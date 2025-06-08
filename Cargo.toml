@@ -1,0 +1,92 @@
+[package]
+name = "zero-db"
+version = "0.1.0"
+authors = ["qdequele <quentin@dequelen.me>"]
+description = "Pure Rust implementation of LMDB with modern performance optimizations"
+license = "MIT"
+repository = "https://github.com/qdequeel/zerodb"
+keywords = ["lmdb", "database", "storage", "typed", "pure-rust"]
+categories = ["database", "data-structures"]
+edition = "2021"
+rust-version = "1.75"
+
+[dependencies]
+# Core dependencies
+bitflags = "2.6"
+byteorder = { version = "1.5", default-features = false }
+thiserror = "1.0"
+tracing = "0.1"
+rand = "0.8"
+
+# Memory and I/O
+memmap2 = "0.9"
+page_size = "0.6"
+libc = "0.2"
+
+# Concurrency
+crossbeam-epoch = "0.9"
+crossbeam-utils = "0.8"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# Type safety
+static_assertions = "1.1"
+
+# Checksums
+crc32fast = "1.4"
+
+# NUMA support
+num_cpus = "1.16"
+
+# Platform-specific
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.6", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_System_IO", "Win32_Storage_FileSystem"] }
+
+[dev-dependencies]
+tempfile = "3.12"
+proptest = "1.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+quickcheck = "1.0"
+quickcheck_macros = "1.0"
+heed = { path = "../heed" }
+rocksdb = "0.22"
+redb = "2.1"
+anyhow = "1.0"
+sled = "0.34"
+
+# Profiling tools
+pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
+flamegraph = "0.6"
+
+[features]
+default = ["io_uring"]
+io_uring = ["dep:io-uring"]
+simd = [] # Will use portable SIMD when stable
+
+[[bench]]
+name = "db_comparison"
+harness = false
+
+[[bench]]
+name = "btree_ops"
+harness = false
+
+[[bench]]
+name = "page_alloc"
+harness = false
+
+[[bench]]
+name = "segregated_freelist"
+harness = false
+
+[[example]]
+name = "simple"
+
+[[example]]
+name = "segregated_freelist_demo"
+
+[[example]]
+name = "numa_demo"
