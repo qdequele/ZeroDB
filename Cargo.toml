@@ -66,9 +66,6 @@ default = ["io_uring"]
 io_uring = ["dep:io-uring"]
 simd = [] # Will use portable SIMD when stable
 
-[[bench]]
-name = "bench_simple"
-harness = false
 
 [[bench]]
 name = "bench_all_dbs"
@@ -98,3 +95,6 @@ name = "segregated_freelist_demo"
 
 [[example]]
 name = "numa_demo"
+
+[[example]]
+name = "io_uring_demo"

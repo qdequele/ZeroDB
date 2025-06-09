@@ -363,12 +363,10 @@ impl Database for RedbDb {
 }
 
 // Optional sled implementation
-#[cfg(feature = "sled")]
 struct SledDb {
     db: sled::Db,
 }
 
-#[cfg(feature = "sled")]
 impl SledDb {
     fn new(path: &std::path::Path) -> anyhow::Result<Self> {
         let db = sled::open(path)?;
@@ -376,7 +374,6 @@ impl SledDb {
     }
 }
 
-#[cfg(feature = "sled")]
 impl Database for SledDb {
     fn write_batch(&self, data: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()> {
         let mut batch = sled::Batch::default();
@@ -451,7 +448,7 @@ fn bench_sequential_writes(c: &mut Criterion) {
     for size in [100, 500, 1000] {
         let data = generate_data(size, 42);
 
-        for db_name in ["zerodb", "heed", "rocksdb", "redb"] {
+        for db_name in ["zerodb", "heed", "rocksdb", "redb", "sled"] {
             group.bench_with_input(BenchmarkId::new(db_name, size), &data, |b, data| {
                 // For benchmarking writes, we need to handle the fact that
                 // criterion runs the closure multiple times
@@ -464,6 +461,7 @@ fn bench_sequential_writes(c: &mut Criterion) {
                             "heed" => Box::new(HeedDb::new(temp_dir.path()).unwrap()),
                             "rocksdb" => Box::new(RocksDb::new(temp_dir.path()).unwrap()),
                             "redb" => Box::new(RedbDb::new(temp_dir.path()).unwrap()),
+                            "sled" => Box::new(SledDb::new(temp_dir.path()).unwrap()),
                             _ => unreachable!(),
                         };
                         (db, temp_dir)
@@ -505,16 +503,18 @@ fn bench_random_reads(c: &mut Criterion) {
             })
             .collect();
 
-        for db_name in ["zerodb", "heed", "rocksdb", "redb"] {
+        for db_name in ["zerodb", "heed", "rocksdb", "redb", "sled"] {
             let temp_dir = TempDir::new().unwrap();
             let db: Box<dyn Database> = match db_name {
                 "zerodb" => Box::new(HeedCoreDb::new(temp_dir.path()).unwrap()),
                 "heed" => Box::new(HeedDb::new(temp_dir.path()).unwrap()),
                 "rocksdb" => Box::new(RocksDb::new(temp_dir.path()).unwrap()),
                 "redb" => Box::new(RedbDb::new(temp_dir.path()).unwrap()),
+                "sled" => Box::new(SledDb::new(temp_dir.path()).unwrap()),
                 _ => unreachable!(),
             };
 
+            println!("Populating database for {} with size {}", db_name, size);
             // Populate database
             db.write_batch(&data).unwrap();
 
@@ -535,13 +535,14 @@ fn bench_full_scan(c: &mut Criterion) {
     for size in [100, 1000] {
         let data = generate_data(size, 42);
 
-        for db_name in ["zerodb", "heed", "rocksdb", "redb"] {
+        for db_name in ["zerodb", "heed", "rocksdb", "redb", "slef"] {
             let temp_dir = TempDir::new().unwrap();
             let db: Box<dyn Database> = match db_name {
                 "zerodb" => Box::new(HeedCoreDb::new(temp_dir.path()).unwrap()),
                 "heed" => Box::new(HeedDb::new(temp_dir.path()).unwrap()),
                 "rocksdb" => Box::new(RocksDb::new(temp_dir.path()).unwrap()),
                 "redb" => Box::new(RedbDb::new(temp_dir.path()).unwrap()),
+                "sled" => Box::new(SledDb::new(temp_dir.path()).unwrap()),
                 _ => unreachable!(),
             };
 
@@ -582,7 +583,7 @@ fn bench_random_writes(c: &mut Criterion) {
 
         // Skip zerodb for random writes due to page allocation limitations
         // Random insertion patterns cause more page splits which exceed current limits
-        for db_name in ["heed", "rocksdb", "redb"] {
+        for db_name in ["zerodb", "heed", "rocksdb", "redb", "sled"] {
             group.bench_with_input(BenchmarkId::new(db_name, size), &data, |b, data| {
                 b.iter_batched(
                     || {
@@ -593,6 +594,7 @@ fn bench_random_writes(c: &mut Criterion) {
                             "heed" => Box::new(HeedDb::new(temp_dir.path()).unwrap()),
                             "rocksdb" => Box::new(RocksDb::new(temp_dir.path()).unwrap()),
                             "redb" => Box::new(RedbDb::new(temp_dir.path()).unwrap()),
+                            "sled" => Box::new(SledDb::new(temp_dir.path()).unwrap()),
                             _ => unreachable!(),
                         };
                         (db, temp_dir)

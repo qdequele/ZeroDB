@@ -429,47 +429,155 @@ pub fn lock_file(_file: &File) -> Result<()> {
 /// io_uring backend for Linux
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
 pub struct IoUringBackend {
-    mmap: MmapBackend, // Fall back to mmap for now
-    ring: io_uring::IoUring,
+    /// The underlying io_uring backend
+    inner: crate::io_uring_parallel::ParallelIoUringBackend,
 }
 
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
 impl IoUringBackend {
     /// Create a new io_uring backend
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
-        let mmap = MmapBackend::new(path)?;
-        let ring = io_uring::IoUring::new(256)
-            .map_err(|e| Error::Io(std::io::Error::from(e).to_string()))?;
-
-        Ok(Self { mmap, ring })
+        // Open the file
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path.as_ref())
+            .map_err(|e| Error::Io(e.to_string()))?;
+        
+        // Get current file size
+        let metadata = file.metadata().map_err(|e| Error::Io(e.to_string()))?;
+        let mut file_size = metadata.len();
+        
+        // Ensure minimum size
+        let min_size = PAGE_SIZE as u64 * 4; // At least 4 pages (2 meta + 2 data)
+        if file_size < min_size {
+            file_size = min_size;
+            file.set_len(file_size).map_err(|e| Error::Io(e.to_string()))?;
+        }
+        
+        // Create io_uring configuration with optimal settings
+        let config = crate::io_uring_parallel::IoUringConfig {
+            sq_entries: 1024,      // Larger submission queue for better batching
+            concurrent_ops: 256,   // Allow many concurrent operations
+            kernel_poll: true,     // Enable kernel polling for lower latency
+            sq_poll: false,        // Disable SQ polling for now (requires CAP_SYS_NICE)
+        };
+        
+        // Create the io_uring backend
+        let inner = crate::io_uring_parallel::ParallelIoUringBackend::new(file, config)?;
+        
+        Ok(Self { inner })
+    }
+    
+    /// Create with custom io_uring configuration
+    pub fn with_config(path: impl AsRef<Path>, config: crate::io_uring_parallel::IoUringConfig) -> Result<Self> {
+        // Open the file
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path.as_ref())
+            .map_err(|e| Error::Io(e.to_string()))?;
+        
+        // Get current file size
+        let metadata = file.metadata().map_err(|e| Error::Io(e.to_string()))?;
+        let mut file_size = metadata.len();
+        
+        // Ensure minimum size
+        let min_size = PAGE_SIZE as u64 * 4;
+        if file_size < min_size {
+            file_size = min_size;
+            file.set_len(file_size).map_err(|e| Error::Io(e.to_string()))?;
+        }
+        
+        // Create the io_uring backend
+        let inner = crate::io_uring_parallel::ParallelIoUringBackend::new(file, config)?;
+        
+        Ok(Self { inner })
     }
 }
 
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
 impl IoBackend for IoUringBackend {
     fn read_page(&self, page_id: PageId) -> Result<Box<Page>> {
-        // For now, fall back to mmap
-        // TODO: Implement async io_uring operations
-        self.mmap.read_page(page_id)
+        self.inner.read_page(page_id)
+    }
+    
+    unsafe fn get_page_ref<'a>(&self, page_id: PageId) -> Result<&'a Page> {
+        // io_uring doesn't support zero-copy page references
+        // because pages are not memory-mapped
+        Err(Error::Custom("Zero-copy not supported by io_uring backend".into()))
     }
 
     fn write_page(&self, page: &Page) -> Result<()> {
-        self.mmap.write_page(page)
+        self.inner.write_page(page)
     }
 
     fn sync(&self) -> Result<()> {
-        self.mmap.sync()
+        self.inner.sync()
     }
 
     fn size_in_pages(&self) -> u64 {
-        self.mmap.size_in_pages()
+        self.inner.size_in_pages()
     }
 
     fn grow(&self, new_size: u64) -> Result<()> {
-        self.mmap.grow(new_size)
+        self.inner.grow(new_size)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+}
+
+/// Backend type selection
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendType {
+    /// Memory-mapped I/O (default)
+    Mmap,
+    /// io_uring (Linux only, requires kernel 5.1+)
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    IoUring,
+}
+
+impl Default for BackendType {
+    fn default() -> Self {
+        // Default to mmap for compatibility
+        BackendType::Mmap
+    }
+}
+
+/// Create an I/O backend based on the specified type
+pub fn create_backend(path: impl AsRef<Path>, backend_type: BackendType) -> Result<Box<dyn IoBackend>> {
+    match backend_type {
+        BackendType::Mmap => {
+            Ok(Box::new(MmapBackend::new(path)?))
+        }
+        #[cfg(all(target_os = "linux", feature = "io_uring"))]
+        BackendType::IoUring => {
+            match IoUringBackend::new(path) {
+                Ok(backend) => Ok(Box::new(backend)),
+                Err(e) => {
+                    // Fall back to mmap if io_uring fails
+                    eprintln!("Failed to create io_uring backend: {}. Falling back to mmap.", e);
+                    Ok(Box::new(MmapBackend::new(path)?))
+                }
+            }
+        }
+    }
+}
+
+/// Create an I/O backend with automatic selection based on platform
+pub fn create_auto_backend(path: impl AsRef<Path>) -> Result<Box<dyn IoBackend>> {
+    // Try io_uring first on Linux if available
+    #[cfg(all(target_os = "linux", feature = "io_uring"))]
+    {
+        if let Ok(backend) = IoUringBackend::new(&path) {
+            return Ok(Box::new(backend));
+        }
+    }
+    
+    // Fall back to mmap
+    Ok(Box::new(MmapBackend::new(path)?))
 }

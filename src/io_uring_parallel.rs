@@ -4,8 +4,16 @@
 //! using Linux's io_uring interface for maximum throughput.
 
 use crate::error::{Error, PageId, Result};
+
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
-use io_uring::{cqueue, opcode, squeue, types, IoUring};
+use {
+    crate::page::{Page, PageFlags, PAGE_SIZE},
+    crate::cache_aligned::CacheAlignedStats,
+    std::sync::{Arc, Mutex},
+    std::collections::HashMap,
+    io_uring::{cqueue, opcode, squeue, types, IoUring},
+    std::os::unix::io::AsRawFd,
+};
 
 /// Configuration for io_uring operations
 pub struct IoUringConfig {
@@ -42,6 +50,8 @@ pub struct ParallelIoUringBackend {
     in_flight: Arc<Mutex<HashMap<u64, InflightOp>>>,
     /// Next request ID
     next_req_id: Arc<Mutex<u64>>,
+    /// File size in bytes
+    file_size: Arc<Mutex<u64>>,
 }
 
 /// Information about an in-flight operation
@@ -78,6 +88,11 @@ impl ParallelIoUringBackend {
     /// Create a new parallel io_uring backend
     pub fn new(file: std::fs::File, config: IoUringConfig) -> Result<Self> {
         let fd = file.as_raw_fd();
+        
+        // Get file size
+        let file_size = file.metadata()
+            .map_err(|e| Error::Io(e.to_string()))?
+            .len();
 
         // Create io_uring with configuration
         let mut builder = IoUring::builder();
@@ -88,8 +103,8 @@ impl ParallelIoUringBackend {
             builder.setup_sqpoll(1000); // 1ms idle timeout
         }
 
-        let ring =
-            builder.build(config.sq_entries).map_err(|e| Error::Io(std::io::Error::from(e)))?;
+        let ring = builder.build(config.sq_entries)
+            .map_err(|e| Error::Custom(format!("Failed to create io_uring: {}", e)))?;
 
         Ok(Self {
             ring: Arc::new(Mutex::new(ring)),
@@ -99,6 +114,7 @@ impl ParallelIoUringBackend {
             config,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
             next_req_id: Arc::new(Mutex::new(0)),
+            file_size: Arc::new(Mutex::new(file_size)),
         })
     }
 
@@ -154,12 +170,12 @@ impl ParallelIoUringBackend {
         }
 
         // Submit all operations
-        ring.submit().map_err(|e| Error::Io(std::io::Error::from(e)))?;
+        ring.submit().map_err(|e| Error::Custom(format!("io_uring submit failed: {}", e)))?;
 
         // Wait for all completions
         let mut completed = 0;
         while completed < submitted.len() {
-            ring.submit_and_wait(1).map_err(|e| Error::Io(std::io::Error::from(e)))?;
+            ring.submit_and_wait(1).map_err(|e| Error::Custom(format!("io_uring wait failed: {}", e)))?;
 
             // Process completions
             let mut cq = ring.completion();
@@ -227,8 +243,7 @@ impl ParallelIoUringBackend {
                         match result {
                             Ok(()) => {
                                 // Parse page from buffer
-                                let page =
-                                    Box::new(Page::new(*page_id, crate::page::PageFlags::empty()));
+                                let page = Page::new(*page_id, PageFlags::empty());
                                 callback(Ok(page));
                             }
                             Err(e) => callback(Err(e)),
@@ -239,7 +254,7 @@ impl ParallelIoUringBackend {
         }
 
         // Submit all operations
-        ring.submit().map_err(|e| Error::Io(std::io::Error::from(e)))?;
+        ring.submit().map_err(|e| Error::Custom(format!("io_uring submit failed: {}", e)))?;
 
         Ok(())
     }
@@ -252,7 +267,7 @@ impl ParallelIoUringBackend {
         let mut processed = 0;
 
         // Check for completions without blocking
-        ring.submit().map_err(|e| Error::Io(std::io::Error::from(e)))?;
+        ring.submit().map_err(|e| Error::Custom(format!("io_uring submit failed: {}", e)))?;
 
         let mut cq = ring.completion();
         for cqe in &mut cq {
@@ -328,7 +343,7 @@ impl ParallelIoUringBackend {
         }
 
         // Submit and wait
-        ring.submit_and_wait(1).map_err(|e| Error::Io(std::io::Error::from(e)))?;
+        ring.submit_and_wait(1).map_err(|e| Error::Custom(format!("io_uring submit_and_wait failed: {}", e)))?;
 
         // Check completion
         let mut cq = ring.completion();
@@ -347,6 +362,131 @@ impl ParallelIoUringBackend {
         }
 
         Err(Error::Custom("io_uring operation not completed".into()))
+    }
+}
+
+/// Implement IoBackend trait for ParallelIoUringBackend
+#[cfg(all(target_os = "linux", feature = "io_uring"))]
+impl crate::io::IoBackend for ParallelIoUringBackend {
+    fn read_page(&self, page_id: PageId) -> Result<Box<Page>> {
+        let mut ring = self.ring.lock().unwrap();
+        let mut next_req_id = self.next_req_id.lock().unwrap();
+        
+        let offset = page_id.0 as i64 * self.page_size as i64;
+        let mut buffer = vec![0u8; self.page_size];
+        
+        // Generate request ID
+        let req_id = *next_req_id;
+        *next_req_id += 1;
+        
+        // Create read operation
+        let read_op = opcode::Read::new(types::Fd(self.fd), buffer.as_mut_ptr(), buffer.len() as u32)
+            .offset(offset)
+            .build()
+            .user_data(req_id);
+        
+        // Submit and wait
+        unsafe {
+            ring.submission()
+                .push(&read_op)
+                .map_err(|_| Error::Custom("io_uring submission queue full".into()))?;
+        }
+        
+        ring.submit_and_wait(1).map_err(|e| Error::Custom(format!("io_uring submit_and_wait failed: {}", e)))?;
+        
+        // Get completion
+        let mut cq = ring.completion();
+        for cqe in &mut cq {
+            if cqe.user_data() == req_id {
+                if cqe.result() < 0 {
+                    return Err(Error::Io(std::io::Error::from_raw_os_error(-cqe.result()).to_string()));
+                }
+                
+                // Parse page from buffer
+                // Safety: We need to properly copy the data from the buffer
+                let page = unsafe {
+                    let mut page_box = Box::new(std::mem::MaybeUninit::<Page>::uninit());
+                    std::ptr::copy_nonoverlapping(
+                        buffer.as_ptr(),
+                        page_box.as_mut_ptr() as *mut u8,
+                        self.page_size
+                    );
+                    page_box.assume_init()
+                };
+                
+                self.stats.record_page_read(self.page_size);
+                return Ok(page);
+            }
+        }
+        
+        Err(Error::Custom("io_uring read operation not completed".into()))
+    }
+    
+    fn write_page(&self, page: &Page) -> Result<()> {
+        self.write_pages_parallel(&[(PageId(page.header.pgno), page)])
+    }
+    
+    fn sync(&self) -> Result<()> {
+        let mut ring = self.ring.lock().unwrap();
+        let mut next_req_id = self.next_req_id.lock().unwrap();
+        
+        let req_id = *next_req_id;
+        *next_req_id += 1;
+        
+        // Create fsync operation
+        let sync_op = opcode::Fsync::new(types::Fd(self.fd))
+            .build()
+            .user_data(req_id);
+        
+        unsafe {
+            ring.submission()
+                .push(&sync_op)
+                .map_err(|_| Error::Custom("io_uring submission queue full".into()))?;
+        }
+        
+        ring.submit_and_wait(1).map_err(|e| Error::Custom(format!("io_uring submit_and_wait failed: {}", e)))?;
+        
+        // Check completion
+        let mut cq = ring.completion();
+        for cqe in &mut cq {
+            if cqe.user_data() == req_id {
+                if cqe.result() < 0 {
+                    return Err(Error::Io(std::io::Error::from_raw_os_error(-cqe.result()).to_string()));
+                }
+                return Ok(());
+            }
+        }
+        
+        Err(Error::Custom("io_uring sync operation not completed".into()))
+    }
+    
+    fn size_in_pages(&self) -> u64 {
+        let file_size = self.file_size.lock().unwrap();
+        *file_size / self.page_size as u64
+    }
+    
+    fn grow(&self, new_size: u64) -> Result<()> {
+        let mut file_size = self.file_size.lock().unwrap();
+        let new_size_bytes = new_size * self.page_size as u64;
+        
+        if new_size_bytes > *file_size {
+            // Use fallocate to grow the file
+            let ret = unsafe {
+                libc::fallocate(self.fd, 0, *file_size as i64, (new_size_bytes - *file_size) as i64)
+            };
+            
+            if ret != 0 {
+                return Err(Error::Io(std::io::Error::last_os_error().to_string()));
+            }
+            
+            *file_size = new_size_bytes;
+        }
+        
+        Ok(())
+    }
+    
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -381,17 +521,17 @@ mod tests {
         // Create test pages
         let mut pages = Vec::new();
         for i in 0..10 {
-            let page = Page::new(PageId(i), crate::page::PageFlags::LEAF);
+            let page = Page::new(PageId(i), PageFlags::LEAF);
             pages.push((PageId(i), page));
         }
 
         // Write pages in parallel
-        let page_refs: Vec<(PageId, &Page)> = pages.iter().map(|(id, page)| (*id, page)).collect();
+        let page_refs: Vec<(PageId, &Page)> = pages.iter().map(|(id, page)| (*id, &**page)).collect();
 
         backend.write_pages_parallel(&page_refs).unwrap();
 
         // Check statistics
-        let stats = backend.stats;
+        let stats = &backend.stats;
         assert_eq!(stats.page_writes.get(), 10);
         assert_eq!(stats.bytes_written.get(), 10 * PAGE_SIZE as u64);
     }
