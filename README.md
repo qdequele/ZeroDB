@@ -165,12 +165,6 @@ python3 scripts/generate-perf-dashboard.py
 - `io_uring` (default): Linux io_uring support for async I/O
 - `simd`: SIMD optimizations (requires nightly Rust)
 
-## Documentation
-
-- [File Organization](FILE_ORGANIZATION.md)
-- [Performance Guide](PERFORMANCE_GUIDE.md)
-- [Performance Analysis](PERFORMANCE_ANALYSIS.md)
-- [Performance Optimizations](PERFORMANCE_OPTIMIZATIONS.md)
 
 ## License
 
