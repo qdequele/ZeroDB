@@ -533,20 +533,16 @@ impl IoBackend for IoUringBackend {
 
 /// Backend type selection
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum BackendType {
     /// Memory-mapped I/O (default)
+    #[default]
     Mmap,
     /// io_uring (Linux only, requires kernel 5.1+)
     #[cfg(all(target_os = "linux", feature = "io_uring"))]
     IoUring,
 }
 
-impl Default for BackendType {
-    fn default() -> Self {
-        // Default to mmap for compatibility
-        BackendType::Mmap
-    }
-}
 
 /// Create an I/O backend based on the specified type
 pub fn create_backend(path: impl AsRef<Path>, backend_type: BackendType) -> Result<Box<dyn IoBackend>> {

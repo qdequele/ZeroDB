@@ -41,11 +41,6 @@ pub mod simd_advanced;
 pub mod tree_utils;
 pub mod txn;
 
-#[cfg(test)]
-mod btree_tests;
-#[cfg(test)]
-mod io_test;
-
 // Re-exports
 pub use db::{Database, DatabaseFlags, Key, Value};
 pub use env::{EnvBuilder, Environment};

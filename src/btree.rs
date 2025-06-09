@@ -553,33 +553,59 @@ impl<C: Comparator> BTree<C> {
         new_key: Vec<u8>,
         new_page: PageId,
     ) -> Result<InsertResult> {
-        // Get the page to split using branch_v2
+        // Instead of splitting first and then inserting (which might fail),
+        // collect all entries including the new one and do a proper balanced split
+        
         let page = txn.get_page(page_id)?;
-
-        // Use branch_v2 split method
-        let (right_entries, median_key, right_leftmost) = crate::branch::BranchPage::split(page)?;
-
-        // Allocate new right page
-        let (right_page_id, right_page) = txn.alloc_page(PageFlags::BRANCH)?;
-
-        // Initialize right page with the split data
-        crate::branch::BranchPage::init_from_split(right_page, right_leftmost, &right_entries)?;
-
-        // Truncate the left page
-        let left_page = txn.get_page_mut(page_id)?;
-        let mid_idx = left_page.header.num_keys as usize / 2;
-        left_page.truncate(mid_idx);
-
-        // Determine which page to insert the new key into
-        if new_key.as_slice() < median_key.as_slice() {
-            // Insert into left page
-            crate::branch::BranchPage::add_split_child(left_page, &new_key, new_page)?;
-        } else {
-            // Insert into right page
-            let right_page = txn.get_page_mut(right_page_id)?;
-            crate::branch::BranchPage::add_split_child(right_page, &new_key, new_page)?;
+        let leftmost_child = crate::branch::BranchPage::get_leftmost_child(page)?;
+        
+        // Collect all existing entries
+        let mut all_entries = Vec::new();
+        for i in 0..page.header.num_keys as usize {
+            let node = page.node(i)?;
+            all_entries.push((node.key()?.to_vec(), node.page_number()?));
         }
-
+        
+        // Add the new entry and sort
+        all_entries.push((new_key, new_page));
+        all_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        
+        // Calculate split point - ensure both sides have room to grow
+        let total_entries = all_entries.len();
+        let split_point = total_entries / 2;
+        
+        // The entry at split_point will be promoted as median
+        let median_key = all_entries[split_point].0.clone();
+        let median_child = all_entries[split_point].1;
+        
+        // Allocate new right page
+        let (right_page_id, _) = txn.alloc_page(PageFlags::BRANCH)?;
+        
+        // Clear and rebuild left page with entries before split point
+        {
+            let left_page = txn.get_page_mut(page_id)?;
+            left_page.clear();
+            left_page.header.flags = PageFlags::BRANCH;
+            
+            // Initialize left page with entries [0..split_point)
+            crate::branch::BranchPage::init_from_split(
+                left_page,
+                leftmost_child,
+                &all_entries[..split_point]
+            )?;
+        }
+        
+        // Initialize right page with entries (split_point+1..]
+        // The median's child becomes the leftmost child of the right page
+        {
+            let right_page = txn.get_page_mut(right_page_id)?;
+            crate::branch::BranchPage::init_from_split(
+                right_page,
+                median_child,
+                &all_entries[(split_point + 1)..]
+            )?;
+        }
+        
         Ok(InsertResult::Split { median_key, right_page: right_page_id })
     }
 

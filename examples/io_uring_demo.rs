@@ -95,7 +95,7 @@ fn test_backend(backend: &dyn IoBackend) -> Result<()> {
     
     // Write a test page
     let test_page = Page::new(PageId(2), PageFlags::LEAF);
-    backend.write_page(&*test_page)?;
+    backend.write_page(&test_page)?;
     println!("  - Wrote test page");
     
     // Read it back
