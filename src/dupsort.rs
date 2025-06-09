@@ -39,14 +39,14 @@ impl DupSort {
 
     /// Check if a value is a sub-database reference
     pub fn is_sub_db(value: &[u8]) -> bool {
-        value.len() > 0
+        !value.is_empty()
             && value[0] == SUB_DB_MARKER
             && value.len() == 1 + std::mem::size_of::<DbInfo>()
     }
 
     /// Check if a value is a single value (optimization for single duplicate)
     pub fn is_single_value(value: &[u8]) -> bool {
-        value.len() > 0 && value[0] == SINGLE_VALUE_MARKER
+        !value.is_empty() && value[0] == SINGLE_VALUE_MARKER
     }
 
     /// Encode a single value with marker
@@ -59,7 +59,7 @@ impl DupSort {
 
     /// Decode a single value
     pub fn decode_single_value(data: &[u8]) -> Result<&[u8]> {
-        if data.len() > 0 && data[0] == SINGLE_VALUE_MARKER {
+        if !data.is_empty() && data[0] == SINGLE_VALUE_MARKER {
             Ok(&data[1..])
         } else {
             Err(Error::Custom("Not a single value".into()))
@@ -393,7 +393,7 @@ impl DupSort {
                 }
 
                 // Also get leftmost child if it's a branch_v2 page
-                if let Ok(leftmost) = crate::branch::BranchPage::get_leftmost_child(&page) {
+                if let Ok(leftmost) = crate::branch::BranchPage::get_leftmost_child(page) {
                     stack.push(leftmost);
                 }
             }

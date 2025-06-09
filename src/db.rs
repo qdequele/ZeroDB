@@ -595,28 +595,25 @@ impl Environment<state::Open> {
         // For named databases, look in the main database
         if let Some(db_name) = name {
             let main_db_info = txn.db_info(None)?;
-            match BTree::<LexicographicComparator>::search(
+            if let Some(value) = BTree::<LexicographicComparator>::search(
                 txn,
                 main_db_info.root,
                 db_name.as_bytes(),
             )? {
-                Some(value) => {
-                    // Try to deserialize using Catalog format
-                    if let Ok(info) = crate::catalog::Catalog::deserialize_db_info(&value) {
-                        // Cache in the environment
-                        self.inner()
-                            .databases
-                            .write()
-                            .unwrap()
-                            .insert(Some(db_name.to_string()), info);
-                        return Ok(Database::new(
-                            self.inner().clone(),
-                            Some(db_name.to_string()),
-                            info,
-                        ));
-                    }
+                // Try to deserialize using Catalog format
+                if let Ok(info) = crate::catalog::Catalog::deserialize_db_info(&value) {
+                    // Cache in the environment
+                    self.inner()
+                        .databases
+                        .write()
+                        .unwrap()
+                        .insert(Some(db_name.to_string()), info);
+                    return Ok(Database::new(
+                        self.inner().clone(),
+                        Some(db_name.to_string()),
+                        info,
+                    ));
                 }
-                None => {}
             }
         }
 

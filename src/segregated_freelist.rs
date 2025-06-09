@@ -45,9 +45,9 @@ impl SizeClass {
     pub fn fits(&self, pages: usize) -> bool {
         match self {
             SizeClass::Single => pages == 1,
-            SizeClass::Small => pages >= 2 && pages <= 4,
-            SizeClass::Medium => pages >= 5 && pages <= 16,
-            SizeClass::Large => pages >= 17 && pages <= 64,
+            SizeClass::Small => (2..=4).contains(&pages),
+            SizeClass::Medium => (5..=16).contains(&pages),
+            SizeClass::Large => (17..=64).contains(&pages),
             SizeClass::Huge => pages >= 65,
         }
     }
@@ -153,6 +153,12 @@ impl SegregatedStats {
     }
 }
 
+impl Default for SegregatedFreeList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SegregatedFreeList {
     /// Create a new segregated free list
     pub fn new() -> Self {
@@ -202,7 +208,7 @@ impl SegregatedFreeList {
                     if let Some(rem) = remainder {
                         // Add remainder back to appropriate size class
                         let rem_class = SizeClass::from_page_count(rem.pages);
-                        size_classes.entry(rem_class).or_insert_with(BTreeSet::new).insert(rem);
+                        size_classes.entry(rem_class).or_default().insert(rem);
                         page_map.insert(rem.start, rem);
 
                         self.stats.fragmentation.increment();
@@ -239,7 +245,7 @@ impl SegregatedFreeList {
                     if let Some(rem) = remainder {
                         // Add remainder back
                         let rem_class = SizeClass::from_page_count(rem.pages);
-                        size_classes.entry(rem_class).or_insert_with(BTreeSet::new).insert(rem);
+                        size_classes.entry(rem_class).or_default().insert(rem);
                         page_map.insert(rem.start, rem);
 
                         self.stats.fragmentation.increment();
@@ -353,7 +359,7 @@ impl SegregatedFreeList {
 
         // Add coalesced extent to appropriate size class
         let class = SizeClass::from_page_count(coalesced.pages);
-        size_classes.entry(class).or_insert_with(BTreeSet::new).insert(coalesced);
+        size_classes.entry(class).or_default().insert(coalesced);
         page_map.insert(coalesced.start, coalesced);
 
         self.stats.free_pages.add(coalesced.pages as u64);

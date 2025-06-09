@@ -224,6 +224,12 @@ pub struct CacheAlignedStats {
     pub bytes_written: CacheAlignedCounter,
 }
 
+impl Default for CacheAlignedStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CacheAlignedStats {
     /// Create new cache-aligned statistics counters initialized to zero
     pub const fn new() -> Self {

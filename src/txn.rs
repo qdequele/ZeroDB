@@ -492,8 +492,7 @@ impl<'env> Transaction<'env, Write> {
                     if let Ok(Some(overflow_id)) = node.overflow_page() {
                         updates.push((i, overflow_id));
                     }
-                } else {
-                }
+                } 
             }
             updates
         } else {
@@ -550,8 +549,7 @@ impl<'env> Transaction<'env, Write> {
                             details: format!(
                                 "Node index {} out of bounds during COW (num_keys={})",
                                 node_idx, new_page.header.num_keys
-                            )
-                            .into(),
+                            ),
                             page_id: Some(page_id),
                         });
                     }

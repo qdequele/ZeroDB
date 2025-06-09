@@ -199,7 +199,7 @@ impl BatchCommitter {
         // Send results back
         for (write, op_result) in batch.drain(..).zip(results.drain(..)) {
             let final_result = match op_result {
-                Ok(()) => commit_result.clone().map_err(|e| e.into()),
+                Ok(()) => commit_result.clone(),
                 Err(e) => Err(e),
             };
             let _ = write.result_tx.send(final_result);

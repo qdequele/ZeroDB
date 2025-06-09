@@ -259,7 +259,7 @@ mod tests {
         db_info.leaf_pages = 1;
 
         // Test with increasingly large values
-        let sizes = vec![100, 500, 1000, 2000, 5000, 10000];
+        let sizes = [100, 500, 1000, 2000, 5000, 10000];
 
         for (i, &size) in sizes.iter().enumerate() {
             let key = format!("key_{}", i);

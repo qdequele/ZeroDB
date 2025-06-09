@@ -65,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut count = 0;
 
     while let Some((key, _)) = cursor.next()? {
-        if count < 10 || count >= 40 {
+        if !(10..40).contains(&count) {
             println!("  {}", String::from_utf8_lossy(&key));
         } else if count == 10 {
             println!("  ...");

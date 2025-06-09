@@ -20,6 +20,12 @@ pub struct BTree<C = LexicographicComparator> {
     _phantom: PhantomData<C>,
 }
 
+impl<C: Comparator> Default for BTree<C> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<C: Comparator> BTree<C> {
     /// Create a new BTree instance
     pub fn new() -> Self {
@@ -178,7 +184,7 @@ impl<C: Comparator> BTree<C> {
                     } else {
                         // In branch page, follow the child pointer
                         current_page_id =
-                            crate::branch::BranchPage::find_child_with_comparator::<C>(&page, key)?;
+                            crate::branch::BranchPage::find_child_with_comparator::<C>(page, key)?;
                     }
                 }
                 SearchResult::NotFound { insert_pos: _ } => {
@@ -188,7 +194,7 @@ impl<C: Comparator> BTree<C> {
                     } else {
                         // In branch page, use the branch helper
                         current_page_id =
-                            crate::branch::BranchPage::find_child_with_comparator::<C>(&page, key)?;
+                            crate::branch::BranchPage::find_child_with_comparator::<C>(page, key)?;
                     }
                 }
             }
@@ -237,7 +243,7 @@ impl<C: Comparator> BTree<C> {
                     } else {
                         // In branch page, follow the child
                         current_page_id =
-                            crate::branch::BranchPage::find_child_with_comparator::<C>(&page, key)?;
+                            crate::branch::BranchPage::find_child_with_comparator::<C>(page, key)?;
                     }
                 }
                 SearchResult::NotFound { insert_pos: _ } => {
@@ -247,7 +253,7 @@ impl<C: Comparator> BTree<C> {
                     } else {
                         // In branch page, use the branch helper
                         current_page_id =
-                            crate::branch::BranchPage::find_child_with_comparator::<C>(&page, key)?;
+                            crate::branch::BranchPage::find_child_with_comparator::<C>(page, key)?;
                     }
                 }
             }
@@ -282,8 +288,7 @@ impl<C: Comparator> BTree<C> {
                         details: format!(
                             "Invalid page IDs during split: old_root={:?}, right_page={:?}",
                             root, right_page
-                        )
-                        .into(),
+                        ),
                         page_id: Some(*root),
                     });
                 }
@@ -392,12 +397,12 @@ impl<C: Comparator> BTree<C> {
                 }
 
                 // Now insert the new value
-                return Self::insert_into_leaf(txn, page_id, key, value).map(
+                Self::insert_into_leaf(txn, page_id, key, value).map(
                     |result| match result {
                         InsertResult::Inserted => InsertResult::Updated(old_value),
                         other => other,
                     },
-                );
+                )
             }
             SearchResult::NotFound { insert_pos: _ } => {
                 if needs_overflow {
@@ -444,18 +449,18 @@ impl<C: Comparator> BTree<C> {
         // Ensure this is actually a branch page
         if !page.header.flags.contains(PageFlags::BRANCH) {
             return Err(Error::Corruption {
-                details: format!("Expected branch page but got {:?}", page.header.flags).into(),
+                details: format!("Expected branch page but got {:?}", page.header.flags),
                 page_id: Some(page_id),
             });
         }
 
         // Find child to insert into using the branch page logic
-        let child_page_id = crate::branch::BranchPage::find_child_with_comparator::<C>(&page, key)?;
+        let child_page_id = crate::branch::BranchPage::find_child_with_comparator::<C>(page, key)?;
 
         // Sanity check: child page ID should never be 0
         if child_page_id.0 == 0 {
             return Err(Error::Corruption {
-                details: format!("Branch page returned invalid child page ID 0").into(),
+                details: "Branch page returned invalid child page ID 0".to_string(),
                 page_id: Some(page_id),
             });
         }
@@ -552,7 +557,7 @@ impl<C: Comparator> BTree<C> {
         let page = txn.get_page(page_id)?;
 
         // Use branch_v2 split method
-        let (right_entries, median_key, right_leftmost) = crate::branch::BranchPage::split(&page)?;
+        let (right_entries, median_key, right_leftmost) = crate::branch::BranchPage::split(page)?;
 
         // Allocate new right page
         let (right_page_id, right_page) = txn.alloc_page(PageFlags::BRANCH)?;
@@ -742,7 +747,7 @@ impl<C: Comparator> BTree<C> {
         let page = txn.get_page(page_id)?;
 
         // Find child to delete from using branch_v2 logic
-        let child_page_id = crate::branch::BranchPage::find_child_with_comparator::<C>(&page, key)?;
+        let child_page_id = crate::branch::BranchPage::find_child_with_comparator::<C>(page, key)?;
 
         // We need to track which child index we're using for rebalancing
         // This is a bit tricky with branch_v2's structure
@@ -796,7 +801,7 @@ impl<C: Comparator> BTree<C> {
         let (child_id, left_sibling_id, right_sibling_id, _parent_num_keys) =
             if child_index == usize::MAX {
                 // Leftmost child
-                let child_id = crate::branch::BranchPage::get_leftmost_child(&parent)?;
+                let child_id = crate::branch::BranchPage::get_leftmost_child(parent)?;
                 let right_sibling_id = if parent.header.num_keys > 0 {
                     Some(parent.node(0)?.page_number()?)
                 } else {
@@ -809,7 +814,7 @@ impl<C: Comparator> BTree<C> {
 
                 let left_sibling_id = if child_index == 0 {
                     // The left sibling of the first key's right child is the leftmost child
-                    Some(crate::branch::BranchPage::get_leftmost_child(&parent)?)
+                    Some(crate::branch::BranchPage::get_leftmost_child(parent)?)
                 } else {
                     Some(parent.node(child_index - 1)?.page_number()?)
                 };
@@ -1483,7 +1488,7 @@ impl<C: Comparator> BTree<C> {
     ) -> Result<(PageId, InsertResult)> {
         let child_page_id = {
             let page = txn.get_page(page_id)?;
-            crate::branch::BranchPage::find_child_with_comparator::<C>(&page, key)?
+            crate::branch::BranchPage::find_child_with_comparator::<C>(page, key)?
         };
 
         // Recursively insert into child with COW

@@ -12,6 +12,7 @@ use crate::txn::{Read, Transaction};
 
 /// Options for copying an environment
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct CopyOptions {
     /// Copy with compaction (skip free pages)
     pub compact: bool,
@@ -19,11 +20,6 @@ pub struct CopyOptions {
     pub exclude_txn_metadata: bool,
 }
 
-impl Default for CopyOptions {
-    fn default() -> Self {
-        Self { compact: false, exclude_txn_metadata: false }
-    }
-}
 
 impl CopyOptions {
     /// Create options for a compact copy

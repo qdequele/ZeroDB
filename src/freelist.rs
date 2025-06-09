@@ -24,6 +24,12 @@ pub struct FreeList {
     needs_save: bool,
 }
 
+impl Default for FreeList {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FreeList {
     /// Create a new free list
     pub fn new() -> Self {
@@ -145,7 +151,7 @@ impl FreeList {
         // Remove transactions that are safe to reuse
         let mut safe_txns = Vec::new();
 
-        for (&txn_id, _) in &self.txn_free_pages {
+        for &txn_id in self.txn_free_pages.keys() {
             // Pages from a transaction can be reused when:
             // 1. There are no active readers (oldest_reader == 0), OR
             // 2. The transaction is older than the oldest reader
@@ -368,7 +374,7 @@ mod tests {
     #[test]
     fn test_free_page_operations() {
         let mut page = Page::new(PageId(100), PageFlags::OVERFLOW);
-        let mut free_page = FreePageMut::new(&mut *page);
+        let mut free_page = FreePageMut::new(&mut page);
 
         // Add some page IDs
         free_page.add_page_id(PageId(1)).unwrap();

@@ -24,6 +24,12 @@ pub struct ReaderSlot {
     pub timestamp: AtomicU64,
 }
 
+impl Default for ReaderSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ReaderSlot {
     /// Create a new empty reader slot
     pub fn new() -> Self {

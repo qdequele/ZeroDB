@@ -69,7 +69,7 @@ fn run_benchmark_with_profiling(
 
     // Run the benchmark
     let output = Command::new("cargo")
-        .args(&["bench", "--bench", bench_file, "--", group, "--profile-time", "5"])
+        .args(["bench", "--bench", bench_file, "--", group, "--profile-time", "5"])
         .env("CARGO_PROFILE_BENCH_DEBUG", "true")
         .output()?;
 

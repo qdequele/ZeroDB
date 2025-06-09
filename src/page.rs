@@ -755,7 +755,7 @@ impl<'a> NodeDataMut<'a> {
         let header = unsafe { *node_ptr };
 
         // Check if new value fits
-        let old_value_size = header.value_size() as usize;
+        let old_value_size = header.value_size();
         if new_value.len() != old_value_size && !header.flags.contains(NodeFlags::BIGDATA) {
             return Err(Error::InvalidParameter("Cannot change value size without reallocation"));
         }

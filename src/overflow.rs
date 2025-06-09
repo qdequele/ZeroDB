@@ -36,7 +36,7 @@ pub fn write_overflow_value<'txn>(
     let total_size = value.len();
     // Account for both PageHeader and OverflowHeader
     let data_per_page = PAGE_SIZE - crate::page::PageHeader::SIZE - OverflowHeader::SIZE;
-    let num_pages = (total_size + data_per_page - 1) / data_per_page;
+    let num_pages = total_size.div_ceil(data_per_page);
 
     if num_pages == 0 {
         return Err(Error::InvalidParameter("Empty value for overflow"));
@@ -142,8 +142,7 @@ pub fn read_overflow_value<'txn, M: Mode>(
             details: format!(
                 "Overflow value size mismatch: expected {}, got {}",
                 total_size, bytes_read
-            )
-            .into(),
+            ),
             page_id: Some(first_page_id),
         });
     }

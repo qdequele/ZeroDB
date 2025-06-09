@@ -74,6 +74,12 @@ pub struct AdaptivePageSelector {
     last_adaptation: AtomicU64,
 }
 
+impl Default for AdaptivePageSelector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AdaptivePageSelector {
     /// Create a new adaptive page selector
     pub fn new() -> Self {

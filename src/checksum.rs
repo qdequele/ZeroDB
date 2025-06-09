@@ -17,6 +17,12 @@ pub struct ChecksumCalculator {
     hasher: Hasher,
 }
 
+impl Default for ChecksumCalculator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ChecksumCalculator {
     /// Create a new checksum calculator
     pub fn new() -> Self {
@@ -70,8 +76,10 @@ impl ChecksumCalculator {
 
 /// Environment-level checksum configuration
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ChecksumMode {
     /// No checksums (default for compatibility)
+    #[default]
     None,
     /// Checksums on meta pages only
     MetaOnly,
@@ -79,11 +87,6 @@ pub enum ChecksumMode {
     Full,
 }
 
-impl Default for ChecksumMode {
-    fn default() -> Self {
-        ChecksumMode::None
-    }
-}
 
 /// Trait for checksum-aware page operations
 pub trait ChecksummedPage {
@@ -114,6 +117,12 @@ impl ChecksummedPage for Page {
 /// Batch checksum validation for performance
 pub struct BatchValidator {
     failed_pages: Vec<(PageId, Checksum, Checksum)>, // (page_id, expected, actual)
+}
+
+impl Default for BatchValidator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BatchValidator {
@@ -231,11 +240,9 @@ mod tests {
         // page3 has no checksum
 
         // All should validate
-        let pages = vec![
-            (PageId(1), page1.as_ref()),
+        let pages = [(PageId(1), page1.as_ref()),
             (PageId(2), page2.as_ref()),
-            (PageId(3), page3.as_ref()),
-        ];
+            (PageId(3), page3.as_ref())];
         assert!(validator.validate_pages(&pages[..]).is_ok());
         assert!(validator.failed_pages().is_empty());
 
@@ -243,11 +250,9 @@ mod tests {
         page1.header.num_keys = 99;
 
         // Validation should fail
-        let pages = vec![
-            (PageId(1), page1.as_ref()),
+        let pages = [(PageId(1), page1.as_ref()),
             (PageId(2), page2.as_ref()),
-            (PageId(3), page3.as_ref()),
-        ];
+            (PageId(3), page3.as_ref())];
         assert!(validator.validate_pages(&pages[..]).is_err());
         assert_eq!(validator.failed_pages().len(), 1);
         assert_eq!(validator.failed_pages()[0].0, PageId(1));

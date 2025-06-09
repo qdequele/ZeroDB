@@ -182,7 +182,7 @@ fn bench_random_reads() {
         let mut found = 0;
 
         for &idx in &read_indices {
-            if let Some(_) = db.get(&txn, &all_keys[idx]).unwrap() {
+            if db.get(&txn, &all_keys[idx]).unwrap().is_some() {
                 found += 1;
             }
         }
@@ -224,7 +224,7 @@ fn bench_random_reads() {
         let mut found = 0;
 
         for &idx in &read_indices {
-            if let Some(_) = db.get(&txn, &all_keys[idx]).unwrap() {
+            if db.get(&txn, &all_keys[idx]).unwrap().is_some() {
                 found += 1;
             }
         }

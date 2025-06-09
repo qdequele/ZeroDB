@@ -54,7 +54,7 @@ impl BloomFilter {
         let num_hashes = k.max(1).min(16); // Limit to reasonable range
 
         // Allocate bit array
-        let num_words = (num_bits + 63) / 64;
+        let num_words = num_bits.div_ceil(64);
         let bits = vec![0u64; num_words];
 
         Self { bits, num_bits, num_hashes, stats: Arc::new(CacheAlignedStats::new()) }
@@ -237,10 +237,10 @@ impl HierarchicalBloomFilter {
     /// Get or create a leaf filter
     pub fn get_or_create_leaf(&self, page_id: PageId) -> Result<()> {
         let mut leaves = self.leaves.write();
-        if !leaves.contains_key(&page_id) {
-            let filter = PageBloomFilter::new(page_id, 100); // Assume ~100 keys per leaf
-            leaves.insert(page_id, filter);
-        }
+        leaves.entry(page_id).or_insert_with(|| {
+             // Assume ~100 keys per leaf
+            PageBloomFilter::new(page_id, 100)
+        });
         Ok(())
     }
 

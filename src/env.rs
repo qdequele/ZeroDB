@@ -405,6 +405,12 @@ impl Default for EnvBuilder {
     }
 }
 
+impl Default for Environment<Closed> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Environment<Closed> {
     /// Create a new closed environment
     pub fn new() -> Self {

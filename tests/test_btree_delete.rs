@@ -110,7 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let txn = env.begin_txn()?;
 
         // Test some odd entries (should exist)
-        for i in vec![1, 5, 9, 13, 17] {
+        for i in [1, 5, 9, 13, 17] {
             if i < num_entries {
                 let key = format!("key_{:03}", i);
                 match db.get(&txn, &key)? {
@@ -121,7 +121,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // Test some even entries (should not exist)
-        for i in vec![0, 4, 8, 12, 16] {
+        for i in [0, 4, 8, 12, 16] {
             if i < num_entries {
                 let key = format!("key_{:03}", i);
                 match db.get(&txn, &key)? {

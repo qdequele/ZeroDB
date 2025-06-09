@@ -102,6 +102,12 @@ pub struct MetaPage {
     pub free_db: DbInfo,
 }
 
+impl Default for MetaPage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MetaPage {
     /// Create a new meta page
     pub fn new() -> Self {
