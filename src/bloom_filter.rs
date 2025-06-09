@@ -167,6 +167,7 @@ pub struct PageBloomFilter {
     /// Bloom filter for this page
     filter: BloomFilter,
     /// Page ID this filter is for
+    #[allow(dead_code)]
     page_id: PageId,
     /// Whether the filter is dirty
     dirty: bool,
@@ -317,6 +318,7 @@ pub struct BloomStats {
 }
 
 #[derive(Debug)]
+/// Statistics for Bloom filter performance
 pub struct BloomFilterStats {
     /// Number of bits
     pub num_bits: usize,

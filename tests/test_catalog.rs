@@ -1,8 +1,8 @@
 //! Test database catalog functionality
 
-use heed_core::EnvBuilder;
-use heed_core::db::{Database, DatabaseFlags};
-use heed_core::error::Result;
+use zerodb::EnvBuilder;
+use zerodb::db::{Database, DatabaseFlags};
+use zerodb::error::Result;
 
 fn main() -> Result<()> {
     // Create a temporary environment
@@ -106,7 +106,7 @@ fn main() -> Result<()> {
     println!("\n=== Test 6: List databases ===");
     {
         let txn = env2.begin_txn()?;
-        let databases = heed_core::catalog::Catalog::list_databases(&txn)?;
+        let databases = zerodb::catalog::Catalog::list_databases(&txn)?;
         
         println!("Found {} named databases:", databases.len());
         for (name, info) in databases {

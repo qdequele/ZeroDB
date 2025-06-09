@@ -1,8 +1,8 @@
 //! Debug environment initialization step by step
 
-use heed_core::{EnvBuilder};
-use heed_core::error::Result;
-use heed_core::page::PageFlags;
+use zerodb::{EnvBuilder};
+use zerodb::error::Result;
+use zerodb::page::PageFlags;
 use std::sync::Arc;
 
 fn main() -> Result<()> {
@@ -74,7 +74,7 @@ fn main() -> Result<()> {
     // Now try to use the main database
     println!("\n--- Testing Main Database ---");
     {
-        use heed_core::db::{Database, DatabaseFlags};
+        use zerodb::db::{Database, DatabaseFlags};
         
         let main_db: Database<Vec<u8>, Vec<u8>> = Database::open(&env, None, DatabaseFlags::empty())?;
         println!("✓ Opened main database");

@@ -1,7 +1,7 @@
-use heed_core::env::EnvBuilder;
-use heed_core::db::{Database, DatabaseFlags};
-use heed_core::io::{IoBackend, MmapBackend};
-use heed_core::meta::{MetaPage, META_PAGE_1, META_PAGE_2};
+use zerodb::env::EnvBuilder;
+use zerodb::db::{Database, DatabaseFlags};
+use zerodb::io::{IoBackend, MmapBackend};
+use zerodb::meta::{MetaPage, META_PAGE_1, META_PAGE_2};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -53,8 +53,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Check if it's a new database
         let is_new_db = match io.read_page(META_PAGE_1) {
             Ok(page) => {
-                let meta = unsafe { &*(page.as_ref() as *const heed_core::page::Page as *const MetaPage) };
-                meta.magic != heed_core::meta::MAGIC
+                let meta = unsafe { &*(page.as_ref() as *const zerodb::page::Page as *const MetaPage) };
+                meta.magic != zerodb::meta::MAGIC
             }
             Err(_) => true,
         };

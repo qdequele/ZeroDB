@@ -1,8 +1,8 @@
 //! Test the I/O backend implementation
 
-use heed_core::io::{IoBackend, MmapBackend};
-use heed_core::page::{Page, PageFlags};
-use heed_core::error::PageId;
+use zerodb::io::{IoBackend, MmapBackend};
+use zerodb::page::{Page, PageFlags};
+use zerodb::error::PageId;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a temporary file

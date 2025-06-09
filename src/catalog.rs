@@ -205,6 +205,7 @@ impl Catalog {
             overflow_pages,
             entries,
             root,
+            last_key_page: PageId(0), // TODO: Serialize this field in a future version
         })
     }
 }
@@ -223,6 +224,7 @@ mod tests {
             overflow_pages: 10,
             entries: 1000,
             root: PageId(42),
+            last_key_page: PageId(0),
         };
         
         let serialized = Catalog::serialize_db_info(&info);

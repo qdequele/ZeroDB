@@ -542,6 +542,7 @@ mod tests {
                 branch_pages: 0,
                 leaf_pages: 1,
                 overflow_pages: 0,
+                last_key_page: PageId(0),
             };
             
             // Save the freelist - not implemented yet

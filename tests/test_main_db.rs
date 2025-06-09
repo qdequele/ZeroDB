@@ -1,8 +1,8 @@
 //! Test the main database first
 
-use heed_core::{EnvBuilder};
-use heed_core::db::{Database, DatabaseFlags};
-use heed_core::error::Result;
+use zerodb::{EnvBuilder};
+use zerodb::db::{Database, DatabaseFlags};
+use zerodb::error::Result;
 
 fn main() -> Result<()> {
     println!("Testing main database functionality...\n");

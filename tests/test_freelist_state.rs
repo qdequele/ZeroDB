@@ -1,4 +1,4 @@
-use heed_core::{EnvBuilder, Database};
+use zerodb::{EnvBuilder, Database};
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _db: Database<Vec<u8>, Vec<u8>> = env.create_database(&mut txn, None)?;
         
         // Allocate pages
-        use heed_core::page::PageFlags;
+        use zerodb::page::PageFlags;
         for i in 0..3 {
             let (page_id, _) = txn.alloc_page(PageFlags::LEAF)?;
             println!("  Allocated page {}: {:?}", i, page_id);
@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut txn = env.begin_write_txn()?;
         
-        use heed_core::page::PageFlags;
+        use zerodb::page::PageFlags;
         let (page_id, _) = txn.alloc_page(PageFlags::LEAF)?;
         println!("  Allocated page: {:?}", page_id);
         
@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut txn = env2.begin_write_txn()?;
         
-        use heed_core::page::PageFlags;
+        use zerodb::page::PageFlags;
         let (page_id, _) = txn.alloc_page(PageFlags::LEAF)?;
         println!("  Allocated page after restart: {:?}", page_id);
         

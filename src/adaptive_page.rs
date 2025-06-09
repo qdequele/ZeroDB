@@ -5,11 +5,10 @@
 
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::time::Instant;
-use crate::error::{Result, Error};
 use crate::cache_aligned::CacheAlignedCounter;
 
 /// Supported page sizes
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PageSize {
     /// 4KB - Default, good for random access
     Small = 4096,

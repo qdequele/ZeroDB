@@ -1,7 +1,7 @@
 //! Test cursor operations thoroughly
 
-use heed_core::{EnvBuilder, Database};
-use heed_core::error::Result;
+use zerodb::{EnvBuilder, Database};
+use zerodb::error::Result;
 use std::sync::Arc;
 
 fn main() -> Result<()> {

@@ -1,7 +1,7 @@
 //! Debug test to understand what's happening
 
-use heed_core::env::EnvBuilder;
-use heed_core::db::Database;
+use zerodb::env::EnvBuilder;
+use zerodb::db::Database;
 use std::sync::Arc;
 use tempfile::TempDir;
 

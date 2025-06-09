@@ -1,4 +1,4 @@
-//! Automated profiling and optimization tool for heed-core
+//! Automated profiling and optimization tool for zerodb
 //!
 //! This tool runs various benchmarks, collects profiling data,
 //! and provides optimization suggestions based on the results.
@@ -23,7 +23,7 @@ struct HotFunction {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("heed-core Automated Profiling Tool");
+    println!("zerodb Automated Profiling Tool");
     println!("==================================\n");
     
     // Create output directory for profiles
@@ -100,17 +100,17 @@ fn analyze_flamegraph(_path: &str) -> Result<Vec<HotFunction>, Box<dyn std::erro
     // Simulate analysis results
     let mock_results = vec![
         HotFunction {
-            name: "heed_core::btree::BTree::search".to_string(),
+            name: "zerodb::btree::BTree::search".to_string(),
             percentage: 25.0,
             samples: 2500,
         },
         HotFunction {
-            name: "heed_core::page::Page::add_node".to_string(),
+            name: "zerodb::page::Page::add_node".to_string(),
             percentage: 15.0,
             samples: 1500,
         },
         HotFunction {
-            name: "heed_core::txn::Transaction::alloc_page".to_string(),
+            name: "zerodb::txn::Transaction::alloc_page".to_string(),
             percentage: 12.0,
             samples: 1200,
         },

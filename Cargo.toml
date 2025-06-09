@@ -1,5 +1,5 @@
 [package]
-name = "zero-db"
+name = "zerodb"
 version = "0.1.0"
 authors = ["qdequele <quentin@dequelen.me>"]
 description = "Pure Rust implementation of LMDB with modern performance optimizations"
@@ -51,7 +51,7 @@ proptest = "1.5"
 criterion = { version = "0.5", features = ["html_reports"] }
 quickcheck = "1.0"
 quickcheck_macros = "1.0"
-heed = { path = "../heed" }
+heed = { git = "https://github.com/meilisearch/heed", branch = "main" }
 rocksdb = "0.22"
 redb = "2.1"
 anyhow = "1.0"
@@ -65,6 +65,14 @@ flamegraph = "0.6"
 default = ["io_uring"]
 io_uring = ["dep:io-uring"]
 simd = [] # Will use portable SIMD when stable
+
+[[bench]]
+name = "bench_simple"
+harness = false
+
+[[bench]]
+name = "bench_all_dbs"
+harness = false
 
 [[bench]]
 name = "db_comparison"

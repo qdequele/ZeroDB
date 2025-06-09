@@ -1,8 +1,8 @@
 //! Debug branch page structure
 
-use heed_core::env::EnvBuilder;
-use heed_core::db::Database;
-use heed_core::branch::BranchHeader;
+use zerodb::env::EnvBuilder;
+use zerodb::db::Database;
+use zerodb::branch::BranchHeader;
 use std::sync::Arc;
 use tempfile::TempDir;
 

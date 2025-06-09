@@ -52,6 +52,7 @@ pub struct DirtyPages {
     /// Allocated pages that need to be written
     pub(crate) allocated: Vec<PageId>,
     /// Pages marked for COW but not yet copied (lazy COW)
+    #[allow(dead_code)]
     pub(crate) cow_pending: HashMap<PageId, PageId>, // old_id -> new_id
 }
 
@@ -85,7 +86,7 @@ impl DirtyPages {
 /// Transaction data shared between read and write modes
 pub(crate) struct TxnData<'env> {
     /// Reference to environment
-    env: &'env Environment<state::Open>,
+    pub(crate) env: &'env Environment<state::Open>,
     /// Transaction ID
     id: TransactionId,
     /// Database info cache
@@ -202,7 +203,7 @@ impl<'env> Transaction<'env, Write> {
         
         // Initialize segregated freelist if enabled
         let segregated_freelist = if env.config().use_segregated_freelist {
-            let mut seg_list = SegregatedFreeList::new();
+            let seg_list = SegregatedFreeList::new();
             // Migrate existing free pages from simple freelist
             // This will be populated as pages are freed
             Some(seg_list)
@@ -485,7 +486,7 @@ impl<'env> Transaction<'env, Write> {
         if let ModeData::Write { ref dirty, .. } = self.mode_data {
             if dirty.pages.contains_key(&page_id) {
                 if let ModeData::Write { ref mut dirty, .. } = self.mode_data {
-                    return Ok((page_id, dirty.pages.get_mut(&page_id).unwrap()));
+                    return Ok((page_id, dirty.pages.get_mut(&page_id).unwrap().as_mut()));
                 }
             }
         }
@@ -636,7 +637,7 @@ impl<'env> Transaction<'env, Write> {
             dirty.mark_dirty(page_id, page);
             dirty.allocated.push(page_id);
             
-            Ok((page_id, dirty.pages.get_mut(&page_id).unwrap()))
+            Ok((page_id, dirty.pages.get_mut(&page_id).unwrap().as_mut()))
         } else {
             unreachable!("Write transaction must have write mode data");
         }
@@ -658,13 +659,14 @@ impl<'env> Transaction<'env, Write> {
         }
     }
     
+    /* TODO: Fix borrow checker issues with returning multiple mutable references
     /// Allocate multiple contiguous pages (useful for overflow pages)
     pub fn alloc_pages(&mut self, count: usize, flags: PageFlags) -> Result<Vec<(PageId, &mut Page)>> {
         if count == 0 {
             return Ok(Vec::new());
         }
         
-        if let ModeData::Write { ref mut dirty, ref mut segregated_freelist, ref mut next_pgno, .. } = self.mode_data {
+        if let ModeData::Write { ref mut dirty, ref mut freelist, ref mut segregated_freelist, ref mut next_pgno, .. } = self.mode_data {
             let mut pages = Vec::with_capacity(count);
             
             // Try to allocate contiguous pages from segregated freelist
@@ -673,22 +675,63 @@ impl<'env> Transaction<'env, Write> {
                     // Try to get contiguous pages
                     if let Some(start_page_id) = seg_list.allocate(count) {
                         // We got contiguous pages
-                        for i in 0..count {
-                            let page_id = PageId(start_page_id.0 + i as u64);
+                        let page_ids: Vec<PageId> = (0..count)
+                            .map(|i| PageId(start_page_id.0 + i as u64))
+                            .collect();
+                        
+                        // First, allocate all pages
+                        for &page_id in &page_ids {
                             let page = Page::new(page_id, flags | PageFlags::DIRTY);
                             dirty.mark_dirty(page_id, page);
                             dirty.allocated.push(page_id);
-                            pages.push((page_id, dirty.pages.get_mut(&page_id).unwrap()));
                         }
+                        
+                        // Then collect mutable references
+                        for &page_id in &page_ids {
+                            pages.push((page_id, dirty.pages.get_mut(&page_id).unwrap().as_mut()));
+                        }
+                        
                         return Ok(pages);
                     }
                 }
             }
             
             // Fall back to allocating pages one by one
+            // We need to collect page IDs first, then get references
+            let mut allocated_ids = Vec::new();
+            
             for _ in 0..count {
-                let result = self.alloc_page(flags)?;
-                pages.push(result);
+                // Allocate page ID
+                let page_id = if let Some(seg_list) = segregated_freelist {
+                    if let Some(free_page_id) = seg_list.allocate(1) {
+                        free_page_id
+                    } else {
+                        let inner = self.data.env.inner();
+                        let id = PageId(inner.next_page_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+                        *next_pgno = PageId(id.0 + 1);
+                        id
+                    }
+                } else {
+                    if let Some(free_page_id) = freelist.alloc_page() {
+                        free_page_id
+                    } else {
+                        let inner = self.data.env.inner();
+                        let id = PageId(inner.next_page_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
+                        *next_pgno = PageId(id.0 + 1);
+                        id
+                    }
+                };
+                
+                // Create and mark page as dirty
+                let page = Page::new(page_id, flags | PageFlags::DIRTY);
+                dirty.mark_dirty(page_id, page);
+                dirty.allocated.push(page_id);
+                allocated_ids.push(page_id);
+            }
+            
+            // Now collect the mutable references
+            for page_id in allocated_ids {
+                pages.push((page_id, dirty.pages.get_mut(&page_id).unwrap().as_mut()));
             }
             
             Ok(pages)
@@ -696,6 +739,7 @@ impl<'env> Transaction<'env, Write> {
             unreachable!("Write transaction must have write mode data");
         }
     }
+    */
     
     /// Free multiple contiguous pages
     pub fn free_pages(&mut self, start_page_id: PageId, count: usize) -> Result<()> {
@@ -744,7 +788,7 @@ impl<'env> Transaction<'env, Write> {
             dirty.mark_dirty(page_id, page);
             dirty.allocated.push(page_id);
             
-            Ok((page_id, dirty.pages.get_mut(&page_id).unwrap()))
+            Ok((page_id, dirty.pages.get_mut(&page_id).unwrap().as_mut()))
         } else {
             unreachable!("Write transaction must have write mode data");
         }

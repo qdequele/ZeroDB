@@ -1,9 +1,9 @@
 //! Debug cursor navigation
 
-use heed_core::env::EnvBuilder;
-use heed_core::db::Database;
-use heed_core::page::PageFlags;
-use heed_core::branch::BranchHeader;
+use zerodb::env::EnvBuilder;
+use zerodb::db::Database;
+use zerodb::page::PageFlags;
+use zerodb::branch::BranchHeader;
 use std::sync::Arc;
 use tempfile::TempDir;
 

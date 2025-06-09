@@ -1,14 +1,14 @@
-//! Correctness tests comparing heed-core behavior with LMDB
+//! Correctness tests comparing zerodb behavior with LMDB
 //! 
-//! These tests ensure that heed-core produces the same results as LMDB
+//! These tests ensure that zerodb produces the same results as LMDB
 //! for various database operations.
 
 use tempfile::TempDir;
 use std::sync::Arc;
 
-// Import both heed (FFI LMDB) and heed-core
+// Import both heed (FFI LMDB) and zerodb
 use heed::{EnvOpenOptions as LmdbEnvOptions, Database as LmdbDatabase, types::{Str}};
-use heed_core::{EnvBuilder as CoreEnvBuilder, Database as CoreDatabase};
+use zerodb::{EnvBuilder as CoreEnvBuilder, Database as CoreDatabase};
 
 #[test]
 fn test_basic_operations_match() {
@@ -62,7 +62,7 @@ fn test_basic_operations_match() {
         results
     };
     
-    // heed-core operations
+    // zerodb operations
     let core_result = {
         let env = Arc::new(CoreEnvBuilder::new()
             .map_size(10 * 1024 * 1024)
@@ -95,7 +95,7 @@ fn test_basic_operations_match() {
     };
     
     // Compare results
-    assert_eq!(lmdb_result, core_result, "LMDB and heed-core should produce identical results");
+    assert_eq!(lmdb_result, core_result, "LMDB and zerodb should produce identical results");
 }
 
 #[test]
@@ -142,7 +142,7 @@ fn test_cursor_iteration_matches() {
         results
     };
     
-    // heed-core cursor iteration
+    // zerodb cursor iteration
     let core_result = {
         let env = Arc::new(CoreEnvBuilder::new()
             .map_size(10 * 1024 * 1024)
@@ -231,7 +231,7 @@ fn test_delete_operations_match() {
         results
     };
     
-    // heed-core delete operations
+    // zerodb delete operations
     let core_result = {
         let env = Arc::new(CoreEnvBuilder::new()
             .map_size(10 * 1024 * 1024)
@@ -305,7 +305,7 @@ fn test_multiple_databases_match() {
         (val1.to_string(), val2.to_string())
     };
     
-    // heed-core multiple databases
+    // zerodb multiple databases
     let core_results = {
         let env = Arc::new(CoreEnvBuilder::new()
             .map_size(10 * 1024 * 1024)

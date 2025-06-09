@@ -1,5 +1,5 @@
-use heed_core::env::EnvBuilder;
-use heed_core::db::{Database, DatabaseFlags};
+use zerodb::env::EnvBuilder;
+use zerodb::db::{Database, DatabaseFlags};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -40,25 +40,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n\nTest 2: Comparing serialization formats");
         
         // Create a DbInfo structure
-        let test_info = heed_core::meta::DbInfo {
+        let test_info = zerodb::meta::DbInfo {
             flags: 0x42,
             depth: 3,
             branch_pages: 100,
             leaf_pages: 500,
             overflow_pages: 10,
             entries: 1000,
-            root: heed_core::error::PageId(42),
+            root: zerodb::error::PageId(42),
+            last_key_page: zerodb::error::PageId(0),
         };
         
         // Serialize using Catalog method
-        let catalog_bytes = heed_core::catalog::Catalog::serialize_db_info(&test_info);
+        let catalog_bytes = zerodb::catalog::Catalog::serialize_db_info(&test_info);
         println!("Catalog serialization: {} bytes", catalog_bytes.len());
         
         // Serialize using raw memory copy (as done in env.create_database)
         let raw_bytes = unsafe {
             std::slice::from_raw_parts(
                 &test_info as *const _ as *const u8,
-                std::mem::size_of::<heed_core::meta::DbInfo>()
+                std::mem::size_of::<zerodb::meta::DbInfo>()
             )
         };
         println!("Raw memory serialization: {} bytes", raw_bytes.len());
@@ -75,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         
         // Try to deserialize raw bytes with Catalog method
-        match heed_core::catalog::Catalog::deserialize_db_info(raw_bytes) {
+        match zerodb::catalog::Catalog::deserialize_db_info(raw_bytes) {
             Ok(_) => println!("✓ Raw bytes can be deserialized by Catalog"),
             Err(e) => println!("✗ Raw bytes CANNOT be deserialized by Catalog: {:?}", e),
         }

@@ -5,12 +5,7 @@
 
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
 use io_uring::{IoUring, opcode, types, squeue, cqueue};
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
-use std::os::unix::io::AsRawFd;
 use crate::error::{Result, Error, PageId};
-use crate::page::{Page, PAGE_SIZE};
-use crate::cache_aligned::CacheAlignedStats;
 
 /// Configuration for io_uring operations
 pub struct IoUringConfig {
@@ -55,7 +50,7 @@ pub struct ParallelIoUringBackend {
 }
 
 /// Information about an in-flight operation
-#[derive(Debug)]
+#[allow(dead_code)]
 struct InflightOp {
     /// Type of operation
     op_type: OpType,
@@ -65,7 +60,18 @@ struct InflightOp {
     callback: Option<Box<dyn FnOnce(Result<()>) + Send>>,
 }
 
+impl std::fmt::Debug for InflightOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InflightOp")
+            .field("op_type", &self.op_type)
+            .field("page_data", &self.page_data.as_ref().map(|v| v.len()))
+            .field("callback", &self.callback.is_some())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 enum OpType {
     Read(PageId),
     Write(PageId),
@@ -345,10 +351,12 @@ impl ParallelIoUringBackend {
 
 // Fallback for non-Linux platforms
 #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
+/// Parallel I/O uring backend implementation (placeholder)
 pub struct ParallelIoUringBackend;
 
 #[cfg(not(all(target_os = "linux", feature = "io_uring")))]
 impl ParallelIoUringBackend {
+    /// Create a new parallel I/O uring backend (not supported on this platform)
     pub fn new(_file: std::fs::File, _config: IoUringConfig) -> Result<Self> {
         Err(Error::Custom("io_uring not available on this platform".into()))
     }

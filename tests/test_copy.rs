@@ -1,8 +1,8 @@
 //! Test environment copy/backup functionality
 
-use heed_core::{EnvBuilder, Database};
-use heed_core::copy::{copy_to_file, copy_with_callback, CopyOptions, BackupCallback};
-use heed_core::error::Result;
+use zerodb::{EnvBuilder, Database};
+use zerodb::copy::{copy_to_file, copy_with_callback, CopyOptions, BackupCallback};
+use zerodb::error::Result;
 use std::sync::Arc;
 
 struct ProgressCallback {

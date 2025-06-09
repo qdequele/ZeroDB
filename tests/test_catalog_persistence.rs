@@ -1,5 +1,5 @@
-use heed_core::env::EnvBuilder;
-use heed_core::db::{Database, DatabaseFlags};
+use zerodb::env::EnvBuilder;
+use zerodb::db::{Database, DatabaseFlags};
 use std::sync::Arc;
 use tempfile::TempDir;
 

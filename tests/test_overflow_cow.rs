@@ -1,8 +1,8 @@
 //! Test for overflow page COW issue
 
-use heed_core::env::EnvBuilder;
-use heed_core::db::Database;
-use heed_core::page::MAX_VALUE_SIZE;
+use zerodb::env::EnvBuilder;
+use zerodb::db::Database;
+use zerodb::page::MAX_VALUE_SIZE;
 use std::sync::Arc;
 use tempfile::TempDir;
 

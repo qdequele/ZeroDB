@@ -149,6 +149,7 @@ impl NumaTopology {
 /// NUMA-aware page allocator
 pub struct NumaPageAllocator {
     /// NUMA topology
+    #[allow(dead_code)]
     topology: Arc<NumaTopology>,
     /// Per-node page pools
     node_pools: RwLock<HashMap<NumaNode, Vec<Box<Page>>>>,
@@ -284,6 +285,7 @@ pub struct NumaAffinity {
     /// Preferred NUMA node for this thread
     preferred_node: NumaNode,
     /// CPU affinity mask
+    #[allow(dead_code)]
     cpu_mask: Vec<usize>,
 }
 
@@ -291,7 +293,7 @@ impl NumaAffinity {
     /// Create affinity for a specific NUMA node
     pub fn for_node(node: NumaNode, topology: &NumaTopology) -> Result<Self> {
         let cpu_mask = topology.node_to_cpus.get(&node)
-            .ok_or_else(|| Error::Custom(format!("Invalid NUMA node: {:?}", node)))?
+            .ok_or_else(|| Error::Custom(format!("Invalid NUMA node: {:?}", node).into()))?
             .clone();
         
         Ok(Self {
@@ -342,6 +344,7 @@ pub struct NumaMemoryRegion {
     /// Size in bytes
     size: usize,
     /// NUMA node
+    #[allow(dead_code)]
     node: NumaNode,
 }
 

@@ -1,6 +1,6 @@
 //! NUMA-aware allocation demonstration
 
-use heed_core::{EnvBuilder, Result};
+use zerodb::{EnvBuilder, Result};
 use std::time::Instant;
 use std::thread;
 
@@ -9,7 +9,7 @@ fn main() -> Result<()> {
     println!("==========================\n");
     
     // Detect NUMA topology
-    let topology = heed_core::numa::NumaTopology::detect()?;
+    let topology = zerodb::numa::NumaTopology::detect()?;
     println!("System NUMA Configuration:");
     println!("  NUMA nodes: {}", topology.num_nodes);
     println!("  CPU to node mapping: {:?}", topology.cpu_to_node);
@@ -44,7 +44,7 @@ fn main() -> Result<()> {
     {
         let mut txn = env_regular.begin_write_txn()?;
         for i in 0..page_count {
-            let _ = txn.alloc_page(heed_core::page::PageFlags::LEAF)?;
+            let _ = txn.alloc_page(zerodb::page::PageFlags::LEAF)?;
             if i % 1000 == 0 {
                 print!(".");
                 use std::io::Write;
@@ -62,7 +62,7 @@ fn main() -> Result<()> {
     {
         let mut txn = env_numa.begin_write_txn()?;
         for i in 0..page_count {
-            let _ = txn.alloc_page(heed_core::page::PageFlags::LEAF)?;
+            let _ = txn.alloc_page(zerodb::page::PageFlags::LEAF)?;
             if i % 1000 == 0 {
                 print!(".");
                 use std::io::Write;
@@ -88,12 +88,12 @@ fn main() -> Result<()> {
         let start = Instant::now();
         
         let handles: Vec<_> = (0..thread_count)
-            .map(|t| {
+            .map(|_| {
                 let env = env_regular.clone();
                 thread::spawn(move || {
                     let mut txn = env.begin_write_txn().unwrap();
                     for _ in 0..pages_per_thread {
-                        let _ = txn.alloc_page(heed_core::page::PageFlags::LEAF).unwrap();
+                        let _ = txn.alloc_page(zerodb::page::PageFlags::LEAF).unwrap();
                     }
                     txn.commit().unwrap();
                 })
@@ -117,14 +117,14 @@ fn main() -> Result<()> {
                 let topology = topology.clone();
                 thread::spawn(move || {
                     // Set thread affinity to distribute across NUMA nodes
-                    let node = heed_core::numa::NumaNode((t % topology.num_nodes) as u32);
-                    if let Ok(affinity) = heed_core::numa::NumaAffinity::for_node(node, &topology) {
+                    let node = zerodb::numa::NumaNode((t % topology.num_nodes) as u32);
+                    if let Ok(affinity) = zerodb::numa::NumaAffinity::for_node(node, &topology) {
                         let _ = affinity.apply();
                     }
                     
                     let mut txn = env.begin_write_txn().unwrap();
                     for _ in 0..pages_per_thread {
-                        let _ = txn.alloc_page(heed_core::page::PageFlags::LEAF).unwrap();
+                        let _ = txn.alloc_page(zerodb::page::PageFlags::LEAF).unwrap();
                     }
                     txn.commit().unwrap();
                 })

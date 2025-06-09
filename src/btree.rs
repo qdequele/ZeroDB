@@ -80,23 +80,12 @@ impl<C: Comparator> BTree<C> {
         }
         
         // Fall back to regular insert
-        let result = Self::insert(txn, db_info.root, key, value)?;
-        match result {
-            InsertResult::Inserted => {
-                db_info.entries += 1;
-                Ok(())
-            }
-            InsertResult::Updated(_) => Ok(()),
-            InsertResult::Split { median_key, right_page } => {
-                // Root was split, create new root
-                let new_root = Self::create_new_root(txn, db_info.root, median_key, right_page)?;
-                db_info.root = new_root;
-                db_info.depth += 1;
-                db_info.branch_pages += 1;
-                db_info.entries += 1;
-                Ok(())
-            }
-        }
+        let mut root = db_info.root;
+        let _result = Self::insert(txn, &mut root, db_info, key, value)?;
+        db_info.root = root;
+        
+        // The insert function already handles updating entries count and root splitting
+        Ok(())
     }
     
     /// Split a leaf page optimized for append mode
@@ -125,11 +114,13 @@ impl<C: Comparator> BTree<C> {
             right_nodes.push((node.key()?.to_vec(), node.value()?.into_owned()));
         }
         
+        // Store original next page before allocation
+        let original_next = page.header.next_pgno;
+        
         // Allocate new right page
         let (right_page_id, right_page) = txn.alloc_page(PageFlags::LEAF)?;
         
         // Update leaf chaining
-        let original_next = page.header.next_pgno;
         right_page.header.prev_pgno = page_id.0;
         right_page.header.next_pgno = original_next;
         

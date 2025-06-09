@@ -14,7 +14,7 @@ DASHBOARD_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>heed-core Performance Dashboard</title>
+    <title>zerodb Performance Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body {
@@ -94,7 +94,7 @@ DASHBOARD_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <h1>heed-core Performance Dashboard</h1>
+        <h1>zerodb Performance Dashboard</h1>
         <p>Last updated: {timestamp}</p>
         
         <div class="metric-grid">

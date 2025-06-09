@@ -1,6 +1,6 @@
-//! Simple example of using heed-core
+//! Simple example of using zerodb
 
-use heed_core::{EnvBuilder, Result};
+use zerodb::{EnvBuilder, Result};
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -20,7 +20,7 @@ fn main() -> Result<()> {
     // Create a database
     let db = {
         let mut txn = env.begin_write_txn()?;
-        let db: heed_core::db::Database<String, String> = env.create_database(&mut txn, None)?;
+        let db: zerodb::db::Database<String, String> = env.create_database(&mut txn, None)?;
         txn.commit()?;
         println!("Database created");
         db

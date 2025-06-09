@@ -1,4 +1,4 @@
-//! Quick benchmark comparison between heed-core, LMDB FFI, RocksDB, and redb
+//! Quick benchmark comparison between zerodb, LMDB FFI, RocksDB, and redb
 //! 
 //! This provides a performance comparison across all major embedded databases
 
@@ -28,19 +28,21 @@ fn bench_sequential_writes() {
         })
         .collect();
     
-    // Benchmark heed-core
+    // Benchmark zerodb
     {
         let dir = TempDir::new().unwrap();
         let env = Arc::new(
-            heed_core::EnvBuilder::new()
+            zerodb::env::EnvBuilder::new()
                 .map_size(100 * 1024 * 1024)
                 .open(dir.path())
                 .unwrap()
         );
         
+        // Open database first
+        let db = zerodb::db::Database::<Vec<u8>, Vec<u8>>::open(&env, None, zerodb::db::DatabaseFlags::CREATE).unwrap();
+        
         let start = Instant::now();
         let mut txn = env.begin_write_txn().unwrap();
-        let db: heed_core::Database<Vec<u8>, Vec<u8>> = env.create_database(&mut txn, None).unwrap();
         
         for (key, value) in &data {
             db.put(&mut txn, key.clone(), value.clone()).unwrap();
@@ -49,7 +51,7 @@ fn bench_sequential_writes() {
         txn.commit().unwrap();
         let duration = start.elapsed();
         
-        println!("heed-core:  {} ({:.0} ops/sec)", 
+        println!("zerodb:  {} ({:.0} ops/sec)", 
             format_duration(duration),
             10_000.0 / duration.as_secs_f64()
         );
@@ -146,19 +148,21 @@ fn bench_random_reads() {
         .map(|i| (i * 7919) % 10_000) // Pseudo-random but deterministic
         .collect();
     
-    // Setup and benchmark heed-core
+    // Setup and benchmark zerodb
     {
         let dir = TempDir::new().unwrap();
         let env = Arc::new(
-            heed_core::EnvBuilder::new()
+            zerodb::env::EnvBuilder::new()
                 .map_size(100 * 1024 * 1024)
                 .open(dir.path())
                 .unwrap()
         );
         
+        // Open database first
+        let db = zerodb::db::Database::<Vec<u8>, Vec<u8>>::open(&env, None, zerodb::db::DatabaseFlags::CREATE).unwrap();
+        
         // Populate
         let mut txn = env.begin_write_txn().unwrap();
-        let db: heed_core::Database<Vec<u8>, Vec<u8>> = env.create_database(&mut txn, None).unwrap();
         
         for (i, key) in all_keys.iter().enumerate() {
             let value = vec![i as u8; 100];
@@ -169,8 +173,6 @@ fn bench_random_reads() {
         
         // Benchmark reads
         let txn = env.begin_txn().unwrap();
-        let db: heed_core::Database<Vec<u8>, Vec<u8>> = 
-            env.open_database(&txn, None).unwrap();
         
         let start = Instant::now();
         let mut found = 0;
@@ -182,7 +184,7 @@ fn bench_random_reads() {
         }
         
         let duration = start.elapsed();
-        println!("heed-core:  {} ({:.0} ops/sec, {} found)", 
+        println!("zerodb:  {} ({:.0} ops/sec, {} found)", 
             format_duration(duration),
             1_000.0 / duration.as_secs_f64(),
             found
@@ -311,7 +313,7 @@ fn bench_random_reads() {
 fn main() {
     println!("Embedded Database Performance Comparison");
     println!("========================================");
-    println!("Comparing: heed-core, LMDB FFI, RocksDB, redb");
+    println!("Comparing: zerodb, LMDB FFI, RocksDB, redb");
     
     bench_sequential_writes();
     bench_random_reads();

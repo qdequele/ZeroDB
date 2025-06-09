@@ -1,6 +1,6 @@
 //! Tests for DUPSORT functionality
 
-use heed_core::{EnvBuilder, Database, DatabaseFlags};
+use zerodb::{EnvBuilder, Database, DatabaseFlags};
 use tempfile::TempDir;
 use std::sync::Arc;
 

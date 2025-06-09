@@ -1,7 +1,7 @@
 //! Test how many entries fit in a page
 
-use heed_core::page::{Page, PageFlags, PageHeader, PAGE_SIZE};
-use heed_core::error::PageId;
+use zerodb::page::{Page, PageFlags, PageHeader, PAGE_SIZE};
+use zerodb::error::PageId;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing page capacity...");

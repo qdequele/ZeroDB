@@ -1,10 +1,10 @@
 //! Debug B+Tree rebalancing
 
-use heed_core::env::EnvBuilder;
-use heed_core::btree::BTree;
-use heed_core::meta::DbInfo;
-use heed_core::error::PageId;
-use heed_core::comparator::LexicographicComparator;
+use zerodb::env::EnvBuilder;
+use zerodb::btree::BTree;
+use zerodb::meta::DbInfo;
+use zerodb::error::PageId;
+use zerodb::comparator::LexicographicComparator;
 use std::sync::Arc;
 use tempfile::TempDir;
 

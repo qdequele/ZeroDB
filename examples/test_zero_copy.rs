@@ -2,8 +2,8 @@
 
 use std::time::Instant;
 use std::sync::Arc;
-use heed_core::EnvBuilder;
-use heed_core::db::Database;
+use zerodb::EnvBuilder;
+use zerodb::db::Database;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create temporary directory

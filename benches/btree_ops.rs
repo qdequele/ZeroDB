@@ -4,7 +4,7 @@
 //! to identify performance bottlenecks.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use heed_core::{EnvBuilder, Database};
+use zerodb::{env::EnvBuilder, db::Database};
 use tempfile::TempDir;
 use std::sync::Arc;
 use pprof::criterion::{PProfProfiler, Output};

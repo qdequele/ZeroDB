@@ -1,4 +1,4 @@
-use heed_core::{EnvBuilder, Database};
+use zerodb::{EnvBuilder, Database};
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

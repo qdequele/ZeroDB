@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use parking_lot::Mutex;
 
 use crate::error::{Error, Result, TransactionId, PageId};
@@ -20,6 +20,7 @@ pub(crate) struct EnvConfig {
     /// Use segregated freelist for better allocation performance
     pub use_segregated_freelist: bool,
     /// Use NUMA-aware allocation
+    #[allow(dead_code)]
     pub use_numa: bool,
 }
 
@@ -78,6 +79,7 @@ pub(crate) struct PagePool {
     /// Pool of recycled pages
     pages: Mutex<Vec<Box<Page>>>,
     /// Maximum pages to keep in pool
+    #[allow(dead_code)]
     max_pages: usize,
 }
 
@@ -105,6 +107,7 @@ impl PagePool {
     }
     
     /// Return a page to the pool
+    #[allow(dead_code)]
     pub fn put(&self, page: Box<Page>) {
         let mut pool = self.pages.lock();
         if pool.len() < self.max_pages {
@@ -342,6 +345,8 @@ impl EnvBuilder {
                 checksum_mode: self.checksum_mode,
                 next_page_id: AtomicU64::new(0),
                 page_pool: PagePool::new(128), // Keep up to 128 pages in pool
+                use_segregated_freelist: self.use_segregated_freelist,
+                numa_allocator: None, // Will be initialized later if needed
             });
             
             meta_info = inner.meta()?;
@@ -448,6 +453,7 @@ impl Environment<Open> {
     
     /// Get inner reference (for testing)
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn inner_test(&self) -> &Arc<EnvInner> {
         self.inner.as_ref().unwrap()
     }

@@ -94,6 +94,7 @@ impl DupSort {
                         overflow_pages: 0,
                         entries: 0,
                         root: sub_root,
+                        last_key_page: PageId(0),
                     };
                     
                     // Insert both values into sub-database
@@ -134,6 +135,7 @@ impl DupSort {
                         overflow_pages: 0,
                         entries: 0,
                         root: sub_root,
+                        last_key_page: PageId(0),
                     };
                     
                     // Insert both the existing value and new value
@@ -500,6 +502,7 @@ mod tests {
             overflow_pages: 0,
             entries: 0,
             root: PageId(3), // Assuming main db root
+            last_key_page: PageId(0),
         };
         
         // Insert multiple values for same key
@@ -541,6 +544,7 @@ mod tests {
             overflow_pages: 0,
             entries: 0,
             root: PageId(3),
+            last_key_page: PageId(0),
         };
         
         // Insert values

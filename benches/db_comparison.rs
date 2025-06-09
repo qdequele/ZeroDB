@@ -1,13 +1,13 @@
 //! Benchmarks comparing various embedded databases
 //!
 //! This benchmark suite compares:
-//! - heed-core (pure Rust LMDB)
+//! - zerodb (pure Rust LMDB)
 //! - heed (LMDB FFI)
 //! - RocksDB
 //! - redb
 //! - sled (optional)
 //!
-//! Note: heed-core currently has limitations with larger datasets due to 
+//! Note: zerodb currently has limitations with larger datasets due to 
 //! page allocation constraints. This benchmark uses smaller dataset sizes
 //! (up to 1000 items with 50-200 byte values) to work within these limits.
 
@@ -28,27 +28,22 @@ trait Database: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
-// heed-core implementation
+// zerodb implementation
 struct HeedCoreDb {
-    env: Arc<heed_core::env::Environment<heed_core::env::state::Open>>,
-    db: heed_core::db::Database<Vec<u8>, Vec<u8>>,
+    env: Arc<zerodb::env::Environment<zerodb::env::state::Open>>,
+    db: zerodb::db::Database<Vec<u8>, Vec<u8>>,
 }
 
 impl HeedCoreDb {
     fn new(path: &std::path::Path) -> anyhow::Result<Self> {
         let env = Arc::new(
-            heed_core::env::EnvBuilder::new()
+            zerodb::env::EnvBuilder::new()
                 .map_size(10 * 1024 * 1024 * 1024) // 10GB - much larger
                 .open(path)?
         );
         
         // Create the database once during initialization
-        let db = {
-            let mut txn = env.begin_write_txn()?;
-            let db: heed_core::db::Database<Vec<u8>, Vec<u8>> = env.create_database(&mut txn, None)?;
-            txn.commit()?;
-            db
-        };
+        let db = zerodb::db::Database::<Vec<u8>, Vec<u8>>::open(&env, None, zerodb::db::DatabaseFlags::CREATE)?;
         
         Ok(Self { env, db })
     }
@@ -106,7 +101,7 @@ impl Database for HeedCoreDb {
     }
     
     fn name(&self) -> &'static str {
-        "heed-core"
+        "zerodb"
     }
 }
 
@@ -443,12 +438,12 @@ fn generate_data(size: usize, seed: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
 fn bench_sequential_writes(c: &mut Criterion) {
     let mut group = c.benchmark_group("sequential_writes");
     
-    // Note: heed-core currently has limitations with larger datasets
+    // Note: zerodb currently has limitations with larger datasets
     // due to page allocation constraints. This will be addressed in future updates.
     for size in [100, 500, 1000] {
         let data = generate_data(size, 42);
         
-        for db_name in ["heed-core", "heed", "rocksdb", "redb"] {
+        for db_name in ["zerodb", "heed", "rocksdb", "redb"] {
             group.bench_with_input(
                 BenchmarkId::new(db_name, size),
                 &data,
@@ -460,7 +455,7 @@ fn bench_sequential_writes(c: &mut Criterion) {
                             // Setup: create a fresh database for each iteration
                             let temp_dir = TempDir::new().unwrap();
                             let db: Box<dyn Database> = match db_name {
-                                "heed-core" => Box::new(HeedCoreDb::new(temp_dir.path()).unwrap()),
+                                "zerodb" => Box::new(HeedCoreDb::new(temp_dir.path()).unwrap()),
                                 "heed" => Box::new(HeedDb::new(temp_dir.path()).unwrap()),
                                 "rocksdb" => Box::new(RocksDb::new(temp_dir.path()).unwrap()),
                                 "redb" => Box::new(RedbDb::new(temp_dir.path()).unwrap()),
@@ -503,10 +498,10 @@ fn bench_random_reads(c: &mut Criterion) {
             })
             .collect();
         
-        for db_name in ["heed-core", "heed", "rocksdb", "redb"] {
+        for db_name in ["zerodb", "heed", "rocksdb", "redb"] {
             let temp_dir = TempDir::new().unwrap();
             let db: Box<dyn Database> = match db_name {
-                "heed-core" => Box::new(HeedCoreDb::new(temp_dir.path()).unwrap()),
+                "zerodb" => Box::new(HeedCoreDb::new(temp_dir.path()).unwrap()),
                 "heed" => Box::new(HeedDb::new(temp_dir.path()).unwrap()),
                 "rocksdb" => Box::new(RocksDb::new(temp_dir.path()).unwrap()),
                 "redb" => Box::new(RedbDb::new(temp_dir.path()).unwrap()),
@@ -537,10 +532,10 @@ fn bench_full_scan(c: &mut Criterion) {
     for size in [100, 1000] {
         let data = generate_data(size, 42);
         
-        for db_name in ["heed-core", "heed", "rocksdb", "redb"] {
+        for db_name in ["zerodb", "heed", "rocksdb", "redb"] {
             let temp_dir = TempDir::new().unwrap();
             let db: Box<dyn Database> = match db_name {
-                "heed-core" => Box::new(HeedCoreDb::new(temp_dir.path()).unwrap()),
+                "zerodb" => Box::new(HeedCoreDb::new(temp_dir.path()).unwrap()),
                 "heed" => Box::new(HeedDb::new(temp_dir.path()).unwrap()),
                 "rocksdb" => Box::new(RocksDb::new(temp_dir.path()).unwrap()),
                 "redb" => Box::new(RedbDb::new(temp_dir.path()).unwrap()),
@@ -586,7 +581,7 @@ fn bench_random_writes(c: &mut Criterion) {
             data.push((key, value));
         }
         
-        // Skip heed-core for random writes due to page allocation limitations
+        // Skip zerodb for random writes due to page allocation limitations
         // Random insertion patterns cause more page splits which exceed current limits
         for db_name in ["heed", "rocksdb", "redb"] {
             group.bench_with_input(
@@ -598,7 +593,7 @@ fn bench_random_writes(c: &mut Criterion) {
                             // Setup: create a fresh database for each iteration
                             let temp_dir = TempDir::new().unwrap();
                             let db: Box<dyn Database> = match db_name {
-                                "heed-core" => Box::new(HeedCoreDb::new(temp_dir.path()).unwrap()),
+                                "zerodb" => Box::new(HeedCoreDb::new(temp_dir.path()).unwrap()),
                                 "heed" => Box::new(HeedDb::new(temp_dir.path()).unwrap()),
                                 "rocksdb" => Box::new(RocksDb::new(temp_dir.path()).unwrap()),
                                 "redb" => Box::new(RedbDb::new(temp_dir.path()).unwrap()),

@@ -1,6 +1,6 @@
 //! Demo of segregated freelist performance improvements
 
-use heed_core::{EnvBuilder, Result};
+use zerodb::{EnvBuilder, Result};
 use std::time::Instant;
 
 fn main() -> Result<()> {
@@ -28,10 +28,9 @@ fn main() -> Result<()> {
     
     // Create a fragmentation pattern by allocating and freeing pages
     // This simulates real-world usage where pages are allocated and freed
-    // in different sizes, creating fragmentation
+    // creating fragmentation
     
-    let pattern_sizes = vec![1, 3, 5, 2, 8, 1, 4, 16, 1, 2, 32, 1];
-    let iterations = 100;
+    let iterations = 1000;
     
     // Test simple freelist
     println!("\nSimple freelist allocation pattern:");
@@ -40,25 +39,23 @@ fn main() -> Result<()> {
         let mut txn = env_simple.begin_write_txn()?;
         let mut allocated_pages = Vec::new();
         
-        // Allocate pages in pattern
-        for _ in 0..iterations {
-            for &size in &pattern_sizes {
-                let pages = txn.alloc_pages(size, heed_core::page::PageFlags::LEAF)?;
-                allocated_pages.push((pages[0].0, size));
-            }
-        }
-        
-        // Free every other allocation to create fragmentation
-        for (i, (page_id, size)) in allocated_pages.iter().enumerate() {
-            if i % 2 == 0 {
-                txn.free_pages(*page_id, *size)?;
+        // Allocate many pages
+        for i in 0..iterations {
+            let (page_id, _page) = txn.alloc_page(zerodb::page::PageFlags::LEAF)?;
+            allocated_pages.push(page_id);
+            
+            // Free every third page to create fragmentation
+            if i > 0 && i % 3 == 0 {
+                if let Some(old_page) = allocated_pages.get(i - 3) {
+                    txn.free_page(*old_page)?;
+                }
             }
         }
         
         txn.commit()?;
     }
-    let simple_fragmentation_time = start.elapsed();
-    println!("  Time: {:?}", simple_fragmentation_time);
+    let simple_time = start.elapsed();
+    println!("Time: {:?}", simple_time);
     
     // Test segregated freelist
     println!("\nSegregated freelist allocation pattern:");
@@ -67,93 +64,69 @@ fn main() -> Result<()> {
         let mut txn = env_segregated.begin_write_txn()?;
         let mut allocated_pages = Vec::new();
         
-        // Allocate pages in pattern
-        for _ in 0..iterations {
-            for &size in &pattern_sizes {
-                let pages = txn.alloc_pages(size, heed_core::page::PageFlags::LEAF)?;
-                allocated_pages.push((pages[0].0, size));
-            }
-        }
-        
-        // Free every other allocation to create fragmentation
-        for (i, (page_id, size)) in allocated_pages.iter().enumerate() {
-            if i % 2 == 0 {
-                txn.free_pages(*page_id, *size)?;
+        // Allocate many pages
+        for i in 0..iterations {
+            let (page_id, _page) = txn.alloc_page(zerodb::page::PageFlags::LEAF)?;
+            allocated_pages.push(page_id);
+            
+            // Free every third page to create fragmentation
+            if i > 0 && i % 3 == 0 {
+                if let Some(old_page) = allocated_pages.get(i - 3) {
+                    txn.free_page(*old_page)?;
+                }
             }
         }
         
         txn.commit()?;
     }
-    let segregated_fragmentation_time = start.elapsed();
-    println!("  Time: {:?}", segregated_fragmentation_time);
+    let segregated_time = start.elapsed();
+    println!("Time: {:?}", segregated_time);
     
-    println!("\nPhase 2: Allocating from fragmented freelist");
-    println!("============================================");
+    println!("\nPhase 2: Allocation performance with fragmentation");
+    println!("=================================================");
     
-    // Now allocate pages from the fragmented freelist
-    // The segregated freelist should be much faster at finding
-    // appropriately sized free extents
+    // Now test allocation performance with the fragmented freelists
+    let alloc_count = 500;
     
-    let allocation_sizes = vec![1, 2, 3, 4, 8, 16, 32];
-    let allocation_count = 50;
-    
-    // Test simple freelist
-    println!("\nSimple freelist re-allocation:");
+    // Simple freelist
+    println!("\nSimple freelist allocations:");
     let start = Instant::now();
-    let mut simple_alloc_success = 0;
     {
         let mut txn = env_simple.begin_write_txn()?;
-        
-        for _ in 0..allocation_count {
-            for &size in &allocation_sizes {
-                match txn.alloc_pages(size, heed_core::page::PageFlags::LEAF) {
-                    Ok(_) => simple_alloc_success += 1,
-                    Err(_) => break,
-                }
-            }
+        for _ in 0..alloc_count {
+            let (_page_id, _page) = txn.alloc_page(zerodb::page::PageFlags::LEAF)?;
         }
-        
         txn.commit()?;
     }
-    let simple_realloc_time = start.elapsed();
-    println!("  Time: {:?}", simple_realloc_time);
-    println!("  Successful allocations: {}", simple_alloc_success);
+    let simple_alloc_time = start.elapsed();
+    println!("Time for {} allocations: {:?}", alloc_count, simple_alloc_time);
+    println!("Average per allocation: {:?}", simple_alloc_time / alloc_count);
     
-    // Test segregated freelist
-    println!("\nSegregated freelist re-allocation:");
+    // Segregated freelist
+    println!("\nSegregated freelist allocations:");
     let start = Instant::now();
-    let mut segregated_alloc_success = 0;
     {
         let mut txn = env_segregated.begin_write_txn()?;
-        
-        for _ in 0..allocation_count {
-            for &size in &allocation_sizes {
-                match txn.alloc_pages(size, heed_core::page::PageFlags::LEAF) {
-                    Ok(_) => segregated_alloc_success += 1,
-                    Err(_) => break,
-                }
-            }
+        for _ in 0..alloc_count {
+            let (_page_id, _page) = txn.alloc_page(zerodb::page::PageFlags::LEAF)?;
         }
-        
         txn.commit()?;
     }
-    let segregated_realloc_time = start.elapsed();
-    println!("  Time: {:?}", segregated_realloc_time);
-    println!("  Successful allocations: {}", segregated_alloc_success);
+    let segregated_alloc_time = start.elapsed();
+    println!("Time for {} allocations: {:?}", alloc_count, segregated_alloc_time);
+    println!("Average per allocation: {:?}", segregated_alloc_time / alloc_count);
     
     println!("\nResults Summary");
     println!("===============");
-    println!("Fragmentation creation speedup: {:.2}x", 
-             simple_fragmentation_time.as_secs_f64() / segregated_fragmentation_time.as_secs_f64());
-    println!("Re-allocation speedup: {:.2}x",
-             simple_realloc_time.as_secs_f64() / segregated_realloc_time.as_secs_f64());
-    println!("Allocation efficiency improvement: {:.1}%",
-             ((segregated_alloc_success as f64 / simple_alloc_success as f64) - 1.0) * 100.0);
+    println!("Fragmentation creation:");
+    println!("  Simple:     {:?}", simple_time);
+    println!("  Segregated: {:?}", segregated_time);
+    println!("  Speedup:    {:.2}x", simple_time.as_secs_f64() / segregated_time.as_secs_f64());
     
-    println!("\nThe segregated freelist provides:");
-    println!("- Faster allocation by organizing free pages by size class");
-    println!("- Better space utilization through intelligent coalescing");
-    println!("- Reduced fragmentation through best-fit allocation strategies");
+    println!("\nAllocation with fragmentation:");
+    println!("  Simple:     {:?}/alloc", simple_alloc_time / alloc_count);
+    println!("  Segregated: {:?}/alloc", segregated_alloc_time / alloc_count);
+    println!("  Speedup:    {:.2}x", simple_alloc_time.as_secs_f64() / segregated_alloc_time.as_secs_f64());
     
     Ok(())
 }

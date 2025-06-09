@@ -209,19 +209,32 @@ pub fn copy_overflow_chain(
     let mut prev_new_page_id = None;
     
     loop {
-        // Get the old page
-        let old_page = txn.get_page(old_page_id)?;
+        // Get the old page and copy necessary data
+        let (old_flags, old_num_keys, old_lower, old_upper, old_overflow, old_data, next_old_page_id) = {
+            let old_page = txn.get_page(old_page_id)?;
+            let next_id = unsafe {
+                let next_ptr = old_page.data.as_ptr() as *const u64;
+                PageId(*next_ptr)
+            };
+            (old_page.header.flags, 
+             old_page.header.num_keys,
+             old_page.header.lower,
+             old_page.header.upper,
+             old_page.header.overflow,
+             old_page.data,
+             next_id)
+        };
         
         // Allocate new page
         let (new_page_id, new_page) = txn.alloc_page(PageFlags::OVERFLOW)?;
         
         // Copy page header and data directly
-        new_page.header.flags = old_page.header.flags;
-        new_page.header.num_keys = old_page.header.num_keys;
-        new_page.header.lower = old_page.header.lower;
-        new_page.header.upper = old_page.header.upper;
-        new_page.header.overflow = old_page.header.overflow;
-        new_page.data = old_page.data;
+        new_page.header.flags = old_flags;
+        new_page.header.num_keys = old_num_keys;
+        new_page.header.lower = old_lower;
+        new_page.header.upper = old_upper;
+        new_page.header.overflow = old_overflow;
+        new_page.data = old_data;
         
         // Track first new page
         if new_first_page_id.is_none() {
@@ -239,11 +252,6 @@ pub fn copy_overflow_chain(
         }
         
         // Check if this is the last page
-        let next_old_page_id = unsafe {
-            let next_ptr = old_page.data.as_ptr() as *const u64;
-            PageId(*next_ptr)
-        };
-        
         if next_old_page_id.0 == 0 {
             // This was the last page
             break;

@@ -236,6 +236,7 @@ impl SimdBloomFilter {
 }
 
 // Fallback implementations for non-AVX2 platforms
+/// SIMD-accelerated binary search using AVX2 instructions (fallback implementation)
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 pub unsafe fn simd_binary_search_avx2(
     keys: &[&[u8]], 
@@ -245,6 +246,7 @@ pub unsafe fn simd_binary_search_avx2(
     keys.binary_search_by(|k| comparator(k, target))
 }
 
+/// SIMD-accelerated prefix matching using AVX2 instructions (fallback implementation)
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 pub unsafe fn simd_prefix_match_avx2(
     keys: &[&[u8]], 
@@ -253,6 +255,7 @@ pub unsafe fn simd_prefix_match_avx2(
     keys.iter().map(|k| k.starts_with(prefix)).collect()
 }
 
+/// SIMD-accelerated validation of sorted keys using AVX2 instructions (fallback implementation)
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 pub unsafe fn simd_validate_sorted_keys_avx2(
     keys: &[&[u8]],

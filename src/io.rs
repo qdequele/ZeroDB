@@ -85,17 +85,17 @@ impl MmapBackend {
             .write(true)
             .create(true)
             .open(&path)
-            .map_err(|e| Error::Io(e))?;
+            .map_err(|e| Error::Io(e.to_string()))?;
         
         // Get current file size
-        let metadata = file.metadata().map_err(|e| Error::Io(e))?;
+        let metadata = file.metadata().map_err(|e| Error::Io(e.to_string()))?;
         let mut file_size = metadata.len();
         
         // Ensure minimum size
         let min_size = PAGE_SIZE as u64 * 4; // At least 4 pages (2 meta + 2 data)
         if file_size < min_size {
             file_size = initial_size.max(min_size);
-            file.set_len(file_size).map_err(|e| Error::Io(e))?;
+            file.set_len(file_size).map_err(|e| Error::Io(e.to_string()))?;
         }
         
         // Ensure size is page-aligned
@@ -107,7 +107,7 @@ impl MmapBackend {
             MmapOptions::new()
                 .len(file_size as usize)
                 .map_mut(&file)
-                .map_err(|e| Error::Io(e))?
+                .map_err(|e| Error::Io(e.to_string()))?
         };
         
         Ok(Self {
@@ -136,7 +136,7 @@ impl MmapBackend {
         let result = unsafe { libc::madvise(ptr, len, advice_flag) };
         
         if result != 0 {
-            return Err(Error::Io(std::io::Error::last_os_error()));
+            return Err(Error::Io(std::io::Error::last_os_error().to_string()));
         }
         
         Ok(())
@@ -161,7 +161,7 @@ impl MmapBackend {
             let result = unsafe { libc::madvise(ptr, len, libc::MADV_WILLNEED) };
             
             if result != 0 {
-                return Err(Error::Io(std::io::Error::last_os_error()));
+                return Err(Error::Io(std::io::Error::last_os_error().to_string()));
             }
         }
         
@@ -250,12 +250,12 @@ impl IoBackend for MmapBackend {
         // 1. The mmap base address is stable until grow() is called
         // 2. grow() requires exclusive access (write transaction)
         // 3. Read transactions cannot call grow()
-        let base_ptr = self.mmap_ptr();
-        let page_ptr = base_ptr.add(offset) as *const Page;
+        let base_ptr = unsafe { self.mmap_ptr() };
+        let page_ptr = unsafe { base_ptr.add(offset) } as *const Page;
         
         // Return a reference with the requested lifetime
         // The caller is responsible for ensuring this lifetime is valid
-        Ok(&*page_ptr)
+        Ok(unsafe { &*page_ptr })
     }
     
     fn write_page(&self, page: &Page) -> Result<()> {
@@ -284,7 +284,7 @@ impl IoBackend for MmapBackend {
     
     fn sync(&self) -> Result<()> {
         let mmap = self.mmap.lock().unwrap();
-        mmap.flush().map_err(|e| Error::Io(e))?;
+        mmap.flush().map_err(|e| Error::Io(e.to_string()))?;
         Ok(())
     }
     
@@ -301,7 +301,7 @@ impl IoBackend for MmapBackend {
         }
         
         // Grow the file
-        self.file.set_len(new_size_bytes).map_err(|e| Error::Io(e))?;
+        self.file.set_len(new_size_bytes).map_err(|e| Error::Io(e.to_string()))?;
         
         // Remap
         let mut mmap_guard = self.mmap.lock().unwrap();
@@ -311,7 +311,7 @@ impl IoBackend for MmapBackend {
             MmapOptions::new()
                 .len(new_size_bytes as usize)
                 .map_mut(&self.file)
-                .map_err(|e| Error::Io(e))?
+                .map_err(|e| Error::Io(e.to_string()))?
         };
         
         // Replace the old mmap
@@ -448,7 +448,7 @@ impl IoUringBackend {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         let mmap = MmapBackend::new(path)?;
         let ring = io_uring::IoUring::new(256)
-            .map_err(|e| Error::Io(std::io::Error::from(e)))?;
+            .map_err(|e| Error::Io(std::io::Error::from(e).to_string()))?;
         
         Ok(Self { mmap, ring })
     }

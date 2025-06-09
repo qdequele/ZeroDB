@@ -1,8 +1,7 @@
-use heed_core::env::EnvBuilder;
-use heed_core::db::{Database, DatabaseFlags};
-use heed_core::io::{IoBackend, MmapBackend};
-use heed_core::meta::{MetaPage, META_PAGE_1, META_PAGE_2};
-use heed_core::page::Page;
+use zerodb::env::EnvBuilder;
+use zerodb::db::{Database, DatabaseFlags};
+use zerodb::io::{IoBackend, MmapBackend};
+use zerodb::meta::{MetaPage, META_PAGE_1, META_PAGE_2};
 use std::sync::Arc;
 use tempfile::TempDir;
 

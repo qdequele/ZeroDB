@@ -1,7 +1,7 @@
 //! Test B+Tree deletion behavior
 
-use heed_core::env::EnvBuilder;
-use heed_core::db::Database;
+use zerodb::env::EnvBuilder;
+use zerodb::db::Database;
 use std::sync::Arc;
 use tempfile::TempDir;
 

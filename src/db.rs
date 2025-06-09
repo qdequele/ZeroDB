@@ -3,7 +3,7 @@
 use bitflags::bitflags;
 use std::marker::PhantomData;
 use std::sync::Arc;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, PageId};
 use crate::txn::{Transaction, mode::Mode};
 use crate::env::{Environment, state};
 use crate::btree::BTree;
@@ -187,6 +187,7 @@ impl<K: Key, V: Value, C: Comparator> Database<K, V, C> {
                     overflow_pages: 0,
                     entries: 0,
                     root: root_id,
+                    last_key_page: PageId(0),
                 };
                 
                 // Store in catalog
@@ -520,6 +521,7 @@ impl Environment<state::Open> {
                     overflow_pages: 0,
                     entries: 0,
                     root: root_id,
+                    last_key_page: PageId(0),
                 };
                 
                 // Store in the main database catalog

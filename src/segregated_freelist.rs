@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::error::{Result, PageId, TransactionId};
-use crate::cache_aligned::{CacheAlignedCounter, CacheAlignedStats};
+use crate::cache_aligned::CacheAlignedCounter;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
@@ -54,7 +54,7 @@ impl SizeClass {
 }
 
 /// Free extent information
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FreeExtent {
     /// Starting page ID
     pub start: PageId,
@@ -403,6 +403,7 @@ pub struct BestFitAllocator {
 }
 
 #[derive(Debug, Clone, Copy)]
+/// Strategy for allocating pages from the segregated free list
 pub enum AllocationStrategy {
     /// Always use best fit
     BestFit,

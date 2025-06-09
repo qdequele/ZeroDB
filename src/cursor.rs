@@ -234,12 +234,15 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
         };
         
         let leaf_page = self.get_page(leaf_page_id)?;
+        let leaf_num_keys = leaf_page.header.num_keys as usize;
+        let leaf_next_pgno = leaf_page.header.next_pgno;
+        let leaf_has_leaf_flag = leaf_page.header.flags.contains(PageFlags::LEAF);
         
         // Now we can mutably borrow position
         let position = self.position.as_mut().unwrap();
         position.indices[leaf_idx] += 1;
         
-        if position.indices[leaf_idx] < leaf_page.header.num_keys as usize {
+        if position.indices[leaf_idx] < leaf_num_keys {
             // Still have entries in current leaf
             let node = leaf_page.node(position.indices[leaf_idx])?;
             let key = node.key()?;
@@ -256,10 +259,13 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
             return Ok(Some((key, value)));
         }
         
+        // Drop the mutable borrow before we need to borrow self again
+        let _ = position;
+        
         // Check if we can use leaf chaining for fast navigation
-        if leaf_page.header.flags.contains(PageFlags::LEAF) && leaf_page.header.next_pgno != 0 {
+        if leaf_has_leaf_flag && leaf_next_pgno != 0 {
             // Use leaf chaining - much faster than tree traversal
-            let next_page_id = PageId(leaf_page.header.next_pgno);
+            let next_page_id = PageId(leaf_next_pgno);
             
             // Prefetch the next few pages for sequential access
             #[cfg(unix)]
@@ -273,6 +279,7 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
             if next_page.header.num_keys > 0 {
                 // Update position to point to first entry in next leaf
                 // Keep only the leaf level in our position stack for efficiency
+                let position = self.position.as_mut().unwrap();
                 position.pages.clear();
                 position.indices.clear();
                 position.pages.push(next_page_id);
@@ -287,6 +294,7 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
         
         // Need to move to next leaf
         // Go up the tree until we find a branch we haven't exhausted
+        let position = self.position.as_mut().unwrap();
         position.pages.pop();
         position.indices.pop();
         

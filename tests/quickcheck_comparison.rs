@@ -1,6 +1,6 @@
-//! QuickCheck tests comparing heed-core with original heed (LMDB)
+//! QuickCheck tests comparing zerodb with original heed (LMDB)
 
-use quickcheck::{Arbitrary, Gen, QuickCheck, TestResult};
+use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;
 use std::collections::BTreeMap;
 use tempfile::TempDir;
@@ -54,9 +54,9 @@ impl Arbitrary for TestConfig {
     }
 }
 
-/// Execute operations on heed-core
-fn execute_heed_core(config: &TestConfig) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, String> {
-    use heed_core::{EnvBuilder, Environment};
+/// Execute operations on zerodb
+fn execute_zerodb(config: &TestConfig) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, String> {
+    use zerodb::EnvBuilder;
     use std::sync::Arc;
     
     let dir = TempDir::new().map_err(|e| format!("TempDir error: {}", e))?;
@@ -66,7 +66,7 @@ fn execute_heed_core(config: &TestConfig) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, 
         .open(dir.path())
         .map_err(|e| format!("Env open error: {:?}", e))?);
     
-    let db: heed_core::Database<Vec<u8>, Vec<u8>> = {
+    let db: zerodb::Database<Vec<u8>, Vec<u8>> = {
         let mut txn = env.begin_write_txn()
             .map_err(|e| format!("Begin write txn error: {:?}", e))?;
         let db = env.create_database(&mut txn, None)
@@ -200,11 +200,11 @@ fn prop_same_results(config: TestConfig) -> TestResult {
     }
     
     // Execute on both implementations
-    let heed_core_result = match execute_heed_core(&config) {
+    let zerodb_result = match execute_zerodb(&config) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("heed-core error: {}", e);
-            return TestResult::error(format!("heed-core failed: {}", e));
+            eprintln!("zerodb error: {}", e);
+            return TestResult::error(format!("zerodb failed: {}", e));
         }
     };
     
@@ -217,11 +217,11 @@ fn prop_same_results(config: TestConfig) -> TestResult {
     };
     
     // Compare results
-    if heed_core_result == heed_lmdb_result {
+    if zerodb_result == heed_lmdb_result {
         TestResult::passed()
     } else {
         eprintln!("Results differ!");
-        eprintln!("heed-core: {:?}", heed_core_result);
+        eprintln!("zerodb: {:?}", zerodb_result);
         eprintln!("heed-lmdb: {:?}", heed_lmdb_result);
         TestResult::failed()
     }
@@ -296,10 +296,10 @@ fn test_specific_failure_case() {
         map_size: 10 * 1024 * 1024,
     };
     
-    let heed_core_result = execute_heed_core(&config).unwrap();
+    let zerodb_result = execute_zerodb(&config).unwrap();
     let heed_lmdb_result = execute_heed_lmdb(&config).unwrap();
     
-    assert_eq!(heed_core_result, heed_lmdb_result);
+    assert_eq!(zerodb_result, heed_lmdb_result);
 }
 
 #[test]
@@ -317,12 +317,12 @@ fn test_clear_operation() {
         map_size: 10 * 1024 * 1024,
     };
     
-    let heed_core_result = execute_heed_core(&config).unwrap();
+    let zerodb_result = execute_zerodb(&config).unwrap();
     let heed_lmdb_result = execute_heed_lmdb(&config).unwrap();
     
-    assert_eq!(heed_core_result, heed_lmdb_result);
-    assert_eq!(heed_core_result.len(), 1);
-    assert_eq!(heed_core_result.get(&vec![4]), Some(&vec![4]));
+    assert_eq!(zerodb_result, heed_lmdb_result);
+    assert_eq!(zerodb_result.len(), 1);
+    assert_eq!(zerodb_result.get(&vec![4]), Some(&vec![4]));
 }
 
 #[quickcheck]
@@ -346,8 +346,8 @@ fn test_large_values() {
         map_size: 10 * 1024 * 1024,
     };
     
-    let heed_core_result = execute_heed_core(&config).unwrap();
+    let zerodb_result = execute_zerodb(&config).unwrap();
     let heed_lmdb_result = execute_heed_lmdb(&config).unwrap();
     
-    assert_eq!(heed_core_result, heed_lmdb_result);
+    assert_eq!(zerodb_result, heed_lmdb_result);
 }

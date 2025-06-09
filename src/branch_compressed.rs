@@ -22,6 +22,7 @@ pub struct CompressedBranchHeader {
 }
 
 impl CompressedBranchHeader {
+    /// Size of the compressed branch header in bytes
     pub const SIZE: usize = std::mem::size_of::<Self>();
 }
 
@@ -40,6 +41,7 @@ pub struct CompressedEntry {
 }
 
 impl CompressedEntry {
+    /// Size of a compressed entry in bytes
     pub const SIZE: usize = std::mem::size_of::<Self>();
 }
 

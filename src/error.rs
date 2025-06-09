@@ -1,16 +1,16 @@
-//! Error types for heed-core
+//! Error types for zerodb
 
 use std::borrow::Cow;
 use std::fmt;
 use std::io;
 use thiserror::Error;
 
-/// The main error type for heed-core operations
-#[derive(Error, Debug)]
+/// The main error type for zerodb operations
+#[derive(Error, Debug, Clone)]
 pub enum Error {
     /// I/O error occurred
     #[error("I/O error: {0}")]
-    Io(#[from] io::Error),
+    Io(String),
     
     /// Transaction conflict detected
     #[error("Transaction conflict: {0}")]
@@ -196,8 +196,14 @@ pub enum PageType {
     Free,
 }
 
-/// Result type alias for heed-core operations
+/// Result type alias for zerodb operations
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Self {
+        Error::Io(err.to_string())
+    }
+}
 
 /// Convert LMDB error codes to our error type (for compatibility)
 impl Error {
@@ -205,10 +211,10 @@ impl Error {
     pub fn from_err_code(code: i32) -> Self {
         match code {
             libc::ENOENT => Error::NotFound,
-            libc::EIO => Error::Io(io::Error::from_raw_os_error(code)),
-            libc::ENOMEM => Error::Io(io::Error::new(io::ErrorKind::OutOfMemory, "out of memory")),
-            libc::EACCES => Error::Io(io::Error::new(io::ErrorKind::PermissionDenied, "permission denied")),
-            libc::EBUSY => Error::Io(io::Error::new(io::ErrorKind::Other, "resource busy")),
+            libc::EIO => Error::Io("I/O error".to_string()),
+            libc::ENOMEM => Error::Io("out of memory".to_string()),
+            libc::EACCES => Error::Io("permission denied".to_string()),
+            libc::EBUSY => Error::Io("resource busy".to_string()),
             libc::EINVAL => Error::InvalidParameter("invalid parameter"),
             libc::ENOSPC => Error::MapFull,
             -30799 => Error::KeyNotFound, // MDB_NOTFOUND
@@ -236,7 +242,7 @@ impl Error {
     /// Convert to LMDB error code (for compatibility)
     pub fn to_err_code(&self) -> i32 {
         match self {
-            Error::Io(e) => e.raw_os_error().unwrap_or(libc::EIO),
+            Error::Io(_) => libc::EIO,
             Error::KeyNotFound => -30799,
             Error::PageNotFound(_) => -30798,
             Error::Corruption { .. } => -30797,

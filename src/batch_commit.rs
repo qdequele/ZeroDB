@@ -23,17 +23,23 @@ pub struct BatchedWrite {
 pub enum WriteOp {
     /// Put a key-value pair
     Put {
+        /// Optional database name
         db_name: Option<String>,
+        /// Key to insert
         key: Vec<u8>,
+        /// Value to insert
         value: Vec<u8>,
     },
     /// Delete a key
     Delete {
+        /// Optional database name
         db_name: Option<String>,
+        /// Key to delete
         key: Vec<u8>,
     },
     /// Clear a database
     Clear {
+        /// Optional database name to clear
         db_name: Option<String>,
     },
 }
@@ -106,7 +112,7 @@ impl BatchCommitter {
     fn commit_loop(
         env: Arc<Environment<crate::env::state::Open>>,
         pending: Arc<Mutex<VecDeque<BatchedWrite>>>,
-        cond: Arc<Condvar>,
+        _cond: Arc<Condvar>,
         config: BatchConfig,
         submit_rx: Receiver<BatchedWrite>,
     ) {
@@ -212,60 +218,36 @@ impl BatchCommitter {
             match op {
                 WriteOp::Put { db_name, key, value } => {
                     // Get database
-                    let db_info = txn.db_info(db_name.as_deref())?;
+                    let mut db_info = *txn.db_info(db_name.as_deref())?;
+                    let mut root = db_info.root;
                     
-                    // Insert using btree
-                    let result = crate::btree::BTree::<crate::comparator::LexicographicComparator>
-                        ::insert(txn, db_info.root, key, value)?;
+                    // Insert using btree - it returns the old value if key existed
+                    let _old_value = crate::btree::BTree::<crate::comparator::LexicographicComparator>
+                        ::insert(txn, &mut root, &mut db_info, key, value)?;
+                    db_info.root = root;
                     
-                    // Handle split if needed
-                    match result {
-                        crate::btree::InsertResult::Inserted => {
-                            // Update entry count
-                            let mut db_info = *db_info;
-                            db_info.entries += 1;
-                            txn.update_db_info(db_name.as_deref(), db_info)?;
-                        }
-                        crate::btree::InsertResult::Updated(_) => {
-                            // No count change
-                        }
-                        crate::btree::InsertResult::Split { median_key, right_page } => {
-                            // Create new root
-                            let mut db_info = *db_info;
-                            let new_root = crate::btree::BTree::<crate::comparator::LexicographicComparator>
-                                ::create_new_root(txn, db_info.root, median_key, right_page)?;
-                            db_info.root = new_root;
-                            db_info.depth += 1;
-                            db_info.branch_pages += 1;
-                            db_info.entries += 1;
-                            txn.update_db_info(db_name.as_deref(), db_info)?;
-                        }
-                    }
+                    // Update db info (insert already updated entries count and root if needed)
+                    txn.update_db_info(db_name.as_deref(), db_info)?;
                 }
                 WriteOp::Delete { db_name, key } => {
                     // Get database
-                    let db_info = txn.db_info(db_name.as_deref())?;
+                    let mut db_info = *txn.db_info(db_name.as_deref())?;
+                    let mut root = db_info.root;
                     
-                    // Delete using btree
-                    let deleted = crate::btree::BTree::<crate::comparator::LexicographicComparator>
-                        ::delete(txn, db_info.root, key)?;
+                    // Delete using btree - it returns the old value if key existed
+                    let _old_value = crate::btree::BTree::<crate::comparator::LexicographicComparator>
+                        ::delete(txn, &mut root, &mut db_info, key)?;
+                    db_info.root = root;
                     
-                    if deleted {
-                        // Update entry count
-                        let mut db_info = *db_info;
-                        db_info.entries = db_info.entries.saturating_sub(1);
-                        txn.update_db_info(db_name.as_deref(), db_info)?;
-                    }
+                    // Update db info (delete already updated entries count)
+                    txn.update_db_info(db_name.as_deref(), db_info)?;
                 }
                 WriteOp::Clear { db_name } => {
                     // Get database
-                    let db_info = txn.db_info(db_name.as_deref())?;
+                    let mut db_info = *txn.db_info(db_name.as_deref())?;
                     
                     // Clear by creating new empty root
-                    let (new_root_id, new_root) = txn.alloc_page(crate::page::PageFlags::LEAF)?;
-                    
-                    // Update database info
-                    let mut db_info = *db_info;
+                    let (new_root_id, _new_root) = txn.alloc_page(crate::page::PageFlags::LEAF)?;
                     db_info.root = new_root_id;
                     db_info.entries = 0;
                     db_info.depth = 1;

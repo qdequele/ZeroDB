@@ -3,7 +3,7 @@
 
 set -e
 
-echo "heed-core Performance Testing Suite"
+echo "zerodb Performance Testing Suite"
 echo "==================================="
 echo ""
 
@@ -142,7 +142,7 @@ mv ../target/performance-dashboard.html "$REPORT_DIR/"
 # 9. Create summary
 echo -e "\n9. Creating performance summary..."
 cat > "$REPORT_DIR/SUMMARY.md" << EOF
-# heed-core Performance Test Results
+# zerodb Performance Test Results
 
 **Date**: $(date)
 **Commit**: $(git rev-parse --short HEAD 2>/dev/null || echo "unknown")

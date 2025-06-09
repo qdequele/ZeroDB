@@ -11,6 +11,7 @@ use std::cell::UnsafeCell;
 #[cfg(target_arch = "x86_64")]
 pub const CACHE_LINE_SIZE: usize = 64;
 
+/// Cache line size for ARM64 architectures
 #[cfg(target_arch = "aarch64")]
 pub const CACHE_LINE_SIZE: usize = 64;
 
@@ -60,6 +61,7 @@ pub struct CacheAlignedCounter {
 }
 
 impl CacheAlignedCounter {
+    /// Create a new cache-aligned counter with the given initial value
     pub const fn new(value: u64) -> Self {
         Self {
             value: AtomicU64::new(value),
@@ -67,16 +69,19 @@ impl CacheAlignedCounter {
         }
     }
     
+    /// Increment the counter and return the previous value
     #[inline]
     pub fn increment(&self) -> u64 {
         self.value.fetch_add(1, Ordering::Relaxed)
     }
     
+    /// Get the current value of the counter
     #[inline]
     pub fn get(&self) -> u64 {
         self.value.load(Ordering::Relaxed)
     }
     
+    /// Add a value to the counter and return the previous value
     #[inline]
     pub fn add(&self, val: u64) -> u64 {
         self.value.fetch_add(val, Ordering::Relaxed)
@@ -228,6 +233,7 @@ pub struct CacheAlignedStats {
 }
 
 impl CacheAlignedStats {
+    /// Create new cache-aligned statistics counters initialized to zero
     pub const fn new() -> Self {
         Self {
             page_reads: CacheAlignedCounter::new(0),
@@ -275,6 +281,7 @@ pub struct Padded<T> {
 }
 
 impl<T> Padded<T> {
+    /// Create a new padded value to prevent false sharing
     pub const fn new(data: T) -> Self {
         Self { data }
     }
