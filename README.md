@@ -8,7 +8,6 @@ A high-performance, pure Rust implementation of LMDB (Lightning Memory-Mapped Da
 - **Memory-Mapped Storage** for zero-copy data access
 - **Type-Safe API** leveraging Rust's type system
 - **B+Tree Storage Engine** for efficient sorted data access
-- **16x Faster Sequential Writes** compared to LMDB
 - **Multiple Databases** per environment with named database support
 - **Duplicate Key Support** with sorted duplicates
 - **SIMD Optimizations** for key comparisons
