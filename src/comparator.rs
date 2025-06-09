@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 pub trait Comparator: Send + Sync + 'static {
     /// Compare two keys and return their ordering
     fn compare(a: &[u8], b: &[u8]) -> Ordering;
-    
+
     /// Optional: Return a name for this comparator (for debugging)
     fn name() -> &'static str {
         "CustomComparator"
@@ -27,7 +27,7 @@ impl Comparator for LexicographicComparator {
         // Use SIMD-optimized comparison when available
         crate::simd::compare_bytes_simd(a, b)
     }
-    
+
     fn name() -> &'static str {
         "LexicographicComparator"
     }
@@ -50,7 +50,7 @@ impl Comparator for CaseInsensitiveComparator {
             }
         }
     }
-    
+
     fn name() -> &'static str {
         "CaseInsensitiveComparator"
     }
@@ -70,7 +70,7 @@ impl Comparator for NumericComparator {
             other => other,
         }
     }
-    
+
     fn name() -> &'static str {
         "NumericComparator"
     }
@@ -85,7 +85,7 @@ impl<C: Comparator> Comparator for ReverseComparator<C> {
     fn compare(a: &[u8], b: &[u8]) -> Ordering {
         C::compare(a, b).reverse()
     }
-    
+
     fn name() -> &'static str {
         "ReverseComparator"
     }
@@ -102,11 +102,11 @@ impl<const N: usize> Comparator for FixedSizeComparator<N> {
             // Fall back to lexicographic comparison for safety
             return a.cmp(b);
         }
-        
+
         // Direct byte comparison for fixed-size data
         a.cmp(b)
     }
-    
+
     fn name() -> &'static str {
         "FixedSizeComparator"
     }
@@ -115,56 +115,53 @@ impl<const N: usize> Comparator for FixedSizeComparator<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_lexicographic_comparator() {
         assert_eq!(LexicographicComparator::compare(b"abc", b"def"), Ordering::Less);
         assert_eq!(LexicographicComparator::compare(b"def", b"abc"), Ordering::Greater);
         assert_eq!(LexicographicComparator::compare(b"abc", b"abc"), Ordering::Equal);
     }
-    
+
     #[test]
     fn test_case_insensitive_comparator() {
         assert_eq!(CaseInsensitiveComparator::compare(b"ABC", b"abc"), Ordering::Equal);
         assert_eq!(CaseInsensitiveComparator::compare(b"abc", b"DEF"), Ordering::Less);
         assert_eq!(CaseInsensitiveComparator::compare(b"XYZ", b"xyz"), Ordering::Equal);
-        
+
         // Test with non-ASCII
         assert_eq!(CaseInsensitiveComparator::compare(b"hello", b"HELLO"), Ordering::Equal);
     }
-    
+
     #[test]
     fn test_numeric_comparator() {
         // Same length numbers
         assert_eq!(NumericComparator::compare(b"123", b"456"), Ordering::Less);
         assert_eq!(NumericComparator::compare(b"999", b"123"), Ordering::Greater);
-        
+
         // Different length numbers
         assert_eq!(NumericComparator::compare(b"9", b"123"), Ordering::Less);
         assert_eq!(NumericComparator::compare(b"1000", b"999"), Ordering::Greater);
     }
-    
+
     #[test]
     fn test_reverse_comparator() {
         assert_eq!(
-            ReverseComparator::<LexicographicComparator>::compare(b"abc", b"def"), 
+            ReverseComparator::<LexicographicComparator>::compare(b"abc", b"def"),
             Ordering::Greater
         );
         assert_eq!(
-            ReverseComparator::<LexicographicComparator>::compare(b"def", b"abc"), 
+            ReverseComparator::<LexicographicComparator>::compare(b"def", b"abc"),
             Ordering::Less
         );
     }
-    
+
     #[test]
     fn test_fixed_size_comparator() {
         // 4-byte comparator (e.g., for u32)
+        assert_eq!(FixedSizeComparator::<4>::compare(&[0, 0, 0, 1], &[0, 0, 0, 2]), Ordering::Less);
         assert_eq!(
-            FixedSizeComparator::<4>::compare(&[0, 0, 0, 1], &[0, 0, 0, 2]), 
-            Ordering::Less
-        );
-        assert_eq!(
-            FixedSizeComparator::<4>::compare(&[0, 0, 0, 2], &[0, 0, 0, 1]), 
+            FixedSizeComparator::<4>::compare(&[0, 0, 0, 2], &[0, 0, 0, 1]),
             Ordering::Greater
         );
     }

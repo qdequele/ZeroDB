@@ -1,18 +1,18 @@
 //! Environment management with type-state pattern
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
-use parking_lot::Mutex;
+use std::sync::{Arc, RwLock};
 
-use crate::error::{Error, Result, TransactionId, PageId};
-use crate::meta::{MetaPage, DbInfo, META_PAGE_1, META_PAGE_2};
-use crate::page::{Page, PageHeader, PAGE_SIZE};
-use crate::txn::{Transaction, Read, Write};
-use crate::reader::ReaderTable;
+use crate::error::{Error, PageId, Result, TransactionId};
 use crate::io::{IoBackend, MmapBackend};
+use crate::meta::{DbInfo, MetaPage, META_PAGE_1, META_PAGE_2};
+use crate::page::{Page, PageHeader, PAGE_SIZE};
+use crate::reader::ReaderTable;
+use crate::txn::{Read, Transaction, Write};
 
 /// Environment configuration
 #[derive(Debug, Clone)]
@@ -30,22 +30,22 @@ pub mod state {
     mod sealed {
         pub trait Sealed {}
     }
-    
+
     /// Environment state trait
     pub trait State: sealed::Sealed {}
-    
+
     /// Closed environment state
     #[derive(Debug)]
     pub struct Closed;
     impl sealed::Sealed for Closed {}
     impl State for Closed {}
-    
+
     /// Open environment state
     #[derive(Debug)]
     pub struct Open;
     impl sealed::Sealed for Open {}
     impl State for Open {}
-    
+
     /// Read-only environment state
     #[derive(Debug)]
     pub struct ReadOnly;
@@ -86,12 +86,9 @@ pub(crate) struct PagePool {
 impl PagePool {
     /// Create a new page pool
     pub fn new(max_pages: usize) -> Self {
-        Self {
-            pages: Mutex::new(Vec::with_capacity(max_pages)),
-            max_pages,
-        }
+        Self { pages: Mutex::new(Vec::with_capacity(max_pages)), max_pages }
     }
-    
+
     /// Get a page from the pool or allocate a new one
     pub fn get(&self, page_id: PageId, flags: crate::page::PageFlags) -> Box<Page> {
         let mut pool = self.pages.lock();
@@ -105,7 +102,7 @@ impl PagePool {
             Page::new(page_id, flags)
         }
     }
-    
+
     /// Return a page to the pool
     #[allow(dead_code)]
     pub fn put(&self, page: Box<Page>) {
@@ -159,15 +156,15 @@ impl EnvInner {
         // Read both meta pages
         let meta0 = self.io.read_page(META_PAGE_1)?;
         let meta1 = self.io.read_page(META_PAGE_2)?;
-        
+
         // Cast data area to MetaPage
         let meta0 = unsafe { &*(meta0.data.as_ptr() as *const MetaPage) };
         let meta1 = unsafe { &*(meta1.data.as_ptr() as *const MetaPage) };
-        
+
         // Validate and return the most recent valid one
         let meta0_valid = meta0.validate().is_ok();
         let meta1_valid = meta1.validate().is_ok();
-        
+
         match (meta0_valid, meta1_valid) {
             (true, true) => {
                 // Both valid, use the one with higher transaction ID
@@ -182,7 +179,7 @@ impl EnvInner {
             (false, false) => Err(Error::Corrupted),
         }
     }
-    
+
     /// Get the non-current meta page ID (for writing)
     pub(crate) fn next_meta_page_id(&self) -> Result<PageId> {
         let meta = self.meta()?;
@@ -193,7 +190,6 @@ impl EnvInner {
             Ok(META_PAGE_1)
         }
     }
-    
 }
 
 /// Database environment
@@ -228,62 +224,63 @@ impl EnvBuilder {
             use_numa: false,
         }
     }
-    
+
     /// Set the map size
     pub fn map_size(mut self, size: usize) -> Self {
         self.map_size = size;
         self
     }
-    
+
     /// Set the maximum number of readers
     pub fn max_readers(mut self, readers: u32) -> Self {
         self.max_readers = readers;
         self
     }
-    
+
     /// Set the maximum number of named databases
     pub fn max_dbs(mut self, dbs: u32) -> Self {
         self.max_dbs = dbs.min(MAX_DBS);
         self
     }
-    
+
     /// Set the durability mode
     pub fn durability(mut self, mode: DurabilityMode) -> Self {
         self.durability = mode;
         self
     }
-    
+
     /// Set the checksum mode
     pub fn checksum_mode(mut self, mode: crate::checksum::ChecksumMode) -> Self {
         self.checksum_mode = mode;
         self
     }
-    
+
     /// Enable segregated freelist for better allocation performance
     pub fn use_segregated_freelist(mut self, enabled: bool) -> Self {
         self.use_segregated_freelist = enabled;
         self
     }
-    
+
     /// Enable NUMA-aware memory allocation for multi-socket systems
     pub fn use_numa(mut self, enabled: bool) -> Self {
         self.use_numa = enabled;
         self
     }
-    
+
     /// Build and open the environment
     pub fn open(self, path: impl AsRef<Path>) -> Result<Environment<Open>> {
         let path = path.as_ref();
-        
+
         // Create directory if it doesn't exist
         std::fs::create_dir_all(path)?;
-        
+
         let data_path = path.join("data.mdb");
         let _lock_path = path.join("lock.mdb");
-        
+
         // Create I/O backend
-        let mut io: Box<dyn IoBackend> = Box::new(MmapBackend::with_options(&data_path, self.map_size as u64)?);
-        
+        let mut io: Box<dyn IoBackend> =
+            Box::new(MmapBackend::with_options(&data_path, self.map_size as u64)?);
+
         // Check if this is a new database by trying to read meta pages
         let is_new_db = match io.read_page(META_PAGE_1) {
             Ok(page) => {
@@ -292,11 +289,11 @@ impl EnvBuilder {
             }
             Err(_) => true,
         };
-        
+
         let last_txn_id;
         let mut last_page_id = 3; // After two meta pages and two root pages
         let meta_info;
-        
+
         if is_new_db {
             // Initialize new database
             let mut meta = MetaPage::new();
@@ -307,27 +304,27 @@ impl EnvBuilder {
             meta.free_db.root = PageId(2);
             meta.main_db.root = PageId(3);
             meta.last_pg = PageId(3);
-            
+
             // Write meta page 0
             let meta_page0 = Page::from_meta(&meta, META_PAGE_1);
             io.write_page(&meta_page0)?;
-            
+
             // Write meta page 1
             meta.last_txnid = TransactionId(1);
             let meta_page1 = Page::from_meta(&meta, META_PAGE_2);
             io.write_page(&meta_page1)?;
-            
+
             // Initialize free DB root page (page 2)
             let free_page = Page::new(PageId(2), crate::page::PageFlags::LEAF);
             io.write_page(&free_page)?;
-            
+
             // Initialize main DB root page (page 3)
             let main_page = Page::new(PageId(3), crate::page::PageFlags::LEAF);
             io.write_page(&main_page)?;
-            
+
             // Sync to disk
             io.sync()?;
-            
+
             last_txn_id = 1;
             meta_info = meta;
         } else {
@@ -348,19 +345,19 @@ impl EnvBuilder {
                 use_segregated_freelist: self.use_segregated_freelist,
                 numa_allocator: None, // Will be initialized later if needed
             });
-            
+
             meta_info = inner.meta()?;
             last_txn_id = meta_info.last_txnid.0;
             last_page_id = meta_info.last_pg.0;
-            
+
             // Recreate with correct values
             drop(inner);
             io = Box::new(MmapBackend::with_options(&data_path, self.map_size as u64)?);
         }
-        
+
         // Initialize reader table
         let readers = ReaderTable::new(self.max_readers as usize);
-        
+
         let inner = Arc::new(EnvInner {
             _path: path.to_path_buf(),
             io,
@@ -387,21 +384,18 @@ impl EnvBuilder {
                 None
             },
         });
-        
+
         // Initialize main database entry
         {
             let mut dbs = inner.databases.write().unwrap();
             dbs.insert(None, meta_info.main_db);
         }
-        
+
         // Note: Named databases will be loaded on-demand from the catalog
-        // We can't load them here because we'd need a transaction, but the 
+        // We can't load them here because we'd need a transaction, but the
         // environment isn't fully constructed yet
-        
-        Ok(Environment {
-            inner: Some(inner),
-            _state: PhantomData,
-        })
+
+        Ok(Environment { inner: Some(inner), _state: PhantomData })
     }
 }
 
@@ -414,12 +408,9 @@ impl Default for EnvBuilder {
 impl Environment<Closed> {
     /// Create a new closed environment
     pub fn new() -> Self {
-        Self {
-            inner: None,
-            _state: PhantomData,
-        }
+        Self { inner: None, _state: PhantomData }
     }
-    
+
     /// Open the environment
     pub fn open(self, path: impl AsRef<Path>) -> Result<Environment<Open>> {
         EnvBuilder::new().open(path)
@@ -431,17 +422,17 @@ impl Environment<Open> {
     pub fn begin_txn(&self) -> Result<Transaction<'_, Read>> {
         Transaction::new_read(self)
     }
-    
+
     /// Begin a write transaction
     pub fn begin_write_txn(&self) -> Result<Transaction<'_, Write>> {
         Transaction::new_write(self)
     }
-    
+
     /// Get inner reference (for internal use)
     pub(crate) fn inner(&self) -> &Arc<EnvInner> {
         self.inner.as_ref().unwrap()
     }
-    
+
     /// Get environment configuration (for internal use)
     pub(crate) fn config(&self) -> EnvConfig {
         let inner = self.inner.as_ref().unwrap();
@@ -450,14 +441,14 @@ impl Environment<Open> {
             use_numa: inner.numa_allocator.is_some(),
         }
     }
-    
+
     /// Get inner reference (for testing)
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn inner_test(&self) -> &Arc<EnvInner> {
         self.inner.as_ref().unwrap()
     }
-    
+
     /// Sync data to disk
     pub fn sync(&self) -> Result<()> {
         let inner = self.inner.as_ref().unwrap();
@@ -472,19 +463,19 @@ impl Environment<Open> {
             }
         }
     }
-    
+
     /// Force a full synchronous sync regardless of durability mode
     pub fn force_sync(&self) -> Result<()> {
         let inner = self.inner.as_ref().unwrap();
         inner.io.sync()?;
         Ok(())
     }
-    
+
     /// Get environment statistics
     pub fn stat(&self) -> Result<crate::meta::DbStats> {
         let inner = self.inner.as_ref().unwrap();
         let meta = inner.meta()?;
-        
+
         Ok(crate::meta::DbStats {
             psize: meta.psize,
             depth: meta.main_db.depth,
@@ -506,11 +497,11 @@ impl<S: State> Drop for Environment<S> {
 
 #[cfg(test)]
 mod tests {
-    use crate::page::PAGE_SIZE;
     use super::*;
-    use tempfile::TempDir;
+    use crate::page::PAGE_SIZE;
     use std::sync::Arc;
-    
+    use tempfile::TempDir;
+
     #[test]
     fn test_env_creation() {
         let dir = TempDir::new().unwrap();
@@ -518,22 +509,22 @@ mod tests {
             .map_size(10 * 1024 * 1024) // 10MB
             .open(dir.path())
             .unwrap();
-            
+
         let stats = env.stat().unwrap();
         assert_eq!(stats.psize, PAGE_SIZE as u32);
     }
-    
+
     #[test]
     fn test_env_reopen() {
         let dir = TempDir::new().unwrap();
-        
+
         // Create and close environment
         {
             let env = EnvBuilder::new().open(dir.path()).unwrap();
             let _txn = env.begin_write_txn().unwrap();
             // Transaction commits on drop
         }
-        
+
         // Reopen and verify
         {
             let env = EnvBuilder::new().open(dir.path()).unwrap();
@@ -541,12 +532,12 @@ mod tests {
             assert_eq!(stats.psize, PAGE_SIZE as u32);
         }
     }
-    
+
     #[test]
     fn test_durability_modes() {
         use crate::db::Database;
         let dir = TempDir::new().unwrap();
-        
+
         // Test with FullSync mode
         {
             let env = Arc::new(
@@ -554,59 +545,55 @@ mod tests {
                     .map_size(10 * 1024 * 1024)
                     .durability(DurabilityMode::FullSync)
                     .open(dir.path())
-                    .unwrap()
+                    .unwrap(),
             );
-            
+
             // Create database and insert data
             let db: Database<String, String> = {
                 let mut txn = env.begin_write_txn().unwrap();
                 let db = env.create_database(&mut txn, None).unwrap();
-                
+
                 db.put(&mut txn, "key1".to_string(), "value1".to_string()).unwrap();
                 db.put(&mut txn, "key2".to_string(), "value2".to_string()).unwrap();
-                
+
                 // Commit with full sync
                 txn.commit().unwrap();
                 db
             };
-            
+
             // Force drop to close mmap
             drop(db);
             drop(env);
         }
-        
+
         // Reopen and verify data persisted
         {
-            let env = Arc::new(
-                EnvBuilder::new()
-                    .map_size(10 * 1024 * 1024)
-                    .open(dir.path())
-                    .unwrap()
-            );
-            
+            let env =
+                Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap());
+
             let txn = env.begin_txn().unwrap();
             let db: Database<String, String> = env.open_database(&txn, None).unwrap();
-            
+
             assert_eq!(db.get(&txn, &"key1".to_string()).unwrap(), Some("value1".to_string()));
             assert_eq!(db.get(&txn, &"key2".to_string()).unwrap(), Some("value2".to_string()));
         }
     }
-    
+
     #[test]
     fn test_no_sync_mode() {
         let dir = TempDir::new().unwrap();
-        
+
         // Test with NoSync mode - should be fastest
         let env = Arc::new(
             EnvBuilder::new()
                 .map_size(10 * 1024 * 1024)
                 .durability(DurabilityMode::NoSync)
                 .open(dir.path())
-                .unwrap()
+                .unwrap(),
         );
-        
+
         let start = std::time::Instant::now();
-        
+
         // Perform many small transactions
         for _ in 0..100 {
             let mut txn = env.begin_write_txn().unwrap();
@@ -614,9 +601,9 @@ mod tests {
             let _ = txn.alloc_page(crate::page::PageFlags::LEAF).unwrap();
             txn.commit().unwrap();
         }
-        
+
         let no_sync_duration = start.elapsed();
-        
+
         // Now test with FullSync mode
         let dir2 = TempDir::new().unwrap();
         let env2 = Arc::new(
@@ -624,20 +611,20 @@ mod tests {
                 .map_size(10 * 1024 * 1024)
                 .durability(DurabilityMode::FullSync)
                 .open(dir2.path())
-                .unwrap()
+                .unwrap(),
         );
-        
+
         let start = std::time::Instant::now();
-        
+
         // Perform same transactions
         for _ in 0..100 {
             let mut txn = env2.begin_write_txn().unwrap();
             let _ = txn.alloc_page(crate::page::PageFlags::LEAF).unwrap();
             txn.commit().unwrap();
         }
-        
+
         let full_sync_duration = start.elapsed();
-        
+
         // NoSync should be significantly faster
         println!("NoSync: {:?}, FullSync: {:?}", no_sync_duration, full_sync_duration);
         assert!(no_sync_duration < full_sync_duration);

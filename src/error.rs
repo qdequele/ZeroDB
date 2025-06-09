@@ -11,37 +11,37 @@ pub enum Error {
     /// I/O error occurred
     #[error("I/O error: {0}")]
     Io(String),
-    
+
     /// Transaction conflict detected
     #[error("Transaction conflict: {0}")]
     Conflict(ConflictDetails),
-    
+
     /// Database corruption detected
     #[error("Corruption detected: {details}")]
-    Corruption { 
+    Corruption {
         /// Description of the corruption
-        details: String, 
+        details: String,
         /// Page where corruption was detected
-        page_id: Option<PageId> 
+        page_id: Option<PageId>,
     },
-    
+
     /// Key not found in database
     #[error("Key not found")]
     KeyNotFound,
-    
+
     /// Database is full
     #[error("Database full: current size is {current_size} bytes, max is {max_size} bytes")]
-    DatabaseFull { 
+    DatabaseFull {
         /// Current database size
         current_size: u64,
         /// Maximum allowed size
-        max_size: u64
+        max_size: u64,
     },
-    
+
     /// Invalid operation attempted
     #[error("Invalid operation: {0}")]
     InvalidOperation(&'static str),
-    
+
     /// Version mismatch
     #[error("Version mismatch: expected {expected}, found {found}")]
     VersionMismatch {
@@ -50,58 +50,58 @@ pub enum Error {
         /// Found version
         found: u32,
     },
-    
+
     /// Bad transaction
     #[error("Bad transaction")]
     BadTransaction,
-    
+
     /// Invalid database
     #[error("Invalid database")]
     InvalidDatabase,
-    
+
     /// Page not found
     #[error("Page {0} not found")]
     PageNotFound(PageId),
-    
+
     /// Encoding error
     #[error("Encoding error: {0}")]
     Encoding(Cow<'static, str>),
-    
+
     /// Decoding error
     #[error("Decoding error: {0}")]
     Decoding(Cow<'static, str>),
-    
+
     /// Environment already open
     #[error("Environment already open")]
     EnvironmentAlreadyOpen,
-    
+
     /// Invalid parameter
     #[error("Invalid parameter: {0}")]
     InvalidParameter(&'static str),
-    
+
     /// Map full - too many databases open
     #[error("Map full: too many databases open")]
     MapFull,
-    
+
     /// Reader table full
     #[error("Reader table full")]
     ReadersFull,
-    
+
     /// Transaction too big
     #[error("Transaction too big: {size} bytes")]
-    TxnFull { 
+    TxnFull {
         /// Size that was attempted
-        size: usize 
+        size: usize,
     },
-    
+
     /// Cursor is not positioned
     #[error("Cursor is not positioned")]
     NotFound,
-    
+
     /// Invalid page ID
     #[error("Invalid page ID: {0}")]
     InvalidPageId(PageId),
-    
+
     /// Invalid page type
     #[error("Invalid page type: expected {expected:?}, found {found:?}")]
     InvalidPageType {
@@ -110,11 +110,11 @@ pub enum Error {
         /// Found page type
         found: PageType,
     },
-    
+
     /// Database corrupted
     #[error("Database corrupted")]
     Corrupted,
-    
+
     /// Custom error
     #[error("{0}")]
     Custom(Cow<'static, str>),
@@ -134,7 +134,7 @@ pub struct ConflictDetails {
 impl fmt::Display for ConflictDetails {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
-            f, 
+            f,
             "transaction {} conflicted on page {} during {:?}",
             self.txn_id, self.conflicting_page, self.operation
         )
@@ -217,28 +217,28 @@ impl Error {
             libc::EBUSY => Error::Io("resource busy".to_string()),
             libc::EINVAL => Error::InvalidParameter("invalid parameter"),
             libc::ENOSPC => Error::MapFull,
-            -30799 => Error::KeyNotFound, // MDB_NOTFOUND
+            -30799 => Error::KeyNotFound,             // MDB_NOTFOUND
             -30798 => Error::PageNotFound(PageId(0)), // MDB_PAGE_NOTFOUND
             -30797 => Error::Corruption { details: "corrupted database".into(), page_id: None }, // MDB_CORRUPTED
             -30796 => Error::Custom("panic in transaction".into()), // MDB_PANIC
             -30795 => Error::VersionMismatch { expected: 1, found: 0 }, // MDB_VERSION_MISMATCH
-            -30794 => Error::InvalidDatabase, // MDB_INVALID
-            -30793 => Error::MapFull, // MDB_MAP_FULL
-            -30792 => Error::MapFull, // MDB_DBS_FULL
-            -30791 => Error::ReadersFull, // MDB_READERS_FULL
-            -30788 => Error::TxnFull { size: 0 }, // MDB_TXN_FULL
+            -30794 => Error::InvalidDatabase,                       // MDB_INVALID
+            -30793 => Error::MapFull,                               // MDB_MAP_FULL
+            -30792 => Error::MapFull,                               // MDB_DBS_FULL
+            -30791 => Error::ReadersFull,                           // MDB_READERS_FULL
+            -30788 => Error::TxnFull { size: 0 },                   // MDB_TXN_FULL
             -30787 => Error::Custom("cursor stack too deep".into()), // MDB_CURSOR_FULL
             -30786 => Error::Custom("page has no more space".into()), // MDB_PAGE_FULL
             -30785 => Error::DatabaseFull { current_size: 0, max_size: 0 }, // MDB_MAP_RESIZED
             -30784 => Error::InvalidOperation("incompatible operation"), // MDB_INCOMPATIBLE
-            -30783 => Error::BadTransaction, // MDB_BAD_RSLOT
-            -30782 => Error::BadTransaction, // MDB_BAD_TXN
-            -30781 => Error::InvalidParameter("bad value size"), // MDB_BAD_VALSIZE
-            -30780 => Error::InvalidDatabase, // MDB_BAD_DBI
+            -30783 => Error::BadTransaction,                        // MDB_BAD_RSLOT
+            -30782 => Error::BadTransaction,                        // MDB_BAD_TXN
+            -30781 => Error::InvalidParameter("bad value size"),    // MDB_BAD_VALSIZE
+            -30780 => Error::InvalidDatabase,                       // MDB_BAD_DBI
             _ => Error::Custom(format!("unknown error code: {}", code).into()),
         }
     }
-    
+
     /// Convert to LMDB error code (for compatibility)
     pub fn to_err_code(&self) -> i32 {
         match self {

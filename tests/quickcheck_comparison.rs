@@ -39,47 +39,46 @@ impl Arbitrary for TestConfig {
         // Limit operations to reasonable numbers for testing
         let num_ops = (u32::arbitrary(g) % 20) as usize;
         let mut operations = Vec::with_capacity(num_ops);
-        
+
         for _ in 0..num_ops {
             operations.push(DbOperation::arbitrary(g));
         }
-        
+
         // Map size between 1MB and 100MB
         let map_size = ((u32::arbitrary(g) % 100) + 1) as usize * 1024 * 1024;
-        
-        TestConfig {
-            operations,
-            map_size,
-        }
+
+        TestConfig { operations, map_size }
     }
 }
 
 /// Execute operations on zerodb
 fn execute_zerodb(config: &TestConfig) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, String> {
-    use zerodb::EnvBuilder;
     use std::sync::Arc;
-    
+    use zerodb::EnvBuilder;
+
     let dir = TempDir::new().map_err(|e| format!("TempDir error: {}", e))?;
-    
-    let env = Arc::new(EnvBuilder::new()
-        .map_size(config.map_size)
-        .open(dir.path())
-        .map_err(|e| format!("Env open error: {:?}", e))?);
-    
+
+    let env = Arc::new(
+        EnvBuilder::new()
+            .map_size(config.map_size)
+            .open(dir.path())
+            .map_err(|e| format!("Env open error: {:?}", e))?,
+    );
+
     let db: zerodb::Database<Vec<u8>, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()
-            .map_err(|e| format!("Begin write txn error: {:?}", e))?;
-        let db = env.create_database(&mut txn, None)
-            .map_err(|e| format!("Create db error: {:?}", e))?;
+        let mut txn =
+            env.begin_write_txn().map_err(|e| format!("Begin write txn error: {:?}", e))?;
+        let db =
+            env.create_database(&mut txn, None).map_err(|e| format!("Create db error: {:?}", e))?;
         txn.commit().map_err(|e| format!("Commit error: {:?}", e))?;
         db
     };
-    
+
     // Execute operations
     for op in &config.operations {
-        let mut txn = env.begin_write_txn()
-            .map_err(|e| format!("Begin write txn error: {:?}", e))?;
-        
+        let mut txn =
+            env.begin_write_txn().map_err(|e| format!("Begin write txn error: {:?}", e))?;
+
         match op {
             DbOperation::Put(key, value) => {
                 // Skip empty keys which are invalid
@@ -94,26 +93,22 @@ fn execute_zerodb(config: &TestConfig) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, Str
                 if key.is_empty() {
                     continue;
                 }
-                let _ = db.delete(&mut txn, key)
-                    .map_err(|e| format!("Delete error: {:?}", e))?;
+                let _ = db.delete(&mut txn, key).map_err(|e| format!("Delete error: {:?}", e))?;
             }
             DbOperation::Clear => {
-                db.clear(&mut txn)
-                    .map_err(|e| format!("Clear error: {:?}", e))?;
+                db.clear(&mut txn).map_err(|e| format!("Clear error: {:?}", e))?;
             }
         }
-        
+
         txn.commit().map_err(|e| format!("Commit error: {:?}", e))?;
     }
-    
+
     // Read final state
-    let txn = env.begin_txn()
-        .map_err(|e| format!("Begin read txn error: {:?}", e))?;
-    
+    let txn = env.begin_txn().map_err(|e| format!("Begin read txn error: {:?}", e))?;
+
     let mut result = BTreeMap::new();
-    let cursor = db.cursor(&txn)
-        .map_err(|e| format!("Cursor error: {:?}", e))?;
-    
+    let cursor = db.cursor(&txn).map_err(|e| format!("Cursor error: {:?}", e))?;
+
     let mut current = cursor;
     if let Ok(Some((key, value))) = current.first() {
         result.insert(key.to_vec(), value.to_vec());
@@ -121,38 +116,36 @@ fn execute_zerodb(config: &TestConfig) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, Str
             result.insert(key.to_vec(), value.to_vec());
         }
     }
-    
+
     Ok(result)
 }
 
 /// Execute operations on original heed (LMDB)
 fn execute_heed_lmdb(config: &TestConfig) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, String> {
-    use heed::{EnvOpenOptions, Database as HeedDatabase};
     use heed::types::Bytes;
-    
+    use heed::{Database as HeedDatabase, EnvOpenOptions};
+
     let dir = TempDir::new().map_err(|e| format!("TempDir error: {}", e))?;
-    
+
     let env = unsafe {
         EnvOpenOptions::new()
             .map_size(config.map_size)
             .open(dir.path())
             .map_err(|e| format!("Env open error: {:?}", e))?
     };
-    
+
     let db: HeedDatabase<Bytes, Bytes> = {
-        let mut txn = env.write_txn()
-            .map_err(|e| format!("Begin write txn error: {:?}", e))?;
-        let db = env.create_database(&mut txn, None)
-            .map_err(|e| format!("Create db error: {:?}", e))?;
+        let mut txn = env.write_txn().map_err(|e| format!("Begin write txn error: {:?}", e))?;
+        let db =
+            env.create_database(&mut txn, None).map_err(|e| format!("Create db error: {:?}", e))?;
         txn.commit().map_err(|e| format!("Commit error: {:?}", e))?;
         db
     };
-    
+
     // Execute operations
     for op in &config.operations {
-        let mut txn = env.write_txn()
-            .map_err(|e| format!("Begin write txn error: {:?}", e))?;
-        
+        let mut txn = env.write_txn().map_err(|e| format!("Begin write txn error: {:?}", e))?;
+
         match op {
             DbOperation::Put(key, value) => {
                 // Skip empty keys which are invalid
@@ -167,29 +160,28 @@ fn execute_heed_lmdb(config: &TestConfig) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, 
                 if key.is_empty() {
                     continue;
                 }
-                let _ = db.delete(&mut txn, key.as_slice())
+                let _ = db
+                    .delete(&mut txn, key.as_slice())
                     .map_err(|e| format!("Delete error: {:?}", e))?;
             }
             DbOperation::Clear => {
-                db.clear(&mut txn)
-                    .map_err(|e| format!("Clear error: {:?}", e))?;
+                db.clear(&mut txn).map_err(|e| format!("Clear error: {:?}", e))?;
             }
         }
-        
+
         txn.commit().map_err(|e| format!("Commit error: {:?}", e))?;
     }
-    
+
     // Read final state
-    let txn = env.read_txn()
-        .map_err(|e| format!("Begin read txn error: {:?}", e))?;
-    
+    let txn = env.read_txn().map_err(|e| format!("Begin read txn error: {:?}", e))?;
+
     let mut result = BTreeMap::new();
-    
+
     for entry in db.iter(&txn).map_err(|e| format!("Iter error: {:?}", e))? {
         let (key, value) = entry.map_err(|e| format!("Entry error: {:?}", e))?;
         result.insert(key.to_vec(), value.to_vec());
     }
-    
+
     Ok(result)
 }
 
@@ -198,7 +190,7 @@ fn prop_same_results(config: TestConfig) -> TestResult {
     if config.operations.is_empty() {
         return TestResult::discard();
     }
-    
+
     // Execute on both implementations
     let zerodb_result = match execute_zerodb(&config) {
         Ok(r) => r,
@@ -207,7 +199,7 @@ fn prop_same_results(config: TestConfig) -> TestResult {
             return TestResult::error(format!("zerodb failed: {}", e));
         }
     };
-    
+
     let heed_lmdb_result = match execute_heed_lmdb(&config) {
         Ok(r) => r,
         Err(e) => {
@@ -215,7 +207,7 @@ fn prop_same_results(config: TestConfig) -> TestResult {
             return TestResult::error(format!("heed-lmdb failed: {}", e));
         }
     };
-    
+
     // Compare results
     if zerodb_result == heed_lmdb_result {
         TestResult::passed()
@@ -233,7 +225,7 @@ fn prop_sequential_inserts(keys: Vec<Vec<u8>>, values: Vec<Vec<u8>>) -> TestResu
     if keys.is_empty() || keys.len() != values.len() {
         return TestResult::discard();
     }
-    
+
     let mut operations = Vec::new();
     for (key, value) in keys.into_iter().zip(values.into_iter()) {
         // Skip empty keys
@@ -242,12 +234,9 @@ fn prop_sequential_inserts(keys: Vec<Vec<u8>>, values: Vec<Vec<u8>>) -> TestResu
         }
         operations.push(DbOperation::Put(key, value));
     }
-    
-    let config = TestConfig {
-        operations,
-        map_size: 10 * 1024 * 1024,
-    };
-    
+
+    let config = TestConfig { operations, map_size: 10 * 1024 * 1024 };
+
     prop_same_results(config)
 }
 
@@ -256,9 +245,9 @@ fn prop_insert_delete_pattern(keys: Vec<Vec<u8>>) -> TestResult {
     if keys.is_empty() {
         return TestResult::discard();
     }
-    
+
     let mut operations = Vec::new();
-    
+
     // Insert all keys
     for key in &keys {
         if key.is_empty() {
@@ -266,19 +255,16 @@ fn prop_insert_delete_pattern(keys: Vec<Vec<u8>>) -> TestResult {
         }
         operations.push(DbOperation::Put(key.clone(), key.clone())); // Use key as value
     }
-    
+
     // Delete half of them
     for (i, key) in keys.iter().enumerate() {
         if i % 2 == 0 && !key.is_empty() {
             operations.push(DbOperation::Delete(key.clone()));
         }
     }
-    
-    let config = TestConfig {
-        operations,
-        map_size: 10 * 1024 * 1024,
-    };
-    
+
+    let config = TestConfig { operations, map_size: 10 * 1024 * 1024 };
+
     prop_same_results(config)
 }
 
@@ -290,15 +276,12 @@ fn test_specific_failure_case() {
         DbOperation::Put(vec![7, 8, 9], vec![10, 11, 12]),
         DbOperation::Delete(vec![1, 2, 3]),
     ];
-    
-    let config = TestConfig {
-        operations,
-        map_size: 10 * 1024 * 1024,
-    };
-    
+
+    let config = TestConfig { operations, map_size: 10 * 1024 * 1024 };
+
     let zerodb_result = execute_zerodb(&config).unwrap();
     let heed_lmdb_result = execute_heed_lmdb(&config).unwrap();
-    
+
     assert_eq!(zerodb_result, heed_lmdb_result);
 }
 
@@ -311,15 +294,12 @@ fn test_clear_operation() {
         DbOperation::Clear,
         DbOperation::Put(vec![4], vec![4]),
     ];
-    
-    let config = TestConfig {
-        operations,
-        map_size: 10 * 1024 * 1024,
-    };
-    
+
+    let config = TestConfig { operations, map_size: 10 * 1024 * 1024 };
+
     let zerodb_result = execute_zerodb(&config).unwrap();
     let heed_lmdb_result = execute_heed_lmdb(&config).unwrap();
-    
+
     assert_eq!(zerodb_result, heed_lmdb_result);
     assert_eq!(zerodb_result.len(), 1);
     assert_eq!(zerodb_result.get(&vec![4]), Some(&vec![4]));
@@ -333,21 +313,18 @@ fn prop_quickcheck_operations(config: TestConfig) -> TestResult {
 #[test]
 fn test_large_values() {
     let large_value = vec![42u8; 5000]; // 5KB value to trigger overflow pages
-    
+
     let operations = vec![
         DbOperation::Put(vec![1], large_value.clone()),
         DbOperation::Put(vec![2], vec![1, 2, 3]),
         DbOperation::Put(vec![3], large_value.clone()),
         DbOperation::Delete(vec![1]),
     ];
-    
-    let config = TestConfig {
-        operations,
-        map_size: 10 * 1024 * 1024,
-    };
-    
+
+    let config = TestConfig { operations, map_size: 10 * 1024 * 1024 };
+
     let zerodb_result = execute_zerodb(&config).unwrap();
     let heed_lmdb_result = execute_heed_lmdb(&config).unwrap();
-    
+
     assert_eq!(zerodb_result, heed_lmdb_result);
 }

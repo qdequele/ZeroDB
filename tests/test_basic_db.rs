@@ -1,18 +1,14 @@
-use zerodb::{EnvBuilder, Database};
 use std::sync::Arc;
+use zerodb::{Database, EnvBuilder};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = tempfile::TempDir::new()?;
     println!("Creating environment at: {:?}", dir.path());
-    
-    let env = Arc::new(
-        EnvBuilder::new()
-            .map_size(10 * 1024 * 1024)
-            .open(dir.path())?
-    );
-    
+
+    let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
+
     println!("Environment created");
-    
+
     // Create database
     let db: Database<Vec<u8>, Vec<u8>> = {
         let mut txn = env.begin_write_txn()?;
@@ -23,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Transaction committed");
         db
     };
-    
+
     // Try a simple put/get
     {
         let mut txn = env.begin_write_txn()?;
@@ -33,14 +29,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         txn.commit()?;
         println!("Committed");
     }
-    
+
     {
         let txn = env.begin_txn()?;
         println!("\nReading value...");
         let val = db.get(&txn, &b"test".to_vec())?;
         println!("Got: {:?}", val.map(|v| String::from_utf8_lossy(&v).to_string()));
     }
-    
+
     // Now try with larger value that needs overflow
     {
         let mut txn = env.begin_write_txn()?;
@@ -52,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         txn.commit()?;
         println!("Committed");
     }
-    
+
     // Read it back
     {
         let txn = env.begin_txn()?;
@@ -63,7 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => println!("ERROR: Large value not found!"),
         }
     }
-    
+
     // Now update the large value
     {
         let mut txn = env.begin_write_txn()?;
@@ -74,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         txn.commit()?;
         println!("Committed");
     }
-    
+
     // Read updated value
     {
         let txn = env.begin_txn()?;
@@ -90,6 +86,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => println!("ERROR: Updated value not found!"),
         }
     }
-    
+
     Ok(())
 }

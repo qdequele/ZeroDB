@@ -1,12 +1,12 @@
 //! I/O operations with io_uring support
 
+use crate::error::{Error, PageId, Result};
+use crate::page::{Page, PageHeader, PAGE_SIZE};
+use memmap2::{MmapMut, MmapOptions};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use memmap2::{MmapMut, MmapOptions};
-use crate::error::{Result, Error, PageId};
-use crate::page::{Page, PageHeader, PAGE_SIZE};
+use std::sync::{Arc, Mutex};
 
 /// Memory access advice for madvise
 #[derive(Debug, Clone, Copy)]
@@ -25,9 +25,9 @@ pub enum MadviseAdvice {
 pub trait IoBackend: Send + Sync {
     /// Read a page from disk (allocating)
     fn read_page(&self, page_id: PageId) -> Result<Box<Page>>;
-    
+
     /// Get a zero-copy page reference
-    /// 
+    ///
     /// # Safety
     /// The caller must ensure the returned reference is not used beyond the lifetime
     /// of the transaction that owns it.
@@ -37,19 +37,19 @@ pub trait IoBackend: Send + Sync {
         let _ = page_id;
         Err(Error::Custom("Zero-copy not supported by this backend".into()))
     }
-    
+
     /// Write a page to disk
     fn write_page(&self, page: &Page) -> Result<()>;
-    
+
     /// Sync data to disk
     fn sync(&self) -> Result<()>;
-    
+
     /// Get the current size in pages
     fn size_in_pages(&self) -> u64;
-    
+
     /// Grow the file to accommodate more pages
     fn grow(&self, new_size: u64) -> Result<()>;
-    
+
     /// Get as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
 }
@@ -74,11 +74,11 @@ impl MmapBackend {
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         Self::with_options(path, 10 * 1024 * 1024) // Default 10MB
     }
-    
+
     /// Create with initial size
     pub fn with_options(path: impl AsRef<Path>, initial_size: u64) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        
+
         // Open or create the file
         let file = OpenOptions::new()
             .read(true)
@@ -86,22 +86,22 @@ impl MmapBackend {
             .create(true)
             .open(&path)
             .map_err(|e| Error::Io(e.to_string()))?;
-        
+
         // Get current file size
         let metadata = file.metadata().map_err(|e| Error::Io(e.to_string()))?;
         let mut file_size = metadata.len();
-        
+
         // Ensure minimum size
         let min_size = PAGE_SIZE as u64 * 4; // At least 4 pages (2 meta + 2 data)
         if file_size < min_size {
             file_size = initial_size.max(min_size);
             file.set_len(file_size).map_err(|e| Error::Io(e.to_string()))?;
         }
-        
+
         // Ensure size is page-aligned
         let page_size = PAGE_SIZE;
         file_size = (file_size / page_size as u64) * page_size as u64;
-        
+
         // Create memory map
         let mmap = unsafe {
             MmapOptions::new()
@@ -109,7 +109,7 @@ impl MmapBackend {
                 .map_mut(&file)
                 .map_err(|e| Error::Io(e.to_string()))?
         };
-        
+
         Ok(Self {
             file,
             mmap: Arc::new(Mutex::new(mmap)),
@@ -118,58 +118,58 @@ impl MmapBackend {
             path,
         })
     }
-    
+
     /// Advise the kernel about memory access patterns
     #[cfg(unix)]
     pub fn madvise(&self, advice: MadviseAdvice) -> Result<()> {
         let mmap = self.mmap.lock().unwrap();
         let ptr = mmap.as_ptr() as *mut libc::c_void;
         let len = self.file_size.load(Ordering::Acquire) as usize;
-        
+
         let advice_flag = match advice {
             MadviseAdvice::Sequential => libc::MADV_SEQUENTIAL,
             MadviseAdvice::Random => libc::MADV_RANDOM,
             MadviseAdvice::WillNeed => libc::MADV_WILLNEED,
             MadviseAdvice::DontNeed => libc::MADV_DONTNEED,
         };
-        
+
         let result = unsafe { libc::madvise(ptr, len, advice_flag) };
-        
+
         if result != 0 {
             return Err(Error::Io(std::io::Error::last_os_error().to_string()));
         }
-        
+
         Ok(())
     }
-    
+
     /// Prefetch pages into memory
     pub fn prefetch_pages(&self, start_page: PageId, num_pages: usize) -> Result<()> {
         let offset = start_page.0 as usize * self.page_size;
         let len = num_pages * self.page_size;
         let size = self.file_size.load(Ordering::Acquire) as usize;
-        
+
         if offset + len > size {
             return Err(Error::InvalidPageId(start_page));
         }
-        
+
         #[cfg(unix)]
         {
             let mmap = self.mmap.lock().unwrap();
             let ptr = unsafe { mmap.as_ptr().add(offset) } as *mut libc::c_void;
-            
+
             // Use madvise WILLNEED to prefetch
             let result = unsafe { libc::madvise(ptr, len, libc::MADV_WILLNEED) };
-            
+
             if result != 0 {
                 return Err(Error::Io(std::io::Error::last_os_error().to_string()));
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Get a raw pointer to the mmap base
-    /// 
+    ///
     /// # Safety
     /// The caller must ensure proper synchronization when accessing the memory
     #[inline]
@@ -180,27 +180,22 @@ impl MmapBackend {
         let mmap = self.mmap.lock().unwrap();
         mmap.as_ptr()
     }
-    
+
     /// Get a mutable slice of the memory map for a page
     #[allow(dead_code)]
     fn get_page_slice_mut(&self, page_id: PageId) -> Result<&mut [u8]> {
         let offset = page_id.0 as usize * self.page_size;
         let size = self.file_size.load(Ordering::Acquire) as usize;
-        
+
         if offset + self.page_size > size {
             return Err(Error::InvalidPageId(page_id));
         }
-        
+
         // This is safe because we have exclusive access through the mmap mutex
         let mut mmap = self.mmap.lock().unwrap();
         let ptr = mmap.as_mut_ptr();
-        
-        unsafe {
-            Ok(std::slice::from_raw_parts_mut(
-                ptr.add(offset),
-                self.page_size
-            ))
-        }
+
+        unsafe { Ok(std::slice::from_raw_parts_mut(ptr.add(offset), self.page_size)) }
     }
 }
 
@@ -208,43 +203,43 @@ impl IoBackend for MmapBackend {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-    
+
     #[inline]
     fn read_page(&self, page_id: PageId) -> Result<Box<Page>> {
         let offset = page_id.0 as usize * self.page_size;
         let size = self.file_size.load(Ordering::Acquire) as usize;
-        
+
         if offset + self.page_size > size {
             return Err(Error::InvalidPageId(page_id));
         }
-        
+
         let mmap = self.mmap.lock().unwrap();
-        
+
         // Create a boxed page to hold the data
         let mut page = Page::new(page_id, crate::page::PageFlags::empty());
-        
+
         // Copy the entire page data
         let src = &mmap[offset..offset + self.page_size];
         unsafe {
             std::ptr::copy_nonoverlapping(
                 src.as_ptr(),
                 page.as_mut() as *mut Page as *mut u8,
-                self.page_size
+                self.page_size,
             );
         }
-        
+
         Ok(page)
     }
-    
+
     #[inline]
     unsafe fn get_page_ref<'a>(&self, page_id: PageId) -> Result<&'a Page> {
         let offset = page_id.0 as usize * self.page_size;
         let size = self.file_size.load(Ordering::Acquire) as usize;
-        
+
         if offset + self.page_size > size {
             return Err(Error::InvalidPageId(page_id));
         }
-        
+
         // Get the base pointer without holding the lock
         // This is safe because:
         // 1. The mmap base address is stable until grow() is called
@@ -252,60 +247,60 @@ impl IoBackend for MmapBackend {
         // 3. Read transactions cannot call grow()
         let base_ptr = unsafe { self.mmap_ptr() };
         let page_ptr = unsafe { base_ptr.add(offset) } as *const Page;
-        
+
         // Return a reference with the requested lifetime
         // The caller is responsible for ensuring this lifetime is valid
         Ok(unsafe { &*page_ptr })
     }
-    
+
     fn write_page(&self, page: &Page) -> Result<()> {
         let page_id = PageId(page.header.pgno);
         let offset = page_id.0 as usize * self.page_size;
         let size = self.file_size.load(Ordering::Acquire) as usize;
-        
+
         if offset + self.page_size > size {
             return Err(Error::InvalidPageId(page_id));
         }
-        
+
         let mut mmap = self.mmap.lock().unwrap();
-        
+
         // Write the entire page data
         let dst = &mut mmap[offset..offset + self.page_size];
         unsafe {
             std::ptr::copy_nonoverlapping(
                 page as *const Page as *const u8,
                 dst.as_mut_ptr(),
-                self.page_size
+                self.page_size,
             );
         }
-        
+
         Ok(())
     }
-    
+
     fn sync(&self) -> Result<()> {
         let mmap = self.mmap.lock().unwrap();
         mmap.flush().map_err(|e| Error::Io(e.to_string()))?;
         Ok(())
     }
-    
+
     fn size_in_pages(&self) -> u64 {
         self.file_size.load(Ordering::Acquire) / self.page_size as u64
     }
-    
+
     fn grow(&self, new_size: u64) -> Result<()> {
         let new_size_bytes = new_size * self.page_size as u64;
         let current_size = self.file_size.load(Ordering::Acquire);
-        
+
         if new_size_bytes <= current_size {
             return Ok(());
         }
-        
+
         // Grow the file
         self.file.set_len(new_size_bytes).map_err(|e| Error::Io(e.to_string()))?;
-        
+
         // Remap
         let mut mmap_guard = self.mmap.lock().unwrap();
-        
+
         // Create new mmap
         let new_mmap = unsafe {
             MmapOptions::new()
@@ -313,13 +308,13 @@ impl IoBackend for MmapBackend {
                 .map_mut(&self.file)
                 .map_err(|e| Error::Io(e.to_string()))?
         };
-        
+
         // Replace the old mmap
         *mmap_guard = new_mmap;
-        
+
         // Update size
         self.file_size.store(new_size_bytes, Ordering::Release);
-        
+
         Ok(())
     }
 }
@@ -337,14 +332,12 @@ impl<'a> PageRef<'a> {
         }
         Ok(Self { data })
     }
-    
+
     /// Get the page header
     pub fn header(&self) -> &PageHeader {
-        unsafe {
-            &*(self.data.as_ptr() as *const PageHeader)
-        }
+        unsafe { &*(self.data.as_ptr() as *const PageHeader) }
     }
-    
+
     /// Get page data (excluding header)
     pub fn data(&self) -> &[u8] {
         &self.data[std::mem::size_of::<PageHeader>()..]
@@ -364,21 +357,17 @@ impl<'a> PageRefMut<'a> {
         }
         Ok(Self { data })
     }
-    
+
     /// Get the page header
     pub fn header(&self) -> &PageHeader {
-        unsafe {
-            &*(self.data.as_ptr() as *const PageHeader)
-        }
+        unsafe { &*(self.data.as_ptr() as *const PageHeader) }
     }
-    
+
     /// Get mutable page header
     pub fn header_mut(&mut self) -> &mut PageHeader {
-        unsafe {
-            &mut *(self.data.as_mut_ptr() as *mut PageHeader)
-        }
+        unsafe { &mut *(self.data.as_mut_ptr() as *mut PageHeader) }
     }
-    
+
     /// Get mutable page data (excluding header)
     pub fn data_mut(&mut self) -> &mut [u8] {
         let header_size = std::mem::size_of::<PageHeader>();
@@ -391,26 +380,28 @@ impl<'a> PageRefMut<'a> {
 pub fn lock_file(file: &File) -> Result<()> {
     use libc::{flock, LOCK_EX, LOCK_NB};
     use std::os::unix::io::AsRawFd;
-    
+
     let fd = file.as_raw_fd();
     let result = unsafe { flock(fd, LOCK_EX | LOCK_NB) };
-    
+
     if result != 0 {
         return Err(Error::Custom("Failed to acquire file lock".into()));
     }
-    
+
     Ok(())
 }
 
 #[cfg(windows)]
 pub fn lock_file(file: &File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
     use windows_sys::Win32::System::IO::OVERLAPPED;
-    
+
     let handle = file.as_raw_handle() as isize;
     let mut overlapped = OVERLAPPED::default();
-    
+
     let result = unsafe {
         LockFileEx(
             handle,
@@ -421,11 +412,11 @@ pub fn lock_file(file: &File) -> Result<()> {
             &mut overlapped,
         )
     };
-    
+
     if result == 0 {
         return Err(Error::Custom("Failed to acquire file lock".into()));
     }
-    
+
     Ok(())
 }
 
@@ -449,7 +440,7 @@ impl IoUringBackend {
         let mmap = MmapBackend::new(path)?;
         let ring = io_uring::IoUring::new(256)
             .map_err(|e| Error::Io(std::io::Error::from(e).to_string()))?;
-        
+
         Ok(Self { mmap, ring })
     }
 }
@@ -461,23 +452,23 @@ impl IoBackend for IoUringBackend {
         // TODO: Implement async io_uring operations
         self.mmap.read_page(page_id)
     }
-    
+
     fn write_page(&self, page: &Page) -> Result<()> {
         self.mmap.write_page(page)
     }
-    
+
     fn sync(&self) -> Result<()> {
         self.mmap.sync()
     }
-    
+
     fn size_in_pages(&self) -> u64 {
         self.mmap.size_in_pages()
     }
-    
+
     fn grow(&self, new_size: u64) -> Result<()> {
         self.mmap.grow(new_size)
     }
-    
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

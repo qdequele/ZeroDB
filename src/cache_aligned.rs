@@ -3,9 +3,9 @@
 //! This module provides cache-line aligned versions of common data structures
 //! to prevent false sharing and improve cache efficiency.
 
+use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::cell::UnsafeCell;
 
 /// CPU cache line size (64 bytes on most modern x86_64 and ARM processors)
 #[cfg(target_arch = "x86_64")]
@@ -27,24 +27,21 @@ macro_rules! cache_aligned {
             inner: $inner,
             _padding: [u8; CACHE_LINE_SIZE - std::mem::size_of::<$inner>()],
         }
-        
+
         impl $name {
             pub fn new(inner: $inner) -> Self {
-                Self {
-                    inner,
-                    _padding: [0; CACHE_LINE_SIZE - std::mem::size_of::<$inner>()],
-                }
+                Self { inner, _padding: [0; CACHE_LINE_SIZE - std::mem::size_of::<$inner>()] }
             }
         }
-        
+
         impl std::ops::Deref for $name {
             type Target = $inner;
-            
+
             fn deref(&self) -> &Self::Target {
                 &self.inner
             }
         }
-        
+
         impl std::ops::DerefMut for $name {
             fn deref_mut(&mut self) -> &mut Self::Target {
                 &mut self.inner
@@ -63,24 +60,21 @@ pub struct CacheAlignedCounter {
 impl CacheAlignedCounter {
     /// Create a new cache-aligned counter with the given initial value
     pub const fn new(value: u64) -> Self {
-        Self {
-            value: AtomicU64::new(value),
-            _padding: [0; CACHE_LINE_SIZE - 8],
-        }
+        Self { value: AtomicU64::new(value), _padding: [0; CACHE_LINE_SIZE - 8] }
     }
-    
+
     /// Increment the counter and return the previous value
     #[inline]
     pub fn increment(&self) -> u64 {
         self.value.fetch_add(1, Ordering::Relaxed)
     }
-    
+
     /// Get the current value of the counter
     #[inline]
     pub fn get(&self) -> u64 {
         self.value.load(Ordering::Relaxed)
     }
-    
+
     /// Add a value to the counter and return the previous value
     #[inline]
     pub fn add(&self, val: u64) -> u64 {
@@ -115,7 +109,7 @@ impl<T> CacheAlignedQueue<T> {
     /// Create a new queue with the given capacity (must be power of 2)
     pub fn new(capacity: usize) -> Self {
         assert!(capacity.is_power_of_two(), "Capacity must be power of 2");
-        
+
         let mut buffer = Vec::with_capacity(capacity);
         for i in 0..capacity {
             buffer.push(CacheAlignedSlot {
@@ -123,7 +117,7 @@ impl<T> CacheAlignedQueue<T> {
                 data: UnsafeCell::new(MaybeUninit::uninit()),
             });
         }
-        
+
         Self {
             head: CacheAlignedCounter::new(0),
             tail: CacheAlignedCounter::new(0),
@@ -131,17 +125,17 @@ impl<T> CacheAlignedQueue<T> {
             capacity_mask: capacity - 1,
         }
     }
-    
+
     /// Try to enqueue an item
     pub fn try_enqueue(&self, item: T) -> Result<(), T> {
         let mut tail = self.tail.get() as usize;
-        
+
         loop {
             let slot = &self.buffer[tail & self.capacity_mask];
             let seq = slot.sequence.load(Ordering::Acquire);
-            
+
             let diff = seq as isize - tail as isize;
-            
+
             if diff == 0 {
                 // Slot is ready for writing
                 match self.tail.value.compare_exchange_weak(
@@ -171,17 +165,17 @@ impl<T> CacheAlignedQueue<T> {
             }
         }
     }
-    
+
     /// Try to dequeue an item
     pub fn try_dequeue(&self) -> Option<T> {
         let mut head = self.head.get() as usize;
-        
+
         loop {
             let slot = &self.buffer[head & self.capacity_mask];
             let seq = slot.sequence.load(Ordering::Acquire);
-            
+
             let diff = seq as isize - (head + 1) as isize;
-            
+
             if diff == 0 {
                 // Slot has data
                 match self.head.value.compare_exchange_weak(
@@ -192,9 +186,7 @@ impl<T> CacheAlignedQueue<T> {
                 ) {
                     Ok(_) => {
                         // We got the slot, read data
-                        let item = unsafe {
-                            (*slot.data.get()).assume_init_read()
-                        };
+                        let item = unsafe { (*slot.data.get()).assume_init_read() };
                         slot.sequence.store(head + self.buffer.len() + 1, Ordering::Release);
                         return Some(item);
                     }
@@ -245,27 +237,27 @@ impl CacheAlignedStats {
             bytes_written: CacheAlignedCounter::new(0),
         }
     }
-    
+
     /// Record a page read
     #[inline]
     pub fn record_page_read(&self, size: usize) {
         self.page_reads.increment();
         self.bytes_read.add(size as u64);
     }
-    
+
     /// Record a page write
     #[inline]
     pub fn record_page_write(&self, size: usize) {
         self.page_writes.increment();
         self.bytes_written.add(size as u64);
     }
-    
+
     /// Record a cache hit
     #[inline]
     pub fn record_cache_hit(&self) {
         self.cache_hits.increment();
     }
-    
+
     /// Record a cache miss
     #[inline]
     pub fn record_cache_miss(&self) {
@@ -289,7 +281,7 @@ impl<T> Padded<T> {
 
 impl<T> std::ops::Deref for Padded<T> {
     type Target = T;
-    
+
     fn deref(&self) -> &Self::Target {
         &self.data
     }
@@ -305,43 +297,43 @@ impl<T> std::ops::DerefMut for Padded<T> {
 mod tests {
     use super::*;
     use std::mem;
-    
+
     #[test]
     fn test_cache_alignment() {
         // Test that our structures are properly aligned
         assert_eq!(mem::align_of::<CacheAlignedCounter>(), CACHE_LINE_SIZE);
         assert_eq!(mem::size_of::<CacheAlignedCounter>(), CACHE_LINE_SIZE);
-        
+
         let counter = CacheAlignedCounter::new(0);
         let addr = &counter as *const _ as usize;
         assert_eq!(addr % CACHE_LINE_SIZE, 0, "Counter not cache aligned");
     }
-    
+
     #[test]
     fn test_cache_aligned_queue() {
         let queue = CacheAlignedQueue::new(16);
-        
+
         // Test enqueue/dequeue
         for i in 0..10 {
             assert!(queue.try_enqueue(i).is_ok());
         }
-        
+
         for i in 0..10 {
             assert_eq!(queue.try_dequeue(), Some(i));
         }
-        
+
         assert_eq!(queue.try_dequeue(), None);
     }
-    
+
     #[test]
     fn test_stats_collector() {
         let stats = CacheAlignedStats::new();
-        
+
         stats.record_page_read(4096);
         stats.record_page_write(4096);
         stats.record_cache_hit();
         stats.record_cache_miss();
-        
+
         assert_eq!(stats.page_reads.get(), 1);
         assert_eq!(stats.page_writes.get(), 1);
         assert_eq!(stats.cache_hits.get(), 1);

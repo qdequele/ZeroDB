@@ -1,9 +1,9 @@
 //! Meta page and database metadata management
 
-use std::mem::size_of;
-use static_assertions::const_assert;
-use crate::error::{Error, Result, PageId, TransactionId};
+use crate::error::{Error, PageId, Result, TransactionId};
 use crate::page::{Page, PageFlags, PAGE_SIZE};
+use static_assertions::const_assert;
+use std::mem::size_of;
 
 /// Page ID for meta page 1
 pub const META_PAGE_1: PageId = PageId(0);
@@ -120,7 +120,7 @@ impl MetaPage {
             free_db: DbInfo::default(),
         }
     }
-    
+
     /// Validate the meta page
     pub fn validate(&self) -> Result<()> {
         if self.magic != MAGIC {
@@ -129,38 +129,35 @@ impl MetaPage {
                 page_id: None,
             });
         }
-        
+
         if self.version != DB_VERSION {
-            return Err(Error::VersionMismatch {
-                expected: DB_VERSION,
-                found: self.version,
-            });
+            return Err(Error::VersionMismatch { expected: DB_VERSION, found: self.version });
         }
-        
+
         if self.psize as usize != PAGE_SIZE {
             return Err(Error::Corruption {
                 details: format!("Invalid page size: {}", self.psize),
                 page_id: None,
             });
         }
-        
+
         Ok(())
     }
-    
+
     /// Convert to a page
     pub fn to_page(&self, pgno: u64) -> Box<Page> {
         let mut page = Page::new(PageId(pgno), PageFlags::META);
-        
+
         // Copy meta page data into page
         unsafe {
             let meta_ptr = page.data.as_mut_ptr() as *mut MetaPage;
             *meta_ptr = *self;
             (*meta_ptr).address = meta_ptr;
         }
-        
+
         page
     }
-    
+
     /// Create from a page
     pub fn from_page(page: &Page) -> Result<&Self> {
         if !page.header.flags.contains(PageFlags::META) {
@@ -169,7 +166,7 @@ impl MetaPage {
                 found: page.header.page_type(),
             });
         }
-        
+
         let meta = unsafe { &*(page.data.as_ptr() as *const MetaPage) };
         meta.validate()?;
         Ok(meta)
@@ -181,29 +178,29 @@ const_assert!(size_of::<MetaPage>() < PAGE_SIZE - size_of::<crate::page::PageHea
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_meta_page_size() {
         assert!(size_of::<MetaPage>() < PAGE_SIZE - size_of::<crate::page::PageHeader>());
     }
-    
+
     #[test]
     fn test_meta_page_validation() {
         let meta = MetaPage::new();
         assert!(meta.validate().is_ok());
-        
+
         let mut bad_meta = meta;
         bad_meta.magic = 0xDEADBEEF;
         assert!(bad_meta.validate().is_err());
     }
-    
+
     #[test]
     fn test_meta_page_conversion() {
         let meta = MetaPage::new();
         let page = meta.to_page(0);
-        
+
         assert!(page.header.flags.contains(PageFlags::META));
-        
+
         let meta2 = MetaPage::from_page(&page).unwrap();
         assert_eq!(meta2.magic, MAGIC);
         assert_eq!(meta2.version, DB_VERSION);

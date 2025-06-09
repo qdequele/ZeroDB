@@ -1,20 +1,16 @@
 //! Test B+Tree splitting behavior
 
-use zerodb::env::EnvBuilder;
-use zerodb::db::Database;
 use std::sync::Arc;
 use tempfile::TempDir;
+use zerodb::db::Database;
+use zerodb::env::EnvBuilder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Testing B+Tree splitting...");
-    
+
     let dir = TempDir::new()?;
-    let env = Arc::new(
-        EnvBuilder::new()
-            .map_size(10 * 1024 * 1024)
-            .open(dir.path())?
-    );
-    
+    let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
+
     // Create a database
     let db: Database<String, Vec<u8>> = {
         let mut txn = env.begin_write_txn()?;
@@ -22,47 +18,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         txn.commit()?;
         db
     };
-    
+
     // Insert entries until we trigger a split
     println!("\nPhase 1: Inserting entries to trigger split...");
     let num_entries = 60; // Should be enough to trigger at least one split
-    
+
     {
         let mut txn = env.begin_write_txn()?;
-        
+
         for i in 0..num_entries {
             let key = format!("key_{:03}", i);
             let value = vec![i as u8; 100];
-            
+
             db.put(&mut txn, key.clone(), value)?;
-            
+
             // Check state periodically
             if i % 10 == 9 {
                 let db_info = txn.db_info(Some("test_db"))?;
-                println!("  After {} entries: depth={}, root={:?}", i + 1, db_info.depth, db_info.root);
+                println!(
+                    "  After {} entries: depth={}, root={:?}",
+                    i + 1,
+                    db_info.depth,
+                    db_info.root
+                );
             }
         }
-        
+
         let final_info = txn.db_info(Some("test_db"))?;
-        println!("  Final state: depth={}, entries={}, root={:?}", 
-                 final_info.depth, final_info.entries, final_info.root);
-        
+        println!(
+            "  Final state: depth={}, entries={}, root={:?}",
+            final_info.depth, final_info.entries, final_info.root
+        );
+
         txn.commit()?;
     }
-    
+
     // Phase 2: Verify all entries are still there
     println!("\nPhase 2: Verifying all entries...");
     {
         let txn = env.begin_txn()?;
         let mut cursor = db.cursor(&txn)?;
-        
+
         let mut found_keys = Vec::new();
         while let Some((key, _value)) = cursor.next()? {
             found_keys.push(String::from_utf8_lossy(&key).to_string());
         }
-        
+
         println!("  Found {} entries", found_keys.len());
-        
+
         // Check if all keys are present
         let mut missing = Vec::new();
         for i in 0..num_entries {
@@ -71,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 missing.push(expected_key);
             }
         }
-        
+
         if missing.is_empty() {
             println!("  ✓ All entries found!");
         } else {
@@ -80,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("    - {}", key);
             }
         }
-        
+
         // Also check ordering
         let mut sorted = found_keys.clone();
         sorted.sort();
@@ -90,12 +93,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  ✗ Entries are not in correct order");
         }
     }
-    
+
     // Phase 3: Random access test
     println!("\nPhase 3: Random access test...");
     {
         let txn = env.begin_txn()?;
-        
+
         let test_keys = vec![0, 15, 30, 45, 59];
         for i in test_keys {
             let key = format!("key_{:03}", i);
@@ -113,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    
+
     println!("\nB+Tree split test completed");
     Ok(())
 }

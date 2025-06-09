@@ -1,25 +1,21 @@
 //! Debug environment initialization step by step
 
-use zerodb::{EnvBuilder};
+use std::sync::Arc;
 use zerodb::error::Result;
 use zerodb::page::PageFlags;
-use std::sync::Arc;
+use zerodb::EnvBuilder;
 
 fn main() -> Result<()> {
     println!("=== Debug Environment Initialization ===\n");
-    
+
     // Create environment
     let dir = tempfile::tempdir().unwrap();
     println!("Creating environment at: {:?}", dir.path());
-    
-    let env = Arc::new(
-        EnvBuilder::new()
-            .map_size(10 * 1024 * 1024)
-            .open(dir.path())?
-    );
-    
+
+    let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
+
     println!("✓ Environment created");
-    
+
     // Get environment stats
     println!("\n--- Environment Stats ---");
     match env.stat() {
@@ -36,13 +32,13 @@ fn main() -> Result<()> {
             println!("✗ Failed to get stats: {:?}", e);
         }
     }
-    
+
     // Try a transaction
     println!("\n--- Testing Transaction ---");
     {
         let mut txn = env.begin_write_txn()?;
         println!("✓ Write transaction created (ID: {})", txn.id().0);
-        
+
         // Check if we can get db info
         match txn.db_info(None) {
             Ok(info) => {
@@ -55,7 +51,7 @@ fn main() -> Result<()> {
                 println!("✗ Failed to get main DB info: {:?}", e);
             }
         }
-        
+
         // Try to allocate a page
         match txn.alloc_page(PageFlags::LEAF) {
             Ok((page_id, page)) => {
@@ -66,19 +62,20 @@ fn main() -> Result<()> {
                 println!("✗ Failed to allocate page: {:?}", e);
             }
         }
-        
+
         txn.commit()?;
         println!("✓ Transaction committed");
     }
-    
+
     // Now try to use the main database
     println!("\n--- Testing Main Database ---");
     {
         use zerodb::db::{Database, DatabaseFlags};
-        
-        let main_db: Database<Vec<u8>, Vec<u8>> = Database::open(&env, None, DatabaseFlags::empty())?;
+
+        let main_db: Database<Vec<u8>, Vec<u8>> =
+            Database::open(&env, None, DatabaseFlags::empty())?;
         println!("✓ Opened main database");
-        
+
         // Check the database info
         {
             let txn = env.begin_txn()?;
@@ -87,7 +84,7 @@ fn main() -> Result<()> {
                 Err(e) => println!("  - Failed to check if empty: {:?}", e),
             }
         }
-        
+
         // Try to get a non-existent key first
         {
             let txn = env.begin_txn()?;
@@ -97,39 +94,45 @@ fn main() -> Result<()> {
                 Err(e) => println!("  - Failed to get nonexistent key: {:?}", e),
             }
         }
-        
+
         // Try to store something
         {
             let mut txn = env.begin_write_txn()?;
             println!("\nAttempting to store data...");
-            
+
             // Debug: check the DB info before put
             match txn.db_info(None) {
                 Ok(info) => {
-                    println!("  - DB info before put: root={}, entries={}", info.root.0, info.entries);
+                    println!(
+                        "  - DB info before put: root={}, entries={}",
+                        info.root.0, info.entries
+                    );
                 }
                 Err(e) => {
                     println!("  - Failed to get DB info: {:?}", e);
                 }
             }
-            
+
             let key = b"test".to_vec();
             let value = b"value".to_vec();
-            
+
             match main_db.put(&mut txn, key, value) {
                 Ok(_) => {
                     println!("✓ Data stored successfully");
-                    
+
                     // Check DB info after put
                     match txn.db_info(None) {
                         Ok(info) => {
-                            println!("  - DB info after put: root={}, entries={}", info.root.0, info.entries);
+                            println!(
+                                "  - DB info after put: root={}, entries={}",
+                                info.root.0, info.entries
+                            );
                         }
                         Err(e) => {
                             println!("  - Failed to get DB info: {:?}", e);
                         }
                     }
-                    
+
                     txn.commit()?;
                     println!("✓ Transaction committed");
                 }
@@ -139,7 +142,7 @@ fn main() -> Result<()> {
                 }
             }
         }
-        
+
         // Try to read it back
         {
             let txn = env.begin_txn()?;
@@ -151,7 +154,7 @@ fn main() -> Result<()> {
             }
         }
     }
-    
+
     println!("\n=== Debug completed successfully ===");
     Ok(())
 }

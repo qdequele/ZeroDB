@@ -8,49 +8,49 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 // #![cfg_attr(feature = "simd", feature(portable_simd))]
 
-pub mod error;
-pub mod page;
-pub mod node;
-pub mod meta;
-pub mod env;
-pub mod txn;
-pub mod db;
-pub mod btree;
-pub mod cursor;
-pub mod overflow;
-pub mod freelist;
-pub mod reader;
-pub mod dupsort;
-pub mod checksum;
-pub mod io;
-pub mod catalog;
-pub mod copy;
+pub mod adaptive_page;
+pub mod batch_commit;
+pub mod bloom_filter;
 pub mod branch;
 pub mod branch_compressed;
-pub mod tree_utils;
-pub mod nested_txn;
+pub mod btree;
+pub mod cache_aligned;
+pub mod catalog;
+pub mod checksum;
 pub mod comparator;
+pub mod copy;
+pub mod cursor;
+pub mod db;
+pub mod dupsort;
+pub mod env;
+pub mod error;
 pub mod fixed_size;
+pub mod freelist;
+pub mod io;
+pub mod io_uring_parallel;
+pub mod meta;
+pub mod nested_txn;
+pub mod node;
+pub mod numa;
+pub mod overflow;
+pub mod page;
+pub mod reader;
+pub mod segregated_freelist;
 pub mod simd;
 pub mod simd_advanced;
-pub mod batch_commit;
-pub mod cache_aligned;
-pub mod io_uring_parallel;
-pub mod adaptive_page;
-pub mod bloom_filter;
-pub mod segregated_freelist;
-pub mod numa;
+pub mod tree_utils;
+pub mod txn;
 
-#[cfg(test)]
-mod io_test;
 #[cfg(test)]
 mod btree_tests;
+#[cfg(test)]
+mod io_test;
 
 // Re-exports
-pub use error::{Error, Result};
-pub use env::{Environment, EnvBuilder};
-pub use txn::{Transaction, ReadTransaction, WriteTransaction};
 pub use db::{Database, DatabaseFlags, Key, Value};
+pub use env::{EnvBuilder, Environment};
+pub use error::{Error, Result};
+pub use txn::{ReadTransaction, Transaction, WriteTransaction};
 
 // Type aliases for common use cases
 /// A read-only transaction

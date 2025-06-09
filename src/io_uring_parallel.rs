@@ -3,9 +3,9 @@
 //! This module implements high-performance parallel I/O operations
 //! using Linux's io_uring interface for maximum throughput.
 
+use crate::error::{Error, PageId, Result};
 #[cfg(all(target_os = "linux", feature = "io_uring"))]
-use io_uring::{IoUring, opcode, types, squeue, cqueue};
-use crate::error::{Result, Error, PageId};
+use io_uring::{cqueue, opcode, squeue, types, IoUring};
 
 /// Configuration for io_uring operations
 pub struct IoUringConfig {
@@ -21,12 +21,7 @@ pub struct IoUringConfig {
 
 impl Default for IoUringConfig {
     fn default() -> Self {
-        Self {
-            sq_entries: 256,
-            concurrent_ops: 64,
-            kernel_poll: true,
-            sq_poll: false,
-        }
+        Self { sq_entries: 256, concurrent_ops: 64, kernel_poll: true, sq_poll: false }
     }
 }
 
@@ -83,7 +78,7 @@ impl ParallelIoUringBackend {
     /// Create a new parallel io_uring backend
     pub fn new(file: std::fs::File, config: IoUringConfig) -> Result<Self> {
         let fd = file.as_raw_fd();
-        
+
         // Create io_uring with configuration
         let mut builder = IoUring::builder();
         if config.kernel_poll {
@@ -92,11 +87,10 @@ impl ParallelIoUringBackend {
         if config.sq_poll {
             builder.setup_sqpoll(1000); // 1ms idle timeout
         }
-        
-        let ring = builder
-            .build(config.sq_entries)
-            .map_err(|e| Error::Io(std::io::Error::from(e)))?;
-        
+
+        let ring =
+            builder.build(config.sq_entries).map_err(|e| Error::Io(std::io::Error::from(e)))?;
+
         Ok(Self {
             ring: Arc::new(Mutex::new(ring)),
             fd,
@@ -107,46 +101,48 @@ impl ParallelIoUringBackend {
             next_req_id: Arc::new(Mutex::new(0)),
         })
     }
-    
+
     /// Submit a batch of page writes in parallel
     pub fn write_pages_parallel(&self, pages: &[(PageId, &Page)]) -> Result<()> {
         let mut ring = self.ring.lock().unwrap();
         let mut in_flight = self.in_flight.lock().unwrap();
         let mut next_req_id = self.next_req_id.lock().unwrap();
-        
+
         // Submit all writes
         let mut submitted = Vec::new();
         for (page_id, page) in pages {
             let offset = page_id.0 as i64 * self.page_size as i64;
-            
+
             // Serialize page data
             let page_data = unsafe {
-                std::slice::from_raw_parts(
-                    page as *const Page as *const u8,
-                    self.page_size
-                )
-            }.to_vec();
-            
+                std::slice::from_raw_parts(page as *const Page as *const u8, self.page_size)
+            }
+            .to_vec();
+
             // Generate request ID
             let req_id = *next_req_id;
             *next_req_id += 1;
-            
+
             // Create write operation
-            let write_op = opcode::Write::new(types::Fd(self.fd), page_data.as_ptr(), page_data.len() as u32)
-                .offset(offset)
-                .build()
-                .user_data(req_id);
-            
+            let write_op =
+                opcode::Write::new(types::Fd(self.fd), page_data.as_ptr(), page_data.len() as u32)
+                    .offset(offset)
+                    .build()
+                    .user_data(req_id);
+
             // Submit to ring
             unsafe {
                 match ring.submission().push(&write_op) {
                     Ok(_) => {
                         // Track in-flight operation
-                        in_flight.insert(req_id, InflightOp {
-                            op_type: OpType::Write(*page_id),
-                            page_data: Some(page_data),
-                            callback: None,
-                        });
+                        in_flight.insert(
+                            req_id,
+                            InflightOp {
+                                op_type: OpType::Write(*page_id),
+                                page_data: Some(page_data),
+                                callback: None,
+                            },
+                        );
                         submitted.push(req_id);
                     }
                     Err(_) => {
@@ -156,15 +152,15 @@ impl ParallelIoUringBackend {
                 }
             }
         }
-        
+
         // Submit all operations
         ring.submit().map_err(|e| Error::Io(std::io::Error::from(e)))?;
-        
+
         // Wait for all completions
         let mut completed = 0;
         while completed < submitted.len() {
             ring.submit_and_wait(1).map_err(|e| Error::Io(std::io::Error::from(e)))?;
-            
+
             // Process completions
             let mut cq = ring.completion();
             for cqe in &mut cq {
@@ -173,20 +169,20 @@ impl ParallelIoUringBackend {
                     if cqe.result() < 0 {
                         return Err(Error::Io(std::io::Error::from_raw_os_error(-cqe.result())));
                     }
-                    
+
                     // Update statistics
                     if let OpType::Write(_) = op.op_type {
                         self.stats.record_page_write(self.page_size);
                     }
-                    
+
                     completed += 1;
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Submit parallel reads with callbacks
     pub fn read_pages_async(
         &self,
@@ -196,62 +192,68 @@ impl ParallelIoUringBackend {
         let mut ring = self.ring.lock().unwrap();
         let mut in_flight = self.in_flight.lock().unwrap();
         let mut next_req_id = self.next_req_id.lock().unwrap();
-        
+
         for (page_id, callback) in page_ids.iter().zip(callbacks) {
             let offset = page_id.0 as i64 * self.page_size as i64;
-            
+
             // Allocate buffer for read
             let mut buffer = vec![0u8; self.page_size];
-            
+
             // Generate request ID
             let req_id = *next_req_id;
             *next_req_id += 1;
-            
+
             // Create read operation
-            let read_op = opcode::Read::new(types::Fd(self.fd), buffer.as_mut_ptr(), buffer.len() as u32)
-                .offset(offset)
-                .build()
-                .user_data(req_id);
-            
+            let read_op =
+                opcode::Read::new(types::Fd(self.fd), buffer.as_mut_ptr(), buffer.len() as u32)
+                    .offset(offset)
+                    .build()
+                    .user_data(req_id);
+
             // Submit to ring
             unsafe {
-                ring.submission().push(&read_op)
+                ring.submission()
+                    .push(&read_op)
                     .map_err(|_| Error::Custom("io_uring submission queue full".into()))?;
             }
-            
+
             // Track in-flight operation with callback
-            in_flight.insert(req_id, InflightOp {
-                op_type: OpType::Read(*page_id),
-                page_data: Some(buffer),
-                callback: Some(Box::new(move |result| {
-                    match result {
-                        Ok(()) => {
-                            // Parse page from buffer
-                            let page = Box::new(Page::new(*page_id, crate::page::PageFlags::empty()));
-                            callback(Ok(page));
+            in_flight.insert(
+                req_id,
+                InflightOp {
+                    op_type: OpType::Read(*page_id),
+                    page_data: Some(buffer),
+                    callback: Some(Box::new(move |result| {
+                        match result {
+                            Ok(()) => {
+                                // Parse page from buffer
+                                let page =
+                                    Box::new(Page::new(*page_id, crate::page::PageFlags::empty()));
+                                callback(Ok(page));
+                            }
+                            Err(e) => callback(Err(e)),
                         }
-                        Err(e) => callback(Err(e)),
-                    }
-                })),
-            });
+                    })),
+                },
+            );
         }
-        
+
         // Submit all operations
         ring.submit().map_err(|e| Error::Io(std::io::Error::from(e)))?;
-        
+
         Ok(())
     }
-    
+
     /// Process completed operations
     pub fn process_completions(&self) -> Result<usize> {
         let mut ring = self.ring.lock().unwrap();
         let mut in_flight = self.in_flight.lock().unwrap();
-        
+
         let mut processed = 0;
-        
+
         // Check for completions without blocking
         ring.submit().map_err(|e| Error::Io(std::io::Error::from(e)))?;
-        
+
         let mut cq = ring.completion();
         for cqe in &mut cq {
             let req_id = cqe.user_data();
@@ -261,74 +263,73 @@ impl ParallelIoUringBackend {
                 } else {
                     Ok(())
                 };
-                
+
                 // Update statistics
                 match op.op_type {
                     OpType::Read(_) => self.stats.record_page_read(self.page_size),
                     OpType::Write(_) => self.stats.record_page_write(self.page_size),
                     OpType::Sync => {}
                 }
-                
+
                 // Call callback if present
                 if let Some(callback) = op.callback.take() {
                     callback(result);
                 }
-                
+
                 processed += 1;
             }
         }
-        
+
         Ok(processed)
     }
-    
+
     /// Submit a vectored write for multiple pages
     pub fn writev_pages(&self, pages: &[(PageId, &Page)]) -> Result<()> {
         if pages.is_empty() {
             return Ok(());
         }
-        
+
         let mut ring = self.ring.lock().unwrap();
         let mut next_req_id = self.next_req_id.lock().unwrap();
-        
+
         // Prepare iovecs
         let mut iovecs = Vec::with_capacity(pages.len());
         let mut buffers = Vec::with_capacity(pages.len());
-        
+
         for (page_id, page) in pages {
             let offset = page_id.0 as i64 * self.page_size as i64;
-            
+
             // Create iovec for this page
             let page_data = unsafe {
-                std::slice::from_raw_parts(
-                    page as *const Page as *const u8,
-                    self.page_size
-                )
+                std::slice::from_raw_parts(page as *const Page as *const u8, self.page_size)
             };
-            
+
             buffers.push(page_data);
             iovecs.push(libc::iovec {
                 iov_base: page_data.as_ptr() as *mut libc::c_void,
                 iov_len: self.page_size,
             });
         }
-        
+
         // Submit vectored write
         let req_id = *next_req_id;
         *next_req_id += 1;
-        
-        let writev_op = opcode::Writev::new(types::Fd(self.fd), iovecs.as_ptr(), iovecs.len() as u32)
-            .offset(pages[0].0.0 as i64 * self.page_size as i64)
-            .build()
-            .user_data(req_id);
-        
+
+        let writev_op =
+            opcode::Writev::new(types::Fd(self.fd), iovecs.as_ptr(), iovecs.len() as u32)
+                .offset(pages[0].0 .0 as i64 * self.page_size as i64)
+                .build()
+                .user_data(req_id);
+
         unsafe {
-            ring.submission().push(&writev_op)
+            ring.submission()
+                .push(&writev_op)
                 .map_err(|_| Error::Custom("io_uring submission queue full".into()))?;
         }
-        
+
         // Submit and wait
         ring.submit_and_wait(1).map_err(|e| Error::Io(std::io::Error::from(e)))?;
-        
+
         // Check completion
         let mut cq = ring.completion();
         for cqe in &mut cq {
@@ -336,15 +337,15 @@ impl ParallelIoUringBackend {
                 if cqe.result() < 0 {
                     return Err(Error::Io(std::io::Error::from_raw_os_error(-cqe.result())));
                 }
-                
+
                 // Update statistics
                 self.stats.bytes_written.add((pages.len() * self.page_size) as u64);
                 self.stats.page_writes.add(pages.len() as u64);
-                
+
                 return Ok(());
             }
         }
-        
+
         Err(Error::Custom("io_uring operation not completed".into()))
     }
 }
@@ -367,29 +368,28 @@ impl ParallelIoUringBackend {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
-    
+
     #[test]
     fn test_parallel_writes() {
         let file = NamedTempFile::new().unwrap();
         let backend = ParallelIoUringBackend::new(
             file.as_file().try_clone().unwrap(),
-            IoUringConfig::default()
-        ).unwrap();
-        
+            IoUringConfig::default(),
+        )
+        .unwrap();
+
         // Create test pages
         let mut pages = Vec::new();
         for i in 0..10 {
             let page = Page::new(PageId(i), crate::page::PageFlags::LEAF);
             pages.push((PageId(i), page));
         }
-        
+
         // Write pages in parallel
-        let page_refs: Vec<(PageId, &Page)> = pages.iter()
-            .map(|(id, page)| (*id, page))
-            .collect();
-        
+        let page_refs: Vec<(PageId, &Page)> = pages.iter().map(|(id, page)| (*id, page)).collect();
+
         backend.write_pages_parallel(&page_refs).unwrap();
-        
+
         // Check statistics
         let stats = backend.stats;
         assert_eq!(stats.page_writes.get(), 10);

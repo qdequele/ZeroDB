@@ -1,44 +1,41 @@
-use zerodb::env::EnvBuilder;
-use zerodb::db::{Database, DatabaseFlags};
 use std::sync::Arc;
 use tempfile::TempDir;
+use zerodb::db::{Database, DatabaseFlags};
+use zerodb::env::EnvBuilder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new()?;
     let db_path = dir.path().to_path_buf();
-    
+
     println!("Testing catalog fix...\n");
-    
+
     // Test 1: Verify the issue - databases created with Database::open don't persist
     {
         println!("Test 1: Creating database with Database::open (uses Catalog)");
-        let env = Arc::new(EnvBuilder::new()
-            .map_size(10 * 1024 * 1024)
-            .open(&db_path)?);
-        
+        let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(&db_path)?);
+
         // Create a database using Database::open (which should use Catalog)
-        let _db1: Database<String, String> = Database::open(&env, Some("catalog_db"), DatabaseFlags::CREATE)?;
-        
+        let _db1: Database<String, String> =
+            Database::open(&env, Some("catalog_db"), DatabaseFlags::CREATE)?;
+
         println!("Created database 'catalog_db'");
     }
-    
+
     // Reopen and check
     {
         println!("\nReopening environment...");
-        let env = Arc::new(EnvBuilder::new()
-            .map_size(10 * 1024 * 1024)
-            .open(&db_path)?);
-        
+        let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(&db_path)?);
+
         match Database::<String, String>::open(&env, Some("catalog_db"), DatabaseFlags::empty()) {
             Ok(_) => println!("✓ Database 'catalog_db' found after reopen!"),
             Err(e) => println!("✗ Database 'catalog_db' NOT found after reopen: {:?}", e),
         }
     }
-    
+
     // Test 2: Compare serialization formats
     {
         println!("\n\nTest 2: Comparing serialization formats");
-        
+
         // Create a DbInfo structure
         let test_info = zerodb::meta::DbInfo {
             flags: 0x42,
@@ -50,20 +47,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             root: zerodb::error::PageId(42),
             last_key_page: zerodb::error::PageId(0),
         };
-        
+
         // Serialize using Catalog method
         let catalog_bytes = zerodb::catalog::Catalog::serialize_db_info(&test_info);
         println!("Catalog serialization: {} bytes", catalog_bytes.len());
-        
+
         // Serialize using raw memory copy (as done in env.create_database)
         let raw_bytes = unsafe {
             std::slice::from_raw_parts(
                 &test_info as *const _ as *const u8,
-                std::mem::size_of::<zerodb::meta::DbInfo>()
+                std::mem::size_of::<zerodb::meta::DbInfo>(),
             )
         };
         println!("Raw memory serialization: {} bytes", raw_bytes.len());
-        
+
         // Check if they're the same
         if catalog_bytes.len() != raw_bytes.len() {
             println!("✗ Serialization formats differ in size!");
@@ -74,13 +71,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             println!("✓ Serialization formats match");
         }
-        
+
         // Try to deserialize raw bytes with Catalog method
         match zerodb::catalog::Catalog::deserialize_db_info(raw_bytes) {
             Ok(_) => println!("✓ Raw bytes can be deserialized by Catalog"),
             Err(e) => println!("✗ Raw bytes CANNOT be deserialized by Catalog: {:?}", e),
         }
     }
-    
+
     Ok(())
 }

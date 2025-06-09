@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::txn::{Transaction, Write};
 
 /// A nested transaction that operates within a parent write transaction
-/// 
+///
 /// NOTE: This is currently a placeholder type. Nested transactions are not yet implemented.
 pub struct NestedTransaction<'env, 'parent> {
     _parent: &'parent mut Transaction<'env, Write>,
@@ -19,8 +19,7 @@ pub struct NestedTransaction<'env, 'parent> {
 
 impl<'env, 'parent> std::fmt::Debug for NestedTransaction<'env, 'parent> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NestedTransaction")
-            .finish_non_exhaustive()
+        f.debug_struct("NestedTransaction").finish_non_exhaustive()
     }
 }
 
@@ -29,12 +28,12 @@ impl<'env, 'parent> NestedTransaction<'env, 'parent> {
     pub(crate) fn new(_parent: &'parent mut Transaction<'env, Write>) -> Result<Self> {
         Err(Error::Custom("Nested transactions are not yet implemented".into()))
     }
-    
+
     /// Commit the nested transaction to its parent (NOT IMPLEMENTED)
     pub fn commit(self) -> Result<()> {
         Err(Error::Custom("Nested transactions are not yet implemented".into()))
     }
-    
+
     /// Abort the nested transaction (NOT IMPLEMENTED)
     pub fn abort(self) {
         // No-op for stub implementation
@@ -57,20 +56,20 @@ impl<'env> NestedTransactionExt<'env> for Transaction<'env, Write> {
 mod tests {
     use super::*;
     use crate::env::EnvBuilder;
-    use tempfile::TempDir;
     use std::sync::Arc;
-    
+    use tempfile::TempDir;
+
     #[test]
     fn test_nested_transaction_not_implemented() {
         let dir = TempDir::new().unwrap();
         let env = Arc::new(EnvBuilder::new().open(dir.path()).unwrap());
-        
+
         let mut parent_txn = env.begin_write_txn().unwrap();
-        
+
         // Try to create nested transaction - should fail
         let result = parent_txn.begin_nested();
         assert!(result.is_err());
-        
+
         let err = result.unwrap_err();
         match err {
             Error::Custom(msg) => {
@@ -78,7 +77,7 @@ mod tests {
             }
             _ => panic!("Expected Custom error, got {:?}", err),
         }
-        
+
         // Parent should still be valid
         parent_txn.commit().unwrap();
     }
