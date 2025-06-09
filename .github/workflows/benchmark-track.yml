@@ -1,0 +1,71 @@
+name: Continuous Benchmark
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  deployments: write
+
+jobs:
+  benchmark:
+    name: Performance regression check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+      
+      # Run all benchmarks
+      - name: Run complete benchmark suite
+        run: |
+          # Run built-in cargo benchmarks
+          cargo bench --all-features -- --output-format bencher | tee cargo-bench-output.txt
+          
+          # Run performance suite if it exists
+          if [ -f "./scripts/run-perf-suite.sh" ]; then
+            chmod +x ./scripts/run-perf-suite.sh
+            ./scripts/run-perf-suite.sh | tee perf-suite-output.txt
+          fi
+          
+      # Store benchmark result - push to gh-pages branch
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: ZeroDB Benchmarks
+          tool: 'cargo'
+          output-file-path: cargo-bench-output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          gh-pages-branch: gh-pages
+          benchmark-data-dir-path: dev/bench
+          
+      # Deploy benchmark dashboard
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+          
+      - name: Generate performance dashboard
+        run: |
+          if [ -f "./scripts/generate-perf-dashboard.py" ]; then
+            python3 ./scripts/generate-perf-dashboard.py
+          fi
+          
+      # Archive benchmark results
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: |
+            cargo-bench-output.txt
+            perf-suite-output.txt
+            target/criterion/
+          retention-days: 90

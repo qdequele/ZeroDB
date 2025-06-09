@@ -1,0 +1,119 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+          
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-bench-${{ hashFiles('**/Cargo.lock') }}
+          
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-bench-${{ hashFiles('**/Cargo.lock') }}
+          
+      - name: Cache cargo build
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-cargo-build-bench-${{ hashFiles('**/Cargo.lock') }}
+          
+      - name: Run benchmarks
+        run: |
+          cargo bench --all-features -- --output-format bencher | tee output.txt
+          
+      - name: Store benchmark result
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Rust Benchmark
+          tool: 'cargo'
+          output-file-path: output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          # Push benchmark results to gh-pages branch
+          gh-pages-branch: gh-pages
+          # Benchmark results will be stored in this directory
+          benchmark-data-dir-path: dev/bench
+          # Enable alert comment
+          comment-on-alert: true
+          # Alert when performance regresses by 5%
+          alert-threshold: '105%'
+          # Comment on PR with benchmark results
+          comment-always: true
+          # Save previous benchmark results
+          save-data-file: true
+          
+  criterion-benchmarks:
+    name: Criterion benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+          
+      - name: Install cargo-criterion
+        run: cargo install cargo-criterion
+        
+      - name: Run Criterion benchmarks
+        run: |
+          mkdir -p criterion-results
+          cargo criterion --message-format=json > criterion-results/output.json
+          
+      - name: Upload criterion results
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-results
+          path: criterion-results/
+          retention-days: 30
+          
+      - name: Download previous benchmark data
+        uses: actions/cache@v4
+        with:
+          path: ./cache
+          key: ${{ runner.os }}-benchmark
+          
+      - name: Compare benchmarks
+        if: github.event_name == 'pull_request'
+        run: |
+          chmod +x scripts/compare-benchmarks.py
+          python3 scripts/compare-benchmarks.py
+          
+      - name: Upload benchmark report
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report
+          path: benchmark-report.md
