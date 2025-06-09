@@ -15,7 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a database
     let db: Database<String, String> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, Some("test_db"))?;
         txn.commit()?;
         db
@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Insert some data
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         for i in 0..10 {
             db.put(&mut txn, format!("key_{}", i), format!("value_{}", i))?;
         }
@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let env_clone = env.clone();
     let reader_handle = thread::spawn(move || {
         println!("\nReader thread: Starting read transaction...");
-        let txn = env_clone.begin_txn().unwrap();
+        let txn = env_clone.read_txn().unwrap();
 
         // Reader is active
         println!("Reader thread: Read transaction active");
@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Try to create write transactions that would reuse pages
     println!("\nMain thread: Creating write transactions...");
     for i in 0..5 {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         // The reader tracking happens internally
         println!("Main thread: Writing transaction {}", i);
@@ -76,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Verify data integrity
     println!("\nVerifying data:");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         for i in 0..10 {
             let key = format!("key_{}", i);
             match db.get(&txn, &key)? {

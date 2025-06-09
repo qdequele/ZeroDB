@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Add some data
         {
-            let mut txn = env.begin_write_txn()?;
+            let mut txn = env.write_txn()?;
             db1.put(&mut txn, "key1".to_string(), "value1".to_string())?;
             db2.put(&mut txn, "key2".to_string(), "value2".to_string())?;
             txn.commit()?;
@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\nTrying Database::open...");
         match Database::<String, String>::open(&env, Some("catalog_db1"), DatabaseFlags::empty()) {
             Ok(db) => {
-                let txn = env.begin_txn()?;
+                let txn = env.read_txn()?;
                 match db.get(&txn, &"key1".to_string())? {
                     Some(val) => println!("✓ Database::open worked! Got value: {}", val),
                     None => println!("✗ Database::open opened but data not found"),
@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Try to open with env.open_database (might fail due to serialization mismatch)
         println!("\nTrying env.open_database...");
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         match env.open_database::<String, String>(&txn, Some("catalog_db1")) {
             Ok(db) => match db.get(&txn, &"key1".to_string())? {
                 Some(val) => println!("✓ env.open_database worked! Got value: {}", val),
@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\nPhase 3: Creating databases with env.create_database");
         let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(&db_path)?);
 
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db3: Database<String, String> = env.create_database(&mut txn, Some("env_db1"))?;
         let db4: Database<String, String> = env.create_database(&mut txn, Some("env_db2"))?;
 
@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\nPhase 4: Final check after reopening");
         let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(&db_path)?);
 
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
 
         // List all databases
         println!("\nListing all databases:");

@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a database
     let db: Database<String, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, Some("test_db"))?;
         txn.commit()?;
         db
@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Insert 30 entries to ensure splits
     println!("\nInserting 30 entries...");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         for i in 0..30 {
             let key = format!("key_{:03}", i);
@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Delete the key
         {
-            let mut txn = env.begin_write_txn()?;
+            let mut txn = env.write_txn()?;
             let key = format!("key_{:03}", i);
 
             if db.delete(&mut txn, &key)? {
@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Check all remaining entries
         {
-            let txn = env.begin_txn()?;
+            let txn = env.read_txn()?;
             let mut cursor = db.cursor(&txn)?;
             let mut found_keys = Vec::new();
 

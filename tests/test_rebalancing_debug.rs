@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Insert entries to create a decent tree
     println!("1. Inserting 50 entries...");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         for i in 0..50 {
             let key = format!("key_{:04}", i);
@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Delete some entries to trigger rebalancing
     println!("\n2. Deleting entries 10-15 to trigger rebalancing...");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         for i in 10..16 {
             let key = format!("key_{:04}", i);

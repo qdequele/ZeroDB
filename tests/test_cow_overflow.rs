@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create database
     let db: Database<String, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, None)?;
         txn.commit()?;
         db
@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Insert small value first
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("Inserting small value...");
         db.put(&mut txn, "small_key".to_string(), vec![1u8; 100])?;
         txn.commit()?;
@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Insert large value that needs overflow
     let large_value = vec![0xAB; 5000]; // 5KB
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("Inserting large value ({} bytes)...", large_value.len());
         db.put(&mut txn, "large_key".to_string(), large_value.clone())?;
         txn.commit()?;
@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read values back
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
 
         println!("Reading small value...");
         let small = db.get(&txn, &"small_key".to_string())?;
@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Update large value (test COW with overflow)
     let updated_value = vec![0xCD; 6000]; // 6KB
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("Updating large value ({} bytes)...", updated_value.len());
 
         // First, check what we have before update
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read updated value
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         println!("Reading updated large value...");
         let large = db.get(&txn, &"large_key".to_string())?;
         match large {

@@ -21,14 +21,14 @@ fn bench_page_allocation(c: &mut Criterion) {
                     let env = Arc::new(
                         EnvBuilder::new().map_size(100 * 1024 * 1024).open(dir.path()).unwrap(),
                     );
-                    let mut txn = env.begin_write_txn().unwrap();
+                    let mut txn = env.write_txn().unwrap();
                     let db: Database<Vec<u8>, Vec<u8>> =
                         env.create_database(&mut txn, None).unwrap();
                     txn.commit().unwrap();
                     (env, db, dir)
                 },
                 |(env, db, _dir)| {
-                    let mut txn = env.begin_write_txn().unwrap();
+                    let mut txn = env.write_txn().unwrap();
 
                     match pattern {
                         "sequential" => {
@@ -96,14 +96,14 @@ fn bench_overflow_pages(c: &mut Criterion) {
                         let env = Arc::new(
                             EnvBuilder::new().map_size(100 * 1024 * 1024).open(dir.path()).unwrap(),
                         );
-                        let mut txn = env.begin_write_txn().unwrap();
+                        let mut txn = env.write_txn().unwrap();
                         let db: Database<Vec<u8>, Vec<u8>> =
                             env.create_database(&mut txn, None).unwrap();
                         txn.commit().unwrap();
                         (env, db, dir)
                     },
                     |(env, db, _dir)| {
-                        let mut txn = env.begin_write_txn().unwrap();
+                        let mut txn = env.write_txn().unwrap();
 
                         // Insert values that require overflow pages
                         for i in 0..10 {
@@ -130,13 +130,13 @@ fn bench_freelist_operations(c: &mut Criterion) {
         let dir = TempDir::new().unwrap();
         let env = Arc::new(EnvBuilder::new().map_size(100 * 1024 * 1024).open(dir.path()).unwrap());
 
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
         let db: Database<Vec<u8>, Vec<u8>> = env.create_database(&mut txn, None).unwrap();
         txn.commit().unwrap();
 
         b.iter(|| {
             // Insert and delete to exercise freelist
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
 
             // Insert batch
             for i in 0..20 {
@@ -164,7 +164,7 @@ fn bench_transaction_overhead(c: &mut Criterion) {
     let dir = TempDir::new().unwrap();
     let env = Arc::new(EnvBuilder::new().map_size(100 * 1024 * 1024).open(dir.path()).unwrap());
 
-    let mut txn = env.begin_write_txn().unwrap();
+    let mut txn = env.write_txn().unwrap();
     let db: Database<Vec<u8>, Vec<u8>> = env.create_database(&mut txn, None).unwrap();
 
     // Pre-populate with some data
@@ -177,21 +177,21 @@ fn bench_transaction_overhead(c: &mut Criterion) {
 
     group.bench_function("read_txn_creation", |b| {
         b.iter(|| {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             black_box(txn);
         });
     });
 
     group.bench_function("write_txn_creation", |b| {
         b.iter(|| {
-            let txn = env.begin_write_txn().unwrap();
+            let txn = env.write_txn().unwrap();
             txn.abort();
         });
     });
 
     group.bench_function("small_txn_commit", |b| {
         b.iter(|| {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let key = b"bench_key".to_vec();
             let value = vec![42u8; 10];
             db.put(&mut txn, key, value).unwrap();

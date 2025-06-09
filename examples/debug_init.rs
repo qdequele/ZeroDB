@@ -36,7 +36,7 @@ fn main() -> Result<()> {
     // Try a transaction
     println!("\n--- Testing Transaction ---");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("✓ Write transaction created (ID: {})", txn.id().0);
 
         // Check if we can get db info
@@ -78,7 +78,7 @@ fn main() -> Result<()> {
 
         // Check the database info
         {
-            let txn = env.begin_txn()?;
+            let txn = env.read_txn()?;
             match main_db.is_empty(&txn) {
                 Ok(empty) => println!("  - Is empty: {}", empty),
                 Err(e) => println!("  - Failed to check if empty: {:?}", e),
@@ -87,7 +87,7 @@ fn main() -> Result<()> {
 
         // Try to get a non-existent key first
         {
-            let txn = env.begin_txn()?;
+            let txn = env.read_txn()?;
             let key = b"nonexistent".to_vec();
             match main_db.get(&txn, &key) {
                 Ok(val) => println!("  - Get nonexistent key: {:?}", val),
@@ -97,7 +97,7 @@ fn main() -> Result<()> {
 
         // Try to store something
         {
-            let mut txn = env.begin_write_txn()?;
+            let mut txn = env.write_txn()?;
             println!("\nAttempting to store data...");
 
             // Debug: check the DB info before put
@@ -145,7 +145,7 @@ fn main() -> Result<()> {
 
         // Try to read it back
         {
-            let txn = env.begin_txn()?;
+            let txn = env.read_txn()?;
             let key = b"test".to_vec();
             match main_db.get(&txn, &key) {
                 Ok(Some(val)) => println!("✓ Retrieved value: {:?}", String::from_utf8_lossy(&val)),

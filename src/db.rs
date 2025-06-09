@@ -157,7 +157,7 @@ impl<K: Key, V: Value, C: Comparator> Database<K, V, C> {
         // Not in cache, need to look in the catalog or create
         if flags.contains(DatabaseFlags::CREATE) {
             // Create a new database
-            let mut txn = env.begin_write_txn()?;
+            let mut txn = env.write_txn()?;
 
             // Check catalog first
             if let Some(info) = crate::catalog::Catalog::get_database(&txn, name.unwrap())? {
@@ -210,7 +210,7 @@ impl<K: Key, V: Value, C: Comparator> Database<K, V, C> {
             }
         } else {
             // Must exist - check catalog
-            let txn = env.begin_txn()?;
+            let txn = env.read_txn()?;
 
             if let Some(info) = crate::catalog::Catalog::get_database(&txn, name.unwrap())? {
                 // Cache it
@@ -719,7 +719,7 @@ mod tests {
 
         // Create database
         let db: Database<String, String> = {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db = env.create_database(&mut txn, None).unwrap();
             txn.commit().unwrap();
             db
@@ -727,7 +727,7 @@ mod tests {
 
         // Insert data
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             db.put(&mut txn, "key1".to_string(), "value1".to_string()).unwrap();
             db.put(&mut txn, "key2".to_string(), "value2".to_string()).unwrap();
             txn.commit().unwrap();
@@ -735,7 +735,7 @@ mod tests {
 
         // Read data
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
 
             let val1 = db.get(&txn, &"key1".to_string()).unwrap();
             assert_eq!(val1, Some("value1".to_string()));
@@ -755,7 +755,7 @@ mod tests {
 
         // Create database
         let db: Database<String, String> = {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db = env.create_database(&mut txn, None).unwrap();
             txn.commit().unwrap();
             db
@@ -763,7 +763,7 @@ mod tests {
 
         // Insert data
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             db.put(&mut txn, "key1".to_string(), "value1".to_string()).unwrap();
             db.put(&mut txn, "key2".to_string(), "value2".to_string()).unwrap();
             db.put(&mut txn, "key3".to_string(), "value3".to_string()).unwrap();
@@ -772,7 +772,7 @@ mod tests {
 
         // Delete data
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
 
             // Delete existing key
             let deleted = db.delete(&mut txn, &"key2".to_string()).unwrap();
@@ -787,7 +787,7 @@ mod tests {
 
         // Verify deletion
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
 
             let val1 = db.get(&txn, &"key1".to_string()).unwrap();
             assert_eq!(val1, Some("value1".to_string()));
@@ -807,7 +807,7 @@ mod tests {
 
         // Create database
         let db: Database<String, String> = {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db = env.create_database(&mut txn, None).unwrap();
             txn.commit().unwrap();
             db
@@ -815,7 +815,7 @@ mod tests {
 
         // Insert data
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             db.put(&mut txn, "key1".to_string(), "value1".to_string()).unwrap();
             db.put(&mut txn, "key2".to_string(), "value2".to_string()).unwrap();
             db.put(&mut txn, "key3".to_string(), "value3".to_string()).unwrap();
@@ -824,21 +824,21 @@ mod tests {
 
         // Verify data exists
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             assert_eq!(db.len(&txn).unwrap(), 3);
             assert!(!db.is_empty(&txn).unwrap());
         }
 
         // Clear the database
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             db.clear(&mut txn).unwrap();
             txn.commit().unwrap();
         }
 
         // Verify database is empty
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             assert_eq!(db.len(&txn).unwrap(), 0);
             assert!(db.is_empty(&txn).unwrap());
 
@@ -850,13 +850,13 @@ mod tests {
 
         // Can insert new data after clear
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             db.put(&mut txn, "new_key".to_string(), "new_value".to_string()).unwrap();
             txn.commit().unwrap();
         }
 
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             assert_eq!(
                 db.get(&txn, &"new_key".to_string()).unwrap(),
                 Some("new_value".to_string())
@@ -872,7 +872,7 @@ mod tests {
 
         // Create multiple named databases
         let (db1, db2, db3) = {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db1: Database<String, String> =
                 env.create_database(&mut txn, Some("users")).unwrap();
             let db2: Database<String, String> =
@@ -890,7 +890,7 @@ mod tests {
 
         // Insert data into each database
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             db1.put(&mut txn, "user1".to_string(), "Alice".to_string()).unwrap();
             db2.put(&mut txn, "prod1".to_string(), "Widget".to_string()).unwrap();
             db3.put(&mut txn, "order1".to_string(), "Pending".to_string()).unwrap();
@@ -899,7 +899,7 @@ mod tests {
 
         // Verify data isolation between databases
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
 
             // Each database has its own data
             assert_eq!(db1.get(&txn, &"user1".to_string()).unwrap(), Some("Alice".to_string()));
@@ -917,7 +917,7 @@ mod tests {
 
         // Test reopening named database
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             let db1_reopened: Database<String, String> =
                 env.open_database(&txn, Some("users")).unwrap();
             assert_eq!(
@@ -928,7 +928,7 @@ mod tests {
 
         // Test listing databases
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             let mut dbs = env.list_databases(&txn).unwrap();
             dbs.sort();
             assert_eq!(dbs, vec!["orders", "products", "users"]);
@@ -942,7 +942,7 @@ mod tests {
 
         // Create named databases
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db1: Database<String, String> =
                 env.create_database(&mut txn, Some("temp_db")).unwrap();
             let db2: Database<String, String> =
@@ -957,7 +957,7 @@ mod tests {
 
         // Verify both databases exist
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             let dbs = env.list_databases(&txn).unwrap();
             assert!(dbs.contains(&"temp_db".to_string()));
             assert!(dbs.contains(&"keep_db".to_string()));
@@ -965,14 +965,14 @@ mod tests {
 
         // Drop one database
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             env.drop_database(&mut txn, "temp_db").unwrap();
             txn.commit().unwrap();
         }
 
         // Verify database is dropped
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             let dbs = env.list_databases(&txn).unwrap();
             assert!(!dbs.contains(&"temp_db".to_string()));
             assert!(dbs.contains(&"keep_db".to_string()));
@@ -988,7 +988,7 @@ mod tests {
 
         // Cannot drop main database
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let result = env.drop_database(&mut txn, "");
             assert!(result.is_err());
         }
@@ -1004,7 +1004,7 @@ mod tests {
             let env =
                 Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(&db_path).unwrap());
 
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db1: Database<String, String> =
                 env.create_database(&mut txn, Some("persistent_db")).unwrap();
             db1.put(&mut txn, "key1".to_string(), "value1".to_string()).unwrap();
@@ -1021,7 +1021,7 @@ mod tests {
             let env =
                 Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(&db_path).unwrap());
 
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
 
             // List databases
             let mut dbs = env.list_databases(&txn).unwrap();
@@ -1046,7 +1046,7 @@ mod tests {
 
         // Create a database
         let db1 = {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db: Database<String, String> =
                 env.create_database(&mut txn, Some("test_db")).unwrap();
             db.put(&mut txn, "key1".to_string(), "value1".to_string()).unwrap();
@@ -1056,7 +1056,7 @@ mod tests {
 
         // Try to create the same database again
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db2: Database<String, String> =
                 env.create_database(&mut txn, Some("test_db")).unwrap();
 
@@ -1076,7 +1076,7 @@ mod tests {
 
         // Create database with DUPSORT
         let db: Database<String, String> = {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db = env
                 .create_database_with_flags(&mut txn, Some("dupsort_db"), DatabaseFlags::DUP_SORT)
                 .unwrap();
@@ -1086,7 +1086,7 @@ mod tests {
 
         // Insert multiple values for the same key
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             db.put_dup(&mut txn, "key1".to_string(), "value1".to_string()).unwrap();
             db.put_dup(&mut txn, "key1".to_string(), "value2".to_string()).unwrap();
             db.put_dup(&mut txn, "key1".to_string(), "value3".to_string()).unwrap();
@@ -1100,7 +1100,7 @@ mod tests {
 
         // Read all values for a key
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
 
             let values = db.get_all(&txn, &"key1".to_string()).unwrap();
             assert_eq!(values.len(), 3);
@@ -1120,7 +1120,7 @@ mod tests {
 
         // Delete specific value
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
 
             // Delete one value
             let deleted =
@@ -1137,7 +1137,7 @@ mod tests {
 
         // Verify deletion
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
 
             let values = db.get_all(&txn, &"key1".to_string()).unwrap();
             assert_eq!(values.len(), 2);

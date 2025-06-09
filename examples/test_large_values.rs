@@ -37,14 +37,14 @@ fn main() -> anyhow::Result<()> {
         
         // Write
         let start = Instant::now();
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         db.put(&mut txn, name.to_string(), value.clone())?;
         txn.commit()?;
         let write_time = start.elapsed();
         
         // Read
         let start = Instant::now();
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let read_value = db.get(&txn, &name.to_string())?.unwrap();
         let read_time = start.elapsed();
         
@@ -65,7 +65,7 @@ fn main() -> anyhow::Result<()> {
     
     // Test concurrent access to large values
     println!("Testing concurrent reads of large values...");
-    let txn = env.begin_txn()?;
+    let txn = env.read_txn()?;
     let start = Instant::now();
     
     for _ in 0..100 {

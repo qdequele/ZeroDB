@@ -64,7 +64,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let env = Arc::new(EnvBuilder::new().open(dir.path()).unwrap());
 
-        let mut parent_txn = env.begin_write_txn().unwrap();
+        let mut parent_txn = env.write_txn().unwrap();
 
         // Try to create nested transaction - should fail
         let result = parent_txn.begin_nested();

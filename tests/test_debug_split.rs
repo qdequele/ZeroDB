@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a database
     let db: Database<String, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, Some("test_db"))?;
         txn.commit()?;
         db
@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Check state before insert
         {
-            let txn = env.begin_txn()?;
+            let txn = env.read_txn()?;
             let db_info = txn.db_info(Some("test_db"))?;
             println!(
                 "Before insert: root={:?}, entries={}, depth={}, page_info={:?}",
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Insert
         {
-            let mut txn = env.begin_write_txn()?;
+            let mut txn = env.write_txn()?;
             let key = format!("key_{:03}", i);
             let value = vec![i as u8; 64];
 
@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Check state after commit
         {
-            let txn = env.begin_txn()?;
+            let txn = env.read_txn()?;
             let db_info = txn.db_info(Some("test_db"))?;
             println!(
                 "After commit: root={:?}, entries={}, depth={}, page_info={:?}",

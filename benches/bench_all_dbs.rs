@@ -44,7 +44,7 @@ fn bench_sequential_writes() {
         .unwrap();
 
         let start = Instant::now();
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
 
         for (key, value) in &data {
             db.put(&mut txn, key.clone(), value.clone()).unwrap();
@@ -166,7 +166,7 @@ fn bench_random_reads() {
         .unwrap();
 
         // Populate
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
 
         for (i, key) in all_keys.iter().enumerate() {
             let value = vec![i as u8; 100];
@@ -176,7 +176,7 @@ fn bench_random_reads() {
         txn.commit().unwrap();
 
         // Benchmark reads
-        let txn = env.begin_txn().unwrap();
+        let txn = env.read_txn().unwrap();
 
         let start = Instant::now();
         let mut found = 0;

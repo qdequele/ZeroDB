@@ -21,7 +21,7 @@ fn main() -> Result<()> {
         .open(path)?;
 
     // Begin write transaction
-    let mut txn = env.begin_write_txn()?;
+    let mut txn = env.write_txn()?;
     
     // Initialize database info
     let mut db_info = DbInfo::default();
@@ -73,7 +73,7 @@ fn main() -> Result<()> {
 
     // Now verify the tree by searching for all keys
     println!("\nVerifying all keys...");
-    let txn = env.begin_txn()?;
+    let txn = env.read_txn()?;
     let mut missing_keys = Vec::new();
     
     for i in 0..num_keys {

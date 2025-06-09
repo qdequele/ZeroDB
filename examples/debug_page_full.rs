@@ -26,7 +26,7 @@ fn main() -> anyhow::Result<()> {
     println!("Starting batch insert of {} items", data.len());
     
     // Insert in a single transaction like the benchmark
-    let mut txn = env.begin_write_txn()?;
+    let mut txn = env.write_txn()?;
     
     for (i, (key, value)) in data.iter().enumerate() {
         match db.put(&mut txn, key.clone(), value.clone()) {

@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a database
     let db: Database<String, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, Some("test_db"))?;
         txn.commit()?;
         db
@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 1: Insert many entries
     println!("\nPhase 1: Inserting entries...");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         for i in 0..50 {
             let key = format!("key_{:03}", i);
@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 2: Delete half the entries
     println!("\nPhase 2: Deleting entries...");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         // Delete every other entry
         let mut deleted_count = 0;
@@ -81,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 3: Insert new entries
     println!("\nPhase 3: Inserting new entries...");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         for i in 100..125 {
             let key = format!("new_key_{:03}", i);
@@ -96,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 4: Verify all data
     println!("\nPhase 4: Verifying data...");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
 
         let mut count = 0;
@@ -145,7 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Open existing database
     let db: Database<String, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.open_database(&mut txn, Some("test_db"))?;
         txn.commit()?;
         db
@@ -153,7 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify data is still there
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let mut count = 0;
         let mut cursor = db.cursor(&txn)?;
 
@@ -167,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Delete more entries and add new ones
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         // Delete all remaining original entries
         for i in (1..50).step_by(2) {
@@ -187,7 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Final verification
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
         let mut count = 0;
         let mut new_count = 0;

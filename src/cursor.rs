@@ -1007,7 +1007,7 @@ mod tests {
 
         // Create database and insert data
         let db: Database<String, String> = {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db = env.create_database(&mut txn, None).unwrap();
 
             db.put(&mut txn, "key1".to_string(), "value1".to_string()).unwrap();
@@ -1020,7 +1020,7 @@ mod tests {
 
         // Test cursor iteration
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             let mut cursor = db.cursor(&txn).unwrap();
 
             // First
@@ -1057,7 +1057,7 @@ mod tests {
 
         // Create database and insert data
         let db: Database<String, String> = {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db = env.create_database(&mut txn, None).unwrap();
 
             db.put(&mut txn, "key1".to_string(), "value1".to_string()).unwrap();
@@ -1070,7 +1070,7 @@ mod tests {
 
         // Test cursor seek
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             let mut cursor = db.cursor(&txn).unwrap();
 
             // Seek to existing key
@@ -1096,7 +1096,7 @@ mod tests {
 
         // Create database and insert data
         let db: Database<String, String> = {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db = env.create_database(&mut txn, None).unwrap();
 
             db.put(&mut txn, "key1".to_string(), "value1".to_string()).unwrap();
@@ -1110,7 +1110,7 @@ mod tests {
 
         // Test 1: Delete a single key using cursor
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let mut cursor: Cursor<'_, String, String> = db.cursor(&mut txn).unwrap();
 
             // Move to key2
@@ -1129,7 +1129,7 @@ mod tests {
 
         // Verify first deletion
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             assert!(db.get(&txn, &"key1".to_string()).unwrap().is_some());
             assert!(db.get(&txn, &"key2".to_string()).unwrap().is_none());
             assert!(db.get(&txn, &"key3".to_string()).unwrap().is_some());
@@ -1138,7 +1138,7 @@ mod tests {
 
         // Test 2: Delete another key in a separate transaction
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let mut cursor: Cursor<'_, String, String> = db.cursor(&mut txn).unwrap();
 
             // Move to key3
@@ -1157,7 +1157,7 @@ mod tests {
 
         // Verify both deletions
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             assert!(db.get(&txn, &"key1".to_string()).unwrap().is_some());
             assert!(db.get(&txn, &"key2".to_string()).unwrap().is_none());
             assert!(db.get(&txn, &"key3".to_string()).unwrap().is_none());
@@ -1172,7 +1172,7 @@ mod tests {
 
         // Create database
         let db: Database<String, String> = {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db = env.create_database(&mut txn, None).unwrap();
             txn.commit().unwrap();
             db
@@ -1180,7 +1180,7 @@ mod tests {
 
         // Test cursor put operations - simplified test
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let mut cursor: Cursor<'_, String, String> = db.cursor(&mut txn).unwrap();
 
             // Put just one entry first
@@ -1196,7 +1196,7 @@ mod tests {
 
         // Verify insertion
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             assert_eq!(db.get(&txn, &"key1".to_string()).unwrap(), Some("value1".to_string()));
         }
     }
@@ -1208,7 +1208,7 @@ mod tests {
 
         // Create database and insert initial data
         let db: Database<String, String> = {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db = env.create_database(&mut txn, None).unwrap();
 
             db.put(&mut txn, "key1".to_string(), "value1".to_string()).unwrap();
@@ -1221,7 +1221,7 @@ mod tests {
 
         // Test cursor update
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let mut cursor: Cursor<'_, String, String> = db.cursor(&mut txn).unwrap();
 
             // Position at key2
@@ -1248,7 +1248,7 @@ mod tests {
 
         // Verify update
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             assert_eq!(db.get(&txn, &"key1".to_string()).unwrap(), Some("value1".to_string()));
             assert_eq!(
                 db.get(&txn, &"key2".to_string()).unwrap(),

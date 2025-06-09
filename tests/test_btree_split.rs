@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a database
     let db: Database<String, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, Some("test_db"))?;
         txn.commit()?;
         db
@@ -24,7 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let num_entries = 60; // Should be enough to trigger at least one split
 
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         for i in 0..num_entries {
             let key = format!("key_{:03}", i);
@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 2: Verify all entries are still there
     println!("\nPhase 2: Verifying all entries...");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
 
         let mut found_keys = Vec::new();
@@ -97,7 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 3: Random access test
     println!("\nPhase 3: Random access test...");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
 
         let test_keys = vec![0, 15, 30, 45, 59];
         for i in test_keys {

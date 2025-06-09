@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 1: Create database and allocate some pages
     println!("Step 1: Initial allocation");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         // Create database
         let _db: Database<Vec<u8>, Vec<u8>> = env.create_database(&mut txn, None)?;
@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 2: Free some pages
     println!("\nStep 2: Freeing pages");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         // Free the middle page
         println!("  Freeing page {:?}", allocated_pages[1]);
@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 4: Allocate in new transaction - should reuse freed page
     println!("\nStep 4: New allocation (should reuse)");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         use zerodb::page::PageFlags;
         let (page_id, _) = txn.alloc_page(PageFlags::LEAF)?;
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Try another allocation
     {
-        let mut txn = env2.begin_write_txn()?;
+        let mut txn = env2.write_txn()?;
 
         use zerodb::page::PageFlags;
         let (page_id, _) = txn.alloc_page(PageFlags::LEAF)?;

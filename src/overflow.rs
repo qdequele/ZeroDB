@@ -282,7 +282,7 @@ mod tests {
         // Create a large value that requires multiple overflow pages
         let large_value = vec![0xAB; 10 * 1024]; // 10KB
 
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
 
         // Write to overflow pages
         let overflow_id = write_overflow_value(&mut txn, &large_value).unwrap();
@@ -294,7 +294,7 @@ mod tests {
         txn.commit().unwrap();
 
         // Read in new transaction
-        let txn = env.begin_txn().unwrap();
+        let txn = env.read_txn().unwrap();
         let read_value = read_overflow_value(&txn, overflow_id).unwrap();
         assert_eq!(read_value, large_value);
     }

@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check initial state
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let main_db_info = txn.db_info(None)?;
         println!("Initial main DB: root={:?}, entries={}", main_db_info.root, main_db_info.entries);
     }
@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a named database in a single transaction
     {
         println!("\nCreating database in a transaction...");
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         // Check main DB before creating database
         let main_before = *txn.db_info(None)?;
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Check state after commit
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let main_db_info = txn.db_info(None)?;
         println!(
             "\nMain DB after commit: root={:?}, entries={}",
@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Created test_db2 with Database::open");
 
         // Check state
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let main_db_info = txn.db_info(None)?;
         println!(
             "Main DB after Database::open: root={:?}, entries={}",

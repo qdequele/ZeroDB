@@ -6,6 +6,7 @@
 
 use crate::comparator::{Comparator, LexicographicComparator};
 use crate::error::{Error, PageId, PageType, Result};
+use crate::page_capacity::PageCapacityConfig;
 use bitflags::bitflags;
 use static_assertions::const_assert;
 use std::borrow::Cow;
@@ -331,6 +332,7 @@ impl Page {
         let actual_value_size = if is_overflow { value_size_override } else { value.len() };
         let node_size = NodeHeader::SIZE + key.len() + value.len();
 
+        // Check if we have space for the new node
         if self.header.free_space() < node_size + size_of::<u16>() {
             return Err(Error::Custom("Page full".into()));
         }
@@ -486,6 +488,59 @@ impl Page {
         let median_key = median_node.key()?.to_vec();
 
         Ok((right_nodes, median_key))
+    }
+    
+    /// Split this page with smart split point calculation
+    pub fn split_with_config(&self, is_append: bool) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>)> {
+        let config = PageCapacityConfig::default();
+        let num_keys = self.header.num_keys as usize;
+        let split_idx = crate::page_capacity::calculate_split_point(num_keys, is_append, &config);
+        
+        let mut right_nodes = Vec::new();
+
+        // Collect nodes for the right page
+        for i in split_idx..num_keys {
+            let node = self.node(i)?;
+            let key = node.key()?.to_vec();
+            let value = node.value()?.into_owned();
+            right_nodes.push((key, value));
+        }
+
+        // Get the median key
+        let median_node = self.node(split_idx)?;
+        let median_key = median_node.key()?.to_vec();
+
+        Ok((right_nodes, median_key))
+    }
+
+    /// Check if page has room for an entry of given size
+    pub fn has_room_for(&self, key_size: usize, value_size: usize) -> bool {
+        let node_size = NodeHeader::SIZE + key_size + value_size;
+        let required_space = node_size + size_of::<u16>(); // node + pointer
+        
+        // Use a safety margin to prevent edge cases
+        const SAFETY_MARGIN: usize = 32;
+        self.header.free_space() >= required_space + SAFETY_MARGIN
+    }
+    
+    /// Check if page should be split proactively based on capacity
+    pub fn should_split(&self, next_entry_size: Option<usize>) -> bool {
+        // For now, use simple threshold-based approach
+        const SPLIT_THRESHOLD: f32 = 0.85; // Split at 85% full
+        
+        let used_space = (self.header.lower - PageHeader::SIZE as u16) as usize + 
+                        (PAGE_SIZE as u16 - self.header.upper) as usize;
+        let total_usable = PAGE_SIZE - PageHeader::SIZE;
+        let utilization = used_space as f32 / total_usable as f32;
+        
+        // If we have a specific entry size, check if adding it would exceed threshold
+        if let Some(size) = next_entry_size {
+            let new_used = used_space + size + size_of::<u16>();
+            let new_utilization = new_used as f32 / total_usable as f32;
+            return new_utilization >= SPLIT_THRESHOLD;
+        }
+        
+        utilization >= SPLIT_THRESHOLD
     }
 
     /// Remove nodes starting from index

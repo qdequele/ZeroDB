@@ -28,7 +28,7 @@ fn main() -> Result<()> {
     // Test 2: Store data in databases
     println!("\n=== Test 2: Storing data ===");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         db1.put(&mut txn, "user1".to_string(), "Alice".to_string())?;
         db1.put(&mut txn, "user2".to_string(), "Bob".to_string())?;
@@ -48,7 +48,7 @@ fn main() -> Result<()> {
     // Test 3: Read data back
     println!("\n=== Test 3: Reading data ===");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
 
         if let Some(user) = db1.get(&txn, &"user1".to_string())? {
             println!("User1: {}", user);
@@ -82,7 +82,7 @@ fn main() -> Result<()> {
 
     // Verify data
     {
-        let txn = env2.begin_txn()?;
+        let txn = env2.read_txn()?;
 
         if let Some(user) = db1_reopened.get(&txn, &"user2".to_string())? {
             println!("User2 after reopen: {}", user);
@@ -103,7 +103,7 @@ fn main() -> Result<()> {
     // Test 6: List all databases
     println!("\n=== Test 6: List databases ===");
     {
-        let txn = env2.begin_txn()?;
+        let txn = env2.read_txn()?;
         let databases = zerodb::catalog::Catalog::list_databases(&txn)?;
 
         println!("Found {} named databases:", databases.len());

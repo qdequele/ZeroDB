@@ -13,7 +13,7 @@ fn main() -> Result<()> {
 
     // Create database with test data
     let db: Database<String, String> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, None)?;
 
         // Insert data in non-sequential order to test sorting
@@ -40,7 +40,7 @@ fn main() -> Result<()> {
     // Test 1: Forward iteration
     println!("--- Test 1: Forward Iteration ---");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
 
         print!("First -> Next: ");
@@ -57,7 +57,7 @@ fn main() -> Result<()> {
     // Test 2: Backward iteration
     println!("\n--- Test 2: Backward Iteration ---");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
 
         print!("Last -> Prev: ");
@@ -74,7 +74,7 @@ fn main() -> Result<()> {
     // Test 3: Seek operations
     println!("\n--- Test 3: Seek Operations ---");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
 
         // Seek to existing key
@@ -104,7 +104,7 @@ fn main() -> Result<()> {
     // Test 4: Mixed navigation
     println!("\n--- Test 4: Mixed Navigation ---");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
 
         // Start at first
@@ -138,7 +138,7 @@ fn main() -> Result<()> {
     // Test 5: Edge cases
     println!("\n--- Test 5: Edge Cases ---");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
 
         // Multiple prev from first
@@ -162,7 +162,7 @@ fn main() -> Result<()> {
     // Test 6: Cursor modification operations
     println!("\n--- Test 6: Cursor Modifications ---");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let mut cursor = db.cursor(&mut txn)?;
 
         // Add new entry
@@ -185,7 +185,7 @@ fn main() -> Result<()> {
     // Verify modifications
     println!("\n--- Verification ---");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
 
         // Check added key
         match db.get(&txn, &"key045".to_string())? {

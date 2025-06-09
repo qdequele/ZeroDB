@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a database
     let db: Database<String, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, Some("test_db"))?;
         txn.commit()?;
         db
@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nInserting entries...");
     let mut last_depth = 0;
     for i in 0..50 {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         let key = format!("key_{:03}", i);
         let value = vec![i as u8; 256];
@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         txn.commit()?;
 
         // After each insert, verify all keys so far
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         for j in 0..=i {
             let check_key = format!("key_{:03}", j);
             if db.get(&txn, &check_key)?.is_none() {
@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Final verification
     println!("\nFinal verification:");
-    let txn = env.begin_txn()?;
+    let txn = env.read_txn()?;
     let mut cursor = db.cursor(&txn)?;
     let mut count = 0;
 

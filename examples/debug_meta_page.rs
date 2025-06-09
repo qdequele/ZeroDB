@@ -69,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("\n\nPhase 2: Reopening environment");
         let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(&db_path)?);
 
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let main_db_info = txn.db_info(None)?;
         println!("Main DB after reopen: entries={}", main_db_info.entries);
     }

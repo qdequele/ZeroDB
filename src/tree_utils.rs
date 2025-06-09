@@ -150,7 +150,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let env = EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap();
 
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
         let mut root = PageId(3);
         let mut db_info = DbInfo::default();
         db_info.root = root;
@@ -187,7 +187,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let env = EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap();
 
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
 
         // Allocate a new page for our test tree instead of using the main DB root
         let (root, _) = txn.alloc_page(PageFlags::LEAF).unwrap();

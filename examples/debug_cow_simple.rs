@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create database
     let db: Database<Vec<u8>, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("Creating database...");
         let db = env.create_database(&mut txn, None)?;
         txn.commit()?;
@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Insert large value
     let large1 = vec![0xAA; 5000];
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("Inserting 5KB value...");
         db.put(&mut txn, b"key".to_vec(), large1.clone())?;
         txn.commit()?;
@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Update to new large value
     let large2 = vec![0xBB; 6000];
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("\nUpdating to 6KB value...");
 
         // Check current value
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read updated value
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         println!("\nReading updated value...");
         let val = db.get(&txn, &b"key".to_vec())?;
         match val {

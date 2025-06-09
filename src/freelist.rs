@@ -401,7 +401,7 @@ mod tests {
         let env = EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap();
 
         // Test allocating and freeing pages
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
 
         // Allocate some pages
         let (_page1, _) = txn.alloc_page(PageFlags::LEAF).unwrap();
@@ -415,7 +415,7 @@ mod tests {
 
         // In a new transaction, allocate a page
         // It should reuse the freed page (once we implement proper reader tracking)
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
         let (new_page, _) = txn.alloc_page(PageFlags::LEAF).unwrap();
 
         // For now, it won't reuse because we're being conservative
@@ -433,11 +433,11 @@ mod tests {
         let env = EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap();
 
         // Start a read transaction
-        let read_txn = env.begin_txn().unwrap();
+        let read_txn = env.read_txn().unwrap();
         let read_txn_id = read_txn.id();
 
         // In a write transaction, allocate and free pages
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
 
         // Allocate some pages
         let (_page1, _) = txn.alloc_page(PageFlags::LEAF).unwrap();
@@ -456,7 +456,7 @@ mod tests {
         txn.commit().unwrap();
 
         // Now start a new write transaction while reader is still active
-        let mut txn2 = env.begin_write_txn().unwrap();
+        let mut txn2 = env.write_txn().unwrap();
 
         // The freelist should see the active reader
         let txn2_id = txn2.id();
@@ -481,7 +481,7 @@ mod tests {
         txn2.commit().unwrap();
 
         // Start another write transaction
-        let mut txn3 = env.begin_write_txn().unwrap();
+        let mut txn3 = env.write_txn().unwrap();
 
         // Now the freelist should have no active readers
         let txn3_id = txn3.id();
@@ -511,7 +511,7 @@ mod tests {
 
         let page_ids = {
             // Create and save a freelist
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
 
             // Allocate some pages to free
             let (page1, _) = txn.alloc_page(PageFlags::LEAF).unwrap();
@@ -549,7 +549,7 @@ mod tests {
 
         // Load the freelist in a new transaction
         {
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             let freelist = FreeList::load(&txn, &page_ids.0).unwrap();
 
             // Verify the loaded data

@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a database
     let db: Database<String, String> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("Write transaction started");
 
         let db = env.create_database(&mut txn, Some("test_db"))?;
@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 1: Insert a single entry
     println!("\nTest 1: Insert single entry");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         db.put(&mut txn, "hello".to_string(), "world".to_string())?;
         println!("  Put hello -> world");
         txn.commit()?;
@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 2: Read the entry
     println!("\nTest 2: Read entry");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let value = db.get(&txn, &"hello".to_string())?;
         println!("  Got value: {:?}", value);
         assert_eq!(value, Some("world".to_string()));
@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 3: Insert multiple entries
     println!("\nTest 3: Insert multiple entries");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         for i in 0..5 {
             let key = format!("key{}", i);
@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 4: Read all entries
     println!("\nTest 4: Read all entries");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
 
         println!("  Iterating with cursor:");
@@ -85,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 5: Delete an entry
     println!("\nTest 5: Delete entry");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let deleted = db.delete(&mut txn, &"key2".to_string())?;
         println!("  Delete key2: {}", deleted);
         txn.commit()?;
@@ -94,7 +94,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 6: Verify deletion
     println!("\nTest 6: Verify deletion");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let value = db.get(&txn, &"key2".to_string())?;
         println!("  Get key2: {:?}", value);
         assert_eq!(value, None);

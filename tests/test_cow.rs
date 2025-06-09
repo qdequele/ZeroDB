@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create database
     let db: Database<String, String> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, None)?;
         txn.commit()?;
         db
@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Insert data
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("Inserting key1...");
         db.put(&mut txn, "key1".to_string(), "value1".to_string())?;
         println!("Inserting key2...");
@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read data
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         println!("Reading key1...");
         let val1 = db.get(&txn, &"key1".to_string())?;
         println!("key1 = {:?}", val1);
@@ -40,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test update with COW
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("Updating key1...");
         db.put(&mut txn, "key1".to_string(), "updated_value1".to_string())?;
         txn.commit()?;
@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read updated data
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let val1 = db.get(&txn, &"key1".to_string())?;
         println!("Updated key1 = {:?}", val1);
     }

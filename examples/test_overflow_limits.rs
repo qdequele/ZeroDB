@@ -74,7 +74,7 @@ fn main() -> Result<()> {
     
     // Create a database
     let db: Database<Vec<u8>, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, None)?;
         txn.commit()?;
         db
@@ -95,14 +95,14 @@ fn main() -> Result<()> {
         let key = format!("test_{}", size);
         let value = vec![0xAB; size];
         
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         match db.put(&mut txn, key.as_bytes().to_vec(), value.clone()) {
             Ok(()) => {
                 println!("  ✓ Successfully stored {} value", name);
                 txn.commit()?;
                 
                 // Verify read
-                let read_txn = env.begin_txn()?;
+                let read_txn = env.read_txn()?;
                 match db.get(&read_txn, &key.as_bytes().to_vec()) {
                     Ok(Some(read_value)) => {
                         assert_eq!(read_value.len(), size);

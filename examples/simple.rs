@@ -19,7 +19,7 @@ fn main() -> Result<()> {
 
     // Create a database
     let db = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db: zerodb::db::Database<String, String> = env.create_database(&mut txn, None)?;
         txn.commit()?;
         println!("Database created");
@@ -28,7 +28,7 @@ fn main() -> Result<()> {
 
     // Insert some data
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         db.put(&mut txn, "hello".to_string(), "world".to_string())?;
         db.put(&mut txn, "foo".to_string(), "bar".to_string())?;
         txn.commit()?;
@@ -37,7 +37,7 @@ fn main() -> Result<()> {
 
     // Read the data back
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
 
         let val1 = db.get(&txn, &"hello".to_string())?;
         println!("hello => {:?}", val1);

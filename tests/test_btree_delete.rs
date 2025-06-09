@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a database
     let db: Database<String, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, Some("test_db"))?;
         txn.commit()?;
         db
@@ -23,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nPhase 1: Inserting entries...");
     let num_entries = 50; // Enough to cause splits
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         for i in 0..num_entries {
             let key = format!("key_{:03}", i);
@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 2: Verify all entries
     println!("\nPhase 2: Before deletion...");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
         let mut count = 0;
 
@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 3: Delete even entries
     println!("\nPhase 3: Deleting even entries...");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let mut deleted = 0;
 
         for i in (0..num_entries).step_by(2) {
@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 4: Verify remaining entries
     println!("\nPhase 4: After deletion...");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
         let mut remaining = Vec::new();
 
@@ -107,7 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Phase 5: Random access to remaining entries
     println!("\nPhase 5: Random access test...");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
 
         // Test some odd entries (should exist)
         for i in [1, 5, 9, 13, 17] {

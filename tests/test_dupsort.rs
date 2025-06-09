@@ -10,7 +10,7 @@ fn test_dupsort_basic() {
     let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap());
 
     // Create database with DUPSORT flag
-    let mut wtxn = env.begin_write_txn().unwrap();
+    let mut wtxn = env.write_txn().unwrap();
     let db: Database<String, String> = env
         .create_database_with_flags(
             &mut wtxn,
@@ -30,7 +30,7 @@ fn test_dupsort_basic() {
     wtxn.commit().unwrap();
 
     // Read and verify
-    let rtxn = env.begin_txn().unwrap();
+    let rtxn = env.read_txn().unwrap();
 
     // Get all duplicates for key1
     let values = db.get_all(&rtxn, &"key1".to_string()).unwrap();
@@ -52,7 +52,7 @@ fn test_dupsort_sorted_order() {
     let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap());
 
     // Create database with DUPSORT flag
-    let mut wtxn = env.begin_write_txn().unwrap();
+    let mut wtxn = env.write_txn().unwrap();
     let db: Database<String, String> = env
         .create_database_with_flags(
             &mut wtxn,
@@ -70,7 +70,7 @@ fn test_dupsort_sorted_order() {
     wtxn.commit().unwrap();
 
     // Read and verify they're sorted
-    let rtxn = env.begin_txn().unwrap();
+    let rtxn = env.read_txn().unwrap();
     let values = db.get_all(&rtxn, &"numbers".to_string()).unwrap();
 
     println!("Sorted values: {:?}", values);
@@ -89,7 +89,7 @@ fn test_dupsort_delete() {
     let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap());
 
     // Create database with DUPSORT flag
-    let mut wtxn = env.begin_write_txn().unwrap();
+    let mut wtxn = env.write_txn().unwrap();
     let db: Database<String, String> = env
         .create_database_with_flags(
             &mut wtxn,
@@ -106,14 +106,14 @@ fn test_dupsort_delete() {
     wtxn.commit().unwrap();
 
     // Delete specific value
-    let mut wtxn = env.begin_write_txn().unwrap();
+    let mut wtxn = env.write_txn().unwrap();
     let deleted = db.delete_dup(&mut wtxn, &"key".to_string(), &"value2".to_string()).unwrap();
     assert!(deleted);
 
     wtxn.commit().unwrap();
 
     // Verify deletion
-    let rtxn = env.begin_txn().unwrap();
+    let rtxn = env.read_txn().unwrap();
     let values = db.get_all(&rtxn, &"key".to_string()).unwrap();
 
     assert_eq!(values.len(), 2);
@@ -128,7 +128,7 @@ fn test_dupsort_mixed_keys() {
     let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap());
 
     // Create database with DUPSORT flag
-    let mut wtxn = env.begin_write_txn().unwrap();
+    let mut wtxn = env.write_txn().unwrap();
     let db: Database<String, String> = env
         .create_database_with_flags(
             &mut wtxn,
@@ -150,7 +150,7 @@ fn test_dupsort_mixed_keys() {
     wtxn.commit().unwrap();
 
     // Verify each key has correct values
-    let rtxn = env.begin_txn().unwrap();
+    let rtxn = env.read_txn().unwrap();
 
     let values_a = db.get_all(&rtxn, &"a".to_string()).unwrap();
     assert_eq!(values_a.len(), 2);

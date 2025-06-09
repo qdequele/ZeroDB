@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create database
     let db: Database<Vec<u8>, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("Creating database...");
         let db = env.create_database(&mut txn, None)?;
         println!("Database created, committing...");
@@ -22,7 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Try a simple put/get
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("\nInserting simple value...");
         db.put(&mut txn, b"test".to_vec(), b"value".to_vec())?;
         println!("Value inserted, committing...");
@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         println!("\nReading value...");
         let val = db.get(&txn, &b"test".to_vec())?;
         println!("Got: {:?}", val.map(|v| String::from_utf8_lossy(&v).to_string()));
@@ -39,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Now try with larger value that needs overflow
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("\nInserting large value (5KB)...");
         let large = vec![0x42; 5000];
         println!("Created {} byte value", large.len());
@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read it back
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         println!("\nReading large value...");
         let val = db.get(&txn, &b"large".to_vec())?;
         match val {
@@ -62,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Now update the large value
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("\nUpdating large value to 6KB...");
         let new_large = vec![0x43; 6000];
         db.put(&mut txn, b"large".to_vec(), new_large.clone())?;
@@ -73,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read updated value
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         println!("\nReading updated value...");
         let val = db.get(&txn, &b"large".to_vec())?;
         match val {

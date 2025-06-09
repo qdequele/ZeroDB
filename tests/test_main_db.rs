@@ -19,7 +19,7 @@ fn main() -> Result<()> {
 
     // Store some data in main database
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         let key = b"test_key".to_vec();
         let value = b"test_value".to_vec();
@@ -38,7 +38,7 @@ fn main() -> Result<()> {
 
     // Read it back in new transaction
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
 
         let key = b"test_key".to_vec();
         if let Some(value) = main_db.get(&txn, &key)? {
@@ -65,7 +65,7 @@ fn main() -> Result<()> {
 
     // Try to use the named database
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         let key = b"named_key".to_vec();
         let value = b"named_value".to_vec();

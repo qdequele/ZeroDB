@@ -40,7 +40,7 @@ pub fn copy_to_file(
     let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
 
     // Use a read transaction to get a consistent view
-    let txn = env.begin_txn()?;
+    let txn = env.read_txn()?;
 
     // Copy the environment
     copy_env_internal(env, &txn, &mut file, options)?;
@@ -58,7 +58,7 @@ pub fn copy_to_writer<W: Write>(
     writer: &mut W,
     options: CopyOptions,
 ) -> Result<()> {
-    let txn = env.begin_txn()?;
+    let txn = env.read_txn()?;
     copy_env_internal(env, &txn, writer, options)
 }
 
@@ -304,7 +304,7 @@ pub fn copy_with_callback<C: BackupCallback>(
 
     let mut file = OpenOptions::new().write(true).create(true).truncate(true).open(path)?;
 
-    let _txn = env.begin_txn()?;
+    let _txn = env.read_txn()?;
     let inner = env.inner();
     let meta = inner.meta()?;
 
@@ -381,7 +381,7 @@ mod tests {
 
         // Add some data
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db: Database<String, String> = env.create_database(&mut txn, None).unwrap();
 
             for i in 0..100 {
@@ -425,7 +425,7 @@ mod tests {
 
         // Add lots of data to ensure callback is triggered
         {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             let db: Database<Vec<u8>, Vec<u8>> = env.create_database(&mut txn, None).unwrap();
 
             // Add enough data to allocate multiple pages

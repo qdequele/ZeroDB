@@ -64,7 +64,7 @@ fn test_basic_operations_match() {
         let env =
             Arc::new(CoreEnvBuilder::new().map_size(10 * 1024 * 1024).open(&core_path).unwrap());
 
-        let mut wtxn = env.begin_write_txn().unwrap();
+        let mut wtxn = env.write_txn().unwrap();
         let db: CoreDatabase<String, String> = env.create_database(&mut wtxn, None).unwrap();
 
         // Insert data
@@ -75,7 +75,7 @@ fn test_basic_operations_match() {
         wtxn.commit().unwrap();
 
         // Read back
-        let rtxn = env.begin_txn().unwrap();
+        let rtxn = env.read_txn().unwrap();
         let mut results = Vec::new();
 
         for (key, _) in &test_data {
@@ -137,7 +137,7 @@ fn test_cursor_iteration_matches() {
         let env =
             Arc::new(CoreEnvBuilder::new().map_size(10 * 1024 * 1024).open(&core_path).unwrap());
 
-        let mut wtxn = env.begin_write_txn().unwrap();
+        let mut wtxn = env.write_txn().unwrap();
         let db: CoreDatabase<String, String> = env.create_database(&mut wtxn, None).unwrap();
 
         for (key, value) in &test_data {
@@ -147,7 +147,7 @@ fn test_cursor_iteration_matches() {
         wtxn.commit().unwrap();
 
         // Iterate with cursor
-        let rtxn = env.begin_txn().unwrap();
+        let rtxn = env.read_txn().unwrap();
         let mut cursor = db.cursor(&rtxn).unwrap();
         let mut results = Vec::new();
 
@@ -214,7 +214,7 @@ fn test_delete_operations_match() {
         let env =
             Arc::new(CoreEnvBuilder::new().map_size(10 * 1024 * 1024).open(&core_path).unwrap());
 
-        let mut wtxn = env.begin_write_txn().unwrap();
+        let mut wtxn = env.write_txn().unwrap();
         let db: CoreDatabase<String, String> = env.create_database(&mut wtxn, None).unwrap();
 
         // Insert initial data
@@ -230,7 +230,7 @@ fn test_delete_operations_match() {
         wtxn.commit().unwrap();
 
         // Read remaining data
-        let rtxn = env.begin_txn().unwrap();
+        let rtxn = env.read_txn().unwrap();
         let mut cursor = db.cursor(&rtxn).unwrap();
         let mut results = Vec::new();
 
@@ -283,7 +283,7 @@ fn test_multiple_databases_match() {
             CoreEnvBuilder::new().map_size(10 * 1024 * 1024).max_dbs(10).open(&core_path).unwrap(),
         );
 
-        let mut wtxn = env.begin_write_txn().unwrap();
+        let mut wtxn = env.write_txn().unwrap();
 
         let db1: CoreDatabase<String, String> =
             env.create_database(&mut wtxn, Some("db1")).unwrap();
@@ -295,7 +295,7 @@ fn test_multiple_databases_match() {
 
         wtxn.commit().unwrap();
 
-        let rtxn = env.begin_txn().unwrap();
+        let rtxn = env.read_txn().unwrap();
         let val1 = db1.get(&rtxn, &"key1".to_string()).unwrap().unwrap();
         let val2 = db2.get(&rtxn, &"key1".to_string()).unwrap().unwrap();
 

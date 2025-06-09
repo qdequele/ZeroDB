@@ -20,7 +20,7 @@ fn main() -> Result<()> {
 
     // Store some data
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         // Use raw bytes for now to avoid trait issues
         let key = b"key1".to_vec();
@@ -34,7 +34,7 @@ fn main() -> Result<()> {
 
     // Read it back
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
 
         let key = b"key1".to_vec();
         if let Some(value) = db.get(&txn, &key)? {
@@ -46,7 +46,7 @@ fn main() -> Result<()> {
 
     // List databases in catalog
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let databases = zerodb::catalog::Catalog::list_databases(&txn)?;
 
         println!("\n✓ Found {} named database(s) in catalog:", databases.len());

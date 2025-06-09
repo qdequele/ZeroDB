@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create database
     let db: Database<Vec<u8>, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, None)?;
         txn.commit()?;
         db
@@ -16,14 +16,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 1: Insert large value
     let large_val1 = vec![0xAA; 5000];
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("1. Inserting large value ({} bytes)", large_val1.len());
         db.put(&mut txn, b"key".to_vec(), large_val1.clone())?;
         txn.commit()?;
     }
 
     // Step 2: Start a read transaction (snapshot)
-    let read_txn = env.begin_txn()?;
+    let read_txn = env.read_txn()?;
     println!("2. Started read transaction (snapshot)");
 
     // Verify the value in the snapshot
@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 3: Update the value
     let large_val2 = vec![0xBB; 6000];
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("\n3. Updating to new value ({} bytes)", large_val2.len());
 
         // Check what we see before update
@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 5: New transaction should see new value
     println!("\n5. New transaction should see new value");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let val = db.get(&txn, &b"key".to_vec())?;
         match val {
             Some(v) => {

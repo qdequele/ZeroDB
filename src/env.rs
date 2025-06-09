@@ -425,12 +425,12 @@ impl Environment<Closed> {
 
 impl Environment<Open> {
     /// Begin a read transaction
-    pub fn begin_txn(&self) -> Result<Transaction<'_, Read>> {
+    pub fn read_txn(&self) -> Result<Transaction<'_, Read>> {
         Transaction::new_read(self)
     }
 
     /// Begin a write transaction
-    pub fn begin_write_txn(&self) -> Result<Transaction<'_, Write>> {
+    pub fn write_txn(&self) -> Result<Transaction<'_, Write>> {
         Transaction::new_write(self)
     }
 
@@ -527,7 +527,7 @@ mod tests {
         // Create and close environment
         {
             let env = EnvBuilder::new().open(dir.path()).unwrap();
-            let _txn = env.begin_write_txn().unwrap();
+            let _txn = env.write_txn().unwrap();
             // Transaction commits on drop
         }
 
@@ -556,7 +556,7 @@ mod tests {
 
             // Create database and insert data
             let db: Database<String, String> = {
-                let mut txn = env.begin_write_txn().unwrap();
+                let mut txn = env.write_txn().unwrap();
                 let db = env.create_database(&mut txn, None).unwrap();
 
                 db.put(&mut txn, "key1".to_string(), "value1".to_string()).unwrap();
@@ -577,7 +577,7 @@ mod tests {
             let env =
                 Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap());
 
-            let txn = env.begin_txn().unwrap();
+            let txn = env.read_txn().unwrap();
             let db: Database<String, String> = env.open_database(&txn, None).unwrap();
 
             assert_eq!(db.get(&txn, &"key1".to_string()).unwrap(), Some("value1".to_string()));
@@ -602,7 +602,7 @@ mod tests {
 
         // Perform many small transactions
         for _ in 0..100 {
-            let mut txn = env.begin_write_txn().unwrap();
+            let mut txn = env.write_txn().unwrap();
             // Just allocate a page
             let _ = txn.alloc_page(crate::page::PageFlags::LEAF).unwrap();
             txn.commit().unwrap();
@@ -624,7 +624,7 @@ mod tests {
 
         // Perform same transactions
         for _ in 0..100 {
-            let mut txn = env2.begin_write_txn().unwrap();
+            let mut txn = env2.write_txn().unwrap();
             let _ = txn.alloc_page(crate::page::PageFlags::LEAF).unwrap();
             txn.commit().unwrap();
         }

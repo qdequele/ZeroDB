@@ -39,7 +39,7 @@ fn main() -> Result<()> {
     // Add test data
     println!("\nAdding test data...");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db: Database<String, String> = env.create_database(&mut txn, None)?;
 
         // Add some data
@@ -53,7 +53,7 @@ fn main() -> Result<()> {
 
     // Create a named database too
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db: Database<String, String> = env.create_database(&mut txn, Some("test_db"))?;
 
         for i in 0..30 {
@@ -98,7 +98,7 @@ fn main() -> Result<()> {
 
     // Add more data to make progress visible
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db: Database<Vec<u8>, Vec<u8>> = env.open_database(&txn, None)?;
 
         // Add larger data to allocate more pages

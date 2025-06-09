@@ -1455,15 +1455,14 @@ impl<C: Comparator> BTree<C> {
                 // Key doesn't exist - check if we need to split
                 let needs_split = {
                     let page = txn.get_page(page_id)?;
-                    // Calculate size needed - for overflow values, we only store 8 bytes + key
                     let needs_overflow = crate::overflow::needs_overflow(key.len(), value.len());
-                    let key_value_size = if needs_overflow {
-                        key.len() + 8 + 8 // key + overflow page ID + overhead
+                    
+                    // First check if we definitely don't have room
+                    if needs_overflow {
+                        !page.has_room_for(key.len(), 8) // 8 bytes for overflow page ID
                     } else {
-                        key.len() + value.len() + 8 // key + value + overhead
-                    };
-                    let _free_space = page.header.free_space();
-                    page.header.free_space() < key_value_size
+                        !page.has_room_for(key.len(), value.len())
+                    }
                 };
 
                 if needs_split {
@@ -1623,7 +1622,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let env = EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap();
 
-        let txn = env.begin_txn().unwrap();
+        let txn = env.read_txn().unwrap();
         let root = PageId(3); // Main DB root
 
         let result = BTree::<LexicographicComparator>::search(&txn, root, b"key").unwrap();
@@ -1653,7 +1652,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let env = EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap();
 
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
         let mut root = PageId(3); // Main DB root
         let mut db_info = DbInfo::default();
         db_info.root = root;
@@ -1678,7 +1677,7 @@ mod tests {
         txn.commit().unwrap();
 
         // Search for the key
-        let txn = env.begin_txn().unwrap();
+        let txn = env.read_txn().unwrap();
         let result = BTree::<LexicographicComparator>::search(&txn, root, b"key1").unwrap();
         assert_eq!(result.as_ref().map(|v| v.as_ref()), Some(&b"value1"[..]));
     }
@@ -1688,7 +1687,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let env = EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap();
 
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
         let mut root = PageId(3);
         let mut db_info = DbInfo::default();
         db_info.root = root;
@@ -1720,7 +1719,7 @@ mod tests {
         txn.commit().unwrap();
 
         // Search for all keys
-        let txn = env.begin_txn().unwrap();
+        let txn = env.read_txn().unwrap();
         for (key, expected_value) in &keys {
             let result = BTree::<LexicographicComparator>::search(&txn, root, *key).unwrap();
             assert_eq!(result.as_ref().map(|v| v.as_ref()), Some(&expected_value[..]));
@@ -1732,7 +1731,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let env = EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap();
 
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
         let mut root = PageId(3);
         let mut db_info = DbInfo::default();
         db_info.root = root;
@@ -1782,7 +1781,7 @@ mod tests {
         txn.commit().unwrap();
 
         // Verify remaining keys
-        let txn = env.begin_txn().unwrap();
+        let txn = env.read_txn().unwrap();
         assert!(BTree::<LexicographicComparator>::search(&txn, root, b"key1").unwrap().is_some());
         assert!(BTree::<LexicographicComparator>::search(&txn, root, b"key2").unwrap().is_none());
         assert!(BTree::<LexicographicComparator>::search(&txn, root, b"key3").unwrap().is_some());
@@ -1793,7 +1792,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let env = EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap();
 
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
         let mut root = PageId(3);
         let mut db_info = DbInfo::default();
         db_info.root = root;
@@ -1848,7 +1847,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let env = EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap();
 
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
         let mut root = PageId(3);
         let mut db_info = DbInfo::default();
         db_info.root = root;
@@ -1885,7 +1884,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let env = EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap();
 
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
 
         // Properly initialize the database
         let (root_id, root_page) = txn.alloc_page(PageFlags::LEAF).unwrap();
@@ -1940,7 +1939,7 @@ mod tests {
         txn.commit().unwrap();
 
         // Search for large value
-        let txn = env.begin_txn().unwrap();
+        let txn = env.read_txn().unwrap();
         let db_info = txn.db_info(None).unwrap();
         let result =
             BTree::<LexicographicComparator>::search(&txn, db_info.root, b"large_key").unwrap();
@@ -1954,7 +1953,7 @@ mod tests {
         drop(txn);
 
         // Delete large value
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
         let mut db_info = *txn.db_info(None).unwrap();
         let mut root = db_info.root;
         let deleted = BTree::<LexicographicComparator>::delete(

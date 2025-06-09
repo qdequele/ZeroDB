@@ -55,7 +55,7 @@ impl HeedCoreDb {
 
 impl Database for HeedCoreDb {
     fn write_batch(&self, data: &[(Vec<u8>, Vec<u8>)]) -> anyhow::Result<()> {
-        let mut txn = self.env.begin_write_txn()?;
+        let mut txn = self.env.write_txn()?;
 
         for (key, value) in data {
             self.db.put(&mut txn, key.clone(), value.clone())?;
@@ -66,7 +66,7 @@ impl Database for HeedCoreDb {
     }
 
     fn read_batch(&self, keys: &[Vec<u8>]) -> anyhow::Result<Vec<Option<Vec<u8>>>> {
-        let txn = self.env.begin_txn()?;
+        let txn = self.env.read_txn()?;
 
         let mut results = Vec::with_capacity(keys.len());
         for key in keys {
@@ -76,7 +76,7 @@ impl Database for HeedCoreDb {
     }
 
     fn scan_all(&self) -> anyhow::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let txn = self.env.begin_txn()?;
+        let txn = self.env.read_txn()?;
 
         let mut results = Vec::new();
         let mut cursor = self.db.cursor(&txn)?;
@@ -87,7 +87,7 @@ impl Database for HeedCoreDb {
     }
 
     fn delete_batch(&self, keys: &[Vec<u8>]) -> anyhow::Result<()> {
-        let mut txn = self.env.begin_write_txn()?;
+        let mut txn = self.env.write_txn()?;
 
         for key in keys {
             self.db.delete(&mut txn, key)?;
@@ -98,7 +98,7 @@ impl Database for HeedCoreDb {
     }
 
     fn clear(&self) -> anyhow::Result<()> {
-        let mut txn = self.env.begin_write_txn()?;
+        let mut txn = self.env.write_txn()?;
         self.db.clear(&mut txn)?;
         txn.commit()?;
         Ok(())

@@ -36,7 +36,7 @@ fn main() -> Result<()> {
     println!("\nSimple freelist allocation pattern:");
     let start = Instant::now();
     {
-        let mut txn = env_simple.begin_write_txn()?;
+        let mut txn = env_simple.write_txn()?;
         let mut allocated_pages = Vec::new();
 
         // Allocate many pages
@@ -61,7 +61,7 @@ fn main() -> Result<()> {
     println!("\nSegregated freelist allocation pattern:");
     let start = Instant::now();
     {
-        let mut txn = env_segregated.begin_write_txn()?;
+        let mut txn = env_segregated.write_txn()?;
         let mut allocated_pages = Vec::new();
 
         // Allocate many pages
@@ -92,7 +92,7 @@ fn main() -> Result<()> {
     println!("\nSimple freelist allocations:");
     let start = Instant::now();
     {
-        let mut txn = env_simple.begin_write_txn()?;
+        let mut txn = env_simple.write_txn()?;
         for _ in 0..alloc_count {
             let (_page_id, _page) = txn.alloc_page(zerodb::page::PageFlags::LEAF)?;
         }
@@ -106,7 +106,7 @@ fn main() -> Result<()> {
     println!("\nSegregated freelist allocations:");
     let start = Instant::now();
     {
-        let mut txn = env_segregated.begin_write_txn()?;
+        let mut txn = env_segregated.write_txn()?;
         for _ in 0..alloc_count {
             let (_page_id, _page) = txn.alloc_page(zerodb::page::PageFlags::LEAF)?;
         }

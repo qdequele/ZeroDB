@@ -345,9 +345,9 @@ mod tests {
             EnvBuilder::new().map_size(10 * 1024 * 1024).max_readers(5).open(dir.path()).unwrap();
 
         // Start multiple read transactions
-        let txn1 = env.begin_txn().unwrap();
-        let txn2 = env.begin_txn().unwrap();
-        let txn3 = env.begin_txn().unwrap();
+        let txn1 = env.read_txn().unwrap();
+        let txn2 = env.read_txn().unwrap();
+        let txn3 = env.read_txn().unwrap();
 
         // Check reader count
         let inner = env.inner();
@@ -360,8 +360,8 @@ mod tests {
         assert_eq!(inner.readers.reader_count(), 2);
 
         // Should be able to start new transactions
-        let txn4 = env.begin_txn().unwrap();
-        let txn5 = env.begin_txn().unwrap();
+        let txn4 = env.read_txn().unwrap();
+        let txn5 = env.read_txn().unwrap();
 
         assert_eq!(inner.readers.reader_count(), 4);
 

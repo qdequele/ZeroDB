@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a database
     let db: Database<String, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, Some("test_db"))?;
         txn.commit()?;
         db
@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Insert entry
         {
-            let mut txn = env.begin_write_txn()?;
+            let mut txn = env.write_txn()?;
             let key = format!("key_{:03}", i);
             let value = vec![i as u8; 256];
             println!("  Inserting: {}", key);
@@ -48,7 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Verify all entries
         {
-            let txn = env.begin_txn()?;
+            let txn = env.read_txn()?;
             let mut cursor = db.cursor(&txn)?;
             let mut count = 0;
             let mut keys = Vec::new();

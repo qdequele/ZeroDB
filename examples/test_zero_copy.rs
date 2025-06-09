@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create database and insert test data
     let db: Database<Vec<u8>, Vec<u8>> = {
-        let mut wtxn = env.begin_write_txn()?;
+        let mut wtxn = env.write_txn()?;
         let db = env.create_database(&mut wtxn, None)?;
 
         // Insert test data
@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Test read performance
     println!("\nTesting read performance...");
-    let rtxn = env.begin_txn()?;
+    let rtxn = env.read_txn()?;
 
     // Warm up
     for i in 0..100 {

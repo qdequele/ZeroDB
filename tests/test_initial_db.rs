@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create database
     let db: Database<Vec<u8>, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("Creating database...");
         let db = env.create_database(&mut txn, None)?;
         println!("Database created");
@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Try simple put/get first
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("\nInserting simple value...");
         db.put(&mut txn, b"test".to_vec(), b"value".to_vec())?;
         println!("Simple value inserted");
@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Read it back
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         println!("\nReading simple value...");
         let val = db.get(&txn, &b"test".to_vec())?;
         println!("Got: {:?}", val.map(|v| String::from_utf8_lossy(&v).to_string()));
@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Now try large value
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("\nInserting large value (5KB)...");
         let large = vec![0x42; 5000];
         println!("Large value created: {} bytes", large.len());

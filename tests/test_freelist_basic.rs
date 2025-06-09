@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create database
     let db: Database<String, String> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, None)?;
         txn.commit()?;
         db
@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Step 1: Inserting initial data...");
     let mut _page_ids: Vec<u64> = Vec::new();
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         // Insert enough data to allocate multiple pages
         for i in 0..100 {
@@ -39,7 +39,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 2: Delete some entries
     println!("\nStep 2: Deleting half the entries...");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         // Delete every other entry
         for i in (0..100).step_by(2) {
@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 3: Insert new data
     println!("\nStep 3: Inserting new data...");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         // Insert new data
         for i in 100..150 {
@@ -91,12 +91,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nStep 5: Testing with active reader...");
     {
         // Start a read transaction that will prevent page reuse
-        let read_txn = env.begin_txn()?;
+        let read_txn = env.read_txn()?;
         println!("  Started read transaction");
 
         // Try to delete and insert in a write transaction
         {
-            let mut txn = env.begin_write_txn()?;
+            let mut txn = env.write_txn()?;
 
             // Delete some more entries
             for i in 1..50 {
@@ -125,7 +125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 6: Check if pages are now reusable
     println!("\nStep 6: Testing page reuse after reader is gone...");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         // Insert more data
         for i in 300..310 {

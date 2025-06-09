@@ -42,7 +42,7 @@ fn main() -> Result<()> {
     println!("\nRegular allocation:");
     let start = Instant::now();
     {
-        let mut txn = env_regular.begin_write_txn()?;
+        let mut txn = env_regular.write_txn()?;
         for i in 0..page_count {
             let _ = txn.alloc_page(zerodb::page::PageFlags::LEAF)?;
             if i % 1000 == 0 {
@@ -60,7 +60,7 @@ fn main() -> Result<()> {
     println!("\nNUMA-aware allocation:");
     let start = Instant::now();
     {
-        let mut txn = env_numa.begin_write_txn()?;
+        let mut txn = env_numa.write_txn()?;
         for i in 0..page_count {
             let _ = txn.alloc_page(zerodb::page::PageFlags::LEAF)?;
             if i % 1000 == 0 {
@@ -91,7 +91,7 @@ fn main() -> Result<()> {
             .map(|_| {
                 let env = env_regular.clone();
                 thread::spawn(move || {
-                    let mut txn = env.begin_write_txn().unwrap();
+                    let mut txn = env.write_txn().unwrap();
                     for _ in 0..pages_per_thread {
                         let _ = txn.alloc_page(zerodb::page::PageFlags::LEAF).unwrap();
                     }
@@ -122,7 +122,7 @@ fn main() -> Result<()> {
                         let _ = affinity.apply();
                     }
 
-                    let mut txn = env.begin_write_txn().unwrap();
+                    let mut txn = env.write_txn().unwrap();
                     for _ in 0..pages_per_thread {
                         let _ = txn.alloc_page(zerodb::page::PageFlags::LEAF).unwrap();
                     }

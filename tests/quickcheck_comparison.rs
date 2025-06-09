@@ -67,7 +67,7 @@ fn execute_zerodb(config: &TestConfig) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, Str
 
     let db: zerodb::Database<Vec<u8>, Vec<u8>> = {
         let mut txn =
-            env.begin_write_txn().map_err(|e| format!("Begin write txn error: {:?}", e))?;
+            env.write_txn().map_err(|e| format!("Begin write txn error: {:?}", e))?;
         let db =
             env.create_database(&mut txn, None).map_err(|e| format!("Create db error: {:?}", e))?;
         txn.commit().map_err(|e| format!("Commit error: {:?}", e))?;
@@ -77,7 +77,7 @@ fn execute_zerodb(config: &TestConfig) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, Str
     // Execute operations
     for op in &config.operations {
         let mut txn =
-            env.begin_write_txn().map_err(|e| format!("Begin write txn error: {:?}", e))?;
+            env.write_txn().map_err(|e| format!("Begin write txn error: {:?}", e))?;
 
         match op {
             DbOperation::Put(key, value) => {
@@ -104,7 +104,7 @@ fn execute_zerodb(config: &TestConfig) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, Str
     }
 
     // Read final state
-    let txn = env.begin_txn().map_err(|e| format!("Begin read txn error: {:?}", e))?;
+    let txn = env.read_txn().map_err(|e| format!("Begin read txn error: {:?}", e))?;
 
     let mut result = BTreeMap::new();
     let cursor = db.cursor(&txn).map_err(|e| format!("Cursor error: {:?}", e))?;

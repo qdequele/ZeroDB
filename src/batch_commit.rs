@@ -170,7 +170,7 @@ impl BatchCommitter {
         enable_group_commit: bool,
     ) {
         // Start a write transaction
-        let mut txn = match env.begin_write_txn() {
+        let mut txn = match env.write_txn() {
             Ok(txn) => txn,
             Err(e) => {
                 // Send error to all writers
@@ -336,7 +336,7 @@ mod tests {
         }
 
         // Verify writes
-        let txn = env.begin_txn().unwrap();
+        let txn = env.read_txn().unwrap();
         for i in 0..20 {
             let key = format!("key{}", i).into_bytes();
             let db_info = txn.db_info(None).unwrap();

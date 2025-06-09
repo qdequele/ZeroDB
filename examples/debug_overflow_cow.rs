@@ -10,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create database using the high-level API
     let db: Database<String, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, None)?;
         txn.commit()?;
         db
@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Step 1: Insert a large value
     let large_value1 = vec![0xAA; 5000]; // 5KB
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("Step 1: Inserting large value (5KB)...");
         db.put(&mut txn, "key1".to_string(), large_value1.clone())?;
         txn.commit()?;
@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 2: Read it back
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let val = db.get(&txn, &"key1".to_string())?;
         match val {
             Some(v) => {
@@ -39,13 +39,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Step 3: Start a read transaction BEFORE updating
-    let read_txn = env.begin_txn()?;
+    let read_txn = env.read_txn()?;
     println!("\nStep 3: Started read transaction (snapshot)");
 
     // Step 4: Update the value in a new write transaction
     let large_value2 = vec![0xBB; 6000]; // 6KB
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("Step 4: Updating to new large value (6KB)...");
 
         // Check value before update
@@ -95,7 +95,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 6: Read from a new transaction (should see new value)
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         println!("\nStep 6: Reading from new transaction...");
         let val = db.get(&txn, &"key1".to_string())?;
         match val {

@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create database
     let db: Database<Vec<u8>, Vec<u8>> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, None)?;
         txn.commit()?;
         db
@@ -16,13 +16,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Test 1: Small value
     println!("Test 1: Small value");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         db.put(&mut txn, b"key1".to_vec(), b"small value".to_vec())?;
         txn.commit()?;
     }
 
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let val = db.get(&txn, &b"key1".to_vec())?;
         println!("  Read small value: {:?}", val.map(|v| String::from_utf8_lossy(&v).to_string()));
     }
@@ -31,14 +31,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nTest 2: Large value");
     let large_val = vec![0xAB; 5000];
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("  Inserting {} bytes...", large_val.len());
         db.put(&mut txn, b"key2".to_vec(), large_val.clone())?;
         txn.commit()?;
     }
 
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let val = db.get(&txn, &b"key2".to_vec())?;
         match val {
             Some(v) => {
@@ -53,14 +53,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nTest 3: Update large value");
     let new_large = vec![0xCD; 6000];
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         println!("  Updating to {} bytes...", new_large.len());
         db.put(&mut txn, b"key2".to_vec(), new_large.clone())?;
         txn.commit()?;
     }
 
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let val = db.get(&txn, &b"key2".to_vec())?;
         match val {
             Some(v) => {

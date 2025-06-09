@@ -16,7 +16,7 @@ fn main() -> anyhow::Result<()> {
     let db = Database::<Vec<u8>, Vec<u8>>::open(&env, None, DatabaseFlags::CREATE)?;
     
     // Try to insert 1000 items like the benchmark does
-    let mut txn = env.begin_write_txn()?;
+    let mut txn = env.write_txn()?;
     
     for i in 0..1000 {
         let key = format!("key_{:08}", i).into_bytes();
@@ -39,7 +39,7 @@ fn main() -> anyhow::Result<()> {
     println!("Successfully inserted 1000 keys!");
     
     // Verify data
-    let txn = env.begin_txn()?;
+    let txn = env.read_txn()?;
     let mut count = 0;
     let mut cursor = db.cursor(&txn)?;
     while cursor.next()?.is_some() {

@@ -534,7 +534,7 @@ mod tests {
         let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap());
 
         // Create database with DUPSORT
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
         let mut db_info = DbInfo {
             flags: DatabaseFlags::DUP_SORT.bits(),
             depth: 0,
@@ -554,7 +554,7 @@ mod tests {
         txn.commit().unwrap();
 
         // Read all values
-        let txn = env.begin_txn().unwrap();
+        let txn = env.read_txn().unwrap();
         let values = DupSort::get_all(&txn, db_info.root, b"key1").unwrap();
         assert_eq!(values.len(), 3);
         assert!(values.contains(&b"value1".to_vec()));
@@ -571,7 +571,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path()).unwrap());
 
-        let mut txn = env.begin_write_txn().unwrap();
+        let mut txn = env.write_txn().unwrap();
         let mut db_info = DbInfo {
             flags: DatabaseFlags::DUP_SORT.bits(),
             depth: 0,

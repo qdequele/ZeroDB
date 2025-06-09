@@ -17,7 +17,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a database
     let _db: Database<String, String> = {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
         let db = env.create_database(&mut txn, Some("test_db"))?;
         txn.commit()?;
         db
@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Insert a lot of entries to create a multi-level tree
     println!("1. Inserting 200 entries to create a multi-level B+Tree...");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         for i in 0..200 {
             let key = format!("key_{:04}", i);
@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Delete every other entry to trigger rebalancing
     println!("\n2. Deleting every other entry (100 total) to trigger rebalancing...");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         for i in (0..200).step_by(2) {
             let key = format!("key_{:04}", i);
@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Verify remaining entries
     println!("\n3. Verifying remaining entries...");
     {
-        let txn = env.begin_txn()?;
+        let txn = env.read_txn()?;
         let mut found = 0;
         let mut missing = 0;
 
@@ -111,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Delete more entries to potentially reduce tree depth
     println!("\n4. Deleting more entries to see if tree shrinks...");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         // Delete entries to leave only 20
         for i in (1..180).step_by(2) {
@@ -135,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Insert new entries to test that the tree can grow again
     println!("\n5. Inserting new entries to test tree can grow again...");
     {
-        let mut txn = env.begin_write_txn()?;
+        let mut txn = env.write_txn()?;
 
         for i in 300..350 {
             let key = format!("key_{:04}", i);

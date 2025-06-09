@@ -844,12 +844,12 @@ mod tests {
         let env = EnvBuilder::new().open(dir.path()).unwrap();
 
         // Create read transaction
-        let rtxn = env.begin_txn().unwrap();
+        let rtxn = env.read_txn().unwrap();
         assert_eq!(rtxn.id().0, env.inner().txn_id.load(std::sync::atomic::Ordering::SeqCst));
         drop(rtxn);
 
         // Create write transaction
-        let wtxn = env.begin_write_txn().unwrap();
+        let wtxn = env.write_txn().unwrap();
         // The txn_id is incremented after creation, so wtxn.id() <= txn_id
         assert!(wtxn.id().0 > 0);
     }
@@ -860,11 +860,11 @@ mod tests {
         let env = EnvBuilder::new().open(dir.path()).unwrap();
 
         // Start read transaction
-        let rtxn1 = env.begin_txn().unwrap();
+        let rtxn1 = env.read_txn().unwrap();
         let id1 = rtxn1.id();
 
         // Start write transaction
-        let wtxn = env.begin_write_txn().unwrap();
+        let wtxn = env.write_txn().unwrap();
         let id2 = wtxn.id();
 
         // Write transaction has higher ID
@@ -887,7 +887,7 @@ mod tests {
 
         // Create database and insert initial data
         let db: Database<String, String> = {
-            let mut wtxn = env.begin_write_txn().unwrap();
+            let mut wtxn = env.write_txn().unwrap();
             let db = env.create_database(&mut wtxn, None).unwrap();
             db.put(&mut wtxn, "key1".to_string(), "value1".to_string()).unwrap();
             db.put(&mut wtxn, "key2".to_string(), "value2".to_string()).unwrap();
@@ -896,7 +896,7 @@ mod tests {
         };
 
         // Start read transaction BEFORE modifications
-        let rtxn1 = env.begin_txn().unwrap();
+        let rtxn1 = env.read_txn().unwrap();
         let snapshot_id = rtxn1.id();
 
         // Verify initial data is visible
@@ -906,7 +906,7 @@ mod tests {
 
         // Modify data in a write transaction
         {
-            let mut wtxn = env.begin_write_txn().unwrap();
+            let mut wtxn = env.write_txn().unwrap();
             db.put(&mut wtxn, "key1".to_string(), "modified1".to_string()).unwrap();
             db.put(&mut wtxn, "key3".to_string(), "value3".to_string()).unwrap();
             db.delete(&mut wtxn, &"key2".to_string()).unwrap();
@@ -919,7 +919,7 @@ mod tests {
         assert_eq!(db.get(&rtxn1, &"key3".to_string()).unwrap(), None);
 
         // New read transaction should see modified data
-        let rtxn2 = env.begin_txn().unwrap();
+        let rtxn2 = env.read_txn().unwrap();
         assert!(rtxn2.id().0 > snapshot_id.0);
         assert_eq!(db.get(&rtxn2, &"key1".to_string()).unwrap(), Some("modified1".to_string()));
         assert_eq!(db.get(&rtxn2, &"key2".to_string()).unwrap(), None);
@@ -942,13 +942,13 @@ mod tests {
         assert_eq!(inner.readers.oldest_reader(), None);
 
         // Start multiple readers with different txn IDs
-        let rtxn1 = env.begin_txn().unwrap();
+        let rtxn1 = env.read_txn().unwrap();
         assert_eq!(inner.readers.reader_count(), 1);
 
-        let rtxn2 = env.begin_txn().unwrap();
+        let rtxn2 = env.read_txn().unwrap();
         assert_eq!(inner.readers.reader_count(), 2);
 
-        let rtxn3 = env.begin_txn().unwrap();
+        let rtxn3 = env.read_txn().unwrap();
         assert_eq!(inner.readers.reader_count(), 3);
 
         // All should have same txn ID (no writes between them)
@@ -1000,7 +1000,7 @@ mod tests {
 
         // Create database and commit transaction
         let db: Database<String, String> = {
-            let mut wtxn = env.begin_write_txn().unwrap();
+            let mut wtxn = env.write_txn().unwrap();
             let txn_id = wtxn.id();
             let db = env.create_database(&mut wtxn, None).unwrap();
             db.put(&mut wtxn, "key1".to_string(), "value1".to_string()).unwrap();
@@ -1016,7 +1016,7 @@ mod tests {
 
         // Second transaction to verify meta page alternation
         {
-            let mut wtxn = env.begin_write_txn().unwrap();
+            let mut wtxn = env.write_txn().unwrap();
             let txn_id2 = wtxn.id();
             db.put(&mut wtxn, "key2".to_string(), "value2".to_string()).unwrap();
             wtxn.commit().unwrap();
@@ -1057,7 +1057,7 @@ mod tests {
             let env = Arc::new(EnvBuilder::new().durability(*mode).open(dir.path()).unwrap());
 
             let db: Database<String, String> = {
-                let mut wtxn = env.begin_write_txn().unwrap();
+                let mut wtxn = env.write_txn().unwrap();
                 let db = env.create_database(&mut wtxn, None).unwrap();
 
                 // Insert some data
@@ -1070,7 +1070,7 @@ mod tests {
             };
 
             // Verify data is readable
-            let rtxn = env.begin_txn().unwrap();
+            let rtxn = env.read_txn().unwrap();
             for i in 0..10 {
                 assert_eq!(
                     db.get(&rtxn, &format!("key{}", i)).unwrap(),

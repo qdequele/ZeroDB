@@ -27,7 +27,7 @@ fn bench_freelist_allocation(c: &mut Criterion) {
                     .unwrap();
 
                 b.iter(|| {
-                    let mut txn = env.begin_write_txn().unwrap();
+                    let mut txn = env.write_txn().unwrap();
                     let mut pages = Vec::new();
 
                     // Allocate pages
@@ -62,7 +62,7 @@ fn bench_freelist_allocation(c: &mut Criterion) {
                     .unwrap();
 
                 b.iter(|| {
-                    let mut txn = env.begin_write_txn().unwrap();
+                    let mut txn = env.write_txn().unwrap();
                     let mut pages = Vec::new();
 
                     // Allocate pages
@@ -108,7 +108,7 @@ fn bench_freelist_fragmentation(c: &mut Criterion) {
 
                 // Pre-fragment the freelist
                 {
-                    let mut txn = env.begin_write_txn().unwrap();
+                    let mut txn = env.write_txn().unwrap();
                     let mut pages = Vec::new();
 
                     // Allocate many pages
@@ -130,7 +130,7 @@ fn bench_freelist_fragmentation(c: &mut Criterion) {
 
                 // Benchmark allocations in fragmented state
                 b.iter(|| {
-                    let mut txn = env.begin_write_txn().unwrap();
+                    let mut txn = env.write_txn().unwrap();
                     for _ in 0..100 {
                         let _ = txn.alloc_page(PageFlags::LEAF);
                     }
@@ -152,7 +152,7 @@ fn bench_freelist_fragmentation(c: &mut Criterion) {
 
                 // Pre-fragment the freelist
                 {
-                    let mut txn = env.begin_write_txn().unwrap();
+                    let mut txn = env.write_txn().unwrap();
                     let mut pages = Vec::new();
 
                     // Allocate many pages
@@ -174,7 +174,7 @@ fn bench_freelist_fragmentation(c: &mut Criterion) {
 
                 // Benchmark allocations in fragmented state
                 b.iter(|| {
-                    let mut txn = env.begin_write_txn().unwrap();
+                    let mut txn = env.write_txn().unwrap();
                     for _ in 0..100 {
                         let _ = txn.alloc_page(PageFlags::LEAF);
                     }
