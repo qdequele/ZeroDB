@@ -3,7 +3,7 @@
 use crate::comparator::{Comparator, LexicographicComparator};
 use crate::error::{Error, PageId, Result};
 use crate::meta::DbInfo;
-use crate::page::{PageFlags, PageHeader, SearchResult, PAGE_SIZE};
+use crate::page::{Page, PageFlags, PageHeader, SearchResult, PAGE_SIZE};
 use crate::txn::{Transaction, Write};
 use std::borrow::Cow;
 use std::marker::PhantomData;
@@ -13,7 +13,42 @@ use std::marker::PhantomData;
 pub const MAX_KEYS_PER_PAGE: usize = (PAGE_SIZE - PageHeader::SIZE) / 16;
 
 /// Minimum number of keys per page (except root)
+/// DEPRECATED: Use is_underflowed() function instead
 pub const MIN_KEYS_PER_PAGE: usize = MAX_KEYS_PER_PAGE / 2;
+
+/// LMDB-style fill threshold: 25% of page must be used
+/// Pages below this threshold are candidates for merging
+const FILL_THRESHOLD: usize = (PAGE_SIZE - PageHeader::SIZE) / 4;
+
+/// Minimum keys for branch pages (must have at least 2 for tree structure)
+const MIN_BRANCH_KEYS: usize = 2;
+
+/// Minimum keys for leaf pages (can go down to 1)
+const MIN_LEAF_KEYS: usize = 1;
+
+/// Check if a page is underflowed based on used space, not key count
+fn is_underflowed(page: &Page) -> bool {
+    // Root page is never considered underflowed
+    if page.header.pgno == 3 {
+        return false;
+    }
+    
+    let used_space = PAGE_SIZE - page.header.free_space() - PageHeader::SIZE;
+    let is_branch = page.header.flags.contains(PageFlags::BRANCH);
+    
+    // For branch pages, also check minimum key count
+    if is_branch && page.header.num_keys < MIN_BRANCH_KEYS as u16 {
+        return true;
+    }
+    
+    // For leaf pages, check minimum key count
+    if !is_branch && page.header.num_keys < MIN_LEAF_KEYS as u16 {
+        return true;
+    }
+    
+    // Check fill threshold
+    used_space < FILL_THRESHOLD
+}
 
 /// B+Tree operations
 pub struct BTree<C = LexicographicComparator> {
@@ -405,28 +440,45 @@ impl<C: Comparator> BTree<C> {
                 )
             }
             SearchResult::NotFound { insert_pos: _ } => {
-                if needs_overflow {
-                    // Write value to overflow pages first
-                    let overflow_id = crate::overflow::write_overflow_value(txn, value)?;
+                // Check if we need to split pre-emptively
+                let needs_split = {
+                    let page = txn.get_page(page_id)?;
+                    let required_size = if needs_overflow {
+                        crate::page::NodeHeader::SIZE + key.len() + 8 + size_of::<u16>()
+                    } else {
+                        crate::page::NodeHeader::SIZE + key.len() + value.len() + size_of::<u16>()
+                    };
+                    // Use should_split for pre-emptive splitting at 85% utilization
+                    page.should_split(Some(required_size))
+                };
 
-                    // Try to add the node with overflow reference
+                if needs_split {
+                    // Page should be split pre-emptively
+                    if needs_overflow {
+                        let overflow_id = crate::overflow::write_overflow_value(txn, value)?;
+                        Self::split_leaf_page_with_overflow(txn, page_id, key, overflow_id)
+                    } else {
+                        Self::split_leaf_page(txn, page_id, key, value)
+                    }
+                } else if needs_overflow {
+                    // Page has room, insert with overflow
+                    let overflow_id = crate::overflow::write_overflow_value(txn, value)?;
                     let page = txn.get_page_mut(page_id)?;
                     match page.add_node_sorted_overflow(key, overflow_id) {
                         Ok(_) => Ok(InsertResult::Inserted),
                         Err(Error::Custom(msg)) if msg.contains("Page full") => {
-                            // Page is full, need to split
-                            // For split, we'll handle overflow as a special case
+                            // Fallback: page became full despite pre-check
                             Self::split_leaf_page_with_overflow(txn, page_id, key, overflow_id)
                         }
                         Err(e) => Err(e),
                     }
                 } else {
-                    // Try to add the node normally
+                    // Page has room, insert normally
                     let page = txn.get_page_mut(page_id)?;
                     match page.add_node_sorted(key, value) {
                         Ok(_) => Ok(InsertResult::Inserted),
                         Err(Error::Custom(msg)) if msg.contains("Page full") => {
-                            // Page is full, need to split
+                            // Fallback: page became full despite pre-check
                             Self::split_leaf_page(txn, page_id, key, value)
                         }
                         Err(e) => Err(e),
@@ -656,7 +708,12 @@ impl<C: Comparator> BTree<C> {
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
         // Start deletion from root
-        let result = Self::delete_from_node(txn, *root, key)?;
+        let (new_root_id, result) = Self::delete_from_node(txn, *root, key)?;
+        
+        // Update root if it changed due to COW
+        if new_root_id != *root {
+            *root = new_root_id;
+        }
 
         match result {
             DeleteResult::NotFound => Ok(None),
@@ -693,7 +750,7 @@ impl<C: Comparator> BTree<C> {
         txn: &mut Transaction<'_, Write>,
         page_id: PageId,
         key: &[u8],
-    ) -> Result<DeleteResult> {
+    ) -> Result<(PageId, DeleteResult)> {
         let page = txn.get_page(page_id)?;
 
         if page.header.flags.contains(PageFlags::LEAF) {
@@ -710,9 +767,9 @@ impl<C: Comparator> BTree<C> {
         txn: &mut Transaction<'_, Write>,
         page_id: PageId,
         key: &[u8],
-    ) -> Result<DeleteResult> {
+    ) -> Result<(PageId, DeleteResult)> {
         // First, search for the key and get node info
-        let (search_result, _num_keys, pgno) = {
+        let (search_result, _num_keys, _pgno) = {
             let page = txn.get_page(page_id)?;
             (page.search_key_with_comparator::<C>(key)?, page.header.num_keys, page.header.pgno)
         };
@@ -735,11 +792,12 @@ impl<C: Comparator> BTree<C> {
                     }
                 };
 
-                // Remove the node
-                {
-                    let page = txn.get_page_mut(page_id)?;
+                // Remove the node using COW
+                let new_page_id = {
+                    let (new_id, page) = txn.get_page_cow(page_id)?;
                     page.remove_node(index)?;
-                }
+                    new_id
+                };
 
                 // Free overflow pages if any
                 if let Some(overflow_id) = overflow_page_to_free {
@@ -747,20 +805,18 @@ impl<C: Comparator> BTree<C> {
                 }
 
                 // Check if underflow occurred
-                let final_num_keys = {
-                    let page = txn.get_page(page_id)?;
-                    page.header.num_keys
+                let underflowed = {
+                    let page = txn.get_page(new_page_id)?;
+                    is_underflowed(page)
                 };
 
-                // Check for underflow (but not on root page)
-                if final_num_keys < MIN_KEYS_PER_PAGE as u16 && pgno != 3 {
-                    // Not root and underflowed
-                    Ok(DeleteResult::Underflow { old_value })
+                if underflowed {
+                    Ok((new_page_id, DeleteResult::Underflow { old_value }))
                 } else {
-                    Ok(DeleteResult::Deleted(old_value))
+                    Ok((new_page_id, DeleteResult::Deleted(old_value)))
                 }
             }
-            SearchResult::NotFound { .. } => Ok(DeleteResult::NotFound),
+            SearchResult::NotFound { .. } => Ok((page_id, DeleteResult::NotFound)),
         }
     }
 
@@ -769,7 +825,7 @@ impl<C: Comparator> BTree<C> {
         txn: &mut Transaction<'_, Write>,
         page_id: PageId,
         key: &[u8],
-    ) -> Result<DeleteResult> {
+    ) -> Result<(PageId, DeleteResult)> {
         let page = txn.get_page(page_id)?;
 
         // Find child to delete from using branch_v2 logic
@@ -791,21 +847,34 @@ impl<C: Comparator> BTree<C> {
         };
 
         // Recursively delete from child
-        let child_result = Self::delete_from_node(txn, child_page_id, key)?;
+        let (new_child_id, child_result) = Self::delete_from_node(txn, child_page_id, key)?;
+        
+        // If child page changed due to COW, update parent's reference
+        let mut current_page_id = page_id;
+        if new_child_id != child_page_id {
+            let (new_parent_id, parent) = txn.get_page_cow(page_id)?;
+            // Update the child pointer in parent
+            crate::branch::BranchPage::update_child_pointer(
+                parent,
+                child_page_id,
+                new_child_id,
+            )?;
+            current_page_id = new_parent_id;
+        }
 
         match child_result {
-            DeleteResult::NotFound => Ok(DeleteResult::NotFound),
-            DeleteResult::Deleted(old_value) => Ok(DeleteResult::Deleted(old_value)),
+            DeleteResult::NotFound => Ok((current_page_id, DeleteResult::NotFound)),
+            DeleteResult::Deleted(old_value) => Ok((current_page_id, DeleteResult::Deleted(old_value))),
             DeleteResult::Underflow { old_value } => {
                 // Child underflowed, need to rebalance
-                Self::rebalance_child(txn, page_id, child_index)?;
+                Self::rebalance_child(txn, current_page_id, child_index)?;
 
                 // Check if this page also underflowed
-                let page = txn.get_page(page_id)?;
-                if page.header.num_keys < MIN_KEYS_PER_PAGE as u16 && page.header.pgno != 3 {
-                    Ok(DeleteResult::Underflow { old_value })
+                let page = txn.get_page(current_page_id)?;
+                if is_underflowed(page) {
+                    Ok((current_page_id, DeleteResult::Underflow { old_value }))
                 } else {
-                    Ok(DeleteResult::Deleted(old_value))
+                    Ok((current_page_id, DeleteResult::Deleted(old_value)))
                 }
             }
         }
@@ -914,14 +983,24 @@ impl<C: Comparator> BTree<C> {
         left_sibling_id: PageId,
         child_id: PageId,
     ) -> Result<bool> {
-        // Check if left sibling has enough keys to share
-        let left_sibling_keys = {
+        // Check if left sibling can share without becoming underflowed
+        let can_borrow = {
             let left_sibling = txn.get_page(left_sibling_id)?;
-            left_sibling.header.num_keys as usize
+            // After removing one key, would the sibling still be above threshold?
+            let is_branch = left_sibling.header.flags.contains(PageFlags::BRANCH);
+            let min_keys = if is_branch { MIN_BRANCH_KEYS } else { MIN_LEAF_KEYS };
+            
+            // Check both key count and space requirements
+            if left_sibling.header.num_keys as usize <= min_keys {
+                false
+            } else {
+                // Estimate if sibling would still be above fill threshold after giving one key
+                let used_space = PAGE_SIZE - left_sibling.header.free_space() - PageHeader::SIZE;
+                used_space > FILL_THRESHOLD * 2  // Conservative check
+            }
         };
-
-        // Can only borrow if left sibling has more than minimum keys
-        if left_sibling_keys <= MIN_KEYS_PER_PAGE {
+        
+        if !can_borrow {
             return Ok(false);
         }
 
@@ -949,25 +1028,38 @@ impl<C: Comparator> BTree<C> {
             }
         };
 
-        // Remove the rightmost node from left sibling
-        {
-            let left_sibling = txn.get_page_mut(left_sibling_id)?;
+        // Remove the rightmost node from left sibling using COW
+        let _new_left_sibling_id = {
+            let (new_id, left_sibling) = txn.get_page_cow(left_sibling_id)?;
             left_sibling.remove_node(left_sibling.header.num_keys as usize - 1)?;
-        }
+            new_id
+        };
 
-        // Insert into child
+        // Insert into child using COW
         if is_leaf {
+            // Check if child has space for the borrowed key/value
+            let node_size = crate::page::NodeHeader::SIZE + borrowed_key.len() + borrowed_value.len();
+            let required_space = node_size + std::mem::size_of::<u16>();
+            
+            {
+                let child_page = txn.get_page(child_id)?;
+                if child_page.header.free_space() < required_space {
+                    // Not enough space to borrow
+                    return Ok(false);
+                }
+            }
+            
             // For leaf nodes, the borrowed key goes directly to child
-            let child = txn.get_page_mut(child_id)?;
+            let (_, child) = txn.get_page_cow(child_id)?;
             // Insert at the beginning
             child.add_node_sorted(&borrowed_key, &borrowed_value)?;
 
             // Update separator in parent to be the new first key of child
-            let parent = txn.get_page_mut(parent_id)?;
+            let (_, parent) = txn.get_page_cow(parent_id)?;
             crate::branch::BranchPage::replace_key(parent, &separator_key, &borrowed_key)?
         } else {
             // For branch nodes, we need to handle the child pointers carefully
-            let child = txn.get_page_mut(child_id)?;
+            let (_, child) = txn.get_page_cow(child_id)?;
 
             // The borrowed child becomes the new leftmost child of the right node
             let old_leftmost = crate::branch::BranchPage::get_leftmost_child(child)?;
@@ -977,7 +1069,7 @@ impl<C: Comparator> BTree<C> {
             child.add_node_sorted(&separator_key, &old_leftmost.0.to_le_bytes())?;
 
             // Update separator in parent to be the borrowed key
-            let parent = txn.get_page_mut(parent_id)?;
+            let (_, parent) = txn.get_page_cow(parent_id)?;
             crate::branch::BranchPage::replace_key(parent, &separator_key, &borrowed_key)?
         }
 
@@ -992,14 +1084,24 @@ impl<C: Comparator> BTree<C> {
         child_id: PageId,
         right_sibling_id: PageId,
     ) -> Result<bool> {
-        // Check if right sibling has enough keys to share
-        let right_sibling_keys = {
+        // Check if right sibling can share without becoming underflowed
+        let can_borrow = {
             let right_sibling = txn.get_page(right_sibling_id)?;
-            right_sibling.header.num_keys as usize
+            // After removing one key, would the sibling still be above threshold?
+            let is_branch = right_sibling.header.flags.contains(PageFlags::BRANCH);
+            let min_keys = if is_branch { MIN_BRANCH_KEYS } else { MIN_LEAF_KEYS };
+            
+            // Check both key count and space requirements
+            if right_sibling.header.num_keys as usize <= min_keys {
+                false
+            } else {
+                // Estimate if sibling would still be above fill threshold after giving one key
+                let used_space = PAGE_SIZE - right_sibling.header.free_space() - PageHeader::SIZE;
+                used_space > FILL_THRESHOLD * 2  // Conservative check
+            }
         };
-
-        // Can only borrow if right sibling has more than minimum keys
-        if right_sibling_keys <= MIN_KEYS_PER_PAGE {
+        
+        if !can_borrow {
             return Ok(false);
         }
 
@@ -1030,39 +1132,52 @@ impl<C: Comparator> BTree<C> {
             }
         };
 
-        // Remove the leftmost node from right sibling and update its leftmost child if branch
-        {
-            let right_sibling = txn.get_page_mut(right_sibling_id)?;
+        // Remove the leftmost node from right sibling and update its leftmost child if branch using COW
+        let new_right_sibling_id = {
+            let (new_id, right_sibling) = txn.get_page_cow(right_sibling_id)?;
             right_sibling.remove_node(0)?;
             if let Some(new_leftmost) = right_new_leftmost {
                 crate::branch::BranchPage::update_leftmost_child(right_sibling, new_leftmost)?;
             }
-        }
+            new_id
+        };
 
-        // Insert into child
+        // Insert into child using COW
         if is_leaf {
+            // Check if child has space for the borrowed key/value
+            let node_size = crate::page::NodeHeader::SIZE + borrowed_key.len() + borrowed_value.len();
+            let required_space = node_size + std::mem::size_of::<u16>();
+            
+            {
+                let child_page = txn.get_page(child_id)?;
+                if child_page.header.free_space() < required_space {
+                    // Not enough space to borrow
+                    return Ok(false);
+                }
+            }
+            
             // For leaf nodes, the borrowed key goes directly to child
-            let child = txn.get_page_mut(child_id)?;
+            let (_, child) = txn.get_page_cow(child_id)?;
             // Insert at the end
             child.add_node_sorted(&borrowed_key, &borrowed_value)?;
 
             // Update separator in parent to be the new first key of right sibling
             let new_separator = {
-                let right_sibling = txn.get_page(right_sibling_id)?;
+                let right_sibling = txn.get_page(new_right_sibling_id)?;
                 right_sibling.node(0)?.key()?.to_vec()
             };
 
-            // Update the separator key in parent
-            let parent = txn.get_page_mut(parent_id)?;
+            // Update the separator key in parent using COW
+            let (_, parent) = txn.get_page_cow(parent_id)?;
             crate::branch::BranchPage::replace_key(parent, &separator_key, &new_separator)?
         } else {
             // For branch nodes, separator goes down to child with borrowed leftmost as its child
-            let child = txn.get_page_mut(child_id)?;
+            let (_, child) = txn.get_page_cow(child_id)?;
             // Insert separator with the borrowed leftmost child
             child.add_node_sorted(&separator_key, &borrowed_child.unwrap().0.to_le_bytes())?;
 
-            // Update separator in parent to be the borrowed key
-            let parent = txn.get_page_mut(parent_id)?;
+            // Update separator in parent to be the borrowed key using COW
+            let (_, parent) = txn.get_page_cow(parent_id)?;
             crate::branch::BranchPage::replace_key(parent, &separator_key, &borrowed_key)?
         }
 
@@ -1088,6 +1203,28 @@ impl<C: Comparator> BTree<C> {
             let left_page = txn.get_page(left_id)?;
             left_page.header.flags.contains(PageFlags::BRANCH)
         };
+
+        // Calculate total size needed for merge
+        let total_size_needed = {
+            let left_page = txn.get_page(left_id)?;
+            let right_page = txn.get_page(right_id)?;
+            let left_used = PAGE_SIZE - left_page.header.free_space();
+            let right_used = PAGE_SIZE - right_page.header.free_space();
+            // Add some overhead for the separator key in branch pages
+            if is_branch {
+                left_used + right_used + separator_key.len() + 16
+            } else {
+                left_used + right_used
+            }
+        };
+
+        // Check if merge is possible
+        if total_size_needed > PAGE_SIZE - PageHeader::SIZE - 100 { // Leave some safety margin
+            // Can't merge - combined size would exceed page capacity
+            // In this case, we'll just leave the pages as they are
+            // This is similar to what LMDB does - it allows underflowed pages in some cases
+            return Ok(());
+        }
 
         if is_branch {
             // For branch pages, we need to handle the leftmost child pointer
@@ -1163,9 +1300,9 @@ impl<C: Comparator> BTree<C> {
                 }
             }
 
-            // Clear left page and add all nodes
-            {
-                let left_page = txn.get_page_mut(left_id)?;
+            // Clear left page and add all nodes using COW
+            let new_left_id = {
+                let (new_id, left_page) = txn.get_page_cow(left_id)?;
                 left_page.clear();
                 for (key, value) in all_nodes {
                     left_page.add_node_sorted(&key, &value)?;
@@ -1174,18 +1311,19 @@ impl<C: Comparator> BTree<C> {
                 // Restore leaf chain pointers
                 left_page.header.prev_pgno = left_prev;
                 left_page.header.next_pgno = right_next;
-            }
+                new_id
+            };
 
             // Update next page's prev pointer if it exists
             if right_next != 0 {
-                let next_page = txn.get_page_mut(PageId(right_next))?;
-                next_page.header.prev_pgno = left_id.0;
+                let (_, next_page) = txn.get_page_cow(PageId(right_next))?;
+                next_page.header.prev_pgno = new_left_id.0;
             }
         }
 
-        // Remove separator from parent
+        // Remove separator from parent using COW
         {
-            let parent = txn.get_page_mut(parent_id)?;
+            let (_, parent) = txn.get_page_cow(parent_id)?;
             parent.remove_node(left_index)?;
         }
 
@@ -1202,14 +1340,24 @@ impl<C: Comparator> BTree<C> {
         leftmost_id: PageId,
         right_sibling_id: PageId,
     ) -> Result<bool> {
-        // Check if leftmost child has enough keys to share
-        let leftmost_keys = {
+        // Check if leftmost child can share without becoming underflowed
+        let can_borrow = {
             let leftmost = txn.get_page(leftmost_id)?;
-            leftmost.header.num_keys as usize
+            // After removing one key, would the leftmost still be above threshold?
+            let is_branch = leftmost.header.flags.contains(PageFlags::BRANCH);
+            let min_keys = if is_branch { MIN_BRANCH_KEYS } else { MIN_LEAF_KEYS };
+            
+            // Check both key count and space requirements
+            if leftmost.header.num_keys as usize <= min_keys {
+                false
+            } else {
+                // Estimate if leftmost would still be above fill threshold after giving one key
+                let used_space = PAGE_SIZE - leftmost.header.free_space() - PageHeader::SIZE;
+                used_space > FILL_THRESHOLD * 2  // Conservative check
+            }
         };
-
-        // Can only borrow if leftmost has more than minimum keys
-        if leftmost_keys <= MIN_KEYS_PER_PAGE {
+        
+        if !can_borrow {
             return Ok(false);
         }
 
@@ -1293,6 +1441,28 @@ impl<C: Comparator> BTree<C> {
             let leftmost_page = txn.get_page(leftmost_id)?;
             leftmost_page.header.flags.contains(PageFlags::BRANCH)
         };
+        
+        // Calculate total size needed for merge
+        let total_size_needed = {
+            let leftmost_page = txn.get_page(leftmost_id)?;
+            let right_page = txn.get_page(right_id)?;
+            let left_used = PAGE_SIZE - leftmost_page.header.free_space() - PageHeader::SIZE;
+            let right_used = PAGE_SIZE - right_page.header.free_space() - PageHeader::SIZE;
+            // Add some overhead for the separator key in branch pages
+            if is_branch {
+                left_used + right_used + separator_key.len() + 64
+            } else {
+                left_used + right_used + 32
+            }
+        };
+
+        // Check if merge is possible
+        if total_size_needed > PAGE_SIZE - PageHeader::SIZE - 100 { // Leave safety margin
+            // Can't merge - combined size would exceed page capacity
+            // This is not an error - we just leave the pages as they are
+            // This matches LMDB behavior
+            return Ok(());
+        }
 
         if is_branch {
             // For branch pages, handle the leftmost child pointers
@@ -1325,9 +1495,9 @@ impl<C: Comparator> BTree<C> {
                 }
             }
 
-            // Clear leftmost page and rebuild
+            // Clear leftmost page and rebuild using COW
             {
-                let leftmost_page = txn.get_page_mut(leftmost_id)?;
+                let (_, leftmost_page) = txn.get_page_cow(leftmost_id)?;
                 leftmost_page.clear();
                 leftmost_page.header.flags = PageFlags::BRANCH;
 
@@ -1361,9 +1531,9 @@ impl<C: Comparator> BTree<C> {
                 }
             }
 
-            // Clear leftmost page and add all nodes
+            // Clear leftmost page and add all nodes using COW
             {
-                let leftmost_page = txn.get_page_mut(leftmost_id)?;
+                let (_, leftmost_page) = txn.get_page_cow(leftmost_id)?;
                 leftmost_page.clear();
                 for (key, value) in all_nodes {
                     leftmost_page.add_node_sorted(&key, &value)?;
@@ -1371,9 +1541,9 @@ impl<C: Comparator> BTree<C> {
             }
         }
 
-        // Remove first key from parent and update leftmost child
+        // Remove first key from parent and update leftmost child using COW
         {
-            let parent = txn.get_page_mut(parent_id)?;
+            let (_, parent) = txn.get_page_cow(parent_id)?;
 
             // Get the new leftmost child (what was the first key's right child)
             let _new_leftmost = parent.node(0)?.page_number()?;
@@ -1452,17 +1622,20 @@ impl<C: Comparator> BTree<C> {
                 }
             }
             SearchResult::NotFound { insert_pos: _ } => {
-                // Key doesn't exist - check if we need to split
+                // Key doesn't exist - check if we need to split (pre-emptively)
                 let needs_split = {
                     let page = txn.get_page(page_id)?;
                     let needs_overflow = crate::overflow::needs_overflow(key.len(), value.len());
                     
-                    // First check if we definitely don't have room
-                    if needs_overflow {
-                        !page.has_room_for(key.len(), 8) // 8 bytes for overflow page ID
+                    // Calculate entry size for pre-emptive split check
+                    let required_size = if needs_overflow {
+                        crate::page::NodeHeader::SIZE + key.len() + 8 + size_of::<u16>()
                     } else {
-                        !page.has_room_for(key.len(), value.len())
-                    }
+                        crate::page::NodeHeader::SIZE + key.len() + value.len() + size_of::<u16>()
+                    };
+                    
+                    // Use should_split for pre-emptive splitting at 85% utilization
+                    page.should_split(Some(required_size))
                 };
 
                 if needs_split {

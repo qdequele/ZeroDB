@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = env.write_txn()?;
 
         for i in 0..num_entries {
-            let key = format!("key_{:03}", i);
+            let key = format!("key_{:03}", i.to_string());
             let value = vec![i as u8; 100];
 
             db.put(&mut txn, key.clone(), value)?;
@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut cursor = db.cursor(&txn)?;
 
         let mut found_keys = Vec::new();
-        while let Some((key, _value)) = cursor.next()? {
+        while let Some((key, _value)) = cursor.next_raw()? {
             found_keys.push(String::from_utf8_lossy(&key).to_string());
         }
 
@@ -69,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Check if all keys are present
         let mut missing = Vec::new();
         for i in 0..num_entries {
-            let expected_key = format!("key_{:03}", i);
+            let expected_key = format!("key_{:03}", i.to_string());
             if !found_keys.contains(&expected_key) {
                 missing.push(expected_key);
             }
@@ -101,7 +101,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let test_keys = vec![0, 15, 30, 45, 59];
         for i in test_keys {
-            let key = format!("key_{:03}", i);
+            let key = format!("key_{:03}", i.to_string());
             match db.get(&txn, &key)? {
                 Some(value) => {
                     if value[0] == i as u8 {

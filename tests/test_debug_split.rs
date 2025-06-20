@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Insert
         {
             let mut txn = env.write_txn()?;
-            let key = format!("key_{:03}", i);
+            let key = format!("key_{:03}", i.to_string());
             let value = vec![i as u8; 64];
 
             match db.put(&mut txn, key.clone(), value) {

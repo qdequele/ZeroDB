@@ -67,7 +67,7 @@ The codebase implements a B+Tree-based storage engine with the following key com
    - `segregated_freelist.rs`: Size-segregated allocation for better performance
    - `overflow.rs`: Handles values larger than a single page
 
-5. **I/O Backend** (`io.rs`): Provides memory-mapped file access with optional io_uring support on Linux for async I/O.
+5. **I/O Backend** (`io.rs`): Provides memory-mapped file access for efficient disk operations.
 
 ## Key Design Patterns
 

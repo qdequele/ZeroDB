@@ -48,7 +48,7 @@ fn main() -> Result<()> {
             print!("{}:{} ", String::from_utf8_lossy(&k), v);
         }
 
-        while let Some((k, v)) = cursor.next()? {
+        while let Some((k, v)) = cursor.next_raw()? {
             print!("{}:{} ", String::from_utf8_lossy(&k), v);
         }
         println!("\n✓ Forward iteration works");
@@ -112,8 +112,8 @@ fn main() -> Result<()> {
         println!("First: {:?}", cursor.current()?);
 
         // Move forward twice
-        cursor.next()?;
-        cursor.next()?;
+        cursor.next_raw()?;
+        cursor.next_raw()?;
         println!("After 2x next: {:?}", cursor.current()?);
 
         // Move back once
@@ -129,7 +129,7 @@ fn main() -> Result<()> {
         println!("After prev: {:?}", cursor.current()?);
 
         // Move forward
-        cursor.next()?;
+        cursor.next_raw()?;
         println!("After next: {:?}", cursor.current()?);
 
         println!("✓ Mixed navigation works");
@@ -148,7 +148,7 @@ fn main() -> Result<()> {
 
         // Multiple next from last
         cursor.last()?;
-        let result = cursor.next()?;
+        let result = cursor.next_raw()?;
         println!("Next from last: {:?} (should be None)", result);
 
         // Current with no position

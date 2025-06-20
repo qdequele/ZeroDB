@@ -4,6 +4,10 @@ use std::cmp::Ordering;
 
 /// SIMD-accelerated binary search within a page
 /// Finds the position where a key should be inserted
+///
+/// # Safety
+/// This function uses AVX2 intrinsics which require the AVX2 feature to be available.
+/// The caller must ensure that the CPU supports AVX2 instructions.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub unsafe fn simd_binary_search_avx2(
     keys: &[&[u8]],
@@ -83,6 +87,10 @@ pub unsafe fn simd_binary_search_avx2(
 
 /// SIMD-accelerated key prefix matching
 /// Returns a bitmask of keys that match the given prefix
+///
+/// # Safety
+/// This function uses AVX2 intrinsics which require the AVX2 feature to be available.
+/// The caller must ensure that the CPU supports AVX2 instructions.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub unsafe fn simd_prefix_match_avx2(keys: &[&[u8]], prefix: &[u8]) -> Vec<bool> {
     use std::arch::x86_64::*;
@@ -143,6 +151,10 @@ pub unsafe fn simd_prefix_match_avx2(keys: &[&[u8]], prefix: &[u8]) -> Vec<bool>
 
 /// SIMD-accelerated batch key validation
 /// Checks if all keys are properly sorted and valid
+///
+/// # Safety
+/// This function uses AVX2 intrinsics which require the AVX2 feature to be available.
+/// The caller must ensure that the CPU supports AVX2 instructions.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 pub unsafe fn simd_validate_sorted_keys_avx2(
     keys: &[&[u8]],
@@ -233,6 +245,10 @@ impl SimdBloomFilter {
 
 // Fallback implementations for non-AVX2 platforms
 /// SIMD-accelerated binary search using AVX2 instructions (fallback implementation)
+///
+/// # Safety
+/// This function is marked unsafe for API compatibility with the AVX2 version,
+/// but the fallback implementation itself is safe.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 pub unsafe fn simd_binary_search_avx2(
     keys: &[&[u8]],
@@ -243,12 +259,20 @@ pub unsafe fn simd_binary_search_avx2(
 }
 
 /// SIMD-accelerated prefix matching using AVX2 instructions (fallback implementation)
+///
+/// # Safety
+/// This function is marked unsafe for API compatibility with the AVX2 version,
+/// but the fallback implementation itself is safe.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 pub unsafe fn simd_prefix_match_avx2(keys: &[&[u8]], prefix: &[u8]) -> Vec<bool> {
     keys.iter().map(|k| k.starts_with(prefix)).collect()
 }
 
 /// SIMD-accelerated validation of sorted keys using AVX2 instructions (fallback implementation)
+///
+/// # Safety
+/// This function is marked unsafe for API compatibility with the AVX2 version,
+/// but the fallback implementation itself is safe.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 pub unsafe fn simd_validate_sorted_keys_avx2(
     keys: &[&[u8]],

@@ -79,7 +79,7 @@ fn test_basic_operations_match() {
         let mut results = Vec::new();
 
         for (key, _) in &test_data {
-            if let Some(value) = db.get(&rtxn, &key.to_string()).unwrap() {
+            if let Some(value) = db.get(&rtxn, &key).unwrap() {
                 results.push((key.to_string(), value));
             }
         }
@@ -104,7 +104,7 @@ fn test_cursor_iteration_matches() {
 
     // Test with more data to ensure ordering is consistent
     let test_data: Vec<(String, String)> =
-        (0..50).map(|i| (format!("key_{:03}", i), format!("value_{}", i))).collect();
+        (0..50).map(|i| (format!("key_{:03}", i.to_string()), format!("value_{}", i.to_string()))).collect();
 
     // LMDB cursor iteration
     let lmdb_result = {
@@ -124,7 +124,8 @@ fn test_cursor_iteration_matches() {
         let rtxn = env.read_txn().unwrap();
         let mut results = Vec::new();
 
-        for item in db.iter(&rtxn).unwrap() {
+        let iter = db.iter(&rtxn).unwrap();
+        for item in iter {
             let (key, value) = item.unwrap();
             results.push((key.to_string(), value.to_string()));
         }
@@ -148,10 +149,10 @@ fn test_cursor_iteration_matches() {
 
         // Iterate with cursor
         let rtxn = env.read_txn().unwrap();
-        let mut cursor = db.cursor(&rtxn).unwrap();
+        let mut cursor = db.iter(&rtxn).unwrap();
         let mut results = Vec::new();
 
-        while let Some((key, value)) = cursor.next().unwrap() {
+        while let Some((key, value)) = cursor.next_raw().unwrap() {
             results.push((String::from_utf8(key).unwrap(), value));
         }
 
@@ -201,7 +202,8 @@ fn test_delete_operations_match() {
         let rtxn = env.read_txn().unwrap();
         let mut results = Vec::new();
 
-        for item in db.iter(&rtxn).unwrap() {
+        let iter = db.iter(&rtxn).unwrap();
+        for item in iter {
             let (key, value) = item.unwrap();
             results.push((key.to_string(), value.to_string()));
         }
@@ -224,17 +226,17 @@ fn test_delete_operations_match() {
 
         // Delete some keys
         for key in &to_delete {
-            db.delete(&mut wtxn, &key.to_string()).unwrap();
+            db.delete(&mut wtxn, &key).unwrap();
         }
 
         wtxn.commit().unwrap();
 
         // Read remaining data
         let rtxn = env.read_txn().unwrap();
-        let mut cursor = db.cursor(&rtxn).unwrap();
+        let mut cursor = db.iter(&rtxn).unwrap();
         let mut results = Vec::new();
 
-        while let Some((key, value)) = cursor.next().unwrap() {
+        while let Some((key, value)) = cursor.next_raw().unwrap() {
             results.push((String::from_utf8(key).unwrap(), value));
         }
 

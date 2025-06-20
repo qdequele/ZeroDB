@@ -10,7 +10,7 @@ fn main() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     
     // Environment creation is the same
-    let mut env = EnvBuilder::new()
+    let env = EnvBuilder::new()
         .map_size(10 * 1024 * 1024 * 1024) // 10GB
         .max_dbs(3)
         .open(&temp_dir)?;

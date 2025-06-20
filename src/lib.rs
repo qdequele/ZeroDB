@@ -2,7 +2,7 @@
 //!
 //! This crate provides a high-performance, type-safe embedded database
 //! that is compatible with LMDB while leveraging modern Rust features
-//! and performance technologies like io_uring and SIMD.
+//! and performance technologies like SIMD.
 
 #![warn(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -28,7 +28,6 @@ pub mod error;
 pub mod fixed_size;
 pub mod freelist;
 pub mod io;
-pub mod io_uring_parallel;
 pub mod meta;
 pub mod nested_txn;
 pub mod node;

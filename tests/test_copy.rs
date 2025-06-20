@@ -44,7 +44,7 @@ fn main() -> Result<()> {
 
         // Add some data
         for i in 0..50 {
-            db.put(&mut txn, format!("key_{:03}", i), format!("value_{:03}", i))?;
+            db.put(&mut txn, format!("key_{:03}", i.to_string()), format!("value_{:03}", i.to_string()))?;
         }
 
         txn.commit()?;
@@ -57,7 +57,7 @@ fn main() -> Result<()> {
         let db: Database<String, String> = env.create_database(&mut txn, Some("test_db"))?;
 
         for i in 0..30 {
-            db.put(&mut txn, format!("test_{:02}", i), format!("data_{:02}", i))?;
+            db.put(&mut txn, format!("test_{:02}", i.to_string()), format!("data_{:02}", i.to_string()))?;
         }
 
         txn.commit()?;
@@ -103,7 +103,7 @@ fn main() -> Result<()> {
 
         // Add larger data to allocate more pages
         for i in 0..200 {
-            let key = format!("bulk_{:04}", i).into_bytes();
+            let key = format!("bulk_{:04}", i.to_string()).into_bytes();
             let value = vec![0u8; 500]; // Larger values
             db.put(&mut txn, key, value)?;
         }

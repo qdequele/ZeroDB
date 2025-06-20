@@ -46,10 +46,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..10 {
         let mut txn = env.write_txn()?;
 
-        let key = format!("key_{:03}", i);
+        let key = format!("key_{:03}", i.to_string());
         let value = vec![i as u8; 64]; // Small values
 
-        println!("\nInserting entry {}", i);
+        println!("\nInserting entry {}", i.to_string());
 
         // Check database info before insert
         let db_info_before = txn.db_info(Some("test_db"))?;
@@ -77,7 +77,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let txn = env.read_txn()?;
             let mut cursor = db.cursor(&txn)?;
             let mut count = 0;
-            while let Some((key, _value)) = cursor.next()? {
+            while let Some((key, _value)) = cursor.next_raw()? {
                 let key_str = String::from_utf8_lossy(&key);
                 println!("    {}", key_str);
                 count += 1;

@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create and write some pages
     for i in 0..5 {
         let page = Page::new(PageId(i), PageFlags::LEAF);
-        println!("Writing page {}", i);
+        println!("Writing page {}", i.to_string());
         backend.write_page(&page)?;
     }
 
@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for i in 0..5 {
         let page = backend.read_page(PageId(i))?;
         println!("Read page {}, flags: {:?}", page.header.pgno, page.header.flags);
-        assert_eq!(page.header.pgno, i);
+        assert_eq!(page.header.pgno, i.to_string());
         assert_eq!(page.header.flags, PageFlags::LEAF);
     }
 

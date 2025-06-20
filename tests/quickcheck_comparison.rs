@@ -112,7 +112,7 @@ fn execute_zerodb(config: &TestConfig) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, Str
     let mut current = cursor;
     if let Ok(Some((key, value))) = current.first() {
         result.insert(key.to_vec(), value.to_vec());
-        while let Ok(Some((key, value))) = current.next() {
+        while let Ok(Some((key, value))) = current.next_entry() {
             result.insert(key.to_vec(), value.to_vec());
         }
     }
@@ -177,7 +177,8 @@ fn execute_heed_lmdb(config: &TestConfig) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, 
 
     let mut result = BTreeMap::new();
 
-    for entry in db.iter(&txn).map_err(|e| format!("Iter error: {:?}", e))? {
+    let cursor = db.cursor(&txn).map_err(|e| format!("Cursor error: {:?}", e))?;
+    for entry in cursor {
         let (key, value) = entry.map_err(|e| format!("Entry error: {:?}", e))?;
         result.insert(key.to_vec(), value.to_vec());
     }

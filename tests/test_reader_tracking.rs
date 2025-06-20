@@ -25,7 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut txn = env.write_txn()?;
         for i in 0..10 {
-            db.put(&mut txn, format!("key_{}", i), format!("value_{}", i))?;
+            db.put(&mut txn, format!("key_{}", i.to_string()), format!("value_{}", i.to_string()))?;
         }
         txn.commit()?;
     }
@@ -55,12 +55,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = env.write_txn()?;
 
         // The reader tracking happens internally
-        println!("Main thread: Writing transaction {}", i);
+        println!("Main thread: Writing transaction {}", i.to_string());
 
         // Delete and re-insert to generate free pages
-        let key = format!("key_{}", i);
+        let key = format!("key_{}", i.to_string());
         db.delete(&mut txn, &key)?;
-        db.put(&mut txn, key, format!("new_value_{}", i))?;
+        db.put(&mut txn, key, format!("new_value_{}", i.to_string()))?;
 
         txn.commit()?;
 
@@ -78,11 +78,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let txn = env.read_txn()?;
         for i in 0..10 {
-            let key = format!("key_{}", i);
+            let key = format!("key_{}", i.to_string());
             match db.get(&txn, &key)? {
                 Some(value) => {
                     let expected =
-                        if i < 5 { format!("new_value_{}", i) } else { format!("value_{}", i) };
+                        if i < 5 { format!("new_value_{}", i.to_string()) } else { format!("value_{}", i.to_string()) };
                     if value == expected {
                         println!("  ✓ {} = {}", key, value);
                     } else {

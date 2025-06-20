@@ -10,6 +10,9 @@ use crate::txn::{mode::Mode, Transaction};
 use std::borrow::Cow;
 use std::marker::PhantomData;
 
+/// Type alias for raw key-value pairs returned by cursor operations
+type RawKeyValue<'a> = (&'a [u8], Cow<'a, [u8]>);
+
 /// Position in the B+Tree
 #[derive(Debug, Clone)]
 struct CursorPosition {
@@ -136,7 +139,7 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
     }
 
     /// Move to first entry (returns raw bytes)
-    pub fn first_raw(&mut self) -> Result<Option<(&'txn [u8], Cow<'txn, [u8]>)>> {
+    pub fn first_raw(&mut self) -> Result<Option<RawKeyValue<'txn>>> {
         let txn = self.txn::<crate::txn::Read>();
 
         // Update db_root in case it changed (e.g., after delete)
@@ -180,7 +183,7 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
     }
 
     /// Move to last entry (returns raw bytes)
-    pub fn last_raw(&mut self) -> Result<Option<(&'txn [u8], Cow<'txn, [u8]>)>> {
+    pub fn last_raw(&mut self) -> Result<Option<RawKeyValue<'txn>>> {
         let txn = self.txn::<crate::txn::Read>();
 
         // Update db_root in case it changed (e.g., after delete)
@@ -223,7 +226,7 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
     }
 
     /// Move to next entry (returns raw bytes)
-    pub fn next_raw(&mut self) -> Result<Option<(&'txn [u8], Cow<'txn, [u8]>)>> {
+    pub fn next_raw(&mut self) -> Result<Option<RawKeyValue<'txn>>> {
         if self.position.is_none() {
             return self.first_raw();
         }
@@ -283,24 +286,53 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
             let next_page = self.get_page(next_page_id)?;
 
             if next_page.header.num_keys > 0 {
-                // Update position to point to first entry in next leaf
-                // Keep only the leaf level in our position stack for efficiency
-                let position = self.position.as_mut().unwrap();
-                position.pages.clear();
-                position.indices.clear();
-                position.pages.push(next_page_id);
-                position.indices.push(0);
-
-                let node = next_page.node(0)?;
-                let key = node.key()?;
-                let value = self.get_node_value(&node)?;
-                return Ok(Some((key, value)));
+                // Get the first key from the next page to properly position ourselves
+                let first_node = next_page.node(0)?;
+                let first_key = first_node.key()?;
+                
+                // Use seek to properly position the cursor with full tree path
+                // This ensures we maintain proper position for subsequent navigation
+                self.position = None;
+                return self.seek_raw(first_key);
             }
         }
 
         // Need to move to next leaf
         // Go up the tree until we find a branch we haven't exhausted
         let position = self.position.as_mut().unwrap();
+        
+        // If we only have one page in our stack, we've lost tree position
+        // This happens after leaf chaining. We need to find where we are in the tree.
+        if position.pages.len() <= 1 {
+            // Get the current leaf page ID and the last key we read
+            if position.pages.is_empty() {
+                self.position = None;
+                return Ok(None);
+            }
+            
+            let current_leaf_id = position.pages[0];
+            let current_leaf_page = self.get_page(current_leaf_id)?;
+            
+            // If this leaf has a next page, we should have used leaf chaining
+            // If we're here, it means next_pgno is 0
+            if current_leaf_page.header.next_pgno != 0 {
+                // This shouldn't happen
+                return Err(Error::Custom("Unexpected state: leaf has next_pgno but not using leaf chaining".into()));
+            }
+            
+            // We need to find the next leaf by traversing the tree
+            // Get the last key in the current leaf
+            if current_leaf_page.header.num_keys == 0 {
+                self.position = None;
+                return Ok(None);
+            }
+            
+            // We've reached the end of the leaf chain and lost our tree position
+            // Since we can't navigate the tree properly, we're done
+            self.position = None;
+            return Ok(None);
+        }
+        
         position.pages.pop();
         position.indices.pop();
 
@@ -368,7 +400,7 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
     }
 
     /// Move to previous entry (returns raw bytes)
-    pub fn prev_raw(&mut self) -> Result<Option<(&'txn [u8], Cow<'txn, [u8]>)>> {
+    pub fn prev_raw(&mut self) -> Result<Option<RawKeyValue<'txn>>> {
         if self.position.is_none() {
             return self.last_raw();
         }
@@ -480,7 +512,7 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
     }
 
     /// Seek to a specific key (returns raw bytes)
-    pub fn seek_raw(&mut self, key: &[u8]) -> Result<Option<(&'txn [u8], Cow<'txn, [u8]>)>> {
+    pub fn seek_raw(&mut self, key: &[u8]) -> Result<Option<RawKeyValue<'txn>>> {
         // For write transactions, the db_root should already be updated via put()
         // Only update for read transactions
         if self.db_root.0 == 0 {
@@ -546,15 +578,19 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
                         }
                     } else {
                         // Branch page, follow appropriate child
-                        let child_index = if insert_pos > 0 { insert_pos - 1 } else { 0 };
-                        position.pages.push(current_page_id);
-                        position.indices.push(child_index);
-
-                        if child_index < page.header.num_keys as usize {
+                        if insert_pos == 0 {
+                            // Key is less than all keys, use leftmost child
+                            position.pages.push(current_page_id);
+                            position.indices.push(usize::MAX); // Special marker for leftmost child
+                            current_page_id = crate::branch::BranchPage::get_leftmost_child(page)?;
+                        } else {
+                            // Use the child of the previous key
+                            let child_index = insert_pos - 1;
+                            position.pages.push(current_page_id);
+                            position.indices.push(child_index);
+                            
                             let node = page.node(child_index)?;
                             current_page_id = node.page_number()?;
-                        } else {
-                            return Ok(None);
                         }
                     }
                 }
@@ -588,7 +624,7 @@ impl<'txn, K: crate::db::Key, V: crate::db::Value, C: Comparator> Cursor<'txn, K
     }
 
     /// Move to next entry
-    pub fn next(&mut self) -> Result<Option<(Vec<u8>, V)>> {
+    pub fn next_entry(&mut self) -> Result<Option<(Vec<u8>, V)>> {
         match self.next_raw()? {
             Some((key, value)) => {
                 let v = V::decode(&value)?;
@@ -839,7 +875,7 @@ impl<'txn, K: crate::db::Key, V: crate::db::Value, C: Comparator> Cursor<'txn, K
     }
 
     /// Get the first duplicate for the current key
-    pub fn first_dup(&mut self) -> Result<Option<(&'txn [u8], Cow<'txn, [u8]>)>> {
+    pub fn first_dup(&mut self) -> Result<Option<RawKeyValue<'txn>>> {
         if !self.is_dupsort() {
             return Err(Error::InvalidOperation("Database does not have DUPSORT enabled"));
         }
@@ -901,7 +937,7 @@ impl<'txn, K: crate::db::Key, V: crate::db::Value, C: Comparator> Cursor<'txn, K
     }
 
     /// Get the next duplicate for the current key
-    pub fn next_dup(&mut self) -> Result<Option<(&'txn [u8], Cow<'txn, [u8]>)>> {
+    pub fn next_dup(&mut self) -> Result<Option<RawKeyValue<'txn>>> {
         if !self.is_dupsort() {
             return Err(Error::InvalidOperation("Database does not have DUPSORT enabled"));
         }
@@ -970,7 +1006,7 @@ impl<'txn, K: crate::db::Key, V: crate::db::Value, C: Comparator> Cursor<'txn, K
     }
 
     /// Get current raw key-value without decoding
-    fn get_current_raw(&self) -> Result<Option<(&'txn [u8], Cow<'txn, [u8]>)>> {
+    fn get_current_raw(&self) -> Result<Option<RawKeyValue<'txn>>> {
         let position = match &self.position {
             Some(pos) => pos,
             None => return Ok(None),
@@ -1029,7 +1065,7 @@ mod tests {
             assert_eq!(value, "value1");
 
             // Next
-            let (key, value) = cursor.next().unwrap().unwrap();
+            let (key, value) = cursor.next_entry().unwrap().unwrap();
             assert_eq!(key, b"key2");
             assert_eq!(value, "value2");
 

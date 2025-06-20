@@ -25,7 +25,7 @@ fn test_conservative_fill_factor() -> Result<()> {
     let base_value_size = 100;
     
     for i in 0..100 {
-        let key = format!("{}{:04}", base_key, i);
+        let key = format!("{}{:04}", base_key, i.to_string());
         let value = vec![b'x'; base_value_size + i * 10]; // Gradually increasing value size
         
         match db.put(&mut txn, key.clone(), value) {
@@ -63,7 +63,7 @@ fn test_proactive_page_splits() -> Result<()> {
     // Insert many medium-sized entries
     let value = vec![b'x'; 200];
     for i in 0..1000 {
-        let key = format!("key_{:06}", i);
+        let key = format!("key_{:06}", i.to_string());
         db.put(&mut txn, key, value.clone())?;
     }
     
@@ -72,7 +72,7 @@ fn test_proactive_page_splits() -> Result<()> {
     // Verify all entries were inserted successfully
     let txn = env.read_txn()?;
     for i in 0..1000 {
-        let key = format!("key_{:06}", i);
+        let key = format!("key_{:06}", i.to_string());
         let result = db.get(&txn, &key)?;
         assert_eq!(result.as_ref().map(|v| v.len()), Some(200));
     }
@@ -97,7 +97,7 @@ fn test_append_mode_optimization() -> Result<()> {
     
     let value = vec![b'y'; 150];
     for i in 0..2000 {
-        let key = format!("{:08}", i); // Sequential keys for append mode
+        let key = format!("{:08}", i.to_string()); // Sequential keys for append mode
         db.put(&mut txn, key, value.clone())?;
     }
     
@@ -162,7 +162,7 @@ fn test_large_value_handling() -> Result<()> {
     
     // Test mix of small and large values
     for i in 0..100 {
-        let key = format!("mixed_{:04}", i);
+        let key = format!("mixed_{:04}", i.to_string());
         let value = if i % 10 == 0 {
             // Every 10th entry is large (will use overflow pages)
             vec![b'L'; 2000]
@@ -179,7 +179,7 @@ fn test_large_value_handling() -> Result<()> {
     // Verify all values
     let txn = env.read_txn()?;
     for i in 0..100 {
-        let key = format!("mixed_{:04}", i);
+        let key = format!("mixed_{:04}", i.to_string());
         let result = db.get(&txn, &key)?;
         let expected_size = if i % 10 == 0 { 2000 } else { 100 };
         assert_eq!(result.as_ref().map(|v| v.len()), Some(expected_size));
@@ -208,7 +208,7 @@ fn test_page_capacity_edge_cases() -> Result<()> {
     let value = vec![b'M'; max_inline_value_size];
     
     for i in 0..50 {
-        let key = format!("max_{:03}", i);
+        let key = format!("max_{:03}", i.to_string());
         db.put(&mut txn, key, value.clone())?;
     }
     
@@ -219,7 +219,7 @@ fn test_page_capacity_edge_cases() -> Result<()> {
     
     let overflow_value = vec![b'O'; 1100]; // Will trigger overflow
     for i in 0..50 {
-        let key = format!("overflow_{:03}", i);
+        let key = format!("overflow_{:03}", i.to_string());
         db.put(&mut txn, key, overflow_value.clone())?;
     }
     
@@ -245,20 +245,20 @@ fn test_delete_and_reinsert_capacity() -> Result<()> {
     
     let value = vec![b'x'; 150];
     for i in 0..500 {
-        let key = format!("del_test_{:04}", i);
+        let key = format!("del_test_{:04}", i.to_string());
         db.put(&mut txn, key, value.clone())?;
     }
     
     // Delete every other entry
     for i in (0..500).step_by(2) {
-        let key = format!("del_test_{:04}", i);
+        let key = format!("del_test_{:04}", i.to_string());
         db.delete(&mut txn, &key)?;
     }
     
     // Reinsert with larger values
     let larger_value = vec![b'X'; 200];
     for i in (0..500).step_by(2) {
-        let key = format!("del_test_{:04}", i);
+        let key = format!("del_test_{:04}", i.to_string());
         db.put(&mut txn, key, larger_value.clone())?;
     }
     
@@ -291,7 +291,7 @@ mod performance_tests {
         let count = 10_000;
         
         for i in 0..count {
-            let key = format!("{:08}", i);
+            let key = format!("{:08}", i.to_string());
             db.put(&mut txn, key, value.clone())?;
         }
         

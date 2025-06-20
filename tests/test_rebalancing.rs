@@ -35,8 +35,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = env.write_txn()?;
 
         for i in 0..200 {
-            let key = format!("key_{:04}", i);
-            let value = format!("value_{:04}", i);
+            let key = format!("key_{:04}", i.to_string());
+            let value = format!("value_{:04}", i.to_string());
             BTree::<LexicographicComparator>::insert(
                 &mut txn,
                 &mut root,
@@ -60,7 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = env.write_txn()?;
 
         for i in (0..200).step_by(2) {
-            let key = format!("key_{:04}", i);
+            let key = format!("key_{:04}", i.to_string());
             BTree::<LexicographicComparator>::delete(
                 &mut txn,
                 &mut root,
@@ -85,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut missing = 0;
 
         for i in 0..200 {
-            let key = format!("key_{:04}", i);
+            let key = format!("key_{:04}", i.to_string());
             match BTree::<LexicographicComparator>::search(&txn, root, key.as_bytes())? {
                 Some(_) => {
                     if i % 2 == 0 {
@@ -115,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Delete entries to leave only 20
         for i in (1..180).step_by(2) {
-            let key = format!("key_{:04}", i);
+            let key = format!("key_{:04}", i.to_string());
             BTree::<LexicographicComparator>::delete(
                 &mut txn,
                 &mut root,
@@ -138,8 +138,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = env.write_txn()?;
 
         for i in 300..350 {
-            let key = format!("key_{:04}", i);
-            let value = format!("new_value_{:04}", i);
+            let key = format!("key_{:04}", i.to_string());
+            let value = format!("new_value_{:04}", i.to_string());
             BTree::<LexicographicComparator>::insert(
                 &mut txn,
                 &mut root,

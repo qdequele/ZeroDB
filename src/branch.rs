@@ -14,6 +14,9 @@ use crate::error::{Error, PageId, Result};
 use crate::page::{NodeHeader, Page, PageFlags, PageHeader};
 use std::mem::size_of;
 
+/// Type alias for split result: (left_items, split_key, right_page_id)
+type SplitResult = (Vec<(Vec<u8>, PageId)>, Vec<u8>, PageId);
+
 /// Branch page header stored at the beginning of page data
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -156,7 +159,7 @@ impl BranchPage {
     }
 
     /// Split a branch page
-    pub fn split(page: &Page) -> Result<(Vec<(Vec<u8>, PageId)>, Vec<u8>, PageId)> {
+    pub fn split(page: &Page) -> Result<SplitResult> {
         if !page.header.flags.contains(PageFlags::BRANCH) {
             return Err(Error::InvalidOperation("Not a branch page"));
         }

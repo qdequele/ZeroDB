@@ -14,6 +14,9 @@ use std::mem::{size_of, MaybeUninit};
 use std::ptr;
 use std::slice;
 
+/// Type alias for split result: (right_nodes, split_key)
+type LeafSplitResult = (Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>);
+
 /// Default page size constant
 pub const PAGE_SIZE: usize = 4096;
 
@@ -140,7 +143,7 @@ impl Page {
             // Zero out data section
             ptr::write_bytes((*page_ptr).data.as_mut_ptr(), 0, PAGE_SIZE - PageHeader::SIZE);
 
-            page.assume_init()
+            Box::from_raw(Box::into_raw(page).cast::<Page>())
         }
     }
 
@@ -332,8 +335,9 @@ impl Page {
         let actual_value_size = if is_overflow { value_size_override } else { value.len() };
         let node_size = NodeHeader::SIZE + key.len() + value.len();
 
-        // Check if we have space for the new node
-        if self.header.free_space() < node_size + size_of::<u16>() {
+        // Check if we have space for the new node using fill factor thresholds
+        // This uses sophisticated utilization checks rather than exact space
+        if !self.has_room_for(key.len(), value.len()) {
             return Err(Error::Custom("Page full".into()));
         }
 
@@ -471,7 +475,7 @@ impl Page {
     }
 
     /// Split this page into two pages, returning nodes for the right page
-    pub fn split(&self) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>)> {
+    pub fn split(&self) -> Result<LeafSplitResult> {
         let mid_idx = self.header.num_keys as usize / 2;
         let mut right_nodes = Vec::new();
 
@@ -491,7 +495,7 @@ impl Page {
     }
     
     /// Split this page with smart split point calculation
-    pub fn split_with_config(&self, is_append: bool) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<u8>)> {
+    pub fn split_with_config(&self, is_append: bool) -> Result<LeafSplitResult> {
         let config = PageCapacityConfig::default();
         let num_keys = self.header.num_keys as usize;
         let split_idx = crate::page_capacity::calculate_split_point(num_keys, is_append, &config);
@@ -518,9 +522,28 @@ impl Page {
         let node_size = NodeHeader::SIZE + key_size + value_size;
         let required_space = node_size + size_of::<u16>(); // node + pointer
         
-        // Use a safety margin to prevent edge cases
-        const SAFETY_MARGIN: usize = 32;
-        self.header.free_space() >= required_space + SAFETY_MARGIN
+        // Check absolute free space first
+        let free = self.header.free_space();
+        if free < required_space {
+            return false;
+        }
+        
+        // Calculate current utilization
+        let used_space = (self.header.lower - PageHeader::SIZE as u16) as usize + 
+                        (PAGE_SIZE as u16 - self.header.upper) as usize;
+        let total_usable = PAGE_SIZE - PageHeader::SIZE;
+        let utilization_after = (used_space + required_space) as f32 / total_usable as f32;
+        
+        // Very permissive thresholds to maximize page usage
+        // For benchmarking, we need to pack pages as full as possible
+        let threshold = match self.header.num_keys {
+            0..=5 => 0.98,   // Nearly empty pages: allow up to 98%
+            6..=15 => 0.96,  // Small pages: allow up to 96%
+            16..=30 => 0.94, // Medium pages: allow up to 94%
+            _ => 0.92,       // Large pages: allow up to 92%
+        };
+        
+        utilization_after < threshold
     }
     
     /// Check if page should be split proactively based on capacity

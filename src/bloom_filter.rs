@@ -51,7 +51,7 @@ impl BloomFilter {
 
         // Optimal number of hash functions: k = (m/n) * ln(2)
         let k = ((m as f64 / n as f64) * 2f64.ln()).round() as usize;
-        let num_hashes = k.max(1).min(16); // Limit to reasonable range
+        let num_hashes = k.clamp(1, 16); // Limit to reasonable range
 
         // Allocate bit array
         let num_words = num_bits.div_ceil(64);
@@ -64,8 +64,8 @@ impl BloomFilter {
     pub fn insert(&mut self, key: &[u8]) {
         let hashes = self.hash_key(key);
 
-        for i in 0..self.num_hashes {
-            let bit_idx = hashes[i] % self.num_bits;
+        for &hash in hashes.iter().take(self.num_hashes) {
+            let bit_idx = hash % self.num_bits;
             let word_idx = bit_idx / 64;
             let bit_offset = bit_idx % 64;
 
@@ -78,8 +78,8 @@ impl BloomFilter {
     pub fn contains(&self, key: &[u8]) -> bool {
         let hashes = self.hash_key(key);
 
-        for i in 0..self.num_hashes {
-            let bit_idx = hashes[i] % self.num_bits;
+        for &hash in hashes.iter().take(self.num_hashes) {
+            let bit_idx = hash % self.num_bits;
             let word_idx = bit_idx / 64;
             let bit_offset = bit_idx % 64;
 

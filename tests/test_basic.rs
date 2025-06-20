@@ -59,8 +59,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = env.write_txn()?;
 
         for i in 0..5 {
-            let key = format!("key{}", i);
-            let value = format!("value{}", i);
+            let key = format!("key{}", i.to_string());
+            let value = format!("value{}", i.to_string());
             db.put(&mut txn, key.clone(), value.clone())?;
             println!("  Put {} -> {}", key, value);
         }
@@ -76,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut cursor = db.cursor(&txn)?;
 
         println!("  Iterating with cursor:");
-        while let Some((key, value)) = cursor.next()? {
+        while let Some((key, value)) = cursor.next_raw()? {
             let key_str = String::from_utf8_lossy(&key);
             println!("    {} -> {}", key_str, value);
         }

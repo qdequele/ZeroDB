@@ -56,11 +56,11 @@ pub fn write_overflow_value<'txn>(
 
         // Calculate how much data goes in this page
         let chunk_size = std::cmp::min(data_per_page, total_size - offset);
-        let is_last = i == num_pages - 1;
+        let _is_last = i == num_pages - 1;
 
         // Write overflow header
         let header = OverflowHeader {
-            next_page: if is_last { 0 } else { 0 }, // Will be updated when we allocate next page
+            next_page: 0, // Will be updated when we allocate next page
             total_size: if i == 0 { total_size as u64 } else { 0 },
         };
 

@@ -11,7 +11,6 @@ A high-performance, pure Rust implementation of LMDB (Lightning Memory-Mapped Da
 - **Multiple Databases** per environment with named database support
 - **Duplicate Key Support** with sorted duplicates
 - **SIMD Optimizations** for key comparisons
-- **io_uring Support** on Linux for async I/O
 - **NUMA-Aware** memory allocation support
 
 ## Installation
@@ -145,9 +144,6 @@ cargo build
 
 # Release build
 cargo build --release
-
-# With io_uring support (Linux only)
-cargo build --features io_uring
 ```
 
 ### Performance Analysis
@@ -162,7 +158,6 @@ python3 scripts/generate-perf-dashboard.py
 
 ## Features
 
-- `io_uring` (default): Linux io_uring support for async I/O
 - `simd`: SIMD optimizations (requires nightly Rust)
 
 

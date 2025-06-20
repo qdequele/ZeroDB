@@ -108,7 +108,7 @@ txn.commit()?;
 | Feature | heed | ZeroDB |
 |---------|------|---------|
 | LMDB compatibility | FFI wrapper | Pure Rust implementation |
-| Performance | Native LMDB speed | Optimized with SIMD, io_uring |
+| Performance | Native LMDB speed | Optimized with SIMD |
 | Type safety | Type wrappers | Trait-based |
 | Cursor control | Limited | Full control |
 | Advanced features | Basic LMDB | Segregated freelist, NUMA, checksums |

@@ -65,7 +65,7 @@ mod zerodb_style {
     // Equivalent code in ZeroDB
     pub fn example() -> Result<(), Box<dyn std::error::Error>> {
         let path = Path::new("target/zerodb");
-        fs::create_dir_all(&path)?;
+        fs::create_dir_all(path)?;
         
         // Environment creation - no unsafe needed!
         let env = EnvBuilder::new()
@@ -92,7 +92,7 @@ mod zerodb_style {
         
         // Iterate - very different approach
         let mut cursor = db.cursor(&rtxn)?;
-        while let Some((key, value)) = cursor.next()? {
+        while let Some((key, value)) = cursor.next_raw()? {
             println!("{:?}: {} bytes", String::from_utf8_lossy(&key), value.len());
         }
         
@@ -104,7 +104,7 @@ mod zerodb_style {
                 break;
             }
             println!("{:?}: {} bytes", String::from_utf8_lossy(&key), value.len());
-            cursor.next()?;
+            cursor.next_raw()?;
         }
         
         Ok(())
@@ -123,7 +123,7 @@ mod migration_guide {
     // db.get()                -> db.get() (same!)
     // db.delete()             -> db.delete() (same!)
     // db.clear()              -> db.clear() (same!)
-    // db.iter()               -> db.cursor() + cursor.next()
+    // db.iter()               -> db.cursor() + cursor.next_raw()
     // db.range()              -> db.cursor() + cursor.seek()
     // db.first()              -> cursor.first()
     // db.last()               -> cursor.last()

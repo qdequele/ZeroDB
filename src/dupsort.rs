@@ -495,14 +495,14 @@ impl<'txn, M: crate::txn::mode::Mode> DupCursor<'txn, M> {
         if let Some(sub_db) = &self.sub_db {
             self.current_page = Some(sub_db.root);
             self.current_index = 0;
-            self.next()
+            self.next_value()
         } else {
             Ok(None)
         }
     }
 
     /// Move to next duplicate
-    pub fn next(&mut self) -> Result<Option<Vec<u8>>> {
+    pub fn next_value(&mut self) -> Result<Option<Vec<u8>>> {
         if let Some(page_id) = self.current_page {
             let page = self.txn.get_page(page_id)?;
 

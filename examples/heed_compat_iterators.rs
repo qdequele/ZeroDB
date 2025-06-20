@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<()> {
     println!("\n2. Using iterator adapters:");
     let count = cursor_iter::iter(&db, &txn)?
         .filter_map(|r| r.ok())
-        .filter(|(k, _)| k.ends_with(&vec![b'5']))
+        .filter(|(k, _)| k.ends_with(&[b'5']))
         .count();
     println!("  Keys ending with '5': {}", count);
     

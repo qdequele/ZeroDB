@@ -44,7 +44,7 @@ where
     type Item = Result<(Vec<u8>, V)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.cursor.next() {
+        match self.cursor.next_entry() {
             Ok(Some((key, value))) => Some(Ok((key, value))),
             Ok(None) => None,
             Err(e) => Some(Err(e)),
@@ -60,7 +60,7 @@ where
 /// ```ignore
 /// // Instead of using cursors directly:
 /// let mut cursor = db.cursor(&txn)?;
-/// while let Some((key, value)) = cursor.next()? {
+/// while let Some((key, value)) = cursor.next_entry()? {
 ///     // process
 /// }
 /// 
@@ -128,7 +128,7 @@ where
                 
                 // Move to next for subsequent calls
                 let result = Some(Ok((key.clone(), value)));
-                let _ = cursor.next();
+                let _ = cursor.next_entry();
                 result
             }
             Ok(None) => None,

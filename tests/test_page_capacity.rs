@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Try to add entries until full
     let mut count = 0;
     for i in 0..1000 {
-        let key = format!("key_{:03}", i);
+        let key = format!("key_{:03}", i.to_string());
         let value = vec![i as u8; 64]; // 64 byte values
 
         match page.add_node_sorted(key.as_bytes(), &value) {

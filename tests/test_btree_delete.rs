@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut txn = env.write_txn()?;
 
         for i in 0..num_entries {
-            let key = format!("key_{:03}", i);
+            let key = format!("key_{:03}", i.to_string());
             let value = vec![i as u8; 256]; // Same size as freelist test
             db.put(&mut txn, key, value)?;
         }
@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut count = 0;
 
         println!("  All entries:");
-        while let Some((key, value)) = cursor.next()? {
+        while let Some((key, value)) = cursor.next_raw()? {
             println!("    {} -> {} bytes", String::from_utf8_lossy(&key), value.len());
             count += 1;
         }
@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut deleted = 0;
 
         for i in (0..num_entries).step_by(2) {
-            let key = format!("key_{:03}", i);
+            let key = format!("key_{:03}", i.to_string());
             if db.delete(&mut txn, &key)? {
                 println!("  Deleted: {}", key);
                 deleted += 1;
@@ -79,7 +79,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut remaining = Vec::new();
 
         println!("  Remaining entries:");
-        while let Some((key, value)) = cursor.next()? {
+        while let Some((key, value)) = cursor.next_raw()? {
             let key_str = String::from_utf8_lossy(&key).to_string();
             println!("    {} -> {} bytes", key_str, value.len());
             remaining.push(key_str);
@@ -89,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Check that we have the right entries
         let mut expected = Vec::new();
         for i in (1..num_entries).step_by(2) {
-            expected.push(format!("key_{:03}", i));
+            expected.push(format!("key_{:03}", i.to_string()));
         }
 
         expected.sort();
@@ -112,7 +112,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Test some odd entries (should exist)
         for i in [1, 5, 9, 13, 17] {
             if i < num_entries {
-                let key = format!("key_{:03}", i);
+                let key = format!("key_{:03}", i.to_string());
                 match db.get(&txn, &key)? {
                     Some(value) => println!("  ✓ {} = {} bytes", key, value.len()),
                     None => println!("  ✗ {} not found", key),
@@ -123,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Test some even entries (should not exist)
         for i in [0, 4, 8, 12, 16] {
             if i < num_entries {
-                let key = format!("key_{:03}", i);
+                let key = format!("key_{:03}", i.to_string());
                 match db.get(&txn, &key)? {
                     Some(value) => {
                         println!("  ✗ {} = {} bytes (should be deleted)", key, value.len())

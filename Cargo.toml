@@ -39,11 +39,12 @@ crc32fast = "1.4"
 num_cpus = "1.16"
 
 # Platform-specific
-[target.'cfg(target_os = "linux")'.dependencies]
-io-uring = { version = "0.6", optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_IO", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 tempfile = "3.12"
@@ -62,29 +63,16 @@ pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
 flamegraph = "0.6"
 
 [features]
-default = ["io_uring"]
-io_uring = ["dep:io-uring"]
-simd = [] # Will use portable SIMD when stable
+default = []
+simd = []                   # Will use portable SIMD when stable
 
 
 [[bench]]
-name = "bench_all_dbs"
+name = "database_comparison"
 harness = false
 
 [[bench]]
-name = "db_comparison"
-harness = false
-
-[[bench]]
-name = "btree_ops"
-harness = false
-
-[[bench]]
-name = "page_alloc"
-harness = false
-
-[[bench]]
-name = "segregated_freelist"
+name = "zerodb_performance"
 harness = false
 
 [[example]]
@@ -95,6 +83,3 @@ name = "segregated_freelist_demo"
 
 [[example]]
 name = "numa_demo"
-
-[[example]]
-name = "io_uring_demo"

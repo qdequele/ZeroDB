@@ -634,7 +634,7 @@ impl Environment<state::Open> {
         let mut cursor = db.cursor(txn)?;
 
         // Iterate through all entries
-        while let Some((key, _value)) = cursor.next()? {
+        while let Some((key, _value)) = cursor.next_entry()? {
             if let Ok(name) = String::from_utf8(key) {
                 databases.push(name);
             }
