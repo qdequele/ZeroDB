@@ -152,9 +152,11 @@ mod tests {
 
         let mut txn = env.write_txn().unwrap();
         let mut root = PageId(3);
-        let mut db_info = DbInfo::default();
-        db_info.root = root;
-        db_info.leaf_pages = 1;
+        let mut db_info = DbInfo {
+            root,
+            leaf_pages: 1,
+            ..Default::default()
+        };
 
         // Insert enough entries to create a multi-level tree
         for i in 0..100 {
@@ -191,9 +193,11 @@ mod tests {
 
         // Allocate a new page for our test tree instead of using the main DB root
         let (root, _) = txn.alloc_page(PageFlags::LEAF).unwrap();
-        let mut db_info = DbInfo::default();
-        db_info.root = root;
-        db_info.leaf_pages = 1;
+        let mut db_info = DbInfo {
+            root,
+            leaf_pages: 1,
+            ..Default::default()
+        };
 
         // Create a tree with some data
         let mut current_root = root;

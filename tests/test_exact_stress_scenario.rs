@@ -90,13 +90,13 @@ fn test_exact_stress_scenario() -> Result<()> {
             let mut cursor = db.cursor(&read_txn)?;
             let mut count = 0;
             let mut first_key = None;
-            let mut last_key = None;
+            let mut last_key: Option<Vec<u8>> = None;
             
             if let Ok(Some((k, _))) = cursor.first() {
                 first_key = Some(k.clone());
                 count += 1;
                 while let Ok(Some((k, _))) = cursor.next_raw() {
-                    last_key = Some(k.clone());
+                    last_key = Some(k.to_vec());
                     count += 1;
                 }
             }
@@ -165,7 +165,7 @@ fn test_with_smaller_batches() -> Result<()> {
         let value = vec![42u8; value_size];
         
         match db.put(&mut txn, key.clone(), value) {
-            Ok(_) => eprintln!("Inserted entry {} with value_size=100", i.to_string()),
+            Ok(_) => eprintln!("Inserted entry {} with value_size=100", i),
             Err(e) => {
                 eprintln!("Failed at entry {} with value_size=100: {:?}", i, e);
                 return Err(e);

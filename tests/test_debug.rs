@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let key = format!("key_{:03}", i.to_string());
         let value = vec![i as u8; 64]; // Small values
 
-        println!("\nInserting entry {}", i.to_string());
+        println!("\nInserting entry {}", i);
 
         // Check database info before insert
         let db_info_before = txn.db_info(Some("test_db"))?;
@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut cursor = db.cursor(&txn)?;
             let mut count = 0;
             while let Some((key, _value)) = cursor.next_raw()? {
-                let key_str = String::from_utf8_lossy(&key);
+                let key_str = String::from_utf8_lossy(key);
                 println!("    {}", key_str);
                 count += 1;
             }

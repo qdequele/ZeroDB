@@ -1,5 +1,5 @@
-/// API Comparison between heed and ZeroDB
-/// This shows how to migrate common operations
+// API Comparison between heed and ZeroDB
+// This shows how to migrate common operations
 
 // Common imports
 use std::fs;
@@ -93,7 +93,7 @@ mod zerodb_style {
         // Iterate - very different approach
         let mut cursor = db.cursor(&rtxn)?;
         while let Some((key, value)) = cursor.next_raw()? {
-            println!("{:?}: {} bytes", String::from_utf8_lossy(&key), value.len());
+            println!("{:?}: {} bytes", String::from_utf8_lossy(key), value.len());
         }
         
         // Range iteration - using seek

@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("  All entries:");
         while let Some((key, value)) = cursor.next_raw()? {
-            println!("    {} -> {} bytes", String::from_utf8_lossy(&key), value.len());
+            println!("    {} -> {} bytes", String::from_utf8_lossy(key), value.len());
             count += 1;
         }
         println!("  Total: {} entries", count);
@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         println!("  Remaining entries:");
         while let Some((key, value)) = cursor.next_raw()? {
-            let key_str = String::from_utf8_lossy(&key).to_string();
+            let key_str = String::from_utf8_lossy(key).to_string();
             println!("    {} -> {} bytes", key_str, value.len());
             remaining.push(key_str);
         }

@@ -48,7 +48,7 @@ fn main() -> Result<()> {
             print!("{}:{} ", String::from_utf8_lossy(&k), v);
         }
 
-        while let Some((k, v)) = cursor.next_raw()? {
+        while let Some((k, v)) = cursor.next_entry()? {
             print!("{}:{} ", String::from_utf8_lossy(&k), v);
         }
         println!("\n✓ Forward iteration works");
@@ -162,8 +162,8 @@ fn main() -> Result<()> {
     // Test 6: Cursor modification operations
     println!("\n--- Test 6: Cursor Modifications ---");
     {
-        let mut txn = env.write_txn()?;
-        let mut cursor = db.cursor(&mut txn)?;
+        let txn = env.write_txn()?;
+        let mut cursor = db.cursor(&txn)?;
 
         // Add new entry
         cursor.put(&"key045".to_string(), &"value045".to_string())?;

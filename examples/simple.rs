@@ -78,10 +78,15 @@ fn main() -> Result<()> {
         let txn = env.read_txn()?;
         
         println!("\nIterating over all entries:");
-        let cursor = db.cursor(&txn)?;
-        for (i, item) in cursor.enumerate() {
-            let (key, value) = item?;
-            println!("  {}: {} => {}", i, key, value);
+        let mut cursor = db.cursor(&txn)?;
+        let mut i = 0;
+        cursor.first()?;
+        while let Some((key, value)) = cursor.current()? {
+            println!("  {}: {} => {}", i, String::from_utf8_lossy(&key), value);
+            i += 1;
+            if cursor.next_entry()?.is_none() {
+                break;
+            }
         }
     }
 
@@ -110,10 +115,10 @@ fn main() -> Result<()> {
         println!("\nManual iteration starting from 'h':");
         let mut cursor = db.cursor(&txn)?;
         if let Some((k, v)) = cursor.seek(&"h".to_string())? {
-            let key_str = String::from_utf8(k).unwrap();
+            let key_str = String::from_utf8_lossy(&k);
             println!("  {} => {}", key_str, v);
-            while let Some((k, v)) = cursor.next_raw()? {
-                let key_str = String::from_utf8(k).unwrap();
+            while let Some((k, v)) = cursor.next_entry()? {
+                let key_str = String::from_utf8_lossy(&k);
                 if !key_str.starts_with('h') {
                     break;
                 }

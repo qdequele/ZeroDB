@@ -31,7 +31,7 @@ fn test_different_prefixes_fresh_db() -> Result<()> {
         match db.put(&mut txn, key.clone(), value) {
             Ok(_) => {
                 if i % 10 == 0 {
-                    println!("Inserted entry {} with size_100 prefix", i.to_string());
+                    println!("Inserted entry {} with size_100 prefix", i);
                 }
             }
             Err(e) => {
@@ -78,7 +78,7 @@ fn test_prefix_transition_issue() -> Result<()> {
         match db.put(&mut txn, key.clone(), value) {
             Ok(_) => {
                 if i % 10 == 0 {
-                    println!("Inserted entry {} with 'z_' prefix", i.to_string());
+                    println!("Inserted entry {} with 'z_' prefix", i);
                 }
             }
             Err(e) => {

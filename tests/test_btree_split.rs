@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut found_keys = Vec::new();
         while let Some((key, _value)) = cursor.next_raw()? {
-            found_keys.push(String::from_utf8_lossy(&key).to_string());
+            found_keys.push(String::from_utf8_lossy(key).to_string());
         }
 
         println!("  Found {} entries", found_keys.len());

@@ -1146,8 +1146,8 @@ mod tests {
 
         // Test 1: Delete a single key using cursor
         {
-            let mut txn = env.write_txn().unwrap();
-            let mut cursor: Cursor<'_, String, String> = db.cursor(&mut txn).unwrap();
+            let txn = env.write_txn().unwrap();
+            let mut cursor: Cursor<'_, String, String> = db.cursor(&txn).unwrap();
 
             // Move to key2
             cursor.seek(&"key2".to_string()).unwrap();
@@ -1174,8 +1174,8 @@ mod tests {
 
         // Test 2: Delete another key in a separate transaction
         {
-            let mut txn = env.write_txn().unwrap();
-            let mut cursor: Cursor<'_, String, String> = db.cursor(&mut txn).unwrap();
+            let txn = env.write_txn().unwrap();
+            let mut cursor: Cursor<'_, String, String> = db.cursor(&txn).unwrap();
 
             // Move to key3
             cursor.seek(&"key3".to_string()).unwrap();
@@ -1216,8 +1216,8 @@ mod tests {
 
         // Test cursor put operations - simplified test
         {
-            let mut txn = env.write_txn().unwrap();
-            let mut cursor: Cursor<'_, String, String> = db.cursor(&mut txn).unwrap();
+            let txn = env.write_txn().unwrap();
+            let mut cursor: Cursor<'_, String, String> = db.cursor(&txn).unwrap();
 
             // Put just one entry first
             cursor.put(&"key1".to_string(), &"value1".to_string()).unwrap();
@@ -1257,8 +1257,8 @@ mod tests {
 
         // Test cursor update
         {
-            let mut txn = env.write_txn().unwrap();
-            let mut cursor: Cursor<'_, String, String> = db.cursor(&mut txn).unwrap();
+            let txn = env.write_txn().unwrap();
+            let mut cursor: Cursor<'_, String, String> = db.cursor(&txn).unwrap();
 
             // Position at key2
             cursor.seek(&"key2".to_string()).unwrap();

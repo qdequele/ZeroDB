@@ -363,15 +363,6 @@ mod tests {
     }
 
     #[test]
-    fn test_free_page_header_size() {
-        assert!(FreePageHeader::SIZE < PAGE_SIZE);
-        assert!(FreePageHeader::MAX_IDS > 0);
-
-        // Check that we can fit a reasonable number of page IDs
-        assert!(FreePageHeader::MAX_IDS >= 500);
-    }
-
-    #[test]
     fn test_free_page_operations() {
         let mut page = Page::new(PageId(100), PageFlags::OVERFLOW);
         let mut free_page = FreePageMut::new(&mut page);

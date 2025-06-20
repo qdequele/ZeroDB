@@ -177,8 +177,8 @@ fn execute_heed_lmdb(config: &TestConfig) -> Result<BTreeMap<Vec<u8>, Vec<u8>>, 
 
     let mut result = BTreeMap::new();
 
-    let cursor = db.cursor(&txn).map_err(|e| format!("Cursor error: {:?}", e))?;
-    for entry in cursor {
+    let iter = db.iter(&txn).map_err(|e| format!("Iter error: {:?}", e))?;
+    for entry in iter {
         let (key, value) = entry.map_err(|e| format!("Entry error: {:?}", e))?;
         result.insert(key.to_vec(), value.to_vec());
     }

@@ -148,7 +148,7 @@ fn test_preemptive_splitting() -> Result<()> {
         match db.put(&mut txn, key, value) {
             Ok(_) => {
                 if i % 50 == 0 {
-                    eprintln!("Successfully inserted entry {}", i.to_string());
+                    eprintln!("Successfully inserted entry {}", i);
                 }
             }
             Err(e) => {
@@ -157,9 +157,9 @@ fn test_preemptive_splitting() -> Result<()> {
                 
                 // The new error should be the transaction page limit, not "Page full"
                 if error_msg.contains("Page full") {
-                    panic!("Pre-emptive splitting failed! Still getting 'Page full' errors at entry {}", i.to_string());
+                    panic!("Pre-emptive splitting failed! Still getting 'Page full' errors at entry {}", i);
                 } else if error_msg.contains("Transaction page limit exceeded") {
-                    eprintln!("Hit transaction page limit as expected after {} entries", i.to_string());
+                    eprintln!("Hit transaction page limit as expected after {} entries", i);
                     assert!(i > 100, "Should handle reasonable number of entries before page limit");
                     break;
                 } else {

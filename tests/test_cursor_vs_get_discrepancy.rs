@@ -72,17 +72,17 @@ fn test_cursor_vs_get_at_limit() -> Result<()> {
     let mut cursor_count = 0;
     let mut last_key = None;
     
-    if let Ok(Some((k, _))) = cursor.first() {
+    if let Ok(Some((_k, _))) = cursor.first() {
         cursor_count += 1;
         while let Ok(Some((k, _))) = cursor.next_raw() {
-            last_key = Some(k.clone());
+            last_key = Some(k);
             cursor_count += 1;
         }
     }
     
     eprintln!("Total found with cursor: {}", cursor_count);
     if let Some(k) = last_key {
-        eprintln!("Last key from cursor: {}", String::from_utf8_lossy(&k));
+        eprintln!("Last key from cursor: {}", String::from_utf8_lossy(k));
     }
     
     // Try to seek to the problem key

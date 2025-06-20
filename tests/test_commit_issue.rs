@@ -46,7 +46,7 @@ fn test_direct_batch_75_to_100() -> Result<()> {
         keys.push(String::from_utf8_lossy(&k).to_string());
         count += 1;
         while let Ok(Some((k, _))) = cursor.next_raw() {
-            keys.push(String::from_utf8_lossy(&k).to_string());
+            keys.push(String::from_utf8_lossy(k).to_string());
             count += 1;
         }
     }
@@ -135,17 +135,17 @@ fn test_cumulative_insert_pattern() -> Result<()> {
     let mut final_count = 0;
     let mut last_key = None;
     
-    if let Ok(Some((k, _))) = cursor.first() {
+    if let Ok(Some((_k, _))) = cursor.first() {
         final_count += 1;
         while let Ok(Some((k, _))) = cursor.next_raw() {
-            last_key = Some(k.clone());
+            last_key = Some(k);
             final_count += 1;
         }
     }
     
     eprintln!("Final database has {} entries", final_count);
     if let Some(k) = last_key {
-        eprintln!("Last key: {}", String::from_utf8_lossy(&k));
+        eprintln!("Last key: {}", String::from_utf8_lossy(k));
     }
     
     if final_count != 100 {

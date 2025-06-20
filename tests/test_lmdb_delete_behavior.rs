@@ -113,7 +113,7 @@ fn test_underflow_tolerance() -> Result<()> {
     if let Ok(Some((key, _))) = cursor.first() {
         remaining.push(String::from_utf8_lossy(&key).to_string());
         while let Ok(Some((key, _))) = cursor.next_raw() {
-            remaining.push(String::from_utf8_lossy(&key).to_string());
+            remaining.push(String::from_utf8_lossy(key).to_string());
         }
     }
     
@@ -185,7 +185,7 @@ fn test_delete_from_nearly_empty() -> Result<()> {
     
     // Insert just a few entries
     for i in 0..3 {
-        let key = format!("key_{}", i.to_string()).into_bytes();
+        let key = format!("key_{}", i).into_bytes();
         let value = vec![i as u8; 500];
         db.put(&mut txn, key, value)?;
     }
@@ -194,7 +194,7 @@ fn test_delete_from_nearly_empty() -> Result<()> {
     // Delete them one by one
     for i in 0..3 {
         let mut txn = env.write_txn()?;
-        let key = format!("key_{}", i.to_string()).into_bytes();
+        let key = format!("key_{}", i).into_bytes();
         let deleted = db.delete(&mut txn, &key)?;
         assert!(deleted);
         txn.commit()?;
@@ -241,7 +241,7 @@ fn test_no_page_full_on_delete_stress() -> Result<()> {
                 match db.put(&mut txn, key.clone(), value) {
                     Ok(_) => {}
                     Err(e) => {
-                        eprintln!("Insert failed for value_size={}, key_index={}", value_size, i.to_string());
+                        eprintln!("Insert failed for value_size={}, key_index={}", value_size, i);
                         eprintln!("Error: {:?}", e);
                         return Err(e);
                     }
@@ -274,7 +274,7 @@ fn test_no_page_full_on_delete_stress() -> Result<()> {
                     }
                 }
                 Err(e) => {
-                    eprintln!("Delete failed for value_size={}, key_index={}", value_size, i.to_string());
+                    eprintln!("Delete failed for value_size={}, key_index={}", value_size, i);
                     eprintln!("Error: {:?}", e);
                     panic!("Delete failed with error: {:?}. This should NEVER happen!", e);
                 }

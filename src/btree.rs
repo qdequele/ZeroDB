@@ -1827,9 +1827,11 @@ mod tests {
 
         let mut txn = env.write_txn().unwrap();
         let mut root = PageId(3); // Main DB root
-        let mut db_info = DbInfo::default();
-        db_info.root = root;
-        db_info.leaf_pages = 1;
+        let mut db_info = DbInfo {
+            root,
+            leaf_pages: 1,
+            ..Default::default()
+        };
 
         // Insert a key using B+Tree
         let old = BTree::<LexicographicComparator>::insert(
@@ -1862,9 +1864,11 @@ mod tests {
 
         let mut txn = env.write_txn().unwrap();
         let mut root = PageId(3);
-        let mut db_info = DbInfo::default();
-        db_info.root = root;
-        db_info.leaf_pages = 1;
+        let mut db_info = DbInfo {
+            root,
+            leaf_pages: 1,
+            ..Default::default()
+        };
 
         // Insert multiple keys
         let keys = vec![
@@ -1906,9 +1910,11 @@ mod tests {
 
         let mut txn = env.write_txn().unwrap();
         let mut root = PageId(3);
-        let mut db_info = DbInfo::default();
-        db_info.root = root;
-        db_info.leaf_pages = 1;
+        let mut db_info = DbInfo {
+            root,
+            leaf_pages: 1,
+            ..Default::default()
+        };
 
         // Insert some keys
         BTree::<LexicographicComparator>::insert(
@@ -1967,9 +1973,11 @@ mod tests {
 
         let mut txn = env.write_txn().unwrap();
         let mut root = PageId(3);
-        let mut db_info = DbInfo::default();
-        db_info.root = root;
-        db_info.leaf_pages = 1;
+        let mut db_info = DbInfo {
+            root,
+            leaf_pages: 1,
+            ..Default::default()
+        };
 
         // Insert many keys to force page splits
         let num_keys = 50;
@@ -2022,9 +2030,11 @@ mod tests {
 
         let mut txn = env.write_txn().unwrap();
         let mut root = PageId(3);
-        let mut db_info = DbInfo::default();
-        db_info.root = root;
-        db_info.leaf_pages = 1;
+        let mut db_info = DbInfo {
+            root,
+            leaf_pages: 1,
+            ..Default::default()
+        };
 
         // Insert some keys
         let keys = vec![b"key1", b"key2", b"key3", b"key4", b"key5"];
@@ -2063,9 +2073,11 @@ mod tests {
         let (root_id, root_page) = txn.alloc_page(PageFlags::LEAF).unwrap();
         root_page.header.num_keys = 0;
 
-        let mut db_info = DbInfo::default();
-        db_info.root = root_id;
-        db_info.leaf_pages = 1;
+        let mut db_info = DbInfo {
+            root: root_id,
+            leaf_pages: 1,
+            ..Default::default()
+        };
         let mut root = root_id;
 
         // Save initial database info

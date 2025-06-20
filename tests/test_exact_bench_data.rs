@@ -58,8 +58,8 @@ fn test_exact_benchmark_data() -> Result<()> {
                     
                     // Try to understand the state
                     println!("\n  First 10 keys in data:");
-                    for j in 0..10.min(data.len()) {
-                        println!("    [{}] {}", j, String::from_utf8_lossy(&data[j].0));
+                    for (j, item) in data.iter().take(10).enumerate() {
+                        println!("    [{}] {}", j, String::from_utf8_lossy(&item.0));
                     }
                     
                     return Err(e);

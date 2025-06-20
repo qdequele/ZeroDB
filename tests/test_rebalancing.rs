@@ -25,9 +25,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Track statistics
     let mut root = PageId(3);
-    let mut db_info = DbInfo::default();
-    db_info.root = root;
-    db_info.leaf_pages = 1;
+    let mut db_info = DbInfo {
+        root,
+        leaf_pages: 1,
+        ..DbInfo::default()
+    };
 
     // Insert a lot of entries to create a multi-level tree
     println!("1. Inserting 200 entries to create a multi-level B+Tree...");
