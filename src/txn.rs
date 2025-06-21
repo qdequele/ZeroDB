@@ -4,6 +4,7 @@ use parking_lot::MutexGuard;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::atomic::Ordering;
+use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 use crate::env::{state, Environment};
 use crate::error::{Error, PageId, Result, TransactionId};
@@ -12,6 +13,30 @@ use crate::meta::DbInfo;
 pub use crate::nested_txn::NestedTransactionExt;
 use crate::page::{Page, PageFlags};
 use crate::segregated_freelist::SegregatedFreeList;
+
+/// Helper function to safely read from a RwLock
+fn read_lock<'a, T>(
+    lock: &'a std::sync::RwLock<T>,
+    context: &'static str,
+) -> Result<RwLockReadGuard<'a, T>> {
+    lock.read()
+        .map_err(|_| Error::Custom(format!("RwLock poisoned: {}", context).into()))
+}
+
+/// Helper function to safely write to a RwLock
+fn write_lock<'a, T>(
+    lock: &'a std::sync::RwLock<T>,
+    context: &'static str,
+) -> Result<RwLockWriteGuard<'a, T>> {
+    lock.write()
+        .map_err(|_| Error::Custom(format!("RwLock poisoned: {}", context).into()))
+}
+
+/// Helper function to get a mutable reference from HashMap with proper error
+fn get_mut_page<'a>(pages: &'a mut HashMap<PageId, Box<Page>>, page_id: &PageId) -> Result<&'a mut Box<Page>> {
+    pages.get_mut(page_id)
+        .ok_or_else(|| Error::Custom(format!("Page {} not found in dirty pages", page_id.0).into()))
+}
 
 /// Transaction mode marker traits
 pub mod mode {
@@ -134,7 +159,7 @@ impl<'env> Transaction<'env, Read> {
         let reader_slot = inner.readers.acquire(current_txn_id).map_err(|_| Error::ReadersFull)?;
 
         // Copy database info at this snapshot
-        let databases = inner.databases.read().unwrap().clone();
+        let databases = read_lock(&inner.databases, "reading databases for read transaction")?.clone();
 
         Ok(Self {
             data: TxnData { env, id: current_txn_id, databases },
@@ -157,7 +182,7 @@ impl<'env> Transaction<'env, Write> {
         let new_txn_id = TransactionId(inner.txn_id.fetch_add(1, Ordering::AcqRel) + 1);
 
         // Copy database info under write lock to ensure consistency
-        let databases = inner.databases.read().unwrap().clone();
+        let databases = read_lock(&inner.databases, "reading databases for write transaction")?.clone();
 
         // Get current meta page to read database state
         let meta = inner.meta()?;
@@ -379,7 +404,7 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
                         let page = Page::new(page_id, PageFlags::LEAF | PageFlags::DIRTY);
                         dirty.mark_dirty(page_id, page);
 
-                        let root_page = dirty.pages.get_mut(&page_id).unwrap();
+                        let root_page = get_mut_page(&mut dirty.pages, &page_id)?;
                         root_page.header.num_keys = 0;
 
                         free_db_info.root = page_id;
@@ -411,7 +436,7 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
                                 new_page.header.flags |= PageFlags::DIRTY;
                                 new_page.data.copy_from_slice(&page.data);
                                 dirty.mark_dirty(current_root, new_page);
-                                dirty.pages.get_mut(&current_root).unwrap()
+                                get_mut_page(&mut dirty.pages, &current_root)?
                             };
                             
                             // Try to add the node
@@ -533,7 +558,7 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
 
                 // Update databases in environment atomically
                 {
-                    let mut env_dbs = inner.databases.write().unwrap();
+                    let mut env_dbs = write_lock(&inner.databases, "updating databases on commit")?;
                     *env_dbs = self.data.databases.clone();
                 }
 
@@ -585,7 +610,7 @@ impl<'env> Transaction<'env, Write> {
         if let ModeData::Write { ref dirty, .. } = self.mode_data {
             if dirty.pages.contains_key(&page_id) {
                 if let ModeData::Write { ref mut dirty, .. } = self.mode_data {
-                    return Ok((page_id, dirty.pages.get_mut(&page_id).unwrap().as_mut()));
+                    return Ok((page_id, get_mut_page(&mut dirty.pages, &page_id)?.as_mut()));
                 }
             }
         }
@@ -681,7 +706,7 @@ impl<'env> Transaction<'env, Write> {
             // Free the old page (it will be added to freelist after oldest reader)
             freelist.free_page(page_id);
 
-            Ok((new_page_id, dirty.pages.get_mut(&new_page_id).unwrap()))
+            Ok((new_page_id, get_mut_page(&mut dirty.pages, &new_page_id)?))
         } else {
             unreachable!("Write transaction must have write mode data");
         }
@@ -700,7 +725,7 @@ impl<'env> Transaction<'env, Write> {
         
         if already_dirty {
             if let ModeData::Write { ref mut dirty, .. } = self.mode_data {
-                return Ok(dirty.pages.get_mut(&page_id).unwrap());
+                return Ok(get_mut_page(&mut dirty.pages, &page_id)?);
             }
         }
 
@@ -716,7 +741,7 @@ impl<'env> Transaction<'env, Write> {
         
         if let ModeData::Write { ref mut dirty, .. } = self.mode_data {
             dirty.mark_dirty(page_id, page);
-            Ok(dirty.pages.get_mut(&page_id).unwrap())
+            Ok(get_mut_page(&mut dirty.pages, &page_id)?)
         } else {
             unreachable!("Write transaction must have write mode data");
         }
@@ -776,7 +801,7 @@ impl<'env> Transaction<'env, Write> {
             dirty.mark_dirty(page_id, page);
             dirty.allocated.push(page_id);
 
-            Ok((page_id, dirty.pages.get_mut(&page_id).unwrap().as_mut()))
+            Ok((page_id, get_mut_page(&mut dirty.pages, &page_id)?.as_mut()))
         } else {
             unreachable!("Write transaction must have write mode data");
         }
@@ -829,7 +854,7 @@ impl<'env> Transaction<'env, Write> {
 
                         // Then collect mutable references
                         for &page_id in &page_ids {
-                            pages.push((page_id, dirty.pages.get_mut(&page_id).unwrap().as_mut()));
+                            pages.push((page_id, get_mut_page(&mut dirty.pages, &page_id)?.as_mut()));
                         }
 
                         return Ok(pages);
@@ -872,7 +897,7 @@ impl<'env> Transaction<'env, Write> {
 
             // Now collect the mutable references
             for page_id in allocated_ids {
-                pages.push((page_id, dirty.pages.get_mut(&page_id).unwrap().as_mut()));
+                pages.push((page_id, get_mut_page(&mut dirty.pages, &page_id)?.as_mut()));
             }
 
             Ok(pages)
@@ -931,7 +956,7 @@ impl<'env> Transaction<'env, Write> {
             dirty.mark_dirty(page_id, page);
             dirty.allocated.push(page_id);
 
-            Ok((page_id, dirty.pages.get_mut(&page_id).unwrap().as_mut()))
+            Ok((page_id, get_mut_page(&mut dirty.pages, &page_id)?.as_mut()))
         } else {
             unreachable!("Write transaction must have write mode data");
         }
