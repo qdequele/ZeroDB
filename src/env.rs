@@ -22,6 +22,8 @@ pub(crate) struct EnvConfig {
     /// Use NUMA-aware allocation
     #[allow(dead_code)]
     pub use_numa: bool,
+    /// Maximum number of pages per transaction
+    pub max_txn_pages: usize,
 }
 
 /// Environment state marker traits
@@ -144,6 +146,8 @@ pub(crate) struct EnvInner {
     pub(crate) use_segregated_freelist: bool,
     /// NUMA-aware page allocator (if enabled)
     pub(crate) numa_allocator: Option<Arc<crate::numa::NumaPageAllocator>>,
+    /// Maximum number of pages per transaction
+    pub(crate) max_txn_pages: usize,
 }
 
 // Safety: EnvInner is Send/Sync because IoBackend is Send/Sync
@@ -156,6 +160,19 @@ impl EnvInner {
         // Read both meta pages
         let meta0 = self.io.read_page(META_PAGE_1)?;
         let meta1 = self.io.read_page(META_PAGE_2)?;
+        
+        // Validate checksums if enabled (meta pages always validated in MetaOnly mode)
+        if self.checksum_mode != crate::checksum::ChecksumMode::None {
+            use crate::checksum::ChecksummedPage;
+            // For meta pages, we try to validate but don't fail if checksum is missing (0)
+            // This allows for backward compatibility
+            if meta0.has_checksum() {
+                meta0.validate_checksum()?;
+            }
+            if meta1.has_checksum() {
+                meta1.validate_checksum()?;
+            }
+        }
 
         // Cast data area to MetaPage
         let meta0 = unsafe { &*(meta0.data.as_ptr() as *const MetaPage) };
@@ -208,6 +225,7 @@ pub struct EnvBuilder {
     checksum_mode: crate::checksum::ChecksumMode,
     use_segregated_freelist: bool,
     use_numa: bool,
+    max_txn_pages: usize,
 }
 
 impl EnvBuilder {
@@ -219,9 +237,10 @@ impl EnvBuilder {
             max_dbs: MAX_DBS,
             _flags: 0,
             durability: DurabilityMode::AsyncFlush,
-            checksum_mode: crate::checksum::ChecksumMode::None,
+            checksum_mode: crate::checksum::ChecksumMode::Full,
             use_segregated_freelist: false,
             use_numa: false,
+            max_txn_pages: 10_000, // Default: 10,000 pages per transaction
         }
     }
 
@@ -264,6 +283,12 @@ impl EnvBuilder {
     /// Enable NUMA-aware memory allocation for multi-socket systems
     pub fn use_numa(mut self, enabled: bool) -> Self {
         self.use_numa = enabled;
+        self
+    }
+
+    /// Set the maximum number of pages per transaction
+    pub fn max_txn_pages(mut self, pages: usize) -> Self {
+        self.max_txn_pages = pages;
         self
     }
 
@@ -344,6 +369,7 @@ impl EnvBuilder {
                 page_pool: PagePool::new(128), // Keep up to 128 pages in pool
                 use_segregated_freelist: self.use_segregated_freelist,
                 numa_allocator: None, // Will be initialized later if needed
+                max_txn_pages: self.max_txn_pages,
             });
 
             meta_info = inner.meta()?;
@@ -383,6 +409,7 @@ impl EnvBuilder {
             } else {
                 None
             },
+            max_txn_pages: self.max_txn_pages,
         });
 
         // Initialize main database entry
@@ -445,6 +472,7 @@ impl Environment<Open> {
         EnvConfig {
             use_segregated_freelist: inner.use_segregated_freelist,
             use_numa: inner.numa_allocator.is_some(),
+            max_txn_pages: inner.max_txn_pages,
         }
     }
 

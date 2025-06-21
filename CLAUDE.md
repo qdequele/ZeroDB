@@ -84,11 +84,81 @@ The codebase implements a B+Tree-based storage engine with the following key com
 - **Benchmarks**: In `/benches/` directory, comparing performance against LMDB, RocksDB, redb, and sled
 - **Property Testing**: Uses quickcheck for comparing behavior with LMDB
 
-## Performance Considerations
+## Work Organization
 
-Based on PERFORMANCE_OPTIMIZATIONS.md, the codebase includes:
-- 16x faster sequential writes than LMDB
-- SIMD optimizations for key comparisons
-- Cache-aligned data structures
-- Profile-guided optimization support
-- Segregated freelists for efficient page allocation
+All temporary files, scripts, and documentation created during development should be organized in the `temp/claude-work/` directory with the following structure:
+
+### File Naming Conventions
+
+1. **TODO_** prefix: Action items and tasks that Claude should work on
+   - Example: `TODO_PRODUCTION_READINESS.md`
+   - These files contain specific tasks to be completed
+   - Check `TODO_MASTER.md` for the consolidated task list
+
+2. **WIKI_** prefix: Long-term information and documentation
+   - Example: `WIKI_API_COMPARISON.md`
+   - These should be kept up to date as the codebase evolves
+   - Contains reference information, architectural decisions, and comparisons
+
+3. **ANALYSIS_** prefix: Specific issue analysis and investigations
+   - Example: `ANALYSIS_PAGE_FULL.md`
+   - Deep dives into particular problems or performance issues
+   - Contains findings, root causes, and potential solutions
+
+### Master TODO Management
+
+- **TODO_MASTER.md**: The single source of truth for all pending work
+- Groups tasks by category/objective
+- Uses priority levels: 🔴 CRITICAL, 🟠 HIGH, 🟡 MEDIUM, 🟢 LOW
+- Tracks completion status for each task group
+- When unable to complete a task, add notes about what remains
+
+### End-of-Work Checklist
+
+At the end of each work session:
+1. Update TODO_MASTER.md with any new tasks discovered
+2. Mark completed items with ✅
+3. Add notes for any partially completed work
+4. Move any temporary files created to `temp/claude-work/`
+5. Update relevant WIKI_ files if architectural changes were made
+
+## Development Workflow
+
+### After Completing Each Task
+
+Always run these commands before considering a task complete:
+
+1. **Build the project**:
+   ```bash
+   cargo build --release
+   ```
+
+2. **Run Clippy for linting**:
+   ```bash
+   cargo clippy --all-targets --all-features -- -D warnings
+   ```
+
+3. **Run all tests**:
+   ```bash
+   cargo test --release
+   ```
+
+4. **Commit changes** (if all checks pass):
+   ```bash
+   git add -A
+   git commit -m "Description of changes
+
+   🤖 Generated with Claude Code
+   
+   Co-Authored-By: Claude <noreply@anthropic.com>"
+   ```
+
+### Coding Guidelines
+
+**IMPORTANT**: Use sequential thinking (mcp sequential-thinking) for all coding tasks:
+- Before implementing any feature or fix
+- When analyzing complex problems
+- When planning architectural changes
+- When debugging issues
+
+This ensures thorough analysis and well-structured solutions.

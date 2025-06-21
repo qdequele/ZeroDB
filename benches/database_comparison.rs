@@ -185,11 +185,12 @@ fn bench_random_writes(c: &mut Criterion) {
     group.sample_size(10);
 
     // Limited dataset sizes for ZeroDB due to PageFull issue
-    let zerodb_limit = 30;
+    // Updated: Can now handle more entries with improved page capacity management
+    let zerodb_limit = 50;
 
     for &value_size in &[SMALL_VALUE, MEDIUM_VALUE] {
         // Small batch for all databases
-        let id = format!("30_keys_{}_bytes", value_size);
+        let id = format!("{}_keys_{}_bytes", zerodb_limit, value_size);
 
         // ZeroDB
         group.bench_with_input(
@@ -227,7 +228,8 @@ fn bench_random_writes(c: &mut Criterion) {
                         let value = vec![0u8; val_size];
 
                         // Process in small batches to avoid page full errors
-                        for chunk in keys.chunks(25) {
+                        // With improved capacity management, we can use larger chunks
+                        for chunk in keys.chunks(50) {
                             let mut txn = env.write_txn().unwrap();
                             for key in chunk {
                                 db.put(&mut txn, key.clone(), value.clone()).unwrap();

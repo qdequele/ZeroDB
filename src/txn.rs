@@ -1,9 +1,5 @@
 //! Transaction management with compile-time safety
 
-/// Maximum number of pages that can be allocated in a single transaction
-/// This prevents runaway page allocation during complex B-tree operations
-const MAX_TXN_PAGES: usize = 1024;
-
 use parking_lot::MutexGuard;
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -250,7 +246,12 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
         // 1. The environment (and thus the mmap) outlives the transaction
         // 2. The mmap base address is stable during the transaction
         // 3. Pages are immutable once written (COW semantics)
-        unsafe { inner.io.get_page_ref(page_id) }
+        let page = unsafe { inner.io.get_page_ref(page_id)? };
+        
+        // Validate checksum if enabled
+        self.validate_page_checksum(page)?;
+        
+        Ok(page)
     }
 
     /// Get database info
@@ -267,9 +268,36 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
         self.data.databases.insert(name.map(|s| s.to_string()), info);
         Ok(())
     }
+    
+    /// Validate page checksum based on environment checksum mode
+    #[inline]
+    fn validate_page_checksum(&self, page: &Page) -> Result<()> {
+        let inner = self.data.env.inner();
+        
+        match inner.checksum_mode {
+            crate::checksum::ChecksumMode::None => Ok(()),
+            crate::checksum::ChecksumMode::MetaOnly => {
+                // Only validate meta pages
+                if page.header.flags.contains(PageFlags::META) {
+                    use crate::checksum::ChecksummedPage;
+                    page.validate_checksum()
+                } else {
+                    Ok(())
+                }
+            }
+            crate::checksum::ChecksumMode::Full => {
+                // Validate all pages
+                use crate::checksum::ChecksummedPage;
+                page.validate_checksum()
+            }
+        }
+    }
 
     /// Commit the transaction
     pub fn commit(mut self) -> Result<()> {
+        // Extract checksum mode before the mutable borrow
+        let checksum_mode = self.data.env.inner().checksum_mode;
+        
         match self.mode_data {
             ModeData::Read { .. } => {
                 // Nothing to do for read transactions
@@ -372,6 +400,11 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
                             } else {
                                 // Need to make the page dirty first
                                 let page = inner.io.read_page(current_root)?;
+                                // Validate checksum if enabled
+                                if checksum_mode != crate::checksum::ChecksumMode::None {
+                                    use crate::checksum::ChecksummedPage;
+                                    page.validate_checksum()?;
+                                }
                                 let mut new_page = Page::new(current_root, page.header.flags | PageFlags::DIRTY);
                                 // Copy the page data
                                 new_page.header = page.header;
@@ -417,7 +450,7 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
                 // This ensures data is on disk before the meta page references it
                 for (_page_id, page) in dirty.pages.iter_mut() {
                     // Update checksum if enabled
-                    if inner.checksum_mode != crate::checksum::ChecksumMode::None {
+                    if checksum_mode != crate::checksum::ChecksumMode::None {
                         use crate::checksum::ChecksummedPage;
                         page.update_checksum();
                     }
@@ -431,12 +464,26 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
                     crate::env::DurabilityMode::NoSync => {
                         // No sync - fastest but no durability guarantees
                         // Write meta page without syncing
-                        let meta_page = Page::from_meta(&new_meta, next_meta_page_id);
+                        let mut meta_page = Page::from_meta(&new_meta, next_meta_page_id);
+                        
+                        // Update checksum if enabled (meta pages always get checksums in MetaOnly mode)
+                        if checksum_mode != crate::checksum::ChecksumMode::None {
+                            use crate::checksum::ChecksummedPage;
+                            meta_page.update_checksum();
+                        }
+                        
                         inner.io.write_page(&meta_page)?;
                     }
                     crate::env::DurabilityMode::AsyncFlush => {
                         // Write meta page
-                        let meta_page = Page::from_meta(&new_meta, next_meta_page_id);
+                        let mut meta_page = Page::from_meta(&new_meta, next_meta_page_id);
+                        
+                        // Update checksum if enabled (meta pages always get checksums in MetaOnly mode)
+                        if checksum_mode != crate::checksum::ChecksumMode::None {
+                            use crate::checksum::ChecksummedPage;
+                            meta_page.update_checksum();
+                        }
+                        
                         inner.io.write_page(&meta_page)?;
                         // Schedule async flush (OS will sync eventually)
                         // Note: Data loss possible if system crashes before flush
@@ -450,7 +497,14 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
 
                         // Write meta page after data is synced
                         // This ensures data pages are durable before meta references them
-                        let meta_page = Page::from_meta(&new_meta, next_meta_page_id);
+                        let mut meta_page = Page::from_meta(&new_meta, next_meta_page_id);
+                        
+                        // Update checksum if enabled (meta pages always get checksums in MetaOnly mode)
+                        if checksum_mode != crate::checksum::ChecksumMode::None {
+                            use crate::checksum::ChecksummedPage;
+                            meta_page.update_checksum();
+                        }
+                        
                         inner.io.write_page(&meta_page)?;
                         // Meta page is not synced - OS crash could lose this commit
                     }
@@ -462,7 +516,14 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
                         }
 
                         // Step 2: Write meta page after data is guaranteed durable
-                        let meta_page = Page::from_meta(&new_meta, next_meta_page_id);
+                        let mut meta_page = Page::from_meta(&new_meta, next_meta_page_id);
+                        
+                        // Update checksum if enabled (meta pages always get checksums in MetaOnly mode)
+                        if checksum_mode != crate::checksum::ChecksumMode::None {
+                            use crate::checksum::ChecksummedPage;
+                            meta_page.update_checksum();
+                        }
+                        
                         inner.io.write_page(&meta_page)?;
 
                         // Step 3: Sync meta page to ensure commit is durable
@@ -532,6 +593,9 @@ impl<'env> Transaction<'env, Write> {
         // Page is not dirty - need to copy it (Copy-on-Write)
         let inner = self.data.env.inner();
         let original_page = inner.io.read_page(page_id)?;
+        
+        // Validate checksum if enabled
+        self.validate_page_checksum(&original_page)?;
 
         // Check if this is a leaf page with overflow references that need copying
         let overflow_updates = if original_page.header.flags.contains(PageFlags::LEAF)
@@ -627,20 +691,31 @@ impl<'env> Transaction<'env, Write> {
     pub fn get_page_mut(&mut self, page_id: PageId) -> Result<&mut Page> {
         // For now, keep the old behavior for compatibility
         // TODO: Update all callers to handle the new page ID from COW
-        if let ModeData::Write { ref mut dirty, .. } = self.mode_data {
-            // Check if already dirty
-            if dirty.pages.contains_key(&page_id) {
+        // First check if already dirty
+        let already_dirty = if let ModeData::Write { ref dirty, .. } = self.mode_data {
+            dirty.pages.contains_key(&page_id)
+        } else {
+            unreachable!("Write transaction must have write mode data");
+        };
+        
+        if already_dirty {
+            if let ModeData::Write { ref mut dirty, .. } = self.mode_data {
                 return Ok(dirty.pages.get_mut(&page_id).unwrap());
             }
+        }
 
-            // Load and copy page
-            let inner = self.data.env.inner();
-            let mut page = inner.io.read_page(page_id)?;
+        // Load and copy page
+        let inner = self.data.env.inner();
+        let mut page = inner.io.read_page(page_id)?;
+        
+        // Validate checksum if enabled
+        self.validate_page_checksum(&page)?;
 
-            // Mark as dirty
-            page.header.flags.insert(PageFlags::DIRTY);
+        // Mark as dirty
+        page.header.flags.insert(PageFlags::DIRTY);
+        
+        if let ModeData::Write { ref mut dirty, .. } = self.mode_data {
             dirty.mark_dirty(page_id, page);
-
             Ok(dirty.pages.get_mut(&page_id).unwrap())
         } else {
             unreachable!("Write transaction must have write mode data");
@@ -658,10 +733,11 @@ impl<'env> Transaction<'env, Write> {
         } = self.mode_data
         {
             // Check transaction page limit to prevent runaway allocation
-            if dirty.allocated.len() >= MAX_TXN_PAGES {
+            let max_txn_pages = self.data.env.config().max_txn_pages;
+            if dirty.allocated.len() >= max_txn_pages {
                 return Err(Error::Custom(
                     format!("Transaction page limit exceeded: {} pages. Consider committing more frequently for random write workloads.", 
-                            MAX_TXN_PAGES).into()
+                            max_txn_pages).into()
                 ));
             }
             // Try to get a page from the appropriate free list
