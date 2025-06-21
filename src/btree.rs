@@ -1063,7 +1063,9 @@ impl<C: Comparator> BTree<C> {
 
             // The borrowed child becomes the new leftmost child of the right node
             let old_leftmost = crate::branch::BranchPage::get_leftmost_child(child)?;
-            crate::branch::BranchPage::update_leftmost_child(child, borrowed_child.unwrap())?;
+            let borrowed_child_id = borrowed_child
+                .ok_or_else(|| Error::Custom("Expected borrowed child for branch node".into()))?;
+            crate::branch::BranchPage::update_leftmost_child(child, borrowed_child_id)?;
 
             // Insert separator with the old leftmost as its child
             child.add_node_sorted(&separator_key, &old_leftmost.0.to_le_bytes())?;
@@ -1174,7 +1176,9 @@ impl<C: Comparator> BTree<C> {
             // For branch nodes, separator goes down to child with borrowed leftmost as its child
             let (_, child) = txn.get_page_cow(child_id)?;
             // Insert separator with the borrowed leftmost child
-            child.add_node_sorted(&separator_key, &borrowed_child.unwrap().0.to_le_bytes())?;
+            let borrowed_child_id = borrowed_child
+                .ok_or_else(|| Error::Custom("Expected borrowed child for branch node".into()))?;
+            child.add_node_sorted(&separator_key, &borrowed_child_id.0.to_le_bytes())?;
 
             // Update separator in parent to be the borrowed key using COW
             let (_, parent) = txn.get_page_cow(parent_id)?;
@@ -1407,9 +1411,11 @@ impl<C: Comparator> BTree<C> {
 
             // The borrowed child becomes the new leftmost child of the right sibling
             let old_leftmost = crate::branch::BranchPage::get_leftmost_child(right_sibling)?;
+            let borrowed_child_id = borrowed_child
+                .ok_or_else(|| Error::Custom("Expected borrowed child for branch node".into()))?;
             crate::branch::BranchPage::update_leftmost_child(
                 right_sibling,
-                borrowed_child.unwrap(),
+                borrowed_child_id,
             )?;
 
             // Insert separator with the old leftmost as its child
