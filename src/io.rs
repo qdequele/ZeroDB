@@ -103,10 +103,18 @@ impl MmapBackend {
     /// Validate that a page ID is within bounds
     #[inline]
     fn validate_page_id(&self, page_id: PageId) -> Result<usize> {
-        let offset = page_id.0 as usize * self.page_size;
+        // Use checked multiplication to prevent overflow
+        let offset = (page_id.0 as usize)
+            .checked_mul(self.page_size)
+            .ok_or(Error::InvalidPageId(page_id))?;
         let size = self.file_size.load(Ordering::Acquire) as usize;
         
-        if offset >= size || offset + self.page_size > size {
+        // Check bounds with overflow-safe addition
+        let end = offset
+            .checked_add(self.page_size)
+            .ok_or(Error::InvalidPageId(page_id))?;
+            
+        if offset >= size || end > size {
             return Err(Error::InvalidPageId(page_id));
         }
         
@@ -126,20 +134,34 @@ impl MmapBackend {
             .open(&path)
             .map_err(|e| Error::Io(e.to_string()))?;
 
+        // Set file permissions to 0600 (owner read/write only) for security
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = std::fs::Permissions::from_mode(0o600);
+            file.set_permissions(permissions)
+                .map_err(|e| Error::Io(format!("Failed to set file permissions: {}", e)))?;
+        }
+
         // Get current file size
         let metadata = file.metadata().map_err(|e| Error::Io(e.to_string()))?;
         let mut file_size = metadata.len();
 
-        // Ensure minimum size
-        let min_size = PAGE_SIZE as u64 * 4; // At least 4 pages (2 meta + 2 data)
+        // Ensure minimum size with overflow-safe multiplication
+        let min_size = (PAGE_SIZE as u64)
+            .checked_mul(4) // At least 4 pages (2 meta + 2 data)
+            .ok_or(Error::Io("Minimum size calculation overflow".into()))?;
         if file_size < min_size {
             file_size = initial_size.max(min_size);
             file.set_len(file_size).map_err(|e| Error::Io(e.to_string()))?;
         }
 
-        // Ensure size is page-aligned
+        // Ensure size is page-aligned using overflow-safe operations
         let page_size = PAGE_SIZE;
-        file_size = (file_size / page_size as u64) * page_size as u64;
+        let page_count = file_size / page_size as u64;
+        file_size = page_count
+            .checked_mul(page_size as u64)
+            .ok_or(Error::Io("File size calculation overflow".into()))?;
 
         // Create memory map
         let mmap = unsafe {
@@ -201,16 +223,30 @@ impl MmapBackend {
             return Ok(());
         }
         
-        let offset = start_page.0 as usize * self.page_size;
-        let len = num_pages * self.page_size;
+        // Use checked multiplication to prevent overflow
+        let offset = (start_page.0 as usize)
+            .checked_mul(self.page_size)
+            .ok_or(Error::InvalidPageId(start_page))?;
+        let len = num_pages
+            .checked_mul(self.page_size)
+            .ok_or(Error::Custom("Prefetch length calculation overflow".into()))?;
         let size = self.file_size.load(Ordering::Acquire) as usize;
 
-        if offset >= size || offset + len > size {
+        // Check bounds with overflow-safe addition
+        let end = offset
+            .checked_add(len)
+            .ok_or(Error::InvalidPageId(start_page))?;
+            
+        if offset >= size || end > size {
             return Err(Error::InvalidPageId(start_page));
         }
         
-        // Also validate end page
-        let end_page = PageId(start_page.0 + num_pages as u64 - 1);
+        // Also validate end page with overflow-safe addition
+        let end_page_num = start_page.0
+            .checked_add(num_pages as u64)
+            .and_then(|n| n.checked_sub(1))
+            .ok_or(Error::InvalidPageId(start_page))?;
+        let end_page = PageId(end_page_num);
         if end_page.0 >= self.size_in_pages() {
             return Err(Error::InvalidPageId(end_page));
         }
@@ -251,10 +287,18 @@ impl MmapBackend {
     /// Get a mutable slice of the memory map for a page
     #[allow(dead_code)]
     fn get_page_slice_mut(&self, page_id: PageId) -> Result<&mut [u8]> {
-        let offset = page_id.0 as usize * self.page_size;
+        // Use checked multiplication to prevent overflow
+        let offset = (page_id.0 as usize)
+            .checked_mul(self.page_size)
+            .ok_or(Error::InvalidPageId(page_id))?;
         let size = self.file_size.load(Ordering::Acquire) as usize;
 
-        if offset + self.page_size > size {
+        // Check bounds with overflow-safe addition
+        let end = offset
+            .checked_add(self.page_size)
+            .ok_or(Error::InvalidPageId(page_id))?;
+            
+        if end > size {
             return Err(Error::InvalidPageId(page_id));
         }
 
@@ -273,10 +317,18 @@ impl IoBackend for MmapBackend {
 
     #[inline]
     fn read_page(&self, page_id: PageId) -> Result<Box<Page>> {
-        let offset = page_id.0 as usize * self.page_size;
+        // Use checked multiplication to prevent overflow
+        let offset = (page_id.0 as usize)
+            .checked_mul(self.page_size)
+            .ok_or(Error::InvalidPageId(page_id))?;
         let size = self.file_size.load(Ordering::Acquire) as usize;
 
-        if offset + self.page_size > size {
+        // Check bounds with overflow-safe addition
+        let end = offset
+            .checked_add(self.page_size)
+            .ok_or(Error::InvalidPageId(page_id))?;
+            
+        if end > size {
             return Err(Error::InvalidPageId(page_id));
         }
 
@@ -304,11 +356,17 @@ impl IoBackend for MmapBackend {
         // The returned reference can become invalid if grow() is called.
         // Consider using get_page_safe() instead which holds the lock.
         //
-        // Validate page ID first
-        let offset = page_id.0 as usize * self.page_size;
+        // Validate page ID first with overflow-safe arithmetic
+        let offset = (page_id.0 as usize)
+            .checked_mul(self.page_size)
+            .ok_or(Error::InvalidPageId(page_id))?;
         let size = self.file_size.load(Ordering::Acquire) as usize;
 
-        if offset + self.page_size > size {
+        let end = offset
+            .checked_add(self.page_size)
+            .ok_or(Error::InvalidPageId(page_id))?;
+            
+        if end > size {
             return Err(Error::InvalidPageId(page_id));
         }
 
@@ -325,7 +383,8 @@ impl IoBackend for MmapBackend {
         // Validate offset again with memory barrier
         fence(Ordering::Acquire);
         let current_size = self.file_size.load(Ordering::Acquire) as usize;
-        if offset + self.page_size > current_size {
+        // Re-use the previously calculated end value since offset hasn't changed
+        if end > current_size {
             return Err(Error::InvalidPageId(page_id));
         }
         
@@ -340,10 +399,18 @@ impl IoBackend for MmapBackend {
 
     fn write_page(&self, page: &Page) -> Result<()> {
         let page_id = PageId(page.header.pgno);
-        let offset = page_id.0 as usize * self.page_size;
+        // Use checked multiplication to prevent overflow
+        let offset = (page_id.0 as usize)
+            .checked_mul(self.page_size)
+            .ok_or(Error::InvalidPageId(page_id))?;
         let size = self.file_size.load(Ordering::Acquire) as usize;
 
-        if offset + self.page_size > size {
+        // Check bounds with overflow-safe addition
+        let end = offset
+            .checked_add(self.page_size)
+            .ok_or(Error::InvalidPageId(page_id))?;
+            
+        if end > size {
             return Err(Error::InvalidPageId(page_id));
         }
 
@@ -373,7 +440,10 @@ impl IoBackend for MmapBackend {
     }
 
     fn grow(&self, new_size: u64) -> Result<()> {
-        let new_size_bytes = new_size * self.page_size as u64;
+        // Use checked multiplication to prevent overflow
+        let new_size_bytes = new_size
+            .checked_mul(self.page_size as u64)
+            .ok_or(Error::Custom("Database size calculation overflow".into()))?;
         let current_size = self.file_size.load(Ordering::Acquire);
 
         if new_size_bytes <= current_size {

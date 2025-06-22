@@ -50,7 +50,7 @@ fn main() -> Result<()> {
     
     for (name, size) in sizes {
         let pages_needed = (size + data_per_overflow_page - 1) / data_per_overflow_page;
-        let total_space = pages_needed * PAGE_SIZE;
+        let total_space = pages_needed.saturating_mul(PAGE_SIZE);
         let overhead = total_space - size;
         let overhead_percent = (overhead as f64 / size as f64) * 100.0;
         

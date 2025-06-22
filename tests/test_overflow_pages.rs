@@ -331,9 +331,9 @@ fn test_overflow_edge_cases() -> Result<()> {
     // Test overflow value that's exactly N pages
     {
         let mut txn = env.write_txn()?;
-        let page_size = 4096;
-        let header_size = 16; // Approximate header size
-        let exact_pages_value = vec![4; page_size * 3 - header_size];
+        let page_size: usize = 4096;
+        let header_size: usize = 16; // Approximate header size
+        let exact_pages_value = vec![4; page_size.saturating_mul(3).saturating_sub(header_size)];
         db.put(&mut txn, b"exact".to_vec(), exact_pages_value)?;
         txn.commit()?;
     }

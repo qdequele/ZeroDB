@@ -210,9 +210,11 @@ git commit -m "fix: resolve transaction page limits"
 This ensures thorough analysis and well-structured solutions.
 
 ### Efficiency Tips
-
+0. **Think before planning**: Use deep-thinking to review the project, find the issue or understand task deeply, think about the best world class solution to bring.
 1. **Plan Before Acting**: Use sequential-thinking to plan the complete solution before starting implementation
 2. **Test Early**: Run tests frequently to catch issues early
 3. **Document as You Go**: Update documentation while making changes, not after
 4. **Use Templates**: Create reusable templates for common operations
 5. **Batch Related Work**: Group related changes to minimize context switching
+6. **Remember for later**: Update the TODO_MASTER.md file to keep track of what has been done and what is still to be done. 
+6. **Commit before finishing**: Always commit what has been done with a short and concise explanantion of what changed. 

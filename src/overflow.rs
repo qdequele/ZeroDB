@@ -13,6 +13,10 @@ use crate::txn::{mode::Mode, Transaction};
 /// Conservative estimate: PAGE_SIZE / 4
 pub const MAX_INLINE_VALUE_SIZE: usize = PAGE_SIZE / 4;
 
+/// Maximum number of overflow pages allowed in a chain
+/// This prevents resource exhaustion from malicious inputs
+pub const MAX_OVERFLOW_PAGES: usize = 1000;
+
 /// Overflow page header
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -43,6 +47,13 @@ pub fn write_overflow_value<'txn>(
 
     if num_pages == 0 {
         return Err(Error::InvalidParameter("Empty value for overflow"));
+    }
+
+    if num_pages > MAX_OVERFLOW_PAGES {
+        return Err(Error::Custom(format!(
+            "Value too large: would require {} overflow pages (max: {})",
+            num_pages, MAX_OVERFLOW_PAGES
+        ).into()));
     }
 
     let mut first_page_id = None;
@@ -120,8 +131,17 @@ pub fn read_overflow_value<'txn, M: Mode>(
 
     let mut current_page_id = first_page_id;
     let mut bytes_read = 0;
+    let mut pages_read = 0;
 
     loop {
+        // Prevent resource exhaustion from malicious overflow chains
+        pages_read += 1;
+        if pages_read > MAX_OVERFLOW_PAGES {
+            return Err(Error::Corruption {
+                details: format!("Overflow chain exceeds maximum allowed pages ({})", MAX_OVERFLOW_PAGES),
+                page_id: Some(current_page_id),
+            });
+        }
         let page = txn.get_page(current_page_id)?;
         let header = unsafe { *(page.data.as_ptr() as *const OverflowHeader) };
 
@@ -171,8 +191,17 @@ pub fn free_overflow_chain(
     first_page_id: PageId,
 ) -> Result<()> {
     let mut current_page_id = first_page_id;
+    let mut pages_freed = 0;
 
     loop {
+        // Prevent resource exhaustion from malicious overflow chains
+        pages_freed += 1;
+        if pages_freed > MAX_OVERFLOW_PAGES {
+            return Err(Error::Corruption {
+                details: format!("Overflow chain exceeds maximum allowed pages ({})", MAX_OVERFLOW_PAGES),
+                page_id: Some(current_page_id),
+            });
+        }
         let page = txn.get_page(current_page_id)?;
 
         // Check it's an overflow page
@@ -209,8 +238,17 @@ pub fn copy_overflow_chain(
     let mut old_page_id = old_first_page_id;
     let mut new_first_page_id = None;
     let mut prev_new_page_id = None;
+    let mut pages_copied = 0;
 
     loop {
+        // Prevent resource exhaustion from malicious overflow chains
+        pages_copied += 1;
+        if pages_copied > MAX_OVERFLOW_PAGES {
+            return Err(Error::Corruption {
+                details: format!("Overflow chain exceeds maximum allowed pages ({})", MAX_OVERFLOW_PAGES),
+                page_id: Some(old_page_id),
+            });
+        }
         // Get the old page and copy necessary data
         let (
             old_flags,
