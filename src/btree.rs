@@ -444,9 +444,17 @@ impl<C: Comparator> BTree<C> {
                 let needs_split = {
                     let page = txn.get_page(page_id)?;
                     let required_size = if needs_overflow {
-                        crate::page::NodeHeader::SIZE + key.len() + 8 + size_of::<u16>()
+                        crate::page::NodeHeader::SIZE
+                            .checked_add(key.len())
+                            .and_then(|s| s.checked_add(8))
+                            .and_then(|s| s.checked_add(size_of::<u16>()))
+                            .ok_or_else(|| Error::Custom("Node size calculation overflow".into()))?
                     } else {
-                        crate::page::NodeHeader::SIZE + key.len() + value.len() + size_of::<u16>()
+                        crate::page::NodeHeader::SIZE
+                            .checked_add(key.len())
+                            .and_then(|s| s.checked_add(value.len()))
+                            .and_then(|s| s.checked_add(size_of::<u16>()))
+                            .ok_or_else(|| Error::Custom("Node size calculation overflow".into()))?
                     };
                     // Use should_split for pre-emptive splitting at 85% utilization
                     page.should_split(Some(required_size))
@@ -1038,8 +1046,13 @@ impl<C: Comparator> BTree<C> {
         // Insert into child using COW
         if is_leaf {
             // Check if child has space for the borrowed key/value
-            let node_size = crate::page::NodeHeader::SIZE + borrowed_key.len() + borrowed_value.len();
-            let required_space = node_size + std::mem::size_of::<u16>();
+            let node_size = crate::page::NodeHeader::SIZE
+                .checked_add(borrowed_key.len())
+                .and_then(|s| s.checked_add(borrowed_value.len()))
+                .ok_or_else(|| Error::Custom("Node size calculation overflow".into()))?;
+            let required_space = node_size
+                .checked_add(std::mem::size_of::<u16>())
+                .ok_or_else(|| Error::Custom("Required space calculation overflow".into()))?;
             
             {
                 let child_page = txn.get_page(child_id)?;
@@ -1147,8 +1160,13 @@ impl<C: Comparator> BTree<C> {
         // Insert into child using COW
         if is_leaf {
             // Check if child has space for the borrowed key/value
-            let node_size = crate::page::NodeHeader::SIZE + borrowed_key.len() + borrowed_value.len();
-            let required_space = node_size + std::mem::size_of::<u16>();
+            let node_size = crate::page::NodeHeader::SIZE
+                .checked_add(borrowed_key.len())
+                .and_then(|s| s.checked_add(borrowed_value.len()))
+                .ok_or_else(|| Error::Custom("Node size calculation overflow".into()))?;
+            let required_space = node_size
+                .checked_add(std::mem::size_of::<u16>())
+                .ok_or_else(|| Error::Custom("Required space calculation overflow".into()))?;
             
             {
                 let child_page = txn.get_page(child_id)?;
@@ -1216,9 +1234,15 @@ impl<C: Comparator> BTree<C> {
             let right_used = PAGE_SIZE - right_page.header.free_space();
             // Add some overhead for the separator key in branch pages
             if is_branch {
-                left_used + right_used + separator_key.len() + 16
+                left_used
+                    .checked_add(right_used)
+                    .and_then(|s| s.checked_add(separator_key.len()))
+                    .and_then(|s| s.checked_add(16))
+                    .ok_or_else(|| Error::Custom("Merge size calculation overflow".into()))?
             } else {
-                left_used + right_used
+                left_used
+                    .checked_add(right_used)
+                    .ok_or_else(|| Error::Custom("Merge size calculation overflow".into()))?
             }
         };
 
@@ -1456,9 +1480,16 @@ impl<C: Comparator> BTree<C> {
             let right_used = PAGE_SIZE - right_page.header.free_space() - PageHeader::SIZE;
             // Add some overhead for the separator key in branch pages
             if is_branch {
-                left_used + right_used + separator_key.len() + 64
+                left_used
+                    .checked_add(right_used)
+                    .and_then(|s| s.checked_add(separator_key.len()))
+                    .and_then(|s| s.checked_add(64))
+                    .ok_or_else(|| Error::Custom("Merge size calculation overflow".into()))?
             } else {
-                left_used + right_used + 32
+                left_used
+                    .checked_add(right_used)
+                    .and_then(|s| s.checked_add(32))
+                    .ok_or_else(|| Error::Custom("Merge size calculation overflow".into()))?
             }
         };
 
@@ -1635,9 +1666,17 @@ impl<C: Comparator> BTree<C> {
                     
                     // Calculate entry size for pre-emptive split check
                     let required_size = if needs_overflow {
-                        crate::page::NodeHeader::SIZE + key.len() + 8 + size_of::<u16>()
+                        crate::page::NodeHeader::SIZE
+                            .checked_add(key.len())
+                            .and_then(|s| s.checked_add(8))
+                            .and_then(|s| s.checked_add(size_of::<u16>()))
+                            .ok_or_else(|| Error::Custom("Node size calculation overflow".into()))?
                     } else {
-                        crate::page::NodeHeader::SIZE + key.len() + value.len() + size_of::<u16>()
+                        crate::page::NodeHeader::SIZE
+                            .checked_add(key.len())
+                            .and_then(|s| s.checked_add(value.len()))
+                            .and_then(|s| s.checked_add(size_of::<u16>()))
+                            .ok_or_else(|| Error::Custom("Node size calculation overflow".into()))?
                     };
                     
                     // Use should_split for pre-emptive splitting at 85% utilization

@@ -143,15 +143,61 @@ Always run these commands before considering a task complete:
    cargo test --release
    ```
 
-4. **Commit changes** (if all checks pass):
+4. **Create commit with short message** (if all checks pass):
    ```bash
    git add -A
-   git commit -m "Description of changes
-
-   🤖 Generated with Claude Code
-   
-   Co-Authored-By: Claude <noreply@anthropic.com>"
+   git commit -m "feat: add transaction page limits"
    ```
+   
+   **Commit Message Guidelines:**
+   - Use conventional commit format: `type: description`
+   - Keep it short and descriptive (under 50 characters)
+   - Common types: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `perf:`
+   - Examples:
+     - `feat: add transaction page limits`
+     - `fix: resolve page full error during delete`
+     - `docs: update API documentation`
+     - `refactor: improve B+Tree insertion logic`
+
+### Minimizing Confirmation Clicks
+
+**IMPORTANT**: To reduce the number of confirmation clicks required:
+
+1. **Batch Operations**: Group related changes into single commits rather than multiple small commits
+2. **Use Non-Interactive Commands**: Prefer commands that don't require user input
+3. **Provide Clear Context**: When asking for confirmation, explain exactly what will happen
+4. **Use Default Values**: When possible, use sensible defaults that don't require user choice
+5. **Pre-Validate**: Check for potential issues before asking for confirmation
+
+**Examples of Good vs Bad Practices:**
+
+❌ **Bad - Multiple confirmations:**
+```bash
+# Don't do this - requires multiple clicks
+git add file1.rs
+git add file2.rs  
+git add file3.rs
+git commit -m "fix: various issues"
+```
+
+✅ **Good - Single operation:**
+```bash
+# Do this - single confirmation
+git add -A
+git commit -m "fix: resolve transaction page limits"
+```
+
+❌ **Bad - Vague confirmation request:**
+```bash
+# Don't do this
+"Should I commit these changes?"
+```
+
+✅ **Good - Clear context:**
+```bash
+# Do this
+"All tests pass. Committing transaction page limits feature (3 files changed, +45 lines). Proceed?"
+```
 
 ### Coding Guidelines
 
@@ -162,3 +208,11 @@ Always run these commands before considering a task complete:
 - When debugging issues
 
 This ensures thorough analysis and well-structured solutions.
+
+### Efficiency Tips
+
+1. **Plan Before Acting**: Use sequential-thinking to plan the complete solution before starting implementation
+2. **Test Early**: Run tests frequently to catch issues early
+3. **Document as You Go**: Update documentation while making changes, not after
+4. **Use Templates**: Create reusable templates for common operations
+5. **Batch Related Work**: Group related changes to minimize context switching

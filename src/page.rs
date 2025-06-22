@@ -271,7 +271,15 @@ impl Page {
         let header = unsafe { *node_ptr };
         
         // Validate node header
-        if header.ksize as usize + header.value_size() + size_of::<NodeHeader>() > self.data.len() - data_offset {
+        let node_total_size = (header.ksize as usize)
+            .checked_add(header.value_size())
+            .and_then(|s| s.checked_add(size_of::<NodeHeader>()))
+            .ok_or_else(|| Error::Corruption {
+                details: "Node size calculation overflow".into(),
+                page_id: Some(PageId(self.header.pgno)),
+            })?;
+        
+        if node_total_size > self.data.len().saturating_sub(data_offset) {
             return Err(Error::Corruption {
                 details: "Node data extends beyond page".into(),
                 page_id: Some(PageId(self.header.pgno)),
@@ -369,7 +377,10 @@ impl Page {
         value_size_override: usize,
     ) -> Result<usize> {
         let actual_value_size = if is_overflow { value_size_override } else { value.len() };
-        let node_size = NodeHeader::SIZE + key.len() + value.len();
+        let node_size = NodeHeader::SIZE
+            .checked_add(key.len())
+            .and_then(|s| s.checked_add(value.len()))
+            .ok_or_else(|| Error::Custom("Node size calculation overflow".into()))?;
 
         // Check if we have space for the new node using fill factor thresholds
         // This uses sophisticated utilization checks rather than exact space
@@ -428,7 +439,10 @@ impl Page {
             // Write key with bounds check
             let key_ptr = node_ptr.add(1) as *mut u8;
             let key_offset = key_ptr as usize - self.data.as_ptr() as usize;
-            if key_offset + key.len() > self.data.len() {
+            let key_end = key_offset
+                .checked_add(key.len())
+                .ok_or_else(|| Error::Custom("Key end calculation overflow".into()))?;
+            if key_end > self.data.len() {
                 return Err(Error::Custom("Page full".into()));
             }
             ptr::copy_nonoverlapping(key.as_ptr(), key_ptr, key.len());
@@ -436,7 +450,10 @@ impl Page {
             // Write value (or overflow page ID) with bounds check
             let val_ptr = key_ptr.add(key.len());
             let val_offset = val_ptr as usize - self.data.as_ptr() as usize;
-            if val_offset + value.len() > self.data.len() {
+            let val_end = val_offset
+                .checked_add(value.len())
+                .ok_or_else(|| Error::Custom("Value end calculation overflow".into()))?;
+            if val_end > self.data.len() {
                 return Err(Error::Custom("Page full".into()));
             }
             ptr::copy_nonoverlapping(value.as_ptr(), val_ptr, value.len());
@@ -472,7 +489,14 @@ impl Page {
         };
 
         // Validate array bounds
-        let required_size = offset + (current_count + 1) * 2;
+        let ptr_array_size = match (current_count + 1).checked_mul(2) {
+            Some(s) => s,
+            None => panic!("Pointer array size overflow"),
+        };
+        let required_size = match offset.checked_add(ptr_array_size) {
+            Some(s) => s,
+            None => panic!("Required size calculation overflow"),
+        };
         if required_size > self.data.len() {
             panic!("Pointer array extends beyond page data");
         }
@@ -484,11 +508,11 @@ impl Page {
         if index < current_count {
             unsafe {
                 // Validate source and destination ranges
-                let src_offset = offset + index * 2;
-                let dst_offset = offset + (index + 1) * 2;
-                let copy_size = (current_count - index) * 2;
+                let src_offset = offset.saturating_add(index.saturating_mul(2));
+                let dst_offset = offset.saturating_add((index + 1).saturating_mul(2));
+                let copy_size = (current_count - index).saturating_mul(2);
                 
-                if src_offset + copy_size > self.data.len() || dst_offset + copy_size > self.data.len() {
+                if src_offset.saturating_add(copy_size) > self.data.len() || dst_offset.saturating_add(copy_size) > self.data.len() {
                     panic!("Pointer copy would exceed page bounds");
                 }
                 
@@ -588,8 +612,16 @@ impl Page {
 
     /// Check if page has room for an entry of given size
     pub fn has_room_for(&self, key_size: usize, value_size: usize) -> bool {
-        let node_size = NodeHeader::SIZE + key_size + value_size;
-        let required_space = node_size + size_of::<u16>(); // node + pointer
+        let node_size = match NodeHeader::SIZE
+            .checked_add(key_size)
+            .and_then(|s| s.checked_add(value_size)) {
+            Some(size) => size,
+            None => return false, // Overflow means it definitely won't fit
+        };
+        let required_space = match node_size.checked_add(size_of::<u16>()) {
+            Some(space) => space,
+            None => return false,
+        };
         
         // Check absolute free space first
         let free = self.header.free_space();
@@ -597,11 +629,19 @@ impl Page {
             return false;
         }
         
-        // Calculate current utilization
-        let used_space = (self.header.lower - PageHeader::SIZE as u16) as usize + 
-                        (PAGE_SIZE as u16 - self.header.upper) as usize;
-        let total_usable = PAGE_SIZE - PageHeader::SIZE;
-        let utilization_after = (used_space + required_space) as f32 / total_usable as f32;
+        // Calculate current utilization with overflow checks
+        let lower_used = self.header.lower.saturating_sub(PageHeader::SIZE as u16) as usize;
+        let upper_used = (PAGE_SIZE as u16).saturating_sub(self.header.upper) as usize;
+        let used_space = match lower_used.checked_add(upper_used) {
+            Some(space) => space,
+            None => return false,
+        };
+        let total_usable = PAGE_SIZE.saturating_sub(PageHeader::SIZE);
+        let new_used = match used_space.checked_add(required_space) {
+            Some(space) => space,
+            None => return false,
+        };
+        let utilization_after = new_used as f32 / total_usable as f32;
         
         // Very permissive thresholds to maximize page usage
         // For benchmarking, we need to pack pages as full as possible
@@ -620,14 +660,22 @@ impl Page {
         // For now, use simple threshold-based approach
         const SPLIT_THRESHOLD: f32 = 0.85; // Split at 85% full
         
-        let used_space = (self.header.lower - PageHeader::SIZE as u16) as usize + 
-                        (PAGE_SIZE as u16 - self.header.upper) as usize;
-        let total_usable = PAGE_SIZE - PageHeader::SIZE;
+        let lower_used = self.header.lower.saturating_sub(PageHeader::SIZE as u16) as usize;
+        let upper_used = (PAGE_SIZE as u16).saturating_sub(self.header.upper) as usize;
+        let used_space = lower_used.saturating_add(upper_used);
+        let total_usable = PAGE_SIZE.saturating_sub(PageHeader::SIZE);
         let utilization = used_space as f32 / total_usable as f32;
         
         // If we have a specific entry size, check if adding it would exceed threshold
         if let Some(size) = next_entry_size {
-            let new_used = used_space + size + size_of::<u16>();
+            let entry_with_ptr = match size.checked_add(size_of::<u16>()) {
+                Some(s) => s,
+                None => return true, // Overflow means we should split
+            };
+            let new_used = match used_space.checked_add(entry_with_ptr) {
+                Some(s) => s,
+                None => return true,
+            };
             let new_utilization = new_used as f32 / total_usable as f32;
             return new_utilization >= SPLIT_THRESHOLD;
         }
@@ -651,8 +699,13 @@ impl Page {
             0
         };
 
-        self.header.lower =
-            PageHeader::SIZE as u16 + header_offset as u16 + (from_index * size_of::<u16>()) as u16;
+        let ptr_size = match from_index.checked_mul(size_of::<u16>()) {
+            Some(s) => s as u16,
+            None => return, // Overflow, just leave it as is
+        };
+        self.header.lower = (PageHeader::SIZE as u16)
+            .saturating_add(header_offset as u16)
+            .saturating_add(ptr_size);
 
         // Note: We don't reclaim the space from removed nodes, they'll be
         // overwritten when new nodes are added
@@ -792,12 +845,29 @@ impl<'a> Node<'a> {
             });
         }
         
-        let key_offset = (self.offset as usize - PageHeader::SIZE) + NodeHeader::SIZE;
+        let node_data_offset = (self.offset as usize)
+            .checked_sub(PageHeader::SIZE)
+            .ok_or_else(|| Error::Corruption {
+                details: "Node offset underflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            })?;
+        let key_offset = node_data_offset
+            .checked_add(NodeHeader::SIZE)
+            .ok_or_else(|| Error::Corruption {
+                details: "Key offset overflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            })?;
         let key_len = self.header.ksize as usize;
 
         // The node data starts at self.offset and extends towards PAGE_SIZE
         // We need to ensure key_offset + key_len doesn't exceed the data array bounds
-        if key_offset > self.page.data.len() || key_offset + key_len > self.page.data.len() {
+        let key_end = key_offset
+            .checked_add(key_len)
+            .ok_or_else(|| Error::Corruption {
+                details: "Key end calculation overflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            })?;
+        if key_offset > self.page.data.len() || key_end > self.page.data.len() {
             return Err(Error::Corruption {
                 details: "Node key extends beyond page".into(),
                 page_id: Some(PageId(self.page.header.pgno)),
@@ -810,9 +880,19 @@ impl<'a> Node<'a> {
     /// Get the value bytes
     #[inline]
     pub fn value(&self) -> Result<Cow<'a, [u8]>> {
-        let val_offset = (self.offset as usize - PageHeader::SIZE)
-            + NodeHeader::SIZE
-            + self.header.ksize as usize;
+        let node_data_offset = (self.offset as usize)
+            .checked_sub(PageHeader::SIZE)
+            .ok_or_else(|| Error::Corruption {
+                details: "Node offset underflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            })?;
+        let val_offset = node_data_offset
+            .checked_add(NodeHeader::SIZE)
+            .and_then(|o| o.checked_add(self.header.ksize as usize))
+            .ok_or_else(|| Error::Corruption {
+                details: "Value offset overflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            })?;
         let val_len = self.header.value_size();
 
         if self.header.flags.contains(NodeFlags::BIGDATA) {
@@ -833,7 +913,13 @@ impl<'a> Node<'a> {
         }
 
         // Ensure value doesn't extend beyond the data array
-        if val_offset + val_len > self.page.data.len() {
+        let val_end = val_offset
+            .checked_add(val_len)
+            .ok_or_else(|| Error::Corruption {
+                details: "Value end calculation overflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            })?;
+        if val_end > self.page.data.len() {
             return Err(Error::Corruption {
                 details: "Node value extends beyond page".into(),
                 page_id: Some(PageId(self.page.header.pgno)),
@@ -875,9 +961,19 @@ impl<'a> Node<'a> {
             return Ok(None);
         }
 
-        let val_offset = (self.offset as usize - PageHeader::SIZE)
-            + NodeHeader::SIZE
-            + self.header.ksize as usize;
+        let node_data_offset = (self.offset as usize)
+            .checked_sub(PageHeader::SIZE)
+            .ok_or_else(|| Error::Corruption {
+                details: "Node offset underflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            })?;
+        let val_offset = node_data_offset
+            .checked_add(NodeHeader::SIZE)
+            .and_then(|o| o.checked_add(self.header.ksize as usize))
+            .ok_or_else(|| Error::Corruption {
+                details: "Value offset overflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            })?;
 
         // Read u64 from potentially unaligned location
         let mut pgno_bytes = [0u8; 8];

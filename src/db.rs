@@ -313,7 +313,6 @@ impl<K: Key, V: Value, C: Comparator> Database<K, V, C> {
         }
         
         // Maximum value size without overflow (approximate, leaving room for headers)
-        const MAX_INLINE_VALUE_SIZE: usize = crate::page::PAGE_SIZE - crate::page::PageHeader::SIZE - 100;
         // Maximum total size including overflow pages (e.g., 1GB)
         const MAX_TOTAL_VALUE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
         

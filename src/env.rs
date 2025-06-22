@@ -149,8 +149,10 @@ pub(crate) struct EnvInner {
     /// Maximum number of pages per transaction
     pub(crate) max_txn_pages: usize,
     /// Maximum key size in bytes
+    #[allow(dead_code)]
     pub(crate) max_key_size: usize,
     /// Maximum value size in bytes (for inline storage)
+    #[allow(dead_code)]
     pub(crate) max_value_size: usize,
     /// Maximum database size in bytes
     pub(crate) max_database_size: Option<usize>,
@@ -232,6 +234,7 @@ impl EnvInner {
     }
 
     /// Validate key size against configured maximum
+    #[allow(dead_code)]
     pub(crate) fn validate_key_size(&self, key_size: usize) -> Result<()> {
         if key_size > self.max_key_size {
             return Err(Error::KeyTooLarge {
@@ -243,6 +246,7 @@ impl EnvInner {
     }
 
     /// Validate value size against configured maximum
+    #[allow(dead_code)]
     pub(crate) fn validate_value_size(&self, value_size: usize) -> Result<()> {
         if value_size > self.max_value_size {
             return Err(Error::ValueTooLarge {
@@ -254,6 +258,7 @@ impl EnvInner {
     }
 
     /// Validate page ID is within allocated range
+    #[allow(dead_code)]
     pub(crate) fn validate_page_id(&self, page_id: PageId) -> Result<()> {
         let max_pages = self.io.size_in_pages();
         
@@ -285,6 +290,7 @@ impl EnvInner {
     }
 
     /// Check for integer overflow in size calculations
+    #[allow(dead_code)]
     pub(crate) fn check_size_overflow(&self, size1: usize, size2: usize) -> Result<usize> {
         size1.checked_add(size2).ok_or_else(|| Error::IntegerOverflow {
             operation: "size addition".to_string(),

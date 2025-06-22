@@ -56,7 +56,9 @@ impl BranchPage {
         }
 
         // Adjust lower to account for branch header
-        page.header.lower += BranchHeader::SIZE as u16;
+        page.header.lower = page.header.lower
+            .checked_add(BranchHeader::SIZE as u16)
+            .ok_or_else(|| Error::Custom("Page lower bound overflow".into()))?;
 
         // Add the median key with right child
         // In branch pages, we store the child page ID as the "value"
@@ -209,7 +211,9 @@ impl BranchPage {
         }
 
         // Adjust lower
-        page.header.lower += BranchHeader::SIZE as u16;
+        page.header.lower = page.header.lower
+            .checked_add(BranchHeader::SIZE as u16)
+            .ok_or_else(|| Error::Custom("Page lower bound overflow".into()))?;
 
         // Add all entries
         for (key, child) in entries {
@@ -253,7 +257,10 @@ impl BranchPage {
                 if old_key.len() == new_key.len() {
                     // Get node offset
                     let ptr = page.ptrs()[i];
-                    let node_offset = ptr as usize - PageHeader::SIZE + NodeHeader::SIZE;
+                    let node_offset = (ptr as usize)
+                        .checked_sub(PageHeader::SIZE)
+                        .and_then(|o| o.checked_add(NodeHeader::SIZE))
+                        .ok_or_else(|| Error::Custom("Node offset calculation overflow".into()))?;
 
                     // Update key in place
                     unsafe {

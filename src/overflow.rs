@@ -35,7 +35,10 @@ pub fn write_overflow_value<'txn>(
 ) -> Result<PageId> {
     let total_size = value.len();
     // Account for both PageHeader and OverflowHeader
-    let data_per_page = PAGE_SIZE - crate::page::PageHeader::SIZE - OverflowHeader::SIZE;
+    let data_per_page = PAGE_SIZE
+        .checked_sub(crate::page::PageHeader::SIZE)
+        .and_then(|s| s.checked_sub(OverflowHeader::SIZE))
+        .ok_or_else(|| Error::Custom("Overflow page size calculation overflow".into()))?;
     let num_pages = total_size.div_ceil(data_per_page);
 
     if num_pages == 0 {
@@ -55,7 +58,7 @@ pub fn write_overflow_value<'txn>(
         }
 
         // Calculate how much data goes in this page
-        let chunk_size = std::cmp::min(data_per_page, total_size - offset);
+        let chunk_size = std::cmp::min(data_per_page, total_size.saturating_sub(offset));
         let _is_last = i == num_pages - 1;
 
         // Write overflow header
@@ -83,7 +86,7 @@ pub fn write_overflow_value<'txn>(
         }
 
         prev_page_id = Some(page_id);
-        offset += chunk_size;
+        offset = offset.saturating_add(chunk_size);
     }
 
     first_page_id.ok_or_else(|| Error::Custom("Failed to allocate first overflow page".into()))
@@ -110,7 +113,10 @@ pub fn read_overflow_value<'txn, M: Mode>(
     let total_size = header.total_size as usize;
     let mut result = Vec::with_capacity(total_size);
     // Account for both PageHeader and OverflowHeader
-    let data_per_page = PAGE_SIZE - crate::page::PageHeader::SIZE - OverflowHeader::SIZE;
+    let data_per_page = PAGE_SIZE
+        .checked_sub(crate::page::PageHeader::SIZE)
+        .and_then(|s| s.checked_sub(OverflowHeader::SIZE))
+        .ok_or_else(|| Error::Custom("Overflow page size calculation overflow".into()))?;
 
     let mut current_page_id = first_page_id;
     let mut bytes_read = 0;
@@ -120,7 +126,7 @@ pub fn read_overflow_value<'txn, M: Mode>(
         let header = unsafe { *(page.data.as_ptr() as *const OverflowHeader) };
 
         // Calculate how much data is in this page
-        let chunk_size = std::cmp::min(data_per_page, total_size - bytes_read);
+        let chunk_size = std::cmp::min(data_per_page, total_size.saturating_sub(bytes_read));
 
         // Read data
         unsafe {
@@ -128,7 +134,7 @@ pub fn read_overflow_value<'txn, M: Mode>(
             result.extend_from_slice(std::slice::from_raw_parts(data_ptr, chunk_size));
         }
 
-        bytes_read += chunk_size;
+        bytes_read = bytes_read.saturating_add(chunk_size);
 
         // Move to next page
         if header.next_page == 0 {
@@ -153,7 +159,10 @@ pub fn read_overflow_value<'txn, M: Mode>(
 /// Check if a value should be stored in overflow pages
 pub fn needs_overflow(key_size: usize, value_size: usize) -> bool {
     // Conservative check: if key + value + headers would take more than 1/4 of page
-    key_size + value_size + 32 > MAX_INLINE_VALUE_SIZE
+    match key_size.checked_add(value_size).and_then(|s| s.checked_add(32)) {
+        Some(total) => total > MAX_INLINE_VALUE_SIZE,
+        None => true, // Overflow in calculation means it definitely needs overflow pages
+    }
 }
 
 /// Free all overflow pages in a chain

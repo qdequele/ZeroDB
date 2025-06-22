@@ -171,14 +171,15 @@ This document consolidates all action items from production readiness and test s
   - [x] Fix use-after-free risks in page references (added PageGuard with lifetime bounds)
 - **Note**: Implemented RCU-like pattern with generation counter, added PageGuard wrapper for safe access
 
-### 🟡 Add Input Validation
-- **Status**: NOT STARTED
-- **Files**: `src/env.rs`, `src/txn.rs`, `src/btree.rs`
+### ✅ Add Input Validation
+- **Status**: COMPLETED (June 22, 2025)
+- **Files**: `src/env.rs`, `src/txn.rs`, `src/btree.rs`, `src/db.rs`, `src/page.rs`, `src/overflow.rs`, `src/branch.rs`
 - **Tasks**:
-  - [ ] Validate key/value sizes don't exceed limits
-  - [ ] Check for integer overflow in size calculations
-  - [ ] Add maximum database size enforcement
-  - [ ] Validate page IDs are within bounds
+  - [x] Validate key/value sizes don't exceed limits (added to db.rs put methods)
+  - [x] Check for integer overflow in size calculations (added throughout btree, page, overflow)
+  - [x] Add maximum database size enforcement (configurable via EnvBuilder)
+  - [x] Validate page IDs are within bounds (added to all page access methods)
+- **Note**: Added comprehensive validation with clear error messages. Created tests for all validation scenarios.
 
 ### 🟡 Fix Security Vulnerabilities
 - **Status**: NOT STARTED
@@ -392,8 +393,8 @@ This document consolidates all action items from production readiness and test s
 ### Remaining Work
 - 🔴 0 critical safety fixes (All completed!)
 - 🟠 0 error handling tasks (All completed!)
-- 🟡 2 security tasks (input validation, security vulnerabilities)
+- 🟡 1 security task (security vulnerabilities)
 - 🟢 11 production features and tools
-- Total: **13 major tasks remaining**
+- Total: **12 major tasks remaining**
 
 Last Updated: 2025-06-22

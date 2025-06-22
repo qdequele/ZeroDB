@@ -236,6 +236,7 @@ impl MmapBackend {
     /// # Safety
     /// The caller must ensure the pointer is only used while the generation is unchanged
     #[inline]
+    #[allow(dead_code)]
     pub(crate) unsafe fn mmap_ptr_with_generation(&self) -> (*const u8, usize) {
         let mmap = self.mmap.read().unwrap_or_else(|poisoned| {
             poisoned.into_inner()
