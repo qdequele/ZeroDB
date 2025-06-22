@@ -26,6 +26,10 @@ const MIN_BRANCH_KEYS: usize = 2;
 /// Minimum keys for leaf pages (can go down to 1)
 const MIN_LEAF_KEYS: usize = 1;
 
+/// Maximum depth allowed for B+Tree to prevent stack exhaustion
+/// This is a safety limit - normal databases should never approach this depth
+pub const MAX_TREE_DEPTH: usize = 100;
+
 /// Check if a page is underflowed based on used space, not key count
 fn is_underflowed(page: &Page) -> bool {
     // Root page is never considered underflowed
@@ -192,8 +196,17 @@ impl<C: Comparator> BTree<C> {
         key: &[u8],
     ) -> Result<Option<Cow<'txn, [u8]>>> {
         let mut current_page_id = root;
+        let mut depth = 0;
 
         loop {
+            // Check depth limit to prevent stack exhaustion
+            depth += 1;
+            if depth > MAX_TREE_DEPTH {
+                return Err(Error::Corruption {
+                    details: format!("Tree depth exceeds maximum allowed depth ({})", MAX_TREE_DEPTH),
+                    page_id: Some(current_page_id),
+                });
+            }
             let page = txn.get_page(current_page_id)?;
 
             // Handle empty pages (newly created)
@@ -353,6 +366,25 @@ impl<C: Comparator> BTree<C> {
         key: &[u8],
         value: &[u8],
     ) -> Result<(PageId, InsertResult)> {
+        Self::insert_cow_with_depth(txn, page_id, key, value, 0)
+    }
+
+    /// Insert with Copy-on-Write with depth tracking - returns new page ID and result
+    fn insert_cow_with_depth(
+        txn: &mut Transaction<'_, Write>,
+        page_id: PageId,
+        key: &[u8],
+        value: &[u8],
+        depth: usize,
+    ) -> Result<(PageId, InsertResult)> {
+        // Check depth limit to prevent stack exhaustion
+        if depth > MAX_TREE_DEPTH {
+            return Err(Error::Corruption {
+                details: format!("Tree depth exceeds maximum allowed depth ({}) during insert", MAX_TREE_DEPTH),
+                page_id: Some(page_id),
+            });
+        }
+
         let page = txn.get_page(page_id)?;
 
         if page.header.flags.contains(PageFlags::LEAF) {
@@ -360,7 +392,7 @@ impl<C: Comparator> BTree<C> {
             Self::insert_into_leaf_cow(txn, page_id, key, value)
         } else {
             // Insert into branch page with COW
-            Self::insert_into_branch_cow(txn, page_id, key, value)
+            Self::insert_into_branch_cow_with_depth(txn, page_id, key, value, depth)
         }
     }
 
@@ -759,6 +791,23 @@ impl<C: Comparator> BTree<C> {
         page_id: PageId,
         key: &[u8],
     ) -> Result<(PageId, DeleteResult)> {
+        Self::delete_from_node_with_depth(txn, page_id, key, 0)
+    }
+
+    fn delete_from_node_with_depth(
+        txn: &mut Transaction<'_, Write>,
+        page_id: PageId,
+        key: &[u8],
+        depth: usize,
+    ) -> Result<(PageId, DeleteResult)> {
+        // Check depth limit to prevent stack exhaustion
+        if depth > MAX_TREE_DEPTH {
+            return Err(Error::Corruption {
+                details: format!("Tree depth exceeds maximum allowed depth ({}) during delete", MAX_TREE_DEPTH),
+                page_id: Some(page_id),
+            });
+        }
+
         let page = txn.get_page(page_id)?;
 
         if page.header.flags.contains(PageFlags::LEAF) {
@@ -766,7 +815,7 @@ impl<C: Comparator> BTree<C> {
             Self::delete_from_leaf(txn, page_id, key)
         } else {
             // Delete from branch
-            Self::delete_from_branch(txn, page_id, key)
+            Self::delete_from_branch_with_depth(txn, page_id, key, depth)
         }
     }
 
@@ -829,10 +878,20 @@ impl<C: Comparator> BTree<C> {
     }
 
     /// Delete from a branch page
+    #[allow(dead_code)]
     fn delete_from_branch(
         txn: &mut Transaction<'_, Write>,
         page_id: PageId,
         key: &[u8],
+    ) -> Result<(PageId, DeleteResult)> {
+        Self::delete_from_branch_with_depth(txn, page_id, key, 0)
+    }
+
+    fn delete_from_branch_with_depth(
+        txn: &mut Transaction<'_, Write>,
+        page_id: PageId,
+        key: &[u8],
+        depth: usize,
     ) -> Result<(PageId, DeleteResult)> {
         let page = txn.get_page(page_id)?;
 
@@ -855,7 +914,7 @@ impl<C: Comparator> BTree<C> {
         };
 
         // Recursively delete from child
-        let (new_child_id, child_result) = Self::delete_from_node(txn, child_page_id, key)?;
+        let (new_child_id, child_result) = Self::delete_from_node_with_depth(txn, child_page_id, key, depth + 1)?;
         
         // If child page changed due to COW, update parent's reference
         let mut current_page_id = page_id;
@@ -1723,11 +1782,22 @@ impl<C: Comparator> BTree<C> {
     }
 
     /// Insert into branch page with Copy-on-Write
+    #[allow(dead_code)]
     fn insert_into_branch_cow(
         txn: &mut Transaction<'_, Write>,
         page_id: PageId,
         key: &[u8],
         value: &[u8],
+    ) -> Result<(PageId, InsertResult)> {
+        Self::insert_into_branch_cow_with_depth(txn, page_id, key, value, 0)
+    }
+
+    fn insert_into_branch_cow_with_depth(
+        txn: &mut Transaction<'_, Write>,
+        page_id: PageId,
+        key: &[u8],
+        value: &[u8],
+        depth: usize,
     ) -> Result<(PageId, InsertResult)> {
         let child_page_id = {
             let page = txn.get_page(page_id)?;
@@ -1735,7 +1805,7 @@ impl<C: Comparator> BTree<C> {
         };
 
         // Recursively insert into child with COW
-        let (new_child_id, child_result) = Self::insert_cow(txn, child_page_id, key, value)?;
+        let (new_child_id, child_result) = Self::insert_cow_with_depth(txn, child_page_id, key, value, depth + 1)?;
 
         match child_result {
             InsertResult::Updated(old) => {

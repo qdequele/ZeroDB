@@ -275,8 +275,16 @@ impl EnvInner {
     pub(crate) fn check_database_size_limit(&self, pages_to_add: u64) -> Result<()> {
         if let Some(max_size) = self.max_database_size {
             let current_pages = self.io.size_in_pages();
-            let current_size = current_pages * PAGE_SIZE as u64;
-            let new_size = current_size + (pages_to_add * PAGE_SIZE as u64);
+            // Use checked multiplication to prevent overflow
+            let current_size = current_pages
+                .checked_mul(PAGE_SIZE as u64)
+                .ok_or(Error::Custom("Current database size calculation overflow".into()))?;
+            let additional_size = pages_to_add
+                .checked_mul(PAGE_SIZE as u64)
+                .ok_or(Error::Custom("Additional size calculation overflow".into()))?;
+            let new_size = current_size
+                .checked_add(additional_size)
+                .ok_or(Error::Custom("Total size calculation overflow".into()))?;
             
             if new_size > max_size as u64 {
                 return Err(Error::DatabaseFull {
