@@ -4,7 +4,7 @@ use crate::comparator::{Comparator, LexicographicComparator};
 use crate::error::{Error, PageId, Result};
 use crate::meta::DbInfo;
 use crate::page::{Page, PageFlags, PageHeader, SearchResult, PAGE_SIZE};
-use crate::txn::{Transaction, Write};
+use crate::txn::{mode, Transaction, Write};
 use std::borrow::Cow;
 use std::marker::PhantomData;
 
@@ -69,6 +69,181 @@ impl<C: Comparator> BTree<C> {
     /// Create a new BTree instance
     pub fn new() -> Self {
         Self { _phantom: PhantomData }
+    }
+
+    /// Validate B+tree invariants for a given subtree
+    /// Returns (min_key, max_key, depth) if valid
+    pub fn validate_btree_invariants<M: mode::Mode>(
+        txn: &Transaction<'_, M>,
+        root: PageId,
+    ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>, usize)> {
+        Self::validate_subtree(txn, root, None, None, 0)
+    }
+
+    /// Recursively validate a subtree
+    fn validate_subtree<M: mode::Mode>(
+        txn: &Transaction<'_, M>,
+        page_id: PageId,
+        parent_min: Option<&[u8]>,
+        parent_max: Option<&[u8]>,
+        depth: usize,
+    ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>, usize)> {
+        // Check depth limit
+        if depth > MAX_TREE_DEPTH {
+            return Err(Error::Corruption {
+                details: format!("Tree depth {} exceeds maximum allowed depth {}", depth, MAX_TREE_DEPTH),
+                page_id: Some(page_id),
+            });
+        }
+
+        let page = txn.get_page(page_id)?;
+        
+        // Validate page has been properly validated during read
+        // (this is done by get_page automatically)
+
+        // Check that page has proper type
+        if !page.header.flags.contains(PageFlags::BRANCH) && !page.header.flags.contains(PageFlags::LEAF) {
+            return Err(Error::Corruption {
+                details: format!("Page {} is neither branch nor leaf", page_id.0),
+                page_id: Some(page_id),
+            });
+        }
+
+        let is_leaf = page.header.flags.contains(PageFlags::LEAF);
+        
+        // Empty pages are valid (newly created)
+        if page.header.num_keys == 0 {
+            return Ok((None, None, 1));
+        }
+
+        // Get first and last keys
+        let first_node = page.node(0)?;
+        let first_key = first_node.key()?;
+        let last_node = page.node(page.header.num_keys as usize - 1)?;
+        let last_key = last_node.key()?;
+
+        // Check key ordering within page
+        let mut prev_key = first_key;
+        for i in 1..page.header.num_keys as usize {
+            let node = page.node(i)?;
+            let key = node.key()?;
+            
+            if C::compare(prev_key, key) != std::cmp::Ordering::Less {
+                return Err(Error::Corruption {
+                    details: format!("Keys not in sorted order at index {} in page {}", i, page_id.0),
+                    page_id: Some(page_id),
+                });
+            }
+            prev_key = key;
+        }
+
+        // Check bounds from parent
+        if let Some(min) = parent_min {
+            if C::compare(first_key, min) != std::cmp::Ordering::Greater 
+                && C::compare(first_key, min) != std::cmp::Ordering::Equal {
+                return Err(Error::Corruption {
+                    details: format!("First key in page {} violates parent minimum bound", page_id.0),
+                    page_id: Some(page_id),
+                });
+            }
+        }
+
+        if let Some(max) = parent_max {
+            if C::compare(last_key, max) != std::cmp::Ordering::Less {
+                return Err(Error::Corruption {
+                    details: format!("Last key in page {} violates parent maximum bound", page_id.0),
+                    page_id: Some(page_id),
+                });
+            }
+        }
+
+        if is_leaf {
+            // Leaf page - check values
+            for i in 0..page.header.num_keys as usize {
+                let node = page.node(i)?;
+                // Validate overflow pages if present
+                if let Some(overflow_id) = node.overflow_page()? {
+                    // Ensure overflow page ID is valid
+                    let inner = txn.data.env.inner();
+                    let num_pages = inner.io.size_in_pages();
+                    if overflow_id.0 >= num_pages {
+                        return Err(Error::Corruption {
+                            details: format!("Invalid overflow page ID {} in leaf node", overflow_id.0),
+                            page_id: Some(page_id),
+                        });
+                    }
+                }
+            }
+            Ok((Some(first_key.to_vec()), Some(last_key.to_vec()), 1))
+        } else {
+            // Branch page - recursively validate children
+            let mut max_child_depth = 0;
+            let mut first_child_depth = None;
+
+            // Get the leftmost child
+            let leftmost_child = crate::branch::BranchPage::get_leftmost_child(page)?;
+
+            // Validate leftmost child with its bounds
+            if page.header.num_keys > 0 {
+                let first_node = page.node(0)?;
+                let first_key = first_node.key()?;
+                
+                let (_, _, child_depth) = Self::validate_subtree(
+                    txn,
+                    leftmost_child,
+                    parent_min,
+                    Some(first_key),
+                    depth + 1,
+                )?;
+                
+                first_child_depth = Some(child_depth);
+                max_child_depth = child_depth;
+            }
+
+            // Validate each child with appropriate bounds
+            for i in 0..page.header.num_keys as usize {
+                let node = page.node(i)?;
+                let key = node.key()?;
+                
+                // Get child page ID (stored as value in branch nodes)
+                let child_id = node.page_number()?;
+
+                // Determine bounds for this child
+                let child_min = Some(key);
+                let child_max = if i + 1 < page.header.num_keys as usize {
+                    let next_node = page.node(i + 1)?;
+                    Some(next_node.key()?)
+                } else {
+                    parent_max
+                };
+
+                // Recursively validate child
+                let (_, _, child_depth) = Self::validate_subtree(
+                    txn,
+                    child_id,
+                    child_min,
+                    child_max,
+                    depth + 1,
+                )?;
+
+                // Check that all children have same depth
+                if let Some(first_depth) = first_child_depth {
+                    if child_depth != first_depth {
+                        return Err(Error::Corruption {
+                            details: format!("Inconsistent child depths in branch page {}: {} vs {}", 
+                                           page_id.0, first_depth, child_depth),
+                            page_id: Some(page_id),
+                        });
+                    }
+                } else {
+                    first_child_depth = Some(child_depth);
+                }
+
+                max_child_depth = max_child_depth.max(child_depth);
+            }
+
+            Ok((Some(first_key.to_vec()), Some(last_key.to_vec()), max_child_depth + 1))
+        }
     }
 
     /// Insert with append mode optimization

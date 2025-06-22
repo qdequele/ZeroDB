@@ -66,6 +66,11 @@ pub fn write_overflow_value<'txn>(
 
         if i == 0 {
             first_page_id = Some(page_id);
+            // Set overflow count in the first page
+            page.header.overflow = num_pages as u32;
+        } else {
+            // Continuation pages have overflow count of 1
+            page.header.overflow = 1;
         }
 
         // Calculate how much data goes in this page

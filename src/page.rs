@@ -147,6 +147,148 @@ impl Page {
         }
     }
 
+    /// Validate page header for corruption detection
+    pub fn validate_header(&self) -> Result<()> {
+        // Check that page flags contain exactly one page type
+        let type_flags = self.header.flags & PageFlags::PERSISTENT;
+        let type_count = type_flags.bits().count_ones();
+        if type_count != 1 {
+            return Err(Error::Corruption {
+                details: format!("Invalid page flags: multiple or no page types set (0x{:04x})", self.header.flags.bits()),
+                page_id: Some(PageId(self.header.pgno)),
+            });
+        }
+
+        // Validate lower/upper bounds
+        if self.header.lower < PageHeader::SIZE as u16 {
+            return Err(Error::Corruption {
+                details: format!("Lower bound {} is less than header size {}", self.header.lower, PageHeader::SIZE),
+                page_id: Some(PageId(self.header.pgno)),
+            });
+        }
+
+        if self.header.upper > PAGE_SIZE as u16 {
+            return Err(Error::Corruption {
+                details: format!("Upper bound {} exceeds page size {}", self.header.upper, PAGE_SIZE),
+                page_id: Some(PageId(self.header.pgno)),
+            });
+        }
+
+        if self.header.lower > self.header.upper {
+            return Err(Error::Corruption {
+                details: format!("Lower bound {} exceeds upper bound {}", self.header.lower, self.header.upper),
+                page_id: Some(PageId(self.header.pgno)),
+            });
+        }
+
+        // For branch/leaf pages, validate num_keys against available space
+        if self.header.flags.contains(PageFlags::BRANCH) || self.header.flags.contains(PageFlags::LEAF) {
+            let offset = if self.header.flags.contains(PageFlags::BRANCH) {
+                crate::branch::BranchHeader::SIZE
+            } else {
+                0
+            };
+
+            let min_required_space = offset + (self.header.num_keys as usize * 2);
+            let available_space = (self.header.lower as usize).saturating_sub(PageHeader::SIZE);
+            
+            if min_required_space > available_space {
+                return Err(Error::Corruption {
+                    details: format!("Not enough space for {} key pointers (need {} bytes, have {})", 
+                                   self.header.num_keys, min_required_space, available_space),
+                    page_id: Some(PageId(self.header.pgno)),
+                });
+            }
+        }
+
+        // Validate overflow count for overflow pages
+        if self.header.flags.contains(PageFlags::OVERFLOW) && self.header.overflow == 0 {
+            return Err(Error::Corruption {
+                details: "Overflow page has zero overflow count".to_string(),
+                page_id: Some(PageId(self.header.pgno)),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Detect if page has partial write corruption
+    /// This checks for zeroed areas that indicate incomplete disk writes
+    pub fn detect_partial_write(&self) -> Result<()> {
+        // For leaf/branch pages with keys, check that pointer area is not zeroed
+        if (self.header.flags.contains(PageFlags::BRANCH) || self.header.flags.contains(PageFlags::LEAF)) 
+            && self.header.num_keys > 0 {
+            
+            let ptrs = self.ptrs();
+            if ptrs.is_empty() {
+                return Err(Error::Corruption {
+                    details: "Pointer array is empty despite num_keys > 0".to_string(),
+                    page_id: Some(PageId(self.header.pgno)),
+                });
+            }
+
+            // Check if all pointers are zero (indicates partial write)
+            let all_zero = ptrs.iter().all(|&p| p == 0);
+            if all_zero {
+                return Err(Error::Corruption {
+                    details: "All key pointers are zero - possible partial write".to_string(),
+                    page_id: Some(PageId(self.header.pgno)),
+                });
+            }
+
+            // Check if pointers are within valid range
+            for (i, &ptr) in ptrs.iter().enumerate() {
+                if ptr != 0 && (ptr < self.header.upper || ptr >= PAGE_SIZE as u16) {
+                    return Err(Error::Corruption {
+                        details: format!("Key pointer {} at index {} is out of valid range [{}, {})", 
+                                       ptr, i, self.header.upper, PAGE_SIZE),
+                        page_id: Some(PageId(self.header.pgno)),
+                    });
+                }
+            }
+        }
+
+        // For overflow pages, check that data isn't completely zeroed
+        if self.header.flags.contains(PageFlags::OVERFLOW) {
+            // Skip the overflow header (16 bytes for next_page + total_size)
+            let data_start = crate::overflow::OverflowHeader::SIZE;
+            let data_end = PAGE_SIZE - PageHeader::SIZE;
+            
+            if data_end > data_start {
+                // Only check a reasonable portion to avoid false positives
+                // Check first 256 bytes of actual data
+                let check_len = std::cmp::min(256, data_end - data_start);
+                let all_zero = self.data[data_start..data_start + check_len].iter().all(|&b| b == 0);
+                
+                // Only flag as corruption if we have a reasonable amount of data that's all zero
+                // and the overflow count indicates this should have data
+                if all_zero && self.header.overflow > 0 && check_len >= 64 {
+                    return Err(Error::Corruption {
+                        details: "Overflow page data is completely zeroed - possible partial write".to_string(),
+                        page_id: Some(PageId(self.header.pgno)),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Comprehensive page validation combining header, checksum, and partial write detection
+    pub fn validate(&self) -> Result<()> {
+        // First validate the header structure
+        self.validate_header()?;
+        
+        // Then check for partial writes
+        self.detect_partial_write()?;
+        
+        // Finally validate checksum if present
+        use crate::checksum::ChecksummedPage;
+        self.validate_checksum()?;
+        
+        Ok(())
+    }
+
     /// Create a page from a MetaPage
     pub fn from_meta(meta: &crate::meta::MetaPage, page_id: PageId) -> Box<Self> {
         let mut page = Self::new(page_id, PageFlags::META);

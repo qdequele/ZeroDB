@@ -347,6 +347,9 @@ impl IoBackend for MmapBackend {
             );
         }
 
+        // Validate the page after reading
+        page.validate()?;
+
         Ok(page)
     }
 
@@ -393,8 +396,12 @@ impl IoBackend for MmapBackend {
         // Drop the lock before returning the reference
         drop(mmap);
         
+        // Get the page reference and validate it
+        let page = unsafe { &*page_ptr };
+        page.validate()?;
+        
         // Return the reference - caller is responsible for safety
-        Ok(unsafe { &*page_ptr })
+        Ok(page)
     }
 
     fn write_page(&self, page: &Page) -> Result<()> {
