@@ -86,7 +86,7 @@ pub fn write_overflow_value<'txn>(
         offset += chunk_size;
     }
 
-    Ok(first_page_id.unwrap())
+    first_page_id.ok_or_else(|| Error::Custom("Failed to allocate first overflow page".into()))
 }
 
 /// Read a large value from overflow pages
@@ -265,7 +265,7 @@ pub fn copy_overflow_chain(
         prev_new_page_id = Some(new_page_id);
     }
 
-    Ok(new_first_page_id.unwrap())
+    new_first_page_id.ok_or_else(|| Error::Custom("Failed to allocate first overflow page during COW".into()))
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@
 //! and performance technologies like SIMD.
 
 #![warn(missing_docs)]
+#![cfg_attr(not(test), warn(clippy::unwrap_used))]
 #![deny(unsafe_op_in_unsafe_fn)]
 // #![cfg_attr(feature = "simd", feature(portable_simd))]
 

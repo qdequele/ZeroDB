@@ -414,7 +414,8 @@ impl EnvBuilder {
 
         // Initialize main database entry
         {
-            let mut dbs = inner.databases.write().unwrap();
+            let mut dbs = inner.databases.write()
+                .expect("Failed to acquire database lock during initialization");
             dbs.insert(None, meta_info.main_db);
         }
 
@@ -463,12 +464,12 @@ impl Environment<Open> {
 
     /// Get inner reference (for internal use)
     pub(crate) fn inner(&self) -> &Arc<EnvInner> {
-        self.inner.as_ref().unwrap()
+        self.inner.as_ref().expect("Environment not open")
     }
 
     /// Get environment configuration (for internal use)
     pub(crate) fn config(&self) -> EnvConfig {
-        let inner = self.inner.as_ref().unwrap();
+        let inner = self.inner();
         EnvConfig {
             use_segregated_freelist: inner.use_segregated_freelist,
             use_numa: inner.numa_allocator.is_some(),
@@ -480,12 +481,12 @@ impl Environment<Open> {
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn inner_test(&self) -> &Arc<EnvInner> {
-        self.inner.as_ref().unwrap()
+        self.inner()
     }
 
     /// Sync data to disk
     pub fn sync(&self) -> Result<()> {
-        let inner = self.inner.as_ref().unwrap();
+        let inner = self.inner();
         match inner.durability {
             DurabilityMode::NoSync => {
                 // No sync requested
@@ -500,14 +501,14 @@ impl Environment<Open> {
 
     /// Force a full synchronous sync regardless of durability mode
     pub fn force_sync(&self) -> Result<()> {
-        let inner = self.inner.as_ref().unwrap();
+        let inner = self.inner();
         inner.io.sync()?;
         Ok(())
     }
 
     /// Get environment statistics
     pub fn stat(&self) -> Result<crate::meta::DbStats> {
-        let inner = self.inner.as_ref().unwrap();
+        let inner = self.inner();
         let meta = inner.meta()?;
 
         Ok(crate::meta::DbStats {

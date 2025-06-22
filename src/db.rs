@@ -8,7 +8,25 @@ use crate::meta::DbInfo;
 use crate::txn::{mode::Mode, Transaction};
 use bitflags::bitflags;
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, RwLockReadGuard, RwLockWriteGuard};
+
+/// Helper function to safely read from a RwLock
+fn read_lock<'a, T>(
+    lock: &'a std::sync::RwLock<T>,
+    context: &'static str,
+) -> Result<RwLockReadGuard<'a, T>> {
+    lock.read()
+        .map_err(|_| Error::Custom(format!("RwLock poisoned: {}", context).into()))
+}
+
+/// Helper function to safely write to a RwLock
+fn write_lock<'a, T>(
+    lock: &'a std::sync::RwLock<T>,
+    context: &'static str,
+) -> Result<RwLockWriteGuard<'a, T>> {
+    lock.write()
+        .map_err(|_| Error::Custom(format!("RwLock poisoned: {}", context).into()))
+}
 
 bitflags! {
     /// Database flags
@@ -132,10 +150,7 @@ impl<K: Key, V: Value, C: Comparator> Database<K, V, C> {
 
         // Check if it's the main database (no name)
         if name.is_none() {
-            let info = inner
-                .databases
-                .read()
-                .unwrap()
+            let info = read_lock(&inner.databases, "reading main database info")?
                 .get(&None)
                 .copied()
                 .ok_or(Error::InvalidDatabase)?;
@@ -145,7 +160,7 @@ impl<K: Key, V: Value, C: Comparator> Database<K, V, C> {
 
         // For named databases, we need to check the catalog
         // First check the cache
-        if let Some(info) = inner.databases.read().unwrap().get(&name.map(|s| s.to_string())) {
+        if let Some(info) = read_lock(&inner.databases, "checking database cache")?.get(&name.map(|s| s.to_string())) {
             return Ok(Self {
                 env_inner: inner.clone(),
                 name: name.map(|s| s.to_string()),
@@ -159,70 +174,83 @@ impl<K: Key, V: Value, C: Comparator> Database<K, V, C> {
             // Create a new database
             let mut txn = env.write_txn()?;
 
-            // Check catalog first
-            if let Some(info) = crate::catalog::Catalog::get_database(&txn, name.unwrap())? {
-                // Already exists in catalog
-                txn.abort();
+            // For named databases, check catalog first
+            if let Some(db_name) = name {
+                if let Some(info) = crate::catalog::Catalog::get_database(&txn, db_name)? {
+                    // Already exists in catalog
+                    txn.abort();
 
-                // Cache it
-                inner.databases.write().unwrap().insert(name.map(|s| s.to_string()), info);
+                    // Cache it
+                    write_lock(&inner.databases, "caching database info")?.insert(Some(db_name.to_string()), info);
 
-                Ok(Self {
-                    env_inner: inner.clone(),
-                    name: name.map(|s| s.to_string()),
-                    info,
-                    _phantom: PhantomData,
-                })
+                    Ok(Self {
+                        env_inner: inner.clone(),
+                        name: Some(db_name.to_string()),
+                        info,
+                        _phantom: PhantomData,
+                    })
+                } else {
+                    // Create new named database
+                    let (root_id, root_page) = txn.alloc_page(crate::page::PageFlags::LEAF)?;
+                    root_page.header.num_keys = 0;
+
+                    let info = DbInfo {
+                        flags: flags.bits(),
+                        depth: 1,
+                        branch_pages: 0,
+                        leaf_pages: 1,
+                        overflow_pages: 0,
+                        entries: 0,
+                        root: root_id,
+                        last_key_page: PageId(0),
+                    };
+
+                    // Store in catalog
+                    crate::catalog::Catalog::put_database(&mut txn, db_name, &info)?;
+
+                    // Update transaction's database list
+                    txn.update_db_info(Some(db_name), info)?;
+
+                    // Commit the transaction
+                    txn.commit()?;
+
+                    // Cache it
+                    write_lock(&inner.databases, "caching database info")?.insert(Some(db_name.to_string()), info);
+
+                    Ok(Self {
+                        env_inner: inner.clone(),
+                        name: Some(db_name.to_string()),
+                        info,
+                        _phantom: PhantomData,
+                    })
+                }
             } else {
-                // Create new database
-                let (root_id, root_page) = txn.alloc_page(crate::page::PageFlags::LEAF)?;
-                root_page.header.num_keys = 0;
-
-                let info = DbInfo {
-                    flags: flags.bits(),
-                    depth: 1,
-                    branch_pages: 0,
-                    leaf_pages: 1,
-                    overflow_pages: 0,
-                    entries: 0,
-                    root: root_id,
-                    last_key_page: PageId(0),
-                };
-
-                // Store in catalog
-                crate::catalog::Catalog::put_database(&mut txn, name.unwrap(), &info)?;
-
-                // Update transaction's database list
-                txn.update_db_info(name, info)?;
-
-                // Commit the transaction
-                txn.commit()?;
-
-                // Cache it
-                inner.databases.write().unwrap().insert(name.map(|s| s.to_string()), info);
-
-                Ok(Self {
-                    env_inner: inner.clone(),
-                    name: name.map(|s| s.to_string()),
-                    info,
-                    _phantom: PhantomData,
-                })
+                // Main database should already exist, can't create it here
+                txn.abort();
+                Err(Error::InvalidDatabase)
             }
         } else {
             // Must exist - check catalog
             let txn = env.read_txn()?;
 
-            if let Some(info) = crate::catalog::Catalog::get_database(&txn, name.unwrap())? {
-                // Cache it
-                inner.databases.write().unwrap().insert(name.map(|s| s.to_string()), info);
+            // For main database (None), it should already be handled above
+            // This branch is only for named databases
+            if let Some(db_name) = name {
+                if let Some(info) = crate::catalog::Catalog::get_database(&txn, db_name)? {
+                    // Cache it
+                    write_lock(&inner.databases, "caching database info")?.insert(Some(db_name.to_string()), info);
 
-                Ok(Self {
-                    env_inner: inner.clone(),
-                    name: name.map(|s| s.to_string()),
-                    info,
-                    _phantom: PhantomData,
-                })
+                    Ok(Self {
+                        env_inner: inner.clone(),
+                        name: Some(db_name.to_string()),
+                        info,
+                        _phantom: PhantomData,
+                    })
+                } else {
+                    Err(Error::InvalidDatabase)
+                }
             } else {
+                // Main database should have been handled above
                 Err(Error::InvalidDatabase)
             }
         }
@@ -507,7 +535,7 @@ impl Environment<state::Open> {
         }
 
         // For named databases, check if it already exists in the main database
-        let db_name = name.unwrap();
+        let db_name = name.ok_or_else(|| Error::Custom("Database name required for creation".into()))?;
 
         // Check if database already exists in transaction cache
         if let Ok(info) = txn.db_info(Some(db_name)) {
@@ -588,7 +616,7 @@ impl Environment<state::Open> {
         }
 
         // Check environment cache
-        if let Some(info) = self.inner().databases.read().unwrap().get(&name.map(String::from)) {
+        if let Some(info) = read_lock(&self.inner().databases, "checking database cache")?.get(&name.map(String::from)) {
             return Ok(Database::new(self.inner().clone(), name.map(String::from), *info));
         }
 
@@ -603,10 +631,7 @@ impl Environment<state::Open> {
                 // Try to deserialize using Catalog format
                 if let Ok(info) = crate::catalog::Catalog::deserialize_db_info(&value) {
                     // Cache in the environment
-                    self.inner()
-                        .databases
-                        .write()
-                        .unwrap()
+                    write_lock(&self.inner().databases, "caching database info")?
                         .insert(Some(db_name.to_string()), info);
                     return Ok(Database::new(
                         self.inner().clone(),
@@ -654,53 +679,23 @@ impl Environment<state::Open> {
             return Err(Error::InvalidOperation("Cannot drop the main database"));
         }
 
-        // Check if database exists
-        let (db_info_to_drop, main_db_info_root) = {
-            let main_db_info = txn.db_info(None)?;
-            match BTree::<LexicographicComparator>::search(txn, main_db_info.root, name.as_bytes())?
-            {
-                Some(value) => {
-                    if value.len() == std::mem::size_of::<DbInfo>() {
-                        let mut db_info = DbInfo::default();
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                value.as_ptr(),
-                                &mut db_info as *mut _ as *mut u8,
-                                std::mem::size_of::<DbInfo>(),
-                            );
-                        }
-                        Some((db_info, main_db_info.root))
-                    } else {
-                        None
-                    }
-                }
-                None => None,
-            }
-        }
-        .ok_or(Error::InvalidDatabase)?;
+        // Get database info from catalog
+        let db_info_to_drop = crate::catalog::Catalog::get_database(txn, name)?
+            .ok_or(Error::InvalidDatabase)?;
 
         // TODO: Free all pages used by this database
         // For now, just mark the root page as free
         txn.free_page(db_info_to_drop.root)?;
 
-        // Remove from main database
-        let main_db_info = *txn.db_info(None)?;
-        let mut main_db_info_mut = main_db_info;
-        let mut main_root = main_db_info_root;
-
-        BTree::<LexicographicComparator>::delete(
-            txn,
-            &mut main_root,
-            &mut main_db_info_mut,
-            name.as_bytes(),
-        )?;
-
-        // Update main database info
-        main_db_info_mut.root = main_root;
-        txn.update_db_info(None, main_db_info_mut)?;
+        // Remove from catalog
+        crate::catalog::Catalog::remove_database(txn, name)?;
 
         // Remove from transaction cache
         txn.data.databases.remove(&Some(name.to_string()));
+
+        // Remove from environment cache
+        write_lock(&self.inner().databases, "removing database from cache")?
+            .remove(&Some(name.to_string()));
 
         Ok(())
     }

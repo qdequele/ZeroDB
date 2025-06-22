@@ -120,10 +120,16 @@ impl MmapBackend {
         })
     }
 
+    /// Helper function to lock the mmap mutex
+    fn lock_mmap(&self) -> Result<std::sync::MutexGuard<'_, MmapMut>> {
+        self.mmap.lock()
+            .map_err(|_| Error::Custom("MmapBackend: Mutex poisoned".into()))
+    }
+
     /// Advise the kernel about memory access patterns
     #[cfg(unix)]
     pub fn madvise(&self, advice: MadviseAdvice) -> Result<()> {
-        let mmap = self.mmap.lock().unwrap();
+        let mmap = self.lock_mmap()?;
         let ptr = mmap.as_ptr() as *mut libc::c_void;
         let len = self.file_size.load(Ordering::Acquire) as usize;
 
@@ -155,7 +161,7 @@ impl MmapBackend {
 
         #[cfg(unix)]
         {
-            let mmap = self.mmap.lock().unwrap();
+            let mmap = self.lock_mmap()?;
             let ptr = unsafe { mmap.as_ptr().add(offset) } as *mut libc::c_void;
 
             // Use madvise WILLNEED to prefetch
@@ -178,7 +184,11 @@ impl MmapBackend {
         // We need to get the pointer without holding the lock
         // This is safe because the mmap base address doesn't change until grow() is called
         // and grow() requires exclusive access
-        let mmap = self.mmap.lock().unwrap();
+        let mmap = self.mmap.lock().unwrap_or_else(|poisoned| {
+            // If mutex is poisoned, we still need to return a pointer
+            // This is a critical function, so we recover from poison
+            poisoned.into_inner()
+        });
         mmap.as_ptr()
     }
 
@@ -193,7 +203,7 @@ impl MmapBackend {
         }
 
         // This is safe because we have exclusive access through the mmap mutex
-        let mut mmap = self.mmap.lock().unwrap();
+        let mut mmap = self.lock_mmap()?;
         let ptr = mmap.as_mut_ptr();
 
         unsafe { Ok(std::slice::from_raw_parts_mut(ptr.add(offset), self.page_size)) }
@@ -214,7 +224,7 @@ impl IoBackend for MmapBackend {
             return Err(Error::InvalidPageId(page_id));
         }
 
-        let mmap = self.mmap.lock().unwrap();
+        let mmap = self.lock_mmap()?;
 
         // Create a boxed page to hold the data
         let mut page = Page::new(page_id, crate::page::PageFlags::empty());
@@ -263,7 +273,7 @@ impl IoBackend for MmapBackend {
             return Err(Error::InvalidPageId(page_id));
         }
 
-        let mut mmap = self.mmap.lock().unwrap();
+        let mut mmap = self.lock_mmap()?;
 
         // Write the entire page data
         let dst = &mut mmap[offset..offset + self.page_size];
@@ -279,7 +289,7 @@ impl IoBackend for MmapBackend {
     }
 
     fn sync(&self) -> Result<()> {
-        let mmap = self.mmap.lock().unwrap();
+        let mmap = self.lock_mmap()?;
         mmap.flush().map_err(|e| Error::Io(e.to_string()))?;
         Ok(())
     }
@@ -300,7 +310,7 @@ impl IoBackend for MmapBackend {
         self.file.set_len(new_size_bytes).map_err(|e| Error::Io(e.to_string()))?;
 
         // Remap
-        let mut mmap_guard = self.mmap.lock().unwrap();
+        let mut mmap_guard = self.lock_mmap()?;
 
         // Create new mmap
         let new_mmap = unsafe {

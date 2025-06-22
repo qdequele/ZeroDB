@@ -214,11 +214,15 @@ impl SegregatedFreeList {
                         self.stats.fragmentation.increment();
                     }
 
-                    self.stats.allocs.get(&target_class).unwrap().increment();
+                    self.stats.allocs.get(&target_class)
+                        .expect("Size class should be initialized in constructor")
+                        .increment();
                     self.stats.free_pages.add(-(pages as i64) as u64);
                     return Some(allocated.start);
                 } else {
-                    self.stats.allocs.get(&target_class).unwrap().increment();
+                    self.stats.allocs.get(&target_class)
+                        .expect("Size class should be initialized in constructor")
+                        .increment();
                     self.stats.free_pages.add(-(pages as i64) as u64);
                     return Some(extent.start);
                 }
@@ -251,7 +255,9 @@ impl SegregatedFreeList {
                         self.stats.fragmentation.increment();
                     }
 
-                    self.stats.allocs.get(&target_class).unwrap().increment();
+                    self.stats.allocs.get(&target_class)
+                        .expect("Size class should be initialized in constructor")
+                        .increment();
                     self.stats.free_pages.add(-(pages as i64) as u64);
                     return Some(allocated.start);
                 }
@@ -271,7 +277,9 @@ impl SegregatedFreeList {
         self.pending.write().push(extent);
 
         let class = SizeClass::from_page_count(pages);
-        self.stats.frees.get(&class).unwrap().increment();
+        self.stats.frees.get(&class)
+            .expect("Size class should be initialized in constructor")
+            .increment();
     }
 
     /// Commit pending frees for a transaction
@@ -328,11 +336,14 @@ impl SegregatedFreeList {
                 if prev_extent.is_adjacent(&coalesced) {
                     // Remove old extent
                     let prev_class = SizeClass::from_page_count(prev_extent.pages);
-                    size_classes.get_mut(&prev_class).unwrap().remove(&prev_extent);
+                    if let Some(class_set) = size_classes.get_mut(&prev_class) {
+                        class_set.remove(&prev_extent);
+                    }
                     page_map.remove(&prev_extent.start);
 
                     // Merge
-                    coalesced = coalesced.merge(prev_extent).unwrap();
+                    coalesced = coalesced.merge(prev_extent)
+                        .expect("Adjacent extents should merge successfully");
                     did_coalesce = true;
                 }
             }
@@ -344,11 +355,14 @@ impl SegregatedFreeList {
             if coalesced.is_adjacent(&next_extent) {
                 // Remove old extent
                 let next_class = SizeClass::from_page_count(next_extent.pages);
-                size_classes.get_mut(&next_class).unwrap().remove(&next_extent);
+                if let Some(class_set) = size_classes.get_mut(&next_class) {
+                    class_set.remove(&next_extent);
+                }
                 page_map.remove(&next_extent.start);
 
                 // Merge
-                coalesced = coalesced.merge(next_extent).unwrap();
+                coalesced = coalesced.merge(next_extent)
+                    .expect("Adjacent extents should merge successfully");
                 did_coalesce = true;
             }
         }

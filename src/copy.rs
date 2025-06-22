@@ -222,12 +222,12 @@ fn copy_compact<W: Write>(
             // Remap page IDs within page content for branch pages
             if page.header.flags.contains(crate::page::PageFlags::BRANCH) {
                 // Update leftmost child in branch_v2 header
-                if let Some(new_id) =
-                    page_map.get(&crate::branch::BranchPage::get_leftmost_child(page).unwrap().0)
-                {
-                    unsafe {
-                        let header_ptr = page.data.as_mut_ptr() as *mut crate::branch::BranchHeader;
-                        (*header_ptr).leftmost_child = crate::error::PageId(*new_id);
+                if let Ok(leftmost_child) = crate::branch::BranchPage::get_leftmost_child(page) {
+                    if let Some(new_id) = page_map.get(&leftmost_child.0) {
+                        unsafe {
+                            let header_ptr = page.data.as_mut_ptr() as *mut crate::branch::BranchHeader;
+                            (*header_ptr).leftmost_child = crate::error::PageId(*new_id);
+                        }
                     }
                 }
 

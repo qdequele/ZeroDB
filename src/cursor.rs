@@ -233,7 +233,8 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
 
         // Get necessary info before mutable borrow
         let (leaf_idx, leaf_page_id) = {
-            let position = self.position.as_ref().unwrap();
+            let position = self.position.as_ref()
+                .ok_or_else(|| Error::Custom("Cursor position unexpectedly None".into()))?;
             let leaf_idx = position.pages.len() - 1;
             let leaf_page_id = position.pages[leaf_idx];
             (leaf_idx, leaf_page_id)
@@ -245,7 +246,8 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
         let leaf_has_leaf_flag = leaf_page.header.flags.contains(PageFlags::LEAF);
 
         // Now we can mutably borrow position
-        let position = self.position.as_mut().unwrap();
+        let position = self.position.as_mut()
+            .ok_or_else(|| Error::Custom("Cursor position unexpectedly None".into()))?;
         position.indices[leaf_idx] += 1;
 
         if position.indices[leaf_idx] < leaf_num_keys {
@@ -299,7 +301,8 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
 
         // Need to move to next leaf
         // Go up the tree until we find a branch we haven't exhausted
-        let position = self.position.as_mut().unwrap();
+        let position = self.position.as_mut()
+            .ok_or_else(|| Error::Custom("Cursor position unexpectedly None".into()))?;
         
         // If we only have one page in our stack, we've lost tree position
         // This happens after leaf chaining. We need to find where we are in the tree.
@@ -407,14 +410,16 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
 
         // Get necessary info before mutable borrow
         let (leaf_idx, current_leaf_index, leaf_page_id) = {
-            let position = self.position.as_ref().unwrap();
+            let position = self.position.as_ref()
+                .ok_or_else(|| Error::Custom("Cursor position unexpectedly None".into()))?;
             let leaf_idx = position.pages.len() - 1;
             (leaf_idx, position.indices[leaf_idx], position.pages[leaf_idx])
         };
 
         if current_leaf_index > 0 {
             // Can move back in current leaf
-            let position = self.position.as_mut().unwrap();
+            let position = self.position.as_mut()
+                .ok_or_else(|| Error::Custom("Cursor position unexpectedly None".into()))?;
             position.indices[leaf_idx] -= 1;
 
             let leaf_page_id = position.pages[leaf_idx];
@@ -438,7 +443,8 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
 
             if prev_page.header.num_keys > 0 {
                 // Update position to point to last entry in previous leaf
-                let position = self.position.as_mut().unwrap();
+                let position = self.position.as_mut()
+                    .ok_or_else(|| Error::Custom("Cursor position unexpectedly None".into()))?;
                 position.pages.clear();
                 position.indices.clear();
                 position.pages.push(prev_page_id);
@@ -451,7 +457,8 @@ impl<'txn, K, V, C: Comparator> Cursor<'txn, K, V, C> {
             }
         }
 
-        let position = self.position.as_mut().unwrap();
+        let position = self.position.as_mut()
+            .ok_or_else(|| Error::Custom("Cursor position unexpectedly None".into()))?;
 
         // Need to move to previous leaf
         // Go up the tree until we find a branch we can go left from
@@ -949,7 +956,8 @@ impl<'txn, K: crate::db::Key, V: crate::db::Value, C: Comparator> Cursor<'txn, K
         }
 
         // Work with the dup cursor
-        let dup_state = self.dup_cursor.as_mut().unwrap();
+        let dup_state = self.dup_cursor.as_mut()
+            .ok_or_else(|| Error::Custom("Dup cursor unexpectedly None".into()))?;
         let dup_position = match &mut dup_state.position {
             Some(pos) => pos,
             None => return Ok(None),

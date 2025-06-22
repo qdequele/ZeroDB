@@ -138,7 +138,14 @@ impl BatchCommitter {
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                     // Check if we have pending writes to commit
-                    let mut pending_guard = pending.lock().unwrap();
+                    let mut pending_guard = match pending.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => {
+                            // Log error and continue with poisoned mutex
+                            eprintln!("BatchCommitter: Mutex poisoned, recovering");
+                            poisoned.into_inner()
+                        }
+                    };
                     if !pending_guard.is_empty() {
                         // Move pending to batch
                         while let Some(write) = pending_guard.pop_front() {
