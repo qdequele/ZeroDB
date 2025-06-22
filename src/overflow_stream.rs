@@ -79,7 +79,7 @@ impl<'txn, M: Mode> Read for OverflowReader<'txn, M> {
         while total_read < buf.len() && self.current_page < self.overflow_count {
             let page_id = PageId(self.first_page_id.0 + self.current_page as u64);
             let page = self.txn.get_page(page_id)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
 
             // Calculate available data in current page
             let available = if self.current_page == self.overflow_count - 1 {
@@ -154,7 +154,7 @@ impl<'txn> OverflowWriter<'txn> {
             self.txn.alloc_consecutive_pages(num_pages_estimate, PageFlags::OVERFLOW)?
         } else {
             // Allocate next consecutive page
-            let last_id = self.current_pages.last().unwrap();
+            let last_id = self.current_pages.last().expect("current_pages should not be empty");
             PageId(last_id.0 + 1)
         };
 
@@ -182,7 +182,7 @@ impl<'txn> IoWrite for OverflowWriter<'txn> {
             // Allocate new page if needed
             if self.position_in_page == 0 || self.position_in_page >= self.data_per_page {
                 self.alloc_new_page()
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                    .map_err(io::Error::other)?;
                 self.position_in_page = 0;
             }
 
@@ -191,7 +191,7 @@ impl<'txn> IoWrite for OverflowWriter<'txn> {
             
             // Get mutable page and write data
             let page = self.txn.get_consecutive_page_mut(page_id)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
 
             let available = self.data_per_page - self.position_in_page;
             let to_write = (buf.len() - total_written).min(available);
@@ -211,7 +211,7 @@ impl<'txn> IoWrite for OverflowWriter<'txn> {
         // Update overflow count in first page
         if let Some(first_id) = self.first_page_id {
             let page = self.txn.get_consecutive_page_mut(first_id)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                .map_err(io::Error::other)?;
             page.header.overflow = self.current_pages.len() as u32;
         }
         Ok(())

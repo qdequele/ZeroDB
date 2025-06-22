@@ -413,8 +413,16 @@ impl Page {
         let header = unsafe { *node_ptr };
         
         // Validate node header
+        // For overflow nodes, we store only the page ID (8 bytes) in the node data,
+        // not the actual value size which is stored in the header
+        let value_data_size = if header.flags.contains(NodeFlags::BIGDATA) {
+            8 // Size of page ID
+        } else {
+            header.value_size()
+        };
+        
         let node_total_size = (header.ksize as usize)
-            .checked_add(header.value_size())
+            .checked_add(value_data_size)
             .and_then(|s| s.checked_add(size_of::<NodeHeader>()))
             .ok_or_else(|| Error::Corruption {
                 details: "Node size calculation overflow".into(),

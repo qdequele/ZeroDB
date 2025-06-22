@@ -283,6 +283,13 @@ pub fn read_overflow_value<'txn, M: Mode>(
     let header = unsafe { *(first_page.data.as_ptr() as *const OverflowHeader) };
 
     let total_size = header.total_size as usize;
+    // Protect against invalid/corrupt total_size
+    if total_size == 0 || total_size > 1_000_000_000 { // 1GB sanity check
+        return Err(Error::Corruption {
+            details: format!("Invalid overflow value size: {}", total_size),
+            page_id: Some(first_page_id),
+        });
+    }
     let mut result = Vec::with_capacity(total_size);
     // Account for both PageHeader and OverflowHeader
     let data_per_page = PAGE_SIZE
@@ -292,11 +299,11 @@ pub fn read_overflow_value<'txn, M: Mode>(
 
     let mut current_page_id = first_page_id;
     let mut bytes_read = 0;
-    let mut pages_read = 0;
+    let mut _pages_read = 0;
 
     loop {
         // Track pages read
-        pages_read += 1;
+        _pages_read += 1;
         let page = txn.get_page(current_page_id)?;
         let header = unsafe { *(page.data.as_ptr() as *const OverflowHeader) };
 
@@ -346,11 +353,11 @@ pub fn free_overflow_chain(
     first_page_id: PageId,
 ) -> Result<()> {
     let mut current_page_id = first_page_id;
-    let mut pages_freed = 0;
+    let mut _pages_freed = 0;
 
     loop {
         // Track pages freed
-        pages_freed += 1;
+        _pages_freed += 1;
         let page = txn.get_page(current_page_id)?;
 
         // Check it's an overflow page
@@ -387,11 +394,11 @@ pub fn copy_overflow_chain(
     let mut old_page_id = old_first_page_id;
     let mut new_first_page_id = None;
     let mut prev_new_page_id = None;
-    let mut pages_copied = 0;
+    let mut _pages_copied = 0;
 
     loop {
         // Track pages copied
-        pages_copied += 1;
+        _pages_copied += 1;
         // Get the old page and copy necessary data
         let (
             old_flags,
@@ -494,6 +501,6 @@ mod tests {
         assert!(!needs_overflow(10, 100));
         assert!(!needs_overflow(100, 500));
         assert!(needs_overflow(100, 2000));
-        assert!(needs_overflow(500, 1500));
+        assert!(!needs_overflow(500, 1500)); // 2032 bytes is NOT > 2048
     }
 }

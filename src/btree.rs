@@ -619,10 +619,12 @@ impl<C: Comparator> BTree<C> {
 
                     if let Some(overflow_id) = node.overflow_page()? {
                         // Read from overflow pages using LMDB-style
+                        let overflow_page = txn.get_page(overflow_id)?;
+                        let overflow_count = overflow_page.header.overflow;
                         let value_size = node.header.value_size();
                         (
-                            Some(crate::overflow::read_overflow_value_lmdb(txn, overflow_id, None, Some(value_size))?),
-                            Some(overflow_id),
+                            Some(crate::overflow::read_overflow_value_lmdb(txn, overflow_id, Some(overflow_count), Some(value_size))?),
+                            Some((overflow_id, overflow_count)),
                         )
                     } else {
                         (node.value().ok().map(|v| v.into_owned()), None)
@@ -637,12 +639,7 @@ impl<C: Comparator> BTree<C> {
                 }
 
                 // Free overflow pages if any (LMDB-style)
-                if let Some(overflow_id) = overflow_page_to_free {
-                    // Get overflow count from the first overflow page
-                    let overflow_count = {
-                        let page = txn.get_page(overflow_id)?;
-                        page.header.overflow
-                    };
+                if let Some((overflow_id, overflow_count)) = overflow_page_to_free {
                     crate::overflow::free_overflow_chain_lmdb(txn, overflow_id, overflow_count)?;
                 }
 
@@ -1024,9 +1021,12 @@ impl<C: Comparator> BTree<C> {
 
                     // Handle overflow values
                     if let Some(overflow_id) = node.overflow_page()? {
-                        // Read value from overflow pages
-                        let value = crate::overflow::read_overflow_value(txn, overflow_id)?;
-                        (value, Some(overflow_id))
+                        // Read value from overflow pages - get overflow count from page
+                        let overflow_page = txn.get_page(overflow_id)?;
+                        let overflow_count = overflow_page.header.overflow;
+                        let value_size = node.header.value_size();
+                        let value = crate::overflow::read_overflow_value_lmdb(txn, overflow_id, Some(overflow_count), Some(value_size))?;
+                        (value, Some((overflow_id, overflow_count)))
                     } else {
                         // Regular value
                         (node.value()?.into_owned(), None)
@@ -1041,12 +1041,7 @@ impl<C: Comparator> BTree<C> {
                 };
 
                 // Free overflow pages if any (LMDB-style)
-                if let Some(overflow_id) = overflow_page_to_free {
-                    // Get overflow count from the first overflow page
-                    let overflow_count = {
-                        let page = txn.get_page(overflow_id)?;
-                        page.header.overflow
-                    };
+                if let Some((overflow_id, overflow_count)) = overflow_page_to_free {
                     crate::overflow::free_overflow_chain_lmdb(txn, overflow_id, overflow_count)?;
                 }
 
@@ -1867,9 +1862,13 @@ impl<C: Comparator> BTree<C> {
                     let node = page.node(index)?;
 
                     if let Some(overflow_id) = node.overflow_page()? {
+                        // Read value from overflow pages - get overflow count from page
+                        let overflow_page = txn.get_page(overflow_id)?;
+                        let overflow_count = overflow_page.header.overflow;
+                        let value_size = node.header.value_size();
                         (
-                            Some(crate::overflow::read_overflow_value(txn, overflow_id)?),
-                            Some(overflow_id),
+                            Some(crate::overflow::read_overflow_value_lmdb(txn, overflow_id, Some(overflow_count), Some(value_size))?),
+                            Some((overflow_id, overflow_count)),
                         )
                     } else {
                         (node.value().ok().map(|v| v.into_owned()), None)
