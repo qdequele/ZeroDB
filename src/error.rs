@@ -30,12 +30,50 @@ pub enum Error {
     KeyNotFound,
 
     /// Database is full
-    #[error("Database full: current size is {current_size} bytes, max is {max_size} bytes")]
+    #[error("Database full: current size is {current_size} bytes, requested {requested_size} bytes, max is {max_size} bytes")]
     DatabaseFull {
         /// Current database size
         current_size: u64,
+        /// Requested new size
+        requested_size: u64,
         /// Maximum allowed size
         max_size: u64,
+    },
+
+    /// Key too large
+    #[error("Key too large: {size} bytes, max is {max_size} bytes")]
+    KeyTooLarge {
+        /// Size of the key
+        size: usize,
+        /// Maximum allowed size
+        max_size: usize,
+    },
+
+    /// Value too large
+    #[error("Value too large: {size} bytes, max is {max_size} bytes")]
+    ValueTooLarge {
+        /// Size of the value
+        size: usize,
+        /// Maximum allowed size
+        max_size: usize,
+    },
+
+    /// Page out of bounds
+    #[error("Page ID {page_id} out of bounds, max is {max_pages}")]
+    PageOutOfBounds {
+        /// The out-of-bounds page ID
+        page_id: PageId,
+        /// Maximum allowed pages
+        max_pages: u64,
+    },
+
+    /// Integer overflow
+    #[error("Integer overflow in {operation}: {values}")]
+    IntegerOverflow {
+        /// Operation that overflowed
+        operation: String,
+        /// Values that caused overflow
+        values: String,
     },
 
     /// Invalid operation attempted
@@ -229,7 +267,7 @@ impl Error {
             -30788 => Error::TxnFull { size: 0 },                   // MDB_TXN_FULL
             -30787 => Error::Custom("cursor stack too deep".into()), // MDB_CURSOR_FULL
             -30786 => Error::Custom("page has no more space".into()), // MDB_PAGE_FULL
-            -30785 => Error::DatabaseFull { current_size: 0, max_size: 0 }, // MDB_MAP_RESIZED
+            -30785 => Error::DatabaseFull { current_size: 0, requested_size: 0, max_size: 0 }, // MDB_MAP_RESIZED
             -30784 => Error::InvalidOperation("incompatible operation"), // MDB_INCOMPATIBLE
             -30783 => Error::BadTransaction,                        // MDB_BAD_RSLOT
             -30782 => Error::BadTransaction,                        // MDB_BAD_TXN

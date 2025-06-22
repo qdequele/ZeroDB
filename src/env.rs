@@ -148,6 +148,12 @@ pub(crate) struct EnvInner {
     pub(crate) numa_allocator: Option<Arc<crate::numa::NumaPageAllocator>>,
     /// Maximum number of pages per transaction
     pub(crate) max_txn_pages: usize,
+    /// Maximum key size in bytes
+    pub(crate) max_key_size: usize,
+    /// Maximum value size in bytes (for inline storage)
+    pub(crate) max_value_size: usize,
+    /// Maximum database size in bytes
+    pub(crate) max_database_size: Option<usize>,
 }
 
 // Safety: EnvInner is Send/Sync because IoBackend is Send/Sync
@@ -224,6 +230,67 @@ impl EnvInner {
             Ok(META_PAGE_1)
         }
     }
+
+    /// Validate key size against configured maximum
+    pub(crate) fn validate_key_size(&self, key_size: usize) -> Result<()> {
+        if key_size > self.max_key_size {
+            return Err(Error::KeyTooLarge {
+                size: key_size,
+                max_size: self.max_key_size,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate value size against configured maximum
+    pub(crate) fn validate_value_size(&self, value_size: usize) -> Result<()> {
+        if value_size > self.max_value_size {
+            return Err(Error::ValueTooLarge {
+                size: value_size,
+                max_size: self.max_value_size,
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate page ID is within allocated range
+    pub(crate) fn validate_page_id(&self, page_id: PageId) -> Result<()> {
+        let max_pages = self.io.size_in_pages();
+        
+        if page_id.0 >= max_pages {
+            return Err(Error::PageOutOfBounds {
+                page_id,
+                max_pages,
+            });
+        }
+        Ok(())
+    }
+
+    /// Check if adding new pages would exceed database size limit
+    pub(crate) fn check_database_size_limit(&self, pages_to_add: u64) -> Result<()> {
+        if let Some(max_size) = self.max_database_size {
+            let current_pages = self.io.size_in_pages();
+            let current_size = current_pages * PAGE_SIZE as u64;
+            let new_size = current_size + (pages_to_add * PAGE_SIZE as u64);
+            
+            if new_size > max_size as u64 {
+                return Err(Error::DatabaseFull {
+                    current_size,
+                    requested_size: new_size,
+                    max_size: max_size as u64,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Check for integer overflow in size calculations
+    pub(crate) fn check_size_overflow(&self, size1: usize, size2: usize) -> Result<usize> {
+        size1.checked_add(size2).ok_or_else(|| Error::IntegerOverflow {
+            operation: "size addition".to_string(),
+            values: format!("{} + {}", size1, size2),
+        })
+    }
 }
 
 /// Database environment
@@ -243,6 +310,9 @@ pub struct EnvBuilder {
     use_segregated_freelist: bool,
     use_numa: bool,
     max_txn_pages: usize,
+    max_key_size: usize,
+    max_value_size: usize,
+    max_database_size: Option<usize>,
 }
 
 impl EnvBuilder {
@@ -258,6 +328,9 @@ impl EnvBuilder {
             use_segregated_freelist: false,
             use_numa: false,
             max_txn_pages: 10_000, // Default: 10,000 pages per transaction
+            max_key_size: crate::DEFAULT_MAX_KEY_SIZE,
+            max_value_size: crate::page::MAX_VALUE_SIZE,
+            max_database_size: None, // No limit by default
         }
     }
 
@@ -306,6 +379,24 @@ impl EnvBuilder {
     /// Set the maximum number of pages per transaction
     pub fn max_txn_pages(mut self, pages: usize) -> Self {
         self.max_txn_pages = pages;
+        self
+    }
+
+    /// Set the maximum key size in bytes
+    pub fn max_key_size(mut self, size: usize) -> Self {
+        self.max_key_size = size;
+        self
+    }
+
+    /// Set the maximum value size in bytes (for inline storage)
+    pub fn max_value_size(mut self, size: usize) -> Self {
+        self.max_value_size = size;
+        self
+    }
+
+    /// Set the maximum database size in bytes
+    pub fn max_database_size(mut self, size: usize) -> Self {
+        self.max_database_size = Some(size);
         self
     }
 
@@ -387,6 +478,9 @@ impl EnvBuilder {
                 use_segregated_freelist: self.use_segregated_freelist,
                 numa_allocator: None, // Will be initialized later if needed
                 max_txn_pages: self.max_txn_pages,
+                max_key_size: self.max_key_size,
+                max_value_size: self.max_value_size,
+                max_database_size: self.max_database_size,
             });
 
             meta_info = inner.meta()?;
@@ -427,6 +521,9 @@ impl EnvBuilder {
                 None
             },
             max_txn_pages: self.max_txn_pages,
+            max_key_size: self.max_key_size,
+            max_value_size: self.max_value_size,
+            max_database_size: self.max_database_size,
         });
 
         // Initialize main database entry

@@ -261,6 +261,17 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
             return Err(Error::InvalidPageId(page_id));
         }
         
+        // Special handling for meta pages (0 and 1)
+        if page_id.0 <= 1 {
+            // Meta pages should always exist, but double-check
+            if num_pages < 2 {
+                return Err(Error::Corruption {
+                    details: "Database file too small to contain meta pages".to_string(),
+                    page_id: Some(page_id),
+                });
+            }
+        }
+        
         // Check dirty pages first if write transaction
         if M::IS_WRITE {
             if let ModeData::Write { ref dirty, .. } = self.mode_data {
@@ -406,6 +417,14 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
                         // Allocate a new page for the free database root
                         let page_id = PageId(next_pgno.0);
                         next_pgno.0 += 1;
+                        
+                        // Ensure we're not allocating beyond reasonable limits
+                        const MAX_PAGE_ID: u64 = 1 << 48; // 256TB with 4KB pages
+                        if page_id.0 >= MAX_PAGE_ID {
+                            return Err(Error::Custom(
+                                format!("Page ID {} exceeds maximum allowed value", page_id.0).into()
+                            ));
+                        }
 
                         let page = Page::new(page_id, PageFlags::LEAF | PageFlags::DIRTY);
                         dirty.mark_dirty(page_id, page);
@@ -429,6 +448,11 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
                             let root_page = if let Some(page) = dirty.pages.get_mut(&current_root) {
                                 page
                             } else {
+                                // Validate page ID before reading
+                                let num_pages = inner.io.size_in_pages();
+                                if current_root.0 >= num_pages {
+                                    return Err(Error::InvalidPageId(current_root));
+                                }
                                 // Need to make the page dirty first
                                 let page = inner.io.read_page(current_root)?;
                                 // Validate checksum if enabled
@@ -612,6 +636,13 @@ impl<'env> Transaction<'env, Write> {
     /// Get a mutable page with Copy-on-Write semantics
     /// Returns the page ID (which may be new) and a mutable reference to the page
     pub fn get_page_cow(&mut self, page_id: PageId) -> Result<(PageId, &mut Page)> {
+        // Validate page ID bounds first
+        let inner = self.data.env.inner();
+        let num_pages = inner.io.size_in_pages();
+        if page_id.0 >= num_pages {
+            return Err(Error::InvalidPageId(page_id));
+        }
+        
         // Check if already dirty in this transaction
         if let ModeData::Write { ref dirty, .. } = self.mode_data {
             if dirty.pages.contains_key(&page_id) {
@@ -622,7 +653,6 @@ impl<'env> Transaction<'env, Write> {
         }
 
         // Page is not dirty - need to copy it (Copy-on-Write)
-        let inner = self.data.env.inner();
         let original_page = inner.io.read_page(page_id)?;
         
         // Validate checksum if enabled
@@ -720,6 +750,13 @@ impl<'env> Transaction<'env, Write> {
 
     /// Get a mutable page (for backward compatibility - uses COW internally)
     pub fn get_page_mut(&mut self, page_id: PageId) -> Result<&mut Page> {
+        // Validate page ID bounds first
+        let inner = self.data.env.inner();
+        let num_pages = inner.io.size_in_pages();
+        if page_id.0 >= num_pages {
+            return Err(Error::InvalidPageId(page_id));
+        }
+        
         // For now, keep the old behavior for compatibility
         // TODO: Update all callers to handle the new page ID from COW
         // First check if already dirty
@@ -736,7 +773,6 @@ impl<'env> Transaction<'env, Write> {
         }
 
         // Load and copy page
-        let inner = self.data.env.inner();
         let mut page = inner.io.read_page(page_id)?;
         
         // Validate checksum if enabled
@@ -815,6 +851,17 @@ impl<'env> Transaction<'env, Write> {
 
     /// Free a page
     pub fn free_page(&mut self, page_id: PageId) -> Result<()> {
+        // Validate page ID
+        if page_id.0 <= 1 {
+            return Err(Error::Custom("Cannot free meta pages (0 or 1)".into()));
+        }
+        
+        let inner = self.data.env.inner();
+        let num_pages = inner.io.size_in_pages();
+        if page_id.0 >= num_pages {
+            return Err(Error::InvalidPageId(page_id));
+        }
+        
         if let ModeData::Write { ref mut freelist, ref mut segregated_freelist, .. } =
             self.mode_data
         {
@@ -917,6 +964,26 @@ impl<'env> Transaction<'env, Write> {
     pub fn free_pages(&mut self, start_page_id: PageId, count: usize) -> Result<()> {
         if count == 0 {
             return Ok(());
+        }
+        
+        // Validate start page ID
+        if start_page_id.0 <= 1 {
+            return Err(Error::Custom("Cannot free meta pages (0 or 1)".into()));
+        }
+        
+        let inner = self.data.env.inner();
+        let num_pages = inner.io.size_in_pages();
+        
+        // Validate start and end pages
+        if start_page_id.0 >= num_pages {
+            return Err(Error::InvalidPageId(start_page_id));
+        }
+        
+        let end_page_id = PageId(start_page_id.0 + count as u64 - 1);
+        if end_page_id.0 >= num_pages {
+            return Err(Error::Custom(
+                format!("Cannot free pages beyond database bounds: {} to {}", start_page_id.0, end_page_id.0).into()
+            ));
         }
 
         if let ModeData::Write { ref mut freelist, ref mut segregated_freelist, .. } =

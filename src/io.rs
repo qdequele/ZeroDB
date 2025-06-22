@@ -196,12 +196,23 @@ impl MmapBackend {
 
     /// Prefetch pages into memory
     pub fn prefetch_pages(&self, start_page: PageId, num_pages: usize) -> Result<()> {
+        // Validate start page first
+        if num_pages == 0 {
+            return Ok(());
+        }
+        
         let offset = start_page.0 as usize * self.page_size;
         let len = num_pages * self.page_size;
         let size = self.file_size.load(Ordering::Acquire) as usize;
 
-        if offset + len > size {
+        if offset >= size || offset + len > size {
             return Err(Error::InvalidPageId(start_page));
+        }
+        
+        // Also validate end page
+        let end_page = PageId(start_page.0 + num_pages as u64 - 1);
+        if end_page.0 >= self.size_in_pages() {
+            return Err(Error::InvalidPageId(end_page));
         }
 
         #[cfg(unix)]
