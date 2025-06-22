@@ -5,8 +5,9 @@ use crate::page::{Page, PageHeader, PAGE_SIZE};
 use memmap2::{MmapMut, MmapOptions};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
+use std::sync::atomic::fence;
 
 /// Memory access advice for madvise
 #[derive(Debug, Clone, Copy)]
@@ -58,8 +59,8 @@ pub trait IoBackend: Send + Sync {
 pub struct MmapBackend {
     /// The underlying file
     file: File,
-    /// Memory map (protected by mutex for resizing)
-    pub(crate) mmap: Arc<Mutex<MmapMut>>,
+    /// Memory map (protected by RwLock for concurrent reads)
+    pub(crate) mmap: Arc<RwLock<MmapMut>>,
     /// Current file size in bytes
     pub(crate) file_size: AtomicU64,
     /// Page size (usually 4KB)
@@ -67,12 +68,49 @@ pub struct MmapBackend {
     /// File path for reopening on resize
     #[allow(dead_code)]
     path: std::path::PathBuf,
+    /// Generation counter for detecting mmap changes
+    generation: AtomicUsize,
 }
 
 impl MmapBackend {
+    /// Get a safe page reference that holds the read lock
+    /// This prevents use-after-free by ensuring the mmap cannot be resized while the page is in use
+    pub fn get_page_safe(&self, page_id: PageId) -> Result<PageGuard> {
+        // Validate page ID
+        let offset = self.validate_page_id(page_id)?;
+        
+        // Hold the read lock for the lifetime of the page reference
+        let guard = self.read_lock()?;
+        
+        // Get the page pointer
+        let page_ptr = unsafe {
+            let base = guard.as_ptr();
+            base.add(offset) as *const Page
+        };
+        
+        // Return the guard which keeps the lock held
+        Ok(PageGuard {
+            page: unsafe { &*page_ptr },
+            _guard: guard,
+        })
+    }
+    
     /// Create a new mmap backend
     pub fn new(path: impl AsRef<Path>) -> Result<Self> {
         Self::with_options(path, 10 * 1024 * 1024) // Default 10MB
+    }
+    
+    /// Validate that a page ID is within bounds
+    #[inline]
+    fn validate_page_id(&self, page_id: PageId) -> Result<usize> {
+        let offset = page_id.0 as usize * self.page_size;
+        let size = self.file_size.load(Ordering::Acquire) as usize;
+        
+        if offset >= size || offset + self.page_size > size {
+            return Err(Error::InvalidPageId(page_id));
+        }
+        
+        Ok(offset)
     }
 
     /// Create with initial size
@@ -113,23 +151,30 @@ impl MmapBackend {
 
         Ok(Self {
             file,
-            mmap: Arc::new(Mutex::new(mmap)),
+            mmap: Arc::new(RwLock::new(mmap)),
             file_size: AtomicU64::new(file_size),
             page_size,
             path,
+            generation: AtomicUsize::new(0),
         })
     }
 
-    /// Helper function to lock the mmap mutex
-    fn lock_mmap(&self) -> Result<std::sync::MutexGuard<'_, MmapMut>> {
-        self.mmap.lock()
-            .map_err(|_| Error::Custom("MmapBackend: Mutex poisoned".into()))
+    /// Helper function to lock the mmap for reading
+    fn read_lock(&self) -> Result<std::sync::RwLockReadGuard<'_, MmapMut>> {
+        self.mmap.read()
+            .map_err(|_| Error::Custom("MmapBackend: RwLock poisoned".into()))
+    }
+    
+    /// Helper function to lock the mmap for writing
+    fn write_lock(&self) -> Result<std::sync::RwLockWriteGuard<'_, MmapMut>> {
+        self.mmap.write()
+            .map_err(|_| Error::Custom("MmapBackend: RwLock poisoned".into()))
     }
 
     /// Advise the kernel about memory access patterns
     #[cfg(unix)]
     pub fn madvise(&self, advice: MadviseAdvice) -> Result<()> {
-        let mmap = self.lock_mmap()?;
+        let mmap = self.read_lock()?;
         let ptr = mmap.as_ptr() as *mut libc::c_void;
         let len = self.file_size.load(Ordering::Acquire) as usize;
 
@@ -161,7 +206,7 @@ impl MmapBackend {
 
         #[cfg(unix)]
         {
-            let mmap = self.lock_mmap()?;
+            let mmap = self.read_lock()?;
             let ptr = unsafe { mmap.as_ptr().add(offset) } as *mut libc::c_void;
 
             // Use madvise WILLNEED to prefetch
@@ -175,21 +220,20 @@ impl MmapBackend {
         Ok(())
     }
 
-    /// Get a raw pointer to the mmap base
+    /// Get a raw pointer to the mmap base along with the current generation
     ///
     /// # Safety
-    /// The caller must ensure proper synchronization when accessing the memory
+    /// The caller must ensure the pointer is only used while the generation is unchanged
     #[inline]
-    pub(crate) unsafe fn mmap_ptr(&self) -> *const u8 {
-        // We need to get the pointer without holding the lock
-        // This is safe because the mmap base address doesn't change until grow() is called
-        // and grow() requires exclusive access
-        let mmap = self.mmap.lock().unwrap_or_else(|poisoned| {
-            // If mutex is poisoned, we still need to return a pointer
-            // This is a critical function, so we recover from poison
+    pub(crate) unsafe fn mmap_ptr_with_generation(&self) -> (*const u8, usize) {
+        let mmap = self.mmap.read().unwrap_or_else(|poisoned| {
             poisoned.into_inner()
         });
-        mmap.as_ptr()
+        let ptr = mmap.as_ptr();
+        let gen = self.generation.load(Ordering::Acquire);
+        // Ensure all reads of generation happen after getting the pointer
+        fence(Ordering::Acquire);
+        (ptr, gen)
     }
 
     /// Get a mutable slice of the memory map for a page
@@ -202,8 +246,8 @@ impl MmapBackend {
             return Err(Error::InvalidPageId(page_id));
         }
 
-        // This is safe because we have exclusive access through the mmap mutex
-        let mut mmap = self.lock_mmap()?;
+        // This is safe because we have exclusive access through the mmap write lock
+        let mut mmap = self.write_lock()?;
         let ptr = mmap.as_mut_ptr();
 
         unsafe { Ok(std::slice::from_raw_parts_mut(ptr.add(offset), self.page_size)) }
@@ -224,7 +268,7 @@ impl IoBackend for MmapBackend {
             return Err(Error::InvalidPageId(page_id));
         }
 
-        let mmap = self.lock_mmap()?;
+        let mmap = self.read_lock()?;
 
         // Create a boxed page to hold the data
         let mut page = Page::new(page_id, crate::page::PageFlags::empty());
@@ -244,6 +288,11 @@ impl IoBackend for MmapBackend {
 
     #[inline]
     unsafe fn get_page_ref<'a>(&self, page_id: PageId) -> Result<&'a Page> {
+        // WARNING: This method has a use-after-free vulnerability!
+        // The returned reference can become invalid if grow() is called.
+        // Consider using get_page_safe() instead which holds the lock.
+        //
+        // Validate page ID first
         let offset = page_id.0 as usize * self.page_size;
         let size = self.file_size.load(Ordering::Acquire) as usize;
 
@@ -251,16 +300,29 @@ impl IoBackend for MmapBackend {
             return Err(Error::InvalidPageId(page_id));
         }
 
-        // Get the base pointer without holding the lock
-        // This is safe because:
-        // 1. The mmap base address is stable until grow() is called
-        // 2. grow() requires exclusive access (write transaction)
-        // 3. Read transactions cannot call grow()
-        let base_ptr = unsafe { self.mmap_ptr() };
+        // IMPORTANT: This method is fundamentally unsafe because it returns a reference
+        // with an arbitrary lifetime that outlives the lock guard. The caller MUST ensure:
+        // 1. They hold a read transaction for the entire lifetime 'a
+        // 2. No grow() operations happen during lifetime 'a
+        // 3. The reference is not used after the transaction ends
+        
+        // Get the page pointer - we need to hold the read lock briefly
+        let mmap = self.read_lock()?;
+        let base_ptr = mmap.as_ptr();
+        
+        // Validate offset again with memory barrier
+        fence(Ordering::Acquire);
+        let current_size = self.file_size.load(Ordering::Acquire) as usize;
+        if offset + self.page_size > current_size {
+            return Err(Error::InvalidPageId(page_id));
+        }
+        
         let page_ptr = unsafe { base_ptr.add(offset) } as *const Page;
-
-        // Return a reference with the requested lifetime
-        // The caller is responsible for ensuring this lifetime is valid
+        
+        // Drop the lock before returning the reference
+        drop(mmap);
+        
+        // Return the reference - caller is responsible for safety
         Ok(unsafe { &*page_ptr })
     }
 
@@ -273,7 +335,7 @@ impl IoBackend for MmapBackend {
             return Err(Error::InvalidPageId(page_id));
         }
 
-        let mut mmap = self.lock_mmap()?;
+        let mut mmap = self.write_lock()?;
 
         // Write the entire page data
         let dst = &mut mmap[offset..offset + self.page_size];
@@ -289,7 +351,7 @@ impl IoBackend for MmapBackend {
     }
 
     fn sync(&self) -> Result<()> {
-        let mmap = self.lock_mmap()?;
+        let mmap = self.read_lock()?;
         mmap.flush().map_err(|e| Error::Io(e.to_string()))?;
         Ok(())
     }
@@ -306,11 +368,17 @@ impl IoBackend for MmapBackend {
             return Ok(());
         }
 
+        // Take exclusive write lock for the entire operation
+        let mut mmap_guard = self.write_lock()?;
+        
+        // Double-check size under lock
+        let current_size = self.file_size.load(Ordering::Acquire);
+        if new_size_bytes <= current_size {
+            return Ok(());
+        }
+
         // Grow the file
         self.file.set_len(new_size_bytes).map_err(|e| Error::Io(e.to_string()))?;
-
-        // Remap
-        let mut mmap_guard = self.lock_mmap()?;
 
         // Create new mmap
         let new_mmap = unsafe {
@@ -320,11 +388,21 @@ impl IoBackend for MmapBackend {
                 .map_err(|e| Error::Io(e.to_string()))?
         };
 
+        // Update generation counter BEFORE replacing mmap
+        // This ensures any concurrent readers will see the change
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        
+        // Memory barrier to ensure generation update is visible
+        fence(Ordering::Release);
+
         // Replace the old mmap
         *mmap_guard = new_mmap;
 
-        // Update size
+        // Update size with release ordering
         self.file_size.store(new_size_bytes, Ordering::Release);
+        
+        // Another memory barrier to ensure all changes are visible
+        fence(Ordering::Release);
 
         Ok(())
     }
@@ -333,6 +411,28 @@ impl IoBackend for MmapBackend {
 /// Zero-copy page access for reading
 pub struct PageRef<'a> {
     data: &'a [u8],
+}
+
+/// Safe page guard that ensures the page reference is valid for its lifetime
+/// This prevents use-after-free by tying the page lifetime to the mmap guard
+pub struct PageGuard<'a> {
+    page: &'a Page,
+    _guard: std::sync::RwLockReadGuard<'a, MmapMut>,
+}
+
+impl<'a> PageGuard<'a> {
+    /// Get the page reference
+    pub fn page(&self) -> &'a Page {
+        self.page
+    }
+}
+
+impl<'a> std::ops::Deref for PageGuard<'a> {
+    type Target = Page;
+    
+    fn deref(&self) -> &Self::Target {
+        self.page
+    }
 }
 
 impl<'a> PageRef<'a> {

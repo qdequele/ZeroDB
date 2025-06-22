@@ -202,6 +202,11 @@ impl Page {
             0
         };
 
+        // Validate bounds before creating slice
+        if offset > self.data.len() || offset + num_keys * 2 > self.data.len() {
+            return &[];
+        }
+        
         unsafe { slice::from_raw_parts(self.data.as_ptr().add(offset) as *const u16, num_keys) }
     }
 
@@ -216,6 +221,11 @@ impl Page {
             0
         };
 
+        // Validate bounds before creating slice
+        if offset > self.data.len() || offset + num_keys * 2 > self.data.len() {
+            return &mut [];
+        }
+        
         unsafe {
             slice::from_raw_parts_mut(self.data.as_mut_ptr().add(offset) as *mut u16, num_keys)
         }
@@ -239,10 +249,36 @@ impl Page {
             });
         }
 
-        let node_ptr =
-            unsafe { self.data.as_ptr().add(ptr as usize - PageHeader::SIZE) as *const NodeHeader };
+        // Prevent integer underflow
+        if (ptr as usize) < PageHeader::SIZE {
+            return Err(Error::Corruption {
+                details: "Node pointer underflow".into(),
+                page_id: Some(PageId(self.header.pgno)),
+            });
+        }
+        
+        let data_offset = ptr as usize - PageHeader::SIZE;
+        
+        // Ensure we have at least NodeHeader size available
+        if data_offset + size_of::<NodeHeader>() > self.data.len() {
+            return Err(Error::Corruption {
+                details: "Node extends beyond page data".into(),
+                page_id: Some(PageId(self.header.pgno)),
+            });
+        }
+        
+        let node_ptr = unsafe { self.data.as_ptr().add(data_offset) as *const NodeHeader };
+        let header = unsafe { *node_ptr };
+        
+        // Validate node header
+        if header.ksize as usize + header.value_size() + size_of::<NodeHeader>() > self.data.len() - data_offset {
+            return Err(Error::Corruption {
+                details: "Node data extends beyond page".into(),
+                page_id: Some(PageId(self.header.pgno)),
+            });
+        }
 
-        Ok(Node { header: unsafe { *node_ptr }, page: self, offset: ptr })
+        Ok(Node { header, page: self, offset: ptr })
     }
 
     /// Get a mutable node data reference by index
@@ -369,9 +405,19 @@ impl Page {
             node_header.flags.insert(NodeFlags::BIGDATA);
         }
 
+        // Validate node_offset to prevent underflow
+        if (node_offset as usize) < PageHeader::SIZE {
+            return Err(Error::Custom("Page full".into()));
+        }
+        
+        let data_offset = node_offset as usize - PageHeader::SIZE;
+        
+        // Validate we have enough space in data array
+        if data_offset + node_size > self.data.len() {
+            return Err(Error::Custom("Page full".into()));
+        }
+        
         unsafe {
-            // node_offset is the absolute offset in the page, we need to subtract PageHeader::SIZE to get offset in data array
-            let data_offset = node_offset as usize - PageHeader::SIZE;
             let node_ptr = self.data.as_mut_ptr().add(data_offset) as *mut NodeHeader;
 
             // Verify alignment
@@ -379,12 +425,20 @@ impl Page {
 
             *node_ptr = node_header;
 
-            // Write key
+            // Write key with bounds check
             let key_ptr = node_ptr.add(1) as *mut u8;
+            let key_offset = key_ptr as usize - self.data.as_ptr() as usize;
+            if key_offset + key.len() > self.data.len() {
+                return Err(Error::Custom("Page full".into()));
+            }
             ptr::copy_nonoverlapping(key.as_ptr(), key_ptr, key.len());
 
-            // Write value (or overflow page ID)
+            // Write value (or overflow page ID) with bounds check
             let val_ptr = key_ptr.add(key.len());
+            let val_offset = val_ptr as usize - self.data.as_ptr() as usize;
+            if val_offset + value.len() > self.data.len() {
+                return Err(Error::Custom("Page full".into()));
+            }
             ptr::copy_nonoverlapping(value.as_ptr(), val_ptr, value.len());
         }
 
@@ -417,12 +471,27 @@ impl Page {
             0
         };
 
+        // Validate array bounds
+        let required_size = offset + (current_count + 1) * 2;
+        if required_size > self.data.len() {
+            panic!("Pointer array extends beyond page data");
+        }
+        
         // Get pointer to the start of the pointer array
         let ptrs_ptr = unsafe { self.data.as_mut_ptr().add(offset) as *mut u16 };
 
         // Shift existing pointers if needed
         if index < current_count {
             unsafe {
+                // Validate source and destination ranges
+                let src_offset = offset + index * 2;
+                let dst_offset = offset + (index + 1) * 2;
+                let copy_size = (current_count - index) * 2;
+                
+                if src_offset + copy_size > self.data.len() || dst_offset + copy_size > self.data.len() {
+                    panic!("Pointer copy would exceed page bounds");
+                }
+                
                 let src = ptrs_ptr.add(index);
                 let dst = ptrs_ptr.add(index + 1);
                 ptr::copy(src, dst, current_count - index);
@@ -715,12 +784,20 @@ impl<'a> Node<'a> {
     /// Get the key bytes
     #[inline]
     pub fn key(&self) -> Result<&'a [u8]> {
+        // Prevent underflow
+        if (self.offset as usize) < PageHeader::SIZE {
+            return Err(Error::Corruption {
+                details: "Node offset underflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            });
+        }
+        
         let key_offset = (self.offset as usize - PageHeader::SIZE) + NodeHeader::SIZE;
         let key_len = self.header.ksize as usize;
 
         // The node data starts at self.offset and extends towards PAGE_SIZE
         // We need to ensure key_offset + key_len doesn't exceed the data array bounds
-        if key_offset + key_len > self.page.data.len() {
+        if key_offset > self.page.data.len() || key_offset + key_len > self.page.data.len() {
             return Err(Error::Corruption {
                 details: "Node key extends beyond page".into(),
                 page_id: Some(PageId(self.page.header.pgno)),
@@ -826,9 +903,26 @@ pub struct NodeDataMut<'a> {
 impl<'a> NodeDataMut<'a> {
     /// Set the value of this node
     pub fn set_value(&mut self, new_value: &[u8]) -> Result<()> {
+        // Prevent underflow
+        if (self.offset as usize) < PageHeader::SIZE {
+            return Err(Error::Corruption {
+                details: "Node offset underflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            });
+        }
+        
+        let node_data_offset = self.offset as usize - PageHeader::SIZE;
+        
+        // Validate node header is within bounds
+        if node_data_offset + size_of::<NodeHeader>() > self.page.data.len() {
+            return Err(Error::Corruption {
+                details: "Node header extends beyond page".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            });
+        }
+        
         let node_ptr = unsafe {
-            self.page.data.as_ptr().add(self.offset as usize - PageHeader::SIZE)
-                as *const NodeHeader
+            self.page.data.as_ptr().add(node_data_offset) as *const NodeHeader
         };
         let header = unsafe { *node_ptr };
 
@@ -838,14 +932,29 @@ impl<'a> NodeDataMut<'a> {
             return Err(Error::InvalidParameter("Cannot change value size without reallocation"));
         }
 
-        // Copy new value
-        let val_offset =
-            self.offset as usize - PageHeader::SIZE + NodeHeader::SIZE + header.ksize as usize;
+        // Calculate and validate value offset
+        let val_offset = node_data_offset
+            .checked_add(NodeHeader::SIZE)
+            .and_then(|o| o.checked_add(header.ksize as usize))
+            .ok_or_else(|| Error::Corruption {
+                details: "Value offset overflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            })?;
+            
+        // Validate write bounds
+        let copy_len = new_value.len().min(old_value_size);
+        if val_offset + copy_len > self.page.data.len() {
+            return Err(Error::Corruption {
+                details: "Value write would exceed page bounds".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            });
+        }
+        
         unsafe {
             std::ptr::copy_nonoverlapping(
                 new_value.as_ptr(),
                 self.page.data.as_mut_ptr().add(val_offset),
-                new_value.len().min(old_value_size),
+                copy_len,
             );
         }
 
@@ -854,18 +963,49 @@ impl<'a> NodeDataMut<'a> {
 
     /// Set this node to use an overflow page
     pub fn set_overflow(&mut self, overflow_id: PageId) -> Result<()> {
+        // Prevent underflow
+        if (self.offset as usize) < PageHeader::SIZE {
+            return Err(Error::Corruption {
+                details: "Node offset underflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            });
+        }
+        
+        let node_data_offset = self.offset as usize - PageHeader::SIZE;
+        
+        // Validate node header is within bounds
+        if node_data_offset + size_of::<NodeHeader>() > self.page.data.len() {
+            return Err(Error::Corruption {
+                details: "Node header extends beyond page".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            });
+        }
+        
         let node_ptr = unsafe {
-            self.page.data.as_mut_ptr().add(self.offset as usize - PageHeader::SIZE)
-                as *mut NodeHeader
+            self.page.data.as_mut_ptr().add(node_data_offset) as *mut NodeHeader
         };
         let header = unsafe { &mut *node_ptr };
 
         // Update flags
         header.flags.insert(NodeFlags::BIGDATA);
 
-        // Store overflow page ID as value
-        let val_offset =
-            self.offset as usize - PageHeader::SIZE + NodeHeader::SIZE + header.ksize as usize;
+        // Calculate and validate value offset
+        let val_offset = node_data_offset
+            .checked_add(NodeHeader::SIZE)
+            .and_then(|o| o.checked_add(header.ksize as usize))
+            .ok_or_else(|| Error::Corruption {
+                details: "Value offset overflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            })?;
+            
+        // Validate we can write 8 bytes for page ID
+        if val_offset + 8 > self.page.data.len() {
+            return Err(Error::Corruption {
+                details: "Overflow page ID write would exceed page bounds".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            });
+        }
+        
         let pgno_bytes = overflow_id.0.to_le_bytes();
         unsafe {
             std::ptr::copy_nonoverlapping(

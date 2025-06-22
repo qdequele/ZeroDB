@@ -254,6 +254,13 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
     /// Get a page by ID
     #[inline]
     pub fn get_page(&self, page_id: PageId) -> Result<&Page> {
+        // Validate page ID bounds first
+        let inner = self.data.env.inner();
+        let num_pages = inner.io.size_in_pages();
+        if page_id.0 >= num_pages {
+            return Err(Error::InvalidPageId(page_id));
+        }
+        
         // Check dirty pages first if write transaction
         if M::IS_WRITE {
             if let ModeData::Write { ref dirty, .. } = self.mode_data {
@@ -264,13 +271,12 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
         }
 
         // For read operations, use zero-copy access directly from mmap
-        let inner = self.data.env.inner();
-
         // SAFETY: The returned page reference is valid for the transaction lifetime
         // because:
         // 1. The environment (and thus the mmap) outlives the transaction
         // 2. The mmap base address is stable during the transaction
         // 3. Pages are immutable once written (COW semantics)
+        // 4. We validated the page ID is within bounds above
         let page = unsafe { inner.io.get_page_ref(page_id)? };
         
         // Validate checksum if enabled

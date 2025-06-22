@@ -174,6 +174,23 @@ impl EnvInner {
             }
         }
 
+        // Validate MetaPage fits in page data before casting
+        if size_of::<MetaPage>() > meta0.data.len() || size_of::<MetaPage>() > meta1.data.len() {
+            return Err(Error::Corruption {
+                details: "MetaPage size exceeds page data".into(),
+                page_id: None,
+            });
+        }
+        
+        // Validate alignment
+        if meta0.data.as_ptr() as usize % std::mem::align_of::<MetaPage>() != 0 ||
+           meta1.data.as_ptr() as usize % std::mem::align_of::<MetaPage>() != 0 {
+            return Err(Error::Corruption {
+                details: "MetaPage not properly aligned".into(),
+                page_id: None,
+            });
+        }
+        
         // Cast data area to MetaPage
         let meta0 = unsafe { &*(meta0.data.as_ptr() as *const MetaPage) };
         let meta1 = unsafe { &*(meta1.data.as_ptr() as *const MetaPage) };
