@@ -414,6 +414,9 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
 
                     // If free database doesn't exist, create it
                     if free_db_info.root.0 == 0 {
+                        // Check database size limit before allocating
+                        inner.check_database_size_limit(1)?;
+                        
                         // Allocate a new page for the free database root
                         let page_id = PageId(next_pgno.0);
                         next_pgno.0 += 1;
@@ -691,6 +694,8 @@ impl<'env> Transaction<'env, Write> {
                 free_page_id
             } else {
                 // Allocate new page from end of file
+                // Check database size limit before allocating
+                inner.check_database_size_limit(1)?;
                 let id =
                     PageId(inner.next_page_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
                 *next_pgno = PageId(id.0 + 1);
@@ -807,6 +812,10 @@ impl<'env> Transaction<'env, Write> {
                             max_txn_pages).into()
                 ));
             }
+            
+            // Check database size limit before allocating new pages
+            let inner = self.data.env.inner();
+            inner.check_database_size_limit(1)?;
             // Try to get a page from the appropriate free list
             let page_id = if let Some(seg_list) = segregated_freelist.as_mut() {
                 // Use segregated freelist if enabled
@@ -815,6 +824,8 @@ impl<'env> Transaction<'env, Write> {
                 } else {
                     // Allocate new page from end of file
                     let inner = self.data.env.inner();
+                    // Double-check database size limit when allocating from end of file
+                    inner.check_database_size_limit(1)?;
                     let id = PageId(
                         inner.next_page_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
                     );
@@ -829,6 +840,8 @@ impl<'env> Transaction<'env, Write> {
                 } else {
                     // Allocate new page from end of file
                     let inner = self.data.env.inner();
+                    // Double-check database size limit when allocating from end of file
+                    inner.check_database_size_limit(1)?;
                     let id = PageId(
                         inner.next_page_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
                     );
@@ -1019,6 +1032,9 @@ impl<'env> Transaction<'env, Write> {
                 free_page_id
             } else {
                 // Allocate new page from end of file
+                // Check database size limit before allocating
+                let inner = self.data.env.inner();
+                inner.check_database_size_limit(1)?;
                 let id = *next_pgno;
                 *next_pgno = PageId(id.0 + 1);
                 id
