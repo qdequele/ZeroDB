@@ -678,10 +678,15 @@ impl<'env> Transaction<'env, Write> {
             Vec::new()
         };
 
-        // Copy overflow chains if needed
+        // Copy overflow chains if needed (LMDB-style)
         let mut overflow_mappings = Vec::new();
         for (node_idx, old_overflow_id) in overflow_updates {
-            let new_overflow_id = crate::overflow::copy_overflow_chain(self, old_overflow_id)?;
+            // Get overflow count from the first overflow page
+            let overflow_count = {
+                let page = self.get_page(old_overflow_id)?;
+                page.header.overflow
+            };
+            let new_overflow_id = crate::overflow::copy_overflow_chain_lmdb(self, old_overflow_id, overflow_count)?;
             overflow_mappings.push((node_idx, new_overflow_id));
         }
 
@@ -891,87 +896,66 @@ impl<'env> Transaction<'env, Write> {
         }
     }
 
-    /* TODO: Fix borrow checker issues with returning multiple mutable references
     /// Allocate multiple contiguous pages (useful for overflow pages)
-    pub fn alloc_pages(&mut self, count: usize, flags: PageFlags) -> Result<Vec<(PageId, &mut Page)>> {
+    /// Returns only the first page ID since pages are consecutive
+    pub fn alloc_consecutive_pages(&mut self, count: usize, flags: PageFlags) -> Result<PageId> {
         if count == 0 {
-            return Ok(Vec::new());
+            return Err(Error::InvalidParameter("Cannot allocate 0 pages"));
         }
 
-        if let ModeData::Write { ref mut dirty, ref mut freelist, ref mut segregated_freelist, ref mut next_pgno, .. } = self.mode_data {
-            let mut pages = Vec::with_capacity(count);
-
-            // Try to allocate contiguous pages from segregated freelist
-            if let Some(seg_list) = segregated_freelist.as_mut() {
-                if count > 1 {
-                    // Try to get contiguous pages
-                    if let Some(start_page_id) = seg_list.allocate(count) {
-                        // We got contiguous pages
-                        let page_ids: Vec<PageId> = (0..count)
-                            .map(|i| PageId(start_page_id.0 + i as u64))
-                            .collect();
-
-                        // First, allocate all pages
-                        for &page_id in &page_ids {
-                            let page = Page::new(page_id, flags | PageFlags::DIRTY);
-                            dirty.mark_dirty(page_id, page);
-                            dirty.allocated.push(page_id);
-                        }
-
-                        // Then collect mutable references
-                        for &page_id in &page_ids {
-                            pages.push((page_id, get_mut_page(&mut dirty.pages, &page_id)?.as_mut()));
-                        }
-
-                        return Ok(pages);
-                    }
-                }
+        if let ModeData::Write { ref mut dirty, ref mut segregated_freelist, ref mut next_pgno, .. } = self.mode_data {
+            // Check transaction page limit
+            let max_txn_pages = self.data.env.config().max_txn_pages;
+            if dirty.allocated.len() + count > max_txn_pages {
+                return Err(Error::Custom(
+                    format!("Transaction page limit exceeded: {} pages", max_txn_pages).into()
+                ));
             }
+            
+            // Check database size limit
+            let inner = self.data.env.inner();
+            inner.check_database_size_limit(count as u64)?;
 
-            // Fall back to allocating pages one by one
-            // We need to collect page IDs first, then get references
-            let mut allocated_ids = Vec::new();
-
-            for _ in 0..count {
-                // Allocate page ID
-                let page_id = if let Some(seg_list) = segregated_freelist.as_mut() {
-                    if let Some(free_page_id) = seg_list.allocate(1) {
-                        free_page_id
-                    } else {
-                        let inner = self.data.env.inner();
-                        let id = PageId(inner.next_page_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
-                        *next_pgno = PageId(id.0 + 1);
-                        id
-                    }
+            let start_page_id = if let Some(seg_list) = segregated_freelist.as_mut() {
+                // Try to get contiguous pages from segregated freelist
+                if let Some(page_id) = seg_list.allocate(count) {
+                    page_id
                 } else {
-                    if let Some(free_page_id) = freelist.alloc_page() {
-                        free_page_id
-                    } else {
-                        let inner = self.data.env.inner();
-                        let id = PageId(inner.next_page_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst));
-                        *next_pgno = PageId(id.0 + 1);
-                        id
-                    }
-                };
+                    // Allocate from end of file
+                    let id = PageId(inner.next_page_id.fetch_add(count as u64, std::sync::atomic::Ordering::SeqCst));
+                    *next_pgno = PageId(id.0 + count as u64);
+                    id
+                }
+            } else {
+                // Simple freelist doesn't support contiguous allocation efficiently
+                // Allocate from end of file for guaranteed contiguity
+                let id = PageId(inner.next_page_id.fetch_add(count as u64, std::sync::atomic::Ordering::SeqCst));
+                *next_pgno = PageId(id.0 + count as u64);
+                id
+            };
 
-                // Create and mark page as dirty
+            // Create and mark all pages as dirty
+            for i in 0..count {
+                let page_id = PageId(start_page_id.0 + i as u64);
                 let page = Page::new(page_id, flags | PageFlags::DIRTY);
                 dirty.mark_dirty(page_id, page);
                 dirty.allocated.push(page_id);
-                allocated_ids.push(page_id);
             }
 
-            // Now collect the mutable references
-            for page_id in allocated_ids {
-                pages.push((page_id, get_mut_page(&mut dirty.pages, &page_id)?.as_mut()));
-            }
-
-            Ok(pages)
+            Ok(start_page_id)
         } else {
             unreachable!("Write transaction must have write mode data");
         }
     }
-    */
+    
+    /// Get a mutable reference to a consecutively allocated page
+    pub fn get_consecutive_page_mut(&mut self, page_id: PageId) -> Result<&mut Page> {
+        if let ModeData::Write { ref mut dirty, .. } = self.mode_data {
+            Ok(get_mut_page(&mut dirty.pages, &page_id)?)
+        } else {
+            unreachable!("Write transaction must have write mode data");
+        }
+    }
 
     /// Free multiple contiguous pages
     pub fn free_pages(&mut self, start_page_id: PageId, count: usize) -> Result<()> {

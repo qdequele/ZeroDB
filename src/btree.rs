@@ -397,8 +397,10 @@ impl<C: Comparator> BTree<C> {
                         // Found in leaf page
                         // Check if value is in overflow pages
                         if let Some(overflow_id) = node.overflow_page()? {
-                            // Read from overflow pages
-                            let value = crate::overflow::read_overflow_value(txn, overflow_id)?;
+                            // Read from overflow pages using LMDB-style
+                            // Get the actual value size from the node header
+                            let value_size = node.header.value_size();
+                            let value = crate::overflow::read_overflow_value_lmdb(txn, overflow_id, None, Some(value_size))?;
                             return Ok(Some(Cow::Owned(value)));
                         } else {
                             // Regular value
@@ -450,8 +452,8 @@ impl<C: Comparator> BTree<C> {
                             let _ = node_data;
                             let _ = page;
 
-                            let overflow_id =
-                                crate::overflow::write_overflow_value(txn, new_value)?;
+                            let (overflow_id, _) =
+                                crate::overflow::write_overflow_value_lmdb(txn, new_value)?;
 
                             // Re-acquire the page and node
                             let page = txn.get_page_mut(current_page_id)?;
@@ -616,9 +618,10 @@ impl<C: Comparator> BTree<C> {
                     let node = page.node(index)?;
 
                     if let Some(overflow_id) = node.overflow_page()? {
-                        // Read from overflow pages
+                        // Read from overflow pages using LMDB-style
+                        let value_size = node.header.value_size();
                         (
-                            Some(crate::overflow::read_overflow_value(txn, overflow_id)?),
+                            Some(crate::overflow::read_overflow_value_lmdb(txn, overflow_id, None, Some(value_size))?),
                             Some(overflow_id),
                         )
                     } else {
@@ -633,9 +636,14 @@ impl<C: Comparator> BTree<C> {
                     page.remove_node(index)?;
                 }
 
-                // Free overflow pages if any
+                // Free overflow pages if any (LMDB-style)
                 if let Some(overflow_id) = overflow_page_to_free {
-                    crate::overflow::free_overflow_chain(txn, overflow_id)?;
+                    // Get overflow count from the first overflow page
+                    let overflow_count = {
+                        let page = txn.get_page(overflow_id)?;
+                        page.header.overflow
+                    };
+                    crate::overflow::free_overflow_chain_lmdb(txn, overflow_id, overflow_count)?;
                 }
 
                 // Now insert the new value
@@ -670,20 +678,20 @@ impl<C: Comparator> BTree<C> {
                 if needs_split {
                     // Page should be split pre-emptively
                     if needs_overflow {
-                        let overflow_id = crate::overflow::write_overflow_value(txn, value)?;
-                        Self::split_leaf_page_with_overflow(txn, page_id, key, overflow_id)
+                        let (overflow_id, _) = crate::overflow::write_overflow_value_lmdb(txn, value)?;
+                        Self::split_leaf_page_with_overflow(txn, page_id, key, overflow_id, value.len())
                     } else {
                         Self::split_leaf_page(txn, page_id, key, value)
                     }
                 } else if needs_overflow {
                     // Page has room, insert with overflow
-                    let overflow_id = crate::overflow::write_overflow_value(txn, value)?;
+                    let (overflow_id, _) = crate::overflow::write_overflow_value_lmdb(txn, value)?;
                     let page = txn.get_page_mut(page_id)?;
-                    match page.add_node_sorted_overflow(key, overflow_id) {
+                    match page.add_node_sorted_overflow_with_size(key, overflow_id, value.len()) {
                         Ok(_) => Ok(InsertResult::Inserted),
                         Err(Error::Custom(msg)) if msg.contains("Page full") => {
                             // Fallback: page became full despite pre-check
-                            Self::split_leaf_page_with_overflow(txn, page_id, key, overflow_id)
+                            Self::split_leaf_page_with_overflow(txn, page_id, key, overflow_id, value.len())
                         }
                         Err(e) => Err(e),
                     }
@@ -882,6 +890,7 @@ impl<C: Comparator> BTree<C> {
         page_id: PageId,
         new_key: &[u8],
         overflow_page_id: PageId,
+        value_size: usize,
     ) -> Result<InsertResult> {
         // Get the page to split
         let page = txn.get_page(page_id)?;
@@ -905,11 +914,11 @@ impl<C: Comparator> BTree<C> {
         // Determine which page to insert the new key into
         if new_key < median_key.as_slice() {
             // Insert into left page
-            left_page.add_node_sorted_overflow(new_key, overflow_page_id)?;
+            left_page.add_node_sorted_overflow_with_size(new_key, overflow_page_id, value_size)?;
         } else {
             // Insert into right page
             let right_page = txn.get_page_mut(right_page_id)?;
-            right_page.add_node_sorted_overflow(new_key, overflow_page_id)?;
+            right_page.add_node_sorted_overflow_with_size(new_key, overflow_page_id, value_size)?;
         }
 
         Ok(InsertResult::Split { median_key, right_page: right_page_id })
@@ -1031,9 +1040,14 @@ impl<C: Comparator> BTree<C> {
                     new_id
                 };
 
-                // Free overflow pages if any
+                // Free overflow pages if any (LMDB-style)
                 if let Some(overflow_id) = overflow_page_to_free {
-                    crate::overflow::free_overflow_chain(txn, overflow_id)?;
+                    // Get overflow count from the first overflow page
+                    let overflow_count = {
+                        let page = txn.get_page(overflow_id)?;
+                        page.header.overflow
+                    };
+                    crate::overflow::free_overflow_chain_lmdb(txn, overflow_id, overflow_count)?;
                 }
 
                 // Check if underflow occurred
@@ -1868,7 +1882,8 @@ impl<C: Comparator> BTree<C> {
                 // Check if we need overflow for new value (do this before getting COW page)
                 let needs_overflow = crate::overflow::needs_overflow(key.len(), value.len());
                 let new_overflow_id = if needs_overflow {
-                    Some(crate::overflow::write_overflow_value(txn, value)?)
+                    let (overflow_id, _) = crate::overflow::write_overflow_value_lmdb(txn, value)?;
+                    Some(overflow_id)
                 } else {
                     None
                 };
@@ -1921,8 +1936,8 @@ impl<C: Comparator> BTree<C> {
                     // Page will be full, handle split
                     let needs_overflow = crate::overflow::needs_overflow(key.len(), value.len());
                     if needs_overflow {
-                        let overflow_id = crate::overflow::write_overflow_value(txn, value)?;
-                        Self::split_leaf_page_with_overflow(txn, page_id, key, overflow_id)
+                        let (overflow_id, _) = crate::overflow::write_overflow_value_lmdb(txn, value)?;
+                        Self::split_leaf_page_with_overflow(txn, page_id, key, overflow_id, value.len())
                             .map(|result| (page_id, result))
                     } else {
                         Self::split_leaf_page(txn, page_id, key, value)
@@ -1932,7 +1947,8 @@ impl<C: Comparator> BTree<C> {
                     // Check if we need overflow (do this before getting COW page)
                     let needs_overflow = crate::overflow::needs_overflow(key.len(), value.len());
                     let overflow_id = if needs_overflow {
-                        Some(crate::overflow::write_overflow_value(txn, value)?)
+                        let (id, _) = crate::overflow::write_overflow_value_lmdb(txn, value)?;
+                        Some(id)
                     } else {
                         None
                     };
@@ -1941,7 +1957,7 @@ impl<C: Comparator> BTree<C> {
                     let (new_page_id, page) = txn.get_page_cow(page_id)?;
 
                     if let Some(overflow_id) = overflow_id {
-                        match page.add_node_sorted_overflow(key, overflow_id) {
+                        match page.add_node_sorted_overflow_with_size(key, overflow_id, value.len()) {
                             Ok(_) => Ok((new_page_id, InsertResult::Inserted)),
                             Err(e) => Err(e),
                         }

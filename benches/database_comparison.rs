@@ -27,61 +27,47 @@ fn bench_sequential_writes(c: &mut Criterion) {
         for &value_size in &[SMALL_VALUE, MEDIUM_VALUE, LARGE_VALUE] {
             let id = format!("{}_keys_{}_bytes", dataset_size, value_size);
 
-            // ZeroDB - skip large values due to overflow page limitations
-            if value_size < 1000 || dataset_size <= 100 {
-                group.bench_with_input(
-                    BenchmarkId::new("zerodb", &id),
-                    &(dataset_size, value_size),
-                    |b, &(size, val_size)| {
-                        b.iter_batched(
-                            || {
-                                let dir = TempDir::new().unwrap();
-                                let env = Arc::new(
-                                    zerodb::EnvBuilder::new()
-                                        .map_size(1024 * 1024 * 1024) // 1GB
-                                        .open(dir.path())
-                                        .unwrap(),
-                                );
-                                let db = {
-                                    let mut txn = env.write_txn().unwrap();
-                                    let db: zerodb::db::Database<Vec<u8>, Vec<u8>> =
-                                        env.create_database(&mut txn, None).unwrap();
-                                    txn.commit().unwrap();
-                                    db
-                                };
-                                (dir, env, db)
-                            },
-                            |(_dir, env, db)| {
-                                let value = vec![0u8; val_size];
+            // ZeroDB
+            group.bench_with_input(
+                BenchmarkId::new("zerodb", &id),
+                &(dataset_size, value_size),
+                |b, &(size, val_size)| {
+                    b.iter_batched(
+                        || {
+                            let dir = TempDir::new().unwrap();
+                            let env = Arc::new(
+                                zerodb::EnvBuilder::new()
+                                    .map_size(1024 * 1024 * 1024) // 1GB
+                                    .open(dir.path())
+                                    .unwrap(),
+                            );
+                            let db = {
+                                let mut txn = env.write_txn().unwrap();
+                                let db: zerodb::db::Database<Vec<u8>, Vec<u8>> =
+                                    env.create_database(&mut txn, None).unwrap();
+                                txn.commit().unwrap();
+                                db
+                            };
+                            (dir, env, db)
+                        },
+                        |(_dir, env, db)| {
+                            let value = vec![0u8; val_size];
 
-                                // Use smaller batches for larger values to avoid overflow issues
-                                let batch_size = match val_size {
-                                    0..=100 => size,            // Small values: full batch
-                                    101..=500 => size.min(500), // Medium values: max 500
-                                    _ => size.min(50), // Large values: max 50 per transaction
-                                };
-
-                                for batch_start in (0..size).step_by(batch_size) {
-                                    let mut txn = env.write_txn().unwrap();
-                                    let batch_end = (batch_start + batch_size).min(size);
-
-                                    for i in batch_start..batch_end {
-                                        let key = format!("key_{:08}", i).into_bytes();
-                                        if let Err(e) = db.put(&mut txn, key.clone(), value.clone())
-                                        {
-                                            eprintln!("ZeroDB put error at key {}: {:?}", i, e);
-                                            panic!("Failed to insert: {:?}", e);
-                                        }
-                                    }
-
-                                    txn.commit().unwrap();
+                            let mut txn = env.write_txn().unwrap();
+                            for i in 0..size {
+                                let key = format!("key_{:08}", i).into_bytes();
+                                if let Err(e) = db.put(&mut txn, key.clone(), value.clone())
+                                {
+                                    eprintln!("ZeroDB put error at key {}: {:?}", i, e);
+                                    panic!("Failed to insert: {:?}", e);
                                 }
-                            },
-                            BatchSize::SmallInput,
-                        );
-                    },
-                );
-            }
+                            }
+                            txn.commit().unwrap();
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
 
             // LMDB (heed)
             group.bench_with_input(
@@ -184,67 +170,56 @@ fn bench_random_writes(c: &mut Criterion) {
     let mut group = c.benchmark_group("random_writes");
     group.sample_size(10);
 
-    // Limited dataset sizes for ZeroDB due to PageFull issue
-    // Updated: Can now handle more entries with improved page capacity management
-    let zerodb_limit = 50;
-
     for &value_size in &[SMALL_VALUE, MEDIUM_VALUE] {
-        // Small batch for all databases
-        let id = format!("{}_keys_{}_bytes", zerodb_limit, value_size);
+        for &dataset_size in &[SMALL_DATASET, MEDIUM_DATASET] {
+            let id = format!("{}_keys_{}_bytes", dataset_size, value_size);
 
-        // ZeroDB
-        group.bench_with_input(
-            BenchmarkId::new("zerodb", &id),
-            &(zerodb_limit, value_size),
-            |b, &(size, val_size)| {
-                b.iter_batched(
-                    || {
-                        let dir = TempDir::new().unwrap();
-                        let env = Arc::new(
-                            zerodb::EnvBuilder::new()
-                                .map_size(1024 * 1024 * 1024)
-                                .open(dir.path())
-                                .unwrap(),
-                        );
-                        let db = {
+            // ZeroDB
+            group.bench_with_input(
+                BenchmarkId::new("zerodb", &id),
+                &(dataset_size, value_size),
+                |b, &(size, val_size)| {
+                    b.iter_batched(
+                        || {
+                            let dir = TempDir::new().unwrap();
+                            let env = Arc::new(
+                                zerodb::EnvBuilder::new()
+                                    .map_size(1024 * 1024 * 1024)
+                                    .open(dir.path())
+                                    .unwrap(),
+                            );
+                            let db = {
+                                let mut txn = env.write_txn().unwrap();
+                                let db: zerodb::db::Database<Vec<u8>, Vec<u8>> =
+                                    env.create_database(&mut txn, None).unwrap();
+                                txn.commit().unwrap();
+                                db
+                            };
+
+                            let mut rng = StdRng::seed_from_u64(42);
+                            let keys: Vec<Vec<u8>> = (0..size)
+                                .map(|_| {
+                                    let key = rng.gen::<u64>();
+                                    format!("key_{:016}", key).into_bytes()
+                                })
+                                .collect();
+
+                            (dir, env, db, keys)
+                        },
+                        |(_dir, env, db, keys)| {
+                            let value = vec![0u8; val_size];
+
+                            // Process all keys in a single transaction like other databases
                             let mut txn = env.write_txn().unwrap();
-                            let db: zerodb::db::Database<Vec<u8>, Vec<u8>> =
-                                env.create_database(&mut txn, None).unwrap();
-                            txn.commit().unwrap();
-                            db
-                        };
-
-                        let mut rng = StdRng::seed_from_u64(42);
-                        let keys: Vec<Vec<u8>> = (0..size)
-                            .map(|_| {
-                                let key = rng.gen::<u64>();
-                                format!("key_{:016}", key).into_bytes()
-                            })
-                            .collect();
-
-                        (dir, env, db, keys)
-                    },
-                    |(_dir, env, db, keys)| {
-                        let value = vec![0u8; val_size];
-
-                        // Process in small batches to avoid page full errors
-                        // With improved capacity management, we can use larger chunks
-                        for chunk in keys.chunks(50) {
-                            let mut txn = env.write_txn().unwrap();
-                            for key in chunk {
+                            for key in keys {
                                 db.put(&mut txn, key.clone(), value.clone()).unwrap();
                             }
                             txn.commit().unwrap();
-                        }
-                    },
-                    BatchSize::SmallInput,
-                );
-            },
-        );
-
-        // Other databases with larger datasets
-        for &dataset_size in &[SMALL_DATASET, MEDIUM_DATASET] {
-            let id = format!("{}_keys_{}_bytes", dataset_size, value_size);
+                        },
+                        BatchSize::SmallInput,
+                    );
+                },
+            );
 
             // LMDB
             group.bench_with_input(
@@ -804,9 +779,9 @@ fn bench_mixed_workload(c: &mut Criterion) {
             // 10 batches of operations
             for _ in 0..10 {
                 if rng.gen_bool(0.2) {
-                    // Write batch (limited to 20 for ZeroDB)
+                    // Write batch
                     let mut txn = env.write_txn().unwrap();
-                    for _ in 0..20 {
+                    for _ in 0..100 {
                         let key = format!("key_{:08}", rng.gen_range(0..dataset_size)).into_bytes();
                         let value = (0..SMALL_VALUE).map(|_| rng.gen::<u8>()).collect::<Vec<u8>>();
                         db.put(&mut txn, key, value).unwrap();

@@ -10,12 +10,12 @@ use crate::txn::{mode::Mode, Transaction};
 
 /// Maximum value size that fits in a regular page
 /// We need space for: NodeHeader (8 bytes) + key + value + page header + pointers
-/// Conservative estimate: PAGE_SIZE / 4
-pub const MAX_INLINE_VALUE_SIZE: usize = PAGE_SIZE / 4;
+/// Using LMDB's approach: PAGE_SIZE / 2 for better utilization
+pub const MAX_INLINE_VALUE_SIZE: usize = PAGE_SIZE / 2;
 
 /// Maximum number of overflow pages allowed in a chain
-/// This prevents resource exhaustion from malicious inputs
-pub const MAX_OVERFLOW_PAGES: usize = 1000;
+/// No artificial limit - supports values up to available memory/disk
+pub const MAX_OVERFLOW_PAGES: usize = usize::MAX;
 
 /// Overflow page header
 #[repr(C)]
@@ -32,6 +32,167 @@ impl OverflowHeader {
     pub const SIZE: usize = std::mem::size_of::<Self>();
 }
 
+/// Write a large value to overflow pages (LMDB-style with consecutive pages)
+pub fn write_overflow_value_lmdb<'txn>(
+    txn: &mut Transaction<'txn, crate::txn::Write>,
+    value: &[u8],
+) -> Result<(PageId, u32)> {
+    // Calculate pages needed (raw data directly after page header)
+    let data_per_page = PAGE_SIZE - crate::page::PageHeader::SIZE;
+    let num_pages = value.len().div_ceil(data_per_page);
+    
+    if num_pages == 0 {
+        return Err(Error::InvalidParameter("Empty value for overflow"));
+    }
+    
+    // Allocate consecutive pages
+    let first_page_id = txn.alloc_consecutive_pages(num_pages, PageFlags::OVERFLOW)?;
+    
+    // Write data directly to pages
+    let mut offset = 0;
+    for i in 0..num_pages {
+        let page_id = PageId(first_page_id.0 + i as u64);
+        let page = txn.get_consecutive_page_mut(page_id)?;
+        
+        // First page stores total overflow count
+        if i == 0 {
+            page.header.overflow = num_pages as u32;
+        } else {
+            // Continuation pages have overflow count of 1 (LMDB compatibility)
+            page.header.overflow = 1;
+        }
+        
+        // Calculate how much data goes in this page
+        let remaining = value.len() - offset;
+        let chunk_size = remaining.min(data_per_page);
+        
+        // Copy raw data directly (no header)
+        page.data[..chunk_size].copy_from_slice(&value[offset..offset + chunk_size]);
+        
+        offset += chunk_size;
+    }
+    
+    Ok((first_page_id, num_pages as u32))
+}
+
+/// Read a large value from overflow pages (LMDB-style)
+pub fn read_overflow_value_lmdb<'txn, M: Mode>(
+    txn: &'txn Transaction<'txn, M>,
+    first_page_id: PageId,
+    overflow_count: Option<u32>,
+    value_size: Option<usize>,
+) -> Result<Vec<u8>> {
+    let first_page = txn.get_page(first_page_id)?;
+    
+    // Check it's an overflow page
+    if !first_page.header.flags.contains(PageFlags::OVERFLOW) {
+        return Err(Error::Corruption {
+            details: "Expected overflow page".into(),
+            page_id: Some(first_page_id),
+        });
+    }
+    
+    // Get overflow count from first page if not provided
+    let num_pages = overflow_count.unwrap_or(first_page.header.overflow) as usize;
+    if num_pages == 0 {
+        return Err(Error::Corruption {
+            details: "Invalid overflow count".into(),
+            page_id: Some(first_page_id),
+        });
+    }
+    
+    let data_per_page = PAGE_SIZE - crate::page::PageHeader::SIZE;
+    let mut result = if let Some(size) = value_size {
+        Vec::with_capacity(size)
+    } else {
+        Vec::new()
+    };
+    
+    // Read data from consecutive pages
+    for i in 0..num_pages {
+        let page_id = PageId(first_page_id.0 + i as u64);
+        let page = txn.get_page(page_id)?;
+        
+        if !page.header.flags.contains(PageFlags::OVERFLOW) {
+            return Err(Error::Corruption {
+                details: format!("Expected overflow page at index {}", i),
+                page_id: Some(page_id),
+            });
+        }
+        
+        // For the last page, we need to figure out actual data size
+        let data_len = if i == num_pages - 1 && value_size.is_some() {
+            // Last page might be partial - calculate remaining bytes
+            let total_read = i * data_per_page;
+            let remaining = value_size.expect("value_size should be Some in last page case") - total_read;
+            remaining.min(data_per_page)
+        } else {
+            data_per_page
+        };
+        
+        result.extend_from_slice(&page.data[..data_len]);
+    }
+    
+    Ok(result)
+}
+
+/// Free overflow pages (LMDB-style with consecutive pages)
+pub fn free_overflow_chain_lmdb(
+    txn: &mut Transaction<'_, crate::txn::Write>,
+    first_page_id: PageId,
+    overflow_count: u32,
+) -> Result<()> {
+    if overflow_count == 0 {
+        return Err(Error::InvalidParameter("Invalid overflow count"));
+    }
+    
+    // Free all consecutive pages
+    txn.free_pages(first_page_id, overflow_count as usize)
+}
+
+/// Copy overflow pages for Copy-on-Write (LMDB-style)
+pub fn copy_overflow_chain_lmdb(
+    txn: &mut Transaction<'_, crate::txn::Write>,
+    old_first_page_id: PageId,
+    overflow_count: u32,
+) -> Result<PageId> {
+    if overflow_count == 0 {
+        return Err(Error::InvalidParameter("Invalid overflow count"));
+    }
+    
+    // Allocate new consecutive pages
+    let new_first_page_id = txn.alloc_consecutive_pages(overflow_count as usize, PageFlags::OVERFLOW)?;
+    
+    // Copy data from old pages to new pages
+    let data_per_page = PAGE_SIZE - crate::page::PageHeader::SIZE;
+    
+    for i in 0..overflow_count {
+        let old_page_id = PageId(old_first_page_id.0 + i as u64);
+        let new_page_id = PageId(new_first_page_id.0 + i as u64);
+        
+        // Read old page and copy needed data
+        let (old_flags, old_overflow, old_data) = {
+            let old_page = txn.get_page(old_page_id)?;
+            let mut data_copy = vec![0u8; data_per_page];
+            data_copy.copy_from_slice(&old_page.data[..data_per_page]);
+            (old_page.header.flags, old_page.header.overflow, data_copy)
+        };
+        
+        // Get new page and copy data
+        let new_page = txn.get_consecutive_page_mut(new_page_id)?;
+        new_page.header.flags = old_flags;
+        new_page.header.overflow = old_overflow;
+        
+        // Copy raw data
+        new_page.data[..data_per_page].copy_from_slice(&old_data);
+    }
+    
+    Ok(new_first_page_id)
+}
+
+// Keep old functions for backward compatibility but mark as deprecated
+
+#[deprecated(note = "Use write_overflow_value_lmdb for LMDB-style consecutive allocation")]
 /// Write a large value to overflow pages
 pub fn write_overflow_value<'txn>(
     txn: &mut Transaction<'txn, crate::txn::Write>,
@@ -49,12 +210,7 @@ pub fn write_overflow_value<'txn>(
         return Err(Error::InvalidParameter("Empty value for overflow"));
     }
 
-    if num_pages > MAX_OVERFLOW_PAGES {
-        return Err(Error::Custom(format!(
-            "Value too large: would require {} overflow pages (max: {})",
-            num_pages, MAX_OVERFLOW_PAGES
-        ).into()));
-    }
+    // No longer enforcing artificial limits - support up to available memory/disk
 
     let mut first_page_id = None;
     let mut prev_page_id = None;
@@ -139,14 +295,8 @@ pub fn read_overflow_value<'txn, M: Mode>(
     let mut pages_read = 0;
 
     loop {
-        // Prevent resource exhaustion from malicious overflow chains
+        // Track pages read
         pages_read += 1;
-        if pages_read > MAX_OVERFLOW_PAGES {
-            return Err(Error::Corruption {
-                details: format!("Overflow chain exceeds maximum allowed pages ({})", MAX_OVERFLOW_PAGES),
-                page_id: Some(current_page_id),
-            });
-        }
         let page = txn.get_page(current_page_id)?;
         let header = unsafe { *(page.data.as_ptr() as *const OverflowHeader) };
 
@@ -183,7 +333,7 @@ pub fn read_overflow_value<'txn, M: Mode>(
 
 /// Check if a value should be stored in overflow pages
 pub fn needs_overflow(key_size: usize, value_size: usize) -> bool {
-    // Conservative check: if key + value + headers would take more than 1/4 of page
+    // LMDB-style check: if key + value + headers would take more than 1/2 of page
     match key_size.checked_add(value_size).and_then(|s| s.checked_add(32)) {
         Some(total) => total > MAX_INLINE_VALUE_SIZE,
         None => true, // Overflow in calculation means it definitely needs overflow pages
@@ -199,14 +349,8 @@ pub fn free_overflow_chain(
     let mut pages_freed = 0;
 
     loop {
-        // Prevent resource exhaustion from malicious overflow chains
+        // Track pages freed
         pages_freed += 1;
-        if pages_freed > MAX_OVERFLOW_PAGES {
-            return Err(Error::Corruption {
-                details: format!("Overflow chain exceeds maximum allowed pages ({})", MAX_OVERFLOW_PAGES),
-                page_id: Some(current_page_id),
-            });
-        }
         let page = txn.get_page(current_page_id)?;
 
         // Check it's an overflow page
@@ -246,14 +390,8 @@ pub fn copy_overflow_chain(
     let mut pages_copied = 0;
 
     loop {
-        // Prevent resource exhaustion from malicious overflow chains
+        // Track pages copied
         pages_copied += 1;
-        if pages_copied > MAX_OVERFLOW_PAGES {
-            return Err(Error::Corruption {
-                details: format!("Overflow chain exceeds maximum allowed pages ({})", MAX_OVERFLOW_PAGES),
-                page_id: Some(old_page_id),
-            });
-        }
         // Get the old page and copy necessary data
         let (
             old_flags,
@@ -337,17 +475,17 @@ mod tests {
         let mut txn = env.write_txn().unwrap();
 
         // Write to overflow pages
-        let overflow_id = write_overflow_value(&mut txn, &large_value).unwrap();
+        let (overflow_id, _) = write_overflow_value_lmdb(&mut txn, &large_value).unwrap();
 
         // Read back
-        let read_value = read_overflow_value(&txn, overflow_id).unwrap();
+        let read_value = read_overflow_value_lmdb(&txn, overflow_id, None, Some(large_value.len())).unwrap();
         assert_eq!(read_value, large_value);
 
         txn.commit().unwrap();
 
         // Read in new transaction
         let txn = env.read_txn().unwrap();
-        let read_value = read_overflow_value(&txn, overflow_id).unwrap();
+        let read_value = read_overflow_value_lmdb(&txn, overflow_id, None, Some(large_value.len())).unwrap();
         assert_eq!(read_value, large_value);
     }
 

@@ -483,13 +483,33 @@ impl Page {
         key: &[u8],
         overflow_page_id: PageId,
     ) -> Result<usize> {
+        self.add_node_sorted_overflow_with_size_with_comparator::<C>(
+            key,
+            overflow_page_id,
+            std::mem::size_of::<u64>(), // Store size of the page ID reference
+        )
+    }
+    
+    /// Add a node with overflow page reference and explicit size
+    pub fn add_node_sorted_overflow_with_size(&mut self, key: &[u8], overflow_page_id: PageId, value_size: usize) -> Result<usize> {
+        self.add_node_sorted_overflow_with_size_with_comparator::<LexicographicComparator>(key, overflow_page_id, value_size)
+    }
+    
+    /// Add a node with overflow page reference and explicit size with a custom comparator
+    pub fn add_node_sorted_overflow_with_size_with_comparator<C: Comparator>(
+        &mut self,
+        key: &[u8],
+        overflow_page_id: PageId,
+        value_size: usize,
+    ) -> Result<usize> {
         // For overflow nodes, we store the page ID as the "value"
+        // The actual value size is stored in the node header
         let page_bytes = overflow_page_id.0.to_le_bytes();
         self.add_node_sorted_internal_with_comparator::<C>(
             key,
             &page_bytes,
             true,
-            std::mem::size_of::<u64>(),
+            value_size,
         )
     }
 

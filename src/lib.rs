@@ -34,6 +34,7 @@ pub mod nested_txn;
 pub mod node;
 pub mod numa;
 pub mod overflow;
+pub mod overflow_stream;
 pub mod page;
 pub mod page_capacity;
 pub mod reader;
@@ -42,6 +43,9 @@ pub mod simd;
 pub mod simd_advanced;
 pub mod tree_utils;
 pub mod txn;
+
+#[cfg(test)]
+mod test_overflow_debug;
 
 // Re-exports
 pub use db::{Database, DatabaseFlags, Key, Value};
