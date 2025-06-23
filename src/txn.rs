@@ -809,14 +809,7 @@ impl<'env> Transaction<'env, Write> {
             ..
         } = self.mode_data
         {
-            // Check transaction page limit to prevent runaway allocation
-            let max_txn_pages = self.data.env.config().max_txn_pages;
-            if dirty.allocated.len() >= max_txn_pages {
-                return Err(Error::Custom(
-                    format!("Transaction page limit exceeded: {} pages. Consider committing more frequently for random write workloads.", 
-                            max_txn_pages).into()
-                ));
-            }
+            // No transaction page limit - matches LMDB behavior
             
             // Check database size limit before allocating new pages
             let inner = self.data.env.inner();
@@ -904,13 +897,7 @@ impl<'env> Transaction<'env, Write> {
         }
 
         if let ModeData::Write { ref mut dirty, ref mut segregated_freelist, ref mut next_pgno, .. } = self.mode_data {
-            // Check transaction page limit
-            let max_txn_pages = self.data.env.config().max_txn_pages;
-            if dirty.allocated.len() + count > max_txn_pages {
-                return Err(Error::Custom(
-                    format!("Transaction page limit exceeded: {} pages", max_txn_pages).into()
-                ));
-            }
+            // No transaction page limit - matches LMDB behavior
             
             // Check database size limit
             let inner = self.data.env.inner();

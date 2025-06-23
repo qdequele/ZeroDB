@@ -22,8 +22,6 @@ pub(crate) struct EnvConfig {
     /// Use NUMA-aware allocation
     #[allow(dead_code)]
     pub use_numa: bool,
-    /// Maximum number of pages per transaction
-    pub max_txn_pages: usize,
 }
 
 /// Environment state marker traits
@@ -146,8 +144,6 @@ pub(crate) struct EnvInner {
     pub(crate) use_segregated_freelist: bool,
     /// NUMA-aware page allocator (if enabled)
     pub(crate) numa_allocator: Option<Arc<crate::numa::NumaPageAllocator>>,
-    /// Maximum number of pages per transaction
-    pub(crate) max_txn_pages: usize,
     /// Maximum key size in bytes
     #[allow(dead_code)]
     pub(crate) max_key_size: usize,
@@ -323,7 +319,6 @@ pub struct EnvBuilder {
     checksum_mode: crate::checksum::ChecksumMode,
     use_segregated_freelist: bool,
     use_numa: bool,
-    max_txn_pages: usize,
     max_key_size: usize,
     max_value_size: usize,
     max_database_size: Option<usize>,
@@ -341,7 +336,6 @@ impl EnvBuilder {
             checksum_mode: crate::checksum::ChecksumMode::Full,
             use_segregated_freelist: false,
             use_numa: false,
-            max_txn_pages: 10_000, // Default: 10,000 pages per transaction
             max_key_size: crate::DEFAULT_MAX_KEY_SIZE,
             max_value_size: crate::page::MAX_VALUE_SIZE,
             max_database_size: None, // No limit by default
@@ -387,12 +381,6 @@ impl EnvBuilder {
     /// Enable NUMA-aware memory allocation for multi-socket systems
     pub fn use_numa(mut self, enabled: bool) -> Self {
         self.use_numa = enabled;
-        self
-    }
-
-    /// Set the maximum number of pages per transaction
-    pub fn max_txn_pages(mut self, pages: usize) -> Self {
-        self.max_txn_pages = pages;
         self
     }
 
@@ -491,7 +479,6 @@ impl EnvBuilder {
                 page_pool: PagePool::new(128), // Keep up to 128 pages in pool
                 use_segregated_freelist: self.use_segregated_freelist,
                 numa_allocator: None, // Will be initialized later if needed
-                max_txn_pages: self.max_txn_pages,
                 max_key_size: self.max_key_size,
                 max_value_size: self.max_value_size,
                 max_database_size: self.max_database_size,
@@ -534,7 +521,6 @@ impl EnvBuilder {
             } else {
                 None
             },
-            max_txn_pages: self.max_txn_pages,
             max_key_size: self.max_key_size,
             max_value_size: self.max_value_size,
             max_database_size: self.max_database_size,
@@ -601,7 +587,6 @@ impl Environment<Open> {
         EnvConfig {
             use_segregated_freelist: inner.use_segregated_freelist,
             use_numa: inner.numa_allocator.is_some(),
-            max_txn_pages: inner.max_txn_pages,
         }
     }
 

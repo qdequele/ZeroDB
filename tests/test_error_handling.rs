@@ -133,7 +133,7 @@ fn test_transaction_size_limits() -> Result<()> {
     };
     
     // Try to allocate many pages in a single transaction
-    // This tests the MAX_TXN_PAGES limit
+    // This tests transaction size handling
     {
         let mut txn = env.write_txn()?;
         

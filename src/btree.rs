@@ -79,6 +79,7 @@ impl<C: Comparator> BTree<C> {
 
     /// Validate B+tree invariants for a given subtree
     /// Returns (min_key, max_key, depth) if valid
+    #[allow(clippy::type_complexity)]
     pub fn validate_btree_invariants<M: mode::Mode>(
         txn: &Transaction<'_, M>,
         root: PageId,
@@ -87,6 +88,7 @@ impl<C: Comparator> BTree<C> {
     }
 
     /// Recursively validate a subtree
+    #[allow(clippy::type_complexity)]
     fn validate_subtree<M: mode::Mode>(
         txn: &Transaction<'_, M>,
         page_id: PageId,

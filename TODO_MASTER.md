@@ -23,7 +23,7 @@ This document consolidates all action items from production readiness and test s
 - **Note**: Changed default to ChecksumMode::Full in env.rs line 235
 
 ### ✅ Add Transaction Page Limits
-- **Status**: COMPLETED (June 21, 2024)
+- **Status**: COMPLETED (June 21, 2024) - REMOVED (June 23, 2025)
 - **Files**: `src/txn.rs`, `src/env.rs`
 - **Tasks**:
   - [x] Make MAX_TXN_PAGES configurable via EnvConfig
@@ -31,6 +31,7 @@ This document consolidates all action items from production readiness and test s
   - [x] Default: 10,000 pages per transaction (increased from 1,024)
   - [x] Add to EnvBuilder API with max_txn_pages() method
 - **Note**: Added max_txn_pages field to EnvConfig and EnvInner, removed hardcoded constant
+- **Update (June 23, 2025)**: Removed max_txn_pages as it's no longer used in the codebase
 
 ### ✅ Fix Random Write Performance (PAGE_FULL errors)
 - **Status**: COMPLETED (June 21, 2024)

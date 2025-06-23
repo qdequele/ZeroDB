@@ -78,7 +78,7 @@ fn test_mixed_key_patterns_no_page_full() -> Result<()> {
 }
 
 #[test]
-fn test_transaction_page_limit() -> Result<()> {
+fn test_no_transaction_page_limit() -> Result<()> {
     let dir = TempDir::new()?;
     let env = Arc::new(
         EnvBuilder::new()
@@ -90,11 +90,11 @@ fn test_transaction_page_limit() -> Result<()> {
     let db: Database<Vec<u8>, Vec<u8>> = env.create_database(&mut txn, None)?;
     txn.commit()?;
     
-    // Try to allocate many pages to test the limit
+    // With no page limit, we should be able to allocate many pages
     let mut txn = env.write_txn()?;
     let mut inserted = 0;
     
-    for i in 0..2000 { // Try to exceed the 1024 page limit
+    for i in 0..2000 { // Previously would hit limit around 1024 pages
         let key = format!("key_{:08}", i.to_string()).into_bytes();
         let value = vec![i as u8; 2000]; // Large values to force page allocation
         
@@ -106,24 +106,20 @@ fn test_transaction_page_limit() -> Result<()> {
                 }
             }
             Err(e) => {
+                eprintln!("Error at insertion {}: {:?}", inserted, e);
+                // Should not fail with transaction page limit error anymore
                 let error_msg = format!("{:?}", e);
-                if error_msg.contains("Transaction page limit exceeded") {
-                    eprintln!("Hit transaction page limit after {} insertions", inserted);
-                    eprintln!("Error: {}", error_msg);
-                    assert!(inserted > 100, "Should allow reasonable number of insertions before hitting limit");
-                    break;
-                } else {
-                    eprintln!("Different error at insertion {}: {:?}", inserted, e);
-                    // Continue to see if we hit the page limit later
-                }
+                assert!(!error_msg.contains("Transaction page limit exceeded"), 
+                        "Should not hit transaction page limit");
+                return Err(e);
             }
         }
     }
     
     eprintln!("Transaction completed with {} insertions", inserted);
+    assert_eq!(inserted, 2000, "Should insert all entries without page limit");
     
-    // The transaction should either succeed completely or fail with page limit error
-    // Either way, it shouldn't fail with "Page full" errors during normal operation
+    txn.commit()?;
     
     Ok(())
 }
@@ -155,13 +151,9 @@ fn test_preemptive_splitting() -> Result<()> {
                 eprintln!("Insert failed at entry {} with error: {:?}", i, e);
                 let error_msg = format!("{:?}", e);
                 
-                // The new error should be the transaction page limit, not "Page full"
+                // Without page limits, we should only get Page full errors in extreme cases
                 if error_msg.contains("Page full") {
                     panic!("Pre-emptive splitting failed! Still getting 'Page full' errors at entry {}", i);
-                } else if error_msg.contains("Transaction page limit exceeded") {
-                    eprintln!("Hit transaction page limit as expected after {} entries", i);
-                    assert!(i > 100, "Should handle reasonable number of entries before page limit");
-                    break;
                 } else {
                     return Err(e); // Unexpected error
                 }
