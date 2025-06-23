@@ -59,6 +59,12 @@ pub struct BTree<C = LexicographicComparator> {
     _phantom: PhantomData<C>,
 }
 
+/// Helper function to get node value data (handles overflow transparently for splits/merges)
+fn get_node_value_data(_page: &Page, node: &crate::page::Node) -> Result<Vec<u8>> {
+    // Use the new raw_value_data method which handles both regular and overflow values
+    node.raw_value_data()
+}
+
 impl<C: Comparator> Default for BTree<C> {
     fn default() -> Self {
         Self::new()
@@ -329,7 +335,7 @@ impl<C: Comparator> BTree<C> {
         let mut right_nodes = Vec::new();
         for i in split_point..num_keys {
             let node = page.node(i)?;
-            right_nodes.push((node.key()?.to_vec(), node.value()?.into_owned()));
+            right_nodes.push((node.key()?.to_vec(), get_node_value_data(page, &node)?));
         }
 
         // Store original next page before allocation
@@ -1268,7 +1274,7 @@ impl<C: Comparator> BTree<C> {
             let node = left_sibling.node(last_idx)?;
             let is_leaf = left_sibling.header.flags.contains(PageFlags::LEAF);
             if is_leaf {
-                (node.key()?.to_vec(), node.value()?.into_owned(), None, true)
+                (node.key()?.to_vec(), get_node_value_data(left_sibling, &node)?, None, true)
             } else {
                 (
                     node.key()?.to_vec(),
@@ -1375,7 +1381,7 @@ impl<C: Comparator> BTree<C> {
             let node = right_sibling.node(0)?;
             let is_leaf = right_sibling.header.flags.contains(PageFlags::LEAF);
             if is_leaf {
-                (node.key()?.to_vec(), node.value()?.into_owned(), None, None, true)
+                (node.key()?.to_vec(), get_node_value_data(right_sibling, &node)?, None, None, true)
             } else {
                 // For branch pages, we need the leftmost child and the first node's child
                 let leftmost = crate::branch::BranchPage::get_leftmost_child(right_sibling)?;
@@ -1558,7 +1564,7 @@ impl<C: Comparator> BTree<C> {
                 let left_page = txn.get_page(left_id)?;
                 for i in 0..left_page.header.num_keys as usize {
                     let node = left_page.node(i)?;
-                    all_nodes.push((node.key()?.to_vec(), node.value()?.into_owned()));
+                    all_nodes.push((node.key()?.to_vec(), get_node_value_data(left_page, &node)?));
                 }
             }
 
@@ -1567,7 +1573,7 @@ impl<C: Comparator> BTree<C> {
                 let right_page = txn.get_page(right_id)?;
                 for i in 0..right_page.header.num_keys as usize {
                     let node = right_page.node(i)?;
-                    all_nodes.push((node.key()?.to_vec(), node.value()?.into_owned()));
+                    all_nodes.push((node.key()?.to_vec(), get_node_value_data(right_page, &node)?));
                 }
             }
 
@@ -1645,7 +1651,7 @@ impl<C: Comparator> BTree<C> {
             let node = leftmost.node(last_idx)?;
             let is_leaf = leftmost.header.flags.contains(PageFlags::LEAF);
             if is_leaf {
-                (node.key()?.to_vec(), node.value()?.into_owned(), None, true)
+                (node.key()?.to_vec(), get_node_value_data(leftmost, &node)?, None, true)
             } else {
                 (
                     node.key()?.to_vec(),
@@ -1798,7 +1804,7 @@ impl<C: Comparator> BTree<C> {
                 let leftmost_page = txn.get_page(leftmost_id)?;
                 for i in 0..leftmost_page.header.num_keys as usize {
                     let node = leftmost_page.node(i)?;
-                    all_nodes.push((node.key()?.to_vec(), node.value()?.into_owned()));
+                    all_nodes.push((node.key()?.to_vec(), get_node_value_data(leftmost_page, &node)?));
                 }
             }
 
@@ -1807,7 +1813,7 @@ impl<C: Comparator> BTree<C> {
                 let right_page = txn.get_page(right_id)?;
                 for i in 0..right_page.header.num_keys as usize {
                     let node = right_page.node(i)?;
-                    all_nodes.push((node.key()?.to_vec(), node.value()?.into_owned()));
+                    all_nodes.push((node.key()?.to_vec(), get_node_value_data(right_page, &node)?));
                 }
             }
 

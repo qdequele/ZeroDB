@@ -32,6 +32,7 @@ pub mod io;
 pub mod meta;
 pub mod nested_txn;
 pub mod node;
+pub mod node_utils;
 pub mod numa;
 pub mod overflow;
 pub mod overflow_stream;

@@ -746,7 +746,10 @@ impl Page {
         for i in mid_idx..self.header.num_keys as usize {
             let node = self.node(i)?;
             let key = node.key()?.to_vec();
-            let value = node.value()?.into_owned();
+            
+            // Handle both regular and overflow values properly
+            let value = node.raw_value_data()?;
+            
             right_nodes.push((key, value));
         }
 
@@ -769,7 +772,10 @@ impl Page {
         for i in split_idx..num_keys {
             let node = self.node(i)?;
             let key = node.key()?.to_vec();
-            let value = node.value()?.into_owned();
+            
+            // Handle both regular and overflow values properly
+            let value = node.raw_value_data()?;
+            
             right_nodes.push((key, value));
         }
 
@@ -1157,6 +1163,49 @@ impl<'a> Node<'a> {
         let pgno = u64::from_le_bytes(pgno_bytes);
 
         Ok(Some(PageId(pgno)))
+    }
+    
+    /// Get raw value data for node (used for page splits/merges)
+    /// For overflow nodes, returns the 8-byte page ID reference
+    /// For regular nodes, returns the actual value data
+    pub fn raw_value_data(&self) -> Result<Vec<u8>> {
+        let node_data_offset = (self.offset as usize)
+            .checked_sub(PageHeader::SIZE)
+            .ok_or_else(|| Error::Corruption {
+                details: "Node offset underflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            })?;
+        let val_offset = node_data_offset
+            .checked_add(NodeHeader::SIZE)
+            .and_then(|o| o.checked_add(self.header.ksize as usize))
+            .ok_or_else(|| Error::Corruption {
+                details: "Value offset overflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            })?;
+            
+        let val_len = if self.header.flags.contains(NodeFlags::BIGDATA) {
+            8 // Overflow nodes store 8-byte page ID
+        } else {
+            self.header.value_size()
+        };
+        
+        // Ensure value doesn't extend beyond the data array
+        let val_end = val_offset
+            .checked_add(val_len)
+            .ok_or_else(|| Error::Corruption {
+                details: "Value end calculation overflow".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            })?;
+        if val_end > self.page.data.len() {
+            return Err(Error::Corruption {
+                details: "Node value extends beyond page".into(),
+                page_id: Some(PageId(self.page.header.pgno)),
+            });
+        }
+        
+        Ok(unsafe {
+            slice::from_raw_parts(self.page.data.as_ptr().add(val_offset), val_len)
+        }.to_vec())
     }
 }
 
