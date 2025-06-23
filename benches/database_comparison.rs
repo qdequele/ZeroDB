@@ -37,7 +37,7 @@ fn bench_sequential_writes(c: &mut Criterion) {
                             let dir = TempDir::new().unwrap();
                             let env = Arc::new(
                                 zerodb::EnvBuilder::new()
-                                    .map_size(1024 * 1024 * 1024) // 1GB
+                                    .map_size(2 * 1024 * 1024 * 1024) // 2GB to handle large dataset
                                     .open(dir.path())
                                     .unwrap(),
                             );
@@ -79,7 +79,7 @@ fn bench_sequential_writes(c: &mut Criterion) {
                             let dir = TempDir::new().unwrap();
                             let env = unsafe {
                                 heed::EnvOpenOptions::new()
-                                    .map_size(1024 * 1024 * 1024)
+                                    .map_size(2 * 1024 * 1024 * 1024) // 2GB to handle large dataset
                                     .open(dir.path())
                                     .unwrap()
                             };
@@ -184,7 +184,7 @@ fn bench_random_writes(c: &mut Criterion) {
                             let dir = TempDir::new().unwrap();
                             let env = Arc::new(
                                 zerodb::EnvBuilder::new()
-                                    .map_size(1024 * 1024 * 1024)
+                                    .map_size(2 * 1024 * 1024 * 1024) // 2GB to handle large dataset
                                     .open(dir.path())
                                     .unwrap(),
                             );
@@ -231,7 +231,7 @@ fn bench_random_writes(c: &mut Criterion) {
                             let dir = TempDir::new().unwrap();
                             let env = unsafe {
                                 heed::EnvOpenOptions::new()
-                                    .map_size(1024 * 1024 * 1024)
+                                    .map_size(2 * 1024 * 1024 * 1024) // 2GB to handle large dataset
                                     .open(dir.path())
                                     .unwrap()
                             };
