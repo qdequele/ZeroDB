@@ -31,7 +31,7 @@ fn test_mixed_key_patterns_no_page_full() -> Result<()> {
     
     // Pattern 1: Sequential keys with 50-byte values
     for i in 0..100 {
-        let key = format!("size_50_key_{:04}", i.to_string()).into_bytes();
+        let key = format!("size_50_key_{:04}", i).into_bytes();
         let value = vec![42u8; 50];
         db.put(&mut txn, key, value)?;
         total_inserted += 1;
@@ -40,7 +40,7 @@ fn test_mixed_key_patterns_no_page_full() -> Result<()> {
     
     // Pattern 2: Sequential keys with 100-byte values
     for i in 0..100 {
-        let key = format!("size_100_key_{:04}", i.to_string()).into_bytes();
+        let key = format!("size_100_key_{:04}", i).into_bytes();
         let value = vec![43u8; 100];
         db.put(&mut txn, key, value)?;
         total_inserted += 1;
@@ -49,7 +49,7 @@ fn test_mixed_key_patterns_no_page_full() -> Result<()> {
     
     // Pattern 3: Random key patterns with 200-byte values
     for i in 0..50 {
-        let key = format!("random_{}_{:04}", i % 10, i.to_string()).into_bytes();
+        let key = format!("random_{}_{:04}", i % 10, i).into_bytes();
         let value = vec![44u8; 200];
         db.put(&mut txn, key, value)?;
         total_inserted += 1;
@@ -94,9 +94,9 @@ fn test_no_transaction_page_limit() -> Result<()> {
     let mut txn = env.write_txn()?;
     let mut inserted = 0;
     
-    for i in 0..2000 { // Previously would hit limit around 1024 pages
-        let key = format!("key_{:08}", i.to_string()).into_bytes();
-        let value = vec![i as u8; 2000]; // Large values to force page allocation
+    for i in 0..20000 { // Test with many more entries now that there's no limit
+        let key = format!("key_{:08}", i).into_bytes();
+        let value = vec![i as u8; 1000]; // 1KB values
         
         match db.put(&mut txn, key, value) {
             Ok(_) => {
@@ -117,7 +117,7 @@ fn test_no_transaction_page_limit() -> Result<()> {
     }
     
     eprintln!("Transaction completed with {} insertions", inserted);
-    assert_eq!(inserted, 2000, "Should insert all entries without page limit");
+    assert_eq!(inserted, 20000, "Should insert all entries without page limit");
     
     txn.commit()?;
     
@@ -138,7 +138,7 @@ fn test_preemptive_splitting() -> Result<()> {
     
     // Use large enough values to ensure pages reach the 85% threshold
     for i in 0..200 {
-        let key = format!("test_{:06}", i.to_string()).into_bytes();
+        let key = format!("test_{:06}", i).into_bytes();
         let value = vec![42u8; 300]; // Moderately large values
         
         match db.put(&mut txn, key, value) {
