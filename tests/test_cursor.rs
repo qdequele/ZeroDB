@@ -4,9 +4,8 @@ use std::sync::Arc;
 use zerodb::error::Result;
 use zerodb::{Database, EnvBuilder};
 
-fn main() -> Result<()> {
-    println!("=== Testing Cursor Operations ===\n");
-
+#[test]
+fn test_cursor_forward_iteration() -> Result<()> {
     // Create environment
     let dir = tempfile::tempdir().unwrap();
     let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
@@ -37,106 +36,188 @@ fn main() -> Result<()> {
         db
     };
 
-    // Test 1: Forward iteration
-    println!("--- Test 1: Forward Iteration ---");
+    // Test forward iteration
     {
         let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
 
-        print!("First -> Next: ");
-        if let Some((k, v)) = cursor.first()? {
-            print!("{}:{} ", String::from_utf8_lossy(&k), v);
+        let mut keys = Vec::new();
+        if let Some((k, _v)) = cursor.first()? {
+            keys.push(String::from_utf8_lossy(&k).to_string());
         }
 
-        while let Some((k, v)) = cursor.next_entry()? {
-            print!("{}:{} ", String::from_utf8_lossy(&k), v);
+        while let Some((k, _v)) = cursor.next_entry()? {
+            keys.push(String::from_utf8_lossy(&k).to_string());
         }
-        println!("\n✓ Forward iteration works");
+
+        // Verify keys are in sorted order
+        let expected: Vec<String> = (1..=9).map(|i| format!("key0{}", i)).collect();
+        assert_eq!(keys, expected);
     }
 
-    // Test 2: Backward iteration
-    println!("\n--- Test 2: Backward Iteration ---");
+    Ok(())
+}
+
+#[test]
+fn test_cursor_backward_iteration() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
+
+    let db: Database<String, String> = {
+        let mut txn = env.write_txn()?;
+        let db = env.create_database(&mut txn, None)?;
+
+        for i in 1..=5 {
+            db.put(&mut txn, format!("key{:02}", i), format!("value{:02}", i))?;
+        }
+
+        txn.commit()?;
+        db
+    };
+
+    // Test backward iteration
     {
         let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
 
-        print!("Last -> Prev: ");
-        if let Some((k, v)) = cursor.last()? {
-            print!("{}:{} ", String::from_utf8_lossy(&k), v);
+        let mut keys = Vec::new();
+        if let Some((k, _v)) = cursor.last()? {
+            keys.push(String::from_utf8_lossy(&k).to_string());
         }
 
-        while let Some((k, v)) = cursor.prev()? {
-            print!("{}:{} ", String::from_utf8_lossy(&k), v);
+        while let Some((k, _v)) = cursor.prev()? {
+            keys.push(String::from_utf8_lossy(&k).to_string());
         }
-        println!("\n✓ Backward iteration works");
+
+        // Verify keys are in reverse sorted order
+        let expected: Vec<String> = (1..=5).rev().map(|i| format!("key{:02}", i)).collect();
+        assert_eq!(keys, expected);
     }
 
-    // Test 3: Seek operations
-    println!("\n--- Test 3: Seek Operations ---");
+    Ok(())
+}
+
+#[test]
+fn test_cursor_seek_operations() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
+
+    let db: Database<String, String> = {
+        let mut txn = env.write_txn()?;
+        let db = env.create_database(&mut txn, None)?;
+
+        for i in [1, 3, 5, 7, 9] {
+            db.put(&mut txn, format!("key{:02}", i), format!("value{:02}", i))?;
+        }
+
+        txn.commit()?;
+        db
+    };
+
     {
         let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
 
         // Seek to existing key
-        if let Some((k, v)) = cursor.seek(&"key05".to_string())? {
-            println!("Seek 'key05': found {}:{}", String::from_utf8_lossy(&k), v);
-        }
+        let result = cursor.seek(&"key05".to_string())?;
+        assert_eq!(
+            result.map(|(k, v)| (String::from_utf8_lossy(&k).to_string(), v)),
+            Some(("key05".to_string(), "value05".to_string()))
+        );
 
         // Seek to non-existing key (should find next)
-        if let Some((k, v)) = cursor.seek(&"key055".to_string())? {
-            println!("Seek 'key055': found next {}:{}", String::from_utf8_lossy(&k), v);
-        }
+        let result = cursor.seek(&"key06".to_string())?;
+        assert_eq!(
+            result.map(|(k, v)| (String::from_utf8_lossy(&k).to_string(), v)),
+            Some(("key07".to_string(), "value07".to_string()))
+        );
 
         // Seek before first
-        if let Some((k, v)) = cursor.seek(&"key00".to_string())? {
-            println!("Seek 'key00': found next {}:{}", String::from_utf8_lossy(&k), v);
-        }
+        let result = cursor.seek(&"key00".to_string())?;
+        assert_eq!(
+            result.map(|(k, v)| (String::from_utf8_lossy(&k).to_string(), v)),
+            Some(("key01".to_string(), "value01".to_string()))
+        );
 
         // Seek after last
-        match cursor.seek(&"key99".to_string())? {
-            Some((k, v)) => println!("Seek 'key99': found {}:{}", String::from_utf8_lossy(&k), v),
-            None => println!("Seek 'key99': no entry found (expected)"),
-        }
-
-        println!("✓ Seek operations work");
+        let result = cursor.seek(&"key99".to_string())?;
+        assert_eq!(result, None);
     }
 
-    // Test 4: Mixed navigation
-    println!("\n--- Test 4: Mixed Navigation ---");
+    Ok(())
+}
+
+#[test]
+fn test_cursor_mixed_navigation() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
+
+    let db: Database<String, String> = {
+        let mut txn = env.write_txn()?;
+        let db = env.create_database(&mut txn, None)?;
+
+        for i in 1..=9 {
+            db.put(&mut txn, format!("key{:02}", i), format!("value{:02}", i))?;
+        }
+
+        txn.commit()?;
+        db
+    };
+
     {
         let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
 
         // Start at first
         cursor.first()?;
-        println!("First: {:?}", cursor.current()?);
+        assert_eq!(
+            cursor.current()?.map(|(k, v)| (String::from_utf8_lossy(&k).to_string(), v)),
+            Some(("key01".to_string(), "value01".to_string()))
+        );
 
         // Move forward twice
         cursor.next_raw()?;
         cursor.next_raw()?;
-        println!("After 2x next: {:?}", cursor.current()?);
+        assert_eq!(
+            cursor.current()?.map(|(k, v)| (String::from_utf8_lossy(&k).to_string(), v)),
+            Some(("key03".to_string(), "value03".to_string()))
+        );
 
         // Move back once
         cursor.prev()?;
-        println!("After prev: {:?}", cursor.current()?);
+        assert_eq!(
+            cursor.current()?.map(|(k, v)| (String::from_utf8_lossy(&k).to_string(), v)),
+            Some(("key02".to_string(), "value02".to_string()))
+        );
 
         // Jump to middle
         cursor.seek(&"key05".to_string())?;
-        println!("After seek key05: {:?}", cursor.current()?);
-
-        // Move back
-        cursor.prev()?;
-        println!("After prev: {:?}", cursor.current()?);
-
-        // Move forward
-        cursor.next_raw()?;
-        println!("After next: {:?}", cursor.current()?);
-
-        println!("✓ Mixed navigation works");
+        assert_eq!(
+            cursor.current()?.map(|(k, v)| (String::from_utf8_lossy(&k).to_string(), v)),
+            Some(("key05".to_string(), "value05".to_string()))
+        );
     }
 
-    // Test 5: Edge cases
-    println!("\n--- Test 5: Edge Cases ---");
+    Ok(())
+}
+
+#[test]
+fn test_cursor_edge_cases() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
+
+    let db: Database<String, String> = {
+        let mut txn = env.write_txn()?;
+        let db = env.create_database(&mut txn, None)?;
+
+        for i in 1..=3 {
+            db.put(&mut txn, format!("key{}", i), format!("value{}", i))?;
+        }
+
+        txn.commit()?;
+        db
+    };
+
     {
         let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
@@ -144,68 +225,79 @@ fn main() -> Result<()> {
         // Multiple prev from first
         cursor.first()?;
         let result = cursor.prev()?;
-        println!("Prev from first: {:?} (should be None)", result);
+        assert_eq!(result, None);
 
         // Multiple next from last
         cursor.last()?;
         let result = cursor.next_raw()?;
-        println!("Next from last: {:?} (should be None)", result);
+        assert_eq!(result, None);
 
         // Current with no position
         let fresh_cursor = db.cursor(&txn)?;
         let result = fresh_cursor.current()?;
-        println!("Current with no position: {:?} (should be None)", result);
-
-        println!("✓ Edge cases handled correctly");
+        assert_eq!(result, None);
     }
 
-    // Test 6: Cursor modification operations
-    println!("\n--- Test 6: Cursor Modifications ---");
+    Ok(())
+}
+
+#[test]
+fn test_cursor_modifications() -> Result<()> {
+    let dir = tempfile::tempdir().unwrap();
+    let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
+
+    let db: Database<String, String> = {
+        let mut txn = env.write_txn()?;
+        let db = env.create_database(&mut txn, None)?;
+
+        for i in [1, 3, 5, 7, 9] {
+            db.put(&mut txn, format!("key{:02}", i), format!("value{:02}", i))?;
+        }
+
+        txn.commit()?;
+        db
+    };
+
     {
-        let txn = env.write_txn()?;
+        let mut txn = env.write_txn()?;
         let mut cursor = db.cursor(&txn)?;
 
         // Add new entry
-        cursor.put(&"key045".to_string(), &"value045".to_string())?;
-        println!("Added key045, current: {:?}", cursor.current()?);
+        cursor.put(&"key04".to_string(), &"value04".to_string())?;
+        assert_eq!(
+            cursor.current()?.map(|(k, v)| (String::from_utf8_lossy(&k).to_string(), v)),
+            Some(("key04".to_string(), "value04".to_string()))
+        );
 
         // Navigate and update
         cursor.seek(&"key03".to_string())?;
         cursor.update(&"updated_value03".to_string())?;
-        println!("Updated key03, current: {:?}", cursor.current()?);
+        assert_eq!(
+            cursor.current()?.map(|(k, v)| (String::from_utf8_lossy(&k).to_string(), v)),
+            Some(("key03".to_string(), "updated_value03".to_string()))
+        );
 
         // Navigate and delete
         cursor.seek(&"key07".to_string())?;
         let deleted = cursor.delete()?;
-        println!("Deleted key07: {}", deleted);
+        assert!(deleted);
 
         txn.commit()?;
     }
 
     // Verify modifications
-    println!("\n--- Verification ---");
     {
         let txn = env.read_txn()?;
 
         // Check added key
-        match db.get(&txn, &"key045".to_string())? {
-            Some(v) => println!("✓ key045 exists: {}", v),
-            None => println!("✗ key045 missing"),
-        }
+        assert_eq!(db.get(&txn, &"key04".to_string())?, Some("value04".to_string()));
 
         // Check updated key
-        match db.get(&txn, &"key03".to_string())? {
-            Some(v) => println!("✓ key03 updated: {}", v),
-            None => println!("✗ key03 missing"),
-        }
+        assert_eq!(db.get(&txn, &"key03".to_string())?, Some("updated_value03".to_string()));
 
         // Check deleted key
-        match db.get(&txn, &"key07".to_string())? {
-            Some(_) => println!("✗ key07 still exists"),
-            None => println!("✓ key07 deleted"),
-        }
+        assert_eq!(db.get(&txn, &"key07".to_string())?, None);
     }
 
-    println!("\n=== All cursor tests completed! ===");
     Ok(())
 }

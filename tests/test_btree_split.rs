@@ -5,9 +5,8 @@ use tempfile::TempDir;
 use zerodb::db::Database;
 use zerodb::env::EnvBuilder;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Testing B+Tree splitting...");
-
+#[test]
+fn test_btree_split_insertion() -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new()?;
     let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
 
@@ -20,7 +19,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Insert entries until we trigger a split
-    println!("\nPhase 1: Inserting entries to trigger split...");
     let num_entries = 60; // Should be enough to trigger at least one split
 
     {
@@ -29,32 +27,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in 0..num_entries {
             let key = format!("key_{:03}", i.to_string());
             let value = vec![i as u8; 100];
-
             db.put(&mut txn, key.clone(), value)?;
-
-            // Check state periodically
-            if i % 10 == 9 {
-                let db_info = txn.db_info(Some("test_db"))?;
-                println!(
-                    "  After {} entries: depth={}, root={:?}",
-                    i + 1,
-                    db_info.depth,
-                    db_info.root
-                );
-            }
         }
 
         let final_info = txn.db_info(Some("test_db"))?;
-        println!(
-            "  Final state: depth={}, entries={}, root={:?}",
-            final_info.depth, final_info.entries, final_info.root
-        );
+        assert!(final_info.entries == num_entries as u64);
+        assert!(final_info.depth > 1); // Should have split
 
         txn.commit()?;
     }
 
-    // Phase 2: Verify all entries are still there
-    println!("\nPhase 2: Verifying all entries...");
+    Ok(())
+}
+
+#[test]
+fn test_btree_split_verify_entries() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
+
+    // Create a database
+    let db: Database<String, Vec<u8>> = {
+        let mut txn = env.write_txn()?;
+        let db = env.create_database(&mut txn, Some("test_db"))?;
+        txn.commit()?;
+        db
+    };
+
+    let num_entries = 60;
+
+    // Insert entries
+    {
+        let mut txn = env.write_txn()?;
+        for i in 0..num_entries {
+            let key = format!("key_{:03}", i.to_string());
+            let value = vec![i as u8; 100];
+            db.put(&mut txn, key.clone(), value)?;
+        }
+        txn.commit()?;
+    }
+
+    // Verify all entries are still there
     {
         let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
@@ -64,38 +76,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             found_keys.push(String::from_utf8_lossy(key).to_string());
         }
 
-        println!("  Found {} entries", found_keys.len());
+        assert_eq!(found_keys.len(), num_entries);
 
         // Check if all keys are present
-        let mut missing = Vec::new();
         for i in 0..num_entries {
             let expected_key = format!("key_{:03}", i.to_string());
-            if !found_keys.contains(&expected_key) {
-                missing.push(expected_key);
-            }
-        }
-
-        if missing.is_empty() {
-            println!("  ✓ All entries found!");
-        } else {
-            println!("  ✗ Missing {} entries:", missing.len());
-            for key in &missing {
-                println!("    - {}", key);
-            }
+            assert!(found_keys.contains(&expected_key), "Missing key: {}", expected_key);
         }
 
         // Also check ordering
         let mut sorted = found_keys.clone();
         sorted.sort();
-        if found_keys == sorted {
-            println!("  ✓ Entries are in correct order");
-        } else {
-            println!("  ✗ Entries are not in correct order");
-        }
+        assert_eq!(found_keys, sorted, "Entries are not in correct order");
     }
 
-    // Phase 3: Random access test
-    println!("\nPhase 3: Random access test...");
+    Ok(())
+}
+
+#[test]
+fn test_btree_split_random_access() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
+
+    // Create a database
+    let db: Database<String, Vec<u8>> = {
+        let mut txn = env.write_txn()?;
+        let db = env.create_database(&mut txn, Some("test_db"))?;
+        txn.commit()?;
+        db
+    };
+
+    let num_entries = 60;
+
+    // Insert entries
+    {
+        let mut txn = env.write_txn()?;
+        for i in 0..num_entries {
+            let key = format!("key_{:03}", i.to_string());
+            let value = vec![i as u8; 100];
+            db.put(&mut txn, key.clone(), value)?;
+        }
+        txn.commit()?;
+    }
+
+    // Random access test
     {
         let txn = env.read_txn()?;
 
@@ -104,19 +128,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key = format!("key_{:03}", i.to_string());
             match db.get(&txn, &key)? {
                 Some(value) => {
-                    if value[0] == i as u8 {
-                        println!("  ✓ {} = correct value", key);
-                    } else {
-                        println!("  ✗ {} = wrong value (expected {}, got {})", key, i, value[0]);
-                    }
+                    assert_eq!(value[0], i as u8, "Wrong value for key {}", key);
                 }
                 None => {
-                    println!("  ✗ {} = not found", key);
+                    panic!("Key {} not found", key);
                 }
             }
         }
     }
 
-    println!("\nB+Tree split test completed");
     Ok(())
 }

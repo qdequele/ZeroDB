@@ -1,12 +1,11 @@
 use std::sync::Arc;
 use zerodb::{Database, EnvBuilder};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[test]
+fn test_copy_on_write_basic() -> Result<(), Box<dyn std::error::Error>> {
     // Create temporary directory
     let dir = tempfile::TempDir::new()?;
     let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
-
-    println!("Testing Copy-on-Write implementation...");
 
     // Create database
     let db: Database<String, String> = {
@@ -19,29 +18,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Insert data
     {
         let mut txn = env.write_txn()?;
-        println!("Inserting key1...");
         db.put(&mut txn, "key1".to_string(), "value1".to_string())?;
-        println!("Inserting key2...");
         db.put(&mut txn, "key2".to_string(), "value2".to_string())?;
-        println!("Committing...");
         txn.commit()?;
     }
 
     // Read data
     {
         let txn = env.read_txn()?;
-        println!("Reading key1...");
         let val1 = db.get(&txn, &"key1".to_string())?;
-        println!("key1 = {:?}", val1);
+        assert_eq!(val1, Some("value1".to_string()));
 
         let val2 = db.get(&txn, &"key2".to_string())?;
-        println!("key2 = {:?}", val2);
+        assert_eq!(val2, Some("value2".to_string()));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_copy_on_write_update() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::TempDir::new()?;
+    let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
+
+    let db: Database<String, String> = {
+        let mut txn = env.write_txn()?;
+        let db = env.create_database(&mut txn, None)?;
+        txn.commit()?;
+        db
+    };
+
+    // Insert initial data
+    {
+        let mut txn = env.write_txn()?;
+        db.put(&mut txn, "key1".to_string(), "value1".to_string())?;
+        db.put(&mut txn, "key2".to_string(), "value2".to_string())?;
+        txn.commit()?;
     }
 
     // Test update with COW
     {
         let mut txn = env.write_txn()?;
-        println!("Updating key1...");
         db.put(&mut txn, "key1".to_string(), "updated_value1".to_string())?;
         txn.commit()?;
     }
@@ -50,9 +67,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let txn = env.read_txn()?;
         let val1 = db.get(&txn, &"key1".to_string())?;
-        println!("Updated key1 = {:?}", val1);
+        assert_eq!(val1, Some("updated_value1".to_string()));
+        
+        // key2 should remain unchanged
+        let val2 = db.get(&txn, &"key2".to_string())?;
+        assert_eq!(val2, Some("value2".to_string()));
     }
 
-    println!("Test completed successfully!");
+    Ok(())
+}
+
+#[test]
+fn test_copy_on_write_isolation() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::TempDir::new()?;
+    let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
+
+    let db: Database<String, String> = {
+        let mut txn = env.write_txn()?;
+        let db = env.create_database(&mut txn, None)?;
+        txn.commit()?;
+        db
+    };
+
+    // Insert initial data
+    {
+        let mut txn = env.write_txn()?;
+        db.put(&mut txn, "key1".to_string(), "value1".to_string())?;
+        txn.commit()?;
+    }
+
+    // Start a read transaction
+    let read_txn = env.read_txn()?;
+    let initial_value = db.get(&read_txn, &"key1".to_string())?;
+    assert_eq!(initial_value, Some("value1".to_string()));
+
+    // Update data in a new write transaction
+    {
+        let mut txn = env.write_txn()?;
+        db.put(&mut txn, "key1".to_string(), "updated_value1".to_string())?;
+        txn.commit()?;
+    }
+
+    // The read transaction should still see the old value (isolation)
+    let isolated_value = db.get(&read_txn, &"key1".to_string())?;
+    assert_eq!(isolated_value, Some("value1".to_string()));
+
+    // Drop the read transaction
+    drop(read_txn);
+
+    // New read transaction should see the updated value
+    {
+        let txn = env.read_txn()?;
+        let updated_value = db.get(&txn, &"key1".to_string())?;
+        assert_eq!(updated_value, Some("updated_value1".to_string()));
+    }
+
     Ok(())
 }

@@ -3,15 +3,13 @@ use tempfile::TempDir;
 use zerodb::db::{Database, DatabaseFlags};
 use zerodb::env::EnvBuilder;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[test]
+fn test_catalog_persistence_database_open() -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new()?;
     let db_path = dir.path().to_path_buf();
 
-    println!("Testing catalog persistence issue...");
-
     // Phase 1: Create databases using Database::open (which uses Catalog)
     {
-        println!("\nPhase 1: Creating databases with Database::open");
         let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(&db_path)?);
 
         // Use Database::open which uses the Catalog
@@ -20,100 +18,112 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let db2: Database<String, String> =
             Database::open(&env, Some("catalog_db2"), DatabaseFlags::CREATE)?;
 
-        println!("Created databases: catalog_db1, catalog_db2");
-
         // Add some data
         {
             let mut txn = env.write_txn()?;
             db1.put(&mut txn, "key1".to_string(), "value1".to_string())?;
             db2.put(&mut txn, "key2".to_string(), "value2".to_string())?;
             txn.commit()?;
-            println!("Added data to databases");
         }
     }
 
     // Phase 2: Reopen and try to access the databases
     {
-        println!("\nPhase 2: Reopening environment");
         let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(&db_path)?);
 
         // Try to open with Database::open (should work)
-        println!("\nTrying Database::open...");
-        match Database::<String, String>::open(&env, Some("catalog_db1"), DatabaseFlags::empty()) {
-            Ok(db) => {
-                let txn = env.read_txn()?;
-                match db.get(&txn, &"key1".to_string())? {
-                    Some(val) => println!("✓ Database::open worked! Got value: {}", val),
-                    None => println!("✗ Database::open opened but data not found"),
-                }
-            }
-            Err(e) => println!("✗ Database::open failed: {:?}", e),
-        }
-
-        // Try to open with env.open_database (might fail due to serialization mismatch)
-        println!("\nTrying env.open_database...");
+        let db = Database::<String, String>::open(&env, Some("catalog_db1"), DatabaseFlags::empty())?;
         let txn = env.read_txn()?;
-        match env.open_database::<String, String>(&txn, Some("catalog_db1")) {
-            Ok(db) => match db.get(&txn, &"key1".to_string())? {
-                Some(val) => println!("✓ env.open_database worked! Got value: {}", val),
-                None => println!("✗ env.open_database opened but data not found"),
-            },
-            Err(e) => println!("✗ env.open_database failed: {:?}", e),
+        let val = db.get(&txn, &"key1".to_string())?;
+        assert_eq!(val, Some("value1".to_string()));
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_catalog_persistence_mixed_methods() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let db_path = dir.path().to_path_buf();
+
+    // Create databases using both methods
+    {
+        let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(&db_path)?);
+
+        // Create with Database::open (Catalog)
+        let db1: Database<String, String> =
+            Database::open(&env, Some("catalog_db"), DatabaseFlags::CREATE)?;
+
+        // Create with env.create_database
+        let db2: Database<String, String> = {
+            let mut txn = env.write_txn()?;
+            let db = env.create_database(&mut txn, Some("env_db"))?;
+            txn.commit()?;
+            db
+        };
+
+        // Add data to both
+        {
+            let mut txn = env.write_txn()?;
+            db1.put(&mut txn, "key1".to_string(), "value1".to_string())?;
+            db2.put(&mut txn, "key2".to_string(), "value2".to_string())?;
+            txn.commit()?;
         }
     }
 
-    // Phase 3: Create databases using env.create_database
+    // Reopen and verify both databases
     {
-        println!("\nPhase 3: Creating databases with env.create_database");
         let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(&db_path)?);
 
-        let mut txn = env.write_txn()?;
-        let db3: Database<String, String> = env.create_database(&mut txn, Some("env_db1"))?;
-        let db4: Database<String, String> = env.create_database(&mut txn, Some("env_db2"))?;
-
-        db3.put(&mut txn, "key3".to_string(), "value3".to_string())?;
-        db4.put(&mut txn, "key4".to_string(), "value4".to_string())?;
-        txn.commit()?;
-
-        println!("Created databases: env_db1, env_db2");
-    }
-
-    // Phase 4: Reopen and check both types
-    {
-        println!("\nPhase 4: Final check after reopening");
-        let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(&db_path)?);
+        // Open catalog database
+        let db1 = Database::<String, String>::open(&env, Some("catalog_db"), DatabaseFlags::empty())?;
+        
+        // Open env database
+        let db2 = Database::<String, String>::open(&env, Some("env_db"), DatabaseFlags::empty())?;
 
         let txn = env.read_txn()?;
+        assert_eq!(db1.get(&txn, &"key1".to_string())?, Some("value1".to_string()));
+        assert_eq!(db2.get(&txn, &"key2".to_string())?, Some("value2".to_string()));
+    }
 
-        // List all databases
-        println!("\nListing all databases:");
+    Ok(())
+}
+
+#[test]
+fn test_catalog_list_databases() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let db_path = dir.path().to_path_buf();
+
+    // Create various databases
+    {
+        let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(&db_path)?);
+
+        // Create with Database::open
+        let _db1: Database<String, String> =
+            Database::open(&env, Some("catalog_db1"), DatabaseFlags::CREATE)?;
+        let _db2: Database<String, String> =
+            Database::open(&env, Some("catalog_db2"), DatabaseFlags::CREATE)?;
+
+        // Create with env.create_database
+        {
+            let mut txn = env.write_txn()?;
+            let _db3: Database<String, String> = env.create_database(&mut txn, Some("env_db1"))?;
+            let _db4: Database<String, String> = env.create_database(&mut txn, Some("env_db2"))?;
+            txn.commit()?;
+        }
+    }
+
+    // Reopen and list all databases
+    {
+        let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(&db_path)?);
+        let txn = env.read_txn()?;
+
         let dbs = env.list_databases(&txn)?;
-        for db_name in &dbs {
-            println!("  - {}", db_name);
-        }
-
-        // Try to open each type
-        println!("\nTrying to open catalog_db1 with both methods:");
-        match Database::<String, String>::open(&env, Some("catalog_db1"), DatabaseFlags::empty()) {
-            Ok(_) => println!("  ✓ Database::open succeeded"),
-            Err(e) => println!("  ✗ Database::open failed: {:?}", e),
-        }
-
-        match env.open_database::<String, String>(&txn, Some("catalog_db1")) {
-            Ok(_) => println!("  ✓ env.open_database succeeded"),
-            Err(e) => println!("  ✗ env.open_database failed: {:?}", e),
-        }
-
-        println!("\nTrying to open env_db1 with both methods:");
-        match Database::<String, String>::open(&env, Some("env_db1"), DatabaseFlags::empty()) {
-            Ok(_) => println!("  ✓ Database::open succeeded"),
-            Err(e) => println!("  ✗ Database::open failed: {:?}", e),
-        }
-
-        match env.open_database::<String, String>(&txn, Some("env_db1")) {
-            Ok(_) => println!("  ✓ env.open_database succeeded"),
-            Err(e) => println!("  ✗ env.open_database failed: {:?}", e),
-        }
+        assert!(dbs.len() >= 4);
+        assert!(dbs.contains(&"catalog_db1".to_string()));
+        assert!(dbs.contains(&"catalog_db2".to_string()));
+        assert!(dbs.contains(&"env_db1".to_string()));
+        assert!(dbs.contains(&"env_db2".to_string()));
     }
 
     Ok(())

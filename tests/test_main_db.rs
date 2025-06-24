@@ -4,18 +4,14 @@ use zerodb::db::{Database, DatabaseFlags};
 use zerodb::error::Result;
 use zerodb::EnvBuilder;
 
-fn main() -> Result<()> {
-    println!("Testing main database functionality...\n");
-
+#[test]
+fn test_main_database_functionality() -> Result<()> {
     // Create environment
     let dir = tempfile::tempdir().unwrap();
     let env = EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?;
 
-    println!("✓ Environment created");
-
     // Open the main database (no name)
     let main_db: Database<Vec<u8>, Vec<u8>> = Database::open(&env, None, DatabaseFlags::empty())?;
-    println!("✓ Opened main database");
 
     // Store some data in main database
     {
@@ -25,15 +21,12 @@ fn main() -> Result<()> {
         let value = b"test_value".to_vec();
 
         main_db.put(&mut txn, key.clone(), value)?;
-        println!("✓ Stored data in main database");
 
         // Check we can read it back in same transaction
-        if let Some(v) = main_db.get(&txn, &key)? {
-            println!("✓ Retrieved value in same txn: {:?}", String::from_utf8_lossy(&v));
-        }
+        let retrieved = main_db.get(&txn, &key)?;
+        assert_eq!(retrieved, Some(b"test_value".to_vec()));
 
         txn.commit()?;
-        println!("✓ Transaction committed");
     }
 
     // Read it back in new transaction
@@ -41,27 +34,22 @@ fn main() -> Result<()> {
         let txn = env.read_txn()?;
 
         let key = b"test_key".to_vec();
-        if let Some(value) = main_db.get(&txn, &key)? {
-            println!("✓ Retrieved value after commit: {:?}", String::from_utf8_lossy(&value));
-        } else {
-            println!("✗ Failed to retrieve value after commit");
-        }
+        let value = main_db.get(&txn, &key)?;
+        assert_eq!(value, Some(b"test_value".to_vec()));
     }
 
-    // Now try creating a named database
-    println!("\nTesting named database creation...");
+    Ok(())
+}
 
+#[test]
+fn test_named_database_creation() -> Result<()> {
+    // Create environment
+    let dir = tempfile::tempdir().unwrap();
+    let env = EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?;
+
+    // Create a named database
     let named_db: Database<Vec<u8>, Vec<u8>> =
-        match Database::open(&env, Some("mydb"), DatabaseFlags::CREATE) {
-            Ok(db) => {
-                println!("✓ Created named database 'mydb'");
-                db
-            }
-            Err(e) => {
-                println!("✗ Failed to create named database: {:?}", e);
-                return Err(e);
-            }
-        };
+        Database::open(&env, Some("mydb"), DatabaseFlags::CREATE)?;
 
     // Try to use the named database
     {
@@ -70,17 +58,22 @@ fn main() -> Result<()> {
         let key = b"named_key".to_vec();
         let value = b"named_value".to_vec();
 
-        match named_db.put(&mut txn, key.clone(), value) {
-            Ok(_) => println!("✓ Stored data in named database"),
-            Err(e) => {
-                println!("✗ Failed to store in named database: {:?}", e);
-                return Err(e);
-            }
-        }
+        named_db.put(&mut txn, key.clone(), value)?;
+
+        // Verify in same transaction
+        let retrieved = named_db.get(&txn, &key)?;
+        assert_eq!(retrieved, Some(b"named_value".to_vec()));
 
         txn.commit()?;
     }
 
-    println!("\nAll tests passed!");
+    // Verify after commit
+    {
+        let txn = env.read_txn()?;
+        let key = b"named_key".to_vec();
+        let value = named_db.get(&txn, &key)?;
+        assert_eq!(value, Some(b"named_value".to_vec()));
+    }
+
     Ok(())
 }

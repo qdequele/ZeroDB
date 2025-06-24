@@ -27,7 +27,6 @@ fn test_page_id_multiplication_overflow() -> Result<()> {
     match read_result {
         Err(Error::InvalidPageId(_)) => {
             // Expected error
-            println!("✓ Correctly rejected overflow-inducing page ID");
         }
         Ok(_) => panic!("Should have rejected overflow page ID"),
         Err(e) => panic!("Got unexpected error: {:?}", e),
@@ -58,7 +57,7 @@ fn test_large_page_id_bounds_check() -> Result<()> {
         let read_result = txn.get_page(page_id);
         match read_result {
             Err(Error::InvalidPageId(_)) => {
-                println!("✓ Correctly rejected large page ID: {:?}", page_id);
+                // Expected error
             }
             Ok(_) => panic!("Should have rejected large page ID: {:?}", page_id),
             Err(e) => panic!("Got unexpected error for page {:?}: {:?}", page_id, e),
@@ -68,36 +67,38 @@ fn test_large_page_id_bounds_check() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_page_offset_calculation_safety() -> Result<()> {
+    let dir = TempDir::new()?;
+    let env = Arc::new(
+        EnvBuilder::new()
+            .map_size(1 << 20) // 1 MB
+            .open(dir.path())?
+    );
+
+    // Test edge cases around the overflow boundary
+    let page_size = 4096u64;
+    let max_safe_page_id = u64::MAX / page_size;
+    
+    let test_page_ids = vec![
+        PageId(max_safe_page_id - 1),  // Just below overflow
+        PageId(max_safe_page_id),      // Exactly at boundary
+        PageId(max_safe_page_id + 1),  // Just above overflow
+    ];
+
+    for page_id in test_page_ids {
+        let txn = env.read_txn()?;
+        let read_result = txn.get_page(page_id);
+        
+        // All of these should fail with InvalidPageId since they're beyond the file size
+        assert!(
+            matches!(read_result, Err(Error::InvalidPageId(_))),
+            "Expected InvalidPageId error for page {:?}", page_id
+        );
+    }
+
+    Ok(())
+}
+
 // Note: We can't directly test prefetch_pages and grow() as they're internal methods.
 // The overflow protection is still tested through the page ID validation tests above.
-
-fn main() {
-    println!("Running integer overflow protection tests...\n");
-    
-    let tests = vec![
-        ("Page ID multiplication overflow", test_page_id_multiplication_overflow()),
-        ("Large page ID bounds check", test_large_page_id_bounds_check()),
-    ];
-    
-    let mut passed = 0;
-    let mut failed = 0;
-    
-    for (name, result) in tests {
-        print!("{}: ", name);
-        match result {
-            Ok(_) => {
-                println!("PASSED");
-                passed += 1;
-            }
-            Err(e) => {
-                println!("FAILED - {:?}", e);
-                failed += 1;
-            }
-        }
-    }
-    
-    println!("\n{} passed, {} failed", passed, failed);
-    if failed > 0 {
-        std::process::exit(1);
-    }
-}

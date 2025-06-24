@@ -2,44 +2,38 @@ use zerodb::{EnvBuilder, Result, db::Database};
 use tempfile::TempDir;
 use std::sync::Arc;
 
-fn main() -> Result<()> {
-    println!("ZeroDB Overflow Page Analysis");
-    println!("=============================\n");
-    
+#[test]
+fn test_overflow_page_calculations() -> Result<()> {
     // Constants from the codebase
     const PAGE_SIZE: usize = 4096;
     const PAGE_HEADER_SIZE: usize = 48; // size_of::<PageHeader>()
     const OVERFLOW_HEADER_SIZE: usize = 16; // size_of::<OverflowHeader>()
     const MAX_INLINE_VALUE_SIZE: usize = PAGE_SIZE / 4; // 1024 bytes
     
-    println!("Page Configuration:");
-    println!("  - Page size: {} bytes", PAGE_SIZE);
-    println!("  - Page header size: {} bytes", PAGE_HEADER_SIZE);
-    println!("  - Overflow header size: {} bytes", OVERFLOW_HEADER_SIZE);
-    println!("  - Max inline value size: {} bytes\n", MAX_INLINE_VALUE_SIZE);
-    
     // Calculate usable space per overflow page
     let data_per_overflow_page = PAGE_SIZE - PAGE_HEADER_SIZE - OVERFLOW_HEADER_SIZE;
-    println!("Overflow Page Capacity:");
-    println!("  - Usable data per overflow page: {} bytes", data_per_overflow_page);
-    println!("  - Overhead per page: {} bytes ({:.1}%)\n", 
-        PAGE_HEADER_SIZE + OVERFLOW_HEADER_SIZE,
-        ((PAGE_HEADER_SIZE + OVERFLOW_HEADER_SIZE) as f64 / PAGE_SIZE as f64) * 100.0
-    );
+    
+    // Verify calculations
+    assert_eq!(MAX_INLINE_VALUE_SIZE, 1024);
+    assert!(data_per_overflow_page > 3000); // Should have most of the page available
     
     // Calculate theoretical maximum value size
-    // total_size is stored as u64, so theoretical max is 2^64 - 1
     let theoretical_max = u64::MAX;
-    println!("Theoretical Limits:");
-    println!("  - Max value size (u64): {} bytes ({:.2} EB)", 
-        theoretical_max, 
-        theoretical_max as f64 / (1024_f64.powi(6))
-    );
-    println!("  - Max overflow pages needed: {}", theoretical_max / data_per_overflow_page as u64);
+    let max_pages = theoretical_max / data_per_overflow_page as u64;
+    assert!(max_pages > 0);
+    
+    Ok(())
+}
+
+#[test]
+fn test_practical_overflow_sizes() -> Result<()> {
+    const PAGE_SIZE: usize = 4096;
+    const PAGE_HEADER_SIZE: usize = 48;
+    const OVERFLOW_HEADER_SIZE: usize = 16;
+    
+    let data_per_overflow_page = PAGE_SIZE - PAGE_HEADER_SIZE - OVERFLOW_HEADER_SIZE;
     
     // Practical examples for large data structures
-    println!("\nPractical Examples:");
-    
     let sizes = vec![
         ("Small FST", 100_000),           // 100 KB
         ("Medium FST", 1_000_000),        // 1 MB
@@ -54,17 +48,17 @@ fn main() -> Result<()> {
         let overhead = total_space - size;
         let overhead_percent = (overhead as f64 / size as f64) * 100.0;
         
-        println!("\n  {}:", name);
-        println!("    - Data size: {} bytes ({:.2} MB)", size, size as f64 / (1024.0 * 1024.0));
-        println!("    - Overflow pages needed: {}", pages_needed);
-        println!("    - Total disk space: {} bytes ({:.2} MB)", total_space, total_space as f64 / (1024.0 * 1024.0));
-        println!("    - Storage overhead: {} bytes ({:.1}%)", overhead, overhead_percent);
+        // Overhead should be reasonable (less than 5% for large values)
+        if size > 1_000_000 {
+            assert!(overhead_percent < 5.0, "{} has too much overhead: {:.1}%", name, overhead_percent);
+        }
     }
     
-    // Test actual storage
-    println!("\n\nTesting Actual Storage:");
-    println!("========================\n");
-    
+    Ok(())
+}
+
+#[test]
+fn test_actual_overflow_storage() -> Result<()> {
     let dir = TempDir::new()?;
     let env = Arc::new(
         EnvBuilder::new()
@@ -90,33 +84,67 @@ fn main() -> Result<()> {
     ];
     
     for (name, size) in test_sizes {
-        println!("Testing {} value...", name);
-        
         let key = format!("test_{}", size);
         let value = vec![0xAB; size];
         
-        let mut txn = env.write_txn()?;
-        match db.put(&mut txn, key.as_bytes().to_vec(), value.clone()) {
-            Ok(()) => {
-                println!("  ✓ Successfully stored {} value", name);
-                txn.commit()?;
-                
-                // Verify read
-                let read_txn = env.read_txn()?;
-                match db.get(&read_txn, &key.as_bytes().to_vec()) {
-                    Ok(Some(read_value)) => {
-                        assert_eq!(read_value.len(), size);
-                        println!("  ✓ Successfully read back {} value", name);
-                    }
-                    Ok(None) => println!("  ✗ Value not found after commit"),
-                    Err(e) => println!("  ✗ Read error: {}", e),
-                }
-            }
-            Err(e) => {
-                println!("  ✗ Write error: {}", e);
-                break;
-            }
+        // Write
+        {
+            let mut txn = env.write_txn()?;
+            db.put(&mut txn, key.as_bytes().to_vec(), value.clone())?;
+            txn.commit()?;
         }
+        
+        // Verify read
+        {
+            let read_txn = env.read_txn()?;
+            let read_value = db.get(&read_txn, &key.as_bytes().to_vec())?.unwrap();
+            assert_eq!(read_value.len(), size, "{} value size mismatch", name);
+            assert_eq!(read_value[0], 0xAB);
+            assert_eq!(read_value[size-1], 0xAB);
+        }
+    }
+    
+    Ok(())
+}
+
+#[test]
+fn test_very_large_overflow_value() -> Result<()> {
+    let dir = TempDir::new()?;
+    let env = Arc::new(
+        EnvBuilder::new()
+            .map_size(1 << 30) // 1 GB
+            .open(dir.path())?
+    );
+    
+    let db: Database<Vec<u8>, Vec<u8>> = {
+        let mut txn = env.write_txn()?;
+        let db = env.create_database(&mut txn, None)?;
+        txn.commit()?;
+        db
+    };
+    
+    // Test a 50MB value (typical large FST size)
+    let large_size = 50 * 1024 * 1024;
+    let key = b"large_fst";
+    let value = vec![0x42; large_size];
+    
+    // Write
+    {
+        let mut txn = env.write_txn()?;
+        db.put(&mut txn, key.to_vec(), value.clone())?;
+        txn.commit()?;
+    }
+    
+    // Read and verify
+    {
+        let txn = env.read_txn()?;
+        let read_value = db.get(&txn, &key.to_vec())?.unwrap();
+        assert_eq!(read_value.len(), large_size);
+        
+        // Check a few spots to ensure data integrity
+        assert_eq!(read_value[0], 0x42);
+        assert_eq!(read_value[large_size/2], 0x42);
+        assert_eq!(read_value[large_size-1], 0x42);
     }
     
     Ok(())

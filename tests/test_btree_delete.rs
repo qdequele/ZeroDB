@@ -5,9 +5,8 @@ use tempfile::TempDir;
 use zerodb::db::Database;
 use zerodb::env::EnvBuilder;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Testing B+Tree deletion...");
-
+#[test]
+fn test_btree_delete_even_entries() -> Result<(), Box<dyn std::error::Error>> {
     let dir = TempDir::new()?;
     let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
 
@@ -19,8 +18,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         db
     };
 
-    // Phase 1: Insert entries
-    println!("\nPhase 1: Inserting entries...");
+    // Insert entries
     let num_entries = 50; // Enough to cause splits
     {
         let mut txn = env.write_txn()?;
@@ -32,27 +30,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         txn.commit()?;
-        println!("  Inserted {} entries", num_entries);
     }
 
-    // Phase 2: Verify all entries
-    println!("\nPhase 2: Before deletion...");
+    // Verify all entries before deletion
     {
         let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
         let mut count = 0;
 
-        println!("  All entries:");
-        while let Some((key, value)) = cursor.next_raw()? {
-            println!("    {} -> {} bytes", String::from_utf8_lossy(key), value.len());
+        while let Some((_key, _value)) = cursor.next_raw()? {
             count += 1;
         }
-        println!("  Total: {} entries", count);
         assert_eq!(count, num_entries);
     }
 
-    // Phase 3: Delete even entries
-    println!("\nPhase 3: Deleting even entries...");
+    // Delete even entries
     {
         let mut txn = env.write_txn()?;
         let mut deleted = 0;
@@ -60,31 +52,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in (0..num_entries).step_by(2) {
             let key = format!("key_{:03}", i.to_string());
             if db.delete(&mut txn, &key)? {
-                println!("  Deleted: {}", key);
                 deleted += 1;
-            } else {
-                println!("  Not found: {}", key);
             }
         }
 
+        assert_eq!(deleted, num_entries / 2);
         txn.commit()?;
-        println!("  Deleted {} entries", deleted);
     }
 
-    // Phase 4: Verify remaining entries
-    println!("\nPhase 4: After deletion...");
+    // Verify remaining entries
     {
         let txn = env.read_txn()?;
         let mut cursor = db.cursor(&txn)?;
         let mut remaining = Vec::new();
 
-        println!("  Remaining entries:");
-        while let Some((key, value)) = cursor.next_raw()? {
+        while let Some((key, _value)) = cursor.next_raw()? {
             let key_str = String::from_utf8_lossy(key).to_string();
-            println!("    {} -> {} bytes", key_str, value.len());
             remaining.push(key_str);
         }
-        println!("  Total: {} entries", remaining.len());
 
         // Check that we have the right entries
         let mut expected = Vec::new();
@@ -95,17 +80,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         expected.sort();
         remaining.sort();
 
-        if expected == remaining {
-            println!("  ✓ Correct entries remain");
-        } else {
-            println!("  ✗ Wrong entries remain");
-            println!("    Expected: {:?}", expected);
-            println!("    Got: {:?}", remaining);
-        }
+        assert_eq!(expected, remaining, "Wrong entries remain after deletion");
     }
 
-    // Phase 5: Random access to remaining entries
-    println!("\nPhase 5: Random access test...");
+    Ok(())
+}
+
+#[test]
+fn test_btree_delete_random_access() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let env = Arc::new(EnvBuilder::new().map_size(10 * 1024 * 1024).open(dir.path())?);
+
+    // Create a database
+    let db: Database<String, Vec<u8>> = {
+        let mut txn = env.write_txn()?;
+        let db = env.create_database(&mut txn, Some("test_db"))?;
+        txn.commit()?;
+        db
+    };
+
+    let num_entries = 50;
+
+    // Insert entries
+    {
+        let mut txn = env.write_txn()?;
+        for i in 0..num_entries {
+            let key = format!("key_{:03}", i.to_string());
+            let value = vec![i as u8; 256];
+            db.put(&mut txn, key, value)?;
+        }
+        txn.commit()?;
+    }
+
+    // Delete even entries
+    {
+        let mut txn = env.write_txn()?;
+        for i in (0..num_entries).step_by(2) {
+            let key = format!("key_{:03}", i.to_string());
+            db.delete(&mut txn, &key)?;
+        }
+        txn.commit()?;
+    }
+
+    // Random access test
     {
         let txn = env.read_txn()?;
 
@@ -113,10 +130,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in [1, 5, 9, 13, 17] {
             if i < num_entries {
                 let key = format!("key_{:03}", i.to_string());
-                match db.get(&txn, &key)? {
-                    Some(value) => println!("  ✓ {} = {} bytes", key, value.len()),
-                    None => println!("  ✗ {} not found", key),
-                }
+                let value = db.get(&txn, &key)?;
+                assert!(value.is_some(), "Key {} should exist", key);
+                assert_eq!(value.unwrap()[0], i as u8);
             }
         }
 
@@ -124,16 +140,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in [0, 4, 8, 12, 16] {
             if i < num_entries {
                 let key = format!("key_{:03}", i.to_string());
-                match db.get(&txn, &key)? {
-                    Some(value) => {
-                        println!("  ✗ {} = {} bytes (should be deleted)", key, value.len())
-                    }
-                    None => println!("  ✓ {} correctly deleted", key),
-                }
+                let value = db.get(&txn, &key)?;
+                assert!(value.is_none(), "Key {} should be deleted", key);
             }
         }
     }
 
-    println!("\nB+Tree delete test completed");
     Ok(())
 }
