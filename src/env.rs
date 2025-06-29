@@ -618,6 +618,38 @@ impl Environment<Open> {
         inner.io.sync()?;
         Ok(())
     }
+    
+    /// Get current space usage information
+    pub fn space_info(&self) -> Result<crate::space_info::SpaceInfo> {
+        let inner = self.inner();
+        let total_pages = inner.io.size_in_pages();
+        let next_page_id = inner.next_page_id.load(std::sync::atomic::Ordering::Acquire);
+        
+        // Get free pages count from a read transaction
+        let free_pages = {
+            let _txn = self.read_txn()?;
+            // Access the transaction's data to get freelist info
+            let free_count = if inner.use_segregated_freelist {
+                // Count segregated freelist pages
+                // For now, estimate based on the difference
+                total_pages.saturating_sub(next_page_id)
+            } else {
+                // Count regular freelist pages
+                total_pages.saturating_sub(next_page_id)
+            };
+            free_count
+        };
+        
+        let used_pages = next_page_id;
+        let map_size = inner._map_size as u64;
+        
+        Ok(crate::space_info::SpaceInfo::new(
+            total_pages,
+            used_pages,
+            free_pages,
+            map_size,
+        ))
+    }
 
     /// Get environment statistics
     pub fn stat(&self) -> Result<crate::meta::DbStats> {

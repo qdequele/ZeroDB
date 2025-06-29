@@ -42,6 +42,7 @@ pub mod reader;
 pub mod segregated_freelist;
 pub mod simd;
 pub mod simd_advanced;
+pub mod space_info;
 pub mod tree_utils;
 pub mod txn;
 

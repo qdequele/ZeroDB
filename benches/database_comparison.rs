@@ -35,9 +35,21 @@ fn bench_sequential_writes(c: &mut Criterion) {
                     b.iter_batched(
                         || {
                             let dir = TempDir::new().unwrap();
+                            // Calculate required map size based on dataset
+                            let map_size = if dataset_size >= LARGE_DATASET && value_size >= LARGE_VALUE {
+                                // For 100K keys with 100KB values, we need ~18GB
+                                20 * 1024 * 1024 * 1024 // 20GB with safety margin
+                            } else if dataset_size >= MEDIUM_DATASET && value_size >= MEDIUM_VALUE {
+                                // For medium datasets
+                                4 * 1024 * 1024 * 1024 // 4GB
+                            } else {
+                                // For small datasets
+                                2 * 1024 * 1024 * 1024 // 2GB
+                            };
+                            
                             let env = Arc::new(
                                 zerodb::EnvBuilder::new()
-                                    .map_size(2 * 1024 * 1024 * 1024) // 2GB to handle large dataset
+                                    .map_size(map_size)
                                     .open(dir.path())
                                     .unwrap(),
                             );
@@ -77,9 +89,18 @@ fn bench_sequential_writes(c: &mut Criterion) {
                     b.iter_batched(
                         || {
                             let dir = TempDir::new().unwrap();
+                            // Use same map size as ZeroDB for fair comparison
+                            let map_size = if dataset_size >= LARGE_DATASET && value_size >= LARGE_VALUE {
+                                20 * 1024 * 1024 * 1024 // 20GB
+                            } else if dataset_size >= MEDIUM_DATASET && value_size >= MEDIUM_VALUE {
+                                4 * 1024 * 1024 * 1024 // 4GB
+                            } else {
+                                2 * 1024 * 1024 * 1024 // 2GB
+                            };
+                            
                             let env = unsafe {
                                 heed::EnvOpenOptions::new()
-                                    .map_size(2 * 1024 * 1024 * 1024) // 2GB to handle large dataset
+                                    .map_size(map_size)
                                     .open(dir.path())
                                     .unwrap()
                             };
@@ -182,9 +203,21 @@ fn bench_random_writes(c: &mut Criterion) {
                     b.iter_batched(
                         || {
                             let dir = TempDir::new().unwrap();
+                            // Calculate required map size based on dataset
+                            let map_size = if dataset_size >= LARGE_DATASET && value_size >= LARGE_VALUE {
+                                // For 100K keys with 100KB values, we need ~18GB
+                                20 * 1024 * 1024 * 1024 // 20GB with safety margin
+                            } else if dataset_size >= MEDIUM_DATASET && value_size >= MEDIUM_VALUE {
+                                // For medium datasets
+                                4 * 1024 * 1024 * 1024 // 4GB
+                            } else {
+                                // For small datasets
+                                2 * 1024 * 1024 * 1024 // 2GB
+                            };
+                            
                             let env = Arc::new(
                                 zerodb::EnvBuilder::new()
-                                    .map_size(2 * 1024 * 1024 * 1024) // 2GB to handle large dataset
+                                    .map_size(map_size)
                                     .open(dir.path())
                                     .unwrap(),
                             );
@@ -234,9 +267,18 @@ fn bench_random_writes(c: &mut Criterion) {
                     b.iter_batched(
                         || {
                             let dir = TempDir::new().unwrap();
+                            // Use same map size as ZeroDB for fair comparison
+                            let map_size = if dataset_size >= LARGE_DATASET && value_size >= LARGE_VALUE {
+                                20 * 1024 * 1024 * 1024 // 20GB
+                            } else if dataset_size >= MEDIUM_DATASET && value_size >= MEDIUM_VALUE {
+                                4 * 1024 * 1024 * 1024 // 4GB
+                            } else {
+                                2 * 1024 * 1024 * 1024 // 2GB
+                            };
+                            
                             let env = unsafe {
                                 heed::EnvOpenOptions::new()
-                                    .map_size(2 * 1024 * 1024 * 1024) // 2GB to handle large dataset
+                                    .map_size(map_size)
                                     .open(dir.path())
                                     .unwrap()
                             };

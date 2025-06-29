@@ -139,6 +139,19 @@ pub enum Error {
     /// Invalid page ID
     #[error("Invalid page ID: {0}")]
     InvalidPageId(PageId),
+    
+    /// Page ID exceeds database size limit
+    #[error("Page ID {page_id} exceeds database limit: requested page {page_id} (offset {offset} bytes) but database has only {max_pages} pages ({db_size} bytes). Consider increasing map_size.")]
+    PageExceedsLimit {
+        /// The requested page ID
+        page_id: PageId,
+        /// Maximum pages in database
+        max_pages: u64,
+        /// Current database size in bytes
+        db_size: u64,
+        /// Requested offset in bytes
+        offset: u64,
+    },
 
     /// Invalid page type
     #[error("Invalid page type: expected {expected:?}, found {found:?}")]

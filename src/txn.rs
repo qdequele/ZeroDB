@@ -258,7 +258,12 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
         let inner = self.data.env.inner();
         let num_pages = inner.io.size_in_pages();
         if page_id.0 >= num_pages {
-            return Err(Error::InvalidPageId(page_id));
+            return Err(Error::PageExceedsLimit {
+                page_id,
+                max_pages: num_pages,
+                db_size: num_pages * crate::page::PAGE_SIZE as u64,
+                offset: page_id.0 * crate::page::PAGE_SIZE as u64,
+            });
         }
         
         // Special handling for meta pages (0 and 1)
@@ -454,7 +459,12 @@ impl<'env, M: mode::Mode> Transaction<'env, M> {
                                 // Validate page ID before reading
                                 let num_pages = inner.io.size_in_pages();
                                 if current_root.0 >= num_pages {
-                                    return Err(Error::InvalidPageId(current_root));
+                                    return Err(Error::PageExceedsLimit {
+                                        page_id: current_root,
+                                        max_pages: num_pages,
+                                        db_size: num_pages * crate::page::PAGE_SIZE as u64,
+                                        offset: current_root.0 * crate::page::PAGE_SIZE as u64,
+                                    });
                                 }
                                 // Need to make the page dirty first
                                 let page = inner.io.read_page(current_root)?;
@@ -643,7 +653,12 @@ impl<'env> Transaction<'env, Write> {
         let inner = self.data.env.inner();
         let num_pages = inner.io.size_in_pages();
         if page_id.0 >= num_pages {
-            return Err(Error::InvalidPageId(page_id));
+            return Err(Error::PageExceedsLimit {
+                page_id,
+                max_pages: num_pages,
+                db_size: num_pages * crate::page::PAGE_SIZE as u64,
+                offset: page_id.0 * crate::page::PAGE_SIZE as u64,
+            });
         }
         
         // Check if already dirty in this transaction
@@ -764,7 +779,12 @@ impl<'env> Transaction<'env, Write> {
         let inner = self.data.env.inner();
         let num_pages = inner.io.size_in_pages();
         if page_id.0 >= num_pages {
-            return Err(Error::InvalidPageId(page_id));
+            return Err(Error::PageExceedsLimit {
+                page_id,
+                max_pages: num_pages,
+                db_size: num_pages * crate::page::PAGE_SIZE as u64,
+                offset: page_id.0 * crate::page::PAGE_SIZE as u64,
+            });
         }
         
         // For now, keep the old behavior for compatibility
@@ -870,7 +890,12 @@ impl<'env> Transaction<'env, Write> {
         let inner = self.data.env.inner();
         let num_pages = inner.io.size_in_pages();
         if page_id.0 >= num_pages {
-            return Err(Error::InvalidPageId(page_id));
+            return Err(Error::PageExceedsLimit {
+                page_id,
+                max_pages: num_pages,
+                db_size: num_pages * crate::page::PAGE_SIZE as u64,
+                offset: page_id.0 * crate::page::PAGE_SIZE as u64,
+            });
         }
         
         if let ModeData::Write { ref mut freelist, ref mut segregated_freelist, .. } =
@@ -960,7 +985,12 @@ impl<'env> Transaction<'env, Write> {
         
         // Validate start and end pages
         if start_page_id.0 >= num_pages {
-            return Err(Error::InvalidPageId(start_page_id));
+            return Err(Error::PageExceedsLimit {
+                page_id: start_page_id,
+                max_pages: num_pages,
+                db_size: num_pages * crate::page::PAGE_SIZE as u64,
+                offset: start_page_id.0 * crate::page::PAGE_SIZE as u64,
+            });
         }
         
         let end_page_id = PageId(start_page_id.0 + count as u64 - 1);
