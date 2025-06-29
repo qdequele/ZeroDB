@@ -259,7 +259,7 @@ fn test_cursor_modifications() -> Result<()> {
     };
 
     {
-        let mut txn = env.write_txn()?;
+        let txn = env.write_txn()?;
         let mut cursor = db.cursor(&txn)?;
 
         // Add new entry

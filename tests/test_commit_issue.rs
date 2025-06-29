@@ -14,7 +14,7 @@ fn test_direct_batch_75_to_100() -> Result<()> {
     let env = Arc::new(
         EnvBuilder::new()
             .map_size(200 * 1024 * 1024)
-            .use_segregated_freelist(true)
+            
             .open(dir.path())?,
     );
     
@@ -65,7 +65,7 @@ fn test_cumulative_insert_pattern() -> Result<()> {
     let env = Arc::new(
         EnvBuilder::new()
             .map_size(200 * 1024 * 1024)
-            .use_segregated_freelist(true)
+            
             .open(dir.path())?,
     );
     

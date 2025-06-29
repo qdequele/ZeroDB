@@ -14,7 +14,7 @@ fn test_debug_insert_issue() -> Result<()> {
     let env = Arc::new(
         EnvBuilder::new()
             .map_size(200 * 1024 * 1024)
-            .use_segregated_freelist(true)
+            
             .open(dir.path())?,
     );
     

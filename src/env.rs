@@ -10,19 +10,11 @@ use std::sync::{Arc, RwLock};
 use crate::error::{Error, PageId, Result, TransactionId};
 use crate::io::{IoBackend, MmapBackend};
 use crate::meta::{DbInfo, MetaPage, META_PAGE_1, META_PAGE_2};
-use crate::page::{Page, PageHeader, PAGE_SIZE};
+use crate::page::Page;
 use crate::reader::ReaderTable;
 use crate::txn::{Read, Transaction, Write};
 
-/// Environment configuration
-#[derive(Debug, Clone)]
-pub(crate) struct EnvConfig {
-    /// Use segregated freelist for better allocation performance
-    pub use_segregated_freelist: bool,
-    /// Use NUMA-aware allocation
-    #[allow(dead_code)]
-    pub use_numa: bool,
-}
+
 
 /// Environment state marker traits
 pub mod state {
@@ -74,45 +66,7 @@ pub enum DurabilityMode {
     FullSync,
 }
 
-/// Page pool for recycling allocations
-pub(crate) struct PagePool {
-    /// Pool of recycled pages
-    pages: Mutex<Vec<Box<Page>>>,
-    /// Maximum pages to keep in pool
-    #[allow(dead_code)]
-    max_pages: usize,
-}
 
-impl PagePool {
-    /// Create a new page pool
-    pub fn new(max_pages: usize) -> Self {
-        Self { pages: Mutex::new(Vec::with_capacity(max_pages)), max_pages }
-    }
-
-    /// Get a page from the pool or allocate a new one
-    pub fn get(&self, page_id: PageId, flags: crate::page::PageFlags) -> Box<Page> {
-        let mut pool = self.pages.lock();
-        if let Some(mut page) = pool.pop() {
-            // Reuse existing page
-            page.header = PageHeader::new(page_id.0, flags);
-            page.data = [0; PAGE_SIZE - PageHeader::SIZE];
-            page
-        } else {
-            // Allocate new page
-            Page::new(page_id, flags)
-        }
-    }
-
-    /// Return a page to the pool
-    #[allow(dead_code)]
-    pub fn put(&self, page: Box<Page>) {
-        let mut pool = self.pages.lock();
-        if pool.len() < self.max_pages {
-            pool.push(page);
-        }
-        // Otherwise, let it be deallocated
-    }
-}
 
 /// Shared environment data
 pub(crate) struct EnvInner {
@@ -121,7 +75,7 @@ pub(crate) struct EnvInner {
     /// I/O backend
     pub(crate) io: Box<dyn IoBackend>,
     /// Current map size
-    _map_size: usize,
+    pub(crate) map_size: usize,
     /// Current transaction ID
     pub(crate) txn_id: AtomicU64,
     /// Write lock
@@ -134,24 +88,11 @@ pub(crate) struct EnvInner {
     pub(crate) _free_pages: RwLock<Vec<PageId>>,
     /// Durability mode
     pub(crate) durability: DurabilityMode,
-    /// Checksum mode
-    pub(crate) checksum_mode: crate::checksum::ChecksumMode,
+
     /// Next page ID to allocate
     pub(crate) next_page_id: AtomicU64,
-    /// Page pool for COW operations
-    pub(crate) page_pool: PagePool,
-    /// Use segregated freelist for better allocation performance
-    pub(crate) use_segregated_freelist: bool,
-    /// NUMA-aware page allocator (if enabled)
-    pub(crate) numa_allocator: Option<Arc<crate::numa::NumaPageAllocator>>,
-    /// Maximum key size in bytes
-    #[allow(dead_code)]
-    pub(crate) max_key_size: usize,
-    /// Maximum value size in bytes (for inline storage)
-    #[allow(dead_code)]
-    pub(crate) max_value_size: usize,
-    /// Maximum database size in bytes
-    pub(crate) max_database_size: Option<usize>,
+
+
 }
 
 // Safety: EnvInner is Send/Sync because IoBackend is Send/Sync
@@ -165,18 +106,7 @@ impl EnvInner {
         let meta0 = self.io.read_page(META_PAGE_1)?;
         let meta1 = self.io.read_page(META_PAGE_2)?;
         
-        // Validate checksums if enabled (meta pages always validated in MetaOnly mode)
-        if self.checksum_mode != crate::checksum::ChecksumMode::None {
-            use crate::checksum::ChecksummedPage;
-            // For meta pages, we try to validate but don't fail if checksum is missing (0)
-            // This allows for backward compatibility
-            if meta0.has_checksum() {
-                meta0.validate_checksum()?;
-            }
-            if meta1.has_checksum() {
-                meta1.validate_checksum()?;
-            }
-        }
+
 
         // Validate MetaPage fits in page data before casting
         if size_of::<MetaPage>() > meta0.data.len() || size_of::<MetaPage>() > meta1.data.len() {
@@ -229,78 +159,9 @@ impl EnvInner {
         }
     }
 
-    /// Validate key size against configured maximum
-    #[allow(dead_code)]
-    pub(crate) fn validate_key_size(&self, key_size: usize) -> Result<()> {
-        if key_size > self.max_key_size {
-            return Err(Error::KeyTooLarge {
-                size: key_size,
-                max_size: self.max_key_size,
-            });
-        }
-        Ok(())
-    }
 
-    /// Validate value size against configured maximum
-    #[allow(dead_code)]
-    pub(crate) fn validate_value_size(&self, value_size: usize) -> Result<()> {
-        if value_size > self.max_value_size {
-            return Err(Error::ValueTooLarge {
-                size: value_size,
-                max_size: self.max_value_size,
-            });
-        }
-        Ok(())
-    }
 
-    /// Validate page ID is within allocated range
-    #[allow(dead_code)]
-    pub(crate) fn validate_page_id(&self, page_id: PageId) -> Result<()> {
-        let max_pages = self.io.size_in_pages();
-        
-        if page_id.0 >= max_pages {
-            return Err(Error::PageOutOfBounds {
-                page_id,
-                max_pages,
-            });
-        }
-        Ok(())
-    }
 
-    /// Check if adding new pages would exceed database size limit
-    pub(crate) fn check_database_size_limit(&self, pages_to_add: u64) -> Result<()> {
-        if let Some(max_size) = self.max_database_size {
-            let current_pages = self.io.size_in_pages();
-            // Use checked multiplication to prevent overflow
-            let current_size = current_pages
-                .checked_mul(PAGE_SIZE as u64)
-                .ok_or(Error::Custom("Current database size calculation overflow".into()))?;
-            let additional_size = pages_to_add
-                .checked_mul(PAGE_SIZE as u64)
-                .ok_or(Error::Custom("Additional size calculation overflow".into()))?;
-            let new_size = current_size
-                .checked_add(additional_size)
-                .ok_or(Error::Custom("Total size calculation overflow".into()))?;
-            
-            if new_size > max_size as u64 {
-                return Err(Error::DatabaseFull {
-                    current_size,
-                    requested_size: new_size,
-                    max_size: max_size as u64,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// Check for integer overflow in size calculations
-    #[allow(dead_code)]
-    pub(crate) fn check_size_overflow(&self, size1: usize, size2: usize) -> Result<usize> {
-        size1.checked_add(size2).ok_or_else(|| Error::IntegerOverflow {
-            operation: "size addition".to_string(),
-            values: format!("{} + {}", size1, size2),
-        })
-    }
 }
 
 /// Database environment
@@ -316,12 +177,7 @@ pub struct EnvBuilder {
     max_dbs: u32,
     _flags: u32,
     durability: DurabilityMode,
-    checksum_mode: crate::checksum::ChecksumMode,
-    use_segregated_freelist: bool,
     use_numa: bool,
-    max_key_size: usize,
-    max_value_size: usize,
-    max_database_size: Option<usize>,
 }
 
 impl EnvBuilder {
@@ -333,12 +189,7 @@ impl EnvBuilder {
             max_dbs: MAX_DBS,
             _flags: 0,
             durability: DurabilityMode::AsyncFlush,
-            checksum_mode: crate::checksum::ChecksumMode::Full,
-            use_segregated_freelist: false,
             use_numa: false,
-            max_key_size: crate::DEFAULT_MAX_KEY_SIZE,
-            max_value_size: crate::page::MAX_VALUE_SIZE,
-            max_database_size: None, // No limit by default
         }
     }
 
@@ -366,17 +217,9 @@ impl EnvBuilder {
         self
     }
 
-    /// Set the checksum mode
-    pub fn checksum_mode(mut self, mode: crate::checksum::ChecksumMode) -> Self {
-        self.checksum_mode = mode;
-        self
-    }
 
-    /// Enable segregated freelist for better allocation performance
-    pub fn use_segregated_freelist(mut self, enabled: bool) -> Self {
-        self.use_segregated_freelist = enabled;
-        self
-    }
+
+
 
     /// Enable NUMA-aware memory allocation for multi-socket systems
     pub fn use_numa(mut self, enabled: bool) -> Self {
@@ -384,23 +227,9 @@ impl EnvBuilder {
         self
     }
 
-    /// Set the maximum key size in bytes
-    pub fn max_key_size(mut self, size: usize) -> Self {
-        self.max_key_size = size;
-        self
-    }
 
-    /// Set the maximum value size in bytes (for inline storage)
-    pub fn max_value_size(mut self, size: usize) -> Self {
-        self.max_value_size = size;
-        self
-    }
 
-    /// Set the maximum database size in bytes
-    pub fn max_database_size(mut self, size: usize) -> Self {
-        self.max_database_size = Some(size);
-        self
-    }
+
 
     /// Build and open the environment
     pub fn open(self, path: impl AsRef<Path>) -> Result<Environment<Open>> {
@@ -467,21 +296,14 @@ impl EnvBuilder {
             let inner = Arc::new(EnvInner {
                 _path: path.to_path_buf(),
                 io,
-                _map_size: self.map_size,
+                map_size: self.map_size,
                 txn_id: AtomicU64::new(0),
                 write_lock: Mutex::new(()),
                 readers: ReaderTable::new(self.max_readers as usize),
                 databases: RwLock::new(HashMap::new()),
                 _free_pages: RwLock::new(Vec::new()),
                 durability: self.durability,
-                checksum_mode: self.checksum_mode,
                 next_page_id: AtomicU64::new(0),
-                page_pool: PagePool::new(128), // Keep up to 128 pages in pool
-                use_segregated_freelist: self.use_segregated_freelist,
-                numa_allocator: None, // Will be initialized later if needed
-                max_key_size: self.max_key_size,
-                max_value_size: self.max_value_size,
-                max_database_size: self.max_database_size,
             });
 
             meta_info = inner.meta()?;
@@ -499,31 +321,14 @@ impl EnvBuilder {
         let inner = Arc::new(EnvInner {
             _path: path.to_path_buf(),
             io,
-            _map_size: self.map_size,
+            map_size: self.map_size,
             txn_id: AtomicU64::new(last_txn_id),
             write_lock: Mutex::new(()),
             readers,
             databases: RwLock::new(HashMap::new()),
             _free_pages: RwLock::new(Vec::new()),
             durability: self.durability,
-            checksum_mode: self.checksum_mode,
             next_page_id: AtomicU64::new(last_page_id + 1),
-            page_pool: PagePool::new(128), // Keep up to 128 pages in pool
-            use_segregated_freelist: self.use_segregated_freelist,
-            numa_allocator: if self.use_numa {
-                match crate::numa::NumaPageAllocator::new(256) {
-                    Ok(allocator) => Some(Arc::new(allocator)),
-                    Err(_) => {
-                        // NUMA initialization failed, fall back to regular allocation
-                        None
-                    }
-                }
-            } else {
-                None
-            },
-            max_key_size: self.max_key_size,
-            max_value_size: self.max_value_size,
-            max_database_size: self.max_database_size,
         });
 
         // Initialize main database entry
@@ -581,14 +386,7 @@ impl Environment<Open> {
         self.inner.as_ref().expect("Environment not open")
     }
 
-    /// Get environment configuration (for internal use)
-    pub(crate) fn config(&self) -> EnvConfig {
-        let inner = self.inner();
-        EnvConfig {
-            use_segregated_freelist: inner.use_segregated_freelist,
-            use_numa: inner.numa_allocator.is_some(),
-        }
-    }
+
 
     /// Get inner reference (for testing)
     #[cfg(test)]
@@ -628,19 +426,12 @@ impl Environment<Open> {
         // Get free pages count from a read transaction
         let free_pages = {
             let _txn = self.read_txn()?;
-            // Access the transaction's data to get freelist info
-            if inner.use_segregated_freelist {
-                // Count segregated freelist pages
-                // For now, estimate based on the difference
-                total_pages.saturating_sub(next_page_id)
-            } else {
-                // Count regular freelist pages
-                total_pages.saturating_sub(next_page_id)
-            }
+            // Count regular freelist pages
+            total_pages.saturating_sub(next_page_id)
         };
         
         let used_pages = next_page_id;
-        let map_size = inner._map_size as u64;
+        let map_size = inner.map_size as u64;
         
         Ok(crate::space_info::SpaceInfo::new(
             total_pages,

@@ -29,52 +29,9 @@ pub enum Error {
     #[error("Key not found")]
     KeyNotFound,
 
-    /// Database is full
-    #[error("Database full: current size is {current_size} bytes, requested {requested_size} bytes, max is {max_size} bytes")]
-    DatabaseFull {
-        /// Current database size
-        current_size: u64,
-        /// Requested new size
-        requested_size: u64,
-        /// Maximum allowed size
-        max_size: u64,
-    },
-
-    /// Key too large
-    #[error("Key too large: {size} bytes, max is {max_size} bytes")]
-    KeyTooLarge {
-        /// Size of the key
-        size: usize,
-        /// Maximum allowed size
-        max_size: usize,
-    },
-
-    /// Value too large
-    #[error("Value too large: {size} bytes, max is {max_size} bytes")]
-    ValueTooLarge {
-        /// Size of the value
-        size: usize,
-        /// Maximum allowed size
-        max_size: usize,
-    },
-
-    /// Page out of bounds
-    #[error("Page ID {page_id} out of bounds, max is {max_pages}")]
-    PageOutOfBounds {
-        /// The out-of-bounds page ID
-        page_id: PageId,
-        /// Maximum allowed pages
-        max_pages: u64,
-    },
-
-    /// Integer overflow
-    #[error("Integer overflow in {operation}: {values}")]
-    IntegerOverflow {
-        /// Operation that overflowed
-        operation: String,
-        /// Values that caused overflow
-        values: String,
-    },
+    /// Map full - no more space available
+    #[error("Map full")]
+    MapFull,
 
     /// Invalid operation attempted
     #[error("Invalid operation: {0}")]
@@ -117,10 +74,6 @@ pub enum Error {
     #[error("Invalid parameter: {0}")]
     InvalidParameter(&'static str),
 
-    /// Map full - too many databases open
-    #[error("Map full: too many databases open")]
-    MapFull,
-
     /// Reader table full
     #[error("Reader table full")]
     ReadersFull,
@@ -139,19 +92,6 @@ pub enum Error {
     /// Invalid page ID
     #[error("Invalid page ID: {0}")]
     InvalidPageId(PageId),
-    
-    /// Page ID exceeds database size limit
-    #[error("Page ID {page_id} exceeds database limit: requested page {page_id} (offset {offset} bytes) but database has only {max_pages} pages ({db_size} bytes). Consider increasing map_size.")]
-    PageExceedsLimit {
-        /// The requested page ID
-        page_id: PageId,
-        /// Maximum pages in database
-        max_pages: u64,
-        /// Current database size in bytes
-        db_size: u64,
-        /// Requested offset in bytes
-        offset: u64,
-    },
 
     /// Invalid page type
     #[error("Invalid page type: expected {expected:?}, found {found:?}")]
@@ -280,7 +220,7 @@ impl Error {
             -30788 => Error::TxnFull { size: 0 },                   // MDB_TXN_FULL
             -30787 => Error::Custom("cursor stack too deep".into()), // MDB_CURSOR_FULL
             -30786 => Error::Custom("page has no more space".into()), // MDB_PAGE_FULL
-            -30785 => Error::DatabaseFull { current_size: 0, requested_size: 0, max_size: 0 }, // MDB_MAP_RESIZED
+            -30785 => Error::MapFull, // MDB_MAP_RESIZED
             -30784 => Error::InvalidOperation("incompatible operation"), // MDB_INCOMPATIBLE
             -30783 => Error::BadTransaction,                        // MDB_BAD_RSLOT
             -30782 => Error::BadTransaction,                        // MDB_BAD_TXN
@@ -302,7 +242,7 @@ impl Error {
             Error::MapFull => -30793,
             Error::ReadersFull => -30791,
             Error::TxnFull { .. } => -30788,
-            Error::DatabaseFull { .. } => -30785,
+
             Error::BadTransaction => -30782,
             Error::NotFound => -30799,
             _ => -1,

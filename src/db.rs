@@ -297,31 +297,9 @@ impl<K: Key, V: Value, C: Comparator> Database<K, V, C> {
         let key_bytes = key.encode()?;
         let value_bytes = value.encode()?;
 
-        // Validate key and value sizes
+        // Basic validation - empty keys not allowed (LMDB behavior)
         if key_bytes.is_empty() {
             return Err(Error::Custom("Key cannot be empty".into()));
-        }
-        
-        // Maximum key size (leaving room for headers and other metadata)
-        const MAX_KEY_SIZE: usize = 511; // LMDB's default max key size
-        if key_bytes.len() > MAX_KEY_SIZE {
-            return Err(Error::Custom(format!(
-                "Key size {} exceeds maximum allowed size of {} bytes", 
-                key_bytes.len(), 
-                MAX_KEY_SIZE
-            ).into()));
-        }
-        
-        // Maximum value size without overflow (approximate, leaving room for headers)
-        // Maximum total size including overflow pages (e.g., 1GB)
-        const MAX_TOTAL_VALUE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
-        
-        if value_bytes.len() > MAX_TOTAL_VALUE_SIZE {
-            return Err(Error::Custom(format!(
-                "Value size {} exceeds maximum allowed size of {} bytes", 
-                value_bytes.len(), 
-                MAX_TOTAL_VALUE_SIZE
-            ).into()));
         }
 
         // Get mutable db info
@@ -436,27 +414,9 @@ impl<K: Key, V: Value, C: Comparator> Database<K, V, C> {
         let key_bytes = key.encode()?;
         let value_bytes = value.encode()?;
 
-        // Validate key and value sizes (same validation as put())
+        // Basic validation - empty keys not allowed (LMDB behavior)
         if key_bytes.is_empty() {
             return Err(Error::Custom("Key cannot be empty".into()));
-        }
-        
-        const MAX_KEY_SIZE: usize = 511; // LMDB's default max key size
-        if key_bytes.len() > MAX_KEY_SIZE {
-            return Err(Error::Custom(format!(
-                "Key size {} exceeds maximum allowed size of {} bytes", 
-                key_bytes.len(), 
-                MAX_KEY_SIZE
-            ).into()));
-        }
-        
-        const MAX_TOTAL_VALUE_SIZE: usize = 1024 * 1024 * 1024; // 1GB
-        if value_bytes.len() > MAX_TOTAL_VALUE_SIZE {
-            return Err(Error::Custom(format!(
-                "Value size {} exceeds maximum allowed size of {} bytes", 
-                value_bytes.len(), 
-                MAX_TOTAL_VALUE_SIZE
-            ).into()));
         }
 
         // Get mutable db info

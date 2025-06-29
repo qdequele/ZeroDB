@@ -9,7 +9,7 @@ fn test_cow_delete_operations() -> Result<()> {
     let env = Arc::new(
         EnvBuilder::new()
             .map_size(100 * 1024 * 1024)
-            .use_segregated_freelist(true)
+            
             .open(dir.path())?,
     );
     

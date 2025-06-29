@@ -19,20 +19,21 @@ fn test_btree_split_insertion() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Insert entries until we trigger a split
-    let num_entries = 60; // Should be enough to trigger at least one split
+    let num_entries = 200; // Increased to ensure we trigger a split
 
     {
         let mut txn = env.write_txn()?;
 
         for i in 0..num_entries {
-            let key = format!("key_{:03}", i.to_string());
-            let value = vec![i as u8; 100];
+            let key = format!("key_{:03}", i);
+            let value = vec![i as u8; 1000]; // Increased value size to force split
             db.put(&mut txn, key.clone(), value)?;
         }
 
         let final_info = txn.db_info(Some("test_db"))?;
         assert!(final_info.entries == num_entries as u64);
-        assert!(final_info.depth > 1); // Should have split
+        println!("Tree depth: {}, entries: {}", final_info.depth, final_info.entries);
+        assert!(final_info.depth > 1); // Should have split with 200 entries
 
         txn.commit()?;
     }

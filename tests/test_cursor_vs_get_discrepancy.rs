@@ -14,7 +14,7 @@ fn test_cursor_vs_get_at_limit() -> Result<()> {
     let env = Arc::new(
         EnvBuilder::new()
             .map_size(1024 * 1024 * 1024)
-            .use_segregated_freelist(true)
+            
             .open(dir.path())?,
     );
     

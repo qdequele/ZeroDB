@@ -222,13 +222,13 @@ mod tests {
         free_tree(&mut txn, current_root).unwrap();
 
         // Check that pages were marked for freeing
-        if let crate::txn::ModeData::Write { ref freelist, .. } = txn.mode_data {
-            let pending = freelist.pending_len();
+        if let crate::txn::ModeData::Write { ref page_alloc, .. } = txn.mode_data {
+            let freed_count = page_alloc.freed_pages().len();
             // We should have freed all pages in the tree
             assert_eq!(
-                pending, page_count,
-                "Expected {} pending pages, got {}",
-                page_count, pending
+                freed_count, page_count,
+                "Expected {} freed pages, got {}",
+                page_count, freed_count
             );
         }
     }

@@ -19,7 +19,6 @@ pub mod branch_compressed;
 pub mod btree;
 pub mod cache_aligned;
 pub mod catalog;
-pub mod checksum;
 pub mod comparator;
 pub mod copy;
 pub mod cursor;
@@ -37,12 +36,13 @@ pub mod node;
 pub mod node_utils;
 pub mod numa;
 pub mod overflow;
+pub mod overflow_consecutive;
 pub mod overflow_stream;
 pub mod page;
+pub mod page_allocator;
 pub mod page_capacity;
 pub mod preflight_checks;
 pub mod reader;
-pub mod segregated_freelist;
 pub mod simd;
 pub mod simd_advanced;
 pub mod space_info;
@@ -68,7 +68,7 @@ pub type RwTxn<'env> = Transaction<'env, txn::Write>;
 pub const DEFAULT_PAGE_SIZE: usize = 4096;
 
 /// Maximum key size (when not using longer-keys feature)
-pub const DEFAULT_MAX_KEY_SIZE: usize = 511;
+
 
 /// Library version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -88,11 +88,7 @@ impl AutoGrowState {
         // Check against maximum
         if new_size > self.config.max_size {
             if current_size >= self.config.max_size {
-                return Err(Error::DatabaseFull {
-                    current_size,
-                    requested_size: new_size,
-                    max_size: self.config.max_size,
-                });
+                return Err(Error::MapFull);
             }
             // Cap at maximum
             Ok(self.config.max_size)

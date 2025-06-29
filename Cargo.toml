@@ -78,8 +78,7 @@ harness = false
 [[example]]
 name = "simple"
 
-[[example]]
-name = "segregated_freelist_demo"
+
 
 [[example]]
 name = "numa_demo"

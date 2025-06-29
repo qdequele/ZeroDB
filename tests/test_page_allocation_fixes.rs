@@ -14,7 +14,7 @@ fn test_mixed_key_patterns_no_page_full() -> Result<()> {
     let env = Arc::new(
         EnvBuilder::new()
             .map_size(100 * 1024 * 1024)
-            .use_segregated_freelist(true)
+            
             .open(dir.path())?,
     );
     

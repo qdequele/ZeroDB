@@ -18,7 +18,7 @@ fn test_mixed_insert_delete_large_values() -> Result<()> {
     let env = Arc::new(
         EnvBuilder::new()
             .map_size(100 * 1024 * 1024)
-            .use_segregated_freelist(true)
+            
             .open(dir.path())?,
     );
     
@@ -215,7 +215,7 @@ fn test_no_page_full_on_delete_stress() -> Result<()> {
     let env = Arc::new(
         EnvBuilder::new()
             .map_size(200 * 1024 * 1024)
-            .use_segregated_freelist(true)
+            
             .open(dir.path())?,
     );
     

@@ -69,8 +69,7 @@ pub struct PageHeader {
     pub upper: u16,
     /// Overflow page count (or parent page for branch)
     pub overflow: u32,
-    /// Page checksum (CRC32) - 0 means no checksum
-    pub checksum: u32,
+
     /// Next leaf page (for leaf chaining) - 0 means no next page
     pub next_pgno: u64,
     /// Previous leaf page (for leaf chaining) - 0 means no prev page
@@ -90,7 +89,6 @@ impl PageHeader {
             lower: Self::SIZE as u16,
             upper: PAGE_SIZE as u16,
             overflow: 0,
-            checksum: 0,
             next_pgno: 0,
             prev_pgno: 0,
         }
@@ -274,17 +272,13 @@ impl Page {
         Ok(())
     }
 
-    /// Comprehensive page validation combining header, checksum, and partial write detection
+    /// Comprehensive page validation combining header and partial write detection
     pub fn validate(&self) -> Result<()> {
         // First validate the header structure
         self.validate_header()?;
         
         // Then check for partial writes
         self.detect_partial_write()?;
-        
-        // Finally validate checksum if present
-        use crate::checksum::ChecksummedPage;
-        self.validate_checksum()?;
         
         Ok(())
     }

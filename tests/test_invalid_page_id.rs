@@ -15,7 +15,7 @@ fn test_reproduce_invalid_page_id_error() {
     let dir = TempDir::new().unwrap();
     let env = Arc::new(
         EnvBuilder::new()
-            .map_size(2 * 1024 * 1024 * 1024) // 2GB map size like in benchmark
+            .map_size(12 * 1024 * 1024 * 1024) // 12GB map size to accommodate 100K * 100KB = ~10GB
             .open(dir.path())
             .unwrap(),
     );
@@ -66,7 +66,7 @@ fn test_gradual_insert_with_large_values() {
     let dir = TempDir::new().unwrap();
     let env = Arc::new(
         EnvBuilder::new()
-            .map_size(2 * 1024 * 1024 * 1024) // 2GB map size
+            .map_size(3 * 1024 * 1024 * 1024) // 3GB map size to accommodate the test data
             .open(dir.path())
             .unwrap(),
     );
@@ -86,7 +86,7 @@ fn test_gradual_insert_with_large_values() {
         
         let mut txn = env.write_txn().unwrap();
         
-        for i in 0..BATCH_SIZE {
+        for _i in 0..BATCH_SIZE {
             let key = format!("key_{:08}", key_count).into_bytes();
             
             match db.put(&mut txn, key.clone(), value.clone()) {
@@ -126,7 +126,7 @@ fn test_exact_failure_point() {
     let dir = TempDir::new().unwrap();
     let env = Arc::new(
         EnvBuilder::new()
-            .map_size(2 * 1024 * 1024 * 1024) // 2GB map size
+            .map_size(3 * 1024 * 1024 * 1024) // 3GB map size to accommodate the test data
             .open(dir.path())
             .unwrap(),
     );

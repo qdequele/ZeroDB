@@ -208,11 +208,11 @@ fn test_freelist_transaction_isolation() -> Result<()> {
 
 #[test]
 #[ignore = "Skipping due to 'Key already exists' bug in core implementation"]
-fn test_segregated_freelist() -> Result<()> {
+fn test_simple_freelist() -> Result<()> {
     let dir = TempDir::new().unwrap();
     let env = Arc::new(
         EnvBuilder::new()
-            .use_segregated_freelist(true)
+            
             .open(dir.path())?
     );
     
@@ -267,21 +267,21 @@ fn test_segregated_freelist() -> Result<()> {
         txn.commit()?;
     }
     
-    // Allocate new entries - segregated freelist should match sizes efficiently
+    // Allocate new entries - simple freelist will reuse pages
     {
         let mut txn = env.write_txn()?;
         
-        // New small entries should reuse small freed pages
+        // New small entries 
         for i in 200..210 {
             db.put(&mut txn, i.to_string(), vec![i as u8; 50])?;
         }
         
-        // New medium entries should reuse medium freed pages
+        // New medium entries
         for i in 210..220 {
             db.put(&mut txn, i.to_string(), vec![i as u8; 2000])?;
         }
         
-        // New large entries should reuse large freed pages
+        // New large entries
         for i in 220..225 {
             db.put(&mut txn, i.to_string(), vec![i as u8; 10000])?;
         }

@@ -145,7 +145,7 @@ fn test_transaction_size_limits() -> Result<()> {
         for i in 0..2000 {
             match db.put(&mut txn, i.to_string(), large_value.clone()) {
                 Ok(_) => continue,
-                Err(zerodb::Error::DatabaseFull { .. }) => {
+                Err(zerodb::Error::MapFull) => {
                     // Expected at some point
                     println!("Hit page limit at iteration {}", i);
                     break;
@@ -205,16 +205,12 @@ fn test_database_full() -> Result<()> {
 }
 
 #[test]
-fn test_corrupted_page_handling() -> Result<()> {
-    // This test would require checksums to be enabled
-    // Currently just a placeholder for when checksum validation is added
+fn test_basic_data_integrity() -> Result<()> {
+    // Basic test for data integrity without checksums
+    // LMDB relies on the storage stack for integrity
     
     let dir = TempDir::new().unwrap();
-    let env = Arc::new(
-        EnvBuilder::new()
-            // Checksums not available in current API
-            .open(dir.path())?
-    );
+    let env = Arc::new(EnvBuilder::new().open(dir.path())?);
     
     let db = {
         let mut txn = env.write_txn()?;
@@ -226,12 +222,7 @@ fn test_corrupted_page_handling() -> Result<()> {
         db
     };
     
-    // In a real test, we would:
-    // 1. Close the environment
-    // 2. Corrupt some bytes in the database file
-    // 3. Reopen and verify checksum errors are detected
-    
-    // For now, just verify checksums work on valid data
+    // Verify all data can be read back correctly
     {
         let txn = env.read_txn()?;
         for i in 0..100 {

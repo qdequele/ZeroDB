@@ -7,13 +7,12 @@ use tempfile::TempDir;
 use std::sync::Arc;
 
 #[test]
-fn test_database_size_limit_enforcement() {
+fn test_map_size_limit_enforcement() {
     let dir = TempDir::new().unwrap();
     
-    // Create environment with a small size limit (1MB)
+    // Create environment with a small map size (2MB)
     let env = Arc::new(EnvBuilder::new()
-        .map_size(10 * 1024 * 1024) // 10MB map size
-        .max_database_size(1024 * 1024) // 1MB limit
+        .map_size(2 * 1024 * 1024) // 2MB map size
         .durability(DurabilityMode::NoSync)
         .open(dir.path())
         .unwrap());
@@ -26,7 +25,7 @@ fn test_database_size_limit_enforcement() {
         db
     };
     
-    // Write data until we hit the size limit
+    // Write data until we hit the map size limit
     let value = vec![0u8; 1024]; // 1KB value
     let mut key_counter = 0u64;
     let mut hit_limit = false;
@@ -35,25 +34,17 @@ fn test_database_size_limit_enforcement() {
         let mut txn = env.write_txn().unwrap();
         
         // Try to insert multiple entries in one transaction
-        for _ in 0..100 {
+        for _ in 0..50 {
             let key = key_counter.to_be_bytes().to_vec();
             match db.put(&mut txn, key, value.clone()) {
                 Ok(()) => {
                     key_counter += 1;
                 }
-                Err(Error::DatabaseFull { .. }) => {
+                Err(Error::MapFull) => {
                     hit_limit = true;
                     break;
                 }
                 Err(e) => {
-                    // Check if it's a custom error about page allocation
-                    if let Error::Custom(msg) = &e {
-                        if msg.contains("Page ID") && msg.contains("exceeds maximum allowed value") {
-                            // This is expected when we hit internal limits
-                            hit_limit = true;
-                            break;
-                        }
-                    }
                     panic!("Unexpected error: {:?}", e);
                 }
             }
@@ -67,7 +58,7 @@ fn test_database_size_limit_enforcement() {
         // Commit the transaction
         match txn.commit() {
             Ok(()) => {}
-            Err(Error::DatabaseFull { .. }) => {
+            Err(Error::MapFull) => {
                 break;
             }
             Err(e) => {
@@ -76,23 +67,23 @@ fn test_database_size_limit_enforcement() {
         }
         
         // Safety check to prevent infinite loop
-        if key_counter > 10000 {
+        if key_counter > 5000 {
             panic!("Wrote too much data without hitting limit");
         }
     }
     
-    // Successfully hit the database size limit
-    println!("Successfully hit database size limit after {} entries", key_counter);
+    // Successfully hit the map size limit
+    println!("Successfully hit map size limit after {} entries", key_counter);
+    assert!(key_counter > 0); // Should have written at least some data
 }
 
 #[test]
-fn test_database_size_limit_with_overflow_pages() {
+fn test_map_size_limit_with_overflow_pages() {
     let dir = TempDir::new().unwrap();
     
-    // Create environment with a small size limit (2MB)
+    // Create environment with a small map size (3MB)
     let env = Arc::new(EnvBuilder::new()
-        .map_size(10 * 1024 * 1024) // 10MB map size
-        .max_database_size(2 * 1024 * 1024) // 2MB limit
+        .map_size(3 * 1024 * 1024) // 3MB map size
         .durability(DurabilityMode::NoSync)
         .open(dir.path())
         .unwrap());
@@ -117,19 +108,11 @@ fn test_database_size_limit_with_overflow_pages() {
             Ok(()) => {
                 key_counter += 1;
             }
-            Err(Error::DatabaseFull { .. }) => {
+            Err(Error::MapFull) => {
                 txn.abort();
                 break;
             }
             Err(e) => {
-                // Check if it's a custom error about page allocation
-                if let Error::Custom(msg) = &e {
-                    if msg.contains("Page ID") && msg.contains("exceeds maximum allowed value") {
-                        // This is expected when we hit internal limits
-                        txn.abort();
-                        break;
-                    }
-                }
                 panic!("Unexpected error: {:?}", e);
             }
         }
@@ -137,7 +120,7 @@ fn test_database_size_limit_with_overflow_pages() {
         // Commit the transaction
         match txn.commit() {
             Ok(()) => {}
-            Err(Error::DatabaseFull { .. }) => {
+            Err(Error::MapFull) => {
                 break;
             }
             Err(e) => {
@@ -146,20 +129,21 @@ fn test_database_size_limit_with_overflow_pages() {
         }
         
         // Safety check
-        if key_counter > 1000 {
+        if key_counter > 500 {
             panic!("Wrote too much data without hitting limit");
         }
     }
     
-    // Successfully hit the database size limit with overflow pages
-    println!("Successfully hit database size limit after {} large entries", key_counter);
+    // Successfully hit the map size limit with overflow pages
+    println!("Successfully hit map size limit after {} large entries", key_counter);
+    assert!(key_counter > 0); // Should have written at least some data
 }
 
 #[test]
-fn test_no_size_limit_by_default() {
+fn test_large_map_size_allows_more_data() {
     let dir = TempDir::new().unwrap();
     
-    // Create environment without size limit
+    // Create environment with a larger map size
     let env = Arc::new(EnvBuilder::new()
         .map_size(10 * 1024 * 1024) // 10MB map size
         .durability(DurabilityMode::NoSync)

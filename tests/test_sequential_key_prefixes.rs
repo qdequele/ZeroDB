@@ -14,7 +14,7 @@ fn test_different_prefixes_fresh_db() -> Result<()> {
     let env = Arc::new(
         EnvBuilder::new()
             .map_size(200 * 1024 * 1024)
-            .use_segregated_freelist(true)
+            
             .open(dir.path())?,
     );
     
@@ -52,7 +52,7 @@ fn test_prefix_transition_issue() -> Result<()> {
     let env = Arc::new(
         EnvBuilder::new()
             .map_size(200 * 1024 * 1024)
-            .use_segregated_freelist(true)
+            
             .open(dir.path())?,
     );
     
@@ -99,7 +99,7 @@ fn test_interleaved_prefixes() -> Result<()> {
     let env = Arc::new(
         EnvBuilder::new()
             .map_size(200 * 1024 * 1024)
-            .use_segregated_freelist(true)
+            
             .open(dir.path())?,
     );
     

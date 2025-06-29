@@ -14,7 +14,7 @@ fn test_exact_stress_scenario() -> Result<()> {
     let env = Arc::new(
         EnvBuilder::new()
             .map_size(200 * 1024 * 1024)
-            .use_segregated_freelist(true)
+            
             .open(dir.path())?,
     );
     
@@ -130,7 +130,7 @@ fn test_with_smaller_batches() -> Result<()> {
     let env = Arc::new(
         EnvBuilder::new()
             .map_size(200 * 1024 * 1024)
-            .use_segregated_freelist(true)
+            
             .open(dir.path())?,
     );
     
