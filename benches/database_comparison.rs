@@ -13,7 +13,7 @@ use tempfile::TempDir;
 // Test configurations
 const SMALL_VALUE: usize = 100;
 const MEDIUM_VALUE: usize = 1_000;
-const LARGE_VALUE: usize = 10_000;
+const LARGE_VALUE: usize = 100_000;
 
 const SMALL_DATASET: usize = 1_000;
 const MEDIUM_DATASET: usize = 10_000;
@@ -197,12 +197,17 @@ fn bench_random_writes(c: &mut Criterion) {
                             };
 
                             let mut rng = StdRng::seed_from_u64(42);
-                            let keys: Vec<Vec<u8>> = (0..size)
-                                .map(|_| {
-                                    let key = rng.gen::<u64>();
-                                    format!("key_{:016}", key).into_bytes()
-                                })
-                                .collect();
+                            let mut keys = Vec::new();
+                            let mut seen_keys = std::collections::HashSet::new();
+                            
+                            // Generate unique keys to avoid "Key already exists" errors
+                            while keys.len() < size {
+                                let key = rng.gen::<u64>();
+                                let key_bytes = format!("key_{:016}", key).into_bytes();
+                                if seen_keys.insert(key_bytes.clone()) {
+                                    keys.push(key_bytes);
+                                }
+                            }
 
                             (dir, env, db, keys)
                         },
@@ -241,9 +246,16 @@ fn bench_random_writes(c: &mut Criterion) {
                             wtxn.commit().unwrap();
 
                             let mut rng = StdRng::seed_from_u64(42);
-                            let keys: Vec<String> = (0..size)
-                                .map(|_| format!("key_{:016}", rng.gen::<u64>()))
-                                .collect();
+                            let mut keys = Vec::new();
+                            let mut seen_keys = std::collections::HashSet::new();
+                            
+                            // Generate unique keys to avoid potential conflicts
+                            while keys.len() < size {
+                                let key = format!("key_{:016}", rng.gen::<u64>());
+                                if seen_keys.insert(key.clone()) {
+                                    keys.push(key);
+                                }
+                            }
 
                             (dir, env, db, keys)
                         },
@@ -273,9 +285,16 @@ fn bench_random_writes(c: &mut Criterion) {
                             let db = rocksdb::DB::open_default(dir.path()).unwrap();
 
                             let mut rng = StdRng::seed_from_u64(42);
-                            let keys: Vec<String> = (0..size)
-                                .map(|_| format!("key_{:016}", rng.gen::<u64>()))
-                                .collect();
+                            let mut keys = Vec::new();
+                            let mut seen_keys = std::collections::HashSet::new();
+                            
+                            // Generate unique keys to avoid potential conflicts
+                            while keys.len() < size {
+                                let key = format!("key_{:016}", rng.gen::<u64>());
+                                if seen_keys.insert(key.clone()) {
+                                    keys.push(key);
+                                }
+                            }
 
                             (dir, db, keys)
                         },
