@@ -629,15 +629,14 @@ impl Environment<Open> {
         let free_pages = {
             let _txn = self.read_txn()?;
             // Access the transaction's data to get freelist info
-            let free_count = if inner.use_segregated_freelist {
+            if inner.use_segregated_freelist {
                 // Count segregated freelist pages
                 // For now, estimate based on the difference
                 total_pages.saturating_sub(next_page_id)
             } else {
                 // Count regular freelist pages
                 total_pages.saturating_sub(next_page_id)
-            };
-            free_count
+            }
         };
         
         let used_pages = next_page_id;

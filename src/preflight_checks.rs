@@ -32,7 +32,7 @@ impl PreflightCheck {
             0.5
         } else {
             // Overflow pages needed
-            ((entry_size + PAGE_SIZE - 1) / PAGE_SIZE) as f64
+            (entry_size.div_ceil(PAGE_SIZE)) as f64
         };
         
         // Add B-tree overhead (nodes, splits, etc.)
@@ -75,7 +75,7 @@ impl PreflightCheck {
         value_size: usize,
     ) -> Self {
         let available_pages = space_info.pages_remaining();
-        let pages_needed = ((value_size + PAGE_SIZE - 1) / PAGE_SIZE) as u64;
+        let pages_needed = (value_size.div_ceil(PAGE_SIZE)) as u64;
         
         // Add some overhead for B-tree operations
         let required_pages = pages_needed + 10;
@@ -109,7 +109,7 @@ impl PreflightCheck {
         let available_pages = space_info.pages_remaining();
         
         // Calculate pages for inserts
-        let pages_per_entry = ((avg_entry_size + PAGE_SIZE - 1) / PAGE_SIZE).max(1) as f64;
+        let pages_per_entry = (avg_entry_size.div_ceil(PAGE_SIZE)).max(1) as f64;
         let insert_pages = (estimated_inserts as f64 * pages_per_entry) as u64;
         
         // Updates might need COW pages
@@ -154,25 +154,25 @@ pub trait SpaceEstimate {
 
 impl SpaceEstimate for Vec<u8> {
     fn estimate_pages(&self) -> u64 {
-        ((self.len() + PAGE_SIZE - 1) / PAGE_SIZE) as u64
+        (self.len().div_ceil(PAGE_SIZE)) as u64
     }
 }
 
 impl SpaceEstimate for &[u8] {
     fn estimate_pages(&self) -> u64 {
-        ((self.len() + PAGE_SIZE - 1) / PAGE_SIZE) as u64
+        (self.len().div_ceil(PAGE_SIZE)) as u64
     }
 }
 
 impl SpaceEstimate for String {
     fn estimate_pages(&self) -> u64 {
-        ((self.len() + PAGE_SIZE - 1) / PAGE_SIZE) as u64
+        (self.len().div_ceil(PAGE_SIZE)) as u64
     }
 }
 
 impl SpaceEstimate for &str {
     fn estimate_pages(&self) -> u64 {
-        ((self.len() + PAGE_SIZE - 1) / PAGE_SIZE) as u64
+        (self.len().div_ceil(PAGE_SIZE)) as u64
     }
 }
 
@@ -182,7 +182,12 @@ mod tests {
     
     #[test]
     fn test_bulk_insert_check() {
-        let space_info = SpaceInfo::new(100_000, 50_000, 50_000, 1024 * 1024 * 1024);
+        // Create a consistent SpaceInfo: 1GB map, 100K pages total, 50K used
+        let map_size = 1024 * 1024 * 1024; // 1GB
+        let total_pages = map_size / PAGE_SIZE as u64; // 262144 pages
+        let used_pages = 50_000;
+        let free_pages = total_pages - used_pages;
+        let space_info = SpaceInfo::new(total_pages, used_pages, free_pages, map_size);
         
         // Small entries that should fit
         let check = PreflightCheck::check_bulk_insert(&space_info, 1000, 32, 100);
@@ -194,21 +199,26 @@ mod tests {
         assert!(!check.can_proceed);
         assert!(check.warning.is_some());
         
-        // Borderline case
-        let check = PreflightCheck::check_bulk_insert(&space_info, 30_000, 32, 1000);
+        // Borderline case - will use lots of remaining space
+        let check = PreflightCheck::check_bulk_insert(&space_info, 150_000, 32, 1000);
         assert!(check.can_proceed);
         assert!(check.warning.is_some()); // Should warn about high usage
     }
     
     #[test]
     fn test_large_value_check() {
-        let space_info = SpaceInfo::new(1000, 900, 100, 1024 * 1024 * 1024);
+        // Create a consistent SpaceInfo: 1GB map, mostly used
+        let map_size = 1024 * 1024 * 1024; // 1GB
+        let total_pages = map_size / PAGE_SIZE as u64; // 262144 pages
+        let used_pages = 262000; // Almost full
+        let free_pages = total_pages - used_pages;
+        let space_info = SpaceInfo::new(total_pages, used_pages, free_pages, map_size);
         
-        // Small value
+        // Small value should fit
         let check = PreflightCheck::check_large_value(&space_info, 4096);
         assert!(check.can_proceed);
         
-        // Large value that won't fit
+        // Large value that won't fit (500 pages needed when only 144 available)
         let check = PreflightCheck::check_large_value(&space_info, 500 * 4096);
         assert!(!check.can_proceed);
     }

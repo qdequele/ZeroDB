@@ -6,7 +6,8 @@ use crate::error::Result;
 use std::sync::Arc;
 
 /// Helper to check and perform auto-growth if needed
-pub fn check_and_grow(inner: &Arc<EnvInner>, auto_grow: &AutoGrowState) -> Result<bool> {
+#[allow(dead_code)]
+pub(crate) fn check_and_grow(inner: &Arc<EnvInner>, auto_grow: &AutoGrowState) -> Result<bool> {
     // Get current usage
     let total_pages = inner.io.size_in_pages();
     let used_pages = inner.next_page_id.load(std::sync::atomic::Ordering::Acquire);
@@ -49,7 +50,6 @@ pub trait EnvBuilderAutoGrowExt {
 mod tests {
     use super::*;
     use crate::auto_grow::AutoGrowConfig;
-    use tempfile::TempDir;
     
     #[test]
     fn test_growth_integration() {

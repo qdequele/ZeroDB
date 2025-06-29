@@ -36,7 +36,12 @@ impl SpaceInfo {
         } else {
             0.0
         };
-        let percent_of_map_used = (db_size_bytes as f64 / map_size as f64) * 100.0;
+        let max_pages = map_size / PAGE_SIZE as u64;
+        let percent_of_map_used = if max_pages > 0 {
+            (used_pages as f64 / max_pages as f64) * 100.0
+        } else {
+            0.0
+        };
         
         Self {
             total_pages,
@@ -57,12 +62,12 @@ impl SpaceInfo {
     /// Get the number of pages remaining before hitting the limit
     pub fn pages_remaining(&self) -> u64 {
         let max_pages = self.max_db_size_bytes / PAGE_SIZE as u64;
-        max_pages.saturating_sub(self.total_pages)
+        max_pages.saturating_sub(self.used_pages)
     }
     
     /// Estimate how many more entries of a given size can be stored
     pub fn estimate_entries_remaining(&self, avg_entry_size: usize) -> u64 {
-        let pages_per_entry = (avg_entry_size + PAGE_SIZE - 1) / PAGE_SIZE;
+        let pages_per_entry = avg_entry_size.div_ceil(PAGE_SIZE);
         self.pages_remaining() / pages_per_entry as u64
     }
 }
@@ -155,7 +160,7 @@ impl MapSizeEstimator {
         // Convert to bytes and round up to nearest GB
         let bytes = final_pages * PAGE_SIZE as u64;
         let gb = 1024 * 1024 * 1024;
-        ((bytes + gb - 1) / gb) * gb
+        bytes.div_ceil(gb) * gb
     }
     
     /// Get a detailed breakdown of the estimation
@@ -194,7 +199,7 @@ impl MapSizeEstimator {
             total_pages,
             self.safety_margin,
             final_pages,
-            (bytes + (1024 * 1024 * 1024) - 1) / (1024 * 1024 * 1024)
+            bytes.div_ceil(1024 * 1024 * 1024)
         )
     }
 }

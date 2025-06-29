@@ -98,7 +98,7 @@ impl AutoGrowState {
             Ok(self.config.max_size)
         } else {
             // Round up to page boundary
-            let pages = (new_size + PAGE_SIZE as u64 - 1) / PAGE_SIZE as u64;
+            let pages = new_size.div_ceil(PAGE_SIZE as u64);
             Ok(pages * PAGE_SIZE as u64)
         }
     }
@@ -112,7 +112,7 @@ impl AutoGrowConfig {
             enabled: true,
             growth_factor: 1.2, // 20% growth
             min_growth: 50 * 1024 * 1024, // 50MB
-            max_growth: 1 * 1024 * 1024 * 1024, // 1GB
+            max_growth: 1024 * 1024 * 1024, // 1GB
             growth_threshold: 95.0, // Wait until 95% full
             max_size: 100 * 1024 * 1024 * 1024, // 100GB max
         }
@@ -153,7 +153,7 @@ mod tests {
         let state = AutoGrowState::new(config);
         
         // Test normal growth
-        let new_size = state.calculate_new_size(1 * 1024 * 1024 * 1024).unwrap();
+        let new_size = state.calculate_new_size(1024 * 1024 * 1024).unwrap();
         assert_eq!(new_size, 1610612736); // 1.5GB rounded to page boundary
         
         // Test minimum growth
