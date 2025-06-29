@@ -25,20 +25,24 @@ zerodb = { path = "path/to/zerodb" }
 ## Quick Start
 
 ```rust
-use zerodb::{Env, EnvOpenOptions, Database};
-use std::path::Path;
+use zerodb::{EnvBuilder, Environment};
+use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Open an environment
-    let env = unsafe {
-        EnvOpenOptions::new()
+    let env = Arc::new(
+        EnvBuilder::new()
             .map_size(1024 * 1024 * 1024) // 1GB
-            .max_dbs(10)
-            .open(Path::new("./my-db"))?
-    };
+            .open("./my-db")?
+    );
 
-    // Open a database
-    let db = env.create_database(None)?;
+    // Create a database
+    let db = {
+        let mut txn = env.write_txn()?;
+        let db = env.create_database(&mut txn, None)?;
+        txn.commit()?;
+        db
+    };
 
     // Write transaction
     let mut wtxn = env.write_txn()?;
@@ -48,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read transaction
     let rtxn = env.read_txn()?;
     let value = db.get(&rtxn, b"key")?;
-    assert_eq!(value, Some(b"value".as_ref()));
+    assert_eq!(value, Some(&b"value"[..]));
 
     Ok(())
 }
@@ -93,6 +97,32 @@ LMDB FFI:   688.00μs (1453400 ops/sec, 1000 found)
 RocksDB:    883.00μs (1131702 ops/sec, 1000 found)
 redb:       533.00μs (1875880 ops/sec, 1000 found)
 ```
+
+## Space Planning
+
+ZeroDB uses memory-mapped files, requiring upfront allocation of the maximum database size. Choose your `map_size` based on:
+
+| Dataset Size | Recommended Map Size |
+|-------------|---------------------|
+| < 10K entries | 1 GB |
+| 10K-100K entries | 2-4 GB |
+| 100K-1M entries | 8-20 GB |
+| > 1M entries | 32+ GB |
+
+### Space Monitoring
+
+```rust
+// Check current usage
+let info = env.space_info()?;
+println!("Database usage: {:.1}%", info.percent_of_map_used);
+
+// Estimate required size
+use zerodb::space_info::MapSizeEstimator;
+let estimator = MapSizeEstimator::new(num_entries, avg_key_size, avg_value_size);
+let recommended = estimator.estimate();
+```
+
+See the [Space Planning Guide](docs/SPACE_PLANNING_GUIDE.md) for detailed information.
 
 ## Architecture
 

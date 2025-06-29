@@ -10,6 +10,8 @@
 // #![cfg_attr(feature = "simd", feature(portable_simd))]
 
 pub mod adaptive_page;
+pub mod auto_grow;
+pub mod auto_grow_integration;
 pub mod batch_commit;
 pub mod bloom_filter;
 pub mod branch;
@@ -38,6 +40,7 @@ pub mod overflow;
 pub mod overflow_stream;
 pub mod page;
 pub mod page_capacity;
+pub mod preflight_checks;
 pub mod reader;
 pub mod segregated_freelist;
 pub mod simd;
