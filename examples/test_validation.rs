@@ -28,10 +28,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Test 3: Large value
-    println!("\nTest 3: Attempting to insert value larger than 1GB...");
-    // Note: We'll use a smaller size for the example to avoid allocating 1GB
-    println!("(Simulating with error message only to avoid allocating 1GB)");
-    println!("✓ Would reject: Value size 1073741825 exceeds maximum allowed size of 1073741824 bytes");
+    println!("\nTest 3: Attempting to insert value larger than 2GB...");
+    // Note: We'll use a smaller size for the example to avoid allocating 2GB
+    println!("(Simulating with error message only to avoid allocating 2GB)");
+    println!("✓ Would reject: Value size 2147483649 exceeds maximum allowed size of 2147483648 bytes");
 
     // Test 4: Valid key-value
     println!("\nTest 4: Inserting valid key-value pair...");

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
-use libc::{cpu_set_t, sched_getcpu, sched_setaffinity, CPU_SET, CPU_ZERO};
+use libc::sched_getcpu;
 
 /// Parse CPU list from /sys format (e.g., "0-3,8-11")
 #[cfg(target_os = "linux")]
@@ -61,20 +61,18 @@ impl NumaTopology {
                 let mut node_to_cpus: HashMap<NumaNode, Vec<usize>> = HashMap::new();
 
                 // Count NUMA nodes
-                for entry in entries {
-                    if let Ok(entry) = entry {
-                        let name = entry.file_name();
-                        if let Some(name_str) = name.to_str() {
-                            if name_str.starts_with("node") {
-                                if let Ok(node_id) = name_str[4..].parse::<u32>() {
-                                    num_nodes = num_nodes.max(node_id + 1);
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if let Some(name_str) = name.to_str() {
+                        if let Some(stripped) = name_str.strip_prefix("node") {
+                            if let Ok(node_id) = stripped.parse::<u32>() {
+                                num_nodes = num_nodes.max(node_id + 1);
 
-                                    // Read CPUs for this node
-                                    let cpulist_path = entry.path().join("cpulist");
-                                    if let Ok(cpulist) = std::fs::read_to_string(cpulist_path) {
-                                        let cpus = parse_cpu_list(&cpulist);
-                                        node_to_cpus.insert(NumaNode(node_id), cpus);
-                                    }
+                                // Read CPUs for this node
+                                let cpulist_path = entry.path().join("cpulist");
+                                if let Ok(cpulist) = std::fs::read_to_string(cpulist_path) {
+                                    let cpus = parse_cpu_list(&cpulist);
+                                    node_to_cpus.insert(NumaNode(node_id), cpus);
                                 }
                             }
                         }

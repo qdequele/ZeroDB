@@ -56,8 +56,8 @@ fn test_large_value_validation() {
     let mut txn = env.write_txn().unwrap();
     let db: Database<&[u8], &[u8]> = Database::open(&env, None, zerodb::DatabaseFlags::empty()).unwrap();
 
-    // Test value that exceeds max size (1GB + 1 byte)
-    let large_value_size = 1024 * 1024 * 1024 + 1; // 1GB + 1 byte
+    // Test value that exceeds max size (2GB + 1 byte)
+    let large_value_size = 2 * 1024 * 1024 * 1024 + 1; // 2GB + 1 byte
     let large_value = vec![b'v'; large_value_size];
     let result = db.put(&mut txn, b"key", large_value.as_slice());
     assert!(result.is_err());

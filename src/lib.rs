@@ -67,8 +67,5 @@ pub type RwTxn<'env> = Transaction<'env, txn::Write>;
 /// The default page size (4KB)
 pub const DEFAULT_PAGE_SIZE: usize = 4096;
 
-/// Maximum key size (when not using longer-keys feature)
-
-
 /// Library version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -284,7 +284,9 @@ pub fn read_overflow_value<'txn, M: Mode>(
 
     let total_size = header.total_size as usize;
     // Protect against invalid/corrupt total_size
-    if total_size == 0 || total_size > 1_000_000_000 { // 1GB sanity check
+    // Allow values up to 2GB. Anything larger is considered invalid.
+    const MAX_VALUE_SIZE: usize = 2 * 1024 * 1024 * 1024; // 2GB
+    if total_size == 0 || total_size > MAX_VALUE_SIZE {
         return Err(Error::Corruption {
             details: format!("Invalid overflow value size: {}", total_size),
             page_id: Some(first_page_id),
