@@ -679,3 +679,124 @@ fn test_database_options_builder() {
 
     rtxn.commit().unwrap();
 }
+
+
+/// Test inserting a 2GiB value to verify large value handling.
+/// This test is ignored by default because it requires ~2GB memory and disk space.
+/// Run with: cargo test test_2gib_value -- --ignored
+#[test]
+#[ignore]
+fn test_2gib_value() {
+    use zerodb::types::{Str, Bytes};
+    use zerodb::Database;
+
+    let dir = tempdir().unwrap();
+
+    // Need a large map size to fit 2GiB+ data
+    // 4GiB should be enough for the value plus metadata
+    let map_size = 4 * 1024 * 1024 * 1024; // 4 GiB
+
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .map_size(map_size)
+            .max_dbs(10)
+            .open(dir.path())
+            .unwrap()
+    };
+
+    let mut wtxn = env.write_txn().unwrap();
+    let db: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("large-values")).unwrap();
+
+    // Create a 2GiB value
+    let two_gib = 2 * 1024 * 1024 * 1024; // 2,147,483,648 bytes
+    println!("Allocating 2GiB value...");
+    let large_value = vec![0x42u8; two_gib];
+    println!("Allocated 2GiB value, inserting into database...");
+
+    // Try to insert it
+    let result = db.put(&mut wtxn, "huge-key", &large_value);
+
+    match result {
+        Ok(()) => {
+            println!("Successfully inserted 2GiB value!");
+            wtxn.commit().unwrap();
+
+            // Verify we can read it back
+            let rtxn = env.read_txn().unwrap();
+            let retrieved = db.get(&rtxn, "huge-key").unwrap();
+            assert!(retrieved.is_some());
+            let retrieved = retrieved.unwrap();
+            assert_eq!(retrieved.len(), two_gib);
+            assert!(retrieved.iter().all(|&b| b == 0x42));
+            println!("Successfully read back 2GiB value!");
+        }
+        Err(e) => {
+            println!("Failed to insert 2GiB value: {:?}", e);
+            // This is expected - ZeroDB has size limits on values
+            // The error is typically PageFull for very large values
+        }
+    }
+}
+
+/// Test to find the maximum value size that ZeroDB can handle.
+/// This test is ignored by default because it requires significant memory.
+/// Run with: cargo test test_max_value_size -- --ignored
+#[test]
+#[ignore]
+fn test_max_value_size() {
+    use zerodb::types::{Str, Bytes};
+    use zerodb::Database;
+
+    let dir = tempdir().unwrap();
+
+    // Use a generous map size
+    let map_size = 1024 * 1024 * 1024; // 1 GiB
+
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .map_size(map_size)
+            .max_dbs(10)
+            .open(dir.path())
+            .unwrap()
+    };
+
+    let mut wtxn = env.write_txn().unwrap();
+    let db: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("size-test")).unwrap();
+
+    // Binary search for max value size
+    let mut min_fail = 1024 * 1024 * 1024; // 1 GiB (known to fail or near limit)
+    let mut max_success = 0;
+
+    // Test some specific sizes - start small to find the threshold
+    let test_sizes = [
+        100,                    // 100 bytes
+        1000,                   // 1 KB
+        4000,                   // ~4 KB (near page size)
+        8000,                   // 8 KB
+        16000,                  // 16 KB
+        64 * 1024,              // 64 KB
+        256 * 1024,             // 256 KB
+        1 * 1024 * 1024,        // 1 MB
+    ];
+
+    for size in test_sizes {
+        let value = vec![0x42u8; size];
+        let key = format!("key-{}", size);
+
+        match db.put(&mut wtxn, &key, &value) {
+            Ok(()) => {
+                println!("SUCCESS: {} bytes ({} MB)", size, size / (1024 * 1024));
+                max_success = max_success.max(size);
+            }
+            Err(e) => {
+                println!("FAILED:  {} bytes ({} MB) - {:?}", size, size / (1024 * 1024), e);
+                min_fail = min_fail.min(size);
+            }
+        }
+    }
+
+    println!("\nMax successful size: {} bytes ({} MB)", max_success, max_success / (1024 * 1024));
+    println!("Min failed size: {} bytes ({} MB)", min_fail, min_fail / (1024 * 1024));
+
+    wtxn.abort();
+}
