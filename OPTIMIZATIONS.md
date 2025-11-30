@@ -52,20 +52,14 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 
 ## Pending Optimizations
 
-### High Priority (Significant Impact Expected)
+### 8. Cursor page caching
+- **Impact**: 20-30% read improvement
+- **Status**: IMPLEMENTED
+- **Description**: LRU cache for recently accessed pages in cursor
+- **Implementation**: `PageCache` struct with configurable capacity (default 16 pages)
+- **Files**: `src/btree/cursor.rs` - `PageCache`, `search_cached()`
 
-#### 8. Cursor page caching
-- **Expected Impact**: 20-30% read improvement
-- **Description**: Cache recently accessed pages in cursor to avoid re-reading during traversal
-- **LMDB**: Keeps page pointers valid during transaction
-- **Implementation**:
-  ```rust
-  struct CursorCache {
-      pages: Vec<(PageNo, *const [u8])>,  // Cached page pointers
-      capacity: usize,
-  }
-  ```
-- **Files**: `src/btree/cursor.rs`
+### High Priority (Significant Impact Expected)
 
 #### 9. Spill dirty pages to disk
 - **Expected Impact**: Enables large transactions
@@ -147,17 +141,12 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 - **Description**: Use `Cow<[u8]>` for page data
 - **Files**: `src/txn.rs`, `src/btree/cursor.rs`
 
-#### 20. Mmap advice hints
-- **Expected Impact**: OS-level optimization
+### 20. Mmap advice hints
+- **Impact**: OS-level optimization
+- **Status**: IMPLEMENTED
 - **Description**: Use `madvise()` for access pattern hints
-- **Implementation**:
-  ```rust
-  // For sequential scan
-  madvise(ptr, len, MADV_SEQUENTIAL);
-  // For random access
-  madvise(ptr, len, MADV_RANDOM);
-  ```
-- **Files**: `src/mmap.rs`
+- **Implementation**: `MmapAdvice` enum with Normal/Sequential/Random/WillNeed/DontNeed
+- **Files**: `src/mmap.rs` - `advise()`, `advise_range()`, `prefetch()`
 
 ---
 
@@ -176,10 +165,12 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 
 ### macOS
 
-#### 23. F_FULLFSYNC
-- **Expected Impact**: Correct durability on macOS
-- **Description**: macOS `fsync()` doesn't guarantee durability
-- **Implementation**: Use `fcntl(fd, F_FULLFSYNC)`
+### 23. F_FULLFSYNC
+- **Impact**: Correct durability on macOS
+- **Status**: IMPLEMENTED
+- **Description**: macOS `fsync()` only flushes to drive cache, not to platters
+- **Implementation**: `fcntl(fd, F_FULLFSYNC)` in `sync()` and `sync_data()`
+- **Files**: `src/mmap.rs` - `DataFile::sync()`, `DataFile::sync_data()`
 
 ### Windows
 
