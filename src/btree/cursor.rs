@@ -4,11 +4,64 @@
 
 use std::collections::HashMap;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::page::PageNo;
 
 use super::page_ops::{BranchPage, LeafPage};
 use super::{default_compare, CompareFn, SearchResult, P_INVALID};
+
+/// Prefetches memory into CPU cache.
+///
+/// This is a hint to the processor that the memory at the given pointer
+/// will be accessed soon. This can improve performance for sequential scans.
+#[inline(always)]
+pub fn prefetch_read<T>(ptr: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Use SSE prefetch instruction
+        // _MM_HINT_T0 = prefetch into all cache levels
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(ptr as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        unsafe {
+            std::arch::x86::_mm_prefetch(ptr as *const i8, std::arch::x86::_MM_HINT_T0);
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // ARM64 prefetch using inline assembly
+        // PRFM PLDL1KEEP - prefetch for load, L1 cache, keep in cache
+        unsafe {
+            std::arch::asm!(
+                "prfm pldl1keep, [{ptr}]",
+                ptr = in(reg) ptr,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
+    {
+        // No-op for unsupported architectures
+        let _ = ptr;
+    }
+}
+
+/// Prefetches a memory range for reading.
+///
+/// This prefetches data in cache-line sized chunks (typically 64 bytes).
+#[inline]
+pub fn prefetch_range(data: &[u8], len: usize) {
+    const CACHE_LINE_SIZE: usize = 64;
+    let len = len.min(data.len());
+    let mut offset = 0;
+    while offset < len {
+        prefetch_read(unsafe { data.as_ptr().add(offset) });
+        offset += CACHE_LINE_SIZE;
+    }
+}
 
 /// Maximum number of pages to cache in cursor.
 const CURSOR_CACHE_SIZE: usize = 16;
@@ -415,6 +468,14 @@ impl CursorOps {
 
         if leaf.index + 1 < page.num_keys() {
             state.stack[leaf_level].index += 1;
+            // Prefetch ahead in the current page for sequential access
+            let next_idx = state.stack[leaf_level].index;
+            if next_idx + 1 < page.num_keys() {
+                // Prefetch the next node we'll access
+                if let Ok(node) = page.node(next_idx + 1) {
+                    prefetch_read(node.key().as_ptr());
+                }
+            }
             return Ok(true);
         }
 
@@ -611,6 +672,7 @@ mod tests {
     use super::*;
     use super::super::node::Node;
     use super::super::page_ops::PageBuilder;
+    use crate::error::Error;
     use std::collections::HashMap;
 
     fn create_test_pages() -> (HashMap<PageNo, Vec<u8>>, PageNo) {
