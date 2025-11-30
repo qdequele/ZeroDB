@@ -193,6 +193,99 @@ impl MemoryMap {
             None
         }
     }
+
+    /// Advises the kernel about expected access patterns.
+    ///
+    /// This can improve performance by allowing the kernel to optimize
+    /// readahead and caching behavior.
+    #[cfg(unix)]
+    pub fn advise(&self, advice: MmapAdvice) -> Result<()> {
+        let ptr = self.as_slice().as_ptr();
+        let len = self.len;
+
+        let advice_flag = match advice {
+            MmapAdvice::Normal => libc::MADV_NORMAL,
+            MmapAdvice::Sequential => libc::MADV_SEQUENTIAL,
+            MmapAdvice::Random => libc::MADV_RANDOM,
+            MmapAdvice::WillNeed => libc::MADV_WILLNEED,
+            MmapAdvice::DontNeed => libc::MADV_DONTNEED,
+        };
+
+        let ret = unsafe { libc::madvise(ptr as *mut libc::c_void, len, advice_flag) };
+        if ret != 0 {
+            return Err(Error::Io {
+                kind: crate::error::IoErrorKind::Other,
+                message: "madvise failed".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Advises the kernel about expected access patterns (no-op on Windows).
+    #[cfg(not(unix))]
+    pub fn advise(&self, _advice: MmapAdvice) -> Result<()> {
+        Ok(())
+    }
+
+    /// Advises the kernel about a specific range.
+    #[cfg(unix)]
+    pub fn advise_range(&self, offset: usize, len: usize, advice: MmapAdvice) -> Result<()> {
+        if offset + len > self.len {
+            return Err(Error::Invalid);
+        }
+
+        let ptr = unsafe { self.as_slice().as_ptr().add(offset) };
+
+        let advice_flag = match advice {
+            MmapAdvice::Normal => libc::MADV_NORMAL,
+            MmapAdvice::Sequential => libc::MADV_SEQUENTIAL,
+            MmapAdvice::Random => libc::MADV_RANDOM,
+            MmapAdvice::WillNeed => libc::MADV_WILLNEED,
+            MmapAdvice::DontNeed => libc::MADV_DONTNEED,
+        };
+
+        let ret = unsafe { libc::madvise(ptr as *mut libc::c_void, len, advice_flag) };
+        if ret != 0 {
+            return Err(Error::Io {
+                kind: crate::error::IoErrorKind::Other,
+                message: "madvise failed".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Advises the kernel about a specific range (no-op on Windows).
+    #[cfg(not(unix))]
+    pub fn advise_range(&self, _offset: usize, _len: usize, _advice: MmapAdvice) -> Result<()> {
+        Ok(())
+    }
+
+    /// Prefetches pages into memory.
+    #[cfg(unix)]
+    pub fn prefetch(&self, offset: usize, len: usize) -> Result<()> {
+        self.advise_range(offset, len, MmapAdvice::WillNeed)
+    }
+
+    /// Prefetches pages into memory (no-op on Windows).
+    #[cfg(not(unix))]
+    pub fn prefetch(&self, _offset: usize, _len: usize) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Memory map access pattern hints for madvise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MmapAdvice {
+    /// No special treatment (default).
+    Normal,
+    /// Expect sequential access (enables aggressive readahead).
+    Sequential,
+    /// Expect random access (disables readahead).
+    Random,
+    /// Pages will be needed soon (prefetch).
+    WillNeed,
+    /// Pages won't be needed soon (can be paged out).
+    DontNeed,
 }
 
 impl Deref for MemoryMap {
@@ -276,15 +369,45 @@ impl DataFile {
     }
 
     /// Syncs the file to disk (full fsync).
+    ///
+    /// On macOS, uses F_FULLFSYNC for guaranteed durability.
     pub fn sync(&self) -> Result<()> {
-        self.file.sync_all()?;
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::io::AsRawFd;
+            // F_FULLFSYNC ensures data reaches non-volatile storage on macOS
+            // Regular fsync on macOS only flushes to drive cache, not platters
+            let ret = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_FULLFSYNC) };
+            if ret == -1 {
+                // Fall back to sync_all if F_FULLFSYNC fails
+                self.file.sync_all()?;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.file.sync_all()?;
+        }
         Ok(())
     }
 
     /// Syncs file data to disk without syncing metadata (fdatasync).
     /// This is faster than sync() as it doesn't update file metadata.
+    ///
+    /// On macOS, uses F_FULLFSYNC for guaranteed durability.
     pub fn sync_data(&self) -> Result<()> {
-        self.file.sync_data()?;
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::io::AsRawFd;
+            // macOS doesn't have fdatasync, use F_FULLFSYNC
+            let ret = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_FULLFSYNC) };
+            if ret == -1 {
+                self.file.sync_data()?;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.file.sync_data()?;
+        }
         Ok(())
     }
 

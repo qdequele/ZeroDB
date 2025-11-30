@@ -2,11 +2,16 @@
 //!
 //! The cursor maintains position state and provides forward/backward traversal.
 
+use std::collections::HashMap;
+
 use crate::error::{Error, Result};
 use crate::page::PageNo;
 
 use super::page_ops::{BranchPage, LeafPage};
 use super::{default_compare, CompareFn, SearchResult, P_INVALID};
+
+/// Maximum number of pages to cache in cursor.
+const CURSOR_CACHE_SIZE: usize = 16;
 
 /// A single level in the cursor stack.
 #[derive(Debug, Clone)]
@@ -15,6 +20,83 @@ pub struct CursorLevel {
     pub page_no: PageNo,
     /// Current key index within the page.
     pub index: usize,
+}
+
+/// Page cache for cursor operations.
+///
+/// Caches recently accessed pages to avoid repeated reads during traversal.
+#[derive(Debug, Clone, Default)]
+pub struct PageCache {
+    /// Cached pages by page number.
+    pages: HashMap<PageNo, Vec<u8>>,
+    /// Access order for LRU eviction.
+    access_order: Vec<PageNo>,
+    /// Maximum cache size.
+    capacity: usize,
+}
+
+impl PageCache {
+    /// Creates a new page cache with default capacity.
+    pub fn new() -> Self {
+        Self {
+            pages: HashMap::with_capacity(CURSOR_CACHE_SIZE),
+            access_order: Vec::with_capacity(CURSOR_CACHE_SIZE),
+            capacity: CURSOR_CACHE_SIZE,
+        }
+    }
+
+    /// Creates a new page cache with specified capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            pages: HashMap::with_capacity(capacity),
+            access_order: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    /// Gets a page from the cache.
+    #[inline]
+    pub fn get(&mut self, pgno: PageNo) -> Option<&[u8]> {
+        if self.pages.contains_key(&pgno) {
+            // Move to end of access order (most recently used)
+            if let Some(pos) = self.access_order.iter().position(|&p| p == pgno) {
+                self.access_order.remove(pos);
+                self.access_order.push(pgno);
+            }
+            self.pages.get(&pgno).map(|v| v.as_slice())
+        } else {
+            None
+        }
+    }
+
+    /// Inserts a page into the cache.
+    #[inline]
+    pub fn insert(&mut self, pgno: PageNo, data: Vec<u8>) {
+        // Evict if at capacity
+        while self.pages.len() >= self.capacity && !self.access_order.is_empty() {
+            let evict = self.access_order.remove(0);
+            self.pages.remove(&evict);
+        }
+
+        self.pages.insert(pgno, data);
+        self.access_order.push(pgno);
+    }
+
+    /// Clears the cache.
+    pub fn clear(&mut self) {
+        self.pages.clear();
+        self.access_order.clear();
+    }
+
+    /// Returns the number of cached pages.
+    pub fn len(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// Returns true if the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
 }
 
 /// Cursor state for navigating a B+tree.
@@ -31,6 +113,8 @@ pub struct CursorState {
     pub valid: bool,
     /// Comparison function for keys.
     pub compare: CompareFn,
+    /// Page cache for avoiding repeated reads.
+    pub cache: PageCache,
 }
 
 impl CursorState {
@@ -41,6 +125,7 @@ impl CursorState {
             stack: Vec::new(),
             valid: false,
             compare: default_compare,
+            cache: PageCache::new(),
         }
     }
 
@@ -51,6 +136,18 @@ impl CursorState {
             stack: Vec::new(),
             valid: false,
             compare,
+            cache: PageCache::new(),
+        }
+    }
+
+    /// Creates a new cursor with a custom cache capacity.
+    pub fn with_cache_capacity(root: PageNo, capacity: usize) -> Self {
+        Self {
+            root,
+            stack: Vec::new(),
+            valid: false,
+            compare: default_compare,
+            cache: PageCache::with_capacity(capacity),
         }
     }
 
@@ -69,10 +166,40 @@ impl CursorState {
         self.valid
     }
 
-    /// Clears the cursor state.
+    /// Clears the cursor state (keeps cache).
     pub fn clear(&mut self) {
         self.stack.clear();
         self.valid = false;
+    }
+
+    /// Clears cursor state and cache.
+    pub fn clear_all(&mut self) {
+        self.stack.clear();
+        self.valid = false;
+        self.cache.clear();
+    }
+
+    /// Gets a page from cache or fetches it.
+    #[inline]
+    pub fn get_page_cached(
+        &mut self,
+        pgno: PageNo,
+        get_page: &impl Fn(PageNo) -> Result<Vec<u8>>,
+    ) -> Result<&[u8]> {
+        // Check cache first
+        if self.cache.pages.contains_key(&pgno) {
+            // Update LRU order
+            if let Some(pos) = self.cache.access_order.iter().position(|&p| p == pgno) {
+                self.cache.access_order.remove(pos);
+                self.cache.access_order.push(pgno);
+            }
+            return Ok(self.cache.pages.get(&pgno).unwrap().as_slice());
+        }
+
+        // Fetch and cache
+        let data = get_page(pgno)?;
+        self.cache.insert(pgno, data);
+        Ok(self.cache.pages.get(&pgno).unwrap().as_slice())
     }
 }
 
@@ -117,6 +244,55 @@ impl CursorOps {
             } else {
                 let page = BranchPage::new(&page_data, page_size)?;
                 let index = page.search(key, state.compare)?;
+                let child = page.child(index)?;
+
+                state.stack.push(CursorLevel { page_no: pgno, index });
+                pgno = child;
+            }
+        }
+    }
+
+    /// Searches for a key with page caching.
+    ///
+    /// Uses the cursor's internal cache to avoid repeated page reads.
+    #[inline]
+    pub fn search_cached(
+        state: &mut CursorState,
+        key: &[u8],
+        page_size: usize,
+        get_page: &impl Fn(PageNo) -> Result<Vec<u8>>,
+    ) -> Result<SearchResult> {
+        state.clear();
+
+        if state.root == P_INVALID {
+            return Ok(SearchResult::NotFound(0));
+        }
+
+        let mut pgno = state.root;
+        let compare = state.compare; // Copy compare function before borrowing
+
+        // Navigate down to the leaf using cached pages
+        loop {
+            // Fetch and cache the page
+            if !state.cache.pages.contains_key(&pgno) {
+                let data = get_page(pgno)?;
+                state.cache.insert(pgno, data);
+            }
+            let page_data = state.cache.pages.get(&pgno).unwrap();
+
+            if is_leaf(page_data, page_size)? {
+                let page = LeafPage::new(page_data, page_size)?;
+                let result = page.search(key, compare)?;
+                let index = result.index();
+                let num_keys = page.num_keys();
+
+                state.stack.push(CursorLevel { page_no: pgno, index });
+                state.valid = result.is_found() || index < num_keys;
+
+                return Ok(result);
+            } else {
+                let page = BranchPage::new(page_data, page_size)?;
+                let index = page.search(key, compare)?;
                 let child = page.child(index)?;
 
                 state.stack.push(CursorLevel { page_no: pgno, index });

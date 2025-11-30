@@ -1316,6 +1316,7 @@ dependencies = [
  "criterion",
  "fs2",
  "heed",
+ "libc",
  "memmap2",
  "page_size",
  "rocksdb",
