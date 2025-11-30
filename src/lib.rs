@@ -56,7 +56,7 @@ pub use database::{
 pub use types::{
     BytesDecode, BytesEncode, OwnedDecode,
     Bytes, OwnedBytes, Str, OwnedStr,
-    U32, U64, I32, I64, Unit,
+    U8, U32, U64, I32, I64, Unit,
     // DecodeIgnore
     DecodeIgnore,
     // Endian-aware types (Heed compatible)
@@ -70,7 +70,7 @@ pub use types::{
 #[cfg(feature = "serde")]
 pub use types::{SerdeJson, SerdeBincode};
 
-pub use error::{Error, Result};
+pub use error::{Error, Result, BoxedError};
 
 /// MdbError is an alias for Error for Heed compatibility.
 pub type MdbError = Error;

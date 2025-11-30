@@ -21,6 +21,9 @@ pub fn page_not_found_error() -> Error {
 /// Result type alias for ZeroDB operations.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Boxed error type for codec operations (Heed compatible).
+pub type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
 /// LMDB-compatible error codes.
 ///
 /// These match the LMDB error codes exactly for compatibility.

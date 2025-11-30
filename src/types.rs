@@ -150,6 +150,39 @@ impl OwnedDecode for OwnedStr {
     }
 }
 
+/// Marker for u8 in native endian.
+pub struct U8;
+
+impl<'a> BytesEncode<'a> for U8 {
+    type EItem = u8;
+
+    fn bytes_encode(item: &'a Self::EItem) -> Result<std::borrow::Cow<'a, [u8]>> {
+        Ok(std::borrow::Cow::Owned(vec![*item]))
+    }
+}
+
+impl<'a> BytesDecode<'a> for U8 {
+    type DItem = u8;
+
+    fn bytes_decode(bytes: &'a [u8]) -> Result<Self::DItem> {
+        if bytes.len() != 1 {
+            return Err(Error::Corrupted);
+        }
+        Ok(bytes[0])
+    }
+}
+
+impl OwnedDecode for U8 {
+    type OwnedItem = u8;
+
+    fn decode_owned(bytes: &[u8]) -> Result<Self::OwnedItem> {
+        if bytes.len() != 1 {
+            return Err(Error::Corrupted);
+        }
+        Ok(bytes[0])
+    }
+}
+
 /// Marker for u32 in native endian.
 pub struct U32;
 
