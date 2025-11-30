@@ -303,11 +303,14 @@ impl PagePool {
     }
 
     /// Returns a page buffer to the pool for reuse.
-    pub fn put(&mut self, mut buf: Vec<u8>) {
+    ///
+    /// Note: We don't zero the buffer here because pages are always
+    /// fully overwritten before being written to disk:
+    /// - Meta pages: MetaPage::write_to() writes the entire page
+    /// - Data pages: copied in full via copy_from_slice()
+    pub fn put(&mut self, buf: Vec<u8>) {
         // Only keep buffers of the correct size
         if buf.len() == self.page_size {
-            // Clear the buffer for reuse
-            buf.fill(0);
             self.free.push(buf);
         }
     }
