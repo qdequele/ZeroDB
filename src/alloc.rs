@@ -165,6 +165,12 @@ impl PageAllocator {
         self.loose_pages.len()
     }
 
+    /// Returns true if any pages were freed in the current transaction.
+    #[inline]
+    pub fn has_freed_pages(&self) -> bool {
+        !self.loose_pages.is_empty()
+    }
+
     /// Returns the total number of pages in the freelist.
     pub fn freelist_count(&self) -> usize {
         self.freelist.values().map(|v| v.len()).sum()

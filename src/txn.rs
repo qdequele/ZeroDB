@@ -337,15 +337,23 @@ impl<'e> RwTxn<'e> {
             return Ok(());
         }
 
+        // Check if transaction has actual changes
+        let has_dirty_pages = !self.dirty_pages.is_empty();
+        let has_new_pages = self.allocator.last_pgno() > self.meta.last_pgno;
+        let has_freed_pages = self.allocator.has_freed_pages();
+        let is_empty = !has_dirty_pages && !has_new_pages && !has_freed_pages;
+
         // Commit freelist changes
         self.allocator.commit(self.txnid);
 
         // Write dirty pages to the environment
+        // Pass is_empty flag to allow commit_txn to skip expensive disk sync
         self.env.commit_txn(
             self.txnid,
             self.meta,
             self.dirty_pages.take(),
             self.allocator.last_pgno(),
+            is_empty,
         )?;
 
         Ok(())

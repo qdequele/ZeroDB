@@ -420,7 +420,12 @@ impl Env {
         mut meta: MetaPage,
         dirty_pages: BTreeMap<PageNo, Vec<u8>>,
         last_pgno: PageNo,
+        is_empty: bool,
     ) -> Result<()> {
+        // Note: is_empty flag reserved for future optimization with WRITE_MAP mode
+        // Currently we always persist to maintain durability guarantees
+        let _ = is_empty;
+
         // Get the new meta index BEFORE acquiring the lock (read is cheap)
         let new_meta_index = {
             let inner = self.inner.read().unwrap();
