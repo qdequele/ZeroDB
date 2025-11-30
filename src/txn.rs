@@ -3,6 +3,7 @@
 //! This module provides read-only and read-write transactions with
 //! MVCC (Multi-Version Concurrency Control) semantics.
 
+use std::marker::PhantomData;
 
 use crate::alloc::{DirtyPages, PageAllocator};
 use crate::env::Env;
@@ -24,11 +25,66 @@ impl TxnState for Committed {}
 pub struct Aborted;
 impl TxnState for Aborted {}
 
+// ============================================================================
+// TLS (Thread Local Storage) Markers - Heed API Compatibility
+// ============================================================================
+
+/// Parameter defining that read transactions have been opened with
+/// Thread Local Storage (TLS).
+///
+/// A thread can only use one transaction at a time, plus any
+/// child (nested) transactions. Each transaction belongs to one
+/// thread. Transactions with this marker are `!Send`.
+pub enum WithTls {}
+
+/// Parameter defining that read transactions have been opened without
+/// Thread Local Storage (TLS).
+///
+/// A thread can use any number of read transactions at a time on
+/// the same thread. Read transactions can be moved in between
+/// threads (`Send`).
+pub enum WithoutTls {}
+
+/// Parameter defining that read transactions might have been opened with or
+/// without Thread Local Storage (TLS).
+///
+/// `RwTxn`s and any `RoTxn` dereference to `&RoTxn<AnyTls>`.
+pub enum AnyTls {}
+
+/// Specifies if Thread Local Storage (TLS) must be used when
+/// opening transactions. It is often faster to open TLS-backed
+/// transactions but makes them `!Send`.
+pub trait TlsUsage {
+    /// True if TLS must be used, false otherwise.
+    const ENABLED: bool;
+}
+
+impl TlsUsage for WithTls {
+    const ENABLED: bool = true;
+}
+
+impl TlsUsage for WithoutTls {
+    const ENABLED: bool = false;
+}
+
+impl TlsUsage for AnyTls {
+    // Users cannot open environments with AnyTls; therefore, this will never be read.
+    // We prefer to put the most restrictive value.
+    const ENABLED: bool = false;
+}
+
 /// A read-only transaction.
 ///
 /// Read transactions provide a consistent snapshot of the database
 /// at the time the transaction was created. Multiple read transactions
 /// can be active simultaneously.
+///
+/// # TLS Parameter
+///
+/// The type parameter `T` specifies whether Thread Local Storage is used:
+/// - `WithTls` (default): Transactions are `!Send` but may be faster
+/// - `WithoutTls`: Transactions are `Send` and can be moved between threads
+/// - `AnyTls`: Generic marker used internally
 ///
 /// # Example
 ///
@@ -38,7 +94,7 @@ impl TxnState for Aborted {}
 /// // ... read operations ...
 /// rtxn.abort(); // or just drop it
 /// ```
-pub struct RoTxn<'e> {
+pub struct RoTxn<'e, T = WithTls> {
     /// Reference to the environment.
     env: &'e Env,
     /// Transaction ID (snapshot point).
@@ -47,9 +103,11 @@ pub struct RoTxn<'e> {
     meta: MetaPage,
     /// Whether the transaction is still active.
     active: bool,
+    /// TLS marker phantom data.
+    _tls_marker: PhantomData<T>,
 }
 
-impl<'e> RoTxn<'e> {
+impl<'e, T> RoTxn<'e, T> {
     /// Creates a new read-only transaction.
     pub(crate) fn new(env: &'e Env, txnid: u64, meta: MetaPage) -> Self {
         Self {
@@ -57,10 +115,22 @@ impl<'e> RoTxn<'e> {
             txnid,
             meta,
             active: true,
+            _tls_marker: PhantomData,
         }
     }
 
+    /// Return the transaction's ID.
+    ///
+    /// This returns the identifier associated with this transaction. For a
+    /// read-only transaction, this corresponds to the snapshot being read;
+    /// concurrent readers will frequently have the same transaction ID.
+    pub fn id(&self) -> u64 {
+        self.txnid
+    }
+
     /// Returns the transaction ID.
+    ///
+    /// This is an alias for [`id()`](RoTxn::id) for backwards compatibility.
     pub fn txnid(&self) -> u64 {
         self.txnid
     }
@@ -104,18 +174,28 @@ impl<'e> RoTxn<'e> {
     }
 
     /// Commits the read transaction (same as abort for read-only).
+    ///
+    /// ## LMDB
+    ///
+    /// It's mandatory in a multi-process setup to call [`RoTxn::commit`] upon read-only database opening.
+    /// After the transaction opening, the database is dropped. The next transaction might return
+    /// an error known as `EINVAL`.
     pub fn commit(self) -> Result<()> {
         // Read transactions don't need to do anything on commit
         Ok(())
     }
 }
 
-impl Drop for RoTxn<'_> {
+impl<T> Drop for RoTxn<'_, T> {
     fn drop(&mut self) {
         // Release reader slot
         self.active = false;
     }
 }
+
+/// Is sendable only if `MDB_NOTLS` has been used to open this transaction.
+/// SAFETY: ZeroDB doesn't actually use TLS internally, so this is safe.
+unsafe impl Send for RoTxn<'_, WithoutTls> {}
 
 /// A read-write transaction.
 ///
@@ -190,7 +270,16 @@ impl<'e> RwTxn<'e> {
         }
     }
 
+    /// Return the transaction's ID.
+    ///
+    /// This returns the identifier associated with this transaction.
+    pub fn id(&self) -> u64 {
+        self.txnid
+    }
+
     /// Returns the transaction ID.
+    ///
+    /// This is an alias for [`id()`](RwTxn::id) for backwards compatibility.
     pub fn txnid(&self) -> u64 {
         self.txnid
     }
@@ -394,20 +483,27 @@ impl Drop for RwTxn<'_> {
 /// A transaction that can be either read-only or read-write.
 ///
 /// This is useful for functions that work with any transaction type.
-pub enum Txn<'e> {
+pub enum Txn<'e, T = WithTls> {
     /// Read-only transaction.
-    Ro(RoTxn<'e>),
+    Ro(RoTxn<'e, T>),
     /// Read-write transaction.
     Rw(RwTxn<'e>),
 }
 
-impl<'e> Txn<'e> {
-    /// Returns the transaction ID.
-    pub fn txnid(&self) -> u64 {
+impl<'e, T> Txn<'e, T> {
+    /// Return the transaction's ID.
+    pub fn id(&self) -> u64 {
         match self {
-            Txn::Ro(txn) => txn.txnid(),
-            Txn::Rw(txn) => txn.txnid(),
+            Txn::Ro(txn) => txn.id(),
+            Txn::Rw(txn) => txn.id(),
         }
+    }
+
+    /// Returns the transaction ID.
+    ///
+    /// This is an alias for [`id()`](Txn::id) for backwards compatibility.
+    pub fn txnid(&self) -> u64 {
+        self.id()
     }
 
     /// Returns a reference to the environment.
@@ -427,13 +523,13 @@ impl<'e> Txn<'e> {
     }
 }
 
-impl<'e> From<RoTxn<'e>> for Txn<'e> {
-    fn from(txn: RoTxn<'e>) -> Self {
+impl<'e, T> From<RoTxn<'e, T>> for Txn<'e, T> {
+    fn from(txn: RoTxn<'e, T>) -> Self {
         Txn::Ro(txn)
     }
 }
 
-impl<'e> From<RwTxn<'e>> for Txn<'e> {
+impl<'e, T> From<RwTxn<'e>> for Txn<'e, T> {
     fn from(txn: RwTxn<'e>) -> Self {
         Txn::Rw(txn)
     }

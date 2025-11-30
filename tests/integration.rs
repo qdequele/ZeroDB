@@ -459,7 +459,7 @@ fn test_env_flags() {
         opts.open(&path).unwrap()
     };
 
-    assert!(env.flags().contains(EnvFlags::NO_SUB_DIR));
+    assert!(env.flags().unwrap().contains(EnvFlags::NO_SUB_DIR));
     assert!(path.exists());
 
     drop(env);
@@ -490,4 +490,192 @@ fn test_transaction_isolation() {
 
     rtxn.commit().unwrap();
     rtxn2.commit().unwrap();
+}
+
+// ============================================================================
+// Named Database Tests
+// ============================================================================
+
+#[test]
+fn test_named_database_create() {
+    use zerodb::types::{Str, U32};
+    use zerodb::Database;
+
+    let dir = tempdir().unwrap();
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .max_dbs(10)
+            .open(dir.path())
+            .unwrap()
+    };
+
+    // Create a named database
+    let mut wtxn = env.write_txn().unwrap();
+    let db: Database<Str, U32> = env.create_database(&mut wtxn, Some("my-database")).unwrap();
+
+    // Verify database has a name and DBI
+    assert_eq!(db.name(), Some("my-database"));
+    assert!(db.dbi() >= 2); // 0=main, 1=free
+
+    wtxn.commit().unwrap();
+}
+
+#[test]
+fn test_named_database_operations() {
+    use zerodb::types::{Str, U32};
+    use zerodb::Database;
+
+    let dir = tempdir().unwrap();
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .max_dbs(10)
+            .open(dir.path())
+            .unwrap()
+    };
+
+    // Create named database and put data
+    let mut wtxn = env.write_txn().unwrap();
+    let db: Database<Str, U32> = env.create_database(&mut wtxn, Some("numbers")).unwrap();
+
+    db.put(&mut wtxn, "one", &1).unwrap();
+    db.put(&mut wtxn, "two", &2).unwrap();
+    db.put(&mut wtxn, "three", &3).unwrap();
+
+    wtxn.commit().unwrap();
+
+    // Read back from named database
+    let rtxn = env.read_txn().unwrap();
+    let db: Database<Str, U32> = env.open_database(&rtxn, Some("numbers")).unwrap().unwrap();
+
+    assert_eq!(db.get(&rtxn, "one").unwrap(), Some(1));
+    assert_eq!(db.get(&rtxn, "two").unwrap(), Some(2));
+    assert_eq!(db.get(&rtxn, "three").unwrap(), Some(3));
+
+    rtxn.commit().unwrap();
+}
+
+#[test]
+fn test_multiple_named_databases() {
+    use zerodb::types::{Str, U32, Bytes};
+    use zerodb::Database;
+
+    let dir = tempdir().unwrap();
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .max_dbs(10)
+            .open(dir.path())
+            .unwrap()
+    };
+
+    // Create multiple named databases
+    let mut wtxn = env.write_txn().unwrap();
+
+    let db1: Database<Str, U32> = env.create_database(&mut wtxn, Some("users")).unwrap();
+    let db2: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("settings")).unwrap();
+
+    // They should have different DBIs
+    assert_ne!(db1.dbi(), db2.dbi());
+
+    // Put data in each
+    db1.put(&mut wtxn, "alice", &42).unwrap();
+    db2.put(&mut wtxn, "theme", b"dark".as_slice()).unwrap();
+
+    wtxn.commit().unwrap();
+
+    // Read back from each database
+    let rtxn = env.read_txn().unwrap();
+
+    let db1: Database<Str, U32> = env.open_database(&rtxn, Some("users")).unwrap().unwrap();
+    let db2: Database<Str, Bytes> = env.open_database(&rtxn, Some("settings")).unwrap().unwrap();
+
+    assert_eq!(db1.get(&rtxn, "alice").unwrap(), Some(42));
+    assert_eq!(db2.get(&rtxn, "theme").unwrap(), Some(b"dark".to_vec()));
+
+    rtxn.commit().unwrap();
+}
+
+#[test]
+fn test_unnamed_database_with_named() {
+    use zerodb::types::{Str, U32};
+    use zerodb::Database;
+
+    let dir = tempdir().unwrap();
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .max_dbs(10)
+            .open(dir.path())
+            .unwrap()
+    };
+
+    // Use both unnamed and named databases
+    let mut wtxn = env.write_txn().unwrap();
+
+    // Unnamed database (main)
+    let main_db: Database<Str, U32> = env.create_database(&mut wtxn, None).unwrap();
+    assert!(main_db.name().is_none());
+    assert_eq!(main_db.dbi(), 0); // Main DBI is 0
+
+    // Named database
+    let named_db: Database<Str, U32> = env.create_database(&mut wtxn, Some("named")).unwrap();
+    assert_eq!(named_db.name(), Some("named"));
+
+    wtxn.commit().unwrap();
+}
+
+#[test]
+fn test_database_open_nonexistent() {
+    use zerodb::types::{Str, U32};
+    use zerodb::Database;
+
+    let dir = tempdir().unwrap();
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .max_dbs(10)
+            .open(dir.path())
+            .unwrap()
+    };
+
+    // Try to open a database that doesn't exist
+    let rtxn = env.read_txn().unwrap();
+    let result: Result<Option<Database<Str, U32>>> = env.open_database(&rtxn, Some("nonexistent"));
+
+    // Should return None (not an error)
+    assert!(result.unwrap().is_none());
+
+    rtxn.commit().unwrap();
+}
+
+#[test]
+fn test_database_options_builder() {
+    use zerodb::types::{Str, U32};
+
+    let dir = tempdir().unwrap();
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .max_dbs(10)
+            .open(dir.path())
+            .unwrap()
+    };
+
+    // Use the builder pattern
+    let mut wtxn = env.write_txn().unwrap();
+
+    let mut options = env.database_options().types::<Str, U32>();
+    options.name("builder-db");
+
+    let db = options.create(&mut wtxn).unwrap();
+    assert_eq!(db.name(), Some("builder-db"));
+
+    db.put(&mut wtxn, "key", &123).unwrap();
+    wtxn.commit().unwrap();
+
+    // Read back using options
+    let rtxn = env.read_txn().unwrap();
+    let mut options = env.database_options().types::<Str, U32>();
+    options.name("builder-db");
+
+    let db = options.open(&rtxn).unwrap().unwrap();
+    assert_eq!(db.get(&rtxn, "key").unwrap(), Some(123));
+
+    rtxn.commit().unwrap();
 }

@@ -2,12 +2,34 @@
 //!
 //! This library provides a memory-mapped key-value store with ACID transactions,
 //! fully compatible with LMDB's file format.
+//!
+//! # Heed-Compatible API
+//!
+//! ZeroDB provides a typed database API compatible with the Heed crate:
+//!
+//! ```ignore
+//! use zerodb::{EnvOpenOptions, Database};
+//! use zerodb::types::{Str, U32};
+//!
+//! let env = unsafe { EnvOpenOptions::new().open(path)? };
+//! let mut wtxn = env.write_txn()?;
+//!
+//! // Create a database with string keys and u32 values
+//! let db: Database<Str, U32> = env.create_database(&mut wtxn, None)?;
+//!
+//! db.put(&mut wtxn, "hello", &42)?;
+//! wtxn.commit()?;
+//!
+//! let rtxn = env.read_txn()?;
+//! assert_eq!(db.get(&rtxn, "hello")?, Some(42));
+//! ```
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
 pub mod alloc;
 pub mod btree;
+pub mod database;
 pub mod db;
 pub mod env;
 pub mod error;
@@ -17,13 +39,34 @@ pub mod page;
 pub mod txn;
 pub mod types;
 
-pub use db::{Database, DbReader, DbWriter, RoCursor, RwCursor};
-pub use types::{BytesDecode, BytesEncode, Bytes, OwnedBytes, Str, OwnedStr, U32, U64, I32, I64, Unit};
+// Re-export the old API for backwards compatibility
+pub use db::{DbReader, DbWriter, RoCursor, RwCursor};
+#[doc(hidden)]
+pub use db::Database as RawDatabase;
+
+// Heed-compatible typed database API
+pub use database::{
+    Database, DatabaseStat, DatabaseOpenOptions, Unspecified, Dbi,
+    LazyDecode, ReservedSpace, RoDuplicates,
+    // Read-only iterators
+    RoIter, RoRevIter, RoRange, RoRevRange, RoPrefix, RoRevPrefix,
+    // Mutable iterators
+    RwIter, RwRevIter, RwRange, RwRevRange, RwPrefix, RwRevPrefix,
+};
+pub use types::{BytesDecode, BytesEncode, OwnedDecode, Bytes, OwnedBytes, Str, OwnedStr, U32, U64, I32, I64, Unit};
 pub use error::{Error, Result};
 pub use flags::{EnvFlags, DatabaseFlags, PutFlags};
 pub use page::{PageFlags, PageHeader};
-pub use env::{Env, EnvOpenOptions};
-pub use txn::{RoTxn, RwTxn};
+pub use env::{
+    Env, EnvOpenOptions, EnvInfo, DbStat,
+    // Closing event
+    EnvClosingEvent, env_closing_event,
+    // Options
+    CompactionOption, FlagSetMode,
+    // Comparators
+    Comparator, LexicographicComparator, DefaultComparator, IntegerComparator,
+};
+pub use txn::{RoTxn, RwTxn, Txn, WithTls, WithoutTls, AnyTls, TlsUsage};
 
 /// LMDB magic number: 0xBEEFC0DE
 pub const MDB_MAGIC: u32 = 0xBEEF_C0DE;

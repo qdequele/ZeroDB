@@ -8,7 +8,7 @@ mod node;
 mod overflow;
 
 pub use header::{PageFlags, PageHeader, PAGE_HEADER_SIZE};
-pub use meta::{DbInfo, MetaPage};
+pub use meta::{DbInfo, MetaPage, DB_INFO_SIZE};
 pub use node::{NodeFlags, LeafNode, BranchNode};
 pub use overflow::OverflowPage;
 

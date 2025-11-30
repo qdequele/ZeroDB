@@ -23,6 +23,17 @@ pub trait BytesDecode<'a> {
     fn bytes_decode(bytes: &'a [u8]) -> Result<Self::DItem>;
 }
 
+/// Trait for types that decode to owned values (no lifetime dependency on input).
+///
+/// This is used by the typed Database API when the decoded values are copied.
+pub trait OwnedDecode {
+    /// The owned decoded type.
+    type OwnedItem;
+
+    /// Decodes bytes into an owned item.
+    fn decode_owned(bytes: &[u8]) -> Result<Self::OwnedItem>;
+}
+
 /// Marker for raw byte slices - no encoding/decoding.
 pub struct Bytes;
 
@@ -42,6 +53,14 @@ impl<'a> BytesDecode<'a> for Bytes {
     }
 }
 
+impl OwnedDecode for Bytes {
+    type OwnedItem = Vec<u8>;
+
+    fn decode_owned(bytes: &[u8]) -> Result<Self::OwnedItem> {
+        Ok(bytes.to_vec())
+    }
+}
+
 /// Marker for owned byte vectors.
 pub struct OwnedBytes;
 
@@ -57,6 +76,14 @@ impl<'a> BytesDecode<'a> for OwnedBytes {
     type DItem = Vec<u8>;
 
     fn bytes_decode(bytes: &'a [u8]) -> Result<Self::DItem> {
+        Ok(bytes.to_vec())
+    }
+}
+
+impl OwnedDecode for OwnedBytes {
+    type OwnedItem = Vec<u8>;
+
+    fn decode_owned(bytes: &[u8]) -> Result<Self::OwnedItem> {
         Ok(bytes.to_vec())
     }
 }
@@ -80,6 +107,14 @@ impl<'a> BytesDecode<'a> for Str {
     }
 }
 
+impl OwnedDecode for Str {
+    type OwnedItem = String;
+
+    fn decode_owned(bytes: &[u8]) -> Result<Self::OwnedItem> {
+        String::from_utf8(bytes.to_vec()).map_err(|_| Error::Corrupted)
+    }
+}
+
 /// Marker for owned strings.
 pub struct OwnedStr;
 
@@ -99,6 +134,14 @@ impl<'a> BytesDecode<'a> for OwnedStr {
     }
 }
 
+impl OwnedDecode for OwnedStr {
+    type OwnedItem = String;
+
+    fn decode_owned(bytes: &[u8]) -> Result<Self::OwnedItem> {
+        String::from_utf8(bytes.to_vec()).map_err(|_| Error::Corrupted)
+    }
+}
+
 /// Marker for u32 in native endian.
 pub struct U32;
 
@@ -114,6 +157,17 @@ impl<'a> BytesDecode<'a> for U32 {
     type DItem = u32;
 
     fn bytes_decode(bytes: &'a [u8]) -> Result<Self::DItem> {
+        if bytes.len() != 4 {
+            return Err(Error::Corrupted);
+        }
+        Ok(u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+}
+
+impl OwnedDecode for U32 {
+    type OwnedItem = u32;
+
+    fn decode_owned(bytes: &[u8]) -> Result<Self::OwnedItem> {
         if bytes.len() != 4 {
             return Err(Error::Corrupted);
         }
@@ -146,6 +200,20 @@ impl<'a> BytesDecode<'a> for U64 {
     }
 }
 
+impl OwnedDecode for U64 {
+    type OwnedItem = u64;
+
+    fn decode_owned(bytes: &[u8]) -> Result<Self::OwnedItem> {
+        if bytes.len() != 8 {
+            return Err(Error::Corrupted);
+        }
+        Ok(u64::from_ne_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+}
+
 /// Marker for i32 in native endian.
 pub struct I32;
 
@@ -161,6 +229,17 @@ impl<'a> BytesDecode<'a> for I32 {
     type DItem = i32;
 
     fn bytes_decode(bytes: &'a [u8]) -> Result<Self::DItem> {
+        if bytes.len() != 4 {
+            return Err(Error::Corrupted);
+        }
+        Ok(i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+}
+
+impl OwnedDecode for I32 {
+    type OwnedItem = i32;
+
+    fn decode_owned(bytes: &[u8]) -> Result<Self::OwnedItem> {
         if bytes.len() != 4 {
             return Err(Error::Corrupted);
         }
@@ -193,6 +272,20 @@ impl<'a> BytesDecode<'a> for I64 {
     }
 }
 
+impl OwnedDecode for I64 {
+    type OwnedItem = i64;
+
+    fn decode_owned(bytes: &[u8]) -> Result<Self::OwnedItem> {
+        if bytes.len() != 8 {
+            return Err(Error::Corrupted);
+        }
+        Ok(i64::from_ne_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3],
+            bytes[4], bytes[5], bytes[6], bytes[7],
+        ]))
+    }
+}
+
 /// Unit type for databases that only store keys (sets).
 pub struct Unit;
 
@@ -208,6 +301,14 @@ impl<'a> BytesDecode<'a> for Unit {
     type DItem = ();
 
     fn bytes_decode(_bytes: &'a [u8]) -> Result<Self::DItem> {
+        Ok(())
+    }
+}
+
+impl OwnedDecode for Unit {
+    type OwnedItem = ();
+
+    fn decode_owned(_bytes: &[u8]) -> Result<Self::OwnedItem> {
         Ok(())
     }
 }
