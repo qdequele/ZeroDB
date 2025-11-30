@@ -27,6 +27,7 @@ pub struct BranchPage<'a> {
 
 impl<'a> BranchPage<'a> {
     /// Creates a new branch page view.
+    #[inline]
     pub fn new(data: &'a [u8], page_size: usize) -> Result<Self> {
         let header = PageHeader::read_from(data)?;
         if !header.flags.is_branch() {
@@ -40,16 +41,19 @@ impl<'a> BranchPage<'a> {
     }
 
     /// Returns the number of keys in this page.
+    #[inline(always)]
     pub fn num_keys(&self) -> usize {
         self.header.num_keys()
     }
 
     /// Returns the page number.
+    #[inline(always)]
     pub fn page_no(&self) -> PageNo {
         self.header.page_no
     }
 
     /// Returns a node at the given index.
+    #[inline]
     pub fn node(&self, index: usize) -> Result<NodeRef<'a>> {
         if index >= self.num_keys() {
             return Err(Error::Corrupted);
@@ -75,6 +79,7 @@ impl<'a> BranchPage<'a> {
     /// Searches for a key in this page.
     ///
     /// Returns the index of the child to follow.
+    #[inline]
     pub fn search(&self, key: &[u8], compare: CompareFn) -> Result<usize> {
         let num_keys = self.num_keys();
         if num_keys == 0 {
@@ -102,6 +107,7 @@ impl<'a> BranchPage<'a> {
     }
 
     /// Returns the child page number at the given index.
+    #[inline]
     pub fn child(&self, index: usize) -> Result<PageNo> {
         let node = self.node(index)?;
         Ok(node.child_pgno())
@@ -122,6 +128,7 @@ pub struct LeafPage<'a> {
 
 impl<'a> LeafPage<'a> {
     /// Creates a new leaf page view.
+    #[inline]
     pub fn new(data: &'a [u8], page_size: usize) -> Result<Self> {
         let header = PageHeader::read_from(data)?;
         if !header.flags.is_leaf() {
@@ -135,16 +142,19 @@ impl<'a> LeafPage<'a> {
     }
 
     /// Returns the number of keys in this page.
+    #[inline(always)]
     pub fn num_keys(&self) -> usize {
         self.header.num_keys()
     }
 
     /// Returns the page number.
+    #[inline(always)]
     pub fn page_no(&self) -> PageNo {
         self.header.page_no
     }
 
     /// Returns a node at the given index.
+    #[inline]
     pub fn node(&self, index: usize) -> Result<NodeRef<'a>> {
         if index >= self.num_keys() {
             return Err(Error::Corrupted);
@@ -168,6 +178,7 @@ impl<'a> LeafPage<'a> {
     }
 
     /// Searches for a key in this page.
+    #[inline]
     pub fn search(&self, key: &[u8], compare: CompareFn) -> Result<SearchResult> {
         let num_keys = self.num_keys();
         if num_keys == 0 {
@@ -193,11 +204,13 @@ impl<'a> LeafPage<'a> {
     }
 
     /// Returns the key at the given index.
+    #[inline]
     pub fn key(&self, index: usize) -> Result<&'a [u8]> {
         Ok(self.node(index)?.key())
     }
 
     /// Returns the value at the given index.
+    #[inline]
     pub fn value(&self, index: usize) -> Result<&'a [u8]> {
         Ok(self.node(index)?.value())
     }

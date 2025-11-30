@@ -3,6 +3,21 @@
 use std::io;
 use thiserror::Error;
 
+/// Cold function for returning corrupted error.
+/// Marked cold to hint that this path is unlikely.
+#[cold]
+#[inline(never)]
+pub fn corrupted_error() -> Error {
+    Error::Corrupted
+}
+
+/// Cold function for returning page not found error.
+#[cold]
+#[inline(never)]
+pub fn page_not_found_error() -> Error {
+    Error::PageNotFound
+}
+
 /// Result type alias for ZeroDB operations.
 pub type Result<T> = std::result::Result<T, Error>;
 

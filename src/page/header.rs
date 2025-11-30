@@ -37,26 +37,31 @@ bitflags! {
 
 impl PageFlags {
     /// Returns true if this is a branch page.
+    #[inline(always)]
     pub fn is_branch(self) -> bool {
         self.contains(PageFlags::BRANCH)
     }
 
     /// Returns true if this is a leaf page.
+    #[inline(always)]
     pub fn is_leaf(self) -> bool {
         self.contains(PageFlags::LEAF)
     }
 
     /// Returns true if this is an overflow page.
+    #[inline(always)]
     pub fn is_overflow(self) -> bool {
         self.contains(PageFlags::OVERFLOW)
     }
 
     /// Returns true if this is a meta page.
+    #[inline(always)]
     pub fn is_meta(self) -> bool {
         self.contains(PageFlags::META)
     }
 
     /// Returns true if this page has been modified.
+    #[inline(always)]
     pub fn is_dirty(self) -> bool {
         self.contains(PageFlags::DIRTY)
     }
@@ -148,6 +153,7 @@ impl PageHeader {
     /// Returns the number of node entries in this page.
     ///
     /// This is calculated from the lower bound offset.
+    #[inline(always)]
     pub fn num_keys(&self) -> usize {
         if self.lower > PAGE_HEADER_SIZE as u16 {
             (self.lower as usize - PAGE_HEADER_SIZE) / 2
@@ -161,6 +167,7 @@ impl PageHeader {
     /// # Errors
     ///
     /// Returns an error if the slice is too small.
+    #[inline]
     pub fn read_from(data: &[u8]) -> Result<Self> {
         if data.len() < PAGE_HEADER_SIZE {
             return Err(Error::Corrupted);

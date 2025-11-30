@@ -33,6 +33,7 @@ impl<'a> NodeRef<'a> {
     /// - lo (4 bytes): lower 32 bits of child pgno
     /// - hi_and_ksize (2 bytes): (pgno_hi << 12) | key_size
     /// - key (variable): key bytes
+    #[inline]
     pub fn parse_branch(data: &'a [u8]) -> Result<Self> {
         if data.len() < 6 {
             return Err(Error::Corrupted);
@@ -68,6 +69,7 @@ impl<'a> NodeRef<'a> {
     /// - flags (2 bytes): node flags
     /// - key (variable): key bytes
     /// - data (variable): value bytes OR overflow pgno (8 bytes)
+    #[inline]
     pub fn parse_leaf(data: &'a [u8]) -> Result<Self> {
         if data.len() < NODE_HEADER_SIZE {
             return Err(Error::Corrupted);
@@ -131,16 +133,19 @@ impl<'a> NodeRef<'a> {
     }
 
     /// Returns the key.
+    #[inline(always)]
     pub fn key(&self) -> &'a [u8] {
         self.key
     }
 
     /// Returns the value (for leaf nodes with inline data).
+    #[inline(always)]
     pub fn value(&self) -> &'a [u8] {
         self.value
     }
 
     /// Returns the child page number (for branch nodes).
+    #[inline(always)]
     pub fn child_pgno(&self) -> PageNo {
         self.extra
     }
