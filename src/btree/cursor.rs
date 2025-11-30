@@ -5,6 +5,8 @@
 use std::collections::HashMap;
 
 use crate::error::Result;
+#[cfg(test)]
+use crate::error::Error;
 use crate::page::PageNo;
 
 use super::page_ops::{BranchPage, LeafPage};
