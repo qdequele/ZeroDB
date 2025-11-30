@@ -2,5 +2,36 @@
 name = "zerodb"
 version = "0.1.0"
 edition = "2024"
+description = "A pure-Rust port of LMDB"
+license = "MIT"
+repository = "https://github.com/quentindequelen/zerodb"
 
 [dependencies]
+# Memory mapping
+memmap2 = "0.9"
+
+# Bitflags for page/env/db flags
+bitflags = "2.6"
+
+# Cross-platform file locking
+fs2 = "0.4"
+
+# Page size detection
+page_size = "0.6"
+
+# Error handling
+thiserror = "2.0"
+
+[dev-dependencies]
+tempfile = "3.14"
+criterion = "0.5"
+heed = "0.20"
+rocksdb = "0.22"
+
+[[bench]]
+name = "basic_ops"
+harness = false
+
+[[bench]]
+name = "comparison"
+harness = false
