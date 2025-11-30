@@ -437,8 +437,8 @@ impl Env {
         meta.last_txnid = txnid;
         meta.header.page_no = new_meta_index as u64;
 
-        // Serialize meta page
-        let mut meta_buf = vec![0u8; self.page_size];
+        // Serialize meta page (use pooled buffer to avoid allocation)
+        let mut meta_buf = self.get_page_buffer();
         meta.write_to(&mut meta_buf)?;
 
         let page_size = self.page_size as u64;
@@ -509,8 +509,9 @@ impl Env {
             // Note: mmap will see file changes after fsync - no need to copy
         }
 
-        // Collect and return buffers to pool
-        let buffers: Vec<Vec<u8>> = dirty_pages.into_values().collect();
+        // Collect and return buffers to pool (including meta buffer)
+        let mut buffers: Vec<Vec<u8>> = dirty_pages.into_values().collect();
+        buffers.push(meta_buf);
         self.return_page_buffers(buffers);
 
         Ok(())
