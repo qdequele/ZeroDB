@@ -375,6 +375,152 @@ impl DirtyPages {
     }
 }
 
+/// Arena allocator for transaction-local allocations.
+///
+/// This reduces heap allocation overhead by pre-allocating a contiguous
+/// block of memory and bumping a pointer for each allocation.
+/// Memory is released all at once when the arena is dropped.
+#[derive(Debug)]
+pub struct Arena {
+    /// Backing storage chunks.
+    chunks: Vec<Vec<u8>>,
+    /// Current chunk index.
+    current_chunk: usize,
+    /// Offset within current chunk.
+    offset: usize,
+    /// Default chunk size.
+    chunk_size: usize,
+}
+
+impl Arena {
+    /// Default chunk size (64KB).
+    const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
+
+    /// Creates a new arena with default chunk size.
+    pub fn new() -> Self {
+        Self::with_capacity(Self::DEFAULT_CHUNK_SIZE)
+    }
+
+    /// Creates a new arena with specified initial capacity.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let chunk_size = capacity.max(1024);
+        Self {
+            chunks: vec![vec![0u8; chunk_size]],
+            current_chunk: 0,
+            offset: 0,
+            chunk_size,
+        }
+    }
+
+    /// Allocates a byte slice of the given size.
+    ///
+    /// Returns a mutable slice that is valid for the lifetime of the arena.
+    #[inline]
+    pub fn alloc(&mut self, size: usize) -> &mut [u8] {
+        // Align to 8 bytes for better performance
+        let aligned_size = (size + 7) & !7;
+
+        // Check if current chunk has space
+        if self.offset + aligned_size <= self.chunks[self.current_chunk].len() {
+            let start = self.offset;
+            self.offset += aligned_size;
+            return &mut self.chunks[self.current_chunk][start..start + size];
+        }
+
+        // Need a new chunk
+        self.grow(aligned_size);
+        let start = self.offset;
+        self.offset += aligned_size;
+        &mut self.chunks[self.current_chunk][start..start + size]
+    }
+
+    /// Allocates and zeros a byte slice.
+    #[inline]
+    pub fn alloc_zeroed(&mut self, size: usize) -> &mut [u8] {
+        let slice = self.alloc(size);
+        slice.fill(0);
+        slice
+    }
+
+    /// Allocates space for a value of type T and returns a mutable reference.
+    #[inline]
+    pub fn alloc_with<T, F>(&mut self, f: F) -> &mut T
+    where
+        F: FnOnce() -> T,
+    {
+        let size = std::mem::size_of::<T>();
+        let align = std::mem::align_of::<T>();
+
+        // Ensure proper alignment
+        let current_ptr = self.chunks[self.current_chunk].as_ptr() as usize + self.offset;
+        let aligned_offset = (current_ptr + align - 1) & !(align - 1);
+        let padding = aligned_offset - current_ptr;
+
+        let total_size = padding + size;
+
+        if self.offset + total_size > self.chunks[self.current_chunk].len() {
+            self.grow(total_size);
+        }
+
+        self.offset += padding;
+        let ptr = self.chunks[self.current_chunk].as_mut_ptr();
+        let typed_ptr = unsafe { ptr.add(self.offset) as *mut T };
+        self.offset += size;
+
+        unsafe {
+            typed_ptr.write(f());
+            &mut *typed_ptr
+        }
+    }
+
+    /// Grows the arena by adding a new chunk.
+    fn grow(&mut self, min_size: usize) {
+        let new_chunk_size = self.chunk_size.max(min_size);
+
+        // Check if there's a next chunk we can reuse
+        if self.current_chunk + 1 < self.chunks.len() {
+            self.current_chunk += 1;
+            // Resize if needed
+            if self.chunks[self.current_chunk].len() < new_chunk_size {
+                self.chunks[self.current_chunk].resize(new_chunk_size, 0);
+            }
+        } else {
+            // Allocate a new chunk
+            self.chunks.push(vec![0u8; new_chunk_size]);
+            self.current_chunk = self.chunks.len() - 1;
+        }
+        self.offset = 0;
+    }
+
+    /// Resets the arena, allowing memory to be reused.
+    ///
+    /// This doesn't free memory, just resets the allocation pointer.
+    pub fn reset(&mut self) {
+        self.current_chunk = 0;
+        self.offset = 0;
+    }
+
+    /// Returns the total allocated capacity.
+    pub fn capacity(&self) -> usize {
+        self.chunks.iter().map(|c| c.len()).sum()
+    }
+
+    /// Returns the amount of memory currently in use.
+    pub fn used(&self) -> usize {
+        let full_chunks: usize = self.chunks[..self.current_chunk]
+            .iter()
+            .map(|c| c.len())
+            .sum();
+        full_chunks + self.offset
+    }
+}
+
+impl Default for Arena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -493,5 +639,66 @@ mod tests {
         let taken = dirty.take();
         assert!(dirty.is_empty());
         assert_eq!(taken.len(), 2);
+    }
+
+    #[test]
+    fn arena_basic_alloc() {
+        let mut arena = Arena::new();
+
+        // First allocation
+        {
+            let slice1 = arena.alloc(100);
+            assert_eq!(slice1.len(), 100);
+            slice1.fill(0xAA);
+        }
+
+        // Second allocation
+        {
+            let slice2 = arena.alloc(200);
+            assert_eq!(slice2.len(), 200);
+            slice2.fill(0xBB);
+        }
+
+        // Verify allocations work and memory is tracked
+        assert!(arena.used() >= 300);
+    }
+
+    #[test]
+    fn arena_alloc_zeroed() {
+        let mut arena = Arena::new();
+
+        let slice = arena.alloc_zeroed(256);
+        assert_eq!(slice.len(), 256);
+        assert!(slice.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn arena_grows_as_needed() {
+        let mut arena = Arena::with_capacity(1024);
+
+        // Allocate more than one chunk
+        for _ in 0..10 {
+            let slice = arena.alloc(512);
+            slice.fill(0xFF);
+        }
+
+        assert!(arena.capacity() > 1024);
+        assert!(arena.used() >= 5120);
+    }
+
+    #[test]
+    fn arena_reset() {
+        let mut arena = Arena::with_capacity(1024);
+
+        arena.alloc(512);
+        arena.alloc(512);
+        assert!(arena.used() >= 1024);
+
+        arena.reset();
+        assert_eq!(arena.used(), 0);
+
+        // Can allocate again after reset
+        let slice = arena.alloc(100);
+        assert_eq!(slice.len(), 100);
     }
 }
