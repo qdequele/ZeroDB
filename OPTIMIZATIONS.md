@@ -11,7 +11,7 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 
 ---
 
-## Implemented Optimizations (13)
+## Implemented Optimizations (14)
 
 ### Write Path Optimizations
 
@@ -86,15 +86,25 @@ This document tracks all performance optimizations for ZeroDB, comparing against
   - Integrated into `CursorOps::next()` to prefetch next node
 - **Files**: `src/btree/cursor.rs` - `prefetch_read()`, `prefetch_range()`
 
+#### 12. SIMD key comparison
+- **Impact**: 5-10% for large keys (>= 16 bytes)
+- **Description**: Hardware-accelerated key comparison using SIMD instructions
+- **Implementation**:
+  - x86_64: SSE2 using `_mm_loadu_si128` and `_mm_cmpeq_epi8`
+  - aarch64: NEON using `vld1q_u8` and `vceqq_u8`
+  - Compares 16 bytes at a time, finds first differing byte
+  - Falls back to standard comparison for short keys
+- **Files**: `src/btree/mod.rs` - `default_compare()`, `simd_compare_x86_64()`, `simd_compare_aarch64()`
+
 ### Platform-Specific Optimizations
 
-#### 12. Mmap advice hints (Unix)
+#### 13. Mmap advice hints (Unix)
 - **Impact**: OS-level optimization
 - **Description**: Use `madvise()` for access pattern hints
 - **Implementation**: `MmapAdvice` enum with Normal/Sequential/Random/WillNeed/DontNeed
 - **Files**: `src/mmap.rs` - `advise()`, `advise_range()`, `prefetch()`
 
-#### 13. F_FULLFSYNC (macOS)
+#### 14. F_FULLFSYNC (macOS)
 - **Impact**: Correct durability on macOS
 - **Description**: macOS `fsync()` only flushes to drive cache, not to platters
 - **Implementation**: `fcntl(fd, F_FULLFSYNC)` in `sync()` and `sync_data()`
@@ -102,37 +112,37 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 
 ---
 
-## Pending Optimizations (11)
+## Pending Optimizations (10)
 
 ### High Priority (Significant Impact Expected)
 
-#### 14. Spill dirty pages to disk
+#### 15. Spill dirty pages to disk
 - **Expected Impact**: Enables large transactions
 - **Description**: When dirty page count exceeds threshold, write some to disk
 - **LMDB**: `MDB_TXN_SPILLS` - spills oldest dirty pages
 - **Files**: `src/txn.rs`, `src/env.rs`
 
-#### 15. Nested transaction optimization
+#### 16. Nested transaction optimization
 - **Expected Impact**: Better subtransaction performance
 - **Description**: Share dirty pages between parent and child transactions
 - **Files**: `src/txn.rs` - `RwTxn::nested()`
 
 ### Medium Priority
 
-#### 16. Inline small values in leaf nodes
+#### 17. Inline small values in leaf nodes
 - **Expected Impact**: 10-15% for small values
 - **Description**: Store values < 64 bytes directly in leaf node instead of separate allocation
 - **LMDB**: `F_DUPDATA` with inline data
 - **Files**: `src/page/node.rs`, `src/btree/node.rs`
 
-#### 17. Compact leaf node format
+#### 18. Compact leaf node format
 - **Expected Impact**: Better cache utilization
 - **Description**: Pack keys and values more efficiently
 - **Current**: Fixed-size slots
 - **Optimal**: Variable-size with offset table
 - **Files**: `src/page/node.rs`
 
-#### 18. Reader table optimization
+#### 19. Reader table optimization
 - **Expected Impact**: Faster read transaction creation
 - **Description**: Use lock-free reader slots like LMDB
 - **LMDB**: Shared memory reader table with atomic operations
@@ -140,15 +150,10 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 
 ### Low Priority (Minor Impact)
 
-#### 19. Custom memory allocator
+#### 20. Custom memory allocator
 - **Expected Impact**: 5% improvement
 - **Description**: Use arena allocator for transaction-local allocations
 - **Files**: `src/alloc.rs`
-
-#### 20. SIMD key comparison
-- **Expected Impact**: 5-10% for large keys
-- **Description**: Use SIMD for memcmp on keys > 16 bytes
-- **Files**: `src/btree/search.rs`
 
 #### 21. Copy-on-write page references
 - **Expected Impact**: Reduced memory copies
@@ -177,11 +182,11 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 | Category | Implemented | Pending | Total |
 |----------|-------------|---------|-------|
 | Write Path | 5 | 2 | 7 |
-| Read Path | 3 | 3 | 6 |
+| Read Path | 4 | 2 | 6 |
 | Memory | 3 | 2 | 5 |
 | Platform | 2 | 3 | 5 |
 | Other | 0 | 1 | 1 |
-| **Total** | **13** | **11** | **24** |
+| **Total** | **14** | **10** | **24** |
 
 ---
 
