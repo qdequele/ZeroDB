@@ -6,7 +6,7 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 
 | Operation | ZeroDB | LMDB | Ratio | Status |
 |-----------|--------|------|-------|--------|
-| Sequential Writes (100) | ~455ms | ~404ms | 89% | Good |
+| Sequential Writes (100) | ~436ms | ~372ms | 85% | Good |
 | Point Lookup | ~150ns | ~130ns | 87% | Good |
 | Read Transaction | ~14ns | ~37ns | 264% | Excellent |
 
