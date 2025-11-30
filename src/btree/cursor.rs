@@ -375,6 +375,9 @@ impl CursorOps {
             let page_data = get_page(pgno)?;
 
             if is_leaf(&page_data, page_size)? {
+                // Prefetch the leaf page for upcoming iteration
+                prefetch_range(&page_data, page_size.min(2048));
+
                 let page = LeafPage::new(&page_data, page_size)?;
 
                 if page.num_keys() == 0 {
@@ -419,6 +422,9 @@ impl CursorOps {
             let page_data = get_page(pgno)?;
 
             if is_leaf(&page_data, page_size)? {
+                // Prefetch the leaf page for upcoming iteration
+                prefetch_range(&page_data, page_size.min(2048));
+
                 let page = LeafPage::new(&page_data, page_size)?;
                 let num_keys = page.num_keys();
 
@@ -579,6 +585,9 @@ impl CursorOps {
             let page_data = get_page(pgno)?;
 
             if is_leaf(&page_data, page_size)? {
+                // Prefetch the leaf page for upcoming iteration
+                prefetch_range(&page_data, page_size.min(2048));
+
                 let page = LeafPage::new(&page_data, page_size)?;
 
                 if page.num_keys() == 0 {
@@ -609,6 +618,9 @@ impl CursorOps {
             let page_data = get_page(pgno)?;
 
             if is_leaf(&page_data, page_size)? {
+                // Prefetch the leaf page for upcoming iteration
+                prefetch_range(&page_data, page_size.min(2048));
+
                 let page = LeafPage::new(&page_data, page_size)?;
                 let num_keys = page.num_keys();
 
