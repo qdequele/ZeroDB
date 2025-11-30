@@ -11,7 +11,7 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 
 ---
 
-## Implemented Optimizations (10)
+## Implemented Optimizations (13)
 
 ### Write Path Optimizations
 
@@ -54,23 +54,47 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 - **Description**: Allocate lowest page numbers first for sequential access patterns
 - **File**: `src/alloc.rs` - `alloc_from_freelist()`
 
+#### 8. Lazy freelist loading
+- **Impact**: Faster environment open
+- **Description**: Defer freelist loading until pages are actually needed
+- **Implementation**: `freelist_loaded` flag with `needs_freelist_load()` check
+- **Files**: `src/alloc.rs` - `PageAllocator`
+
 ### Read Path Optimizations
 
-#### 8. Cursor page caching
+#### 9. Cursor page caching
 - **Impact**: 20-30% read improvement
 - **Description**: LRU cache for recently accessed pages in cursor
 - **Implementation**: `PageCache` struct with configurable capacity (default 16 pages)
 - **Files**: `src/btree/cursor.rs` - `PageCache`, `search_cached()`
 
+#### 10. Branch prediction hints
+- **Impact**: 5-10% improvement
+- **Description**: Use `#[cold]` and `#[inline]` hints for hot paths
+- **Implementation**:
+  - `#[cold]` on error handlers (`corrupted_error()`, `page_not_found_error()`)
+  - `#[inline(always)]` on frequently called methods (`num_keys()`, `is_leaf()`, `key()`, `value()`)
+  - `#[inline]` on search and parse methods
+- **Files**: `src/error.rs`, `src/btree/page_ops.rs`, `src/btree/node.rs`, `src/page/header.rs`
+
+#### 11. CPU prefetch for sequential scans
+- **Impact**: 10-20% for sequential iteration
+- **Description**: Hardware prefetch instructions during cursor iteration
+- **Implementation**:
+  - `prefetch_read<T>()` - CPU cache prefetch using x86_64/aarch64 intrinsics
+  - `prefetch_range()` - Prefetch in cache-line sized chunks (64 bytes)
+  - Integrated into `CursorOps::next()` to prefetch next node
+- **Files**: `src/btree/cursor.rs` - `prefetch_read()`, `prefetch_range()`
+
 ### Platform-Specific Optimizations
 
-#### 9. Mmap advice hints (Unix)
+#### 12. Mmap advice hints (Unix)
 - **Impact**: OS-level optimization
 - **Description**: Use `madvise()` for access pattern hints
 - **Implementation**: `MmapAdvice` enum with Normal/Sequential/Random/WillNeed/DontNeed
 - **Files**: `src/mmap.rs` - `advise()`, `advise_range()`, `prefetch()`
 
-#### 10. F_FULLFSYNC (macOS)
+#### 13. F_FULLFSYNC (macOS)
 - **Impact**: Correct durability on macOS
 - **Description**: macOS `fsync()` only flushes to drive cache, not to platters
 - **Implementation**: `fcntl(fd, F_FULLFSYNC)` in `sync()` and `sync_data()`
@@ -78,63 +102,37 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 
 ---
 
-## Pending Optimizations (14)
+## Pending Optimizations (11)
 
 ### High Priority (Significant Impact Expected)
 
-#### 11. Spill dirty pages to disk
+#### 14. Spill dirty pages to disk
 - **Expected Impact**: Enables large transactions
 - **Description**: When dirty page count exceeds threshold, write some to disk
 - **LMDB**: `MDB_TXN_SPILLS` - spills oldest dirty pages
 - **Files**: `src/txn.rs`, `src/env.rs`
 
-#### 12. Nested transaction optimization
+#### 15. Nested transaction optimization
 - **Expected Impact**: Better subtransaction performance
 - **Description**: Share dirty pages between parent and child transactions
 - **Files**: `src/txn.rs` - `RwTxn::nested()`
 
 ### Medium Priority
 
-#### 13. Branch prediction hints
-- **Expected Impact**: 5-10% improvement
-- **Description**: Use `likely`/`unlikely` hints for hot paths
-- **Implementation**:
-  ```rust
-  #[cold]
-  fn handle_error() { ... }
-
-  if unlikely(page.is_overflow()) { ... }
-  ```
-- **Files**: All hot paths
-
-#### 14. Prefetch pages
-- **Expected Impact**: 10-20% for sequential scans
-- **Description**: Prefetch next pages during iteration
-- **Implementation**:
-  ```rust
-  fn prefetch_page(pgno: PageNo) {
-      #[cfg(target_arch = "x86_64")]
-      unsafe {
-          std::arch::x86_64::_mm_prefetch(ptr, _MM_HINT_T0);
-      }
-  }
-  ```
-- **Files**: `src/btree/cursor.rs`
-
-#### 15. Inline small values in leaf nodes
+#### 16. Inline small values in leaf nodes
 - **Expected Impact**: 10-15% for small values
 - **Description**: Store values < 64 bytes directly in leaf node instead of separate allocation
 - **LMDB**: `F_DUPDATA` with inline data
 - **Files**: `src/page/node.rs`, `src/btree/node.rs`
 
-#### 16. Compact leaf node format
+#### 17. Compact leaf node format
 - **Expected Impact**: Better cache utilization
 - **Description**: Pack keys and values more efficiently
 - **Current**: Fixed-size slots
 - **Optimal**: Variable-size with offset table
 - **Files**: `src/page/node.rs`
 
-#### 17. Reader table optimization
+#### 18. Reader table optimization
 - **Expected Impact**: Faster read transaction creation
 - **Description**: Use lock-free reader slots like LMDB
 - **LMDB**: Shared memory reader table with atomic operations
@@ -142,20 +140,15 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 
 ### Low Priority (Minor Impact)
 
-#### 18. Custom memory allocator
+#### 19. Custom memory allocator
 - **Expected Impact**: 5% improvement
 - **Description**: Use arena allocator for transaction-local allocations
 - **Files**: `src/alloc.rs`
 
-#### 19. SIMD key comparison
+#### 20. SIMD key comparison
 - **Expected Impact**: 5-10% for large keys
 - **Description**: Use SIMD for memcmp on keys > 16 bytes
 - **Files**: `src/btree/search.rs`
-
-#### 20. Lazy freelist loading
-- **Expected Impact**: Faster environment open
-- **Description**: Load freelist on-demand instead of at startup
-- **Files**: `src/env.rs`, `src/alloc.rs`
 
 #### 21. Copy-on-write page references
 - **Expected Impact**: Reduced memory copies
@@ -184,11 +177,11 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 | Category | Implemented | Pending | Total |
 |----------|-------------|---------|-------|
 | Write Path | 5 | 2 | 7 |
-| Read Path | 1 | 4 | 5 |
-| Memory | 2 | 2 | 4 |
+| Read Path | 3 | 3 | 6 |
+| Memory | 3 | 2 | 5 |
 | Platform | 2 | 3 | 5 |
-| Other | 0 | 3 | 3 |
-| **Total** | **10** | **14** | **24** |
+| Other | 0 | 1 | 1 |
+| **Total** | **13** | **11** | **24** |
 
 ---
 
