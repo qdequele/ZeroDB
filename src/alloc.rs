@@ -32,6 +32,9 @@ pub struct PageAllocator {
     /// Minimum reader transaction ID.
     /// Pages freed by transactions newer than this cannot be reused.
     min_reader_txnid: u64,
+    /// Whether the freelist has been loaded from disk.
+    /// Used for lazy freelist loading optimization.
+    freelist_loaded: bool,
 }
 
 impl PageAllocator {
@@ -51,6 +54,7 @@ impl PageAllocator {
             loose_pages: Vec::new(),
             freelist: BTreeMap::new(),
             min_reader_txnid: 0,
+            freelist_loaded: false,
         }
     }
 
@@ -173,11 +177,33 @@ impl PageAllocator {
 
     /// Loads the freelist from the database.
     ///
-    /// This should be called during environment initialization.
+    /// This should be called during environment initialization or on-demand
+    /// when freelist pages are needed (lazy loading).
     pub fn load_freelist(&mut self, entries: impl IntoIterator<Item = (u64, Vec<PageNo>)>) {
         for (txnid, pages) in entries {
             self.freelist.insert(txnid, pages);
         }
+        self.freelist_loaded = true;
+    }
+
+    /// Returns whether the freelist has been loaded.
+    #[inline]
+    pub fn is_freelist_loaded(&self) -> bool {
+        self.freelist_loaded
+    }
+
+    /// Marks the freelist as loaded (even if empty).
+    /// Used when we've checked and there's no freelist to load.
+    pub fn mark_freelist_loaded(&mut self) {
+        self.freelist_loaded = true;
+    }
+
+    /// Returns true if we should try to load the freelist.
+    /// This returns true if the freelist hasn't been loaded yet
+    /// and might contain reusable pages.
+    #[inline]
+    pub fn needs_freelist_load(&self) -> bool {
+        !self.freelist_loaded
     }
 
     /// Clears the freelist.
