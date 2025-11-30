@@ -6,6 +6,10 @@ description = "A pure-Rust port of LMDB"
 license = "MIT"
 repository = "https://github.com/quentindequelen/zerodb"
 
+[features]
+default = []
+serde = ["dep:serde", "dep:serde_json", "dep:bincode"]
+
 [dependencies]
 # Memory mapping
 memmap2 = "0.9"
@@ -21,6 +25,14 @@ page_size = "0.6"
 
 # Error handling
 thiserror = "2.0"
+
+# Byte ordering for endian-aware types (Heed compatibility)
+byteorder = "1.5"
+
+# Serde support (optional, for SerdeJson/SerdeBincode types)
+serde = { version = "1.0", optional = true }
+serde_json = { version = "1.0", optional = true }
+bincode = { version = "1.3", optional = true }
 
 # Platform-specific syscalls (madvise, F_FULLFSYNC)
 [target.'cfg(unix)'.dependencies]

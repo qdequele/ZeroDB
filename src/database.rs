@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::flags::DatabaseFlags;
 use crate::page::{DbInfo, PageNo};
 use crate::types::{BytesEncode, OwnedDecode};
-use crate::txn::{RoTxn, RwTxn};
+use crate::txn::{RoTxn, RwTxn, WithTls, TlsUsage};
 
 // ============================================================================
 // Unspecified type marker
@@ -54,14 +54,14 @@ pub enum Unspecified {}
 /// db.put(&mut wtxn, "hello", &42)?;
 /// wtxn.commit()?;
 /// ```
-pub struct DatabaseOpenOptions<'e, 'n, KC, DC, C = DefaultComparator> {
-    env: &'e Env,
+pub struct DatabaseOpenOptions<'e, 'n, KC, DC, C = DefaultComparator, T: TlsUsage = WithTls> {
+    env: &'e Env<T>,
     _types: PhantomData<(KC, DC, C)>,
     name: Option<&'n str>,
     flags: DatabaseFlags,
 }
 
-impl<KC, DC, C> std::fmt::Debug for DatabaseOpenOptions<'_, '_, KC, DC, C> {
+impl<KC, DC, C, T: TlsUsage> std::fmt::Debug for DatabaseOpenOptions<'_, '_, KC, DC, C, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatabaseOpenOptions")
             .field("name", &self.name)
@@ -70,9 +70,9 @@ impl<KC, DC, C> std::fmt::Debug for DatabaseOpenOptions<'_, '_, KC, DC, C> {
     }
 }
 
-impl<'e> DatabaseOpenOptions<'e, 'static, Unspecified, Unspecified, DefaultComparator> {
+impl<'e, T: TlsUsage> DatabaseOpenOptions<'e, 'static, Unspecified, Unspecified, DefaultComparator, T> {
     /// Create an options struct to open/create a database with specific flags.
-    pub fn new(env: &'e Env) -> Self {
+    pub fn new(env: &'e Env<T>) -> Self {
         DatabaseOpenOptions {
             env,
             _types: PhantomData,
@@ -82,12 +82,12 @@ impl<'e> DatabaseOpenOptions<'e, 'static, Unspecified, Unspecified, DefaultCompa
     }
 }
 
-impl<'e, 'n, KC, DC, C> DatabaseOpenOptions<'e, 'n, KC, DC, C> {
+impl<'e, 'n, KC, DC, C, T: TlsUsage> DatabaseOpenOptions<'e, 'n, KC, DC, C, T> {
     /// Change the type of the database.
     ///
     /// The default types are [`Unspecified`] and require a call to [`Database::remap_types`]
     /// to use the [`Database`].
-    pub fn types<NKC, NDC>(self) -> DatabaseOpenOptions<'e, 'n, NKC, NDC, C> {
+    pub fn types<NKC, NDC>(self) -> DatabaseOpenOptions<'e, 'n, NKC, NDC, C, T> {
         DatabaseOpenOptions {
             env: self.env,
             _types: PhantomData,
@@ -99,7 +99,7 @@ impl<'e, 'n, KC, DC, C> DatabaseOpenOptions<'e, 'n, KC, DC, C> {
     /// Change the customized key compare function of the database.
     ///
     /// By default no customized compare function will be set when opening a database.
-    pub fn key_comparator<NC>(self) -> DatabaseOpenOptions<'e, 'n, KC, DC, NC> {
+    pub fn key_comparator<NC>(self) -> DatabaseOpenOptions<'e, 'n, KC, DC, NC, T> {
         DatabaseOpenOptions {
             env: self.env,
             _types: PhantomData,
@@ -131,7 +131,7 @@ impl<'e, 'n, KC, DC, C> DatabaseOpenOptions<'e, 'n, KC, DC, C> {
     /// LMDB has an important restriction on the unnamed database when named ones are opened.
     /// The names of the named databases are stored as keys in the unnamed one and are immutable,
     /// and these keys can only be read and not written.
-    pub fn open<'txn>(&self, rtxn: &'txn RoTxn<'_>) -> Result<Option<Database<KC, DC>>>
+    pub fn open<'txn>(&self, rtxn: &'txn RoTxn<'_, T>) -> Result<Option<Database<KC, DC>>>
     where
         KC: 'static,
         DC: 'static,
@@ -148,7 +148,7 @@ impl<'e, 'n, KC, DC, C> DatabaseOpenOptions<'e, 'n, KC, DC, C> {
     /// LMDB has an important restriction on the unnamed database when named ones are opened.
     /// The names of the named databases are stored as keys in the unnamed one and are immutable,
     /// and these keys can only be read and not written.
-    pub fn create(&self, wtxn: &mut RwTxn<'_>) -> Result<Database<KC, DC>>
+    pub fn create(&self, wtxn: &mut RwTxn<'_, T>) -> Result<Database<KC, DC>>
     where
         KC: 'static,
         DC: 'static,
@@ -157,13 +157,13 @@ impl<'e, 'n, KC, DC, C> DatabaseOpenOptions<'e, 'n, KC, DC, C> {
     }
 }
 
-impl<KC, DC, C> Clone for DatabaseOpenOptions<'_, '_, KC, DC, C> {
+impl<KC, DC, C, T: TlsUsage> Clone for DatabaseOpenOptions<'_, '_, KC, DC, C, T> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<KC, DC, C> Copy for DatabaseOpenOptions<'_, '_, KC, DC, C> {}
+impl<KC, DC, C, T: TlsUsage> Copy for DatabaseOpenOptions<'_, '_, KC, DC, C, T> {}
 
 // ============================================================================
 // DatabaseStat

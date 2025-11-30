@@ -1312,7 +1312,9 @@ dependencies = [
 name = "zerodb"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "bitflags",
+ "byteorder",
  "criterion",
  "fs2",
  "heed",
@@ -1320,6 +1322,8 @@ dependencies = [
  "memmap2",
  "page_size",
  "rocksdb",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
 ]

@@ -53,8 +53,27 @@ pub use database::{
     // Mutable iterators
     RwIter, RwRevIter, RwRange, RwRevRange, RwPrefix, RwRevPrefix,
 };
-pub use types::{BytesDecode, BytesEncode, OwnedDecode, Bytes, OwnedBytes, Str, OwnedStr, U32, U64, I32, I64, Unit};
+pub use types::{
+    BytesDecode, BytesEncode, OwnedDecode,
+    Bytes, OwnedBytes, Str, OwnedStr,
+    U32, U64, I32, I64, Unit,
+    // DecodeIgnore
+    DecodeIgnore,
+    // Endian-aware types (Heed compatible)
+    U16, U32BE, U64BE, U128, I128,
+    BEU16, BEU32, BEU64, BEU128, BEI128,
+    // Re-export byteorder types
+    BigEndian, LittleEndian, NativeEndian, ByteOrder, BE, LE, NE,
+};
+
+// Serde types (feature-gated)
+#[cfg(feature = "serde")]
+pub use types::{SerdeJson, SerdeBincode};
+
 pub use error::{Error, Result};
+
+/// MdbError is an alias for Error for Heed compatibility.
+pub type MdbError = Error;
 pub use flags::{EnvFlags, DatabaseFlags, PutFlags};
 pub use page::{PageFlags, PageHeader};
 pub use env::{

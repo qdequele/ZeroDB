@@ -73,6 +73,25 @@ impl TlsUsage for AnyTls {
     const ENABLED: bool = false;
 }
 
+/// Inner state for read-only transaction environment reference.
+///
+/// Uses `Cow` to allow either borrowing or owning the environment.
+enum RoTxnEnv<'e, T: TlsUsage> {
+    /// Borrowed reference to the environment.
+    Borrowed(&'e Env<T>),
+    /// Owned environment (for static_read_txn).
+    Owned(Env<T>),
+}
+
+impl<'e, T: TlsUsage> RoTxnEnv<'e, T> {
+    fn as_ref(&self) -> &Env<T> {
+        match self {
+            RoTxnEnv::Borrowed(env) => env,
+            RoTxnEnv::Owned(env) => env,
+        }
+    }
+}
+
 /// A read-only transaction.
 ///
 /// Read transactions provide a consistent snapshot of the database
@@ -94,9 +113,9 @@ impl TlsUsage for AnyTls {
 /// // ... read operations ...
 /// rtxn.abort(); // or just drop it
 /// ```
-pub struct RoTxn<'e, T = WithTls> {
+pub struct RoTxn<'e, T: TlsUsage = WithTls> {
     /// Reference to the environment.
-    env: &'e Env,
+    env: RoTxnEnv<'e, T>,
     /// Transaction ID (snapshot point).
     txnid: u64,
     /// Snapshot of the meta page at transaction start.
@@ -107,11 +126,24 @@ pub struct RoTxn<'e, T = WithTls> {
     _tls_marker: PhantomData<T>,
 }
 
-impl<'e, T> RoTxn<'e, T> {
+impl<'e, T: TlsUsage> RoTxn<'e, T> {
     /// Creates a new read-only transaction.
-    pub(crate) fn new(env: &'e Env, txnid: u64, meta: MetaPage) -> Self {
+    pub(crate) fn new(env: &'e Env<T>, txnid: u64, meta: MetaPage) -> Self {
         Self {
-            env,
+            env: RoTxnEnv::Borrowed(env),
+            txnid,
+            meta,
+            active: true,
+            _tls_marker: PhantomData,
+        }
+    }
+
+    /// Creates a new read-only transaction that owns the environment.
+    ///
+    /// This allows the transaction to have a `'static` lifetime.
+    pub(crate) fn new_static(env: Env<T>, txnid: u64, meta: MetaPage) -> RoTxn<'static, T> {
+        RoTxn {
+            env: RoTxnEnv::Owned(env),
             txnid,
             meta,
             active: true,
@@ -136,8 +168,8 @@ impl<'e, T> RoTxn<'e, T> {
     }
 
     /// Returns a reference to the environment.
-    pub fn env(&self) -> &'e Env {
-        self.env
+    pub fn env(&self) -> &Env<T> {
+        self.env.as_ref()
     }
 
     /// Returns the meta page snapshot.
@@ -162,7 +194,7 @@ impl<'e, T> RoTxn<'e, T> {
         if !self.active {
             return Err(Error::BadTxn);
         }
-        self.env.page_data(pgno)
+        self.env.as_ref().page_data(pgno)
     }
 
     /// Aborts the transaction.
@@ -186,7 +218,7 @@ impl<'e, T> RoTxn<'e, T> {
     }
 }
 
-impl<T> Drop for RoTxn<'_, T> {
+impl<T: TlsUsage> Drop for RoTxn<'_, T> {
     fn drop(&mut self) {
         // Release reader slot
         self.active = false;
@@ -211,9 +243,9 @@ unsafe impl Send for RoTxn<'_, WithoutTls> {}
 /// // ... write operations ...
 /// wtxn.commit()?;
 /// ```
-pub struct RwTxn<'e> {
+pub struct RwTxn<'e, T: TlsUsage = WithTls> {
     /// Reference to the environment.
-    env: &'e Env,
+    env: &'e Env<T>,
     /// Transaction ID for this write transaction.
     txnid: u64,
     /// Starting meta page (will be updated on commit).
@@ -225,13 +257,13 @@ pub struct RwTxn<'e> {
     /// Whether the transaction is still active.
     active: bool,
     /// Parent transaction (for nested transactions).
-    parent: Option<Box<RwTxn<'e>>>,
+    parent: Option<Box<RwTxn<'e, T>>>,
 }
 
-impl<'e> RwTxn<'e> {
+impl<'e, T: TlsUsage> RwTxn<'e, T> {
     /// Creates a new read-write transaction.
     pub(crate) fn new(
-        env: &'e Env,
+        env: &'e Env<T>,
         txnid: u64,
         meta: MetaPage,
         allocator: PageAllocator,
@@ -249,7 +281,7 @@ impl<'e> RwTxn<'e> {
 
     /// Creates a nested (child) transaction.
     #[allow(dead_code)]
-    pub(crate) fn nested(parent: RwTxn<'e>) -> Self {
+    pub(crate) fn nested(parent: RwTxn<'e, T>) -> Self {
         let env = parent.env;
         let txnid = parent.txnid;
         let meta = parent.meta;
@@ -285,7 +317,7 @@ impl<'e> RwTxn<'e> {
     }
 
     /// Returns a reference to the environment.
-    pub fn env(&self) -> &'e Env {
+    pub fn env(&self) -> &Env<T> {
         self.env
     }
 
@@ -467,7 +499,7 @@ impl<'e> RwTxn<'e> {
     }
 }
 
-impl Drop for RwTxn<'_> {
+impl<T: TlsUsage> Drop for RwTxn<'_, T> {
     fn drop(&mut self) {
         if self.active {
             // Transaction was not committed or aborted - abort it
@@ -483,14 +515,14 @@ impl Drop for RwTxn<'_> {
 /// A transaction that can be either read-only or read-write.
 ///
 /// This is useful for functions that work with any transaction type.
-pub enum Txn<'e, T = WithTls> {
+pub enum Txn<'e, T: TlsUsage = WithTls> {
     /// Read-only transaction.
     Ro(RoTxn<'e, T>),
     /// Read-write transaction.
-    Rw(RwTxn<'e>),
+    Rw(RwTxn<'e, T>),
 }
 
-impl<'e, T> Txn<'e, T> {
+impl<'e, T: TlsUsage> Txn<'e, T> {
     /// Return the transaction's ID.
     pub fn id(&self) -> u64 {
         match self {
@@ -507,7 +539,7 @@ impl<'e, T> Txn<'e, T> {
     }
 
     /// Returns a reference to the environment.
-    pub fn env(&self) -> &'e Env {
+    pub fn env(&self) -> &Env<T> {
         match self {
             Txn::Ro(txn) => txn.env(),
             Txn::Rw(txn) => txn.env(),
@@ -523,14 +555,14 @@ impl<'e, T> Txn<'e, T> {
     }
 }
 
-impl<'e, T> From<RoTxn<'e, T>> for Txn<'e, T> {
+impl<'e, T: TlsUsage> From<RoTxn<'e, T>> for Txn<'e, T> {
     fn from(txn: RoTxn<'e, T>) -> Self {
         Txn::Ro(txn)
     }
 }
 
-impl<'e, T> From<RwTxn<'e>> for Txn<'e, T> {
-    fn from(txn: RwTxn<'e>) -> Self {
+impl<'e, T: TlsUsage> From<RwTxn<'e, T>> for Txn<'e, T> {
+    fn from(txn: RwTxn<'e, T>) -> Self {
         Txn::Rw(txn)
     }
 }

@@ -6,17 +6,19 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
-use std::io::{Seek, SeekFrom};
+use std::io::Seek;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+
+use std::marker::PhantomData;
 
 use crate::alloc::{PageAllocator, PagePool};
 use crate::error::{Error, Result};
 use crate::flags::EnvFlags;
 use crate::mmap::{DataFile, MemoryMap};
 use crate::page::{DbInfo, MetaPage, PageNo};
-use crate::txn::{RoTxn, RwTxn};
+use crate::txn::{RoTxn, RwTxn, WithTls, WithoutTls, TlsUsage};
 
 /// Default map size (10 MB).
 const DEFAULT_MAP_SIZE: usize = 10 * 1024 * 1024;
@@ -57,7 +59,7 @@ impl SignalEvent {
 
     fn wait_timeout(&self, timeout: Duration) -> bool {
         let (lock, cvar) = &*self.inner;
-        let mut signaled = lock.lock().unwrap();
+        let signaled = lock.lock().unwrap();
         if *signaled {
             return true;
         }
@@ -232,31 +234,41 @@ impl<C: LexicographicComparator> Comparator for C {
 }
 
 /// Options for opening an environment.
+///
+/// The type parameter `T` specifies the TLS mode:
+/// - `WithTls` (default): Read transactions are `!Send` but may be faster
+/// - `WithoutTls`: Read transactions are `Send` and can be moved between threads
 #[derive(Debug, Clone)]
-pub struct EnvOpenOptions {
+pub struct EnvOpenOptions<T = WithTls> {
     map_size: usize,
     max_readers: u32,
     max_dbs: u32,
     flags: EnvFlags,
+    _tls_marker: PhantomData<T>,
 }
 
-impl Default for EnvOpenOptions {
+impl Default for EnvOpenOptions<WithTls> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl EnvOpenOptions {
+impl EnvOpenOptions<WithTls> {
     /// Creates a new set of environment open options with default values.
+    ///
+    /// By default, read transactions use Thread Local Storage (TLS) and are `!Send`.
     pub fn new() -> Self {
         Self {
             map_size: DEFAULT_MAP_SIZE,
             max_readers: DEFAULT_MAX_READERS,
             max_dbs: DEFAULT_MAX_DBS,
             flags: EnvFlags::empty(),
+            _tls_marker: PhantomData,
         }
     }
+}
 
+impl<T: TlsUsage> EnvOpenOptions<T> {
     /// Sets the size of the memory map.
     ///
     /// The size must be a multiple of the OS page size.
@@ -296,9 +308,39 @@ impl EnvOpenOptions {
     /// - The database file is not modified by another process while open
     /// - Long-lived transactions are avoided
     /// - The process is not killed with an active write transaction
-    pub unsafe fn open(&self, path: &Path) -> Result<Env> {
+    pub unsafe fn open(&self, path: &Path) -> Result<Env<T>> {
         // SAFETY: Caller guarantees the safety requirements.
         unsafe { Env::open(path, self) }
+    }
+
+    /// Returns the current configuration but with TLS enabled for read transactions.
+    ///
+    /// A thread can only use one transaction at a time, plus any child (nested)
+    /// transactions. Each transaction belongs to one thread. A `BadRslot` error
+    /// will be thrown when multiple read transactions exist on the same thread.
+    pub fn read_txn_with_tls(self) -> EnvOpenOptions<WithTls> {
+        EnvOpenOptions {
+            map_size: self.map_size,
+            max_readers: self.max_readers,
+            max_dbs: self.max_dbs,
+            flags: self.flags,
+            _tls_marker: PhantomData,
+        }
+    }
+
+    /// Returns the current configuration but without TLS for read transactions.
+    ///
+    /// When used to open transactions: A thread can use any number of read
+    /// transactions at a time on the same thread. Read transactions can be
+    /// moved in between threads (`Send`).
+    pub fn read_txn_without_tls(self) -> EnvOpenOptions<WithoutTls> {
+        EnvOpenOptions {
+            map_size: self.map_size,
+            max_readers: self.max_readers,
+            max_dbs: self.max_dbs,
+            flags: self.flags,
+            _tls_marker: PhantomData,
+        }
     }
 }
 
@@ -347,7 +389,11 @@ struct EnvInner {
 ///
 /// The environment is the main handle for working with the database.
 /// It manages the memory-mapped file, transactions, and readers.
-pub struct Env {
+///
+/// The type parameter `T` specifies the TLS mode for read transactions:
+/// - `WithTls` (default): Read transactions are `!Send` but may be faster
+/// - `WithoutTls`: Read transactions are `Send` and can be moved between threads
+pub struct Env<T: TlsUsage = WithTls> {
     /// Path to the environment directory or file.
     path: PathBuf,
     /// Data file path.
@@ -375,11 +421,13 @@ pub struct Env {
     page_pool: Mutex<PagePool>,
     /// Signal event for closing notification.
     signal_event: Arc<SignalEvent>,
+    /// TLS marker.
+    _tls_marker: PhantomData<T>,
 }
 
-impl Env {
+impl<T: TlsUsage> Env<T> {
     /// Opens or creates an environment.
-    unsafe fn open(path: &Path, options: &EnvOpenOptions) -> Result<Self> {
+    unsafe fn open(path: &Path, options: &EnvOpenOptions<T>) -> Result<Self> {
         let page_size = page_size::get();
 
         // Validate map size is multiple of page size
@@ -513,6 +561,7 @@ impl Env {
             write_lock: Mutex::new(()),
             page_pool: Mutex::new(PagePool::new(page_size)),
             signal_event,
+            _tls_marker: PhantomData,
         })
     }
 
@@ -649,7 +698,7 @@ impl Env {
     /// ```
     pub fn database_options(
         &self,
-    ) -> crate::database::DatabaseOpenOptions<'_, 'static, crate::database::Unspecified, crate::database::Unspecified> {
+    ) -> crate::database::DatabaseOpenOptions<'_, 'static, crate::database::Unspecified, crate::database::Unspecified, crate::env::DefaultComparator, T> {
         crate::database::DatabaseOpenOptions::new(self)
     }
 
@@ -666,7 +715,7 @@ impl Env {
     /// - A named database already exists with different flags
     pub fn create_database<KC, DC>(
         &self,
-        wtxn: &mut RwTxn<'_>,
+        wtxn: &mut RwTxn<'_, T>,
         name: Option<&str>,
     ) -> Result<crate::database::Database<KC, DC>> {
         let flags = crate::flags::DatabaseFlags::empty();
@@ -756,7 +805,7 @@ impl Env {
     /// ```
     pub fn open_database<KC, DC>(
         &self,
-        rtxn: &RoTxn<'_>,
+        rtxn: &RoTxn<'_, T>,
         name: Option<&str>,
     ) -> Result<Option<crate::database::Database<KC, DC>>> {
         let flags = crate::flags::DatabaseFlags::empty();
@@ -816,7 +865,7 @@ impl Env {
     }
 
     /// Loads a named database's DbInfo from the main database (read-only).
-    fn load_named_db_info_ro(&self, txn: &RoTxn<'_>, name: &str) -> Result<Option<DbInfo>> {
+    fn load_named_db_info_ro(&self, txn: &RoTxn<'_, T>, name: &str) -> Result<Option<DbInfo>> {
         use crate::btree::{CursorOps, CursorState, SearchResult};
 
         let inner = self.inner.read().unwrap();
@@ -853,7 +902,7 @@ impl Env {
     }
 
     /// Loads a named database's DbInfo from the main database (read-write).
-    fn load_named_db_info(&self, txn: &mut RwTxn<'_>, name: &str) -> Result<Option<DbInfo>> {
+    fn load_named_db_info(&self, txn: &mut RwTxn<'_, T>, name: &str) -> Result<Option<DbInfo>> {
         use crate::btree::{CursorOps, CursorState, SearchResult};
 
         let main_db = txn.meta().main_db;
@@ -889,7 +938,7 @@ impl Env {
     }
 
     /// Stores a named database's DbInfo in the main database.
-    fn store_named_db_info(&self, txn: &mut RwTxn<'_>, name: &str, info: &DbInfo) -> Result<()> {
+    fn store_named_db_info(&self, txn: &mut RwTxn<'_, T>, name: &str, info: &DbInfo) -> Result<()> {
         use crate::btree::{PageBuilder, Node};
 
         let page_size = self.page_size;
@@ -973,7 +1022,11 @@ impl Env {
     ///
     /// Read transactions provide a consistent snapshot of the database.
     /// Multiple read transactions can be active simultaneously.
-    pub fn read_txn(&self) -> Result<RoTxn<'_>> {
+    ///
+    /// You can make this transaction `Send`able between threads by opening
+    /// the environment with the [`EnvOpenOptions::read_txn_without_tls`]
+    /// method.
+    pub fn read_txn(&self) -> Result<RoTxn<'_, T>> {
         if self.flags.read().unwrap().contains(EnvFlags::NO_LOCK) {
             // With NO_LOCK, caller manages concurrency
         }
@@ -985,11 +1038,48 @@ impl Env {
         Ok(RoTxn::new(self, txnid, meta))
     }
 
+    /// Creates a read-only transaction with a `'static` lifetime.
+    ///
+    /// This is useful when you want to pass the transaction to a thread
+    /// or store it in a struct without lifetime parameters.
+    ///
+    /// The transaction owns the environment, so the environment will
+    /// be dropped when the transaction is dropped.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use zerodb::{EnvOpenOptions, WithoutTls};
+    ///
+    /// let env_options = EnvOpenOptions::new().read_txn_without_tls();
+    /// let env = unsafe { env_options.open(path)? };
+    ///
+    /// // Move env into a static transaction
+    /// let rtxn = env.static_read_txn()?;
+    ///
+    /// // rtxn can now be moved to another thread
+    /// std::thread::spawn(move || {
+    ///     // use rtxn here
+    /// });
+    /// ```
+    pub fn static_read_txn(self) -> Result<RoTxn<'static, T>> {
+        if self.flags.read().unwrap().contains(EnvFlags::NO_LOCK) {
+            // With NO_LOCK, caller manages concurrency
+        }
+
+        let inner = self.inner.read().unwrap();
+        let txnid = inner.last_txnid;
+        let meta = inner.meta;
+        drop(inner);
+
+        Ok(RoTxn::new_static(self, txnid, meta))
+    }
+
     /// Creates a new read-write transaction.
     ///
     /// Only one write transaction can be active at a time.
     /// Write transactions have exclusive access to modify the database.
-    pub fn write_txn(&self) -> Result<RwTxn<'_>> {
+    pub fn write_txn(&self) -> Result<RwTxn<'_, T>> {
         if self.flags.read().unwrap().contains(EnvFlags::READ_ONLY) {
             return Err(Error::Incompatible);
         }
@@ -1218,7 +1308,7 @@ impl Env {
     ///
     /// The new transaction will be a nested transaction, with the transaction indicated by parent
     /// as its parent.
-    pub fn nested_write_txn<'p>(&'p self, parent: &'p mut RwTxn) -> Result<RwTxn<'p>> {
+    pub fn nested_write_txn<'p>(&'p self, parent: &'p mut RwTxn<'_, T>) -> Result<RwTxn<'p, T>> {
         if self.flags.read().unwrap().contains(EnvFlags::READ_ONLY) {
             return Err(Error::Incompatible);
         }
@@ -1242,15 +1332,15 @@ impl Env {
     }
 }
 
-impl Drop for Env {
+impl<T: TlsUsage> Drop for Env<T> {
     fn drop(&mut self) {
         self.close();
     }
 }
 
 // Env is Send + Sync because all mutable state is protected by RwLock
-unsafe impl Send for Env {}
-unsafe impl Sync for Env {}
+unsafe impl<T: TlsUsage> Send for Env<T> {}
+unsafe impl<T: TlsUsage> Sync for Env<T> {}
 
 /// Environment information.
 #[derive(Debug, Clone, Copy)]
