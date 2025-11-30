@@ -11,7 +11,7 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 
 ---
 
-## Implemented Optimizations (14)
+## Implemented Optimizations (15)
 
 ### Write Path Optimizations
 
@@ -60,15 +60,25 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 - **Implementation**: `freelist_loaded` flag with `needs_freelist_load()` check
 - **Files**: `src/alloc.rs` - `PageAllocator`
 
+#### 9. Arena allocator for transactions
+- **Impact**: ~5% improvement for allocation-heavy workloads
+- **Description**: Bump-pointer arena allocator for transaction-local allocations
+- **Implementation**:
+  - Pre-allocated chunks (default 64KB)
+  - 8-byte alignment for performance
+  - Auto-growing with new chunks
+  - `reset()` for memory reuse without deallocation
+- **Files**: `src/alloc.rs` - `Arena`
+
 ### Read Path Optimizations
 
-#### 9. Cursor page caching
+#### 10. Cursor page caching
 - **Impact**: 20-30% read improvement
 - **Description**: LRU cache for recently accessed pages in cursor
 - **Implementation**: `PageCache` struct with configurable capacity (default 16 pages)
 - **Files**: `src/btree/cursor.rs` - `PageCache`, `search_cached()`
 
-#### 10. Branch prediction hints
+#### 11. Branch prediction hints
 - **Impact**: 5-10% improvement
 - **Description**: Use `#[cold]` and `#[inline]` hints for hot paths
 - **Implementation**:
@@ -77,7 +87,7 @@ This document tracks all performance optimizations for ZeroDB, comparing against
   - `#[inline]` on search and parse methods
 - **Files**: `src/error.rs`, `src/btree/page_ops.rs`, `src/btree/node.rs`, `src/page/header.rs`
 
-#### 11. CPU prefetch for sequential scans
+#### 12. CPU prefetch for sequential scans
 - **Impact**: 10-20% for sequential iteration
 - **Description**: Hardware prefetch instructions during cursor iteration
 - **Implementation**:
@@ -86,7 +96,7 @@ This document tracks all performance optimizations for ZeroDB, comparing against
   - Integrated into `CursorOps::next()` to prefetch next node
 - **Files**: `src/btree/cursor.rs` - `prefetch_read()`, `prefetch_range()`
 
-#### 12. SIMD key comparison
+#### 13. SIMD key comparison
 - **Impact**: 5-10% for large keys (>= 16 bytes)
 - **Description**: Hardware-accelerated key comparison using SIMD instructions
 - **Implementation**:
@@ -98,13 +108,13 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 
 ### Platform-Specific Optimizations
 
-#### 13. Mmap advice hints (Unix)
+#### 14. Mmap advice hints (Unix)
 - **Impact**: OS-level optimization
 - **Description**: Use `madvise()` for access pattern hints
 - **Implementation**: `MmapAdvice` enum with Normal/Sequential/Random/WillNeed/DontNeed
 - **Files**: `src/mmap.rs` - `advise()`, `advise_range()`, `prefetch()`
 
-#### 14. F_FULLFSYNC (macOS)
+#### 15. F_FULLFSYNC (macOS)
 - **Impact**: Correct durability on macOS
 - **Description**: macOS `fsync()` only flushes to drive cache, not to platters
 - **Implementation**: `fcntl(fd, F_FULLFSYNC)` in `sync()` and `sync_data()`
@@ -112,48 +122,43 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 
 ---
 
-## Pending Optimizations (10)
+## Pending Optimizations (9)
 
 ### High Priority (Significant Impact Expected)
 
-#### 15. Spill dirty pages to disk
+#### 16. Spill dirty pages to disk
 - **Expected Impact**: Enables large transactions
 - **Description**: When dirty page count exceeds threshold, write some to disk
 - **LMDB**: `MDB_TXN_SPILLS` - spills oldest dirty pages
 - **Files**: `src/txn.rs`, `src/env.rs`
 
-#### 16. Nested transaction optimization
+#### 17. Nested transaction optimization
 - **Expected Impact**: Better subtransaction performance
 - **Description**: Share dirty pages between parent and child transactions
 - **Files**: `src/txn.rs` - `RwTxn::nested()`
 
 ### Medium Priority
 
-#### 17. Inline small values in leaf nodes
+#### 18. Inline small values in leaf nodes
 - **Expected Impact**: 10-15% for small values
 - **Description**: Store values < 64 bytes directly in leaf node instead of separate allocation
 - **LMDB**: `F_DUPDATA` with inline data
 - **Files**: `src/page/node.rs`, `src/btree/node.rs`
 
-#### 18. Compact leaf node format
+#### 19. Compact leaf node format
 - **Expected Impact**: Better cache utilization
 - **Description**: Pack keys and values more efficiently
 - **Current**: Fixed-size slots
 - **Optimal**: Variable-size with offset table
 - **Files**: `src/page/node.rs`
 
-#### 19. Reader table optimization
+#### 20. Reader table optimization
 - **Expected Impact**: Faster read transaction creation
 - **Description**: Use lock-free reader slots like LMDB
 - **LMDB**: Shared memory reader table with atomic operations
 - **Files**: `src/env.rs`, new `src/reader.rs`
 
 ### Low Priority (Minor Impact)
-
-#### 20. Custom memory allocator
-- **Expected Impact**: 5% improvement
-- **Description**: Use arena allocator for transaction-local allocations
-- **Files**: `src/alloc.rs`
 
 #### 21. Copy-on-write page references
 - **Expected Impact**: Reduced memory copies
@@ -183,10 +188,10 @@ This document tracks all performance optimizations for ZeroDB, comparing against
 |----------|-------------|---------|-------|
 | Write Path | 5 | 2 | 7 |
 | Read Path | 4 | 2 | 6 |
-| Memory | 3 | 2 | 5 |
+| Memory | 4 | 1 | 5 |
 | Platform | 2 | 3 | 5 |
 | Other | 0 | 1 | 1 |
-| **Total** | **14** | **10** | **24** |
+| **Total** | **15** | **9** | **24** |
 
 ---
 
