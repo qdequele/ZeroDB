@@ -3,6 +3,8 @@
 //! This module provides abstractions for reading and writing
 //! branch and leaf pages.
 
+use std::cell::RefCell;
+
 use crate::error::{Error, Result};
 use crate::page::{PAGE_HEADER_SIZE, PageHeader, PageNo};
 
@@ -11,6 +13,57 @@ use super::{CompareFn, SearchResult};
 
 /// Size of a node pointer (offset within page).
 const NODE_PTR_SIZE: usize = 2;
+
+/// Maximum number of buffers to keep in thread-local pool per page size.
+const MAX_POOLED_BUFFERS: usize = 8;
+
+thread_local! {
+    /// Thread-local page buffer pool to avoid repeated allocations.
+    /// Key is page_size, value is list of reusable buffers.
+    static PAGE_BUFFER_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Gets a page buffer from the thread-local pool or allocates a new one.
+#[inline]
+fn get_page_buffer(page_size: usize) -> Vec<u8> {
+    PAGE_BUFFER_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        // Find a buffer of the right size
+        if let Some(pos) = pool.iter().position(|b| b.len() == page_size) {
+            let mut buf = pool.swap_remove(pos);
+            // Zero the buffer for safety
+            buf.fill(0);
+            buf
+        } else {
+            vec![0u8; page_size]
+        }
+    })
+}
+
+/// Returns a page buffer to the thread-local pool for reuse.
+#[inline]
+pub fn return_page_buffer(buf: Vec<u8>) {
+    PAGE_BUFFER_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < MAX_POOLED_BUFFERS {
+            pool.push(buf);
+        }
+        // If pool is full, buffer is dropped
+    });
+}
+
+/// Returns multiple page buffers to the thread-local pool.
+#[inline]
+pub fn return_page_buffers(buffers: impl IntoIterator<Item = Vec<u8>>) {
+    PAGE_BUFFER_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        for buf in buffers {
+            if pool.len() < MAX_POOLED_BUFFERS {
+                pool.push(buf);
+            }
+        }
+    });
+}
 
 /// A branch page view.
 ///
@@ -235,8 +288,10 @@ pub struct PageBuilder {
 
 impl PageBuilder {
     /// Creates a new branch page builder.
+    ///
+    /// Uses thread-local buffer pooling to minimize allocations.
     pub fn new_branch(page_no: PageNo, page_size: usize) -> Self {
-        let mut data = vec![0u8; page_size];
+        let mut data = get_page_buffer(page_size);
         let header = PageHeader::new_branch(page_no, page_size);
         header.write_to(&mut data).unwrap();
 
@@ -250,8 +305,10 @@ impl PageBuilder {
     }
 
     /// Creates a new leaf page builder.
+    ///
+    /// Uses thread-local buffer pooling to minimize allocations.
     pub fn new_leaf(page_no: PageNo, page_size: usize) -> Self {
-        let mut data = vec![0u8; page_size];
+        let mut data = get_page_buffer(page_size);
         let header = PageHeader::new_leaf(page_no, page_size);
         header.write_to(&mut data).unwrap();
 

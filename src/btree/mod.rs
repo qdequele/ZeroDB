@@ -12,7 +12,7 @@ mod search;
 pub use cursor::{CursorLevel, CursorOps, CursorState};
 pub use insert::{InsertResult, insert_into_branch, insert_into_leaf};
 pub use node::{Node, NodeRef};
-pub use page_ops::{BranchPage, LeafPage, PageBuilder};
+pub use page_ops::{BranchPage, LeafPage, PageBuilder, return_page_buffer, return_page_buffers};
 pub use search::search_page;
 
 use crate::page::PageNo;
