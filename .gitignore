@@ -1,3 +1,9 @@
 /target
 lmdb/
 heed/
+
+# Profiling artifacts
+*.svg
+*.trace
+cargo-flamegraph.trace
+perf.data*
