@@ -210,6 +210,12 @@ impl<'a> LeafPage<'a> {
     pub fn value(&self, index: usize) -> Result<&'a [u8]> {
         Ok(self.node(index)?.value())
     }
+
+    /// Returns the amount of free space available in this page.
+    #[inline]
+    pub fn free_space(&self) -> usize {
+        self.header.free_space()
+    }
 }
 
 /// A mutable page builder for creating new pages.

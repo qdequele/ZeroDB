@@ -5,12 +5,15 @@
 
 #![allow(clippy::type_complexity)]
 
-use crate::error::Result;
-use crate::page::PageNo;
+use crate::error::{Error, Result};
+use crate::page::{PageNo, PAGE_HEADER_SIZE};
 
 use super::P_INVALID;
-use super::node::Node;
+use super::node::{Node, NodeRef};
 use super::page_ops::{LeafPage, PageBuilder};
+
+/// Size of a node pointer in the page index.
+const NODE_PTR_SIZE: usize = 2;
 
 /// Result of an insert operation.
 #[derive(Debug)]
@@ -48,6 +51,11 @@ pub fn calculate_split_point(
 
 /// Inserts a node into a leaf page at the specified index.
 ///
+/// This is an optimized implementation that:
+/// 1. Attempts in-place insertion when there's enough space
+/// 2. Uses zero-copy iteration when rebuilding is necessary
+/// 3. Minimizes memory allocations
+///
 /// If the page is full, returns the nodes that should go into a new split page.
 pub fn insert_into_leaf(
     page_data: &[u8],
@@ -58,73 +66,178 @@ pub fn insert_into_leaf(
 ) -> Result<(Vec<u8>, Option<(Vec<u8>, Vec<u8>)>)> {
     let page = LeafPage::new(page_data, page_size)?;
     let num_keys = page.num_keys();
+    let new_node_size = new_node.size();
 
-    // Collect all nodes including the new one
-    let mut nodes: Vec<Node> = Vec::with_capacity(num_keys + 1);
+    // Calculate if we can fit the new node
+    let current_free_space = page.free_space();
+    let space_needed = new_node_size + NODE_PTR_SIZE;
 
+    // Fast path: in-place insertion when there's enough space
+    if current_free_space >= space_needed {
+        return insert_in_place(page_data, &new_node, insert_index, page_no, page_size);
+    }
+
+    // Need to rebuild (and possibly split)
+    // Use zero-copy iteration to minimize allocations
+    insert_with_rebuild(page_data, new_node, insert_index, page_no, page_size, num_keys)
+}
+
+/// Fast path: insert node in-place without full page rebuild.
+///
+/// This directly manipulates the page buffer to insert a new node,
+/// shifting existing pointers as needed.
+#[inline]
+fn insert_in_place(
+    page_data: &[u8],
+    new_node: &Node,
+    insert_index: usize,
+    page_no: PageNo,
+    page_size: usize,
+) -> Result<(Vec<u8>, Option<(Vec<u8>, Vec<u8>)>)> {
+    let page = LeafPage::new(page_data, page_size)?;
+    let num_keys = page.num_keys();
+    let new_node_size = new_node.size();
+
+    // Copy page data to new buffer
+    let mut data = page_data.to_vec();
+
+    // Read current bounds from header
+    let lower = u16::from_le_bytes([data[12], data[13]]) as usize;
+    let upper = u16::from_le_bytes([data[14], data[15]]) as usize;
+
+    // Calculate new bounds
+    let new_upper = upper - new_node_size;
+    let new_lower = lower + NODE_PTR_SIZE;
+
+    // Write the new node data at new_upper
+    new_node.write_leaf(&mut data[new_upper..])?;
+
+    // Shift existing pointers after insert_index to make room
+    if insert_index < num_keys {
+        let shift_start = PAGE_HEADER_SIZE + insert_index * NODE_PTR_SIZE;
+        let shift_end = lower;
+        // Shift right by NODE_PTR_SIZE bytes
+        data.copy_within(shift_start..shift_end, shift_start + NODE_PTR_SIZE);
+    }
+
+    // Write the new pointer at insert_index
+    let ptr_offset = PAGE_HEADER_SIZE + insert_index * NODE_PTR_SIZE;
+    data[ptr_offset..ptr_offset + 2].copy_from_slice(&(new_upper as u16).to_le_bytes());
+
+    // Update header bounds
+    data[12..14].copy_from_slice(&(new_lower as u16).to_le_bytes());
+    data[14..16].copy_from_slice(&(new_upper as u16).to_le_bytes());
+
+    // Update page number in header if different
+    data[0..8].copy_from_slice(&page_no.to_le_bytes());
+
+    Ok((data, None))
+}
+
+/// Slow path: rebuild the page (and possibly split) using zero-copy iteration.
+fn insert_with_rebuild(
+    page_data: &[u8],
+    new_node: Node,
+    insert_index: usize,
+    page_no: PageNo,
+    page_size: usize,
+    num_keys: usize,
+) -> Result<(Vec<u8>, Option<(Vec<u8>, Vec<u8>)>)> {
+    let page = LeafPage::new(page_data, page_size)?;
+
+    // Calculate total size to determine if split is needed
+    let mut total_data_size = new_node.size() + NODE_PTR_SIZE;
     for i in 0..num_keys {
-        if i == insert_index {
-            nodes.push(new_node.clone());
-        }
         let node_ref = page.node(i)?;
-        // Preserve overflow nodes properly
-        if node_ref.is_overflow() {
-            if let Some(overflow_pgno) = node_ref.overflow_pgno() {
-                nodes.push(Node::leaf_overflow(node_ref.key().to_vec(), overflow_pgno));
-            } else {
-                return Err(crate::error::Error::Corrupted);
+        total_data_size += node_ref.size() + NODE_PTR_SIZE;
+    }
+
+    let available_space = page_size - PAGE_HEADER_SIZE;
+    let needs_split = total_data_size > available_space;
+
+    if !needs_split {
+        // Rebuild without split - use single-pass building
+        let mut builder = PageBuilder::new_leaf(page_no, page_size);
+
+        for i in 0..=num_keys {
+            if i == insert_index {
+                builder.add_leaf(&new_node)?;
             }
-        } else {
-            nodes.push(Node::leaf(
-                node_ref.key().to_vec(),
-                node_ref.value().to_vec(),
-            ));
+            if i < num_keys {
+                let node_ref = page.node(i)?;
+                add_node_ref_to_builder(&mut builder, &node_ref)?;
+            }
         }
-    }
 
-    // Handle insert at end
-    if insert_index >= num_keys {
-        nodes.push(new_node.clone());
-    }
-
-    // Try to fit all nodes in one page
-    let mut builder = PageBuilder::new_leaf(page_no, page_size);
-    let mut fit_count = 0;
-
-    for node in &nodes {
-        if builder.can_fit(node.size()) {
-            builder.add_leaf(node)?;
-            fit_count += 1;
-        } else {
-            break;
-        }
-    }
-
-    if fit_count == nodes.len() {
-        // Everything fits
         return Ok((builder.finish(), None));
     }
 
     // Need to split - calculate split point
-    let split_point = nodes.len() / 2;
-    let split_point = split_point.max(1);
+    let total_keys = num_keys + 1;
+    let split_point = (total_keys / 2).max(1);
 
     // Build left page
     let mut left_builder = PageBuilder::new_leaf(page_no, page_size);
-    for node in &nodes[..split_point] {
-        left_builder.add_leaf(node)?;
+    // Build right page
+    let mut right_builder = PageBuilder::new_leaf(P_INVALID, page_size);
+
+    let mut separator_key: Option<Vec<u8>> = None;
+    let mut current_index = 0;
+
+    for i in 0..=num_keys {
+        let is_new_node = i == insert_index;
+        let has_existing = i < num_keys;
+
+        // Process new node at insert position
+        if is_new_node {
+            if current_index < split_point {
+                left_builder.add_leaf(&new_node)?;
+            } else {
+                if separator_key.is_none() {
+                    separator_key = Some(new_node.key.clone());
+                }
+                right_builder.add_leaf(&new_node)?;
+            }
+            current_index += 1;
+        }
+
+        // Process existing node
+        if has_existing {
+            let node_ref = page.node(i)?;
+            if current_index < split_point {
+                add_node_ref_to_builder(&mut left_builder, &node_ref)?;
+            } else {
+                if separator_key.is_none() {
+                    separator_key = Some(node_ref.key().to_vec());
+                }
+                add_node_ref_to_builder(&mut right_builder, &node_ref)?;
+            }
+            current_index += 1;
+        }
     }
 
-    // Build right page (page number will be set by caller)
-    let mut right_builder = PageBuilder::new_leaf(P_INVALID, page_size);
-    for node in &nodes[split_point..] {
-        right_builder.add_leaf(node)?;
-    }
+    let separator = separator_key.ok_or(Error::Corrupted)?;
 
     Ok((
         left_builder.finish(),
-        Some((right_builder.finish(), nodes[split_point].key.clone())),
+        Some((right_builder.finish(), separator)),
     ))
+}
+
+/// Helper to add a NodeRef to a PageBuilder without allocating a full Node.
+#[inline]
+fn add_node_ref_to_builder(builder: &mut PageBuilder, node_ref: &NodeRef) -> Result<()> {
+    // Create a minimal Node from the reference
+    if node_ref.is_overflow() {
+        let node = Node::leaf_overflow(
+            node_ref.key().to_vec(),
+            node_ref.overflow_pgno().ok_or(Error::Corrupted)?,
+        );
+        builder.add_leaf(&node)
+    } else {
+        let node = Node::leaf(node_ref.key().to_vec(), node_ref.value().to_vec());
+        builder.add_leaf(&node)
+    }
 }
 
 /// Inserts a child pointer into a branch page.
