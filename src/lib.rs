@@ -7,22 +7,85 @@
 //!
 //! ZeroDB provides a typed database API compatible with the Heed crate:
 //!
-//! ```ignore
+//! ```
 //! use zerodb::{EnvOpenOptions, Database};
 //! use zerodb::types::{Str, U32};
 //!
-//! let env = unsafe { EnvOpenOptions::new().open(path)? };
+//! # fn main() -> zerodb::Result<()> {
+//! // Create a temporary directory for the database
+//! let dir = tempfile::tempdir()?;
+//!
+//! // Open the environment (unsafe due to memory-mapping requirements)
+//! let env = unsafe {
+//!     EnvOpenOptions::new()
+//!         .max_dbs(10)
+//!         .open(dir.path())?
+//! };
+//!
+//! // Start a write transaction
 //! let mut wtxn = env.write_txn()?;
 //!
 //! // Create a database with string keys and u32 values
-//! let db: Database<Str, U32> = env.create_database(&mut wtxn, None)?;
+//! let db: Database<Str, U32> = env.create_database(&mut wtxn, Some("my-db"))?;
 //!
+//! // Insert key-value pairs
 //! db.put(&mut wtxn, "hello", &42)?;
+//! db.put(&mut wtxn, "world", &100)?;
 //! wtxn.commit()?;
 //!
+//! // Read data back
 //! let rtxn = env.read_txn()?;
 //! assert_eq!(db.get(&rtxn, "hello")?, Some(42));
+//! assert_eq!(db.get(&rtxn, "world")?, Some(100));
+//! # Ok(())
+//! # }
 //! ```
+//!
+//! # Iteration
+//!
+//! ZeroDB supports efficient iteration over database entries:
+//!
+//! ```
+//! use zerodb::{EnvOpenOptions, Database};
+//! use zerodb::types::{Str, U32};
+//!
+//! # fn main() -> zerodb::Result<()> {
+//! # let dir = tempfile::tempdir()?;
+//! # let env = unsafe { EnvOpenOptions::new().max_dbs(10).open(dir.path())? };
+//! # let mut wtxn = env.write_txn()?;
+//! # let db: Database<Str, U32> = env.create_database(&mut wtxn, Some("iter-db"))?;
+//! # db.put(&mut wtxn, "a", &1)?;
+//! # db.put(&mut wtxn, "b", &2)?;
+//! # db.put(&mut wtxn, "c", &3)?;
+//! # wtxn.commit()?;
+//! let rtxn = env.read_txn()?;
+//!
+//! // Forward iteration
+//! for result in db.iter(&rtxn)? {
+//!     let (key, value) = result?;
+//!     println!("{}: {}", key, value);
+//! }
+//!
+//! // Range queries
+//! for result in db.range(&rtxn, &("a".."c"))? {
+//!     let (key, value) = result?;
+//!     println!("{}: {}", key, value);
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Safety
+//!
+//! The [`EnvOpenOptions::open`] method is marked `unsafe` because:
+//!
+//! - The database file must not be opened multiple times simultaneously
+//! - The memory-mapped region must remain valid for the environment's lifetime
+//! - The caller must ensure proper file permissions
+//!
+//! # Features
+//!
+//! - `serde` - Enables `SerdeJson` and `SerdeBincode` types for automatic serialization
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
