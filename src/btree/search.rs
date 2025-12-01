@@ -8,6 +8,7 @@ use super::{CompareFn, SearchResult};
 
 /// Result of searching through the tree.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct TreeSearchResult<'a> {
     /// The leaf page containing the key (or where it would be).
     pub leaf_data: &'a [u8],
@@ -47,18 +48,21 @@ pub fn search_page(
 }
 
 /// Determines if a page is a leaf page.
+#[allow(dead_code)]
 pub fn is_leaf_page(data: &[u8]) -> Result<bool> {
     let header = PageHeader::read_from(data)?;
     Ok(header.flags.is_leaf())
 }
 
 /// Determines if a page is a branch page.
+#[allow(dead_code)]
 pub fn is_branch_page(data: &[u8]) -> Result<bool> {
     let header = PageHeader::read_from(data)?;
     Ok(header.flags.is_branch())
 }
 
 /// Gets the child page number from a branch page at the given index.
+#[allow(dead_code)]
 pub fn get_child_pgno(data: &[u8], index: usize, page_size: usize) -> Result<PageNo> {
     let page = BranchPage::new(data, page_size)?;
     page.child(index)
@@ -66,18 +70,24 @@ pub fn get_child_pgno(data: &[u8], index: usize, page_size: usize) -> Result<Pag
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::default_compare;
-    use super::super::page_ops::PageBuilder;
     use super::super::node::Node;
+    use super::super::page_ops::PageBuilder;
+    use super::*;
 
     #[test]
     fn search_leaf_page() {
         let page_size = 4096;
         let mut builder = PageBuilder::new_leaf(1, page_size);
-        builder.add_leaf(&Node::leaf(b"a".to_vec(), b"1".to_vec())).unwrap();
-        builder.add_leaf(&Node::leaf(b"c".to_vec(), b"3".to_vec())).unwrap();
-        builder.add_leaf(&Node::leaf(b"e".to_vec(), b"5".to_vec())).unwrap();
+        builder
+            .add_leaf(&Node::leaf(b"a".to_vec(), b"1".to_vec()))
+            .unwrap();
+        builder
+            .add_leaf(&Node::leaf(b"c".to_vec(), b"3".to_vec()))
+            .unwrap();
+        builder
+            .add_leaf(&Node::leaf(b"e".to_vec(), b"5".to_vec()))
+            .unwrap();
         let data = builder.finish();
 
         let (is_leaf, result) = search_page(&data, b"c", page_size, default_compare).unwrap();
@@ -93,8 +103,12 @@ mod tests {
     fn search_branch_page() {
         let page_size = 4096;
         let mut builder = PageBuilder::new_branch(1, page_size);
-        builder.add_branch(&Node::branch(b"m".to_vec(), 10)).unwrap();
-        builder.add_branch(&Node::branch(b"z".to_vec(), 20)).unwrap();
+        builder
+            .add_branch(&Node::branch(b"m".to_vec(), 10))
+            .unwrap();
+        builder
+            .add_branch(&Node::branch(b"z".to_vec(), 20))
+            .unwrap();
         let data = builder.finish();
 
         let (is_leaf, result) = search_page(&data, b"a", page_size, default_compare).unwrap();

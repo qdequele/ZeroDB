@@ -13,6 +13,7 @@ pub const NODE_HEADER_SIZE: usize = 8;
 ///
 /// This is a zero-copy view into the page data.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct NodeRef<'a> {
     /// Raw node data.
     data: &'a [u8],
@@ -282,10 +283,16 @@ impl Node {
         }
 
         let (lo, size_hi) = if self.flags.contains(NodeFlags::BIGDATA) {
-            ((self.pgno & 0xFFFF_FFFF) as u32, ((self.pgno >> 32) & 0x0F) as u16)
+            (
+                (self.pgno & 0xFFFF_FFFF) as u32,
+                ((self.pgno >> 32) & 0x0F) as u16,
+            )
         } else {
             let data_size = self.value.len() as u64;
-            ((data_size & 0xFFFF_FFFF) as u32, ((data_size >> 32) & 0x0F) as u16)
+            (
+                (data_size & 0xFFFF_FFFF) as u32,
+                ((data_size >> 32) & 0x0F) as u16,
+            )
         };
 
         let hi_and_ksize = (size_hi << 12) | key_size;

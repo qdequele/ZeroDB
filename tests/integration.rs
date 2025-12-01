@@ -2,14 +2,14 @@
 //!
 //! These tests verify that all components work together correctly.
 
-use std::collections::BTreeMap;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 
 use zerodb::{
-    btree::{CursorOps, CursorState, Node, PageBuilder, insert_into_leaf, SearchResult},
+    EnvFlags, EnvOpenOptions,
+    btree::{CursorOps, CursorState, Node, PageBuilder, SearchResult, insert_into_leaf},
     error::{Error, Result},
     page::{DbInfo, PageNo},
-    EnvOpenOptions, EnvFlags,
 };
 
 use tempfile::tempdir;
@@ -18,6 +18,7 @@ use tempfile::tempdir;
 struct PageStore {
     pages: RefCell<BTreeMap<PageNo, Vec<u8>>>,
     next_pgno: RefCell<PageNo>,
+    #[allow(dead_code)]
     page_size: usize,
 }
 
@@ -84,10 +85,12 @@ fn test_btree_operations_in_memory() {
     let builder = PageBuilder::new_leaf(root_pgno, page_size);
     store.set(root_pgno, builder.finish()).unwrap();
 
-    let mut db_info = DbInfo::default();
-    db_info.root = root_pgno;
-    db_info.leaf_pages = 1;
-    db_info.depth = 1;
+    let mut db_info = DbInfo {
+        root: root_pgno,
+        leaf_pages: 1,
+        depth: 1,
+        ..Default::default()
+    };
 
     // Insert some keys
     let keys = vec![
@@ -108,13 +111,8 @@ fn test_btree_operations_in_memory() {
         let insert_index = result.index();
 
         let node = Node::leaf(key.clone(), value.clone());
-        let (new_data, split) = insert_into_leaf(
-            &leaf_data,
-            node,
-            insert_index,
-            leaf_pgno,
-            page_size,
-        ).unwrap();
+        let (new_data, split) =
+            insert_into_leaf(&leaf_data, node, insert_index, leaf_pgno, page_size).unwrap();
 
         store.set(leaf_pgno, new_data).unwrap();
         db_info.entries += 1;
@@ -166,7 +164,9 @@ fn test_cursor_iteration() {
     ];
 
     for (key, value) in &keys {
-        builder.add_leaf(&Node::leaf(key.to_vec(), value.to_vec())).unwrap();
+        builder
+            .add_leaf(&Node::leaf(key.to_vec(), value.to_vec()))
+            .unwrap();
     }
     store.set(root_pgno, builder.finish()).unwrap();
 
@@ -227,10 +227,12 @@ fn test_many_keys_with_splits() {
     let builder = PageBuilder::new_leaf(root_pgno, page_size);
     store.set(root_pgno, builder.finish()).unwrap();
 
-    let mut db_info = DbInfo::default();
-    db_info.root = root_pgno;
-    db_info.leaf_pages = 1;
-    db_info.depth = 1;
+    let mut db_info = DbInfo {
+        root: root_pgno,
+        leaf_pages: 1,
+        depth: 1,
+        ..Default::default()
+    };
 
     // Insert many keys to trigger splits
     let mut keys_inserted = Vec::new();
@@ -242,17 +244,13 @@ fn test_many_keys_with_splits() {
         // (simplified - doesn't handle multi-level trees)
         let leaf_data = store.get(db_info.root).unwrap();
         let mut state = CursorState::new(db_info.root);
-        let result = CursorOps::search(&mut state, &key, page_size, |pgno| store.get(pgno)).unwrap();
+        let result =
+            CursorOps::search(&mut state, &key, page_size, |pgno| store.get(pgno)).unwrap();
         let insert_index = result.index();
 
         let node = Node::leaf(key.clone(), value.clone());
-        let (new_data, split) = insert_into_leaf(
-            &leaf_data,
-            node,
-            insert_index,
-            db_info.root,
-            page_size,
-        ).unwrap();
+        let (new_data, split) =
+            insert_into_leaf(&leaf_data, node, insert_index, db_info.root, page_size).unwrap();
 
         store.set(db_info.root, new_data).unwrap();
         keys_inserted.push(key);
@@ -303,7 +301,7 @@ fn test_write_transaction_persistence() {
         page_size = env.page_size();
 
         let mut wtxn = env.write_txn().unwrap();
-        let (pgno, data) = wtxn.alloc_page().unwrap();
+        let (_pgno, data) = wtxn.alloc_page().unwrap();
 
         // Write a marker pattern
         data[0..8].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE]);
@@ -367,7 +365,9 @@ fn test_binary_keys_and_values() {
     ];
 
     for (key, value) in &binary_data {
-        builder.add_leaf(&Node::leaf(key.clone(), value.clone())).unwrap();
+        builder
+            .add_leaf(&Node::leaf(key.clone(), value.clone()))
+            .unwrap();
     }
     store.set(root_pgno, builder.finish()).unwrap();
 
@@ -378,7 +378,9 @@ fn test_binary_keys_and_values() {
         assert!(result.is_found(), "Key {:?} not found", key);
 
         let leaf_data = store.get(root_pgno).unwrap();
-        let (k, v) = CursorOps::get_current(&state, &leaf_data, page_size).unwrap().unwrap();
+        let (k, v) = CursorOps::get_current(&state, &leaf_data, page_size)
+            .unwrap()
+            .unwrap();
         assert_eq!(k, key.as_slice());
         assert_eq!(v, expected_value.as_slice());
     }
@@ -395,23 +397,32 @@ fn test_large_values() {
 
     // Values of various sizes (but not overflow)
     let large_value = vec![0x42u8; 1000];
-    builder.add_leaf(&Node::leaf(b"large".to_vec(), large_value.clone())).unwrap();
+    builder
+        .add_leaf(&Node::leaf(b"large".to_vec(), large_value.clone()))
+        .unwrap();
 
     let medium_value = vec![0x43u8; 500];
-    builder.add_leaf(&Node::leaf(b"medium".to_vec(), medium_value.clone())).unwrap();
+    builder
+        .add_leaf(&Node::leaf(b"medium".to_vec(), medium_value.clone()))
+        .unwrap();
 
     let small_value = vec![0x44u8; 10];
-    builder.add_leaf(&Node::leaf(b"small".to_vec(), small_value.clone())).unwrap();
+    builder
+        .add_leaf(&Node::leaf(b"small".to_vec(), small_value.clone()))
+        .unwrap();
 
     store.set(root_pgno, builder.finish()).unwrap();
 
     // Verify
     let mut state = CursorState::new(root_pgno);
-    let result = CursorOps::search(&mut state, b"large", page_size, |pgno| store.get(pgno)).unwrap();
+    let result =
+        CursorOps::search(&mut state, b"large", page_size, |pgno| store.get(pgno)).unwrap();
     assert!(result.is_found());
 
     let leaf_data = store.get(root_pgno).unwrap();
-    let (_, v) = CursorOps::get_current(&state, &leaf_data, page_size).unwrap().unwrap();
+    let (_, v) = CursorOps::get_current(&state, &leaf_data, page_size)
+        .unwrap()
+        .unwrap();
     assert_eq!(v.len(), 1000);
     assert!(v.iter().all(|&b| b == 0x42));
 }
@@ -442,7 +453,9 @@ fn test_range_queries() {
     // Position cursor at "05" (the next key after where "04x" would go)
     if state.is_valid() {
         let leaf_data = store.get(root_pgno).unwrap();
-        let (k, _) = CursorOps::get_current(&state, &leaf_data, page_size).unwrap().unwrap();
+        let (k, _) = CursorOps::get_current(&state, &leaf_data, page_size)
+            .unwrap()
+            .unwrap();
         assert_eq!(k, b"05");
     }
 }
@@ -498,16 +511,11 @@ fn test_transaction_isolation() {
 
 #[test]
 fn test_named_database_create() {
-    use zerodb::types::{Str, U32};
     use zerodb::Database;
+    use zerodb::types::{Str, U32};
 
     let dir = tempdir().unwrap();
-    let env = unsafe {
-        EnvOpenOptions::new()
-            .max_dbs(10)
-            .open(dir.path())
-            .unwrap()
-    };
+    let env = unsafe { EnvOpenOptions::new().max_dbs(10).open(dir.path()).unwrap() };
 
     // Create a named database
     let mut wtxn = env.write_txn().unwrap();
@@ -522,16 +530,11 @@ fn test_named_database_create() {
 
 #[test]
 fn test_named_database_operations() {
-    use zerodb::types::{Str, U32};
     use zerodb::Database;
+    use zerodb::types::{Str, U32};
 
     let dir = tempdir().unwrap();
-    let env = unsafe {
-        EnvOpenOptions::new()
-            .max_dbs(10)
-            .open(dir.path())
-            .unwrap()
-    };
+    let env = unsafe { EnvOpenOptions::new().max_dbs(10).open(dir.path()).unwrap() };
 
     // Create named database and put data
     let mut wtxn = env.write_txn().unwrap();
@@ -556,16 +559,11 @@ fn test_named_database_operations() {
 
 #[test]
 fn test_multiple_named_databases() {
-    use zerodb::types::{Str, U32, Bytes};
     use zerodb::Database;
+    use zerodb::types::{Bytes, Str, U32};
 
     let dir = tempdir().unwrap();
-    let env = unsafe {
-        EnvOpenOptions::new()
-            .max_dbs(10)
-            .open(dir.path())
-            .unwrap()
-    };
+    let env = unsafe { EnvOpenOptions::new().max_dbs(10).open(dir.path()).unwrap() };
 
     // Create multiple named databases
     let mut wtxn = env.write_txn().unwrap();
@@ -596,16 +594,11 @@ fn test_multiple_named_databases() {
 
 #[test]
 fn test_unnamed_database_with_named() {
-    use zerodb::types::{Str, U32};
     use zerodb::Database;
+    use zerodb::types::{Str, U32};
 
     let dir = tempdir().unwrap();
-    let env = unsafe {
-        EnvOpenOptions::new()
-            .max_dbs(10)
-            .open(dir.path())
-            .unwrap()
-    };
+    let env = unsafe { EnvOpenOptions::new().max_dbs(10).open(dir.path()).unwrap() };
 
     // Use both unnamed and named databases
     let mut wtxn = env.write_txn().unwrap();
@@ -624,16 +617,11 @@ fn test_unnamed_database_with_named() {
 
 #[test]
 fn test_database_open_nonexistent() {
-    use zerodb::types::{Str, U32};
     use zerodb::Database;
+    use zerodb::types::{Str, U32};
 
     let dir = tempdir().unwrap();
-    let env = unsafe {
-        EnvOpenOptions::new()
-            .max_dbs(10)
-            .open(dir.path())
-            .unwrap()
-    };
+    let env = unsafe { EnvOpenOptions::new().max_dbs(10).open(dir.path()).unwrap() };
 
     // Try to open a database that doesn't exist
     let rtxn = env.read_txn().unwrap();
@@ -650,12 +638,7 @@ fn test_database_options_builder() {
     use zerodb::types::{Str, U32};
 
     let dir = tempdir().unwrap();
-    let env = unsafe {
-        EnvOpenOptions::new()
-            .max_dbs(10)
-            .open(dir.path())
-            .unwrap()
-    };
+    let env = unsafe { EnvOpenOptions::new().max_dbs(10).open(dir.path()).unwrap() };
 
     // Use the builder pattern
     let mut wtxn = env.write_txn().unwrap();
@@ -680,15 +663,14 @@ fn test_database_options_builder() {
     rtxn.commit().unwrap();
 }
 
-
 /// Test inserting a 2GiB value to verify large value handling.
 /// This test is ignored by default because it requires ~2GB memory and disk space.
 /// Run with: cargo test test_2gib_value -- --ignored
 #[test]
 #[ignore]
 fn test_2gib_value() {
-    use zerodb::types::{Str, Bytes};
     use zerodb::Database;
+    use zerodb::types::{Bytes, Str};
 
     let dir = tempdir().unwrap();
 
@@ -705,7 +687,9 @@ fn test_2gib_value() {
     };
 
     let mut wtxn = env.write_txn().unwrap();
-    let db: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("large-values")).unwrap();
+    let db: Database<Str, Bytes> = env
+        .create_database(&mut wtxn, Some("large-values"))
+        .unwrap();
 
     // Create a 2GiB value
     let two_gib = 2 * 1024 * 1024 * 1024; // 2,147,483,648 bytes
@@ -744,8 +728,8 @@ fn test_2gib_value() {
 #[test]
 #[ignore]
 fn test_max_value_size() {
-    use zerodb::types::{Str, Bytes};
     use zerodb::Database;
+    use zerodb::types::{Bytes, Str};
 
     let dir = tempdir().unwrap();
 
@@ -769,14 +753,14 @@ fn test_max_value_size() {
 
     // Test some specific sizes - start small to find the threshold
     let test_sizes = [
-        100,                    // 100 bytes
-        1000,                   // 1 KB
-        4000,                   // ~4 KB (near page size)
-        8000,                   // 8 KB
-        16000,                  // 16 KB
-        64 * 1024,              // 64 KB
-        256 * 1024,             // 256 KB
-        1 * 1024 * 1024,        // 1 MB
+        100,         // 100 bytes
+        1000,        // 1 KB
+        4000,        // ~4 KB (near page size)
+        8000,        // 8 KB
+        16000,       // 16 KB
+        64 * 1024,   // 64 KB
+        256 * 1024,  // 256 KB
+        1024 * 1024, // 1 MB
     ];
 
     for size in test_sizes {
@@ -789,14 +773,27 @@ fn test_max_value_size() {
                 max_success = max_success.max(size);
             }
             Err(e) => {
-                println!("FAILED:  {} bytes ({} MB) - {:?}", size, size / (1024 * 1024), e);
+                println!(
+                    "FAILED:  {} bytes ({} MB) - {:?}",
+                    size,
+                    size / (1024 * 1024),
+                    e
+                );
                 min_fail = min_fail.min(size);
             }
         }
     }
 
-    println!("\nMax successful size: {} bytes ({} MB)", max_success, max_success / (1024 * 1024));
-    println!("Min failed size: {} bytes ({} MB)", min_fail, min_fail / (1024 * 1024));
+    println!(
+        "\nMax successful size: {} bytes ({} MB)",
+        max_success,
+        max_success / (1024 * 1024)
+    );
+    println!(
+        "Min failed size: {} bytes ({} MB)",
+        min_fail,
+        min_fail / (1024 * 1024)
+    );
 
     wtxn.abort();
 }

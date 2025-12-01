@@ -174,8 +174,7 @@ impl PageHeader {
         }
 
         let page_no = u64::from_le_bytes([
-            data[0], data[1], data[2], data[3],
-            data[4], data[5], data[6], data[7],
+            data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
         ]);
         let pad = u16::from_le_bytes([data[8], data[9]]);
         let flags_bits = u16::from_le_bytes([data[10], data[11]]);

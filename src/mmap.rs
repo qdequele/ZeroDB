@@ -42,7 +42,7 @@ impl MemoryMap {
             MmapOptions::new()
                 .len(len)
                 .map(&file)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                .map_err(io::Error::other)?
         };
 
         Ok(Self {
@@ -58,10 +58,7 @@ impl MemoryMap {
     /// The file must not be modified by another process while mapped.
     /// Writes to the mapping will be visible to other processes.
     pub unsafe fn open_read_write(path: &Path, len: usize) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
 
         // Ensure file is at least `len` bytes, extend if needed
         let file_len = file.metadata()?.len() as usize;
@@ -73,7 +70,7 @@ impl MemoryMap {
             MmapOptions::new()
                 .len(len)
                 .map_mut(&file)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                .map_err(io::Error::other)?
         };
 
         Ok(Self {
@@ -89,7 +86,7 @@ impl MemoryMap {
         let mmap = MmapOptions::new()
             .len(len)
             .map_anon()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         Ok(Self {
             inner: MmapInner::ReadWrite(mmap),
@@ -145,7 +142,7 @@ impl MemoryMap {
         match &self.inner {
             MmapInner::ReadOnly(_) => Ok(()),
             MmapInner::ReadWrite(mmap) => {
-                mmap.flush().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                mmap.flush().map_err(io::Error::other)?;
                 Ok(())
             }
         }
@@ -156,7 +153,7 @@ impl MemoryMap {
         match &self.inner {
             MmapInner::ReadOnly(_) => Ok(()),
             MmapInner::ReadWrite(mmap) => {
-                mmap.flush_async().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                mmap.flush_async().map_err(io::Error::other)?;
                 Ok(())
             }
         }
@@ -167,8 +164,7 @@ impl MemoryMap {
         match &self.inner {
             MmapInner::ReadOnly(_) => Ok(()),
             MmapInner::ReadWrite(mmap) => {
-                mmap.flush_range(offset, len)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                mmap.flush_range(offset, len).map_err(io::Error::other)?;
                 Ok(())
             }
         }
@@ -311,10 +307,7 @@ pub struct DataFile {
 impl DataFile {
     /// Opens an existing data file.
     pub fn open(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
 
         Ok(Self {
             file,

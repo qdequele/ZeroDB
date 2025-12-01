@@ -3,11 +3,13 @@
 //! This module provides the main Database struct for interacting with
 //! key-value data stored in B+trees.
 
+#![allow(clippy::type_complexity)]
+
 use std::marker::PhantomData;
 
 use crate::btree::{
-    insert_into_branch, insert_into_leaf, CursorOps, CursorState,
-    LeafPage, Node, PageBuilder, SearchResult,
+    CursorOps, CursorState, LeafPage, Node, PageBuilder, SearchResult, insert_into_branch,
+    insert_into_leaf,
 };
 use crate::error::{Error, Result};
 use crate::flags::DatabaseFlags;
@@ -27,6 +29,7 @@ pub struct Database {
 
 impl Database {
     /// Creates a new database handle.
+    #[allow(dead_code)]
     pub(crate) fn new(dbi: u32, flags: DatabaseFlags) -> Self {
         Self { dbi, flags }
     }
@@ -83,13 +86,21 @@ impl<'txn> RoCursor<'txn> {
     }
 
     /// Seeks to a key.
-    pub fn seek(&mut self, key: &[u8], get_page: impl Fn(PageNo) -> Result<Vec<u8>>) -> Result<bool> {
+    pub fn seek(
+        &mut self,
+        key: &[u8],
+        get_page: impl Fn(PageNo) -> Result<Vec<u8>>,
+    ) -> Result<bool> {
         let result = CursorOps::search(&mut self.state, key, self.page_size, get_page)?;
         Ok(result.is_found())
     }
 
     /// Seeks to a key or the next greater key.
-    pub fn seek_range(&mut self, key: &[u8], get_page: impl Fn(PageNo) -> Result<Vec<u8>>) -> Result<bool> {
+    pub fn seek_range(
+        &mut self,
+        key: &[u8],
+        get_page: impl Fn(PageNo) -> Result<Vec<u8>>,
+    ) -> Result<bool> {
         CursorOps::search(&mut self.state, key, self.page_size, get_page)?;
         Ok(self.state.is_valid())
     }
@@ -145,7 +156,11 @@ impl<'txn> RwCursor<'txn> {
     }
 
     /// Seeks to a key.
-    pub fn seek(&mut self, key: &[u8], get_page: impl Fn(PageNo) -> Result<Vec<u8>>) -> Result<bool> {
+    pub fn seek(
+        &mut self,
+        key: &[u8],
+        get_page: impl Fn(PageNo) -> Result<Vec<u8>>,
+    ) -> Result<bool> {
         self.inner.seek(key, get_page)
     }
 
@@ -161,6 +176,7 @@ impl<'txn> RwCursor<'txn> {
 }
 
 /// Operations on a database within a read transaction.
+#[allow(dead_code)]
 pub struct DbReader<'db, 'txn> {
     /// Database handle.
     db: &'db Database,
@@ -174,6 +190,7 @@ pub struct DbReader<'db, 'txn> {
 
 impl<'db, 'txn> DbReader<'db, 'txn> {
     /// Creates a new database reader.
+    #[allow(dead_code)]
     pub(crate) fn new(db: &'db Database, db_info: DbInfo, page_size: usize) -> Self {
         Self {
             db,
@@ -184,7 +201,11 @@ impl<'db, 'txn> DbReader<'db, 'txn> {
     }
 
     /// Gets a value by key.
-    pub fn get(&self, key: &[u8], get_page: impl Fn(PageNo) -> Result<Vec<u8>>) -> Result<Option<Vec<u8>>> {
+    pub fn get(
+        &self,
+        key: &[u8],
+        get_page: impl Fn(PageNo) -> Result<Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>> {
         if self.db_info.root == 0 {
             return Ok(None);
         }
@@ -196,7 +217,9 @@ impl<'db, 'txn> DbReader<'db, 'txn> {
             SearchResult::Found(_) => {
                 if let Some(pgno) = state.leaf_pgno() {
                     let page_data = get_page(pgno)?;
-                    if let Some((_, value)) = CursorOps::get_current(&state, &page_data, self.page_size)? {
+                    if let Some((_, value)) =
+                        CursorOps::get_current(&state, &page_data, self.page_size)?
+                    {
                         return Ok(Some(value.to_vec()));
                     }
                 }
@@ -218,6 +241,7 @@ impl<'db, 'txn> DbReader<'db, 'txn> {
 }
 
 /// Operations on a database within a write transaction.
+#[allow(dead_code)]
 pub struct DbWriter<'db, 'txn> {
     /// Database handle.
     db: &'db Database,
@@ -231,6 +255,7 @@ pub struct DbWriter<'db, 'txn> {
 
 impl<'db, 'txn> DbWriter<'db, 'txn> {
     /// Creates a new database writer.
+    #[allow(dead_code)]
     pub(crate) fn new(db: &'db Database, db_info: DbInfo, page_size: usize) -> Self {
         Self {
             db,
@@ -241,7 +266,11 @@ impl<'db, 'txn> DbWriter<'db, 'txn> {
     }
 
     /// Gets a value by key.
-    pub fn get(&self, key: &[u8], get_page: impl Fn(PageNo) -> Result<Vec<u8>>) -> Result<Option<Vec<u8>>> {
+    pub fn get(
+        &self,
+        key: &[u8],
+        get_page: impl Fn(PageNo) -> Result<Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>> {
         if self.db_info.root == 0 {
             return Ok(None);
         }
@@ -253,7 +282,9 @@ impl<'db, 'txn> DbWriter<'db, 'txn> {
             SearchResult::Found(_) => {
                 if let Some(pgno) = state.leaf_pgno() {
                     let page_data = get_page(pgno)?;
-                    if let Some((_, value)) = CursorOps::get_current(&state, &page_data, self.page_size)? {
+                    if let Some((_, value)) =
+                        CursorOps::get_current(&state, &page_data, self.page_size)?
+                    {
                         return Ok(Some(value.to_vec()));
                     }
                 }
@@ -339,12 +370,8 @@ impl<'db, 'txn> DbWriter<'db, 'txn> {
         if is_update {
             // For now, we'll just do a simple insert-at-position which handles updates
             // by rebuilding the page without the old entry
-            let (new_leaf_data, split) = self.insert_at_leaf_update(
-                &leaf_data,
-                new_node,
-                insert_index,
-                leaf_pgno,
-            )?;
+            let (new_leaf_data, split) =
+                self.insert_at_leaf_update(&leaf_data, new_node, insert_index, leaf_pgno)?;
 
             set_page(leaf_pgno, new_leaf_data)?;
 
@@ -662,25 +689,29 @@ mod tests {
         let mut writer = DbWriter::new(&db, db_info, page_size);
 
         // Put first key
-        writer.put(
-            b"key1",
-            b"value1",
-            |pgno| store.get(pgno),
-            || store.alloc(),
-            |pgno, data| store.set(pgno, data),
-        ).unwrap();
+        writer
+            .put(
+                b"key1",
+                b"value1",
+                |pgno| store.get(pgno),
+                || store.alloc(),
+                |pgno, data| store.set(pgno, data),
+            )
+            .unwrap();
 
         assert_eq!(writer.db_info.entries, 1);
         assert_eq!(writer.db_info.leaf_pages, 1);
 
         // Put second key
-        writer.put(
-            b"key2",
-            b"value2",
-            |pgno| store.get(pgno),
-            || store.alloc(),
-            |pgno, data| store.set(pgno, data),
-        ).unwrap();
+        writer
+            .put(
+                b"key2",
+                b"value2",
+                |pgno| store.get(pgno),
+                || store.alloc(),
+                |pgno, data| store.set(pgno, data),
+            )
+            .unwrap();
 
         assert_eq!(writer.db_info.entries, 2);
 
@@ -707,22 +738,26 @@ mod tests {
         let mut writer = DbWriter::new(&db, db_info, page_size);
 
         // Put key
-        writer.put(
-            b"key",
-            b"value1",
-            |pgno| store.get(pgno),
-            || store.alloc(),
-            |pgno, data| store.set(pgno, data),
-        ).unwrap();
+        writer
+            .put(
+                b"key",
+                b"value1",
+                |pgno| store.get(pgno),
+                || store.alloc(),
+                |pgno, data| store.set(pgno, data),
+            )
+            .unwrap();
 
         // Update key
-        writer.put(
-            b"key",
-            b"value2",
-            |pgno| store.get(pgno),
-            || store.alloc(),
-            |pgno, data| store.set(pgno, data),
-        ).unwrap();
+        writer
+            .put(
+                b"key",
+                b"value2",
+                |pgno| store.get(pgno),
+                || store.alloc(),
+                |pgno, data| store.set(pgno, data),
+            )
+            .unwrap();
 
         // Entry count should not increase
         assert_eq!(writer.db_info.entries, 1);
@@ -746,23 +781,27 @@ mod tests {
         for i in 0..3 {
             let key = format!("key{}", i);
             let value = format!("value{}", i);
-            writer.put(
-                key.as_bytes(),
-                value.as_bytes(),
-                |pgno| store.get(pgno),
-                || store.alloc(),
-                |pgno, data| store.set(pgno, data),
-            ).unwrap();
+            writer
+                .put(
+                    key.as_bytes(),
+                    value.as_bytes(),
+                    |pgno| store.get(pgno),
+                    || store.alloc(),
+                    |pgno, data| store.set(pgno, data),
+                )
+                .unwrap();
         }
 
         assert_eq!(writer.db_info.entries, 3);
 
         // Delete middle key
-        let deleted = writer.delete(
-            b"key1",
-            |pgno| store.get(pgno),
-            |pgno, data| store.set(pgno, data),
-        ).unwrap();
+        let deleted = writer
+            .delete(
+                b"key1",
+                |pgno| store.get(pgno),
+                |pgno, data| store.set(pgno, data),
+            )
+            .unwrap();
         assert!(deleted);
         assert_eq!(writer.db_info.entries, 2);
 
@@ -792,13 +831,15 @@ mod tests {
         for i in 0..100 {
             let key = format!("key{:03}", i);
             let value = format!("value{:03}", i);
-            writer.put(
-                key.as_bytes(),
-                value.as_bytes(),
-                |pgno| store.get(pgno),
-                || store.alloc(),
-                |pgno, data| store.set(pgno, data),
-            ).unwrap();
+            writer
+                .put(
+                    key.as_bytes(),
+                    value.as_bytes(),
+                    |pgno| store.get(pgno),
+                    || store.alloc(),
+                    |pgno, data| store.set(pgno, data),
+                )
+                .unwrap();
         }
 
         assert_eq!(writer.db_info.entries, 100);

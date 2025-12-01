@@ -1,15 +1,15 @@
 //! Benchmarks for ZeroDB basic operations.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use tempfile::tempdir;
 
 use zerodb::{
+    EnvOpenOptions,
     btree::{CursorOps, CursorState, Node, PageBuilder, insert_into_leaf},
     error::{Error, Result},
     page::PageNo,
-    EnvOpenOptions,
 };
 
 /// Test helper for managing pages.
@@ -132,12 +132,10 @@ fn bench_btree_search(c: &mut Criterion) {
                 let search_key = format!("key{:04}", num_keys / 2).into_bytes();
                 b.iter(|| {
                     let mut state = CursorState::new(root_pgno);
-                    let result = CursorOps::search(
-                        &mut state,
-                        &search_key,
-                        page_size,
-                        |pgno| store.get(pgno),
-                    ).unwrap();
+                    let result = CursorOps::search(&mut state, &search_key, page_size, |pgno| {
+                        store.get(pgno)
+                    })
+                    .unwrap();
                     black_box(result)
                 })
             },
@@ -150,12 +148,10 @@ fn bench_btree_search(c: &mut Criterion) {
                 let search_key = b"nonexistent_key";
                 b.iter(|| {
                     let mut state = CursorState::new(root_pgno);
-                    let result = CursorOps::search(
-                        &mut state,
-                        search_key,
-                        page_size,
-                        |pgno| store.get(pgno),
-                    ).unwrap();
+                    let result = CursorOps::search(&mut state, search_key, page_size, |pgno| {
+                        store.get(pgno)
+                    })
+                    .unwrap();
                     black_box(result)
                 })
             },
@@ -178,13 +174,8 @@ fn bench_btree_insert(c: &mut Criterion) {
 
             let leaf_data = store.get(root_pgno).unwrap();
             let node = Node::leaf(b"testkey".to_vec(), b"testvalue".to_vec());
-            let (new_data, _split) = insert_into_leaf(
-                &leaf_data,
-                node,
-                0,
-                root_pgno,
-                page_size,
-            ).unwrap();
+            let (new_data, _split) =
+                insert_into_leaf(&leaf_data, node, 0, root_pgno, page_size).unwrap();
             store.set(root_pgno, new_data).unwrap();
             black_box(store)
         })
@@ -203,17 +194,13 @@ fn bench_btree_insert(c: &mut Criterion) {
                 let value = format!("val{:04}", i).into_bytes();
 
                 let mut state = CursorState::new(root_pgno);
-                let result = CursorOps::search(&mut state, &key, page_size, |pgno| store.get(pgno)).unwrap();
+                let result =
+                    CursorOps::search(&mut state, &key, page_size, |pgno| store.get(pgno)).unwrap();
                 let insert_index = result.index();
 
                 let node = Node::leaf(key, value);
-                let (new_data, _split) = insert_into_leaf(
-                    &leaf_data,
-                    node,
-                    insert_index,
-                    root_pgno,
-                    page_size,
-                ).unwrap();
+                let (new_data, _split) =
+                    insert_into_leaf(&leaf_data, node, insert_index, root_pgno, page_size).unwrap();
                 store.set(root_pgno, new_data).unwrap();
             }
             black_box(store)
@@ -251,11 +238,14 @@ fn bench_cursor_iteration(c: &mut Criterion) {
                     let mut count = 0;
                     loop {
                         let leaf_data = store.get(state.leaf_pgno().unwrap()).unwrap();
-                        if let Some((k, _v)) = CursorOps::get_current(&state, &leaf_data, page_size).unwrap() {
+                        if let Some((k, _v)) =
+                            CursorOps::get_current(&state, &leaf_data, page_size).unwrap()
+                        {
                             black_box(k);
                             count += 1;
                         }
-                        if !CursorOps::next(&mut state, page_size, |pgno| store.get(pgno)).unwrap() {
+                        if !CursorOps::next(&mut state, page_size, |pgno| store.get(pgno)).unwrap()
+                        {
                             break;
                         }
                     }
@@ -275,11 +265,14 @@ fn bench_cursor_iteration(c: &mut Criterion) {
                     let mut count = 0;
                     loop {
                         let leaf_data = store.get(state.leaf_pgno().unwrap()).unwrap();
-                        if let Some((k, _v)) = CursorOps::get_current(&state, &leaf_data, page_size).unwrap() {
+                        if let Some((k, _v)) =
+                            CursorOps::get_current(&state, &leaf_data, page_size).unwrap()
+                        {
                             black_box(k);
                             count += 1;
                         }
-                        if !CursorOps::prev(&mut state, page_size, |pgno| store.get(pgno)).unwrap() {
+                        if !CursorOps::prev(&mut state, page_size, |pgno| store.get(pgno)).unwrap()
+                        {
                             break;
                         }
                     }

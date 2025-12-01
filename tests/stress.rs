@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use zerodb::{EnvOpenOptions, EnvFlags};
+use zerodb::EnvOpenOptions;
 
 use tempfile::tempdir;
 
@@ -227,7 +227,10 @@ fn stress_transaction_snapshots() {
 
     // Verify snapshots saw increasing txnids
     for window in snapshots.windows(2) {
-        assert!(window[0].1 < window[1].1, "snapshots should see increasing txnids");
+        assert!(
+            window[0].1 < window[1].1,
+            "snapshots should see increasing txnids"
+        );
     }
 }
 
@@ -293,7 +296,10 @@ fn stress_env_info_during_writes() {
 
     // Txnids should be non-decreasing
     for window in infos.windows(2) {
-        assert!(window[0] <= window[1], "txnids from info() should be non-decreasing");
+        assert!(
+            window[0] <= window[1],
+            "txnids from info() should be non-decreasing"
+        );
     }
 }
 

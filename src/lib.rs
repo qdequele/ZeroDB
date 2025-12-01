@@ -40,52 +40,100 @@ pub mod txn;
 pub mod types;
 
 // Re-export the old API for backwards compatibility
-pub use db::{DbReader, DbWriter, RoCursor, RwCursor};
 #[doc(hidden)]
 pub use db::Database as RawDatabase;
+pub use db::{DbReader, DbWriter, RoCursor, RwCursor};
 
 // Heed-compatible typed database API
 pub use database::{
-    Database, DatabaseStat, DatabaseOpenOptions, Unspecified, Dbi,
-    LazyDecode, ReservedSpace, RoDuplicates,
+    Database,
+    DatabaseOpenOptions,
+    DatabaseStat,
+    Dbi,
+    LazyDecode,
+    ReservedSpace,
+    RoDuplicates,
     // Read-only iterators
-    RoIter, RoRevIter, RoRange, RoRevRange, RoPrefix, RoRevPrefix,
+    RoIter,
+    RoPrefix,
+    RoRange,
+    RoRevIter,
+    RoRevPrefix,
+    RoRevRange,
     // Mutable iterators
-    RwIter, RwRevIter, RwRange, RwRevRange, RwPrefix, RwRevPrefix,
+    RwIter,
+    RwPrefix,
+    RwRange,
+    RwRevIter,
+    RwRevPrefix,
+    RwRevRange,
+    Unspecified,
 };
 pub use types::{
-    BytesDecode, BytesEncode, OwnedDecode,
-    Bytes, OwnedBytes, Str, OwnedStr,
-    U8, U32, U64, I32, I64, Unit,
+    BE,
+    BEI128,
+    BEU16,
+    BEU32,
+    BEU64,
+    BEU128,
+    // Re-export byteorder types
+    BigEndian,
+    ByteOrder,
+    Bytes,
+    BytesDecode,
+    BytesEncode,
     // DecodeIgnore
     DecodeIgnore,
+    I32,
+    I64,
+    I128,
+    LE,
+    LittleEndian,
+    NE,
+    NativeEndian,
+    OwnedBytes,
+    OwnedDecode,
+    OwnedStr,
+    Str,
+    U8,
     // Endian-aware types (Heed compatible)
-    U16, U32BE, U64BE, U128, I128,
-    BEU16, BEU32, BEU64, BEU128, BEI128,
-    // Re-export byteorder types
-    BigEndian, LittleEndian, NativeEndian, ByteOrder, BE, LE, NE,
+    U16,
+    U32,
+    U32BE,
+    U64,
+    U64BE,
+    U128,
+    Unit,
 };
 
 // Serde types (feature-gated)
 #[cfg(feature = "serde")]
-pub use types::{SerdeJson, SerdeBincode};
+pub use types::{SerdeBincode, SerdeJson};
 
-pub use error::{Error, Result, BoxedError};
+pub use error::{BoxedError, Error, Result};
 
 /// MdbError is an alias for Error for Heed compatibility.
 pub type MdbError = Error;
-pub use flags::{EnvFlags, DatabaseFlags, PutFlags};
-pub use page::{PageFlags, PageHeader};
 pub use env::{
-    Env, EnvOpenOptions, EnvInfo, DbStat,
-    // Closing event
-    EnvClosingEvent, env_closing_event,
     // Options
-    CompactionOption, FlagSetMode,
+    CompactionOption,
     // Comparators
-    Comparator, LexicographicComparator, DefaultComparator, IntegerComparator,
+    Comparator,
+    DbStat,
+    DefaultComparator,
+    Env,
+    // Closing event
+    EnvClosingEvent,
+    EnvInfo,
+    EnvOpenOptions,
+    FlagSetMode,
+    IntegerComparator,
+    LexicographicComparator,
+    env_closing_event,
 };
-pub use txn::{RoTxn, RwTxn, Txn, WithTls, WithoutTls, AnyTls, TlsUsage};
+pub use flags::{DatabaseFlags, EnvFlags, PutFlags};
+pub use page::{PageFlags, PageHeader};
+pub use txn::{AnyTls, RoTxn, RwTxn, TlsUsage, Txn, WithTls, WithoutTls};
 
 /// LMDB magic number: 0xBEEFC0DE
 pub const MDB_MAGIC: u32 = 0xBEEF_C0DE;

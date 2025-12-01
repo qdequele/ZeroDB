@@ -3,17 +3,21 @@
 //! This module provides a typed `Database<KC, DC>` wrapper that uses
 //! `BytesEncode` and `BytesDecode` traits for type-safe key-value storage.
 
+#![allow(clippy::type_complexity)]
+
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 
 use crate::btree::{CursorOps, CursorState, LeafPage, Node, PageBuilder, SearchResult};
 use crate::btree::{insert_into_branch, insert_into_leaf};
-use crate::env::{Env, DefaultComparator};
+use crate::env::{DefaultComparator, Env};
 use crate::error::{Error, Result};
 use crate::flags::DatabaseFlags;
-use crate::page::{DbInfo, PageNo, PageHeader, should_use_overflow, overflow_pages, OVERFLOW_HEADER_SIZE};
+use crate::page::{
+    DbInfo, OVERFLOW_HEADER_SIZE, PageHeader, PageNo, overflow_pages, should_use_overflow,
+};
+use crate::txn::{RoTxn, RwTxn, TlsUsage, WithTls};
 use crate::types::{BytesEncode, OwnedDecode};
-use crate::txn::{RoTxn, RwTxn, WithTls, TlsUsage};
 
 // ============================================================================
 // Unspecified type marker
@@ -70,7 +74,9 @@ impl<KC, DC, C, T: TlsUsage> std::fmt::Debug for DatabaseOpenOptions<'_, '_, KC,
     }
 }
 
-impl<'e, T: TlsUsage> DatabaseOpenOptions<'e, 'static, Unspecified, Unspecified, DefaultComparator, T> {
+impl<'e, T: TlsUsage>
+    DatabaseOpenOptions<'e, 'static, Unspecified, Unspecified, DefaultComparator, T>
+{
     /// Create an options struct to open/create a database with specific flags.
     pub fn new(env: &'e Env<T>) -> Self {
         DatabaseOpenOptions {
@@ -131,7 +137,7 @@ impl<'e, 'n, KC, DC, C, T: TlsUsage> DatabaseOpenOptions<'e, 'n, KC, DC, C, T> {
     /// LMDB has an important restriction on the unnamed database when named ones are opened.
     /// The names of the named databases are stored as keys in the unnamed one and are immutable,
     /// and these keys can only be read and not written.
-    pub fn open<'txn>(&self, rtxn: &'txn RoTxn<'_, T>) -> Result<Option<Database<KC, DC>>>
+    pub fn open(&self, rtxn: &RoTxn<'_, T>) -> Result<Option<Database<KC, DC>>>
     where
         KC: 'static,
         DC: 'static,
@@ -237,7 +243,12 @@ impl<KC, DC> Clone for Database<KC, DC> {
 
 impl<KC, DC> Database<KC, DC> {
     /// Creates a new typed database wrapper.
-    pub(crate) fn new(dbi: Dbi, name: Option<String>, db_info: DbInfo, flags: DatabaseFlags) -> Self {
+    pub(crate) fn new(
+        dbi: Dbi,
+        name: Option<String>,
+        db_info: DbInfo,
+        flags: DatabaseFlags,
+    ) -> Self {
         Self {
             dbi,
             name,
@@ -267,16 +278,16 @@ impl<KC, DC> Database<KC, DC> {
         let info = &self.db_info;
         Ok(DatabaseStat {
             depth: info.depth as u32,
-            branch_pages: info.branch_pages as u64,
-            leaf_pages: info.leaf_pages as u64,
-            overflow_pages: info.overflow_pages as u64,
-            entries: info.entries as u64,
+            branch_pages: info.branch_pages,
+            leaf_pages: info.leaf_pages,
+            overflow_pages: info.overflow_pages,
+            entries: info.entries,
         })
     }
 
     /// Returns the number of entries in the database.
     pub fn len(&self, _txn: &RoTxn<'_>) -> Result<u64> {
-        Ok(self.db_info.entries as u64)
+        Ok(self.db_info.entries)
     }
 
     /// Returns `true` if the database contains no entries.
@@ -350,11 +361,9 @@ impl<KC, DC> Database<KC, DC> {
         let page_size = txn.env().page_size();
         let mut state = CursorState::new(db_info.root);
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
-        let result = CursorOps::search(&mut state, &key_bytes, page_size, &get_page)?;
+        let result = CursorOps::search(&mut state, &key_bytes, page_size, get_page)?;
 
         match result {
             SearchResult::Found(_) => {
@@ -385,7 +394,7 @@ impl<KC, DC> Database<KC, DC> {
     }
 
     /// Returns the first key-value pair in the database.
-    pub fn first<'txn>(&self, txn: &'txn RoTxn<'_>) -> Result<Option<(KC::OwnedItem, DC::OwnedItem)>>
+    pub fn first(&self, txn: &RoTxn<'_>) -> Result<Option<(KC::OwnedItem, DC::OwnedItem)>>
     where
         KC: OwnedDecode,
         DC: OwnedDecode,
@@ -397,11 +406,9 @@ impl<KC, DC> Database<KC, DC> {
         let page_size = txn.env().page_size();
         let mut state = CursorState::new(self.db_info.root);
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
-        if !CursorOps::first(&mut state, page_size, &get_page)? {
+        if !CursorOps::first(&mut state, page_size, get_page)? {
             return Ok(None);
         }
 
@@ -430,7 +437,7 @@ impl<KC, DC> Database<KC, DC> {
     }
 
     /// Returns the last key-value pair in the database.
-    pub fn last<'txn>(&self, txn: &'txn RoTxn<'_>) -> Result<Option<(KC::OwnedItem, DC::OwnedItem)>>
+    pub fn last(&self, txn: &RoTxn<'_>) -> Result<Option<(KC::OwnedItem, DC::OwnedItem)>>
     where
         KC: OwnedDecode,
         DC: OwnedDecode,
@@ -442,11 +449,9 @@ impl<KC, DC> Database<KC, DC> {
         let page_size = txn.env().page_size();
         let mut state = CursorState::new(self.db_info.root);
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
-        if !CursorOps::last(&mut state, page_size, &get_page)? {
+        if !CursorOps::last(&mut state, page_size, get_page)? {
             return Ok(None);
         }
 
@@ -550,11 +555,9 @@ impl<KC, DC> Database<KC, DC> {
         let page_size = txn.env().page_size();
         let mut state = CursorState::new(db_info.root);
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
-        let result = CursorOps::search(&mut state, key, page_size, &get_page)?;
+        let result = CursorOps::search(&mut state, key, page_size, get_page)?;
         let insert_index = result.index();
         let is_update = result.is_found();
 
@@ -572,10 +575,22 @@ impl<KC, DC> Database<KC, DC> {
         };
 
         let (new_leaf_data, split) = if is_update {
-            self.insert_at_leaf_update(&leaf_data_copy, new_node, insert_index, leaf_pgno, page_size)?
+            self.insert_at_leaf_update(
+                &leaf_data_copy,
+                new_node,
+                insert_index,
+                leaf_pgno,
+                page_size,
+            )?
         } else {
             db_info.entries += 1;
-            insert_into_leaf(&leaf_data_copy, new_node, insert_index, leaf_pgno, page_size)?
+            insert_into_leaf(
+                &leaf_data_copy,
+                new_node,
+                insert_index,
+                leaf_pgno,
+                page_size,
+            )?
         };
 
         // Write the new leaf data
@@ -618,10 +633,7 @@ impl<KC, DC> Database<KC, DC> {
                 // Preserve overflow nodes properly
                 if node_ref.is_overflow() {
                     let overflow_pgno = node_ref.overflow_pgno().ok_or(Error::Corrupted)?;
-                    nodes.push(Node::leaf_overflow(
-                        node_ref.key().to_vec(),
-                        overflow_pgno,
-                    ));
+                    nodes.push(Node::leaf_overflow(node_ref.key().to_vec(), overflow_pgno));
                 } else {
                     nodes.push(Node::leaf(
                         node_ref.key().to_vec(),
@@ -815,12 +827,18 @@ impl<KC, DC> Database<KC, DC> {
 
         // Read number of pages
         let num_pages = u32::from_le_bytes([
-            first_page[16], first_page[17], first_page[18], first_page[19]
+            first_page[16],
+            first_page[17],
+            first_page[18],
+            first_page[19],
         ]);
 
         // Read data size
         let data_size = u32::from_le_bytes([
-            first_page[20], first_page[21], first_page[22], first_page[23]
+            first_page[20],
+            first_page[21],
+            first_page[22],
+            first_page[23],
         ]) as usize;
 
         let data_start = OVERFLOW_HEADER_SIZE + 4; // +4 for data size field
@@ -866,11 +884,9 @@ impl<KC, DC> Database<KC, DC> {
         let page_size = txn.env().page_size();
         let mut state = CursorState::new(self.db_info.root);
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
-        let result = CursorOps::search(&mut state, &key_bytes, page_size, &get_page)?;
+        let result = CursorOps::search(&mut state, &key_bytes, page_size, get_page)?;
 
         if !result.is_found() {
             return Ok(false);
@@ -938,28 +954,28 @@ impl<KC, DC> Database<KC, DC> {
         let page_size = txn.env().page_size();
         let mut state = CursorState::new(self.db_info.root);
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
         // Search for the key
-        let result = CursorOps::search(&mut state, &key_bytes, page_size, &get_page)?;
+        let result = CursorOps::search(&mut state, &key_bytes, page_size, get_page)?;
 
         // Move to previous entry
         let found = if result.is_found() {
             // Key exists, move to previous
-            CursorOps::prev(&mut state, page_size, &get_page)?
+            CursorOps::prev(&mut state, page_size, get_page)?
         } else {
             // Key doesn't exist, cursor is at insertion point
             // If we're at a valid position, check if current key is less than target
             if state.is_valid() {
                 if let Some(pgno) = state.leaf_pgno() {
                     let page_data = get_page(pgno)?;
-                    if let Some((current_key, _)) = CursorOps::get_current(&state, &page_data, page_size)? {
+                    if let Some((current_key, _)) =
+                        CursorOps::get_current(&state, &page_data, page_size)?
+                    {
                         if current_key < key_bytes.as_ref() {
                             true
                         } else {
-                            CursorOps::prev(&mut state, page_size, &get_page)?
+                            CursorOps::prev(&mut state, page_size, get_page)?
                         }
                     } else {
                         false
@@ -1007,11 +1023,9 @@ impl<KC, DC> Database<KC, DC> {
         let page_size = txn.env().page_size();
         let mut state = CursorState::new(self.db_info.root);
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
-        let result = CursorOps::search(&mut state, &key_bytes, page_size, &get_page)?;
+        let result = CursorOps::search(&mut state, &key_bytes, page_size, get_page)?;
 
         let found = if result.is_found() {
             // Exact match
@@ -1020,11 +1034,13 @@ impl<KC, DC> Database<KC, DC> {
             // Check if current is less than or equal
             if let Some(pgno) = state.leaf_pgno() {
                 let page_data = get_page(pgno)?;
-                if let Some((current_key, _)) = CursorOps::get_current(&state, &page_data, page_size)? {
+                if let Some((current_key, _)) =
+                    CursorOps::get_current(&state, &page_data, page_size)?
+                {
                     if current_key <= key_bytes.as_ref() {
                         true
                     } else {
-                        CursorOps::prev(&mut state, page_size, &get_page)?
+                        CursorOps::prev(&mut state, page_size, get_page)?
                     }
                 } else {
                     false
@@ -1071,20 +1087,20 @@ impl<KC, DC> Database<KC, DC> {
         let page_size = txn.env().page_size();
         let mut state = CursorState::new(self.db_info.root);
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
-        let result = CursorOps::search(&mut state, &key_bytes, page_size, &get_page)?;
+        let result = CursorOps::search(&mut state, &key_bytes, page_size, get_page)?;
 
         let found = if result.is_found() {
             // Exact match, need to move to next
-            CursorOps::next(&mut state, page_size, &get_page)?
+            CursorOps::next(&mut state, page_size, get_page)?
         } else if state.is_valid() {
             // Cursor at insertion point, check if current is greater
             if let Some(pgno) = state.leaf_pgno() {
                 let page_data = get_page(pgno)?;
-                if let Some((current_key, _)) = CursorOps::get_current(&state, &page_data, page_size)? {
+                if let Some((current_key, _)) =
+                    CursorOps::get_current(&state, &page_data, page_size)?
+                {
                     current_key > key_bytes.as_ref()
                 } else {
                     false
@@ -1131,22 +1147,20 @@ impl<KC, DC> Database<KC, DC> {
         let page_size = txn.env().page_size();
         let mut state = CursorState::new(self.db_info.root);
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
-        let result = CursorOps::search(&mut state, &key_bytes, page_size, &get_page)?;
+        let result = CursorOps::search(&mut state, &key_bytes, page_size, get_page)?;
 
-        if result.is_found() || state.is_valid() {
-            if let Some(pgno) = state.leaf_pgno() {
-                let page_data = get_page(pgno)?;
-                if let Some((k, v)) = CursorOps::get_current(&state, &page_data, page_size)? {
-                    if k >= key_bytes.as_ref() {
-                        let key = KC::decode_owned(k)?;
-                        let value = DC::decode_owned(v)?;
-                        return Ok(Some((key, value)));
-                    }
-                }
+        if (result.is_found() || state.is_valid())
+            && let Some(pgno) = state.leaf_pgno()
+        {
+            let page_data = get_page(pgno)?;
+            if let Some((k, v)) = CursorOps::get_current(&state, &page_data, page_size)?
+                && k >= key_bytes.as_ref()
+            {
+                let key = KC::decode_owned(k)?;
+                let value = DC::decode_owned(v)?;
+                return Ok(Some((key, value)));
             }
         }
 
@@ -1190,7 +1204,13 @@ impl<KC, DC> Database<KC, DC> {
             Bound::Unbounded => Bound::Unbounded,
         };
 
-        Ok(RoRange::new(self.db_info.root, page_size, txn, start_bound, end_bound))
+        Ok(RoRange::new(
+            self.db_info.root,
+            page_size,
+            txn,
+            start_bound,
+            end_bound,
+        ))
     }
 
     /// Returns a reverse iterator over a range of entries in the database.
@@ -1218,7 +1238,13 @@ impl<KC, DC> Database<KC, DC> {
             Bound::Unbounded => Bound::Unbounded,
         };
 
-        Ok(RoRevRange::new(self.db_info.root, page_size, txn, start_bound, end_bound))
+        Ok(RoRevRange::new(
+            self.db_info.root,
+            page_size,
+            txn,
+            start_bound,
+            end_bound,
+        ))
     }
 
     /// Returns an iterator over all entries with keys starting with the given prefix.
@@ -1232,7 +1258,12 @@ impl<KC, DC> Database<KC, DC> {
     {
         let page_size = txn.env().page_size();
         let prefix_bytes = KC::bytes_encode(prefix)?.to_vec();
-        Ok(RoPrefix::new(self.db_info.root, page_size, txn, prefix_bytes))
+        Ok(RoPrefix::new(
+            self.db_info.root,
+            page_size,
+            txn,
+            prefix_bytes,
+        ))
     }
 
     /// Returns a reverse iterator over all entries with keys starting with the given prefix.
@@ -1246,7 +1277,12 @@ impl<KC, DC> Database<KC, DC> {
     {
         let page_size = txn.env().page_size();
         let prefix_bytes = KC::bytes_encode(prefix)?.to_vec();
-        Ok(RoRevPrefix::new(self.db_info.root, page_size, txn, prefix_bytes))
+        Ok(RoRevPrefix::new(
+            self.db_info.root,
+            page_size,
+            txn,
+            prefix_bytes,
+        ))
     }
 
     /// Returns a mutable iterator over all entries in the database.
@@ -1256,7 +1292,10 @@ impl<KC, DC> Database<KC, DC> {
     }
 
     /// Returns a mutable reverse iterator over all entries in the database.
-    pub fn rev_iter_mut<'txn>(&self, txn: &'txn mut RwTxn<'txn>) -> Result<RwRevIter<'txn, KC, DC>> {
+    pub fn rev_iter_mut<'txn>(
+        &self,
+        txn: &'txn mut RwTxn<'txn>,
+    ) -> Result<RwRevIter<'txn, KC, DC>> {
         let page_size = txn.env().page_size();
         Ok(RwRevIter::new(self.db_info.root, page_size, txn))
     }
@@ -1285,7 +1324,13 @@ impl<KC, DC> Database<KC, DC> {
             Bound::Unbounded => Bound::Unbounded,
         };
 
-        Ok(RwRange::new(self.db_info.root, page_size, txn, start_bound, end_bound))
+        Ok(RwRange::new(
+            self.db_info.root,
+            page_size,
+            txn,
+            start_bound,
+            end_bound,
+        ))
     }
 
     /// Returns a mutable reverse iterator over a range of entries in the database.
@@ -1312,7 +1357,13 @@ impl<KC, DC> Database<KC, DC> {
             Bound::Unbounded => Bound::Unbounded,
         };
 
-        Ok(RwRevRange::new(self.db_info.root, page_size, txn, start_bound, end_bound))
+        Ok(RwRevRange::new(
+            self.db_info.root,
+            page_size,
+            txn,
+            start_bound,
+            end_bound,
+        ))
     }
 
     /// Returns a mutable iterator over all entries with keys starting with the given prefix.
@@ -1326,7 +1377,12 @@ impl<KC, DC> Database<KC, DC> {
     {
         let page_size = txn.env().page_size();
         let prefix_bytes = KC::bytes_encode(prefix)?.to_vec();
-        Ok(RwPrefix::new(self.db_info.root, page_size, txn, prefix_bytes))
+        Ok(RwPrefix::new(
+            self.db_info.root,
+            page_size,
+            txn,
+            prefix_bytes,
+        ))
     }
 
     /// Returns a mutable reverse iterator over all entries with keys starting with the given prefix.
@@ -1340,7 +1396,12 @@ impl<KC, DC> Database<KC, DC> {
     {
         let page_size = txn.env().page_size();
         let prefix_bytes = KC::bytes_encode(prefix)?.to_vec();
-        Ok(RwRevPrefix::new(self.db_info.root, page_size, txn, prefix_bytes))
+        Ok(RwRevPrefix::new(
+            self.db_info.root,
+            page_size,
+            txn,
+            prefix_bytes,
+        ))
     }
 
     /// Inserts a key-value pair into the database with specific flags.
@@ -1363,17 +1424,13 @@ impl<KC, DC> Database<KC, DC> {
         }
 
         // Handle NOOVERWRITE flag
-        if flags.contains(crate::flags::PutFlags::NO_OVERWRITE) {
-            if self.db_info.root != 0 {
-                let page_size = txn.env().page_size();
-                let mut state = CursorState::new(self.db_info.root);
-                let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-                    txn.page(pgno).map(|s| s.to_vec())
-                };
-                let result = CursorOps::search(&mut state, &key_bytes, page_size, &get_page)?;
-                if result.is_found() {
-                    return Ok(false); // Key exists, don't overwrite
-                }
+        if flags.contains(crate::flags::PutFlags::NO_OVERWRITE) && self.db_info.root != 0 {
+            let page_size = txn.env().page_size();
+            let mut state = CursorState::new(self.db_info.root);
+            let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
+            let result = CursorOps::search(&mut state, &key_bytes, page_size, get_page)?;
+            if result.is_found() {
+                return Ok(false); // Key exists, don't overwrite
             }
         }
 
@@ -1416,18 +1473,16 @@ impl<KC, DC> Database<KC, DC> {
         if self.db_info.root != 0 {
             let page_size = txn.env().page_size();
             let mut state = CursorState::new(self.db_info.root);
-            let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-                txn.page(pgno).map(|s| s.to_vec())
-            };
+            let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
-            let result = CursorOps::search(&mut state, &key_bytes, page_size, &get_page)?;
+            let result = CursorOps::search(&mut state, &key_bytes, page_size, get_page)?;
 
-            if result.is_found() {
-                if let Some(pgno) = state.leaf_pgno() {
-                    let page_data = get_page(pgno)?;
-                    if let Some((_, v)) = CursorOps::get_current(&state, &page_data, page_size)? {
-                        return Ok(Some(DC::decode_owned(v)?));
-                    }
+            if result.is_found()
+                && let Some(pgno) = state.leaf_pgno()
+            {
+                let page_data = get_page(pgno)?;
+                if let Some((_, v)) = CursorOps::get_current(&state, &page_data, page_size)? {
+                    return Ok(Some(DC::decode_owned(v)?));
                 }
             }
         }
@@ -1455,18 +1510,16 @@ impl<KC, DC> Database<KC, DC> {
         if self.db_info.root != 0 {
             let page_size = txn.env().page_size();
             let mut state = CursorState::new(self.db_info.root);
-            let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-                txn.page(pgno).map(|s| s.to_vec())
-            };
+            let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
-            let result = CursorOps::search(&mut state, &key_bytes, page_size, &get_page)?;
+            let result = CursorOps::search(&mut state, &key_bytes, page_size, get_page)?;
 
-            if result.is_found() {
-                if let Some(pgno) = state.leaf_pgno() {
-                    let page_data = get_page(pgno)?;
-                    if let Some((_, v)) = CursorOps::get_current(&state, &page_data, page_size)? {
-                        return Ok(Some(DC::decode_owned(v)?));
-                    }
+            if result.is_found()
+                && let Some(pgno) = state.leaf_pgno()
+            {
+                let page_data = get_page(pgno)?;
+                if let Some((_, v)) = CursorOps::get_current(&state, &page_data, page_size)? {
+                    return Ok(Some(DC::decode_owned(v)?));
                 }
             }
         }
@@ -1508,21 +1561,19 @@ impl<KC, DC> Database<KC, DC> {
 
         {
             let mut state = CursorState::new(self.db_info.root);
-            let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-                txn.page(pgno).map(|s| s.to_vec())
-            };
+            let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
             // Position at start
             let positioned = match &start_bound {
                 Bound::Included(start) | Bound::Excluded(start) => {
-                    let result = CursorOps::search(&mut state, start, page_size, &get_page)?;
+                    let result = CursorOps::search(&mut state, start, page_size, get_page)?;
                     if matches!(&start_bound, Bound::Excluded(_)) && result.is_found() {
-                        CursorOps::next(&mut state, page_size, &get_page)?
+                        CursorOps::next(&mut state, page_size, get_page)?
                     } else {
                         state.is_valid()
                     }
                 }
-                Bound::Unbounded => CursorOps::first(&mut state, page_size, &get_page)?,
+                Bound::Unbounded => CursorOps::first(&mut state, page_size, get_page)?,
             };
 
             if !positioned {
@@ -1549,7 +1600,7 @@ impl<KC, DC> Database<KC, DC> {
                     }
                 }
 
-                if !CursorOps::next(&mut state, page_size, &get_page)? {
+                if !CursorOps::next(&mut state, page_size, get_page)? {
                     break;
                 }
             }
@@ -1573,11 +1624,9 @@ impl<KC, DC> Database<KC, DC> {
         let page_size = txn.env().page_size();
         let mut state = CursorState::new(self.db_info.root);
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
-        let result = CursorOps::search(&mut state, key, page_size, &get_page)?;
+        let result = CursorOps::search(&mut state, key, page_size, get_page)?;
 
         if !result.is_found() {
             return Ok(false);
@@ -1653,7 +1702,7 @@ impl<KC, DC> Database<KC, DC> {
         let mut reserved = ReservedSpace::new(&mut value_buffer);
 
         // Let the user write to the reserved space
-        write_func(&mut reserved).map_err(|e| Error::from(e))?;
+        write_func(&mut reserved).map_err(Error::from)?;
 
         // Ensure all bytes were written
         if reserved.remaining() != 0 {
@@ -1705,18 +1754,16 @@ impl<KC, DC> Database<KC, DC> {
         if self.db_info.root != 0 {
             let page_size = txn.env().page_size();
             let mut state = CursorState::new(self.db_info.root);
-            let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-                txn.page(pgno).map(|s| s.to_vec())
-            };
+            let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
-            let result = CursorOps::search(&mut state, &key_bytes, page_size, &get_page)?;
+            let result = CursorOps::search(&mut state, &key_bytes, page_size, get_page)?;
 
-            if result.is_found() {
-                if let Some(pgno) = state.leaf_pgno() {
-                    let page_data = get_page(pgno)?;
-                    if let Some((_, v)) = CursorOps::get_current(&state, &page_data, page_size)? {
-                        return Ok(Some(DC::decode_owned(v)?));
-                    }
+            if result.is_found()
+                && let Some(pgno) = state.leaf_pgno()
+            {
+                let page_data = get_page(pgno)?;
+                if let Some((_, v)) = CursorOps::get_current(&state, &page_data, page_size)? {
+                    return Ok(Some(DC::decode_owned(v)?));
                 }
             }
         }
@@ -1776,11 +1823,9 @@ impl<KC, DC> Database<KC, DC> {
         let page_size = txn.env().page_size();
         let mut state = CursorState::new(self.db_info.root);
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
-        let result = CursorOps::search(&mut state, &key_bytes, page_size, &get_page)?;
+        let result = CursorOps::search(&mut state, &key_bytes, page_size, get_page)?;
 
         if !result.is_found() {
             return Ok(RoDuplicates::empty(txn));
@@ -1829,11 +1874,9 @@ impl<KC, DC> Database<KC, DC> {
         let page_size = txn.env().page_size();
         let mut state = CursorState::new(self.db_info.root);
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
-        let result = CursorOps::search(&mut state, &key_bytes, page_size, &get_page)?;
+        let result = CursorOps::search(&mut state, &key_bytes, page_size, get_page)?;
 
         if !result.is_found() {
             return Ok(false);
@@ -2022,11 +2065,7 @@ where
 
         self.returned = true;
 
-        if let Some(ref value) = self.value {
-            Some(DC::decode_owned(value))
-        } else {
-            None
-        }
+        self.value.as_ref().map(|value| DC::decode_owned(value))
     }
 }
 
@@ -2072,14 +2111,13 @@ where
             return None;
         }
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            self.txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page =
+            |pgno: PageNo| -> Result<Vec<u8>> { self.txn.page(pgno).map(|s| s.to_vec()) };
 
         // Position at first entry if not started
         if !self.started {
             self.started = true;
-            match CursorOps::first(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::first(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;
@@ -2089,7 +2127,7 @@ where
             }
         } else {
             // Move to next entry
-            match CursorOps::next(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::next(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;
@@ -2168,14 +2206,13 @@ where
             return None;
         }
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            self.txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page =
+            |pgno: PageNo| -> Result<Vec<u8>> { self.txn.page(pgno).map(|s| s.to_vec()) };
 
         // Position at last entry if not started
         if !self.started {
             self.started = true;
-            match CursorOps::last(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::last(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;
@@ -2185,7 +2222,7 @@ where
             }
         } else {
             // Move to previous entry
-            match CursorOps::prev(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::prev(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;
@@ -2285,9 +2322,8 @@ where
             return None;
         }
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            self.txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page =
+            |pgno: PageNo| -> Result<Vec<u8>> { self.txn.page(pgno).map(|s| s.to_vec()) };
 
         // Position at start if not started
         if !self.started {
@@ -2296,11 +2332,12 @@ where
             // Position cursor based on start bound
             let positioned = match &self.start_bound {
                 Bound::Included(start) | Bound::Excluded(start) => {
-                    match CursorOps::search(&mut self.state, start, self.page_size, &get_page) {
+                    match CursorOps::search(&mut self.state, start, self.page_size, get_page) {
                         Ok(result) => {
                             // If excluded and found exact match, move to next
-                            if matches!(&self.start_bound, Bound::Excluded(_)) && result.is_found() {
-                                match CursorOps::next(&mut self.state, self.page_size, &get_page) {
+                            if matches!(&self.start_bound, Bound::Excluded(_)) && result.is_found()
+                            {
+                                match CursorOps::next(&mut self.state, self.page_size, get_page) {
                                     Ok(found) => found,
                                     Err(e) => return Some(Err(e)),
                                 }
@@ -2312,7 +2349,7 @@ where
                     }
                 }
                 Bound::Unbounded => {
-                    match CursorOps::first(&mut self.state, self.page_size, &get_page) {
+                    match CursorOps::first(&mut self.state, self.page_size, get_page) {
                         Ok(found) => found,
                         Err(e) => return Some(Err(e)),
                     }
@@ -2325,7 +2362,7 @@ where
             }
         } else {
             // Move to next entry
-            match CursorOps::next(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::next(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;
@@ -2421,26 +2458,25 @@ where
             return None;
         }
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            self.txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page =
+            |pgno: PageNo| -> Result<Vec<u8>> { self.txn.page(pgno).map(|s| s.to_vec()) };
 
         if !self.started {
             self.started = true;
 
             let positioned = match &self.end_bound {
                 Bound::Included(end) | Bound::Excluded(end) => {
-                    match CursorOps::search(&mut self.state, end, self.page_size, &get_page) {
+                    match CursorOps::search(&mut self.state, end, self.page_size, get_page) {
                         Ok(result) => {
                             if matches!(&self.end_bound, Bound::Excluded(_)) && result.is_found() {
-                                match CursorOps::prev(&mut self.state, self.page_size, &get_page) {
+                                match CursorOps::prev(&mut self.state, self.page_size, get_page) {
                                     Ok(found) => found,
                                     Err(e) => return Some(Err(e)),
                                 }
                             } else if result.is_found() {
                                 true
                             } else {
-                                match CursorOps::prev(&mut self.state, self.page_size, &get_page) {
+                                match CursorOps::prev(&mut self.state, self.page_size, get_page) {
                                     Ok(found) => found,
                                     Err(e) => return Some(Err(e)),
                                 }
@@ -2450,7 +2486,7 @@ where
                     }
                 }
                 Bound::Unbounded => {
-                    match CursorOps::last(&mut self.state, self.page_size, &get_page) {
+                    match CursorOps::last(&mut self.state, self.page_size, get_page) {
                         Ok(found) => found,
                         Err(e) => return Some(Err(e)),
                     }
@@ -2462,7 +2498,7 @@ where
                 return None;
             }
         } else {
-            match CursorOps::prev(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::prev(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;
@@ -2515,7 +2551,12 @@ pub struct RoPrefix<'txn, KC, DC> {
 }
 
 impl<'txn, KC, DC> RoPrefix<'txn, KC, DC> {
-    pub(crate) fn new(root: PageNo, page_size: usize, txn: &'txn RoTxn<'txn>, prefix: Vec<u8>) -> Self {
+    pub(crate) fn new(
+        root: PageNo,
+        page_size: usize,
+        txn: &'txn RoTxn<'txn>,
+        prefix: Vec<u8>,
+    ) -> Self {
         Self {
             state: CursorState::new(root),
             page_size,
@@ -2544,13 +2585,12 @@ where
             return None;
         }
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            self.txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page =
+            |pgno: PageNo| -> Result<Vec<u8>> { self.txn.page(pgno).map(|s| s.to_vec()) };
 
         if !self.started {
             self.started = true;
-            match CursorOps::search(&mut self.state, &self.prefix, self.page_size, &get_page) {
+            match CursorOps::search(&mut self.state, &self.prefix, self.page_size, get_page) {
                 Ok(_) => {
                     if !self.state.is_valid() {
                         self.finished = true;
@@ -2560,7 +2600,7 @@ where
                 Err(e) => return Some(Err(e)),
             }
         } else {
-            match CursorOps::next(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::next(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;
@@ -2613,7 +2653,12 @@ pub struct RoRevPrefix<'txn, KC, DC> {
 }
 
 impl<'txn, KC, DC> RoRevPrefix<'txn, KC, DC> {
-    pub(crate) fn new(root: PageNo, page_size: usize, txn: &'txn RoTxn<'txn>, prefix: Vec<u8>) -> Self {
+    pub(crate) fn new(
+        root: PageNo,
+        page_size: usize,
+        txn: &'txn RoTxn<'txn>,
+        prefix: Vec<u8>,
+    ) -> Self {
         Self {
             state: CursorState::new(root),
             page_size,
@@ -2656,19 +2701,18 @@ where
             return None;
         }
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            self.txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page =
+            |pgno: PageNo| -> Result<Vec<u8>> { self.txn.page(pgno).map(|s| s.to_vec()) };
 
         if !self.started {
             self.started = true;
             let end = self.prefix_end();
-            match CursorOps::search(&mut self.state, &end, self.page_size, &get_page) {
+            match CursorOps::search(&mut self.state, &end, self.page_size, get_page) {
                 Ok(_) => {
                     // Move back to find last entry with prefix
                     loop {
                         if !self.state.is_valid() {
-                            match CursorOps::last(&mut self.state, self.page_size, &get_page) {
+                            match CursorOps::last(&mut self.state, self.page_size, get_page) {
                                 Ok(true) => {}
                                 Ok(false) => {
                                     self.finished = true;
@@ -2681,16 +2725,19 @@ where
                         if let Some(pgno) = self.state.leaf_pgno() {
                             match get_page(pgno) {
                                 Ok(page_data) => {
-                                    if let Ok(Some((key, _))) = CursorOps::get_current(&self.state, &page_data, self.page_size) {
-                                        if self.has_prefix(key) {
-                                            break;
-                                        }
+                                    if let Ok(Some((key, _))) = CursorOps::get_current(
+                                        &self.state,
+                                        &page_data,
+                                        self.page_size,
+                                    ) && self.has_prefix(key)
+                                    {
+                                        break;
                                     }
                                 }
                                 Err(e) => return Some(Err(e)),
                             }
                         }
-                        match CursorOps::prev(&mut self.state, self.page_size, &get_page) {
+                        match CursorOps::prev(&mut self.state, self.page_size, get_page) {
                             Ok(true) => {}
                             Ok(false) => {
                                 self.finished = true;
@@ -2703,7 +2750,7 @@ where
                 Err(e) => return Some(Err(e)),
             }
         } else {
-            match CursorOps::prev(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::prev(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;
@@ -2779,13 +2826,12 @@ where
             return None;
         }
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            self.txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page =
+            |pgno: PageNo| -> Result<Vec<u8>> { self.txn.page(pgno).map(|s| s.to_vec()) };
 
         if !self.started {
             self.started = true;
-            match CursorOps::first(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::first(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;
@@ -2794,7 +2840,7 @@ where
                 Err(e) => return Some(Err(e)),
             }
         } else {
-            match CursorOps::next(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::next(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;
@@ -2865,13 +2911,12 @@ where
             return None;
         }
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            self.txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page =
+            |pgno: PageNo| -> Result<Vec<u8>> { self.txn.page(pgno).map(|s| s.to_vec()) };
 
         if !self.started {
             self.started = true;
-            match CursorOps::last(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::last(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;
@@ -2880,7 +2925,7 @@ where
                 Err(e) => return Some(Err(e)),
             }
         } else {
-            match CursorOps::prev(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::prev(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;
@@ -2969,19 +3014,19 @@ where
             return None;
         }
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            self.txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page =
+            |pgno: PageNo| -> Result<Vec<u8>> { self.txn.page(pgno).map(|s| s.to_vec()) };
 
         if !self.started {
             self.started = true;
 
             let positioned = match &self.start_bound {
                 Bound::Included(start) | Bound::Excluded(start) => {
-                    match CursorOps::search(&mut self.state, start, self.page_size, &get_page) {
+                    match CursorOps::search(&mut self.state, start, self.page_size, get_page) {
                         Ok(result) => {
-                            if matches!(&self.start_bound, Bound::Excluded(_)) && result.is_found() {
-                                match CursorOps::next(&mut self.state, self.page_size, &get_page) {
+                            if matches!(&self.start_bound, Bound::Excluded(_)) && result.is_found()
+                            {
+                                match CursorOps::next(&mut self.state, self.page_size, get_page) {
                                     Ok(found) => found,
                                     Err(e) => return Some(Err(e)),
                                 }
@@ -2993,7 +3038,7 @@ where
                     }
                 }
                 Bound::Unbounded => {
-                    match CursorOps::first(&mut self.state, self.page_size, &get_page) {
+                    match CursorOps::first(&mut self.state, self.page_size, get_page) {
                         Ok(found) => found,
                         Err(e) => return Some(Err(e)),
                     }
@@ -3005,7 +3050,7 @@ where
                 return None;
             }
         } else {
-            match CursorOps::next(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::next(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;
@@ -3099,26 +3144,25 @@ where
             return None;
         }
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            self.txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page =
+            |pgno: PageNo| -> Result<Vec<u8>> { self.txn.page(pgno).map(|s| s.to_vec()) };
 
         if !self.started {
             self.started = true;
 
             let positioned = match &self.end_bound {
                 Bound::Included(end) | Bound::Excluded(end) => {
-                    match CursorOps::search(&mut self.state, end, self.page_size, &get_page) {
+                    match CursorOps::search(&mut self.state, end, self.page_size, get_page) {
                         Ok(result) => {
                             if matches!(&self.end_bound, Bound::Excluded(_)) && result.is_found() {
-                                match CursorOps::prev(&mut self.state, self.page_size, &get_page) {
+                                match CursorOps::prev(&mut self.state, self.page_size, get_page) {
                                     Ok(found) => found,
                                     Err(e) => return Some(Err(e)),
                                 }
                             } else if result.is_found() {
                                 true
                             } else {
-                                match CursorOps::prev(&mut self.state, self.page_size, &get_page) {
+                                match CursorOps::prev(&mut self.state, self.page_size, get_page) {
                                     Ok(found) => found,
                                     Err(e) => return Some(Err(e)),
                                 }
@@ -3128,7 +3172,7 @@ where
                     }
                 }
                 Bound::Unbounded => {
-                    match CursorOps::last(&mut self.state, self.page_size, &get_page) {
+                    match CursorOps::last(&mut self.state, self.page_size, get_page) {
                         Ok(found) => found,
                         Err(e) => return Some(Err(e)),
                     }
@@ -3140,7 +3184,7 @@ where
                 return None;
             }
         } else {
-            match CursorOps::prev(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::prev(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;
@@ -3193,7 +3237,12 @@ pub struct RwPrefix<'txn, KC, DC> {
 }
 
 impl<'txn, KC, DC> RwPrefix<'txn, KC, DC> {
-    pub(crate) fn new(root: PageNo, page_size: usize, txn: &'txn RwTxn<'txn>, prefix: Vec<u8>) -> Self {
+    pub(crate) fn new(
+        root: PageNo,
+        page_size: usize,
+        txn: &'txn RwTxn<'txn>,
+        prefix: Vec<u8>,
+    ) -> Self {
         Self {
             state: CursorState::new(root),
             page_size,
@@ -3222,13 +3271,12 @@ where
             return None;
         }
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            self.txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page =
+            |pgno: PageNo| -> Result<Vec<u8>> { self.txn.page(pgno).map(|s| s.to_vec()) };
 
         if !self.started {
             self.started = true;
-            match CursorOps::search(&mut self.state, &self.prefix, self.page_size, &get_page) {
+            match CursorOps::search(&mut self.state, &self.prefix, self.page_size, get_page) {
                 Ok(_) => {
                     if !self.state.is_valid() {
                         self.finished = true;
@@ -3238,7 +3286,7 @@ where
                 Err(e) => return Some(Err(e)),
             }
         } else {
-            match CursorOps::next(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::next(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;
@@ -3291,7 +3339,12 @@ pub struct RwRevPrefix<'txn, KC, DC> {
 }
 
 impl<'txn, KC, DC> RwRevPrefix<'txn, KC, DC> {
-    pub(crate) fn new(root: PageNo, page_size: usize, txn: &'txn RwTxn<'txn>, prefix: Vec<u8>) -> Self {
+    pub(crate) fn new(
+        root: PageNo,
+        page_size: usize,
+        txn: &'txn RwTxn<'txn>,
+        prefix: Vec<u8>,
+    ) -> Self {
         Self {
             state: CursorState::new(root),
             page_size,
@@ -3332,40 +3385,16 @@ where
             return None;
         }
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            self.txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page =
+            |pgno: PageNo| -> Result<Vec<u8>> { self.txn.page(pgno).map(|s| s.to_vec()) };
 
         if !self.started {
             self.started = true;
             let end = self.prefix_end();
-            match CursorOps::search(&mut self.state, &end, self.page_size, &get_page) {
-                Ok(_) => {
-                    loop {
-                        if !self.state.is_valid() {
-                            match CursorOps::last(&mut self.state, self.page_size, &get_page) {
-                                Ok(true) => {}
-                                Ok(false) => {
-                                    self.finished = true;
-                                    return None;
-                                }
-                                Err(e) => return Some(Err(e)),
-                            }
-                            break;
-                        }
-                        if let Some(pgno) = self.state.leaf_pgno() {
-                            match get_page(pgno) {
-                                Ok(page_data) => {
-                                    if let Ok(Some((key, _))) = CursorOps::get_current(&self.state, &page_data, self.page_size) {
-                                        if self.has_prefix(key) {
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(e) => return Some(Err(e)),
-                            }
-                        }
-                        match CursorOps::prev(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::search(&mut self.state, &end, self.page_size, get_page) {
+                Ok(_) => loop {
+                    if !self.state.is_valid() {
+                        match CursorOps::last(&mut self.state, self.page_size, get_page) {
                             Ok(true) => {}
                             Ok(false) => {
                                 self.finished = true;
@@ -3373,12 +3402,34 @@ where
                             }
                             Err(e) => return Some(Err(e)),
                         }
+                        break;
                     }
-                }
+                    if let Some(pgno) = self.state.leaf_pgno() {
+                        match get_page(pgno) {
+                            Ok(page_data) => {
+                                if let Ok(Some((key, _))) =
+                                    CursorOps::get_current(&self.state, &page_data, self.page_size)
+                                    && self.has_prefix(key)
+                                {
+                                    break;
+                                }
+                            }
+                            Err(e) => return Some(Err(e)),
+                        }
+                    }
+                    match CursorOps::prev(&mut self.state, self.page_size, get_page) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            self.finished = true;
+                            return None;
+                        }
+                        Err(e) => return Some(Err(e)),
+                    }
+                },
                 Err(e) => return Some(Err(e)),
             }
         } else {
-            match CursorOps::prev(&mut self.state, self.page_size, &get_page) {
+            match CursorOps::prev(&mut self.state, self.page_size, get_page) {
                 Ok(true) => {}
                 Ok(false) => {
                     self.finished = true;

@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use crate::flags::EnvFlags;
 use crate::mmap::{DataFile, MemoryMap};
 use crate::page::{DbInfo, MetaPage, PageNo};
-use crate::txn::{RoTxn, RwTxn, WithTls, WithoutTls, TlsUsage};
+use crate::txn::{RoTxn, RwTxn, TlsUsage, WithTls, WithoutTls};
 
 /// Default map size (10 MB).
 const DEFAULT_MAP_SIZE: usize = 10 * 1024 * 1024;
@@ -75,7 +75,8 @@ static OPENED_ENVS: std::sync::LazyLock<RwLock<HashMap<PathBuf, Arc<SignalEvent>
 /// Returns a struct that allows to wait for the effective closing of an environment.
 pub fn env_closing_event<P: AsRef<Path>>(path: P) -> Option<EnvClosingEvent> {
     let lock = OPENED_ENVS.read().unwrap();
-    lock.get(path.as_ref()).map(|signal_event| EnvClosingEvent(signal_event.clone()))
+    lock.get(path.as_ref())
+        .map(|signal_event| EnvClosingEvent(signal_event.clone()))
 }
 
 /// A structure that can be used to wait for the closing event.
@@ -355,6 +356,7 @@ pub const FREE_DBI: Dbi = 1;
 
 /// Information about an open database.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct OpenDatabase {
     /// Database name (None for unnamed database).
     name: Option<String>,
@@ -397,6 +399,7 @@ pub struct Env<T: TlsUsage = WithTls> {
     /// Path to the environment directory or file.
     path: PathBuf,
     /// Data file path.
+    #[allow(dead_code)]
     data_path: PathBuf,
     /// Lock file path.
     #[allow(dead_code)]
@@ -431,7 +434,7 @@ impl<T: TlsUsage> Env<T> {
         let page_size = page_size::get();
 
         // Validate map size is multiple of page size
-        if options.map_size % page_size != 0 {
+        if !options.map_size.is_multiple_of(page_size) {
             return Err(Error::Io {
                 kind: crate::error::IoErrorKind::InvalidInput,
                 message: format!(
@@ -632,6 +635,7 @@ impl<T: TlsUsage> Env<T> {
     }
 
     /// Returns a page buffer to the pool for reuse.
+    #[allow(dead_code)]
     pub(crate) fn return_page_buffer(&self, buf: Vec<u8>) {
         self.page_pool.lock().unwrap().put(buf);
     }
@@ -698,7 +702,14 @@ impl<T: TlsUsage> Env<T> {
     /// ```
     pub fn database_options(
         &self,
-    ) -> crate::database::DatabaseOpenOptions<'_, 'static, crate::database::Unspecified, crate::database::Unspecified, crate::env::DefaultComparator, T> {
+    ) -> crate::database::DatabaseOpenOptions<
+        '_,
+        'static,
+        crate::database::Unspecified,
+        crate::database::Unspecified,
+        crate::env::DefaultComparator,
+        T,
+    > {
         crate::database::DatabaseOpenOptions::new(self)
     }
 
@@ -725,7 +736,9 @@ impl<T: TlsUsage> Env<T> {
                 // Unnamed (main) database - always exists
                 let inner = self.inner.read().unwrap();
                 let db_info = inner.meta.main_db;
-                Ok(crate::database::Database::new(MAIN_DBI, None, db_info, flags))
+                Ok(crate::database::Database::new(
+                    MAIN_DBI, None, db_info, flags,
+                ))
             }
             Some(db_name) => {
                 // Check max_dbs limit
@@ -736,15 +749,15 @@ impl<T: TlsUsage> Env<T> {
                     }
 
                     // Check if already open
-                    if let Some(&dbi) = inner.db_registry.get(db_name) {
-                        if let Some(open_db) = inner.open_dbs.get(&dbi) {
-                            return Ok(crate::database::Database::new(
-                                dbi,
-                                Some(db_name.to_string()),
-                                open_db.db_info,
-                                open_db.flags,
-                            ));
-                        }
+                    if let Some(&dbi) = inner.db_registry.get(db_name)
+                        && let Some(open_db) = inner.open_dbs.get(&dbi)
+                    {
+                        return Ok(crate::database::Database::new(
+                            dbi,
+                            Some(db_name.to_string()),
+                            open_db.db_info,
+                            open_db.flags,
+                        ));
                     }
                 }
 
@@ -757,11 +770,14 @@ impl<T: TlsUsage> Env<T> {
                     let dbi = inner.next_dbi;
                     inner.next_dbi += 1;
                     inner.db_registry.insert(db_name.to_string(), dbi);
-                    inner.open_dbs.insert(dbi, OpenDatabase {
-                        name: Some(db_name.to_string()),
-                        db_info: info,
-                        flags,
-                    });
+                    inner.open_dbs.insert(
+                        dbi,
+                        OpenDatabase {
+                            name: Some(db_name.to_string()),
+                            db_info: info,
+                            flags,
+                        },
+                    );
                     (dbi, info)
                 } else {
                     // Create new database
@@ -775,15 +791,23 @@ impl<T: TlsUsage> Env<T> {
                     let dbi = inner.next_dbi;
                     inner.next_dbi += 1;
                     inner.db_registry.insert(db_name.to_string(), dbi);
-                    inner.open_dbs.insert(dbi, OpenDatabase {
-                        name: Some(db_name.to_string()),
-                        db_info: new_info,
-                        flags,
-                    });
+                    inner.open_dbs.insert(
+                        dbi,
+                        OpenDatabase {
+                            name: Some(db_name.to_string()),
+                            db_info: new_info,
+                            flags,
+                        },
+                    );
                     (dbi, new_info)
                 };
 
-                Ok(crate::database::Database::new(dbi, Some(db_name.to_string()), db_info, flags))
+                Ok(crate::database::Database::new(
+                    dbi,
+                    Some(db_name.to_string()),
+                    db_info,
+                    flags,
+                ))
             }
         }
     }
@@ -817,21 +841,23 @@ impl<T: TlsUsage> Env<T> {
                 let db_info = inner.meta.main_db;
 
                 // The main database always exists (even if empty)
-                Ok(Some(crate::database::Database::new(MAIN_DBI, None, db_info, flags)))
+                Ok(Some(crate::database::Database::new(
+                    MAIN_DBI, None, db_info, flags,
+                )))
             }
             Some(db_name) => {
                 // Check if already open
                 {
                     let inner = self.inner.read().unwrap();
-                    if let Some(&dbi) = inner.db_registry.get(db_name) {
-                        if let Some(open_db) = inner.open_dbs.get(&dbi) {
-                            return Ok(Some(crate::database::Database::new(
-                                dbi,
-                                Some(db_name.to_string()),
-                                open_db.db_info,
-                                open_db.flags,
-                            )));
-                        }
+                    if let Some(&dbi) = inner.db_registry.get(db_name)
+                        && let Some(open_db) = inner.open_dbs.get(&dbi)
+                    {
+                        return Ok(Some(crate::database::Database::new(
+                            dbi,
+                            Some(db_name.to_string()),
+                            open_db.db_info,
+                            open_db.flags,
+                        )));
                     }
                 }
 
@@ -845,11 +871,14 @@ impl<T: TlsUsage> Env<T> {
                         let dbi = inner.next_dbi;
                         inner.next_dbi += 1;
                         inner.db_registry.insert(db_name.to_string(), dbi);
-                        inner.open_dbs.insert(dbi, OpenDatabase {
-                            name: Some(db_name.to_string()),
-                            db_info: info,
-                            flags,
-                        });
+                        inner.open_dbs.insert(
+                            dbi,
+                            OpenDatabase {
+                                name: Some(db_name.to_string()),
+                                db_info: info,
+                                flags,
+                            },
+                        );
 
                         Ok(Some(crate::database::Database::new(
                             dbi,
@@ -878,21 +907,19 @@ impl<T: TlsUsage> Env<T> {
         let page_size = self.page_size;
         let mut state = CursorState::new(main_db.root);
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
         let key_bytes = name.as_bytes();
-        let result = CursorOps::search(&mut state, key_bytes, page_size, &get_page)?;
+        let result = CursorOps::search(&mut state, key_bytes, page_size, get_page)?;
 
         match result {
             SearchResult::Found(_) => {
                 if let Some(pgno) = state.leaf_pgno() {
                     let page_data = get_page(pgno)?;
-                    if let Some((_, value)) = CursorOps::get_current(&state, &page_data, page_size)? {
-                        if value.len() >= crate::page::DB_INFO_SIZE {
-                            return Ok(Some(DbInfo::read_from(value)?));
-                        }
+                    if let Some((_, value)) = CursorOps::get_current(&state, &page_data, page_size)?
+                        && value.len() >= crate::page::DB_INFO_SIZE
+                    {
+                        return Ok(Some(DbInfo::read_from(value)?));
                     }
                 }
                 Ok(None)
@@ -914,21 +941,19 @@ impl<T: TlsUsage> Env<T> {
         let page_size = self.page_size;
         let mut state = CursorState::new(main_db.root);
 
-        let get_page = |pgno: PageNo| -> Result<Vec<u8>> {
-            txn.page(pgno).map(|s| s.to_vec())
-        };
+        let get_page = |pgno: PageNo| -> Result<Vec<u8>> { txn.page(pgno).map(|s| s.to_vec()) };
 
         let key_bytes = name.as_bytes();
-        let result = CursorOps::search(&mut state, key_bytes, page_size, &get_page)?;
+        let result = CursorOps::search(&mut state, key_bytes, page_size, get_page)?;
 
         match result {
             SearchResult::Found(_) => {
                 if let Some(pgno) = state.leaf_pgno() {
                     let page_data = get_page(pgno)?;
-                    if let Some((_, value)) = CursorOps::get_current(&state, &page_data, page_size)? {
-                        if value.len() >= crate::page::DB_INFO_SIZE {
-                            return Ok(Some(DbInfo::read_from(value)?));
-                        }
+                    if let Some((_, value)) = CursorOps::get_current(&state, &page_data, page_size)?
+                        && value.len() >= crate::page::DB_INFO_SIZE
+                    {
+                        return Ok(Some(DbInfo::read_from(value)?));
                     }
                 }
                 Ok(None)
@@ -939,7 +964,7 @@ impl<T: TlsUsage> Env<T> {
 
     /// Stores a named database's DbInfo in the main database.
     fn store_named_db_info(&self, txn: &mut RwTxn<'_, T>, name: &str, info: &DbInfo) -> Result<()> {
-        use crate::btree::{PageBuilder, Node};
+        use crate::btree::{Node, PageBuilder};
 
         let page_size = self.page_size;
         let key_bytes = name.as_bytes();
@@ -1009,7 +1034,8 @@ impl<T: TlsUsage> Env<T> {
         // SAFETY: We hold the read lock, so the mmap won't be unmapped
         let mmap_ptr = &inner.mmap as *const MemoryMap;
         let mmap = unsafe { &*mmap_ptr };
-        mmap.page(page_no, self.page_size).ok_or(Error::PageNotFound)
+        mmap.page(page_no, self.page_size)
+            .ok_or(Error::PageNotFound)
     }
 
     /// Returns the current meta page.
@@ -1151,8 +1177,7 @@ impl<T: TlsUsage> Env<T> {
                     // Write meta page to mmap
                     let meta_off = meta_offset as usize;
                     if meta_off + meta_buf.len() <= mmap_slice.len() {
-                        mmap_slice[meta_off..meta_off + meta_buf.len()]
-                            .copy_from_slice(&meta_buf);
+                        mmap_slice[meta_off..meta_off + meta_buf.len()].copy_from_slice(&meta_buf);
                     }
                 }
 
@@ -1177,7 +1202,7 @@ impl<T: TlsUsage> Env<T> {
             let mut writes: Vec<(&[u8], u64)> = Vec::with_capacity(dirty_pages.len() + 1);
 
             for (pgno, data) in &dirty_pages {
-                let offset = *pgno as u64 * page_size;
+                let offset = *pgno * page_size;
                 writes.push((data.as_slice(), offset));
             }
 
@@ -1233,7 +1258,7 @@ impl<T: TlsUsage> Env<T> {
     /// The caller must ensure no transactions are active.
     pub unsafe fn resize(&self, new_size: usize) -> Result<()> {
         let page_size = page_size::get();
-        if new_size % page_size != 0 {
+        if !new_size.is_multiple_of(page_size) {
             return Err(Error::Io {
                 kind: crate::error::IoErrorKind::InvalidInput,
                 message: format!(
@@ -1314,7 +1339,7 @@ impl<T: TlsUsage> Env<T> {
         }
 
         // Create a nested transaction using the existing RwTxn::nested constructor
-        let meta = parent.meta().clone();
+        let meta = *parent.meta();
         let last_pgno = parent.main_root(); // Use parent's state
 
         let allocator = PageAllocator::new(last_pgno, self.map_size(), self.page_size);

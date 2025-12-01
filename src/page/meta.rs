@@ -79,24 +79,19 @@ impl DbInfo {
             flags: u16::from_le_bytes([data[4], data[5]]),
             depth: u16::from_le_bytes([data[6], data[7]]),
             branch_pages: u64::from_le_bytes([
-                data[8], data[9], data[10], data[11],
-                data[12], data[13], data[14], data[15],
+                data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
             ]),
             leaf_pages: u64::from_le_bytes([
-                data[16], data[17], data[18], data[19],
-                data[20], data[21], data[22], data[23],
+                data[16], data[17], data[18], data[19], data[20], data[21], data[22], data[23],
             ]),
             overflow_pages: u64::from_le_bytes([
-                data[24], data[25], data[26], data[27],
-                data[28], data[29], data[30], data[31],
+                data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31],
             ]),
             entries: u64::from_le_bytes([
-                data[32], data[33], data[34], data[35],
-                data[36], data[37], data[38], data[39],
+                data[32], data[33], data[34], data[35], data[36], data[37], data[38], data[39],
             ]),
             root: u64::from_le_bytes([
-                data[40], data[41], data[42], data[43],
-                data[44], data[45], data[46], data[47],
+                data[40], data[41], data[42], data[43], data[44], data[45], data[46], data[47],
             ]),
         })
     }
@@ -215,22 +210,18 @@ impl MetaPage {
         let magic = u32::from_le_bytes([data[16], data[17], data[18], data[19]]);
         let version = u32::from_le_bytes([data[20], data[21], data[22], data[23]]);
         let address = u64::from_le_bytes([
-            data[24], data[25], data[26], data[27],
-            data[28], data[29], data[30], data[31],
+            data[24], data[25], data[26], data[27], data[28], data[29], data[30], data[31],
         ]);
         let map_size = u64::from_le_bytes([
-            data[32], data[33], data[34], data[35],
-            data[36], data[37], data[38], data[39],
+            data[32], data[33], data[34], data[35], data[36], data[37], data[38], data[39],
         ]);
         let free_db = DbInfo::read_from(&data[40..88])?;
         let main_db = DbInfo::read_from(&data[88..136])?;
         let last_pgno = u64::from_le_bytes([
-            data[136], data[137], data[138], data[139],
-            data[140], data[141], data[142], data[143],
+            data[136], data[137], data[138], data[139], data[140], data[141], data[142], data[143],
         ]);
         let last_txnid = u64::from_le_bytes([
-            data[144], data[145], data[146], data[147],
-            data[148], data[149], data[150], data[151],
+            data[144], data[145], data[146], data[147], data[148], data[149], data[150], data[151],
         ]);
 
         let meta = Self {

@@ -4,7 +4,7 @@
 //! branch and leaf pages.
 
 use crate::error::{Error, Result};
-use crate::page::{PageHeader, PageNo, PAGE_HEADER_SIZE};
+use crate::page::{PAGE_HEADER_SIZE, PageHeader, PageNo};
 
 use super::node::{Node, NodeRef};
 use super::{CompareFn, SearchResult};
@@ -64,10 +64,8 @@ impl<'a> BranchPage<'a> {
             return Err(Error::Corrupted);
         }
 
-        let node_offset = u16::from_le_bytes([
-            self.data[ptr_offset],
-            self.data[ptr_offset + 1],
-        ]) as usize;
+        let node_offset =
+            u16::from_le_bytes([self.data[ptr_offset], self.data[ptr_offset + 1]]) as usize;
 
         if node_offset >= self.page_size {
             return Err(Error::Corrupted);
@@ -165,10 +163,8 @@ impl<'a> LeafPage<'a> {
             return Err(Error::Corrupted);
         }
 
-        let node_offset = u16::from_le_bytes([
-            self.data[ptr_offset],
-            self.data[ptr_offset + 1],
-        ]) as usize;
+        let node_offset =
+            u16::from_le_bytes([self.data[ptr_offset], self.data[ptr_offset + 1]]) as usize;
 
         if node_offset >= self.page_size {
             return Err(Error::Corrupted);
@@ -217,6 +213,7 @@ impl<'a> LeafPage<'a> {
 }
 
 /// A mutable page builder for creating new pages.
+#[allow(dead_code)]
 pub struct PageBuilder {
     /// Page data buffer.
     data: Vec<u8>,
@@ -360,9 +357,15 @@ mod tests {
         let mut builder = PageBuilder::new_leaf(5, page_size);
 
         // Add some nodes
-        builder.add_leaf(&Node::leaf(b"key1".to_vec(), b"value1".to_vec())).unwrap();
-        builder.add_leaf(&Node::leaf(b"key2".to_vec(), b"value2".to_vec())).unwrap();
-        builder.add_leaf(&Node::leaf(b"key3".to_vec(), b"value3".to_vec())).unwrap();
+        builder
+            .add_leaf(&Node::leaf(b"key1".to_vec(), b"value1".to_vec()))
+            .unwrap();
+        builder
+            .add_leaf(&Node::leaf(b"key2".to_vec(), b"value2".to_vec()))
+            .unwrap();
+        builder
+            .add_leaf(&Node::leaf(b"key3".to_vec(), b"value3".to_vec()))
+            .unwrap();
 
         let data = builder.finish();
 
@@ -379,8 +382,12 @@ mod tests {
         let page_size = 4096;
         let mut builder = PageBuilder::new_branch(10, page_size);
 
-        builder.add_branch(&Node::branch(b"key1".to_vec(), 100)).unwrap();
-        builder.add_branch(&Node::branch(b"key2".to_vec(), 200)).unwrap();
+        builder
+            .add_branch(&Node::branch(b"key1".to_vec(), 100))
+            .unwrap();
+        builder
+            .add_branch(&Node::branch(b"key2".to_vec(), 200))
+            .unwrap();
 
         let data = builder.finish();
 
@@ -397,23 +404,41 @@ mod tests {
         let page_size = 4096;
         let mut builder = PageBuilder::new_leaf(5, page_size);
 
-        builder.add_leaf(&Node::leaf(b"apple".to_vec(), b"1".to_vec())).unwrap();
-        builder.add_leaf(&Node::leaf(b"banana".to_vec(), b"2".to_vec())).unwrap();
-        builder.add_leaf(&Node::leaf(b"cherry".to_vec(), b"3".to_vec())).unwrap();
+        builder
+            .add_leaf(&Node::leaf(b"apple".to_vec(), b"1".to_vec()))
+            .unwrap();
+        builder
+            .add_leaf(&Node::leaf(b"banana".to_vec(), b"2".to_vec()))
+            .unwrap();
+        builder
+            .add_leaf(&Node::leaf(b"cherry".to_vec(), b"3".to_vec()))
+            .unwrap();
 
         let data = builder.finish();
         let page = LeafPage::new(&data, page_size).unwrap();
 
         // Search for existing key
-        assert!(matches!(page.search(b"banana", default_compare), Ok(SearchResult::Found(1))));
+        assert!(matches!(
+            page.search(b"banana", default_compare),
+            Ok(SearchResult::Found(1))
+        ));
 
         // Search for non-existing key
-        assert!(matches!(page.search(b"blueberry", default_compare), Ok(SearchResult::NotFound(2))));
+        assert!(matches!(
+            page.search(b"blueberry", default_compare),
+            Ok(SearchResult::NotFound(2))
+        ));
 
         // Search before first
-        assert!(matches!(page.search(b"aardvark", default_compare), Ok(SearchResult::NotFound(0))));
+        assert!(matches!(
+            page.search(b"aardvark", default_compare),
+            Ok(SearchResult::NotFound(0))
+        ));
 
         // Search after last
-        assert!(matches!(page.search(b"zebra", default_compare), Ok(SearchResult::NotFound(3))));
+        assert!(matches!(
+            page.search(b"zebra", default_compare),
+            Ok(SearchResult::NotFound(3))
+        ));
     }
 }

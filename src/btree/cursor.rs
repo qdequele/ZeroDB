@@ -5,12 +5,10 @@
 use std::collections::HashMap;
 
 use crate::error::Result;
-#[cfg(test)]
-use crate::error::Error;
 use crate::page::PageNo;
 
 use super::page_ops::{BranchPage, LeafPage};
-use super::{default_compare, CompareFn, SearchResult, P_INVALID};
+use super::{CompareFn, P_INVALID, SearchResult, default_compare};
 
 /// Prefetches memory into CPU cache.
 ///
@@ -292,7 +290,10 @@ impl CursorOps {
                 let result = page.search(key, state.compare)?;
                 let index = result.index();
 
-                state.stack.push(CursorLevel { page_no: pgno, index });
+                state.stack.push(CursorLevel {
+                    page_no: pgno,
+                    index,
+                });
                 state.valid = result.is_found() || index < page.num_keys();
 
                 return Ok(result);
@@ -301,7 +302,10 @@ impl CursorOps {
                 let index = page.search(key, state.compare)?;
                 let child = page.child(index)?;
 
-                state.stack.push(CursorLevel { page_no: pgno, index });
+                state.stack.push(CursorLevel {
+                    page_no: pgno,
+                    index,
+                });
                 pgno = child;
             }
         }
@@ -341,7 +345,10 @@ impl CursorOps {
                 let index = result.index();
                 let num_keys = page.num_keys();
 
-                state.stack.push(CursorLevel { page_no: pgno, index });
+                state.stack.push(CursorLevel {
+                    page_no: pgno,
+                    index,
+                });
                 state.valid = result.is_found() || index < num_keys;
 
                 return Ok(result);
@@ -350,7 +357,10 @@ impl CursorOps {
                 let index = page.search(key, compare)?;
                 let child = page.child(index)?;
 
-                state.stack.push(CursorLevel { page_no: pgno, index });
+                state.stack.push(CursorLevel {
+                    page_no: pgno,
+                    index,
+                });
                 pgno = child;
             }
         }
@@ -385,7 +395,10 @@ impl CursorOps {
                     return Ok(false);
                 }
 
-                state.stack.push(CursorLevel { page_no: pgno, index: 0 });
+                state.stack.push(CursorLevel {
+                    page_no: pgno,
+                    index: 0,
+                });
                 state.valid = true;
                 return Ok(true);
             } else {
@@ -397,7 +410,10 @@ impl CursorOps {
                 }
 
                 let child = page.child(0)?;
-                state.stack.push(CursorLevel { page_no: pgno, index: 0 });
+                state.stack.push(CursorLevel {
+                    page_no: pgno,
+                    index: 0,
+                });
                 pgno = child;
             }
         }
@@ -595,13 +611,19 @@ impl CursorOps {
                     return Ok(false);
                 }
 
-                state.stack.push(CursorLevel { page_no: pgno, index: 0 });
+                state.stack.push(CursorLevel {
+                    page_no: pgno,
+                    index: 0,
+                });
                 state.valid = true;
                 return Ok(true);
             } else {
                 let page = BranchPage::new(&page_data, page_size)?;
                 let child = page.child(0)?;
-                state.stack.push(CursorLevel { page_no: pgno, index: 0 });
+                state.stack.push(CursorLevel {
+                    page_no: pgno,
+                    index: 0,
+                });
                 pgno = child;
             }
         }
@@ -683,9 +705,9 @@ fn is_leaf(data: &[u8], _page_size: usize) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::node::Node;
     use super::super::page_ops::PageBuilder;
+    use super::*;
     use crate::error::Error;
     use std::collections::HashMap;
 
@@ -695,9 +717,15 @@ mod tests {
 
         // Create a simple tree: one leaf page
         let mut builder = PageBuilder::new_leaf(1, page_size);
-        builder.add_leaf(&Node::leaf(b"apple".to_vec(), b"1".to_vec())).unwrap();
-        builder.add_leaf(&Node::leaf(b"banana".to_vec(), b"2".to_vec())).unwrap();
-        builder.add_leaf(&Node::leaf(b"cherry".to_vec(), b"3".to_vec())).unwrap();
+        builder
+            .add_leaf(&Node::leaf(b"apple".to_vec(), b"1".to_vec()))
+            .unwrap();
+        builder
+            .add_leaf(&Node::leaf(b"banana".to_vec(), b"2".to_vec()))
+            .unwrap();
+        builder
+            .add_leaf(&Node::leaf(b"cherry".to_vec(), b"3".to_vec()))
+            .unwrap();
         pages.insert(1, builder.finish());
 
         (pages, 1)
@@ -711,7 +739,8 @@ mod tests {
 
         let result = CursorOps::search(&mut state, b"banana", page_size, |pgno| {
             pages.get(&pgno).cloned().ok_or(Error::Corrupted)
-        }).unwrap();
+        })
+        .unwrap();
 
         assert!(matches!(result, SearchResult::Found(1)));
         assert!(state.is_valid());
@@ -725,7 +754,8 @@ mod tests {
 
         let result = CursorOps::search(&mut state, b"blueberry", page_size, |pgno| {
             pages.get(&pgno).cloned().ok_or(Error::Corrupted)
-        }).unwrap();
+        })
+        .unwrap();
 
         assert!(matches!(result, SearchResult::NotFound(2)));
     }
@@ -739,14 +769,16 @@ mod tests {
         // First
         let found = CursorOps::first(&mut state, page_size, |pgno| {
             pages.get(&pgno).cloned().ok_or(Error::Corrupted)
-        }).unwrap();
+        })
+        .unwrap();
         assert!(found);
         assert_eq!(state.leaf_index(), Some(0));
 
         // Last
         let found = CursorOps::last(&mut state, page_size, |pgno| {
             pages.get(&pgno).cloned().ok_or(Error::Corrupted)
-        }).unwrap();
+        })
+        .unwrap();
         assert!(found);
         assert_eq!(state.leaf_index(), Some(2));
     }
@@ -760,36 +792,42 @@ mod tests {
         // Start at first
         CursorOps::first(&mut state, page_size, |pgno| {
             pages.get(&pgno).cloned().ok_or(Error::Corrupted)
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(state.leaf_index(), Some(0));
 
         // Next
         let found = CursorOps::next(&mut state, page_size, |pgno| {
             pages.get(&pgno).cloned().ok_or(Error::Corrupted)
-        }).unwrap();
+        })
+        .unwrap();
         assert!(found);
         assert_eq!(state.leaf_index(), Some(1));
 
         // Next
         let found = CursorOps::next(&mut state, page_size, |pgno| {
             pages.get(&pgno).cloned().ok_or(Error::Corrupted)
-        }).unwrap();
+        })
+        .unwrap();
         assert!(found);
         assert_eq!(state.leaf_index(), Some(2));
 
         // Next (should fail - end of tree)
         let found = CursorOps::next(&mut state, page_size, |pgno| {
             pages.get(&pgno).cloned().ok_or(Error::Corrupted)
-        }).unwrap();
+        })
+        .unwrap();
         assert!(!found);
 
         // Prev from last
         CursorOps::last(&mut state, page_size, |pgno| {
             pages.get(&pgno).cloned().ok_or(Error::Corrupted)
-        }).unwrap();
+        })
+        .unwrap();
         let found = CursorOps::prev(&mut state, page_size, |pgno| {
             pages.get(&pgno).cloned().ok_or(Error::Corrupted)
-        }).unwrap();
+        })
+        .unwrap();
         assert!(found);
         assert_eq!(state.leaf_index(), Some(1));
     }
@@ -802,7 +840,8 @@ mod tests {
 
         CursorOps::first(&mut state, page_size, |pgno| {
             pages.get(&pgno).cloned().ok_or(Error::Corrupted)
-        }).unwrap();
+        })
+        .unwrap();
 
         let page_data = pages.get(&1).unwrap();
         let kv = CursorOps::get_current(&state, page_data, page_size).unwrap();

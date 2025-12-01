@@ -3,12 +3,14 @@
 //! This module handles inserting new key-value pairs into the B+tree,
 //! including page splits when necessary.
 
+#![allow(clippy::type_complexity)]
+
 use crate::error::Result;
 use crate::page::PageNo;
 
+use super::P_INVALID;
 use super::node::Node;
 use super::page_ops::{LeafPage, PageBuilder};
-use super::P_INVALID;
 
 /// Result of an insert operation.
 #[derive(Debug)]
@@ -27,6 +29,7 @@ pub enum InsertResult {
 /// Calculates the split point for a page.
 ///
 /// Returns the index at which to split (items 0..split go left, split.. go right).
+#[allow(dead_code)]
 pub fn calculate_split_point(
     num_keys: usize,
     _key_sizes: &[usize],
@@ -67,10 +70,7 @@ pub fn insert_into_leaf(
         // Preserve overflow nodes properly
         if node_ref.is_overflow() {
             if let Some(overflow_pgno) = node_ref.overflow_pgno() {
-                nodes.push(Node::leaf_overflow(
-                    node_ref.key().to_vec(),
-                    overflow_pgno,
-                ));
+                nodes.push(Node::leaf_overflow(node_ref.key().to_vec(), overflow_pgno));
             } else {
                 return Err(crate::error::Error::Corrupted);
             }
@@ -121,7 +121,10 @@ pub fn insert_into_leaf(
         right_builder.add_leaf(node)?;
     }
 
-    Ok((left_builder.finish(), Some((right_builder.finish(), nodes[split_point].key.clone()))))
+    Ok((
+        left_builder.finish(),
+        Some((right_builder.finish(), nodes[split_point].key.clone())),
+    ))
 }
 
 /// Inserts a child pointer into a branch page.
@@ -149,10 +152,7 @@ pub fn insert_into_branch(
             nodes.push(Node::branch(separator.clone(), right_pgno));
         }
 
-        nodes.push(Node::branch(
-            node_ref.key().to_vec(),
-            node_ref.child_pgno(),
-        ));
+        nodes.push(Node::branch(node_ref.key().to_vec(), node_ref.child_pgno()));
     }
 
     // Handle insert at end
@@ -191,7 +191,10 @@ pub fn insert_into_branch(
         right_builder.add_branch(node)?;
     }
 
-    Ok((left_builder.finish(), Some((right_builder.finish(), nodes[split_point].key.clone()))))
+    Ok((
+        left_builder.finish(),
+        Some((right_builder.finish(), nodes[split_point].key.clone())),
+    ))
 }
 
 #[cfg(test)]
@@ -218,8 +221,12 @@ mod tests {
     fn insert_maintains_order() {
         let page_size = 4096;
         let mut builder = PageBuilder::new_leaf(1, page_size);
-        builder.add_leaf(&Node::leaf(b"a".to_vec(), b"1".to_vec())).unwrap();
-        builder.add_leaf(&Node::leaf(b"c".to_vec(), b"3".to_vec())).unwrap();
+        builder
+            .add_leaf(&Node::leaf(b"a".to_vec(), b"1".to_vec()))
+            .unwrap();
+        builder
+            .add_leaf(&Node::leaf(b"c".to_vec(), b"3".to_vec()))
+            .unwrap();
         let page_data = builder.finish();
 
         // Insert "b" between "a" and "c"

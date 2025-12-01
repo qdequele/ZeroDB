@@ -7,12 +7,12 @@ mod meta;
 mod node;
 mod overflow;
 
-pub use header::{PageFlags, PageHeader, PAGE_HEADER_SIZE};
-pub use meta::{DbInfo, MetaPage, DB_INFO_SIZE};
-pub use node::{NodeFlags, LeafNode, BranchNode};
+pub use header::{PAGE_HEADER_SIZE, PageFlags, PageHeader};
+pub use meta::{DB_INFO_SIZE, DbInfo, MetaPage};
+pub use node::{BranchNode, LeafNode, NodeFlags};
 pub use overflow::{
-    OverflowPage, OVERFLOW_HEADER_SIZE,
-    node_max, should_use_overflow, overflow_threshold, overflow_pages,
+    OVERFLOW_HEADER_SIZE, OverflowPage, node_max, overflow_pages, overflow_threshold,
+    should_use_overflow,
 };
 
 /// Page number type (64-bit for large databases).

@@ -3,6 +3,8 @@
 //! This module provides read-only and read-write transactions with
 //! MVCC (Multi-Version Concurrency Control) semantics.
 
+#![allow(clippy::large_enum_variant)]
+
 use std::marker::PhantomData;
 
 use crate::alloc::{DirtyPages, PageAllocator};
@@ -350,10 +352,10 @@ impl<'e, T: TlsUsage> RwTxn<'e, T> {
         }
 
         // Check parent transaction's dirty pages
-        if let Some(ref parent) = self.parent {
-            if let Some(data) = parent.dirty_pages.get(pgno) {
-                return Ok(data);
-            }
+        if let Some(ref parent) = self.parent
+            && let Some(data) = parent.dirty_pages.get(pgno)
+        {
+            return Ok(data);
         }
 
         // Fall back to mmap

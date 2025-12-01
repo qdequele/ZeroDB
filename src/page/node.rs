@@ -281,7 +281,10 @@ impl LeafNode {
             ((pgno & 0xFFFF_FFFF) as u32, ((pgno >> 32) & 0x0F) as u16)
         } else {
             let data_size = self.data.len() as u64;
-            ((data_size & 0xFFFF_FFFF) as u32, ((data_size >> 32) & 0x0F) as u16)
+            (
+                (data_size & 0xFFFF_FFFF) as u32,
+                ((data_size >> 32) & 0x0F) as u16,
+            )
         };
 
         let hi_and_ksize = (size_hi << 12) | key_size;

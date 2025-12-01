@@ -3,22 +3,22 @@
 //! These benchmarks compare the performance of basic operations across
 //! different key-value stores.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use tempfile::tempdir;
 
 // ZeroDB imports
 use zerodb::{
+    EnvOpenOptions as ZeroEnvOptions,
     btree::{CursorOps, CursorState, Node, PageBuilder},
     error::Result as ZeroResult,
     page::PageNo,
-    EnvOpenOptions as ZeroEnvOptions,
 };
 
 // LMDB (heed) imports
-use heed::{EnvOpenOptions as HeedEnvOptions, Database as HeedDatabase};
 use heed::types::*;
+use heed::{Database as HeedDatabase, EnvOpenOptions as HeedEnvOptions};
 
 // RocksDB imports
 use rocksdb::DB as RocksDB;
@@ -70,80 +70,68 @@ fn bench_sequential_writes(c: &mut Criterion) {
         group.throughput(Throughput::Elements(count as u64));
 
         // ZeroDB
-        group.bench_with_input(
-            BenchmarkId::new("zerodb", count),
-            &count,
-            |b, &count| {
-                b.iter(|| {
-                    let dir = tempdir().unwrap();
-                    let env = unsafe {
-                        ZeroEnvOptions::new()
-                            .map_size(100 * 1024 * 1024) // 100MB
-                            .open(dir.path())
-                            .unwrap()
-                    };
+        group.bench_with_input(BenchmarkId::new("zerodb", count), &count, |b, &count| {
+            b.iter(|| {
+                let dir = tempdir().unwrap();
+                let env = unsafe {
+                    ZeroEnvOptions::new()
+                        .map_size(100 * 1024 * 1024) // 100MB
+                        .open(dir.path())
+                        .unwrap()
+                };
 
-                    for i in 0..count {
-                        let mut wtxn = env.write_txn().unwrap();
-                        let (_pgno, data) = wtxn.alloc_page().unwrap();
-                        let key = format!("key{:08}", i);
-                        let value = format!("value{:08}", i);
-                        data[0..key.len()].copy_from_slice(key.as_bytes());
-                        data[64..64 + value.len()].copy_from_slice(value.as_bytes());
-                        wtxn.commit().unwrap();
-                    }
-                    black_box(env)
-                })
-            },
-        );
+                for i in 0..count {
+                    let mut wtxn = env.write_txn().unwrap();
+                    let (_pgno, data) = wtxn.alloc_page().unwrap();
+                    let key = format!("key{:08}", i);
+                    let value = format!("value{:08}", i);
+                    data[0..key.len()].copy_from_slice(key.as_bytes());
+                    data[64..64 + value.len()].copy_from_slice(value.as_bytes());
+                    wtxn.commit().unwrap();
+                }
+                black_box(env)
+            })
+        });
 
         // LMDB (heed)
-        group.bench_with_input(
-            BenchmarkId::new("lmdb_heed", count),
-            &count,
-            |b, &count| {
-                b.iter(|| {
-                    let dir = tempdir().unwrap();
-                    let env = unsafe {
-                        HeedEnvOptions::new()
-                            .map_size(100 * 1024 * 1024)
-                            .open(dir.path())
-                            .unwrap()
-                    };
-                    let mut wtxn = env.write_txn().unwrap();
-                    let db: HeedDatabase<Str, Str> = env.create_database(&mut wtxn, None).unwrap();
-                    wtxn.commit().unwrap();
+        group.bench_with_input(BenchmarkId::new("lmdb_heed", count), &count, |b, &count| {
+            b.iter(|| {
+                let dir = tempdir().unwrap();
+                let env = unsafe {
+                    HeedEnvOptions::new()
+                        .map_size(100 * 1024 * 1024)
+                        .open(dir.path())
+                        .unwrap()
+                };
+                let mut wtxn = env.write_txn().unwrap();
+                let db: HeedDatabase<Str, Str> = env.create_database(&mut wtxn, None).unwrap();
+                wtxn.commit().unwrap();
 
-                    for i in 0..count {
-                        let mut wtxn = env.write_txn().unwrap();
-                        let key = format!("key{:08}", i);
-                        let value = format!("value{:08}", i);
-                        db.put(&mut wtxn, &key, &value).unwrap();
-                        wtxn.commit().unwrap();
-                    }
-                    black_box(env)
-                })
-            },
-        );
+                for i in 0..count {
+                    let mut wtxn = env.write_txn().unwrap();
+                    let key = format!("key{:08}", i);
+                    let value = format!("value{:08}", i);
+                    db.put(&mut wtxn, &key, &value).unwrap();
+                    wtxn.commit().unwrap();
+                }
+                black_box(env)
+            })
+        });
 
         // RocksDB
-        group.bench_with_input(
-            BenchmarkId::new("rocksdb", count),
-            &count,
-            |b, &count| {
-                b.iter(|| {
-                    let dir = tempdir().unwrap();
-                    let db = RocksDB::open_default(dir.path()).unwrap();
+        group.bench_with_input(BenchmarkId::new("rocksdb", count), &count, |b, &count| {
+            b.iter(|| {
+                let dir = tempdir().unwrap();
+                let db = RocksDB::open_default(dir.path()).unwrap();
 
-                    for i in 0..count {
-                        let key = format!("key{:08}", i);
-                        let value = format!("value{:08}", i);
-                        db.put(key.as_bytes(), value.as_bytes()).unwrap();
-                    }
-                    black_box(db)
-                })
-            },
-        );
+                for i in 0..count {
+                    let key = format!("key{:08}", i);
+                    let value = format!("value{:08}", i);
+                    db.put(key.as_bytes(), value.as_bytes()).unwrap();
+                }
+                black_box(db)
+            })
+        });
     }
 
     group.finish();
@@ -160,52 +148,44 @@ fn bench_batch_writes(c: &mut Criterion) {
         group.throughput(Throughput::Elements(count as u64));
 
         // LMDB (heed) - batch in single transaction
-        group.bench_with_input(
-            BenchmarkId::new("lmdb_heed", count),
-            &count,
-            |b, &count| {
-                b.iter(|| {
-                    let dir = tempdir().unwrap();
-                    let env = unsafe {
-                        HeedEnvOptions::new()
-                            .map_size(100 * 1024 * 1024)
-                            .open(dir.path())
-                            .unwrap()
-                    };
-                    let mut wtxn = env.write_txn().unwrap();
-                    let db: HeedDatabase<Str, Str> = env.create_database(&mut wtxn, None).unwrap();
+        group.bench_with_input(BenchmarkId::new("lmdb_heed", count), &count, |b, &count| {
+            b.iter(|| {
+                let dir = tempdir().unwrap();
+                let env = unsafe {
+                    HeedEnvOptions::new()
+                        .map_size(100 * 1024 * 1024)
+                        .open(dir.path())
+                        .unwrap()
+                };
+                let mut wtxn = env.write_txn().unwrap();
+                let db: HeedDatabase<Str, Str> = env.create_database(&mut wtxn, None).unwrap();
 
-                    for i in 0..count {
-                        let key = format!("key{:08}", i);
-                        let value = format!("value{:08}", i);
-                        db.put(&mut wtxn, &key, &value).unwrap();
-                    }
-                    wtxn.commit().unwrap();
-                    black_box(env)
-                })
-            },
-        );
+                for i in 0..count {
+                    let key = format!("key{:08}", i);
+                    let value = format!("value{:08}", i);
+                    db.put(&mut wtxn, &key, &value).unwrap();
+                }
+                wtxn.commit().unwrap();
+                black_box(env)
+            })
+        });
 
         // RocksDB - batch write
-        group.bench_with_input(
-            BenchmarkId::new("rocksdb", count),
-            &count,
-            |b, &count| {
-                b.iter(|| {
-                    let dir = tempdir().unwrap();
-                    let db = RocksDB::open_default(dir.path()).unwrap();
-                    let mut batch = rocksdb::WriteBatch::default();
+        group.bench_with_input(BenchmarkId::new("rocksdb", count), &count, |b, &count| {
+            b.iter(|| {
+                let dir = tempdir().unwrap();
+                let db = RocksDB::open_default(dir.path()).unwrap();
+                let mut batch = rocksdb::WriteBatch::default();
 
-                    for i in 0..count {
-                        let key = format!("key{:08}", i);
-                        let value = format!("value{:08}", i);
-                        batch.put(key.as_bytes(), value.as_bytes());
-                    }
-                    db.write(batch).unwrap();
-                    black_box(db)
-                })
-            },
-        );
+                for i in 0..count {
+                    let key = format!("key{:08}", i);
+                    let value = format!("value{:08}", i);
+                    batch.put(key.as_bytes(), value.as_bytes());
+                }
+                db.write(batch).unwrap();
+                black_box(db)
+            })
+        });
     }
 
     group.finish();
@@ -484,12 +464,9 @@ fn bench_point_lookup(c: &mut Criterion) {
         group.bench_function("zerodb_btree_search", |b| {
             b.iter(|| {
                 let mut state = CursorState::new(root_pgno);
-                let result = CursorOps::search(
-                    &mut state,
-                    &lookup_key,
-                    page_size,
-                    |pgno| store.get(pgno),
-                ).unwrap();
+                let result =
+                    CursorOps::search(&mut state, &lookup_key, page_size, |pgno| store.get(pgno))
+                        .unwrap();
                 black_box(result)
             })
         });

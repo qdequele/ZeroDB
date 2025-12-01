@@ -5,8 +5,8 @@
 //! to the first overflow page.
 
 use super::{PageHeader, PageNo};
-use crate::error::{Error, Result};
 use crate::PAGE_HEADER_SIZE;
+use crate::error::{Error, Result};
 
 /// Overflow page header extension size (pages count).
 pub const OVERFLOW_HEADER_SIZE: usize = PAGE_HEADER_SIZE + 4;
@@ -47,7 +47,7 @@ impl OverflowPage {
         let pages = if data.is_empty() {
             1
         } else {
-            ((data.len() + usable_per_page - 1) / usable_per_page) as u32
+            data.len().div_ceil(usable_per_page) as u32
         };
 
         Self {
@@ -63,7 +63,7 @@ impl OverflowPage {
         if data_size == 0 {
             1
         } else {
-            ((data_size + usable_per_page - 1) / usable_per_page) as u32
+            data_size.div_ceil(usable_per_page) as u32
         }
     }
 
@@ -133,8 +133,7 @@ impl OverflowPage {
         }
 
         self.header.write_to(&mut data[0..PAGE_HEADER_SIZE])?;
-        data[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 4]
-            .copy_from_slice(&self.pages.to_le_bytes());
+        data[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 4].copy_from_slice(&self.pages.to_le_bytes());
 
         Ok(())
     }
@@ -174,6 +173,7 @@ const INDEX_SIZE: usize = 2;
 pub const NODE_HEADER_SIZE: usize = 8;
 
 /// Size of overflow page number stored in leaf node.
+#[allow(dead_code)]
 pub const OVERFLOW_PGNO_SIZE: usize = 8;
 
 /// Calculates the maximum node size for a given page size.

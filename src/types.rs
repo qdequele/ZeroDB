@@ -8,7 +8,7 @@ use std::marker::PhantomData;
 use crate::error::{Error, Result};
 
 // Re-export byteorder for Heed compatibility
-pub use byteorder::{BigEndian, LittleEndian, NativeEndian, ByteOrder, BE, LE};
+pub use byteorder::{BE, BigEndian, ByteOrder, LE, LittleEndian, NativeEndian};
 
 /// Alias for NativeEndian
 pub type NE = NativeEndian;
@@ -235,8 +235,7 @@ impl<'a> BytesDecode<'a> for U64 {
             return Err(Error::Corrupted);
         }
         Ok(u64::from_ne_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]))
     }
 }
@@ -249,8 +248,7 @@ impl OwnedDecode for U64 {
             return Err(Error::Corrupted);
         }
         Ok(u64::from_ne_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]))
     }
 }
@@ -307,8 +305,7 @@ impl<'a> BytesDecode<'a> for I64 {
             return Err(Error::Corrupted);
         }
         Ok(i64::from_ne_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]))
     }
 }
@@ -321,8 +318,7 @@ impl OwnedDecode for I64 {
             return Err(Error::Corrupted);
         }
         Ok(i64::from_ne_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]))
     }
 }
@@ -727,8 +723,8 @@ mod tests {
         let _encoded = DecodeIgnore::bytes_encode(&()).unwrap();
         // DecodeIgnore decodes anything to ()
         let data = b"some arbitrary data";
-        let decoded = DecodeIgnore::bytes_decode(data).unwrap();
-        assert_eq!(decoded, ());
+        // Just verify it doesn't panic - it always returns ()
+        DecodeIgnore::bytes_decode(data).unwrap();
     }
 
     #[test]

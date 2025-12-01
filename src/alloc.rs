@@ -226,13 +226,12 @@ impl PageAllocator {
 
         for (&txnid, pages) in &self.freelist {
             // Only consider pages from transactions older than min_reader_txnid
-            if txnid <= self.min_reader_txnid {
-                if let Some(&first_pgno) = pages.first() {
-                    if best_pgno.is_none() || first_pgno < best_pgno.unwrap() {
-                        best_pgno = Some(first_pgno);
-                        best_txnid = Some(txnid);
-                    }
-                }
+            if txnid <= self.min_reader_txnid
+                && let Some(&first_pgno) = pages.first()
+                && (best_pgno.is_none() || first_pgno < best_pgno.unwrap())
+            {
+                best_pgno = Some(first_pgno);
+                best_txnid = Some(txnid);
             }
         }
 
