@@ -164,20 +164,48 @@ impl OverflowPage {
     }
 }
 
-/// Determines if a value should be stored as overflow based on key and value sizes.
+/// Minimum number of keys per page (LMDB's MDB_MINKEYS).
+const MIN_KEYS: usize = 2;
+
+/// Size of index pointer in leaf page.
+const INDEX_SIZE: usize = 2;
+
+/// Size of the node header in bytes.
+pub const NODE_HEADER_SIZE: usize = 8;
+
+/// Size of overflow page number stored in leaf node.
+pub const OVERFLOW_PGNO_SIZE: usize = 8;
+
+/// Calculates the maximum node size for a given page size.
 ///
-/// LMDB uses approximately 1/4 of page size as the threshold.
-pub fn should_use_overflow(key_size: usize, value_size: usize, page_size: usize) -> bool {
-    // Node header (8 bytes) + key + value must fit in less than 1/4 of the page
-    // to leave room for other entries and page header
-    let node_size = 8 + key_size + value_size;
-    let threshold = (page_size - PAGE_HEADER_SIZE) / 4;
-    node_size > threshold
+/// This matches LMDB's me_nodemax calculation:
+/// `(page_size - PAGEHDRSZ) / MDB_MINKEYS - sizeof(indx_t)`
+///
+/// For a 4096 byte page: (4096 - 16) / 2 - 2 = 2038 bytes
+pub fn node_max(page_size: usize) -> usize {
+    (page_size - PAGE_HEADER_SIZE) / MIN_KEYS - INDEX_SIZE
 }
 
-/// Calculates the threshold size for values that go to overflow.
-pub fn overflow_threshold(page_size: usize) -> usize {
-    (page_size - PAGE_HEADER_SIZE) / 4 - 8 // subtract node header
+/// Determines if a value should be stored as overflow based on key and value sizes.
+///
+/// LMDB checks: node_header + key_size + value_size > nodemax
+pub fn should_use_overflow(key_size: usize, value_size: usize, page_size: usize) -> bool {
+    let node_size = NODE_HEADER_SIZE + key_size + value_size;
+    node_size > node_max(page_size)
+}
+
+/// Calculates the threshold size for values that go to overflow for a given key size.
+pub fn overflow_threshold(key_size: usize, page_size: usize) -> usize {
+    let nodemax = node_max(page_size);
+    nodemax.saturating_sub(NODE_HEADER_SIZE + key_size)
+}
+
+/// Calculates the number of overflow pages needed using LMDB's OVPAGES formula.
+///
+/// LMDB's OVPAGES: ((PAGEHDRSZ-1 + size) / page_size + 1)
+/// This accounts for the header and ensures at least 1 page.
+pub fn overflow_pages(data_size: usize, page_size: usize) -> u32 {
+    ((PAGE_HEADER_SIZE - 1 + data_size) / page_size + 1) as u32
 }
 
 #[cfg(test)]
@@ -229,20 +257,45 @@ mod tests {
     #[test]
     fn should_use_overflow_check() {
         let page_size = 4096;
-        let threshold = overflow_threshold(page_size);
+        let key_size = 10;
+        let threshold = overflow_threshold(key_size, page_size);
 
         // Small values should not use overflow
-        assert!(!should_use_overflow(10, 100, page_size));
+        assert!(!should_use_overflow(key_size, 100, page_size));
 
         // Large values should use overflow
-        assert!(should_use_overflow(10, threshold + 100, page_size));
+        assert!(should_use_overflow(key_size, threshold + 100, page_size));
     }
 
     #[test]
     fn overflow_threshold_value() {
+        // For 4096 byte pages with 10-byte key:
+        // nodemax = (4096 - 16) / 2 - 2 = 2038
+        // threshold = 2038 - 8 - 10 = 2020
+        let threshold = overflow_threshold(10, 4096);
+        assert_eq!(threshold, 2020);
+    }
+
+    #[test]
+    fn node_max_value() {
         // For 4096 byte pages:
-        // threshold = (4096 - 16) / 4 - 8 = 1020 - 8 = 1012
-        let threshold = overflow_threshold(4096);
-        assert_eq!(threshold, 1012);
+        // nodemax = (4096 - 16) / 2 - 2 = 2038
+        assert_eq!(node_max(4096), 2038);
+    }
+
+    #[test]
+    fn overflow_pages_calculation() {
+        let page_size = 4096;
+
+        // Small data fits in 1 page
+        assert_eq!(overflow_pages(100, page_size), 1);
+        assert_eq!(overflow_pages(4000, page_size), 1);
+
+        // Data slightly over page size needs 2 pages
+        assert_eq!(overflow_pages(4096, page_size), 2);
+        assert_eq!(overflow_pages(8000, page_size), 2);
+
+        // Very large data: ((16-1 + 1048576) / 4096 + 1) = 257
+        assert_eq!(overflow_pages(1024 * 1024, page_size), 257); // ~1MB
     }
 }

@@ -10,7 +10,10 @@ mod overflow;
 pub use header::{PageFlags, PageHeader, PAGE_HEADER_SIZE};
 pub use meta::{DbInfo, MetaPage, DB_INFO_SIZE};
 pub use node::{NodeFlags, LeafNode, BranchNode};
-pub use overflow::OverflowPage;
+pub use overflow::{
+    OverflowPage, OVERFLOW_HEADER_SIZE,
+    node_max, should_use_overflow, overflow_threshold, overflow_pages,
+};
 
 /// Page number type (64-bit for large databases).
 pub type PageNo = u64;

@@ -11,7 +11,7 @@ use crate::btree::{insert_into_branch, insert_into_leaf};
 use crate::env::{Env, DefaultComparator};
 use crate::error::{Error, Result};
 use crate::flags::DatabaseFlags;
-use crate::page::{DbInfo, PageNo};
+use crate::page::{DbInfo, PageNo, PageHeader, should_use_overflow, overflow_pages, OVERFLOW_HEADER_SIZE};
 use crate::types::{BytesEncode, OwnedDecode};
 use crate::txn::{RoTxn, RwTxn, WithTls, TlsUsage};
 
@@ -360,9 +360,22 @@ impl<KC, DC> Database<KC, DC> {
             SearchResult::Found(_) => {
                 if let Some(pgno) = state.leaf_pgno() {
                     let page_data = get_page(pgno)?;
-                    if let Some((_, value)) = CursorOps::get_current(&state, &page_data, page_size)? {
-                        // Copy value to owned bytes for decoding
-                        return Ok(Some(DC::decode_owned(value)?));
+                    let page = LeafPage::new(&page_data, page_size)?;
+
+                    if let Some(idx) = state.leaf_index() {
+                        let node = page.node(idx)?;
+
+                        // Check if this is an overflow node
+                        let value_bytes = if node.is_overflow() {
+                            // Read value from overflow pages
+                            let overflow_pgno = node.overflow_pgno().ok_or(Error::Corrupted)?;
+                            Self::read_overflow_pages(txn, overflow_pgno)?
+                        } else {
+                            // Inline value
+                            node.value().to_vec()
+                        };
+
+                        return Ok(Some(DC::decode_owned(&value_bytes)?));
                     }
                 }
                 Ok(None)
@@ -394,9 +407,21 @@ impl<KC, DC> Database<KC, DC> {
 
         if let Some(pgno) = state.leaf_pgno() {
             let page_data = get_page(pgno)?;
-            if let Some((key, value)) = CursorOps::get_current(&state, &page_data, page_size)? {
-                let key = KC::decode_owned(key)?;
-                let value = DC::decode_owned(value)?;
+            let page = LeafPage::new(&page_data, page_size)?;
+
+            if let Some(idx) = state.leaf_index() {
+                let node = page.node(idx)?;
+                let key = KC::decode_owned(node.key())?;
+
+                // Check if this is an overflow node
+                let value_bytes = if node.is_overflow() {
+                    let overflow_pgno = node.overflow_pgno().ok_or(Error::Corrupted)?;
+                    Self::read_overflow_pages(txn, overflow_pgno)?
+                } else {
+                    node.value().to_vec()
+                };
+
+                let value = DC::decode_owned(&value_bytes)?;
                 return Ok(Some((key, value)));
             }
         }
@@ -427,9 +452,21 @@ impl<KC, DC> Database<KC, DC> {
 
         if let Some(pgno) = state.leaf_pgno() {
             let page_data = get_page(pgno)?;
-            if let Some((key, value)) = CursorOps::get_current(&state, &page_data, page_size)? {
-                let key = KC::decode_owned(key)?;
-                let value = DC::decode_owned(value)?;
+            let page = LeafPage::new(&page_data, page_size)?;
+
+            if let Some(idx) = state.leaf_index() {
+                let node = page.node(idx)?;
+                let key = KC::decode_owned(node.key())?;
+
+                // Check if this is an overflow node
+                let value_bytes = if node.is_overflow() {
+                    let overflow_pgno = node.overflow_pgno().ok_or(Error::Corrupted)?;
+                    Self::read_overflow_pages(txn, overflow_pgno)?
+                } else {
+                    node.value().to_vec()
+                };
+
+                let value = DC::decode_owned(&value_bytes)?;
                 return Ok(Some((key, value)));
             }
         }
@@ -471,10 +508,19 @@ impl<KC, DC> Database<KC, DC> {
         // Check if tree is empty (root == 0 for legacy, or PageNo::MAX for P_INVALID)
         if db_info.root == 0 || db_info.root == PageNo::MAX {
             // Empty tree - create root leaf
-            let (pgno, data) = txn.alloc_page()?;
+            // Check if value needs overflow pages and allocate them first
+            let node = if should_use_overflow(key_bytes.len(), value_bytes.len(), page_size) {
+                let overflow_pgno = self.write_overflow_pages(txn, &value_bytes, &mut db_info)?;
+                Node::leaf_overflow(key_bytes.to_vec(), overflow_pgno)
+            } else {
+                Node::leaf(key_bytes.to_vec(), value_bytes.to_vec())
+            };
+
+            // Now allocate the leaf page
+            let (pgno, page_data) = txn.alloc_page()?;
             let mut builder = PageBuilder::new_leaf(pgno, page_size);
-            builder.add_leaf(&Node::leaf(key_bytes.to_vec(), value_bytes.to_vec()))?;
-            data.copy_from_slice(&builder.finish());
+            builder.add_leaf(&node)?;
+            page_data.copy_from_slice(&builder.finish());
 
             db_info.root = pgno;
             db_info.entries += 1;
@@ -516,7 +562,14 @@ impl<KC, DC> Database<KC, DC> {
         let leaf_data = txn.page_mut(leaf_pgno)?;
         let leaf_data_copy = leaf_data.to_vec();
 
-        let new_node = Node::leaf(key.to_vec(), value.to_vec());
+        // Check if value needs overflow pages
+        let new_node = if should_use_overflow(key.len(), value.len(), page_size) {
+            // Allocate overflow pages and write the value
+            let overflow_pgno = self.write_overflow_pages(txn, value, db_info)?;
+            Node::leaf_overflow(key.to_vec(), overflow_pgno)
+        } else {
+            Node::leaf(key.to_vec(), value.to_vec())
+        };
 
         let (new_leaf_data, split) = if is_update {
             self.insert_at_leaf_update(&leaf_data_copy, new_node, insert_index, leaf_pgno, page_size)?
@@ -562,10 +615,19 @@ impl<KC, DC> Database<KC, DC> {
                 nodes.push(new_node.clone());
             } else {
                 let node_ref = page.node(i)?;
-                nodes.push(Node::leaf(
-                    node_ref.key().to_vec(),
-                    node_ref.value().to_vec(),
-                ));
+                // Preserve overflow nodes properly
+                if node_ref.is_overflow() {
+                    let overflow_pgno = node_ref.overflow_pgno().ok_or(Error::Corrupted)?;
+                    nodes.push(Node::leaf_overflow(
+                        node_ref.key().to_vec(),
+                        overflow_pgno,
+                    ));
+                } else {
+                    nodes.push(Node::leaf(
+                        node_ref.key().to_vec(),
+                        node_ref.value().to_vec(),
+                    ));
+                }
             }
         }
 
@@ -676,6 +738,116 @@ impl<KC, DC> Database<KC, DC> {
         db_info.branch_pages += 1;
 
         Ok(())
+    }
+
+    /// Writes value data to overflow pages.
+    ///
+    /// Allocates the required number of contiguous overflow pages,
+    /// writes the value data, and returns the starting page number.
+    fn write_overflow_pages(
+        &self,
+        txn: &mut RwTxn<'_>,
+        value: &[u8],
+        db_info: &mut DbInfo,
+    ) -> Result<PageNo> {
+        let page_size = txn.env().page_size();
+        let num_pages = overflow_pages(value.len(), page_size);
+
+        // Allocate contiguous pages
+        let start_pgno = txn.alloc_pages(num_pages)?;
+
+        // Write the overflow page header and data
+        // Layout: [PageHeader (16 bytes)] [pages count (4 bytes)] [data size (4 bytes)] [data...]
+        let first_page = txn.page_mut(start_pgno)?;
+
+        // Create overflow page header
+        let header = PageHeader::new_overflow(start_pgno);
+        header.write_to(&mut first_page[..16])?;
+
+        // Write number of pages
+        first_page[16..20].copy_from_slice(&num_pages.to_le_bytes());
+
+        // Write data size (stored after page count for reading)
+        first_page[20..24].copy_from_slice(&(value.len() as u32).to_le_bytes());
+
+        // Write the data starting after the header (24 bytes)
+        let data_start = OVERFLOW_HEADER_SIZE + 4; // +4 for data size field
+        let first_page_data_capacity = page_size - data_start;
+
+        if value.len() <= first_page_data_capacity {
+            // All data fits in first page
+            first_page[data_start..data_start + value.len()].copy_from_slice(value);
+        } else {
+            // Write first chunk
+            first_page[data_start..].copy_from_slice(&value[..first_page_data_capacity]);
+
+            // Write remaining data to subsequent pages
+            let mut written = first_page_data_capacity;
+            for i in 1..num_pages {
+                let pgno = start_pgno + i as PageNo;
+                let page = txn.page_mut(pgno)?;
+                let remaining = value.len() - written;
+                let to_write = remaining.min(page_size);
+                page[..to_write].copy_from_slice(&value[written..written + to_write]);
+                written += to_write;
+            }
+        }
+
+        db_info.overflow_pages += num_pages as u64;
+
+        Ok(start_pgno)
+    }
+
+    /// Reads value data from overflow pages.
+    ///
+    /// Returns the value data stored in the overflow pages starting at the given page number.
+    fn read_overflow_pages(txn: &RoTxn<'_>, overflow_pgno: PageNo) -> Result<Vec<u8>> {
+        let page_size = txn.env().page_size();
+
+        // Read the first overflow page
+        let first_page = txn.page(overflow_pgno)?;
+
+        // Verify it's an overflow page
+        let header = PageHeader::read_from(&first_page[..16])?;
+        if !header.flags.is_overflow() {
+            return Err(Error::Corrupted);
+        }
+
+        // Read number of pages
+        let num_pages = u32::from_le_bytes([
+            first_page[16], first_page[17], first_page[18], first_page[19]
+        ]);
+
+        // Read data size
+        let data_size = u32::from_le_bytes([
+            first_page[20], first_page[21], first_page[22], first_page[23]
+        ]) as usize;
+
+        let data_start = OVERFLOW_HEADER_SIZE + 4; // +4 for data size field
+        let first_page_data_capacity = page_size - data_start;
+
+        let mut result = Vec::with_capacity(data_size);
+
+        if data_size <= first_page_data_capacity {
+            // All data in first page
+            result.extend_from_slice(&first_page[data_start..data_start + data_size]);
+        } else {
+            // Read first chunk
+            result.extend_from_slice(&first_page[data_start..]);
+
+            // Read remaining pages
+            let mut read = first_page_data_capacity;
+            for i in 1..num_pages {
+                let pgno = overflow_pgno + i as PageNo;
+                let page = txn.page(pgno)?;
+                let remaining = data_size - read;
+                let to_read = remaining.min(page_size);
+                result.extend_from_slice(&page[..to_read]);
+                read += to_read;
+            }
+        }
+
+        Ok(result)
     }
 
     /// Deletes the entry with the given key.

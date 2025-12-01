@@ -64,10 +64,22 @@ pub fn insert_into_leaf(
             nodes.push(new_node.clone());
         }
         let node_ref = page.node(i)?;
-        nodes.push(Node::leaf(
-            node_ref.key().to_vec(),
-            node_ref.value().to_vec(),
-        ));
+        // Preserve overflow nodes properly
+        if node_ref.is_overflow() {
+            if let Some(overflow_pgno) = node_ref.overflow_pgno() {
+                nodes.push(Node::leaf_overflow(
+                    node_ref.key().to_vec(),
+                    overflow_pgno,
+                ));
+            } else {
+                return Err(crate::error::Error::Corrupted);
+            }
+        } else {
+            nodes.push(Node::leaf(
+                node_ref.key().to_vec(),
+                node_ref.value().to_vec(),
+            ));
+        }
     }
 
     // Handle insert at end
