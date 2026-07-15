@@ -1,0 +1,20 @@
+{
+  "model": "claude-opus-4-8",
+  "permissions": {
+    "allow": [
+      "Bash(cargo *)",
+      "Bash(just *)",
+      "Bash(git status)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(rustup *)"
+    ],
+    "deny": [
+      "Bash(git push *)",
+      "Bash(rm -rf *)",
+      "Read(.env*)"
+    ]
+  }
+}
