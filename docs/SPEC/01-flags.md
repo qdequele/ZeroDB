@@ -157,6 +157,8 @@ heed user-facing method in the SPEC 00 surface.
 
 ### §S1 — `MDB_APPEND`: last-key compare, not full-order validation
 
+> Confirmed empirically via oracle self-test 2026-07-15 (`tests/flag_semantics.rs`: append tests — out-of-order and equal-to-last both `KeyExist`, empty-db append ok).
+
 `_mdb_cursor_put` with `MDB_APPEND` does **not** perform a normal tree search.
 It calls `mdb_cursor_last`, then `md_cmp(new_key, last_key)`:
 
@@ -180,6 +182,8 @@ The heed → error path is `MDB_KEYEXIST` → `MdbError::KeyExist` → (arroy)
 `Error::InvalidItemAppend`.
 
 ### §S2 — `MDB_NOOVERWRITE`: the returned-existing-value contract
+
+> Confirmed empirically via oracle self-test 2026-07-15 (`tests/flag_semantics.rs`: NOOVERWRITE collision returns the existing value).
 
 When the key exists, LMDB does **not** just return an error — it first writes the
 existing value back into the caller's `MDB_val *data` (`*data = d2;`) and *then*
@@ -223,11 +227,44 @@ returns `KeyExist` without exposing the existing bytes is a divergence.
   non-DUPSORT DB. milli separately synthesizes `BadValSize` for empty or
   `> u16::MAX` keys (SPEC 00 row 57); zerodb must at minimum enforce the
   empty-key rejection and a documented max-key bound, and report the same
-  `BadValSize`. **Divergence candidate:** the real LMDB max key is 511, but milli
-  assumes `NonZeroU16` (up to 65535) — worth an oracle test to confirm which
-  bound is actually observable through heed before Phase 1 fixes a number.
+  `BadValSize`.
+
+**Confirmed via oracle self-test 2026-07-15** (`zerodb-oracle`
+`tests/key_bounds.rs`: `max_key_size_is_511_and_map_size_independent`,
+`key_size_511_boundary_and_empty_key_rejection`), observed directly against the
+fork through heed 0.22.1 on macOS aarch64:
+
+| Probe | Observed result |
+|-------|-----------------|
+| `Env::max_key_size()` | **511**, identical for map_size 1 MiB and 64 MiB |
+| key len **0** (empty) | `Err(heed::Error::Mdb(MdbError::BadValSize))` |
+| key len 1 / 255 / 510 / **511** | `Ok(())` |
+| key len **512** / 513 / 1024 / 65535 | `Err(heed::Error::Mdb(MdbError::BadValSize))` |
+
+So the observable max key **is exactly 511 bytes** (511 accepted, 512 rejected),
+the bound is **constant across map sizes**, and an **empty key is rejected** —
+all with the **`BadValSize`** variant, matching the header analysis above.
+
+Two caveats on scope:
+- heed 0.22 exposes no page-size selector, and in this fork build
+  `MDB_MAXKEYSIZE` is the compile-time constant 511, so page-size *variation*
+  is not reachable through the frozen surface; map-size invariance (tested at
+  two sizes) plus the constant `max_key_size()` is the strongest statement
+  observable here. The `longer-keys` heed feature (which would raise the bound)
+  is **not** enabled by Meilisearch and not by this oracle.
+- The milli-vs-LMDB discrepancy is **real and remains**: milli assumes
+  `NonZeroU16` (empty rejected, up to 65535 accepted) and synthesizes its own
+  `BadValSize` for empty / `> u16::MAX` keys, but LMDB itself rejects everything
+  `> 511`. For keys in `512..=65535` milli's type-level assumption says "valid"
+  while LMDB returns `BadValSize`. Phase 1 zerodb **replicates LMDB exactly: max
+  key = 511, empty rejected, `BadValSize` otherwise** — so zerodb does **not**
+  diverge from the oracle here (no `docs/DIVERGENCES.md` entry needed). Whether
+  to expose a larger key bound as an opt-in is a Phase 3 question, not a Phase 1
+  parity gap.
 
 ### §S5 — `MDB_PREVSNAPSHOT` open protocol
+
+> Confirmed empirically via oracle self-test 2026-07-15 (`tests/flag_semantics.rs`: PREV_SNAPSHOT opens older meta; flag auto-clears after first commit).
 
 - Meta selection: `mdb_env_pick_meta` returns
   `metas[(metas[0]->mm_txnid < metas[1]->mm_txnid) ^ (flags & PREVSNAPSHOT)]`.

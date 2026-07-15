@@ -4,3 +4,15 @@ version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+[dependencies]
+# The oracle is the ONLY crate permitted to link C LMDB (CLAUDE.md unsafe policy).
+# heed 0.22.1 vendors lmdb-master-sys 0.2.6 = the Meilisearch LMDB fork
+# (mdb.master.nested-rtxns @ cd767228). Exact pin — see ADR-0001. This crate,
+# and only this crate, may depend on heed / any LMDB sys crate in Phases 0–1.
+heed = "=0.22.1"
+thiserror.workspace = true
+arbitrary.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true

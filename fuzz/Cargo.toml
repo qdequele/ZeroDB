@@ -1,0 +1,29 @@
+[package]
+name = "zerodb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+
+# The fuzz crate is intentionally NOT a member of the root workspace: cargo-fuzz
+# builds it with nightly + sanitizer flags that must not perturb the workspace.
+# An empty `[workspace]` table makes this its own workspace root.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zerodb-oracle = { path = "../crates/zerodb-oracle" }
+
+[[bin]]
+name = "diff_ops"
+path = "fuzz_targets/diff_ops.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

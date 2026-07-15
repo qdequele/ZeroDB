@@ -1,4 +1,5 @@
 /target
+fuzz/target
 fuzz/corpus
 fuzz/artifacts
 benches/results/*.tmp
