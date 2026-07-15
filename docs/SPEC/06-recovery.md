@@ -112,7 +112,7 @@ this section defines the **recovery decision** and its error taxonomy.
   guaranteed only against cleanly-committed history, and MUST NOT claim
   crash-proof rollback. The **exact guard** — e.g. refusing PREV_SNAPSHOT unless
   the older meta's referenced pages verify intact, or requiring both slots
-  cleanly valid — is a **human decision pending** (an ADR seam), not fixed here.
+  cleanly valid — was **ratified 2026-07-16 (Quentin, chat): Phase 1 ships the warning only, no verification guard**; a stronger guard remains an ADR seam for Phase 3.
   This rule deliberately **does not overclaim**: Phase 1 provides best-effort
   single-step rollback with an honest warning, not a guaranteed crash-consistent
   rollback.
