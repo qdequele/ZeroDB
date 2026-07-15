@@ -637,10 +637,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zerodb-core"
+version = "0.0.1"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "zerodb-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
+ "zerodb-core",
  "zerodb-oracle",
 ]
 

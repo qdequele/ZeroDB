@@ -882,6 +882,10 @@ version = "0.0.1"
 [[package]]
 name = "zerodb-core"
 version = "0.0.1"
+dependencies = [
+ "proptest",
+ "thiserror",
+]
 
 [[package]]
 name = "zerodb-io"

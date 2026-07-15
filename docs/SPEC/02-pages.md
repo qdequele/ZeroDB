@@ -231,6 +231,11 @@ Selection among the *CRC-valid* slots:
 - `PREV_SNAPSHOT` (SPEC 01 §S5, SPEC 00 row 9): pick the **lower-txnid** valid
   slot instead — milli's `Index::rollback`. Formally the selected index is
   `(txnid[0] < txnid[1]) XOR prev_snapshot`, restricted to CRC-valid slots.
+- **Exactly one valid slot + `PREV_SNAPSHOT`**: this layer reports the single
+  valid slot as a typed one-valid outcome regardless of the flag; the **env
+  layer** (M1.2) maps that combination to `MdbError::Invalid` per SPEC 06
+  REC-2† (ratified 2026-07-16) — there are not two committed snapshots to
+  identify an older from.
 
 ### §3.3 — CRC32C coverage (exact byte range)
 
