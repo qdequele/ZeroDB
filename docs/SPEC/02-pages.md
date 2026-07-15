@@ -13,5 +13,6 @@ Must define, with byte-level layouts and worked examples:
   reserved checksum field (data-page checksums are Phase 3.9; only the meta
   CRC is mandatory in Phase 1).
 - Branch, leaf, overflow, GC page layouts; node encodings; max key size rule.
-- DUPSORT sub-page and sub-tree encodings (align with SPEC 03).
+- DUPSORT sub-page and sub-tree encodings (align with SPEC 03) — format
+  reserved in Phase 1, implemented in Phase 2.8 (D-004: no consumer uses it).
 - Endianness (little only), alignment guarantees, page sizes 4K–64K.

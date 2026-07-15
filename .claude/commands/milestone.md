@@ -11,7 +11,7 @@ Execute milestone $ARGUMENTS from PLAN.md.
    `cargo test --workspace` green. If not, STOP and report.
 4. If the milestone is 0.5: it is ADR-only — draft the heed-integration ADR
    (see /adr) and STOP for human approval; implement nothing.
-   If the milestone is 1.4, 1.5, 1.7, 1.8, 1.11, or any 3.x touching GC/commit/
+   If the milestone is 1.4, 1.5, 1.8, 1.9, 1.11, or any 3.x touching GC/commit/
    readers: delegate implementation to the critical-implementer agent (ADR
    first). Otherwise delegate to the implementer agent.
 5. Delegate test coverage to the test-writer agent.

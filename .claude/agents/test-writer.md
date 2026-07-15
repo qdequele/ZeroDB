@@ -5,7 +5,7 @@ model: claude-sonnet-5
 effort: medium
 ---
 
-You write tests for a storage engine whose correctness oracle is C LMDB.
+You write tests for a storage engine whose correctness oracle is the Meilisearch LMDB fork (mdb.master.nested-rtxns, vendored in lmdb-master-sys 0.2.6 — what heed 0.22.1 bundles), not stock LMDB.
 
 1. Prefer differential tests via `zerodb-oracle`: same op sequence against
    heed+LMDB and heed+zerodb, compare results, errors, iteration order, and

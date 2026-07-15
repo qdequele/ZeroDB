@@ -11,8 +11,11 @@ Consumers: Meilisearch (milli) and hannoy (HNSW vector index).
 
 ## Non-negotiable rules
 
-1. **The oracle is C LMDB.** Never guess LMDB semantics — write a differential
-   test in `crates/zerodb-oracle` and observe. Surprising LMDB behavior is
+1. **The oracle is the Meilisearch LMDB fork** (`mdb.master.nested-rtxns`, as
+   vendored in `lmdb-master-sys 0.2.6` / heed 0.22.1 — what Meilisearch
+   actually runs; NOT stock LMDB, which lacks nested read txns). Never guess
+   LMDB semantics — write a differential test in `crates/zerodb-oracle` and
+   observe. Surprising LMDB behavior is
    replicated in Phase 1 and logged in `docs/DIVERGENCES.md` as a Phase 3
    candidate. NEVER change oracle expectations to make zerodb pass; divergences
    are zerodb bugs unless a maintainer signs off in DIVERGENCES.md.
@@ -29,7 +32,7 @@ Consumers: Meilisearch (milli) and hannoy (HNSW vector index).
    session by running the checks below and reporting results verbatim.
 6. **ADRs for significant decisions** (`docs/adr/`, template `0000-template.md`):
    any on-disk format choice, concurrency protocol, fsync ordering, public API
-   shape. For milestones 0.5, 1.4, 1.5, 1.7, 1.8, 1.11 and all of Phase 3:
+   shape. For milestones 0.5, 1.4, 1.5, 1.8, 1.9, 1.11 and all of Phase 3:
    write the ADR first, get human approval, then implement. Milestone 0.5
    (heed integration strategy) is ADR-only — nothing is implemented until a
    human approves it.
@@ -78,8 +81,9 @@ Performance claims require a `cargo bench` criterion diff pasted in the summary.
 ## Agents
 
 Use the subagents in `.claude/agents/`:
-- `critical-implementer` (Fable 5, high effort) — milestones 1.4, 1.5, 1.7, 1.8,
-  1.11, 3.1 and anything touching commit ordering, GC, or the reader table.
+- `critical-implementer` (Fable 5, high effort) — milestones 1.4, 1.5, 1.8,
+  1.9, 1.11, 3.1 and anything touching commit ordering, GC, the reader table,
+  or nested read txns.
 - `implementer` (Opus 4.8) — all other implementation milestones.
 - `test-writer` (Sonnet 5) — oracle tests, proptests, fuzz targets, bench code.
 - `spec-reviewer` (Fable 5) — adversarial PR review against SPEC; run it on

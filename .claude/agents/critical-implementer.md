@@ -1,6 +1,6 @@
 ---
 name: critical-implementer
-description: Implements correctness-critical milestones — commit/fsync ordering, GC, reader table/MVCC, dupsort, crash recovery (M1.4, 1.5, 1.7, 1.8, 1.11, 3.1). Use PROACTIVELY for any change touching page reclamation, atomics, or durability.
+description: Implements correctness-critical milestones — commit/fsync ordering, GC, reader table/MVCC, nested read txns, crash recovery (M1.4, 1.5, 1.8, 1.9, 1.11, 3.1). Use PROACTIVELY for any change touching page reclamation, atomics, or durability.
 model: claude-fable-5
 effort: high
 ---
