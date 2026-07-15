@@ -31,7 +31,7 @@
 //!   again outside the `Op`/`Engine` seam.
 
 use heed::types::Bytes;
-use heed::{Database, EnvFlags, EnvOpenOptions};
+use heed::{Database, EnvFlags, EnvOpenOptions, PutFlags};
 use zerodb_oracle::tempdir::TempDir;
 use zerodb_oracle::{DbName, Engine, LmdbEngine, Op, OpResult, OracleError, PutFlag};
 
@@ -228,6 +228,112 @@ fn flag_no_overwrite_errors_and_does_not_modify() {
         "NO_OVERWRITE on an existing key must not modify the stored value"
     );
     assert_eq!(e.apply(&Op::Commit), OpResult::Ok);
+}
+
+// ---------------------------------------------------------------------
+// §S1 / SPEC 03 §7 — cursor put_current_with_options(APPEND): the write-cursor
+// APPEND path (milli facet bulk). heed's `put_current_with_options` passes the
+// caller's `PutFlags` straight to `mdb_cursor_put` (verified: cursor.rs
+// `put_current_with_flags` -> `flags.bits()`), with NO forced MDB_CURRENT. So
+// APPEND here behaves exactly like a plain `MDB_APPEND` put: mdb_cursor_put runs
+// its own `mdb_cursor_last` + last-key compare, IGNORING where the iterator is
+// currently positioned. These tests pin that observed behavior; SPEC 03 §7 is
+// annotated "confirmed via oracle self-test 2026-07-15".
+//
+// NOT reachable through the Op/Engine model (no write-cursor op in op.rs);
+// driven directly via heed like the §S2/§S5 tests.
+// ---------------------------------------------------------------------
+
+/// APPEND through a write cursor positioned at the FIRST (non-last) entry, with
+/// a key strictly greater than the current last key, SUCCEEDS — proving the
+/// cursor position is irrelevant to MDB_APPEND (it compares against the DB's
+/// last key, not the cursor's entry).
+#[test]
+fn cursor_put_current_append_ignores_position_when_greater() {
+    let dir = TempDir::new().unwrap();
+    let env = open_raw(dir.path());
+    let mut wtxn = env.write_txn().unwrap();
+    let db: Database<Bytes, Bytes> = env.create_database(&mut wtxn, None).unwrap();
+    for (kk, vv) in [
+        (b"a".as_slice(), b"1".as_slice()),
+        (b"b", b"2"),
+        (b"c", b"3"),
+    ] {
+        db.put(&mut wtxn, kk, vv).unwrap();
+    }
+
+    let mut it = db.iter_mut(&mut wtxn).unwrap();
+    {
+        // Position at the FIRST entry ("a"), which is NOT the last key.
+        let first = it.next().unwrap().unwrap();
+        assert_eq!(first.0, b"a".as_slice(), "cursor sits at first entry");
+    }
+    // Append "z" (> last key "c") while the cursor is at "a": must succeed.
+    // SAFETY: no cursor-borrowed value is held across this call (the `first`
+    // borrow above is dropped); owned literals are passed.
+    let res =
+        unsafe { it.put_current_with_options::<Bytes>(PutFlags::APPEND, b"z".as_slice(), b"Z") };
+    assert!(
+        res.is_ok(),
+        "cursor-APPEND of a key > last must succeed regardless of cursor position, got {res:?}"
+    );
+    drop(it);
+
+    assert_eq!(
+        db.get(&wtxn, b"z".as_slice()).unwrap(),
+        Some(b"Z".as_slice()),
+        "the appended key must be present"
+    );
+    wtxn.commit().unwrap();
+}
+
+/// APPEND through a write cursor with a key that is NOT strictly greater than
+/// the current last key errors `KeyExist`, even when the cursor is parked at
+/// the last entry — the last-key compare rejects `new <= last` (SPEC 01 §S1),
+/// and the cursor position does not exempt it.
+#[test]
+fn cursor_put_current_append_not_greater_is_keyexist() {
+    let dir = TempDir::new().unwrap();
+    let env = open_raw(dir.path());
+    let mut wtxn = env.write_txn().unwrap();
+    let db: Database<Bytes, Bytes> = env.create_database(&mut wtxn, None).unwrap();
+    for (kk, vv) in [(b"a".as_slice(), b"1".as_slice()), (b"b", b"2")] {
+        db.put(&mut wtxn, kk, vv).unwrap();
+    }
+
+    let mut it = db.iter_mut(&mut wtxn).unwrap();
+    {
+        // Walk to the LAST entry ("b").
+        let a = it.next().unwrap().unwrap();
+        assert_eq!(a.0, b"a".as_slice());
+        let b = it.next().unwrap().unwrap();
+        assert_eq!(b.0, b"b".as_slice(), "cursor now at last entry");
+    }
+    // Append "a" (< last "b"): out-of-order -> KeyExist even at the last entry.
+    // SAFETY: no cursor-borrowed value held across the call.
+    let res_lt =
+        unsafe { it.put_current_with_options::<Bytes>(PutFlags::APPEND, b"a".as_slice(), b"x") };
+    assert!(
+        matches!(res_lt, Err(heed::Error::Mdb(heed::MdbError::KeyExist))),
+        "cursor-APPEND of key < last must be KeyExist, got {res_lt:?}"
+    );
+    // Append "b" (== last "b"): equal-to-last is also KeyExist (not overwrite).
+    // SAFETY: as above.
+    let res_eq =
+        unsafe { it.put_current_with_options::<Bytes>(PutFlags::APPEND, b"b".as_slice(), b"y") };
+    assert!(
+        matches!(res_eq, Err(heed::Error::Mdb(heed::MdbError::KeyExist))),
+        "cursor-APPEND of key == last must be KeyExist, got {res_eq:?}"
+    );
+    drop(it);
+
+    // The equal-key APPEND must NOT have overwritten "b"'s value.
+    assert_eq!(
+        db.get(&wtxn, b"b".as_slice()).unwrap(),
+        Some(b"2".as_slice()),
+        "failed cursor-APPEND must not modify the stored value"
+    );
+    wtxn.commit().unwrap();
 }
 
 // ---------------------------------------------------------------------
