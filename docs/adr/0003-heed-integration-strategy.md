@@ -1,6 +1,6 @@
 # ADR-0003: heed integration strategy — how ZeroDB gets behind milli & hannoy
 
-- Status: Proposed
+- Status: Approved — Quentin, 2026-07-16 (chat: 'continue' on the presented Phase 0 ratification queue, per recommendations)
 - Milestone: 0.5 (this ADR); implemented in 1.13, gated in 1.14
 - Date: 2026-07-15
 

@@ -54,7 +54,7 @@ this section defines the **recovery decision** and its error taxonomy.
   unidentifiable — so ZeroDB fails `MdbError::Invalid` rather than guess. This is
   **zerodb-defined behavior**: the fork has no meta CRC, so its selection under a
   torn slot is not observable/pinnable, and there is no oracle to match here.
-  **Marked "human ratification pending"** — a maintainer may prefer to serve the
+  **Ratified 2026-07-16 (Quentin, chat)** — a maintainer may prefer to serve the
   lone valid older slot instead; until ratified, the conservative hard error
   stands.
 - **REC-3** — **Both invalid → `MdbError::Invalid`** (heed maps to
@@ -349,5 +349,5 @@ crash-window warning, placed with §1's PREV_SNAPSHOT topic).**
 >    Phase-1 best-effort-plus-warning stance) is a **human decision pending** / ADR
 >    seam. Phase 1 does not overclaim crash-proof rollback.
 > 3. **One-valid PREV_SNAPSHOT → hard error (REC-2 †).** zerodb-defined (the fork
->    has no meta CRC, so its torn-slot behavior is unpinnable); **human ratification
+>    has no meta CRC, so its torn-slot behavior is unpinnable); **ratified 2026-07-16 — Phase 1 ships the documented warning only, no extra interlock; guard redesign deferred (Phase 3 candidate). Original note: human ratification
 >    pending** on whether to instead serve the lone valid older slot.

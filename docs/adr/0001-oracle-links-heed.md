@@ -1,6 +1,6 @@
 # ADR-0001: The oracle crate links heed =0.22.1 (the Meilisearch LMDB fork)
 
-- Status: Proposed (agent-drafted; awaiting human ratification — PLAN.md §0.3 mandates the substance)
+- Status: Approved — Quentin, 2026-07-16 (chat: 'continue' on the presented Phase 0 ratification queue, per recommendations)
 - Milestone: 0.3 (Oracle harness)
 - Date: 2026-07-15
 
