@@ -4,10 +4,11 @@
 //! A [`RoTxn`] pins the env's **published snapshot** at open: it `Arc`-clones
 //! the current [`Snapshot`] object (SPEC 04 TXN-18 — never re-reading a durable
 //! meta page, whose slot a later commit overwrites) and borrows the mapped
-//! bytes for its life (TXN-37). No reader-table slot is claimed yet: that is
-//! the **M1.8 seam**. When the reader table lands, `read_txn` additionally
-//! claims a slot and pins the snapshot txnid (TXN-10); the read API below is
-//! unaffected because it already reads only the pinned roots.
+//! bytes for its life (TXN-37). Since M1.5 it also pins its snapshot txnid in
+//! the env's **interim reader registry** (ADR-0005 OQ1; SPEC 04 TXN-21 as
+//! amended) so the GC gate never reclaims a page a live reader can reach; the
+//! M1.8 lock-free reader table replaces the registry's *implementation*, not
+//! this API (TXN-10).
 //!
 //! The read API is generic over [`TxnRead`], so the same `Database` methods
 //! serve a `RoTxn` (mapped bytes) **and** a write txn (`RwTxn`: dirty frames
@@ -41,6 +42,9 @@ pub trait TxnRead {
     fn source(&self) -> Source<'_>;
     /// The main DB's root/stats as this txn observes them.
     fn main_record(&self) -> &DBRecord;
+    /// The free (GC) DB's root/stats as this txn observes them (SPEC 05 §7 —
+    /// the `non_free_pages_size` walk reads the GC DB under a snapshot).
+    fn free_record(&self) -> &DBRecord;
     /// The env's page size.
     fn page_size(&self) -> u32;
 }
@@ -51,7 +55,7 @@ pub trait TxnRead {
 /// holds an `Arc` to the pinned [`Snapshot`] so its roots survive later
 /// commits (TXN-18).
 pub struct RoTxn<'env> {
-    _env: &'env Env,
+    env: &'env Env,
     bytes: &'env [u8],
     psize: u32,
     snap: Arc<Snapshot>,
@@ -65,12 +69,24 @@ impl RoTxn<'_> {
     }
 }
 
+impl Drop for RoTxn<'_> {
+    fn drop(&mut self) {
+        // Interim reader registry (ADR-0005 OQ1, SPEC 04 TXN-21 as amended):
+        // release this reader's pin so the GC gate can advance. Replaced by the
+        // M1.8 reader-table slot release.
+        self.env.inner().deregister_reader(self.snap.txnid);
+    }
+}
+
 impl TxnRead for RoTxn<'_> {
     fn source(&self) -> Source<'_> {
         Source::Map { bytes: self.bytes }
     }
     fn main_record(&self) -> &DBRecord {
         &self.snap.main_db
+    }
+    fn free_record(&self) -> &DBRecord {
+        &self.snap.free_db
     }
     fn page_size(&self) -> u32 {
         self.psize
@@ -79,19 +95,24 @@ impl TxnRead for RoTxn<'_> {
 
 impl Env {
     /// Open a read transaction over the live published snapshot (SPEC 00
-    /// row 13, SPEC 04 TXN-10). See the module docs for the M1.8 reader-slot
-    /// seam.
+    /// row 13, SPEC 04 TXN-10). Pins the snapshot txnid in the interim reader
+    /// registry (ADR-0005 OQ1) so GC never reclaims a page this reader can
+    /// reach; the M1.8 reader table replaces the registry, not this API.
     ///
     /// # Errors
     ///
-    /// Infallible in M1.4 (no slot to claim, no I/O); returns [`Result`] to
+    /// Infallible pre-M1.8 (no slot to claim, no I/O); returns [`Result`] to
     /// match the heed shape and the future M1.8 slot-claim failure mode.
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
+        // Clone-and-pin is atomic under the registry mutex (see
+        // `EnvInner::pin_reader` for the race-freedom argument), so the GC
+        // gate can never miss this reader while it holds a reachable page.
+        let snap = self.inner().pin_reader();
         Ok(RoTxn {
             bytes: self.inner().backing_bytes(),
             psize: self.page_size(),
-            snap: self.inner().snapshot(),
-            _env: self,
+            snap,
+            env: self,
         })
     }
 
@@ -101,6 +122,54 @@ impl Env {
     pub fn main_database(&self) -> Database {
         Database { _priv: () }
     }
+
+    /// `non_free_pages_size()` (SPEC 00 row 19 — MUST; SPEC 05 GC-23/GC-24):
+    /// `real_disk_size() − free_page_count() * psize`, where the free-page
+    /// count is the exact sum of every GC entry's PIL count under a fresh read
+    /// snapshot. This is the native replacement for milli reading LMDB's
+    /// freelist; it drives the `> 0.75 * map_size` auto-resize trigger.
+    ///
+    /// **TOCTOU note (GC-24):** the free count is exact *for the snapshot*,
+    /// but the `fstat` length is sampled independently and can only be
+    /// **larger** (a concurrent writer may extend the file; nothing ever
+    /// truncates it in Phase 1). The result may therefore over-report
+    /// non-free bytes by at most the concurrent growth — monotone-conservative
+    /// for milli's resize trigger (it can only fire *earlier* than the exact
+    /// value would, never later), and exact whenever no writer commits during
+    /// the call. GC-24's precision claim is per-snapshot and holds.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] from `fstat`; [`MdbError::Invalid`] on a corrupt GC DB.
+    pub fn non_free_pages_size(&self) -> Result<u64> {
+        let rtxn = self.read_txn()?;
+        let free_pages = free_page_count(&rtxn)?;
+        let disk = self.inner().real_disk_size()?;
+        Ok(disk.saturating_sub(free_pages * u64::from(self.page_size())))
+    }
+}
+
+/// Sum of every GC entry's PIL `count` prefix reachable from the txn's
+/// `free_db` root (SPEC 05 GC-23). Overflow-spilled PILs are read through
+/// their run like any large value (the cursor already resolves them).
+///
+/// # Errors
+///
+/// [`MdbError::Invalid`] on a corrupt GC tree or a malformed PIL.
+pub fn free_page_count<T: TxnRead>(txn: &T) -> Result<u64> {
+    let rec = txn.free_record();
+    let tree = Tree::new(txn.source(), txn.page_size(), rec.root, rec.depth);
+    let mut cursor = tree.cursor();
+    let mut total = 0u64;
+    let mut entry = cursor.first().map_err(map_page_err)?;
+    while let Some((_key, val)) = entry {
+        // GC-3 shape validation via the shared PIL codec (a torn PIL errors
+        // rather than silently mis-counting — INV-26's runtime cousin).
+        let ids = crate::page::geometry::pil_decode(val).ok_or(Error::Mdb(MdbError::Invalid))?;
+        total += ids.len() as u64;
+        entry = cursor.next().map_err(map_page_err)?;
+    }
+    Ok(total)
 }
 
 /// A database handle. In Phase-1-so-far this only ever names the main/unnamed

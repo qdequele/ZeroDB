@@ -471,9 +471,11 @@ merged/rebalanced, the cursor is fixed up per §5.4). `delete(key)` (SPEC 00 r36
 ## §8 — Page allocation and overflow chain alloc/free
 
 - **Single page**: obtain a pgno from the GC DB's reusable set (SPEC 05 gates
-  reuse on the oldest live reader — until M1.8's reader table exists, oldest
-  reader = current txn, so only pages freed by *earlier committed* txns are
-  reusable); if none, bump `next_pgno` (`= last_pg + 1`), growing the file, and
+  reuse on the oldest live reader — until M1.8's reader table exists, the
+  oldest reader comes from the interim mutexed reader registry of SPEC 04
+  TXN-21 as amended by ADR-0005 OQ1, so only pages freed at-or-before the
+  oldest live reader's snapshot are reusable); if none, bump `next_pgno`
+  (`= last_pg + 1`), growing the file, and
   fail with `MapFull` if it would exceed `map_size / psize` (SPEC 02 §8).
 - **Overflow run of N pages** needs `N` *contiguous* free pages. Try the GC DB
   for a contiguous run of length `≥ N` (SPEC 05); else allocate `N` fresh

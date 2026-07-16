@@ -585,6 +585,10 @@ impl Engine for ZerodbEngine {
         "zerodb"
     }
 
+    fn real_disk_size(&self) -> Option<u64> {
+        self.env.as_ref().and_then(|e| e.real_disk_size().ok())
+    }
+
     fn implements(&self, op: &Op) -> bool {
         match op {
             // Out of scope, gated symmetrically: named DBs + DropDb (M1.6),

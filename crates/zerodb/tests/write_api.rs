@@ -6,8 +6,8 @@
 //! the multi-MB overflow value the coordinator scoped in.
 //!
 //! Every committed image is validated with `zerodb::check::check_image`
-//! (SPEC 03 §11, minus INV-10 per ADR-0004 OQ4). Do not weaken (CLAUDE.md
-//! rule 2).
+//! (SPEC 03 §11 + SPEC 05 §9, including INV-10/INV-22 reachable-XOR-free
+//! since M1.5). Do not weaken (CLAUDE.md rule 2).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -241,7 +241,7 @@ fn meta_slots_alternate_and_prev_snapshot_rolls_back() {
 #[test]
 fn multi_commit_churn_stays_clean() {
     // put/del/clear churn across several commits; the invariant walk runs
-    // after each (freed-page leak is sanctioned and excluded, ADR-0004 OQ4).
+    // after each, including the INV-22 reachable-XOR-free partition (M1.5).
     let dir = TempDir::new();
     let env = open(dir.path(), MAP, PS);
     let db = env.main_database();

@@ -7,3 +7,4 @@
 | 0002 | [On-disk format principles](adr/0002-on-disk-format.md) | Approved | 0.4 |
 | 0003 | [heed integration strategy (standalone heed-zerodb crate)](adr/0003-heed-integration-strategy.md) | Approved | 0.5 |
 | 0004 | [Write path — single-writer RwTxn, COW dirty store, commit pipeline](adr/0004-write-path.md) | Approved | 1.4 |
+| 0005 | [GC implementation — in-txn structures, freelist_save at C1, reclaim wiring](adr/0005-gc.md) | Approved | 1.5 |

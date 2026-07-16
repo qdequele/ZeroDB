@@ -265,6 +265,13 @@ pub struct EnvInner {
     /// (Acquire) at every write-txn begin and commit. A poisoned env still
     /// serves read txns from their pinned snapshots.
     poisoned: AtomicBool,
+    /// **Interim reader registry** (M1.5, ADR-0005 OQ1; SPEC 04 TXN-21 as
+    /// amended): refcounts of live `RoTxn` snapshot txnids, so the GC gate
+    /// (`oldest_reader()`, SPEC 05 GC-18) never reclaims a page a live reader
+    /// can still reach. A plain mutexed map — deliberately boring; it is
+    /// replaced wholesale by the M1.8 lock-free reader table (TXN-20), whose
+    /// only consumer is the same gate expression.
+    readers: Mutex<std::collections::BTreeMap<u64, usize>>,
 }
 
 impl std::fmt::Debug for EnvInner {
@@ -382,6 +389,49 @@ impl EnvInner {
         self.backing
             .as_deref()
             .expect("backing present while the env is open")
+    }
+
+    /// Atomically clone the published snapshot **and** pin its txnid in the
+    /// interim reader registry (ADR-0005 OQ1). The clone and the pin happen
+    /// under the registry mutex, and the GC gate ([`EnvInner::oldest_live_reader`])
+    /// also reads under that mutex, so a gate computation either runs before
+    /// this section (in which case the writer it belongs to is `W` with
+    /// published snapshot `W − 1`; the clone below then returns `≥ W − 1`,
+    /// which `W`'s reclamation — capped at `F ≤ W − 1` — can never invalidate)
+    /// or after it (and sees the pin). No register-then-verify retry loop is
+    /// needed. Paired with [`EnvInner::deregister_reader`] in `RoTxn::drop`.
+    /// Lock order: registry → snapshot cell; nothing takes them in the other
+    /// order.
+    pub(crate) fn pin_reader(&self) -> Arc<Snapshot> {
+        let mut m = self.readers.lock().expect("reader registry poisoned");
+        let snap = self.snapshot();
+        *m.entry(snap.txnid).or_insert(0) += 1;
+        snap
+    }
+
+    /// Deregister one reader pinned at `txnid` (interim registry).
+    pub(crate) fn deregister_reader(&self, txnid: u64) {
+        let mut m = self.readers.lock().expect("reader registry poisoned");
+        match m.get_mut(&txnid) {
+            Some(n) if *n > 1 => *n -= 1,
+            Some(_) => {
+                m.remove(&txnid);
+            }
+            None => debug_assert!(false, "deregistering an unregistered reader"),
+        }
+    }
+
+    /// The smallest snapshot txnid any live reader has pinned, if any (interim
+    /// registry; the GC gate folds it with `writer_txnid − 1` per SPEC 04
+    /// TXN-20/21).
+    #[must_use]
+    pub(crate) fn oldest_live_reader(&self) -> Option<u64> {
+        self.readers
+            .lock()
+            .expect("reader registry poisoned")
+            .keys()
+            .next()
+            .copied()
     }
 
     /// Whether this env was opened on the previous (older) snapshot.
@@ -677,6 +727,7 @@ pub fn open_with_backing(
         write_mutex: Mutex::new(()),
         commit_hook: Mutex::new(None),
         poisoned: AtomicBool::new(false),
+        readers: Mutex::new(std::collections::BTreeMap::new()),
         meta,
         prev_snapshot,
         closing,

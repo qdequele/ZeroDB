@@ -323,9 +323,13 @@ only a full fence / `SeqCst` does.
   txn, TXN-22) observes the freed slot and catches up.
 - **TXN-21** — GC reuse (SPEC 05) is gated by `oldest_reader()`: a page freed by
   txn `F` is reclaimable only when `F ≤ oldest_reader()` (SPEC 05 GC-18). Until
-  the reader table exists (pre-M1.8), `oldest_reader()` degenerates to
-  `writer_txnid − 1` (no readers) — exactly SPEC 03 §8's "oldest reader = current
-  txn" placeholder.
+  the reader table exists (pre-M1.8), `oldest_reader()` is computed from the
+  **interim reader registry** (ADR-0005 OQ1, approved 2026-07-16): a mutexed
+  refcount map of live `RoTxn` snapshot txnids on the env, giving
+  `min(smallest live reader txnid, writer_txnid − 1)` — sound against readers
+  held across commits, unlike the earlier "no readers ⇒ `writer_txnid − 1`"
+  placeholder, which is superseded. The registry is replaced wholesale by the
+  M1.8 lock-free reader table; the gate expression is the only consumer.
 - **TXN-22** — The writer recomputes `oldest_reader()` at most once per
   allocation attempt and may cache it for the duration of a single
   `mdb_page_alloc`-equivalent (SPEC 05); caching only ever makes `oldest` *more*

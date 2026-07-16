@@ -1,16 +1,16 @@
-//! Tree invariant checker (SPEC 03 §11 INV-1..21 + SPEC 05 §9 subset).
-//! Milestone 1.4 (the M1.12 `zerodb-tools check` command wraps this walk).
+//! Tree invariant checker (SPEC 03 §11 INV-1..21 + SPEC 05 §9 INV-22..26).
+//! Milestones 1.4/1.5 (the M1.12 `zerodb-tools check` command wraps this walk).
 //!
 //! [`check_image`] validates a whole env-file image against the live meta's
 //! snapshot and returns every violation found, each tagged with its INV id.
-//!
-//! **M1.4 scope note (ADR-0004 D6/OQ4, accepted):** the reachability-XOR-free
-//! invariant (INV-10/INV-22) is **not** checked. Until M1.5's `freelist_save`
-//! lands, pages freed by committed txns are neither reachable nor GC-listed —
-//! the sanctioned leak window — so images written by M1.4 legitimately contain
-//! orphaned pages. Every other structural invariant is enforced.
+//! Since M1.5 the **reachable-XOR-free** partition (INV-10/INV-22) is checked
+//! unconditionally: every page in `[FIRST_DATA_PGNO, last_pg]` is either
+//! reachable exactly once through a tree or listed exactly once as free in the
+//! GC DB — never both (reuse-while-referenced), never neither (leak).
+//! (INV-27, the `non_free_pages_size` identity, is asserted at the API level —
+//! this walk has no `fstat`.)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::page::geometry::{gc_key_decode, overflow_page_count};
 use crate::page::{
@@ -33,6 +33,9 @@ struct Checker<'a> {
     meta_txnid: u64,
     last_pg: u64,
     visited: HashSet<u64>,
+    /// Free page ids collected from every GC PIL → occurrence count
+    /// (INV-22/INV-24; SPEC 05 §9).
+    free: HashMap<u64, u64>,
     violations: Vec<String>,
 }
 
@@ -266,10 +269,10 @@ impl<'a> Checker<'a> {
         stats.overflow_pages += expect;
     }
 
-    /// GC-entry well-formedness (INV-14/23/25/26): 8-byte big-endian txnid key
+    /// GC-entry well-formedness (INV-23/25/26): 8-byte big-endian txnid key
     /// `<=` the live meta txnid; PIL = count prefix + strictly-ascending ids in
-    /// `[2, last_pg]`. (M1.4 writes no GC entries; the checks are ready for
-    /// M1.5.)
+    /// `[2, last_pg]`. Every id is also collected into `self.free` for the
+    /// INV-22/INV-24 partition check.
     fn check_gc_entry(&mut self, leaf: u64, key: &[u8], val: LeafValue<'_>) {
         let Some(txnid) = gc_key_decode(key) else {
             self.fail("INV-23", format!("GC leaf {leaf}: key is not 8 bytes"));
@@ -324,6 +327,33 @@ impl<'a> Checker<'a> {
                 }
             }
             prev = Some(id);
+            *self.free.entry(id).or_insert(0) += 1;
+        }
+    }
+
+    /// INV-22 (the GC side of INV-10) + INV-24: after both tree walks, every
+    /// page in `[FIRST_DATA_PGNO, last_pg]` is reachable XOR free, and no page
+    /// id is GC-listed more than once.
+    fn check_reachable_xor_free(&mut self) {
+        for (id, count) in &self.free {
+            if *count > 1 {
+                self.violations.push(format!(
+                    "INV-24: page {id} listed free {count} times across GC entries"
+                ));
+            }
+        }
+        for pgno in FIRST_DATA_PGNO..=self.last_pg {
+            let reachable = self.visited.contains(&pgno);
+            let free = self.free.contains_key(&pgno);
+            match (reachable, free) {
+                (true, true) => self.violations.push(format!(
+                    "INV-22: page {pgno} both reachable and GC-listed free"
+                )),
+                (false, false) => self.violations.push(format!(
+                    "INV-22: page {pgno} neither reachable nor GC-listed free (leaked)"
+                )),
+                _ => {}
+            }
         }
     }
 
@@ -412,12 +442,13 @@ pub fn check_image(bytes: &[u8], psize: u32) -> Vec<String> {
         meta_txnid: meta.txnid,
         last_pg: meta.last_pg,
         visited: HashSet::new(),
+        free: HashMap::new(),
         violations,
     };
     checker.check_record("main_db", &meta.main_db, false);
     checker.check_record("free_db", &meta.free_db, true);
-    // INV-10 / INV-22 (reachable XOR free) intentionally skipped in M1.4
-    // (ADR-0004 OQ4 leak window; M1.5 turns it on).
+    // INV-10 / INV-22 + INV-24 (reachable XOR free, unconditional since M1.5).
+    checker.check_reachable_xor_free();
     checker.violations
 }
 

@@ -35,4 +35,14 @@ pub trait Engine {
     fn implements(&self, _op: &Op) -> bool {
         true
     }
+
+    /// The engine's actual on-disk data-file size, if it can report one.
+    ///
+    /// Feeds the M1.5 file-size tripwire in [`crate::run`] (ADR-0005 D5): after
+    /// every committed op, the native engine's file must stay within a fixed
+    /// band of the reference's, catching unbounded GC growth on every fuzz
+    /// case. Default `None` (no check).
+    fn real_disk_size(&self) -> Option<u64> {
+        None
+    }
 }

@@ -196,6 +196,10 @@ impl Engine for LmdbEngine {
         "lmdb"
     }
 
+    fn real_disk_size(&self) -> Option<u64> {
+        self.env.as_ref().and_then(|e| e.real_disk_size().ok())
+    }
+
     fn apply(&mut self, op: &Op) -> OpResult {
         if let Some(reason) = &self.poisoned {
             return OpResult::Err(crate::result::OracleError::Other(format!(

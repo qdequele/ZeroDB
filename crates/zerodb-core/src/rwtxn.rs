@@ -12,14 +12,21 @@
 //! `&RwTxn`, mutations `&mut RwTxn`, so no `&'txn [u8]` can span a mutation
 //! (TXN-39).
 //!
-//! ## COW and allocation (SPEC 03 §5/§8; M1.4 scope per ADR-0004 D6)
+//! ## COW, allocation, and GC (SPEC 03 §5/§8, SPEC 05; ADR-0005)
 //!
 //! First touch copies a committed page into a fresh frame under a **new** pgno
-//! and rewrites the parent chain top-down (§5.1/§5.3). Allocation draws from
-//! the loose-page list (GC-7/8) for single pages, else extends the file
-//! (`next_pgno`, GC-15/16) with the GC-17 `MapFull` bound. **No GC-DB draw
-//! exists yet** (M1.5); `freelist_save` is a stub at the C1 hook, so pages
-//! freed by committed txns leak on disk until M1.5 (ADR-0004 OQ4, accepted).
+//! and rewrites the parent chain top-down (§5.1/§5.3). Allocation follows
+//! GC-16: the loose-page list (GC-7/8) for single pages, then a GC-DB draw
+//! ([`RwTxn::gc_reclaim`], gated by the oldest live reader — the interim
+//! registry of SPEC 04 TXN-21 as amended by ADR-0005 OQ1), then file extend
+//! (`next_pgno`, GC-15) with the GC-17 `MapFull` bound. Draws are recorded in
+//! the in-memory drain map (GC-20) and applied to the GC tree at commit. At
+//! C1, [`RwTxn::freelist_save`] rewrites drained entries, releases trailing
+//! loose pages (GC-10), and writes this txn's freed set under
+//! `BE(writer_txnid)` in a fixed-point loop (GC-11..13) during which
+//! `allocate` is restricted to loose pages / extend only (GC-12,
+//! [`AllocMode::GcSave`]). The GC tree is mutated by the **same** split/COW
+//! code as the main tree, selected by [`TreeId`].
 //!
 //! ## Commit (SPEC 04 §9, SPEC 06 §2)
 //!
@@ -40,14 +47,16 @@
 //! commit ids are consecutive. Non-reuse would make a post-abort commit
 //! overwrite the *live* snapshot's slot. (SPEC 04 §1 clarified in this change.)
 
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, MutexGuard};
 
-use crate::btree::Source;
+use crate::btree::{Source, Tree};
 use crate::dirty::DirtyStore;
 use crate::env::{Env, HookPoint, Snapshot};
 use crate::error::{Error, MdbError, Result};
 use crate::page::geometry::{
-    body_size, is_map_full, map_pages, overflow_page_count, value_is_inline,
+    body_size, gc_key_decode, gc_key_encode, is_map_full, map_pages, overflow_page_count,
+    pil_decode, pil_encode_into, pil_size, value_is_inline,
 };
 use crate::page::{
     write_overflow_head, BranchMut, BranchRef, DBRecord, LeafMut, LeafRef, LeafValue, MetaPage,
@@ -62,6 +71,26 @@ fn even(n: usize) -> usize {
     (n + 1) & !1
 }
 
+/// Find an `n`-page pick in a sorted-ascending, unique id list (SPEC 05
+/// GC-15/16/19): the **smallest id** for `n == 1`, else the head of the
+/// **first** contiguous run of length `≥ n`. Because the ids are strictly
+/// ascending and unique, `ids[i + n - 1] == ids[i] + n - 1` implies all `n`
+/// are consecutive.
+fn find_run(ids: &[u64], n: u64) -> Option<u64> {
+    if n == 1 {
+        return ids.first().copied();
+    }
+    let n = usize::try_from(n).ok()?;
+    let mut i = 0;
+    while i + n <= ids.len() {
+        if ids[i + n - 1] == ids[i] + (n as u64 - 1) {
+            return Some(ids[i]);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// A root-to-leaf descent path: `(pgno, ki)` per level (SPEC 03 §1 cursor
 /// shape). `ki` is the chosen child index on branches and the entry/insertion
 /// slot on the leaf.
@@ -71,6 +100,34 @@ type Path = Vec<(u64, usize)>;
 const LEAF_NODE_HEADER: usize = 8;
 /// Branch node header size (SPEC 02 §4.1).
 const BRANCH_NODE_HEADER: usize = 10;
+
+/// Which B+tree a mutation targets (ADR-0005 D1). The GC (free) DB is an
+/// ordinary tree of `P_LEAF`/`P_BRANCH` pages (SPEC 02 §7), so it is mutated
+/// by exactly the same split/merge/COW code as the main tree — this selector
+/// is the only difference, and it is the seam M1.6's named-DB catalog extends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeId {
+    /// The main (unnamed) database.
+    Main,
+    /// The free (GC) database, `BE(txnid) → PIL` (SPEC 05 §1).
+    Free,
+}
+
+/// Allocation restriction state (SPEC 05 GC-12, ADR-0005 D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllocMode {
+    /// Normal ops: loose → GC draw → extend (GC-16).
+    Normal,
+    /// Inside `freelist_save` (commit step C1): **all GC draws barred**; loose
+    /// pages (including contiguous loose runs — see the GC-12 note) or extend
+    /// only. Set once at `freelist_save` entry and never cleared: the commit
+    /// consumes the txn.
+    GcSave,
+}
+
+/// GC-13 regression guard: `freelist_save`'s loop provably terminates; a bug
+/// that breaks the fixed point should be a loud panic, not a hang.
+const FREELIST_SAVE_MAX_ITERS: usize = 64;
 
 /// Put flags (SPEC 01 Table 3 subset in M1.4 scope). Hand-rolled bitset like
 /// [`crate::env::Env`]'s flags — no `bitflags` dependency.
@@ -219,12 +276,30 @@ pub struct RwTxn<'env> {
     txnid: u64,
     psize: u32,
     dirty: DirtyStore,
-    /// Committed pages obsoleted by this txn (GC-6). Persisted to the GC DB
-    /// from M1.5 on; **leaked** in M1.4 (ADR-0004 OQ4).
+    /// Committed pages obsoleted by this txn (GC-6). Written to the GC DB
+    /// under `BE(writer_txnid)` at commit step C1 (`freelist_save`).
     freed: Vec<u64>,
     /// Pages allocated *and* freed by this txn (GC-7): the reuse fast path
-    /// (GC-8) and the trailing-shrink set (GC-10).
+    /// (GC-8) and the trailing-shrink set (GC-10). A GC-reclaimed page freed
+    /// again this txn also lands here (it is this-txn-private after the gate).
     loose: Vec<u64>,
+    /// GC-20 drain bookkeeping (ADR-0005 D1): for every GC entry `F` this txn
+    /// drew from, the **remaining** (still-free, sorted-ascending) ids. Loaded
+    /// from the tree PIL on first touch; `freelist_save` step (a) rewrites the
+    /// remainder (or deletes the entry when empty). `BTreeMap` so iteration is
+    /// ascending-`F`, matching the GC-18 scan.
+    drains: BTreeMap<u64, Vec<u64>>,
+    /// Every pgno handed out by a GC draw this txn (ADR-0005 D1): feeds the
+    /// generalized TXN-62 assert at C2 and the loose classification in
+    /// [`RwTxn::free_page`].
+    reclaimed: HashSet<u64>,
+    /// GC-12 allocation restriction (ADR-0005 D2).
+    alloc_mode: AllocMode,
+    /// Entries of `drains` whose `remaining` shrank via an **in-save pool
+    /// draw** (GC-12 as amended — see `freelist_save`): each must be
+    /// re-rewritten before the C1 fixed point is declared, so no rewritten
+    /// entry ever lists a handed-out page.
+    save_touched: std::collections::BTreeSet<u64>,
     /// Next never-allocated pgno (GC-15); persisted as `last_pg = next_pgno-1`.
     next_pgno: u64,
     /// `base.last_pg` — the committed high-water, used to classify freed pages
@@ -271,6 +346,10 @@ impl Env {
             dirty: DirtyStore::new(inner.page_size()),
             freed: Vec::new(),
             loose: Vec::new(),
+            drains: BTreeMap::new(),
+            reclaimed: HashSet::new(),
+            alloc_mode: AllocMode::Normal,
+            save_touched: std::collections::BTreeSet::new(),
             errored: false,
             bytes: inner.backing_bytes(),
             base,
@@ -289,6 +368,9 @@ impl TxnRead for RwTxn<'_> {
     }
     fn main_record(&self) -> &DBRecord {
         &self.main_db
+    }
+    fn free_record(&self) -> &DBRecord {
+        &self.free_db
     }
     fn page_size(&self) -> u32 {
         self.psize
@@ -317,6 +399,22 @@ impl<'env> RwTxn<'env> {
         Ok(())
     }
 
+    /// The working `DBRecord` of `tree` (ADR-0005 D1 selector).
+    fn record(&self, tree: TreeId) -> &DBRecord {
+        match tree {
+            TreeId::Main => &self.main_db,
+            TreeId::Free => &self.free_db,
+        }
+    }
+
+    /// Mutable working `DBRecord` of `tree`.
+    fn record_mut(&mut self, tree: TreeId) -> &mut DBRecord {
+        match tree {
+            TreeId::Main => &mut self.main_db,
+            TreeId::Free => &mut self.free_db,
+        }
+    }
+
     fn load(&self, pgno: u64) -> Result<PageRef<'_>> {
         PageRef::new(
             self.source()
@@ -327,13 +425,43 @@ impl<'env> RwTxn<'env> {
         .map_err(corrupt)
     }
 
-    /// `allocate(n)` (SPEC 05 GC-16, M1.4 subset — ADR-0004 D4): loose-page
-    /// fast path for single pages, else file extend with the GC-17 bound. No
-    /// GC-DB draw until M1.5.
+    /// `allocate(n)` (SPEC 05 GC-16, ADR-0005 D3): loose fast path, then a GC
+    /// draw (skipped entirely inside `freelist_save` — GC-12), then file
+    /// extend with the GC-17 bound.
     fn allocate(&mut self, n: u64) -> Result<u64> {
+        debug_assert!(n >= 1);
         if n == 1 {
             if let Some(p) = self.loose.pop() {
                 return Ok(p);
+            }
+        } else if self.alloc_mode == AllocMode::GcSave {
+            // Loose-run draw, `freelist_save` only (SPEC 05 GC-12 note): the
+            // previous loop iteration's PIL value run is loose and must be
+            // re-allocatable or the fixed point is unreachable.
+            if let Some(start) = self.loose_run(n) {
+                return Ok(start);
+            }
+        }
+        match self.alloc_mode {
+            AllocMode::Normal => {
+                // GC-16 step 2: read the GC tree under the oldest-reader gate.
+                if let Some(start) = self.gc_reclaim(n)? {
+                    return Ok(start);
+                }
+            }
+            AllocMode::GcSave => {
+                // GC-12 (as amended, ADR-0005): never *read* the GC tree
+                // in-save, but draws from the already-loaded drain pool are
+                // permitted — required for bounded file growth, since the
+                // in-save COW of a committed GC page can never reuse its own
+                // predecessor (TXN-62: the N−1 meta still references it) and
+                // would otherwise extend the file on every commit. Each entry
+                // touched here is re-rewritten before the fixed point
+                // (`save_touched`), so no rewritten entry lists a handed-out
+                // page (the anti-leak property GC-12 exists for).
+                if let Some(start) = self.save_pool_draw(n) {
+                    return Ok(start);
+                }
             }
         }
         let mp = map_pages(self.env.inner().map_size(), self.psize);
@@ -345,13 +473,177 @@ impl<'env> RwTxn<'env> {
         Ok(p)
     }
 
+    /// Serve a contiguous `n`-page run from the loose list (GcSave only; see
+    /// [`RwTxn::allocate`]). A loose run that abuts `next_pgno` may be
+    /// completed by extension. Returns the run's head pgno.
+    fn loose_run(&mut self, n: u64) -> Option<u64> {
+        debug_assert!(self.alloc_mode == AllocMode::GcSave);
+        if self.loose.is_empty() {
+            return None;
+        }
+        self.loose.sort_unstable();
+        debug_assert!(
+            self.loose.windows(2).all(|w| w[0] < w[1]),
+            "loose list holds a duplicate pgno"
+        );
+        let mp = map_pages(self.env.inner().map_size(), self.psize);
+        let mut i = 0;
+        while i < self.loose.len() {
+            // Extent of the maximal consecutive run starting at index i.
+            let mut j = i + 1;
+            while j < self.loose.len() && self.loose[j] == self.loose[j - 1] + 1 {
+                j += 1;
+            }
+            let len = (j - i) as u64;
+            if len >= n {
+                let start = self.loose[i];
+                self.loose.drain(i..i + n as usize);
+                return Some(start);
+            }
+            // Top-of-file completion: the run ends at next_pgno - 1, so
+            // extending by (n - len) yields one contiguous run.
+            if self.loose[j - 1] + 1 == self.next_pgno && !is_map_full(self.next_pgno, n - len, mp)
+            {
+                let start = self.loose[i];
+                self.loose.drain(i..j);
+                self.next_pgno += n - len;
+                return Some(start);
+            }
+            i = j;
+        }
+        None
+    }
+
+    /// In-save draw from the **already-loaded drain pool** (GC-12 as amended;
+    /// see [`RwTxn::allocate`]). Deterministic like GC-19: smallest
+    /// reclaimable `F` first (`drains` is a `BTreeMap`), smallest id / first
+    /// contiguous run within it. Gate compliance is inherited: every pool
+    /// entry passed `F ≤ oldest_reader()` when first loaded during ops, and
+    /// any reader that pins *after* that pins the published snapshot
+    /// `≥ writer_txnid − 1 ≥ F`, from whose trees these pages are absent.
+    fn save_pool_draw(&mut self, n: u64) -> Option<u64> {
+        debug_assert!(self.alloc_mode == AllocMode::GcSave);
+        let mut hit: Option<(u64, u64)> = None;
+        for (f, remaining) in &self.drains {
+            if let Some(start) = find_run(remaining, n) {
+                hit = Some((*f, start));
+                break;
+            }
+        }
+        let (f, start) = hit?;
+        let remaining = self.drains.get_mut(&f).expect("pool entry present");
+        let pos = remaining
+            .binary_search(&start)
+            .expect("picked id present in the remaining set");
+        remaining.drain(pos..pos + n as usize);
+        for p in start..start + n {
+            let first_time = self.reclaimed.insert(p);
+            debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
+        }
+        self.save_touched.insert(f);
+        Some(start)
+    }
+
+    /// The GC reuse gate (SPEC 05 GC-18, SPEC 04 TXN-20/21 as amended by
+    /// ADR-0005 OQ1): `min(smallest live reader snapshot txnid,
+    /// writer_txnid − 1)`. The reader term comes from the interim mutexed
+    /// registry; M1.8 swaps in the lock-free reader-table scan here and
+    /// nowhere else.
+    fn oldest_reader(&self) -> u64 {
+        let cap = self.txnid - 1;
+        match self.env.inner().oldest_live_reader() {
+            Some(r) => r.min(cap),
+            None => cap,
+        }
+    }
+
+    /// GC-16 step 2 (`gc_reclaim`, SPEC 05 GC-18..20): walk GC entries in
+    /// ascending freeing-txnid order (BE keys ⇒ forward cursor); for the first
+    /// entry `F ≤ oldest_reader()` whose remaining ids satisfy the request
+    /// (smallest id for `n == 1` — GC-19; first within-PIL contiguous run for
+    /// `n > 1` — GC-15/21), record the drain in `self.drains` (the tree entry
+    /// itself is rewritten only at C1, GC-20) and return the head pgno.
+    fn gc_reclaim(&mut self, n: u64) -> Result<Option<u64>> {
+        debug_assert!(
+            self.alloc_mode == AllocMode::Normal,
+            "GC draw inside freelist_save (GC-12)"
+        );
+        if self.free_db.root == PGNO_INVALID {
+            return Ok(None);
+        }
+        let oldest = self.oldest_reader();
+        // Scan pass (shared borrows only); the drain mutation happens after
+        // the cursor borrow ends.
+        struct Pick {
+            f: u64,
+            fresh: Option<Vec<u64>>,
+            start: u64,
+        }
+        let pick: Option<Pick> = {
+            let rec = self.free_db;
+            let tree = Tree::new(self.source(), self.psize, rec.root, rec.depth);
+            let mut cursor = tree.cursor();
+            let mut entry = cursor.first().map_err(map_page_err)?;
+            let mut found = None;
+            while let Some((key, val)) = entry {
+                let f = gc_key_decode(key).ok_or(Error::Mdb(MdbError::Invalid))?;
+                if f > oldest {
+                    break; // gate: no older entries remain (ascending scan)
+                }
+                match self.drains.get(&f) {
+                    Some(remaining) => {
+                        if let Some(start) = find_run(remaining, n) {
+                            found = Some(Pick {
+                                f,
+                                fresh: None,
+                                start,
+                            });
+                            break;
+                        }
+                    }
+                    None => {
+                        let ids = pil_decode(val).ok_or(Error::Mdb(MdbError::Invalid))?;
+                        if let Some(start) = find_run(&ids, n) {
+                            found = Some(Pick {
+                                f,
+                                fresh: Some(ids),
+                                start,
+                            });
+                            break;
+                        }
+                    }
+                }
+                entry = cursor.next().map_err(map_page_err)?;
+            }
+            found
+        };
+        let Some(Pick { f, fresh, start }) = pick else {
+            return Ok(None);
+        };
+        let remaining = match fresh {
+            Some(ids) => self.drains.entry(f).or_insert(ids),
+            None => self.drains.get_mut(&f).expect("drain entry present"),
+        };
+        let pos = remaining
+            .binary_search(&start)
+            .expect("picked id present in the remaining set");
+        remaining.drain(pos..pos + n as usize);
+        for p in start..start + n {
+            let first_time = self.reclaimed.insert(p);
+            debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
+        }
+        Ok(Some(start))
+    }
+
     /// Record `pgno` as freed (GC-6), dropping its dirty frame if it has one.
-    /// A page this txn allocated (`> committed_last_pg`) is loose (GC-7);
-    /// dropping the frame here is sound because freeing only happens inside
-    /// `&mut` ops, where no borrow into the frame can be live (TXN-39/43).
+    /// A page this txn allocated (`> committed_last_pg`) — or reclaimed from
+    /// the GC DB this txn (drained out of its entry, so no committed snapshot
+    /// at-or-after the gate references it) — is loose (GC-7); dropping the
+    /// frame here is sound because freeing only happens inside `&mut` ops,
+    /// where no borrow into the frame can be live (TXN-39/43).
     fn free_page(&mut self, pgno: u64) {
         let _ = self.dirty.remove(pgno);
-        if pgno > self.committed_last_pg {
+        if pgno > self.committed_last_pg || self.reclaimed.contains(&pgno) {
             self.loose.push(pgno);
         } else {
             self.freed.push(pgno);
@@ -362,7 +654,7 @@ impl<'env> RwTxn<'env> {
     fn free_run(&mut self, head: u64, n: u64) {
         let _ = self.dirty.remove(head);
         for p in head..head + n {
-            if p > self.committed_last_pg {
+            if p > self.committed_last_pg || self.reclaimed.contains(&p) {
                 self.loose.push(p);
             } else {
                 self.freed.push(p);
@@ -403,13 +695,14 @@ impl<'env> RwTxn<'env> {
     /// No page is touched — COW happens only when a mutation is decided
     /// (`touch_path`), so a `NO_OVERWRITE` miss or a `del` of an absent key
     /// dirties nothing (LMDB parity).
-    fn search_path(&self, key: &[u8]) -> Result<(Path, bool)> {
+    fn search_path(&self, tree: TreeId, key: &[u8]) -> Result<(Path, bool)> {
+        let rec = *self.record(tree);
         let mut path = Vec::new();
-        if self.main_db.root == PGNO_INVALID {
+        if rec.root == PGNO_INVALID {
             return Ok((path, false));
         }
-        let mut pgno = self.main_db.root;
-        for _ in 0..=self.main_db.depth {
+        let mut pgno = rec.root;
+        for _ in 0..=rec.depth {
             let page = self.load(pgno)?;
             match page.page_type() {
                 PageType::Leaf => {
@@ -436,10 +729,11 @@ impl<'env> RwTxn<'env> {
     /// Read-only descent to the rightmost entry (APPEND's last-key compare,
     /// §6.3). Returns the path (leaf `ki = num_keys - 1`) and the owned last
     /// key. The tree must be non-empty.
-    fn rightmost_path(&self) -> Result<(Path, Vec<u8>)> {
+    fn rightmost_path(&self, tree: TreeId) -> Result<(Path, Vec<u8>)> {
+        let rec = *self.record(tree);
         let mut path = Vec::new();
-        let mut pgno = self.main_db.root;
-        for _ in 0..=self.main_db.depth {
+        let mut pgno = rec.root;
+        for _ in 0..=rec.depth {
             let page = self.load(pgno)?;
             match page.page_type() {
                 PageType::Leaf => {
@@ -468,14 +762,14 @@ impl<'env> RwTxn<'env> {
     /// rewrites the (already dirty) parent's child pointer; copying the root
     /// updates the working `DBRecord.root`. `ki` values stay valid — the copy
     /// is byte-identical apart from its header identity.
-    fn touch_path(&mut self, path: &mut [(u64, usize)]) -> Result<()> {
+    fn touch_path(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<()> {
         for level in 0..path.len() {
             let (pgno, _) = path[level];
             let np = self.touch(pgno)?;
             if np != pgno {
                 path[level].0 = np;
                 if level == 0 {
-                    self.main_db.root = np;
+                    self.record_mut(tree).root = np;
                 } else {
                     let (ppg, pki) = path[level - 1];
                     let frame = self.dirty.bytes_mut(ppg).expect("parent already touched");
@@ -490,7 +784,13 @@ impl<'env> RwTxn<'env> {
 
     // -- put ------------------------------------------------------------------
 
-    fn put_main(&mut self, key: &[u8], flags: PutFlags, val: ValSrc<'_>) -> Result<ReserveLoc> {
+    fn put_tree(
+        &mut self,
+        tree: TreeId,
+        key: &[u8],
+        flags: PutFlags,
+        val: ValSrc<'_>,
+    ) -> Result<ReserveLoc> {
         self.guard_ok()?;
         // SPEC 03 §6 / §2.1: writes validate up front — empty or > 511-byte
         // key, oversized value → BadValSize (the split machinery's termination
@@ -502,14 +802,14 @@ impl<'env> RwTxn<'env> {
             return Err(Error::Mdb(MdbError::BadValSize));
         }
         if flags.contains(PutFlags::APPEND) {
-            return self.append_main(key, val);
+            return self.append_tree(tree, key, val);
         }
-        let (mut path, found) = self.search_path(key)?;
+        let (mut path, found) = self.search_path(tree, key)?;
         if found && flags.contains(PutFlags::NO_OVERWRITE) {
             // §S2: no mutation, nothing dirtied.
             return Err(Error::Mdb(MdbError::KeyExist));
         }
-        let res = self.put_apply(&mut path, found, key, val);
+        let res = self.put_apply(tree, &mut path, found, key, val);
         if res.is_err() {
             // Mid-mutation failure (MapFull in a split cascade, corrupt page):
             // the working tree may be partial — poison the txn (TXN-59 clean
@@ -521,20 +821,20 @@ impl<'env> RwTxn<'env> {
 
     /// APPEND (§6.3): compare against the **last** key only; the cursor/search
     /// position is irrelevant. Equal-to-last is `KeyExist`, not an overwrite.
-    fn append_main(&mut self, key: &[u8], val: ValSrc<'_>) -> Result<ReserveLoc> {
-        if self.main_db.root == PGNO_INVALID {
-            let res = self.insert_first(key, val);
+    fn append_tree(&mut self, tree: TreeId, key: &[u8], val: ValSrc<'_>) -> Result<ReserveLoc> {
+        if self.record(tree).root == PGNO_INVALID {
+            let res = self.insert_first(tree, key, val);
             match res {
-                Ok(_) => self.main_db.entries += 1,
+                Ok(_) => self.record_mut(tree).entries += 1,
                 Err(_) => self.errored = true,
             }
             return res;
         }
-        let (mut path, last_key) = self.rightmost_path()?;
+        let (mut path, last_key) = self.rightmost_path(tree)?;
         if key <= last_key.as_slice() {
             return Err(Error::Mdb(MdbError::KeyExist));
         }
-        let res = self.append_apply(&mut path, key, val);
+        let res = self.append_apply(tree, &mut path, key, val);
         if res.is_err() {
             self.errored = true;
         }
@@ -543,24 +843,26 @@ impl<'env> RwTxn<'env> {
 
     fn append_apply(
         &mut self,
+        tree: TreeId,
         path: &mut [(u64, usize)],
         key: &[u8],
         val: ValSrc<'_>,
     ) -> Result<ReserveLoc> {
-        self.touch_path(path)?;
+        self.touch_path(tree, path)?;
         let (lpg, _) = *path.last().expect("non-empty path");
         let n = {
             let frame = self.dirty.bytes(lpg).expect("leaf touched");
             LeafRef::new(frame, self.psize).map_err(corrupt)?.num_keys()
         };
         path.last_mut().expect("non-empty path").1 = n;
-        let loc = self.insert_into_leaf(path, n, key, val, true)?;
-        self.main_db.entries += 1;
+        let loc = self.insert_into_leaf(tree, path, n, key, val, true)?;
+        self.record_mut(tree).entries += 1;
         Ok(loc)
     }
 
     fn put_apply(
         &mut self,
+        tree: TreeId,
         path: &mut [(u64, usize)],
         found: bool,
         key: &[u8],
@@ -568,15 +870,15 @@ impl<'env> RwTxn<'env> {
     ) -> Result<ReserveLoc> {
         if path.is_empty() {
             // Empty tree: first insert allocates the root leaf (§9 grow).
-            let loc = self.insert_first(key, val)?;
-            self.main_db.entries += 1;
+            let loc = self.insert_first(tree, key, val)?;
+            self.record_mut(tree).entries += 1;
             return Ok(loc);
         }
-        self.touch_path(path)?;
+        self.touch_path(tree, path)?;
         let (lpg, ki) = *path.last().expect("non-empty path");
         if !found {
-            let loc = self.insert_into_leaf(path, ki, key, val, false)?;
-            self.main_db.entries += 1;
+            let loc = self.insert_into_leaf(tree, path, ki, key, val, false)?;
+            self.record_mut(tree).entries += 1;
             return Ok(loc);
         }
         // §6.1 replace. Read the old value's shape first: `Err(dsize)` for an
@@ -612,7 +914,7 @@ impl<'env> RwTxn<'env> {
         if let Ok((head, dsize)) = old_big {
             let n = overflow_page_count(dsize as u64, self.psize);
             self.free_run(head, n);
-            self.main_db.overflow_pages -= n;
+            self.record_mut(tree).overflow_pages -= n;
         }
         {
             let frame = self.dirty.bytes_mut(lpg).expect("leaf touched");
@@ -621,21 +923,22 @@ impl<'env> RwTxn<'env> {
                 .remove(ki);
         }
         // entries unchanged: replace, not insert.
-        self.insert_into_leaf(path, ki, key, val, false)
+        self.insert_into_leaf(tree, path, ki, key, val, false)
     }
 
     /// First insert into an empty tree (§9 grow: empty → 1 leaf).
-    fn insert_first(&mut self, key: &[u8], val: ValSrc<'_>) -> Result<ReserveLoc> {
+    fn insert_first(&mut self, tree: TreeId, key: &[u8], val: ValSrc<'_>) -> Result<ReserveLoc> {
         let pg = self.allocate(1)?;
         {
             let frame = self.dirty.insert_tree_frame(pg);
             LeafMut::init(frame, self.psize, pg, self.txnid).map_err(corrupt)?;
         }
-        self.main_db.root = pg;
-        self.main_db.depth = 1;
-        self.main_db.leaf_pages = 1;
+        let rec = self.record_mut(tree);
+        rec.root = pg;
+        rec.depth = 1;
+        rec.leaf_pages = 1;
         let mut path = vec![(pg, 0usize)];
-        self.insert_into_leaf(&mut path, 0, key, val, false)
+        self.insert_into_leaf(tree, &mut path, 0, key, val, false)
     }
 
     /// Insert a `(key, val)` cell at slot `ki` of the (dirty) leaf at
@@ -644,6 +947,7 @@ impl<'env> RwTxn<'env> {
     /// (SPEC 02 §4.2 inline rule).
     fn insert_into_leaf(
         &mut self,
+        tree: TreeId,
         path: &mut [(u64, usize)],
         ki: usize,
         key: &[u8],
@@ -677,7 +981,7 @@ impl<'env> RwTxn<'env> {
                             ValSrc::Reserve(n) => vec![0u8; *n],
                         }),
                     };
-                    self.split_leaf(path, ki, cell, append)?;
+                    self.split_leaf(tree, path, ki, cell, append)?;
                     Ok(ReserveLoc::Inline)
                 }
                 Err(e) => Err(corrupt(e)),
@@ -700,7 +1004,7 @@ impl<'env> RwTxn<'env> {
                 run[ps..ps + rest.len()].copy_from_slice(rest);
             }
             self.dirty.insert(head, run);
-            self.main_db.overflow_pages += n;
+            self.record_mut(tree).overflow_pages += n;
             let (lpg, _) = *path.last().expect("non-empty path");
             let r = {
                 let frame = self.dirty.bytes_mut(lpg).expect("leaf is dirty");
@@ -714,7 +1018,7 @@ impl<'env> RwTxn<'env> {
                         key: key.to_vec(),
                         val: OwnedVal::Big { head, dsize },
                     };
-                    self.split_leaf(path, ki, cell, append)?;
+                    self.split_leaf(tree, path, ki, cell, append)?;
                     Ok(ReserveLoc::Big(head))
                 }
                 Err(e) => Err(corrupt(e)),
@@ -794,6 +1098,7 @@ impl<'env> RwTxn<'env> {
     /// page's first key into the parent.
     fn split_leaf(
         &mut self,
+        tree: TreeId,
         path: &mut [(u64, usize)],
         newindx: usize,
         newcell: OwnedLeafCell,
@@ -815,12 +1120,12 @@ impl<'env> RwTxn<'env> {
         self.dirty.insert_tree_frame(rpg);
         self.write_leaf_frame(lpg, &cells[..s])?;
         self.write_leaf_frame(rpg, &cells[s..])?;
-        self.main_db.leaf_pages += 1;
+        self.record_mut(tree).leaf_pages += 1;
         if top == 0 {
-            self.insert_into_branch(path, -1, 0, sep, rpg)
+            self.insert_into_branch(tree, path, -1, 0, sep, rpg)
         } else {
             let at = path[top - 1].1 + 1;
-            self.insert_into_branch(path, top as isize - 1, at, sep, rpg)
+            self.insert_into_branch(tree, path, top as isize - 1, at, sep, rpg)
         }
     }
 
@@ -829,6 +1134,7 @@ impl<'env> RwTxn<'env> {
     /// `level < 0`.
     fn insert_into_branch(
         &mut self,
+        tree: TreeId,
         path: &mut [(u64, usize)],
         level: isize,
         at: usize,
@@ -847,9 +1153,10 @@ impl<'env> RwTxn<'env> {
                 br.insert(0, &[], old_root).map_err(corrupt)?;
                 br.insert(1, &key, child).map_err(corrupt)?;
             }
-            self.main_db.root = np;
-            self.main_db.depth += 1;
-            self.main_db.branch_pages += 1;
+            let rec = self.record_mut(tree);
+            rec.root = np;
+            rec.depth += 1;
+            rec.branch_pages += 1;
             return Ok(());
         }
         let lvl = level as usize;
@@ -863,7 +1170,7 @@ impl<'env> RwTxn<'env> {
         };
         match r {
             Ok(()) => Ok(()),
-            Err(PageError::PageFull { .. }) => self.split_branch(path, lvl, at, key, child),
+            Err(PageError::PageFull { .. }) => self.split_branch(tree, path, lvl, at, key, child),
             Err(e) => Err(corrupt(e)),
         }
     }
@@ -873,6 +1180,7 @@ impl<'env> RwTxn<'env> {
     /// the empty separator.
     fn split_branch(
         &mut self,
+        tree: TreeId,
         path: &mut [(u64, usize)],
         lvl: usize,
         at: usize,
@@ -900,29 +1208,29 @@ impl<'env> RwTxn<'env> {
         cells.truncate(s); // left keeps [0, s)
         self.write_branch_frame(ppg, &cells)?;
         self.write_branch_frame(rpg, &right)?;
-        self.main_db.branch_pages += 1;
+        self.record_mut(tree).branch_pages += 1;
         if lvl == 0 {
-            self.insert_into_branch(path, -1, 0, rising, rpg)
+            self.insert_into_branch(tree, path, -1, 0, rising, rpg)
         } else {
             let at2 = path[lvl - 1].1 + 1;
-            self.insert_into_branch(path, lvl as isize - 1, at2, rising, rpg)
+            self.insert_into_branch(tree, path, lvl as isize - 1, at2, rising, rpg)
         }
     }
 
     // -- delete + rebalance (§7/§10, §9 shrink) --------------------------------
 
-    fn delete_main(&mut self, key: &[u8]) -> Result<bool> {
+    fn delete_tree(&mut self, tree: TreeId, key: &[u8]) -> Result<bool> {
         self.guard_ok()?;
         // Read-side key leniency (§2.1): an oversized key simply finds
         // nothing (`Ok(false)`); the empty-key `BadValSize` is an API-boundary
         // concern (oracle adapter / heed adapter).
-        let (mut path, found) = self.search_path(key)?;
+        let (mut path, found) = self.search_path(tree, key)?;
         if !found {
             return Ok(false);
         }
-        match self.delete_apply(&mut path) {
+        match self.delete_apply(tree, &mut path) {
             Ok(()) => {
-                self.main_db.entries -= 1;
+                self.record_mut(tree).entries -= 1;
                 Ok(true)
             }
             Err(e) => {
@@ -932,8 +1240,8 @@ impl<'env> RwTxn<'env> {
         }
     }
 
-    fn delete_apply(&mut self, path: &mut [(u64, usize)]) -> Result<()> {
-        self.touch_path(path)?;
+    fn delete_apply(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<()> {
+        self.touch_path(tree, path)?;
         let (lpg, ki) = *path.last().expect("non-empty path");
         let big = {
             let frame = self.dirty.bytes(lpg).expect("leaf touched");
@@ -946,7 +1254,7 @@ impl<'env> RwTxn<'env> {
         if let Some((head, dsize)) = big {
             let n = overflow_page_count(dsize as u64, self.psize);
             self.free_run(head, n);
-            self.main_db.overflow_pages -= n;
+            self.record_mut(tree).overflow_pages -= n;
         }
         {
             let frame = self.dirty.bytes_mut(lpg).expect("leaf touched");
@@ -955,7 +1263,7 @@ impl<'env> RwTxn<'env> {
                 .remove(ki);
         }
         let top = path.len() - 1;
-        self.rebalance(path, top)
+        self.rebalance(tree, path, top)
     }
 
     /// `(is_leaf, num_keys, used_bytes)` of the dirty page at `pgno`.
@@ -979,7 +1287,7 @@ impl<'env> RwTxn<'env> {
     /// §10 rebalance at `path[level]` after a delete/merge: root shrink at the
     /// root (§9); otherwise, when below threshold, borrow from (or merge with)
     /// a sibling, recursing upward on merge.
-    fn rebalance(&mut self, path: &mut [(u64, usize)], level: usize) -> Result<()> {
+    fn rebalance(&mut self, tree: TreeId, path: &mut [(u64, usize)], level: usize) -> Result<()> {
         let (pgno, _) = path[level];
         let (is_leaf, nkeys, used) = self.page_stats(pgno)?;
         let body = body_size(self.psize);
@@ -987,9 +1295,10 @@ impl<'env> RwTxn<'env> {
             // §9 root shrink.
             if is_leaf && nkeys == 0 {
                 self.free_page(pgno);
-                self.main_db.root = PGNO_INVALID;
-                self.main_db.depth = 0;
-                self.main_db.leaf_pages -= 1;
+                let rec = self.record_mut(tree);
+                rec.root = PGNO_INVALID;
+                rec.depth = 0;
+                rec.leaf_pages -= 1;
             } else if !is_leaf && nkeys == 1 {
                 let child = {
                     let frame = self.dirty.bytes(pgno).expect("root is dirty");
@@ -998,9 +1307,10 @@ impl<'env> RwTxn<'env> {
                         .child_pgno(0)
                 };
                 self.free_page(pgno);
-                self.main_db.root = child;
-                self.main_db.depth -= 1;
-                self.main_db.branch_pages -= 1;
+                let rec = self.record_mut(tree);
+                rec.root = child;
+                rec.depth -= 1;
+                rec.branch_pages -= 1;
             }
             return Ok(());
         }
@@ -1057,10 +1367,10 @@ impl<'env> RwTxn<'env> {
             s_nkeys > MIN_KEYS_BRANCH
         };
         if can_borrow {
-            self.borrow_entry(path, level, sib, fromleft, is_leaf)
+            self.borrow_entry(tree, path, level, sib, fromleft, is_leaf)
         } else {
-            self.merge_pages(path, level, sib, fromleft, is_leaf)?;
-            self.rebalance(path, level - 1)
+            self.merge_pages(tree, path, level, sib, fromleft, is_leaf)?;
+            self.rebalance(tree, path, level - 1)
         }
     }
 
@@ -1068,6 +1378,7 @@ impl<'env> RwTxn<'env> {
     /// sibling and rewrite the parent separator.
     fn borrow_entry(
         &mut self,
+        tree: TreeId,
         path: &mut [(u64, usize)],
         level: usize,
         sib: u64,
@@ -1104,7 +1415,7 @@ impl<'env> RwTxn<'env> {
                 }
                 self.insert_owned_leaf_cell(pg, 0, &cell)?;
                 let newkey = cell.key.clone();
-                self.update_parent_key(path, level - 1, pki, newkey)
+                self.update_parent_key(tree, path, level - 1, pki, newkey)
             } else {
                 // Sibling's first entry becomes P's last; the sibling's
                 // separator = its new first key.
@@ -1137,7 +1448,7 @@ impl<'env> RwTxn<'env> {
                     LeafRef::new(frame, psize).map_err(corrupt)?.num_keys()
                 };
                 self.insert_owned_leaf_cell(pg, p_n, &cell)?;
-                self.update_parent_key(path, level - 1, pki + 1, new_first)
+                self.update_parent_key(tree, path, level - 1, pki + 1, new_first)
             }
         } else if fromleft {
             // Branch borrow from the left sibling: its last child becomes P's
@@ -1178,7 +1489,7 @@ impl<'env> RwTxn<'env> {
                 b.insert(0, &[], c).map_err(corrupt)?;
                 b.insert(1, &old_sep, c0).map_err(corrupt)?;
             }
-            self.update_parent_key(path, level - 1, pki, k_m)
+            self.update_parent_key(tree, path, level - 1, pki, k_m)
         } else {
             // Branch borrow from the right sibling: its node 0 moves to P's
             // end carrying the sibling's old parent separator; the sibling's
@@ -1217,7 +1528,7 @@ impl<'env> RwTxn<'env> {
                 let n = b.num_keys();
                 b.insert(n, &old_sep, c).map_err(corrupt)?;
             }
-            self.update_parent_key(path, level - 1, pki + 1, k1)
+            self.update_parent_key(tree, path, level - 1, pki + 1, k1)
         }
     }
 
@@ -1242,6 +1553,7 @@ impl<'env> RwTxn<'env> {
     /// insert, which splits the parent if the longer key no longer fits.
     fn update_parent_key(
         &mut self,
+        tree: TreeId,
         path: &mut [(u64, usize)],
         parent_level: usize,
         child_idx: usize,
@@ -1261,7 +1573,7 @@ impl<'env> RwTxn<'env> {
                 .map_err(corrupt)?
                 .remove(child_idx);
         }
-        self.insert_into_branch(path, parent_level as isize, child_idx, new_key, child)
+        self.insert_into_branch(tree, path, parent_level as isize, child_idx, new_key, child)
     }
 
     /// §10 MERGE, always right-into-left: append the right page's entries to
@@ -1269,6 +1581,7 @@ impl<'env> RwTxn<'env> {
     /// free the right page. The caller then rebalances the parent.
     fn merge_pages(
         &mut self,
+        tree: TreeId,
         path: &mut [(u64, usize)],
         level: usize,
         sib: u64,
@@ -1291,7 +1604,7 @@ impl<'env> RwTxn<'env> {
             for (j, c) in cells.iter().enumerate() {
                 self.insert_owned_leaf_cell(left, base + j, c)?;
             }
-            self.main_db.leaf_pages -= 1;
+            self.record_mut(tree).leaf_pages -= 1;
         } else {
             // The right branch's node 0 regains its explicit key: the parent
             // separator being dropped (§10 merge / §6.5 inverse).
@@ -1312,7 +1625,7 @@ impl<'env> RwTxn<'env> {
                     b.insert(base + j, &c.key, c.child).map_err(corrupt)?;
                 }
             }
-            self.main_db.branch_pages -= 1;
+            self.record_mut(tree).branch_pages -= 1;
         }
         {
             let frame = self.dirty.bytes_mut(ppg).expect("parent is dirty");
@@ -1336,13 +1649,14 @@ impl<'env> RwTxn<'env> {
     /// working record to empty.
     fn clear_main(&mut self) -> Result<()> {
         self.guard_ok()?;
-        if self.main_db.root == PGNO_INVALID {
+        let rec = *self.record(TreeId::Main);
+        if rec.root == PGNO_INVALID {
             self.main_db = DBRecord::empty();
             return Ok(());
         }
         let mut pages = Vec::new();
         let mut runs = Vec::new();
-        let res = self.collect_tree(self.main_db.root, self.main_db.depth, &mut pages, &mut runs);
+        let res = self.collect_tree(rec.root, rec.depth, &mut pages, &mut runs);
         if let Err(e) = res {
             self.errored = true;
             return Err(e);
@@ -1400,6 +1714,8 @@ impl<'env> RwTxn<'env> {
         self.dirty.is_empty()
             && self.freed.is_empty()
             && self.loose.is_empty()
+            && self.drains.is_empty()
+            && self.reclaimed.is_empty()
             && self.next_pgno == self.base.last_pg + 1
             && self.main_db == self.base.main_db
             && self.free_db == self.base.free_db
@@ -1419,6 +1735,158 @@ impl<'env> RwTxn<'env> {
             self.next_pgno -= 1;
         }
         self.loose = set.into_iter().collect();
+    }
+
+    /// Write a PIL under `BE(f)` into the GC tree via the RESERVE path
+    /// (GC-11 step (c) / GC-20 rewrite): the engine places the cell (possibly
+    /// splitting GC leaves / spilling to an overflow run, GC-5), then the ids
+    /// are encoded straight into the dirty frame — no double buffering of a
+    /// potentially multi-MB PIL.
+    fn put_pil(&mut self, f: u64, ids: &[u64]) -> Result<()> {
+        let key = gc_key_encode(f);
+        let len = pil_size(ids.len());
+        let loc = self.put_tree(TreeId::Free, &key, PutFlags::EMPTY, ValSrc::Reserve(len))?;
+        match loc {
+            ReserveLoc::Big(head) => {
+                let frame = self.dirty.bytes_mut(head).expect("run frame present");
+                pil_encode_into(ids, &mut frame[HEADER_SIZE..HEADER_SIZE + len]);
+            }
+            ReserveLoc::Inline => {
+                // Locate the settled cell (it may have moved through a split).
+                let (path, found) = self.search_path(TreeId::Free, &key)?;
+                debug_assert!(found, "reserved GC key must be present");
+                let (lpg, ki) = *path.last().expect("non-empty path");
+                let frame = self.dirty.bytes_mut(lpg).expect("GC leaf is dirty");
+                let (off, dsize) = {
+                    let leaf = LeafMut::from_valid(&mut *frame, self.psize).map_err(corrupt)?;
+                    leaf.inline_value_at(ki).map_err(corrupt)?
+                };
+                debug_assert_eq!(dsize as usize, len);
+                pil_encode_into(ids, &mut frame[off..off + len]);
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit step C1 (SPEC 05 §4 GC-11..13 as amended by ADR-0005, SPEC 04
+    /// §9): release trailing loose pages (GC-10), merge the surviving loose
+    /// pages into the freed set (GC-9, mirroring the fork's
+    /// `mdb_freelist_save` loose merge), then loop to a fixed point: rewrite
+    /// every drained entry's remainder / delete the empties (GC-20), and
+    /// write the freed set under `BE(writer_txnid)`.
+    ///
+    /// **Crash safety:** everything here mutates dirty frames and the working
+    /// `free_db` record only; nothing reaches disk before C2, so a crash at
+    /// any point inside C1 recovers to `N−1` byte-identically (GC-14, REC-6
+    /// H0). Between C2 and C5, a page drained from entry `F` may already be
+    /// overwritten on disk — safe, because the fallback meta `N−1` still holds
+    /// the old `free_db` root whose entry `F` lists that page as free and
+    /// whose trees do not reference it (`F ≤ oldest_reader() ≤ N−1`, TXN-62).
+    ///
+    /// **Allocation restriction (GC-12 as amended):** `alloc_mode = GcSave`
+    /// for the whole procedure — `allocate` never **reads** the GC tree; it
+    /// draws loose pages (including contiguous loose runs), pages from the
+    /// **already-loaded drain pool** ([`RwTxn::save_pool_draw`]), or extends.
+    /// Pool draws are what keep file growth bounded: the in-save COW of a
+    /// committed GC page cannot reuse its own predecessor (the `N−1` meta
+    /// still references it, TXN-62), so a total draw ban would extend the
+    /// file on every commit, unboundedly under churn. The anti-leak property
+    /// the ban existed for is provided by the fixed point instead: an entry
+    /// touched by a pool draw goes back on the `pending` rewrite set, and the
+    /// loop only exits when no rewrite is pending — so the final tree state
+    /// never lists a handed-out page.
+    ///
+    /// **Termination (GC-13):** each iteration that does not exit strictly
+    /// shrinks the finite drain pool (a draw), grows `freed` by
+    /// COW-obsoleting a **committed** GC page (finitely many), or folds a
+    /// loose page into `freed` (each id folds at most once); all three are
+    /// bounded, and the previous iteration's PIL value run is loose and is
+    /// re-served to the next iteration's allocation (free-before-allocate
+    /// ordering inside the put). `FREELIST_SAVE_MAX_ITERS` turns a regression
+    /// into a panic.
+    fn freelist_save(&mut self) -> Result<()> {
+        debug_assert!(self.alloc_mode == AllocMode::Normal);
+        self.alloc_mode = AllocMode::GcSave;
+        debug_assert!(self.save_touched.is_empty());
+        // Every ops-drained entry needs its GC-20 rewrite at least once.
+        let mut pending: std::collections::BTreeSet<u64> = self.drains.keys().copied().collect();
+        // Release-active bound on the *inner* rewrite loop (GC-13 guard, ADR
+        // review finding 2): each inner iteration consumes one pending entry,
+        // and an entry only re-enters `pending` via an in-save pool draw,
+        // which strictly shrinks the finite pool — so total inner iterations
+        // across the whole save are bounded by (initial entries) + (total
+        // pool ids) + slack. A regression confined to the inner loop panics
+        // loudly instead of hanging.
+        let inner_budget = pending.len() + self.drains.values().map(Vec::len).sum::<usize>() + 16;
+        let mut inner_iters = 0usize;
+        // (b) GC-10 trailing shrink of ops-era loose pages, then GC-9: the
+        // survivors join the freed set up front (LMDB parity — the fork's
+        // freelist_save merges loose pages into the list first). Loose pages
+        // *generated by the loop below* (a replaced PIL overflow run) are
+        // re-served to later in-save allocations or folded in at the end.
+        self.release_trailing_loose();
+        self.freed.extend(std::mem::take(&mut self.loose));
+        let mut iters = 0usize;
+        loop {
+            iters += 1;
+            assert!(
+                iters <= FREELIST_SAVE_MAX_ITERS,
+                "freelist_save failed to reach a fixed point (GC-13)"
+            );
+            // (a) apply_drains (GC-11a/GC-20): rewrite the remainder of every
+            // pending entry; delete fully-drained ones. Never delete a
+            // partially-drained entry (leaks the remainder), never leave a
+            // drained id behind (double-hand-out). A put/delete here may draw
+            // from the pool (re-dirtying entries — merged from `save_touched`)
+            // or free committed GC pages (growing `freed`).
+            loop {
+                pending.extend(std::mem::take(&mut self.save_touched));
+                let Some(&f) = pending.iter().next() else {
+                    break;
+                };
+                pending.remove(&f);
+                inner_iters += 1;
+                assert!(
+                    inner_iters <= inner_budget,
+                    "freelist_save drain-rewrite loop exceeded its budget (GC-13)"
+                );
+                let remaining = self.drains.get(&f).cloned().unwrap_or_default();
+                if remaining.is_empty() {
+                    self.drains.remove(&f);
+                    let existed = self.delete_tree(TreeId::Free, &gc_key_encode(f))?;
+                    debug_assert!(existed, "drained GC entry {f} missing from the tree");
+                } else {
+                    self.put_pil(f, &remaining)?;
+                }
+            }
+            // (c) this txn's own entry under BE(writer_txnid).
+            self.freed.sort_unstable();
+            let pre_dedup = self.freed.len();
+            self.freed.dedup();
+            debug_assert_eq!(self.freed.len(), pre_dedup, "page double-freed (GC-4)");
+            let before = self.freed.len();
+            if before > 0 {
+                let ids = self.freed.clone();
+                self.put_pil(self.txnid, &ids)?;
+                if self.freed.len() != before {
+                    continue; // the put freed committed GC pages; the PIL must grow
+                }
+            }
+            // Fixed-point checks: no entry awaits a re-rewrite (anti-leak — a
+            // pool draw during the writes above means some tree entry still
+            // lists a handed-out page), and no loose page survives unlisted
+            // (GC-9/GC-10).
+            pending.extend(std::mem::take(&mut self.save_touched));
+            if !pending.is_empty() {
+                continue;
+            }
+            self.release_trailing_loose();
+            if self.loose.is_empty() {
+                break; // true fixed point
+            }
+            self.freed.extend(std::mem::take(&mut self.loose));
+        }
+        Ok(())
     }
 
     /// Commit (SPEC 04 TXN-58/61): run the pipeline; on success the new meta
@@ -1456,11 +1924,10 @@ impl<'env> RwTxn<'env> {
         // ----- C0: no nested readers exist before M1.9 (child_count ≡ 0);
         // the freed-page list is already accumulated (GC-6). -----
 
-        // ----- C1: freelist_save (SPEC 05 §4) — M1.4 stub (ADR-0004 D6/OQ4).
-        // The GC-10 trailing shrink runs; the freed/loose sets are NOT written
-        // to the GC DB and leak on disk until M1.5 fills this stub in. -----
-        self.release_trailing_loose();
-        // freelist_save(self) — M1.5 lands here (C1 hook point).
+        // ----- C1: freelist_save (SPEC 05 §4, GC-11..14; ADR-0005 D2):
+        // drains applied, trailing loose released, this txn's freed set
+        // written under BE(writer_txnid) — all into dirty frames only. -----
+        self.freelist_save()?;
         inner.run_hook(HookPoint::H0);
         // Crash here: nothing written — disk is byte-identical to snapshot
         // `N-1` (REC-6 H0).
@@ -1471,10 +1938,11 @@ impl<'env> RwTxn<'env> {
             for pgno in self.dirty.sorted_pgnos() {
                 let data = self.dirty.bytes(pgno).expect("sorted pgno present");
                 // TXN-62: C2 may only write pages the live meta `N-1` does not
-                // reference. In M1.4 every allocation is beyond the committed
-                // high-water (extend-only + this-txn loose reuse), so:
+                // reference: beyond the committed high-water (extend / loose),
+                // or GC-reclaimed under the oldest-reader gate (freed by
+                // `F ≤ oldest ≤ N-1`, hence absent from `N-1`'s trees).
                 debug_assert!(
-                    pgno > self.committed_last_pg,
+                    pgno > self.committed_last_pg || self.reclaimed.contains(&pgno),
                     "TXN-62 violation: writing page {pgno} referenced by the live snapshot"
                 );
                 backing.write_at_page(pgno, psize, data)?;
@@ -1551,7 +2019,7 @@ impl Database {
     /// [`MdbError::BadValSize`] (empty/oversized key, oversized value),
     /// [`MdbError::MapFull`], [`MdbError::BadTxn`] on a poisoned txn.
     pub fn put(&self, txn: &mut RwTxn<'_>, key: &[u8], value: &[u8]) -> Result<()> {
-        txn.put_main(key, PutFlags::EMPTY, ValSrc::Val(value))
+        txn.put_tree(TreeId::Main, key, PutFlags::EMPTY, ValSrc::Val(value))
             .map(|_| ())
     }
 
@@ -1569,7 +2037,8 @@ impl Database {
         key: &[u8],
         value: &[u8],
     ) -> Result<()> {
-        txn.put_main(key, flags, ValSrc::Val(value)).map(|_| ())
+        txn.put_tree(TreeId::Main, key, flags, ValSrc::Val(value))
+            .map(|_| ())
     }
 
     /// `put_reserved(txn, key, len, f)` (SPEC 00 row 35, `MDB_RESERVE`,
@@ -1589,7 +2058,7 @@ impl Database {
         len: usize,
         f: impl FnOnce(&mut [u8]),
     ) -> Result<()> {
-        let loc = txn.put_main(key, PutFlags::EMPTY, ValSrc::Reserve(len))?;
+        let loc = txn.put_tree(TreeId::Main, key, PutFlags::EMPTY, ValSrc::Reserve(len))?;
         match loc {
             ReserveLoc::Big(head) => {
                 let frame = txn.dirty.bytes_mut(head).expect("run frame present");
@@ -1597,7 +2066,7 @@ impl Database {
             }
             ReserveLoc::Inline => {
                 // Locate the settled cell (it may have moved through a split).
-                let (path, found) = txn.search_path(key)?;
+                let (path, found) = txn.search_path(TreeId::Main, key)?;
                 debug_assert!(found, "reserved key must be present");
                 let (lpg, ki) = *path.last().expect("non-empty path");
                 let frame = txn.dirty.bytes_mut(lpg).expect("leaf is dirty");
@@ -1619,7 +2088,7 @@ impl Database {
     /// [`MdbError::BadTxn`] on a poisoned txn; [`MdbError::MapFull`] if the
     /// COW/rebalance ran out of map (which also poisons the txn).
     pub fn delete(&self, txn: &mut RwTxn<'_>, key: &[u8]) -> Result<bool> {
-        txn.delete_main(key)
+        txn.delete_tree(TreeId::Main, key)
     }
 
     /// `delete_range(txn, lower, upper)` (SPEC 00 row 37): delete every entry
@@ -1644,7 +2113,7 @@ impl Database {
         };
         let mut n = 0u64;
         for k in &keys {
-            if txn.delete_main(k)? {
+            if txn.delete_tree(TreeId::Main, k)? {
                 n += 1;
             }
         }
@@ -1741,7 +2210,7 @@ impl RwCursor<'_, '_> {
             CurPos::At(k) => {
                 let k = k.clone();
                 self.txn
-                    .put_main(&k, PutFlags::EMPTY, ValSrc::Val(value))
+                    .put_tree(TreeId::Main, &k, PutFlags::EMPTY, ValSrc::Val(value))
                     .map(|_| ())?;
                 Ok(true)
             }
@@ -1760,7 +2229,7 @@ impl RwCursor<'_, '_> {
         match &self.pos {
             CurPos::At(k) => {
                 let k = k.clone();
-                let existed = self.txn.delete_main(&k)?;
+                let existed = self.txn.delete_tree(TreeId::Main, &k)?;
                 self.pos = CurPos::AfterDelete(k);
                 Ok(existed)
             }
@@ -1777,6 +2246,21 @@ mod tests {
 
     const PS: u32 = 4096;
     const MAP: u64 = 1 << 20;
+
+    #[test]
+    fn find_run_picks_deterministically() {
+        // GC-19: n == 1 -> smallest id.
+        assert_eq!(find_run(&[5, 9, 10, 11], 1), Some(5));
+        assert_eq!(find_run(&[], 1), None);
+        // GC-15/21: first contiguous run of length >= n.
+        assert_eq!(find_run(&[5, 9, 10, 11], 3), Some(9));
+        assert_eq!(find_run(&[5, 9, 10, 11], 2), Some(9));
+        assert_eq!(find_run(&[5, 9, 10, 11], 4), None);
+        // A longer run serves a shorter request from its head.
+        assert_eq!(find_run(&[2, 3, 4, 5, 6], 3), Some(2));
+        // Gaps split runs.
+        assert_eq!(find_run(&[2, 4, 6, 8], 2), None);
+    }
 
     fn kv(i: u32) -> (Vec<u8>, Vec<u8>) {
         (

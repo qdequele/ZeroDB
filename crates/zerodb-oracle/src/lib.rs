@@ -129,6 +129,34 @@ pub fn run<A: Engine, B: Engine>(ops: &[Op]) -> Result<(), Box<Divergence>> {
                 b: rb,
             }));
         }
+        // M1.5 file-size tripwire (ADR-0005 D5, approved bands): after every
+        // commit, the second engine's on-disk size must stay within
+        // `BASE + 1.5x` of the reference's — a cheap unbounded-GC-growth
+        // detector on every fuzz case / proptest sequence. `BASE` = 72 pages
+        // (72 x 4096 = 288 KiB): the deterministic minimum is 65 pages, set
+        // by `deep_split_cascade_then_delete_to_empty` (400 ascending
+        // ~500-byte keys), whose gap is NOT fixed overhead but the measured
+        // sequential-plain-put fill-factor divergence — zerodb's §6.4 median
+        // split yields ~50% leaves on ascending inserts where the fork's
+        // `mdb_page_split` splits at the insert point, giving a true ~2x
+        // leaf-page ratio on that workload (zerodb 263 vs lmdb 132 pages at
+        // peak; flagged for triage in ADR-0005 D5 / M1.5 report — a split
+        // heuristic question for SPEC 03 §6.4, not a GC leak: reuse was
+        // verified to hold the file exactly flat across generations). The
+        // harness's <= 64-op fuzz sequences keep leaf counts far below this
+        // bound, so the tripwire still catches unbounded GC growth.
+        if matches!(op, Op::Commit) {
+            if let (Some(sa), Some(sb)) = (a.real_disk_size(), b.real_disk_size()) {
+                const BASE: u64 = 72 * 4096;
+                assert!(
+                    sb <= BASE + sa.saturating_mul(3) / 2,
+                    "file-size tripwire at op #{index}: {} = {sb} bytes vs {} = {sa} bytes \
+                     (band BASE=288KiB + 1.5x, ADR-0005 D5)",
+                    b.name(),
+                    a.name(),
+                );
+            }
+        }
     }
     Ok(())
 }

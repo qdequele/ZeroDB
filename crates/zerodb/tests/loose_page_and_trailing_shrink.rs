@@ -98,9 +98,11 @@ fn same_txn_alloc_then_free_overflow_reused_leaves_only_the_leaf_cow() {
         .len();
     assert_eq!(
         size_after,
-        size_before + PS as u64,
+        size_before + 2 * PS as u64,
         "the whole 5-page overflow run must be reclaimed (GC-7/8/10); the only \
-         durable growth allowed is the one-page leaf COW"
+         durable growth allowed is the one-page leaf COW plus the one GC leaf \
+         page recording the freed old leaf (M1.5 freelist_save, SPEC 05 GC-11 — \
+         pre-M1.5 this txn leaked the old leaf instead of listing it)"
     );
 
     let rtxn = env.read_txn().unwrap();
@@ -153,9 +155,11 @@ fn trailing_loose_pages_shrink_next_pgno() {
         .len();
     assert_eq!(
         size_after,
-        size_seed + PS as u64,
+        size_seed + 2 * PS as u64,
         "a 10-page trailing alloc-then-free must shrink back to just the one \
-         unavoidable leaf-COW page (GC-10), not leak any of the 10 overflow pages"
+         unavoidable leaf-COW page (GC-10) plus the one GC leaf page recording \
+         the freed old leaf (M1.5 freelist_save), not leak any of the 10 \
+         overflow pages"
     );
 
     // The env is still fully usable afterward (the rolled-back pgnos are

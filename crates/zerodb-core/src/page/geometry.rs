@@ -114,6 +114,51 @@ pub fn gc_key_decode(key: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(arr))
 }
 
+/// Encoded byte length of a page-id list holding `count` ids (SPEC 02 §7,
+/// SPEC 05 GC-3): a `u64` count prefix plus `count` × `u64` page numbers, all
+/// little-endian.
+#[must_use]
+pub fn pil_size(count: usize) -> usize {
+    8 + 8 * count
+}
+
+/// Encode a PIL (SPEC 05 GC-3/GC-4) into `buf`, which must be exactly
+/// [`pil_size`]`(ids.len())` bytes. `ids` must be strictly ascending and
+/// unique (GC-4) — debug-asserted, not re-sorted.
+///
+/// # Panics
+///
+/// If `buf` has the wrong length (internal-caller contract).
+pub fn pil_encode_into(ids: &[u64], buf: &mut [u8]) {
+    assert_eq!(buf.len(), pil_size(ids.len()), "PIL buffer size mismatch");
+    debug_assert!(ids.windows(2).all(|w| w[0] < w[1]), "PIL not sorted/unique");
+    buf[0..8].copy_from_slice(&(ids.len() as u64).to_le_bytes());
+    for (i, id) in ids.iter().enumerate() {
+        buf[8 + 8 * i..16 + 8 * i].copy_from_slice(&id.to_le_bytes());
+    }
+}
+
+/// Decode a PIL (SPEC 05 GC-3): validates the length shape and the count
+/// prefix, returning the page ids. Returns `None` on any malformation (wrong
+/// length multiple, count/length disagreement). Ordering is **not** validated
+/// here — the check tool asserts GC-4/INV-26 separately with diagnostics.
+#[must_use]
+pub fn pil_decode(bytes: &[u8]) -> Option<Vec<u64>> {
+    if bytes.len() < 8 || bytes.len() % 8 != 0 {
+        return None;
+    }
+    let count = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
+    if count as usize != bytes.len() / 8 - 1 {
+        return None;
+    }
+    Some(
+        bytes[8..]
+            .chunks_exact(8)
+            .map(|c| u64::from_le_bytes(c.try_into().expect("8-byte chunk")))
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +213,22 @@ mod tests {
         // psize 4096, max_node_size 2030. Inline iff 8 + ksize + dsize <= 2030.
         assert!(value_is_inline(2, 2020, 4096)); // 8+2+2020 = 2030 -> inline
         assert!(!value_is_inline(2, 2021, 4096)); // 2031 -> overflow
+    }
+
+    #[test]
+    fn pil_codec_roundtrip_and_malformations() {
+        for ids in [vec![], vec![2u64], vec![2, 3, 7, 100, u64::MAX - 1]] {
+            let mut buf = vec![0u8; pil_size(ids.len())];
+            pil_encode_into(&ids, &mut buf);
+            assert_eq!(pil_decode(&buf), Some(ids.clone()));
+        }
+        // Malformed: too short, non-multiple, count mismatch.
+        assert_eq!(pil_decode(&[]), None);
+        assert_eq!(pil_decode(&[0u8; 7]), None);
+        assert_eq!(pil_decode(&[0u8; 12]), None);
+        let mut bad = vec![0u8; 16];
+        bad[0] = 7; // claims 7 ids, has 1
+        assert_eq!(pil_decode(&bad), None);
     }
 
     #[test]
