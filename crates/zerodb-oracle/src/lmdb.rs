@@ -70,6 +70,10 @@ pub struct LmdbEngine {
     /// Set when the env was irrecoverably lost (double reopen failure); every
     /// subsequent op returns a comparable error instead of panicking.
     poisoned: Option<String>,
+    /// Whether the current write txn has executed a `ClearDb` — the FORK-1
+    /// guard fact (see `driver::classify` and `docs/UPSTREAM-BUGS.md`). Set in
+    /// `clear_db`, reset at every txn boundary.
+    cleared_in_txn: bool,
     dir: TempDir,
 }
 
@@ -114,6 +118,18 @@ impl LmdbEngine {
             None
         } else {
             Some(self.dbs[db as usize % self.dbs.len()].name.clone())
+        }
+    }
+
+    /// Map this engine's concrete transaction state onto the abstract
+    /// [`TxnState`](crate::driver::TxnState) the shared classifier reasons over.
+    fn txn_state(&self) -> crate::driver::TxnState {
+        use crate::driver::TxnState;
+        match &self.active {
+            Active::None => TxnState::None,
+            Active::Rw(_) => TxnState::Rw,
+            Active::Ro(_) => TxnState::Ro,
+            Active::RwNested { .. } => TxnState::RwNested,
         }
     }
 
@@ -168,6 +184,7 @@ impl Engine for LmdbEngine {
             env: Some(Box::new(env)),
             map_size: BASE_MAP_SIZE,
             poisoned: None,
+            cleared_in_txn: false,
             dir,
         }
     }
@@ -181,6 +198,18 @@ impl Engine for LmdbEngine {
             return OpResult::Err(crate::result::OracleError::Other(format!(
                 "poisoned: {reason}"
             )));
+        }
+        // The shared driver is the single authority on op-validity/Skip
+        // (M1.2 hoist). If it says skip, do so without touching the backend; the
+        // per-method `db_at`/`write_txn`/`read_source` helpers below only resolve
+        // handles from here on (their skip arms are unreachable after this gate).
+        if let Some(skip) = crate::driver::classify(
+            op,
+            self.txn_state(),
+            self.dbs.is_empty(),
+            self.cleared_in_txn,
+        ) {
+            return OpResult::Skipped(skip);
         }
         match op {
             // ---------------- environment ----------------
@@ -274,6 +303,8 @@ impl LmdbEngine {
     }
 
     fn begin_rw(&mut self) -> OpResult {
+        // Txn boundary: reset the FORK-1 guard fact.
+        self.cleared_in_txn = false;
         if !matches!(self.active, Active::None) {
             return OpResult::Skipped(Skip::TxnAlreadyOpen);
         }
@@ -319,6 +350,8 @@ impl LmdbEngine {
     }
 
     fn commit(&mut self) -> OpResult {
+        // Txn boundary: reset the FORK-1 guard fact.
+        self.cleared_in_txn = false;
         match std::mem::replace(&mut self.active, Active::None) {
             Active::Rw(w) => match w.commit() {
                 Ok(()) => {
@@ -354,6 +387,8 @@ impl LmdbEngine {
     }
 
     fn abort(&mut self) -> OpResult {
+        // Txn boundary: reset the FORK-1 guard fact.
+        self.cleared_in_txn = false;
         match std::mem::replace(&mut self.active, Active::None) {
             Active::None => OpResult::Skipped(Skip::NoTxn),
             Active::Rw(w) => {
@@ -458,6 +493,8 @@ impl LmdbEngine {
     }
 
     fn clear_db(&mut self, db: u8) -> OpResult {
+        // FORK-1 guard fact: this write txn has cleared a db (see driver::classify).
+        self.cleared_in_txn = true;
         let db = match self.db_at(db) {
             Ok(d) => d,
             Err(r) => return r,

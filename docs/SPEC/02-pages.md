@@ -528,13 +528,26 @@ reachability-xor-freeness invariant (INV-10, INV-14).
 ## §8 — File geometry and growth (map_size, MAP_FULL)
 
 - **Layout.** The env is a single regular data file (SPEC 00 row 22 depends on
-  it). Page 0 = meta A, page 1 = meta B, pages `≥ 2` = tree/overflow/GC pages.
-  The file length is always a whole number of pages.
+  it) named **`zerodb.dat`** inside the env **directory** (the directory-env
+  convention, SPEC 00 row 7; the path passed to `open` is the directory, not the
+  file). Page 0 = meta A, page 1 = meta B, pages `≥ 2` = tree/overflow/GC pages.
+  The file length is always a whole number of pages. (M1.2 fixed the filename;
+  it is ZeroDB's own layout, not LMDB's `data.mdb`/`lock.mdb` — D-002.)
 - **map_size.** `meta.map_size` is the size of the mmap region and the ceiling
   on the data file. It is set at env creation and read back via
   `Env::info().map_size` (SPEC 00 row 20). Growth beyond it is *not* automatic
   in Phase 1 (auto-geometry is Phase 3.2): heed callers grow by reopening with a
   larger `map_size` after a `MapFull` (SPEC 00 rows 3, 55).
+  - **Runtime `map_size` selection (M1.2).** At open the effective `map_size` is
+    the caller's `EnvOpenOptions::map_size` when set, else the persisted
+    `meta.map_size`. In M1.2 (read-only, no write path) the read mmap covers the
+    *file length*, not `map_size`, so accessing existing pages can never fault
+    past EOF; the write path (M1.4) grows the file toward `map_size` and remaps.
+  - **`map_size` value leniency vs heed (D-006, PROPOSED).** heed rejects a
+    `map_size` that is not a multiple of the **OS** page size; ZeroDB does not
+    (its DB page size is independent of the OS page size, §0), so it accepts any
+    `map_size ≥ 2·psize`. Unobservable to consumers, which always clamp before
+    the call (SPEC 00 row 3). See `docs/DIVERGENCES.md` D-006.
 - **Allocation.** New pages are taken first from the GC DB (SPEC 05; where a
   reader still pins them, from end-of-file), otherwise by bumping `last_pg`.
   A single-page allocation needs one free page; an `N`-page overflow run needs

@@ -8,10 +8,14 @@
 //! * The reference engine is [`LmdbEngine`], backed by `heed =0.22.1` — the
 //!   Meilisearch LMDB fork (`mdb.master.nested-rtxns`), the exact C Meilisearch
 //!   runs. See ADR-0001.
-//! * The native zerodb engine arrives in milestone 1.2+ as a second [`Engine`]
-//!   implementor. Until then, the Phase 0 acceptance mode is [`run_self_test`]:
-//!   `LmdbEngine` vs a second, independent `LmdbEngine`, which validates the
-//!   harness is deterministic and order-stable.
+//! * The native [`ZerodbEngine`] is the second [`Engine`] implementor. At M1.2
+//!   it covers only the environment-lifecycle op ([`Op::Reopen`]); every other
+//!   op is gated out symmetrically by the driver ([`Engine::implements`]), so a
+//!   `run::<LmdbEngine, ZerodbEngine>` differential run restricts itself to the
+//!   ops both engines support and grows as later milestones fill ops in.
+//! * [`run_self_test`] (`LmdbEngine` vs a second, independent `LmdbEngine`)
+//!   remains the harness's determinism/order-stability check and backs the
+//!   `diff_ops` fuzz target.
 //!
 //! ```
 //! use zerodb_oracle::{run_self_test, Op, DbName};
@@ -29,16 +33,20 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod driver;
 mod engine;
 mod lmdb;
 mod op;
 mod result;
 pub mod tempdir;
+mod zerodb_engine;
 
+pub use driver::{classify, TxnState};
 pub use engine::Engine;
 pub use lmdb::LmdbEngine;
 pub use op::{DbName, Key, Op, PutFlag, Value};
 pub use result::{OpResult, OracleError, Skip};
+pub use zerodb_engine::ZerodbEngine;
 
 /// A point where two engines produced different results for the same op.
 #[derive(Clone, PartialEq, Eq)]
@@ -86,6 +94,13 @@ pub fn run<A: Engine, B: Engine>(ops: &[Op]) -> Result<(), Box<Divergence>> {
     let mut a = A::new();
     let mut b = B::new();
     for (index, op) in ops.iter().enumerate() {
+        // Symmetric milestone gate: if either engine does not yet implement this
+        // op, skip it on both sides so a partially-built engine restricts the
+        // differential to its supported ops without spurious divergences
+        // (see `Engine::implements`). Neither engine's state advances.
+        if !a.implements(op) || !b.implements(op) {
+            continue;
+        }
         let ra = a.apply(op);
         let rb = b.apply(op);
         if ra != rb {
@@ -126,9 +141,10 @@ pub fn run_self_test(ops: &[Op]) -> Result<(), Box<Divergence>> {
     run::<LmdbEngine, LmdbEngine>(ops)
 }
 
-// The native zerodb `Engine` impl lands in M1.2+; at that point add, in the
-// consuming crate/test:
-//
-//     zerodb_oracle::run::<LmdbEngine, ZerodbEngine>(&ops)
-//
-// and graduate the `diff_ops` fuzz target from `run_self_test` to it.
+// The native differential is `run::<LmdbEngine, ZerodbEngine>(&ops)`. At M1.2
+// only `Op::Reopen` is implemented on the zerodb side (see `ZerodbEngine`), so
+// its dedicated env-lifecycle tests live in
+// `tests/env_lifecycle_differential.rs`. The `diff_ops` fuzz target stays on
+// `run_self_test` until enough ops are implemented to make a differential fuzz
+// worthwhile (it will also need `Op::Reopen` map sizes normalized to the OS page
+// size — DIVERGENCES D-006 — before graduating).

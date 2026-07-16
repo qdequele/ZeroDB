@@ -46,6 +46,19 @@ pub enum Skip {
     NoNestedToEnd,
     /// `Begin*` while a transaction is already active.
     TxnAlreadyOpen,
+    /// The op is not yet implemented by one of the engines in this milestone, so
+    /// [`crate::run`] skips it symmetrically on both sides (see
+    /// [`crate::Engine::implements`]). A differential run restricts itself to the
+    /// ops both engines support.
+    NotImplemented,
+    /// The op combination is skipped because it crashes the *reference* engine —
+    /// a confirmed bug in the vendored LMDB fork, not an observable behavior an
+    /// oracle can assert. See `docs/UPSTREAM-BUGS.md` FORK-1 (SEGV in
+    /// `_mdb_cursor_put`: APPEND put after a `clear` of another db in the same
+    /// write txn, when the put should return `KeyExist`). The skip is decided by
+    /// the shared [`classify`](crate::driver::classify), so both engines skip
+    /// symmetrically; remove when the fork fix lands upstream.
+    KnownForkBug,
 }
 
 /// The observable outcome of applying one [`Op`](crate::Op).

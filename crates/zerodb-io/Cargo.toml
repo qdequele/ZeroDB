@@ -4,3 +4,7 @@ version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+[dependencies]
+zerodb-core = { path = "../zerodb-core" }
+memmap2.workspace = true

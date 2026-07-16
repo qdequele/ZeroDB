@@ -13,6 +13,9 @@ license.workspace = true
 heed = "=0.22.1"
 thiserror.workspace = true
 arbitrary.workspace = true
+# The native engine under test. Workspace-internal, no C linkage.
+zerodb = { path = "../zerodb" }
+zerodb-core = { path = "../zerodb-core" }
 
 [dev-dependencies]
 proptest.workspace = true
