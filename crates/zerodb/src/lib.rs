@@ -17,6 +17,7 @@ use std::path::Path;
 pub use zerodb_core::check;
 pub use zerodb_core::env::{CommitHook, Env, EnvClosingEvent, EnvInfo, HookPoint, Snapshot};
 pub use zerodb_core::error::{Error, MdbError, Result};
+pub use zerodb_core::nested::NestedRoTxn;
 pub use zerodb_core::rotxn::{free_page_count, Database, DatabaseStat, RoRange, RoTxn, TxnRead};
 pub use zerodb_core::rwtxn::{PutFlags, RwCursor, RwTxn};
 

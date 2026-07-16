@@ -8,7 +8,26 @@
 //! index exactly as [`crate::LmdbEngine`] does, so the two engines exercise
 //! identical multi-DB workloads. Reads/writes target the resolved handle;
 //! `VerifyGet` opens the DB in a fresh read txn via
-//! [`zerodb::Env::open_database`]. Still gated out (M1.9): nested read txns.
+//! [`zerodb::Env::open_database`].
+//!
+//! ## Nested read txns (M1.9, SPEC 04 §5) — now differential
+//!
+//! `BeginNestedRo`/`EndNestedRo` mirror [`crate::LmdbEngine`]'s
+//! `Active::RwNested`: while a nested child is open, every read is served
+//! **through the child** (uncommitted state, TXN-26/27) and every write op is
+//! `Skip::WriteBlockedByNested` — the shared driver classifies that skip
+//! *before either engine runs*, so the fork's technical allowance of
+//! writes-under-a-child (D-005: it does not enforce quiescence; zerodb does)
+//! stays unobservable and the two engines cannot drift. The op model holds
+//! **one** child at a time (like its one-txn limitation); multiple concurrent
+//! children + real thread fan-out are covered by
+//! `crates/zerodb/tests/nested_fanout.rs`.
+//!
+//! Unlike heed's child (a raw `MDB_txn` pointer, no Rust reference into the
+//! parent), `zerodb::NestedRoTxn` holds a **real `&RwTxn`** — so the parent
+//! must sit at a stable heap address while children exist. `Active::Rw`
+//! already boxes the txn (ADR-0007 D5); the nested child borrows the Box's
+//! target and both move together between `Active` variants.
 //!
 //! Earlier scope carries over: every write op runs zerodb's real COW write
 //! path, `Commit` runs the real C0–C6 pipeline (now incl. the C1a catalog
@@ -29,7 +48,9 @@
 //! validates keys itself (`put*` → `BadValSize`); the *read/del* leniency
 //! differences are LMDB API-boundary behaviors applied here.
 
-use zerodb::{check, Database, Env, EnvOpenOptions, Error, MdbError, PutFlags, RoTxn, RwTxn};
+use zerodb::{
+    check, Database, Env, EnvOpenOptions, Error, MdbError, NestedRoTxn, PutFlags, RoTxn, RwTxn,
+};
 
 use crate::result::{OpResult, OracleError, Skip};
 use crate::tempdir::TempDir;
@@ -53,6 +74,12 @@ macro_rules! with_read {
                 let $t = &**w;
                 $body
             }
+            // A live nested child serves the reads (uncommitted view,
+            // TXN-26/27) — mirrors `LmdbEngine::read_source`.
+            Active::RwNested { nested, .. } => {
+                let $t = nested;
+                $body
+            }
             Active::Ro(r) => {
                 let $t = r;
                 $body
@@ -70,6 +97,15 @@ enum Active {
     None,
     Rw(Box<RwTxn<'static>>),
     Ro(RoTxn<'static>),
+    /// A nested read child over the paused write txn (SPEC 04 §5, M1.9).
+    ///
+    /// Field order is load-bearing: `nested` is declared **before** `wtxn`,
+    /// so the child (which borrows the boxed txn) drops before its parent —
+    /// same construction as `LmdbEngine::Active::RwNested`.
+    RwNested {
+        nested: NestedRoTxn<'static>,
+        wtxn: Box<RwTxn<'static>>,
+    },
 }
 
 /// A database handle plus the catalog name it was opened under (mirrors
@@ -125,6 +161,7 @@ impl ZerodbEngine {
             Active::None => TxnState::None,
             Active::Rw(_) => TxnState::Rw,
             Active::Ro(_) => TxnState::Ro,
+            Active::RwNested { .. } => TxnState::RwNested,
         }
     }
 
@@ -133,6 +170,9 @@ impl ZerodbEngine {
     fn write_txn(&mut self) -> Result<&mut RwTxn<'static>, OpResult> {
         match &mut self.active {
             Active::Rw(w) => Ok(w),
+            // Writer paused while a nested child lives (D-005 / TXN-29):
+            // symmetric with `LmdbEngine::write_txn`.
+            Active::RwNested { .. } => Err(OpResult::Skipped(Skip::WriteBlockedByNested)),
             Active::Ro(_) | Active::None => Err(OpResult::Skipped(Skip::NoWriteTxn)),
         }
     }
@@ -257,6 +297,24 @@ impl ZerodbEngine {
                     OpResult::Err(to_oracle(e))
                 }
             },
+            // Commit with a live child first drops the child (mirrors
+            // `LmdbEngine`; the driver only reaches this via `Commit`, which
+            // is legal in `RwNested`), then commits the parent — TXN-33 is
+            // satisfied because the child is gone before `commit()` runs.
+            Active::RwNested { nested, wtxn } => {
+                drop(nested);
+                match wtxn.commit() {
+                    Ok(()) => {
+                        self.committed_dbs = self.dbs.len();
+                        self.debug_check_image();
+                        OpResult::Ok
+                    }
+                    Err(e) => {
+                        self.dbs.truncate(self.committed_dbs);
+                        OpResult::Err(to_oracle(e))
+                    }
+                }
+            }
             Active::Ro(r) => {
                 drop(r);
                 OpResult::Ok
@@ -274,9 +332,78 @@ impl ZerodbEngine {
                 self.dbs.truncate(self.committed_dbs);
                 OpResult::Ok
             }
+            // Child dropped before the parent aborts (field order also
+            // guarantees this if dropped as a unit; mirrors `LmdbEngine`).
+            Active::RwNested { nested, wtxn } => {
+                drop(nested);
+                wtxn.abort();
+                self.dbs.truncate(self.committed_dbs);
+                OpResult::Ok
+            }
             Active::Ro(r) => {
                 drop(r);
                 OpResult::Ok
+            }
+        }
+    }
+
+    fn begin_nested_ro(&mut self) -> OpResult {
+        match std::mem::replace(&mut self.active, Active::None) {
+            Active::Rw(wtxn) => {
+                // Open the nested child and erase its borrow of the boxed
+                // parent to 'static so both can be stored side by side.
+                //
+                // SAFETY (ADR-0007 D5): the child's one reference is
+                // `&RwTxn`, pointing at the **Box's heap target** — a stable
+                // address that survives moves of the `Box` itself and of
+                // `self.active` between variants. Invariants:
+                //  * `wtxn` stays boxed and is never dropped or moved-out
+                //    while `nested` exists (`RwNested` holds both; `nested`
+                //    is a *prior* field, so it drops first, and
+                //    `end_nested_ro`/`commit`/`abort` all drop the child
+                //    before touching the parent);
+                //  * no `&mut RwTxn` is created while `nested` exists — the
+                //    `Active::RwNested` state routes every write op to
+                //    `Skip::WriteBlockedByNested` (and zerodb's own TXN-29
+                //    counter guard backstops even that);
+                //  * the child never escapes `self` and both drop before the
+                //    boxed `Env` (field order of `ZerodbEngine`).
+                let outcome: Result<NestedRoTxn<'static>, Error> = match wtxn.nested_read_txn() {
+                    Ok(n) => Ok(unsafe {
+                        std::mem::transmute::<NestedRoTxn<'_>, NestedRoTxn<'static>>(n)
+                    }),
+                    Err(e) => Err(e),
+                };
+                match outcome {
+                    Ok(nested) => {
+                        self.active = Active::RwNested { nested, wtxn };
+                        OpResult::Ok
+                    }
+                    Err(e) => {
+                        self.active = Active::Rw(wtxn);
+                        OpResult::Err(to_oracle(e))
+                    }
+                }
+            }
+            other => {
+                self.active = other;
+                OpResult::Skipped(Skip::NoWriteTxnForNested)
+            }
+        }
+    }
+
+    fn end_nested_ro(&mut self) -> OpResult {
+        match std::mem::replace(&mut self.active, Active::None) {
+            Active::RwNested { nested, wtxn } => {
+                // Child first (its Drop releases the parent's counter —
+                // TXN-31), then the parent resumes as plain Rw.
+                drop(nested);
+                self.active = Active::Rw(wtxn);
+                OpResult::Ok
+            }
+            other => {
+                self.active = other;
+                OpResult::Skipped(Skip::NoNestedToEnd)
             }
         }
     }
@@ -702,12 +829,10 @@ impl Engine for ZerodbEngine {
         self.env.as_ref().and_then(|e| e.real_disk_size().ok())
     }
 
-    fn implements(&self, op: &Op) -> bool {
-        match op {
-            // Out of scope, gated symmetrically: nested read txns (M1.9).
-            Op::BeginNestedRo | Op::EndNestedRo => false,
-            _ => true,
-        }
+    fn implements(&self, _op: &Op) -> bool {
+        // Every modeled op is differential as of M1.9 (nested read txns were
+        // the last gated pair).
+        true
     }
 
     fn apply(&mut self, op: &Op) -> OpResult {
@@ -757,8 +882,8 @@ impl Engine for ZerodbEngine {
 
             Op::VerifyGet { db, key } => self.verify_get(*db, &key.0),
 
-            // Gated out by `implements`; never reached in a differential run.
-            Op::BeginNestedRo | Op::EndNestedRo => OpResult::Skipped(Skip::NotImplemented),
+            Op::BeginNestedRo => self.begin_nested_ro(),
+            Op::EndNestedRo => self.end_nested_ro(),
         }
     }
 }

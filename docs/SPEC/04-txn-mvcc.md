@@ -393,6 +393,12 @@ hot-path MUST. Nested **write** txns remain unsupported (D-003, TXN-40).
   the write txn's *working* roots (the COW roots the writer has produced so far,
   §SPEC 03 §5), **not** the last committed meta. It therefore observes every
   put/del the writer has performed **before the nested reader was opened**.
+  - *Implementation note (M1.9, ADR-0007 D2): the child **delegates live** to
+    the parent's `TxnRead` rather than copying roots at open — observably
+    equivalent, because mutation is impossible from the first child's open to
+    the last child's drop (TXN-29/30), so the parent's roots/open-table/dirty
+    set are constant across every child's lifetime and all children of one
+    paused window see the identical state.*
 - **TXN-27** — A nested reader reads through the writer's **dirty set** for any
   page the writer has copied, and through the read-only mmap for pages the writer
   has not touched. Reading a dirty page is subject to the value-borrow contract
@@ -419,11 +425,16 @@ page concurrently, the borrow would dangle and the read would race.
     `put_with_flags`, `put_reserved`, `del`, `delete_range`, `clear`,
     `put_current`, `del_current`) asserts `child_count == 0` on entry, in **both**
     debug and release builds. If a nested reader is somehow live (an `unsafe`/FFI
-    path that bypassed the borrow checker), the op returns the documented
-    unsupported/misuse error rather than mutating frozen-but-aliased pages. This
-    backstops TXN-30's compile-time guarantee. This quiescence is a **zerodb**
-    soundness rule the fork does not itself impose — filed as **D-005 (PROPOSED)**
-    in `docs/DIVERGENCES.md` (not observable to any consumer, which always pause
+    path that bypassed the borrow checker), the op returns
+    **`MdbError::BadTxn`** (ADR-0007 Q4, ratified 2026-07-16 — LMDB's own
+    `MDB_BAD_TXN` is "transaction … has a child", the parity-adjacent choice)
+    rather than mutating frozen-but-aliased pages. This backstops TXN-30's
+    compile-time guarantee. *(M1.9 implementation note: the guard lives in the
+    single `guard_ok` funnel every mutating entry passes through, plus
+    `ensure_open` — which mutates the open-table children read via
+    `record_for` — and commit C0.)* This quiescence is a **zerodb** soundness
+    rule the fork does not itself impose — **D-005 (APPROVED)** in
+    `docs/DIVERGENCES.md` (not observable to any consumer, which always pause
     the writer; see §10 conflict block).
 - **TXN-30** — Enforcement is primarily **compile-time**: `nested_read_txn(&wtxn)`
   borrows the `RwTxn` **immutably** (`&self`). All mutating `RwTxn` ops take
@@ -437,10 +448,18 @@ page concurrently, the borrow would dangle and the read would race.
   **live-child counter** on the write txn (incremented at open, decremented at
   drop) additionally guards the internal invariant and lets `commit`/`abort`
   assert `child_count == 0` (TXN-33), catching any `unsafe`/FFI-boundary misuse
-  that bypassed the borrow checker. The counter is a plain `Cell`/`usize` on the
-  single-threaded writer side, or an `AtomicUsize` if children decrement from
-  worker threads (decrement `Release`, the commit-side read `Acquire`, so all
-  child drops happen-before the commit proceeds).
+  that bypassed the borrow checker. The counter is an **`AtomicUsize`**
+  (ADR-0007 D3, ratified 2026-07-16; the `Cell` alternative in the original
+  text is struck — a `Cell` would destroy `RwTxn: Sync`, which the `Send`
+  child derivation depends on, and children really do decrement from worker
+  threads at all six consumer call sites): open `fetch_add(1, Relaxed)` (the
+  opener holds `&RwTxn`; the child reaches its worker through the spawn/send
+  happens-before edge), drop `fetch_sub(1, Release)`, every writer-side check
+  `load(Acquire)` — so all child reads happen-before the writer mutates or
+  commits. Loom-checked as **L6** (`zerodb-core/src/nested.rs`); note the L6
+  mutation-check record there: an all-`Relaxed` weakening is load-buffering-
+  shaped and NOT loom-detectable — the `Release`/`Acquire` pair is normative
+  per this clause, guarded by the per-site comments, not by loom.
 - **TXN-32** — Because the writer is frozen (TXN-29), a nested reader needs **no
   reader-table slot** (TXN-25): the writer performs no allocation while children
   live, so there is nothing for a slot to gate. GC sees only `writer_txnid − 1`
@@ -450,12 +469,20 @@ page concurrently, the borrow would dangle and the read would race.
 
 - **TXN-33** — `RwTxn::commit()` / `abort()` require `child_count == 0` (all
   nested readers dropped). Because of TXN-30 this is normally guaranteed by the
-  borrow checker; the runtime assert is defense-in-depth. A nested reader thus
-  **must not outlive its parent** — enforced by lifetime and asserted by counter.
+  borrow checker; the **commit** path carries the runtime check (C0, TXN-58) as
+  defense-in-depth. The **abort/drop** path deliberately carries no runtime
+  check *(amended 2026-07-16, M1.9 — ratified, session lead under standing
+  directive; ADR-0007 post-implementation notes)*: a live child at parent-drop
+  is unrepresentable in safe Rust, and a nonzero count at drop can only mean
+  `mem::forget(child)` — which consumed the child, aliases nothing, and is
+  harmless; a drop-side assert would false-positive on exactly that case while
+  the FFI-misuse case it could catch is already covered by the per-`&mut`-op
+  TXN-29 guard. A nested reader thus **must not outlive its parent** — enforced
+  by lifetime, asserted by counter at commit and on every mutation.
 - **TXN-34** — A nested reader is strictly read-only; it exposes the `RoTxn`
   read API only (`get`, cursors, `len`, …). Any attempt to obtain a write txn or
-  nested write txn from it is a type error / returns the D-003 unsupported error
-  (TXN-40).
+  nested write txn from it is a type error — no such API exists (TXN-40 as
+  amended, D-003).
 - **TXN-35** — Opening a nested reader while the env is in `WRITE_MAP` mode
   (SPEC 01 §S7) is permitted: the nested reader reads dirty bytes straight from
   the writable map instead of a heap page (§6.4), same borrow contract. (The fork
@@ -463,8 +490,9 @@ page concurrently, the borrow would dangle and the read would race.
 - **TXN-36** — Oracle parity target (PLAN 1.9): randomized
   write-then-open-nested-read-then-read sequences, including reads of uncommitted
   state, and replays of the milli/hannoy fan-out, must match the fork observed
-  through heed. Nested-**write** attempts return the documented D-003 error
-  (TXN-40).
+  through heed. A nested-**write** attempt is **unrepresentable in the API**
+  (TXN-40 as amended): the D-003 acceptance is carried by API absence — a
+  stronger form of "clean error" — not by a runtime test.
 
 ### §5.4 — Relationship to Phase 3.8 snapshot()
 
@@ -766,12 +794,13 @@ every hook; this section defines the steps and their ordering. Both write modes
 >    the abandoned commit's beyond-high-water pages (a bounded space leak milli's
 >    rollback already tolerates, LMDB parity). This needs no SPEC 02 format change;
 >    flagged for maintainer ratification only.
-> 2. **Writer-quiescence rule TXN-29 (D-005 PROPOSED).** The fork technically
->    permits a writer to mutate while nested read children are live; ZeroDB forbids
->    it for Rust soundness and adds a runtime guard (TXN-29). This is **not**
->    observable to any consumer (all six call sites pause the writer), so it is
->    filed as **D-005 PROPOSED** in `docs/DIVERGENCES.md` for a human to ratify,
->    not as an approved functional divergence.
+> 2. **Writer-quiescence rule TXN-29 (D-005 APPROVED, Quentin 2026-07-16).**
+>    The fork technically permits a writer to mutate while nested read children
+>    are live; ZeroDB forbids it for Rust soundness and adds a runtime guard
+>    (TXN-29, `MdbError::BadTxn`). This is **not** observable to any consumer
+>    (all six call sites pause the writer); the oracle keeps it unobservable by
+>    classifying writes-under-a-child as the symmetric
+>    `Skip::WriteBlockedByNested` **before either engine runs**.
 
 ---
 
@@ -784,7 +813,7 @@ every hook; this section defines the steps and their ordering. Both write modes
 | read snapshot pin | TXN-10..13 | SPEC 05 GC-18 |
 | reader table | TXN-14..25 | PLAN 1.8; loom suite L1–L5 (`zerodb-core/src/readers.rs`, `just loom`); stress gate (`zerodb/tests/reader_stress.rs`, `just stress`) |
 | memory ordering | TXN-15/17/19/20 | CLAUDE.md (ARM), SPEC 06 |
-| nested read txn | TXN-26..36 | SPEC 00 row 16, SPEC 01 §S9 |
+| nested read txn | TXN-26..36 | SPEC 00 row 16, SPEC 01 §S9; loom L6 (`zerodb-core/src/nested.rs`); fan-out gate (`zerodb/tests/nested_fanout.rs`); differential (`zerodb-oracle/tests/nested_read_differential.rs`) |
 | value-borrow contract | TXN-37..49 | SPEC 03 §3/§5/§7, SPEC 01 §S3/§S7 |
 | env clone/close/registry | TXN-50..55 | SPEC 00 rows 23–26 |
 | commit pipeline | TXN-61..64 | SPEC 06 REC-1..12 |
@@ -794,8 +823,18 @@ every hook; this section defines the steps and their ordering. Both write modes
 slot release).** TXN-40 (nested write unsupported, D-003) is referenced from
 §5/§8 and defined here:
 
-- **TXN-40** — A nested **write** txn (`Env::nested_write_txn` /
-  `RwTxn::nested`) is **unsupported** (D-003): it returns a clean, documented
-  "unsupported" error (mapped through the heed error taxonomy, §8.1), never a
-  panic and never partial state. Zero consumer call sites (SPEC 00 §A). The 1.14
-  heed-suite gate excludes nested-write tests.
+- **TXN-40** — A nested **write** txn is **unsupported** (D-003) and, as
+  amended by ADR-0007 Q2/Q3 (ratified 2026-07-16), **unrepresentable in the
+  public API**: zerodb exposes **no** nested-write entry point at all — no
+  `Env::nested_write_txn`, no `RwTxn::nested` — which is a strictly stronger
+  form of the original "clean error" clause (nothing to call, so never a
+  panic and never partial state). heed itself keeps `RwTxn::nested`
+  `pub(crate)`, so the heed-zerodb adapter (M1.13) likewise surfaces no
+  nested-write entry point and no error variant is needed. Should any future
+  surface be forced to exist (e.g. an FFI shim), it must return a clean
+  documented "unsupported" error mapped through the heed taxonomy (§8.1).
+  Zero consumer call sites (SPEC 00 §A). The 1.14 heed-suite gate excludes
+  nested-write tests.
+  - *Pre-amendment text (superseded): "it returns a clean, documented
+    'unsupported' error (mapped through the heed error taxonomy, §8.1), never
+    a panic and never partial state."*

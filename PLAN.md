@@ -270,8 +270,9 @@ milestone.
 - **Critical-path milestone** (concurrency): critical-implementer, ADR first.
 - **Accept:** oracle parity (vs the fork) on randomized
   write-then-nested-read sequences incl. reads of uncommitted state;
-  replay of the milli/hannoy fan-out patterns; nested-write attempt returns
-  the documented error (D-003 test).
+  replay of the milli/hannoy fan-out patterns; nested WRITE txns are
+  **unrepresentable in the public API** (TXN-40 as amended 2026-07-16 —
+  stronger than an error; D-003, no stub exists by design).
 
 ### 1.10 Write flags and modes
 - APPEND (with correct misuse errors), NO_OVERWRITE, CURRENT, RESERVE (heed's

@@ -55,6 +55,7 @@ use crate::btree::{Source, Tree};
 use crate::dirty::DirtyStore;
 use crate::env::{Env, HookPoint, Snapshot};
 use crate::error::{Error, MdbError, Result};
+use crate::nested::{ChildCounter, NestedRoTxn};
 use crate::page::geometry::{
     body_size, gc_key_decode, gc_key_encode, is_map_full, map_pages, overflow_page_count,
     pil_decode, pil_encode_into, pil_size, value_is_inline,
@@ -348,6 +349,19 @@ pub struct RwTxn<'env> {
     /// — and the cache dies with the `RwTxn` ("must recompute in a fresh
     /// write txn"). The debug shadow check re-scans fresh at every draw.
     oldest_cache: Option<u64>,
+    /// Live nested read children (SPEC 04 TXN-31, ADR-0007 D3). Checked by
+    /// [`RwTxn::guard_ok`] on every mutating entry (TXN-29, D-005) and at
+    /// commit C0 (TXN-33); bumped/released by
+    /// [`crate::nested::NestedRoTxn`].
+    ///
+    /// **`RwTxn: Sync` standing contract (ADR-0007 Q1, ratified
+    /// 2026-07-16):** `NestedRoTxn` is `Send` purely because `&RwTxn: Send`,
+    /// i.e. because this struct is `Sync`. No field may introduce interior
+    /// mutability usable through `&self` (`Cell`, `RefCell`, …) — use an
+    /// atomic (like this one) or keep it behind `&mut`. The
+    /// `rwtxn_sync_contract_and_child_send` compile-time assertion in
+    /// `crate::nested` turns a violation into a build failure.
+    children: ChildCounter,
 }
 
 impl Env {
@@ -388,6 +402,7 @@ impl Env {
             save_touched: std::collections::BTreeSet::new(),
             errored: false,
             oldest_cache: None,
+            children: ChildCounter::new(),
             bytes: inner.backing_bytes(),
             base,
             _guard: guard,
@@ -423,6 +438,18 @@ impl Env {
             .ok_or(Error::Mdb(MdbError::DbsFull))?;
         wtxn.create_named(dbi, name)?;
         Ok(Database::from_sel(DbSel::Named(dbi)))
+    }
+
+    /// Open a nested read transaction parented to `parent` (SPEC 00 row 16).
+    /// Equivalent to [`RwTxn::nested_read_txn`] — provided because heed
+    /// exposes both entry points (`Env::nested_read_txn(&self, &wtxn)`
+    /// delegates exactly like this, without an env-identity check).
+    ///
+    /// # Errors
+    ///
+    /// As [`RwTxn::nested_read_txn`].
+    pub fn nested_read_txn<'p>(&'p self, parent: &'p RwTxn<'_>) -> Result<NestedRoTxn<'p>> {
+        parent.nested_read_txn()
     }
 }
 
@@ -473,14 +500,63 @@ impl<'env> RwTxn<'env> {
 
     /// Abort: drop the dirty set and freed lists, change nothing on disk,
     /// release the write mutex (SPEC 04 TXN-59). Equivalent to dropping.
+    ///
+    /// Nested read children must be gone first (TXN-33) — enforced at
+    /// compile time: `abort(self)` is by-value, and a live child holds a
+    /// shared borrow of this txn. (There is deliberately no drop-time
+    /// quiescence assert: a nonzero counter at drop is reachable *only* via
+    /// the sound `mem::forget(child)` degradation — see `crate::nested`.)
     pub fn abort(self) {
         drop(self);
+    }
+
+    /// Open a **nested read transaction**: a read-only child of this write
+    /// txn that sees its *uncommitted, in-progress* state (SPEC 00 row 16,
+    /// SPEC 04 §5 TXN-26..28 — the fork's ITS#10395 semantics; heed:
+    /// `RwTxn::nested_read_txn`). Reads go through this txn's dirty frames
+    /// first, then the map (TXN-27); no reader-table slot is claimed
+    /// (TXN-25/32).
+    ///
+    /// Arbitrarily many children may be open concurrently (TXN-28); each is
+    /// `Send`, so the milli/hannoy pattern — open `N` children, move one to
+    /// each rayon worker, read in parallel while the writer is paused, join,
+    /// resume — works as with the fork. While any child is alive this txn
+    /// cannot mutate, commit, or abort: the child's shared borrow enforces it
+    /// at compile time (TXN-30), and every mutating op additionally refuses
+    /// with [`MdbError::BadTxn`] at runtime (TXN-29, D-005). The writer
+    /// resumes implicitly when the last child drops.
+    ///
+    /// # Errors
+    ///
+    /// [`MdbError::BadTxn`] if this txn is errored (fork parity:
+    /// `mdb_txn_begin` on an `MDB_TXN_ERROR` parent).
+    pub fn nested_read_txn(&self) -> Result<NestedRoTxn<'_>> {
+        if self.errored {
+            return Err(Error::Mdb(MdbError::BadTxn));
+        }
+        Ok(NestedRoTxn::open(self))
+    }
+
+    /// The live-child counter (M1.9, ADR-0007 D3) — for `crate::nested` only.
+    pub(crate) fn children(&self) -> &ChildCounter {
+        &self.children
     }
 
     // -- internal plumbing ---------------------------------------------------
 
     fn guard_ok(&self) -> Result<()> {
         if self.errored {
+            return Err(Error::Mdb(MdbError::BadTxn));
+        }
+        // TXN-29 (D-005, ADR-0007 Q4): while any nested read child is live,
+        // the dirty set is frozen — every mutating entry funnels through here
+        // and refuses with BadTxn (LMDB `MDB_BAD_TXN` = "transaction … has a
+        // child") in BOTH debug and release. Normally unreachable (the child
+        // holds a shared `&RwTxn` borrow, so no `&mut` op can even be
+        // called); it backstops `unsafe`/FFI lifetime erasure (e.g. the
+        // oracle). The `Acquire` inside `live()` pairs with each child-drop's
+        // `Release` (see `crate::nested`).
+        if self.children.live() != 0 {
             return Err(Error::Mdb(MdbError::BadTxn));
         }
         Ok(())
@@ -523,6 +599,11 @@ impl<'env> RwTxn<'env> {
     /// (from the catalog view, or empty if the entry does not yet exist), and
     /// return its tree selector. Idempotent. The main DB needs no loading.
     fn ensure_open(&mut self, sel: DbSel) -> Result<TreeId> {
+        // TXN-29 airtightness: `ensure_open` mutates the open table, which
+        // live children read through `record_for` — so the child guard fires
+        // here too, *before* the table is touched (the page-mutation entries
+        // it precedes re-check via their own `guard_ok`).
+        self.guard_ok()?;
         let dbi = match sel {
             DbSel::Main => return Ok(TreeId::Main),
             DbSel::Named(dbi) => dbi,
@@ -2266,6 +2347,16 @@ impl<'env> RwTxn<'env> {
         if self.errored {
             return Err(Error::Mdb(MdbError::BadTxn));
         }
+        // C0 (SPEC 04 TXN-33/58, ADR-0007 D4): all nested read children must
+        // be gone before anything commits. Compile-time this is guaranteed —
+        // `commit(self)` is by-value, so a live child's `&self` borrow makes
+        // the call unrepresentable; the runtime check backstops lifetime
+        // erasure (oracle/FFI) and `mem::forget`-leaked children (risk R1).
+        // Checked before `is_unchanged` too: a leaked child must block even a
+        // no-op commit, keeping the degradation mode uniform (always BadTxn).
+        if self.children.live() != 0 {
+            return Err(Error::Mdb(MdbError::BadTxn));
+        }
         if self.env.inner().is_poisoned() {
             return Err(poisoned_error());
         }
@@ -2284,8 +2375,9 @@ impl<'env> RwTxn<'env> {
         let inner = self.env.inner();
         let psize = self.psize;
 
-        // ----- C0: no nested readers exist before M1.9 (child_count ≡ 0);
-        // the freed-page list is already accumulated (GC-6). -----
+        // ----- C0 was checked in `commit()` (TXN-33: `children.live() == 0`,
+        // M1.9/ADR-0007 D4); the freed-page list is already accumulated
+        // (GC-6). -----
 
         // ----- C1a: flush dirty named-DB records into the main catalog
         // (SPEC 02 §6). Runs BEFORE freelist_save (the LMDB sub-DB flush order):

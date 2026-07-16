@@ -24,6 +24,7 @@ pub mod check;
 pub mod dirty;
 pub mod env;
 pub mod error;
+pub mod nested;
 pub mod page;
 pub(crate) mod readers;
 pub mod rotxn;
@@ -31,6 +32,7 @@ pub mod rwtxn;
 pub(crate) mod sync;
 
 pub use env::{CommitHook, HookPoint, Snapshot};
+pub use nested::NestedRoTxn;
 pub use rotxn::{Database, RoRange, RoTxn, TxnRead};
 pub use rwtxn::{PutFlags, RwCursor, RwTxn};
 
