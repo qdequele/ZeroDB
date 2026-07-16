@@ -540,14 +540,24 @@ reachability-xor-freeness invariant (INV-10, INV-14).
   larger `map_size` after a `MapFull` (SPEC 00 rows 3, 55).
   - **Runtime `map_size` selection (M1.2).** At open the effective `map_size` is
     the caller's `EnvOpenOptions::map_size` when set, else the persisted
-    `meta.map_size`. In M1.2 (read-only, no write path) the read mmap covers the
-    *file length*, not `map_size`, so accessing existing pages can never fault
-    past EOF; the write path (M1.4) grows the file toward `map_size` and remaps.
-  - **`map_size` value leniency vs heed (D-006, PROPOSED).** heed rejects a
+    `meta.map_size`.
+  - **Mapping strategy (amended M1.4, ADR-0004 D4/OQ2 — approved).** The read
+    mmap covers `max(map_size, file length)` from open, so the base address is
+    fixed for the env's life and **no remap ever happens in Phase 1** (file
+    growth happens *underneath* the fixed `MAP_SHARED` mapping via the commit's
+    positioned writes). Pages beyond EOF are mapped but never dereferenced: a
+    committed meta only references pages made durable before it (SPEC 06
+    REC-7/REC-14), and the writer reads its own new pages from the dirty set,
+    never the map (SPEC 04 TXN-38). *(Supersedes the M1.2 map-the-file-length
+    wording; the earlier "grows … and remaps" plan is retired.)*
+  - **`map_size` value leniency vs heed (D-006, APPROVED).** heed rejects a
     `map_size` that is not a multiple of the **OS** page size; ZeroDB does not
     (its DB page size is independent of the OS page size, §0), so it accepts any
-    `map_size ≥ 2·psize`. Unobservable to consumers, which always clamp before
-    the call (SPEC 00 row 3). See `docs/DIVERGENCES.md` D-006.
+    `map_size ≥ 2·psize` — the kernel rounds the mapping length internally, and
+    the reported `map_size`/`MapFull` boundary use the exact configured value.
+    Unobservable to consumers, which always clamp before the call (SPEC 00
+    row 3). See `docs/DIVERGENCES.md` D-006 (approved 2026-07-16 via ADR-0004
+    OQ2).
 - **Allocation.** New pages are taken first from the GC DB (SPEC 05; where a
   reader still pins them, from end-of-file), otherwise by bumping `last_pg`.
   A single-page allocation needs one free page; an `N`-page overflow run needs

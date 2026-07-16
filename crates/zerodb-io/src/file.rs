@@ -37,16 +37,29 @@ pub fn read_page(file: &File, pgno: u64, psize: u32) -> std::io::Result<Vec<u8>>
     Ok(buf)
 }
 
-/// Write `bytes` at page `pgno` (positioned; `bytes.len()` need not equal
-/// `psize` but must fit within the page).
+/// Write `bytes` starting at page `pgno` (positioned). `bytes` is one page (or
+/// less), or — for an overflow run (M1.4 commit C2) — a whole multiple of
+/// `psize` spanning the contiguous run.
 ///
 /// # Errors
 ///
 /// Propagates the positioned-write I/O error.
 pub fn write_page(file: &File, pgno: u64, psize: u32, bytes: &[u8]) -> std::io::Result<()> {
-    debug_assert!(bytes.len() <= psize as usize);
+    debug_assert!(bytes.len() <= psize as usize || bytes.len() % psize as usize == 0);
     let off = pgno * psize as u64;
     file.write_all_at(bytes, off)
+}
+
+/// Read the first `len` bytes of the file (the meta-slot head, used to probe
+/// the persisted map size before mapping).
+///
+/// # Errors
+///
+/// Propagates the positioned-read I/O error.
+pub fn read_head(file: &File, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    file.read_exact_at(&mut buf, 0)?;
+    Ok(buf)
 }
 
 /// The actual on-disk file length via `fstat` (SPEC 00 row 18).

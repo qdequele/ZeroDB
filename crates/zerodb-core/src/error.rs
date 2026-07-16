@@ -58,6 +58,13 @@ pub enum MdbError {
     /// `MDB_NOTFOUND` — key not found. Reserved for the read/write paths.
     #[error("key not found")]
     NotFound,
+
+    /// `MDB_BAD_TXN` — the transaction encountered a mid-operation failure
+    /// (e.g. `MapFull` inside a split cascade) and must be aborted; further
+    /// operations and `commit` refuse to run on it (LMDB `MDB_TXN_ERROR`
+    /// parity; SPEC 04 TXN-59 clean-abort guarantee).
+    #[error("transaction must abort")]
+    BadTxn,
 }
 
 /// A convenience result alias for engine operations.

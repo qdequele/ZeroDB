@@ -259,9 +259,17 @@ copied and how pgnos propagate):
    recorded in the txn's working `DBRecord.root` and written to the meta at
    commit (SPEC 02 §3).
 4. **Cursor fix-up.** After a page is copied/split/merged, every live cursor in
-   the same txn positioned on the affected page(s) has its `page[]`/`ki[]`
-   adjusted so it still points at the logically-same entry (LMDB tracks sibling
-   cursors; ZeroDB does the same for cursors open in the write txn).
+   the same txn positioned on the affected page(s) must still point at the
+   logically-same entry. *(Clarified 2026-07-16, M1.4 / ADR-0004 D5.)* LMDB
+   tracks and repairs **sibling** cursors because C permits many live cursors
+   in one write txn; under ZeroDB's borrow model **at most one cursor can
+   exist across a mutation** — mutations reach the tree through `&mut RwTxn`
+   or through the single write cursor holding it exclusively — so fix-up
+   reduces to the *acting* cursor's own position. The M1.4 write cursor tracks
+   its position **by key** and re-seeks after each of its own mutations, which
+   is trivially stable across splits/merges; no sibling-cursor tracking
+   infrastructure exists (observable behavior is oracle-gated either way). If
+   a later phase exposes concurrent write cursors, that requires a new ADR.
 5. **Overflow pages are COW'd as whole runs**: modifying a BIGDATA value frees
    the old run and allocates a new one (§8); overflow pages are never edited in
    place across txns.

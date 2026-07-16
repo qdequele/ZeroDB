@@ -17,26 +17,34 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
 use crate::error::{Error, MdbError};
 use crate::page::geometry::{is_map_full, map_pages};
-use crate::page::{select_meta, MetaChoice, MetaPage, MetaValidity, META_A_PGNO, META_B_PGNO};
+use crate::page::{
+    select_meta, DBRecord, MetaChoice, MetaPage, MetaValidity, META_A_PGNO, META_B_PGNO,
+};
 
-/// Read access to a memory-mapped (or, in tests, heap) env file.
+/// Read (and, for the write path, page-granular write) access to a
+/// memory-mapped (or, in tests, heap) env file.
 ///
 /// The concrete real implementation is `zerodb_io::MmapBacking`, which confines
 /// the mmap `unsafe` and guarantees the map is unmapped before the file fd is
 /// closed (SPEC 04 TXN-53). Tests supply a `Vec<u8>`-backed implementation so
-/// the selection logic runs under `miri`.
+/// the selection logic runs under `miri` (that implementation is read-only —
+/// the write methods keep their erroring defaults, so miri tests exercise
+/// mutation and in-txn reads, never commit I/O).
 ///
 /// Implementors must be `Send + Sync`: an [`EnvInner`] is shared across threads
-/// through an `Arc` and read txns (later milestones) hand out `Send` borrows.
+/// through an `Arc` and read txns hand out `Send` borrows.
 pub trait Backing: Send + Sync {
     /// The whole mapped region as bytes. Slot 0 is `[0, page_size)`, slot 1 is
-    /// `[page_size, 2*page_size)`; data pages follow.
+    /// `[page_size, 2*page_size)`; data pages follow. The region may extend
+    /// past the current file length (ADR-0004 D4: the map covers the full
+    /// `map_size`); callers only dereference pages a committed snapshot
+    /// references, which are always within the file (SPEC 06 REC-14).
     fn bytes(&self) -> &[u8];
 
     /// The actual on-disk length of the backing file (`fstat`), for
@@ -47,6 +55,96 @@ pub trait Backing: Send + Sync {
     /// [`Env::try_clone_inner_file`]). Requires the env to be a single regular
     /// data file (SPEC 02 §8).
     fn try_clone_file(&self) -> std::io::Result<std::fs::File>;
+
+    /// Positioned write of `data` starting at page `pgno` (commit step C2/C4,
+    /// SPEC 04 §9). `data.len()` is a multiple of `psize` (one page, or a whole
+    /// overflow run). Writing past EOF extends the file. Not durable until
+    /// [`Backing::sync_data`].
+    ///
+    /// The default errors with `Unsupported` — read-only backings (the miri
+    /// test backing) never commit.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the positioned-write I/O error.
+    fn write_at_page(&self, pgno: u64, psize: u32, data: &[u8]) -> std::io::Result<()> {
+        let _ = (pgno, psize, data);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this backing is read-only",
+        ))
+    }
+
+    /// Durability barrier for previously-written pages (commit steps C3/C5;
+    /// `File::sync_data` — ADR-0004 D3 as amended by OQ3: std semantics as-is,
+    /// `fdatasync` on Linux).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the fsync I/O error (the caller poisons the env, REC-13).
+    fn sync_data(&self) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this backing is read-only",
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Published snapshot + commit hooks (SPEC 04 TXN-18/19, §9; ADR-0004 D3)
+// ---------------------------------------------------------------------------
+
+/// An immutable committed snapshot: the roots and geometry of one committed
+/// state (SPEC 04 TXN-18). Readers `Arc`-clone the env's published snapshot at
+/// begin and never re-read a durable meta page (the slot a pinned txnid lived
+/// in is overwritten two commits later, TXN-63).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Snapshot {
+    /// The commit point of this snapshot.
+    pub txnid: u64,
+    /// File high-water as of this commit (`next_pgno - 1`, SPEC 05 GC-15).
+    pub last_pg: u64,
+    /// Root/stats of the main/catalog DB.
+    pub main_db: DBRecord,
+    /// Root/stats of the free (GC) DB.
+    pub free_db: DBRecord,
+}
+
+impl Snapshot {
+    /// The snapshot a validated meta page describes.
+    #[must_use]
+    pub fn from_meta(meta: &MetaPage) -> Snapshot {
+        Snapshot {
+            txnid: meta.txnid,
+            last_pg: meta.last_pg,
+            main_db: meta.main_db,
+            free_db: meta.free_db,
+        }
+    }
+}
+
+/// A crash-injection point between commit-pipeline steps (SPEC 04 §9 H0–H4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookPoint {
+    /// After C1 (`freelist_save`): nothing on disk yet.
+    H0,
+    /// After C2 (dirty pages written, **not** fsynced).
+    H1,
+    /// After C3 (`fsync(data)`).
+    H2,
+    /// After C4 (meta written to slot `N & 1`, **not** fsynced).
+    H3,
+    /// After C5 (`fsync(meta)`): txn `N` durable.
+    H4,
+}
+
+/// A commit-pipeline observer (ADR-0004 D3/OQ5: **always compiled**, default
+/// absent, so the crash-tested pipeline is byte-for-byte the shipped one).
+/// M1.11's harnesses install hooks that kill/tear at a chosen [`HookPoint`];
+/// the M1.4 smoke test aborts the process at each point in turn.
+pub trait CommitHook: Send + Sync {
+    /// Called between commit steps, at `point`. May abort/kill the process.
+    fn at(&self, point: HookPoint);
 }
 
 /// A cross-thread one-shot signal: fires once, when the last [`EnvInner`]
@@ -140,13 +238,33 @@ pub struct EnvInner {
     /// The runtime map size (SPEC 02 §8): the caller's `map_size` if given, else
     /// the live meta's. Returned by [`Env::info`].
     map_size: u64,
-    /// The selected live meta snapshot (higher-txnid, or older under
-    /// `PREV_SNAPSHOT`).
+    /// The meta selected **at open** (higher-txnid, or older under
+    /// `PREV_SNAPSHOT`). Read once to seed the published snapshot (TXN-18);
+    /// steady-state reads use [`EnvInner::snapshot`], never this field, because
+    /// commits advance past it.
     meta: MetaPage,
     /// Whether this env was opened with `PREV_SNAPSHOT` (SPEC 01 §S5).
     prev_snapshot: bool,
     /// Close signal, shared with any outstanding [`EnvClosingEvent`].
     closing: Arc<SignalEvent>,
+    /// The single-writer mutex (SPEC 04 TXN-6). Guards no data — the write
+    /// txn's state lives in the `RwTxn` — it only serializes writers.
+    write_mutex: Mutex<()>,
+    /// The published-snapshot cell (SPEC 04 TXN-18). M1.4 placeholder per
+    /// ADR-0004 OQ1: a `Mutex<Arc<Snapshot>>` with the TXN-19 publish order
+    /// (swap the object, then store `commit_point`); M1.8 replaces the cell's
+    /// implementation with the lock-free ArcSwap-style cell + reader table.
+    snapshot: Mutex<Arc<Snapshot>>,
+    /// Mirrors the published snapshot's txnid (SPEC 04 TXN-17/19). Stored
+    /// `SeqCst` *after* the snapshot swap so a reader that observes the new
+    /// commit point can always load matching-or-newer roots.
+    commit_point: AtomicU64,
+    /// Commit-pipeline crash hooks (ADR-0004 D3; default `None` = no-op).
+    commit_hook: Mutex<Option<Arc<dyn CommitHook>>>,
+    /// REC-13 fsync-gate: set (Release) when a commit fsync fails; checked
+    /// (Acquire) at every write-txn begin and commit. A poisoned env still
+    /// serves read txns from their pinned snapshots.
+    poisoned: AtomicBool,
 }
 
 impl std::fmt::Debug for EnvInner {
@@ -175,16 +293,95 @@ impl EnvInner {
         self.map_size
     }
 
-    /// The txnid of the selected live snapshot.
+    /// The txnid of the current live snapshot (the commit point; advances on
+    /// every commit, SPEC 04 TXN-19).
     #[must_use]
     pub fn txnid(&self) -> u64 {
-        self.meta.txnid
+        // SeqCst: pairs with the publish store in `publish_snapshot` (TXN-19)
+        // and the reader pin protocol (TXN-17) — see SPEC 04 §4.3 for why the
+        // commit-point loads/stores are all SeqCst (StoreLoad on ARM).
+        self.commit_point.load(Ordering::SeqCst)
     }
 
-    /// The live meta snapshot.
+    /// The meta selected **at open** (creation-time geometry). Live roots must
+    /// come from [`EnvInner::snapshot`] — this field goes stale after the first
+    /// commit (TXN-18: the durable meta page is read only once, at open).
     #[must_use]
     pub fn meta(&self) -> &MetaPage {
         &self.meta
+    }
+
+    /// `Arc`-clone the current published snapshot (SPEC 04 TXN-18). The clone
+    /// keeps the `(txnid, roots)` alive for the caller's life regardless of
+    /// later commits. M1.4 cell placeholder: a brief mutex lock (ADR-0004 OQ1;
+    /// lock-free in M1.8).
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        Arc::clone(&self.snapshot.lock().expect("snapshot cell poisoned"))
+    }
+
+    /// Publish a freshly committed snapshot (commit step C6) in the TXN-19
+    /// order: (1) swap the `Arc<Snapshot>` into the cell, then (2) store the
+    /// commit point `SeqCst`. Object-before-counter guarantees a reader that
+    /// sees the new counter can load the matching (or newer) roots.
+    pub(crate) fn publish_snapshot(&self, snap: Arc<Snapshot>) {
+        let txnid = snap.txnid;
+        *self.snapshot.lock().expect("snapshot cell poisoned") = snap;
+        // SeqCst: the writer half of the TXN-17/TXN-19 StoreLoad pairing (ARM
+        // weak memory) — the reader's publish-and-verify loop and this store
+        // must share the single SeqCst total order.
+        self.commit_point.store(txnid, Ordering::SeqCst);
+    }
+
+    /// Acquire the single-writer mutex (SPEC 04 TXN-6/7): blocks until the
+    /// current writer finishes; never errors.
+    pub(crate) fn lock_writer(&self) -> MutexGuard<'_, ()> {
+        // A panicked writer poisons the std mutex, but the mutex guards no
+        // data (the dirty set lived in the RwTxn and was dropped during
+        // unwind — TXN-60 implicit abort), so clearing the poison is sound and
+        // keeps the env usable after a writer panic.
+        self.write_mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether a failed commit fsync poisoned the env (SPEC 06 REC-13).
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        // Acquire: pairs with the Release in `poison` so a writer that
+        // observes the flag also observes everything before the failure.
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    /// Poison the env after a failed durability barrier (SPEC 06 REC-13).
+    pub(crate) fn poison(&self) {
+        // Release: see `is_poisoned`.
+        self.poisoned.store(true, Ordering::Release);
+    }
+
+    /// Install (or clear) the commit-pipeline crash hook (ADR-0004 D3). Test
+    /// infrastructure for M1.4's smoke test and M1.11's crash harness; the
+    /// default (`None`) makes every hook site a no-op.
+    pub fn set_commit_hook(&self, hook: Option<Arc<dyn CommitHook>>) {
+        *self.commit_hook.lock().expect("hook cell poisoned") = hook;
+    }
+
+    /// Fire the crash hook at `point`, if one is installed. The `Arc` is
+    /// cloned out of the cell before the call so a hook that re-enters the env
+    /// cannot deadlock on the cell.
+    pub(crate) fn run_hook(&self, point: HookPoint) {
+        let hook = self.commit_hook.lock().expect("hook cell poisoned").clone();
+        if let Some(h) = hook {
+            h.at(point);
+        }
+    }
+
+    /// The backing for commit I/O (write pages / fsync). Panics only if called
+    /// after close — impossible while any `Env`/txn borrow exists.
+    pub(crate) fn backing_ref(&self) -> &dyn Backing {
+        self.backing
+            .as_deref()
+            .expect("backing present while the env is open")
     }
 
     /// Whether this env was opened on the previous (older) snapshot.
@@ -353,6 +550,12 @@ impl Env {
         Arc::strong_count(&self.inner)
     }
 
+    /// Install (or clear) the commit-pipeline crash hook (ADR-0004 D3). See
+    /// [`EnvInner::set_commit_hook`]; test infrastructure (M1.4 smoke, M1.11).
+    pub fn set_commit_hook(&self, hook: Option<Arc<dyn CommitHook>>) {
+        self.inner.set_commit_hook(hook);
+    }
+
     /// Consume this handle and return an [`EnvClosingEvent`] that fires when the
     /// **last** reference to the env drops (SPEC 04 TXN-52). Dropping this
     /// handle is part of the close: if it was the last reference, the event has
@@ -467,6 +670,13 @@ pub fn open_with_backing(
         backing: Some(backing),
         page_size,
         map_size,
+        // Seed the published-snapshot cell from the durable meta — the one
+        // and only time a meta *page* is read for roots (SPEC 04 TXN-18).
+        snapshot: Mutex::new(Arc::new(Snapshot::from_meta(&meta))),
+        commit_point: AtomicU64::new(meta.txnid),
+        write_mutex: Mutex::new(()),
+        commit_hook: Mutex::new(None),
+        poisoned: AtomicBool::new(false),
         meta,
         prev_snapshot,
         closing,
@@ -508,14 +718,22 @@ fn read_slot(
     MetaPage::validate(&bytes[base..end], page_size).map_err(|_| Error::Mdb(MdbError::Invalid))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Test-only helpers: a heap-backed [`Backing`] and an in-memory env
+/// constructor, so txn/mutation logic runs under `miri` (no mmap, no file
+/// I/O). **Not part of the stable API** — used by this crate's tests, the
+/// crate's integration tests, and nothing else. The backing is read-only
+/// (commit I/O keeps the erroring `Backing` defaults), so in-memory envs
+/// exercise mutation and in-txn reads but never the commit pipeline — commits
+/// are tested against real files in `crates/zerodb`.
+#[doc(hidden)]
+pub mod testutil {
+    use super::{next_env_id, open_with_backing, Backing, Env};
+    use crate::error::Error;
     use crate::page::MetaPage;
+    use std::path::PathBuf;
 
-    /// A heap-backed [`Backing`] so the selection logic runs under `miri`
-    /// (no mmap, no file I/O).
-    struct VecBacking(Vec<u8>);
+    /// A heap-backed read-only [`Backing`].
+    pub struct VecBacking(pub Vec<u8>);
 
     impl Backing for VecBacking {
         fn bytes(&self) -> &[u8] {
@@ -531,6 +749,37 @@ mod tests {
             ))
         }
     }
+
+    /// A fresh in-memory env: both meta slots valid at txnid 0 (SPEC 02 §3.4),
+    /// the backing vector sized to `map_size` (as a real map would be,
+    /// ADR-0004 D4), registered under a unique virtual path.
+    ///
+    /// # Panics
+    ///
+    /// On an invalid `page_size` (test helper).
+    #[must_use]
+    pub fn mem_env(page_size: u32, map_size: u64) -> Env {
+        let ps = page_size as usize;
+        let mut buf = vec![0u8; map_size as usize];
+        for slot in [0u64, 1] {
+            let meta = MetaPage::create(slot, page_size, map_size);
+            let base = slot as usize * ps;
+            meta.encode(&mut buf[base..base + ps]).expect("valid meta");
+        }
+        let path = PathBuf::from(format!("/virtual/mem-env-{}", next_env_id()));
+        match open_with_backing(path, Box::new(VecBacking(buf)), page_size, map_size, false) {
+            Ok(env) => env,
+            Err(Error::Io(e)) => panic!("mem_env open failed: {e}"),
+            Err(e) => panic!("mem_env open failed: {e}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::VecBacking;
+    use super::*;
+    use crate::page::MetaPage;
 
     const PS: u32 = 4096;
     const MAP: u64 = 1 << 20;

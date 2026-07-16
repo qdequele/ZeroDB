@@ -1,65 +1,96 @@
 //! Read transactions and the heed-shaped read API over the [`btree`] cursor
-//! (SPEC 04 §3, SPEC 00 read-op rows). Milestone 1.3.
+//! (SPEC 04 §3, SPEC 00 read-op rows). Milestones 1.3/1.4.
 //!
-//! A [`RoTxn`] is, in M1.3, **simply a handle pinning the env's live meta roots
-//! at open** — it copies the `main_db` [`DBRecord`] out of the selected meta and
-//! borrows the mapped bytes for its life (SPEC 04 TXN-37). There is no
-//! reclamation to defend against yet, so no reader-table slot is claimed: that
-//! is the **M1.8 seam**. When the reader table lands, `read_txn` additionally
-//! claims a slot and pins the snapshot txnid (SPEC 04 TXN-10); the read API
-//! below is unaffected because it already reads only the pinned roots.
+//! A [`RoTxn`] pins the env's **published snapshot** at open: it `Arc`-clones
+//! the current [`Snapshot`] object (SPEC 04 TXN-18 — never re-reading a durable
+//! meta page, whose slot a later commit overwrites) and borrows the mapped
+//! bytes for its life (TXN-37). No reader-table slot is claimed yet: that is
+//! the **M1.8 seam**. When the reader table lands, `read_txn` additionally
+//! claims a slot and pins the snapshot txnid (TXN-10); the read API below is
+//! unaffected because it already reads only the pinned roots.
 //!
-//! Named-database catalogs are out of M1.3 scope (they are M1.6): only the
-//! main/unnamed database is exposed, via [`Env::main_database`]. Reads are
-//! zero-copy `&'txn [u8]` borrows tied to the `&RoTxn`.
+//! The read API is generic over [`TxnRead`], so the same `Database` methods
+//! serve a `RoTxn` (mapped bytes) **and** a write txn (`RwTxn`: dirty frames
+//! first, map fallback — SPEC 04 TXN-38, ADR-0004 D2). heed's borrow model is
+//! reproduced: reads take `&Txn` and return `&'txn [u8]`; mutations take
+//! `&mut RwTxn`, so no read borrow can span a mutation (TXN-39).
+//!
+//! Named-database catalogs are out of scope (M1.6): only the main/unnamed
+//! database is exposed, via [`Env::main_database`].
 
 use std::ops::Bound;
+use std::sync::Arc;
 
-use crate::btree::{prefix_successor, Cursor, Tree};
-use crate::env::Env;
+use crate::btree::{prefix_successor, Cursor, Source, Tree};
+use crate::env::{Env, Snapshot};
 use crate::error::{Error, MdbError, Result};
 use crate::page::{DBRecord, PageError};
 
 /// Map a structural tree-decode error to the public taxonomy. A corrupt page
 /// reached during a read means the store is not a valid zerodb file
 /// (SPEC 00 row 56); for a builder/write-path-produced tree this never fires.
-fn map_page_err(_e: PageError) -> Error {
+pub(crate) fn map_page_err(_e: PageError) -> Error {
     Error::Mdb(MdbError::Invalid)
 }
 
-/// A read-only transaction: a consistent snapshot of the env (SPEC 04 §3). It
-/// borrows the [`Env`] for its whole life, which keeps the mapped file alive so
-/// every `&'txn [u8]` it lends stays valid (SPEC 04 TXN-37).
+/// Anything the read API can read through: a [`RoTxn`] (mapped bytes of a
+/// committed snapshot) or a [`crate::rwtxn::RwTxn`] (the writer's in-progress
+/// view). The three accessors are exactly what [`Tree`] needs (ADR-0004 D2).
+pub trait TxnRead {
+    /// Where this txn's pages come from (SPEC 04 TXN-37/38).
+    fn source(&self) -> Source<'_>;
+    /// The main DB's root/stats as this txn observes them.
+    fn main_record(&self) -> &DBRecord;
+    /// The env's page size.
+    fn page_size(&self) -> u32;
+}
+
+/// A read-only transaction: a consistent view of one committed snapshot
+/// (SPEC 04 §3). It borrows the [`Env`] for its whole life, which keeps the
+/// mapped file alive so every `&'txn [u8]` it lends stays valid (TXN-37), and
+/// holds an `Arc` to the pinned [`Snapshot`] so its roots survive later
+/// commits (TXN-18).
 pub struct RoTxn<'env> {
     _env: &'env Env,
     bytes: &'env [u8],
     psize: u32,
-    main_db: DBRecord,
+    snap: Arc<Snapshot>,
 }
 
-impl<'env> RoTxn<'env> {
-    /// The snapshot txnid this read txn observes (the live meta's txnid at open).
+impl RoTxn<'_> {
+    /// The snapshot txnid this read txn observes (SPEC 04 TXN-4).
     #[must_use]
     pub fn txnid(&self) -> u64 {
-        // The pinned snapshot is the env's live meta; M1.8 will pin it in a
-        // reader slot. Until then it cannot change (no write path).
-        self._env.txnid()
+        self.snap.txnid
+    }
+}
+
+impl TxnRead for RoTxn<'_> {
+    fn source(&self) -> Source<'_> {
+        Source::Map { bytes: self.bytes }
+    }
+    fn main_record(&self) -> &DBRecord {
+        &self.snap.main_db
+    }
+    fn page_size(&self) -> u32 {
+        self.psize
     }
 }
 
 impl Env {
-    /// Open a read transaction over the live snapshot (SPEC 00 row 13). See the
-    /// module docs for the M1.8 reader-slot seam.
+    /// Open a read transaction over the live published snapshot (SPEC 00
+    /// row 13, SPEC 04 TXN-10). See the module docs for the M1.8 reader-slot
+    /// seam.
     ///
     /// # Errors
     ///
-    /// Infallible in M1.3 (no slot to claim, no I/O); returns [`Result`] to
+    /// Infallible in M1.4 (no slot to claim, no I/O); returns [`Result`] to
     /// match the heed shape and the future M1.8 slot-claim failure mode.
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
         Ok(RoTxn {
             bytes: self.inner().backing_bytes(),
             psize: self.page_size(),
-            main_db: self.inner().meta().main_db,
+            snap: self.inner().snapshot(),
             _env: self,
         })
     }
@@ -72,24 +103,32 @@ impl Env {
     }
 }
 
-/// A database handle. In M1.3 this only ever names the main/unnamed database;
-/// its root/stats come from the [`RoTxn`] snapshot passed to each method.
+/// A database handle. In Phase-1-so-far this only ever names the main/unnamed
+/// database; its root/stats come from the transaction passed to each method.
 ///
-/// **Key-size validation is intentionally lenient here.** These methods are
-/// pure tree searches: an empty or oversized key is not rejected, it simply
-/// matches nothing. LMDB's heed-observed key-size error taxonomy — `BadValSize`
-/// on an empty `get`/seek, an empty forward-prefix, or an empty/oversized write
-/// key (SPEC 03 §2.1) — is a heed-API-boundary concern applied by the caller
-/// (the oracle adapter today; the `heed-zerodb` adapter at M1.13), not by this
-/// core read path.
+/// **Key-size validation is intentionally lenient on the read side.** Read
+/// methods are pure tree searches: an empty or oversized key is not rejected,
+/// it simply matches nothing. LMDB's heed-observed read-key error taxonomy
+/// (SPEC 03 §2.1) is a heed-API-boundary concern applied by the caller (the
+/// oracle adapter today; `heed-zerodb` at M1.13). **Write** methods do
+/// validate (SPEC 03 §6: `put*` rejects an empty or `> 511`-byte key and an
+/// oversized value with `BadValSize`) — the split machinery's termination
+/// proof relies on the key bound.
 #[derive(Debug, Clone, Copy)]
 pub struct Database {
     _priv: (),
 }
 
+/// The main DB's tree view over any readable txn (shared by the read API and
+/// the write cursor).
+pub(crate) fn tree_of<T: TxnRead + ?Sized>(txn: &T) -> Tree<'_> {
+    let rec = txn.main_record();
+    Tree::new(txn.source(), txn.page_size(), rec.root, rec.depth)
+}
+
 impl Database {
-    fn tree<'txn>(&self, txn: &RoTxn<'txn>) -> Tree<'txn> {
-        Tree::new(txn.bytes, txn.psize, txn.main_db.root, txn.main_db.depth)
+    pub(crate) fn tree<'txn, T: TxnRead + ?Sized>(&self, txn: &'txn T) -> Tree<'txn> {
+        tree_of(txn)
     }
 
     /// `get(txn, key)` (SPEC 00 row 30): the value for `key`, or `Ok(None)` if
@@ -98,7 +137,7 @@ impl Database {
     /// # Errors
     ///
     /// [`MdbError::Invalid`] only on a structurally-corrupt tree.
-    pub fn get<'txn>(&self, txn: &RoTxn<'txn>, key: &[u8]) -> Result<Option<&'txn [u8]>> {
+    pub fn get<'txn, T: TxnRead>(&self, txn: &'txn T, key: &[u8]) -> Result<Option<&'txn [u8]>> {
         self.tree(txn).get(key).map_err(map_page_err)
     }
 
@@ -108,8 +147,8 @@ impl Database {
     /// # Errors
     ///
     /// Infallible; returns [`Result`] for API shape.
-    pub fn len(&self, txn: &RoTxn<'_>) -> Result<u64> {
-        Ok(txn.main_db.entries)
+    pub fn len<T: TxnRead>(&self, txn: &T) -> Result<u64> {
+        Ok(txn.main_record().entries)
     }
 
     /// `is_empty(txn)` (SPEC 00 row 40).
@@ -117,8 +156,8 @@ impl Database {
     /// # Errors
     ///
     /// Infallible; returns [`Result`] for API shape.
-    pub fn is_empty(&self, txn: &RoTxn<'_>) -> Result<bool> {
-        Ok(txn.main_db.entries == 0)
+    pub fn is_empty<T: TxnRead>(&self, txn: &T) -> Result<bool> {
+        Ok(txn.main_record().entries == 0)
     }
 
     /// `first(txn)` — the minimum entry (SPEC 00 row 41).
@@ -126,7 +165,10 @@ impl Database {
     /// # Errors
     ///
     /// [`MdbError::Invalid`] on a corrupt tree.
-    pub fn first<'txn>(&self, txn: &RoTxn<'txn>) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
+    pub fn first<'txn, T: TxnRead>(
+        &self,
+        txn: &'txn T,
+    ) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
         self.tree(txn).cursor().first().map_err(map_page_err)
     }
 
@@ -135,7 +177,7 @@ impl Database {
     /// # Errors
     ///
     /// [`MdbError::Invalid`] on a corrupt tree.
-    pub fn last<'txn>(&self, txn: &RoTxn<'txn>) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
+    pub fn last<'txn, T: TxnRead>(&self, txn: &'txn T) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
         self.tree(txn).cursor().last().map_err(map_page_err)
     }
 
@@ -145,9 +187,9 @@ impl Database {
     /// # Errors
     ///
     /// [`MdbError::Invalid`] on a corrupt tree.
-    pub fn get_greater_than_or_equal_to<'txn>(
+    pub fn get_greater_than_or_equal_to<'txn, T: TxnRead>(
         &self,
-        txn: &RoTxn<'txn>,
+        txn: &'txn T,
         key: &[u8],
     ) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
         self.tree(txn).cursor().set_range(key).map_err(map_page_err)
@@ -158,9 +200,9 @@ impl Database {
     /// # Errors
     ///
     /// [`MdbError::Invalid`] on a corrupt tree.
-    pub fn get_greater_than<'txn>(
+    pub fn get_greater_than<'txn, T: TxnRead>(
         &self,
-        txn: &RoTxn<'txn>,
+        txn: &'txn T,
         key: &[u8],
     ) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
         self.tree(txn)
@@ -175,9 +217,9 @@ impl Database {
     /// # Errors
     ///
     /// [`MdbError::Invalid`] on a corrupt tree.
-    pub fn get_lower_than_or_equal_to<'txn>(
+    pub fn get_lower_than_or_equal_to<'txn, T: TxnRead>(
         &self,
-        txn: &RoTxn<'txn>,
+        txn: &'txn T,
         key: &[u8],
     ) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
         self.tree(txn)
@@ -191,9 +233,9 @@ impl Database {
     /// # Errors
     ///
     /// [`MdbError::Invalid`] on a corrupt tree.
-    pub fn get_lower_than<'txn>(
+    pub fn get_lower_than<'txn, T: TxnRead>(
         &self,
-        txn: &RoTxn<'txn>,
+        txn: &'txn T,
         key: &[u8],
     ) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
         self.tree(txn)
@@ -204,22 +246,22 @@ impl Database {
 
     /// `iter(txn)` — forward full scan (SPEC 00 row 43).
     #[must_use]
-    pub fn iter<'txn>(&self, txn: &RoTxn<'txn>) -> RoRange<'txn> {
+    pub fn iter<'txn, T: TxnRead>(&self, txn: &'txn T) -> RoRange<'txn> {
         self.range_impl(txn, Dir::Fwd, Bound::Unbounded, Bound::Unbounded)
     }
 
     /// `rev_iter(txn)` — reverse full scan (SPEC 00 SHOULD).
     #[must_use]
-    pub fn rev_iter<'txn>(&self, txn: &RoTxn<'txn>) -> RoRange<'txn> {
+    pub fn rev_iter<'txn, T: TxnRead>(&self, txn: &'txn T) -> RoRange<'txn> {
         self.range_impl(txn, Dir::Rev, Bound::Unbounded, Bound::Unbounded)
     }
 
     /// `range(txn, lower, upper)` — forward scan over the bound pair
     /// (SPEC 00 row 44). Any `Bound` combination is supported.
     #[must_use]
-    pub fn range<'txn>(
+    pub fn range<'txn, T: TxnRead>(
         &self,
-        txn: &RoTxn<'txn>,
+        txn: &'txn T,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> RoRange<'txn> {
@@ -229,9 +271,9 @@ impl Database {
     /// `rev_range(txn, lower, upper)` — reverse scan over the bound pair
     /// (SPEC 00 row 44).
     #[must_use]
-    pub fn rev_range<'txn>(
+    pub fn rev_range<'txn, T: TxnRead>(
         &self,
-        txn: &RoTxn<'txn>,
+        txn: &'txn T,
         lower: Bound<&[u8]>,
         upper: Bound<&[u8]>,
     ) -> RoRange<'txn> {
@@ -242,21 +284,21 @@ impl Database {
     /// (SPEC 00 row 45), realized as the range `[prefix, prefix_successor)`
     /// (SPEC 03 §4; the all-`0xFF` edge yields an unbounded upper).
     #[must_use]
-    pub fn prefix_iter<'txn>(&self, txn: &RoTxn<'txn>, prefix: &[u8]) -> RoRange<'txn> {
+    pub fn prefix_iter<'txn, T: TxnRead>(&self, txn: &'txn T, prefix: &[u8]) -> RoRange<'txn> {
         let (lo, hi) = prefix_bounds(prefix);
         self.range_impl(txn, Dir::Fwd, lo, hi)
     }
 
     /// `rev_prefix_iter(txn, prefix)` — reverse prefix scan (SPEC 00 row 46).
     #[must_use]
-    pub fn rev_prefix_iter<'txn>(&self, txn: &RoTxn<'txn>, prefix: &[u8]) -> RoRange<'txn> {
+    pub fn rev_prefix_iter<'txn, T: TxnRead>(&self, txn: &'txn T, prefix: &[u8]) -> RoRange<'txn> {
         let (lo, hi) = prefix_bounds(prefix);
         self.range_impl(txn, Dir::Rev, lo, hi)
     }
 
-    fn range_impl<'txn>(
+    fn range_impl<'txn, T: TxnRead>(
         &self,
-        txn: &RoTxn<'txn>,
+        txn: &'txn T,
         dir: Dir,
         lo: Bound<Vec<u8>>,
         hi: Bound<Vec<u8>>,
@@ -298,8 +340,10 @@ enum Dir {
 }
 
 /// A lazy, zero-copy range/prefix iterator (SPEC 00 rows 43–46). Yields
-/// `Result<(&'txn [u8], &'txn [u8])>`; the borrowed slices live for the txn, not
-/// for the `&mut` `next` call, so they can outlive iteration.
+/// `Result<(&'txn [u8], &'txn [u8])>`; the borrowed slices live for the txn
+/// borrow, not for the `&mut` `next` call, so they can outlive iteration.
+/// Works over both txn kinds ([`TxnRead`]); on a write txn the shared `&RwTxn`
+/// borrow it holds forbids any mutation while it is alive (SPEC 04 TXN-39).
 pub struct RoRange<'txn> {
     cursor: Cursor<'txn>,
     dir: Dir,

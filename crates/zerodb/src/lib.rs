@@ -14,9 +14,11 @@
 
 use std::path::Path;
 
-pub use zerodb_core::env::{Env, EnvClosingEvent, EnvInfo};
+pub use zerodb_core::check;
+pub use zerodb_core::env::{CommitHook, Env, EnvClosingEvent, EnvInfo, HookPoint, Snapshot};
 pub use zerodb_core::error::{Error, MdbError, Result};
-pub use zerodb_core::rotxn::{Database, RoRange, RoTxn};
+pub use zerodb_core::rotxn::{Database, RoRange, RoTxn, TxnRead};
+pub use zerodb_core::rwtxn::{PutFlags, RwCursor, RwTxn};
 
 /// The name of the single data file inside an env directory (D-002, SPEC 02 §8).
 pub const DATA_FILE_NAME: &str = "zerodb.dat";

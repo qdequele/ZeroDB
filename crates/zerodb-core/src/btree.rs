@@ -1,19 +1,21 @@
 //! B+tree read path — search, `get`, and the full cursor state machine
-//! ([SPEC 03](../../../../docs/SPEC/03-btree.md) §2–§4). Milestone 1.3.
+//! ([SPEC 03](../../../../docs/SPEC/03-btree.md) §2–§4). Milestones 1.3/1.4.
 //!
-//! Everything here operates over an immutable byte view of a whole env file
-//! (`bytes: &'a [u8]`, the mapped region) plus a page size and a
-//! [`super::page::DBRecord`]'s `root`/`depth`. Reads are **zero-copy**: keys and
-//! values are `&'a [u8]` borrowed straight from the map (SPEC 04 TXN-37), and a
-//! `F_BIGDATA` value resolves to one contiguous slice spanning its overflow run
-//! (SPEC 03 §3). This module contains **no** `unsafe` (the crate is
-//! `#![forbid(unsafe_code)]`) and no I/O — it is pure logic over borrowed bytes,
-//! so `miri` exercises it.
+//! Everything here operates over a [`Source`] — either the immutable mapped
+//! env file (`Source::Map`, the M1.3 read path) or a write txn's view
+//! (`Source::Writer`: the dirty-page store first, the map for untouched pages
+//! — SPEC 04 TXN-38, ADR-0004 D2). Reads are **zero-copy**: keys and values
+//! are `&'a [u8]` borrowed straight from the backing bytes (SPEC 04 TXN-37/41),
+//! and a `F_BIGDATA` value resolves to one contiguous slice spanning its
+//! overflow run (SPEC 03 §3; a dirty run is one contiguous frame, TXN-41).
+//! This module contains **no** `unsafe` (the crate is `#![forbid(unsafe_code)]`)
+//! and no I/O — it is pure logic over borrowed bytes, so `miri` exercises it.
 //!
 //! The cursor is a root-to-leaf path (`stack` of `(pgno, ki)` frames) plus the
 //! `INITIALIZED`/`EOF` flags of SPEC 03 §4. Each public op documents the §4
 //! subsection whose positioning/EOF/empty-DB semantics it implements.
 
+use super::dirty::DirtyStore;
 use super::page::{LeafRef, LeafValue, OverflowRef, PageError, PageRef, PageType, PGNO_INVALID};
 
 /// An entry `(key, value)` borrowed from the map for the view's lifetime `'a`.
@@ -24,29 +26,73 @@ pub type Entry<'a> = (&'a [u8], &'a [u8]);
 pub type PosResult<'a> = Result<Option<Entry<'a>>, PageError>;
 
 // ---------------------------------------------------------------------------
+// Page source (ADR-0004 D2): where a page's bytes come from
+// ---------------------------------------------------------------------------
+
+/// Where tree pages are read from (SPEC 04 TXN-37/38).
+///
+/// `Map` is a read snapshot over the mapped file; `Writer` is a write txn's
+/// view, which resolves the **dirty-page store first** and falls back to the
+/// map for pages the txn has not touched. A caller cannot tell which backing a
+/// borrow came from; the lifetime rules are identical (SPEC 04 §6.2). This is
+/// also the M1.9 seam (a nested reader is the writer's source, read-only) and
+/// the M1.10 seam (WRITE_MAP swaps the backing, TXN-46).
+#[derive(Clone, Copy)]
+pub enum Source<'a> {
+    /// The read-only mapped env file.
+    Map {
+        /// The whole mapped region.
+        bytes: &'a [u8],
+    },
+    /// A write txn's view: dirty frames first, then the map.
+    Writer {
+        /// The txn's dirty-page store (checked first).
+        dirty: &'a DirtyStore,
+        /// The mapped region (fallback for untouched pages).
+        bytes: &'a [u8],
+    },
+}
+
+impl<'a> Source<'a> {
+    /// Bytes beginning at page `pgno`: at least one page; for an overflow head
+    /// resolved from this source, the returned slice covers the whole run
+    /// (a dirty run is its full contiguous frame; a mapped run extends to the
+    /// end of the map, bounded by the overflow decoder).
+    pub(crate) fn bytes_from(&self, psize: u32, pgno: u64) -> Result<&'a [u8], PageError> {
+        let ps = psize as usize;
+        let map_slice = |bytes: &'a [u8]| -> Result<&'a [u8], PageError> {
+            let base = (pgno as usize)
+                .checked_mul(ps)
+                .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })?;
+            bytes
+                .get(base..)
+                .filter(|s| s.len() >= ps)
+                .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })
+        };
+        match self {
+            Source::Map { bytes } => map_slice(bytes),
+            Source::Writer { dirty, bytes } => match dirty.bytes(pgno) {
+                Some(frame) => Ok(frame),
+                None => map_slice(bytes),
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Page loading + value resolution
 // ---------------------------------------------------------------------------
 
-/// Load the `psize`-byte page `pgno` from the map as a validated [`PageRef`].
-fn load_page(bytes: &[u8], psize: u32, pgno: u64) -> Result<PageRef<'_>, PageError> {
-    let ps = psize as usize;
-    let base = (pgno as usize)
-        .checked_mul(ps)
-        .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })?;
-    let end = base
-        .checked_add(ps)
-        .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })?;
-    let slice = bytes
-        .get(base..end)
-        .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })?;
-    PageRef::new(slice, psize)
+/// Load the `psize`-byte page `pgno` from the source as a validated [`PageRef`].
+fn load_page<'a>(src: Source<'a>, psize: u32, pgno: u64) -> Result<PageRef<'a>, PageError> {
+    PageRef::new(src.bytes_from(psize, pgno)?, psize)
 }
 
 /// Resolve the value of leaf entry `i` to a contiguous `&'a [u8]` (SPEC 03 §3):
 /// inline values borrow the leaf page; `F_BIGDATA` values borrow the overflow
 /// run, sliced from the head page across the whole run.
 fn resolve_value<'a>(
-    bytes: &'a [u8],
+    src: Source<'a>,
     psize: u32,
     leaf: &LeafRef<'a>,
     i: usize,
@@ -54,13 +100,7 @@ fn resolve_value<'a>(
     match leaf.value(i) {
         LeafValue::Inline(v) => Ok(v),
         LeafValue::Overflow { head_pgno, dsize } => {
-            let ps = psize as usize;
-            let base = (head_pgno as usize)
-                .checked_mul(ps)
-                .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })?;
-            let run = bytes
-                .get(base..)
-                .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })?;
+            let run = src.bytes_from(psize, head_pgno)?;
             OverflowRef::new(run, psize)?.payload(dsize)
         }
     }
@@ -72,22 +112,21 @@ fn resolve_value<'a>(
 
 /// An immutable view of one B+tree, rooted at `root` with height `depth`
 /// (SPEC 03 §1). Cheap to copy; carries no owned state.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Tree<'a> {
-    bytes: &'a [u8],
+    src: Source<'a>,
     psize: u32,
     root: u64,
     depth: u16,
 }
 
 impl<'a> Tree<'a> {
-    /// Build a tree view over `bytes` (the whole mapped file) with the given
-    /// page size, root page number (`PGNO_INVALID` for an empty tree), and
-    /// height.
+    /// Build a tree view over `src` with the given page size, root page number
+    /// (`PGNO_INVALID` for an empty tree), and height.
     #[must_use]
-    pub fn new(bytes: &'a [u8], psize: u32, root: u64, depth: u16) -> Tree<'a> {
+    pub fn new(src: Source<'a>, psize: u32, root: u64, depth: u16) -> Tree<'a> {
         Tree {
-            bytes,
+            src,
             psize,
             root,
             depth,
@@ -114,10 +153,10 @@ impl<'a> Tree<'a> {
             return Ok(None);
         }
         let (pgno, ki) = *c.stack.last().expect("initialized cursor has a leaf frame");
-        let page = load_page(self.bytes, self.psize, pgno)?;
+        let page = load_page(self.src, self.psize, pgno)?;
         let leaf = page.as_leaf()?;
         if ki < leaf.num_keys() && leaf.key(ki) == key {
-            Ok(Some(resolve_value(self.bytes, self.psize, &leaf, ki)?))
+            Ok(Some(resolve_value(self.src, self.psize, &leaf, ki)?))
         } else {
             Ok(None)
         }
@@ -136,10 +175,10 @@ impl<'a> Tree<'a> {
 
 /// A read cursor: a root-to-leaf path plus the `INITIALIZED`/`EOF` flags of
 /// SPEC 03 §4. All positioning ops return the entry at the new position (or
-/// `None` at an edge), borrowing key/value `&'a [u8]` from the map.
-#[derive(Debug, Clone)]
+/// `None` at an edge), borrowing key/value `&'a [u8]` from the source.
+#[derive(Clone)]
 pub struct Cursor<'a> {
-    bytes: &'a [u8],
+    src: Source<'a>,
     psize: u32,
     root: u64,
     depth: u16,
@@ -157,7 +196,7 @@ pub struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     fn new(t: Tree<'a>) -> Cursor<'a> {
         Cursor {
-            bytes: t.bytes,
+            src: t.src,
             psize: t.psize,
             root: t.root,
             depth: t.depth,
@@ -170,7 +209,7 @@ impl<'a> Cursor<'a> {
     // -- page helpers ------------------------------------------------------
 
     fn page(&self, pgno: u64) -> Result<PageRef<'a>, PageError> {
-        load_page(self.bytes, self.psize, pgno)
+        load_page(self.src, self.psize, pgno)
     }
 
     /// The entry at the current leaf position, or `None` if unpositioned / EOF /
@@ -188,7 +227,7 @@ impl<'a> Cursor<'a> {
             return Ok(None);
         }
         let k = leaf.key(ki);
-        let v = resolve_value(self.bytes, self.psize, &leaf, ki)?;
+        let v = resolve_value(self.src, self.psize, &leaf, ki)?;
         Ok(Some((k, v)))
     }
 
@@ -584,7 +623,7 @@ mod tests {
     #[test]
     fn empty_tree_reads() {
         let (img, root, depth) = build(&[]);
-        let t = Tree::new(&img, PS, root, depth);
+        let t = Tree::new(Source::Map { bytes: &img }, PS, root, depth);
         assert!(t.is_empty());
         assert_eq!(t.get(b"x").unwrap(), None);
         let mut c = t.cursor();
@@ -603,7 +642,7 @@ mod tests {
             .map(|i| kv(format!("k{i:03}").as_bytes(), format!("v{i}").as_bytes()))
             .collect();
         let (img, root, depth) = build(&entries);
-        let t = Tree::new(&img, PS, root, depth);
+        let t = Tree::new(Source::Map { bytes: &img }, PS, root, depth);
         assert_eq!(depth, 1, "20 tiny entries fit one leaf");
         for (k, v) in &entries {
             assert_eq!(t.get(k).unwrap(), Some(v.as_slice()));
@@ -628,7 +667,7 @@ mod tests {
             })
             .collect();
         let (img, root, depth) = build(&entries);
-        let t = Tree::new(&img, PS, root, depth);
+        let t = Tree::new(Source::Map { bytes: &img }, PS, root, depth);
         assert!(
             depth >= 2,
             "2000 entries need a branch level, got depth {depth}"
@@ -653,7 +692,7 @@ mod tests {
             kv(b"d", b"tiny"),
         ];
         let (img, root, depth) = build(&entries);
-        let t = Tree::new(&img, PS, root, depth);
+        let t = Tree::new(Source::Map { bytes: &img }, PS, root, depth);
         assert_eq!(t.get(b"b").unwrap(), Some(big.as_slice()));
         assert_eq!(t.get(b"c").unwrap(), Some(bigger.as_slice()));
         assert_eq!(collect_fwd(&t), entries);
@@ -666,7 +705,7 @@ mod tests {
             .map(|n| kv(format!("{n:03}").as_bytes(), b"x"))
             .collect();
         let (img, root, depth) = build(&entries);
-        let t = Tree::new(&img, PS, root, depth);
+        let t = Tree::new(Source::Map { bytes: &img }, PS, root, depth);
         let mut c = t.cursor();
 
         // set_range (>=)
@@ -723,7 +762,7 @@ mod tests {
             .map(|i| kv(format!("k{i:04}").as_bytes(), b"v"))
             .collect();
         let (img, root, depth) = build(&entries);
-        let t = Tree::new(&img, PS, root, depth);
+        let t = Tree::new(Source::Map { bytes: &img }, PS, root, depth);
         let mut c = t.cursor();
         // Walk to EOF.
         c.first().unwrap();

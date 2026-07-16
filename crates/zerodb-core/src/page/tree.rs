@@ -345,6 +345,50 @@ impl<'a> LeafMut<'a> {
         self.insert_raw(idx, key, F_BIGDATA, dsize, &area)
     }
 
+    /// Insert an inline cell whose value bytes are **reserved** rather than
+    /// copied (`MDB_RESERVE`, SPEC 01 §S3 / SPEC 04 TXN-47): the cell header,
+    /// key, and pad byte are written, but the `dsize`-byte value area keeps
+    /// whatever bytes the frame held (uninitialized-but-owned — the engine
+    /// must not zero it). Returns the **absolute** byte offset of the value
+    /// area within the page buffer; the caller re-borrows the frame to fill
+    /// it before the txn's next operation (TXN-47).
+    ///
+    /// # Errors
+    ///
+    /// As [`insert_inline`](LeafMut::insert_inline).
+    pub fn insert_inline_reserved(
+        &mut self,
+        idx: usize,
+        key: &[u8],
+        dsize: u32,
+    ) -> Result<usize, PageError> {
+        if dsize as u64 > MAX_DATA_SIZE as u64 {
+            return Err(PageError::BadValueSize(dsize as u64));
+        }
+        self.insert_cell(idx, key, 0, dsize, dsize as usize, None)
+    }
+
+    /// Absolute byte offset of entry `idx`'s inline value area, together with
+    /// its `dsize`. Errors if the entry is `F_BIGDATA` (its value lives on an
+    /// overflow run, not in this page).
+    ///
+    /// # Errors
+    ///
+    /// [`PageError::WrongPageType`]-free; returns [`PageError::ReservedFlagSet`]
+    /// never — a `F_BIGDATA` entry yields [`PageError::BadValueSize`] carrying
+    /// the logical size, signalling "not inline".
+    pub fn inline_value_at(&self, idx: usize) -> Result<(usize, u32), PageError> {
+        debug_assert!(idx < self.num_keys(), "index out of range");
+        let abs = HEADER_SIZE + ptr_at(self.buf, idx) as usize;
+        let flags = read_u16(self.buf, abs);
+        let ksize = read_u16(self.buf, abs + 2) as usize;
+        let dsize = read_u32(self.buf, abs + 4);
+        if flags & F_BIGDATA != 0 {
+            return Err(PageError::BadValueSize(dsize as u64));
+        }
+        Ok((abs + LEAF_NODE_HEADER + ksize, dsize))
+    }
+
     /// Low-level insert: places a cell whose value area is exactly `value_area`
     /// and whose logical length is `dsize`.
     fn insert_raw(
@@ -355,6 +399,29 @@ impl<'a> LeafMut<'a> {
         dsize: u32,
         value_area: &[u8],
     ) -> Result<(), PageError> {
+        self.insert_cell(
+            idx,
+            key,
+            node_flags,
+            dsize,
+            value_area.len(),
+            Some(value_area),
+        )
+        .map(|_| ())
+    }
+
+    /// Shared insert machinery: place a cell with a `value_area_len`-byte value
+    /// region, copied from `fill` when given, left untouched when `None`
+    /// (RESERVE). Returns the absolute offset of the value area.
+    fn insert_cell(
+        &mut self,
+        idx: usize,
+        key: &[u8],
+        node_flags: u16,
+        dsize: u32,
+        value_area_len: usize,
+        fill: Option<&[u8]>,
+    ) -> Result<usize, PageError> {
         if key.is_empty() || key.len() > MAX_KEY_SIZE {
             return Err(PageError::BadKeySize { ksize: key.len() });
         }
@@ -363,7 +430,7 @@ impl<'a> LeafMut<'a> {
         }
         let num_keys = self.num_keys();
         debug_assert!(idx <= num_keys, "insert index out of range");
-        let clen = even(LEAF_NODE_HEADER + key.len() + value_area.len());
+        let clen = even(LEAF_NODE_HEADER + key.len() + value_area_len);
         let need = clen + 2;
         let avail = self.free_space();
         if need > avail {
@@ -380,13 +447,15 @@ impl<'a> LeafMut<'a> {
         write_u32(self.buf, abs + 4, dsize);
         self.buf[abs + LEAF_NODE_HEADER..abs + LEAF_NODE_HEADER + key.len()].copy_from_slice(key);
         let voff = abs + LEAF_NODE_HEADER + key.len();
-        self.buf[voff..voff + value_area.len()].copy_from_slice(value_area);
+        if let Some(value_area) = fill {
+            self.buf[voff..voff + value_area.len()].copy_from_slice(value_area);
+        }
         // Even-pad byte, if any.
-        if clen > LEAF_NODE_HEADER + key.len() + value_area.len() {
-            self.buf[voff + value_area.len()] = 0;
+        if clen > LEAF_NODE_HEADER + key.len() + value_area_len {
+            self.buf[voff + value_area_len] = 0;
         }
         insert_pointer(self.buf, idx, num_keys, new_upper as u16);
-        Ok(())
+        Ok(voff)
     }
 
     /// Remove entry `idx`, compacting the cell heap (SPEC 02 §2.2).
@@ -501,6 +570,24 @@ pub struct BranchMut<'a> {
 }
 
 impl<'a> BranchMut<'a> {
+    /// Wrap an already-validated branch page for mutation.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`BranchRef::new`] validation.
+    pub fn from_valid(buf: &'a mut [u8], psize: u32) -> Result<BranchMut<'a>, PageError> {
+        BranchRef::new(buf, psize)?;
+        Ok(BranchMut { buf, psize })
+    }
+
+    /// Overwrite the child pgno of entry `idx` in place (COW parent-chain
+    /// pointer rewrite, SPEC 03 §5.3). The cell length is unchanged.
+    pub fn set_child_pgno(&mut self, idx: usize, child_pgno: u64) {
+        debug_assert!(idx < self.num_keys(), "index out of range");
+        let abs = HEADER_SIZE + ptr_at(self.buf, idx) as usize;
+        write_u64(self.buf, abs, child_pgno);
+    }
+
     /// Initialize `buf` as an empty branch page with the given identity.
     ///
     /// # Errors

@@ -52,18 +52,21 @@ Normative rules are numbered **TXN-n** so tests and the check tool can cite them
   records `last_committed_txnid = meta.txnid`. This is the id of the newest
   durable snapshot.
 - **TXN-2** — A new write txn is assigned `writer_txnid = last_committed_txnid +
-  1` at `begin`. It is not published to any meta until commit. If the writer
-  aborts, the id is *not* consumed by disk state, but the engine still advances
-  its in-memory counter monotonically (the next write txn gets a strictly larger
-  id than any previously-begun one, never a reused id) — reusing an aborted id is
-  permitted only because no page or meta ever recorded it, but the simplest
-  correct implementation never reuses ids and this spec assumes non-reuse. **One
-  deliberate exception:** a `PREV_SNAPSHOT` rollback (TXN-67) reopens on
-  `older_txnid` and its first commit is txn `older_txnid + 1` — the *same* id the
-  now-abandoned newer branch used. This is sound because that abandoned commit's
-  meta and beyond-high-water pages are superseded in place by the same-parity
-  rewrite (TXN-67, SPEC 06 REC-5); it is the only path that re-mints an id, and it
-  does so on a branch that has been discarded.
+  1` at `begin` — always, so **an aborted txn's id is reused** by the next
+  writer. It is not published to any meta until commit, and reuse is sound
+  precisely because no page or meta ever recorded the aborted id. Reuse is not
+  merely permitted but **required** by the slot-parity scheme: commit `N`
+  writes slot `N & 1`, and that slot is the *older* slot (TXN-63) only when
+  committed ids are consecutive — a non-reusing counter would let a post-abort
+  commit share parity with the *live* snapshot's slot and overwrite the crash
+  fallback. *(Amended 2026-07-16, M1.4: an earlier revision of this rule
+  described a never-reusing monotone counter as the assumed implementation;
+  that contradicted TXN-63/TXN-67 and is retired — ADR-0004, module note in
+  `zerodb-core::rwtxn`.)* The same mechanism serves the `PREV_SNAPSHOT`
+  rollback (TXN-67): reopening on `older_txnid` makes the first commit
+  `older_txnid + 1` — the id the now-abandoned newer branch used — whose
+  same-parity meta write supersedes the abandoned slot in place (SPEC 06
+  REC-5), on a branch that has been discarded.
 - **TXN-3** — Every page a write txn writes is stamped `page.txnid =
   writer_txnid` (SPEC 02 §2). On commit, the meta slot `writer_txnid & 1`
   (SPEC 02 §3) is written with `txnid = writer_txnid`; that meta becomes the new

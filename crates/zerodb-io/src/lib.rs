@@ -1,11 +1,11 @@
 //! zerodb-io — the I/O layer: read-only mmap, plain-file helpers, and the
-//! [`Backing`] implementation the engine core reads env files through.
+//! [`Backing`] implementation the engine core reads env files through (and,
+//! from M1.4 on, commits through: positioned `pwrite` + `sync_data`).
 //!
 //! This crate is one of the two sanctioned homes for mmap `unsafe` (CLAUDE.md
 //! unsafe policy). The single `unsafe` block is in [`mmap`]; everything else is
-//! safe `std` I/O. Milestone 1.2 uses only the read-mmap + create-and-open
-//! paths; the pwrite / io_uring write backends and fsync strategies arrive with
-//! the write path (M1.4) and later.
+//! safe `std` I/O. The io_uring write backend and the fault-injection backend
+//! (M1.11) arrive later.
 
 mod file;
 mod mmap;
@@ -44,6 +44,24 @@ impl Backing for MmapBacking {
     fn try_clone_file(&self) -> std::io::Result<File> {
         self.file.try_clone()
     }
+
+    fn write_at_page(&self, pgno: u64, psize: u32, data: &[u8]) -> std::io::Result<()> {
+        // Positioned write through the fd (commit C2/C4, SPEC 04 §9). Writing
+        // past EOF extends the file; the MAP_SHARED read map observes the new
+        // bytes without a remap (ADR-0004 D4 — the map already covers the full
+        // map_size). Safe against readers because C2 only ever targets pages
+        // no live snapshot references (TXN-62) and the meta pages are never
+        // lent out as borrows (readers use the published snapshot object,
+        // TXN-18) — see the SAFETY discussion in `mmap.rs`.
+        file::write_page(&self.file, pgno, psize, data)
+    }
+
+    fn sync_data(&self) -> std::io::Result<()> {
+        // ADR-0004 D3 as amended (OQ3): std's `sync_data` semantics as-is —
+        // `fdatasync` on Linux (flushes data + the size metadata needed to
+        // read it back, REC-14/GC-28), the full-flush path on macOS.
+        self.file.sync_data()
+    }
 }
 
 impl MmapBacking {
@@ -51,18 +69,6 @@ impl MmapBacking {
     #[must_use]
     pub fn map(&self) -> &Mmap {
         &self.mmap
-    }
-
-    /// Remap after the file has grown (SPEC 02 §8 growth hook). **API surface
-    /// only for M1.2** — the write path (M1.4) that grows the file will call
-    /// this to extend the mapping. Currently re-maps the given `len`.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the `mmap` I/O error.
-    pub fn remap(&mut self, len: usize) -> std::io::Result<()> {
-        self.mmap = Mmap::map(&self.file, len)?;
-        Ok(())
     }
 }
 
@@ -122,7 +128,11 @@ pub fn open_or_create(
         let map_size = requested_map_size.unwrap_or(default_map_size);
         let file = file::create_env_file(data_path, requested_page_size, map_size)?;
         let file_len = file::real_disk_size(&file)? as usize;
-        let mmap = Mmap::map(&file, file_len)?;
+        // ADR-0004 D4 (approved OQ2): map the full map_size once at open —
+        // the base address is fixed for the env's life and file growth needs
+        // no remap. Pages beyond EOF are never dereferenced (engine
+        // discipline; see `Mmap::map`).
+        let mmap = Mmap::map(&file, file_len.max(map_size as usize))?;
         return Ok(Opened {
             backing: Box::new(MmapBacking { mmap, file }),
             page_size: requested_page_size,
@@ -139,10 +149,12 @@ pub fn open_or_create(
     if file_len == 0 {
         return Err(Error::Mdb(MdbError::Invalid));
     }
-    let mmap = Mmap::map(&file, file_len)?;
-
-    let persisted = persisted_map_size(mmap.bytes(), page_size);
+    // Probe the persisted map size from a small head read before mapping, so
+    // the mapping can cover the full effective map_size (ADR-0004 D4).
+    let head = file::read_head(&file, file_len.min(2 * page_size as usize))?;
+    let persisted = persisted_map_size(&head, page_size);
     let map_size = requested_map_size.or(persisted).unwrap_or(default_map_size);
+    let mmap = Mmap::map(&file, file_len.max(map_size as usize))?;
 
     Ok(Opened {
         backing: Box::new(MmapBacking { mmap, file }),

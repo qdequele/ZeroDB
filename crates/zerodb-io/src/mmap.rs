@@ -6,37 +6,48 @@
 
 use std::fs::File;
 
-/// A read-only memory map of (a prefix of) an env data file.
+/// A read-only memory map over an env data file.
 ///
-/// Exposes the mapped bytes as `&[u8]` and individual pages by page number. The
-/// map covers exactly `len` bytes, which the caller guarantees is `<=` the file
-/// length so no access can fault past end-of-file (SPEC 02 §8; single-process
-/// D-001 rules out concurrent truncation).
+/// Exposes the mapped bytes as `&[u8]` and individual pages by page number.
+/// From M1.4 on (ADR-0004 D4) the map covers the **full `map_size`** — which
+/// may extend past the current end-of-file. The file grows underneath the
+/// fixed mapping via `pwrite` (commit C2); no remap ever happens in Phase 1.
 pub struct Mmap {
     inner: memmap2::Mmap,
 }
 
 impl Mmap {
-    /// Map the first `len` bytes of `file` read-only.
+    /// Map the first `len` bytes of `file` read-only (`MAP_SHARED`).
     ///
-    /// `len` must be `> 0` and `<=` the current file length.
+    /// `len` must be `> 0`. It may exceed the current file length (ADR-0004
+    /// D4): accessing a page wholly beyond EOF raises SIGBUS, so the engine
+    /// must only dereference pages a committed snapshot references — which are
+    /// always within the file, because a meta is fsynced only after the data
+    /// it references (SPEC 06 REC-7/REC-14, SPEC 05 GC-28).
     ///
     /// # Errors
     ///
     /// Propagates the `mmap` I/O error.
     pub fn map(file: &File, len: usize) -> std::io::Result<Mmap> {
         // SAFETY: memmap2's `map` is `unsafe` because a memory map aliases the
-        // file's contents and the borrow checker cannot see external writers.
-        // Our invariants (SPEC 02 §8, D-001 single-process):
+        // file's contents and the borrow checker cannot see writers through
+        // the fd. Our invariants (SPEC 02 §8, SPEC 04 §9, D-001):
         //  * `file` is a live, open regular file for the whole lifetime of the
         //    returned `Mmap` (the caller keeps the `File` alive alongside it —
         //    see `MmapBacking`);
-        //  * `len <= file length` (asserted by the caller), so every byte of the
-        //    map is backed by a real page and no access faults past EOF;
-        //  * the env is single-process (D-001): no other process truncates or
-        //    concurrently writes the file, so the mapping stays valid and the
-        //    `&[u8]` we hand out is not mutated underneath a reader.
-        // The map is read-only (`PROT_READ`), so we never write through it.
+        //  * accesses are confined to pages referenced by some committed
+        //    snapshot, all of which lie within the real file length (REC-14),
+        //    so no dereference faults past EOF even though `len` may exceed it;
+        //  * the env is single-process (D-001): no *other* process writes or
+        //    truncates the file. Our *own* commit path writes through the fd
+        //    (`MmapBacking::write_at_page`), which mutates the mapped memory —
+        //    but only at pages **no live snapshot references** (TXN-62: fresh
+        //    pages beyond the committed high-water) and at the meta slots
+        //    0/1, which are never handed out as borrows (readers clone the
+        //    published snapshot *object*, TXN-18, and never read a meta page
+        //    after open). So no `&[u8]` observable by safe code is ever
+        //    mutated while borrowed.
+        // The map is read-only (`PROT_READ`); we never write through it.
         let inner = unsafe { memmap2::MmapOptions::new().len(len).map(file)? };
         Ok(Mmap { inner })
     }
