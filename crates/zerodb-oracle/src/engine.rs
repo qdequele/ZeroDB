@@ -1,6 +1,6 @@
 //! The engine-agnostic trait both sides of the differential harness implement.
 
-use crate::{Op, OpResult};
+use crate::{EngineMode, Op, OpResult};
 
 /// A storage engine the oracle can drive.
 ///
@@ -16,6 +16,20 @@ pub trait Engine {
     fn new() -> Self
     where
         Self: Sized;
+
+    /// Create a fresh engine opened in `mode` (M1.10, SPEC 01 Table 1):
+    /// `WRITE_MAP` and/or durability flags. The default delegates to
+    /// [`Engine::new`] (the default all-durable heap mode), so an engine that
+    /// does not care about modes needs no override; the LMDB and zerodb engines
+    /// override it to open with the matching env flags. Used by
+    /// [`crate::run_in_mode`] and the M1.10 differential tests / fuzz dimension.
+    fn new_in_mode(mode: EngineMode) -> Self
+    where
+        Self: Sized,
+    {
+        let _ = mode;
+        Self::new()
+    }
 
     /// A short human-readable name used in divergence reports.
     fn name(&self) -> &'static str;

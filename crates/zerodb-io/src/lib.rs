@@ -16,7 +16,7 @@ use std::path::Path;
 pub use file::{
     create_env_file, open_file, probe_page_size, read_page, real_disk_size, write_page,
 };
-pub use mmap::Mmap;
+pub use mmap::{Mmap, MmapWritable};
 
 use zerodb_core::env::Backing;
 use zerodb_core::error::{Error, MdbError};
@@ -72,6 +72,80 @@ impl MmapBacking {
     }
 }
 
+/// A [`Backing`] over a **writable** memory-mapped env data file
+/// (`EnvFlags::WRITE_MAP`, SPEC 01 §S7, SPEC 04 §6.4; M1.10).
+///
+/// The commit path writes dirty pages *through the map* (`write_at_page` =
+/// `memcpy` into the map) and flushes with `msync` (`sync`) instead of the
+/// default heap-buffer `pwrite` + `fdatasync`. Field order is load-bearing for
+/// `Drop` (map unmapped before the fd closes, TXN-53).
+///
+/// **Realization note (SPEC 04 §6.4, amended M1.10):** during a write txn the
+/// dirty bytes still live in the engine-core heap dirty-page store (so the
+/// value-borrow contract, nested-reader reads, and abort-by-drop are byte-for-
+/// byte identical to the default mode, and `zerodb-core` needs no map `unsafe`);
+/// they are copied into the writable map at commit **C2** via `write_at_page`
+/// and made durable by `msync` at C3/C5. This is observably identical to the
+/// fork's live-map writes through the heed surface; true zero-copy live-map
+/// mutation is a Phase-3 optimization (needs a bench and a `zerodb-io`-brokered
+/// map-slice API to keep the map `unsafe` out of `zerodb-core`).
+pub struct WriteMapBacking {
+    mmap: MmapWritable,
+    file: File,
+}
+
+impl Backing for WriteMapBacking {
+    fn bytes(&self) -> &[u8] {
+        self.mmap.bytes()
+    }
+
+    fn real_disk_size(&self) -> std::io::Result<u64> {
+        file::real_disk_size(&self.file)
+    }
+
+    fn try_clone_file(&self) -> std::io::Result<File> {
+        self.file.try_clone()
+    }
+
+    fn write_at_page(&self, pgno: u64, psize: u32, data: &[u8]) -> std::io::Result<()> {
+        // Commit C2/C4 (SPEC 04 §9): copy the dirty frame / meta buffer straight
+        // into the writable map at the page's on-disk offset. TXN-62 guarantees
+        // the target page is not referenced by any live snapshot (see the
+        // `MmapWritable::map` SAFETY note). No `pwrite`; the bytes become durable
+        // only at the next `sync` (`msync`).
+        let off = (pgno as usize)
+            .checked_mul(psize as usize)
+            .expect("page offset overflow");
+        self.mmap.write_at(off, data);
+        Ok(())
+    }
+
+    fn sync_data(&self) -> std::io::Result<()> {
+        self.sync(false)
+    }
+
+    fn sync(&self, async_flush: bool) -> std::io::Result<()> {
+        // SPEC 06 REC-12: `msync(MS_SYNC)` is the durability barrier under
+        // WRITE_MAP (or `MS_ASYNC` under MAP_ASYNC). On macOS `msync` alone is
+        // not a full barrier, so a synchronous flush additionally `fdatasync`s
+        // the data fd (SPEC 01 §S7); an async flush deliberately does neither
+        // (relaxed durability, REC-9).
+        self.mmap.flush(async_flush)?;
+        if !async_flush {
+            self.file.sync_data()?;
+        }
+        Ok(())
+    }
+}
+
+impl WriteMapBacking {
+    /// Access the writable map (used by the engine core through [`Backing`]).
+    #[must_use]
+    pub fn map(&self) -> &MmapWritable {
+        &self.mmap
+    }
+}
+
 /// The result of opening (or creating) an env data file: the [`Backing`] plus
 /// the authoritative page size, the effective runtime map size, and whether the
 /// file was freshly created.
@@ -110,7 +184,14 @@ pub fn open_or_create(
     requested_map_size: Option<u64>,
     default_map_size: u64,
     read_only: bool,
+    write_map: bool,
 ) -> Result<Opened, Error> {
+    // `WRITE_MAP` needs write access; it is meaningless (and unsupported here)
+    // on a read-only env, which maps read-only. LMDB likewise maps a
+    // `WRITEMAP|RDONLY` env read-only. So the writable path is taken only when
+    // `write_map && !read_only`.
+    let write_map = write_map && !read_only;
+
     let exists_nonempty = match std::fs::metadata(data_path) {
         Ok(m) => m.len() > 0,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -127,14 +208,9 @@ pub fn open_or_create(
         }
         let map_size = requested_map_size.unwrap_or(default_map_size);
         let file = file::create_env_file(data_path, requested_page_size, map_size)?;
-        let file_len = file::real_disk_size(&file)? as usize;
-        // ADR-0004 D4 (approved OQ2): map the full map_size once at open —
-        // the base address is fixed for the env's life and file growth needs
-        // no remap. Pages beyond EOF are never dereferenced (engine
-        // discipline; see `Mmap::map`).
-        let mmap = Mmap::map(&file, file_len.max(map_size as usize))?;
+        let backing = map_backing(file, map_size, write_map)?;
         return Ok(Opened {
-            backing: Box::new(MmapBacking { mmap, file }),
+            backing,
             page_size: requested_page_size,
             map_size,
             created: true,
@@ -154,14 +230,36 @@ pub fn open_or_create(
     let head = file::read_head(&file, file_len.min(2 * page_size as usize))?;
     let persisted = persisted_map_size(&head, page_size);
     let map_size = requested_map_size.or(persisted).unwrap_or(default_map_size);
-    let mmap = Mmap::map(&file, file_len.max(map_size as usize))?;
+    let backing = map_backing(file, map_size, write_map)?;
 
     Ok(Opened {
-        backing: Box::new(MmapBacking { mmap, file }),
+        backing,
         page_size,
         map_size,
         created: false,
     })
+}
+
+/// Map `file` at the effective `map_size` and box it as a [`Backing`]: the
+/// read-only [`MmapBacking`] (default) or the writable [`WriteMapBacking`]
+/// (`WRITE_MAP`). ADR-0004 D4: the map covers the full `map_size` once, no
+/// remap. Under `WRITE_MAP` the file is first `set_len(map_size)` so every
+/// mapped page is backed (SPEC 04 §6.4 — no `SIGBUS` on a store past EOF).
+fn map_backing(file: File, map_size: u64, write_map: bool) -> Result<Box<dyn Backing>, Error> {
+    let file_len = file::real_disk_size(&file)? as usize;
+    let want = file_len.max(map_size as usize);
+    if write_map {
+        // Grow the file to cover the whole map so writes anywhere in
+        // `[0, map_size)` land in backed (sparse) blocks, not past EOF.
+        if (file_len as u64) < map_size {
+            file.set_len(map_size)?;
+        }
+        let mmap = MmapWritable::map(&file, want)?;
+        Ok(Box::new(WriteMapBacking { mmap, file }))
+    } else {
+        let mmap = Mmap::map(&file, want)?;
+        Ok(Box::new(MmapBacking { mmap, file }))
+    }
 }
 
 /// The persisted `map_size` from whichever meta slot validates (prefer the

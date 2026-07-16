@@ -15,7 +15,9 @@
 use std::path::Path;
 
 pub use zerodb_core::check;
-pub use zerodb_core::env::{CommitHook, Env, EnvClosingEvent, EnvInfo, HookPoint, Snapshot};
+pub use zerodb_core::env::{
+    CommitHook, DurabilityFlags, Env, EnvClosingEvent, EnvInfo, HookPoint, Snapshot,
+};
 pub use zerodb_core::error::{Error, MdbError, Result};
 pub use zerodb_core::nested::NestedRoTxn;
 pub use zerodb_core::rotxn::{free_page_count, Database, DatabaseStat, RoRange, RoTxn, TxnRead};
@@ -36,23 +38,35 @@ const DEFAULT_PAGE_SIZE: u32 = 4096;
 /// Environment open flags (SPEC 01 Table 1). A hand-rolled bitset — no
 /// `bitflags` dependency (not on the CLAUDE.md allowlist).
 ///
-/// Phase-1 in-scope flags: [`EnvFlags::PREV_SNAPSHOT`] (MUST — milli's
-/// `Index::rollback`, opens the older meta) and [`EnvFlags::READ_ONLY`]
-/// (SHOULD — accepted and stored; write-rejection is deferred to the txn
-/// milestones, M1.10). Durability and writemap flags (`NO_SYNC`, `WRITE_MAP`, …)
-/// land with the write path.
+/// Phase-1 in-scope flags (all MUST/SHOULD-Phase-1 per SPEC 01 Table 1):
+/// [`EnvFlags::PREV_SNAPSHOT`] (milli's `Index::rollback`), [`EnvFlags::READ_ONLY`]
+/// (write-txn → `EACCES`), [`EnvFlags::WRITE_MAP`] (writable-mmap write path,
+/// M1.10), and the durability flags [`EnvFlags::NO_SYNC`] /
+/// [`EnvFlags::NO_META_SYNC`] / [`EnvFlags::MAP_ASYNC`] (SPEC 01 §S6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EnvFlags(u32);
 
 impl EnvFlags {
     /// No flags.
     pub const EMPTY: EnvFlags = EnvFlags(0);
+    /// `MDB_NOSYNC` — skip both data and meta fsync on commit (SPEC 01 Table 1,
+    /// §S6). Durability restored by [`Env::force_sync`].
+    pub const NO_SYNC: EnvFlags = EnvFlags(0x0001_0000);
+    /// `MDB_RDONLY` — env-level read-only (SPEC 01 Table 1). A write txn on such
+    /// an env returns `EACCES` (M1.10).
+    pub const READ_ONLY: EnvFlags = EnvFlags(0x0002_0000);
+    /// `MDB_NOMETASYNC` — fsync data but skip the meta fsync this commit
+    /// (SPEC 01 Table 1, §S6, REC-10).
+    pub const NO_META_SYNC: EnvFlags = EnvFlags(0x0004_0000);
+    /// `MDB_WRITEMAP` — writes go through a writable mmap instead of
+    /// heap-buffer + `pwrite` (SPEC 01 Table 1, §S7, SPEC 04 §6.4; M1.10).
+    pub const WRITE_MAP: EnvFlags = EnvFlags(0x0008_0000);
+    /// `MDB_MAPASYNC` — with `WRITE_MAP`, use `msync(MS_ASYNC)` for the commit
+    /// flushes (SPEC 01 Table 1, §S6). No effect without `WRITE_MAP`.
+    pub const MAP_ASYNC: EnvFlags = EnvFlags(0x0010_0000);
     /// `MDB_PREVSNAPSHOT` — open on the older of the two meta pages (SPEC 01
     /// Table 1, §S5).
     pub const PREV_SNAPSHOT: EnvFlags = EnvFlags(0x0200_0000);
-    /// `MDB_RDONLY` — env-level read-only (SPEC 01 Table 1). Accepted and stored
-    /// in Phase 1; the write-txn rejection is M1.10.
-    pub const READ_ONLY: EnvFlags = EnvFlags(0x0002_0000);
 
     /// Whether all bits in `other` are set.
     #[must_use]
@@ -143,8 +157,9 @@ impl EnvOpenOptions {
         self
     }
 
-    /// Set the env flags (SPEC 00 row 6). Only [`EnvFlags::PREV_SNAPSHOT`] and
-    /// [`EnvFlags::READ_ONLY`] are meaningful in M1.2.
+    /// Set the env flags (SPEC 00 row 6). All Phase-1 flags are honored:
+    /// `PREV_SNAPSHOT`, `READ_ONLY`, `WRITE_MAP`, `NO_SYNC`, `NO_META_SYNC`,
+    /// `MAP_ASYNC` (SPEC 01 Table 1; M1.10).
     pub fn flags(&mut self, flags: EnvFlags) -> &mut EnvOpenOptions {
         self.flags = flags;
         self
@@ -196,6 +211,15 @@ impl EnvOpenOptions {
 
         let read_only = self.flags.contains(EnvFlags::READ_ONLY);
         let prev_snapshot = self.flags.contains(EnvFlags::PREV_SNAPSHOT);
+        // `WRITE_MAP` is meaningful only on a writable env; the backing maps
+        // read-only under `READ_ONLY` regardless (LMDB parity).
+        let durability = DurabilityFlags {
+            read_only,
+            no_sync: self.flags.contains(EnvFlags::NO_SYNC),
+            no_meta_sync: self.flags.contains(EnvFlags::NO_META_SYNC),
+            map_async: self.flags.contains(EnvFlags::MAP_ASYNC),
+            write_map: self.flags.contains(EnvFlags::WRITE_MAP) && !read_only,
+        };
 
         let opened = zerodb_io::open_or_create(
             &data_path,
@@ -203,6 +227,7 @@ impl EnvOpenOptions {
             self.map_size,
             DEFAULT_MAP_SIZE,
             read_only,
+            durability.write_map,
         )?;
 
         zerodb_core::env::open_with_backing(
@@ -213,6 +238,7 @@ impl EnvOpenOptions {
             prev_snapshot,
             self.max_dbs,
             self.max_readers,
+            durability,
         )
     }
 }

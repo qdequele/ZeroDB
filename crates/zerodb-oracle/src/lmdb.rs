@@ -21,7 +21,7 @@ use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
 
 use crate::result::{OpResult, OracleError, Skip};
 use crate::tempdir::TempDir;
-use crate::{DbName, Engine, Op, PutFlag};
+use crate::{DbName, Engine, EngineMode, Op, PutFlag};
 
 /// Base map size; growth is layered on top in 4 KiB units. Sized so a full
 /// op sequence cannot exhaust the map (see [`crate::DIFF_MAP_SIZE`]).
@@ -75,6 +75,9 @@ pub struct LmdbEngine {
     /// guard fact (see `driver::classify` and `docs/UPSTREAM-BUGS.md`). Set in
     /// `clear_db`, reset at every txn boundary.
     cleared_in_txn: bool,
+    /// The env open mode (M1.10): `WRITE_MAP` / durability flags. Preserved
+    /// across `reopen` so a reopened env keeps the same write mode.
+    mode: EngineMode,
     dir: TempDir,
 }
 
@@ -144,14 +147,45 @@ impl LmdbEngine {
     }
 }
 
-fn open_env(dir: &std::path::Path, map_size: usize) -> heed::Result<Env<WithoutTls>> {
+/// The heed env flags for a mode (M1.10, SPEC 01 Table 1). `WithoutTls` is set
+/// separately via `read_txn_without_tls()` (SPEC 00 rows 2/29); these are the
+/// durability / write-mode bits only.
+fn heed_flags(mode: EngineMode) -> heed::EnvFlags {
+    let mut f = heed::EnvFlags::empty();
+    if mode.write_map {
+        f |= heed::EnvFlags::WRITE_MAP;
+    }
+    if mode.no_sync {
+        f |= heed::EnvFlags::NO_SYNC;
+    }
+    if mode.no_meta_sync {
+        f |= heed::EnvFlags::NO_META_SYNC;
+    }
+    if mode.map_async {
+        f |= heed::EnvFlags::MAP_ASYNC;
+    }
+    f
+}
+
+fn open_env(
+    dir: &std::path::Path,
+    map_size: usize,
+    mode: EngineMode,
+) -> heed::Result<Env<WithoutTls>> {
     let mut opts = EnvOpenOptions::new().read_txn_without_tls();
     opts.map_size(map_size);
     opts.max_dbs(MAX_DBS);
-    // SAFETY: `open` is `unsafe` only because LMDB env flags can enable
-    // cross-process behaviors; we pass none, and the path is a private temp dir
-    // used single-threaded by this engine instance.
-    unsafe { opts.open(dir) }
+    let flags = heed_flags(mode);
+    // SAFETY: `open`/`flags` are `unsafe` only because LMDB env flags can enable
+    // cross-process behaviors; the flags we set (`WRITE_MAP` + durability, M1.10)
+    // are single-process-safe, and the path is a private temp dir used
+    // single-threaded by this engine instance.
+    unsafe {
+        if !flags.is_empty() {
+            opts.flags(flags);
+        }
+        opts.open(dir)
+    }
 }
 
 /// Map a heed error into the oracle's normalized taxonomy.
@@ -178,8 +212,12 @@ fn err(e: heed::Error) -> OpResult {
 
 impl Engine for LmdbEngine {
     fn new() -> Self {
+        Self::new_in_mode(EngineMode::DEFAULT)
+    }
+
+    fn new_in_mode(mode: EngineMode) -> Self {
         let dir = TempDir::new().expect("create temp dir");
-        let env = open_env(dir.path(), BASE_MAP_SIZE).expect("open env");
+        let env = open_env(dir.path(), BASE_MAP_SIZE, mode).expect("open env");
         LmdbEngine {
             active: Active::None,
             dbs: Vec::new(),
@@ -188,6 +226,7 @@ impl Engine for LmdbEngine {
             map_size: BASE_MAP_SIZE,
             poisoned: None,
             cleared_in_txn: false,
+            mode,
             dir,
         }
     }
@@ -292,7 +331,7 @@ impl LmdbEngine {
         drop(self.env.take());
 
         let new_size = self.desired_map_size(kib);
-        match open_env(self.dir.path(), new_size) {
+        match open_env(self.dir.path(), new_size, self.mode) {
             Ok(env) => {
                 self.env = Some(Box::new(env));
                 self.map_size = new_size;
@@ -302,7 +341,7 @@ impl LmdbEngine {
                 // Reopening at a non-shrinking size should not fail; if it
                 // somehow does, restore the env at the previous size (which was
                 // open moments ago) so the engine stays usable, and report.
-                match open_env(self.dir.path(), self.map_size) {
+                match open_env(self.dir.path(), self.map_size, self.mode) {
                     Ok(env) => self.env = Some(Box::new(env)),
                     Err(restore) => {
                         // Both opens failed (e.g. transient EMFILE): the env is

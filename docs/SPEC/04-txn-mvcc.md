@@ -605,6 +605,34 @@ dirty-page store must be built so it is.
   **uniformly** at the API/borrow level (SPEC 01 §S7): the same `get` signature,
   the same TXN-39 invalidation points. Only the internal backing differs.
 
+- **TXN-45a — Phase-1 realization (amended 2026-07-16, M1.10).** The
+  implementation realizes `WRITE_MAP` as a **commit-time write strategy**, not
+  live-map mutation during the txn: dirty bytes live in the heap dirty-page
+  store (§6.3) for the whole write txn — identical to the default mode — and are
+  copied into the writable map at commit **C2** (`WriteMapBacking::write_at_page`
+  = `memcpy` into the map), then made durable by `msync` at C3/C5 (SPEC 06
+  REC-12). Rationale and consequences:
+  - **Observably identical** to the fork's live-map writes through the heed /
+    oracle surface: same `put`/`get`/`put_reserved`/iteration results, same
+    durability. `env_writemap_*` differential tests (M1.10) confirm parity.
+  - **Preserves every invariant unchanged:** the value-borrow contract (§6.3),
+    nested-reader reads of dirty pages (§5), and abort-by-drop all operate on the
+    heap store exactly as the default mode — so `WRITE_MAP` needs **no map
+    `unsafe` in `zerodb-core`** (the writable-mmap `unsafe` is confined to
+    `zerodb-io`, per the CLAUDE.md unsafe policy) and the M1.4 miri coverage
+    (§6.6 / TXN-49) covers writemap's during-txn path for free.
+  - The writable map covers the full `map_size` and the file is `set_len` to
+    `map_size` at open (matching the fork's `ftruncate`-to-mapsize under
+    writemap) so a store to any mapped page never faults past EOF (ADR-0004 D4).
+  - True zero-copy **live-map mutation during the txn** (writing COW copies
+    straight into the map, `get` returning a slice into the map) is a Phase-3
+    optimization: it needs a `zerodb-io`-brokered map-slice API (to keep the map
+    `unsafe` out of `zerodb-core`) and a bench to justify it. The full-generality
+    wording of TXN-45 (bytes "live in the writable map") is the Phase-3 target;
+    Phase-1 satisfies the observable contract via the commit-time copy. This is
+    **not** a `docs/DIVERGENCES.md` entry — it produces no observable divergence
+    from the fork.
+
 ### §6.5 — put_reserved / ReservedSpace rules
 
 - **TXN-47** — `Database::put_reserved(txn, key, len, f)` (SPEC 00 row 35,

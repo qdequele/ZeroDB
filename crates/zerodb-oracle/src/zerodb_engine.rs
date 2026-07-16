@@ -49,12 +49,13 @@
 //! differences are LMDB API-boundary behaviors applied here.
 
 use zerodb::{
-    check, Database, Env, EnvOpenOptions, Error, MdbError, NestedRoTxn, PutFlags, RoTxn, RwTxn,
+    check, Database, Env, EnvFlags, EnvOpenOptions, Error, MdbError, NestedRoTxn, PutFlags, RoTxn,
+    RwTxn,
 };
 
 use crate::result::{OpResult, OracleError, Skip};
 use crate::tempdir::TempDir;
-use crate::{DbName, Engine, Op, PutFlag};
+use crate::{DbName, Engine, EngineMode, Op, PutFlag};
 
 /// Base map size (see [`crate::DIFF_MAP_SIZE`]); matches [`crate::LmdbEngine`].
 const BASE_MAP_SIZE: usize = crate::DIFF_MAP_SIZE;
@@ -62,6 +63,25 @@ const BASE_MAP_SIZE: usize = crate::DIFF_MAP_SIZE;
 const PAGE_SIZE: u32 = 4096;
 /// Catalog capacity: unnamed + `db0`..`db3` plus slack (matches `LmdbEngine`).
 const MAX_DBS: u32 = 16;
+
+/// The zerodb env flags for a mode (M1.10, SPEC 01 Table 1) — the durability /
+/// write-mode bits mirrored from `EngineMode`.
+fn env_flags(mode: EngineMode) -> EnvFlags {
+    let mut f = EnvFlags::EMPTY;
+    if mode.write_map {
+        f |= EnvFlags::WRITE_MAP;
+    }
+    if mode.no_sync {
+        f |= EnvFlags::NO_SYNC;
+    }
+    if mode.no_meta_sync {
+        f |= EnvFlags::NO_META_SYNC;
+    }
+    if mode.map_async {
+        f |= EnvFlags::MAP_ASYNC;
+    }
+    f
+}
 
 /// Run a read expression `$body` (with the serving txn bound to `$t`) against
 /// whichever transaction serves reads, or skip. A macro (not a `&dyn` helper)
@@ -134,15 +154,19 @@ pub struct ZerodbEngine {
     /// FORK-1 guard fact (see `driver::classify`): set by `ClearDb`, reset at
     /// every txn boundary.
     cleared_in_txn: bool,
+    /// The env open mode (M1.10): `WRITE_MAP` / durability flags. Preserved
+    /// across `reopen` so a reopened env keeps the same write mode.
+    mode: EngineMode,
     dir: TempDir,
 }
 
 impl ZerodbEngine {
-    fn open(dir: &std::path::Path, map_size: usize) -> Result<Env, Error> {
+    fn open(dir: &std::path::Path, map_size: usize, mode: EngineMode) -> Result<Env, Error> {
         let mut opts = EnvOpenOptions::new();
         opts.map_size(map_size);
         opts.max_dbs(MAX_DBS);
         opts.page_size(PAGE_SIZE);
+        opts.flags(env_flags(mode));
         opts.open(dir)
     }
 
@@ -225,14 +249,14 @@ impl ZerodbEngine {
         self.env = None;
 
         let new_size = self.desired_map_size(kib);
-        match Self::open(self.dir.path(), new_size) {
+        match Self::open(self.dir.path(), new_size, self.mode) {
             Ok(env) => {
                 self.env = Some(Box::new(env));
                 self.map_size = new_size;
                 OpResult::Ok
             }
             Err(e) => {
-                if let Ok(env) = Self::open(self.dir.path(), self.map_size) {
+                if let Ok(env) = Self::open(self.dir.path(), self.map_size, self.mode) {
                     self.env = Some(Box::new(env));
                 }
                 OpResult::Err(to_oracle(e))
@@ -808,8 +832,12 @@ fn to_oracle(e: Error) -> OracleError {
 
 impl Engine for ZerodbEngine {
     fn new() -> Self {
+        Self::new_in_mode(EngineMode::DEFAULT)
+    }
+
+    fn new_in_mode(mode: EngineMode) -> Self {
         let dir = TempDir::new().expect("create temp dir");
-        let env = ZerodbEngine::open(dir.path(), BASE_MAP_SIZE).expect("open zerodb env");
+        let env = ZerodbEngine::open(dir.path(), BASE_MAP_SIZE, mode).expect("open zerodb env");
         ZerodbEngine {
             active: Active::None,
             dbs: Vec::new(),
@@ -817,6 +845,7 @@ impl Engine for ZerodbEngine {
             env: Some(Box::new(env)),
             map_size: BASE_MAP_SIZE,
             cleared_in_txn: false,
+            mode,
             dir,
         }
     }

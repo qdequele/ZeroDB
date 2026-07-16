@@ -90,6 +90,23 @@ pub trait Backing: Send + Sync {
             "this backing is read-only",
         ))
     }
+
+    /// The durability barrier the commit pipeline invokes at C3/C5 (M1.10,
+    /// SPEC 06 REC-9/REC-12). `async_flush` is honored only by the writable-map
+    /// backing (`WRITE_MAP` + `MAP_ASYNC` → `msync(MS_ASYNC)`); the default
+    /// heap/pwrite backing ignores it and calls [`Backing::sync_data`]
+    /// (`fdatasync`). Whether this method is called *at all* is decided by the
+    /// caller from the durability flags (`NO_SYNC`/`NO_META_SYNC` skip it,
+    /// SPEC 01 §S6); the backing only chooses the *primitive*
+    /// (`fdatasync` vs `msync`), never the policy.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the fsync/msync I/O error (the caller poisons the env, REC-13).
+    fn sync(&self, async_flush: bool) -> std::io::Result<()> {
+        let _ = async_flush;
+        self.sync_data()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +204,38 @@ impl SignalEvent {
         let (g2, _res) = self.cv.wait_timeout(g, dur).expect("signal mutex poisoned");
         *g2
     }
+}
+
+/// Env-level durability / write-mode flags (SPEC 01 Table 1, §S6/§S7; M1.10).
+/// Selected once at open and immutable for the env's life. The commit pipeline
+/// reads them to decide which fsync/msync barriers run (SPEC 06 REC-9/REC-12);
+/// the backing implementation chooses the *primitive* (`fdatasync` vs `msync`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DurabilityFlags {
+    /// `MDB_RDONLY` — env-level read-only: `write_txn`/`force_sync` → `EACCES`
+    /// (SPEC 01 Table 1, TXN-8).
+    pub read_only: bool,
+    /// `MDB_NOSYNC` — skip **both** data (C3) and meta (C5) fsync on commit
+    /// (SPEC 01 §S6). Durability restored by `force_sync`.
+    pub no_sync: bool,
+    /// `MDB_NOMETASYNC` — fsync data (C3) but skip the meta fsync (C5) this
+    /// commit (SPEC 01 §S6, REC-10).
+    pub no_meta_sync: bool,
+    /// `MDB_MAPASYNC` — with `WRITE_MAP`, use `msync(MS_ASYNC)` for the commit
+    /// flushes (SPEC 01 §S6, REC-9). No effect without `write_map`.
+    pub map_async: bool,
+    /// `MDB_WRITEMAP` — writes go through a writable mmap (SPEC 01 §S7,
+    /// SPEC 04 §6.4). Recorded here for introspection; the actual writable map
+    /// lives in the `zerodb-io` backing.
+    pub write_map: bool,
+}
+
+/// The `EACCES` error a write attempt on a read-only env returns (SPEC 01
+/// Table 1, TXN-8). Matches the fork's `mdb_txn_begin` → `EACCES`, which heed
+/// surfaces as `Error::Io(PermissionDenied)` (os error 13) — so ZeroDB returns
+/// the identical `Io(PermissionDenied)` for oracle taxonomy parity.
+fn eacces_error() -> Error {
+    Error::Io(std::io::Error::from_raw_os_error(13))
 }
 
 // ---------------------------------------------------------------------------
@@ -318,6 +367,10 @@ pub struct EnvInner {
     /// The named-DB registry (the dbi table, SPEC 02 §6; M1.6). Guards the
     /// dbi ↔ name mapping only — records resolve from the catalog (TXN-10).
     named: Mutex<NamedRegistry>,
+    /// Env-level durability / write-mode flags (SPEC 01 §S6/§S7; M1.10).
+    /// Immutable after open; read by the commit pipeline and by `write_txn` /
+    /// `force_sync`.
+    durability: DurabilityFlags,
 }
 
 impl std::fmt::Debug for EnvInner {
@@ -501,6 +554,53 @@ impl EnvInner {
         self.prev_snapshot
     }
 
+    /// The env-level durability / write-mode flags (SPEC 01 §S6/§S7; M1.10).
+    #[must_use]
+    pub fn durability(&self) -> DurabilityFlags {
+        self.durability
+    }
+
+    /// Whether the env is read-only (`MDB_RDONLY`, SPEC 01 Table 1).
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.durability.read_only
+    }
+
+    /// Force durability of all prior commits (`mdb_env_sync`, SPEC 00 row —
+    /// `Env::force_sync`; SPEC 01 §S6). Overrides `NO_SYNC` and downgrades
+    /// `MAP_ASYNC` to a synchronous flush (`async_flush = false`). A no-op'able
+    /// call on an env whose backing has nothing pending still issues the
+    /// barrier, matching `mdb_env_sync(force=1)`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] (`EACCES`) on a read-only env (SPEC 01 Table 1: `mdb_env_sync`
+    ///   on an `MDB_RDONLY` env returns `EACCES`).
+    /// - [`Error::Io`] on an `msync`/`fsync` failure — which also **poisons** the
+    ///   env (SPEC 06 REC-13), exactly like a failed commit barrier.
+    pub fn force_sync(&self) -> Result<(), Error> {
+        if self.durability.read_only {
+            return Err(eacces_error());
+        }
+        if self.is_poisoned() {
+            return Err(Error::Io(std::io::Error::other(
+                "environment poisoned by a failed durability barrier (SPEC 06 REC-13)",
+            )));
+        }
+        // Serialize with the writer: a concurrent commit must not interleave its
+        // pipeline with an explicit sync. The guard is released on return.
+        let _guard = self.lock_writer();
+        // `async_flush = false`: a forced sync is always a synchronous barrier
+        // (SPEC 01 §S6 — `force` downgrades `MAP_ASYNC` to `MS_SYNC`).
+        match self.backing_ref().sync(false) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.poison(); // REC-13
+                Err(e.into())
+            }
+        }
+    }
+
     /// The canonical directory path (SPEC 00 row 21).
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -636,6 +736,29 @@ impl Env {
         self.inner.is_prev_snapshot()
     }
 
+    /// Whether the env is read-only (`MDB_RDONLY`, SPEC 01 Table 1).
+    #[must_use]
+    pub fn is_read_only(&self) -> bool {
+        self.inner.is_read_only()
+    }
+
+    /// The env-level durability / write-mode flags (SPEC 01 §S6/§S7).
+    #[must_use]
+    pub fn durability(&self) -> DurabilityFlags {
+        self.inner.durability()
+    }
+
+    /// Force durability of all prior commits (`mdb_env_sync` parity, SPEC 01
+    /// §S6). Restores durability under `NO_SYNC` / `NO_META_SYNC` / `MAP_ASYNC`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] (`EACCES`) on a read-only env; [`Error::Io`] on an
+    /// `msync`/`fsync` failure (which poisons the env, REC-13).
+    pub fn force_sync(&self) -> Result<(), Error> {
+        self.inner.force_sync()
+    }
+
     /// Actual on-disk file size (SPEC 00 row 18).
     ///
     /// # Errors
@@ -740,6 +863,11 @@ impl EnvClosingEvent {
 /// - [`Error::EnvAlreadyOpened`] if a live handle for `canonical_path` exists.
 /// - [`Error::Mdb`]`(`[`MdbError::Invalid`]`)` if neither slot validates, or
 ///   under the one-valid + `PREV_SNAPSHOT` combination (SPEC 06 REC-2†).
+// The open parameters are all distinct scalars/flags the caller (zerodb-io / the
+// public crate) has already resolved; bundling them into a params struct would
+// only add indirection for this single internal entry point. M1.10 pushed the
+// count from 7 to 8 with `durability`.
+#[allow(clippy::too_many_arguments)]
 pub fn open_with_backing(
     canonical_path: PathBuf,
     backing: Box<dyn Backing>,
@@ -748,6 +876,7 @@ pub fn open_with_backing(
     prev_snapshot: bool,
     max_dbs: u32,
     max_readers: u32,
+    durability: DurabilityFlags,
 ) -> Result<Env, Error> {
     // Validate the two meta slots from the mapped bytes (SPEC 02 §3.2). A
     // decode error here (bad page size / truncated buffer) means the file is not
@@ -792,6 +921,7 @@ pub fn open_with_backing(
         // The reader table is sized once at open and never resized (TXN-14).
         reader_table: ReaderTable::new(max_readers),
         named: Mutex::new(NamedRegistry::new(max_dbs)),
+        durability,
         meta,
         prev_snapshot,
         closing,
@@ -893,6 +1023,7 @@ pub mod testutil {
             false,
             128,
             126,
+            super::DurabilityFlags::default(),
         ) {
             Ok(env) => env,
             Err(Error::Io(e)) => panic!("mem_env open failed: {e}"),
@@ -934,7 +1065,16 @@ mod tests {
     }
 
     fn open(buf: Vec<u8>, prev: bool, path: PathBuf) -> Result<Env, Error> {
-        open_with_backing(path, Box::new(VecBacking(buf)), PS, MAP, prev, 128, 126)
+        open_with_backing(
+            path,
+            Box::new(VecBacking(buf)),
+            PS,
+            MAP,
+            prev,
+            128,
+            126,
+            DurabilityFlags::default(),
+        )
     }
 
     #[test]

@@ -1,6 +1,8 @@
 # SPEC 01 — LMDB flag & semantics matrix (Phase 0.2 deliverable)
 
-Status: **DONE** — 2026-07-15.
+Status: **DONE** — 2026-07-15. **M1.10 landed addendum** — 2026-07-16 (the
+env write-mode / durability / RDONLY flags implemented; see the *M1.10 landed
+flag matrix* at the end of this file for each flag's landing test).
 
 Source of truth: the **Meilisearch LMDB fork**, branch `mdb.master.nested-rtxns`,
 as vendored by `lmdb-master-sys 0.2.6` inside **heed v0.22.1** (SPEC 00 pinned
@@ -420,3 +422,43 @@ from its MUST table):
   cursor-ops, all revived in Phase 2.8) and **3 by D-001/written rationale**
   (`FIXEDMAP` experimental upstream, `NOSUBDIR` own-format, `NOLOCK` cross-process
   per D-001).
+
+---
+
+## M1.10 landed flag matrix (write flags and modes)
+
+**Landed 2026-07-16** (PLAN §1.10). Every write-mode / durability / RDONLY flag
+in Phase-1 scope, its landing test, and where it lives. The put-flag rows
+(`APPEND` / `NO_OVERWRITE` / `CURRENT` / `RESERVE`) landed earlier in M1.4/M1.6;
+they are re-listed here for a single flag-matrix view (PLAN §1.10 acceptance).
+
+| Flag | Table | Behavior (landed) | Landing test | Kind |
+|------|-------|-------------------|--------------|------|
+| `MDB_WRITEMAP` | 1 | Writes go through a writable mmap (`zerodb-io::WriteMapBacking`); commit `msync` instead of `pwrite`+`fdatasync`. Realized as a commit-time write strategy — heap dirty frames during the txn, copied into the map at C2 (SPEC 04 §6.4, amended). | `env_writemap_put_get_parity`, `env_writemap_put_reserved` (oracle, both engines in WRITE_MAP); `writemap_put_get_reserved_persist`, `writemap_reopened_as_writemap_sees_data` (`crates/zerodb/tests/write_flags.rs`) | differential + e2e |
+| `MDB_MAPASYNC` | 1 | With WRITE_MAP, C3/C5 use `msync(MS_ASYNC)`. | `durability_mapasync_writemap` (oracle); `map_async_makes_barriers_async` (barrier count); `mapasync_writemap_commit_and_force_sync` (e2e) | differential + control-flow |
+| `MDB_NOSYNC` | 1 | Skip **both** C3 and C5 fsync (SPEC 06 REC-9). Restored by `force_sync`. | `durability_nosync_no_fsync` (oracle); `no_sync_skips_both_barriers` / `no_sync_dominates_no_meta_sync` (barrier count) | differential + control-flow |
+| `MDB_NOMETASYNC` | 1 | fsync data (C3), skip meta fsync (C5); recovery falls back to newest durable meta, corruption-free (REC-10). | `durability_nometasync` (oracle); `no_meta_sync_skips_meta_barrier` (barrier count) | differential + control-flow |
+| `MDB_RDONLY` | 1 | `write_txn` / `force_sync` → `EACCES` (`Io(PermissionDenied)`, matching the fork); reads fully functional; no store creation. | `env_rdonly_rejects_write` (oracle, direct two-engine); `read_only_env_rejects_write_txn_and_force_sync`, `read_only_open_of_missing_store_errors` (e2e) | differential + e2e |
+| `MDB_NOTLS` | 1 | `RoTxn: Send` (default/only mode); reader-table slot tied to the txn object. | `flag_notls_rotxn_is_send` (compile assert + cross-thread move) | compile + e2e |
+| `MDB_PREVSNAPSHOT` | 1 | Open on the older meta; auto-clears on first commit (M1.2 / SPEC 02 §3.2, TXN-65..67). | `env_prevsnapshot_opens_older_meta` (M1.2) | differential |
+| `MDB_APPEND` | 3 | Last-key compare; `key <= last` → `KeyExist` (SPEC 01 §S1). | `flag_append_*` (M1.4 oracle) | differential |
+| `MDB_NOOVERWRITE` | 3 | Return existing value + `KeyExist` (SPEC 01 §S2). | `flag_no_overwrite_returns_existing` (M1.4) | differential |
+| `MDB_CURRENT` | 3 | `put_current` at cursor; `EINVAL` if uninitialized. | `cursor_put_current_*` (M1.4) | differential |
+| `MDB_RESERVE` | 3 | `put_reserved`: caller fills the slot in place; not zeroed (SPEC 01 §S3). Under WRITE_MAP the slot is (logically) into the map. | `put_reserved_*` (M1.4), `env_writemap_put_reserved` (M1.10) | differential |
+
+**`Env::force_sync`** (`mdb_env_sync` parity, SPEC 01 §S6): a synchronous
+barrier that restores durability under `NO_SYNC`/`NO_META_SYNC`/`MAP_ASYNC`;
+`EACCES` on a read-only env; poisons the env on an `msync`/`fsync` failure
+(REC-13). Covered by the `durability_*` and `read_only_*` e2e tests.
+
+**Meilisearch indexing flag-combo replay** (PLAN §1.10 acceptance): the exact
+milli combo — `WithoutTls` + `map_size` + named DBs + `put`/`put_with_flags`
+(APPEND, sorted) + `del` + `clear` + **nested reads mid-txn** — is replayed on
+both engines and compared exhaustively by `milli_indexing_flag_combo_replay`
+(oracle). `WRITE_MAP` (milli's experimental gate) is covered by the WRITE_MAP
+rows above.
+
+**Fuzz dimension:** `fuzz/fuzz_targets/diff_ops.rs` seeds an `EngineMode` from
+the first input byte so ~25% of differential fuzz cases run **both** engines in
+`WRITE_MAP` (a slice also with a relaxed durability flag), exercising the second
+write mode continuously.

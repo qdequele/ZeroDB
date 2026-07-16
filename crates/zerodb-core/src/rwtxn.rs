@@ -281,6 +281,14 @@ fn poisoned_error() -> Error {
     ))
 }
 
+/// The `EACCES` a write txn on a read-only env returns (SPEC 01 Table 1, TXN-8).
+/// The fork's `mdb_txn_begin` returns `EACCES`, which heed surfaces as
+/// `Error::Io(PermissionDenied)` (os error 13); ZeroDB returns the identical
+/// value so the oracle taxonomy agrees.
+fn read_only_error() -> Error {
+    Error::Io(std::io::Error::from_raw_os_error(13))
+}
+
 // ---------------------------------------------------------------------------
 // RwTxn
 // ---------------------------------------------------------------------------
@@ -375,6 +383,13 @@ impl Env {
     /// (SPEC 06 REC-13).
     pub fn write_txn(&self) -> Result<RwTxn<'_>> {
         let inner = self.inner();
+        // TXN-8 / SPEC 01 Table 1 (M1.10): a write txn on a read-only env is
+        // `EACCES` (the fork's `mdb_txn_begin` returns `EACCES` when
+        // `me_flags & MDB_RDONLY`). Checked before the write mutex is taken —
+        // an RDONLY env never has a writer.
+        if inner.is_read_only() {
+            return Err(read_only_error());
+        }
         if inner.is_poisoned() {
             return Err(poisoned_error());
         }
@@ -2374,6 +2389,15 @@ impl<'env> RwTxn<'env> {
     fn commit_pipeline(&mut self) -> Result<()> {
         let inner = self.env.inner();
         let psize = self.psize;
+        // Durability lattice (SPEC 01 §S6, SPEC 06 REC-9; M1.10). `NO_SYNC` skips
+        // both barriers (C3+C5); `NO_META_SYNC` skips only the meta barrier (C5).
+        // `MAP_ASYNC` (WRITE_MAP only) turns the barriers that *do* run into
+        // `msync(MS_ASYNC)` — the backing honors `async_flush`, the core only
+        // decides whether a barrier runs.
+        let durability = inner.durability();
+        let sync_data = !durability.no_sync;
+        let sync_meta = !durability.no_sync && !durability.no_meta_sync;
+        let async_flush = durability.map_async;
 
         // ----- C0 was checked in `commit()` (TXN-33: `children.live() == 0`,
         // M1.9/ADR-0007 D4); the freed-page list is already accumulated
@@ -2413,10 +2437,14 @@ impl<'env> RwTxn<'env> {
         // Crash here: meta slots untouched → `N-1` selected; the written (or
         // torn) pages are unreferenced garbage (REC-6 H1).
 
-        // ----- C3: fsync(data) — MUST complete before C4 (REC-7). -----
-        if let Err(e) = inner.backing_ref().sync_data() {
-            inner.poison(); // REC-13
-            return Err(e.into());
+        // ----- C3: fsync(data) — MUST complete before C4 (REC-7). Skipped
+        // under NO_SYNC/MAP_ASYNC-none (SPEC 06 REC-9): the pages are written
+        // (C2) but not made durable this commit. -----
+        if sync_data {
+            if let Err(e) = inner.backing_ref().sync(async_flush) {
+                inner.poison(); // REC-13
+                return Err(e.into());
+            }
         }
         inner.run_hook(HookPoint::H2);
         // Crash here: `N`'s data durable but unreferenced → `N-1` (REC-6 H2).
@@ -2446,10 +2474,16 @@ impl<'env> RwTxn<'env> {
         // already made `N`'s data durable). Never a torn meta accepted
         // (REC-6 H3, REC-8).
 
-        // ----- C5: fsync(meta). -----
-        if let Err(e) = inner.backing_ref().sync_data() {
-            inner.poison(); // REC-13
-            return Err(e.into());
+        // ----- C5: fsync(meta). Skipped under NO_META_SYNC/NO_SYNC (SPEC 06
+        // REC-9/REC-10): the meta is written to its slot (C4) but not made
+        // durable this commit; recovery falls back to the newest durable meta
+        // (REC-2), which is corruption-free under NO_META_SYNC because C3 still
+        // fsynced the data. -----
+        if sync_meta {
+            if let Err(e) = inner.backing_ref().sync(async_flush) {
+                inner.poison(); // REC-13
+                return Err(e.into());
+            }
         }
         inner.run_hook(HookPoint::H4);
         // Crash here: `N` durable and selected (REC-6 H4).
