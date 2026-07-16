@@ -887,6 +887,7 @@ dependencies = [
  "thiserror",
  "zerodb",
  "zerodb-core",
+ "zerodb-io",
 ]
 
 [[package]]

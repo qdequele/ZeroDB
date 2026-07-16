@@ -191,6 +191,34 @@ recovered) **except** where explicitly noted as FS-order-dependent.
   visibility, never corruption.** The double buffer must remain a valid pair
   (SPEC 01 §S6): even the un-fsynced meta write still targets the correct slot
   (SPEC 04 TXN-63), so the older intact slot is always available.
+
+  **M1.11 amendment — the reclaim-clobber window (`NO_META_SYNC`) — PENDING
+  HUMAN RATIFICATION (found by the ADR-0008 crash harness, 2026-07-16; repro
+  seed 15797139550980166469).** The argument above shows the recovered meta's
+  pages were durable *when written*, not that they *remain unclobbered*. The
+  hole: after commit `N` returns, its meta write is issued but un-fsynced
+  (C5 skipped). Txn `N+1` may legally reclaim pages freed by txn `N`
+  (GC-18) — pages that belong to **snapshot `N−1`** — and its C2 writes them
+  *before* its C3 barrier would make meta `N` durable. In the window between
+  commit `N+1`'s C2 and C3, a power cut can persist txn `N+1`'s data while
+  meta `N` tears (sub-sector → CRC-rejected) or drops entirely: recovery then
+  selects meta `N−1`, one or more of whose pages now hold txn `N+1`'s bytes —
+  **structural corruption of the fallback snapshot** (walker: INV-20 "page
+  stamped by future txn"). So the corrected claim is: `NO_META_SYNC` recovery
+  to the **newest issued** meta is fully consistent; recovery that falls
+  **below** it, when a younger txn's data also persisted, is not guaranteed
+  structurally consistent. The default mode is immune (C5 makes meta `N`
+  durable before txn `N+1` can exist, so the only fallback is to `N−1`
+  against txn `N`'s own writes, which TXN-62 confines to pages `N−1` does not
+  reference). **LMDB parity:** the fork shares this window verbatim under
+  `MDB_NOMETASYNC` (same reclaim gate, no meta CRC — a torn meta may even be
+  *accepted* there); libmdbx's steady/weak-meta machinery (steady-gated page
+  reclaim; a third meta slot) exists precisely to close it. Phase 1 keeps
+  LMDB parity and documents the window; steady-meta gating is a **Phase 3
+  candidate**. The harness (ADR-0008 D4) asserts full REC-18 on every
+  `NO_META_SYNC` image whose recovery lands on the newest issued meta, and
+  window/taxonomy obligations only (walk/data waived, counted as "stale
+  fallbacks") on the precisely-delimited clobber-window images.
 - **REC-11** — **`NO_SYNC`/`MAP_ASYNC` window.** With neither fsync, an unbounded
   suffix of recent commits may be lost, and — unlike `NO_META_SYNC` — a
   reordering filesystem can make a meta durable before its referenced data,
@@ -318,6 +346,51 @@ obligations (REC-18).
   (each mode asserting its own REC-18 obligation strength). A single clean run is
   not sufficient; the ≥10k-cycle bar is the milestone gate.
 
+**M1.11 amendments (ADR-0008, Approved 2026-07-16 — implementation of this
+section; behavior clarifications per CLAUDE.md rule 3):**
+
+- **Cycle accounting (REC-21).** One *cycle* = one recovered-and-verified
+  crash state: each materialized fault-plan image variant (mechanism 2) and
+  each SIGKILL recovery (mechanism 1) counts as one (ratified OQ1). A `both`
+  run targets ≈80/20 image/SIGKILL **by cycle** with a ≥1k-verified-SIGKILL
+  floor on full (≥10k) runs (ratified OQ6).
+- **`NO_SYNC`/`MAP_ASYNC` sub-model split (REC-11/REC-19, ADR-0008 D4).** The
+  fault backend runs these modes under two materialization sub-models:
+  *ordered* (pending writes persist only as an issue-order prefix, modeling an
+  order-preserving filesystem) — REC-11's conditional guarantee applies, so
+  the full REC-18 obligations are asserted; and *adversarial* (full REC-20
+  drop/reorder/tear) — only "open never panics; errors confined to the
+  designed taxonomy (`Invalid`)" is asserted, with walk/loss outcomes logged
+  for characterization (ratified OQ3: asserting more would invent guarantees
+  REC-11 does not make). Bounded-window modes (default, `WRITE_MAP`,
+  `NO_META_SYNC`) run the full adversarial model **with** full REC-18
+  assertions — REC-9 promises corruption-freedom there, with one
+  precisely-scoped exception: `NO_META_SYNC` images landing in the
+  reclaim-clobber window (REC-10 amendment) carry window/taxonomy
+  obligations only and are counted as "stale fallbacks".
+- **Legal-window encoding (REC-6/REC-18.2).** The harness derives each cut's
+  legal recovered set as `[floor, ceil]` where floor/ceil are the txnids
+  selected over the durable-only / all-applied materializations of the cut —
+  a self-adapting encoding of the REC-6 rows. Two shape assertions ride on
+  it: `ceil − floor ≤ 1` for bounded-window modes (a barrier failed to fold
+  otherwise; under `NO_META_SYNC` this holds because every C3 `fdatasync`
+  covers the whole file, folding the previous commit's pending meta too), and
+  `floor ≥ acked-at-cut` for default/`WRITE_MAP` (REC-18.4 at the barrier
+  level).
+- **Env-creation window (REC-18.1 scope note).** A crash *inside env
+  creation* (SPEC 02 §3.4/§3.5 — before any transaction exists) may leave a
+  partially created store: a one-valid-slot open (REC-4) on a file shorter
+  than two meta pages, or a designed `Invalid`. This window predates the
+  commit protocol; REC-6 does not cover it, and the harness accepts either
+  outcome only when **zero** commits were ever acknowledged. From the first
+  acknowledged commit on, REC-18 applies in full.
+- **Write-alignment audit (ADR-0008 D5).** Every commit write is a positive
+  whole-page multiple at a page offset (the `Backing::write_at_page` shape
+  makes the offset structural); the fault backend debug-asserts the length on
+  every journaled write, so every crash cycle doubles as a continuous
+  O_DIRECT-friendliness audit. `O_DIRECT` itself is deferred to Phase 3.5
+  (io_uring backend).
+
 ---
 
 ## §6 — Cross-reference index
@@ -351,3 +424,14 @@ crash-window warning, placed with §1's PREV_SNAPSHOT topic).**
 > 3. **One-valid PREV_SNAPSHOT → hard error (REC-2 †).** zerodb-defined (the fork
 >    has no meta CRC, so its torn-slot behavior is unpinnable); **ratified 2026-07-16 — Phase 1 ships the documented warning only, no extra interlock; guard redesign deferred (Phase 3 candidate). Original note: human ratification
 >    pending** on whether to instead serve the lone valid older slot.
+> 4. **`NO_META_SYNC` reclaim-clobber window (REC-10 amendment, M1.11) —
+>    RATIFIED 2026-07-17 (Quentin, standing directive, session lead): scoped claim adopted; steady-gated reclaim = Phase 3 candidate.** The ADR-0008 crash harness materialized a
+>    legal power-loss image (repro seed 15797139550980166469) where the
+>    fallback snapshot is structurally corrupted by a younger txn's legally
+>    reclaimed pages — REC-10's original blanket "never corruption" overclaims.
+>    Engine matches LMDB (`MDB_NOMETASYNC` shares the window; libmdbx's
+>    steady/weak metas fix it). Decision needed: ratify the scoped claim +
+>    Phase 3 steady-gating candidate (recommended, keeps Phase 1 parity), or
+>    mandate an engine fix now (mdbx-grade: steady-gated reclaim needs a
+>    survivable steady meta — effectively a third slot — i.e. an ADR-scale
+>    format/GC change).

@@ -16,6 +16,13 @@ arbitrary.workspace = true
 # The native engine under test. Workspace-internal, no C linkage.
 zerodb = { path = "../zerodb" }
 zerodb-core = { path = "../zerodb-core" }
+# The fault-injection write backend + deterministic PRNG for the M1.11 crash
+# harness (ADR-0008). Workspace-internal.
+zerodb-io = { path = "../zerodb-io" }
+
+[[bin]]
+name = "crash-harness"
+path = "src/bin/crash-harness.rs"
 
 [dev-dependencies]
 proptest.workspace = true

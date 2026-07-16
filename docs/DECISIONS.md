@@ -10,3 +10,4 @@
 | 0005 | [GC implementation — in-txn structures, freelist_save at C1, reclaim wiring](adr/0005-gc.md) | Approved | 1.5 |
 | 0006 | [MVCC reader table — slot table, publish cell, oldest-reader, loom/stress plan](adr/0006-reader-table.md) | Approved | 1.8 |
 | 0007 | [Nested read txns — safe borrow-based `Send` child, child_count, oracle plan](adr/0007-nested-read-txns.md) | Approved | 1.9 |
+| 0008 | [Crash harness — fault-injection write backend, two-mechanism crash cycles, crash-harness binary](adr/0008-crash-harness.md) | Approved | 1.11 |

@@ -33,6 +33,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod crash;
 pub mod driver;
 mod engine;
 mod lmdb;
