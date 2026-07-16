@@ -132,22 +132,31 @@ pub fn run<A: Engine, B: Engine>(ops: &[Op]) -> Result<(), Box<Divergence>> {
         // M1.5 file-size tripwire (ADR-0005 D5, approved bands): after every
         // commit, the second engine's on-disk size must stay within
         // `BASE + 1.5x` of the reference's — a cheap unbounded-GC-growth
-        // detector on every fuzz case / proptest sequence. `BASE` = 72 pages
-        // (72 x 4096 = 288 KiB): the deterministic minimum is 65 pages, set
-        // by `deep_split_cascade_then_delete_to_empty` (400 ascending
-        // ~500-byte keys), whose gap is NOT fixed overhead but the measured
-        // sequential-plain-put fill-factor divergence — zerodb's §6.4 median
-        // split yields ~50% leaves on ascending inserts where the fork's
-        // `mdb_page_split` splits at the insert point, giving a true ~2x
-        // leaf-page ratio on that workload (zerodb 263 vs lmdb 132 pages at
-        // peak; flagged for triage in ADR-0005 D5 / M1.5 report — a split
-        // heuristic question for SPEC 03 §6.4, not a GC leak: reuse was
-        // verified to hold the file exactly flat across generations). The
-        // harness's <= 64-op fuzz sequences keep leaf counts far below this
-        // bound, so the tripwire still catches unbounded GC growth.
+        // detector on every fuzz case / proptest sequence. `BASE` = 16 pages
+        // (16 x 4096 = 64 KiB).
+        //
+        // BASE was tightened from 72 to 16 pages when the SPEC 03 §6.4
+        // end-of-page insert-point rule was ratified (ADR-0005 D5 addendum,
+        // 2026-07-16). The old 72-page BASE existed almost entirely to absorb
+        // the sequential-plain-put fill-factor divergence: zerodb's median
+        // split left ~50%-full leaves on ascending inserts where the fork's
+        // `mdb_page_split` splits at the insert point, a ~2x leaf-page ratio
+        // (old `deep_split_cascade_then_delete_to_empty` peak: zerodb 263 vs
+        // fork 132 pages at 4 KiB → the old 65-page deterministic minimum).
+        // The amendment eliminates that divergence — measured post-amendment:
+        // zerodb@4K peak on the same workload is 154 pages (vs fork ~132),
+        // overage `sb - 1.5*sa = 154 - 198 = -44` pages (negative); at MATCHED
+        // page size small DBs are byte-identical (fixed overhead ~0); and the
+        // whole differential+proptest suite shows NO positive-overage commit
+        // (max observed -4 pages on this dev machine's fork@16K vs zerodb@4K).
+        // 16 pages is thus the ~0-page deterministic minimum plus a margin for
+        // GC-21 within-PIL-only overflow-fragmentation transients in fuzz
+        // overflow sequences, still a tight unbounded-growth tripwire (a real
+        // leak grows without bound and clears BASE + 1.5x within a few
+        // commits). See ADR-0005 D5 addendum for the full measurement.
         if matches!(op, Op::Commit) {
             if let (Some(sa), Some(sb)) = (a.real_disk_size(), b.real_disk_size()) {
-                const BASE: u64 = 72 * 4096;
+                const BASE: u64 = 16 * 4096;
                 assert!(
                     sb <= BASE + sa.saturating_mul(3) / 2,
                     "file-size tripwire at op #{index}: {} = {sb} bytes vs {} = {sa} bytes \

@@ -215,5 +215,12 @@ fn churn_parity_no_overflow() {
     let zdir = TempDir::new("z-inl");
     let lmdb = run_lmdb(ldir.path(), &cycles);
     let zdb = run_zerodb(zdir.path(), &cycles);
-    assert_curves("no-overflow", &lmdb, &zdb, 0.75, 1.25);
+    // Lower edge 0.60 (was 0.75): ratified 2026-07-16 with the SPEC 03 §6.4
+    // insert-point split amendment (ADR-0005 D5 addendum, option a). The edge is
+    // a sanity bound, not the acceptance — bounded growth + the upper edge are.
+    // zerodb legitimately packs ascending churn tighter than the fork, and the
+    // fork's page size here is the OS page size (16 KiB on macOS ARM) vs
+    // zerodb's pinned 4 KiB, skewing the ratio down platform-dependently; on a
+    // matched-4K platform the expected ratio is ~1.0 (see ascending_fill_parity).
+    assert_curves("no-overflow", &lmdb, &zdb, 0.60, 1.25);
 }

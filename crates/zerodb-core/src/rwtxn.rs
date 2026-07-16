@@ -1092,10 +1092,19 @@ impl<'env> RwTxn<'env> {
         Ok(())
     }
 
-    /// Leaf split (§6.2): distribute the post-insert cells around `s`
-    /// (§6.4; `append` forces `s = nkeys`), keep the left half in the existing
-    /// (dirty) frame, put the right half on a fresh page, and rise the right
-    /// page's first key into the parent.
+    /// Leaf split (§6.2): distribute the post-insert cells around `s` (§6.4),
+    /// keep the left half in the existing (dirty) frame, put the right half on
+    /// a fresh page, and rise the right page's first key into the parent.
+    ///
+    /// **End-of-page insert-point rule** (§6.4, ratified — Quentin,
+    /// 2026-07-16, standing directive): when the new cell lands at the end of
+    /// the page (`newindx == nkeys`, i.e. `newindx == cells.len() - 1` after
+    /// insertion) the split forces `s = nkeys` — ALL existing cells stay on the
+    /// left (dirty) frame, the new cell alone starts the right page. This is
+    /// APPEND's split behavior (§6.3) generalized to *any* end insert (plain
+    /// puts included); it matches the fork's `mdb_page_split` and roughly
+    /// doubles leaf fill on ascending workloads (milli's dominant pattern).
+    /// All non-end inserts keep the median-fit-adjust rule (`choose_split`).
     fn split_leaf(
         &mut self,
         tree: TreeId,
@@ -1109,8 +1118,11 @@ impl<'env> RwTxn<'env> {
         let mut cells = self.extract_leaf_cells(lpg)?;
         cells.insert(newindx, newcell);
         let cap = body_size(self.psize);
-        let s = if append {
-            cells.len() - 1 // §6.4 append split: new cell alone on the right
+        // `append` implies an end insert; the general `newindx == nkeys` case
+        // covers plain puts that land at the end too (ratified end-of-page
+        // insert-point rule, §6.4).
+        let s = if append || newindx == cells.len() - 1 {
+            cells.len() - 1 // §6.4 end-of-page split: new cell alone on the right
         } else {
             let sizes: Vec<usize> = cells.iter().map(OwnedLeafCell::used).collect();
             choose_split(&sizes, cap)

@@ -339,10 +339,13 @@ split(page P at insertion index newindx, new cell):
 **last** entry (`last()`), compares `key` against the last key:
 
 - `key > last_key` (memcmp): insert at the end. If the rightmost leaf is full,
-  split with the **append policy** (§6.4): put the *new* key alone on a fresh
-  right page instead of splitting the full page in half — this keeps
-  sequentially-loaded pages ~100 % full and avoids repeated half-empty pages
-  (the point of APPEND, milli facet bulk / arroy item append).
+  split with the **end-of-page insert-point policy** (§6.4): put the *new* key
+  alone on a fresh right page instead of splitting the full page in half — this
+  keeps sequentially-loaded pages ~100 % full and avoids repeated half-empty
+  pages (milli facet bulk / arroy item append). *(As of the 2026-07-16
+  ADR-0005 D5 amendment this split behavior is no longer APPEND-specific — it is
+  the general behavior for any end-of-page insert, §6.4. APPEND's distinctness
+  is now only its **last-key-compare validation** below, not its split rule.)*
 - `key == last_key` or `key < last_key`: `KeyExist` (`MDB_KEYEXIST` → heed
   `KeyExist` → arroy `InvalidItemAppend`). Equal-to-last is an error, **not** a
   silent overwrite (contrast plain put).
@@ -350,7 +353,13 @@ split(page P at insertion index newindx, new cell):
   the first leaf, §9). Only the last key is validated, not full order (but since
   every prior append was strictly ascending, the tree stays sorted).
 
-### §6.4 — Split-point policy (ADR-0002 §D6)
+### §6.4 — Split-point policy (ADR-0002 §D6; end-of-page rule ADR-0005 D5)
+
+**[AMENDED 2026-07-16 by ADR-0005 D5; RATIFIED — Quentin, 2026-07-16, standing
+directive. The end-of-page insert-point rule below now governs *any* insert
+that lands at `newindx == nkeys` (plain puts included), not just APPEND; the
+median-fit-adjust rule is scoped to non-end inserts. The pre-amendment text is
+preserved for the record at the end of this section.]**
 
 Setup. The full page holds `nkeys` cells; the new cell is inserted at position
 `newindx` (`0 ≤ newindx ≤ nkeys`). Consider the **post-insert sequence** of
@@ -361,7 +370,22 @@ belongs to `R`). Let `C = psize − HEADER_SIZE` be the body capacity and, for a
 page holding a set of cells, `used = Σ(cell_size + 2)` (each cell plus its 2-byte
 pointer). A split is **feasible** at `s` iff `used(L) ≤ C` **and** `used(R) ≤ C`.
 
-- **Normal split — median then fit-adjust (exact):**
+- **End-of-page insert-point split (`newindx == nkeys`) — MUST.** When the new
+  cell lands at the very end of the page (`newindx == nkeys`; the new key is
+  greater than every existing key on the page), force `s = nkeys`: **all**
+  `nkeys` existing cells stay on `L`, and the new cell alone starts `R`. This
+  is the fork's `mdb_page_split` behavior for any end insert — it keeps
+  sequentially-loaded pages ~100 % full and roughly doubles leaf fill on
+  ascending workloads (milli's dominant put pattern), where the median rule
+  would instead leave a cascade of ~50 %-full leaves (ADR-0005 D5: measured
+  400 ascending ~500 B puts → ~132 leaves under the median rule vs ~68 for the
+  fork). APPEND (§6.3) is one case of this rule; it keeps its distinct
+  last-key-compare validation (§6.3) but its split behavior is now the general
+  end-of-page behavior. This rule is applied to **leaf splits** (see the
+  branch-scope note below).
+
+- **Normal split — median then fit-adjust (exact) — non-end inserts
+  (`newindx < nkeys`):**
 
   ```
   choose_split(nkeys, newindx, newcell):
@@ -397,14 +421,41 @@ pointer). A split is **feasible** at `s` iff `used(L) ≤ C` **and** `used(R) �
     byte-identical boundary in every case. The gate is the **PLAN 1.5 tolerance
     band**: page counts must track the oracle within that band, not exactly.
 
-- **Append split** (APPEND at the rightmost position, §6.3): force
-  `s = nkeys`, i.e. `newindx = nkeys` and the new cell is the sole entry of `R`;
-  all `nkeys` existing cells stay on `L`. This keeps sequentially-loaded pages
-  ~100 % full (the point of APPEND).
+- **Branch-split scope (ADR-0005 D5).** The end-of-page insert-point rule is
+  applied to **leaf splits only** in Phase 1. Branch splits (§6.5) keep the
+  median-fit-adjust `choose_split` for every `newindx`, including
+  `newindx == nkeys`. Rationale: a literal "new cell alone on `R`" would leave
+  the right branch with a single child (node 0 only), violating the branch
+  `min_keys = 2` occupancy invariant (INV-8) — the fork itself does not put the
+  new child alone but lands its end-insert split at `nkeys − 1` (two children on
+  `R`) via a fit loop, a different computation from the leaf "new alone" case.
+  Leaves carry essentially all of the ascending-workload fill-factor effect
+  (there are far more leaves than branches; ADR-0005 D5's ~2× ratio is a leaf
+  phenomenon), so leaves-only captures the benefit without the branch-occupancy
+  hazard. The PLAN 1.5 tolerance band and the oracle page-count parity tests
+  gate the resulting counts either way.
 
 - **Rising separator.** For a **leaf** split the separator promoted to the parent
-  is the first key of `R` (the key at post-insert index `s`); for a **branch**
-  split it is the removed median key (§6.5).
+  is the first key of `R` (the key at post-insert index `s`, or the sole new
+  cell under the end-of-page rule); for a **branch** split it is the removed
+  median key (§6.5).
+
+**Pre-amendment text (superseded 2026-07-16, ADR-0005 D5 — preserved for the
+record).** Before the ratified end-of-page rule, the median-fit-adjust
+`choose_split` governed **every** non-APPEND insert (including end inserts,
+`newindx == nkeys`), and only APPEND forced the insert-point split:
+
+> - *Normal split — median then fit-adjust (exact):* applied for every
+>   `newindx` regardless of position; `s = (nkeys + 1) / 2` then fit-adjust as
+>   above.
+> - *Append split* (APPEND at the rightmost position, §6.3): force `s = nkeys`,
+>   i.e. `newindx = nkeys` and the new cell is the sole entry of `R`; all
+>   `nkeys` existing cells stay on `L`. This keeps sequentially-loaded pages
+>   ~100 % full (the point of APPEND).
+
+The amendment generalizes the APPEND split behavior to any end-of-page insert;
+the measured consequence (ADR-0005 D5) is the ~2× leaf-fill improvement on
+ascending plain-put workloads.
 
 ### §6.5 — Branch split
 
