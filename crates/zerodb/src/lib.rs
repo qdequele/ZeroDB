@@ -125,7 +125,10 @@ impl EnvOpenOptions {
         self
     }
 
-    /// Set the reader-table size (SPEC 00 row 5). Stored; consumed in M1.8.
+    /// Set the reader-table size (SPEC 00 row 5; SPEC 04 TXN-14, default 126
+    /// = LMDB `DEFAULT_READERS`). The table is allocated once at open and
+    /// never resized; when it is exhausted, `read_txn` fails with
+    /// [`MdbError::ReadersFull`] (TXN-16).
     pub fn max_readers(&mut self, n: u32) -> &mut EnvOpenOptions {
         self.max_readers = n;
         self
@@ -208,6 +211,7 @@ impl EnvOpenOptions {
             opened.map_size,
             prev_snapshot,
             self.max_dbs,
+            self.max_readers,
         )
     }
 }

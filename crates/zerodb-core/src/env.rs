@@ -12,8 +12,9 @@
 //! the live snapshot (normal / `PREV_SNAPSHOT`), mapping the SPEC 06 REC error
 //! taxonomy onto [`Error`], the process registry with `EnvAlreadyOpened`, the
 //! refcounted [`EnvInner`] behind [`Env`] (`Clone`), and deferred close with
-//! [`EnvClosingEvent`] (SPEC 04 TXN-52/53). Write txns, the reader table, and
-//! the B-tree read path are later milestones and are *not* built here.
+//! [`EnvClosingEvent`] (SPEC 04 TXN-52/53). Since M1.8 the inner also owns the
+//! MVCC reader table and the published-snapshot cell (`crate::readers`,
+//! SPEC 04 §3/§4, ADR-0006); the write path lives in `crate::rwtxn`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -26,6 +27,7 @@ use crate::page::geometry::{is_map_full, map_pages};
 use crate::page::{
     select_meta, DBRecord, MetaChoice, MetaPage, MetaValidity, META_A_PGNO, META_B_PGNO,
 };
+use crate::readers::{ReaderTable, SnapshotCell};
 
 /// Read (and, for the write path, page-granular write) access to a
 /// memory-mapped (or, in tests, heap) env file.
@@ -228,8 +230,10 @@ fn next_env_id() -> u64 {
 /// is that `max_dbs` counts distinct names ever seen (incl. aborted) rather
 /// than currently-live ones, so `DbsFull` could fire one creation early after
 /// `max_dbs` *distinct* aborted-and-never-reused names — a case no consumer and
-/// no oracle sequence produces (names are a bounded reused set). The full dbi
-/// lifecycle (abort-frees-slot) lands with the M1.8 reader/handle rework.
+/// no oracle sequence produces (names are a bounded reused set). M1.8 (the
+/// reader table) deliberately did **not** touch this: the full dbi lifecycle
+/// (abort-frees-slot) remains an accepted interim simplification, revisited
+/// with the Phase 2 handle/introspection work (PLAN 2.2) if ever observable.
 #[derive(Debug)]
 struct NamedRegistry {
     /// dbi index → name. Append-only; index is the `DbSel::Named` payload.
@@ -293,28 +297,24 @@ pub struct EnvInner {
     /// The single-writer mutex (SPEC 04 TXN-6). Guards no data — the write
     /// txn's state lives in the `RwTxn` — it only serializes writers.
     write_mutex: Mutex<()>,
-    /// The published-snapshot cell (SPEC 04 TXN-18). M1.4 placeholder per
-    /// ADR-0004 OQ1: a `Mutex<Arc<Snapshot>>` with the TXN-19 publish order
-    /// (swap the object, then store `commit_point`); M1.8 replaces the cell's
-    /// implementation with the lock-free ArcSwap-style cell + reader table.
-    snapshot: Mutex<Arc<Snapshot>>,
-    /// Mirrors the published snapshot's txnid (SPEC 04 TXN-17/19). Stored
-    /// `SeqCst` *after* the snapshot swap so a reader that observes the new
-    /// commit point can always load matching-or-newer roots.
-    commit_point: AtomicU64,
+    /// The published-snapshot cell (SPEC 04 TXN-18 as amended, ratified
+    /// 2026-07-16; ADR-0006 Option B): the immutable `Arc<Snapshot>` behind a
+    /// bounded-O(1)-critical-section mutex, plus the mirroring SeqCst
+    /// `commit_point` atomic that carries the whole lock-free pin protocol
+    /// (TXN-17/19/20). Published in the TXN-19 order (swap the object, then
+    /// store the commit point).
+    snap_cell: SnapshotCell,
     /// Commit-pipeline crash hooks (ADR-0004 D3; default `None` = no-op).
     commit_hook: Mutex<Option<Arc<dyn CommitHook>>>,
     /// REC-13 fsync-gate: set (Release) when a commit fsync fails; checked
     /// (Acquire) at every write-txn begin and commit. A poisoned env still
     /// serves read txns from their pinned snapshots.
     poisoned: AtomicBool,
-    /// **Interim reader registry** (M1.5, ADR-0005 OQ1; SPEC 04 TXN-21 as
-    /// amended): refcounts of live `RoTxn` snapshot txnids, so the GC gate
-    /// (`oldest_reader()`, SPEC 05 GC-18) never reclaims a page a live reader
-    /// can still reach. A plain mutexed map — deliberately boring; it is
-    /// replaced wholesale by the M1.8 lock-free reader table (TXN-20), whose
-    /// only consumer is the same gate expression.
-    readers: Mutex<std::collections::BTreeMap<u64, usize>>,
+    /// The MVCC reader table (M1.8, SPEC 04 §4; ADR-0006): `max_readers`
+    /// cache-padded single-`AtomicU64` slots. Replaces the M1.5 interim
+    /// mutexed reader registry wholesale (TXN-21). Readers claim/pin/release
+    /// slots lock-free; the writer's GC gate scans it (`oldest_live_reader`).
+    reader_table: ReaderTable,
     /// The named-DB registry (the dbi table, SPEC 02 §6; M1.6). Guards the
     /// dbi ↔ name mapping only — records resolve from the catalog (TXN-10).
     named: Mutex<NamedRegistry>,
@@ -347,13 +347,11 @@ impl EnvInner {
     }
 
     /// The txnid of the current live snapshot (the commit point; advances on
-    /// every commit, SPEC 04 TXN-19).
+    /// every commit, SPEC 04 TXN-19). SeqCst load inside the cell — see
+    /// `crate::readers` for the TXN-17/19/20 StoreLoad pairing argument.
     #[must_use]
     pub fn txnid(&self) -> u64 {
-        // SeqCst: pairs with the publish store in `publish_snapshot` (TXN-19)
-        // and the reader pin protocol (TXN-17) — see SPEC 04 §4.3 for why the
-        // commit-point loads/stores are all SeqCst (StoreLoad on ARM).
-        self.commit_point.load(Ordering::SeqCst)
+        self.snap_cell.commit_point()
     }
 
     /// The meta selected **at open** (creation-time geometry). Live roots must
@@ -364,26 +362,22 @@ impl EnvInner {
         &self.meta
     }
 
-    /// `Arc`-clone the current published snapshot (SPEC 04 TXN-18). The clone
-    /// keeps the `(txnid, roots)` alive for the caller's life regardless of
-    /// later commits. M1.4 cell placeholder: a brief mutex lock (ADR-0004 OQ1;
-    /// lock-free in M1.8).
+    /// `Arc`-clone the current published snapshot (SPEC 04 TXN-18 as
+    /// amended). The clone keeps the `(txnid, roots)` alive for the caller's
+    /// life regardless of later commits. Critical section: one refcount bump
+    /// (ADR-0006 Option B).
     #[must_use]
     pub fn snapshot(&self) -> Arc<Snapshot> {
-        Arc::clone(&self.snapshot.lock().expect("snapshot cell poisoned"))
+        self.snap_cell.clone_snapshot()
     }
 
     /// Publish a freshly committed snapshot (commit step C6) in the TXN-19
     /// order: (1) swap the `Arc<Snapshot>` into the cell, then (2) store the
     /// commit point `SeqCst`. Object-before-counter guarantees a reader that
-    /// sees the new counter can load the matching (or newer) roots.
+    /// sees the new counter can load the matching (or newer) roots. See
+    /// `crate::readers::SnapshotCell::publish` for the ordering comments.
     pub(crate) fn publish_snapshot(&self, snap: Arc<Snapshot>) {
-        let txnid = snap.txnid;
-        *self.snapshot.lock().expect("snapshot cell poisoned") = snap;
-        // SeqCst: the writer half of the TXN-17/TXN-19 StoreLoad pairing (ARM
-        // weak memory) — the reader's publish-and-verify loop and this store
-        // must share the single SeqCst total order.
-        self.commit_point.store(txnid, Ordering::SeqCst);
+        self.snap_cell.publish(snap);
     }
 
     /// Acquire the single-writer mutex (SPEC 04 TXN-6/7): blocks until the
@@ -437,47 +431,37 @@ impl EnvInner {
             .expect("backing present while the env is open")
     }
 
-    /// Atomically clone the published snapshot **and** pin its txnid in the
-    /// interim reader registry (ADR-0005 OQ1). The clone and the pin happen
-    /// under the registry mutex, and the GC gate ([`EnvInner::oldest_live_reader`])
-    /// also reads under that mutex, so a gate computation either runs before
-    /// this section (in which case the writer it belongs to is `W` with
-    /// published snapshot `W − 1`; the clone below then returns `≥ W − 1`,
-    /// which `W`'s reclamation — capped at `F ≤ W − 1` — can never invalidate)
-    /// or after it (and sees the pin). No register-then-verify retry loop is
-    /// needed. Paired with [`EnvInner::deregister_reader`] in `RoTxn::drop`.
-    /// Lock order: registry → snapshot cell; nothing takes them in the other
-    /// order.
-    pub(crate) fn pin_reader(&self) -> Arc<Snapshot> {
-        let mut m = self.readers.lock().expect("reader registry poisoned");
-        let snap = self.snapshot();
-        *m.entry(snap.txnid).or_insert(0) += 1;
-        snap
+    /// Pin a snapshot for a new read txn (SPEC 04 TXN-10 steps 1–3, M1.8):
+    /// claim a reader-table slot, run the TXN-17 SeqCst publish-and-verify
+    /// loop against the commit point, and clone the published snapshot
+    /// (adopting a newer one if a commit raced the clone — the TXN-17 tail).
+    /// Returns the pinned snapshot and the owned slot index; the caller
+    /// (`RoTxn`) releases the slot at drop via [`EnvInner::release_reader`].
+    ///
+    /// # Errors
+    ///
+    /// [`MdbError::ReadersFull`] when every slot is occupied (TXN-16).
+    pub(crate) fn pin_reader(&self) -> Result<(Arc<Snapshot>, u32), Error> {
+        self.snap_cell
+            .pin(&self.reader_table)
+            .ok_or(Error::Mdb(MdbError::ReadersFull))
     }
 
-    /// Deregister one reader pinned at `txnid` (interim registry).
-    pub(crate) fn deregister_reader(&self, txnid: u64) {
-        let mut m = self.readers.lock().expect("reader registry poisoned");
-        match m.get_mut(&txnid) {
-            Some(n) if *n > 1 => *n -= 1,
-            Some(_) => {
-                m.remove(&txnid);
-            }
-            None => debug_assert!(false, "deregistering an unregistered reader"),
-        }
+    /// Release a reader-table slot (SPEC 04 TXN-18a: `Release` store of
+    /// `RDR_FREE`). Called from `RoTxn::drop`, from whatever thread the
+    /// `Send` txn ended up on (TXN-13).
+    pub(crate) fn release_reader(&self, slot: u32) {
+        self.reader_table.release(slot);
     }
 
-    /// The smallest snapshot txnid any live reader has pinned, if any (interim
-    /// registry; the GC gate folds it with `writer_txnid − 1` per SPEC 04
-    /// TXN-20/21).
+    /// The smallest snapshot txnid any live reader has pinned, if any: the
+    /// SeqCst full-table scan of SPEC 04 TXN-20 (two-case proof quoted at the
+    /// scan site, `crate::readers::ReaderTable::oldest`). The GC gate folds it
+    /// with `writer_txnid − 1` (TXN-20/21) and caches it per write txn
+    /// (TXN-22; ADR-0006 decision 6).
     #[must_use]
     pub(crate) fn oldest_live_reader(&self) -> Option<u64> {
-        self.readers
-            .lock()
-            .expect("reader registry poisoned")
-            .keys()
-            .next()
-            .copied()
+        self.reader_table.oldest()
     }
 
     /// The dbi index for `name`, assigning a fresh one if absent (SPEC 02 §6).
@@ -763,6 +747,7 @@ pub fn open_with_backing(
     map_size: u64,
     prev_snapshot: bool,
     max_dbs: u32,
+    max_readers: u32,
 ) -> Result<Env, Error> {
     // Validate the two meta slots from the mapped bytes (SPEC 02 §3.2). A
     // decode error here (bad page size / truncated buffer) means the file is not
@@ -800,12 +785,12 @@ pub fn open_with_backing(
         map_size,
         // Seed the published-snapshot cell from the durable meta — the one
         // and only time a meta *page* is read for roots (SPEC 04 TXN-18).
-        snapshot: Mutex::new(Arc::new(Snapshot::from_meta(&meta))),
-        commit_point: AtomicU64::new(meta.txnid),
+        snap_cell: SnapshotCell::new(Arc::new(Snapshot::from_meta(&meta))),
         write_mutex: Mutex::new(()),
         commit_hook: Mutex::new(None),
         poisoned: AtomicBool::new(false),
-        readers: Mutex::new(std::collections::BTreeMap::new()),
+        // The reader table is sized once at open and never resized (TXN-14).
+        reader_table: ReaderTable::new(max_readers),
         named: Mutex::new(NamedRegistry::new(max_dbs)),
         meta,
         prev_snapshot,
@@ -898,7 +883,8 @@ pub mod testutil {
         }
         let path = PathBuf::from(format!("/virtual/mem-env-{}", next_env_id()));
         // A generous named-DB capacity for tests (real envs pass the caller's
-        // `max_dbs`; SPEC 02 §6 / M1.6).
+        // `max_dbs`; SPEC 02 §6 / M1.6); max_readers = 126, the TXN-14
+        // default.
         match open_with_backing(
             path,
             Box::new(VecBacking(buf)),
@@ -906,6 +892,7 @@ pub mod testutil {
             map_size,
             false,
             128,
+            126,
         ) {
             Ok(env) => env,
             Err(Error::Io(e)) => panic!("mem_env open failed: {e}"),
@@ -947,7 +934,7 @@ mod tests {
     }
 
     fn open(buf: Vec<u8>, prev: bool, path: PathBuf) -> Result<Env, Error> {
-        open_with_backing(path, Box::new(VecBacking(buf)), PS, MAP, prev, 128)
+        open_with_backing(path, Box::new(VecBacking(buf)), PS, MAP, prev, 128, 126)
     }
 
     #[test]

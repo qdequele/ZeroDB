@@ -1,14 +1,15 @@
 //! Read transactions and the heed-shaped read API over the [`btree`] cursor
 //! (SPEC 04 §3, SPEC 00 read-op rows). Milestones 1.3/1.4.
 //!
-//! A [`RoTxn`] pins the env's **published snapshot** at open: it `Arc`-clones
-//! the current [`Snapshot`] object (SPEC 04 TXN-18 — never re-reading a durable
-//! meta page, whose slot a later commit overwrites) and borrows the mapped
-//! bytes for its life (TXN-37). Since M1.5 it also pins its snapshot txnid in
-//! the env's **interim reader registry** (ADR-0005 OQ1; SPEC 04 TXN-21 as
-//! amended) so the GC gate never reclaims a page a live reader can reach; the
-//! M1.8 lock-free reader table replaces the registry's *implementation*, not
-//! this API (TXN-10).
+//! A [`RoTxn`] pins the env's **published snapshot** at open: it claims a
+//! reader-table slot, runs the SeqCst publish-and-verify pin (SPEC 04
+//! TXN-10/15/17; M1.8, ADR-0006), and `Arc`-clones the current [`Snapshot`]
+//! object (TXN-18 — never re-reading a durable meta page, whose slot a later
+//! commit overwrites). The pinned slot is what stops the writer's GC from
+//! reclaiming any page this snapshot can reach (TXN-20/21); it is released
+//! with a `Release` store at drop (TXN-18a), from whatever thread the `Send`
+//! txn ended up on (TXN-13, WithoutTls). Tree bytes are borrowed from the
+//! mapped file for the txn's life (TXN-37).
 //!
 //! The read API is generic over [`TxnRead`], so the same `Database` methods
 //! serve a `RoTxn` (mapped bytes) **and** a write txn (`RwTxn`: dirty frames
@@ -96,16 +97,41 @@ pub(crate) fn resolve_named_record(
     }
 }
 
+/// How a [`RoTxn`] holds its environment: borrowed for a plain
+/// `Env::read_txn` (TXN-23), or owned for a `'static`, env-owning
+/// `Env::static_read_txn` (TXN-24 — the owned clone keeps the env, and hence
+/// the mapped file, alive and blocks close until the txn drops, TXN-52).
+enum EnvHandle<'e> {
+    /// Plain `RoTxn<'env>`: borrows the env by lifetime; cannot outlive it.
+    Borrowed(&'e Env),
+    /// `RoTxn<'static>`: owns an `Env` clone (a strong `Arc<EnvInner>` ref).
+    Owned(Env),
+}
+
 /// A read-only transaction: a consistent view of one committed snapshot
-/// (SPEC 04 §3). It borrows the [`Env`] for its whole life, which keeps the
-/// mapped file alive so every `&'txn [u8]` it lends stays valid (TXN-37), and
-/// holds an `Arc` to the pinned [`Snapshot`] so its roots survive later
-/// commits (TXN-18).
+/// (SPEC 04 §3). It holds the [`Env`] (borrowed or owned, [`EnvHandle`]),
+/// which keeps the mapped file alive so every `&'txn [u8]` it lends stays
+/// valid (TXN-37); an `Arc` to the pinned [`Snapshot`] so its roots survive
+/// later commits (TXN-18); and its reader-table slot, which gates the
+/// writer's GC (TXN-20/21) and is released at drop (TXN-18a).
+///
+/// `RoTxn` is **`Send`** (WithoutTls, TXN-13): the slot is owned by the txn
+/// *object* (`slot` is a plain field), never a thread, so the txn — and any
+/// `&[u8]` it lends — may move to another thread (rayon/async). Asserted at
+/// compile time by the `send_assertions` test below.
+///
+/// **Leaked readers (documented stall, ADR-0006 R5):** `mem::forget(ro_txn)`
+/// is safe Rust and cannot be prevented; the slot then pins its txnid
+/// forever, the GC gate stops advancing past it, and the file grows. Same
+/// failure mode as a stale LMDB reader, minus the cross-process reap (under
+/// D-001 there is nothing to reap — the owner provably is this process).
+/// Reader introspection is Phase 2.2; no reaping path exists.
 pub struct RoTxn<'env> {
-    env: &'env Env,
-    bytes: &'env [u8],
+    env: EnvHandle<'env>,
     psize: u32,
     snap: Arc<Snapshot>,
+    /// The owned reader-table slot (claimed in `EnvInner::pin_reader`).
+    slot: u32,
 }
 
 impl RoTxn<'_> {
@@ -114,20 +140,38 @@ impl RoTxn<'_> {
     pub fn txnid(&self) -> u64 {
         self.snap.txnid
     }
+
+    /// The env this txn reads (borrowed or owned).
+    fn env_ref(&self) -> &Env {
+        match &self.env {
+            EnvHandle::Borrowed(e) => e,
+            EnvHandle::Owned(e) => e,
+        }
+    }
 }
 
 impl Drop for RoTxn<'_> {
     fn drop(&mut self) {
-        // Interim reader registry (ADR-0005 OQ1, SPEC 04 TXN-21 as amended):
-        // release this reader's pin so the GC gate can advance. Replaced by the
-        // M1.8 reader-table slot release.
-        self.env.inner().deregister_reader(self.snap.txnid);
+        // TXN-18a: release the slot (Release store of RDR_FREE) so the GC
+        // gate can advance past this snapshot. Ordering vs teardown: this
+        // body runs *before* the struct's fields drop, so for an env-owning
+        // txn (TXN-24) the owned `Env` — and with it the reader table — is
+        // still alive here; the handle's strong ref drops after, which is
+        // what un-blocks a pending close (TXN-52/53).
+        self.env_ref().inner().release_reader(self.slot);
     }
 }
 
 impl TxnRead for RoTxn<'_> {
     fn source(&self) -> Source<'_> {
-        Source::Map { bytes: self.bytes }
+        // Borrowed lazily from the env on each access (rather than cached at
+        // open) so the same struct supports the env-owning 'static shape
+        // without self-reference; the map's address is stable for the txn's
+        // life either way (TXN-37: the env cannot close while this txn holds
+        // it, borrowed or owned).
+        Source::Map {
+            bytes: self.env_ref().inner().backing_bytes(),
+        }
     }
     fn main_record(&self) -> &DBRecord {
         &self.snap.main_db
@@ -141,7 +185,7 @@ impl TxnRead for RoTxn<'_> {
     fn record_for(&self, sel: DbSel) -> DBRecord {
         match sel {
             DbSel::Main => self.snap.main_db,
-            DbSel::Named(dbi) => match self.env.inner().named_name(dbi) {
+            DbSel::Named(dbi) => match self.env_ref().inner().named_name(dbi) {
                 Some(name) => {
                     resolve_named_record(self.source(), self.psize, &self.snap.main_db, &name)
                 }
@@ -153,24 +197,43 @@ impl TxnRead for RoTxn<'_> {
 
 impl Env {
     /// Open a read transaction over the live published snapshot (SPEC 00
-    /// row 13, SPEC 04 TXN-10). Pins the snapshot txnid in the interim reader
-    /// registry (ADR-0005 OQ1) so GC never reclaims a page this reader can
-    /// reach; the M1.8 reader table replaces the registry, not this API.
+    /// row 13, SPEC 04 TXN-10/23): claim a reader-table slot, pin the
+    /// snapshot with the SeqCst publish-and-verify protocol (TXN-17), and
+    /// clone the published roots. The pin guarantees GC never reclaims a page
+    /// this reader can reach (TXN-20/21); the slot is released at drop.
     ///
     /// # Errors
     ///
-    /// Infallible pre-M1.8 (no slot to claim, no I/O); returns [`Result`] to
-    /// match the heed shape and the future M1.8 slot-claim failure mode.
+    /// [`MdbError::ReadersFull`] when every reader-table slot is occupied
+    /// (TXN-16; the table holds `max_readers` slots, default 126).
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
-        // Clone-and-pin is atomic under the registry mutex (see
-        // `EnvInner::pin_reader` for the race-freedom argument), so the GC
-        // gate can never miss this reader while it holds a reachable page.
-        let snap = self.inner().pin_reader();
+        let (snap, slot) = self.inner().pin_reader()?;
         Ok(RoTxn {
-            bytes: self.inner().backing_bytes(),
             psize: self.page_size(),
             snap,
-            env: self,
+            slot,
+            env: EnvHandle::Borrowed(self),
+        })
+    }
+
+    /// Open a `'static`, env-owning read transaction (SPEC 00 row 15, SPEC 04
+    /// TXN-24; heed's `Env::static_read_txn`): consumes this handle (clone the
+    /// `Env` first to keep one), pins a slot exactly like [`Env::read_txn`],
+    /// and owns the env for the txn's life — keeping the env open (blocking
+    /// [`Env::prepare_for_closing`]'s event, TXN-52) until the txn drops.
+    /// `Send`, for handing to async handlers.
+    ///
+    /// # Errors
+    ///
+    /// [`MdbError::ReadersFull`] when every reader-table slot is occupied
+    /// (TXN-16).
+    pub fn static_read_txn(self) -> Result<RoTxn<'static>> {
+        let (snap, slot) = self.inner().pin_reader()?;
+        Ok(RoTxn {
+            psize: self.page_size(),
+            snap,
+            slot,
+            env: EnvHandle::Owned(self),
         })
     }
 
@@ -642,5 +705,22 @@ impl<'txn> Iterator for RoRange<'txn> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod send_assertions {
+    use super::RoTxn;
+
+    fn assert_send<T: Send>() {}
+
+    /// SPEC 04 TXN-13 (WithoutTls): a reader-table slot is owned by the txn
+    /// object, not a thread, so `RoTxn` — both the borrowed and the `'static`
+    /// env-owning shape — is `Send`. Compile-time assertion; a regression
+    /// (e.g. a non-`Send` field sneaking into `RoTxn`) fails to build.
+    #[test]
+    fn rotxn_is_send_in_both_shapes() {
+        assert_send::<RoTxn<'_>>();
+        assert_send::<RoTxn<'static>>();
     }
 }

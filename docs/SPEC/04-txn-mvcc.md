@@ -101,7 +101,11 @@ Normative rules are numbered **TXN-n** so tests and the check tool can cite them
 - **TXN-9** — Readers never take the write mutex and never block on it; the
   writer never blocks on readers (it computes the oldest reader lock-free, §4).
   This is the core concurrency guarantee (PLAN 1.8): *readers never block, the
-  writer never blocks readers.*
+  writer never blocks readers.* The published-snapshot **cell** is not the
+  write mutex: readers may briefly contend on its bounded O(1) pointer
+  operations (one swap per commit, one clone per pin) but never on any part
+  of the writer's *transaction* — see TXN-18 as amended (ratified 2026-07-16,
+  ADR-0006 Option B) for the precise scope of this guarantee.
 
 ---
 
@@ -236,10 +240,14 @@ only a full fence / `SeqCst` does.
   (TXN-10 step 3); if that object's own txnid is `> t` (a commit landed between
   the verify and the clone), the reader adopts the newer object and re-stores its
   txnid into the slot — monotone and still a validly pinned, newer snapshot.
-- **TXN-18** — **The published-snapshot object.** `EnvInner` holds an
-  **atomically-swappable `Arc<Snapshot>`** (an ArcSwap-style cell: a lock-free
-  atomic pointer with deferred reclamation, living in the reader-table module
-  where `unsafe` is sanctioned — CLAUDE.md), plus a mirroring
+- **TXN-18** — **The published-snapshot object.** *(Amended 2026-07-16,
+  ratified — Quentin, standing directive, ADR-0006 Option B: the original
+  text required an ArcSwap-style lock-free cell "in the reader-table module
+  where `unsafe` is sanctioned"; the ratified implementation keeps
+  `zerodb-core` `forbid(unsafe_code)` and scopes the no-blocking guarantee to
+  its intent — never blocking on the write* ***transaction*** *— with
+  LMDB-NOTLS read-open parity as the bar.)* `EnvInner` holds a
+  **published-snapshot cell**: the current `Arc<Snapshot>` plus a mirroring
   `commit_point: AtomicU64` equal to the object's txnid. `Snapshot` is an
   **immutable** value `{ txnid, main_db, free_db, catalog view }` (the roots and
   DBRecords of one committed state). Rules:
@@ -249,10 +257,16 @@ only a full fence / `SeqCst` does.
     SeqCst)` (TXN-19). Because the object is swapped *before* `commit_point` is
     advanced, any reader that observes the new `commit_point` also observes the
     matching (or newer) snapshot object — closing the pin↔roots race.
-  - Readers **load-and-clone** the `Arc` **without taking any lock** (never
-    blocking, TXN-9): the atomic-pointer load plus an `Arc` refcount bump. The
-    clone keeps the `(txnid, roots)` alive for the reader's life regardless of
-    later commits.
+  - Readers load-and-clone the `Arc` **without ever blocking on the write
+    transaction** (TXN-9). The cell may be lock-free or a mutex whose critical
+    sections are all bounded O(1) pointer operations (the writer's single swap
+    at C6; a reader's clone), never held across I/O, allocation, tree work, or
+    any other writer step — so the worst reader wait is another thread's
+    pointer op, independent of write-txn duration. (Implementation: ADR-0006
+    Option B — the M1.4 `Mutex<Arc<Snapshot>>` cell is thereby ratified as the
+    M1.8 cell; the lock-free pin protocol lives entirely in the slot and
+    `commit_point` atomics, TXN-17/19/20.) The clone keeps the
+    `(txnid, roots)` alive for the reader's life regardless of later commits.
   - The **durable meta page is read only once, at env open** (SPEC 02 §3.2), to
     seed the first `Arc<Snapshot>`. Steady-state reads *never* touch a meta page;
     they use the published object. This is what removes the "read the meta slot
@@ -322,20 +336,27 @@ only a full fence / `SeqCst` does.
   page a live reader needs. The next `oldest_reader()` (next allocation or next
   txn, TXN-22) observes the freed slot and catches up.
 - **TXN-21** — GC reuse (SPEC 05) is gated by `oldest_reader()`: a page freed by
-  txn `F` is reclaimable only when `F ≤ oldest_reader()` (SPEC 05 GC-18). Until
-  the reader table exists (pre-M1.8), `oldest_reader()` is computed from the
-  **interim reader registry** (ADR-0005 OQ1, approved 2026-07-16): a mutexed
-  refcount map of live `RoTxn` snapshot txnids on the env, giving
-  `min(smallest live reader txnid, writer_txnid − 1)` — sound against readers
-  held across commits, unlike the earlier "no readers ⇒ `writer_txnid − 1`"
-  placeholder, which is superseded. The registry is replaced wholesale by the
-  M1.8 lock-free reader table; the gate expression is the only consumer.
+  txn `F` is reclaimable only when `F ≤ oldest_reader()` (SPEC 05 GC-18).
+  `oldest_reader()` = `min(smallest live reader table pin, writer_txnid − 1)`,
+  with the reader term computed by the TXN-20 SeqCst table scan. *(History:
+  pre-M1.8 the reader term came from an **interim mutexed reader registry** —
+  ADR-0005 OQ1, approved 2026-07-16, itself superseding an earlier "no
+  readers ⇒ `writer_txnid − 1`" placeholder. The M1.8 lock-free reader table
+  replaced the registry wholesale — ADR-0006; the gate expression, its only
+  consumer, is unchanged.)* Debug builds additionally re-scan the table at
+  every GC hand-out and assert `F ≤` every live pin (the PLAN §1.8 shadow
+  check).
 - **TXN-22** — The writer recomputes `oldest_reader()` at most once per
   allocation attempt and may cache it for the duration of a single
   `mdb_page_alloc`-equivalent (SPEC 05); caching only ever makes `oldest` *more*
   conservative (a reader that releases after the cache read is simply not
   reclaimed-against this round), so it is always safe. It must recompute in a
-  fresh write txn.
+  fresh write txn. *(Implementation choice, ratified 2026-07-16 with ADR-0006
+  decision 6: the cache spans the whole write txn — computed by the first GC
+  draw, dropped with the `RwTxn`. Sound by the same conservativeness argument;
+  a reader that pins mid-txn pins `≥ commit_point = writer_txnid − 1 ≥` the
+  cache, so the cache never overshoots a new pin. No refresh-on-gated-miss in
+  Phase 1.)*
 
 ### §4.6 — Slot lifecycle for the three read-txn shapes
 
@@ -761,7 +782,7 @@ every hook; this section defines the steps and their ordering. Both write modes
 | txnid ↔ meta | TXN-1..5, TXN-63 | SPEC 02 §2/§3, INV-20 |
 | single writer | TXN-6..9 | SPEC 01 Table 1 RDONLY |
 | read snapshot pin | TXN-10..13 | SPEC 05 GC-18 |
-| reader table | TXN-14..25 | PLAN 1.8, loom suite |
+| reader table | TXN-14..25 | PLAN 1.8; loom suite L1–L5 (`zerodb-core/src/readers.rs`, `just loom`); stress gate (`zerodb/tests/reader_stress.rs`, `just stress`) |
 | memory ordering | TXN-15/17/19/20 | CLAUDE.md (ARM), SPEC 06 |
 | nested read txn | TXN-26..36 | SPEC 00 row 16, SPEC 01 §S9 |
 | value-borrow contract | TXN-37..49 | SPEC 03 §3/§5/§7, SPEC 01 §S3/§S7 |

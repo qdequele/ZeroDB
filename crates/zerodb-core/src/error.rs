@@ -73,6 +73,15 @@ pub enum MdbError {
     #[error("database is incompatible with the requested operation")]
     Incompatible,
 
+    /// `MDB_READERS_FULL` — every reader-table slot is occupied at
+    /// `read_txn`/`static_read_txn` begin (SPEC 04 TXN-16; the table is sized
+    /// by `EnvOpenOptions::max_readers`, default 126). Raised immediately —
+    /// under D-001 (single process) there are no stale cross-process slots to
+    /// reap first. `Debug` renders as `ReadersFull`, matching
+    /// `heed::MdbError::ReadersFull` for oracle taxonomy parity.
+    #[error("environment maxreaders limit reached")]
+    ReadersFull,
+
     /// `MDB_BAD_TXN` — the transaction encountered a mid-operation failure
     /// (e.g. `MapFull` inside a split cascade) and must be aborted; further
     /// operations and `commit` refuse to run on it (LMDB `MDB_TXN_ERROR`

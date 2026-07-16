@@ -12,6 +12,9 @@
 //!   SPEC 04 §6.3), [`rwtxn`] (single-writer txn, COW, split/rebalance, the
 //!   commit pipeline with H0–H4 hooks, SPEC 04 §9), and [`check`] (the SPEC 03
 //!   §11 invariant walker the M1.12 tool will wrap).
+//! - Milestone 1.8: the [`readers`] module — the lock-free MVCC reader table
+//!   and the published-snapshot cell (SPEC 04 §3/§4, ADR-0006), model-checked
+//!   under loom via the [`sync`] shim (`just loom`).
 
 #![forbid(unsafe_code)]
 
@@ -22,8 +25,10 @@ pub mod dirty;
 pub mod env;
 pub mod error;
 pub mod page;
+pub(crate) mod readers;
 pub mod rotxn;
 pub mod rwtxn;
+pub(crate) mod sync;
 
 pub use env::{CommitHook, HookPoint, Snapshot};
 pub use rotxn::{Database, RoRange, RoTxn, TxnRead};

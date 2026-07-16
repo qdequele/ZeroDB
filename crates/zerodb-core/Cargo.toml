@@ -7,6 +7,19 @@ license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+# Cache-line padding for the reader-table slots (SPEC 04 TXN-14; ADR-0006 D1).
+# On the CLAUDE.md dependency allowlist.
+crossbeam-utils.workspace = true
+
+# loom is compiled ONLY under `RUSTFLAGS="--cfg loom"` (`just loom`) — never in
+# a normal, miri, or release build. Sanctioned by ADR-0006 (test infrastructure
+# only, this crate only), on the ADR-0001 libfuzzer-sys precedent.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
 
 [dev-dependencies]
 proptest.workspace = true
+
+[lints.rust]
+# `cfg(loom)` is set externally by the `just loom` recipe (ADR-0006).
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

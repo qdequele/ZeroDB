@@ -85,8 +85,16 @@ fn committed_env_with_one_entry(map_size: u64, key: &[u8], val: &[u8]) -> Env {
         "/virtual/value-borrow-contract-{:p}",
         &buf as *const _
     ));
-    open_with_backing(path, Box::new(VecBacking(buf)), PS, map_size, false, 128)
-        .expect("open pre-baked committed image")
+    open_with_backing(
+        path,
+        Box::new(VecBacking(buf)),
+        PS,
+        map_size,
+        false,
+        128,
+        126,
+    )
+    .expect("open pre-baked committed image")
 }
 
 /// Item 1: a `RoTxn` opened against a committed page must keep serving the

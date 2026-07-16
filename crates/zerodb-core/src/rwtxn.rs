@@ -17,8 +17,9 @@
 //! First touch copies a committed page into a fresh frame under a **new** pgno
 //! and rewrites the parent chain top-down (§5.1/§5.3). Allocation follows
 //! GC-16: the loose-page list (GC-7/8) for single pages, then a GC-DB draw
-//! ([`RwTxn::gc_reclaim`], gated by the oldest live reader — the interim
-//! registry of SPEC 04 TXN-21 as amended by ADR-0005 OQ1), then file extend
+//! ([`RwTxn::gc_reclaim`], gated by the oldest live reader — the M1.8
+//! lock-free reader-table scan, SPEC 04 TXN-20/21, cached per txn per
+//! TXN-22), then file extend
 //! (`next_pgno`, GC-15) with the GC-17 `MapFull` bound. Draws are recorded in
 //! the in-memory drain map (GC-20) and applied to the GC tree at commit. At
 //! C1, [`RwTxn::freelist_save`] rewrites drained entries, releases trailing
@@ -340,6 +341,13 @@ pub struct RwTxn<'env> {
     /// inside a split cascade) leaves the working tree partial, so every later
     /// mutation and `commit` returns `BadTxn`; only abort is valid.
     errored: bool,
+    /// Per-txn cache of the GC reuse gate (SPEC 04 TXN-22; ADR-0006
+    /// decision 6): computed by the first `gc_reclaim` of this txn, reused
+    /// for its remaining draws. Caching is only ever *more* conservative — a
+    /// reader that releases mid-txn is simply not reclaimed-against this txn
+    /// — and the cache dies with the `RwTxn` ("must recompute in a fresh
+    /// write txn"). The debug shadow check re-scans fresh at every draw.
+    oldest_cache: Option<u64>,
 }
 
 impl Env {
@@ -379,6 +387,7 @@ impl Env {
             alloc_mode: AllocMode::Normal,
             save_touched: std::collections::BTreeSet::new(),
             errored: false,
+            oldest_cache: None,
             bytes: inner.backing_bytes(),
             base,
             _guard: guard,
@@ -653,6 +662,10 @@ impl<'env> RwTxn<'env> {
             }
         }
         let (f, start) = hit?;
+        // M1.8 shadow check: gate compliance is inherited (doc above), but a
+        // fresh table re-scan re-proves it at the hand-out moment.
+        #[cfg(debug_assertions)]
+        self.debug_assert_gate(f);
         let remaining = self.drains.get_mut(&f).expect("pool entry present");
         let pos = remaining
             .binary_search(&start)
@@ -666,16 +679,60 @@ impl<'env> RwTxn<'env> {
         Some(start)
     }
 
-    /// The GC reuse gate (SPEC 05 GC-18, SPEC 04 TXN-20/21 as amended by
-    /// ADR-0005 OQ1): `min(smallest live reader snapshot txnid,
-    /// writer_txnid − 1)`. The reader term comes from the interim mutexed
-    /// registry; M1.8 swaps in the lock-free reader-table scan here and
-    /// nowhere else.
-    fn oldest_reader(&self) -> u64 {
+    /// The GC reuse gate (SPEC 05 GC-18, SPEC 04 TXN-20/21): `min(smallest
+    /// live reader snapshot txnid, writer_txnid − 1)`. The reader term is the
+    /// M1.8 lock-free reader-table SeqCst scan
+    /// ([`crate::env::EnvInner::oldest_live_reader`]); this is its only
+    /// consumer. Cached per write txn (TXN-22; ADR-0006 decision 6): the
+    /// first draw scans, later draws reuse — always sound because a stale
+    /// gate is only ever *smaller* (readers that release mid-txn are not
+    /// reclaimed-against; readers that pin mid-txn pin `≥ commit point =
+    /// txnid − 1 ≥` the cache, so the cache never overshoots a new pin).
+    fn oldest_reader(&mut self) -> u64 {
+        if let Some(o) = self.oldest_cache {
+            return o;
+        }
         let cap = self.txnid - 1;
-        match self.env.inner().oldest_live_reader() {
+        let o = match self.env.inner().oldest_live_reader() {
             Some(r) => r.min(cap),
             None => cap,
+        };
+        self.oldest_cache = Some(o);
+        o
+    }
+
+    /// M1.8 debug shadow tracking (PLAN §1.8 acceptance: "GC never reclaims a
+    /// page a live reader can reach — assert via shadow tracking in debug
+    /// builds"): at the moment pages from GC entry `F` are handed out,
+    /// re-scan the reader table **fresh** (SeqCst, not the per-txn cache) and
+    /// assert no live reader is pinned below `F`. A snapshot `t` references a
+    /// page freed by `F` iff `t < F` (the page left `F`'s tree and every
+    /// later one), so `F ≤ min(live pins)` is exactly "no live reader can
+    /// reach any page being drawn". Catches a gate bug at the reclaim site,
+    /// not via downstream corruption. Debug builds only.
+    ///
+    /// Caveat: this re-scan is itself just a set of SeqCst loads subject to
+    /// the same memory-model visibility rules as the real gate — it is a
+    /// debug *aid*, not an independent oracle. A pin it fails to observe is
+    /// exactly a pin the TXN-20 proof already covers (mid-pin ⇒ `≥ N − 1`),
+    /// and a stale read of a just-released slot only makes the assert
+    /// stricter (conservative), so it can produce no false confidence and no
+    /// false alarm — but it also cannot detect ordering bugs the gate itself
+    /// would miss on the same hardware.
+    #[cfg(debug_assertions)]
+    fn debug_assert_gate(&self, f: u64) {
+        // `F ≤ writer_txnid − 1`, spelled `<` for clippy (same predicate).
+        assert!(
+            f < self.txnid,
+            "GC drew from entry F={f} > writer_txnid-1={} (TXN-20 seed violated)",
+            self.txnid - 1
+        );
+        if let Some(min_pin) = self.env.inner().oldest_live_reader() {
+            assert!(
+                f <= min_pin,
+                "GC gate violated: drew pages freed by F={f} while a live reader is pinned at \
+                 {min_pin} < F — that snapshot still references them (TXN-20/21, ADR-0006)"
+            );
         }
     }
 
@@ -742,6 +799,10 @@ impl<'env> RwTxn<'env> {
         let Some(Pick { f, fresh, start }) = pick else {
             return Ok(None);
         };
+        // M1.8 shadow check: re-scan the live reader table at the hand-out
+        // moment (fresh, not the per-txn cache) — see `debug_assert_gate`.
+        #[cfg(debug_assertions)]
+        self.debug_assert_gate(f);
         let remaining = match fresh {
             Some(ids) => self.drains.entry(f).or_insert(ids),
             None => self.drains.get_mut(&f).expect("drain entry present"),
