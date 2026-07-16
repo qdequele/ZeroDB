@@ -162,6 +162,34 @@ impl<'a> Tree<'a> {
         }
     }
 
+    /// Catalog lookup for the named-DB resolver (SPEC 02 §6): like [`Tree::get`]
+    /// but also returns the leaf **node flags** of the matched entry, so the
+    /// caller can tell an `F_SUBDATA` sub-DB record from a plain user key
+    /// (a name collision → `Incompatible`). `Ok(None)` if the key is absent.
+    ///
+    /// # Errors
+    ///
+    /// A [`PageError`] only if the tree is structurally corrupt.
+    pub fn get_catalog_entry(&self, key: &[u8]) -> Result<Option<(u16, &'a [u8])>, PageError> {
+        let mut c = Cursor::new(*self);
+        c.search(key)?;
+        if !c.initialized {
+            return Ok(None);
+        }
+        let (pgno, ki) = *c.stack.last().expect("initialized cursor has a leaf frame");
+        let page = load_page(self.src, self.psize, pgno)?;
+        let leaf = page.as_leaf()?;
+        if ki < leaf.num_keys() && leaf.key(ki) == key {
+            let flags = leaf.node_flags(ki);
+            Ok(Some((
+                flags,
+                resolve_value(self.src, self.psize, &leaf, ki)?,
+            )))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Open a fresh, unpositioned [`Cursor`] over this tree.
     #[must_use]
     pub fn cursor(&self) -> Cursor<'a> {

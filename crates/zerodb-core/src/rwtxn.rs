@@ -47,7 +47,7 @@
 //! commit ids are consecutive. Non-reuse would make a post-abort commit
 //! overwrite the *live* snapshot's slot. (SPEC 04 §1 clarified in this change.)
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, MutexGuard};
 
 use crate::btree::{Source, Tree};
@@ -60,10 +60,11 @@ use crate::page::geometry::{
 };
 use crate::page::{
     write_overflow_head, BranchMut, BranchRef, DBRecord, LeafMut, LeafRef, LeafValue, MetaPage,
-    PageError, PageRef, PageType, FILL_THRESHOLD_PERMILLE, FORMAT_VERSION, HEADER_SIZE, MAGIC,
-    MAX_DATA_SIZE, MAX_KEY_SIZE, MIN_KEYS_BRANCH, MIN_KEYS_LEAF, PGNO_INVALID,
+    PageError, PageRef, PageType, DBRECORD_LEN, FILL_THRESHOLD_PERMILLE, FORMAT_VERSION, F_SUBDATA,
+    HEADER_SIZE, MAGIC, MAX_DATA_SIZE, MAX_DB_NAME, MAX_KEY_SIZE, MIN_KEYS_BRANCH, MIN_KEYS_LEAF,
+    PGNO_INVALID,
 };
-use crate::rotxn::{map_page_err, Database, TxnRead};
+use crate::rotxn::{map_page_err, resolve_named_record, Database, DbSel, TxnRead};
 
 /// Round `n` up to the next even number (2-byte cell alignment, SPEC 02 §2.2).
 #[inline]
@@ -107,10 +108,24 @@ const BRANCH_NODE_HEADER: usize = 10;
 /// is the only difference, and it is the seam M1.6's named-DB catalog extends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TreeId {
-    /// The main (unnamed) database.
+    /// The main (unnamed) database — also the named-DB catalog (SPEC 02 §6).
     Main,
     /// The free (GC) database, `BE(txnid) → PIL` (SPEC 05 §1).
     Free,
+    /// A named database, addressed by its env-level dbi index (M1.6). Its
+    /// working record lives in [`RwTxn::open`], loaded from the catalog on
+    /// first touch and written back at commit (SPEC 04 TXN-10).
+    Named(u32),
+}
+
+/// A named DB's per-txn working state (M1.6): the loaded/mutated `DBRecord`
+/// plus its catalog name, kept in [`RwTxn::open`]. `dirty` marks that the
+/// record changed and must be written back into the main catalog at commit
+/// (SPEC 02 §6, before `freelist_save` — the LMDB sub-DB flush order).
+struct NamedTree {
+    name: Box<[u8]>,
+    rec: DBRecord,
+    dirty: bool,
 }
 
 /// Allocation restriction state (SPEC 05 GC-12, ADR-0005 D2).
@@ -187,10 +202,16 @@ enum OwnedVal {
     Big { head: u64, dsize: u32 },
 }
 
-/// An owned leaf cell (key + value), the currency of page rewrites.
+/// An owned leaf cell (key + value + node flags), the currency of page
+/// rewrites. `flags` carries the leaf-node flags (`F_SUBDATA` for a named-DB
+/// catalog entry, SPEC 02 §6) so splits/merges/rebalances preserve them;
+/// `F_BIGDATA` is implied by [`OwnedVal::Big`] and re-derived on write.
 struct OwnedLeafCell {
     key: Vec<u8>,
     val: OwnedVal,
+    /// Non-`F_BIGDATA` leaf-node flags to preserve across a rewrite (only
+    /// `F_SUBDATA` in Phase 1).
+    flags: u16,
 }
 
 impl OwnedLeafCell {
@@ -309,6 +330,12 @@ pub struct RwTxn<'env> {
     /// Working roots/stats (TXN-56); written to the meta at commit.
     main_db: DBRecord,
     free_db: DBRecord,
+    /// Per-txn named-DB working records (the dbi table's txn half; M1.6),
+    /// keyed by dbi index. Loaded lazily from the catalog on first touch;
+    /// `dirty` entries are written back to the main tree at commit before
+    /// `freelist_save` ([`RwTxn::flush_catalog`]). Dropped-this-txn entries are
+    /// removed here (their catalog entry is deleted eagerly at drop time).
+    open: HashMap<u32, NamedTree>,
     /// LMDB `MDB_TXN_ERROR` parity: a mid-mutation failure (e.g. `MapFull`
     /// inside a split cascade) leaves the working tree partial, so every later
     /// mutation and `commit` returns `BadTxn`; only abort is valid.
@@ -342,6 +369,7 @@ impl Env {
             committed_last_pg: base.last_pg,
             main_db: base.main_db,
             free_db: base.free_db,
+            open: HashMap::new(),
             psize: inner.page_size(),
             dirty: DirtyStore::new(inner.page_size()),
             freed: Vec::new(),
@@ -356,6 +384,36 @@ impl Env {
             _guard: guard,
             env: self,
         })
+    }
+
+    /// `create_database(wtxn, name)` (SPEC 00 rows 11/12, `mdb_dbi_open` +
+    /// `MDB_CREATE`): open a database, creating it if absent, inside the active
+    /// write txn. `None` name → the main DB (always present). `Some(name)`
+    /// assigns/looks up the dbi and inserts an empty `F_SUBDATA` catalog entry
+    /// if the name is new (SPEC 02 §6); an abort discards a just-created DB with
+    /// the dirty set. Idempotent for an already-open name.
+    ///
+    /// # Errors
+    ///
+    /// - [`MdbError::BadValSize`] if `name` is empty or `> MAX_DB_NAME`.
+    /// - [`MdbError::DbsFull`] if the catalog is full (`> max_dbs` named DBs).
+    /// - [`MdbError::Incompatible`] if the name exists as a plain user key.
+    /// - [`MdbError::BadTxn`] on a poisoned write txn.
+    pub fn create_database(&self, wtxn: &mut RwTxn<'_>, name: Option<&[u8]>) -> Result<Database> {
+        wtxn.guard_ok()?;
+        let name = match name {
+            None => return Ok(self.main_database()),
+            Some(n) => n,
+        };
+        if name.is_empty() || name.len() > MAX_DB_NAME {
+            return Err(Error::Mdb(MdbError::BadValSize));
+        }
+        let dbi = self
+            .inner()
+            .named_dbi_assign(name)
+            .ok_or(Error::Mdb(MdbError::DbsFull))?;
+        wtxn.create_named(dbi, name)?;
+        Ok(Database::from_sel(DbSel::Named(dbi)))
     }
 }
 
@@ -374,6 +432,26 @@ impl TxnRead for RwTxn<'_> {
     }
     fn page_size(&self) -> u32 {
         self.psize
+    }
+    fn record_for(&self, sel: DbSel) -> DBRecord {
+        match sel {
+            DbSel::Main => self.main_db,
+            DbSel::Named(dbi) => {
+                // The writer's own working record if the DB was touched this
+                // txn (uncommitted state, TXN-38); otherwise resolve from the
+                // working catalog (which itself reflects uncommitted catalog
+                // inserts through the dirty-frame source).
+                if let Some(t) = self.open.get(&dbi) {
+                    return t.rec;
+                }
+                match self.env.inner().named_name(dbi) {
+                    Some(name) => {
+                        resolve_named_record(self.source(), self.psize, &self.main_db, &name)
+                    }
+                    None => DBRecord::empty(),
+                }
+            }
+        }
     }
 }
 
@@ -399,20 +477,64 @@ impl<'env> RwTxn<'env> {
         Ok(())
     }
 
-    /// The working `DBRecord` of `tree` (ADR-0005 D1 selector).
+    /// The working `DBRecord` of `tree` (ADR-0005 D1 selector). A named tree's
+    /// record must have been loaded by [`RwTxn::ensure_open`] first.
     fn record(&self, tree: TreeId) -> &DBRecord {
         match tree {
             TreeId::Main => &self.main_db,
             TreeId::Free => &self.free_db,
+            TreeId::Named(dbi) => {
+                &self
+                    .open
+                    .get(&dbi)
+                    .expect("named record loaded before use")
+                    .rec
+            }
         }
     }
 
-    /// Mutable working `DBRecord` of `tree`.
+    /// Mutable working `DBRecord` of `tree`. Touching a named tree's record
+    /// marks it dirty (its catalog entry is rewritten at commit, SPEC 02 §6).
     fn record_mut(&mut self, tree: TreeId) -> &mut DBRecord {
         match tree {
             TreeId::Main => &mut self.main_db,
             TreeId::Free => &mut self.free_db,
+            TreeId::Named(dbi) => {
+                let e = self
+                    .open
+                    .get_mut(&dbi)
+                    .expect("named record loaded before use");
+                e.dirty = true;
+                &mut e.rec
+            }
         }
+    }
+
+    /// Ensure the named DB `dbi`'s working record is loaded into [`RwTxn::open`]
+    /// (from the catalog view, or empty if the entry does not yet exist), and
+    /// return its tree selector. Idempotent. The main DB needs no loading.
+    fn ensure_open(&mut self, sel: DbSel) -> Result<TreeId> {
+        let dbi = match sel {
+            DbSel::Main => return Ok(TreeId::Main),
+            DbSel::Named(dbi) => dbi,
+        };
+        if !self.open.contains_key(&dbi) {
+            let name = self
+                .env
+                .inner()
+                .named_name(dbi)
+                .expect("named dbi is assigned before a handle exists");
+            let rec = resolve_named_record(self.source(), self.psize, &self.main_db, &name);
+            self.open.insert(
+                dbi,
+                NamedTree {
+                    name,
+                    rec,
+                    dirty: false,
+                },
+            );
+        }
+        Ok(TreeId::Named(dbi))
     }
 
     fn load(&self, pgno: u64) -> Result<PageRef<'_>> {
@@ -791,6 +913,22 @@ impl<'env> RwTxn<'env> {
         flags: PutFlags,
         val: ValSrc<'_>,
     ) -> Result<ReserveLoc> {
+        self.put_tree_flagged(tree, key, flags, val, 0)
+    }
+
+    /// As [`RwTxn::put_tree`] but with an explicit leaf-node flag (`F_SUBDATA`
+    /// for a named-DB catalog entry, SPEC 02 §6). `node_flags` is applied only
+    /// when the entry is *inserted* fresh; a same-size in-place overwrite keeps
+    /// the existing node flags (so a catalog record update never disturbs
+    /// `F_SUBDATA`).
+    fn put_tree_flagged(
+        &mut self,
+        tree: TreeId,
+        key: &[u8],
+        flags: PutFlags,
+        val: ValSrc<'_>,
+        node_flags: u16,
+    ) -> Result<ReserveLoc> {
         self.guard_ok()?;
         // SPEC 03 §6 / §2.1: writes validate up front — empty or > 511-byte
         // key, oversized value → BadValSize (the split machinery's termination
@@ -809,7 +947,7 @@ impl<'env> RwTxn<'env> {
             // §S2: no mutation, nothing dirtied.
             return Err(Error::Mdb(MdbError::KeyExist));
         }
-        let res = self.put_apply(tree, &mut path, found, key, val);
+        let res = self.put_apply(tree, &mut path, found, key, val, node_flags);
         if res.is_err() {
             // Mid-mutation failure (MapFull in a split cascade, corrupt page):
             // the working tree may be partial — poison the txn (TXN-59 clean
@@ -823,7 +961,7 @@ impl<'env> RwTxn<'env> {
     /// position is irrelevant. Equal-to-last is `KeyExist`, not an overwrite.
     fn append_tree(&mut self, tree: TreeId, key: &[u8], val: ValSrc<'_>) -> Result<ReserveLoc> {
         if self.record(tree).root == PGNO_INVALID {
-            let res = self.insert_first(tree, key, val);
+            let res = self.insert_first(tree, key, val, 0);
             match res {
                 Ok(_) => self.record_mut(tree).entries += 1,
                 Err(_) => self.errored = true,
@@ -855,7 +993,7 @@ impl<'env> RwTxn<'env> {
             LeafRef::new(frame, self.psize).map_err(corrupt)?.num_keys()
         };
         path.last_mut().expect("non-empty path").1 = n;
-        let loc = self.insert_into_leaf(tree, path, n, key, val, true)?;
+        let loc = self.insert_into_leaf(tree, path, n, key, val, true, 0)?;
         self.record_mut(tree).entries += 1;
         Ok(loc)
     }
@@ -867,17 +1005,18 @@ impl<'env> RwTxn<'env> {
         found: bool,
         key: &[u8],
         val: ValSrc<'_>,
+        node_flags: u16,
     ) -> Result<ReserveLoc> {
         if path.is_empty() {
             // Empty tree: first insert allocates the root leaf (§9 grow).
-            let loc = self.insert_first(tree, key, val)?;
+            let loc = self.insert_first(tree, key, val, node_flags)?;
             self.record_mut(tree).entries += 1;
             return Ok(loc);
         }
         self.touch_path(tree, path)?;
         let (lpg, ki) = *path.last().expect("non-empty path");
         if !found {
-            let loc = self.insert_into_leaf(tree, path, ki, key, val, false)?;
+            let loc = self.insert_into_leaf(tree, path, ki, key, val, false, node_flags)?;
             self.record_mut(tree).entries += 1;
             return Ok(loc);
         }
@@ -923,11 +1062,17 @@ impl<'env> RwTxn<'env> {
                 .remove(ki);
         }
         // entries unchanged: replace, not insert.
-        self.insert_into_leaf(tree, path, ki, key, val, false)
+        self.insert_into_leaf(tree, path, ki, key, val, false, node_flags)
     }
 
     /// First insert into an empty tree (§9 grow: empty → 1 leaf).
-    fn insert_first(&mut self, tree: TreeId, key: &[u8], val: ValSrc<'_>) -> Result<ReserveLoc> {
+    fn insert_first(
+        &mut self,
+        tree: TreeId,
+        key: &[u8],
+        val: ValSrc<'_>,
+        node_flags: u16,
+    ) -> Result<ReserveLoc> {
         let pg = self.allocate(1)?;
         {
             let frame = self.dirty.insert_tree_frame(pg);
@@ -938,13 +1083,14 @@ impl<'env> RwTxn<'env> {
         rec.depth = 1;
         rec.leaf_pages = 1;
         let mut path = vec![(pg, 0usize)];
-        self.insert_into_leaf(tree, &mut path, 0, key, val, false)
+        self.insert_into_leaf(tree, &mut path, 0, key, val, false, node_flags)
     }
 
     /// Insert a `(key, val)` cell at slot `ki` of the (dirty) leaf at
     /// `path.last()` (§6.2), splitting when full (§6.4; `append` forces the
     /// append split policy §6.3). BIGDATA values allocate their run first
     /// (SPEC 02 §4.2 inline rule).
+    #[allow(clippy::too_many_arguments)]
     fn insert_into_leaf(
         &mut self,
         tree: TreeId,
@@ -953,6 +1099,7 @@ impl<'env> RwTxn<'env> {
         key: &[u8],
         val: ValSrc<'_>,
         append: bool,
+        node_flags: u16,
     ) -> Result<ReserveLoc> {
         let psize = self.psize;
         if value_is_inline(key.len(), val.len() as u64, psize) {
@@ -961,7 +1108,7 @@ impl<'env> RwTxn<'env> {
                 let frame = self.dirty.bytes_mut(lpg).expect("leaf is dirty");
                 let mut leaf = LeafMut::from_valid(frame, psize).map_err(corrupt)?;
                 match &val {
-                    ValSrc::Val(v) => leaf.insert_inline(ki, key, 0, v),
+                    ValSrc::Val(v) => leaf.insert_inline(ki, key, node_flags, v),
                     ValSrc::Reserve(n) => {
                         leaf.insert_inline_reserved(ki, key, *n as u32).map(|_| ())
                     }
@@ -980,6 +1127,7 @@ impl<'env> RwTxn<'env> {
                             ValSrc::Val(v) => v.to_vec(),
                             ValSrc::Reserve(n) => vec![0u8; *n],
                         }),
+                        flags: node_flags,
                     };
                     self.split_leaf(tree, path, ki, cell, append)?;
                     Ok(ReserveLoc::Inline)
@@ -1017,6 +1165,7 @@ impl<'env> RwTxn<'env> {
                     let cell = OwnedLeafCell {
                         key: key.to_vec(),
                         val: OwnedVal::Big { head, dsize },
+                        flags: node_flags,
                     };
                     self.split_leaf(tree, path, ki, cell, append)?;
                     Ok(ReserveLoc::Big(head))
@@ -1040,9 +1189,13 @@ impl<'env> RwTxn<'env> {
                     dsize,
                 },
             };
+            // Preserve non-BIGDATA node flags (F_SUBDATA) across the rewrite
+            // (SPEC 02 §6); F_BIGDATA is re-derived from the value on write.
+            let flags = leaf.node_flags(i) & !crate::page::F_BIGDATA;
             cells.push(OwnedLeafCell {
                 key: leaf.key(i).to_vec(),
                 val,
+                flags,
             });
         }
         Ok(cells)
@@ -1069,7 +1222,9 @@ impl<'env> RwTxn<'env> {
         let mut leaf = LeafMut::init(frame, psize, pgno, txnid).map_err(corrupt)?;
         for (i, c) in cells.iter().enumerate() {
             match &c.val {
-                OwnedVal::Inline(v) => leaf.insert_inline(i, &c.key, 0, v).map_err(corrupt)?,
+                OwnedVal::Inline(v) => {
+                    leaf.insert_inline(i, &c.key, c.flags, v).map_err(corrupt)?
+                }
                 OwnedVal::Big { head, dsize } => leaf
                     .insert_bigdata(i, &c.key, *dsize, *head)
                     .map_err(corrupt)?,
@@ -1417,6 +1572,7 @@ impl<'env> RwTxn<'env> {
                                 dsize,
                             },
                         },
+                        flags: leaf.node_flags(i) & !crate::page::F_BIGDATA,
                     }
                 };
                 {
@@ -1443,6 +1599,7 @@ impl<'env> RwTxn<'env> {
                                 dsize,
                             },
                         },
+                        flags: leaf.node_flags(0) & !crate::page::F_BIGDATA,
                     }
                 };
                 {
@@ -1553,7 +1710,9 @@ impl<'env> RwTxn<'env> {
         let frame = self.dirty.bytes_mut(pgno).expect("page is dirty");
         let mut leaf = LeafMut::from_valid(frame, self.psize).map_err(corrupt)?;
         match &cell.val {
-            OwnedVal::Inline(v) => leaf.insert_inline(idx, &cell.key, 0, v).map_err(corrupt),
+            OwnedVal::Inline(v) => leaf
+                .insert_inline(idx, &cell.key, cell.flags, v)
+                .map_err(corrupt),
             OwnedVal::Big { head, dsize } => leaf
                 .insert_bigdata(idx, &cell.key, *dsize, *head)
                 .map_err(corrupt),
@@ -1657,29 +1816,156 @@ impl<'env> RwTxn<'env> {
 
     // -- clear ------------------------------------------------------------------
 
-    /// `clear` (SPEC 00 row 38): free every page of the tree and reset the
-    /// working record to empty.
-    fn clear_main(&mut self) -> Result<()> {
+    /// `clear` (SPEC 00 row 38): free every page of `tree` and reset its working
+    /// record to empty. Works for the main DB and any named DB (SPEC 02 §6). The
+    /// named record is left in the open table marked dirty (by `record_mut`), so
+    /// its catalog entry is rewritten empty at commit; the entry itself stays.
+    fn clear_tree(&mut self, tree: TreeId) -> Result<()> {
         self.guard_ok()?;
-        let rec = *self.record(TreeId::Main);
-        if rec.root == PGNO_INVALID {
-            self.main_db = DBRecord::empty();
-            return Ok(());
+        let rec = *self.record(tree);
+        if rec.root != PGNO_INVALID {
+            let mut pages = Vec::new();
+            let mut runs = Vec::new();
+            let res = self.collect_tree(rec.root, rec.depth, &mut pages, &mut runs);
+            if let Err(e) = res {
+                self.errored = true;
+                return Err(e);
+            }
+            for (head, n) in runs {
+                self.free_run(head, n);
+            }
+            for p in pages {
+                self.free_page(p);
+            }
         }
-        let mut pages = Vec::new();
-        let mut runs = Vec::new();
-        let res = self.collect_tree(rec.root, rec.depth, &mut pages, &mut runs);
-        if let Err(e) = res {
-            self.errored = true;
-            return Err(e);
+        // Reset to empty (persistent flags stay 0 in Phase 1). `record_mut`
+        // marks a named record dirty for the commit write-back.
+        *self.record_mut(tree) = DBRecord::empty();
+        Ok(())
+    }
+
+    /// `drop` (`mdb_drop(_, 1)`, SPEC 02 §6). Main DB → `clear` (no catalog
+    /// entry to remove). Named DB → free every page, then delete the catalog
+    /// entry from the main tree and forget the working record so commit does
+    /// not write it back. The dbi index stays reserved in the env registry
+    /// (append-only; see [`crate::env`] `NamedRegistry`).
+    fn drop_database(&mut self, sel: DbSel) -> Result<()> {
+        self.guard_ok()?;
+        match sel {
+            DbSel::Main => self.clear_tree(TreeId::Main),
+            DbSel::Named(dbi) => {
+                let tree = self.ensure_open(DbSel::Named(dbi))?;
+                self.clear_tree(tree)?;
+                let name = self
+                    .open
+                    .get(&dbi)
+                    .expect("named record loaded")
+                    .name
+                    .clone();
+                // Remove the catalog entry (decrements main_db.entries).
+                let existed = self.delete_tree(TreeId::Main, &name)?;
+                debug_assert!(existed, "dropped named DB had no catalog entry");
+                // The DB no longer exists this txn: drop its working record so
+                // `flush_catalog` does not re-create it.
+                self.open.remove(&dbi);
+                Ok(())
+            }
         }
-        for (head, n) in runs {
-            self.free_run(head, n);
+    }
+
+    /// Create-or-open a named DB's catalog entry (SPEC 02 §6, `mdb_dbi_open` +
+    /// `MDB_CREATE`): if the name already exists as an `F_SUBDATA` record, load
+    /// it (idempotent open); if it exists as a plain user key, `Incompatible`;
+    /// otherwise insert an empty `F_SUBDATA` record eagerly (LMDB `MDB_CREATE`
+    /// creates the entry inside the write txn), so `open_database` sees it and
+    /// abort discards it with the dirty set.
+    fn create_named(&mut self, dbi: u32, name: &[u8]) -> Result<()> {
+        self.guard_ok()?;
+        enum Cat {
+            Missing,
+            SubDb(DBRecord),
+            Collision,
         }
-        for p in pages {
-            self.free_page(p);
+        let cat = {
+            let tree = Tree::new(
+                self.source(),
+                self.psize,
+                self.main_db.root,
+                self.main_db.depth,
+            );
+            match tree.get_catalog_entry(name).map_err(map_page_err)? {
+                Some((flags, val)) if flags & F_SUBDATA != 0 => {
+                    Cat::SubDb(DBRecord::from_bytes(val).unwrap_or_else(DBRecord::empty))
+                }
+                Some(_) => Cat::Collision,
+                None => Cat::Missing,
+            }
+        };
+        match cat {
+            Cat::Collision => Err(Error::Mdb(MdbError::Incompatible)),
+            Cat::SubDb(rec) => {
+                self.open.entry(dbi).or_insert_with(|| NamedTree {
+                    name: name.into(),
+                    rec,
+                    dirty: false,
+                });
+                Ok(())
+            }
+            Cat::Missing => {
+                let empty = DBRecord::empty();
+                let bytes = empty.to_bytes();
+                debug_assert_eq!(bytes.len(), DBRECORD_LEN);
+                let res = self.put_tree_flagged(
+                    TreeId::Main,
+                    name,
+                    PutFlags::EMPTY,
+                    ValSrc::Val(&bytes),
+                    F_SUBDATA,
+                );
+                if res.is_err() {
+                    self.errored = true;
+                    return res.map(|_| ());
+                }
+                self.open.insert(
+                    dbi,
+                    NamedTree {
+                        name: name.into(),
+                        rec: empty,
+                        dirty: false,
+                    },
+                );
+                Ok(())
+            }
         }
-        self.main_db = DBRecord::empty();
+    }
+
+    /// Write back every dirty named-DB working record into the main catalog
+    /// (SPEC 02 §6), in ascending-name order for determinism. Runs at commit
+    /// step **C1a — before `freelist_save`** (the LMDB sub-DB flush order): a
+    /// record rewrite is a same-size 48-byte overwrite of an existing
+    /// `F_SUBDATA` entry, but it COWs main-tree leaves and may free pages, all
+    /// of which must be captured by the subsequent `freelist_save`.
+    fn flush_catalog(&mut self) -> Result<()> {
+        let mut dirty: Vec<(Box<[u8]>, DBRecord)> = self
+            .open
+            .values()
+            .filter(|t| t.dirty)
+            .map(|t| (t.name.clone(), t.rec))
+            .collect();
+        dirty.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, rec) in dirty {
+            let bytes = rec.to_bytes();
+            self.put_tree_flagged(
+                TreeId::Main,
+                &name,
+                PutFlags::EMPTY,
+                ValSrc::Val(&bytes),
+                F_SUBDATA,
+            )?;
+        }
+        for t in self.open.values_mut() {
+            t.dirty = false;
+        }
         Ok(())
     }
 
@@ -1731,6 +2017,10 @@ impl<'env> RwTxn<'env> {
             && self.next_pgno == self.base.last_pg + 1
             && self.main_db == self.base.main_db
             && self.free_db == self.base.free_db
+            // A dirty named-DB working record still needs its catalog write-back
+            // (defensive: any named mutation also dirties a page, so this is
+            // implied — but keep the commit honest, SPEC 02 §6).
+            && !self.open.values().any(|t| t.dirty)
     }
 
     /// GC-10 trailing shrink: loose pages that are the highest-numbered pages
@@ -1936,6 +2226,12 @@ impl<'env> RwTxn<'env> {
         // ----- C0: no nested readers exist before M1.9 (child_count ≡ 0);
         // the freed-page list is already accumulated (GC-6). -----
 
+        // ----- C1a: flush dirty named-DB records into the main catalog
+        // (SPEC 02 §6). Runs BEFORE freelist_save (the LMDB sub-DB flush order):
+        // the record rewrites COW main-tree leaves and may free pages, which
+        // freelist_save must then capture. -----
+        self.flush_catalog()?;
+
         // ----- C1: freelist_save (SPEC 05 §4, GC-11..14; ADR-0005 D2):
         // drains applied, trailing loose released, this txn's freed set
         // written under BE(writer_txnid) — all into dirty frames only. -----
@@ -2031,7 +2327,8 @@ impl Database {
     /// [`MdbError::BadValSize`] (empty/oversized key, oversized value),
     /// [`MdbError::MapFull`], [`MdbError::BadTxn`] on a poisoned txn.
     pub fn put(&self, txn: &mut RwTxn<'_>, key: &[u8], value: &[u8]) -> Result<()> {
-        txn.put_tree(TreeId::Main, key, PutFlags::EMPTY, ValSrc::Val(value))
+        let tree = txn.ensure_open(self.sel())?;
+        txn.put_tree(tree, key, PutFlags::EMPTY, ValSrc::Val(value))
             .map(|_| ())
     }
 
@@ -2049,7 +2346,8 @@ impl Database {
         key: &[u8],
         value: &[u8],
     ) -> Result<()> {
-        txn.put_tree(TreeId::Main, key, flags, ValSrc::Val(value))
+        let tree = txn.ensure_open(self.sel())?;
+        txn.put_tree(tree, key, flags, ValSrc::Val(value))
             .map(|_| ())
     }
 
@@ -2070,7 +2368,8 @@ impl Database {
         len: usize,
         f: impl FnOnce(&mut [u8]),
     ) -> Result<()> {
-        let loc = txn.put_tree(TreeId::Main, key, PutFlags::EMPTY, ValSrc::Reserve(len))?;
+        let tree = txn.ensure_open(self.sel())?;
+        let loc = txn.put_tree(tree, key, PutFlags::EMPTY, ValSrc::Reserve(len))?;
         match loc {
             ReserveLoc::Big(head) => {
                 let frame = txn.dirty.bytes_mut(head).expect("run frame present");
@@ -2078,7 +2377,7 @@ impl Database {
             }
             ReserveLoc::Inline => {
                 // Locate the settled cell (it may have moved through a split).
-                let (path, found) = txn.search_path(TreeId::Main, key)?;
+                let (path, found) = txn.search_path(tree, key)?;
                 debug_assert!(found, "reserved key must be present");
                 let (lpg, ki) = *path.last().expect("non-empty path");
                 let frame = txn.dirty.bytes_mut(lpg).expect("leaf is dirty");
@@ -2100,7 +2399,8 @@ impl Database {
     /// [`MdbError::BadTxn`] on a poisoned txn; [`MdbError::MapFull`] if the
     /// COW/rebalance ran out of map (which also poisons the txn).
     pub fn delete(&self, txn: &mut RwTxn<'_>, key: &[u8]) -> Result<bool> {
-        txn.delete_tree(TreeId::Main, key)
+        let tree = txn.ensure_open(self.sel())?;
+        txn.delete_tree(tree, key)
     }
 
     /// `delete_range(txn, lower, upper)` (SPEC 00 row 37): delete every entry
@@ -2115,6 +2415,7 @@ impl Database {
         lower: std::ops::Bound<&[u8]>,
         upper: std::ops::Bound<&[u8]>,
     ) -> Result<u64> {
+        let tree = txn.ensure_open(self.sel())?;
         let keys: Vec<Vec<u8>> = {
             let mut out = Vec::new();
             for item in self.range(&*txn, lower, upper) {
@@ -2125,20 +2426,39 @@ impl Database {
         };
         let mut n = 0u64;
         for k in &keys {
-            if txn.delete_tree(TreeId::Main, k)? {
+            if txn.delete_tree(tree, k)? {
                 n += 1;
             }
         }
         Ok(n)
     }
 
-    /// `clear(txn)` (SPEC 00 row 38): empty the database.
+    /// `clear(txn)` (SPEC 00 row 38, `mdb_drop(_, 0)`): empty the database,
+    /// freeing every page, but keep the database (and, for a named DB, its
+    /// catalog entry). The working record is reset to empty and, for a named
+    /// DB, written back at commit (SPEC 02 §6).
     ///
     /// # Errors
     ///
     /// As [`Database::delete`].
     pub fn clear(&self, txn: &mut RwTxn<'_>) -> Result<()> {
-        txn.clear_main()
+        let tree = txn.ensure_open(self.sel())?;
+        txn.clear_tree(tree)
+    }
+
+    /// `drop(txn)` (`mdb_drop(_, 1)`): empty the database **and** remove its
+    /// catalog entry (SPEC 02 §6). For a **named** DB this deletes the name
+    /// from the main tree (decrementing `main_db.entries`) and the handle
+    /// becomes stale (a later `open_database` returns `None` until re-created).
+    /// For the **main** DB there is no catalog entry to remove — it behaves
+    /// like [`Database::clear`] (LMDB `mdb_drop(MAIN_DBI, 1)` = clear, since the
+    /// main dbi is a core DB).
+    ///
+    /// # Errors
+    ///
+    /// As [`Database::delete`].
+    pub fn drop_db(&self, txn: &mut RwTxn<'_>) -> Result<()> {
+        txn.drop_database(self.sel())
     }
 
     /// A mutable cursor over this database (the `iter_mut` /
@@ -2147,6 +2467,7 @@ impl Database {
     pub fn rw_cursor<'t, 'env>(&self, txn: &'t mut RwTxn<'env>) -> RwCursor<'t, 'env> {
         RwCursor {
             txn,
+            sel: self.sel(),
             pos: CurPos::Start,
         }
     }
@@ -2173,6 +2494,8 @@ enum CurPos {
 /// M1.4 (the heed adapter revisits zero-copy yields at M1.13).
 pub struct RwCursor<'t, 'env> {
     txn: &'t mut RwTxn<'env>,
+    /// Which database this cursor iterates/mutates (M1.6).
+    sel: DbSel,
     pos: CurPos,
 }
 
@@ -2186,7 +2509,7 @@ impl RwCursor<'_, '_> {
     /// [`MdbError::Invalid`] on a corrupt tree.
     pub fn move_next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         let entry: Option<(Vec<u8>, Vec<u8>)> = {
-            let tree = crate::rotxn::tree_of(&*self.txn);
+            let tree = Database::from_sel(self.sel).tree(&*self.txn);
             let mut c = tree.cursor();
             let r = match &self.pos {
                 CurPos::Start => c.first(),
@@ -2221,8 +2544,9 @@ impl RwCursor<'_, '_> {
         match &self.pos {
             CurPos::At(k) => {
                 let k = k.clone();
+                let tree = self.txn.ensure_open(self.sel)?;
                 self.txn
-                    .put_tree(TreeId::Main, &k, PutFlags::EMPTY, ValSrc::Val(value))
+                    .put_tree(tree, &k, PutFlags::EMPTY, ValSrc::Val(value))
                     .map(|_| ())?;
                 Ok(true)
             }
@@ -2241,7 +2565,8 @@ impl RwCursor<'_, '_> {
         match &self.pos {
             CurPos::At(k) => {
                 let k = k.clone();
-                let existed = self.txn.delete_tree(TreeId::Main, &k)?;
+                let tree = self.txn.ensure_open(self.sel)?;
+                let existed = self.txn.delete_tree(tree, &k)?;
                 self.pos = CurPos::AfterDelete(k);
                 Ok(existed)
             }
@@ -2641,6 +2966,68 @@ mod tests {
         // error) and must not advance the commit point.
         txn.commit().unwrap();
         assert_eq!(env.txnid(), 0);
+    }
+
+    #[test]
+    fn named_db_in_txn_create_put_read_clear_drop() {
+        // Exercises the M1.6 named-DB write path under mem_env (miri-clean, no
+        // commit): create → put → read via the catalog-resolved record →
+        // clear → drop, plus F_SUBDATA on the catalog entry.
+        let env = mem_env(PS, MAP);
+        let mut txn = env.write_txn().unwrap();
+        let named = env.create_database(&mut txn, Some(b"users")).unwrap();
+        // The main catalog now has one F_SUBDATA entry keyed by the name.
+        let main = env.main_database();
+        assert_eq!(main.len(&txn).unwrap(), 1);
+        assert_eq!(
+            main.get(&txn, b"users").unwrap().map(<[u8]>::len),
+            Some(48) // the 48-byte DBRecord
+        );
+        // Writes land in the named tree, isolated from main.
+        for i in 0..800u32 {
+            named
+                .put(&mut txn, format!("u{i:04}").as_bytes(), b"value")
+                .unwrap();
+        }
+        assert_eq!(named.len(&txn).unwrap(), 800);
+        assert_eq!(main.len(&txn).unwrap(), 1); // still just the catalog entry
+        assert_eq!(
+            named.get(&txn, b"u0100").unwrap(),
+            Some(b"value".as_slice())
+        );
+        assert!(main.get(&txn, b"u0100").unwrap().is_none());
+        let st = named.stat(&txn).unwrap();
+        assert_eq!(st.entries, 800);
+        assert!(st.depth >= 2, "expected a split, depth {}", st.depth);
+        // clear empties the named tree but keeps the catalog entry.
+        named.clear(&mut txn).unwrap();
+        assert_eq!(named.len(&txn).unwrap(), 0);
+        assert_eq!(main.len(&txn).unwrap(), 1);
+        // drop removes the catalog entry.
+        named.drop_db(&mut txn).unwrap();
+        assert_eq!(main.len(&txn).unwrap(), 0);
+        // Reusable name after a re-create.
+        let named2 = env.create_database(&mut txn, Some(b"users")).unwrap();
+        named2.put(&mut txn, b"again", b"1").unwrap();
+        assert_eq!(named2.get(&txn, b"again").unwrap(), Some(b"1".as_slice()));
+        assert_eq!(main.len(&txn).unwrap(), 1);
+    }
+
+    #[test]
+    fn named_db_bad_name_rejected() {
+        // (DbsFull is covered on real files in crates/zerodb/tests/named_db.rs;
+        // mem_env's capacity is generous.)
+        let env = mem_env(PS, MAP);
+        let mut txn = env.write_txn().unwrap();
+        // Empty / oversized names → BadValSize.
+        for bad in [b"".as_slice(), &[0u8; 512]] {
+            let e = env.create_database(&mut txn, Some(bad)).unwrap_err();
+            assert!(matches!(e, Error::Mdb(MdbError::BadValSize)));
+        }
+        // 511-byte name is fine.
+        env.create_database(&mut txn, Some(&[7u8; 511])).unwrap();
+        // None → main DB, always Ok.
+        env.create_database(&mut txn, None).unwrap();
     }
 
     #[test]

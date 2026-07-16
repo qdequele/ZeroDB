@@ -76,6 +76,27 @@ impl DBRecord {
         }
     }
 
+    /// Encode this record as a standalone 48-byte catalog value (SPEC 02 §6:
+    /// the value of a named DB's `F_SUBDATA` catalog entry in the main tree).
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; DBRECORD_LEN] {
+        let mut buf = [0u8; DBRECORD_LEN];
+        self.write(&mut buf, 0);
+        buf
+    }
+
+    /// Decode a `DBRecord` from a standalone 48-byte catalog value (SPEC 02
+    /// §6). Returns `None` if the slice is not exactly [`DBRECORD_LEN`] bytes —
+    /// a catalog entry whose value is the wrong size is not a valid sub-DB
+    /// record (a user-key collision, not a named DB).
+    #[must_use]
+    pub fn from_bytes(buf: &[u8]) -> Option<DBRecord> {
+        if buf.len() != DBRECORD_LEN {
+            return None;
+        }
+        Some(DBRecord::read(buf, 0))
+    }
+
     /// Decode a `DBRecord` from `buf[base..base + 48]`.
     fn read(buf: &[u8], base: usize) -> DBRecord {
         DBRecord {

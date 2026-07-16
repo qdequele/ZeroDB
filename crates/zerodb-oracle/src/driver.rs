@@ -167,11 +167,16 @@ pub fn classify(op: &Op, txn: TxnState, dbs_empty: bool, cleared_in_txn: bool) -
         // In-place cursor mutation needs a write txn.
         IterMutPutCurrent { .. } | IterMutDelCurrent { .. } => db_write(),
 
-        // A fresh independent read: only needs a db to exist (its own txn is
-        // opened internally).
+        // A fresh independent read modeling a **post-commit** verification: it
+        // opens its own read txn, so it needs a db to exist but no active txn —
+        // and it must NOT run while a write txn is open (VerifyDuringWrite; see
+        // that `Skip`'s doc + DIVERGENCES D-009). Its concurrent-with-writer
+        // isolation is a M1.8 (reader table) concern.
         VerifyGet { .. } => {
             if dbs_empty {
                 Some(Skip::NoDb)
+            } else if matches!(txn, TxnState::Rw | TxnState::RwNested) {
+                Some(Skip::VerifyDuringWrite)
             } else {
                 None
             }

@@ -499,6 +499,43 @@ Reserved for Phase 2.8: `DBRecord.flags` carries persistent DB flags; opening a
 name with mismatched flags → `MdbError::Incompatible` (SPEC 01 §S8). All the
 `DatabaseFlags` bits are 0 in Phase 1 (D-004).
 
+### §6.1 — M1.6 implementation notes (open/create/clear/drop, write-back)
+
+- **dbi table.** A named `Database` handle carries a small integer *dbi index*
+  into an env-level registry (`EnvInner::named`, ZeroDB's analogue of LMDB's
+  `me_dbxs`) that maps dbi → **name only**. The record always resolves lazily
+  from the transaction's catalog view (SPEC 04 TXN-10 step 3): `open_database`
+  searches the main tree for the name; `create_database` inserts an empty
+  `F_SUBDATA` record eagerly (LMDB `MDB_CREATE` semantics) so it is visible
+  in-txn and discarded with the dirty set on abort. Assignment is append-only
+  within a process (an interim simplification like the M1.5 reader registry);
+  it is unobservable through the SPEC-00 surface because resolution is always
+  catalog-driven (an aborted create resolves to *absent*; re-creating re-uses
+  the dbi). `max_dbs` counts distinct named DBs; the `max_dbs+1`-th distinct
+  name → `MdbError::DbsFull`.
+- **`F_SUBDATA` preservation.** A catalog value is always a 48-byte inline
+  record, never `F_BIGDATA`. The `F_SUBDATA` node flag is threaded through the
+  write path (`OwnedLeafCell.flags`) so it survives leaf splits, merges, and
+  rebalances — the `check` walker (§below / SPEC 03 §11) relies on it to
+  distinguish sub-DB records from user keys and to follow every named-DB tree.
+- **Write-back timing (chosen mechanics).** A named DB's working record is held
+  per-txn (`RwTxn::open`) and mutated in place during ops. Dirty records are
+  written back into the main catalog at **commit step C1a — immediately before
+  `freelist_save`** (SPEC 04 §9, matching LMDB's sub-DB flush order in
+  `mdb_txn_commit`): the write-back is a same-size 48-byte overwrite of the
+  existing `F_SUBDATA` entry, but it COWs main-tree leaves and may free pages,
+  which the subsequent `freelist_save` must capture. (Rejected alternative:
+  write-back on every mutation — it would touch the main tree on every named
+  put/del and complicate the interleaving for no benefit.)
+- **clear vs drop.** `clear` (`mdb_drop(_, 0)`) frees the tree's pages and
+  resets the record to empty but keeps the catalog entry (rewritten empty at
+  commit). `drop` (`mdb_drop(_, 1)`) additionally deletes the catalog entry
+  (decrementing `main_db.entries`); for the **main** DB there is no entry to
+  remove, so `drop` degrades to `clear` (LMDB: the main dbi is a core DB).
+- **Name = byte string.** A DB name is a leaf key (1–`MAX_DB_NAME` bytes),
+  arbitrary bytes including `0x00`. heed's C-string names are a stricter
+  adapter-boundary rule imposed in M1.13 (DIVERGENCES D-008).
+
 ---
 
 ## §7 — GC / freelist pages

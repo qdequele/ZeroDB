@@ -111,19 +111,36 @@ impl<'a> Arbitrary<'a> for Value {
 
 /// Selects which database an op targets by *name*, mapped to a bounded set of
 /// catalog names so fuzzing keeps hitting the same handful of databases.
+///
+/// **Why `Unnamed` resolves to a *named* `"main"` DB (M1.6).** The differential
+/// mixes several databases in one env. If it stored user data in the true
+/// unnamed/root DB while also creating named DBs, iterating the root would
+/// surface the named DBs' catalog entries (SPEC 02 §6) — whose value is the
+/// engine's on-disk sub-DB **record**, a byte layout that legitimately differs
+/// between LMDB (`MDB_db`) and zerodb (`DBRecord`, SPEC 02 §3.1) because ZeroDB
+/// defines its own format (D-002). That is a raw-byte pattern **no consumer
+/// uses**: milli's primary DB is itself the *named* `"main"` DB, so the root is
+/// a pure catalog it never reads as data; arroy/hannoy use only the true
+/// unnamed DB and never create named DBs, so their root has no catalog entries.
+/// Modeling `Unnamed` as milli's named `"main"` keeps the fuzz faithful and
+/// avoids surfacing engine-internal records (DIVERGENCES D-008). The true
+/// unnamed/root DB is covered on its own — with no catalog mixing — by
+/// `tests/unnamed_root_differential.rs`.
 #[derive(Arbitrary, Debug, Clone, PartialEq, Eq)]
 pub enum DbName {
-    /// The unnamed (main) database.
+    /// The primary database, modeled as milli's named `"main"` DB.
     Unnamed,
     /// A named database `db0`..`db3` (index taken modulo 4).
     Named(u8),
 }
 
 impl DbName {
-    /// The catalog name (`None` = unnamed/main DB).
+    /// The catalog name this selector resolves to. Never `None`: see the type
+    /// docs — the fuzz's "primary" DB is milli's named `"main"`, not the true
+    /// unnamed/root DB, so no op ever reads the root catalog as user data.
     pub fn resolve(&self) -> Option<String> {
         match self {
-            DbName::Unnamed => None,
+            DbName::Unnamed => Some("main".to_string()),
             DbName::Named(n) => Some(format!("db{}", n % 4)),
         }
     }

@@ -46,6 +46,16 @@ pub enum Skip {
     NoNestedToEnd,
     /// `Begin*` while a transaction is already active.
     TxnAlreadyOpen,
+    /// `VerifyGet` (a fresh independent read modeling a **post-commit**
+    /// verification, SPEC 00 `VerifyGet`) issued while a **write txn is open**.
+    /// Skipped symmetrically because it is outside VerifyGet's modeled scenario
+    /// and, on LMDB, opening a database by name in a fresh read txn concurrent
+    /// with a write txn that has dropped-and-reused that dbi number trips an
+    /// LMDB dbi-reuse hazard (`EINVAL` from `mdb_get` on the reused slot) that
+    /// no consumer exercises — zerodb returns the correct MVCC answer (absent →
+    /// `None`). See DIVERGENCES D-009. Concurrent reader-vs-writer isolation is
+    /// exercised properly with the M1.8 reader table.
+    VerifyDuringWrite,
     /// The op is not yet implemented by one of the engines in this milestone, so
     /// [`crate::run`] skips it symmetrically on both sides (see
     /// [`crate::Engine::implements`]). A differential run restricts itself to the

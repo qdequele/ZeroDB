@@ -59,6 +59,20 @@ pub enum MdbError {
     #[error("key not found")]
     NotFound,
 
+    /// `MDB_DBS_FULL` — the named-DB catalog is full (`create_database` beyond
+    /// `max_dbs`; SPEC 00 row 4, SPEC 01 §S8). Its `Debug` renders as `DbsFull`,
+    /// matching `heed::MdbError::DbsFull` so the oracle's error taxonomy agrees.
+    #[error("environment maxdbs reached")]
+    DbsFull,
+
+    /// `MDB_INCOMPATIBLE` — a name is opened with flags/shape incompatible with
+    /// the existing entry: in Phase 1 this is a `create_database`/`open_database`
+    /// on a name that already exists in the main tree as a **plain user key**
+    /// (not an `F_SUBDATA` sub-DB record). SPEC 01 §S8; SPEC 02 §6. `Debug`
+    /// renders as `Incompatible`, matching `heed::MdbError::Incompatible`.
+    #[error("database is incompatible with the requested operation")]
+    Incompatible,
+
     /// `MDB_BAD_TXN` — the transaction encountered a mid-operation failure
     /// (e.g. `MapFull` inside a split cascade) and must be aborted; further
     /// operations and `commit` refuse to run on it (LMDB `MDB_TXN_ERROR`

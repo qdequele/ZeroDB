@@ -16,8 +16,15 @@
 //! reproduced: reads take `&Txn` and return `&'txn [u8]`; mutations take
 //! `&mut RwTxn`, so no read borrow can span a mutation (TXN-39).
 //!
-//! Named-database catalogs are out of scope (M1.6): only the main/unnamed
-//! database is exposed, via [`Env::main_database`].
+//! Named databases (M1.6): a [`Database`] handle carries a [`DbSel`] — the
+//! main/unnamed DB or a named DB addressed by its env-level *dbi index*
+//! ([`Env::open_database`] / [`Env::create_database`]). A named DB's
+//! `DBRecord` (root/depth/stats) is **not** stored in the [`RoTxn`] snapshot;
+//! it resolves lazily from the transaction's catalog view — the main tree,
+//! keyed by name, value = 48-byte `F_SUBDATA` record (SPEC 02 §6, SPEC 04
+//! TXN-10 step 3). This module owns that resolution ([`resolve_named_record`])
+//! and the read API; the write side (create/clear/drop, catalog write-back)
+//! lives in [`crate::rwtxn`].
 
 use std::ops::Bound;
 use std::sync::Arc;
@@ -25,7 +32,7 @@ use std::sync::Arc;
 use crate::btree::{prefix_successor, Cursor, Source, Tree};
 use crate::env::{Env, Snapshot};
 use crate::error::{Error, MdbError, Result};
-use crate::page::{DBRecord, PageError};
+use crate::page::{DBRecord, PageError, F_SUBDATA};
 
 /// Map a structural tree-decode error to the public taxonomy. A corrupt page
 /// reached during a read means the store is not a valid zerodb file
@@ -47,6 +54,46 @@ pub trait TxnRead {
     fn free_record(&self) -> &DBRecord;
     /// The env's page size.
     fn page_size(&self) -> u32;
+    /// The `DBRecord` (root/depth/stats) of the database `sel` addresses, as
+    /// this txn observes it (SPEC 04 TXN-10 step 3). For the main DB this is
+    /// [`TxnRead::main_record`]; for a named DB it resolves from the catalog
+    /// (or the write txn's working record). An absent/unresolvable named DB
+    /// yields [`DBRecord::empty`] (a lenient read view — the strict
+    /// `Incompatible` check lives in `open`/`create`).
+    fn record_for(&self, sel: DbSel) -> DBRecord;
+}
+
+/// Which database a [`Database`] handle addresses (SPEC 02 §6). `Copy` so the
+/// handle stays a cheap value like `heed::Database`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbSel {
+    /// The main (unnamed/default) database — the meta's `main_db` and the
+    /// named-DB catalog itself.
+    Main,
+    /// A named database, addressed by its env-level dbi index (the position in
+    /// the env's named registry; SPEC 02 §6).
+    Named(u32),
+}
+
+/// Resolve a named DB's `DBRecord` from a catalog view (SPEC 02 §6, SPEC 04
+/// TXN-10 step 3): search the main tree for `name`; if the entry is a 48-byte
+/// `F_SUBDATA` sub-DB record, decode it; otherwise (absent, or a plain user-key
+/// collision) return [`DBRecord::empty`]. The strict collision → `Incompatible`
+/// error is enforced only at `open`/`create` time, where a `create` intent
+/// exists; a bare read is lenient.
+pub(crate) fn resolve_named_record(
+    src: Source<'_>,
+    psize: u32,
+    main: &DBRecord,
+    name: &[u8],
+) -> DBRecord {
+    let tree = Tree::new(src, psize, main.root, main.depth);
+    match tree.get_catalog_entry(name) {
+        Ok(Some((flags, val))) if flags & F_SUBDATA != 0 => {
+            DBRecord::from_bytes(val).unwrap_or_else(DBRecord::empty)
+        }
+        _ => DBRecord::empty(),
+    }
 }
 
 /// A read-only transaction: a consistent view of one committed snapshot
@@ -91,6 +138,17 @@ impl TxnRead for RoTxn<'_> {
     fn page_size(&self) -> u32 {
         self.psize
     }
+    fn record_for(&self, sel: DbSel) -> DBRecord {
+        match sel {
+            DbSel::Main => self.snap.main_db,
+            DbSel::Named(dbi) => match self.env.inner().named_name(dbi) {
+                Some(name) => {
+                    resolve_named_record(self.source(), self.psize, &self.snap.main_db, &name)
+                }
+                None => DBRecord::empty(),
+            },
+        }
+    }
 }
 
 impl Env {
@@ -117,10 +175,54 @@ impl Env {
     }
 
     /// A handle to the main (unnamed) database (SPEC 00 row 10, `None` name).
-    /// Always present — it is the meta's `main_db`. Named DBs are M1.6.
+    /// Always present — it is the meta's `main_db`.
     #[must_use]
     pub fn main_database(&self) -> Database {
-        Database { _priv: () }
+        Database { sel: DbSel::Main }
+    }
+
+    /// `open_database(txn, name)` (SPEC 00 rows 10/12, `mdb_dbi_open` without
+    /// `MDB_CREATE`): open an **existing** database by name. `None` name → the
+    /// main DB (always present). `Some(name)` resolves the name in the txn's
+    /// catalog view (SPEC 04 TXN-10 step 3): present as an `F_SUBDATA` sub-DB
+    /// record → `Some(handle)`; absent → `Ok(None)`. Works over any readable
+    /// txn ([`TxnRead`]): a `RoTxn` (committed catalog) or an `RwTxn` (its
+    /// working catalog, so a database created earlier in the same write txn is
+    /// visible).
+    ///
+    /// # Errors
+    ///
+    /// - [`MdbError::BadValSize`] if `name` is empty or `> MAX_DB_NAME`.
+    /// - [`MdbError::Incompatible`] if the name exists in the main tree as a
+    ///   plain **user key** (not a sub-DB record) — SPEC 02 §6.
+    pub fn open_database<T: TxnRead>(
+        &self,
+        txn: &T,
+        name: Option<&[u8]>,
+    ) -> Result<Option<Database>> {
+        let name = match name {
+            None => return Ok(Some(self.main_database())),
+            Some(n) => n,
+        };
+        if name.is_empty() || name.len() > crate::page::MAX_DB_NAME {
+            return Err(Error::Mdb(MdbError::BadValSize));
+        }
+        let main = txn.main_record();
+        let tree = Tree::new(txn.source(), txn.page_size(), main.root, main.depth);
+        match tree.get_catalog_entry(name).map_err(map_page_err)? {
+            Some((flags, _val)) if flags & F_SUBDATA != 0 => {
+                let dbi = self
+                    .inner()
+                    .named_dbi_assign(name)
+                    .ok_or(Error::Mdb(MdbError::DbsFull))?;
+                Ok(Some(Database {
+                    sel: DbSel::Named(dbi),
+                }))
+            }
+            // Present but a plain user key (no F_SUBDATA): a name collision.
+            Some(_) => Err(Error::Mdb(MdbError::Incompatible)),
+            None => Ok(None),
+        }
     }
 
     /// `non_free_pages_size()` (SPEC 00 row 19 — MUST; SPEC 05 GC-23/GC-24):
@@ -172,8 +274,10 @@ pub fn free_page_count<T: TxnRead>(txn: &T) -> Result<u64> {
     Ok(total)
 }
 
-/// A database handle. In Phase-1-so-far this only ever names the main/unnamed
-/// database; its root/stats come from the transaction passed to each method.
+/// A database handle: the main/unnamed DB or a named DB (a [`DbSel`]). Its
+/// root/stats come from the transaction passed to each method (resolved lazily
+/// from the catalog for named DBs, SPEC 04 TXN-10). `Copy`, like
+/// `heed::Database`.
 ///
 /// **Key-size validation is intentionally lenient on the read side.** Read
 /// methods are pure tree searches: an empty or oversized key is not rejected,
@@ -185,19 +289,66 @@ pub fn free_page_count<T: TxnRead>(txn: &T) -> Result<u64> {
 /// proof relies on the key bound.
 #[derive(Debug, Clone, Copy)]
 pub struct Database {
-    _priv: (),
+    sel: DbSel,
 }
 
-/// The main DB's tree view over any readable txn (shared by the read API and
-/// the write cursor).
+/// Per-database statistics (`Database::stat`, SPEC 00 row 49; `mdb_stat`).
+/// Mirrors `heed::DatabaseStat`. Page counts are ZeroDB-format specific;
+/// `entries` and `depth` carry the same meaning as LMDB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DatabaseStat {
+    /// Tree height (0 = empty, 1 = root-is-leaf).
+    pub depth: u16,
+    /// Number of branch (internal) pages.
+    pub branch_pages: u64,
+    /// Number of leaf pages.
+    pub leaf_pages: u64,
+    /// Number of overflow pages (sum of all runs).
+    pub overflow_pages: u64,
+    /// Number of key/value entries.
+    pub entries: u64,
+}
+
+/// The main DB's tree view over any readable txn (a test helper; the sel-aware
+/// form is [`Database::tree`]).
+#[cfg(test)]
 pub(crate) fn tree_of<T: TxnRead + ?Sized>(txn: &T) -> Tree<'_> {
     let rec = txn.main_record();
     Tree::new(txn.source(), txn.page_size(), rec.root, rec.depth)
 }
 
 impl Database {
+    /// Construct a handle from a raw selector (used by the write path).
+    pub(crate) fn from_sel(sel: DbSel) -> Database {
+        Database { sel }
+    }
+
+    /// This handle's selector (used by the write path to pick the target tree).
+    pub(crate) fn sel(&self) -> DbSel {
+        self.sel
+    }
+
     pub(crate) fn tree<'txn, T: TxnRead + ?Sized>(&self, txn: &'txn T) -> Tree<'txn> {
-        tree_of(txn)
+        let rec = txn.record_for(self.sel);
+        Tree::new(txn.source(), txn.page_size(), rec.root, rec.depth)
+    }
+
+    /// `stat(txn)` (SPEC 00 row 49): depth, page counts, and entry count of
+    /// this database, read from its `DBRecord` (maintained by the write path
+    /// and verified against a full walk by [`crate::check`]).
+    ///
+    /// # Errors
+    ///
+    /// Infallible; returns [`Result`] for API shape and future fallibility.
+    pub fn stat<T: TxnRead>(&self, txn: &T) -> Result<DatabaseStat> {
+        let rec = txn.record_for(self.sel);
+        Ok(DatabaseStat {
+            depth: rec.depth,
+            branch_pages: rec.branch_pages,
+            leaf_pages: rec.leaf_pages,
+            overflow_pages: rec.overflow_pages,
+            entries: rec.entries,
+        })
     }
 
     /// `get(txn, key)` (SPEC 00 row 30): the value for `key`, or `Ok(None)` if
@@ -217,7 +368,7 @@ impl Database {
     ///
     /// Infallible; returns [`Result`] for API shape.
     pub fn len<T: TxnRead>(&self, txn: &T) -> Result<u64> {
-        Ok(txn.main_record().entries)
+        Ok(txn.record_for(self.sel).entries)
     }
 
     /// `is_empty(txn)` (SPEC 00 row 40).
@@ -226,7 +377,7 @@ impl Database {
     ///
     /// Infallible; returns [`Result`] for API shape.
     pub fn is_empty<T: TxnRead>(&self, txn: &T) -> Result<bool> {
-        Ok(txn.main_record().entries == 0)
+        Ok(txn.record_for(self.sel).entries == 0)
     }
 
     /// `first(txn)` — the minimum entry (SPEC 00 row 41).

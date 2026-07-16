@@ -31,7 +31,7 @@ mod tree;
 
 pub use crc32c::crc32c;
 pub use header::{CommonHeader, PageRef};
-pub use meta::{select as select_meta, DBRecord, MetaChoice, MetaPage, MetaValidity};
+pub use meta::{select as select_meta, DBRecord, MetaChoice, MetaPage, MetaValidity, DBRECORD_LEN};
 pub use overflow::{write_overflow_head, OverflowRef};
 pub use tree::{BranchMut, BranchRef, LeafMut, LeafRef, LeafValue};
 

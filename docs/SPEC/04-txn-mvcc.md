@@ -681,6 +681,7 @@ every hook; this section defines the steps and their ordering. Both write modes
   | # | Step | Hook after | What is on disk if we crash here |
   |---|------|-----------|----------------------------------|
   | C0 | Assert `child_count == 0`; compute freed-page list. | — | last committed meta `N−1` (unchanged). |
+  | C1a | **catalog write-back** (M1.6, SPEC 02 §6.1): write each dirty named-DB working record back into the main tree as its `F_SUBDATA` catalog entry. Before `freelist_save` (matches LMDB's sub-DB flush order) so the pages this COWs/frees are captured by C1. | — | `N−1` (all changes still in the dirty set). |
   | C1 | **freelist_save** (SPEC 05 §4): write this txn's freed pages into the GC DB, dirtying GC pages into the dirty set (loop-until-stable, SPEC 05 GC-11). | H0 | `N−1` (all changes still in dirty set, nothing written). |
   | C2 | **write dirty pages** to their pgnos (`pwrite` each dirty frame / `msync` region under WRITE_MAP). Not yet durable. | **H1** | `N−1` live; new pages sit in free/beyond-HWM slots the `N−1` tree does not reference (TXN-62). Partial/torn data pages are unreferenced garbage. |
   | C3 | **fsync(data)** — flush all data pages (skipped under `NO_SYNC`/`MAP_ASYNC`, SPEC 06 REC-6). | **H2** | `N−1` live; txn `N`'s data fully durable but unreferenced (no meta points at it). |

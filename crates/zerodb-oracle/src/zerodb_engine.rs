@@ -1,17 +1,20 @@
 //! The native [`Engine`] backed by the `zerodb` crate.
 //!
-//! ## Milestone scope (M1.4 — real write path)
+//! ## Milestone scope (M1.6 — named databases and the catalog)
 //!
-//! The M1.3 rebuild-world-on-commit shadow is **gone**: every write op runs
-//! zerodb's real COW write path (`RwTxn`), `Commit` runs the real C0–C6 commit
-//! pipeline, and reads inside a write txn go through the dirty-frame source
-//! (SPEC 04 TXN-38). The `iter_mut` cursor-mutation ops (`put_current` /
-//! `del_current`) are differential from this milestone on.
+//! Named DBs and `DropDb` are now differential (previously gated out): the
+//! engine holds real [`zerodb::Database`] handles created via
+//! [`zerodb::Env::create_database`], resolved from the shared `dbs` table by
+//! index exactly as [`crate::LmdbEngine`] does, so the two engines exercise
+//! identical multi-DB workloads. Reads/writes target the resolved handle;
+//! `VerifyGet` opens the DB in a fresh read txn via
+//! [`zerodb::Env::open_database`]. Still gated out (M1.9): nested read txns.
 //!
-//! In debug builds (which includes `cargo fuzz`'s default), every successful
-//! commit re-reads `zerodb.dat` and runs the SPEC 03 §11 invariant walk
-//! ([`zerodb::check::check_image`]); a violation panics with the INV ids —
-//! PLAN §1.4's "tree invariant checker passes after every fuzz run".
+//! Earlier scope carries over: every write op runs zerodb's real COW write
+//! path, `Commit` runs the real C0–C6 pipeline (now incl. the C1a catalog
+//! write-back, SPEC 02 §6), and in debug builds every successful commit re-reads
+//! `zerodb.dat` and runs the SPEC 03 §11 + M1.6 catalog invariant walk
+//! ([`zerodb::check::check_image`]).
 //!
 //! ## Transaction storage (the sanctioned unsafe, as in [`crate::LmdbEngine`])
 //!
@@ -22,15 +25,11 @@
 //! are stated at each site and mirror the `LmdbEngine` construction exactly
 //! (CLAUDE.md unsafe policy: confined to this test-only oracle crate).
 //!
-//! Scoped **out** (gated via [`Engine::implements`], symmetric on both
-//! engines): named databases + `DropDb` (M1.6), nested read txns (M1.9).
-//!
 //! **Key-size taxonomy split** (SPEC 03 §2.1): zerodb-core's *write* path
 //! validates keys itself (`put*` → `BadValSize`); the *read/del* leniency
-//! differences are LMDB API-boundary behaviors applied here (empty read key →
-//! `BadValSize`, etc.), exactly as in M1.3.
+//! differences are LMDB API-boundary behaviors applied here.
 
-use zerodb::{check, Env, EnvOpenOptions, Error, MdbError, PutFlags, RoTxn, RwTxn};
+use zerodb::{check, Database, Env, EnvOpenOptions, Error, MdbError, PutFlags, RoTxn, RwTxn};
 
 use crate::result::{OpResult, OracleError, Skip};
 use crate::tempdir::TempDir;
@@ -40,8 +39,28 @@ use crate::{DbName, Engine, Op, PutFlag};
 const BASE_MAP_SIZE: usize = crate::DIFF_MAP_SIZE;
 /// DB page size (Phase 1 exposes no heed selector; 4 KiB).
 const PAGE_SIZE: u32 = 4096;
-/// Catalog capacity (stored; consumed when named DBs land in M1.6).
+/// Catalog capacity: unnamed + `db0`..`db3` plus slack (matches `LmdbEngine`).
 const MAX_DBS: u32 = 16;
+
+/// Run a read expression `$body` (with the serving txn bound to `$t`) against
+/// whichever transaction serves reads, or skip. A macro (not a `&dyn` helper)
+/// so the generic `Database` read methods monomorphize over the concrete
+/// `&RwTxn` / `&RoTxn` types (`TxnRead` is used generically, not as an object).
+macro_rules! with_read {
+    ($active:expr, |$t:ident| $body:expr) => {
+        match &$active {
+            Active::Rw(w) => {
+                let $t = &**w;
+                $body
+            }
+            Active::Ro(r) => {
+                let $t = r;
+                $body
+            }
+            Active::None => OpResult::Skipped(Skip::NoTxn),
+        }
+    };
+}
 
 /// The currently-open transaction, if any.
 ///
@@ -53,14 +72,22 @@ enum Active {
     Ro(RoTxn<'static>),
 }
 
+/// A database handle plus the catalog name it was opened under (mirrors
+/// `LmdbEngine::DbEntry`).
+struct DbEntry {
+    name: Option<String>,
+    db: Database,
+}
+
 /// The native engine under differential test.
 ///
 /// Field order is load-bearing for `Drop`: `active` (transactions) before
 /// `env` before `dir`.
 pub struct ZerodbEngine {
     active: Active,
-    /// Open database names in creation order (only the unnamed DB until M1.6).
-    dbs: Vec<Option<String>>,
+    /// Open databases in creation order (index = the op's `db` selector, taken
+    /// modulo the length — identical addressing to `LmdbEngine`).
+    dbs: Vec<DbEntry>,
     /// Databases known committed (survive an abort).
     committed_dbs: usize,
     /// `Box` gives the `Env` a stable heap address that survives moves of the
@@ -72,24 +99,6 @@ pub struct ZerodbEngine {
     /// every txn boundary.
     cleared_in_txn: bool,
     dir: TempDir,
-}
-
-/// Run a read closure against whichever txn serves reads, or skip.
-macro_rules! with_read {
-    ($self:ident, |$t:ident, $db:ident| $body:expr) => {{
-        let $db = $self.env().main_database();
-        match &$self.active {
-            Active::Rw(w) => {
-                let $t = &**w;
-                $body
-            }
-            Active::Ro(r) => {
-                let $t = r;
-                $body
-            }
-            Active::None => OpResult::Skipped(Skip::NoTxn),
-        }
-    }};
 }
 
 impl ZerodbEngine {
@@ -128,14 +137,25 @@ impl ZerodbEngine {
         }
     }
 
-    fn db_name_at(&self, db: u8) -> Option<String> {
-        let n = self.dbs.len();
-        self.dbs[db as usize % n].clone()
+    /// Resolve a db index (modulo the number of open dbs) to a handle.
+    fn db_at(&self, db: u8) -> Result<Database, OpResult> {
+        if self.dbs.is_empty() {
+            return Err(OpResult::Skipped(Skip::NoDb));
+        }
+        Ok(self.dbs[db as usize % self.dbs.len()].db)
+    }
+
+    /// Resolve a db index to the catalog name it was opened under.
+    fn db_name_at(&self, db: u8) -> Option<Option<String>> {
+        if self.dbs.is_empty() {
+            None
+        } else {
+            Some(self.dbs[db as usize % self.dbs.len()].name.clone())
+        }
     }
 
     /// In debug builds, verify the committed on-disk image against the
-    /// SPEC 03 §11 invariant walk (minus INV-10, the sanctioned M1.4 leak
-    /// window — ADR-0004 OQ4).
+    /// SPEC 03 §11 + M1.6 catalog invariant walk.
     fn debug_check_image(&self) {
         #[cfg(debug_assertions)]
         {
@@ -264,22 +284,41 @@ impl ZerodbEngine {
     // -- databases -------------------------------------------------------------
 
     fn create_db(&mut self, name: &DbName) -> OpResult {
-        // Only the unnamed DB is in scope (named gated out): the main DB
-        // always exists in zerodb, so this only tracks the handle.
+        let resolved = name.resolve();
+        // Reuse an already-open handle for this name (idempotent open).
+        if self.dbs.iter().any(|e| e.name == resolved) {
+            return match self.write_txn() {
+                Ok(_) => OpResult::Ok,
+                Err(skip) => skip,
+            };
+        }
         if let Err(skip) = self.write_txn() {
             return skip;
         }
-        let resolved = name.resolve();
-        if !self.dbs.iter().any(|n| n == &resolved) {
-            self.dbs.push(resolved);
+        // Reborrow env + txn together (disjoint fields).
+        let created = {
+            let env = self.env.as_ref().expect("env present").as_ref();
+            let wtxn = match &mut self.active {
+                Active::Rw(w) => w,
+                _ => unreachable!("write_txn() checked above"),
+            };
+            env.create_database(wtxn, resolved.as_deref().map(str::as_bytes))
+        };
+        match created {
+            Ok(db) => {
+                self.dbs.push(DbEntry { name: resolved, db });
+                OpResult::Ok
+            }
+            Err(e) => OpResult::Err(to_oracle(e)),
         }
-        OpResult::Ok
     }
 
     fn clear_db(&mut self, db: u8) -> OpResult {
         self.cleared_in_txn = true; // FORK-1 guard fact
-        let _name = self.db_name_at(db);
-        let dbh = self.env().main_database();
+        let dbh = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
         let wtxn = match self.write_txn() {
             Ok(w) => w,
             Err(r) => return r,
@@ -290,11 +329,35 @@ impl ZerodbEngine {
         }
     }
 
+    fn drop_db(&mut self, db: u8) -> OpResult {
+        if self.dbs.is_empty() {
+            return OpResult::Skipped(Skip::NoDb);
+        }
+        let idx = db as usize % self.dbs.len();
+        let handle = self.dbs[idx].db;
+        let wtxn = match self.write_txn() {
+            Ok(w) => w,
+            Err(r) => return r,
+        };
+        match handle.drop_db(wtxn) {
+            Ok(()) => {
+                self.dbs.remove(idx);
+                if self.committed_dbs > self.dbs.len() {
+                    self.committed_dbs = self.dbs.len();
+                }
+                OpResult::Ok
+            }
+            Err(e) => OpResult::Err(to_oracle(e)),
+        }
+    }
+
     // -- writes ------------------------------------------------------------------
 
     fn put(&mut self, db: u8, key: &[u8], val: &[u8]) -> OpResult {
-        let _name = self.db_name_at(db);
-        let dbh = self.env().main_database();
+        let dbh = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
         let wtxn = match self.write_txn() {
             Ok(w) => w,
             Err(r) => return r,
@@ -306,12 +369,14 @@ impl ZerodbEngine {
     }
 
     fn put_flagged(&mut self, db: u8, key: &[u8], val: &[u8], flag: PutFlag) -> OpResult {
-        let _name = self.db_name_at(db);
         let flags = match flag {
             PutFlag::Append => PutFlags::APPEND,
             PutFlag::NoOverwrite => PutFlags::NO_OVERWRITE,
         };
-        let dbh = self.env().main_database();
+        let dbh = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
         let wtxn = match self.write_txn() {
             Ok(w) => w,
             Err(r) => return r,
@@ -323,8 +388,10 @@ impl ZerodbEngine {
     }
 
     fn put_reserved(&mut self, db: u8, key: &[u8], val: &[u8]) -> OpResult {
-        let _name = self.db_name_at(db);
-        let dbh = self.env().main_database();
+        let dbh = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
         let wtxn = match self.write_txn() {
             Ok(w) => w,
             Err(r) => return r,
@@ -341,8 +408,10 @@ impl ZerodbEngine {
         if let Some(e) = bad_read_key(key) {
             return e;
         }
-        let _name = self.db_name_at(db);
-        let dbh = self.env().main_database();
+        let dbh = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
         let wtxn = match self.write_txn() {
             Ok(w) => w,
             Err(r) => return r,
@@ -356,8 +425,10 @@ impl ZerodbEngine {
     // -- in-place cursor mutation (iter_mut, SPEC 03 §7) -------------------------
 
     fn iter_mut_put(&mut self, db: u8, nth: u8, val: &[u8]) -> OpResult {
-        let _name = self.db_name_at(db);
-        let dbh = self.env().main_database();
+        let dbh = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
         let wtxn = match self.write_txn() {
             Ok(w) => w,
             Err(r) => return r,
@@ -377,8 +448,10 @@ impl ZerodbEngine {
     }
 
     fn iter_mut_del(&mut self, db: u8, nth: u8) -> OpResult {
-        let _name = self.db_name_at(db);
-        let dbh = self.env().main_database();
+        let dbh = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
         let wtxn = match self.write_txn() {
             Ok(w) => w,
             Err(r) => return r,
@@ -403,32 +476,44 @@ impl ZerodbEngine {
         if let Some(e) = bad_read_key(key) {
             return e;
         }
-        let _name = self.db_name_at(db);
-        with_read!(self, |t, dbh| match dbh.get(t, key) {
+        let dbh = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
+        with_read!(self.active, |t| match dbh.get(t, key) {
             Ok(v) => OpResult::MaybeVal(v.map(<[u8]>::to_vec)),
             Err(e) => OpResult::Err(to_oracle(e)),
         })
     }
 
     fn len(&self, db: u8) -> OpResult {
-        let _name = self.db_name_at(db);
-        with_read!(self, |t, dbh| match dbh.len(t) {
+        let dbh = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
+        with_read!(self.active, |t| match dbh.len(t) {
             Ok(n) => OpResult::Count(n),
             Err(e) => OpResult::Err(to_oracle(e)),
         })
     }
 
     fn is_empty(&self, db: u8) -> OpResult {
-        let _name = self.db_name_at(db);
-        with_read!(self, |t, dbh| match dbh.is_empty(t) {
+        let dbh = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
+        with_read!(self.active, |t| match dbh.is_empty(t) {
             Ok(b) => OpResult::Bool(b),
             Err(e) => OpResult::Err(to_oracle(e)),
         })
     }
 
     fn first_last(&self, db: u8, last: bool) -> OpResult {
-        let _name = self.db_name_at(db);
-        with_read!(self, |t, dbh| {
+        let dbh = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
+        with_read!(self.active, |t| {
             let r = if last { dbh.last(t) } else { dbh.first(t) };
             match r {
                 Ok(e) => OpResult::MaybeEntry(e.map(|(k, v)| (k.to_vec(), v.to_vec()))),
@@ -441,8 +526,11 @@ impl ZerodbEngine {
         if let Some(e) = bad_seek_key(key) {
             return e;
         }
-        let _name = self.db_name_at(db);
-        with_read!(self, |t, dbh| {
+        let dbh = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
+        with_read!(self.active, |t| {
             let r = match kind {
                 Seek::Ge => dbh.get_greater_than_or_equal_to(t, key),
                 Seek::Gt => dbh.get_greater_than(t, key),
@@ -456,8 +544,11 @@ impl ZerodbEngine {
     }
 
     fn iter(&self, db: u8, rev: bool) -> OpResult {
-        let _name = self.db_name_at(db);
-        with_read!(self, |t, dbh| {
+        let dbh = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
+        with_read!(self.active, |t| {
             let it = if rev { dbh.rev_iter(t) } else { dbh.iter(t) };
             collect_iter(it)
         })
@@ -467,8 +558,11 @@ impl ZerodbEngine {
         if let Some(e) = bad_prefix_key(prefix, rev) {
             return e;
         }
-        let _name = self.db_name_at(db);
-        with_read!(self, |t, dbh| {
+        let dbh = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
+        with_read!(self.active, |t| {
             let it = if rev {
                 dbh.rev_prefix_iter(t, prefix)
             } else {
@@ -480,17 +574,34 @@ impl ZerodbEngine {
 
     fn verify_get(&self, db: u8, key: &[u8]) -> OpResult {
         // A fresh independent read txn: sees only committed state, regardless
-        // of any active txn (readers never block on the writer, TXN-9).
-        if let Some(e) = bad_read_key(key) {
-            return e;
-        }
-        let _name = self.db_name_at(db);
+        // of any active txn (readers never block on the writer, TXN-9). The DB
+        // is resolved by name through `open_database` — a committed catalog
+        // lookup, matching `LmdbEngine::verify_get`.
+        //
+        // Ordering matters (found by the M1.6 differential): LMDB resolves and
+        // **opens** the DB before any key-size check, so an uncommitted /
+        // dropped name returns `None` regardless of the key. The empty-read-key
+        // boundary shim (§2.1) must therefore be applied only once the DB
+        // opens — at the `get`, exactly where LMDB's `mdb_get` would hit it.
+        let name = match self.db_name_at(db) {
+            Some(n) => n,
+            None => return OpResult::Skipped(Skip::NoDb),
+        };
         let env = self.env();
         let rtxn = match env.read_txn() {
             Ok(t) => t,
             Err(e) => return OpResult::Err(to_oracle(e)),
         };
-        match env.main_database().get(&rtxn, key) {
+        let dbh = match env.open_database(&rtxn, name.as_deref().map(str::as_bytes)) {
+            Ok(Some(d)) => d,
+            // Not yet committed (or dropped): nothing visible, key irrelevant.
+            Ok(None) => return OpResult::MaybeVal(None),
+            Err(e) => return OpResult::Err(to_oracle(e)),
+        };
+        if let Some(e) = bad_read_key(key) {
+            return e;
+        }
+        match dbh.get(&rtxn, key) {
             Ok(v) => OpResult::MaybeVal(v.map(<[u8]>::to_vec)),
             Err(e) => OpResult::Err(to_oracle(e)),
         }
@@ -549,7 +660,9 @@ fn bad_seek_key(key: &[u8]) -> Option<OpResult> {
 }
 
 /// Map a `zerodb::Error` into the oracle's normalized taxonomy (matching
-/// [`crate::LmdbEngine`]'s mapping so error kinds compare equal).
+/// [`crate::LmdbEngine`]'s mapping so error kinds compare equal). `DbsFull` and
+/// `Incompatible` fall through to `Other("mdb:DbsFull"/"mdb:Incompatible")`,
+/// the same string `heed`'s mapping produces for its identical variants.
 fn to_oracle(e: Error) -> OracleError {
     match e {
         Error::Mdb(m) => match m {
@@ -591,10 +704,8 @@ impl Engine for ZerodbEngine {
 
     fn implements(&self, op: &Op) -> bool {
         match op {
-            // Out of scope, gated symmetrically: named DBs + DropDb (M1.6),
-            // nested read txns (M1.9).
-            Op::CreateDb { name } => matches!(name, DbName::Unnamed),
-            Op::BeginNestedRo | Op::EndNestedRo | Op::DropDb { .. } => false,
+            // Out of scope, gated symmetrically: nested read txns (M1.9).
+            Op::BeginNestedRo | Op::EndNestedRo => false,
             _ => true,
         }
     }
@@ -619,6 +730,7 @@ impl Engine for ZerodbEngine {
 
             Op::CreateDb { name } => self.create_db(name),
             Op::ClearDb { db } => self.clear_db(*db),
+            Op::DropDb { db } => self.drop_db(*db),
 
             Op::Get { db, key } => self.get(*db, &key.0),
             Op::Put { db, key, val } => self.put(*db, &key.0, &val.0),
@@ -646,9 +758,7 @@ impl Engine for ZerodbEngine {
             Op::VerifyGet { db, key } => self.verify_get(*db, &key.0),
 
             // Gated out by `implements`; never reached in a differential run.
-            Op::BeginNestedRo | Op::EndNestedRo | Op::DropDb { .. } => {
-                OpResult::Skipped(Skip::NotImplemented)
-            }
+            Op::BeginNestedRo | Op::EndNestedRo => OpResult::Skipped(Skip::NotImplemented),
         }
     }
 }

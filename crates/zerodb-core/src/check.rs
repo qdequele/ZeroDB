@@ -14,8 +14,9 @@ use std::collections::{HashMap, HashSet};
 
 use crate::page::geometry::{gc_key_decode, overflow_page_count};
 use crate::page::{
-    select_meta, DBRecord, LeafValue, MetaPage, OverflowRef, PageRef, PageType, FIRST_DATA_PGNO,
-    MAX_KEY_SIZE, MIN_KEYS_BRANCH, MIN_KEYS_LEAF, PGNO_INVALID,
+    select_meta, DBRecord, LeafValue, MetaPage, OverflowRef, PageRef, PageType, DBRECORD_LEN,
+    FIRST_DATA_PGNO, F_SUBDATA, MAX_DB_NAME, MAX_KEY_SIZE, MIN_KEYS_BRANCH, MIN_KEYS_LEAF,
+    PGNO_INVALID,
 };
 
 /// Accumulated walk statistics, compared against a `DBRecord` (INV-18).
@@ -114,6 +115,7 @@ impl<'a> Checker<'a> {
         high: Option<&[u8]>,
         stats: &mut WalkStats,
         gc_tree: bool,
+        catalog: bool,
     ) {
         let Some(page) = self.visit(pgno, if gc_tree { "GC" } else { "tree" }) else {
             return;
@@ -138,6 +140,9 @@ impl<'a> Checker<'a> {
                     );
                 }
                 let mut prev: Option<&[u8]> = None;
+                // Named-DB catalog entries found on this leaf (main tree only);
+                // their sub-trees are walked after the `leaf` borrow ends.
+                let mut subdbs: Vec<(Vec<u8>, DBRecord)> = Vec::new();
                 for i in 0..leaf.num_keys() {
                     stats.entries += 1;
                     let k = leaf.key(i);
@@ -163,15 +168,59 @@ impl<'a> Checker<'a> {
                         }
                     }
                     prev = Some(k);
+                    let is_subdata = leaf.node_flags(i) & F_SUBDATA != 0;
                     match leaf.value(i) {
-                        LeafValue::Inline(_) => {}
+                        LeafValue::Inline(v) => {
+                            // Catalog entry (SPEC 02 §6): an `F_SUBDATA` value is
+                            // a 48-byte sub-DB record on the main tree only.
+                            if is_subdata {
+                                if !catalog {
+                                    self.fail(
+                                        "INV-21",
+                                        format!(
+                                            "leaf {pgno} entry {i}: F_SUBDATA outside the main catalog"
+                                        ),
+                                    );
+                                } else if k.len() > MAX_DB_NAME {
+                                    self.fail(
+                                        "INV-12",
+                                        format!("catalog {pgno} entry {i}: DB name too long"),
+                                    );
+                                } else if let Some(rec) = DBRecord::from_bytes(v) {
+                                    subdbs.push((k.to_vec(), rec));
+                                } else {
+                                    self.fail(
+                                        "INV-21",
+                                        format!(
+                                            "catalog {pgno} entry {i}: F_SUBDATA value is {} bytes, not {DBRECORD_LEN}",
+                                            v.len()
+                                        ),
+                                    );
+                                }
+                            }
+                        }
                         LeafValue::Overflow { head_pgno, dsize } => {
+                            if is_subdata {
+                                self.fail(
+                                    "INV-21",
+                                    format!("catalog {pgno} entry {i}: sub-DB record on overflow"),
+                                );
+                            }
                             self.check_overflow(pgno, head_pgno, dsize, stats);
                         }
                     }
                     if gc_tree {
                         self.check_gc_entry(pgno, k, leaf.value(i));
                     }
+                }
+                // Walk each named-DB sub-tree: its pages join `visited`
+                // (reachable-XOR-free) and its stats are validated against its
+                // own record (INV-18) — check.rs coverage extends to every DB
+                // (M1.6). `leaf` borrows the immutable image (not `&mut self`),
+                // so these `&mut self` calls are sound while it is in scope.
+                for (name, rec) in subdbs {
+                    let label = format!("subdb {:?}", String::from_utf8_lossy(&name));
+                    self.check_record(&label, &rec, false);
                 }
             }
             PageType::Branch => {
@@ -205,7 +254,16 @@ impl<'a> Checker<'a> {
                             self.fail("INV-6", format!("branch {pgno} separators not ascending"));
                         }
                     }
-                    self.walk(children[i], level - 1, false, lo, hi, stats, gc_tree);
+                    self.walk(
+                        children[i],
+                        level - 1,
+                        false,
+                        lo,
+                        hi,
+                        stats,
+                        gc_tree,
+                        catalog,
+                    );
                 }
             }
             other => {
@@ -357,7 +415,20 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Validate a `DBRecord` (`name` labels it in violation messages) and walk
+    /// its tree. `gc_tree` marks the free/GC DB; `catalog` marks the main DB
+    /// (so its `F_SUBDATA` leaf entries are followed as named-DB records,
+    /// SPEC 02 §6, M1.6). A named DB's own tree is neither (`catalog = false`).
     fn check_record(&mut self, name: &str, rec: &DBRecord, gc_tree: bool) {
+        self.check_record_inner(name, rec, gc_tree, false);
+    }
+
+    /// The main catalog DB: `catalog = true` so `F_SUBDATA` entries are walked.
+    fn check_catalog_record(&mut self, name: &str, rec: &DBRecord) {
+        self.check_record_inner(name, rec, false, true);
+    }
+
+    fn check_record_inner(&mut self, name: &str, rec: &DBRecord, gc_tree: bool, catalog: bool) {
         // INV-19 root shape.
         if rec.depth == 0 && rec.root != PGNO_INVALID {
             self.fail("INV-19", format!("{name}: depth 0 but root {}", rec.root));
@@ -378,7 +449,9 @@ impl<'a> Checker<'a> {
                 (1, Some(PageType::Leaf)) | (2.., Some(PageType::Branch)) => {}
                 (d, t) => self.fail("INV-19", format!("{name}: depth {d} but root is {t:?}")),
             }
-            self.walk(rec.root, rec.depth, true, None, None, &mut stats, gc_tree);
+            self.walk(
+                rec.root, rec.depth, true, None, None, &mut stats, gc_tree, catalog,
+            );
         }
         // INV-18 stat accuracy.
         let expect = WalkStats {
@@ -445,7 +518,7 @@ pub fn check_image(bytes: &[u8], psize: u32) -> Vec<String> {
         free: HashMap::new(),
         violations,
     };
-    checker.check_record("main_db", &meta.main_db, false);
+    checker.check_catalog_record("main_db", &meta.main_db);
     checker.check_record("free_db", &meta.free_db, true);
     // INV-10 / INV-22 + INV-24 (reachable XOR free, unconditional since M1.5).
     checker.check_reachable_xor_free();

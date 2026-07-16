@@ -209,6 +209,49 @@ fn next_env_id() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Named-DB registry (the dbi table, SPEC 02 §6, SPEC 04 TXN-10; M1.6)
+// ---------------------------------------------------------------------------
+
+/// The env-level named-database registry — ZeroDB's analogue of LMDB's
+/// `me_dbxs` array (the stable dbi ↔ name mapping). A named `Database` handle
+/// carries a small integer *dbi index* into `names`; the record itself always
+/// resolves lazily from the transaction's catalog view (the main tree; SPEC 04
+/// TXN-10 step 3), so this table maps **only** dbi → name, never dbi → root.
+///
+/// **Assignment is append-only within a process** (an interim simplification,
+/// like the M1.5 reader registry). LMDB frees a dbi when the txn that opened it
+/// aborts; ZeroDB keeps the slot and re-uses it on a later open of the same
+/// name (`by_name`). This is **unobservable** through the heed/SPEC-00 surface:
+/// resolution is always catalog-driven, so a handle whose creation was aborted
+/// resolves to *absent* (its catalog entry was discarded with the dirty set),
+/// and re-creating the name re-uses the same dbi. The only theoretical effect
+/// is that `max_dbs` counts distinct names ever seen (incl. aborted) rather
+/// than currently-live ones, so `DbsFull` could fire one creation early after
+/// `max_dbs` *distinct* aborted-and-never-reused names — a case no consumer and
+/// no oracle sequence produces (names are a bounded reused set). The full dbi
+/// lifecycle (abort-frees-slot) lands with the M1.8 reader/handle rework.
+#[derive(Debug)]
+struct NamedRegistry {
+    /// dbi index → name. Append-only; index is the `DbSel::Named` payload.
+    names: Vec<Box<[u8]>>,
+    /// name → dbi index, for `open`/`create` lookup.
+    by_name: HashMap<Box<[u8]>, u32>,
+    /// Catalog capacity (number of **named** DBs; the main DB is not counted,
+    /// matching LMDB's `mdb_env_set_maxdbs` semantics).
+    max_dbs: u32,
+}
+
+impl NamedRegistry {
+    fn new(max_dbs: u32) -> NamedRegistry {
+        NamedRegistry {
+            names: Vec::new(),
+            by_name: HashMap::new(),
+            max_dbs,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // EnvInner / Env
 // ---------------------------------------------------------------------------
 
@@ -272,6 +315,9 @@ pub struct EnvInner {
     /// replaced wholesale by the M1.8 lock-free reader table (TXN-20), whose
     /// only consumer is the same gate expression.
     readers: Mutex<std::collections::BTreeMap<u64, usize>>,
+    /// The named-DB registry (the dbi table, SPEC 02 §6; M1.6). Guards the
+    /// dbi ↔ name mapping only — records resolve from the catalog (TXN-10).
+    named: Mutex<NamedRegistry>,
 }
 
 impl std::fmt::Debug for EnvInner {
@@ -432,6 +478,37 @@ impl EnvInner {
             .keys()
             .next()
             .copied()
+    }
+
+    /// The dbi index for `name`, assigning a fresh one if absent (SPEC 02 §6).
+    /// Returns `None` when the catalog is full (`DbsFull`): the number of
+    /// distinct named DBs has reached `max_dbs`.
+    #[must_use]
+    pub(crate) fn named_dbi_assign(&self, name: &[u8]) -> Option<u32> {
+        let mut r = self.named.lock().expect("named registry poisoned");
+        if let Some(&dbi) = r.by_name.get(name) {
+            return Some(dbi);
+        }
+        if r.names.len() as u64 >= u64::from(r.max_dbs) {
+            return None;
+        }
+        let dbi = r.names.len() as u32;
+        let boxed: Box<[u8]> = name.into();
+        r.names.push(boxed.clone());
+        r.by_name.insert(boxed, dbi);
+        Some(dbi)
+    }
+
+    /// The name for a named-DB dbi index (`DbSel::Named`), if the index is
+    /// assigned. Cloned out so no registry lock is held by the caller.
+    #[must_use]
+    pub(crate) fn named_name(&self, dbi: u32) -> Option<Box<[u8]>> {
+        self.named
+            .lock()
+            .expect("named registry poisoned")
+            .names
+            .get(dbi as usize)
+            .cloned()
     }
 
     /// Whether this env was opened on the previous (older) snapshot.
@@ -685,6 +762,7 @@ pub fn open_with_backing(
     page_size: u32,
     map_size: u64,
     prev_snapshot: bool,
+    max_dbs: u32,
 ) -> Result<Env, Error> {
     // Validate the two meta slots from the mapped bytes (SPEC 02 §3.2). A
     // decode error here (bad page size / truncated buffer) means the file is not
@@ -728,6 +806,7 @@ pub fn open_with_backing(
         commit_hook: Mutex::new(None),
         poisoned: AtomicBool::new(false),
         readers: Mutex::new(std::collections::BTreeMap::new()),
+        named: Mutex::new(NamedRegistry::new(max_dbs)),
         meta,
         prev_snapshot,
         closing,
@@ -818,7 +897,16 @@ pub mod testutil {
             meta.encode(&mut buf[base..base + ps]).expect("valid meta");
         }
         let path = PathBuf::from(format!("/virtual/mem-env-{}", next_env_id()));
-        match open_with_backing(path, Box::new(VecBacking(buf)), page_size, map_size, false) {
+        // A generous named-DB capacity for tests (real envs pass the caller's
+        // `max_dbs`; SPEC 02 §6 / M1.6).
+        match open_with_backing(
+            path,
+            Box::new(VecBacking(buf)),
+            page_size,
+            map_size,
+            false,
+            128,
+        ) {
             Ok(env) => env,
             Err(Error::Io(e)) => panic!("mem_env open failed: {e}"),
             Err(e) => panic!("mem_env open failed: {e}"),
@@ -859,7 +947,7 @@ mod tests {
     }
 
     fn open(buf: Vec<u8>, prev: bool, path: PathBuf) -> Result<Env, Error> {
-        open_with_backing(path, Box::new(VecBacking(buf)), PS, MAP, prev)
+        open_with_backing(path, Box::new(VecBacking(buf)), PS, MAP, prev, 128)
     }
 
     #[test]
