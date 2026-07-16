@@ -554,6 +554,31 @@ impl<'a> Cursor<'a> {
     pub fn get_current(&self) -> PosResult<'a> {
         self.current()
     }
+
+    /// The leaf **node flags** of the entry at the current position (M1.12
+    /// tools/copy): lets `dump`/`copy_to_file` tell an `F_SUBDATA` named-DB
+    /// catalog record apart from a plain user-data key during an in-order scan
+    /// (SPEC 02 §6). `None` if unpositioned, at `EOF`, or parked past a leaf's
+    /// last entry — the same positions for which [`Cursor::get_current`] yields
+    /// `None`.
+    ///
+    /// # Errors
+    ///
+    /// A [`PageError`] only if the tree is structurally corrupt.
+    pub fn current_flags(&self) -> Result<Option<u16>, PageError> {
+        if !self.initialized || self.eof {
+            return Ok(None);
+        }
+        let (pgno, ki) = match self.stack.last() {
+            Some(f) => *f,
+            None => return Ok(None),
+        };
+        let leaf = self.page(pgno)?.as_leaf()?;
+        if ki >= leaf.num_keys() {
+            return Ok(None);
+        }
+        Ok(Some(leaf.node_flags(ki)))
+    }
 }
 
 // ---------------------------------------------------------------------------

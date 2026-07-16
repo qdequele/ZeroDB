@@ -141,6 +141,25 @@ impl RoTxn<'_> {
         self.snap.txnid
     }
 
+    /// The committed [`Snapshot`] this txn pins (roots + `last_pg`, SPEC 04
+    /// TXN-18). M1.12's `Env::copy_to_file` reads `last_pg`/`main_db`/`free_db`
+    /// from here to bound a raw range copy and to synthesize the copy's meta
+    /// pages.
+    #[must_use]
+    pub fn snapshot(&self) -> &Snapshot {
+        &self.snap
+    }
+
+    /// The whole mapped env file as bytes, borrowed for the txn's life
+    /// (SPEC 04 TXN-37). M1.12's non-compact `copy_to_file` copies the pinned
+    /// snapshot's pages directly from here; pages this snapshot references are
+    /// immutable while the txn's reader slot is held (TXN-20/21), so the copy
+    /// is torn-free for reachable pages.
+    #[must_use]
+    pub fn map_bytes(&self) -> &[u8] {
+        self.env_ref().inner().backing_bytes()
+    }
+
     /// The env this txn reads (borrowed or owned).
     fn env_ref(&self) -> &Env {
         match &self.env {
@@ -335,6 +354,54 @@ pub fn free_page_count<T: TxnRead>(txn: &T) -> Result<u64> {
         entry = cursor.next().map_err(map_page_err)?;
     }
     Ok(total)
+}
+
+/// One owned, flagged entry: `(key, leaf-node flags, value)` (M1.12 tools/copy).
+pub type FlaggedEntry = (Vec<u8>, u16, Vec<u8>);
+
+/// Collect every entry of the database `db` addresses, in key order, as owned
+/// bytes together with each entry's leaf **node flags** (M1.12 tools/copy).
+///
+/// The flags let a caller separate `F_SUBDATA` named-DB catalog records (which
+/// live inline on the **main** tree, SPEC 02 §6) from plain user data:
+/// `dump`/`copy_to_file` dump only the user entries of the main DB and follow
+/// the catalog entries into their own sub-DB sections. For any non-main DB (and
+/// for user keys) the flags are `0`.
+///
+/// Owned (not zero-copy) because the tool then re-encodes the bytes and the
+/// values may span overflow runs — a `Vec<u8>` per value is the natural shape.
+///
+/// # Errors
+///
+/// [`MdbError::Invalid`] on a structurally-corrupt tree.
+pub fn collect_entries_flagged<T: TxnRead>(db: &Database, txn: &T) -> Result<Vec<FlaggedEntry>> {
+    let tree = db.tree(txn);
+    let mut c = tree.cursor();
+    let mut out = Vec::new();
+    let mut e = c.first().map_err(map_page_err)?;
+    while let Some((k, v)) = e {
+        let flags = c.current_flags().map_err(map_page_err)?.unwrap_or(0);
+        out.push((k.to_vec(), flags, v.to_vec()));
+        e = c.next().map_err(map_page_err)?;
+    }
+    Ok(out)
+}
+
+/// The names of every named database, in key (name) order (M1.12 tools/copy):
+/// the `F_SUBDATA` catalog entries on the main tree (SPEC 02 §6). An env with
+/// no named DBs yields an empty list. Works over any readable txn: a committed
+/// `RoTxn`, or an `RwTxn`'s working catalog view.
+///
+/// # Errors
+///
+/// [`MdbError::Invalid`] on a structurally-corrupt main tree.
+pub fn named_databases<T: TxnRead>(txn: &T) -> Result<Vec<Vec<u8>>> {
+    let main = Database::from_sel(DbSel::Main);
+    Ok(collect_entries_flagged(&main, txn)?
+        .into_iter()
+        .filter(|(_, flags, _)| flags & F_SUBDATA != 0)
+        .map(|(k, _, _)| k)
+        .collect())
 }
 
 /// A database handle: the main/unnamed DB or a named DB (a [`DbSel`]). Its

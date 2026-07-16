@@ -75,8 +75,9 @@ Meilisearch does: `EnvOpenOptions::new().read_txn_without_tls()` (i.e. `MDB_NOTL
 `RoTxn: Send`), an explicit `map_size`, and `max_dbs`.
 
 **Scope of this dependency:** `heed` and any LMDB `*-sys` crate are permitted in
-**`zerodb-oracle` only**, and only for Phases 0–1. No other crate
-(`zerodb-core`, `zerodb-io`, `zerodb`, `heed-zerodb`, `zerodb-tools`) may depend
+**`zerodb-oracle` only** (and, per the M1.12 amendment below, in `zerodb-tools`
+behind an off-by-default feature), and only for Phases 0–1. No other crate
+(`zerodb-core`, `zerodb-io`, `zerodb`, `heed-zerodb`) may depend
 on `heed` or an LMDB sys crate during Phases 0–1. `heed-zerodb` (milestone 1.13)
 will depend on/replace heed per the milestone-0.5 integration ADR, not this one;
 the `fuzz/` crate (outside the workspace) additionally depends on `libfuzzer-sys 0.4`,
@@ -85,6 +86,24 @@ this ADR with the same oracle-only, test-infrastructure-only scope;
 that is a separate, human-approved decision. The oracle routes zerodb through its
 **native** API, never through `heed-zerodb` (PLAN.md §0.3); adapter-level parity
 is re-verified at the 1.14 gate.
+
+## Amendment (M1.12, 2026-07-17): `zerodb-tools` may link heed behind `migrate-lmdb`
+
+PLAN.md §1.12 sanctions the `migrate-from-lmdb` tool as "the one place linking C
+is fine" — it must open a **real** LMDB env read-only and stream it into a fresh
+zerodb env. That requires the same C library this ADR already blesses (heed
+=0.22.1 / lmdb-master-sys 0.2.6, the Meilisearch fork).
+
+**Amendment:** `zerodb-tools` MAY depend on `heed = "=0.22.1"` **only behind an
+off-by-default `migrate-lmdb` cargo feature**, and only for the `migrate-from-lmdb`
+subcommand's implementation. With the feature off (the default), `zerodb-tools`
+links no C and no heed — `stat`/`dump`/`load`/`check` and the shipped binary's
+default build are pure Rust over `zerodb`/`zerodb-core`. This keeps the C-linkage
+boundary explicit and opt-in, consistent with the oracle-only spirit of the
+original decision: the migrate path is a one-off operational tool, not part of
+the engine.
+
+Ratification: **session lead under standing directive 2026-07-17.**
 
 ## Consequences
 

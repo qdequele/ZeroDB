@@ -14,13 +14,20 @@
 
 use std::path::Path;
 
+mod copy;
+pub use copy::{CompactionOption, CopyToFile};
+
+pub use zerodb_core::builder::{build_multi_db_image, NamedDbData, DEFAULT_FILL_PERMILLE};
 pub use zerodb_core::check;
 pub use zerodb_core::env::{
     CommitHook, DurabilityFlags, Env, EnvClosingEvent, EnvInfo, HookPoint, Snapshot,
 };
 pub use zerodb_core::error::{Error, MdbError, Result};
 pub use zerodb_core::nested::NestedRoTxn;
-pub use zerodb_core::rotxn::{free_page_count, Database, DatabaseStat, RoRange, RoTxn, TxnRead};
+pub use zerodb_core::rotxn::{
+    collect_entries_flagged, free_page_count, named_databases, Database, DatabaseStat, RoRange,
+    RoTxn, TxnRead,
+};
 pub use zerodb_core::rwtxn::{PutFlags, RwCursor, RwTxn};
 
 /// The name of the single data file inside an env directory (D-002, SPEC 02 §8).

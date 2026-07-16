@@ -20,12 +20,28 @@
 use crate::page::geometry::{body_size, overflow_page_count, validate_page_size, value_is_inline};
 use crate::page::{
     write_overflow_head, BranchMut, DBRecord, LeafMut, MetaPage, PageError, FIRST_DATA_PGNO,
-    FORMAT_VERSION, MAGIC, MIN_KEYS_BRANCH,
+    FORMAT_VERSION, F_SUBDATA, MAGIC, MIN_KEYS_BRANCH,
 };
 
 /// Default leaf/branch fill factor in permille (~90 %). Sequentially-packed
 /// pages are left ~10 % slack, matching a typical bulk-load target.
 pub const DEFAULT_FILL_PERMILLE: u32 = 900;
+
+/// One entry fed to the tree builder: `(key, value, leaf-node flags)`. The flags
+/// are `0` for plain user data and [`F_SUBDATA`] for a named-DB catalog record
+/// on the main tree (SPEC 02 §6). Layout is decided by key/value size only —
+/// the flags do not affect a cell's size (an `F_SUBDATA` record is a fixed
+/// 48-byte inline value).
+type FEntry = (Vec<u8>, Vec<u8>, u16);
+
+/// A named database to place in a multi-DB image ([`build_multi_db_image`]): its
+/// catalog name and its pre-sorted, unique entries.
+pub struct NamedDbData<'a> {
+    /// The database name (the catalog key; 1..=`MAX_DB_NAME` bytes).
+    pub name: &'a [u8],
+    /// The database's entries, strictly ascending and unique by key.
+    pub entries: &'a [(Vec<u8>, Vec<u8>)],
+}
 
 /// Round `n` up to the next even number (2-byte cell alignment; SPEC 02 §2.2).
 #[inline]
@@ -124,7 +140,7 @@ fn build_leaves(
     store: &mut PageStore,
     psize: u32,
     txnid: u64,
-    entries: &[(Vec<u8>, Vec<u8>)],
+    entries: &[FEntry],
     fill: u32,
 ) -> Result<Vec<(Vec<u8>, u64)>, PageError> {
     let body = body_size(psize);
@@ -138,7 +154,7 @@ fn build_leaves(
         let mut used = 0usize;
         let mut count = 0usize;
         while i < entries.len() {
-            let (k, v) = &entries[i];
+            let (k, v, flags) = &entries[i];
             let plan = plan_leaf_cell(psize, k, v);
             let need = plan.cell_len + 2;
             if count >= 1 && used + need > target {
@@ -150,7 +166,7 @@ fn build_leaves(
                     store.write_run(opg, n, txnid, v)?;
                     leaf.insert_bigdata(count, k, v.len() as u32, opg)?;
                 }
-                None => leaf.insert_inline(count, k, 0, v)?,
+                None => leaf.insert_inline(count, k, *flags, v)?,
             }
             used += need;
             count += 1;
@@ -262,25 +278,31 @@ fn pack_branch_level(
     Ok(parents)
 }
 
-/// Build the whole tree, returning its `DBRecord` and the page store holding the
-/// data pages.
-fn build_tree(
+/// Build one tree into a shared [`PageStore`], returning its `DBRecord`. The
+/// store's `next_pgno` advances so several trees (named DBs + the main catalog)
+/// pack into one env image ([`build_multi_db_image`]). `entries` are flagged
+/// ([`FEntry`]) so the main catalog can carry `F_SUBDATA` sub-DB records
+/// alongside user data; a per-DB tree passes flags `0`.
+fn build_tree_into(
+    store: &mut PageStore,
     psize: u32,
     txnid: u64,
-    entries: &[(Vec<u8>, Vec<u8>)],
+    entries: &[FEntry],
     fill: u32,
-) -> Result<(DBRecord, PageStore), PageError> {
+) -> Result<DBRecord, PageError> {
     validate_page_size(psize)?;
     debug_assert!(
         entries.windows(2).all(|w| w[0].0 < w[1].0),
-        "build_tree requires strictly-ascending, unique keys"
+        "build_tree_into requires strictly-ascending, unique keys"
     );
-    let mut store = PageStore::new(psize);
     if entries.is_empty() {
-        return Ok((DBRecord::empty(), store));
+        return Ok(DBRecord::empty());
     }
 
-    let leaves = build_leaves(&mut store, psize, txnid, entries, fill)?;
+    // The store's overflow counter is shared across trees in a multi-DB image,
+    // so snapshot it and diff to get *this* tree's overflow-page count.
+    let overflow_before = store.overflow_pages;
+    let leaves = build_leaves(store, psize, txnid, entries, fill)?;
     let leaf_pages = leaves.len() as u64;
 
     let (root, depth, branch_pages) = if leaves.len() == 1 {
@@ -290,29 +312,62 @@ fn build_tree(
         let mut branch_pages = 0u64;
         let mut branch_levels = 0u16;
         while level.len() > 1 {
-            level = pack_branch_level(&mut store, psize, txnid, &level, fill, &mut branch_pages)?;
+            level = pack_branch_level(store, psize, txnid, &level, fill, &mut branch_pages)?;
             branch_levels += 1;
         }
         (level[0].1, 1 + branch_levels, branch_pages)
     };
 
-    let rec = DBRecord {
+    Ok(DBRecord {
         root,
         branch_pages,
         leaf_pages,
-        overflow_pages: store.overflow_pages,
+        overflow_pages: store.overflow_pages - overflow_before,
         entries: entries.len() as u64,
         depth,
         flags: 0,
         leaf2_ksize: 0,
+    })
+}
+
+/// Finalize a filled [`PageStore`] into a two-meta env image whose `main_db`
+/// roots `main`, `free_db` is empty, and `map_size`/`last_pg` describe the file.
+fn finalize_image(
+    store: PageStore,
+    psize: u32,
+    map_size: u64,
+    txnid: u64,
+    main_db: DBRecord,
+) -> Result<Vec<u8>, PageError> {
+    let last_pg = store.next_pgno - 1;
+    let mut buf = store.buf;
+    if buf.len() < 2 * psize as usize {
+        buf.resize(2 * psize as usize, 0);
+    }
+    let m0 = MetaPage {
+        pgno: 0,
+        txnid,
+        magic: MAGIC,
+        format_version: FORMAT_VERSION,
+        page_size: psize,
+        env_flags: 0,
+        map_size,
+        last_pg,
+        free_db: DBRecord::empty(),
+        main_db,
     };
-    Ok((rec, store))
+    m0.encode(&mut buf[0..psize as usize])?;
+    let mut m1 = m0;
+    m1.pgno = 1;
+    m1.encode(&mut buf[psize as usize..2 * psize as usize])?;
+    Ok(buf)
 }
 
 /// Build a complete single-DB env-file image from pre-sorted, unique `entries`:
 /// two identical valid meta slots at `txnid` whose `main_db` roots the built
-/// tree (SPEC 02 §3). `free_db` is empty (M1.3 has no GC). Named-DB catalogs are
-/// out of M1.3 scope (M1.6); the whole dataset lives in the main/unnamed DB.
+/// tree (SPEC 02 §3). `free_db` is empty (the builder produces no GC state). The
+/// whole dataset lives in the main/unnamed DB; for named DBs use
+/// [`build_multi_db_image`].
 ///
 /// The returned bytes can be written to an env's `zerodb.dat` and opened.
 ///
@@ -332,30 +387,74 @@ pub fn build_single_db_image(
     fill_permille: u32,
 ) -> Result<Vec<u8>, PageError> {
     let fill = fill_permille.clamp(1, 1000);
-    let (main_db, store) = build_tree(psize, txnid, entries, fill)?;
-    let last_pg = store.next_pgno - 1;
-    let mut buf = store.buf;
-    if buf.len() < 2 * psize as usize {
-        buf.resize(2 * psize as usize, 0);
+    let mut store = PageStore::new(psize);
+    let flagged: Vec<FEntry> = entries
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone(), 0u16))
+        .collect();
+    let main_db = build_tree_into(&mut store, psize, txnid, &flagged, fill)?;
+    finalize_image(store, psize, map_size, txnid, main_db)
+}
+
+/// Build a complete **multi-DB** env-file image: the main/unnamed DB
+/// (`main_user` = its plain user entries) plus every named DB in `named`, each
+/// referenced from the main catalog by an inline `F_SUBDATA` record (SPEC 02
+/// §6). This is the compaction primitive for `Env::copy_to_file(Enabled)` and
+/// the `zerodb-tools load` reload path (M1.12): every tree is packed bottom-up
+/// and densely, dropping fragmentation and all stale GC state.
+///
+/// Build order: each named DB's tree is packed first (so its root pgno is
+/// known), then the main catalog is packed over `main_user` merged with one
+/// `F_SUBDATA` entry per named DB, sorted by key. `free_db` is empty in the
+/// result (a fresh compact env owns no free pages).
+///
+/// Requirements (as for [`build_single_db_image`]): within each DB the entries
+/// are strictly ascending and unique, and the named-DB names are disjoint from
+/// the main DB's user keys (guaranteed for any image produced from a valid env
+/// — a main-tree key is either a user key or a sub-DB pointer, never both).
+///
+/// # Errors
+///
+/// [`PageError`] on an invalid page size or a page-encoding failure.
+///
+/// # Panics (debug only)
+///
+/// If any DB's entries are not strictly ascending / unique, or a name collides
+/// with a main user key.
+pub fn build_multi_db_image(
+    psize: u32,
+    map_size: u64,
+    txnid: u64,
+    main_user: &[(Vec<u8>, Vec<u8>)],
+    named: &[NamedDbData<'_>],
+    fill_permille: u32,
+) -> Result<Vec<u8>, PageError> {
+    let fill = fill_permille.clamp(1, 1000);
+    let mut store = PageStore::new(psize);
+
+    // Pack each named DB's tree; collect its catalog record keyed by name.
+    let mut catalog: Vec<FEntry> = Vec::with_capacity(named.len());
+    for nd in named {
+        let flagged: Vec<FEntry> = nd
+            .entries
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone(), 0u16))
+            .collect();
+        let rec = build_tree_into(&mut store, psize, txnid, &flagged, fill)?;
+        catalog.push((nd.name.to_vec(), rec.to_bytes().to_vec(), F_SUBDATA));
     }
 
-    let m0 = MetaPage {
-        pgno: 0,
-        txnid,
-        magic: MAGIC,
-        format_version: FORMAT_VERSION,
-        page_size: psize,
-        env_flags: 0,
-        map_size,
-        last_pg,
-        free_db: DBRecord::empty(),
-        main_db,
-    };
-    m0.encode(&mut buf[0..psize as usize])?;
-    let mut m1 = m0;
-    m1.pgno = 1;
-    m1.encode(&mut buf[psize as usize..2 * psize as usize])?;
-    Ok(buf)
+    // Merge main user data (flags 0) with the catalog records (F_SUBDATA) and
+    // sort by key: the main tree holds both, in one ascending order.
+    let mut main_entries: Vec<FEntry> = main_user
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone(), 0u16))
+        .collect();
+    main_entries.extend(catalog);
+    main_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let main_db = build_tree_into(&mut store, psize, txnid, &main_entries, fill)?;
+    finalize_image(store, psize, map_size, txnid, main_db)
 }
 
 #[cfg(test)]
@@ -520,5 +619,54 @@ mod tests {
         let rec = main_record(&img);
         assert!(rec.depth >= 2);
         assert_eq!(walk(&img, &rec), entries);
+    }
+
+    #[test]
+    fn multi_db_image_is_check_clean() {
+        // Main user data + two named DBs (one with multi-page overflow, one
+        // empty), all packed into one image; the invariant walker follows every
+        // F_SUBDATA catalog entry into its sub-tree.
+        let main_user: Vec<_> = (0u32..2000)
+            .map(|i| kv(format!("m{i:06}").as_bytes(), b"x"))
+            .collect();
+        let posts: Vec<_> = (0u32..1500)
+            .map(|i| {
+                kv(
+                    format!("p{i:06}").as_bytes(),
+                    format!("value-{i}").as_bytes(),
+                )
+            })
+            .collect();
+        let big = vec![
+            kv(b"blob-a", &[7u8; 40_000]),
+            kv(b"blob-b", &[9u8; 100_000]),
+        ];
+        let named = vec![
+            NamedDbData {
+                name: b"posts",
+                entries: &posts,
+            },
+            NamedDbData {
+                name: b"blobs",
+                entries: &big,
+            },
+            NamedDbData {
+                name: b"empty",
+                entries: &[],
+            },
+        ];
+        let img = build_multi_db_image(PS, 16 << 20, 4, &main_user, &named, DEFAULT_FILL_PERMILLE)
+            .unwrap();
+        assert_eq!(
+            crate::check::check_image(&img, PS),
+            Vec::<String>::new(),
+            "multi-DB image must be invariant-clean"
+        );
+    }
+
+    #[test]
+    fn empty_multi_db_image_is_check_clean() {
+        let img = build_multi_db_image(PS, 1 << 20, 0, &[], &[], DEFAULT_FILL_PERMILLE).unwrap();
+        assert_eq!(crate::check::check_image(&img, PS), Vec::<String>::new());
     }
 }

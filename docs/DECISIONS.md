@@ -11,3 +11,4 @@
 | 0006 | [MVCC reader table — slot table, publish cell, oldest-reader, loom/stress plan](adr/0006-reader-table.md) | Approved | 1.8 |
 | 0007 | [Nested read txns — safe borrow-based `Send` child, child_count, oracle plan](adr/0007-nested-read-txns.md) | Approved | 1.9 |
 | 0008 | [Crash harness — fault-injection write backend, two-mechanism crash cycles, crash-harness binary](adr/0008-crash-harness.md) | Approved | 1.11 |
+| 0009 | [copy_to_file design + zerodb-tools shape (compact/raw copy, flock guard, logical dump format)](adr/0009-copy-and-tools.md) | Proposed | 1.12 |

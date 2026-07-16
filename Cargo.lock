@@ -1104,6 +1104,13 @@ dependencies = [
 [[package]]
 name = "zerodb-tools"
 version = "0.0.1"
+dependencies = [
+ "heed",
+ "libc",
+ "zerodb",
+ "zerodb-core",
+ "zerodb-io",
+]
 
 [[package]]
 name = "zerofrom"

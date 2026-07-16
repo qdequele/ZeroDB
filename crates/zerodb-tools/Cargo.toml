@@ -4,3 +4,31 @@ version = "0.0.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+[lib]
+name = "zerodb_tools"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zerodb-tools"
+path = "src/main.rs"
+
+[dependencies]
+zerodb = { path = "../zerodb" }
+zerodb-core = { path = "../zerodb-core" }
+# Read-only file helpers (probe_page_size) for the offline `check` walk; no C.
+zerodb-io = { path = "../zerodb-io" }
+# `flock`-based advisory liveness guard on the data file (SPEC/D-001: no
+# cross-process protocol exists, so the guard is best-effort). libc is on the
+# CLAUDE.md allowlist; the single `unsafe` FFI block is confined to
+# `src/lock.rs` with a SAFETY comment. This EXPANDS the CLAUDE.md unsafe policy
+# (which lists only zerodb-core::page/readers and zerodb-io and the oracle) to
+# cover zerodb-tools flock — flagged for a human to record in CLAUDE.md.
+libc.workspace = true
+# migrate-from-lmdb only: opens a real LMDB env read-only (the Meilisearch
+# fork). Off by default; see ADR-0001 M1.12 amendment.
+heed = { version = "=0.22.1", optional = true }
+
+[features]
+# Enables the `migrate-from-lmdb` subcommand (links C LMDB via heed).
+migrate-lmdb = ["dep:heed"]
