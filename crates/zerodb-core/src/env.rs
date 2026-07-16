@@ -125,8 +125,16 @@ pub struct EnvInner {
     /// Canonical directory path — the registry key and [`Env::path`] value.
     path: PathBuf,
     /// The mapped file. `Option` so `Drop` can release it *before* firing the
-    /// close event, guaranteeing waiters observe a fully-closed env.
-    backing: Mutex<Option<Box<dyn Backing>>>,
+    /// close event, guaranteeing waiters observe a fully-closed env (TXN-53).
+    ///
+    /// No `Mutex` is needed: the only mutation is the release in [`EnvInner`]'s
+    /// `Drop`, which receives `&mut self` and runs only when the last `Arc`
+    /// reference is gone (so no reader can be touching it concurrently). Shared
+    /// `&self` readers ([`EnvInner::backing_bytes`], `real_disk_size`, …) take
+    /// only immutable references, which is why a `RoTxn` can borrow the mapped
+    /// `&[u8]` for its whole life (SPEC 04 TXN-37) with no `unsafe` in this
+    /// crate. `Backing: Send + Sync` keeps `EnvInner: Sync`.
+    backing: Option<Box<dyn Backing>>,
     /// The DB page size (from the live meta; authoritative — SPEC 02 §3.2).
     page_size: u32,
     /// The runtime map size (SPEC 02 §8): the caller's `map_size` if given, else
@@ -197,10 +205,22 @@ impl EnvInner {
     ///
     /// Propagates the `fstat` I/O error.
     pub fn real_disk_size(&self) -> Result<u64, Error> {
-        let g = self.backing.lock().expect("backing mutex poisoned");
-        match g.as_ref() {
+        match self.backing.as_ref() {
             Some(b) => Ok(b.real_disk_size()?),
             None => Err(Error::Mdb(MdbError::Invalid)),
+        }
+    }
+
+    /// The whole mapped env file as bytes, borrowed for as long as this
+    /// `EnvInner` is borrowed (SPEC 04 TXN-37). A `RoTxn` holds `&'env Env`,
+    /// which keeps the owning `Arc<EnvInner>` (and hence this map) alive for the
+    /// txn's life, so the returned slice is valid `'env`. Returns an empty slice
+    /// only after close has released the map (never observed by a live txn).
+    #[must_use]
+    pub fn backing_bytes(&self) -> &[u8] {
+        match self.backing.as_ref() {
+            Some(b) => b.bytes(),
+            None => &[],
         }
     }
 
@@ -210,8 +230,7 @@ impl EnvInner {
     ///
     /// Propagates the `dup` I/O error.
     pub fn try_clone_inner_file(&self) -> Result<std::fs::File, Error> {
-        let g = self.backing.lock().expect("backing mutex poisoned");
-        match g.as_ref() {
+        match self.backing.as_ref() {
             Some(b) => Ok(b.try_clone_file()?),
             None => Err(Error::Mdb(MdbError::Invalid)),
         }
@@ -239,10 +258,10 @@ impl Drop for EnvInner {
         }
         // Release the map (and, inside `MmapBacking`, close the fd) *before*
         // firing the close event, so `EnvClosingEvent::wait` returns only once
-        // teardown has actually run (SPEC 04 TXN-53).
-        if let Ok(mut g) = self.backing.lock() {
-            drop(g.take());
-        }
+        // teardown has actually run (SPEC 04 TXN-53). `Drop` holds `&mut self`
+        // (the last `Arc` reference is gone), so taking the backing here races
+        // with no reader.
+        drop(self.backing.take());
         self.closing.signal();
     }
 }
@@ -445,7 +464,7 @@ pub fn open_with_backing(
     let inner = Arc::new(EnvInner {
         id,
         path: canonical_path.clone(),
-        backing: Mutex::new(Some(backing)),
+        backing: Some(backing),
         page_size,
         map_size,
         meta,

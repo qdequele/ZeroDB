@@ -35,9 +35,19 @@ use arbitrary::{Arbitrary, Unstructured};
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Key(pub Vec<u8>);
 
-/// A value: usually 0..=64 bytes, occasionally into the multi-megabyte range
-/// so the generator reaches overflow pages. The large branch is rare (about
-/// 1 in 256) to keep proptest/fuzz runtime bounded.
+/// A value: usually 0..=64 bytes (inline), and about 1 in 16 in the
+/// `1_000..=64_000`-byte range so the generator crosses the inline/overflow
+/// threshold (~2 KiB at a 4 KiB page) and reaches **multi-page overflow runs**
+/// (up to ~16 pages) frequently.
+///
+/// The large branch is deliberately bounded at 64 KiB (M1.3, not the multi-MB
+/// of the original M0.3 generator): the differential now populates a real LMDB
+/// env of a fixed [`DIFF_MAP_SIZE`](crate::DIFF_MAP_SIZE), so a 64-op sequence
+/// must stay well under the map to avoid `MapFull` (which the rebuild-on-commit
+/// zerodb harness does not model) and to keep per-iteration temp files small.
+/// The overflow *algorithm* is length-independent, so 16-page runs exercise it
+/// as thoroughly as 750-page runs; a dedicated multi-MB overflow value is
+/// unit-tested separately in the zerodb read path.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Value(pub Vec<u8>);
 
@@ -85,11 +95,11 @@ impl<'a> Arbitrary<'a> for Key {
 
 impl<'a> Arbitrary<'a> for Value {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        // About 1 in 256: a multi-megabyte value (overflow pages), kept rare
-        // so proptest/fuzz runtime stays bounded. Otherwise the common small
-        // case.
-        let len = if u.ratio(1u16, 256u16)? {
-            u.int_in_range(1_000_000u32..=3_000_000)? as usize
+        // About 1 in 16: a 1..=64 KiB value (multi-page overflow runs), else the
+        // common small inline case. Bounded so a 64-op sequence stays under the
+        // differential's fixed map size (see the type docs).
+        let len = if u.ratio(1u8, 16u8)? {
+            u.int_in_range(1_000u32..=64_000)? as usize
         } else {
             u.int_in_range(0u16..=64)? as usize
         };

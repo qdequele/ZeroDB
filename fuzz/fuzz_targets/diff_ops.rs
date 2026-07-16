@@ -1,19 +1,21 @@
 #![no_main]
 //! Differential fuzz target: decode an arbitrary `Vec<Op>` and run it through
-//! the oracle.
+//! the oracle as **LmdbEngine vs the native ZerodbEngine** (M1.3).
 //!
-//! Today it runs `run_self_test` (LmdbEngine vs a second independent
-//! LmdbEngine), which fuzzes the harness for determinism. When the native
-//! zerodb `Engine` lands (M1.2+), switch the body to
-//! `zerodb_oracle::run::<LmdbEngine, ZerodbEngine>(&ops)` to fuzz true
-//! LMDB-vs-zerodb differential parity (see the seam note in `lib.rs`).
+//! The zerodb side buffers writes in a shadow, materializes them through the
+//! bulk-load builder on commit, and serves reads from the real B-tree read
+//! path; every read / cursor / seek / iteration result is compared against the
+//! LMDB fork. Ops zerodb does not yet implement (named DBs, nested read txns,
+//! write-cursor mutation, drop) are gated out symmetrically by
+//! `Engine::implements`, so the differential restricts itself to the M1.3
+//! surface without spurious divergences.
 
 use libfuzzer_sys::fuzz_target;
-use zerodb_oracle::{decode_ops, run_self_test};
+use zerodb_oracle::{decode_ops, run, LmdbEngine, ZerodbEngine};
 
 fuzz_target!(|data: &[u8]| {
     let ops = decode_ops(data, 64);
-    if let Err(divergence) = run_self_test(&ops) {
+    if let Err(divergence) = run::<LmdbEngine, ZerodbEngine>(&ops) {
         panic!("oracle divergence:\n{divergence}");
     }
 });

@@ -23,8 +23,9 @@ use crate::result::{OpResult, OracleError, Skip};
 use crate::tempdir::TempDir;
 use crate::{DbName, Engine, Op, PutFlag};
 
-/// 1 MiB base map size; growth is layered on top in 4 KiB units.
-const BASE_MAP_SIZE: usize = 1 << 20;
+/// Base map size; growth is layered on top in 4 KiB units. Sized so a full
+/// op sequence cannot exhaust the map (see [`crate::DIFF_MAP_SIZE`]).
+const BASE_MAP_SIZE: usize = crate::DIFF_MAP_SIZE;
 /// Catalog capacity: unnamed + `db0`..`db3` plus slack.
 const MAX_DBS: u32 = 16;
 
@@ -137,7 +138,9 @@ impl LmdbEngine {
         let want = BASE_MAP_SIZE + (kib as usize) * 4096;
         // Monotonic: never shrink below the current size, so a reopen can never
         // fail by cutting below the live data (models "reopen larger on MapFull").
-        want.max(self.map_size)
+        // Rounded to a 64 KiB multiple so heed accepts it and both engines agree
+        // on the effective size (DIVERGENCES D-006).
+        crate::round_map_size(want.max(self.map_size))
     }
 }
 
@@ -272,7 +275,14 @@ impl LmdbEngine {
     fn reopen(&mut self, kib: u16) -> OpResult {
         // Close all transactions and forget handles before dropping the env
         // (heed's same-process registry forbids two open handles to one path).
+        // Reopen drops the active txn, so it is a txn boundary: reset the FORK-1
+        // guard fact too, exactly as `commit`/`abort`/`begin_rw` do (and as
+        // `ZerodbEngine::reopen` does). Without this the two engines' tracked
+        // `cleared_in_txn` drift after a reopen-while-cleared, making the shared
+        // `classify` FORK-1 guard fire asymmetrically (found by the M1.3
+        // differential fuzz).
         self.active = Active::None;
+        self.cleared_in_txn = false;
         self.dbs.clear();
         self.committed_dbs = 0;
         drop(self.env.take());

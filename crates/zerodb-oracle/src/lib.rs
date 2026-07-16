@@ -48,6 +48,22 @@ pub use op::{DbName, Key, Op, PutFlag, Value};
 pub use result::{OpResult, OracleError, Skip};
 pub use zerodb_engine::ZerodbEngine;
 
+/// Base map size for the differential engines: 64 MiB. Large enough that no
+/// 64-op sequence of `≤ 64 KiB` values (see [`Value`]) can exceed it, so the
+/// reference LMDB env never returns `MdbError::MapFull` — a boundary the
+/// rebuild-on-commit [`ZerodbEngine`] does not model (its shadow is in-memory).
+pub const DIFF_MAP_SIZE: usize = 64 << 20;
+
+/// Round a map size up to a 64 KiB multiple — a multiple of every target OS
+/// page size (4 / 16 / 64 KiB), so heed never rejects it for not being an
+/// OS-page multiple (DIVERGENCES D-006) and both engines agree on the effective
+/// size after an [`Op::Reopen`]. Both differential engines round identically.
+#[must_use]
+pub fn round_map_size(size: usize) -> usize {
+    let q = 64 * 1024;
+    size.div_ceil(q) * q
+}
+
 /// A point where two engines produced different results for the same op.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Divergence {

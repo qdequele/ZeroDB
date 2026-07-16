@@ -73,6 +73,28 @@ search(tree, key):
 (inline slice, or read the overflow run for BIGDATA); else `None` (heed maps a
 missing key to `Ok(None)`, never an error — SPEC 00 rows 14/30).
 
+### §2.1 — Key-size validation on reads vs. writes (observed via the oracle, M1.3)
+
+The engine surfaces the same `search`, but LMDB validates key size differently
+depending on the entry point — pinned by `zerodb-oracle` differential tests
+(`read_differential.rs`) and replicated in Phase 1:
+
+| Operation | empty key (len 0) | oversized key (len > 511) |
+|-----------|-------------------|---------------------------|
+| `put` / `put_with_flags` / `put_reserved` | `BadValSize` | `BadValSize` (maxkey checked up front — SPEC 01 §S4) |
+| `get` / `set` (exact) | `BadValSize` | **`Ok(None)`** — search finds nothing, no error |
+| `del` | `BadValSize` | **`Ok(false)`** — search finds nothing (del does **not** check maxkey up front, unlike put) |
+| `set_range` / `get_greater_than` / `get_lower_than_or_equal_to` | `BadValSize` (an explicit `MDB_SET_RANGE` with a zero-size key is rejected) | `None`/last per the seek — no error |
+| `prefix_iter` (forward) | `BadValSize` (realized as `set_range(prefix)`) | empty scan — no error |
+| `rev_prefix_iter` (reverse) | **works** — full reverse iteration (its successor is unbounded, so it seeks via `last`, not `set_range`) | empty scan — no error |
+
+The unifying rule: **write ops** (`put*`) validate `maxkey` before searching, so
+both an empty and an oversized key are `BadValSize`; **read/search ops** reject
+only the *empty* key (an explicit zero-size `MDB_SET`/`MDB_SET_RANGE` fails),
+while an *oversized* key is not an error — it simply matches nothing. The one
+asymmetry is `rev_prefix_iter` of an empty prefix, which seeks via `last` rather
+than a zero-size set-range and therefore succeeds.
+
 ---
 
 ## §3 — Reading a value (zero-copy + overflow)

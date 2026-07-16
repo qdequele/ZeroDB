@@ -10,8 +10,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod btree;
+pub mod builder;
 pub mod env;
 pub mod error;
 pub mod page;
+pub mod rotxn;
+
+pub use rotxn::{Database, RoRange, RoTxn};
 
 pub use error::{Error, MdbError, Result};
