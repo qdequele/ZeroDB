@@ -1,0 +1,10 @@
+--- Cargo.toml.bak	2026-07-17 01:59:45
++++ Cargo.toml	2026-07-17 01:59:45
+@@ -63,3 +63,7 @@
+ opt-level = 3
+ [profile.dev.package.gemm-f16]
+ opt-level = 3
++
++# [M1.13 consumer compile gate] — reverted after; diff saved to docs/patches/.
++[patch.crates-io]
++heed = { path = "/Users/quentindequelen/Projects/Meilisearch/_side_projects/zerodb/crates/heed-shim" }

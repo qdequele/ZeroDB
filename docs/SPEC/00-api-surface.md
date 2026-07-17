@@ -2,6 +2,17 @@
 
 Status: **DONE** — 2026-07-15.
 
+> **M1.13 (2026-07-17):** the `heed-zerodb` adapter now **satisfies the full MUST
+> table over ZeroDB's native API** — the integration rows 23–26 (registry /
+> `EnvClosingEvent` / `Env: Clone`), 51–54 (`remap_*` / codecs /
+> `DefaultComparator` / error taxonomy), and 61 (the `WithoutTls`/`PutFlags`/…
+> type surface + `BytesEncode`/`BytesDecode`/`BoxedError` re-exported verbatim)
+> are realized by `crates/heed-zerodb`, and the read/write/env rows 1–22, 27–49,
+> 55–60 are wired through it (verified by the oracle re-run through the adapter
+> and by the milli+hannoy compile gate, ADR-0003). The read-key taxonomy of
+> rows 30/47/48 (empty key → `BadValSize`) is re-imposed at the adapter boundary
+> (SPEC 03 §2.1). The WithTls rows stay a compile-only shim (Phase 2, OQ5).
+
 This document is the frozen heed API contract that ZeroDB Phase 1 must reproduce.
 It is derived by inventorying every `heed` item used by the five consumers below,
 reading the call sites (not guessing), and mapping each item to the LMDB

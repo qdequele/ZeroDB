@@ -1,6 +1,43 @@
+# heed-zerodb — a 1:1 re-implementation of heed 0.22.1's public surface over
+# ZeroDB's native API (ADR-0003 Option C/D, milestone 1.13).
+#
+# The crate's *package* name stays `heed-zerodb` inside this workspace so it does
+# not collide with the real `heed = "=0.22.1"` the oracle links (ADR-0001): the
+# oracle depends on BOTH — real heed (LMDB) and this crate (`heed_zerodb`) — in
+# one binary for in-process A/B diffing. Consumers (milli/hannoy) switch backends
+# with `[patch.crates-io] heed = { path = ".../heed-zerodb", package = "heed-zerodb" }`
+# (docs/patches/, milestone 1.13); the `package =` rename keeps the dependency
+# *named* `heed` in consumer code while pointing it at this crate.
 [package]
 name = "heed-zerodb"
-version = "0.0.1"
+# Version tracks the heed line it reproduces (0.22.1) so a consumer's
+# `[patch.crates-io] heed = { path = "…", package = "heed-zerodb" }` satisfies
+# their `heed = "0.22.1"` requirement (docs/patches/, milestone 1.13). The crate
+# is never published (ADR-0003 OQ1); the version is only for patch resolution.
+version = "0.22.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+
+[dependencies]
+# The native engine under test. Workspace-internal, no C linkage.
+zerodb = { path = "../zerodb" }
+# The backend-independent trait + codec crates, re-exported VERBATIM so codec
+# identity (`BytesEncode`/`BytesDecode`) and trait coherence hold across the two
+# sibling surfaces (ADR-0003: "the codec and trait types are literally the same
+# types"). Pinned to the exact 0.22.1-line versions heed 0.22.1 bundles.
+heed-traits = "=0.20.0"
+heed-types = { version = "=0.21.0", default-features = false, features = [
+  "serde-bincode",
+  "serde-json",
+] }
+# Re-exported as `heed::byteorder` (heed does `pub use byteorder`); milli names
+# `heed::byteorder::BigEndian`. Part of the sanctioned heed-surface re-export
+# (heed-types already pulls it transitively), not a new engine dependency.
+byteorder = "1.5"
+# Allow-listed (CLAUDE.md). One `sysconf` call re-imposes the fork's D-006
+# `map_size` OS-page-multiple check at the heed boundary (heed uses `page_size`).
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

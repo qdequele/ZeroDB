@@ -16,6 +16,10 @@ arbitrary.workspace = true
 # The native engine under test. Workspace-internal, no C linkage.
 zerodb = { path = "../zerodb" }
 zerodb-core = { path = "../zerodb-core" }
+# The heed adapter (M1.13), driven as a third engine (`HeedZerodbEngine`) so the
+# oracle re-runs the whole op model THROUGH the adapter (ADR-0003 accept #6).
+# Depends on zerodb (no C) + heed-traits/heed-types (no C) — ADR-0001 compliant.
+heed-zerodb = { path = "../heed-zerodb" }
 # The fault-injection write backend + deterministic PRNG for the M1.11 crash
 # harness (ADR-0008). Workspace-internal.
 zerodb-io = { path = "../zerodb-io" }

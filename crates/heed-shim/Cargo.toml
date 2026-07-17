@@ -1,0 +1,49 @@
+# heed-shim — a crate literally named `heed` (v0.22.1) that re-exports
+# `heed-zerodb` verbatim. Its sole purpose is to be the target of a consumer's
+# `[patch.crates-io] heed = { path = ".../crates/heed-shim" }`: cargo's `[patch]`
+# requires the replacement crate to share the *name* of the crate it replaces
+# (`heed`), and the `package =` rename is silently ignored (verified M1.13). The
+# real adapter lives in `heed-zerodb`; this is a 3-line pass-through so the
+# oracle can still link the genuine crates.io `heed` (real LMDB) alongside it.
+#
+# NOT a member of the ZeroDB workspace (an empty `[workspace]` table + a root
+# `exclude`) so its name never collides with the oracle's real `heed` dep.
+[workspace]
+
+[package]
+name = "heed"
+version = "0.22.1"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+heed-zerodb = { path = "../heed-zerodb" }
+
+# heed's public feature names, declared as **no-op passthroughs** so a consumer's
+# `heed = { features = [...] }` resolves. The adapter's serde codecs are always
+# compiled in `heed-zerodb`; `posix-sem` and the LMDB build knobs are irrelevant
+# to the pure-Rust engine. Mirrors heed 0.22.1's `[features]` names.
+[features]
+default = ["serde", "serde-bincode", "serde-json"]
+serde = []
+serde-bincode = []
+serde-json = []
+serde-rmp = []
+preserve_order = []
+arbitrary_precision = []
+raw_value = []
+unbounded_depth = []
+posix-sem = []
+longer-keys = []
+use-valgrind = []
+mdb_idl_logn_8 = []
+mdb_idl_logn_9 = []
+mdb_idl_logn_10 = []
+mdb_idl_logn_11 = []
+mdb_idl_logn_12 = []
+mdb_idl_logn_13 = []
+mdb_idl_logn_14 = []
+mdb_idl_logn_15 = []
+mdb_idl_logn_16 = []

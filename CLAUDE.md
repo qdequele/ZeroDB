@@ -40,8 +40,11 @@ Consumers: Meilisearch (milli) and hannoy (HNSW vector index).
 ## unsafe policy
 
 `unsafe` is permitted ONLY in: mmap access and page casting (`zerodb-core::page`,
-`zerodb-io`), the reader table (`zerodb-core::readers`), and FFI inside
-`zerodb-oracle`. Every unsafe block requires a `// SAFETY:` comment stating the
+`zerodb-io`), the reader table (`zerodb-core::readers`), FFI inside
+`zerodb-oracle`, and the minimal API-shape unsafe in `heed-zerodb` that heed's
+pointer model inherently requires (Send impls, TLS-marker retags, the
+lifetime-erased write cursor — nothing beyond what the mirrored heed surface
+forces; ratified 2026-07-17, M1.13). Every unsafe block requires a `// SAFETY:` comment stating the
 invariants relied on. No `#[repr(C)]` casts of possibly-unaligned data — use
 explicit offsets + `read_unaligned`. All atomics use explicit `Ordering` with a
 comment justifying it; assume ARM (weak memory model), never "works on x86".

@@ -242,7 +242,15 @@ dependencies = [
 
 [[package]]
 name = "heed-zerodb"
-version = "0.0.1"
+version = "0.22.1"
+dependencies = [
+ "byteorder",
+ "heed-traits",
+ "heed-types",
+ "libc",
+ "tempfile",
+ "zerodb",
+]
 
 [[package]]
 name = "icu_collections"
@@ -1094,6 +1102,7 @@ version = "0.0.1"
 dependencies = [
  "arbitrary",
  "heed",
+ "heed-zerodb",
  "proptest",
  "thiserror",
  "zerodb",

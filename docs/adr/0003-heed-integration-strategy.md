@@ -4,6 +4,21 @@
 - Milestone: 0.5 (this ADR); implemented in 1.13, gated in 1.14
 - Date: 2026-07-15
 
+> **Implemented (M1.13, 2026-07-17).** `crates/heed-zerodb` reproduces the full
+> SPEC 00 MUST surface over ZeroDB's native API and re-exports
+> `heed-traits`/`heed-types` verbatim; consumers switch via a
+> `[patch.crates-io] heed` pointing at the standalone shim `crates/heed-shim`
+> (a crate literally named `heed`, since cargo `[patch]` matches by name — the
+> `package =` rename is ignored). milli and hannoy compile on the backend with
+> zero `.rs` edits (patch diffs in `docs/patches/`); the oracle re-run *through*
+> the adapter (`HeedZerodbEngine`, `tests/heed_adapter_differential.rs`) shows
+> zero divergences; heed's suite passes at the IN scope
+> (`crates/heed-zerodb/tests/heed_suite.rs`). Accept criteria 1–6 met. Answers
+> to OQ1 (never published — shim path/patch only), OQ2 (workspace-level
+> `[patch]`), OQ3 (`=0.20.0`/`=0.21.0` version-locked), OQ4 (single `heed` patch
+> flows through arroy/hannoy/cellulite — confirmed by the milli check), OQ5
+> (compile-only WithTls shim) are realized as described.
+
 > **ADR-only milestone.** Per CLAUDE.md rule 6, milestone 0.5 is ADR-only:
 > **nothing is implemented until a human approves this document.** No code,
 > no crate scaffolding, no `[patch]` entries. This file + its `docs/DECISIONS.md`

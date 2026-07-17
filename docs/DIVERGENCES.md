@@ -18,3 +18,26 @@ Rules:
 | D-009 | Concurrent `open_database` of a dropped-and-reused dbi | Opening a database **by name** in a fresh read txn while a *concurrent, still-open* write txn has **dropped and reused** that dbi's slot number returns the reused handle from the in-memory dbi table, then `mdb_get` through the read txn's stale dbi slot fails with `EINVAL` (`Io(InvalidInput)`). An LMDB dbi-reuse hazard. | zerodb resolves `open_database` purely from the transaction's **committed catalog** (SPEC 04 TXN-10): the just-created (uncommitted) name is absent → `Ok(None)`, the correct MVCC answer, no reused-slot hazard. **No consumer exercises this** — it requires a mid-write-txn `open_database` of a name whose dbi was dropped-and-recreated in that same open txn, read from a concurrent txn. The oracle's `VerifyGet` models a *post-commit* independent read, so `driver::classify` skips it while a write txn is open (`Skip::VerifyDuringWrite`); concurrent reader-vs-writer isolation is exercised via the M1.8 reader table. | PROPOSED | (agent-proposed 2026-07-16, M1.6; LMDB dbi-reuse artifact — needs sign-off) |
 | D-008 | Raw bytes of a named-DB catalog record | Iterating/reading the **parent** DB (the unnamed root, or an outer named DB) surfaces each sub-DB's catalog entry with the sub-DB **record** as its value — LMDB's `MDB_db` struct layout (root pgno at offset 40, little-endian, packed). A consumer that raw-reads that value sees LMDB's bytes. | zerodb surfaces the same entry (same key, `F_SUBDATA`) but with **its own** `DBRecord` layout (SPEC 02 §3.1: root pgno at offset 0). The 48-byte value bytes therefore differ. **A direct consequence of D-002** (own on-disk format); observable *only* by raw-reading a sub-DB record through its parent, which **no consumer does** (milli's primary DB is the *named* `"main"`, so the root is a pure catalog it never reads as data; arroy/hannoy use only the unnamed root and never create named DBs, so their root has no catalog entries). The oracle models `DbName::Unnamed` as milli's named `"main"` so the fuzz never raw-reads a catalog record (see `op.rs`); the true unnamed-root path is covered without catalog mixing by `unnamed_root_differential.rs`. **Secondary:** DB **names** are byte strings in zerodb-core but C strings in heed (a name with an embedded `0x00` is a valid distinct DB in zerodb, unrepresentable in heed) — a heed adapter-boundary difference (M1.13), not a core one. | PROPOSED | (agent-proposed 2026-07-16, M1.6; consequence of D-002 — needs sign-off) |
 | D-010 | `max_readers(0)` at env open | The fork **rejects the open**: `mdb_env_set_maxreaders(env, 0)` → `EINVAL`, surfaced by heed as `Io(InvalidInput)` ("Invalid argument", code 22). Observed empirically in M1.8 (probe against heed =0.22.1 / the fork, 2026-07-16). | zerodb **accepts the open** and sizes the reader table 0; every subsequent `read_txn`/`static_read_txn` fails with `MdbError::ReadersFull` (SPEC 04 TXN-16 applied per-txn instead of an open-time argument check). **No consumer passes 0** — Meilisearch sets 1024, the default is 126 — so the divergence is unobservable in real use. Kept as-is in M1.8 (no open-time validation added); the heed-zerodb adapter (M1.13) may re-impose the fork's open-time `EINVAL` at the heed boundary if the 1.14 gate requires exact parity. | PROPOSED | (agent-proposed 2026-07-16, M1.8 spec-review condition — needs sign-off) |
+
+### M1.13 adapter-boundary re-impositions (2026-07-17)
+
+The core engine keeps its lenient native behavior (the divergences above stand
+as filed); the **`heed-zerodb` adapter now re-imposes the fork's stricter
+behavior at the heed boundary** so the 1.14 gate sees exact parity, each with a
+test in `crates/heed-zerodb/tests/boundary.rs`:
+
+- **D-006** — `EnvOpenOptions::open` rejects a `map_size` that is not a multiple
+  of the OS page size (`sysconf(_SC_PAGESIZE)`) with `Io(InvalidInput)`.
+- **D-010** — `EnvOpenOptions::open` rejects `max_readers(0)` with
+  `Io(InvalidInput)` before touching the engine.
+- **D-008 (secondary)** — a DB name with an embedded NUL reproduces heed's
+  `CString::new(name).unwrap()` **panic** (the fork's observable behavior, probed
+  against heed =0.22.1's `raw_open_dbi`), rather than inventing a clean error.
+
+Additionally, the LMDB **read-key size taxonomy** (SPEC 03 §2.1 — the leniency
+the core defers to "the caller", D-004/SPEC 03 note) is applied in the adapter's
+read path: an **empty** key → `MdbError::BadValSize` on
+`get`/`delete`/neighbor-seeks/forward-`prefix_iter` (an oversized read key is
+still not rejected). Not a new divergence — it closes the read-side leniency the
+core intentionally left to the heed boundary. No consumer sends empty keys, so
+none of these fire in real use; they exist for exact fork parity.

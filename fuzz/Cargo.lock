@@ -188,6 +188,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "heed-zerodb"
+version = "0.22.1"
+dependencies = [
+ "byteorder",
+ "heed-traits",
+ "heed-types",
+ "libc",
+ "zerodb",
+]
+
+[[package]]
 name = "icu_collections"
 version = "2.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -884,6 +895,7 @@ version = "0.0.1"
 dependencies = [
  "arbitrary",
  "heed",
+ "heed-zerodb",
  "thiserror",
  "zerodb",
  "zerodb-core",

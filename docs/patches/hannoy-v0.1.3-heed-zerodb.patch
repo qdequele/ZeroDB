@@ -1,0 +1,10 @@
+--- Cargo.toml.bak	2026-07-17 01:59:15
++++ Cargo.toml	2026-07-17 01:59:15
+@@ -94,3 +94,7 @@
+ [[bench]]
+ name = "speed"
+ harness = false
++
++# [M1.13 consumer compile gate] — reverted after; diff saved to docs/patches/.
++[patch.crates-io]
++heed = { path = "/Users/quentindequelen/Projects/Meilisearch/_side_projects/zerodb/crates/heed-shim" }

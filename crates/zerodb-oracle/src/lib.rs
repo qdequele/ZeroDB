@@ -36,6 +36,7 @@
 pub mod crash;
 pub mod driver;
 mod engine;
+mod heed_zerodb_engine;
 mod lmdb;
 mod op;
 mod result;
@@ -44,6 +45,7 @@ mod zerodb_engine;
 
 pub use driver::{classify, TxnState};
 pub use engine::Engine;
+pub use heed_zerodb_engine::HeedZerodbEngine;
 // `EngineMode` / `run_in_mode` are defined in this module; re-listed here for
 // discoverability alongside the other public items.
 pub use lmdb::LmdbEngine;
