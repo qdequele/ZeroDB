@@ -34,9 +34,15 @@ LMDB struct is transliterated.
 - **Page size** is a runtime value `psize`, chosen at env creation, a power of
   two in `[4096, 65536]` (4 KiB – 64 KiB). It is stored in the meta page and is
   **independent of the OS page size** (ARM distros often use 64 KiB OS pages;
-  the DB page size is its own knob). Phase 1 exposes no selector through heed
-  (SPEC 01 §S4); the engine supports the full range internally and Phase 2.6
-  exposes selection.
+  the DB page size is its own knob). Phase 1 exposed no selector through heed
+  (SPEC 01 §S4). **Milestone 2.6 (2026-07-20) promotes it to a public knob:**
+  `zerodb::EnvOpenOptions::page_size(u32)` and the new
+  `heed_zerodb::EnvOpenOptions::page_size(u32)` (a ZeroDB extension — heed/LMDB
+  0.9 have no equivalent). Bounds are the constants `zerodb::MIN_PAGE_SIZE` /
+  `MAX_PAGE_SIZE`; a value outside them, or not a power of two, is rejected at
+  `open` with `Io(InvalidInput)`. Selection applies **only when creating** a
+  store — reopening adopts the persisted `psize` from the meta page (§3.2) and
+  silently ignores the request, exactly as for `map_size`.
 - **Page number** (`pgno`) is a `u64` index into the file: byte offset of a
   page = `pgno * psize`. `PGNO_INVALID = u64::MAX` (`0xFFFF_FFFF_FFFF_FFFF`)
   denotes "no page" (empty tree / end of chain).

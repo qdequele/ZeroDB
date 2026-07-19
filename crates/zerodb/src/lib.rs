@@ -20,7 +20,7 @@ pub use copy::{CompactionOption, CopyToFile};
 pub use zerodb_core::builder::{build_multi_db_image, NamedDbData, DEFAULT_FILL_PERMILLE};
 pub use zerodb_core::check;
 pub use zerodb_core::env::{
-    CommitHook, DurabilityFlags, Env, EnvClosingEvent, EnvInfo, HookPoint, Snapshot,
+    CommitHook, DurabilityFlags, Env, EnvClosingEvent, EnvInfo, EnvStat, HookPoint, Snapshot,
 };
 pub use zerodb_core::error::{Error, MdbError, Result};
 pub use zerodb_core::nested::NestedRoTxn;
@@ -38,9 +38,15 @@ pub const DATA_FILE_NAME: &str = "zerodb.dat";
 /// default only matters for tests.
 const DEFAULT_MAP_SIZE: u64 = 1 << 20;
 
-/// Default DB page size when not overridden (SPEC 02 §0; Phase 1 exposes no heed
-/// selector, SPEC 01 §S4).
-const DEFAULT_PAGE_SIZE: u32 = 4096;
+/// Default DB page size when not overridden (SPEC 02 §0). Selectable since
+/// milestone 2.6 via [`EnvOpenOptions::page_size`].
+pub const DEFAULT_PAGE_SIZE: u32 = 4096;
+
+/// The smallest selectable DB page size (SPEC 02 §0, milestone 2.6).
+pub const MIN_PAGE_SIZE: u32 = 4096;
+
+/// The largest selectable DB page size (SPEC 02 §0, milestone 2.6).
+pub const MAX_PAGE_SIZE: u32 = 65536;
 
 /// Environment open flags (SPEC 01 Table 1). A hand-rolled bitset — no
 /// `bitflags` dependency (not on the CLAUDE.md allowlist).
@@ -156,12 +162,42 @@ impl EnvOpenOptions {
         self
     }
 
-    /// Set the DB page size (internal option; SPEC 02 §0). Only used when
-    /// **creating** a new env — for an existing env the persisted page size
-    /// wins (SPEC 02 §3.2). Must be a power of two in `[4096, 65536]`.
+    /// Select the DB page size (**milestone 2.6**; SPEC 02 §0).
+    ///
+    /// This is a **ZeroDB extension**: LMDB 0.9 derives the page size from the
+    /// OS and offers no selector, so there is no heed API to mirror and no
+    /// cross-engine differential to run. ZeroDB's page size has always been a
+    /// runtime value in the meta page (SPEC 02 §0/§3.2) — 2.6 promotes it to a
+    /// supported public knob.
+    ///
+    /// Semantics:
+    ///
+    /// - **Creation-only.** The value is used only when [`EnvOpenOptions::open`]
+    ///   *creates* a new store. Opening an **existing** env ignores it entirely
+    ///   and adopts the persisted page size from the meta page (SPEC 02 §3.2) —
+    ///   opening a 64 K store with `page_size(4096)` succeeds and yields a 64 K
+    ///   env. Read the effective value back with [`Env::page_size`] (or
+    ///   [`EnvStat::page_size`]); it is never silently wrong, just not what was
+    ///   requested. There is deliberately no "wrong expectation" error: the
+    ///   persisted geometry is authoritative, exactly as for `map_size`.
+    /// - **Independent of the OS page size.** ARM distros commonly run 64 K OS
+    ///   pages; the DB page size is chosen here and does not track them.
+    /// - **Validated at `open`**, not here, so the builder stays chainable —
+    ///   see [`EnvOpenOptions::open`] for the error.
+    ///
+    /// # Panics
+    ///
+    /// Never. An invalid `size` is reported by [`EnvOpenOptions::open`].
     pub fn page_size(&mut self, size: u32) -> &mut EnvOpenOptions {
         self.page_size = size;
         self
+    }
+
+    /// The configured page size (milestone 2.6). For a value that reflects an
+    /// *existing* store, use [`Env::page_size`] after opening.
+    #[must_use]
+    pub fn get_page_size(&self) -> u32 {
+        self.page_size
     }
 
     /// Set the env flags (SPEC 00 row 6). All Phase-1 flags are honored:
@@ -196,6 +232,12 @@ impl EnvOpenOptions {
     ///
     /// # Errors
     ///
+    /// - [`Error::Io`] (`InvalidInput`) if [`EnvOpenOptions::page_size`] is not
+    ///   a power of two in `[`[`MIN_PAGE_SIZE`]`, `[`MAX_PAGE_SIZE`]`]`
+    ///   (milestone 2.6). `Io(InvalidInput)` is the taxonomy ZeroDB already
+    ///   uses for open-time argument rejection (cf. the `max_readers(0)` and
+    ///   non-page-multiple `map_size` boundaries, D-010 / D-006); LMDB has no
+    ///   error for this because it has no such option.
     /// - [`Error::Io`] if the directory does not exist, on any file/mmap I/O
     ///   error, or if a `READ_ONLY` open finds no existing store.
     /// - [`Error::Mdb`]`(`[`MdbError::Invalid`]`)` if the file is not a valid
@@ -205,10 +247,18 @@ impl EnvOpenOptions {
     ///   for the same canonical path (SPEC 04 TXN-51).
     pub fn open(&self, path: impl AsRef<Path>) -> Result<Env> {
         let dir = path.as_ref();
-        if self.page_size < 4096 || self.page_size > 65536 || !self.page_size.is_power_of_two() {
+        // M2.6: validate the page-size selector here rather than in the setter
+        // so the builder stays chainable.
+        if self.page_size < MIN_PAGE_SIZE
+            || self.page_size > MAX_PAGE_SIZE
+            || !self.page_size.is_power_of_two()
+        {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "page_size must be a power of two in [4096, 65536]",
+                format!(
+                    "page_size ({}) must be a power of two in [{MIN_PAGE_SIZE}, {MAX_PAGE_SIZE}]",
+                    self.page_size
+                ),
             )));
         }
         // Canonicalize the directory so the registry keys one env per real path

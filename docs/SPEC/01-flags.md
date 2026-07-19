@@ -446,10 +446,32 @@ they are re-listed here for a single flag-matrix view (PLAN §1.10 acceptance).
 | `MDB_CURRENT` | 3 | `put_current` at cursor; `EINVAL` if uninitialized. | `cursor_put_current_*` (M1.4) | differential |
 | `MDB_RESERVE` | 3 | `put_reserved`: caller fills the slot in place; not zeroed (SPEC 01 §S3). Under WRITE_MAP the slot is (logically) into the map. | `put_reserved_*` (M1.4), `env_writemap_put_reserved` (M1.10) | differential |
 
-**`Env::force_sync`** (`mdb_env_sync` parity, SPEC 01 §S6): a synchronous
-barrier that restores durability under `NO_SYNC`/`NO_META_SYNC`/`MAP_ASYNC`;
-`EACCES` on a read-only env; poisons the env on an `msync`/`fsync` failure
-(REC-13). Covered by the `durability_*` and `read_only_*` e2e tests.
+**`Env::force_sync` / `Env::sync(force)`** (`mdb_env_sync` parity, §S6).
+`force_sync()` — the only form heed exposes — is exactly `mdb_env_sync(env, 1)`:
+a synchronous barrier that restores durability under
+`NO_SYNC`/`NO_META_SYNC`/`MAP_ASYNC`; `EACCES` on a read-only env; poisons the
+env on an `msync`/`fsync` failure (REC-13). Covered by the `durability_*` and
+`read_only_*` e2e tests.
+
+**Milestone 2.5 (2026-07-20)** adds `Env::sync(force: bool)`, the full
+`mdb_env_sync` signature (a ZeroDB extension; `force_sync()` == `sync(true)`),
+reproducing all three decisions of the fork's `mdb_env_sync0` in order:
+
+1. `MDB_RDONLY` → `EACCES`, checked **before** anything else, for either value
+   of `force`.
+2. Flush at all only if `force || !(flags & MDB_NOSYNC)`. So **`sync(false)` on
+   a `NO_SYNC` env is a silent no-op returning success** — it does *not* make
+   prior commits durable. This is the sole behavioral difference between the two
+   `force` values, and the reason `force_sync` is the durability-restoring call.
+3. Primitive: under `WRITE_MAP`, `msync(MS_ASYNC)` iff `MAP_ASYNC && !force`,
+   else `MS_SYNC`; without `WRITE_MAP`, `fdatasync`. I.e. `force` also downgrades
+   `MAP_ASYNC` to a real barrier.
+
+A call that does flush always issues the barrier even with nothing pending,
+matching LMDB. Proved against the M1.11 fault-injection backing in
+`zerodb-oracle/tests/force_sync_durability.rs` (the journal must be empty after
+`force_sync`, and the crash-floor image must then read back every committed
+key).
 
 **Meilisearch indexing flag-combo replay** (PLAN §1.10 acceptance): the exact
 milli combo — `WithoutTls` + `map_size` + named DBs + `put`/`put_with_flags`

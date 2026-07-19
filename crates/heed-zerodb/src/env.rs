@@ -48,6 +48,8 @@ pub struct EnvOpenOptions<T: TlsUsage = WithTls> {
     map_size: Option<usize>,
     max_readers: Option<u32>,
     max_dbs: u32,
+    /// M2.6 ZeroDB extension — no heed counterpart. `None` = engine default.
+    page_size: Option<u32>,
     flags: EnvFlags,
     _tls: std::marker::PhantomData<T>,
 }
@@ -66,6 +68,7 @@ impl EnvOpenOptions<WithTls> {
             map_size: None,
             max_readers: None,
             max_dbs: 0,
+            page_size: None,
             flags: EnvFlags::empty(),
             _tls: std::marker::PhantomData,
         }
@@ -78,6 +81,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
             map_size: self.map_size,
             max_readers: self.max_readers,
             max_dbs: self.max_dbs,
+            page_size: self.page_size,
             flags: self.flags,
             _tls: std::marker::PhantomData,
         }
@@ -110,6 +114,26 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// Set the named-DB catalog capacity (SPEC 00 row 4).
     pub fn max_dbs(&mut self, dbs: u32) -> &mut Self {
         self.max_dbs = dbs;
+        self
+    }
+
+    /// Select the DB page size (**milestone 2.6**).
+    ///
+    /// **ZeroDB extension — heed has no such method**, because LMDB 0.9 derives
+    /// its page size from the OS and offers no selector. Adding it here is
+    /// additive and feature-neutral: code that never calls it gets the engine
+    /// default and behaves exactly as before, so the frozen heed contract
+    /// (PLAN ground rule 2) is untouched.
+    ///
+    /// `size` must be a power of two in
+    /// `[`[`zerodb::MIN_PAGE_SIZE`]`, `[`zerodb::MAX_PAGE_SIZE`]`]`; an invalid
+    /// value is reported by [`EnvOpenOptions::open`] as `Io(InvalidInput)`.
+    /// The value applies only when **creating** a store — an existing env keeps
+    /// its persisted page size (SPEC 02 §3.2). Read the effective value back
+    /// from `Env::stat().page_size`. Note this is the **database** page size,
+    /// independent of the OS page size (which gates `map_size` under D-006).
+    pub fn page_size(&mut self, size: u32) -> &mut Self {
+        self.page_size = Some(size);
         self
     }
 
@@ -168,6 +192,10 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         opts.max_dbs(self.max_dbs);
         if let Some(r) = self.max_readers {
             opts.max_readers(r);
+        }
+        // M2.6 extension; absent = the engine default (no heed counterpart).
+        if let Some(ps) = self.page_size {
+            opts.page_size(ps);
         }
         opts.flags(zerodb_env_flags(self.flags));
         let env = opts.open(path).map_err(Error::from)?;
@@ -299,36 +327,45 @@ impl<T> Env<T> {
         Ok(self.get_flags_bits().bits())
     }
 
-    /// Environment info (SPEC 00 rows 20/60). Only `map_size` is load-bearing.
+    /// Environment info (SPEC 00 rows 20/60; `mdb_env_info`). **Completed in
+    /// milestone 2.1** — every field is now populated from the live snapshot
+    /// and the reader table, where Phase 1 filled only `map_size`.
+    ///
+    /// `map_addr` is always null: it is `MDB_envinfo::me_mapaddr`, meaningful
+    /// only under `MDB_FIXEDMAP`, which ZeroDB does not implement (SPEC 01).
+    /// The field is kept for heed signature parity. `last_page_number` carries
+    /// LMDB's *meaning* but a ZeroDB-format *value* (D-002) — do not compare it
+    /// against LMDB. See [`zerodb::EnvInfo`] for the full mapping table.
     #[must_use]
     pub fn info(&self) -> EnvInfo {
+        let i = self.inner.info();
         EnvInfo {
             map_addr: ptr::null_mut(),
-            map_size: self.inner.map_size() as usize,
-            last_page_number: 0,
-            last_txn_id: self.inner.txnid() as usize,
-            maximum_number_of_readers: 0,
-            number_of_readers: 0,
+            map_size: i.map_size as usize,
+            last_page_number: i.last_pgno as usize,
+            last_txn_id: i.last_txnid as usize,
+            maximum_number_of_readers: i.max_readers,
+            number_of_readers: i.num_readers,
         }
     }
 
-    /// Env-level statistics (SPEC 00 second table — SHOULD): the main DB's stat.
+    /// Env-level statistics (SPEC 00 second table — **landed in milestone
+    /// 2.1**): the main DB's `MDB_stat`. Delegates to [`zerodb::Env::stat`],
+    /// which reads the published snapshot directly — no read txn is opened, so
+    /// this no longer consumes a reader slot or fails silently to zeros when
+    /// the reader table is full.
+    ///
+    /// Page counts are ZeroDB-format values (D-002); see [`zerodb::EnvStat`].
     #[must_use]
     pub fn stat(&self) -> EnvStat {
-        let page_size = self.inner.page_size();
-        match self.inner.read_txn() {
-            Ok(rtxn) => match self.inner.main_database().stat(&rtxn) {
-                Ok(s) => EnvStat {
-                    page_size,
-                    depth: u32::from(s.depth),
-                    branch_pages: s.branch_pages as usize,
-                    leaf_pages: s.leaf_pages as usize,
-                    overflow_pages: s.overflow_pages as usize,
-                    entries: s.entries as usize,
-                },
-                Err(_) => EnvStat::empty(page_size),
-            },
-            Err(_) => EnvStat::empty(page_size),
+        let s = self.inner.stat();
+        EnvStat {
+            page_size: s.page_size,
+            depth: u32::from(s.depth),
+            branch_pages: s.branch_pages as usize,
+            leaf_pages: s.leaf_pages as usize,
+            overflow_pages: s.overflow_pages as usize,
+            entries: s.entries as usize,
         }
     }
 
@@ -476,7 +513,9 @@ impl<T> Env<T> {
         self.inner.copy_to_file(path, opt).map_err(Into::into)
     }
 
-    /// Force durability of all prior commits (SPEC 00 second table — SHOULD).
+    /// Force durability of all prior commits (SPEC 00 second table — **landed
+    /// in milestone 2.5**). Exactly `mdb_env_sync(env, 1)`; the only form heed
+    /// exposes. Equivalent to [`Env::sync`]`(true)`.
     ///
     /// # Errors
     ///
@@ -485,17 +524,47 @@ impl<T> Env<T> {
         self.inner.force_sync().map_err(Into::into)
     }
 
+    /// Explicit environment sync — full `mdb_env_sync(env, force)` parity
+    /// (**milestone 2.5**). **ZeroDB extension:** heed exposes only
+    /// [`Env::force_sync`] (the `force = true` form), so there is no heed
+    /// signature to mirror here.
+    ///
+    /// `force = false` reproduces LMDB's `mdb_env_sync0` gate: it is a
+    /// **no-op** on a `NO_SYNC` env (prior commits stay non-durable), and it
+    /// leaves `MAP_ASYNC` as an asynchronous `msync`. `force = true` always
+    /// issues a real barrier. See [`zerodb::Env::sync`].
+    ///
+    /// # Errors
+    ///
+    /// `Io`(`EACCES`) on a read-only env; `Io` on a sync failure.
+    pub fn sync(&self, force: bool) -> Result<()> {
+        self.inner.sync(force).map_err(Into::into)
+    }
+
     /// The canonical directory path (SPEC 00 row 21).
     #[must_use]
     pub fn path(&self) -> &Path {
         self.inner.path()
     }
 
-    /// The configured reader-table size (SPEC 00 second table — SHOULD).
-    /// ZeroDB does not surface the raw value post-open; returns the LMDB default.
+    /// The configured reader-table size (SPEC 00 second table — **landed in
+    /// milestone 2.1**; `mdb_env_get_maxreaders`). Reads the real table
+    /// capacity, where Phase 1 returned the LMDB default constant.
     #[must_use]
     pub fn max_readers(&self) -> u32 {
-        126
+        self.inner.info().max_readers
+    }
+
+    /// Reader slots **currently** occupied (**milestone 2.1**).
+    ///
+    /// **ZeroDB extension — no heed/LMDB counterpart.** `EnvInfo`'s
+    /// `number_of_readers` mirrors `MDB_envinfo::me_numreaders`, which is a
+    /// *high-water mark* that never decreases (D-011); this is the live count
+    /// it is usually mistaken for. Exposed as a method rather than an `EnvInfo`
+    /// field so the mirrored struct keeps heed's exact shape.
+    #[must_use]
+    pub fn live_readers(&self) -> u32 {
+        self.inner.info().live_readers
     }
 
     /// The maximum key size (SPEC 00 second table — SHOULD; SPEC 03 §2.1).
@@ -562,19 +631,6 @@ pub struct EnvStat {
     pub overflow_pages: usize,
     /// Number of data items.
     pub entries: usize,
-}
-
-impl EnvStat {
-    fn empty(page_size: u32) -> EnvStat {
-        EnvStat {
-            page_size,
-            depth: 0,
-            branch_pages: 0,
-            leaf_pages: 0,
-            overflow_pages: 0,
-            entries: 0,
-        }
-    }
 }
 
 /// A signal fired once the environment is fully closed (SPEC 00 rows 23/24).

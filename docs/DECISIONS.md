@@ -12,3 +12,4 @@
 | 0007 | [Nested read txns — safe borrow-based `Send` child, child_count, oracle plan](adr/0007-nested-read-txns.md) | Approved | 1.9 |
 | 0008 | [Crash harness — fault-injection write backend, two-mechanism crash cycles, crash-harness binary](adr/0008-crash-harness.md) | Approved | 1.11 |
 | 0009 | [copy_to_file design + zerodb-tools shape (compact/raw copy, flock guard, logical dump format)](adr/0009-copy-and-tools.md) | Proposed | 1.12 |
+| 0010 | [Env data-file naming — adapter presents `data.mdb`, core keeps `zerodb.dat` (D-012)](adr/0010-env-file-naming.md) — file to be `git mv`'d to `0010-env-file-naming.md` at implementation (created under a docs-only constraint; number 0009 was already taken) | Proposed | 1.14 gate remainder |

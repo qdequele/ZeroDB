@@ -46,6 +46,11 @@ pub(crate) const RDR_CLAIMED: u64 = u64::MAX - 1;
 /// other's cache lines (TXN-14).
 pub(crate) struct ReaderTable {
     slots: Box<[CachePadded<AtomicU64>]>,
+    /// LMDB `MDB_txninfo::mti_numreaders` parity (milestone 2.1): the
+    /// **high-water** slot count, i.e. `max(claimed slot index) + 1` over the
+    /// env's lifetime. See [`ReaderTable::num_readers`] for why this is a
+    /// high-water mark and not the live count.
+    high_water: AtomicU64,
 }
 
 impl ReaderTable {
@@ -55,7 +60,10 @@ impl ReaderTable {
             .map(|_| CachePadded::new(AtomicU64::new(RDR_FREE)))
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        ReaderTable { slots }
+        ReaderTable {
+            slots,
+            high_water: AtomicU64::new(0),
+        }
     }
 
     /// Claim a slot (SPEC 04 TXN-15): scan from 0; the first successful
@@ -70,6 +78,12 @@ impl ReaderTable {
     /// read (ADR-0006 D1). No scan hint and no high-water-mark shortcut
     /// (ADR-0006 D2): a stale bound could hide an already-pinned reader from
     /// the writer's scan, which is exactly the missed-pin bug.
+    ///
+    /// **ADR-0006 D2 still holds** despite the `high_water` counter maintained
+    /// below: that counter is written here but read *only* by
+    /// [`ReaderTable::num_readers`] (introspection, M2.1). Neither this scan
+    /// nor the writer's [`ReaderTable::oldest`] scan consults it — both still
+    /// walk every slot, unconditionally.
     pub(crate) fn claim(&self) -> Option<u32> {
         for (i, slot) in self.slots.iter().enumerate() {
             // Relaxed pre-filter: a pure optimization to skip occupied slots
@@ -90,6 +104,15 @@ impl ReaderTable {
                 .compare_exchange(RDR_FREE, RDR_CLAIMED, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
+                // `mti_numreaders` parity (M2.1): LMDB bumps its counter only
+                // when the first-fit scan lands *past* the current high-water
+                // (`if (i == nr) ti->mti_numreaders = ++nr;`), so the value is
+                // monotone. `fetch_max` is the same thing without LMDB's
+                // reader mutex. Relaxed: this counter is pure introspection —
+                // nothing reads it to make a correctness decision, and it
+                // orders no other access. Monotonicity comes from `fetch_max`
+                // being a single RMW, not from the ordering.
+                self.high_water.fetch_max(i as u64 + 1, Ordering::Relaxed);
                 return Some(i as u32);
             }
         }
@@ -192,6 +215,61 @@ impl ReaderTable {
             // A commit landed between the two loads; retry with the newer t.
             t = t2;
         }
+    }
+
+    /// The table's fixed slot count — `max_readers` as configured at open
+    /// (TXN-14; `mdb_env_get_maxreaders` / `MDB_envinfo::me_maxreaders`).
+    /// Milestone 2.1.
+    pub(crate) fn capacity(&self) -> u32 {
+        self.slots.len() as u32
+    }
+
+    /// `MDB_envinfo::me_numreaders` parity (milestone 2.1).
+    ///
+    /// **This is a high-water mark, not a live count** — the surprising part,
+    /// verified against the fork's `mdb.c`, not assumed. LMDB allocates a
+    /// reader slot by first-fit scan and only ever *increments*
+    /// `mti_numreaders`, when the scan lands past the current high-water:
+    ///
+    /// ```text
+    /// nr = ti->mti_numreaders;
+    /// for (i=0; i<nr; i++) if (ti->mti_readers[i].mr_pid == 0) break;
+    /// ...
+    /// if (i == nr) ti->mti_numreaders = ++nr;
+    /// ```
+    ///
+    /// Ending a read txn clears the slot's `mr_pid` but leaves the counter
+    /// alone, so `me_numreaders` is the **maximum number of simultaneously
+    /// live readers ever observed** by the env, and it never decreases. LMDB's
+    /// own header documents it as "number of reader slots used", which is
+    /// misleading; the differential test in
+    /// `zerodb-oracle/tests/env_info_differential.rs` observed the real
+    /// behavior. ZeroDB reproduces it exactly (CLAUDE.md rule 1) and offers
+    /// the genuinely-live count separately as [`ReaderTable::in_use`].
+    ///
+    /// Logged as `D-011` in `docs/DIVERGENCES.md` (PROPOSED Phase 3 candidate,
+    /// not approved).
+    ///
+    /// Relaxed load: introspection only, orders nothing (see [`ReaderTable::claim`]).
+    pub(crate) fn num_readers(&self) -> u32 {
+        self.high_water.load(Ordering::Relaxed) as u32
+    }
+
+    /// Slots **currently** occupied — claimed *or* pinned. A ZeroDB extension:
+    /// the number LMDB's `me_numreaders` looks like it should be but is not
+    /// (see [`ReaderTable::num_readers`]). Milestone 2.1.
+    ///
+    /// This is an **introspection** read, not part of the pin protocol: the
+    /// value is a sample of a concurrently-mutating table and is only
+    /// meaningful as a snapshot count. `RDR_CLAIMED` counts as occupied — the
+    /// slot is owned. `SeqCst` for consistency with every other read of a slot
+    /// word (TXN-17/19/20); the cost is irrelevant on a diagnostic path and
+    /// using a weaker ordering here would need its own justification.
+    pub(crate) fn in_use(&self) -> u32 {
+        self.slots
+            .iter()
+            .filter(|s| s.load(Ordering::SeqCst) != RDR_FREE)
+            .count() as u32
     }
 
     /// Raw slot value (tests only).

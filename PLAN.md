@@ -340,15 +340,41 @@ milestone.
 ## Phase 2 — heed API completion (LMDB features heed doesn't expose)
 
 Add to heed (as the zerodb backend's extension or upstreamed):
-- 2.1 Full env/db stat & info structs (depth, pages by type, entries).
+- 2.1 Full env/db stat & info structs (depth, pages by type, entries). **DONE
+  2026-07-20** — `Env::stat() -> EnvStat` (page_size/depth/branch/leaf/overflow/
+  entries over the main tree, read from the published snapshot: no read txn, no
+  reader slot); `EnvInfo` completed to the full `MDB_envinfo` shape (map_size,
+  last_pgno, last_txnid, max_readers, num_readers) + the `live_readers`
+  extension; `heed_zerodb::Env::{info,stat,max_readers}` now report real values
+  instead of Phase-1 zeros/constants. `Database::stat` audited vs `MDB_stat` —
+  complete, no gaps (`ms_psize` is the env-level field). Found and replicated
+  D-011 (`me_numreaders` is a high-water mark, not a live count). Tests:
+  `zerodb/tests/env_stat_info.rs` (12), `zerodb-oracle/tests/env_info_differential.rs`
+  (6), `heed-zerodb/tests/phase2_extensions.rs` (9, shared with 2.5/2.6).
 - 2.2 Reader introspection API (list readers, txnID ages) — replaces
   `mdb_reader_list/check` in a single-process world.
 - 2.3 Compacting copy with progress callback.
 - 2.4 `cmp`/custom key comparators as safe Rust closures/traits (LMDB has
   `mdb_set_compare`; heed hides it) — needed before Phase 3 features anyway.
-- 2.5 Explicit `sync(force)` (mdb_env_sync parity).
+- 2.5 Explicit `sync(force)` (mdb_env_sync parity). **DONE 2026-07-20** —
+  audited `force_sync` against the fork's `mdb_env_sync0` and added the missing
+  `force` parameter as `Env::sync(force)` (heed exposes only the forced form).
+  All three `mdb_env_sync0` decisions reproduced: `MDB_RDONLY` → `EACCES` first,
+  flush only if `force || !NO_SYNC`, `MS_ASYNC` only when `MAP_ASYNC && !force`.
+  Tests: `zerodb-oracle/tests/force_sync_durability.rs` (8) — the M1.11
+  `FaultBacking` proves the journal is non-empty before `force_sync` and empty
+  after, and that the crash-floor image then reads back every committed key;
+  plus the `EACCES` differential, which is the one half heed can reach.
 - 2.6 Page-size selection at env creation (LMDB 1.0 feature, our engine already
-  supports it internally).
+  supports it internally). **DONE 2026-07-20** — `EnvOpenOptions::page_size`
+  promoted to a documented public knob on `zerodb` (+ `get_page_size`,
+  `MIN_PAGE_SIZE`/`MAX_PAGE_SIZE`/`DEFAULT_PAGE_SIZE` consts) and added as a
+  **new** method on `heed-zerodb` (heed has none). Validation: power of two in
+  `[4096, 65536]`, else `Io(InvalidInput)` at `open`. Creation-only; reopen
+  adopts the persisted geometry. No oracle dimension is possible (LMDB cannot
+  change its page size); instead the differential is zerodb-vs-zerodb —
+  identical op streams must yield identical logical content at 4K…64K. Tests:
+  `zerodb/tests/page_size_selection.rs` (10), `heed-zerodb/tests/phase2_extensions.rs`.
 - 2.7 Anything found in 0.1 marked SHOULD but unexposed.
 - 2.8 DUPSORT / DUPFIXED (descoped from 1.7 — no Phase 1 consumer): sub-page
   then sub-tree encoding, dup cursors (first_dup/next_dup/get_both...),

@@ -507,6 +507,31 @@ impl EnvInner {
         self.reader_table.release(slot);
     }
 
+    /// The reader table's fixed slot count (`max_readers` as configured at
+    /// open; `MDB_envinfo::me_maxreaders`). Milestone 2.1.
+    #[must_use]
+    pub fn max_readers(&self) -> u32 {
+        self.reader_table.capacity()
+    }
+
+    /// `MDB_envinfo::me_numreaders` parity: the **high-water** reader-slot
+    /// count, which never decreases when a read txn ends. See
+    /// [`crate::readers::ReaderTable::num_readers`] for the fork evidence and
+    /// D-011. Milestone 2.1.
+    #[must_use]
+    pub fn num_readers(&self) -> u32 {
+        self.reader_table.num_readers()
+    }
+
+    /// Reader slots **currently** occupied — a ZeroDB extension, and the
+    /// number [`EnvInner::num_readers`] misleadingly looks like (D-011).
+    /// A concurrently-sampled diagnostic count, not a synchronization point.
+    /// Milestone 2.1.
+    #[must_use]
+    pub fn live_readers(&self) -> u32 {
+        self.reader_table.in_use()
+    }
+
     /// The smallest snapshot txnid any live reader has pinned, if any: the
     /// SeqCst full-table scan of SPEC 04 TXN-20 (two-case proof quoted at the
     /// scan site, `crate::readers::ReaderTable::oldest`). The GC gate folds it
@@ -566,19 +591,47 @@ impl EnvInner {
         self.durability.read_only
     }
 
-    /// Force durability of all prior commits (`mdb_env_sync`, SPEC 00 row —
-    /// `Env::force_sync`; SPEC 01 §S6). Overrides `NO_SYNC` and downgrades
-    /// `MAP_ASYNC` to a synchronous flush (`async_flush = false`). A no-op'able
-    /// call on an env whose backing has nothing pending still issues the
-    /// barrier, matching `mdb_env_sync(force=1)`.
+    /// Force durability of all prior commits — `mdb_env_sync(env, 1)`
+    /// (SPEC 01 §S6). Equivalent to [`EnvInner::sync`]`(true)`, and the only
+    /// form heed exposes (SPEC 00 second table).
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`] (`EACCES`) on a read-only env (SPEC 01 Table 1: `mdb_env_sync`
-    ///   on an `MDB_RDONLY` env returns `EACCES`).
-    /// - [`Error::Io`] on an `msync`/`fsync` failure — which also **poisons** the
-    ///   env (SPEC 06 REC-13), exactly like a failed commit barrier.
+    /// See [`EnvInner::sync`].
     pub fn force_sync(&self) -> Result<(), Error> {
+        self.sync(true)
+    }
+
+    /// Explicit environment sync — full `mdb_env_sync(env, force)` parity
+    /// (milestone 2.5, SPEC 01 §S6). heed exposes only the `force = true` form
+    /// ([`EnvInner::force_sync`]); `force = false` is a ZeroDB extension.
+    ///
+    /// The fork's `mdb_env_sync0` decides three things, reproduced exactly:
+    ///
+    /// 1. **`MDB_RDONLY` → `EACCES`**, before anything else, for either value
+    ///    of `force`.
+    /// 2. **Whether to flush at all**: only if `force || !NO_SYNC`. So
+    ///    `sync(false)` on a `NO_SYNC` env is a **silent no-op returning
+    ///    `Ok(())`** — it does *not* make prior commits durable. This is the
+    ///    one behavioral difference between the two `force` values, and the
+    ///    reason `force_sync` is the durability-restoring call.
+    /// 3. **Which primitive**: under `WRITE_MAP`, `msync(MS_ASYNC)` iff
+    ///    `MAP_ASYNC && !force`, else `MS_SYNC`; without `WRITE_MAP`,
+    ///    `fdatasync`. I.e. `force` also downgrades `MAP_ASYNC` to a real
+    ///    barrier. Expressed here as the `async_flush` argument to
+    ///    [`Backing::sync`], which owns the primitive choice.
+    ///
+    /// A call that does flush always issues the barrier even when nothing is
+    /// pending, matching LMDB (which likewise always calls through).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] (`EACCES`) on a read-only env (SPEC 01 Table 1).
+    /// - [`Error::Io`] if the env is already poisoned (SPEC 06 REC-13).
+    /// - [`Error::Io`] on an `msync`/`fsync` failure — which also **poisons**
+    ///   the env (REC-13), exactly like a failed commit barrier.
+    pub fn sync(&self, force: bool) -> Result<(), Error> {
+        // (1) RDONLY is rejected before the NO_SYNC test, as in mdb_env_sync0.
         if self.durability.read_only {
             return Err(eacces_error());
         }
@@ -587,12 +640,18 @@ impl EnvInner {
                 "environment poisoned by a failed durability barrier (SPEC 06 REC-13)",
             )));
         }
+        // (2) `force || !NO_SYNC` — otherwise no flush is issued at all.
+        if !force && self.durability.no_sync {
+            return Ok(());
+        }
+        // (3) MS_ASYNC only when MAP_ASYNC is in effect and this is not a
+        // forced sync. `Backing::sync` ignores `async_flush` unless the
+        // backing is the writable map, matching the `MDB_WRITEMAP` guard.
+        let async_flush = !force && self.durability.map_async && self.durability.write_map;
         // Serialize with the writer: a concurrent commit must not interleave its
         // pipeline with an explicit sync. The guard is released on return.
         let _guard = self.lock_writer();
-        // `async_flush = false`: a forced sync is always a synchronous barrier
-        // (SPEC 01 §S6 — `force` downgrades `MAP_ASYNC` to `MS_SYNC`).
-        match self.backing_ref().sync(false) {
+        match self.backing_ref().sync(async_flush) {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.poison(); // REC-13
@@ -709,12 +768,44 @@ impl Env {
         self.inner.map_size()
     }
 
-    /// Environment info (SPEC 00 row 20/60). Only `map_size` is populated in
-    /// Phase 1 — the sole field any consumer reads (`Env::info().map_size`).
+    /// Environment info (SPEC 00 rows 20/60; `mdb_env_info`). Milestone 2.1
+    /// completes the struct — see [`EnvInfo`] for the field-by-field
+    /// `MDB_envinfo` mapping and which values are format-specific.
+    ///
+    /// All fields are read from the **live published snapshot** plus the reader
+    /// table; no transaction is opened, so this never blocks a writer and never
+    /// consumes a reader slot.
     #[must_use]
     pub fn info(&self) -> EnvInfo {
+        let snap = self.inner.snapshot();
         EnvInfo {
             map_size: self.inner.map_size(),
+            last_pgno: snap.last_pg,
+            last_txnid: snap.txnid,
+            max_readers: self.inner.max_readers(),
+            num_readers: self.inner.num_readers(),
+            live_readers: self.inner.live_readers(),
+        }
+    }
+
+    /// Environment-level statistics (`mdb_env_stat`): the [`EnvStat`] of the
+    /// **main** DB of the live snapshot. Milestone 2.1.
+    ///
+    /// Like [`Env::info`] this reads the published snapshot directly rather
+    /// than opening a read txn, so it neither blocks nor occupies a reader
+    /// slot. See [`EnvStat`] for the `MDB_stat` field mapping; the page counts
+    /// are ZeroDB-format values (D-002) and must not be compared to LMDB's.
+    #[must_use]
+    pub fn stat(&self) -> EnvStat {
+        let snap = self.inner.snapshot();
+        let rec = snap.main_db;
+        EnvStat {
+            page_size: self.inner.page_size(),
+            depth: rec.depth,
+            branch_pages: rec.branch_pages,
+            leaf_pages: rec.leaf_pages,
+            overflow_pages: rec.overflow_pages,
+            entries: rec.entries,
         }
     }
 
@@ -748,8 +839,9 @@ impl Env {
         self.inner.durability()
     }
 
-    /// Force durability of all prior commits (`mdb_env_sync` parity, SPEC 01
-    /// §S6). Restores durability under `NO_SYNC` / `NO_META_SYNC` / `MAP_ASYNC`.
+    /// Force durability of all prior commits — `mdb_env_sync(env, 1)`
+    /// (SPEC 01 §S6). Restores durability under `NO_SYNC` / `NO_META_SYNC` /
+    /// `MAP_ASYNC`. The form heed exposes; equivalent to [`Env::sync`]`(true)`.
     ///
     /// # Errors
     ///
@@ -757,6 +849,19 @@ impl Env {
     /// `msync`/`fsync` failure (which poisons the env, REC-13).
     pub fn force_sync(&self) -> Result<(), Error> {
         self.inner.force_sync()
+    }
+
+    /// Explicit environment sync with full `mdb_env_sync(env, force)` parity
+    /// (milestone 2.5). `force = false` is a ZeroDB extension — heed exposes
+    /// only [`Env::force_sync`]. See [`EnvInner::sync`] for the exact
+    /// three-way semantics (`EACCES`, the `force || !NO_SYNC` gate, and the
+    /// `MAP_ASYNC` downgrade).
+    ///
+    /// # Errors
+    ///
+    /// See [`EnvInner::sync`].
+    pub fn sync(&self, force: bool) -> Result<(), Error> {
+        self.inner.sync(force)
     }
 
     /// Actual on-disk file size (SPEC 00 row 18).
@@ -806,12 +911,71 @@ impl Env {
     }
 }
 
-/// Environment info (SPEC 00 rows 20/60). Mirrors the single field any consumer
-/// reads from `mdb_env_info`.
+/// Environment info (SPEC 00 rows 20/60; `mdb_env_info` / `MDB_envinfo`).
+/// Completed in **milestone 2.1** — Phase 1 populated only `map_size`, the sole
+/// field any consumer reads.
+///
+/// ## LMDB `MDB_envinfo` field mapping
+///
+/// | `MDB_envinfo` | here | note |
+/// |---|---|---|
+/// | `me_mapaddr` | *(absent)* | LMDB-structural: the address the map is fixed at under `MDB_FIXEDMAP`. ZeroDB never maps at a fixed address (`MDB_FIXEDMAP` is WON'T, SPEC 01), so the value would always be null and the field is **not exposed** here. The `heed-zerodb` mirror keeps a `map_addr` field for signature parity and reports null. |
+/// | `me_mapsize` | [`EnvInfo::map_size`] | identical meaning. |
+/// | `me_last_pgno` | [`EnvInfo::last_pgno`] | identical *meaning* (id of the last used page), but the **value is format-specific**: it counts ZeroDB pages of ZeroDB's layout, not LMDB's. Never compare it cross-engine. |
+/// | `me_last_txnid` | [`EnvInfo::last_txnid`] | identical meaning and value domain: the id of the last committed txn. Comparable cross-engine. |
+/// | `me_maxreaders` | [`EnvInfo::max_readers`] | identical: the configured reader-table size. |
+/// | `me_numreaders` | [`EnvInfo::num_readers`] | identical — **including LMDB's surprise**: it is a *high-water mark*, not a live count (D-011). Single-process (D-001), so it only ever covers *this* process's readers; under LMDB it spans every process sharing the lock file. |
+/// | *(none)* | [`EnvInfo::live_readers`] | **ZeroDB extension**: the genuinely-live occupied-slot count that `me_numreaders` looks like but is not. |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvInfo {
-    /// The configured/runtime map size, in bytes.
+    /// The configured/runtime map size, in bytes (`me_mapsize`).
     pub map_size: u64,
+    /// Id of the last used page (`me_last_pgno`) — the file high-water of the
+    /// live snapshot. Format-specific value (see the struct docs).
+    pub last_pgno: u64,
+    /// Id of the last committed transaction (`me_last_txnid`).
+    pub last_txnid: u64,
+    /// Configured reader-table size (`me_maxreaders`).
+    pub max_readers: u32,
+    /// `me_numreaders`: the **high-water** reader-slot count — the maximum
+    /// number of simultaneously live readers ever observed. It does **not**
+    /// decrease when a read txn ends; that is LMDB's actual behavior, verified
+    /// against the fork and reproduced here (D-011). For the live count, use
+    /// [`EnvInfo::live_readers`].
+    pub num_readers: u32,
+    /// **ZeroDB extension** (no `MDB_envinfo` counterpart): reader slots
+    /// currently occupied. A concurrently sampled diagnostic count.
+    pub live_readers: u32,
+}
+
+/// Environment-level statistics (`mdb_env_stat` / `MDB_stat` over the **main**
+/// DB). Milestone 2.1; the per-database form is
+/// [`crate::rotxn::DatabaseStat`] (SPEC 00 row 49).
+///
+/// ## LMDB `MDB_stat` field mapping
+///
+/// | `MDB_stat` | here | note |
+/// |---|---|---|
+/// | `ms_psize` | [`EnvStat::page_size`] | identical meaning; the value is whatever the env was created with (SPEC 02 §0, milestone 2.6). |
+/// | `ms_depth` | [`EnvStat::depth`] | identical meaning (tree height, 0 = empty). The *value* depends on per-page fan-out and therefore on the on-disk format (D-002) — comparable in kind, not exactly, cross-engine. |
+/// | `ms_branch_pages` | [`EnvStat::branch_pages`] | identical meaning; **format-specific value** (D-002). |
+/// | `ms_leaf_pages` | [`EnvStat::leaf_pages`] | identical meaning; **format-specific value** (D-002). |
+/// | `ms_overflow_pages` | [`EnvStat::overflow_pages`] | identical meaning; **format-specific value** (D-002). |
+/// | `ms_entries` | [`EnvStat::entries`] | identical meaning **and value**: for the env-level stat this is the number of entries in the main DB, which under a named-DB env is the number of named-DB catalog records. Comparable cross-engine. |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnvStat {
+    /// Database page size in bytes (`ms_psize`).
+    pub page_size: u32,
+    /// Height of the main tree (`ms_depth`); 0 = empty, 1 = root-is-leaf.
+    pub depth: u16,
+    /// Branch (internal) pages of the main tree (`ms_branch_pages`).
+    pub branch_pages: u64,
+    /// Leaf pages of the main tree (`ms_leaf_pages`).
+    pub leaf_pages: u64,
+    /// Overflow pages of the main tree (`ms_overflow_pages`).
+    pub overflow_pages: u64,
+    /// Entries in the main tree (`ms_entries`).
+    pub entries: u64,
 }
 
 /// A signal fired once the environment is fully closed (SPEC 04 TXN-53,
