@@ -9,9 +9,15 @@ Start here: `claude` then `/milestone 0.1`.
 ## `zerodb-tools` (M1.12)
 
 Offline utilities for a zerodb env directory. **All tools operate offline**: they
-take a best-effort exclusive `flock` on `<env-dir>/zerodb.dat` and refuse if the
+take a best-effort exclusive `flock` on the env's data file and refuse if the
 env may be live (D-001: zerodb has no cross-process reader protocol, so pointing
 a tool at a running env would be unsafe — close it first).
+
+The data file is `zerodb.dat` in a natively-created env and `data.mdb` in one
+created through the `heed-zerodb` adapter (ADR-0010 / D-012). The read tools
+probe **both** names; a directory holding both is a hard error rather than a
+silent pick, and `stat` prints an engine-identification line read from the
+file's own `ZDB1` magic.
 
 ```
 zerodb-tools <SUBCOMMAND> [ARGS]

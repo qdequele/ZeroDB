@@ -571,11 +571,33 @@ reachability-xor-freeness invariant (INV-10, INV-14).
 ## §8 — File geometry and growth (map_size, MAP_FULL)
 
 - **Layout.** The env is a single regular data file (SPEC 00 row 22 depends on
-  it) named **`zerodb.dat`** inside the env **directory** (the directory-env
-  convention, SPEC 00 row 7; the path passed to `open` is the directory, not the
-  file). Page 0 = meta A, page 1 = meta B, pages `≥ 2` = tree/overflow/GC pages.
-  The file length is always a whole number of pages. (M1.2 fixed the filename;
-  it is ZeroDB's own layout, not LMDB's `data.mdb`/`lock.mdb` — D-002.)
+  it) inside the env **directory** (the directory-env convention, SPEC 00 row 7;
+  the path passed to `open` is the directory, not the file). Page 0 = meta A,
+  page 1 = meta B, pages `≥ 2` = tree/overflow/GC pages. The file length is
+  always a whole number of pages.
+- **Data-file name (amended M2.x, ADR-0010 — approved; D-012).** The file is
+  **named by the opener**: the native default is **`zerodb.dat`**
+  (`zerodb::DATA_FILE_NAME`), and it is **`data.mdb`**
+  (`zerodb::HEED_DATA_FILE_NAME`) when the env is opened through `heed-zerodb`,
+  which sets `EnvOpenOptions::data_file_name` unconditionally. The name is
+  chosen via that option and resolved **once, at open**, before any write, so it
+  is outside the on-disk format (`format_version` is unaffected) and no SPEC 06
+  invariant depends on it.
+  - Rationale: LMDB's `data.mdb` is not private to LMDB — Meilisearch hardcodes
+    it in production compaction and snapshot paths, so the adapter must present
+    it or those paths break (silently, on snapshot restore). The core keeps the
+    honest name because a `ZDB1`-format file should not wear LMDB's extension in
+    contexts that never touch heed. This is the D-006/D-008/D-010
+    adapter-boundary re-imposition pattern applied to the filesystem surface.
+  - **No fallback probing in the engine**: `open` uses exactly the configured
+    name. A directory holding both names is two independent databases.
+    `zerodb-tools`, which only reads, probes both and treats both-present as a
+    hard error.
+  - **No lock file is ever created** under either name (D-001, single-process;
+    nothing in the consumer tree reads `lock.mdb` — one doc comment aside).
+  - The layout remains ZeroDB's own, never LMDB's, regardless of file name
+    (D-002); the `ZDB1` magic at byte 32 (§3) is the authoritative
+    discriminator, and `zerodb-tools stat` reports it.
 - **map_size.** `meta.map_size` is the size of the mmap region and the ceiling
   on the data file. It is set at env creation and read back via
   `Env::info().map_size` (SPEC 00 row 20). Growth beyond it is *not* automatic

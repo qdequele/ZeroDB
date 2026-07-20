@@ -61,10 +61,15 @@ fn tools_refuse_a_locked_env() {
     assert!(zerodb_tools::commands::cmd_stat(&dir).is_ok());
 }
 
-/// A tool on a missing env fails cleanly (not a panic).
+/// A tool on a missing env fails cleanly (not a panic). Since ADR-0010 the
+/// message names **both** candidate data-file names, so an operator who pointed
+/// the tool at the wrong directory can see what it looked for.
 #[test]
 fn tools_refuse_a_missing_env() {
     let dir = tmp_dir("missing");
     let err = zerodb_tools::commands::cmd_stat(&dir).unwrap_err();
-    assert!(err.to_string().contains("not found"), "err: {err}");
+    let msg = err.to_string();
+    assert!(msg.contains("no zerodb env"), "err: {err}");
+    assert!(msg.contains(zerodb::DATA_FILE_NAME), "err: {err}");
+    assert!(msg.contains(zerodb::HEED_DATA_FILE_NAME), "err: {err}");
 }

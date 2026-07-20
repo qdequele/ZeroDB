@@ -213,3 +213,103 @@ fn garbage_store_error_kind_parity() {
         "foreign/garbage store must error the same kind on both engines"
     );
 }
+
+/// ADR-0010 extension of the case above. Since the `heed-zerodb` adapter names
+/// its data file `data.mdb` (D-012), the garbage-file case becomes a *true*
+/// same-name differential: both engines are handed a garbage file at the
+/// **identical path**, differing only in which engine reads it. Both must still
+/// report `Invalid`.
+///
+/// This is also the sharpest available check that the adapter reads the name it
+/// writes: if it looked at `zerodb.dat`, it would ignore the garbage entirely
+/// and cheerfully create a fresh env.
+#[test]
+fn garbage_data_mdb_error_kind_parity_through_the_adapter() {
+    fn garbage_dir() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("data.mdb"), vec![0xFFu8; 8192]).unwrap();
+        dir
+    }
+
+    // LMDB reading a garbage `data.mdb`.
+    let lmdb_kind = {
+        let dir = garbage_dir();
+        let mut opts = heed::EnvOpenOptions::new().read_txn_without_tls();
+        opts.map_size(1 << 20);
+        opts.max_dbs(4);
+        // SAFETY: no cross-process flags; private temp dir, single-threaded.
+        match unsafe { opts.open(dir.path()) } {
+            Ok(_) => panic!("LMDB unexpectedly opened a garbage store"),
+            Err(e) => normalize_heed(e),
+        }
+    };
+
+    // heed-zerodb reading a garbage `data.mdb` at the same relative path.
+    let adapter_kind = {
+        let dir = garbage_dir();
+        let mut opts = heed_zerodb::EnvOpenOptions::new().read_txn_without_tls();
+        opts.map_size(1 << 20);
+        opts.max_dbs(4);
+        // SAFETY: as above; the adapter's `open` is unsafe only for heed
+        // signature parity (D-001 — no reachable cross-process flag).
+        match unsafe { opts.open(dir.path()) } {
+            Ok(_) => panic!(
+                "the adapter opened a garbage data.mdb — it must be reading the \
+                 name it writes (ADR-0010), not falling back to zerodb.dat"
+            ),
+            Err(e) => match e {
+                heed_zerodb::Error::Mdb(heed_zerodb::MdbError::Invalid) => OracleError::Invalid,
+                heed_zerodb::Error::Mdb(heed_zerodb::MdbError::MapFull) => OracleError::MapFull,
+                heed_zerodb::Error::Io(io) => OracleError::Other(format!("io:{}", io.kind())),
+                other => OracleError::Other(format!("{other:?}")),
+            },
+        }
+    };
+
+    assert_eq!(lmdb_kind, OracleError::Invalid);
+    assert_eq!(
+        lmdb_kind, adapter_kind,
+        "a garbage data.mdb must error the same kind on LMDB and through the adapter"
+    );
+}
+
+/// The positive half: an env *created* through the adapter is reopenable by the
+/// adapter, and its directory carries exactly the file layout LMDB consumers
+/// expect minus the lock file — `data.mdb` and nothing else. LMDB, handed the
+/// same directory, rejects it loudly on the magic (`ZDB1` ≠ LMDB) rather than
+/// misreading it: the file name is shared, the format is not (D-002).
+#[test]
+fn adapter_env_dir_is_loudly_rejected_by_real_lmdb() {
+    use heed_zerodb::types::Bytes;
+
+    let dir = TempDir::new().unwrap();
+    {
+        let mut opts = heed_zerodb::EnvOpenOptions::new().read_txn_without_tls();
+        opts.map_size(1 << 20);
+        opts.max_dbs(4);
+        // SAFETY: see above.
+        let env = unsafe { opts.open(dir.path()).unwrap() };
+        let mut wtxn = env.write_txn().unwrap();
+        let db: heed_zerodb::Database<Bytes, Bytes> = env.create_database(&mut wtxn, None).unwrap();
+        db.put(&mut wtxn, b"k", b"v").unwrap();
+        wtxn.commit().unwrap();
+        env.prepare_for_closing().wait();
+    }
+
+    let mut names: Vec<String> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["data.mdb".to_string()], "no lock.mdb (D-001)");
+
+    // Real LMDB must reject it — loudly, not by misreading ZDB1 bytes.
+    let mut opts = heed::EnvOpenOptions::new().read_txn_without_tls();
+    opts.map_size(1 << 20);
+    opts.max_dbs(4);
+    // SAFETY: no cross-process flags; private temp dir, single-threaded.
+    match unsafe { opts.open(dir.path()) } {
+        Ok(_) => panic!("real LMDB must not open a ZDB1-format data.mdb"),
+        Err(e) => assert_eq!(normalize_heed(e), OracleError::Invalid),
+    }
+}

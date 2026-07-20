@@ -43,15 +43,25 @@ pub fn cmd_migrate(
     map_size: usize,
     page_size: u32,
 ) -> Result<String, BoxErr> {
-    // The destination must be fresh; hold its lock for the whole migration.
-    let data = dst_dir.join(zerodb::DATA_FILE_NAME);
-    if data.exists() && std::fs::metadata(&data)?.len() > 0 {
+    // The source must actually be an LMDB env. Since ADR-0010 a ZeroDB env can
+    // *also* be named `data.mdb` (adapter-created), so the file name no longer
+    // discriminates — the magic does (SPEC 02 §3). Check it up front and say so
+    // explicitly, rather than letting heed return an opaque MDB_INVALID.
+    let src_data = src_dir.join(zerodb::HEED_DATA_FILE_NAME);
+    if src_data.exists() && crate::naming::is_zerodb_image(&src_data)? {
         return Err(format!(
-            "refusing to migrate into a non-empty env: {} exists",
-            data.display()
+            "{} is a ZeroDB env, not an LMDB one: it carries the ZDB1 magic (SPEC 02 §3) even \
+             though it is named {}, because envs created through the heed-zerodb adapter use \
+             LMDB's file name (ADR-0010). There is nothing to migrate — open it directly.",
+            src_data.display(),
+            zerodb::HEED_DATA_FILE_NAME
         )
         .into());
     }
+    // The destination must be fresh under either name; hold its lock for the
+    // whole migration.
+    std::fs::create_dir_all(dst_dir)?;
+    crate::commands::refuse_existing_env(dst_dir, "migrate into")?;
     let _dst_guard = lock::acquire_or_create(dst_dir)?;
 
     // --- Source: open LMDB read-only via heed ---

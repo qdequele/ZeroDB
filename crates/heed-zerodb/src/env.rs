@@ -6,7 +6,8 @@
 //! registry-deduped with `EnvAlreadyOpened`, and deferred-close, TXN-50..53).
 //! The adapter re-imposes three cheap fork boundary behaviors ZeroDB is lenient
 //! about (D-006/D-008/D-010) so the 1.14 gate sees exact parity — each is
-//! checked here, at the heed boundary, and covered by a test.
+//! checked here, at the heed boundary, and covered by a test. A fourth
+//! re-imposition landed with ADR-0010: the **data-file name** ([`DATA_FILE_NAME`]).
 
 use std::cmp::Ordering;
 use std::ffi::c_void;
@@ -20,6 +21,21 @@ use heed_traits::{Comparator, LexicographicComparator};
 use crate::flags::EnvFlags;
 use crate::txn::{RoTxn, RwTxn, TlsUsage, WithTls, WithoutTls};
 use crate::{Database, DatabaseOpenOptions, Error, Result, Unspecified};
+
+/// The name of the data file an adapter-opened env directory contains
+/// (**ADR-0010**, D-012).
+///
+/// Matches LMDB's directory-env contract, because that name is not private to
+/// LMDB: Meilisearch joins `"data.mdb"` onto an env path in production
+/// compaction (`process_batch.rs`, `routes/tasks/compact.rs`, `meilitool`) and
+/// snapshot code (`process_snapshot_creation.rs`, `enterprise_edition/s3.rs`).
+/// An adapter env dir therefore contains **exactly** this one file — no
+/// `zerodb.dat`, and no `lock.mdb` (nothing reads one; D-001).
+///
+/// The bytes inside are still ZeroDB's own `ZDB1` format (D-002): pointing
+/// `mdb_stat`/`mdb_dump` at one fails loudly with `MDB_INVALID` rather than
+/// misreading it. Use `zerodb-tools stat`, which reports the real engine.
+pub const DATA_FILE_NAME: &str = zerodb::HEED_DATA_FILE_NAME;
 
 /// The OS page size (`sysconf(_SC_PAGESIZE)`), for the D-006 boundary check.
 fn os_page_size() -> usize {
@@ -197,6 +213,12 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         if let Some(ps) = self.page_size {
             opts.page_size(ps);
         }
+        // ADR-0010 / D-012: re-impose heed's on-disk contract at the heed
+        // boundary — an env opened through this adapter materializes as
+        // `<dir>/data.mdb`, the name Meilisearch hardcodes in its production
+        // compaction and snapshot paths. No `lock.mdb` is created: ZeroDB is
+        // single-process (D-001) and nothing in the consumer tree reads one.
+        opts.data_file_name(DATA_FILE_NAME);
         opts.flags(zerodb_env_flags(self.flags));
         let env = opts.open(path).map_err(Error::from)?;
         Ok(Env {

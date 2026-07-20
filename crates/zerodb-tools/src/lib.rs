@@ -13,8 +13,17 @@
 //!
 //! ZeroDB has no cross-process reader protocol (D-001), so pointing a tool at a
 //! **live** env is unsafe. Every tool takes a best-effort exclusive `flock` on
-//! `<env-dir>/zerodb.dat` and **refuses** if it is held (`crate::lock`); the
+//! the env's data file and **refuses** if it is held (`crate::lock`); the
 //! documented contract is that tools run against a **closed** env.
+//!
+//! ## Which data file? (ADR-0010)
+//!
+//! The data-file name depends on the stack that created the env — `zerodb.dat`
+//! natively, `data.mdb` through the `heed-zerodb` adapter. The read tools
+//! (`stat`/`dump`/`check`) and the flock guard therefore **probe both names**
+//! (`crate::naming`); a directory holding *both* is a hard error, never a
+//! silent pick. `stat` reports the engine and format read from the file's own
+//! magic, so an operator never has to infer it from the name.
 //!
 //! The crate is a library (so the dump format, lock, and command functions are
 //! unit- and integration-testable) plus a thin `main.rs` that parses argv and
@@ -24,6 +33,7 @@ pub mod commands;
 pub mod common;
 pub mod dump_format;
 pub mod lock;
+pub mod naming;
 
 #[cfg(feature = "migrate-lmdb")]
 pub mod migrate;

@@ -213,3 +213,67 @@ fn real_index_proxy_point_queries_match() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// ADR-0010 / D-012 — magic-based source discrimination.
+// ---------------------------------------------------------------------------
+
+/// Since ADR-0010 a ZeroDB env can *also* be named `data.mdb` (that is exactly
+/// what the `heed-zerodb` adapter creates), so the file name no longer tells an
+/// LMDB env from a ZeroDB one. The **magic** does (SPEC 02 §3), and
+/// `migrate-from-lmdb` must say so explicitly rather than surfacing an opaque
+/// `MDB_INVALID` from heed.
+#[test]
+fn migrate_rejects_a_zerodb_data_mdb_source_by_magic() {
+    let src = tmp_dir("zdb-source");
+    // A ZeroDB env named `data.mdb`, i.e. what the adapter produces.
+    let env = ZEnvOpenOptions::new()
+        .map_size(1 << 20)
+        .data_file_name(zerodb::HEED_DATA_FILE_NAME)
+        .open(&src)
+        .unwrap();
+    let mut wtxn = env.write_txn().unwrap();
+    env.main_database().put(&mut wtxn, b"k", b"v").unwrap();
+    wtxn.commit().unwrap();
+    env.prepare_for_closing().wait();
+
+    let dst = tmp_dir("zdb-source-dst");
+    let err = zerodb_tools::migrate::cmd_migrate(&src, &dst, 1 << 20, 4096)
+        .unwrap_err()
+        .to_string();
+
+    assert!(err.contains("ZDB1"), "must name the magic: {err}");
+    assert!(
+        err.contains("ZeroDB") && err.contains("LMDB"),
+        "must say which engine it actually is: {err}"
+    );
+    // And it must not have created a half-migrated destination.
+    assert!(
+        !dst.join(zerodb::DATA_FILE_NAME).exists() || {
+            std::fs::metadata(dst.join(zerodb::DATA_FILE_NAME))
+                .unwrap()
+                .len()
+                == 0
+        }
+    );
+}
+
+/// Control: a genuine LMDB `data.mdb` is still accepted (the magic check must
+/// not reject real sources).
+#[test]
+fn migrate_still_accepts_a_real_lmdb_source() {
+    let src = tmp_dir("real-lmdb-source");
+    {
+        let mut opts = LEnvOpenOptions::new();
+        opts.max_dbs(4);
+        opts.map_size(1 << 20);
+        // SAFETY: private temp env, single-threaded, no cross-process flags.
+        let env = unsafe { opts.open(&src).unwrap() };
+        let mut wtxn = env.write_txn().unwrap();
+        let db: heed::Database<Bytes, Bytes> = env.create_database(&mut wtxn, None).unwrap();
+        db.put(&mut wtxn, b"k", b"v").unwrap();
+        wtxn.commit().unwrap();
+    }
+    let dst = tmp_dir("real-lmdb-dst");
+    zerodb_tools::migrate::cmd_migrate(&src, &dst, 1 << 20, 4096).unwrap();
+}

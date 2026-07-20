@@ -1,17 +1,17 @@
 # ADR-0010: Env directory presentation — the data-file name (`zerodb.dat` vs heed's `data.mdb` contract)
 
-- Status: **Proposed** (agent-drafted 2026-07-20; awaiting human approval — do
-  not implement before sign-off, CLAUDE.md rule 6)
-- Milestone: filed against the **M1.14 gate remainder** (this is a gate blocker:
-  compaction and snapshot-restore are latent-broken behind a green suite);
-  implementing milestone TBA by the maintainer.
+- Status: **Approved** — Option A adopted (approved by Quentin, 2026-07-20,
+  standing directive as session lead). **Implemented 2026-07-20**; see
+  §Consequences for the acceptance criteria and PROGRESS.md for the landing
+  note. D-012 is flipped to APPROVED/resolved.
+- Milestone: filed against the **M1.14 gate remainder** (this was a gate
+  blocker: compaction and snapshot-restore were latent-broken behind a green
+  suite).
 - Date: 2026-07-20
-- **Numbering note:** ADR number 0009 is already taken by
-  [`0009-copy-and-tools.md`](0009-copy-and-tools.md). This document is
-  **ADR-0010**; the file was created at `0009-env-file-naming.md` under a
-  docs-only task constraint. The implementer should `git mv` it to
-  `0010-env-file-naming.md` in the implementing change (DECISIONS.md already
-  indexes it as 0010).
+- **Numbering note (resolved):** ADR number 0009 is taken by
+  [`0009-copy-and-tools.md`](0009-copy-and-tools.md); this document is
+  **ADR-0010** and now lives at `0010-env-file-naming.md`, matching the
+  DECISIONS.md index.
 
 ## Context
 
@@ -168,7 +168,7 @@ Carry Meilisearch/meilitool patches replacing the `"data.mdb"` literals.
 
 ## Decision
 
-**Adopt Option A** (proposed — pending human approval): the core keeps
+**Adopt Option A** (approved; implemented 2026-07-20): the core keeps
 `zerodb.dat` as its native default; `zerodb::EnvOpenOptions` gains a
 `data_file_name` option; `heed-zerodb` sets it to `"data.mdb"`
 unconditionally, so every env opened through the adapter materializes as
@@ -260,7 +260,7 @@ name it writes.
    `cargo miri test -p zerodb-core`, `just fuzz-quick`,
    `just crash-test-quick`.
 
-## Open questions for human review
+## Open questions — resolved at implementation (2026-07-20)
 
 1. **Knob visibility**: should `data_file_name` be `pub` on
    `zerodb::EnvOpenOptions` (useful to embedders, slightly widens the frozen
@@ -272,3 +272,20 @@ name it writes.
    envs? Recommendation: no — there are no production envs; `mv` is enough.
 3. **Numbering**: confirm the `git mv` to `0010-env-file-naming.md` (see
    header note).
+
+**Resolutions (implementation, 2026-07-20):**
+
+1. **Knob visibility** — implemented as **`pub`**, per the recommendation:
+   `zerodb::EnvOpenOptions::data_file_name(impl Into<OsString>)` plus
+   `get_data_file_name()`, documented as an integration knob. The native API is
+   ZeroDB's own and is not frozen by SPEC 00. Validation is at `open` (empty, or
+   any embedded path separator → `Io(InvalidInput)`), keeping the builder
+   chainable and matching the D-006/D-010 open-time taxonomy. Note the check is
+   on the **raw** name, not the normalized one: `"a/"` would normalize to the
+   single component `a`, but an integration knob whose on-disk result differs
+   from the value passed is a trap, so it is rejected.
+2. **Legacy-name convenience** — **no** auto-rename, per the recommendation.
+   There are no production envs; `mv zerodb.dat data.mdb` covers the dev case.
+   Adding a rename would also make the adapter's open path non-deterministic,
+   which is the property criterion 2 exists to protect.
+3. **Numbering** — done; this file is `0010-env-file-naming.md`.

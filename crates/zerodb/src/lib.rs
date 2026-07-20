@@ -4,7 +4,9 @@
 //! 17–22): [`EnvOpenOptions`] → [`Env`], with `map_size`/`max_dbs`/`max_readers`
 //! stored, the `PREV_SNAPSHOT` / `READ_ONLY` env flags, the directory-env
 //! convention (the env path is a **directory**; the data lives in a single file
-//! `zerodb.dat` inside it — D-002 / SPEC 02 §8), [`Env::info`], [`Env::path`],
+//! inside it, named by the opener — [`DATA_FILE_NAME`] natively,
+//! [`HEED_DATA_FILE_NAME`] through the `heed-zerodb` adapter; D-002 / D-012 /
+//! SPEC 02 §8 / ADR-0010), [`Env::info`], [`Env::path`],
 //! [`Env::real_disk_size`], [`Env::try_clone_inner_file`], and deferred close via
 //! [`Env::prepare_for_closing`] / [`EnvClosingEvent`].
 //!
@@ -12,7 +14,8 @@
 //! are not exposed here yet. The error taxonomy mirrors `heed::Error`
 //! ([`Error`] / [`MdbError`]); the `heed-zerodb` adapter (M1.13) maps it 1:1.
 
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::path::{Component, Path};
 
 mod copy;
 pub use copy::{CompactionOption, CopyToFile};
@@ -30,8 +33,45 @@ pub use zerodb_core::rotxn::{
 };
 pub use zerodb_core::rwtxn::{PutFlags, RwCursor, RwTxn};
 
-/// The name of the single data file inside an env directory (D-002, SPEC 02 §8).
+/// The **native default** name of the single data file inside an env directory
+/// (D-002, SPEC 02 §8).
+///
+/// This is only a default: the opener chooses the name via
+/// [`EnvOpenOptions::data_file_name`]. Envs opened through the `heed-zerodb`
+/// adapter use [`HEED_DATA_FILE_NAME`] instead, so that heed consumers that
+/// hardcode LMDB's `data.mdb` (Meilisearch does, in production paths) see the
+/// file they expect (ADR-0010, D-012).
 pub const DATA_FILE_NAME: &str = "zerodb.dat";
+
+/// The data-file name the `heed-zerodb` adapter uses, matching LMDB's
+/// directory-env contract (ADR-0010, D-012).
+///
+/// Exposed here so the adapter, `zerodb-tools`' two-name probe, and tests all
+/// agree on one constant. No `lock.mdb` is ever created — ZeroDB is
+/// single-process (D-001) and nothing in the consumer tree reads it.
+pub const HEED_DATA_FILE_NAME: &str = "data.mdb";
+
+/// Whether `name` is a single, non-empty path component — i.e. it names a file
+/// directly inside the env directory and cannot escape it (ADR-0010).
+///
+/// Rejects a name containing *any* path separator, per the ADR, rather than
+/// only one that survives normalization: `"a/"` normalizes to the single
+/// component `a`, but accepting it would mean the file on disk is not the name
+/// the caller passed. An integration knob whose value silently differs from
+/// what lands on disk is a trap, so the check is on the raw bytes.
+fn is_single_component(name: &OsStr) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    if name
+        .to_string_lossy()
+        .contains(['/', std::path::MAIN_SEPARATOR])
+    {
+        return false;
+    }
+    let mut comps = Path::new(name).components();
+    matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
+}
 
 /// Default map size when the caller does not set one (1 MiB). LMDB/heed require
 /// a `map_size`; every production consumer sets it (SPEC 00 row 3), so this
@@ -116,6 +156,7 @@ pub struct EnvOpenOptions {
     max_readers: u32,
     page_size: u32,
     flags: EnvFlags,
+    data_file_name: OsString,
 }
 
 impl Default for EnvOpenOptions {
@@ -136,6 +177,7 @@ impl EnvOpenOptions {
             max_readers: 126,
             page_size: DEFAULT_PAGE_SIZE,
             flags: EnvFlags::EMPTY,
+            data_file_name: OsString::from(DATA_FILE_NAME),
         }
     }
 
@@ -208,6 +250,46 @@ impl EnvOpenOptions {
         self
     }
 
+    /// Choose the name of the data file inside the env directory (**ADR-0010**,
+    /// D-012). Default: [`DATA_FILE_NAME`] (`zerodb.dat`).
+    ///
+    /// This is an **integration knob**, not a format knob: the name lives
+    /// outside the on-disk format (`format_version` is unaffected) and is
+    /// resolved once, at [`EnvOpenOptions::open`], before any write — so no
+    /// SPEC 06 crash-safety invariant depends on it.
+    ///
+    /// It exists because heed/LMDB's directory-env contract names the map
+    /// `data.mdb`, and that name leaks into consumer code: Meilisearch
+    /// hardcodes it in production compaction and snapshot paths. The
+    /// `heed-zerodb` adapter therefore sets [`HEED_DATA_FILE_NAME`]
+    /// unconditionally, re-imposing the heed contract at the heed boundary
+    /// (the D-006/D-008/D-010 pattern) while the native engine keeps its honest
+    /// `ZDB1`-format name.
+    ///
+    /// **There is no fallback probing.** `open` uses exactly the configured
+    /// name: pointing this at `data.mdb` in a directory that holds only
+    /// `zerodb.dat` creates a *fresh, empty* env at `data.mdb`, it does not
+    /// adopt the other file. Determinism matters more than convenience here —
+    /// the adapter must always read the same name it writes. (`zerodb-tools`,
+    /// which only reads, does probe both names; both present is a hard error
+    /// there.)
+    ///
+    /// # Errors
+    ///
+    /// Validated at [`EnvOpenOptions::open`], not here, so the builder stays
+    /// chainable: an empty name, or one that is not a single path component
+    /// (contains a separator, or is `.`/`..`), is `Io(InvalidInput)`.
+    pub fn data_file_name(&mut self, name: impl Into<OsString>) -> &mut EnvOpenOptions {
+        self.data_file_name = name.into();
+        self
+    }
+
+    /// The configured data-file name (ADR-0010).
+    #[must_use]
+    pub fn get_data_file_name(&self) -> &OsStr {
+        &self.data_file_name
+    }
+
     /// The configured max DBs.
     #[must_use]
     pub fn get_max_dbs(&self) -> u32 {
@@ -223,7 +305,8 @@ impl EnvOpenOptions {
     /// Open (or create) the environment at `path` (SPEC 00 row 7).
     ///
     /// `path` is a **directory** (the directory-env convention, SPEC 00 row 7);
-    /// the data lives in `path/`[`DATA_FILE_NAME`]. The directory must already
+    /// the data lives in `path/`[`EnvOpenOptions::get_data_file_name`]
+    /// (default [`DATA_FILE_NAME`], ADR-0010). The directory must already
     /// exist (LMDB parity). If the data file is absent or empty, a fresh empty
     /// env is created there (SPEC 02 §3.4).
     ///
@@ -238,6 +321,9 @@ impl EnvOpenOptions {
     ///   uses for open-time argument rejection (cf. the `max_readers(0)` and
     ///   non-page-multiple `map_size` boundaries, D-010 / D-006); LMDB has no
     ///   error for this because it has no such option.
+    /// - [`Error::Io`] (`InvalidInput`) if
+    ///   [`EnvOpenOptions::data_file_name`] is empty or is not a single path
+    ///   component (ADR-0010).
     /// - [`Error::Io`] if the directory does not exist, on any file/mmap I/O
     ///   error, or if a `READ_ONLY` open finds no existing store.
     /// - [`Error::Mdb`]`(`[`MdbError::Invalid`]`)` if the file is not a valid
@@ -261,10 +347,21 @@ impl EnvOpenOptions {
                 ),
             )));
         }
+        // ADR-0010: the data-file name must be a single path component, so it
+        // can only ever name a file *inside* the env directory.
+        if !is_single_component(&self.data_file_name) {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "data_file_name ({:?}) must be a single, non-empty path component",
+                    self.data_file_name
+                ),
+            )));
+        }
         // Canonicalize the directory so the registry keys one env per real path
         // (SPEC 04 TXN-51). The directory must exist (LMDB parity).
         let canonical_dir = dir.canonicalize().map_err(Error::Io)?;
-        let data_path = canonical_dir.join(DATA_FILE_NAME);
+        let data_path = canonical_dir.join(&self.data_file_name);
 
         let read_only = self.flags.contains(EnvFlags::READ_ONLY);
         let prev_snapshot = self.flags.contains(EnvFlags::PREV_SNAPSHOT);

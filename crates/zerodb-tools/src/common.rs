@@ -25,13 +25,18 @@ pub type NamedDb = (Vec<u8>, Vec<Kv>);
 /// Open an existing env **read-only** for a tool (SPEC 01 `MDB_RDONLY`). The
 /// persisted page size wins, so the builder default here is irrelevant.
 ///
+/// `data_file_name` is the name resolved by the ADR-0010 two-name probe
+/// (`crate::naming::resolve`) — the engine itself never guesses, so the tool
+/// must tell it which file the directory actually holds.
+///
 /// # Errors
 ///
 /// Propagates [`zerodb::Error`] (missing dir, corrupt file, already-open).
-pub fn open_ro(env_dir: &std::path::Path) -> Result<Env, BoxErr> {
+pub fn open_ro(env_dir: &std::path::Path, data_file_name: &str) -> Result<Env, BoxErr> {
     let env = EnvOpenOptions::new()
         .max_dbs(MAX_TOOL_DBS)
         .flags(EnvFlags::READ_ONLY)
+        .data_file_name(data_file_name)
         .open(env_dir)?;
     Ok(env)
 }

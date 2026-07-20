@@ -45,7 +45,7 @@ mod txn;
 pub use self::database::{Database, DatabaseOpenOptions, DatabaseStat};
 pub use self::env::{
     env_closing_event, CompactionOption, DefaultComparator, Env, EnvClosingEvent, EnvInfo,
-    EnvOpenOptions, EnvStat, FlagSetMode, IntegerComparator,
+    EnvOpenOptions, EnvStat, FlagSetMode, IntegerComparator, DATA_FILE_NAME,
 };
 pub use self::error::{Error, MdbError, Result};
 pub use self::flags::{DatabaseFlags, EnvFlags, PutFlags};

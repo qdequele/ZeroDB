@@ -4,7 +4,7 @@
 //! design, no lock file). So a tool pointed at a *live* env would read a
 //! concurrently-mutated file. The tools therefore **require the env to be
 //! closed** and detect liveness only **best-effort**: they take an advisory
-//! `flock(LOCK_EX | LOCK_NB)` on `<dir>/zerodb.dat` and refuse if it is already
+//! `flock(LOCK_EX | LOCK_NB)` on the env's data file and refuse if it is already
 //! held. This detects *another tool invocation* (or any process that flocks the
 //! file); it does **not** detect the engine itself, which takes no flock — the
 //! documented contract is "run tools offline".
@@ -25,6 +25,8 @@ use std::path::Path;
 
 use zerodb::DATA_FILE_NAME;
 
+use crate::naming::{self, NameError};
+
 /// A held advisory lock. Dropping it closes the fd, which releases the
 /// `flock` (POSIX semantics: the lock is released when the last descriptor for
 /// the open file description is closed).
@@ -36,10 +38,12 @@ pub struct EnvLock {
 /// Why acquiring the env lock failed.
 #[derive(Debug)]
 pub enum LockError {
-    /// The data file does not exist (no env at this path).
+    /// The data file does not exist under either candidate name (no env here).
     Missing(std::path::PathBuf),
     /// The lock is already held — the env may be live or another tool is running.
     Busy(std::path::PathBuf),
+    /// The directory holds **both** candidate data-file names (ADR-0010).
+    Ambiguous(std::path::PathBuf),
     /// An I/O error opening or locking the file.
     Io(io::Error),
 }
@@ -48,11 +52,10 @@ impl std::fmt::Display for LockError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LockError::Missing(p) => {
-                write!(
-                    f,
-                    "no zerodb env at {}: {DATA_FILE_NAME} not found",
-                    p.display()
-                )
+                write!(f, "{}", NameError::Missing(p.clone()))
+            }
+            LockError::Ambiguous(p) => {
+                write!(f, "{}", NameError::Ambiguous(p.clone()))
             }
             LockError::Busy(p) => write!(
                 f,
@@ -68,27 +71,37 @@ impl std::fmt::Display for LockError {
 impl std::error::Error for LockError {}
 
 /// Take an exclusive advisory lock on an existing env's data file (read tools:
-/// `stat`/`dump`/`check`).
+/// `stat`/`dump`/`check`), probing **both** candidate names (ADR-0010). Returns
+/// the lock together with the resolved data file so the caller opens the same
+/// one that is locked.
 ///
 /// # Errors
 ///
-/// [`LockError::Missing`] if the env has no data file, [`LockError::Busy`] if
-/// the lock is held, [`LockError::Io`] on other I/O errors.
-pub fn acquire_existing(env_dir: &Path) -> Result<EnvLock, LockError> {
-    let data = env_dir.join(DATA_FILE_NAME);
-    if !data.exists() {
-        return Err(LockError::Missing(env_dir.to_path_buf()));
-    }
+/// [`LockError::Missing`] if the env has no data file under either name,
+/// [`LockError::Ambiguous`] if it has both, [`LockError::Busy`] if the lock is
+/// held, [`LockError::Io`] on other I/O errors.
+pub fn acquire_existing(env_dir: &Path) -> Result<(EnvLock, naming::EnvDataFile), LockError> {
+    let resolved = naming::resolve(env_dir).map_err(|e| match e {
+        NameError::Missing(p) => LockError::Missing(p),
+        NameError::Ambiguous(p) => LockError::Ambiguous(p),
+    })?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
-        .open(&data)
+        .open(&resolved.path)
         .map_err(LockError::Io)?;
-    lock_or_busy(file, env_dir)
+    let guard = lock_or_busy(file, env_dir)?;
+    Ok((guard, resolved))
 }
 
 /// Take an exclusive advisory lock on a (possibly not-yet-existing) data file,
 /// creating it if absent (write tools: `load`/`migrate` targeting a fresh dir).
+///
+/// Write tools create **native** envs, so this always uses
+/// [`zerodb::DATA_FILE_NAME`] — no probing. Callers must already have refused a
+/// directory holding an existing env under either name
+/// (`crate::naming::existing_data_files`), so this never creates a second data
+/// file next to a live one (ADR-0010).
 ///
 /// # Errors
 ///

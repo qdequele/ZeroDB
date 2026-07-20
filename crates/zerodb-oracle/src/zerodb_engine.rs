@@ -133,6 +133,24 @@ enum Active {
 struct DbEntry {
     name: Option<String>,
     db: Database,
+    /// Whether the transaction that opened this handle has **committed**.
+    ///
+    /// LMDB (`lmdb.h`): "The database handle will be private to the current
+    /// transaction until the transaction is successfully committed. If the
+    /// transaction is aborted the handle will be closed automatically."
+    /// `mdb.c`'s `mdb_dbis_update(txn, keep=0)` implements that close on the
+    /// abort path. So a handle whose creating txn aborted is DEAD, and using it
+    /// afterwards is an API-contract violation that LMDB reports as `EINVAL`
+    /// from the `TXN_DBI_EXIST` gate in `mdb_cursor_open` / `mdb_put`.
+    ///
+    /// This flag replaces the old positional `committed_dbs` watermark, which
+    /// was only correct while entries were append-only: `drop_db`'s
+    /// `dbs.remove(idx)` removes from the middle, after which
+    /// `truncate(committed_dbs)` retained the WRONG set — keeping an
+    /// uncommitted (dead) handle while discarding a committed one. That made
+    /// the harness drive both engines through a use-after-close and report the
+    /// resulting LMDB `EINVAL` as an engine divergence.
+    committed: bool,
 }
 
 /// The native engine under differential test.
@@ -144,8 +162,6 @@ pub struct ZerodbEngine {
     /// Open databases in creation order (index = the op's `db` selector, taken
     /// modulo the length — identical addressing to `LmdbEngine`).
     dbs: Vec<DbEntry>,
-    /// Databases known committed (survive an abort).
-    committed_dbs: usize,
     /// `Box` gives the `Env` a stable heap address that survives moves of the
     /// engine struct — what makes the `'static` txn borrows sound. Always
     /// `Some` between operations.
@@ -201,6 +217,25 @@ impl ZerodbEngine {
         }
     }
 
+    /// Mark every open handle as surviving the txn boundary: a successful
+    /// commit "exports" the dbis opened in this txn into the shared env
+    /// (`mdb_dbis_update(txn, keep=1)`), after which they stay valid.
+    fn mark_dbs_committed(&mut self) {
+        for e in &mut self.dbs {
+            e.committed = true;
+        }
+    }
+
+    /// Drop the handles LMDB closes when a write txn ends without committing
+    /// (`mdb_dbis_update(txn, keep=0)`): exactly those opened in that txn.
+    /// Committed handles survive. Keeping a dead handle here would make the
+    /// harness issue a use-after-close, which LMDB rejects with `EINVAL` while
+    /// ZeroDB — whose handles are plain values, not env-level dbi slots —
+    /// happily serves it. That is a harness defect, not an engine divergence.
+    fn close_dbs_opened_in_aborted_txn(&mut self) {
+        self.dbs.retain(|e| e.committed);
+    }
+
     /// Resolve a db index (modulo the number of open dbs) to a handle.
     fn db_at(&self, db: u8) -> Result<Database, OpResult> {
         if self.dbs.is_empty() {
@@ -245,7 +280,6 @@ impl ZerodbEngine {
         self.active = Active::None;
         self.cleared_in_txn = false;
         self.dbs.clear();
-        self.committed_dbs = 0;
         self.env = None;
 
         let new_size = self.desired_map_size(kib);
@@ -310,14 +344,14 @@ impl ZerodbEngine {
         match std::mem::replace(&mut self.active, Active::None) {
             Active::Rw(w) => match w.commit() {
                 Ok(()) => {
-                    self.committed_dbs = self.dbs.len();
+                    self.mark_dbs_committed();
                     self.debug_check_image();
                     OpResult::Ok
                 }
                 Err(e) => {
                     // Failed commit = abort: roll back txn-created dbs
                     // (matches LmdbEngine).
-                    self.dbs.truncate(self.committed_dbs);
+                    self.close_dbs_opened_in_aborted_txn();
                     OpResult::Err(to_oracle(e))
                 }
             },
@@ -329,12 +363,12 @@ impl ZerodbEngine {
                 drop(nested);
                 match wtxn.commit() {
                     Ok(()) => {
-                        self.committed_dbs = self.dbs.len();
+                        self.mark_dbs_committed();
                         self.debug_check_image();
                         OpResult::Ok
                     }
                     Err(e) => {
-                        self.dbs.truncate(self.committed_dbs);
+                        self.close_dbs_opened_in_aborted_txn();
                         OpResult::Err(to_oracle(e))
                     }
                 }
@@ -353,7 +387,7 @@ impl ZerodbEngine {
             Active::None => OpResult::Skipped(Skip::NoTxn),
             Active::Rw(w) => {
                 w.abort();
-                self.dbs.truncate(self.committed_dbs);
+                self.close_dbs_opened_in_aborted_txn();
                 OpResult::Ok
             }
             // Child dropped before the parent aborts (field order also
@@ -361,7 +395,7 @@ impl ZerodbEngine {
             Active::RwNested { nested, wtxn } => {
                 drop(nested);
                 wtxn.abort();
-                self.dbs.truncate(self.committed_dbs);
+                self.close_dbs_opened_in_aborted_txn();
                 OpResult::Ok
             }
             Active::Ro(r) => {
@@ -457,7 +491,11 @@ impl ZerodbEngine {
         };
         match created {
             Ok(db) => {
-                self.dbs.push(DbEntry { name: resolved, db });
+                self.dbs.push(DbEntry {
+                    name: resolved,
+                    db,
+                    committed: false,
+                });
                 OpResult::Ok
             }
             Err(e) => OpResult::Err(to_oracle(e)),
@@ -492,10 +530,11 @@ impl ZerodbEngine {
         };
         match handle.drop_db(wtxn) {
             Ok(()) => {
+                // `mdb_drop(.., del=1)` closes the dbi at ENV level
+                // (mdb.c `mdb_dbi_close`), and that close is NOT undone by a
+                // later abort — the entry is gone for good, never restored on
+                // rollback.
                 self.dbs.remove(idx);
-                if self.committed_dbs > self.dbs.len() {
-                    self.committed_dbs = self.dbs.len();
-                }
                 OpResult::Ok
             }
             Err(e) => OpResult::Err(to_oracle(e)),
@@ -841,7 +880,6 @@ impl Engine for ZerodbEngine {
         ZerodbEngine {
             active: Active::None,
             dbs: Vec::new(),
-            committed_dbs: 0,
             env: Some(Box::new(env)),
             map_size: BASE_MAP_SIZE,
             cleared_in_txn: false,
