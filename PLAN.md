@@ -390,7 +390,10 @@ Add to heed (as the zerodb backend's extension or upstreamed):
   identical op streams must yield identical logical content at 4K…64K. Tests:
   `zerodb/tests/page_size_selection.rs` (10), `heed-zerodb/tests/phase2_extensions.rs`.
 - 2.7 Anything found in 0.1 marked SHOULD but unexposed.
-- 2.8 DUPSORT / DUPFIXED (descoped from 1.7 — no Phase 1 consumer): sub-page
+- 2.8 DUPSORT / DUPFIXED — **PARKED 2026-07-20** (stage A implemented, reviewed, and
+  reverted to a git stash; the pin list is kept. No consumer uses it, and stage A
+  broke three consumer-facing paths — see PROGRESS.md for the resume preconditions.)
+  Original scope (descoped from 1.7 — no Phase 1 consumer): sub-page
   then sub-tree encoding, dup cursors (first_dup/next_dup/get_both...),
   DUPFIXED packed layout, APPEND_DUP/MULTIPLE. Highest-defect-density area of
   LMDB — budget the dedicated differential fuzz target (≥ 2 h clean) when it
