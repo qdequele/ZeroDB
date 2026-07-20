@@ -36,6 +36,17 @@ Consumers: Meilisearch (milli) and hannoy (HNSW vector index).
    write the ADR first, get human approval, then implement. Milestone 0.5
    (heed integration strategy) is ADR-only — nothing is implemented until a
    human approves it.
+7. **Scope rule.** Before a milestone that touches the on-disk format or spans
+   more than 3 crates, land the smallest change that tests the riskiest
+   assumption first. Do NOT bundle orthogonal improvements into a format change
+   because "it's the cheap moment to do it" — that reasoning is how a stage
+   becomes 4,000 lines. If a milestone has **no consumer**, prefer a spike over
+   a staged implementation: build the minimum that reveals the blast radius,
+   then decide whether to continue.
+   *(Added 2026-07-20 from M2.8a: stage A of DUPSORT — a feature no consumer
+   uses — reached 4,330 insertions across 46 files, was reviewed, and was
+   parked. A spike would have surfaced the same finding, that a dup-aware
+   cursor silently breaks compaction and dump/load, in a few hundred lines.)*
 
 ## unsafe policy
 
