@@ -789,3 +789,127 @@ against the format hooks reserved in SPEC 02 §10:
 Phase 1 implementers MUST NOT emit any of these structures; INV-21 rejects them.
 The differential-fuzz budget for this area (≥ 2 h clean) is deferred to 2.8
 (PLAN §2.8).
+
+### §12.1 — 2.8a pinned fork observations (2026-07-20; ADR-0011 Q5 first act)
+
+Observed against the oracle (heed =0.22.1 / lmdb-master-sys 0.2.6, fork
+`mdb.master.nested-rtxns`, macOS aarch64) by
+`crates/zerodb-oracle/tests/dup_pin_semantics.rs` and `dup_pin_ffi.rs` —
+**before any zerodb dup code exists**. These tables are the normative record
+the 2.8 implementation must match; the tests are the executable form. Items
+marked ⚠ contradict previously written spec/ADR text and are **pending human
+adjudication (the 2.8a stop-report)** — the observation is the truth about the
+fork; whether zerodb replicates or diverges is the open decision.
+
+**O1 — dup value size bound.** In a DUPSORT DB the value is bounded exactly
+like a key: len 0..=511 → `Ok` (empty dup values are legal), len ≥ 512 →
+`BadValSize`. Key 511 + value 511 together → `Ok`. Non-dup DBs accept the same
+lengths (inline/overflow). Confirms ADR-0011 Decision 1 (dup values are
+sub-tree keys; no `F_BIGDATA` inside dup structures).
+
+**O2 — `Database::stat` folding and growth.** `entries` counts **pairs**
+(so does `len`). `depth`/`branch_pages`/`leaf_pages`/`overflow_pages` cover
+the **main tree only**: growing one key's dup set from 3 pairs to 403 pairs
+(~40 KiB, well past sub-page capacity → promoted sub-tree) leaves
+`depth=1 branch=0 leaf=1` unchanged. Deleting back down restores nothing to
+observe (counters never moved). A key reduced to a single dup reads back
+normally. Consequence for zerodb: the parent `DBRecord`'s page counters and
+`depth` must **not** fold dup sub-tree pages; `entries` is Σ pairs.
+
+**O3 — GET_BOTH / GET_BOTH_RANGE** (FFI; dup set `k1 → [d1,d3,d5]`,
+`k2 → [e1]`):
+
+| Probe | Observed |
+|---|---|
+| GET_BOTH exact (k1,d3) | `OK key=k1 data=d3` |
+| GET_BOTH absent dup (below/between/above) | `NOTFOUND` |
+| GET_BOTH missing key | `NOTFOUND` |
+| GET_BOTH empty data | `BAD_VALSIZE` (dup data validated like a key on the read path — asymmetric with put, which accepts empty) |
+| GET_BOTH_RANGE (k1,d2) | `OK key=k1 data=d3` (first dup ≥ given) |
+| GET_BOTH_RANGE exact (k1,d5) | `OK key=k1 data=d5` |
+| GET_BOTH_RANGE empty data | `BAD_VALSIZE` |
+| GET_BOTH_RANGE (k1,d9) past last dup | `NOTFOUND`; afterwards `GET_CURRENT` → `NOTFOUND` (position invalidated) but `NEXT` → `OK k2/e1` (the main position survives at k1, stepping on) |
+| GET_BOTH_RANGE missing key | `NOTFOUND` (no ≥-key fallback: the KEY match is exact) |
+
+**O4 — dup cursor-op taxonomy** (FFI): on a **non-dup** DB:
+`FIRST_DUP`/`LAST_DUP`/`GET_BOTH`/`GET_BOTH_RANGE` → `MDB_INCOMPATIBLE`
+(⚠ Table 5 / ADR-0011 guessed `EINVAL`); `NEXT_DUP`/`PREV_DUP` **degenerate to
+plain `NEXT`/`PREV`** (they cross keys!); `NEXT_NODUP`/`PREV_NODUP` behave as
+`NEXT`/`PREV` (Table 5 already said so). On a **dup** DB with an unpositioned
+cursor: `FIRST_DUP` → `EINVAL`, `NEXT_DUP` → first entry (inherits
+NEXT-from-scratch = FIRST), `PREV_DUP` → `NOTFOUND`. Positioned:
+`NEXT_DUP` at the last dup of a key → `NOTFOUND` (never crosses keys);
+`NEXT` at the last dup → next key's first dup; `NEXT_NODUP` → next key's
+**first** dup; `PREV_NODUP` from key b → previous key's **last** dup.
+
+**O5 — put-flag semantics on a dup DB.** Plain put of an exactly-existing
+pair → `Ok`, `entries` unchanged (idempotent no-op). `NODUPDATA`: new pair
+`Ok`; exact pair → `KeyExist`, and (FFI) the out-data still points at the
+caller's bytes (no §S2-style rewrite — trivially, the existing item equals the
+input). `NOOVERWRITE` on an existing key with a NEW value → `KeyExist`, and
+(FFI) out-data is rewritten to the **first dup** of the key (the §S2 contract,
+dup flavor). `delete(key)` (no value) removes **all** dups (`entries` -= dup
+count). `delete_one_duplicate(k,v)`: exact pair → `true`, absent pair →
+`false`. RESERVE (`put_reserved`): ⚠ lmdb.h says "must not be specified with
+DUPSORT" (SPEC 01 Table 3 repeated it) but the fork **accepts** it and stores
+the reserved bytes as an ordinary dup value.
+
+**O6 — APPENDDUP / APPEND.** `APPENDDUP` compares only against the current
+**last dup of that key** under the dup ordering: first dup of any key → `Ok`
+(the key need **not** be the DB's last key — an earlier key's dup set can be
+appended to); `new > last` → `Ok`; `new ≤ last` (equal included) → `KeyExist`.
+`APPEND` on a dup DB: `key > last key` → `Ok`; **equal key → `KeyExist`
+regardless of the dup value and regardless of `APPENDDUP` also being set**
+(the fork refuses equal keys under APPEND even for dup insertion;
+`APPEND|APPENDDUP` only helps for fresh keys).
+
+**O7 — dup-only put flags on a NON-dup DB are silently IGNORED.** ⚠
+`NODUPDATA` and `APPENDDUP` on a non-dup DB behave as a plain overwrite put:
+no error, no KeyExist, no order check (out-of-order APPENDDUP keys accepted,
+values silently overwritten). `mdb_del` with a data argument on a non-dup DB
+ignores the data bytes and deletes the key (lmdb.h documents this one). heed's
+`get_duplicates` on a non-dup DB returns an iterator whose first step
+(`FIRST_DUP`) yields `Err(Incompatible)`; on a missing key it returns `None`
+(the `MDB_SET` fails first).
+
+**O8 — persisted-flag handling at open.** ⚠⚠ **The fork's `mdb_dbi_open`
+performs NO persistent-flags mismatch check** (read directly in the vendored
+`mdb.c`: on an existing named DB the persisted `MDB_db` — including
+`md_flags` — is copied into the slot and the caller's flag bits are silently
+**ignored**). Observed: a DUPSORT DB opened with no flags behaves DUPSORT; a
+plain DB opened with `DUP_SORT` requested behaves plain (double-put keeps 1
+entry); extra flags on reopen → `Ok`; **no `MDB_INCOMPATIBLE` on any
+mismatch, same-process or across env reopen**. This **falsifies SPEC 01 §S8
+item 8** and the ADR-0011 assumption "mismatch → Incompatible". Persistence
+itself is real: flags live in the on-disk record and survive reopen (O9).
+Unknown flag bits (outside `VALID_FLAGS`) → `EINVAL`; `REVERSEDUP` or
+`DUPFIXED` **without** `DUPSORT` are accepted at open (no combination check).
+
+**O9 — main-DB DUPSORT (§S8 items 3/4).** `create_database(None)` with
+`DUP_SORT` → `Ok`; the unnamed root becomes a working dup DB; its flags are
+OR'd into the main record, **persisted**, and survive env reopen (a later
+flag-less unnamed open behaves DUPSORT). While the main DB carries
+`DUPSORT`: named `create` → `Incompatible`, named `open` → `NotFound`
+(`None`) — exactly §S8 item 4, confirmed live.
+
+**O10 — DUPFIXED size discipline.** ⚠ The fork does **not** enforce item-size
+uniformity: after two 4-byte items, a 5-byte and a 3-byte put both return
+`Ok` and the stored dup set becomes garbage (4 items, wrong bytes — silent
+corruption; neither a clean `BadValSize` nor an un-fixing of the page). The
+per-key first item fixes the accepted size *per DB record*... observably the
+corruption is immediate. A different key may still start at another size
+(2-byte item on a fresh key → `Ok`, reads back clean). 2.8c must adjudicate
+replicate-vs-diverge before any DUPFIXED code.
+
+**O11 — built-in orderings.** `INTEGERDUP`/`INTEGERKEY` on same-size items:
+numeric order for native-endian 4-byte and 8-byte values (`mdb_cmp_cint`
+family). Mixed sizes are accepted and, on little-endian, an 8-byte 7 sorts
+numerically among 4-byte items (`[1,2,7,300,70000]`) — formally undefined per
+lmdb.h, pinned as observed on LE (all target platforms are LE).
+`REVERSEDUP`/`REVERSEKEY`: bytes compared from the **end** toward the front
+(`c < ax < by < az`).
+
+**O12 — iteration shape.** Full iteration of a dup DB yields one entry per
+**pair**, the key repeated, dups in dup order (`[a=1,a=5,a=9,b=2]`);
+`rev_iter` is the exact reverse; `first`/`last` return (first key, first dup)
+/ (last key, last dup); `get` returns the **first** dup of the key.

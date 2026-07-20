@@ -106,7 +106,7 @@ and never appear as a user-visible `PutFlags` bit; `MULTIPLE` is unexposed.
 | `MDB_NOOVERWRITE` | `0x10` | `PutFlags::NO_OVERWRITE` | **SHOULD** ‡ | 1.10 | `flag_no_overwrite_returns_existing` | If the key already exists, **do not overwrite**: LMDB copies the existing value into the caller's `data` (`*data = d2`) and returns `MDB_KEYEXIST` → heed `MdbError::KeyExist`. The returned-existing-value contract is load-bearing (§S2). No consumer passes it, but PLAN 1.10 lists it in Phase-1 scope (‡, Mismatches note 2). |
 | `MDB_NODUPDATA` | `0x20` | `PutFlags::NO_DUP_DATA` | **WON'T** (→2.8) | — | — | DUPSORT-only: skip if the key/value pair already exists; on `mdb_cursor_del` removes all dups. No consumer (no DUPSORT DB). D-004. |
 | `MDB_CURRENT` | `0x40` | `Cursor::put_current` (internal) | **MUST** | 1.4 | `cursor_put_current_overwrite`, `cursor_put_current_uninit_einval` | SPEC 00 row 33 (milli/arroy/hannoy/cellulite `put_current`/`put_current_with_options`). Overwrite the value at the current cursor position. Requires the cursor be positioned (`C_INITIALIZED`) else `EINVAL`. The `_with_options` form re-encodes with a different data codec. `unsafe`: no live borrow into the entry may span the call (§S3). |
-| `MDB_RESERVE` | `0x10000` | `Database::put_reserved` (internal) | **MUST** | 1.10 | `put_reserved_writes_into_map`, `put_reserved_overwrite_same_size` | SPEC 00 row 35 (milli word-prefix docids). Allocate space for the value and return a pointer to it (`data->mv_data = METADATA(page)` / `= olddata.mv_data`); the caller fills it in-place, avoiding a temp buffer. Not valid with DUPSORT. Lifetime + `WRITE_MAP` interaction in §S3/§S7. |
+| `MDB_RESERVE` | `0x10000` | `Database::put_reserved` (internal) | **MUST** | 1.10 | `put_reserved_writes_into_map`, `put_reserved_overwrite_same_size` | SPEC 00 row 35 (milli word-prefix docids). Allocate space for the value and return a pointer to it (`data->mv_data = METADATA(page)` / `= olddata.mv_data`); the caller fills it in-place, avoiding a temp buffer. ~~Not valid with DUPSORT~~ **observed 2.8a pin: lmdb.h forbids it with DUPSORT but the fork does NOT reject it — the reserved bytes are stored as an ordinary dup value (SPEC 03 §12.1 O5; ⚠ pending adjudication)**. Lifetime + `WRITE_MAP` interaction in §S3/§S7. |
 | `MDB_APPEND` | `0x20000` | `PutFlags::APPEND` | **MUST** | 1.10 | `flag_append_out_of_order`, `flag_append_ascending_ok`, `flag_append_equal_key_keyexist` | SPEC 00 rows 32/33 (arroy bulk item append; milli facet bulk via `put_current_with_options`). Fast bulk insert assuming ascending key order: LMDB positions at the **last** key and compares (`md_cmp(key, last)`). If `key > last` → insert at end (no page split). If `key <= last` (**including equal**) → `MDB_KEYEXIST` → heed `KeyExist` → arroy `InvalidItemAppend`. Only the last key is checked, not full order (§S1). |
 | `MDB_APPENDDUP` | `0x40000` | `PutFlags::APPEND_DUP` | **WON'T** (→2.8) | — | — | DUPSORT append of a dup value in sorted order. No consumer (no DUPSORT DB). D-004. |
 | `MDB_MULTIPLE` | `0x80000` | *(unexposed by heed)* | **WON'T** (→2.8) | — | — | DUPFIXED-only bulk-store of many fixed-size dup values in one call; `data[1].mv_size` carries the count. Returns `MDB_INCOMPATIBLE` if the DB is not DUPFIXED. Not exposed by heed; no consumer. D-004. |
@@ -344,8 +344,19 @@ Order of checks, each with its exact code, for zerodb's M1.6 catalog to match:
 6. name absent: no `CREATE` → propagate `MDB_NOTFOUND`; `CREATE` in an RDONLY
    txn → `EACCES`.
 7. no free slot and `numdbs >= maxdbs` → `MDB_DBS_FULL`.
-8. reopening an existing named DB with a **different** persistent-flags set →
-   `MDB_INCOMPATIBLE` (checked against `PERSISTENT_FLAGS`).
+8. ~~reopening an existing named DB with a **different** persistent-flags set →
+   `MDB_INCOMPATIBLE` (checked against `PERSISTENT_FLAGS`)~~ — **FALSIFIED BY
+   OBSERVATION (2.8a pin, 2026-07-20; ⚠ human ratification of the corrected
+   text pending, see the 2.8a stop-report).** The fork's `mdb_dbi_open` has
+   **no** persistent-flags mismatch check: for an existing named DB the
+   persisted `md_flags` are copied into the dbi slot and the caller's
+   requested flag bits are **silently ignored** (a DUPSORT DB opened
+   flag-less behaves DUPSORT; a plain DB opened with `MDB_DUPSORT` requested
+   behaves plain). Verified both same-process and across env reopen, and read
+   directly in the vendored `mdb.c`. For the main DB (`name == NULL`),
+   requested persistent flags are **OR'd into** the main record and persist
+   on commit. See SPEC 03 §12.1 O8/O9 and
+   `zerodb-oracle/tests/dup_pin_semantics.rs::pin_flags_persistence_open_mismatch`.
 
 Since Phase 1 rejects all persistent DB flags (D-004), checks 4/5/8's
 dup/integer branches are dormant, but the `CREATE`/`NOTFOUND`/`EACCES`/`DBS_FULL`/

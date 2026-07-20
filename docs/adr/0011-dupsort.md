@@ -482,3 +482,48 @@ which the staging fence already requires.
 CONFIRMED, emphatically.** In the area PLAN.md calls LMDB's
 highest-defect-density, behavior is observed before it is implemented. No engine
 code lands until the pin list is green against the fork.
+
+---
+
+## Pin-list adjudication (2026-07-20, session lead under standing directive)
+
+The Q5 pin list fired its stop clause. Rulings:
+
+**O8 — flags mismatch at open: REPLICATE THE FORK (silent persisted-wins).**
+The fork performs no check; SPEC 01 §S8 item 8 was false and its strike-through
+is **ratified**. Ground rule 1 governs: observed behavior wins over documentation
+and over this ADR's assumption. Decision 3's "mismatch → `Incompatible`" is
+**retracted**; `Incompatible` is produced only where the fork actually produces
+it (named-create under a DUPSORT main DB; name collides with a non-subDB node).
+No DIVERGENCES entry — we are matching, not diverging.
+
+The asymmetry with the approved Q1 fingerprint is principled, not arbitrary: a
+flags mismatch is **well-defined and non-corrupting** (the DB behaves as
+persisted), whereas a comparator mismatch **silently corrupts on write**. We
+replicate well-defined surprises; we refuse to ship silent corruption when the
+fix is 16 spare bits. The fingerprint therefore remains the only refuse-at-open
+check zerodb adds.
+
+**O9 — main-DB DUPSORT is legal, functional, and persisted.** The ADR's aside to
+the contrary is retracted; §S8 item 4 is confirmed live.
+
+**O12 — `put_reserved` on DUPSORT is accepted.** Replicate. `lmdb.h` and SPEC 01
+Table 3 both say "not valid with DUPSORT"; the fork accepts it and stores
+normally. Observation wins; the Table 3 annotation is ratified.
+
+**O10 — DUPFIXED size mismatch (silent corruption): LEAN toward `BadValSize`,
+decided at 2.8c.** Not settled here, but the implementer should keep
+`leaf2_ksize` wording compatible with rejecting a mismatched item size. Rationale
+matches Q1: converting silent corruption into a typed error costs a length check
+on a path that already validates sizes, and no consumer uses DUPFIXED. If taken,
+it **requires a DIVERGENCES entry with sign-off** — it is a deliberate
+improvement, not parity.
+
+**O2 is load-bearing for the format freeze:** `stat.entries` counts **pairs**,
+while depth/branch/leaf/overflow describe the **main tree only** — a promoted dup
+sub-tree contributes nothing. The parent `DBRecord` must not fold sub-tree pages.
+
+**O7 is load-bearing for the fuzz driver:** `NODUPDATA`/`APPENDDUP` on a non-dup
+DB are silently ignored (plain put, no error), so they are compared *successes*,
+not compared errors.
+

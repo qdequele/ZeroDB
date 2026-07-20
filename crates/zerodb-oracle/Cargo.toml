@@ -11,6 +11,11 @@ license.workspace = true
 # (mdb.master.nested-rtxns @ cd767228). Exact pin — see ADR-0001. This crate,
 # and only this crate, may depend on heed / any LMDB sys crate in Phases 0–1.
 heed = "=0.22.1"
+# Direct FFI to the same vendored fork, for dup surfaces heed does not expose
+# (GET_BOTH/GET_BOTH_RANGE, raw dbi flags, MDB_MULTIPLE). Sanctioned by
+# ADR-0011 Q2 ("direct lmdb-master-sys FFI inside zerodb-oracle — the one
+# crate allowed to"); exact same pin heed vendors, so a single C linkage.
+lmdb-master-sys = "=0.2.6"
 thiserror.workspace = true
 arbitrary.workspace = true
 # The native engine under test. Workspace-internal, no C linkage.
