@@ -18,15 +18,18 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path};
 
 mod copy;
-pub use copy::{CompactionOption, CopyToFile};
+pub use copy::{CompactionOption, CopyProgress, CopyToFile};
 
 pub use zerodb_core::builder::{build_multi_db_image, NamedDbData, DEFAULT_FILL_PERMILLE};
 pub use zerodb_core::check;
+pub use zerodb_core::cmp::{Comparator, ComparatorError, DefaultComparator, FnComparator, KeyCmp};
 pub use zerodb_core::env::{
-    CommitHook, DurabilityFlags, Env, EnvClosingEvent, EnvInfo, EnvStat, HookPoint, Snapshot,
+    CommitHook, DurabilityFlags, Env, EnvClosingEvent, EnvInfo, EnvStat, HookPoint, ReaderEntry,
+    Snapshot,
 };
 pub use zerodb_core::error::{Error, MdbError, Result};
 pub use zerodb_core::nested::NestedRoTxn;
+pub use zerodb_core::page::MAX_KEY_SIZE;
 pub use zerodb_core::rotxn::{
     collect_entries_flagged, free_page_count, named_databases, Database, DatabaseStat, RoRange,
     RoTxn, TxnRead,

@@ -455,6 +455,73 @@ impl Env {
         Ok(Database::from_sel(DbSel::Named(dbi)))
     }
 
+    /// `create_database` with a **custom key comparator** (**milestone 2.4**;
+    /// LMDB's `mdb_dbi_open` + `MDB_CREATE` followed by `mdb_set_compare`,
+    /// which heed does not expose at all — SPEC 00 second table, D-004).
+    ///
+    /// The comparator is registered for this database on the environment and
+    /// governs every subsequent search, insert, split, range bound, neighbor
+    /// seek and `APPEND` check on it (SPEC 03 §2.0).
+    ///
+    /// # The comparator is not stored in the file
+    ///
+    /// **Every future open of this database — in this process or any other —
+    /// must pass the same ordering, and nothing checks that it did.** A tree
+    /// read under a different ordering than the one that built it silently
+    /// returns wrong answers and, once written to, is permanently corrupt.
+    /// LMDB has the identical hazard; ZeroDB cannot do better without an
+    /// on-disk format change (`DBRecord` is full — see [`crate::cmp`] and
+    /// D-014). Treat the comparator as part of your schema.
+    ///
+    /// # Errors
+    ///
+    /// - Everything [`Env::create_database`] returns.
+    /// - [`Error::Io`] (`InvalidInput`) if `name` is `None`: the main/unnamed
+    ///   database is also the named-DB catalog and is always memcmp-ordered
+    ///   ([`crate::cmp::ComparatorError::MainDatabase`]).
+    /// - [`Error::Io`] (`InvalidInput`) if a *different* comparator is already
+    ///   registered for this database in this process
+    ///   ([`crate::cmp::ComparatorError::Mismatch`]).
+    pub fn create_database_with_comparator(
+        &self,
+        wtxn: &mut RwTxn<'_>,
+        name: Option<&[u8]>,
+        cmp: Box<dyn crate::cmp::Comparator>,
+    ) -> Result<Database> {
+        let db = self.create_database(wtxn, name)?;
+        self.register_comparator_on(db, cmp)?;
+        Ok(db)
+    }
+
+    /// Register `cmp` for `db` on `env`, mapping [`crate::cmp::ComparatorError`]
+    /// into the public taxonomy (**M2.4**).
+    ///
+    /// `Io(InvalidInput)` is the error kind ZeroDB already uses for open-time
+    /// argument rejection (cf. D-006 / D-010 / the 2.6 `page_size` selector);
+    /// LMDB has no error to mirror here because `mdb_set_compare` simply returns
+    /// `EINVAL` for a bad dbi and otherwise cannot fail.
+    pub(crate) fn register_comparator_on(
+        &self,
+        db: Database,
+        cmp: Box<dyn crate::cmp::Comparator>,
+    ) -> Result<()> {
+        let dbi = match db.sel() {
+            DbSel::Main => {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    crate::cmp::ComparatorError::MainDatabase.to_string(),
+                )))
+            }
+            DbSel::Named(dbi) => dbi,
+        };
+        self.inner().register_comparator(dbi, cmp).map_err(|e| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                e.to_string(),
+            ))
+        })
+    }
+
     /// Open a nested read transaction parented to `parent` (SPEC 00 row 16).
     /// Equivalent to [`RwTxn::nested_read_txn`] — provided because heed
     /// exposes both entry points (`Env::nested_read_txn(&self, &wtxn)`
@@ -503,6 +570,9 @@ impl TxnRead for RwTxn<'_> {
                 }
             }
         }
+    }
+    fn comparator_for(&self, sel: DbSel) -> crate::cmp::KeyCmp<'_> {
+        self.env.inner().comparator_for(sel)
     }
 }
 
@@ -579,6 +649,19 @@ impl<'env> RwTxn<'env> {
 
     /// The working `DBRecord` of `tree` (ADR-0005 D1 selector). A named tree's
     /// record must have been loaded by [`RwTxn::ensure_open`] first.
+    /// The key ordering of `tree` (**M2.4**, SPEC 03 §2.0).
+    ///
+    /// `Main` and `Free` are memcmp **unconditionally**: `Main` doubles as the
+    /// named-DB catalog and `Free` is keyed by big-endian txnids whose memcmp
+    /// order *is* their numeric order (SPEC 05 §1), which the GC gate depends
+    /// on. Only a named DB can carry a caller's comparator.
+    fn tree_comparator(&self, tree: TreeId) -> crate::cmp::KeyCmp<'_> {
+        match tree {
+            TreeId::Main | TreeId::Free => crate::cmp::KeyCmp::Default,
+            TreeId::Named(dbi) => self.env.inner().comparator_for(DbSel::Named(dbi)),
+        }
+    }
+
     fn record(&self, tree: TreeId) -> &DBRecord {
         match tree {
             TreeId::Main => &self.main_db,
@@ -975,6 +1058,7 @@ impl<'env> RwTxn<'env> {
     /// (`touch_path`), so a `NO_OVERWRITE` miss or a `del` of an absent key
     /// dirties nothing (LMDB parity).
     fn search_path(&self, tree: TreeId, key: &[u8]) -> Result<(Path, bool)> {
+        let cmp = self.tree_comparator(tree);
         let rec = *self.record(tree);
         let mut path = Vec::new();
         if rec.root == PGNO_INVALID {
@@ -986,7 +1070,7 @@ impl<'env> RwTxn<'env> {
             match page.page_type() {
                 PageType::Leaf => {
                     let leaf = page.as_leaf().map_err(corrupt)?;
-                    let (ki, found) = match leaf.lookup(key) {
+                    let (ki, found) = match leaf.lookup_with(key, cmp) {
                         Ok(i) => (i, true),
                         Err(i) => (i, false),
                     };
@@ -995,7 +1079,7 @@ impl<'env> RwTxn<'env> {
                 }
                 PageType::Branch => {
                     let br = page.as_branch().map_err(corrupt)?;
-                    let i = br.child_index(key);
+                    let i = br.child_index_with(key, cmp);
                     path.push((pgno, i));
                     pgno = br.child_pgno(i);
                 }
@@ -1126,7 +1210,10 @@ impl<'env> RwTxn<'env> {
             return res;
         }
         let (mut path, last_key) = self.rightmost_path(tree)?;
-        if key <= last_key.as_slice() {
+        // M2.4: "strictly greater than the last key" is decided by the target
+        // tree's ordering, not memcmp — otherwise APPEND on a custom-comparator
+        // DB would reject exactly the keys it should accept.
+        if self.tree_comparator(tree).compare(key, &last_key) != std::cmp::Ordering::Greater {
             return Err(Error::Mdb(MdbError::KeyExist));
         }
         let res = self.append_apply(tree, &mut path, key, val);

@@ -124,6 +124,28 @@ impl<'e, T> RoTxn<'e, T> {
         drop(self);
         Ok(())
     }
+
+    /// This transaction's id (SPEC 00 second table — SHOULD, **landed in
+    /// milestone 2.7**; `mdb_txn_id`).
+    ///
+    /// For a read txn this is the **pinned snapshot's** txnid — the commit
+    /// this reader sees, which is also what `Env::reader_list` reports for its
+    /// slot (M2.2). For a write txn it is the id the txn *will* publish when
+    /// it commits. A nested read txn reports its parent write txn's id, since
+    /// that is the state it observes (SPEC 04 §5).
+    #[must_use]
+    pub fn id(&self) -> usize {
+        let id = match &self.inner {
+            InnerTxn::Ro(r) => r.txnid(),
+            InnerTxn::Nested(n) => n.txnid(),
+            InnerTxn::Rw(w) => w.txnid(),
+        };
+        // heed types this as `usize` (`mdb_txn_id` returns `size_t`); ZeroDB
+        // txnids are `u64`. On a 32-bit target this would truncate, but the
+        // supported targets (CLAUDE.md: linux-aarch64 primary, linux-x86_64,
+        // macOS aarch64) are all 64-bit, so the cast is lossless there.
+        id as usize
+    }
 }
 
 /// `RoTxn<WithTls>` → `RoTxn<AnyTls>` (SPEC 04 §4 deref chain). ZeroDB carries

@@ -255,3 +255,247 @@ fn page_size_survives_the_tls_retag() {
     let env = unsafe { opts.open(dir.path()).unwrap() };
     assert_eq!(env.stat().page_size, 16384, "page_size lost across retag");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2 tranche B (milestones 2.2, 2.3, 2.4, 2.7) at the adapter boundary
+// ---------------------------------------------------------------------------
+
+// 2.2 — reader introspection -------------------------------------------------
+
+#[test]
+fn reader_list_through_the_adapter_tracks_live_read_txns() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = env_opts();
+    opts.map_size(4 * 1024 * 1024).max_dbs(4).max_readers(16);
+    let env = unsafe { opts.open(dir.path()).unwrap() };
+
+    let mut wtxn = env.write_txn().unwrap();
+    let db: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("d")).unwrap();
+    db.put(&mut wtxn, "k", b"v").unwrap();
+    wtxn.commit().unwrap();
+
+    assert!(env.reader_list().is_empty());
+
+    let r1 = env.read_txn().unwrap();
+    let r2 = env.read_txn().unwrap();
+    let list = env.reader_list();
+    assert_eq!(list.len(), 2, "both read txns occupy listed slots");
+    assert_eq!(list.len() as u32, env.live_readers());
+    let pinned = env.info().last_txn_id as u64;
+    for e in &list {
+        assert_eq!(e.txnid, Some(pinned));
+        assert_eq!(e.age, Some(0));
+    }
+
+    // Ages advance with commits while the readers stay pinned.
+    let mut wtxn = env.write_txn().unwrap();
+    db.put(&mut wtxn, "k2", b"v").unwrap();
+    wtxn.commit().unwrap();
+    assert!(env.reader_list().iter().all(|e| e.age == Some(1)));
+
+    drop(r1);
+    assert_eq!(env.reader_list().len(), 1);
+    drop(r2);
+    assert!(env.reader_list().is_empty());
+}
+
+#[test]
+fn clear_stale_readers_through_the_adapter_is_zero_and_harmless() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = env_opts();
+    opts.map_size(1024 * 1024).max_dbs(2);
+    let env = unsafe { opts.open(dir.path()).unwrap() };
+
+    assert_eq!(env.clear_stale_readers().unwrap(), 0);
+    let r = env.read_txn().unwrap();
+    assert_eq!(
+        env.clear_stale_readers().unwrap(),
+        0,
+        "a live reader is not stale (D-001: no cross-process readers exist)"
+    );
+    assert_eq!(env.reader_list().len(), 1, "and it was not evicted");
+    drop(r);
+}
+
+// 2.3 — copy with progress ---------------------------------------------------
+
+#[test]
+fn copy_to_path_with_progress_through_the_adapter() {
+    use heed_zerodb::CompactionOption;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = env_opts();
+    opts.map_size(16 * 1024 * 1024).max_dbs(4);
+    let env = unsafe { opts.open(dir.path()).unwrap() };
+
+    let mut wtxn = env.write_txn().unwrap();
+    let db: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("d")).unwrap();
+    for k in 0..3000u32 {
+        db.put(&mut wtxn, &format!("k{k:06}"), &[b'x'; 100])
+            .unwrap();
+    }
+    wtxn.commit().unwrap();
+
+    for (option, name) in [
+        (CompactionOption::Enabled, "compact.mdb"),
+        (CompactionOption::Disabled, "raw.mdb"),
+    ] {
+        let out = dir.path().join(name);
+        let mut seen = Vec::new();
+        env.copy_to_path_with_progress(&out, option, &mut |p| seen.push(p))
+            .unwrap();
+        assert!(
+            seen.len() >= 2,
+            "{name}: opening and closing calls at least"
+        );
+        assert_eq!(seen[0].done, 0);
+        assert_eq!(seen.last().unwrap().done, seen.last().unwrap().total);
+        assert!(
+            seen.windows(2).all(|w| w[0].done <= w[1].done),
+            "{name}: monotone"
+        );
+        assert!(out.exists());
+    }
+}
+
+// 2.4 — heed's type-level comparator is finally honored -----------------------
+
+/// Descending byte order, in heed's type-level `Comparator` shape.
+enum ReverseComparator {}
+
+impl heed_zerodb::Comparator for ReverseComparator {
+    fn compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        b.cmp(a)
+    }
+}
+
+#[test]
+fn database_open_options_key_comparator_is_actually_applied() {
+    // Before 2.4 the `C` type parameter on `DatabaseOpenOptions::key_comparator`
+    // was accepted and then silently ignored — every database was memcmp. A
+    // caller asking for a different ordering got no error and no effect. This
+    // asserts the ordering now reaches the engine.
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = env_opts();
+    opts.map_size(8 * 1024 * 1024).max_dbs(4);
+    let env = unsafe { opts.open(dir.path()).unwrap() };
+
+    let mut wtxn = env.write_txn().unwrap();
+    let rev: Database<Str, Bytes, ReverseComparator> = env
+        .database_options()
+        .types::<Str, Bytes>()
+        .key_comparator::<ReverseComparator>()
+        .name("rev")
+        .create(&mut wtxn)
+        .unwrap();
+    let plain: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("plain")).unwrap();
+    for k in ["a", "b", "c", "d"] {
+        rev.put(&mut wtxn, k, b"v").unwrap();
+        plain.put(&mut wtxn, k, b"v").unwrap();
+    }
+    wtxn.commit().unwrap();
+
+    let rtxn = env.read_txn().unwrap();
+    let got: Vec<String> = rev
+        .iter(&rtxn)
+        .unwrap()
+        .map(|e| e.unwrap().0.to_string())
+        .collect();
+    assert_eq!(
+        got,
+        vec!["d", "c", "b", "a"],
+        "the registered comparator governs iteration order"
+    );
+    // Every key still resolves through the comparator-aware descent.
+    for k in ["a", "b", "c", "d"] {
+        assert!(rev.get(&rtxn, k).unwrap().is_some(), "missing {k}");
+    }
+    // The DefaultComparator database in the same env is untouched.
+    let got: Vec<String> = plain
+        .iter(&rtxn)
+        .unwrap()
+        .map(|e| e.unwrap().0.to_string())
+        .collect();
+    assert_eq!(got, vec!["a", "b", "c", "d"]);
+}
+
+#[test]
+fn default_comparator_databases_are_unaffected_by_the_2_4_plumbing() {
+    // The whole consumer tree is DefaultComparator (SPEC 00 row 53). 2.4 must
+    // be a strict no-op for them — no registration, no behavior change.
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = env_opts();
+    opts.map_size(4 * 1024 * 1024).max_dbs(4);
+    let env = unsafe { opts.open(dir.path()).unwrap() };
+
+    let mut wtxn = env.write_txn().unwrap();
+    let db: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("d")).unwrap();
+    for k in 0..500u32 {
+        db.put(&mut wtxn, &format!("k{k:05}"), b"v").unwrap();
+    }
+    wtxn.commit().unwrap();
+
+    let rtxn = env.read_txn().unwrap();
+    let got: Vec<String> = db
+        .iter(&rtxn)
+        .unwrap()
+        .map(|e| e.unwrap().0.to_string())
+        .collect();
+    let mut expected: Vec<String> = (0..500u32).map(|k| format!("k{k:05}")).collect();
+    expected.sort();
+    assert_eq!(got, expected, "plain byte order, exactly as before 2.4");
+    drop(rtxn);
+
+    // And compaction — which refuses a custom-comparator env — still works.
+    let out = dir.path().join("c.mdb");
+    env.copy_to_path(&out, heed_zerodb::CompactionOption::Enabled)
+        .expect("no custom comparator registered, so compaction is available");
+    assert!(out.exists());
+}
+
+// 2.7 — SHOULD leftovers -----------------------------------------------------
+
+#[test]
+fn max_key_size_reflects_the_engine_constant() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = env_opts();
+    opts.map_size(1024 * 1024);
+    let env = unsafe { opts.open(dir.path()).unwrap() };
+    assert_eq!(
+        env.max_key_size(),
+        zerodb::MAX_KEY_SIZE,
+        "must read the engine's constant, not a copy of its current value \
+         (the M2.1 max_readers defect class)"
+    );
+    assert_eq!(env.max_key_size(), 511, "and that constant is still 511");
+}
+
+#[test]
+fn txn_id_is_exposed_on_both_txn_kinds() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = env_opts();
+    opts.map_size(2 * 1024 * 1024).max_dbs(2);
+    let env = unsafe { opts.open(dir.path()).unwrap() };
+
+    let before = env.info().last_txn_id;
+    let mut wtxn = env.write_txn().unwrap();
+    let db: Database<Str, Bytes> = env.create_database(&mut wtxn, Some("d")).unwrap();
+    db.put(&mut wtxn, "k", b"v").unwrap();
+    assert_eq!(
+        wtxn.id(),
+        before + 1,
+        "a write txn's id is the commit it will publish"
+    );
+    wtxn.commit().unwrap();
+
+    let rtxn = env.read_txn().unwrap();
+    assert_eq!(
+        rtxn.id(),
+        env.info().last_txn_id,
+        "a read txn's id is its pinned snapshot"
+    );
+    // ... and it agrees with what reader_list reports for that reader's slot.
+    let list = env.reader_list();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].txnid, Some(rtxn.id() as u64));
+}

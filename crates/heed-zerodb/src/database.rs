@@ -3,6 +3,7 @@
 //! over ZeroDB. Read methods dispatch across the three txn sources
 //! ([`with_read!`]); write methods target `&mut RwTxn`.
 
+use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 
@@ -826,7 +827,10 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         let name = name_bytes(self.name);
         let page_size = self.env.zdb().page_size();
         let z = self.env.zdb();
-        let res = with_read!(rtxn, |t| z.open_database(t, name))?;
+        let res = match custom_comparator::<C>() {
+            None => with_read!(rtxn, |t| z.open_database(t, name))?,
+            Some(cmp) => with_read!(rtxn, |t| z.open_database_with_comparator(t, name, cmp))?,
+        };
         Ok(res.map(|db| Database::new(db, page_size)))
     }
 
@@ -844,7 +848,14 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         self.check_flags()?;
         let name = name_bytes(self.name);
         let page_size = self.env.zdb().page_size();
-        let db = self.env.zdb().create_database(wtxn.zdb_mut(), name)?;
+        let db = match custom_comparator::<C>() {
+            None => self.env.zdb().create_database(wtxn.zdb_mut(), name)?,
+            Some(cmp) => {
+                self.env
+                    .zdb()
+                    .create_database_with_comparator(wtxn.zdb_mut(), name, cmp)?
+            }
+        };
         Ok(Database::new(db, page_size))
     }
 }
@@ -857,6 +868,48 @@ impl<T, KC, DC, C, CDUP> Clone for DatabaseOpenOptions<'_, '_, T, KC, DC, C, CDU
             flags: self.flags,
             marker: PhantomData,
         }
+    }
+}
+
+/// Bridge from heed's **type-level** [`Comparator`] (an associated `compare`
+/// function, no receiver) to ZeroDB's object-safe `zerodb::Comparator`
+/// (**milestone 2.4**).
+///
+/// heed's shape is a marker type, so this is a zero-sized forwarder; the
+/// `type_name` is a stable-enough identity for ZeroDB's in-process
+/// mismatch check, and it is never written to disk.
+///
+/// `C` appears only behind `fn() -> C`, a function-pointer type that is
+/// unconditionally `Send + Sync`, so this is `Send + Sync` for **any** `C`
+/// with no `unsafe impl` — which matters, because CLAUDE.md's unsafe policy
+/// for this crate covers only what heed's pointer model forces, and this does
+/// not need to be on that list.
+struct HeedComparator<C>(PhantomData<fn() -> C>);
+
+impl<C: Comparator + 'static> zerodb::Comparator for HeedComparator<C> {
+    fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+        C::compare(a, b)
+    }
+
+    fn name(&self) -> &str {
+        std::any::type_name::<C>()
+    }
+}
+
+/// The ZeroDB comparator to register for a database typed with heed
+/// comparator `C`, or `None` when `C` is heed's [`DefaultComparator`]
+/// (**milestone 2.4**).
+///
+/// `DefaultComparator` is memcmp — exactly ZeroDB's built-in ordering — so
+/// registering a forwarder for it would trade an inlined `slice::cmp` for a
+/// vtable call on the hot path of every consumer, all of which use it (SPEC 00
+/// row 53). Returning `None` keeps the default path bit-for-bit what it was
+/// before this milestone.
+fn custom_comparator<C: Comparator + 'static>() -> Option<Box<dyn zerodb::Comparator>> {
+    if std::any::TypeId::of::<C>() == std::any::TypeId::of::<DefaultComparator>() {
+        None
+    } else {
+        Some(Box::new(HeedComparator::<C>(PhantomData)))
     }
 }
 

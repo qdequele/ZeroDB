@@ -7,10 +7,87 @@ Pseudocode is illustrative, not code to transliterate; the LMDB fork was read to
 understand the *algorithms* (CLAUDE.md rule 4), and the semantics below are
 pinned to the oracle (SPEC 00/01), not to LMDB's C.
 
-Ordering is **unsigned lexicographic byte comparison** of keys everywhere
-(`memcmp`; SPEC 00 row 53, SPEC 01 Table 2). "`k1 < k2`", "ascending",
-"greater", etc. all mean memcmp order. No custom comparator exists in Phase 1;
-this single ordering invariant underpins every operation here.
+> **AMENDED 2026-07-20 (milestone 2.4).** The ordering statement below was
+> absolute in Phase 1; it is now parameterized. Read §2.0 first — everything
+> after it that says "memcmp" means "the tree's ordering", which is memcmp for
+> every tree except a named database with a registered comparator.
+
+---
+
+## §2.0 — Key ordering (AMENDED, milestone 2.4)
+
+**Phase 1 (superseded).** Ordering was **unsigned lexicographic byte
+comparison** of keys everywhere (`memcmp`; SPEC 00 row 53, SPEC 01 Table 2).
+"`k1 < k2`", "ascending", "greater" all meant memcmp order. No custom
+comparator existed, and that single invariant underpinned every operation here.
+
+**Phase 2.4 (current).** Every tree carries an ordering, `cmp`, and every
+comparison in this document is `cmp`-relative. The rest of the spec continues
+to be written in memcmp language because memcmp is the default and the only
+ordering any consumer uses (SPEC 00 row 53); substitute `cmp` throughout.
+
+| Tree | Ordering | Settable? |
+|---|---|---|
+| A **named** database | `DefaultComparator` (memcmp) unless one is registered | yes — `Env::{create,open}_database_with_comparator` |
+| The **main / unnamed** database | memcmp, **always** | no — refused with `Io(InvalidInput)` |
+| The **GC / free** database | memcmp, **always** | not reachable from the public API |
+
+**BT-1 (amended).** Within one tree, the ordering is total, deterministic, and
+fixed for the tree's lifetime. All of §2, §4, §6, §7, §10 and the INV-5/INV-6
+invariants of §11 hold with respect to *that tree's* ordering, not with respect
+to byte order.
+
+Why the main DB is excluded: it doubles as the named-DB **catalog** (SPEC 02
+§6). Its keys are database names and its `F_SUBDATA` values are engine-internal
+`DBRecord` bytes, so making its order caller-defined would put engine metadata
+under user code — and a single misbehaving comparator would corrupt the catalog
+rather than one database. Why the GC tree is excluded: its keys are big-endian
+txnids (SPEC 05 §1), for which memcmp order *is* numeric order, and the
+oldest-reader gate depends on that.
+
+### Consequences elsewhere in the engine
+
+- **Prefix iteration (§4 "prefix iteration") is byte-defined.** It is realized
+  as the range `[prefix, prefix_successor(prefix))`, and `prefix_successor` is a
+  byte-increment. Under a custom comparator that range is still a well-defined
+  *comparator* range between those two byte strings, but it is **not** "the keys
+  starting with `prefix`" — prefix containment is not a property an arbitrary
+  order preserves. heed reaches the same conclusion from the other direction:
+  its prefix iterators require `C: LexicographicComparator`, not merely
+  `Comparator`. Callers using a custom comparator should use explicit ranges.
+- **The compacting copy refuses.** `Env::copy_to_file(CompactionOption::Enabled)`
+  returns `Io(InvalidInput)` on an environment with any registered comparator.
+  The bulk builder (SPEC 02, `build_multi_db_image`) sorts and debug-asserts in
+  memcmp, and the `zerodb-tools` dump format records no comparator identity, so
+  a comparator-aware compaction is a separate piece of work spanning the
+  builder, the dump format and the tools. `CompactionOption::Disabled` (the raw
+  page copy) is byte-level and unaffected.
+- **`check` / `zerodb-tools check` is memcmp-defined.** It walks a *file*, which
+  carries no comparator, so INV-5 (ascending keys in a page) and INV-6
+  (separator bounds) are evaluated in byte order and a custom-comparator
+  database legitimately reports violations of exactly those two. Every other
+  invariant — page typing, reachability, depth uniformity, counter accuracy,
+  GC structure — is ordering-independent and must still pass.
+- **The comparator is not persisted.** See §2.0.1.
+
+### §2.0.1 — Non-persistence hazard (D-014)
+
+The comparator lives in process memory (`ComparatorRegistry`, keyed by dbi) and
+is **never written to the file**. Reopening a database under a different
+ordering than the one that built it silently yields wrong results and, once
+written to, permanent corruption. LMDB has the identical hazard with
+`mdb_set_compare`, and neither engine detects it.
+
+ZeroDB detects the *in-process* case: a second registration for the same dbi
+with a different `Comparator::name` is refused (`Io(InvalidInput)`). The
+*cross-open* case is **not** detected. A stored comparator fingerprint checked
+at open is the natural fix and there is nowhere to put one: `DBRecord` is
+exactly 48 bytes with every offset assigned (SPEC 02 §3.1), and its only two
+unused *values* — `flags` (offset 42) and `leaf2_ksize` (offset 44) — are
+already reserved for DUPSORT/DUPFIXED in milestone 2.8. Widening the record or
+repurposing those fields is an on-disk **format** change, which CLAUDE.md rule 6
+puts behind an ADR and human approval. **Deliberately not taken in 2.4**; the
+hazard is documented, filed as D-014, and left for a maintainer decision.
 
 ---
 
@@ -338,7 +415,7 @@ split(page P at insertion index newindx, new cell):
 `put(..., APPEND)` does **not** do a normal search. It positions at the
 **last** entry (`last()`), compares `key` against the last key:
 
-- `key > last_key` (memcmp): insert at the end. If the rightmost leaf is full,
+- `key > last_key` (the tree's ordering, §2.0; memcmp by default): insert at the end. If the rightmost leaf is full,
   split with the **end-of-page insert-point policy** (§6.4): put the *new* key
   alone on a fresh right page instead of splitting the full page in half — this
   keeps sequentially-loaded pages ~100 % full and avoids repeated half-empty
@@ -488,7 +565,7 @@ value of the entry at `ki[top]` **keeping the key**:
   caller's `PutFlags` straight to the underlying put with **no forced
   `MDB_CURRENT`**, so `APPEND` here behaves exactly like a plain `MDB_APPEND`
   (§6.3): the engine does its own **last-key compare** and **ignores the cursor's
-  current position**. If `key > last_key` (memcmp) it appends at the end
+  current position**. If `key > last_key` (the tree's ordering, §2.0) it appends at the end
   (append-split policy, §6.4), *wherever* the iterator happens to be parked; if
   `key ≤ last_key` (equal included) it returns `KeyExist` **even when the cursor
   is sitting on the last entry**, and does not overwrite. The cursor position is
@@ -623,7 +700,9 @@ some DB tree walked from a meta root. Applies to the live meta's snapshot.
   header. Only written pages self-identify. (Overflow *interior* pages are also
   exempt: they are raw payload, SPEC 02 §5.)
 - **INV-5** — Intra-page key order: within any leaf/branch page the node-pointer
-  array is strictly ascending by key (memcmp); no duplicate keys within a page
+  array is strictly ascending by key (the tree's ordering, §2.0 — the file-level
+  `check` tool evaluates this in memcmp, so a custom-comparator DB reports
+  INV-5/INV-6 by design); no duplicate keys within a page
   (Phase 1 has no DUPSORT).
 - **INV-6** — Separator bounds: for every branch, child `i`'s subtree keys all
   lie in `[sep(i), sep(i+1))` (with `sep(0) = −∞`, `sep(last+1) = +∞`); node 0's

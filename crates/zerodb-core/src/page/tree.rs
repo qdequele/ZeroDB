@@ -14,6 +14,8 @@
 //! (measured from absolute offset [`HEADER_SIZE`]); cells are even-length
 //! (2-byte alignment) and their u32/u64 fields are read unaligned via [`raw`].
 
+use crate::cmp::KeyCmp;
+
 use super::geometry::body_size;
 use super::header::{read_and_check_bounds, CommonHeader};
 use super::raw::{read_u16, read_u32, read_u64, write_u16, write_u32, write_u64};
@@ -227,7 +229,12 @@ impl<'a> LeafRef<'a> {
     /// Binary-search for `key`. `Ok(i)` if entry `i` equals `key`; `Err(i)` if
     /// absent, where `i` is the lower-bound insertion index (SPEC 03 §2).
     pub fn lookup(&self, key: &[u8]) -> Result<usize, usize> {
-        leaf_lookup(self.buf, self.num_keys(), key)
+        leaf_lookup(self.buf, self.num_keys(), key, KeyCmp::Default)
+    }
+
+    /// As [`Self::lookup`], under an explicit ordering (milestone 2.4).
+    pub fn lookup_with(&self, key: &[u8], cmp: KeyCmp<'_>) -> Result<usize, usize> {
+        leaf_lookup(self.buf, self.num_keys(), key, cmp)
     }
 }
 
@@ -305,7 +312,12 @@ impl<'a> LeafMut<'a> {
 
     /// Binary-search for `key` (see [`LeafRef::lookup`]).
     pub fn lookup(&self, key: &[u8]) -> Result<usize, usize> {
-        leaf_lookup(self.buf, self.num_keys(), key)
+        leaf_lookup(self.buf, self.num_keys(), key, KeyCmp::Default)
+    }
+
+    /// As [`Self::lookup`], under an explicit ordering (milestone 2.4).
+    pub fn lookup_with(&self, key: &[u8], cmp: KeyCmp<'_>) -> Result<usize, usize> {
+        leaf_lookup(self.buf, self.num_keys(), key, cmp)
     }
 
     /// Insert an inline value at sorted index `idx`.
@@ -547,13 +559,19 @@ impl<'a> BranchRef<'a> {
     /// `branch_child_index` — greatest `i` with `sep(i) <= key`, node 0 = −∞).
     #[must_use]
     pub fn child_index(&self, key: &[u8]) -> usize {
+        self.child_index_with(key, KeyCmp::Default)
+    }
+
+    /// As [`Self::child_index`], under an explicit ordering (milestone 2.4).
+    #[must_use]
+    pub fn child_index_with(&self, key: &[u8], cmp: KeyCmp<'_>) -> usize {
         // Node 0 is -inf and always qualifies; scan separators 1..num_keys.
         let n = self.num_keys();
         let mut lo = 1usize;
         let mut hi = n; // first index whose sep > key
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.key(mid) <= key {
+            if cmp.compare(self.key(mid), key) != std::cmp::Ordering::Greater {
                 lo = mid + 1;
             } else {
                 hi = mid;
@@ -741,8 +759,10 @@ fn remove_cell(
     write_u16(buf, OFF_UPPER, (upper + clen) as u16);
 }
 
-/// Binary-search a leaf's sorted pointer array for `key`.
-fn leaf_lookup(buf: &[u8], num_keys: usize, key: &[u8]) -> Result<usize, usize> {
+/// Binary-search a leaf's sorted pointer array for `key` under `cmp`
+/// (milestone 2.4: the ordering is the tree's, not necessarily memcmp —
+/// SPEC 03 §2.0).
+fn leaf_lookup(buf: &[u8], num_keys: usize, key: &[u8], cmp: KeyCmp<'_>) -> Result<usize, usize> {
     let mut lo = 0usize;
     let mut hi = num_keys;
     while lo < hi {
@@ -750,7 +770,7 @@ fn leaf_lookup(buf: &[u8], num_keys: usize, key: &[u8]) -> Result<usize, usize> 
         let abs = HEADER_SIZE + ptr_at(buf, mid) as usize;
         let ksize = read_u16(buf, abs + 2) as usize;
         let mid_key = &buf[abs + LEAF_NODE_HEADER..abs + LEAF_NODE_HEADER + ksize];
-        match mid_key.cmp(key) {
+        match cmp.compare(mid_key, key) {
             std::cmp::Ordering::Less => lo = mid + 1,
             std::cmp::Ordering::Greater => hi = mid,
             std::cmp::Ordering::Equal => return Ok(mid),

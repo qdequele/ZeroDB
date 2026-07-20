@@ -352,10 +352,24 @@ Add to heed (as the zerodb backend's extension or upstreamed):
   `zerodb/tests/env_stat_info.rs` (12), `zerodb-oracle/tests/env_info_differential.rs`
   (6), `heed-zerodb/tests/phase2_extensions.rs` (9, shared with 2.5/2.6).
 - 2.2 Reader introspection API (list readers, txnID ages) — replaces
-  `mdb_reader_list/check` in a single-process world.
-- 2.3 Compacting copy with progress callback.
+  `mdb_reader_list/check` in a single-process world. **DONE 2026-07-20** —
+  `Env::reader_list() -> Vec<ReaderEntry { slot, txnid, age }>` over the
+  occupied slots (free slots omitted, as `mdb_reader_list` skips `mr_pid == 0`);
+  documented as a *sample* of a lock-free table, not a linearizable snapshot.
+  `Env::clear_stale_readers()` kept and returns 0 with the D-001 argument
+  spelled out — a nonzero return would be a lie, not a missing feature.
+- 2.3 Compacting copy with progress callback. **DONE 2026-07-20** —
+  `copy_to_file_with_progress(path, option, &mut FnMut(CopyProgress))`; the
+  no-callback signatures are untouched and now delegate to it, pinned by a
+  byte-equality test. Every callback fires before any destination write, so a
+  panicking callback cannot leave a partial copy.
 - 2.4 `cmp`/custom key comparators as safe Rust closures/traits (LMDB has
   `mdb_set_compare`; heed hides it) — needed before Phase 3 features anyway.
+  **DONE 2026-07-20** — safe object-safe `Comparator` trait + `FnComparator`,
+  per named DB, registered at open/create; SPEC 03 amended (§2.0). Main DB and
+  GC tree stay memcmp by construction. Not persisted → **D-014** (PROPOSED,
+  needs a maintainer call on a format-level fingerprint). Compacting copy and
+  `check`/`dump`/`load` remain memcmp-only and refuse/report accordingly.
 - 2.5 Explicit `sync(force)` (mdb_env_sync parity). **DONE 2026-07-20** —
   audited `force_sync` against the fork's `mdb_env_sync0` and added the missing
   `force` parameter as `Env::sync(force)` (heed exposes only the forced form).

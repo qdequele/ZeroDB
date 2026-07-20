@@ -21,6 +21,7 @@
 pub mod btree;
 pub mod builder;
 pub mod check;
+pub mod cmp;
 pub mod dirty;
 pub mod env;
 pub mod error;

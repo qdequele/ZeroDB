@@ -15,6 +15,7 @@
 //! `INITIALIZED`/`EOF` flags of SPEC 03 §4. Each public op documents the §4
 //! subsection whose positioning/EOF/empty-DB semantics it implements.
 
+use super::cmp::KeyCmp;
 use super::dirty::DirtyStore;
 use super::page::{LeafRef, LeafValue, OverflowRef, PageError, PageRef, PageType, PGNO_INVALID};
 
@@ -118,6 +119,12 @@ pub struct Tree<'a> {
     psize: u32,
     root: u64,
     depth: u16,
+    /// The ordering this tree is stored under (milestone 2.4, SPEC 03 §2.0).
+    /// Carried by the `Tree` rather than looked up per comparison so every
+    /// descent, seek and hit-test in this module uses the same ordering by
+    /// construction — the only way to be sure none of them silently falls back
+    /// to memcmp.
+    cmp: KeyCmp<'a>,
 }
 
 impl<'a> Tree<'a> {
@@ -125,12 +132,34 @@ impl<'a> Tree<'a> {
     /// (`PGNO_INVALID` for an empty tree), and height.
     #[must_use]
     pub fn new(src: Source<'a>, psize: u32, root: u64, depth: u16) -> Tree<'a> {
+        Tree::with_comparator(src, psize, root, depth, KeyCmp::Default)
+    }
+
+    /// As [`Tree::new`], under an explicit ordering (**milestone 2.4**). Every
+    /// engine path that serves a *named* database builds its tree through here;
+    /// [`Tree::new`] (memcmp) remains correct for the main/catalog tree and the
+    /// GC tree, which are memcmp by construction (SPEC 03 §2.0).
+    #[must_use]
+    pub fn with_comparator(
+        src: Source<'a>,
+        psize: u32,
+        root: u64,
+        depth: u16,
+        cmp: KeyCmp<'a>,
+    ) -> Tree<'a> {
         Tree {
             src,
             psize,
             root,
             depth,
+            cmp,
         }
+    }
+
+    /// The ordering this tree is stored under (milestone 2.4).
+    #[must_use]
+    pub fn comparator(&self) -> KeyCmp<'a> {
+        self.cmp
     }
 
     /// Whether the tree is empty (`root == PGNO_INVALID`).
@@ -155,7 +184,7 @@ impl<'a> Tree<'a> {
         let (pgno, ki) = *c.stack.last().expect("initialized cursor has a leaf frame");
         let page = load_page(self.src, self.psize, pgno)?;
         let leaf = page.as_leaf()?;
-        if ki < leaf.num_keys() && leaf.key(ki) == key {
+        if ki < leaf.num_keys() && self.cmp.eq(leaf.key(ki), key) {
             Ok(Some(resolve_value(self.src, self.psize, &leaf, ki)?))
         } else {
             Ok(None)
@@ -179,7 +208,7 @@ impl<'a> Tree<'a> {
         let (pgno, ki) = *c.stack.last().expect("initialized cursor has a leaf frame");
         let page = load_page(self.src, self.psize, pgno)?;
         let leaf = page.as_leaf()?;
-        if ki < leaf.num_keys() && leaf.key(ki) == key {
+        if ki < leaf.num_keys() && self.cmp.eq(leaf.key(ki), key) {
             let flags = leaf.node_flags(ki);
             Ok(Some((
                 flags,
@@ -219,6 +248,9 @@ pub struct Cursor<'a> {
     initialized: bool,
     /// The `EOF` flag (SPEC 03 §4): the cursor sits past the maximum entry.
     eof: bool,
+    /// The tree's ordering (milestone 2.4), copied from the [`Tree`] this
+    /// cursor was opened on so every seek uses it.
+    cmp: KeyCmp<'a>,
 }
 
 impl<'a> Cursor<'a> {
@@ -231,6 +263,7 @@ impl<'a> Cursor<'a> {
             stack: Vec::new(),
             initialized: false,
             eof: false,
+            cmp: t.cmp,
         }
     }
 
@@ -324,7 +357,7 @@ impl<'a> Cursor<'a> {
             match page.page_type() {
                 PageType::Leaf => {
                     let leaf = page.as_leaf()?;
-                    let ki = match leaf.lookup(key) {
+                    let ki = match leaf.lookup_with(key, self.cmp) {
                         Ok(i) | Err(i) => i,
                     };
                     self.stack.push((pgno, ki));
@@ -333,7 +366,7 @@ impl<'a> Cursor<'a> {
                 }
                 PageType::Branch => {
                     let br = page.as_branch()?;
-                    let i = br.child_index(key);
+                    let i = br.child_index_with(key, self.cmp);
                     self.stack.push((pgno, i));
                     pgno = br.child_pgno(i);
                 }
@@ -484,7 +517,7 @@ impl<'a> Cursor<'a> {
             .last()
             .expect("initialized cursor has a leaf frame");
         let leaf = self.page(pgno)?.as_leaf()?;
-        if ki < leaf.num_keys() && leaf.key(ki) == key {
+        if ki < leaf.num_keys() && self.cmp.eq(leaf.key(ki), key) {
             return self.current();
         }
         // Not found: leave unpositioned for iteration (SPEC 03 §4 `set`).
@@ -518,7 +551,7 @@ impl<'a> Cursor<'a> {
     pub fn get_greater_than(&mut self, key: &[u8]) -> PosResult<'a> {
         match self.set_range(key)? {
             None => Ok(None),
-            Some((k, _)) if k == key => self.next(),
+            Some((k, _)) if self.cmp.eq(k, key) => self.next(),
             some => Ok(some),
         }
     }
@@ -534,7 +567,7 @@ impl<'a> Cursor<'a> {
     pub fn get_lower_than_or_equal_to(&mut self, key: &[u8]) -> PosResult<'a> {
         match self.set_range(key)? {
             None => self.last(),
-            Some((k, _)) if k == key => self.current(),
+            Some((k, _)) if self.cmp.eq(k, key) => self.current(),
             Some(_) => self.prev(),
         }
     }

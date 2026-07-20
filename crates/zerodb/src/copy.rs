@@ -46,6 +46,29 @@ pub enum CompactionOption {
     Disabled,
 }
 
+/// How far along a [`CopyToFile::copy_to_file_with_progress`] run is
+/// (**milestone 2.3**).
+///
+/// A **ZeroDB extension**: `mdb_env_copy2` reports nothing, and heed's
+/// `copy_to_file` is a blocking call with no observation point, which makes a
+/// multi-gigabyte Meilisearch snapshot an opaque wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyProgress {
+    /// Source pages processed so far. Monotonically non-decreasing within one
+    /// copy, and equal to [`CopyProgress::total`] in the final call.
+    pub done: u64,
+    /// Total pages the copy expects to process.
+    ///
+    /// For [`CompactionOption::Disabled`] this is **exact**: the snapshot's
+    /// page count, every one of which is copied. For
+    /// [`CompactionOption::Enabled`] it is an **estimate** — the number of
+    /// live pages reachable in the source, which is what the copy must *read*;
+    /// the number it *writes* is smaller and unknowable until packing
+    /// finishes. `total` never changes during a run, so `done as f64 / total
+    /// as f64` is a usable fraction in both modes.
+    pub total: u64,
+}
+
 /// `Env::copy_to_file` (SPEC 00 row 17). Produces a **single data file** (a
 /// `zerodb.dat`-format image); to open the copy as an env, place it as
 /// `<dir>/zerodb.dat` and open `<dir>`.
@@ -58,17 +81,114 @@ pub trait CopyToFile {
     /// - [`Error::Io`] on any write error.
     /// - [`MdbError::Invalid`] if the source is structurally corrupt.
     fn copy_to_file(&self, path: impl AsRef<Path>, option: CompactionOption) -> Result<()>;
+
+    /// As [`CopyToFile::copy_to_file`], reporting progress to `on_progress`
+    /// (**milestone 2.3**).
+    ///
+    /// `on_progress` is called at least twice — once with `done == 0` before
+    /// any work, once with `done == total` when the image is complete — and
+    /// with monotonically non-decreasing `done` in between. `total` is
+    /// identical in every call of a run. See [`CopyProgress`] for what the
+    /// numbers mean in each mode.
+    ///
+    /// # Where the callback runs, and what a panic does
+    ///
+    /// Every callback fires **while the copy is assembling the image in
+    /// memory, before a single byte reaches `path`** — the destination is
+    /// written by one `std::fs::write` after the last callback returns. That
+    /// is a deliberate ordering, not an accident of the implementation:
+    ///
+    /// - A panicking callback unwinds out of this function normally (panics
+    ///   are not caught). Because no destination write has happened yet,
+    ///   **`path` is left untouched** — absent if it did not exist, and byte-
+    ///   for-byte its old contents if it did. There is no half-written copy to
+    ///   mistake for a good one.
+    /// - The **source** environment is likewise untouched under any callback
+    ///   behavior: a copy only ever reads it, under an internal read txn that
+    ///   is released when this function returns (including while unwinding).
+    ///   A panic leaks no reader slot.
+    ///
+    /// The cost of that guarantee is that progress tracks *source pages
+    /// processed*, not bytes landed on disk, and that the last stretch (the
+    /// single `write`) is not covered by any callback. Callers wanting a
+    /// progress bar that ends exactly when the file is durable should treat
+    /// `done == total` as "reading finished", not "file written".
+    ///
+    /// # Errors
+    ///
+    /// As [`CopyToFile::copy_to_file`].
+    fn copy_to_file_with_progress(
+        &self,
+        path: impl AsRef<Path>,
+        option: CompactionOption,
+        on_progress: &mut dyn FnMut(CopyProgress),
+    ) -> Result<()>;
 }
 
 impl CopyToFile for Env {
     fn copy_to_file(&self, path: impl AsRef<Path>, option: CompactionOption) -> Result<()> {
+        // Same code path as the progress form, with a callback that does
+        // nothing — so the no-callback signature (heed parity, SPEC 00 row 17)
+        // cannot drift from the instrumented one.
+        self.copy_to_file_with_progress(path, option, &mut |_| {})
+    }
+
+    fn copy_to_file_with_progress(
+        &self,
+        path: impl AsRef<Path>,
+        option: CompactionOption,
+        on_progress: &mut dyn FnMut(CopyProgress),
+    ) -> Result<()> {
         // The internal read txn pins the snapshot for the whole copy (SPEC 00
         // row 17: copy opens its own read txn).
         let txn = self.read_txn()?;
         match option {
-            CompactionOption::Disabled => copy_raw(self, &txn, path.as_ref()),
-            CompactionOption::Enabled => copy_compact(self, &txn, path.as_ref()),
+            CompactionOption::Disabled => copy_raw(self, &txn, path.as_ref(), on_progress),
+            CompactionOption::Enabled => copy_compact(self, &txn, path.as_ref(), on_progress),
         }
+    }
+}
+
+/// Drives a [`CopyProgress`] sequence: fixed `total`, monotone `done`, a
+/// guaranteed `done == 0` opening call and `done == total` closing call.
+struct Progress<'f> {
+    total: u64,
+    done: u64,
+    f: &'f mut dyn FnMut(CopyProgress),
+}
+
+impl<'f> Progress<'f> {
+    /// Start a run and emit the opening `done == 0` call.
+    fn start(total: u64, f: &'f mut dyn FnMut(CopyProgress)) -> Progress<'f> {
+        let mut p = Progress { total, done: 0, f };
+        p.emit();
+        p
+    }
+
+    /// Advance to `done` and report. Clamped to `total` and never allowed to
+    /// go backwards, so the monotonicity the callback contract promises holds
+    /// even when a caller's page estimate is off (the compacting mode's
+    /// `total` is an estimate — see [`CopyProgress::total`]).
+    fn advance_to(&mut self, done: u64) {
+        let done = done.min(self.total);
+        if done > self.done {
+            self.done = done;
+            self.emit();
+        }
+    }
+
+    /// Emit the closing `done == total` call. Idempotent-safe: if `done`
+    /// already equals `total`, `advance_to` suppresses the duplicate.
+    fn finish(&mut self) {
+        let total = self.total;
+        self.advance_to(total);
+    }
+
+    fn emit(&mut self) {
+        (self.f)(CopyProgress {
+            done: self.done,
+            total: self.total,
+        });
     }
 }
 
@@ -85,20 +205,47 @@ fn corrupt(_e: zerodb_core::page::PageError) -> Error {
 /// copied verbatim from the map, with two freshly-encoded meta slots pinned to
 /// this snapshot (so the copy opens at exactly snapshot `T`, even if the live
 /// env has committed newer metas since the txn began — SPEC 00 row 17).
-fn copy_raw(env: &Env, txn: &RoTxn<'_>, dest: &Path) -> Result<()> {
+fn copy_raw(
+    env: &Env,
+    txn: &RoTxn<'_>,
+    dest: &Path,
+    on_progress: &mut dyn FnMut(CopyProgress),
+) -> Result<()> {
     let psize = env.page_size();
     let ps = psize as usize;
     let snap = txn.snapshot();
     // Pages 0..=last_pg. Slots 0/1 are rewritten below; the rest are data.
+    let n_pages = snap.last_pg + 1;
     let data_end = (snap.last_pg as usize + 1) * ps;
     let map = txn.map_bytes();
     let src = map.get(..data_end).ok_or(Error::Mdb(MdbError::Invalid))?;
 
+    // M2.3: the raw copy's page count is exact — every page in the snapshot is
+    // copied verbatim.
+    let mut progress = Progress::start(n_pages, on_progress);
+
     let mut out = vec![0u8; data_end];
     if data_end > 2 * ps {
         // Copy the data pages verbatim (reachable pages are immutable under the
-        // reader pin; free pages are harmless — see the module docs).
-        out[2 * ps..data_end].copy_from_slice(&src[2 * ps..data_end]);
+        // reader pin; free pages are harmless — see the module docs). Chunked
+        // so progress is observable; the chunk size is a *reporting*
+        // granularity only and does not affect one byte of the output.
+        //
+        // Sized relative to the env rather than fixed: a fixed chunk either
+        // fires once on a small env (useless — the caller learns nothing
+        // between 0 and total) or hundreds of thousands of times on a large
+        // one. Aiming at ~`PROGRESS_STEPS` reports keeps the callback rate
+        // bounded and the resolution usable at every scale.
+        const PROGRESS_STEPS: u64 = 32;
+        let pages_per_chunk = (n_pages / PROGRESS_STEPS).max(1);
+        let mut pg = 2u64;
+        while pg < n_pages {
+            let end = (pg + pages_per_chunk).min(n_pages);
+            let (from, to) = (pg as usize * ps, end as usize * ps);
+            out[from..to].copy_from_slice(&src[from..to]);
+            pg = end;
+            progress.advance_to(pg);
+        }
     }
 
     // Synthesize both meta slots from the pinned snapshot — the copy is a
@@ -119,6 +266,9 @@ fn copy_raw(env: &Env, txn: &RoTxn<'_>, dest: &Path) -> Result<()> {
     meta.pgno = 1;
     meta.encode(&mut out[ps..2 * ps]).map_err(corrupt)?;
 
+    // Last callback before any destination I/O — see the panic contract on
+    // `copy_to_file_with_progress`.
+    progress.finish();
     std::fs::write(dest, &out)?;
     Ok(())
 }
@@ -126,31 +276,79 @@ fn copy_raw(env: &Env, txn: &RoTxn<'_>, dest: &Path) -> Result<()> {
 /// Compacting copy: read every live entry of every DB under the snapshot and
 /// rebuild a fresh, densely-packed image (`build_multi_db_image`) with no free
 /// pages — the `MDB_CP_COMPACT` shape.
-fn copy_compact(env: &Env, txn: &RoTxn<'_>, dest: &Path) -> Result<()> {
+fn copy_compact(
+    env: &Env,
+    txn: &RoTxn<'_>,
+    dest: &Path,
+    on_progress: &mut dyn FnMut(CopyProgress),
+) -> Result<()> {
+    // M2.4 scope boundary (SPEC 03 §2.0). The compacting rebuild goes through
+    // the bulk builder, whose ordering contract is memcmp end to end: it packs
+    // the main catalog by `sort_by(memcmp)` and debug-asserts strictly
+    // ascending memcmp order for every DB it packs. Feeding it entries ordered
+    // by a caller's comparator would produce a tree whose physical order is
+    // the comparator's but whose builder-side reasoning assumed memcmp — and
+    // the resulting file records no comparator identity, so nothing downstream
+    // (`zerodb-tools check`, `dump`/`load`) could tell. Refusing loudly is the
+    // only honest option until the builder, the dump format and the tools are
+    // made comparator-aware, which is its own milestone.
+    //
+    // `CompactionOption::Disabled` (the raw page copy) is unaffected: it is a
+    // byte-level copy that preserves whatever order is on disk.
+    if env.has_custom_comparator() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "compacting copy is not supported on an environment with a custom key comparator              (milestone 2.4, SPEC 03 §2.0); use CompactionOption::Disabled",
+        )));
+    }
     let psize = env.page_size();
     let snap = txn.snapshot();
+
+    // M2.3: the compacting copy's unit of work is *reading* the source's live
+    // pages; how many pages it writes is only known once packing finishes, so
+    // `total` is the source's reachable page count (see `CopyProgress::total`).
+    // The main tree's record covers the catalog; each named DB's record is
+    // added as its section is read.
+    let main_pages =
+        snap.main_db.branch_pages + snap.main_db.leaf_pages + snap.main_db.overflow_pages;
 
     // Main DB user data = main tree entries minus the F_SUBDATA catalog records
     // (which are followed into their own sections below).
     let main = env.main_database();
+    let mut total = main_pages;
+    let names_probe = named_databases(txn)?;
+    for name in &names_probe {
+        if let Some(dbh) = env.open_database(txn, Some(name))? {
+            let st = dbh.stat(txn)?;
+            total += st.branch_pages + st.leaf_pages + st.overflow_pages;
+        }
+    }
+    let mut progress = Progress::start(total, on_progress);
+
     let main_user: Vec<(Vec<u8>, Vec<u8>)> = collect_entries_flagged(&main, txn)?
         .into_iter()
         .filter(|(_, flags, _)| flags & F_SUBDATA == 0)
         .map(|(k, _, v)| (k, v))
         .collect();
 
+    progress.advance_to(main_pages);
+
     // Each named DB, in name order.
-    let names = named_databases(txn)?;
+    let names = names_probe;
     let mut named_entries: Vec<(Vec<u8>, Vec<KvPair>)> = Vec::with_capacity(names.len());
+    let mut read = main_pages;
     for name in names {
         let dbh = env
             .open_database(txn, Some(&name))?
             .ok_or(Error::Mdb(MdbError::Invalid))?;
+        let st = dbh.stat(txn)?;
         let entries: Vec<(Vec<u8>, Vec<u8>)> = collect_entries_flagged(&dbh, txn)?
             .into_iter()
             .map(|(k, _, v)| (k, v))
             .collect();
         named_entries.push((name, entries));
+        read += st.branch_pages + st.leaf_pages + st.overflow_pages;
+        progress.advance_to(read);
     }
     let named: Vec<NamedDbData<'_>> = named_entries
         .iter()
@@ -169,6 +367,9 @@ fn copy_compact(env: &Env, txn: &RoTxn<'_>, dest: &Path) -> Result<()> {
         DEFAULT_FILL_PERMILLE,
     )
     .map_err(corrupt)?;
+    // Last callback before any destination I/O — see the panic contract on
+    // `copy_to_file_with_progress`.
+    progress.finish();
     std::fs::write(dest, &img)?;
     Ok(())
 }

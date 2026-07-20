@@ -170,6 +170,9 @@ impl TxnRead for NestedRoTxn<'_> {
     fn record_for(&self, sel: DbSel) -> DBRecord {
         self.parent.record_for(sel)
     }
+    fn comparator_for(&self, sel: DbSel) -> crate::cmp::KeyCmp<'_> {
+        self.parent.comparator_for(sel)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -272,6 +272,39 @@ impl ReaderTable {
             .count() as u32
     }
 
+    /// A **snapshot of the occupied slots** — the introspection primitive
+    /// behind `Env::reader_list` (`mdb_reader_list`, milestone 2.2).
+    ///
+    /// Returns `(slot index, pinned txnid)` for every slot that is not
+    /// `RDR_FREE`, in slot order; `None` for the txnid means the slot is
+    /// `RDR_CLAIMED` — owned by a reader that is mid-pin and has not yet
+    /// published a snapshot txnid (SPEC 04 §4.3).
+    ///
+    /// **The result is inherently stale.** Slots are read one at a time with
+    /// no global lock (there is none to take — SPEC 04 §4 is a lock-free
+    /// protocol), so this is not a linearizable snapshot of the whole table:
+    /// a reader can be born or die between two loads, and the returned vector
+    /// may correspond to no single instant. That is the honest and only
+    /// possible semantics for lock-free introspection, and it is why nothing
+    /// in the engine consults this — the GC gate uses
+    /// [`ReaderTable::oldest`], which is correct *because* a stale read there
+    /// can only under-estimate (TXN-20).
+    ///
+    /// `SeqCst` per slot, matching every other slot read (TXN-17/19/20); the
+    /// ordering buys nothing here beyond consistency of style, and the cost is
+    /// irrelevant on a diagnostic path.
+    pub(crate) fn list(&self) -> Vec<(u32, Option<u64>)> {
+        let mut out = Vec::new();
+        for (i, slot) in self.slots.iter().enumerate() {
+            match slot.load(Ordering::SeqCst) {
+                RDR_FREE => {}
+                RDR_CLAIMED => out.push((i as u32, None)),
+                txnid => out.push((i as u32, Some(txnid))),
+            }
+        }
+        out
+    }
+
     /// Raw slot value (tests only).
     #[cfg(test)]
     pub(crate) fn raw(&self, slot: u32) -> u64 {

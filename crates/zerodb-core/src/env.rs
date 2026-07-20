@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 use std::time::Duration;
 
+use crate::cmp::{Comparator, ComparatorError, ComparatorRegistry, KeyCmp};
 use crate::error::{Error, MdbError};
 use crate::page::geometry::{is_map_full, map_pages};
 use crate::page::{
@@ -371,6 +372,13 @@ pub struct EnvInner {
     /// Immutable after open; read by the commit pipeline and by `write_txn` /
     /// `force_sync`.
     durability: DurabilityFlags,
+    /// Per-named-database key comparators (**M2.4**, SPEC 03 §2.0). Empty
+    /// unless a caller opened a database through one of the
+    /// `*_with_comparator` entry points; the main/catalog tree and the GC tree
+    /// are never represented here and are always memcmp.
+    ///
+    /// **Not persisted** — see `crate::cmp` for the reopen hazard (D-014).
+    comparators: ComparatorRegistry,
 }
 
 impl std::fmt::Debug for EnvInner {
@@ -530,6 +538,63 @@ impl EnvInner {
     #[must_use]
     pub fn live_readers(&self) -> u32 {
         self.reader_table.in_use()
+    }
+
+    /// The ordering in force for the database `sel` addresses (**M2.4**,
+    /// SPEC 03 §2.0).
+    ///
+    /// [`DbSel::Main`] is **always** [`KeyCmp::Default`]: the main tree is
+    /// also the named-DB catalog, whose keys are DB names and whose values are
+    /// engine-internal `DBRecord` bytes. A named DB is whatever was registered
+    /// for its dbi, defaulting to memcmp.
+    #[must_use]
+    pub fn comparator_for(&self, sel: crate::rotxn::DbSel) -> KeyCmp<'_> {
+        match sel {
+            crate::rotxn::DbSel::Main => KeyCmp::Default,
+            crate::rotxn::DbSel::Named(dbi) => self.comparators.get(dbi),
+        }
+    }
+
+    /// Register a comparator for named database `dbi` (**M2.4**). Called from
+    /// the `*_with_comparator` open paths, never directly by users.
+    pub(crate) fn register_comparator(
+        &self,
+        dbi: u32,
+        cmp: Box<dyn Comparator>,
+    ) -> Result<(), ComparatorError> {
+        self.comparators.register(dbi, cmp)
+    }
+
+    /// Whether any custom comparator is registered on this env (**M2.4**).
+    /// Gates the memcmp-only compacting-copy path (SPEC 03 §2.0).
+    #[must_use]
+    pub fn has_custom_comparator(&self) -> bool {
+        self.comparators.any_custom()
+    }
+
+    /// Per-slot reader introspection — `mdb_reader_list` in a single-process
+    /// world (milestone 2.2). See [`Env::reader_list`] for the full contract;
+    /// this is the raw form.
+    #[must_use]
+    pub fn reader_list(&self) -> Vec<ReaderEntry> {
+        // Sample the commit point *once* so every age in the returned vector
+        // is relative to the same reference point. Sampling per entry would
+        // make the ages mutually inconsistent for no benefit.
+        let now = self.txnid();
+        self.reader_table
+            .list()
+            .into_iter()
+            .map(|(slot, txnid)| ReaderEntry {
+                slot,
+                txnid,
+                // `saturating_sub`, not a subtraction: a reader can publish a
+                // pin *newer* than the commit point we sampled a moment ago
+                // (it read a commit that landed in between), which would
+                // otherwise underflow. Reporting age 0 for "as new as or newer
+                // than the reference point" is the truthful answer.
+                age: txnid.map(|t| now.saturating_sub(t)),
+            })
+            .collect()
     }
 
     /// The smallest snapshot txnid any live reader has pinned, if any: the
@@ -809,6 +874,76 @@ impl Env {
         }
     }
 
+    /// List the environment's **occupied** reader slots (**milestone 2.2**) —
+    /// ZeroDB's answer to `mdb_reader_list`, which heed does not expose at all.
+    ///
+    /// One [`ReaderEntry`] per slot that is currently owned by a read
+    /// transaction, in slot order. Free slots are omitted, exactly as
+    /// `mdb_reader_list` skips slots with `mr_pid == 0`: presence in the
+    /// returned vector *is* the liveness answer, and `max_readers() -
+    /// reader_list().len()` is the number of free slots. Under D-001
+    /// (single-process) every listed reader belongs to this process, so unlike
+    /// LMDB there is no pid/tid column to report — a slot index, the pinned
+    /// snapshot txnid, and its age are the whole truth.
+    ///
+    /// # This is a sample, not a snapshot
+    ///
+    /// The reader table is lock-free (SPEC 04 §4): slots are read one at a
+    /// time, so **entries can already be stale by the time this returns**, and
+    /// the vector may correspond to no single instant — a read txn can end (or
+    /// begin) between two slot loads. This is inherent to lock-free
+    /// introspection, not an implementation shortcut: the only way to get a
+    /// linearizable answer would be to stop the world, which would make the
+    /// diagnostic itself a correctness hazard. Treat the result as a
+    /// monitoring sample. Nothing in the engine consults it; the GC gate uses
+    /// a different scan (TXN-20) whose staleness is provably one-directional.
+    ///
+    /// Ages are all computed against a single sampled commit point
+    /// ([`Env::txnid`]); see [`ReaderEntry::age`].
+    #[must_use]
+    pub fn reader_list(&self) -> Vec<ReaderEntry> {
+        self.inner.reader_list()
+    }
+
+    /// Reclaim reader slots abandoned by dead processes (**milestone 2.2**) —
+    /// `mdb_reader_check`. **Always returns 0, and that is the correct
+    /// answer**, not a stub.
+    ///
+    /// LMDB's reader table lives in a shared `lock.mdb` mapped by every
+    /// process that opens the env, so a process that dies without ending its
+    /// read txn leaves a slot pinned forever, stalling GC for everyone else.
+    /// `mdb_reader_check` exists to scan those slots and free the ones whose
+    /// `mr_pid` no longer names a live process.
+    ///
+    /// ZeroDB is **single-process** (D-001): the reader table is plain process
+    /// memory with no lock file and no cross-process sharing. Every slot is
+    /// owned by a `RoTxn` in *this* address space, and a `RoTxn` releases its
+    /// slot in `Drop` — including while unwinding from a panic. The only way
+    /// to leak a slot is to `mem::forget` a live `RoTxn`, which is exactly as
+    /// unrecoverable as leaking any other resource and is not what
+    /// `mdb_reader_check` is for. If this process dies, the table dies with
+    /// it. **There is therefore no such thing as a stale reader here, and a
+    /// nonzero return would be a lie.**
+    ///
+    /// It is kept (rather than omitted) so that code written against heed's
+    /// `Env::clear_stale_readers` compiles and behaves sensibly on ZeroDB: a
+    /// periodic janitor call is a no-op instead of a compile error.
+    ///
+    /// # Errors
+    ///
+    /// Never. The [`Result`] exists for heed shape.
+    pub fn clear_stale_readers(&self) -> Result<usize, Error> {
+        Ok(0)
+    }
+
+    /// Whether any custom key comparator is registered on this environment
+    /// (**milestone 2.4**). Gates the memcmp-only compacting-copy path
+    /// (SPEC 03 §2.0).
+    #[must_use]
+    pub fn has_custom_comparator(&self) -> bool {
+        self.inner.has_custom_comparator()
+    }
+
     /// The canonical directory path (SPEC 00 row 21).
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -946,6 +1081,40 @@ pub struct EnvInfo {
     /// **ZeroDB extension** (no `MDB_envinfo` counterpart): reader slots
     /// currently occupied. A concurrently sampled diagnostic count.
     pub live_readers: u32,
+}
+
+/// One occupied reader-table slot, as reported by [`Env::reader_list`]
+/// (**milestone 2.2**; the single-process analogue of one `MDB_reader` row in
+/// `mdb_reader_list` output).
+///
+/// A **ZeroDB extension**: heed exposes no reader introspection whatsoever, so
+/// there is no signature to mirror. Compared to LMDB's row there is no `pid`
+/// or `thread` column — under D-001 every reader is in this process, and a
+/// `RoTxn` is `Send`, so the owning thread is not a stable property worth
+/// reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderEntry {
+    /// The slot's index in the reader table, in `0..max_readers`. Stable for
+    /// the life of the read txn that owns it, then reusable by another reader.
+    pub slot: u32,
+    /// The snapshot txnid this reader has pinned — the transaction whose data
+    /// it sees, and the value that holds GC back (SPEC 04 TXN-20).
+    ///
+    /// `None` means the slot is **claimed but not yet pinned**: a read txn has
+    /// won the slot's CAS and is inside the publish-and-verify loop (SPEC 04
+    /// §4.3), a window of a few instructions. Such a reader constrains nothing
+    /// yet, and by the time you act on this value it is certainly pinned.
+    pub txnid: Option<u64>,
+    /// How many commits the environment has published since the pinned
+    /// snapshot: `Env::txnid() - txnid`. `None` exactly when [`ReaderEntry::txnid`]
+    /// is.
+    ///
+    /// This is the number that matters operationally — a large and growing age
+    /// identifies the long-lived read transaction that is preventing free-page
+    /// reclamation. It is computed against **one** commit point sampled for
+    /// the whole [`Env::reader_list`] call, and saturates at 0 rather than
+    /// underflowing if a reader pinned a commit that landed after that sample.
+    pub age: Option<u64>,
 }
 
 /// Environment-level statistics (`mdb_env_stat` / `MDB_stat` over the **main**
@@ -1086,6 +1255,7 @@ pub fn open_with_backing(
         reader_table: ReaderTable::new(max_readers),
         named: Mutex::new(NamedRegistry::new(max_dbs)),
         durability,
+        comparators: ComparatorRegistry::new(max_dbs),
         meta,
         prev_snapshot,
         closing,

@@ -31,9 +31,11 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::btree::{prefix_successor, Cursor, Source, Tree};
+use crate::cmp::KeyCmp;
 use crate::env::{Env, Snapshot};
 use crate::error::{Error, MdbError, Result};
 use crate::page::{DBRecord, PageError, F_SUBDATA};
+use std::cmp::Ordering;
 
 /// Map a structural tree-decode error to the public taxonomy. A corrupt page
 /// reached during a read means the store is not a valid zerodb file
@@ -62,6 +64,11 @@ pub trait TxnRead {
     /// yields [`DBRecord::empty`] (a lenient read view — the strict
     /// `Incompatible` check lives in `open`/`create`).
     fn record_for(&self, sel: DbSel) -> DBRecord;
+    /// The key ordering in force for the database `sel` addresses (**M2.4**,
+    /// SPEC 03 §2.0). [`DbSel::Main`] is always memcmp — it is the named-DB
+    /// catalog. Every tree this module builds for a *user* database routes
+    /// through here.
+    fn comparator_for(&self, sel: DbSel) -> KeyCmp<'_>;
 }
 
 /// Which database a [`Database`] handle addresses (SPEC 02 §6). `Copy` so the
@@ -212,6 +219,9 @@ impl TxnRead for RoTxn<'_> {
             },
         }
     }
+    fn comparator_for(&self, sel: DbSel) -> KeyCmp<'_> {
+        self.env_ref().inner().comparator_for(sel)
+    }
 }
 
 impl Env {
@@ -305,6 +315,35 @@ impl Env {
             Some(_) => Err(Error::Mdb(MdbError::Incompatible)),
             None => Ok(None),
         }
+    }
+
+    /// `open_database` with a **custom key comparator** (**milestone 2.4**;
+    /// `mdb_dbi_open` + `mdb_set_compare`). See
+    /// [`Env::create_database_with_comparator`] for the full contract — in
+    /// particular that the comparator is **not stored in the file**, so this
+    /// call is where you take responsibility for passing the same ordering the
+    /// database was built under. Passing a different one is undetectable and
+    /// silently returns wrong results (D-014).
+    ///
+    /// The comparator is registered even though the database already exists:
+    /// registration is an environment-level fact about a dbi, not a
+    /// creation-time one.
+    ///
+    /// # Errors
+    ///
+    /// As [`Env::open_database`], plus `Io(InvalidInput)` for a `None` name
+    /// (the main DB is always memcmp) or an in-process comparator conflict.
+    pub fn open_database_with_comparator<T: TxnRead>(
+        &self,
+        txn: &T,
+        name: Option<&[u8]>,
+        cmp: Box<dyn crate::cmp::Comparator>,
+    ) -> Result<Option<Database>> {
+        let Some(db) = self.open_database(txn, name)? else {
+            return Ok(None);
+        };
+        self.register_comparator_on(db, cmp)?;
+        Ok(Some(db))
     }
 
     /// `non_free_pages_size()` (SPEC 00 row 19 — MUST; SPEC 05 GC-23/GC-24):
@@ -460,7 +499,15 @@ impl Database {
 
     pub(crate) fn tree<'txn, T: TxnRead + ?Sized>(&self, txn: &'txn T) -> Tree<'txn> {
         let rec = txn.record_for(self.sel);
-        Tree::new(txn.source(), txn.page_size(), rec.root, rec.depth)
+        // M2.4: the tree carries its database's ordering, so every descent,
+        // seek, range bound and hit-test below uses it (SPEC 03 §2.0).
+        Tree::with_comparator(
+            txn.source(),
+            txn.page_size(),
+            rec.root,
+            rec.depth,
+            txn.comparator_for(self.sel),
+        )
     }
 
     /// `stat(txn)` (SPEC 00 row 49): depth, page counts, and entry count of
@@ -653,8 +700,10 @@ impl Database {
         lo: Bound<Vec<u8>>,
         hi: Bound<Vec<u8>>,
     ) -> RoRange<'txn> {
+        let tree = self.tree(txn);
         RoRange {
-            cursor: self.tree(txn).cursor(),
+            cmp: tree.comparator(),
+            cursor: tree.cursor(),
             dir,
             lo,
             hi,
@@ -696,6 +745,11 @@ enum Dir {
 /// borrow it holds forbids any mutation while it is alive (SPEC 04 TXN-39).
 pub struct RoRange<'txn> {
     cursor: Cursor<'txn>,
+    /// The database's ordering (**M2.4**), copied from the tree so the
+    /// termination test below agrees with the seek the cursor performed. A
+    /// memcmp bound test over a comparator-ordered cursor would stop the scan
+    /// at an arbitrary point.
+    cmp: KeyCmp<'txn>,
     dir: Dir,
     lo: Bound<Vec<u8>>,
     hi: Bound<Vec<u8>>,
@@ -726,13 +780,13 @@ impl<'txn> RoRange<'txn> {
         match self.dir {
             Dir::Fwd => match &self.hi {
                 Bound::Unbounded => true,
-                Bound::Included(h) => key <= h.as_slice(),
-                Bound::Excluded(h) => key < h.as_slice(),
+                Bound::Included(h) => self.cmp.compare(key, h) != Ordering::Greater,
+                Bound::Excluded(h) => self.cmp.compare(key, h) == Ordering::Less,
             },
             Dir::Rev => match &self.lo {
                 Bound::Unbounded => true,
-                Bound::Included(l) => key >= l.as_slice(),
-                Bound::Excluded(l) => key > l.as_slice(),
+                Bound::Included(l) => self.cmp.compare(key, l) != Ordering::Less,
+                Bound::Excluded(l) => self.cmp.compare(key, l) == Ordering::Greater,
             },
         }
     }

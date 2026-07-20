@@ -526,13 +526,37 @@ impl<T> Env<T> {
         File::open(path.as_ref()).map_err(Into::into)
     }
 
+    /// Copy this environment to `path`, reporting progress (**milestone 2.3**).
+    ///
+    /// **ZeroDB extension — heed's copy is an opaque blocking call.** See
+    /// [`zerodb::CopyToFile::copy_to_file_with_progress`] for the callback
+    /// contract, in particular that every callback fires before any byte
+    /// reaches `path`, so a panicking callback leaves no partial copy.
+    ///
+    /// The heed-mirrored [`Env::copy_to_file`] / [`Env::copy_to_path`]
+    /// signatures are unchanged and behave identically to before.
+    ///
+    /// # Errors
+    ///
+    /// As [`Env::copy_to_path`].
+    pub fn copy_to_path_with_progress<P: AsRef<Path>>(
+        &self,
+        path: P,
+        option: CompactionOption,
+        on_progress: &mut dyn FnMut(zerodb::CopyProgress),
+    ) -> Result<File> {
+        use zerodb::CopyToFile;
+        let opt = zdb_compaction(option);
+        self.inner
+            .copy_to_file_with_progress(path.as_ref(), opt, on_progress)?;
+        File::open(path.as_ref()).map_err(Into::into)
+    }
+
     fn copy_to_path_internal(&self, path: &Path, option: CompactionOption) -> Result<()> {
         use zerodb::CopyToFile;
-        let opt = match option {
-            CompactionOption::Enabled => zerodb::CompactionOption::Enabled,
-            CompactionOption::Disabled => zerodb::CompactionOption::Disabled,
-        };
-        self.inner.copy_to_file(path, opt).map_err(Into::into)
+        self.inner
+            .copy_to_file(path, zdb_compaction(option))
+            .map_err(Into::into)
     }
 
     /// Force durability of all prior commits (SPEC 00 second table — **landed
@@ -589,10 +613,29 @@ impl<T> Env<T> {
         self.inner.info().live_readers
     }
 
-    /// The maximum key size (SPEC 00 second table — SHOULD; SPEC 03 §2.1).
+    /// The maximum key size (SPEC 00 second table — SHOULD, **landed in
+    /// milestone 2.7**; `mdb_env_get_maxkeysize`, SPEC 03 §2.1).
+    ///
+    /// Reports the engine's real [`zerodb::MAX_KEY_SIZE`]. Until 2.7 this
+    /// returned a hardcoded `511` — the same defect class 2.1 fixed in
+    /// [`Env::max_readers`]: the value happened to be right, but it was a
+    /// literal that would silently stop matching the engine the moment the
+    /// constant moved.
     #[must_use]
     pub fn max_key_size(&self) -> usize {
-        511
+        zerodb::MAX_KEY_SIZE
+    }
+
+    /// List the environment's occupied reader slots (**milestone 2.2**).
+    ///
+    /// **ZeroDB extension — heed exposes no reader introspection.** This is
+    /// the single-process analogue of `mdb_reader_list`. See
+    /// [`zerodb::Env::reader_list`] for the full contract, in particular that
+    /// the result is a *sample* of a lock-free table and entries may be stale
+    /// by the time it returns.
+    #[must_use]
+    pub fn reader_list(&self) -> Vec<zerodb::ReaderEntry> {
+        self.inner.reader_list()
     }
 
     /// Consume this handle and return the closing event (SPEC 00 row 23).
@@ -601,14 +644,32 @@ impl<T> Env<T> {
         EnvClosingEvent(self.inner.prepare_for_closing())
     }
 
-    /// Clear stale readers (SPEC 00 second table — SHOULD). Single-process
-    /// model (D-001): there is never a stale cross-process reader, so 0.
+    /// Clear stale readers (SPEC 00 second table — SHOULD, **landed in
+    /// milestone 2.2**; `mdb_reader_check`).
+    ///
+    /// **Always 0, and that is the correct answer rather than a stub.** ZeroDB
+    /// is single-process (D-001): the reader table is process memory, every
+    /// slot is owned by a `RoTxn` that releases it in `Drop`, and a dead
+    /// process takes the whole table with it. There is no cross-process
+    /// abandoned slot for `mdb_reader_check` to reap. Kept so heed code that
+    /// calls it periodically keeps compiling and no-ops.
+    ///
+    /// See [`zerodb::Env::clear_stale_readers`] for the full argument, and
+    /// [`Env::reader_list`] for the introspection that *is* meaningful here.
     ///
     /// # Errors
     ///
-    /// Infallible; returns [`Result`] for heed shape.
+    /// Never. The [`Result`] exists for heed shape.
     pub fn clear_stale_readers(&self) -> Result<usize> {
-        Ok(0)
+        Ok(self.inner.clear_stale_readers()?)
+    }
+}
+
+/// heed's `CompactionOption` → ZeroDB's (SPEC 00 row 59).
+fn zdb_compaction(option: CompactionOption) -> zerodb::CompactionOption {
+    match option {
+        CompactionOption::Enabled => zerodb::CompactionOption::Enabled,
+        CompactionOption::Disabled => zerodb::CompactionOption::Disabled,
     }
 }
 
