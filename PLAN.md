@@ -423,12 +423,30 @@ Ordering chosen by expected impact for Meilisearch/hannoy on Graviton + EBS/NVMe
   corruption (meta only advances to fully-synced txns). Designed for
   NVMe + replication deployments where replicated-ack is the real durability.
 
-### 3.4 Bulk-load builder
+### 3.4 Bulk-load builder — PREMISE STALE, PARKED 2026-07-20
 - `Database::bulk_load(sorted_stream)` — bottom-up packed page construction,
-  sequential writes, no rebalancing. Direct consumer: milli's grenad-sorted
-  output replacing APPEND loops.
-- Bench: indexing throughput on EBS gp3 (sequential-write win is largest
-  there).
+  sequential writes, no rebalancing.
+- **Stale premise (verified against milli source 2026-07-20):** the stated
+  "direct consumer: milli's grenad-sorted output replacing APPEND loops"
+  describes the *legacy* `index_documents` indexer. The indexer the scheduler
+  actually runs (`update::new::indexer::index`) has **no sorted-stream-into-
+  empty-tree write**: the main write loop is interleaved individual `put`/`del`
+  off a bbqueue (unsorted at the write site, values pre-merged); the single
+  `PutFlags::APPEND` site (`facet/bulk.rs:141`) is reached only via
+  `FacetsUpdateBulk::new(delta_data=Some)` + `db.is_empty()`, and the new
+  indexer constructs `new_not_updating_level_0` (`delta_data=None`), so that
+  branch never runs; facet higher levels are sorted `put` into a *cleared
+  key-sub-range* of a populated DB, not an empty tree. So whole-tree
+  `bulk_load` has **no live milli consumer**.
+- The only live consumers of the bottom-up builder (`zerodb-core::builder`)
+  today are `zerodb-tools load` and `Env::copy_to_file` compaction, which
+  materialise the *entire* env image in a `Vec<u8>`. A streaming transactional
+  `bulk_load` would lift that whole-image-in-RAM ceiling — a real win, but for
+  **tooling**, not milli indexing throughput. Revisit under that framing if/when
+  large-index compaction memory becomes a constraint.
+- Superseded for this pass by **3.7** (prefetch/access hints), which has a
+  verified live consumer (hannoy's hand-rolled madvise). See ADR-0012.
+- Bench (if revived): indexing throughput on EBS gp3.
 
 ### 3.5 Pluggable write path: pwrite vs io_uring
 - `zerodb-io` backends selectable at env open. io_uring path with batched
@@ -444,9 +462,20 @@ Ordering chosen by expected impact for Meilisearch/hannoy on Graviton + EBS/NVMe
 - Bench: hannoy distance-kernel throughput and search latency vs B-tree
   storage.
 
-### 3.7 Prefetch and access hints
+### 3.7 Prefetch and access hints — ACTIVE (chosen 2026-07-20, ADR-0012)
 - `db.prefetch(keys)` / `txn.advise(range, Willneed|Random|Sequential)`
   mapping to madvise; replaces hannoy's env-var hack.
+- **Verified live consumer:** hannoy `Reader::prefetch_graph`
+  (`src/reader.rs:447-539`) hand-rolls this today — direct `madvise` crate,
+  `READER_AVAILABLE_MEMORY` env var, raw pointers into the mmap, and a Windows
+  `#[cfg]`-out. It walks the HNSW graph top-down and madvises each item's value
+  pages under a running byte budget, stopping early when spent. The engine must
+  expose a *hint*, not a policy: hannoy keeps the graph traversal + budget.
+- Primary primitive (ADR-0012): safe slice-level `RoTxn::will_need(bytes)` —
+  hannoy swaps its unsafe `madvise_page(item)` closure for `rtxn.will_need(item)`
+  1:1. Backed by `memmap2::advise_range` (no new unsafe, no `madvise` dep).
+  Secondary: `RoTxn::advise(range, Sequential)` for scan-shaped consumers
+  (iteration / compaction / dump) — a distinct consumer, staged after.
 
 ### 3.8 Snapshot reads during a write txn
 - `RwTxn::snapshot() -> RoSnapshot` pinning the last committed root — legal
