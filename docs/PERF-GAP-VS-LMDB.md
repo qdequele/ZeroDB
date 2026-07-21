@@ -98,6 +98,39 @@ cursor. No unsafe. Effort: low.
 comparison on custom-comparator DBs (milli sets one). LMDB uses a plain fn
 pointer. Monomorphize the search over the comparator. Effort: low.
 
+### A8. Memo probe cost: `Mutex<HashSet>` + SipHash per page view — **DONE 2026-07-21**
+Found by profiling, not inspection: with B1/B6 landed, the milli indexing
+referee did NOT move (2.68× → 2.81× same-run) — `sample` profiles of both
+backends showed milli indexing is **get-bound on both**, and the #2 zerodb
+frame was `ValidatedPages::contains` itself: the A2 memo's `Mutex<HashSet>`
+probe (lock + SipHash + probe per page view, contended — milli shares one
+`RoTxn` across rayon workers). LMDB's equivalent cost is zero.
+**Done:** (1) the memo is now an insert-only **lock-free** open-addressed set
+of `AtomicU64` slots in geometrically growing `OnceLock`-published levels
+(never rehashed; splitmix64 mix; ½ load-factor gate; saturation degrades to
+revalidation — the memo can never affect correctness, so every race outcome
+is at worst a miss). Orderings: `Release` slot publication pairs with
+`Acquire` probes ("validation completed" happens-before any trusting reader —
+ARM-safe); justified inline per the atomics policy. `std::sync` directly, not
+the loom shim — ADR-0006 scopes the shim to the reader table/nested counter,
+and the memo's contract is advisory; a native+miri 4-thread stress test
+(kind-tag separation, level growth, races) rides the gate instead.
+(2) The memo key now **tags the page kind** (bit 63: leaf/branch), so a hit
+hands out `LeafRef::new_trusted`/`BranchRef::new_trusted` — two raw header
+reads, zero checks (the old `new_prevalidated` hit path still re-parsed and
+re-checked type/reserved-tail/bounds every view; a kind-mismatched lookup now
+just misses and revalidates loudly). Dirty-frame views keep the O(1)
+`new_prevalidated` checks (batch-3 trust unchanged).
+(3) **The real milli lever, found only by reading the write-phase call
+tree** (91% of the main thread inside `write_to_db`; `LeafRef::new` ≈ 2,100
+of 3,570 samples): `LeafMut::from_valid` / `BranchMut::from_valid` — doc'd
+"wrap an already-validated page" — silently re-ran the **full O(`num_keys`)
+cell walk on every mutation** (every put wraps its target leaf; parent-chain
+touches wrap branches), a batch-3 miss hiding inside the mutable wrapper,
+made 4× worse by 16 K parity pages. All 22 call sites audited: every one
+passes `self.dirty.bytes_mut(..)` frames (engine-authored by the batch-3
+argument) — now O(1) `new_prevalidated`, matching the read-side dirty path.
+
 ## B. Write path (time, per operation)
 
 ### B1. `RwCursor`: full re-seek + 3 heap copies per step — **DONE 2026-07-21**

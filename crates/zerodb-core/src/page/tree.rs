@@ -191,6 +191,24 @@ impl<'a> LeafRef<'a> {
         Ok(LeafRef { buf, lower, upper })
     }
 
+    /// [`new_prevalidated`](Self::new_prevalidated) minus every check — two
+    /// raw header reads (PERF-GAP A8). Only for a **kind-tagged memo hit**:
+    /// these same bytes passed [`LeafRef::new`] earlier this txn *and* the
+    /// memo key records that they validated as a **leaf**
+    /// (`btree::ValidatedPages` tags the page kind), so not even the type
+    /// flag needs a re-read. The debug assert keeps the claim honest.
+    pub(crate) fn new_trusted(buf: &'a [u8]) -> LeafRef<'a> {
+        debug_assert!(matches!(
+            page_type_of(CommonHeader::read(buf).flags),
+            Ok(PageType::Leaf)
+        ));
+        LeafRef {
+            buf,
+            lower: read_u16(buf, OFF_LOWER),
+            upper: read_u16(buf, OFF_UPPER),
+        }
+    }
+
     /// Number of entries on this page (`lower / 2`).
     #[must_use]
     pub fn num_keys(&self) -> usize {
@@ -296,11 +314,21 @@ impl<'a> LeafMut<'a> {
 
     /// Wrap an already-validated leaf page for mutation.
     ///
+    /// Callers only ever hand this **engine-authored dirty frames** (a COW
+    /// copy of a page fully validated on its first map access this txn, or
+    /// the output of this txn's own page encoders — PERF-GAP batch 3 / A8),
+    /// so validation is the same O(1) structural checks the read-side dirty
+    /// path uses ([`LeafRef::new_prevalidated`]: type, reserved fields,
+    /// bounds). Until A8 this silently re-ran the **full O(`num_keys`)**
+    /// [`LeafRef::new`] cell walk — on every put (`insert_into_leaf` wraps
+    /// the target leaf per call), which the milli write-phase profile showed
+    /// as the single hottest zerodb cost.
+    ///
     /// # Errors
     ///
-    /// Propagates [`LeafRef::new`] validation.
+    /// Propagates [`LeafRef::new_prevalidated`] validation.
     pub fn from_valid(buf: &'a mut [u8], psize: u32) -> Result<LeafMut<'a>, PageError> {
-        LeafRef::new(buf, psize)?;
+        LeafRef::new_prevalidated(buf, psize)?;
         Ok(LeafMut { buf, psize })
     }
 
@@ -546,6 +574,21 @@ impl<'a> BranchRef<'a> {
         Ok(BranchRef { buf, lower, upper })
     }
 
+    /// [`new_prevalidated`](Self::new_prevalidated) minus every check — same
+    /// contract as [`LeafRef::new_trusted`], for a memo hit kind-tagged
+    /// **branch** (PERF-GAP A8).
+    pub(crate) fn new_trusted(buf: &'a [u8]) -> BranchRef<'a> {
+        debug_assert!(matches!(
+            page_type_of(CommonHeader::read(buf).flags),
+            Ok(PageType::Branch)
+        ));
+        BranchRef {
+            buf,
+            lower: read_u16(buf, OFF_LOWER),
+            upper: read_u16(buf, OFF_UPPER),
+        }
+    }
+
     /// Number of children on this page (`lower / 2`).
     #[must_use]
     pub fn num_keys(&self) -> usize {
@@ -611,11 +654,16 @@ pub struct BranchMut<'a> {
 impl<'a> BranchMut<'a> {
     /// Wrap an already-validated branch page for mutation.
     ///
+    /// Same contract and same A8 change as [`LeafMut::from_valid`]: callers
+    /// only hand this engine-authored dirty frames, so validation is the
+    /// O(1) structural checks ([`BranchRef::new_prevalidated`]) — the full
+    /// per-cell walk ran here on every parent-chain touch until A8.
+    ///
     /// # Errors
     ///
-    /// Propagates [`BranchRef::new`] validation.
+    /// Propagates [`BranchRef::new_prevalidated`] validation.
     pub fn from_valid(buf: &'a mut [u8], psize: u32) -> Result<BranchMut<'a>, PageError> {
-        BranchRef::new(buf, psize)?;
+        BranchRef::new_prevalidated(buf, psize)?;
         Ok(BranchMut { buf, psize })
     }
 

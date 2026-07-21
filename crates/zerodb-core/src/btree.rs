@@ -16,8 +16,8 @@
 //! subsection whose positioning/EOF/empty-DB semantics it implements.
 
 use std::cell::Cell;
-use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 
 use super::cmp::KeyCmp;
 use super::dirty::DirtyStore;
@@ -103,36 +103,162 @@ impl<'a> Source<'a> {
     }
 }
 
+/// Geometric growth levels of the memo (level `i` holds
+/// `MEMO_BASE_SLOTS << (2 * i)` slots): 7 levels ≈ 5.6 M slots ≈ 2.8 M
+/// memoized pages at the ½ load-factor gate — a ~45 GB env of 16 K pages
+/// touched by ONE txn before the memo saturates and degrades to plain
+/// revalidation (correct, just slower).
+const MEMO_LEVELS: usize = 7;
+/// Slots in level 0 (8 KiB) — sized so short txns allocate once and small.
+const MEMO_BASE_SLOTS: usize = 1024;
+
+/// Which validated shape a memo entry vouches for (PERF-GAP A8). The kind is
+/// part of the memo **key**, so a hit can hand out a fully *trusted* typed
+/// view (`new_trusted`, zero checks) while a pgno validated as one kind can
+/// never be trusted as the other — the mismatched lookup simply misses and
+/// revalidates, failing loudly on the type check.
+#[derive(Clone, Copy)]
+pub(crate) enum PageKind {
+    Leaf,
+    Branch,
+}
+
 /// Txn-scoped memo of pages whose **cells** have already passed full
-/// validation this txn (docs/PERF-GAP-VS-LMDB.md A2).
+/// validation this txn (docs/PERF-GAP-VS-LMDB.md A2; lock-free since A7).
 ///
 /// `LeafRef::new`/`BranchRef::new` validate every cell — O(`num_keys`) per
-/// view construction — which multiplied every descent (get, seek, put search).
-/// A page recorded here may be re-wrapped via the `new_prevalidated`
-/// constructors (O(1) structural checks only, cell loop skipped).
+/// view construction — which multiplied every descent (get, seek, put
+/// search). A page recorded here is re-wrapped via the zero-check
+/// `new_trusted` constructors (the memo key carries the page kind).
 ///
 /// Soundness: entries are only recorded for **map-sourced** bytes
 /// ([`Source::bytes_from_classified`]), which are immutable for the owning
-/// txn's life; dirty frames never enter the memo. The type flag is still
-/// re-read on every wrap, so a pgno validated as one type can never be
-/// trusted as another. `Mutex` keeps the owning txn auto-`Sync`.
+/// txn's life; dirty frames never enter the memo.
+///
+/// Concurrency (A7): milli shares one `RoTxn` across rayon workers, and the
+/// previous `Mutex<HashSet>` probe was the second-hottest zerodb frame in the
+/// milli indexing profile. Now: insert-only open addressing over `AtomicU64`
+/// slots (`0` = empty, else `key`), in geometrically growing levels published
+/// through `OnceLock` — levels are never moved or rehashed, `contains` probes
+/// every initialized level, and nothing here can affect correctness: any
+/// degradation (stale level counter, saturated last level, racing duplicate
+/// insert) is at worst a miss, which revalidates.
 pub struct ValidatedPages {
-    set: Mutex<HashSet<u64>>,
+    levels: [OnceLock<Box<[AtomicU64]>>; MEMO_LEVELS],
+    /// Highest level inserts currently target.
+    cur: AtomicUsize,
+    /// Per-level advisory fill counts (½ load-factor gate only).
+    counts: [AtomicUsize; MEMO_LEVELS],
 }
 
 impl ValidatedPages {
     pub(crate) fn new() -> ValidatedPages {
         ValidatedPages {
-            set: Mutex::new(HashSet::new()),
+            levels: std::array::from_fn(|_| OnceLock::new()),
+            cur: AtomicUsize::new(0),
+            counts: std::array::from_fn(|_| AtomicUsize::new(0)),
         }
     }
 
-    fn contains(&self, pgno: u64) -> bool {
-        self.set.lock().expect("memo poisoned").contains(&pgno)
+    /// One slot's stored key: `(pgno | kind_tag) + 1`, so `0` stays "empty".
+    /// Bit 63 tags the kind; pgnos are bounded far below that
+    /// (`map_size / page_size`), and the `+1` cannot wrap.
+    fn key_of(pgno: u64, kind: PageKind) -> u64 {
+        let tag = match kind {
+            PageKind::Leaf => 0,
+            PageKind::Branch => 1u64 << 63,
+        };
+        (pgno | tag) + 1
     }
 
-    fn insert(&self, pgno: u64) {
-        self.set.lock().expect("memo poisoned").insert(pgno);
+    /// splitmix64 finalizer — cheap, well-mixed slot index (the memo's
+    /// previous SipHash was measurable in the milli profile).
+    fn mix(mut z: u64) -> u64 {
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn contains(&self, pgno: u64, kind: PageKind) -> bool {
+        let key = Self::key_of(pgno, kind);
+        // Ordering: `Acquire` here pairs with the `Release` slot publication
+        // in `insert`, so a hit happens-after the completed validation that
+        // program-order preceded that insert (required on ARM's weak model;
+        // the page bytes themselves are immutable and were readable before).
+        // A stale `cur` or slot read is only ever a miss → revalidation.
+        let top = self.cur.load(Ordering::Acquire).min(MEMO_LEVELS - 1);
+        for level in self.levels.iter().take(top + 1) {
+            let Some(lvl) = level.get() else { continue };
+            let mask = lvl.len() - 1;
+            let mut i = (Self::mix(key) as usize) & mask;
+            // Bounded probe: the ½ load-factor gate guarantees empty slots,
+            // so the first `0` ends this level; the bound is belt-and-braces.
+            for _ in 0..lvl.len() {
+                match lvl[i].load(Ordering::Acquire) {
+                    0 => break,
+                    s if s == key => return true,
+                    _ => i = (i + 1) & mask,
+                }
+            }
+        }
+        false
+    }
+
+    fn insert(&self, pgno: u64, kind: PageKind) {
+        let key = Self::key_of(pgno, kind);
+        loop {
+            // Ordering: `Acquire` on `cur` sees the latest published level
+            // index; `get_or_init` does its own synchronization for the
+            // allocation itself.
+            let li = self.cur.load(Ordering::Acquire).min(MEMO_LEVELS - 1);
+            let lvl = self.levels[li].get_or_init(|| {
+                (0..MEMO_BASE_SLOTS << (2 * li))
+                    .map(|_| AtomicU64::new(0))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            });
+            // ½ load-factor gate: keeps probes short and guarantees empty
+            // slots so `contains` terminates on the first `0`.
+            if self.counts[li].load(Ordering::Relaxed) * 2 >= lvl.len() {
+                if li + 1 < MEMO_LEVELS {
+                    // Ordering: `AcqRel` — the winning bump publishes the new
+                    // level index; losers reload and retry.
+                    let _ =
+                        self.cur
+                            .compare_exchange(li, li + 1, Ordering::AcqRel, Ordering::Acquire);
+                    continue;
+                }
+                return; // saturated: degrade to revalidation, stay correct
+            }
+            let mask = lvl.len() - 1;
+            let mut i = (Self::mix(key) as usize) & mask;
+            for _ in 0..lvl.len() {
+                // Ordering: `Release` on success publishes "this page's full
+                // validation completed" (all validation reads are
+                // program-ordered before this CAS) to `contains`'s `Acquire`
+                // loads; `Acquire` on failure so an observed equal key is a
+                // completed publication by a racing thread.
+                match lvl[i].compare_exchange(0, key, Ordering::Release, Ordering::Acquire) {
+                    Ok(_) => {
+                        // Advisory only (gates the load factor); `Relaxed`
+                        // suffices — no data is published through it.
+                        self.counts[li].fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                    Err(s) if s == key => return,
+                    Err(_) => i = (i + 1) & mask,
+                }
+            }
+            // Level filled under racing inserts before the gate caught it:
+            // advance (or saturate) and retry.
+            if li + 1 < MEMO_LEVELS {
+                let _ = self
+                    .cur
+                    .compare_exchange(li, li + 1, Ordering::AcqRel, Ordering::Acquire);
+            } else {
+                return;
+            }
+        }
     }
 }
 
@@ -149,11 +275,12 @@ pub(crate) fn leaf_view<'a>(
     match valid {
         Some(v) => {
             if from_map {
-                if v.contains(pgno) {
-                    LeafRef::new_prevalidated(bytes, psize)
+                if v.contains(pgno, PageKind::Leaf) {
+                    // Kind-tagged hit: zero checks (PERF-GAP A8).
+                    Ok(LeafRef::new_trusted(bytes))
                 } else {
                     let leaf = LeafRef::new(bytes, psize)?;
-                    v.insert(pgno);
+                    v.insert(pgno, PageKind::Leaf);
                     Ok(leaf)
                 }
             } else {
@@ -182,11 +309,12 @@ pub(crate) fn branch_view<'a>(
     match valid {
         Some(v) => {
             if from_map {
-                if v.contains(pgno) {
-                    BranchRef::new_prevalidated(bytes, psize)
+                if v.contains(pgno, PageKind::Branch) {
+                    // Kind-tagged hit: zero checks (PERF-GAP A8).
+                    Ok(BranchRef::new_trusted(bytes))
                 } else {
                     let br = BranchRef::new(bytes, psize)?;
-                    v.insert(pgno);
+                    v.insert(pgno, PageKind::Branch);
                     Ok(br)
                 }
             } else {
@@ -1150,5 +1278,58 @@ mod tests {
         assert_eq!(prefix_successor(b"\xff\xff"), None);
         assert_eq!(prefix_successor(b""), None);
         assert_eq!(prefix_successor(b"a\xff\xff"), Some(b"b".to_vec()));
+    }
+
+    /// PERF-GAP A8: the lock-free memo under concurrent insert/contains.
+    /// 4 threads × 2,000 keys with heavy overlap (every key inserted by two
+    /// threads, both kinds) force level growth (level 0 holds 512 at the ½
+    /// gate), CAS races on duplicate keys, and probes racing publications.
+    /// Afterwards every inserted key must be a hit under its own kind and a
+    /// miss under the other (bit-63 tag). Runs natively and under miri
+    /// (miri's weak-memory machinery checks the Acquire/Release pairs); loom
+    /// is deliberately not wired: the memo's contract is advisory (any race
+    /// outcome is at worst a miss → revalidation), unlike the reader table's.
+    #[test]
+    fn validated_pages_concurrent_insert_contains() {
+        let vp = ValidatedPages::new();
+        let n_threads = 4usize;
+        // Full size natively (forces two level-growths); small under miri —
+        // its weak-memory simulation is ~1000× slower and the orderings it
+        // checks are the same at any size. Level growth still triggers with
+        // 640 distinct keys > level 0's 512-insert gate.
+        #[cfg(not(miri))]
+        let per_thread = 2_000u64;
+        #[cfg(miri)]
+        let per_thread = 320u64;
+        std::thread::scope(|s| {
+            for t in 0..n_threads {
+                let vp = &vp;
+                s.spawn(move || {
+                    for i in 0..per_thread {
+                        // Overlap: thread t and thread (t+1)%4 share keys.
+                        let pgno = (t as u64 % 2) * 10_000 + i;
+                        let kind = if i % 2 == 0 {
+                            PageKind::Leaf
+                        } else {
+                            PageKind::Branch
+                        };
+                        vp.insert(pgno, kind);
+                        assert!(vp.contains(pgno, kind), "own insert must hit");
+                    }
+                });
+            }
+        });
+        for pgno in 0..per_thread {
+            let (own, other) = if pgno % 2 == 0 {
+                (PageKind::Leaf, PageKind::Branch)
+            } else {
+                (PageKind::Branch, PageKind::Leaf)
+            };
+            assert!(vp.contains(pgno, own));
+            assert!(vp.contains(10_000 + pgno, own));
+            assert!(!vp.contains(pgno, other), "kind tag must separate");
+            assert!(!vp.contains(10_000 + pgno, other));
+        }
+        assert!(!vp.contains(999_999, PageKind::Leaf));
     }
 }

@@ -101,7 +101,7 @@ macro_rules! with_read {
                 $body
             }
             Active::Ro(r) => {
-                let $t = r;
+                let $t = &**r;
                 $body
             }
             Active::None => OpResult::Skipped(Skip::NoTxn),
@@ -116,7 +116,9 @@ macro_rules! with_read {
 enum Active {
     None,
     Rw(Box<RwTxn<'static>>),
-    Ro(RoTxn<'static>),
+    // Boxed: `RoTxn` carries the inline lock-free validated-pages memo
+    // since PERF-GAP A8 (~180 B), tripping `clippy::large_enum_variant`.
+    Ro(Box<RoTxn<'static>>),
     /// A nested read child over the paused write txn (SPEC 04 §5, M1.9).
     ///
     /// Field order is load-bearing: `nested` is declared **before** `wtxn`,
@@ -332,7 +334,7 @@ impl ZerodbEngine {
         };
         match outcome {
             Ok(txn) => {
-                self.active = Active::Ro(txn);
+                self.active = Active::Ro(Box::new(txn));
                 OpResult::Ok
             }
             Err(e) => OpResult::Err(to_oracle(e)),
