@@ -1472,6 +1472,7 @@ dependencies = [
 name = "zerodb-io"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "memmap2",
  "zerodb-core",
 ]

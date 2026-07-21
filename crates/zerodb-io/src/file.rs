@@ -50,6 +50,75 @@ pub fn write_page(file: &File, pgno: u64, psize: u32, bytes: &[u8]) -> std::io::
     file.write_all_at(bytes, off)
 }
 
+/// Vectored positioned write of consecutive page-multiple `frames` laid out
+/// back-to-back from `start_pgno * psize` (commit C2 batching, PERF-GAP B4):
+/// one `pwritev` per chunk of up to [`MAX_IOV`] frames instead of one syscall
+/// per dirty page.
+///
+/// A short write (rare on regular files) falls back to per-frame
+/// [`write_page`] for the whole chunk — positioned rewrites of the same bytes
+/// at the same offsets are idempotent, so restarting the chunk is correct.
+///
+/// # Errors
+///
+/// Propagates the positioned-write I/O error.
+pub fn write_pages_vectored(
+    file: &File,
+    start_pgno: u64,
+    psize: u32,
+    frames: &[&[u8]],
+) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    /// Conservative iovec cap ≤ `IOV_MAX` on every supported platform
+    /// (Linux 1024, macOS 1024; LMDB's `MDB_COMMIT_PAGES` plays the same
+    /// role).
+    const MAX_IOV: usize = 512;
+
+    let mut off: u64 = start_pgno * psize as u64;
+    let mut i = 0usize;
+    while i < frames.len() {
+        let chunk = &frames[i..(i + MAX_IOV).min(frames.len())];
+        let total: usize = chunk.iter().map(|f| f.len()).sum();
+        let iovs: Vec<libc::iovec> = chunk
+            .iter()
+            .map(|f| libc::iovec {
+                iov_base: f.as_ptr() as *mut libc::c_void,
+                iov_len: f.len(),
+            })
+            .collect();
+        let offset = libc::off_t::try_from(off).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset overflow")
+        })?;
+        // SAFETY: each iovec points at a live `&[u8]` borrow held for the
+        // whole call (`chunk` outlives it); `pwritev` only READS the buffers
+        // (`iov_base` is `*mut` purely for C signature symmetry); the fd is a
+        // valid, open regular file owned by `file`.
+        let n = unsafe {
+            libc::pwritev(
+                file.as_raw_fd(),
+                iovs.as_ptr(),
+                iovs.len() as libc::c_int,
+                offset,
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if n as usize != total {
+            // Short write: restart this chunk with idempotent per-frame
+            // positioned writes.
+            let mut pg = off / psize as u64;
+            for f in chunk {
+                write_page(file, pg, psize, f)?;
+                pg += (f.len() / psize as usize) as u64;
+            }
+        }
+        off += total as u64;
+        i += chunk.len();
+    }
+    Ok(())
+}
+
 /// Read the first `len` bytes of the file (the meta-slot head, used to probe
 /// the persisted map size before mapping).
 ///

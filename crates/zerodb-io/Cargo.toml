@@ -8,3 +8,5 @@ license.workspace = true
 [dependencies]
 zerodb-core = { path = "../zerodb-core" }
 memmap2.workspace = true
+# pwritev for the vectored commit write path (PERF-GAP B4); allowlisted.
+libc.workspace = true

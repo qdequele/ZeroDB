@@ -48,6 +48,7 @@
 //! commit ids are consecutive. Non-reuse would make a post-abort commit
 //! overwrite the *live* snapshot's slot. (SPEC 04 §1 clarified in this change.)
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, MutexGuard};
 
@@ -216,15 +217,40 @@ struct OwnedLeafCell {
     flags: u16,
 }
 
-impl OwnedLeafCell {
-    /// `cell + 2` bytes this cell consumes on a page (§6.4 `used` term).
-    fn used(&self) -> usize {
-        let varea = match &self.val {
-            OwnedVal::Inline(v) => v.len(),
-            OwnedVal::Big { .. } => 8,
+/// A leaf split's new-cell payload, **borrowed** from the caller (PERF-GAP
+/// B2): `split_leaf` packs it straight into the target frame without ever
+/// materializing an owned cell.
+enum NewLeafVal<'v> {
+    /// A plain inline value.
+    Inline(&'v [u8]),
+    /// RESERVE (TXN-47): a zero-filled inline region of this length (fresh
+    /// frames are zero-initialized, so packing reserves bytes without a
+    /// zeroed scratch vec).
+    ZeroReserve(usize),
+    /// A BIGDATA pointer cell (the overflow run is already written).
+    Big { head: u64, dsize: u32 },
+}
+
+impl NewLeafVal<'_> {
+    /// §6.4 `used` term for the new cell (mirrors [`OwnedLeafCell::used`]).
+    fn used(&self, key_len: usize) -> usize {
+        let varea = match self {
+            NewLeafVal::Inline(v) => v.len(),
+            NewLeafVal::ZeroReserve(n) => *n,
+            NewLeafVal::Big { .. } => 8,
         };
-        even(LEAF_NODE_HEADER + self.key.len() + varea) + 2
+        even(LEAF_NODE_HEADER + key_len + varea) + 2
     }
+}
+
+/// §6.4 `used` term of existing cell `i` of a leaf view (borrowed twin of
+/// [`OwnedLeafCell::used`]; PERF-GAP B2).
+fn leaf_cell_used(leaf: &LeafRef<'_>, i: usize) -> usize {
+    let varea = match leaf.value(i) {
+        LeafValue::Inline(v) => v.len(),
+        LeafValue::Overflow { .. } => 8,
+    };
+    even(LEAF_NODE_HEADER + leaf.key(i).len() + varea) + 2
 }
 
 /// An owned branch cell (separator + child). `key` is empty for node 0.
@@ -1380,19 +1406,15 @@ impl<'env> RwTxn<'env> {
             match r {
                 Ok(()) => Ok(ReserveLoc::Inline),
                 Err(PageError::PageFull { .. }) => {
-                    // Split (§6.2/§6.4). A RESERVE that splits materializes as
-                    // a zero-filled placeholder the caller then overwrites
-                    // (TXN-47 note: fresh frames have no prior content to
-                    // preserve; the closure must fully write the region).
-                    let cell = OwnedLeafCell {
-                        key: key.to_vec(),
-                        val: OwnedVal::Inline(match &val {
-                            ValSrc::Val(v) => v.to_vec(),
-                            ValSrc::Reserve(n) => vec![0u8; *n],
-                        }),
-                        flags: node_flags,
+                    // Split (§6.2/§6.4). A RESERVE that splits packs as a
+                    // zero-filled placeholder the caller then overwrites
+                    // (TXN-47: fresh frames are zero-initialized, so the
+                    // region is zeroed without a scratch buffer).
+                    let nv = match &val {
+                        ValSrc::Val(v) => NewLeafVal::Inline(v),
+                        ValSrc::Reserve(n) => NewLeafVal::ZeroReserve(*n),
                     };
-                    self.split_leaf(tree, path, ki, cell, append)?;
+                    self.split_leaf(tree, path, ki, key, nv, node_flags, append)?;
                     Ok(ReserveLoc::Inline)
                 }
                 Err(e) => Err(corrupt(e)),
@@ -1425,12 +1447,15 @@ impl<'env> RwTxn<'env> {
             match r {
                 Ok(()) => Ok(ReserveLoc::Big(head)),
                 Err(PageError::PageFull { .. }) => {
-                    let cell = OwnedLeafCell {
-                        key: key.to_vec(),
-                        val: OwnedVal::Big { head, dsize },
-                        flags: node_flags,
-                    };
-                    self.split_leaf(tree, path, ki, cell, append)?;
+                    self.split_leaf(
+                        tree,
+                        path,
+                        ki,
+                        key,
+                        NewLeafVal::Big { head, dsize },
+                        node_flags,
+                        append,
+                    )?;
                     Ok(ReserveLoc::Big(head))
                 }
                 Err(e) => Err(corrupt(e)),
@@ -1477,25 +1502,6 @@ impl<'env> RwTxn<'env> {
         Ok(cells)
     }
 
-    /// Rewrite the (dirty) leaf frame at `pgno` from owned cells.
-    fn write_leaf_frame(&mut self, pgno: u64, cells: &[OwnedLeafCell]) -> Result<()> {
-        let psize = self.psize;
-        let txnid = self.txnid;
-        let frame = self.dirty.bytes_mut(pgno).expect("page is dirty");
-        let mut leaf = LeafMut::init(frame, psize, pgno, txnid).map_err(corrupt)?;
-        for (i, c) in cells.iter().enumerate() {
-            match &c.val {
-                OwnedVal::Inline(v) => {
-                    leaf.insert_inline(i, &c.key, c.flags, v).map_err(corrupt)?
-                }
-                OwnedVal::Big { head, dsize } => leaf
-                    .insert_bigdata(i, &c.key, *dsize, *head)
-                    .map_err(corrupt)?,
-            }
-        }
-        Ok(())
-    }
-
     /// Rewrite the (dirty) branch frame at `pgno` from owned cells. `cells[0]`
     /// carries the empty separator (node 0).
     fn write_branch_frame(&mut self, pgno: u64, cells: &[OwnedBranchCell]) -> Result<()> {
@@ -1523,33 +1529,85 @@ impl<'env> RwTxn<'env> {
     /// puts included); it matches the fork's `mdb_page_split` and roughly
     /// doubles leaf fill on ascending workloads (milli's dominant pattern).
     /// All non-end inserts keep the median-fit-adjust rule (`choose_split`).
+    #[allow(clippy::too_many_arguments)] // house pattern (insert_into_leaf): pre-resolved scalars
     fn split_leaf(
         &mut self,
         tree: TreeId,
         path: &mut [(u64, usize)],
         newindx: usize,
-        newcell: OwnedLeafCell,
+        key: &[u8],
+        val: NewLeafVal<'_>,
+        node_flags: u16,
         append: bool,
     ) -> Result<()> {
+        let psize = self.psize;
         let top = path.len() - 1;
         let (lpg, _) = path[top];
-        let mut cells = self.extract_leaf_cells(lpg)?;
-        cells.insert(newindx, newcell);
-        let cap = body_size(self.psize);
-        // `append` implies an end insert; the general `newindx == nkeys` case
-        // covers plain puts that land at the end too (ratified end-of-page
-        // insert-point rule, §6.4).
-        let s = if append || newindx == cells.len() - 1 {
-            cells.len() - 1 // §6.4 end-of-page split: new cell alone on the right
-        } else {
-            let sizes: Vec<usize> = cells.iter().map(OwnedLeafCell::used).collect();
-            choose_split(&sizes, cap)
+        let n_old = {
+            let frame = self.dirty.bytes(lpg).expect("leaf is dirty");
+            LeafRef::new_prevalidated(frame, psize)
+                .map_err(corrupt)?
+                .num_keys()
         };
-        let sep = cells[s].key.clone(); // leaf split: sep = first key of R (§6.4)
+
+        // `append` implies an end insert; the general `newindx == n_old` case
+        // covers plain puts that land at the end too (ratified end-of-page
+        // insert-point rule, §6.4): the new cell ALONE forms the right page.
+        // B2 fast path: the left (dirty) frame is byte-identical to the
+        // pre-split page, so it is not touched at all — no extraction, no
+        // rewrite, no per-cell allocation.
+        if append || newindx == n_old {
+            let rpg = self.allocate(1)?;
+            {
+                let txnid = self.txnid;
+                let frame = self.dirty.insert_tree_frame(rpg);
+                let mut leaf = LeafMut::init(frame, psize, rpg, txnid).map_err(corrupt)?;
+                match &val {
+                    NewLeafVal::Inline(v) => leaf.insert_inline(0, key, node_flags, v),
+                    NewLeafVal::ZeroReserve(n) => {
+                        leaf.insert_inline_reserved(0, key, *n as u32).map(|_| ())
+                    }
+                    NewLeafVal::Big { head, dsize } => leaf.insert_bigdata(0, key, *dsize, *head),
+                }
+                .map_err(corrupt)?;
+            }
+            self.record_mut(tree).leaf_pages += 1;
+            let sep = key.to_vec(); // sep = first key of R = the new key (§6.4)
+            return if top == 0 {
+                self.insert_into_branch(tree, path, -1, 0, sep, rpg)
+            } else {
+                let at = path[top - 1].1 + 1;
+                self.insert_into_branch(tree, path, top as isize - 1, at, sep, rpg)
+            };
+        }
+
+        // General split: pack both frames from cells **borrowed** out of the
+        // old frame — removed from the store as an owned, address-stable
+        // `Box` — plus the caller's new cell. No `OwnedLeafCell`
+        // materialization (PERF-GAP B2).
         let rpg = self.allocate(1)?;
-        self.dirty.insert_tree_frame(rpg);
-        self.write_leaf_frame(lpg, &cells[..s])?;
-        self.write_leaf_frame(rpg, &cells[s..])?;
+        let old = self.dirty.remove(lpg).expect("leaf is dirty");
+        let oldleaf = LeafRef::new_prevalidated(&old, psize).map_err(corrupt)?;
+        let total = n_old + 1;
+        let mut sizes = Vec::with_capacity(total);
+        for j in 0..total {
+            sizes.push(match j.cmp(&newindx) {
+                Ordering::Less => leaf_cell_used(&oldleaf, j),
+                Ordering::Equal => val.used(key.len()),
+                Ordering::Greater => leaf_cell_used(&oldleaf, j - 1),
+            });
+        }
+        let cap = body_size(psize);
+        let s = choose_split(&sizes, cap);
+        // sep = first key of R (§6.4).
+        let sep = match s.cmp(&newindx) {
+            Ordering::Less => oldleaf.key(s).to_vec(),
+            Ordering::Equal => key.to_vec(),
+            Ordering::Greater => oldleaf.key(s - 1).to_vec(),
+        };
+        self.pack_leaf_range(lpg, &oldleaf, newindx, key, &val, node_flags, 0, s)?;
+        self.pack_leaf_range(rpg, &oldleaf, newindx, key, &val, node_flags, s, total)?;
+        drop(old);
         self.record_mut(tree).leaf_pages += 1;
         if top == 0 {
             self.insert_into_branch(tree, path, -1, 0, sep, rpg)
@@ -1557,6 +1615,56 @@ impl<'env> RwTxn<'env> {
             let at = path[top - 1].1 + 1;
             self.insert_into_branch(tree, path, top as isize - 1, at, sep, rpg)
         }
+    }
+
+    /// Pack post-insert items `[from, to)` into a fresh frame at `pgno`
+    /// (PERF-GAP B2): item `j` is the caller's new cell when `j == newindx`,
+    /// else old cell `j`/`j-1` borrowed from `old`. The frame is
+    /// zero-initialized by `insert_tree_frame`, so `ZeroReserve` regions are
+    /// zero-filled without a scratch buffer (TXN-47).
+    #[allow(clippy::too_many_arguments)]
+    fn pack_leaf_range(
+        &mut self,
+        pgno: u64,
+        old: &LeafRef<'_>,
+        newindx: usize,
+        key: &[u8],
+        val: &NewLeafVal<'_>,
+        node_flags: u16,
+        from: usize,
+        to: usize,
+    ) -> Result<()> {
+        let psize = self.psize;
+        let txnid = self.txnid;
+        let frame = self.dirty.insert_tree_frame(pgno);
+        let mut leaf = LeafMut::init(frame, psize, pgno, txnid).map_err(corrupt)?;
+        for (slot, j) in (from..to).enumerate() {
+            let r = match j.cmp(&newindx) {
+                Ordering::Equal => match val {
+                    NewLeafVal::Inline(v) => leaf.insert_inline(slot, key, node_flags, v),
+                    NewLeafVal::ZeroReserve(n) => leaf
+                        .insert_inline_reserved(slot, key, *n as u32)
+                        .map(|_| ()),
+                    NewLeafVal::Big { head, dsize } => {
+                        leaf.insert_bigdata(slot, key, *dsize, *head)
+                    }
+                },
+                other => {
+                    let i = if other == Ordering::Less { j } else { j - 1 };
+                    // Preserve non-BIGDATA node flags (F_SUBDATA) across the
+                    // rewrite (SPEC 02 §6); F_BIGDATA is re-derived on write.
+                    let flags = old.node_flags(i) & !crate::page::F_BIGDATA;
+                    match old.value(i) {
+                        LeafValue::Inline(v) => leaf.insert_inline(slot, old.key(i), flags, v),
+                        LeafValue::Overflow { head_pgno, dsize } => {
+                            leaf.insert_bigdata(slot, old.key(i), dsize, head_pgno)
+                        }
+                    }
+                }
+            };
+            r.map_err(corrupt)?;
+        }
+        Ok(())
     }
 
     /// Insert `(key -> child)` at index `at` of the branch at `path[level]`,
@@ -2535,8 +2643,14 @@ impl<'env> RwTxn<'env> {
         // `N-1` (REC-6 H0).
 
         // ----- C2: write dirty pages, ascending pgno. Not yet durable. -----
+        // Consecutive frames are batched into one vectored write (PERF-GAP
+        // B4): a frame at `pgno` covering `n` pages (an overflow run) makes
+        // the run contiguous iff the next frame starts at `pgno + n`.
         {
             let backing = inner.backing_ref();
+            let mut run_start: u64 = 0;
+            let mut next_expected: u64 = 0;
+            let mut run: Vec<&[u8]> = Vec::new();
             for pgno in self.dirty.sorted_pgnos() {
                 let data = self.dirty.bytes(pgno).expect("sorted pgno present");
                 // TXN-62: C2 may only write pages the live meta `N-1` does not
@@ -2547,7 +2661,19 @@ impl<'env> RwTxn<'env> {
                     pgno > self.committed_last_pg || self.reclaimed.contains(&pgno),
                     "TXN-62 violation: writing page {pgno} referenced by the live snapshot"
                 );
-                backing.write_at_page(pgno, psize, data)?;
+                if !run.is_empty() && pgno != next_expected {
+                    backing.write_pages_at(run_start, psize, &run)?;
+                    run.clear();
+                }
+                if run.is_empty() {
+                    run_start = pgno;
+                    next_expected = pgno;
+                }
+                run.push(data);
+                next_expected += (data.len() / psize as usize) as u64;
+            }
+            if !run.is_empty() {
+                backing.write_pages_at(run_start, psize, &run)?;
             }
         }
         inner.run_hook(HookPoint::H1);

@@ -58,6 +58,14 @@ impl Backing for MmapBacking {
         file::write_page(&self.file, pgno, psize, data)
     }
 
+    fn write_pages_at(&self, start_pgno: u64, psize: u32, frames: &[&[u8]]) -> std::io::Result<()> {
+        // Batched C2 (PERF-GAP B4): one pwritev per chunk instead of one
+        // pwrite per dirty page. Same TXN-62 safety argument as
+        // `write_at_page` — the target pages are unreferenced by any live
+        // snapshot, so racing readers cannot observe the writes.
+        file::write_pages_vectored(&self.file, start_pgno, psize, frames)
+    }
+
     fn sync_data(&self) -> std::io::Result<()> {
         // ADR-0004 D3 as amended (OQ3): std's `sync_data` semantics as-is —
         // `fdatasync` on Linux (flushes data + the size metadata needed to

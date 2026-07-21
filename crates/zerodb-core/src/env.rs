@@ -78,6 +78,29 @@ pub trait Backing: Send + Sync {
         ))
     }
 
+    /// Vectored positioned write of **consecutive** frames starting at
+    /// `start_pgno` (commit C2 batching, PERF-GAP B4): `frames` are
+    /// page-multiple buffers laid out back-to-back on disk from
+    /// `start_pgno * psize`.
+    ///
+    /// The default delegates to one [`Backing::write_at_page`] per frame —
+    /// byte-identical semantics, so the fault-injection backing keeps its
+    /// per-frame crash journal and the writable-map backing its per-frame
+    /// copy. The plain-file backing overrides this with `pwritev` to batch
+    /// syscalls.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the positioned-write I/O error.
+    fn write_pages_at(&self, start_pgno: u64, psize: u32, frames: &[&[u8]]) -> std::io::Result<()> {
+        let mut pgno = start_pgno;
+        for f in frames {
+            self.write_at_page(pgno, psize, f)?;
+            pgno += (f.len() / psize as usize) as u64;
+        }
+        Ok(())
+    }
+
     /// Durability barrier for previously-written pages (commit steps C3/C5;
     /// `File::sync_data` — ADR-0004 D3 as amended by OQ3: std semantics as-is,
     /// `fdatasync` on Linux).
