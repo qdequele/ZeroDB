@@ -7,17 +7,23 @@
 //! borrows over the txn's view (committed map, or a write/nested txn's dirty
 //! frames). `next` just decodes with the codecs.
 //!
-//! ## Write iterators (the pointer-based cursor, mirroring heed)
+//! ## Write iterators (the engine write cursor, mirroring heed)
 //!
 //! heed's `RwIter` holds a raw `MDB_txn` and alternates read (`next`) and
 //! mutate (`del_current`/`put_current`). ZeroDB's `RwTxn` is a Rust type, so we
-//! store a lifetime-erased [`NonNull`] to it and re-derive `&'txn` /
-//! `&'txn mut` views per call — sound under heed's documented contract: **no
-//! `&` borrow from a prior `next` may be live across a mutating call** (the
-//! reason `del_current`/`put_current` are `unsafe fn`). Positioning is by key
-//! (like `zerodb::RwCursor`): `next` seeks strictly past the last yielded key;
-//! after a delete it re-seeks with `set_range`. This is the single place the
-//! adapter needs raw pointers, exactly as heed does.
+//! erase its env lifetime **once at construction** and hand the resulting
+//! `&'txn mut` to a native [`zerodb::RwCursor`] — the stack-carrying write
+//! cursor (PERF-GAP B1): an advance is an amortized O(1) page-stack step
+//! (LMDB's `mc_pg[]`/`mc_ki[]` walk), not a fresh O(log n) seek by the last
+//! yielded key, and nothing is copied per step. The cursor yields lending
+//! borrows (they die at its next call); [`RwGuts::step`] stretches them to
+//! `'txn` — sound under heed's documented contract: **no `&` borrow from a
+//! prior `next` may be live across a mutating call** (the reason
+//! `del_current`/`put_current` are `unsafe fn`), and the yielded bytes live in
+//! the txn's committed map or its dirty frames, which only a mutation through
+//! this same iterator can replace. This is the single place the adapter needs
+//! raw pointers / lifetime erasure, exactly as heed does (the M1.13-sanctioned
+//! "lifetime-erased write cursor" unsafe).
 
 use std::marker::PhantomData;
 use std::ops::Bound;
@@ -166,20 +172,15 @@ pub(crate) enum Dir {
     Rev,
 }
 
-/// Shared guts of every `Rw*` iterator: a lifetime-erased handle to the write
-/// txn plus a key-based cursor position and range bounds. See the module docs
-/// for the safety contract.
+/// Shared guts of every `Rw*` iterator: a native stack-carrying write cursor
+/// over the lifetime-erased txn, plus the range bounds (PERF-GAP B1). See the
+/// module docs for the safety contract.
 pub(crate) struct RwGuts<'txn> {
-    txn: NonNull<zerodb::RwTxn<'txn>>,
-    db: zerodb::Database,
+    cursor: zerodb::RwCursor<'txn, 'txn>,
     dir: Dir,
     lower: Bound<Vec<u8>>,
     upper: Bound<Vec<u8>>,
-    /// Last yielded key (owned); `None` before the first `next`.
-    last: Option<Vec<u8>>,
     started: bool,
-    just_deleted: bool,
-    _p: PhantomData<&'txn mut zerodb::RwTxn<'txn>>,
 }
 
 impl<'txn> RwGuts<'txn> {
@@ -190,95 +191,72 @@ impl<'txn> RwGuts<'txn> {
         lower: Bound<Vec<u8>>,
         upper: Bound<Vec<u8>>,
     ) -> RwGuts<'txn> {
-        // Erase the write txn's env lifetime to `'txn`. Sound: the `&'txn mut`
-        // borrow guarantees the txn outlives `'txn`; the pointee layout is
-        // lifetime-independent.
+        // Erase the write txn's env lifetime to `'txn` and hand the exclusive
+        // borrow to the native write cursor for the iterator's whole life.
         let raw: NonNull<zerodb::RwTxn<'_>> = NonNull::from(wtxn.zdb_mut());
         let txn = raw.cast::<zerodb::RwTxn<'txn>>();
+        // SAFETY: `txn` came from a live `&'txn mut RwTxn`, so the pointee is
+        // valid and exclusively ours for `'txn`; the raw-pointer deref gives
+        // the unconstrained lifetime the cursor's `&'txn mut` needs, and the
+        // pointee layout is lifetime-independent.
+        let cursor = db.rw_cursor(unsafe { &mut *txn.as_ptr() });
         RwGuts {
-            txn,
-            db,
+            cursor,
             dir,
             lower,
             upper,
-            last: None,
             started: false,
-            just_deleted: false,
-            _p: PhantomData,
-        }
-    }
-
-    /// Immutable view of the write txn (`&'txn`) for a read step. See module
-    /// safety contract.
-    fn txn_ref(&self) -> &'txn zerodb::RwTxn<'txn> {
-        // SAFETY: the `NonNull` was derived from a live `&'txn mut RwTxn` and no
-        // `&mut` view is active during a `next` read; the pointee outlives
-        // `'txn`.
-        unsafe { self.txn.as_ref() }
-    }
-
-    /// Mutable view of the write txn (`&'txn mut`) for a mutate step.
-    fn txn_mut(&mut self) -> &'txn mut zerodb::RwTxn<'txn> {
-        // SAFETY: exclusive per the `&mut self` receiver and the contract that
-        // no `&` borrow from a prior `next` is live across this mutation.
-        unsafe { self.txn.as_mut() }
-    }
-
-    fn in_upper(&self, key: &[u8]) -> bool {
-        match &self.upper {
-            Bound::Unbounded => true,
-            Bound::Included(h) => key <= h.as_slice(),
-            Bound::Excluded(h) => key < h.as_slice(),
-        }
-    }
-    fn in_lower(&self, key: &[u8]) -> bool {
-        match &self.lower {
-            Bound::Unbounded => true,
-            Bound::Included(l) => key >= l.as_slice(),
-            Bound::Excluded(l) => key > l.as_slice(),
         }
     }
 
     /// Advance and yield the next in-range `(key, value)` as `&'txn` borrows.
     fn step(&mut self) -> Option<Result<(&'txn [u8], &'txn [u8])>> {
-        let txn = self.txn_ref();
-        let db = self.db;
-        let res = if !self.started || self.just_deleted {
-            self.started = true;
-            let seek_from_delete = self.just_deleted;
-            self.just_deleted = false;
-            match self.dir {
-                Dir::Fwd => match (&self.last, &self.lower) {
-                    // After a delete, re-seek at the deleted key (>=).
-                    (Some(k), _) if seek_from_delete => db.get_greater_than_or_equal_to(txn, k),
-                    (_, Bound::Unbounded) => db.first(txn),
-                    (_, Bound::Included(l)) => db.get_greater_than_or_equal_to(txn, l),
-                    (_, Bound::Excluded(l)) => db.get_greater_than(txn, l),
-                },
-                Dir::Rev => match (&self.last, &self.upper) {
-                    (Some(k), _) if seek_from_delete => db.get_lower_than(txn, k),
-                    (_, Bound::Unbounded) => db.last(txn),
-                    (_, Bound::Included(h)) => db.get_lower_than_or_equal_to(txn, h),
-                    (_, Bound::Excluded(h)) => db.get_lower_than(txn, h),
-                },
-            }
-        } else {
-            match (self.dir, &self.last) {
-                (Dir::Fwd, Some(k)) => db.get_greater_than(txn, k),
-                (Dir::Rev, Some(k)) => db.get_lower_than(txn, k),
-                (_, None) => Ok(None),
-            }
+        let first = !self.started;
+        self.started = true;
+        let res = match (self.dir, first) {
+            (Dir::Fwd, true) => match &self.lower {
+                Bound::Unbounded => self.cursor.seek_first(),
+                Bound::Included(l) => self.cursor.seek_ge(l),
+                Bound::Excluded(l) => self.cursor.seek_gt(l),
+            },
+            (Dir::Fwd, false) => self.cursor.move_next(),
+            (Dir::Rev, true) => match &self.upper {
+                Bound::Unbounded => self.cursor.seek_last(),
+                Bound::Included(h) => self.cursor.seek_le(h),
+                Bound::Excluded(h) => self.cursor.seek_lt(h),
+            },
+            (Dir::Rev, false) => self.cursor.move_prev(),
         };
         match res {
             Err(e) => Some(Err(e.into())),
             Ok(None) => None,
             Ok(Some((k, v))) => {
                 let ok = match self.dir {
-                    Dir::Fwd => self.in_upper(k),
-                    Dir::Rev => self.in_lower(k),
+                    Dir::Fwd => match &self.upper {
+                        Bound::Unbounded => true,
+                        Bound::Included(h) => k <= h.as_slice(),
+                        Bound::Excluded(h) => k < h.as_slice(),
+                    },
+                    Dir::Rev => match &self.lower {
+                        Bound::Unbounded => true,
+                        Bound::Included(l) => k >= l.as_slice(),
+                        Bound::Excluded(l) => k > l.as_slice(),
+                    },
                 };
                 if ok {
-                    self.last = Some(k.to_vec());
+                    // SAFETY (lifetime stretch to `'txn` — the M1.13
+                    // "lifetime-erased write cursor" clause): the yielded
+                    // bytes live in the txn's committed map or its dirty
+                    // frames, both stable until the next mutation through
+                    // this iterator; heed's contract forbids holding these
+                    // borrows across such a mutation (`del_current`/
+                    // `put_current` are `unsafe fn` for exactly this).
+                    let (k, v) = unsafe {
+                        (
+                            std::slice::from_raw_parts(k.as_ptr(), k.len()),
+                            std::slice::from_raw_parts(v.as_ptr(), v.len()),
+                        )
+                    };
                     Some(Ok((k, v)))
                 } else {
                     None
@@ -288,31 +266,17 @@ impl<'txn> RwGuts<'txn> {
     }
 
     fn del_current(&mut self) -> Result<bool> {
-        let Some(key) = self.last.clone() else {
-            return Ok(false);
-        };
-        let db = self.db;
-        let existed = db.delete(self.txn_mut(), &key)?;
-        self.just_deleted = true;
-        Ok(existed)
+        Ok(self.cursor.del_current()?)
     }
 
     fn put_current(&mut self, key: &[u8], data: &[u8]) -> Result<bool> {
-        let db = self.db;
-        db.put(self.txn_mut(), key, data)?;
-        self.last = Some(key.to_vec());
+        self.cursor.put(zerodb::PutFlags::EMPTY, key, data)?;
         Ok(true)
     }
 
     fn put_current_with_flags(&mut self, flags: PutFlags, key: &[u8], data: &[u8]) -> Result<()> {
-        let db = self.db;
-        db.put_with_flags(
-            self.txn_mut(),
-            crate::database::to_zdb_put_flags(flags),
-            key,
-            data,
-        )?;
-        self.last = Some(key.to_vec());
+        self.cursor
+            .put(crate::database::to_zdb_put_flags(flags), key, data)?;
         Ok(())
     }
 }

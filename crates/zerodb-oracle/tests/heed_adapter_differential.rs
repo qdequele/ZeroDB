@@ -309,3 +309,76 @@ proptest! {
         }
     }
 }
+
+/// PERF-GAP B6 pin (2026-07-21): the fork's `put_reserved` semantics when the
+/// caller's closure FAILS. LMDB reserves the slot inside the page via
+/// `MDB_RESERVE` *before* the closure runs, so a closure error cannot un-put
+/// the entry. Pinned side by side: (a) whether the call errors, (b) whether
+/// the key is present afterwards, (c) the stored length. Value BYTES are
+/// deliberately not compared — LMDB's unwritten reserve tail is whatever the
+/// page held (uninitialized from the API's point of view; zerodb zero-fills
+/// its tail, which this pin cannot and does not observe).
+///
+/// The pre-B6 adapter diverged here: it filled a heap buffer first, so a
+/// closure error meant NO entry. B6 reserves in-frame first, matching the
+/// fork.
+#[test]
+fn put_reserved_failing_closure_leaves_entry_parity() {
+    use std::io::Write as _;
+    use zerodb_oracle::tempdir::TempDir;
+
+    const LEN: usize = 64;
+
+    let fork = {
+        let dir = TempDir::new().unwrap();
+        let mut opts = heed::EnvOpenOptions::new().read_txn_without_tls();
+        opts.map_size(1 << 20);
+        opts.max_dbs(4);
+        // SAFETY: no cross-process flags; private temp dir, single-threaded.
+        let env = unsafe { opts.open(dir.path()).unwrap() };
+        let mut w = env.write_txn().unwrap();
+        let db: heed::Database<heed::types::Bytes, heed::types::Bytes> =
+            env.create_database(&mut w, None).unwrap();
+        let r = db.put_reserved(&mut w, b"key", LEN, |sp| {
+            sp.write_all(b"partial")?;
+            Err(std::io::Error::other("closure failure"))
+        });
+        let errored = r.is_err();
+        w.commit().unwrap();
+        let rt = env.read_txn().unwrap();
+        let len = db.get(&rt, b"key").unwrap().map(<[u8]>::len);
+        (errored, len)
+    };
+
+    let adapter = {
+        let dir = TempDir::new().unwrap();
+        let mut opts = heed_zerodb::EnvOpenOptions::new().read_txn_without_tls();
+        opts.map_size(1 << 20);
+        opts.max_dbs(4);
+        // SAFETY: as above.
+        let env = unsafe { opts.open(dir.path()).unwrap() };
+        let mut w = env.write_txn().unwrap();
+        let db: heed_zerodb::Database<heed_zerodb::types::Bytes, heed_zerodb::types::Bytes> =
+            env.create_database(&mut w, None).unwrap();
+        let r = db.put_reserved(&mut w, b"key", LEN, |sp| {
+            sp.write_all(b"partial")?;
+            Err(std::io::Error::other("closure failure"))
+        });
+        let errored = r.is_err();
+        w.commit().unwrap();
+        let rt = env.read_txn().unwrap();
+        let len = db.get(&rt, b"key").unwrap().map(<[u8]>::len);
+        (errored, len)
+    };
+
+    assert_eq!(
+        fork.0, adapter.0,
+        "closure-error propagation parity (fork errored: {}, adapter errored: {})",
+        fork.0, adapter.0
+    );
+    assert_eq!(
+        fork.1, adapter.1,
+        "post-error presence/length parity (fork: {:?}, adapter: {:?})",
+        fork.1, adapter.1
+    );
+}

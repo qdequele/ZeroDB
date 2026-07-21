@@ -1,12 +1,17 @@
 //! `ReservedSpace` — heed's `MDB_RESERVE` write buffer (SPEC 00 row 35). heed
-//! reserves bytes *inside the map*; the adapter reserves a heap buffer the
-//! caller fills, which `Database::put_reserved` then writes into the dirty page
-//! via ZeroDB's native `put_reserved` (SPEC 04 §6). API-compatible with heed's:
-//! `io::Write` + `size`/`remaining`/`written_mut`/`fill_zeroes`.
+//! reserves bytes *inside the map*; since PERF-GAP B6 (2026-07-21) the adapter
+//! does the equivalent: `Database::put_reserved` hands the caller a
+//! `ReservedSpace` wrapping the engine's **in-frame slot** (the mutable slice
+//! into the dirty page or overflow-run frame, SPEC 04 TXN-47) — no
+//! intermediate heap buffer, no copy. The slot may carry stale frame bytes
+//! (a COWed page's old cell heap), so the put path zeroes the unwritten tail
+//! after the caller's closure runs, preserving the pre-B6 zero-tail contract.
+//! API-compatible with heed's: `io::Write` + `size`/`remaining`/`written_mut`/
+//! `fill_zeroes`.
 
 use std::io;
 
-/// A buffer the caller fills for a reserved-space put. Must be fully written.
+/// A buffer the caller fills for a reserved-space put.
 pub struct ReservedSpace<'a> {
     bytes: &'a mut [u8],
     written: usize,
@@ -14,13 +19,23 @@ pub struct ReservedSpace<'a> {
 }
 
 impl<'a> ReservedSpace<'a> {
-    /// Wrap a (zero-initialized) buffer of the reserved size.
+    /// Wrap the reserved slot (since B6: the engine's in-frame slice, whose
+    /// bytes may be stale until written or [`zero_unwritten_tail`]ed).
     pub(crate) fn new(bytes: &'a mut [u8]) -> ReservedSpace<'a> {
         ReservedSpace {
             bytes,
             written: 0,
             write_head: 0,
         }
+    }
+
+    /// Zero every byte past the written high-water mark (PERF-GAP B6): the
+    /// space wraps the engine's in-frame slot, whose bytes are whatever the
+    /// (COWed) frame held there — zeroing the tail preserves the adapter's
+    /// shipped contract (the pre-B6 heap buffer was zero-initialized) and
+    /// keeps stores byte-deterministic.
+    pub(crate) fn zero_unwritten_tail(&mut self) {
+        self.bytes[self.written..].fill(0);
     }
 
     /// The total number of bytes this buffer has.
@@ -56,8 +71,9 @@ impl<'a> ReservedSpace<'a> {
     pub fn as_uninit_mut(&mut self) -> &mut [std::mem::MaybeUninit<u8>] {
         let len = self.bytes.len();
         let ptr = self.bytes.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>();
-        // SAFETY: `MaybeUninit<u8>` has the same layout as `u8`; the buffer is
-        // heap-owned and fully initialized (zeroed at creation).
+        // SAFETY: `MaybeUninit<u8>` has the same layout as `u8`; the slot is a
+        // live `&mut [u8]` (initialized memory — since B6 it is dirty-frame
+        // bytes, possibly *stale* in value but never uninitialized).
         unsafe { std::slice::from_raw_parts_mut(ptr, len) }
     }
 
@@ -65,8 +81,10 @@ impl<'a> ReservedSpace<'a> {
     ///
     /// # Safety
     ///
-    /// The caller guarantees those bytes are initialized (always true here — the
-    /// backing buffer starts zeroed).
+    /// The caller guarantees those bytes are initialized (always true here —
+    /// the slot is a live `&mut [u8]`, so every byte is initialized memory;
+    /// "written" only moves the high-water mark used by `remaining`/
+    /// `written_mut` and the B6 zero-tail).
     #[inline]
     pub unsafe fn assume_written(&mut self, len: usize) {
         debug_assert!(len <= self.bytes.len());

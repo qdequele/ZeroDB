@@ -52,7 +52,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, MutexGuard};
 
-use crate::btree::{branch_view, leaf_view, Source, Tree, ValidatedPages};
+use crate::btree::{
+    branch_view, leaf_view, Cursor as BCursor, SavedCursor, Source, Tree, ValidatedPages,
+};
 use crate::dirty::DirtyStore;
 use crate::env::{Env, HookPoint, Snapshot};
 use crate::error::{Error, MdbError, Result};
@@ -2899,89 +2901,273 @@ impl Database {
             txn,
             sel: self.sel(),
             pos: CurPos::Start,
+            saved: None,
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// RwCursor — the mutable cursor (SPEC 03 §7, ADR-0004 D5)
+// RwCursor — the mutable cursor (SPEC 03 §7, ADR-0004 D5; PERF-GAP B1)
 // ---------------------------------------------------------------------------
 
+/// The write cursor's **semantic** position, used only when no parked stack
+/// exists (fresh cursor, or right after a mutation): the next advance
+/// re-derives the physical position from it with one seek.
 #[derive(Debug, Clone)]
 enum CurPos {
+    /// Never positioned: `next` behaves as `first`, `prev` as `last`.
     Start,
+    /// On the entry with this key (set by a mutation): `next` = strictly
+    /// greater, `prev` = strictly lower.
     At(Vec<u8>),
+    /// This key was just deleted: `next` = first `>=` it (the entry that
+    /// followed the deleted one, SPEC 03 §7), `prev` = first `<` it.
     AfterDelete(Vec<u8>),
-    End,
 }
 
-/// A write cursor: forward iteration with `put_current`/`del_current` at the
+/// One physical step for [`RwCursor::drive`].
+enum Step<'k> {
+    Next,
+    Prev,
+    First,
+    Last,
+    Ge(&'k [u8]),
+    Gt(&'k [u8]),
+    Le(&'k [u8]),
+    Lt(&'k [u8]),
+}
+
+/// A write cursor: iteration with `put_current`/`del_current`/`put` at the
 /// current entry (SPEC 03 §7). It holds the `&mut RwTxn` exclusively, so **at
 /// most one cursor exists across any mutation** — cursor fix-up therefore
-/// reduces to this cursor's own position (ADR-0004 D5), which is tracked by
-/// key: after a structural change the cursor re-seeks its key, so splits and
-/// merges cannot leave it dangling. Entries are yielded as owned pairs in
-/// M1.4 (the heed adapter revisits zero-copy yields at M1.13).
+/// reduces to this cursor's own position (ADR-0004 D5).
+///
+/// **PERF-GAP B1 (2026-07-21):** between mutations the cursor persists its
+/// root-to-leaf path as a parked [`SavedCursor`], so an advance is an O(1)
+/// amortized stack step (LMDB's `mc_pg[]`/`mc_ki[]` walk), not a fresh
+/// O(log n) descent; entries are yielded as **borrows** of the txn's frames
+/// (lending style — the borrow dies at the next call, which is what makes the
+/// in-place mutations safe at compile time). A mutation drops the parked path
+/// and records the key (`CurPos`); the next advance re-seeks once — LMDB
+/// avoids that seek with in-place fix-up, a difference that costs one descent
+/// per mutation and is recorded in `docs/PERF-GAP-VS-LMDB.md` (B1 residual).
+/// The exclusivity argument is what makes `SavedCursor::resume`'s
+/// same-tree-state contract hold: no mutation can happen while a parked stack
+/// exists, because every mutating method of this cursor clears it.
 pub struct RwCursor<'t, 'env> {
     txn: &'t mut RwTxn<'env>,
     /// Which database this cursor iterates/mutates (M1.6).
     sel: DbSel,
+    /// Semantic fallback position (authoritative only when `saved` is `None`).
     pos: CurPos,
+    /// Parked physical path (authoritative when `Some`); cleared by mutations.
+    saved: Option<SavedCursor>,
 }
 
 impl RwCursor<'_, '_> {
+    /// Run one physical step: resume the parked path (or re-derive the
+    /// position from [`CurPos`] with one seek), park the new path, and
+    /// re-materialize the yielded entry as borrows of the txn's frames.
+    fn drive(&mut self, op: Step<'_>) -> Result<Option<(&[u8], &[u8])>> {
+        // Phase 1 — position under a scoped shared borrow of the txn; keep
+        // only plain data (the parked stack and the hit's (pgno, ki)).
+        let hit: Option<(u64, usize)> = {
+            let tree = Database::from_sel(self.sel).tree(&*self.txn);
+            let (mut c, resumed) = match self.saved.take() {
+                Some(s) => (BCursor::resume(tree, s), true),
+                None => (tree.cursor(), false),
+            };
+            let r = match op {
+                Step::Next => {
+                    if resumed {
+                        c.next()
+                    } else {
+                        match &self.pos {
+                            // A fresh cursor's `next` is `first` (SPEC 03 §4),
+                            // which `BCursor::next` already implements.
+                            CurPos::Start => c.next(),
+                            CurPos::At(k) => c.get_greater_than(k),
+                            CurPos::AfterDelete(k) => c.set_range(k),
+                        }
+                    }
+                }
+                Step::Prev => {
+                    if resumed {
+                        c.prev()
+                    } else {
+                        match &self.pos {
+                            // A fresh cursor's `prev` is `last` (SPEC 03 §4).
+                            CurPos::Start => c.prev(),
+                            CurPos::At(k) => c.get_lower_than(k),
+                            // The deleted key's successor is "current", so
+                            // `prev` is the entry strictly before the deleted
+                            // key (LMDB cursor-delete semantics).
+                            CurPos::AfterDelete(k) => c.get_lower_than(k),
+                        }
+                    }
+                }
+                Step::First => c.first(),
+                Step::Last => c.last(),
+                Step::Ge(k) => c.get_greater_than_or_equal_to(k),
+                Step::Gt(k) => c.get_greater_than(k),
+                Step::Le(k) => c.get_lower_than_or_equal_to(k),
+                Step::Lt(k) => c.get_lower_than(k),
+            };
+            let hit = match r.map_err(map_page_err)? {
+                Some(_) => c.entry_pos(),
+                None => None,
+            };
+            self.saved = Some(c.park());
+            hit
+        };
+        // Phase 2 — re-materialize the entry from plain data under a fresh
+        // shared borrow (leaf view comes from the txn's validated-pages memo,
+        // so this is a hash hit + O(1) header check, not a re-validation).
+        match hit {
+            None => Ok(None),
+            Some((pgno, ki)) => {
+                let tree = Database::from_sel(self.sel).tree(&*self.txn);
+                let (k, v) = tree.entry_at(pgno, ki).map_err(map_page_err)?;
+                Ok(Some((k, v)))
+            }
+        }
+    }
+
+    /// The current entry's key as owned bytes (for a mutation about to
+    /// invalidate the borrows), or `None` if the cursor is not on an entry.
+    fn current_key(&self) -> Result<Option<Vec<u8>>> {
+        match &self.saved {
+            Some(s) => match s.entry_pos() {
+                Some((pgno, ki)) => {
+                    let tree = Database::from_sel(self.sel).tree(&*self.txn);
+                    let (k, _) = tree.entry_at(pgno, ki).map_err(map_page_err)?;
+                    Ok(Some(k.to_vec()))
+                }
+                None => Ok(None),
+            },
+            None => match &self.pos {
+                CurPos::At(k) => Ok(Some(k.clone())),
+                _ => Ok(None),
+            },
+        }
+    }
+
     /// Advance to the next entry (ascending; SPEC 03 §4 `next` semantics over
     /// the writer's view). After a `del_current`, yields the entry that
-    /// followed the deleted one (§7).
+    /// followed the deleted one (§7). The yielded borrows die at the next
+    /// call on this cursor.
     ///
     /// # Errors
     ///
     /// [`MdbError::Invalid`] on a corrupt tree.
-    pub fn move_next(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
-        let entry: Option<(Vec<u8>, Vec<u8>)> = {
-            let tree = Database::from_sel(self.sel).tree(&*self.txn);
-            let mut c = tree.cursor();
-            let r = match &self.pos {
-                CurPos::Start => c.first(),
-                CurPos::At(k) => c.get_greater_than(k),
-                CurPos::AfterDelete(k) => c.set_range(k),
-                CurPos::End => return Ok(None),
-            };
-            r.map_err(map_page_err)?
-                .map(|(k, v)| (k.to_vec(), v.to_vec()))
-        };
-        match entry {
-            Some((k, v)) => {
-                self.pos = CurPos::At(k.clone());
-                Ok(Some((k, v)))
-            }
-            None => {
-                self.pos = CurPos::End;
-                Ok(None)
-            }
-        }
+    pub fn move_next(&mut self) -> Result<Option<(&[u8], &[u8])>> {
+        self.drive(Step::Next)
+    }
+
+    /// Step back to the previous entry (descending; SPEC 03 §4 `prev`
+    /// semantics over the writer's view). From a fresh cursor behaves as
+    /// `last`; after a `del_current`, yields the entry that preceded the
+    /// deleted one.
+    ///
+    /// # Errors
+    ///
+    /// As [`RwCursor::move_next`].
+    pub fn move_prev(&mut self) -> Result<Option<(&[u8], &[u8])>> {
+        self.drive(Step::Prev)
+    }
+
+    /// Position on the first entry (SPEC 03 §4 `first`).
+    ///
+    /// # Errors
+    ///
+    /// As [`RwCursor::move_next`].
+    pub fn seek_first(&mut self) -> Result<Option<(&[u8], &[u8])>> {
+        self.drive(Step::First)
+    }
+
+    /// Position on the last entry (SPEC 03 §4 `last`).
+    ///
+    /// # Errors
+    ///
+    /// As [`RwCursor::move_next`].
+    pub fn seek_last(&mut self) -> Result<Option<(&[u8], &[u8])>> {
+        self.drive(Step::Last)
+    }
+
+    /// Position on the first entry `>= key` (SPEC 03 §4 `set_range`).
+    ///
+    /// # Errors
+    ///
+    /// As [`RwCursor::move_next`].
+    pub fn seek_ge(&mut self, key: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
+        self.drive(Step::Ge(key))
+    }
+
+    /// Position on the first entry `> key`.
+    ///
+    /// # Errors
+    ///
+    /// As [`RwCursor::move_next`].
+    pub fn seek_gt(&mut self, key: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
+        self.drive(Step::Gt(key))
+    }
+
+    /// Position on the last entry `<= key`.
+    ///
+    /// # Errors
+    ///
+    /// As [`RwCursor::move_next`].
+    pub fn seek_le(&mut self, key: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
+        self.drive(Step::Le(key))
+    }
+
+    /// Position on the last entry `< key`.
+    ///
+    /// # Errors
+    ///
+    /// As [`RwCursor::move_next`].
+    pub fn seek_lt(&mut self, key: &[u8]) -> Result<Option<(&[u8], &[u8])>> {
+        self.drive(Step::Lt(key))
     }
 
     /// Rewrite the value of the current entry, keeping the key (`MDB_CURRENT`,
     /// SPEC 03 §7): same-size rewrites happen in place; a different size
     /// deletes and re-inserts (which may split). Returns `false` if the cursor
-    /// is not positioned on an entry.
+    /// is not positioned on an entry. Drops the parked path (the next advance
+    /// re-seeks once).
     ///
     /// # Errors
     ///
     /// As [`Database::put`].
     pub fn put_current(&mut self, value: &[u8]) -> Result<bool> {
-        match &self.pos {
-            CurPos::At(k) => {
-                let k = k.clone();
-                let tree = self.txn.ensure_open(self.sel)?;
-                self.txn
-                    .put_tree(tree, &k, PutFlags::EMPTY, ValSrc::Val(value))
-                    .map(|_| ())?;
-                Ok(true)
-            }
-            _ => Ok(false),
-        }
+        let Some(key) = self.current_key()? else {
+            return Ok(false);
+        };
+        let tree = self.txn.ensure_open(self.sel)?;
+        self.txn
+            .put_tree(tree, &key, PutFlags::EMPTY, ValSrc::Val(value))
+            .map(|_| ())?;
+        self.saved = None;
+        self.pos = CurPos::At(key);
+        Ok(true)
+    }
+
+    /// General put through the cursor — exactly [`Database::put_with_flags`]
+    /// (same flag semantics, SPEC 01 §S1/§S2), leaving the cursor positioned
+    /// on `key` (the heed `RwIter::put_current(key, ..)` primitive, which may
+    /// write a key other than the one under the cursor).
+    ///
+    /// # Errors
+    ///
+    /// As [`Database::put_with_flags`].
+    pub fn put(&mut self, flags: PutFlags, key: &[u8], value: &[u8]) -> Result<()> {
+        let tree = self.txn.ensure_open(self.sel)?;
+        self.txn
+            .put_tree(tree, key, flags, ValSrc::Val(value))
+            .map(|_| ())?;
+        self.saved = None;
+        self.pos = CurPos::At(key.to_vec());
+        Ok(())
     }
 
     /// Delete the current entry (SPEC 03 §7). The cursor is left so that a
@@ -2992,16 +3178,14 @@ impl RwCursor<'_, '_> {
     ///
     /// As [`Database::delete`].
     pub fn del_current(&mut self) -> Result<bool> {
-        match &self.pos {
-            CurPos::At(k) => {
-                let k = k.clone();
-                let tree = self.txn.ensure_open(self.sel)?;
-                let existed = self.txn.delete_tree(tree, &k)?;
-                self.pos = CurPos::AfterDelete(k);
-                Ok(existed)
-            }
-            _ => Ok(false),
-        }
+        let Some(key) = self.current_key()? else {
+            return Ok(false);
+        };
+        let tree = self.txn.ensure_open(self.sel)?;
+        let existed = self.txn.delete_tree(tree, &key)?;
+        self.saved = None;
+        self.pos = CurPos::AfterDelete(key);
+        Ok(existed)
     }
 }
 
@@ -3140,6 +3324,197 @@ mod tests {
         }
         let addr_after = db.get(&txn, b"a0000").unwrap().unwrap().as_ptr() as usize;
         assert_eq!(addr_before, addr_after, "frame moved under the index");
+    }
+
+    /// PERF-GAP B1 referee: the stack-carrying write cursor against a
+    /// `BTreeMap` model. Deterministic pseudo-random walks (forward and
+    /// reverse, each opened by a random seek — the consumer envelope: no
+    /// mid-walk direction reversal) with mutations interleaved at yielded
+    /// entries: `put_current` (resized values, so in-place *and*
+    /// delete+reinsert *and* splits happen mid-walk), `del_current`, and
+    /// repositioning `put`. Every mutation drops the parked stack, so the
+    /// walk continuously alternates the resume fast path with the CurPos
+    /// re-seek fallback — the equivalence this test pins. Model semantics per
+    /// SPEC 03 §4/§7: from `At(k)` next is strictly greater / prev strictly
+    /// lower; from `AfterDelete(k)` next is `>= k` / prev strictly lower.
+    #[test]
+    fn rw_cursor_walks_match_btreemap_model_under_mutation() {
+        use std::collections::BTreeMap;
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+
+        #[derive(Clone)]
+        enum MPos {
+            Start,
+            At(Vec<u8>),
+            AfterDel(Vec<u8>),
+        }
+
+        fn m_next(m: &BTreeMap<Vec<u8>, Vec<u8>>, p: &MPos) -> Option<(Vec<u8>, Vec<u8>)> {
+            let r = match p {
+                MPos::Start => m.iter().next(),
+                MPos::At(k) => m.range((Excluded(k.clone()), Unbounded)).next(),
+                MPos::AfterDel(k) => m.range((Included(k.clone()), Unbounded)).next(),
+            };
+            r.map(|(k, v)| (k.clone(), v.clone()))
+        }
+        fn m_prev(m: &BTreeMap<Vec<u8>, Vec<u8>>, p: &MPos) -> Option<(Vec<u8>, Vec<u8>)> {
+            let r = match p {
+                MPos::Start => m.iter().next_back(),
+                MPos::At(k) | MPos::AfterDel(k) => {
+                    m.range((Unbounded, Excluded(k.clone()))).next_back()
+                }
+            };
+            r.map(|(k, v)| (k.clone(), v.clone()))
+        }
+
+        let env = mem_env(PS, 8 << 20);
+        let db = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+        // Deterministic xorshift64*.
+        let mut state: u64 = 0x243F_6A88_85A3_08D3;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let key_of = |n: u64| format!("k{:05}", n % 3000).into_bytes();
+        let val_of = |n: u64| vec![b'a' + (n % 23) as u8; 4 + (n % 400) as usize];
+
+        // Seed store + model identically.
+        for _ in 0..500 {
+            let (k, v) = (key_of(rnd()), val_of(rnd()));
+            db.put(&mut txn, &k, &v).unwrap();
+            model.insert(k, v);
+        }
+
+        // 40 walks of up to 60 steps each, mutating ~1 step in 3.
+        for _ in 0..40 {
+            let fwd = rnd() % 2 == 0;
+            let mut cur = db.rw_cursor(&mut txn);
+            let mut pos = MPos::Start;
+
+            // Open with a random seek (or plain first step from Start).
+            let sk = key_of(rnd());
+            let (got, want): (Option<(Vec<u8>, Vec<u8>)>, _) = match rnd() % 4 {
+                0 => (
+                    cur.seek_ge(&sk)
+                        .unwrap()
+                        .map(|(k, v)| (k.to_vec(), v.to_vec())),
+                    model
+                        .range((Included(sk.clone()), Unbounded))
+                        .next()
+                        .map(|(k, v)| (k.clone(), v.clone())),
+                ),
+                1 => (
+                    cur.seek_gt(&sk)
+                        .unwrap()
+                        .map(|(k, v)| (k.to_vec(), v.to_vec())),
+                    model
+                        .range((Excluded(sk.clone()), Unbounded))
+                        .next()
+                        .map(|(k, v)| (k.clone(), v.clone())),
+                ),
+                2 => (
+                    cur.seek_le(&sk)
+                        .unwrap()
+                        .map(|(k, v)| (k.to_vec(), v.to_vec())),
+                    model
+                        .range((Unbounded, Included(sk.clone())))
+                        .next_back()
+                        .map(|(k, v)| (k.clone(), v.clone())),
+                ),
+                _ => (
+                    cur.seek_lt(&sk)
+                        .unwrap()
+                        .map(|(k, v)| (k.to_vec(), v.to_vec())),
+                    model
+                        .range((Unbounded, Excluded(sk.clone())))
+                        .next_back()
+                        .map(|(k, v)| (k.clone(), v.clone())),
+                ),
+            };
+            assert_eq!(got, want, "seek divergence");
+            let mut on_entry = match got {
+                Some((k, _)) => {
+                    pos = MPos::At(k);
+                    true
+                }
+                None => false,
+            };
+
+            for _ in 0..60 {
+                // Maybe mutate at the current entry.
+                if on_entry {
+                    match rnd() % 6 {
+                        0 => {
+                            // put_current with a resized value.
+                            let nv = val_of(rnd());
+                            assert!(cur.put_current(&nv).unwrap());
+                            if let MPos::At(k) = &pos {
+                                model.insert(k.clone(), nv);
+                            } else {
+                                unreachable!("on_entry implies At");
+                            }
+                        }
+                        1 => {
+                            assert!(cur.del_current().unwrap());
+                            let k = match &pos {
+                                MPos::At(k) => k.clone(),
+                                _ => unreachable!("on_entry implies At"),
+                            };
+                            model.remove(&k);
+                            pos = MPos::AfterDel(k);
+                            // (No `on_entry = false` needed: the step below is
+                            // unconditional and re-derives it.)
+                        }
+                        2 => {
+                            // Repositioning put at an arbitrary key.
+                            let (k, v) = (key_of(rnd()), val_of(rnd()));
+                            cur.put(PutFlags::EMPTY, &k, &v).unwrap();
+                            model.insert(k.clone(), v);
+                            pos = MPos::At(k);
+                        }
+                        _ => {}
+                    }
+                }
+                // Step.
+                let got = if fwd {
+                    cur.move_next()
+                        .unwrap()
+                        .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                } else {
+                    cur.move_prev()
+                        .unwrap()
+                        .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                };
+                let want = if fwd {
+                    m_next(&model, &pos)
+                } else {
+                    m_prev(&model, &pos)
+                };
+                assert_eq!(got, want, "step divergence (fwd={fwd})");
+                match got {
+                    Some((k, _)) => {
+                        pos = MPos::At(k);
+                        on_entry = true;
+                    }
+                    None => break, // walk over; next walk re-seeks
+                }
+            }
+        }
+
+        // Final ground truth: the store must equal the model exactly.
+        let mut cur = db.rw_cursor(&mut txn);
+        let mut store: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        while let Some((k, v)) = cur.move_next().unwrap() {
+            store.push((k.to_vec(), v.to_vec()));
+        }
+        let want: Vec<(Vec<u8>, Vec<u8>)> =
+            model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(store, want, "final store/model divergence");
     }
 
     #[test]

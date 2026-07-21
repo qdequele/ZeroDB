@@ -603,16 +603,33 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         F: FnOnce(&mut ReservedSpace) -> std::io::Result<()>,
     {
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
-        let mut buf = vec![0u8; data_size];
-        {
-            let mut space = ReservedSpace::new(&mut buf);
-            write_func(&mut space).map_err(|e| Error::Encoding(Box::new(e)))?;
-        }
+        // PERF-GAP B6 (2026-07-21): hand the caller the engine's in-frame slot
+        // directly (the `MDB_RESERVE` shape) instead of a zeroed heap buffer
+        // copied in afterwards — one alloc + one full copy per reserved put
+        // gone. Two deliberate semantics, both fork-pinned by the oracle's
+        // `put_reserved_failing_closure_leaves_entry_parity`:
+        //  - the engine reserves the slot BEFORE the closure runs, so a
+        //    closure error leaves the entry in place (LMDB cannot un-put a
+        //    reserve either) while the error still propagates as `Io` (the
+        //    fork's variant; pre-B6 this adapter returned `Encoding` and no
+        //    entry — a real divergence);
+        //  - the slot may carry stale frame bytes (a COWed page's old cell
+        //    heap), so the unwritten tail is zeroed either way, preserving
+        //    the shipped zero-tail contract of the old heap buffer.
+        let mut werr: Option<std::io::Error> = None;
         self.inner
             .put_reserved(txn.zdb_mut(), &kb, data_size, |slot| {
-                slot.copy_from_slice(&buf)
+                let mut space = ReservedSpace::new(slot);
+                if let Err(e) = write_func(&mut space) {
+                    werr = Some(e);
+                }
+                space.zero_unwritten_tail();
             })
-            .map_err(Into::into)
+            .map_err(Into::<Error>::into)?;
+        match werr {
+            Some(e) => Err(Error::Io(e)),
+            None => Ok(()),
+        }
     }
 
     /// `delete(txn, key)` (SPEC 00 row 36): whether the key existed.

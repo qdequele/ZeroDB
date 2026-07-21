@@ -100,19 +100,27 @@ pointer. Monomorphize the search over the comparator. Effort: low.
 
 ## B. Write path (time, per operation)
 
-### B1. `RwCursor`: full re-seek + 3 heap copies per step — **new; milli's hot API**
-`RwCursor` tracks position **by key** (`rwtxn.rs:2766-2774`): each `next()`
-runs a fresh descent (`set_range(k)`), yields the pair as **owned**
-`(k.to_vec(), v.to_vec())`, then clones the key a third time into
-`CurPos::At(k.clone())` (`rwtxn.rs` next/put_current/del_current). So milli's
-`iter_mut`/`put_current`/`del_current` loops — sharding, vector db, facet
-level 0, all of `write_from_bbqueue`'s delete path — pay a tree descent plus
-three allocations and a full value copy *per entry*. LMDB: pointer bump in
-`mc_pg[top]`, zero copies.
-**Fix shape:** page-position tracking with explicit invalidation on structural
-change (the M1.4 comment even anticipates the heed adapter "revisits zero-copy
-yields at M1.13" — it never did). No unsafe. Effort: medium (must keep the
-re-seek fallback for splits/merges).
+### B1. `RwCursor`: full re-seek + 3 heap copies per step — **DONE 2026-07-21**
+Was: `RwCursor` tracked position **by key**: each `next()` ran a fresh descent
+(`set_range(k)`), yielded the pair as **owned** `(k.to_vec(), v.to_vec())`,
+then cloned the key a third time into `CurPos::At(k.clone())` — and the
+adapter's `RwGuts` didn't even use it: every `iter_mut` step was its own
+`db.get_greater_than(txn, last)` descent plus a `last = k.to_vec()`.
+**Done:** the engine `RwCursor` parks/resumes the read cursor's root-to-leaf
+stack (`btree.rs` `SavedCursor`; the stack `Vec`'s allocation is moved in/out,
+not reallocated) — an advance is an amortized O(1) stack step (LMDB's
+`mc_pg[]`/`mc_ki[]`), yields are lending borrows of the txn's frames (safe at
+the engine level; two-phase position-then-materialize through the txn's
+validated-pages memo), and the adapter's `RwGuts` now owns one engine cursor
+(seeks for all six bound forms + `move_next`/`move_prev`), erasing lifetimes
+once at construction (the sanctioned M1.13 clause). Per-step allocations:
+zero. **Residual (deliberate):** a mutation (`put_current`/`del_current`/
+`put`) drops the parked stack and records the key; the next advance re-seeks
+once — LMDB's in-place cursor fix-up avoids that descent. Costs one descent
+per *mutation* (was: one per *step* + one per mutation). Revisit only if a
+consumer bench still shows it (put_tree path adoption is the escalation).
+`put_reserved`'s inline re-locate second descent has the same shape (noted
+below).
 
 ### B2. Per-insert owned-cell alloc; splits materialize the whole page
 Every put builds an `OwnedLeafCell` (heap `Vec`s for key/value) for the new
@@ -152,14 +160,24 @@ skips the write entirely (mdb_page_flush early-out). Already flagged in
 PROGRESS as "true zero-copy live-map mutation deferred to Phase 3". Effort:
 high (abort semantics + borrow contract redesign). Do last, if at all.
 
-### B6. Adapter `ReservedSpace` = alloc + zero + copy — **new; milli's put path**
-heed's `MDB_RESERVE` hands the caller a pointer *into the page*; the adapter
-hands a **zero-initialized heap buffer** (`reserved_space.rs:1-17`) that the
-caller fills and the engine then copies into the dirty frame. Every
-`put_reserved` (milli serializes documents and roaring bitmaps this way) pays
-alloc + memset + extra memcpy. Fix: reserve directly in the dirty frame (the
-frame is heap memory the engine owns — no unsafe needed for a first version
-that returns `&mut [u8]` into the frame). Effort: medium (API threading).
+### B6. Adapter `ReservedSpace` = alloc + zero + copy — **DONE 2026-07-21**
+Was: heed's `MDB_RESERVE` hands the caller a pointer *into the page*; the
+adapter handed a **zero-initialized heap buffer** the caller filled and the
+engine then copied into the dirty frame — alloc + memset + extra memcpy per
+`put_reserved` (milli serializes documents and roaring bitmaps this way).
+**Done:** `Database::put_reserved` builds the `ReservedSpace` over the
+engine's in-frame slot inside the native fill closure — no buffer, no copy;
+only the *unwritten tail* is zeroed (usually 0 bytes — milli fills fully),
+preserving the shipped zero-tail contract. Fork-pinned semantics change that
+came with it: a failing closure now leaves the entry in place and errors as
+`Io` (LMDB cannot un-put a reserve; the pre-B6 adapter wrote nothing and
+returned `Encoding` — a real divergence, pinned by the oracle's
+`put_reserved_failing_closure_leaves_entry_parity`). **Residuals:** the
+engine's inline-reserve path still re-locates the settled cell with a second
+descent (`rwtxn.rs` `put_reserved` → `search_path`) — same shape as the B1
+mutation residual; and the *cursor* reserved put
+(`put_current_reserved_with_flags`) still goes through a heap buffer (rare
+path; wire it to the slot fill if a consumer profile ever shows it).
 
 ### B7. Freelist bookkeeping allocation churn
 `drains: BTreeMap<u64, Vec<u64>>` + `reclaimed: HashSet` + PIL decode `Vec`

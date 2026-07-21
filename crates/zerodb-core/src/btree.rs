@@ -356,6 +356,37 @@ impl<'a> Tree<'a> {
     pub fn cursor(&self) -> Cursor<'a> {
         Cursor::new(*self)
     }
+
+    /// The entry at a known `(leaf pgno, cell index)` position (PERF-GAP B1):
+    /// used by the write cursor to re-materialize the borrows of a position it
+    /// computed while holding a *different* borrow of the txn. Goes through the
+    /// txn's validated-pages memo, so no re-validation on the hot path.
+    ///
+    /// The caller vouches that `(pgno, ki)` is a live leaf position in **this**
+    /// tree state (the write cursor only replays positions it just derived,
+    /// with no mutation in between — it holds the `&mut RwTxn` exclusively).
+    ///
+    /// # Errors
+    ///
+    /// A [`PageError`] if the page is not a valid leaf or `ki` is out of range.
+    pub(crate) fn entry_at(&self, pgno: u64, ki: usize) -> Result<(&'a [u8], &'a [u8]), PageError> {
+        let leaf = leaf_view(self.src, self.psize, pgno, self.valid)?;
+        let n = leaf.num_keys();
+        if ki >= n {
+            // Unreachable under the caller contract; surfaced as an
+            // out-of-bounds cell rather than a panic so a logic error degrades
+            // to `Invalid`, not UB-adjacent behavior.
+            debug_assert!(false, "entry_at({pgno}, {ki}) past num_keys={n}");
+            return Err(PageError::CellOutOfBounds {
+                offset: ki,
+                needed: 1,
+                body_size: n,
+            });
+        }
+        let k = leaf.key(ki);
+        let v = resolve_value(self.src, self.psize, &leaf, ki)?;
+        Ok((k, v))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -781,6 +812,79 @@ impl<'a> Cursor<'a> {
             return Ok(None);
         }
         Ok(Some(leaf.node_flags(ki)))
+    }
+
+    // -- park / resume (PERF-GAP B1: the write cursor's stack persistence) --
+
+    /// Detach this cursor's position as plain data (no borrows), so a write
+    /// cursor can persist it across `&mut RwTxn` calls and [`resume`]
+    /// (Self::resume) later without a re-descent. The `Vec`'s allocation
+    /// travels with the `SavedCursor`, so a park/resume round-trip allocates
+    /// nothing once the stack has reached tree depth.
+    pub(crate) fn park(self) -> SavedCursor {
+        SavedCursor {
+            stack: self.stack,
+            initialized: self.initialized,
+            eof: self.eof,
+        }
+    }
+
+    /// Rebuild a cursor over `t` from a parked position.
+    ///
+    /// Caller contract (PERF-GAP B1): `saved` must have been parked from a
+    /// cursor over the **same tree state** — same root, same pages, no
+    /// mutation in between. The write cursor guarantees this by holding the
+    /// `&mut RwTxn` exclusively and dropping its parked state on every
+    /// mutation.
+    pub(crate) fn resume(t: Tree<'a>, saved: SavedCursor) -> Cursor<'a> {
+        Cursor {
+            src: t.src,
+            psize: t.psize,
+            root: t.root,
+            depth: t.depth,
+            stack: saved.stack,
+            initialized: saved.initialized,
+            eof: saved.eof,
+            cmp: t.cmp,
+            leaf_cache: Cell::new(None),
+            valid: t.valid,
+        }
+    }
+
+    /// The `(leaf pgno, cell index)` under the cursor, for callers that just
+    /// received `Some(..)` from a positioning op and need the position as
+    /// plain data (PERF-GAP B1 two-phase yield). `None` when unpositioned/EOF
+    /// (mirrors [`get_current`](Self::get_current)'s `None` conditions except
+    /// the past-leaf-end park, which positioning ops never yield `Some` from).
+    pub(crate) fn entry_pos(&self) -> Option<(u64, usize)> {
+        if !self.initialized || self.eof {
+            return None;
+        }
+        self.stack.last().copied()
+    }
+}
+
+/// A [`Cursor`]'s position detached from its borrows (PERF-GAP B1): the
+/// root-to-leaf `(pgno, child/cell index)` stack plus the SPEC 03 §4
+/// `INITIALIZED`/`EOF` flags. Only meaningful for the exact tree state it was
+/// parked from (see [`Cursor::resume`]).
+#[derive(Debug)]
+pub(crate) struct SavedCursor {
+    stack: Vec<(u64, usize)>,
+    initialized: bool,
+    eof: bool,
+}
+
+impl SavedCursor {
+    /// The parked `(leaf pgno, cell index)` if the parked cursor sat on an
+    /// entry — same conditions as [`Cursor::entry_pos`], evaluated on the
+    /// detached state (used by the write cursor's mutations to read the
+    /// current key without resuming).
+    pub(crate) fn entry_pos(&self) -> Option<(u64, usize)> {
+        if !self.initialized || self.eof {
+            return None;
+        }
+        self.stack.last().copied()
     }
 }
 
