@@ -28,11 +28,12 @@
 
 use std::path::Path;
 
-use zerodb_core::builder::{build_multi_db_image, NamedDbData, DEFAULT_FILL_PERMILLE};
+use zerodb_core::builder::{EnvStream, PageSink, StreamBuildError, DEFAULT_FILL_PERMILLE};
 use zerodb_core::env::Env;
 use zerodb_core::error::{Error, MdbError, Result};
+use zerodb_core::page::FIRST_DATA_PGNO;
 use zerodb_core::page::{MetaPage, FORMAT_VERSION, F_SUBDATA, MAGIC};
-use zerodb_core::{collect_entries_flagged, named_databases, RoTxn};
+use zerodb_core::{for_each_entry_flagged, named_databases, RoTxn};
 
 /// Whether [`CopyToFile::copy_to_file`] compacts (`heed::CompactionOption`,
 /// SPEC 00 row 59). `Enabled` rewrites into a fresh, densely-packed env with no
@@ -93,26 +94,38 @@ pub trait CopyToFile {
     ///
     /// # Where the callback runs, and what a panic does
     ///
-    /// Every callback fires **while the copy is assembling the image in
-    /// memory, before a single byte reaches `path`** — the destination is
-    /// written by one `std::fs::write` after the last callback returns. That
-    /// is a deliberate ordering, not an accident of the implementation:
+    /// Every callback fires **before a single byte reaches `path`**. That is
+    /// a deliberate contract, not an accident of the implementation, and both
+    /// modes honor it by different means:
+    ///
+    /// - `Disabled` (raw): the image is assembled in memory and written to
+    ///   `path` by one `std::fs::write` after the last callback returns.
+    /// - `Enabled` (compacting, **streamed since PERF-GAP C1**): pages land
+    ///   incrementally in a sibling temp file (`<name>.copy-tmp-<pid>` in
+    ///   `path`'s directory, bounded memory — O(tree depth × page size));
+    ///   `path` itself is touched only by the final atomic `rename`, after
+    ///   the last callback. On any error — or a panicking callback — the
+    ///   temp file is removed by a drop guard.
+    ///
+    /// In both modes therefore:
     ///
     /// - A panicking callback unwinds out of this function normally (panics
-    ///   are not caught). Because no destination write has happened yet,
-    ///   **`path` is left untouched** — absent if it did not exist, and byte-
-    ///   for-byte its old contents if it did. There is no half-written copy to
-    ///   mistake for a good one.
+    ///   are not caught) and **`path` is left untouched** — absent if it did
+    ///   not exist, and byte-for-byte its old contents if it did. There is no
+    ///   half-written copy to mistake for a good one. (The compacting mode's
+    ///   rename makes this hold even for a process kill mid-copy, which the
+    ///   raw mode's single `write` cannot promise.)
     /// - The **source** environment is likewise untouched under any callback
     ///   behavior: a copy only ever reads it, under an internal read txn that
     ///   is released when this function returns (including while unwinding).
     ///   A panic leaks no reader slot.
     ///
     /// The cost of that guarantee is that progress tracks *source pages
-    /// processed*, not bytes landed on disk, and that the last stretch (the
-    /// single `write`) is not covered by any callback. Callers wanting a
-    /// progress bar that ends exactly when the file is durable should treat
-    /// `done == total` as "reading finished", not "file written".
+    /// processed*, not bytes landed at `path`, and that the final stretch
+    /// (the raw mode's single `write`; the compacting mode's rename) is not
+    /// covered by any callback. Callers wanting a progress bar that ends
+    /// exactly when the file is durable should treat `done == total` as
+    /// "reading finished", not "file written".
     ///
     /// # Errors
     ///
@@ -191,9 +204,6 @@ impl<'f> Progress<'f> {
         });
     }
 }
-
-/// A key/value pair collected from a database.
-type KvPair = (Vec<u8>, Vec<u8>);
 
 /// Map a page-encode failure to the public taxonomy (never fires for a valid
 /// snapshot).
@@ -325,51 +335,124 @@ fn copy_compact(
     }
     let mut progress = Progress::start(total, on_progress);
 
-    let main_user: Vec<(Vec<u8>, Vec<u8>)> = collect_entries_flagged(&main, txn)?
-        .into_iter()
-        .filter(|(_, flags, _)| flags & F_SUBDATA == 0)
-        .map(|(k, _, v)| (k, v))
-        .collect();
+    // PERF-GAP C1: stream the rebuild. Pages land incrementally in a sibling
+    // TEMP file; `dest` is touched only by the final atomic rename, after the
+    // last progress callback — so the documented panic contract ("`path` is
+    // left untouched") holds verbatim, now under a *stronger* mechanism: even
+    // a process kill mid-copy cannot leave a half-written `dest` (the old
+    // single `std::fs::write` could). Peak memory is O(tree depth × psize)
+    // instead of the whole entry set + whole image (~2× env size).
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| Error::Io(std::io::Error::other("copy destination has no file name")))?;
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(format!(".copy-tmp-{}", std::process::id()));
+    let tmp = dest.with_file_name(tmp_name);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    // Remove the temp on every non-rename exit (error or unwinding callback).
+    let mut guard = TmpGuard {
+        path: &tmp,
+        armed: true,
+    };
 
-    progress.advance_to(main_pages);
+    let sink = FileSink {
+        file,
+        psize,
+        next: FIRST_DATA_PGNO,
+    };
+    let mut es = EnvStream::new(sink, psize, snap.txnid, DEFAULT_FILL_PERMILLE).map_err(corrupt)?;
 
-    // Each named DB, in name order.
-    let names = names_probe;
-    let mut named_entries: Vec<(Vec<u8>, Vec<KvPair>)> = Vec::with_capacity(names.len());
-    let mut read = main_pages;
-    for name in names {
+    // Named DBs first (their roots feed the catalog), in name order — the
+    // stream's contract and `named_databases`'s order. Progress advances per
+    // source section read, monotone under the same fixed total as before
+    // (the section *order* moved: named DBs now precede the main tree, which
+    // the callback contract deliberately does not pin).
+    let mut read = 0u64;
+    for name in names_probe {
         let dbh = env
             .open_database(txn, Some(&name))?
             .ok_or(Error::Mdb(MdbError::Invalid))?;
         let st = dbh.stat(txn)?;
-        let entries: Vec<(Vec<u8>, Vec<u8>)> = collect_entries_flagged(&dbh, txn)?
-            .into_iter()
-            .map(|(k, _, v)| (k, v))
-            .collect();
-        named_entries.push((name, entries));
+        es.named_db(&name, |ts| {
+            for_each_entry_flagged(&dbh, txn, |k, _flags, v| ts.push(k, 0, v))
+        })
+        .map_err(stream_err)?;
         read += st.branch_pages + st.leaf_pages + st.overflow_pages;
         progress.advance_to(read);
     }
-    let named: Vec<NamedDbData<'_>> = named_entries
-        .iter()
-        .map(|(n, e)| NamedDbData {
-            name: n,
-            entries: e,
-        })
-        .collect();
 
-    let img = build_multi_db_image(
-        psize,
-        env.map_size(),
-        snap.txnid,
-        &main_user,
-        &named,
-        DEFAULT_FILL_PERMILLE,
-    )
-    .map_err(corrupt)?;
-    // Last callback before any destination I/O — see the panic contract on
+    // Main tree: user entries only (catalog records are regenerated by the
+    // stream from the named-DB roots just built).
+    let sink = es
+        .finish_main(env.map_size(), |ms| {
+            for_each_entry_flagged(&main, txn, |k, flags, v| {
+                if flags & F_SUBDATA == 0 {
+                    ms.push(k, v)
+                } else {
+                    Ok(())
+                }
+            })
+        })
+        .map_err(stream_err)?;
+    read += main_pages;
+    progress.advance_to(read);
+    drop(sink); // close the temp file before renaming it
+
+    // Last callback before `dest` is touched — see the panic contract on
     // `copy_to_file_with_progress`.
     progress.finish();
-    std::fs::write(dest, &img)?;
+    std::fs::rename(&tmp, dest)?;
+    guard.armed = false;
     Ok(())
+}
+
+/// Map a streaming-build failure to the public taxonomy.
+fn stream_err(e: StreamBuildError) -> Error {
+    match e {
+        StreamBuildError::Page(_) => Error::Mdb(MdbError::Invalid),
+        StreamBuildError::Io(io) => Error::Io(io),
+    }
+}
+
+/// A [`PageSink`] over the destination file: one positioned write per page
+/// (`pwrite`; writing past EOF extends). No userspace buffering, so there is
+/// nothing to flush before the rename; durability matches the previous
+/// implementation (no fsync — heed/LMDB `mdb_env_copy` parity).
+struct FileSink {
+    file: std::fs::File,
+    psize: u32,
+    next: u64,
+}
+
+impl PageSink for FileSink {
+    fn alloc(&mut self, n: u64) -> u64 {
+        let p = self.next;
+        self.next += n;
+        p
+    }
+    fn next_pgno(&self) -> u64 {
+        self.next
+    }
+    fn emit(&mut self, pgno: u64, frame: &[u8]) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file.write_all_at(frame, pgno * self.psize as u64)
+    }
+}
+
+/// Removes the temp file on drop unless disarmed (the rename succeeded).
+struct TmpGuard<'p> {
+    path: &'p Path,
+    armed: bool,
+}
+
+impl Drop for TmpGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(self.path);
+        }
+    }
 }

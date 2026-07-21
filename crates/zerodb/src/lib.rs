@@ -31,8 +31,8 @@ pub use zerodb_core::error::{Error, MdbError, Result};
 pub use zerodb_core::nested::NestedRoTxn;
 pub use zerodb_core::page::MAX_KEY_SIZE;
 pub use zerodb_core::rotxn::{
-    collect_entries_flagged, free_page_count, named_databases, Database, DatabaseStat, RoRange,
-    RoTxn, TxnRead,
+    collect_entries_flagged, for_each_entry_flagged, free_page_count, named_databases, Database,
+    DatabaseStat, RoRange, RoTxn, TxnRead,
 };
 pub use zerodb_core::rwtxn::{PutFlags, RwCursor, RwTxn};
 

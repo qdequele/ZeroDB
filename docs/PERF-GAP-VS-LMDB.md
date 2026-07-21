@@ -240,7 +240,25 @@ medium. Only matters under GC churn; measure before redesigning.
 
 ## C. RAM (peak memory)
 
-### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **new, quantified**
+### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**
+**Done:** push-driven streaming rebuild — `PageSink` trait in core (core keeps
+its no-I/O policy; the positioned-write `FileSink` lives in `zerodb::copy`),
+`TreeStream` (the batch packer's greedy fill + last-two rebalance, driven one
+entry at a time; one leaf scratch + one overflow scratch + ≤ 2 child lists
+per branch level = **O(depth × psize)** peak), `EnvStream`/`MainStream`
+(named DBs → catalog records merge-interleaved into the main push stream),
+and `copy_to_file(Enabled)` rewritten onto a borrowed cursor walk
+(`for_each_entry_flagged`) — no entry Vecs, no whole-image buffer. `path` is
+touched only by an atomic rename of a sibling temp file after the last
+progress callback, so the documented panic contract holds verbatim and even
+a mid-copy process kill cannot leave a half-written destination (the old
+single `fs::write` could). Referee: `stream_builder_matches_batch_builder`
+(identical logical content INCLUDING followed catalogs, identical page
+economy — same page counts per kind, same depth; layout order legitimately
+differs) + the existing copy differentials/round-trips/tools acceptance.
+**Residual:** `zerodb-tools load` and `migrate-from-lmdb` still use the batch
+builder (fine at tool scale; wire them to a `FileSink` if 100 GB reloads
+become a workflow). Original analysis kept below.
 `collect_entries_flagged` copies **every key and value in the DB into owned
 `Vec`s** (`rotxn.rs:416-424`), then `build_multi_db_image` materializes **the
 entire output env image in a second `Vec<u8>`** (`builder.rs`). Peak ≈ live

@@ -31,6 +31,7 @@ use std::ops::Bound;
 use std::sync::{Arc, Mutex};
 
 use crate::btree::{prefix_successor, Cursor, Source, Tree, ValidatedPages};
+use crate::builder::StreamBuildError;
 use crate::cmp::KeyCmp;
 use crate::env::{Env, Snapshot};
 use crate::error::{Error, MdbError, Result};
@@ -466,6 +467,36 @@ pub fn collect_entries_flagged<T: TxnRead>(db: &Database, txn: &T) -> Result<Vec
         e = c.next().map_err(map_page_err)?;
     }
     Ok(out)
+}
+
+/// Walk `db`'s entries in key order, handing each `(key, node_flags, value)`
+/// to `f` as **borrows** of the snapshot — the streaming-compaction feed
+/// (PERF-GAP C1; the owned sibling is [`collect_entries_flagged`]). Errors
+/// share [`StreamBuildError`] with the streaming builder so a
+/// [`crate::builder::TreeStream::push`] call inside `f` needs no conversion;
+/// walk-side page errors surface as `StreamBuildError::Page`.
+///
+/// # Errors
+///
+/// `StreamBuildError::Page` on a structurally-corrupt tree, or whatever `f`
+/// returns.
+pub fn for_each_entry_flagged<T: TxnRead>(
+    db: &Database,
+    txn: &T,
+    mut f: impl FnMut(&[u8], u16, &[u8]) -> std::result::Result<(), StreamBuildError>,
+) -> std::result::Result<(), StreamBuildError> {
+    let tree = db.tree(txn);
+    let mut c = tree.cursor();
+    let mut e = c.first().map_err(StreamBuildError::Page)?;
+    while let Some((k, v)) = e {
+        let flags = c
+            .current_flags()
+            .map_err(StreamBuildError::Page)?
+            .unwrap_or(0);
+        f(k, flags, v)?;
+        e = c.next().map_err(StreamBuildError::Page)?;
+    }
+    Ok(())
 }
 
 /// The names of every named database, in key (name) order (M1.12 tools/copy):

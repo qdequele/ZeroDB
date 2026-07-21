@@ -40,7 +40,10 @@ pub(crate) mod sync;
 
 pub use env::{CommitHook, HookPoint, Snapshot};
 pub use nested::NestedRoTxn;
-pub use rotxn::{collect_entries_flagged, named_databases, Database, RoRange, RoTxn, TxnRead};
+pub use rotxn::{
+    collect_entries_flagged, for_each_entry_flagged, named_databases, Database, RoRange, RoTxn,
+    TxnRead,
+};
 pub use rwtxn::{PutFlags, RwCursor, RwTxn};
 
 pub use error::{Error, MdbError, Result};
