@@ -1,15 +1,26 @@
 //! Alignment-safe little-endian field accessors.
 //!
 //! SPEC 02 §0 forbids `#[repr(C)]` casting of possibly-unaligned page data.
-//! Every multi-byte field is therefore read and written through these helpers,
-//! which copy the exact bytes into a stack array and use `from_le_bytes` /
-//! `to_le_bytes`. These are pure safe Rust — no `unsafe`, no alignment
-//! assumptions — and are equivalent to `read_unaligned`/`write_unaligned` for
-//! little-endian integers.
+//! Every multi-byte field is therefore read and written through these helpers
+//! in one of two tiers:
 //!
-//! All functions panic on out-of-bounds access; callers in this crate validate
-//! bounds against the page size before invoking them (the view constructors in
-//! `tree`/`overflow`/`meta` do this and surface a typed [`PageError`] instead).
+//! - **Checked** (`read_*`/`write_*`): pure safe Rust — copy the exact bytes
+//!   into a stack array and use `from_le_bytes`/`to_le_bytes`. Panic on
+//!   out-of-bounds. Used by validation, mutation, and every cold path.
+//! - **Unchecked** (`read_*_unchecked`, PERF-GAP A3): `unsafe fn`s using
+//!   explicit offsets + [`core::ptr::read_unaligned`] — exactly the pattern
+//!   the CLAUDE.md unsafe policy prescribes, in one of its sanctioned homes
+//!   (`zerodb-core::page`). Callers must guarantee `off + N <= buf.len()`;
+//!   the only callers are the `tree` view accessors, whose constructors prove
+//!   (full validation walk) or inherit (kind-tagged memo hit / engine-authored
+//!   dirty frame — the batch-3/A8 trust arguments) that every cell lies in
+//!   bounds. `debug_assert!`s keep the contract loud in test builds; the
+//!   differential fuzzer and miri referee it.
+//!
+//! Checked functions panic on out-of-bounds access; callers in this crate
+//! validate bounds against the page size before invoking them (the view
+//! constructors in `tree`/`overflow`/`meta` do this and surface a typed
+//! [`PageError`] instead).
 //!
 //! [`PageError`]: super::PageError
 
@@ -38,6 +49,43 @@ pub(crate) fn read_u64(buf: &[u8], off: usize) -> u64 {
         buf[off + 6],
         buf[off + 7],
     ])
+}
+
+/// Read a little-endian `u16` at byte offset `off` without a bounds check.
+///
+/// # Safety
+///
+/// `off + 2 <= buf.len()`. See the module docs for who may call this.
+#[inline]
+pub(crate) unsafe fn read_u16_unchecked(buf: &[u8], off: usize) -> u16 {
+    debug_assert!(off + 2 <= buf.len(), "read_u16_unchecked OOB");
+    // SAFETY: caller guarantees `off + 2 <= buf.len()`; `[u8; 2]` has
+    // alignment 1, `read_unaligned` documents the (non-)assumption anyway.
+    u16::from_le_bytes(unsafe { core::ptr::read_unaligned(buf.as_ptr().add(off).cast()) })
+}
+
+/// Read a little-endian `u32` at byte offset `off` without a bounds check.
+///
+/// # Safety
+///
+/// `off + 4 <= buf.len()`. See the module docs for who may call this.
+#[inline]
+pub(crate) unsafe fn read_u32_unchecked(buf: &[u8], off: usize) -> u32 {
+    debug_assert!(off + 4 <= buf.len(), "read_u32_unchecked OOB");
+    // SAFETY: caller guarantees `off + 4 <= buf.len()`.
+    u32::from_le_bytes(unsafe { core::ptr::read_unaligned(buf.as_ptr().add(off).cast()) })
+}
+
+/// Read a little-endian `u64` at byte offset `off` without a bounds check.
+///
+/// # Safety
+///
+/// `off + 8 <= buf.len()`. See the module docs for who may call this.
+#[inline]
+pub(crate) unsafe fn read_u64_unchecked(buf: &[u8], off: usize) -> u64 {
+    debug_assert!(off + 8 <= buf.len(), "read_u64_unchecked OOB");
+    // SAFETY: caller guarantees `off + 8 <= buf.len()`.
+    u64::from_le_bytes(unsafe { core::ptr::read_unaligned(buf.as_ptr().add(off).cast()) })
 }
 
 /// Write a little-endian `u16` at byte offset `off`.

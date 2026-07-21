@@ -26,6 +26,10 @@ pub mod geometry;
 mod header;
 pub mod meta;
 mod overflow;
+// The crate's single sanctioned `unsafe` home (CLAUDE.md unsafe policy:
+// "page casting" in `zerodb-core::page`; PERF-GAP A3): the unchecked
+// little-endian field readers used by the validated/trusted view accessors.
+#[allow(unsafe_code)]
 mod raw;
 mod tree;
 

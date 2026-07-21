@@ -16,7 +16,13 @@
 //!   and the published-snapshot cell (SPEC 04 §3/§4, ADR-0006), model-checked
 //!   under loom via the [`sync`] shim (`just loom`).
 
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`, since PERF-GAP A3 (2026-07-22): the CLAUDE.md unsafe
+// policy sanctions `zerodb-core::page` for page-casting unsafe, and the A3
+// unchecked field readers live in exactly one module there — `page::raw`,
+// which carries the only `#[allow(unsafe_code)]` in the crate (on its `mod`
+// declaration, with the safety contract in the module docs). Everything else
+// in this crate remains unsafe-free and the lint keeps it that way.
+#![deny(unsafe_code)]
 
 pub mod btree;
 pub mod builder;

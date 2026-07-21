@@ -70,12 +70,25 @@ checked (they slice unchecked at `page/tree.rs:205-227`, which is *why* the
 eager pass exists) and validate lazily per access — O(log K) instead of O(K)
 per page. No unsafe. Effort: (a) low, (b) medium.
 
-### A3. Byte-copy field reads instead of pointer reads — *unsafe (sanctioned)*
-`page/raw.rs:19-33`: every u16/u32/u64 field read = bounds-checked indexing
-into a stack array + `from_le_bytes`; every field of every node of every page.
-LMDB: direct struct access through `NODEPTR` (mdb.c:1159-1168), zero copies.
-**Fix shape:** `read_unaligned` at explicit offsets in `zerodb-core::page` —
-exactly what the policy prescribes. Must stay miri-clean. Effort: medium.
+### A3. Byte-copy field reads instead of pointer reads — **DONE 2026-07-22**
+Was: every u16/u32/u64 field read = bounds-checked indexing into a stack
+array + `from_le_bytes` (a u64 = 8 checked indexes + panic paths); every
+field of every node of every page. LMDB: direct struct access through
+`NODEPTR`, zero copies.
+**Done:** `read_*_unchecked` tier in `page/raw.rs` — explicit offsets +
+`ptr::read_unaligned`, exactly the pattern the unsafe policy prescribes, in
+its sanctioned home. Crate went `forbid(unsafe_code)` →
+`deny` + a single `#[allow]` scoped to `mod raw` (plus per-fn allows at the
+call sites); every block SAFETY-commented against one contract: view
+construction proves (full walk) or inherits (kind-tagged memo hit /
+engine-authored dirty frame — batch 3/A8) that all cells lie in bounds.
+Converted: `LeafRef`/`BranchRef` `cell_abs`/`node_flags`/`key`/`value`/
+`child_pgno` + `leaf_lookup` (the profile's hottest descent loop). Public
+accessors now **hard-assert** `i < num_keys` (one predictable branch —
+strictly stricter than before, where a bad index could silently read a
+garbage in-bounds offset) and do unchecked reads behind it; internal loops
+ride the binary-search invariant. `debug_assert!`s keep every contract loud
+in test/fuzz builds; miri referees the whole corpus.
 
 ### A4. `validate_page_size` re-run on every page load — free fix
 `PageRef::new` (`page/header.rs:101`) re-validates an env-immutable value on
@@ -164,7 +177,14 @@ cell of the page copied into a `Vec<OwnedLeafCell>`** (`rwtxn.rs:1424-1439`)
 the two mapped pages. Amortized: ~2 allocs + a page copy per K inserts on top
 of B1/B3. No unsafe. Effort: medium.
 
-### B3. Dirty store: HashMap + `Box` per page + commit-time sort + zeroing
+### B3. Dirty store: HashMap + `Box` per page + commit-time sort + zeroing — **PARKED 2026-07-22 (profile says no)**
+Verdict from the post-A8 milli write-phase call tree (the referee that found
+`from_valid`): at 1.19× end-to-end, the dirty-store probe does not clear a
+60-sample bar in an 8 s window where `search_path` holds ~1,760 — the arena
+redesign would chase <5 % while risking the TXN-41 frame-address-stability
+contract (the `Box` is load-bearing; B2's split path moreover now *takes
+ownership* of frames via `DirtyStore::remove`). Re-open only if a future
+profile (EBS commit path included) names it. Original analysis kept below.
 `DirtyStore { frames: HashMap<u64, Box<[u8]>> }` (`dirty.rs:31-33`): hash
 lookup on every page touch (every read *inside a write txn* goes through
 `Source::Writer` → `dirty.bytes(pgno)` first — `btree.rs:75`), a heap alloc

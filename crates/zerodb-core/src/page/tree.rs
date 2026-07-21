@@ -18,7 +18,10 @@ use crate::cmp::KeyCmp;
 
 use super::geometry::body_size;
 use super::header::{read_and_check_bounds, CommonHeader};
-use super::raw::{read_u16, read_u32, read_u64, write_u16, write_u32, write_u64};
+use super::raw::{
+    read_u16, read_u16_unchecked, read_u32, read_u32_unchecked, read_u64_unchecked, write_u16,
+    write_u32, write_u64,
+};
 use super::{
     page_type_of, PageError, PageType, F_BIGDATA, HEADER_SIZE, LEAF_FLAGS_PHASE1_MASK,
     MAX_DATA_SIZE, MAX_KEY_SIZE, P_BRANCH, P_LEAF,
@@ -221,39 +224,71 @@ impl<'a> LeafRef<'a> {
         self.upper as usize - self.lower as usize
     }
 
+    /// Absolute offset of cell `i`'s header (A3: unchecked pointer-array
+    /// read). Callers guarantee `i < num_keys` (public accessors `assert!`
+    /// it; the lookup loops maintain it as a binary-search invariant).
+    #[allow(unsafe_code)]
     fn cell_abs(&self, i: usize) -> usize {
-        HEADER_SIZE + ptr_at(self.buf, i) as usize
+        debug_assert!(i < self.num_keys());
+        // SAFETY: `i < num_keys = lower/2`, so the slot at
+        // `HEADER_SIZE + i*2` lies inside `[HEADER_SIZE, HEADER_SIZE+lower)`,
+        // and `lower <= upper <= body_size` held at view construction (or is
+        // inherited via the A8 trusted-view / engine-authorship contract).
+        HEADER_SIZE + unsafe { read_u16_unchecked(self.buf, HEADER_SIZE + i * 2) } as usize
     }
 
-    /// The node flags of entry `i`.
+    /// The node flags of entry `i`. Panics if `i >= num_keys`.
     #[must_use]
+    #[allow(unsafe_code)]
     pub fn node_flags(&self, i: usize) -> u16 {
-        read_u16(self.buf, self.cell_abs(i))
+        assert!(i < self.num_keys(), "leaf entry index out of range");
+        // SAFETY (A3 view contract): cell `i` was proven in-bounds by the
+        // full validation walk, or inherits that proof (kind-tagged memo hit
+        // / engine-authored dirty frame — batch 3/A8); its 8-byte header is
+        // inside `buf`.
+        unsafe { read_u16_unchecked(self.buf, self.cell_abs(i)) }
     }
 
-    /// The key bytes of entry `i`.
+    /// The key bytes of entry `i`. Panics if `i >= num_keys`.
     #[must_use]
+    #[allow(unsafe_code)]
     pub fn key(&self, i: usize) -> &'a [u8] {
+        assert!(i < self.num_keys(), "leaf entry index out of range");
         let abs = self.cell_abs(i);
-        let ksize = read_u16(self.buf, abs + 2) as usize;
-        &self.buf[abs + LEAF_NODE_HEADER..abs + LEAF_NODE_HEADER + ksize]
+        // SAFETY (A3 view contract, as `node_flags`): validation bounded the
+        // whole cell — header AND `header + ksize` key span — inside `buf`
+        // (`leaf_cell_len`), so the unchecked `ksize` read and key slice are
+        // in bounds.
+        unsafe {
+            let ksize = read_u16_unchecked(self.buf, abs + 2) as usize;
+            self.buf
+                .get_unchecked(abs + LEAF_NODE_HEADER..abs + LEAF_NODE_HEADER + ksize)
+        }
     }
 
-    /// The value of entry `i` (inline slice or overflow reference).
+    /// The value of entry `i` (inline slice or overflow reference). Panics if
+    /// `i >= num_keys`.
     #[must_use]
+    #[allow(unsafe_code)]
     pub fn value(&self, i: usize) -> LeafValue<'a> {
+        assert!(i < self.num_keys(), "leaf entry index out of range");
         let abs = self.cell_abs(i);
-        let flags = read_u16(self.buf, abs);
-        let ksize = read_u16(self.buf, abs + 2) as usize;
-        let dsize = read_u32(self.buf, abs + 4);
-        let val_off = abs + LEAF_NODE_HEADER + ksize;
-        if flags & F_BIGDATA != 0 {
-            LeafValue::Overflow {
-                head_pgno: read_u64(self.buf, val_off),
-                dsize,
+        // SAFETY (A3 view contract, as `key`): `leaf_cell_len` bounded the
+        // header, key span, and value area (`dsize` inline bytes, or the
+        // 8-byte overflow head under `F_BIGDATA`) inside `buf`.
+        unsafe {
+            let flags = read_u16_unchecked(self.buf, abs);
+            let ksize = read_u16_unchecked(self.buf, abs + 2) as usize;
+            let dsize = read_u32_unchecked(self.buf, abs + 4);
+            let val_off = abs + LEAF_NODE_HEADER + ksize;
+            if flags & F_BIGDATA != 0 {
+                LeafValue::Overflow {
+                    head_pgno: read_u64_unchecked(self.buf, val_off),
+                    dsize,
+                }
+            } else {
+                LeafValue::Inline(self.buf.get_unchecked(val_off..val_off + dsize as usize))
             }
-        } else {
-            LeafValue::Inline(&self.buf[val_off..val_off + dsize as usize])
         }
     }
 
@@ -601,22 +636,42 @@ impl<'a> BranchRef<'a> {
         self.upper as usize - self.lower as usize
     }
 
+    /// Absolute offset of cell `i`'s header (A3 — same contract as
+    /// [`LeafRef`]'s `cell_abs`: callers guarantee `i < num_keys`).
+    #[allow(unsafe_code)]
     fn cell_abs(&self, i: usize) -> usize {
-        HEADER_SIZE + ptr_at(self.buf, i) as usize
+        debug_assert!(i < self.num_keys());
+        // SAFETY: as `LeafRef::cell_abs` — slot inside `[HEADER_SIZE,
+        // HEADER_SIZE + lower)`, bounds checked at view construction or
+        // inherited via the trusted-view contract.
+        HEADER_SIZE + unsafe { read_u16_unchecked(self.buf, HEADER_SIZE + i * 2) } as usize
     }
 
-    /// The child page number of entry `i`.
+    /// The child page number of entry `i`. Panics if `i >= num_keys`.
     #[must_use]
+    #[allow(unsafe_code)]
     pub fn child_pgno(&self, i: usize) -> u64 {
-        read_u64(self.buf, self.cell_abs(i))
+        assert!(i < self.num_keys(), "branch entry index out of range");
+        // SAFETY (A3 view contract): cell `i` was proven in-bounds by the
+        // full validation walk, or inherits that proof (kind-tagged memo hit
+        // / engine-authored dirty frame); its 10-byte header is inside `buf`.
+        unsafe { read_u64_unchecked(self.buf, self.cell_abs(i)) }
     }
 
-    /// The separator key of entry `i` (empty slice for index 0).
+    /// The separator key of entry `i` (empty slice for index 0). Panics if
+    /// `i >= num_keys`.
     #[must_use]
+    #[allow(unsafe_code)]
     pub fn key(&self, i: usize) -> &'a [u8] {
+        assert!(i < self.num_keys(), "branch entry index out of range");
         let abs = self.cell_abs(i);
-        let ksize = read_u16(self.buf, abs + 8) as usize;
-        &self.buf[abs + BRANCH_NODE_HEADER..abs + BRANCH_NODE_HEADER + ksize]
+        // SAFETY (A3 view contract, as `child_pgno`): `branch_cell_len`
+        // bounded the header and `header + ksize` separator span in `buf`.
+        unsafe {
+            let ksize = read_u16_unchecked(self.buf, abs + 8) as usize;
+            self.buf
+                .get_unchecked(abs + BRANCH_NODE_HEADER..abs + BRANCH_NODE_HEADER + ksize)
+        }
     }
 
     /// The child index whose subtree covers `key` (SPEC 03 §2:
@@ -831,14 +886,31 @@ fn remove_cell(
 /// Binary-search a leaf's sorted pointer array for `key` under `cmp`
 /// (milestone 2.4: the ordering is the tree's, not necessarily memcmp —
 /// SPEC 03 §2.0).
-fn leaf_lookup(buf: &[u8], num_keys: usize, key: &[u8], cmp: KeyCmp<'_>) -> Result<usize, usize> {
+///
+/// A3 contract: `buf` is a validated/trusted leaf page's buffer and
+/// `num_keys` is **that page's** entry count — every caller derives both from
+/// a constructed view (`LeafRef::lookup{,_with}`, `btree`'s descent over
+/// `leaf_view`s), so `mid < num_keys` makes the unchecked reads in-bounds by
+/// the view contract.
+#[allow(unsafe_code)]
+pub(crate) fn leaf_lookup(
+    buf: &[u8],
+    num_keys: usize,
+    key: &[u8],
+    cmp: KeyCmp<'_>,
+) -> Result<usize, usize> {
     let mut lo = 0usize;
     let mut hi = num_keys;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        let abs = HEADER_SIZE + ptr_at(buf, mid) as usize;
-        let ksize = read_u16(buf, abs + 2) as usize;
-        let mid_key = &buf[abs + LEAF_NODE_HEADER..abs + LEAF_NODE_HEADER + ksize];
+        // SAFETY: `mid < num_keys` (binary-search invariant) and the A3 view
+        // contract above — pointer slot, cell header, and key span were all
+        // bounds-proven when the page validated (or are engine-authored).
+        let mid_key = unsafe {
+            let abs = HEADER_SIZE + read_u16_unchecked(buf, HEADER_SIZE + mid * 2) as usize;
+            let ksize = read_u16_unchecked(buf, abs + 2) as usize;
+            buf.get_unchecked(abs + LEAF_NODE_HEADER..abs + LEAF_NODE_HEADER + ksize)
+        };
         match cmp.compare(mid_key, key) {
             std::cmp::Ordering::Less => lo = mid + 1,
             std::cmp::Ordering::Greater => hi = mid,
