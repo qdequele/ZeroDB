@@ -39,5 +39,11 @@ crash-test-quick:
 crash-test-full:
     cargo run -p zerodb-oracle --bin crash-harness -- --cycles 10000
 
+# Dual-backend comparison: zerodb vs the LMDB fork (heed), both in one binary.
+# `bench` = full criterion run; `bench-quick` = fast, fewer samples (indicative).
+# macOS is indicative; run on Graviton + EBS gp3 for the representative numbers.
+bench:
+    cargo bench -p zerodb-oracle --bench engine_comparison
+
 bench-quick:
-    cargo bench --workspace -- --quick
+    cargo bench -p zerodb-oracle --bench engine_comparison -- --quick

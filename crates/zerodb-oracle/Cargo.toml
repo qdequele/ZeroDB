@@ -33,5 +33,16 @@ zerodb-io = { path = "../zerodb-io" }
 name = "crash-harness"
 path = "src/bin/crash-harness.rs"
 
+# Dual-backend timing bench: zerodb (via heed-zerodb) vs the LMDB fork (heed),
+# both already linked here for the differential harness. Indicative on macOS;
+# representative on Graviton + EBS (see the bench file's module docs).
+[[bench]]
+name = "engine_comparison"
+harness = false
+
 [dev-dependencies]
 proptest.workspace = true
+criterion.workspace = true
+# OS page size query (sysconf) so zerodb can be pinned to LMDB's page size for a
+# fair comparison. Allowlisted (CLAUDE.md); bench-only.
+libc.workspace = true
