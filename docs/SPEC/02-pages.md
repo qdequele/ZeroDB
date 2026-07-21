@@ -208,6 +208,18 @@ A DBRecord captures one B+tree's root and statistics. Two live in every meta
 
 ### §3.2 — Double-buffer selection (open protocol)
 
+**Step 0 (amended 2026-07-21) — minimum-length gate, before mapping.** A store
+holds both meta slots in its first `2 * page_size` bytes (page size = the
+probed value from slot 0's `page_size` field, else the requested/default page
+size when the probe fails). Any existing non-empty file shorter than
+`2 * page_size` cannot be an env and is rejected with `MdbError::Invalid`
+**before the mmap is created**. This is load-bearing, not cosmetic: slot 1 is
+read at `[psize, 2*psize)` *through the map*, and OS pages wholly past EOF
+fault (SIGBUS) rather than erroring — reachable with a garbage or truncated
+file whenever the file ends at least one OS page before `2 * psize`. LMDB
+never faults here because it `pread`s the header before mapping; the parity
+outcome for both engines is a clean invalid-store error.
+
 At env open the engine reads both slots and validates each independently:
 
 1. `magic == MAGIC`, else the file is not a ZeroDB env → `MdbError::Invalid`

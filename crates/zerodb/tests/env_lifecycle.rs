@@ -199,6 +199,40 @@ fn garbage_file_is_invalid() {
     assert!(matches!(e, Error::Mdb(MdbError::Invalid)));
 }
 
+/// SPEC 02 §3.2 step 0 (amended 2026-07-21): a non-empty file shorter than
+/// `2 * page_size` is rejected `Invalid` **before mapping**. Regression pin for
+/// a real SIGBUS: slot 1 is read at `[psize, 2*psize)` through the map, and a
+/// garbage file whose length leaves that range on OS pages wholly past EOF
+/// faulted instead of erroring. The 4 KiB-garbage + 16 K/64 K-psize shapes
+/// below reproduce it on any host whose OS page is ≤ the DB page size (the
+/// pre-fix crash was first observed via the adapter's OS-page-size default on
+/// a 16 K-page Mac; on 4 K-page Linux even the 4 K default was exposed).
+#[test]
+fn garbage_file_shorter_than_both_meta_slots_is_invalid_not_sigbus() {
+    for psize in [16384u32, 65536] {
+        // Garbage shorter than 2*psize, probe field unreadable as a page size.
+        let dir = TempDir::new();
+        std::fs::write(dir.path().join(zerodb::DATA_FILE_NAME), vec![0xFFu8; 4096]).unwrap();
+        let e = EnvOpenOptions::new()
+            .page_size(psize)
+            .open(dir.path())
+            .unwrap_err();
+        assert!(matches!(e, Error::Mdb(MdbError::Invalid)), "psize={psize}");
+    }
+
+    // A truncated *real* env: valid slot-0 prefix (probe succeeds and returns
+    // the persisted page size), file cut before slot 1.
+    let dir = TempDir::new();
+    let bytes = slot_bytes(0, 0);
+    std::fs::write(
+        dir.path().join(zerodb::DATA_FILE_NAME),
+        &bytes[..PS as usize],
+    )
+    .unwrap();
+    let e = EnvOpenOptions::new().open(dir.path()).unwrap_err();
+    assert!(matches!(e, Error::Mdb(MdbError::Invalid)), "truncated env");
+}
+
 /// `try_clone_inner_file` dups the data-file fd (SPEC 00 row 22).
 #[test]
 fn try_clone_inner_file_dups_fd() {

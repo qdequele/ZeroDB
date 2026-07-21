@@ -220,14 +220,23 @@ fn page_size_is_selectable_through_the_adapter() {
 }
 
 #[test]
-fn omitting_page_size_keeps_the_pre_2_6_default() {
-    // The additive guarantee: an options builder that never mentions page_size
-    // must behave exactly as it did before 2.6.
+fn omitting_page_size_defaults_to_the_os_page_size() {
+    // LMDB parity (contract CHANGED 2026-07-21, perf-parity spike): the fork
+    // derives `me_psize` from `sysconf(_SC_PAGE_SIZE)` (capped 64 K) at store
+    // creation, so an adapter-created store must adopt the same geometry —
+    // 16 K on Apple Silicon, 4 K on x86_64 Linux — not the native engine's
+    // fixed 4 K default. Before this change the adapter silently created 4 K
+    // stores on 16 K-page hosts, a heed-observable divergence
+    // (`Env::stat().page_size`) and an unfair handicap vs LMDB. SPEC 00
+    // row 164 records the new default.
+    let os_page = u32::try_from(unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) })
+        .unwrap()
+        .clamp(zerodb::MIN_PAGE_SIZE, zerodb::MAX_PAGE_SIZE);
     let dir = tempfile::tempdir().unwrap();
     let mut opts = env_opts();
     opts.map_size(1024 * 1024).max_dbs(4);
     let env = unsafe { opts.open(dir.path()).unwrap() };
-    assert_eq!(env.stat().page_size, zerodb::DEFAULT_PAGE_SIZE);
+    assert_eq!(env.stat().page_size, os_page);
 }
 
 #[test]

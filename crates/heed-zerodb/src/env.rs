@@ -136,10 +136,12 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// Select the DB page size (**milestone 2.6**).
     ///
     /// **ZeroDB extension — heed has no such method**, because LMDB 0.9 derives
-    /// its page size from the OS and offers no selector. Adding it here is
-    /// additive and feature-neutral: code that never calls it gets the engine
-    /// default and behaves exactly as before, so the frozen heed contract
-    /// (PLAN ground rule 2) is untouched.
+    /// its page size from the OS and offers no selector. Code that never calls
+    /// it gets exactly what the fork would give it: new stores default to the
+    /// **OS page size**, clamped to the engine window (LMDB parity —
+    /// `me_psize = me_os_psize`, capped at 64 K; SPEC 00 row 164). So the
+    /// frozen heed contract (PLAN ground rule 2) is untouched, and this method
+    /// only ever *overrides* that parity default.
     ///
     /// `size` must be a power of two in
     /// `[`[`zerodb::MIN_PAGE_SIZE`]`, `[`zerodb::MAX_PAGE_SIZE`]`]`; an invalid
@@ -209,10 +211,21 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         if let Some(r) = self.max_readers {
             opts.max_readers(r);
         }
-        // M2.6 extension; absent = the engine default (no heed counterpart).
-        if let Some(ps) = self.page_size {
-            opts.page_size(ps);
-        }
+        // M2.6 extension. Absent = the **OS page size**, clamped to the engine
+        // window — LMDB parity: the fork derives `me_psize` from
+        // `sysconf(_SC_PAGE_SIZE)` at creation (capped at 64 K), so a store
+        // created through the heed surface must get the same geometry the fork
+        // would give it (16 K on Apple Silicon / 64 K-page ARM distros, 4 K on
+        // x86_64). The native `zerodb::EnvOpenOptions` keeps its own fixed
+        // 4 K default; this parity default lives at the heed boundary only
+        // (SPEC 00 row 164). Creation-only, as for every geometry option: an
+        // existing store keeps its persisted page size.
+        let ps = self.page_size.unwrap_or_else(|| {
+            u32::try_from(os_page_size())
+                .unwrap_or(zerodb::MAX_PAGE_SIZE)
+                .clamp(zerodb::MIN_PAGE_SIZE, zerodb::MAX_PAGE_SIZE)
+        });
+        opts.page_size(ps);
         // ADR-0010 / D-012: re-impose heed's on-disk contract at the heed
         // boundary — an env opened through this adapter materializes as
         // `<dir>/data.mdb`, the name Meilisearch hardcodes in its production

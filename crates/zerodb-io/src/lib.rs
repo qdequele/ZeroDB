@@ -235,6 +235,17 @@ pub fn open_or_create(
     if file_len == 0 {
         return Err(Error::Mdb(MdbError::Invalid));
     }
+    // SPEC 02 §3.2: an env holds both meta slots in its first `2 * page_size`
+    // bytes; any shorter file cannot be a store and is rejected **before the
+    // map exists**. Load-bearing, not just tidy: the core reads slot 1 at
+    // `[psize, 2*psize)` through the map, and OS pages wholly past EOF fault
+    // (SIGBUS) instead of erroring — reachable with a garbage or truncated
+    // file whenever `file_len` is at least one OS page short of `2 * psize`.
+    // LMDB never faults here because it preads the header before mapping; the
+    // parity outcome for both engines is a clean `MDB_INVALID`.
+    if file_len < 2 * page_size as usize {
+        return Err(Error::Mdb(MdbError::Invalid));
+    }
     // Probe the persisted map size from a small head read before mapping, so
     // the mapping can cover the full effective map_size (ADR-0004 D4).
     let head = file::read_head(&file, file_len.min(2 * page_size as usize))?;

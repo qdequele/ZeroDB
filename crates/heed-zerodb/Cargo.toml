@@ -41,3 +41,5 @@ libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# For the OS-page-size probe in the page-size parity test (allowlisted dep).
+libc.workspace = true
