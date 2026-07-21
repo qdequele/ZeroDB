@@ -51,7 +51,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, MutexGuard};
 
-use crate::btree::{Source, Tree};
+use crate::btree::{branch_view, leaf_view, Source, Tree, ValidatedPages};
 use crate::dirty::DirtyStore;
 use crate::env::{Env, HookPoint, Snapshot};
 use crate::error::{Error, MdbError, Result};
@@ -307,6 +307,12 @@ pub struct RwTxn<'env> {
     txnid: u64,
     psize: u32,
     dirty: DirtyStore,
+    /// Map-sourced pages fully validated this txn (PERF-GAP A2). Sound for a
+    /// writer because every mutation is buffered in [`RwTxn::dirty`] until
+    /// commit C2 — including WRITE_MAP (TXN-45a) — so the *map* bytes never
+    /// change during the txn; dirty frames are excluded from the memo by
+    /// [`Source::bytes_from_classified`].
+    validated: ValidatedPages,
     /// Committed pages obsoleted by this txn (GC-6). Written to the GC DB
     /// under `BE(writer_txnid)` at commit step C1 (`freelist_save`).
     freed: Vec<u64>,
@@ -409,6 +415,7 @@ impl Env {
             open: HashMap::new(),
             psize: inner.page_size(),
             dirty: DirtyStore::new(inner.page_size()),
+            validated: ValidatedPages::new(),
             freed: Vec::new(),
             loose: Vec::new(),
             drains: BTreeMap::new(),
@@ -574,6 +581,9 @@ impl TxnRead for RwTxn<'_> {
     fn comparator_for(&self, sel: DbSel) -> crate::cmp::KeyCmp<'_> {
         self.env.inner().comparator_for(sel)
     }
+    fn validated_pages(&self) -> Option<&ValidatedPages> {
+        Some(&self.validated)
+    }
 }
 
 impl<'env> RwTxn<'env> {
@@ -726,7 +736,8 @@ impl<'env> RwTxn<'env> {
     }
 
     fn load(&self, pgno: u64) -> Result<PageRef<'_>> {
-        PageRef::new(
+        // Trusted-psize load (PERF-GAP A4): psize is env-validated at open.
+        PageRef::new_trusted_psize(
             self.source()
                 .bytes_from(self.psize, pgno)
                 .map_err(corrupt)?,
@@ -1065,11 +1076,13 @@ impl<'env> RwTxn<'env> {
             return Ok((path, false));
         }
         let mut pgno = rec.root;
+        let valid = Some(&self.validated);
         for _ in 0..=rec.depth {
             let page = self.load(pgno)?;
             match page.page_type() {
                 PageType::Leaf => {
-                    let leaf = page.as_leaf().map_err(corrupt)?;
+                    let leaf =
+                        leaf_view(self.source(), self.psize, pgno, valid).map_err(corrupt)?;
                     let (ki, found) = match leaf.lookup_with(key, cmp) {
                         Ok(i) => (i, true),
                         Err(i) => (i, false),
@@ -1078,7 +1091,8 @@ impl<'env> RwTxn<'env> {
                     return Ok((path, found));
                 }
                 PageType::Branch => {
-                    let br = page.as_branch().map_err(corrupt)?;
+                    let br =
+                        branch_view(self.source(), self.psize, pgno, valid).map_err(corrupt)?;
                     let i = br.child_index_with(key, cmp);
                     path.push((pgno, i));
                     pgno = br.child_pgno(i);
@@ -1096,11 +1110,13 @@ impl<'env> RwTxn<'env> {
         let rec = *self.record(tree);
         let mut path = Vec::new();
         let mut pgno = rec.root;
+        let valid = Some(&self.validated);
         for _ in 0..=rec.depth {
             let page = self.load(pgno)?;
             match page.page_type() {
                 PageType::Leaf => {
-                    let leaf = page.as_leaf().map_err(corrupt)?;
+                    let leaf =
+                        leaf_view(self.source(), self.psize, pgno, valid).map_err(corrupt)?;
                     let n = leaf.num_keys();
                     if n == 0 {
                         return Err(Error::Mdb(MdbError::Invalid));
@@ -1110,7 +1126,8 @@ impl<'env> RwTxn<'env> {
                     return Ok((path, key));
                 }
                 PageType::Branch => {
-                    let br = page.as_branch().map_err(corrupt)?;
+                    let br =
+                        branch_view(self.source(), self.psize, pgno, valid).map_err(corrupt)?;
                     let last = br.num_keys() - 1;
                     path.push((pgno, last));
                     pgno = br.child_pgno(last);
@@ -1234,7 +1251,9 @@ impl<'env> RwTxn<'env> {
         let (lpg, _) = *path.last().expect("non-empty path");
         let n = {
             let frame = self.dirty.bytes(lpg).expect("leaf touched");
-            LeafRef::new(frame, self.psize).map_err(corrupt)?.num_keys()
+            LeafRef::new_prevalidated(frame, self.psize)
+                .map_err(corrupt)?
+                .num_keys()
         };
         path.last_mut().expect("non-empty path").1 = n;
         let loc = self.insert_into_leaf(tree, path, n, key, val, true, 0)?;
@@ -1268,7 +1287,7 @@ impl<'env> RwTxn<'env> {
         // inline value, `Ok((head, dsize))` for a BIGDATA one.
         let (old_big, new_inline) = {
             let frame = self.dirty.bytes(lpg).expect("leaf touched");
-            let leaf = LeafRef::new(frame, self.psize).map_err(corrupt)?;
+            let leaf = LeafRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
             let old_big = match leaf.value(ki) {
                 LeafValue::Inline(v) => Err(v.len() as u32),
                 LeafValue::Overflow { head_pgno, dsize } => Ok((head_pgno, dsize)),
@@ -1423,7 +1442,7 @@ impl<'env> RwTxn<'env> {
 
     fn extract_leaf_cells(&self, pgno: u64) -> Result<Vec<OwnedLeafCell>> {
         let frame = self.dirty.bytes(pgno).expect("page is dirty");
-        let leaf = LeafRef::new(frame, self.psize).map_err(corrupt)?;
+        let leaf = LeafRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
         let mut cells = Vec::with_capacity(leaf.num_keys());
         for i in 0..leaf.num_keys() {
             let val = match leaf.value(i) {
@@ -1447,7 +1466,7 @@ impl<'env> RwTxn<'env> {
 
     fn extract_branch_cells(&self, pgno: u64) -> Result<Vec<OwnedBranchCell>> {
         let frame = self.dirty.bytes(pgno).expect("page is dirty");
-        let br = BranchRef::new(frame, self.psize).map_err(corrupt)?;
+        let br = BranchRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
         let mut cells = Vec::with_capacity(br.num_keys());
         for i in 0..br.num_keys() {
             cells.push(OwnedBranchCell {
@@ -1656,7 +1675,7 @@ impl<'env> RwTxn<'env> {
         let (lpg, ki) = *path.last().expect("non-empty path");
         let big = {
             let frame = self.dirty.bytes(lpg).expect("leaf touched");
-            let leaf = LeafRef::new(frame, self.psize).map_err(corrupt)?;
+            let leaf = LeafRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
             match leaf.value(ki) {
                 LeafValue::Inline(_) => None,
                 LeafValue::Overflow { head_pgno, dsize } => Some((head_pgno, dsize)),
@@ -1680,15 +1699,17 @@ impl<'env> RwTxn<'env> {
     /// `(is_leaf, num_keys, used_bytes)` of the dirty page at `pgno`.
     fn page_stats(&self, pgno: u64) -> Result<(bool, usize, usize)> {
         let frame = self.dirty.bytes(pgno).expect("page is dirty");
-        let page = PageRef::new(frame, self.psize).map_err(corrupt)?;
+        // A dirty frame is engine-authored (batch 3, see `btree::leaf_view`):
+        // O(1) structural checks only.
+        let page = PageRef::new_trusted_psize(frame, self.psize).map_err(corrupt)?;
         let body = body_size(self.psize);
         match page.page_type() {
             PageType::Leaf => {
-                let l = page.as_leaf().map_err(corrupt)?;
+                let l = LeafRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
                 Ok((true, l.num_keys(), body - l.free_space()))
             }
             PageType::Branch => {
-                let b = page.as_branch().map_err(corrupt)?;
+                let b = BranchRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
                 Ok((false, b.num_keys(), body - b.free_space()))
             }
             _ => Err(Error::Mdb(MdbError::Invalid)),
@@ -1713,7 +1734,7 @@ impl<'env> RwTxn<'env> {
             } else if !is_leaf && nkeys == 1 {
                 let child = {
                     let frame = self.dirty.bytes(pgno).expect("root is dirty");
-                    BranchRef::new(frame, self.psize)
+                    BranchRef::new_prevalidated(frame, self.psize)
                         .map_err(corrupt)?
                         .child_pgno(0)
                 };
@@ -1739,7 +1760,7 @@ impl<'env> RwTxn<'env> {
         let (ppg, pki) = path[level - 1];
         let parent_nkeys = {
             let frame = self.dirty.bytes(ppg).expect("parent is dirty");
-            BranchRef::new(frame, self.psize)
+            BranchRef::new_prevalidated(frame, self.psize)
                 .map_err(corrupt)?
                 .num_keys()
         };
@@ -1757,7 +1778,7 @@ impl<'env> RwTxn<'env> {
         };
         let sib_old = {
             let frame = self.dirty.bytes(ppg).expect("parent is dirty");
-            BranchRef::new(frame, self.psize)
+            BranchRef::new_prevalidated(frame, self.psize)
                 .map_err(corrupt)?
                 .child_pgno(sib_idx)
         };
@@ -1805,7 +1826,7 @@ impl<'env> RwTxn<'env> {
                 // moved key.
                 let cell = {
                     let frame = self.dirty.bytes(sib).expect("sibling touched");
-                    let leaf = LeafRef::new(frame, psize).map_err(corrupt)?;
+                    let leaf = LeafRef::new_prevalidated(frame, psize).map_err(corrupt)?;
                     let i = leaf.num_keys() - 1;
                     OwnedLeafCell {
                         key: leaf.key(i).to_vec(),
@@ -1833,7 +1854,7 @@ impl<'env> RwTxn<'env> {
                 // separator = its new first key.
                 let cell = {
                     let frame = self.dirty.bytes(sib).expect("sibling touched");
-                    let leaf = LeafRef::new(frame, psize).map_err(corrupt)?;
+                    let leaf = LeafRef::new_prevalidated(frame, psize).map_err(corrupt)?;
                     OwnedLeafCell {
                         key: leaf.key(0).to_vec(),
                         val: match leaf.value(0) {
@@ -1854,11 +1875,16 @@ impl<'env> RwTxn<'env> {
                 }
                 let new_first = {
                     let frame = self.dirty.bytes(sib).expect("sibling touched");
-                    LeafRef::new(frame, psize).map_err(corrupt)?.key(0).to_vec()
+                    LeafRef::new_prevalidated(frame, psize)
+                        .map_err(corrupt)?
+                        .key(0)
+                        .to_vec()
                 };
                 let p_n = {
                     let frame = self.dirty.bytes(pg).expect("page is dirty");
-                    LeafRef::new(frame, psize).map_err(corrupt)?.num_keys()
+                    LeafRef::new_prevalidated(frame, psize)
+                        .map_err(corrupt)?
+                        .num_keys()
                 };
                 self.insert_owned_leaf_cell(pg, p_n, &cell)?;
                 self.update_parent_key(tree, path, level - 1, pki + 1, new_first)
@@ -1869,7 +1895,7 @@ impl<'env> RwTxn<'env> {
             // parent separator becomes the moved child's key.
             let (k_m, c) = {
                 let frame = self.dirty.bytes(sib).expect("sibling touched");
-                let br = BranchRef::new(frame, psize).map_err(corrupt)?;
+                let br = BranchRef::new_prevalidated(frame, psize).map_err(corrupt)?;
                 let i = br.num_keys() - 1;
                 (br.key(i).to_vec(), br.child_pgno(i))
             };
@@ -1882,7 +1908,7 @@ impl<'env> RwTxn<'env> {
             let old_sep = {
                 let (ppg, _) = path[level - 1];
                 let frame = self.dirty.bytes(ppg).expect("parent is dirty");
-                BranchRef::new(frame, psize)
+                BranchRef::new_prevalidated(frame, psize)
                     .map_err(corrupt)?
                     .key(pki)
                     .to_vec()
@@ -1891,7 +1917,7 @@ impl<'env> RwTxn<'env> {
             // Rebuild it as: node 0 = (empty, c), node 1 = (old_sep, c0).
             let c0 = {
                 let frame = self.dirty.bytes(pg).expect("page is dirty");
-                let br = BranchRef::new(frame, psize).map_err(corrupt)?;
+                let br = BranchRef::new_prevalidated(frame, psize).map_err(corrupt)?;
                 debug_assert_eq!(br.num_keys(), 1, "underful branch has one child");
                 br.child_pgno(0)
             };
@@ -1910,7 +1936,7 @@ impl<'env> RwTxn<'env> {
             // the parent.
             let (c, k1, c1) = {
                 let frame = self.dirty.bytes(sib).expect("sibling touched");
-                let br = BranchRef::new(frame, psize).map_err(corrupt)?;
+                let br = BranchRef::new_prevalidated(frame, psize).map_err(corrupt)?;
                 (br.child_pgno(0), br.key(1).to_vec(), br.child_pgno(1))
             };
             {
@@ -1930,7 +1956,7 @@ impl<'env> RwTxn<'env> {
             let old_sep = {
                 let (ppg, _) = path[level - 1];
                 let frame = self.dirty.bytes(ppg).expect("parent is dirty");
-                BranchRef::new(frame, psize)
+                BranchRef::new_prevalidated(frame, psize)
                     .map_err(corrupt)?
                     .key(pki + 1)
                     .to_vec()
@@ -1978,7 +2004,7 @@ impl<'env> RwTxn<'env> {
         let (ppg, _) = path[parent_level];
         let child = {
             let frame = self.dirty.bytes(ppg).expect("parent is dirty");
-            BranchRef::new(frame, self.psize)
+            BranchRef::new_prevalidated(frame, self.psize)
                 .map_err(corrupt)?
                 .child_pgno(child_idx)
         };
@@ -2014,7 +2040,9 @@ impl<'env> RwTxn<'env> {
             let cells = self.extract_leaf_cells(right)?;
             let base = {
                 let frame = self.dirty.bytes(left).expect("left is dirty");
-                LeafRef::new(frame, self.psize).map_err(corrupt)?.num_keys()
+                LeafRef::new_prevalidated(frame, self.psize)
+                    .map_err(corrupt)?
+                    .num_keys()
             };
             for (j, c) in cells.iter().enumerate() {
                 self.insert_owned_leaf_cell(left, base + j, c)?;
@@ -2025,7 +2053,7 @@ impl<'env> RwTxn<'env> {
             // separator being dropped (§10 merge / §6.5 inverse).
             let sep = {
                 let frame = self.dirty.bytes(ppg).expect("parent is dirty");
-                BranchRef::new(frame, self.psize)
+                BranchRef::new_prevalidated(frame, self.psize)
                     .map_err(corrupt)?
                     .key(right_idx)
                     .to_vec()
@@ -2226,7 +2254,8 @@ impl<'env> RwTxn<'env> {
         let page = self.load(pgno)?;
         match page.page_type() {
             PageType::Leaf => {
-                let leaf = page.as_leaf().map_err(corrupt)?;
+                let leaf = leaf_view(self.source(), self.psize, pgno, Some(&self.validated))
+                    .map_err(corrupt)?;
                 for i in 0..leaf.num_keys() {
                     if let LeafValue::Overflow { head_pgno, dsize } = leaf.value(i) {
                         runs.push((head_pgno, overflow_page_count(dsize as u64, self.psize)));
@@ -2236,7 +2265,8 @@ impl<'env> RwTxn<'env> {
                 Ok(())
             }
             PageType::Branch => {
-                let br = page.as_branch().map_err(corrupt)?;
+                let br = branch_view(self.source(), self.psize, pgno, Some(&self.validated))
+                    .map_err(corrupt)?;
                 for i in 0..br.num_keys() {
                     self.collect_tree(br.child_pgno(i), level - 1, pages, runs)?;
                 }

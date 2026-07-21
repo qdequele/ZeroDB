@@ -159,6 +159,26 @@ impl<'a> LeafRef<'a> {
     ///
     /// Any [`PageError`] arising from the checks above.
     pub fn new(buf: &'a [u8], psize: u32) -> Result<LeafRef<'a>, PageError> {
+        let view = Self::new_prevalidated(buf, psize)?;
+        // Validate every cell.
+        for i in 0..view.num_keys() {
+            let rel = ptr_at(buf, i) as usize;
+            check_ptr_in_heap(rel, view.upper, psize)?;
+            leaf_cell_len(buf, HEADER_SIZE + rel, psize)?;
+        }
+        Ok(view)
+    }
+
+    /// [`LeafRef::new`] minus the per-cell loop: type flag, reserved fields
+    /// and free-space bounds are still checked (O(1)); the O(`num_keys`) cell
+    /// walk is skipped.
+    ///
+    /// The accessors do unchecked slicing and rely on the cells having been
+    /// validated, so this may only be used when **these same bytes** already
+    /// passed [`LeafRef::new`] earlier — i.e. behind the txn-scoped
+    /// validated-pages memo over an immutable source
+    /// (`btree::ValidatedPages`; docs/PERF-GAP-VS-LMDB.md A2).
+    pub(crate) fn new_prevalidated(buf: &'a [u8], psize: u32) -> Result<LeafRef<'a>, PageError> {
         let hdr = CommonHeader::read(buf);
         if page_type_of(hdr.flags)? != PageType::Leaf {
             return Err(PageError::WrongPageType {
@@ -168,14 +188,7 @@ impl<'a> LeafRef<'a> {
         }
         check_reserved_tail_fields(buf)?;
         let (lower, upper) = read_and_check_bounds(buf, psize)?;
-        let view = LeafRef { buf, lower, upper };
-        // Validate every cell.
-        for i in 0..view.num_keys() {
-            let rel = ptr_at(buf, i) as usize;
-            check_ptr_in_heap(rel, upper, psize)?;
-            leaf_cell_len(buf, HEADER_SIZE + rel, psize)?;
-        }
-        Ok(view)
+        Ok(LeafRef { buf, lower, upper })
     }
 
     /// Number of entries on this page (`lower / 2`).
@@ -507,6 +520,20 @@ impl<'a> BranchRef<'a> {
     /// As [`LeafRef::new`], but for branch cells (index 0 may have an empty
     /// separator key).
     pub fn new(buf: &'a [u8], psize: u32) -> Result<BranchRef<'a>, PageError> {
+        let view = Self::new_prevalidated(buf, psize)?;
+        for i in 0..view.num_keys() {
+            let rel = ptr_at(buf, i) as usize;
+            check_ptr_in_heap(rel, view.upper, psize)?;
+            branch_cell_len(buf, HEADER_SIZE + rel, psize, i == 0)?;
+        }
+        Ok(view)
+    }
+
+    /// [`BranchRef::new`] minus the per-cell loop — same contract as
+    /// [`LeafRef::new_prevalidated`]: only for bytes that already passed the
+    /// full constructor earlier in the same txn, behind
+    /// `btree::ValidatedPages`.
+    pub(crate) fn new_prevalidated(buf: &'a [u8], psize: u32) -> Result<BranchRef<'a>, PageError> {
         let hdr = CommonHeader::read(buf);
         if page_type_of(hdr.flags)? != PageType::Branch {
             return Err(PageError::WrongPageType {
@@ -516,13 +543,7 @@ impl<'a> BranchRef<'a> {
         }
         check_reserved_tail_fields(buf)?;
         let (lower, upper) = read_and_check_bounds(buf, psize)?;
-        let view = BranchRef { buf, lower, upper };
-        for i in 0..view.num_keys() {
-            let rel = ptr_at(buf, i) as usize;
-            check_ptr_in_heap(rel, upper, psize)?;
-            branch_cell_len(buf, HEADER_SIZE + rel, psize, i == 0)?;
-        }
-        Ok(view)
+        Ok(BranchRef { buf, lower, upper })
     }
 
     /// Number of children on this page (`lower / 2`).

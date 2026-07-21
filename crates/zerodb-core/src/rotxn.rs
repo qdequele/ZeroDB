@@ -28,9 +28,9 @@
 //! lives in [`crate::rwtxn`].
 
 use std::ops::Bound;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use crate::btree::{prefix_successor, Cursor, Source, Tree};
+use crate::btree::{prefix_successor, Cursor, Source, Tree, ValidatedPages};
 use crate::cmp::KeyCmp;
 use crate::env::{Env, Snapshot};
 use crate::error::{Error, MdbError, Result};
@@ -69,6 +69,13 @@ pub trait TxnRead {
     /// catalog. Every tree this module builds for a *user* database routes
     /// through here.
     fn comparator_for(&self, sel: DbSel) -> KeyCmp<'_>;
+    /// The txn's validated-pages memo, if it keeps one (PERF-GAP A2): pages
+    /// whose cells were fully validated earlier this txn and may be re-wrapped
+    /// without the O(`num_keys`) cell walk. Default `None` = always fully
+    /// validate.
+    fn validated_pages(&self) -> Option<&ValidatedPages> {
+        None
+    }
 }
 
 /// Which database a [`Database`] handle addresses (SPEC 02 §6). `Copy` so the
@@ -139,6 +146,24 @@ pub struct RoTxn<'env> {
     snap: Arc<Snapshot>,
     /// The owned reader-table slot (claimed in `EnvInner::pin_reader`).
     slot: u32,
+    /// Per-txn memo of resolved named-DB records, keyed by dbi.
+    ///
+    /// Without it every read op on a named DB re-did the registry lock + name
+    /// clone + a full catalog descent (`resolve_named_record`) — roughly
+    /// doubling the tree work per `get` (docs/PERF-GAP-VS-LMDB.md A1).
+    ///
+    /// Soundness: this txn pins an immutable [`Snapshot`] (its catalog cannot
+    /// change while pinned, TXN-18/20) and the dbi→name registry is
+    /// append-only for the process (M1.6), so a (dbi → record) resolution is
+    /// constant for the txn's life. A linear `Vec` scan beats a map: the set
+    /// is bounded by `max_dbs` and typically small. `Mutex` (not `RefCell`)
+    /// keeps `RoTxn` auto-`Sync`; the lock is uncontended and held only for
+    /// the lookup/insert.
+    named_memo: Mutex<Vec<(u32, DBRecord)>>,
+    /// Pages fully validated this txn (PERF-GAP A2; see
+    /// [`ValidatedPages`]). Sound here because every page this snapshot can
+    /// reach is immutable while its reader slot is held (TXN-20/21).
+    validated: ValidatedPages,
 }
 
 impl RoTxn<'_> {
@@ -211,16 +236,29 @@ impl TxnRead for RoTxn<'_> {
     fn record_for(&self, sel: DbSel) -> DBRecord {
         match sel {
             DbSel::Main => self.snap.main_db,
-            DbSel::Named(dbi) => match self.env_ref().inner().named_name(dbi) {
-                Some(name) => {
-                    resolve_named_record(self.source(), self.psize, &self.snap.main_db, &name)
+            DbSel::Named(dbi) => {
+                // Memo hit: the resolution is constant for this txn's life
+                // (see the `named_memo` field docs).
+                let mut memo = self.named_memo.lock().expect("named memo poisoned");
+                if let Some(&(_, rec)) = memo.iter().find(|&&(d, _)| d == dbi) {
+                    return rec;
                 }
-                None => DBRecord::empty(),
-            },
+                let rec = match self.env_ref().inner().named_name(dbi) {
+                    Some(name) => {
+                        resolve_named_record(self.source(), self.psize, &self.snap.main_db, &name)
+                    }
+                    None => DBRecord::empty(),
+                };
+                memo.push((dbi, rec));
+                rec
+            }
         }
     }
     fn comparator_for(&self, sel: DbSel) -> KeyCmp<'_> {
         self.env_ref().inner().comparator_for(sel)
+    }
+    fn validated_pages(&self) -> Option<&ValidatedPages> {
+        Some(&self.validated)
     }
 }
 
@@ -242,6 +280,8 @@ impl Env {
             snap,
             slot,
             env: EnvHandle::Borrowed(self),
+            named_memo: Mutex::new(Vec::new()),
+            validated: ValidatedPages::new(),
         })
     }
 
@@ -263,6 +303,8 @@ impl Env {
             snap,
             slot,
             env: EnvHandle::Owned(self),
+            named_memo: Mutex::new(Vec::new()),
+            validated: ValidatedPages::new(),
         })
     }
 
@@ -508,6 +550,7 @@ impl Database {
             rec.depth,
             txn.comparator_for(self.sel),
         )
+        .with_validation_memo(txn.validated_pages())
     }
 
     /// `stat(txn)` (SPEC 00 row 49): depth, page counts, and entry count of

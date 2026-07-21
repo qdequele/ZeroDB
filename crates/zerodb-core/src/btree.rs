@@ -15,9 +15,15 @@
 //! `INITIALIZED`/`EOF` flags of SPEC 03 §4. Each public op documents the §4
 //! subsection whose positioning/EOF/empty-DB semantics it implements.
 
+use std::cell::Cell;
+use std::collections::HashSet;
+use std::sync::Mutex;
+
 use super::cmp::KeyCmp;
 use super::dirty::DirtyStore;
-use super::page::{LeafRef, LeafValue, OverflowRef, PageError, PageRef, PageType, PGNO_INVALID};
+use super::page::{
+    BranchRef, LeafRef, LeafValue, OverflowRef, PageError, PageRef, PageType, PGNO_INVALID,
+};
 
 /// An entry `(key, value)` borrowed from the map for the view's lifetime `'a`.
 pub type Entry<'a> = (&'a [u8], &'a [u8]);
@@ -60,6 +66,23 @@ impl<'a> Source<'a> {
     /// (a dirty run is its full contiguous frame; a mapped run extends to the
     /// end of the map, bounded by the overflow decoder).
     pub(crate) fn bytes_from(&self, psize: u32, pgno: u64) -> Result<&'a [u8], PageError> {
+        self.bytes_from_classified(psize, pgno).map(|(b, _)| b)
+    }
+
+    /// As [`Source::bytes_from`], additionally reporting whether the bytes
+    /// came from the **map** (`true`) or from a **dirty frame** (`false`).
+    ///
+    /// The distinction gates [`ValidatedPages`]: map bytes are immutable for
+    /// the owning txn's life (a reader's pinned snapshot is GC-protected,
+    /// TXN-20/21; a writer buffers every mutation in the dirty store until
+    /// commit C2 — including WRITE_MAP, TXN-45a — so the map never changes
+    /// under a live txn). Dirty frames mutate mid-txn and must never be
+    /// trusted from a memo.
+    pub(crate) fn bytes_from_classified(
+        &self,
+        psize: u32,
+        pgno: u64,
+    ) -> Result<(&'a [u8], bool), PageError> {
         let ps = psize as usize;
         let map_slice = |bytes: &'a [u8]| -> Result<&'a [u8], PageError> {
             let base = (pgno as usize)
@@ -71,12 +94,107 @@ impl<'a> Source<'a> {
                 .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })
         };
         match self {
-            Source::Map { bytes } => map_slice(bytes),
+            Source::Map { bytes } => map_slice(bytes).map(|b| (b, true)),
             Source::Writer { dirty, bytes } => match dirty.bytes(pgno) {
-                Some(frame) => Ok(frame),
-                None => map_slice(bytes),
+                Some(frame) => Ok((frame, false)),
+                None => map_slice(bytes).map(|b| (b, true)),
             },
         }
+    }
+}
+
+/// Txn-scoped memo of pages whose **cells** have already passed full
+/// validation this txn (docs/PERF-GAP-VS-LMDB.md A2).
+///
+/// `LeafRef::new`/`BranchRef::new` validate every cell — O(`num_keys`) per
+/// view construction — which multiplied every descent (get, seek, put search).
+/// A page recorded here may be re-wrapped via the `new_prevalidated`
+/// constructors (O(1) structural checks only, cell loop skipped).
+///
+/// Soundness: entries are only recorded for **map-sourced** bytes
+/// ([`Source::bytes_from_classified`]), which are immutable for the owning
+/// txn's life; dirty frames never enter the memo. The type flag is still
+/// re-read on every wrap, so a pgno validated as one type can never be
+/// trusted as another. `Mutex` keeps the owning txn auto-`Sync`.
+pub struct ValidatedPages {
+    set: Mutex<HashSet<u64>>,
+}
+
+impl ValidatedPages {
+    pub(crate) fn new() -> ValidatedPages {
+        ValidatedPages {
+            set: Mutex::new(HashSet::new()),
+        }
+    }
+
+    fn contains(&self, pgno: u64) -> bool {
+        self.set.lock().expect("memo poisoned").contains(&pgno)
+    }
+
+    fn insert(&self, pgno: u64) {
+        self.set.lock().expect("memo poisoned").insert(pgno);
+    }
+}
+
+/// The validated leaf view of `pgno` from `src`: memo hit on a map-sourced
+/// page skips the O(`num_keys`) cell walk; every other case fully validates
+/// (and records map-sourced pages for the rest of the txn).
+pub(crate) fn leaf_view<'a>(
+    src: Source<'a>,
+    psize: u32,
+    pgno: u64,
+    valid: Option<&ValidatedPages>,
+) -> Result<LeafRef<'a>, PageError> {
+    let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
+    match valid {
+        Some(v) => {
+            if from_map {
+                if v.contains(pgno) {
+                    LeafRef::new_prevalidated(bytes, psize)
+                } else {
+                    let leaf = LeafRef::new(bytes, psize)?;
+                    v.insert(pgno);
+                    Ok(leaf)
+                }
+            } else {
+                // Engine-authored dirty frame (PERF-GAP batch 3): a frame is
+                // either a COW copy of a page fully validated on its first
+                // map access this txn, or the output of this txn's own page
+                // encoders — never raw disk bytes, which always enter through
+                // the `from_map` arm above. Structural O(1) checks (type,
+                // bounds) still run; the per-cell walk over the engine's own
+                // output is skipped — LMDB's model for its dirty pages.
+                LeafRef::new_prevalidated(bytes, psize)
+            }
+        }
+        None => LeafRef::new(bytes, psize),
+    }
+}
+
+/// As [`leaf_view`], for branch pages.
+pub(crate) fn branch_view<'a>(
+    src: Source<'a>,
+    psize: u32,
+    pgno: u64,
+    valid: Option<&ValidatedPages>,
+) -> Result<BranchRef<'a>, PageError> {
+    let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
+    match valid {
+        Some(v) => {
+            if from_map {
+                if v.contains(pgno) {
+                    BranchRef::new_prevalidated(bytes, psize)
+                } else {
+                    let br = BranchRef::new(bytes, psize)?;
+                    v.insert(pgno);
+                    Ok(br)
+                }
+            } else {
+                // Engine-authored dirty frame — see [`leaf_view`].
+                BranchRef::new_prevalidated(bytes, psize)
+            }
+        }
+        None => BranchRef::new(bytes, psize),
     }
 }
 
@@ -85,8 +203,10 @@ impl<'a> Source<'a> {
 // ---------------------------------------------------------------------------
 
 /// Load the `psize`-byte page `pgno` from the source as a validated [`PageRef`].
+/// Uses the trusted-psize constructor: `psize` comes from the env, validated
+/// once at open (PERF-GAP A4); every per-buffer check is unchanged.
 fn load_page<'a>(src: Source<'a>, psize: u32, pgno: u64) -> Result<PageRef<'a>, PageError> {
-    PageRef::new(src.bytes_from(psize, pgno)?, psize)
+    PageRef::new_trusted_psize(src.bytes_from(psize, pgno)?, psize)
 }
 
 /// Resolve the value of leaf entry `i` to a contiguous `&'a [u8]` (SPEC 03 §3):
@@ -125,6 +245,10 @@ pub struct Tree<'a> {
     /// construction — the only way to be sure none of them silently falls back
     /// to memcmp.
     cmp: KeyCmp<'a>,
+    /// The owning txn's validated-pages memo, if it provides one
+    /// ([`ValidatedPages`]); `None` (always fully validate) for tests, tools
+    /// and the GC tree.
+    valid: Option<&'a ValidatedPages>,
 }
 
 impl<'a> Tree<'a> {
@@ -153,7 +277,17 @@ impl<'a> Tree<'a> {
             root,
             depth,
             cmp,
+            valid: None,
         }
+    }
+
+    /// Attach the owning txn's validated-pages memo (PERF-GAP A2). Descents
+    /// through this tree then skip re-validating cells of map-sourced pages
+    /// already validated this txn; without it every view fully validates.
+    #[must_use]
+    pub(crate) fn with_validation_memo(mut self, valid: Option<&'a ValidatedPages>) -> Tree<'a> {
+        self.valid = valid;
+        self
     }
 
     /// The ordering this tree is stored under (milestone 2.4).
@@ -182,8 +316,7 @@ impl<'a> Tree<'a> {
             return Ok(None);
         }
         let (pgno, ki) = *c.stack.last().expect("initialized cursor has a leaf frame");
-        let page = load_page(self.src, self.psize, pgno)?;
-        let leaf = page.as_leaf()?;
+        let leaf = leaf_view(self.src, self.psize, pgno, self.valid)?;
         if ki < leaf.num_keys() && self.cmp.eq(leaf.key(ki), key) {
             Ok(Some(resolve_value(self.src, self.psize, &leaf, ki)?))
         } else {
@@ -206,8 +339,7 @@ impl<'a> Tree<'a> {
             return Ok(None);
         }
         let (pgno, ki) = *c.stack.last().expect("initialized cursor has a leaf frame");
-        let page = load_page(self.src, self.psize, pgno)?;
-        let leaf = page.as_leaf()?;
+        let leaf = leaf_view(self.src, self.psize, pgno, self.valid)?;
         if ki < leaf.num_keys() && self.cmp.eq(leaf.key(ki), key) {
             let flags = leaf.node_flags(ki);
             Ok(Some((
@@ -251,6 +383,22 @@ pub struct Cursor<'a> {
     /// The tree's ordering (milestone 2.4), copied from the [`Tree`] this
     /// cursor was opened on so every seek uses it.
     cmp: KeyCmp<'a>,
+    /// Memoized current leaf view, keyed by pgno.
+    ///
+    /// [`LeafRef::new`] validates **every cell** on the page (O(`num_keys`)), so
+    /// re-deriving the view on each step made a full scan O(`num_keys`²) per
+    /// page instead of O(`num_keys`) — the dominant cost in cursor iteration.
+    /// Caching keeps the validation (every page is still fully validated before
+    /// any access) and just stops repeating it while the cursor stays on one
+    /// page.
+    ///
+    /// Soundness: the cursor owns a [`Source<'a>`], whose `&'a [u8]` map and
+    /// `&'a DirtyStore` are *immutable* borrows for `'a`. No mutation can occur
+    /// while this cursor is alive, so a cached view can never go stale.
+    leaf_cache: Cell<Option<(u64, LeafRef<'a>)>>,
+    /// The owning txn's validated-pages memo (PERF-GAP A2), copied from the
+    /// [`Tree`] this cursor was opened on.
+    valid: Option<&'a ValidatedPages>,
 }
 
 impl<'a> Cursor<'a> {
@@ -264,6 +412,8 @@ impl<'a> Cursor<'a> {
             initialized: false,
             eof: false,
             cmp: t.cmp,
+            leaf_cache: Cell::new(None),
+            valid: t.valid,
         }
     }
 
@@ -271,6 +421,26 @@ impl<'a> Cursor<'a> {
 
     fn page(&self, pgno: u64) -> Result<PageRef<'a>, PageError> {
         load_page(self.src, self.psize, pgno)
+    }
+
+    /// The validated leaf view for `pgno`, reusing the memoized one while the
+    /// cursor stays on the same page (see [`Cursor::leaf_cache`]). A miss goes
+    /// through the txn's validated-pages memo ([`leaf_view`]).
+    fn leaf_at(&self, pgno: u64) -> Result<LeafRef<'a>, PageError> {
+        if let Some((cached, leaf)) = self.leaf_cache.get() {
+            if cached == pgno {
+                return Ok(leaf);
+            }
+        }
+        let leaf = leaf_view(self.src, self.psize, pgno, self.valid)?;
+        self.leaf_cache.set(Some((pgno, leaf)));
+        Ok(leaf)
+    }
+
+    /// The validated branch view for `pgno`, through the txn's memo
+    /// ([`branch_view`]).
+    fn branch_at(&self, pgno: u64) -> Result<BranchRef<'a>, PageError> {
+        branch_view(self.src, self.psize, pgno, self.valid)
     }
 
     /// The entry at the current leaf position, or `None` if unpositioned / EOF /
@@ -283,7 +453,7 @@ impl<'a> Cursor<'a> {
             Some(f) => *f,
             None => return Ok(None),
         };
-        let leaf = self.page(pgno)?.as_leaf()?;
+        let leaf = self.leaf_at(pgno)?;
         if ki >= leaf.num_keys() {
             return Ok(None);
         }
@@ -306,7 +476,7 @@ impl<'a> Cursor<'a> {
                     return Ok(());
                 }
                 PageType::Branch => {
-                    let br = page.as_branch()?;
+                    let br = self.branch_at(pgno)?;
                     self.stack.push((pgno, 0));
                     pgno = br.child_pgno(0);
                 }
@@ -324,13 +494,13 @@ impl<'a> Cursor<'a> {
             let page = self.page(pgno)?;
             match page.page_type() {
                 PageType::Leaf => {
-                    let leaf = page.as_leaf()?;
+                    let leaf = self.leaf_at(pgno)?;
                     let n = leaf.num_keys();
                     self.stack.push((pgno, n.saturating_sub(1)));
                     return Ok(());
                 }
                 PageType::Branch => {
-                    let br = page.as_branch()?;
+                    let br = self.branch_at(pgno)?;
                     let last = br.num_keys().saturating_sub(1);
                     self.stack.push((pgno, last));
                     pgno = br.child_pgno(last);
@@ -356,7 +526,7 @@ impl<'a> Cursor<'a> {
             let page = self.page(pgno)?;
             match page.page_type() {
                 PageType::Leaf => {
-                    let leaf = page.as_leaf()?;
+                    let leaf = self.leaf_at(pgno)?;
                     let ki = match leaf.lookup_with(key, self.cmp) {
                         Ok(i) | Err(i) => i,
                     };
@@ -365,7 +535,7 @@ impl<'a> Cursor<'a> {
                     return Ok(());
                 }
                 PageType::Branch => {
-                    let br = page.as_branch()?;
+                    let br = self.branch_at(pgno)?;
                     let i = br.child_index_with(key, self.cmp);
                     self.stack.push((pgno, i));
                     pgno = br.child_pgno(i);
@@ -390,7 +560,7 @@ impl<'a> Cursor<'a> {
             }
             self.stack.pop();
             let (bp, bki) = *self.stack.last().expect("len > 1");
-            let br = self.page(bp)?.as_branch()?;
+            let br = self.branch_at(bp)?;
             if bki + 1 < br.num_keys() {
                 self.stack.last_mut().expect("len > 1").1 = bki + 1;
                 let child = br.child_pgno(bki + 1);
@@ -411,7 +581,7 @@ impl<'a> Cursor<'a> {
             }
             self.stack.pop();
             let (bp, bki) = *self.stack.last().expect("len > 1");
-            let br = self.page(bp)?.as_branch()?;
+            let br = self.branch_at(bp)?;
             if bki > 0 {
                 self.stack.last_mut().expect("len > 1").1 = bki - 1;
                 let child = br.child_pgno(bki - 1);
@@ -470,7 +640,7 @@ impl<'a> Cursor<'a> {
             .stack
             .last()
             .expect("initialized cursor has a leaf frame");
-        let leaf = self.page(pgno)?.as_leaf()?;
+        let leaf = self.leaf_at(pgno)?;
         if ki + 1 < leaf.num_keys() {
             self.stack.last_mut().expect("leaf frame").1 = ki + 1;
             return self.current();
@@ -516,7 +686,7 @@ impl<'a> Cursor<'a> {
             .stack
             .last()
             .expect("initialized cursor has a leaf frame");
-        let leaf = self.page(pgno)?.as_leaf()?;
+        let leaf = self.leaf_at(pgno)?;
         if ki < leaf.num_keys() && self.cmp.eq(leaf.key(ki), key) {
             return self.current();
         }
@@ -537,7 +707,7 @@ impl<'a> Cursor<'a> {
             .stack
             .last()
             .expect("initialized cursor has a leaf frame");
-        let leaf = self.page(pgno)?.as_leaf()?;
+        let leaf = self.leaf_at(pgno)?;
         if ki < leaf.num_keys() {
             return self.current();
         }
@@ -606,7 +776,7 @@ impl<'a> Cursor<'a> {
             Some(f) => *f,
             None => return Ok(None),
         };
-        let leaf = self.page(pgno)?.as_leaf()?;
+        let leaf = self.leaf_at(pgno)?;
         if ki >= leaf.num_keys() {
             return Ok(None);
         }

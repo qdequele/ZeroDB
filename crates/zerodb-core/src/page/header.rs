@@ -99,6 +99,16 @@ impl<'a> PageRef<'a> {
     /// and the classification errors from [`page_type_of`].
     pub fn new(buf: &'a [u8], psize: u32) -> Result<PageRef<'a>, PageError> {
         validate_page_size(psize)?;
+        Self::new_trusted_psize(buf, psize)
+    }
+
+    /// [`PageRef::new`] minus the `validate_page_size` re-check, for the
+    /// engine's per-page-load hot path (`btree::load_page`): the page size is
+    /// validated once at env open and is immutable after, so re-validating it
+    /// on every page load only costs time (docs/PERF-GAP-VS-LMDB.md A4). All
+    /// per-buffer checks (length, type classification) are kept — this trusts
+    /// only `psize`, never the bytes.
+    pub(crate) fn new_trusted_psize(buf: &'a [u8], psize: u32) -> Result<PageRef<'a>, PageError> {
         if buf.len() < psize as usize {
             return Err(PageError::BufferTooSmall {
                 got: buf.len(),

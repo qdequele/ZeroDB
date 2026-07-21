@@ -173,6 +173,11 @@ impl TxnRead for NestedRoTxn<'_> {
     fn comparator_for(&self, sel: DbSel) -> crate::cmp::KeyCmp<'_> {
         self.parent.comparator_for(sel)
     }
+    fn validated_pages(&self) -> Option<&crate::btree::ValidatedPages> {
+        // The parent writer is immutably borrowed for this nested reader's
+        // whole life, so its map-gated memo stays sound here (PERF-GAP A2).
+        self.parent.validated_pages()
+    }
 }
 
 // ---------------------------------------------------------------------------
