@@ -45,7 +45,12 @@ multiplies the rest.** Together this accounts for the measured get ≈ 5.6×.
 
 ## A. Read path (time, per operation)
 
-### A1. Named-DB record re-resolved on EVERY read op — **new, likely #1**
+### A1. Named-DB record re-resolved on EVERY read op — **DONE 2026-07-21 (37eb96e)**
+**Done:** per-txn `named_memo` on `RoTxn` (a `Mutex<Vec<(dbi, DBRecord)>>` —
+uncontended, `Sync`-preserving; soundness: the pinned snapshot's catalog and
+the append-only dbi registry are both immutable for the txn's life). RwTxn and
+nested txns were already covered by the open-table. Part of the batch that
+took hannoy indexing 5–6× → 1.3–1.44×. Original analysis kept below.
 `Database::get/len/is_empty/iter…` on a `RoTxn` all call `record_for`
 (`rotxn.rs:501,521,548,557`) which, for a named DB, does the mutex + name
 clone + full catalog descent *every time* (`rotxn.rs:211-216`, comment at
@@ -58,7 +63,15 @@ the catalog descent, the mutex, and the name clone from every read.
 No unsafe. Effort: low. **This also multiplies A2–A4** (the catalog descent
 pays validation too), so it must land first or it hides the others' wins.
 
-### A2. Eager O(num_keys) page validation on every view construction
+### A2. Eager O(num_keys) page validation on every view construction — **(a) DONE 2026-07-21 (37eb96e; lock-free via A8); (b) open, issue [#21](https://github.com/qdequele/ZeroDB/issues/21)**
+**Done (a):** txn-scoped `ValidatedPages` memo — disk bytes validate exactly
+once per txn at first map entry; every later view is `new_prevalidated`
+(O(1)) or, since A8, `new_trusted` (two raw header reads). Engine-authored
+dirty frames trusted by construction (batch 3, same commit).
+**Open (b):** the lazy/checked-per-access variant (validate O(log K) per
+descent instead of O(K) at first touch) — tracked as issue #21 (`needs-adr`:
+it bundles an opt-in trusted-file mode). Superseded in practice by (a); re-open
+only if a profile names first-visit validation. Original analysis kept below.
 `LeafRef::new`/`BranchRef::new` walk every cell (`page/tree.rs:161-179`,
 `:509+`). Cursor iteration no longer repays it (leaf memoized — scan went
 29× → 2.18×), but **every descent still does**: root + each branch + leaf,
@@ -70,7 +83,9 @@ checked (they slice unchecked at `page/tree.rs:205-227`, which is *why* the
 eager pass exists) and validate lazily per access — O(log K) instead of O(K)
 per page. No unsafe. Effort: (a) low, (b) medium.
 
-### A3. Byte-copy field reads instead of pointer reads — **DONE 2026-07-22**
+### A3. Byte-copy field reads instead of pointer reads — **DONE 2026-07-22 (7848e30)**
+(Issue [#20](https://github.com/qdequele/ZeroDB/issues/20) was filed for this
+after the work landed — safe to close against 7848e30.)
 Was: every u16/u32/u64 field read = bounds-checked indexing into a stack
 array + `from_le_bytes` (a u64 = 8 checked indexes + panic paths); every
 field of every node of every page. LMDB: direct struct access through
@@ -90,26 +105,32 @@ garbage in-bounds offset) and do unchecked reads behind it; internal loops
 ride the binary-search invariant. `debug_assert!`s keep every contract loud
 in test/fuzz builds; miri referees the whole corpus.
 
-### A4. `validate_page_size` re-run on every page load — free fix
-`PageRef::new` (`page/header.rs:101`) re-validates an env-immutable value on
-the hottest path in the engine. Hoist to open. Effort: trivial.
+### A4. `validate_page_size` re-run on every page load — **DONE 2026-07-21 (37eb96e)**
+Was: `PageRef::new` (`page/header.rs:101`) re-validated an env-immutable value
+on the hottest path in the engine.
+**Done:** `PageRef::new_trusted_psize` — trusts only `psize` (validated once at
+env open), keeps every per-buffer check; `btree::load_page` uses it.
 
 ### A5. Cursor caches only the leaf; branch levels re-resolved
-`Cursor.stack` holds `(pgno, ki)` only; ascend/descend re-load + re-validate
-branches (`btree.rs:393,414`). LMDB keeps a resolved `MDB_page*` per level
-(`mc_pg[CURSOR_STACK]`, mdb.c:1470). Extend the proven leaf-memo pattern per
-level. No unsafe. Effort: low.
+`Cursor.stack` holds `(pgno, ki)` only; ascend/descend re-load branches
+(`btree.rs`). Post-A8 the *revalidation* is gone (memo hit → trusted view, two
+raw header reads), so what remains per level is the page lookup + header
+parse. LMDB keeps a resolved `MDB_page*` per level (`mc_pg[CURSOR_STACK]`,
+mdb.c:1470). Extend the proven leaf-memo pattern per level. No unsafe.
+Effort: low. No tracking issue (this ledger is its home); profile-gated.
 
-### A6. Heap allocation per get / per cursor
+### A6. Heap allocation per get / per cursor — issue [#19](https://github.com/qdequele/ZeroDB/issues/19)
 `Tree::get` builds a `Cursor` with a heap `Vec` stack per call
 (`btree.rs:180-182`). LMDB cursors live on the C stack. Fix: inline
 `[(u64, u16); MAX_DEPTH]` array (depth is bounded), or a reusable per-txn
 cursor. No unsafe. Effort: low.
 
-### A7. Custom-comparator vtable call per key comparison
+### A7. Custom-comparator vtable call per key comparison — issue [#14](https://github.com/qdequele/ZeroDB/issues/14)
 `KeyCmp::Custom(&dyn Comparator)` (`cmp.rs:160-172`) — indirect call per
 comparison on custom-comparator DBs (milli sets one). LMDB uses a plain fn
 pointer. Monomorphize the search over the comparator. Effort: low.
+(Not to be confused with the memo work stamped below — the old task list
+briefly used "A7" for what this ledger numbers A8.)
 
 ### A8. Memo probe cost: `Mutex<HashSet>` + SipHash per page view — **DONE 2026-07-21**
 Found by profiling, not inspection: with B1/B6 landed, the milli indexing
@@ -164,11 +185,18 @@ zero. **Residual (deliberate):** a mutation (`put_current`/`del_current`/
 `put`) drops the parked stack and records the key; the next advance re-seeks
 once — LMDB's in-place cursor fix-up avoids that descent. Costs one descent
 per *mutation* (was: one per *step* + one per mutation). Revisit only if a
-consumer bench still shows it (put_tree path adoption is the escalation).
+consumer bench still shows it (put_tree path adoption is the escalation);
+tracked as issue [#7](https://github.com/qdequele/ZeroDB/issues/7).
 `put_reserved`'s inline re-locate second descent has the same shape (noted
 below).
 
-### B2. Per-insert owned-cell alloc; splits materialize the whole page
+### B2. Per-insert owned-cell alloc; splits materialize the whole page — **DONE 2026-07-21 (3c6a064)**
+**Done:** end-insert/append split takes a fast path (fresh right page, insert
+directly, no copy — LMDB's `newindx == n_old` bias); the general split packs
+both frames from cells **borrowed** out of the old frame (removed from the
+dirty store as an address-stable `Box`) + the caller's new cell — no
+`OwnedLeafCell` materialization. Plain puts insert straight into the frame
+(`NewLeafVal`). Original analysis kept below.
 Every put builds an `OwnedLeafCell` (heap `Vec`s for key/value) for the new
 cell (`rwtxn.rs:1368,1409`); a split calls `extract_leaf_cells` — **every
 cell of the page copied into a `Vec<OwnedLeafCell>`** (`rwtxn.rs:1424-1439`)
@@ -177,7 +205,7 @@ cell of the page copied into a `Vec<OwnedLeafCell>`** (`rwtxn.rs:1424-1439`)
 the two mapped pages. Amortized: ~2 allocs + a page copy per K inserts on top
 of B1/B3. No unsafe. Effort: medium.
 
-### B3. Dirty store: HashMap + `Box` per page + commit-time sort + zeroing — **PARKED 2026-07-22 (profile says no)**
+### B3. Dirty store: HashMap + `Box` per page + commit-time sort + zeroing — **PARKED 2026-07-22 (profile says no)** — issues [#4](https://github.com/qdequele/ZeroDB/issues/4), [#5](https://github.com/qdequele/ZeroDB/issues/5)
 Verdict from the post-A8 milli write-phase call tree (the referee that found
 `from_valid`): at 1.19× end-to-end, the dirty-store probe does not clear a
 60-sample bar in an 8 s window where `search_path` holds ~1,760 — the arena
@@ -196,15 +224,17 @@ traffic, ordered iteration for free.
 **Note:** the `Box` is load-bearing for TXN-41 frame-address stability; an
 arena/pool preserves that. No unsafe. Effort: medium.
 
-### B4. One `pwrite` syscall per dirty page at commit; no coalescing
-`rwtxn.rs:2510`: `for pgno in sorted_pgnos { backing.write_at_page(...) }`.
-LMDB's `mdb_page_flush` coalesces contiguous runs into `iovec[MDB_COMMIT_PAGES]`
-batches (mdb.c:1613-1617) flushed via `pwritev`. Hidden by the laptop page
-cache; **dominant on the real target (Graviton + EBS gp3)** — the current
-bench cannot see it. No unsafe. Effort: medium (zerodb-io gains a vectored
-write; the C2 loop batches contiguous pgnos).
+### B4. One `pwrite` syscall per dirty page at commit; no coalescing — **DONE 2026-07-21 (3c6a064); EBS validation PENDING**
+Was: `for pgno in sorted_pgnos { backing.write_at_page(...) }` — one syscall
+per dirty page. LMDB's `mdb_page_flush` coalesces contiguous runs into
+`iovec[MDB_COMMIT_PAGES]` batches (mdb.c:1613-1617) flushed via `pwritev`.
+**Done:** the C2 flush batches contiguous pgnos and `zerodb-io` issues one
+`pwritev` per chunk of up to `MAX_IOV` frames (`file.rs`). **Caveat:** the win
+this exists for is Graviton + EBS gp3, where per-syscall latency dominates —
+the laptop page cache hides it, so it is implemented but *unmeasured on
+target*. Same hardware gate as the ~1.8× durable-commit number.
 
-### B5. WRITEMAP copies at commit instead of mutating the map — *unsafe (sanctioned)*
+### B5. WRITEMAP copies at commit instead of mutating the map — *unsafe (sanctioned)* — issue [#13](https://github.com/qdequele/ZeroDB/issues/13)
 M1.10 implemented WRITE_MAP as commit-time copy (heap dirty store → map at
 C2) to keep the value-borrow contract, nested-reader dirty reads, and
 abort-by-drop identical. Costs a full memcpy of every dirty page per commit +
@@ -225,14 +255,15 @@ preserving the shipped zero-tail contract. Fork-pinned semantics change that
 came with it: a failing closure now leaves the entry in place and errors as
 `Io` (LMDB cannot un-put a reserve; the pre-B6 adapter wrote nothing and
 returned `Encoding` — a real divergence, pinned by the oracle's
-`put_reserved_failing_closure_leaves_entry_parity`). **Residuals:** the
+`put_reserved_failing_closure_leaves_entry_parity`). **Residuals** (tracked
+as issue [#10](https://github.com/qdequele/ZeroDB/issues/10)): the
 engine's inline-reserve path still re-locates the settled cell with a second
 descent (`rwtxn.rs` `put_reserved` → `search_path`) — same shape as the B1
 mutation residual; and the *cursor* reserved put
 (`put_current_reserved_with_flags`) still goes through a heap buffer (rare
 path; wire it to the slot fill if a consumer profile ever shows it).
 
-### B7. Freelist bookkeeping allocation churn
+### B7. Freelist bookkeeping allocation churn — issue [#29](https://github.com/qdequele/ZeroDB/issues/29)
 `drains: BTreeMap<u64, Vec<u64>>` + `reclaimed: HashSet` + PIL decode `Vec`
 per GC entry touched (`rwtxn.rs:924-998`); `freelist_save` fixed-point loop
 per commit. LMDB: sorted `MDB_IDL` arrays manipulated in place. Effort:
@@ -258,7 +289,9 @@ economy — same page counts per kind, same depth; layout order legitimately
 differs) + the existing copy differentials/round-trips/tools acceptance.
 **Residual:** `zerodb-tools load` and `migrate-from-lmdb` still use the batch
 builder (fine at tool scale; wire them to a `FileSink` if 100 GB reloads
-become a workflow). Original analysis kept below.
+become a workflow) — the load half of issue
+[#63](https://github.com/qdequele/ZeroDB/issues/63). Original analysis kept
+below.
 `collect_entries_flagged` copies **every key and value in the DB into owned
 `Vec`s** (`rotxn.rs:416-424`), then `build_multi_db_image` materializes **the
 entire output env image in a second `Vec<u8>`** (`builder.rs`). Peak ≈ live
@@ -274,7 +307,10 @@ This is the difference between "compaction works on a 100 GB index" and OOM.
 Inherent to the heap dirty store (B3/B5): a write txn holds `Box` copies of
 every touched page + overflow run. LMDB WRITEMAP holds zero (mutates the
 map); LMDB default holds the same order but pool-recycled. Bounded by txn
-size; milli's indexing txns are large. Mitigation = B5, or frame pooling (B3).
+size; milli's indexing txns are large. Mitigations = B5 (issue #13), frame
+pooling (B3, parked), or dirty-page **spilling** — LMDB's `mdb_page_spill`
+analogue, tracked as issue
+[#3](https://github.com/qdequele/ZeroDB/issues/3).
 
 ### C3. Env-image builder for `load`/`migrate` (same as C1's second half)
 `build_single/multi_db_image` return the whole file as `Vec<u8>` — fine for
@@ -289,21 +325,36 @@ tests, wrong for tools at scale. Covered by the C1 streaming fix.
   exists. A2(b) keeps the guarantee at O(log K) instead of O(K) — removing
   validation outright is not on the table.
 
-## Sequencing (dependency-aware)
+## State of play (2026-07-22 — supersedes the original sequencing)
 
-1. **A1** named-record memo per txn — unlocks true read cost; everything
-   read-side is currently double-counted through the catalog descent.
-2. **A4** hoist `validate_page_size` (trivial) + **A5/A6** cursor/branch memo
-   + stack-array cursor (the proven pattern).
-3. **A2** lazy/checked validation (the big remaining read multiplier).
-4. **B1** RwCursor page-position (milli's mutation loops) + **B6** reserve
-   into the frame (milli's put path).
-5. **B3/B4** dirty-store arena + `pwritev` coalescing (commit cost; the EBS
-   win invisible on the laptop).
-6. **C1** streaming compaction (RAM ceiling, tooling-critical).
-7. **A3** `read_unaligned` codec (cross-cutting constant factor) — after the
-   structural fixes so its effect is measurable in isolation.
-8. **B5** WRITEMAP in-place — only with an ADR; highest blast radius.
+The original sequencing ran to completion: A1, A4, A2(a), B1, B6, B2, B4,
+A8, A3, C1 are **DONE** (stamps above, each behind the full gate + referee);
+B3 is **PARKED** on profile evidence. Scoreboard at this point (alternated
+same-run medians vs the fork, matched 16 K geometry, Apple M-series): milli
+end-to-end indexing 2.68× → **1.12×**; hannoy search **0.95×** (faster, all
+dims); hannoy build 1.27–1.49×; micro get/scan/overflow ≈ parity; on-disk
+17 % denser; compaction peak RAM 2× env → ~100 KB.
+
+What remains, and its gate:
+
+- **Profile-gated micro levers:** A5 (branch-level cursor cache), A6 (#19
+  inline cursor stack), A7 (#14 comparator monomorphization), plus the B1
+  residual (#7) and B6 residuals (#10). Implement only what a consumer
+  call-tree names — two blind picks were falsified this campaign.
+- **Hardware-gated validation:** B4 is built but unmeasured on its target
+  (Graviton + EBS); same run validates the durable-commit path (~1.8× on
+  laptop, unknown on EBS).
+- **ADR-gated:** B5 (#13, WRITEMAP in-place — last, if at all), A2(b) (#21,
+  lazy validation + trusted-file mode).
+- **Measure-first:** B7 (#29) — only matters under GC churn.
+- **Inherent, mitigations tracked:** C2 → spilling (#3), B5 (#13), or B3
+  pooling (parked).
+- **Tooling residual:** C3 — wire `load`/`migrate-from-lmdb` to the C1
+  streaming path (#63's load half).
+
+The broader Phase-3 technique backlog (beyond this inventory's LMDB-parity
+scope) lives in the GitHub issues, filed 2026-07-22: prefetch/madvise, io_uring,
+durability tiers, page-layout evolutions, consumer-API batching.
 
 ## Already done
 
