@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::dirty::PgnoBuildHasher;
 use crate::page::geometry::{gc_key_decode, overflow_page_count};
 use crate::page::{
     select_meta, DBRecord, LeafValue, MetaPage, OverflowRef, PageRef, PageType, DBRECORD_LEN,
@@ -33,10 +34,10 @@ struct Checker<'a> {
     psize: u32,
     meta_txnid: u64,
     last_pg: u64,
-    visited: HashSet<u64>,
+    visited: HashSet<u64, PgnoBuildHasher>,
     /// Free page ids collected from every GC PIL → occurrence count
-    /// (INV-22/INV-24; SPEC 05 §9).
-    free: HashMap<u64, u64>,
+    /// (INV-22/INV-24; SPEC 05 §9). Pgno-hashed (issue #9).
+    free: HashMap<u64, u64, PgnoBuildHasher>,
     violations: Vec<String>,
 }
 
@@ -514,8 +515,8 @@ pub fn check_image(bytes: &[u8], psize: u32) -> Vec<String> {
         psize,
         meta_txnid: meta.txnid,
         last_pg: meta.last_pg,
-        visited: HashSet::new(),
-        free: HashMap::new(),
+        visited: HashSet::default(),
+        free: HashMap::default(),
         violations,
     };
     checker.check_catalog_record("main_db", &meta.main_db);

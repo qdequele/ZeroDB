@@ -24,13 +24,50 @@
 //! (TXN-49).
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+/// Pgno hasher (PERF-GAP issue #9): every page load inside a write txn
+/// probes this store first (`Source::Writer`), and the hannoy-build call
+/// tree put the default `RandomState` SipHash among the top descent costs.
+/// Keys are page numbers authored by the engine itself — never
+/// attacker-controlled input — so SipHash's HashDoS resistance buys nothing
+/// here. This uses the splitmix64 finalizer (same full-avalanche 3-multiply
+/// mixer as `btree::ValidatedPages::mix`), which also mixes the low bits
+/// hashbrown's control bytes rely on.
+#[derive(Default)]
+pub(crate) struct PgnoHasher(u64);
+
+impl Hasher for PgnoHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        // splitmix64 finalizer.
+        let mut z = n;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        self.0 = z ^ (z >> 31);
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Unused for the `u64` keys this store indexes (`u64::hash` calls
+        // `write_u64`); kept correct (FNV-1a fold) so any future key shape
+        // degrades gracefully instead of panicking.
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+    }
+}
+
+pub(crate) type PgnoBuildHasher = BuildHasherDefault<PgnoHasher>;
 
 /// A write txn's dirty-page frames, indexed by pgno. See the module docs for
 /// the stability contract.
 #[derive(Debug)]
 pub struct DirtyStore {
     psize: u32,
-    frames: HashMap<u64, Box<[u8]>>,
+    frames: HashMap<u64, Box<[u8]>, PgnoBuildHasher>,
 }
 
 impl DirtyStore {
@@ -39,7 +76,7 @@ impl DirtyStore {
     pub fn new(psize: u32) -> DirtyStore {
         DirtyStore {
             psize,
-            frames: HashMap::new(),
+            frames: HashMap::default(),
         }
     }
 

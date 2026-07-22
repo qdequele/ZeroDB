@@ -53,9 +53,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, MutexGuard};
 
 use crate::btree::{
-    branch_view, leaf_view, Cursor as BCursor, SavedCursor, Source, Tree, ValidatedPages,
+    branch_view, leaf_view, node_view, Cursor as BCursor, NodeView, SavedCursor, Source, Tree,
+    ValidatedPages,
 };
-use crate::dirty::DirtyStore;
+use crate::dirty::{DirtyStore, PgnoBuildHasher};
 use crate::env::{Env, HookPoint, Snapshot};
 use crate::error::{Error, MdbError, Result};
 use crate::nested::{ChildCounter, NestedRoTxn};
@@ -356,8 +357,9 @@ pub struct RwTxn<'env> {
     drains: BTreeMap<u64, Vec<u64>>,
     /// Every pgno handed out by a GC draw this txn (ADR-0005 D1): feeds the
     /// generalized TXN-62 assert at C2 and the loose classification in
-    /// [`RwTxn::free_page`].
-    reclaimed: HashSet<u64>,
+    /// [`RwTxn::free_page`]. Pgno-hashed (issue #9): engine-authored keys,
+    /// no HashDoS surface.
+    reclaimed: HashSet<u64, PgnoBuildHasher>,
     /// GC-12 allocation restriction (ADR-0005 D2).
     alloc_mode: AllocMode,
     /// Entries of `drains` whose `remaining` shrank via an **in-save pool
@@ -447,7 +449,7 @@ impl Env {
             freed: Vec::new(),
             loose: Vec::new(),
             drains: BTreeMap::new(),
-            reclaimed: HashSet::new(),
+            reclaimed: HashSet::default(),
             alloc_mode: AllocMode::Normal,
             save_touched: std::collections::BTreeSet::new(),
             errored: false,
@@ -1106,11 +1108,11 @@ impl<'env> RwTxn<'env> {
         let mut pgno = rec.root;
         let valid = Some(&self.validated);
         for _ in 0..=rec.depth {
-            let page = self.load(pgno)?;
-            match page.page_type() {
-                PageType::Leaf => {
-                    let leaf =
-                        leaf_view(self.source(), self.psize, pgno, valid).map_err(corrupt)?;
+            // One source resolution per level (PERF-GAP issue #9); a non-tree
+            // page type maps through `corrupt` to the same `Invalid` the old
+            // two-step dispatch returned.
+            match node_view(self.source(), self.psize, pgno, valid).map_err(corrupt)? {
+                NodeView::Leaf(leaf) => {
                     let (ki, found) = match leaf.lookup_with(key, cmp) {
                         Ok(i) => (i, true),
                         Err(i) => (i, false),
@@ -1118,14 +1120,11 @@ impl<'env> RwTxn<'env> {
                     path.push((pgno, ki));
                     return Ok((path, found));
                 }
-                PageType::Branch => {
-                    let br =
-                        branch_view(self.source(), self.psize, pgno, valid).map_err(corrupt)?;
+                NodeView::Branch(br) => {
                     let i = br.child_index_with(key, cmp);
                     path.push((pgno, i));
                     pgno = br.child_pgno(i);
                 }
-                _ => return Err(Error::Mdb(MdbError::Invalid)),
             }
         }
         Err(Error::Mdb(MdbError::Invalid)) // deeper than depth: corrupt
@@ -1140,11 +1139,8 @@ impl<'env> RwTxn<'env> {
         let mut pgno = rec.root;
         let valid = Some(&self.validated);
         for _ in 0..=rec.depth {
-            let page = self.load(pgno)?;
-            match page.page_type() {
-                PageType::Leaf => {
-                    let leaf =
-                        leaf_view(self.source(), self.psize, pgno, valid).map_err(corrupt)?;
+            match node_view(self.source(), self.psize, pgno, valid).map_err(corrupt)? {
+                NodeView::Leaf(leaf) => {
                     let n = leaf.num_keys();
                     if n == 0 {
                         return Err(Error::Mdb(MdbError::Invalid));
@@ -1153,14 +1149,11 @@ impl<'env> RwTxn<'env> {
                     path.push((pgno, n - 1));
                     return Ok((path, key));
                 }
-                PageType::Branch => {
-                    let br =
-                        branch_view(self.source(), self.psize, pgno, valid).map_err(corrupt)?;
+                NodeView::Branch(br) => {
                     let last = br.num_keys() - 1;
                     path.push((pgno, last));
                     pgno = br.child_pgno(last);
                 }
-                _ => return Err(Error::Mdb(MdbError::Invalid)),
             }
         }
         Err(Error::Mdb(MdbError::Invalid))

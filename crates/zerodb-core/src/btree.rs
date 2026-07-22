@@ -272,6 +272,18 @@ pub(crate) fn leaf_view<'a>(
     valid: Option<&ValidatedPages>,
 ) -> Result<LeafRef<'a>, PageError> {
     let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
+    leaf_view_over(bytes, from_map, psize, pgno, valid)
+}
+
+/// [`leaf_view`] over bytes the caller already resolved (PERF-GAP issue #9:
+/// the descent resolves each page's bytes exactly once — see [`node_view`]).
+fn leaf_view_over<'a>(
+    bytes: &'a [u8],
+    from_map: bool,
+    psize: u32,
+    pgno: u64,
+    valid: Option<&ValidatedPages>,
+) -> Result<LeafRef<'a>, PageError> {
     match valid {
         Some(v) => {
             if from_map {
@@ -306,6 +318,17 @@ pub(crate) fn branch_view<'a>(
     valid: Option<&ValidatedPages>,
 ) -> Result<BranchRef<'a>, PageError> {
     let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
+    branch_view_over(bytes, from_map, psize, pgno, valid)
+}
+
+/// [`branch_view`] over bytes the caller already resolved (see [`node_view`]).
+fn branch_view_over<'a>(
+    bytes: &'a [u8],
+    from_map: bool,
+    psize: u32,
+    pgno: u64,
+    valid: Option<&ValidatedPages>,
+) -> Result<BranchRef<'a>, PageError> {
     match valid {
         Some(v) => {
             if from_map {
@@ -326,16 +349,41 @@ pub(crate) fn branch_view<'a>(
     }
 }
 
+/// A tree page as its typed view, resolved and dispatched in **one** source
+/// resolution (PERF-GAP issue #9).
+///
+/// The descent previously resolved every page's bytes twice — once through
+/// [`load_page`] for the type dispatch, then again inside
+/// [`leaf_view`]/[`branch_view`] — and in a write txn each resolution probes
+/// the dirty store first ([`Source::bytes_from_classified`]), which the
+/// hannoy-build call tree showed as a top descent cost. Any non-tree page
+/// type fails with the same [`PageError::WrongPageType`] the two-step
+/// dispatch produced.
+pub(crate) enum NodeView<'a> {
+    Leaf(LeafRef<'a>),
+    Branch(BranchRef<'a>),
+}
+
+pub(crate) fn node_view<'a>(
+    src: Source<'a>,
+    psize: u32,
+    pgno: u64,
+    valid: Option<&ValidatedPages>,
+) -> Result<NodeView<'a>, PageError> {
+    let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
+    let page = PageRef::new_trusted_psize(bytes, psize)?;
+    match page.page_type() {
+        PageType::Leaf => leaf_view_over(bytes, from_map, psize, pgno, valid).map(NodeView::Leaf),
+        PageType::Branch => {
+            branch_view_over(bytes, from_map, psize, pgno, valid).map(NodeView::Branch)
+        }
+        other => Err(wrong_type(other)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Page loading + value resolution
 // ---------------------------------------------------------------------------
-
-/// Load the `psize`-byte page `pgno` from the source as a validated [`PageRef`].
-/// Uses the trusted-psize constructor: `psize` comes from the env, validated
-/// once at open (PERF-GAP A4); every per-buffer check is unchanged.
-fn load_page<'a>(src: Source<'a>, psize: u32, pgno: u64) -> Result<PageRef<'a>, PageError> {
-    PageRef::new_trusted_psize(src.bytes_from(psize, pgno)?, psize)
-}
 
 /// Resolve the value of leaf entry `i` to a contiguous `&'a [u8]` (SPEC 03 §3):
 /// inline values borrow the leaf page; `F_BIGDATA` values borrow the overflow
@@ -444,7 +492,8 @@ impl<'a> Tree<'a> {
             return Ok(None);
         }
         let (pgno, ki) = *c.stack.last().expect("initialized cursor has a leaf frame");
-        let leaf = leaf_view(self.src, self.psize, pgno, self.valid)?;
+        // The search just cached this leaf's view — no re-resolution.
+        let leaf = c.leaf_at(pgno)?;
         if ki < leaf.num_keys() && self.cmp.eq(leaf.key(ki), key) {
             Ok(Some(resolve_value(self.src, self.psize, &leaf, ki)?))
         } else {
@@ -467,7 +516,8 @@ impl<'a> Tree<'a> {
             return Ok(None);
         }
         let (pgno, ki) = *c.stack.last().expect("initialized cursor has a leaf frame");
-        let leaf = leaf_view(self.src, self.psize, pgno, self.valid)?;
+        // The search just cached this leaf's view — no re-resolution.
+        let leaf = c.leaf_at(pgno)?;
         if ki < leaf.num_keys() && self.cmp.eq(leaf.key(ki), key) {
             let flags = leaf.node_flags(ki);
             Ok(Some((
@@ -518,6 +568,76 @@ impl<'a> Tree<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// PathStack — inline root-to-leaf frame stack (PERF-GAP A6, issue #19)
+// ---------------------------------------------------------------------------
+
+/// Maximum root-to-leaf frames a cursor path can hold — LMDB's
+/// `CURSOR_STACK` bound. With the B+tree's minimum branch fanout of 2,
+/// depth 32 already addresses 2^31 leaf pages (8 TB at the smallest page
+/// size); any deeper descent means a corrupt `depth`/cycle and fails with
+/// the same typed error the per-descent iteration guards produce.
+const CURSOR_STACK: usize = 32;
+
+/// A `Vec`-shaped fixed-capacity `(pgno, ki)` stack. Descents are the
+/// engine's hottest loop, and the previous heap `Vec` cost one alloc + free
+/// per `Tree::get` (the `grow_one` frame in the hannoy-build profile).
+/// Inline storage makes cursor construction allocation-free; `push` reports
+/// overflow as a typed corruption error instead of growing.
+#[derive(Clone, Debug)]
+pub(crate) struct PathStack {
+    /// Frames `0..len`; slots past `len` are dead space.
+    buf: [(u64, usize); CURSOR_STACK],
+    len: usize,
+}
+
+impl PathStack {
+    fn new() -> PathStack {
+        PathStack {
+            buf: [(0, 0); CURSOR_STACK],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, frame: (u64, usize)) -> Result<(), PageError> {
+        match self.buf.get_mut(self.len) {
+            Some(slot) => {
+                *slot = frame;
+                self.len += 1;
+                Ok(())
+            }
+            // Deeper than any legal tree: reject like the descent iteration
+            // guards do (SPEC 03 §11 INV-7), never overflow.
+            None => Err(depth_exceeded()),
+        }
+    }
+
+    fn pop(&mut self) -> Option<(u64, usize)> {
+        if self.len == 0 {
+            None
+        } else {
+            self.len -= 1;
+            Some(self.buf[self.len])
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn last(&self) -> Option<&(u64, usize)> {
+        self.buf[..self.len].last()
+    }
+
+    fn last_mut(&mut self) -> Option<&mut (u64, usize)> {
+        self.buf[..self.len].last_mut()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Cursor — the read positioning state machine (SPEC 03 §4)
 // ---------------------------------------------------------------------------
 
@@ -532,7 +652,7 @@ pub struct Cursor<'a> {
     depth: u16,
     /// `(pgno, ki)` from root (index 0) to the current leaf (`top`). Empty when
     /// the cursor is unpositioned.
-    stack: Vec<(u64, usize)>,
+    stack: PathStack,
     /// The `INITIALIZED` flag (SPEC 03 §4): the cursor has been positioned.
     /// Cleared on before-begin (`prev` past the minimum) and on a failed exact
     /// `set`.
@@ -567,7 +687,7 @@ impl<'a> Cursor<'a> {
             psize: t.psize,
             root: t.root,
             depth: t.depth,
-            stack: Vec::new(),
+            stack: PathStack::new(),
             initialized: false,
             eof: false,
             cmp: t.cmp,
@@ -577,10 +697,6 @@ impl<'a> Cursor<'a> {
     }
 
     // -- page helpers ------------------------------------------------------
-
-    fn page(&self, pgno: u64) -> Result<PageRef<'a>, PageError> {
-        load_page(self.src, self.psize, pgno)
-    }
 
     /// The validated leaf view for `pgno`, reusing the memoized one while the
     /// cursor stays on the same page (see [`Cursor::leaf_cache`]). A miss goes
@@ -628,18 +744,16 @@ impl<'a> Cursor<'a> {
     fn descend_min(&mut self, start: u64) -> Result<(), PageError> {
         let mut pgno = start;
         for _ in 0..=(self.depth as usize + 1) {
-            let page = self.page(pgno)?;
-            match page.page_type() {
-                PageType::Leaf => {
-                    self.stack.push((pgno, 0));
+            match node_view(self.src, self.psize, pgno, self.valid)? {
+                NodeView::Leaf(leaf) => {
+                    self.stack.push((pgno, 0))?;
+                    self.leaf_cache.set(Some((pgno, leaf)));
                     return Ok(());
                 }
-                PageType::Branch => {
-                    let br = self.branch_at(pgno)?;
-                    self.stack.push((pgno, 0));
+                NodeView::Branch(br) => {
+                    self.stack.push((pgno, 0))?;
                     pgno = br.child_pgno(0);
                 }
-                other => return Err(wrong_type(other)),
             }
         }
         Err(depth_exceeded())
@@ -650,21 +764,18 @@ impl<'a> Cursor<'a> {
     fn descend_max(&mut self, start: u64) -> Result<(), PageError> {
         let mut pgno = start;
         for _ in 0..=(self.depth as usize + 1) {
-            let page = self.page(pgno)?;
-            match page.page_type() {
-                PageType::Leaf => {
-                    let leaf = self.leaf_at(pgno)?;
+            match node_view(self.src, self.psize, pgno, self.valid)? {
+                NodeView::Leaf(leaf) => {
                     let n = leaf.num_keys();
-                    self.stack.push((pgno, n.saturating_sub(1)));
+                    self.stack.push((pgno, n.saturating_sub(1)))?;
+                    self.leaf_cache.set(Some((pgno, leaf)));
                     return Ok(());
                 }
-                PageType::Branch => {
-                    let br = self.branch_at(pgno)?;
+                NodeView::Branch(br) => {
                     let last = br.num_keys().saturating_sub(1);
-                    self.stack.push((pgno, last));
+                    self.stack.push((pgno, last))?;
                     pgno = br.child_pgno(last);
                 }
-                other => return Err(wrong_type(other)),
             }
         }
         Err(depth_exceeded())
@@ -682,24 +793,21 @@ impl<'a> Cursor<'a> {
         }
         let mut pgno = self.root;
         for _ in 0..=(self.depth as usize + 1) {
-            let page = self.page(pgno)?;
-            match page.page_type() {
-                PageType::Leaf => {
-                    let leaf = self.leaf_at(pgno)?;
+            match node_view(self.src, self.psize, pgno, self.valid)? {
+                NodeView::Leaf(leaf) => {
                     let ki = match leaf.lookup_with(key, self.cmp) {
                         Ok(i) | Err(i) => i,
                     };
-                    self.stack.push((pgno, ki));
+                    self.stack.push((pgno, ki))?;
+                    self.leaf_cache.set(Some((pgno, leaf)));
                     self.initialized = true;
                     return Ok(());
                 }
-                PageType::Branch => {
-                    let br = self.branch_at(pgno)?;
+                NodeView::Branch(br) => {
                     let i = br.child_index_with(key, self.cmp);
-                    self.stack.push((pgno, i));
+                    self.stack.push((pgno, i))?;
                     pgno = br.child_pgno(i);
                 }
-                other => return Err(wrong_type(other)),
             }
         }
         Err(depth_exceeded())
@@ -946,9 +1054,8 @@ impl<'a> Cursor<'a> {
 
     /// Detach this cursor's position as plain data (no borrows), so a write
     /// cursor can persist it across `&mut RwTxn` calls and [`resume`]
-    /// (Self::resume) later without a re-descent. The `Vec`'s allocation
-    /// travels with the `SavedCursor`, so a park/resume round-trip allocates
-    /// nothing once the stack has reached tree depth.
+    /// (Self::resume) later without a re-descent. The inline [`PathStack`]
+    /// moves by value, so a park/resume round-trip never allocates.
     pub(crate) fn park(self) -> SavedCursor {
         SavedCursor {
             stack: self.stack,
@@ -998,7 +1105,7 @@ impl<'a> Cursor<'a> {
 /// parked from (see [`Cursor::resume`]).
 #[derive(Debug)]
 pub(crate) struct SavedCursor {
-    stack: Vec<(u64, usize)>,
+    stack: PathStack,
     initialized: bool,
     eof: bool,
 }
@@ -1068,6 +1175,30 @@ mod tests {
 
     const PS: u32 = 4096;
     const MAP: u64 = 1 << 20;
+
+    #[test]
+    fn path_stack_is_vec_shaped_and_rejects_overflow() {
+        // PERF-GAP A6 (#19): the inline stack must behave like the Vec it
+        // replaced and fail typed (never grow, never panic) past the
+        // CURSOR_STACK bound.
+        let mut s = PathStack::new();
+        assert!(s.last().is_none());
+        assert!(s.pop().is_none());
+        for i in 0..CURSOR_STACK as u64 {
+            s.push((i, i as usize)).expect("within capacity");
+        }
+        assert_eq!(s.len(), CURSOR_STACK);
+        assert!(
+            s.push((99, 0)).is_err(),
+            "frame {CURSOR_STACK} must fail typed, not grow"
+        );
+        assert_eq!(s.pop(), Some((CURSOR_STACK as u64 - 1, CURSOR_STACK - 1)));
+        s.last_mut().expect("nonempty").1 = 7;
+        assert_eq!(s.last(), Some(&(CURSOR_STACK as u64 - 2, 7)));
+        s.clear();
+        assert_eq!(s.len(), 0);
+        assert!(s.last().is_none());
+    }
 
     /// Build an env image from `entries` and return `(image, main_root, depth)`.
     fn build(entries: &[(Vec<u8>, Vec<u8>)]) -> (Vec<u8>, u64, u16) {

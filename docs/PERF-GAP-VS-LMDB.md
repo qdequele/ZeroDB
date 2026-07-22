@@ -119,11 +119,24 @@ parse. LMDB keeps a resolved `MDB_page*` per level (`mc_pg[CURSOR_STACK]`,
 mdb.c:1470). Extend the proven leaf-memo pattern per level. No unsafe.
 Effort: low. No tracking issue (this ledger is its home); profile-gated.
 
-### A6. Heap allocation per get / per cursor — issue [#19](https://github.com/qdequele/ZeroDB/issues/19)
-`Tree::get` builds a `Cursor` with a heap `Vec` stack per call
-(`btree.rs:180-182`). LMDB cursors live on the C stack. Fix: inline
-`[(u64, u16); MAX_DEPTH]` array (depth is bounded), or a reusable per-txn
-cursor. No unsafe. Effort: low.
+### A6. Heap allocation per get / per cursor — **DONE 2026-07-22** — issue [#19](https://github.com/qdequele/ZeroDB/issues/19)
+Was: `Tree::get` built a `Cursor` with a heap `Vec` stack per call — one
+malloc + free per get (the `grow_one` frame in the hannoy-build call tree;
+allocator traffic also contended across rayon workers). LMDB cursors live on
+the C stack.
+**Done:** `PathStack` — inline `[(u64, usize); 32]` + len (LMDB's
+`CURSOR_STACK` bound; SPEC 03 §4 "Path bound"), `Vec`-shaped API, overflow
+fails typed (`depth_exceeded`), park/resume moves it by value. Cursor
+construction is now allocation-free. **In the same batch** (all three named
+by the same profile): the descent now resolves each page's bytes **once**
+per level (`node_view` — was twice: type dispatch + view construction, each
+a dirty-store probe inside a write txn), `Tree::get` reuses the leaf view
+the search just cached (was a third resolution), and the rwtxn
+`search_path`/`rightmost_path` descents got the same single-resolution
+treatment. Referee numbers pending a quiet machine — the first post-batch
+hannoy run was discarded as contaminated (interactive load; 8–32 s tail
+samples on both sides); correctness gates all green (fmt/clippy/81 suites/
+miri/37,891-run differential fuzz 0 divergences/crash 212 cycles).
 
 ### A7. Custom-comparator vtable call per key comparison — issue [#14](https://github.com/qdequele/ZeroDB/issues/14)
 `KeyCmp::Custom(&dyn Comparator)` (`cmp.rs:160-172`) — indirect call per
@@ -223,6 +236,12 @@ reuse pool (`me_dpages`, mdb.c:1567, 2076-2118) — steady-state zero allocator
 traffic, ordered iteration for free.
 **Note:** the `Box` is load-bearing for TXN-41 frame-address stability; an
 arena/pool preserves that. No unsafe. Effort: medium.
+**Amendment 2026-07-22:** the *hash-cost* component of this entry (SipHash
+per probe, and two probes per descent level) was eliminated separately
+without touching the parked arena/TXN-41 design: issue #9 (splitmix64
+`PgnoHasher` on the frames map, the GC `reclaimed` set, and the check
+walker's maps) + the `node_view` single-resolution descent (see A6). The
+parked scope is now only the allocation/pooling redesign itself.
 
 ### B4. One `pwrite` syscall per dirty page at commit; no coalescing — **DONE 2026-07-21 (3c6a064); EBS validation PENDING**
 Was: `for pgno in sorted_pgnos { backing.write_at_page(...) }` — one syscall

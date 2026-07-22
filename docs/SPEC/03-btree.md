@@ -194,6 +194,13 @@ Each operation below states exact positioning and the empty-DB / EOF edges.
 `EOF=true` and yields `None` until repositioned. Ops map to SPEC 01 Table 5
 `MDB_cursor_op`s (slug in parentheses) and to SPEC 00 rows.
 
+**Path bound.** A cursor's root-to-leaf frame stack is inline with capacity
+**32** (LMDB's `CURSOR_STACK`). With the minimum branch fanout of 2, depth 32
+already addresses 2^31 leaf pages — beyond any representable env — so the
+bound is unreachable for a well-formed tree; a descent that would exceed it
+(a corrupt `depth` or a page cycle) fails with the same typed structural
+error as the per-descent iteration guard (INV-7), never unbounded growth.
+
 ### first (`MDB_FIRST`) — SPEC 00 r41/r43
 
 Descend taking child 0 at every branch level to the leftmost leaf; `ki[top]=0`.
