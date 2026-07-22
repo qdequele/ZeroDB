@@ -5,7 +5,8 @@ use std::fs::File;
 use std::path::Path;
 
 use zerodb::{
-    build_multi_db_image, check::check_image, NamedDbData, DATA_FILE_NAME, DEFAULT_FILL_PERMILLE,
+    check::check_image, EnvStream, PageSink, StreamBuildError, DATA_FILE_NAME,
+    DEFAULT_FILL_PERMILLE, FIRST_DATA_PGNO,
 };
 
 use crate::common::{collect_dump, open_ro, BoxErr};
@@ -173,28 +174,26 @@ pub fn cmd_load(dump_path: &Path, env_dir: &Path, psize: u32, map_size: u64) -> 
         }
     }
     named_owned.sort_by(|a, b| a.0.cmp(&b.0));
-    let named: Vec<NamedDbData<'_>> = named_owned
-        .iter()
-        .map(|(n, e)| NamedDbData {
-            name: n,
-            entries: e,
-        })
-        .collect();
 
-    // Build once at the requested map_size (txnid 1 = a fresh env's first
-    // state). If the packed image is larger than that map_size, rebuild with a
-    // map_size that comfortably covers the file so the loaded env re-opens.
-    let build =
-        |ms: u64| build_multi_db_image(psize, ms, 1, &main_user, &named, DEFAULT_FILL_PERMILLE);
-    let mut img = build(map_size)?;
-    let need = img.len() as u64;
+    // Stream the env straight into the data file (PERF-GAP C3 / issue #63):
+    // the old path materialized the whole env image in a second Vec
+    // (`build_multi_db_image`) before one `fs::write`. Page content is
+    // independent of `map_size` (only the meta pages record it), so if the
+    // streamed file outgrows the requested map_size, re-stream once with a
+    // map_size that comfortably covers it — the same retry the batch build
+    // did, minus the image buffer. Txnid 1 = a fresh env's first state.
+    let need = stream_env_to_file(&data, psize, map_size, &main_user, &named_owned)?;
     if need > map_size {
         let ms = round_up(need + need / 4, u64::from(psize));
-        img = build(ms)?;
+        stream_env_to_file(&data, psize, ms, &main_user, &named_owned)?;
     }
-    std::fs::write(&data, &img)?;
 
-    // Verify the produced image is structurally clean before returning.
+    // Verify the produced image is structurally clean before returning. Drop
+    // the parse buffers first so peak RAM is max(parse, check), not the sum.
+    drop(named_owned);
+    drop(main_user);
+    drop(text);
+    let img = std::fs::read(&data)?;
     let violations = check_image(&img, psize);
     if !violations.is_empty() {
         return Err(format!(
@@ -205,6 +204,73 @@ pub fn cmd_load(dump_path: &Path, env_dir: &Path, psize: u32, map_size: u64) -> 
         .into());
     }
     Ok(())
+}
+
+/// A [`PageSink`] over the load destination: one positioned write per page,
+/// no userspace buffering (mirrors `zerodb::copy`'s file sink; durability is
+/// the caller's concern, as with the batch `fs::write` this replaces).
+struct LoadSink {
+    file: File,
+    psize: u32,
+    next: u64,
+}
+
+impl PageSink for LoadSink {
+    fn alloc(&mut self, n: u64) -> u64 {
+        let p = self.next;
+        self.next += n;
+        p
+    }
+    fn next_pgno(&self) -> u64 {
+        self.next
+    }
+    fn emit(&mut self, pgno: u64, frame: &[u8]) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file.write_all_at(frame, pgno * u64::from(self.psize))
+    }
+}
+
+/// Stream `(main, named)` into a fresh env file at `data`, returning the
+/// resulting file size in bytes (`(last_pg + 1) * psize`). Truncates any
+/// previous content, so the oversized-map_size retry can simply re-run it.
+fn stream_env_to_file(
+    data: &Path,
+    psize: u32,
+    map_size: u64,
+    main_user: &[crate::common::Kv],
+    named: &[crate::common::NamedDb],
+) -> Result<u64, BoxErr> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(data)?;
+    let sink = LoadSink {
+        file,
+        psize,
+        next: FIRST_DATA_PGNO,
+    };
+    let stream_err = |e: StreamBuildError| -> BoxErr { format!("stream build: {e:?}").into() };
+    let mut es = EnvStream::new(sink, psize, 1, DEFAULT_FILL_PERMILLE)
+        .map_err(|e| -> BoxErr { format!("stream build: {e:?}").into() })?;
+    for (name, entries) in named {
+        es.named_db(name, |ts| {
+            for (k, v) in entries {
+                ts.push(k, 0, v)?;
+            }
+            Ok(())
+        })
+        .map_err(stream_err)?;
+    }
+    let sink = es
+        .finish_main(map_size, |ms| {
+            for (k, v) in main_user {
+                ms.push(k, v)?;
+            }
+            Ok(())
+        })
+        .map_err(stream_err)?;
+    Ok(sink.next_pgno() * u64::from(psize))
 }
 
 /// Refuse to create an env in `env_dir` if it already holds a non-empty data

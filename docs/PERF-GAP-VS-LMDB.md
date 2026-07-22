@@ -306,11 +306,16 @@ single `fs::write` could). Referee: `stream_builder_matches_batch_builder`
 (identical logical content INCLUDING followed catalogs, identical page
 economy — same page counts per kind, same depth; layout order legitimately
 differs) + the existing copy differentials/round-trips/tools acceptance.
-**Residual:** `zerodb-tools load` and `migrate-from-lmdb` still use the batch
-builder (fine at tool scale; wire them to a `FileSink` if 100 GB reloads
-become a workflow) — the load half of issue
-[#63](https://github.com/qdequele/ZeroDB/issues/63). Original analysis kept
-below.
+**Residual resolved 2026-07-22:** `zerodb-tools load` now streams straight
+into the data file (a tools-side `PageSink`; the whole-image `Vec` and its
+`fs::write` are gone — the load half of issue
+[#63](https://github.com/qdequele/ZeroDB/issues/63); #63 stays open for its
+double-buffered-writer idea). Two bounds remain by choice: the dump-text
+parse is still in-memory (input side), and the post-load invariant check
+reads the file back (same `fs::read` the `check` subcommand uses) — peak is
+now max(parse, check) instead of parse + image. Correction to the original
+note: `migrate-from-lmdb` never used the batch builder — it streams through
+batched write txns. Original analysis kept below.
 `collect_entries_flagged` copies **every key and value in the DB into owned
 `Vec`s** (`rotxn.rs:416-424`), then `build_multi_db_image` materializes **the
 entire output env image in a second `Vec<u8>`** (`builder.rs`). Peak ≈ live
@@ -331,9 +336,12 @@ pooling (B3, parked), or dirty-page **spilling** — LMDB's `mdb_page_spill`
 analogue, tracked as issue
 [#3](https://github.com/qdequele/ZeroDB/issues/3).
 
-### C3. Env-image builder for `load`/`migrate` (same as C1's second half)
-`build_single/multi_db_image` return the whole file as `Vec<u8>` — fine for
-tests, wrong for tools at scale. Covered by the C1 streaming fix.
+### C3. Env-image builder for `load`/`migrate` (same as C1's second half) — **DONE 2026-07-22**
+Was: `build_single/multi_db_image` return the whole file as `Vec<u8>` — fine
+for tests, wrong for tools at scale.
+**Done:** `load` streams (see the C1 residual note above); `migrate` never
+had the problem (batched write txns). The batch `build_*_image` wrappers
+remain for tests and the stream-vs-batch differential referee.
 
 ## D. Deliberate — keep, do not "optimize"
 

@@ -29,8 +29,9 @@ zerodb-tools <SUBCOMMAND> [ARGS]
   engines and page sizes. Writes to stdout unless `--out` is given.
 
 - **`load <dump-file> <env-dir> [--page-size N] [--map-size BYTES]`** — rebuild
-  a **fresh** env from a dump using the bulk builder (bottom-up packed).
-  Refuses a non-empty target.
+  a **fresh** env from a dump using the **streaming** bulk builder
+  (bottom-up packed, O(tree depth × page size) build memory; the dump-text
+  parse itself is still in-memory). Refuses a non-empty target.
 
 - **`check <env-dir>`** — run the invariant walker (SPEC 03 §11 / SPEC 05 §9)
   over the data file and report; exits non-zero on any violation. Tolerant of
