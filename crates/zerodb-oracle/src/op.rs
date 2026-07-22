@@ -22,8 +22,13 @@
 //!   `nth` entry, mutates, and finishes — all within one `apply` call.
 //!
 //! Databases are addressed by a small `u8` index taken modulo the number of
-//! open databases at apply time, so ops are almost always "valid" against a
-//! non-empty engine.
+//! **tracked** databases at apply time, so ops are almost always "valid"
+//! against a non-empty engine. Since M2.9 (ADR-0013, D-013) the tracked set
+//! includes **dead** handles — a handle whose creating txn aborted, or whose
+//! database was `DropDb`'d — kept addressable until the next executed
+//! `CreateDb` purges them: an op resolving to one drives a real
+//! use-after-close against both engines, which must refuse it identically
+//! (`OracleError::BadDbi`; LMDB `EINVAL`, ZeroDB TXN-68 `BadDbi`).
 
 use arbitrary::{Arbitrary, Unstructured};
 

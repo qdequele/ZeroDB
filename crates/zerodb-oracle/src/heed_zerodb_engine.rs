@@ -46,18 +46,23 @@ struct DbEntry {
     /// transaction until the transaction is successfully committed. If the
     /// transaction is aborted the handle will be closed automatically."
     /// `mdb.c`'s `mdb_dbis_update(txn, keep=0)` implements that close on the
-    /// abort path. So a handle whose creating txn aborted is DEAD, and using it
-    /// afterwards is an API-contract violation that LMDB reports as `EINVAL`
-    /// from the `TXN_DBI_EXIST` gate in `mdb_cursor_open` / `mdb_put`.
-    ///
-    /// This flag replaces the old positional `committed_dbs` watermark, which
-    /// was only correct while entries were append-only: `drop_db`'s
-    /// `dbs.remove(idx)` removes from the middle, after which
-    /// `truncate(committed_dbs)` retained the WRONG set — keeping an
-    /// uncommitted (dead) handle while discarding a committed one. That made
-    /// the harness drive both engines through a use-after-close and report the
-    /// resulting LMDB `EINVAL` as an engine divergence.
+    /// abort path; a dead handle then fails the `TXN_DBI_EXIST` gate with
+    /// `EINVAL`. (Replaces the old positional `committed_dbs` watermark,
+    /// which `drop_db`'s middle-removal broke — the 2026-07-20 harness fix.)
     committed: bool,
+    /// Whether the handle is still open. **Dead handles are kept in the vec
+    /// and stay addressable** (M2.9 / ADR-0013): resolving a `db` index to a
+    /// dead entry issues the op against the stale handle on BOTH engines,
+    /// which is now a differential state — LMDB answers `EINVAL` from
+    /// `TXN_DBI_EXIST`, ZeroDB `BadDbi` from the TXN-68 generation gate, and
+    /// both normalize to `OracleError::BadDbi`. Death events: end of the
+    /// creating txn without commit, and a successful `DropDb`. Dead entries
+    /// are purged at the next executed `CreateDb` (see `create_db`) so the
+    /// harness never drives a stale handle after LMDB may have *reused* its
+    /// freed dbi slot for a new name — the resurrection corner ZeroDB
+    /// deliberately does not replicate (D-009 hazard class; DIVERGENCES
+    /// D-015 PROPOSED).
+    alive: bool,
 }
 
 /// The currently-open transaction, if any.
@@ -139,26 +144,35 @@ impl HeedZerodbEngine {
         }
     }
 
-    /// Mark every open handle as surviving the txn boundary: a successful
+    /// Mark every live handle as surviving the txn boundary: a successful
     /// commit "exports" the dbis opened in this txn into the shared env
     /// (`mdb_dbis_update(txn, keep=1)`), after which they stay valid.
     fn mark_dbs_committed(&mut self) {
         for e in &mut self.dbs {
-            e.committed = true;
+            if e.alive {
+                e.committed = true;
+            }
         }
     }
 
-    /// Drop the handles LMDB closes when a write txn ends without committing
-    /// (`mdb_dbis_update(txn, keep=0)`): exactly those opened in that txn.
-    /// Committed handles survive. Keeping a dead handle here would make the
-    /// harness issue a use-after-close, which LMDB rejects with `EINVAL` while
-    /// ZeroDB — whose handles are plain values, not env-level dbi slots —
-    /// happily serves it. That is a harness defect, not an engine divergence.
+    /// Mark dead the handles LMDB closes when a write txn ends without
+    /// committing (`mdb_dbis_update(txn, keep=0)`): exactly those opened in
+    /// that txn. Committed handles survive. Since M2.9 (ADR-0013) the dead
+    /// entries are KEPT: a later op resolving to one is a real differential
+    /// stale-handle use, which both engines must refuse identically
+    /// (`OracleError::BadDbi`).
     fn close_dbs_opened_in_aborted_txn(&mut self) {
-        self.dbs.retain(|e| e.committed);
+        for e in &mut self.dbs {
+            if e.alive && !e.committed {
+                e.alive = false;
+            }
+        }
     }
 
-    /// Resolve a db index (modulo the number of open dbs) to a handle.
+    /// Resolve a db index (modulo the number of TRACKED dbs, dead included —
+    /// M2.9) to a handle. A dead entry's stale handle is returned on purpose:
+    /// issuing the op against it is the differential use-after-close state
+    /// both engines must refuse identically (`OracleError::BadDbi`).
     fn db_at(&self, db: u8) -> Result<Db, OpResult> {
         if self.dbs.is_empty() {
             return Err(OpResult::Skipped(Skip::NoDb));
@@ -247,8 +261,16 @@ fn to_oracle(e: heed_zerodb::Error) -> OracleError {
             heed_zerodb::MdbError::MapFull => OracleError::MapFull,
             heed_zerodb::MdbError::BadValSize => OracleError::BadValSize,
             heed_zerodb::MdbError::Invalid => OracleError::Invalid,
+            // Defensive namesake mapping; the adapter's boundary re-imposes
+            // the fork's `Io(EINVAL)` shape, matched below.
+            heed_zerodb::MdbError::BadDbi => OracleError::BadDbi,
             other => OracleError::Other(format!("mdb:{other:?}")),
         },
+        // The adapter maps zerodb's `BadDbi` to the fork's exact observable —
+        // raw `EINVAL` (M2.9, ADR-0013); normalize like the LMDB engine.
+        heed_zerodb::Error::Io(io) if io.kind() == std::io::ErrorKind::InvalidInput => {
+            OracleError::BadDbi
+        }
         heed_zerodb::Error::Io(io) => OracleError::Other(format!("io:{}", io.kind())),
         heed_zerodb::Error::Encoding(_) => OracleError::Other("encoding".into()),
         heed_zerodb::Error::Decoding(_) => OracleError::Other("decoding".into()),
@@ -565,6 +587,14 @@ impl HeedZerodbEngine {
     }
 
     fn create_db(&mut self, name: &DbName) -> OpResult {
+        // M2.9 (ADR-0013): purge dead entries BEFORE opening/creating. LMDB
+        // frees a closed handle's dbi slot and `mdb_dbi_open` may REUSE it for
+        // this (or a later) name, silently resurrecting a stale handle —
+        // ZeroDB's append-only generation registry deliberately refuses that
+        // (D-009 hazard class; DIVERGENCES D-015 PROPOSED). Purging here keeps
+        // stale handles addressable only in the window where both engines
+        // agree they are dead: between the close event and the next create.
+        self.dbs.retain(|e| e.alive);
         let name = name.resolve();
         // Reuse an already-open handle for this name.
         if self.dbs.iter().any(|e| e.name == name) {
@@ -592,6 +622,7 @@ impl HeedZerodbEngine {
                     name,
                     db,
                     committed: false,
+                    alive: true,
                 });
                 OpResult::Ok
             }
@@ -626,17 +657,19 @@ impl HeedZerodbEngine {
             Ok(w) => w,
             Err(r) => return r,
         };
-        // SAFETY: `remove` invalidates the dbi for any other handle to the same
-        // database; this engine keeps exactly one handle per catalog entry, and
-        // we drop that entry immediately below, so no stale handle survives.
+        // SAFETY: `remove` invalidates the dbi for any other handle to the
+        // same database; this engine keeps exactly one handle per catalog
+        // entry. The entry is marked dead below and only ever used again as a
+        // deliberate stale-handle probe (M2.9), which the adapter refuses at
+        // the TXN-68 generation gate before touching any state.
         let res = unsafe { handle.remove(wtxn) };
         match res {
             Ok(()) => {
-                // `mdb_drop(.., del=1)` closes the dbi at ENV level
-                // (mdb.c `mdb_dbi_close`), and that close is NOT undone by a
-                // later abort — the entry is gone for good, never restored on
-                // rollback.
-                self.dbs.remove(idx);
+                // `mdb_drop(.., del=1)` closes the dbi at ENV level (zerodb:
+                // the TXN-68 generation bump), NOT undone by a later abort.
+                // The entry is KEPT, dead (M2.9): later uses are differential
+                // stale-handle probes.
+                self.dbs[idx].alive = false;
                 OpResult::Ok
             }
             Err(e) => err(e),

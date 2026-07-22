@@ -21,6 +21,17 @@ pub enum OracleError {
     /// `MDB_INVALID` (not a valid DB file).
     #[error("invalid")]
     Invalid,
+    /// A stale dbi handle (M2.9 / ADR-0013, D-013): the handle's creating txn
+    /// aborted, or `drop_db(delete=true)` closed it. The fork reports every
+    /// such use as raw `EINVAL` (`Io(InvalidInput)` through heed — probed
+    /// 2026-07-22, uniform across op classes); ZeroDB reports
+    /// `MdbError::BadDbi` natively and the fork's `Io(InvalidInput)` through
+    /// the `heed-zerodb` adapter. All three normalize here. The mapping is
+    /// kind-based on the Io side (`InvalidInput` → `BadDbi`), which is
+    /// deliberately symmetric: within the modeled op surface the dbi gate is
+    /// the only `EINVAL` producer on both engines.
+    #[error("bad-dbi")]
+    BadDbi,
     /// Any other error, rendered stably so both engines can agree on the text.
     #[error("other: {0}")]
     Other(String),

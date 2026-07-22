@@ -126,7 +126,10 @@ snapshot references.
      meta page.** The reader `Arc`-clones the current published snapshot (TXN-18)
      — an immutable `(txnid, roots)` value — and takes its `main_db`/`free_db`
      roots (named-DB roots resolve lazily on first `open_database`, also from this
-     object's catalog view). It **must not** re-read a meta *page* after open: the
+     object's catalog view; that lazy resolution is the txn's **bind** of the
+     dbi and carries the TXN-68 handle-generation gate — a stale `Database`
+     handle is refused with `BadDbi` in a read txn too, and the generation
+     observed at the bind is authoritative for the txn's whole life). It **must not** re-read a meta *page* after open: the
      meta slot the pinned txnid lived in can be overwritten by a later commit
      (`t & 1` is rewritten by commit `t+2`, TXN-63), so reading the durable meta
      page here would race. The `Arc` keeps the `(txnid, roots)` alive for the
@@ -725,7 +728,8 @@ dirty-page store must be built so it is.
   SPEC 00 row 28): drop the dirty set and freed-page list, discard the working
   `DBRecord`s, make **no** disk change (the live meta is untouched), release the
   write mutex. txnid is not consumed on disk (TXN-2). Named-DB creates performed
-  in the txn vanish (SPEC 00 row 62 "create-in-txn-then-abort"; M1.6).
+  in the txn vanish (SPEC 00 row 62 "create-in-txn-then-abort"; M1.6), and the
+  handles to them are **closed** (TXN-68).
 - **TXN-60** — A panic while a `RwTxn` is live is an implicit abort (the guard's
   `Drop` releases the mutex and drops the dirty set); the env's durable state is
   the last committed meta. If a commit-pipeline fsync failed, the env is poisoned
@@ -741,6 +745,66 @@ dirty-page store must be built so it is.
 | allocation exceeds map_size | `MdbError::MapFull` | SPEC 02 §8, SPEC 05 GC-17 |
 | nested write txn attempt | unsupported (D-003) | TXN-40 |
 | fsync failed (poisoned) | `Error::Io` / poisoned | SPEC 06 REC-13 |
+| stale dbi handle | `MdbError::BadDbi` → heed `Io(EINVAL)` (fork observable, probed) | TXN-68 |
+
+### §8.2 — dbi-handle lifetime (M2.9; ADR-0013, closes D-013)
+
+- **TXN-68** — A named-DB `Database` handle captures its env dbi slot's
+  **generation** at `open_database`/`create_database` and is refused with
+  `MdbError::BadDbi` once the slot's generation has moved past it. Exactly two
+  events bump a generation, mirroring LMDB's two `mdb_dbi_close` paths:
+  1. **End-without-commit of an opening txn** (the `DB_NEW` analog,
+     `mdb_dbis_update(txn, keep=0)`): each registry slot carries an
+     **exported** flag (the `me_dbflags[i] & MDB_VALID` analog; `false` for a
+     fresh slot). A `create_database` in a write txn W against a
+     **not-exported** slot makes W the slot's *opener* — whether the catalog
+     entry is being created or already exists on disk (e.g. the first open
+     after an env reopen: LMDB sets `DB_NEW` for every newly-allocated slot).
+     If W ends by any non-commit path — explicit abort (TXN-59), plain drop,
+     panic unwind (TXN-60), or a failed commit — the dbis it opened are
+     bumped (and stay unexported). A successful commit **exports** them
+     (`keep=1`): no bump, and later opens of an exported slot are not
+     openers, so later aborts never invalidate. Every bump also un-exports
+     (LMDB frees the slot), so the next open is `DB_NEW` again.
+     *Residual (D-016, PROPOSED):* handles minted through the generic
+     `open_database` (including read-txn opens) are not tracked as openers —
+     such a handle for an unexported slot survives its txn's end, where LMDB
+     would close it; unobservable for consumers that open through committed
+     txns (all pinned consumers do; heed's `RoTxn::commit` exists precisely
+     for this).
+  2. **`drop_db(delete=true)`** (`mdb_drop(_,1)` → `mdb_dbi_close`): bumped
+     **immediately at call time**, on success, env-wide. A later abort of that
+     same txn does **not** resurrect the handle — the DB's *data* comes back
+     with the rollback, the handle stays dead; a fresh
+     `open_database`/`create_database` yields a new valid handle.
+     `clear`/`drop_db(delete=false)` never invalidates. The main/unnamed
+     handle is never invalidated (LMDB `MAIN_DBI` is a core dbi).
+  **Where enforced:** at every operation's **per-txn bind** of the handle
+  (ADR-0013 Q2) — `RwTxn::ensure_open` and the write-cursor's positioning
+  step on the write path, the memoized named-record bind on the `RoTxn` path,
+  delegate-through-parent on nested readers — plus at the drop/clear sites
+  themselves (a stale handle cannot drop or clear the re-created DB). A txn
+  compares against the generation observed at **its own first bind** of the
+  dbi and does not re-observe later bumps mid-txn (LMDB parity: `mt_dbflags`
+  is a txn-local copy). Bind vs. concurrent bump linearizes under the
+  registry lock (ADR-0013 Q3): the bind either sees the bump (refused) or
+  completed before it (legal use of a then-valid handle). The refusal is
+  **non-poisoning** (probed fork behavior: the `EINVAL` from `TXN_DBI_EXIST`
+  leaves the txn usable and committable). Constructor split: the **native
+  engine's** read-side iterator constructors are infallible by signature and
+  defer the `BadDbi` to the first `next()`; the **`heed-zerodb` adapter's**
+  iterator/range/prefix constructors are `Result`-returning (heed shape) and
+  validate **eagerly at construction** via `Database::validate`, so through
+  the adapter the observable is error-at-open — identical to the fork, whose
+  `mdb_cursor_open` fails the `TXN_DBI_EXIST` gate before a cursor exists.
+  Any other native caller needing error-at-open pre-checks the same way.
+  **State scope:** generations are per-process, in-memory registry state (the
+  `me_dbiseqs` analog) with **no on-disk representation** and no crash-safety
+  interaction — a process death discards every handle with the registry, and
+  a fresh process mints fresh handles. Unlike LMDB, a closed slot's dbi
+  number is never re-issued to a different name (append-only registry), so
+  LMDB's slot-reuse resurrection of stale handles (D-009 hazard class) is
+  unrepresentable; ZeroDB keeps such handles dead (D-015, PROPOSED).
 
 ---
 
@@ -846,8 +910,9 @@ every hook; this section defines the steps and their ordering. Both write modes
 | env clone/close/registry | TXN-50..55 | SPEC 00 rows 23–26 |
 | commit pipeline | TXN-61..64 | SPEC 06 REC-1..12 |
 | PREV_SNAPSHOT | TXN-65..67 | SPEC 01 §S5, SPEC 02 §3.2, SPEC 06 REC-5 |
+| dbi handle lifetime | TXN-68 (+ the TXN-10 step-3 bind gate) | ADR-0013; D-013 resolved, D-015 proposed; SPEC 02 §6; oracle `dbi_handle_lifetime.rs`, native `zerodb/tests/dbi_handle_lifetime_native.rs` |
 
-**Rule count: TXN-1 … TXN-67 (67 normative rules; §4.4 adds sub-rule TXN-18a for
+**Rule count: TXN-1 … TXN-68 (68 normative rules; §4.4 adds sub-rule TXN-18a for
 slot release).** TXN-40 (nested write unsupported, D-003) is referenced from
 §5/§8 and defined here:
 

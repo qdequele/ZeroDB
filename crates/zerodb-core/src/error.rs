@@ -88,6 +88,22 @@ pub enum MdbError {
     /// parity; SPEC 04 TXN-59 clean-abort guarantee).
     #[error("transaction must abort")]
     BadTxn,
+
+    /// `MDB_BAD_DBI` analog — a stale [`Database`](crate::rotxn::Database)
+    /// handle: the dbi it captured was **closed** after the handle was
+    /// obtained, either because the write txn that created the named DB ended
+    /// without committing (SPEC 04 TXN-59/60), or because
+    /// `Database::drop_db` (`mdb_drop(_, 1)`) closed it env-wide at call time
+    /// (SPEC 04 TXN-68; ADR-0013, D-013). Unlike `BadTxn` this does **not**
+    /// poison the transaction — the op is refused, the txn stays usable
+    /// (probed fork behavior: the `EINVAL` from `TXN_DBI_EXIST` leaves the
+    /// txn committable). The vendored fork reports this state as raw `EINVAL`
+    /// on every op class (probed 2026-07-22), which heed surfaces as
+    /// `Io(InvalidInput)`; the `heed-zerodb` adapter maps this variant to
+    /// exactly that observable. `Debug` renders as `BadDbi`, matching
+    /// `heed::MdbError::BadDbi`'s name for native diagnostics.
+    #[error("the specified DBI handle was closed or changed unexpectedly")]
+    BadDbi,
 }
 
 /// A convenience result alias for engine operations.

@@ -65,6 +65,19 @@ impl From<zerodb::Error> for Error {
     fn from(e: zerodb::Error) -> Error {
         match e {
             zerodb::Error::Io(io) => Error::Io(io),
+            // Stale dbi handle (SPEC 04 TXN-68; ADR-0013, D-013): the fork
+            // reports every stale-handle use as raw `EINVAL` from the
+            // `TXN_DBI_EXIST` gate — NOT as `MDB_BAD_DBI` — uniformly across
+            // op classes (get / put / del / clear / drop / stat / len /
+            // first / cursor-open RO+RW / iter_mut; probed against heed
+            // =0.22.1 on 2026-07-22, all three invalidation scenarios), which
+            // heed surfaces as `Error::Io(kind=InvalidInput, raw_os=EINVAL)`.
+            // Replicate that exact observable at the boundary (the M1.13
+            // split: engine keeps the precise `BadDbi`, adapter re-imposes
+            // the fork's shape).
+            zerodb::Error::Mdb(zerodb::MdbError::BadDbi) => {
+                Error::Io(io::Error::from_raw_os_error(libc::EINVAL))
+            }
             zerodb::Error::Mdb(m) => Error::Mdb(m.into()),
             zerodb::Error::EnvAlreadyOpened => Error::EnvAlreadyOpened,
             // `zerodb::Error` is #[non_exhaustive]; a future variant maps to the
@@ -187,6 +200,11 @@ impl From<zerodb::MdbError> for MdbError {
             zerodb::MdbError::Incompatible => MdbError::Incompatible,
             zerodb::MdbError::ReadersFull => MdbError::ReadersFull,
             zerodb::MdbError::BadTxn => MdbError::BadTxn,
+            // Namesake mapping for direct converters. NOTE: every adapter
+            // path converts through `From<zerodb::Error>` above, which
+            // intercepts `BadDbi` first and re-imposes the fork's observable
+            // (`Io(EINVAL)`, not `Mdb(BadDbi)`) — see the comment there.
+            zerodb::MdbError::BadDbi => MdbError::BadDbi,
             // `zerodb::MdbError` is #[non_exhaustive]; map a future code to the
             // generic `Problem` until it earns a dedicated peer.
             _ => MdbError::Problem,

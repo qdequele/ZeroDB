@@ -77,6 +77,21 @@ pub trait TxnRead {
     fn validated_pages(&self) -> Option<&ValidatedPages> {
         None
     }
+    /// Validate `db` against this txn's view of the env dbi registry (SPEC 04
+    /// TXN-10 gate / TXN-68; ADR-0013, D-013). The main/unnamed handle is
+    /// always valid (LMDB's `MAIN_DBI`); a named handle is valid iff the
+    /// generation it captured at `open_database`/`create_database` matches
+    /// the registry slot's generation **as of this txn's first bind of the
+    /// dbi** (the per-txn-bind granularity of ADR-0013 Q2 — LMDB likewise
+    /// snapshots dbi validity into the txn at bind and does not re-observe
+    /// later env-level changes mid-txn).
+    ///
+    /// # Errors
+    ///
+    /// [`MdbError::BadDbi`] for a stale handle: the creating write txn ended
+    /// without committing (TXN-59/60), or `drop_db(delete=true)` closed the
+    /// dbi (TXN-68). The error does **not** poison the transaction.
+    fn validate_db(&self, db: &Database) -> Result<()>;
 }
 
 /// Which database a [`Database`] handle addresses (SPEC 02 §6). `Copy` so the
@@ -147,7 +162,9 @@ pub struct RoTxn<'env> {
     snap: Arc<Snapshot>,
     /// The owned reader-table slot (claimed in `EnvInner::pin_reader`).
     slot: u32,
-    /// Per-txn memo of resolved named-DB records, keyed by dbi.
+    /// Per-txn memo of named-DB **binds**, keyed by dbi: the registry
+    /// generation observed at first bind (SPEC 04 TXN-10 gate, ADR-0013) and
+    /// the resolved record.
     ///
     /// Without it every read op on a named DB re-did the registry lock + name
     /// clone + a full catalog descent (`resolve_named_record`) — roughly
@@ -156,11 +173,13 @@ pub struct RoTxn<'env> {
     /// Soundness: this txn pins an immutable [`Snapshot`] (its catalog cannot
     /// change while pinned, TXN-18/20) and the dbi→name registry is
     /// append-only for the process (M1.6), so a (dbi → record) resolution is
-    /// constant for the txn's life. A linear `Vec` scan beats a map: the set
-    /// is bounded by `max_dbs` and typically small. `Mutex` (not `RefCell`)
-    /// keeps `RoTxn` auto-`Sync`; the lock is uncontended and held only for
-    /// the lookup/insert.
-    named_memo: Mutex<Vec<(u32, DBRecord)>>,
+    /// constant for the txn's life; memoizing the bind generation is exactly
+    /// the per-txn-bind granularity of ADR-0013 Q2 (LMDB, too, snapshots dbi
+    /// validity into the txn and does not re-observe later bumps mid-txn). A
+    /// linear `Vec` scan beats a map: the set is bounded by `max_dbs` and
+    /// typically small. `Mutex` (not `RefCell`) keeps `RoTxn` auto-`Sync`;
+    /// the lock is uncontended and held only for the lookup/insert.
+    named_memo: Mutex<Vec<(u32, u64, DBRecord)>>,
     /// Pages fully validated this txn (PERF-GAP A2; see
     /// [`ValidatedPages`]). Sound here because every page this snapshot can
     /// reach is immutable while its reader slot is held (TXN-20/21).
@@ -200,6 +219,28 @@ impl RoTxn<'_> {
             EnvHandle::Owned(e) => e,
         }
     }
+
+    /// Bind `dbi` in this txn (idempotent, memoized): resolve its record from
+    /// the pinned catalog and capture the registry generation observed at the
+    /// bind (SPEC 04 TXN-10 gate; ADR-0013). Returns `(bind_generation,
+    /// record)`. One registry lock on the cold path only; memo hits touch no
+    /// env state.
+    fn bind_named(&self, dbi: u32) -> (u64, DBRecord) {
+        let mut memo = self.named_memo.lock().expect("named memo poisoned");
+        if let Some(&(_, generation, rec)) = memo.iter().find(|&&(d, _, _)| d == dbi) {
+            return (generation, rec);
+        }
+        let (generation, rec) = match self.env_ref().inner().named_slot(dbi) {
+            Some((name, generation)) => {
+                let rec =
+                    resolve_named_record(self.source(), self.psize, &self.snap.main_db, &name);
+                (generation, rec)
+            }
+            None => (0, DBRecord::empty()),
+        };
+        memo.push((dbi, generation, rec));
+        (generation, rec)
+    }
 }
 
 impl Drop for RoTxn<'_> {
@@ -237,22 +278,7 @@ impl TxnRead for RoTxn<'_> {
     fn record_for(&self, sel: DbSel) -> DBRecord {
         match sel {
             DbSel::Main => self.snap.main_db,
-            DbSel::Named(dbi) => {
-                // Memo hit: the resolution is constant for this txn's life
-                // (see the `named_memo` field docs).
-                let mut memo = self.named_memo.lock().expect("named memo poisoned");
-                if let Some(&(_, rec)) = memo.iter().find(|&&(d, _)| d == dbi) {
-                    return rec;
-                }
-                let rec = match self.env_ref().inner().named_name(dbi) {
-                    Some(name) => {
-                        resolve_named_record(self.source(), self.psize, &self.snap.main_db, &name)
-                    }
-                    None => DBRecord::empty(),
-                };
-                memo.push((dbi, rec));
-                rec
-            }
+            DbSel::Named(dbi) => self.bind_named(dbi).1,
         }
     }
     fn comparator_for(&self, sel: DbSel) -> KeyCmp<'_> {
@@ -260,6 +286,21 @@ impl TxnRead for RoTxn<'_> {
     }
     fn validated_pages(&self) -> Option<&ValidatedPages> {
         Some(&self.validated)
+    }
+    fn validate_db(&self, db: &Database) -> Result<()> {
+        match db.sel() {
+            DbSel::Main => Ok(()),
+            DbSel::Named(dbi) => {
+                // Per-txn bind (ADR-0013 Q2): the generation captured at this
+                // txn's first bind of the dbi is authoritative for the txn's
+                // whole life; the handle must match it.
+                if self.bind_named(dbi).0 == db.generation() {
+                    Ok(())
+                } else {
+                    Err(Error::Mdb(MdbError::BadDbi))
+                }
+            }
+        }
     }
 }
 
@@ -310,10 +351,14 @@ impl Env {
     }
 
     /// A handle to the main (unnamed) database (SPEC 00 row 10, `None` name).
-    /// Always present — it is the meta's `main_db`.
+    /// Always present — it is the meta's `main_db` — and **never invalidated**
+    /// (LMDB's `MAIN_DBI` is a core dbi that is always valid; SPEC 04 TXN-68).
     #[must_use]
     pub fn main_database(&self) -> Database {
-        Database { sel: DbSel::Main }
+        Database {
+            sel: DbSel::Main,
+            generation: 0,
+        }
     }
 
     /// `open_database(txn, name)` (SPEC 00 rows 10/12, `mdb_dbi_open` without
@@ -346,12 +391,27 @@ impl Env {
         let tree = Tree::new(txn.source(), txn.page_size(), main.root, main.depth);
         match tree.get_catalog_entry(name).map_err(map_page_err)? {
             Some((flags, _val)) if flags & F_SUBDATA != 0 => {
-                let dbi = self
+                // The handle captures the slot's current generation
+                // (ADR-0013): a fresh open after an invalidation yields a
+                // fresh, valid handle — only outstanding older handles die.
+                //
+                // The `db_new` fact is deliberately IGNORED here (documented
+                // residual, DIVERGENCES D-016 PROPOSED): `open_database` is
+                // generic over any readable txn and tracks no opener, so a
+                // handle minted through it for an UNexported slot survives
+                // the txn's end, where LMDB's `DB_NEW` would close it (LMDB
+                // closes dbis opened in an aborted READ txn too, and heed's
+                // `RoTxn::commit` exists precisely to export them). Every
+                // pinned consumer opens through committed txns, so the
+                // leniency is unobservable in the suites; `create_database`
+                // (the write-txn open) does track TXN-68 openers.
+                let (dbi, generation, _db_new) = self
                     .inner()
                     .named_dbi_assign(name)
                     .ok_or(Error::Mdb(MdbError::DbsFull))?;
                 Ok(Some(Database {
                     sel: DbSel::Named(dbi),
+                    generation,
                 }))
             }
             // Present but a plain user key (no F_SUBDATA): a name collision.
@@ -508,7 +568,7 @@ pub fn for_each_entry_flagged<T: TxnRead>(
 ///
 /// [`MdbError::Invalid`] on a structurally-corrupt main tree.
 pub fn named_databases<T: TxnRead>(txn: &T) -> Result<Vec<Vec<u8>>> {
-    let main = Database::from_sel(DbSel::Main);
+    let main = Database::from_parts(DbSel::Main, 0);
     Ok(collect_entries_flagged(&main, txn)?
         .into_iter()
         .filter(|(_, flags, _)| flags & F_SUBDATA != 0)
@@ -521,6 +581,18 @@ pub fn named_databases<T: TxnRead>(txn: &T) -> Result<Vec<Vec<u8>>> {
 /// from the catalog for named DBs, SPEC 04 TXN-10). `Copy`, like
 /// `heed::Database`.
 ///
+/// **Handle lifetime (SPEC 04 TXN-68; ADR-0013, D-013).** A named handle
+/// captures the env dbi slot's *generation* at `open_database`/
+/// `create_database` and dies exactly when LMDB would close the dbi: when the
+/// write txn that **created** the named DB ends without committing
+/// (TXN-59/60), or immediately when [`Database::drop_db`] deletes it (not
+/// undone by a later abort — the *data* comes back, the handle stays dead).
+/// Using a dead handle fails with [`MdbError::BadDbi`] at the per-txn bind of
+/// every operation, in read **and** write txns (the dbi table is env-level).
+/// `clear` / a committed create never invalidate; a fresh
+/// `open_database`/`create_database` after an invalidation returns a new,
+/// valid handle. The main/unnamed handle is never invalidated.
+///
 /// **Key-size validation is intentionally lenient on the read side.** Read
 /// methods are pure tree searches: an empty or oversized key is not rejected,
 /// it simply matches nothing. LMDB's heed-observed read-key error taxonomy
@@ -532,6 +604,9 @@ pub fn named_databases<T: TxnRead>(txn: &T) -> Result<Vec<Vec<u8>>> {
 #[derive(Debug, Clone, Copy)]
 pub struct Database {
     sel: DbSel,
+    /// The dbi-slot generation captured when this handle was obtained
+    /// (ADR-0013); `0` and never checked for the main DB.
+    generation: u64,
 }
 
 /// Per-database statistics (`Database::stat`, SPEC 00 row 49; `mdb_stat`).
@@ -560,14 +635,35 @@ pub(crate) fn tree_of<T: TxnRead + ?Sized>(txn: &T) -> Tree<'_> {
 }
 
 impl Database {
-    /// Construct a handle from a raw selector (used by the write path).
-    pub(crate) fn from_sel(sel: DbSel) -> Database {
-        Database { sel }
+    /// Construct a handle from a raw selector and its captured dbi-slot
+    /// generation (used by the write path; pass `0` for [`DbSel::Main`],
+    /// whose generation is never checked).
+    pub(crate) fn from_parts(sel: DbSel, generation: u64) -> Database {
+        Database { sel, generation }
     }
 
     /// This handle's selector (used by the write path to pick the target tree).
     pub(crate) fn sel(&self) -> DbSel {
         self.sel
+    }
+
+    /// The dbi-slot generation this handle captured (ADR-0013; meaningless
+    /// for the main DB).
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Validate this handle against `txn`'s view of the env dbi registry
+    /// (SPEC 04 TXN-10 gate / TXN-68) — a convenience forwarding to
+    /// [`TxnRead::validate_db`], for callers (like the `heed-zerodb`
+    /// adapter's iterator constructors) that must surface a stale handle at
+    /// call time rather than at first iteration.
+    ///
+    /// # Errors
+    ///
+    /// [`MdbError::BadDbi`] for a stale handle (see the type-level docs).
+    pub fn validate<T: TxnRead>(&self, txn: &T) -> Result<()> {
+        txn.validate_db(self)
     }
 
     pub(crate) fn tree<'txn, T: TxnRead + ?Sized>(&self, txn: &'txn T) -> Tree<'txn> {
@@ -592,6 +688,7 @@ impl Database {
     ///
     /// Infallible; returns [`Result`] for API shape and future fallibility.
     pub fn stat<T: TxnRead>(&self, txn: &T) -> Result<DatabaseStat> {
+        txn.validate_db(self)?;
         let rec = txn.record_for(self.sel);
         Ok(DatabaseStat {
             depth: rec.depth,
@@ -609,6 +706,7 @@ impl Database {
     ///
     /// [`MdbError::Invalid`] only on a structurally-corrupt tree.
     pub fn get<'txn, T: TxnRead>(&self, txn: &'txn T, key: &[u8]) -> Result<Option<&'txn [u8]>> {
+        txn.validate_db(self)?;
         self.tree(txn).get(key).map_err(map_page_err)
     }
 
@@ -619,6 +717,7 @@ impl Database {
     ///
     /// Infallible; returns [`Result`] for API shape.
     pub fn len<T: TxnRead>(&self, txn: &T) -> Result<u64> {
+        txn.validate_db(self)?;
         Ok(txn.record_for(self.sel).entries)
     }
 
@@ -628,6 +727,7 @@ impl Database {
     ///
     /// Infallible; returns [`Result`] for API shape.
     pub fn is_empty<T: TxnRead>(&self, txn: &T) -> Result<bool> {
+        txn.validate_db(self)?;
         Ok(txn.record_for(self.sel).entries == 0)
     }
 
@@ -640,6 +740,7 @@ impl Database {
         &self,
         txn: &'txn T,
     ) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
+        txn.validate_db(self)?;
         self.tree(txn).cursor().first().map_err(map_page_err)
     }
 
@@ -649,6 +750,7 @@ impl Database {
     ///
     /// [`MdbError::Invalid`] on a corrupt tree.
     pub fn last<'txn, T: TxnRead>(&self, txn: &'txn T) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
+        txn.validate_db(self)?;
         self.tree(txn).cursor().last().map_err(map_page_err)
     }
 
@@ -663,6 +765,7 @@ impl Database {
         txn: &'txn T,
         key: &[u8],
     ) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
+        txn.validate_db(self)?;
         self.tree(txn).cursor().set_range(key).map_err(map_page_err)
     }
 
@@ -676,6 +779,7 @@ impl Database {
         txn: &'txn T,
         key: &[u8],
     ) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
+        txn.validate_db(self)?;
         self.tree(txn)
             .cursor()
             .get_greater_than(key)
@@ -693,6 +797,7 @@ impl Database {
         txn: &'txn T,
         key: &[u8],
     ) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
+        txn.validate_db(self)?;
         self.tree(txn)
             .cursor()
             .get_lower_than_or_equal_to(key)
@@ -709,6 +814,7 @@ impl Database {
         txn: &'txn T,
         key: &[u8],
     ) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
+        txn.validate_db(self)?;
         self.tree(txn)
             .cursor()
             .get_lower_than(key)
@@ -774,6 +880,16 @@ impl Database {
         lo: Bound<Vec<u8>>,
         hi: Bound<Vec<u8>>,
     ) -> RoRange<'txn> {
+        // Iterator constructors are infallible by signature (heed shape), so
+        // a stale handle (TXN-68) is deferred: the first `next()` yields the
+        // `BadDbi` the fallible methods return at call time. Callers needing
+        // the fork's error-at-open observable pre-check via
+        // [`Database::validate`] (the `heed-zerodb` adapter does).
+        let fail = match txn.validate_db(self) {
+            Ok(()) => None,
+            Err(Error::Mdb(m)) => Some(m),
+            Err(_) => Some(MdbError::BadDbi),
+        };
         let tree = self.tree(txn);
         RoRange {
             cmp: tree.comparator(),
@@ -783,6 +899,7 @@ impl Database {
             hi,
             started: false,
             done: false,
+            fail,
         }
     }
 }
@@ -818,6 +935,11 @@ enum Dir {
 /// Works over both txn kinds ([`TxnRead`]); on a write txn the shared `&RwTxn`
 /// borrow it holds forbids any mutation while it is alive (SPEC 04 TXN-39).
 pub struct RoRange<'txn> {
+    /// A construction-time failure (a stale handle, TXN-68), yielded as the
+    /// first and only item: the constructors are infallible by signature, so
+    /// the `BadDbi` the fallible read methods return at call time surfaces at
+    /// the first `next()` here (see `range_impl`).
+    fail: Option<MdbError>,
     cursor: Cursor<'txn>,
     /// The database's ordering (**M2.4**), copied from the tree so the
     /// termination test below agrees with the seek the cursor performed. A
@@ -872,6 +994,10 @@ impl<'txn> Iterator for RoRange<'txn> {
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
+        }
+        if let Some(m) = self.fail.take() {
+            self.done = true;
+            return Some(Err(Error::Mdb(m)));
         }
         let step = if !self.started {
             self.started = true;

@@ -168,6 +168,10 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         DC: BytesDecode<'txn>,
     {
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
+        // LMDB precedence (probed, M2.9): the stale-dbi `TXN_DBI_EXIST` gate
+        // fires BEFORE key-size validation, so validate ahead of the §2.1
+        // read-key shim (encoding stays first — heed encodes client-side).
+        with_read!(txn, |t| self.inner.validate(t))?;
         check_read_key(&kb)?;
         let raw = with_read!(txn, |t| self.inner.get(t, &kb))?;
         match raw {
@@ -252,6 +256,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         DC: BytesDecode<'txn>,
     {
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
+        with_read!(txn, |t| self.inner.validate(t))?; // TXN-68 before §2.1
         check_read_key(&kb)?;
         decode_opt::<KC, DC>(with_read!(txn, |t| self.inner.get_lower_than(t, &kb))?)
     }
@@ -272,6 +277,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         DC: BytesDecode<'txn>,
     {
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
+        with_read!(txn, |t| self.inner.validate(t))?; // TXN-68 before §2.1
         check_read_key(&kb)?;
         decode_opt::<KC, DC>(with_read!(txn, |t| self
             .inner
@@ -293,6 +299,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         DC: BytesDecode<'txn>,
     {
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
+        with_read!(txn, |t| self.inner.validate(t))?; // TXN-68 before §2.1
         check_read_key(&kb)?;
         decode_opt::<KC, DC>(with_read!(txn, |t| self.inner.get_greater_than(t, &kb))?)
     }
@@ -313,6 +320,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         DC: BytesDecode<'txn>,
     {
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
+        with_read!(txn, |t| self.inner.validate(t))?; // TXN-68 before §2.1
         check_read_key(&kb)?;
         decode_opt::<KC, DC>(with_read!(txn, |t| self
             .inner
@@ -327,6 +335,9 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// Infallible construction; returns [`Result`] for heed shape.
     pub fn iter<'txn>(&self, txn: &'txn RoTxn) -> Result<RoIter<'txn, KC, DC>> {
+        // TXN-68 (ADR-0013): surface a stale dbi handle at open — the fork
+        // errors inside `mdb_cursor_open` — not at first iteration.
+        with_read!(txn, |t| self.inner.validate(t))?;
         Ok(RoIter::new(with_read!(txn, |t| self.inner.iter(t))))
     }
 
@@ -336,6 +347,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// As [`Database::iter`].
     pub fn rev_iter<'txn>(&self, txn: &'txn RoTxn) -> Result<RoRevIter<'txn, KC, DC>> {
+        with_read!(txn, |t| self.inner.validate(t))?; // TXN-68: error at open
         Ok(RoRevIter::new(with_read!(txn, |t| self.inner.rev_iter(t))))
     }
 
@@ -354,6 +366,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         R: RangeBounds<KC::EItem>,
     {
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
+        with_read!(txn, |t| self.inner.validate(t))?; // TXN-68: error at open
         let (lo, hi) = (as_bound(&lo), as_bound(&hi));
         Ok(RoRange::new(with_read!(txn, |t| self
             .inner
@@ -375,6 +388,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         R: RangeBounds<KC::EItem>,
     {
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
+        with_read!(txn, |t| self.inner.validate(t))?; // TXN-68: error at open
         let (lo, hi) = (as_bound(&lo), as_bound(&hi));
         Ok(RoRevRange::new(with_read!(txn, |t| self
             .inner
@@ -396,6 +410,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         C: LexicographicComparator,
     {
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
+        with_read!(txn, |t| self.inner.validate(t))?; // TXN-68 before §2.1
         check_read_key(&pb)?;
         Ok(RoPrefix::new(with_read!(txn, |t| self
             .inner
@@ -417,6 +432,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         C: LexicographicComparator,
     {
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
+        with_read!(txn, |t| self.inner.validate(t))?; // TXN-68: error at open
         Ok(RoRevPrefix::new(with_read!(txn, |t| self
             .inner
             .rev_prefix_iter(t, &pb))))
@@ -430,6 +446,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// Infallible construction; returns [`Result`] for heed shape.
     pub fn iter_mut<'txn>(&self, txn: &'txn mut RwTxn) -> Result<RwIter<'txn, KC, DC>> {
+        self.inner.validate(txn.zdb())?; // TXN-68: error at open
         Ok(RwIter::new(RwGuts::new(
             txn,
             self.inner,
@@ -445,6 +462,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// As [`Database::iter_mut`].
     pub fn rev_iter_mut<'txn>(&self, txn: &'txn mut RwTxn) -> Result<RwRevIter<'txn, KC, DC>> {
+        self.inner.validate(txn.zdb())?; // TXN-68: error at open
         Ok(RwRevIter::new(RwGuts::new(
             txn,
             self.inner,
@@ -469,6 +487,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         R: RangeBounds<KC::EItem>,
     {
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
+        self.inner.validate(txn.zdb())?; // TXN-68: error at open
         Ok(RwRange::new(RwGuts::new(txn, self.inner, Dir::Fwd, lo, hi)))
     }
 
@@ -487,6 +506,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         R: RangeBounds<KC::EItem>,
     {
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
+        self.inner.validate(txn.zdb())?; // TXN-68: error at open
         Ok(RwRevRange::new(RwGuts::new(
             txn,
             self.inner,
@@ -511,6 +531,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         C: LexicographicComparator,
     {
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
+        self.inner.validate(txn.zdb())?; // TXN-68: error at open
         let (lo, hi) = prefix_bounds(&pb);
         Ok(RwPrefix::new(RwGuts::new(
             txn,
@@ -536,6 +557,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         C: LexicographicComparator,
     {
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
+        self.inner.validate(txn.zdb())?; // TXN-68: error at open
         let (lo, hi) = prefix_bounds(&pb);
         Ok(RwRevPrefix::new(RwGuts::new(
             txn,
@@ -642,6 +664,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         KC: BytesEncode<'a>,
     {
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
+        self.inner.validate(txn.zdb())?; // TXN-68 before §2.1
         check_read_key(&kb)?;
         self.inner.delete(txn.zdb_mut(), &kb).map_err(Into::into)
     }

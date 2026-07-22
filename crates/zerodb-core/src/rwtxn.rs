@@ -131,6 +131,10 @@ struct NamedTree {
     name: Box<[u8]>,
     rec: DBRecord,
     dirty: bool,
+    /// The dbi-slot generation observed when this txn bound the dbi (SPEC 04
+    /// TXN-10 gate / TXN-68; ADR-0013). Handles used against this txn must
+    /// carry the same generation or fail with `BadDbi`.
+    generation: u64,
 }
 
 /// Allocation restriction state (SPEC 05 GC-12, ADR-0005 D2).
@@ -404,6 +408,19 @@ pub struct RwTxn<'env> {
     /// `rwtxn_sync_contract_and_child_send` compile-time assertion in
     /// `crate::nested` turns a violation into a build failure.
     children: ChildCounter,
+    /// The dbis THIS txn **newly opened** — the `DB_NEW` analog (SPEC 04
+    /// TXN-68, ADR-0013): every `create_database` against a slot that was not
+    /// exported env-wide at the time, whether the catalog entry was created
+    /// or already existed on disk (e.g. the first open after an env reopen).
+    /// If the txn ends without committing, `Drop` bumps each one's registry
+    /// generation, closing every outstanding handle exactly as LMDB's
+    /// `mdb_dbis_update(keep=0)` does; a successful commit **exports** them
+    /// instead (`keep=1`). Deduplicated.
+    new_dbis: Vec<u32>,
+    /// Set by a successful [`RwTxn::commit`]; `Drop` reads it to distinguish
+    /// commit from the abort shapes (explicit abort TXN-59, plain drop, panic
+    /// unwind TXN-60, and a failed commit — all of which close created dbis).
+    committed: bool,
 }
 
 impl Env {
@@ -453,6 +470,8 @@ impl Env {
             errored: false,
             oldest_cache: None,
             children: ChildCounter::new(),
+            new_dbis: Vec::new(),
+            committed: false,
             bytes: inner.backing_bytes(),
             base,
             _guard: guard,
@@ -482,12 +501,21 @@ impl Env {
         if name.is_empty() || name.len() > MAX_DB_NAME {
             return Err(Error::Mdb(MdbError::BadValSize));
         }
-        let dbi = self
+        // The handle captures the slot's current generation (ADR-0013): if
+        // this open is rolled back and the slot was `DB_NEW` (unexported),
+        // the end-of-txn bump (TXN-68) kills it.
+        let (dbi, generation, db_new) = self
             .inner()
             .named_dbi_assign(name)
             .ok_or(Error::Mdb(MdbError::DbsFull))?;
-        wtxn.create_named(dbi, name)?;
-        Ok(Database::from_sel(DbSel::Named(dbi)))
+        wtxn.create_named(dbi, name, generation)?;
+        // Track only on success: a failed open (`Incompatible` collision)
+        // mints no handle, so there is nothing to close (LMDB's failed
+        // `mdb_dbi_open` likewise releases the slot).
+        if db_new && !wtxn.new_dbis.contains(&dbi) {
+            wtxn.new_dbis.push(dbi);
+        }
+        Ok(Database::from_parts(DbSel::Named(dbi), generation))
     }
 
     /// `create_database` with a **custom key comparator** (**milestone 2.4**;
@@ -612,6 +640,28 @@ impl TxnRead for RwTxn<'_> {
     fn validated_pages(&self) -> Option<&ValidatedPages> {
         Some(&self.validated)
     }
+    fn validate_db(&self, db: &Database) -> Result<()> {
+        match db.sel() {
+            DbSel::Main => Ok(()),
+            DbSel::Named(dbi) => {
+                // Bound this txn (`ensure_open`): the bind generation is
+                // authoritative (ADR-0013 Q2). Unbound: read the live registry
+                // — equivalent to bind-time under the single-writer protocol,
+                // because the only bump that can land while this write txn is
+                // live is this txn's own `drop_db` (TXN-6: no other writer;
+                // readers never bump).
+                let expected = match self.open.get(&dbi) {
+                    Some(t) => t.generation,
+                    None => self.env.inner().named_generation(dbi),
+                };
+                if expected == db.generation() {
+                    Ok(())
+                } else {
+                    Err(Error::Mdb(MdbError::BadDbi))
+                }
+            }
+        }
+    }
 }
 
 impl<'env> RwTxn<'env> {
@@ -731,34 +781,53 @@ impl<'env> RwTxn<'env> {
         }
     }
 
-    /// Ensure the named DB `dbi`'s working record is loaded into [`RwTxn::open`]
+    /// Ensure the named DB's working record is loaded into [`RwTxn::open`]
     /// (from the catalog view, or empty if the entry does not yet exist), and
     /// return its tree selector. Idempotent. The main DB needs no loading.
-    fn ensure_open(&mut self, sel: DbSel) -> Result<TreeId> {
+    ///
+    /// This is the write path's **per-txn bind** (SPEC 04 TXN-10 gate /
+    /// TXN-68; ADR-0013): the handle's captured generation is validated here
+    /// — against the registry on a cold bind (one lock, which the name
+    /// resolution paid already), against the stored bind generation on a warm
+    /// one (no lock). A stale handle fails with [`MdbError::BadDbi`]
+    /// **without** poisoning the txn (probed fork behavior: the `EINVAL` from
+    /// `TXN_DBI_EXIST` leaves the txn committable).
+    fn ensure_open(&mut self, db: Database) -> Result<TreeId> {
         // TXN-29 airtightness: `ensure_open` mutates the open table, which
         // live children read through `record_for` — so the child guard fires
         // here too, *before* the table is touched (the page-mutation entries
         // it precedes re-check via their own `guard_ok`).
         self.guard_ok()?;
-        let dbi = match sel {
+        let dbi = match db.sel() {
             DbSel::Main => return Ok(TreeId::Main),
             DbSel::Named(dbi) => dbi,
         };
-        if !self.open.contains_key(&dbi) {
-            let name = self
-                .env
-                .inner()
-                .named_name(dbi)
-                .expect("named dbi is assigned before a handle exists");
-            let rec = resolve_named_record(self.source(), self.psize, &self.main_db, &name);
-            self.open.insert(
-                dbi,
-                NamedTree {
-                    name,
-                    rec,
-                    dirty: false,
-                },
-            );
+        match self.open.get(&dbi) {
+            Some(t) => {
+                if t.generation != db.generation() {
+                    return Err(Error::Mdb(MdbError::BadDbi));
+                }
+            }
+            None => {
+                let (name, generation) = self
+                    .env
+                    .inner()
+                    .named_slot(dbi)
+                    .expect("named dbi is assigned before a handle exists");
+                if generation != db.generation() {
+                    return Err(Error::Mdb(MdbError::BadDbi));
+                }
+                let rec = resolve_named_record(self.source(), self.psize, &self.main_db, &name);
+                self.open.insert(
+                    dbi,
+                    NamedTree {
+                        name,
+                        rec,
+                        dirty: false,
+                        generation,
+                    },
+                );
+            }
         }
         Ok(TreeId::Named(dbi))
     }
@@ -2230,13 +2299,20 @@ impl<'env> RwTxn<'env> {
     /// entry to remove). Named DB → free every page, then delete the catalog
     /// entry from the main tree and forget the working record so commit does
     /// not write it back. The dbi index stays reserved in the env registry
-    /// (append-only; see [`crate::env`] `NamedRegistry`).
-    fn drop_database(&mut self, sel: DbSel) -> Result<()> {
+    /// (append-only; see [`crate::env`] `NamedRegistry`), but its generation
+    /// is bumped **immediately at call time** (SPEC 04 TXN-68; the
+    /// `mdb_dbi_close` inside `mdb_drop`): every outstanding handle dies now,
+    /// and a later abort of this txn does NOT resurrect them — the DB's
+    /// *data* comes back, the handles stay dead. A fresh
+    /// `open_database`/`create_database` afterwards yields a new valid handle.
+    fn drop_database(&mut self, db: Database) -> Result<()> {
         self.guard_ok()?;
-        match sel {
+        match db.sel() {
             DbSel::Main => self.clear_tree(TreeId::Main),
             DbSel::Named(dbi) => {
-                let tree = self.ensure_open(DbSel::Named(dbi))?;
+                // Drop-site validation (ADR-0013 Q2): a stale handle cannot
+                // drop the re-created DB behind a fresh handle's back.
+                let tree = self.ensure_open(db)?;
                 self.clear_tree(tree)?;
                 let name = self
                     .open
@@ -2250,6 +2326,9 @@ impl<'env> RwTxn<'env> {
                 // The DB no longer exists this txn: drop its working record so
                 // `flush_catalog` does not re-create it.
                 self.open.remove(&dbi);
+                // Env-wide immediate close (TXN-68), on success only (LMDB
+                // closes the dbi only after the catalog delete succeeded).
+                self.env.inner().named_bump(dbi);
                 Ok(())
             }
         }
@@ -2261,7 +2340,7 @@ impl<'env> RwTxn<'env> {
     /// otherwise insert an empty `F_SUBDATA` record eagerly (LMDB `MDB_CREATE`
     /// creates the entry inside the write txn), so `open_database` sees it and
     /// abort discards it with the dirty set.
-    fn create_named(&mut self, dbi: u32, name: &[u8]) -> Result<()> {
+    fn create_named(&mut self, dbi: u32, name: &[u8], generation: u64) -> Result<()> {
         self.guard_ok()?;
         enum Cat {
             Missing,
@@ -2290,6 +2369,7 @@ impl<'env> RwTxn<'env> {
                     name: name.into(),
                     rec,
                     dirty: false,
+                    generation,
                 });
                 Ok(())
             }
@@ -2314,6 +2394,7 @@ impl<'env> RwTxn<'env> {
                         name: name.into(),
                         rec: empty,
                         dirty: false,
+                        generation,
                     },
                 );
                 Ok(())
@@ -2603,9 +2684,32 @@ impl<'env> RwTxn<'env> {
             return Err(poisoned_error());
         }
         if self.is_unchanged() {
+            // A no-op data commit is still a successful commit for handle
+            // purposes (TXN-68): reachable with a non-empty `new_dbis` when
+            // the txn only re-OPENED an existing-on-disk DB (first open after
+            // an env reopen writes nothing) — LMDB exports those dbis too.
+            self.export_new_dbis();
+            self.committed = true;
             return Ok(());
         }
-        self.commit_pipeline()
+        let r = self.commit_pipeline();
+        if r.is_ok() {
+            // TXN-68: only a SUCCESSFUL commit keeps this txn's newly-opened
+            // dbis valid (`mdb_dbis_update(keep=1)` = export); every error
+            // path falls through to `Drop`'s abort semantics below, matching
+            // the fork (a failed `mdb_txn_commit` aborts the txn, closing
+            // its dbis).
+            self.export_new_dbis();
+            self.committed = true;
+        }
+        r
+    }
+
+    /// Export every dbi this txn newly opened (TXN-68 commit path).
+    fn export_new_dbis(&self) {
+        for &dbi in &self.new_dbis {
+            self.env.inner().named_export(dbi);
+        }
     }
 
     /// The one commit function (ADR-0004 D3): steps C1–C6 in textual order,
@@ -2747,6 +2851,32 @@ impl<'env> RwTxn<'env> {
     }
 }
 
+impl Drop for RwTxn<'_> {
+    fn drop(&mut self) {
+        // TXN-68 (ADR-0013, D-013): a write txn that ends without a
+        // successful commit — explicit `abort` (TXN-59), plain drop, panic
+        // unwind (TXN-60), or a failed `commit` — closes the dbi handles it
+        // NEWLY OPENED (the `DB_NEW` set: unexported slots it opened via
+        // `create_database`, catalog-creating or not), by bumping their
+        // registry generations (LMDB's `mdb_dbis_update(txn, keep=0)`).
+        // Purely in-process registry state: no disk effect, so nothing here
+        // interacts with crash safety — if the process dies before/after
+        // this body, the registry dies with it and every handle dies too (a
+        // fresh process re-opens fresh handles). Handles this txn merely
+        // *used* (bound, exported slots) survive, as do handles whose
+        // `drop_db` already bumped (a second bump is harmless: both
+        // generations are dead). Runs before the fields drop, so `_guard`
+        // (the write mutex) is still held: the bump is ordered before the
+        // next writer can begin, and the registry mutex inside `named_bump`
+        // never nests around the write mutex (no lock-order inversion).
+        if !self.committed {
+            for &dbi in &self.new_dbis {
+                self.env.inner().named_bump(dbi);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Database write API (heed-shaped wrappers over RwTxn internals)
 // ---------------------------------------------------------------------------
@@ -2759,7 +2889,7 @@ impl Database {
     /// [`MdbError::BadValSize`] (empty/oversized key, oversized value),
     /// [`MdbError::MapFull`], [`MdbError::BadTxn`] on a poisoned txn.
     pub fn put(&self, txn: &mut RwTxn<'_>, key: &[u8], value: &[u8]) -> Result<()> {
-        let tree = txn.ensure_open(self.sel())?;
+        let tree = txn.ensure_open(*self)?;
         txn.put_tree(tree, key, PutFlags::EMPTY, ValSrc::Val(value))
             .map(|_| ())
     }
@@ -2778,7 +2908,7 @@ impl Database {
         key: &[u8],
         value: &[u8],
     ) -> Result<()> {
-        let tree = txn.ensure_open(self.sel())?;
+        let tree = txn.ensure_open(*self)?;
         txn.put_tree(tree, key, flags, ValSrc::Val(value))
             .map(|_| ())
     }
@@ -2800,7 +2930,7 @@ impl Database {
         len: usize,
         f: impl FnOnce(&mut [u8]),
     ) -> Result<()> {
-        let tree = txn.ensure_open(self.sel())?;
+        let tree = txn.ensure_open(*self)?;
         let loc = txn.put_tree(tree, key, PutFlags::EMPTY, ValSrc::Reserve(len))?;
         match loc {
             ReserveLoc::Big(head) => {
@@ -2831,7 +2961,7 @@ impl Database {
     /// [`MdbError::BadTxn`] on a poisoned txn; [`MdbError::MapFull`] if the
     /// COW/rebalance ran out of map (which also poisons the txn).
     pub fn delete(&self, txn: &mut RwTxn<'_>, key: &[u8]) -> Result<bool> {
-        let tree = txn.ensure_open(self.sel())?;
+        let tree = txn.ensure_open(*self)?;
         txn.delete_tree(tree, key)
     }
 
@@ -2847,7 +2977,7 @@ impl Database {
         lower: std::ops::Bound<&[u8]>,
         upper: std::ops::Bound<&[u8]>,
     ) -> Result<u64> {
-        let tree = txn.ensure_open(self.sel())?;
+        let tree = txn.ensure_open(*self)?;
         let keys: Vec<Vec<u8>> = {
             let mut out = Vec::new();
             for item in self.range(&*txn, lower, upper) {
@@ -2874,7 +3004,7 @@ impl Database {
     ///
     /// As [`Database::delete`].
     pub fn clear(&self, txn: &mut RwTxn<'_>) -> Result<()> {
-        let tree = txn.ensure_open(self.sel())?;
+        let tree = txn.ensure_open(*self)?;
         txn.clear_tree(tree)
     }
 
@@ -2890,7 +3020,7 @@ impl Database {
     ///
     /// As [`Database::delete`].
     pub fn drop_db(&self, txn: &mut RwTxn<'_>) -> Result<()> {
-        txn.drop_database(self.sel())
+        txn.drop_database(*self)
     }
 
     /// A mutable cursor over this database (the `iter_mut` /
@@ -2899,7 +3029,7 @@ impl Database {
     pub fn rw_cursor<'t, 'env>(&self, txn: &'t mut RwTxn<'env>) -> RwCursor<'t, 'env> {
         RwCursor {
             txn,
-            sel: self.sel(),
+            db: *self,
             pos: CurPos::Start,
             saved: None,
         }
@@ -2956,8 +3086,12 @@ enum Step<'k> {
 /// exists, because every mutating method of this cursor clears it.
 pub struct RwCursor<'t, 'env> {
     txn: &'t mut RwTxn<'env>,
-    /// Which database this cursor iterates/mutates (M1.6).
-    sel: DbSel,
+    /// Which database this cursor iterates/mutates (M1.6). The full handle
+    /// (not just the selector), so every internal bind re-runs the TXN-68
+    /// generation gate — a cursor opened on a stale handle errors on first
+    /// use (the fork errors at `mdb_cursor_open`; the adapter pre-validates
+    /// to surface it at open, see `Database::validate`).
+    db: Database,
     /// Semantic fallback position (authoritative only when `saved` is `None`).
     pos: CurPos,
     /// Parked physical path (authoritative when `Some`); cleared by mutations.
@@ -2969,10 +3103,16 @@ impl RwCursor<'_, '_> {
     /// position from [`CurPos`] with one seek), park the new path, and
     /// re-materialize the yielded entry as borrows of the txn's frames.
     fn drive(&mut self, op: Step<'_>) -> Result<Option<(&[u8], &[u8])>> {
+        // TXN-68 gate (ADR-0013): the cursor's positioning steps read through
+        // `record_for` without a bind, so validate the handle here — a cursor
+        // opened on a stale handle errors on its first movement (the fork
+        // errors at `mdb_cursor_open`; the adapter pre-validates at open, so
+        // through heed-zerodb the observable is identical).
+        self.txn.validate_db(&self.db)?;
         // Phase 1 — position under a scoped shared borrow of the txn; keep
         // only plain data (the parked stack and the hit's (pgno, ki)).
         let hit: Option<(u64, usize)> = {
-            let tree = Database::from_sel(self.sel).tree(&*self.txn);
+            let tree = self.db.tree(&*self.txn);
             let (mut c, resumed) = match self.saved.take() {
                 Some(s) => (BCursor::resume(tree, s), true),
                 None => (tree.cursor(), false),
@@ -3026,7 +3166,7 @@ impl RwCursor<'_, '_> {
         match hit {
             None => Ok(None),
             Some((pgno, ki)) => {
-                let tree = Database::from_sel(self.sel).tree(&*self.txn);
+                let tree = self.db.tree(&*self.txn);
                 let (k, v) = tree.entry_at(pgno, ki).map_err(map_page_err)?;
                 Ok(Some((k, v)))
             }
@@ -3039,7 +3179,7 @@ impl RwCursor<'_, '_> {
         match &self.saved {
             Some(s) => match s.entry_pos() {
                 Some((pgno, ki)) => {
-                    let tree = Database::from_sel(self.sel).tree(&*self.txn);
+                    let tree = self.db.tree(&*self.txn);
                     let (k, _) = tree.entry_at(pgno, ki).map_err(map_page_err)?;
                     Ok(Some(k.to_vec()))
                 }
@@ -3143,7 +3283,7 @@ impl RwCursor<'_, '_> {
         let Some(key) = self.current_key()? else {
             return Ok(false);
         };
-        let tree = self.txn.ensure_open(self.sel)?;
+        let tree = self.txn.ensure_open(self.db)?;
         self.txn
             .put_tree(tree, &key, PutFlags::EMPTY, ValSrc::Val(value))
             .map(|_| ())?;
@@ -3161,7 +3301,7 @@ impl RwCursor<'_, '_> {
     ///
     /// As [`Database::put_with_flags`].
     pub fn put(&mut self, flags: PutFlags, key: &[u8], value: &[u8]) -> Result<()> {
-        let tree = self.txn.ensure_open(self.sel)?;
+        let tree = self.txn.ensure_open(self.db)?;
         self.txn
             .put_tree(tree, key, flags, ValSrc::Val(value))
             .map(|_| ())?;
@@ -3181,7 +3321,7 @@ impl RwCursor<'_, '_> {
         let Some(key) = self.current_key()? else {
             return Ok(false);
         };
-        let tree = self.txn.ensure_open(self.sel)?;
+        let tree = self.txn.ensure_open(self.db)?;
         let existed = self.txn.delete_tree(tree, &key)?;
         self.saved = None;
         self.pos = CurPos::AfterDelete(key);

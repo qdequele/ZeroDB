@@ -293,24 +293,50 @@ fn next_env_id() -> u64 {
 /// resolves lazily from the transaction's catalog view (the main tree; SPEC 04
 /// TXN-10 step 3), so this table maps **only** dbi → name, never dbi → root.
 ///
-/// **Assignment is append-only within a process** (an interim simplification,
-/// like the M1.5 reader registry). LMDB frees a dbi when the txn that opened it
-/// aborts; ZeroDB keeps the slot and re-uses it on a later open of the same
-/// name (`by_name`). This is **unobservable** through the heed/SPEC-00 surface:
-/// resolution is always catalog-driven, so a handle whose creation was aborted
-/// resolves to *absent* (its catalog entry was discarded with the dirty set),
-/// and re-creating the name re-uses the same dbi. The only theoretical effect
-/// is that `max_dbs` counts distinct names ever seen (incl. aborted) rather
-/// than currently-live ones, so `DbsFull` could fire one creation early after
-/// `max_dbs` *distinct* aborted-and-never-reused names — a case no consumer and
-/// no oracle sequence produces (names are a bounded reused set). M1.8 (the
-/// reader table) deliberately did **not** touch this: the full dbi lifecycle
-/// (abort-frees-slot) remains an accepted interim simplification, revisited
-/// with the Phase 2 handle/introspection work (PLAN 2.2) if ever observable.
+/// **Assignment is append-only within a process** (unlike LMDB, which frees a
+/// dbi slot when the handle closes and may later re-issue the number for a
+/// *different* database — the D-009 hazard class ZeroDB keeps
+/// unrepresentable). Handle **lifetime** parity (D-013, ADR-0013, SPEC 04
+/// TXN-68) is carried by a per-slot **generation** counter instead of slot
+/// reuse: a `Database` handle captures `(dbi, generation)` at
+/// `open_database`/`create_database`, every per-txn bind re-checks the pair,
+/// and the two LMDB handle-close events — abort of the creating txn
+/// (`mdb_dbis_update(keep=0)`) and `drop_db(delete=true)`
+/// (`mdb_dbi_close`) — bump the generation, killing every outstanding handle
+/// exactly where LMDB's `TXN_DBI_EXIST` gate would return `EINVAL`. The
+/// generation is per-process in-memory state with **no on-disk
+/// representation**, same as LMDB's `me_dbiseqs` (TXN-68). The one residual
+/// effect of append-only assignment: `max_dbs` counts distinct names ever
+/// seen (incl. aborted) rather than currently-live ones, so `DbsFull` could
+/// fire one creation early after `max_dbs` *distinct* aborted-and-never-reused
+/// names — a case no consumer and no oracle sequence produces.
+///
+/// **Locking (ADR-0013 Q3):** every generation read and bump happens under
+/// this registry's `Mutex` — the same lock the bind path already takes to
+/// resolve dbi → name, so validation adds no new lock acquisition to any hot
+/// path (reads memoize the bind per txn). The mutex linearizes a bind against
+/// a concurrent abort-bump exactly as the ADR's sketched Acquire/Release
+/// atomics would: a bind either observes the bump (handle refused, like LMDB)
+/// or completed before it (legal use of a then-valid handle). The ADR's
+/// lock-free option was therefore unnecessary; no new atomics were added.
 #[derive(Debug)]
 struct NamedRegistry {
     /// dbi index → name. Append-only; index is the `DbSel::Named` payload.
     names: Vec<Box<[u8]>>,
+    /// dbi index → handle generation (parallel to `names`; ADR-0013, the
+    /// `me_dbiseqs` analog). Bumped by `named_bump`; captured by handles at
+    /// assignment and compared at every per-txn bind (SPEC 04 TXN-10/68).
+    generations: Vec<u64>,
+    /// dbi index → whether the slot is **exported** env-wide (parallel to
+    /// `names`; the `me_dbflags[i] & MDB_VALID` analog, SPEC 04 TXN-68).
+    /// `false` for a fresh slot; set by `named_export` when a write txn that
+    /// opened the slot **commits** (`mdb_dbis_update(keep=1)`); cleared by
+    /// `named_bump` (every close event un-exports, like LMDB freeing the
+    /// slot). A `create_database` against an unexported slot makes the txn
+    /// the slot's **opener** (`DB_NEW`) — whether or not the catalog entry
+    /// already exists on disk (e.g. the first open after an env reopen) —
+    /// so ending that txn without a commit closes the handle.
+    exported: Vec<bool>,
     /// name → dbi index, for `open`/`create` lookup.
     by_name: HashMap<Box<[u8]>, u32>,
     /// Catalog capacity (number of **named** DBs; the main DB is not counted,
@@ -322,6 +348,8 @@ impl NamedRegistry {
     fn new(max_dbs: u32) -> NamedRegistry {
         NamedRegistry {
             names: Vec::new(),
+            generations: Vec::new(),
+            exported: Vec::new(),
             by_name: HashMap::new(),
             max_dbs,
         }
@@ -630,14 +658,21 @@ impl EnvInner {
         self.reader_table.oldest()
     }
 
-    /// The dbi index for `name`, assigning a fresh one if absent (SPEC 02 §6).
+    /// The `(dbi, generation, db_new)` triple for `name`, assigning a fresh
+    /// dbi if absent (SPEC 02 §6). The generation is the slot's **current**
+    /// one (ADR-0013): a handle minted from this pair is valid until the slot
+    /// is next bumped. `db_new` is the LMDB `DB_NEW` fact (TXN-68): the slot
+    /// is not currently exported, so a write txn opening it now becomes its
+    /// opener and must close it (bump) if it ends without committing.
     /// Returns `None` when the catalog is full (`DbsFull`): the number of
     /// distinct named DBs has reached `max_dbs`.
     #[must_use]
-    pub(crate) fn named_dbi_assign(&self, name: &[u8]) -> Option<u32> {
+    pub(crate) fn named_dbi_assign(&self, name: &[u8]) -> Option<(u32, u64, bool)> {
         let mut r = self.named.lock().expect("named registry poisoned");
         if let Some(&dbi) = r.by_name.get(name) {
-            return Some(dbi);
+            let generation = r.generations[dbi as usize];
+            let db_new = !r.exported[dbi as usize];
+            return Some((dbi, generation, db_new));
         }
         if r.names.len() as u64 >= u64::from(r.max_dbs) {
             return None;
@@ -645,8 +680,10 @@ impl EnvInner {
         let dbi = r.names.len() as u32;
         let boxed: Box<[u8]> = name.into();
         r.names.push(boxed.clone());
+        r.generations.push(0);
+        r.exported.push(false);
         r.by_name.insert(boxed, dbi);
-        Some(dbi)
+        Some((dbi, 0, true))
     }
 
     /// The name for a named-DB dbi index (`DbSel::Named`), if the index is
@@ -659,6 +696,62 @@ impl EnvInner {
             .names
             .get(dbi as usize)
             .cloned()
+    }
+
+    /// The `(name, generation)` slot for a named-DB dbi index, if assigned —
+    /// the one-lock read the per-txn bind uses to resolve *and* validate a
+    /// handle (SPEC 04 TXN-10 gate, ADR-0013). Cloned out so no registry lock
+    /// is held by the caller.
+    #[must_use]
+    pub(crate) fn named_slot(&self, dbi: u32) -> Option<(Box<[u8]>, u64)> {
+        let r = self.named.lock().expect("named registry poisoned");
+        let name = r.names.get(dbi as usize)?.clone();
+        let generation = r.generations[dbi as usize];
+        Some((name, generation))
+    }
+
+    /// The current handle generation of a named-DB dbi (ADR-0013); `0` for an
+    /// unassigned index (unreachable through a real handle — dbis are only
+    /// ever issued by [`EnvInner::named_dbi_assign`]).
+    #[must_use]
+    pub(crate) fn named_generation(&self, dbi: u32) -> u64 {
+        self.named
+            .lock()
+            .expect("named registry poisoned")
+            .generations
+            .get(dbi as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Close every outstanding handle to `dbi` by bumping its generation
+    /// (SPEC 04 TXN-68; ADR-0013 — the `me_dbiseqs[i]++` analog). Called on
+    /// the two LMDB handle-close events only: the end-without-commit of a txn
+    /// that **created** the named DB (TXN-59/60, `mdb_dbis_update(keep=0)`),
+    /// and a successful `drop_db(delete=true)` (`mdb_dbi_close`, immediate
+    /// and not undone by a later abort). A no-op for an unassigned index.
+    pub(crate) fn named_bump(&self, dbi: u32) {
+        let mut r = self.named.lock().expect("named registry poisoned");
+        if let Some(g) = r.generations.get_mut(dbi as usize) {
+            *g += 1;
+        }
+        // Every close event also un-exports the slot (LMDB frees it): the
+        // next `create_database` of this name becomes the slot's new opener
+        // (`DB_NEW` again).
+        if let Some(e) = r.exported.get_mut(dbi as usize) {
+            *e = false;
+        }
+    }
+
+    /// Export `dbi` env-wide (SPEC 04 TXN-68; `mdb_dbis_update(keep=1)`):
+    /// called when a write txn that opened the slot **commits**. From then on
+    /// opening the name is not a `DB_NEW` open, until a close event
+    /// ([`EnvInner::named_bump`]) un-exports it.
+    pub(crate) fn named_export(&self, dbi: u32) {
+        let mut r = self.named.lock().expect("named registry poisoned");
+        if let Some(e) = r.exported.get_mut(dbi as usize) {
+            *e = true;
+        }
     }
 
     /// Whether this env was opened on the previous (older) snapshot.

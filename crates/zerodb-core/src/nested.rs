@@ -178,6 +178,12 @@ impl TxnRead for NestedRoTxn<'_> {
         // whole life, so its map-gated memo stays sound here (PERF-GAP A2).
         self.parent.validated_pages()
     }
+    fn validate_db(&self, db: &crate::rotxn::Database) -> crate::error::Result<()> {
+        // TXN-68 gate, delegate-live like every other view: the child shares
+        // the parent's binds (fork parity — a nested reader shares the parent
+        // txn's dbi table view).
+        self.parent.validate_db(db)
+    }
 }
 
 // ---------------------------------------------------------------------------
