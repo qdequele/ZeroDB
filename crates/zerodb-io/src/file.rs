@@ -198,5 +198,23 @@ pub fn create_env_file(path: &Path, page_size: u32, map_size: u64) -> std::io::R
 
     // fsync so both slots are durable before the env is usable (SPEC 02 §3.4).
     file.sync_all()?;
+    // …and fsync the parent directory so the file's *directory entry* is
+    // durable too (SPEC 02 §3.4 step 4; issue #46): without this, a crash
+    // shortly after creation can lose the name while the content was already
+    // durable — a reachable-file guarantee, one fsync per env lifetime.
+    fsync_parent_dir(path)?;
     Ok(file)
+}
+
+/// fsync the directory containing `path` (see [`create_env_file`]).
+///
+/// # Errors
+///
+/// Propagates the directory open/fsync error.
+fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    File::open(parent)?.sync_all()
 }

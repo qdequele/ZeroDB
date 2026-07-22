@@ -278,6 +278,11 @@ Creating a new env writes **both** meta slots (pages 0 and 1) as valid, identica
    no data page yet), `free_db` and `main_db` both **empty**
    (`root = PGNO_INVALID`, all stats 0, `depth = 0`), fresh `meta_crc` on each.
 3. `fsync(data)` so both slots are durable.
+4. `fsync(parent dir)` so the data file's **directory entry** is durable
+   (added 2026-07-22, issue #46): without it, a crash shortly after creation
+   can lose the file's *name* while its content was already durable —
+   durable-but-unreachable. One fsync per env lifetime; commits never repeat
+   it (the entry exists from here on).
 
 After creation the live snapshot is txnid 0 (both slots valid; the higher-txnid
 rule §3.2 is a tie broken to either — they are identical). The **first commit**

@@ -127,6 +127,13 @@ pub trait CopyToFile {
     /// exactly when the file is durable should treat `done == total` as
     /// "reading finished", not "file written".
     ///
+    /// **Durability is the caller's concern** (LMDB `mdb_env_copy` parity —
+    /// deliberate, revisited for issue #46): no mode fsyncs the copy, and the
+    /// compacting mode does not fsync `path`'s directory after its rename. A
+    /// caller that needs the snapshot crash-durable must fsync the produced
+    /// file *and* its parent directory. (Contrast: *env creation* does both
+    /// itself — SPEC 02 §3.4 step 4.)
+    ///
     /// # Errors
     ///
     /// As [`CopyToFile::copy_to_file`].
