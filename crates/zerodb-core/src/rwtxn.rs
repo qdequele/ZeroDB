@@ -196,8 +196,12 @@ impl ValSrc<'_> {
 
 /// Where a reserved value landed (so `put_reserved` can hand out the slice).
 enum ReserveLoc {
-    /// Inline in the leaf — relocate by key after the insert settles.
-    Inline,
+    /// Inline in the leaf. `at` carries the settled `(leaf pgno, cell index)`
+    /// when the insert path can prove it final — every no-split arm, where
+    /// the receiving leaf and slot are in scope (PERF-GAP B6 residual /
+    /// issue #10: this makes the common `put_reserved` single-descent).
+    /// `None` (a split moved cells) falls back to a key search.
+    Inline { at: Option<(u64, usize)> },
     /// On the overflow run headed at this pgno.
     Big(u64),
 }
@@ -1328,7 +1332,9 @@ impl<'env> RwTxn<'env> {
                 if let ValSrc::Val(v) = val {
                     frame[off..off + dsize as usize].copy_from_slice(v);
                 }
-                return Ok(ReserveLoc::Inline);
+                return Ok(ReserveLoc::Inline {
+                    at: Some((lpg, ki)),
+                });
             }
             _ => {}
         }
@@ -1399,7 +1405,9 @@ impl<'env> RwTxn<'env> {
                 }
             };
             match r {
-                Ok(()) => Ok(ReserveLoc::Inline),
+                Ok(()) => Ok(ReserveLoc::Inline {
+                    at: Some((lpg, ki)),
+                }),
                 Err(PageError::PageFull { .. }) => {
                     // Split (§6.2/§6.4). A RESERVE that splits packs as a
                     // zero-filled placeholder the caller then overwrites
@@ -1410,7 +1418,8 @@ impl<'env> RwTxn<'env> {
                         ValSrc::Reserve(n) => NewLeafVal::ZeroReserve(*n),
                     };
                     self.split_leaf(tree, path, ki, key, nv, node_flags, append)?;
-                    Ok(ReserveLoc::Inline)
+                    // The cell may have landed on either split half.
+                    Ok(ReserveLoc::Inline { at: None })
                 }
                 Err(e) => Err(corrupt(e)),
             }
@@ -2430,11 +2439,30 @@ impl<'env> RwTxn<'env> {
                 let frame = self.dirty.bytes_mut(head).expect("run frame present");
                 pil_encode_into(ids, &mut frame[HEADER_SIZE..HEADER_SIZE + len]);
             }
-            ReserveLoc::Inline => {
-                // Locate the settled cell (it may have moved through a split).
-                let (path, found) = self.search_path(TreeId::Free, &key)?;
-                debug_assert!(found, "reserved GC key must be present");
-                let (lpg, ki) = *path.last().expect("non-empty path");
+            ReserveLoc::Inline { at } => {
+                // The no-split insert arms prove the settled cell (issue
+                // #10); a split falls back to the key search.
+                let (lpg, ki) = match at {
+                    Some(pos) => {
+                        // Same cross-check as `Database::put_reserved`.
+                        #[cfg(debug_assertions)]
+                        {
+                            let (path, found) = self.search_path(TreeId::Free, &key)?;
+                            debug_assert!(found, "reserved GC key must be present");
+                            debug_assert_eq!(
+                                *path.last().expect("non-empty path"),
+                                pos,
+                                "GC ReserveLoc::Inline{{at}} disagrees with search"
+                            );
+                        }
+                        pos
+                    }
+                    None => {
+                        let (path, found) = self.search_path(TreeId::Free, &key)?;
+                        debug_assert!(found, "reserved GC key must be present");
+                        *path.last().expect("non-empty path")
+                    }
+                };
                 let frame = self.dirty.bytes_mut(lpg).expect("GC leaf is dirty");
                 let (off, dsize) = {
                     let leaf = LeafMut::from_valid(&mut *frame, self.psize).map_err(corrupt)?;
@@ -2800,11 +2828,33 @@ impl Database {
                 let frame = txn.dirty.bytes_mut(head).expect("run frame present");
                 f(&mut frame[HEADER_SIZE..HEADER_SIZE + len]);
             }
-            ReserveLoc::Inline => {
-                // Locate the settled cell (it may have moved through a split).
-                let (path, found) = txn.search_path(tree, key)?;
-                debug_assert!(found, "reserved key must be present");
-                let (lpg, ki) = *path.last().expect("non-empty path");
+            ReserveLoc::Inline { at } => {
+                // The insert path proves the settled `(leaf, slot)` on every
+                // no-split arm (issue #10: one descent, not two); a split
+                // returns `None` and we re-locate by key.
+                let (lpg, ki) = match at {
+                    Some(pos) => {
+                        // Cross-check the proof against a real search in
+                        // debug/fuzz builds — a stale position here would
+                        // corrupt user data silently.
+                        #[cfg(debug_assertions)]
+                        {
+                            let (path, found) = txn.search_path(tree, key)?;
+                            debug_assert!(found, "reserved key must be present");
+                            debug_assert_eq!(
+                                *path.last().expect("non-empty path"),
+                                pos,
+                                "ReserveLoc::Inline{{at}} disagrees with search"
+                            );
+                        }
+                        pos
+                    }
+                    None => {
+                        let (path, found) = txn.search_path(tree, key)?;
+                        debug_assert!(found, "reserved key must be present");
+                        *path.last().expect("non-empty path")
+                    }
+                };
                 let frame = txn.dirty.bytes_mut(lpg).expect("leaf is dirty");
                 let (off, dsize) = {
                     let leaf = LeafMut::from_valid(&mut *frame, txn.psize).map_err(corrupt)?;

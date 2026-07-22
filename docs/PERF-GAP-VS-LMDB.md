@@ -275,12 +275,18 @@ came with it: a failing closure now leaves the entry in place and errors as
 `Io` (LMDB cannot un-put a reserve; the pre-B6 adapter wrote nothing and
 returned `Encoding` — a real divergence, pinned by the oracle's
 `put_reserved_failing_closure_leaves_entry_parity`). **Residuals** (tracked
-as issue [#10](https://github.com/qdequele/ZeroDB/issues/10)): the
-engine's inline-reserve path still re-locates the settled cell with a second
-descent (`rwtxn.rs` `put_reserved` → `search_path`) — same shape as the B1
-mutation residual; and the *cursor* reserved put
-(`put_current_reserved_with_flags`) still goes through a heap buffer (rare
-path; wire it to the slot fill if a consumer profile ever shows it).
+as issue [#10](https://github.com/qdequele/ZeroDB/issues/10)):
+- ~~second descent~~ **RESOLVED 2026-07-22:** `ReserveLoc::Inline` now
+  carries the settled `(leaf, slot)` from every no-split insert arm (the
+  common case — one descent per `put_reserved`, also taken by the GC's
+  per-commit PIL writer); a split returns `None` and re-locates by key.
+  Debug builds cross-check the carried position against a real search on
+  every use, so the whole test battery referees the proof.
+- The *cursor* reserved put (`put_current_reserved_with_flags`) keeps its
+  heap-buffer emulation: no consumer calls it, and exact parity needs an
+  engine-level cursor reserve — see **D-015** (its closure/fill semantics
+  measurably diverge from the fork; recorded, pending maintainer decision
+  rather than built unilaterally).
 
 ### B7. Freelist bookkeeping allocation churn — issue [#29](https://github.com/qdequele/ZeroDB/issues/29)
 `drains: BTreeMap<u64, Vec<u64>>` + `reclaimed: HashSet` + PIL decode `Vec`
