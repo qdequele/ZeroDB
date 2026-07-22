@@ -18,6 +18,7 @@ exclude = ["crates/heed-shim"]
 edition = "2021"
 rust-version = "1.78"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/qdequele/ZeroDB"
 
 [workspace.dependencies]
 memmap2 = "0.9"
