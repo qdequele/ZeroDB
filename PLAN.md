@@ -397,7 +397,34 @@ Add to heed (as the zerodb backend's extension or upstreamed):
   then sub-tree encoding, dup cursors (first_dup/next_dup/get_both...),
   DUPFIXED packed layout, APPEND_DUP/MULTIPLE. Highest-defect-density area of
   LMDB — budget the dedicated differential fuzz target (≥ 2 h clean) when it
-  lands.
+  lands. **REVIVAL DIRECTED 2026-07-22** (parity-closure track below, issue
+  #72): resume per the PROGRESS.md M2.8 preconditions; ADR-0011 is Approved,
+  including the `cmp_fingerprint` that also settles D-014.
+
+**Parity-closure track (2026-07-22, maintainer directive):** fix the four
+divergences where LMDB is ahead of ZeroDB — D-004 (2.8 revival, issue #72),
+D-013 (2.9, issue #73), D-001 (2.10, issue #70), D-003 (2.11 spike, issue
+#71). DIVERGENCES.md winds down as fixes land: each fix retires its row; at
+track end the remaining ZeroDB-better/by-design entries are re-homed as
+permanent behavior documentation (requires a CLAUDE.md rule-1 rewrite —
+separate maintainer sign-off).
+
+- 2.9 dbi-handle lifetime parity (D-013, issue #73) — **ADR-0013 Approved
+  2026-07-22 (Option A)**: generation-checked `Database` handles so
+  use-after-abort / after-`drop_db` errors exactly like the fork
+  (`Io(InvalidInput)` at the heed boundary). Engine-level; no on-disk impact.
+  critical-implementer (touches the txn abort path).
+- 2.10 cross-process access (D-001, issue #70) — **ADR-0014 Approved
+  2026-07-22 (Option B: full multi-process)**, new SPEC 07 before code.
+  Staged: **2.10a** read-only attach (shared reader table in `zerodb.lck`,
+  single-RW exclusivity via file lock, pid+boot-id reaping) — closes D-001 as
+  filed; **2.10b** cross-process write arbitration (writer file-lock mutex at
+  `write_txn` begin, dead-writer takeover = reopen-grade meta re-validation).
+  critical-implementer; the crash matrix gains the dying-lock-holder
+  dimension.
+- 2.11 nested write txns (D-003, issue #71) — **spike-gated** (scope rule: no
+  consumer): bound the blast radius of child-txn page shadowing in a spike
+  before any ADR/staging decision. Not scheduled until the spike reports.
 
 **Accept:** each new API has differential semantics tests where LMDB has the
 feature, and doc + unit tests where it's zerodb-defined.
