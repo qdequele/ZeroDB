@@ -57,20 +57,25 @@ carries a `SAFETY:` contract, and the whole policy is written down in
 
 ## Performance
 
-Measured end-to-end on the real consumers, alternated same-run medians vs the
-LMDB fork, matched 16 K page geometry (Apple M-series; NVMe/EBS validation
-pending):
+Measured on the real consumers vs the LMDB fork (Apple M-series laptop;
+Graviton + EBS validation pending). Each row is dated: the July rows come from
+the in-repo perf campaign (alternated same-run medians, matched 16 K page
+geometry); the September row is Meilisearch's own end-to-end benchmark runner
+on two release builds of the real server (`scripts/consumer.sh bench`,
+[`benches/results/`](benches/results/)).
 
-| Workload | zerodb vs LMDB |
-|---|---|
-| **hannoy vector search** (DIM 512/768/1536) | **0.95× — faster** |
-| **Meilisearch (milli) indexing**, 30 k docs end-to-end | **1.12×** |
-| hannoy graph build | 1.27–1.49× |
-| Point get / full scan / overflow values (microbench) | ≈ parity |
-| Sequential put (microbench) | ~1.25× |
-| Commit (durable, laptop) | ~1.8× — the vectored-write path targets EBS, unmeasured there yet |
-| **On-disk size** (same milli index) | **0.83× — 17 % denser** |
-| Compaction peak memory | **O(tree depth × page size)** (~100 KB) vs ~2× env size |
+| Workload | zerodb vs LMDB | Measured |
+|---|---|---|
+| **Meilisearch v1.53.1 indexing**, movies workload, whole pipeline (10 runs) | **1.00×** — `write_db` phase 0.99× | 2026-09-09 |
+| **Meilisearch v1.53.1 search**, movies workload (10 runs) | 1.03× — inside noise | 2026-09-09 |
+| **hannoy vector search** (DIM 512/768/1536) | **0.95× — faster** | 2026-07-22 |
+| Meilisearch (milli) indexing, 30 k docs, in-repo harness | 1.12× | 2026-07-22 |
+| hannoy graph build | 1.27–1.49× | 2026-07-22 |
+| Point get / full scan / overflow values (microbench) | ≈ parity | 2026-07-22 |
+| Sequential put (microbench) | ~1.25× | 2026-07-22 |
+| Commit (durable, laptop) | ~1.8× — the vectored-write path targets EBS, unmeasured there yet | 2026-07-22 |
+| **On-disk size** (same milli index) | **0.83× — 17 % denser** | 2026-07-22 |
+| Compaction peak memory | **O(tree depth × page size)** (~100 KB) vs ~2× env size | 2026-07-22 |
 
 The whole optimization campaign is documented lever-by-lever — each with its
 profile evidence, soundness argument, and referee run — in
