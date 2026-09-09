@@ -5,6 +5,11 @@ description = "ZeroDB engine core: copy-on-write B+tree pages, MVCC transactions
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["lmdb", "heed", "key-value", "btree", "mvcc"]
+categories = ["database-implementations"]
 
 [dependencies]
 thiserror.workspace = true

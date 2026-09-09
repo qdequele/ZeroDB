@@ -5,6 +5,11 @@ description = "Offline utilities for ZeroDB environments: stat, dump, load, chec
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../docs/TOOLS.md"
+keywords = ["lmdb", "heed", "zerodb", "cli", "database"]
+categories = ["command-line-utilities", "database"]
 
 [lib]
 name = "zerodb_tools"
@@ -15,10 +20,10 @@ name = "zerodb-tools"
 path = "src/main.rs"
 
 [dependencies]
-zerodb = { path = "../zerodb" }
-zerodb-core = { path = "../zerodb-core" }
+zerodb = { path = "../zerodb", version = "=0.1.0" }
+zerodb-core = { path = "../zerodb-core", version = "=0.1.0" }
 # Read-only file helpers (probe_page_size) for the offline `check` walk; no C.
-zerodb-io = { path = "../zerodb-io" }
+zerodb-io = { path = "../zerodb-io", version = "=0.1.0" }
 # `flock`-based advisory liveness guard on the data file (SPEC/D-001: no
 # cross-process protocol exists, so the guard is best-effort). libc is on the
 # CLAUDE.md allowlist; the single `unsafe` FFI block is confined to

@@ -5,7 +5,12 @@ description = "A pure-Rust, transactional, memory-mapped key-value engine with L
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["lmdb", "heed", "key-value", "embedded", "database"]
+categories = ["database-implementations", "database"]
 
 [dependencies]
-zerodb-core = { path = "../zerodb-core" }
-zerodb-io = { path = "../zerodb-io" }
+zerodb-core = { path = "../zerodb-core", version = "=0.1.0" }
+zerodb-io = { path = "../zerodb-io", version = "=0.1.0" }

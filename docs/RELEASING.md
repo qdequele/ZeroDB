@@ -1,9 +1,21 @@
 # Releasing ZeroDB
 
 Policy: ADR-0013 (release and versioning). Short version: 0.x releases are git
-tags with a GitHub release and prebuilt `zerodb-tools` binaries; nothing is
-published to crates.io; consumers depend on the repo through `[patch.crates-io]`
-on `crates/heed-shim` at a tag.
+tags with a GitHub release, prebuilt `zerodb-tools` binaries, and a crates.io
+publish of the four engine crates (`zerodb-core`, `zerodb-io`, `zerodb`,
+`zerodb-tools`). The heed adapter is **not** published — cargo needs a crate
+*named* `heed` for the patch, so heed consumers depend on the repo through
+`[patch.crates-io]` on `crates/heed-shim` at a tag.
+
+## One-time setup
+
+- A crates.io API token scoped to *publish-new* and *publish-update* (limit it
+  to the four crate names once they exist), stored as the repository secret
+  `CARGO_REGISTRY_TOKEN`. The release workflow's last job uses it. Rotate it
+  like any credential; never paste it into a workflow file or a log.
+- The first publish of a brand-new crate name can also be done from a
+  maintainer's machine with the same token (`cargo login`, then the command in
+  "If crates.io publish fails" below); after that, prefer the workflow.
 
 ## Before tagging
 
@@ -59,6 +71,19 @@ on `crates/heed-shim` at a tag.
    new one). A format bump is an ADR (CLAUDE.md rule 6) and a minor-version bump
    at least while 0.x.
 
+7. **Publish dry run** on the release commit (CI does the manifest-only
+   variant on every PR; this one also builds each packaged crate):
+
+   ```sh
+   cargo publish --workspace --dry-run
+   ```
+
+   It must print exactly four `Uploading` lines (`zerodb-core`, `zerodb-io`,
+   `zerodb`, `zerodb-tools`, each "aborting upload due to dry run"). The
+   internal dependencies are exact pins (`version = "=X.Y.Z"`), so the version
+   bump in step 4 must also update those pins in `zerodb-io`, `zerodb` and
+   `zerodb-tools`.
+
 ## Tagging
 
 ```sh
@@ -72,11 +97,32 @@ builds `zerodb-tools` for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu
 and `aarch64-apple-darwin`, and creates the GitHub release with the CHANGELOG
 section as notes and the tarballs plus SHA-256 sums as assets. Binaries are
 built with default features only; `migrate-from-lmdb` links C LMDB and stays a
-from-source feature.
+from-source feature. Last, the `publish` job runs `cargo publish --workspace
+--locked`, which uploads the four engine crates in dependency order and skips
+the `publish = false` members.
+
+### If crates.io publish fails
+
+The tag and the GitHub release stand; crates.io is the only thing missing. Fix
+the cause (an expired token, a crates.io outage, a name squatted between the
+dry run and the tag) and publish from the tag by hand:
+
+```sh
+git checkout vX.Y.Z
+cargo publish --workspace --locked
+```
+
+If some crates already went out, `--workspace` will refuse to re-upload them;
+resume with the remaining ones in dependency order (`cargo publish -p zerodb-io`,
+then `-p zerodb`, then `-p zerodb-tools`). A version that went out wrong cannot
+be replaced, only yanked (`cargo yank`); the fix is a patch release.
 
 ## After tagging
 
 - Check the release page renders the notes and lists six assets.
+- Check crates.io shows the four crates at the new version and docs.rs built
+  them (`https://docs.rs/zerodb/X.Y.Z`); a docs.rs failure is fixed in a
+  patch release, not by re-publishing.
 - Update the pinned tag in `docs/CONSUMER-GATE.md` examples if the consumer
   pins moved.
 - Open the next CHANGELOG section as `## [Unreleased]`.
@@ -84,7 +130,9 @@ from-source feature.
 ## What 0.x promises (from ADR-0013)
 
 - **API**: may change between minor versions; a change to a heed-mirrored
-  signature is never made (that surface is heed's), only ZeroDB extensions move.
+  signature is never made (that surface is heed's), only ZeroDB extensions and
+  the native `zerodb` API move. cargo treats `0.Y.*` as one compatible line, so
+  a patch release never breaks a crates.io consumer's build.
 - **On-disk format**: files written by a release open unchanged in every later
   release with the same `FORMAT_VERSION`; a bump is announced in the CHANGELOG
   with a dump/load path.

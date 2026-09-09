@@ -52,6 +52,9 @@ jobs:
       - run: cargo test --workspace
       # heed-shim is excluded from the workspace on purpose; make sure it still builds.
       - run: cargo check --manifest-path crates/heed-shim/Cargo.toml
+      # The four engine crates must stay publishable (ADR-0013 rule 10): manifest
+      # metadata, versioned internal deps, readme paths. No upload, no build.
+      - run: cargo publish --workspace --dry-run --no-verify
 
   msrv:
     name: MSRV (workspace rust-version)

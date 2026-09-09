@@ -171,10 +171,12 @@ ZeroDB benchmark on the same workloads — see
   a custom comparator, `prefix_iter_mut("")`, streamed `copy_to_file`) are
   pinned by adapter tests but not yet by the oracle — see PROGRESS.md.
 - `DUPSORT` is parked by design (no consumer uses it — ADR-0011).
-- Releases are git tags with GitHub release notes and prebuilt `zerodb-tools`
-  binaries; nothing is on crates.io during 0.x (ADR-0013). Consumers pin a tag
-  through the `[patch.crates-io]` above. ZeroDB-only extension APIs may still
-  move between minor versions; heed-mirrored signatures never do.
+- Releases are git tags with GitHub release notes, prebuilt `zerodb-tools`
+  binaries, and the engine crates (`zerodb`, `zerodb-core`, `zerodb-io`,
+  `zerodb-tools`) on crates.io (ADR-0013). The heed drop-in itself is not on
+  crates.io — cargo needs a crate *named* `heed`, so consumers pin a tag through
+  the `[patch.crates-io]` above. ZeroDB-only extension APIs may still move
+  between minor versions; heed-mirrored signatures never do.
 
 ## License
 

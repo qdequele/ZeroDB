@@ -20,8 +20,11 @@ architecture (single writer, lock-free MVCC readers, copy-on-write B+tree,
 double-buffered CRC32C meta pages, reader-gated free-page GC) behind a 1:1
 re-implementation of heed 0.22.1's API. Meilisearch and hannoy build against it
 with **zero source changes** through `[patch.crates-io] heed = { git =
-"https://github.com/qdequele/ZeroDB", tag = "v0.1.0" }`. The full coverage
-matrix of heed items and LMDB features is `docs/COMPATIBILITY.md`.
+"https://github.com/qdequele/ZeroDB", tag = "v0.1.0" }`. The engine crates
+`zerodb`, `zerodb-core`, `zerodb-io` and `zerodb-tools` are published on
+crates.io at this version (the heed adapter is git-only: cargo needs a crate
+*named* `heed` for the patch). The full coverage matrix of heed items and LMDB
+features is `docs/COMPATIBILITY.md`.
 
 ### Verified on this release
 

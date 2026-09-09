@@ -5,9 +5,14 @@ description = "ZeroDB I/O layer: memory-mapped reads, pwrite/pwritev commit back
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["lmdb", "heed", "key-value", "mmap", "fsync"]
+categories = ["database-implementations", "filesystem"]
 
 [dependencies]
-zerodb-core = { path = "../zerodb-core" }
+zerodb-core = { path = "../zerodb-core", version = "=0.1.0" }
 memmap2.workspace = true
 # pwritev for the vectored commit write path (PERF-GAP B4); allowlisted.
 libc.workspace = true
