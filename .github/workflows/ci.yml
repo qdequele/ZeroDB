@@ -73,7 +73,7 @@ jobs:
           toolchain: ${{ steps.msrv.outputs.v }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       # The MSRV promise covers the crates a consumer builds, without
-      # dev-dependencies (criterion's clap needs edition 2024 / Rust 1.85, and
+      # dev-dependencies (criterion 0.8 needs Rust 1.86, and
       # that only matters for running our own benches and tests).
       - run: cargo check -p zerodb-core -p zerodb-io -p zerodb -p heed-zerodb -p zerodb-tools
       - run: cargo check --manifest-path crates/heed-shim/Cargo.toml

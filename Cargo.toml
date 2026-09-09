@@ -26,8 +26,8 @@ authors = ["Quentin de Quelen <quentin@meilisearch.com>"]
 [workspace.dependencies]
 memmap2 = "0.9"
 libc = "0.2"
-thiserror = "1"
+thiserror = "2"
 crossbeam-utils = "0.8"
 proptest = "1"
 arbitrary = { version = "1", features = ["derive"] }
-criterion = "0.5"
+criterion = "0.8"
