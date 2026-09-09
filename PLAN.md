@@ -464,7 +464,7 @@ Ordering chosen by expected impact for Meilisearch/hannoy on Graviton + EBS/NVMe
 - Bench: hannoy distance-kernel throughput and search latency vs B-tree
   storage.
 
-### 3.7 Prefetch and access hints — CHOSEN 2026-07-20; ADR-0012 is a **Draft** awaiting human approval, no code exists yet (rule 6)
+### 3.7 Prefetch and access hints — CHOSEN 2026-07-20; ADR-0012 is a **Draft** awaiting human approval, no code exists yet (CLAUDE.md rule 6: Phase 3 is ADR-first)
 - `db.prefetch(keys)` / `txn.advise(range, Willneed|Random|Sequential)`
   mapping to madvise; replaces hannoy's env-var hack.
 - **Verified live consumer:** hannoy `Reader::prefetch_graph`

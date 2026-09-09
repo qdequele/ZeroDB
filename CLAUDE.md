@@ -86,9 +86,10 @@ just loom                                # reader-table model check (ADR-0006) w
 just stress                              # 180 s reader/writer stress — mandatory before an integration gate
 ```
 
-The same battery runs in `.github/workflows/ci.yml` (fmt/clippy/test/miri/loom
-and fuzz-quick + crash-test-quick per PR on x86-64 and aarch64; the long fuzz,
-full crash run and stress nightly).
+The same battery runs in `.github/workflows/ci.yml`: per PR, fmt/clippy/test
+and fuzz-quick on both x86-64 and aarch64, miri, loom and crash-test-quick on
+x86-64 only; nightly, the long fuzz, the full crash run and stress on both
+architectures.
 
 Performance claims require a `cargo bench` criterion diff pasted in the summary.
 

@@ -8,8 +8,11 @@ be nested one level (`round-N/`), as scripts/consumer.sh writes them.
 
 For every workload this prints the per-run total (sum of every span's
 `self_time`, i.e. the wall time spent inside instrumented code) as median and
-min over runs for both engines, plus the spans that dominate the total, so a
-regression can be attributed to indexing, search, commit, and so on.
+min over runs for both engines, plus the spans that dominate, so a regression
+can be attributed to indexing, search, commit, and so on. The per-span column
+is deliberately the *inclusive* `time` (what Meilisearch's benchmark dashboard
+shows): `indexing::write_db::all` is only meaningful with its children
+counted. Inclusive spans therefore overlap and do not sum to the total.
 
 Usage: bench-compare.py <lmdb-report-dir> <zerodb-report-dir> [--top N]
 """
@@ -72,7 +75,8 @@ def main(argv):
         ma, mb = statistics.median(ta), statistics.median(tb)
         print(f"   {'total (self time)':44s} lmdb {fmt(ma)}  zerodb {fmt(mb)}  ratio {mb / ma:5.2f}x"
               f"   (min {fmt(min(ta)).strip()} / {fmt(min(tb)).strip()})")
-        # dominant spans by LMDB median time, compared on the ZeroDB side
+        # dominant spans by LMDB median *inclusive* time (index 1), compared on
+        # the ZeroDB side; the total above is self time (index 2) — see the docstring
         names = set()
         for r in ra + rb:
             names.update(r)
@@ -84,11 +88,11 @@ def main(argv):
                 continue  # not present in most runs on both sides
             rows.append((statistics.median(sa), statistics.median(sb), n))
         rows.sort(reverse=True)
-        print(f"   {'span (median time over runs)':44s} {'lmdb':>11s}  {'zerodb':>13s}  ratio")
+        print(f"   {'span (median inclusive time over runs)':44s} {'lmdb':>11s}  {'zerodb':>13s}  ratio")
         for sa, sb, n in rows[:top]:
             ratio = f"{sb / sa:5.2f}x" if sa else "   n/a"
             print(f"   {n[:44]:44s} {fmt(sa)}  {fmt(sb)}  {ratio}")
-    print("\nratio < 1.00x means ZeroDB is faster; spans are summed across calls per run.")
+    print("\nratio < 1.00x means ZeroDB is faster; spans are inclusive and summed across calls per run.")
     return 0
 
 

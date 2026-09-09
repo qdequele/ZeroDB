@@ -8,7 +8,7 @@ only: the production target is Graviton + EBS gp3.
 - Workloads: `workloads/movies.json` (settings + ~32k documents indexing, run_count 10) and `workloads/search/movies.json` (run_count 10). One round, LMDB first then ZeroDB. Server on port 7799.
 - Per-span timings collected by `cargo xtask bench --no-dashboard` through the logs route; `total (self time)` = sum of every span's self time per run; median over the 10 runs.
 
-```
+```text
 == movies.json  (runs: lmdb 10, zerodb 10)
    total (self time)                            lmdb    4.486 s   zerodb    4.503 s   ratio  1.00x   (min 4.072 s / 3.977 s)
    span (median time over runs)                        lmdb         zerodb  ratio

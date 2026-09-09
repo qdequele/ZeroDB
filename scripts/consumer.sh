@@ -46,7 +46,15 @@ log() { printf '\n\033[1m[consumer] %s\033[0m\n' "$*"; }
 
 ensure_clone() {
     if [ -d "$CLONE/.git" ]; then
-        log "reusing clone at $CLONE ($(git -C "$CLONE" rev-parse --short HEAD))"
+        # A previous run may have died with the patch block still in place.
+        set_patch off
+        if git -C "$CLONE" rev-parse --verify -q "$MEILISEARCH_REF^{commit}" >/dev/null; then
+            git -C "$CLONE" checkout -q --detach "$MEILISEARCH_REF"
+        else
+            git -C "$CLONE" fetch -q origin "$MEILISEARCH_REF"
+            git -C "$CLONE" checkout -q --detach FETCH_HEAD
+        fi
+        log "reusing clone at $CLONE, now at $MEILISEARCH_REF ($(git -C "$CLONE" rev-parse --short HEAD))"
         return
     fi
     mkdir -p "$(dirname "$CLONE")"
@@ -159,7 +167,6 @@ do_bench() {
     build_binary zerodb
     set_patch off
     port_setup
-    trap port_teardown EXIT
     for r in $(seq 1 "$ROUNDS"); do
         if [ $((r % 2)) -eq 1 ]; then
             run_bench lmdb "$r"; run_bench zerodb "$r"
@@ -172,12 +179,21 @@ do_bench() {
     python3 "$ZERODB/scripts/bench-compare.py" "$WORKDIR/reports/lmdb" "$WORKDIR/reports/zerodb"
 }
 
+# Whatever happens — a failing suite, a killed bench — leave the clone with its
+# stock manifest and the runner unpatched, and keep the real exit status.
+cleanup() {
+    local rc=$?
+    port_teardown
+    set_patch off
+    exit "$rc"
+}
+
 ensure_clone
+trap cleanup EXIT
 case "$MODE" in
     check)  do_check ;;
     suites) do_suites ;;
     bench)  do_bench ;;
     *) echo "usage: $0 {check|suites|bench}" >&2; exit 2 ;;
 esac
-set_patch off
 log "done ($MODE); clone left at $CLONE with its stock Cargo.toml"

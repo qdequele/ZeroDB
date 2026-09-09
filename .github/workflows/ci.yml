@@ -36,6 +36,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -53,6 +55,8 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
@@ -67,6 +71,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: RUSTFLAGS="--cfg loom" CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo test -p zerodb-core --lib --release loom_
@@ -82,6 +88,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
@@ -106,6 +114,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo run -p zerodb-oracle --bin crash-harness -- --cycles 200
@@ -121,6 +131,8 @@ jobs:
     timeout-minutes: 350 # GitHub caps a job at 6 h
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
