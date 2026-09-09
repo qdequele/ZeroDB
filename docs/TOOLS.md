@@ -13,7 +13,21 @@ file's own `ZDB1` magic.
 
 ```
 zerodb-tools <SUBCOMMAND> [ARGS]
+zerodb-tools --version          # crate version + on-disk format version
+zerodb-tools --help
 ```
+
+**Installing.** Every GitHub release ships prebuilt tarballs for
+`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` and
+`aarch64-apple-darwin` with a SHA-256 sum next to each; unpack and put
+`zerodb-tools` on your `PATH`. From crates.io: `cargo install zerodb-tools`.
+From source: `cargo install --path crates/zerodb-tools`. Either way, add
+`--features migrate-lmdb` for `migrate-from-lmdb`, which links the C LMDB fork
+and is therefore not in the prebuilt binaries.
+
+**Exit codes.** `0` success; `1` = `check` found violations; `2` = usage error
+or any other failure (unknown subcommand or option, unreadable env, …). Unknown
+`--options` are rejected rather than treated as paths.
 
 - **`stat <env-dir>`** — environment and per-database statistics: page size,
   map size, `real_disk_size`, `non_free_pages_size`, free-page count,

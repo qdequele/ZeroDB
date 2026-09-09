@@ -5,16 +5,21 @@
 # not collide with the real `heed = "=0.22.1"` the oracle links (ADR-0001): the
 # oracle depends on BOTH — real heed (LMDB) and this crate (`heed_zerodb`) — in
 # one binary for in-process A/B diffing. Consumers (milli/hannoy) switch backends
-# with `[patch.crates-io] heed = { path = ".../heed-zerodb", package = "heed-zerodb" }`
-# (docs/patches/, milestone 1.13); the `package =` rename keeps the dependency
-# *named* `heed` in consumer code while pointing it at this crate.
+# with `[patch.crates-io] heed = { path = ".../crates/heed-shim" }` — a crate
+# literally named `heed` that re-exports this one (docs/CONSUMER-GATE.md). A
+# `package = "heed-zerodb"` rename inside `[patch]` does NOT work: cargo requires
+# the replacement to share the patched crate's name and ignores the rename
+# (verified M1.13; see crates/heed-shim/Cargo.toml).
 [package]
 name = "heed-zerodb"
-# Version tracks the heed line it reproduces (0.22.1) so a consumer's
-# `[patch.crates-io] heed = { path = "…", package = "heed-zerodb" }` satisfies
-# their `heed = "0.22.1"` requirement (docs/patches/, milestone 1.13). The crate
+# Version tracks the heed line it reproduces (0.22.1) so the `heed-shim` patch
+# target that re-exports it satisfies a consumer's `heed = "0.22.1"`
+# requirement (scripts/consumer.sh, milestone 1.13). The crate
 # is never published (ADR-0003 OQ1); the version is only for patch resolution.
 version = "0.22.1"
+# Never published (ADR-0003 OQ1, ADR-0013): consumed only through crates/heed-shim.
+publish = false
+description = "heed 0.22.1 API surface re-implemented over the ZeroDB engine (the heed-shim target)."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -200,6 +200,13 @@ impl RoTxn<'_> {
             EnvHandle::Owned(e) => e,
         }
     }
+
+    /// The identity of the environment this transaction belongs to
+    /// ([`Env::ident`]).
+    #[must_use]
+    pub fn env_ident(&self) -> usize {
+        self.env_ref().ident()
+    }
 }
 
 impl Drop for RoTxn<'_> {
@@ -223,6 +230,10 @@ impl TxnRead for RoTxn<'_> {
         // it, borrowed or owned).
         Source::Map {
             bytes: self.env_ref().inner().backing_bytes(),
+            // The pinned snapshot's committed high-water bounds every map
+            // read (SPEC 06 REC-14: no committed reference exceeds it, so any
+            // pgno above it is corruption, refused typed).
+            last_pg: self.snap.last_pg,
         }
     }
     fn main_record(&self) -> &DBRecord {
@@ -424,7 +435,9 @@ impl Env {
 /// [`MdbError::Invalid`] on a corrupt GC tree or a malformed PIL.
 pub fn free_page_count<T: TxnRead>(txn: &T) -> Result<u64> {
     let rec = txn.free_record();
-    let tree = Tree::new(txn.source(), txn.page_size(), rec.root, rec.depth);
+    let source = txn.source();
+    let last_pg = source.last_pg();
+    let tree = Tree::new(source, txn.page_size(), rec.root, rec.depth);
     let mut cursor = tree.cursor();
     let mut total = 0u64;
     let mut entry = cursor.first().map_err(map_page_err)?;
@@ -432,6 +445,7 @@ pub fn free_page_count<T: TxnRead>(txn: &T) -> Result<u64> {
         // GC-3 shape validation via the shared PIL codec (a torn PIL errors
         // rather than silently mis-counting — INV-26's runtime cousin).
         let ids = crate::page::geometry::pil_decode(val).ok_or(Error::Mdb(MdbError::Invalid))?;
+        crate::rwtxn::validate_pil_ids(&ids, last_pg)?;
         total += ids.len() as u64;
         entry = cursor.next().map_err(map_page_err)?;
     }

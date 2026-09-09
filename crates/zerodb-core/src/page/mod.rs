@@ -13,8 +13,10 @@
 //!   is the GC-DB txnid key, which is big-endian (SPEC 05); see
 //!   [`geometry::gc_key_encode`].
 //! - **No `#[repr(C)]` casts of unaligned data.** All fields are read/written by
-//!   explicit offset through [`raw`] (safe `from_le_bytes`/`to_le_bytes`). This
-//!   module contains **zero** `unsafe`.
+//!   explicit offset through [`raw`]. Since PERF-GAP A3 the field readers in
+//!   [`raw`] are unchecked `read_unaligned` behind the validated-view contract
+//!   (the only `unsafe` in this crate; `#[allow(unsafe_code)]` on that one
+//!   module); the rest of this module is safe code.
 //! - **Body-relative offsets:** intra-page offsets (`lower`, `upper`, node
 //!   pointers) are measured from the first byte after the header (absolute
 //!   offset [`HEADER_SIZE`]).
@@ -294,5 +296,25 @@ pub enum PageError {
         needed: usize,
         /// Free bytes available.
         available: usize,
+    },
+
+    /// A branch page decodes with zero children. A well-formed branch always
+    /// holds at least one child (SPEC 02 §4.1, SPEC 03 INV-8), so this is
+    /// structural corruption; rejecting it at decode keeps `child_pgno(0)`
+    /// total for every constructed view.
+    #[error("branch page has zero children (a branch always holds >= 1 child)")]
+    EmptyBranch,
+
+    /// A page number lies beyond the transaction snapshot's committed
+    /// high-water (`last_pg`). Bytes past the high-water may be unbacked by
+    /// the file even though the mapping covers them (the map spans the full
+    /// `map_size`), so dereferencing them could fault; a corrupt/hostile
+    /// reference is refused with this typed error instead (SPEC 06 REC-14).
+    #[error("page {pgno} beyond the snapshot high-water last_pg={last_pg}")]
+    PageOutOfBounds {
+        /// The out-of-bounds page number.
+        pgno: u64,
+        /// The snapshot's committed high-water.
+        last_pg: u64,
     },
 }

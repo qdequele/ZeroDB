@@ -1,9 +1,15 @@
 [package]
 name = "zerodb-core"
-version = "0.0.1"
+version = "0.1.0"
+description = "ZeroDB engine core: copy-on-write B+tree pages, MVCC transactions, free-page GC and a lock-free reader table. No I/O policy."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["lmdb", "heed", "key-value", "btree", "mvcc"]
+categories = ["database-implementations"]
 
 [dependencies]
 thiserror.workspace = true

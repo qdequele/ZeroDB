@@ -370,10 +370,10 @@ dims); hannoy build 1.27–1.49×; micro get/scan/overflow ≈ parity; on-disk
 
 What remains, and its gate:
 
-- **Profile-gated micro levers:** A5 (branch-level cursor cache), A6 (#19
-  inline cursor stack), A7 (#14 comparator monomorphization), plus the B1
-  residual (#7) and B6 residuals (#10). Implement only what a consumer
-  call-tree names — two blind picks were falsified this campaign.
+- **Profile-gated micro levers:** A5 (branch-level cursor cache), A7 (#14
+  comparator monomorphization), plus the B1 residual (#7) and the cursor half
+  of B6 (#10 / D-015). A6 (#19) landed 2026-07-22. Implement only what a
+  consumer call-tree names — two blind picks were falsified this campaign.
 - **Hardware-gated validation:** B4 is built but unmeasured on its target
   (Graviton + EBS); same run validates the durable-commit path (~1.8× on
   laptop, unknown on EBS).
@@ -382,8 +382,11 @@ What remains, and its gate:
 - **Measure-first:** B7 (#29) — only matters under GC churn.
 - **Inherent, mitigations tracked:** C2 → spilling (#3), B5 (#13), or B3
   pooling (parked).
-- **Tooling residual:** C3 — wire `load`/`migrate-from-lmdb` to the C1
-  streaming path (#63's load half).
+- **Tooling residual:** C3 landed 2026-07-22 (`load` streams; #63's load
+  half). Still buffered: `copy_raw` (`CompactionOption::Disabled`, 1× env in
+  RAM + single `fs::write`), and — until 2026-09-09 — the adapter's
+  `heed::Env::copy_to_file`, which `read_to_end`'d the staged copy before
+  writing it (now `io::copy` through a private staging dir).
 
 The broader Phase-3 technique backlog (beyond this inventory's LMDB-parity
 scope) lives in the GitHub issues, filed 2026-07-22: prefetch/madvise, io_uring,

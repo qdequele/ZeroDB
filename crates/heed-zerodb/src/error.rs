@@ -139,34 +139,67 @@ impl MdbError {
 }
 
 impl fmt::Display for MdbError {
+    // The exact `mdb_strerror` text of the vendored fork (`mdb_errstr` table in
+    // liblmdb/mdb.c), which is what heed's `Display` prints: consumers format
+    // these into logs and HTTP error bodies, so the wording is part of the
+    // observable surface. Pinned against real heed by
+    // `zerodb-oracle/tests/adapter_surface_parity.rs`.
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            MdbError::KeyExist => f.write_str("key/data pair already exists"),
-            MdbError::NotFound => f.write_str("key/data pair not found (EOF)"),
-            MdbError::PageNotFound => f.write_str("requested page not found"),
-            MdbError::Corrupted => f.write_str("located page was wrong type"),
-            MdbError::Panic => f.write_str("update of meta page failed or environment fatal error"),
-            MdbError::VersionMismatch => f.write_str("environment version mismatch"),
-            MdbError::Invalid => f.write_str("file is not a valid LMDB file"),
-            MdbError::MapFull => f.write_str("environment mapsize reached"),
-            MdbError::DbsFull => f.write_str("environment maxdbs reached"),
-            MdbError::ReadersFull => f.write_str("environment maxreaders reached"),
-            MdbError::TlsFull => f.write_str("too many TLS keys in use"),
-            MdbError::TxnFull => f.write_str("transaction has too many dirty pages"),
-            MdbError::CursorFull => f.write_str("cursor stack too deep"),
-            MdbError::PageFull => f.write_str("page has not enough space"),
+            MdbError::KeyExist => f.write_str("MDB_KEYEXIST: Key/data pair already exists"),
+            MdbError::NotFound => f.write_str("MDB_NOTFOUND: No matching key/data pair found"),
+            MdbError::PageNotFound => f.write_str("MDB_PAGE_NOTFOUND: Requested page not found"),
+            MdbError::Corrupted => f.write_str("MDB_CORRUPTED: Located page was wrong type"),
+            MdbError::Panic => {
+                f.write_str("MDB_PANIC: Update of meta page failed or environment had fatal error")
+            }
+            MdbError::VersionMismatch => {
+                f.write_str("MDB_VERSION_MISMATCH: Database environment version mismatch")
+            }
+            MdbError::Invalid => f.write_str("MDB_INVALID: File is not an LMDB file"),
+            MdbError::MapFull => f.write_str("MDB_MAP_FULL: Environment mapsize limit reached"),
+            MdbError::DbsFull => f.write_str("MDB_DBS_FULL: Environment maxdbs limit reached"),
+            MdbError::ReadersFull => {
+                f.write_str("MDB_READERS_FULL: Environment maxreaders limit reached")
+            }
+            MdbError::TlsFull => f.write_str(
+                "MDB_TLS_FULL: Thread-local storage keys full - too many environments open",
+            ),
+            MdbError::TxnFull => f.write_str(
+                "MDB_TXN_FULL: Transaction has too many dirty pages - transaction too big",
+            ),
+            MdbError::CursorFull => {
+                f.write_str("MDB_CURSOR_FULL: Internal error - cursor stack limit reached")
+            }
+            MdbError::PageFull => {
+                f.write_str("MDB_PAGE_FULL: Internal error - page has no more space")
+            }
             MdbError::MapResized => {
-                f.write_str("database contents grew beyond environment mapsize")
+                f.write_str("MDB_MAP_RESIZED: Database contents grew beyond environment mapsize")
             }
             MdbError::Incompatible => {
-                f.write_str("operation and DB incompatible, or DB type changed")
+                f.write_str("MDB_INCOMPATIBLE: Operation and DB incompatible, or DB flags changed")
             }
-            MdbError::BadRslot => f.write_str("invalid reuse of reader locktable slot"),
-            MdbError::BadTxn => f.write_str("transaction cannot recover — it must be aborted"),
-            MdbError::BadValSize => f.write_str("unsupported size of key/DB name/data"),
-            MdbError::BadDbi => f.write_str("the specified DBI was changed unexpectedly"),
-            MdbError::Problem => f.write_str("unexpected problem — transaction should abort"),
-            MdbError::Other(code) => write!(f, "{}", io::Error::from_raw_os_error(*code)),
+            MdbError::BadRslot => {
+                f.write_str("MDB_BAD_RSLOT: Invalid reuse of reader locktable slot")
+            }
+            MdbError::BadTxn => {
+                f.write_str("MDB_BAD_TXN: Transaction must abort, has a child, or is invalid")
+            }
+            MdbError::BadValSize => f.write_str(
+                "MDB_BAD_VALSIZE: Unsupported size of key/DB name/data, or wrong DUPFIXED size",
+            ),
+            MdbError::BadDbi => {
+                f.write_str("MDB_BAD_DBI: The specified DBI handle was closed/changed unexpectedly")
+            }
+            MdbError::Problem => f.write_str("MDB_PROBLEM: Unexpected problem - txn should abort"),
+            // heed prints the bare `strerror` text for an OS error code; Rust's
+            // `io::Error` Display appends " (os error N)", so trim that suffix.
+            MdbError::Other(code) => {
+                let text = io::Error::from_raw_os_error(*code).to_string();
+                let suffix = format!(" (os error {code})");
+                f.write_str(text.strip_suffix(suffix.as_str()).unwrap_or(&text))
+            }
         }
     }
 }

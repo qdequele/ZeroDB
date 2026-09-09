@@ -240,11 +240,17 @@ fn stream_env_to_file(
     main_user: &[crate::common::Kv],
     named: &[crate::common::NamedDb],
 ) -> Result<u64, BoxErr> {
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(data)?;
+    // Owner-only, like the engine's own env creation (the lock step already
+    // created this file 0600; keep the mode if a future path creates fresh).
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(data)?
+    };
     let sink = LoadSink {
         file,
         psize,

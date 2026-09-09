@@ -24,11 +24,14 @@ loom:
 stress:
     ZERODB_STRESS_SECS=180 cargo test -p zerodb --test reader_stress -- --nocapture stress_
 
-# 10-minute differential fuzz (gate for every milestone; cargo-fuzz needs nightly)
+# Differential fuzz gate for every milestone (10 min diff_ops + 2 min hostile-image
+# open; cargo-fuzz needs nightly)
 fuzz-quick:
     cargo +nightly fuzz run diff_ops -- -max_total_time=600
+    cargo +nightly fuzz run fuzz_image_open -- -max_total_time=120
 
-# Long fuzz for nightly CI (diff_dupsort target joins in Phase 2.8, see D-004)
+# Long fuzz for nightly CI (6 h; PLAN 1.14 asks for a 24 h soak — run it on a
+# self-hosted box or chain runs. A dup fuzz target only arrives if 2.8 resumes.)
 fuzz-long:
     cargo +nightly fuzz run diff_ops -- -max_total_time=21600
 
@@ -47,3 +50,22 @@ bench:
 
 bench-quick:
     cargo bench -p zerodb-oracle --bench engine_comparison -- --quick
+
+# Consumer gate — Meilisearch on ZeroDB (scripts/consumer.sh; MEILISEARCH_REF,
+# MEILISEARCH_SRC, WORKLOADS, ROUNDS documented in the script header).
+consumer-check:
+    scripts/consumer.sh check
+
+consumer-suites:
+    scripts/consumer.sh suites
+
+# Same workloads, two binaries (stock LMDB vs ZeroDB), spans compared per run.
+consumer-bench:
+    scripts/consumer.sh bench
+
+# hannoy (HNSW) on ZeroDB — suite, and divan build/search benches on both engines.
+hannoy-suites:
+    scripts/hannoy.sh suites
+
+hannoy-bench:
+    scripts/hannoy.sh bench

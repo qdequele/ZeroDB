@@ -550,16 +550,19 @@ impl<'a> LeafMut<'a> {
     ///
     /// # Errors
     ///
-    /// Never fails for a valid `idx`; returns via `debug_assert` in debug if
-    /// `idx` is out of range.
-    pub fn remove(&mut self, idx: usize) {
+    /// [`PageError::CellOutOfBounds`] (or another cell-shape error) if the
+    /// cell at `idx` does not decode. [`LeafMut::from_valid`] runs only the
+    /// O(1) structural checks since PERF-GAP A8, so a caller that wraps a
+    /// page whose cells were never fully validated (the constructor is `pub`)
+    /// must get a typed error here, never a panic.
+    pub fn remove(&mut self, idx: usize) -> Result<(), PageError> {
         let num_keys = self.num_keys();
         debug_assert!(idx < num_keys, "remove index out of range");
         let cpos = ptr_at(self.buf, idx) as usize;
         let abs = HEADER_SIZE + cpos;
-        let clen =
-            leaf_cell_len(self.buf, abs, self.psize).expect("cell was validated on construction");
+        let clen = leaf_cell_len(self.buf, abs, self.psize)?;
         remove_cell(self.buf, idx, num_keys, cpos, clen, self.upper() as usize);
+        Ok(())
     }
 }
 
@@ -606,6 +609,16 @@ impl<'a> BranchRef<'a> {
         }
         check_reserved_tail_fields(buf)?;
         let (lower, upper) = read_and_check_bounds(buf, psize)?;
+        // A well-formed branch always has >= 1 child (SPEC 02 §4.1, SPEC 03
+        // INV-8): rejecting `num_keys == 0` here keeps `child_pgno(0)` /
+        // `child_index` total for every constructed view (the descent loops
+        // dereference child 0 unconditionally). Engine-authored frames are
+        // never re-wrapped while transiently empty (fresh branches are built
+        // through `BranchMut::init` + `insert`), so this is a pure
+        // corruption check — O(1), safe on the prevalidated path.
+        if lower < 2 {
+            return Err(PageError::EmptyBranch);
+        }
         Ok(BranchRef { buf, lower, upper })
     }
 
@@ -821,14 +834,20 @@ impl<'a> BranchMut<'a> {
     }
 
     /// Remove child entry `idx`, compacting the cell heap.
-    pub fn remove(&mut self, idx: usize) {
+    ///
+    /// # Errors
+    ///
+    /// A cell-shape error if the cell at `idx` does not decode — same
+    /// rationale as [`LeafMut::remove`]: `from_valid` runs O(1) checks only,
+    /// so an unvalidated cell surfaces here as a typed error, not a panic.
+    pub fn remove(&mut self, idx: usize) -> Result<(), PageError> {
         let num_keys = self.num_keys();
         debug_assert!(idx < num_keys, "remove index out of range");
         let cpos = ptr_at(self.buf, idx) as usize;
         let abs = HEADER_SIZE + cpos;
-        let clen = branch_cell_len(self.buf, abs, self.psize, idx == 0)
-            .expect("cell was validated on construction");
+        let clen = branch_cell_len(self.buf, abs, self.psize, idx == 0)?;
         remove_cell(self.buf, idx, num_keys, cpos, clen, self.upper() as usize);
+        Ok(())
     }
 }
 

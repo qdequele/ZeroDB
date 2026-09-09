@@ -2,7 +2,8 @@
 //! TXN-14..22; ADR-0006). Milestone 1.8.
 //!
 //! This module is the only place a reader and the writer communicate. It
-//! contains **no** `unsafe` (the crate stays `#![forbid(unsafe_code)]` —
+//! contains **no** `unsafe` (the crate is `#![deny(unsafe_code)]`, opened only
+//! in `page::raw` —
 //! ADR-0006 Option B): the load-bearing lock-free protocol is carried entirely
 //! by the slot atomics and the `commit_point` atomic; the snapshot cell's
 //! mutex only manages the `Arc<Snapshot>`'s lifetime, with critical sections
@@ -29,6 +30,23 @@ use crate::sync::{AtomicU64, Mutex, Ordering};
 
 /// Slot sentinel: unoccupied (SPEC 04 TXN-14).
 pub(crate) const RDR_FREE: u64 = u64::MAX;
+/// The largest committed txnid an env may carry (open-time bound, SPEC 06
+/// REC-1a): the slot word encodes occupancy via the sentinel band at the top
+/// of `u64`, so a *pinned* txnid must stay strictly below [`RDR_CLAIMED`] —
+/// and the next writer txnid is `meta.txnid + 1`, which must not wrap or
+/// enter the band either. A committed txnid above this is unreachable by any
+/// real workload (ids grow by one per commit) and therefore marks a corrupt
+/// or hostile meta; `open_with_backing` rejects it with `MdbError::Invalid`
+/// instead of letting `store_pin`'s TXN-14 assumption break.
+///
+/// The bound leaves a margin of 2^32 ids below the band, and `RwTxn::new`
+/// re-enforces it at runtime (a writer refuses to start once
+/// `base.txnid >= MAX_COMMITTED_TXNID`): an accepted file can therefore
+/// never *commit its way* into the band, however many transactions follow.
+/// (A margin of only a few ids would let a boundary-value hostile meta reach
+/// `RDR_CLAIMED` two commits after a successful open — spec review 2026-09-09.)
+pub(crate) const MAX_COMMITTED_TXNID: u64 = RDR_CLAIMED - (1 << 32);
+
 /// Slot sentinel: reserved by a reader that has not yet published a real
 /// snapshot txnid (transient, SPEC 04 §4.3).
 pub(crate) const RDR_CLAIMED: u64 = u64::MAX - 1;

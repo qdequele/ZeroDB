@@ -447,7 +447,7 @@ fn leaf_remove_compaction_adversarial(psize: u32) {
         let idx = leaf.lookup(key).unwrap();
         let removed_val = expected.remove(key).unwrap();
         consumed -= leaf_cost(key.len(), removed_val.len());
-        leaf.remove(idx);
+        leaf.remove(idx).unwrap();
         assert_eq!(leaf.free_space(), body - consumed);
     }
 

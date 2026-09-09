@@ -29,6 +29,7 @@
 //! unit- and integration-testable) plus a thin `main.rs` that parses argv and
 //! dispatches through [`run`].
 
+#![deny(missing_docs)]
 pub mod commands;
 pub mod common;
 pub mod dump_format;
@@ -76,7 +77,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, common::BoxErr> {
             Ok(ExitCode::SUCCESS)
         }
         "dump" => {
-            let (positional, opts) = parse_opts(rest);
+            let (positional, opts) = parse_opts(rest)?;
             let dir = first_positional(&positional, "dump <env-dir> [--out FILE]")?;
             let text = commands::cmd_dump(&dir)?;
             match opts.out {
@@ -86,7 +87,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, common::BoxErr> {
             Ok(ExitCode::SUCCESS)
         }
         "load" => {
-            let (positional, opts) = parse_opts(rest);
+            let (positional, opts) = parse_opts(rest)?;
             if positional.len() < 2 {
                 return Err(
                     "usage: load <dump-file> <env-dir> [--page-size N] [--map-size BYTES]".into(),
@@ -115,13 +116,21 @@ fn dispatch(args: &[String]) -> Result<ExitCode, common::BoxErr> {
             println!("{USAGE}");
             Ok(ExitCode::SUCCESS)
         }
+        "-V" | "--version" | "version" => {
+            println!(
+                "zerodb-tools {} (on-disk format version {})",
+                env!("CARGO_PKG_VERSION"),
+                zerodb_core::page::FORMAT_VERSION
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         other => Err(format!("unknown subcommand {other:?}\n{USAGE}").into()),
     }
 }
 
 #[cfg(feature = "migrate-lmdb")]
 fn run_migrate(rest: &[String]) -> Result<ExitCode, common::BoxErr> {
-    let (positional, opts) = parse_opts(rest);
+    let (positional, opts) = parse_opts(rest)?;
     if positional.len() < 2 {
         return Err(
             "usage: migrate-from-lmdb <src-lmdb-dir> <dst-env-dir> [--page-size N] [--map-size BYTES]"
@@ -153,6 +162,8 @@ Subcommands:
   check <env-dir>                       invariant check (exit 1 on violations)
   migrate-from-lmdb <src> <dst>         stream an LMDB env into a fresh env
         [--page-size N] [--map-size BYTES]   (requires --features migrate-lmdb)
+  -V, --version                         print the zerodb-tools version
+  -h, --help                            this text
 
 All tools operate OFFLINE: they take an exclusive flock on the data file and
 refuse if the env may be live (D-001: no cross-process reader protocol).";
@@ -168,12 +179,19 @@ struct Opts {
 /// Split `args` into positional args and recognised `--flag value` options.
 /// Unknown `--flags` are treated as positional (kept simple; hand-rolled, no
 /// `clap`). Returns `(positional, opts)`.
-fn parse_opts(args: &[String]) -> (Vec<String>, Opts) {
+fn parse_opts(args: &[String]) -> Result<(Vec<String>, Opts), common::BoxErr> {
     let mut positional = Vec::new();
     let mut opts = Opts::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            // An unknown `--flag` is a usage error, not a path: `check --verbose
+            // dir` must not try to open a directory named `--verbose`.
+            flag if flag.starts_with("--")
+                && !matches!(flag, "--out" | "--page-size" | "--map-size") =>
+            {
+                return Err(format!("unknown option {flag:?}\n{USAGE}").into());
+            }
             "--out" => {
                 if let Some(v) = args.get(i + 1) {
                     opts.out = Some(PathBuf::from(v));
@@ -200,11 +218,11 @@ fn parse_opts(args: &[String]) -> (Vec<String>, Opts) {
         positional.push(args[i].clone());
         i += 1;
     }
-    (positional, opts)
+    Ok((positional, opts))
 }
 
 fn require_positional(rest: &[String], usage: &str) -> Result<PathBuf, common::BoxErr> {
-    let (positional, _) = parse_opts(rest);
+    let (positional, _) = parse_opts(rest)?;
     first_positional(&positional, usage)
 }
 

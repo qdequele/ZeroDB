@@ -8,7 +8,8 @@
 //! are `&'a [u8]` borrowed straight from the backing bytes (SPEC 04 TXN-37/41),
 //! and a `F_BIGDATA` value resolves to one contiguous slice spanning its
 //! overflow run (SPEC 03 §3; a dirty run is one contiguous frame, TXN-41).
-//! This module contains **no** `unsafe` (the crate is `#![forbid(unsafe_code)]`)
+//! This module contains **no** `unsafe` (the crate is `#![deny(unsafe_code)]`,
+//! opened only in `page::raw` — PERF-GAP A3)
 //! and no I/O — it is pure logic over borrowed bytes, so `miri` exercises it.
 //!
 //! The cursor is a root-to-leaf path (`stack` of `(pgno, ki)` frames) plus the
@@ -50,6 +51,12 @@ pub enum Source<'a> {
     Map {
         /// The whole mapped region.
         bytes: &'a [u8],
+        /// The pinned snapshot's committed high-water (`Snapshot::last_pg`).
+        /// Map reads refuse any pgno beyond it: the mapping covers the full
+        /// `map_size` (ADR-0004 D4), so bytes past the real file end are
+        /// mapped but unbacked — dereferencing them on a corrupt/hostile
+        /// reference would `SIGBUS` instead of erroring (SPEC 06 REC-14).
+        last_pg: u64,
     },
     /// A write txn's view: dirty frames first, then the map.
     Writer {
@@ -57,10 +64,24 @@ pub enum Source<'a> {
         dirty: &'a DirtyStore,
         /// The mapped region (fallback for untouched pages).
         bytes: &'a [u8],
+        /// The base snapshot's committed high-water. Bounds only the **map
+        /// fallback**: pages the writer allocates beyond it live in `dirty`
+        /// and are resolved before this bound is consulted.
+        last_pg: u64,
     },
 }
 
 impl<'a> Source<'a> {
+    /// The committed high-water this source is bounded by (`Snapshot::last_pg`
+    /// for a reader; the base snapshot's for a writer). Pages above it are
+    /// refused by the committed-map resolver (SPEC 04 TXN-38).
+    #[must_use]
+    pub fn last_pg(&self) -> u64 {
+        match self {
+            Source::Map { last_pg, .. } | Source::Writer { last_pg, .. } => *last_pg,
+        }
+    }
+
     /// Bytes beginning at page `pgno`: at least one page; for an overflow head
     /// resolved from this source, the returned slice covers the whole run
     /// (a dirty run is its full contiguous frame; a mapped run extends to the
@@ -84,20 +105,41 @@ impl<'a> Source<'a> {
         pgno: u64,
     ) -> Result<(&'a [u8], bool), PageError> {
         let ps = psize as usize;
-        let map_slice = |bytes: &'a [u8]| -> Result<&'a [u8], PageError> {
+        let map_slice = |bytes: &'a [u8], last_pg: u64| -> Result<&'a [u8], PageError> {
+            // Committed-map reads never dereference past the snapshot's
+            // high-water: pages there may be unbacked by the file even though
+            // the mapping covers them (see the `Source` field docs). A
+            // corrupt/hostile reference fails typed instead of faulting.
+            if pgno > last_pg {
+                return Err(PageError::PageOutOfBounds { pgno, last_pg });
+            }
             let base = (pgno as usize)
                 .checked_mul(ps)
                 .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })?;
-            bytes
+            let slice = bytes
                 .get(base..)
                 .filter(|s| s.len() >= ps)
-                .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })
+                .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })?;
+            // Clamp the slice at the high-water so a multi-page consumer (an
+            // overflow-run payload) can never read past it either: the pages
+            // beyond `last_pg` are exactly the potentially-unbacked ones.
+            let cap = usize::try_from(last_pg - pgno + 1)
+                .ok()
+                .and_then(|n| n.checked_mul(ps));
+            Ok(match cap {
+                Some(c) if c < slice.len() => &slice[..c],
+                _ => slice,
+            })
         };
         match self {
-            Source::Map { bytes } => map_slice(bytes).map(|b| (b, true)),
-            Source::Writer { dirty, bytes } => match dirty.bytes(pgno) {
+            Source::Map { bytes, last_pg } => map_slice(bytes, *last_pg).map(|b| (b, true)),
+            Source::Writer {
+                dirty,
+                bytes,
+                last_pg,
+            } => match dirty.bytes(pgno) {
                 Some(frame) => Ok((frame, false)),
-                None => map_slice(bytes).map(|b| (b, true)),
+                None => map_slice(bytes, *last_pg).map(|b| (b, true)),
             },
         }
     }
@@ -576,7 +618,7 @@ impl<'a> Tree<'a> {
 /// depth 32 already addresses 2^31 leaf pages (8 TB at the smallest page
 /// size); any deeper descent means a corrupt `depth`/cycle and fails with
 /// the same typed error the per-descent iteration guards produce.
-const CURSOR_STACK: usize = 32;
+pub(crate) const CURSOR_STACK: usize = 32;
 
 /// A `Vec`-shaped fixed-capacity `(pgno, ki)` stack. Descents are the
 /// engine's hottest loop, and the previous heap `Vec` cost one alloc + free
@@ -1176,6 +1218,15 @@ mod tests {
     const PS: u32 = 4096;
     const MAP: u64 = 1 << 20;
 
+    /// A map source over a whole built image: the high-water is the image's
+    /// last page (built images are exact-length files).
+    fn src(img: &[u8]) -> Source<'_> {
+        Source::Map {
+            bytes: img,
+            last_pg: (img.len() / PS as usize) as u64 - 1,
+        }
+    }
+
     #[test]
     fn path_stack_is_vec_shaped_and_rejects_overflow() {
         // PERF-GAP A6 (#19): the inline stack must behave like the Vec it
@@ -1242,7 +1293,7 @@ mod tests {
     #[test]
     fn empty_tree_reads() {
         let (img, root, depth) = build(&[]);
-        let t = Tree::new(Source::Map { bytes: &img }, PS, root, depth);
+        let t = Tree::new(src(&img), PS, root, depth);
         assert!(t.is_empty());
         assert_eq!(t.get(b"x").unwrap(), None);
         let mut c = t.cursor();
@@ -1261,7 +1312,7 @@ mod tests {
             .map(|i| kv(format!("k{i:03}").as_bytes(), format!("v{i}").as_bytes()))
             .collect();
         let (img, root, depth) = build(&entries);
-        let t = Tree::new(Source::Map { bytes: &img }, PS, root, depth);
+        let t = Tree::new(src(&img), PS, root, depth);
         assert_eq!(depth, 1, "20 tiny entries fit one leaf");
         for (k, v) in &entries {
             assert_eq!(t.get(k).unwrap(), Some(v.as_slice()));
@@ -1286,7 +1337,7 @@ mod tests {
             })
             .collect();
         let (img, root, depth) = build(&entries);
-        let t = Tree::new(Source::Map { bytes: &img }, PS, root, depth);
+        let t = Tree::new(src(&img), PS, root, depth);
         assert!(
             depth >= 2,
             "2000 entries need a branch level, got depth {depth}"
@@ -1311,7 +1362,7 @@ mod tests {
             kv(b"d", b"tiny"),
         ];
         let (img, root, depth) = build(&entries);
-        let t = Tree::new(Source::Map { bytes: &img }, PS, root, depth);
+        let t = Tree::new(src(&img), PS, root, depth);
         assert_eq!(t.get(b"b").unwrap(), Some(big.as_slice()));
         assert_eq!(t.get(b"c").unwrap(), Some(bigger.as_slice()));
         assert_eq!(collect_fwd(&t), entries);
@@ -1324,7 +1375,7 @@ mod tests {
             .map(|n| kv(format!("{n:03}").as_bytes(), b"x"))
             .collect();
         let (img, root, depth) = build(&entries);
-        let t = Tree::new(Source::Map { bytes: &img }, PS, root, depth);
+        let t = Tree::new(src(&img), PS, root, depth);
         let mut c = t.cursor();
 
         // set_range (>=)
@@ -1381,7 +1432,7 @@ mod tests {
             .map(|i| kv(format!("k{i:04}").as_bytes(), b"v"))
             .collect();
         let (img, root, depth) = build(&entries);
-        let t = Tree::new(Source::Map { bytes: &img }, PS, root, depth);
+        let t = Tree::new(src(&img), PS, root, depth);
         let mut c = t.cursor();
         // Walk to EOF.
         c.first().unwrap();

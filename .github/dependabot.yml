@@ -1,0 +1,22 @@
+# Keep the pinned GitHub Actions SHAs and the Cargo dependency tree current.
+# Cargo updates are grouped so a routine bump is one PR, not ten; the oracle's
+# `heed`/`lmdb-master-sys` pins are exact (`=`) on purpose (ADR-0001) and must
+# not move — they are ignored here.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-and-patch:
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: heed
+      - dependency-name: lmdb-master-sys
+      - dependency-name: heed-traits
+      - dependency-name: heed-types

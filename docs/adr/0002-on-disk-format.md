@@ -1,6 +1,6 @@
 # ADR-0002: On-disk format principles
 
-- Status: **Proposed**
+- Status: **Approved** — Quentin, 2026-07-16 (commit 602169c "Ratify Phase 0 queue: ADR-0001/0002/0003 approved"; that commit updated the DECISIONS.md index but not this status line — corrected 2026-09-09)
 - Milestone: 0.4 (spec), implemented 1.1–1.6
 - Date: 2026-07-15
 

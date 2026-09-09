@@ -1,6 +1,8 @@
 [package]
 name = "zerodb-oracle"
-version = "0.0.1"
+version = "0.1.0"
+description = "ZeroDB differential test harness against the Meilisearch LMDB fork (links C LMDB; never published)."
+publish = false
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -27,7 +29,7 @@ zerodb-core = { path = "../zerodb-core" }
 heed-zerodb = { path = "../heed-zerodb" }
 # The fault-injection write backend + deterministic PRNG for the M1.11 crash
 # harness (ADR-0008). Workspace-internal.
-zerodb-io = { path = "../zerodb-io" }
+zerodb-io = { path = "../zerodb-io", features = ["fault"] }
 
 [[bin]]
 name = "crash-harness"

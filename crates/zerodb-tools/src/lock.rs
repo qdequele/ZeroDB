@@ -16,8 +16,8 @@
 //! the CLAUDE.md allowlist, but that unsafe-policy currently sanctions `unsafe`
 //! only in `zerodb-core::{page,readers}`, `zerodb-io`, and `zerodb-oracle`.
 //! This single, SAFETY-commented block **expands** that policy to
-//! `zerodb-tools` — flagged for a human to record in CLAUDE.md. `zerodb-core`
-//! remains `#![forbid(unsafe_code)]`.
+//! `zerodb-tools` — recorded in CLAUDE.md on 2026-09-09 as "in use, not yet
+//! ratified"; a human still has to sanction or remove it.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -108,13 +108,21 @@ pub fn acquire_existing(env_dir: &Path) -> Result<(EnvLock, naming::EnvDataFile)
 /// [`LockError::Busy`] if the lock is held, [`LockError::Io`] on other I/O errors.
 pub fn acquire_or_create(env_dir: &Path) -> Result<EnvLock, LockError> {
     let data = env_dir.join(DATA_FILE_NAME);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&data)
-        .map_err(LockError::Io)?;
+    // `mode(0o600)`: when this call *creates* the data file (fresh load /
+    // migrate target) it must be owner-only, matching the engine's own
+    // creation mode — a default-mode store leaks data via umask. An existing
+    // file keeps its mode (the mode applies at creation only).
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&data)
+            .map_err(LockError::Io)?
+    };
     lock_or_busy(file, env_dir)
 }
 

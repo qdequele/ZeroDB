@@ -124,6 +124,13 @@ pub struct NestedRoTxn<'p> {
 }
 
 impl<'p> NestedRoTxn<'p> {
+    /// The identity of the environment this transaction belongs to
+    /// ([`crate::env::Env::ident`]) — its parent's.
+    #[must_use]
+    pub fn env_ident(&self) -> usize {
+        self.parent.env_ident()
+    }
+
     /// Open a child of `parent`, bumping the live-child counter. Only called
     /// through `RwTxn::nested_read_txn`, which performs the errored-txn check
     /// first (fork parity: `mdb_txn_begin` on an errored parent →

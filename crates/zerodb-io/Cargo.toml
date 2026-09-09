@@ -1,12 +1,24 @@
 [package]
 name = "zerodb-io"
-version = "0.0.1"
+version = "0.1.0"
+description = "ZeroDB I/O layer: memory-mapped reads, pwrite/pwritev commit backends and fsync strategies."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["lmdb", "heed", "key-value", "mmap", "fsync"]
+categories = ["database-implementations", "filesystem"]
 
 [dependencies]
-zerodb-core = { path = "../zerodb-core" }
+zerodb-core = { path = "../zerodb-core", version = "=0.1.0" }
 memmap2.workspace = true
 # pwritev for the vectored commit write path (PERF-GAP B4); allowlisted.
 libc.workspace = true
+
+[features]
+default = []
+# Crash-injection write backend for the differential crash harness (ADR-0008,
+# M1.11). Test infrastructure: the oracle enables it; consumer builds never do.
+fault = []

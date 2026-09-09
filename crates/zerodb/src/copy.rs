@@ -286,7 +286,26 @@ fn copy_raw(
     // Last callback before any destination I/O — see the panic contract on
     // `copy_to_file_with_progress`.
     progress.finish();
-    std::fs::write(dest, &out)?;
+    // Owner-only, like every other env file this crate creates (M2): a copy
+    // holds the same data as the source store. The destination is opened
+    // create+truncate on purpose: that is heed's `copy_to_path` contract
+    // (`File::options().create(true).truncate(true)`, heed 0.22.1 `env.rs`),
+    // and the compacting path replaces an existing destination too (staged
+    // sibling + rename). The destination path is the caller's; protecting it
+    // from a planted symlink is out of the engine's threat model
+    // (SECURITY.md) — the *staging* names, which the caller never sees, are
+    // the ones created exclusively.
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(dest)?;
+        f.write_all(&out)?;
+    }
     Ok(())
 }
 
@@ -352,14 +371,37 @@ fn copy_compact(
     let file_name = dest
         .file_name()
         .ok_or_else(|| Error::Io(std::io::Error::other("copy destination has no file name")))?;
-    let mut tmp_name = file_name.to_os_string();
-    tmp_name.push(format!(".copy-tmp-{}", std::process::id()));
-    let tmp = dest.with_file_name(tmp_name);
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&tmp)?;
+    // Staging file hygiene: `create_new` (O_CREAT|O_EXCL) never follows a
+    // symlink planted at the staging path, `mode(0o600)` keeps the copy
+    // owner-only like the engine's own env files, and the randomized suffix
+    // (std `RandomState` is seeded from OS entropy) makes the name
+    // unpredictable — retrying on `AlreadyExists` handles the astronomically
+    // unlikely collision (and any pre-placed file at a guessed name).
+    let (tmp, file) = {
+        use std::hash::{BuildHasher, Hasher};
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut attempt = 0u32;
+        loop {
+            let nonce = std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish();
+            let mut tmp_name = file_name.to_os_string();
+            tmp_name.push(format!(".copy-tmp-{}-{nonce:016x}", std::process::id()));
+            let tmp = dest.with_file_name(tmp_name);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&tmp)
+            {
+                Ok(f) => break (tmp, f),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
+                    attempt += 1;
+                }
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+    };
     // Remove the temp on every non-rename exit (error or unwinding callback).
     let mut guard = TmpGuard {
         path: &tmp,

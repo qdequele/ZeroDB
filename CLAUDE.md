@@ -54,8 +54,15 @@ Consumers: Meilisearch (milli) and hannoy (HNSW vector index).
 `zerodb-io`), the reader table (`zerodb-core::readers`), FFI inside
 `zerodb-oracle`, and the minimal API-shape unsafe in `heed-zerodb` that heed's
 pointer model inherently requires (Send impls, TLS-marker retags, the
-lifetime-erased write cursor — nothing beyond what the mirrored heed surface
-forces; ratified 2026-07-17, M1.13). Every unsafe block requires a `// SAFETY:` comment stating the
+lifetime-erased write cursor, the `ReservedSpace` uninit view, and one
+`sysconf` for the D-006 boundary — nothing beyond what the mirrored heed
+surface forces; ratified 2026-07-17, M1.13). **In use but not yet ratified:**
+`zerodb-tools` carries one `libc::flock` (`src/lock.rs`, the live-env guard)
+and the `migrate-lmdb` feature's heed `open` (`src/migrate.rs`), both shipped
+with M1.12 and self-flagged there; a human must either sanction them here or
+ask for their removal (recorded 2026-09-09). `zerodb-core::readers` is listed
+above but contains no `unsafe` — the lock-free protocol is plain atomics.
+Every unsafe block requires a `// SAFETY:` comment stating the
 invariants relied on. No `#[repr(C)]` casts of possibly-unaligned data — use
 explicit offsets + `read_unaligned`. All atomics use explicit `Ordering` with a
 comment justifying it; assume ARM (weak memory model), never "works on x86".
@@ -72,10 +79,17 @@ size; never assume 4K OS pages (ARM distros often use 64K).
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo miri test -p zerodb-core          # non-mmap logic must pass miri
+cargo +nightly miri test -p zerodb-core # non-mmap logic must pass miri
 just fuzz-quick                          # 10 min differential fuzz
 just crash-test-quick                    # crash-consistency smoke (from M1.11 on)
+just loom                                # reader-table model check (ADR-0006) when touching readers/nested
+just stress                              # 180 s reader/writer stress — mandatory before an integration gate
 ```
+
+The same battery runs in `.github/workflows/ci.yml`: per PR, fmt/clippy/test
+and fuzz-quick on both x86-64 and aarch64, miri, loom and crash-test-quick on
+x86-64 only; nightly, the long fuzz, the full crash run and stress on both
+architectures.
 
 Performance claims require a `cargo bench` criterion diff pasted in the summary.
 
@@ -86,6 +100,9 @@ Performance claims require a `cargo bench` criterion diff pasted in the summary.
   strategies; fault-injection write backend for crash testing (M1.11).
 - `crates/zerodb` — public engine API (heed-shaped).
 - `crates/heed-zerodb` — heed backend adapter.
+- `crates/heed-shim` — a crate literally named `heed` re-exporting heed-zerodb;
+  the `[patch.crates-io]` target consumers point at. Excluded from the
+  workspace so it never collides with the oracle's real `heed`.
 - `crates/zerodb-tools` — `stat`, `dump`, `load`, `check`, `migrate-from-lmdb`.
 - `crates/zerodb-oracle` — differential harness vs C LMDB (only place linking C).
 - `docs/SPEC/` — format & algorithm spec (source of truth).
@@ -107,8 +124,14 @@ Use the subagents in `.claude/agents/`:
 ## Style
 
 Rust 2021+, MSRV pinned in workspace Cargo.toml. No new dependencies without an
-ADR (current allowlist: memmap2, libc, thiserror, crossbeam-utils, rand,
-proptest, arbitrary, criterion; io-uring behind a feature). Errors mirror heed's
+ADR (current allowlist: memmap2, libc, thiserror, crossbeam-utils, rand
+[allowlisted, currently unused], proptest, arbitrary, criterion; io-uring
+behind a feature [not yet present]; plus the heed-surface re-exports
+heed-traits / heed-types / byteorder in `heed-zerodb` only (ADR-0003), loom
+under `cfg(loom)` in `zerodb-core` only (ADR-0006), libfuzzer-sys in `fuzz/`
+only (ADR-0001). `tempfile` is a dev-dependency of `heed-zerodb` without an
+ADR — pending a human call, since `crates/zerodb/tests` hand-roll a `TempDir`
+in 19 files to avoid exactly that dependency.) Errors mirror heed's
 error taxonomy. Public items documented. No `TODO` left in merged code — file it
 in PLAN.md progress notes instead.
 

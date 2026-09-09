@@ -12,18 +12,20 @@
 //! impl of the very same trait the LMDB `heed` uses.
 //!
 //! Consumers switch backends via `[patch.crates-io] heed = { path =
-//! ".../crates/heed-zerodb", package = "heed-zerodb" }` (docs/patches/); the
-//! `package =` rename keeps the dependency *named* `heed` in their code.
+//! ".../crates/heed-shim" }` — a crate literally named `heed` that re-exports
+//! this one (a `package =` rename inside `[patch]` is silently ignored by cargo;
+//! see `crates/heed-shim/Cargo.toml` and `docs/CONSUMER-GATE.md`).
 //!
 //! ## Adapter `unsafe` (see per-site `SAFETY:` comments)
 //!
 //! The adapter reproduces heed's inherently pointer-based model, so it needs the
 //! same small `unsafe` heed itself carries: `unsafe impl Send for
-//! RoTxn<WithoutTls>` (SPEC 04 TXN-13; sound under an encapsulation invariant,
-//! `txn.rs`), the `repr(transparent)` TLS-marker deref retags (`txn.rs`), the
+//! RoTxn<WithoutTls>` (SPEC 04 TXN-13; every inner ZeroDB txn is itself `Send`,
+//! the writer lock being thread-agnostic — `txn.rs`), the `repr(transparent)` TLS-marker deref retags (`txn.rs`), the
 //! lifetime-erased write cursor (`iterator.rs`, guarded by heed's documented
-//! "no live borrow across a mutating call" contract), and one `sysconf` query
-//! for the D-006 boundary (`env.rs`). Each is documented at its site; this is
+//! "no live borrow across a mutating call" contract), the `ReservedSpace`
+//! uninit view and its `assume_written` (`reserved_space.rs`, heed's own
+//! signatures), and one `sysconf` query for the D-006 boundary (`env.rs`). Each is documented at its site; this is
 //! the vestigial adapter-shape `unsafe` PLAN 1.13 anticipates, wrapping no UB
 //! under the stated contracts.
 

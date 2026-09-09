@@ -16,9 +16,12 @@ exclude = ["crates/heed-shim"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.78"
+# 1.80: `check-cfg` under [lints.rust.unexpected_cfgs] (zerodb-core) needs cargo 1.80.
+# Verified by the `msrv` CI job.
+rust-version = "1.80"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/qdequele/ZeroDB"
+authors = ["Quentin de Quelen <quentin@meilisearch.com>"]
 
 [workspace.dependencies]
 memmap2 = "0.9"

@@ -95,14 +95,15 @@ pub struct RoTxn<'e, T = AnyTls> {
     _tls: PhantomData<&'e T>,
 }
 
-// SAFETY (SPEC 04 TXN-13; heed parity, see module docs): the reader
-// (`InnerTxn::Ro`) and nested (`InnerTxn::Nested`) variants are `Send` by
-// ZeroDB's own guarantees (`zerodb::RoTxn` / `zerodb::NestedRoTxn` are `Send`).
-// The `InnerTxn::Rw` variant carries a `!Send` write-mutex guard; declaring it
-// sendable mirrors heed's identical `unsafe impl Send for RoTxn<WithoutTls>`
-// and is sound for the single-writer install/join usage (module docs): the
-// guard is locked and dropped on the owning thread; only a mutable borrow
-// crosses into a rayon-join-ordered worker.
+// SAFETY (SPEC 04 TXN-13; heed parity, see module docs): every variant of
+// `InnerTxn` is `Send` by ZeroDB's own guarantees — `zerodb::RoTxn`,
+// `zerodb::NestedRoTxn`, and (since the 2026-09-09 hardening) `zerodb::RwTxn`,
+// whose writer lock is a thread-agnostic occupied flag (`WriterLock`, SPEC 04
+// TXN-6) rather than a std `MutexGuard`, so dropping or committing it on
+// another thread is sound. This impl therefore adds no capability the auto
+// trait would not derive; it exists because the `T` marker parameter is not
+// `Send`-bounded and heed spells the impl out the same way. No thread-affinity
+// argument is relied on any more.
 unsafe impl Send for RoTxn<'_, WithoutTls> {}
 
 impl<'e, T> RoTxn<'e, T> {
@@ -110,6 +111,16 @@ impl<'e, T> RoTxn<'e, T> {
         RoTxn {
             inner,
             _tls: PhantomData,
+        }
+    }
+
+    /// The owning environment's identity (`zerodb::Env::ident`), used for
+    /// heed's environment/transaction pairing assertions.
+    pub(crate) fn env_ident(&self) -> usize {
+        match &self.inner {
+            InnerTxn::Ro(t) => t.env_ident(),
+            InnerTxn::Nested(t) => t.env_ident(),
+            InnerTxn::Rw(t) => t.env_ident(),
         }
     }
 
@@ -181,12 +192,13 @@ impl<'a> Deref for RoTxn<'a, WithoutTls> {
 /// **`Send` (heed parity, milli requirement).** heed declares `RwTxn: Send`, and
 /// milli moves `&mut RwTxn` into a rayon `install`/join scope during indexing
 /// (`ThreadPoolNoAbort::install`), which needs `RwTxn: Send`. This type is `Send`
-/// via the `unsafe impl Send for RoTxn<WithoutTls>` above (its only field). The
-/// underlying ZeroDB write-mutex guard is `!Send`, so this asserts what heed
-/// asserts for its `MDB_txn`: the single-writer txn is safe to hand to a joined
-/// worker (the guard is locked and dropped on the owning thread; only mutable
-/// access happens on the joined worker, ordered by the rayon join). `Sync`
-/// too, so `&RwTxn` — hence a nested reader — is `Send` (SPEC 04 §5).
+/// via the `unsafe impl Send for RoTxn<WithoutTls>` above (its only field), and
+/// that is genuinely sound: `zerodb::RwTxn` holds a thread-agnostic writer lock
+/// (`WriterLock`, SPEC 04 TXN-6), so the transaction may be dropped, aborted or
+/// committed on any thread — pinned by `zerodb/tests/hostile_file.rs`. (Before
+/// 2026-09-09 the engine held a std `MutexGuard` there and the impl rested on
+/// the caller dropping on the owning thread.) `Sync` too, so `&RwTxn` — hence a
+/// nested reader — is `Send` (SPEC 04 §5).
 pub struct RwTxn<'p> {
     pub(crate) txn: RoTxn<'p, WithoutTls>,
 }
