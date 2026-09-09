@@ -126,9 +126,31 @@ impl Backing for WriteMapBacking {
         // the target page is not referenced by any live snapshot (see the
         // `MmapWritable::map` SAFETY note). No `pwrite`; the bytes become durable
         // only at the next `sync` (`msync`).
-        let off = (pgno as usize)
-            .checked_mul(psize as usize)
-            .expect("page offset overflow");
+        let off = (pgno as usize).checked_mul(psize as usize).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("page offset overflow: pgno {pgno} * psize {psize}"),
+            )
+        })?;
+        // Typed error instead of the map's own bounds assert: the commit
+        // pipeline validates its targets (TXN-62, the GC freelist checks),
+        // but a bug or corruption upstream must surface as an I/O error the
+        // caller can poison the env on, not a panic mid-commit.
+        let end = off.checked_add(data.len()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "page write overflows usize",
+            )
+        })?;
+        if end > self.mmap.bytes().len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "page write [{off}, {end}) outside the writable map ({} bytes)",
+                    self.mmap.bytes().len()
+                ),
+            ));
+        }
         self.mmap.write_at(off, data);
         Ok(())
     }

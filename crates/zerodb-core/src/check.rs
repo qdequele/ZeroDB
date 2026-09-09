@@ -12,7 +12,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::dirty::PgnoBuildHasher;
 use crate::page::geometry::{gc_key_decode, overflow_page_count};
 use crate::page::{
     select_meta, DBRecord, LeafValue, MetaPage, OverflowRef, PageRef, PageType, DBRECORD_LEN,
@@ -34,10 +33,15 @@ struct Checker<'a> {
     psize: u32,
     meta_txnid: u64,
     last_pg: u64,
-    visited: HashSet<u64, PgnoBuildHasher>,
+    /// Pages reached by the tree walks. **Randomly seeded** (std
+    /// `RandomState`), unlike the engine's unseeded pgno hasher: the checker
+    /// populates these sets from *on-disk* page ids, so a hostile file could
+    /// otherwise choose ids that all collide (HashDoS). The engine's
+    /// dirty-store hasher is unaffected — its keys are engine-authored.
+    visited: HashSet<u64>,
     /// Free page ids collected from every GC PIL → occurrence count
-    /// (INV-22/INV-24; SPEC 05 §9). Pgno-hashed (issue #9).
-    free: HashMap<u64, u64, PgnoBuildHasher>,
+    /// (INV-22/INV-24; SPEC 05 §9). Randomly seeded, see `visited`.
+    free: HashMap<u64, u64>,
     violations: Vec<String>,
 }
 
@@ -279,7 +283,12 @@ impl<'a> Checker<'a> {
     /// INV-11: overflow head + run integrity.
     fn check_overflow(&mut self, leaf: u64, head: u64, dsize: u32, stats: &mut WalkStats) {
         let expect = overflow_page_count(dsize as u64, self.psize);
-        if head < FIRST_DATA_PGNO || head + expect - 1 > self.last_pg {
+        // Checked: `head + expect - 1` on hostile values must not wrap.
+        let run_end = expect
+            .checked_sub(1)
+            .and_then(|e| head.checked_add(e))
+            .unwrap_or(u64::MAX);
+        if head < FIRST_DATA_PGNO || run_end > self.last_pg {
             self.fail(
                 "INV-11",
                 format!("leaf {leaf}: overflow run [{head}, +{expect}) outside high-water"),
@@ -294,7 +303,11 @@ impl<'a> Checker<'a> {
             }
         }
         let ps = self.psize as usize;
-        let base = head as usize * ps;
+        // `head <= last_pg <= bytes.len()/ps` here, but keep it checked.
+        let Some(base) = (head as usize).checked_mul(ps) else {
+            self.fail("INV-11", format!("overflow head {head} beyond the file"));
+            return;
+        };
         let Some(run) = self.bytes.get(base..) else {
             self.fail("INV-11", format!("overflow head {head} beyond the file"));
             return;
@@ -344,7 +357,12 @@ impl<'a> Checker<'a> {
             LeafValue::Inline(v) => v.to_vec(),
             LeafValue::Overflow { head_pgno, dsize } => {
                 let ps = self.psize as usize;
-                let base = head_pgno as usize * ps;
+                // Checked: `head_pgno` is raw on-disk data; the multiply must
+                // not wrap into a bogus in-bounds offset.
+                let Some(base) = (head_pgno as usize).checked_mul(ps) else {
+                    self.fail("INV-26", format!("GC entry {txnid}: unreadable PIL"));
+                    return;
+                };
                 match self
                     .bytes
                     .get(base..)
@@ -443,6 +461,22 @@ impl<'a> Checker<'a> {
         if rec.flags != 0 || rec.leaf2_ksize != 0 {
             self.fail("INV-21", format!("{name}: reserved DBRecord fields set"));
         }
+        // Hostile-depth guard: `walk` recurses one frame per level, and
+        // `rec.depth` is raw on-disk data (u16 → up to 65 535 frames → stack
+        // overflow). Anything deeper than the read path's CURSOR_STACK bound
+        // (32 — minimum fanout 2 already addresses 2^31 leaves there) is
+        // corruption; report it and do not walk.
+        if rec.depth as usize > crate::btree::CURSOR_STACK {
+            self.fail(
+                "INV-7",
+                format!(
+                    "{name}: depth {} exceeds the maximum legal tree depth {}",
+                    rec.depth,
+                    crate::btree::CURSOR_STACK
+                ),
+            );
+            return;
+        }
         let mut stats = WalkStats::default();
         if rec.root != PGNO_INVALID {
             let root_page_type = self.page(rec.root).map(|p| p.page_type());
@@ -502,21 +536,34 @@ pub fn check_image(bytes: &[u8], psize: u32) -> Vec<String> {
             bytes.len()
         ));
     }
-    // INV-17: the file covers the high-water.
-    if bytes.len() < (meta.last_pg as usize + 1) * ps {
-        violations.push(format!(
-            "INV-17: file length {} < (last_pg {} + 1) * psize",
-            bytes.len(),
-            meta.last_pg
-        ));
+    // INV-17: the file covers the high-water. Checked arithmetic — a hostile
+    // `last_pg` near `u64::MAX` must not wrap the multiply — and an **early
+    // return**: every later phase (the walks, and especially the
+    // reachable-XOR-free sweep over `FIRST_DATA_PGNO..=last_pg`) is bounded
+    // by `last_pg`, so a high-water the image cannot back would otherwise
+    // loop ~2^64 times allocating a violation `String` per page.
+    let needed = meta
+        .last_pg
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(ps as u64));
+    match needed {
+        Some(n) if n <= bytes.len() as u64 => {}
+        _ => {
+            violations.push(format!(
+                "INV-17: file length {} < (last_pg {} + 1) * psize",
+                bytes.len(),
+                meta.last_pg
+            ));
+            return violations;
+        }
     }
     let mut checker = Checker {
         bytes,
         psize,
         meta_txnid: meta.txnid,
         last_pg: meta.last_pg,
-        visited: HashSet::default(),
-        free: HashMap::default(),
+        visited: HashSet::new(),
+        free: HashMap::new(),
         violations,
     };
     checker.check_catalog_record("main_db", &meta.main_db);

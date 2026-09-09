@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
 use crate::cmp::{Comparator, ComparatorError, ComparatorRegistry, KeyCmp};
@@ -188,6 +188,75 @@ pub enum HookPoint {
 pub trait CommitHook: Send + Sync {
     /// Called between commit steps, at `point`. May abort/kill the process.
     fn at(&self, point: HookPoint);
+}
+
+/// The single-writer lock (SPEC 04 TXN-6), thread-agnostic by construction:
+/// an `occupied` flag under a short-critical-section mutex plus a condvar.
+///
+/// It deliberately does **not** hand out the `Mutex`'s own `MutexGuard` for
+/// the write txn's lifetime: `std::sync::MutexGuard` is `!Send` (and on some
+/// platforms unlocking from a foreign thread aborts), while `zerodb::RwTxn`
+/// must be genuinely `Send` — heed's `WithoutTls` mode moves write txns
+/// across threads, and the txn's drop (commit or abort) may run on any
+/// thread. Here the guard only *clears the flag* under a fresh short lock
+/// taken on whichever thread drops it, which is sound on every platform.
+#[derive(Debug)]
+struct WriterLock {
+    /// `true` while a write txn is live.
+    occupied: Mutex<bool>,
+    cv: Condvar,
+}
+
+/// Ownership of the writer slot; releases it on drop, from any thread.
+/// Held by `RwTxn` for its whole life (TXN-6).
+pub(crate) struct WriterGuard<'env> {
+    lock: &'env WriterLock,
+}
+
+impl WriterLock {
+    fn new() -> WriterLock {
+        WriterLock {
+            occupied: Mutex::new(false),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Block until the writer slot is free, then claim it.
+    fn acquire(&self) -> WriterGuard<'_> {
+        // A panicked writer used to poison the old `Mutex<()>` writer lock;
+        // the policy (unchanged) is that the lock guards no data — the dirty
+        // set lived in the RwTxn and was dropped during unwind (TXN-60
+        // implicit abort) — so clearing the poison is sound and keeps the env
+        // usable after a writer panic. The flag mutex is only ever held for
+        // the flag flip below, but the same recovery applies.
+        let mut g = self
+            .occupied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *g {
+            g = self
+                .cv
+                .wait(g)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *g = true;
+        WriterGuard { lock: self }
+    }
+}
+
+impl Drop for WriterGuard<'_> {
+    fn drop(&mut self) {
+        let mut g = self
+            .lock
+            .occupied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *g = false;
+        // One waiter at most can make progress (single writer), so
+        // `notify_one` suffices; drop the flag lock before notify is not
+        // required for correctness (the waiter re-checks under the lock).
+        self.lock.cv.notify_one();
+    }
 }
 
 /// A cross-thread one-shot signal: fires once, when the last [`EnvInner`]
@@ -367,9 +436,11 @@ pub struct EnvInner {
     prev_snapshot: bool,
     /// Close signal, shared with any outstanding [`EnvClosingEvent`].
     closing: Arc<SignalEvent>,
-    /// The single-writer mutex (SPEC 04 TXN-6). Guards no data — the write
-    /// txn's state lives in the `RwTxn` — it only serializes writers.
-    write_mutex: Mutex<()>,
+    /// The single-writer lock (SPEC 04 TXN-6). Guards no data — the write
+    /// txn's state lives in the `RwTxn` — it only serializes writers. A
+    /// thread-agnostic flag+condvar lock (see [`WriterLock`]) so the guard —
+    /// and with it `RwTxn` — is `Send`.
+    write_mutex: WriterLock,
     /// The published-snapshot cell (SPEC 04 TXN-18 as amended, ratified
     /// 2026-07-16; ADR-0006 Option B): the immutable `Arc<Snapshot>` behind a
     /// bounded-O(1)-critical-section mutex, plus the mirroring SeqCst
@@ -464,16 +535,13 @@ impl EnvInner {
         self.snap_cell.publish(snap);
     }
 
-    /// Acquire the single-writer mutex (SPEC 04 TXN-6/7): blocks until the
-    /// current writer finishes; never errors.
-    pub(crate) fn lock_writer(&self) -> MutexGuard<'_, ()> {
-        // A panicked writer poisons the std mutex, but the mutex guards no
-        // data (the dirty set lived in the RwTxn and was dropped during
-        // unwind — TXN-60 implicit abort), so clearing the poison is sound and
-        // keeps the env usable after a writer panic.
-        self.write_mutex
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// Acquire the single-writer lock (SPEC 04 TXN-6/7): blocks until the
+    /// current writer finishes; never errors. The returned guard releases
+    /// from whatever thread drops it ([`WriterLock`]), so `RwTxn` is `Send`.
+    /// The writer-panic poison-recovery policy lives in
+    /// [`WriterLock::acquire`], unchanged from the old `Mutex<()>` form.
+    pub(crate) fn lock_writer(&self) -> WriterGuard<'_> {
+        self.write_mutex.acquire()
     }
 
     /// Whether a failed commit fsync poisoned the env (SPEC 06 REC-13).
@@ -1210,6 +1278,18 @@ impl EnvClosingEvent {
 // Open
 // ---------------------------------------------------------------------------
 
+/// Upper bound accepted for `max_readers` (SPEC 00 row 5, SPEC 04 TXN-14).
+/// The reader table eagerly allocates one cache-padded slot (128 bytes on
+/// aarch64) per reader — 1 Mi slots is 128 MiB, already far beyond any real
+/// configuration; anything larger is treated as a caller bug
+/// (`Io(InvalidInput)`) rather than an allocation-failure abort.
+pub const MAX_READERS_LIMIT: u32 = 1 << 20;
+
+/// Upper bound accepted for `max_dbs` (SPEC 00 row 4) — same rationale as
+/// [`MAX_READERS_LIMIT`] (the comparator registry allocates `max_dbs` slots
+/// eagerly).
+pub const MAX_DBS_LIMIT: u32 = 1 << 20;
+
 /// Open an env over an already-constructed [`Backing`] (SPEC 02 §3.2, SPEC 06
 /// §1). This is the I/O-free core of open: the caller (`zerodb-io` / the public
 /// `zerodb` crate) has already opened, created-if-new, and mapped the file, and
@@ -1244,6 +1324,26 @@ pub fn open_with_backing(
     max_readers: u32,
     durability: DurabilityFlags,
 ) -> Result<Env, Error> {
+    // D-006-style open-time argument rejection (`Io(InvalidInput)`): both
+    // values size eager allocations (`max_readers` cache-padded reader slots,
+    // `max_dbs` comparator `OnceLock`s), so an unbounded value — e.g.
+    // `max_readers(u32::MAX)` — is an allocation-failure abort, not an error.
+    // The bounds (SPEC 00 rows 4/5, SPEC 04 TXN-14) are far above any real
+    // deployment (Meilisearch's ceiling is 1024 readers / ~30 dbs).
+    if max_readers > MAX_READERS_LIMIT {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "max_readers ({max_readers}) exceeds the supported maximum {MAX_READERS_LIMIT}"
+            ),
+        )));
+    }
+    if max_dbs > MAX_DBS_LIMIT {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("max_dbs ({max_dbs}) exceeds the supported maximum {MAX_DBS_LIMIT}"),
+        )));
+    }
     // Validate the two meta slots from the mapped bytes (SPEC 02 §3.2). A
     // decode error here (bad page size / truncated buffer) means the file is not
     // a usable env → Invalid.
@@ -1268,6 +1368,43 @@ pub fn open_with_backing(
         MetaChoice::None => return Err(Error::Mdb(MdbError::Invalid)),
     };
 
+    // SPEC 06 REC-1a / SPEC 02 §3.2 step 6 (geometry validation): a slot can
+    // carry a valid CRC and still name geometry the real file cannot back — a
+    // truncated or hostile file. The mapping covers the full `map_size`
+    // (ADR-0004 D4), so pages inside the map but past the file end are
+    // unbacked: dereferencing them faults (SIGBUS) instead of erroring. Reject
+    // at open, with checked arithmetic (a hostile `last_pg` near `u64::MAX`
+    // must not wrap the multiply):
+    //  - the file must cover `(last_pg + 1) * page_size` bytes;
+    //  - each root is `PGNO_INVALID` or within `[FIRST_DATA_PGNO, last_pg]`.
+    // Under WRITE_MAP the file was already grown to `map_size` at map time,
+    // so the length check is trivially true there; the roots check still
+    // applies.
+    // Also part of REC-1a: the committed txnid itself. The reader table
+    // encodes slot occupancy in the top-of-u64 sentinel band (SPEC 04 TXN-14)
+    // and the next writer txnid is `meta.txnid + 1`; a txnid at or above the
+    // band is unreachable by real commits (one increment per commit) and
+    // would alias the RDR_FREE/RDR_CLAIMED sentinels or wrap — corrupt file.
+    if meta.txnid > crate::readers::MAX_COMMITTED_TXNID {
+        return Err(Error::Mdb(MdbError::Invalid));
+    }
+    let real = backing.real_disk_size().map_err(Error::Io)?;
+    let needed = meta
+        .last_pg
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(u64::from(page_size)))
+        .ok_or(Error::Mdb(MdbError::Invalid))?;
+    if needed > real {
+        return Err(Error::Mdb(MdbError::Invalid));
+    }
+    for rec in [&meta.main_db, &meta.free_db] {
+        if rec.root != crate::page::PGNO_INVALID
+            && (rec.root < crate::page::FIRST_DATA_PGNO || rec.root > meta.last_pg)
+        {
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
+    }
+
     // Register under the process registry (SPEC 04 TXN-51). Hold the lock across
     // check + insert so two concurrent opens of one path cannot both succeed.
     let id = next_env_id();
@@ -1281,7 +1418,7 @@ pub fn open_with_backing(
         // Seed the published-snapshot cell from the durable meta — the one
         // and only time a meta *page* is read for roots (SPEC 04 TXN-18).
         snap_cell: SnapshotCell::new(Arc::new(Snapshot::from_meta(&meta))),
-        write_mutex: Mutex::new(()),
+        write_mutex: WriterLock::new(),
         commit_hook: Mutex::new(None),
         poisoned: AtomicBool::new(false),
         // The reader table is sized once at open and never resized (TXN-14).

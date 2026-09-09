@@ -73,8 +73,20 @@ matrix of heed items and LMDB features is `docs/COMPATIBILITY.md`.
 - Range and prefix iterators carry heed's comparator type parameter;
   `DatabaseOpenOptions` is `Copy`/`Debug` with a public `new`; `EnvOpenOptions`
   is `Debug`/`PartialEq`/`Eq`; flag types have `from_bits`.
-- Hardening against corrupt or hostile files: see the security section of the
-  release notes and `SECURITY.md`.
+- **Soundness:** the write transaction held a std `MutexGuard` while being
+  `Send`, so dropping or committing it on another thread unlocked a mutex from
+  a foreign thread. The writer lock is now a thread-agnostic occupied flag;
+  `RwTxn: Send` is genuinely sound (milli moves the transaction across rayon
+  threads).
+- **Hostile or corrupt files** now fail with typed errors instead of crashing
+  (pre-release security review): open refuses page references beyond the file
+  and a txnid near the reader-table sentinel band; the read path refuses pages
+  above the snapshot's high-water instead of `SIGBUS`; zero-child branch pages
+  are rejected at decode; the GC free list is validated before reuse; the
+  offline checker uses checked arithmetic, a bounded depth and a seeded hasher;
+  `max_readers`/`max_dbs` are bounded; files are created `0600` and never
+  through a planted symlink. A new fuzz target feeds arbitrary bytes to `open`.
+  Details: `SECURITY.md`, D-017/D-018.
 
 ### Known gaps (deliberate, documented)
 

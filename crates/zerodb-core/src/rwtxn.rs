@@ -50,7 +50,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, MutexGuard};
+use std::sync::Arc;
 
 use crate::btree::{
     branch_view, leaf_view, node_view, Cursor as BCursor, NodeView, SavedCursor, Source, Tree,
@@ -66,9 +66,9 @@ use crate::page::geometry::{
 };
 use crate::page::{
     write_overflow_head, BranchMut, BranchRef, DBRecord, LeafMut, LeafRef, LeafValue, MetaPage,
-    PageError, PageRef, PageType, DBRECORD_LEN, FILL_THRESHOLD_PERMILLE, FORMAT_VERSION, F_SUBDATA,
-    HEADER_SIZE, MAGIC, MAX_DATA_SIZE, MAX_DB_NAME, MAX_KEY_SIZE, MIN_KEYS_BRANCH, MIN_KEYS_LEAF,
-    PGNO_INVALID,
+    PageError, PageRef, PageType, DBRECORD_LEN, FILL_THRESHOLD_PERMILLE, FIRST_DATA_PGNO,
+    FORMAT_VERSION, F_SUBDATA, HEADER_SIZE, MAGIC, MAX_DATA_SIZE, MAX_DB_NAME, MAX_KEY_SIZE,
+    MIN_KEYS_BRANCH, MIN_KEYS_LEAF, PGNO_INVALID,
 };
 use crate::rotxn::{map_page_err, resolve_named_record, Database, DbSel, TxnRead};
 
@@ -83,6 +83,43 @@ fn even(n: usize) -> usize {
 /// **first** contiguous run of length `≥ n`. Because the ids are strictly
 /// ascending and unique, `ids[i + n - 1] == ids[i] + n - 1` implies all `n`
 /// are consecutive.
+/// Saturating in-place stat update. `DBRecord` stats (`entries`,
+/// `leaf_pages`, `branch_pages`, `overflow_pages`, `depth`) are **on-disk
+/// data**: a hostile file can carry `u64::MAX` or `0`, so the write path's
+/// `+= 1` / `-= 1` bookkeeping must never overflow-panic (debug) or wrap
+/// (release). Saturation is exact on every non-corrupt file (real counters
+/// are nowhere near the bounds); on a corrupt one the drifted stat is caught
+/// by the checker (INV-18), not by an arithmetic panic mid-mutation.
+fn sat_add(v: &mut u64, n: u64) {
+    *v = v.saturating_add(n);
+}
+
+/// See [`sat_add`].
+fn sat_sub(v: &mut u64, n: u64) {
+    *v = v.saturating_sub(n);
+}
+
+/// Reject a decoded GC PIL whose ids are not strictly ascending or lie
+/// outside `[FIRST_DATA_PGNO, last_pg]` (SPEC 05 GC-3/INV-25/INV-26). The
+/// freelist is on-disk data: a corrupt or hostile entry must yield
+/// `MdbError::Invalid`, never hand out the meta slots (page 0/1), a live
+/// page, or a page beyond the committed file.
+pub(crate) fn validate_pil_ids(ids: &[u64], last_pg: u64) -> Result<()> {
+    let mut prev: Option<u64> = None;
+    for &id in ids {
+        if id < FIRST_DATA_PGNO || id > last_pg {
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
+        if let Some(p) = prev {
+            if p >= id {
+                return Err(Error::Mdb(MdbError::Invalid));
+            }
+        }
+        prev = Some(id);
+    }
+    Ok(())
+}
+
 fn find_run(ids: &[u64], n: u64) -> Option<u64> {
     if n == 1 {
         return ids.first().copied();
@@ -331,8 +368,11 @@ fn read_only_error() -> Error {
 /// an abort (TXN-59/60 — the dirty set vanishes, the disk is untouched).
 pub struct RwTxn<'env> {
     env: &'env Env,
-    /// TXN-6: released when the txn drops (commit or abort).
-    _guard: MutexGuard<'env, ()>,
+    /// TXN-6: released when the txn drops (commit or abort) — from whatever
+    /// thread that happens on (`RwTxn` is `Send`; the guard is the
+    /// thread-agnostic [`crate::env`] writer-lock guard, not a
+    /// `std::sync::MutexGuard`).
+    _guard: crate::env::WriterGuard<'env>,
     /// The mapped region (fallback source for untouched pages, TXN-38).
     bytes: &'env [u8],
     /// The snapshot this txn grew from (`writer_txnid = base.txnid + 1`).
@@ -440,6 +480,14 @@ impl Env {
             return Err(poisoned_error());
         }
         let base = inner.snapshot();
+        // TXN-14 runtime half of the open-time bound (SPEC 06 REC-1a): the
+        // next txnid must stay 2^32 below the reader-table sentinel band, so
+        // an accepted file cannot commit its way into RDR_CLAIMED/RDR_FREE.
+        // Unreachable by any honest store (2^64 - 2^32 commits); a hit means a
+        // corrupt or hostile meta that slipped past open.
+        if base.txnid >= crate::readers::MAX_COMMITTED_TXNID {
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
         Ok(RwTxn {
             txnid: base.txnid + 1, // TXN-2 (+ the reuse note in the module docs)
             next_pgno: base.last_pg + 1,
@@ -581,6 +629,9 @@ impl TxnRead for RwTxn<'_> {
         Source::Writer {
             dirty: &self.dirty,
             bytes: self.bytes,
+            // Bounds the map fallback only: pages this txn allocated beyond
+            // the base snapshot live in `dirty` and resolve before the bound.
+            last_pg: self.committed_last_pg,
         }
     }
     fn main_record(&self) -> &DBRecord {
@@ -1013,6 +1064,14 @@ impl<'env> RwTxn<'env> {
                     }
                     None => {
                         let ids = pil_decode(val).ok_or(Error::Mdb(MdbError::Invalid))?;
+                        // SPEC 05 GC-18 (validation rule): the freelist is
+                        // on-disk data and is NOT trusted. Every id must be a
+                        // real, committed, non-meta page — strictly ascending
+                        // (find_run/binary_search assume sorted ids) and in
+                        // [FIRST_DATA_PGNO, base.last_pg]. A hostile PIL
+                        // could otherwise hand out page 0/1 (the meta slots,
+                        // clobbered at commit C2) or a page past the file.
+                        validate_pil_ids(&ids, self.committed_last_pg)?;
                         if let Some(start) = find_run(&ids, n) {
                             found = Some(Pick {
                                 f,
@@ -1084,6 +1143,13 @@ impl<'env> RwTxn<'env> {
         if self.dirty.contains(pgno) {
             return Ok(pgno);
         }
+        // Not dirty, so the page must be committed: a committed reference
+        // never exceeds the base snapshot's high-water (SPEC 06 REC-14). The
+        // map may extend past the real file end (ADR-0004 D4), so an
+        // unbounded read here could fault on a corrupt reference.
+        if pgno > self.committed_last_pg {
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
         let ps = self.psize as usize;
         let base = (pgno as usize)
             .checked_mul(ps)
@@ -1116,6 +1182,15 @@ impl<'env> RwTxn<'env> {
         if rec.root == PGNO_INVALID {
             return Ok((path, false));
         }
+        // Hostile-depth guard: `rec.depth` is on-disk data. Deeper than the
+        // read path's CURSOR_STACK bound is corruption (a legal tree of
+        // minimum fanout 2 addresses 2^31 leaves at depth 32); without the
+        // cap the descent loop below can build an unbounded `path` (a page
+        // cycle plus a huge depth) and `rebalance` recurses `path.len()`
+        // frames — a stack overflow, not a typed error.
+        if rec.depth as usize > crate::btree::CURSOR_STACK {
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
         let mut pgno = rec.root;
         let valid = Some(&self.validated);
         for _ in 0..=rec.depth {
@@ -1147,6 +1222,10 @@ impl<'env> RwTxn<'env> {
     fn rightmost_path(&self, tree: TreeId) -> Result<(Path, Vec<u8>)> {
         let rec = *self.record(tree);
         let mut path = Vec::new();
+        // Same hostile-depth guard as `search_path`.
+        if rec.depth as usize > crate::btree::CURSOR_STACK {
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
         let mut pgno = rec.root;
         let valid = Some(&self.validated);
         for _ in 0..=rec.depth {
@@ -1161,7 +1240,13 @@ impl<'env> RwTxn<'env> {
                     return Ok((path, key));
                 }
                 NodeView::Branch(br) => {
-                    let last = br.num_keys() - 1;
+                    // A zero-child branch is rejected at decode
+                    // (PageError::EmptyBranch); keep the subtraction checked
+                    // anyway so this path can never underflow.
+                    let last = br
+                        .num_keys()
+                        .checked_sub(1)
+                        .ok_or(Error::Mdb(MdbError::Invalid))?;
                     path.push((pgno, last));
                     pgno = br.child_pgno(last);
                 }
@@ -1253,7 +1338,7 @@ impl<'env> RwTxn<'env> {
         if self.record(tree).root == PGNO_INVALID {
             let res = self.insert_first(tree, key, val, 0);
             match res {
-                Ok(_) => self.record_mut(tree).entries += 1,
+                Ok(_) => sat_add(&mut self.record_mut(tree).entries, 1),
                 Err(_) => self.errored = true,
             }
             return res;
@@ -1289,7 +1374,7 @@ impl<'env> RwTxn<'env> {
         };
         path.last_mut().expect("non-empty path").1 = n;
         let loc = self.insert_into_leaf(tree, path, n, key, val, true, 0)?;
-        self.record_mut(tree).entries += 1;
+        sat_add(&mut self.record_mut(tree).entries, 1);
         Ok(loc)
     }
 
@@ -1305,14 +1390,14 @@ impl<'env> RwTxn<'env> {
         if path.is_empty() {
             // Empty tree: first insert allocates the root leaf (§9 grow).
             let loc = self.insert_first(tree, key, val, node_flags)?;
-            self.record_mut(tree).entries += 1;
+            sat_add(&mut self.record_mut(tree).entries, 1);
             return Ok(loc);
         }
         self.touch_path(tree, path)?;
         let (lpg, ki) = *path.last().expect("non-empty path");
         if !found {
             let loc = self.insert_into_leaf(tree, path, ki, key, val, false, node_flags)?;
-            self.record_mut(tree).entries += 1;
+            sat_add(&mut self.record_mut(tree).entries, 1);
             return Ok(loc);
         }
         // §6.1 replace. Read the old value's shape first: `Err(dsize)` for an
@@ -1350,13 +1435,14 @@ impl<'env> RwTxn<'env> {
         if let Ok((head, dsize)) = old_big {
             let n = overflow_page_count(dsize as u64, self.psize);
             self.free_run(head, n);
-            self.record_mut(tree).overflow_pages -= n;
+            sat_sub(&mut self.record_mut(tree).overflow_pages, n);
         }
         {
             let frame = self.dirty.bytes_mut(lpg).expect("leaf touched");
             LeafMut::from_valid(frame, self.psize)
                 .map_err(corrupt)?
-                .remove(ki);
+                .remove(ki)
+                .map_err(corrupt)?;
         }
         // entries unchanged: replace, not insert.
         self.insert_into_leaf(tree, path, ki, key, val, false, node_flags)
@@ -1448,7 +1534,7 @@ impl<'env> RwTxn<'env> {
                 run[ps..ps + rest.len()].copy_from_slice(rest);
             }
             self.dirty.insert(head, run);
-            self.record_mut(tree).overflow_pages += n;
+            sat_add(&mut self.record_mut(tree).overflow_pages, n);
             let (lpg, _) = *path.last().expect("non-empty path");
             let r = {
                 let frame = self.dirty.bytes_mut(lpg).expect("leaf is dirty");
@@ -1582,7 +1668,7 @@ impl<'env> RwTxn<'env> {
                 }
                 .map_err(corrupt)?;
             }
-            self.record_mut(tree).leaf_pages += 1;
+            sat_add(&mut self.record_mut(tree).leaf_pages, 1);
             let sep = key.to_vec(); // sep = first key of R = the new key (§6.4)
             return if top == 0 {
                 self.insert_into_branch(tree, path, -1, 0, sep, rpg)
@@ -1619,7 +1705,7 @@ impl<'env> RwTxn<'env> {
         self.pack_leaf_range(lpg, &oldleaf, newindx, key, &val, node_flags, 0, s)?;
         self.pack_leaf_range(rpg, &oldleaf, newindx, key, &val, node_flags, s, total)?;
         drop(old);
-        self.record_mut(tree).leaf_pages += 1;
+        sat_add(&mut self.record_mut(tree).leaf_pages, 1);
         if top == 0 {
             self.insert_into_branch(tree, path, -1, 0, sep, rpg)
         } else {
@@ -1704,8 +1790,8 @@ impl<'env> RwTxn<'env> {
             }
             let rec = self.record_mut(tree);
             rec.root = np;
-            rec.depth += 1;
-            rec.branch_pages += 1;
+            rec.depth = rec.depth.saturating_add(1);
+            sat_add(&mut rec.branch_pages, 1);
             return Ok(());
         }
         let lvl = level as usize;
@@ -1757,7 +1843,7 @@ impl<'env> RwTxn<'env> {
         cells.truncate(s); // left keeps [0, s)
         self.write_branch_frame(ppg, &cells)?;
         self.write_branch_frame(rpg, &right)?;
-        self.record_mut(tree).branch_pages += 1;
+        sat_add(&mut self.record_mut(tree).branch_pages, 1);
         if lvl == 0 {
             self.insert_into_branch(tree, path, -1, 0, rising, rpg)
         } else {
@@ -1779,7 +1865,7 @@ impl<'env> RwTxn<'env> {
         }
         match self.delete_apply(tree, &mut path) {
             Ok(()) => {
-                self.record_mut(tree).entries -= 1;
+                sat_sub(&mut self.record_mut(tree).entries, 1);
                 Ok(true)
             }
             Err(e) => {
@@ -1803,13 +1889,14 @@ impl<'env> RwTxn<'env> {
         if let Some((head, dsize)) = big {
             let n = overflow_page_count(dsize as u64, self.psize);
             self.free_run(head, n);
-            self.record_mut(tree).overflow_pages -= n;
+            sat_sub(&mut self.record_mut(tree).overflow_pages, n);
         }
         {
             let frame = self.dirty.bytes_mut(lpg).expect("leaf touched");
             LeafMut::from_valid(frame, self.psize)
                 .map_err(corrupt)?
-                .remove(ki);
+                .remove(ki)
+                .map_err(corrupt)?;
         }
         let top = path.len() - 1;
         self.rebalance(tree, path, top)
@@ -1849,7 +1936,7 @@ impl<'env> RwTxn<'env> {
                 let rec = self.record_mut(tree);
                 rec.root = PGNO_INVALID;
                 rec.depth = 0;
-                rec.leaf_pages -= 1;
+                sat_sub(&mut rec.leaf_pages, 1);
             } else if !is_leaf && nkeys == 1 {
                 let child = {
                     let frame = self.dirty.bytes(pgno).expect("root is dirty");
@@ -1860,8 +1947,8 @@ impl<'env> RwTxn<'env> {
                 self.free_page(pgno);
                 let rec = self.record_mut(tree);
                 rec.root = child;
-                rec.depth -= 1;
-                rec.branch_pages -= 1;
+                rec.depth = rec.depth.saturating_sub(1);
+                sat_sub(&mut rec.branch_pages, 1);
             }
             return Ok(());
         }
@@ -1963,7 +2050,7 @@ impl<'env> RwTxn<'env> {
                     let frame = self.dirty.bytes_mut(sib).expect("sibling touched");
                     let mut l = LeafMut::from_valid(frame, psize).map_err(corrupt)?;
                     let i = l.num_keys() - 1;
-                    l.remove(i);
+                    l.remove(i).map_err(corrupt)?;
                 }
                 self.insert_owned_leaf_cell(pg, 0, &cell)?;
                 let newkey = cell.key.clone();
@@ -1990,7 +2077,8 @@ impl<'env> RwTxn<'env> {
                     let frame = self.dirty.bytes_mut(sib).expect("sibling touched");
                     LeafMut::from_valid(frame, psize)
                         .map_err(corrupt)?
-                        .remove(0);
+                        .remove(0)
+                        .map_err(corrupt)?;
                 }
                 let new_first = {
                     let frame = self.dirty.bytes(sib).expect("sibling touched");
@@ -2022,7 +2110,7 @@ impl<'env> RwTxn<'env> {
                 let frame = self.dirty.bytes_mut(sib).expect("sibling touched");
                 let mut b = BranchMut::from_valid(frame, psize).map_err(corrupt)?;
                 let i = b.num_keys() - 1;
-                b.remove(i);
+                b.remove(i).map_err(corrupt)?;
             }
             let old_sep = {
                 let (ppg, _) = path[level - 1];
@@ -2043,7 +2131,7 @@ impl<'env> RwTxn<'env> {
             {
                 let frame = self.dirty.bytes_mut(pg).expect("page is dirty");
                 let mut b = BranchMut::from_valid(frame, psize).map_err(corrupt)?;
-                b.remove(0);
+                b.remove(0).map_err(corrupt)?;
                 b.insert(0, &[], c).map_err(corrupt)?;
                 b.insert(1, &old_sep, c0).map_err(corrupt)?;
             }
@@ -2068,8 +2156,8 @@ impl<'env> RwTxn<'env> {
                 // (repeated `remove(0)`). So: drop old node 1 first (its child
                 // is re-inserted as the new sentinel), then the old node 0
                 // sentinel, then install the new sentinel.
-                b.remove(1); // old node 1 (real key; child c1 survives below)
-                b.remove(0); // old node 0 (the empty-key sentinel)
+                b.remove(1).map_err(corrupt)?; // old node 1 (real key; child c1 survives below)
+                b.remove(0).map_err(corrupt)?; // old node 0 (the empty-key sentinel)
                 b.insert(0, &[], c1).map_err(corrupt)?;
             }
             let old_sep = {
@@ -2131,7 +2219,8 @@ impl<'env> RwTxn<'env> {
             let frame = self.dirty.bytes_mut(ppg).expect("parent is dirty");
             BranchMut::from_valid(frame, self.psize)
                 .map_err(corrupt)?
-                .remove(child_idx);
+                .remove(child_idx)
+                .map_err(corrupt)?;
         }
         self.insert_into_branch(tree, path, parent_level as isize, child_idx, new_key, child)
     }
@@ -2166,7 +2255,7 @@ impl<'env> RwTxn<'env> {
             for (j, c) in cells.iter().enumerate() {
                 self.insert_owned_leaf_cell(left, base + j, c)?;
             }
-            self.record_mut(tree).leaf_pages -= 1;
+            sat_sub(&mut self.record_mut(tree).leaf_pages, 1);
         } else {
             // The right branch's node 0 regains its explicit key: the parent
             // separator being dropped (§10 merge / §6.5 inverse).
@@ -2187,13 +2276,14 @@ impl<'env> RwTxn<'env> {
                     b.insert(base + j, &c.key, c.child).map_err(corrupt)?;
                 }
             }
-            self.record_mut(tree).branch_pages -= 1;
+            sat_sub(&mut self.record_mut(tree).branch_pages, 1);
         }
         {
             let frame = self.dirty.bytes_mut(ppg).expect("parent is dirty");
             BranchMut::from_valid(frame, self.psize)
                 .map_err(corrupt)?
-                .remove(right_idx);
+                .remove(right_idx)
+                .map_err(corrupt)?;
         }
         self.free_page(right);
         // Keep the path coherent for the parent-level recursion: the surviving
@@ -2368,6 +2458,13 @@ impl<'env> RwTxn<'env> {
         runs: &mut Vec<(u64, u64)>,
     ) -> Result<()> {
         if level == 0 {
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
+        // Hostile-depth guard (same as `search_path`): this function recurses
+        // one frame per level and the entry `level` is the on-disk
+        // `rec.depth` — a u16::MAX there must be a typed error, not a stack
+        // overflow.
+        if level as usize > crate::btree::CURSOR_STACK {
             return Err(Error::Mdb(MdbError::Invalid));
         }
         let page = self.load(pgno)?;

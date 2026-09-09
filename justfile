@@ -24,9 +24,11 @@ loom:
 stress:
     ZERODB_STRESS_SECS=180 cargo test -p zerodb --test reader_stress -- --nocapture stress_
 
-# 10-minute differential fuzz (gate for every milestone; cargo-fuzz needs nightly)
+# Differential fuzz gate for every milestone (10 min diff_ops + 2 min hostile-image
+# open; cargo-fuzz needs nightly)
 fuzz-quick:
     cargo +nightly fuzz run diff_ops -- -max_total_time=600
+    cargo +nightly fuzz run fuzz_image_open -- -max_total_time=120
 
 # Long fuzz for nightly CI (6 h; PLAN 1.14 asks for a 24 h soak — run it on a
 # self-hosted box or chain runs. A dup fuzz target only arrives if 2.8 resumes.)

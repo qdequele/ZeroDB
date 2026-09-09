@@ -108,13 +108,21 @@ pub fn acquire_existing(env_dir: &Path) -> Result<(EnvLock, naming::EnvDataFile)
 /// [`LockError::Busy`] if the lock is held, [`LockError::Io`] on other I/O errors.
 pub fn acquire_or_create(env_dir: &Path) -> Result<EnvLock, LockError> {
     let data = env_dir.join(DATA_FILE_NAME);
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&data)
-        .map_err(LockError::Io)?;
+    // `mode(0o600)`: when this call *creates* the data file (fresh load /
+    // migrate target) it must be owner-only, matching the engine's own
+    // creation mode — a default-mode store leaks data via umask. An existing
+    // file keeps its mode (the mode applies at creation only).
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&data)
+            .map_err(LockError::Io)?
+    };
     lock_or_busy(file, env_dir)
 }
 

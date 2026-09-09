@@ -734,6 +734,18 @@ some DB tree walked from a meta root. Applies to the live meta's snapshot.
   of INV-9), **not** `≥ FILL_THRESHOLD`. The root is exempt from `min_keys`. The
   threshold governs *when delete rebalances*, and is verified indirectly by the
   file-size tolerance band (PLAN 1.5), not as a per-page assertion.
+  **Decode-level floor (added 2026-09-09, security review H2):** independent of
+  the invariant, the *decoder* rejects a branch page with **zero** children
+  (`PageError::EmptyBranch`, SPEC 02 §4.1) — even a root branch — because
+  every descent dereferences child 0 unconditionally. A one-child branch
+  (legal only mid-collapse in a writer's dirty frames, and as the pre-shrink
+  root) still decodes; the checker flags it off-root via this INV-8.
+  **Depth ceiling:** any traversal driven by an on-disk `depth` (the cursor's
+  `CURSOR_STACK`, the write path's `search_path`/`rightmost_path`, the check
+  tool's recursive walk) bounds it at 32 — with the minimum branch fanout of
+  2, depth 32 already addresses 2^31 leaves, so a deeper `depth` is corrupt
+  and fails typed (`MdbError::Invalid` / a checker violation), never by stack
+  overflow.
 - **INV-9** — Bounds consistency: `HEADER_SIZE`-body offsets satisfy
   `0 ≤ lower ≤ upper ≤ psize − HEADER_SIZE`; `num_keys = lower/2`; cells do not
   overlap the pointer array or each other; every pointer targets a cell fully

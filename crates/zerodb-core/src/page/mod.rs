@@ -297,4 +297,24 @@ pub enum PageError {
         /// Free bytes available.
         available: usize,
     },
+
+    /// A branch page decodes with zero children. A well-formed branch always
+    /// holds at least one child (SPEC 02 §4.1, SPEC 03 INV-8), so this is
+    /// structural corruption; rejecting it at decode keeps `child_pgno(0)`
+    /// total for every constructed view.
+    #[error("branch page has zero children (a branch always holds >= 1 child)")]
+    EmptyBranch,
+
+    /// A page number lies beyond the transaction snapshot's committed
+    /// high-water (`last_pg`). Bytes past the high-water may be unbacked by
+    /// the file even though the mapping covers them (the map spans the full
+    /// `map_size`), so dereferencing them could fault; a corrupt/hostile
+    /// reference is refused with this typed error instead (SPEC 06 REC-14).
+    #[error("page {pgno} beyond the snapshot high-water last_pg={last_pg}")]
+    PageOutOfBounds {
+        /// The out-of-bounds page number.
+        pgno: u64,
+        /// The snapshot's committed high-water.
+        last_pg: u64,
+    },
 }

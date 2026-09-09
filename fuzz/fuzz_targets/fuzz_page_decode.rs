@@ -53,7 +53,16 @@ fn walk_branch(branch: &BranchRef<'_>) {
         let _ = branch.key(i);
         let _ = branch.child_pgno(i);
     }
-    let _ = branch.child_index(b"probe");
+    // H2 regression (2026-09 security review): the descent dereferences
+    // `child_pgno(child_index(..))` unconditionally, so exercise that exact
+    // pair on every constructed view — a zero-key branch used to construct
+    // and then panic here (`child_index` returns 0, `child_pgno(0)` asserts).
+    // Since the fix a zero-child branch never constructs (EmptyBranch), so
+    // these calls are total.
+    let i = branch.child_index(b"probe");
+    let _ = branch.child_pgno(i);
+    let i0 = branch.child_index(&[]);
+    let _ = branch.child_pgno(i0);
     let _ = branch.free_space();
 }
 

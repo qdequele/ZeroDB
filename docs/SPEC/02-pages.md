@@ -236,6 +236,21 @@ At env open the engine reads both slots and validates each independently:
 This numbered list is the **single owner** of the meta-slot validation
 predicate; SPEC 06 REC-1 references it rather than restating it.
 
+6. **Geometry validation of the selected slot** (added 2026-09-09, security
+   review H1; SPEC 06 REC-1a). After selection, the winning meta's geometry is
+   validated against the **real on-disk file length** (`fstat`), with checked
+   arithmetic (a hostile `last_pg` near `u64::MAX` must not wrap the multiply):
+   `(last_pg + 1) * page_size <= file length`, each of `main_db.root` /
+   `free_db.root` is `PGNO_INVALID` or within `[FIRST_DATA_PGNO, last_pg]`,
+   and `txnid` is below the reader-table sentinel band (SPEC 06 REC-1a /
+   SPEC 04 TXN-14). Failure → `MdbError::Invalid`. Rationale: the mapping covers the full
+   `map_size` (ADR-0004 D4), so a CRC-valid slot naming a page inside the map
+   but past EOF would otherwise hand readers unbacked bytes — a SIGBUS on
+   first touch, not an error. Under `WRITE_MAP` the file is grown to
+   `map_size` before this check, so the length half is trivially satisfied
+   there; the root-range half still applies. This step validates only the
+   slot actually selected (a discarded slot's geometry is irrelevant).
+
 Selection among the *CRC-valid* slots:
 
 - Normal open: pick the slot with the **higher `txnid`** — the most recent
@@ -351,6 +366,14 @@ other nodes carry the separator key (the smallest key reachable in that child).
 
 Cell length = `10 + ksize`, rounded up to even. ZeroDB stores the full 8-byte
 child pgno (ADR-0002 §D4) rather than LMDB's packed 48-bit lo/hi/flags encoding.
+
+**A branch page always holds at least one node.** A decoded branch with
+`num_keys == 0` is structural corruption and is rejected at view construction
+(`PageError::EmptyBranch`; added 2026-09-09, security review H2): every
+descent dereferences `child_pgno(child_index(key))` unconditionally, and
+`child_index` on an empty branch would name the nonexistent node 0. The
+occupancy *invariant* (≥ 2 children off-root) remains SPEC 03 INV-8; this
+decode rule only pins the weaker ≥ 1 bound that keeps the accessors total.
 
 ### §4.2 — Leaf node (8-byte header + key + value-or-pointer)
 

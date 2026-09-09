@@ -421,7 +421,7 @@ fn leaf_insert_remove_maintains_order_and_space() {
     // Remove the middle key ("cc"), heap compacts, order preserved.
     let mut leaf = LeafMut::from_valid(&mut buf, PSIZE).unwrap();
     let i = leaf.lookup(b"cc").unwrap();
-    leaf.remove(i);
+    leaf.remove(i).unwrap();
     let leaf_ref = LeafRef::new(&buf, PSIZE).unwrap();
     assert_eq!(leaf_ref.num_keys(), 4);
     let keys: Vec<&[u8]> = (0..4).map(|i| leaf_ref.key(i)).collect();
@@ -433,7 +433,7 @@ fn leaf_insert_remove_maintains_order_and_space() {
     // Remove all -> free space returns to the empty baseline.
     let mut leaf = LeafMut::from_valid(&mut buf, PSIZE).unwrap();
     while leaf.num_keys() > 0 {
-        leaf.remove(0);
+        leaf.remove(0).unwrap();
     }
     assert_eq!(leaf.free_space(), free0);
 }

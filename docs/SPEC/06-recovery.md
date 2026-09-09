@@ -33,6 +33,26 @@ this section defines the **recovery decision** and its error taxonomy.
   mandatory — `meta_crc` over `[0,168)`, SPEC 02 §3.3). REC-1 does **not** restate
   the list; it references SPEC 02 §3.2 as the single owner. A slot failing any
   check is **invalid** (torn or foreign) and is discarded from selection.
+- **REC-1a** — **Geometry validation of the selected slot** (added 2026-09-09,
+  security review H1; predicate owned by SPEC 02 §3.2 step 6). A CRC-valid slot
+  can still name geometry the real file cannot back — a truncated or hostile
+  file. After selection, open verifies with **checked arithmetic** that
+  `(last_pg + 1) * page_size` does not exceed the on-disk file length
+  (`fstat`), that `main_db.root` / `free_db.root` are each `PGNO_INVALID`
+  or within `[FIRST_DATA_PGNO, last_pg]`, and that `txnid <=
+  MAX_COMMITTED_TXNID = RDR_CLAIMED - 2^32` (SPEC 04 TXN-14: slot occupancy is
+  encoded in the top of `u64`; the 2^32 margin below the band, together with
+  the writer's runtime re-check — `write_txn` fails with `Invalid` once
+  `base.txnid >= MAX_COMMITTED_TXNID` — guarantees an accepted file can never
+  commit its way into the sentinels or wrap, however many transactions
+  follow); failure is `MdbError::Invalid`.
+  Motivation: the mapping spans the full `map_size` (ADR-0004 D4), so a root
+  or high-water inside the map but past EOF would otherwise SIGBUS on first
+  touch instead of erroring. This is the open-time half of the guarantee; the
+  runtime half is the read path's high-water bound (SPEC 04 TXN-38: no
+  committed-map resolution ever dereferences a pgno above the pinned
+  snapshot's `last_pg` — REC-14's "no recovered reference exceeds the file"
+  is thereby enforced, not assumed, on corrupt input).
 - **REC-2** — **Selection among valid slots:**
 
   | Valid slots | PREV_SNAPSHOT off | PREV_SNAPSHOT on |

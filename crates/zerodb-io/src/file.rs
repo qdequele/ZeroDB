@@ -8,7 +8,7 @@
 //! the vectored commit write (PERF-GAP B4), SAFETY-commented at the site.
 
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 
 use zerodb_core::page::MetaPage;
@@ -16,6 +16,18 @@ use zerodb_core::page::MetaPage;
 // Meta body offset of the `page_size` field (SPEC 02 §3), used to probe the
 // page size of an existing file before it is decoded.
 const OFF_PAGE_SIZE: u64 = 40;
+
+/// The byte offset of page `pgno`, checked: a hostile page number (e.g. from
+/// a corrupt freelist) must yield a typed error, never a wrapped offset that
+/// silently writes/reads elsewhere in the file.
+fn page_offset(pgno: u64, psize: u32) -> std::io::Result<u64> {
+    pgno.checked_mul(u64::from(psize)).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("page offset overflow: pgno {pgno} * psize {psize}"),
+        )
+    })
+}
 
 /// Open an existing data file for read (and, unless `read_only`, write).
 ///
@@ -33,7 +45,7 @@ pub fn open_file(path: &Path, read_only: bool) -> std::io::Result<File> {
 /// Propagates the positioned-read I/O error, or `UnexpectedEof` on a short read.
 pub fn read_page(file: &File, pgno: u64, psize: u32) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; psize as usize];
-    let off = pgno * psize as u64;
+    let off = page_offset(pgno, psize)?;
     file.read_exact_at(&mut buf, off)?;
     Ok(buf)
 }
@@ -47,7 +59,7 @@ pub fn read_page(file: &File, pgno: u64, psize: u32) -> std::io::Result<Vec<u8>>
 /// Propagates the positioned-write I/O error.
 pub fn write_page(file: &File, pgno: u64, psize: u32, bytes: &[u8]) -> std::io::Result<()> {
     debug_assert!(bytes.len() <= psize as usize || bytes.len() % psize as usize == 0);
-    let off = pgno * psize as u64;
+    let off = page_offset(pgno, psize)?;
     file.write_all_at(bytes, off)
 }
 
@@ -75,7 +87,7 @@ pub fn write_pages_vectored(
     /// role).
     const MAX_IOV: usize = 512;
 
-    let mut off: u64 = start_pgno * psize as u64;
+    let mut off: u64 = page_offset(start_pgno, psize)?;
     let mut i = 0usize;
     while i < frames.len() {
         let chunk = &frames[i..(i + MAX_IOV).min(frames.len())];
@@ -169,21 +181,53 @@ pub fn probe_page_size(file: &File) -> std::io::Result<Option<u32>> {
 /// Create a brand-new env data file (SPEC 02 §3.4): allocate `2 * page_size`
 /// bytes, write both meta slots as identical empty metas at txnid 0, and fsync.
 ///
-/// The file is created with `create_new` semantics via truncation of a freshly
-/// created file: the caller must ensure the file did not previously exist (or
-/// was empty). Returns the open file handle (read+write).
+/// The file is created with real `create_new` (O_CREAT|O_EXCL) semantics,
+/// owner-only (`0o600`); when the path already holds an **empty regular
+/// file** (the caller only reaches this for absent-or-empty paths, e.g. a
+/// lock file pre-created by the tools) it is opened in place instead, and a
+/// symlink or other non-regular file at the path is refused. Returns the open
+/// file handle (read+write).
 ///
 /// # Errors
 ///
 /// Propagates any create/write/fsync I/O error, or (unexpectedly) a meta encode
 /// error wrapped as `InvalidInput`.
 pub fn create_env_file(path: &Path, page_size: u32, map_size: u64) -> std::io::Result<File> {
-    let file = OpenOptions::new()
+    // `create_new` (O_CREAT|O_EXCL): never follows a symlink planted at the
+    // data-file path, and `mode(0o600)` keeps the store owner-only (LMDB
+    // creates its map 0600 too; a default-mode file leaks data via umask).
+    // The caller reaches this with the file absent **or existing-but-empty**
+    // (SPEC 02 §3.4/§3.5): for the empty-file case `create_new` fails with
+    // `AlreadyExists` and we fall back to opening the existing file — but
+    // only after `symlink_metadata` proves it is a plain regular file, so a
+    // planted symlink is refused rather than written through.
+    let file = match OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let md = std::fs::symlink_metadata(path)?;
+            if !md.file_type().is_file() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "refusing to initialize an env over a non-regular file (symlink?)",
+                ));
+            }
+            // `O_NOFOLLOW` closes the check-then-open window: a symlink
+            // swapped in after `symlink_metadata` makes this open fail
+            // (`ELOOP`) instead of being followed.
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)?
+        }
+        Err(e) => return Err(e),
+    };
     let ps = page_size as usize;
     // Size the file to the two meta slots (no data page yet — SPEC 02 §3.4).
     file.set_len(2 * ps as u64)?;

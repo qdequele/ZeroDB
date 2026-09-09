@@ -84,12 +84,24 @@ Normative rules are numbered **TXN-n** so tests and the check tool can cite them
 
 ## §2 — Single-writer protocol (no lock file)
 
-- **TXN-6** — `Env::write_txn()` acquires the env's in-process **write mutex**
-  (a plain `std::sync::Mutex`/`parking_lot::Mutex` field on the shared
-  `EnvInner`, §7). The guard is held for the entire life of the `RwTxn` and
-  released on commit or abort. There is **no** lock file and **no** cross-process
-  coordination (D-001); the mutex serialises only the threads of this process,
-  which is the whole world under D-001.
+- **TXN-6** — `Env::write_txn()` acquires the env's in-process **writer lock**
+  (a field on the shared `EnvInner`, §7). The guard is held for the entire life
+  of the `RwTxn` and released on commit or abort. There is **no** lock file and
+  **no** cross-process coordination (D-001); the lock serialises only the
+  threads of this process, which is the whole world under D-001.
+  **Lock construction (amended 2026-09-09, security review M1):** the lock is
+  a **thread-agnostic** `occupied: Mutex<bool>` flag plus a `Condvar`, NOT a
+  `Mutex<()>` whose `MutexGuard` lives inside the txn. `RwTxn` is `Send` (and
+  heed's `WithoutTls` mode moves write txns across threads), so the release
+  may run on a different thread than the acquire — unlocking a
+  `std::sync::MutexGuard` from a foreign thread is forbidden by std
+  (`MutexGuard: !Send`; the underlying lock may abort on macOS). Acquire
+  waits on the condvar until `occupied` is false, then sets it; the guard's
+  drop takes the flag mutex briefly *on whatever thread drops it*, clears the
+  flag, and notifies. Writer-panic policy is unchanged: the flag mutex guards
+  no txn data (the dirty set died with the unwound `RwTxn`, TXN-60), so a
+  poisoned flag mutex is recovered (`PoisonError::into_inner`) rather than
+  propagated.
 - **TXN-7** — A second `write_txn()` on the same env **blocks** until the current
   writer finishes (mutex contention), matching LMDB's single-writer serialisation
   (LMDB blocks on `me_wmutex`). It does not error. (Consumers hold a write txn
@@ -162,7 +174,13 @@ claim/release a pinned snapshot without blocking the writer.
   1024). When the caller does **not** set it, the default is **126** (LMDB
   parity: `DEFAULT_READERS`), not an arbitrary number — a differential detail the
   oracle can probe. It is allocated once and never resized during the env's life
-  (matching LMDB, whose reader count is fixed at open).
+  (matching LMDB, whose reader count is fixed at open). Because the slots are
+  allocated **eagerly** (one cache-padded word per slot), `max_readers` is
+  bounded at open: values above `MAX_READERS_LIMIT` (2^20) are rejected with
+  `Io(InvalidInput)` rather than aborting on allocation failure
+  (added 2026-09-09, security review M6; `max_dbs` has the same bound,
+  `MAX_DBS_LIMIT` = 2^20, for the comparator-registry slots — SPEC 00
+  rows 4/5).
 - Each **slot** is cache-line padded (≥ 64 bytes, aligned) to avoid false
   sharing between a reader touching its slot and the writer scanning the array.
   A slot carries exactly one load-bearing atomic field:
@@ -177,7 +195,11 @@ claim/release a pinned snapshot without blocking the writer.
     finished publishing a real snapshot txnid (transient, §4.3).
 
   A real `snapshot_txnid` is always `< RDR_CLAIMED` (TXN-1: ids start at 1 and
-  grow by 1/commit; the sentinel band at the top of `u64` is unreachable).
+  grow by 1/commit; the sentinel band at the top of `u64` is unreachable) —
+  and, against a hostile meta, *enforced*: open refuses `txnid >
+  MAX_COMMITTED_TXNID = RDR_CLAIMED - 2^32` (SPEC 06 REC-1a) and `write_txn`
+  refuses to start once `base.txnid >= MAX_COMMITTED_TXNID`, so the 2^32 margin
+  can never be consumed by commits.
   Because occupancy is encoded in `txnid` alone, no separate `pid`/`tid` fields
   are needed (D-001 deletes LMDB's `mr_pid`/`mr_tid`).
 
@@ -529,6 +551,15 @@ dirty-page store must be built so it is.
     (WRITE_MAP, §6.4).
   A caller cannot tell which; the borrow lifetime rules (§6.2) are identical for
   both so the distinction is invisible and safe.
+  **High-water bound (added 2026-09-09, security review H1):** every
+  committed-map resolution — a reader's, or the writer's map fallback — refuses
+  a pgno above the pinned snapshot's `last_pg` with a typed error
+  (`PageError::PageOutOfBounds`), and clamps multi-page (overflow-run) slices
+  at that bound. The mapping covers the full `map_size` (ADR-0004 D4), so map
+  bytes past the real file end are unbacked: a corrupt/hostile reference there
+  must fail typed, not SIGBUS (SPEC 06 REC-14). Dirty frames are exempt — a
+  writer legitimately allocates pages beyond its base snapshot's `last_pg`,
+  and those resolve from the dirty store before the bound is consulted.
 
 ### §6.2 — Which operations invalidate which borrows
 

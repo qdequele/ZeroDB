@@ -35,5 +35,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "fuzz_image_open"
+path = "fuzz_targets/fuzz_image_open.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1
