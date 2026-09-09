@@ -29,7 +29,9 @@
 //! Graviton-bench remainder). This harness is written to run unchanged on that
 //! hardware; only the reported medians move.
 
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use zerodb_oracle::tempdir::TempDir;
 
 /// 1 GiB sparse map — larger than any dataset here, and a multiple of every
