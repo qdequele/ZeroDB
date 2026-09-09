@@ -33,7 +33,10 @@ just fuzz-quick                           # 10-minute differential fuzz vs real 
 just crash-test-quick                     # when touching the write or commit path
 ```
 
-CI runs the same battery on x86-64 and aarch64. For changes that could affect
+CI runs the same battery on x86-64 and aarch64, plus a build of the consumer
+crates on the workspace `rust-version` (the MSRV is for consumers; developing
+ZeroDB itself needs a current stable toolchain because of the bench and fuzz
+tooling). For changes that could affect
 Meilisearch or hannoy, run the consumer gate too
 ([`docs/CONSUMER-GATE.md`](docs/CONSUMER-GATE.md)).
 

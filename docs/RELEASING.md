@@ -91,4 +91,7 @@ from-source feature.
 - **Platforms**: linux-aarch64, linux-x86_64, macOS aarch64; DB page size is
   independent of the OS page size, but a 64K-page kernel has not been exercised
   in CI yet (see the release notes' known gaps).
-- **MSRV**: the workspace `rust-version`; a bump is a CHANGELOG entry.
+- **MSRV**: the workspace `rust-version` is what a **consumer** needs to build
+  the library crates and `zerodb-tools` (checked in CI without
+  dev-dependencies). Developing ZeroDB itself — running the oracle, benches and
+  fuzzers — needs a current stable toolchain. A bump is a CHANGELOG entry.
