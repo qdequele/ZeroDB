@@ -69,6 +69,11 @@ fn check_read_key(kb: &[u8]) -> Result<()> {
 /// Dispatch a read closure over the three txn sources (SPEC 04 §3–§5). Each arm
 /// monomorphizes over the concrete `zerodb` txn type (all `TxnRead`).
 macro_rules! with_read {
+    // Database operation: check the handle/txn environment pairing first.
+    ($db:expr, $txn:expr, |$t:ident| $e:expr) => {{
+        $db.assert_env($txn);
+        with_read!($txn, |$t| $e)
+    }};
     ($txn:expr, |$t:ident| $e:expr) => {
         match &$txn.inner {
             $crate::txn::InnerTxn::Ro($t) => $e,
@@ -134,6 +139,11 @@ fn prefix_bounds(prefix: &[u8]) -> OwnedBounds {
 pub struct Database<KC, DC, C = DefaultComparator, CDUP = DefaultComparator> {
     pub(crate) inner: zerodb::Database,
     pub(crate) page_size: u32,
+    /// The owning environment's identity (`zerodb::Env::ident`), so every
+    /// operation can refuse a transaction from another environment the way
+    /// heed's `assert_eq_env_db_txn!` does. Without it a handle used with the
+    /// wrong env's txn would silently walk the wrong file's pages.
+    pub(crate) env_ident: usize,
     marker: PhantomData<(KC, DC, C, CDUP)>,
 }
 
@@ -151,12 +161,28 @@ impl<KC, DC, C, CDUP> std::fmt::Debug for Database<KC, DC, C, CDUP> {
 }
 
 impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
-    pub(crate) fn new(inner: zerodb::Database, page_size: u32) -> Database<KC, DC, C, CDUP> {
+    pub(crate) fn new(
+        inner: zerodb::Database,
+        page_size: u32,
+        env_ident: usize,
+    ) -> Database<KC, DC, C, CDUP> {
         Database {
             inner,
             page_size,
+            env_ident,
             marker: PhantomData,
         }
+    }
+
+    /// heed's `assert_eq_env_db_txn!`: a database handle used with a
+    /// transaction from a different environment is a programming error heed
+    /// turns into a panic with exactly this message; so do we.
+    #[inline]
+    fn assert_env(&self, txn: &RoTxn) {
+        assert!(
+            self.env_ident == txn.env_ident(),
+            "The database environment doesn't match the transaction's environment"
+        );
     }
 
     /// `get(txn, key)` (SPEC 00 row 30): the value for `key`, or `None`.
@@ -171,7 +197,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
         check_read_key(&kb)?;
-        let raw = with_read!(txn, |t| self.inner.get(t, &kb))?;
+        let raw = with_read!(self, txn, |t| self.inner.get(t, &kb))?;
         match raw {
             Some(bytes) => Ok(Some(DC::bytes_decode(bytes).map_err(Error::Decoding)?)),
             None => Ok(None),
@@ -184,7 +210,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// `Mdb(Invalid)` on corruption.
     pub fn len(&self, txn: &RoTxn) -> Result<u64> {
-        Ok(with_read!(txn, |t| self.inner.len(t))?)
+        Ok(with_read!(self, txn, |t| self.inner.len(t))?)
     }
 
     /// `is_empty(txn)` (SPEC 00 row 40).
@@ -193,7 +219,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// `Mdb(Invalid)` on corruption.
     pub fn is_empty(&self, txn: &RoTxn) -> Result<bool> {
-        Ok(with_read!(txn, |t| self.inner.is_empty(t))?)
+        Ok(with_read!(self, txn, |t| self.inner.is_empty(t))?)
     }
 
     /// `stat(txn)` (SPEC 00 row 49).
@@ -202,7 +228,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// `Mdb(Invalid)` on corruption.
     pub fn stat(&self, txn: &RoTxn) -> Result<DatabaseStat> {
-        let s = with_read!(txn, |t| self.inner.stat(t))?;
+        let s = with_read!(self, txn, |t| self.inner.stat(t))?;
         Ok(DatabaseStat {
             page_size: self.page_size,
             depth: u32::from(s.depth),
@@ -223,7 +249,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         KC: BytesDecode<'txn>,
         DC: BytesDecode<'txn>,
     {
-        decode_opt::<KC, DC>(with_read!(txn, |t| self.inner.first(t))?)
+        decode_opt::<KC, DC>(with_read!(self, txn, |t| self.inner.first(t))?)
     }
 
     /// `last(txn)` (SPEC 00 row 42).
@@ -236,7 +262,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         KC: BytesDecode<'txn>,
         DC: BytesDecode<'txn>,
     {
-        decode_opt::<KC, DC>(with_read!(txn, |t| self.inner.last(t))?)
+        decode_opt::<KC, DC>(with_read!(self, txn, |t| self.inner.last(t))?)
     }
 
     /// `get_lower_than(txn, key)` — last entry `< key` (SPEC 00 second table).
@@ -255,7 +281,9 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
         check_read_key(&kb)?;
-        decode_opt::<KC, DC>(with_read!(txn, |t| self.inner.get_lower_than(t, &kb))?)
+        decode_opt::<KC, DC>(with_read!(self, txn, |t| self
+            .inner
+            .get_lower_than(t, &kb))?)
     }
 
     /// `get_lower_than_or_equal_to(txn, key)` — last entry `<= key`
@@ -275,7 +303,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
         check_read_key(&kb)?;
-        decode_opt::<KC, DC>(with_read!(txn, |t| self
+        decode_opt::<KC, DC>(with_read!(self, txn, |t| self
             .inner
             .get_lower_than_or_equal_to(t, &kb))?)
     }
@@ -296,7 +324,9 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
         check_read_key(&kb)?;
-        decode_opt::<KC, DC>(with_read!(txn, |t| self.inner.get_greater_than(t, &kb))?)
+        decode_opt::<KC, DC>(with_read!(self, txn, |t| self
+            .inner
+            .get_greater_than(t, &kb))?)
     }
 
     /// `get_greater_than_or_equal_to(txn, key)` — first entry `>= key`
@@ -316,7 +346,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
         check_read_key(&kb)?;
-        decode_opt::<KC, DC>(with_read!(txn, |t| self
+        decode_opt::<KC, DC>(with_read!(self, txn, |t| self
             .inner
             .get_greater_than_or_equal_to(t, &kb))?)
     }
@@ -329,7 +359,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// Infallible construction; returns [`Result`] for heed shape.
     pub fn iter<'txn>(&self, txn: &'txn RoTxn) -> Result<RoIter<'txn, KC, DC>> {
-        Ok(RoIter::new(with_read!(txn, |t| self.inner.iter(t))))
+        Ok(RoIter::new(with_read!(self, txn, |t| self.inner.iter(t))))
     }
 
     /// `rev_iter(txn)` (SPEC 00 second table).
@@ -338,7 +368,9 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// As [`Database::iter`].
     pub fn rev_iter<'txn>(&self, txn: &'txn RoTxn) -> Result<RoRevIter<'txn, KC, DC>> {
-        Ok(RoRevIter::new(with_read!(txn, |t| self.inner.rev_iter(t))))
+        Ok(RoRevIter::new(with_read!(self, txn, |t| self
+            .inner
+            .rev_iter(t))))
     }
 
     /// `range(txn, range)` (SPEC 00 row 44).
@@ -357,7 +389,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
         let (lo, hi) = (as_bound(&lo), as_bound(&hi));
-        Ok(RoRange::new(with_read!(txn, |t| self
+        Ok(RoRange::new(with_read!(self, txn, |t| self
             .inner
             .range(t, lo, hi))))
     }
@@ -378,7 +410,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
         let (lo, hi) = (as_bound(&lo), as_bound(&hi));
-        Ok(RoRevRange::new(with_read!(txn, |t| self
+        Ok(RoRevRange::new(with_read!(self, txn, |t| self
             .inner
             .rev_range(t, lo, hi))))
     }
@@ -399,7 +431,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
         check_read_key(&pb)?;
-        Ok(RoPrefix::new(with_read!(txn, |t| self
+        Ok(RoPrefix::new(with_read!(self, txn, |t| self
             .inner
             .prefix_iter(t, &pb))))
     }
@@ -419,7 +451,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         C: LexicographicComparator,
     {
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
-        Ok(RoRevPrefix::new(with_read!(txn, |t| self
+        Ok(RoRevPrefix::new(with_read!(self, txn, |t| self
             .inner
             .rev_prefix_iter(t, &pb))))
     }
@@ -432,6 +464,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// Infallible construction; returns [`Result`] for heed shape.
     pub fn iter_mut<'txn>(&self, txn: &'txn mut RwTxn) -> Result<RwIter<'txn, KC, DC>> {
+        self.assert_env(txn);
         Ok(RwIter::new(RwGuts::new(
             txn,
             self.inner,
@@ -447,6 +480,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// As [`Database::iter_mut`].
     pub fn rev_iter_mut<'txn>(&self, txn: &'txn mut RwTxn) -> Result<RwRevIter<'txn, KC, DC>> {
+        self.assert_env(txn);
         Ok(RwRevIter::new(RwGuts::new(
             txn,
             self.inner,
@@ -470,6 +504,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         KC: BytesEncode<'a>,
         R: RangeBounds<KC::EItem>,
     {
+        self.assert_env(txn);
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
         Ok(RwRange::new(RwGuts::new(txn, self.inner, Dir::Fwd, lo, hi)))
     }
@@ -488,6 +523,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         KC: BytesEncode<'a>,
         R: RangeBounds<KC::EItem>,
     {
+        self.assert_env(txn);
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
         Ok(RwRevRange::new(RwGuts::new(
             txn,
@@ -513,6 +549,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         KC: BytesEncode<'a>,
         C: LexicographicComparator,
     {
+        self.assert_env(txn);
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
         check_read_key(&pb)?;
         let (lo, hi) = prefix_bounds(&pb);
@@ -539,6 +576,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         KC: BytesEncode<'a>,
         C: LexicographicComparator,
     {
+        self.assert_env(txn);
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
         let (lo, hi) = prefix_bounds(&pb);
         Ok(RwRevPrefix::new(RwGuts::new(
@@ -562,6 +600,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         KC: BytesEncode<'a>,
         DC: BytesEncode<'a>,
     {
+        self.assert_env(txn);
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
         let vb = DC::bytes_encode(data).map_err(Error::Encoding)?;
         self.inner.put(txn.zdb_mut(), &kb, &vb).map_err(Into::into)
@@ -583,6 +622,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         KC: BytesEncode<'a>,
         DC: BytesEncode<'a>,
     {
+        self.assert_env(txn);
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
         let vb = DC::bytes_encode(data).map_err(Error::Encoding)?;
         self.inner
@@ -606,6 +646,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         KC: BytesEncode<'a>,
         F: FnOnce(&mut ReservedSpace) -> std::io::Result<()>,
     {
+        self.assert_env(txn);
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
         // PERF-GAP B6 (2026-07-21): hand the caller the engine's in-frame slot
         // directly (the `MDB_RESERVE` shape) instead of a zeroed heap buffer
@@ -645,6 +686,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     where
         KC: BytesEncode<'a>,
     {
+        self.assert_env(txn);
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
         check_read_key(&kb)?;
         self.inner.delete(txn.zdb_mut(), &kb).map_err(Into::into)
@@ -660,6 +702,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         KC: BytesEncode<'a>,
         R: RangeBounds<KC::EItem>,
     {
+        self.assert_env(txn);
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
         let n = self
             .inner
@@ -673,6 +716,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// `Mdb(BadTxn)` / `Mdb(MapFull)`.
     pub fn clear(&self, txn: &mut RwTxn) -> Result<()> {
+        self.assert_env(txn);
         self.inner.clear(txn.zdb_mut()).map_err(Into::into)
     }
 
@@ -688,6 +732,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// `Mdb(BadTxn)` / `Mdb(MapFull)`.
     pub unsafe fn remove(self, rwtxn: &mut RwTxn) -> Result<()> {
+        self.assert_env(rwtxn);
         self.inner.drop_db(rwtxn.zdb_mut()).map_err(Into::into)
     }
 
@@ -696,7 +741,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     /// Change the key/data codecs (SPEC 00 row 51). Pure client-side retype.
     #[must_use]
     pub fn remap_types<KC2, DC2>(&self) -> Database<KC2, DC2, C> {
-        Database::new(self.inner, self.page_size)
+        Database::new(self.inner, self.page_size, self.env_ident)
     }
 
     /// Change the key codec (SPEC 00 row 51).
@@ -748,8 +793,8 @@ pub struct DatabaseOpenOptions<'e, 'n, T, KC, DC, C = DefaultComparator, CDUP = 
 }
 
 impl<'e, T> DatabaseOpenOptions<'e, 'static, T, Unspecified, Unspecified> {
-    /// A fresh builder over `env`.
-    pub(crate) fn new(env: &'e Env<T>) -> Self {
+    /// A fresh builder over `env` (heed: `DatabaseOpenOptions::new`).
+    pub fn new(env: &'e Env<T>) -> Self {
         DatabaseOpenOptions {
             env,
             name: None,
@@ -845,6 +890,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         C: Comparator + 'static,
     {
         self.check_flags()?;
+        self.assert_env_txn(rtxn);
         let name = name_bytes(self.name);
         let page_size = self.env.zdb().page_size();
         let z = self.env.zdb();
@@ -852,7 +898,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
             None => with_read!(rtxn, |t| z.open_database(t, name))?,
             Some(cmp) => with_read!(rtxn, |t| z.open_database_with_comparator(t, name, cmp))?,
         };
-        Ok(res.map(|db| Database::new(db, page_size)))
+        Ok(res.map(|db| Database::new(db, page_size, z.ident())))
     }
 
     /// Create the database if absent (SPEC 00 rows 11/12).
@@ -867,6 +913,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         C: Comparator + 'static,
     {
         self.check_flags()?;
+        self.assert_env_txn(wtxn);
         let name = name_bytes(self.name);
         let page_size = self.env.zdb().page_size();
         let db = match custom_comparator::<C>() {
@@ -877,18 +924,31 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
                     .create_database_with_comparator(wtxn.zdb_mut(), name, cmp)?
             }
         };
-        Ok(Database::new(db, page_size))
+        Ok(Database::new(db, page_size, self.env.zdb().ident()))
+    }
+
+    /// heed's `assert_eq_env_txn!` on `open`/`create`.
+    fn assert_env_txn(&self, txn: &RoTxn) {
+        assert!(
+            self.env.zdb().ident() == txn.env_ident(),
+            "The environment doesn't match the transaction's environment"
+        );
     }
 }
 
 impl<T, KC, DC, C, CDUP> Clone for DatabaseOpenOptions<'_, '_, T, KC, DC, C, CDUP> {
     fn clone(&self) -> Self {
-        DatabaseOpenOptions {
-            env: self.env,
-            name: self.name,
-            flags: self.flags,
-            marker: PhantomData,
-        }
+        *self
+    }
+}
+impl<T, KC, DC, C, CDUP> Copy for DatabaseOpenOptions<'_, '_, T, KC, DC, C, CDUP> {}
+
+impl<T, KC, DC, C, CDUP> std::fmt::Debug for DatabaseOpenOptions<'_, '_, T, KC, DC, C, CDUP> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("DatabaseOpenOptions")
+            .field("name", &self.name)
+            .field("flags", &self.flags)
+            .finish_non_exhaustive()
     }
 }
 

@@ -621,6 +621,13 @@ impl TxnRead for RwTxn<'_> {
 }
 
 impl<'env> RwTxn<'env> {
+    /// The identity of the environment this transaction belongs to
+    /// ([`Env::ident`]).
+    #[must_use]
+    pub fn env_ident(&self) -> usize {
+        self.env.ident()
+    }
+
     /// This writer's txnid (`last committed + 1`, SPEC 04 TXN-2/5).
     #[must_use]
     pub fn txnid(&self) -> u64 {

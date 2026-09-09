@@ -113,6 +113,16 @@ impl<'e, T> RoTxn<'e, T> {
         }
     }
 
+    /// The owning environment's identity (`zerodb::Env::ident`), used for
+    /// heed's environment/transaction pairing assertions.
+    pub(crate) fn env_ident(&self) -> usize {
+        match &self.inner {
+            InnerTxn::Ro(t) => t.env_ident(),
+            InnerTxn::Nested(t) => t.env_ident(),
+            InnerTxn::Rw(t) => t.env_ident(),
+        }
+    }
+
     /// Commit a read transaction (SPEC 00 — `RoTxn::commit`). For ZeroDB a read
     /// txn commit is a plain release (no cross-process metadata sync to do); it
     /// simply drops the pinned snapshot / reader slot.

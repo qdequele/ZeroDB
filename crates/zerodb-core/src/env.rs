@@ -844,6 +844,16 @@ impl Env {
         &self.inner
     }
 
+    /// An identity for this environment, equal across every clone of the same
+    /// `Env` and distinct from every other open environment (the address of the
+    /// shared inner state). Consumers use it to assert that a database handle
+    /// and a transaction belong to the same environment, as heed does with its
+    /// `MDB_env` pointer.
+    #[must_use]
+    pub fn ident(&self) -> usize {
+        Arc::as_ptr(self.inner()) as *const () as usize
+    }
+
     /// The DB page size (SPEC 02 §3.2, authoritative from the live meta).
     #[must_use]
     pub fn page_size(&self) -> u32 {

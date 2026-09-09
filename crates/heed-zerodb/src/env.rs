@@ -59,7 +59,7 @@ fn os_page_size() -> usize {
 /// Builder for opening an [`Env`] — the exact `heed::EnvOpenOptions<T>` shape
 /// (default `WithTls`, immediately converted via `read_txn_without_tls` in
 /// every production open; SPEC 00 rows 1/2).
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnvOpenOptions<T: TlsUsage = WithTls> {
     map_size: Option<usize>,
     max_readers: Option<u32>,

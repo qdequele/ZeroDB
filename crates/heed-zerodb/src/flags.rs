@@ -34,6 +34,13 @@ macro_rules! flags {
             #[must_use]
             pub const fn bits(&self) -> u32 { self.0 }
 
+            /// The flags for `bits`, or `None` if any bit is not a defined flag
+            /// (bitflags' `from_bits`; heed's `Env::flags` relies on it).
+            #[must_use]
+            pub const fn from_bits(bits: u32) -> Option<$name> {
+                if bits & !Self::all().0 == 0 { Some($name(bits)) } else { None }
+            }
+
             /// Convert from bits, truncating unknown bits.
             #[must_use]
             pub const fn from_bits_truncate(bits: u32) -> $name { $name(bits & $name::all().0) }

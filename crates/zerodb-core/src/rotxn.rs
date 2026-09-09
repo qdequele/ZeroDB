@@ -200,6 +200,13 @@ impl RoTxn<'_> {
             EnvHandle::Owned(e) => e,
         }
     }
+
+    /// The identity of the environment this transaction belongs to
+    /// ([`Env::ident`]).
+    #[must_use]
+    pub fn env_ident(&self) -> usize {
+        self.env_ref().ident()
+    }
 }
 
 impl Drop for RoTxn<'_> {
