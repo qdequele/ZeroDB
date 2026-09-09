@@ -3,3 +3,5 @@ fuzz/target
 fuzz/corpus
 fuzz/artifacts
 benches/results/*.tmp
+__pycache__/
+*.pyc
