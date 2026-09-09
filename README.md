@@ -11,15 +11,24 @@ against the exact LMDB fork Meilisearch ships, operation by operation.
 ```toml
 # In a heed 0.22 consumer (milli, hannoy, …) — one line to switch engines:
 [patch.crates-io]
-heed = { path = "…/zerodb/crates/heed-shim" }
+heed = { git = "https://github.com/qdequele/ZeroDB", tag = "v0.1.0" }   # or path = "…/zerodb/crates/heed-shim"
 ```
 
-> **Status: experimental.** Phase 1 (strict LMDB parity) is implemented and
-> its consumer-suite gate is green; the remaining Phase 1 exit criteria (24 h
-> fuzz soak, Graviton 4K/64K bench, CI) are still open. Phase 2 (the LMDB
-> features heed hides) is implemented except `DUPSORT` (parked) and three
-> deferred `SHOULD` items. Phase 3 has not started: 3.7 is chosen, its ADR is a
-> draft. Not production-ready — see [Pending](#whats-pending).
+Before you rely on it, know four things about the files: the data file is
+**not an LMDB file** (own `ZDB1` format, migrate with `zerodb-tools`); an
+adapter env directory contains exactly one file, `data.mdb`, and **no
+`lock.mdb`**; **one process per environment** (no cross-process locking); keys
+are at most **511 bytes**, as in LMDB. The full list is in
+[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
+
+> **Status: 0.1, experimental.** Phase 1 (strict LMDB parity) is implemented and
+> Meilisearch v1.53.1 and hannoy build and pass their test suites on it with zero
+> source changes; the remaining Phase 1 exit criteria (24 h fuzz soak, Graviton
+> 4K/64K bench) are still open. Phase 2 (the LMDB features heed hides) is
+> implemented except `DUPSORT` (parked) and three deferred `SHOULD` items. Phase 3
+> has not started. Not production-ready — see [Pending](#whats-pending),
+> [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) for every heed item's status,
+> and [`CHANGELOG.md`](CHANGELOG.md).
 
 ---
 
@@ -155,14 +164,17 @@ ZeroDB benchmark on the same workloads — see
 ## What's pending
 
 - Production-target validation: Graviton + EBS runs (the vectored commit path
-  is built for exactly that), 24 h fuzz soak, CI.
+  is built for exactly that), the 24 h fuzz soak, a 64K-page kernel in CI.
 - Human sign-off pending on ADR-0009 and ADR-0012 (draft) and on divergences
   D-011, D-013, D-014, D-015 (`docs/DIVERGENCES.md`).
 - Three write-iterator parity fixes landed 2026-09-09 (`range_mut` bounds under
   a custom comparator, `prefix_iter_mut("")`, streamed `copy_to_file`) are
   pinned by adapter tests but not yet by the oracle — see PROGRESS.md.
 - `DUPSORT` is parked by design (no consumer uses it — ADR-0011).
-- Not published to crates.io; API may still move.
+- Releases are git tags with GitHub release notes and prebuilt `zerodb-tools`
+  binaries; nothing is on crates.io during 0.x (ADR-0013). Consumers pin a tag
+  through the `[patch.crates-io]` above. ZeroDB-only extension APIs may still
+  move between minor versions; heed-mirrored signatures never do.
 
 ## License
 

@@ -184,6 +184,15 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// [`Error::Io`] (boundary rejections, missing dir, I/O), `Error::Mdb`
     /// (`Invalid`) on a bad store, [`Error::EnvAlreadyOpened`] (TXN-51).
     pub unsafe fn open<P: AsRef<Path>>(&self, path: P) -> Result<Env<T>> {
+        // D-016: `MDB_NOSUBDIR` (env = two files `path` and `path-lock`) is not
+        // supported — every ZeroDB env is a directory. Refuse loudly rather than
+        // silently creating a directory where the caller expects a file.
+        if self.flags.contains(EnvFlags::NO_SUB_DIR) {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "ZeroDB does not support MDB_NOSUBDIR: an environment is always a directory (D-016)",
+            )));
+        }
         // D-010: the fork rejects `max_readers(0)` with EINVAL at open.
         if self.max_readers == Some(0) {
             return Err(Error::Io(std::io::Error::new(

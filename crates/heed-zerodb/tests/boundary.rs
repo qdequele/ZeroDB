@@ -90,3 +90,18 @@ fn db_name_without_nul_ok() {
     let _db: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some("good-name")).unwrap();
     wtxn.commit().unwrap();
 }
+
+/// D-016: `NO_SUB_DIR` is refused at open (`Io(Unsupported)`) instead of being
+/// silently ignored and producing a directory env.
+#[test]
+fn no_sub_dir_is_refused_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts();
+    o.map_size(os_page() * 16);
+    unsafe { o.flags(heed_zerodb::EnvFlags::NO_SUB_DIR) };
+    match unsafe { o.open(dir.path().join("env")) } {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::Unsupported),
+        other => panic!("expected Io(Unsupported), got {other:?}"),
+    }
+    assert!(!dir.path().join("env").exists(), "nothing must be created");
+}

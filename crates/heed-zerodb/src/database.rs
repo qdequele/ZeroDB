@@ -382,7 +382,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         &self,
         txn: &'txn RoTxn,
         range: &'a R,
-    ) -> Result<RoRange<'txn, KC, DC>>
+    ) -> Result<RoRange<'txn, KC, DC, C>>
     where
         KC: BytesEncode<'a>,
         R: RangeBounds<KC::EItem>,
@@ -403,7 +403,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         &self,
         txn: &'txn RoTxn,
         range: &'a R,
-    ) -> Result<RoRevRange<'txn, KC, DC>>
+    ) -> Result<RoRevRange<'txn, KC, DC, C>>
     where
         KC: BytesEncode<'a>,
         R: RangeBounds<KC::EItem>,
@@ -424,7 +424,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         &self,
         txn: &'txn RoTxn,
         prefix: &'a KC::EItem,
-    ) -> Result<RoPrefix<'txn, KC, DC>>
+    ) -> Result<RoPrefix<'txn, KC, DC, C>>
     where
         KC: BytesEncode<'a>,
         C: LexicographicComparator,
@@ -445,7 +445,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         &self,
         txn: &'txn RoTxn,
         prefix: &'a KC::EItem,
-    ) -> Result<RoRevPrefix<'txn, KC, DC>>
+    ) -> Result<RoRevPrefix<'txn, KC, DC, C>>
     where
         KC: BytesEncode<'a>,
         C: LexicographicComparator,
@@ -499,7 +499,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         &self,
         txn: &'txn mut RwTxn,
         range: &'a R,
-    ) -> Result<RwRange<'txn, KC, DC>>
+    ) -> Result<RwRange<'txn, KC, DC, C>>
     where
         KC: BytesEncode<'a>,
         R: RangeBounds<KC::EItem>,
@@ -518,7 +518,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         &self,
         txn: &'txn mut RwTxn,
         range: &'a R,
-    ) -> Result<RwRevRange<'txn, KC, DC>>
+    ) -> Result<RwRevRange<'txn, KC, DC, C>>
     where
         KC: BytesEncode<'a>,
         R: RangeBounds<KC::EItem>,
@@ -544,7 +544,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         &self,
         txn: &'txn mut RwTxn,
         prefix: &'a KC::EItem,
-    ) -> Result<RwPrefix<'txn, KC, DC>>
+    ) -> Result<RwPrefix<'txn, KC, DC, C>>
     where
         KC: BytesEncode<'a>,
         C: LexicographicComparator,
@@ -571,7 +571,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         &self,
         txn: &'txn mut RwTxn,
         prefix: &'a KC::EItem,
-    ) -> Result<RwRevPrefix<'txn, KC, DC>>
+    ) -> Result<RwRevPrefix<'txn, KC, DC, C>>
     where
         KC: BytesEncode<'a>,
         C: LexicographicComparator,

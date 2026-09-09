@@ -118,7 +118,10 @@ Versioning rules while 0.x:
 
 1. Is the "no crates.io for 0.x" call acceptable, or is docs.rs presence wanted
    from day one (Option B)?
-2. Should `v0.1.0` wait for the 24 h fuzz soak (about a day, local), or ship with
-   it listed as a gap as decided on 2026-09-09?
+2. ~~Should `v0.1.0` wait for the 24 h fuzz soak?~~ **Answered 2026-09-09
+   (Quentin, chat): ship 0.1 with the 24 h soak, the Graviton bench and the
+   64K-page kernel listed as known gaps in the release notes.** Also answered:
+   the release is a git tag + GitHub release with prebuilt `zerodb-tools`
+   (Option A), no crates.io — pending only the formal ratification of this ADR.
 3. Tag signing: plain annotated tags, or require signed tags from a maintainer
    key?
