@@ -17,6 +17,7 @@
 //!   and the published-snapshot cell (SPEC 04 §3/§4, ADR-0006), model-checked
 //!   under loom via the [`sync`] shim (`just loom`).
 
+#![deny(missing_docs)]
 // `deny`, not `forbid`, since PERF-GAP A3 (2026-07-22): the CLAUDE.md unsafe
 // policy sanctions `zerodb-core::page` for page-casting unsafe, and the A3
 // unchecked field readers live in exactly one module there — `page::raw`,

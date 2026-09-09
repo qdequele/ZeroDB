@@ -425,7 +425,7 @@ dependencies = [
 
 [[package]]
 name = "zerodb"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "zerodb-core",
  "zerodb-io",
@@ -433,7 +433,7 @@ dependencies = [
 
 [[package]]
 name = "zerodb-core"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "crossbeam-utils",
  "loom",
@@ -442,8 +442,9 @@ dependencies = [
 
 [[package]]
 name = "zerodb-io"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
+ "libc",
  "memmap2",
  "zerodb-core",
 ]

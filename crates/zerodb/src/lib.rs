@@ -14,6 +14,7 @@
 //! are not exposed here yet. The error taxonomy mirrors `heed::Error`
 //! ([`Error`] / [`MdbError`]); the `heed-zerodb` adapter (M1.13) maps it 1:1.
 
+#![deny(missing_docs)]
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path};
 

@@ -1,6 +1,7 @@
 [package]
 name = "zerodb"
-version = "0.0.1"
+version = "0.1.0"
+description = "A pure-Rust, transactional, memory-mapped key-value engine with LMDB parity behind the heed API and no C dependency."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

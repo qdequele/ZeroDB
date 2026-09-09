@@ -1,0 +1,117 @@
+# Release: on a `v*` tag, run the gate, build `zerodb-tools` for the three
+# supported targets, and publish a GitHub release whose notes are the matching
+# CHANGELOG.md section. No crates.io publish (ADR-0013: git-only for 0.x).
+#
+# Process: docs/RELEASING.md.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  gate:
+    name: gate (${{ matrix.os }})
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: tag matches the workspace version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(grep -m1 '^version' crates/zerodb/Cargo.toml | sed 's/.*"\(.*\)"/\1/')"
+          [ "$tag" = "$ver" ] || { echo "tag v$tag != crates/zerodb version $ver"; exit 1; }
+          grep -q "^## \[$tag\]" CHANGELOG.md || { echo "CHANGELOG.md has no ## [$tag] section"; exit 1; }
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  tools:
+    name: zerodb-tools (${{ matrix.target }})
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      # Default features only: `migrate-from-lmdb` links C LMDB and is a
+      # from-source feature (docs/TOOLS.md).
+      - run: cargo build --release -p zerodb-tools --target ${{ matrix.target }}
+      - name: package
+        run: |
+          name="zerodb-tools-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/release/zerodb-tools" "dist/$name/"
+          cp LICENSE-MIT LICENSE-APACHE docs/TOOLS.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zerodb-tools-${{ matrix.target }}
+          path: dist/*.tar.gz*
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: tools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: release notes from CHANGELOG.md
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          awk -v tag="$tag" '
+            /^## \[/ { if (found) exit; if ($0 ~ "^## \\[" tag "\\]") { found=1; next } }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          [ -s notes.md ] || { echo "empty notes for $tag"; exit 1; }
+          cat notes.md
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "ZeroDB $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --verify-tag \
+            dist/*.tar.gz dist/*.sha256

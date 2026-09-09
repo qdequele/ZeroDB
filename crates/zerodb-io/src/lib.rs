@@ -9,6 +9,8 @@
 //! ADR-0008 D1 Option B: it *wraps* a real backing, adding zero `unsafe`). The
 //! io_uring write backend arrives in Phase 3.5.
 
+#![deny(missing_docs)]
+#[cfg(feature = "fault")]
 pub mod fault;
 mod file;
 mod mmap;

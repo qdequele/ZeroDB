@@ -48,6 +48,25 @@ jobs:
       # heed-shim is excluded from the workspace on purpose; make sure it still builds.
       - run: cargo check --manifest-path crates/heed-shim/Cargo.toml
 
+  msrv:
+    name: MSRV (workspace rust-version)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: read rust-version
+        id: msrv
+        run: echo "v=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.v }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+      - run: cargo check --manifest-path crates/heed-shim/Cargo.toml
+
   miri:
     name: miri (zerodb-core)
     if: github.event_name != 'schedule'
