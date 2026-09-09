@@ -60,3 +60,10 @@ consumer-suites:
 # Same workloads, two binaries (stock LMDB vs ZeroDB), spans compared per run.
 consumer-bench:
     scripts/consumer.sh bench
+
+# hannoy (HNSW) on ZeroDB — suite, and divan build/search benches on both engines.
+hannoy-suites:
+    scripts/hannoy.sh suites
+
+hannoy-bench:
+    scripts/hannoy.sh bench
