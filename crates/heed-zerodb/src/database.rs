@@ -53,9 +53,11 @@ pub(crate) fn to_zdb_put_flags(f: PutFlags) -> zerodb::PutFlags {
 /// LMDB read-key size validation, re-imposed at the heed boundary (SPEC 03
 /// §2.1; the taxonomy the native engine's `bad_read_key` models, which SPEC
 /// notes "the caller applies … heed-zerodb at M1.13"). An **empty** key errors
-/// with `BadValSize` on `get`/`del`/neighbor-seeks/forward-prefix; an oversized
-/// key is *not* rejected (the search simply finds nothing). No consumer sends an
-/// empty key, so this only affects exact LMDB parity.
+/// with `BadValSize` on `get`/`del`/neighbor-seeks/forward-prefix (both the
+/// read-only `prefix_iter` and the write cursor's `prefix_iter_mut` — heed
+/// realizes each as `MDB_SET_RANGE(prefix)`); an oversized key is *not* rejected
+/// (the search simply finds nothing). No consumer sends an empty key, so this
+/// only affects exact LMDB parity.
 fn check_read_key(kb: &[u8]) -> Result<()> {
     if kb.is_empty() {
         Err(Error::Mdb(MdbError::BadValSize))
@@ -500,7 +502,8 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// # Errors
     ///
-    /// `Encoding` on a prefix codec failure.
+    /// `Encoding` on a prefix codec failure; `Mdb(BadValSize)` on an empty
+    /// prefix (SPEC 03 §2.1 — the same rule as [`Database::prefix_iter`]).
     pub fn prefix_iter_mut<'a, 'txn>(
         &self,
         txn: &'txn mut RwTxn,
@@ -511,6 +514,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         C: LexicographicComparator,
     {
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
+        check_read_key(&pb)?;
         let (lo, hi) = prefix_bounds(&pb);
         Ok(RwPrefix::new(RwGuts::new(
             txn,

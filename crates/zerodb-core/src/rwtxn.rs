@@ -3095,6 +3095,17 @@ impl RwCursor<'_, '_> {
         }
     }
 
+    /// The ordering this cursor's database is sorted by (SPEC 03 §2.0): the
+    /// registered comparator of a named database, memcmp otherwise. A caller
+    /// that bounds a walk over this cursor must test the bound under this
+    /// ordering — a memcmp test over a comparator-ordered seek stops the scan
+    /// at an arbitrary point (the read-side `RoRange` carries the same value
+    /// for the same reason).
+    #[must_use]
+    pub fn key_cmp(&self) -> crate::cmp::KeyCmp<'_> {
+        self.txn.comparator_for(self.sel)
+    }
+
     /// Advance to the next entry (ascending; SPEC 03 §4 `next` semantics over
     /// the writer's view). After a `del_current`, yields the entry that
     /// followed the deleted one (§7). The yielded borrows die at the next

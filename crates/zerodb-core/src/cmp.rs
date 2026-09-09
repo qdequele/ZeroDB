@@ -52,7 +52,7 @@
 //! total, and *deterministic* — the same pair of byte strings must always
 //! compare the same way, for the life of the data, across processes and
 //! releases. Violating this does not trigger Rust unsafety (nothing here is
-//! `unsafe`, and the crate is `#![forbid(unsafe_code)]`), but it does corrupt
+//! `unsafe`; the crate is `#![deny(unsafe_code)]` outside `page::raw`), but it does corrupt
 //! the tree in the ordinary sense: a B+tree built under an inconsistent
 //! ordering has no correct search path, and `zerodb-tools check` will report
 //! INV-5/INV-6 violations.

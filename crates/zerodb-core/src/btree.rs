@@ -8,7 +8,8 @@
 //! are `&'a [u8]` borrowed straight from the backing bytes (SPEC 04 TXN-37/41),
 //! and a `F_BIGDATA` value resolves to one contiguous slice spanning its
 //! overflow run (SPEC 03 §3; a dirty run is one contiguous frame, TXN-41).
-//! This module contains **no** `unsafe` (the crate is `#![forbid(unsafe_code)]`)
+//! This module contains **no** `unsafe` (the crate is `#![deny(unsafe_code)]`,
+//! opened only in `page::raw` — PERF-GAP A3)
 //! and no I/O — it is pure logic over borrowed bytes, so `miri` exercises it.
 //!
 //! The cursor is a root-to-leaf path (`stack` of `(pgno, ki)` frames) plus the

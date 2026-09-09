@@ -14,9 +14,12 @@ against the exact LMDB fork Meilisearch ships, operation by operation.
 heed = { path = "…/zerodb/crates/heed-shim" }
 ```
 
-> **Status: experimental.** Phase 1 (strict LMDB parity) and Phase 2 (the LMDB
-> features heed hides) are complete; Phase 3 (performance & workload features)
-> is in progress. Not production-ready — see [Pending](#whats-pending).
+> **Status: experimental.** Phase 1 (strict LMDB parity) is implemented and
+> its consumer-suite gate is green; the remaining Phase 1 exit criteria (24 h
+> fuzz soak, Graviton 4K/64K bench, CI) are still open. Phase 2 (the LMDB
+> features heed hides) is implemented except `DUPSORT` (parked) and three
+> deferred `SHOULD` items. Phase 3 has not started: 3.7 is chosen, its ADR is a
+> draft. Not production-ready — see [Pending](#whats-pending).
 
 ---
 
@@ -46,9 +49,10 @@ The correctness story is the point of this project. Every change passes:
 | **Consumer suites** | milli's and hannoy's own test suites pass on the zerodb backend via the shim. |
 | **Sanctioned divergences** | Anything that deliberately differs from the fork is a signed-off entry in [`docs/DIVERGENCES.md`](docs/DIVERGENCES.md) — nothing diverges silently. |
 
-`unsafe` is confined to four audited locations (mmap, page casting, the
-reader table, the adapter's heed-shaped boundary), every block carries a
-`SAFETY:` contract, and the whole policy is written down in
+`unsafe` is confined to a handful of audited locations (mmap, page casting,
+the adapter's heed-shaped boundary, the oracle's LMDB FFI, and one `flock`
+in the tools crate — the lock-free reader table needs none), every block
+carries a `SAFETY:` contract, and the whole policy is written down in
 [`CLAUDE.md`](CLAUDE.md).
 
 ## Performance
@@ -91,7 +95,8 @@ fuzz/               # differential fuzz targets (cargo-fuzz)
 Engine shape (LMDB's, deliberately): single write transaction, any number of
 lock-free MVCC readers pinned to published snapshots, copy-on-write B+trees,
 free-page recycling with a reader-gated GC, double-buffered meta pages, page
-size chosen at creation (4 K–64 K, OS-page default). Plus what LMDB can't
+size chosen at creation (4 K–64 K; 4 K native default, the OS page size
+through the heed adapter, matching LMDB). Plus what LMDB can't
 give you: nested read transactions *inside* a write transaction (the fork
 feature milli depends on), reader introspection, copy progress callbacks,
 streamed compaction with an atomic destination.
@@ -143,7 +148,11 @@ patches for milli and hannoy are in [`docs/patches/`](docs/patches/).
 
 - Production-target validation: Graviton + EBS runs (the vectored commit path
   is built for exactly that), 24 h fuzz soak, CI.
-- Three ADRs / divergence entries awaiting human sign-off.
+- Human sign-off pending on ADR-0009 and ADR-0012 (draft) and on divergences
+  D-011, D-013, D-014, D-015 (`docs/DIVERGENCES.md`).
+- Three write-iterator parity fixes landed 2026-09-09 (`range_mut` bounds under
+  a custom comparator, `prefix_iter_mut("")`, streamed `copy_to_file`) are
+  pinned by adapter tests but not yet by the oracle — see PROGRESS.md.
 - `DUPSORT` is parked by design (no consumer uses it — ADR-0011).
 - Not published to crates.io; API may still move.
 

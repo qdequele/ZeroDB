@@ -162,7 +162,7 @@ depending on the entry point — pinned by `zerodb-oracle` differential tests
 | `get` / `set` (exact) | `BadValSize` | **`Ok(None)`** — search finds nothing, no error |
 | `del` | `BadValSize` | **`Ok(false)`** — search finds nothing (del does **not** check maxkey up front, unlike put) |
 | `set_range` / `get_greater_than` / `get_lower_than_or_equal_to` | `BadValSize` (an explicit `MDB_SET_RANGE` with a zero-size key is rejected) | `None`/last per the seek — no error |
-| `prefix_iter` (forward) | `BadValSize` (realized as `set_range(prefix)`) | empty scan — no error |
+| `prefix_iter` / `prefix_iter_mut` (forward) | `BadValSize` (realized as `set_range(prefix)`; the adapter applies it to both the read and the write-cursor variant — 2026-09-09) | empty scan — no error |
 | `rev_prefix_iter` (reverse) | **works** — full reverse iteration (its successor is unbounded, so it seeks via `last`, not `set_range`) | empty scan — no error |
 
 The unifying rule: **write ops** (`put*`) validate `maxkey` before searching, so

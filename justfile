@@ -28,7 +28,8 @@ stress:
 fuzz-quick:
     cargo +nightly fuzz run diff_ops -- -max_total_time=600
 
-# Long fuzz for nightly CI (diff_dupsort target joins in Phase 2.8, see D-004)
+# Long fuzz for nightly CI (6 h; PLAN 1.14 asks for a 24 h soak — run it on a
+# self-hosted box or chain runs. A dup fuzz target only arrives if 2.8 resumes.)
 fuzz-long:
     cargo +nightly fuzz run diff_ops -- -max_total_time=21600
 

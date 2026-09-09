@@ -2,7 +2,8 @@
 //! TXN-14..22; ADR-0006). Milestone 1.8.
 //!
 //! This module is the only place a reader and the writer communicate. It
-//! contains **no** `unsafe` (the crate stays `#![forbid(unsafe_code)]` —
+//! contains **no** `unsafe` (the crate is `#![deny(unsafe_code)]`, opened only
+//! in `page::raw` —
 //! ADR-0006 Option B): the load-bearing lock-free protocol is carried entirely
 //! by the slot atomics and the `commit_point` atomic; the snapshot cell's
 //! mutex only manages the `Arc<Snapshot>`'s lifetime, with critical sections

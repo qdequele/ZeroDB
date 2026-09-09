@@ -3,7 +3,8 @@
 //! from M1.4 on, commits through: positioned `pwrite` + `sync_data`).
 //!
 //! This crate is one of the two sanctioned homes for mmap `unsafe` (CLAUDE.md
-//! unsafe policy). The `unsafe` blocks all live in [`mmap`]; everything else is
+//! unsafe policy). The `unsafe` blocks live in [`mmap`] and the single `pwritev`
+//! call in [`file`] (PERF-GAP B4); everything else is
 //! safe `std` I/O — including the [`fault`] crash-injection backend (M1.11,
 //! ADR-0008 D1 Option B: it *wraps* a real backing, adding zero `unsafe`). The
 //! io_uring write backend arrives in Phase 3.5.

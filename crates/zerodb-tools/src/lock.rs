@@ -16,8 +16,8 @@
 //! the CLAUDE.md allowlist, but that unsafe-policy currently sanctions `unsafe`
 //! only in `zerodb-core::{page,readers}`, `zerodb-io`, and `zerodb-oracle`.
 //! This single, SAFETY-commented block **expands** that policy to
-//! `zerodb-tools` — flagged for a human to record in CLAUDE.md. `zerodb-core`
-//! remains `#![forbid(unsafe_code)]`.
+//! `zerodb-tools` — recorded in CLAUDE.md on 2026-09-09 as "in use, not yet
+//! ratified"; a human still has to sanction or remove it.
 
 use std::fs::{File, OpenOptions};
 use std::io;

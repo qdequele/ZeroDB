@@ -192,9 +192,9 @@ recovered) **except** where explicitly noted as FS-order-dependent.
   (SPEC 01 §S6): even the un-fsynced meta write still targets the correct slot
   (SPEC 04 TXN-63), so the older intact slot is always available.
 
-  **M1.11 amendment — the reclaim-clobber window (`NO_META_SYNC`) — PENDING
-  HUMAN RATIFICATION (found by the ADR-0008 crash harness, 2026-07-16; repro
-  seed 15797139550980166469).** The argument above shows the recovered meta's
+  **M1.11 amendment — the reclaim-clobber window (`NO_META_SYNC`) — RATIFIED
+  2026-07-17 (Quentin; see REC-10 item 4 at the end of this file. Found by
+  the ADR-0008 crash harness, 2026-07-16; repro seed 15797139550980166469).** The argument above shows the recovered meta's
   pages were durable *when written*, not that they *remain unclobbered*. The
   hole: after commit `N` returns, its meta write is issued but un-fsynced
   (C5 skipped). Txn `N+1` may legally reclaim pages freed by txn `N`

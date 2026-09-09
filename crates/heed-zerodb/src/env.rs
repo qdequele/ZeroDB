@@ -509,23 +509,22 @@ impl<T> Env<T> {
     ///
     /// `Mdb(ReadersFull)`, `Error::Io`, or `Mdb(Invalid)` from the copy.
     pub fn copy_to_file(&self, file: &mut File, option: CompactionOption) -> Result<()> {
-        use std::io::{Read, Seek, Write};
+        use std::io::{Seek, Write};
         // ZeroDB's `CopyToFile` writes to a *path*; heed hands us an open File.
-        // Stage into a unique temp path, then stream it into `file` (no
-        // tempfile dependency: a pid+counter name in the system temp dir).
-        let tmp = unique_temp_path();
-        let res = self.copy_to_path_internal(&tmp, option);
-        let out = res.and_then(|()| {
-            let mut src = File::open(&tmp)?;
-            let mut buf = Vec::new();
-            src.read_to_end(&mut buf)?;
-            file.write_all(&buf)?;
-            file.flush()?;
-            file.rewind()?;
-            Ok(())
-        });
-        let _ = std::fs::remove_file(&tmp);
-        out
+        // Stage into a private, freshly-created directory (so no other process
+        // can pre-place a file or symlink at the name we are about to write),
+        // then **stream** the image into `file` — never the whole copy in RAM
+        // (PERF-GAP C1: the compaction path is O(depth × page size); buffering
+        // the result here would have restored a 1× env-size peak). The
+        // directory and its contents are removed on every exit path.
+        let stage = StagingDir::create()?;
+        let tmp = stage.path().join("copy.dat");
+        self.copy_to_path_internal(&tmp, option)?;
+        let mut src = File::open(&tmp)?;
+        std::io::copy(&mut src, file)?;
+        file.flush()?;
+        file.rewind()?;
+        Ok(())
     }
 
     /// Copy this environment to `path`, returning the created file (SPEC 00
@@ -686,13 +685,57 @@ fn zdb_compaction(option: CompactionOption) -> zerodb::CompactionOption {
     }
 }
 
-/// A unique temp path for the `copy_to_file` staging (no tempfile dependency).
-fn unique_temp_path() -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    std::env::temp_dir().join(format!("heed-zerodb-copy-{pid}-{n}.dat"))
+/// A private staging directory for `copy_to_file` (no tempfile dependency).
+///
+/// `create_dir` fails if the name already exists — including as a symlink —
+/// so a directory we successfully created is ours alone; on Unix it is also
+/// mode `0700`. The name mixes pid, a process-wide counter and a clock sample
+/// so collisions are retried, not followed. Dropping the guard removes the
+/// directory and everything staged in it.
+struct StagingDir(std::path::PathBuf);
+
+impl StagingDir {
+    fn create() -> std::io::Result<StagingDir> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let pid = std::process::id();
+        let base = std::env::temp_dir();
+        for _ in 0..16 {
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let path = base.join(format!("heed-zerodb-copy-{pid}-{n}-{nanos:08x}"));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&path) {
+                Ok(()) => return Ok(StagingDir(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "heed-zerodb: could not create a private staging directory for copy_to_file",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        // Best-effort: the directory is ours (created above), so removing it
+        // recursively cannot touch anything we did not stage.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Contains information about the environment (SPEC 00 row 60).

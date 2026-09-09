@@ -25,6 +25,7 @@
 //! raw pointers / lifetime erasure, exactly as heed does (the M1.13-sanctioned
 //! "lifetime-erased write cursor" unsafe).
 
+use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::ops::Bound;
 use std::ptr::NonNull;
@@ -231,32 +232,41 @@ impl<'txn> RwGuts<'txn> {
             Err(e) => Some(Err(e.into())),
             Ok(None) => None,
             Ok(Some((k, v))) => {
+                // SAFETY (lifetime stretch to `'txn` — the M1.13
+                // "lifetime-erased write cursor" clause): the yielded bytes
+                // live in the txn's committed map or its dirty frames, both
+                // stable until the next mutation through this iterator; heed's
+                // contract forbids holding these borrows across such a
+                // mutation (`del_current`/`put_current` are `unsafe fn` for
+                // exactly this). The stretch happens before the bound test
+                // only so the test can borrow the cursor's comparator; an
+                // out-of-range pair is dropped here and never yielded.
+                let (k, v): (&'txn [u8], &'txn [u8]) = unsafe {
+                    (
+                        std::slice::from_raw_parts(k.as_ptr(), k.len()),
+                        std::slice::from_raw_parts(v.as_ptr(), v.len()),
+                    )
+                };
+                // The terminating bound is tested under the **database's**
+                // ordering (SPEC 03 §2.0), the same one the seek above used.
+                // heed's `RwRange` does `C::compare(key, end)`; a memcmp test
+                // over a comparator-ordered cursor would stop the scan at an
+                // arbitrary point (or run past the bound), exactly as the
+                // read-side `zerodb::RoRange` documents.
+                let cmp = self.cursor.key_cmp();
                 let ok = match self.dir {
                     Dir::Fwd => match &self.upper {
                         Bound::Unbounded => true,
-                        Bound::Included(h) => k <= h.as_slice(),
-                        Bound::Excluded(h) => k < h.as_slice(),
+                        Bound::Included(h) => cmp.compare(k, h) != Ordering::Greater,
+                        Bound::Excluded(h) => cmp.compare(k, h) == Ordering::Less,
                     },
                     Dir::Rev => match &self.lower {
                         Bound::Unbounded => true,
-                        Bound::Included(l) => k >= l.as_slice(),
-                        Bound::Excluded(l) => k > l.as_slice(),
+                        Bound::Included(l) => cmp.compare(k, l) != Ordering::Less,
+                        Bound::Excluded(l) => cmp.compare(k, l) == Ordering::Greater,
                     },
                 };
                 if ok {
-                    // SAFETY (lifetime stretch to `'txn` — the M1.13
-                    // "lifetime-erased write cursor" clause): the yielded
-                    // bytes live in the txn's committed map or its dirty
-                    // frames, both stable until the next mutation through
-                    // this iterator; heed's contract forbids holding these
-                    // borrows across such a mutation (`del_current`/
-                    // `put_current` are `unsafe fn` for exactly this).
-                    let (k, v) = unsafe {
-                        (
-                            std::slice::from_raw_parts(k.as_ptr(), k.len()),
-                            std::slice::from_raw_parts(v.as_ptr(), v.len()),
-                        )
-                    };
                     Some(Ok((k, v)))
                 } else {
                     None

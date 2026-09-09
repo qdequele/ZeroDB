@@ -4,7 +4,8 @@
 //! positioned reads/writes use the unix `pwrite`/`pread` family via
 //! [`std::os::unix::fs::FileExt`] (no cursor movement, no `libc`). `fstat` for
 //! [`real_disk_size`] uses `File::metadata`, and fd duplication uses
-//! `File::try_clone`. No `unsafe` lives here.
+//! `File::try_clone`. The one `unsafe` here is the `pwritev` FFI call behind
+//! the vectored commit write (PERF-GAP B4), SAFETY-commented at the site.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;

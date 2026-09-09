@@ -13,8 +13,10 @@
 //!   is the GC-DB txnid key, which is big-endian (SPEC 05); see
 //!   [`geometry::gc_key_encode`].
 //! - **No `#[repr(C)]` casts of unaligned data.** All fields are read/written by
-//!   explicit offset through [`raw`] (safe `from_le_bytes`/`to_le_bytes`). This
-//!   module contains **zero** `unsafe`.
+//!   explicit offset through [`raw`]. Since PERF-GAP A3 the field readers in
+//!   [`raw`] are unchecked `read_unaligned` behind the validated-view contract
+//!   (the only `unsafe` in this crate; `#[allow(unsafe_code)]` on that one
+//!   module); the rest of this module is safe code.
 //! - **Body-relative offsets:** intra-page offsets (`lower`, `upper`, node
 //!   pointers) are measured from the first byte after the header (absolute
 //!   offset [`HEADER_SIZE`]).

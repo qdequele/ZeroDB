@@ -29,9 +29,10 @@ Project name: `zerodb` (ZeroDB).
    *algorithms and formats*, then implement from your own notes in
    `docs/SPEC/`. Never transliterate C code. All code Rust 2021+, MIT/Apache
    dual license.
-5. **unsafe policy.** `unsafe` is allowed only in: mmap access, page casting,
-   the reader table, and FFI in the test oracle. Every unsafe block gets a
-   `// SAFETY:` comment. `cargo miri` must pass on all non-mmap logic.
+5. **unsafe policy.** See CLAUDE.md (the single source; this rule was
+   superseded there on 2026-07-17 by the M1.13 heed-adapter clause). Every
+   unsafe block gets a `// SAFETY:` comment. `cargo miri` must pass on all
+   non-mmap logic.
 6. **Target platforms:** linux-aarch64 (Graviton 3/4, primary), linux-x86_64,
    macOS aarch64 (dev). Test with 4K and 64K kernel page sizes. ARM's weak
    memory model is the default assumption — all atomics get explicit orderings
@@ -48,7 +49,8 @@ zerodb/
     zerodb-core/        # page formats, B+tree, txn, GC — no I/O policy
     zerodb-io/          # mmap reader, pwrite/io_uring writers, fsync strategies
     zerodb/             # public engine API (heed-shaped)
-    heed-zerodb/        # heed backend adapter (or: fork heed, add backend feature)
+    heed-zerodb/        # heed backend adapter (ADR-0003 Option D)
+    heed-shim/          # crate named `heed` re-exporting heed-zerodb; the [patch.crates-io] target
     zerodb-tools/       # dump/load/stat/check/migrate binaries
     zerodb-oracle/      # differential test harness against C LMDB (via lmdb-master-sys)
   fuzz/                 # cargo-fuzz targets
@@ -462,7 +464,7 @@ Ordering chosen by expected impact for Meilisearch/hannoy on Graviton + EBS/NVMe
 - Bench: hannoy distance-kernel throughput and search latency vs B-tree
   storage.
 
-### 3.7 Prefetch and access hints — ACTIVE (chosen 2026-07-20, ADR-0012)
+### 3.7 Prefetch and access hints — CHOSEN 2026-07-20; ADR-0012 is a **Draft** awaiting human approval, no code exists yet (rule 6)
 - `db.prefetch(keys)` / `txn.advise(range, Willneed|Random|Sequential)`
   mapping to madvise; replaces hannoy's env-var hack.
 - **Verified live consumer:** hannoy `Reader::prefetch_graph`
