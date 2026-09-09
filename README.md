@@ -141,8 +141,11 @@ just fuzz-quick                 # differential fuzz vs real LMDB (10 min)
 cargo bench -p zerodb-oracle    # dual-backend microbench, LMDB vs zerodb
 ```
 
-To run a heed consumer on zerodb, add the `[patch.crates-io]` above — ready-made
-patches for milli and hannoy are in [`docs/patches/`](docs/patches/).
+To run a heed consumer on zerodb, add the `[patch.crates-io]` above. For
+Meilisearch specifically, `scripts/consumer.sh` does it for you — compile
+check, the milli and index-scheduler suites, and a Meilisearch-level LMDB vs
+ZeroDB benchmark on the same workloads — see
+[`docs/CONSUMER-GATE.md`](docs/CONSUMER-GATE.md).
 
 ## What's pending
 

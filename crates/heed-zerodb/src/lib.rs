@@ -12,8 +12,9 @@
 //! impl of the very same trait the LMDB `heed` uses.
 //!
 //! Consumers switch backends via `[patch.crates-io] heed = { path =
-//! ".../crates/heed-zerodb", package = "heed-zerodb" }` (docs/patches/); the
-//! `package =` rename keeps the dependency *named* `heed` in their code.
+//! ".../crates/heed-shim" }` — a crate literally named `heed` that re-exports
+//! this one (a `package =` rename inside `[patch]` is silently ignored by cargo;
+//! see `crates/heed-shim/Cargo.toml` and `docs/CONSUMER-GATE.md`).
 //!
 //! ## Adapter `unsafe` (see per-site `SAFETY:` comments)
 //!

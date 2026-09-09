@@ -6,7 +6,7 @@
 # oracle depends on BOTH — real heed (LMDB) and this crate (`heed_zerodb`) — in
 # one binary for in-process A/B diffing. Consumers (milli/hannoy) switch backends
 # with `[patch.crates-io] heed = { path = ".../crates/heed-shim" }` — a crate
-# literally named `heed` that re-exports this one (docs/patches/, README). A
+# literally named `heed` that re-exports this one (docs/CONSUMER-GATE.md). A
 # `package = "heed-zerodb"` rename inside `[patch]` does NOT work: cargo requires
 # the replacement to share the patched crate's name and ignores the rename
 # (verified M1.13; see crates/heed-shim/Cargo.toml).
@@ -14,7 +14,7 @@
 name = "heed-zerodb"
 # Version tracks the heed line it reproduces (0.22.1) so the `heed-shim` patch
 # target that re-exports it satisfies a consumer's `heed = "0.22.1"`
-# requirement (docs/patches/, milestone 1.13). The crate
+# requirement (scripts/consumer.sh, milestone 1.13). The crate
 # is never published (ADR-0003 OQ1); the version is only for patch resolution.
 version = "0.22.1"
 edition.workspace = true

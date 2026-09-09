@@ -48,3 +48,15 @@ bench:
 
 bench-quick:
     cargo bench -p zerodb-oracle --bench engine_comparison -- --quick
+
+# Consumer gate — Meilisearch on ZeroDB (scripts/consumer.sh; MEILISEARCH_REF,
+# MEILISEARCH_SRC, WORKLOADS, ROUNDS documented in the script header).
+consumer-check:
+    scripts/consumer.sh check
+
+consumer-suites:
+    scripts/consumer.sh suites
+
+# Same workloads, two binaries (stock LMDB vs ZeroDB), spans compared per run.
+consumer-bench:
+    scripts/consumer.sh bench

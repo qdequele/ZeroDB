@@ -8,8 +8,8 @@
 | [`DIVERGENCES.md`](DIVERGENCES.md) | Every sanctioned behavior difference vs the LMDB fork, numbered `D-001`…, each with rationale and sign-off state | Nothing diverges silently |
 | [`PERF-GAP-VS-LMDB.md`](PERF-GAP-VS-LMDB.md) | The performance ledger: every LMDB implementation trick, cited to `mdb.c`, marked DONE / PARKED / open — with the profile evidence and referee numbers per lever | Engineering log |
 | [`UPSTREAM-BUGS.md`](UPSTREAM-BUGS.md) | Bugs found **in the LMDB fork itself** by ZeroDB's differential fuzzer, with repro recipes and ready-to-file issue drafts | Kept until fixed upstream |
+| [`CONSUMER-GATE.md`](CONSUMER-GATE.md) | Meilisearch on ZeroDB: the zero-source-change drop-in check, the consumer test suites, and the LMDB-vs-ZeroDB Meilisearch benchmark (`scripts/consumer.sh`) | Gate + bench procedure |
 | [`TOOLS.md`](TOOLS.md) | Manual for `zerodb-tools` (`stat`/`dump`/`load`/`check`/`migrate-from-lmdb`) | Manual |
-| [`patches/`](patches/) | Ready-made `[patch.crates-io]` snippets to run milli and hannoy on the zerodb backend | Convenience |
 
 Top-level companions: [`PLAN.md`](../PLAN.md) (the milestone roadmap),
 [`PROGRESS.md`](../PROGRESS.md) (the append-only engineering log),
