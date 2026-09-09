@@ -30,4 +30,4 @@ thiserror = "1"
 crossbeam-utils = "0.8"
 proptest = "1"
 arbitrary = { version = "1", features = ["derive"] }
-criterion = "0.5"
+criterion = "0.8"
