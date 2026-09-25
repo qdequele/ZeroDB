@@ -98,7 +98,12 @@ Normative rules are numbered **TXN-n** so tests and the check tool can cite them
   (`MutexGuard: !Send`; the underlying lock may abort on macOS). Acquire
   waits on the condvar until `occupied` is false, then sets it; the guard's
   drop takes the flag mutex briefly *on whatever thread drops it*, clears the
-  flag, and notifies. Writer-panic policy is unchanged: the flag mutex guards
+  flag, and notifies — **only if a waiter is parked** (amended 2026-09-25): the
+  flag mutex also holds a waiter count, incremented before `wait` and
+  decremented after it, so a release that reads zero under the mutex cannot
+  miss a thread about to park. On Linux an unconditional `notify_one` is a
+  `futex_wake` system call per write txn even when uncontended. Writer-panic
+  policy is unchanged: the flag mutex guards
   no txn data (the dirty set died with the unwound `RwTxn`, TXN-60), so a
   poisoned flag mutex is recovered (`PoisonError::into_inner`) rather than
   propagated.

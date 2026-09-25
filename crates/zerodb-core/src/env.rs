@@ -202,9 +202,20 @@ pub trait CommitHook: Send + Sync {
 /// taken on whichever thread drops it, which is sound on every platform.
 #[derive(Debug)]
 struct WriterLock {
-    /// `true` while a write txn is live.
-    occupied: Mutex<bool>,
+    occupied: Mutex<WriterSlot>,
     cv: Condvar,
+}
+
+/// The state behind [`WriterLock`]'s mutex.
+#[derive(Debug, Default)]
+struct WriterSlot {
+    /// `true` while a write txn is live.
+    occupied: bool,
+    /// Threads parked in [`WriterLock::acquire`]'s wait. The release notifies
+    /// only when this is non-zero: on Linux, std's futex `Condvar` makes every
+    /// `notify_one` a `futex_wake` system call even with nobody waiting, which
+    /// cost one syscall per write txn (`env/txn/rw_empty_commit`).
+    waiters: u32,
 }
 
 /// Ownership of the writer slot; releases it on drop, from any thread.
@@ -216,7 +227,7 @@ pub(crate) struct WriterGuard<'env> {
 impl WriterLock {
     fn new() -> WriterLock {
         WriterLock {
-            occupied: Mutex::new(false),
+            occupied: Mutex::new(WriterSlot::default()),
             cv: Condvar::new(),
         }
     }
@@ -233,13 +244,18 @@ impl WriterLock {
             .occupied
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while *g {
+        while g.occupied {
+            // Registered under the mutex before `wait` releases it, so a
+            // release that reads `waiters == 0` under the same mutex cannot be
+            // racing a thread about to park: no lost wakeup.
+            g.waiters += 1;
             g = self
                 .cv
                 .wait(g)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.waiters -= 1;
         }
-        *g = true;
+        g.occupied = true;
         WriterGuard { lock: self }
     }
 }
@@ -251,11 +267,14 @@ impl Drop for WriterGuard<'_> {
             .occupied
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *g = false;
+        g.occupied = false;
         // One waiter at most can make progress (single writer), so
         // `notify_one` suffices; drop the flag lock before notify is not
         // required for correctness (the waiter re-checks under the lock).
-        self.lock.cv.notify_one();
+        // Skipped when nobody is parked, which is the common, uncontended case.
+        if g.waiters > 0 {
+            self.lock.cv.notify_one();
+        }
     }
 }
 

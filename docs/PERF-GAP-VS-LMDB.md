@@ -491,6 +491,29 @@ I/O. `copy_raw` (`CompactionOption::Disabled`) is also still the buffered path
 flagged in the 2026-09-09 review — a 1× env image in RAM plus one `fs::write` —
 which C1's streaming work never reached. Reproduce with `just bench maint`.
 
+### B11. Writer slot: a `futex_wake` system call on every write-txn release — **DONE 2026-09-25**
+`WriterGuard::drop` (`env.rs`) called `Condvar::notify_one()` unconditionally.
+On Linux, std's futex `Condvar` turns every notify into a `futex_wake` system
+call, even with nobody waiting. That is one syscall per write txn, on a CPU
+whose page-table-isolation mitigation makes each syscall expensive. LMDB's
+writer lock on Linux is a pthread mutex (`me_wmutex`, `LOCK_MUTEX0` →
+`pthread_mutex_lock`, mdb.c:466): uncontended lock and unlock stay in user
+space, and the kernel is entered only under contention. **Fix:** a waiter
+count lives under the flag mutex, and the release notifies only when it is
+non-zero (SPEC 04 TXN-6 amended). On macOS, LMDB is built with
+`MDB_USE_POSIX_SEM` (named semaphores, mdb.c:408), which always syscall.
+That is why the laptop ladder showed ZeroDB 8× *faster* on empty commits, and
+why this cost never appeared there.
+Bench server (x86-64, 4 KiB, turbo off), `perf trace -s` over 3 s of
+`env/txn/rw_empty_commit`: ZeroDB **1,401,099 → 31** `futex` calls (LMDB: 31
+in the same binary). 5 interleaved rounds: 456 → 168 µs, **5.93× → 2.19×** vs
+LMDB, every round 436–460 → 163–174 µs. `bench-ab` itself returned `invalid`
+(LMDB drift 1.032 against a 0.03 limit), and Quentin approved the keep on the
+deterministic count (chat, 2026-09-25). `commit/batch/*` and
+`env/txn/ro_begin_abort` flat. The remaining 2.19× on this rung is the rest
+of ZeroDB's begin/commit path (`write_txn`, `RwTxn` drop glue,
+`SnapshotCell::clone_snapshot` in the profile).
+
 ## C. RAM (peak memory)
 
 ### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**
