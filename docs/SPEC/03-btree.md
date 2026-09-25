@@ -344,16 +344,15 @@ copied and how pgnos propagate):
    commit (SPEC 02 §3).
 4. **Cursor fix-up.** After a page is copied/split/merged, every live cursor in
    the same txn positioned on the affected page(s) must still point at the
-   logically-same entry. *(Clarified 2026-07-16, M1.4 / ADR-0004 D5.)* LMDB
-   tracks and repairs **sibling** cursors because C permits many live cursors
-   in one write txn; under ZeroDB's borrow model **at most one cursor can
-   exist across a mutation** — mutations reach the tree through `&mut RwTxn`
-   or through the single write cursor holding it exclusively — so fix-up
-   reduces to the *acting* cursor's own position. The M1.4 write cursor tracks
-   its position **by key** and re-seeks after each of its own mutations, which
-   is trivially stable across splits/merges; no sibling-cursor tracking
-   infrastructure exists (observable behavior is oracle-gated either way). If
-   a later phase exposes concurrent write cursors, that requires a new ADR.
+   logically-same entry. *(Clarified 2026-07-16, M1.4 / ADR-0004 D5; mechanism
+   de-mandated 2026-09-10 — see §5.4a.)* LMDB tracks and repairs **sibling**
+   cursors because C permits many live cursors in one write txn; under ZeroDB's
+   borrow model **at most one cursor can exist across a mutation** — mutations
+   reach the tree through `&mut RwTxn` or through the single write cursor
+   holding it exclusively — so fix-up reduces to the *acting* cursor's own
+   position. No sibling-cursor tracking infrastructure exists. If a later phase
+   exposes concurrent write cursors, that requires a new ADR.
+
 5. **Overflow pages are COW'd as whole runs**: modifying a BIGDATA value frees
    the old run and allocates a new one (§8); overflow pages are never edited in
    place across txns.
@@ -362,6 +361,55 @@ miri must exercise get-then-put sequences (PLAN 1.4): a `&[u8]` obtained by
 `get` before a `put` must not dangle — enforced by SPEC 04's dirty-page
 stability contract; this doc requires only that COW never *moves* an
 already-dirty page's backing storage while a borrow into it is live.
+
+### §5.4a — Position preservation is a contract, not a mechanism (AMENDED 2026-09-10)
+
+The M1.4 rule read: *"The M1.4 write cursor tracks its position **by key** and
+re-seeks after each of its own mutations, which is trivially stable across
+splits/merges."* That described the implementation and, by sitting in a
+normative list, **mandated** it. It is hereby demoted to one permitted
+mechanism among others.
+
+**The requirement.** After any mutation performed *through* a cursor, that
+cursor's **logical** position MUST be unchanged — the entry a subsequent
+`next` / `prev` / `get_current` yields MUST be the one the pre-mutation
+position defines (§4, and §7 for the post-delete case). Nothing else is
+required. In particular the spec does **not** require that the position be
+*recomputed*, only that it be *correct*.
+
+**Permitted mechanisms.** An implementation MAY:
+
+- re-derive the position by key on the next access (the M1.4 mechanism); or
+- **retain the physical path** (`(pgno, ki)` per level) across the mutation
+  and resume from it; or
+- retain it in the cases where it provably survives and re-derive otherwise.
+
+**Obligations if a path is retained.** The retained path MUST be discarded, or
+repaired, whenever the mutation could have moved the entry it names. At minimum:
+
+| event | effect on a retained path |
+|---|---|
+| COW of any page on the path (§5.1–§5.3) | pgnos on the path change; the path MUST be remapped to the new pgnos |
+| cell removal/insertion on the cursor's own leaf | `ki` on that leaf shifts; MUST be adjusted |
+| borrow from a sibling (§10) | entries move between two leaves and a parent separator is rewritten; the path MUST be adjusted or discarded |
+| merge (§10) | one leaf is freed and its entries move to the sibling; the path MUST be repaired to the surviving page or discarded |
+| root shrink (§9) | tree depth changes; the path MUST be truncated or discarded |
+| any error that poisons the txn (SPEC 04) | the cursor is unusable; no obligation |
+
+Discarding is always a correct implementation of "repair"; it costs a re-seek,
+which is exactly the M1.4 mechanism applied selectively.
+
+**Why this was changed.** The mandate cost two full root-to-leaf descents per
+entry on `del_current` (one for the delete, one for the following re-seek),
+which made ZeroDB's cursor-delete loop **4.2×** the fork's — where LMDB's is
+*cheaper* than its own point delete because `C_DEL` resumes in place. That is
+`del_current`'s dominant cost and it is paid at nine `del_current` call sites in
+milli, four of them in the current indexer. Measured on the real server, the
+`prefix_iter_mut` + `del_current` loop in
+`post_processing::prefix::delete_prefixes` runs at **3.63×**
+(PERF-GAP **B8a**; `benches/results/2026-09-10-meilisearch-delete-heavy-macos.md`).
+The contract above is what the fork actually guarantees; the re-seek was never
+part of it.
 
 ---
 
@@ -600,6 +648,37 @@ one (LMDB leaves `ki[top]` pointing at the successor slot; if the page was
 merged/rebalanced, the cursor is fixed up per §5.4). `delete(key)` (SPEC 00 r36)
 = `set(key)` then `del_current`, returning whether the key existed;
 `delete_range` (r37) and `clear` (r38) are cursor walks / whole-tree resets.
+
+**Position after the delete (PINNED 2026-09-10).** The contract above was
+asserted from M1.4 onward but never differentially observed: the oracle's
+`Op::IterMutDelCurrent` deletes and *stops*, so only the surviving content was
+compared, never the surviving position. It is now pinned against the fork
+through the heed surface consumers actually use:
+
+| case | observed on the fork, and matched by ZeroDB |
+|---|---|
+| delete mid-page, then `next` | yields the immediate successor |
+| delete the last entry of a leaf, then `next` | yields the successor — the first entry of the next leaf |
+| delete the final entry of the tree, then `next` | yields `None` |
+| drain the whole tree (`while next { del_current }`) | visits every key exactly once, strictly ascending, tree ends empty |
+| drain only the tail | visits exactly the tail; the head survives unchanged |
+| delete every *other* entry | the cursor stays aligned across alternating delete/advance |
+| drain a `prefix_iter_mut` range | visits exactly the prefix's keys; the rest survives |
+
+> Observed against the fork 2026-09-10:
+> `crates/zerodb-oracle/tests/cursor_delete_position.rs` (7 cases) drives
+> `iter_mut` / `prefix_iter_mut` on both engines from one macro body and
+> requires an identical event trace **and** identical surviving content. The
+> drain cases span ~2 000 entries at the OS page size, so they cross leaf
+> boundaries and force merges mid-walk — the case a retained path is most
+> likely to get wrong.
+
+**Mechanism is unconstrained.** How the cursor is left in that position — a
+re-seek by key, a retained physical path, or a retained path repaired on the
+structural events that invalidate it — is an implementation choice governed by
+§5.4a, not by this section. The table above is the whole obligation, and the
+test above is its guard: an optimization that changes any row is a divergence,
+not a speed-up.
 
 ---
 

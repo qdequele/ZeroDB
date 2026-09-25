@@ -5,6 +5,13 @@ first "LMDB techniques" listing; that pass compared against LMDB's design
 choices, this one also sweeps zerodb's own hot paths for every copy,
 allocation, redundant computation, lock, and RAM sink).
 
+**Measuring these items.** `just bench` runs a microbench *ladder* built so
+that each rung isolates one of the mechanisms inventoried below; `just
+bench-report` prints the per-rung LMDB-vs-ZeroDB ratio and each rung's delta
+against its family's base rung. [`BENCH-MAP.md`](BENCH-MAP.md) maps rungs to the
+A/B/C items on this page — start there before picking a lever, since two blind
+picks were falsified during the July 2026 campaign.
+
 Every claim is cited. LMDB side: the vendored fork (`lmdb-master-sys 0.2.6`,
 `liblmdb/mdb.c` — the tree the oracle links; reading it for techniques is
 permitted by CLAUDE.md rule 4, nothing is transliterated). ZeroDB side:
@@ -293,6 +300,196 @@ as issue [#10](https://github.com/qdequele/ZeroDB/issues/10)):
 per GC entry touched (`rwtxn.rs:924-998`); `freelist_save` fixed-point loop
 per commit. LMDB: sorted `MDB_IDL` arrays manipulated in place. Effort:
 medium. Only matters under GC churn; measure before redesigning.
+
+### B8. Delete-time rebalance moves entries cell-by-cell — **DIAGNOSED + CONSUMER-CONFIRMED 2026-09-10, open**
+The largest steady-state gap the microbench ladder finds, and the only cluster
+in this inventory that was never predicted from reading `mdb.c`. On the first
+ladder run (`benches/results/2026-09-10-engine-ladder-macos.md`, Apple M1 Pro,
+16 K pages both sides):
+
+| rung | LMDB | ZeroDB | ratio |
+|---|---:|---:|---:|
+| `del/bulk/half` (per-key, tree stays populated) | 11.3 ms | 22.9 ms | **2.02×** |
+| `del/bulk/all` (per-key, down to empty) | 20.5 ms | 40.4 ms | **1.97×** |
+| `del/range/half` (one `delete_range` cursor walk) | 8.7 ms | 23.7 ms | **2.74×** |
+| `del/churn/reinsert` (delete + re-insert, 3 rounds) | 13.1 ms | 21.5 ms | 1.64× |
+
+**Ruled out by the ladder.** `churn/reinsert` is the *least* affected rung, so
+this is not freelist/GC churn (that is B7, and it is not what fires). Commit
+write-out is not it either: deleting with the commit dropped instead of taken
+costs the same (21.2 ms vs 21.3 ms). The read side is not it: the range **scan**
+that `delete_range` performs first is *faster* on ZeroDB (1.61 ms vs 2.12 ms).
+
+**Diagnosis (2026-09-10).** Ablation on 50 K entries / 16 K pages, deleting the
+first 25 K keys, best of 5, per operation:
+
+| step | LMDB | ZeroDB | ratio |
+|---|---:|---:|---:|
+| same-size overwrite — descent + COW only, no cell churn | 274 ns | 393 ns | 1.43× |
+| delete — the same, plus cell removal and rebalance | 390 ns | 864 ns | 2.22× |
+| **difference = the removal + rebalance step** | **116 ns** | **471 ns** | **4.1×** |
+
+So the shared descent/COW path costs ZeroDB +119 ns (secondary), and the
+**removal + rebalance step costs +355 ns — 75 % of the whole gap.**
+
+**The mechanism, counted.** Instrumenting the page primitives: 25 000 logical
+deletes issue **63 542 `remove_cell` calls (2.54 per delete)** and **44 041
+`insert_pointer` calls (1.76 per delete)**. A delete needs one removal and zero
+insertions. The surplus is `rebalance` → `borrow_entry`, which round-trips each
+moved entry through a full `remove_cell` + `insert_cell` page rewrite, and fires
+on nearly every delete once a leaf sits at the threshold (a borrow moves exactly
+one entry, so the next delete drops the page under 25 % again). Each of those
+primitives runs the O(`num_keys`) pointer-adjust loop: **4 990 806 iterations
+for 25 000 deletes ≈ 200 per delete** at 78.5 keys/page average. LMDB performs
+the same *algorithm* — `mdb_node_move` then `mdb_node_del`, identical
+thresholds (`FILL_THRESHOLD` 250 ‰, `minkeys` 1 leaf / 2 branch, verified
+against `mdb.c`) — but moves node bytes page-to-page, where `borrow_entry`
+materializes an `OwnedLeafCell` (`key.to_vec()` + `val.to_vec()`) in between.
+
+Suppressing rebalance confirms it: deleting every 8th key instead (fill never
+approaches the threshold) drops ZeroDB to **1.00 `remove_cell` and 0.00
+`insert_pointer` per delete**, and the ratio from 2.18× to 1.47×.
+
+**Falsified — do not retry.** Converting `remove_cell`'s pointer-adjust loop to
+a fused single pass over a bounds-narrowed slice (LMDB's loop shape) made it
+**slower**: 23.8 ms vs 21.3 ms. Per-element indexing loses to `copy_within`.
+The cost is the *number* of cell operations, not the per-element checking, so
+the lever is doing fewer of them — e.g. moving several entries per borrow, or a
+`move_entry` primitive that writes the destination cell directly from the source
+page without the owned round-trip. Both are real design changes: **ADR first.**
+
+**Confirmed at consumer level, same day.** Meilisearch v1.53.1,
+`settings-add-remove-filters` on 150 k documents, `ROUNDS=2` alternated
+(`benches/results/2026-09-10-meilisearch-delete-heavy-macos.md`): the delete
+phase — `apply_index_operation` **self** time, which is where the
+un-instrumented `delete_old_fid_from_facet_databases` lands — goes
+332.8 ms → 805.1 ms = **2.42×, +472 ms**, while `write_db::all` is **0.96×**
+and `extract` **0.96×** (ZeroDB faster). The 2.42× lands inside this rung's
+1.97–2.74× microbench band: the ladder predicted the consumer number. Bounded
+blast radius — 1.07× end-to-end on the workload built to trigger it — but
+linear in entries deleted, so a 10 M-document index pays proportionally.
+The 2026-09-09 insert-only bench could not have caught this: the path fires
+only on settings changes that *remove* an attribute.
+
+**Reproduce:** `just bench del` for the rung;
+`WORKLOADS="workloads/settings-add-remove-filters.json" ROUNDS=2
+scripts/consumer.sh bench` for the consumer figure.
+[`BENCH-MAP.md`](BENCH-MAP.md) says what each rung isolates. Effort: medium.
+No tracking issue yet.
+
+### B8a. `RwCursor::del_current` re-descends twice per entry — **DONE 2026-09-10**
+Separate from B8 and additive with it. Deleting a 25 K span three ways:
+
+| path | LMDB | ZeroDB |
+|---|---:|---:|
+| `Database::delete` per key | 9.54 ms | 21.3 ms |
+| `Database::delete_range` (the public API) | 6.85 ms | 22.2 ms |
+| `range_mut` + `del_current` (the cursor loop) | 6.87 ms | 29.2 ms (**4.2×**) |
+
+LMDB's cursor delete is *cheaper* than its point delete (6.87 vs 9.54 ms) — the
+cursor keeps its path and `mdb_cursor_del` sets `C_DEL` so the following `NEXT`
+resumes in place. ZeroDB's is *dearer* than its own point delete (29.2 vs
+21.3 ms): `del_current` (`rwtxn.rs`) clones the current key, calls
+`delete_tree` — a fresh root descent — then sets `saved = None` and
+`pos = AfterDelete(key)`, so the following `move_next` does `set_range(k)`, a
+**second** full descent. Two descents and a key clone per entry, where LMDB does
+neither.
+
+`Database::delete_range` sidesteps this by collecting every key into a `Vec`
+first and issuing point deletes, which is why it tracks the point-delete number
+rather than the cursor one — at the cost of materialising the whole key set.
+
+**This is not a hypothetical API.** `del_current` appears at **nine call sites
+in milli, four of them in the current indexer** (`update/new/indexer/mod.rs`) —
+`IndexingStep::DeletingFromAllFilters`, `delete_old_fid_word_count_docids`,
+`words_prefix_docids`, `facet/new_incremental`, and
+`post_processing::prefix::delete_prefixes`, all written as the idiomatic
+`prefix_iter_mut` + `del_current` loop. Measured on the real server
+(`benches/results/2026-09-10-meilisearch-delete-heavy-macos.md`),
+`post_processing::prefix::delete_prefixes` is **3.63×** (3.9 → 14.1 ms) and
+reproduces at 3.65× / 3.60× across both alternated rounds — against the 4.2×
+microbench figure.
+
+Fixing this is the `C_DEL`-equivalent: let `del_current` leave the parked stack
+valid at the successor instead of discarding it.
+
+**DONE 2026-09-10.** `del_current` now (1) deletes at the path the cursor is
+already holding — the new `RwTxn::delete_at_path`, so the delete costs no
+descent of its own — and (2) parks on the slot the delete vacated, which now
+holds the successor, so a following `next` *settles* there
+(`Cursor::settle`, LMDB's `C_DEL` shape) instead of re-seeking. `rebalance`
+now reports whether it changed the tree's shape; on a borrow/merge/root-shrink
+the path is discarded and the old re-seek runs, which §5.4a sanctions as a
+correct repair. Parking on the vacated slot rather than one before it is what
+makes it fire on milli's drain, where the deleted index is always 0.
+
+The vacated slot stays invisible to everything but `next`: `current_key`
+reports `None` there, so a second `del_current` or a `put_current` remains the
+no-op it was — otherwise it would have silently deleted the *successor* — and
+`prev` discards the path and re-derives, exactly as before.
+
+**Three-column referee** (`just bench del`, Apple M1 Pro, 16 K pages, medians;
+the `del/cursor/drain` rung was added with the fix — the pre-existing `del/*`
+rungs all reach the tree *by key*, so none of them could show this at all):
+
+| rung | LMDB | ZeroDB before | ZeroDB after |
+|---|---:|---:|---:|
+| **`del/cursor/drain`** (`range_mut` + `del_current`) | 9.22 ms | 31.19 ms (**3.38×**) | **25.35 ms (2.46×)** |
+| `del/range/half` — control, by key | 9.46 ms | 24.31 ms | 25.12 ms |
+| `del/bulk/half` — control, by key | 12.16 ms | 24.75 ms | 23.58 ms |
+| `del/bulk/all` — control, by key | 21.48 ms | 42.56 ms | 42.88 ms |
+
+The by-key controls do not move, which is the check that the change is confined
+to the cursor. The result to read is the *relationship*: before, draining
+through the cursor cost **28 % more** than the same span deleted by key
+(31.19 vs 24.31 ms) — LMDB's cursor drain is *cheaper* than its by-key delete.
+After, the two are at parity (25.35 vs 25.12 ms). **The cursor-specific penalty
+is gone**; the residual 2.46× is B8, which every delete path pays alike, and
+which is now the only thing left in this cluster.
+
+Not yet re-measured at consumer level: the `delete_prefixes` 3.63× should fall
+toward the by-key ratio, but that claim needs another
+`scripts/consumer.sh bench` run before it is made.
+
+**Spec amendment landed 2026-09-10 — this is what unblocked it.** The
+blocker was not §7 but SPEC 03 §5 rule 4, which *mandated* the slow mechanism
+("the M1.4 write cursor tracks its position **by key** and re-seeks after each
+of its own mutations"). New **§5.4a** demotes that to one permitted mechanism
+and states the actual requirement — the cursor's *logical* position must be
+unchanged, by any means — with a table of the structural events (COW, cell
+shift, borrow, merge, root shrink) at which a retained path must be repaired or
+discarded. §7 gains the observed position contract as a table, pinned by
+`crates/zerodb-oracle/tests/cursor_delete_position.rs` (7 differential cases,
+including drains that force merges mid-walk). That test is the guard: it was
+written *before* any optimization, so it cannot be tuned to fit one.
+
+Gate: fmt / clippy `-D warnings` / `cargo test --workspace` 543 pass /
+`miri` 154 pass, no UB / `fuzz-quick` 72,532 diff_ops runs, 0 divergences /
+`crash-test-quick` 215 cycles, 0 violations.
+
+
+
+### B9. Env creation costs two `fsync`s — **BY DESIGN, recorded 2026-09-10**
+`env/open/create` is 10.85× (LMDB 0.51 ms, ZeroDB 5.5 ms per env). Fully
+explained: `create_env_file` (`zerodb-io/src/file.rs:245-250`) does
+`file.sync_all()` and then `fsync_parent_dir`, unconditionally and regardless of
+`NO_SYNC`; LMDB does neither. On macOS Rust's `sync_all` is `F_FULLFSYNC`
+(~2.5 ms each on a laptop SSD), which accounts for the entire gap.
+
+This is the durability guarantee added by issue #46 — without the directory
+fsync a crash just after creation can lose the *name* of an already-durable
+file — and it is paid **once per environment lifetime**. `env/open/reopen`, the
+same path minus creation, is **0.41×**. Listed here only so the ratio is not
+re-derived as a regression; no action.
+
+### B10. Copy / compaction — **MEASURED 2026-09-10** (extends C1's residual)
+`maint/copy/raw` 2.77× (LMDB 7.4 ms, ZeroDB 20.5 ms) and
+`maint/copy/compact` 4.72× (6.3 ms vs 29.6 ms). Meilisearch calls this on every
+snapshot, so it is user-visible latency, not an internal detail. The
+`compact ÷ raw` step (+1.95 ratio) puts the cost in the rebuild rather than the
+I/O. `copy_raw` (`CompactionOption::Disabled`) is also still the buffered path
+flagged in the 2026-09-09 review — a 1× env image in RAM plus one `fs::write` —
+which C1's streaming work never reached. Reproduce with `just bench maint`.
 
 ## C. RAM (peak memory)
 

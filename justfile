@@ -42,14 +42,36 @@ crash-test-quick:
 crash-test-full:
     cargo run -p zerodb-oracle --bin crash-harness -- --cycles 10000
 
-# Dual-backend comparison: zerodb vs the LMDB fork (heed), both in one binary.
-# `bench` = full criterion run; `bench-quick` = fast, fewer samples (indicative).
-# macOS is indicative; run on Graviton + EBS gp3 for the representative numbers.
-bench:
-    cargo bench -p zerodb-oracle --bench engine_comparison
+# --- Engine comparison: zerodb vs the LMDB fork (heed), both in one binary ---
+#
+# The bench is a LADDER: adjacent rungs differ by exactly one mechanism, so a
+# ratio that jumps between two rungs names the cost. docs/BENCH-MAP.md maps
+# every rung to the mechanism it isolates and the PERF-GAP-VS-LMDB item it
+# implicates. macOS numbers are indicative; Graviton + EBS gp3 is the referee.
+#
+#   just bench            the whole ladder
+#   just bench get        one suite (`just bench-list` for the names)
+#   just bench-report     the LMDB-vs-ZeroDB ratio table from the last run
 
-bench-quick:
-    cargo bench -p zerodb-oracle --bench engine_comparison -- --quick
+# Run the comparison ladder; pass a suite name to run only that suite.
+bench SUITE='':
+    cargo bench -p zerodb-oracle --bench engine_comparison -- '^{{SUITE}}'
+
+# List the suite names `just bench <suite>` accepts.
+bench-list:
+    @echo "env get scan seek put del commit mixed concurrent maint"
+
+# The ladder plus the long tier: the 1M-entry depth rung and the concurrent suite.
+bench-long SUITE='':
+    ZERODB_BENCH_TIER=long cargo bench -p zerodb-oracle --bench engine_comparison -- '^{{SUITE}}'
+
+# Fast indicative pass (criterion --quick): checks a rung runs, proves no number.
+bench-quick SUITE='':
+    cargo bench -p zerodb-oracle --bench engine_comparison -- --quick '^{{SUITE}}'
+
+# Ratio table from the last run: zerodb/lmdb per rung, plus ladder-family deltas.
+bench-report *ARGS:
+    scripts/bench-report.py {{ARGS}}
 
 # Consumer gate — Meilisearch on ZeroDB (scripts/consumer.sh; MEILISEARCH_REF,
 # MEILISEARCH_SRC, WORKLOADS, ROUNDS documented in the script header).

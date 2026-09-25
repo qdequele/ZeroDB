@@ -670,6 +670,14 @@ impl PathStack {
         self.len
     }
 
+    /// The live frames as one mutable slice, for the write path's
+    /// `touch_path`/`rebalance` (which take `&mut [(u64, usize)]`). Lets a
+    /// parked cursor's path be deleted at directly, with no descent and no
+    /// `Vec` (SPEC 03 §5.4a).
+    fn frames_mut(&mut self) -> &mut [(u64, usize)] {
+        &mut self.buf[..self.len]
+    }
+
     fn last(&self) -> Option<&(u64, usize)> {
         self.buf[..self.len].last()
     }
@@ -957,6 +965,41 @@ impl<'a> Cursor<'a> {
         self.ascend_next()
     }
 
+    /// Yield the entry at the slot the cursor already sits on, **without
+    /// advancing** (SPEC 03 §7 / §5.4a; LMDB's `C_DEL` resume).
+    ///
+    /// The write cursor parks here after `del_current`: the vacated slot now
+    /// holds the deleted entry's successor, so `next` must settle rather than
+    /// step. If the delete vacated the leaf's last slot the successor lives on
+    /// the following leaf, which is where `ascend_next` from the last live slot
+    /// lands.
+    ///
+    /// Only the write cursor's post-delete path calls this; a cursor that has
+    /// not just deleted must use [`next`](Self::next).
+    pub(crate) fn settle(&mut self) -> PosResult<'a> {
+        if !self.initialized {
+            return self.first();
+        }
+        if self.eof {
+            return Ok(None);
+        }
+        let (pgno, ki) = *self
+            .stack
+            .last()
+            .expect("initialized cursor has a leaf frame");
+        let leaf = self.leaf_at(pgno)?;
+        let nkeys = leaf.num_keys();
+        if ki < nkeys {
+            return self.current();
+        }
+        // The vacated slot was past the last live cell. An empty leaf cannot
+        // reach here: emptying one is a structural change (§10), and the write
+        // cursor discards its path on those rather than parking.
+        debug_assert!(nkeys > 0, "settle on an empty leaf");
+        self.stack.last_mut().expect("leaf frame").1 = nkeys.saturating_sub(1);
+        self.ascend_next()
+    }
+
     /// `prev` (`MDB_PREV`) — SPEC 03 §4: from an uninitialized cursor behaves as
     /// [`last`](Self::last); from `EOF` returns the maximum entry (`last`);
     /// otherwise steps back one entry, hopping to the previous leaf. Stepping
@@ -1162,6 +1205,14 @@ impl SavedCursor {
             return None;
         }
         self.stack.last().copied()
+    }
+
+    /// The parked root-to-leaf path as a mutable slice, so the write path can
+    /// delete at it directly — no descent, no allocation (SPEC 03 §5.4a).
+    /// `touch_path` rewrites the pgnos in place as it COWs, which is exactly
+    /// the remap the parked path needs.
+    pub(crate) fn frames_mut(&mut self) -> &mut [(u64, usize)] {
+        self.stack.frames_mut()
     }
 }
 

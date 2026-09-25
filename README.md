@@ -152,8 +152,16 @@ results and referee numbers in the message.
 ```bash
 cargo test --workspace          # the whole battery minus fuzz/crash
 just fuzz-quick                 # differential fuzz vs real LMDB (10 min)
-cargo bench -p zerodb-oracle    # dual-backend microbench, LMDB vs zerodb
+just bench                      # dual-backend microbench ladder, LMDB vs zerodb
+just bench get                  # ...or one suite of it
+just bench-report               # the per-rung ratio table from the last run
 ```
+
+The microbench is a *ladder*: adjacent rungs differ by exactly one mechanism, so
+a ratio that jumps between two rungs names the cost.
+[`docs/BENCH-MAP.md`](docs/BENCH-MAP.md) maps every rung to the mechanism it
+isolates and the [`docs/PERF-GAP-VS-LMDB.md`](docs/PERF-GAP-VS-LMDB.md) item it
+implicates.
 
 To run a heed consumer on zerodb, add the `[patch.crates-io]` above. For
 Meilisearch specifically, `scripts/consumer.sh` does it for you — compile

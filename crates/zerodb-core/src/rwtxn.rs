@@ -1863,10 +1863,24 @@ impl<'env> RwTxn<'env> {
         if !found {
             return Ok(false);
         }
-        match self.delete_apply(tree, &mut path) {
-            Ok(()) => {
+        self.delete_at_path(tree, &mut path).map(|_| true)
+    }
+
+    /// Delete the entry `path` already points at, skipping the descent
+    /// `delete_tree` would do (SPEC 03 §5.4a). Returns whether the tree's shape
+    /// changed (borrow / merge / root shrink), which tells a parked cursor
+    /// whether its path survived.
+    ///
+    /// `path` MUST be the live root-to-leaf path to an existing entry of
+    /// `tree`: either fresh from [`search_path`](Self::search_path), or a
+    /// cursor's parked path over an unmutated tree (the `Cursor::resume`
+    /// contract). It is rewritten in place as pages are COWed.
+    fn delete_at_path(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<bool> {
+        self.guard_ok()?;
+        match self.delete_apply(tree, path) {
+            Ok(structural) => {
                 sat_sub(&mut self.record_mut(tree).entries, 1);
-                Ok(true)
+                Ok(structural)
             }
             Err(e) => {
                 self.errored = true;
@@ -1875,7 +1889,8 @@ impl<'env> RwTxn<'env> {
         }
     }
 
-    fn delete_apply(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<()> {
+    /// Returns [`rebalance`](Self::rebalance)'s structural-change flag.
+    fn delete_apply(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<bool> {
         self.touch_path(tree, path)?;
         let (lpg, ki) = *path.last().expect("non-empty path");
         let big = {
@@ -1925,7 +1940,10 @@ impl<'env> RwTxn<'env> {
     /// §10 rebalance at `path[level]` after a delete/merge: root shrink at the
     /// root (§9); otherwise, when below threshold, borrow from (or merge with)
     /// a sibling, recursing upward on merge.
-    fn rebalance(&mut self, tree: TreeId, path: &mut [(u64, usize)], level: usize) -> Result<()> {
+    /// Returns whether the tree's *shape* changed — a borrow, a merge, or a
+    /// root shrink. `false` means the delete only removed a cell from its leaf,
+    /// which is the case a parked cursor path survives (SPEC 03 §5.4a).
+    fn rebalance(&mut self, tree: TreeId, path: &mut [(u64, usize)], level: usize) -> Result<bool> {
         let (pgno, _) = path[level];
         let (is_leaf, nkeys, used) = self.page_stats(pgno)?;
         let body = body_size(self.psize);
@@ -1937,6 +1955,7 @@ impl<'env> RwTxn<'env> {
                 rec.root = PGNO_INVALID;
                 rec.depth = 0;
                 sat_sub(&mut rec.leaf_pages, 1);
+                return Ok(true);
             } else if !is_leaf && nkeys == 1 {
                 let child = {
                     let frame = self.dirty.bytes(pgno).expect("root is dirty");
@@ -1949,8 +1968,9 @@ impl<'env> RwTxn<'env> {
                 rec.root = child;
                 rec.depth = rec.depth.saturating_sub(1);
                 sat_sub(&mut rec.branch_pages, 1);
+                return Ok(true);
             }
-            return Ok(());
+            return Ok(false);
         }
         // §10 thresholds: leaf = 25 % fill (FILL_THRESHOLD) or below min_keys;
         // branch = below min_keys (2 children) — its fill threshold is
@@ -1961,7 +1981,7 @@ impl<'env> RwTxn<'env> {
             nkeys < MIN_KEYS_BRANCH
         };
         if !below {
-            return Ok(());
+            return Ok(false);
         }
         let (ppg, pki) = path[level - 1];
         let parent_nkeys = {
@@ -1973,7 +1993,7 @@ impl<'env> RwTxn<'env> {
         if parent_nkeys < 2 {
             // Cannot happen on an INV-8-conforming tree; degrade gracefully.
             debug_assert!(false, "parent branch with < 2 children mid-rebalance");
-            return Ok(());
+            return Ok(false);
         }
         // §10 sibling choice: leftmost child pairs with its right neighbor;
         // every other child pairs with its left neighbor.
@@ -2005,10 +2025,12 @@ impl<'env> RwTxn<'env> {
             s_nkeys > MIN_KEYS_BRANCH
         };
         if can_borrow {
-            self.borrow_entry(tree, path, level, sib, fromleft, is_leaf)
+            self.borrow_entry(tree, path, level, sib, fromleft, is_leaf)?;
+            Ok(true)
         } else {
             self.merge_pages(tree, path, level, sib, fromleft, is_leaf)?;
-            self.rebalance(tree, path, level - 1)
+            self.rebalance(tree, path, level - 1)?;
+            Ok(true)
         }
     }
 
@@ -3049,6 +3071,7 @@ impl Database {
             sel: self.sel(),
             pos: CurPos::Start,
             saved: None,
+            on_vacated_slot: false,
         }
     }
 }
@@ -3109,6 +3132,14 @@ pub struct RwCursor<'t, 'env> {
     pos: CurPos,
     /// Parked physical path (authoritative when `Some`); cleared by mutations.
     saved: Option<SavedCursor>,
+    /// The parked path sits on the slot a `del_current` just vacated, which now
+    /// holds that entry's successor (SPEC 03 §7 / §5.4a — LMDB's `C_DEL`).
+    ///
+    /// While set, the cursor is **not** on a live entry: `current_key` reports
+    /// `None`, so a second `del_current` or a `put_current` is a no-op exactly
+    /// as it was before the path was retained. Only `next` may use the path (it
+    /// settles instead of stepping); every other op re-derives from `pos`.
+    on_vacated_slot: bool,
 }
 
 impl RwCursor<'_, '_> {
@@ -3116,6 +3147,15 @@ impl RwCursor<'_, '_> {
     /// position from [`CurPos`] with one seek), park the new path, and
     /// re-materialize the yielded entry as borrows of the txn's frames.
     fn drive(&mut self, op: Step<'_>) -> Result<Option<(&[u8], &[u8])>> {
+        // A post-delete parked path names the vacated slot, which only `next`
+        // knows how to read (it settles there rather than stepping). Every
+        // other op re-derives from `pos`, which is the pre-B8a behaviour
+        // (SPEC 03 §5.4a: discarding is always a correct repair).
+        let settle = self.on_vacated_slot && matches!(op, Step::Next);
+        if self.on_vacated_slot && !settle {
+            self.saved = None;
+        }
+        self.on_vacated_slot = false;
         // Phase 1 — position under a scoped shared borrow of the txn; keep
         // only plain data (the parked stack and the hit's (pgno, ki)).
         let hit: Option<(u64, usize)> = {
@@ -3126,7 +3166,9 @@ impl RwCursor<'_, '_> {
             };
             let r = match op {
                 Step::Next => {
-                    if resumed {
+                    if settle {
+                        c.settle()
+                    } else if resumed {
                         c.next()
                     } else {
                         match &self.pos {
@@ -3183,6 +3225,11 @@ impl RwCursor<'_, '_> {
     /// The current entry's key as owned bytes (for a mutation about to
     /// invalidate the borrows), or `None` if the cursor is not on an entry.
     fn current_key(&self) -> Result<Option<Vec<u8>>> {
+        if self.on_vacated_slot {
+            // The parked path names a slot whose entry was just deleted; the
+            // cursor is between entries, not on one.
+            return Ok(None);
+        }
         match &self.saved {
             Some(s) => match s.entry_pos() {
                 Some((pgno, ki)) => {
@@ -3306,6 +3353,7 @@ impl RwCursor<'_, '_> {
             .put_tree(tree, &key, PutFlags::EMPTY, ValSrc::Val(value))
             .map(|_| ())?;
         self.saved = None;
+        self.on_vacated_slot = false;
         self.pos = CurPos::At(key);
         Ok(true)
     }
@@ -3324,6 +3372,7 @@ impl RwCursor<'_, '_> {
             .put_tree(tree, key, flags, ValSrc::Val(value))
             .map(|_| ())?;
         self.saved = None;
+        self.on_vacated_slot = false;
         self.pos = CurPos::At(key.to_vec());
         Ok(())
     }
@@ -3340,10 +3389,39 @@ impl RwCursor<'_, '_> {
             return Ok(false);
         };
         let tree = self.txn.ensure_open(self.sel)?;
-        let existed = self.txn.delete_tree(tree, &key)?;
-        self.saved = None;
+        // `pos` is set on every path: it is what `prev`, and any op after a
+        // discarded path, re-derives from.
+        let Some(mut saved) = self.saved.take() else {
+            // No parked path (fresh cursor, or the position came from `pos`
+            // after an earlier mutation): descend as before.
+            let existed = self.txn.delete_tree(tree, &key)?;
+            self.pos = CurPos::AfterDelete(key);
+            return Ok(existed);
+        };
+        // The parked path IS the live root-to-leaf path to this entry, so the
+        // delete needs no descent of its own (SPEC 03 §5.4a; PERF-GAP B8a).
+        debug_assert!(
+            saved.entry_pos().is_some(),
+            "current_key returned Some, so the parked cursor is on an entry"
+        );
+        // The parked leaf slot needs no adjustment: it already names the cell
+        // being removed, and removing it shifts the successor down into it.
+        let structural = self.txn.delete_at_path(tree, saved.frames_mut())?;
         self.pos = CurPos::AfterDelete(key);
-        Ok(existed)
+        if structural {
+            // A borrow, merge or root shrink moved entries between pages: the
+            // parked path may name the wrong page or depth. Discard it — the
+            // next op re-seeks from `pos`, which is the pre-B8a behaviour.
+            self.saved = None;
+        } else {
+            // Only a cell left this leaf. `ki` now names the successor (the
+            // cells above it shifted down), or is one past the last live cell
+            // if the tail was deleted — both of which `Cursor::settle` reads,
+            // and from which a plain `prev` still yields the predecessor.
+            self.saved = Some(saved);
+            self.on_vacated_slot = true;
+        }
+        Ok(true)
     }
 }
 
