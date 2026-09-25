@@ -202,7 +202,9 @@ End the loop (`ScheduleWakeup` with `stop: true`) when any of these happens:
 - three consecutive `reverted` iterations. The scoreboard, the profiles or the
   hypotheses are wrong, and a human should look.
 
-Every claim this loop makes is macOS-indicative. A batch of kept changes goes
-to `just bench-gate` (the whole ladder against the merge base with `main`),
+Every claim this loop makes is indicative for the host that measured it (the
+bench server, or macOS as the fallback); label it with that host. A batch of
+kept changes goes to `just bench-gate` (the whole ladder against the merge
+base with `main`),
 then to `just consumer-bench`, then to Graviton + EBS before a release note
 states any number.
