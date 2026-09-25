@@ -20,6 +20,10 @@ drift, not code. Per rung:
 * ``noise = max(criterion's 95 % CI on the two ZeroDB estimates, combined,
   2 × round-to-round stdev of the speedup)``. A change is only reported when
   it exceeds ``max(--min-effect, noise)``.
+* Exception: a *layout offset*. LMDB may be off by the same amount, in the same
+  direction, in every one of ≥3 order-alternated rounds. That is the two
+  binaries' code layout, not the machine. The rung stays readable, and the
+  offset is added to its threshold.
 
 Per rung, the verdict is improved, regressed, flat or unreliable. The run verdict
 (``verdict.json`` → ``verdict``) is one of:
@@ -94,7 +98,23 @@ def analyse(rounds, target: str, min_effect: float, max_drift: float):
         noise = max(ci, spread)
         threshold = max(min_effect, noise)
         s, d = statistics.median(speed), statistics.median(drift)
-        if abs(d - 1) > max_drift:
+        # A per-BINARY LMDB offset is not machine drift. Suppose LMDB is off by
+        # the same amount, in the same direction, in every round, and the
+        # rounds alternated which binary ran first. Then the machine did not
+        # move: the two binaries lay out LMDB's side differently (rebuilding
+        # zerodb-core changes the bench binary's codegen), which on
+        # ~100 ns/op rungs is worth ~10 %. That offset bounds how far layout
+        # alone can move ZeroDB too, so it is ADDED to the threshold: stricter,
+        # not looser.
+        layout = (
+            abs(d - 1) > max_drift
+            and len(drift) >= 3
+            and (all(x > 1 for x in drift) or all(x < 1 for x in drift))
+            and max(drift) - min(drift) <= max_drift
+        )
+        if layout:
+            threshold += abs(d - 1)
+        if abs(d - 1) > max_drift and not layout:
             state = "unreliable"
         elif s < 1 - threshold:
             state = "improved"
@@ -118,6 +138,7 @@ def analyse(rounds, target: str, min_effect: float, max_drift: float):
             "ratio_vs_lmdb_after": after_ns / lmdb,
             "speedup": s,
             "lmdb_drift": d,
+            "layout_offset": layout,
             "noise": noise,
             "threshold": threshold,
             "rounds": [
@@ -156,6 +177,8 @@ def table(rungs) -> str:
     for r in rungs:
         mark = {"improved": "✅ faster", "regressed": "❌ slower",
                 "flat": "flat", "unreliable": "⚠ drift"}[r["state"]]
+        if r["layout_offset"]:
+            mark += " (layout offset, threshold widened)"
         tgt = " 🎯" if r["target"] else ""
         lines.append(
             f"| `{r['rung']}`{tgt} | {h(r['lmdb_ns'])} | {h(r['before_ns'])} "
