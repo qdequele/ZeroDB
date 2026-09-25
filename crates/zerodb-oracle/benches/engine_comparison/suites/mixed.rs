@@ -40,7 +40,9 @@ fn case<B: Backend>(g: &mut Group<'_>, page: u32, names: &[String], keys: &[Vec<
             |f| {
                 let hits = B::mixed_rw(&f.env, &f.dbs, keys, val);
                 assert_eq!(hits, keys.len(), "every read-back must see its own put");
-                drop(f);
+                // Returned, not dropped: iter_batched drops routine outputs
+                // after it stops the clock, so teardown stays untimed.
+                f
             },
             BatchSize::PerIteration,
         )

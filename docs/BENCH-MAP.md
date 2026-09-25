@@ -230,6 +230,16 @@ Check `zerodb-tools stat` before claiming either. Implicates PERF-GAP **B10**
 and **C1** (streaming compaction), plus the still-buffered `copy_raw` noted in
 the 2026-09-09 review.
 
+## Timing-fix log
+
+- **2026-09-26:** the shared write shapes (`wr_fresh`, `wr_loaded` in
+  `harness.rs`), `del/range/half`, `mixed/rw/8dbs` and `maint/copy/*` dropped
+  their fixture (env unmap, temp-dir removal, copied file) **inside** the timed
+  closure. They now return it, and criterion drops it after stopping the clock.
+  Every `put/*`, `del/*`, `mixed/*` and `maint/*` number from before this date
+  includes that teardown and is not comparable with later runs. (The same fix
+  landed for `commit/*` and `concurrent/*` on 2026-09-25.)
+
 ## Fairness properties
 
 These are structural, not conventions to remember:

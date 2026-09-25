@@ -105,7 +105,9 @@ fn case_range<B: Backend>(
             |f| {
                 let n = B::delete_range(&f.env, f.db, lo, hi);
                 assert!(n > 0, "delete_range must remove something");
-                drop(f);
+                // Returned, not dropped: iter_batched drops routine outputs
+                // after it stops the clock, so teardown stays untimed.
+                f
             },
             BatchSize::PerIteration,
         )

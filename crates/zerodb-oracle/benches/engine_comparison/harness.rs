@@ -301,7 +301,9 @@ pub fn wr_fresh<B: Backend>(
             || Fixture::<B>::empty(page, Some("bench"), no_sync),
             |f| {
                 op(&f.env, f.db, keys, val);
-                drop(f);
+                // Returned, not dropped: iter_batched drops routine outputs
+                // after it stops the clock, so teardown stays untimed.
+                f
             },
             BatchSize::PerIteration,
         )
@@ -327,7 +329,9 @@ pub fn wr_loaded<B: Backend>(
             },
             |f| {
                 op(&f.env, f.db, keys, val);
-                drop(f);
+                // Returned, not dropped: iter_batched drops routine outputs
+                // after it stops the clock, so teardown stays untimed.
+                f
             },
             BatchSize::PerIteration,
         )

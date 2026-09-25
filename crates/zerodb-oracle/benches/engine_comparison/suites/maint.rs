@@ -40,7 +40,9 @@ fn case<B: Backend>(g: &mut Group<'_>, page: u32, keys: &[Vec<u8>], val: &[u8], 
             || zerodb_oracle::tempdir::TempDir::new().expect("tempdir"),
             |dest| {
                 B::copy_to(&f.env, &dest.path().join("copy.mdb"), compact);
-                drop(dest);
+                // Returned, not dropped: iter_batched drops routine outputs
+                // after it stops the clock, so teardown stays untimed.
+                dest
             },
             BatchSize::PerIteration,
         )
