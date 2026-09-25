@@ -492,6 +492,10 @@ pub struct EnvInner {
     ///
     /// **Not persisted** — see `crate::cmp` for the reopen hazard (D-014).
     comparators: ComparatorRegistry,
+    /// Catalog capacity (`max_dbs`), immutable after open. Duplicated out of
+    /// the `named` registry so read txns can size their dbi-indexed record
+    /// table without taking the registry lock.
+    max_dbs: u32,
 }
 
 impl std::fmt::Debug for EnvInner {
@@ -734,6 +738,13 @@ impl EnvInner {
         r.names.push(boxed.clone());
         r.by_name.insert(boxed, dbi);
         Some(dbi)
+    }
+
+    /// The catalog capacity this env was opened with (`max_dbs`). Every dbi
+    /// the registry hands out is below it. Lock-free.
+    #[must_use]
+    pub(crate) fn max_dbs(&self) -> u32 {
+        self.max_dbs
     }
 
     /// The name for a named-DB dbi index (`DbSel::Named`), if the index is
@@ -1445,6 +1456,7 @@ pub fn open_with_backing(
         named: Mutex::new(NamedRegistry::new(max_dbs)),
         durability,
         comparators: ComparatorRegistry::new(max_dbs),
+        max_dbs,
         meta,
         prev_snapshot,
         closing,

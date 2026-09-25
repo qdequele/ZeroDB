@@ -28,7 +28,7 @@
 //! lives in [`crate::rwtxn`].
 
 use std::ops::Bound;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::btree::{prefix_successor, Cursor, Source, Tree, ValidatedPages};
 use crate::builder::StreamBuildError;
@@ -156,10 +156,17 @@ pub struct RoTxn<'env> {
     /// Soundness: this txn pins an immutable [`Snapshot`] (its catalog cannot
     /// change while pinned, TXN-18/20) and the dbi→name registry is
     /// append-only for the process (M1.6), so a (dbi → record) resolution is
-    /// constant for the txn's life. A linear `Vec` scan beats a map: the set
-    /// is bounded by `max_dbs` and typically small. `Mutex` (not `RefCell`)
-    /// keeps `RoTxn` auto-`Sync`; the lock is uncontended and held only for
-    /// the lookup/insert.
+    /// constant for the txn's life.
+    ///
+    /// Two tiers. `named_dense` is the hot path: a dbi-indexed table of
+    /// write-once slots, the shape of LMDB's per-txn `mt_dbs[dbi]` array.
+    /// A hit is an index plus one `Acquire` load, with no lock, so rayon
+    /// workers sharing one `RoTxn` (milli) do not contend. It is allocated on
+    /// the first named access and sized `min(max_dbs, DENSE_DBI_LIMIT)`.
+    /// `named_memo` (a locked `Vec` scan) serves only dbis past that cap, so a
+    /// huge `max_dbs` never costs a huge per-txn allocation. Both keep
+    /// `RoTxn` auto-`Sync`.
+    named_dense: OnceLock<Box<[OnceLock<DBRecord>]>>,
     named_memo: Mutex<Vec<(u32, DBRecord)>>,
     /// Pages fully validated this txn (PERF-GAP A2; see
     /// [`ValidatedPages`]). Sound here because every page this snapshot can
@@ -207,7 +214,23 @@ impl RoTxn<'_> {
     pub fn env_ident(&self) -> usize {
         self.env_ref().ident()
     }
+
+    /// Resolve `dbi`'s record against this txn's pinned catalog (uncached).
+    fn resolve_named(&self, dbi: u32) -> DBRecord {
+        match self.env_ref().inner().named_name(dbi) {
+            Some(name) => {
+                resolve_named_record(self.source(), self.psize, &self.snap.main_db, &name)
+            }
+            None => DBRecord::empty(),
+        }
+    }
 }
+
+/// Dbis below this get [`RoTxn`]'s lock-free record table (see
+/// `named_dense`). Meilisearch opens ~30 named DBs per env and hannoy a
+/// handful, so this covers every known consumer while bounding the
+/// per-txn allocation for envs opened with a very large `max_dbs`.
+const DENSE_DBI_LIMIT: u32 = 256;
 
 impl Drop for RoTxn<'_> {
     fn drop(&mut self) {
@@ -249,18 +272,29 @@ impl TxnRead for RoTxn<'_> {
         match sel {
             DbSel::Main => self.snap.main_db,
             DbSel::Named(dbi) => {
-                // Memo hit: the resolution is constant for this txn's life
-                // (see the `named_memo` field docs).
+                // The resolution is constant for this txn's life (see the
+                // `named_dense` field docs).
+                if dbi < DENSE_DBI_LIMIT {
+                    let table = self.named_dense.get_or_init(|| {
+                        let n = self.env_ref().inner().max_dbs().min(DENSE_DBI_LIMIT);
+                        (0..n).map(|_| OnceLock::new()).collect()
+                    });
+                    if let Some(slot) = table.get(dbi as usize) {
+                        if let Some(rec) = slot.get() {
+                            return *rec;
+                        }
+                        let rec = self.resolve_named(dbi);
+                        // A racing thread may have filled the slot first; it
+                        // resolved the same constant record, so either wins.
+                        let _ = slot.set(rec);
+                        return rec;
+                    }
+                }
                 let mut memo = self.named_memo.lock().expect("named memo poisoned");
                 if let Some(&(_, rec)) = memo.iter().find(|&&(d, _)| d == dbi) {
                     return rec;
                 }
-                let rec = match self.env_ref().inner().named_name(dbi) {
-                    Some(name) => {
-                        resolve_named_record(self.source(), self.psize, &self.snap.main_db, &name)
-                    }
-                    None => DBRecord::empty(),
-                };
+                let rec = self.resolve_named(dbi);
                 memo.push((dbi, rec));
                 rec
             }
@@ -292,6 +326,7 @@ impl Env {
             snap,
             slot,
             env: EnvHandle::Borrowed(self),
+            named_dense: OnceLock::new(),
             named_memo: Mutex::new(Vec::new()),
             validated: ValidatedPages::new(),
         })
@@ -315,6 +350,7 @@ impl Env {
             snap,
             slot,
             env: EnvHandle::Owned(self),
+            named_dense: OnceLock::new(),
             named_memo: Mutex::new(Vec::new()),
             validated: ValidatedPages::new(),
         })

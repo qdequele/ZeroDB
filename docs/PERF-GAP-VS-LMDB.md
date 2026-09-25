@@ -58,6 +58,16 @@ uncontended, `Sync`-preserving; soundness: the pinned snapshot's catalog and
 the append-only dbi registry are both immutable for the txn's life). RwTxn and
 nested txns were already covered by the open-table. Part of the batch that
 took hannoy indexing 5–6× → 1.3–1.44×. Original analysis kept below.
+**Amendment 2026-09-25: lock-free.** The memo's mutex was still taken on every
+read. LMDB indexes a per-txn array (`txn->mt_dbs[dbi]`, sized `me_maxdbs`,
+filled lazily through `DB_STALE`). `RoTxn` now does the same: a dbi-indexed
+table of write-once `OnceLock<DBRecord>` slots, allocated on the first named
+access and sized `min(max_dbs, 256)`. A hit is one `Acquire` load, so milli's
+rayon workers sharing a `RoTxn` no longer contend. The mutex `Vec` remains
+only for dbis ≥ 256. Bench server (x86-64, 4 KiB): `scan/meta/len` 222 → 92 µs
+(**2.46× → 1.01×**), `scan/edge/first_last` 2.38× → 2.13–2.22× (0.89–0.90 of
+before). `get/access/hot` is flat, so the rest of the per-get gap is not
+handle resolution.
 `Database::get/len/is_empty/iter…` on a `RoTxn` all call `record_for`
 (`rotxn.rs:501,521,548,557`) which, for a named DB, does the mutex + name
 clone + full catalog descent *every time* (`rotxn.rs:211-216`, comment at
