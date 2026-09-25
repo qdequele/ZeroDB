@@ -76,10 +76,28 @@ Read the heaviest frames of both profiles. Then read the PERF-GAP item that
 BENCH-MAP links to this rung, and the SPEC file for the code area (CLAUDE.md
 rule 3).
 
+**Then find how LMDB does the same thing.** The goal is to be as close to LMDB
+as possible, taking its techniques and not inventing new ones. Read the
+matching code path in the vendored fork,
+`~/.cargo/registry/src/*/lmdb-master-sys-0.2.6/lmdb/libraries/liblmdb/mdb.c`
+(`mdb_txn_begin`, `mdb_page_search`, `mdb_cursor_*`, `mdb_rebalance`,
+`mdb_page_spill`, …). PERF-GAP already cites many of them by line. Write down
+the technique in one sentence: *what LMDB avoids doing, and how*. This is
+clean-room (CLAUDE.md rule 4): understand the algorithm and implement it from
+that understanding, in Rust, against the SPEC. Never transliterate the C.
+Compile-time and platform choices count too; for example, LMDB on macOS is
+built with POSIX semaphores and on Linux with pthread mutexes.
+
 ## 3. Write the hypothesis down, then check the stop zones
 
-Write one sentence: *"<mechanism> costs <x> on <rung> because <cause>;
-<change> removes it; expected: <rung> ≥ N % faster, no other rung moves."*
+Write one sentence: *"<mechanism> costs <x> on <rung> because <cause>; LMDB
+avoids it by <technique>; <change> does the same; expected: <rung> ≥ N %
+faster, no other rung moves."*
+
+A lever with no LMDB counterpart needs a reason, stated in the hypothesis:
+ZeroDB's Rust/safety model forbids LMDB's way (e.g. no raw-pointer page
+access outside the sanctioned modules), or the cost exists only because of a
+ZeroDB-specific choice. Prefer the LMDB-shaped lever whenever one exists.
 
 **STOP zones.** If the lever touches any of these, draft the ADR with `/adr`,
 record `just perf-ledger add --outcome blocked-adr ...`, and **end the
