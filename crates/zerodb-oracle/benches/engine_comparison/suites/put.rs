@@ -15,12 +15,17 @@
 //! * `over/{same_size,grow}` — overwriting into a populated tree. Same-size can
 //!   be replaced where it sits; growing may force the page to split. The delta
 //!   is that split.
+//! * `gc/drain_big` — overwrites whose copy-on-write pages all come from ONE
+//!   large free-list entry (a contiguous half of a 300k-key tree was deleted
+//!   first). Every other rung starts with an empty or tiny free list, so this
+//!   is the only one where the cost of drawing reused pages scales with the
+//!   entry's length (roadmap #1, SPEC 05 GC-19/20).
 
-use criterion::{Criterion, Throughput};
+use criterion::{BatchSize, Criterion, Throughput};
 
-use crate::data::{ascending_keys, os_page_size, shuffled_keys, N, N_OVF, N_PROBE, VAL};
-use crate::harness::{wr_fresh, wr_loaded, Seed};
-use crate::{pair, Cfg};
+use crate::data::{ascending_keys, os_page_size, shuffle, shuffled_keys, N, N_OVF, N_PROBE, VAL};
+use crate::harness::{wr_fresh, wr_loaded, Backend, Fixture, Group, Seed};
+use crate::{pair, pair_shape, Cfg};
 
 /// Entry count for the value-size sweep — see `get`'s `N_VAL`, same reasoning:
 /// held constant across the sweep so value width is the only variable.
@@ -32,6 +37,7 @@ pub fn run(c: &mut Criterion, cfg: &Cfg) {
     family_val(c, cfg);
     family_api(c, cfg);
     family_over(c, cfg);
+    family_gc(c, cfg);
 }
 
 fn family_order(c: &mut Criterion, cfg: &Cfg) {
@@ -128,6 +134,56 @@ fn family_over(c: &mut Criterion, cfg: &Cfg) {
         &big_val
     );
     g.finish();
+}
+
+/// Keys in the tree `gc/drain_big` builds before deleting its lower half.
+const N_GC: usize = 300_000;
+/// Overwrites in the timed txn, all in the surviving upper half.
+const N_GC_TOUCH: usize = 20_000;
+const SEED_GC: u64 = 0x6c63_6772_6169_6e21;
+
+fn family_gc(c: &mut Criterion, cfg: &Cfg) {
+    let val = vec![0xABu8; VAL];
+    let keys = ascending_keys(N_GC);
+    let mid = N_GC / 2;
+    let touch: Vec<Vec<u8>> = shuffle(keys[mid..].to_vec(), SEED_GC)
+        .into_iter()
+        .take(N_GC_TOUCH)
+        .collect();
+    let mut g = group(c, "put/gc/drain_big", touch.len());
+    pair_shape!(gc_drain_case, &mut g, cfg.page, &keys, mid, &touch, &val);
+    g.finish();
+}
+
+/// Untimed: load `keys`, delete `keys[..mid]` in one txn (one large GC entry),
+/// then one more commit so the entry passes LMDB's stricter reuse gate too
+/// (F < oldest) as well as ZeroDB's. Timed: one txn overwriting `touch` (all
+/// in the surviving half) plus its commit; its COW pages are drawn from that
+/// entry. The fixture is returned, not dropped, so teardown is untimed.
+fn gc_drain_case<B: Backend>(
+    g: &mut Group<'_>,
+    page: u32,
+    keys: &[Vec<u8>],
+    mid: usize,
+    touch: &[Vec<u8>],
+    val: &[u8],
+) {
+    g.bench_function(B::NAME, |b| {
+        b.iter_batched(
+            || {
+                let f = Fixture::<B>::empty(page, Some("bench"), true);
+                B::bulk_put(&f.env, f.db, keys, val);
+                B::delete_range(&f.env, f.db, &keys[0], &keys[mid]);
+                B::bulk_put(&f.env, f.db, &keys[mid..mid + 1], val);
+                f
+            },
+            |f| {
+                B::bulk_put(&f.env, f.db, touch, val);
+                f
+            },
+            BatchSize::PerIteration,
+        )
+    });
 }
 
 /// A write group: element throughput, and the `heavy` criterion profile because

@@ -125,6 +125,7 @@ plain descent cost.
 | `put/api/reserved` | `MDB_RESERVE` — milli's document-serialization path | PERF-GAP **B6** / issue #10 / D-015 |
 | `put/over/same_size` **(base)** | overwriting a cell that still fits | in-place replacement |
 | `put/over/grow` | overwriting a cell that no longer fits | page rearrangement and splits |
+| `put/gc/drain_big` | overwrites whose COW pages are all drawn from ONE large free-list entry (half of a 300k-key tree deleted first, then aged one commit so both engines' reuse gates admit it) | roadmap #1: cost per reused page vs free-list entry length (SPEC 05 GC-19/20). Every other rung starts with an empty or tiny free list |
 
 `rand ÷ seq` is the split-and-COW cost. `seq ÷ append` is what an undeclared
 ascending order leaves on the table.
