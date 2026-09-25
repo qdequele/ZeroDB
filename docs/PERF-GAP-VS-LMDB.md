@@ -559,6 +559,45 @@ free-list save; and lazy first-touch validation (A2(b), ADR). The
 `commit/batch/*` rungs no longer time the fixture drop (2026-09-25 harness
 fix), so their pre-fix numbers are not comparable.
 
+### B13. Hot paths sit above LLVM's inlining threshold — **MEASURED 2026-09-26**
+Bench server (x86-64, 4 KiB, turbo off). The same commit is built four ways,
+each in its own target dir, and measured in two passes (forward, then reverse
+order; pass-to-pass spread 0.3–1.3 %). LMDB's C core is compiled by gcc and
+ignores these flags, so it is the control (drift 0.97–1.0 except under fat LTO).
+
+| rung | V0 default (CGU16) | V1 CGU1 (Meilisearch's release profile) | V2 CGU1 + `-C llvm-args=-inline-threshold=1000` | ZeroDB time V2 vs V0 |
+|---|---:|---:|---:|---:|
+| `get/access/hot` | 1.22× | 1.40× | 1.08× | −14 % |
+| `get/db/named` | 1.45× | 1.55× | 1.26× | −15 % |
+| `seek/ge/*` | 1.39–1.46× | 1.45–1.55× | 1.20–1.25× | −13 to −16 % |
+| `scan/edge/first_last` | 2.15× | 2.19× | 1.41× | −38 % |
+| `scan/range/*`, `scan/prefix/bucket` | 1.94–2.82× | 2.16–2.85× | 1.58–2.09× | −25 to −26 % |
+| `scan/full/*` | 1.84–1.96× | 1.79–2.04× | 1.50–1.53× | −18 to −21 % |
+| `put/order/seq` | 1.16× | 1.23× | 1.05× | −10 % |
+| `put/val/v256` | 1.19× | 1.26× | 1.08× | −11 % |
+| `commit/batch/n1` | 2.17× | 2.12× | 2.06× | −8 % |
+
+(Cells are ZeroDB ÷ LMDB.) Adding fat LTO to V2 (V3) also speeds up heed's Rust
+wrapper around LMDB (scan LMDB drift 0.75–0.86), so it does not separate the
+engines and is omitted.
+
+Three consequences:
+1. With no code change, 8–38 % of ZeroDB's time on the hot paths comes from
+   hot functions LLVM declines to inline at its default threshold.
+2. CGU1, Meilisearch's build, is ZeroDB's **worst** case: slower than CGU16 on
+   most read rungs. Before/after runs meant to speak for Meilisearch must also
+   run at `CARGO_PROFILE_BENCH_CODEGEN_UNITS=1`. hannoy builds at the default
+   16.
+3. It explains the reverted GC head offset (ledger, 2026-09-25). Functions at
+   the threshold change shape when a neighbour changes, which moved unrelated
+   write rungs by 1–9 %.
+
+Lever: consumers will not set an LLVM flag, so the fix is at the source level.
+Shrink the hot bodies below the default threshold: `#[cold]` /
+`#[inline(never)]` on the memo-miss, full-validation, error and
+multi-page-allocation arms, and `#[inline]` on the small hot helpers. Judge it
+by how much of V2's gain the default build keeps, at both CGU1 and CGU16.
+
 ## C. RAM (peak memory)
 
 ### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**

@@ -139,7 +139,11 @@ TARGET='^<rung>$' $BS/ab.sh '^<family>/'
 ```
 
 The filter is the whole family, so the neighbouring rungs, and the family base
-rung, show whether the gain is real or just moved. Three interleaved rounds by
+rung, show whether the gain is real or just moved. Run it **twice**: with the
+default build (16 codegen units; how hannoy builds) and with
+`CARGO_PROFILE_BENCH_CODEGEN_UNITS=1` (how Meilisearch builds). PERF-GAP B13
+shows ZeroDB's hot paths sit at LLVM's inlining threshold, so a lever can win
+under one setting and lose under the other; keep it only if neither regresses. Three interleaved rounds by
 default. Read the `verdict.json` path it prints last → `verdict`:
 
 | verdict | action |
