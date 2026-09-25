@@ -55,7 +55,12 @@ elif command -v sample >/dev/null; then
     fi
     echo "profile: $OUT/sample.txt  (start at 'Sort by top of stack' for self time, then the 'Call graph')"
 elif command -v perf >/dev/null; then
-    perf record -g -o "$OUT/perf.data" -- "$EXE" "${ARGS[@]}"
+    # `-g` alone unwinds via frame pointers, which this build does not force,
+    # so call graphs came out broken (single-frame or truncated). DWARF
+    # unwinding reads .debug_frame/.eh_frame instead, so it works regardless of
+    # the frame-pointer setting; 32768 is the unwind stack size perf captures
+    # per sample, generous enough for this codebase's call depth.
+    perf record --call-graph dwarf,32768 -o "$OUT/perf.data" -- "$EXE" "${ARGS[@]}"
     perf report -i "$OUT/perf.data" --stdio --no-children --percent-limit 1 >"$OUT/report.txt"
     echo "profile: $OUT/report.txt"
 else

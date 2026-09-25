@@ -55,6 +55,11 @@ pub trait Backend {
 
     // -- read ------------------------------------------------------------
     fn point_get(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>]) -> usize;
+    /// Same as `point_get`, but reads the first/last byte of every returned
+    /// value through `black_box` — the control for the `get/val/*_touch` rungs,
+    /// so overflow-value rungs measure the value chase and copy rather than an
+    /// elided read.
+    fn point_get_touch(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>]) -> usize;
     fn point_get_multi(env: &Self::Env, dbs: &[Self::Db], keys: &[Vec<u8>]) -> usize;
     fn point_get_hot(env: &Self::Env, db: Self::Db, key: &[u8], n: usize) -> usize;
     fn scan(env: &Self::Env, db: Self::Db) -> usize;
@@ -68,6 +73,9 @@ pub trait Backend {
     // -- composite / maintenance -----------------------------------------
     fn mixed_rw(env: &Self::Env, dbs: &[Self::Db], keys: &[Vec<u8>], val: &[u8]) -> usize;
     #[allow(clippy::too_many_arguments)]
+    /// Returns the elapsed time of the writer loop ONLY (first `write_txn` to
+    /// last `commit`), so a caller timing this with `iter_custom` excludes the
+    /// reader threads' join tail and the fixture's drop.
     fn writer_under_readers(
         env: &Self::Env,
         db: Self::Db,
@@ -76,7 +84,7 @@ pub trait Backend {
         readers: usize,
         batches: usize,
         per_batch: usize,
-    );
+    ) -> std::time::Duration;
     fn copy_to(env: &Self::Env, dest: &Path, compact: bool);
 }
 

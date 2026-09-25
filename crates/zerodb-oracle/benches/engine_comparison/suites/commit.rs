@@ -78,7 +78,12 @@ fn case<B: Backend>(
             || Fixture::<B>::empty(page, Some("bench"), no_sync),
             |f| {
                 B::commit_churn(&f.env, f.db, keys, val, per_txn);
-                drop(f);
+                // Return `f` instead of dropping it here: `iter_batched`
+                // collects routine outputs and drops them AFTER it stops the
+                // clock, so an explicit `drop(f)` inside this closure used to
+                // charge the fixture's teardown (env unmap, tempdir removal)
+                // to the timed commits. Only the commits above are measured.
+                f
             },
             BatchSize::PerIteration,
         )

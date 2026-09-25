@@ -14,9 +14,12 @@ macro_rules! bench_backend {
     ($mod:ident, $heed:ident, $setpage:tt) => {
         pub mod $mod {
             use std::fs::File;
+            use std::hint::black_box;
             use std::io::Write as _;
             use std::ops::Bound;
             use std::path::Path;
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::time::{Duration, Instant};
 
             use $heed::types::Bytes;
             use $heed::{
@@ -259,6 +262,25 @@ macro_rules! bench_backend {
                 hits
             }
 
+            /// Point lookups that also READ the returned value's first and last
+            /// byte through `black_box` — unlike `point_get`, this cannot let an
+            /// overflow-value rung (`v4k`, `v2page`) skip the actual page-chase
+            /// and memcpy of the value bytes.
+            pub fn point_get_touch(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
+                let r = env.read_txn().expect("read_txn");
+                let mut hits = 0usize;
+                for k in keys {
+                    if let Some(v) = db.get(&r, k.as_slice()).expect("get") {
+                        if !v.is_empty() {
+                            black_box(v[0]);
+                            black_box(v[v.len() - 1]);
+                        }
+                        hits += 1;
+                    }
+                }
+                hits
+            }
+
             /// Point lookups spread over `dbs` round-robin — the multi-named-DB
             /// rung (catalog resolution repeated against different records).
             pub fn point_get_multi(env: &BEnv, dbs: &[Db], keys: &[Vec<u8>]) -> usize {
@@ -390,9 +412,32 @@ macro_rules! bench_backend {
                 hits
             }
 
-            /// `readers` threads full-scanning in a loop while this thread commits
-            /// `batches` write txns. Timed value = the whole scope, i.e. the
-            /// writer's work under concurrent reader pressure.
+            /// A single forward scan that checks `stop` every `chunk` entries
+            /// instead of only at end-of-scan, so a reader notices the writer is
+            /// done within a fraction of a full scan rather than up to one whole
+            /// scan late. Not part of `Backend`: it exists only to give
+            /// `writer_under_readers`'s reader threads a responsive stop
+            /// condition, and it is generated identically for both engines by
+            /// this same macro body.
+            fn scan_chunked_until_stop(env: &BEnv, db: Db, stop: &AtomicBool, chunk: usize) {
+                let r = env.read_txn().expect("read_txn");
+                let mut n = 0usize;
+                for kv in db.iter(&r).expect("iter") {
+                    let _ = kv.expect("entry");
+                    n += 1;
+                    if n % chunk == 0 && stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+            }
+
+            /// `readers` threads full-scanning in a loop (polling `stop` every
+            /// 1024 entries) while this thread commits `batches` write txns.
+            /// Returns the ELAPSED TIME OF THE WRITER LOOP ONLY — from the first
+            /// `write_txn` to the last `commit` — so the caller's criterion
+            /// `iter_custom` times exactly the writer's work under concurrent
+            /// reader pressure, not the reader threads' join tail or the
+            /// fixture's drop.
             pub fn writer_under_readers(
                 env: &BEnv,
                 db: Db,
@@ -401,16 +446,18 @@ macro_rules! bench_backend {
                 readers: usize,
                 batches: usize,
                 per_batch: usize,
-            ) {
-                let stop = std::sync::atomic::AtomicBool::new(false);
+            ) -> Duration {
+                const READER_STOP_POLL_CHUNK: usize = 1024;
+                let stop = AtomicBool::new(false);
                 std::thread::scope(|s| {
                     for _ in 0..readers {
                         s.spawn(|| {
-                            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                                let _ = scan(env, db);
+                            while !stop.load(Ordering::Relaxed) {
+                                scan_chunked_until_stop(env, db, &stop, READER_STOP_POLL_CHUNK);
                             }
                         });
                     }
+                    let start = Instant::now();
                     for b in 0..batches {
                         let lo = (b * per_batch) % keys.len();
                         let hi = (lo + per_batch).min(keys.len());
@@ -420,8 +467,10 @@ macro_rules! bench_backend {
                         }
                         w.commit().expect("commit");
                     }
-                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-                });
+                    let elapsed = start.elapsed();
+                    stop.store(true, Ordering::Relaxed);
+                    elapsed
+                })
             }
 
             /// `mdb_env_copy2` into `dest`, compacting or raw.
@@ -509,6 +558,9 @@ macro_rules! bench_backend {
                 fn point_get(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
                     point_get(env, db, keys)
                 }
+                fn point_get_touch(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
+                    point_get_touch(env, db, keys)
+                }
                 fn point_get_multi(env: &BEnv, dbs: &[Db], keys: &[Vec<u8>]) -> usize {
                     point_get_multi(env, dbs, keys)
                 }
@@ -548,7 +600,7 @@ macro_rules! bench_backend {
                     readers: usize,
                     batches: usize,
                     per_batch: usize,
-                ) {
+                ) -> Duration {
                     writer_under_readers(env, db, keys, val, readers, batches, per_batch)
                 }
                 fn copy_to(env: &BEnv, dest: &Path, compact: bool) {

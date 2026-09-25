@@ -68,10 +68,23 @@ one-put commit that is actually about the put.
 | `get/size/n1k` **(base)** → `n50k` → `n1m` *(long)* | tree depth, and nothing else | PERF-GAP **A5** (branch levels re-resolved per descent) |
 | `get/key/k8` **(base)** → `k32` → `k128` | key width: comparison cost and cells per page | PERF-GAP **A7** (comparator vtable), leaf density |
 | `get/val/v8` **(base)** → `v256` → `v4k` → `v2page` | value width; at 2×page it crosses into overflow pages | value memcpy, overflow handling |
+| `get/val/v8_touch` → `v4k_touch` → `v2page_touch` | the same value-width sweep, but every returned value is actually read | overflow-page chase + value memcpy net of an elided read |
 
 `named ÷ root` is the price of A1. `n1m ÷ n50k` is roughly the price of one
 more tree level — read it against `n50k ÷ n1k` to see whether per-level cost is
 constant or growing.
+
+**2026-09-25:** `point_get` never reads the bytes behind the returned value, so
+on `v4k`/`v2page` the overflow-page chase and the value memcpy could be
+optimized away or never actually paid for — those two rungs measured an
+artifact, not real work. The `*_touch` rungs (`get/val/v8_touch`,
+`get/val/v4k_touch`, `get/val/v2page_touch`) add a `point_get_touch` operation,
+shared by both engines in `backend.rs`, that reads the first and last byte of
+every returned value through `std::hint::black_box`. `v8_touch` is the
+family-local control; compare `v4k_touch ÷ v8_touch` and `v2page_touch ÷
+v8_touch` to isolate what actually reading the value costs, the same way the
+non-touch rungs are read against `v8`. The original `v8`/`v256`/`v4k`/`v2page`
+rungs are unchanged, for history comparability.
 
 ### `scan` — cursor iteration
 
@@ -147,6 +160,15 @@ instead of by key — it was 1.28 before B8a and is 1.01 after.
 that is an SSD; the number that decides anything is the EBS gp3 one, which is
 also where B4's coalesced writes are supposed to pay for themselves.
 
+**2026-09-25:** every `commit/batch/*` and `commit/sync/*` rung shares one
+`case` function that ran the fixture teardown (`drop(f)`) as the last line of
+the `iter_batched` routine closure — inside the timed region. `f` now flows out
+of the routine as its return value instead; `iter_batched` collects routine
+outputs into a `Vec` and drops that `Vec` only after it stops the clock, so the
+env unmap and tempdir removal no longer count against the commits. Rung numbers
+for `commit/batch/*` (and `commit/sync/*`, same `case` function) from before
+this change are **not comparable** with numbers from after.
+
 ### `mixed` — the milli-shaped rung
 
 `mixed/rw/8dbs` is the only rung that reads through a **write** txn, so the
@@ -159,17 +181,38 @@ the `PgnoHasher` work of batch #9.
 
 ### `concurrent` *(long tier)* — MVCC under contention
 
-`concurrent/writer/r1` **(base)** → `r4`: the timed value is the **writer's**
-work while `r` reader threads full-scan in a loop. Every other suite is
-single-threaded, which hides exactly what MVCC exists to manage — the reader
-table under contention, and a writer whose page reclamation is pinned by the
-oldest live reader.
+`concurrent/writer/r0` **(base)** → `r1` → `r4`: the timed value is the
+**writer's** work ONLY, while `r` reader threads full-scan in a loop. Every
+other suite is single-threaded, which hides exactly what MVCC exists to
+manage — the reader table under contention, and a writer whose page
+reclamation is pinned by the oldest live reader. `r0` runs the identical txn
+count and overwrites-per-txn as `r1`/`r4` with zero reader threads, so it is
+the family's same-shape base rung.
 
-Read `concurrent/writer/rN ÷ commit/batch/n100` **per engine**: that is what
-concurrency costs that engine. A gap between the two engines' ratios is a
-reader-table (ADR-0006) or reclamation (SPEC 05) finding, not a tree finding.
-Long tier because on a laptop the reader threads compete with the writer for the
-same few cores, and the rung gets noisy.
+Read `concurrent/writer/rN ÷ concurrent/writer/r0` **per engine**: that is what
+N readers cost that engine (historically this was read against
+`commit/batch/n100`, the same writer with nobody else in the environment — that
+comparison still holds, `r0` just gives the family its own base). A gap between
+the two engines' ratios is a reader-table (ADR-0006) or reclamation (SPEC 05)
+finding, not a tree finding. Long tier because on a laptop the reader threads
+compete with the writer for the same few cores, and the rung gets noisy.
+
+**2026-09-25:** the timed closure used to be the whole `iter_batched` routine,
+which included the reader threads' join tail and the fixture's drop. Each
+reader thread only checked the stop flag once per full 50k-entry `scan`, so
+after the writer's last commit the timed region could wait up to one whole scan
+before the closure returned — a real cost, but not the writer's cost, and not
+a fixed one (it scales with however slow that engine's own `scan` happens to
+be, which is exactly the kind of thing this rung is supposed to isolate on the
+writer side only). Fixed two ways: `backend.rs`'s `writer_under_readers` now
+returns the elapsed time of its own write-txn loop (first `write_txn` to last
+`commit`) and the suite times it with criterion's `iter_custom`, excluding the
+reader join and the drop entirely; and the reader loop
+(`scan_chunked_until_stop`) now polls the stop flag every 1024 entries instead
+of once per full scan, so even the reader threads' own wall-clock join is fast.
+Also added: the `r0` baseline rung described above. Rung numbers for
+`concurrent/writer/*` from before this change are **not comparable** with
+numbers from after.
 
 ### `maint` — whole-environment maintenance
 

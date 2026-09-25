@@ -194,6 +194,27 @@ fn family_val(c: &mut Criterion, cfg: &Cfg) {
             &p,
         );
     }
+
+    // `point_get` never reads the returned value's bytes, so on `v4k`/`v2page`
+    // the overflow-page chase and value memcpy can be an artifact the
+    // optimizer (or, on the LMDB side, the OS page cache) never has to pay
+    // for. These `_touch` variants read the first and last byte of every
+    // returned value through `black_box`; `v8_touch` is the family-local
+    // control so `v4k_touch ÷ v8_touch` / `v2page_touch ÷ v8_touch` isolate
+    // the touch's own cost the same way the non-touch rungs do.
+    for (label, width) in [
+        ("v8_touch".to_string(), 8usize),
+        ("v4k_touch".to_string(), 4096),
+        ("v2page_touch".to_string(), page * 2),
+    ] {
+        let val = vec![0xCDu8; width];
+        rung_touch(
+            c,
+            &format!("get/val/{label}"),
+            &Seed::named(cfg.page, &keys, &val),
+            &p,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -203,5 +224,13 @@ fn rung(c: &mut Criterion, name: &str, seed: &Seed<'_>, p: &[Vec<u8>]) {
     let mut g = c.benchmark_group(name);
     g.throughput(Throughput::Elements(p.len() as u64));
     pair!(ro_probe, point_get, &mut g, seed, p);
+    g.finish();
+}
+
+/// One `point_get_touch` rung, both engines — see `family_val`'s `_touch` loop.
+fn rung_touch(c: &mut Criterion, name: &str, seed: &Seed<'_>, p: &[Vec<u8>]) {
+    let mut g = c.benchmark_group(name);
+    g.throughput(Throughput::Elements(p.len() as u64));
+    pair!(ro_probe, point_get_touch, &mut g, seed, p);
     g.finish();
 }

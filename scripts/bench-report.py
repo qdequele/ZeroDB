@@ -50,7 +50,7 @@ LADDER_BASE = {
     "commit/batch": "commit/batch/n10k",
     "commit/sync": "commit/sync/n100",
     "maint/copy": "maint/copy/raw",
-    "concurrent/writer": "concurrent/writer/r1",
+    "concurrent/writer": "concurrent/writer/r0",
 }
 
 

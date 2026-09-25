@@ -524,6 +524,41 @@ deterministic count (chat, 2026-09-25). `commit/batch/*` and
 of ZeroDB's begin/commit path (`write_txn`, `RwTxn` drop glue,
 `SnapshotCell::clone_snapshot` in the profile).
 
+### B12. Single-put commit: +8.4 µs per commit, attributed — **MEASURED 2026-09-25**
+Bench server (x86-64, 4 KiB, turbo off), `examples/commit_census.rs`:
+20,000 single-put commits of 256-byte values into a fresh named DB, NO_SYNC,
+nothing else in the process. Phases are timed with `Instant`; `strace -c`,
+`perf stat` and a DWARF `perf record` are taken over the same binary.
+
+| per commit | LMDB | ZeroDB |
+|---|---:|---:|
+| total | 7.6 µs | 16.0 µs |
+| begin / put / commit | 0.12 / 1.1 / 6.4 µs | 0.17 / **4.45** / **11.35** µs |
+| write syscalls | 5.5 | 4.3 |
+| bytes written | 20.3 KB (4.96 pages) | 24.3 KB (5.93 pages) |
+| instructions | 22.9k | **57.5k** |
+
+The gap is CPU work, not I/O; about 89 % of it is attributed:
+
+- **Copy-on-write of the path, +2.3 µs** (`touch_path`: 3.0 µs vs
+  `mdb_cursor_touch` 0.7 µs). `RwTxn::touch` heap-allocates a fresh 4 KiB `Box`
+  and copies the **whole** page. LMDB reuses a frame from `me_dpages` and
+  `mdb_page_copy` copies only the header/pointer area and the used heap,
+  skipping the free gap.
+- **Descent, +1.5 µs** (`search_path` 2.1 µs vs `mdb_page_search` 0.56 µs).
+  Most of it is `node_view` → `BranchRef::new`/`LeafRef::new`: full per-cell
+  validation of every map page the first time a write txn touches it.
+- **Commit CPU, +3.1 µs.** The free-list save (`put_pil`: a second tree put,
+  plus its own touch, per commit) is ~1.6 µs; `allocate` ~1.0 µs; then meta
+  encoding and the rest.
+- **Kernel write path, +1.1 µs**: roughly one extra 4 KiB page per commit.
+
+`begin` differs by only 0.05 µs. Levers, in LMDB's shape: used-portion COW
+copy plus frame reuse (reopens B3's frame pool, now with evidence); a cheaper
+free-list save; and lazy first-touch validation (A2(b), ADR). The
+`commit/batch/*` rungs no longer time the fixture drop (2026-09-25 harness
+fix), so their pre-fix numbers are not comparable.
+
 ## C. RAM (peak memory)
 
 ### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**
