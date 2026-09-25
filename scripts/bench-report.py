@@ -13,7 +13,7 @@ much each rung's ratio moved against the family's FIRST rung. A rung whose
 ratio jumps is naming the mechanism that rung added.
 
 Usage:
-    scripts/bench-report.py [--dir target/criterion] [--md] [--min-jump 0.15]
+    scripts/bench-report.py [--dir target/criterion] [--md | --json] [--min-jump 0.15]
 """
 import argparse
 import json
@@ -54,8 +54,13 @@ LADDER_BASE = {
 }
 
 
-def load(root: Path):
-    """{group_id: {function_id: (point_estimate_ns, std_dev_ns)}} in run order."""
+def load_estimates(root: Path):
+    """{group_id: {function_id: {point, sd, lo, hi}}} in run order, all in ns.
+
+    `lo`/`hi` bound criterion's 95 % confidence interval on the point estimate,
+    which is what `scripts/bench-ab.py` needs to call a before/after change
+    real; `sd` is the per-sample spread the noise mark below uses.
+    """
     groups = OrderedDict()
     for bench in sorted(root.rglob("new/benchmark.json")):
         est = bench.parent / "estimates.json"
@@ -73,11 +78,22 @@ def load(root: Path):
         # sampling); `mean` is the fallback for flat sampling. `typical()` in
         # criterion's own reporter makes exactly this choice.
         typical = e.get("slope") or e.get("mean")
-        groups.setdefault(group, {})[func] = (
-            typical["point_estimate"],
-            e["std_dev"]["point_estimate"],
-        )
+        ci = typical["confidence_interval"]
+        groups.setdefault(group, {})[func] = {
+            "point": typical["point_estimate"],
+            "sd": e["std_dev"]["point_estimate"],
+            "lo": ci["lower_bound"],
+            "hi": ci["upper_bound"],
+        }
     return groups
+
+
+def load(root: Path):
+    """{group_id: {function_id: (point_estimate_ns, std_dev_ns)}} in run order."""
+    return OrderedDict(
+        (g, {f: (v["point"], v["sd"]) for f, v in funcs.items()})
+        for g, funcs in load_estimates(root).items()
+    )
 
 
 def human(ns: float) -> str:
@@ -97,6 +113,11 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dir", default="target/criterion", type=Path)
     ap.add_argument("--md", action="store_true", help="emit a Markdown table")
+    ap.add_argument(
+        "--json",
+        action="store_true",
+        help="emit one JSON array of rungs (the perf loop's scoreboard)",
+    )
     ap.add_argument(
         "--min-jump",
         type=float,
@@ -152,6 +173,26 @@ def main() -> int:
     if not rows:
         print("no group had both engines — was the run filtered?", file=sys.stderr)
         return 1
+
+    if args.json:
+        json.dump(
+            [
+                {
+                    "rung": g,
+                    "family": family_of(g),
+                    "lmdb_ns": l,
+                    "zerodb_ns": z,
+                    "ratio": r,
+                    "delta_family": j,
+                    "noise": noisy,
+                }
+                for g, l, z, r, j, noisy in rows
+            ],
+            sys.stdout,
+            indent=1,
+        )
+        print()
+        return 0
 
     if args.md:
         print("| rung | LMDB | ZeroDB | ratio | vs family base |")

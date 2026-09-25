@@ -73,6 +73,31 @@ bench-quick SUITE='':
 bench-report *ARGS:
     scripts/bench-report.py {{ARGS}}
 
+# --- Before/after: the perf-iteration loop (.claude/commands/perf-iterate.md) ---
+#
+#   just bench-ab '^del/'        ZeroDB at BASE (default HEAD) vs the working tree,
+#                                interleaved ROUNDS (default 3), LMDB as drift control;
+#                                prints the three-column table, writes verdict.json
+#   just bench-gate              the whole ladder vs the merge base with main
+#   just bench-profile del/range/half [lmdb]    where the time goes, one rung
+#   just perf-ledger show        prior attempts; read before picking a lever
+
+# Before/after A/B on a criterion regex (env: BASE ROUNDS TARGET MIN_EFFECT MAX_DRIFT).
+bench-ab FILTER='':
+    scripts/bench-ab.sh '{{FILTER}}'
+
+# Branch-level gate: every rung, before = merge base with main, one round.
+bench-gate:
+    BASE="$(git merge-base HEAD main)" ROUNDS="${ROUNDS:-1}" scripts/bench-ab.sh ''
+
+# Profile one rung on one engine (samply, else macOS `sample`, else perf).
+bench-profile RUNG ENGINE='zerodb':
+    scripts/bench-profile.sh '{{RUNG}}' '{{ENGINE}}'
+
+# The perf-attempt ledger (benches/results/perf-ledger.jsonl).
+perf-ledger *ARGS:
+    scripts/perf-ledger.py {{ARGS}}
+
 # Consumer gate — Meilisearch on ZeroDB (scripts/consumer.sh; MEILISEARCH_REF,
 # MEILISEARCH_SRC, WORKLOADS, ROUNDS documented in the script header).
 consumer-check:

@@ -208,6 +208,33 @@ These are structural, not conventions to remember:
   `get/db/root` is the deliberate exception: it is the baseline the named rungs
   are measured against.
 
+## Before/after: judging one change
+
+The ladder above compares ZeroDB with LMDB. A change needs a second question
+answered: did *this change* move ZeroDB, or did the machine move? `just
+bench-ab <regex>` answers it with three columns: LMDB, ZeroDB before and ZeroDB
+after.
+
+* **Before** is the engine at `BASE` (default `HEAD`). It is built in a reusable
+  worktree under `target/bench-ab/base` with the working tree's bench harness
+  copied over it, so both sides are measured with the same harness.
+  **After** is the working tree.
+* The two binaries run in `ROUNDS` interleaved rounds (default 3), and even
+  rounds flip the order.
+* LMDB's code is identical in both binaries, so **its before÷after is pure
+  drift**. A rung whose LMDB moved more than `MAX_DRIFT` (3 %) is reported as
+  unreliable, not read.
+* A ZeroDB change counts only past `max(MIN_EFFECT, noise)`. Noise is the larger
+  of criterion's 95 % CI and twice the round-to-round spread.
+* `verdict.json` gives one of `improved`, `regressed`, `flat` or `invalid`. A
+  regression on any rung counts, not just on the targeted rungs.
+
+`just bench-gate` runs the same comparison over the whole ladder against the
+merge base with `main`. `just bench-profile <rung> [lmdb]` shows where one
+rung's time goes. `just perf-ledger show` lists every earlier attempt, including
+the reverted ones. `.claude/commands/perf-iterate.md` chains these into the
+agent loop.
+
 ## Adding a rung
 
 1. Decide which mechanism it isolates and which existing rung it differs from by
