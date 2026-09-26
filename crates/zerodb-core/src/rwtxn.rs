@@ -1349,12 +1349,15 @@ impl<'env> RwTxn<'env> {
         Err(Error::Mdb(MdbError::Invalid)) // deeper than depth: corrupt
     }
 
-    /// Read-only descent to the rightmost entry (APPEND's last-key compare,
-    /// §6.3). Returns the path (leaf `ki = num_keys - 1`) and the owned last
-    /// key. The tree must be non-empty.
-    fn rightmost_path(&self, tree: TreeId) -> Result<(Path, Vec<u8>)> {
+    /// Read-only descent to the rightmost entry (APPEND's last-key check,
+    /// §6.3) into a caller-owned buffer (cleared first): fills the path (leaf
+    /// `ki = num_keys - 1`) and returns whether `key` sorts strictly after the
+    /// last key under the tree's ordering. The key is compared in place in
+    /// the leaf, as LMDB's APPEND check does, not copied out. The tree must be
+    /// non-empty.
+    fn rightmost_path_into(&self, tree: TreeId, key: &[u8], path: &mut Path) -> Result<bool> {
+        path.clear();
         let rec = *self.record(tree);
-        let mut path = Vec::new();
         // Same hostile-depth guard as `search_path`.
         if rec.depth as usize > crate::btree::CURSOR_STACK {
             return Err(Error::Mdb(MdbError::Invalid));
@@ -1368,9 +1371,14 @@ impl<'env> RwTxn<'env> {
                     if n == 0 {
                         return Err(Error::Mdb(MdbError::Invalid));
                     }
-                    let key = leaf.key(n - 1).to_vec();
                     path.push((pgno, n - 1));
-                    return Ok((path, key));
+                    // M2.4: "strictly greater than the last key" is decided by
+                    // the target tree's ordering, not memcmp — otherwise
+                    // APPEND on a custom-comparator DB would reject exactly
+                    // the keys it should accept.
+                    let after = self.tree_comparator(tree).compare(key, leaf.key(n - 1))
+                        == Ordering::Greater;
+                    return Ok(after);
                 }
                 NodeView::Branch(br) => {
                     // A zero-child branch is rejected at decode
@@ -1485,14 +1493,19 @@ impl<'env> RwTxn<'env> {
             }
             return res;
         }
-        let (mut path, last_key) = self.rightmost_path(tree)?;
-        // M2.4: "strictly greater than the last key" is decided by the target
-        // tree's ordering, not memcmp — otherwise APPEND on a custom-comparator
-        // DB would reject exactly the keys it should accept.
-        if self.tree_comparator(tree).compare(key, &last_key) != std::cmp::Ordering::Greater {
-            return Err(Error::Mdb(MdbError::KeyExist));
-        }
-        let res = self.append_apply(tree, &mut path, key, val);
+        let mut path = std::mem::take(&mut self.path_buf);
+        let res = match self.rightmost_path_into(tree, key, &mut path) {
+            Ok(true) => self.append_apply(tree, &mut path, key, val),
+            Ok(false) => {
+                self.path_buf = path;
+                return Err(Error::Mdb(MdbError::KeyExist));
+            }
+            Err(e) => {
+                self.path_buf = path;
+                return Err(e);
+            }
+        };
+        self.path_buf = path;
         if res.is_err() {
             self.errored = true;
         }

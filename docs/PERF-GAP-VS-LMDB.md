@@ -679,6 +679,12 @@ Bench server, x86-64, 4 KiB (bench-ab, 3 rounds), on top of B14:
 No `put/*` or `del/*` rung regressed in either build; breadth at CGU1 had
 `commit/batch/n10k` 1.03× → 0.99× and nothing slower.
 
+**Amendment 2026-09-26: APPEND.** The APPEND check copied the tree's last key
+into a fresh `Vec` (`rightmost_path`) to compare it once. It now compares in
+place in the leaf under the tree's ordering, as LMDB's APPEND check does, and
+reuses the same path buffer. `put/order/append` 1.32× → 1.19× (CGU16) and
+1.30× → 1.16× (CGU1); the other 11 `put/*` rungs flat.
+
 ## C. RAM (peak memory)
 
 ### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**
