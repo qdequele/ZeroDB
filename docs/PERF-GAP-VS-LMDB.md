@@ -634,6 +634,30 @@ Shrink the hot bodies below the default threshold: `#[cold]` /
 multi-page-allocation arms, and `#[inline]` on the small hot helpers. Judge it
 by how much of V2's gain the default build keeps, at both CGU1 and CGU16.
 
+### B14. Write txn's named-DB table was a SipHash map — **DONE 2026-09-26**
+`RwTxn.open` was a `HashMap<u32, NamedTree>` keyed by dbi with the default
+SipHash hasher, and a named put probes it several times (`ensure_open`,
+`record`, `record_mut`). A `put/val/v8` profile on the bench server put
+`hash_one::<&u32>` plus `DefaultHasher::write` at 7.5 % of ZeroDB's samples.
+LMDB keeps the same state in `txn->mt_dbs[dbi]`, an array read by index on
+every cursor init (`mdb_cursor_init`). The table is now indexed by dbi
+(`OpenTable`, a `Vec<Option<NamedTree>>`); dbi indices are small and
+append-only, so it grows only to the highest dbi the txn touched.
+
+Bench server, x86-64, 4 KiB (bench-ab, 3 rounds):
+
+| rung | CGU16 | CGU1 |
+|---|---|---|
+| `put/val/v8` | 1.28× → 1.09× | 1.28× → 1.10× |
+| `put/order/seq` | 1.04× → 0.95× | 1.03× → 0.96× |
+| `put/api/plain` | 1.06× → 0.97× | 1.05× → 0.97× |
+| `put/api/reserved` | 1.16× → 1.07× | 1.15× → 1.04× |
+| `put/order/append` | 1.47× → 1.32× | 1.45× → 1.30× |
+
+No `put/*` rung regressed in either build. Breadth at CGU1 (1 round):
+`commit/batch/n10k` 1.16× → 1.02×, `mixed/rw/8dbs` 1.11× → 1.05×, `del/*` 4–7 %
+faster; the one flag (`del/clear/all`) was flat over 3 rounds (0.984).
+
 ## C. RAM (peak memory)
 
 ### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**

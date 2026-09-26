@@ -49,7 +49,7 @@
 //! overwrite the *live* snapshot's slot. (SPEC 04 §1 clarified in this change.)
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use crate::btree::{
@@ -230,6 +230,60 @@ struct NamedTree {
     name: Box<[u8]>,
     rec: DBRecord,
     dirty: bool,
+}
+
+/// The per-txn named-DB table, indexed directly by dbi. LMDB keeps the same
+/// state in `txn->mt_dbs[dbi]`, an array read by index on every cursor init;
+/// a hashed map cost a SipHash per probe and a named put probes several times.
+/// dbi indices are small and append-only (the env registry never reuses one),
+/// so the table grows to the highest dbi this txn touched, never past it.
+#[derive(Default)]
+struct OpenTable {
+    slots: Vec<Option<NamedTree>>,
+}
+
+impl OpenTable {
+    #[inline]
+    fn get(&self, dbi: u32) -> Option<&NamedTree> {
+        self.slots.get(dbi as usize)?.as_ref()
+    }
+
+    #[inline]
+    fn get_mut(&mut self, dbi: u32) -> Option<&mut NamedTree> {
+        self.slots.get_mut(dbi as usize)?.as_mut()
+    }
+
+    #[inline]
+    fn contains(&self, dbi: u32) -> bool {
+        self.get(dbi).is_some()
+    }
+
+    /// The slot for `dbi`, growing the table to reach it.
+    fn slot(&mut self, dbi: u32) -> &mut Option<NamedTree> {
+        let i = dbi as usize;
+        if i >= self.slots.len() {
+            self.slots.resize_with(i + 1, || None);
+        }
+        &mut self.slots[i]
+    }
+
+    fn insert(&mut self, dbi: u32, t: NamedTree) {
+        *self.slot(dbi) = Some(t);
+    }
+
+    fn remove(&mut self, dbi: u32) {
+        if let Some(s) = self.slots.get_mut(dbi as usize) {
+            *s = None;
+        }
+    }
+
+    fn values(&self) -> impl Iterator<Item = &NamedTree> {
+        self.slots.iter().flatten()
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut NamedTree> {
+        self.slots.iter_mut().flatten()
+    }
 }
 
 /// Allocation restriction state (SPEC 05 GC-12, ADR-0005 D2).
@@ -483,11 +537,11 @@ pub struct RwTxn<'env> {
     main_db: DBRecord,
     free_db: DBRecord,
     /// Per-txn named-DB working records (the dbi table's txn half; M1.6),
-    /// keyed by dbi index. Loaded lazily from the catalog on first touch;
+    /// indexed by dbi. Loaded lazily from the catalog on first touch;
     /// `dirty` entries are written back to the main tree at commit before
     /// `freelist_save` ([`RwTxn::flush_catalog`]). Dropped-this-txn entries are
     /// removed here (their catalog entry is deleted eagerly at drop time).
-    open: HashMap<u32, NamedTree>,
+    open: OpenTable,
     /// LMDB `MDB_TXN_ERROR` parity: a mid-mutation failure (e.g. `MapFull`
     /// inside a split cascade) leaves the working tree partial, so every later
     /// mutation and `commit` returns `BadTxn`; only abort is valid.
@@ -556,7 +610,7 @@ impl Env {
             committed_last_pg: base.last_pg,
             main_db: base.main_db,
             free_db: base.free_db,
-            open: HashMap::new(),
+            open: OpenTable::default(),
             psize: inner.page_size(),
             dirty: DirtyStore::new(inner.page_size()),
             validated: ValidatedPages::new(),
@@ -713,7 +767,7 @@ impl TxnRead for RwTxn<'_> {
                 // txn (uncommitted state, TXN-38); otherwise resolve from the
                 // working catalog (which itself reflects uncommitted catalog
                 // inserts through the dirty-frame source).
-                if let Some(t) = self.open.get(&dbi) {
+                if let Some(t) = self.open.get(dbi) {
                     return t.rec;
                 }
                 match self.env.inner().named_name(dbi) {
@@ -833,7 +887,7 @@ impl<'env> RwTxn<'env> {
             TreeId::Named(dbi) => {
                 &self
                     .open
-                    .get(&dbi)
+                    .get(dbi)
                     .expect("named record loaded before use")
                     .rec
             }
@@ -849,7 +903,7 @@ impl<'env> RwTxn<'env> {
             TreeId::Named(dbi) => {
                 let e = self
                     .open
-                    .get_mut(&dbi)
+                    .get_mut(dbi)
                     .expect("named record loaded before use");
                 e.dirty = true;
                 &mut e.rec
@@ -870,7 +924,7 @@ impl<'env> RwTxn<'env> {
             DbSel::Main => return Ok(TreeId::Main),
             DbSel::Named(dbi) => dbi,
         };
-        if !self.open.contains_key(&dbi) {
+        if !self.open.contains(dbi) {
             let name = self
                 .env
                 .inner()
@@ -2426,7 +2480,7 @@ impl<'env> RwTxn<'env> {
                 self.clear_tree(tree)?;
                 let name = self
                     .open
-                    .get(&dbi)
+                    .get(dbi)
                     .expect("named record loaded")
                     .name
                     .clone();
@@ -2435,7 +2489,7 @@ impl<'env> RwTxn<'env> {
                 debug_assert!(existed, "dropped named DB had no catalog entry");
                 // The DB no longer exists this txn: drop its working record so
                 // `flush_catalog` does not re-create it.
-                self.open.remove(&dbi);
+                self.open.remove(dbi);
                 Ok(())
             }
         }
@@ -2472,7 +2526,7 @@ impl<'env> RwTxn<'env> {
         match cat {
             Cat::Collision => Err(Error::Mdb(MdbError::Incompatible)),
             Cat::SubDb(rec) => {
-                self.open.entry(dbi).or_insert_with(|| NamedTree {
+                self.open.slot(dbi).get_or_insert_with(|| NamedTree {
                     name: name.into(),
                     rec,
                     dirty: false,
