@@ -542,6 +542,11 @@ pub struct RwTxn<'env> {
     /// `freelist_save` ([`RwTxn::flush_catalog`]). Dropped-this-txn entries are
     /// removed here (their catalog entry is deleted eagerly at drop time).
     open: OpenTable,
+    /// Descent-path buffer reused by every put and delete of this txn: taken
+    /// with `mem::take` for the op and put back after, so only the first op
+    /// allocates. LMDB's cursor stack is likewise allocated once and reused;
+    /// a fresh `Vec` per op cost an allocation, its growth and a free.
+    path_buf: Path,
     /// LMDB `MDB_TXN_ERROR` parity: a mid-mutation failure (e.g. `MapFull`
     /// inside a split cascade) leaves the working tree partial, so every later
     /// mutation and `commit` returns `BadTxn`; only abort is valid.
@@ -611,6 +616,7 @@ impl Env {
             main_db: base.main_db,
             free_db: base.free_db,
             open: OpenTable::default(),
+            path_buf: Path::new(),
             psize: inner.page_size(),
             dirty: DirtyStore::new(inner.page_size()),
             validated: ValidatedPages::new(),
@@ -1295,11 +1301,19 @@ impl<'env> RwTxn<'env> {
     /// (`touch_path`), so a `NO_OVERWRITE` miss or a `del` of an absent key
     /// dirties nothing (LMDB parity).
     fn search_path(&self, tree: TreeId, key: &[u8]) -> Result<(Path, bool)> {
+        let mut path = Path::new();
+        let found = self.search_path_into(tree, key, &mut path)?;
+        Ok((path, found))
+    }
+
+    /// [`RwTxn::search_path`] into a caller-owned buffer (cleared first), so
+    /// the put and delete paths can reuse [`RwTxn::path_buf`].
+    fn search_path_into(&self, tree: TreeId, key: &[u8], path: &mut Path) -> Result<bool> {
+        path.clear();
         let cmp = self.tree_comparator(tree);
         let rec = *self.record(tree);
-        let mut path = Vec::new();
         if rec.root == PGNO_INVALID {
-            return Ok((path, false));
+            return Ok(false);
         }
         // Hostile-depth guard: `rec.depth` is on-disk data. Deeper than the
         // read path's CURSOR_STACK bound is corruption (a legal tree of
@@ -1323,7 +1337,7 @@ impl<'env> RwTxn<'env> {
                         Err(i) => (i, false),
                     };
                     path.push((pgno, ki));
-                    return Ok((path, found));
+                    return Ok(found);
                 }
                 NodeView::Branch(br) => {
                     let i = br.child_index_with(key, cmp);
@@ -1436,12 +1450,21 @@ impl<'env> RwTxn<'env> {
         if flags.contains(PutFlags::APPEND) {
             return self.append_tree(tree, key, val);
         }
-        let (mut path, found) = self.search_path(tree, key)?;
+        let mut path = std::mem::take(&mut self.path_buf);
+        let found = match self.search_path_into(tree, key, &mut path) {
+            Ok(found) => found,
+            Err(e) => {
+                self.path_buf = path;
+                return Err(e);
+            }
+        };
         if found && flags.contains(PutFlags::NO_OVERWRITE) {
             // §S2: no mutation, nothing dirtied.
+            self.path_buf = path;
             return Err(Error::Mdb(MdbError::KeyExist));
         }
         let res = self.put_apply(tree, &mut path, found, key, val, node_flags);
+        self.path_buf = path;
         if res.is_err() {
             // Mid-mutation failure (MapFull in a split cascade, corrupt page):
             // the working tree may be partial — poison the txn (TXN-59 clean
@@ -1978,11 +2001,13 @@ impl<'env> RwTxn<'env> {
         // Read-side key leniency (§2.1): an oversized key simply finds
         // nothing (`Ok(false)`); the empty-key `BadValSize` is an API-boundary
         // concern (oracle adapter / heed adapter).
-        let (mut path, found) = self.search_path(tree, key)?;
-        if !found {
-            return Ok(false);
-        }
-        self.delete_at_path(tree, &mut path).map(|_| true)
+        let mut path = std::mem::take(&mut self.path_buf);
+        let res = match self.search_path_into(tree, key, &mut path) {
+            Ok(true) => self.delete_at_path(tree, &mut path).map(|_| true),
+            other => other,
+        };
+        self.path_buf = path;
+        res
     }
 
     /// Delete the entry `path` already points at, skipping the descent

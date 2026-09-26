@@ -658,6 +658,27 @@ No `put/*` rung regressed in either build. Breadth at CGU1 (1 round):
 `commit/batch/n10k` 1.16× → 1.02×, `mixed/rw/8dbs` 1.11× → 1.05×, `del/*` 4–7 %
 faster; the one flag (`del/clear/all`) was flat over 3 rounds (0.984).
 
+### B15. A fresh descent-path `Vec` per put and delete — **DONE 2026-09-26**
+`search_path` built a new `Vec<(u64, usize)>` for every put and delete: an
+allocation, a growth and a free per op (~3 % of `put/val/v8` samples). LMDB's
+cursor stack is allocated once and reused. The write txn now keeps one path
+buffer (`RwTxn::path_buf`), taken for each put/delete and put back after, so
+only the first op allocates. The first try, the read path's inline 32-frame
+`PathStack`, was reverted: zero-filling and returning a 520-byte struct per op
+cost more than the 2–3-frame `Vec` (put/val/v8 +8 % at CGU16).
+
+Bench server, x86-64, 4 KiB (bench-ab, 3 rounds), on top of B14:
+
+| rung | CGU16 | CGU1 |
+|---|---|---|
+| `put/val/v8` | 1.08× → 1.00× | 1.11× → 0.96× |
+| `put/order/seq` | 0.95× → 0.92× | 0.94× → 0.90× |
+| `put/api/plain` | 0.96× → 0.93× | 0.96× → 0.92× |
+| `del/bulk/half` | 2.25× → 2.08× | flat |
+
+No `put/*` or `del/*` rung regressed in either build; breadth at CGU1 had
+`commit/batch/n10k` 1.03× → 0.99× and nothing slower.
+
 ## C. RAM (peak memory)
 
 ### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**
