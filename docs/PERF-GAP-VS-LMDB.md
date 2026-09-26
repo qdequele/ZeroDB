@@ -311,6 +311,20 @@ per GC entry touched (`rwtxn.rs:924-998`); `freelist_save` fixed-point loop
 per commit. LMDB: sorted `MDB_IDL` arrays manipulated in place. Effort:
 medium. Only matters under GC churn; measure before redesigning.
 
+**Amendment 2026-09-26: the front draw is O(1).** Every single-page GC draw
+takes the entry's smallest id (GC-19), and `Vec::drain(0..1)` memmoved the
+whole remainder each time, so consuming an entry of `L` ids cost O(L²). A
+drain entry is now the decoded ids plus a consumed-prefix offset: a front draw
+advances the offset, and a mid-entry run removal (rare) still memmoves. The
+rewritten free-list value at commit is exactly the live remainder, so the file
+is byte-identical. LMDB avoids the same cost by keeping its reclaimed list
+reverse-sorted and cutting from the tail. The draw arms (`gc_reclaim`,
+`save_pool_draw`, `loose_run`) are kept `#[inline(never)]` so `allocate`'s hot
+shape (the loose pop) does not move; the first try without that was reverted
+because it re-laid-out neighbouring write code (B13 point 3). Bench server,
+x86-64, 4 KiB: `put/gc/drain_big` 2.21× → 1.68× (CGU16) and 2.23× → 1.70×
+(CGU1); the other 17 `put/*` and `del/*` rungs flat in both builds.
+
 ### B8. Delete-time rebalance moves entries cell-by-cell — **DIAGNOSED + CONSUMER-CONFIRMED 2026-09-10, open**
 The largest steady-state gap the microbench ladder finds, and the only cluster
 in this inventory that was never predicted from reading `mdb.c`. On the first
@@ -590,7 +604,14 @@ Three consequences:
    16.
 3. It explains the reverted GC head offset (ledger, 2026-09-25). Functions at
    the threshold change shape when a neighbour changes, which moved unrelated
-   write rungs by 1–9 %.
+   write rungs by 1–9 %. The retry with the draw arms kept out of line landed
+   (B7 amendment).
+4. A one-round breadth run can still flag identical code. On the B7 retry,
+   five read rungs showed +5–8 % at CGU1 while `Tree::get`, `Cursor::search`,
+   `Cursor::next` and the adapter `get` disassembled to identical instructions
+   in both builds; only their 64-byte alignment moved. Three rounds on those
+   rungs were flat (0.999–1.010). Confirm every one-round regression with
+   three rounds before reverting.
 
 **Amendment 2026-09-26: lever landed (source-level, no LLVM flag).** The
 first try, `#[cold]` arms plus `#[inline]` hints, was flat and was reverted:

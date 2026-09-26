@@ -135,6 +135,67 @@ fn find_run(ids: &[u64], n: u64) -> Option<u64> {
     None
 }
 
+/// One GC entry's in-memory drain state (GC-20 bookkeeping): the decoded,
+/// validated (strictly ascending — `validate_pil_ids`) PIL ids, viewed
+/// through a consumed-prefix offset. Only `ids[head..]` is live; the prefix
+/// is pages already handed out this txn.
+///
+/// Why the offset: the deterministic pick is the **smallest** live id (GC-19,
+/// and for runs usually the front too), so a plain `Vec::drain(0..n)`
+/// memmoves the whole tail on every draw — O(L²) to consume an entry of `L`
+/// ids. Advancing `head` makes the dominant front draw O(1) while keeping the
+/// live slice sorted-ascending for `find_run`/`binary_search`. (LMDB solves
+/// the same problem by keeping its reclaimed list reverse-sorted and cutting
+/// the tail.) A mid-slice run removal (rare: `n > 1` whose run does not start
+/// at the front) still pays the memmove via `Vec::drain`.
+///
+/// The consumed prefix is never re-exposed: every read goes through
+/// [`Drain::live`], and the GC-20 rewrite at commit encodes exactly the live
+/// slice — the same remaining ids the drain-on-every-draw representation
+/// produced, so the on-disk result is unchanged.
+#[derive(Debug, Clone)]
+struct Drain {
+    /// Decoded PIL ids, ascending. `..head` consumed, `head..` live.
+    ids: Vec<u64>,
+    /// Length of the consumed front prefix. Invariant: `head <= ids.len()`.
+    head: usize,
+}
+
+impl Drain {
+    fn new(ids: Vec<u64>) -> Self {
+        Drain { ids, head: 0 }
+    }
+
+    /// The remaining (still-free) ids, sorted ascending.
+    fn live(&self) -> &[u64] {
+        &self.ids[self.head..]
+    }
+
+    /// Number of remaining ids.
+    fn len(&self) -> usize {
+        self.ids.len() - self.head
+    }
+
+    /// Consume the run `start .. start + n`. The caller (a `find_run` hit on
+    /// [`Drain::live`]) guarantees the run is present and — since the live
+    /// slice is strictly ascending — occupies `n` consecutive positions.
+    /// Front runs advance `head` (O(1), the GC-19 common case); mid-slice
+    /// runs fall back to `Vec::drain`.
+    fn take_run(&mut self, start: u64, n: u64) {
+        let n = usize::try_from(n).expect("run length fits usize (find_run did)");
+        let pos = self
+            .live()
+            .binary_search(&start)
+            .expect("picked id present in the remaining set");
+        if pos == 0 {
+            self.head += n;
+        } else {
+            self.ids.drain(self.head + pos..self.head + pos + n);
+        }
+        debug_assert!(self.head <= self.ids.len());
+    }
+}
+
 /// A root-to-leaf descent path: `(pgno, ki)` per level (SPEC 03 §1 cursor
 /// shape). `ki` is the chosen child index on branches and the entry/insertion
 /// slot on the leaf.
@@ -394,11 +455,12 @@ pub struct RwTxn<'env> {
     /// again this txn also lands here (it is this-txn-private after the gate).
     loose: Vec<u64>,
     /// GC-20 drain bookkeeping (ADR-0005 D1): for every GC entry `F` this txn
-    /// drew from, the **remaining** (still-free, sorted-ascending) ids. Loaded
-    /// from the tree PIL on first touch; `freelist_save` step (a) rewrites the
-    /// remainder (or deletes the entry when empty). `BTreeMap` so iteration is
-    /// ascending-`F`, matching the GC-18 scan.
-    drains: BTreeMap<u64, Vec<u64>>,
+    /// drew from, the **remaining** (still-free, sorted-ascending) ids —
+    /// [`Drain::live`], a consumed-prefix view so the GC-19 front pop is O(1).
+    /// Loaded from the tree PIL on first touch; `freelist_save` step (a)
+    /// rewrites the remainder (or deletes the entry when empty). `BTreeMap` so
+    /// iteration is ascending-`F`, matching the GC-18 scan.
+    drains: BTreeMap<u64, Drain>,
     /// Every pgno handed out by a GC draw this txn (ADR-0005 D1): feeds the
     /// generalized TXN-62 assert at C2 and the loose classification in
     /// [`RwTxn::free_page`]. Pgno-hashed (issue #9): engine-authored keys,
@@ -889,6 +951,9 @@ impl<'env> RwTxn<'env> {
     /// Serve a contiguous `n`-page run from the loose list (GcSave only; see
     /// [`RwTxn::allocate`]). A loose run that abuts `next_pgno` may be
     /// completed by extension. Returns the run's head pgno.
+    // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
+    // arms stay separate so their size never moves it (PERF-GAP B13).
+    #[inline(never)]
     fn loose_run(&mut self, n: u64) -> Option<u64> {
         debug_assert!(self.alloc_mode == AllocMode::GcSave);
         if self.loose.is_empty() {
@@ -934,11 +999,14 @@ impl<'env> RwTxn<'env> {
     /// entry passed `F ≤ oldest_reader()` when first loaded during ops, and
     /// any reader that pins *after* that pins the published snapshot
     /// `≥ writer_txnid − 1 ≥ F`, from whose trees these pages are absent.
+    // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
+    // arms stay separate so their size never moves it (PERF-GAP B13).
+    #[inline(never)]
     fn save_pool_draw(&mut self, n: u64) -> Option<u64> {
         debug_assert!(self.alloc_mode == AllocMode::GcSave);
         let mut hit: Option<(u64, u64)> = None;
         for (f, remaining) in &self.drains {
-            if let Some(start) = find_run(remaining, n) {
+            if let Some(start) = find_run(remaining.live(), n) {
                 hit = Some((*f, start));
                 break;
             }
@@ -949,10 +1017,7 @@ impl<'env> RwTxn<'env> {
         #[cfg(debug_assertions)]
         self.debug_assert_gate(f);
         let remaining = self.drains.get_mut(&f).expect("pool entry present");
-        let pos = remaining
-            .binary_search(&start)
-            .expect("picked id present in the remaining set");
-        remaining.drain(pos..pos + n as usize);
+        remaining.take_run(start, n);
         for p in start..start + n {
             let first_time = self.reclaimed.insert(p);
             debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
@@ -1024,6 +1089,9 @@ impl<'env> RwTxn<'env> {
     /// (smallest id for `n == 1` — GC-19; first within-PIL contiguous run for
     /// `n > 1` — GC-15/21), record the drain in `self.drains` (the tree entry
     /// itself is rewritten only at C1, GC-20) and return the head pgno.
+    // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
+    // arms stay separate so their size never moves it (PERF-GAP B13).
+    #[inline(never)]
     fn gc_reclaim(&mut self, n: u64) -> Result<Option<u64>> {
         debug_assert!(
             self.alloc_mode == AllocMode::Normal,
@@ -1053,7 +1121,7 @@ impl<'env> RwTxn<'env> {
                 }
                 match self.drains.get(&f) {
                     Some(remaining) => {
-                        if let Some(start) = find_run(remaining, n) {
+                        if let Some(start) = find_run(remaining.live(), n) {
                             found = Some(Pick {
                                 f,
                                 fresh: None,
@@ -1094,13 +1162,10 @@ impl<'env> RwTxn<'env> {
         #[cfg(debug_assertions)]
         self.debug_assert_gate(f);
         let remaining = match fresh {
-            Some(ids) => self.drains.entry(f).or_insert(ids),
+            Some(ids) => self.drains.entry(f).or_insert(Drain::new(ids)),
             None => self.drains.get_mut(&f).expect("drain entry present"),
         };
-        let pos = remaining
-            .binary_search(&start)
-            .expect("picked id present in the remaining set");
-        remaining.drain(pos..pos + n as usize);
+        remaining.take_run(start, n);
         for p in start..start + n {
             let first_time = self.reclaimed.insert(p);
             debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
@@ -2650,7 +2715,7 @@ impl<'env> RwTxn<'env> {
         // across the whole save are bounded by (initial entries) + (total
         // pool ids) + slack. A regression confined to the inner loop panics
         // loudly instead of hanging.
-        let inner_budget = pending.len() + self.drains.values().map(Vec::len).sum::<usize>() + 16;
+        let inner_budget = pending.len() + self.drains.values().map(Drain::len).sum::<usize>() + 16;
         let mut inner_iters = 0usize;
         // (b) GC-10 trailing shrink of ops-era loose pages, then GC-9: the
         // survivors join the freed set up front (LMDB parity — the fork's
@@ -2683,7 +2748,13 @@ impl<'env> RwTxn<'env> {
                     inner_iters <= inner_budget,
                     "freelist_save drain-rewrite loop exceeded its budget (GC-13)"
                 );
-                let remaining = self.drains.get(&f).cloned().unwrap_or_default();
+                // GC-20 rewrite payload: exactly the live remainder — the
+                // consumed prefix never reaches the tree, so the encoded PIL
+                // is identical to the drain-on-every-draw representation's.
+                let remaining: Vec<u64> = self
+                    .drains
+                    .get(&f)
+                    .map_or(Vec::new(), |d| d.live().to_vec());
                 if remaining.is_empty() {
                     self.drains.remove(&f);
                     let existed = self.delete_tree(TreeId::Free, &gc_key_encode(f))?;
@@ -3447,6 +3518,82 @@ mod tests {
         assert_eq!(find_run(&[2, 3, 4, 5, 6], 3), Some(2));
         // Gaps split runs.
         assert_eq!(find_run(&[2, 4, 6, 8], 2), None);
+    }
+
+    /// GC-19 common case: a front draw advances `head` (no memmove) and the
+    /// live view shrinks from the front.
+    #[test]
+    fn drain_front_pop_advances_head() {
+        let mut d = Drain::new(vec![5, 9, 10, 11]);
+        d.take_run(5, 1);
+        assert_eq!(d.live(), &[9, 10, 11]);
+        assert_eq!((d.head, d.ids.len()), (1, 4), "front pop must not memmove");
+        // A front *run* draw also advances head, by n.
+        d.take_run(9, 2);
+        assert_eq!(d.live(), &[11]);
+        assert_eq!((d.head, d.ids.len()), (3, 4));
+        assert_eq!(d.len(), 1);
+    }
+
+    /// The rare mid-slice run removal (n > 1, run not at the live front)
+    /// falls back to `Vec::drain` and preserves order around the hole.
+    #[test]
+    fn drain_mid_slice_run_removal() {
+        let mut d = Drain::new(vec![2, 6, 7, 8, 12]);
+        // Consume the front first so the mid removal happens behind a
+        // non-zero head.
+        d.take_run(2, 1);
+        assert_eq!(d.live(), &[6, 7, 8, 12]);
+        let start = find_run(d.live(), 2).unwrap();
+        assert_eq!(start, 6);
+        // Remove [7, 8] — a run strictly inside the live slice.
+        d.take_run(7, 2);
+        assert_eq!(d.live(), &[6, 12]);
+        assert_eq!(d.len(), 2);
+    }
+
+    /// Fully drained: the live view is empty however the ids were consumed —
+    /// the state `freelist_save` step (a) turns into a tree-entry delete.
+    #[test]
+    fn drain_fully_drained_is_empty() {
+        let mut d = Drain::new(vec![3, 4, 5]);
+        d.take_run(3, 2); // front run
+        d.take_run(5, 1); // last id
+        assert_eq!(d.live(), &[] as &[u64]);
+        assert_eq!(d.len(), 0);
+
+        let mut d = Drain::new(vec![3, 4, 5]);
+        d.take_run(4, 2); // mid/tail run first
+        d.take_run(3, 1);
+        assert_eq!(d.live(), &[] as &[u64]);
+    }
+
+    /// GC-20 byte-identity guarantee: for a mixed draw sequence, the live
+    /// remainder equals what the previous representation (binary_search +
+    /// `Vec::drain` on every draw) would encode into the rewritten PIL.
+    #[test]
+    fn drain_remainder_matches_old_drain_algorithm() {
+        // Reference: the pre-Drain algorithm, verbatim.
+        fn naive_take(ids: &mut Vec<u64>, start: u64, n: u64) {
+            let pos = ids.binary_search(&start).unwrap();
+            ids.drain(pos..pos + n as usize);
+        }
+        // Ascending ids with runs and gaps.
+        let init: Vec<u64> = vec![2, 3, 4, 5, 8, 9, 10, 14, 15, 20, 21, 22, 23, 30];
+        let mut d = Drain::new(init.clone());
+        let mut naive = init;
+        // Draw with GC-19/GC-18 pick rules (n == 1 -> front; n > 1 -> first
+        // run), interleaving sizes so front pops and mid-slice removals mix.
+        for n in [1u64, 3, 1, 2, 1, 4, 1, 1, 2] {
+            let pick = find_run(d.live(), n);
+            assert_eq!(pick, find_run(&naive, n), "pick diverged at n={n}");
+            let Some(start) = pick else { continue };
+            d.take_run(start, n);
+            naive_take(&mut naive, start, n);
+            assert_eq!(d.live(), naive.as_slice(), "remainder diverged at n={n}");
+        }
+        assert_eq!(d.live(), &[] as &[u64], "sequence sized to drain fully");
+        assert!(naive.is_empty());
     }
 
     fn kv(i: u32) -> (Vec<u8>, Vec<u8>) {
