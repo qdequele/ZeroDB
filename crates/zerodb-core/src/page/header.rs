@@ -237,6 +237,8 @@ impl<'a> PageRef<'a> {
 
 /// Validate the free-space bounds of a branch/leaf page against the body size,
 /// shared by the tree views. Returns `(lower, upper)` on success.
+// Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+#[inline(always)]
 pub(crate) fn read_and_check_bounds(buf: &[u8], psize: u32) -> Result<(u16, u16), PageError> {
     let body_size = psize as usize - HEADER_SIZE;
     let lower = read_u16(buf, tree::OFF_LOWER);

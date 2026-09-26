@@ -66,6 +66,8 @@ pub enum LeafValue<'a> {
 
 /// Compute the padded length of the leaf cell at absolute offset `abs`, bounds-
 /// checking every field read against `psize`.
+// Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+#[inline(always)]
 fn leaf_cell_len(buf: &[u8], abs: usize, psize: u32) -> Result<usize, PageError> {
     let body = body_size(psize);
     let rel = abs - HEADER_SIZE;
@@ -696,6 +698,8 @@ impl<'a> BranchRef<'a> {
 
     /// As [`Self::child_index`], under an explicit ordering (milestone 2.4).
     #[must_use]
+    // Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+    #[inline(always)]
     pub fn child_index_with(&self, key: &[u8], cmp: KeyCmp<'_>) -> usize {
         // Node 0 is -inf and always qualifies; scan separators 1..num_keys.
         let n = self.num_keys();

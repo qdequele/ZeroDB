@@ -592,6 +592,21 @@ Three consequences:
    the threshold change shape when a neighbour changes, which moved unrelated
    write rungs by 1–9 %.
 
+**Amendment 2026-09-26: lever landed (source-level, no LLVM flag).** The
+first try, `#[cold]` arms plus `#[inline]` hints, was flat and was reverted:
+`#[inline]` only makes a function eligible, and LLVM's cost model still
+declined. An `nm` diff of the gate builds (CGU1 vs CGU1 + threshold 1000)
+named what LLVM inlines only at the raised threshold. Forcing exactly those
+with `#[inline(always)]` (`bytes_from_classified`, `ValidatedPages::contains`,
+`node_view`, `Cursor::leaf_at`, `BranchRef::child_index_with`,
+`leaf_cell_len`, `read_and_check_bounds`, `OverflowRef::new`; `#[inline]` on
+heed-zerodb `Database::get`) gives, at CGU1 (Meilisearch's build):
+`get/access/hot` 1.37× → 1.11×, `get/db/named` 1.56× → 1.33×,
+`scan/edge/first_last` 2.22× → 1.56×, `seek/ge/rand` 1.46× → 1.27×,
+`put/order/seq` 1.23× → 1.10×, `put/api/reserved` 1.33× → 1.18×; deletes
+10–12 % faster, `mixed/rw/8dbs` 1.20× → 1.10×. It improved 37 rungs at CGU1
+and 31 at CGU16, and regressed none in either build (bench server).
+
 Lever: consumers will not set an LLVM flag, so the fix is at the source level.
 Shrink the hot bodies below the default threshold: `#[cold]` /
 `#[inline(never)]` on the memo-miss, full-validation, error and

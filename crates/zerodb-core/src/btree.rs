@@ -99,6 +99,8 @@ impl<'a> Source<'a> {
     /// commit C2 — including WRITE_MAP, TXN-45a — so the map never changes
     /// under a live txn). Dirty frames mutate mid-txn and must never be
     /// trusted from a memo.
+    // Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+    #[inline(always)]
     pub(crate) fn bytes_from_classified(
         &self,
         psize: u32,
@@ -221,6 +223,8 @@ impl ValidatedPages {
         z ^ (z >> 31)
     }
 
+    // Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+    #[inline(always)]
     fn contains(&self, pgno: u64, kind: PageKind) -> bool {
         let key = Self::key_of(pgno, kind);
         // Ordering: `Acquire` here pairs with the `Release` slot publication
@@ -406,6 +410,8 @@ pub(crate) enum NodeView<'a> {
     Branch(BranchRef<'a>),
 }
 
+// Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+#[inline(always)]
 pub(crate) fn node_view<'a>(
     src: Source<'a>,
     psize: u32,
@@ -751,6 +757,8 @@ impl<'a> Cursor<'a> {
     /// The validated leaf view for `pgno`, reusing the memoized one while the
     /// cursor stays on the same page (see [`Cursor::leaf_cache`]). A miss goes
     /// through the txn's validated-pages memo ([`leaf_view`]).
+    // Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+    #[inline(always)]
     fn leaf_at(&self, pgno: u64) -> Result<LeafRef<'a>, PageError> {
         if let Some((cached, leaf)) = self.leaf_cache.get() {
             if cached == pgno {
