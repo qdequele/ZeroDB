@@ -677,8 +677,36 @@ Delete the entry at `ki[top]`. Frees an associated overflow run (§8). Then
 positioned so that a following `next` yields the entry that followed the deleted
 one (LMDB leaves `ki[top]` pointing at the successor slot; if the page was
 merged/rebalanced, the cursor is fixed up per §5.4). `delete(key)` (SPEC 00 r36)
-= `set(key)` then `del_current`, returning whether the key existed;
-`delete_range` (r37) and `clear` (r38) are cursor walks / whole-tree resets.
+= `set(key)` then `del_current`, returning whether the key existed; `clear`
+(r38) is a whole-tree reset.
+
+**`delete_range` (r37) is leaf-granular (2026-09-27).** heed over LMDB
+realizes r37 as a `range_mut` walk with one `mdb_cursor_del` per entry; LMDB
+has no bulk range-delete primitive, so there is no LMDB technique to mirror
+here. ZeroDB instead deletes one **leaf span** at a time: position at the
+first covered key with the same seek + bound tests as `range` (§2.0/§4 —
+every `Bound` combination, inverted bounds and custom comparators behave
+exactly as the per-entry walk did), then for each leaf intersecting the
+range: COW its root-to-leaf path once (§5.3), free the covered `F_BIGDATA`
+runs (§8, decrementing `overflow_pages`), splice the whole covered cell span
+out in one heap compaction (`LeafMut::remove_span`, equivalent to that many
+single removes), decrement `entries` by the span, and rebalance that leaf
+once through the ordinary §10 path. A span that ran to the leaf's end may
+leave covered keys in later leaves: the walk re-descends at the first key
+after the last deleted one — no cursor path is trusted across the rebalance
+(§5.4a). A span that stopped mid-leaf hit the upper bound and ends the walk.
+One exception to “rebalance once per leaf”: the **range-start** leaf — the
+only leaf that can keep uncovered survivors *in front of* its span — defers
+its rebalance to the **end of the walk** when covered keys continue past it
+(rebalanced mid-walk, a below-threshold boundary leaf would borrow the next
+leaf's still-covered entries back one at a time). Deferring is sound: the
+survivors keep it non-empty, and the fill threshold is a delete-time trigger,
+not a committed invariant (§11 INV-8); the walk settles it with one
+re-descent to a surviving key once the range is gone.
+The observable result (returned count, surviving entries, bound semantics,
+stat counters) is identical to the per-entry walk; only the page-touch
+pattern differs — one COW + one rebalance per covered leaf, and no
+materialized key list.
 
 **Position after the delete (PINNED 2026-09-10).** The contract above was
 asserted from M1.4 onward but never differentially observed: the oracle's
@@ -769,6 +797,8 @@ rebalance(page P at cursor):
     choose a sibling:
         if P is the leftmost child of its parent: sibling = right neighbor (fromleft=false)
         else: sibling = left neighbor (fromleft=true)
+    if P is an EMPTY leaf (0 keys) AND this is delete_range's walk:
+        MERGE (below) — never borrow into it
     if sibling is above threshold AND has > min_keys:
         BORROW one entry from the sibling across the parent separator (node_move)
         update the parent separator key accordingly
@@ -785,6 +815,18 @@ rebalance(page P at cursor):
 - **Borrow** (a.k.a. rotate / `node_move`): moves the boundary entry from the
   fuller sibling into `P` and rewrites the parent separator so ordering holds.
   Preferred when it avoids a merge (keeps height stable).
+- **Empty page, walk mode** (2026-09-27): inside `delete_range`'s leaf walk
+  (only), a leaf left with **zero** entries always takes the merge arm,
+  whatever the sibling's fill — the combination trivially fits. The outcome
+  mirrors LMDB's `mdb_rebalance`, which *unlinks* an empty page from its
+  parent rather than feeding it: merging nothing-plus-sibling through the
+  left-absorbs-right rule leaves exactly that tree (one surviving page of the
+  pair under the parent). Without it, borrowing into an emptied leaf would
+  trickle a still-covered right sibling across, one separator rewrite per
+  entry. Point/cursor deletes keep the neighbor policy above unconditionally:
+  they can only reach an empty page from a 1-entry-above-threshold leaf (a
+  rare wide-entry corner), and their steady-state churn shape is pinned by
+  the reclamation flatness tests.
 - **Merge** direction: LMDB always merges the *right* page into the *left* one
   (when the underful page is the right sibling it merges itself into the left;
   when it is the left it merges the right into itself). ZeroDB follows the same

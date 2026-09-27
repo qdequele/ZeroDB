@@ -845,6 +845,22 @@ Bench server, x86-64, 4 KiB: `del/cursor/drain` 2.91× → 2.63× (CGU1, 3 round
 `del/bulk/half` / `del/range/half` +3.5–5 % under LMDB drift; the re-run read
 them flat (+1.5–3.2 %, within ±4–5 %).
 
+### B23. `delete_range` collected every key, then point-deleted each — **DONE 2026-09-27 (beyond LMDB)**
+`Database::delete_range` copied every covered key into a `Vec<Vec<u8>>`
+(~50–60 MB for a 90 % delete of 1M keys) and called `delete_tree` per key: a
+root-to-leaf descent and possible rebalance each. heed over LMDB implements it
+as `range_mut` + one `mdb_cursor_del` per entry; LMDB has no bulk range-delete
+primitive, so this lever deliberately goes past it. The walk now splices each
+covered leaf's cells out in one pass (`LeafMut::remove_span`), frees covered
+overflow runs, and rebalances each touched leaf once; the range-start leaf is
+rebalanced once at the end, and on this path an emptied leaf merges instead of
+being borrowed into (the outcome of LMDB's own empty-page unlink). Point and
+cursor deletes keep the old policy. SPEC 03 describes the walk.
+
+Bench server, x86-64, 4 KiB: `del/range/half` 2.63× → **0.92×** (CGU1, 3 rounds,
+0.351) and 2.58× → 0.97× (CGU16, 1 round, 0.375); the other 17 `put/*` and
+`del/*` rungs flat in both builds.
+
 ## C. RAM (peak memory)
 
 ### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**

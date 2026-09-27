@@ -201,6 +201,12 @@ impl Drain {
 /// slot on the leaf.
 type Path = Vec<(u64, usize)>;
 
+/// One `delete_range` leaf step (SPEC 03, delete_range note): entries
+/// deleted, the resume key (set when the span ran to its leaf's end), and
+/// the deferred-rebalance anchor (set when the leaf kept survivors in front
+/// of the span).
+type LeafSpan = (u64, Option<Vec<u8>>, Option<Vec<u8>>);
+
 /// What a delete's rebalance ([`RwTxn::rebalance`]) did to the root-to-leaf
 /// path it was handed (SPEC 03 §5.4a): the parked write cursor keeps, pops,
 /// or discards its path based on this.
@@ -2123,7 +2129,191 @@ impl<'env> RwTxn<'env> {
                 .map_err(corrupt)?;
         }
         let top = path.len() - 1;
-        self.rebalance(tree, path, top)
+        self.rebalance(tree, path, top, false)
+    }
+
+    /// One leaf step of `Database::delete_range` (SPEC 00 row 37; SPEC 03,
+    /// delete_range note): descend to `first` — a key the caller just read from this
+    /// tree's range, so it exists and is covered by both bounds — splice the
+    /// whole covered span of its leaf out in one compaction, and rebalance
+    /// that leaf once. Returns the number of entries deleted and, when the
+    /// span ran to the leaf's end (covered keys may remain in later leaves),
+    /// the last deleted key for the caller to resume strictly after; `None`
+    /// means the span stopped at the upper bound and the walk is done. The
+    /// third element is the walk's deferred-rebalance anchor, when this leaf
+    /// kept survivors in front of the span (see the body).
+    fn delete_range_leaf(
+        &mut self,
+        tree: TreeId,
+        first: &[u8],
+        upper: std::ops::Bound<&[u8]>,
+    ) -> Result<LeafSpan> {
+        self.guard_ok()?;
+        let mut path = std::mem::take(&mut self.path_buf);
+        let res = self.delete_range_leaf_inner(tree, first, upper, &mut path);
+        self.path_buf = path;
+        res
+    }
+
+    /// [`delete_range_leaf`](Self::delete_range_leaf) body, split out so the
+    /// path buffer is restored on every exit.
+    fn delete_range_leaf_inner(
+        &mut self,
+        tree: TreeId,
+        first: &[u8],
+        upper: std::ops::Bound<&[u8]>,
+        path: &mut Path,
+    ) -> Result<LeafSpan> {
+        use std::ops::Bound;
+        let found = self.search_path_into(tree, first, path)?;
+        // `first` was read from this txn's own tree with no mutation in
+        // between, so the descent lands on it; degrade to "walk done" rather
+        // than mutate anything if it somehow does not.
+        debug_assert!(found, "delete_range re-descent lost the key it just read");
+        let Some(&(lpg, start)) = path.last() else {
+            return Ok((0, None, None));
+        };
+        // Scan the covered span `[start, end)` and collect its overflow runs
+        // on the untouched leaf; COW happens once the span is known.
+        let (end, bigs, last, anchor) = {
+            let cmp = self.tree_comparator(tree);
+            let leaf = match node_view(self.source(), self.psize, lpg, Some(&self.validated))
+                .map_err(corrupt)?
+            {
+                NodeView::Leaf(l) => l,
+                NodeView::Branch(_) => return Err(Error::Mdb(MdbError::Invalid)),
+            };
+            let nkeys = leaf.num_keys();
+            let mut bigs: Vec<(u64, u64)> = Vec::new();
+            let mut end = start;
+            while end < nkeys {
+                let key = leaf.key(end);
+                // The exact upper-bound test `RoRange` terminates on, under
+                // the tree's ordering (SPEC 03 §2.0) — anything else would
+                // stop the splice at a different entry than the per-entry
+                // walk this replaces.
+                let covered = match upper {
+                    Bound::Unbounded => true,
+                    Bound::Included(h) => cmp.compare(key, h) != Ordering::Greater,
+                    Bound::Excluded(h) => cmp.compare(key, h) == Ordering::Less,
+                };
+                if !covered {
+                    break;
+                }
+                if let LeafValue::Overflow { head_pgno, dsize } = leaf.value(end) {
+                    bigs.push((head_pgno, overflow_page_count(dsize as u64, self.psize)));
+                }
+                end += 1;
+            }
+            if end == start {
+                // Unreachable when `found` (the caller's range test proved
+                // `first` covered); bail without mutating rather than splice
+                // an empty span.
+                debug_assert!(!found, "a found first key must be covered");
+                return Ok((0, None, None));
+            }
+            // Only a span that ran to the leaf's end can leave covered keys
+            // in later leaves (every key between two leaf boundaries lives in
+            // this leaf); a mid-leaf stop hit the upper bound.
+            let last = (end == nkeys).then(|| leaf.key(end - 1).to_vec());
+            // Uncovered survivors in front of the span (`start > 0`) only
+            // exist on the walk's first leaf: every later `first` is the
+            // smallest key past the previous leaf's last deleted key, so
+            // nothing uncovered can sit before it. When the walk continues
+            // past this leaf, its rebalance is deferred to the end of the
+            // walk (`anchor` = the survivor just before the span): rebalanced
+            // now, a below-threshold boundary leaf would borrow the next
+            // leaf's still-covered entries back one separator rewrite at a
+            // time, and the walk would re-delete each of them. Deferring is
+            // sound: the survivors keep the leaf non-empty (INV-8 holds), and
+            // the fill threshold is a delete-time trigger, not a committed
+            // invariant (SPEC 03 §11 INV-8).
+            let anchor = (start > 0 && last.is_some()).then(|| leaf.key(start - 1).to_vec());
+            (end, bigs, last, anchor)
+        };
+        let run = (end - start) as u64;
+        // Mutation phase: a failure past this point leaves partially-applied
+        // structure, so it poisons the txn exactly as `delete_at_path` does.
+        match self.delete_span_apply(tree, path, start, end, &bigs, anchor.is_none()) {
+            Ok(()) => {
+                sat_sub(&mut self.record_mut(tree).entries, run);
+                Ok((run, last, anchor))
+            }
+            Err(e) => {
+                self.errored = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// The delete_range walk's one deferred rebalance (SPEC 03, delete_range
+    /// note): the range-start leaf kept its uncovered survivors but may sit
+    /// below the fill threshold now that the walk is done. `anchor` is one of
+    /// those survivors; re-descend to it and rebalance its (possibly
+    /// since-merged) leaf through the ordinary §10 path — by now every
+    /// right neighbor is a survivor too, so this borrows or merges once.
+    fn delete_range_settle(&mut self, tree: TreeId, anchor: &[u8]) -> Result<()> {
+        self.guard_ok()?;
+        let mut path = std::mem::take(&mut self.path_buf);
+        let res = (|| {
+            let found = self.search_path_into(tree, anchor, &mut path)?;
+            debug_assert!(found, "deferred-rebalance anchor is a survivor");
+            if path.is_empty() {
+                return Ok(());
+            }
+            // The leaf is already dirty from its splice, so this COWs
+            // nothing new; `rebalance` requires a touched path.
+            self.touch_path(tree, &mut path)?;
+            let top = path.len() - 1;
+            self.rebalance(tree, &mut path, top, true).map(|_| ())
+        })();
+        self.path_buf = path;
+        if res.is_err() {
+            // Same poisoning as the splice: the walk's structure is applied.
+            self.errored = true;
+        }
+        res
+    }
+
+    /// Apply one `delete_range` leaf splice — the bulk sibling of
+    /// [`delete_apply`](Self::delete_apply): COW the path (§5.3), free the
+    /// span's overflow runs (§8), remove cells `[start, end)` in one
+    /// compaction, and — unless the walk deferred it — rebalance the leaf
+    /// once (§10). The caller adjusts `entries` and poisons the txn on
+    /// error. The rebalance's [`PathFate`] is dropped: the walk re-descends
+    /// from the last deleted key instead of trusting a repaired path across
+    /// leaves.
+    fn delete_span_apply(
+        &mut self,
+        tree: TreeId,
+        path: &mut [(u64, usize)],
+        start: usize,
+        end: usize,
+        bigs: &[(u64, u64)],
+        do_rebalance: bool,
+    ) -> Result<()> {
+        self.touch_path(tree, path)?;
+        let (lpg, _) = *path.last().expect("non-empty path");
+        let mut freed = 0u64;
+        for &(head, npages) in bigs {
+            self.free_run(head, npages);
+            freed += npages;
+        }
+        if freed != 0 {
+            sat_sub(&mut self.record_mut(tree).overflow_pages, freed);
+        }
+        {
+            let frame = self.dirty.bytes_mut(lpg).expect("leaf touched");
+            LeafMut::from_valid(frame, self.psize)
+                .map_err(corrupt)?
+                .remove_span(start, end)
+                .map_err(corrupt)?;
+        }
+        if !do_rebalance {
+            return Ok(());
+        }
+        let top = path.len() - 1;
+        self.rebalance(tree, path, top, true).map(|_| ())
     }
 
     /// Debug shadow check for a kept cursor path (SPEC 03 §5.4a): after a
@@ -2180,7 +2370,11 @@ impl<'env> RwTxn<'env> {
 
     /// §10 rebalance at `path[level]` after a delete/merge: root shrink at the
     /// root (§9); otherwise, when below threshold, borrow from (or merge with)
-    /// a sibling, recursing upward on merge.
+    /// a sibling, recursing upward on merge. `empty_leaf_merges` is
+    /// `delete_range`'s walk mode (SPEC 03 §10 empty-page rule): an emptied
+    /// leaf takes the merge arm outright instead of borrowing; every other
+    /// delete path passes `false` and keeps the historical neighbor policy
+    /// bit-for-bit (the churn-flatness pins depend on it).
     /// Returns the [`PathFate`] of `path` (SPEC 03 §5.4a): `Unchanged` when
     /// the delete only removed a cell from its leaf; `Kept`/`KeptShrunk` when
     /// the shape changed through the leftmost pairing (child 0 + its RIGHT
@@ -2192,6 +2386,7 @@ impl<'env> RwTxn<'env> {
         tree: TreeId,
         path: &mut [(u64, usize)],
         level: usize,
+        empty_leaf_merges: bool,
     ) -> Result<PathFate> {
         let (pgno, _) = path[level];
         let (is_leaf, nkeys, used) = self.page_stats(pgno)?;
@@ -2275,7 +2470,16 @@ impl<'env> RwTxn<'env> {
             return Err(Error::Mdb(MdbError::Invalid));
         }
         let can_borrow = if is_leaf {
-            s_nkeys > MIN_KEYS_LEAF && s_used * 1000 >= body * FILL_THRESHOLD_PERMILLE as usize
+            // Walk mode (§10 empty-page rule): a leaf `delete_range` emptied
+            // is never borrowed into. Forcing the merge arm reproduces the
+            // tree LMDB's `mdb_rebalance` leaves after *unlinking* an empty
+            // page — one surviving page of the pair under the parent — and it
+            // always fits (nothing + sibling <= one page). Borrowing here
+            // would leave the pair standing and trickle a fully-covered
+            // right sibling across, one separator rewrite per entry.
+            !(empty_leaf_merges && nkeys == 0)
+                && s_nkeys > MIN_KEYS_LEAF
+                && s_used * 1000 >= body * FILL_THRESHOLD_PERMILLE as usize
         } else {
             s_nkeys > MIN_KEYS_BRANCH
         };
@@ -2307,7 +2511,7 @@ impl<'env> RwTxn<'env> {
             } else {
                 PathFate::Kept
             };
-            let parent = self.rebalance(tree, path, level - 1)?;
+            let parent = self.rebalance(tree, path, level - 1, empty_leaf_merges)?;
             Ok(here.and(parent))
         }
     }
@@ -3408,6 +3612,17 @@ impl Database {
     /// `delete_range(txn, lower, upper)` (SPEC 00 row 37): delete every entry
     /// in the bound pair; returns the number deleted.
     ///
+    /// Works leaf-at-a-time (SPEC 03, delete_range note): position at the
+    /// first covered key, splice the whole covered span out of that leaf in
+    /// one compaction, rebalance the leaf once, and re-descend after the last
+    /// deleted key. heed over LMDB realizes row 37 as a cursor walk with one
+    /// `mdb_cursor_del` per entry — LMDB has no bulk range-delete primitive
+    /// to mirror — so this deliberately goes beyond LMDB's own technique: one
+    /// COW + one rebalance per covered leaf instead of one descent + one
+    /// rebalance per key, and no materialized key list. The observable result
+    /// (count, survivors, bound semantics, comparator order) is identical to
+    /// the per-entry walk it replaces.
+    ///
     /// # Errors
     ///
     /// As [`Database::delete`].
@@ -3418,19 +3633,45 @@ impl Database {
         upper: std::ops::Bound<&[u8]>,
     ) -> Result<u64> {
         let tree = txn.ensure_open(self.sel())?;
-        let keys: Vec<Vec<u8>> = {
-            let mut out = Vec::new();
-            for item in self.range(&*txn, lower, upper) {
-                let (k, _) = item?;
-                out.push(k.to_vec());
-            }
-            out
-        };
         let mut n = 0u64;
-        for k in &keys {
-            if txn.delete_tree(tree, k)? {
-                n += 1;
+        // The key the walk resumes strictly after (`None` = start at
+        // `lower`): always the last key deleted from the previous leaf, so
+        // every descent runs against the already-rebalanced tree — no saved
+        // path is trusted across a rebalance (SPEC 03 §5.4a).
+        let mut resume: Option<Vec<u8>> = None;
+        // The range-start leaf's deferred rebalance anchor (at most one, set
+        // on the first leaf — see `delete_range_leaf_inner`).
+        let mut deferred: Option<Vec<u8>> = None;
+        loop {
+            // Read phase: the first still-covered key, through the same
+            // iterator `range` uses, so every `Bound` combination, inverted
+            // bounds, and a custom comparator (SPEC 03 §2.0) position
+            // identically to the per-entry walk this replaces.
+            let lo = match &resume {
+                None => lower,
+                Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+            };
+            let first: Vec<u8> = match self.range(&*txn, lo, upper).next() {
+                None => break,
+                Some(item) => item?.0.to_vec(),
+            };
+            let (deleted, last, anchor) = txn.delete_range_leaf(tree, &first, upper)?;
+            n += deleted;
+            if anchor.is_some() {
+                deferred = anchor;
             }
+            match last {
+                // The covered span ran to its leaf's end: covered keys may
+                // remain in later leaves.
+                Some(k) => resume = Some(k),
+                // The span stopped at the upper bound: nothing covered is
+                // left.
+                None => break,
+            }
+        }
+        // Settle the boundary leaf the walk left below the fill threshold.
+        if let Some(anchor) = &deferred {
+            txn.delete_range_settle(tree, anchor)?;
         }
         Ok(n)
     }
@@ -4835,6 +5076,306 @@ mod tests {
             let survivors: Vec<Vec<u8>> = model.keys().cloned().collect();
             proptest::prop_assert_eq!(rest, survivors);
             proptest::prop_assert_eq!(db.len(&txn).unwrap(), 0);
+        }
+    }
+
+    // -- delete_range (leaf-granular, SPEC 00 r37) ----------------------------
+
+    /// Reference model: the keys of `model` covered by the bound pair under
+    /// memcmp order (the main DB's ordering).
+    fn covered_keys(
+        model: &BTreeMap<Vec<u8>, Vec<u8>>,
+        lower: &std::ops::Bound<Vec<u8>>,
+        upper: &std::ops::Bound<Vec<u8>>,
+    ) -> Vec<Vec<u8>> {
+        use std::ops::Bound;
+        model
+            .keys()
+            .filter(|k| {
+                let lo_ok = match lower {
+                    Bound::Unbounded => true,
+                    Bound::Included(l) => *k >= l,
+                    Bound::Excluded(l) => *k > l,
+                };
+                let hi_ok = match upper {
+                    Bound::Unbounded => true,
+                    Bound::Included(h) => *k <= h,
+                    Bound::Excluded(h) => *k < h,
+                };
+                lo_ok && hi_ok
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Drive one leaf-granular `delete_range` against a fresh env seeded with
+    /// `entries`, and assert every observable against the `BTreeMap` model:
+    /// the returned count, the survivors by full dump and by point gets, the
+    /// `entries` stat, and exact `overflow_pages` accounting (only surviving
+    /// big values may keep runs).
+    fn check_delete_range_case(
+        entries: &BTreeMap<Vec<u8>, Vec<u8>>,
+        lower: std::ops::Bound<Vec<u8>>,
+        upper: std::ops::Bound<Vec<u8>>,
+    ) {
+        use std::ops::Bound;
+        let env = mem_env(PS, 8 << 20);
+        let db = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        for (k, v) in entries {
+            db.put(&mut txn, k, v).unwrap();
+        }
+        let mut model = entries.clone();
+        let removed = covered_keys(&model, &lower, &upper);
+        for k in &removed {
+            model.remove(k);
+        }
+        fn as_ref(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+            match b {
+                Bound::Unbounded => Bound::Unbounded,
+                Bound::Included(k) => Bound::Included(k.as_slice()),
+                Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
+            }
+        }
+        let n = db
+            .delete_range(&mut txn, as_ref(&lower), as_ref(&upper))
+            .unwrap();
+        assert_eq!(n, removed.len() as u64, "returned count");
+        assert_eq!(db.len(&txn).unwrap(), model.len() as u64, "entries stat");
+        let left: Vec<(Vec<u8>, Vec<u8>)> =
+            model.iter().map(|(a, b)| (a.clone(), b.clone())).collect();
+        assert_eq!(dump(&txn), left, "survivors by dump");
+        for k in entries.keys() {
+            let want = model.get(k).map(Vec::as_slice);
+            assert_eq!(db.get(&txn, k).unwrap(), want, "point get");
+        }
+        let want_ovf: u64 = model
+            .iter()
+            .filter(|(k, v)| !value_is_inline(k.len(), v.len() as u64, PS))
+            .map(|(_, v)| overflow_page_count(v.len() as u64, PS))
+            .sum();
+        assert_eq!(
+            db.stat(&txn).unwrap().overflow_pages,
+            want_ovf,
+            "overflow_pages stat"
+        );
+    }
+
+    #[test]
+    fn delete_range_bound_combinations_and_edges() {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        // Wide cells keep leaf fanout low, so interior ranges cross whole
+        // leaves, partially-covered leaves, and both tree edges. Sizes are
+        // miri-scaled like the proptest case counts.
+        let n = miri_scaled(120, 30);
+        let vlen = if cfg!(miri) { 40 } else { 300 } as usize;
+        let mut entries = BTreeMap::new();
+        for i in 0..n {
+            entries.insert(
+                format!("k{i:03}").into_bytes(),
+                vec![b'v'; vlen + (i % 7) as usize],
+            );
+        }
+        // Bound keys as fractions of the key space, so the shapes survive
+        // the miri scaling; `kx` lands between two keys.
+        let k = |i: u32| format!("k{i:03}").into_bytes();
+        let kx = |i: u32| format!("k{i:03}x").into_bytes();
+        // Empty db.
+        check_delete_range_case(&BTreeMap::new(), Unbounded, Unbounded);
+        // Full wipe across many leaves.
+        check_delete_range_case(&entries, Unbounded, Unbounded);
+        // Interior range spanning several leaves.
+        check_delete_range_case(&entries, Included(k(n / 12)), Excluded(k(5 * n / 6)));
+        // Both ends exclusive, bounds falling between keys.
+        check_delete_range_case(&entries, Excluded(kx(n / 12)), Excluded(kx(5 * n / 6)));
+        // Single key, surrounded by every bound kind.
+        check_delete_range_case(&entries, Included(k(n / 2)), Included(k(n / 2)));
+        check_delete_range_case(&entries, Excluded(k(n / 2)), Included(k(n / 2 + 1)));
+        check_delete_range_case(&entries, Included(k(n / 2 + 1)), Excluded(k(n / 2 + 2)));
+        // Empty ranges: Excluded/Excluded on one key, inverted bounds.
+        check_delete_range_case(&entries, Excluded(k(n / 2)), Excluded(k(n / 2)));
+        check_delete_range_case(&entries, Included(k(5 * n / 6)), Included(k(n / 12)));
+        // Tree edges: a prefix drain and a suffix drain.
+        check_delete_range_case(&entries, Unbounded, Excluded(k(n / 6)));
+        check_delete_range_case(&entries, Included(k(5 * n / 6)), Unbounded);
+        // Bounds entirely outside the key space.
+        check_delete_range_case(&entries, Included(b"x".to_vec()), Unbounded);
+        check_delete_range_case(&entries, Unbounded, Excluded(b"a".to_vec()));
+    }
+
+    #[test]
+    fn delete_range_frees_covered_overflow_runs_only() {
+        use std::ops::Bound::{Excluded, Included};
+        // Every 5th value overflows; the range covers some of each kind and
+        // leaves overflow values alive on both sides.
+        let n = miri_scaled(40, 15);
+        let mut entries = BTreeMap::new();
+        for i in 0..n {
+            let len = if i % 5 == 0 { 3000 + i as usize } else { 200 };
+            entries.insert(format!("k{i:03}").into_bytes(), vec![b'o'; len]);
+        }
+        check_delete_range_case(
+            &entries,
+            Included(format!("k{:03}", n / 8).into_bytes()),
+            Excluded(format!("k{:03}", 3 * n / 4).into_bytes()),
+        );
+    }
+
+    #[test]
+    fn delete_range_poisoned_txn_refuses() {
+        // Same poisoning recipe as `map_full_poisons_txn`.
+        let env = mem_env(PS, 16 * PS as u64);
+        let db = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        let mut hit_full = false;
+        for i in 0..64u32 {
+            let key = format!("k{i:02}").into_bytes();
+            if db.put(&mut txn, &key, &vec![0u8; 3000]).is_err() {
+                hit_full = true;
+                break;
+            }
+        }
+        assert!(hit_full, "expected MapFull on a 16-page map");
+        let e = db
+            .delete_range(
+                &mut txn,
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Unbounded,
+            )
+            .unwrap_err();
+        assert!(matches!(e, Error::Mdb(MdbError::BadTxn)));
+    }
+
+    /// Child-1 separator of the root branch. On a freshly split, delete-free
+    /// tree it **equals** the second leaf's first key (SPEC 03 §11 INV-6:
+    /// equality holds for freshly built/split branches), which makes it an
+    /// exact leaf boundary for the shape pins below.
+    fn root_separator_1(txn: &RwTxn<'_>) -> Vec<u8> {
+        let rec = txn.main_db;
+        let frame = txn
+            .source()
+            .bytes_from(txn.psize, rec.root)
+            .expect("root readable");
+        BranchRef::new(frame, txn.psize)
+            .expect("root is a branch")
+            .key(1)
+            .to_vec()
+    }
+
+    /// §10 empty-page rule, walk mode (SPEC 03, 2026-09-27): a leaf that
+    /// `delete_range` empties is merged away by the very next rebalance —
+    /// never borrowed into. Deleting exactly the first leaf's keys of a
+    /// two-leaf tree must therefore collapse it to one full leaf in that same
+    /// call; the borrow arm would instead pull one (uncovered) entry across
+    /// and leave both leaves standing. Point deletes keep the historical
+    /// neighbor policy (the gc_reclaim churn-flatness pin depends on it).
+    #[test]
+    fn delete_range_merges_emptied_leaf_instead_of_borrowing() {
+        let env = mem_env(PS, MAP);
+        let db = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        // Descending inserts avoid the append-split skew; wide entries keep
+        // the tree at exactly two leaves.
+        let total = 6u64;
+        for i in (0..total).rev() {
+            db.put(&mut txn, format!("k{i}").as_bytes(), &vec![b'w'; 1100])
+                .unwrap();
+        }
+        let pre = db.stat(&txn).unwrap();
+        assert_eq!(pre.depth, 2, "want a root branch over leaves");
+        assert!(pre.leaf_pages >= 2, "want at least two leaves: {pre:?}");
+        let boundary = root_separator_1(&txn);
+        // Exactly the first leaf: [-inf, second leaf's first key).
+        let n = db
+            .delete_range(
+                &mut txn,
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Excluded(boundary.as_slice()),
+            )
+            .unwrap();
+        assert!(n >= 1);
+        let stat = db.stat(&txn).unwrap();
+        assert_eq!(stat.entries, total - n);
+        // The emptied leaf merged with its (untouched, full) right sibling in
+        // the same call: one leaf gone. The borrow arm would have pulled one
+        // uncovered entry across and kept both leaves standing.
+        assert_eq!(
+            stat.leaf_pages,
+            pre.leaf_pages - 1,
+            "emptied leaf must merge away, not borrow"
+        );
+        let survivor = vec![b'w'; 1100];
+        assert_eq!(db.get(&txn, &boundary).unwrap(), Some(survivor.as_slice()));
+    }
+
+    /// Bound strategy for [`delete_range_matches_model`]: anchor on an
+    /// existing key (or its "between keys" successor, a 0-byte appended) and
+    /// a bound kind, independently per side — inverted and empty ranges
+    /// included.
+    fn bound_from(keys: &[Vec<u8>], pick: usize, kind: u8) -> std::ops::Bound<Vec<u8>> {
+        use std::ops::Bound;
+        if keys.is_empty() {
+            return Bound::Unbounded;
+        }
+        let k = keys[pick % keys.len()].clone();
+        match kind % 4 {
+            0 => Bound::Unbounded,
+            1 => Bound::Included(k),
+            2 => Bound::Excluded(k),
+            _ => {
+                let mut between = k;
+                between.push(0);
+                Bound::Included(between)
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            failure_persistence: None,
+            cases: if cfg!(miri) { 16 } else { 256 },
+            ..Default::default()
+        })]
+
+        /// Random key sets (a slice of the values overflow-sized), random
+        /// bound pairs anchored on existing keys: the leaf-granular
+        /// `delete_range` must match the `BTreeMap` model on count,
+        /// survivors, and stats. Small keys keep leaves wide; the wide-entry
+        /// unit tests above pin the many-leaf shapes. Sizes are miri-scaled
+        /// like the case count.
+        #[test]
+        fn delete_range_matches_model(
+            entries in proptest::collection::btree_map(
+                proptest::collection::vec(proptest::prelude::any::<u8>(), 1..24),
+                proptest::prelude::prop_oneof![
+                    // Inline values, element-random.
+                    4 => proptest::collection::vec(
+                        proptest::prelude::any::<u8>(),
+                        0..if cfg!(miri) { 40usize } else { 200 },
+                    ),
+                    // Overflow values (>= 2030 always overflows at 4 K for
+                    // keys < 24 bytes): a (len, fill) pair, not a per-element
+                    // vec — element-random 2.5 KB values made this the miri
+                    // long pole for no extra coverage.
+                    1 => proptest::prelude::Strategy::prop_map(
+                        (
+                            2030..if cfg!(miri) { 2060usize } else { 3300 },
+                            proptest::prelude::any::<u8>(),
+                        ),
+                        |(len, b)| vec![b; len],
+                    ),
+                ],
+                1..if cfg!(miri) { 16usize } else { 100 },
+            ),
+            lo_pick in 0usize..1024,
+            lo_kind in 0u8..4,
+            hi_pick in 0usize..1024,
+            hi_kind in 0u8..4,
+        ) {
+            let keys: Vec<Vec<u8>> = entries.keys().cloned().collect();
+            let lower = bound_from(&keys, lo_pick, lo_kind);
+            let upper = bound_from(&keys, hi_pick, hi_kind);
+            check_delete_range_case(&entries, lower, upper);
         }
     }
 }
