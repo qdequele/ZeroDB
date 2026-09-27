@@ -765,6 +765,31 @@ tried, the last with zero extra lock operations) is accepted by the maintainer
 for the gains on page-heavy writes; Meilisearch does not run empty write txns
 in a hot loop.
 
+### B19. Default key compare called `memcmp` on every probe — **DONE 2026-09-27 (maintainer override)**
+With the default ordering every binary-search probe (`leaf_lookup`,
+`BranchRef::child_index_with`) went through `a.cmp(b)`, a `memcmp` call. For
+two slices of equal length 8 or 4, big-endian integer order is exactly memcmp
+order, so `KeyCmp::Default` now compares those as one `u64`/`u32` each
+(Masstree-style key slices); every other length pair, and custom comparators,
+are unchanged. Proptests check it against slice order for all length pairs
+0..=16.
+
+Bench server, x86-64, 4 KiB (bench-ab; CGU1 3 rounds, CGU16 1 round):
+
+| rung | CGU16 | CGU1 |
+|---|---|---|
+| `get/access/hot` | 1.00× → 0.80× | 0.93× → 0.77× |
+| `get/val/v8` | 1.07× → 0.93× | 1.02× → 0.91× |
+| `put/order/seq` | 0.90× → 0.86× | 0.92× → 0.86× |
+| `seek/ge/rand` | 1.27× → 1.19× | 1.19× → 1.11× |
+| `get/key/k128` | 1.21× → 1.26× | 1.20× → 1.26× |
+
+25 / 20 rungs faster. Two caveats: most ladder rungs use 8-byte keys, so the
+gain is overstated for string keys; and long keys pay the length dispatch
+(`get/key/k128` +4–5 % in both builds). Kept by the maintainer: Meilisearch's
+hot trees key on 4-byte big-endian document ids and hannoy's on item ids, which
+take the fast path.
+
 ## C. RAM (peak memory)
 
 ### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**

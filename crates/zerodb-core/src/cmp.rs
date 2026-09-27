@@ -165,13 +165,38 @@ pub enum KeyCmp<'a> {
     Custom(&'a dyn Comparator),
 }
 
+/// Unsigned lexicographic byte comparison (the [`KeyCmp::Default`] ordering),
+/// with a fast path for equal-length 8- and 4-byte keys.
+///
+/// Meilisearch and hannoy key the hot trees on fixed-width big-endian integers
+/// (u32/u64 document and item ids), so almost every binary-search probe compares
+/// two slices of the same length 8 or 4. For equal-length slices, comparing them
+/// as big-endian integers is *identical* to memcmp order (the most significant
+/// differing byte decides both), so this returns exactly `a.cmp(b)` — but as one
+/// integer load and compare each rather than a `memcmp` call (roadmap 7e; the
+/// aarch64 hot path showed `bl _memcmp` on every probe, PERF-GAP B13). Every
+/// other length pair, including 8-vs-4, falls through to the slice comparison,
+/// which never reads past either slice's length.
+#[inline]
+fn default_cmp_fast(a: &[u8], b: &[u8]) -> Ordering {
+    match (a.len(), b.len()) {
+        // The `try_into` cannot fail — the arm guard fixes each length — and the
+        // fallible branch optimizes out; no bytes outside `a`/`b` are read.
+        (8, 8) => u64::from_be_bytes(a.try_into().unwrap())
+            .cmp(&u64::from_be_bytes(b.try_into().unwrap())),
+        (4, 4) => u32::from_be_bytes(a.try_into().unwrap())
+            .cmp(&u32::from_be_bytes(b.try_into().unwrap())),
+        _ => a.cmp(b),
+    }
+}
+
 impl KeyCmp<'_> {
     /// Compare two keys under this ordering.
     #[inline]
     #[must_use]
     pub fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
         match self {
-            KeyCmp::Default => a.cmp(b),
+            KeyCmp::Default => default_cmp_fast(a, b),
             KeyCmp::Custom(c) => c.compare(a, b),
         }
     }
@@ -358,6 +383,7 @@ impl std::fmt::Debug for ComparatorRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn rev() -> Box<dyn Comparator> {
         Box::new(FnComparator::new("test.reverse", |a: &[u8], b: &[u8]| {
@@ -417,5 +443,121 @@ mod tests {
         assert!(r.get(9).is_default());
         r.register(9, rev()).unwrap();
         assert!(r.get(9).is_default());
+    }
+
+    // --- roadmap 7e: equal-length integer-compare fast path ---
+
+    /// The 8-/4-byte fast path must return exactly memcmp order on the edges
+    /// that a naive integer compare could get wrong.
+    #[test]
+    fn fast_path_matches_memcmp_on_edges() {
+        // Equal keys, both widths.
+        assert_eq!(default_cmp_fast(&[0u8; 8], &[0u8; 8]), Ordering::Equal);
+        assert_eq!(default_cmp_fast(&[0xAB; 4], &[0xAB; 4]), Ordering::Equal);
+
+        // Differ only in the last (least-significant) byte.
+        let a8 = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut b8 = a8;
+        b8[7] = 9;
+        assert_eq!(default_cmp_fast(&a8, &b8), Ordering::Less);
+        assert_eq!(default_cmp_fast(&b8, &a8), Ordering::Greater);
+
+        // 0x00 vs 0xFF boundaries in the most-significant byte: memcmp treats
+        // bytes as unsigned, and so must the integer compare.
+        assert_eq!(default_cmp_fast(&[0x00u8; 8], &[0xFFu8; 8]), Ordering::Less);
+        assert_eq!(
+            default_cmp_fast(&[0xFFu8; 4], &[0x00u8; 4]),
+            Ordering::Greater
+        );
+        // High bit set in the leading byte must still be the *larger* value
+        // (unsigned), which a signed compare would get backwards.
+        assert_eq!(
+            default_cmp_fast(&[0x80, 0, 0, 0], &[0x7F, 0xFF, 0xFF, 0xFF]),
+            Ordering::Greater
+        );
+
+        // Mixed 4-vs-8 lengths fall through to slice order (a prefix is less).
+        assert_eq!(
+            default_cmp_fast(&[0u8; 4], &[0u8; 8]),
+            [0u8; 4].as_slice().cmp([0u8; 8].as_slice())
+        );
+        assert_eq!(
+            default_cmp_fast(&[0xFFu8; 8], &[0xFFu8; 4]),
+            [0xFFu8; 8].as_slice().cmp([0xFFu8; 4].as_slice())
+        );
+    }
+
+    /// Proptest config that also runs under miri: failure persistence writes a
+    /// regressions file (it calls `getcwd`, which miri's isolation refuses),
+    /// and miri is ~1000× slower, so it gets fewer cases.
+    fn prop_config() -> ProptestConfig {
+        ProptestConfig {
+            failure_persistence: None,
+            cases: if cfg!(miri) { 16 } else { 256 },
+            ..ProptestConfig::default()
+        }
+    }
+
+    proptest! {
+        #![proptest_config(prop_config())]
+        /// For every length pair in 0..=16 and any bytes, the fast compare is
+        /// byte-for-byte identical to slice (memcmp) order.
+        #[test]
+        fn fast_path_equals_slice_cmp_all_lengths(
+            a in proptest::collection::vec(any::<u8>(), 0..=16),
+            b in proptest::collection::vec(any::<u8>(), 0..=16),
+        ) {
+            prop_assert_eq!(default_cmp_fast(&a, &b), a.cmp(&b));
+            // And through the public choke point, so both call sites benefit.
+            prop_assert_eq!(KeyCmp::Default.compare(&a, &b), a.cmp(&b));
+        }
+    }
+
+    /// A leaf/branch binary search over 8-byte big-endian keys must return the
+    /// same Ok/Err positions as `slice::binary_search` on the sorted key list,
+    /// confirming the fast path preserves search results end to end.
+    #[test]
+    fn lookup_over_be_keys_matches_binary_search() {
+        use proptest::test_runner::TestRunner;
+
+        let mut runner = TestRunner::new(prop_config());
+        runner
+            .run(
+                &(
+                    proptest::collection::btree_set(any::<u64>(), 0..64),
+                    any::<u64>(),
+                ),
+                |(keys, probe)| {
+                    let sorted: Vec<[u8; 8]> = keys.iter().map(|k| k.to_be_bytes()).collect();
+                    let needle = probe.to_be_bytes();
+
+                    // Reference: linear binary search over the sorted Vec.
+                    let expected = sorted.binary_search(&needle);
+
+                    // Under test: the same search driven by KeyCmp::Default,
+                    // mirroring `leaf_lookup`'s loop over a sorted array.
+                    let mut lo = 0usize;
+                    let mut hi = sorted.len();
+                    let mut got = Err(sorted.len());
+                    while lo < hi {
+                        let mid = lo + (hi - lo) / 2;
+                        match KeyCmp::Default.compare(&sorted[mid], &needle) {
+                            Ordering::Less => lo = mid + 1,
+                            Ordering::Greater => hi = mid,
+                            Ordering::Equal => {
+                                got = Ok(mid);
+                                break;
+                            }
+                        }
+                    }
+                    if got.is_err() {
+                        got = Err(lo);
+                    }
+
+                    prop_assert_eq!(got, expected);
+                    Ok(())
+                },
+            )
+            .unwrap();
     }
 }
