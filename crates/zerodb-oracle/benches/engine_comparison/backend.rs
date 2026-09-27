@@ -424,14 +424,18 @@ macro_rules! bench_backend {
                 db: Db,
                 stop: &AtomicBool,
                 chunk: usize,
-                ready: Option<&AtomicUsize>,
+                ready: Option<(&AtomicUsize, &AtomicBool)>,
             ) {
                 let r = env.read_txn().expect("read_txn");
-                // Signal only once the read txn is open, so the writer's timer
-                // starts under real reader pressure (a spawned thread has not
-                // necessarily opened anything yet).
-                if let Some(ready) = ready {
+                // Signal only once the read txn is open, then hold it until the
+                // writer has started its timer, so every reader is live at t0
+                // (a spawned thread has not necessarily opened anything yet, and
+                // one that finished its first scan early would sit between txns).
+                if let Some((ready, started)) = ready {
                     ready.fetch_add(1, Ordering::Release);
+                    while !started.load(Ordering::Acquire) {
+                        std::thread::yield_now();
+                    }
                 }
                 let mut n = 0usize;
                 for kv in db.iter(&r).expect("iter") {
@@ -462,10 +466,11 @@ macro_rules! bench_backend {
                 const READER_STOP_POLL_CHUNK: usize = 1024;
                 let stop = AtomicBool::new(false);
                 let ready = AtomicUsize::new(0);
+                let started = AtomicBool::new(false);
                 std::thread::scope(|s| {
                     for _ in 0..readers {
                         s.spawn(|| {
-                            let mut first = Some(&ready);
+                            let mut first = Some((&ready, &started));
                             while !stop.load(Ordering::Relaxed) {
                                 scan_chunked_until_stop(
                                     env,
@@ -482,6 +487,10 @@ macro_rules! bench_backend {
                         std::thread::yield_now();
                     }
                     let start = Instant::now();
+                    // Release the readers only after t0: each still holds the
+                    // read txn it opened, so all of them are live when timing
+                    // begins.
+                    started.store(true, Ordering::Release);
                     for b in 0..batches {
                         let lo = (b * per_batch) % keys.len();
                         let hi = (lo + per_batch).min(keys.len());
