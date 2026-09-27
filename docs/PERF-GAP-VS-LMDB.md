@@ -711,6 +711,33 @@ every put and delete. Bench server, x86-64, 4 KiB (bench-ab, 3 rounds):
 address in both builds (`Database::len` inlines its engine work); it is
 harness layout, not this change (see B13 point 4).
 
+### B17. Point `get` built a full cursor — **DONE 2026-09-27**
+`Tree::get` (and the catalog lookup) opened a `Cursor`, zero-filling its
+32-frame `PathStack`, descended through `Cursor::search`, then compared the
+found key a second time (`cmp.eq`) although the leaf's binary search had
+already decided exactness. A point lookup needs no path: `Tree::find_exact`
+now walks root to leaf with the same `node_view` loop and the same level bound
+and error as `Cursor::search` (`depth + 2` levels, capped at `CURSOR_STACK`),
+and takes exactness from `lookup_with` (`Ok` = exact). LMDB's
+`mdb_node_search` reports exactness the same way, and `mdb_cursor_init` only
+resets the depth.
+
+Bench server, x86-64, 4 KiB (bench-ab, 3 rounds):
+
+| rung | CGU16 | CGU1 |
+|---|---|---|
+| `get/access/hot` | 1.11× → 0.94× | 1.12× → 0.93× |
+| `get/access/miss` | 1.33× → 1.12× | 1.35× → 1.13× |
+| `get/val/v8` | 1.16× → 1.02× | 1.21× → 1.04× |
+| `get/db/named` | 1.30× → 1.23× | 1.35× → 1.24× |
+| `get/size/n1k` | 1.17× → 1.03× | 1.21× → 1.01× |
+
+CGU1: 20 improved, 0 regressed. CGU16: 20 improved; three scan rungs flagged
+(`scan/full/fwd` +4.1 %, `scan/full/rev` +4.4 %, `scan/prefix/bucket` +3.7 %),
+but every cursor function they run (`next`, `prev`, `ascend_next`,
+`set_range`, `search`, `first`, `last`) disassembles identically in both
+builds, shifted by 80 bytes: layout, not this change (B13 point 4).
+
 ## C. RAM (peak memory)
 
 ### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**
