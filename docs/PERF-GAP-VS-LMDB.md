@@ -685,6 +685,32 @@ place in the leaf under the tree's ordering, as LMDB's APPEND check does, and
 reuses the same path buffer. `put/order/append` 1.32× → 1.19× (CGU16) and
 1.30× → 1.16× (CGU1); the other 11 `put/*` rungs flat.
 
+### B16. Page views decoded the whole header to read its flags — **DONE 2026-09-27**
+`LeafRef::new_prevalidated`, `BranchRef::new_prevalidated` and `OverflowRef::new`
+called `CommonHeader::read`, which also loads `pgno` and `txnid`. The loads are
+bounds-checked, so LLVM keeps them although nothing uses the values: this is
+the out-of-line `read_u64` at 15 % of hannoy's search profile and 5.7 % of
+`put/val/v8`. They now read only the flags field (`header::read_flags`), as
+LMDB tests `IS_LEAF(mp)` on the one field. Every check is unchanged.
+
+The write path gains most, because its descent builds a view per level on
+every put and delete. Bench server, x86-64, 4 KiB (bench-ab, 3 rounds):
+
+| rung | CGU16 | CGU1 |
+|---|---|---|
+| `del/bulk/half` | 2.14× → 1.83× | 2.07× → 1.76× |
+| `del/range/half` | 3.18× → 2.68× | 3.14× → 2.65× |
+| `del/cursor/drain` | 3.61× → 3.05× | 3.50× → 2.99× |
+| `put/val/v8` | 1.00× → 0.89× | 0.98× → 0.87× |
+| `put/api/reserved` | 1.04× → 0.96× | 1.05× → 0.94× |
+| `put/order/append` | 1.27× → 1.05× | 1.16× → 1.05× |
+
+`put/*` + `del/*`: 14 / 12 improved, 0 regressed. Reads: `scan/range/*` and
+`scan/prefix/bucket` 3–5 % faster in both builds. One flag, `scan/meta/len`
++3.4 % at CGU16 (reproduced), runs byte-identical engine code at the same
+address in both builds (`Database::len` inlines its engine work); it is
+harness layout, not this change (see B13 point 4).
+
 ## C. RAM (peak memory)
 
 ### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**

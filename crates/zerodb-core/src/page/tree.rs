@@ -17,7 +17,7 @@
 use crate::cmp::KeyCmp;
 
 use super::geometry::body_size;
-use super::header::{read_and_check_bounds, CommonHeader};
+use super::header::{read_and_check_bounds, read_flags, CommonHeader};
 use super::raw::{
     read_u16, read_u16_unchecked, read_u32, read_u32_unchecked, read_u64_unchecked, write_u16,
     write_u32, write_u64,
@@ -184,11 +184,11 @@ impl<'a> LeafRef<'a> {
     /// validated-pages memo over an immutable source
     /// (`btree::ValidatedPages`; docs/PERF-GAP-VS-LMDB.md A2).
     pub(crate) fn new_prevalidated(buf: &'a [u8], psize: u32) -> Result<LeafRef<'a>, PageError> {
-        let hdr = CommonHeader::read(buf);
-        if page_type_of(hdr.flags)? != PageType::Leaf {
+        let flags = read_flags(buf);
+        if page_type_of(flags)? != PageType::Leaf {
             return Err(PageError::WrongPageType {
                 expected: PageType::Leaf,
-                found: page_type_of(hdr.flags)?,
+                found: page_type_of(flags)?,
             });
         }
         check_reserved_tail_fields(buf)?;
@@ -602,11 +602,11 @@ impl<'a> BranchRef<'a> {
     /// full constructor earlier in the same txn, behind
     /// `btree::ValidatedPages`.
     pub(crate) fn new_prevalidated(buf: &'a [u8], psize: u32) -> Result<BranchRef<'a>, PageError> {
-        let hdr = CommonHeader::read(buf);
-        if page_type_of(hdr.flags)? != PageType::Branch {
+        let flags = read_flags(buf);
+        if page_type_of(flags)? != PageType::Branch {
             return Err(PageError::WrongPageType {
                 expected: PageType::Branch,
-                found: page_type_of(hdr.flags)?,
+                found: page_type_of(flags)?,
             });
         }
         check_reserved_tail_fields(buf)?;

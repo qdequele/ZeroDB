@@ -42,6 +42,18 @@ pub struct CommonHeader {
     pub flags: u16,
 }
 
+/// The `flags` field alone (header offset 16), for the page-view constructors
+/// that only classify the page: decoding the whole [`CommonHeader`] also read
+/// `pgno` and `txnid`, two bounds-checked loads LLVM cannot drop even though
+/// nothing uses them (the out-of-line `read_u64` in the hannoy search
+/// profile). LMDB reads just the field it tests (`IS_LEAF(mp)`).
+///
+/// The caller must guarantee `buf.len() >= HEADER_SIZE`.
+#[inline]
+pub(crate) fn read_flags(buf: &[u8]) -> u16 {
+    read_u16(buf, OFF_FLAGS)
+}
+
 impl CommonHeader {
     /// Decode the common header from the first 32 bytes of `buf`.
     ///
