@@ -790,6 +790,24 @@ gain is overstated for string keys; and long keys pay the length dispatch
 hot trees key on 4-byte big-endian document ids and hannoy's on item ids, which
 take the fast path.
 
+### B20. `non_free_pages_size` decoded and validated every free-list id — **DONE 2026-09-27 (first step)**
+`free_page_count` (behind heed's `non_free_pages_size` / `used_size`) walked
+every GC entry and ran `pil_decode` (a `Vec<u64>` per entry) plus
+`validate_pil_ids`, only to take the length. Meilisearch's index-scheduler
+calls it before every register write txn and `IndexStats` after every batch.
+It now sums each entry's 8-byte count prefix (`pil_count`), which keeps the
+length/shape check (a torn value still errors `Invalid`) but no longer decodes
+or range-checks the ids; they stay fully validated where they are drawn for
+reuse (`gc_reclaim`) and by `check`. SPEC 05 GC-23 states this.
+
+New rung `env/stat/non_free` (1M keys deleted across 1,000 commits under a
+pinned reader, ~1k GC entries). Bench server, x86-64, 4 KiB: 317 µs → 170 µs
+(0.537, CGU1 3 rounds; 0.524 CGU16) — the same ratio in the screen and both
+builds; the CGU1 verdict reads `invalid` only from LMDB drift on its 0.35 µs
+side. **Still ~480× LMDB:** heed over LMDB derives the figure from `mdb_stat`
+page counts per DB and never reads the free list (O(#DBs)). Matching that is
+the next step and needs a SPEC GC-23/24 amendment.
+
 ## C. RAM (peak memory)
 
 ### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**

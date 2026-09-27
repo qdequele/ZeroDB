@@ -86,6 +86,22 @@ pub trait Backend {
         per_batch: usize,
     ) -> std::time::Duration;
     fn copy_to(env: &Self::Env, dest: &Path, compact: bool);
+
+    /// `non_free_pages_size()` — milli's used-bytes probe (SPEC 05 GC-23).
+    /// LMDB sums `mdb_stat` per DB; zerodb walks the GC tree. Returns the
+    /// figure so the call cannot be elided.
+    fn non_free_size(env: &Self::Env) -> u64;
+    /// Build the fragmented-free-list fixture for `env/stat/non_free`: a filled
+    /// DB deleted across `commits` committed txns under a pinned reader, so the
+    /// free DB ends holding ~`commits` distinct PIL entries. Untimed setup.
+    fn build_fragmented_free(
+        dir: &Path,
+        map_size: usize,
+        page: u32,
+        keys: &[Vec<u8>],
+        val: &[u8],
+        commits: usize,
+    ) -> Self::Env;
 }
 
 // ---------------------------------------------------------------------------

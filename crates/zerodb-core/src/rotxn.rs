@@ -472,17 +472,18 @@ impl Env {
 pub fn free_page_count<T: TxnRead>(txn: &T) -> Result<u64> {
     let rec = txn.free_record();
     let source = txn.source();
-    let last_pg = source.last_pg();
     let tree = Tree::new(source, txn.page_size(), rec.root, rec.depth);
     let mut cursor = tree.cursor();
     let mut total = 0u64;
     let mut entry = cursor.first().map_err(map_page_err)?;
     while let Some((_key, val)) = entry {
-        // GC-3 shape validation via the shared PIL codec (a torn PIL errors
-        // rather than silently mis-counting — INV-26's runtime cousin).
-        let ids = crate::page::geometry::pil_decode(val).ok_or(Error::Mdb(MdbError::Invalid))?;
-        crate::rwtxn::validate_pil_ids(&ids, last_pg)?;
-        total += ids.len() as u64;
+        // GC-23: sum only each PIL's `count` prefix — no `Vec<u64>` decode and
+        // no id-range walk. The length/count shape check still fires (a torn
+        // PIL errors with `MdbError::Invalid` rather than mis-counting —
+        // INV-26's length half); the ids' range and order (INV-25/GC-4) are
+        // validated where they are drawn for reuse (`gc_reclaim`), not here.
+        let count = crate::page::geometry::pil_count(val).ok_or(Error::Mdb(MdbError::Invalid))?;
+        total += count;
         entry = cursor.next().map_err(map_page_err)?;
     }
     Ok(total)

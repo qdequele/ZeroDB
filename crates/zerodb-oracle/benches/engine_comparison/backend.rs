@@ -506,6 +506,52 @@ macro_rules! bench_backend {
                 })
             }
 
+            /// `non_free_pages_size()` — the used-bytes figure milli reads
+            /// before every register write txn and after every batch. LMDB sums
+            /// `mdb_stat` per database (`mdb_env_stat` + one `mdb_stat` per DB)
+            /// and never touches the freelist; zerodb walks the GC tree summing
+            /// each PIL's count prefix (SPEC 05 GC-23). Returned so neither
+            /// engine's call can be elided.
+            pub fn non_free_size(env: &BEnv) -> u64 {
+                env.non_free_pages_size().expect("non_free_pages_size")
+            }
+
+            /// Build an env whose free DB holds MANY small entries — the shape
+            /// `non_free_size` costs the most over on zerodb. Fill one named DB,
+            /// then delete it in `commits` separate committed txns while a reader
+            /// pinned at the just-filled snapshot blocks reclamation (the
+            /// oldest-reader gate): every commit's freed pages accumulate as
+            /// their own GC entry instead of recycling the previous one, so the
+            /// free list ends fragmented into ~`commits` PILs. Untimed setup for
+            /// the `env/stat/non_free` rung; returns the env with the DB loaded.
+            pub fn build_fragmented_free(
+                dir: &Path,
+                map_size: usize,
+                page: u32,
+                keys: &[Vec<u8>],
+                val: &[u8],
+                commits: usize,
+            ) -> BEnv {
+                let env = open(dir, map_size, true, page);
+                let db = create_db(&env, Some("bench"));
+                bulk_put(&env, db, keys, val);
+                let pin = env.read_txn().expect("read_txn");
+                let commits = commits.max(1);
+                let per = keys.len().div_ceil(commits).max(1);
+                for chunk in keys.chunks(per) {
+                    let mut w = env.write_txn().expect("write_txn");
+                    for k in chunk {
+                        db.delete(&mut w, k.as_slice()).expect("delete");
+                    }
+                    w.commit().expect("commit");
+                }
+                // The pin has done its job: the freed pages are committed and,
+                // with no further writer, stay un-reclaimed. Drop it so the
+                // timed reads open against an empty reader table.
+                drop(pin);
+                env
+            }
+
             /// `mdb_env_copy2` into `dest`, compacting or raw.
             pub fn copy_to(env: &BEnv, dest: &Path, compact: bool) {
                 let mut f = File::create(dest).expect("create copy dest");
@@ -635,6 +681,19 @@ macro_rules! bench_backend {
                     per_batch: usize,
                 ) -> Duration {
                     writer_under_readers(env, db, keys, val, readers, batches, per_batch)
+                }
+                fn non_free_size(env: &BEnv) -> u64 {
+                    non_free_size(env)
+                }
+                fn build_fragmented_free(
+                    dir: &Path,
+                    map_size: usize,
+                    page: u32,
+                    keys: &[Vec<u8>],
+                    val: &[u8],
+                    commits: usize,
+                ) -> BEnv {
+                    build_fragmented_free(dir, map_size, page, keys, val, commits)
                 }
                 fn copy_to(env: &BEnv, dest: &Path, compact: bool) {
                     copy_to(env, dest, compact)
