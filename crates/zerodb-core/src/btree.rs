@@ -705,6 +705,15 @@ impl PathStack {
     fn last_mut(&mut self) -> Option<&mut (u64, usize)> {
         self.buf[..self.len].last_mut()
     }
+
+    /// Drop frame 0 (the root frame), shifting the rest down: the write
+    /// path's root-shrink repair (SPEC 03 §5.4a) — the old root left the tree
+    /// and its only child, frame 1, is the new root frame.
+    fn drop_root(&mut self) {
+        debug_assert!(self.len >= 2, "root pop needs a frame below the root");
+        self.buf.copy_within(1..self.len, 0);
+        self.len -= 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1235,6 +1244,13 @@ impl SavedCursor {
     /// the remap the parked path needs.
     pub(crate) fn frames_mut(&mut self) -> &mut [(u64, usize)] {
         self.stack.frames_mut()
+    }
+
+    /// Apply the root-shrink repair to the parked path (SPEC 03 §5.4a): the
+    /// delete's rebalance freed the old root branch, so frame 0 goes and the
+    /// surviving child becomes the root frame.
+    pub(crate) fn drop_root(&mut self) {
+        self.stack.drop_root();
     }
 }
 

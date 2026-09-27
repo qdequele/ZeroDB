@@ -827,6 +827,24 @@ every function on their path (`delete_tree`, `delete_at_path`, `rebalance`,
 `search_path`, `update_parent_key`) disassembles identically; only
 `clear_tree`/`collect_tree` changed: layout (B13 point 4).
 
+### B22. A cursor delete that rebalanced threw away the cursor's path — **DONE 2026-09-27 (leftmost pairing)**
+After B8a, `RwCursor::del_current` still discarded its parked path whenever the
+delete borrowed or merged (~86 % of front-to-back drain deletes at 4 KiB), so
+the next step re-descended from the root. LMDB's `mdb_cursor_del0` repairs
+the cursor after `mdb_rebalance`. `rebalance` now reports a `PathFate`
+(Unchanged / Kept / KeptShrunk / Invalidated) and `del_current` keeps the
+path when it can. Repaired: the leftmost pairing (`pki == 0`, always with the
+right sibling) — borrow from right, merge with right and its cascade, root
+shrink to the surviving child (frame 0 popped). Everything else, including any
+ancestor split, the from-left pairing and a hostile empty sibling, falls back
+to today's re-descent. In debug builds every kept path is re-checked against a
+fresh root-to-leaf search. SPEC 03 §5.4a carries the per-level repair table.
+
+Bench server, x86-64, 4 KiB: `del/cursor/drain` 2.91× → 2.63× (CGU1, 3 rounds,
+0.889) and 2.95× → 2.69× (CGU16, 1 round, 0.914). A first CGU1 run flagged
+`del/bulk/half` / `del/range/half` +3.5–5 % under LMDB drift; the re-run read
+them flat (+1.5–3.2 %, within ±4–5 %).
+
 ## C. RAM (peak memory)
 
 ### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**

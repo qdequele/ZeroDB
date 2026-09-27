@@ -399,6 +399,37 @@ repaired, whenever the mutation could have moved the entry it names. At minimum:
 Discarding is always a correct implementation of "repair"; it costs a re-seek,
 which is exactly the M1.4 mechanism applied selectively.
 
+**Implemented repair table (2026-09-27, leftmost pairing only).** The engine
+retains the path across `del_current` and repairs it for the structural cases
+below; everything else discards. The rebalance reports one of *unchanged*
+(no structural change — the path is valid as-is), *kept* (repaired per this
+table), *kept + root pop* (as kept, plus frame 0 must be dropped), or
+*invalidated* (discard and re-seek). The repairs apply **only when the
+rebalanced page is its parent's child 0** — the §10 sibling choice then
+always pairs it with its RIGHT sibling — which is every delete of a
+front-to-back drain (milli's `del_current` loops). The "from left" pairing
+(child ≥ 1) is not repaired in this iteration.
+
+| §10 event at a level (page P = parent's child 0) | per-level repair |
+|---|---|
+| borrow from the right sibling (leaf or branch), no ancestor split | keep every frame as-is: P keeps its pgno (it is already dirty), the moved entry is *appended* at/after the vacated `ki` (so the slot still holds the successor when the tail was deleted), and the parent's separator rewrite at child 1 moves no lower-indexed child |
+| merge with the right sibling (right into left = P), right sibling non-empty | keep every frame as-is: P survives with its pgno, the sibling's cells land at/after the vacated `ki`, the parent only loses child 1; the parent level then re-enters this table (merge cascade) |
+| root shrink to the remaining branch child (§9) | pop frame 0: the surviving child is the single-child root's child 0, which is exactly the path's frame 1 |
+| any ancestor **split** during a separator rewrite (a longer separator can split the parent, up to a root grow) | invalidate — splits move sibling frames and can add a level; not followed |
+| the "from left" pairing (P is child ≥ 1) | invalidate — not implemented in this iteration |
+| root shrink to empty (last entry deleted) | invalidate — the path names a freed page |
+| right sibling with zero cells (hostile image) | invalidate — the vacated slot could sit past an empty leaf |
+
+**Debug shadow check (mandatory while a path is retained).** In debug builds
+(`debug_assertions`), after every delete that keeps the path — repaired or
+untouched — the engine re-runs a fresh root-to-leaf search for the deleted key
+and asserts it reproduces the kept path exactly: same `pgno` and same `ki` at
+every level (the deleted key's insertion slot IS the vacated slot), the key
+absent, and, when the vacated slot is live, the entry it holds strictly greater
+than the deleted key under the tree's ordering. Every `cargo test`, fuzz and
+stress run therefore re-derives every kept path; a repair bug fails loudly
+instead of silently skipping or repeating entries in a cursor drain.
+
 **Why this was changed.** The mandate cost two full root-to-leaf descents per
 entry on `del_current` (one for the delete, one for the following re-seek),
 which made ZeroDB's cursor-delete loop **4.2×** the fork's — where LMDB's is

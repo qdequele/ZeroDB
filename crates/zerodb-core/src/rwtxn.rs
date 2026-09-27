@@ -201,6 +201,40 @@ impl Drain {
 /// slot on the leaf.
 type Path = Vec<(u64, usize)>;
 
+/// What a delete's rebalance ([`RwTxn::rebalance`]) did to the root-to-leaf
+/// path it was handed (SPEC 03 §5.4a): the parked write cursor keeps, pops,
+/// or discards its path based on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathFate {
+    /// No structural change: the path is valid exactly as it stands.
+    Unchanged,
+    /// A borrow or merge changed the tree's shape, but every `(pgno, ki)`
+    /// frame still names the descent to the vacated slot — the path was
+    /// repaired in place (the leftmost / right-sibling repair table,
+    /// SPEC 03 §5.4a).
+    Kept,
+    /// As [`Kept`](PathFate::Kept), plus a root shrink dropped the tree's top
+    /// level: frame 0 must be popped before the path is used.
+    KeptShrunk,
+    /// The path may name freed pages or stale indices: discard it and re-seek
+    /// (always a correct repair, SPEC 03 §5.4a).
+    Invalidated,
+}
+
+impl PathFate {
+    /// Combine this level's fate with the parent recursion's (merge cascades):
+    /// any invalidation wins, then a root pop, then a plain keep.
+    fn and(self, parent: PathFate) -> PathFate {
+        use PathFate::{Invalidated, Kept, KeptShrunk, Unchanged};
+        match (self, parent) {
+            (Invalidated, _) | (_, Invalidated) => Invalidated,
+            (KeptShrunk, _) | (_, KeptShrunk) => KeptShrunk,
+            (Kept, _) | (_, Kept) => Kept,
+            (Unchanged, Unchanged) => Unchanged,
+        }
+    }
+}
+
 /// Leaf node header size (SPEC 02 §4.2).
 const LEAF_NODE_HEADER: usize = 8;
 /// Branch node header size (SPEC 02 §4.1).
@@ -1834,9 +1868,11 @@ impl<'env> RwTxn<'env> {
             let sep = key.to_vec(); // sep = first key of R = the new key (§6.4)
             return if top == 0 {
                 self.insert_into_branch(tree, path, -1, 0, sep, rpg)
+                    .map(|_| ())
             } else {
                 let at = path[top - 1].1 + 1;
                 self.insert_into_branch(tree, path, top as isize - 1, at, sep, rpg)
+                    .map(|_| ())
             };
         }
 
@@ -1868,11 +1904,14 @@ impl<'env> RwTxn<'env> {
         self.pack_leaf_range(rpg, &oldleaf, newindx, key, &val, node_flags, s, total)?;
         drop(old);
         sat_add(&mut self.record_mut(tree).leaf_pages, 1);
+        // The split flag only matters to a kept delete path; puts discard it.
         if top == 0 {
             self.insert_into_branch(tree, path, -1, 0, sep, rpg)
+                .map(|_| ())
         } else {
             let at = path[top - 1].1 + 1;
             self.insert_into_branch(tree, path, top as isize - 1, at, sep, rpg)
+                .map(|_| ())
         }
     }
 
@@ -1928,7 +1967,9 @@ impl<'env> RwTxn<'env> {
 
     /// Insert `(key -> child)` at index `at` of the branch at `path[level]`,
     /// splitting recursively (§6.5) up to a root split (§9 grow) at
-    /// `level < 0`.
+    /// `level < 0`. Returns whether any page split (or the root grew) on the
+    /// way — the signal that a kept cursor path can no longer be proven
+    /// correct (SPEC 03 §5.4a).
     fn insert_into_branch(
         &mut self,
         tree: TreeId,
@@ -1937,7 +1978,7 @@ impl<'env> RwTxn<'env> {
         at: usize,
         key: Vec<u8>,
         child: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if level < 0 {
             // Root split (§9): new root branch over (old root, risen key).
             let old_root = path[0].0;
@@ -1954,7 +1995,7 @@ impl<'env> RwTxn<'env> {
             rec.root = np;
             rec.depth = rec.depth.saturating_add(1);
             sat_add(&mut rec.branch_pages, 1);
-            return Ok(());
+            return Ok(true);
         }
         let lvl = level as usize;
         debug_assert!(at >= 1, "branch inserts never target node 0");
@@ -1966,7 +2007,7 @@ impl<'env> RwTxn<'env> {
                 .insert(at, &key, child)
         };
         match r {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(false),
             Err(PageError::PageFull { .. }) => self.split_branch(tree, path, lvl, at, key, child),
             Err(e) => Err(corrupt(e)),
         }
@@ -1974,7 +2015,8 @@ impl<'env> RwTxn<'env> {
 
     /// Branch split (§6.5): the median rises and is **removed from both
     /// children** — the right page's node 0 keeps the rising key's child under
-    /// the empty separator.
+    /// the empty separator. Always returns `true` (it *is* a split), after
+    /// propagating the rising key.
     fn split_branch(
         &mut self,
         tree: TreeId,
@@ -1983,7 +2025,7 @@ impl<'env> RwTxn<'env> {
         at: usize,
         key: Vec<u8>,
         child: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let (ppg, _) = path[lvl];
         let mut cells = self.extract_branch_cells(ppg)?;
         cells.insert(at, OwnedBranchCell { key, child });
@@ -2007,11 +2049,12 @@ impl<'env> RwTxn<'env> {
         self.write_branch_frame(rpg, &right)?;
         sat_add(&mut self.record_mut(tree).branch_pages, 1);
         if lvl == 0 {
-            self.insert_into_branch(tree, path, -1, 0, rising, rpg)
+            self.insert_into_branch(tree, path, -1, 0, rising, rpg)?;
         } else {
             let at2 = path[lvl - 1].1 + 1;
-            self.insert_into_branch(tree, path, lvl as isize - 1, at2, rising, rpg)
+            self.insert_into_branch(tree, path, lvl as isize - 1, at2, rising, rpg)?;
         }
+        Ok(true)
     }
 
     // -- delete + rebalance (§7/§10, §9 shrink) --------------------------------
@@ -2023,6 +2066,7 @@ impl<'env> RwTxn<'env> {
         // concern (oracle adapter / heed adapter).
         let mut path = std::mem::take(&mut self.path_buf);
         let res = match self.search_path_into(tree, key, &mut path) {
+            // The path is transient here, so its fate is irrelevant.
             Ok(true) => self.delete_at_path(tree, &mut path).map(|_| true),
             other => other,
         };
@@ -2031,20 +2075,21 @@ impl<'env> RwTxn<'env> {
     }
 
     /// Delete the entry `path` already points at, skipping the descent
-    /// `delete_tree` would do (SPEC 03 §5.4a). Returns whether the tree's shape
-    /// changed (borrow / merge / root shrink), which tells a parked cursor
-    /// whether its path survived.
+    /// `delete_tree` would do (SPEC 03 §5.4a). Returns the path's
+    /// [`PathFate`], which tells a parked cursor whether its path survived
+    /// (possibly repaired) or must be discarded.
     ///
     /// `path` MUST be the live root-to-leaf path to an existing entry of
     /// `tree`: either fresh from [`search_path`](Self::search_path), or a
     /// cursor's parked path over an unmutated tree (the `Cursor::resume`
-    /// contract). It is rewritten in place as pages are COWed.
-    fn delete_at_path(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<bool> {
+    /// contract). It is rewritten in place as pages are COWed and as the
+    /// rebalance repairs it.
+    fn delete_at_path(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<PathFate> {
         self.guard_ok()?;
         match self.delete_apply(tree, path) {
-            Ok(structural) => {
+            Ok(fate) => {
                 sat_sub(&mut self.record_mut(tree).entries, 1);
-                Ok(structural)
+                Ok(fate)
             }
             Err(e) => {
                 self.errored = true;
@@ -2053,8 +2098,8 @@ impl<'env> RwTxn<'env> {
         }
     }
 
-    /// Returns [`rebalance`](Self::rebalance)'s structural-change flag.
-    fn delete_apply(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<bool> {
+    /// Returns [`rebalance`](Self::rebalance)'s [`PathFate`].
+    fn delete_apply(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<PathFate> {
         self.touch_path(tree, path)?;
         let (lpg, ki) = *path.last().expect("non-empty path");
         let big = {
@@ -2081,6 +2126,38 @@ impl<'env> RwTxn<'env> {
         self.rebalance(tree, path, top)
     }
 
+    /// Debug shadow check for a kept cursor path (SPEC 03 §5.4a): after a
+    /// delete keeps (or repairs) the parked path, that path must be identical
+    /// to a fresh root-to-leaf descent for the deleted key — same `pgno` and
+    /// `ki` at every level, with the key absent and its insertion slot the
+    /// vacated one — and the vacated slot, when live, must hold a strictly
+    /// greater key (the successor). Runs in every debug build (tests, fuzz,
+    /// stress), so a repair bug fails loudly instead of silently skipping or
+    /// repeating entries in a cursor drain.
+    #[cfg(debug_assertions)]
+    fn shadow_check_kept_path(&self, tree: TreeId, kept: &[(u64, usize)], deleted_key: &[u8]) {
+        let (fresh, found) = self
+            .search_path(tree, deleted_key)
+            .expect("shadow re-descent failed on a kept path");
+        assert!(!found, "deleted key still present after del_current");
+        assert_eq!(
+            fresh.as_slice(),
+            kept,
+            "kept cursor path diverges from a fresh descent for the deleted key"
+        );
+        let (lpg, ki) = *kept.last().expect("kept path is non-empty");
+        let frame = self.dirty.bytes(lpg).expect("kept path leaf is dirty");
+        let leaf = LeafRef::new_prevalidated(frame, self.psize).expect("kept leaf decodes");
+        if ki < leaf.num_keys() {
+            assert_eq!(
+                self.tree_comparator(tree)
+                    .compare(leaf.key(ki), deleted_key),
+                Ordering::Greater,
+                "vacated slot does not hold the deleted key's successor"
+            );
+        }
+    }
+
     /// `(is_leaf, num_keys, used_bytes)` of the dirty page at `pgno`.
     fn page_stats(&self, pgno: u64) -> Result<(bool, usize, usize)> {
         let frame = self.dirty.bytes(pgno).expect("page is dirty");
@@ -2104,10 +2181,18 @@ impl<'env> RwTxn<'env> {
     /// §10 rebalance at `path[level]` after a delete/merge: root shrink at the
     /// root (§9); otherwise, when below threshold, borrow from (or merge with)
     /// a sibling, recursing upward on merge.
-    /// Returns whether the tree's *shape* changed — a borrow, a merge, or a
-    /// root shrink. `false` means the delete only removed a cell from its leaf,
-    /// which is the case a parked cursor path survives (SPEC 03 §5.4a).
-    fn rebalance(&mut self, tree: TreeId, path: &mut [(u64, usize)], level: usize) -> Result<bool> {
+    /// Returns the [`PathFate`] of `path` (SPEC 03 §5.4a): `Unchanged` when
+    /// the delete only removed a cell from its leaf; `Kept`/`KeptShrunk` when
+    /// the shape changed through the leftmost pairing (child 0 + its RIGHT
+    /// sibling) and every frame was repaired in place; `Invalidated` for the
+    /// left pairing, for any ancestor split during a separator rewrite, and
+    /// for anything else this table does not prove.
+    fn rebalance(
+        &mut self,
+        tree: TreeId,
+        path: &mut [(u64, usize)],
+        level: usize,
+    ) -> Result<PathFate> {
         let (pgno, _) = path[level];
         let (is_leaf, nkeys, used) = self.page_stats(pgno)?;
         let body = body_size(self.psize);
@@ -2119,7 +2204,8 @@ impl<'env> RwTxn<'env> {
                 rec.root = PGNO_INVALID;
                 rec.depth = 0;
                 sat_sub(&mut rec.leaf_pages, 1);
-                return Ok(true);
+                // The tree is empty: the path names a freed page.
+                return Ok(PathFate::Invalidated);
             } else if !is_leaf && nkeys == 1 {
                 let child = {
                     let frame = self.dirty.bytes(pgno).expect("root is dirty");
@@ -2132,9 +2218,14 @@ impl<'env> RwTxn<'env> {
                 rec.root = child;
                 rec.depth = rec.depth.saturating_sub(1);
                 sat_sub(&mut rec.branch_pages, 1);
-                return Ok(true);
+                // The surviving child is the root's only (0th) child, which
+                // is exactly the path's next frame: popping frame 0 repairs
+                // the path (SPEC 03 §5.4a root-shrink row).
+                debug_assert_eq!(path[0].1, 0, "single-child root descends via 0");
+                debug_assert_eq!(child, path[1].0, "new root is the path's frame 1");
+                return Ok(PathFate::KeptShrunk);
             }
-            return Ok(false);
+            return Ok(PathFate::Unchanged);
         }
         // §10 thresholds: leaf = 25 % fill (FILL_THRESHOLD) or below min_keys;
         // branch = below min_keys (2 children) — its fill threshold is
@@ -2145,7 +2236,7 @@ impl<'env> RwTxn<'env> {
             nkeys < MIN_KEYS_BRANCH
         };
         if !below {
-            return Ok(false);
+            return Ok(PathFate::Unchanged);
         }
         let (ppg, pki) = path[level - 1];
         let parent_nkeys = {
@@ -2157,7 +2248,7 @@ impl<'env> RwTxn<'env> {
         if parent_nkeys < 2 {
             // Cannot happen on an INV-8-conforming tree; degrade gracefully.
             debug_assert!(false, "parent branch with < 2 children mid-rebalance");
-            return Ok(false);
+            return Ok(PathFate::Unchanged);
         }
         // §10 sibling choice: leftmost child pairs with its right neighbor;
         // every other child pairs with its left neighbor.
@@ -2189,17 +2280,41 @@ impl<'env> RwTxn<'env> {
             s_nkeys > MIN_KEYS_BRANCH
         };
         if can_borrow {
-            self.borrow_entry(tree, path, level, sib, fromleft, is_leaf)?;
-            Ok(true)
+            let split = self.borrow_entry(tree, path, level, sib, fromleft, is_leaf)?;
+            // Right-sibling borrow (SPEC 03 §5.4a repair table): P keeps its
+            // pgno, the moved entry is appended after the vacated slot, and
+            // the parent's child 0 does not move — every frame is already
+            // correct. A separator split rewrites ancestors this table does
+            // not follow (and a root grow adds a frame), so it invalidates;
+            // so does the left pairing, whose rules this step does not
+            // implement.
+            Ok(if fromleft || split {
+                PathFate::Invalidated
+            } else {
+                PathFate::Kept
+            })
         } else {
             self.merge_pages(tree, path, level, sib, fromleft, is_leaf)?;
-            self.rebalance(tree, path, level - 1)?;
-            Ok(true)
+            // Right-sibling merge (right into left = P): P keeps its pgno and
+            // the appended cells land at or after the vacated slot, so the
+            // slot still names the successor; the parent loses child 1 only.
+            // A left-pairing merge moves the path onto the sibling
+            // (`merge_pages` repairs it for the recursion, not for the
+            // cursor), and an empty right sibling (hostile image) would leave
+            // the vacated slot past a possibly-empty leaf — both invalidate.
+            let here = if fromleft || s_nkeys == 0 {
+                PathFate::Invalidated
+            } else {
+                PathFate::Kept
+            };
+            let parent = self.rebalance(tree, path, level - 1)?;
+            Ok(here.and(parent))
         }
     }
 
     /// §10 BORROW (`node_move`): move the boundary entry from the fuller
-    /// sibling and rewrite the parent separator.
+    /// sibling and rewrite the parent separator. Returns whether the separator
+    /// rewrite split an ancestor (the kept-path invalidation signal).
     fn borrow_entry(
         &mut self,
         tree: TreeId,
@@ -2208,7 +2323,7 @@ impl<'env> RwTxn<'env> {
         sib: u64,
         fromleft: bool,
         is_leaf: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let (pg, _) = path[level];
         let (_, pki) = path[level - 1];
         let psize = self.psize;
@@ -2385,6 +2500,7 @@ impl<'env> RwTxn<'env> {
     /// Rewrite the parent separator for `child_idx` (never node 0): remove the
     /// old node and re-insert with the new key through the generic branch
     /// insert, which splits the parent if the longer key no longer fits.
+    /// Returns [`insert_into_branch`](Self::insert_into_branch)'s split flag.
     fn update_parent_key(
         &mut self,
         tree: TreeId,
@@ -2392,7 +2508,7 @@ impl<'env> RwTxn<'env> {
         parent_level: usize,
         child_idx: usize,
         new_key: Vec<u8>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         debug_assert!(child_idx >= 1, "node 0's separator is always empty");
         let (ppg, _) = path[parent_level];
         let child = {
@@ -3357,6 +3473,8 @@ impl Database {
             pos: CurPos::Start,
             saved: None,
             on_vacated_slot: false,
+            #[cfg(debug_assertions)]
+            repaired_keeps: 0,
         }
     }
 }
@@ -3425,6 +3543,11 @@ pub struct RwCursor<'t, 'env> {
     /// as it was before the path was retained. Only `next` may use the path (it
     /// settles instead of stepping); every other op re-derives from `pos`.
     on_vacated_slot: bool,
+    /// Deletes whose *structural* rebalance kept a repaired path instead of
+    /// discarding it (SPEC 03 §5.4a repair table) — a test signal that the
+    /// repair fires, mirrored by the shadow check. Debug builds only.
+    #[cfg(debug_assertions)]
+    repaired_keeps: u64,
 }
 
 impl RwCursor<'_, '_> {
@@ -3691,21 +3814,43 @@ impl RwCursor<'_, '_> {
         );
         // The parked leaf slot needs no adjustment: it already names the cell
         // being removed, and removing it shifts the successor down into it.
-        let structural = self.txn.delete_at_path(tree, saved.frames_mut())?;
-        self.pos = CurPos::AfterDelete(key);
-        if structural {
-            // A borrow, merge or root shrink moved entries between pages: the
-            // parked path may name the wrong page or depth. Discard it — the
-            // next op re-seeks from `pos`, which is the pre-B8a behaviour.
-            self.saved = None;
-        } else {
-            // Only a cell left this leaf. `ki` now names the successor (the
-            // cells above it shifted down), or is one past the last live cell
-            // if the tail was deleted — both of which `Cursor::settle` reads,
-            // and from which a plain `prev` still yields the predecessor.
-            self.saved = Some(saved);
-            self.on_vacated_slot = true;
+        let fate = self.txn.delete_at_path(tree, saved.frames_mut())?;
+        match fate {
+            PathFate::Invalidated => {
+                // The rebalance moved entries in a way the repair table does
+                // not follow (left pairing, an ancestor split, an emptied
+                // tree): the parked path may name the wrong page or depth.
+                // Discard it — the next op re-seeks from `pos`, which is the
+                // pre-B8a behaviour and always a correct repair (§5.4a).
+                self.saved = None;
+            }
+            fate => {
+                // The path still descends to the vacated slot: either nothing
+                // structural happened (`Unchanged` — only a cell left this
+                // leaf), or the leftmost-pairing repair held every frame
+                // steady (`Kept`), possibly minus a popped root frame
+                // (`KeptShrunk`). `ki` names the successor (the cells above it
+                // shifted down, and a borrow/merge appended the right
+                // sibling's cells at or after it), or is one past the last
+                // live cell if the tail was deleted — both of which
+                // `Cursor::settle` reads, and from which a plain `prev` still
+                // yields the predecessor.
+                if fate == PathFate::KeptShrunk {
+                    saved.drop_root();
+                }
+                #[cfg(debug_assertions)]
+                {
+                    if fate != PathFate::Unchanged {
+                        self.repaired_keeps += 1;
+                    }
+                    self.txn
+                        .shadow_check_kept_path(tree, saved.frames_mut(), &key);
+                }
+                self.saved = Some(saved);
+                self.on_vacated_slot = true;
+            }
         }
+        self.pos = CurPos::AfterDelete(key);
         Ok(true)
     }
 }
@@ -4443,5 +4588,253 @@ mod tests {
         // (TXN-11); the writer sees its own (TXN-38).
         assert_eq!(db.get(&rtxn, b"k").unwrap(), None);
         assert_eq!(db.get(&wtxn, b"k").unwrap(), Some(b"v".as_slice()));
+    }
+
+    // -- del_current path repair (SPEC 03 §5.4a repair table) -----------------
+
+    /// A wide key/value pair: at 4 K pages the leaves hold ~6 entries and the
+    /// branches ~8 children, so a depth-3 tree needs only ~120 entries and a
+    /// front-to-back drain rebalances on most deletes (the structural case the
+    /// §5.4a repair table exists for).
+    fn wide_kv(i: u32) -> (Vec<u8>, Vec<u8>) {
+        (
+            format!("{i:05}{}", "k".repeat(455)).into_bytes(),
+            format!("v{i}-{}", "x".repeat(96)).into_bytes(),
+        )
+    }
+
+    /// Drain the whole DB front-to-back through the write cursor (milli's
+    /// `iter_mut` + `del_current` pattern) and return the keys in the order
+    /// the drain yielded them.
+    fn drain_all(db: &Database, txn: &mut RwTxn<'_>) -> Vec<Vec<u8>> {
+        let mut seen = Vec::new();
+        let mut cur = db.rw_cursor(txn);
+        while let Some((k, _v)) = cur.move_next().unwrap() {
+            seen.push(k.to_vec());
+            assert!(cur.del_current().unwrap());
+        }
+        seen
+    }
+
+    /// Tree sizes are miri-scaled like proptest case counts: the shadow check
+    /// re-descends per delete, which the interpreter pays ~1000x for.
+    fn miri_scaled(native: u32, miri: u32) -> u32 {
+        if cfg!(miri) {
+            miri
+        } else {
+            native
+        }
+    }
+
+    /// A `first/del_current/next` drain over depths 1, 2 and 3+ must yield
+    /// every key exactly once, in order — none skipped, none repeated — and
+    /// leave the tree empty. The depth-2/3 runs exercise the kept-path repair
+    /// (borrow-from-right, merge-with-right, root shrink); the debug shadow
+    /// check re-derives every kept path against a fresh descent.
+    #[test]
+    fn cursor_drain_matches_model_at_depths() {
+        for (n, min_depth) in [(4u32, 1u16), (12, 2), (miri_scaled(150, 80), 3)] {
+            let env = mem_env(PS, 8 << 20);
+            let db = env.main_database();
+            let mut txn = env.write_txn().unwrap();
+            let mut model = std::collections::BTreeMap::new();
+            for i in 0..n {
+                let (k, v) = wide_kv(i);
+                db.put(&mut txn, &k, &v).unwrap();
+                model.insert(k, v);
+            }
+            assert!(
+                txn.main_record().depth >= min_depth,
+                "wanted depth >= {min_depth}, got {} for n = {n}",
+                txn.main_record().depth
+            );
+            let seen = drain_all(&db, &mut txn);
+            let expected: Vec<Vec<u8>> = model.keys().cloned().collect();
+            assert_eq!(
+                seen, expected,
+                "drain skipped or repeated entries (n = {n})"
+            );
+            assert_eq!(db.len(&txn).unwrap(), 0);
+            assert_eq!(txn.main_record().root, PGNO_INVALID);
+        }
+    }
+
+    /// A backward drain (`prev/del_current`) deletes at `pki != 0`, the
+    /// pairing this step does NOT repair: every structural delete falls back
+    /// to the discard + re-seek path. It must still visit every key exactly
+    /// once, in reverse order.
+    #[test]
+    fn cursor_reverse_drain_matches_model() {
+        let env = mem_env(PS, 8 << 20);
+        let db = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        let n = miri_scaled(130, 72);
+        let mut model = std::collections::BTreeMap::new();
+        for i in 0..n {
+            let (k, v) = wide_kv(i);
+            db.put(&mut txn, &k, &v).unwrap();
+            model.insert(k, v);
+        }
+        assert!(txn.main_record().depth >= 3);
+        let mut seen = Vec::new();
+        {
+            let mut cur = db.rw_cursor(&mut txn);
+            while let Some((k, _v)) = cur.move_prev().unwrap() {
+                seen.push(k.to_vec());
+                assert!(cur.del_current().unwrap());
+            }
+        }
+        let expected: Vec<Vec<u8>> = model.keys().rev().cloned().collect();
+        assert_eq!(seen, expected);
+        assert_eq!(db.len(&txn).unwrap(), 0);
+    }
+
+    /// Drain in segments with point `get`s in between (the cursor cannot
+    /// overlap a shared borrow of the txn, so milli interleaves exactly this
+    /// way): deleted keys must read back `None`, survivors `Some`, and the
+    /// resumed cursor must not skip or repeat across the seam.
+    #[test]
+    fn cursor_drain_interleaved_with_gets() {
+        let env = mem_env(PS, 8 << 20);
+        let db = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        let n = miri_scaled(120, 72);
+        for i in 0..n {
+            let (k, v) = wide_kv(i);
+            db.put(&mut txn, &k, &v).unwrap();
+        }
+        assert!(txn.main_record().depth >= 3);
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut segment = 0u32;
+        loop {
+            let mut deleted_now = 0u32;
+            {
+                let mut cur = db.rw_cursor(&mut txn);
+                // Resume strictly after the last drained key.
+                let start = match seen.last() {
+                    Some(k) => cur.seek_gt(k).unwrap(),
+                    None => cur.move_next().unwrap(),
+                };
+                let mut entry = start.map(|(k, _)| k.to_vec());
+                while let Some(k) = entry {
+                    seen.push(k);
+                    assert!(cur.del_current().unwrap());
+                    deleted_now += 1;
+                    if deleted_now == 17 {
+                        break; // segment boundary: drop the cursor, go get()
+                    }
+                    entry = cur.move_next().unwrap().map(|(k, _)| k.to_vec());
+                }
+            }
+            for k in &seen {
+                assert_eq!(db.get(&txn, k).unwrap(), None, "segment {segment}");
+            }
+            let survivors = n as usize - seen.len();
+            assert_eq!(db.len(&txn).unwrap() as usize, survivors);
+            if deleted_now < 17 {
+                break;
+            }
+            segment += 1;
+        }
+        let expected: Vec<Vec<u8>> = (0..n).map(|i| wide_kv(i).0).collect();
+        assert_eq!(seen, expected);
+        assert_eq!(db.len(&txn).unwrap(), 0);
+    }
+
+    /// The lever must actually fire: a front-to-back drain over a deep tree
+    /// performs structural deletes whose path is KEPT (repaired), not
+    /// re-derived. Counted in debug builds only, where the shadow check also
+    /// re-validates every kept path.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn cursor_drain_keeps_repaired_paths() {
+        let env = mem_env(PS, 8 << 20);
+        let db = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        let n = miri_scaled(150, 80);
+        for i in 0..n {
+            let (k, v) = wide_kv(i);
+            db.put(&mut txn, &k, &v).unwrap();
+        }
+        assert!(txn.main_record().depth >= 3);
+        let mut cur = db.rw_cursor(&mut txn);
+        while let Some((_k, _v)) = cur.move_next().unwrap() {
+            assert!(cur.del_current().unwrap());
+        }
+        // At ~6 wide entries per 4 K leaf, a 150-entry front drain rebalances
+        // dozens of times; the leftmost pairing keeps all of those except the
+        // rare separator-split fallback, so "many" is the honest bound.
+        assert!(
+            cur.repaired_keeps >= 10,
+            "kept-path repair never fired: {} structural keeps",
+            cur.repaired_keeps
+        );
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            failure_persistence: None,
+            cases: if cfg!(miri) { 16 } else { 256 },
+            ..Default::default()
+        })]
+
+        /// Random key sets, random partial drains: delete every `k`-th entry
+        /// through the cursor, then check the survivors equal a `BTreeMap`
+        /// model and the visited sequence was every key exactly once, in
+        /// order. Small keys keep the tree shallow *and* mixed-`pki` (both
+        /// repair and fallback paths fire); the wide-entry unit tests above
+        /// pin the deep-tree shapes. Sizes are miri-scaled like the case
+        /// count.
+        #[test]
+        fn cursor_partial_drain_matches_model(
+            entries in proptest::collection::btree_map(
+                proptest::collection::vec(proptest::prelude::any::<u8>(), 1..24),
+                proptest::collection::vec(
+                    proptest::prelude::any::<u8>(),
+                    0..if cfg!(miri) { 80 } else { 400 },
+                ),
+                1..if cfg!(miri) { 40usize } else { 120 },
+            ),
+            k in 1..5u32,
+        ) {
+            let env = mem_env(PS, 8 << 20);
+            let db = env.main_database();
+            let mut txn = env.write_txn().unwrap();
+            let mut model = entries.clone();
+            for (key, val) in &entries {
+                db.put(&mut txn, key, val).unwrap();
+            }
+            let mut seen = Vec::new();
+            {
+                let mut cur = db.rw_cursor(&mut txn);
+                let mut i = 0u32;
+                while let Some((key, _v)) = cur.move_next().unwrap() {
+                    let key = key.to_vec();
+                    if i % k == 0 {
+                        proptest::prop_assert!(cur.del_current().unwrap());
+                        model.remove(&key);
+                    }
+                    seen.push(key);
+                    i += 1;
+                }
+            }
+            // Every key visited exactly once, in order (nothing skipped or
+            // repeated around the deletes).
+            let all: Vec<Vec<u8>> = entries.keys().cloned().collect();
+            proptest::prop_assert_eq!(&seen, &all);
+            // Survivors match the model, by full dump and by point gets.
+            let left: Vec<(Vec<u8>, Vec<u8>)> =
+                model.iter().map(|(a, b)| (a.clone(), b.clone())).collect();
+            proptest::prop_assert_eq!(dump(&txn), left);
+            for key in entries.keys() {
+                let want = model.get(key).map(Vec::as_slice);
+                proptest::prop_assert_eq!(db.get(&txn, key).unwrap(), want);
+            }
+            // Drain the rest: still every survivor exactly once, then empty.
+            let rest = drain_all(&db, &mut txn);
+            let survivors: Vec<Vec<u8>> = model.keys().cloned().collect();
+            proptest::prop_assert_eq!(rest, survivors);
+            proptest::prop_assert_eq!(db.len(&txn).unwrap(), 0);
+        }
     }
 }
