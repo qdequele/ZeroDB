@@ -21,9 +21,18 @@ included, so they always see the candidate.
 
 ```
 export ZERODB_SRC=$PWD BS=<path to the benches-server scripts> BENCH_HOST=<user@bench-host>
-$BS/remote.sh -- '<command>'            # gate / profile; exit code is the command's
+$BS/remote.sh -- '<command>'            # profile / crash / stress; exit code is the command's
 TARGET='^<rung>$' $BS/ab.sh '^<family>/' # bench-ab in bench mode; last line = local verdict.json
+$BS/screen.sh <rung>                     # 1 round, target rung only, CGU1: ~10 min first look
+$BS/local-gate.sh                        # fmt/clippy/test/miri/fuzz on THIS machine, niced
 ```
+
+**Keep the bench server busy with timing only.** Only one A/B can run there at
+a time (two would disturb each other), so it is the loop's bottleneck. The
+correctness gate does not need a quiet machine: it runs here, in parallel with
+the server's A/B. While the server measures lever N, prepare lever N+1 in a
+second worktree (never in `$ZERODB_SRC` while a job or the local gate is
+reading it), and apply it once lever N is kept or reverted.
 
 The local `just bench-ab` is the fallback when the server is unreachable. It
 is only valid when the load precondition below holds.
@@ -117,50 +126,71 @@ findings, the files and the SPEC section. One mechanism only; no drive-by
 cleanups. Every behaviour stays the same, because this is a Phase 1 parity
 engine.
 
-## 5. Correctness gate, before any timing
-
-A fast wrong engine is worth nothing. Run:
+## 5. Screen it (~10 min)
 
 ```
-$BS/remote.sh -- 'cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && just fuzz-quick'
+$BS/screen.sh <rung>
 ```
 
-Append `&& cargo +nightly miri test -p zerodb-core` if `zerodb-core` logic
-changed. Append `&& just stress`, and `&& just loom` if the readers or nested
-txns are involved, for anything concurrent (locks, atomics, the writer slot).
-**Never edit, weaken or `#[ignore]` a test to get green** (CLAUDE.md rule 2).
-If the gate cannot pass without touching a test, revert the change, log it as
-`abandoned` with the failing test named, and end the iteration.
+One round, the target rung only, in Meilisearch's build. If `after ÷ before`
+is not at or below ~0.97, revert now and log it `reverted` with the screen's
+number. A lever that cannot move its own target in one round will not survive
+three, and this saves the ~2 h a full A/B and gate would cost. A screen never
+decides a keep on its own: it has no spread estimate.
 
-## 6. Measure it
+## 6. Correctness gate, in parallel with the measurement
+
+A fast wrong engine is worth nothing, and **nothing is kept without a green
+gate**. Start it here as soon as the screen passes, and start step 7 on the
+server at the same time:
+
+```
+$BS/local-gate.sh        # fmt, clippy, cargo test, miri (zerodb-core), fuzz-quick
+```
+
+For anything touching commit, durability or concurrency (locks, atomics, the
+writer slot) also run, on the server after the A/B, `$BS/remote.sh -- 'just
+crash-test-quick && just stress'`, and `just loom` if the readers or nested
+txns are involved. **Never edit, weaken or `#[ignore]` a test to get green**
+(CLAUDE.md rule 2). If the gate cannot pass without touching a test, revert the
+change, log it as `abandoned` with the failing test named, and end the
+iteration.
+
+## 7. Measure it
 
 ```
 TARGET='^<rung>$' $BS/ab.sh '^<family>/'
 ```
 
 The filter is the whole family, so the neighbouring rungs, and the family base
-rung, show whether the gain is real or just moved. Run it **twice**: with the
-default build (16 codegen units; how hannoy builds) and with
-`CARGO_PROFILE_BENCH_CODEGEN_UNITS=1` (how Meilisearch builds). PERF-GAP B13
-shows ZeroDB's hot paths sit at LLVM's inlining threshold, so a lever can win
-under one setting and lose under the other; keep it only if neither regresses. Three interleaved rounds by
-default. Read the `verdict.json` path it prints last → `verdict`:
+rung, show whether the gain is real or just moved. Run it in both builds.
+PERF-GAP B13 shows ZeroDB's hot paths sit at LLVM's inlining threshold, so a
+lever can win under one setting and lose under the other; keep it only if
+neither regresses:
+
+1. **Meilisearch's build, in full:** `CARGO_PROFILE_BENCH_CODEGEN_UNITS=1`,
+   three interleaved rounds (the default).
+2. **hannoy's build (16 codegen units, the default), one round:** `ROUNDS=1`.
+   Re-run only the rungs it flags, with three rounds, before calling them
+   regressions.
+
+Read the `verdict.json` path it prints last → `verdict`:
 
 | verdict | action |
 |---|---|
 | `invalid` | Re-run once. If still `invalid`, STOP and report that the machine is too noisy (LMDB drifted). |
 | `regressed` | Revert. |
 | `flat` | Revert. A change that does not pay for itself is just complexity. |
-| `improved` | Continue to step 7. |
+| `improved` | Continue to step 8 (and wait for the step 6 gate before keeping). |
 
-## 7. Breadth check, for `improved` only
+## 8. Breadth check, for `improved` only
 
 Run `ROUNDS=1 $BS/ab.sh '<every suite the changed code path serves>'`. For
 example, a btree change gets `'^(get|put|del|scan|seek|mixed)/'`. For any rung
 this reports as `regressed`, confirm with `ROUNDS=3` on that rung alone. A
 confirmed regression anywhere means revert. Say so in the ledger entry.
 
-## 8. Keep or revert, and always log it
+## 9. Keep or revert, and always log it
 
 **Keep:**
 
@@ -183,7 +213,7 @@ clean tree. Then run the same `perf-ledger add` with
 profile was wrong, the effect was below the noise, the cost moved to <rung>,
 and so on. Commit the ledger line. **A disproved idea is a result.**
 
-## 9. Report
+## 10. Report
 
 Report:
 

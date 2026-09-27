@@ -534,19 +534,40 @@ impl<'a> Tree<'a> {
     ///
     /// A [`PageError`] only if the tree is structurally corrupt.
     pub fn get(&self, key: &[u8]) -> Result<Option<&'a [u8]>, PageError> {
-        let mut c = Cursor::new(*self);
-        c.search(key)?;
-        if !c.initialized {
+        match self.find_exact(key)? {
+            Some((leaf, ki)) => Ok(Some(resolve_value(self.src, self.psize, &leaf, ki)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Root-to-leaf descent for an exact point lookup: the leaf holding `key`
+    /// and its slot, or `None` if absent. No cursor: a point lookup needs no
+    /// path, so it skips the [`PathStack`] and the leaf cache, and it takes
+    /// exactness from the leaf's binary search instead of comparing the found
+    /// key a second time. LMDB's `mdb_node_search` reports exactness the same
+    /// way, and `mdb_cursor_init` only resets the depth. The level bound and
+    /// its error match [`Cursor::search`]: `depth + 2` iterations, capped at
+    /// the `CURSOR_STACK` frames its path stack can push, so a hostile depth
+    /// over a page cycle fails after the same number of levels.
+    fn find_exact(&self, key: &[u8]) -> Result<Option<(LeafRef<'a>, usize)>, PageError> {
+        if self.root == PGNO_INVALID {
             return Ok(None);
         }
-        let (pgno, ki) = *c.stack.last().expect("initialized cursor has a leaf frame");
-        // The search just cached this leaf's view — no re-resolution.
-        let leaf = c.leaf_at(pgno)?;
-        if ki < leaf.num_keys() && self.cmp.eq(leaf.key(ki), key) {
-            Ok(Some(resolve_value(self.src, self.psize, &leaf, ki)?))
-        } else {
-            Ok(None)
+        let mut pgno = self.root;
+        for _ in 0..(self.depth as usize + 2).min(CURSOR_STACK) {
+            match node_view(self.src, self.psize, pgno, self.valid)? {
+                NodeView::Leaf(leaf) => {
+                    return Ok(match leaf.lookup_with(key, self.cmp) {
+                        Ok(ki) => Some((leaf, ki)),
+                        Err(_) => None,
+                    });
+                }
+                NodeView::Branch(br) => {
+                    pgno = br.child_pgno(br.child_index_with(key, self.cmp));
+                }
+            }
         }
+        Err(depth_exceeded())
     }
 
     /// Catalog lookup for the named-DB resolver (SPEC 02 §6): like [`Tree::get`]
@@ -558,22 +579,15 @@ impl<'a> Tree<'a> {
     ///
     /// A [`PageError`] only if the tree is structurally corrupt.
     pub fn get_catalog_entry(&self, key: &[u8]) -> Result<Option<(u16, &'a [u8])>, PageError> {
-        let mut c = Cursor::new(*self);
-        c.search(key)?;
-        if !c.initialized {
-            return Ok(None);
-        }
-        let (pgno, ki) = *c.stack.last().expect("initialized cursor has a leaf frame");
-        // The search just cached this leaf's view — no re-resolution.
-        let leaf = c.leaf_at(pgno)?;
-        if ki < leaf.num_keys() && self.cmp.eq(leaf.key(ki), key) {
-            let flags = leaf.node_flags(ki);
-            Ok(Some((
-                flags,
-                resolve_value(self.src, self.psize, &leaf, ki)?,
-            )))
-        } else {
-            Ok(None)
+        match self.find_exact(key)? {
+            Some((leaf, ki)) => {
+                let flags = leaf.node_flags(ki);
+                Ok(Some((
+                    flags,
+                    resolve_value(self.src, self.psize, &leaf, ki)?,
+                )))
+            }
+            None => Ok(None),
         }
     }
 
