@@ -18,7 +18,7 @@ macro_rules! bench_backend {
             use std::io::Write as _;
             use std::ops::Bound;
             use std::path::Path;
-            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
             use std::time::{Duration, Instant};
 
             use $heed::types::Bytes;
@@ -419,8 +419,20 @@ macro_rules! bench_backend {
             /// `writer_under_readers`'s reader threads a responsive stop
             /// condition, and it is generated identically for both engines by
             /// this same macro body.
-            fn scan_chunked_until_stop(env: &BEnv, db: Db, stop: &AtomicBool, chunk: usize) {
+            fn scan_chunked_until_stop(
+                env: &BEnv,
+                db: Db,
+                stop: &AtomicBool,
+                chunk: usize,
+                ready: Option<&AtomicUsize>,
+            ) {
                 let r = env.read_txn().expect("read_txn");
+                // Signal only once the read txn is open, so the writer's timer
+                // starts under real reader pressure (a spawned thread has not
+                // necessarily opened anything yet).
+                if let Some(ready) = ready {
+                    ready.fetch_add(1, Ordering::Release);
+                }
                 let mut n = 0usize;
                 for kv in db.iter(&r).expect("iter") {
                     let _ = kv.expect("entry");
@@ -449,13 +461,25 @@ macro_rules! bench_backend {
             ) -> Duration {
                 const READER_STOP_POLL_CHUNK: usize = 1024;
                 let stop = AtomicBool::new(false);
+                let ready = AtomicUsize::new(0);
                 std::thread::scope(|s| {
                     for _ in 0..readers {
                         s.spawn(|| {
+                            let mut first = Some(&ready);
                             while !stop.load(Ordering::Relaxed) {
-                                scan_chunked_until_stop(env, db, &stop, READER_STOP_POLL_CHUNK);
+                                scan_chunked_until_stop(
+                                    env,
+                                    db,
+                                    &stop,
+                                    READER_STOP_POLL_CHUNK,
+                                    first.take(),
+                                );
                             }
                         });
+                    }
+                    // Time the writer only once every reader holds a read txn.
+                    while ready.load(Ordering::Acquire) < readers {
+                        std::thread::yield_now();
                     }
                     let start = Instant::now();
                     for b in 0..batches {

@@ -39,6 +39,7 @@ LADDER_BASE = {
     "get/size": "get/size/n1k",
     "get/key": "get/key/k8",
     "get/val": "get/val/v8",
+    "get/val_touch": "get/val/v8_touch",
     "scan/full": "scan/full/fwd",
     "scan/range": "scan/range/1pct",
     "seek/ge": "seek/ge/seq",
@@ -104,9 +105,18 @@ def human(ns: float) -> str:
 
 
 def family_of(group: str) -> str:
-    """`get/db/named` -> `get/db`. The rungs a ladder step compares within."""
+    """`get/db/named` -> `get/db`. The rungs a ladder step compares within.
+
+    `*_touch` rungs are their own ladder (`get/val/v8_touch` → `v4k_touch` →
+    `v2page_touch`, docs/BENCH-MAP.md) with `v8_touch` as the control, so
+    `get/val/v4k_touch` -> `get/val_touch`: comparing them against `get/val/v8`
+    would mix the touch's cost into the value-width delta.
+    """
     parts = group.split("/")
-    return "/".join(parts[:2]) if len(parts) > 2 else group
+    if len(parts) <= 2:
+        return group
+    family = "/".join(parts[:2])
+    return family + "_touch" if parts[-1].endswith("_touch") else family
 
 
 def main() -> int:
