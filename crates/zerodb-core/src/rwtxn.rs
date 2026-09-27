@@ -2493,7 +2493,31 @@ impl<'env> RwTxn<'env> {
         if rec.root != PGNO_INVALID {
             let mut pages = Vec::new();
             let mut runs = Vec::new();
-            let res = self.collect_tree(rec.root, rec.depth, &mut pages, &mut runs);
+            // Leaf-skipping fast path (SPEC 02 §6.1, LMDB `mdb_drop0`): a tree
+            // whose record says it has no overflow pages frees its leaf pgnos
+            // straight from the lowest branch level, never reading the leaves.
+            // Any overflow forces the full walk, which reads every leaf to
+            // find the runs.
+            let res = if rec.overflow_pages == 0 {
+                let mut r =
+                    self.collect_tree_skip_leaves(rec.root, rec.depth, &mut pages, &mut runs);
+                if r.is_ok() {
+                    // The unread leaves were never loaded, so a hostile image
+                    // aliasing one pgno under several branch pointers would
+                    // free it twice (the full walk double-frees such a page
+                    // too, but only after loading it). Refuse the whole clear
+                    // instead — nothing has been freed yet.
+                    let mut sorted = pages.clone();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    if sorted.len() != pages.len() {
+                        r = Err(Error::Mdb(MdbError::Invalid));
+                    }
+                }
+                r
+            } else {
+                self.collect_tree(rec.root, rec.depth, &mut pages, &mut runs)
+            };
             if let Err(e) = res {
                 self.errored = true;
                 return Err(e);
@@ -2671,6 +2695,75 @@ impl<'env> RwTxn<'env> {
                     .map_err(corrupt)?;
                 for i in 0..br.num_keys() {
                     self.collect_tree(br.child_pgno(i), level - 1, pages, runs)?;
+                }
+                pages.push(pgno);
+                Ok(())
+            }
+            _ => Err(Error::Mdb(MdbError::Invalid)),
+        }
+    }
+
+    /// Leaf-skipping variant of [`collect_tree`](Self::collect_tree) for a
+    /// tree whose record says `overflow_pages == 0` (SPEC 02 §6.1, LMDB
+    /// `mdb_drop0`): branch pages are read as before, but the children of the
+    /// lowest branch level — and a root-is-leaf root — are collected WITHOUT
+    /// loading the leaf pages, so `clear`/`drop` reads only the branches.
+    ///
+    /// An unread pgno bypasses the loader's own bounds check, so it is
+    /// classified here before it may reach the free list: it must be dirty in
+    /// this txn (a this-txn allocation, legitimately past the committed
+    /// high-water) or lie in `[FIRST_DATA_PGNO, committed_last_pg]`. Anything
+    /// else — a meta slot (0/1) or a pgno past the committed high-water —
+    /// gets the same typed `Invalid` the full walk's loader returns, and the
+    /// caller then frees nothing (collect-before-free). What is NOT checked is
+    /// the page's type: a corrupt record that understates the depth frees the
+    /// mis-typed page (in-bounds, so non-corrupting) and leaks its subtree,
+    /// where the full walk returned `Invalid`.
+    fn collect_tree_skip_leaves(
+        &self,
+        pgno: u64,
+        level: u16,
+        pages: &mut Vec<u64>,
+        runs: &mut Vec<(u64, u64)>,
+    ) -> Result<()> {
+        if level == 0 {
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
+        // Hostile-depth guard, exactly as `collect_tree`.
+        if level as usize > crate::btree::CURSOR_STACK {
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
+        if level == 1 {
+            // The leaf level: bound-check (see above), collect unread.
+            if self.dirty.contains(pgno)
+                || (FIRST_DATA_PGNO..=self.committed_last_pg).contains(&pgno)
+            {
+                pages.push(pgno);
+                return Ok(());
+            }
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
+        let page = self.load(pgno)?;
+        match page.page_type() {
+            PageType::Branch => {
+                let br = branch_view(self.source(), self.psize, pgno, Some(&self.validated))
+                    .map_err(corrupt)?;
+                for i in 0..br.num_keys() {
+                    self.collect_tree_skip_leaves(br.child_pgno(i), level - 1, pages, runs)?;
+                }
+                pages.push(pgno);
+                Ok(())
+            }
+            // A leaf above the leaf level (ragged — only a hostile image):
+            // handled exactly as the full walk handles a loaded leaf — scan
+            // it for overflow refs and collect the page itself.
+            PageType::Leaf => {
+                let leaf = leaf_view(self.source(), self.psize, pgno, Some(&self.validated))
+                    .map_err(corrupt)?;
+                for i in 0..leaf.num_keys() {
+                    if let LeafValue::Overflow { head_pgno, dsize } = leaf.value(i) {
+                        runs.push((head_pgno, overflow_page_count(dsize as u64, self.psize)));
+                    }
                 }
                 pages.push(pgno);
                 Ok(())

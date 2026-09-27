@@ -808,6 +808,25 @@ side. **Still ~480× LMDB:** heed over LMDB derives the figure from `mdb_stat`
 page counts per DB and never reads the free list (O(#DBs)). Matching that is
 the next step and needs a SPEC GC-23/24 amendment.
 
+### B21. `clear` read every leaf of the tree — **DONE 2026-09-27**
+`clear_tree` → `collect_tree` loaded every page, leaves included, to collect
+the pgnos to free. LMDB's `mdb_drop0` walks only to the lowest branch level
+when the DB has no overflow pages and frees the leaf pgnos from the child
+pointers without reading the leaves. `clear_tree` now does the same when the
+working record's `overflow_pages == 0` (`collect_tree_skip_leaves`); otherwise
+the full walk is unchanged. Every unread pgno must be dirty in this txn or lie
+in `[FIRST_DATA_PGNO, committed last_pg]`, else `Invalid`; collection happens
+before any free, so a crafted pointer never reaches the free list, and an
+aliased child refuses the clear. SPEC 02 §6.1 states the rule.
+
+Bench server, x86-64, 4 KiB (bench-ab): `del/clear/all` 12.73× → 1.78× (CGU1,
+3 rounds, 0.141) and 12.15× → 1.88× (CGU16, 0.155). The per-key delete rungs
+(`del/bulk/*`, `del/range/half`, `del/churn`) read +4–7 % in both builds, but
+every function on their path (`delete_tree`, `delete_at_path`, `rebalance`,
+`merge_pages`, `borrow_entry`, `free_page`, `touch`, `touch_path`,
+`search_path`, `update_parent_key`) disassembles identically; only
+`clear_tree`/`collect_tree` changed: layout (B13 point 4).
+
 ## C. RAM (peak memory)
 
 ### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**
