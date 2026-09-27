@@ -22,6 +22,19 @@
 //! is met by construction; the store never drops a frame under a `&self`
 //! borrow). This module is pure safe Rust with no I/O; `miri` exercises it
 //! (TXN-49).
+//!
+//! **Frame reuse (PERF-GAP B3/B12; LMDB's `me_dpages` pool).** A freed or
+//! discarded one-page frame is not returned to the allocator immediately;
+//! [`DirtyStore::discard`] parks it on a bounded `spare` list, and
+//! [`DirtyStore::insert_tree_frame`] / [`DirtyStore::insert_copy`] reuse a
+//! spare (zero-filling or overwriting it) before falling back to a fresh
+//! allocation. This keeps the stability contract intact — spares are still
+//! individually boxed and only move to/from `spare` inside `&mut` ops — while
+//! avoiding a slow-path `malloc`+`free` of a full page (above glibc's tcache
+//! bin) per touched or new page. Run frames (multi-page) are never pooled;
+//! they are just dropped. The env hands a store its initial spares at
+//! write-txn begin and reclaims them at end (see [`DirtyStore::with_spare`] /
+//! [`DirtyStore::reclaimable_frames`]).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -62,12 +75,29 @@ impl Hasher for PgnoHasher {
 
 pub(crate) type PgnoBuildHasher = BuildHasherDefault<PgnoHasher>;
 
+/// Cap on pooled one-page frames — both a store's `spare` list and the
+/// env-level pool it draws from (PERF-GAP B3/B12).
+///
+/// LMDB's `me_dpages` pool has no such cap because LMDB *spills* dirty pages
+/// (`mdb_page_spill`), so its dirty set — and therefore its pool — is bounded
+/// (`MDB_IDL_UM_MAX`). ZeroDB has no spill: the whole dirty set lives in RAM
+/// until commit (SPEC 04), so an uncapped pool would retain a large indexing
+/// txn's entire dirty set as spares for the rest of the env's life. 256
+/// one-page frames is ≈ 1 MiB at a 4 KiB page size — enough to serve the
+/// small, bursty write txns that dominate, cheap to hold onto.
+pub(crate) const SPARE_CAP: usize = 256;
+
 /// A write txn's dirty-page frames, indexed by pgno. See the module docs for
 /// the stability contract.
 #[derive(Debug)]
 pub struct DirtyStore {
     psize: u32,
     frames: HashMap<u64, Box<[u8]>, PgnoBuildHasher>,
+    /// Recycled one-page frames (exactly `psize` bytes each), reused by
+    /// `insert_tree_frame` / `insert_copy` before allocating (PERF-GAP B3).
+    /// Frames only move to/from here inside `&mut` ops, preserving the TXN-41
+    /// stability contract; bounded by [`SPARE_CAP`].
+    spare: Vec<Box<[u8]>>,
 }
 
 impl DirtyStore {
@@ -77,6 +107,24 @@ impl DirtyStore {
         DirtyStore {
             psize,
             frames: HashMap::default(),
+            spare: Vec::new(),
+        }
+    }
+
+    /// An empty store seeded with a pool of recycled one-page frames (the
+    /// env's `me_dpages`-style pool handed in at write-txn begin, PERF-GAP
+    /// B12). The `Vec` is adopted as is, O(1): every write txn, empty ones
+    /// included, pays for the pool hand-over, so it must not scale with the
+    /// pool size (a per-frame filter here made `env/txn/rw_empty_commit` 6×
+    /// slower). The pool only ever holds frames of this env's page size.
+    #[must_use]
+    pub fn with_spare(psize: u32, mut spare: Vec<Box<[u8]>>) -> DirtyStore {
+        debug_assert!(spare.iter().all(|f| f.len() == psize as usize));
+        spare.truncate(SPARE_CAP);
+        DirtyStore {
+            psize,
+            frames: HashMap::default(),
+            spare,
         }
     }
 
@@ -124,9 +172,42 @@ impl DirtyStore {
     }
 
     /// Insert a fresh zeroed one-page tree frame for `pgno` and return it
-    /// mutably (the caller formats it as a leaf/branch page).
+    /// mutably (the caller formats it as a leaf/branch page). Reuses a pooled
+    /// spare when one is available, zero-filling it — callers rely on the frame
+    /// being all-zero (e.g. `ZeroReserve` regions, TXN-47).
     pub fn insert_tree_frame(&mut self, pgno: u64) -> &mut [u8] {
-        let frame = vec![0u8; self.psize as usize].into_boxed_slice();
+        let frame = match self.spare.pop() {
+            Some(mut f) => {
+                debug_assert_eq!(f.len(), self.psize as usize, "spare frame is one page");
+                f.fill(0);
+                f
+            }
+            None => vec![0u8; self.psize as usize].into_boxed_slice(),
+        };
+        self.frames.insert(pgno, frame);
+        self.frames
+            .get_mut(&pgno)
+            .map(|b| &mut **b)
+            .expect("frame was just inserted")
+    }
+
+    /// Insert a one-page COW copy of `src` for `pgno` and return it mutably (the
+    /// caller restamps the header). Reuses a pooled spare, overwriting it with
+    /// `src`, before allocating (PERF-GAP B3). `src` must be exactly one page.
+    pub fn insert_copy(&mut self, pgno: u64, src: &[u8]) -> &mut [u8] {
+        debug_assert_eq!(
+            src.len(),
+            self.psize as usize,
+            "insert_copy is one-page only"
+        );
+        let frame = match self.spare.pop() {
+            Some(mut f) => {
+                debug_assert_eq!(f.len(), self.psize as usize, "spare frame is one page");
+                f.copy_from_slice(src);
+                f
+            }
+            None => src.into(),
+        };
         self.frames.insert(pgno, frame);
         self.frames
             .get_mut(&pgno)
@@ -138,6 +219,46 @@ impl DirtyStore {
     /// or rebound by loose-page reuse). Only called from `&mut` ops (TXN-43).
     pub fn remove(&mut self, pgno: u64) -> Option<Box<[u8]>> {
         self.frames.remove(&pgno)
+    }
+
+    /// Discard the frame for `pgno` (freed within the txn). A one-page frame is
+    /// parked on the `spare` pool for reuse if there is room; a run frame
+    /// (multi-page) or an overflow past [`SPARE_CAP`] is dropped. Like
+    /// [`DirtyStore::remove`], only called from `&mut` ops (TXN-43): the frame
+    /// leaves `frames` at a `&mut` boundary, so no borrow can alias it.
+    pub fn discard(&mut self, pgno: u64) {
+        if let Some(frame) = self.frames.remove(&pgno) {
+            if frame.len() == self.psize as usize && self.spare.len() < SPARE_CAP {
+                self.spare.push(frame);
+            }
+        }
+    }
+
+    /// Take up to `cap` one-page frames out of this store — spares first, then
+    /// remaining one-page dirty frames — to hand back to the env pool at
+    /// end-of-txn (PERF-GAP B12). Called only after the commit pipeline has
+    /// finished writing (or on abort, where the frames are discarded garbage):
+    /// recycled contents never matter because every reuse zero-fills or fully
+    /// overwrites. Run frames are left behind to drop with the store.
+    #[must_use]
+    pub fn reclaimable_frames(&mut self, cap: usize) -> Vec<Box<[u8]>> {
+        // The spare `Vec` moves out whole (O(1)); only this txn's dirty frames
+        // are walked, so the hand-back costs O(pages dirtied), like LMDB
+        // returning its dirty list to `me_dpages`.
+        let ps = self.psize as usize;
+        let mut out = std::mem::take(&mut self.spare);
+        out.truncate(cap);
+        if out.len() < cap && !self.frames.is_empty() {
+            for (_, f) in self.frames.drain() {
+                if out.len() >= cap {
+                    break;
+                }
+                if f.len() == ps {
+                    out.push(f);
+                }
+            }
+        }
+        out
     }
 
     /// Dirty pgnos in ascending order — the commit write-out order (C2 writes
@@ -186,5 +307,73 @@ mod tests {
             s.insert(pgno, vec![0u8; 4096].into_boxed_slice());
         }
         assert_eq!(s.sorted_pgnos(), vec![2, 3, 9, 40]);
+    }
+
+    #[test]
+    fn discarded_one_page_frame_is_reused_and_zeroed() {
+        // A discarded one-page frame is handed back to the next allocation
+        // (same buffer, no fresh malloc), and `insert_tree_frame` returns it
+        // all-zero even though it last held data (PERF-GAP B3).
+        let mut s = DirtyStore::new(4096);
+        s.insert_copy(7, &[0xAB; 4096]);
+        let addr = s.bytes(7).unwrap().as_ptr() as usize;
+        s.discard(7);
+        // insert_copy reuses the same buffer, overwriting it.
+        let reused = s.insert_copy(8, &[0xCD; 4096]).as_ptr() as usize;
+        assert_eq!(reused, addr, "insert_copy reused the discarded frame");
+        assert!(s.bytes(8).unwrap().iter().all(|&b| b == 0xCD));
+        // Discard again; this time a tree frame must come back zeroed.
+        s.discard(8);
+        let f = s.insert_tree_frame(9);
+        assert_eq!(f.as_ptr() as usize, addr, "insert_tree_frame reused it");
+        assert!(f.iter().all(|&b| b == 0), "reused tree frame is zeroed");
+    }
+
+    #[test]
+    fn run_frames_are_not_pooled() {
+        // A discarded multi-page (run) frame is dropped, not parked as a spare:
+        // the next one-page allocation must allocate fresh, not hand out a
+        // slice of the wrong length.
+        let mut s = DirtyStore::new(4096);
+        s.insert(10, vec![1u8; 3 * 4096].into_boxed_slice());
+        s.discard(10);
+        let f = s.insert_tree_frame(11);
+        assert_eq!(f.len(), 4096, "one-page frame, not the 3-page run");
+    }
+
+    #[test]
+    fn spare_pool_respects_cap() {
+        // No more than SPARE_CAP frames are ever parked; overflow is dropped.
+        let mut s = DirtyStore::new(4096);
+        for pgno in 0..(SPARE_CAP as u64 + 50) {
+            s.insert_tree_frame(pgno);
+        }
+        for pgno in 0..(SPARE_CAP as u64 + 50) {
+            s.discard(pgno);
+        }
+        assert_eq!(s.spare.len(), SPARE_CAP, "spare list capped at SPARE_CAP");
+        // reclaimable_frames also honors its own cap argument.
+        let taken = s.reclaimable_frames(10);
+        assert_eq!(taken.len(), 10);
+    }
+
+    #[test]
+    fn with_spare_seeds_and_reclaim_returns_frames() {
+        // A store seeded from the env pool reuses those frames; reclaim then
+        // hands one-page frames (spare + dirty) back, capped.
+        let seed: Vec<Box<[u8]>> = (0..3).map(|_| vec![9u8; 4096].into_boxed_slice()).collect();
+        let seed_addr = seed[2].as_ptr() as usize; // last popped first
+        let mut s = DirtyStore::with_spare(4096, seed);
+        let f = s.insert_tree_frame(1);
+        assert_eq!(f.as_ptr() as usize, seed_addr, "seeded spare reused");
+        // Two spares left plus one dirty frame => three reclaimable.
+        let back = s.reclaimable_frames(SPARE_CAP);
+        assert_eq!(back.len(), 3);
+        // The spare Vec is handed over whole: its allocation survives the
+        // round trip (no per-frame copy into a fresh Vec).
+        let pool_ptr = back.as_ptr() as usize;
+        let mut s2 = DirtyStore::with_spare(4096, back);
+        let back2 = s2.reclaimable_frames(SPARE_CAP);
+        assert_eq!(back2.as_ptr() as usize, pool_ptr);
     }
 }

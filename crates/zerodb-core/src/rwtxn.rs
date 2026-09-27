@@ -594,7 +594,7 @@ impl Env {
         if inner.is_poisoned() {
             return Err(poisoned_error());
         }
-        let guard = inner.lock_writer();
+        let mut guard = inner.lock_writer();
         // Recheck under the lock: a concurrent commit may have failed while we
         // blocked on the mutex.
         if inner.is_poisoned() {
@@ -618,7 +618,10 @@ impl Env {
             open: OpenTable::default(),
             path_buf: Path::new(),
             psize: inner.page_size(),
-            dirty: DirtyStore::new(inner.page_size()),
+            // Seed the dirty store's spare list with the frames recycled from
+            // earlier write txns (LMDB's `me_dpages`, PERF-GAP B12); they came
+            // with the writer slot, so this takes no lock.
+            dirty: DirtyStore::with_spare(inner.page_size(), guard.take_frames()),
             validated: ValidatedPages::new(),
             freed: Vec::new(),
             loose: Vec::new(),
@@ -1240,7 +1243,7 @@ impl<'env> RwTxn<'env> {
     /// frame here is sound because freeing only happens inside `&mut` ops,
     /// where no borrow into the frame can be live (TXN-39/43).
     fn free_page(&mut self, pgno: u64) {
-        let _ = self.dirty.remove(pgno);
+        self.dirty.discard(pgno);
         if pgno > self.committed_last_pg || self.reclaimed.contains(&pgno) {
             self.loose.push(pgno);
         } else {
@@ -1250,7 +1253,8 @@ impl<'env> RwTxn<'env> {
 
     /// Free a whole overflow run (SPEC 03 §8: all `n` pgnos).
     fn free_run(&mut self, head: u64, n: u64) {
-        let _ = self.dirty.remove(head);
+        // Run frames are multi-page; `discard` drops them rather than pooling.
+        self.dirty.discard(head);
         for p in head..head + n {
             if p > self.committed_last_pg || self.reclaimed.contains(&p) {
                 self.loose.push(p);
@@ -1279,18 +1283,21 @@ impl<'env> RwTxn<'env> {
         let base = (pgno as usize)
             .checked_mul(ps)
             .ok_or(Error::Mdb(MdbError::Invalid))?;
-        let src = self
-            .bytes
+        // Copy the `&'env [u8]` map handle out of `self` (it is `Copy`, lifetime
+        // 'env) so the source borrow does not alias the `&mut self.dirty` op
+        // below — letting `insert_copy` copy straight into a pooled frame.
+        let map: &[u8] = self.bytes;
+        let src = map
             .get(base..base + ps)
             .ok_or(Error::Mdb(MdbError::Invalid))?;
-        let mut frame: Box<[u8]> = src.into();
         let np = self.allocate(1)?;
-        // Restamp the copy's identity (SPEC 02 §2: pgno + writer txnid).
-        let mut hdr = crate::page::CommonHeader::read(&frame);
+        // Copy the committed page into a fresh (or recycled) frame, then restamp
+        // the copy's identity in place (SPEC 02 §2: pgno + writer txnid).
+        let frame = self.dirty.insert_copy(np, src);
+        let mut hdr = crate::page::CommonHeader::read(frame);
         hdr.pgno = np;
         hdr.txnid = self.txnid;
-        hdr.write(&mut frame);
-        self.dirty.insert(np, frame);
+        hdr.write(frame);
         self.free_page(pgno);
         Ok(np)
     }
@@ -3054,6 +3061,28 @@ impl<'env> RwTxn<'env> {
         }));
         Ok(())
         // Drop of `self` releases the write mutex — the tail of C6.
+    }
+}
+
+impl Drop for RwTxn<'_> {
+    fn drop(&mut self) {
+        // Reclaim up to `SPARE_CAP` one-page frames into the writer slot's pool for
+        // the next write txn (LMDB's `me_dpages` reuse, PERF-GAP B12). This runs
+        // on every end-of-txn path — commit success, commit failure, and abort
+        // (which is `drop(self)`) — and is safe on all of them:
+        //   * The commit pipeline has fully returned before this drop begins, so
+        //     C2 has finished copying every dirty frame to disk. All write
+        //     backends copy synchronously (pwrite / msync `memcpy`); none retain
+        //     a reference to a frame buffer past the write call, so no frame is
+        //     recycled while a write still reads it.
+        //   * On abort/failure the frames are unwritten garbage; recycled
+        //     contents never matter because every reuse (`insert_copy` /
+        //     `insert_tree_frame`) fully overwrites or zero-fills the frame.
+        // The frames ride back on the writer guard, which stores them in the
+        // slot under the release lock it takes anyway when this txn's fields
+        // drop right after this method.
+        let frames = self.dirty.reclaimable_frames(crate::dirty::SPARE_CAP);
+        self._guard.give_back_frames(frames);
     }
 }
 

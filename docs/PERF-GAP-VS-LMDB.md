@@ -738,6 +738,33 @@ but every cursor function they run (`next`, `prev`, `ascend_next`,
 `set_range`, `search`, `first`, `last`) disassembles identically in both
 builds, shifted by 80 bytes: layout, not this change (B13 point 4).
 
+### B18. A fresh 4 KiB frame per touched page — **DONE 2026-09-27 (maintainer override)**
+Every first-touch COW copied the page into a new `Box` and every new page
+allocated a zeroed one; freed and committed frames went back to the allocator
+(4 KiB is above glibc's tcache size). LMDB reuses dirty-page buffers through
+`me_dpages`, within and across write txns. `DirtyStore` now keeps a spare list
+of one-page frames (freed frames go there; `touch` copies into one, new pages
+zero-fill one), and the spares ride across txns in the writer slot's state,
+under the writer lock's own mutex as LMDB keeps `me_dpages` under its writer
+mutex, so the hand-over costs no lock of its own. Capped at 256 frames (1 MiB
+at 4 KiB): LMDB's pool is bounded because it spills dirty pages, ZeroDB has no
+spill. Frames stay individually boxed (TXN-41), and every reuse overwrites or
+zero-fills the frame, so the file bytes are unchanged.
+
+Bench server, x86-64, 4 KiB, CGU1 (bench-ab, 3 rounds, on top of B17):
+
+| rung | before | after |
+|---|---|---|
+| `put/gc/drain_big` | 1.58× | 1.17× |
+| `commit/batch/n1` | 2.05× | 1.93× |
+| `put/val/v4k` | 1.04× | 1.00× |
+| `env/txn/rw_empty_commit` | 2.19× | 2.41× |
+
+The empty-write-txn cost (~+10–15 % at CGU1, flat at CGU16; three designs
+tried, the last with zero extra lock operations) is accepted by the maintainer
+for the gains on page-heavy writes; Meilisearch does not run empty write txns
+in a hot loop.
+
 ## C. RAM (peak memory)
 
 ### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**

@@ -216,12 +216,48 @@ struct WriterSlot {
     /// `notify_one` a `futex_wake` system call even with nobody waiting, which
     /// cost one syscall per write txn (`env/txn/rw_empty_commit`).
     waiters: u32,
+    /// Reusable one-page dirty-frame buffers carried across write txns
+    /// (LMDB's `me_dpages`, PERF-GAP B12). Kept under the writer lock's own
+    /// mutex, as LMDB keeps `me_dpages` under its writer mutex: the frames
+    /// move out with the acquire and back with the release, so the pool costs
+    /// no lock operation of its own (a separate `Mutex` made every write txn,
+    /// empty ones included, ~36 % slower).
+    frames: FramePool,
+}
+
+/// The recycled frames in [`WriterSlot`]. A newtype only so `Debug` prints a
+/// count instead of every frame's bytes.
+#[derive(Default)]
+struct FramePool(Vec<Box<[u8]>>);
+
+impl std::fmt::Debug for FramePool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FramePool({} frames)", self.0.len())
+    }
 }
 
 /// Ownership of the writer slot; releases it on drop, from any thread.
 /// Held by `RwTxn` for its whole life (TXN-6).
 pub(crate) struct WriterGuard<'env> {
     lock: &'env WriterLock,
+    /// The recycled frames: taken from the slot at acquire, handed to the
+    /// txn's dirty store, given back at txn end, stored at release.
+    frames: Vec<Box<[u8]>>,
+}
+
+impl WriterGuard<'_> {
+    /// The recycled-frame pool taken with the writer slot, for the new write
+    /// txn's dirty store. O(1): the `Vec` moves whole.
+    pub(crate) fn take_frames(&mut self) -> Vec<Box<[u8]>> {
+        std::mem::take(&mut self.frames)
+    }
+
+    /// Frames to store back into the slot when this guard releases it, capped
+    /// at [`crate::dirty::SPARE_CAP`].
+    pub(crate) fn give_back_frames(&mut self, mut frames: Vec<Box<[u8]>>) {
+        frames.truncate(crate::dirty::SPARE_CAP);
+        self.frames = frames;
+    }
 }
 
 impl WriterLock {
@@ -256,7 +292,8 @@ impl WriterLock {
             g.waiters -= 1;
         }
         g.occupied = true;
-        WriterGuard { lock: self }
+        let frames = std::mem::take(&mut g.frames.0);
+        WriterGuard { lock: self, frames }
     }
 }
 
@@ -268,6 +305,7 @@ impl Drop for WriterGuard<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         g.occupied = false;
+        g.frames.0 = std::mem::take(&mut self.frames);
         // One waiter at most can make progress (single writer), so
         // `notify_one` suffices; drop the flag lock before notify is not
         // required for correctness (the waiter re-checks under the lock).
