@@ -253,3 +253,13 @@ then repeated the header checks and ran 4–5 % slower than validating ones. Tha
 as LMDB's `IS_LEAF` test is. Nested read txns share the parent's memo and so
 its policy. `check::check_image` never uses a memo and ignores the policy.
 
+
+**Measured (bench server, x86-64, 4 KiB pages, 2026-09-28).** Gate (a),
+validating path against the commit before the option: flat on 34 of 35
+read, seek, scan, commit and put rungs (CGU1, 3 rounds) and on every rung
+at CGU16. Gate (b), trusting against validating on one build (CGU1 and
+CGU16, 1 round each), ZeroDB ÷ LMDB: random gets 1.14–1.21× → 0.91–0.96×,
+seeks 1.11–1.31× → 0.89–1.10×, range scans 1.73–1.81× → 1.33–1.38×, prefix
+scan 2.33× → 1.74×, full scans 1.6–1.7× → 1.4–1.45×; no rung slower. Reads
+of overflow values (`get/val/v2page`, `v4k`) and `scan/edge/first_last` did
+not move: their gap is not validation.
