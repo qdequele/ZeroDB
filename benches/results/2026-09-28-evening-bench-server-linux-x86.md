@@ -47,6 +47,21 @@ The commit span read 1.23×, but it did not reproduce in two follow-up checks:
 
 So at 1M documents indexing is at parity end to end; the 1.23× span is most likely spread on an fsync-bound span on this SATA RAID 1. Search is at parity; the facet sort buckets (range scans over the facet trees) are 1.21×.
 
+### Hackernews replay: default vs trusted, with search and memory
+
+A direct replay of the hackernews **search** workload's setup (the same ten uploads, with the search settings: title searchable, `by` filterable, `score`/`time` sortable) against three Meilisearch binaries, two runs each, then its five queries (5 warm-up rounds, 50 timed; median client-side latency, HTTP included). `zerodb-trusted` is a bench-only build that opens the index envs with the ADR-0014 trusted-file policy (one line at the index open); Meilisearch's code is otherwise unchanged. Peak memory is the server's `ru_maxrss`, which includes the mapped file pages it touched.
+
+| | LMDB | ZeroDB | ZeroDB trusted |
+|---|---:|---:|---:|
+| indexing, 100k + 900k batches | 14.8 / 14.9 s | 14.4 / 15.5 s | 14.9 / 15.4 s |
+| bytes written | 1.54–1.55 GB | 1.51–1.65 GB | 1.56–1.62 GB |
+| index file | 1.00 GB | 0.96–1.11 GB | 1.02–1.07 GB |
+| peak RSS | 3.91–4.10 GB | 4.02–4.27 GB | 4.20–4.23 GB |
+| 5 queries, sum of medians | 22.4 ms | 23.7 ms (+6 %) | 23.05 ms (+3 %) |
+| └ `rust meilisearch`, `NOT by = tpayet`, sort score/time | 15.9 ms | 17.0 ms | 16.5 ms |
+
+Indexing, bytes written and file size are at parity. The search gap is almost entirely the one query that sorts through the facet trees (range scans), the path still 1.5–1.6× on the ladder; trusted mode halves it. The other four queries are within 3 %.
+
 ## Engine ladder (long tier)
 
 Three ladder runs of the same binary, back to back: default options, every ZeroDB env opened with the trusted-file policy (`ZERODB_BENCH_TRUST_FILE=1`), and every ZeroDB env with sequential writes on (`ZERODB_BENCH_SEQUENTIAL_WRITES=1`). Each column is its own run's ZeroDB ÷ LMDB; LMDB and ZeroDB times are from the default run. These are single runs, not interleaved A/Bs: a difference under ~3 % between columns is noise. The measured A/Bs are in the perf ledger and in ADR-0014 / ADR-0015.
