@@ -40,7 +40,12 @@ The hackernews workloads from Meilisearch's own bench suite: 1M documents indexe
 | search, total self time (6 runs) | 33.2 ms | 33.4 ms | **1.01×** |
 | └ `search::sort::next_bucket` | 5.1 ms | 6.2 ms | 1.21× |
 
-At this scale the commit of a large write txn is ZeroDB's weak spot (1.23×), which no ladder rung exercises (`commit/batch/n10k` commits ~10k small puts). Search is at parity; the facet sort buckets (range scans over the facet trees) are 1.21×.
+The commit span read 1.23×, but it did not reproduce in two follow-up checks:
+
+- **Direct replay** of the same indexing workload against each engine's Meilisearch binary (two runs each; the last nine uploads autobatch into one 900k-document txn): 122.1 / 123.8 s for LMDB against 124.3 / 123.2 s for ZeroDB (1.00–1.02×). ZeroDB wrote 6.65–6.69 GB against 6.58–6.62 GB (+1 %) with 489k write syscalls against 768k–882k, and its index file ended at 4.00–4.04 GB against 3.93–3.94 GB (+2–3 %).
+- **`examples/big_commit_census.rs`** (10 durable batches of 200k random-key puts over 8 DBs, Meilisearch-like value sizes): commit 18.3–18.7 s against 17.9 s (~1.03×), dominated by `pwritev` and `fdatasync`; the puts themselves are 1.14× (the descent into large trees).
+
+So at 1M documents indexing is at parity end to end; the 1.23× span is most likely spread on an fsync-bound span on this SATA RAID 1. Search is at parity; the facet sort buckets (range scans over the facet trees) are 1.21×.
 
 ## Engine ladder (long tier)
 
@@ -125,4 +130,4 @@ Three ladder runs of the same binary, back to back: default options, every ZeroD
 - `env/open/create` 8.5×: by design (two fsyncs, PERF-GAP B9).
 - `del/cursor/drain` 2.7×, `commit/batch/n1` 2.0×, `env/txn/rw_empty_commit` 2.5×: commit and delete-path constants.
 - `scan/*` 1.5–2.2× (1.2–1.9× trusted), `del/bulk/*` 1.75×, overflow-value reads `get/val/v2page`/`v4k` 1.3× in both modes.
-- End to end at 1M documents: the commit of Meilisearch's large indexing txns, 1.23×.
+- End to end at 1M documents: random-key puts into large trees (1.14× in the commit census) and facet range scans (1.21× in hackernews search).
