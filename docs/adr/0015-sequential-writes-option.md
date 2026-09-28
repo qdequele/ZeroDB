@@ -70,3 +70,24 @@ extension; results are identical with the option on or off.
 - **Docs:** SPEC 00 gains the option rows, SPEC 03 §6.6 states that the finger
   runs only for trees with the setting on, DIVERGENCES gains the extension
   entry.
+
+## Measured (bench server, x86-64, 4 KiB pages, 2026-09-28)
+
+**Gate (a), option off, against the commit before the option.** A first
+layout carried the setting through the put path and inlined the finger
+hooks into `free_page`; it cost `put/order/rand` +3.3 % (CGU1, 3 rounds) and
+`commit/batch/n1` +5.6 %, `del/clear/all` +6.3 % (CGU16, 1 round). The kept
+layout branches once at the top of `put` into an out-of-line finger-aware
+copy of the put path and keeps only an empty-table test inline in the hooks:
+flat on all 22 `put/*`, `commit/*`, `mixed/*`, `del/*` rungs at CGU1 (3
+rounds) and on the 8 previously flagged rungs at CGU16 (3 rounds).
+
+**Gate (b), option on vs off, same build (CGU1, 1 round), ZeroDB ÷ LMDB.**
+Faster: `put/val/v8` 0.87× → 0.73×, `put/api/plain` 0.87× → 0.79×,
+`put/api/reserved` 0.93× → 0.83×, `put/order/seq` 0.87× → 0.79×,
+`put/val/v256` 0.89× → 0.83×, `commit/batch/n10k` 0.91× → 0.82×,
+`commit/batch/n100` 1.14× → 1.05×. Slower: `put/order/rand` +5.8 %,
+`mixed/rw/8dbs` +6.9 %, `del/churn/reinsert` +6.9 %, `commit/batch/n1` +7.1 %
+(a finger is established and dropped in every one-put txn). That is the
+trade the option exists for: turn it on for databases whose keys only grow,
+through the per-database override, and leave random-key databases off.
