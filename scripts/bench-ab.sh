@@ -33,6 +33,10 @@
 #               (default 0.03)
 #   OUT         output dir (default target/bench-ab/runs/<timestamp>)
 #   ZERODB_BENCH_TIER is passed through (long = include the 1M rung + concurrent).
+#   CAND_ENV    space-separated VAR=value pairs set for the "after" runs only, to
+#               A/B a runtime option of one engine build against its default
+#               (e.g. CAND_ENV=ZERODB_BENCH_TRUST_FILE=1 with a clean tree: the
+#               two binaries are then identical and only the option differs).
 set -euo pipefail
 
 ZERODB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -121,12 +125,17 @@ if busy "$LOAD"; then
 fi
 cat > "$OUT/meta.json" <<EOF
 {"base": "$BASE_SHA", "candidate": "$CAND_DESC", "filter": "$FILTER", "target": "$TARGET",
- "rounds": $ROUNDS, "load_avg": $LOAD, "ncpu": $NCPU, "tier": "${ZERODB_BENCH_TIER:-default}", "host": "$(uname -sm)",
+ "cand_env": "${CAND_ENV:-}", "rounds": $ROUNDS, "load_avg": $LOAD, "ncpu": $NCPU, "tier": "${ZERODB_BENCH_TIER:-default}", "host": "$(uname -sm)",
  "date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 EOF
 run_side() { # side exe round
     log "round $3/$ROUNDS: $1"
-    CRITERION_HOME="$OUT/round-$3/$1" "$2" --bench --noplot ${FILTER:+"$FILTER"} >"$OUT/round-$3/$1.log" 2>&1 ||
+    local extra=()
+    if [ "$1" = after ] && [ -n "${CAND_ENV:-}" ]; then
+        read -r -a extra <<<"$CAND_ENV"
+    fi
+    env ${extra[@]+"${extra[@]}"} CRITERION_HOME="$OUT/round-$3/$1" "$2" --bench --noplot ${FILTER:+"$FILTER"} \
+        >"$OUT/round-$3/$1.log" 2>&1 ||
         { tail -20 "$OUT/round-$3/$1.log" >&2; exit 1; }
 }
 for r in $(seq 1 "$ROUNDS"); do

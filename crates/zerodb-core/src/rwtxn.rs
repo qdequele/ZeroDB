@@ -662,7 +662,7 @@ impl Env {
             // earlier write txns (LMDB's `me_dpages`, PERF-GAP B12); they came
             // with the writer slot, so this takes no lock.
             dirty: DirtyStore::with_spare(inner.page_size(), guard.take_frames()),
-            validated: ValidatedPages::new(),
+            validated: ValidatedPages::for_policy(inner.file_trust()),
             freed: Vec::new(),
             loose: Vec::new(),
             drains: BTreeMap::new(),

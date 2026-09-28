@@ -703,11 +703,26 @@ macro_rules! bench_backend {
     };
     (@setpage $opts:ident, $page:ident, set) => {
         $opts.page_size($page);
+        // ADR-0014 bench axis: `ZERODB_BENCH_TRUST_FILE=1` opens every zerodb
+        // env with the trusting page-validation policy, to measure it against
+        // the validating default. Off unless set.
+        if crate::backend::trust_file_requested() {
+            // SAFETY: the bench envs are fresh temp directories written only
+            // by zerodb in this process — the `trust_contents` contract.
+            $opts.file_trust(unsafe { heed_zerodb::FileTrust::trust_contents() });
+        }
     };
     (@setpage $opts:ident, $page:ident, noset) => {
         // LMDB derives its page size from the OS; nothing to set.
         let _ = $page;
     };
+}
+
+/// Whether `ZERODB_BENCH_TRUST_FILE=1` asks for the ADR-0014 trusting policy
+/// (read once per process).
+pub fn trust_file_requested() -> bool {
+    static REQ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQ.get_or_init(|| std::env::var("ZERODB_BENCH_TRUST_FILE").as_deref() == Ok("1"))
 }
 
 bench_backend!(lmdb, heed, noset);

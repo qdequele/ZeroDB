@@ -34,6 +34,8 @@
 pub use byteorder;
 pub use heed_traits::{BoxedError, BytesDecode, BytesEncode, Comparator, LexicographicComparator};
 pub use heed_types as types;
+/// The page-validation policy (ADR-0014; ZeroDB extension).
+pub use zerodb::FileTrust;
 
 mod database;
 mod env;

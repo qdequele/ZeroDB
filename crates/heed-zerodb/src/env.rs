@@ -67,6 +67,8 @@ pub struct EnvOpenOptions<T: TlsUsage = WithTls> {
     /// M2.6 ZeroDB extension — no heed counterpart. `None` = engine default.
     page_size: Option<u32>,
     flags: EnvFlags,
+    /// ADR-0014 ZeroDB extension — no heed counterpart.
+    file_trust: zerodb::FileTrust,
     _tls: std::marker::PhantomData<T>,
 }
 
@@ -86,6 +88,7 @@ impl EnvOpenOptions<WithTls> {
             max_dbs: 0,
             page_size: None,
             flags: EnvFlags::empty(),
+            file_trust: zerodb::FileTrust::VALIDATE,
             _tls: std::marker::PhantomData,
         }
     }
@@ -99,6 +102,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
             max_dbs: self.max_dbs,
             page_size: self.page_size,
             flags: self.flags,
+            file_trust: self.file_trust,
             _tls: std::marker::PhantomData,
         }
     }
@@ -152,6 +156,21 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// independent of the OS page size (which gates `map_size` under D-006).
     pub fn page_size(&mut self, size: u32) -> &mut Self {
         self.page_size = Some(size);
+        self
+    }
+
+    /// Choose the page-validation policy (**ADR-0014**).
+    ///
+    /// **ZeroDB extension — heed has no such method**: LMDB never validates
+    /// page contents, while ZeroDB validates them by default so that a
+    /// corrupt or hostile file yields an error instead of undefined
+    /// behaviour. Passing the value of the `unsafe`
+    /// [`FileTrust::trust_contents`](zerodb::FileTrust::trust_contents)
+    /// switches that off for this env, reading pages the way LMDB does; its
+    /// `# Safety` section is the contract. Code that never calls this method
+    /// keeps the validating default.
+    pub fn file_trust(&mut self, policy: zerodb::FileTrust) -> &mut Self {
+        self.file_trust = policy;
         self
     }
 
@@ -242,6 +261,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         // single-process (D-001) and nothing in the consumer tree reads one.
         opts.data_file_name(DATA_FILE_NAME);
         opts.flags(zerodb_env_flags(self.flags));
+        opts.file_trust(self.file_trust);
         let env = opts.open(path).map_err(Error::from)?;
         Ok(Env {
             inner: env,

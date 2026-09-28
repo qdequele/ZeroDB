@@ -26,7 +26,7 @@ use crate::cmp::{Comparator, ComparatorError, ComparatorRegistry, KeyCmp};
 use crate::error::{Error, MdbError};
 use crate::page::geometry::{is_map_full, map_pages};
 use crate::page::{
-    select_meta, DBRecord, MetaChoice, MetaPage, MetaValidity, META_A_PGNO, META_B_PGNO,
+    select_meta, DBRecord, FileTrust, MetaChoice, MetaPage, MetaValidity, META_A_PGNO, META_B_PGNO,
 };
 use crate::readers::{ReaderTable, SnapshotCell};
 
@@ -534,6 +534,9 @@ pub struct EnvInner {
     /// the `named` registry so read txns can size their dbi-indexed record
     /// table without taking the registry lock.
     max_dbs: u32,
+    /// Page-validation policy (ADR-0014), fixed at open. Every txn copies it
+    /// into its validated-pages memo at begin.
+    file_trust: FileTrust,
 }
 
 impl std::fmt::Debug for EnvInner {
@@ -807,6 +810,12 @@ impl EnvInner {
     #[must_use]
     pub fn durability(&self) -> DurabilityFlags {
         self.durability
+    }
+
+    /// The page-validation policy this env was opened with (ADR-0014).
+    #[must_use]
+    pub fn file_trust(&self) -> FileTrust {
+        self.file_trust
     }
 
     /// Whether the env is read-only (`MDB_RDONLY`, SPEC 01 Table 1).
@@ -1143,6 +1152,12 @@ impl Env {
         self.inner.durability()
     }
 
+    /// The page-validation policy this env was opened with (ADR-0014).
+    #[must_use]
+    pub fn file_trust(&self) -> FileTrust {
+        self.inner.file_trust()
+    }
+
     /// Force durability of all prior commits — `mdb_env_sync(env, 1)`
     /// (SPEC 01 §S6). Restores durability under `NO_SYNC` / `NO_META_SYNC` /
     /// `MAP_ASYNC`. The form heed exposes; equivalent to [`Env::sync`]`(true)`.
@@ -1392,6 +1407,39 @@ pub fn open_with_backing(
     max_readers: u32,
     durability: DurabilityFlags,
 ) -> Result<Env, Error> {
+    open_with_backing_policy(
+        canonical_path,
+        backing,
+        page_size,
+        map_size,
+        prev_snapshot,
+        max_dbs,
+        max_readers,
+        durability,
+        FileTrust::VALIDATE,
+    )
+}
+
+/// [`open_with_backing`] with an explicit page-validation policy
+/// (ADR-0014). [`FileTrust::VALIDATE`] is exactly [`open_with_backing`];
+/// the trusting policy can only be built through the `unsafe`
+/// [`FileTrust::trust_contents`], whose contract the caller carries.
+///
+/// # Errors
+///
+/// As [`open_with_backing`].
+#[allow(clippy::too_many_arguments)]
+pub fn open_with_backing_policy(
+    canonical_path: PathBuf,
+    backing: Box<dyn Backing>,
+    page_size: u32,
+    map_size: u64,
+    prev_snapshot: bool,
+    max_dbs: u32,
+    max_readers: u32,
+    durability: DurabilityFlags,
+    file_trust: FileTrust,
+) -> Result<Env, Error> {
     // D-006-style open-time argument rejection (`Io(InvalidInput)`): both
     // values size eager allocations (`max_readers` cache-padded reader slots,
     // `max_dbs` comparator `OnceLock`s), so an unbounded value — e.g.
@@ -1495,6 +1543,7 @@ pub fn open_with_backing(
         durability,
         comparators: ComparatorRegistry::new(max_dbs),
         max_dbs,
+        file_trust,
         meta,
         prev_snapshot,
         closing,

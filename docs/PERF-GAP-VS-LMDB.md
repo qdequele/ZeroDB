@@ -923,7 +923,10 @@ remain for tests and the stream-vs-batch differential referee.
   equivalent. Keep.
 - **Corrupt-page → typed error, never UB/panic**: the reason validation
   exists. A2(b) keeps the guarantee at O(log K) instead of O(K) — removing
-  validation outright is not on the table.
+  validation outright is not on the table **by default**. *Amended
+  2026-09-28 (ADR-0014):* an env may opt out through the `unsafe`
+  `FileTrust::trust_contents()` open policy, which reads map pages as LMDB
+  does; the default stays validating.
 
 ## State of play (2026-07-22 — supersedes the original sequencing)
 

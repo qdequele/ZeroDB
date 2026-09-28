@@ -565,6 +565,16 @@ dirty-page store must be built so it is.
   must fail typed, not SIGBUS (SPEC 06 REC-14). Dirty frames are exempt — a
   writer legitimately allocates pages beyond its base snapshot's `last_pg`,
   and those resolve from the dirty store before the bound is consulted.
+  **Page-validation policy (added 2026-09-28, ADR-0014):** by default a
+  map-sourced tree page is fully validated (every cell) the first time a txn
+  views it, and re-wrapped without checks on later views through the
+  txn-scoped validated-pages memo. An env opened with the trusting
+  `FileTrust` policy skips the memo and the cell walk for map pages: they take
+  the O(1) header checks dirty frames take (page type, reserved fields,
+  free-space bounds). The high-water bound above, the overflow-run checks and
+  the free-list id checks (SPEC 05 GC-18) apply under both policies. Under the
+  trusting policy a corrupt page is undefined behaviour, as in LMDB; the
+  policy is the caller's `unsafe` contract (SPEC 00, `file_trust`).
 
 ### §6.2 — Which operations invalidate which borrows
 

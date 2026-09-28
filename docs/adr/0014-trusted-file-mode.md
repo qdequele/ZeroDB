@@ -1,6 +1,6 @@
 # ADR-0014: Opt-in trusted-file mode (LMDB parity for page reads)
 
-- Status: Draft
+- Status: Accepted (2026-09-28); the lever is kept only if the measurement gate below passes
 - Milestone: Phase 3 (performance), PERF-GAP A2(b) / issue #21
 - Date: 2026-09-28
 
@@ -212,3 +212,38 @@ opt in. It can be done before or after A.
    come from users. If it enables trusted mode for its index envs, it should run
    `zerodb check` on imported snapshots, or open them validating. Who owns that
    guidance?
+
+## Resolution (2026-09-28)
+
+The maintainer approved implementing the read path ("do the read path now",
+2026-09-28, after the 2026-09-26 "it would be great if it could be an
+option"). The open questions were settled on the recommendations above:
+
+1. **Writers trust too**, as LMDB does. A writer reading a corrupt committed
+   page under the trusting policy can carry the corruption into new pages;
+   the `trust_contents` safety section says so.
+2. **Free-list id checks stay on** (`validate_pil_ids`), as do page-number
+   bounds, page type, overflow runs and meta validation.
+3. **API surface: a safe setter plus an `unsafe` constructor**, rather than an
+   `unsafe` setter. `FileTrust::trust_contents()` in `zerodb-core::page` is the
+   only `unsafe` item (a declaration in the sanctioned page module; it holds no
+   unsafe operation). `zerodb::EnvOpenOptions::file_trust(FileTrust)` and
+   `heed_zerodb::EnvOpenOptions::file_trust(FileTrust)` are safe, because no
+   safe code can produce the trusting value. This keeps the obligation
+   explicit at the call site (`unsafe { FileTrust::trust_contents() }`) and
+   adds no `unsafe` block to `zerodb` or `heed-zerodb`.
+4. **Option D (lazy validation) is not done first.** It stays a separate
+   candidate for the validating default.
+5. **Snapshot guidance** lives in the `trust_contents` safety section: run
+   `zerodb check` on a file of uncertain origin, such as an imported snapshot,
+   before opening it trusting. Whether Meilisearch opts in is Meilisearch's
+   call.
+
+**Mechanism as built.** The validated-pages memo carries the env's policy,
+copied at txn begin. Under the trusting policy `leaf_view`/`branch_view` send
+map pages down the dirty-frame arm (`new_prevalidated`: page type, reserved
+fields, free-space bounds, all O(1)) instead of the memo probe and the cell
+walk. That arm was chosen over `new_trusted` so the page type stays checked,
+as LMDB's `IS_LEAF` test is. Nested read txns share the parent's memo and so
+its policy. `check::check_image` never uses a memo and ignores the policy.
+

@@ -328,7 +328,7 @@ impl Env {
             env: EnvHandle::Borrowed(self),
             named_dense: OnceLock::new(),
             named_memo: Mutex::new(Vec::new()),
-            validated: ValidatedPages::new(),
+            validated: ValidatedPages::for_policy(self.inner().file_trust()),
         })
     }
 
@@ -345,6 +345,7 @@ impl Env {
     /// (TXN-16).
     pub fn static_read_txn(self) -> Result<RoTxn<'static>> {
         let (snap, slot) = self.inner().pin_reader()?;
+        let validated = ValidatedPages::for_policy(self.inner().file_trust());
         Ok(RoTxn {
             psize: self.page_size(),
             snap,
@@ -352,7 +353,7 @@ impl Env {
             env: EnvHandle::Owned(self),
             named_dense: OnceLock::new(),
             named_memo: Mutex::new(Vec::new()),
-            validated: ValidatedPages::new(),
+            validated,
         })
     }
 

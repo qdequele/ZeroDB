@@ -23,7 +23,8 @@ use std::sync::OnceLock;
 use super::cmp::KeyCmp;
 use super::dirty::DirtyStore;
 use super::page::{
-    BranchRef, LeafRef, LeafValue, OverflowRef, PageError, PageRef, PageType, PGNO_INVALID,
+    BranchRef, FileTrust, LeafRef, LeafValue, OverflowRef, PageError, PageRef, PageType,
+    PGNO_INVALID,
 };
 
 /// An entry `(key, value)` borrowed from the map for the view's lifetime `'a`.
@@ -193,15 +194,33 @@ pub struct ValidatedPages {
     cur: AtomicUsize,
     /// Per-level advisory fill counts (½ load-factor gate only).
     counts: [AtomicUsize; MEMO_LEVELS],
+    /// The env's [`FileTrust`] policy, copied in at txn begin (ADR-0014).
+    /// When set, map pages skip the memo and the cell walk and take the
+    /// header-checked `new_prevalidated` view, as dirty frames do.
+    trust_file: bool,
 }
 
 impl ValidatedPages {
+    #[cfg(test)]
     pub(crate) fn new() -> ValidatedPages {
+        ValidatedPages::for_policy(FileTrust::VALIDATE)
+    }
+
+    /// A memo for a txn of an env opened under `policy` (ADR-0014).
+    pub(crate) fn for_policy(policy: FileTrust) -> ValidatedPages {
         ValidatedPages {
             levels: std::array::from_fn(|_| OnceLock::new()),
             cur: AtomicUsize::new(0),
             counts: std::array::from_fn(|_| AtomicUsize::new(0)),
+            trust_file: policy.is_trusted(),
         }
+    }
+
+    /// `true` when map pages must go through the memo and the cell walk,
+    /// i.e. the env was not opened with [`FileTrust::trust_contents`].
+    #[inline(always)]
+    fn validates_map_pages(&self) -> bool {
+        !self.trust_file
     }
 
     /// One slot's stored key: `(pgno | kind_tag) + 1`, so `0` stays "empty".
@@ -332,7 +351,7 @@ fn leaf_view_over<'a>(
 ) -> Result<LeafRef<'a>, PageError> {
     match valid {
         Some(v) => {
-            if from_map {
+            if from_map && v.validates_map_pages() {
                 if v.contains(pgno, PageKind::Leaf) {
                     // Kind-tagged hit: zero checks (PERF-GAP A8).
                     Ok(LeafRef::new_trusted(bytes))
@@ -349,6 +368,10 @@ fn leaf_view_over<'a>(
                 // the `from_map` arm above. Structural O(1) checks (type,
                 // bounds) still run; the per-cell walk over the engine's own
                 // output is skipped — LMDB's model for its dirty pages.
+                //
+                // Also every map page of an env opened with
+                // `FileTrust::trust_contents` (ADR-0014): the caller's
+                // contract stands in for the cell walk, as in LMDB.
                 LeafRef::new_prevalidated(bytes, psize)
             }
         }
@@ -377,7 +400,7 @@ fn branch_view_over<'a>(
 ) -> Result<BranchRef<'a>, PageError> {
     match valid {
         Some(v) => {
-            if from_map {
+            if from_map && v.validates_map_pages() {
                 if v.contains(pgno, PageKind::Branch) {
                     // Kind-tagged hit: zero checks (PERF-GAP A8).
                     Ok(BranchRef::new_trusted(bytes))
@@ -387,7 +410,8 @@ fn branch_view_over<'a>(
                     Ok(br)
                 }
             } else {
-                // Engine-authored dirty frame — see [`leaf_view`].
+                // Engine-authored dirty frame, or a map page under
+                // `FileTrust::trust_contents` — see [`leaf_view`].
                 BranchRef::new_prevalidated(bytes, psize)
             }
         }
@@ -1560,6 +1584,35 @@ mod tests {
     /// (miri's weak-memory machinery checks the Acquire/Release pairs); loom
     /// is deliberately not wired: the memo's contract is advisory (any race
     /// outcome is at worst a miss → revalidation), unlike the reader table's.
+    /// ADR-0014: under the trusting policy a map page skips the per-cell
+    /// walk (a corrupt node pointer is not looked at) but keeps the O(1)
+    /// header checks (page type); the validating memo rejects the same page.
+    /// The trusted view is built and dropped without reading any cell.
+    #[test]
+    fn trusting_policy_skips_the_cell_walk_but_checks_the_type() {
+        let entries: Vec<_> = (0..8u8).map(|i| kv(&[b'k', i], b"v")).collect();
+        let (mut img, root, depth) = build(&entries);
+        assert_eq!(depth, 1, "a single leaf root");
+        let off = root as usize * PS as usize + crate::page::HEADER_SIZE;
+        img[off..off + 2].copy_from_slice(&0xFFF0u16.to_le_bytes());
+
+        let validating = ValidatedPages::new();
+        assert!(leaf_view(src(&img), PS, root, Some(&validating)).is_err());
+
+        // The corrupt page is wrapped but no cell accessor runs, so nothing
+        // reads through the bad pointer.
+        let trusting = ValidatedPages::for_policy(FileTrust::trusting_for_tests());
+        let view = leaf_view(src(&img), PS, root, Some(&trusting)).expect("header checks pass");
+        assert_eq!(view.num_keys(), entries.len());
+        assert!(
+            matches!(
+                branch_view(src(&img), PS, root, Some(&trusting)),
+                Err(PageError::WrongPageType { .. })
+            ),
+            "the page type stays checked when trusted"
+        );
+    }
+
     #[test]
     fn validated_pages_concurrent_insert_contains() {
         let vp = ValidatedPages::new();

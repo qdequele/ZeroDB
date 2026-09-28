@@ -32,7 +32,7 @@ pub use zerodb_core::env::{
 };
 pub use zerodb_core::error::{Error, MdbError, Result};
 pub use zerodb_core::nested::NestedRoTxn;
-pub use zerodb_core::page::{FIRST_DATA_PGNO, MAX_KEY_SIZE};
+pub use zerodb_core::page::{FileTrust, FIRST_DATA_PGNO, MAX_KEY_SIZE};
 pub use zerodb_core::rotxn::{
     collect_entries_flagged, for_each_entry_flagged, free_page_count, named_databases, Database,
     DatabaseStat, RoRange, RoTxn, TxnRead,
@@ -163,6 +163,7 @@ pub struct EnvOpenOptions {
     page_size: u32,
     flags: EnvFlags,
     data_file_name: OsString,
+    file_trust: FileTrust,
 }
 
 impl Default for EnvOpenOptions {
@@ -184,6 +185,7 @@ impl EnvOpenOptions {
             page_size: DEFAULT_PAGE_SIZE,
             flags: EnvFlags::EMPTY,
             data_file_name: OsString::from(DATA_FILE_NAME),
+            file_trust: FileTrust::VALIDATE,
         }
     }
 
@@ -296,6 +298,25 @@ impl EnvOpenOptions {
         &self.data_file_name
     }
 
+    /// Choose the page-validation policy (**ADR-0014**; ZeroDB extension,
+    /// LMDB has no validating mode). Default: [`FileTrust::VALIDATE`], under
+    /// which a corrupt or hostile file yields a typed error.
+    ///
+    /// Passing the value of the `unsafe` [`FileTrust::trust_contents`] makes
+    /// the env read page cells without validating them, as LMDB does; its
+    /// `# Safety` section is the contract. The setter itself is safe because
+    /// only that `unsafe` constructor can produce the trusting value.
+    pub fn file_trust(&mut self, policy: FileTrust) -> &mut EnvOpenOptions {
+        self.file_trust = policy;
+        self
+    }
+
+    /// The configured page-validation policy (ADR-0014).
+    #[must_use]
+    pub fn get_file_trust(&self) -> FileTrust {
+        self.file_trust
+    }
+
     /// The configured max DBs.
     #[must_use]
     pub fn get_max_dbs(&self) -> u32 {
@@ -390,7 +411,7 @@ impl EnvOpenOptions {
             durability.write_map,
         )?;
 
-        zerodb_core::env::open_with_backing(
+        zerodb_core::env::open_with_backing_policy(
             canonical_dir,
             opened.backing,
             opened.page_size,
@@ -399,6 +420,7 @@ impl EnvOpenOptions {
             self.max_dbs,
             self.max_readers,
             durability,
+            self.file_trust,
         )
     }
 }
