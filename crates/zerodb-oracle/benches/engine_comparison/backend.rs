@@ -711,6 +711,11 @@ macro_rules! bench_backend {
             // by zerodb in this process — the `trust_contents` contract.
             $opts.file_trust(unsafe { heed_zerodb::FileTrust::trust_contents() });
         }
+        // ADR-0015 bench axis: `ZERODB_BENCH_SEQUENTIAL_WRITES=1` turns the
+        // sequential-writes fast path on for every zerodb env.
+        if crate::backend::bench_knob("ZERODB_BENCH_SEQUENTIAL_WRITES") {
+            $opts.sequential_writes(true);
+        }
     };
     (@setpage $opts:ident, $page:ident, noset) => {
         // LMDB derives its page size from the OS; nothing to set.
@@ -722,7 +727,12 @@ macro_rules! bench_backend {
 /// (read once per process).
 pub fn trust_file_requested() -> bool {
     static REQ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *REQ.get_or_init(|| std::env::var("ZERODB_BENCH_TRUST_FILE").as_deref() == Ok("1"))
+    *REQ.get_or_init(|| bench_knob("ZERODB_BENCH_TRUST_FILE"))
+}
+
+/// Whether the bench env variable `name` is set to `1`.
+pub fn bench_knob(name: &str) -> bool {
+    std::env::var(name).as_deref() == Ok("1")
 }
 
 bench_backend!(lmdb, heed, noset);

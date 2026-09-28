@@ -69,6 +69,8 @@ pub struct EnvOpenOptions<T: TlsUsage = WithTls> {
     flags: EnvFlags,
     /// ADR-0014 ZeroDB extension — no heed counterpart.
     file_trust: zerodb::FileTrust,
+    /// ADR-0015 ZeroDB extension — no heed counterpart.
+    sequential_writes: bool,
     _tls: std::marker::PhantomData<T>,
 }
 
@@ -89,6 +91,7 @@ impl EnvOpenOptions<WithTls> {
             page_size: None,
             flags: EnvFlags::empty(),
             file_trust: zerodb::FileTrust::VALIDATE,
+            sequential_writes: false,
             _tls: std::marker::PhantomData,
         }
     }
@@ -103,6 +106,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
             page_size: self.page_size,
             flags: self.flags,
             file_trust: self.file_trust,
+            sequential_writes: self.sequential_writes,
             _tls: std::marker::PhantomData,
         }
     }
@@ -171,6 +175,16 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// keeps the validating default.
     pub fn file_trust(&mut self, policy: zerodb::FileTrust) -> &mut Self {
         self.file_trust = policy;
+        self
+    }
+
+    /// Turn on the sequential-writes fast path for every database by default
+    /// (**ADR-0015**). **ZeroDB extension — heed has no such method.**
+    /// Faster ascending and APPEND loads, 3–5 % slower random-key writes,
+    /// identical results; override it per database with
+    /// [`Env::set_sequential_writes`]. Default: off.
+    pub fn sequential_writes(&mut self, on: bool) -> &mut Self {
+        self.sequential_writes = on;
         self
     }
 
@@ -262,6 +276,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         opts.data_file_name(DATA_FILE_NAME);
         opts.flags(zerodb_env_flags(self.flags));
         opts.file_trust(self.file_trust);
+        opts.sequential_writes(self.sequential_writes);
         let env = opts.open(path).map_err(Error::from)?;
         Ok(Env {
             inner: env,
@@ -530,6 +545,28 @@ impl<T> Env<T> {
     /// `Mdb(BadTxn)` if the parent has errored.
     pub fn nested_read_txn<'p>(&'p self, parent: &'p RwTxn) -> Result<RoTxn<'p, WithoutTls>> {
         parent.nested_read_txn()
+    }
+
+    /// Set (`Some`) or clear (`None`, follow the env default) a database's
+    /// sequential-writes override (**ADR-0015**; ZeroDB extension). Runtime
+    /// state, not persisted; write txns that start after the call use it.
+    /// See [`EnvOpenOptions::sequential_writes`] for the trade-off.
+    pub fn set_sequential_writes<KC, DC, C, CDUP>(
+        &self,
+        db: &crate::Database<KC, DC, C, CDUP>,
+        on: Option<bool>,
+    ) {
+        self.inner.set_sequential_writes(&db.inner, on);
+    }
+
+    /// Whether write txns use the sequential-writes fast path for `db`
+    /// (ADR-0015).
+    #[must_use]
+    pub fn sequential_writes<KC, DC, C, CDUP>(
+        &self,
+        db: &crate::Database<KC, DC, C, CDUP>,
+    ) -> bool {
+        self.inner.sequential_writes(&db.inner)
     }
 
     /// Copy this environment to an open file (SPEC 00 row 17, `mdb_env_copy2`).

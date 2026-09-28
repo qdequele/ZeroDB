@@ -357,6 +357,32 @@ impl Env {
         })
     }
 
+    /// Set (`Some`) or clear (`None`, follow the env default) `db`'s
+    /// sequential-writes override (**ADR-0015**; ZeroDB extension). With the
+    /// setting on, a write txn remembers the path to the tree's rightmost
+    /// leaf and appends there without descending when a key sorts after
+    /// every key already in it: faster ascending and APPEND loads, 3–5 %
+    /// slower random-key writes. Results are identical either way. Runtime
+    /// state, not persisted; write txns that start after the call use it.
+    pub fn set_sequential_writes(&self, db: &Database, on: Option<bool>) {
+        let dbi = match db.sel() {
+            DbSel::Main => None,
+            DbSel::Named(dbi) => Some(dbi),
+        };
+        self.inner().set_sequential_writes(dbi, on);
+    }
+
+    /// Whether write txns use the sequential-writes fast path for `db`: its
+    /// override if set, else the env default (ADR-0015).
+    #[must_use]
+    pub fn sequential_writes(&self, db: &Database) -> bool {
+        let dbi = match db.sel() {
+            DbSel::Main => None,
+            DbSel::Named(dbi) => Some(dbi),
+        };
+        self.inner().sequential_writes_for(dbi)
+    }
+
     /// A handle to the main (unnamed) database (SPEC 00 row 10, `None` name).
     /// Always present — it is the meta's `main_db`.
     #[must_use]

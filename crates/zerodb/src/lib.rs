@@ -164,6 +164,7 @@ pub struct EnvOpenOptions {
     flags: EnvFlags,
     data_file_name: OsString,
     file_trust: FileTrust,
+    sequential_writes: bool,
 }
 
 impl Default for EnvOpenOptions {
@@ -186,6 +187,7 @@ impl EnvOpenOptions {
             flags: EnvFlags::EMPTY,
             data_file_name: OsString::from(DATA_FILE_NAME),
             file_trust: FileTrust::VALIDATE,
+            sequential_writes: false,
         }
     }
 
@@ -317,6 +319,27 @@ impl EnvOpenOptions {
         self.file_trust
     }
 
+    /// Turn on the sequential-writes fast path for every database of the env
+    /// by default (**ADR-0015**; ZeroDB extension, LMDB has no counterpart).
+    /// Default: off.
+    ///
+    /// With it on, a write txn remembers the path to each tree's rightmost
+    /// leaf and appends there without descending from the root when a key
+    /// sorts after every key already in that leaf. Measured on x86-64:
+    /// ascending and APPEND loads 14–24 % faster, random-key writes 3–5 %
+    /// slower. Results are identical either way. Override it per database
+    /// with [`Env::set_sequential_writes`].
+    pub fn sequential_writes(&mut self, on: bool) -> &mut EnvOpenOptions {
+        self.sequential_writes = on;
+        self
+    }
+
+    /// The configured sequential-writes default (ADR-0015).
+    #[must_use]
+    pub fn get_sequential_writes(&self) -> bool {
+        self.sequential_writes
+    }
+
     /// The configured max DBs.
     #[must_use]
     pub fn get_max_dbs(&self) -> u32 {
@@ -421,6 +444,7 @@ impl EnvOpenOptions {
             self.max_readers,
             durability,
             self.file_trust,
+            self.sequential_writes,
         )
     }
 }

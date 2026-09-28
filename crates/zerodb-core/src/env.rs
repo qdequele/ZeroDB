@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -537,7 +537,21 @@ pub struct EnvInner {
     /// Page-validation policy (ADR-0014), fixed at open. Every txn copies it
     /// into its validated-pages memo at begin.
     file_trust: FileTrust,
+    /// Sequential-writes default (ADR-0015), fixed at open: whether a write
+    /// txn keeps a rightmost-leaf finger for a tree with no override.
+    sequential_writes: bool,
+    /// Per-database sequential-writes overrides (ADR-0015): slot 0 is the
+    /// main DB, slot `1 + dbi` a named DB. [`SEQ_FOLLOW`] = the env default,
+    /// [`SEQ_OFF`] / [`SEQ_ON`] = forced. Runtime state, never persisted.
+    sequential_overrides: Box<[AtomicU8]>,
 }
+
+/// [`EnvInner`] sequential-writes override: follow the env default.
+const SEQ_FOLLOW: u8 = 0;
+/// [`EnvInner`] sequential-writes override: forced off.
+const SEQ_OFF: u8 = 1;
+/// [`EnvInner`] sequential-writes override: forced on.
+const SEQ_ON: u8 = 2;
 
 impl std::fmt::Debug for EnvInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -816,6 +830,49 @@ impl EnvInner {
     #[must_use]
     pub fn file_trust(&self) -> FileTrust {
         self.file_trust
+    }
+
+    /// The env's sequential-writes default (ADR-0015).
+    #[must_use]
+    pub fn sequential_writes_default(&self) -> bool {
+        self.sequential_writes
+    }
+
+    /// Whether the main DB (`None`) or named DB `dbi` uses the sequential-
+    /// writes fast path: its override if set, else the env default
+    /// (ADR-0015).
+    #[must_use]
+    pub fn sequential_writes_for(&self, dbi: Option<u32>) -> bool {
+        let slot = dbi.map_or(0, |d| d as usize + 1);
+        // Ordering: `Relaxed` — the value is a performance hint that selects
+        // between two paths with identical results, it publishes no other
+        // data, and any value a racing read sees is a valid choice.
+        match self
+            .sequential_overrides
+            .get(slot)
+            .map_or(SEQ_FOLLOW, |a| a.load(Ordering::Relaxed))
+        {
+            SEQ_ON => true,
+            SEQ_OFF => false,
+            _ => self.sequential_writes,
+        }
+    }
+
+    /// Set or clear (`None`) the sequential-writes override of the main DB
+    /// (`dbi = None`) or named DB `dbi` (ADR-0015). Write txns that start
+    /// after the call use it; an out-of-range dbi (impossible for a handle
+    /// the engine produced) is ignored.
+    pub fn set_sequential_writes(&self, dbi: Option<u32>, on: Option<bool>) {
+        let slot = dbi.map_or(0, |d| d as usize + 1);
+        let v = match on {
+            None => SEQ_FOLLOW,
+            Some(false) => SEQ_OFF,
+            Some(true) => SEQ_ON,
+        };
+        if let Some(a) = self.sequential_overrides.get(slot) {
+            // Ordering: `Relaxed` — see `sequential_writes_for`.
+            a.store(v, Ordering::Relaxed);
+        }
     }
 
     /// Whether the env is read-only (`MDB_RDONLY`, SPEC 01 Table 1).
@@ -1417,12 +1474,14 @@ pub fn open_with_backing(
         max_readers,
         durability,
         FileTrust::VALIDATE,
+        false,
     )
 }
 
 /// [`open_with_backing`] with an explicit page-validation policy
-/// (ADR-0014). [`FileTrust::VALIDATE`] is exactly [`open_with_backing`];
-/// the trusting policy can only be built through the `unsafe`
+/// (ADR-0014) and sequential-writes default (ADR-0015).
+/// `(FileTrust::VALIDATE, false)` is exactly [`open_with_backing`]; the
+/// trusting policy can only be built through the `unsafe`
 /// [`FileTrust::trust_contents`], whose contract the caller carries.
 ///
 /// # Errors
@@ -1439,6 +1498,7 @@ pub fn open_with_backing_policy(
     max_readers: u32,
     durability: DurabilityFlags,
     file_trust: FileTrust,
+    sequential_writes: bool,
 ) -> Result<Env, Error> {
     // D-006-style open-time argument rejection (`Io(InvalidInput)`): both
     // values size eager allocations (`max_readers` cache-padded reader slots,
@@ -1544,6 +1604,8 @@ pub fn open_with_backing_policy(
         comparators: ComparatorRegistry::new(max_dbs),
         max_dbs,
         file_trust,
+        sequential_writes,
+        sequential_overrides: (0..=max_dbs).map(|_| AtomicU8::new(SEQ_FOLLOW)).collect(),
         meta,
         prev_snapshot,
         closing,
@@ -1594,8 +1656,9 @@ fn read_slot(
 /// are tested against real files in `crates/zerodb`.
 #[doc(hidden)]
 pub mod testutil {
-    use super::{next_env_id, open_with_backing, Backing, Env};
+    use super::{next_env_id, open_with_backing_policy, Backing, Env};
     use crate::error::Error;
+    use crate::page::FileTrust;
     use crate::page::MetaPage;
     use std::path::PathBuf;
 
@@ -1626,6 +1689,21 @@ pub mod testutil {
     /// On an invalid `page_size` (test helper).
     #[must_use]
     pub fn mem_env(page_size: u32, map_size: u64) -> Env {
+        mem_env_with(page_size, map_size, false)
+    }
+
+    /// [`mem_env`] with the sequential-writes default on (ADR-0015), for the
+    /// rightmost-leaf finger tests.
+    ///
+    /// # Panics
+    ///
+    /// On an invalid `page_size` (test helper).
+    #[must_use]
+    pub fn mem_env_sequential(page_size: u32, map_size: u64) -> Env {
+        mem_env_with(page_size, map_size, true)
+    }
+
+    fn mem_env_with(page_size: u32, map_size: u64, sequential_writes: bool) -> Env {
         let ps = page_size as usize;
         let mut buf = vec![0u8; map_size as usize];
         for slot in [0u64, 1] {
@@ -1637,7 +1715,7 @@ pub mod testutil {
         // A generous named-DB capacity for tests (real envs pass the caller's
         // `max_dbs`; SPEC 02 §6 / M1.6); max_readers = 126, the TXN-14
         // default.
-        match open_with_backing(
+        match open_with_backing_policy(
             path,
             Box::new(VecBacking(buf)),
             page_size,
@@ -1646,6 +1724,8 @@ pub mod testutil {
             128,
             126,
             super::DurabilityFlags::default(),
+            FileTrust::VALIDATE,
+            sequential_writes,
         ) {
             Ok(env) => env,
             Err(Error::Io(e)) => panic!("mem_env open failed: {e}"),

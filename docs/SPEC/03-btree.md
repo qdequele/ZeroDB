@@ -452,6 +452,8 @@ part of it.
 put(key, value, flags):
     validate: 1 <= key.len <= 511 else BadValSize (empty key rejected)   # SPEC01 §S4
               value.len <= MAX_DATA_SIZE else BadValSize
+    if the tree's sequential-writes setting is on and its rightmost-leaf finger
+        hits: insert there, skip the descent (§6.6; ADR-0015)
     if flags has APPEND: see §6.3
     c = search(tree, key)                       # COW along the descent path (§5)
     if c positioned on entrykey == key:         # key exists
@@ -630,6 +632,92 @@ B+tree "the median key moves up, it does not stay down"). Concretely: pick
 key's *child pointer* becomes right page's node-0 (empty-key) child. Contrast
 leaf split, where the split key stays in the right leaf (leaves hold data, so no
 key is discarded).
+
+### §6.6 — Rightmost-leaf finger (writer-private fast path; roadmap #6, 2026-09-28)
+
+A pure in-memory write-txn optimization for sequential and APPEND loads
+(milli's sorted bulk pattern): **nothing observable changes** — not the on-disk
+format, not the put semantics, not the split policy — only which descent code
+computes the target leaf. This is PostgreSQL 11 nbtree's rightmost-leaf
+fastpath (commit `2b272734`) adapted to COW txns; LMDB has no equivalent to
+mirror (`mdb_put` initializes a fresh cursor per call, and even `MDB_APPEND`
+re-descends via `mdb_cursor_last`), so this is a documented non-LMDB lever.
+
+**Opt-in (ADR-0015, 2026-09-28).** The finger runs only for trees whose
+sequential-writes setting is on: the env option `sequential_writes` (default
+off) or a per-database override. A write txn resolves the setting once per
+tree (the main DB at begin, a named DB when first touched); the GC tree never
+has a finger. For a tree with the setting off, `put` neither tests nor
+establishes a finger, and the invalidation hooks below are no-ops on an empty
+finger table. On valid inputs the committed file is byte-identical with the
+setting on or off.
+
+**What is cached.** Per tree touched by the write txn, at most one *finger*:
+the full root-to-rightmost-leaf descent path (`(pgno, ki)` per level — full so
+a hit can run the ordinary §6.2 insert, §6.4 end-of-page split included,
+against it). Branch `ki`s are the right spine (`num_keys − 1` at every level);
+the leaf `ki` is not trusted (the insertion slot is recomputed from the live
+leaf at use time). The finger is writer-private: readers, nested read children
+and the commit pipeline never consult it, and it dies with the txn.
+
+**F1 — hit rule.** A put takes the fast path iff ALL of:
+1. the tree has a live finger, and every frame on it is **dirty in this txn**
+   — verified at use time, never assumed from establishment — so the insert
+   needs no COW (`touch_path` would no-op on every frame);
+2. the spine re-verifies against the **current** working record: `path[0] ==
+   rec.root`, `len == rec.depth`, every branch frame decodes as a branch with
+   `ki == num_keys − 1` and `child(ki)` naming the next frame, and the last
+   frame decodes as a non-empty leaf. A passing walk *is* the tree's current
+   rightmost descent (it re-proves the path through live child pointers), so a
+   hit's correctness rests on this re-verification, not on F3's completeness;
+3. `key` sorts **strictly greater** than the leaf's last key under the tree's
+   comparator (§2.0). This is APPEND's §6.3 validation, and for a plain put it
+   proves the key absent — so `NO_OVERWRITE` cannot fail and the hit is always
+   a fresh insert (never a §6.1 replace).
+
+On a hit the engine runs the SAME leaf insert as the descent path (§6.2,
+including the BIGDATA/RESERVE arms and the §6.4 end-of-page split — the hit's
+insert is always an end insert, so a full leaf splits exactly as APPEND's
+does), with only the descent and `touch_path` skipped. Anything else — no
+finger, any failed check, `key ≤` last — is a **miss**: the finger is dropped
+and the put proceeds through §6/§6.3 unchanged.
+
+**F2 — establishment.** After a put that inserted (not replaced) through the
+normal descent, the finger is set from the op's final (fully-COWed) path iff
+the op provably left it as the right spine: no depth or page count moved (no
+split — a split relocates the rightmost leaf and leaves the path frames
+stale), the inserted slot is the leaf's last, and the spine passes the F1
+walk. A fast-path hit that did not split keeps the finger as is. The GC (Free)
+tree is deliberately never fingered: it is written almost solely inside
+`freelist_save` (GC-11..13), whose rewrite/delete interleaving would
+invalidate a finger at every step.
+
+**F3 — invalidation.** The finger is dropped by:
+- any fast-path **miss** (the slow put may restructure the tree; its descent
+  re-establishes per F2) and any fast-path insert that **split**;
+- every **delete entry** on its tree: point delete (`delete_at_path`, which
+  also serves the write cursor's `del_current`), each `delete_range` splice
+  and its deferred settle pass, `clear`, `drop`;
+- `free_page`/`free_run` for **any page a finger names** (all fingers, all
+  trees): a freed page can be re-served by `allocate` to another tree while
+  staying dirty, so a finger naming it would pass per-frame checks under the
+  wrong tree. This ownership hook makes the freed-then-reused hazard
+  impossible by construction; F1's spine walk independently protects against
+  it, so the two are redundant on purpose.
+- an errored (poisoned) txn cannot reach the fast path at all: `guard_ok`
+  precedes it on every mutating entry, and the failing op itself dropped its
+  tree's finger before mutating (miss/entry invalidation above).
+
+**F4 — debug cross-check.** In every `debug_assertions` build (tests, fuzz,
+stress), every hit first runs the normal §2 descent for the key and asserts it
+lands on the finger's exact frames — same `(pgno, ki)` at every level, key
+absent, same insertion slot — so a finger bug fails loudly instead of
+corrupting the tree.
+
+**Crash safety.** None of this state reaches disk: a hit produces exactly the
+dirty frames the slow path would have produced (same bytes, same pgnos), and
+the commit pipeline (SPEC 04 §9) is untouched. Every REC-6 cut point recovers
+as before.
 
 ---
 
