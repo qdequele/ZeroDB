@@ -240,10 +240,15 @@ option"). The open questions were settled on the recommendations above:
    call.
 
 **Mechanism as built.** The validated-pages memo carries the env's policy,
-copied at txn begin. Under the trusting policy `leaf_view`/`branch_view` send
-map pages down the dirty-frame arm (`new_prevalidated`: page type, reserved
-fields, free-space bounds, all O(1)) instead of the memo probe and the cell
-walk. That arm was chosen over `new_trusted` so the page type stays checked,
+copied at txn begin. The flag is tested only on a **memo miss**, after the
+probe, so a validating memo hit runs exactly the code it ran before the
+option existed. Under the trusting policy a miss takes the dirty-frame view
+(`new_prevalidated`: page type, reserved fields, free-space bounds, all
+O(1)) instead of the cell walk, and records nothing, so the memo stays empty
+and each view costs one empty-memo probe plus the header checks. A first
+version tested the flag before the probe; it cost `get/access/hot` +3.3 %
+and `get/access/miss` +3.1 % on the validating path (CGU1, 3 rounds), just
+past the gate, and was replaced. That arm was chosen over `new_trusted` so the page type stays checked,
 as LMDB's `IS_LEAF` test is. Nested read txns share the parent's memo and so
 its policy. `check::check_image` never uses a memo and ignores the policy.
 

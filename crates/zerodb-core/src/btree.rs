@@ -195,8 +195,8 @@ pub struct ValidatedPages {
     /// Per-level advisory fill counts (½ load-factor gate only).
     counts: [AtomicUsize; MEMO_LEVELS],
     /// The env's [`FileTrust`] policy, copied in at txn begin (ADR-0014).
-    /// When set, map pages skip the memo and the cell walk and take the
-    /// header-checked `new_prevalidated` view, as dirty frames do.
+    /// When set, a memo miss on a map page takes the header-checked
+    /// `new_prevalidated` view, as dirty frames do, and records nothing.
     trust_file: bool,
 }
 
@@ -216,11 +216,11 @@ impl ValidatedPages {
         }
     }
 
-    /// `true` when map pages must go through the memo and the cell walk,
-    /// i.e. the env was not opened with [`FileTrust::trust_contents`].
-    #[inline(always)]
-    fn validates_map_pages(&self) -> bool {
-        !self.trust_file
+    /// `true` when the env was opened with [`FileTrust::trust_contents`]:
+    /// a memo miss on a map page then takes the header-checked view instead
+    /// of the cell walk (ADR-0014).
+    fn trusts_file(&self) -> bool {
+        self.trust_file
     }
 
     /// One slot's stored key: `(pgno | kind_tag) + 1`, so `0` stays "empty".
@@ -351,10 +351,17 @@ fn leaf_view_over<'a>(
 ) -> Result<LeafRef<'a>, PageError> {
     match valid {
         Some(v) => {
-            if from_map && v.validates_map_pages() {
+            if from_map {
                 if v.contains(pgno, PageKind::Leaf) {
                     // Kind-tagged hit: zero checks (PERF-GAP A8).
                     Ok(LeafRef::new_trusted(bytes))
+                } else if v.trusts_file() {
+                    // ADR-0014: the caller's `trust_contents` contract stands
+                    // in for the cell walk, as in LMDB. Tested only on a memo
+                    // miss, so a validating memo hit runs the code it ran
+                    // before the option existed; a trusting txn never inserts,
+                    // so its memo stays empty and every view lands here.
+                    LeafRef::new_prevalidated(bytes, psize)
                 } else {
                     let leaf = LeafRef::new(bytes, psize)?;
                     v.insert(pgno, PageKind::Leaf);
@@ -368,10 +375,6 @@ fn leaf_view_over<'a>(
                 // the `from_map` arm above. Structural O(1) checks (type,
                 // bounds) still run; the per-cell walk over the engine's own
                 // output is skipped — LMDB's model for its dirty pages.
-                //
-                // Also every map page of an env opened with
-                // `FileTrust::trust_contents` (ADR-0014): the caller's
-                // contract stands in for the cell walk, as in LMDB.
                 LeafRef::new_prevalidated(bytes, psize)
             }
         }
@@ -400,18 +403,20 @@ fn branch_view_over<'a>(
 ) -> Result<BranchRef<'a>, PageError> {
     match valid {
         Some(v) => {
-            if from_map && v.validates_map_pages() {
+            if from_map {
                 if v.contains(pgno, PageKind::Branch) {
                     // Kind-tagged hit: zero checks (PERF-GAP A8).
                     Ok(BranchRef::new_trusted(bytes))
+                } else if v.trusts_file() {
+                    // ADR-0014 — see [`leaf_view`].
+                    BranchRef::new_prevalidated(bytes, psize)
                 } else {
                     let br = BranchRef::new(bytes, psize)?;
                     v.insert(pgno, PageKind::Branch);
                     Ok(br)
                 }
             } else {
-                // Engine-authored dirty frame, or a map page under
-                // `FileTrust::trust_contents` — see [`leaf_view`].
+                // Engine-authored dirty frame — see [`leaf_view`].
                 BranchRef::new_prevalidated(bytes, psize)
             }
         }

@@ -569,8 +569,8 @@ dirty-page store must be built so it is.
   map-sourced tree page is fully validated (every cell) the first time a txn
   views it, and re-wrapped without checks on later views through the
   txn-scoped validated-pages memo. An env opened with the trusting
-  `FileTrust` policy skips the memo and the cell walk for map pages: they take
-  the O(1) header checks dirty frames take (page type, reserved fields,
+  `FileTrust` policy skips the cell walk for map pages and records nothing in
+  the memo: on a memo miss they take the O(1) header checks dirty frames take (page type, reserved fields,
   free-space bounds). The high-water bound above, the overflow-run checks and
   the free-list id checks (SPEC 05 GC-18) apply under both policies. Under the
   trusting policy a corrupt page is undefined behaviour, as in LMDB; the
