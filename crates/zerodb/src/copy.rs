@@ -455,6 +455,14 @@ fn refuse_custom_comparator(env: &Env) -> Result<()> {
 /// rebuild a fresh, densely-packed image (the `MDB_CP_COMPACT` shape),
 /// streamed into `file` at `base` (PERF-GAP C1: peak memory O(tree depth ×
 /// psize) plus the write buffer). Returns the image length.
+///
+/// The walk and the writes overlap, as in LMDB's compacting copy
+/// (`mdb_env_copyfd1` hands full buffers to a writer thread): this thread
+/// walks and packs, a scoped writer thread lands each full buffer, and
+/// buffers go back and forth over two channels (at most [`WRITE_BUFS`] exist).
+/// The first write error stops the writer and is the error returned; a
+/// panicking progress callback unwinds normally (dropping the sender ends the
+/// writer, and the scope joins it).
 fn write_compact(
     env: &Env,
     txn: &RoTxn<'_>,
@@ -463,11 +471,51 @@ fn write_compact(
     base: u64,
     progress: &mut Progress<'_>,
 ) -> Result<u64> {
+    use std::os::unix::fs::FileExt;
+    use std::sync::mpsc;
+    std::thread::scope(|scope| {
+        // Bounded: one buffer queued, one being written, one being filled.
+        let (full_tx, full_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(WRITE_BUFS - 2);
+        let (free_tx, free_rx) = mpsc::channel::<Vec<u8>>();
+        let writer = scope.spawn(move || -> std::io::Result<()> {
+            for (off, mut buf) in full_rx {
+                file.write_all_at(&buf, off)?;
+                buf.clear();
+                // The sink may already be gone (last buffer): nothing to do.
+                let _ = free_tx.send(buf);
+            }
+            Ok(())
+        });
+        let built = build_compact(
+            env,
+            txn,
+            names,
+            FileSink::new(full_tx, free_rx, base, env.page_size()),
+            progress,
+        );
+        // `build_compact` consumed the sink, so the sender is dropped and the
+        // writer finishes its queue. A write error outranks the build's own
+        // (which is then only "the writer stopped").
+        match writer.join() {
+            Ok(Ok(())) => built,
+            Ok(Err(e)) => Err(Error::Io(e)),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
+}
+
+/// The walk-and-pack half of [`write_compact`], feeding `sink`.
+fn build_compact(
+    env: &Env,
+    txn: &RoTxn<'_>,
+    names: Vec<Vec<u8>>,
+    sink: FileSink,
+    progress: &mut Progress<'_>,
+) -> Result<u64> {
     let psize = env.page_size();
     let snap = txn.snapshot();
     let main_pages =
         snap.main_db.branch_pages + snap.main_db.leaf_pages + snap.main_db.overflow_pages;
-    let sink = FileSink::new(file, base, psize);
     let mut es = EnvStream::new(sink, psize, snap.txnid, DEFAULT_FILL_PERMILLE).map_err(corrupt)?;
 
     // Named DBs first (their roots feed the catalog), in name order — the
@@ -515,15 +563,17 @@ fn stream_err(e: StreamBuildError) -> Error {
     }
 }
 
-/// A [`PageSink`] over the destination file, writing at `base + pgno ×
-/// psize`. Runs of consecutive pages are gathered into one buffer and landed
-/// with a single positioned write (LMDB's compacting copy likewise writes
-/// through a 1 MiB buffer, `MDB_WBUF`) instead of one `pwrite` per page. A
-/// page that does not extend the current run flushes it first, so any
-/// emission order lands correctly. [`FileSink::flush`] must run before the
-/// file is used; durability matches LMDB's `mdb_env_copy` (no fsync).
-struct FileSink<'f> {
-    file: &'f File,
+/// A [`PageSink`] that hands the destination's pages to the copy's writer
+/// thread (see [`write_compact`]), to land at `base + pgno × psize`. Runs of
+/// consecutive pages are gathered into one buffer and sent as a single
+/// positioned write (LMDB's compacting copy likewise writes through 1 MiB
+/// buffers, `MDB_WBUF`) instead of one `pwrite` per page. A page that does
+/// not extend the current run sends it first, so any emission order lands
+/// correctly (the writer applies buffers in order). [`FileSink::flush`] sends
+/// the last run; durability matches LMDB's `mdb_env_copy` (no fsync).
+struct FileSink {
+    full: std::sync::mpsc::SyncSender<(u64, Vec<u8>)>,
+    free: std::sync::mpsc::Receiver<Vec<u8>>,
     base: u64,
     psize: u32,
     next: u64,
@@ -532,13 +582,21 @@ struct FileSink<'f> {
     buf: Vec<u8>,
 }
 
-/// Bytes gathered before a flush.
+/// Bytes gathered before a buffer goes to the writer.
 const WRITE_BUF_BYTES: usize = 1 << 20;
+/// Buffers in flight at most: one filling, one queued, one being written.
+const WRITE_BUFS: usize = 3;
 
-impl<'f> FileSink<'f> {
-    fn new(file: &'f File, base: u64, psize: u32) -> FileSink<'f> {
+impl FileSink {
+    fn new(
+        full: std::sync::mpsc::SyncSender<(u64, Vec<u8>)>,
+        free: std::sync::mpsc::Receiver<Vec<u8>>,
+        base: u64,
+        psize: u32,
+    ) -> FileSink {
         FileSink {
-            file,
+            full,
+            free,
             base,
             psize,
             next: FIRST_DATA_PGNO,
@@ -547,19 +605,27 @@ impl<'f> FileSink<'f> {
         }
     }
 
-    /// Land the buffered run.
+    /// Send the buffered run to the writer and take a recycled buffer (or a
+    /// new one while fewer than [`WRITE_BUFS`] exist).
     fn flush(&mut self) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
-        if !self.buf.is_empty() {
-            let off = self.base + self.run_start * u64::from(self.psize);
-            self.file.write_all_at(&self.buf, off)?;
-            self.buf.clear();
+        if self.buf.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let off = self.base + self.run_start * u64::from(self.psize);
+        let next = self
+            .free
+            .try_recv()
+            .unwrap_or_else(|_| Vec::with_capacity(WRITE_BUF_BYTES));
+        let full = std::mem::replace(&mut self.buf, next);
+        // A send fails only once the writer has stopped on an I/O error;
+        // `write_compact` reports that error instead of this one.
+        self.full
+            .send((off, full))
+            .map_err(|_| std::io::Error::other("copy writer stopped"))
     }
 }
 
-impl PageSink for FileSink<'_> {
+impl PageSink for FileSink {
     fn alloc(&mut self, n: u64) -> u64 {
         let p = self.next;
         self.next += n;

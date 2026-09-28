@@ -196,3 +196,25 @@ fn copy_to_open_file_matches_path_copy_at_the_current_position() {
         );
     }
 }
+
+/// A write failure surfaces as `Error::Io` in both modes — for the compacting
+/// mode that is the writer thread's error, returned once the walk stops — and
+/// never hangs the copy.
+#[test]
+fn copy_to_open_file_reports_write_errors() {
+    for (option, tag) in [
+        (CompactionOption::Disabled, "werr-raw"),
+        (CompactionOption::Enabled, "werr-compact"),
+    ] {
+        let src = build_source(&tmp_dir(&format!("{tag}-src")));
+        let path = tmp_dir(&format!("{tag}-out")).join("ro.dat");
+        std::fs::write(&path, b"").unwrap();
+        // Opened read-only: every positioned write fails with EBADF.
+        let mut f = std::fs::File::open(&path).unwrap();
+        let err = src.copy_to_open_file(&mut f, option).unwrap_err();
+        assert!(
+            matches!(err, zerodb::Error::Io(_)),
+            "{tag}: expected an I/O error, got {err:?}"
+        );
+    }
+}

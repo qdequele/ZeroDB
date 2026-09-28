@@ -879,9 +879,17 @@ the first destination byte) holds unchanged.
 
 Bench server, x86-64, 4 KiB: `maint/copy/raw` 2.53× → **0.93×** (CGU1,
 3 rounds, 0.370) and → 0.95× (CGU16, 1 round, 0.374); `maint/copy/compact`
-3.31× → **1.51×** (0.456) and 3.34× → 1.51× (0.451). What is left in the
-compacting mode is the rebuild itself: ZeroDB re-packs every entry, LMDB
-copies pages and rewrites only child pointers.
+3.31× → **1.51×** (0.456) and 3.34× → 1.51× (0.451).
+
+*Second step (same day):* the profile then put ~31 % of the compacting copy's
+samples in `pwrite` (ext4 page-cache work) against ~13 % for the walk and
+re-pack. LMDB overlaps the two: `mdb_env_copyfd1` hands full buffers to a
+writer thread. The compacting copy now does the same: a scoped writer thread
+lands each full 1 MiB buffer while the walk packs the next (at most three
+buffers exist; the first write error stops the writer and is the error
+returned). `maint/copy/compact` 1.51× → **0.98×** (CGU1, 3 rounds, 0.651) and
+1.49× → 0.99× (CGU16, 1 round, 0.668). The walk still re-packs every entry
+where LMDB copies pages; at parity that is no longer worth a new algorithm.
 
 ## C. RAM (peak memory)
 
