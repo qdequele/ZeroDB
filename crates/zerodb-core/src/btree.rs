@@ -196,7 +196,7 @@ pub struct ValidatedPages {
     counts: [AtomicUsize; MEMO_LEVELS],
     /// The env's [`FileTrust`] policy, copied in at txn begin (ADR-0014).
     /// When set, a memo miss on a map page takes the header-checked
-    /// `new_prevalidated` view, as dirty frames do, and records nothing.
+    /// `new_prevalidated` view, as dirty frames do, and records the page.
     trust_file: bool,
 }
 
@@ -357,11 +357,15 @@ fn leaf_view_over<'a>(
                     Ok(LeafRef::new_trusted(bytes))
                 } else if v.trusts_file() {
                     // ADR-0014: the caller's `trust_contents` contract stands
-                    // in for the cell walk, as in LMDB. Tested only on a memo
+                    // in for the cell walk, as in LMDB; the O(1) header checks
+                    // (page type included) still run. Tested only on a memo
                     // miss, so a validating memo hit runs the code it ran
-                    // before the option existed; a trusting txn never inserts,
-                    // so its memo stays empty and every view lands here.
-                    LeafRef::new_prevalidated(bytes, psize)
+                    // before the option existed. Recorded like a validated
+                    // page, so later views of it take the same zero-check hit
+                    // path (the kind tag was just checked).
+                    let leaf = LeafRef::new_prevalidated(bytes, psize)?;
+                    v.insert(pgno, PageKind::Leaf);
+                    Ok(leaf)
                 } else {
                     let leaf = LeafRef::new(bytes, psize)?;
                     v.insert(pgno, PageKind::Leaf);
@@ -409,7 +413,9 @@ fn branch_view_over<'a>(
                     Ok(BranchRef::new_trusted(bytes))
                 } else if v.trusts_file() {
                     // ADR-0014 — see [`leaf_view`].
-                    BranchRef::new_prevalidated(bytes, psize)
+                    let br = BranchRef::new_prevalidated(bytes, psize)?;
+                    v.insert(pgno, PageKind::Branch);
+                    Ok(br)
                 } else {
                     let br = BranchRef::new(bytes, psize)?;
                     v.insert(pgno, PageKind::Branch);
