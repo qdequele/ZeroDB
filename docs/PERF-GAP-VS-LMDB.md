@@ -861,6 +861,28 @@ Bench server, x86-64, 4 KiB: `del/range/half` 2.63× → **0.92×** (CGU1, 3 rou
 0.351) and 2.58× → 0.97× (CGU16, 1 round, 0.375); the other 17 `put/*` and
 `del/*` rungs flat in both builds.
 
+### B24. Env copies wrote every byte two or three times — **DONE 2026-09-28**
+heed's `Env::copy_to_file(&mut File)` (what the ladder's `maint/copy/*`
+calls) staged the copy in a private directory, then `io::copy`'d it into the
+caller's file: every byte written twice and read back once. The raw mode also
+assembled the whole image in a zeroed `Vec` before writing it, and the
+compacting mode's sink issued one `pwrite` per page. LMDB's
+`mdb_env_copyfd2` writes into the caller's descriptor directly, the raw mode
+straight from its map and the compacting mode through a 1 MiB buffer
+(`MDB_WBUF`). Now the same: `CopyToFile::copy_to_open_file` writes into the
+handle from its current position (the adapter's `copy_to_file` calls it),
+the raw copy writes the map in large positioned chunks with no in-memory
+image, and the compacting sink gathers runs of consecutive pages into a
+1 MiB buffer. The path-based copy streams both modes into a sibling staging
+file renamed over the destination, so the panic contract (no callback after
+the first destination byte) holds unchanged.
+
+Bench server, x86-64, 4 KiB: `maint/copy/raw` 2.53× → **0.93×** (CGU1,
+3 rounds, 0.370) and → 0.95× (CGU16, 1 round, 0.374); `maint/copy/compact`
+3.31× → **1.51×** (0.456) and 3.34× → 1.51× (0.451). What is left in the
+compacting mode is the rebuild itself: ZeroDB re-packs every entry, LMDB
+copies pages and rewrites only child pointers.
+
 ## C. RAM (peak memory)
 
 ### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**
@@ -953,10 +975,11 @@ What remains, and its gate:
 - **Inherent, mitigations tracked:** C2 → spilling (#3), B5 (#13), or B3
   pooling (parked).
 - **Tooling residual:** C3 landed 2026-07-22 (`load` streams; #63's load
-  half). Still buffered: `copy_raw` (`CompactionOption::Disabled`, 1× env in
-  RAM + single `fs::write`), and — until 2026-09-09 — the adapter's
-  `heed::Env::copy_to_file`, which `read_to_end`'d the staged copy before
-  writing it (now `io::copy` through a private staging dir).
+  half). *Closed 2026-09-28 (B24):* the raw copy streams from the map into
+  a staging file (it held 1× env in RAM before), and the adapter's
+  `heed::Env::copy_to_file` writes straight into the caller's handle through
+  `CopyToFile::copy_to_open_file` (it staged the image in a private directory
+  and `io::copy`'d it across, writing every byte twice).
 
 The broader Phase-3 technique backlog (beyond this inventory's LMDB-parity
 scope) lives in the GitHub issues, filed 2026-07-22: prefetch/madvise, io_uring,

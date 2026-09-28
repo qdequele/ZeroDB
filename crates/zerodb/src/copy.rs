@@ -26,7 +26,8 @@
 //! overwritten on the next reuse), so a torn free page is harmless. Compaction
 //! sidesteps the question entirely: it reads only reachable entries.
 
-use std::path::Path;
+use std::fs::File;
+use std::path::{Path, PathBuf};
 
 use zerodb_core::builder::{EnvStream, PageSink, StreamBuildError, DEFAULT_FILL_PERMILLE};
 use zerodb_core::env::Env;
@@ -98,23 +99,25 @@ pub trait CopyToFile {
     /// a deliberate contract, not an accident of the implementation, and both
     /// modes honor it by different means:
     ///
-    /// - `Disabled` (raw): the image is assembled in memory and written to
-    ///   `path` by one `std::fs::write` after the last callback returns.
+    /// Both modes stream the image into a sibling temp file
+    /// (`<name>.copy-tmp-<pid>-<nonce>` in `path`'s directory); `path` itself
+    /// is touched only by the final atomic `rename`, after the last callback.
+    /// On any error — or a panicking callback — the temp file is removed by a
+    /// drop guard.
+    ///
+    /// - `Disabled` (raw, **streamed since 2026-09-28**): the snapshot's data
+    ///   pages are written straight from the map in large chunks, as LMDB's
+    ///   `mdb_env_copyfd` writes from its map; no in-memory image.
     /// - `Enabled` (compacting, **streamed since PERF-GAP C1**): pages land
-    ///   incrementally in a sibling temp file (`<name>.copy-tmp-<pid>` in
-    ///   `path`'s directory, bounded memory — O(tree depth × page size));
-    ///   `path` itself is touched only by the final atomic `rename`, after
-    ///   the last callback. On any error — or a panicking callback — the
-    ///   temp file is removed by a drop guard.
+    ///   incrementally, bounded memory — O(tree depth × page size).
     ///
     /// In both modes therefore:
     ///
     /// - A panicking callback unwinds out of this function normally (panics
     ///   are not caught) and **`path` is left untouched** — absent if it did
     ///   not exist, and byte-for-byte its old contents if it did. There is no
-    ///   half-written copy to mistake for a good one. (The compacting mode's
-    ///   rename makes this hold even for a process kill mid-copy, which the
-    ///   raw mode's single `write` cannot promise.)
+    ///   half-written copy to mistake for a good one. (The rename makes this
+    ///   hold even for a process kill mid-copy.)
     /// - The **source** environment is likewise untouched under any callback
     ///   behavior: a copy only ever reads it, under an internal read txn that
     ///   is released when this function returns (including while unwinding).
@@ -122,8 +125,7 @@ pub trait CopyToFile {
     ///
     /// The cost of that guarantee is that progress tracks *source pages
     /// processed*, not bytes landed at `path`, and that the final stretch
-    /// (the raw mode's single `write`; the compacting mode's rename) is not
-    /// covered by any callback. Callers wanting a progress bar that ends
+    /// (the rename) is not covered by any callback. Callers wanting a progress bar that ends
     /// exactly when the file is durable should treat `done == total` as
     /// "reading finished", not "file written".
     ///
@@ -143,6 +145,21 @@ pub trait CopyToFile {
         option: CompactionOption,
         on_progress: &mut dyn FnMut(CopyProgress),
     ) -> Result<()>;
+
+    /// Copy this environment into an already-open `file`, the engine half of
+    /// heed's `Env::copy_to_file(&mut File)` (`mdb_env_copyfd2`).
+    ///
+    /// The image is written starting at the file's current position, and the
+    /// position is left at the end of the image, as LMDB's sequential writes
+    /// leave it. Pages go straight into `file`: no temp file, no rename, no
+    /// progress reporting, so a failure can leave a partial image in `file`
+    /// (as with LMDB). Durability is the caller's concern, as for
+    /// [`CopyToFile::copy_to_file`].
+    ///
+    /// # Errors
+    ///
+    /// As [`CopyToFile::copy_to_file`].
+    fn copy_to_open_file(&self, file: &mut File, option: CompactionOption) -> Result<()>;
 }
 
 impl CopyToFile for Env {
@@ -159,12 +176,137 @@ impl CopyToFile for Env {
         option: CompactionOption,
         on_progress: &mut dyn FnMut(CopyProgress),
     ) -> Result<()> {
+        let dest = path.as_ref();
         // The internal read txn pins the snapshot for the whole copy (SPEC 00
         // row 17: copy opens its own read txn).
         let txn = self.read_txn()?;
+        let plan = Plan::new(self, &txn, option)?;
+        let (tmp, file) = create_staging_file(dest)?;
+        // Remove the temp on every non-rename exit (error or unwinding callback).
+        let mut guard = TmpGuard {
+            path: &tmp,
+            armed: true,
+        };
+        let mut progress = Progress::start(plan.total, on_progress);
+        plan.write(self, &txn, &file, 0, &mut progress)?;
+        drop(file); // close the temp file before renaming it
+                    // Last callback before `dest` is touched — see the panic contract on
+                    // `copy_to_file_with_progress`.
+        progress.finish();
+        std::fs::rename(&tmp, dest)?;
+        guard.armed = false;
+        Ok(())
+    }
+
+    fn copy_to_open_file(&self, file: &mut File, option: CompactionOption) -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+        let txn = self.read_txn()?;
+        let plan = Plan::new(self, &txn, option)?;
+        let base = file.stream_position()?;
+        let mut silent = |_: CopyProgress| {};
+        let mut progress = Progress::start(plan.total, &mut silent);
+        let len = plan.write(self, &txn, file, base, &mut progress)?;
+        file.seek(SeekFrom::Start(base + len))?;
+        Ok(())
+    }
+}
+
+/// What one copy will do, decided before any byte is written: the mode, the
+/// progress total, and for the compacting mode the named DBs to rebuild.
+struct Plan {
+    option: CompactionOption,
+    total: u64,
+    names: Vec<Vec<u8>>,
+}
+
+impl Plan {
+    fn new(env: &Env, txn: &RoTxn<'_>, option: CompactionOption) -> Result<Plan> {
+        let snap = txn.snapshot();
         match option {
-            CompactionOption::Disabled => copy_raw(self, &txn, path.as_ref(), on_progress),
-            CompactionOption::Enabled => copy_compact(self, &txn, path.as_ref(), on_progress),
+            // M2.3: the raw copy's page count is exact — every page in the
+            // snapshot is copied verbatim.
+            CompactionOption::Disabled => Ok(Plan {
+                option,
+                total: snap.last_pg + 1,
+                names: Vec::new(),
+            }),
+            CompactionOption::Enabled => {
+                refuse_custom_comparator(env)?;
+                // M2.3: the compacting copy's unit of work is *reading* the
+                // source's live pages; how many pages it writes is only known
+                // once packing finishes, so `total` is the source's reachable
+                // page count (see `CopyProgress::total`). The main tree's
+                // record covers the catalog; each named DB's record is added
+                // as its section is read.
+                let mut total = snap.main_db.branch_pages
+                    + snap.main_db.leaf_pages
+                    + snap.main_db.overflow_pages;
+                let names = named_databases(txn)?;
+                for name in &names {
+                    if let Some(dbh) = env.open_database(txn, Some(name))? {
+                        let st = dbh.stat(txn)?;
+                        total += st.branch_pages + st.leaf_pages + st.overflow_pages;
+                    }
+                }
+                Ok(Plan {
+                    option,
+                    total,
+                    names,
+                })
+            }
+        }
+    }
+
+    /// Write the image into `file` at offset `base`; returns its length.
+    fn write(
+        self,
+        env: &Env,
+        txn: &RoTxn<'_>,
+        file: &File,
+        base: u64,
+        progress: &mut Progress<'_>,
+    ) -> Result<u64> {
+        match self.option {
+            CompactionOption::Disabled => write_raw(env, txn, file, base, progress),
+            CompactionOption::Enabled => write_compact(env, txn, self.names, file, base, progress),
+        }
+    }
+}
+
+/// Create the sibling staging file for a copy to `dest`.
+///
+/// Staging file hygiene: `create_new` (O_CREAT|O_EXCL) never follows a
+/// symlink planted at the staging path, `mode(0o600)` keeps the copy
+/// owner-only like the engine's own env files, and the randomized suffix
+/// (std `RandomState` is seeded from OS entropy) makes the name unpredictable
+/// — retrying on `AlreadyExists` handles the astronomically unlikely collision
+/// (and any pre-placed file at a guessed name). The destination path itself
+/// is the caller's; the final rename replaces it.
+fn create_staging_file(dest: &Path) -> Result<(PathBuf, File)> {
+    use std::hash::{BuildHasher, Hasher};
+    use std::os::unix::fs::OpenOptionsExt;
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| Error::Io(std::io::Error::other("copy destination has no file name")))?;
+    let mut attempt = 0u32;
+    loop {
+        let nonce = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        let mut tmp_name = file_name.to_os_string();
+        tmp_name.push(format!(".copy-tmp-{}-{nonce:016x}", std::process::id()));
+        let tmp = dest.with_file_name(tmp_name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            Ok(f) => return Ok((tmp, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(Error::Io(e)),
         }
     }
 }
@@ -222,51 +364,31 @@ fn corrupt(_e: zerodb_core::page::PageError) -> Error {
 /// copied verbatim from the map, with two freshly-encoded meta slots pinned to
 /// this snapshot (so the copy opens at exactly snapshot `T`, even if the live
 /// env has committed newer metas since the txn began — SPEC 00 row 17).
-fn copy_raw(
+///
+/// The data pages are written straight from the map in large positioned
+/// writes, as LMDB's `mdb_env_copyfd` writes from its map: no in-memory image
+/// (reachable pages are immutable under the reader pin; free pages are
+/// harmless — see the module docs). Returns the image length.
+fn write_raw(
     env: &Env,
     txn: &RoTxn<'_>,
-    dest: &Path,
-    on_progress: &mut dyn FnMut(CopyProgress),
-) -> Result<()> {
+    file: &File,
+    base: u64,
+    progress: &mut Progress<'_>,
+) -> Result<u64> {
+    use std::os::unix::fs::FileExt;
     let psize = env.page_size();
     let ps = psize as usize;
     let snap = txn.snapshot();
-    // Pages 0..=last_pg. Slots 0/1 are rewritten below; the rest are data.
+    // Pages 0..=last_pg. Slots 0/1 are synthesized below; the rest are data.
     let n_pages = snap.last_pg + 1;
     let data_end = (snap.last_pg as usize + 1) * ps;
     let map = txn.map_bytes();
     let src = map.get(..data_end).ok_or(Error::Mdb(MdbError::Invalid))?;
 
-    // M2.3: the raw copy's page count is exact — every page in the snapshot is
-    // copied verbatim.
-    let mut progress = Progress::start(n_pages, on_progress);
-
-    let mut out = vec![0u8; data_end];
-    if data_end > 2 * ps {
-        // Copy the data pages verbatim (reachable pages are immutable under the
-        // reader pin; free pages are harmless — see the module docs). Chunked
-        // so progress is observable; the chunk size is a *reporting*
-        // granularity only and does not affect one byte of the output.
-        //
-        // Sized relative to the env rather than fixed: a fixed chunk either
-        // fires once on a small env (useless — the caller learns nothing
-        // between 0 and total) or hundreds of thousands of times on a large
-        // one. Aiming at ~`PROGRESS_STEPS` reports keeps the callback rate
-        // bounded and the resolution usable at every scale.
-        const PROGRESS_STEPS: u64 = 32;
-        let pages_per_chunk = (n_pages / PROGRESS_STEPS).max(1);
-        let mut pg = 2u64;
-        while pg < n_pages {
-            let end = (pg + pages_per_chunk).min(n_pages);
-            let (from, to) = (pg as usize * ps, end as usize * ps);
-            out[from..to].copy_from_slice(&src[from..to]);
-            pg = end;
-            progress.advance_to(pg);
-        }
-    }
-
     // Synthesize both meta slots from the pinned snapshot — the copy is a
     // self-contained env at snapshot T, freelist preserved (SPEC 02 §3).
+    let mut metas = vec![0u8; 2 * ps];
     let mut meta = MetaPage {
         pgno: 0,
         txnid: snap.txnid,
@@ -279,149 +401,80 @@ fn copy_raw(
         free_db: snap.free_db,
         main_db: snap.main_db,
     };
-    meta.encode(&mut out[0..ps]).map_err(corrupt)?;
+    meta.encode(&mut metas[0..ps]).map_err(corrupt)?;
     meta.pgno = 1;
-    meta.encode(&mut out[ps..2 * ps]).map_err(corrupt)?;
+    meta.encode(&mut metas[ps..2 * ps]).map_err(corrupt)?;
+    file.write_all_at(&metas, base)?;
 
-    // Last callback before any destination I/O — see the panic contract on
-    // `copy_to_file_with_progress`.
-    progress.finish();
-    // Owner-only, like every other env file this crate creates (M2): a copy
-    // holds the same data as the source store. The destination is opened
-    // create+truncate on purpose: that is heed's `copy_to_path` contract
-    // (`File::options().create(true).truncate(true)`, heed 0.22.1 `env.rs`),
-    // and the compacting path replaces an existing destination too (staged
-    // sibling + rename). The destination path is the caller's; protecting it
-    // from a planted symlink is out of the engine's threat model
-    // (SECURITY.md) — the *staging* names, which the caller never sees, are
-    // the ones created exclusively.
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(dest)?;
-        f.write_all(&out)?;
+    // Data pages in chunks, so progress is observable. The chunk is sized
+    // relative to the env (~`PROGRESS_STEPS` reports keep the callback rate
+    // bounded and the resolution usable at every scale) and capped so one
+    // write stays a bounded syscall. The chunk size is a reporting
+    // granularity only and does not affect one byte of the output.
+    const PROGRESS_STEPS: u64 = 32;
+    const MAX_CHUNK_BYTES: u64 = 64 << 20;
+    let pages_per_chunk = (n_pages / PROGRESS_STEPS).clamp(1, MAX_CHUNK_BYTES / u64::from(psize));
+    let mut pg = FIRST_DATA_PGNO.min(n_pages);
+    while pg < n_pages {
+        let end = (pg + pages_per_chunk).min(n_pages);
+        let (from, to) = (pg as usize * ps, end as usize * ps);
+        file.write_all_at(&src[from..to], base + from as u64)?;
+        pg = end;
+        progress.advance_to(pg);
     }
-    Ok(())
+    Ok(data_end as u64)
 }
 
-/// Compacting copy: read every live entry of every DB under the snapshot and
-/// rebuild a fresh, densely-packed image (`build_multi_db_image`) with no free
-/// pages — the `MDB_CP_COMPACT` shape.
-fn copy_compact(
-    env: &Env,
-    txn: &RoTxn<'_>,
-    dest: &Path,
-    on_progress: &mut dyn FnMut(CopyProgress),
-) -> Result<()> {
-    // M2.4 scope boundary (SPEC 03 §2.0). The compacting rebuild goes through
-    // the bulk builder, whose ordering contract is memcmp end to end: it packs
-    // the main catalog by `sort_by(memcmp)` and debug-asserts strictly
-    // ascending memcmp order for every DB it packs. Feeding it entries ordered
-    // by a caller's comparator would produce a tree whose physical order is
-    // the comparator's but whose builder-side reasoning assumed memcmp — and
-    // the resulting file records no comparator identity, so nothing downstream
-    // (`zerodb-tools check`, `dump`/`load`) could tell. Refusing loudly is the
-    // only honest option until the builder, the dump format and the tools are
-    // made comparator-aware, which is its own milestone.
-    //
-    // `CompactionOption::Disabled` (the raw page copy) is unaffected: it is a
-    // byte-level copy that preserves whatever order is on disk.
+/// The M2.4 scope boundary (SPEC 03 §2.0): refuse a compacting copy of an env
+/// with a custom key comparator.
+///
+/// The compacting rebuild goes through the bulk builder, whose ordering
+/// contract is memcmp end to end: it packs the main catalog by
+/// `sort_by(memcmp)` and debug-asserts strictly ascending memcmp order for
+/// every DB it packs. Feeding it entries ordered by a caller's comparator
+/// would produce a tree whose physical order is the comparator's but whose
+/// builder-side reasoning assumed memcmp — and the resulting file records no
+/// comparator identity, so nothing downstream (`zerodb-tools check`,
+/// `dump`/`load`) could tell. Refusing loudly is the only honest option until
+/// the builder, the dump format and the tools are made comparator-aware,
+/// which is its own milestone.
+///
+/// `CompactionOption::Disabled` (the raw page copy) is unaffected: it is a
+/// byte-level copy that preserves whatever order is on disk.
+fn refuse_custom_comparator(env: &Env) -> Result<()> {
     if env.has_custom_comparator() {
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "compacting copy is not supported on an environment with a custom key comparator              (milestone 2.4, SPEC 03 §2.0); use CompactionOption::Disabled",
         )));
     }
+    Ok(())
+}
+
+/// Compacting copy: read every live entry of every DB under the snapshot and
+/// rebuild a fresh, densely-packed image (the `MDB_CP_COMPACT` shape),
+/// streamed into `file` at `base` (PERF-GAP C1: peak memory O(tree depth ×
+/// psize) plus the write buffer). Returns the image length.
+fn write_compact(
+    env: &Env,
+    txn: &RoTxn<'_>,
+    names: Vec<Vec<u8>>,
+    file: &File,
+    base: u64,
+    progress: &mut Progress<'_>,
+) -> Result<u64> {
     let psize = env.page_size();
     let snap = txn.snapshot();
-
-    // M2.3: the compacting copy's unit of work is *reading* the source's live
-    // pages; how many pages it writes is only known once packing finishes, so
-    // `total` is the source's reachable page count (see `CopyProgress::total`).
-    // The main tree's record covers the catalog; each named DB's record is
-    // added as its section is read.
     let main_pages =
         snap.main_db.branch_pages + snap.main_db.leaf_pages + snap.main_db.overflow_pages;
-
-    // Main DB user data = main tree entries minus the F_SUBDATA catalog records
-    // (which are followed into their own sections below).
-    let main = env.main_database();
-    let mut total = main_pages;
-    let names_probe = named_databases(txn)?;
-    for name in &names_probe {
-        if let Some(dbh) = env.open_database(txn, Some(name))? {
-            let st = dbh.stat(txn)?;
-            total += st.branch_pages + st.leaf_pages + st.overflow_pages;
-        }
-    }
-    let mut progress = Progress::start(total, on_progress);
-
-    // PERF-GAP C1: stream the rebuild. Pages land incrementally in a sibling
-    // TEMP file; `dest` is touched only by the final atomic rename, after the
-    // last progress callback — so the documented panic contract ("`path` is
-    // left untouched") holds verbatim, now under a *stronger* mechanism: even
-    // a process kill mid-copy cannot leave a half-written `dest` (the old
-    // single `std::fs::write` could). Peak memory is O(tree depth × psize)
-    // instead of the whole entry set + whole image (~2× env size).
-    let file_name = dest
-        .file_name()
-        .ok_or_else(|| Error::Io(std::io::Error::other("copy destination has no file name")))?;
-    // Staging file hygiene: `create_new` (O_CREAT|O_EXCL) never follows a
-    // symlink planted at the staging path, `mode(0o600)` keeps the copy
-    // owner-only like the engine's own env files, and the randomized suffix
-    // (std `RandomState` is seeded from OS entropy) makes the name
-    // unpredictable — retrying on `AlreadyExists` handles the astronomically
-    // unlikely collision (and any pre-placed file at a guessed name).
-    let (tmp, file) = {
-        use std::hash::{BuildHasher, Hasher};
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut attempt = 0u32;
-        loop {
-            let nonce = std::collections::hash_map::RandomState::new()
-                .build_hasher()
-                .finish();
-            let mut tmp_name = file_name.to_os_string();
-            tmp_name.push(format!(".copy-tmp-{}-{nonce:016x}", std::process::id()));
-            let tmp = dest.with_file_name(tmp_name);
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)
-            {
-                Ok(f) => break (tmp, f),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
-                    attempt += 1;
-                }
-                Err(e) => return Err(Error::Io(e)),
-            }
-        }
-    };
-    // Remove the temp on every non-rename exit (error or unwinding callback).
-    let mut guard = TmpGuard {
-        path: &tmp,
-        armed: true,
-    };
-
-    let sink = FileSink {
-        file,
-        psize,
-        next: FIRST_DATA_PGNO,
-    };
+    let sink = FileSink::new(file, base, psize);
     let mut es = EnvStream::new(sink, psize, snap.txnid, DEFAULT_FILL_PERMILLE).map_err(corrupt)?;
 
     // Named DBs first (their roots feed the catalog), in name order — the
     // stream's contract and `named_databases`'s order. Progress advances per
-    // source section read, monotone under the same fixed total as before
-    // (the section *order* moved: named DBs now precede the main tree, which
-    // the callback contract deliberately does not pin).
+    // source section read, monotone under the fixed total.
     let mut read = 0u64;
-    for name in names_probe {
+    for name in names {
         let dbh = env
             .open_database(txn, Some(&name))?
             .ok_or(Error::Mdb(MdbError::Invalid))?;
@@ -436,7 +489,8 @@ fn copy_compact(
 
     // Main tree: user entries only (catalog records are regenerated by the
     // stream from the named-DB roots just built).
-    let sink = es
+    let main = env.main_database();
+    let mut sink = es
         .finish_main(env.map_size(), |ms| {
             for_each_entry_flagged(&main, txn, |k, flags, v| {
                 if flags & F_SUBDATA == 0 {
@@ -447,16 +501,10 @@ fn copy_compact(
             })
         })
         .map_err(stream_err)?;
+    sink.flush()?;
     read += main_pages;
     progress.advance_to(read);
-    drop(sink); // close the temp file before renaming it
-
-    // Last callback before `dest` is touched — see the panic contract on
-    // `copy_to_file_with_progress`.
-    progress.finish();
-    std::fs::rename(&tmp, dest)?;
-    guard.armed = false;
-    Ok(())
+    Ok(sink.next * u64::from(psize))
 }
 
 /// Map a streaming-build failure to the public taxonomy.
@@ -467,17 +515,51 @@ fn stream_err(e: StreamBuildError) -> Error {
     }
 }
 
-/// A [`PageSink`] over the destination file: one positioned write per page
-/// (`pwrite`; writing past EOF extends). No userspace buffering, so there is
-/// nothing to flush before the rename; durability matches the previous
-/// implementation (no fsync — heed/LMDB `mdb_env_copy` parity).
-struct FileSink {
-    file: std::fs::File,
+/// A [`PageSink`] over the destination file, writing at `base + pgno ×
+/// psize`. Runs of consecutive pages are gathered into one buffer and landed
+/// with a single positioned write (LMDB's compacting copy likewise writes
+/// through a 1 MiB buffer, `MDB_WBUF`) instead of one `pwrite` per page. A
+/// page that does not extend the current run flushes it first, so any
+/// emission order lands correctly. [`FileSink::flush`] must run before the
+/// file is used; durability matches LMDB's `mdb_env_copy` (no fsync).
+struct FileSink<'f> {
+    file: &'f File,
+    base: u64,
     psize: u32,
     next: u64,
+    /// First pgno of the buffered run (meaningful while `buf` is non-empty).
+    run_start: u64,
+    buf: Vec<u8>,
 }
 
-impl PageSink for FileSink {
+/// Bytes gathered before a flush.
+const WRITE_BUF_BYTES: usize = 1 << 20;
+
+impl<'f> FileSink<'f> {
+    fn new(file: &'f File, base: u64, psize: u32) -> FileSink<'f> {
+        FileSink {
+            file,
+            base,
+            psize,
+            next: FIRST_DATA_PGNO,
+            run_start: 0,
+            buf: Vec::with_capacity(WRITE_BUF_BYTES),
+        }
+    }
+
+    /// Land the buffered run.
+    fn flush(&mut self) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        if !self.buf.is_empty() {
+            let off = self.base + self.run_start * u64::from(self.psize);
+            self.file.write_all_at(&self.buf, off)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
+impl PageSink for FileSink<'_> {
     fn alloc(&mut self, n: u64) -> u64 {
         let p = self.next;
         self.next += n;
@@ -487,8 +569,14 @@ impl PageSink for FileSink {
         self.next
     }
     fn emit(&mut self, pgno: u64, frame: &[u8]) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
-        self.file.write_all_at(frame, pgno * self.psize as u64)
+        let run_pages = (self.buf.len() / self.psize as usize) as u64;
+        let extends = !self.buf.is_empty() && pgno == self.run_start + run_pages;
+        if !extends || self.buf.len() + frame.len() > WRITE_BUF_BYTES {
+            self.flush()?;
+            self.run_start = pgno;
+        }
+        self.buf.extend_from_slice(frame);
+        Ok(())
     }
 }
 

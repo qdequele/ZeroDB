@@ -154,3 +154,45 @@ fn compacted_copy_is_no_larger_than_raw_copy() {
         "compacted copy ({compact_len}) larger than raw copy ({raw_len})"
     );
 }
+
+/// `copy_to_open_file` (the engine half of heed's `copy_to_file(&mut File)`,
+/// `mdb_env_copyfd2`) writes the same image `copy_to_file` produces, starting
+/// at the handle's current position, and leaves the position at the end of
+/// the image. Bytes before the start position are untouched.
+#[test]
+fn copy_to_open_file_matches_path_copy_at_the_current_position() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    for (option, tag) in [
+        (CompactionOption::Disabled, "handle-raw"),
+        (CompactionOption::Enabled, "handle-compact"),
+    ] {
+        let src = build_source(&tmp_dir(&format!("{tag}-src")));
+        let out = tmp_dir(&format!("{tag}-out"));
+        let by_path = out.join("by-path.dat");
+        src.copy_to_file(&by_path, option).unwrap();
+        let want = std::fs::read(&by_path).unwrap();
+
+        let prefix = b"caller-owned prefix";
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(out.join("by-handle.dat"))
+            .unwrap();
+        f.write_all(prefix).unwrap();
+        src.copy_to_open_file(&mut f, option).unwrap();
+        assert_eq!(
+            f.stream_position().unwrap(),
+            (prefix.len() + want.len()) as u64,
+            "{tag}: position after the copy"
+        );
+        let mut got = Vec::new();
+        f.seek(SeekFrom::Start(0)).unwrap();
+        f.read_to_end(&mut got).unwrap();
+        assert_eq!(&got[..prefix.len()], prefix, "{tag}: prefix overwritten");
+        assert!(
+            got[prefix.len()..] == want[..],
+            "{tag}: handle image differs from the path image"
+        );
+    }
+}
