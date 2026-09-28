@@ -1531,10 +1531,17 @@ impl<'env> RwTxn<'env> {
     /// finger: point deletes, `delete_range`'s splices and settle pass,
     /// `clear`/`drop` — and by the put path on any fast-path miss, whose
     /// descent then re-establishes it ([`RwTxn::finger_consider`]).
+    #[inline(always)]
     fn finger_invalidate(&mut self, tree: TreeId) {
-        if self.fingers.is_empty() {
-            return; // every tree with the setting off (ADR-0015)
+        // The table is empty for every tree with the setting off (ADR-0015):
+        // one load and a branch, the body out of line.
+        if !self.fingers.is_empty() {
+            self.finger_invalidate_slow(tree);
         }
+    }
+
+    #[inline(never)]
+    fn finger_invalidate_slow(&mut self, tree: TreeId) {
         self.fingers.retain(|f| f.tree != tree);
     }
 
@@ -1547,10 +1554,17 @@ impl<'env> RwTxn<'env> {
     /// unreachable: a finger page is live in its tree, so only an op on that
     /// tree frees it, and every such op invalidates first — but "normally" is
     /// exactly what a refactor breaks.)
+    #[inline(always)]
     fn finger_forget(&mut self, head: u64, n: u64) {
-        if self.fingers.is_empty() {
-            return;
+        // Empty for every tree with the setting off (ADR-0015); see
+        // `finger_invalidate`.
+        if !self.fingers.is_empty() {
+            self.finger_forget_slow(head, n);
         }
+    }
+
+    #[inline(never)]
+    fn finger_forget_slow(&mut self, head: u64, n: u64) {
         self.fingers.retain(|f| {
             f.path
                 .iter()
@@ -1823,20 +1837,14 @@ impl<'env> RwTxn<'env> {
         if val.len() as u64 > MAX_DATA_SIZE as u64 {
             return Err(Error::Mdb(MdbError::BadValSize));
         }
-        // Rightmost-leaf finger fast path (SPEC 03 §6.6; ADR-0015), only for a
-        // tree whose sequential-writes setting is on. Checked before the
-        // APPEND dispatch: a hit proves `key >` the tree's last key, which is
-        // APPEND's §6.3 validation and (for plain puts) proof the key is
-        // absent, so one fast path serves every flag combination. Out of line
-        // so a tree with the setting off runs the code it ran before.
-        let seq = self.seq_writes_on(tree);
-        if seq {
-            if let Some(res) = self.put_finger(tree, key, flags, val, node_flags) {
-                return res;
-            }
+        // Sequential-writes trees (ADR-0015) take the finger-aware copy of
+        // this path, out of line, so a tree with the setting off runs exactly
+        // the code it ran before the option existed plus this one branch.
+        if self.seq_writes_on(tree) {
+            return self.put_tree_seq(tree, key, flags, val, node_flags);
         }
         if flags.contains(PutFlags::APPEND) {
-            return self.append_tree(tree, key, val, seq);
+            return self.append_tree(tree, key, val, false);
         }
         let mut path = std::mem::take(&mut self.path_buf);
         let found = match self.search_path_into(tree, key, &mut path) {
@@ -1851,18 +1859,60 @@ impl<'env> RwTxn<'env> {
             self.path_buf = path;
             return Err(Error::Mdb(MdbError::KeyExist));
         }
-        let before = seq.then(|| *self.record(tree));
         let res = self.put_apply(tree, &mut path, found, key, val, node_flags);
-        if let (Some(before), true) = (before, res.is_ok() && !found) {
+        self.path_buf = path;
+        if res.is_err() {
+            // Mid-mutation failure (MapFull in a split cascade, corrupt page):
+            // the working tree may be partial — poison the txn (TXN-59 clean
+            // abort is the only exit).
+            self.errored = true;
+        }
+        res
+    }
+
+    /// [`RwTxn::put_tree_flagged`] for a tree with the sequential-writes
+    /// setting on (SPEC 03 §6.6; ADR-0015), after validation. The finger is
+    /// tested before the APPEND dispatch: a hit proves `key >` the tree's
+    /// last key, which is APPEND's §6.3 validation and (for plain puts) proof
+    /// the key is absent, so one fast path serves every flag combination. A
+    /// miss runs the same descent as the default path and establishes the
+    /// finger from it.
+    #[inline(never)]
+    fn put_tree_seq(
+        &mut self,
+        tree: TreeId,
+        key: &[u8],
+        flags: PutFlags,
+        val: ValSrc<'_>,
+        node_flags: u16,
+    ) -> Result<ReserveLoc> {
+        if let Some(res) = self.put_finger(tree, key, flags, val, node_flags) {
+            return res;
+        }
+        if flags.contains(PutFlags::APPEND) {
+            return self.append_tree(tree, key, val, true);
+        }
+        let mut path = std::mem::take(&mut self.path_buf);
+        let found = match self.search_path_into(tree, key, &mut path) {
+            Ok(found) => found,
+            Err(e) => {
+                self.path_buf = path;
+                return Err(e);
+            }
+        };
+        if found && flags.contains(PutFlags::NO_OVERWRITE) {
+            self.path_buf = path;
+            return Err(Error::Mdb(MdbError::KeyExist));
+        }
+        let before = *self.record(tree);
+        let res = self.put_apply(tree, &mut path, found, key, val, node_flags);
+        if res.is_ok() && !found {
             // A fresh insert may have landed at the end of the tree:
             // establish the finger from this descent (§6.6 F2).
             self.finger_consider(tree, &path, &before);
         }
         self.path_buf = path;
         if res.is_err() {
-            // Mid-mutation failure (MapFull in a split cascade, corrupt page):
-            // the working tree may be partial — poison the txn (TXN-59 clean
-            // abort is the only exit).
             self.errored = true;
         }
         res
