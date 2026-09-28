@@ -1,6 +1,6 @@
 # LMDB fork vs ZeroDB on the bench server after the perf loop — 2026-09-28
 
-The second full run on the dedicated bench server, after the LMDB-parity perf loop of 2026-09-25..28 (every kept lever is in  and  B11–B23). Same machine and settings as [2026-09-25](2026-09-25-bench-server-linux-x86.md). The reading guide is [`docs/BENCH-MAP.md`](../../docs/BENCH-MAP.md).
+The second full run on the dedicated bench server, after the LMDB-parity perf loop of 2026-09-25..28 (every kept lever is in `benches/results/perf-ledger.jsonl` and in `docs/PERF-GAP-VS-LMDB.md` B11–B23). Same machine and settings as [2026-09-25](2026-09-25-bench-server-linux-x86.md). The reading guide is [`docs/BENCH-MAP.md`](../../docs/BENCH-MAP.md).
 
 **Ratio = ZeroDB ÷ LMDB; below 1.00 means ZeroDB is faster.**
 
