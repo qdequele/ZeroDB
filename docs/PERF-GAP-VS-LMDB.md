@@ -808,6 +808,16 @@ side. **Still ~480× LMDB:** heed over LMDB derives the figure from `mdb_stat`
 page counts per DB and never reads the free list (O(#DBs)). Matching that is
 the next step and needs a SPEC GC-23/24 amendment.
 
+*Second step, 2026-09-29 (SPEC GC-23/24 amended with maintainer approval):*
+`non_free_pages_size` now uses heed's definition — the main DB's and every
+named DB's branch + leaf + overflow pages times the page size, read from the
+catalog records in one pass over the main DB's entries — and no longer walks
+the free list or reads the file length. That also fixes `WRITE_MAP`, where
+the file spans the whole map and the old `real_disk_size − free × psize`
+reported almost all of it as used. `env/stat/non_free` 169 µs → **148 ns**
+(467× → **0.41×** LMDB, CGU1 3 rounds). `free_page_count` stays for tools and
+`check`.
+
 ### B21. `clear` read every leaf of the tree — **DONE 2026-09-27**
 `clear_tree` → `collect_tree` loaded every page, leaves included, to collect
 the pgnos to free. LMDB's `mdb_drop0` walks only to the lowest branch level

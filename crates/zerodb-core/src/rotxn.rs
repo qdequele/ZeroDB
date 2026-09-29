@@ -463,29 +463,38 @@ impl Env {
         Ok(Some(db))
     }
 
-    /// `non_free_pages_size()` (SPEC 00 row 19 — MUST; SPEC 05 GC-23/GC-24):
-    /// `real_disk_size() − free_page_count() * psize`, where the free-page
-    /// count is the exact sum of every GC entry's PIL count under a fresh read
-    /// snapshot. This is the native replacement for milli reading LMDB's
-    /// freelist; it drives the `> 0.75 * map_size` auto-resize trigger.
-    ///
-    /// **TOCTOU note (GC-24):** the free count is exact *for the snapshot*,
-    /// but the `fstat` length is sampled independently and can only be
-    /// **larger** (a concurrent writer may extend the file; nothing ever
-    /// truncates it in Phase 1). The result may therefore over-report
-    /// non-free bytes by at most the concurrent growth — monotone-conservative
-    /// for milli's resize trigger (it can only fire *earlier* than the exact
-    /// value would, never later), and exact whenever no writer commits during
-    /// the call. GC-24's precision claim is per-snapshot and holds.
+    /// `non_free_pages_size()` (SPEC 00 row 19 — MUST; SPEC 05 GC-23/GC-24,
+    /// amended 2026-09-29): the bytes held by the env's databases — the main
+    /// DB's branch, leaf and overflow pages plus those of every named DB,
+    /// times the page size — under a fresh read snapshot. This is heed's
+    /// definition (heed 0.22.1 `Env::non_free_pages_size` sums `mdb_stat`
+    /// over the unnamed DB and every named DB), computed from the records
+    /// the catalog already keeps: one pass over the main DB's entries, no
+    /// free-list walk. It does not count the two meta pages or the GC tree's
+    /// own pages, and it does not depend on the file length (which under
+    /// `WRITE_MAP` is the whole map). Meilisearch reads it on every task
+    /// registration and after every indexing batch.
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] from `fstat`; [`MdbError::Invalid`] on a corrupt GC DB.
+    /// [`MdbError::Invalid`] on a corrupt main tree or catalog record.
     pub fn non_free_pages_size(&self) -> Result<u64> {
         let rtxn = self.read_txn()?;
-        let free_pages = free_page_count(&rtxn)?;
-        let disk = self.inner().real_disk_size()?;
-        Ok(disk.saturating_sub(free_pages * u64::from(self.page_size())))
+        let pages = |r: &DBRecord| r.branch_pages + r.leaf_pages + r.overflow_pages;
+        let mut total = pages(rtxn.main_record());
+        let main = *rtxn.main_record();
+        let tree = Tree::new(rtxn.source(), rtxn.page_size(), main.root, main.depth);
+        let mut cursor = tree.cursor();
+        let mut entry = cursor.first().map_err(map_page_err)?;
+        while let Some((_key, val)) = entry {
+            let flags = cursor.current_flags().map_err(map_page_err)?.unwrap_or(0);
+            if flags & F_SUBDATA != 0 {
+                let rec = DBRecord::from_bytes(val).ok_or(Error::Mdb(MdbError::Invalid))?;
+                total += pages(&rec);
+            }
+            entry = cursor.next().map_err(map_page_err)?;
+        }
+        Ok(total * u64::from(self.page_size()))
     }
 }
 

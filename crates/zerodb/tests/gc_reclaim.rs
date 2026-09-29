@@ -338,9 +338,12 @@ fn reader_gate_blocks_reuse_until_release() {
     );
 }
 
-/// INV-27 (SPEC 05 §9): `real_disk_size − non_free_pages_size ==
-/// free_page_count * psize`, asserted at the API level against an
-/// independent walk under a read snapshot (GC-22/23).
+/// INV-27 (SPEC 05 §9, amended 2026-09-29): every page of a committed
+/// image is exactly one of the two meta slots, a page of a user tree (main +
+/// named DBs, which `non_free_pages_size` counts), a page of the GC tree, or
+/// a free page (`free_page_count`), so
+/// `non_free_pages_size + (free + gc_tree_pages + 2) * psize == real_disk_size`
+/// (GC-22/23), checked against an independent free-list walk.
 #[test]
 fn non_free_pages_size_identity() {
     let dir = TempDir::new();
@@ -363,15 +366,21 @@ fn non_free_pages_size_identity() {
 
         let rtxn = env.read_txn().unwrap();
         let free = free_page_count(&rtxn).unwrap();
+        let g = rtxn.snapshot().free_db;
+        let gc_tree = g.branch_pages + g.leaf_pages + g.overflow_pages;
+        let m = rtxn.snapshot().main_db;
+        let main_tree = m.branch_pages + m.leaf_pages + m.overflow_pages;
         drop(rtxn);
         let disk = env.real_disk_size().unwrap();
         let non_free = env.non_free_pages_size().unwrap();
+        // Only the main DB here: the value is exactly its pages.
+        assert_eq!(non_free, main_tree * u64::from(PS), "cycle {cycle}");
         assert_eq!(
-            disk - non_free,
-            free * u64::from(PS),
-            "INV-27 violated at cycle {cycle}: disk={disk} non_free={non_free} free={free}"
+            non_free + (free + gc_tree + 2) * u64::from(PS),
+            disk,
+            "INV-27 violated at cycle {cycle}: disk={disk} non_free={non_free} free={free} gc_tree={gc_tree}"
         );
-        assert!(non_free > 0 && non_free <= disk);
+        assert!(non_free > 0 && non_free < disk);
     }
 }
 

@@ -108,18 +108,23 @@ fn free_page_count_over_fragmented_gc_tree() {
         free,
         "count not deterministic"
     );
+    let g = rtxn.snapshot().free_db;
+    let gc_tree = g.branch_pages + g.leaf_pages + g.overflow_pages;
     drop(rtxn);
 
-    // INV-27 (SPEC 05 §9) over the same several-entry tree: the free bytes
-    // `non_free_pages_size` subtracts are exactly this walk's count × psize.
+    // INV-27 (SPEC 05 §9, amended 2026-09-29) over the same several-entry
+    // tree: user-tree pages (`non_free_pages_size`), GC-tree pages, free pages
+    // and the two meta slots partition the file exactly.
     let disk = env.real_disk_size().unwrap();
     let non_free = env.non_free_pages_size().unwrap();
     assert_eq!(
-        disk - non_free,
-        free * u64::from(PS),
-        "INV-27 violated: disk={disk} non_free={non_free} free={free}"
+        non_free + (free + gc_tree + 2) * u64::from(PS),
+        disk,
+        "INV-27 violated: disk={disk} non_free={non_free} free={free} gc_tree={gc_tree}"
     );
-    assert!(non_free > 0 && non_free <= disk);
+    // Every key was deleted: the databases hold no pages (heed reports the
+    // same for empty trees).
+    assert_eq!(non_free, 0, "an emptied env must report no used pages");
 
     drop(pin);
 }
