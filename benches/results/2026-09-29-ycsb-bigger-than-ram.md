@@ -42,3 +42,19 @@ ZeroDB accepted `NO_READ_AHEAD` as a no-op, so every page fault read a whole rea
 2. **Memory pressure.** Both engines sit at the 2 GB cap, yet ZeroDB reads 5–9× more from disk (0.9–1.7 GB vs 0.1–0.3 GB): its p99 is a major fault. Either ZeroDB touches more pages per operation or keeps less of the working set resident; not yet diagnosed.
 
 Meilisearch does not set `NO_READ_AHEAD` and keeps one read txn per request, so neither the thrash nor the per-op txn cost applies to it as-is; hannoy search does not set it either.
+
+## Diagnosis: why ZeroDB reads more from disk at the same cap
+
+YCSB B re-run with the scope's cgroup `memory.stat` sampled every 5 s and `fincore` on the data file at the end (`ycsb-mem.sh` on the bench server):
+
+| YCSB B, 2 GB cap | LMDB | ZeroDB | ZeroDB + `malloc_trim(0)` after the load |
+|---|---:|---:|---:|
+| anonymous memory during the run | 517 MiB | 1,544 MiB | 11–29 MiB |
+| file cache at the end | 1,485 MiB | 489 MiB | 1,380 MiB |
+| data file resident at the end | 1.55 of 1.59 GB | 0.51 of 1.60 GB | 1.45 of 1.60 GB |
+| major page faults | 62,012 | 356,214 | 234,287 |
+| ops/s | 625,671 | 190,165 | 257,596 |
+
+The harness loads all 10M items in **one** write txn (`ingest`). ZeroDB keeps every dirty page of a write txn as its own 4 KiB heap allocation until commit (~1.5 GB here); after the commit glibc keeps the freed memory in the process, and the cgroup counts it against the cap, leaving a quarter of it for the page cache. Forcing glibc to return it (`malloc_trim(0)`, a bench-side experiment, `RSB_MALLOC_TRIM=1`) brings the heap back to tens of MiB and throughput up 35 %. LMDB never holds that much: past ~131k dirty pages it spills them to the file mid-txn, so its dirty memory stays bounded.
+
+The same shape applies to Meilisearch, whose indexing batches are single large write txns: after a batch, a ZeroDB process would keep roughly that batch's dirty set as heap memory unavailable to the page cache. Fix candidates: allocate dirty frames from large chunks returned to the OS when the txn ends (internal), or spill dirty pages mid-txn as LMDB does (commit-path change, ADR). The remaining gap with the trim (read p50 2.2 µs vs 0.55 µs, write p50 19 µs vs 9 µs) is the per-operation transaction cost.
