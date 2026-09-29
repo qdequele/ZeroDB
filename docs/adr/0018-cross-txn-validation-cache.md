@@ -43,8 +43,12 @@ it.
 - **Soundness:** a hit requires the exact stamp read from the current bytes;
   ZeroDB never writes two different contents with the same (pgno, stamp) that
   a snapshot can see (a txn writes each page once at commit, and a reused page
-  gets the reusing txn's id). A hostile file is still validated on its first
-  view, since the cache starts empty at open.
+  gets the reusing txn's id — `RwTxn::touch` restamps every COW copy with the
+  txn id, and fresh pages are initialized with it). A hostile file is still
+  validated on its first view, since the cache starts empty at open.
+- **Invariant to pin with a test:** every page written at commit (tree pages,
+  overflow runs, GC pages) carries the committing txn's id, so no two
+  visible versions of a pgno share a stamp.
 - **Limits:** a file modified by another process while open breaks the
   immutability the cache relies on — already outside the single-process model
   (D-001), but it must be stated.
