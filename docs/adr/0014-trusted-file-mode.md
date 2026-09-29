@@ -263,3 +263,22 @@ seeks 1.11–1.31× → 0.89–1.10×, range scans 1.73–1.81× → 1.33–1.38
 scan 2.33× → 1.74×, full scans 1.6–1.7× → 1.4–1.45×; no rung slower. Reads
 of overflow values (`get/val/v2page`, `v4k`) and `scan/edge/first_last` did
 not move: their gap is not validation.
+
+## Amendment (2026-09-29): overflow runs under the trusting policy
+
+Approved by the maintainer ("go with both", 2026-09-29). Under the trusting
+policy an overflow value is sliced from its head page without reading the
+run's header (type, `ovf_pages`, reserved field), as LMDB's `mdb_node_read`
+computes the data address from the page number alone. Memory safety does not
+depend on the header: the slice is bounded by the snapshot's high-water
+(`Source::bytes_from` clamps there), so a corrupt run yields wrong bytes or a
+typed error, never a read outside the committed map. This replaces
+"overflow runs" in the list of checks kept when trusted; the validating
+default is unchanged.
+
+Measured (bench server, CGU1, 3 rounds; both sides trusted, so only the
+header read differs): `get/val/v4k` 1.29× → 0.91×, `get/val/v2page` 1.27× →
+0.89×, `get/val/v4k_touch` 1.14× → 0.94×, `get/val/v2page_touch` 1.13× →
+0.93× LMDB; inline-value and scan rungs flat. Validating default: all 9 rungs
+flat.
+

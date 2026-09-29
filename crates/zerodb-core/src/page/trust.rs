@@ -24,8 +24,9 @@ impl FileTrust {
     /// Trust the cells of the pages read from the data file.
     ///
     /// Page numbers, page types, reserved header fields, free-space bounds,
-    /// overflow runs, the meta pages and the free list stay checked. The
-    /// per-cell walk (node pointers, key and value spans) does not run.
+    /// the meta pages and the free list stay checked. The per-cell walk (node
+    /// pointers, key and value spans) does not run, and overflow values are
+    /// read without their run header (bounded by the snapshot's high-water).
     ///
     /// # Safety
     ///

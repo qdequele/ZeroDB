@@ -471,16 +471,33 @@ pub(crate) fn node_view<'a>(
 /// Resolve the value of leaf entry `i` to a contiguous `&'a [u8]` (SPEC 03 §3):
 /// inline values borrow the leaf page; `F_BIGDATA` values borrow the overflow
 /// run, sliced from the head page across the whole run.
+///
+/// Under the trusting policy (ADR-0014, amended 2026-09-29) an overflow value
+/// is sliced from its head page without reading the run's header, as LMDB's
+/// `mdb_node_read` computes the data address from the page number alone. The
+/// slice stays bounded by the snapshot's high-water (`Source::bytes_from`
+/// clamps there), so a corrupt run can only yield wrong bytes or a typed
+/// error, never a read outside the committed map.
 fn resolve_value<'a>(
     src: Source<'a>,
     psize: u32,
     leaf: &LeafRef<'a>,
     i: usize,
+    valid: Option<&ValidatedPages>,
 ) -> Result<&'a [u8], PageError> {
     match leaf.value(i) {
         LeafValue::Inline(v) => Ok(v),
         LeafValue::Overflow { head_pgno, dsize } => {
             let run = src.bytes_from(psize, head_pgno)?;
+            if valid.is_some_and(ValidatedPages::trusts_file) {
+                let end = crate::page::HEADER_SIZE + dsize as usize;
+                return run
+                    .get(crate::page::HEADER_SIZE..end)
+                    .ok_or(PageError::BufferTooSmall {
+                        got: run.len(),
+                        psize: end,
+                    });
+            }
             OverflowRef::new(run, psize)?.payload(dsize)
         }
     }
@@ -570,7 +587,9 @@ impl<'a> Tree<'a> {
     /// A [`PageError`] only if the tree is structurally corrupt.
     pub fn get(&self, key: &[u8]) -> Result<Option<&'a [u8]>, PageError> {
         match self.find_exact(key)? {
-            Some((leaf, ki)) => Ok(Some(resolve_value(self.src, self.psize, &leaf, ki)?)),
+            Some((leaf, ki)) => Ok(Some(resolve_value(
+                self.src, self.psize, &leaf, ki, self.valid,
+            )?)),
             None => Ok(None),
         }
     }
@@ -619,7 +638,7 @@ impl<'a> Tree<'a> {
                 let flags = leaf.node_flags(ki);
                 Ok(Some((
                     flags,
-                    resolve_value(self.src, self.psize, &leaf, ki)?,
+                    resolve_value(self.src, self.psize, &leaf, ki, self.valid)?,
                 )))
             }
             None => Ok(None),
@@ -659,7 +678,7 @@ impl<'a> Tree<'a> {
             });
         }
         let k = leaf.key(ki);
-        let v = resolve_value(self.src, self.psize, &leaf, ki)?;
+        let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
         Ok((k, v))
     }
 }
@@ -849,7 +868,7 @@ impl<'a> Cursor<'a> {
             return Ok(None);
         }
         let k = leaf.key(ki);
-        let v = resolve_value(self.src, self.psize, &leaf, ki)?;
+        let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
         Ok(Some((k, v)))
     }
 
