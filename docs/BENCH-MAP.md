@@ -49,7 +49,7 @@ extra mechanism added". Changing a base here means changing `LADDER_BASE` in
 | `env/open/create` | writing a fresh image: file creation, initial metas, the catalog write | PERF-GAP **B9** — two unconditional fsyncs, by design |
 | `env/txn/ro_begin_abort` **(base)** | the reader-table slot pin/unpin protocol, nothing else | ADR-0006 lock-free reader table |
 | `env/txn/rw_empty_commit` | the same, plus the writer-lock handoff and the meta update, with **zero** dirty pages | the commit floor every `commit/*` rung sits on |
-| `env/stat/non_free` | `non_free_pages_size()` over a fragmented free list (~1M entries deleted across ~1k commits under a pinned reader → on the order of 10^5 free pages at 4 KiB, fewer at larger pages, in ~1k GC entries) | milli's per-write-txn used-bytes probe: LMDB sums `mdb_stat` per DB (freelist untouched), zerodb walks the GC tree summing each PIL's count prefix (SPEC 05 GC-23) — roadmap #10 drops the walk's per-entry id decode |
+| `env/stat/non_free` | `non_free_pages_size()` over a fragmented free list (~1M entries deleted across ~1k commits under a pinned reader → on the order of 10^5 free pages at 4 KiB, fewer at larger pages, in ~1k GC entries) | milli's per-write-txn used-bytes probe: both engines sum per-DB branch + leaf + overflow pages (LMDB via `mdb_stat`, zerodb from its catalog records, SPEC 05 GC-23 amended 2026-09-29), so the cost tracks the DB count; the large free list pins that it no longer depends on the free list (previously a GC-tree walk, PERF-GAP B20) |
 
 `rw_empty_commit ÷ ro_begin_abort` is what a write transaction costs when it has
 nothing to write. Subtract it from `commit/batch/n1` to get the part of a

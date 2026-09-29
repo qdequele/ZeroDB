@@ -27,7 +27,8 @@ const N_EMPTY_COMMIT: usize = 1_000;
 
 /// Entries loaded before the free list is built, for `env/stat/non_free`. Large
 /// enough that deleting them frees on the order of 10^5 pages at a 4 KiB page
-/// size (fewer at larger pages), so zerodb's GC walk has real work to sum.
+/// size (fewer at larger pages): a free-list walk would have real work, which
+/// the per-database computation must not do.
 const FRAG_KEYS: usize = 1_000_000;
 /// Separate committed delete txns the fill is torn down in — each leaves its own
 /// GC entry under the pinned reader, so the free DB ends with ~this many PILs.
@@ -143,15 +144,18 @@ fn case_empty_commit<B: Backend>(g: &mut Group<'_>, page: u32, keys: &[Vec<u8>],
     });
 }
 
-/// `non_free_pages_size()` over a fragmented free list — the used-bytes figure
-/// milli reads before every register write txn and after every batch. The two
-/// engines compute it from opposite ends: LMDB sums `mdb_stat` per database and
-/// never reads the freelist, so its cost tracks the DB count; zerodb walks the
-/// GC tree summing each PIL's count prefix (SPEC 05 GC-23), so its cost tracks
-/// the free list's size. The fixture makes that list deliberately large and
-/// fragmented (see `case_non_free`), which is the regime the count-prefix-only
-/// walk (roadmap #10) targets: it drops the per-entry id decode the walk used to
-/// pay, leaving only the prefix read.
+/// `non_free_pages_size()` — the used-bytes figure milli reads before every
+/// register write txn and after every batch. Since SPEC 05 GC-23's 2026-09-29
+/// amendment both engines compute it the same way: the main DB's and every
+/// named DB's branch + leaf + overflow page counts times the page size (LMDB
+/// via `mdb_stat` per DB, zerodb from its catalog records), so the cost tracks
+/// the number of databases, not the free list.
+///
+/// The fixture still carries a deliberately large, fragmented free list (see
+/// `case_non_free`): it is the regime the previous free-list walk paid for
+/// (roadmap #10, PERF-GAP B20), and keeping it pins that the figure no longer
+/// depends on the free list's size — a regression back to a walk would show
+/// here at once.
 fn non_free_stat(c: &mut Criterion, cfg: &Cfg) {
     let keys = ascending_keys(FRAG_KEYS);
     let val = vec![0xABu8; VAL];

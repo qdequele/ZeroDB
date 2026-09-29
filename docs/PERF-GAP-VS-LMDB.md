@@ -506,7 +506,11 @@ file — and it is paid **once per environment lifetime**. `env/open/reopen`, th
 same path minus creation, is **0.41×**. Listed here only so the ratio is not
 re-derived as a regression; no action.
 
-### B10. Copy / compaction — **MEASURED 2026-09-10** (extends C1's residual)
+### B10. Copy / compaction — **MEASURED 2026-09-10** (extends C1's residual); **superseded by [B24](#b24-env-copies-wrote-every-byte-two-or-three-times--done-2026-09-28)**
+*Pre-B24 baseline, kept for history: the buffered raw copy described here is
+gone. B24 (2026-09-28) streams both modes: `maint/copy/raw` 2.53× → 0.93× and
+`maint/copy/compact` 3.31× → 0.98× on the bench server.*
+
 `maint/copy/raw` 2.77× (LMDB 7.4 ms, ZeroDB 20.5 ms) and
 `maint/copy/compact` 4.72× (6.3 ms vs 29.6 ms). Meilisearch calls this on every
 snapshot, so it is user-visible latency, not an internal detail. The
