@@ -58,3 +58,17 @@ YCSB B re-run with the scope's cgroup `memory.stat` sampled every 5 s and `finco
 The harness loads all 10M items in **one** write txn (`ingest`). ZeroDB keeps every dirty page of a write txn as its own 4 KiB heap allocation until commit (~1.5 GB here); after the commit glibc keeps the freed memory in the process, and the cgroup counts it against the cap, leaving a quarter of it for the page cache. Forcing glibc to return it (`malloc_trim(0)`, a bench-side experiment, `RSB_MALLOC_TRIM=1`) brings the heap back to tens of MiB and throughput up 35 %. LMDB never holds that much: past ~131k dirty pages it spills them to the file mid-txn, so its dirty memory stays bounded.
 
 The same shape applies to Meilisearch, whose indexing batches are single large write txns: after a batch, a ZeroDB process would keep roughly that batch's dirty set as heap memory unavailable to the page cache. Fix candidates: allocate dirty frames from large chunks returned to the OS when the txn ends (internal), or spill dirty pages mid-txn as LMDB does (commit-path change, ADR). The remaining gap with the trim (read p50 2.2 µs vs 0.55 µs, write p50 19 µs vs 9 µs) is the per-operation transaction cost.
+
+### With Meilisearch's allocator (mimalloc v3)
+
+Meilisearch replaces `malloc` process-wide with mimalloc v3 (`override`). The same YCSB B run with the harness built `--features mimalloc_v3`, no trim:
+
+| YCSB B, 2 GB cap, mimalloc | LMDB | ZeroDB |
+|---|---:|---:|
+| anonymous memory during the load (peak) | 539 MiB | 1,681 MiB |
+| anonymous memory after the load | 537 MiB | 43–62 MiB |
+| data file resident at the end | 1.53 GB | 1.42 GB |
+| major page faults | 89,581 | 257,262 |
+| ops/s | 577,640 | 243,583 |
+
+mimalloc returns the load's freed memory to the OS on its own, so the glibc retention does not apply to Meilisearch; after the load ZeroDB's heap is smaller than LMDB's (LMDB keeps ~537 MiB for the whole run). What remains is the **peak during a large write txn**: ZeroDB holds every dirty page in RAM until commit (1.7 GB here), where LMDB spills past ~131k dirty pages and stays near 540 MiB — extra memory during Meilisearch's large indexing batches (PERF-GAP C2, "spilling"). ZeroDB's higher fault count here is the cache refilling after the load (its file cache grows from 0.26 to 1.34 GB over the run).
