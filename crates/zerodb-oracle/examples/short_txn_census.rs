@@ -57,6 +57,10 @@ macro_rules! census {
                 black_box(db.get(&r, &k).expect("get"));
             }
             let read_ns = t.elapsed().as_nanos() as f64 / ops as f64;
+            if std::env::var("CENSUS_READS_ONLY").is_ok() {
+                println!("{}: read txn+get {read_ns:.0} ns/op", stringify!($name));
+                return;
+            }
 
             let t = Instant::now();
             for _ in 0..ops {
@@ -91,8 +95,6 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1_000_000);
     let ops: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(200_000);
-    let only_reads = std::env::var("CENSUS_READS_ONLY").is_ok();
-    let _ = only_reads;
     match engine.as_str() {
         "lmdb" => lmdb(items, ops),
         "zerodb" => zerodb(items, ops),
