@@ -53,7 +53,8 @@ shape kept, implemented differently (noted) · **Extension** ZeroDB-only ·
 |---|---|
 | `WRITE_MAP`, `NO_SYNC`, `NO_META_SYNC`, `MAP_ASYNC`, `READ_ONLY`, `PREV_SNAPSHOT`, `NO_TLS` | Same |
 | `NO_SUB_DIR` | Unsupported — **refused at `open`** with `Io(Unsupported)` (D-016) |
-| `FIXED_MAP`, `NO_LOCK`, `NO_READ_AHEAD`, `NO_MEM_INIT` | No-op — accepted, no observable effect (no lock file, no fixed mapping) |
+| `NO_READ_AHEAD` | Honored as in LMDB: the map is advised `madvise(MADV_RANDOM)` (no readahead around page faults) |
+| `FIXED_MAP`, `NO_LOCK`, `NO_MEM_INIT` | No-op — accepted, no observable effect (no lock file, no fixed mapping) |
 | bitflags API: `empty`, `all`, `bits`, `from_bits`, `from_bits_truncate`, `contains`, `intersects`, `insert`, `remove`, `union`, bit operators | Same |
 | bitflags API: `from_bits_retain`, `from_name`, `iter`, `iter_names`, `set`, `toggle`, `difference`, `symmetric_difference`, `complement`, `Extend`/`FromIterator`, hex/binary formatting, `serde` | Unsupported |
 | `Debug` output | Emulated — prints the numeric value, not the flag names |
@@ -134,7 +135,8 @@ always initialised; seek error text differs).
 | Multi-process access, lock file, `mdb_reader_check` | Unsupported (single process) | D-001 |
 | `MDB_WRITEMAP`, `NOSYNC`, `NOMETASYNC`, `MAPASYNC`, `RDONLY`, `PREVSNAPSHOT`, `NOTLS` | Supported | SPEC 01 |
 | `MDB_NOSUBDIR` | Unsupported, refused at open | D-016 |
-| `MDB_FIXEDMAP`, `NOLOCK`, `NORDAHEAD`, `NOMEMINIT` | Accepted no-ops | this file |
+| `MDB_NORDAHEAD` | Honored (`MADV_RANDOM`) | SPEC 01 Table 1 |
+| `MDB_FIXEDMAP`, `NOLOCK`, `NOMEMINIT` | Accepted no-ops | this file |
 | `DUPSORT`, `DUPFIXED`, `INTEGERKEY`, `INTEGERDUP`, `REVERSEKEY`, `REVERSEDUP`, dup cursor ops, `MDB_MULTIPLE` | Unsupported | D-004, ADR-0011 (parked) |
 | `mdb_set_compare` | Emulated (safe trait, named DBs, not persisted) | SPEC 03 §2.0, D-014 |
 | `mdb_set_dupsort` | No-op | this file |

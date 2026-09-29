@@ -123,6 +123,11 @@ impl EnvFlags {
     /// `MDB_MAPASYNC` — with `WRITE_MAP`, use `msync(MS_ASYNC)` for the commit
     /// flushes (SPEC 01 Table 1, §S6). No effect without `WRITE_MAP`.
     pub const MAP_ASYNC: EnvFlags = EnvFlags(0x0010_0000);
+    /// `MDB_NORDAHEAD` — advise the kernel that the map is read at random
+    /// (`madvise(MADV_RANDOM)`), turning off readahead around page faults,
+    /// as LMDB does (SPEC 01 Table 1). Matters when the data does not fit in
+    /// memory and reads are random; it changes no result.
+    pub const NO_READ_AHEAD: EnvFlags = EnvFlags(0x0080_0000);
     /// `MDB_PREVSNAPSHOT` — open on the older of the two meta pages (SPEC 01
     /// Table 1, §S5).
     pub const PREV_SNAPSHOT: EnvFlags = EnvFlags(0x0200_0000);
@@ -425,13 +430,14 @@ impl EnvOpenOptions {
             write_map: self.flags.contains(EnvFlags::WRITE_MAP) && !read_only,
         };
 
-        let opened = zerodb_io::open_or_create(
+        let opened = zerodb_io::open_or_create_with_advice(
             &data_path,
             self.page_size,
             self.map_size,
             DEFAULT_MAP_SIZE,
             read_only,
             durability.write_map,
+            self.flags.contains(EnvFlags::NO_READ_AHEAD),
         )?;
 
         zerodb_core::env::open_with_backing_policy(

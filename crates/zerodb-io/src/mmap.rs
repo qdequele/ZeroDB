@@ -55,6 +55,17 @@ impl Mmap {
         Ok(Mmap { inner })
     }
 
+    /// Tell the kernel page reads will be random (`madvise(MADV_RANDOM)`):
+    /// no readahead around each fault. LMDB applies the same advice for
+    /// `MDB_NORDAHEAD` (SPEC 01 Table 1).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `madvise` I/O error.
+    pub fn advise_random(&self) -> std::io::Result<()> {
+        self.inner.advise(memmap2::Advice::Random)
+    }
+
     /// The whole mapped region.
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
@@ -103,6 +114,15 @@ pub struct MmapWritable {
 }
 
 impl MmapWritable {
+    /// As [`Mmap::advise_random`], for the writable map.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `madvise` I/O error.
+    pub fn advise_random(&self) -> std::io::Result<()> {
+        self.inner.advise(memmap2::Advice::Random)
+    }
+
     /// Map the first `len` bytes of `file` read/write (`MAP_SHARED`,
     /// `PROT_READ | PROT_WRITE`). `file` must be open read+write and at least
     /// `len` bytes long (the caller `set_len`s it first, SPEC 04 §6.4).

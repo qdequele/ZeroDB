@@ -308,6 +308,9 @@ fn zerodb_env_flags(flags: EnvFlags) -> zerodb::EnvFlags {
     if flags.contains(EnvFlags::MAP_ASYNC) {
         z |= zerodb::EnvFlags::MAP_ASYNC;
     }
+    if flags.contains(EnvFlags::NO_READ_AHEAD) {
+        z |= zerodb::EnvFlags::NO_READ_AHEAD;
+    }
     z
 }
 
