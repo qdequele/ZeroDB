@@ -1,6 +1,6 @@
 # ADR-0016: Lazy (read-time) cell validation on first sight
 
-- Status: Accepted (2026-09-29); kept only if the measurement gate below passes
+- Status: Measured, not adopted (parked 2026-09-29) — see Results
 - Milestone: Phase 3 (performance), PERF-GAP A2(b) / issue #21 (ADR-0014 Option D)
 - Date: 2026-09-29
 
@@ -123,3 +123,33 @@ function, by the check of the cell it reads.
 2. Should write txns get lazy leaf views for pure reads (`RwTxn::get`,
    write-cursor reads) as long as a page is fully validated before it is
    copied? More gain for indexing's read-your-writes lookups, more audit.
+
+## Results (2026-09-29) — step 1 parked
+
+Step 1 (read-txn point lookups, leaf pages) was built with no new `unsafe`
+(`LazyLeaf`: every read bounds-checked; property tests: never panics on
+corrupt pages, agrees with the full view on valid ones) and measured on the
+bench server (CGU1, `get/*` long tier; ZeroDB ÷ LMDB):
+
+| variant | wins | losses |
+|---|---|---|
+| full walk on the 2nd view (Option C as written) | `get/size/n1m` 1.46× → 1.30× | random / named / key-size gets +9–16 % |
+| never promote | n1m 1.48× → 1.16×, random −5 % | hot / miss / seq / n1k +29–53 % |
+| promote after 8 views (per-txn view-count table) | n1m 1.47× → 1.14× (3 rounds), random −4–7 %, hot −7 % | miss +11 %, seq +21 % |
+| promote after 8, lazy step out of line | n1m −23 %, random −3–5 % | miss +17 %, seq +23 % |
+
+Diagnosis: (1) a lazy lookup costs several times a zero-check one (each probe
+checks its cell with bounds-checked reads), so pages viewed a few dozen times
+per txn (`seq`: ~100 lookups per leaf) lose; the promotion threshold would have
+to track `num_keys / log2(num_keys)` per page; (2) restructuring
+`Tree::find_exact` alone — lazy path disabled — cost `miss` +17 % and `rand`
++6 %: the descent sits at LLVM's inlining threshold (PERF-GAP B13), and any
+new arm moves it. Only very large trees (pages seen once) gain clearly.
+
+Parked: not adopted in this form. Patch kept at
+`research/next-adr16-lazy-point-lookups.patch` (benches-server). If resumed:
+a per-page check budget (promote once the lazy checks spent reach the page's
+`num_keys`), a single-check `LazyLeaf::find`, and a hot path left
+byte-identical (the lazy step entered only on a memo miss, through a path
+that does not change `find_exact`'s code). Scans (step 1b) remain untested.
+
