@@ -95,6 +95,12 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1_000_000);
     let ops: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(200_000);
+    // Zero items would divide by zero in the key draw; zero ops would print
+    // NaN timings.
+    assert!(
+        items > 0 && ops > 0,
+        "items and ops must be positive (got {items}, {ops})"
+    );
     match engine.as_str() {
         "lmdb" => lmdb(items, ops),
         "zerodb" => zerodb(items, ops),

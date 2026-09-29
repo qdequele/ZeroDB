@@ -33,13 +33,22 @@ invalidation message from the writer.
 ## Options
 
 ### Option A — Env-wide direct-mapped cache keyed by (pgno, stamp) (proposed)
-A fixed-size, lock-free table in the env (e.g. 64 Ki slots of `AtomicU64`
-pairs), consulted on a txn-memo miss for a **map** page: read the page's
-stamp (a header field, same cache line as the flags), probe the slot, and on
-an exact (pgno, stamp, kind) hit take the zero-check view; on a miss validate
-fully and publish the pair (Release; lookups Acquire). A collision or a race
-only causes a miss, which revalidates. The txn-scoped memo stays in front of
-it.
+A fixed-size, lock-free table in the env (e.g. 64 Ki slots), consulted on a
+txn-memo miss for a **map** page: read the page's stamp (a header field, same
+cache line as the flags), probe the slot, and on an exact (pgno, stamp, kind)
+hit take the zero-check view; on a miss validate fully and publish the entry.
+A collision or a race only causes a miss, which revalidates. The txn-scoped
+memo stays in front of it.
+- **Coherent entries (required):** the key word (pgno and kind) and the stamp
+  are two separate atomics, and Release/Acquire on each does not make two
+  loads a coherent pair: a replacement could expose the old pgno with the new
+  stamp, and since many pages share one txn's stamp, that mixed pair could
+  match a page nobody validated. Each slot is therefore a **seqlock**: a
+  version word that a publisher makes odd (CAS from even) before writing the
+  two words and even again after; a lookup reads the version, the two words,
+  then the version again, and counts a hit only for an unchanged, even
+  version and an exact key and stamp. Any mixed read sees a changed or odd
+  version and is a miss. The protocol gets a loom model.
 - **Soundness:** a hit requires the exact stamp read from the current bytes;
   ZeroDB never writes two different contents with the same (pgno, stamp) that
   a snapshot can see (a txn writes each page once at commit, and a reused page
