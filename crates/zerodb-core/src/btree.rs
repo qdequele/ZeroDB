@@ -99,8 +99,11 @@ impl<'a> Source<'a> {
     /// the owning txn's life (a reader's pinned snapshot is GC-protected,
     /// TXN-20/21; a writer buffers every mutation in the dirty store until
     /// commit C2 — including WRITE_MAP, TXN-45a — so the map never changes
-    /// under a live txn). Dirty frames mutate mid-txn and must never be
-    /// trusted from a memo.
+    /// under a live txn). The one exception is a writer's **spilled** pages
+    /// (SPEC 04 §6.3a): they are rewritten in the map only at a spill, and
+    /// every spill resets that writer's memo (TXN-71), so no memo entry
+    /// outlives the bytes it vouched for. Dirty frames mutate mid-txn and
+    /// must never be trusted from a memo.
     // Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
     #[inline(always)]
     pub(crate) fn bytes_from_classified(

@@ -56,4 +56,8 @@ pub struct CutReport {
     /// (REC-10 as amended M1.11): window/taxonomy obligations verified,
     /// walk/data waived. Counted for characterization.
     pub stale_fallback: u64,
+    /// Write txns of the cycle that spilled before their commit or abort
+    /// (ADR-0017), as the SIGKILL child acked them; the image mechanism is
+    /// counted process-wide in `model::SPILLED_TXNS` instead.
+    pub spilled_txns: u64,
 }

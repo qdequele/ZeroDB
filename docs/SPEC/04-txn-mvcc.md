@@ -656,11 +656,70 @@ dirty-page store must be built so it is.
   loose-page path, SPEC 05 GC-8). Because reuse happens only at a `&mut`
   boundary (no borrow outstanding, TXN-39), reusing a freed frame for a new page
   is sound. The store must not `Drop` a frame while a `&self`-scoped borrow into
-  it could still be live — which TXN-39 already precludes.
+  it could still be live — which TXN-39 already precludes. Spilling (§6.3a)
+  also releases frames, likewise only at a `&mut` boundary.
 - **TXN-44** — Growth of the *index* (the pgno→frame map) may reallocate the map
   itself; that is fine — the map stores handles/pointers to frames, and moving a
   pointer does not move the pointee. Only frame *contents* addresses are
   load-bearing for borrows.
+
+### §6.3a — Bounded dirty memory: spilling (ADR-0017, added 2026-09-30)
+
+A write txn's dirty set is bounded, as LMDB bounds it (`mdb_page_spill`): when
+it grows past the env's **dirty limit**, part of it is written to the file
+early and its frames are released.
+
+- **TXN-68 (limit, trigger)** — The dirty limit is counted in pages (an
+  overflow run counts its `N` pages). Default: LMDB's `MDB_IDL_UM_MAX` =
+  131,072 pages; `EnvOpenOptions::max_dirty_bytes` (ZeroDB extension, SPEC 00)
+  sets it to `max(bytes / psize, 128)`. The check runs where no descent path,
+  view or borrow into a frame is live: at the start of every page-mutating
+  `Database` / `RwCursor` call and of `create_database` (after the TXN-29 child
+  guard), and at the top of each leaf step of `delete_range` (which keeps no
+  path across steps). Commit-internal writes (C1a/C1) never spill: commit
+  writes every frame anyway. At each check, if `dirty_pages + NEED > limit`
+  (`NEED` = 64, a fixed estimate of one op's worst-case touches, as LMDB's
+  `need` estimate), the txn spills. An op may still overshoot the limit by its own pages (a large
+  value's run); the next op's check brings it back.
+- **TXN-69 (what is spilled)** — At least `max(NEED, limit / 8)` pages (LMDB's
+  1/8 rule), taken from the dirty frames with the **highest** pgnos first (LMDB
+  flushes its pgno-sorted dirty list from the tail), skipping each open tree's
+  root page (main, GC, open named DBs) and every page a rightmost-leaf finger
+  names (SPEC 03 §6.6) — the pages about to be touched again. The chosen
+  frames are written at their pgnos with the commit's page writer (same
+  batched writes as C2, no fsync), then removed from the store and their pgnos
+  recorded as **spilled** (with their page count). A failed write marks the
+  txn errored (only abort remains); frames leave the store only after their
+  write succeeded.
+- **TXN-70 (what may be written)** — A spilled page is a dirty page, so it
+  satisfies TXN-62: it lies past the committed high-water or was reclaimed
+  under the oldest-reader gate, and no live snapshot references it. Spilling
+  changes when those pages reach the file, not which pages do. The meta is
+  written only at commit (C4); a crash or an abort after a spill leaves the
+  spilled pages as unreferenced bytes (SPEC 06 REC-6 H0 as amended). Nothing is
+  undone on abort; the file may keep a grown, unreferenced tail, as with LMDB.
+- **TXN-71 (reading a spilled page)** — The writer's source resolves a spilled
+  pgno from the map, through the ordinary map path: its TXN-38 high-water bound
+  is the committed high-water **raised past the highest page any spill of this
+  txn has written** (`read_high`). The spill wrote that page, so the file backs
+  every page up to the bound (never-written pages in between read as zeros),
+  and a stray reference into that range fails with a typed validation error,
+  never a fault (under `WRITE_MAP` the whole map is backed anyway). A spilled
+  page's map bytes change only when a later spill rewrites it, and **every
+  spill resets the writer's validated-pages memo**, so a memo entry never
+  outlives the bytes it vouched for. The resolution hot path is unchanged
+  (PERF-GAP B13: an extra spilled-page lookup inlined into every descent cost
+  read rungs 3–13 %). Nested read children read through the same source; no
+  spill runs while one is live (TXN-29 guard precedes the check).
+- **TXN-72 (writing a spilled page again)** — Touching a spilled tree page
+  (COW first-touch, SPEC 03 §5.1) copies its bytes from the map into a fresh
+  frame **at the same pgno** and clears its spilled mark (LMDB
+  `mdb_page_unspill`); the page already carries this txn's id, so there is no
+  new pgno, no parent-pointer rewrite and no free. Freeing a spilled page or run
+  clears its mark and classifies it as loose, like any page this txn
+  allocated. Commit C2 writes the remaining frames only: spilled pages are
+  already on the file with their final bytes. A txn whose only remaining change
+  is spilled pages is not "unchanged" (the commit proceeds).
 
 ### §6.4 — WRITE_MAP variant of the contract
 

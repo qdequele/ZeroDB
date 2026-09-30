@@ -71,6 +71,8 @@ pub struct EnvOpenOptions<T: TlsUsage = WithTls> {
     file_trust: zerodb::FileTrust,
     /// ADR-0015 ZeroDB extension — no heed counterpart.
     sequential_writes: bool,
+    /// ADR-0017 ZeroDB extension — no heed counterpart.
+    max_dirty_bytes: Option<usize>,
     _tls: std::marker::PhantomData<T>,
 }
 
@@ -92,6 +94,7 @@ impl EnvOpenOptions<WithTls> {
             flags: EnvFlags::empty(),
             file_trust: zerodb::FileTrust::VALIDATE,
             sequential_writes: false,
+            max_dirty_bytes: None,
             _tls: std::marker::PhantomData,
         }
     }
@@ -107,6 +110,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
             flags: self.flags,
             file_trust: self.file_trust,
             sequential_writes: self.sequential_writes,
+            max_dirty_bytes: self.max_dirty_bytes,
             _tls: std::marker::PhantomData,
         }
     }
@@ -185,6 +189,16 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// [`Env::set_sequential_writes`]. Default: off.
     pub fn sequential_writes(&mut self, on: bool) -> &mut Self {
         self.sequential_writes = on;
+        self
+    }
+
+    /// Bound a write txn's dirty memory to about `bytes` (**ADR-0017**).
+    /// **ZeroDB extension — heed has no such method** (LMDB's limit is a
+    /// compile-time constant). Default: LMDB's, 131,072 dirty pages. Past it
+    /// a write txn spills its highest-numbered dirty pages to the file, as
+    /// LMDB does; results and committed files never depend on it.
+    pub fn max_dirty_bytes(&mut self, bytes: usize) -> &mut Self {
+        self.max_dirty_bytes = Some(bytes);
         self
     }
 
@@ -277,6 +291,9 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         opts.flags(zerodb_env_flags(self.flags));
         opts.file_trust(self.file_trust);
         opts.sequential_writes(self.sequential_writes);
+        if let Some(b) = self.max_dirty_bytes {
+            opts.max_dirty_bytes(b);
+        }
         let env = opts.open(path).map_err(Error::from)?;
         Ok(Env {
             inner: env,

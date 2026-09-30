@@ -953,7 +953,15 @@ leaves incrementally into a bounded write buffer (the PLAN §3.4 note already
 reframed bulk-load as exactly this tooling win). No unsafe. Effort: medium.
 This is the difference between "compaction works on a 100 GB index" and OOM.
 
-### C2. Write-txn RAM = full copy of every touched page
+### C2. Write-txn RAM = full copy of every touched page — **DONE 2026-09-30 (spilling, ADR-0017)**
+**Done:** a write txn past its dirty limit (LMDB's 131,072 pages by default,
+`max_dirty_bytes` to set it) writes its highest-numbered dirty pages to the
+file and drops them from memory, as `mdb_page_spill` does (SPEC 04 §6.3a).
+rust-storage-bench, 10M items, 2 GB cap: the unsorted YCSB C load no longer
+dies at the cap (539 MiB anonymous peak vs LMDB's 520 MiB); with the memory
+back for the page cache, YCSB A 0.58× → 0.76× LMDB and YCSB B 0.31× → 0.69×
+(`benches/results/2026-09-30-bounded-dirty-memory.md`). Engine ladder flat.
+Original analysis kept below.
 Inherent to the heap dirty store (B3/B5): a write txn holds `Box` copies of
 every touched page + overflow run. LMDB WRITEMAP holds zero (mutates the
 map); LMDB default holds the same order but pool-recycled. Bounded by txn

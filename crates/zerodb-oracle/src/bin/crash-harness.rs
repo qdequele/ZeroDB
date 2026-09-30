@@ -147,6 +147,7 @@ struct Totals {
     adv_invalid: u64,
     adv_walk_clean: u64,
     stale_fallback: u64,
+    sigkill_spilled: u64,
     by_mode: std::collections::BTreeMap<&'static str, u64>,
     violations: Vec<String>,
 }
@@ -168,6 +169,7 @@ impl Totals {
         self.adv_invalid += r.adv_invalid;
         self.adv_walk_clean += r.adv_walk_clean;
         self.stale_fallback += r.stale_fallback;
+        self.sigkill_spilled += r.spilled_txns;
         if let Some(m) = r.mode {
             *self.by_mode.entry(m.name()).or_default() += r.verified;
         }
@@ -321,6 +323,7 @@ fn main() {
          by mode         : {:?}\n\
          adversarial     : {} probes — {} opened, {} designed-Invalid, {} walk-clean (characterization, not gated)\n\
          stale fallbacks : {} (NO_META_SYNC reclaim-clobber window, REC-10 as amended — walk/data waived)\n\
+         spilling txns   : {} image, {} sigkill (ADR-0017 spill cycles)\n\
          wall time       : {:.1}s ({:.1} cycles/s)",
         t.verified,
         t.image_cuts,
@@ -333,6 +336,8 @@ fn main() {
         t.adv_invalid,
         t.adv_walk_clean,
         t.stale_fallback,
+        zerodb_oracle::crash::model::SPILLED_TXNS.load(Ordering::Relaxed),
+        t.sigkill_spilled,
         secs,
         t.verified as f64 / secs.max(0.001),
     );

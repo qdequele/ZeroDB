@@ -35,6 +35,15 @@
 //! they are just dropped. The env hands a store its initial spares at
 //! write-txn begin and reclaims them at end (see [`DirtyStore::with_spare`] /
 //! [`DirtyStore::reclaimable_frames`]).
+//!
+//! **Spilling (SPEC 04 §6.3a, ADR-0017; LMDB `mdb_page_spill`).** The store
+//! counts the pages its frames hold ([`DirtyStore::pages`]). Past the env's
+//! dirty limit the write txn writes some frames to the file and hands them to
+//! [`DirtyStore::spill`], which drops the frame and records the pgno as
+//! **spilled** with its page count; reads then resolve it from the map, and
+//! [`DirtyStore::unspill_copy`] brings a tree page back into a frame at the
+//! same pgno when the txn writes it again. A pgno is never both a frame and
+//! spilled. Like frame removal, spilling happens only inside `&mut` ops.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -92,22 +101,36 @@ pub(crate) const SPARE_CAP: usize = 256;
 #[derive(Debug)]
 pub struct DirtyStore {
     psize: u32,
+    /// `log2(psize)` (page sizes are powers of two, SPEC 02 §3.2): turns a
+    /// frame length into its page count with a shift, not a division, on the
+    /// discard/remove path deletes take once per freed page.
+    psize_shift: u32,
     frames: HashMap<u64, Box<[u8]>, PgnoBuildHasher>,
     /// Recycled one-page frames (exactly `psize` bytes each), reused by
     /// `insert_tree_frame` / `insert_copy` before allocating (PERF-GAP B3).
     /// Frames only move to/from here inside `&mut` ops, preserving the TXN-41
     /// stability contract; bounded by [`SPARE_CAP`].
     spare: Vec<Box<[u8]>>,
+    /// Pages held by `frames` (a run frame counts its `n` pages): the
+    /// quantity the dirty limit bounds (SPEC 04 TXN-68).
+    pages: u64,
+    /// Spilled pgnos (SPEC 04 TXN-69..72) → page count (1 for a tree page,
+    /// `n` for an overflow-run head). Disjoint from `frames`.
+    spilled: HashMap<u64, u64, PgnoBuildHasher>,
 }
 
 impl DirtyStore {
     /// An empty store for pages of size `psize`.
     #[must_use]
     pub fn new(psize: u32) -> DirtyStore {
+        debug_assert!(psize.is_power_of_two());
         DirtyStore {
             psize,
+            psize_shift: psize.trailing_zeros(),
             frames: HashMap::default(),
             spare: Vec::new(),
+            pages: 0,
+            spilled: HashMap::default(),
         }
     }
 
@@ -121,10 +144,14 @@ impl DirtyStore {
     pub fn with_spare(psize: u32, mut spare: Vec<Box<[u8]>>) -> DirtyStore {
         debug_assert!(spare.iter().all(|f| f.len() == psize as usize));
         spare.truncate(SPARE_CAP);
+        debug_assert!(psize.is_power_of_two());
         DirtyStore {
             psize,
+            psize_shift: psize.trailing_zeros(),
             frames: HashMap::default(),
             spare,
+            pages: 0,
+            spilled: HashMap::default(),
         }
     }
 
@@ -144,6 +171,79 @@ impl DirtyStore {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
+    }
+
+    /// Pages held in frames (a run counts its `n` pages; SPEC 04 TXN-68).
+    #[must_use]
+    pub fn pages(&self) -> u64 {
+        self.pages
+    }
+
+    /// Pages a frame of `len` bytes holds.
+    #[inline]
+    fn pages_of(&self, len: usize) -> u64 {
+        (len >> self.psize_shift) as u64
+    }
+
+    /// Whether any page of this txn is spilled (SPEC 04 §6.3a). The cheap
+    /// gate in front of every spilled-page lookup.
+    #[must_use]
+    #[inline]
+    pub fn has_spills(&self) -> bool {
+        !self.spilled.is_empty()
+    }
+
+    /// The page count of spilled `pgno` (1 for a tree page, `n` for a run
+    /// head), or `None` if it is not spilled.
+    #[must_use]
+    pub fn spilled_pages(&self, pgno: u64) -> Option<u64> {
+        if self.spilled.is_empty() {
+            return None;
+        }
+        self.spilled.get(&pgno).copied()
+    }
+
+    /// Number of spilled pgnos (runs count once).
+    #[must_use]
+    pub fn spilled_len(&self) -> usize {
+        self.spilled.len()
+    }
+
+    /// Every frame as `(pgno, pages)` — the spill candidate set.
+    pub fn frame_extents(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let ps = self.psize as usize;
+        self.frames
+            .iter()
+            .map(move |(&p, f)| (p, (f.len() / ps) as u64))
+    }
+
+    /// Record that `pgno`'s frame has been written to the file and release it
+    /// (SPEC 04 TXN-69): the frame goes to the spare pool (or is dropped) and
+    /// `pgno` becomes spilled. The caller must have written the frame's
+    /// current bytes at `pgno` first. A `&mut` op, like [`DirtyStore::discard`].
+    pub fn spill(&mut self, pgno: u64) {
+        if let Some(frame) = self.frames.remove(&pgno) {
+            let n = self.pages_of(frame.len());
+            self.pages -= n;
+            self.spilled.insert(pgno, n);
+            if frame.len() == self.psize as usize && self.spare.len() < SPARE_CAP {
+                self.spare.push(frame);
+            }
+        }
+    }
+
+    /// Bring spilled tree page `pgno` back into a frame holding `src` (its
+    /// bytes as read from the map) and clear its spilled mark (SPEC 04
+    /// TXN-72; LMDB `mdb_page_unspill`). Returns the frame mutably. `src` must
+    /// be exactly one page.
+    pub fn unspill_copy(&mut self, pgno: u64, src: &[u8]) -> &mut [u8] {
+        debug_assert_eq!(
+            self.spilled.get(&pgno),
+            Some(&1),
+            "unspill of a spilled tree page"
+        );
+        self.spilled.remove(&pgno);
+        self.insert_copy(pgno, src)
     }
 
     /// The frame bytes for `pgno`: exactly `psize` for a tree page, the whole
@@ -168,7 +268,14 @@ impl DirtyStore {
             frame.len(),
             self.psize
         );
-        self.frames.insert(pgno, frame);
+        debug_assert!(
+            !self.spilled.contains_key(&pgno),
+            "frame for a spilled pgno"
+        );
+        self.pages += self.pages_of(frame.len());
+        if let Some(old) = self.frames.insert(pgno, frame) {
+            self.pages -= self.pages_of(old.len());
+        }
     }
 
     /// Insert a fresh zeroed one-page tree frame for `pgno` and return it
@@ -184,7 +291,14 @@ impl DirtyStore {
             }
             None => vec![0u8; self.psize as usize].into_boxed_slice(),
         };
-        self.frames.insert(pgno, frame);
+        debug_assert!(
+            !self.spilled.contains_key(&pgno),
+            "frame for a spilled pgno"
+        );
+        self.pages += 1;
+        if let Some(old) = self.frames.insert(pgno, frame) {
+            self.pages -= self.pages_of(old.len());
+        }
         self.frames
             .get_mut(&pgno)
             .map(|b| &mut **b)
@@ -208,7 +322,14 @@ impl DirtyStore {
             }
             None => src.into(),
         };
-        self.frames.insert(pgno, frame);
+        debug_assert!(
+            !self.spilled.contains_key(&pgno),
+            "frame for a spilled pgno"
+        );
+        self.pages += 1;
+        if let Some(old) = self.frames.insert(pgno, frame) {
+            self.pages -= self.pages_of(old.len());
+        }
         self.frames
             .get_mut(&pgno)
             .map(|b| &mut **b)
@@ -218,7 +339,17 @@ impl DirtyStore {
     /// Remove and return the frame for `pgno` (freed within the txn, GC-7/8;
     /// or rebound by loose-page reuse). Only called from `&mut` ops (TXN-43).
     pub fn remove(&mut self, pgno: u64) -> Option<Box<[u8]>> {
-        self.frames.remove(&pgno)
+        // A spilled pgno has no frame; freeing one goes through `discard`,
+        // which clears the mark (SPEC 04 TXN-72).
+        debug_assert!(
+            !self.spilled.contains_key(&pgno),
+            "remove of a spilled pgno"
+        );
+        let f = self.frames.remove(&pgno);
+        if let Some(f) = &f {
+            self.pages -= self.pages_of(f.len());
+        }
+        f
     }
 
     /// Discard the frame for `pgno` (freed within the txn). A one-page frame is
@@ -226,11 +357,17 @@ impl DirtyStore {
     /// (multi-page) or an overflow past [`SPARE_CAP`] is dropped. Like
     /// [`DirtyStore::remove`], only called from `&mut` ops (TXN-43): the frame
     /// leaves `frames` at a `&mut` boundary, so no borrow can alias it.
+    ///
+    /// Freeing a **spilled** pgno clears its spilled mark (SPEC 04 TXN-72):
+    /// the page returns to the txn as loose, like any page it allocated.
     pub fn discard(&mut self, pgno: u64) {
         if let Some(frame) = self.frames.remove(&pgno) {
+            self.pages -= self.pages_of(frame.len());
             if frame.len() == self.psize as usize && self.spare.len() < SPARE_CAP {
                 self.spare.push(frame);
             }
+        } else if !self.spilled.is_empty() {
+            self.spilled.remove(&pgno);
         }
     }
 
@@ -249,6 +386,7 @@ impl DirtyStore {
         let mut out = std::mem::take(&mut self.spare);
         out.truncate(cap);
         if out.len() < cap && !self.frames.is_empty() {
+            self.pages = 0;
             for (_, f) in self.frames.drain() {
                 if out.len() >= cap {
                     break;

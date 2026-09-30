@@ -170,6 +170,8 @@ pub struct EnvOpenOptions {
     data_file_name: OsString,
     file_trust: FileTrust,
     sequential_writes: bool,
+    /// Dirty limit in bytes (ADR-0017); `None` = LMDB's default.
+    max_dirty_bytes: Option<usize>,
 }
 
 impl Default for EnvOpenOptions {
@@ -193,6 +195,7 @@ impl EnvOpenOptions {
             data_file_name: OsString::from(DATA_FILE_NAME),
             file_trust: FileTrust::VALIDATE,
             sequential_writes: false,
+            max_dirty_bytes: None,
         }
     }
 
@@ -345,6 +348,28 @@ impl EnvOpenOptions {
         self.sequential_writes
     }
 
+    /// Bound a write txn's dirty memory to about `bytes` (**ADR-0017**;
+    /// ZeroDB extension — LMDB's limit is a compile-time constant). Default:
+    /// LMDB's limit, 131,072 dirty pages (512 MiB at 4 KiB pages).
+    ///
+    /// Past the limit, a write txn writes its highest-numbered dirty pages to
+    /// the file at the start of its next mutating call and drops them from
+    /// memory, as LMDB's `mdb_page_spill` does; pages it touches again are
+    /// read back. The limit is `max(bytes / page_size, 128)` pages. Results
+    /// and committed files never depend on it; a lower limit trades memory
+    /// for extra writes in very large txns.
+    pub fn max_dirty_bytes(&mut self, bytes: usize) -> &mut EnvOpenOptions {
+        self.max_dirty_bytes = Some(bytes);
+        self
+    }
+
+    /// The configured dirty limit in bytes (ADR-0017); `None` = LMDB's
+    /// default.
+    #[must_use]
+    pub fn get_max_dirty_bytes(&self) -> Option<usize> {
+        self.max_dirty_bytes
+    }
+
     /// The configured max DBs.
     #[must_use]
     pub fn get_max_dbs(&self) -> u32 {
@@ -451,6 +476,8 @@ impl EnvOpenOptions {
             durability,
             self.file_trust,
             self.sequential_writes,
+            self.max_dirty_bytes
+                .map(|b| zerodb_core::env::dirty_limit_pages(Some(b), opened.page_size)),
         )
     }
 }

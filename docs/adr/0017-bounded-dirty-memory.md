@@ -1,6 +1,6 @@
 # ADR-0017: Bounded dirty-page memory in large write transactions (spilling)
 
-- Status: Draft — needs maintainer approval (commit-path change)
+- Status: Accepted (approved by Quentin 2026-09-30: "go continue, I should be closer to LMDB in memory usage")
 - Milestone: Phase 3 (performance / memory), PERF-GAP C2, issue #3
 - Date: 2026-09-29
 
@@ -63,16 +63,53 @@ Bounded, but pushes the problem to the caller; Meilisearch does not expect
 Allocate frames from large chunks and release them when the txn ends. Fixes
 glibc retention (not Meilisearch's case) but not the peak.
 
-## Decision (proposed)
+## Decision
 
-Option A, default threshold = LMDB's, behind the full gate (crash-test,
-stress, fuzz) and a memory rung: a load txn larger than the threshold must
-stay near the threshold's memory, with commit and read results identical.
+Option A, LMDB-style spill, specified in SPEC 04 §6.3a (TXN-68..72), with
+SPEC 06 REC-6 H0 amended. Answers to the review questions (2026-09-30,
+following the recommendation approved in chat):
 
-## Open questions for human review
+1. **Default threshold:** LMDB's — 131,072 dirty pages, counted in pages as
+   LMDB counts them (512 MiB at 4 KiB pages; 2 GiB at 16 KiB, as with LMDB).
+2. **Option:** yes, opt-in: `EnvOpenOptions::max_dirty_bytes` (zerodb and
+   heed-zerodb), limit = `max(bytes / psize, 128)` pages. Default unset =
+   LMDB's. Divergence D-021.
+3. **Order:** implement now; the acceptance test is the rust-storage-bench
+   YCSB C load (10M unsorted keys in one txn under a 2 GB cap), which LMDB
+   completes and ZeroDB could not (killed at 2.09 GB, 2026-09-30). Meilisearch's
+   peak indexing memory is measured afterwards to size the consumer benefit.
 
-1. Default threshold: LMDB's 131k pages (512 MiB at 4 KiB, 2 GiB at 16 KiB),
-   or a byte budget that does not scale with the page size?
-2. Expose it as an env option (e.g. `max_dirty_bytes`)?
-3. Land before or after measuring Meilisearch's peak indexing memory on
-   hackernews with both engines (to size the benefit on the real consumer)?
+Design points settled by the spec:
+
+- Trigger at the start of every mutating entry (`ensure_open`, after the
+  child guard), when nothing borrows a frame: `dirty_pages + 64 > limit`.
+- Spill at least `max(64, limit / 8)` pages, highest pgnos first, keeping
+  tree roots and finger pages; write with the commit's batched page writer.
+  LMDB also keeps the pages of every open cursor (`P_KEEP`); ZeroDB's
+  cursors hold no frames between calls (they re-resolve by pgno), so a
+  spilled page on a cursor's path is simply brought back on its next write.
+  Results are identical; only the number of re-reads can differ.
+- Spilled pages are read back from the map through the ordinary resolution
+  path, whose bound is raised past the highest page any spill wrote (the
+  file backs everything below it); every spill resets the writer's
+  validated-pages memo, since a spill is the only time a spilled page's map
+  bytes change. A touch brings a spilled page back into a frame at the same
+  pgno (`mdb_page_unspill`). A first version resolved spilled pages through a
+  separate lookup inside the force-inlined resolution function instead; it
+  grew every inlined descent and cost read-only rungs 3–13 %
+  (`scan/edge/first_last`, `get/db/named_x8`, `scan/full/rev`) in the
+  codegen-units=1 build, so the hot path is now byte-identical to before.
+- Crash and abort: TXN-62's writable set is unchanged; only timing moves.
+  Under `NO_META_SYNC` that timing widens the known reclaim-clobber window
+  (SPEC 06 REC-10 amendment) from "C2 to C3" to "first spill to C3", as with
+  LMDB; the default mode stays immune. Harness, one seed, same workload:
+  5 stale fallbacks without spilling, 48 with it, 0 violations.
+
+## Acceptance
+
+- YCSB C (10M × 128 B, 2 GB cap) completes; peak anonymous memory during the
+  load near the limit (≈ LMDB's ~540 MiB) instead of > 2 GB.
+- Results and committed files byte-identical to an unbounded run (differential
+  test with a tiny limit against the default).
+- Crash harness with spill-heavy cycles (small limit) green; the full gate.
+- The engine ladder flat (no spill below the limit: one comparison per op).

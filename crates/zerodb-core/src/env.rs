@@ -541,6 +541,9 @@ pub struct EnvInner {
     /// Env-wide cache of validated page versions (ADR-0018), borrowed by
     /// every plain read txn. Never consulted under a trusting policy.
     stamp_cache: StampCache,
+    /// A write txn's dirty limit in pages (SPEC 04 TXN-68, ADR-0017), fixed
+    /// at open: past it the txn spills pages to the file.
+    dirty_limit: u64,
     /// Sequential-writes default (ADR-0015), fixed at open: whether a write
     /// txn keeps a rightmost-leaf finger for a tree with no override.
     sequential_writes: bool,
@@ -839,6 +842,12 @@ impl EnvInner {
     /// The env-wide cache of validated page versions (ADR-0018).
     pub(crate) fn stamp_cache(&self) -> &StampCache {
         &self.stamp_cache
+    }
+
+    /// A write txn's dirty limit in pages (SPEC 04 TXN-68, ADR-0017).
+    #[must_use]
+    pub fn dirty_limit(&self) -> u64 {
+        self.dirty_limit
     }
 
     /// The env's sequential-writes default (ADR-0015).
@@ -1484,12 +1493,36 @@ pub fn open_with_backing(
         durability,
         FileTrust::VALIDATE,
         false,
+        None,
     )
 }
 
+/// LMDB's dirty limit, `MDB_IDL_UM_MAX` = 2^17 pages (SPEC 04 TXN-68).
+pub const DEFAULT_DIRTY_LIMIT: u64 = 1 << 17;
+
+/// The smallest dirty limit `max_dirty_bytes` can set, in pages (SPEC 04
+/// TXN-68): a spill writes at least 64 pages and keeps roots and finger
+/// pages, so a smaller limit would spill on nearly every call.
+pub const MIN_DIRTY_LIMIT: u64 = 128;
+
+/// The dirty limit in pages for `max_dirty_bytes` at `page_size` (SPEC 04
+/// TXN-68): `None` = LMDB's [`DEFAULT_DIRTY_LIMIT`], otherwise
+/// `max(bytes / page_size, MIN_DIRTY_LIMIT)`.
+#[must_use]
+pub fn dirty_limit_pages(max_dirty_bytes: Option<usize>, page_size: u32) -> u64 {
+    match max_dirty_bytes {
+        None => DEFAULT_DIRTY_LIMIT,
+        Some(b) => (b as u64 / u64::from(page_size.max(1))).max(MIN_DIRTY_LIMIT),
+    }
+}
+
 /// [`open_with_backing`] with an explicit page-validation policy
-/// (ADR-0014) and sequential-writes default (ADR-0015).
-/// `(FileTrust::VALIDATE, false)` is exactly [`open_with_backing`]; the
+/// (ADR-0014), sequential-writes default (ADR-0015) and dirty limit in
+/// pages (ADR-0017; `None` = LMDB's [`DEFAULT_DIRTY_LIMIT`]). The limit is
+/// taken as given (at least 1): the public option applies its floor through
+/// [`dirty_limit_pages`], while the crash harness uses tiny limits here to
+/// spill on nearly every call.
+/// `(FileTrust::VALIDATE, false, None)` is exactly [`open_with_backing`]; the
 /// trusting policy can only be built through the `unsafe`
 /// [`FileTrust::trust_contents`], whose contract the caller carries.
 ///
@@ -1508,6 +1541,7 @@ pub fn open_with_backing_policy(
     durability: DurabilityFlags,
     file_trust: FileTrust,
     sequential_writes: bool,
+    dirty_limit: Option<u64>,
 ) -> Result<Env, Error> {
     // D-006-style open-time argument rejection (`Io(InvalidInput)`): both
     // values size eager allocations (`max_readers` cache-padded reader slots,
@@ -1614,6 +1648,7 @@ pub fn open_with_backing_policy(
         max_dbs,
         file_trust,
         stamp_cache: StampCache::new(),
+        dirty_limit: dirty_limit.unwrap_or(DEFAULT_DIRTY_LIMIT).max(1),
         sequential_writes,
         sequential_overrides: (0..=max_dbs).map(|_| AtomicU8::new(SEQ_FOLLOW)).collect(),
         meta,
@@ -1736,6 +1771,7 @@ pub mod testutil {
             super::DurabilityFlags::default(),
             FileTrust::VALIDATE,
             sequential_writes,
+            None,
         ) {
             Ok(env) => env,
             Err(Error::Io(e)) => panic!("mem_env open failed: {e}"),

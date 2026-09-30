@@ -57,10 +57,18 @@ const KEYSPACE: u64 = 1500;
 const READERS: usize = 8;
 
 fn open(dir: &Path, max_readers: u32) -> Env {
+    open_with(dir, max_readers, None)
+}
+
+/// [`open`] with a dirty limit (ADR-0017): the spilling-writer variant.
+fn open_with(dir: &Path, max_readers: u32, max_dirty_bytes: Option<usize>) -> Env {
     let mut opts = EnvOpenOptions::new();
     opts.map_size(MAP);
     opts.page_size(PS);
     opts.max_readers(max_readers);
+    if let Some(b) = max_dirty_bytes {
+        opts.max_dirty_bytes(b);
+    }
     opts.open(dir).expect("open env")
 }
 
@@ -141,8 +149,21 @@ fn stress_duration() -> Duration {
 /// (`static_read_txn`) shapes and hold snapshots across commits.
 #[test]
 fn stress_readers_vs_gc_churn_writer() {
+    readers_vs_churn(None, 120);
+}
+
+/// The same stress with a writer that **spills** (ADR-0017, SPEC 04 §6.3a):
+/// the smallest dirty limit and 800-op txns, so every churn txn writes
+/// reclaimed and fresh pages to the file mid-txn while readers hold older
+/// snapshots — TXN-62/70 under concurrency. `just stress` runs it too.
+#[test]
+fn stress_readers_vs_spilling_writer() {
+    readers_vs_churn(Some(128 * PS as usize), 800);
+}
+
+fn readers_vs_churn(max_dirty_bytes: Option<usize>, ops_per_txn: usize) {
     let dir = TempDir::new();
-    let env = open(dir.path(), 64);
+    let env = open_with(dir.path(), 64, max_dirty_bytes);
     let db = env.main_database();
 
     // Seed a full keyspace so readers always see a populated tree.
@@ -159,6 +180,7 @@ fn stress_readers_vs_gc_churn_writer() {
     let stop = Arc::new(AtomicBool::new(false));
     let commits = Arc::new(AtomicU64::new(0));
     let walks = Arc::new(AtomicU64::new(0));
+    let spilled = Arc::new(AtomicU64::new(0));
 
     std::thread::scope(|s| {
         // ---- the single writer: GC-heavy churn ----
@@ -166,6 +188,7 @@ fn stress_readers_vs_gc_churn_writer() {
             let env = env.clone();
             let stop = Arc::clone(&stop);
             let commits = Arc::clone(&commits);
+            let spilled = Arc::clone(&spilled);
             s.spawn(move || {
                 let db = env.main_database();
                 let mut rng = Lcg(0x05ee_d1e8);
@@ -174,7 +197,7 @@ fn stress_readers_vs_gc_churn_writer() {
                     let mut wtxn = env.write_txn().expect("begin churn txn");
                     // Overwrites (COW frees the old leaves/overflow runs → GC
                     // entries), plus deletes and re-inserts (rebalance churn).
-                    for _ in 0..120 {
+                    for _ in 0..ops_per_txn {
                         let k = rng.next() % KEYSPACE;
                         match rng.next() % 4 {
                             0 => {
@@ -185,6 +208,9 @@ fn stress_readers_vs_gc_churn_writer() {
                                     .expect("put");
                             }
                         }
+                    }
+                    if wtxn.spill_count() > 0 {
+                        spilled.fetch_add(1, Ordering::Relaxed);
                     }
                     wtxn.commit().expect("churn commit");
                     generation += 1;
@@ -240,9 +266,15 @@ fn stress_readers_vs_gc_churn_writer() {
 
     let n_commits = commits.load(Ordering::Relaxed);
     let n_walks = walks.load(Ordering::Relaxed);
-    println!("stress: {n_commits} writer commits, {n_walks} reader double-walks");
+    let n_spilled = spilled.load(Ordering::Relaxed);
+    println!(
+        "stress: {n_commits} writer commits ({n_spilled} spilled), {n_walks} reader double-walks"
+    );
     assert!(n_commits > 0, "writer never committed");
     assert!(n_walks > 0, "readers never walked");
+    if max_dirty_bytes.is_some() {
+        assert!(n_spilled > 0, "the spilling variant never spilled");
+    }
 
     // Post-stress: full structural + GC-partition check of the final image
     // (INV-1..27 incl. the reachable-XOR-free partition, INV-22).

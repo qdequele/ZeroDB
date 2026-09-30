@@ -1,4 +1,6 @@
 target/
+# Side build dirs (loom, clippy, miri runs with their own CARGO_TARGET_DIR).
+/target-*/
 fuzz/corpus
 fuzz/artifacts
 benches/results/*.tmp
