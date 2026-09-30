@@ -74,7 +74,7 @@ pub trait TxnRead {
     /// whose cells were fully validated earlier this txn and may be re-wrapped
     /// without the O(`num_keys`) cell walk. Default `None` = always fully
     /// validate.
-    fn validated_pages(&self) -> Option<&ValidatedPages> {
+    fn validated_pages(&self) -> Option<&ValidatedPages<'_>> {
         None
     }
 }
@@ -171,7 +171,7 @@ pub struct RoTxn<'env> {
     /// Pages fully validated this txn (PERF-GAP A2; see
     /// [`ValidatedPages`]). Sound here because every page this snapshot can
     /// reach is immutable while its reader slot is held (TXN-20/21).
-    validated: ValidatedPages,
+    validated: ValidatedPages<'env>,
 }
 
 impl RoTxn<'_> {
@@ -303,7 +303,7 @@ impl TxnRead for RoTxn<'_> {
     fn comparator_for(&self, sel: DbSel) -> KeyCmp<'_> {
         self.env_ref().inner().comparator_for(sel)
     }
-    fn validated_pages(&self) -> Option<&ValidatedPages> {
+    fn validated_pages(&self) -> Option<&ValidatedPages<'_>> {
         Some(&self.validated)
     }
 }
@@ -328,7 +328,11 @@ impl Env {
             env: EnvHandle::Borrowed(self),
             named_dense: OnceLock::new(),
             named_memo: Mutex::new(Vec::new()),
-            validated: ValidatedPages::for_policy(self.inner().file_trust()),
+            // ADR-0018: borrows the env's cache; no refcount per txn.
+            validated: ValidatedPages::for_reader(
+                self.inner().file_trust(),
+                Some(self.inner().stamp_cache()),
+            ),
         })
     }
 
@@ -345,6 +349,8 @@ impl Env {
     /// (TXN-16).
     pub fn static_read_txn(self) -> Result<RoTxn<'static>> {
         let (snap, slot) = self.inner().pin_reader()?;
+        // ADR-0018: an env-owning txn cannot borrow the env's cache and does
+        // not use it (Meilisearch opens these only off its search path).
         let validated = ValidatedPages::for_policy(self.inner().file_trust());
         Ok(RoTxn {
             psize: self.page_size(),

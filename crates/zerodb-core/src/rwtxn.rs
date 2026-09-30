@@ -565,7 +565,7 @@ pub struct RwTxn<'env> {
     /// commit C2 — including WRITE_MAP (TXN-45a) — so the *map* bytes never
     /// change during the txn; dirty frames are excluded from the memo by
     /// [`Source::bytes_from_classified`].
-    validated: ValidatedPages,
+    validated: ValidatedPages<'static>,
     /// Committed pages obsoleted by this txn (GC-6). Written to the GC DB
     /// under `BE(writer_txnid)` at commit step C1 (`freelist_save`).
     freed: Vec<u64>,
@@ -877,7 +877,7 @@ impl TxnRead for RwTxn<'_> {
     fn comparator_for(&self, sel: DbSel) -> crate::cmp::KeyCmp<'_> {
         self.env.inner().comparator_for(sel)
     }
-    fn validated_pages(&self) -> Option<&ValidatedPages> {
+    fn validated_pages(&self) -> Option<&ValidatedPages<'_>> {
         Some(&self.validated)
     }
 }

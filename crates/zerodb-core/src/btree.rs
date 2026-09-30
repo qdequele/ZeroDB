@@ -26,6 +26,7 @@ use super::page::{
     BranchRef, FileTrust, LeafRef, LeafValue, OverflowRef, PageError, PageRef, PageType,
     PGNO_INVALID,
 };
+use super::stamps::{StampCache, StampKind};
 
 /// An entry `(key, value)` borrowed from the map for the view's lifetime `'a`.
 pub type Entry<'a> = (&'a [u8], &'a [u8]);
@@ -188,7 +189,7 @@ pub(crate) enum PageKind {
 /// every initialized level, and nothing here can affect correctness: any
 /// degradation (stale level counter, saturated last level, racing duplicate
 /// insert) is at worst a miss, which revalidates.
-pub struct ValidatedPages {
+pub struct ValidatedPages<'e> {
     levels: [OnceLock<Box<[AtomicU64]>>; MEMO_LEVELS],
     /// Highest level inserts currently target.
     cur: AtomicUsize,
@@ -198,21 +199,46 @@ pub struct ValidatedPages {
     /// When set, a memo miss on a map page takes the header-checked
     /// `new_prevalidated` view, as dirty frames do, and records the page.
     trust_file: bool,
+    /// The env-wide cache of validated page versions (ADR-0018), probed on
+    /// a validating memo miss for a map page. Borrowed from the env by a
+    /// plain read txn, so opening one touches no shared refcount (an `Arc`
+    /// cloned per txn cost `env/txn/ro_begin_abort` +17 %, and an owning
+    /// variant for `static_read_txn` still cost +7 % in drop glue). `None`
+    /// for write txns, whose map pages are mostly copied on write right
+    /// after (`put/val/v8` +12 % with the cache), for env-owning
+    /// `static_read_txn`s, and under a trusting policy. Kept inside the memo
+    /// so the tree code passes one pointer: a two-word handle cost 4–7 % on
+    /// memo-hit and scan rungs in the codegen-units=16 build.
+    shared: Option<&'e StampCache>,
 }
 
-impl ValidatedPages {
+impl ValidatedPages<'static> {
     #[cfg(test)]
-    pub(crate) fn new() -> ValidatedPages {
+    pub(crate) fn new() -> ValidatedPages<'static> {
         ValidatedPages::for_policy(FileTrust::VALIDATE)
     }
 
-    /// A memo for a txn of an env opened under `policy` (ADR-0014).
-    pub(crate) fn for_policy(policy: FileTrust) -> ValidatedPages {
+    /// A memo for a txn of an env opened under `policy` (ADR-0014), with no
+    /// env-wide cache (write txns, tools, tests).
+    pub(crate) fn for_policy(policy: FileTrust) -> ValidatedPages<'static> {
+        ValidatedPages::for_reader(policy, None)
+    }
+}
+
+impl<'e> ValidatedPages<'e> {
+    /// A read txn's memo: `policy` (ADR-0014) and the env-wide cache
+    /// (ADR-0018). Under a trusting policy the cache is dropped: the trusted
+    /// memo-miss arm never probes it.
+    pub(crate) fn for_reader(
+        policy: FileTrust,
+        shared: Option<&'e StampCache>,
+    ) -> ValidatedPages<'e> {
         ValidatedPages {
             levels: std::array::from_fn(|_| OnceLock::new()),
             cur: AtomicUsize::new(0),
             counts: std::array::from_fn(|_| AtomicUsize::new(0)),
             trust_file: policy.is_trusted(),
+            shared: if policy.is_trusted() { None } else { shared },
         }
     }
 
@@ -334,7 +360,7 @@ pub(crate) fn leaf_view<'a>(
     src: Source<'a>,
     psize: u32,
     pgno: u64,
-    valid: Option<&ValidatedPages>,
+    valid: Option<&ValidatedPages<'_>>,
 ) -> Result<LeafRef<'a>, PageError> {
     let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
     leaf_view_over(bytes, from_map, psize, pgno, valid)
@@ -347,7 +373,7 @@ fn leaf_view_over<'a>(
     from_map: bool,
     psize: u32,
     pgno: u64,
-    valid: Option<&ValidatedPages>,
+    valid: Option<&ValidatedPages<'_>>,
 ) -> Result<LeafRef<'a>, PageError> {
     match valid {
         Some(v) => {
@@ -367,9 +393,7 @@ fn leaf_view_over<'a>(
                     v.insert(pgno, PageKind::Leaf);
                     Ok(leaf)
                 } else {
-                    let leaf = LeafRef::new(bytes, psize)?;
-                    v.insert(pgno, PageKind::Leaf);
-                    Ok(leaf)
+                    validate_leaf_miss(bytes, psize, pgno, v)
                 }
             } else {
                 // Engine-authored dirty frame (PERF-GAP batch 3): a frame is
@@ -386,12 +410,73 @@ fn leaf_view_over<'a>(
     }
 }
 
+/// A validating memo miss on a map leaf: a hit in the env-wide cache of
+/// validated page versions (ADR-0018) — same pgno, kind **and** header stamp,
+/// so the same immutable bytes — takes the zero-check view; otherwise the
+/// full cell walk runs and its success is published there. Either way the
+/// page enters this txn's memo. Out of line so the memo-hit path keeps its
+/// shape (PERF-GAP B13).
+#[inline(never)]
+fn validate_leaf_miss<'a>(
+    bytes: &'a [u8],
+    psize: u32,
+    pgno: u64,
+    v: &ValidatedPages<'_>,
+) -> Result<LeafRef<'a>, PageError> {
+    let leaf = match v.shared {
+        Some(cache) => {
+            let stamp = page_stamp(bytes);
+            if cache.contains(pgno, StampKind::Leaf, stamp) {
+                LeafRef::new_trusted(bytes)
+            } else {
+                let leaf = LeafRef::new(bytes, psize)?;
+                cache.publish(pgno, StampKind::Leaf, stamp);
+                leaf
+            }
+        }
+        None => LeafRef::new(bytes, psize)?,
+    };
+    v.insert(pgno, PageKind::Leaf);
+    Ok(leaf)
+}
+
+/// As [`validate_leaf_miss`], for branch pages.
+#[inline(never)]
+fn validate_branch_miss<'a>(
+    bytes: &'a [u8],
+    psize: u32,
+    pgno: u64,
+    v: &ValidatedPages<'_>,
+) -> Result<BranchRef<'a>, PageError> {
+    let br = match v.shared {
+        Some(cache) => {
+            let stamp = page_stamp(bytes);
+            if cache.contains(pgno, StampKind::Branch, stamp) {
+                BranchRef::new_trusted(bytes)
+            } else {
+                let br = BranchRef::new(bytes, psize)?;
+                cache.publish(pgno, StampKind::Branch, stamp);
+                br
+            }
+        }
+        None => BranchRef::new(bytes, psize)?,
+    };
+    v.insert(pgno, PageKind::Branch);
+    Ok(br)
+}
+
+/// The writer-txnid stamp of a page (header offset 8, SPEC 02 §2). `bytes`
+/// is a resolved map page, at least one page long.
+fn page_stamp(bytes: &[u8]) -> u64 {
+    crate::page::read_page_txnid(bytes)
+}
+
 /// As [`leaf_view`], for branch pages.
 pub(crate) fn branch_view<'a>(
     src: Source<'a>,
     psize: u32,
     pgno: u64,
-    valid: Option<&ValidatedPages>,
+    valid: Option<&ValidatedPages<'_>>,
 ) -> Result<BranchRef<'a>, PageError> {
     let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
     branch_view_over(bytes, from_map, psize, pgno, valid)
@@ -403,7 +488,7 @@ fn branch_view_over<'a>(
     from_map: bool,
     psize: u32,
     pgno: u64,
-    valid: Option<&ValidatedPages>,
+    valid: Option<&ValidatedPages<'_>>,
 ) -> Result<BranchRef<'a>, PageError> {
     match valid {
         Some(v) => {
@@ -417,9 +502,7 @@ fn branch_view_over<'a>(
                     v.insert(pgno, PageKind::Branch);
                     Ok(br)
                 } else {
-                    let br = BranchRef::new(bytes, psize)?;
-                    v.insert(pgno, PageKind::Branch);
-                    Ok(br)
+                    validate_branch_miss(bytes, psize, pgno, v)
                 }
             } else {
                 // Engine-authored dirty frame — see [`leaf_view`].
@@ -451,7 +534,7 @@ pub(crate) fn node_view<'a>(
     src: Source<'a>,
     psize: u32,
     pgno: u64,
-    valid: Option<&ValidatedPages>,
+    valid: Option<&ValidatedPages<'_>>,
 ) -> Result<NodeView<'a>, PageError> {
     let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
     let page = PageRef::new_trusted_psize(bytes, psize)?;
@@ -483,7 +566,7 @@ fn resolve_value<'a>(
     psize: u32,
     leaf: &LeafRef<'a>,
     i: usize,
-    valid: Option<&ValidatedPages>,
+    valid: Option<&ValidatedPages<'_>>,
 ) -> Result<&'a [u8], PageError> {
     match leaf.value(i) {
         LeafValue::Inline(v) => Ok(v),
@@ -524,7 +607,7 @@ pub struct Tree<'a> {
     /// The owning txn's validated-pages memo, if it provides one
     /// ([`ValidatedPages`]); `None` (always fully validate) for tests, tools
     /// and the GC tree.
-    valid: Option<&'a ValidatedPages>,
+    valid: Option<&'a ValidatedPages<'a>>,
 }
 
 impl<'a> Tree<'a> {
@@ -561,7 +644,10 @@ impl<'a> Tree<'a> {
     /// through this tree then skip re-validating cells of map-sourced pages
     /// already validated this txn; without it every view fully validates.
     #[must_use]
-    pub(crate) fn with_validation_memo(mut self, valid: Option<&'a ValidatedPages>) -> Tree<'a> {
+    pub(crate) fn with_validation_memo(
+        mut self,
+        valid: Option<&'a ValidatedPages<'a>>,
+    ) -> Tree<'a> {
         self.valid = valid;
         self
     }
@@ -810,7 +896,7 @@ pub struct Cursor<'a> {
     leaf_cache: Cell<Option<(u64, LeafRef<'a>)>>,
     /// The owning txn's validated-pages memo (PERF-GAP A2), copied from the
     /// [`Tree`] this cursor was opened on.
-    valid: Option<&'a ValidatedPages>,
+    valid: Option<&'a ValidatedPages<'a>>,
 }
 
 impl<'a> Cursor<'a> {
@@ -1640,6 +1726,47 @@ mod tests {
                 Err(PageError::WrongPageType { .. })
             ),
             "the page type stays checked when trusted"
+        );
+    }
+
+    /// ADR-0018: a leaf fully validated by one txn is taken from the env-wide
+    /// cache by the next txn's first view, keyed by its exact header stamp.
+    /// Shown by corrupting a cell after the first view, keeping the stamp: a
+    /// later txn with the same cache is served from the cache (the stated
+    /// limit: bytes changed under the env with an old stamp are trusted),
+    /// while a different stamp, a txn without the cache, or the other page
+    /// kind misses and fails validation. No cell accessor runs on the corrupt
+    /// view.
+    #[test]
+    fn stamp_cache_serves_the_exact_page_version_across_txns() {
+        let entries: Vec<_> = (0..8u8).map(|i| kv(&[b'k', i], b"v")).collect();
+        let (mut img, root, depth) = build(&entries);
+        assert_eq!(depth, 1, "a single leaf root");
+        let cache = StampCache::new();
+        let reader = || ValidatedPages::for_reader(FileTrust::VALIDATE, Some(&cache));
+        let first = reader();
+        leaf_view(src(&img), PS, root, Some(&first)).expect("clean leaf validates");
+
+        let off = root as usize * PS as usize + crate::page::HEADER_SIZE;
+        img[off..off + 2].copy_from_slice(&0xFFF0u16.to_le_bytes());
+
+        let second = reader();
+        let view = leaf_view(src(&img), PS, root, Some(&second)).expect("served from the cache");
+        assert_eq!(view.num_keys(), entries.len());
+
+        let alone = ValidatedPages::new();
+        assert!(
+            leaf_view(src(&img), PS, root, Some(&alone)).is_err(),
+            "without the cache the corrupt cell is caught"
+        );
+
+        let restamped = reader();
+        let stamp_off = root as usize * PS as usize + 8;
+        let old = u64::from_le_bytes(img[stamp_off..stamp_off + 8].try_into().unwrap());
+        img[stamp_off..stamp_off + 8].copy_from_slice(&(old + 1).to_le_bytes());
+        assert!(
+            leaf_view(src(&img), PS, root, Some(&restamped)).is_err(),
+            "a newer stamp is a new page version: it misses and is validated"
         );
     }
 

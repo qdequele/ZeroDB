@@ -577,6 +577,33 @@ dirty-page store must be built so it is.
   (ADR-0014 amendment, 2026-09-29); the slice stays bounded by the high-water. Under the
   trusting policy a corrupt page is undefined behaviour, as in LMDB; the
   policy is the caller's `unsafe` contract (SPEC 00, `file_trust`).
+  **Cross-txn validation cache (added 2026-09-29, ADR-0018):** under the
+  validating policy a txn-memo miss on a map-sourced leaf or branch first
+  probes an env-wide cache keyed by **(pgno, page kind, header txnid stamp)**.
+  An exact hit takes the zero-check view; a miss runs the full cell walk and,
+  on success, records that key. Either way the page enters the txn's memo.
+  Plain read txns use it, borrowing it from the env (opening a txn touches
+  no shared refcount); write txns, the nested read txns that share their
+  parent writer's memo, and env-owning `static_read_txn`s do not (measured:
+  the probe and publish cost more than they save on pages a writer copies
+  on write), and dirty frames never do. Soundness
+  rests on the **page-version identity**: ZeroDB never exposes two byte images
+  of one pgno under the same stamp, because every page a commit writes
+  carries the committing txnid (COW copies are restamped, fresh pages are
+  initialized with it), each pgno is written at most once per commit, a
+  pgno is only reused by a later txn, and aborted or failed commits leave no
+  page reachable from a published snapshot. A reused page therefore carries a
+  newer stamp and misses; no invalidation is needed. The cache starts empty
+  at open, so a corrupt or hostile file is still validated on its first view.
+  It assumes the file changes only through this process's commits (D-001).
+  The table is fixed-size (allocated in chunks as publishes land) and
+  direct-mapped by pgno; each slot is a seqlock, so a
+  lookup racing a publish or a collision only misses (loom model
+  `loom_stamp_cache_never_mixes_publishes`). Tests:
+  `zerodb/tests/page_version_identity.rs` (the identity over churn with
+  overflow values, named DBs, aborts and delayed reuse; short read txns
+  against a model), `stamps::tests`,
+  `btree::tests::stamp_cache_serves_the_exact_page_version_across_txns`.
 
 ### §6.2 — Which operations invalidate which borrows
 

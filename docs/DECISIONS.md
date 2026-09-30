@@ -20,4 +20,4 @@
 | 0015 | [Opt-in sequential-writes fast path — env option plus per-database override for the rightmost-leaf finger, default off](adr/0015-sequential-writes-option.md) | Accepted | Phase 3 (PERF-GAP roadmap #6) |
 | 0016 | [Lazy (read-time) cell validation on first sight — full walk on second sight; read txns, leaf pages first](adr/0016-lazy-validation.md) | Measured, not adopted (parked) | Phase 3 (PERF-GAP A2(b), issue #21) |
 | 0017 | [Bounded dirty-page memory in large write transactions (spilling, LMDB `mdb_page_spill`)](adr/0017-bounded-dirty-memory.md) | Draft | Phase 3 (PERF-GAP C2, issue #3) |
-| 0018 | [Env-wide validated-pages cache across transactions, keyed by (pgno, writer txnid stamp)](adr/0018-cross-txn-validation-cache.md) | Draft | Phase 3 (follow-up of ADR-0016) |
+| 0018 | [Env-wide validated-pages cache across transactions, keyed by (pgno, writer txnid stamp)](adr/0018-cross-txn-validation-cache.md) | Accepted | Phase 3 (follow-up of ADR-0016) |

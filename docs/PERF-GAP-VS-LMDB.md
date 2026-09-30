@@ -80,7 +80,16 @@ the catalog descent, the mutex, and the name clone from every read.
 No unsafe. Effort: low. **This also multiplies A2–A4** (the catalog descent
 pays validation too), so it must land first or it hides the others' wins.
 
-### A2. Eager O(num_keys) page validation on every view construction — **(a) DONE 2026-07-21 (37eb96e; lock-free via A8); (b) open, issue [#21](https://github.com/qdequele/ZeroDB/issues/21)**
+### A2. Eager O(num_keys) page validation on every view construction — **(a) DONE 2026-07-21 (37eb96e; lock-free via A8); (b) parked (ADR-0016); (c) DONE 2026-09-30 (ADR-0018)**
+**Done (c), 2026-09-30:** the txn-scoped memo left short read txns
+re-validating the same hot pages on every txn (a one-get read txn over a
+1M-key tree: 1,984 ns vs LMDB's 649 ns, 59 % in the cell walk). Read txns now
+share an env-wide cache keyed by (pgno, kind, header txnid stamp): one txn's
+validation serves the next, and a reused page misses on its newer stamp
+(ADR-0018, SPEC 04 TXN-38). Result: that read txn **1,984 → 1,008 ns**;
+`get/*` 1.15× → 0.94–0.96×, `seek/ge/*` → 0.95×, `get/size/n1m` 1.48× →
+1.08×, `scan/range/*` 1.70× → 1.33×; writes, memo-hit and per-txn rungs flat
+in both builds (`benches/results/2026-09-30-validation-cache.md`).
 **Done (a):** txn-scoped `ValidatedPages` memo — disk bytes validate exactly
 once per txn at first map entry; every later view is `new_prevalidated`
 (O(1)) or, since A8, `new_trusted` (two raw header reads). Engine-authored

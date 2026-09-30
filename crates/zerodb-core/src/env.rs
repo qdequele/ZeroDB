@@ -29,6 +29,7 @@ use crate::page::{
     select_meta, DBRecord, FileTrust, MetaChoice, MetaPage, MetaValidity, META_A_PGNO, META_B_PGNO,
 };
 use crate::readers::{ReaderTable, SnapshotCell};
+use crate::stamps::StampCache;
 
 /// Read (and, for the write path, page-granular write) access to a
 /// memory-mapped (or, in tests, heap) env file.
@@ -537,6 +538,9 @@ pub struct EnvInner {
     /// Page-validation policy (ADR-0014), fixed at open. Every txn copies it
     /// into its validated-pages memo at begin.
     file_trust: FileTrust,
+    /// Env-wide cache of validated page versions (ADR-0018), borrowed by
+    /// every plain read txn. Never consulted under a trusting policy.
+    stamp_cache: StampCache,
     /// Sequential-writes default (ADR-0015), fixed at open: whether a write
     /// txn keeps a rightmost-leaf finger for a tree with no override.
     sequential_writes: bool,
@@ -830,6 +834,11 @@ impl EnvInner {
     #[must_use]
     pub fn file_trust(&self) -> FileTrust {
         self.file_trust
+    }
+
+    /// The env-wide cache of validated page versions (ADR-0018).
+    pub(crate) fn stamp_cache(&self) -> &StampCache {
+        &self.stamp_cache
     }
 
     /// The env's sequential-writes default (ADR-0015).
@@ -1604,6 +1613,7 @@ pub fn open_with_backing_policy(
         comparators: ComparatorRegistry::new(max_dbs),
         max_dbs,
         file_trust,
+        stamp_cache: StampCache::new(),
         sequential_writes,
         sequential_overrides: (0..=max_dbs).map(|_| AtomicU8::new(SEQ_FOLLOW)).collect(),
         meta,

@@ -21,6 +21,14 @@ use super::{
 // Field offsets within the common header.
 pub(crate) const OFF_PGNO: usize = 0;
 pub(crate) const OFF_TXNID: usize = 8;
+
+/// The writer-txnid stamp of the page at the start of `buf` (offset 8), read
+/// without classifying the page — for the ADR-0018 cache probe, whose caller
+/// already holds a resolved page of at least one page's length.
+#[inline]
+pub(crate) fn read_page_txnid(buf: &[u8]) -> u64 {
+    read_u64(buf, OFF_TXNID)
+}
 pub(crate) const OFF_FLAGS: usize = 16;
 pub(crate) const OFF_RESERVED0: usize = 18;
 pub(crate) const OFF_CHECKSUM: usize = 20;
