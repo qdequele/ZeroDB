@@ -6,6 +6,41 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+A large LMDB-parity performance campaign (merged in #83) plus a follow-up (#85).
+Per-lever detail is in [`docs/PERF-GAP-VS-LMDB.md`](docs/PERF-GAP-VS-LMDB.md) and
+[`benches/results/perf-ledger.jsonl`](benches/results/perf-ledger.jsonl); the
+cross-engine results are in
+[`benches/results/2026-09-30-public-suite-nvme.md`](benches/results/2026-09-30-public-suite-nvme.md).
+
+### Added
+
+- Opt-in `FileTrust::trust_contents()` open policy that skips read-path page
+  validation for LMDB-style trust, default unchanged (ADR-0014).
+- Opt-in sequential-writes fast path — a rightmost-leaf finger as an env option
+  with a per-database override, default off (ADR-0015).
+- Bounded write-transaction dirty memory via LMDB-style page spilling, so a large
+  write txn no longer holds every dirty page in RAM until commit (ADR-0017).
+- An env-wide validated-pages cache shared across read transactions, keyed by
+  `(pgno, kind, writer txnid)`; commit seeds it and write txns probe it
+  (ADR-0018 and its 2026-10-01 amendment).
+- A cross-engine benchmark harness (a `zerodb` backend for rust-storage-bench)
+  and the microbench ladder's three-column before/after tooling.
+
+### Performance
+
+ZeroDB now runs its consumers at LMDB-level performance and is competitive across
+the embedded KV field. Landed levers include: one durability-barrier `futex_wake`
+syscall removed per write txn; nine hot read-path helpers force-inlined; a
+cursor-free point `get`; dbi-indexed per-txn tables and a reused descent-path
+buffer; flags-only page-header reads; O(1) free-list front draws; dirty-frame
+pooling across write txns; equal-length integer key comparison; `clear` and
+`delete_range` done leaf-wise; and env copies that write each byte once.
+
+### Changed
+
+- Dependencies refreshed: `thiserror` 1 → 2, `criterion` 0.5 → 0.8, lockfiles
+  updated (#81).
+
 ## [0.1.0] - 2026-09-09
 
 First tagged release. **On-disk `format_version` 1.** Not compatible with LMDB
