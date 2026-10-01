@@ -21,6 +21,18 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+/// Write txns that spilled pages before their commit or abort (ADR-0017), in
+/// this process — the image mechanism's cycles. Reported by the harness
+/// summary so a green run shows spills were actually exercised.
+pub static SPILLED_TXNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn count_spills(t: &zerodb::RwTxn<'_>) {
+    if t.spill_count() > 0 {
+        // Ordering: `Relaxed` — a statistics counter, read after the jobs join.
+        SPILLED_TXNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 use zerodb::{Database, Env, PutFlags, RwTxn};
 use zerodb_core::error::{Error, MdbError};
 
@@ -213,6 +225,7 @@ impl<'e> Exec<'e> {
             Op::Commit => {
                 let view = self.view.take().expect("classify guaranteed a txn");
                 if let Some(t) = self.wtxn.take() {
+                    count_spills(&t);
                     if let Err(e) = t.commit() {
                         return Err(ExecErr::Abandon(format!("commit: {e}")));
                     }
@@ -236,6 +249,7 @@ impl<'e> Exec<'e> {
             }
             Op::Abort => {
                 if let Some(t) = self.wtxn.take() {
+                    count_spills(&t);
                     t.abort();
                 }
                 self.view = None;

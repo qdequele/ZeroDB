@@ -48,11 +48,25 @@ impl Mmap {
         //    pages beyond the committed high-water) and at the meta slots
         //    0/1, which are never handed out as borrows (readers clone the
         //    published snapshot *object*, TXN-18, and never read a meta page
-        //    after open). So no `&[u8]` observable by safe code is ever
-        //    mutated while borrowed.
+        //    after open). A write txn that spills (SPEC 04 §6.3a) writes
+        //    the same TXN-62 pages earlier and may read them back through
+        //    the map; it rewrites one only at the start of a later `&mut`
+        //    call of that txn, when no borrow into it is live (TXN-39). So no
+        //    `&[u8]` observable by safe code is ever mutated while borrowed.
         // The map is read-only (`PROT_READ`); we never write through it.
         let inner = unsafe { memmap2::MmapOptions::new().len(len).map(file)? };
         Ok(Mmap { inner })
+    }
+
+    /// Tell the kernel page reads will be random (`madvise(MADV_RANDOM)`):
+    /// no readahead around each fault. LMDB applies the same advice for
+    /// `MDB_NORDAHEAD` (SPEC 01 Table 1).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `madvise` I/O error.
+    pub fn advise_random(&self) -> std::io::Result<()> {
+        self.inner.advise(memmap2::Advice::Random)
     }
 
     /// The whole mapped region.
@@ -103,6 +117,15 @@ pub struct MmapWritable {
 }
 
 impl MmapWritable {
+    /// As [`Mmap::advise_random`], for the writable map.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `madvise` I/O error.
+    pub fn advise_random(&self) -> std::io::Result<()> {
+        self.inner.advise(memmap2::Advice::Random)
+    }
+
     /// Map the first `len` bytes of `file` read/write (`MAP_SHARED`,
     /// `PROT_READ | PROT_WRITE`). `file` must be open read+write and at least
     /// `len` bytes long (the caller `set_len`s it first, SPEC 04 §6.4).
@@ -120,11 +143,15 @@ impl MmapWritable {
         //  * the file was `set_len(map_size)` so every page in `[0, len)` is
         //    backed — a store never faults past EOF;
         //  * writes go only through `write_at_page`, called only by the single
-        //    writer holding the write mutex (TXN-6) at commit C2/C4, and only to
+        //    writer holding the write mutex (TXN-6) at commit C2/C4 or when it
+        //    spills (SPEC 04 §6.3a), and only to
         //    pages **no live snapshot references** (TXN-62: fresh pages beyond
         //    the committed high-water, or GC-reclaimed pages under the
         //    oldest-reader gate) and the meta slots 0/1 (never lent out as
-        //    borrows — readers use the published snapshot object, TXN-18). So no
+        //    borrows — readers use the published snapshot object, TXN-18); a
+        //    spilling write txn (SPEC 04 §6.3a) also writes those TXN-62 pages
+        //    mid-txn, each only at the start of a `&mut` call when no borrow
+        //    into it is live (TXN-39). So no
         //    `&[u8]` a reader actually dereferences is mutated while borrowed;
         //  * the env is single-process (D-001): no other process writes/truncates.
         let inner = unsafe { memmap2::MmapOptions::new().len(len).map_mut(file)? };

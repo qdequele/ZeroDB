@@ -34,12 +34,17 @@ mod overflow;
 #[allow(unsafe_code)]
 mod raw;
 mod tree;
+// ADR-0014: declares the one `unsafe fn` that opts an env out of cell
+// validation; it contains no unsafe operation.
+mod trust;
 
 pub use crc32c::crc32c;
+pub(crate) use header::read_page_txnid;
 pub use header::{CommonHeader, PageRef};
 pub use meta::{select as select_meta, DBRecord, MetaChoice, MetaPage, MetaValidity, DBRECORD_LEN};
 pub use overflow::{write_overflow_head, OverflowRef};
 pub use tree::{BranchMut, BranchRef, LeafMut, LeafRef, LeafValue};
+pub use trust::FileTrust;
 
 // ---------------------------------------------------------------------------
 // §1 — Constants

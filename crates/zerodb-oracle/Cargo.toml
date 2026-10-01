@@ -40,6 +40,7 @@ path = "src/bin/crash-harness.rs"
 # representative on Graviton + EBS (see the bench file's module docs).
 [[bench]]
 name = "engine_comparison"
+path = "benches/engine_comparison/main.rs"
 harness = false
 
 [dev-dependencies]

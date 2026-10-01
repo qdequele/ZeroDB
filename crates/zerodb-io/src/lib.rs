@@ -221,6 +221,34 @@ pub fn open_or_create(
     read_only: bool,
     write_map: bool,
 ) -> Result<Opened, Error> {
+    open_or_create_with_advice(
+        data_path,
+        requested_page_size,
+        requested_map_size,
+        default_map_size,
+        read_only,
+        write_map,
+        false,
+    )
+}
+
+/// [`open_or_create`] with the `MDB_NORDAHEAD` access hint: `random_access`
+/// advises the kernel that the map is read at random (`MADV_RANDOM`, no
+/// readahead), as LMDB does for that flag. The hint changes no result.
+///
+/// # Errors
+///
+/// As [`open_or_create`], plus the `madvise` error.
+#[allow(clippy::too_many_arguments)]
+pub fn open_or_create_with_advice(
+    data_path: &Path,
+    requested_page_size: u32,
+    requested_map_size: Option<u64>,
+    default_map_size: u64,
+    read_only: bool,
+    write_map: bool,
+    random_access: bool,
+) -> Result<Opened, Error> {
     // `WRITE_MAP` needs write access; it is meaningless (and unsupported here)
     // on a read-only env, which maps read-only. LMDB likewise maps a
     // `WRITEMAP|RDONLY` env read-only. So the writable path is taken only when
@@ -243,7 +271,7 @@ pub fn open_or_create(
         }
         let map_size = requested_map_size.unwrap_or(default_map_size);
         let file = file::create_env_file(data_path, requested_page_size, map_size)?;
-        let backing = map_backing(file, map_size, write_map)?;
+        let backing = map_backing(file, map_size, write_map, random_access)?;
         return Ok(Opened {
             backing,
             page_size: requested_page_size,
@@ -276,7 +304,7 @@ pub fn open_or_create(
     let head = file::read_head(&file, file_len.min(2 * page_size as usize))?;
     let persisted = persisted_map_size(&head, page_size);
     let map_size = requested_map_size.or(persisted).unwrap_or(default_map_size);
-    let backing = map_backing(file, map_size, write_map)?;
+    let backing = map_backing(file, map_size, write_map, random_access)?;
 
     Ok(Opened {
         backing,
@@ -291,7 +319,12 @@ pub fn open_or_create(
 /// (`WRITE_MAP`). ADR-0004 D4: the map covers the full `map_size` once, no
 /// remap. Under `WRITE_MAP` the file is first `set_len(map_size)` so every
 /// mapped page is backed (SPEC 04 §6.4 — no `SIGBUS` on a store past EOF).
-fn map_backing(file: File, map_size: u64, write_map: bool) -> Result<Box<dyn Backing>, Error> {
+fn map_backing(
+    file: File,
+    map_size: u64,
+    write_map: bool,
+    random_access: bool,
+) -> Result<Box<dyn Backing>, Error> {
     let file_len = file::real_disk_size(&file)? as usize;
     let want = file_len.max(map_size as usize);
     if write_map {
@@ -301,9 +334,15 @@ fn map_backing(file: File, map_size: u64, write_map: bool) -> Result<Box<dyn Bac
             file.set_len(map_size)?;
         }
         let mmap = MmapWritable::map(&file, want)?;
+        if random_access {
+            mmap.advise_random()?;
+        }
         Ok(Box::new(WriteMapBacking { mmap, file }))
     } else {
         let mmap = Mmap::map(&file, want)?;
+        if random_access {
+            mmap.advise_random()?;
+        }
         Ok(Box::new(MmapBacking { mmap, file }))
     }
 }

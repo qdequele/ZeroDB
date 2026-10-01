@@ -28,7 +28,7 @@
 //! lives in [`crate::rwtxn`].
 
 use std::ops::Bound;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::btree::{prefix_successor, Cursor, Source, Tree, ValidatedPages};
 use crate::builder::StreamBuildError;
@@ -74,7 +74,7 @@ pub trait TxnRead {
     /// whose cells were fully validated earlier this txn and may be re-wrapped
     /// without the O(`num_keys`) cell walk. Default `None` = always fully
     /// validate.
-    fn validated_pages(&self) -> Option<&ValidatedPages> {
+    fn validated_pages(&self) -> Option<&ValidatedPages<'_>> {
         None
     }
 }
@@ -156,15 +156,22 @@ pub struct RoTxn<'env> {
     /// Soundness: this txn pins an immutable [`Snapshot`] (its catalog cannot
     /// change while pinned, TXN-18/20) and the dbi→name registry is
     /// append-only for the process (M1.6), so a (dbi → record) resolution is
-    /// constant for the txn's life. A linear `Vec` scan beats a map: the set
-    /// is bounded by `max_dbs` and typically small. `Mutex` (not `RefCell`)
-    /// keeps `RoTxn` auto-`Sync`; the lock is uncontended and held only for
-    /// the lookup/insert.
+    /// constant for the txn's life.
+    ///
+    /// Two tiers. `named_dense` is the hot path: a dbi-indexed table of
+    /// write-once slots, the shape of LMDB's per-txn `mt_dbs[dbi]` array.
+    /// A hit is an index plus one `Acquire` load, with no lock, so rayon
+    /// workers sharing one `RoTxn` (milli) do not contend. It is allocated on
+    /// the first named access and sized `min(max_dbs, DENSE_DBI_LIMIT)`.
+    /// `named_memo` (a locked `Vec` scan) serves only dbis past that cap, so a
+    /// huge `max_dbs` never costs a huge per-txn allocation. Both keep
+    /// `RoTxn` auto-`Sync`.
+    named_dense: OnceLock<Box<[OnceLock<DBRecord>]>>,
     named_memo: Mutex<Vec<(u32, DBRecord)>>,
     /// Pages fully validated this txn (PERF-GAP A2; see
     /// [`ValidatedPages`]). Sound here because every page this snapshot can
     /// reach is immutable while its reader slot is held (TXN-20/21).
-    validated: ValidatedPages,
+    validated: ValidatedPages<'env>,
 }
 
 impl RoTxn<'_> {
@@ -207,7 +214,23 @@ impl RoTxn<'_> {
     pub fn env_ident(&self) -> usize {
         self.env_ref().ident()
     }
+
+    /// Resolve `dbi`'s record against this txn's pinned catalog (uncached).
+    fn resolve_named(&self, dbi: u32) -> DBRecord {
+        match self.env_ref().inner().named_name(dbi) {
+            Some(name) => {
+                resolve_named_record(self.source(), self.psize, &self.snap.main_db, &name)
+            }
+            None => DBRecord::empty(),
+        }
+    }
 }
+
+/// Dbis below this get [`RoTxn`]'s lock-free record table (see
+/// `named_dense`). Meilisearch opens ~30 named DBs per env and hannoy a
+/// handful, so this covers every known consumer while bounding the
+/// per-txn allocation for envs opened with a very large `max_dbs`.
+const DENSE_DBI_LIMIT: u32 = 256;
 
 impl Drop for RoTxn<'_> {
     fn drop(&mut self) {
@@ -249,18 +272,29 @@ impl TxnRead for RoTxn<'_> {
         match sel {
             DbSel::Main => self.snap.main_db,
             DbSel::Named(dbi) => {
-                // Memo hit: the resolution is constant for this txn's life
-                // (see the `named_memo` field docs).
+                // The resolution is constant for this txn's life (see the
+                // `named_dense` field docs).
+                if dbi < DENSE_DBI_LIMIT {
+                    let table = self.named_dense.get_or_init(|| {
+                        let n = self.env_ref().inner().max_dbs().min(DENSE_DBI_LIMIT);
+                        (0..n).map(|_| OnceLock::new()).collect()
+                    });
+                    if let Some(slot) = table.get(dbi as usize) {
+                        if let Some(rec) = slot.get() {
+                            return *rec;
+                        }
+                        let rec = self.resolve_named(dbi);
+                        // A racing thread may have filled the slot first; it
+                        // resolved the same constant record, so either wins.
+                        let _ = slot.set(rec);
+                        return rec;
+                    }
+                }
                 let mut memo = self.named_memo.lock().expect("named memo poisoned");
                 if let Some(&(_, rec)) = memo.iter().find(|&&(d, _)| d == dbi) {
                     return rec;
                 }
-                let rec = match self.env_ref().inner().named_name(dbi) {
-                    Some(name) => {
-                        resolve_named_record(self.source(), self.psize, &self.snap.main_db, &name)
-                    }
-                    None => DBRecord::empty(),
-                };
+                let rec = self.resolve_named(dbi);
                 memo.push((dbi, rec));
                 rec
             }
@@ -269,7 +303,7 @@ impl TxnRead for RoTxn<'_> {
     fn comparator_for(&self, sel: DbSel) -> KeyCmp<'_> {
         self.env_ref().inner().comparator_for(sel)
     }
-    fn validated_pages(&self) -> Option<&ValidatedPages> {
+    fn validated_pages(&self) -> Option<&ValidatedPages<'_>> {
         Some(&self.validated)
     }
 }
@@ -292,8 +326,13 @@ impl Env {
             snap,
             slot,
             env: EnvHandle::Borrowed(self),
+            named_dense: OnceLock::new(),
             named_memo: Mutex::new(Vec::new()),
-            validated: ValidatedPages::new(),
+            // ADR-0018: borrows the env's cache; no refcount per txn.
+            validated: ValidatedPages::for_reader(
+                self.inner().file_trust(),
+                Some(self.inner().stamp_cache()),
+            ),
         })
     }
 
@@ -310,14 +349,44 @@ impl Env {
     /// (TXN-16).
     pub fn static_read_txn(self) -> Result<RoTxn<'static>> {
         let (snap, slot) = self.inner().pin_reader()?;
+        // ADR-0018: an env-owning txn cannot borrow the env's cache and does
+        // not use it (Meilisearch opens these only off its search path).
+        let validated = ValidatedPages::for_policy(self.inner().file_trust());
         Ok(RoTxn {
             psize: self.page_size(),
             snap,
             slot,
             env: EnvHandle::Owned(self),
+            named_dense: OnceLock::new(),
             named_memo: Mutex::new(Vec::new()),
-            validated: ValidatedPages::new(),
+            validated,
         })
+    }
+
+    /// Set (`Some`) or clear (`None`, follow the env default) `db`'s
+    /// sequential-writes override (**ADR-0015**; ZeroDB extension). With the
+    /// setting on, a write txn remembers the path to the tree's rightmost
+    /// leaf and appends there without descending when a key sorts after
+    /// every key already in it: faster ascending and APPEND loads, 3–5 %
+    /// slower random-key writes. Results are identical either way. Runtime
+    /// state, not persisted; write txns that start after the call use it.
+    pub fn set_sequential_writes(&self, db: &Database, on: Option<bool>) {
+        let dbi = match db.sel() {
+            DbSel::Main => None,
+            DbSel::Named(dbi) => Some(dbi),
+        };
+        self.inner().set_sequential_writes(dbi, on);
+    }
+
+    /// Whether write txns use the sequential-writes fast path for `db`: its
+    /// override if set, else the env default (ADR-0015).
+    #[must_use]
+    pub fn sequential_writes(&self, db: &Database) -> bool {
+        let dbi = match db.sel() {
+            DbSel::Main => None,
+            DbSel::Named(dbi) => Some(dbi),
+        };
+        self.inner().sequential_writes_for(dbi)
     }
 
     /// A handle to the main (unnamed) database (SPEC 00 row 10, `None` name).
@@ -400,29 +469,38 @@ impl Env {
         Ok(Some(db))
     }
 
-    /// `non_free_pages_size()` (SPEC 00 row 19 — MUST; SPEC 05 GC-23/GC-24):
-    /// `real_disk_size() − free_page_count() * psize`, where the free-page
-    /// count is the exact sum of every GC entry's PIL count under a fresh read
-    /// snapshot. This is the native replacement for milli reading LMDB's
-    /// freelist; it drives the `> 0.75 * map_size` auto-resize trigger.
-    ///
-    /// **TOCTOU note (GC-24):** the free count is exact *for the snapshot*,
-    /// but the `fstat` length is sampled independently and can only be
-    /// **larger** (a concurrent writer may extend the file; nothing ever
-    /// truncates it in Phase 1). The result may therefore over-report
-    /// non-free bytes by at most the concurrent growth — monotone-conservative
-    /// for milli's resize trigger (it can only fire *earlier* than the exact
-    /// value would, never later), and exact whenever no writer commits during
-    /// the call. GC-24's precision claim is per-snapshot and holds.
+    /// `non_free_pages_size()` (SPEC 00 row 19 — MUST; SPEC 05 GC-23/GC-24,
+    /// amended 2026-09-29): the bytes held by the env's databases — the main
+    /// DB's branch, leaf and overflow pages plus those of every named DB,
+    /// times the page size — under a fresh read snapshot. This is heed's
+    /// definition (heed 0.22.1 `Env::non_free_pages_size` sums `mdb_stat`
+    /// over the unnamed DB and every named DB), computed from the records
+    /// the catalog already keeps: one pass over the main DB's entries, no
+    /// free-list walk. It does not count the two meta pages or the GC tree's
+    /// own pages, and it does not depend on the file length (which under
+    /// `WRITE_MAP` is the whole map). Meilisearch reads it on every task
+    /// registration and after every indexing batch.
     ///
     /// # Errors
     ///
-    /// [`Error::Io`] from `fstat`; [`MdbError::Invalid`] on a corrupt GC DB.
+    /// [`MdbError::Invalid`] on a corrupt main tree or catalog record.
     pub fn non_free_pages_size(&self) -> Result<u64> {
         let rtxn = self.read_txn()?;
-        let free_pages = free_page_count(&rtxn)?;
-        let disk = self.inner().real_disk_size()?;
-        Ok(disk.saturating_sub(free_pages * u64::from(self.page_size())))
+        let pages = |r: &DBRecord| r.branch_pages + r.leaf_pages + r.overflow_pages;
+        let mut total = pages(rtxn.main_record());
+        let main = *rtxn.main_record();
+        let tree = Tree::new(rtxn.source(), rtxn.page_size(), main.root, main.depth);
+        let mut cursor = tree.cursor();
+        let mut entry = cursor.first().map_err(map_page_err)?;
+        while let Some((_key, val)) = entry {
+            let flags = cursor.current_flags().map_err(map_page_err)?.unwrap_or(0);
+            if flags & F_SUBDATA != 0 {
+                let rec = DBRecord::from_bytes(val).ok_or(Error::Mdb(MdbError::Invalid))?;
+                total += pages(&rec);
+            }
+            entry = cursor.next().map_err(map_page_err)?;
+        }
+        Ok(total * u64::from(self.page_size()))
     }
 }
 
@@ -436,17 +514,18 @@ impl Env {
 pub fn free_page_count<T: TxnRead>(txn: &T) -> Result<u64> {
     let rec = txn.free_record();
     let source = txn.source();
-    let last_pg = source.last_pg();
     let tree = Tree::new(source, txn.page_size(), rec.root, rec.depth);
     let mut cursor = tree.cursor();
     let mut total = 0u64;
     let mut entry = cursor.first().map_err(map_page_err)?;
     while let Some((_key, val)) = entry {
-        // GC-3 shape validation via the shared PIL codec (a torn PIL errors
-        // rather than silently mis-counting — INV-26's runtime cousin).
-        let ids = crate::page::geometry::pil_decode(val).ok_or(Error::Mdb(MdbError::Invalid))?;
-        crate::rwtxn::validate_pil_ids(&ids, last_pg)?;
-        total += ids.len() as u64;
+        // GC-23: sum only each PIL's `count` prefix — no `Vec<u64>` decode and
+        // no id-range walk. The length/count shape check still fires (a torn
+        // PIL errors with `MdbError::Invalid` rather than mis-counting —
+        // INV-26's length half); the ids' range and order (INV-25/GC-4) are
+        // validated where they are drawn for reuse (`gc_reclaim`), not here.
+        let count = crate::page::geometry::pil_count(val).ok_or(Error::Mdb(MdbError::Invalid))?;
+        total += count;
         entry = cursor.next().map_err(map_page_err)?;
     }
     Ok(total)

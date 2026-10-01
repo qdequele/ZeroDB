@@ -847,3 +847,106 @@ fn overflow_dsize_exceeding_declared_capacity_is_bad_value_size() {
     let err = ovf.payload(u32::MAX).unwrap_err();
     assert!(matches!(err, PageError::BadValueSize(_)));
 }
+
+// ===========================================================================
+// 8. remove_span — the bulk arm of delete_range (SPEC 00 r37)
+// ===========================================================================
+
+/// Build a leaf whose heap order differs from its index order (shuffled
+/// insertion, varied cell sizes, a sprinkle of `F_BIGDATA` pointer cells),
+/// so `remove_span`'s re-tiling sweep is exercised on a heterogeneous heap.
+fn build_span_leaf(psize: u32, n: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; psize as usize];
+    let mut leaf = LeafMut::init(&mut buf, psize, 7, 3).unwrap();
+    for &i in &shuffled_indices(n, 0x5EED_D57A) {
+        let key = format!("key{i:04}").into_bytes();
+        let idx = leaf.lookup(&key).unwrap_err();
+        if i % 7 == 3 {
+            leaf.insert_bigdata(idx, &key, 5000 + i as u32, 100 + i as u64)
+                .unwrap();
+        } else {
+            let val = vec![(i % 251) as u8; (i * 13) % 97];
+            leaf.insert_inline(idx, &key, 0, &val).unwrap();
+        }
+    }
+    buf
+}
+
+/// Differential: for **every** `[start, end)` span of the leaf, `remove_span`
+/// must leave exactly the page that `end - start` single `remove` calls
+/// leave — same survivors (keys, values, `F_BIGDATA` pointers), same free
+/// space — and the heap must stay fully compacted (an exactly-fitting insert
+/// still succeeds). This is the page-level correctness core of the
+/// leaf-granular `delete_range`: a bug here silently deletes or corrupts the
+/// wrong entries.
+fn remove_span_matches_repeated_remove(psize: u32) {
+    let n = if cfg!(miri) { 10 } else { 24 };
+    let base = build_span_leaf(psize, n);
+    for start in 0..n {
+        for end in start + 1..=n {
+            let mut bulk = base.clone();
+            LeafMut::from_valid(&mut bulk, psize)
+                .unwrap()
+                .remove_span(start, end)
+                .unwrap();
+            let mut seq = base.clone();
+            for idx in (start..end).rev() {
+                LeafMut::from_valid(&mut seq, psize)
+                    .unwrap()
+                    .remove(idx)
+                    .unwrap();
+            }
+            let va = LeafRef::new(&bulk, psize).unwrap();
+            let vb = LeafRef::new(&seq, psize).unwrap();
+            assert_eq!(va.num_keys(), vb.num_keys(), "span [{start},{end})");
+            for i in 0..va.num_keys() {
+                assert_eq!(va.key(i), vb.key(i), "key {i}, span [{start},{end})");
+                assert_eq!(va.value(i), vb.value(i), "value {i}, span [{start},{end})");
+            }
+            assert_eq!(
+                va.free_space(),
+                vb.free_space(),
+                "free space, span [{start},{end})"
+            );
+            // Compaction proof: a cell consuming exactly the remaining free
+            // space must fit, i.e. the freed bytes are contiguous.
+            let mut leaf = LeafMut::from_valid(&mut bulk, psize).unwrap();
+            let remaining = leaf.free_space();
+            if let Some(vlen) = leaf_value_len_for_exact_cost(1, remaining) {
+                let at = leaf.num_keys(); // 0xFF sorts after every "key…"
+                leaf.insert_inline(at, b"\xFF", 0, &vec![0x11u8; vlen])
+                    .unwrap();
+                assert_eq!(leaf.free_space(), 0, "span [{start},{end}) not compacted");
+            }
+        }
+    }
+}
+
+#[test]
+fn remove_span_matches_repeated_remove_4096() {
+    remove_span_matches_repeated_remove(4096);
+}
+
+#[test]
+fn remove_span_matches_repeated_remove_65536() {
+    remove_span_matches_repeated_remove(65536);
+}
+
+/// Whole-page span: every entry removed in one call resets the page to its
+/// pristine-empty geometry (`lower == 0`, `free_space == body`).
+#[test]
+fn remove_span_whole_page_resets_geometry() {
+    for psize in PSIZES {
+        let n = 12;
+        let mut buf = build_span_leaf(psize, n);
+        let mut leaf = LeafMut::from_valid(&mut buf, psize).unwrap();
+        leaf.remove_span(0, n).unwrap();
+        assert_eq!(leaf.num_keys(), 0);
+        assert_eq!(leaf.free_space(), psize as usize - 32);
+        // The emptied page accepts inserts again.
+        leaf.insert_inline(0, b"a", 0, b"v").unwrap();
+        let view = LeafRef::new(&buf, psize).unwrap();
+        assert_eq!(view.num_keys(), 1);
+        assert_eq!(view.key(0), b"a");
+    }
+}

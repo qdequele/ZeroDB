@@ -349,6 +349,12 @@ impl Engine for HeedZerodbEngine {
             // ---------------- in-place mutation ----------------
             Op::IterMutPutCurrent { db, nth, val } => self.iter_mut_put(*db, *nth, &val.0),
             Op::IterMutDelCurrent { db, nth } => self.iter_mut_del(*db, *nth),
+            Op::IterMutDelThenWalk {
+                db,
+                nth,
+                steps,
+                drain,
+            } => self.iter_mut_del_then_walk(*db, *nth, *steps, *drain),
 
             // ---------------- verification ----------------
             Op::VerifyGet { db, key } => self.verify_get(*db, &key.0),
@@ -960,6 +966,70 @@ impl HeedZerodbEngine {
             Ok(b) => OpResult::Bool(b),
             Err(e) => err(e),
         }
+    }
+
+    /// `iter_mut` → advance to `nth` → `del_current` → keep walking.
+    /// SPEC 03 §7 / §5.4a: pins the post-delete cursor position, not just the
+    /// surviving content.
+    fn iter_mut_del_then_walk(&mut self, db: u8, nth: u8, steps: u8, drain: bool) -> OpResult {
+        let db = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
+        let wtxn = match self.write_txn() {
+            Ok(w) => w,
+            Err(r) => return r,
+        };
+        let mut it = match db.iter_mut(wtxn) {
+            Ok(it) => it,
+            Err(e) => return err(e),
+        };
+        let target = nth as usize;
+        let mut i = 0usize;
+        let mut positioned = false;
+        loop {
+            match it.next() {
+                Some(Ok(_)) => {
+                    if i == target {
+                        positioned = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                Some(Err(e)) => return err(e),
+                None => break,
+            }
+        }
+        if !positioned {
+            return OpResult::Bool(false);
+        }
+        // SAFETY: no live borrow into the current entry spans this call — the
+        // last `next()` result was dropped before we reached here.
+        if let Err(e) = unsafe { it.del_current() } {
+            return err(e);
+        }
+        let limit = if steps == 0 {
+            usize::MAX
+        } else {
+            steps as usize
+        };
+        let mut seen = Vec::new();
+        while seen.len() < limit {
+            match it.next() {
+                Some(Ok((k, v))) => {
+                    seen.push((k.to_vec(), v.to_vec()));
+                    if drain {
+                        // SAFETY: the entry was copied out above; no borrow lives.
+                        if let Err(e) = unsafe { it.del_current() } {
+                            return err(e);
+                        }
+                    }
+                }
+                Some(Err(e)) => return err(e),
+                None => break,
+            }
+        }
+        OpResult::Entries(seen)
     }
 
     fn verify_get(&mut self, db: u8, key: &[u8]) -> OpResult {

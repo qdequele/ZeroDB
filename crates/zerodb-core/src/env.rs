@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -26,9 +26,10 @@ use crate::cmp::{Comparator, ComparatorError, ComparatorRegistry, KeyCmp};
 use crate::error::{Error, MdbError};
 use crate::page::geometry::{is_map_full, map_pages};
 use crate::page::{
-    select_meta, DBRecord, MetaChoice, MetaPage, MetaValidity, META_A_PGNO, META_B_PGNO,
+    select_meta, DBRecord, FileTrust, MetaChoice, MetaPage, MetaValidity, META_A_PGNO, META_B_PGNO,
 };
 use crate::readers::{ReaderTable, SnapshotCell};
+use crate::stamps::StampCache;
 
 /// Read (and, for the write path, page-granular write) access to a
 /// memory-mapped (or, in tests, heap) env file.
@@ -202,21 +203,68 @@ pub trait CommitHook: Send + Sync {
 /// taken on whichever thread drops it, which is sound on every platform.
 #[derive(Debug)]
 struct WriterLock {
-    /// `true` while a write txn is live.
-    occupied: Mutex<bool>,
+    occupied: Mutex<WriterSlot>,
     cv: Condvar,
+}
+
+/// The state behind [`WriterLock`]'s mutex.
+#[derive(Debug, Default)]
+struct WriterSlot {
+    /// `true` while a write txn is live.
+    occupied: bool,
+    /// Threads parked in [`WriterLock::acquire`]'s wait. The release notifies
+    /// only when this is non-zero: on Linux, std's futex `Condvar` makes every
+    /// `notify_one` a `futex_wake` system call even with nobody waiting, which
+    /// cost one syscall per write txn (`env/txn/rw_empty_commit`).
+    waiters: u32,
+    /// Reusable one-page dirty-frame buffers carried across write txns
+    /// (LMDB's `me_dpages`, PERF-GAP B12). Kept under the writer lock's own
+    /// mutex, as LMDB keeps `me_dpages` under its writer mutex: the frames
+    /// move out with the acquire and back with the release, so the pool costs
+    /// no lock operation of its own (a separate `Mutex` made every write txn,
+    /// empty ones included, ~36 % slower).
+    frames: FramePool,
+}
+
+/// The recycled frames in [`WriterSlot`]. A newtype only so `Debug` prints a
+/// count instead of every frame's bytes.
+#[derive(Default)]
+struct FramePool(Vec<Box<[u8]>>);
+
+impl std::fmt::Debug for FramePool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FramePool({} frames)", self.0.len())
+    }
 }
 
 /// Ownership of the writer slot; releases it on drop, from any thread.
 /// Held by `RwTxn` for its whole life (TXN-6).
 pub(crate) struct WriterGuard<'env> {
     lock: &'env WriterLock,
+    /// The recycled frames: taken from the slot at acquire, handed to the
+    /// txn's dirty store, given back at txn end, stored at release.
+    frames: Vec<Box<[u8]>>,
+}
+
+impl WriterGuard<'_> {
+    /// The recycled-frame pool taken with the writer slot, for the new write
+    /// txn's dirty store. O(1): the `Vec` moves whole.
+    pub(crate) fn take_frames(&mut self) -> Vec<Box<[u8]>> {
+        std::mem::take(&mut self.frames)
+    }
+
+    /// Frames to store back into the slot when this guard releases it, capped
+    /// at [`crate::dirty::SPARE_CAP`].
+    pub(crate) fn give_back_frames(&mut self, mut frames: Vec<Box<[u8]>>) {
+        frames.truncate(crate::dirty::SPARE_CAP);
+        self.frames = frames;
+    }
 }
 
 impl WriterLock {
     fn new() -> WriterLock {
         WriterLock {
-            occupied: Mutex::new(false),
+            occupied: Mutex::new(WriterSlot::default()),
             cv: Condvar::new(),
         }
     }
@@ -233,14 +281,20 @@ impl WriterLock {
             .occupied
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while *g {
+        while g.occupied {
+            // Registered under the mutex before `wait` releases it, so a
+            // release that reads `waiters == 0` under the same mutex cannot be
+            // racing a thread about to park: no lost wakeup.
+            g.waiters += 1;
             g = self
                 .cv
                 .wait(g)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.waiters -= 1;
         }
-        *g = true;
-        WriterGuard { lock: self }
+        g.occupied = true;
+        let frames = std::mem::take(&mut g.frames.0);
+        WriterGuard { lock: self, frames }
     }
 }
 
@@ -251,11 +305,15 @@ impl Drop for WriterGuard<'_> {
             .occupied
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *g = false;
+        g.occupied = false;
+        g.frames.0 = std::mem::take(&mut self.frames);
         // One waiter at most can make progress (single writer), so
         // `notify_one` suffices; drop the flag lock before notify is not
         // required for correctness (the waiter re-checks under the lock).
-        self.lock.cv.notify_one();
+        // Skipped when nobody is parked, which is the common, uncontended case.
+        if g.waiters > 0 {
+            self.lock.cv.notify_one();
+        }
     }
 }
 
@@ -473,7 +531,34 @@ pub struct EnvInner {
     ///
     /// **Not persisted** — see `crate::cmp` for the reopen hazard (D-014).
     comparators: ComparatorRegistry,
+    /// Catalog capacity (`max_dbs`), immutable after open. Duplicated out of
+    /// the `named` registry so read txns can size their dbi-indexed record
+    /// table without taking the registry lock.
+    max_dbs: u32,
+    /// Page-validation policy (ADR-0014), fixed at open. Every txn copies it
+    /// into its validated-pages memo at begin.
+    file_trust: FileTrust,
+    /// Env-wide cache of validated page versions (ADR-0018), borrowed by
+    /// every plain read txn. Never consulted under a trusting policy.
+    stamp_cache: StampCache,
+    /// A write txn's dirty limit in pages (SPEC 04 TXN-68, ADR-0017), fixed
+    /// at open: past it the txn spills pages to the file.
+    dirty_limit: u64,
+    /// Sequential-writes default (ADR-0015), fixed at open: whether a write
+    /// txn keeps a rightmost-leaf finger for a tree with no override.
+    sequential_writes: bool,
+    /// Per-database sequential-writes overrides (ADR-0015): slot 0 is the
+    /// main DB, slot `1 + dbi` a named DB. [`SEQ_FOLLOW`] = the env default,
+    /// [`SEQ_OFF`] / [`SEQ_ON`] = forced. Runtime state, never persisted.
+    sequential_overrides: Box<[AtomicU8]>,
 }
+
+/// [`EnvInner`] sequential-writes override: follow the env default.
+const SEQ_FOLLOW: u8 = 0;
+/// [`EnvInner`] sequential-writes override: forced off.
+const SEQ_OFF: u8 = 1;
+/// [`EnvInner`] sequential-writes override: forced on.
+const SEQ_ON: u8 = 2;
 
 impl std::fmt::Debug for EnvInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -717,6 +802,13 @@ impl EnvInner {
         Some(dbi)
     }
 
+    /// The catalog capacity this env was opened with (`max_dbs`). Every dbi
+    /// the registry hands out is below it. Lock-free.
+    #[must_use]
+    pub(crate) fn max_dbs(&self) -> u32 {
+        self.max_dbs
+    }
+
     /// The name for a named-DB dbi index (`DbSel::Named`), if the index is
     /// assigned. Cloned out so no registry lock is held by the caller.
     #[must_use]
@@ -739,6 +831,66 @@ impl EnvInner {
     #[must_use]
     pub fn durability(&self) -> DurabilityFlags {
         self.durability
+    }
+
+    /// The page-validation policy this env was opened with (ADR-0014).
+    #[must_use]
+    pub fn file_trust(&self) -> FileTrust {
+        self.file_trust
+    }
+
+    /// The env-wide cache of validated page versions (ADR-0018).
+    pub(crate) fn stamp_cache(&self) -> &StampCache {
+        &self.stamp_cache
+    }
+
+    /// A write txn's dirty limit in pages (SPEC 04 TXN-68, ADR-0017).
+    #[must_use]
+    pub fn dirty_limit(&self) -> u64 {
+        self.dirty_limit
+    }
+
+    /// The env's sequential-writes default (ADR-0015).
+    #[must_use]
+    pub fn sequential_writes_default(&self) -> bool {
+        self.sequential_writes
+    }
+
+    /// Whether the main DB (`None`) or named DB `dbi` uses the sequential-
+    /// writes fast path: its override if set, else the env default
+    /// (ADR-0015).
+    #[must_use]
+    pub fn sequential_writes_for(&self, dbi: Option<u32>) -> bool {
+        let slot = dbi.map_or(0, |d| d as usize + 1);
+        // Ordering: `Relaxed` — the value is a performance hint that selects
+        // between two paths with identical results, it publishes no other
+        // data, and any value a racing read sees is a valid choice.
+        match self
+            .sequential_overrides
+            .get(slot)
+            .map_or(SEQ_FOLLOW, |a| a.load(Ordering::Relaxed))
+        {
+            SEQ_ON => true,
+            SEQ_OFF => false,
+            _ => self.sequential_writes,
+        }
+    }
+
+    /// Set or clear (`None`) the sequential-writes override of the main DB
+    /// (`dbi = None`) or named DB `dbi` (ADR-0015). Write txns that start
+    /// after the call use it; an out-of-range dbi (impossible for a handle
+    /// the engine produced) is ignored.
+    pub fn set_sequential_writes(&self, dbi: Option<u32>, on: Option<bool>) {
+        let slot = dbi.map_or(0, |d| d as usize + 1);
+        let v = match on {
+            None => SEQ_FOLLOW,
+            Some(false) => SEQ_OFF,
+            Some(true) => SEQ_ON,
+        };
+        if let Some(a) = self.sequential_overrides.get(slot) {
+            // Ordering: `Relaxed` — see `sequential_writes_for`.
+            a.store(v, Ordering::Relaxed);
+        }
     }
 
     /// Whether the env is read-only (`MDB_RDONLY`, SPEC 01 Table 1).
@@ -1075,6 +1227,12 @@ impl Env {
         self.inner.durability()
     }
 
+    /// The page-validation policy this env was opened with (ADR-0014).
+    #[must_use]
+    pub fn file_trust(&self) -> FileTrust {
+        self.inner.file_trust()
+    }
+
     /// Force durability of all prior commits — `mdb_env_sync(env, 1)`
     /// (SPEC 01 §S6). Restores durability under `NO_SYNC` / `NO_META_SYNC` /
     /// `MAP_ASYNC`. The form heed exposes; equivalent to [`Env::sync`]`(true)`.
@@ -1324,6 +1482,67 @@ pub fn open_with_backing(
     max_readers: u32,
     durability: DurabilityFlags,
 ) -> Result<Env, Error> {
+    open_with_backing_policy(
+        canonical_path,
+        backing,
+        page_size,
+        map_size,
+        prev_snapshot,
+        max_dbs,
+        max_readers,
+        durability,
+        FileTrust::VALIDATE,
+        false,
+        None,
+    )
+}
+
+/// LMDB's dirty limit, `MDB_IDL_UM_MAX` = 2^17 pages (SPEC 04 TXN-68).
+pub const DEFAULT_DIRTY_LIMIT: u64 = 1 << 17;
+
+/// The smallest dirty limit `max_dirty_bytes` can set, in pages (SPEC 04
+/// TXN-68): a spill writes at least 64 pages and keeps roots and finger
+/// pages, so a smaller limit would spill on nearly every call.
+pub const MIN_DIRTY_LIMIT: u64 = 128;
+
+/// The dirty limit in pages for `max_dirty_bytes` at `page_size` (SPEC 04
+/// TXN-68): `None` = LMDB's [`DEFAULT_DIRTY_LIMIT`], otherwise
+/// `max(bytes / page_size, MIN_DIRTY_LIMIT)`.
+#[must_use]
+pub fn dirty_limit_pages(max_dirty_bytes: Option<usize>, page_size: u32) -> u64 {
+    match max_dirty_bytes {
+        None => DEFAULT_DIRTY_LIMIT,
+        Some(b) => (b as u64 / u64::from(page_size.max(1))).max(MIN_DIRTY_LIMIT),
+    }
+}
+
+/// [`open_with_backing`] with an explicit page-validation policy
+/// (ADR-0014), sequential-writes default (ADR-0015) and dirty limit in
+/// pages (ADR-0017; `None` = LMDB's [`DEFAULT_DIRTY_LIMIT`]). The limit is
+/// taken as given (at least 1): the public option applies its floor through
+/// [`dirty_limit_pages`], while the crash harness uses tiny limits here to
+/// spill on nearly every call.
+/// `(FileTrust::VALIDATE, false, None)` is exactly [`open_with_backing`]; the
+/// trusting policy can only be built through the `unsafe`
+/// [`FileTrust::trust_contents`], whose contract the caller carries.
+///
+/// # Errors
+///
+/// As [`open_with_backing`].
+#[allow(clippy::too_many_arguments)]
+pub fn open_with_backing_policy(
+    canonical_path: PathBuf,
+    backing: Box<dyn Backing>,
+    page_size: u32,
+    map_size: u64,
+    prev_snapshot: bool,
+    max_dbs: u32,
+    max_readers: u32,
+    durability: DurabilityFlags,
+    file_trust: FileTrust,
+    sequential_writes: bool,
+    dirty_limit: Option<u64>,
+) -> Result<Env, Error> {
     // D-006-style open-time argument rejection (`Io(InvalidInput)`): both
     // values size eager allocations (`max_readers` cache-padded reader slots,
     // `max_dbs` comparator `OnceLock`s), so an unbounded value — e.g.
@@ -1426,6 +1645,12 @@ pub fn open_with_backing(
         named: Mutex::new(NamedRegistry::new(max_dbs)),
         durability,
         comparators: ComparatorRegistry::new(max_dbs),
+        max_dbs,
+        file_trust,
+        stamp_cache: StampCache::new(),
+        dirty_limit: dirty_limit.unwrap_or(DEFAULT_DIRTY_LIMIT).max(1),
+        sequential_writes,
+        sequential_overrides: (0..=max_dbs).map(|_| AtomicU8::new(SEQ_FOLLOW)).collect(),
         meta,
         prev_snapshot,
         closing,
@@ -1476,8 +1701,9 @@ fn read_slot(
 /// are tested against real files in `crates/zerodb`.
 #[doc(hidden)]
 pub mod testutil {
-    use super::{next_env_id, open_with_backing, Backing, Env};
+    use super::{next_env_id, open_with_backing_policy, Backing, Env};
     use crate::error::Error;
+    use crate::page::FileTrust;
     use crate::page::MetaPage;
     use std::path::PathBuf;
 
@@ -1508,6 +1734,21 @@ pub mod testutil {
     /// On an invalid `page_size` (test helper).
     #[must_use]
     pub fn mem_env(page_size: u32, map_size: u64) -> Env {
+        mem_env_with(page_size, map_size, false)
+    }
+
+    /// [`mem_env`] with the sequential-writes default on (ADR-0015), for the
+    /// rightmost-leaf finger tests.
+    ///
+    /// # Panics
+    ///
+    /// On an invalid `page_size` (test helper).
+    #[must_use]
+    pub fn mem_env_sequential(page_size: u32, map_size: u64) -> Env {
+        mem_env_with(page_size, map_size, true)
+    }
+
+    fn mem_env_with(page_size: u32, map_size: u64, sequential_writes: bool) -> Env {
         let ps = page_size as usize;
         let mut buf = vec![0u8; map_size as usize];
         for slot in [0u64, 1] {
@@ -1519,7 +1760,7 @@ pub mod testutil {
         // A generous named-DB capacity for tests (real envs pass the caller's
         // `max_dbs`; SPEC 02 §6 / M1.6); max_readers = 126, the TXN-14
         // default.
-        match open_with_backing(
+        match open_with_backing_policy(
             path,
             Box::new(VecBacking(buf)),
             page_size,
@@ -1528,6 +1769,9 @@ pub mod testutil {
             128,
             126,
             super::DurabilityFlags::default(),
+            FileTrust::VALIDATE,
+            sequential_writes,
+            None,
         ) {
             Ok(env) => env,
             Err(Error::Io(e)) => panic!("mem_env open failed: {e}"),

@@ -10,6 +10,7 @@
 | [`UPSTREAM-BUGS.md`](UPSTREAM-BUGS.md) | Bugs found **in the LMDB fork itself** by ZeroDB's differential fuzzer, with repro recipes and ready-to-file issue drafts | Kept until fixed upstream |
 | [`COMPATIBILITY.md`](COMPATIBILITY.md) | The release contract: every heed 0.22.1 item and every LMDB feature with its status on the adapter (Same / Emulated / Extension / No-op / Unsupported), plus what a user must know about the files | **Release contract** |
 | [`RELEASING.md`](RELEASING.md) | How a version is cut: gate, consumer gate, docs truth pass, versions, CHANGELOG, tag, release workflow (ADR-0013) | Procedure |
+| [`BENCH-MAP.md`](BENCH-MAP.md) | The LMDB-vs-ZeroDB microbench ladder: what every rung isolates, which PERF-GAP item it implicates, and how to read a jump between adjacent rungs (`just bench`, `just bench-report`) | Bench procedure |
 | [`CONSUMER-GATE.md`](CONSUMER-GATE.md) | Meilisearch on ZeroDB: the zero-source-change drop-in check, the consumer test suites, and the LMDB-vs-ZeroDB Meilisearch benchmark (`scripts/consumer.sh`) | Gate + bench procedure |
 | [`TOOLS.md`](TOOLS.md) | Manual for `zerodb-tools` (`stat`/`dump`/`load`/`check`/`migrate-from-lmdb`) | Manual |
 

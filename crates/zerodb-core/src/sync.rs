@@ -5,7 +5,8 @@
 //! (ADR-0006 §loom).
 //!
 //! Scope: only `crate::readers`, `crate::nested` (the M1.9 child counter,
-//! ADR-0007 D3) and the `EnvInner` fields they own import from here. The rest
+//! ADR-0007 D3), `crate::stamps` (the ADR-0018 slot seqlock) and the
+//! `EnvInner` fields they own import from here. The rest
 //! of the crate uses `std::sync` directly — loom tests drive the
 //! table/cell/commit-point and child-counter protocols in isolation, not a
 //! whole env.
@@ -15,11 +16,11 @@
 //! swap), so `std::sync::Arc` is used everywhere, including in loom models.
 
 #[cfg(loom)]
-pub(crate) use loom::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+pub(crate) use loom::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 #[cfg(loom)]
 pub(crate) use loom::sync::Mutex;
 
 #[cfg(not(loom))]
-pub(crate) use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+pub(crate) use std::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(loom))]
 pub(crate) use std::sync::Mutex;

@@ -17,7 +17,7 @@
 use crate::cmp::KeyCmp;
 
 use super::geometry::body_size;
-use super::header::{read_and_check_bounds, CommonHeader};
+use super::header::{read_and_check_bounds, read_flags, CommonHeader};
 use super::raw::{
     read_u16, read_u16_unchecked, read_u32, read_u32_unchecked, read_u64_unchecked, write_u16,
     write_u32, write_u64,
@@ -66,6 +66,8 @@ pub enum LeafValue<'a> {
 
 /// Compute the padded length of the leaf cell at absolute offset `abs`, bounds-
 /// checking every field read against `psize`.
+// Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+#[inline(always)]
 fn leaf_cell_len(buf: &[u8], abs: usize, psize: u32) -> Result<usize, PageError> {
     let body = body_size(psize);
     let rel = abs - HEADER_SIZE;
@@ -182,11 +184,11 @@ impl<'a> LeafRef<'a> {
     /// validated-pages memo over an immutable source
     /// (`btree::ValidatedPages`; docs/PERF-GAP-VS-LMDB.md A2).
     pub(crate) fn new_prevalidated(buf: &'a [u8], psize: u32) -> Result<LeafRef<'a>, PageError> {
-        let hdr = CommonHeader::read(buf);
-        if page_type_of(hdr.flags)? != PageType::Leaf {
+        let flags = read_flags(buf);
+        if page_type_of(flags)? != PageType::Leaf {
             return Err(PageError::WrongPageType {
                 expected: PageType::Leaf,
-                found: page_type_of(hdr.flags)?,
+                found: page_type_of(flags)?,
             });
         }
         check_reserved_tail_fields(buf)?;
@@ -564,6 +566,74 @@ impl<'a> LeafMut<'a> {
         remove_cell(self.buf, idx, num_keys, cpos, clen, self.upper() as usize);
         Ok(())
     }
+
+    /// Remove the contiguous entry span `[start, end)` in one heap sweep —
+    /// the bulk arm of `delete_range` (SPEC 00 row 37). Equivalent to
+    /// `end - start` single [`remove`](LeafMut::remove) calls (survivors keep
+    /// their relative heap order and the heap ends fully compacted), but each
+    /// surviving cell moves at most once instead of once per removed cell.
+    ///
+    /// A degenerate span (`start >= end`, or `end` past the key count) is a
+    /// debug assertion and a release no-op — nothing is half-removed.
+    ///
+    /// # Errors
+    ///
+    /// As [`remove`](LeafMut::remove), for any cell of the page that does not
+    /// decode; the page is unmodified in that case. A hostile-but-decodable
+    /// page (individually in-bounds cells that overlap) yields a typed error
+    /// or garbage content, exactly as repeated `remove` would — never a panic
+    /// or an out-of-bounds access.
+    pub fn remove_span(&mut self, start: usize, end: usize) -> Result<(), PageError> {
+        let num_keys = self.num_keys();
+        debug_assert!(start < end && end <= num_keys, "span out of range");
+        if start >= end || end > num_keys {
+            return Ok(());
+        }
+        let body = body_size(self.psize);
+        // Snapshot every cell's `(cpos, clen, idx)` before touching anything:
+        // a cell-shape error must surface with the page unmodified, and the
+        // pointer slots are rewritten in place below.
+        let mut cells: Vec<(usize, usize, usize)> = Vec::with_capacity(num_keys);
+        for i in 0..num_keys {
+            let cpos = ptr_at(self.buf, i) as usize;
+            let clen = leaf_cell_len(self.buf, HEADER_SIZE + cpos, self.psize)?;
+            cells.push((cpos, clen, i));
+        }
+        // The heap tiles `[upper, body)`, so sweeping the survivors in
+        // descending `cpos` order re-tiles them from `body` downward with
+        // every move upward: no destination can overlap a survivor that has
+        // not been copied yet (its whole cell lies strictly below `cpos`).
+        cells.sort_unstable_by_key(|&(cpos, _, _)| std::cmp::Reverse(cpos));
+        let span = end - start;
+        let mut write_pos = body;
+        for &(cpos, clen, idx) in &cells {
+            if idx >= start && idx < end {
+                continue; // removed: its bytes are dead
+            }
+            // Checked: on a hostile page whose cells overlap, the survivor
+            // total can exceed the body.
+            write_pos = write_pos
+                .checked_sub(clen)
+                .ok_or(PageError::CellOutOfBounds {
+                    offset: cpos,
+                    needed: clen,
+                    body_size: body,
+                })?;
+            if write_pos != cpos {
+                self.buf.copy_within(
+                    HEADER_SIZE + cpos..HEADER_SIZE + cpos + clen,
+                    HEADER_SIZE + write_pos,
+                );
+            }
+            // Final pointer slot: indices above the span shift down by its
+            // width. Every old slot was snapshotted, so overwrites are safe.
+            let slot = if idx >= end { idx - span } else { idx };
+            write_u16(self.buf, HEADER_SIZE + slot * 2, write_pos as u16);
+        }
+        write_u16(self.buf, OFF_LOWER, ((num_keys - span) * 2) as u16);
+        write_u16(self.buf, OFF_UPPER, write_pos as u16);
+        Ok(())
+    }
 }
 
 // ===========================================================================
@@ -600,11 +670,11 @@ impl<'a> BranchRef<'a> {
     /// full constructor earlier in the same txn, behind
     /// `btree::ValidatedPages`.
     pub(crate) fn new_prevalidated(buf: &'a [u8], psize: u32) -> Result<BranchRef<'a>, PageError> {
-        let hdr = CommonHeader::read(buf);
-        if page_type_of(hdr.flags)? != PageType::Branch {
+        let flags = read_flags(buf);
+        if page_type_of(flags)? != PageType::Branch {
             return Err(PageError::WrongPageType {
                 expected: PageType::Branch,
-                found: page_type_of(hdr.flags)?,
+                found: page_type_of(flags)?,
             });
         }
         check_reserved_tail_fields(buf)?;
@@ -696,6 +766,8 @@ impl<'a> BranchRef<'a> {
 
     /// As [`Self::child_index`], under an explicit ordering (milestone 2.4).
     #[must_use]
+    // Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+    #[inline(always)]
     pub fn child_index_with(&self, key: &[u8], cmp: KeyCmp<'_>) -> usize {
         // Node 0 is -inf and always qualifies; scan separators 1..num_keys.
         let n = self.num_keys();

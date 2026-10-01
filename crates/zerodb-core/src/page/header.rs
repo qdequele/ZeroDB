@@ -21,6 +21,14 @@ use super::{
 // Field offsets within the common header.
 pub(crate) const OFF_PGNO: usize = 0;
 pub(crate) const OFF_TXNID: usize = 8;
+
+/// The writer-txnid stamp of the page at the start of `buf` (offset 8), read
+/// without classifying the page — for the ADR-0018 cache probe, whose caller
+/// already holds a resolved page of at least one page's length.
+#[inline]
+pub(crate) fn read_page_txnid(buf: &[u8]) -> u64 {
+    read_u64(buf, OFF_TXNID)
+}
 pub(crate) const OFF_FLAGS: usize = 16;
 pub(crate) const OFF_RESERVED0: usize = 18;
 pub(crate) const OFF_CHECKSUM: usize = 20;
@@ -40,6 +48,18 @@ pub struct CommonHeader {
     pub txnid: u64,
     /// Page-type bitfield (§1).
     pub flags: u16,
+}
+
+/// The `flags` field alone (header offset 16), for the page-view constructors
+/// that only classify the page: decoding the whole [`CommonHeader`] also read
+/// `pgno` and `txnid`, two bounds-checked loads LLVM cannot drop even though
+/// nothing uses them (the out-of-line `read_u64` in the hannoy search
+/// profile). LMDB reads just the field it tests (`IS_LEAF(mp)`).
+///
+/// The caller must guarantee `buf.len() >= HEADER_SIZE`.
+#[inline]
+pub(crate) fn read_flags(buf: &[u8]) -> u16 {
+    read_u16(buf, OFF_FLAGS)
 }
 
 impl CommonHeader {
@@ -237,6 +257,8 @@ impl<'a> PageRef<'a> {
 
 /// Validate the free-space bounds of a branch/leaf page against the body size,
 /// shared by the tree views. Returns `(lower, upper)` on success.
+// Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+#[inline(always)]
 pub(crate) fn read_and_check_bounds(buf: &[u8], psize: u32) -> Result<(u16, u16), PageError> {
     let body_size = psize as usize - HEADER_SIZE;
     let lower = read_u16(buf, tree::OFF_LOWER);

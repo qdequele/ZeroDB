@@ -578,6 +578,28 @@ name with mismatched flags → `MdbError::Incompatible` (SPEC 01 §S8). All the
   commit). `drop` (`mdb_drop(_, 1)`) additionally deletes the catalog entry
   (decrementing `main_db.entries`); for the **main** DB there is no entry to
   remove, so `drop` degrades to `clear` (LMDB: the main dbi is a core DB).
+- **clear/drop leaf-skipping walk (LMDB `mdb_drop0` parity).** The page
+  collection behind both ops first gathers every pgno, then frees; an error
+  during collection frees **nothing** and poisons the txn. When the tree's
+  working record says `overflow_pages == 0`, only the branch levels are read:
+  the children of the lowest branch level (and a root-is-leaf root) are freed
+  **without reading the leaf pages**. Every pgno freed unread MUST first be
+  classified — dirty in this txn (a this-txn allocation, legitimately past
+  the committed high-water) or within `[FIRST_DATA_PGNO, committed last_pg]`
+  — else the clear returns `MdbError::Invalid` exactly as the full walk's
+  page loader would: a crafted branch must never feed a meta slot (page 0/1)
+  or an unbacked pgno to the freelist. The collected set is also refused if it
+  contains a duplicate pgno (an aliasing branch would otherwise double-free an
+  unread page; the reading walk only meets that shape after a page load).
+  Unread pgnos are not type-checked: a record that understates the depth frees
+  the mis-typed page (in-bounds, so non-corrupting) and leaks its subtree,
+  where the reading walk returned `Invalid` — accepted, matching LMDB, which
+  trusts the record's depth. When `overflow_pages > 0` the walk reads every
+  leaf to collect the overflow runs (LMDB's early exit once the running
+  overflow count hits zero is NOT replicated: an understated count would
+  silently leak the remaining runs; rejected 2026-09-27). The record's
+  `overflow_pages` is trustworthy here because the write path maintains it and
+  `check` verifies it against a full walk on every committed image.
 - **Name = byte string.** A DB name is a leaf key (1–`MAX_DB_NAME` bytes),
   arbitrary bytes including `0x00`. heed's C-string names are a stricter
   adapter-boundary rule imposed in M1.13 (DIVERGENCES D-008).

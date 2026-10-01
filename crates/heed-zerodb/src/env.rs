@@ -67,6 +67,12 @@ pub struct EnvOpenOptions<T: TlsUsage = WithTls> {
     /// M2.6 ZeroDB extension — no heed counterpart. `None` = engine default.
     page_size: Option<u32>,
     flags: EnvFlags,
+    /// ADR-0014 ZeroDB extension — no heed counterpart.
+    file_trust: zerodb::FileTrust,
+    /// ADR-0015 ZeroDB extension — no heed counterpart.
+    sequential_writes: bool,
+    /// ADR-0017 ZeroDB extension — no heed counterpart.
+    max_dirty_bytes: Option<usize>,
     _tls: std::marker::PhantomData<T>,
 }
 
@@ -86,6 +92,9 @@ impl EnvOpenOptions<WithTls> {
             max_dbs: 0,
             page_size: None,
             flags: EnvFlags::empty(),
+            file_trust: zerodb::FileTrust::VALIDATE,
+            sequential_writes: false,
+            max_dirty_bytes: None,
             _tls: std::marker::PhantomData,
         }
     }
@@ -99,6 +108,9 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
             max_dbs: self.max_dbs,
             page_size: self.page_size,
             flags: self.flags,
+            file_trust: self.file_trust,
+            sequential_writes: self.sequential_writes,
+            max_dirty_bytes: self.max_dirty_bytes,
             _tls: std::marker::PhantomData,
         }
     }
@@ -152,6 +164,41 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// independent of the OS page size (which gates `map_size` under D-006).
     pub fn page_size(&mut self, size: u32) -> &mut Self {
         self.page_size = Some(size);
+        self
+    }
+
+    /// Choose the page-validation policy (**ADR-0014**).
+    ///
+    /// **ZeroDB extension — heed has no such method**: LMDB never validates
+    /// page contents, while ZeroDB validates them by default so that a
+    /// corrupt or hostile file yields an error instead of undefined
+    /// behaviour. Passing the value of the `unsafe`
+    /// [`FileTrust::trust_contents`](zerodb::FileTrust::trust_contents)
+    /// switches that off for this env, reading pages the way LMDB does; its
+    /// `# Safety` section is the contract. Code that never calls this method
+    /// keeps the validating default.
+    pub fn file_trust(&mut self, policy: zerodb::FileTrust) -> &mut Self {
+        self.file_trust = policy;
+        self
+    }
+
+    /// Turn on the sequential-writes fast path for every database by default
+    /// (**ADR-0015**). **ZeroDB extension — heed has no such method.**
+    /// Faster ascending and APPEND loads, 3–5 % slower random-key writes,
+    /// identical results; override it per database with
+    /// [`Env::set_sequential_writes`]. Default: off.
+    pub fn sequential_writes(&mut self, on: bool) -> &mut Self {
+        self.sequential_writes = on;
+        self
+    }
+
+    /// Bound a write txn's dirty memory to about `bytes` (**ADR-0017**).
+    /// **ZeroDB extension — heed has no such method** (LMDB's limit is a
+    /// compile-time constant). Default: LMDB's, 131,072 dirty pages. Past it
+    /// a write txn spills its highest-numbered dirty pages to the file, as
+    /// LMDB does; results and committed files never depend on it.
+    pub fn max_dirty_bytes(&mut self, bytes: usize) -> &mut Self {
+        self.max_dirty_bytes = Some(bytes);
         self
     }
 
@@ -242,6 +289,11 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         // single-process (D-001) and nothing in the consumer tree reads one.
         opts.data_file_name(DATA_FILE_NAME);
         opts.flags(zerodb_env_flags(self.flags));
+        opts.file_trust(self.file_trust);
+        opts.sequential_writes(self.sequential_writes);
+        if let Some(b) = self.max_dirty_bytes {
+            opts.max_dirty_bytes(b);
+        }
         let env = opts.open(path).map_err(Error::from)?;
         Ok(Env {
             inner: env,
@@ -272,6 +324,9 @@ fn zerodb_env_flags(flags: EnvFlags) -> zerodb::EnvFlags {
     }
     if flags.contains(EnvFlags::MAP_ASYNC) {
         z |= zerodb::EnvFlags::MAP_ASYNC;
+    }
+    if flags.contains(EnvFlags::NO_READ_AHEAD) {
+        z |= zerodb::EnvFlags::NO_READ_AHEAD;
     }
     z
 }
@@ -512,26 +567,43 @@ impl<T> Env<T> {
         parent.nested_read_txn()
     }
 
+    /// Set (`Some`) or clear (`None`, follow the env default) a database's
+    /// sequential-writes override (**ADR-0015**; ZeroDB extension). Runtime
+    /// state, not persisted; write txns that start after the call use it.
+    /// See [`EnvOpenOptions::sequential_writes`] for the trade-off.
+    pub fn set_sequential_writes<KC, DC, C, CDUP>(
+        &self,
+        db: &crate::Database<KC, DC, C, CDUP>,
+        on: Option<bool>,
+    ) {
+        self.inner.set_sequential_writes(&db.inner, on);
+    }
+
+    /// Whether write txns use the sequential-writes fast path for `db`
+    /// (ADR-0015).
+    #[must_use]
+    pub fn sequential_writes<KC, DC, C, CDUP>(
+        &self,
+        db: &crate::Database<KC, DC, C, CDUP>,
+    ) -> bool {
+        self.inner.sequential_writes(&db.inner)
+    }
+
     /// Copy this environment to an open file (SPEC 00 row 17, `mdb_env_copy2`).
     ///
     /// # Errors
     ///
     /// `Mdb(ReadersFull)`, `Error::Io`, or `Mdb(Invalid)` from the copy.
     pub fn copy_to_file(&self, file: &mut File, option: CompactionOption) -> Result<()> {
-        use std::io::{Seek, Write};
-        // ZeroDB's `CopyToFile` writes to a *path*; heed hands us an open File.
-        // Stage into a private, freshly-created directory (so no other process
-        // can pre-place a file or symlink at the name we are about to write),
-        // then **stream** the image into `file` — never the whole copy in RAM
-        // (PERF-GAP C1: the compaction path is O(depth × page size); buffering
-        // the result here would have restored a 1× env-size peak). The
-        // directory and its contents are removed on every exit path.
-        let stage = StagingDir::create()?;
-        let tmp = stage.path().join("copy.dat");
-        self.copy_to_path_internal(&tmp, option)?;
-        let mut src = File::open(&tmp)?;
-        std::io::copy(&mut src, file)?;
-        file.flush()?;
+        use std::io::Seek;
+        use zerodb::CopyToFile;
+        // Pages go straight into `file` from the current position, as
+        // `mdb_env_copyfd2` writes them (the raw mode straight from the map,
+        // the compacting mode through a write buffer). No staging copy: the
+        // image is written once, never read back.
+        self.inner
+            .copy_to_open_file(file, zdb_compaction(option))
+            .map_err(Error::from)?;
         file.rewind()?;
         Ok(())
     }
@@ -691,59 +763,6 @@ fn zdb_compaction(option: CompactionOption) -> zerodb::CompactionOption {
     match option {
         CompactionOption::Enabled => zerodb::CompactionOption::Enabled,
         CompactionOption::Disabled => zerodb::CompactionOption::Disabled,
-    }
-}
-
-/// A private staging directory for `copy_to_file` (no tempfile dependency).
-///
-/// `create_dir` fails if the name already exists — including as a symlink —
-/// so a directory we successfully created is ours alone; on Unix it is also
-/// mode `0700`. The name mixes pid, a process-wide counter and a clock sample
-/// so collisions are retried, not followed. Dropping the guard removes the
-/// directory and everything staged in it.
-struct StagingDir(std::path::PathBuf);
-
-impl StagingDir {
-    fn create() -> std::io::Result<StagingDir> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let pid = std::process::id();
-        let base = std::env::temp_dir();
-        for _ in 0..16 {
-            let n = N.fetch_add(1, Ordering::Relaxed);
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            let path = base.join(format!("heed-zerodb-copy-{pid}-{n}-{nanos:08x}"));
-            let mut builder = std::fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                builder.mode(0o700);
-            }
-            match builder.create(&path) {
-                Ok(()) => return Ok(StagingDir(path)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            "heed-zerodb: could not create a private staging directory for copy_to_file",
-        ))
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for StagingDir {
-    fn drop(&mut self) {
-        // Best-effort: the directory is ours (created above), so removing it
-        // recursively cannot touch anything we did not stage.
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

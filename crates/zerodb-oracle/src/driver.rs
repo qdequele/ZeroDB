@@ -165,7 +165,9 @@ pub fn classify(op: &Op, txn: TxnState, dbs_empty: bool, cleared_in_txn: bool) -
         | RevPrefixIter { .. } => db_read(),
 
         // In-place cursor mutation needs a write txn.
-        IterMutPutCurrent { .. } | IterMutDelCurrent { .. } => db_write(),
+        IterMutPutCurrent { .. } | IterMutDelCurrent { .. } | IterMutDelThenWalk { .. } => {
+            db_write()
+        }
 
         // A fresh independent read modeling a **post-commit** verification: it
         // opens its own read txn, so it needs a db to exist but no active txn —

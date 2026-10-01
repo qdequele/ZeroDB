@@ -6,7 +6,7 @@ use zerodb::EnvFlags;
 use zerodb_core::env::DurabilityFlags;
 use zerodb_io::fault::{splitmix64, Rng};
 
-use crate::{decode_ops, Op};
+use crate::{decode_ops, DbName, Key, Op, Value};
 
 /// Durability mode of one crash cycle (SPEC 06 REC-9..12; ADR-0008 D4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +112,12 @@ pub struct Spec {
     /// Whether this is a big-value cycle (one multi-MB overflow value,
     /// REC-21's 16 MB end of the band).
     pub big: bool,
+    /// A tiny dirty limit in pages (ADR-0017, SPEC 04 §6.3a) on ~1/3 of
+    /// cycles — below the public option's floor, so nearly every mutating
+    /// call spills and cuts land before, during and after spills; `None` =
+    /// LMDB's default (no spill at this workload's size). The SIGKILL child
+    /// opens through the public option, which raises it to that floor.
+    pub dirty_limit: Option<u64>,
 }
 
 /// Ops decoded per workload round (mechanism B loops rounds so an async kill
@@ -134,12 +140,15 @@ pub fn gen_spec(seed: u64) -> Spec {
     // Generous maps: `MapFull` is unmodeled (cycles abandon on it) and the
     // fault backend's memory tracks *usage*, not the map (ADR-0008 D1).
     let map_size: u64 = if big { 128 << 20 } else { 64 << 20 };
+    // Drawn last so every earlier field keeps its value for a given seed.
+    let dirty_limit = rng.ratio(1, 3).then(|| 8 + rng.below(120) as u64);
     Spec {
         seed,
         mode,
         page_size,
         map_size,
         big,
+        dirty_limit,
     }
 }
 
@@ -178,6 +187,71 @@ impl Spec {
                 val.0 = v;
             }
         }
+        if self.dirty_limit.is_some() {
+            let mut bulk = spill_phase(&mut rng);
+            bulk.append(&mut ops);
+            ops = bulk;
+        }
         ops
+    }
+}
+
+/// A spill cycle's bulk phase (ADR-0017): one committed txn of 1,200 puts,
+/// then an open txn of 900 puts and 180 deletes — several hundred pages per
+/// txn even at 8 KiB pages, past both the image mechanism's tiny limit and
+/// the SIGKILL child's 128-page floor, so both txns spill and the round's ops
+/// and the cut land inside a txn that has spilled. Mixed inline and
+/// overflow values; keys drawn from a small space so deletes hit.
+fn spill_phase(rng: &mut Rng) -> Vec<Op> {
+    let key = |rng: &mut Rng| Key(format!("spill-{:05}", rng.below(4_000)).into_bytes());
+    let val = |rng: &mut Rng| {
+        let len = if rng.ratio(1, 8) {
+            4_000 + rng.below(20_000)
+        } else {
+            100 + rng.below(1_400)
+        };
+        let mut v = vec![0u8; len];
+        rng.fill(&mut v);
+        Value(v)
+    };
+    // Puts resolve over the databases that exist: create the primary one
+    // (`main`, `DbName::Unnamed`) first; idempotent if the round made it.
+    let mut ops = vec![
+        Op::BeginRw,
+        Op::CreateDb {
+            name: DbName::Unnamed,
+        },
+    ];
+    for _ in 0..1_200 {
+        ops.push(Op::Put {
+            db: 0,
+            key: key(rng),
+            val: val(rng),
+        });
+    }
+    ops.push(Op::Commit);
+    ops.push(Op::BeginRw);
+    for i in 0..1_080 {
+        if i % 6 == 5 {
+            ops.push(Op::Del {
+                db: 0,
+                key: key(rng),
+            });
+        } else {
+            ops.push(Op::Put {
+                db: 0,
+                key: key(rng),
+                val: val(rng),
+            });
+        }
+    }
+    ops
+}
+
+impl Spec {
+    /// Whether this cycle runs with a tiny dirty limit (ADR-0017).
+    #[must_use]
+    pub fn spills(&self) -> bool {
+        self.dirty_limit.is_some()
     }
 }

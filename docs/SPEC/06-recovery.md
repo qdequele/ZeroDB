@@ -153,7 +153,7 @@ open, REC-1/REC-2 select snapshot `X` and the check tool (SPEC 03 §11 + SPEC 05
 
   | Hook | Just completed | Recovers to | Invariant that MUST hold |
   |------|----------------|-------------|--------------------------|
-  | H0 | C1 freelist_save (all in dirty set, nothing on disk) | `N−1` | Disk is byte-identical to the `N−1` commit; txn `N` is invisible; GC unchanged. |
+  | H0 | C1 freelist_save (all in dirty set, nothing on disk) | `N−1` | Every page `N−1` references is byte-identical to the `N−1` commit; txn `N` is invisible; GC unchanged. Pages txn `N` spilled before commit (SPEC 04 §6.3a) may already be on the file — only in space `N−1` does not reference (TXN-62/70). |
   | **H1** | C2 wrote (some/all) dirty data pages, **no fsync** | `N−1` | Meta slots untouched → `N−1` selected. Written data pages occupy only pages `N−1` does not reference (SPEC 04 TXN-62), so torn/partial data pages are unreferenced garbage. No corruption; `N` invisible. |
   | **H2** | C3 fsync(data) done | `N−1` | Same as H1 but `N`'s data is now fully durable and still unreferenced. `N−1` selected; `N` invisible. |
   | **H3** | C4 wrote meta slot `N&1`, **no fsync(meta)** | `N−1` **or** `N` | The meta write is a single page. If it did not reach disk, or reached disk **torn**, its CRC fails → discarded → `N−1` (the intact `(N−1)&1` slot) selected (REC-3 impossible: only one slot in flight). If it reached disk **intact**, `N` may be selected — and that is safe **because `N`'s data was fsynced at C3** (H2), so every page `N`'s meta references is durable. Never a torn meta accepted; never a meta referencing unwritten pages. |
@@ -227,7 +227,13 @@ recovered) **except** where explicitly noted as FS-order-dependent.
   stamped by future txn"). So the corrected claim is: `NO_META_SYNC` recovery
   to the **newest issued** meta is fully consistent; recovery that falls
   **below** it, when a younger txn's data also persisted, is not guaranteed
-  structurally consistent. The default mode is immune (C5 makes meta `N`
+  structurally consistent. **Spilling (SPEC 04 §6.3a, 2026-09-30)** moves
+  those writes earlier: txn `N+1` may write reclaimed pages when it spills,
+  mid-txn, so the window runs from its **first spill** (not its C2) to its
+  C3 — as in LMDB, whose `mdb_page_spill` writes the same pages before the
+  meta is durable. Measured with the harness on one seed (10k cycles, the
+  same spill-heavy workload): 5 stale fallbacks with spilling disabled, 48
+  with it; 0 violations either way. The default mode is immune (C5 makes meta `N`
   durable before txn `N+1` can exist, so the only fallback is to `N−1`
   against txn `N`'s own writes, which TXN-62 confines to pages `N−1` does not
   reference). **LMDB parity:** the fork shares this window verbatim under

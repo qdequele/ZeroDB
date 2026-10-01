@@ -118,6 +118,9 @@ pub fn child_run(seed: u64, dir: &Path, kill: &str) -> ! {
         .page_size(spec.page_size)
         .max_dbs(16)
         .flags(spec.mode.env_flags());
+    if let Some(pages) = spec.dirty_limit {
+        opts.max_dirty_bytes(pages as usize * spec.page_size as usize);
+    }
     let env = match opts.open(dir) {
         Ok(e) => e,
         Err(e) => {
@@ -138,7 +141,17 @@ pub fn child_run(seed: u64, dir: &Path, kill: &str) -> ! {
     let mut exec = Exec::new(Some(&env));
     for round in 0..MAX_ROUNDS {
         for op in spec.ops_for_round(round) {
-            match exec.step(&op) {
+            // Ordering: `Relaxed` — a single-threaded child reads its own
+            // statistics counter.
+            let spilled =
+                crate::crash::model::SPILLED_TXNS.load(std::sync::atomic::Ordering::Relaxed);
+            let step = exec.step(&op);
+            if crate::crash::model::SPILLED_TXNS.load(std::sync::atomic::Ordering::Relaxed)
+                > spilled
+            {
+                mark("S".to_string());
+            }
+            match step {
                 Ok(StepOutcome::Committed(t)) => mark(format!("C {t}")),
                 Ok(_) => {}
                 Err(ExecErr::Drift(d)) => {
@@ -167,6 +180,8 @@ struct Sidecar {
     done: bool,
     abandon: Option<String>,
     drift: Option<String>,
+    /// Txns the child acked as having spilled (ADR-0017).
+    spilled: u64,
 }
 
 fn read_sidecar(dir: &Path) -> Sidecar {
@@ -175,6 +190,7 @@ fn read_sidecar(dir: &Path) -> Sidecar {
         done: false,
         abandon: None,
         drift: None,
+        spilled: 0,
     };
     let Ok(text) = std::fs::read_to_string(dir.join(SIDECAR)) else {
         return s;
@@ -185,6 +201,8 @@ fn read_sidecar(dir: &Path) -> Sidecar {
             if let Ok(t) = t.parse() {
                 s.commits.push(t);
             }
+        } else if line == "S" {
+            s.spilled += 1;
         } else if line == "DONE" {
             s.done = true;
         } else if let Some(w) = line.strip_prefix("ABANDON") {
@@ -250,6 +268,7 @@ pub fn run_sigkill_cycle(seed: u64, opts: &SigkillOpts) -> CutReport {
     };
 
     let side = read_sidecar(tmp.path());
+    report.spilled_txns = side.spilled;
     if let Some(d) = side.drift {
         report.violation = violation(format!("child model/engine drift: {d}"));
         return report;

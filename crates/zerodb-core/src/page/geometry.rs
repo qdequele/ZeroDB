@@ -138,12 +138,18 @@ pub fn pil_encode_into(ids: &[u64], buf: &mut [u8]) {
     }
 }
 
-/// Decode a PIL (SPEC 05 GC-3): validates the length shape and the count
-/// prefix, returning the page ids. Returns `None` on any malformation (wrong
-/// length multiple, count/length disagreement). Ordering is **not** validated
-/// here — the check tool asserts GC-4/INV-26 separately with diagnostics.
+/// Read a PIL's `count` prefix (SPEC 05 GC-3) without decoding the ids,
+/// applying the same length/count shape check as [`pil_decode`]: the value must
+/// be at least 8 bytes, a multiple of 8, and its `u64` count prefix must equal
+/// the number of ids that follow. Returns `None` on any malformation (the
+/// length half of INV-26).
+///
+/// This is the counting primitive for the `free_page_count` walk (SPEC 05
+/// GC-23), which needs only the count: it skips the per-entry `Vec<u64>`
+/// [`pil_decode`] allocates. The ids themselves (range/order, INV-25/GC-4) are
+/// validated where they are drawn for reuse (`gc_reclaim`), not on the count.
 #[must_use]
-pub fn pil_decode(bytes: &[u8]) -> Option<Vec<u64>> {
+pub fn pil_count(bytes: &[u8]) -> Option<u64> {
     if bytes.len() < 8 || bytes.len() % 8 != 0 {
         return None;
     }
@@ -151,6 +157,18 @@ pub fn pil_decode(bytes: &[u8]) -> Option<Vec<u64>> {
     if count as usize != bytes.len() / 8 - 1 {
         return None;
     }
+    Some(count)
+}
+
+/// Decode a PIL (SPEC 05 GC-3): validates the length shape and the count
+/// prefix, returning the page ids. Returns `None` on any malformation (wrong
+/// length multiple, count/length disagreement). Ordering is **not** validated
+/// here — the check tool asserts GC-4/INV-26 separately with diagnostics.
+#[must_use]
+pub fn pil_decode(bytes: &[u8]) -> Option<Vec<u64>> {
+    // Shape check shared with `pil_count` so the two never diverge: a byte
+    // string one accepts, the other accepts, with the same count.
+    pil_count(bytes)?;
     Some(
         bytes[8..]
             .chunks_exact(8)

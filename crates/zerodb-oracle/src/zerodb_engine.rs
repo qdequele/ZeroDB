@@ -662,6 +662,52 @@ impl ZerodbEngine {
         }
     }
 
+    /// `rw_cursor` → advance to `nth` → `del_current` → keep walking.
+    /// SPEC 03 §7 / §5.4a: pins the post-delete cursor position, not just the
+    /// surviving content.
+    fn iter_mut_del_then_walk(&mut self, db: u8, nth: u8, steps: u8, drain: bool) -> OpResult {
+        let dbh = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
+        let wtxn = match self.write_txn() {
+            Ok(w) => w,
+            Err(r) => return r,
+        };
+        let mut cur = dbh.rw_cursor(wtxn);
+        for _ in 0..=nth {
+            match cur.move_next() {
+                Ok(Some(_)) => {}
+                Ok(None) => return OpResult::Bool(false),
+                Err(e) => return OpResult::Err(to_oracle(e)),
+            }
+        }
+        if let Err(e) = cur.del_current() {
+            return OpResult::Err(to_oracle(e));
+        }
+        let limit = if steps == 0 {
+            usize::MAX
+        } else {
+            steps as usize
+        };
+        let mut seen = Vec::new();
+        while seen.len() < limit {
+            match cur.move_next() {
+                Ok(Some((k, v))) => {
+                    seen.push((k.to_vec(), v.to_vec()));
+                    if drain {
+                        if let Err(e) = cur.del_current() {
+                            return OpResult::Err(to_oracle(e));
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => return OpResult::Err(to_oracle(e)),
+            }
+        }
+        OpResult::Entries(seen)
+    }
+
     // -- reads --------------------------------------------------------------------
 
     fn get(&self, db: u8, key: &[u8]) -> OpResult {
@@ -948,6 +994,12 @@ impl Engine for ZerodbEngine {
 
             Op::IterMutPutCurrent { db, nth, val } => self.iter_mut_put(*db, *nth, &val.0),
             Op::IterMutDelCurrent { db, nth } => self.iter_mut_del(*db, *nth),
+            Op::IterMutDelThenWalk {
+                db,
+                nth,
+                steps,
+                drain,
+            } => self.iter_mut_del_then_walk(*db, *nth, *steps, *drain),
 
             Op::VerifyGet { db, key } => self.verify_get(*db, &key.0),
 

@@ -49,7 +49,7 @@
 //! overwrite the *live* snapshot's slot. (SPEC 04 §1 clarified in this change.)
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use crate::btree::{
@@ -135,10 +135,137 @@ fn find_run(ids: &[u64], n: u64) -> Option<u64> {
     None
 }
 
+/// One GC entry's in-memory drain state (GC-20 bookkeeping): the decoded,
+/// validated (strictly ascending — `validate_pil_ids`) PIL ids, viewed
+/// through a consumed-prefix offset. Only `ids[head..]` is live; the prefix
+/// is pages already handed out this txn.
+///
+/// Why the offset: the deterministic pick is the **smallest** live id (GC-19,
+/// and for runs usually the front too), so a plain `Vec::drain(0..n)`
+/// memmoves the whole tail on every draw — O(L²) to consume an entry of `L`
+/// ids. Advancing `head` makes the dominant front draw O(1) while keeping the
+/// live slice sorted-ascending for `find_run`/`binary_search`. (LMDB solves
+/// the same problem by keeping its reclaimed list reverse-sorted and cutting
+/// the tail.) A mid-slice run removal (rare: `n > 1` whose run does not start
+/// at the front) still pays the memmove via `Vec::drain`.
+///
+/// The consumed prefix is never re-exposed: every read goes through
+/// [`Drain::live`], and the GC-20 rewrite at commit encodes exactly the live
+/// slice — the same remaining ids the drain-on-every-draw representation
+/// produced, so the on-disk result is unchanged.
+#[derive(Debug, Clone)]
+struct Drain {
+    /// Decoded PIL ids, ascending. `..head` consumed, `head..` live.
+    ids: Vec<u64>,
+    /// Length of the consumed front prefix. Invariant: `head <= ids.len()`.
+    head: usize,
+}
+
+impl Drain {
+    fn new(ids: Vec<u64>) -> Self {
+        Drain { ids, head: 0 }
+    }
+
+    /// The remaining (still-free) ids, sorted ascending.
+    fn live(&self) -> &[u64] {
+        &self.ids[self.head..]
+    }
+
+    /// Number of remaining ids.
+    fn len(&self) -> usize {
+        self.ids.len() - self.head
+    }
+
+    /// Consume the run `start .. start + n`. The caller (a `find_run` hit on
+    /// [`Drain::live`]) guarantees the run is present and — since the live
+    /// slice is strictly ascending — occupies `n` consecutive positions.
+    /// Front runs advance `head` (O(1), the GC-19 common case); mid-slice
+    /// runs fall back to `Vec::drain`.
+    fn take_run(&mut self, start: u64, n: u64) {
+        let n = usize::try_from(n).expect("run length fits usize (find_run did)");
+        let pos = self
+            .live()
+            .binary_search(&start)
+            .expect("picked id present in the remaining set");
+        if pos == 0 {
+            self.head += n;
+        } else {
+            self.ids.drain(self.head + pos..self.head + pos + n);
+        }
+        debug_assert!(self.head <= self.ids.len());
+    }
+}
+
 /// A root-to-leaf descent path: `(pgno, ki)` per level (SPEC 03 §1 cursor
 /// shape). `ki` is the chosen child index on branches and the entry/insertion
 /// slot on the leaf.
 type Path = Vec<(u64, usize)>;
+
+/// One mutating call's worst-case page touches, as LMDB's `need` estimate in
+/// `mdb_page_spill` (SPEC 04 TXN-68): the spill trigger's headroom and the
+/// smallest spill.
+const SPILL_NEED: u64 = 64;
+
+/// One tree's **rightmost-leaf finger** (SPEC 03 §6.6, roadmap #6): the full
+/// root-to-rightmost-leaf descent path as of the tree's last end-of-tree
+/// insert. Every branch frame's `ki` is that page's `num_keys - 1` (the right
+/// spine); the leaf frame's `ki` is the slot of the establishing insert and is
+/// **not** trusted at use time (the insertion slot is recomputed from the live
+/// leaf). Valid only while every page on the path is dirty in this txn — so a
+/// hit needs no COW — which [`RwTxn::finger_spine`] re-verifies at use time,
+/// never assumes from establishment.
+///
+/// This is PostgreSQL 11 nbtree's rightmost-leaf fastpath (commit `2b272734`)
+/// transplanted to the write txn: sequential and APPEND loads (milli's sorted
+/// bulk pattern) always target the rightmost leaf, so remembering its descent
+/// skips the per-put root-to-leaf search. LMDB has no equivalent technique to
+/// mirror here — `mdb_put` initializes a fresh cursor per call and even
+/// `MDB_APPEND` re-descends via `mdb_cursor_last` — so this is a deliberate,
+/// documented non-LMDB lever (the observable put semantics are unchanged).
+struct Finger {
+    tree: TreeId,
+    path: Path,
+}
+
+/// One `delete_range` leaf step (SPEC 03, delete_range note): entries
+/// deleted, the resume key (set when the span ran to its leaf's end), and
+/// the deferred-rebalance anchor (set when the leaf kept survivors in front
+/// of the span).
+type LeafSpan = (u64, Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// What a delete's rebalance ([`RwTxn::rebalance`]) did to the root-to-leaf
+/// path it was handed (SPEC 03 §5.4a): the parked write cursor keeps, pops,
+/// or discards its path based on this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathFate {
+    /// No structural change: the path is valid exactly as it stands.
+    Unchanged,
+    /// A borrow or merge changed the tree's shape, but every `(pgno, ki)`
+    /// frame still names the descent to the vacated slot — the path was
+    /// repaired in place (the leftmost / right-sibling repair table,
+    /// SPEC 03 §5.4a).
+    Kept,
+    /// As [`Kept`](PathFate::Kept), plus a root shrink dropped the tree's top
+    /// level: frame 0 must be popped before the path is used.
+    KeptShrunk,
+    /// The path may name freed pages or stale indices: discard it and re-seek
+    /// (always a correct repair, SPEC 03 §5.4a).
+    Invalidated,
+}
+
+impl PathFate {
+    /// Combine this level's fate with the parent recursion's (merge cascades):
+    /// any invalidation wins, then a root pop, then a plain keep.
+    fn and(self, parent: PathFate) -> PathFate {
+        use PathFate::{Invalidated, Kept, KeptShrunk, Unchanged};
+        match (self, parent) {
+            (Invalidated, _) | (_, Invalidated) => Invalidated,
+            (KeptShrunk, _) | (_, KeptShrunk) => KeptShrunk,
+            (Kept, _) | (_, Kept) => Kept,
+            (Unchanged, Unchanged) => Unchanged,
+        }
+    }
+}
 
 /// Leaf node header size (SPEC 02 §4.2).
 const LEAF_NODE_HEADER: usize = 8;
@@ -169,6 +296,63 @@ struct NamedTree {
     name: Box<[u8]>,
     rec: DBRecord,
     dirty: bool,
+    /// This DB's sequential-writes setting (ADR-0015), resolved when the txn
+    /// first touches it.
+    seq: bool,
+}
+
+/// The per-txn named-DB table, indexed directly by dbi. LMDB keeps the same
+/// state in `txn->mt_dbs[dbi]`, an array read by index on every cursor init;
+/// a hashed map cost a SipHash per probe and a named put probes several times.
+/// dbi indices are small and append-only (the env registry never reuses one),
+/// so the table grows to the highest dbi this txn touched, never past it.
+#[derive(Default)]
+struct OpenTable {
+    slots: Vec<Option<NamedTree>>,
+}
+
+impl OpenTable {
+    #[inline]
+    fn get(&self, dbi: u32) -> Option<&NamedTree> {
+        self.slots.get(dbi as usize)?.as_ref()
+    }
+
+    #[inline]
+    fn get_mut(&mut self, dbi: u32) -> Option<&mut NamedTree> {
+        self.slots.get_mut(dbi as usize)?.as_mut()
+    }
+
+    #[inline]
+    fn contains(&self, dbi: u32) -> bool {
+        self.get(dbi).is_some()
+    }
+
+    /// The slot for `dbi`, growing the table to reach it.
+    fn slot(&mut self, dbi: u32) -> &mut Option<NamedTree> {
+        let i = dbi as usize;
+        if i >= self.slots.len() {
+            self.slots.resize_with(i + 1, || None);
+        }
+        &mut self.slots[i]
+    }
+
+    fn insert(&mut self, dbi: u32, t: NamedTree) {
+        *self.slot(dbi) = Some(t);
+    }
+
+    fn remove(&mut self, dbi: u32) {
+        if let Some(s) = self.slots.get_mut(dbi as usize) {
+            *s = None;
+        }
+    }
+
+    fn values(&self) -> impl Iterator<Item = &NamedTree> {
+        self.slots.iter().flatten()
+    }
+
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut NamedTree> {
+        self.slots.iter_mut().flatten()
+    }
 }
 
 /// Allocation restriction state (SPEC 05 GC-12, ADR-0005 D2).
@@ -217,6 +401,7 @@ impl std::ops::BitOr for PutFlags {
 
 /// The value source of a put: caller bytes, or a RESERVE of `n` bytes
 /// (TXN-47 — the engine places the cell and the caller fills it).
+#[derive(Clone, Copy)]
 enum ValSrc<'v> {
     Val(&'v [u8]),
     Reserve(usize),
@@ -385,7 +570,7 @@ pub struct RwTxn<'env> {
     /// commit C2 — including WRITE_MAP (TXN-45a) — so the *map* bytes never
     /// change during the txn; dirty frames are excluded from the memo by
     /// [`Source::bytes_from_classified`].
-    validated: ValidatedPages,
+    validated: ValidatedPages<'static>,
     /// Committed pages obsoleted by this txn (GC-6). Written to the GC DB
     /// under `BE(writer_txnid)` at commit step C1 (`freelist_save`).
     freed: Vec<u64>,
@@ -394,11 +579,12 @@ pub struct RwTxn<'env> {
     /// again this txn also lands here (it is this-txn-private after the gate).
     loose: Vec<u64>,
     /// GC-20 drain bookkeeping (ADR-0005 D1): for every GC entry `F` this txn
-    /// drew from, the **remaining** (still-free, sorted-ascending) ids. Loaded
-    /// from the tree PIL on first touch; `freelist_save` step (a) rewrites the
-    /// remainder (or deletes the entry when empty). `BTreeMap` so iteration is
-    /// ascending-`F`, matching the GC-18 scan.
-    drains: BTreeMap<u64, Vec<u64>>,
+    /// drew from, the **remaining** (still-free, sorted-ascending) ids —
+    /// [`Drain::live`], a consumed-prefix view so the GC-19 front pop is O(1).
+    /// Loaded from the tree PIL on first touch; `freelist_save` step (a)
+    /// rewrites the remainder (or deletes the entry when empty). `BTreeMap` so
+    /// iteration is ascending-`F`, matching the GC-18 scan.
+    drains: BTreeMap<u64, Drain>,
     /// Every pgno handed out by a GC draw this txn (ADR-0005 D1): feeds the
     /// generalized TXN-62 assert at C2 and the loose classification in
     /// [`RwTxn::free_page`]. Pgno-hashed (issue #9): engine-authored keys,
@@ -421,11 +607,43 @@ pub struct RwTxn<'env> {
     main_db: DBRecord,
     free_db: DBRecord,
     /// Per-txn named-DB working records (the dbi table's txn half; M1.6),
-    /// keyed by dbi index. Loaded lazily from the catalog on first touch;
+    /// indexed by dbi. Loaded lazily from the catalog on first touch;
     /// `dirty` entries are written back to the main tree at commit before
     /// `freelist_save` ([`RwTxn::flush_catalog`]). Dropped-this-txn entries are
     /// removed here (their catalog entry is deleted eagerly at drop time).
-    open: HashMap<u32, NamedTree>,
+    open: OpenTable,
+    /// Descent-path buffer reused by every put and delete of this txn: taken
+    /// with `mem::take` for the op and put back after, so only the first op
+    /// allocates. LMDB's cursor stack is likewise allocated once and reused;
+    /// a fresh `Vec` per op cost an allocation, its growth and a free.
+    path_buf: Path,
+    /// Rightmost-leaf fingers, at most one per tree (SPEC 03 §6.6, roadmap
+    /// #6): the cached right-spine descent a sequential/APPEND put re-uses
+    /// instead of descending. Writer-private — reads and nested read children
+    /// never consult it (they descend from the records as always). Dropped by
+    /// every structural or ownership change of its pages: any put miss, every
+    /// delete/clear/drop entry, a fast-path split, and `free_page`/`free_run`
+    /// for any page a finger names (see [`RwTxn::finger_forget`]); an errored
+    /// txn cannot reach the fast path at all (`guard_ok` precedes it). A tiny
+    /// `Vec` scanned linearly: a txn touches a handful of trees.
+    fingers: Vec<Finger>,
+    /// The main DB's sequential-writes setting (ADR-0015), resolved at txn
+    /// begin; named DBs carry theirs in [`NamedTree::seq`].
+    seq_main: bool,
+    /// The env's dirty limit in pages (SPEC 04 TXN-68, ADR-0017): past it,
+    /// the next mutating call spills pages to the file.
+    dirty_limit: u64,
+    /// Spills this txn has done (diagnostics; SPEC 04 TXN-69).
+    spills: u64,
+    /// The bound on this txn's map reads (SPEC 04 TXN-38/71): the committed
+    /// high-water, raised past the highest page each spill writes. The spill
+    /// wrote that page, so the file backs every page up to here (holes read
+    /// as zeros), and a stray reference fails typed rather than faulting.
+    read_high: u64,
+    /// Fast-path hits this txn — a test signal that the finger actually
+    /// fires (like `RwCursor::repaired_keeps`). Debug builds only.
+    #[cfg(debug_assertions)]
+    finger_hits: u64,
     /// LMDB `MDB_TXN_ERROR` parity: a mid-mutation failure (e.g. `MapFull`
     /// inside a split cascade) leaves the working tree partial, so every later
     /// mutation and `commit` returns `BadTxn`; only abort is valid.
@@ -473,7 +691,7 @@ impl Env {
         if inner.is_poisoned() {
             return Err(poisoned_error());
         }
-        let guard = inner.lock_writer();
+        let mut guard = inner.lock_writer();
         // Recheck under the lock: a concurrent commit may have failed while we
         // blocked on the mutex.
         if inner.is_poisoned() {
@@ -494,10 +712,21 @@ impl Env {
             committed_last_pg: base.last_pg,
             main_db: base.main_db,
             free_db: base.free_db,
-            open: HashMap::new(),
+            open: OpenTable::default(),
+            path_buf: Path::new(),
+            fingers: Vec::new(),
+            seq_main: inner.sequential_writes_for(None),
+            dirty_limit: inner.dirty_limit(),
+            spills: 0,
+            read_high: base.last_pg,
+            #[cfg(debug_assertions)]
+            finger_hits: 0,
             psize: inner.page_size(),
-            dirty: DirtyStore::new(inner.page_size()),
-            validated: ValidatedPages::new(),
+            // Seed the dirty store's spare list with the frames recycled from
+            // earlier write txns (LMDB's `me_dpages`, PERF-GAP B12); they came
+            // with the writer slot, so this takes no lock.
+            dirty: DirtyStore::with_spare(inner.page_size(), guard.take_frames()),
+            validated: ValidatedPages::for_policy(inner.file_trust()),
             freed: Vec::new(),
             loose: Vec::new(),
             drains: BTreeMap::new(),
@@ -630,8 +859,9 @@ impl TxnRead for RwTxn<'_> {
             dirty: &self.dirty,
             bytes: self.bytes,
             // Bounds the map fallback only: pages this txn allocated beyond
-            // the base snapshot live in `dirty` and resolve before the bound.
-            last_pg: self.committed_last_pg,
+            // the base snapshot live in `dirty` and resolve before the bound,
+            // or were spilled below `read_high` (SPEC 04 TXN-71).
+            last_pg: self.read_high,
         }
     }
     fn main_record(&self) -> &DBRecord {
@@ -651,7 +881,7 @@ impl TxnRead for RwTxn<'_> {
                 // txn (uncommitted state, TXN-38); otherwise resolve from the
                 // working catalog (which itself reflects uncommitted catalog
                 // inserts through the dirty-frame source).
-                if let Some(t) = self.open.get(&dbi) {
+                if let Some(t) = self.open.get(dbi) {
                     return t.rec;
                 }
                 match self.env.inner().named_name(dbi) {
@@ -666,7 +896,7 @@ impl TxnRead for RwTxn<'_> {
     fn comparator_for(&self, sel: DbSel) -> crate::cmp::KeyCmp<'_> {
         self.env.inner().comparator_for(sel)
     }
-    fn validated_pages(&self) -> Option<&ValidatedPages> {
+    fn validated_pages(&self) -> Option<&ValidatedPages<'_>> {
         Some(&self.validated)
     }
 }
@@ -771,7 +1001,7 @@ impl<'env> RwTxn<'env> {
             TreeId::Named(dbi) => {
                 &self
                     .open
-                    .get(&dbi)
+                    .get(dbi)
                     .expect("named record loaded before use")
                     .rec
             }
@@ -787,7 +1017,7 @@ impl<'env> RwTxn<'env> {
             TreeId::Named(dbi) => {
                 let e = self
                     .open
-                    .get_mut(&dbi)
+                    .get_mut(dbi)
                     .expect("named record loaded before use");
                 e.dirty = true;
                 &mut e.rec
@@ -804,11 +1034,14 @@ impl<'env> RwTxn<'env> {
         // here too, *before* the table is touched (the page-mutation entries
         // it precedes re-check via their own `guard_ok`).
         self.guard_ok()?;
+        // SPEC 04 TXN-68: every page-mutating `Database`/`RwCursor` entry
+        // passes here first, with no path, view or frame borrow live.
+        self.maybe_spill()?;
         let dbi = match sel {
             DbSel::Main => return Ok(TreeId::Main),
             DbSel::Named(dbi) => dbi,
         };
-        if !self.open.contains_key(&dbi) {
+        if !self.open.contains(dbi) {
             let name = self
                 .env
                 .inner()
@@ -821,6 +1054,7 @@ impl<'env> RwTxn<'env> {
                     name,
                     rec,
                     dirty: false,
+                    seq: self.env.inner().sequential_writes_for(Some(dbi)),
                 },
             );
         }
@@ -889,6 +1123,9 @@ impl<'env> RwTxn<'env> {
     /// Serve a contiguous `n`-page run from the loose list (GcSave only; see
     /// [`RwTxn::allocate`]). A loose run that abuts `next_pgno` may be
     /// completed by extension. Returns the run's head pgno.
+    // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
+    // arms stay separate so their size never moves it (PERF-GAP B13).
+    #[inline(never)]
     fn loose_run(&mut self, n: u64) -> Option<u64> {
         debug_assert!(self.alloc_mode == AllocMode::GcSave);
         if self.loose.is_empty() {
@@ -934,11 +1171,14 @@ impl<'env> RwTxn<'env> {
     /// entry passed `F ≤ oldest_reader()` when first loaded during ops, and
     /// any reader that pins *after* that pins the published snapshot
     /// `≥ writer_txnid − 1 ≥ F`, from whose trees these pages are absent.
+    // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
+    // arms stay separate so their size never moves it (PERF-GAP B13).
+    #[inline(never)]
     fn save_pool_draw(&mut self, n: u64) -> Option<u64> {
         debug_assert!(self.alloc_mode == AllocMode::GcSave);
         let mut hit: Option<(u64, u64)> = None;
         for (f, remaining) in &self.drains {
-            if let Some(start) = find_run(remaining, n) {
+            if let Some(start) = find_run(remaining.live(), n) {
                 hit = Some((*f, start));
                 break;
             }
@@ -949,10 +1189,7 @@ impl<'env> RwTxn<'env> {
         #[cfg(debug_assertions)]
         self.debug_assert_gate(f);
         let remaining = self.drains.get_mut(&f).expect("pool entry present");
-        let pos = remaining
-            .binary_search(&start)
-            .expect("picked id present in the remaining set");
-        remaining.drain(pos..pos + n as usize);
+        remaining.take_run(start, n);
         for p in start..start + n {
             let first_time = self.reclaimed.insert(p);
             debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
@@ -1024,6 +1261,9 @@ impl<'env> RwTxn<'env> {
     /// (smallest id for `n == 1` — GC-19; first within-PIL contiguous run for
     /// `n > 1` — GC-15/21), record the drain in `self.drains` (the tree entry
     /// itself is rewritten only at C1, GC-20) and return the head pgno.
+    // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
+    // arms stay separate so their size never moves it (PERF-GAP B13).
+    #[inline(never)]
     fn gc_reclaim(&mut self, n: u64) -> Result<Option<u64>> {
         debug_assert!(
             self.alloc_mode == AllocMode::Normal,
@@ -1053,7 +1293,7 @@ impl<'env> RwTxn<'env> {
                 }
                 match self.drains.get(&f) {
                     Some(remaining) => {
-                        if let Some(start) = find_run(remaining, n) {
+                        if let Some(start) = find_run(remaining.live(), n) {
                             found = Some(Pick {
                                 f,
                                 fresh: None,
@@ -1094,13 +1334,10 @@ impl<'env> RwTxn<'env> {
         #[cfg(debug_assertions)]
         self.debug_assert_gate(f);
         let remaining = match fresh {
-            Some(ids) => self.drains.entry(f).or_insert(ids),
+            Some(ids) => self.drains.entry(f).or_insert(Drain::new(ids)),
             None => self.drains.get_mut(&f).expect("drain entry present"),
         };
-        let pos = remaining
-            .binary_search(&start)
-            .expect("picked id present in the remaining set");
-        remaining.drain(pos..pos + n as usize);
+        remaining.take_run(start, n);
         for p in start..start + n {
             let first_time = self.reclaimed.insert(p);
             debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
@@ -1115,7 +1352,10 @@ impl<'env> RwTxn<'env> {
     /// frame here is sound because freeing only happens inside `&mut` ops,
     /// where no borrow into the frame can be live (TXN-39/43).
     fn free_page(&mut self, pgno: u64) {
-        let _ = self.dirty.remove(pgno);
+        // SPEC 03 §6.6 F3 ownership hook: a freed page may be re-served to
+        // another tree while staying dirty — no finger may keep naming it.
+        self.finger_forget(pgno, 1);
+        self.dirty.discard(pgno);
         if pgno > self.committed_last_pg || self.reclaimed.contains(&pgno) {
             self.loose.push(pgno);
         } else {
@@ -1125,7 +1365,10 @@ impl<'env> RwTxn<'env> {
 
     /// Free a whole overflow run (SPEC 03 §8: all `n` pgnos).
     fn free_run(&mut self, head: u64, n: u64) {
-        let _ = self.dirty.remove(head);
+        // SPEC 03 §6.6 F3 ownership hook, as in `free_page`.
+        self.finger_forget(head, n);
+        // Run frames are multi-page; `discard` drops them rather than pooling.
+        self.dirty.discard(head);
         for p in head..head + n {
             if p > self.committed_last_pg || self.reclaimed.contains(&p) {
                 self.loose.push(p);
@@ -1143,6 +1386,9 @@ impl<'env> RwTxn<'env> {
         if self.dirty.contains(pgno) {
             return Ok(pgno);
         }
+        if self.dirty.has_spills() && self.dirty.spilled_pages(pgno).is_some() {
+            return self.unspill(pgno);
+        }
         // Not dirty, so the page must be committed: a committed reference
         // never exceeds the base snapshot's high-water (SPEC 06 REC-14). The
         // map may extend past the real file end (ADR-0004 D4), so an
@@ -1154,20 +1400,182 @@ impl<'env> RwTxn<'env> {
         let base = (pgno as usize)
             .checked_mul(ps)
             .ok_or(Error::Mdb(MdbError::Invalid))?;
-        let src = self
-            .bytes
+        // Copy the `&'env [u8]` map handle out of `self` (it is `Copy`, lifetime
+        // 'env) so the source borrow does not alias the `&mut self.dirty` op
+        // below — letting `insert_copy` copy straight into a pooled frame.
+        let map: &[u8] = self.bytes;
+        let src = map
             .get(base..base + ps)
             .ok_or(Error::Mdb(MdbError::Invalid))?;
-        let mut frame: Box<[u8]> = src.into();
         let np = self.allocate(1)?;
-        // Restamp the copy's identity (SPEC 02 §2: pgno + writer txnid).
-        let mut hdr = crate::page::CommonHeader::read(&frame);
+        // Copy the committed page into a fresh (or recycled) frame, then restamp
+        // the copy's identity in place (SPEC 02 §2: pgno + writer txnid).
+        let frame = self.dirty.insert_copy(np, src);
+        let mut hdr = crate::page::CommonHeader::read(frame);
         hdr.pgno = np;
         hdr.txnid = self.txnid;
-        hdr.write(&mut frame);
-        self.dirty.insert(np, frame);
+        hdr.write(frame);
         self.free_page(pgno);
         Ok(np)
+    }
+
+    /// Bring spilled tree page `pgno` back into a frame at the **same** pgno
+    /// (SPEC 04 TXN-72; LMDB `mdb_page_unspill`): its bytes were written by
+    /// this txn and already carry its id, so there is no new pgno, no
+    /// parent-pointer rewrite and no free.
+    #[cold]
+    #[inline(never)]
+    fn unspill(&mut self, pgno: u64) -> Result<u64> {
+        if self.dirty.spilled_pages(pgno) != Some(1) {
+            // Only tree pages are touched; a run head never is.
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
+        let ps = self.psize as usize;
+        let base = (pgno as usize)
+            .checked_mul(ps)
+            .ok_or(Error::Mdb(MdbError::Invalid))?;
+        // The `&'env [u8]` map handle, copied out of `self` so the borrow
+        // does not alias the `&mut self.dirty` op (as in `touch`). The page
+        // was written at a `&mut` boundary before this one, and no borrow into
+        // it is live (TXN-39), so reading it now is the TXN-62 contract.
+        let map: &[u8] = self.bytes;
+        let src = map
+            .get(base..base + ps)
+            .ok_or(Error::Mdb(MdbError::Invalid))?;
+        let frame = self.dirty.unspill_copy(pgno, src);
+        debug_assert_eq!(
+            crate::page::CommonHeader::read(frame).txnid,
+            self.txnid,
+            "a spilled page carries its txn's id"
+        );
+        Ok(pgno)
+    }
+
+    /// Write the frames at `pgnos` (ascending) with the commit's page writer:
+    /// consecutive frames go out as one vectored write (PERF-GAP B4) — a frame
+    /// at `pgno` covering `n` pages (an overflow run) makes the run
+    /// contiguous iff the next frame starts at `pgno + n`. Used by commit C2
+    /// and by spilling (SPEC 04 TXN-69). Not yet durable.
+    fn write_frames(&self, pgnos: &[u64]) -> Result<()> {
+        let psize = self.psize;
+        let backing = self.env.inner().backing_ref();
+        let mut run_start: u64 = 0;
+        let mut next_expected: u64 = 0;
+        let mut run: Vec<&[u8]> = Vec::new();
+        for &pgno in pgnos {
+            let data = self.dirty.bytes(pgno).expect("pgno has a frame");
+            // TXN-62: only pages the live meta `N-1` does not reference may be
+            // written: beyond the committed high-water (extend / loose), or
+            // GC-reclaimed under the oldest-reader gate (freed by
+            // `F ≤ oldest ≤ N-1`, hence absent from `N-1`'s trees). Spilling
+            // writes a subset of the same pages, earlier (TXN-70).
+            debug_assert!(
+                pgno > self.committed_last_pg || self.reclaimed.contains(&pgno),
+                "TXN-62 violation: writing page {pgno} referenced by the live snapshot"
+            );
+            if !run.is_empty() && pgno != next_expected {
+                backing.write_pages_at(run_start, psize, &run)?;
+                run.clear();
+            }
+            if run.is_empty() {
+                run_start = pgno;
+                next_expected = pgno;
+            }
+            run.push(data);
+            next_expected += (data.len() / psize as usize) as u64;
+        }
+        if !run.is_empty() {
+            backing.write_pages_at(run_start, psize, &run)?;
+        }
+        Ok(())
+    }
+
+    /// The spill check (SPEC 04 TXN-68): spill if the dirty set is within
+    /// [`SPILL_NEED`] of the limit. Call only where no descent path, view or
+    /// frame borrow is live — the start of a mutating entry, or the top of a
+    /// multi-step loop that keeps no path across iterations.
+    #[inline]
+    fn maybe_spill(&mut self) -> Result<()> {
+        if self.dirty.pages() + SPILL_NEED > self.dirty_limit {
+            self.spill()?;
+        }
+        Ok(())
+    }
+
+    /// Spill (SPEC 04 TXN-69, ADR-0017; LMDB `mdb_page_spill`): write at
+    /// least `max(SPILL_NEED, limit / 8)` pages of dirty frames to the file —
+    /// highest pgnos first, skipping tree roots and finger pages, which are
+    /// about to be touched again — and release their frames. A write failure
+    /// errors the txn (only abort remains); frames leave the store only after
+    /// their write succeeded.
+    #[cold]
+    #[inline(never)]
+    fn spill(&mut self) -> Result<()> {
+        let want = SPILL_NEED.max(self.dirty_limit / 8);
+        let mut keep: Vec<u64> = vec![self.main_db.root, self.free_db.root];
+        keep.extend(self.open.values().map(|t| t.rec.root));
+        for f in &self.fingers {
+            keep.extend(f.path.iter().map(|&(p, _)| p));
+        }
+        let mut cands: Vec<(u64, u64)> = self
+            .dirty
+            .frame_extents()
+            .filter(|(p, _)| !keep.contains(p))
+            .collect();
+        cands.sort_unstable_by_key(|&(p, _)| std::cmp::Reverse(p));
+        let mut chosen = Vec::new();
+        let mut got = 0u64;
+        let mut high = self.read_high;
+        for (p, n) in cands {
+            if got >= want {
+                break;
+            }
+            got += n;
+            high = high.max(p + n - 1);
+            chosen.push(p);
+        }
+        if chosen.is_empty() {
+            return Ok(());
+        }
+        chosen.sort_unstable();
+        if let Err(e) = self.write_frames(&chosen) {
+            self.errored = true;
+            return Err(e);
+        }
+        for p in chosen {
+            self.dirty.spill(p);
+        }
+        // TXN-71: the spill wrote its highest page, so the file now backs
+        // every page up to `high`; spilled pages resolve from the map below it.
+        self.read_high = high;
+        // TXN-71: a spilled page's map bytes change only here, so a fresh
+        // memo per spill keeps every memo entry true to the current bytes.
+        self.validated = ValidatedPages::for_policy(self.env.inner().file_trust());
+        self.spills += 1;
+        Ok(())
+    }
+
+    /// How many times this txn has spilled (SPEC 04 TXN-69), even if every
+    /// spilled page was brought back since. Test and diagnostics hook.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn spill_count(&self) -> u64 {
+        self.spills
+    }
+
+    /// Pages currently held in dirty frames (SPEC 04 TXN-68): what the dirty
+    /// limit bounds. Test and diagnostics hook.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn dirty_pages(&self) -> u64 {
+        self.dirty.pages()
+    }
+
+    /// Pgnos currently spilled (SPEC 04 TXN-69). Test and diagnostics hook.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn spilled_pgnos(&self) -> usize {
+        self.dirty.spilled_len()
     }
 
     /// Read-only root-to-key descent (SPEC 03 §2), returning the path of
@@ -1176,11 +1584,19 @@ impl<'env> RwTxn<'env> {
     /// (`touch_path`), so a `NO_OVERWRITE` miss or a `del` of an absent key
     /// dirties nothing (LMDB parity).
     fn search_path(&self, tree: TreeId, key: &[u8]) -> Result<(Path, bool)> {
+        let mut path = Path::new();
+        let found = self.search_path_into(tree, key, &mut path)?;
+        Ok((path, found))
+    }
+
+    /// [`RwTxn::search_path`] into a caller-owned buffer (cleared first), so
+    /// the put and delete paths can reuse [`RwTxn::path_buf`].
+    fn search_path_into(&self, tree: TreeId, key: &[u8], path: &mut Path) -> Result<bool> {
+        path.clear();
         let cmp = self.tree_comparator(tree);
         let rec = *self.record(tree);
-        let mut path = Vec::new();
         if rec.root == PGNO_INVALID {
-            return Ok((path, false));
+            return Ok(false);
         }
         // Hostile-depth guard: `rec.depth` is on-disk data. Deeper than the
         // read path's CURSOR_STACK bound is corruption (a legal tree of
@@ -1204,7 +1620,7 @@ impl<'env> RwTxn<'env> {
                         Err(i) => (i, false),
                     };
                     path.push((pgno, ki));
-                    return Ok((path, found));
+                    return Ok(found);
                 }
                 NodeView::Branch(br) => {
                     let i = br.child_index_with(key, cmp);
@@ -1216,12 +1632,15 @@ impl<'env> RwTxn<'env> {
         Err(Error::Mdb(MdbError::Invalid)) // deeper than depth: corrupt
     }
 
-    /// Read-only descent to the rightmost entry (APPEND's last-key compare,
-    /// §6.3). Returns the path (leaf `ki = num_keys - 1`) and the owned last
-    /// key. The tree must be non-empty.
-    fn rightmost_path(&self, tree: TreeId) -> Result<(Path, Vec<u8>)> {
+    /// Read-only descent to the rightmost entry (APPEND's last-key check,
+    /// §6.3) into a caller-owned buffer (cleared first): fills the path (leaf
+    /// `ki = num_keys - 1`) and returns whether `key` sorts strictly after the
+    /// last key under the tree's ordering. The key is compared in place in
+    /// the leaf, as LMDB's APPEND check does, not copied out. The tree must be
+    /// non-empty.
+    fn rightmost_path_into(&self, tree: TreeId, key: &[u8], path: &mut Path) -> Result<bool> {
+        path.clear();
         let rec = *self.record(tree);
-        let mut path = Vec::new();
         // Same hostile-depth guard as `search_path`.
         if rec.depth as usize > crate::btree::CURSOR_STACK {
             return Err(Error::Mdb(MdbError::Invalid));
@@ -1235,9 +1654,14 @@ impl<'env> RwTxn<'env> {
                     if n == 0 {
                         return Err(Error::Mdb(MdbError::Invalid));
                     }
-                    let key = leaf.key(n - 1).to_vec();
                     path.push((pgno, n - 1));
-                    return Ok((path, key));
+                    // M2.4: "strictly greater than the last key" is decided by
+                    // the target tree's ordering, not memcmp — otherwise
+                    // APPEND on a custom-comparator DB would reject exactly
+                    // the keys it should accept.
+                    let after = self.tree_comparator(tree).compare(key, leaf.key(n - 1))
+                        == Ordering::Greater;
+                    return Ok(after);
                 }
                 NodeView::Branch(br) => {
                     // A zero-child branch is rejected at decode
@@ -1279,6 +1703,289 @@ impl<'env> RwTxn<'env> {
         Ok(())
     }
 
+    // -- rightmost-leaf finger (SPEC 03 §6.6, roadmap #6) ----------------------
+
+    /// Index of `tree`'s finger in the table, if one is live.
+    fn finger_pos(&self, tree: TreeId) -> Option<usize> {
+        self.fingers.iter().position(|f| f.tree == tree)
+    }
+
+    /// Drop `tree`'s finger (SPEC 03 §6.6 F3). Called at the head of every
+    /// structural mutation of `tree` that does not itself re-prove the
+    /// finger: point deletes, `delete_range`'s splices and settle pass,
+    /// `clear`/`drop` — and by the put path on any fast-path miss, whose
+    /// descent then re-establishes it ([`RwTxn::finger_consider`]).
+    #[inline(always)]
+    fn finger_invalidate(&mut self, tree: TreeId) {
+        // The table is empty for every tree with the setting off (ADR-0015):
+        // one load and a branch, the body out of line.
+        if !self.fingers.is_empty() {
+            self.finger_invalidate_slow(tree);
+        }
+    }
+
+    #[inline(never)]
+    fn finger_invalidate_slow(&mut self, tree: TreeId) {
+        self.fingers.retain(|f| f.tree != tree);
+    }
+
+    /// Ownership-change hook (SPEC 03 §6.6 F3, the load-bearing one): a page
+    /// freed into the loose list can be re-served by `allocate` to ANOTHER
+    /// tree while staying dirty, so a finger naming it would still pass every
+    /// per-frame check — under the wrong tree. Dropping every finger that
+    /// names a freed page (`head .. head + n`) makes that reuse hazard
+    /// impossible by construction, not by call-site audit. (Normally
+    /// unreachable: a finger page is live in its tree, so only an op on that
+    /// tree frees it, and every such op invalidates first — but "normally" is
+    /// exactly what a refactor breaks.)
+    #[inline(always)]
+    fn finger_forget(&mut self, head: u64, n: u64) {
+        // Empty for every tree with the setting off (ADR-0015); see
+        // `finger_invalidate`.
+        if !self.fingers.is_empty() {
+            self.finger_forget_slow(head, n);
+        }
+    }
+
+    #[inline(never)]
+    fn finger_forget_slow(&mut self, head: u64, n: u64) {
+        self.fingers.retain(|f| {
+            f.path
+                .iter()
+                .all(|&(pg, _)| !(head..head + n).contains(&pg))
+        });
+    }
+
+    /// Verify a candidate finger path against the live working tree (SPEC 03
+    /// §6.6 F1, structural half): every frame is **dirty in this txn**
+    /// (checked now, at use time — a hit must need no COW, and a non-dirty
+    /// frame may be any committed page), the branch frames form the right
+    /// spine (`ki == num_keys - 1`, each child pointer naming the next frame)
+    /// down from the record's **current** root, and the last frame is a
+    /// non-empty leaf. Returns the leaf's `(pgno, num_keys)`.
+    ///
+    /// The walk re-proves the path from `rec.root` through live child
+    /// pointers, so a `Some` return *is* the tree's current rightmost descent
+    /// — byte-for-byte what `rightmost_path_into` would build, minus the
+    /// per-level source dispatch. The F3 invalidation hooks keep stale
+    /// fingers from lingering (and from ever aliasing a freed-then-reused
+    /// page), but a hit's correctness rests on this re-verification, not on
+    /// their completeness.
+    fn finger_spine(&self, rec: &DBRecord, path: &[(u64, usize)]) -> Option<(u64, usize)> {
+        if rec.root == PGNO_INVALID
+            || path.is_empty()
+            || path.len() != rec.depth as usize
+            || path[0].0 != rec.root
+        {
+            return None;
+        }
+        for lvl in 0..path.len() - 1 {
+            let (pg, ki) = path[lvl];
+            let frame = self.dirty.bytes(pg)?;
+            // A dirty frame is engine-authored: O(1) structural checks only
+            // (the `page_stats` convention). A reused frame of another type
+            // (leaf, overflow run) fails the type check and misses.
+            let br = BranchRef::new_prevalidated(frame, self.psize).ok()?;
+            if ki + 1 != br.num_keys() || br.child_pgno(ki) != path[lvl + 1].0 {
+                return None;
+            }
+        }
+        let (lpg, _) = *path.last()?;
+        let frame = self.dirty.bytes(lpg)?;
+        let leaf = LeafRef::new_prevalidated(frame, self.psize).ok()?;
+        let n = leaf.num_keys();
+        if n == 0 {
+            return None;
+        }
+        Some((lpg, n))
+    }
+
+    /// The finger fast path's hit test (SPEC 03 §6.6 F1). A hit needs a live
+    /// finger for `tree`, a spine that still verifies ([`finger_spine`]
+    /// (Self::finger_spine)), and `key` sorting **strictly greater** than the
+    /// leaf's last key under the tree's comparator — which is APPEND's §6.3
+    /// validation and, for a plain put, proof the key is absent (so
+    /// `NO_OVERWRITE` cannot fail either): one condition serves every flag
+    /// combination. On a hit `path` is loaded with the finger's frames, the
+    /// leaf `ki` set to the insertion slot (`num_keys`), and the finger stays
+    /// put — a no-split hit only appends a cell to the fingered leaf. On a
+    /// miss the finger is dropped: the normal path may restructure the tree,
+    /// and its own descent re-establishes the finger (F2).
+    fn finger_hit(&mut self, tree: TreeId, key: &[u8], path: &mut Path) -> bool {
+        let Some(i) = self.finger_pos(tree) else {
+            return false;
+        };
+        let hit = (|| {
+            // Cheapest test first: a key that does not sort after the
+            // fingered leaf's last key misses without the spine walk, so a
+            // random put pays one leaf view and one compare. This read proves
+            // nothing on its own (the frame may since belong to another
+            // tree); the spine walk below is what makes a hit correct.
+            let (lpg, _) = *self.fingers[i].path.last()?;
+            let frame = self.dirty.bytes(lpg)?;
+            let leaf = LeafRef::new_prevalidated(frame, self.psize).ok()?;
+            let n = leaf.num_keys();
+            if n == 0
+                || self.tree_comparator(tree).compare(key, leaf.key(n - 1)) != Ordering::Greater
+            {
+                return None;
+            }
+            let rec = *self.record(tree);
+            let (spine_lpg, spine_n) = self.finger_spine(&rec, &self.fingers[i].path)?;
+            debug_assert_eq!((spine_lpg, spine_n), (lpg, n));
+            Some(n)
+        })();
+        match hit {
+            Some(n) => {
+                path.clear();
+                path.extend_from_slice(&self.fingers[i].path);
+                path.last_mut().expect("finger path is non-empty").1 = n;
+                true
+            }
+            None => {
+                self.fingers.swap_remove(i);
+                false
+            }
+        }
+    }
+
+    /// Establish `tree`'s finger from a just-completed insert (SPEC 03 §6.6
+    /// F2). `path` is the op's final descent — fully touched, so every frame
+    /// is dirty — and `before` the tree's record from before the mutation.
+    /// The finger is set only when the op provably left `path` as the right
+    /// spine: no depth or page count moved (no split — a split relocates the
+    /// rightmost leaf and leaves `path`'s frames stale), the inserted slot is
+    /// the leaf's last (an end-of-tree insert), and the spine re-verifies
+    /// frame by frame. Anything unprovable establishes nothing: the next
+    /// qualifying put pays its one descent and tries again. Check order is
+    /// cheapest-first so a random put pays two record compares and one leaf
+    /// slot check, not the spine walk.
+    fn finger_consider(&mut self, tree: TreeId, path: &[(u64, usize)], before: &DBRecord) {
+        if tree == TreeId::Free {
+            // Deliberately unfingered: the GC tree is written almost solely
+            // inside `freelist_save`, whose rewrite/delete interleaving would
+            // invalidate a finger at every step — cost without a consumer.
+            return;
+        }
+        let rec = *self.record(tree);
+        if rec.depth != before.depth
+            || rec.leaf_pages != before.leaf_pages
+            || rec.branch_pages != before.branch_pages
+        {
+            return;
+        }
+        let Some((_, n)) = self.finger_spine(&rec, path) else {
+            return;
+        };
+        let (_, ki) = *path.last().expect("finger_spine rejected an empty path");
+        if ki + 1 != n {
+            return; // not an end-of-tree insert
+        }
+        debug_assert!(
+            self.finger_pos(tree).is_none(),
+            "establishing over a live finger (op entry must have dropped it)"
+        );
+        self.fingers.push(Finger {
+            tree,
+            path: path.to_vec(),
+        });
+    }
+
+    /// Mandated fast-path cross-check (SPEC 03 §6.6 F4), on **every** hit in
+    /// every debug build (tests, fuzz, stress): the normal descent for `key`
+    /// must land exactly on the finger's frames — same `(pgno, ki)` at every
+    /// level, key absent, insertion slot the one the fast path is about to
+    /// use. A finger bug fails loudly here instead of corrupting the tree.
+    #[cfg(debug_assertions)]
+    fn finger_shadow_check(&self, tree: TreeId, key: &[u8], path: &[(u64, usize)]) {
+        let (fresh, found) = self
+            .search_path(tree, key)
+            .expect("finger shadow re-descent failed");
+        assert!(!found, "finger fast path hit an existing key");
+        assert_eq!(
+            fresh.as_slice(),
+            path,
+            "finger path diverges from a fresh descent"
+        );
+    }
+
+    /// Whether `tree` keeps a rightmost-leaf finger in this txn (ADR-0015).
+    /// The GC tree never does (see [`RwTxn::finger_consider`]).
+    #[inline]
+    fn seq_writes_on(&self, tree: TreeId) -> bool {
+        match tree {
+            TreeId::Main => self.seq_main,
+            TreeId::Free => false,
+            TreeId::Named(dbi) => self.open.get(dbi).is_some_and(|t| t.seq),
+        }
+    }
+
+    /// The finger half of [`RwTxn::put_tree_flagged`] (SPEC 03 §6.6,
+    /// ADR-0015): `Some(result)` when the put took the fast path, `None` on a
+    /// miss (the finger is dropped and the caller runs the normal path, whose
+    /// descent re-establishes it). Out of line so that trees with the setting
+    /// off keep the put path's previous shape (PERF-GAP B13: the hot path
+    /// sits at LLVM's inlining threshold).
+    #[inline(never)]
+    fn put_finger(
+        &mut self,
+        tree: TreeId,
+        key: &[u8],
+        flags: PutFlags,
+        val: ValSrc<'_>,
+        node_flags: u16,
+    ) -> Option<Result<ReserveLoc>> {
+        let mut path = std::mem::take(&mut self.path_buf);
+        if !self.finger_hit(tree, key, &mut path) {
+            self.path_buf = path;
+            return None;
+        }
+        #[cfg(debug_assertions)]
+        self.finger_shadow_check(tree, key, &path);
+        let before = *self.record(tree);
+        let ki = path.last().expect("finger path is non-empty").1;
+        // The SAME leaf-insert code as the descent paths — entries and
+        // overflow_pages bookkeeping, F_BIGDATA runs, RESERVE, and the §6.4
+        // end-of-page split all included; only the descent and `touch_path`
+        // (every frame is already dirty) are skipped.
+        let res = self.insert_into_leaf(
+            tree,
+            &mut path,
+            ki,
+            key,
+            val,
+            flags.contains(PutFlags::APPEND),
+            node_flags,
+        );
+        match &res {
+            Ok(_) => {
+                sat_add(&mut self.record_mut(tree).entries, 1);
+                let after = *self.record(tree);
+                if after.depth != before.depth
+                    || after.leaf_pages != before.leaf_pages
+                    || after.branch_pages != before.branch_pages
+                {
+                    // The insert split: the fingered leaf is no longer the
+                    // rightmost one. Drop the finger; the next end insert
+                    // re-descends and re-establishes it (§6.6 F3).
+                    self.finger_invalidate(tree);
+                }
+                #[cfg(debug_assertions)]
+                {
+                    self.finger_hits += 1;
+                }
+            }
+            Err(_) => {
+                // Mid-mutation failure: poison, exactly as the descent path
+                // does (TXN-59 clean abort is the only exit).
+                self.finger_invalidate(tree);
+                self.errored = true;
+            }
+        }
+        self.path_buf = path;
+        Some(res)
+    }
+
     // -- put ------------------------------------------------------------------
 
     fn put_tree(
@@ -1314,15 +2021,30 @@ impl<'env> RwTxn<'env> {
         if val.len() as u64 > MAX_DATA_SIZE as u64 {
             return Err(Error::Mdb(MdbError::BadValSize));
         }
-        if flags.contains(PutFlags::APPEND) {
-            return self.append_tree(tree, key, val);
+        // Sequential-writes trees (ADR-0015) take the finger-aware copy of
+        // this path, out of line, so a tree with the setting off runs exactly
+        // the code it ran before the option existed plus this one branch.
+        if self.seq_writes_on(tree) {
+            return self.put_tree_seq(tree, key, flags, val, node_flags);
         }
-        let (mut path, found) = self.search_path(tree, key)?;
+        if flags.contains(PutFlags::APPEND) {
+            return self.append_tree(tree, key, val, false);
+        }
+        let mut path = std::mem::take(&mut self.path_buf);
+        let found = match self.search_path_into(tree, key, &mut path) {
+            Ok(found) => found,
+            Err(e) => {
+                self.path_buf = path;
+                return Err(e);
+            }
+        };
         if found && flags.contains(PutFlags::NO_OVERWRITE) {
             // §S2: no mutation, nothing dirtied.
+            self.path_buf = path;
             return Err(Error::Mdb(MdbError::KeyExist));
         }
         let res = self.put_apply(tree, &mut path, found, key, val, node_flags);
+        self.path_buf = path;
         if res.is_err() {
             // Mid-mutation failure (MapFull in a split cascade, corrupt page):
             // the working tree may be partial — poison the txn (TXN-59 clean
@@ -1332,9 +2054,66 @@ impl<'env> RwTxn<'env> {
         res
     }
 
+    /// [`RwTxn::put_tree_flagged`] for a tree with the sequential-writes
+    /// setting on (SPEC 03 §6.6; ADR-0015), after validation. The finger is
+    /// tested before the APPEND dispatch: a hit proves `key >` the tree's
+    /// last key, which is APPEND's §6.3 validation and (for plain puts) proof
+    /// the key is absent, so one fast path serves every flag combination. A
+    /// miss runs the same descent as the default path and establishes the
+    /// finger from it.
+    #[inline(never)]
+    fn put_tree_seq(
+        &mut self,
+        tree: TreeId,
+        key: &[u8],
+        flags: PutFlags,
+        val: ValSrc<'_>,
+        node_flags: u16,
+    ) -> Result<ReserveLoc> {
+        if let Some(res) = self.put_finger(tree, key, flags, val, node_flags) {
+            return res;
+        }
+        if flags.contains(PutFlags::APPEND) {
+            return self.append_tree(tree, key, val, true);
+        }
+        let mut path = std::mem::take(&mut self.path_buf);
+        let found = match self.search_path_into(tree, key, &mut path) {
+            Ok(found) => found,
+            Err(e) => {
+                self.path_buf = path;
+                return Err(e);
+            }
+        };
+        if found && flags.contains(PutFlags::NO_OVERWRITE) {
+            self.path_buf = path;
+            return Err(Error::Mdb(MdbError::KeyExist));
+        }
+        let before = *self.record(tree);
+        let res = self.put_apply(tree, &mut path, found, key, val, node_flags);
+        if res.is_ok() && !found {
+            // A fresh insert may have landed at the end of the tree:
+            // establish the finger from this descent (§6.6 F2).
+            self.finger_consider(tree, &path, &before);
+        }
+        self.path_buf = path;
+        if res.is_err() {
+            self.errored = true;
+        }
+        res
+    }
+
     /// APPEND (§6.3): compare against the **last** key only; the cursor/search
     /// position is irrelevant. Equal-to-last is `KeyExist`, not an overwrite.
-    fn append_tree(&mut self, tree: TreeId, key: &[u8], val: ValSrc<'_>) -> Result<ReserveLoc> {
+    ///
+    /// `seq` is the tree's sequential-writes setting (ADR-0015): when on, a
+    /// successful append establishes the rightmost-leaf finger.
+    fn append_tree(
+        &mut self,
+        tree: TreeId,
+        key: &[u8],
+        val: ValSrc<'_>,
+        seq: bool,
+    ) -> Result<ReserveLoc> {
         if self.record(tree).root == PGNO_INVALID {
             let res = self.insert_first(tree, key, val, 0);
             match res {
@@ -1343,14 +2122,29 @@ impl<'env> RwTxn<'env> {
             }
             return res;
         }
-        let (mut path, last_key) = self.rightmost_path(tree)?;
-        // M2.4: "strictly greater than the last key" is decided by the target
-        // tree's ordering, not memcmp — otherwise APPEND on a custom-comparator
-        // DB would reject exactly the keys it should accept.
-        if self.tree_comparator(tree).compare(key, &last_key) != std::cmp::Ordering::Greater {
-            return Err(Error::Mdb(MdbError::KeyExist));
-        }
-        let res = self.append_apply(tree, &mut path, key, val);
+        let mut path = std::mem::take(&mut self.path_buf);
+        let res = match self.rightmost_path_into(tree, key, &mut path) {
+            Ok(true) if seq => {
+                let before = *self.record(tree);
+                let res = self.append_apply(tree, &mut path, key, val);
+                if res.is_ok() {
+                    // A fully-touched right-spine descent that did not split
+                    // is exactly the finger invariant (§6.6 F2).
+                    self.finger_consider(tree, &path, &before);
+                }
+                res
+            }
+            Ok(true) => self.append_apply(tree, &mut path, key, val),
+            Ok(false) => {
+                self.path_buf = path;
+                return Err(Error::Mdb(MdbError::KeyExist));
+            }
+            Err(e) => {
+                self.path_buf = path;
+                return Err(e);
+            }
+        };
+        self.path_buf = path;
         if res.is_err() {
             self.errored = true;
         }
@@ -1672,9 +2466,11 @@ impl<'env> RwTxn<'env> {
             let sep = key.to_vec(); // sep = first key of R = the new key (§6.4)
             return if top == 0 {
                 self.insert_into_branch(tree, path, -1, 0, sep, rpg)
+                    .map(|_| ())
             } else {
                 let at = path[top - 1].1 + 1;
                 self.insert_into_branch(tree, path, top as isize - 1, at, sep, rpg)
+                    .map(|_| ())
             };
         }
 
@@ -1706,11 +2502,14 @@ impl<'env> RwTxn<'env> {
         self.pack_leaf_range(rpg, &oldleaf, newindx, key, &val, node_flags, s, total)?;
         drop(old);
         sat_add(&mut self.record_mut(tree).leaf_pages, 1);
+        // The split flag only matters to a kept delete path; puts discard it.
         if top == 0 {
             self.insert_into_branch(tree, path, -1, 0, sep, rpg)
+                .map(|_| ())
         } else {
             let at = path[top - 1].1 + 1;
             self.insert_into_branch(tree, path, top as isize - 1, at, sep, rpg)
+                .map(|_| ())
         }
     }
 
@@ -1766,7 +2565,9 @@ impl<'env> RwTxn<'env> {
 
     /// Insert `(key -> child)` at index `at` of the branch at `path[level]`,
     /// splitting recursively (§6.5) up to a root split (§9 grow) at
-    /// `level < 0`.
+    /// `level < 0`. Returns whether any page split (or the root grew) on the
+    /// way — the signal that a kept cursor path can no longer be proven
+    /// correct (SPEC 03 §5.4a).
     fn insert_into_branch(
         &mut self,
         tree: TreeId,
@@ -1775,7 +2576,7 @@ impl<'env> RwTxn<'env> {
         at: usize,
         key: Vec<u8>,
         child: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         if level < 0 {
             // Root split (§9): new root branch over (old root, risen key).
             let old_root = path[0].0;
@@ -1792,7 +2593,7 @@ impl<'env> RwTxn<'env> {
             rec.root = np;
             rec.depth = rec.depth.saturating_add(1);
             sat_add(&mut rec.branch_pages, 1);
-            return Ok(());
+            return Ok(true);
         }
         let lvl = level as usize;
         debug_assert!(at >= 1, "branch inserts never target node 0");
@@ -1804,7 +2605,7 @@ impl<'env> RwTxn<'env> {
                 .insert(at, &key, child)
         };
         match r {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(false),
             Err(PageError::PageFull { .. }) => self.split_branch(tree, path, lvl, at, key, child),
             Err(e) => Err(corrupt(e)),
         }
@@ -1812,7 +2613,8 @@ impl<'env> RwTxn<'env> {
 
     /// Branch split (§6.5): the median rises and is **removed from both
     /// children** — the right page's node 0 keeps the rising key's child under
-    /// the empty separator.
+    /// the empty separator. Always returns `true` (it *is* a split), after
+    /// propagating the rising key.
     fn split_branch(
         &mut self,
         tree: TreeId,
@@ -1821,7 +2623,7 @@ impl<'env> RwTxn<'env> {
         at: usize,
         key: Vec<u8>,
         child: u64,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let (ppg, _) = path[lvl];
         let mut cells = self.extract_branch_cells(ppg)?;
         cells.insert(at, OwnedBranchCell { key, child });
@@ -1845,11 +2647,12 @@ impl<'env> RwTxn<'env> {
         self.write_branch_frame(rpg, &right)?;
         sat_add(&mut self.record_mut(tree).branch_pages, 1);
         if lvl == 0 {
-            self.insert_into_branch(tree, path, -1, 0, rising, rpg)
+            self.insert_into_branch(tree, path, -1, 0, rising, rpg)?;
         } else {
             let at2 = path[lvl - 1].1 + 1;
-            self.insert_into_branch(tree, path, lvl as isize - 1, at2, rising, rpg)
+            self.insert_into_branch(tree, path, lvl as isize - 1, at2, rising, rpg)?;
         }
+        Ok(true)
     }
 
     // -- delete + rebalance (§7/§10, §9 shrink) --------------------------------
@@ -1859,14 +2662,34 @@ impl<'env> RwTxn<'env> {
         // Read-side key leniency (§2.1): an oversized key simply finds
         // nothing (`Ok(false)`); the empty-key `BadValSize` is an API-boundary
         // concern (oracle adapter / heed adapter).
-        let (mut path, found) = self.search_path(tree, key)?;
-        if !found {
-            return Ok(false);
-        }
-        match self.delete_apply(tree, &mut path) {
-            Ok(()) => {
+        let mut path = std::mem::take(&mut self.path_buf);
+        let res = match self.search_path_into(tree, key, &mut path) {
+            // The path is transient here, so its fate is irrelevant.
+            Ok(true) => self.delete_at_path(tree, &mut path).map(|_| true),
+            other => other,
+        };
+        self.path_buf = path;
+        res
+    }
+
+    /// Delete the entry `path` already points at, skipping the descent
+    /// `delete_tree` would do (SPEC 03 §5.4a). Returns the path's
+    /// [`PathFate`], which tells a parked cursor whether its path survived
+    /// (possibly repaired) or must be discarded.
+    ///
+    /// `path` MUST be the live root-to-leaf path to an existing entry of
+    /// `tree`: either fresh from [`search_path`](Self::search_path), or a
+    /// cursor's parked path over an unmutated tree (the `Cursor::resume`
+    /// contract). It is rewritten in place as pages are COWed and as the
+    /// rebalance repairs it.
+    fn delete_at_path(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<PathFate> {
+        self.guard_ok()?;
+        // Any delete can restructure the right spine (SPEC 03 §6.6 F3).
+        self.finger_invalidate(tree);
+        match self.delete_apply(tree, path) {
+            Ok(fate) => {
                 sat_sub(&mut self.record_mut(tree).entries, 1);
-                Ok(true)
+                Ok(fate)
             }
             Err(e) => {
                 self.errored = true;
@@ -1875,7 +2698,8 @@ impl<'env> RwTxn<'env> {
         }
     }
 
-    fn delete_apply(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<()> {
+    /// Returns [`rebalance`](Self::rebalance)'s [`PathFate`].
+    fn delete_apply(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<PathFate> {
         self.touch_path(tree, path)?;
         let (lpg, ki) = *path.last().expect("non-empty path");
         let big = {
@@ -1899,7 +2723,228 @@ impl<'env> RwTxn<'env> {
                 .map_err(corrupt)?;
         }
         let top = path.len() - 1;
-        self.rebalance(tree, path, top)
+        self.rebalance(tree, path, top, false)
+    }
+
+    /// One leaf step of `Database::delete_range` (SPEC 00 row 37; SPEC 03,
+    /// delete_range note): descend to `first` — a key the caller just read from this
+    /// tree's range, so it exists and is covered by both bounds — splice the
+    /// whole covered span of its leaf out in one compaction, and rebalance
+    /// that leaf once. Returns the number of entries deleted and, when the
+    /// span ran to the leaf's end (covered keys may remain in later leaves),
+    /// the last deleted key for the caller to resume strictly after; `None`
+    /// means the span stopped at the upper bound and the walk is done. The
+    /// third element is the walk's deferred-rebalance anchor, when this leaf
+    /// kept survivors in front of the span (see the body).
+    fn delete_range_leaf(
+        &mut self,
+        tree: TreeId,
+        first: &[u8],
+        upper: std::ops::Bound<&[u8]>,
+    ) -> Result<LeafSpan> {
+        self.guard_ok()?;
+        // The splice and its rebalance can restructure the right spine
+        // (SPEC 03 §6.6 F3).
+        self.finger_invalidate(tree);
+        let mut path = std::mem::take(&mut self.path_buf);
+        let res = self.delete_range_leaf_inner(tree, first, upper, &mut path);
+        self.path_buf = path;
+        res
+    }
+
+    /// [`delete_range_leaf`](Self::delete_range_leaf) body, split out so the
+    /// path buffer is restored on every exit.
+    fn delete_range_leaf_inner(
+        &mut self,
+        tree: TreeId,
+        first: &[u8],
+        upper: std::ops::Bound<&[u8]>,
+        path: &mut Path,
+    ) -> Result<LeafSpan> {
+        use std::ops::Bound;
+        let found = self.search_path_into(tree, first, path)?;
+        // `first` was read from this txn's own tree with no mutation in
+        // between, so the descent lands on it; degrade to "walk done" rather
+        // than mutate anything if it somehow does not.
+        debug_assert!(found, "delete_range re-descent lost the key it just read");
+        let Some(&(lpg, start)) = path.last() else {
+            return Ok((0, None, None));
+        };
+        // Scan the covered span `[start, end)` and collect its overflow runs
+        // on the untouched leaf; COW happens once the span is known.
+        let (end, bigs, last, anchor) = {
+            let cmp = self.tree_comparator(tree);
+            let leaf = match node_view(self.source(), self.psize, lpg, Some(&self.validated))
+                .map_err(corrupt)?
+            {
+                NodeView::Leaf(l) => l,
+                NodeView::Branch(_) => return Err(Error::Mdb(MdbError::Invalid)),
+            };
+            let nkeys = leaf.num_keys();
+            let mut bigs: Vec<(u64, u64)> = Vec::new();
+            let mut end = start;
+            while end < nkeys {
+                let key = leaf.key(end);
+                // The exact upper-bound test `RoRange` terminates on, under
+                // the tree's ordering (SPEC 03 §2.0) — anything else would
+                // stop the splice at a different entry than the per-entry
+                // walk this replaces.
+                let covered = match upper {
+                    Bound::Unbounded => true,
+                    Bound::Included(h) => cmp.compare(key, h) != Ordering::Greater,
+                    Bound::Excluded(h) => cmp.compare(key, h) == Ordering::Less,
+                };
+                if !covered {
+                    break;
+                }
+                if let LeafValue::Overflow { head_pgno, dsize } = leaf.value(end) {
+                    bigs.push((head_pgno, overflow_page_count(dsize as u64, self.psize)));
+                }
+                end += 1;
+            }
+            if end == start {
+                // Unreachable when `found` (the caller's range test proved
+                // `first` covered); bail without mutating rather than splice
+                // an empty span.
+                debug_assert!(!found, "a found first key must be covered");
+                return Ok((0, None, None));
+            }
+            // Only a span that ran to the leaf's end can leave covered keys
+            // in later leaves (every key between two leaf boundaries lives in
+            // this leaf); a mid-leaf stop hit the upper bound.
+            let last = (end == nkeys).then(|| leaf.key(end - 1).to_vec());
+            // Uncovered survivors in front of the span (`start > 0`) only
+            // exist on the walk's first leaf: every later `first` is the
+            // smallest key past the previous leaf's last deleted key, so
+            // nothing uncovered can sit before it. When the walk continues
+            // past this leaf, its rebalance is deferred to the end of the
+            // walk (`anchor` = the survivor just before the span): rebalanced
+            // now, a below-threshold boundary leaf would borrow the next
+            // leaf's still-covered entries back one separator rewrite at a
+            // time, and the walk would re-delete each of them. Deferring is
+            // sound: the survivors keep the leaf non-empty (INV-8 holds), and
+            // the fill threshold is a delete-time trigger, not a committed
+            // invariant (SPEC 03 §11 INV-8).
+            let anchor = (start > 0 && last.is_some()).then(|| leaf.key(start - 1).to_vec());
+            (end, bigs, last, anchor)
+        };
+        let run = (end - start) as u64;
+        // Mutation phase: a failure past this point leaves partially-applied
+        // structure, so it poisons the txn exactly as `delete_at_path` does.
+        match self.delete_span_apply(tree, path, start, end, &bigs, anchor.is_none()) {
+            Ok(()) => {
+                sat_sub(&mut self.record_mut(tree).entries, run);
+                Ok((run, last, anchor))
+            }
+            Err(e) => {
+                self.errored = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// The delete_range walk's one deferred rebalance (SPEC 03, delete_range
+    /// note): the range-start leaf kept its uncovered survivors but may sit
+    /// below the fill threshold now that the walk is done. `anchor` is one of
+    /// those survivors; re-descend to it and rebalance its (possibly
+    /// since-merged) leaf through the ordinary §10 path — by now every
+    /// right neighbor is a survivor too, so this borrows or merges once.
+    fn delete_range_settle(&mut self, tree: TreeId, anchor: &[u8]) -> Result<()> {
+        self.guard_ok()?;
+        // The deferred rebalance can borrow/merge (SPEC 03 §6.6 F3).
+        self.finger_invalidate(tree);
+        let mut path = std::mem::take(&mut self.path_buf);
+        let res = (|| {
+            let found = self.search_path_into(tree, anchor, &mut path)?;
+            debug_assert!(found, "deferred-rebalance anchor is a survivor");
+            if path.is_empty() {
+                return Ok(());
+            }
+            // The leaf is already dirty from its splice, so this COWs
+            // nothing new; `rebalance` requires a touched path.
+            self.touch_path(tree, &mut path)?;
+            let top = path.len() - 1;
+            self.rebalance(tree, &mut path, top, true).map(|_| ())
+        })();
+        self.path_buf = path;
+        if res.is_err() {
+            // Same poisoning as the splice: the walk's structure is applied.
+            self.errored = true;
+        }
+        res
+    }
+
+    /// Apply one `delete_range` leaf splice — the bulk sibling of
+    /// [`delete_apply`](Self::delete_apply): COW the path (§5.3), free the
+    /// span's overflow runs (§8), remove cells `[start, end)` in one
+    /// compaction, and — unless the walk deferred it — rebalance the leaf
+    /// once (§10). The caller adjusts `entries` and poisons the txn on
+    /// error. The rebalance's [`PathFate`] is dropped: the walk re-descends
+    /// from the last deleted key instead of trusting a repaired path across
+    /// leaves.
+    fn delete_span_apply(
+        &mut self,
+        tree: TreeId,
+        path: &mut [(u64, usize)],
+        start: usize,
+        end: usize,
+        bigs: &[(u64, u64)],
+        do_rebalance: bool,
+    ) -> Result<()> {
+        self.touch_path(tree, path)?;
+        let (lpg, _) = *path.last().expect("non-empty path");
+        let mut freed = 0u64;
+        for &(head, npages) in bigs {
+            self.free_run(head, npages);
+            freed += npages;
+        }
+        if freed != 0 {
+            sat_sub(&mut self.record_mut(tree).overflow_pages, freed);
+        }
+        {
+            let frame = self.dirty.bytes_mut(lpg).expect("leaf touched");
+            LeafMut::from_valid(frame, self.psize)
+                .map_err(corrupt)?
+                .remove_span(start, end)
+                .map_err(corrupt)?;
+        }
+        if !do_rebalance {
+            return Ok(());
+        }
+        let top = path.len() - 1;
+        self.rebalance(tree, path, top, true).map(|_| ())
+    }
+
+    /// Debug shadow check for a kept cursor path (SPEC 03 §5.4a): after a
+    /// delete keeps (or repairs) the parked path, that path must be identical
+    /// to a fresh root-to-leaf descent for the deleted key — same `pgno` and
+    /// `ki` at every level, with the key absent and its insertion slot the
+    /// vacated one — and the vacated slot, when live, must hold a strictly
+    /// greater key (the successor). Runs in every debug build (tests, fuzz,
+    /// stress), so a repair bug fails loudly instead of silently skipping or
+    /// repeating entries in a cursor drain.
+    #[cfg(debug_assertions)]
+    fn shadow_check_kept_path(&self, tree: TreeId, kept: &[(u64, usize)], deleted_key: &[u8]) {
+        let (fresh, found) = self
+            .search_path(tree, deleted_key)
+            .expect("shadow re-descent failed on a kept path");
+        assert!(!found, "deleted key still present after del_current");
+        assert_eq!(
+            fresh.as_slice(),
+            kept,
+            "kept cursor path diverges from a fresh descent for the deleted key"
+        );
+        let (lpg, ki) = *kept.last().expect("kept path is non-empty");
+        let frame = self.dirty.bytes(lpg).expect("kept path leaf is dirty");
+        let leaf = LeafRef::new_prevalidated(frame, self.psize).expect("kept leaf decodes");
+        if ki < leaf.num_keys() {
+            assert_eq!(
+                self.tree_comparator(tree)
+                    .compare(leaf.key(ki), deleted_key),
+                Ordering::Greater,
+                "vacated slot does not hold the deleted key's successor"
+            );
+        }
     }
 
     /// `(is_leaf, num_keys, used_bytes)` of the dirty page at `pgno`.
@@ -1924,8 +2969,24 @@ impl<'env> RwTxn<'env> {
 
     /// §10 rebalance at `path[level]` after a delete/merge: root shrink at the
     /// root (§9); otherwise, when below threshold, borrow from (or merge with)
-    /// a sibling, recursing upward on merge.
-    fn rebalance(&mut self, tree: TreeId, path: &mut [(u64, usize)], level: usize) -> Result<()> {
+    /// a sibling, recursing upward on merge. `empty_leaf_merges` is
+    /// `delete_range`'s walk mode (SPEC 03 §10 empty-page rule): an emptied
+    /// leaf takes the merge arm outright instead of borrowing; every other
+    /// delete path passes `false` and keeps the historical neighbor policy
+    /// bit-for-bit (the churn-flatness pins depend on it).
+    /// Returns the [`PathFate`] of `path` (SPEC 03 §5.4a): `Unchanged` when
+    /// the delete only removed a cell from its leaf; `Kept`/`KeptShrunk` when
+    /// the shape changed through the leftmost pairing (child 0 + its RIGHT
+    /// sibling) and every frame was repaired in place; `Invalidated` for the
+    /// left pairing, for any ancestor split during a separator rewrite, and
+    /// for anything else this table does not prove.
+    fn rebalance(
+        &mut self,
+        tree: TreeId,
+        path: &mut [(u64, usize)],
+        level: usize,
+        empty_leaf_merges: bool,
+    ) -> Result<PathFate> {
         let (pgno, _) = path[level];
         let (is_leaf, nkeys, used) = self.page_stats(pgno)?;
         let body = body_size(self.psize);
@@ -1937,6 +2998,8 @@ impl<'env> RwTxn<'env> {
                 rec.root = PGNO_INVALID;
                 rec.depth = 0;
                 sat_sub(&mut rec.leaf_pages, 1);
+                // The tree is empty: the path names a freed page.
+                return Ok(PathFate::Invalidated);
             } else if !is_leaf && nkeys == 1 {
                 let child = {
                     let frame = self.dirty.bytes(pgno).expect("root is dirty");
@@ -1949,8 +3012,14 @@ impl<'env> RwTxn<'env> {
                 rec.root = child;
                 rec.depth = rec.depth.saturating_sub(1);
                 sat_sub(&mut rec.branch_pages, 1);
+                // The surviving child is the root's only (0th) child, which
+                // is exactly the path's next frame: popping frame 0 repairs
+                // the path (SPEC 03 §5.4a root-shrink row).
+                debug_assert_eq!(path[0].1, 0, "single-child root descends via 0");
+                debug_assert_eq!(child, path[1].0, "new root is the path's frame 1");
+                return Ok(PathFate::KeptShrunk);
             }
-            return Ok(());
+            return Ok(PathFate::Unchanged);
         }
         // §10 thresholds: leaf = 25 % fill (FILL_THRESHOLD) or below min_keys;
         // branch = below min_keys (2 children) — its fill threshold is
@@ -1961,7 +3030,7 @@ impl<'env> RwTxn<'env> {
             nkeys < MIN_KEYS_BRANCH
         };
         if !below {
-            return Ok(());
+            return Ok(PathFate::Unchanged);
         }
         let (ppg, pki) = path[level - 1];
         let parent_nkeys = {
@@ -1973,7 +3042,7 @@ impl<'env> RwTxn<'env> {
         if parent_nkeys < 2 {
             // Cannot happen on an INV-8-conforming tree; degrade gracefully.
             debug_assert!(false, "parent branch with < 2 children mid-rebalance");
-            return Ok(());
+            return Ok(PathFate::Unchanged);
         }
         // §10 sibling choice: leftmost child pairs with its right neighbor;
         // every other child pairs with its left neighbor.
@@ -2000,20 +3069,55 @@ impl<'env> RwTxn<'env> {
             return Err(Error::Mdb(MdbError::Invalid));
         }
         let can_borrow = if is_leaf {
-            s_nkeys > MIN_KEYS_LEAF && s_used * 1000 >= body * FILL_THRESHOLD_PERMILLE as usize
+            // Walk mode (§10 empty-page rule): a leaf `delete_range` emptied
+            // is never borrowed into. Forcing the merge arm reproduces the
+            // tree LMDB's `mdb_rebalance` leaves after *unlinking* an empty
+            // page — one surviving page of the pair under the parent — and it
+            // always fits (nothing + sibling <= one page). Borrowing here
+            // would leave the pair standing and trickle a fully-covered
+            // right sibling across, one separator rewrite per entry.
+            !(empty_leaf_merges && nkeys == 0)
+                && s_nkeys > MIN_KEYS_LEAF
+                && s_used * 1000 >= body * FILL_THRESHOLD_PERMILLE as usize
         } else {
             s_nkeys > MIN_KEYS_BRANCH
         };
         if can_borrow {
-            self.borrow_entry(tree, path, level, sib, fromleft, is_leaf)
+            let split = self.borrow_entry(tree, path, level, sib, fromleft, is_leaf)?;
+            // Right-sibling borrow (SPEC 03 §5.4a repair table): P keeps its
+            // pgno, the moved entry is appended after the vacated slot, and
+            // the parent's child 0 does not move — every frame is already
+            // correct. A separator split rewrites ancestors this table does
+            // not follow (and a root grow adds a frame), so it invalidates;
+            // so does the left pairing, whose rules this step does not
+            // implement.
+            Ok(if fromleft || split {
+                PathFate::Invalidated
+            } else {
+                PathFate::Kept
+            })
         } else {
             self.merge_pages(tree, path, level, sib, fromleft, is_leaf)?;
-            self.rebalance(tree, path, level - 1)
+            // Right-sibling merge (right into left = P): P keeps its pgno and
+            // the appended cells land at or after the vacated slot, so the
+            // slot still names the successor; the parent loses child 1 only.
+            // A left-pairing merge moves the path onto the sibling
+            // (`merge_pages` repairs it for the recursion, not for the
+            // cursor), and an empty right sibling (hostile image) would leave
+            // the vacated slot past a possibly-empty leaf — both invalidate.
+            let here = if fromleft || s_nkeys == 0 {
+                PathFate::Invalidated
+            } else {
+                PathFate::Kept
+            };
+            let parent = self.rebalance(tree, path, level - 1, empty_leaf_merges)?;
+            Ok(here.and(parent))
         }
     }
 
     /// §10 BORROW (`node_move`): move the boundary entry from the fuller
-    /// sibling and rewrite the parent separator.
+    /// sibling and rewrite the parent separator. Returns whether the separator
+    /// rewrite split an ancestor (the kept-path invalidation signal).
     fn borrow_entry(
         &mut self,
         tree: TreeId,
@@ -2022,7 +3126,7 @@ impl<'env> RwTxn<'env> {
         sib: u64,
         fromleft: bool,
         is_leaf: bool,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let (pg, _) = path[level];
         let (_, pki) = path[level - 1];
         let psize = self.psize;
@@ -2199,6 +3303,7 @@ impl<'env> RwTxn<'env> {
     /// Rewrite the parent separator for `child_idx` (never node 0): remove the
     /// old node and re-insert with the new key through the generic branch
     /// insert, which splits the parent if the longer key no longer fits.
+    /// Returns [`insert_into_branch`](Self::insert_into_branch)'s split flag.
     fn update_parent_key(
         &mut self,
         tree: TreeId,
@@ -2206,7 +3311,7 @@ impl<'env> RwTxn<'env> {
         parent_level: usize,
         child_idx: usize,
         new_key: Vec<u8>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         debug_assert!(child_idx >= 1, "node 0's separator is always empty");
         let (ppg, _) = path[parent_level];
         let child = {
@@ -2303,11 +3408,38 @@ impl<'env> RwTxn<'env> {
     /// its catalog entry is rewritten empty at commit; the entry itself stays.
     fn clear_tree(&mut self, tree: TreeId) -> Result<()> {
         self.guard_ok()?;
+        // Every page of the tree is about to be freed (SPEC 03 §6.6 F3; the
+        // `free_page` hook would also catch each fingered page one by one).
+        self.finger_invalidate(tree);
         let rec = *self.record(tree);
         if rec.root != PGNO_INVALID {
             let mut pages = Vec::new();
             let mut runs = Vec::new();
-            let res = self.collect_tree(rec.root, rec.depth, &mut pages, &mut runs);
+            // Leaf-skipping fast path (SPEC 02 §6.1, LMDB `mdb_drop0`): a tree
+            // whose record says it has no overflow pages frees its leaf pgnos
+            // straight from the lowest branch level, never reading the leaves.
+            // Any overflow forces the full walk, which reads every leaf to
+            // find the runs.
+            let res = if rec.overflow_pages == 0 {
+                let mut r =
+                    self.collect_tree_skip_leaves(rec.root, rec.depth, &mut pages, &mut runs);
+                if r.is_ok() {
+                    // The unread leaves were never loaded, so a hostile image
+                    // aliasing one pgno under several branch pointers would
+                    // free it twice (the full walk double-frees such a page
+                    // too, but only after loading it). Refuse the whole clear
+                    // instead — nothing has been freed yet.
+                    let mut sorted = pages.clone();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    if sorted.len() != pages.len() {
+                        r = Err(Error::Mdb(MdbError::Invalid));
+                    }
+                }
+                r
+            } else {
+                self.collect_tree(rec.root, rec.depth, &mut pages, &mut runs)
+            };
             if let Err(e) = res {
                 self.errored = true;
                 return Err(e);
@@ -2332,6 +3464,8 @@ impl<'env> RwTxn<'env> {
     /// (append-only; see [`crate::env`] `NamedRegistry`).
     fn drop_database(&mut self, sel: DbSel) -> Result<()> {
         self.guard_ok()?;
+        // TXN-68: the main DB's arm does not pass through `ensure_open`.
+        self.maybe_spill()?;
         match sel {
             DbSel::Main => self.clear_tree(TreeId::Main),
             DbSel::Named(dbi) => {
@@ -2339,7 +3473,7 @@ impl<'env> RwTxn<'env> {
                 self.clear_tree(tree)?;
                 let name = self
                     .open
-                    .get(&dbi)
+                    .get(dbi)
                     .expect("named record loaded")
                     .name
                     .clone();
@@ -2348,7 +3482,7 @@ impl<'env> RwTxn<'env> {
                 debug_assert!(existed, "dropped named DB had no catalog entry");
                 // The DB no longer exists this txn: drop its working record so
                 // `flush_catalog` does not re-create it.
-                self.open.remove(&dbi);
+                self.open.remove(dbi);
                 Ok(())
             }
         }
@@ -2362,6 +3496,8 @@ impl<'env> RwTxn<'env> {
     /// abort discards it with the dirty set.
     fn create_named(&mut self, dbi: u32, name: &[u8]) -> Result<()> {
         self.guard_ok()?;
+        // TXN-68: creating a DB inserts a catalog record (a main-tree put).
+        self.maybe_spill()?;
         enum Cat {
             Missing,
             SubDb(DBRecord),
@@ -2385,10 +3521,12 @@ impl<'env> RwTxn<'env> {
         match cat {
             Cat::Collision => Err(Error::Mdb(MdbError::Incompatible)),
             Cat::SubDb(rec) => {
-                self.open.entry(dbi).or_insert_with(|| NamedTree {
+                let seq = self.env.inner().sequential_writes_for(Some(dbi));
+                self.open.slot(dbi).get_or_insert_with(|| NamedTree {
                     name: name.into(),
                     rec,
                     dirty: false,
+                    seq,
                 });
                 Ok(())
             }
@@ -2413,6 +3551,7 @@ impl<'env> RwTxn<'env> {
                         name: name.into(),
                         rec: empty,
                         dirty: false,
+                        seq: self.env.inner().sequential_writes_for(Some(dbi)),
                     },
                 );
                 Ok(())
@@ -2493,6 +3632,78 @@ impl<'env> RwTxn<'env> {
         }
     }
 
+    /// Leaf-skipping variant of [`collect_tree`](Self::collect_tree) for a
+    /// tree whose record says `overflow_pages == 0` (SPEC 02 §6.1, LMDB
+    /// `mdb_drop0`): branch pages are read as before, but the children of the
+    /// lowest branch level — and a root-is-leaf root — are collected WITHOUT
+    /// loading the leaf pages, so `clear`/`drop` reads only the branches.
+    ///
+    /// An unread pgno bypasses the loader's own bounds check, so it is
+    /// classified here before it may reach the free list: it must be dirty in
+    /// this txn (a this-txn allocation, legitimately past the committed
+    /// high-water) or lie in `[FIRST_DATA_PGNO, committed_last_pg]`. Anything
+    /// else — a meta slot (0/1) or a pgno past the committed high-water —
+    /// gets the same typed `Invalid` the full walk's loader returns, and the
+    /// caller then frees nothing (collect-before-free). What is NOT checked is
+    /// the page's type: a corrupt record that understates the depth frees the
+    /// mis-typed page (in-bounds, so non-corrupting) and leaks its subtree,
+    /// where the full walk returned `Invalid`.
+    fn collect_tree_skip_leaves(
+        &self,
+        pgno: u64,
+        level: u16,
+        pages: &mut Vec<u64>,
+        runs: &mut Vec<(u64, u64)>,
+    ) -> Result<()> {
+        if level == 0 {
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
+        // Hostile-depth guard, exactly as `collect_tree`.
+        if level as usize > crate::btree::CURSOR_STACK {
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
+        if level == 1 {
+            // The leaf level: bound-check (see above), collect unread.
+            // Committed leaves (the common case) answer on the range test;
+            // the spilled-set lookup runs only for this-txn pages.
+            if (FIRST_DATA_PGNO..=self.committed_last_pg).contains(&pgno)
+                || self.dirty.contains(pgno)
+                || self.dirty.spilled_pages(pgno).is_some()
+            {
+                pages.push(pgno);
+                return Ok(());
+            }
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
+        let page = self.load(pgno)?;
+        match page.page_type() {
+            PageType::Branch => {
+                let br = branch_view(self.source(), self.psize, pgno, Some(&self.validated))
+                    .map_err(corrupt)?;
+                for i in 0..br.num_keys() {
+                    self.collect_tree_skip_leaves(br.child_pgno(i), level - 1, pages, runs)?;
+                }
+                pages.push(pgno);
+                Ok(())
+            }
+            // A leaf above the leaf level (ragged — only a hostile image):
+            // handled exactly as the full walk handles a loaded leaf — scan
+            // it for overflow refs and collect the page itself.
+            PageType::Leaf => {
+                let leaf = leaf_view(self.source(), self.psize, pgno, Some(&self.validated))
+                    .map_err(corrupt)?;
+                for i in 0..leaf.num_keys() {
+                    if let LeafValue::Overflow { head_pgno, dsize } = leaf.value(i) {
+                        runs.push((head_pgno, overflow_page_count(dsize as u64, self.psize)));
+                    }
+                }
+                pages.push(pgno);
+                Ok(())
+            }
+            _ => Err(Error::Mdb(MdbError::Invalid)),
+        }
+    }
+
     // -- commit pipeline (SPEC 04 §9 TXN-61..64, SPEC 06 §2 REC-6/7) -----------
 
     /// Whether this txn changed nothing observable (no dirty pages, no frees,
@@ -2500,6 +3711,7 @@ impl<'env> RwTxn<'env> {
     /// no meta write, no txnid consumption (LMDB parity).
     fn is_unchanged(&self) -> bool {
         self.dirty.is_empty()
+            && !self.dirty.has_spills()
             && self.freed.is_empty()
             && self.loose.is_empty()
             && self.drains.is_empty()
@@ -2514,9 +3726,11 @@ impl<'env> RwTxn<'env> {
     }
 
     /// GC-10 trailing shrink: loose pages that are the highest-numbered pages
-    /// of the file and were never written (nothing is written before C2, so
-    /// every loose page qualifies) are dropped and `next_pgno` rolls back past
-    /// them, so the file does not grow by holes at its tail.
+    /// of the file are dropped and `next_pgno` rolls back past them, so the
+    /// file does not grow by holes at its tail. A loose page may have been
+    /// written by a spill before it was freed (SPEC 04 §6.3a); dropping it
+    /// then leaves unreferenced bytes past the new high-water, which TXN-70
+    /// allows (the file may keep a grown, unreferenced tail).
     fn release_trailing_loose(&mut self) {
         if self.loose.is_empty() {
             return;
@@ -2628,7 +3842,7 @@ impl<'env> RwTxn<'env> {
         // across the whole save are bounded by (initial entries) + (total
         // pool ids) + slack. A regression confined to the inner loop panics
         // loudly instead of hanging.
-        let inner_budget = pending.len() + self.drains.values().map(Vec::len).sum::<usize>() + 16;
+        let inner_budget = pending.len() + self.drains.values().map(Drain::len).sum::<usize>() + 16;
         let mut inner_iters = 0usize;
         // (b) GC-10 trailing shrink of ops-era loose pages, then GC-9: the
         // survivors join the freed set up front (LMDB parity — the fork's
@@ -2661,7 +3875,13 @@ impl<'env> RwTxn<'env> {
                     inner_iters <= inner_budget,
                     "freelist_save drain-rewrite loop exceeded its budget (GC-13)"
                 );
-                let remaining = self.drains.get(&f).cloned().unwrap_or_default();
+                // GC-20 rewrite payload: exactly the live remainder — the
+                // consumed prefix never reaches the tree, so the encoded PIL
+                // is identical to the drain-on-every-draw representation's.
+                let remaining: Vec<u64> = self
+                    .drains
+                    .get(&f)
+                    .map_or(Vec::new(), |d| d.live().to_vec());
                 if remaining.is_empty() {
                     self.drains.remove(&f);
                     let existed = self.delete_tree(TreeId::Free, &gc_key_encode(f))?;
@@ -2770,39 +3990,10 @@ impl<'env> RwTxn<'env> {
         // `N-1` (REC-6 H0).
 
         // ----- C2: write dirty pages, ascending pgno. Not yet durable. -----
-        // Consecutive frames are batched into one vectored write (PERF-GAP
-        // B4): a frame at `pgno` covering `n` pages (an overflow run) makes
-        // the run contiguous iff the next frame starts at `pgno + n`.
-        {
-            let backing = inner.backing_ref();
-            let mut run_start: u64 = 0;
-            let mut next_expected: u64 = 0;
-            let mut run: Vec<&[u8]> = Vec::new();
-            for pgno in self.dirty.sorted_pgnos() {
-                let data = self.dirty.bytes(pgno).expect("sorted pgno present");
-                // TXN-62: C2 may only write pages the live meta `N-1` does not
-                // reference: beyond the committed high-water (extend / loose),
-                // or GC-reclaimed under the oldest-reader gate (freed by
-                // `F ≤ oldest ≤ N-1`, hence absent from `N-1`'s trees).
-                debug_assert!(
-                    pgno > self.committed_last_pg || self.reclaimed.contains(&pgno),
-                    "TXN-62 violation: writing page {pgno} referenced by the live snapshot"
-                );
-                if !run.is_empty() && pgno != next_expected {
-                    backing.write_pages_at(run_start, psize, &run)?;
-                    run.clear();
-                }
-                if run.is_empty() {
-                    run_start = pgno;
-                    next_expected = pgno;
-                }
-                run.push(data);
-                next_expected += (data.len() / psize as usize) as u64;
-            }
-            if !run.is_empty() {
-                backing.write_pages_at(run_start, psize, &run)?;
-            }
-        }
+        // Pages spilled earlier this txn (SPEC 04 §6.3a) are already on the
+        // file with their final bytes; only frames remain to write.
+        let pgnos = self.dirty.sorted_pgnos();
+        self.write_frames(&pgnos)?;
         inner.run_hook(HookPoint::H1);
         // Crash here: meta slots untouched → `N-1` selected; the written (or
         // torn) pages are unreferenced garbage (REC-6 H1).
@@ -2869,6 +4060,28 @@ impl<'env> RwTxn<'env> {
         }));
         Ok(())
         // Drop of `self` releases the write mutex — the tail of C6.
+    }
+}
+
+impl Drop for RwTxn<'_> {
+    fn drop(&mut self) {
+        // Reclaim up to `SPARE_CAP` one-page frames into the writer slot's pool for
+        // the next write txn (LMDB's `me_dpages` reuse, PERF-GAP B12). This runs
+        // on every end-of-txn path — commit success, commit failure, and abort
+        // (which is `drop(self)`) — and is safe on all of them:
+        //   * The commit pipeline has fully returned before this drop begins, so
+        //     C2 has finished copying every dirty frame to disk. All write
+        //     backends copy synchronously (pwrite / msync `memcpy`); none retain
+        //     a reference to a frame buffer past the write call, so no frame is
+        //     recycled while a write still reads it.
+        //   * On abort/failure the frames are unwritten garbage; recycled
+        //     contents never matter because every reuse (`insert_copy` /
+        //     `insert_tree_frame`) fully overwrites or zero-fills the frame.
+        // The frames ride back on the writer guard, which stores them in the
+        // slot under the release lock it takes anyway when this txn's fields
+        // drop right after this method.
+        let frames = self.dirty.reclaimable_frames(crate::dirty::SPARE_CAP);
+        self._guard.give_back_frames(frames);
     }
 }
 
@@ -2985,6 +4198,17 @@ impl Database {
     /// `delete_range(txn, lower, upper)` (SPEC 00 row 37): delete every entry
     /// in the bound pair; returns the number deleted.
     ///
+    /// Works leaf-at-a-time (SPEC 03, delete_range note): position at the
+    /// first covered key, splice the whole covered span out of that leaf in
+    /// one compaction, rebalance the leaf once, and re-descend after the last
+    /// deleted key. heed over LMDB realizes row 37 as a cursor walk with one
+    /// `mdb_cursor_del` per entry — LMDB has no bulk range-delete primitive
+    /// to mirror — so this deliberately goes beyond LMDB's own technique: one
+    /// COW + one rebalance per covered leaf instead of one descent + one
+    /// rebalance per key, and no materialized key list. The observable result
+    /// (count, survivors, bound semantics, comparator order) is identical to
+    /// the per-entry walk it replaces.
+    ///
     /// # Errors
     ///
     /// As [`Database::delete`].
@@ -2995,19 +4219,48 @@ impl Database {
         upper: std::ops::Bound<&[u8]>,
     ) -> Result<u64> {
         let tree = txn.ensure_open(self.sel())?;
-        let keys: Vec<Vec<u8>> = {
-            let mut out = Vec::new();
-            for item in self.range(&*txn, lower, upper) {
-                let (k, _) = item?;
-                out.push(k.to_vec());
-            }
-            out
-        };
         let mut n = 0u64;
-        for k in &keys {
-            if txn.delete_tree(tree, k)? {
-                n += 1;
+        // The key the walk resumes strictly after (`None` = start at
+        // `lower`): always the last key deleted from the previous leaf, so
+        // every descent runs against the already-rebalanced tree — no saved
+        // path is trusted across a rebalance (SPEC 03 §5.4a).
+        let mut resume: Option<Vec<u8>> = None;
+        // The range-start leaf's deferred rebalance anchor (at most one, set
+        // on the first leaf — see `delete_range_leaf_inner`).
+        let mut deferred: Option<Vec<u8>> = None;
+        loop {
+            // TXN-68: each leaf step starts from an owned resume key with no
+            // saved path, so a long range delete keeps its dirty set bounded.
+            txn.maybe_spill()?;
+            // Read phase: the first still-covered key, through the same
+            // iterator `range` uses, so every `Bound` combination, inverted
+            // bounds, and a custom comparator (SPEC 03 §2.0) position
+            // identically to the per-entry walk this replaces.
+            let lo = match &resume {
+                None => lower,
+                Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+            };
+            let first: Vec<u8> = match self.range(&*txn, lo, upper).next() {
+                None => break,
+                Some(item) => item?.0.to_vec(),
+            };
+            let (deleted, last, anchor) = txn.delete_range_leaf(tree, &first, upper)?;
+            n += deleted;
+            if anchor.is_some() {
+                deferred = anchor;
             }
+            match last {
+                // The covered span ran to its leaf's end: covered keys may
+                // remain in later leaves.
+                Some(k) => resume = Some(k),
+                // The span stopped at the upper bound: nothing covered is
+                // left.
+                None => break,
+            }
+        }
+        // Settle the boundary leaf the walk left below the fill threshold.
+        if let Some(anchor) = &deferred {
+            txn.delete_range_settle(tree, anchor)?;
         }
         Ok(n)
     }
@@ -3049,6 +4302,9 @@ impl Database {
             sel: self.sel(),
             pos: CurPos::Start,
             saved: None,
+            on_vacated_slot: false,
+            #[cfg(debug_assertions)]
+            repaired_keeps: 0,
         }
     }
 }
@@ -3109,6 +4365,19 @@ pub struct RwCursor<'t, 'env> {
     pos: CurPos,
     /// Parked physical path (authoritative when `Some`); cleared by mutations.
     saved: Option<SavedCursor>,
+    /// The parked path sits on the slot a `del_current` just vacated, which now
+    /// holds that entry's successor (SPEC 03 §7 / §5.4a — LMDB's `C_DEL`).
+    ///
+    /// While set, the cursor is **not** on a live entry: `current_key` reports
+    /// `None`, so a second `del_current` or a `put_current` is a no-op exactly
+    /// as it was before the path was retained. Only `next` may use the path (it
+    /// settles instead of stepping); every other op re-derives from `pos`.
+    on_vacated_slot: bool,
+    /// Deletes whose *structural* rebalance kept a repaired path instead of
+    /// discarding it (SPEC 03 §5.4a repair table) — a test signal that the
+    /// repair fires, mirrored by the shadow check. Debug builds only.
+    #[cfg(debug_assertions)]
+    repaired_keeps: u64,
 }
 
 impl RwCursor<'_, '_> {
@@ -3116,6 +4385,15 @@ impl RwCursor<'_, '_> {
     /// position from [`CurPos`] with one seek), park the new path, and
     /// re-materialize the yielded entry as borrows of the txn's frames.
     fn drive(&mut self, op: Step<'_>) -> Result<Option<(&[u8], &[u8])>> {
+        // A post-delete parked path names the vacated slot, which only `next`
+        // knows how to read (it settles there rather than stepping). Every
+        // other op re-derives from `pos`, which is the pre-B8a behaviour
+        // (SPEC 03 §5.4a: discarding is always a correct repair).
+        let settle = self.on_vacated_slot && matches!(op, Step::Next);
+        if self.on_vacated_slot && !settle {
+            self.saved = None;
+        }
+        self.on_vacated_slot = false;
         // Phase 1 — position under a scoped shared borrow of the txn; keep
         // only plain data (the parked stack and the hit's (pgno, ki)).
         let hit: Option<(u64, usize)> = {
@@ -3126,7 +4404,9 @@ impl RwCursor<'_, '_> {
             };
             let r = match op {
                 Step::Next => {
-                    if resumed {
+                    if settle {
+                        c.settle()
+                    } else if resumed {
                         c.next()
                     } else {
                         match &self.pos {
@@ -3183,6 +4463,11 @@ impl RwCursor<'_, '_> {
     /// The current entry's key as owned bytes (for a mutation about to
     /// invalidate the borrows), or `None` if the cursor is not on an entry.
     fn current_key(&self) -> Result<Option<Vec<u8>>> {
+        if self.on_vacated_slot {
+            // The parked path names a slot whose entry was just deleted; the
+            // cursor is between entries, not on one.
+            return Ok(None);
+        }
         match &self.saved {
             Some(s) => match s.entry_pos() {
                 Some((pgno, ki)) => {
@@ -3306,6 +4591,7 @@ impl RwCursor<'_, '_> {
             .put_tree(tree, &key, PutFlags::EMPTY, ValSrc::Val(value))
             .map(|_| ())?;
         self.saved = None;
+        self.on_vacated_slot = false;
         self.pos = CurPos::At(key);
         Ok(true)
     }
@@ -3324,6 +4610,7 @@ impl RwCursor<'_, '_> {
             .put_tree(tree, key, flags, ValSrc::Val(value))
             .map(|_| ())?;
         self.saved = None;
+        self.on_vacated_slot = false;
         self.pos = CurPos::At(key.to_vec());
         Ok(())
     }
@@ -3340,17 +4627,68 @@ impl RwCursor<'_, '_> {
             return Ok(false);
         };
         let tree = self.txn.ensure_open(self.sel)?;
-        let existed = self.txn.delete_tree(tree, &key)?;
-        self.saved = None;
+        // `pos` is set on every path: it is what `prev`, and any op after a
+        // discarded path, re-derives from.
+        let Some(mut saved) = self.saved.take() else {
+            // No parked path (fresh cursor, or the position came from `pos`
+            // after an earlier mutation): descend as before.
+            let existed = self.txn.delete_tree(tree, &key)?;
+            self.pos = CurPos::AfterDelete(key);
+            return Ok(existed);
+        };
+        // The parked path IS the live root-to-leaf path to this entry, so the
+        // delete needs no descent of its own (SPEC 03 §5.4a; PERF-GAP B8a).
+        debug_assert!(
+            saved.entry_pos().is_some(),
+            "current_key returned Some, so the parked cursor is on an entry"
+        );
+        // The parked leaf slot needs no adjustment: it already names the cell
+        // being removed, and removing it shifts the successor down into it.
+        let fate = self.txn.delete_at_path(tree, saved.frames_mut())?;
+        match fate {
+            PathFate::Invalidated => {
+                // The rebalance moved entries in a way the repair table does
+                // not follow (left pairing, an ancestor split, an emptied
+                // tree): the parked path may name the wrong page or depth.
+                // Discard it — the next op re-seeks from `pos`, which is the
+                // pre-B8a behaviour and always a correct repair (§5.4a).
+                self.saved = None;
+            }
+            fate => {
+                // The path still descends to the vacated slot: either nothing
+                // structural happened (`Unchanged` — only a cell left this
+                // leaf), or the leftmost-pairing repair held every frame
+                // steady (`Kept`), possibly minus a popped root frame
+                // (`KeptShrunk`). `ki` names the successor (the cells above it
+                // shifted down, and a borrow/merge appended the right
+                // sibling's cells at or after it), or is one past the last
+                // live cell if the tail was deleted — both of which
+                // `Cursor::settle` reads, and from which a plain `prev` still
+                // yields the predecessor.
+                if fate == PathFate::KeptShrunk {
+                    saved.drop_root();
+                }
+                #[cfg(debug_assertions)]
+                {
+                    if fate != PathFate::Unchanged {
+                        self.repaired_keeps += 1;
+                    }
+                    self.txn
+                        .shadow_check_kept_path(tree, saved.frames_mut(), &key);
+                }
+                self.saved = Some(saved);
+                self.on_vacated_slot = true;
+            }
+        }
         self.pos = CurPos::AfterDelete(key);
-        Ok(existed)
+        Ok(true)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::env::testutil::mem_env;
+    use crate::env::testutil::{mem_env, mem_env_sequential};
     use crate::error::MdbError;
 
     const PS: u32 = 4096;
@@ -3369,6 +4707,82 @@ mod tests {
         assert_eq!(find_run(&[2, 3, 4, 5, 6], 3), Some(2));
         // Gaps split runs.
         assert_eq!(find_run(&[2, 4, 6, 8], 2), None);
+    }
+
+    /// GC-19 common case: a front draw advances `head` (no memmove) and the
+    /// live view shrinks from the front.
+    #[test]
+    fn drain_front_pop_advances_head() {
+        let mut d = Drain::new(vec![5, 9, 10, 11]);
+        d.take_run(5, 1);
+        assert_eq!(d.live(), &[9, 10, 11]);
+        assert_eq!((d.head, d.ids.len()), (1, 4), "front pop must not memmove");
+        // A front *run* draw also advances head, by n.
+        d.take_run(9, 2);
+        assert_eq!(d.live(), &[11]);
+        assert_eq!((d.head, d.ids.len()), (3, 4));
+        assert_eq!(d.len(), 1);
+    }
+
+    /// The rare mid-slice run removal (n > 1, run not at the live front)
+    /// falls back to `Vec::drain` and preserves order around the hole.
+    #[test]
+    fn drain_mid_slice_run_removal() {
+        let mut d = Drain::new(vec![2, 6, 7, 8, 12]);
+        // Consume the front first so the mid removal happens behind a
+        // non-zero head.
+        d.take_run(2, 1);
+        assert_eq!(d.live(), &[6, 7, 8, 12]);
+        let start = find_run(d.live(), 2).unwrap();
+        assert_eq!(start, 6);
+        // Remove [7, 8] — a run strictly inside the live slice.
+        d.take_run(7, 2);
+        assert_eq!(d.live(), &[6, 12]);
+        assert_eq!(d.len(), 2);
+    }
+
+    /// Fully drained: the live view is empty however the ids were consumed —
+    /// the state `freelist_save` step (a) turns into a tree-entry delete.
+    #[test]
+    fn drain_fully_drained_is_empty() {
+        let mut d = Drain::new(vec![3, 4, 5]);
+        d.take_run(3, 2); // front run
+        d.take_run(5, 1); // last id
+        assert_eq!(d.live(), &[] as &[u64]);
+        assert_eq!(d.len(), 0);
+
+        let mut d = Drain::new(vec![3, 4, 5]);
+        d.take_run(4, 2); // mid/tail run first
+        d.take_run(3, 1);
+        assert_eq!(d.live(), &[] as &[u64]);
+    }
+
+    /// GC-20 byte-identity guarantee: for a mixed draw sequence, the live
+    /// remainder equals what the previous representation (binary_search +
+    /// `Vec::drain` on every draw) would encode into the rewritten PIL.
+    #[test]
+    fn drain_remainder_matches_old_drain_algorithm() {
+        // Reference: the pre-Drain algorithm, verbatim.
+        fn naive_take(ids: &mut Vec<u64>, start: u64, n: u64) {
+            let pos = ids.binary_search(&start).unwrap();
+            ids.drain(pos..pos + n as usize);
+        }
+        // Ascending ids with runs and gaps.
+        let init: Vec<u64> = vec![2, 3, 4, 5, 8, 9, 10, 14, 15, 20, 21, 22, 23, 30];
+        let mut d = Drain::new(init.clone());
+        let mut naive = init;
+        // Draw with GC-19/GC-18 pick rules (n == 1 -> front; n > 1 -> first
+        // run), interleaving sizes so front pops and mid-slice removals mix.
+        for n in [1u64, 3, 1, 2, 1, 4, 1, 1, 2] {
+            let pick = find_run(d.live(), n);
+            assert_eq!(pick, find_run(&naive, n), "pick diverged at n={n}");
+            let Some(start) = pick else { continue };
+            d.take_run(start, n);
+            naive_take(&mut naive, start, n);
+            assert_eq!(d.live(), naive.as_slice(), "remainder diverged at n={n}");
+        }
+        assert_eq!(d.live(), &[] as &[u64], "sequence sized to drain fully");
+        assert!(naive.is_empty());
     }
 
     fn kv(i: u32) -> (Vec<u8>, Vec<u8>) {
@@ -4004,5 +5418,952 @@ mod tests {
         // (TXN-11); the writer sees its own (TXN-38).
         assert_eq!(db.get(&rtxn, b"k").unwrap(), None);
         assert_eq!(db.get(&wtxn, b"k").unwrap(), Some(b"v".as_slice()));
+    }
+
+    // -- del_current path repair (SPEC 03 §5.4a repair table) -----------------
+
+    /// A wide key/value pair: at 4 K pages the leaves hold ~6 entries and the
+    /// branches ~8 children, so a depth-3 tree needs only ~120 entries and a
+    /// front-to-back drain rebalances on most deletes (the structural case the
+    /// §5.4a repair table exists for).
+    fn wide_kv(i: u32) -> (Vec<u8>, Vec<u8>) {
+        (
+            format!("{i:05}{}", "k".repeat(455)).into_bytes(),
+            format!("v{i}-{}", "x".repeat(96)).into_bytes(),
+        )
+    }
+
+    /// Drain the whole DB front-to-back through the write cursor (milli's
+    /// `iter_mut` + `del_current` pattern) and return the keys in the order
+    /// the drain yielded them.
+    fn drain_all(db: &Database, txn: &mut RwTxn<'_>) -> Vec<Vec<u8>> {
+        let mut seen = Vec::new();
+        let mut cur = db.rw_cursor(txn);
+        while let Some((k, _v)) = cur.move_next().unwrap() {
+            seen.push(k.to_vec());
+            assert!(cur.del_current().unwrap());
+        }
+        seen
+    }
+
+    /// Tree sizes are miri-scaled like proptest case counts: the shadow check
+    /// re-descends per delete, which the interpreter pays ~1000x for.
+    fn miri_scaled(native: u32, miri: u32) -> u32 {
+        if cfg!(miri) {
+            miri
+        } else {
+            native
+        }
+    }
+
+    /// A `first/del_current/next` drain over depths 1, 2 and 3+ must yield
+    /// every key exactly once, in order — none skipped, none repeated — and
+    /// leave the tree empty. The depth-2/3 runs exercise the kept-path repair
+    /// (borrow-from-right, merge-with-right, root shrink); the debug shadow
+    /// check re-derives every kept path against a fresh descent.
+    #[test]
+    fn cursor_drain_matches_model_at_depths() {
+        for (n, min_depth) in [(4u32, 1u16), (12, 2), (miri_scaled(150, 80), 3)] {
+            let env = mem_env(PS, 8 << 20);
+            let db = env.main_database();
+            let mut txn = env.write_txn().unwrap();
+            let mut model = std::collections::BTreeMap::new();
+            for i in 0..n {
+                let (k, v) = wide_kv(i);
+                db.put(&mut txn, &k, &v).unwrap();
+                model.insert(k, v);
+            }
+            assert!(
+                txn.main_record().depth >= min_depth,
+                "wanted depth >= {min_depth}, got {} for n = {n}",
+                txn.main_record().depth
+            );
+            let seen = drain_all(&db, &mut txn);
+            let expected: Vec<Vec<u8>> = model.keys().cloned().collect();
+            assert_eq!(
+                seen, expected,
+                "drain skipped or repeated entries (n = {n})"
+            );
+            assert_eq!(db.len(&txn).unwrap(), 0);
+            assert_eq!(txn.main_record().root, PGNO_INVALID);
+        }
+    }
+
+    /// A backward drain (`prev/del_current`) deletes at `pki != 0`, the
+    /// pairing this step does NOT repair: every structural delete falls back
+    /// to the discard + re-seek path. It must still visit every key exactly
+    /// once, in reverse order.
+    #[test]
+    fn cursor_reverse_drain_matches_model() {
+        let env = mem_env(PS, 8 << 20);
+        let db = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        let n = miri_scaled(130, 72);
+        let mut model = std::collections::BTreeMap::new();
+        for i in 0..n {
+            let (k, v) = wide_kv(i);
+            db.put(&mut txn, &k, &v).unwrap();
+            model.insert(k, v);
+        }
+        assert!(txn.main_record().depth >= 3);
+        let mut seen = Vec::new();
+        {
+            let mut cur = db.rw_cursor(&mut txn);
+            while let Some((k, _v)) = cur.move_prev().unwrap() {
+                seen.push(k.to_vec());
+                assert!(cur.del_current().unwrap());
+            }
+        }
+        let expected: Vec<Vec<u8>> = model.keys().rev().cloned().collect();
+        assert_eq!(seen, expected);
+        assert_eq!(db.len(&txn).unwrap(), 0);
+    }
+
+    /// Drain in segments with point `get`s in between (the cursor cannot
+    /// overlap a shared borrow of the txn, so milli interleaves exactly this
+    /// way): deleted keys must read back `None`, survivors `Some`, and the
+    /// resumed cursor must not skip or repeat across the seam.
+    #[test]
+    fn cursor_drain_interleaved_with_gets() {
+        let env = mem_env(PS, 8 << 20);
+        let db = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        let n = miri_scaled(120, 72);
+        for i in 0..n {
+            let (k, v) = wide_kv(i);
+            db.put(&mut txn, &k, &v).unwrap();
+        }
+        assert!(txn.main_record().depth >= 3);
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut segment = 0u32;
+        loop {
+            let mut deleted_now = 0u32;
+            {
+                let mut cur = db.rw_cursor(&mut txn);
+                // Resume strictly after the last drained key.
+                let start = match seen.last() {
+                    Some(k) => cur.seek_gt(k).unwrap(),
+                    None => cur.move_next().unwrap(),
+                };
+                let mut entry = start.map(|(k, _)| k.to_vec());
+                while let Some(k) = entry {
+                    seen.push(k);
+                    assert!(cur.del_current().unwrap());
+                    deleted_now += 1;
+                    if deleted_now == 17 {
+                        break; // segment boundary: drop the cursor, go get()
+                    }
+                    entry = cur.move_next().unwrap().map(|(k, _)| k.to_vec());
+                }
+            }
+            for k in &seen {
+                assert_eq!(db.get(&txn, k).unwrap(), None, "segment {segment}");
+            }
+            let survivors = n as usize - seen.len();
+            assert_eq!(db.len(&txn).unwrap() as usize, survivors);
+            if deleted_now < 17 {
+                break;
+            }
+            segment += 1;
+        }
+        let expected: Vec<Vec<u8>> = (0..n).map(|i| wide_kv(i).0).collect();
+        assert_eq!(seen, expected);
+        assert_eq!(db.len(&txn).unwrap(), 0);
+    }
+
+    /// The lever must actually fire: a front-to-back drain over a deep tree
+    /// performs structural deletes whose path is KEPT (repaired), not
+    /// re-derived. Counted in debug builds only, where the shadow check also
+    /// re-validates every kept path.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn cursor_drain_keeps_repaired_paths() {
+        let env = mem_env(PS, 8 << 20);
+        let db = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        let n = miri_scaled(150, 80);
+        for i in 0..n {
+            let (k, v) = wide_kv(i);
+            db.put(&mut txn, &k, &v).unwrap();
+        }
+        assert!(txn.main_record().depth >= 3);
+        let mut cur = db.rw_cursor(&mut txn);
+        while let Some((_k, _v)) = cur.move_next().unwrap() {
+            assert!(cur.del_current().unwrap());
+        }
+        // At ~6 wide entries per 4 K leaf, a 150-entry front drain rebalances
+        // dozens of times; the leftmost pairing keeps all of those except the
+        // rare separator-split fallback, so "many" is the honest bound.
+        assert!(
+            cur.repaired_keeps >= 10,
+            "kept-path repair never fired: {} structural keeps",
+            cur.repaired_keeps
+        );
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            failure_persistence: None,
+            cases: if cfg!(miri) { 16 } else { 256 },
+            ..Default::default()
+        })]
+
+        /// Random key sets, random partial drains: delete every `k`-th entry
+        /// through the cursor, then check the survivors equal a `BTreeMap`
+        /// model and the visited sequence was every key exactly once, in
+        /// order. Small keys keep the tree shallow *and* mixed-`pki` (both
+        /// repair and fallback paths fire); the wide-entry unit tests above
+        /// pin the deep-tree shapes. Sizes are miri-scaled like the case
+        /// count.
+        #[test]
+        fn cursor_partial_drain_matches_model(
+            entries in proptest::collection::btree_map(
+                proptest::collection::vec(proptest::prelude::any::<u8>(), 1..24),
+                proptest::collection::vec(
+                    proptest::prelude::any::<u8>(),
+                    0..if cfg!(miri) { 80 } else { 400 },
+                ),
+                1..if cfg!(miri) { 40usize } else { 120 },
+            ),
+            k in 1..5u32,
+        ) {
+            let env = mem_env(PS, 8 << 20);
+            let db = env.main_database();
+            let mut txn = env.write_txn().unwrap();
+            let mut model = entries.clone();
+            for (key, val) in &entries {
+                db.put(&mut txn, key, val).unwrap();
+            }
+            let mut seen = Vec::new();
+            {
+                let mut cur = db.rw_cursor(&mut txn);
+                let mut i = 0u32;
+                while let Some((key, _v)) = cur.move_next().unwrap() {
+                    let key = key.to_vec();
+                    if i % k == 0 {
+                        proptest::prop_assert!(cur.del_current().unwrap());
+                        model.remove(&key);
+                    }
+                    seen.push(key);
+                    i += 1;
+                }
+            }
+            // Every key visited exactly once, in order (nothing skipped or
+            // repeated around the deletes).
+            let all: Vec<Vec<u8>> = entries.keys().cloned().collect();
+            proptest::prop_assert_eq!(&seen, &all);
+            // Survivors match the model, by full dump and by point gets.
+            let left: Vec<(Vec<u8>, Vec<u8>)> =
+                model.iter().map(|(a, b)| (a.clone(), b.clone())).collect();
+            proptest::prop_assert_eq!(dump(&txn), left);
+            for key in entries.keys() {
+                let want = model.get(key).map(Vec::as_slice);
+                proptest::prop_assert_eq!(db.get(&txn, key).unwrap(), want);
+            }
+            // Drain the rest: still every survivor exactly once, then empty.
+            let rest = drain_all(&db, &mut txn);
+            let survivors: Vec<Vec<u8>> = model.keys().cloned().collect();
+            proptest::prop_assert_eq!(rest, survivors);
+            proptest::prop_assert_eq!(db.len(&txn).unwrap(), 0);
+        }
+    }
+
+    // -- delete_range (leaf-granular, SPEC 00 r37) ----------------------------
+
+    /// Reference model: the keys of `model` covered by the bound pair under
+    /// memcmp order (the main DB's ordering).
+    fn covered_keys(
+        model: &BTreeMap<Vec<u8>, Vec<u8>>,
+        lower: &std::ops::Bound<Vec<u8>>,
+        upper: &std::ops::Bound<Vec<u8>>,
+    ) -> Vec<Vec<u8>> {
+        use std::ops::Bound;
+        model
+            .keys()
+            .filter(|k| {
+                let lo_ok = match lower {
+                    Bound::Unbounded => true,
+                    Bound::Included(l) => *k >= l,
+                    Bound::Excluded(l) => *k > l,
+                };
+                let hi_ok = match upper {
+                    Bound::Unbounded => true,
+                    Bound::Included(h) => *k <= h,
+                    Bound::Excluded(h) => *k < h,
+                };
+                lo_ok && hi_ok
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Drive one leaf-granular `delete_range` against a fresh env seeded with
+    /// `entries`, and assert every observable against the `BTreeMap` model:
+    /// the returned count, the survivors by full dump and by point gets, the
+    /// `entries` stat, and exact `overflow_pages` accounting (only surviving
+    /// big values may keep runs).
+    fn check_delete_range_case(
+        entries: &BTreeMap<Vec<u8>, Vec<u8>>,
+        lower: std::ops::Bound<Vec<u8>>,
+        upper: std::ops::Bound<Vec<u8>>,
+    ) {
+        use std::ops::Bound;
+        let env = mem_env(PS, 8 << 20);
+        let db = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        for (k, v) in entries {
+            db.put(&mut txn, k, v).unwrap();
+        }
+        let mut model = entries.clone();
+        let removed = covered_keys(&model, &lower, &upper);
+        for k in &removed {
+            model.remove(k);
+        }
+        fn as_ref(b: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+            match b {
+                Bound::Unbounded => Bound::Unbounded,
+                Bound::Included(k) => Bound::Included(k.as_slice()),
+                Bound::Excluded(k) => Bound::Excluded(k.as_slice()),
+            }
+        }
+        let n = db
+            .delete_range(&mut txn, as_ref(&lower), as_ref(&upper))
+            .unwrap();
+        assert_eq!(n, removed.len() as u64, "returned count");
+        assert_eq!(db.len(&txn).unwrap(), model.len() as u64, "entries stat");
+        let left: Vec<(Vec<u8>, Vec<u8>)> =
+            model.iter().map(|(a, b)| (a.clone(), b.clone())).collect();
+        assert_eq!(dump(&txn), left, "survivors by dump");
+        for k in entries.keys() {
+            let want = model.get(k).map(Vec::as_slice);
+            assert_eq!(db.get(&txn, k).unwrap(), want, "point get");
+        }
+        let want_ovf: u64 = model
+            .iter()
+            .filter(|(k, v)| !value_is_inline(k.len(), v.len() as u64, PS))
+            .map(|(_, v)| overflow_page_count(v.len() as u64, PS))
+            .sum();
+        assert_eq!(
+            db.stat(&txn).unwrap().overflow_pages,
+            want_ovf,
+            "overflow_pages stat"
+        );
+    }
+
+    #[test]
+    fn delete_range_bound_combinations_and_edges() {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        // Wide cells keep leaf fanout low, so interior ranges cross whole
+        // leaves, partially-covered leaves, and both tree edges. Sizes are
+        // miri-scaled like the proptest case counts.
+        let n = miri_scaled(120, 30);
+        let vlen = if cfg!(miri) { 40 } else { 300 } as usize;
+        let mut entries = BTreeMap::new();
+        for i in 0..n {
+            entries.insert(
+                format!("k{i:03}").into_bytes(),
+                vec![b'v'; vlen + (i % 7) as usize],
+            );
+        }
+        // Bound keys as fractions of the key space, so the shapes survive
+        // the miri scaling; `kx` lands between two keys.
+        let k = |i: u32| format!("k{i:03}").into_bytes();
+        let kx = |i: u32| format!("k{i:03}x").into_bytes();
+        // Empty db.
+        check_delete_range_case(&BTreeMap::new(), Unbounded, Unbounded);
+        // Full wipe across many leaves.
+        check_delete_range_case(&entries, Unbounded, Unbounded);
+        // Interior range spanning several leaves.
+        check_delete_range_case(&entries, Included(k(n / 12)), Excluded(k(5 * n / 6)));
+        // Both ends exclusive, bounds falling between keys.
+        check_delete_range_case(&entries, Excluded(kx(n / 12)), Excluded(kx(5 * n / 6)));
+        // Single key, surrounded by every bound kind.
+        check_delete_range_case(&entries, Included(k(n / 2)), Included(k(n / 2)));
+        check_delete_range_case(&entries, Excluded(k(n / 2)), Included(k(n / 2 + 1)));
+        check_delete_range_case(&entries, Included(k(n / 2 + 1)), Excluded(k(n / 2 + 2)));
+        // Empty ranges: Excluded/Excluded on one key, inverted bounds.
+        check_delete_range_case(&entries, Excluded(k(n / 2)), Excluded(k(n / 2)));
+        check_delete_range_case(&entries, Included(k(5 * n / 6)), Included(k(n / 12)));
+        // Tree edges: a prefix drain and a suffix drain.
+        check_delete_range_case(&entries, Unbounded, Excluded(k(n / 6)));
+        check_delete_range_case(&entries, Included(k(5 * n / 6)), Unbounded);
+        // Bounds entirely outside the key space.
+        check_delete_range_case(&entries, Included(b"x".to_vec()), Unbounded);
+        check_delete_range_case(&entries, Unbounded, Excluded(b"a".to_vec()));
+    }
+
+    #[test]
+    fn delete_range_frees_covered_overflow_runs_only() {
+        use std::ops::Bound::{Excluded, Included};
+        // Every 5th value overflows; the range covers some of each kind and
+        // leaves overflow values alive on both sides.
+        let n = miri_scaled(40, 15);
+        let mut entries = BTreeMap::new();
+        for i in 0..n {
+            let len = if i % 5 == 0 { 3000 + i as usize } else { 200 };
+            entries.insert(format!("k{i:03}").into_bytes(), vec![b'o'; len]);
+        }
+        check_delete_range_case(
+            &entries,
+            Included(format!("k{:03}", n / 8).into_bytes()),
+            Excluded(format!("k{:03}", 3 * n / 4).into_bytes()),
+        );
+    }
+
+    #[test]
+    fn delete_range_poisoned_txn_refuses() {
+        // Same poisoning recipe as `map_full_poisons_txn`.
+        let env = mem_env(PS, 16 * PS as u64);
+        let db = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        let mut hit_full = false;
+        for i in 0..64u32 {
+            let key = format!("k{i:02}").into_bytes();
+            if db.put(&mut txn, &key, &vec![0u8; 3000]).is_err() {
+                hit_full = true;
+                break;
+            }
+        }
+        assert!(hit_full, "expected MapFull on a 16-page map");
+        let e = db
+            .delete_range(
+                &mut txn,
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Unbounded,
+            )
+            .unwrap_err();
+        assert!(matches!(e, Error::Mdb(MdbError::BadTxn)));
+    }
+
+    /// Child-1 separator of the root branch. On a freshly split, delete-free
+    /// tree it **equals** the second leaf's first key (SPEC 03 §11 INV-6:
+    /// equality holds for freshly built/split branches), which makes it an
+    /// exact leaf boundary for the shape pins below.
+    fn root_separator_1(txn: &RwTxn<'_>) -> Vec<u8> {
+        let rec = txn.main_db;
+        let frame = txn
+            .source()
+            .bytes_from(txn.psize, rec.root)
+            .expect("root readable");
+        BranchRef::new(frame, txn.psize)
+            .expect("root is a branch")
+            .key(1)
+            .to_vec()
+    }
+
+    /// §10 empty-page rule, walk mode (SPEC 03, 2026-09-27): a leaf that
+    /// `delete_range` empties is merged away by the very next rebalance —
+    /// never borrowed into. Deleting exactly the first leaf's keys of a
+    /// two-leaf tree must therefore collapse it to one full leaf in that same
+    /// call; the borrow arm would instead pull one (uncovered) entry across
+    /// and leave both leaves standing. Point deletes keep the historical
+    /// neighbor policy (the gc_reclaim churn-flatness pin depends on it).
+    #[test]
+    fn delete_range_merges_emptied_leaf_instead_of_borrowing() {
+        let env = mem_env(PS, MAP);
+        let db = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        // Descending inserts avoid the append-split skew; wide entries keep
+        // the tree at exactly two leaves.
+        let total = 6u64;
+        for i in (0..total).rev() {
+            db.put(&mut txn, format!("k{i}").as_bytes(), &vec![b'w'; 1100])
+                .unwrap();
+        }
+        let pre = db.stat(&txn).unwrap();
+        assert_eq!(pre.depth, 2, "want a root branch over leaves");
+        assert!(pre.leaf_pages >= 2, "want at least two leaves: {pre:?}");
+        let boundary = root_separator_1(&txn);
+        // Exactly the first leaf: [-inf, second leaf's first key).
+        let n = db
+            .delete_range(
+                &mut txn,
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Excluded(boundary.as_slice()),
+            )
+            .unwrap();
+        assert!(n >= 1);
+        let stat = db.stat(&txn).unwrap();
+        assert_eq!(stat.entries, total - n);
+        // The emptied leaf merged with its (untouched, full) right sibling in
+        // the same call: one leaf gone. The borrow arm would have pulled one
+        // uncovered entry across and kept both leaves standing.
+        assert_eq!(
+            stat.leaf_pages,
+            pre.leaf_pages - 1,
+            "emptied leaf must merge away, not borrow"
+        );
+        let survivor = vec![b'w'; 1100];
+        assert_eq!(db.get(&txn, &boundary).unwrap(), Some(survivor.as_slice()));
+    }
+
+    /// Bound strategy for [`delete_range_matches_model`]: anchor on an
+    /// existing key (or its "between keys" successor, a 0-byte appended) and
+    /// a bound kind, independently per side — inverted and empty ranges
+    /// included.
+    fn bound_from(keys: &[Vec<u8>], pick: usize, kind: u8) -> std::ops::Bound<Vec<u8>> {
+        use std::ops::Bound;
+        if keys.is_empty() {
+            return Bound::Unbounded;
+        }
+        let k = keys[pick % keys.len()].clone();
+        match kind % 4 {
+            0 => Bound::Unbounded,
+            1 => Bound::Included(k),
+            2 => Bound::Excluded(k),
+            _ => {
+                let mut between = k;
+                between.push(0);
+                Bound::Included(between)
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            failure_persistence: None,
+            cases: if cfg!(miri) { 16 } else { 256 },
+            ..Default::default()
+        })]
+
+        /// Random key sets (a slice of the values overflow-sized), random
+        /// bound pairs anchored on existing keys: the leaf-granular
+        /// `delete_range` must match the `BTreeMap` model on count,
+        /// survivors, and stats. Small keys keep leaves wide; the wide-entry
+        /// unit tests above pin the many-leaf shapes. Sizes are miri-scaled
+        /// like the case count.
+        #[test]
+        fn delete_range_matches_model(
+            entries in proptest::collection::btree_map(
+                proptest::collection::vec(proptest::prelude::any::<u8>(), 1..24),
+                proptest::prelude::prop_oneof![
+                    // Inline values, element-random.
+                    4 => proptest::collection::vec(
+                        proptest::prelude::any::<u8>(),
+                        0..if cfg!(miri) { 40usize } else { 200 },
+                    ),
+                    // Overflow values (>= 2030 always overflows at 4 K for
+                    // keys < 24 bytes): a (len, fill) pair, not a per-element
+                    // vec — element-random 2.5 KB values made this the miri
+                    // long pole for no extra coverage.
+                    1 => proptest::prelude::Strategy::prop_map(
+                        (
+                            2030..if cfg!(miri) { 2060usize } else { 3300 },
+                            proptest::prelude::any::<u8>(),
+                        ),
+                        |(len, b)| vec![b; len],
+                    ),
+                ],
+                1..if cfg!(miri) { 16usize } else { 100 },
+            ),
+            lo_pick in 0usize..1024,
+            lo_kind in 0u8..4,
+            hi_pick in 0usize..1024,
+            hi_kind in 0u8..4,
+        ) {
+            let keys: Vec<Vec<u8>> = entries.keys().cloned().collect();
+            let lower = bound_from(&keys, lo_pick, lo_kind);
+            let upper = bound_from(&keys, hi_pick, hi_kind);
+            check_delete_range_case(&entries, lower, upper);
+        }
+    }
+
+    // -- rightmost-leaf finger (SPEC 03 §6.6, roadmap #6) ----------------------
+
+    /// Everything visible in `db` through the txn, in key order.
+    fn dump_db(db: &Database, txn: &RwTxn<'_>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        db.iter(txn)
+            .map(|r| {
+                let (k, v) = r.unwrap();
+                (k.to_vec(), v.to_vec())
+            })
+            .collect()
+    }
+
+    /// The main DB doubles as the named-DB catalog (SPEC 02 §6): a model
+    /// comparison of user entries must skip the `F_SUBDATA` records.
+    fn dump_main_user(txn: &RwTxn<'_>, names: &[&[u8]]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        dump(txn)
+            .into_iter()
+            .filter(|(k, _)| !names.contains(&k.as_slice()))
+            .collect()
+    }
+
+    /// The fast path actually fires: an APPEND load of a multi-level tree
+    /// pays one descent per split and hits the finger for every other put
+    /// (each hit shadow-checked against a fresh descent), and a plain
+    /// ascending load fires it just the same. Contents stay exact.
+    #[test]
+    fn finger_fires_on_append_and_seq_loads() {
+        let env = mem_env_sequential(PS, 8 << 20);
+        let db = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        // Wide entries so the tree splits into a branch level even at the
+        // miri-scaled size.
+        let n = miri_scaled(600, 60);
+        for i in 0..n {
+            let (k, v) = wide_kv(i);
+            db.put_with_flags(&mut txn, PutFlags::APPEND, &k, &v)
+                .unwrap();
+        }
+        assert!(
+            txn.main_record().depth >= 2,
+            "load must build a branch level"
+        );
+        // Every put except the re-establishing descent after each split (and
+        // the very first) is a hit; >= n/2 is the loose, honest bound.
+        assert!(
+            txn.finger_hits >= u64::from(n) / 2,
+            "APPEND load took the fast path only {} times of {n}",
+            txn.finger_hits
+        );
+        let expected: Vec<_> = (0..n).map(wide_kv).collect();
+        assert_eq!(dump(&txn), expected);
+
+        // Plain sequential puts (no APPEND flag) fire it too.
+        let named = env.create_database(&mut txn, Some(b"seq")).unwrap();
+        let before = txn.finger_hits;
+        for i in 0..n {
+            let (k, v) = wide_kv(i);
+            named.put(&mut txn, &k, &v).unwrap();
+        }
+        assert!(
+            txn.finger_hits - before >= u64::from(n) / 2,
+            "sequential load took the fast path only {} times of {n}",
+            txn.finger_hits - before
+        );
+        assert_eq!(dump_db(&named, &txn), expected);
+    }
+
+    /// ADR-0015: the finger runs only where the sequential-writes setting is
+    /// on. Off by default (an APPEND load never hits); a per-database
+    /// override wins over the env default in both directions; `None` goes
+    /// back to the default. The override applies from the next write txn.
+    #[test]
+    fn finger_follows_the_sequential_writes_setting() {
+        fn load(env: &Env, db: &Database, n: u32) -> u64 {
+            let mut txn = env.write_txn().unwrap();
+            for i in 0..n {
+                let (k, v) = wide_kv(i);
+                db.put_with_flags(&mut txn, PutFlags::APPEND, &k, &v)
+                    .unwrap();
+            }
+            let hits = txn.finger_hits;
+            txn.abort();
+            hits
+        }
+        let n = miri_scaled(200, 40);
+
+        let off = mem_env(PS, 8 << 20);
+        let main = off.main_database();
+        assert!(!off.sequential_writes(&main), "default must be off");
+        assert_eq!(load(&off, &main, n), 0, "finger ran with the setting off");
+        off.set_sequential_writes(&main, Some(true));
+        assert!(load(&off, &main, n) > 0, "override on did not enable it");
+        off.set_sequential_writes(&main, None);
+        assert_eq!(load(&off, &main, n), 0, "None must restore the default");
+
+        // Named DBs, created inside the measured txn (a mem env cannot
+        // commit); an aborted create keeps its dbi, so the override set
+        // between txns applies when the next txn creates it again.
+        let on = mem_env_sequential(PS, 8 << 20);
+        let named_load = |env: &Env| {
+            let mut txn = env.write_txn().unwrap();
+            let db = env.create_database(&mut txn, Some(b"ids")).unwrap();
+            for i in 0..n {
+                let (k, v) = wide_kv(i);
+                db.put_with_flags(&mut txn, PutFlags::APPEND, &k, &v)
+                    .unwrap();
+            }
+            let hits = txn.finger_hits;
+            txn.abort();
+            (db, hits)
+        };
+        let (named, hits) = named_load(&on);
+        assert!(hits > 0, "env default on did not reach a named DB");
+        on.set_sequential_writes(&named, Some(false));
+        assert!(!on.sequential_writes(&named));
+        assert_eq!(named_load(&on).1, 0, "override off did not disable it");
+        assert!(
+            on.sequential_writes(&on.main_database()),
+            "main keeps the env default"
+        );
+    }
+
+    /// The finger under adversarial interleaving, all in one txn: sequential
+    /// and APPEND runs on the main DB and a named DB, broken up by
+    /// out-of-order puts, tail deletes, a `delete_range`, `clear`, and
+    /// drop + recreate — every phase checked against a `BTreeMap` model
+    /// (and every fast-path hit shadow-checked against a fresh descent).
+    #[test]
+    fn finger_model_interleaved_ops() {
+        let env = mem_env_sequential(PS, 8 << 20);
+        let main = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        let named = env.create_database(&mut txn, Some(b"aux")).unwrap();
+        let mut mm: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let mut mn: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let n = miri_scaled(400, 48);
+        // Phase 1: interleaved ascending loads — plain puts on main, APPEND
+        // on the named DB — so both trees keep a live finger at once.
+        for i in 0..n {
+            let (k, v) = kv(i);
+            main.put(&mut txn, &k, &v).unwrap();
+            mm.insert(k.clone(), v.clone());
+            named
+                .put_with_flags(&mut txn, PutFlags::APPEND, &k, &v)
+                .unwrap();
+            mn.insert(k, v);
+        }
+        // Phase 2: out-of-order puts into main (finger misses, then
+        // re-establishes on the next end insert).
+        for i in (0..n).rev().step_by(3) {
+            let (k, _) = kv(i);
+            let v = format!("rewritten-{i}").into_bytes();
+            main.put(&mut txn, &k, &v).unwrap();
+            mm.insert(k, v);
+        }
+        assert_eq!(
+            dump_main_user(&txn, &[b"aux"]),
+            mm.clone().into_iter().collect::<Vec<_>>()
+        );
+        // Phase 3: delete the tail of main (kills the right spine), then
+        // append past the old maximum again.
+        for i in n.saturating_sub(24)..n {
+            let (k, _) = kv(i);
+            assert!(main.delete(&mut txn, &k).unwrap());
+            mm.remove(&k);
+        }
+        for i in n..n + 32 {
+            let (k, v) = kv(i);
+            main.put_with_flags(&mut txn, PutFlags::APPEND, &k, &v)
+                .unwrap();
+            mm.insert(k, v);
+        }
+        // Phase 4: range-delete a middle band of main, then more end inserts.
+        let (lo, _) = kv(n / 4);
+        let (hi, _) = kv(n / 2);
+        let deleted = main
+            .delete_range(
+                &mut txn,
+                std::ops::Bound::Included(lo.as_slice()),
+                std::ops::Bound::Excluded(hi.as_slice()),
+            )
+            .unwrap();
+        let covered: Vec<Vec<u8>> = mm
+            .range::<[u8], _>((
+                std::ops::Bound::Included(lo.as_slice()),
+                std::ops::Bound::Excluded(hi.as_slice()),
+            ))
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(deleted, covered.len() as u64);
+        for k in covered {
+            mm.remove(&k);
+        }
+        for i in n + 32..n + 48 {
+            let (k, v) = kv(i);
+            main.put(&mut txn, &k, &v).unwrap();
+            mm.insert(k, v);
+        }
+        assert_eq!(
+            dump_main_user(&txn, &[b"aux"]),
+            mm.clone().into_iter().collect::<Vec<_>>()
+        );
+        // Phase 5: clear the named DB, refill ascending.
+        named.clear(&mut txn).unwrap();
+        mn.clear();
+        for i in 0..n / 2 {
+            let (k, v) = kv(i);
+            named
+                .put_with_flags(&mut txn, PutFlags::APPEND, &k, &v)
+                .unwrap();
+            mn.insert(k, v);
+        }
+        assert_eq!(
+            dump_db(&named, &txn),
+            mn.clone().into_iter().collect::<Vec<_>>()
+        );
+        // Phase 6: drop + recreate the named DB, refill with plain puts.
+        named.drop_db(&mut txn).unwrap();
+        mn.clear();
+        let named = env.create_database(&mut txn, Some(b"aux")).unwrap();
+        for i in 0..n / 2 {
+            let (k, v) = kv(i);
+            named.put(&mut txn, &k, &v).unwrap();
+            mn.insert(k, v);
+        }
+        assert_eq!(dump_db(&named, &txn), mn.into_iter().collect::<Vec<_>>());
+        assert_eq!(
+            dump_main_user(&txn, &[b"aux"]),
+            mm.into_iter().collect::<Vec<_>>()
+        );
+        assert!(txn.finger_hits > 0, "the interleaving never hit the finger");
+    }
+
+    /// The stale-finger hazard the F3 ownership hook exists for: build main
+    /// so its rightmost pages are dirty and fingered, delete the tail so the
+    /// rightmost leaf merges away (its dirty pgno goes to the loose list),
+    /// fill a named DB so allocation re-serves that pgno as a page of the
+    /// OTHER tree (still dirty!), then append to main again. A finger keyed
+    /// on dirtiness alone would descend into the named DB's page; here the
+    /// delete invalidates, `free_page` forgets, the hit re-verifies the
+    /// spine, and the debug shadow check re-descends — the append must land
+    /// correctly and both trees stay exact.
+    #[test]
+    fn finger_survives_freed_page_reuse_by_another_tree() {
+        let env = mem_env_sequential(PS, 8 << 20);
+        let main = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        // Named "!thief" so the catalog entry sorts BEFORE the digit-prefixed
+        // user keys — otherwise the entry itself is the main tree's last key
+        // and every APPEND below would rightly refuse with KeyExist.
+        let named = env.create_database(&mut txn, Some(b"!thief")).unwrap();
+        let n = miri_scaled(300, 60);
+        let mut mm: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        for i in 0..n {
+            let (k, v) = wide_kv(i);
+            main.put(&mut txn, &k, &v).unwrap();
+            mm.insert(k, v);
+        }
+        assert!(txn.main_record().depth >= 2);
+        let leaves_before = txn.main_record().leaf_pages;
+        // Tail deletes until at least one rightmost leaf merged away — its
+        // dirty, this-txn pgno lands on the loose list.
+        let mut i = n;
+        while txn.main_record().leaf_pages == leaves_before {
+            i -= 1;
+            let (k, _) = wide_kv(i);
+            assert!(main.delete(&mut txn, &k).unwrap());
+            mm.remove(&k);
+            assert!(i > 0, "never merged a rightmost leaf");
+        }
+        assert!(!txn.loose.is_empty(), "merged leaf pgno must be loose");
+        // The named DB's growth pops the loose list first (GC-8): the freed
+        // main-tree page is re-served as a page of the named tree.
+        for j in 0..n {
+            let (k, v) = wide_kv(j);
+            named.put(&mut txn, &k, &v).unwrap();
+        }
+        // Append to main past its old maximum: any surviving finger for main
+        // would have to re-verify through the reused page and MUST miss.
+        for j in n..n + 40 {
+            let (k, v) = wide_kv(j);
+            main.put_with_flags(&mut txn, PutFlags::APPEND, &k, &v)
+                .unwrap();
+            mm.insert(k, v);
+        }
+        assert_eq!(
+            dump_main_user(&txn, &[b"!thief"]),
+            mm.into_iter().collect::<Vec<_>>()
+        );
+        let expected: Vec<_> = (0..n).map(wide_kv).collect();
+        assert_eq!(dump_db(&named, &txn), expected);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            failure_persistence: None,
+            cases: if cfg!(miri) { 16 } else { 256 },
+            ..Default::default()
+        })]
+
+        /// Random op tapes over the main DB — APPEND bursts, plain ascending
+        /// bursts, out-of-order puts, point deletes, range deletes, clears —
+        /// must match a `BTreeMap` model exactly. The bursts keep the finger
+        /// hot; the other ops exercise every invalidation edge between hits,
+        /// and each hit runs the debug shadow re-descent. Sizes are
+        /// miri-scaled like the case count.
+        #[test]
+        fn finger_random_ops_match_model(
+            ops in proptest::collection::vec(
+                (0u8..6, proptest::prelude::any::<u16>(), proptest::prelude::any::<u16>()),
+                1..if cfg!(miri) { 12usize } else { 48 },
+            ),
+        ) {
+            let env = mem_env_sequential(PS, 8 << 20);
+            let db = env.main_database();
+            let mut txn = env.write_txn().unwrap();
+            let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+            // Ascending key counter for the sequential/APPEND bursts.
+            let mut next: u32 = 0;
+            let mkkey = |i: u32| format!("k{i:08}").into_bytes();
+            let mkval = |a: u16, b: u16| {
+                let mut v = format!("v{a}-{b}-").into_bytes();
+                v.resize(8 + (b % 160) as usize, b'x');
+                v
+            };
+            for &(kind, a, b) in &ops {
+                match kind {
+                    // APPEND burst past the current maximum.
+                    0 => {
+                        for _ in 0..(a % 24) + 1 {
+                            let k = mkkey(next);
+                            let v = mkval(a, b);
+                            db.put_with_flags(&mut txn, PutFlags::APPEND, &k, &v).unwrap();
+                            model.insert(k, v);
+                            next += 1;
+                        }
+                    }
+                    // Plain ascending burst past the current maximum.
+                    1 => {
+                        for _ in 0..(a % 24) + 1 {
+                            let k = mkkey(next);
+                            let v = mkval(b, a);
+                            db.put(&mut txn, &k, &v).unwrap();
+                            model.insert(k, v);
+                            next += 1;
+                        }
+                    }
+                    // Out-of-order put (insert or replace, possibly past the
+                    // max — `next` then moves so APPEND bursts stay legal).
+                    2 => {
+                        let idx = u32::from(a) % (next + 40);
+                        let k = mkkey(idx);
+                        let v = mkval(a, b);
+                        db.put(&mut txn, &k, &v).unwrap();
+                        model.insert(k, v);
+                        next = next.max(idx + 1);
+                    }
+                    // Point delete of an existing key (when any).
+                    3 => {
+                        if let Some(k) = model.keys().nth(a as usize % model.len().max(1)).cloned() {
+                            proptest::prop_assert!(db.delete(&mut txn, &k).unwrap());
+                            model.remove(&k);
+                        }
+                    }
+                    // Range delete between two existing keys.
+                    4 => {
+                        if !model.is_empty() {
+                            let ka = model.keys().nth(a as usize % model.len()).cloned().unwrap();
+                            let kb = model.keys().nth(b as usize % model.len()).cloned().unwrap();
+                            let (lo, hi) = if ka <= kb { (ka, kb) } else { (kb, ka) };
+                            let got = db.delete_range(
+                                &mut txn,
+                                std::ops::Bound::Included(lo.as_slice()),
+                                std::ops::Bound::Included(hi.as_slice()),
+                            ).unwrap();
+                            let covered: Vec<Vec<u8>> = model
+                                .range(lo..=hi)
+                                .map(|(k, _)| k.clone())
+                                .collect();
+                            proptest::prop_assert_eq!(got, covered.len() as u64);
+                            for k in covered {
+                                model.remove(&k);
+                            }
+                        }
+                    }
+                    // Clear (rare: kind == 5 only).
+                    _ => {
+                        db.clear(&mut txn).unwrap();
+                        model.clear();
+                    }
+                }
+            }
+            let want: Vec<(Vec<u8>, Vec<u8>)> =
+                model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            proptest::prop_assert_eq!(dump(&txn), want);
+            proptest::prop_assert_eq!(db.len(&txn).unwrap(), model.len() as u64);
+        }
     }
 }

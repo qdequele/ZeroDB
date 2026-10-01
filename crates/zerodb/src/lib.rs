@@ -32,7 +32,7 @@ pub use zerodb_core::env::{
 };
 pub use zerodb_core::error::{Error, MdbError, Result};
 pub use zerodb_core::nested::NestedRoTxn;
-pub use zerodb_core::page::{FIRST_DATA_PGNO, MAX_KEY_SIZE};
+pub use zerodb_core::page::{FileTrust, FIRST_DATA_PGNO, MAX_KEY_SIZE};
 pub use zerodb_core::rotxn::{
     collect_entries_flagged, for_each_entry_flagged, free_page_count, named_databases, Database,
     DatabaseStat, RoRange, RoTxn, TxnRead,
@@ -123,6 +123,11 @@ impl EnvFlags {
     /// `MDB_MAPASYNC` — with `WRITE_MAP`, use `msync(MS_ASYNC)` for the commit
     /// flushes (SPEC 01 Table 1, §S6). No effect without `WRITE_MAP`.
     pub const MAP_ASYNC: EnvFlags = EnvFlags(0x0010_0000);
+    /// `MDB_NORDAHEAD` — advise the kernel that the map is read at random
+    /// (`madvise(MADV_RANDOM)`), turning off readahead around page faults,
+    /// as LMDB does (SPEC 01 Table 1). Matters when the data does not fit in
+    /// memory and reads are random; it changes no result.
+    pub const NO_READ_AHEAD: EnvFlags = EnvFlags(0x0080_0000);
     /// `MDB_PREVSNAPSHOT` — open on the older of the two meta pages (SPEC 01
     /// Table 1, §S5).
     pub const PREV_SNAPSHOT: EnvFlags = EnvFlags(0x0200_0000);
@@ -163,6 +168,10 @@ pub struct EnvOpenOptions {
     page_size: u32,
     flags: EnvFlags,
     data_file_name: OsString,
+    file_trust: FileTrust,
+    sequential_writes: bool,
+    /// Dirty limit in bytes (ADR-0017); `None` = LMDB's default.
+    max_dirty_bytes: Option<usize>,
 }
 
 impl Default for EnvOpenOptions {
@@ -184,6 +193,9 @@ impl EnvOpenOptions {
             page_size: DEFAULT_PAGE_SIZE,
             flags: EnvFlags::EMPTY,
             data_file_name: OsString::from(DATA_FILE_NAME),
+            file_trust: FileTrust::VALIDATE,
+            sequential_writes: false,
+            max_dirty_bytes: None,
         }
     }
 
@@ -296,6 +308,68 @@ impl EnvOpenOptions {
         &self.data_file_name
     }
 
+    /// Choose the page-validation policy (**ADR-0014**; ZeroDB extension,
+    /// LMDB has no validating mode). Default: [`FileTrust::VALIDATE`], under
+    /// which a corrupt or hostile file yields a typed error.
+    ///
+    /// Passing the value of the `unsafe` [`FileTrust::trust_contents`] makes
+    /// the env read page cells without validating them, as LMDB does; its
+    /// `# Safety` section is the contract. The setter itself is safe because
+    /// only that `unsafe` constructor can produce the trusting value.
+    pub fn file_trust(&mut self, policy: FileTrust) -> &mut EnvOpenOptions {
+        self.file_trust = policy;
+        self
+    }
+
+    /// The configured page-validation policy (ADR-0014).
+    #[must_use]
+    pub fn get_file_trust(&self) -> FileTrust {
+        self.file_trust
+    }
+
+    /// Turn on the sequential-writes fast path for every database of the env
+    /// by default (**ADR-0015**; ZeroDB extension, LMDB has no counterpart).
+    /// Default: off.
+    ///
+    /// With it on, a write txn remembers the path to each tree's rightmost
+    /// leaf and appends there without descending from the root when a key
+    /// sorts after every key already in that leaf. Measured on x86-64:
+    /// ascending and APPEND loads 14–24 % faster, random-key writes 3–5 %
+    /// slower. Results are identical either way. Override it per database
+    /// with [`Env::set_sequential_writes`].
+    pub fn sequential_writes(&mut self, on: bool) -> &mut EnvOpenOptions {
+        self.sequential_writes = on;
+        self
+    }
+
+    /// The configured sequential-writes default (ADR-0015).
+    #[must_use]
+    pub fn get_sequential_writes(&self) -> bool {
+        self.sequential_writes
+    }
+
+    /// Bound a write txn's dirty memory to about `bytes` (**ADR-0017**;
+    /// ZeroDB extension — LMDB's limit is a compile-time constant). Default:
+    /// LMDB's limit, 131,072 dirty pages (512 MiB at 4 KiB pages).
+    ///
+    /// Past the limit, a write txn writes its highest-numbered dirty pages to
+    /// the file at the start of its next mutating call and drops them from
+    /// memory, as LMDB's `mdb_page_spill` does; pages it touches again are
+    /// read back. The limit is `max(bytes / page_size, 128)` pages. Results
+    /// and committed files never depend on it; a lower limit trades memory
+    /// for extra writes in very large txns.
+    pub fn max_dirty_bytes(&mut self, bytes: usize) -> &mut EnvOpenOptions {
+        self.max_dirty_bytes = Some(bytes);
+        self
+    }
+
+    /// The configured dirty limit in bytes (ADR-0017); `None` = LMDB's
+    /// default.
+    #[must_use]
+    pub fn get_max_dirty_bytes(&self) -> Option<usize> {
+        self.max_dirty_bytes
+    }
+
     /// The configured max DBs.
     #[must_use]
     pub fn get_max_dbs(&self) -> u32 {
@@ -381,16 +455,17 @@ impl EnvOpenOptions {
             write_map: self.flags.contains(EnvFlags::WRITE_MAP) && !read_only,
         };
 
-        let opened = zerodb_io::open_or_create(
+        let opened = zerodb_io::open_or_create_with_advice(
             &data_path,
             self.page_size,
             self.map_size,
             DEFAULT_MAP_SIZE,
             read_only,
             durability.write_map,
+            self.flags.contains(EnvFlags::NO_READ_AHEAD),
         )?;
 
-        zerodb_core::env::open_with_backing(
+        zerodb_core::env::open_with_backing_policy(
             canonical_dir,
             opened.backing,
             opened.page_size,
@@ -399,6 +474,10 @@ impl EnvOpenOptions {
             self.max_dbs,
             self.max_readers,
             durability,
+            self.file_trust,
+            self.sequential_writes,
+            self.max_dirty_bytes
+                .map(|b| zerodb_core::env::dirty_limit_pages(Some(b), opened.page_size)),
         )
     }
 }

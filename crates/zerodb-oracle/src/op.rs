@@ -338,6 +338,26 @@ pub enum Op {
         /// Position to delete.
         nth: u8,
     },
+    /// `iter_mut`, advance to the `nth` entry, `del_current`, then **keep
+    /// walking** and report every entry the cursor yields afterwards.
+    ///
+    /// [`Op::IterMutDelCurrent`] stops at the delete, so it compares the
+    /// surviving *content* but never the surviving *position* — the exact
+    /// semantics SPEC 03 §7 pins and whose mechanism PERF-GAP B8a changed.
+    /// This op puts the post-delete cursor position under the differential
+    /// fuzzer: both engines must agree on every entry yielded afterwards,
+    /// including across the leaf merges a long drain provokes.
+    IterMutDelThenWalk {
+        /// Target database index.
+        db: u8,
+        /// Position to delete.
+        nth: u8,
+        /// Entries to read after the delete; 0 means walk to exhaustion.
+        steps: u8,
+        /// Delete every entry the walk visits too — milli's
+        /// `while next { del_current }` drain shape.
+        drain: bool,
+    },
 
     // ---- post-txn verification ----
     /// Open a fresh independent read txn and read a key — models a post-commit

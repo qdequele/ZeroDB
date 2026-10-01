@@ -39,6 +39,8 @@ impl<'a> OverflowRef<'a> {
     ///
     /// [`PageError::WrongPageType`], [`PageError::BadOverflowRun`], or
     /// [`PageError::ReservedFieldNonZero`].
+    // Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+    #[inline(always)]
     pub fn new(buf: &'a [u8], psize: u32) -> Result<OverflowRef<'a>, PageError> {
         validate_page_size(psize)?;
         if buf.len() < psize as usize {
@@ -47,11 +49,11 @@ impl<'a> OverflowRef<'a> {
                 psize: psize as usize,
             });
         }
-        let hdr = CommonHeader::read(buf);
-        if page_type_of(hdr.flags)? != PageType::Overflow {
+        let flags = super::header::read_flags(buf);
+        if page_type_of(flags)? != PageType::Overflow {
             return Err(PageError::WrongPageType {
                 expected: PageType::Overflow,
-                found: page_type_of(hdr.flags)?,
+                found: page_type_of(flags)?,
             });
         }
         let ovf_pages = read_u32(buf, OFF_OVF_PAGES);

@@ -98,7 +98,12 @@ Normative rules are numbered **TXN-n** so tests and the check tool can cite them
   (`MutexGuard: !Send`; the underlying lock may abort on macOS). Acquire
   waits on the condvar until `occupied` is false, then sets it; the guard's
   drop takes the flag mutex briefly *on whatever thread drops it*, clears the
-  flag, and notifies. Writer-panic policy is unchanged: the flag mutex guards
+  flag, and notifies — **only if a waiter is parked** (amended 2026-09-25): the
+  flag mutex also holds a waiter count, incremented before `wait` and
+  decremented after it, so a release that reads zero under the mutex cannot
+  miss a thread about to park. On Linux an unconditional `notify_one` is a
+  `futex_wake` system call per write txn even when uncontended. Writer-panic
+  policy is unchanged: the flag mutex guards
   no txn data (the dirty set died with the unwound `RwTxn`, TXN-60), so a
   poisoned flag mutex is recovered (`PoisonError::into_inner`) rather than
   propagated.
@@ -560,6 +565,45 @@ dirty-page store must be built so it is.
   must fail typed, not SIGBUS (SPEC 06 REC-14). Dirty frames are exempt — a
   writer legitimately allocates pages beyond its base snapshot's `last_pg`,
   and those resolve from the dirty store before the bound is consulted.
+  **Page-validation policy (added 2026-09-28, ADR-0014):** by default a
+  map-sourced tree page is fully validated (every cell) the first time a txn
+  views it, and re-wrapped without checks on later views through the
+  txn-scoped validated-pages memo. An env opened with the trusting
+  `FileTrust` policy skips the cell walk for map pages: on a memo miss they
+  take the O(1) header checks dirty frames take, then enter the memo (page type, reserved fields,
+  free-space bounds). The high-water bound above and the free-list id checks
+  (SPEC 05 GC-18) apply under both policies. Under the trusting policy an
+  overflow value is sliced from its head page without reading the run's header
+  (ADR-0014 amendment, 2026-09-29); the slice stays bounded by the high-water. Under the
+  trusting policy a corrupt page is undefined behaviour, as in LMDB; the
+  policy is the caller's `unsafe` contract (SPEC 00, `file_trust`).
+  **Cross-txn validation cache (added 2026-09-29, ADR-0018):** under the
+  validating policy a txn-memo miss on a map-sourced leaf or branch first
+  probes an env-wide cache keyed by **(pgno, page kind, header txnid stamp)**.
+  An exact hit takes the zero-check view; a miss runs the full cell walk and,
+  on success, records that key. Either way the page enters the txn's memo.
+  Plain read txns use it, borrowing it from the env (opening a txn touches
+  no shared refcount); write txns, the nested read txns that share their
+  parent writer's memo, and env-owning `static_read_txn`s do not (measured:
+  the probe and publish cost more than they save on pages a writer copies
+  on write), and dirty frames never do. Soundness
+  rests on the **page-version identity**: ZeroDB never exposes two byte images
+  of one pgno under the same stamp, because every page a commit writes
+  carries the committing txnid (COW copies are restamped, fresh pages are
+  initialized with it), each pgno is written at most once per commit, a
+  pgno is only reused by a later txn, and aborted or failed commits leave no
+  page reachable from a published snapshot. A reused page therefore carries a
+  newer stamp and misses; no invalidation is needed. The cache starts empty
+  at open, so a corrupt or hostile file is still validated on its first view.
+  It assumes the file changes only through this process's commits (D-001).
+  The table is fixed-size (allocated in chunks as publishes land) and
+  direct-mapped by pgno; each slot is a seqlock, so a
+  lookup racing a publish or a collision only misses (loom model
+  `loom_stamp_cache_never_mixes_publishes`). Tests:
+  `zerodb/tests/page_version_identity.rs` (the identity over churn with
+  overflow values, named DBs, aborts and delayed reuse; short read txns
+  against a model), `stamps::tests`,
+  `btree::tests::stamp_cache_serves_the_exact_page_version_across_txns`.
 
 ### §6.2 — Which operations invalidate which borrows
 
@@ -612,11 +656,70 @@ dirty-page store must be built so it is.
   loose-page path, SPEC 05 GC-8). Because reuse happens only at a `&mut`
   boundary (no borrow outstanding, TXN-39), reusing a freed frame for a new page
   is sound. The store must not `Drop` a frame while a `&self`-scoped borrow into
-  it could still be live — which TXN-39 already precludes.
+  it could still be live — which TXN-39 already precludes. Spilling (§6.3a)
+  also releases frames, likewise only at a `&mut` boundary.
 - **TXN-44** — Growth of the *index* (the pgno→frame map) may reallocate the map
   itself; that is fine — the map stores handles/pointers to frames, and moving a
   pointer does not move the pointee. Only frame *contents* addresses are
   load-bearing for borrows.
+
+### §6.3a — Bounded dirty memory: spilling (ADR-0017, added 2026-09-30)
+
+A write txn's dirty set is bounded, as LMDB bounds it (`mdb_page_spill`): when
+it grows past the env's **dirty limit**, part of it is written to the file
+early and its frames are released.
+
+- **TXN-68 (limit, trigger)** — The dirty limit is counted in pages (an
+  overflow run counts its `N` pages). Default: LMDB's `MDB_IDL_UM_MAX` =
+  131,072 pages; `EnvOpenOptions::max_dirty_bytes` (ZeroDB extension, SPEC 00)
+  sets it to `max(bytes / psize, 128)`. The check runs where no descent path,
+  view or borrow into a frame is live: at the start of every page-mutating
+  `Database` / `RwCursor` call and of `create_database` (after the TXN-29 child
+  guard), and at the top of each leaf step of `delete_range` (which keeps no
+  path across steps). Commit-internal writes (C1a/C1) never spill: commit
+  writes every frame anyway. At each check, if `dirty_pages + NEED > limit`
+  (`NEED` = 64, a fixed estimate of one op's worst-case touches, as LMDB's
+  `need` estimate), the txn spills. An op may still overshoot the limit by its own pages (a large
+  value's run); the next op's check brings it back.
+- **TXN-69 (what is spilled)** — At least `max(NEED, limit / 8)` pages (LMDB's
+  1/8 rule), taken from the dirty frames with the **highest** pgnos first (LMDB
+  flushes its pgno-sorted dirty list from the tail), skipping each open tree's
+  root page (main, GC, open named DBs) and every page a rightmost-leaf finger
+  names (SPEC 03 §6.6) — the pages about to be touched again. The chosen
+  frames are written at their pgnos with the commit's page writer (same
+  batched writes as C2, no fsync), then removed from the store and their pgnos
+  recorded as **spilled** (with their page count). A failed write marks the
+  txn errored (only abort remains); frames leave the store only after their
+  write succeeded.
+- **TXN-70 (what may be written)** — A spilled page is a dirty page, so it
+  satisfies TXN-62: it lies past the committed high-water or was reclaimed
+  under the oldest-reader gate, and no live snapshot references it. Spilling
+  changes when those pages reach the file, not which pages do. The meta is
+  written only at commit (C4); a crash or an abort after a spill leaves the
+  spilled pages as unreferenced bytes (SPEC 06 REC-6 H0 as amended). Nothing is
+  undone on abort; the file may keep a grown, unreferenced tail, as with LMDB.
+- **TXN-71 (reading a spilled page)** — The writer's source resolves a spilled
+  pgno from the map, through the ordinary map path: its TXN-38 high-water bound
+  is the committed high-water **raised past the highest page any spill of this
+  txn has written** (`read_high`). The spill wrote that page, so the file backs
+  every page up to the bound (never-written pages in between read as zeros),
+  and a stray reference into that range fails with a typed validation error,
+  never a fault (under `WRITE_MAP` the whole map is backed anyway). A spilled
+  page's map bytes change only when a later spill rewrites it, and **every
+  spill resets the writer's validated-pages memo**, so a memo entry never
+  outlives the bytes it vouched for. The resolution hot path is unchanged
+  (PERF-GAP B13: an extra spilled-page lookup inlined into every descent cost
+  read rungs 3–13 %). Nested read children read through the same source; no
+  spill runs while one is live (TXN-29 guard precedes the check).
+- **TXN-72 (writing a spilled page again)** — Touching a spilled tree page
+  (COW first-touch, SPEC 03 §5.1) copies its bytes from the map into a fresh
+  frame **at the same pgno** and clears its spilled mark (LMDB
+  `mdb_page_unspill`); the page already carries this txn's id, so there is no
+  new pgno, no parent-pointer rewrite and no free. Freeing a spilled page or run
+  clears its mark and classifies it as loose, like any page this txn
+  allocated. Commit C2 writes the remaining frames only: spilled pages are
+  already on the file with their final bytes. A txn whose only remaining change
+  is spilled pages is not "unchanged" (the commit proceeds).
 
 ### §6.4 — WRITE_MAP variant of the contract
 

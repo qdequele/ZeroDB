@@ -23,8 +23,10 @@ use std::sync::OnceLock;
 use super::cmp::KeyCmp;
 use super::dirty::DirtyStore;
 use super::page::{
-    BranchRef, LeafRef, LeafValue, OverflowRef, PageError, PageRef, PageType, PGNO_INVALID,
+    BranchRef, FileTrust, LeafRef, LeafValue, OverflowRef, PageError, PageRef, PageType,
+    PGNO_INVALID,
 };
+use super::stamps::{StampCache, StampKind};
 
 /// An entry `(key, value)` borrowed from the map for the view's lifetime `'a`.
 pub type Entry<'a> = (&'a [u8], &'a [u8]);
@@ -97,8 +99,13 @@ impl<'a> Source<'a> {
     /// the owning txn's life (a reader's pinned snapshot is GC-protected,
     /// TXN-20/21; a writer buffers every mutation in the dirty store until
     /// commit C2 — including WRITE_MAP, TXN-45a — so the map never changes
-    /// under a live txn). Dirty frames mutate mid-txn and must never be
-    /// trusted from a memo.
+    /// under a live txn). The one exception is a writer's **spilled** pages
+    /// (SPEC 04 §6.3a): they are rewritten in the map only at a spill, and
+    /// every spill resets that writer's memo (TXN-71), so no memo entry
+    /// outlives the bytes it vouched for. Dirty frames mutate mid-txn and
+    /// must never be trusted from a memo.
+    // Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+    #[inline(always)]
     pub(crate) fn bytes_from_classified(
         &self,
         psize: u32,
@@ -185,21 +192,64 @@ pub(crate) enum PageKind {
 /// every initialized level, and nothing here can affect correctness: any
 /// degradation (stale level counter, saturated last level, racing duplicate
 /// insert) is at worst a miss, which revalidates.
-pub struct ValidatedPages {
+pub struct ValidatedPages<'e> {
     levels: [OnceLock<Box<[AtomicU64]>>; MEMO_LEVELS],
     /// Highest level inserts currently target.
     cur: AtomicUsize,
     /// Per-level advisory fill counts (½ load-factor gate only).
     counts: [AtomicUsize; MEMO_LEVELS],
+    /// The env's [`FileTrust`] policy, copied in at txn begin (ADR-0014).
+    /// When set, a memo miss on a map page takes the header-checked
+    /// `new_prevalidated` view, as dirty frames do, and records the page.
+    trust_file: bool,
+    /// The env-wide cache of validated page versions (ADR-0018), probed on
+    /// a validating memo miss for a map page. Borrowed from the env by a
+    /// plain read txn, so opening one touches no shared refcount (an `Arc`
+    /// cloned per txn cost `env/txn/ro_begin_abort` +17 %, and an owning
+    /// variant for `static_read_txn` still cost +7 % in drop glue). `None`
+    /// for write txns, whose map pages are mostly copied on write right
+    /// after (`put/val/v8` +12 % with the cache), for env-owning
+    /// `static_read_txn`s, and under a trusting policy. Kept inside the memo
+    /// so the tree code passes one pointer: a two-word handle cost 4–7 % on
+    /// memo-hit and scan rungs in the codegen-units=16 build.
+    shared: Option<&'e StampCache>,
 }
 
-impl ValidatedPages {
-    pub(crate) fn new() -> ValidatedPages {
+impl ValidatedPages<'static> {
+    #[cfg(test)]
+    pub(crate) fn new() -> ValidatedPages<'static> {
+        ValidatedPages::for_policy(FileTrust::VALIDATE)
+    }
+
+    /// A memo for a txn of an env opened under `policy` (ADR-0014), with no
+    /// env-wide cache (write txns, tools, tests).
+    pub(crate) fn for_policy(policy: FileTrust) -> ValidatedPages<'static> {
+        ValidatedPages::for_reader(policy, None)
+    }
+}
+
+impl<'e> ValidatedPages<'e> {
+    /// A read txn's memo: `policy` (ADR-0014) and the env-wide cache
+    /// (ADR-0018). Under a trusting policy the cache is dropped: the trusted
+    /// memo-miss arm never probes it.
+    pub(crate) fn for_reader(
+        policy: FileTrust,
+        shared: Option<&'e StampCache>,
+    ) -> ValidatedPages<'e> {
         ValidatedPages {
             levels: std::array::from_fn(|_| OnceLock::new()),
             cur: AtomicUsize::new(0),
             counts: std::array::from_fn(|_| AtomicUsize::new(0)),
+            trust_file: policy.is_trusted(),
+            shared: if policy.is_trusted() { None } else { shared },
         }
+    }
+
+    /// `true` when the env was opened with [`FileTrust::trust_contents`]:
+    /// a memo miss on a map page then takes the header-checked view instead
+    /// of the cell walk (ADR-0014).
+    fn trusts_file(&self) -> bool {
+        self.trust_file
     }
 
     /// One slot's stored key: `(pgno | kind_tag) + 1`, so `0` stays "empty".
@@ -221,6 +271,8 @@ impl ValidatedPages {
         z ^ (z >> 31)
     }
 
+    // Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+    #[inline(always)]
     fn contains(&self, pgno: u64, kind: PageKind) -> bool {
         let key = Self::key_of(pgno, kind);
         // Ordering: `Acquire` here pairs with the `Release` slot publication
@@ -311,7 +363,7 @@ pub(crate) fn leaf_view<'a>(
     src: Source<'a>,
     psize: u32,
     pgno: u64,
-    valid: Option<&ValidatedPages>,
+    valid: Option<&ValidatedPages<'_>>,
 ) -> Result<LeafRef<'a>, PageError> {
     let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
     leaf_view_over(bytes, from_map, psize, pgno, valid)
@@ -324,7 +376,7 @@ fn leaf_view_over<'a>(
     from_map: bool,
     psize: u32,
     pgno: u64,
-    valid: Option<&ValidatedPages>,
+    valid: Option<&ValidatedPages<'_>>,
 ) -> Result<LeafRef<'a>, PageError> {
     match valid {
         Some(v) => {
@@ -332,10 +384,19 @@ fn leaf_view_over<'a>(
                 if v.contains(pgno, PageKind::Leaf) {
                     // Kind-tagged hit: zero checks (PERF-GAP A8).
                     Ok(LeafRef::new_trusted(bytes))
-                } else {
-                    let leaf = LeafRef::new(bytes, psize)?;
+                } else if v.trusts_file() {
+                    // ADR-0014: the caller's `trust_contents` contract stands
+                    // in for the cell walk, as in LMDB; the O(1) header checks
+                    // (page type included) still run. Tested only on a memo
+                    // miss, so a validating memo hit runs the code it ran
+                    // before the option existed. Recorded like a validated
+                    // page, so later views of it take the same zero-check hit
+                    // path (the kind tag was just checked).
+                    let leaf = LeafRef::new_prevalidated(bytes, psize)?;
                     v.insert(pgno, PageKind::Leaf);
                     Ok(leaf)
+                } else {
+                    validate_leaf_miss(bytes, psize, pgno, v)
                 }
             } else {
                 // Engine-authored dirty frame (PERF-GAP batch 3): a frame is
@@ -352,12 +413,73 @@ fn leaf_view_over<'a>(
     }
 }
 
+/// A validating memo miss on a map leaf: a hit in the env-wide cache of
+/// validated page versions (ADR-0018) — same pgno, kind **and** header stamp,
+/// so the same immutable bytes — takes the zero-check view; otherwise the
+/// full cell walk runs and its success is published there. Either way the
+/// page enters this txn's memo. Out of line so the memo-hit path keeps its
+/// shape (PERF-GAP B13).
+#[inline(never)]
+fn validate_leaf_miss<'a>(
+    bytes: &'a [u8],
+    psize: u32,
+    pgno: u64,
+    v: &ValidatedPages<'_>,
+) -> Result<LeafRef<'a>, PageError> {
+    let leaf = match v.shared {
+        Some(cache) => {
+            let stamp = page_stamp(bytes);
+            if cache.contains(pgno, StampKind::Leaf, stamp) {
+                LeafRef::new_trusted(bytes)
+            } else {
+                let leaf = LeafRef::new(bytes, psize)?;
+                cache.publish(pgno, StampKind::Leaf, stamp);
+                leaf
+            }
+        }
+        None => LeafRef::new(bytes, psize)?,
+    };
+    v.insert(pgno, PageKind::Leaf);
+    Ok(leaf)
+}
+
+/// As [`validate_leaf_miss`], for branch pages.
+#[inline(never)]
+fn validate_branch_miss<'a>(
+    bytes: &'a [u8],
+    psize: u32,
+    pgno: u64,
+    v: &ValidatedPages<'_>,
+) -> Result<BranchRef<'a>, PageError> {
+    let br = match v.shared {
+        Some(cache) => {
+            let stamp = page_stamp(bytes);
+            if cache.contains(pgno, StampKind::Branch, stamp) {
+                BranchRef::new_trusted(bytes)
+            } else {
+                let br = BranchRef::new(bytes, psize)?;
+                cache.publish(pgno, StampKind::Branch, stamp);
+                br
+            }
+        }
+        None => BranchRef::new(bytes, psize)?,
+    };
+    v.insert(pgno, PageKind::Branch);
+    Ok(br)
+}
+
+/// The writer-txnid stamp of a page (header offset 8, SPEC 02 §2). `bytes`
+/// is a resolved map page, at least one page long.
+fn page_stamp(bytes: &[u8]) -> u64 {
+    crate::page::read_page_txnid(bytes)
+}
+
 /// As [`leaf_view`], for branch pages.
 pub(crate) fn branch_view<'a>(
     src: Source<'a>,
     psize: u32,
     pgno: u64,
-    valid: Option<&ValidatedPages>,
+    valid: Option<&ValidatedPages<'_>>,
 ) -> Result<BranchRef<'a>, PageError> {
     let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
     branch_view_over(bytes, from_map, psize, pgno, valid)
@@ -369,7 +491,7 @@ fn branch_view_over<'a>(
     from_map: bool,
     psize: u32,
     pgno: u64,
-    valid: Option<&ValidatedPages>,
+    valid: Option<&ValidatedPages<'_>>,
 ) -> Result<BranchRef<'a>, PageError> {
     match valid {
         Some(v) => {
@@ -377,10 +499,13 @@ fn branch_view_over<'a>(
                 if v.contains(pgno, PageKind::Branch) {
                     // Kind-tagged hit: zero checks (PERF-GAP A8).
                     Ok(BranchRef::new_trusted(bytes))
-                } else {
-                    let br = BranchRef::new(bytes, psize)?;
+                } else if v.trusts_file() {
+                    // ADR-0014 — see [`leaf_view`].
+                    let br = BranchRef::new_prevalidated(bytes, psize)?;
                     v.insert(pgno, PageKind::Branch);
                     Ok(br)
+                } else {
+                    validate_branch_miss(bytes, psize, pgno, v)
                 }
             } else {
                 // Engine-authored dirty frame — see [`leaf_view`].
@@ -406,11 +531,13 @@ pub(crate) enum NodeView<'a> {
     Branch(BranchRef<'a>),
 }
 
+// Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+#[inline(always)]
 pub(crate) fn node_view<'a>(
     src: Source<'a>,
     psize: u32,
     pgno: u64,
-    valid: Option<&ValidatedPages>,
+    valid: Option<&ValidatedPages<'_>>,
 ) -> Result<NodeView<'a>, PageError> {
     let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
     let page = PageRef::new_trusted_psize(bytes, psize)?;
@@ -430,16 +557,33 @@ pub(crate) fn node_view<'a>(
 /// Resolve the value of leaf entry `i` to a contiguous `&'a [u8]` (SPEC 03 §3):
 /// inline values borrow the leaf page; `F_BIGDATA` values borrow the overflow
 /// run, sliced from the head page across the whole run.
+///
+/// Under the trusting policy (ADR-0014, amended 2026-09-29) an overflow value
+/// is sliced from its head page without reading the run's header, as LMDB's
+/// `mdb_node_read` computes the data address from the page number alone. The
+/// slice stays bounded by the snapshot's high-water (`Source::bytes_from`
+/// clamps there), so a corrupt run can only yield wrong bytes or a typed
+/// error, never a read outside the committed map.
 fn resolve_value<'a>(
     src: Source<'a>,
     psize: u32,
     leaf: &LeafRef<'a>,
     i: usize,
+    valid: Option<&ValidatedPages<'_>>,
 ) -> Result<&'a [u8], PageError> {
     match leaf.value(i) {
         LeafValue::Inline(v) => Ok(v),
         LeafValue::Overflow { head_pgno, dsize } => {
             let run = src.bytes_from(psize, head_pgno)?;
+            if valid.is_some_and(ValidatedPages::trusts_file) {
+                let end = crate::page::HEADER_SIZE + dsize as usize;
+                return run
+                    .get(crate::page::HEADER_SIZE..end)
+                    .ok_or(PageError::BufferTooSmall {
+                        got: run.len(),
+                        psize: end,
+                    });
+            }
             OverflowRef::new(run, psize)?.payload(dsize)
         }
     }
@@ -466,7 +610,7 @@ pub struct Tree<'a> {
     /// The owning txn's validated-pages memo, if it provides one
     /// ([`ValidatedPages`]); `None` (always fully validate) for tests, tools
     /// and the GC tree.
-    valid: Option<&'a ValidatedPages>,
+    valid: Option<&'a ValidatedPages<'a>>,
 }
 
 impl<'a> Tree<'a> {
@@ -503,7 +647,10 @@ impl<'a> Tree<'a> {
     /// through this tree then skip re-validating cells of map-sourced pages
     /// already validated this txn; without it every view fully validates.
     #[must_use]
-    pub(crate) fn with_validation_memo(mut self, valid: Option<&'a ValidatedPages>) -> Tree<'a> {
+    pub(crate) fn with_validation_memo(
+        mut self,
+        valid: Option<&'a ValidatedPages<'a>>,
+    ) -> Tree<'a> {
         self.valid = valid;
         self
     }
@@ -528,19 +675,42 @@ impl<'a> Tree<'a> {
     ///
     /// A [`PageError`] only if the tree is structurally corrupt.
     pub fn get(&self, key: &[u8]) -> Result<Option<&'a [u8]>, PageError> {
-        let mut c = Cursor::new(*self);
-        c.search(key)?;
-        if !c.initialized {
+        match self.find_exact(key)? {
+            Some((leaf, ki)) => Ok(Some(resolve_value(
+                self.src, self.psize, &leaf, ki, self.valid,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Root-to-leaf descent for an exact point lookup: the leaf holding `key`
+    /// and its slot, or `None` if absent. No cursor: a point lookup needs no
+    /// path, so it skips the [`PathStack`] and the leaf cache, and it takes
+    /// exactness from the leaf's binary search instead of comparing the found
+    /// key a second time. LMDB's `mdb_node_search` reports exactness the same
+    /// way, and `mdb_cursor_init` only resets the depth. The level bound and
+    /// its error match [`Cursor::search`]: `depth + 2` iterations, capped at
+    /// the `CURSOR_STACK` frames its path stack can push, so a hostile depth
+    /// over a page cycle fails after the same number of levels.
+    fn find_exact(&self, key: &[u8]) -> Result<Option<(LeafRef<'a>, usize)>, PageError> {
+        if self.root == PGNO_INVALID {
             return Ok(None);
         }
-        let (pgno, ki) = *c.stack.last().expect("initialized cursor has a leaf frame");
-        // The search just cached this leaf's view — no re-resolution.
-        let leaf = c.leaf_at(pgno)?;
-        if ki < leaf.num_keys() && self.cmp.eq(leaf.key(ki), key) {
-            Ok(Some(resolve_value(self.src, self.psize, &leaf, ki)?))
-        } else {
-            Ok(None)
+        let mut pgno = self.root;
+        for _ in 0..(self.depth as usize + 2).min(CURSOR_STACK) {
+            match node_view(self.src, self.psize, pgno, self.valid)? {
+                NodeView::Leaf(leaf) => {
+                    return Ok(match leaf.lookup_with(key, self.cmp) {
+                        Ok(ki) => Some((leaf, ki)),
+                        Err(_) => None,
+                    });
+                }
+                NodeView::Branch(br) => {
+                    pgno = br.child_pgno(br.child_index_with(key, self.cmp));
+                }
+            }
         }
+        Err(depth_exceeded())
     }
 
     /// Catalog lookup for the named-DB resolver (SPEC 02 §6): like [`Tree::get`]
@@ -552,22 +722,15 @@ impl<'a> Tree<'a> {
     ///
     /// A [`PageError`] only if the tree is structurally corrupt.
     pub fn get_catalog_entry(&self, key: &[u8]) -> Result<Option<(u16, &'a [u8])>, PageError> {
-        let mut c = Cursor::new(*self);
-        c.search(key)?;
-        if !c.initialized {
-            return Ok(None);
-        }
-        let (pgno, ki) = *c.stack.last().expect("initialized cursor has a leaf frame");
-        // The search just cached this leaf's view — no re-resolution.
-        let leaf = c.leaf_at(pgno)?;
-        if ki < leaf.num_keys() && self.cmp.eq(leaf.key(ki), key) {
-            let flags = leaf.node_flags(ki);
-            Ok(Some((
-                flags,
-                resolve_value(self.src, self.psize, &leaf, ki)?,
-            )))
-        } else {
-            Ok(None)
+        match self.find_exact(key)? {
+            Some((leaf, ki)) => {
+                let flags = leaf.node_flags(ki);
+                Ok(Some((
+                    flags,
+                    resolve_value(self.src, self.psize, &leaf, ki, self.valid)?,
+                )))
+            }
+            None => Ok(None),
         }
     }
 
@@ -604,7 +767,7 @@ impl<'a> Tree<'a> {
             });
         }
         let k = leaf.key(ki);
-        let v = resolve_value(self.src, self.psize, &leaf, ki)?;
+        let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
         Ok((k, v))
     }
 }
@@ -670,12 +833,29 @@ impl PathStack {
         self.len
     }
 
+    /// The live frames as one mutable slice, for the write path's
+    /// `touch_path`/`rebalance` (which take `&mut [(u64, usize)]`). Lets a
+    /// parked cursor's path be deleted at directly, with no descent and no
+    /// `Vec` (SPEC 03 §5.4a).
+    fn frames_mut(&mut self) -> &mut [(u64, usize)] {
+        &mut self.buf[..self.len]
+    }
+
     fn last(&self) -> Option<&(u64, usize)> {
         self.buf[..self.len].last()
     }
 
     fn last_mut(&mut self) -> Option<&mut (u64, usize)> {
         self.buf[..self.len].last_mut()
+    }
+
+    /// Drop frame 0 (the root frame), shifting the rest down: the write
+    /// path's root-shrink repair (SPEC 03 §5.4a) — the old root left the tree
+    /// and its only child, frame 1, is the new root frame.
+    fn drop_root(&mut self) {
+        debug_assert!(self.len >= 2, "root pop needs a frame below the root");
+        self.buf.copy_within(1..self.len, 0);
+        self.len -= 1;
     }
 }
 
@@ -719,7 +899,7 @@ pub struct Cursor<'a> {
     leaf_cache: Cell<Option<(u64, LeafRef<'a>)>>,
     /// The owning txn's validated-pages memo (PERF-GAP A2), copied from the
     /// [`Tree`] this cursor was opened on.
-    valid: Option<&'a ValidatedPages>,
+    valid: Option<&'a ValidatedPages<'a>>,
 }
 
 impl<'a> Cursor<'a> {
@@ -743,6 +923,8 @@ impl<'a> Cursor<'a> {
     /// The validated leaf view for `pgno`, reusing the memoized one while the
     /// cursor stays on the same page (see [`Cursor::leaf_cache`]). A miss goes
     /// through the txn's validated-pages memo ([`leaf_view`]).
+    // Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+    #[inline(always)]
     fn leaf_at(&self, pgno: u64) -> Result<LeafRef<'a>, PageError> {
         if let Some((cached, leaf)) = self.leaf_cache.get() {
             if cached == pgno {
@@ -775,7 +957,7 @@ impl<'a> Cursor<'a> {
             return Ok(None);
         }
         let k = leaf.key(ki);
-        let v = resolve_value(self.src, self.psize, &leaf, ki)?;
+        let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
         Ok(Some((k, v)))
     }
 
@@ -954,6 +1136,41 @@ impl<'a> Cursor<'a> {
             self.stack.last_mut().expect("leaf frame").1 = ki + 1;
             return self.current();
         }
+        self.ascend_next()
+    }
+
+    /// Yield the entry at the slot the cursor already sits on, **without
+    /// advancing** (SPEC 03 §7 / §5.4a; LMDB's `C_DEL` resume).
+    ///
+    /// The write cursor parks here after `del_current`: the vacated slot now
+    /// holds the deleted entry's successor, so `next` must settle rather than
+    /// step. If the delete vacated the leaf's last slot the successor lives on
+    /// the following leaf, which is where `ascend_next` from the last live slot
+    /// lands.
+    ///
+    /// Only the write cursor's post-delete path calls this; a cursor that has
+    /// not just deleted must use [`next`](Self::next).
+    pub(crate) fn settle(&mut self) -> PosResult<'a> {
+        if !self.initialized {
+            return self.first();
+        }
+        if self.eof {
+            return Ok(None);
+        }
+        let (pgno, ki) = *self
+            .stack
+            .last()
+            .expect("initialized cursor has a leaf frame");
+        let leaf = self.leaf_at(pgno)?;
+        let nkeys = leaf.num_keys();
+        if ki < nkeys {
+            return self.current();
+        }
+        // The vacated slot was past the last live cell. An empty leaf cannot
+        // reach here: emptying one is a structural change (§10), and the write
+        // cursor discards its path on those rather than parking.
+        debug_assert!(nkeys > 0, "settle on an empty leaf");
+        self.stack.last_mut().expect("leaf frame").1 = nkeys.saturating_sub(1);
         self.ascend_next()
     }
 
@@ -1162,6 +1379,21 @@ impl SavedCursor {
             return None;
         }
         self.stack.last().copied()
+    }
+
+    /// The parked root-to-leaf path as a mutable slice, so the write path can
+    /// delete at it directly — no descent, no allocation (SPEC 03 §5.4a).
+    /// `touch_path` rewrites the pgnos in place as it COWs, which is exactly
+    /// the remap the parked path needs.
+    pub(crate) fn frames_mut(&mut self) -> &mut [(u64, usize)] {
+        self.stack.frames_mut()
+    }
+
+    /// Apply the root-shrink repair to the parked path (SPEC 03 §5.4a): the
+    /// delete's rebalance freed the old root branch, so frame 0 goes and the
+    /// surviving child becomes the root frame.
+    pub(crate) fn drop_root(&mut self) {
+        self.stack.drop_root();
     }
 }
 
@@ -1471,6 +1703,76 @@ mod tests {
     /// (miri's weak-memory machinery checks the Acquire/Release pairs); loom
     /// is deliberately not wired: the memo's contract is advisory (any race
     /// outcome is at worst a miss → revalidation), unlike the reader table's.
+    /// ADR-0014: under the trusting policy a map page skips the per-cell
+    /// walk (a corrupt node pointer is not looked at) but keeps the O(1)
+    /// header checks (page type); the validating memo rejects the same page.
+    /// The trusted view is built and dropped without reading any cell.
+    #[test]
+    fn trusting_policy_skips_the_cell_walk_but_checks_the_type() {
+        let entries: Vec<_> = (0..8u8).map(|i| kv(&[b'k', i], b"v")).collect();
+        let (mut img, root, depth) = build(&entries);
+        assert_eq!(depth, 1, "a single leaf root");
+        let off = root as usize * PS as usize + crate::page::HEADER_SIZE;
+        img[off..off + 2].copy_from_slice(&0xFFF0u16.to_le_bytes());
+
+        let validating = ValidatedPages::new();
+        assert!(leaf_view(src(&img), PS, root, Some(&validating)).is_err());
+
+        // The corrupt page is wrapped but no cell accessor runs, so nothing
+        // reads through the bad pointer.
+        let trusting = ValidatedPages::for_policy(FileTrust::trusting_for_tests());
+        let view = leaf_view(src(&img), PS, root, Some(&trusting)).expect("header checks pass");
+        assert_eq!(view.num_keys(), entries.len());
+        assert!(
+            matches!(
+                branch_view(src(&img), PS, root, Some(&trusting)),
+                Err(PageError::WrongPageType { .. })
+            ),
+            "the page type stays checked when trusted"
+        );
+    }
+
+    /// ADR-0018: a leaf fully validated by one txn is taken from the env-wide
+    /// cache by the next txn's first view, keyed by its exact header stamp.
+    /// Shown by corrupting a cell after the first view, keeping the stamp: a
+    /// later txn with the same cache is served from the cache (the stated
+    /// limit: bytes changed under the env with an old stamp are trusted),
+    /// while a different stamp, a txn without the cache, or the other page
+    /// kind misses and fails validation. No cell accessor runs on the corrupt
+    /// view.
+    #[test]
+    fn stamp_cache_serves_the_exact_page_version_across_txns() {
+        let entries: Vec<_> = (0..8u8).map(|i| kv(&[b'k', i], b"v")).collect();
+        let (mut img, root, depth) = build(&entries);
+        assert_eq!(depth, 1, "a single leaf root");
+        let cache = StampCache::new();
+        let reader = || ValidatedPages::for_reader(FileTrust::VALIDATE, Some(&cache));
+        let first = reader();
+        leaf_view(src(&img), PS, root, Some(&first)).expect("clean leaf validates");
+
+        let off = root as usize * PS as usize + crate::page::HEADER_SIZE;
+        img[off..off + 2].copy_from_slice(&0xFFF0u16.to_le_bytes());
+
+        let second = reader();
+        let view = leaf_view(src(&img), PS, root, Some(&second)).expect("served from the cache");
+        assert_eq!(view.num_keys(), entries.len());
+
+        let alone = ValidatedPages::new();
+        assert!(
+            leaf_view(src(&img), PS, root, Some(&alone)).is_err(),
+            "without the cache the corrupt cell is caught"
+        );
+
+        let restamped = reader();
+        let stamp_off = root as usize * PS as usize + 8;
+        let old = u64::from_le_bytes(img[stamp_off..stamp_off + 8].try_into().unwrap());
+        img[stamp_off..stamp_off + 8].copy_from_slice(&(old + 1).to_le_bytes());
+        assert!(
+            leaf_view(src(&img), PS, root, Some(&restamped)).is_err(),
+            "a newer stamp is a new page version: it misses and is validated"
+        );
+    }
+
     #[test]
     fn validated_pages_concurrent_insert_contains() {
         let vp = ValidatedPages::new();

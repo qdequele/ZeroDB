@@ -190,6 +190,8 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     /// # Errors
     ///
     /// `Encoding`/`Decoding` on codec failure; `Mdb(Invalid)` on corruption.
+    // Hint: inlined only at a raised LLVM threshold (PERF-GAP B13).
+    #[inline]
     pub fn get<'a, 'txn>(&self, txn: &'txn RoTxn, key: &'a KC::EItem) -> Result<Option<DC::DItem>>
     where
         KC: BytesEncode<'a>,

@@ -38,6 +38,7 @@ pub mod page;
 pub(crate) mod readers;
 pub mod rotxn;
 pub mod rwtxn;
+pub(crate) mod stamps;
 pub(crate) mod sync;
 
 pub use env::{CommitHook, HookPoint, Snapshot};

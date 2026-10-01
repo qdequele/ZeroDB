@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use zerodb::{CommitHook, HookPoint};
-use zerodb_core::env::open_with_backing;
+use zerodb_core::env::open_with_backing_policy;
 use zerodb_io::fault::{
     splitmix64, CapturedDisk, FaultBacking, FaultHandle, FaultPlan, Rng, WriteFate,
 };
@@ -177,7 +177,7 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
     if opts.broken_barriers {
         handle.set_broken_data_barriers(true);
     }
-    let env = open_with_backing(
+    let env = open_with_backing_policy(
         opts.env_path.clone(),
         Box::new(fault),
         spec.page_size,
@@ -186,6 +186,9 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
         16,
         126,
         spec.mode.durability(),
+        zerodb::FileTrust::VALIDATE,
+        false,
+        spec.dirty_limit,
     )
     .map_err(|e| abandon(format!("env open: {e}")))?;
 

@@ -344,16 +344,15 @@ copied and how pgnos propagate):
    commit (SPEC 02 §3).
 4. **Cursor fix-up.** After a page is copied/split/merged, every live cursor in
    the same txn positioned on the affected page(s) must still point at the
-   logically-same entry. *(Clarified 2026-07-16, M1.4 / ADR-0004 D5.)* LMDB
-   tracks and repairs **sibling** cursors because C permits many live cursors
-   in one write txn; under ZeroDB's borrow model **at most one cursor can
-   exist across a mutation** — mutations reach the tree through `&mut RwTxn`
-   or through the single write cursor holding it exclusively — so fix-up
-   reduces to the *acting* cursor's own position. The M1.4 write cursor tracks
-   its position **by key** and re-seeks after each of its own mutations, which
-   is trivially stable across splits/merges; no sibling-cursor tracking
-   infrastructure exists (observable behavior is oracle-gated either way). If
-   a later phase exposes concurrent write cursors, that requires a new ADR.
+   logically-same entry. *(Clarified 2026-07-16, M1.4 / ADR-0004 D5; mechanism
+   de-mandated 2026-09-10 — see §5.4a.)* LMDB tracks and repairs **sibling**
+   cursors because C permits many live cursors in one write txn; under ZeroDB's
+   borrow model **at most one cursor can exist across a mutation** — mutations
+   reach the tree through `&mut RwTxn` or through the single write cursor
+   holding it exclusively — so fix-up reduces to the *acting* cursor's own
+   position. No sibling-cursor tracking infrastructure exists. If a later phase
+   exposes concurrent write cursors, that requires a new ADR.
+
 5. **Overflow pages are COW'd as whole runs**: modifying a BIGDATA value frees
    the old run and allocates a new one (§8); overflow pages are never edited in
    place across txns.
@@ -362,6 +361,86 @@ miri must exercise get-then-put sequences (PLAN 1.4): a `&[u8]` obtained by
 `get` before a `put` must not dangle — enforced by SPEC 04's dirty-page
 stability contract; this doc requires only that COW never *moves* an
 already-dirty page's backing storage while a borrow into it is live.
+
+### §5.4a — Position preservation is a contract, not a mechanism (AMENDED 2026-09-10)
+
+The M1.4 rule read: *"The M1.4 write cursor tracks its position **by key** and
+re-seeks after each of its own mutations, which is trivially stable across
+splits/merges."* That described the implementation and, by sitting in a
+normative list, **mandated** it. It is hereby demoted to one permitted
+mechanism among others.
+
+**The requirement.** After any mutation performed *through* a cursor, that
+cursor's **logical** position MUST be unchanged — the entry a subsequent
+`next` / `prev` / `get_current` yields MUST be the one the pre-mutation
+position defines (§4, and §7 for the post-delete case). Nothing else is
+required. In particular the spec does **not** require that the position be
+*recomputed*, only that it be *correct*.
+
+**Permitted mechanisms.** An implementation MAY:
+
+- re-derive the position by key on the next access (the M1.4 mechanism); or
+- **retain the physical path** (`(pgno, ki)` per level) across the mutation
+  and resume from it; or
+- retain it in the cases where it provably survives and re-derive otherwise.
+
+**Obligations if a path is retained.** The retained path MUST be discarded, or
+repaired, whenever the mutation could have moved the entry it names. At minimum:
+
+| event | effect on a retained path |
+|---|---|
+| COW of any page on the path (§5.1–§5.3) | pgnos on the path change; the path MUST be remapped to the new pgnos |
+| cell removal/insertion on the cursor's own leaf | `ki` on that leaf shifts; MUST be adjusted |
+| borrow from a sibling (§10) | entries move between two leaves and a parent separator is rewritten; the path MUST be adjusted or discarded |
+| merge (§10) | one leaf is freed and its entries move to the sibling; the path MUST be repaired to the surviving page or discarded |
+| root shrink (§9) | tree depth changes; the path MUST be truncated or discarded |
+| any error that poisons the txn (SPEC 04) | the cursor is unusable; no obligation |
+
+Discarding is always a correct implementation of "repair"; it costs a re-seek,
+which is exactly the M1.4 mechanism applied selectively.
+
+**Implemented repair table (2026-09-27, leftmost pairing only).** The engine
+retains the path across `del_current` and repairs it for the structural cases
+below; everything else discards. The rebalance reports one of *unchanged*
+(no structural change — the path is valid as-is), *kept* (repaired per this
+table), *kept + root pop* (as kept, plus frame 0 must be dropped), or
+*invalidated* (discard and re-seek). The repairs apply **only when the
+rebalanced page is its parent's child 0** — the §10 sibling choice then
+always pairs it with its RIGHT sibling — which is every delete of a
+front-to-back drain (milli's `del_current` loops). The "from left" pairing
+(child ≥ 1) is not repaired in this iteration.
+
+| §10 event at a level (page P = parent's child 0) | per-level repair |
+|---|---|
+| borrow from the right sibling (leaf or branch), no ancestor split | keep every frame as-is: P keeps its pgno (it is already dirty), the moved entry is *appended* at/after the vacated `ki` (so the slot still holds the successor when the tail was deleted), and the parent's separator rewrite at child 1 moves no lower-indexed child |
+| merge with the right sibling (right into left = P), right sibling non-empty | keep every frame as-is: P survives with its pgno, the sibling's cells land at/after the vacated `ki`, the parent only loses child 1; the parent level then re-enters this table (merge cascade) |
+| root shrink to the remaining branch child (§9) | pop frame 0: the surviving child is the single-child root's child 0, which is exactly the path's frame 1 |
+| any ancestor **split** during a separator rewrite (a longer separator can split the parent, up to a root grow) | invalidate — splits move sibling frames and can add a level; not followed |
+| the "from left" pairing (P is child ≥ 1) | invalidate — not implemented in this iteration |
+| root shrink to empty (last entry deleted) | invalidate — the path names a freed page |
+| right sibling with zero cells (hostile image) | invalidate — the vacated slot could sit past an empty leaf |
+
+**Debug shadow check (mandatory while a path is retained).** In debug builds
+(`debug_assertions`), after every delete that keeps the path — repaired or
+untouched — the engine re-runs a fresh root-to-leaf search for the deleted key
+and asserts it reproduces the kept path exactly: same `pgno` and same `ki` at
+every level (the deleted key's insertion slot IS the vacated slot), the key
+absent, and, when the vacated slot is live, the entry it holds strictly greater
+than the deleted key under the tree's ordering. Every `cargo test`, fuzz and
+stress run therefore re-derives every kept path; a repair bug fails loudly
+instead of silently skipping or repeating entries in a cursor drain.
+
+**Why this was changed.** The mandate cost two full root-to-leaf descents per
+entry on `del_current` (one for the delete, one for the following re-seek),
+which made ZeroDB's cursor-delete loop **4.2×** the fork's — where LMDB's is
+*cheaper* than its own point delete because `C_DEL` resumes in place. That is
+`del_current`'s dominant cost and it is paid at nine `del_current` call sites in
+milli, four of them in the current indexer. Measured on the real server, the
+`prefix_iter_mut` + `del_current` loop in
+`post_processing::prefix::delete_prefixes` runs at **3.63×**
+(PERF-GAP **B8a**; `benches/results/2026-09-10-meilisearch-delete-heavy-macos.md`).
+The contract above is what the fork actually guarantees; the re-seek was never
+part of it.
 
 ---
 
@@ -373,6 +452,8 @@ already-dirty page's backing storage while a borrow into it is live.
 put(key, value, flags):
     validate: 1 <= key.len <= 511 else BadValSize (empty key rejected)   # SPEC01 §S4
               value.len <= MAX_DATA_SIZE else BadValSize
+    if the tree's sequential-writes setting is on and its rightmost-leaf finger
+        hits: insert there, skip the descent (§6.6; ADR-0015)
     if flags has APPEND: see §6.3
     c = search(tree, key)                       # COW along the descent path (§5)
     if c positioned on entrykey == key:         # key exists
@@ -552,6 +633,92 @@ key's *child pointer* becomes right page's node-0 (empty-key) child. Contrast
 leaf split, where the split key stays in the right leaf (leaves hold data, so no
 key is discarded).
 
+### §6.6 — Rightmost-leaf finger (writer-private fast path; roadmap #6, 2026-09-28)
+
+A pure in-memory write-txn optimization for sequential and APPEND loads
+(milli's sorted bulk pattern): **nothing observable changes** — not the on-disk
+format, not the put semantics, not the split policy — only which descent code
+computes the target leaf. This is PostgreSQL 11 nbtree's rightmost-leaf
+fastpath (commit `2b272734`) adapted to COW txns; LMDB has no equivalent to
+mirror (`mdb_put` initializes a fresh cursor per call, and even `MDB_APPEND`
+re-descends via `mdb_cursor_last`), so this is a documented non-LMDB lever.
+
+**Opt-in (ADR-0015, 2026-09-28).** The finger runs only for trees whose
+sequential-writes setting is on: the env option `sequential_writes` (default
+off) or a per-database override. A write txn resolves the setting once per
+tree (the main DB at begin, a named DB when first touched); the GC tree never
+has a finger. For a tree with the setting off, `put` neither tests nor
+establishes a finger, and the invalidation hooks below are no-ops on an empty
+finger table. On valid inputs the committed file is byte-identical with the
+setting on or off.
+
+**What is cached.** Per tree touched by the write txn, at most one *finger*:
+the full root-to-rightmost-leaf descent path (`(pgno, ki)` per level — full so
+a hit can run the ordinary §6.2 insert, §6.4 end-of-page split included,
+against it). Branch `ki`s are the right spine (`num_keys − 1` at every level);
+the leaf `ki` is not trusted (the insertion slot is recomputed from the live
+leaf at use time). The finger is writer-private: readers, nested read children
+and the commit pipeline never consult it, and it dies with the txn.
+
+**F1 — hit rule.** A put takes the fast path iff ALL of:
+1. the tree has a live finger, and every frame on it is **dirty in this txn**
+   — verified at use time, never assumed from establishment — so the insert
+   needs no COW (`touch_path` would no-op on every frame);
+2. the spine re-verifies against the **current** working record: `path[0] ==
+   rec.root`, `len == rec.depth`, every branch frame decodes as a branch with
+   `ki == num_keys − 1` and `child(ki)` naming the next frame, and the last
+   frame decodes as a non-empty leaf. A passing walk *is* the tree's current
+   rightmost descent (it re-proves the path through live child pointers), so a
+   hit's correctness rests on this re-verification, not on F3's completeness;
+3. `key` sorts **strictly greater** than the leaf's last key under the tree's
+   comparator (§2.0). This is APPEND's §6.3 validation, and for a plain put it
+   proves the key absent — so `NO_OVERWRITE` cannot fail and the hit is always
+   a fresh insert (never a §6.1 replace).
+
+On a hit the engine runs the SAME leaf insert as the descent path (§6.2,
+including the BIGDATA/RESERVE arms and the §6.4 end-of-page split — the hit's
+insert is always an end insert, so a full leaf splits exactly as APPEND's
+does), with only the descent and `touch_path` skipped. Anything else — no
+finger, any failed check, `key ≤` last — is a **miss**: the finger is dropped
+and the put proceeds through §6/§6.3 unchanged.
+
+**F2 — establishment.** After a put that inserted (not replaced) through the
+normal descent, the finger is set from the op's final (fully-COWed) path iff
+the op provably left it as the right spine: no depth or page count moved (no
+split — a split relocates the rightmost leaf and leaves the path frames
+stale), the inserted slot is the leaf's last, and the spine passes the F1
+walk. A fast-path hit that did not split keeps the finger as is. The GC (Free)
+tree is deliberately never fingered: it is written almost solely inside
+`freelist_save` (GC-11..13), whose rewrite/delete interleaving would
+invalidate a finger at every step.
+
+**F3 — invalidation.** The finger is dropped by:
+- any fast-path **miss** (the slow put may restructure the tree; its descent
+  re-establishes per F2) and any fast-path insert that **split**;
+- every **delete entry** on its tree: point delete (`delete_at_path`, which
+  also serves the write cursor's `del_current`), each `delete_range` splice
+  and its deferred settle pass, `clear`, `drop`;
+- `free_page`/`free_run` for **any page a finger names** (all fingers, all
+  trees): a freed page can be re-served by `allocate` to another tree while
+  staying dirty, so a finger naming it would pass per-frame checks under the
+  wrong tree. This ownership hook makes the freed-then-reused hazard
+  impossible by construction; F1's spine walk independently protects against
+  it, so the two are redundant on purpose.
+- an errored (poisoned) txn cannot reach the fast path at all: `guard_ok`
+  precedes it on every mutating entry, and the failing op itself dropped its
+  tree's finger before mutating (miss/entry invalidation above).
+
+**F4 — debug cross-check.** In every `debug_assertions` build (tests, fuzz,
+stress), every hit first runs the normal §2 descent for the key and asserts it
+lands on the finger's exact frames — same `(pgno, ki)` at every level, key
+absent, same insertion slot — so a finger bug fails loudly instead of
+corrupting the tree.
+
+**Crash safety.** None of this state reaches disk: a hit produces exactly the
+dirty frames the slow path would have produced (same bytes, same pgnos), and
+the commit pipeline (SPEC 04 §9) is untouched. Every REC-6 cut point recovers
+as before.
+
 ---
 
 ## §7 — Write-cursor ops: put_current / del_current (M1.4)
@@ -598,8 +765,67 @@ Delete the entry at `ki[top]`. Frees an associated overflow run (§8). Then
 positioned so that a following `next` yields the entry that followed the deleted
 one (LMDB leaves `ki[top]` pointing at the successor slot; if the page was
 merged/rebalanced, the cursor is fixed up per §5.4). `delete(key)` (SPEC 00 r36)
-= `set(key)` then `del_current`, returning whether the key existed;
-`delete_range` (r37) and `clear` (r38) are cursor walks / whole-tree resets.
+= `set(key)` then `del_current`, returning whether the key existed; `clear`
+(r38) is a whole-tree reset.
+
+**`delete_range` (r37) is leaf-granular (2026-09-27).** heed over LMDB
+realizes r37 as a `range_mut` walk with one `mdb_cursor_del` per entry; LMDB
+has no bulk range-delete primitive, so there is no LMDB technique to mirror
+here. ZeroDB instead deletes one **leaf span** at a time: position at the
+first covered key with the same seek + bound tests as `range` (§2.0/§4 —
+every `Bound` combination, inverted bounds and custom comparators behave
+exactly as the per-entry walk did), then for each leaf intersecting the
+range: COW its root-to-leaf path once (§5.3), free the covered `F_BIGDATA`
+runs (§8, decrementing `overflow_pages`), splice the whole covered cell span
+out in one heap compaction (`LeafMut::remove_span`, equivalent to that many
+single removes), decrement `entries` by the span, and rebalance that leaf
+once through the ordinary §10 path. A span that ran to the leaf's end may
+leave covered keys in later leaves: the walk re-descends at the first key
+after the last deleted one — no cursor path is trusted across the rebalance
+(§5.4a). A span that stopped mid-leaf hit the upper bound and ends the walk.
+One exception to “rebalance once per leaf”: the **range-start** leaf — the
+only leaf that can keep uncovered survivors *in front of* its span — defers
+its rebalance to the **end of the walk** when covered keys continue past it
+(rebalanced mid-walk, a below-threshold boundary leaf would borrow the next
+leaf's still-covered entries back one at a time). Deferring is sound: the
+survivors keep it non-empty, and the fill threshold is a delete-time trigger,
+not a committed invariant (§11 INV-8); the walk settles it with one
+re-descent to a surviving key once the range is gone.
+The observable result (returned count, surviving entries, bound semantics,
+stat counters) is identical to the per-entry walk; only the page-touch
+pattern differs — one COW + one rebalance per covered leaf, and no
+materialized key list.
+
+**Position after the delete (PINNED 2026-09-10).** The contract above was
+asserted from M1.4 onward but never differentially observed: the oracle's
+`Op::IterMutDelCurrent` deletes and *stops*, so only the surviving content was
+compared, never the surviving position. It is now pinned against the fork
+through the heed surface consumers actually use:
+
+| case | observed on the fork, and matched by ZeroDB |
+|---|---|
+| delete mid-page, then `next` | yields the immediate successor |
+| delete the last entry of a leaf, then `next` | yields the successor — the first entry of the next leaf |
+| delete the final entry of the tree, then `next` | yields `None` |
+| drain the whole tree (`while next { del_current }`) | visits every key exactly once, strictly ascending, tree ends empty |
+| drain only the tail | visits exactly the tail; the head survives unchanged |
+| delete every *other* entry | the cursor stays aligned across alternating delete/advance |
+| drain a `prefix_iter_mut` range | visits exactly the prefix's keys; the rest survives |
+
+> Observed against the fork 2026-09-10:
+> `crates/zerodb-oracle/tests/cursor_delete_position.rs` (7 cases) drives
+> `iter_mut` / `prefix_iter_mut` on both engines from one macro body and
+> requires an identical event trace **and** identical surviving content. The
+> drain cases span ~2 000 entries at the OS page size, so they cross leaf
+> boundaries and force merges mid-walk — the case a retained path is most
+> likely to get wrong.
+
+**Mechanism is unconstrained.** How the cursor is left in that position — a
+re-seek by key, a retained physical path, or a retained path repaired on the
+structural events that invalidate it — is an implementation choice governed by
+§5.4a, not by this section. The table above is the whole obligation, and the
+test above is its guard: an optimization that changes any row is a divergence,
+not a speed-up.
 
 ---
 
@@ -659,6 +885,8 @@ rebalance(page P at cursor):
     choose a sibling:
         if P is the leftmost child of its parent: sibling = right neighbor (fromleft=false)
         else: sibling = left neighbor (fromleft=true)
+    if P is an EMPTY leaf (0 keys) AND this is delete_range's walk:
+        MERGE (below) — never borrow into it
     if sibling is above threshold AND has > min_keys:
         BORROW one entry from the sibling across the parent separator (node_move)
         update the parent separator key accordingly
@@ -675,6 +903,18 @@ rebalance(page P at cursor):
 - **Borrow** (a.k.a. rotate / `node_move`): moves the boundary entry from the
   fuller sibling into `P` and rewrites the parent separator so ordering holds.
   Preferred when it avoids a merge (keeps height stable).
+- **Empty page, walk mode** (2026-09-27): inside `delete_range`'s leaf walk
+  (only), a leaf left with **zero** entries always takes the merge arm,
+  whatever the sibling's fill — the combination trivially fits. The outcome
+  mirrors LMDB's `mdb_rebalance`, which *unlinks* an empty page from its
+  parent rather than feeding it: merging nothing-plus-sibling through the
+  left-absorbs-right rule leaves exactly that tree (one surviving page of the
+  pair under the parent). Without it, borrowing into an emptied leaf would
+  trickle a still-covered right sibling across, one separator rewrite per
+  entry. Point/cursor deletes keep the neighbor policy above unconditionally:
+  they can only reach an empty page from a 1-entry-above-threshold leaf (a
+  rare wide-entry corner), and their steady-state churn shape is pinned by
+  the reclamation flatness tests.
 - **Merge** direction: LMDB always merges the *right* page into the *left* one
   (when the underful page is the right sibling it merges itself into the left;
   when it is the left it merges the right into itself). ZeroDB follows the same

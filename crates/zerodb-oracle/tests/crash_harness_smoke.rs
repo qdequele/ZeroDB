@@ -117,7 +117,15 @@ fn regression_nometasync_acked_at_cut_not_at_end() {
 /// newest issued meta.
 #[test]
 fn regression_nometasync_reclaim_clobber_window_is_characterized() {
-    const SEED: u64 = 15_797_139_550_980_166_469;
+    // RE-PINNED 2026-09-10 (was 15_797_139_550_980_166_469). The seed selects a
+    // cut, but the *ops* come from `Spec::ops_for_round` → `decode_ops` → `Op`'s
+    // `Arbitrary`, so adding any variant to `Op` re-shuffles what every seed
+    // decodes to. B8a's `Op::IterMutDelThenWalk` did exactly that and this seed
+    // stopped reaching the window (`gen_spec` kept returning NO_META_SYNC —
+    // it never touches `Op` — so the mode guard below could not catch it).
+    // The assertions are unchanged; only the vehicle was replaced, by searching
+    // for a seed that still satisfies all four of them.
+    const SEED: u64 = 11_834_834_180_059_103_290;
     assert_eq!(
         gen_spec(SEED).mode,
         Mode::NoMetaSync,
