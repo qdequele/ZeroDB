@@ -1,18 +1,40 @@
-//! zerodb — the public, heed-shaped engine API.
+//! ZeroDB — a pure-Rust embedded key-value store with LMDB's architecture.
 //!
-//! Milestone 1.2 exposes the environment lifecycle surface (SPEC 00 rows 1–12,
-//! 17–22): [`EnvOpenOptions`] → [`Env`], with `map_size`/`max_dbs`/`max_readers`
-//! stored, the `PREV_SNAPSHOT` / `READ_ONLY` env flags, the directory-env
-//! convention (the env path is a **directory**; the data lives in a single file
-//! inside it, named by the opener — [`DATA_FILE_NAME`] natively,
-//! [`HEED_DATA_FILE_NAME`] through the `heed-zerodb` adapter; D-002 / D-012 /
-//! SPEC 02 §8 / ADR-0010), [`Env::info`], [`Env::path`],
-//! [`Env::real_disk_size`], [`Env::try_clone_inner_file`], and deferred close via
-//! [`Env::prepare_for_closing`] / [`EnvClosingEvent`].
+//! A transactional, memory-mapped KV engine: a single writer, any number of
+//! lock-free MVCC readers over the memory map, copy-on-write B+trees, and two
+//! durable CRC32C meta pages — LMDB's design, reimplemented in safe Rust with no
+//! C dependency. The API is heed-shaped, so the same code runs here or on real
+//! LMDB through the [`heed`](https://github.com/meilisearch/heed) adapter.
 //!
-//! Transactions, databases, and the read/write paths are later milestones and
-//! are not exposed here yet. The error taxonomy mirrors `heed::Error`
-//! ([`Error`] / [`MdbError`]); the `heed-zerodb` adapter (M1.13) maps it 1:1.
+//! An environment ([`Env`]) is a **directory** holding a single data file
+//! (named [`DATA_FILE_NAME`] natively, [`HEED_DATA_FILE_NAME`] through the
+//! `heed-zerodb` adapter; ADR-0010). It holds a main database plus any number of
+//! named ones. Writes go through one [`RwTxn`] at a time; reads ([`RoTxn`]) are
+//! lock-free snapshots that never block the writer. Keys and values are byte
+//! slices, and the error taxonomy mirrors heed's ([`Error`] / [`MdbError`]).
+//!
+//! ```rust,no_run
+//! use zerodb::EnvOpenOptions;
+//!
+//! # fn main() -> zerodb::Result<()> {
+//! // An environment is a directory holding one data file.
+//! let env = EnvOpenOptions::new()
+//!     .map_size(10 * 1024 * 1024) // 10 MiB map ceiling
+//!     .max_dbs(4)
+//!     .open("books.db")?;
+//!
+//! // All writes go through a single write transaction.
+//! let mut wtxn = env.write_txn()?;
+//! let db = env.create_database(&mut wtxn, Some(&b"books"[..]))?;
+//! db.put(&mut wtxn, b"1984", b"Orwell")?;
+//! wtxn.commit()?;
+//!
+//! // Reads are lock-free MVCC snapshots — any number can run concurrently.
+//! let rtxn = env.read_txn()?;
+//! assert_eq!(db.get(&rtxn, b"1984")?, Some(&b"Orwell"[..]));
+//! # Ok(())
+//! # }
+//! ```
 
 #![deny(missing_docs)]
 use std::ffi::{OsStr, OsString};
