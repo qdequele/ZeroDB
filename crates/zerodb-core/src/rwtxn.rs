@@ -569,8 +569,9 @@ pub struct RwTxn<'env> {
     /// writer because every mutation is buffered in [`RwTxn::dirty`] until
     /// commit C2 — including WRITE_MAP (TXN-45a) — so the *map* bytes never
     /// change during the txn; dirty frames are excluded from the memo by
-    /// [`Source::bytes_from_classified`].
-    validated: ValidatedPages<'static>,
+    /// [`Source::bytes_from_classified`]. Probes (never publishes) the
+    /// env-wide stamp cache (ADR-0018 amendment, 2026-10-01).
+    validated: ValidatedPages<'env>,
     /// Committed pages obsoleted by this txn (GC-6). Written to the GC DB
     /// under `BE(writer_txnid)` at commit step C1 (`freelist_save`).
     freed: Vec<u64>,
@@ -726,7 +727,10 @@ impl Env {
             // earlier write txns (LMDB's `me_dpages`, PERF-GAP B12); they came
             // with the writer slot, so this takes no lock.
             dirty: DirtyStore::with_spare(inner.page_size(), guard.take_frames()),
-            validated: ValidatedPages::for_policy(inner.file_trust()),
+            // ADR-0018 amendment (2026-10-01): the writer probes the env
+            // cache (the previous commit seeded it with the very pages this
+            // txn's first descent walks) but never publishes from a miss.
+            validated: ValidatedPages::for_writer(inner.file_trust(), Some(inner.stamp_cache())),
             freed: Vec::new(),
             loose: Vec::new(),
             drains: BTreeMap::new(),
@@ -1550,7 +1554,13 @@ impl<'env> RwTxn<'env> {
         self.read_high = high;
         // TXN-71: a spilled page's map bytes change only here, so a fresh
         // memo per spill keeps every memo entry true to the current bytes.
-        self.validated = ValidatedPages::for_policy(self.env.inner().file_trust());
+        // The env cache needs no reset: it cannot hold this txn's stamp
+        // (only committed txnids are published, all below ours), so a
+        // re-read of a spilled page always misses it and revalidates.
+        self.validated = ValidatedPages::for_writer(
+            self.env.inner().file_trust(),
+            Some(self.env.inner().stamp_cache()),
+        );
         self.spills += 1;
         Ok(())
     }
@@ -4048,6 +4058,39 @@ impl<'env> RwTxn<'env> {
         }
         inner.run_hook(HookPoint::H4);
         // Crash here: `N` durable and selected (REC-6 H4).
+
+        // ----- C5a: seed the env-wide validated-pages cache (ADR-0018
+        // amendment, 2026-10-01; SPEC 04 TXN-38). Every frame C2 wrote is
+        // engine-authored, stamped with this txnid, and now final: C5 is
+        // done, the commit can no longer fail, and txnid `N` is consumed
+        // forever — so `(pgno, N)` names exactly these bytes for the env's
+        // life. Sits after C5 so a failed commit (whose txnid the next
+        // writer reuses, TXN-2) publishes nothing; the cache is in-memory
+        // only, so this step has no crash-safety footprint (a crash here
+        // just loses the hints). Pages still spilled at commit are absent
+        // from the dirty store and are not published: their mid-txn image
+        // was rewritable in place (TXN-72), and their first reader simply
+        // revalidates. Trusted envs skip it: nothing probes the cache there.
+        if !inner.file_trust().is_trusted() {
+            let cache = inner.stamp_cache();
+            for &pgno in &pgnos {
+                let bytes = self.dirty.bytes(pgno).expect("pgno has a frame");
+                debug_assert_eq!(
+                    crate::page::read_page_txnid(bytes),
+                    self.txnid,
+                    "every committed frame carries the committing txnid (ADR-0018)"
+                );
+                let kind = match crate::page::page_type_of(crate::page::read_flags(bytes)) {
+                    Ok(PageType::Leaf) => crate::stamps::StampKind::Leaf,
+                    Ok(PageType::Branch) => crate::stamps::StampKind::Branch,
+                    // Overflow runs are not cacheable; meta pages are never
+                    // dirty frames. `Err` is unreachable for engine-authored
+                    // frames but must not fail an already-durable commit.
+                    _ => continue,
+                };
+                cache.publish(pgno, kind, self.txnid);
+            }
+        }
 
         // ----- C6: publish the snapshot (TXN-18/19 order: swap the object,
         // then store the commit point SeqCst) — only after C5, so no reader

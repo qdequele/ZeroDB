@@ -581,12 +581,25 @@ dirty-page store must be built so it is.
   validating policy a txn-memo miss on a map-sourced leaf or branch first
   probes an env-wide cache keyed by **(pgno, page kind, header txnid stamp)**.
   An exact hit takes the zero-check view; a miss runs the full cell walk and,
-  on success, records that key. Either way the page enters the txn's memo.
-  Plain read txns use it, borrowing it from the env (opening a txn touches
-  no shared refcount); write txns, the nested read txns that share their
-  parent writer's memo, and env-owning `static_read_txn`s do not (measured:
-  the probe and publish cost more than they save on pages a writer copies
-  on write), and dirty frames never do. Soundness
+  on success, records that key — **readers only**. Either way the page enters
+  the txn's memo. Plain read txns use it, borrowing it from the env (opening
+  a txn touches no shared refcount). Write txns — and the nested read txns
+  that share their parent writer's memo — **probe the cache but never publish
+  from the miss arm** (ADR-0018 amendment, 2026-10-01): a writer's miss-arm
+  publish could record a non-final image of its own spilled page (TXN-69
+  rewrites a spilled pgno in place under the same stamp), and an aborted
+  writer's publishes would survive into its reused txnid (TXN-2). A writer
+  probe cannot false-hit, because the cache holds only successfully committed
+  stamps, all strictly below the live writer's txnid. Env-owning
+  `static_read_txn`s do not use the cache, and dirty frames never do.
+  **Commit seeds the cache** (same amendment): after commit step C5 — the
+  commit is irrevocable and the txnid consumed forever — and before C6, the
+  committer publishes `(pgno, kind, txnid)` for every leaf or branch frame C2
+  wrote (engine-authored, stamped with the committing txnid, final). Failed
+  or aborted commits publish nothing (their txnid is reused, TXN-2); pages
+  still spilled at commit are not published (their mid-txn image was
+  rewritable in place) and revalidate on first view; trusted-mode envs skip
+  the seeding. Soundness
   rests on the **page-version identity**: ZeroDB never exposes two byte images
   of one pgno under the same stamp, because every page a commit writes
   carries the committing txnid (COW copies are restamped, fresh pages are

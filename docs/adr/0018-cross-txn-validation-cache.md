@@ -137,3 +137,94 @@ Answers to the review questions (2026-09-29):
   `stamps::tests`, loom `loom_stamp_cache_never_mixes_publishes` (exhaustive,
   ~10 min; mutation-checked: without the reader's sequence re-check it finds
   a mixed pair in under a second).
+
+## Amendment: publish at commit; writers probe but never publish (2026-10-01)
+
+Approved by Quentin 2026-10-01 ("go for all of those") as part of the
+one-operation-txn cost work.
+
+### Problem
+
+The cache only learned a page version when a *reader* validated it. A
+workload of one-operation txns (YCSB A; rust-storage-bench) rewrites the
+root-to-leaf path on every commit, so every page a reader or the next writer
+touches is freshly stamped and **misses**: the census showed one write txn at
+15.2 µs vs LMDB's 5.9 µs with `BranchRef::new` + `LeafRef::new` ≈ 9.7 % of
+the process (~1.6 µs/txn) re-validating pages the previous commit had just
+written, and the one-get read txn paying the same walk on its first view of
+each fresh page.
+
+### Change
+
+1. **The committer seeds the cache.** Every frame commit step C2 writes is
+   engine-authored, carries the committing txn's stamp (`RwTxn::touch`
+   restamps COW copies; fresh and GC pages are initialized with it), and is
+   final once the commit has succeeded. After C5 (both barriers done, the
+   commit can no longer fail) and before C6 publishes the snapshot, the
+   committer publishes `(pgno, kind, txnid)` for each written **tree** frame
+   (leaf or branch; overflow frames are not cacheable). Trusted-mode envs
+   skip it (nothing probes the cache there).
+2. **Write txns probe the cache but never publish from the miss arm.** The
+   memo gains a `for_writer` constructor: `shared` is set, a new
+   `publish_shared` flag is false (readers carry true). Nested read txns
+   share the parent writer's memo and inherit the same behavior.
+
+### Why it is safe
+
+The soundness invariant is unchanged: an entry `(pgno, stamp)` is published
+only for a byte image that is **committed and final**, so no two images the
+env can expose ever share a pair.
+
+- **Failed or aborted commits publish nothing.** The publish sits after C5.
+  A txn that aborts, or whose commit fails at C1–C5, reuses its txnid (module
+  doc, TXN-2), and the next writer may write *different* bytes at the same
+  pgnos under the same stamp — which is exactly why no publish may happen
+  before the commit is irrevocable.
+- **Spilled pages are not published.** ADR-0017 writes spilled pages to the
+  file mid-txn under the txn's stamp and may rewrite them in place
+  (spill → unspill/touch → C2 rewrites the frame, same pgno, same stamp), so
+  a mid-txn image is not final. Spilled pages absent from the dirty store at
+  commit are simply not published; their first reader revalidates as before.
+- **Writer probes cannot false-hit.** The cache only ever holds stamps of
+  *successfully committed* txns, and the current writer's txnid is strictly
+  greater than every committed txnid, so a probe on the writer's own spilled
+  pages (stamp = its txnid) always misses; probes on committed map pages hit
+  only the exact committed image.
+- **Writer publishes nothing from the miss arm.** If the miss arm published,
+  a writer that validated its own spilled page would record a non-final
+  image (see above), and an aborted writer's publishes would survive the
+  abort into a reused txnid. `publish_shared = false` closes both.
+- **The committed image is valid without a walk.** A published frame skipped
+  the reader's cell walk forever after. The frame is the output of this
+  engine's page encoders (the same trust the dirty-frame
+  `new_prevalidated` arm already extends, and less than LMDB extends to
+  every page); a hostile *file* still validates on first view because the
+  cache starts empty at open and only commits performed by this process
+  publish.
+
+### What was considered and not done
+
+- Publishing spilled pages at commit (re-reading their kinds from the map):
+  correct for the spilled-and-not-retouched subset, but it only matters for
+  huge txns whose first re-read is a vanishing cost; not worth the extra
+  commit-path code.
+- A writer-private memo carried across txns under the write lock: strictly
+  weaker than reading the shared cache (same hits, plus invalidation
+  bookkeeping the stamp key already does for free).
+
+### Tests
+
+- `zerodb/tests/page_version_identity.rs` gains an abort-after-spill +
+  txnid-reuse scenario over a tiny dirty limit (the model and ledger checks
+  catch a publish of non-final bytes).
+- `btree::tests::writer_memo_probes_the_cache_but_never_publishes` pins the
+  probe/no-publish split.
+- The existing identity ledger, loom model L7 (protocol untouched) and crash
+  harness still apply; `just crash-test-quick` and `just stress` run because
+  the commit pipeline gained a step.
+
+### Measurements
+
+Recorded in the perf ledger and the commit body (bench server, x86-64,
+4 KiB): see `short_txn_census` three-column table and the `get/put/commit`
+ladder A/B.
