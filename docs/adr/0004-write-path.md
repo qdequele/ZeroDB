@@ -2,7 +2,10 @@
 
 - Status: Approved — Quentin, 2026-07-16 (relayed via session lead; standing
   directive "continue until finished"). OQ1–OQ5 answered; resolutions recorded
-  at the end of this document.
+  at the end of this document. **Amended by ADR-0019 (2026-10-01):** in
+  default durability mode the C5 meta fsync described here is subsumed by a
+  durable C4 write through an `O_DSYNC` meta-sync fd — the D3 ordering and
+  hook design are unchanged; only the meta-barrier primitive moved.
 - Milestone: 1.4
 - Date: 2026-07-16
 
