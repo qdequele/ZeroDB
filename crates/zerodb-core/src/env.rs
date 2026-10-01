@@ -116,6 +116,33 @@ pub trait Backing: Send + Sync {
         ))
     }
 
+    /// **Durable** positioned write of one meta page (commit C4+C5 fused in
+    /// default durability mode — ADR-0019, SPEC 04 TXN-61 as amended): on
+    /// `Ok(())` the written bytes are on stable storage, so no separate meta
+    /// barrier follows. The mmap backing overrides this with a `pwrite`
+    /// through its `O_DSYNC` meta-sync descriptor (LMDB's `me_mfd`); the
+    /// default — a plain [`Backing::write_at_page`] followed by a full
+    /// [`Backing::sync_data`] — is semantically today's C4 write + C5 barrier,
+    /// so backends without a synchronized-write primitive keep the exact
+    /// pre-ADR-0019 behavior.
+    ///
+    /// Only ever called for a meta page (pgno 0/1, one `psize` page), and only
+    /// when the durability flags call for a durable meta (the caller owns the
+    /// policy; SPEC 06 REC-9). A synchronized write covers **that write
+    /// only** — safe because the caller's C3 barrier has already drained
+    /// every other pending write (SPEC 06 REC-7 note), and the meta pages
+    /// never extend the file.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the write/sync I/O error. The caller treats any failure as a
+    /// failed durability barrier: it scrubs the slot through the plain write
+    /// path and poisons the env (SPEC 06 REC-13 as amended).
+    fn write_page_durable(&self, pgno: u64, psize: u32, data: &[u8]) -> std::io::Result<()> {
+        self.write_at_page(pgno, psize, data)?;
+        self.sync_data()
+    }
+
     /// The durability barrier the commit pipeline invokes at C3/C5 (M1.10,
     /// SPEC 06 REC-9/REC-12). `async_flush` is honored only by the writable-map
     /// backing (`WRITE_MAP` + `MAP_ASYNC` → `msync(MS_ASYNC)`); the default
@@ -176,9 +203,14 @@ pub enum HookPoint {
     H1,
     /// After C3 (`fsync(data)`).
     H2,
-    /// After C4 (meta written to slot `N & 1`, **not** fsynced).
+    /// After C4 (meta written to slot `N & 1`). In default durability mode C4
+    /// is the **durable** meta write (ADR-0019), so H3 fires with the meta
+    /// already durable (H3 ≡ H4, SPEC 06 REC-6 as amended); under
+    /// `NO_META_SYNC`/`NO_SYNC`/`WRITE_MAP` the meta is written but **not**
+    /// fsynced here, as before.
     H3,
-    /// After C5 (`fsync(meta)`): txn `N` durable.
+    /// After C5 (the meta barrier — subsumed by C4's synchronized write in
+    /// default mode): txn `N` durable, except under `NO_META_SYNC`/`NO_SYNC`.
     H4,
 }
 

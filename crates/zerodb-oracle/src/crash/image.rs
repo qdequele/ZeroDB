@@ -65,6 +65,11 @@ pub struct ImageOpts {
     /// ADR-0008 D6.1 mutation self-test: break the data barrier accounting.
     /// The harness MUST then report a violation — see `crash_mutation.rs`.
     pub broken_barriers: bool,
+    /// ADR-0019 mutation self-test: demote the durable meta write to a plain
+    /// journaled write (an O_DSYNC fd that lies). In default mode the harness
+    /// MUST then report a REC-18.4 violation (an acked commit above the
+    /// durable floor) — see `crash_mutation.rs`.
+    pub broken_dsync: bool,
     /// Registry path for the workload env (reuse per worker arms the
     /// deregistration tripwire, ADR-0008 D6.2).
     pub env_path: PathBuf,
@@ -81,6 +86,7 @@ impl ImageOpts {
         ImageOpts {
             variants: 12,
             broken_barriers: false,
+            broken_dsync: false,
             env_path: PathBuf::from(format!("/crash-harness/w{w}/env")),
             verify_path: PathBuf::from(format!("/crash-harness/w{w}/verify")),
             repro_dir,
@@ -177,6 +183,9 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
     if opts.broken_barriers {
         handle.set_broken_data_barriers(true);
     }
+    if opts.broken_dsync {
+        handle.set_broken_dsync(true);
+    }
     let env = open_with_backing_policy(
         opts.env_path.clone(),
         Box::new(fault),
@@ -213,6 +222,28 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
             captured: Mutex::new(None),
         });
         env.set_commit_hook(Some(h.clone()));
+        // ADR-0019: in default mode C4 is the durable meta write, so the H3
+        // hook fires with the meta already durable (H3 ≡ H4) — the old
+        // "meta written, not yet durable" window exists only WHILE that write
+        // is in flight. An H3 target in default mode therefore captures
+        // through the fault backend's in-flight observer, which fires between
+        // journaling the durable write and its fold-self: the materialized
+        // images then cover {absent, torn, intact} for the meta, keeping the
+        // pre-ADR REC-6 H3 row fully exercised by mechanism 2.
+        let d = spec.mode.durability();
+        let durable_c4 = !d.no_sync && !d.no_meta_sync && !d.write_map;
+        if durable_c4 && h.target_point == HookPoint::H3 {
+            let hc = Arc::clone(&h);
+            handle.set_durable_write_observer(Some(Arc::new(move || {
+                // Relaxed: observer and hook run on the single writer thread.
+                if hc.entries.load(Ordering::Relaxed) == hc.target_commit {
+                    let mut slot = hc.captured.lock().expect("capture slot");
+                    if slot.is_none() {
+                        *slot = Some(hc.handle.capture());
+                    }
+                }
+            })));
+        }
         Some(h)
     } else {
         None
@@ -267,6 +298,10 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
         (std::mem::take(&mut exec.states), exec.acked())
     };
     env.set_commit_hook(None);
+    // Break the FaultState → observer → CaptureHook → FaultHandle → FaultState
+    // reference cycle (the observer closure holds the hook, which holds the
+    // handle) — without this every cut leaks its durable image.
+    handle.set_durable_write_observer(None);
     drop(env); // release the registry entry; the fault journal lives on
 
     // The cut: hook capture, else op-boundary capture, else end-of-run. Each

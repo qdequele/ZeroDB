@@ -885,7 +885,11 @@ The commit ordering is the crash-safety invariant (PLAN 1.4). It is encoded in
 (M1.11 kills / tears at each hook). SPEC 06 defines the invariant guaranteed at
 every hook; this section defines the steps and their ordering. Both write modes
 (heap+pwrite default, and WRITE_MAP) share this ordering; only the primitive
-(`pwrite`+`fdatasync` vs `msync`) differs (SPEC 06 REC-8/REC-9).
+(`pwrite`+`fdatasync`+O_DSYNC meta write vs `msync`) differs (SPEC 06
+REC-8/REC-9). Since ADR-0019, the default mode's meta write (C4) goes through
+the **meta-sync descriptor** — a second fd on the data file opened
+`O_WRONLY|O_DSYNC|O_CLOEXEC` (LMDB's `me_mfd`, SPEC 01 §S6) — and is **durable
+on return**, so C5 is subsumed by C4 there (one barrier per durable commit).
 
 - **TXN-61** — Commit steps, in order (target meta slot = `writer_txnid & 1`):
 
@@ -896,8 +900,8 @@ every hook; this section defines the steps and their ordering. Both write modes
   | C1 | **freelist_save** (SPEC 05 §4): write this txn's freed pages into the GC DB, dirtying GC pages into the dirty set (loop-until-stable, SPEC 05 GC-11). | H0 | `N−1` (all changes still in dirty set, nothing written). |
   | C2 | **write dirty pages** to their pgnos (`pwrite` each dirty frame / `msync` region under WRITE_MAP). Not yet durable. | **H1** | `N−1` live; new pages sit in free/beyond-HWM slots the `N−1` tree does not reference (TXN-62). Partial/torn data pages are unreferenced garbage. |
   | C3 | **fsync(data)** — flush all data pages (skipped under `NO_SYNC`/`MAP_ASYNC`, SPEC 06 REC-6). | **H2** | `N−1` live; txn `N`'s data fully durable but unreferenced (no meta points at it). |
-  | C4 | **write meta** to slot `N&1` (the *older* slot), with `txnid = writer_txnid` and a fresh CRC (SPEC 02 §3.3). Not yet durable. | **H3** | Either `N−1` (meta `N` not yet reached disk, or reached but torn → CRC rejects it → older slot wins) or `N` (meta reached disk intact). Never a torn meta accepted. |
-  | C5 | **fsync(meta)** — flush the meta page (skipped under `NO_META_SYNC`/`NO_SYNC`: the meta is written but not fsynced this commit, SPEC 06 REC-6/REC-7/REC-9). | **H4** | txn `N` durable and live. |
+  | C4 | **write meta** to slot `N&1` (the *older* slot), with `txnid = writer_txnid` and a fresh CRC (SPEC 02 §3.3). **Default mode (ADR-0019):** written through the meta-sync fd (`O_DSYNC`) — **durable on return**; a failed/short write scrubs the slot's previous bytes back through the plain fd and poisons the env (SPEC 06 REC-13). **`NO_META_SYNC`/`NO_SYNC`:** a plain-fd write, not durable. **`WRITE_MAP`:** a map write, not durable (REC-12). | **H3** | **Default mode:** `N` — the meta write returned durable (H3 ≡ H4); the old `{N−1, N}` window exists only *during* the synchronized write (power loss mid-write leaves the slot absent/torn/intact → `N−1` or `N`, never a torn meta accepted). **Plain-write modes:** either `N−1` (meta `N` not yet reached disk, or reached but torn → CRC rejects it → older slot wins) or `N` (meta reached disk intact). |
+  | C5 | **meta barrier** — subsumed by C4's synchronized write in default mode (no separate syscall); under `WRITE_MAP` an explicit `msync` (REC-12); skipped under `NO_META_SYNC`/`NO_SYNC` (the meta is written but not fsynced this commit, SPEC 06 REC-6/REC-7/REC-9). | **H4** | txn `N` durable and live (except under `NO_META_SYNC`/`NO_SYNC`, per the mode's window, REC-9). |
   | C6 | Publish the new snapshot (TXN-18/TXN-19): swap the `Arc<Snapshot>`, then `commit_point.store(writer_txnid, SeqCst)`; update `last_committed_txnid`; release the write mutex. | — | commit complete; new readers see `N`. |
 
 - **TXN-62** — **Page-reuse crash-safety invariant.** C2 may only write to pages
@@ -912,7 +916,8 @@ every hook; this section defines the steps and their ordering. Both write modes
   double buffer, not a single meta, is mandatory (SPEC 02 §3): the last committed
   snapshot survives the entire pipeline (SPEC 06 REC-2).
 - **TXN-64** — `writer_txnid` is published as the in-memory commit point (C6)
-  **only after** C5, so no reader can pin `N` before it is durable. This closes
+  **only after** the meta barrier (C4's synchronized write in default mode,
+  else C5), so no reader can pin `N` before it is durable. This closes
   the loop with the reader pin (TXN-17): a reader either pins `≤ N−1` (and the
   writer respects it in GC) or, after C6, pins `N` (durable).
 

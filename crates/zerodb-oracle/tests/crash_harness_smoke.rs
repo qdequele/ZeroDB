@@ -17,6 +17,7 @@ fn opts(worker: usize) -> ImageOpts {
     ImageOpts {
         variants: 12,
         broken_barriers: false,
+        broken_dsync: false,
         env_path: PathBuf::from(format!("/crash-smoke/w{worker}/env")),
         verify_path: PathBuf::from(format!("/crash-smoke/w{worker}/verify")),
         repro_dir: None,

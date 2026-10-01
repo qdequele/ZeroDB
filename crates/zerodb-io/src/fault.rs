@@ -129,16 +129,20 @@ pub struct WriteRecord {
 /// Counters for reporting/plan-distribution sanity.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FaultStats {
-    /// `write_at_page` calls journaled.
+    /// `write_at_page` calls journaled (`write_page_durable` counts here too).
     pub writes: u64,
     /// Synchronous barriers completed (pending folded into durable).
     pub barriers: u64,
     /// Asynchronous flushes observed (deliberately **not** barriers, REC-9:
     /// `msync(MS_ASYNC)` gives no completion guarantee).
     pub async_flushes: u64,
+    /// `write_page_durable` calls (ADR-0019): durable-on-return meta writes.
+    /// Lets the harness and tests assert the per-mode fd routing (default
+    /// mode: exactly one per effective commit; relaxed modes and `WRITE_MAP`:
+    /// zero).
+    pub durable_writes: u64,
 }
 
-#[derive(Debug)]
 struct FaultState {
     psize: u32,
     /// The disk image as of the last completed barrier. Only grows; sized to
@@ -154,10 +158,53 @@ struct FaultState {
     /// data fsync is ineffective/misordered — the harness MUST catch the
     /// resulting meta-without-data images. Never set outside the self-test.
     broken_data_barriers: bool,
+    /// Mutation self-test mode (ADR-0019 crash-testing impact): demote
+    /// `write_page_durable` to a plain journaled write — the fold-self never
+    /// happens, modeling an O_DSYNC fd that lies about durability. The
+    /// harness MUST catch this as a REC-18.4 monotonic-durability violation
+    /// (an acked default-mode commit above the durable floor). Never set
+    /// outside the self-test.
+    broken_dsync: bool,
+    /// Failure injection (ADR-0019 scrub tests): every `write_page_durable`
+    /// errors *after* journaling the write and updating the live view — the
+    /// "failed write whose bytes may still sit in the page cache" state
+    /// LMDB's scrub exists for. The journaled record stays pending (its
+    /// on-platter fate at the failure is unknown: absent, torn or intact).
+    fail_durable_writes: bool,
+    /// Invoked while a durable write is **in flight** (journaled pending, not
+    /// yet folded): the harness captures here to materialize the
+    /// {absent, torn, intact} window of the synchronized write (the REC-6 H3
+    /// pre-ADR-0019 row, which no post-return hook can reach any more).
+    /// Called outside the state lock, so it may re-enter
+    /// [`FaultHandle::capture`].
+    durable_observer: Option<Arc<dyn Fn() + Send + Sync>>,
     stats: FaultStats,
 }
 
+impl std::fmt::Debug for FaultState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FaultState")
+            .field("psize", &self.psize)
+            .field("durable_len", &self.durable_len)
+            .field("pending", &self.pending.len())
+            .field("broken_data_barriers", &self.broken_data_barriers)
+            .field("broken_dsync", &self.broken_dsync)
+            .field("fail_durable_writes", &self.fail_durable_writes)
+            .field("stats", &self.stats)
+            .finish_non_exhaustive()
+    }
+}
+
 impl FaultState {
+    fn fold_one(&mut self, rec: &WriteRecord) {
+        let end = rec.offset + rec.data.len() as u64;
+        if self.durable.len() < end as usize {
+            self.durable.resize(end as usize, 0);
+        }
+        self.durable[rec.offset as usize..end as usize].copy_from_slice(&rec.data);
+        self.durable_len = self.durable_len.max(end);
+    }
+
     fn fold_barrier(&mut self) {
         self.stats.barriers += 1;
         let broken = self.broken_data_barriers;
@@ -170,12 +217,7 @@ impl FaultState {
                 self.pending.push(rec);
                 continue;
             }
-            let end = rec.offset + rec.data.len() as u64;
-            if self.durable.len() < end as usize {
-                self.durable.resize(end as usize, 0);
-            }
-            self.durable[rec.offset as usize..end as usize].copy_from_slice(&rec.data);
-            self.durable_len = self.durable_len.max(end);
+            self.fold_one(&rec);
         }
     }
 }
@@ -208,6 +250,31 @@ impl FaultHandle {
             .lock()
             .expect("fault state lock")
             .broken_data_barriers = broken;
+    }
+
+    /// ADR-0019 mutation self-test switch: demote durable meta writes to
+    /// plain journaled writes. See [`FaultState`] docs.
+    pub fn set_broken_dsync(&self, broken: bool) {
+        self.state.lock().expect("fault state lock").broken_dsync = broken;
+    }
+
+    /// ADR-0019 failure injection: make every durable meta write fail after
+    /// journaling + updating the live view (the scrub-path test switch). See
+    /// [`FaultState`] docs.
+    pub fn set_fail_durable_writes(&self, fail: bool) {
+        self.state
+            .lock()
+            .expect("fault state lock")
+            .fail_durable_writes = fail;
+    }
+
+    /// Install (or clear) the in-flight durable-write observer — the capture
+    /// window of the synchronized meta write. See [`FaultState`] docs.
+    pub fn set_durable_write_observer(&self, obs: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.state
+            .lock()
+            .expect("fault state lock")
+            .durable_observer = obs;
     }
 
     /// Journal counters.
@@ -263,6 +330,9 @@ impl FaultBacking {
             durable_len,
             pending: Vec::new(),
             broken_data_barriers: false,
+            broken_dsync: false,
+            fail_durable_writes: false,
+            durable_observer: None,
             stats: FaultStats::default(),
         }));
         let handle = FaultHandle {
@@ -323,6 +393,71 @@ impl Backing for FaultBacking {
             }
         }
         self.inner.sync(async_flush)
+    }
+
+    fn write_page_durable(&self, pgno: u64, psize: u32, data: &[u8]) -> std::io::Result<()> {
+        // ADR-0019's durable-on-return write, modeled in two steps so a
+        // capture *during* the call sees the write as pending (power loss
+        // mid-write leaves the slot {absent, torn, intact} — REC-20's pending
+        // semantics), while a capture after the call sees it durable.
+        //
+        // Step 1: journal as pending.
+        let (observer, broken, fail) = {
+            let mut st = self.state.lock().expect("fault state lock");
+            debug_assert_eq!(psize, st.psize, "write psize drifted from env psize");
+            debug_assert!(
+                !data.is_empty() && data.len() % psize as usize == 0,
+                "ADR-0008 D5: non-page-multiple commit write ({} bytes)",
+                data.len()
+            );
+            st.stats.writes += 1;
+            st.stats.durable_writes += 1;
+            st.pending.push(WriteRecord {
+                offset: pgno * u64::from(psize),
+                data: data.into(),
+            });
+            (
+                st.durable_observer.clone(),
+                st.broken_dsync,
+                st.fail_durable_writes,
+            )
+        };
+        // The in-flight window: invoked outside the lock so it can capture.
+        if let Some(obs) = observer {
+            obs();
+        }
+        // Live view: the attempted write reaches the OS page cache whether or
+        // not it becomes durable — including on an injected failure, which is
+        // exactly the exposure the pipeline's scrub must undo (REC-13 as
+        // amended). The inner backing's own durability is irrelevant here;
+        // the journal is the authority (ADR-0008 D1 Option B).
+        self.inner.write_at_page(pgno, psize, data)?;
+        if fail {
+            return Err(std::io::Error::other(
+                "injected durable meta write failure (fault backend)",
+            ));
+        }
+        // Step 2: fold ONLY this write (fold-self, never the barrier's
+        // fold-all): on return the synchronized write is durable while every
+        // other pending write stays losable — folding more would silently
+        // model away the NO_SYNC/NO_META_SYNC windows. Popping the tail is
+        // sound: the engine's single writer is the only producer of writes
+        // (`Env::sync` takes the writer lock the committing txn holds), and
+        // captures never mutate the journal.
+        if !broken {
+            let mut st = self.state.lock().expect("fault state lock");
+            let rec = st
+                .pending
+                .pop()
+                .expect("durable write still pending at fold-self");
+            debug_assert_eq!(
+                rec.offset,
+                pgno * u64::from(psize),
+                "fold-self popped a foreign record"
+            );
+            st.fold_one(&rec);
+        }
+        Ok(())
     }
 }
 
@@ -968,6 +1103,92 @@ mod tests {
             2 * u64::from(PS),
             "no data extension folded"
         );
+    }
+
+    #[test]
+    fn durable_write_folds_only_itself() {
+        // ADR-0019: the durable meta write folds ITSELF on return (fold-self)
+        // and leaves every other pending write losable — fold-all here would
+        // silently model away the relaxed-durability windows.
+        let (b, h) = setup(2);
+        b.write_at_page(5, PS, &page(0xDA)).unwrap(); // data, stays pending
+        b.write_page_durable(1, PS, &page(0x1E)).unwrap(); // meta slot 1
+        let cap = h.capture();
+        assert_eq!(cap.pending.len(), 1, "only the data write stays pending");
+        assert_eq!(cap.pending[0].offset, 5 * u64::from(PS));
+        assert_eq!(cap.durable[PS as usize], 0x1E, "meta folded on return");
+        assert_eq!(
+            cap.durable_len,
+            2 * u64::from(PS),
+            "fold-self must not extend durability to the pending data write"
+        );
+        let s = h.stats();
+        assert_eq!(s.durable_writes, 1);
+        assert_eq!(s.writes, 2);
+        assert_eq!(s.barriers, 0, "a durable write is not a barrier");
+    }
+
+    #[test]
+    fn durable_write_capture_during_call_sees_it_pending() {
+        // The {absent, torn, intact} window: an observer firing while the
+        // synchronized write is in flight captures it as pending.
+        let (b, h) = setup(2);
+        let mid: Arc<Mutex<Option<CapturedDisk>>> = Arc::new(Mutex::new(None));
+        let mid2 = Arc::clone(&mid);
+        let h2 = h.clone();
+        h.set_durable_write_observer(Some(Arc::new(move || {
+            *mid2.lock().unwrap() = Some(h2.capture());
+        })));
+        b.write_page_durable(0, PS, &page(0x77)).unwrap();
+        let during = mid.lock().unwrap().take().expect("observer fired");
+        assert_eq!(during.pending.len(), 1, "in flight: pending");
+        assert_eq!(during.pending[0].offset, 0);
+        assert_eq!(during.durable[0], 7, "in flight: durable still old");
+        let after = h.capture();
+        assert!(after.pending.is_empty(), "returned: durable");
+        assert_eq!(after.durable[0], 0x77);
+    }
+
+    #[test]
+    fn broken_dsync_demotes_durable_write_to_plain() {
+        // ADR-0019 mutation self-test switch: the durable write journals but
+        // never folds itself — an O_DSYNC fd that lies.
+        let (b, h) = setup(2);
+        h.set_broken_dsync(true);
+        b.write_page_durable(1, PS, &page(0x99)).unwrap();
+        let cap = h.capture();
+        assert_eq!(cap.pending.len(), 1, "demoted write must stay pending");
+        assert_eq!(cap.durable[PS as usize], 7, "durable image untouched");
+        // A later real barrier still folds it (the next commit's C3 would).
+        b.sync(false).unwrap();
+        let cap = h.capture();
+        assert!(cap.pending.is_empty());
+        assert_eq!(cap.durable[PS as usize], 0x99);
+    }
+
+    #[test]
+    fn failed_durable_write_stays_pending_and_scrub_is_journaled() {
+        // ADR-0019 scrub modeling: an injected durable-write failure leaves
+        // the record pending (its on-platter fate unknown) and reaches the
+        // live view; the pipeline's scrub (a plain write of the old bytes)
+        // journals after it, so the all-applied (reopen-before-power-loss)
+        // image shows the OLD content again.
+        let (b, h) = setup(2);
+        h.set_fail_durable_writes(true);
+        let err = b.write_page_durable(0, PS, &page(0xBD)).unwrap_err();
+        assert!(err.to_string().contains("injected"));
+        // The scrub the commit pipeline would issue: old slot bytes (0x07…).
+        b.write_at_page(0, PS, &page(7)).unwrap();
+        let cap = h.capture();
+        assert_eq!(cap.pending.len(), 2, "failed write + scrub both pending");
+        assert_eq!(h.stats().durable_writes, 1);
+        // All-applied in issue order == what the OS page cache would serve on
+        // a clean reopen: the scrub wins, the unacknowledged meta is gone.
+        let ceil = cap.ceil_image();
+        assert!(ceil[..PS as usize].iter().all(|&x| x == 7));
+        // Dropped-everything (power cut right there): the old durable bytes.
+        let floor = cap.floor_image();
+        assert!(floor[..PS as usize].iter().all(|&x| x == 7));
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! zerodb-io — the I/O layer: read-only mmap, plain-file helpers, and the
 //! [`Backing`] implementation the engine core reads env files through (and,
-//! from M1.4 on, commits through: positioned `pwrite` + `sync_data`).
+//! from M1.4 on, commits through: positioned `pwrite` + `sync_data`, plus —
+//! ADR-0019 — the durable meta write through a second `O_DSYNC` descriptor).
 //!
 //! This crate is one of the two sanctioned homes for mmap `unsafe` (CLAUDE.md
 //! unsafe policy). The `unsafe` blocks live in [`mmap`] and the single `pwritev`
@@ -19,7 +20,8 @@ use std::fs::File;
 use std::path::Path;
 
 pub use file::{
-    create_env_file, open_file, probe_page_size, read_page, real_disk_size, write_page,
+    create_env_file, open_file, open_meta_sync, probe_page_size, read_page, real_disk_size,
+    write_page,
 };
 pub use mmap::{Mmap, MmapWritable};
 
@@ -31,10 +33,21 @@ use zerodb_core::page::{MetaPage, MetaValidity};
 ///
 /// Field order is load-bearing for `Drop`: `mmap` is declared **before** `file`
 /// so the map is unmapped before the descriptor is closed (SPEC 04 TXN-53 — "the
-/// mmap is unmapped before the file is closed").
+/// mmap is unmapped before the file is closed"). `meta_sync` is a second,
+/// non-mapped descriptor on the same file, so its position relative to `mmap`
+/// is irrelevant; it simply closes with the backing.
 pub struct MmapBacking {
     mmap: Mmap,
     file: File,
+    /// The meta-sync descriptor (ADR-0019, LMDB's `me_mfd`): a second fd on
+    /// the data file opened `O_WRONLY|O_DSYNC|O_CLOEXEC`, through which the
+    /// commit pipeline's durable meta write (C4) goes — durable on return, no
+    /// separate C5 `fdatasync`. `Some` for every writable non-`WRITE_MAP` env
+    /// — **including** `NO_SYNC`/`NO_META_SYNC` envs (fork parity: opened "in
+    /// case these get reset"; also keeps `Env::sync(force)` free to restore
+    /// durability through the plain fd). `None` only for read-only envs,
+    /// which never commit.
+    meta_sync: Option<File>,
 }
 
 impl Backing for MmapBacking {
@@ -74,6 +87,28 @@ impl Backing for MmapBacking {
         // `fdatasync` on Linux (flushes data + the size metadata needed to
         // read it back, REC-14/GC-28), the full-flush path on macOS.
         self.file.sync_data()
+    }
+
+    fn write_page_durable(&self, pgno: u64, psize: u32, data: &[u8]) -> std::io::Result<()> {
+        // ADR-0019: the durable meta write (commit C4+C5 fused). Through the
+        // O_DSYNC descriptor the positioned write returns only once it is on
+        // stable storage — one syscall, no separate fdatasync, and the kernel
+        // may use an FUA write instead of a full device-cache flush where the
+        // device supports it. Crash invariant: if power dies *during* the
+        // call, the slot is absent/torn/intact exactly as a plain C4 write
+        // (REC-6 H3's old window); once the call returns, the meta is durable
+        // (REC-6 H4). O_DSYNC synchronizes only this write — safe because the
+        // caller's C3 barrier already drained every other pending write
+        // (SPEC 06 REC-7 note), and the meta pages never extend the file.
+        match &self.meta_sync {
+            Some(mfd) => file::write_page(mfd, pgno, psize, data),
+            // No meta-sync fd (read-only envs never commit; defensive):
+            // the trait-default equivalent — plain write + full barrier.
+            None => {
+                self.write_at_page(pgno, psize, data)?;
+                self.sync_data()
+            }
+        }
     }
 }
 
@@ -271,7 +306,8 @@ pub fn open_or_create_with_advice(
         }
         let map_size = requested_map_size.unwrap_or(default_map_size);
         let file = file::create_env_file(data_path, requested_page_size, map_size)?;
-        let backing = map_backing(file, map_size, write_map, random_access)?;
+        let meta_sync = open_meta_sync_fd(data_path, read_only, write_map)?;
+        let backing = map_backing(file, map_size, write_map, random_access, meta_sync)?;
         return Ok(Opened {
             backing,
             page_size: requested_page_size,
@@ -304,7 +340,8 @@ pub fn open_or_create_with_advice(
     let head = file::read_head(&file, file_len.min(2 * page_size as usize))?;
     let persisted = persisted_map_size(&head, page_size);
     let map_size = requested_map_size.or(persisted).unwrap_or(default_map_size);
-    let backing = map_backing(file, map_size, write_map, random_access)?;
+    let meta_sync = open_meta_sync_fd(data_path, read_only, write_map)?;
+    let backing = map_backing(file, map_size, write_map, random_access, meta_sync)?;
 
     Ok(Opened {
         backing,
@@ -314,20 +351,47 @@ pub fn open_or_create_with_advice(
     })
 }
 
+/// Whether an env opened with these modes carries the meta-sync descriptor
+/// (ADR-0019, fork parity `if (!(flags & (MDB_RDONLY|MDB_WRITEMAP)))
+/// mdb_fopen(MDB_O_META)`): every writable, non-`WRITE_MAP` env does — even
+/// under `NO_SYNC`/`NO_META_SYNC` ("in case these get reset"). A `WRITE_MAP`
+/// env's meta barrier is the meta-page `msync` (SPEC 06 REC-12); a read-only
+/// env never commits.
+fn wants_meta_sync_fd(read_only: bool, write_map: bool) -> bool {
+    !read_only && !write_map
+}
+
+/// Open the meta-sync descriptor when the mode calls for one (see
+/// [`wants_meta_sync_fd`]).
+fn open_meta_sync_fd(
+    data_path: &Path,
+    read_only: bool,
+    write_map: bool,
+) -> Result<Option<File>, Error> {
+    if wants_meta_sync_fd(read_only, write_map) {
+        Ok(Some(file::open_meta_sync(data_path)?))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Map `file` at the effective `map_size` and box it as a [`Backing`]: the
 /// read-only [`MmapBacking`] (default) or the writable [`WriteMapBacking`]
 /// (`WRITE_MAP`). ADR-0004 D4: the map covers the full `map_size` once, no
 /// remap. Under `WRITE_MAP` the file is first `set_len(map_size)` so every
 /// mapped page is backed (SPEC 04 §6.4 — no `SIGBUS` on a store past EOF).
+/// `meta_sync` is the ADR-0019 descriptor (always `None` under `WRITE_MAP`).
 fn map_backing(
     file: File,
     map_size: u64,
     write_map: bool,
     random_access: bool,
+    meta_sync: Option<File>,
 ) -> Result<Box<dyn Backing>, Error> {
     let file_len = file::real_disk_size(&file)? as usize;
     let want = file_len.max(map_size as usize);
     if write_map {
+        debug_assert!(meta_sync.is_none(), "WRITE_MAP opens no meta-sync fd");
         // Grow the file to cover the whole map so writes anywhere in
         // `[0, map_size)` land in backed (sparse) blocks, not past EOF.
         if (file_len as u64) < map_size {
@@ -343,7 +407,11 @@ fn map_backing(
         if random_access {
             mmap.advise_random()?;
         }
-        Ok(Box::new(MmapBacking { mmap, file }))
+        Ok(Box::new(MmapBacking {
+            mmap,
+            file,
+            meta_sync,
+        }))
     }
 }
 
@@ -366,4 +434,141 @@ fn persisted_map_size(bytes: &[u8], page_size: u32) -> Option<u64> {
         }
     }
     best.map(|(_, ms)| ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Hand-rolled temp dir (no `tempfile` dependency — CLAUDE.md allowlist):
+    /// unique per test, removed on drop.
+    struct TmpDir(std::path::PathBuf);
+
+    impl TmpDir {
+        fn new(tag: &str) -> TmpDir {
+            let p = std::env::temp_dir().join(format!(
+                "zerodb-io-meta-sync-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&p).expect("create temp dir");
+            TmpDir(p)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const PS: u32 = 4096;
+    const MAP: u64 = 1 << 20;
+
+    #[test]
+    fn meta_sync_fd_policy() {
+        // ADR-0019 / fork parity: only a writable, non-WRITE_MAP env opens the
+        // meta-sync fd — and it does so even under NO_SYNC/NO_META_SYNC
+        // (which are commit-time routing, not open-time policy, so they do
+        // not appear here at all).
+        assert!(wants_meta_sync_fd(false, false));
+        assert!(!wants_meta_sync_fd(true, false), "READ_ONLY: no dsync fd");
+        assert!(!wants_meta_sync_fd(false, true), "WRITE_MAP: no dsync fd");
+        assert!(!wants_meta_sync_fd(true, true));
+    }
+
+    #[test]
+    fn open_meta_sync_is_write_only_dsync() {
+        let dir = TmpDir::new("flags");
+        let data = dir.path().join("data");
+        let _env = file::create_env_file(&data, PS, MAP).expect("create env");
+        let mfd = file::open_meta_sync(&data).expect("open meta-sync fd");
+        // Write-only: a read through it must fail.
+        let mut buf = [0u8; 8];
+        use std::os::unix::fs::FileExt;
+        assert!(
+            mfd.read_exact_at(&mut buf, 0).is_err(),
+            "meta-sync fd must be O_WRONLY"
+        );
+        // O_DSYNC is set on the open fd (observable via F_GETFL on Linux;
+        // macOS's F_GETFL does not report O_DSYNC, so only the open success
+        // and write-only-ness are asserted there).
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: F_GETFL on an owned, open fd reads flags only.
+            let fl = unsafe { libc::fcntl(mfd.as_raw_fd(), libc::F_GETFL) };
+            assert!(fl >= 0, "F_GETFL failed");
+            assert_ne!(fl & libc::O_DSYNC, 0, "O_DSYNC must be set");
+        }
+    }
+
+    /// The durable write goes through the dsync fd and the bytes land in the
+    /// file (and are visible through the MAP_SHARED read map).
+    #[test]
+    fn write_page_durable_lands_and_is_visible() {
+        let dir = TmpDir::new("durable");
+        let data = dir.path().join("data");
+        let file = file::create_env_file(&data, PS, MAP).expect("create env");
+        let meta_sync = Some(file::open_meta_sync(&data).expect("meta-sync fd"));
+        let mmap = Mmap::map(&file, 2 * PS as usize).expect("map");
+        let b = MmapBacking {
+            mmap,
+            file,
+            meta_sync,
+        };
+        let page = vec![0xA5u8; PS as usize];
+        b.write_page_durable(1, PS, &page).expect("durable write");
+        // Visible through the plain fd…
+        let back = file::read_page(&b.file, 1, PS).expect("read back");
+        assert_eq!(back, page);
+        // …and through the shared map without a remap (ADR-0004 D4).
+        assert_eq!(&b.bytes()[PS as usize..2 * PS as usize], &page[..]);
+    }
+
+    /// Without a meta-sync fd the durable write falls back to the
+    /// trait-default equivalent (plain write + full barrier) and still lands.
+    #[test]
+    fn write_page_durable_fallback_without_fd() {
+        let dir = TmpDir::new("fallback");
+        let data = dir.path().join("data");
+        let file = file::create_env_file(&data, PS, MAP).expect("create env");
+        let mmap = Mmap::map(&file, 2 * PS as usize).expect("map");
+        let b = MmapBacking {
+            mmap,
+            file,
+            meta_sync: None,
+        };
+        let page = vec![0x3Cu8; PS as usize];
+        b.write_page_durable(0, PS, &page).expect("fallback write");
+        assert_eq!(file::read_page(&b.file, 0, PS).expect("read back"), page);
+    }
+
+    /// A read-only open must not try to open the (write-only) meta-sync fd:
+    /// proven behaviorally on a store whose file permits no writers.
+    #[test]
+    #[cfg(unix)]
+    fn read_only_open_needs_no_write_access() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TmpDir::new("rdonly");
+        let data = dir.path().join("data");
+        drop(file::create_env_file(&data, PS, MAP).expect("create env"));
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o400))
+            .expect("chmod 0400");
+        // Root ignores permission bits; the guarantee is only observable as
+        // an unprivileged user (every dev/CI environment this runs in).
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let opened = open_or_create(&data, PS, Some(MAP), MAP, true, false)
+            .expect("read-only open must not need write access (no dsync fd)");
+        assert!(!opened.created);
+        // And a writable open on the same file must fail — proving the 0400
+        // bits were actually in force for the assertion above.
+        assert!(open_or_create(&data, PS, Some(MAP), MAP, false, false).is_err());
+    }
 }

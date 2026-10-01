@@ -156,14 +156,38 @@ open, REC-1/REC-2 select snapshot `X` and the check tool (SPEC 03 §11 + SPEC 05
   | H0 | C1 freelist_save (all in dirty set, nothing on disk) | `N−1` | Every page `N−1` references is byte-identical to the `N−1` commit; txn `N` is invisible; GC unchanged. Pages txn `N` spilled before commit (SPEC 04 §6.3a) may already be on the file — only in space `N−1` does not reference (TXN-62/70). |
   | **H1** | C2 wrote (some/all) dirty data pages, **no fsync** | `N−1` | Meta slots untouched → `N−1` selected. Written data pages occupy only pages `N−1` does not reference (SPEC 04 TXN-62), so torn/partial data pages are unreferenced garbage. No corruption; `N` invisible. |
   | **H2** | C3 fsync(data) done | `N−1` | Same as H1 but `N`'s data is now fully durable and still unreferenced. `N−1` selected; `N` invisible. |
-  | **H3** | C4 wrote meta slot `N&1`, **no fsync(meta)** | `N−1` **or** `N` | The meta write is a single page. If it did not reach disk, or reached disk **torn**, its CRC fails → discarded → `N−1` (the intact `(N−1)&1` slot) selected (REC-3 impossible: only one slot in flight). If it reached disk **intact**, `N` may be selected — and that is safe **because `N`'s data was fsynced at C3** (H2), so every page `N`'s meta references is durable. Never a torn meta accepted; never a meta referencing unwritten pages. |
-  | **H4** | C5 fsync(meta) done | `N` | `N` is durable and selected. `N−1`'s slot still holds a valid older snapshot (untouched this commit). |
+  | **H3** | C4 wrote meta slot `N&1` — in default mode a **durable** write through the meta-sync fd (ADR-0019), returned | `N` | **Amended by ADR-0019:** C4 is the durable meta write, so once it returns, `N` is durable and selected — H3 ≡ H4. The pre-ADR `{N−1, N}` outcome now describes a power loss **during** the synchronized write: the single meta page is then absent (→ `N−1`), torn (CRC fails → discarded → the intact `(N−1)&1` slot, REC-3 impossible: only one slot in flight), or intact (→ `N`, safe **because `N`'s data was fsynced at C3** (H2), so every page `N`'s meta references is durable). Never a torn meta accepted; never a meta referencing unwritten pages. Under the plain-write modes (`NO_META_SYNC`/`NO_SYNC`/`WRITE_MAP`) H3 keeps the old `{N−1, N}` row (§3, REC-12). |
+  | **H4** | C5 meta barrier done (in default mode: nothing — C4 already was the barrier) | `N` | `N` is durable and selected. `N−1`'s slot still holds a valid older snapshot (untouched this commit). |
 
 - **REC-7** — **The single load-bearing ordering** (SPEC 04 TXN-61/TXN-62): C3
   (fsync data) MUST complete before C4 (write meta), and C4 MUST target the older
   slot only. This is what makes H3 safe: an accepted meta `N` can only reference
   already-durable pages. Reordering C3 after C4 would allow a crash to accept a
   meta pointing at unwritten data — the one corruption this design forbids.
+
+  **ADR-0019 note (the meta write is the barrier).** In default mode C4 is a
+  positioned write through the meta-sync fd (`O_WRONLY|O_DSYNC|O_CLOEXEC`,
+  LMDB's `me_mfd`): it returns only once the write is on stable storage, so no
+  separate C5 barrier exists — one barrier syscall per durable commit (C3).
+  The ordering claim is unchanged: C3 still completes before the meta write
+  begins. One semantic difference from `fdatasync`: `O_DSYNC` synchronizes
+  **that write only**, not other pending writes on the file — safe here
+  because C3 has already drained everything else in every mode that routes
+  through the meta-sync fd, and the meta pages (pgno 0/1) never extend the
+  file, so no size-metadata concern arises.
+
+  **Platform note — macOS meta barrier (ADR-0019, maintainer decision
+  2026-10-01: all platforms, macOS included).** The meta-sync fd uses
+  `O_DSYNC` on macOS too, exactly as LMDB does — and on macOS `O_DSYNC` does
+  **not** force the device write cache. The macOS meta barrier is therefore
+  **weaker** than the data barrier (std `sync_data`, the full-flush path) and
+  weaker than Linux's: after a **power loss** (not a mere process crash) the
+  most recent durable-mode commits' metas may not have reached stable storage
+  even though `commit()` returned `Ok`. Recovery still falls back to the
+  newest meta that did (REC-2/REC-8) — structural consistency is unaffected;
+  only loss-of-the-tail differs. macOS is a development platform, not a
+  durability target; Linux (both arches) keeps the full durable-on-return
+  guarantee.
 - **REC-8** — **Meta CRC catches *sub-sector* tears; *sector-aligned* tears are
   handled by txnid selection.** The meta is exactly one `psize` page with a CRC over
   `[0,168)` (SPEC 02 §3.3), and both the covered region and the CRC field sit in the
@@ -194,10 +218,10 @@ recovered) **except** where explicitly noted as FS-order-dependent.
 
 - **REC-9** — **Durability lattice** (SPEC 01 §S6, mapped onto the pipeline):
 
-  | Mode | C3 fsync(data) | C5 fsync(meta) | On crash may lose | Corruption-free? |
-  |------|----------------|----------------|-------------------|------------------|
-  | default | yes | yes | nothing | yes, unconditionally |
-  | `NO_META_SYNC` | yes | **no** (meta page written but not fsynced this commit) | the most recent commits whose meta never reached disk | **yes** — data is always durable and each meta only ever references data fsynced before it; recovery falls back to the newest *durable* meta (REC-2), an intact older snapshot |
+  | Mode | C3 fsync(data) | meta durability | On crash may lose | Corruption-free? |
+  |------|----------------|-----------------|-------------------|------------------|
+  | default | yes | **C4 itself** — a durable write through the meta-sync fd (ADR-0019; no separate C5 syscall) | nothing | yes, unconditionally |
+  | `NO_META_SYNC` | yes | **none this commit** (meta written through the plain fd, not fsynced) | the most recent commits whose meta never reached disk | **yes** — data is always durable and each meta only ever references data fsynced before it; recovery falls back to the newest *durable* meta (REC-2), an intact older snapshot |
   | `NO_SYNC` | **no** | **no** | the last N commits (data + meta) | **conditional** — structurally safe **iff** the filesystem preserves write order (data before meta). If the FS can make a meta durable before its data, a crash can yield a meta referencing unwritten pages → corruption. LMDB documents this; ZeroDB inherits it. |
   | `MAP_ASYNC` (+`WRITE_MAP`) | `msync(MS_ASYNC)` | `msync(MS_ASYNC)` | recent commits flushed lazily by the kernel | same conditional as `NO_SYNC`: the kernel may write pages out of pipeline order |
 
@@ -283,6 +307,24 @@ recovered) **except** where explicitly noted as FS-order-dependent.
   is weaker, and treating a failed barrier as fatal is a strengthening ZeroDB
   adopts (recorded, not a consumer-visible divergence — consumers surface it as an
   `Io` error either way).
+
+  **ADR-0019 amendment — the failed-durable-meta-write scrub.** In default
+  mode C4 and C5 are one durable write, so its failure is a failed barrier:
+  the env is poisoned exactly as above. Additionally, **before** poisoning,
+  the engine rewrites the slot's **previous** bytes through the plain,
+  non-synchronizing write path (LMDB's scrub, `mdb_env_write_meta`'s
+  write-old-data-back): the failed write may have left the new meta in the OS
+  page cache even though it never became durable, and a clean **reopen before
+  power loss** must not read back a commit whose `commit()` returned an
+  error. The scrub is best-effort (its own error is ignored — the env is
+  poisoned either way); the previous bytes are captured from the mapped slot
+  just before the durable write (the slot holds snapshot `N−2`, TXN-63, which
+  no live reader references, and the committing thread is the single writer).
+  A failed **plain** C4 write (relaxed modes, `WRITE_MAP`'s map copy) keeps
+  its pre-existing behavior: the commit fails without poisoning — the next
+  writer reuses the txnid and rewrites the slot (the fork scrubs and sets
+  `MDB_FATAL_ERROR` there too; ZeroDB's narrower scope is recorded in
+  ADR-0019's implementation note).
 - **REC-14** — **File growth crash safety.** Growing the file (SPEC 05 GC-16
   extend; durability ordering GC-28) writes new data pages into the extended
   region and fsyncs them (C2/C3) **before**
@@ -324,7 +366,12 @@ obligations (REC-18).
   purpose) — `SIGKILL` the child, reopen the env in the parent, and verify
   (REC-18). This exercises the *control-flow* cut points (did we order the steps
   correctly?) but, because the page cache survives, it cannot by itself simulate a
-  torn/reordered sector — mechanism 2 does that.
+  torn/reordered sector — mechanism 2 does that. **Hook note (ADR-0019):** in
+  default mode H3 fires after the *durable* meta write, so its REC-6 row — and
+  the harness assertion on it — tightens to "recovers to `N`" (H3 ≡ H4); the
+  old `{N−1, N}` outcome stays exercised by mechanism 2 (a fault capture taken
+  *while* the durable write is in flight) and by H3 under
+  `NO_META_SYNC`/`NO_SYNC`/`WRITE_MAP`, where C4 stays a plain write.
 - **REC-18** — **Per-cycle verification obligations** (both mechanisms). After every
   crash+reopen:
   1. Open succeeds selecting a valid meta, **or** fails only with the designed
@@ -366,6 +413,20 @@ obligations (REC-18).
   data before C4 writes meta, no image can contain a durable meta `N` without
   durable `N`-data — the fault backend cannot construct that image, which is the
   formal statement of the crash-safety spine.
+
+  **ADR-0019 amendment — the durable-on-return write.** The backend also
+  models the fused C4+C5 (`write_page_durable`): the write is journaled as
+  pending, then — on return — folded into the durable image **by itself**
+  (fold-self, never the barrier's fold-all: other pending writes must stay
+  losable, or the `NO_SYNC`/`NO_META_SYNC` windows would be silently modeled
+  away). A capture taken *while* the call is in flight sees the write pending,
+  materializing {absent, torn, intact} — the REC-6 H3 pre-ADR window. The
+  mutation self-test suite (ADR-0008 D6.1) gains `broken_dsync`, which demotes
+  the durable write to a plain journaled write; the harness MUST then report a
+  REC-18.4 violation on default-mode cuts — the tripwire guarding the
+  "durable on return" claim. An injected durable-write failure leaves the
+  record pending and the live view written (the page-cache exposure), so the
+  pipeline's scrub (REC-13) is modeled as the plain write that follows it.
 - **REC-21** — **Coverage target** (PLAN 1.11 acceptance): ≥ 10k crash-recovery
   cycles clean in CI across both mechanisms, over randomized write workloads
   (put/del/commit/abort, values 0 B–16 MB) and across the durability modes of §3

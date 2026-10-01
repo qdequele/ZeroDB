@@ -1,10 +1,14 @@
 //! One-operation transactions, the shape of rust-storage-bench's YCSB runs
 //! (Phase D): every point read opens its own read txn, every write its own
 //! write txn + commit. Times `read_txn + get + drop` and `write_txn + put +
-//! commit` (NO_SYNC) per op, for both engines, over a pre-filled DB.
+//! commit` (NO_SYNC by default) per op, for both engines, over a pre-filled
+//! DB. `CENSUS_SYNC=1` opens both engines **without** NO_SYNC — fully durable
+//! commits, for the ADR-0019 strace syscall census (expected: ≈1 barrier per
+//! durable commit on both engines, the meta going through the O_DSYNC fd).
 //!
 //! ```text
 //! cargo run --release -p zerodb-oracle --example short_txn_census -- <lmdb|zerodb> [items] [ops]
+//! CENSUS_SYNC=1 strace -cf ... -- zerodb 100000 2000   # syscall census
 //! ```
 
 use std::hint::black_box;
@@ -35,9 +39,14 @@ macro_rules! census {
             opts.map_size(16 << 30);
             opts.max_dbs(4);
             census!(@setpage opts, $setpage);
-            // SAFETY: single-process private temp dir; NO_SYNC is the only flag.
+            // SAFETY: single-process private temp dir; NO_SYNC is the only
+            // flag, and CENSUS_SYNC=1 drops even that (both engines then run
+            // fully durable commits — the ADR-0019 strace syscall census:
+            // count fsync/fdatasync and the O_DSYNC meta write per commit).
             let env = unsafe {
-                opts.flags(EnvFlags::NO_SYNC);
+                if std::env::var("CENSUS_SYNC").is_err() {
+                    opts.flags(EnvFlags::NO_SYNC);
+                }
                 opts.open(dir.path())
             }
             .expect("open env");

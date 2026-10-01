@@ -2,7 +2,9 @@
 
 - Status: Accepted (approved by Quentin 2026-10-01: Option A on **all
   platforms**, macOS included, and LMDB's failed-write scrub adopted; OQ4 and
-  OQ5 left to the implementation and its bench)
+  OQ5 left to the implementation and its bench). Implemented 2026-10-01 — see
+  the dated implementation note under Decision; bench columns pending (the
+  main session runs them).
 - Milestone: Phase 3 (performance — durable-commit cost; perf roadmap Phase B
   "do what LMDB does")
 - Date: 2026-10-01
@@ -150,6 +152,54 @@ Human decisions (2026-10-01):
   meta.
 - **OQ4** (Option D, sector-0-only write) and **OQ5** (where the dsync fd
   lives) are left to the implementation, decided by its bench and review.
+
+### Implementation note (2026-10-01, with the implementation)
+
+- **OQ5 — where the fd lives: `MmapBacking` (the proposed option).**
+  `zerodb-io::open_or_create*` opens it (`file::open_meta_sync`,
+  `O_WRONLY|O_DSYNC`; Rust's `File` adds `O_CLOEXEC`) for every writable
+  non-`WRITE_MAP` env and stores it as `MmapBacking::meta_sync: Option<File>`.
+  Rationale: the backing already owns every commit-I/O primitive (ADR-0004 —
+  the core owns policy, the backing owns primitives), the fd's lifetime is
+  exactly the backing's (closed at env close, after the map per TXN-53 — the
+  field is not the mapped fd, so its drop order is unconstrained), and a
+  future io_uring backend implements `Backing::write_page_durable` itself
+  (FUA / `IORING_OP_FSYNC`), so a shared `MetaWriter` seam would today
+  abstract exactly one implementation. Revisit only if a second non-mmap
+  write backend lands first.
+- **OQ4 — full-page write kept (Option D not folded in).** No measured reason
+  on hand: the macOS dev box is not a flush referee, and the io2/NVMe bench
+  runs after this change (bench plan below). The sector-0-only write remains
+  a ledger candidate gated on that bench showing page-size sensitivity.
+- **The trait seam is as sketched:** `Backing::write_page_durable(pgno,
+  psize, data)`, default = `write_at_page` + `sync_data` (byte-identical to
+  the old C4+C5 for backends without a synchronized write — the oracle's
+  `VecBacking`-class test backings); `MmapBacking` overrides with the
+  dsync-fd `pwrite` (fallback to the default when the fd is absent, i.e.
+  read-only envs, which never commit). The pipeline fuses C4+C5 through it
+  when `sync_meta && !write_map` (LMDB's routing mask — note `MAP_ASYNC`
+  alone, without `WRITE_MAP`, still routes through the dsync fd, as the
+  fork's mask does); `WRITE_MAP` keeps the explicit C4 map-write + C5 msync
+  (REC-12 untouched).
+- **Scrub realization:** the pipeline snapshots the target slot's current
+  mapped bytes (one `psize` memcpy per durable commit — noise next to the
+  device flush the commit already pays; LMDB avoids it by rewriting only the
+  few fields it wrote, ZeroDB writes the full page so it scrubs the full
+  page) and, on a failed/short durable write, rewrites them via
+  `write_at_page` best-effort, then poisons (REC-13 as amended). **Scope
+  note:** the fork scrubs and sets `MDB_FATAL_ERROR` on a failed *plain*
+  (relaxed-mode) meta write too; ZeroDB keeps its pre-existing
+  propagate-without-poison behavior there — the relaxed modes' meta is
+  unsynced anyway (REC-9's documented window), and widening REC-13 was not
+  part of this decision. Recorded in SPEC 06 REC-13.
+- **Crash model:** `FaultBacking::write_page_durable` journals pending →
+  (observer window: a capture here materializes {absent, torn, intact}) →
+  live-view write → fold-**self**. Knobs: `broken_dsync` (mutation self-test;
+  trips REC-18.4 within 4 default-mode cuts — `crash_mutation.rs`),
+  `fail_durable_writes` (scrub tests), `set_durable_write_observer` (the
+  harness's in-flight H3 capture). Harness: image H3 cuts in default mode
+  capture mid-write; SIGKILL H3 assertion tightened to `== N` for default
+  mode only.
 
 Mechanism sketch (for review, not implementation): `Backing` gains
 `write_page_durable(pgno, psize, data)` with a default impl of

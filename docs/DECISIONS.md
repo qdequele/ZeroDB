@@ -21,5 +21,5 @@
 | 0016 | [Lazy (read-time) cell validation on first sight — full walk on second sight; read txns, leaf pages first](adr/0016-lazy-validation.md) | Measured, not adopted (parked) | Phase 3 (PERF-GAP A2(b), issue #21) |
 | 0017 | [Bounded dirty-page memory in large write transactions (spilling, LMDB `mdb_page_spill`)](adr/0017-bounded-dirty-memory.md) | Accepted | Phase 3 (PERF-GAP C2, issue #3) |
 | 0018 | [Env-wide validated-pages cache across transactions, keyed by (pgno, writer txnid stamp)](adr/0018-cross-txn-validation-cache.md) | Accepted | Phase 3 (follow-up of ADR-0016) |
-| 0019 | [Durable meta write through an O_DSYNC descriptor — one barrier per durable commit, as LMDB's `me_mfd`](adr/0019-meta-write-dsync.md) | Accepted (all platforms; LMDB's failed-write scrub adopted) | Phase 3 (durable-commit cost) |
+| 0019 | [Durable meta write through an O_DSYNC descriptor — one barrier per durable commit, as LMDB's `me_mfd`](adr/0019-meta-write-dsync.md) | Accepted (all platforms; LMDB's failed-write scrub adopted); implemented 2026-10-01, bench pending | Phase 3 (durable-commit cost) |
 | 0020 | [Shrink the 32-byte common page header (24 bytes, keeping pgno and the writer stamp)](adr/0020-compact-page-header.md) | Spike approved; format change pending its numbers | Phase 3 (density) |

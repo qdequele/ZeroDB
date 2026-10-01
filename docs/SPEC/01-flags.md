@@ -306,6 +306,22 @@ layer differs — pwrite/io_uring vs writemap+msync):
 - `force` (an explicit `mdb_env_sync`) overrides `NO_SYNC` and downgrades
   `MAP_ASYNC` to a synchronous flush. `mdb_env_sync` on an `MDB_RDONLY` env →
   `EACCES`.
+- **ZeroDB realization of the `me_mfd` routing (ADR-0019).** At open, every
+  writable non-`WRITE_MAP` env opens the data file a **second** time,
+  `O_WRONLY|O_DSYNC|O_CLOEXEC` — the *meta-sync fd* (`MmapBacking::meta_sync`,
+  written through `Backing::write_page_durable`). It is opened even under
+  `NO_SYNC`/`NO_META_SYNC` (fork parity: "in case these get reset"; it also
+  keeps `Env::sync(force)` free to restore durability through the plain fd);
+  `READ_ONLY` and `WRITE_MAP` envs open no meta-sync fd (the fork's
+  `!(MDB_RDONLY|MDB_WRITEMAP)` gate — a writemap env's meta barrier is its
+  `msync`, §S7 / SPEC 06 REC-12). The commit meta write (C4) routes through it
+  **iff** neither `NO_SYNC` nor `NO_META_SYNC` is set (the fork's
+  `mfd = (flags & (NOSYNC|NOMETASYNC)) ? me_fd : me_mfd`), making the write
+  durable on return and eliding C5 — one barrier syscall per durable commit.
+  This holds on **all platforms, macOS included** (maintainer decision
+  2026-10-01); the weaker macOS `O_DSYNC` guarantee is stated in SPEC 06
+  (platform note after REC-7). `copy`/compaction descriptors are untouched
+  (the fork's `MDB_O_COPY` has no DSYNC either).
 - **PLAN note:** these three flags are SHOULD (no consumer) yet PLAN M1.10
   implements their parity in Phase 1; the crash-consistency behavior above is
   validated by the M1.11 harness, not just unit tests. See Mismatches note 1.

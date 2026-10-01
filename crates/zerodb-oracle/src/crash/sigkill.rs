@@ -337,7 +337,14 @@ pub fn run_sigkill_cycle(seed: u64, opts: &SigkillOpts) -> CutReport {
                 return report;
             }
             match point {
-                0..=2 => r == commit - 1,            // H0/H1/H2 → N−1
+                0..=2 => r == commit - 1, // H0/H1/H2 → N−1
+                // H3: in default mode C4 is the durable meta write (ADR-0019),
+                // so H3 fires with `N` durable — the assertion TIGHTENS to
+                // exactly `N` (REC-6 as amended; H3 ≡ H4). The other modes
+                // keep the spec-scoped {N−1, N} (their C4 is a plain write;
+                // under SIGKILL the page cache survives, so N is what is
+                // observed, but the spec only promises the set).
+                3 if spec.mode == super::Mode::Default => r == commit,
                 3 => r == commit - 1 || r == commit, // H3 → {N−1, N}
                 _ => r == commit,                    // H4 → N (REC-18.4)
             }

@@ -35,9 +35,12 @@
 //! ([`RwTxn::commit_pipeline`]) with the always-compiled H0–H4 crash hooks
 //! between steps (ADR-0004 D3/OQ5). The single load-bearing ordering (REC-7):
 //! dirty pages are written (C2) and fsynced (C3) strictly before the meta is
-//! written (C4) to slot `txnid & 1` (TXN-63) and fsynced (C5); the in-memory
-//! snapshot is published last (C6, TXN-18/19 order). A failed fsync poisons
-//! the env (REC-13).
+//! written (C4) to slot `txnid & 1` (TXN-63) and made durable — in default
+//! mode by C4 itself (a durable write through the O_DSYNC meta-sync fd,
+//! ADR-0019; C5 is subsumed), under `WRITE_MAP` by C5's msync; the in-memory
+//! snapshot is published last (C6, TXN-18/19 order). A failed barrier poisons
+//! the env (REC-13), and a failed durable meta write additionally scrubs the
+//! slot's previous bytes back through the plain fd first (LMDB's scrub).
 //!
 //! ## txnid assignment note (TXN-2 vs TXN-63)
 //!
@@ -3970,6 +3973,13 @@ impl<'env> RwTxn<'env> {
         let sync_data = !durability.no_sync;
         let sync_meta = !durability.no_sync && !durability.no_meta_sync;
         let async_flush = durability.map_async;
+        // ADR-0019: when the meta barrier is on and the env is not WRITE_MAP,
+        // C4 goes through `Backing::write_page_durable` (the O_DSYNC meta-sync
+        // fd on the mmap backing — LMDB's `me_mfd` routing, SPEC 01 §S6) and
+        // is durable on return; C5's separate barrier is subsumed. WRITE_MAP
+        // keeps the explicit C4 map-write + C5 msync (SPEC 06 REC-12,
+        // untouched); NO_SYNC/NO_META_SYNC keep the plain, unsynced C4 write.
+        let durable_meta = sync_meta && !durability.write_map;
 
         // ----- C0 was checked in `commit()` (TXN-33: `children.live() == 0`,
         // M1.9/ADR-0007 D4); the freed-page list is already accumulated
@@ -4028,29 +4038,67 @@ impl<'env> RwTxn<'env> {
         };
         let mut buf = vec![0u8; psize as usize];
         meta.encode(&mut buf).map_err(corrupt)?;
-        inner.backing_ref().write_at_page(slot, psize, &buf)?;
-        inner.run_hook(HookPoint::H3);
-        // Crash here: recovered snapshot is `N-1` (meta missing/torn → CRC
-        // rejects → older slot wins) or `N` (meta intact — safe because C3
-        // already made `N`'s data durable). Never a torn meta accepted
-        // (REC-6 H3, REC-8).
-
-        // ----- C5: fsync(meta). Skipped under NO_META_SYNC/NO_SYNC (SPEC 06
-        // REC-9/REC-10): the meta is written to its slot (C4) but not made
-        // durable this commit; recovery falls back to the newest durable meta
-        // (REC-2), which is corruption-free under NO_META_SYNC because C3 still
-        // fsynced the data. -----
-        if sync_meta {
-            if let Err(e) = inner.backing_ref().sync(async_flush) {
-                inner.poison(); // REC-13
+        if durable_meta {
+            // ----- C4+C5 fused (ADR-0019): one durable meta write. Crash
+            // DURING the call: the slot is absent/torn/intact — recovery sees
+            // `N-1` (absent, or torn → CRC rejects → older slot wins) or `N`
+            // (intact — safe because C3 already made `N`'s data durable);
+            // never a torn meta accepted (REC-6 H3 old window, REC-8). After
+            // the call returns, `N` is durable (REC-6 H4). -----
+            //
+            // LMDB's failed-write scrub (REC-13 as amended): snapshot the
+            // slot's current bytes first — on a failed or short durable
+            // write, the *new* meta may still sit in the OS page cache even
+            // though it never became durable, and a clean reopen before a
+            // power loss must not read back an unacknowledged commit. The
+            // slot being written holds snapshot `N-2` (TXN-63), which no
+            // live reader references, and we are the single writer — reading
+            // it through the map races nothing.
+            let slot_off = slot as usize * psize as usize;
+            let prev = inner.backing_ref().bytes()[slot_off..slot_off + psize as usize].to_vec();
+            if let Err(e) = inner.backing_ref().write_page_durable(slot, psize, &buf) {
+                // Best-effort scrub through the plain, non-synchronizing
+                // path (LMDB rewrites old bytes through `me_fd` and ignores
+                // the result — the env is poisoned either way).
+                let _ = inner.backing_ref().write_at_page(slot, psize, &prev);
+                inner.poison(); // REC-13: a failed durability barrier
                 return Err(e.into());
             }
+            inner.run_hook(HookPoint::H3);
+            // Crash here: `N` durable and selected — H3 ≡ H4 in this mode
+            // (REC-6 as amended; the old {N-1, N} window exists only *during*
+            // the durable write above).
+            inner.run_hook(HookPoint::H4);
+        } else {
+            // ----- C4 (plain): write the meta, not yet durable. -----
+            inner.backing_ref().write_at_page(slot, psize, &buf)?;
+            inner.run_hook(HookPoint::H3);
+            // Crash here: recovered snapshot is `N-1` (meta missing/torn → CRC
+            // rejects → older slot wins) or `N` (meta intact — safe because C3
+            // already made `N`'s data durable, except under NO_SYNC where the
+            // FS-order caveat of REC-11 applies). Never a torn meta accepted
+            // (REC-6 H3, REC-8).
+
+            // ----- C5: the meta barrier — here only under WRITE_MAP (msync,
+            // REC-12). Skipped under NO_META_SYNC/NO_SYNC (SPEC 06
+            // REC-9/REC-10): the meta is written to its slot (C4) but not made
+            // durable this commit; recovery falls back to the newest durable
+            // meta (REC-2), which is corruption-free under NO_META_SYNC
+            // because C3 still fsynced the data. -----
+            if sync_meta {
+                if let Err(e) = inner.backing_ref().sync(async_flush) {
+                    inner.poison(); // REC-13
+                    return Err(e.into());
+                }
+            }
+            inner.run_hook(HookPoint::H4);
+            // Crash here: `N` durable and selected (REC-6 H4) — or, under
+            // NO_META_SYNC/NO_SYNC, pending per the mode's window (REC-9).
         }
-        inner.run_hook(HookPoint::H4);
-        // Crash here: `N` durable and selected (REC-6 H4).
 
         // ----- C6: publish the snapshot (TXN-18/19 order: swap the object,
-        // then store the commit point SeqCst) — only after C5, so no reader
+        // then store the commit point SeqCst) — only after the meta barrier
+        // (C4's synchronized write in default mode, else C5), so no reader
         // can pin `N` before it is durable (TXN-64). -----
         inner.publish_snapshot(Arc::new(Snapshot {
             txnid: self.txnid,

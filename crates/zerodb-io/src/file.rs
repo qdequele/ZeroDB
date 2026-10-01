@@ -38,6 +38,29 @@ pub fn open_file(path: &Path, read_only: bool) -> std::io::Result<File> {
     OpenOptions::new().read(true).write(!read_only).open(path)
 }
 
+/// Open the data file a **second** time as the meta-sync descriptor
+/// (ADR-0019, LMDB's `me_mfd` / `MDB_O_META`): `O_WRONLY | O_DSYNC`
+/// (`O_CLOEXEC` is added by Rust's `File` on every open). A positioned write
+/// through this fd returns only once that write — data plus the file metadata
+/// needed to read it back — is on stable storage, so the commit pipeline's
+/// durable meta write (C4) needs no separate `fdatasync` (C5).
+///
+/// Used on **all platforms, macOS included** (ADR-0019, maintainer decision
+/// 2026-10-01): on macOS `O_DSYNC` does not force the device write cache, so
+/// the meta barrier there is weaker than the data barrier — stated in
+/// SPEC 06 (platform note after REC-7); macOS is a development platform, not
+/// a durability target.
+///
+/// # Errors
+///
+/// Propagates the open I/O error.
+pub fn open_meta_sync(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_DSYNC)
+        .open(path)
+}
+
 /// Read one page-worth (`psize` bytes) at `pgno`, positioned (no cursor move).
 ///
 /// # Errors
