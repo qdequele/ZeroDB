@@ -222,3 +222,158 @@ fn short_read_txns_see_exact_contents_while_pages_are_reused() {
         assert_eq!(got, want, "round {round}");
     }
 }
+
+/// No cache entry exists anywhere in the table under `stamp` (ADR-0018
+/// amendment): probes every pgno the file could hold, both kinds.
+fn no_entry_with_stamp(env: &Env, dir: &Path, stamp: u64) -> bool {
+    let len = std::fs::metadata(dir.join(zerodb::DATA_FILE_NAME))
+        .expect("data file")
+        .len();
+    let pages = len / PS as u64 + 1;
+    (0..pages).all(|p| !env.inner().stamp_cache_has(p, false, stamp))
+        && (0..pages).all(|p| !env.inner().stamp_cache_has(p, true, stamp))
+}
+
+/// ADR-0018 amendment (2026-10-01): a successful commit seeds the env-wide
+/// cache with the tree frames it wrote under the committing txnid; an abort
+/// seeds nothing, so the reused txnid (TXN-2) starts clean and the reuse
+/// commit's own seeding is the first entry under that stamp.
+#[test]
+fn commit_seeds_the_cache_and_abort_does_not() {
+    let dir = TempDir::new();
+    let env = open(dir.path());
+    let db = env.main_database();
+
+    // Commit txnid 1: its root leaf is seeded under stamp 1.
+    let mut w = env.write_txn().unwrap();
+    db.put(&mut w, b"a", b"1").unwrap();
+    w.commit().unwrap();
+    let snap = env.inner().snapshot();
+    assert_eq!(snap.txnid, 1);
+    assert!(
+        env.inner().stamp_cache_has(snap.main_db.root, false, 1),
+        "the committed root leaf must be seeded under the committing txnid"
+    );
+
+    // Abort the would-be txnid 2: nothing anywhere is seeded under stamp 2.
+    let mut w = env.write_txn().unwrap();
+    for i in 0..200u32 {
+        let k = format!("key-{i:05}");
+        db.put(&mut w, k.as_bytes(), &[7u8; 100]).unwrap();
+    }
+    w.abort();
+    assert!(
+        no_entry_with_stamp(&env, dir.path(), 2),
+        "an aborted txn must seed nothing under its (reusable) txnid"
+    );
+
+    // The reused txnid 2 commits different bytes; now stamp 2 entries exist
+    // and a fresh reader sees exactly the new contents.
+    let mut w = env.write_txn().unwrap();
+    for i in 0..300u32 {
+        let k = format!("key-{i:05}");
+        db.put(&mut w, k.as_bytes(), &[9u8; 64]).unwrap();
+    }
+    w.commit().unwrap();
+    let snap = env.inner().snapshot();
+    assert_eq!(snap.txnid, 2, "TXN-2: the aborted id is reused");
+    assert!(snap.main_db.depth >= 2, "expected a branch level");
+    assert!(
+        env.inner().stamp_cache_has(snap.main_db.root, true, 2),
+        "the committed root branch must be seeded under its kind"
+    );
+    assert!(
+        !env.inner().stamp_cache_has(snap.main_db.root, false, 2),
+        "the kind is part of the key"
+    );
+    let r = env.read_txn().unwrap();
+    assert_eq!(
+        db.get(&r, b"key-00000").unwrap(),
+        Some([9u8; 64].as_slice())
+    );
+    assert_eq!(db.get(&r, b"a").unwrap(), Some(b"1".as_slice()));
+}
+
+/// ADR-0018 amendment safety pin: spilled pages are written to the file
+/// mid-txn under the txn's stamp (ADR-0017) and may be rewritten in place, so
+/// they must never seed the cache — not from the writer's own re-validation
+/// (the writer memo never publishes) and not from an aborted txn. After the
+/// abort the same txnid re-writes the same keys with different bytes (reusing
+/// pgnos, spilling again) and commits; one-op read txns — each resolving
+/// through the env-wide cache — must see exactly the model's contents.
+#[test]
+fn aborted_spills_seed_nothing_and_reuse_stays_correct() {
+    let dir = TempDir::new();
+    let mut opts = EnvOpenOptions::new();
+    opts.map_size(64 << 20);
+    opts.page_size(PS);
+    // Floor of the knob: 128 dirty pages, so a few-hundred-page txn spills.
+    opts.max_dirty_bytes(1);
+    let env = opts.open(dir.path()).expect("open env");
+    let db = env.main_database();
+
+    // A committed base so the aborted txn below COWs (and spills) real pages.
+    let mut w = env.write_txn().unwrap();
+    for i in 0..4_000u32 {
+        let k = format!("key{i:05}");
+        db.put(&mut w, k.as_bytes(), [b'B'; 240].as_slice())
+            .unwrap();
+    }
+    assert!(w.spill_count() > 0, "the base txn must have spilled");
+    w.commit().unwrap();
+    let base_txnid = env.inner().snapshot().txnid;
+
+    // Spill heavily, then abort: nothing may be seeded under the aborted id.
+    let mut w = env.write_txn().unwrap();
+    let aborted = w.txnid();
+    for i in 0..4_000u32 {
+        let k = format!("key{i:05}");
+        db.put(&mut w, k.as_bytes(), [b'A'; 240].as_slice())
+            .unwrap();
+    }
+    assert!(w.spill_count() > 0, "the aborted txn must have spilled");
+    w.abort();
+    assert_eq!(aborted, base_txnid + 1);
+    assert!(
+        no_entry_with_stamp(&env, dir.path(), aborted),
+        "an aborted spilling txn must seed nothing under its txnid"
+    );
+
+    // The reused txnid writes different bytes over the same keys (spilling,
+    // re-touching spilled pages, reusing the aborted txn's freed pgnos) and
+    // commits.
+    let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut w = env.write_txn().unwrap();
+    assert_eq!(w.txnid(), aborted, "TXN-2: the aborted id is reused");
+    for i in 0..4_000u32 {
+        let k = format!("key{i:05}").into_bytes();
+        let v: Vec<u8> = format!("new-{i}-")
+            .bytes()
+            .cycle()
+            .take(120 + (i as usize % 160))
+            .collect();
+        db.put(&mut w, &k, &v).unwrap();
+        model.insert(k, v);
+    }
+    assert!(w.spill_count() > 0, "the committed txn must have spilled");
+    w.commit().unwrap();
+
+    // One-op read txns resolve through the env-wide cache; any stale or
+    // non-final seeded entry would surface as wrong bytes or a bad view.
+    let mut rng = Rng(0x5851_F42D_4C95_7F2D);
+    for _ in 0..500 {
+        let k = format!("key{:05}", rng.below(4_200)).into_bytes();
+        let r = env.read_txn().unwrap();
+        assert_eq!(db.get(&r, &k).unwrap(), model.get(&k).map(Vec::as_slice));
+    }
+    let r = env.read_txn().unwrap();
+    let got: Vec<(Vec<u8>, Vec<u8>)> = db
+        .iter(&r)
+        .map(|e| {
+            let (k, v) = e.unwrap();
+            (k.to_vec(), v.to_vec())
+        })
+        .collect();
+    let want: Vec<(Vec<u8>, Vec<u8>)> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    assert_eq!(got, want);
+}

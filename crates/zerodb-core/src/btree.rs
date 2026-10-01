@@ -207,12 +207,21 @@ pub struct ValidatedPages<'e> {
     /// plain read txn, so opening one touches no shared refcount (an `Arc`
     /// cloned per txn cost `env/txn/ro_begin_abort` +17 %, and an owning
     /// variant for `static_read_txn` still cost +7 % in drop glue). `None`
-    /// for write txns, whose map pages are mostly copied on write right
-    /// after (`put/val/v8` +12 % with the cache), for env-owning
-    /// `static_read_txn`s, and under a trusting policy. Kept inside the memo
+    /// for env-owning `static_read_txn`s and under a trusting policy. Write
+    /// txns carry it too since the publish-at-commit amendment (ADR-0018,
+    /// 2026-10-01): the committer seeds the cache, so a writer's probe hits
+    /// the path the previous commit rewrote. Kept inside the memo
     /// so the tree code passes one pointer: a two-word handle cost 4–7 % on
     /// memo-hit and scan rungs in the codegen-units=16 build.
     shared: Option<&'e StampCache>,
+    /// Whether a validating miss may publish its result into `shared`
+    /// (ADR-0018 amendment, 2026-10-01). True for plain read txns; false for
+    /// write txns (and the nested read txns sharing their memo): a writer's
+    /// miss-arm publish could record a non-final image of its own spilled
+    /// page (rewritten in place under the same stamp, SPEC 04 TXN-69/72), and
+    /// an aborted writer's publishes would outlive the abort into its reused
+    /// txnid (TXN-2). Read only in the out-of-line miss arms.
+    publish_shared: bool,
 }
 
 impl ValidatedPages<'static> {
@@ -236,12 +245,32 @@ impl<'e> ValidatedPages<'e> {
         policy: FileTrust,
         shared: Option<&'e StampCache>,
     ) -> ValidatedPages<'e> {
+        ValidatedPages::build(policy, shared, true)
+    }
+
+    /// A write txn's memo (ADR-0018 amendment, 2026-10-01): probes the
+    /// env-wide cache — the committer seeds it, so the path the previous
+    /// commit rewrote hits — but never publishes from the miss arm (see
+    /// `publish_shared`). Under a trusting policy the cache is dropped.
+    pub(crate) fn for_writer(
+        policy: FileTrust,
+        shared: Option<&'e StampCache>,
+    ) -> ValidatedPages<'e> {
+        ValidatedPages::build(policy, shared, false)
+    }
+
+    fn build(
+        policy: FileTrust,
+        shared: Option<&'e StampCache>,
+        publish_shared: bool,
+    ) -> ValidatedPages<'e> {
         ValidatedPages {
             levels: std::array::from_fn(|_| OnceLock::new()),
             cur: AtomicUsize::new(0),
             counts: std::array::from_fn(|_| AtomicUsize::new(0)),
             trust_file: policy.is_trusted(),
             shared: if policy.is_trusted() { None } else { shared },
+            publish_shared,
         }
     }
 
@@ -433,7 +462,12 @@ fn validate_leaf_miss<'a>(
                 LeafRef::new_trusted(bytes)
             } else {
                 let leaf = LeafRef::new(bytes, psize)?;
-                cache.publish(pgno, StampKind::Leaf, stamp);
+                // Writers never publish (ADR-0018 amendment, 2026-10-01):
+                // their own spilled pages are non-final images, and an
+                // abort would leave the entry behind under a reused txnid.
+                if v.publish_shared {
+                    cache.publish(pgno, StampKind::Leaf, stamp);
+                }
                 leaf
             }
         }
@@ -458,7 +492,10 @@ fn validate_branch_miss<'a>(
                 BranchRef::new_trusted(bytes)
             } else {
                 let br = BranchRef::new(bytes, psize)?;
-                cache.publish(pgno, StampKind::Branch, stamp);
+                // Writers never publish — see `validate_leaf_miss`.
+                if v.publish_shared {
+                    cache.publish(pgno, StampKind::Branch, stamp);
+                }
                 br
             }
         }
@@ -1770,6 +1807,48 @@ mod tests {
         assert!(
             leaf_view(src(&img), PS, root, Some(&restamped)).is_err(),
             "a newer stamp is a new page version: it misses and is validated"
+        );
+    }
+
+    /// ADR-0018 amendment (2026-10-01): a write txn's memo probes the
+    /// env-wide cache but never publishes into it. Probing is shown by a
+    /// cache hit on a page whose cells were corrupted after the entry was
+    /// published (the hit skips the walk a fresh memo would fail); the
+    /// no-publish half by the cache staying empty after a writer memo fully
+    /// validated the clean page.
+    #[test]
+    fn writer_memo_probes_the_cache_but_never_publishes() {
+        let entries: Vec<_> = (0..8u8).map(|i| kv(&[b'k', i], b"v")).collect();
+        let (mut img, root, depth) = build(&entries);
+        assert_eq!(depth, 1, "a single leaf root");
+        let cache = StampCache::new();
+        let stamp_off = root as usize * PS as usize + 8;
+        let stamp = u64::from_le_bytes(img[stamp_off..stamp_off + 8].try_into().unwrap());
+
+        // No publish: a writer memo's full validation leaves no entry.
+        let writer = ValidatedPages::for_writer(FileTrust::VALIDATE, Some(&cache));
+        leaf_view(src(&img), PS, root, Some(&writer)).expect("clean leaf validates");
+        assert!(
+            !cache.contains(root, StampKind::Leaf, stamp),
+            "a write txn's miss arm must not publish (ADR-0018 amendment)"
+        );
+
+        // Probe: with the entry published (as commit seeding does), a fresh
+        // writer memo is served from the cache even over corrupt cells.
+        cache.publish(root, StampKind::Leaf, stamp);
+        let off = root as usize * PS as usize + crate::page::HEADER_SIZE;
+        img[off..off + 2].copy_from_slice(&0xFFF0u16.to_le_bytes());
+        let second = ValidatedPages::for_writer(FileTrust::VALIDATE, Some(&cache));
+        let view = leaf_view(src(&img), PS, root, Some(&second)).expect("served from the cache");
+        assert_eq!(view.num_keys(), entries.len());
+
+        // A newer stamp (a spilled page of the live txn, or a reused pgno)
+        // misses and is validated — here, caught.
+        img[stamp_off..stamp_off + 8].copy_from_slice(&(stamp + 1).to_le_bytes());
+        let third = ValidatedPages::for_writer(FileTrust::VALIDATE, Some(&cache));
+        assert!(
+            leaf_view(src(&img), PS, root, Some(&third)).is_err(),
+            "a stamp above every committed txnid always misses"
         );
     }
 

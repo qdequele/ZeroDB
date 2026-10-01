@@ -844,6 +844,22 @@ impl EnvInner {
         &self.stamp_cache
     }
 
+    /// Test/diagnostics hook (ADR-0018 amendment, 2026-10-01; the
+    /// [`crate::rwtxn::RwTxn::spills`] precedent): whether the env-wide
+    /// validated-pages cache currently holds exactly the page version
+    /// `(pgno, kind, stamp)` — `branch` selects the kind half of the key.
+    /// Observes only; never part of the stable API.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn stamp_cache_has(&self, pgno: u64, branch: bool, stamp: u64) -> bool {
+        let kind = if branch {
+            crate::stamps::StampKind::Branch
+        } else {
+            crate::stamps::StampKind::Leaf
+        };
+        self.stamp_cache.contains(pgno, kind, stamp)
+    }
+
     /// A write txn's dirty limit in pages (SPEC 04 TXN-68, ADR-0017).
     #[must_use]
     pub fn dirty_limit(&self) -> u64 {
