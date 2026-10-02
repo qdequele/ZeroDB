@@ -380,7 +380,23 @@ section; behavior clarifications per CLAUDE.md rule 3):**
   each SIGKILL recovery (mechanism 1) counts as one (ratified OQ1). A `both`
   run targets ≈80/20 image/SIGKILL **by cycle** with a ≥1k-verified-SIGKILL
   floor on full (≥10k) runs (ratified OQ6).
-- **`NO_SYNC`/`MAP_ASYNC` sub-model split (REC-11/REC-19, ADR-0008 D4).** The
+- **In-place `WRITE_MAP` journaling (REC-19/REC-20 under SPEC 04 TXN-45b;
+  added 2026-10-02, ADR-0021 B3).** Under the in-place realization dirty
+  pages never pass through the write path — the engine stores them into the
+  map at allocation/edit time — so the fault backend journals each
+  **brokered map region** (deduplicated) and resolves its bytes from the
+  live map at every `sync` call (synchronous or `MS_ASYNC` — each flush
+  seals that commit window's final bytes, preserving per-commit versions
+  for the ordered sub-model) and at capture. The resolved records then
+  flow through the unchanged REC-20 fate machinery: the model is "the
+  kernel may persist any subset of dirty map bytes, torn at any
+  granularity, between barriers". Intermediate byte states *between* two
+  seal points are not enumerated; under the bounded-window modes they can
+  land only on pages no durable meta references (TXN-62 applied at store
+  time), and under `MAP_ASYNC` the adversarial sub-model is probe-only.
+  The harness additionally trips on any fd **data** write journaled in a
+  WRITE_MAP cycle (the realization would have silently disengaged — the
+  coverage-vacuousness bug this amendment exists to prevent).
   fault backend runs these modes under two materialization sub-models:
   *ordered* (pending writes persist only as an issue-order prefix, modeling an
   order-preserving filesystem) — REC-11's conditional guarantee applies, so

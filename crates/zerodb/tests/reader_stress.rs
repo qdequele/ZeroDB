@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use zerodb::{Env, EnvOpenOptions, Error, MdbError, RoTxn};
+use zerodb::{Env, EnvFlags, EnvOpenOptions, Error, MdbError, RoTxn};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -57,15 +57,17 @@ const KEYSPACE: u64 = 1500;
 const READERS: usize = 8;
 
 fn open(dir: &Path, max_readers: u32) -> Env {
-    open_with(dir, max_readers, None)
+    open_with(dir, max_readers, None, EnvFlags::EMPTY)
 }
 
-/// [`open`] with a dirty limit (ADR-0017): the spilling-writer variant.
-fn open_with(dir: &Path, max_readers: u32, max_dirty_bytes: Option<usize>) -> Env {
+/// [`open`] with a dirty limit (ADR-0017) and env flags (ADR-0021: the
+/// `WRITE_MAP` in-place writer variant).
+fn open_with(dir: &Path, max_readers: u32, max_dirty_bytes: Option<usize>, flags: EnvFlags) -> Env {
     let mut opts = EnvOpenOptions::new();
     opts.map_size(MAP);
     opts.page_size(PS);
     opts.max_readers(max_readers);
+    opts.flags(flags);
     if let Some(b) = max_dirty_bytes {
         opts.max_dirty_bytes(b);
     }
@@ -149,7 +151,7 @@ fn stress_duration() -> Duration {
 /// (`static_read_txn`) shapes and hold snapshots across commits.
 #[test]
 fn stress_readers_vs_gc_churn_writer() {
-    readers_vs_churn(None, 120);
+    readers_vs_churn(None, 120, EnvFlags::EMPTY);
 }
 
 /// The same stress with a writer that **spills** (ADR-0017, SPEC 04 §6.3a):
@@ -158,12 +160,26 @@ fn stress_readers_vs_gc_churn_writer() {
 /// snapshots — TXN-62/70 under concurrency. `just stress` runs it too.
 #[test]
 fn stress_readers_vs_spilling_writer() {
-    readers_vs_churn(Some(128 * PS as usize), 800);
+    readers_vs_churn(Some(128 * PS as usize), 800, EnvFlags::EMPTY);
 }
 
-fn readers_vs_churn(max_dirty_bytes: Option<usize>, ops_per_txn: usize) {
+/// The same stress with an **in-place `WRITE_MAP`** writer (ADR-0021 B4,
+/// SPEC 04 TXN-45b): every churn txn stores its dirty pages straight into
+/// the writable map mid-txn — fresh and GC-reclaimed pgnos alike — while 8
+/// readers hold and re-walk older snapshots, and nested-free commits
+/// publish through the same C3 msync → C4 meta → C6 ordering. Any TXN-62
+/// breach (an in-place store clobbering a pinned snapshot's page) fails the
+/// readers' double-walk digests loudly. The tiny dirty limit keeps the
+/// spill/unspill bookkeeping (TXN-68..72 degenerate) in the loop too.
+/// `just stress` runs it for the full 180 s.
+#[test]
+fn stress_readers_vs_writemap_in_place_writer() {
+    readers_vs_churn(Some(128 * PS as usize), 800, EnvFlags::WRITE_MAP);
+}
+
+fn readers_vs_churn(max_dirty_bytes: Option<usize>, ops_per_txn: usize, flags: EnvFlags) {
     let dir = TempDir::new();
-    let env = open_with(dir.path(), 64, max_dirty_bytes);
+    let env = open_with(dir.path(), 64, max_dirty_bytes, flags);
     let db = env.main_database();
 
     // Seed a full keyspace so readers always see a populated tree.
@@ -193,8 +209,19 @@ fn readers_vs_churn(max_dirty_bytes: Option<usize>, ops_per_txn: usize) {
                 let db = env.main_database();
                 let mut rng = Lcg(0x05ee_d1e8);
                 let mut generation = 1u64;
+                let mut asserted_mode = false;
                 while Instant::now() < deadline {
                     let mut wtxn = env.write_txn().expect("begin churn txn");
+                    if !asserted_mode {
+                        // ADR-0021: the writemap variant must actually run
+                        // the in-place realization (vacuousness tripwire).
+                        assert_eq!(
+                            wtxn.dirty_in_map_mode(),
+                            flags.contains(EnvFlags::WRITE_MAP),
+                            "dirty-page realization does not match the env flags"
+                        );
+                        asserted_mode = true;
+                    }
                     // Overwrites (COW frees the old leaves/overflow runs → GC
                     // entries), plus deletes and re-inserts (rebalance churn).
                     for _ in 0..ops_per_txn {

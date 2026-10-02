@@ -79,6 +79,53 @@ pub trait Backing: Send + Sync {
         ))
     }
 
+    /// Whether this backing brokers **in-map dirty pages** (ADR-0021,
+    /// SPEC 04 §6.4 TXN-45b): `true` only for the writable-map backing
+    /// (`EnvFlags::WRITE_MAP`), where [`Backing::map_dirty_page`] returns
+    /// slices and the write txn realizes dirty pages directly in the map.
+    /// Default `false`: dirty pages are heap frames written at commit C2
+    /// (TXN-45a), the Phase-1 behavior of every other backing.
+    fn dirty_in_map(&self) -> bool {
+        false
+    }
+
+    /// The brokered mutable slice for the `pages`-page region starting at
+    /// page `pgno` of the writable map (ADR-0021; SPEC 04 §6.4 TXN-45b).
+    /// `None` when the backing does not broker in-map dirty pages
+    /// ([`Backing::dirty_in_map`] is `false`) or the region is out of the
+    /// map's bounds.
+    ///
+    /// # Safety
+    ///
+    /// **The brokered contract (ADR-0021 B1).**
+    /// This mints `&mut [u8]` from `&self`; the signature cannot express the
+    /// exclusivity it needs, so the obligation is the caller's. The sole
+    /// sanctioned caller is the write txn's `DirtyStore` (CLAUDE.md unsafe
+    /// policy; see `zerodb_io::MmapWritable::slice_mut` for the full
+    /// statement). The caller must guarantee:
+    ///
+    /// - the region belongs to a page/run the active write txn **allocated**
+    ///   (TXN-62 — no live snapshot references it);
+    /// - there is a single writer (TXN-6);
+    /// - at most one `&mut` into the region is live at a time, tied to
+    ///   `&mut` on the dirty store and never stored (TXN-39/41/42);
+    /// - no outstanding `&[u8]` view of the map is later read at locations
+    ///   this slice wrote — the writer re-derives its whole-map read view
+    ///   after every spill (TXN-71, ADR-0021 B2).
+    // `unsafe fn` *declaration* only (ADR-0021 B1: no safe fn may mint `&mut`
+    // from `&self`); the default body is trivially safe and the one unsafe
+    // *call* lives in `crate::dirty::map_mut`, the home the CLAUDE.md policy
+    // sanctions for the WRITE_MAP in-place brokered map-slice write.
+    #[allow(unsafe_code)]
+    // clippy cannot see that this is an `unsafe fn` whose documented contract
+    // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
+    // too — verified clippy 1.97); B1's substance is the `unsafe fn` itself.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
+        let _ = (pgno, psize, pages);
+        None
+    }
+
     /// Vectored positioned write of **consecutive** frames starting at
     /// `start_pgno` (commit C2 batching, PERF-GAP B4): `frames` are
     /// page-multiple buffers laid out back-to-back on disk from

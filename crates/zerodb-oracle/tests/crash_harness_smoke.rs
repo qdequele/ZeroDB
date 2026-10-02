@@ -67,6 +67,33 @@ fn image_cuts_all_modes_clean() {
     );
 }
 
+/// ADR-0021 B3 non-vacuousness: image cuts of the WRITE_MAP modes must run
+/// the **in-place** realization — the fault journal records brokered map
+/// regions (and would flag any fd data write as a violation inside the cut).
+/// The other modes must journal none.
+#[test]
+fn writemap_image_cuts_run_in_place() {
+    let mut in_place_regions = 0u64;
+    for seed in seeds_covering_all_modes() {
+        let spec = gen_spec(seed);
+        let r = run_image_cut(seed, &opts(9));
+        assert!(r.violation.is_none(), "seed {seed}: {:?}", r.violation);
+        match spec.mode {
+            Mode::WriteMap | Mode::MapAsync => in_place_regions += r.map_regions,
+            _ => assert_eq!(
+                r.map_regions, 0,
+                "seed {seed} ({:?}) journaled map regions without WRITE_MAP",
+                spec.mode
+            ),
+        }
+    }
+    assert!(
+        in_place_regions > 0,
+        "WRITE_MAP image cuts journaled no brokered regions — the in-place \
+         realization is not being exercised (ADR-0021 B3)"
+    );
+}
+
 #[test]
 fn image_cut_reports_are_deterministic() {
     // Same seed ⇒ same spec, plans, and verdict (ratified OQ4 end-to-end).

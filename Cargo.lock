@@ -436,6 +436,8 @@ dependencies = [
  "libc",
  "tempfile",
  "zerodb",
+ "zerodb-core",
+ "zerodb-io",
 ]
 
 [[package]]
@@ -1469,6 +1471,7 @@ dependencies = [
  "loom",
  "proptest",
  "thiserror",
+ "zerodb-io",
 ]
 
 [[package]]

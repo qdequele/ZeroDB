@@ -48,3 +48,8 @@ libc = { workspace = true }
 tempfile = "3"
 # For the OS-page-size probe in the page-size parity test (allowlisted dep).
 libc.workspace = true
+# ADR-0021 B4 (M1.13 adapter borrow audit): the lifetime-erased write cursor
+# is exercised under miri over the heap-backed writable-map stand-in —
+# workspace-internal test infrastructure, not new external dependencies.
+zerodb-core = { path = "../zerodb-core" }
+zerodb-io = { path = "../zerodb-io", features = ["test-backing"] }

@@ -62,8 +62,10 @@ pub enum Source<'a> {
     },
     /// A write txn's view: dirty frames first, then the map.
     Writer {
-        /// The txn's dirty-page store (checked first).
-        dirty: &'a DirtyStore,
+        /// The txn's dirty-page store (checked first). Covariance makes any
+        /// `&'a DirtyStore<'env>` (`'env: 'a`) coerce here — the store only
+        /// holds a *shared* backing reference (ADR-0021), never `&mut`.
+        dirty: &'a DirtyStore<'a>,
         /// The mapped region (fallback for untouched pages).
         bytes: &'a [u8],
         /// The base snapshot's committed high-water. Bounds only the **map

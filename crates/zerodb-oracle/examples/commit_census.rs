@@ -19,7 +19,7 @@ use zerodb_oracle::tempdir::TempDir;
 
 macro_rules! census {
     ($name:ident, $heed:ident, $setpage:tt) => {
-        fn $name(n: usize, phases: bool) {
+        fn $name(n: usize, phases: bool, write_map: bool) {
             use $heed::types::Bytes;
             use $heed::{Database, EnvFlags, EnvOpenOptions};
 
@@ -28,9 +28,14 @@ macro_rules! census {
             opts.map_size(1 << 30);
             opts.max_dbs(16);
             census!(@setpage opts, $setpage);
-            // SAFETY: single-process private temp dir; NO_SYNC is the only flag.
+            // SAFETY: single-process private temp dir; NO_SYNC (plus the
+            // optional WRITE_MAP A/B toggle, ADR-0021) are the only flags.
             let env = unsafe {
-                opts.flags(EnvFlags::NO_SYNC);
+                let mut flags = EnvFlags::NO_SYNC;
+                if write_map {
+                    flags |= EnvFlags::WRITE_MAP;
+                }
+                opts.flags(flags);
                 opts.open(dir.path())
             }
             .expect("open env");
@@ -100,10 +105,13 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let engine = args.get(1).map(String::as_str).unwrap_or("zerodb");
     let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20_000);
-    let phases = args.get(3).map(String::as_str) == Some("phases");
+    let phases = args.iter().any(|a| a == "phases");
+    // `writemap` anywhere in the tail sets `EnvFlags::WRITE_MAP` on either
+    // engine — the ADR-0021 fair-comparison toggle (WRITE_MAP on both sides).
+    let write_map = args.iter().any(|a| a == "writemap");
     match engine {
-        "lmdb" => lmdb(n, phases),
-        "zerodb" => zerodb(n, phases),
+        "lmdb" => lmdb(n, phases, write_map),
+        "zerodb" => zerodb(n, phases, write_map),
         other => panic!("engine must be lmdb or zerodb, not {other}"),
     }
 }
