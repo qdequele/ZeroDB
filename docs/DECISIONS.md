@@ -23,3 +23,4 @@
 | 0018 | [Env-wide validated-pages cache across transactions, keyed by (pgno, writer txnid stamp)](adr/0018-cross-txn-validation-cache.md) | Accepted | Phase 3 (follow-up of ADR-0016) |
 | 0019 | [Durable meta write through an O_DSYNC descriptor — one barrier per durable commit, as LMDB's `me_mfd`](adr/0019-meta-write-dsync.md) | Accepted (all platforms; LMDB's failed-write scrub adopted) | Phase 3 (durable-commit cost) |
 | 0020 | [Shrink the 32-byte common page header (24 bytes, keeping pgno and the writer stamp)](adr/0020-compact-page-header.md) | Spike approved; format change pending its numbers | Phase 3 (density) |
+| 0021 | [True in-place WRITE_MAP — dirty pages in the map, no heap staging, no commit write-back](adr/0021-writemap-in-place.md) | Accepted (2026-10-02, Quentin); spike first — fair WRITE_MAP comparison shows ZeroDB-writemap 0.42–0.53× of LMDB-writemap | Phase 3 (PERF-GAP B5, issue #13) |
