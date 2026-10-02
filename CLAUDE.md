@@ -51,12 +51,23 @@ Consumers: Meilisearch (milli) and hannoy (HNSW vector index).
 ## unsafe policy
 
 `unsafe` is permitted ONLY in: mmap access and page casting (`zerodb-core::page`,
-`zerodb-io`), the reader table (`zerodb-core::readers`), FFI inside
+`zerodb-io`), the reader table (`zerodb-core::readers`), the WRITE_MAP in-place
+brokered map-slice write in `zerodb-core::dirty` (ADR-0021; sanctioned
+2026-10-02, Quentin), FFI inside
 `zerodb-oracle`, and the minimal API-shape unsafe in `heed-zerodb` that heed's
 pointer model inherently requires (Send impls, TLS-marker retags, the
 lifetime-erased write cursor, the `ReservedSpace` uninit view, and one
 `sysconf` for the D-006 boundary — nothing beyond what the mirrored heed
-surface forces; ratified 2026-07-17, M1.13). **In use but not yet ratified:**
+surface forces; ratified 2026-07-17, M1.13).
+
+The `zerodb-core::dirty` sanction covers ONLY the WRITE_MAP in-place path: calling
+`zerodb-io`'s `unsafe` map-slice broker (`unsafe fn`) to realize a dirty page in
+the writable map at a freshly-COW'd page number. The invariants the `// SAFETY:`
+block must state: single writer (TXN-6); the target pgno is referenced by no live
+snapshot (TXN-62); exactly one live `&mut` per map region, tied to `&mut
+DirtyStore`, never stored; and the whole-map `&[u8]` read view is re-derived after
+each spill so no stale borrow aliases an in-place write (ADR-0021 B2). The broker
+must be an `unsafe fn` (not a safe fn minting `&mut` from `&self`, ADR-0021 B1). **In use but not yet ratified:**
 `zerodb-tools` carries one `libc::flock` (`src/lock.rs`, the live-env guard)
 and the `migrate-lmdb` feature's heed `open` (`src/migrate.rs`), both shipped
 with M1.12 and self-flagged there; a human must either sanction them here or
