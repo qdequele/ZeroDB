@@ -93,15 +93,17 @@ impl MmapBacking {
 /// default heap-buffer `pwrite` + `fdatasync`. Field order is load-bearing for
 /// `Drop` (map unmapped before the fd closes, TXN-53).
 ///
-/// **Realization note (SPEC 04 §6.4, amended M1.10):** during a write txn the
-/// dirty bytes still live in the engine-core heap dirty-page store (so the
-/// value-borrow contract, nested-reader reads, and abort-by-drop are byte-for-
-/// byte identical to the default mode, and `zerodb-core` needs no map `unsafe`);
-/// they are copied into the writable map at commit **C2** via `write_at_page`
-/// and made durable by `msync` at C3/C5. This is observably identical to the
-/// fork's live-map writes through the heed surface; true zero-copy live-map
-/// mutation is a Phase-3 optimization (needs a bench and a `zerodb-io`-brokered
-/// map-slice API to keep the map `unsafe` out of `zerodb-core`).
+/// **Realization note (SPEC 04 §6.4 TXN-45b, ADR-0021):** this backing offers
+/// the brokered dirty-page slice ([`Backing::map_dirty_page`] /
+/// [`MmapWritable::slice_mut`]): the engine core realizes a write txn's dirty
+/// pages **directly in the map** at their freshly-COW'd page numbers, so
+/// commit C2 has no heap→map copy for them — only `msync` (C3/C5) and the
+/// meta write (C4, still through `write_at_page`) remain. The map `unsafe`
+/// stays in this crate; `zerodb-core` consumes safe slices whose exclusivity
+/// contract is documented on [`MmapWritable::slice_mut`]. The heap-staged
+/// realization (TXN-45a) remains the behavior of every backing that does not
+/// broker slices (the default mode, the miri test backing, the
+/// fault-injection backend).
 pub struct WriteMapBacking {
     mmap: MmapWritable,
     file: File,
@@ -153,6 +155,28 @@ impl Backing for WriteMapBacking {
         }
         self.mmap.write_at(off, data);
         Ok(())
+    }
+
+    fn dirty_in_map(&self) -> bool {
+        // ADR-0021: this backing brokers dirty-page slices, so the engine
+        // core realizes dirty pages in the map (SPEC 04 §6.4 TXN-45b).
+        true
+    }
+
+    #[allow(clippy::mut_from_ref)] // brokered; see `MmapWritable::slice_mut`.
+    fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
+        // ADR-0021 brokered dirty-page slice. Bounds are typed (`None`), not
+        // asserted: a pgno past `map_size` must already have failed
+        // allocation as `MapFull`, so a miss here is a caller bug surfaced
+        // gently. The exclusivity contract is `MmapWritable::slice_mut`'s.
+        let ps = psize as usize;
+        let off = (pgno as usize).checked_mul(ps)?;
+        let len = (pages as usize).checked_mul(ps)?;
+        let end = off.checked_add(len)?;
+        if len == 0 || end > self.mmap.len() {
+            return None;
+        }
+        Some(self.mmap.slice_mut(off, len))
     }
 
     fn sync_data(&self) -> std::io::Result<()> {

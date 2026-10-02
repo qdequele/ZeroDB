@@ -3,9 +3,10 @@
 //! M1.10).
 //!
 //! This is one of the sanctioned homes for `unsafe` (CLAUDE.md unsafe policy:
-//! mmap access). There are three `unsafe` blocks: [`Mmap::map`] (read map),
-//! [`MmapWritable::map`] (writable map), and [`MmapWritable::write_at`] (the
-//! `memcpy` into the writable map); each states its safety contract.
+//! mmap access). There are four `unsafe` blocks: [`Mmap::map`] (read map),
+//! [`MmapWritable::map`] (writable map), [`MmapWritable::write_at`] (the
+//! `memcpy` into the writable map), and [`MmapWritable::slice_mut`] (the
+//! ADR-0021 brokered dirty-page slice); each states its safety contract.
 
 use std::fs::File;
 
@@ -202,6 +203,53 @@ impl MmapWritable {
             let dst = self.inner.as_ptr().cast_mut().add(off);
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
+    }
+
+    /// A mutable view of `len` bytes of the map starting at byte offset `off`
+    /// — the brokered dirty-page slice of ADR-0021 (SPEC 04 §6.4 TXN-45b):
+    /// under in-place `WRITE_MAP` a write txn's dirty page is realized
+    /// directly in the map at its freshly-COW'd page number, through this
+    /// slice.
+    ///
+    /// This is a **brokered** `&mut`: the signature alone cannot express the
+    /// exclusivity it relies on (two calls could alias), so the obligation is
+    /// discharged by the engine-core discipline, exactly as
+    /// [`MmapWritable::write_at`]'s is:
+    ///
+    /// - the region belongs to one page (or one overflow run) at a pgno the
+    ///   active write txn **allocated** (TXN-62: beyond the committed
+    ///   high-water, or GC-reclaimed under the oldest-reader gate), so no live
+    ///   snapshot — reader, nested reader on an older txn, or the committed
+    ///   trees — references it;
+    /// - there is exactly one write txn (TXN-6), and the core's `DirtyStore`
+    ///   hands out at most one live `&mut` into it at a time (every mutable
+    ///   access is tied to `&mut` on the store, TXN-39/41/42);
+    /// - the map is never remapped (ADR-0004 D4) and the file was
+    ///   `set_len(map_size)`, so the region is backed for the map's life.
+    ///
+    /// # Panics
+    ///
+    /// If `off + len` exceeds the mapped region (caller bug: allocation past
+    /// `map_size` must have been rejected as `MapFull` first).
+    #[allow(clippy::mut_from_ref)] // brokered by design; see above.
+    #[must_use]
+    pub fn slice_mut(&self, off: usize, len: usize) -> &mut [u8] {
+        let end = off.checked_add(len).expect("map slice overflows usize");
+        assert!(
+            end <= self.inner.len(),
+            "writemap dirty slice [{off}, {end}) exceeds map len {}",
+            self.inner.len()
+        );
+        // SAFETY: `as_ptr()` is valid for the whole `[0, len)` mapping and the
+        // range is bounded by the assert above. The pointer is derived from the
+        // map's root allocation (never through a `&[u8]` view), so writes
+        // through it do not assert exclusivity over any shared view's tag —
+        // the same provenance discipline as `write_at`. Exclusivity of the
+        // *region* is the brokered contract documented above (single writer,
+        // TXN-62 fresh pgno, one live `&mut` per page via the dirty store);
+        // readers never dereference these pages (TXN-62), so no `&[u8]` that
+        // safe code actually reads aliases this slice while it is live.
+        unsafe { std::slice::from_raw_parts_mut(self.inner.as_ptr().cast_mut().add(off), len) }
     }
 
     /// `msync` the whole map. `async_flush` selects `MS_ASYNC` (`MAP_ASYNC`,

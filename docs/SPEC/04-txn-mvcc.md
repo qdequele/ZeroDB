@@ -680,7 +680,9 @@ dirty-page store must be built so it is.
 
 A write txn's dirty set is bounded, as LMDB bounds it (`mdb_page_spill`): when
 it grows past the env's **dirty limit**, part of it is written to the file
-early and its frames are released.
+early and its frames are released. (Under in-place WRITE_MAP, TXN-45b, the
+same contract holds but the "write" is a no-op per in-map frame — see the
+spilling bullet there.)
 
 - **TXN-68 (limit, trigger)** — The dirty limit is counted in pages (an
   overflow run counts its `N` pages). Default: LMDB's `MDB_IDL_UM_MAX` =
@@ -771,14 +773,72 @@ early and its frames are released.
   - The writable map covers the full `map_size` and the file is `set_len` to
     `map_size` at open (matching the fork's `ftruncate`-to-mapsize under
     writemap) so a store to any mapped page never faults past EOF (ADR-0004 D4).
-  - True zero-copy **live-map mutation during the txn** (writing COW copies
-    straight into the map, `get` returning a slice into the map) is a Phase-3
-    optimization: it needs a `zerodb-io`-brokered map-slice API (to keep the map
-    `unsafe` out of `zerodb-core`) and a bench to justify it. The full-generality
-    wording of TXN-45 (bytes "live in the writable map") is the Phase-3 target;
-    Phase-1 satisfies the observable contract via the commit-time copy. This is
-    **not** a `docs/DIVERGENCES.md` entry — it produces no observable divergence
-    from the fork.
+  - True zero-copy **live-map mutation during the txn** is the TXN-45b
+    realization below (ADR-0021). TXN-45a remains the realization for every
+    backing that does not broker map slices: the default mode, the miri test
+    backing, and the fault-injection backend (whose crash journal records
+    fd-path writes only). Neither realization is a `docs/DIVERGENCES.md`
+    entry — both are observably identical to the fork through the heed /
+    oracle surface.
+
+- **TXN-45b — in-place realization (ADR-0021, accepted 2026-10-02; spike).**
+  When the backing brokers mutable map slices (`Backing::dirty_in_map`,
+  implemented by the writable-map backing only), the write txn realizes every
+  dirty frame **in the writable map at the frame's own page number**: COW
+  first-touch copies the source page straight into the map at the fresh pgno,
+  new tree pages and overflow runs are formatted in the map at their final
+  offsets, and in-frame edits (TXN-42 rule 2) mutate the map bytes directly.
+  Commit C2 therefore writes nothing for these frames; C3's `msync` is the
+  barrier that makes the in-place stores durable, and C4/C5 are unchanged.
+  Rules and consequences:
+  - **Reader safety is TXN-62's, applied earlier.** Every in-place store
+    targets a pgno this txn **allocated** (beyond the committed high-water, or
+    GC-reclaimed under the oldest-reader gate), which no live snapshot — and
+    no nested read child of an older state — references. This is the same
+    invariant spilling relies on (TXN-70); in-place merely moves the write
+    from C2/spill time to allocation/edit time. Crash at any point before C4:
+    the live meta `N-1` references none of the written pages, so the
+    recovered store is byte-equivalent to `N-1` (SPEC 06 REC-6 H0/H1 hold with
+    "nothing written" relaxed to "only unreferenced pages written", exactly as
+    §6.3a already relaxed it for spills).
+  - **The borrow contract (TXN-39/41/42/46) is unchanged.** A map frame's
+    address is stable for the txn's life (the map is mapped once, ADR-0004
+    D4, and never remapped — growth is `MapFull`); shared views of a dirty
+    frame are tied to `&txn`, mutable views to `&mut txn`, exactly as heap
+    frames are. The brokered `&mut` slices are created transiently inside
+    `&mut` ops of the dirty store and never stored.
+  - **Abort = don't advance the meta.** An aborted (or crashed) txn leaves
+    its in-place stores as unreferenced bytes at TXN-62 pgnos: free-list
+    pages whose *contents* no committed tree references. The next txn
+    re-draws them from the GC as usual (their prior contents never mattered
+    for a free page). Nothing is unwound; the file may keep grown,
+    garbage-filled unreferenced pages — LMDB's own `MDB_WRITEMAP` abort
+    behavior, and the same end state §6.3a already sanctions after an
+    aborted spill.
+  - **Spilling (§6.3a) degenerates to bookkeeping.** The dirty limit and the
+    TXN-68..72 observable contract stand, but a "spill" of an in-map frame
+    writes nothing (the bytes already sit at their final offset): the frame
+    is released from tracking and the pgno marked spilled; unspilling
+    re-tracks the same map region with no copy (TXN-72's "copies its bytes
+    from the map into a fresh frame at the same pgno" is satisfied
+    degenerately — the frame *is* the map region). The kernel, not the
+    engine, bounds in-map dirty memory (dirty file-backed pages are evictable
+    page cache).
+  - **The validated-pages memo (TXN-38/71) stays sound** because a map page's
+    bytes now change during the txn **only at dirty pgnos**, and dirty pgnos
+    are resolved from the dirty store before the memo is consulted; spills
+    still reset the memo (TXN-71).
+  - **The split scratch copy.** Re-packing a page at its own pgno while
+    reading its pre-split image (the general split) copies the in-map frame
+    out to a heap scratch first — the map region cannot be both source and
+    destination. One page copy per general split, as LMDB's split makes under
+    `MDB_WRITEMAP`.
+  - **unsafe containment (CLAUDE.md policy).** The map `unsafe` stays in
+    `zerodb-io` (`MmapWritable::slice_mut`); `zerodb-core` consumes the
+    brokered safe slices through `Backing::map_dirty_page`, whose exclusivity
+    contract (single writer, TXN-62 target, one live `&mut` per region via
+    the dirty store) is documented at both ends. The dirty store is the sole
+    sanctioned caller.
 
 ### §6.5 — put_reserved / ReservedSpace rules
 
@@ -907,7 +967,7 @@ every hook; this section defines the steps and their ordering. Both write modes
   | C0 | Assert `child_count == 0`; compute freed-page list. | — | last committed meta `N−1` (unchanged). |
   | C1a | **catalog write-back** (M1.6, SPEC 02 §6.1): write each dirty named-DB working record back into the main tree as its `F_SUBDATA` catalog entry. Before `freelist_save` (matches LMDB's sub-DB flush order) so the pages this COWs/frees are captured by C1. | — | `N−1` (all changes still in the dirty set). |
   | C1 | **freelist_save** (SPEC 05 §4): write this txn's freed pages into the GC DB, dirtying GC pages into the dirty set (loop-until-stable, SPEC 05 GC-11). | H0 | `N−1` (all changes still in dirty set, nothing written). |
-  | C2 | **write dirty pages** to their pgnos (`pwrite` each dirty frame / `msync` region under WRITE_MAP). Not yet durable. | **H1** | `N−1` live; new pages sit in free/beyond-HWM slots the `N−1` tree does not reference (TXN-62). Partial/torn data pages are unreferenced garbage. |
+  | C2 | **write dirty pages** to their pgnos (`pwrite` each dirty frame; memcpy-into-map under heap-staged WRITE_MAP, TXN-45a; a no-op per in-map frame under in-place WRITE_MAP, TXN-45b — those bytes were stored at allocation/edit time, under the same TXN-62 invariant). Not yet durable. | **H1** | `N−1` live; new pages sit in free/beyond-HWM slots the `N−1` tree does not reference (TXN-62). Partial/torn data pages are unreferenced garbage. |
   | C3 | **fsync(data)** — flush all data pages (skipped under `NO_SYNC`/`MAP_ASYNC`, SPEC 06 REC-6). | **H2** | `N−1` live; txn `N`'s data fully durable but unreferenced (no meta points at it). |
   | C4 | **write meta** to slot `N&1` (the *older* slot), with `txnid = writer_txnid` and a fresh CRC (SPEC 02 §3.3). Not yet durable. | **H3** | Either `N−1` (meta `N` not yet reached disk, or reached but torn → CRC rejects it → older slot wins) or `N` (meta reached disk intact). Never a torn meta accepted. |
   | C5 | **fsync(meta)** — flush the meta page (skipped under `NO_META_SYNC`/`NO_SYNC`: the meta is written but not fsynced this commit, SPEC 06 REC-6/REC-7/REC-9). | **H4** | txn `N` durable and live. |

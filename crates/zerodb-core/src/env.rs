@@ -79,6 +79,35 @@ pub trait Backing: Send + Sync {
         ))
     }
 
+    /// Whether this backing brokers **in-map dirty pages** (ADR-0021,
+    /// SPEC 04 §6.4 TXN-45b): `true` only for the writable-map backing
+    /// (`EnvFlags::WRITE_MAP`), where [`Backing::map_dirty_page`] returns
+    /// slices and the write txn realizes dirty pages directly in the map.
+    /// Default `false`: dirty pages are heap frames written at commit C2
+    /// (TXN-45a), the Phase-1 behavior of every other backing.
+    fn dirty_in_map(&self) -> bool {
+        false
+    }
+
+    /// The brokered mutable slice for the `pages`-page region starting at
+    /// page `pgno` of the writable map (ADR-0021; SPEC 04 §6.4 TXN-45b).
+    /// `None` when the backing does not broker in-map dirty pages
+    /// ([`Backing::dirty_in_map`] is `false`) or the region is out of the
+    /// map's bounds.
+    ///
+    /// **Brokered contract** (the signature cannot express it; the sole
+    /// sanctioned caller is the write txn's `DirtyStore`, which upholds it —
+    /// see `zerodb_io::MmapWritable::slice_mut` for the full statement):
+    /// the region must belong to a page/run the active write txn allocated
+    /// (TXN-62 — no live snapshot references it), there is a single writer
+    /// (TXN-6), and at most one `&mut` into the region is live at a time
+    /// (every mutable access is tied to `&mut` on the dirty store, TXN-39).
+    #[allow(clippy::mut_from_ref)] // brokered; see the contract above.
+    fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
+        let _ = (pgno, psize, pages);
+        None
+    }
+
     /// Vectored positioned write of **consecutive** frames starting at
     /// `start_pgno` (commit C2 batching, PERF-GAP B4): `frames` are
     /// page-multiple buffers laid out back-to-back on disk from
