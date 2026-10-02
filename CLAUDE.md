@@ -67,7 +67,14 @@ block must state: single writer (TXN-6); the target pgno is referenced by no liv
 snapshot (TXN-62); exactly one live `&mut` per map region, tied to `&mut
 DirtyStore`, never stored; and the whole-map `&[u8]` read view is re-derived after
 each spill so no stale borrow aliases an in-place write (ADR-0021 B2). The broker
-must be an `unsafe fn` (not a safe fn minting `&mut` from `&self`, ADR-0021 B1). **In use but not yet ratified:**
+must be an `unsafe fn` (not a safe fn minting `&mut` from `&self`, ADR-0021 B1).
+This sanction also covers the `Backing::map_dirty_page` **`unsafe fn` declaration**
+in `zerodb-core::env` (the trait's definition site; a declaration-only
+`#[allow(unsafe_code)]` with a trivially-safe default body — the actual map
+`unsafe` stays in `zerodb-io`), and the `#[allow(clippy::mut_from_ref)]` on the
+broker's `unsafe fn` surface (clippy fires that lint on `unsafe fn` too; each
+allow carries the exclusivity contract inline). Ratified 2026-10-02, Quentin.
+**In use but not yet ratified:**
 `zerodb-tools` carries one `libc::flock` (`src/lock.rs`, the live-env guard)
 and the `migrate-lmdb` feature's heed `open` (`src/migrate.rs`), both shipped
 with M1.12 and self-flagged there; a human must either sanction them here or
