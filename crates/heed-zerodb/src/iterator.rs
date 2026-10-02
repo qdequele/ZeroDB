@@ -750,3 +750,172 @@ rw_range_iterator!(
     "A read-write forward prefix iterator (SPEC 00 row 45)."
 );
 rw_range_iterator!(RwRevPrefix, "A read-write reverse prefix iterator.");
+
+#[cfg(test)]
+mod erased_cursor_in_place_tests {
+    //! ADR-0021 B4 — the M1.13 **lifetime-erased write cursor** under miri,
+    //! over the in-place `WRITE_MAP` realization (SPEC 04 TXN-45b).
+    //!
+    //! `RwGuts` is the one place the adapter erases lifetimes: it reborrows
+    //! the write txn through a raw pointer so the native cursor can carry
+    //! `'txn` in both parameters, and `step` stretches the yielded `(k, v)`
+    //! borrows to `'txn`. Under in-place WRITE_MAP those borrows point
+    //! straight into the writable map, and a contract violation (holding
+    //! them across `del_current`/`put_current`) is a **silent wrong-bytes
+    //! read**, not an ASAN-catchable UAF — so this battery drives the guts
+    //! over the heap-backed `TestWriteMap`, where miri checks every access:
+    //! the erased `&mut`, the stretched borrows, interleaved mutations
+    //! through the cursor (which rewrite map bytes in place), and commit.
+    //!
+    //! Run under miri: `cargo +nightly miri test -p heed-zerodb erased_cursor`.
+
+    use std::ops::Bound;
+    use std::path::PathBuf;
+
+    use zerodb_core::env::{open_with_backing_policy, DurabilityFlags};
+    use zerodb_core::page::FileTrust;
+    use zerodb_io::testmap::TestWriteMap;
+
+    use super::{Dir, RwGuts};
+
+    const PS: u32 = 4096;
+    const MAP: u64 = 2 << 20;
+
+    fn wm_env(tag: &str) -> zerodb::Env {
+        let backing = TestWriteMap::fresh_env(PS, MAP as usize);
+        open_with_backing_policy(
+            PathBuf::from(format!("/virtual/heed-erased-{}-{tag}", std::process::id())),
+            Box::new(backing),
+            PS,
+            MAP,
+            false,
+            4,
+            8,
+            DurabilityFlags {
+                write_map: true,
+                ..DurabilityFlags::default()
+            },
+            FileTrust::VALIDATE,
+            false,
+            None,
+        )
+        .expect("open in-place writemap env")
+    }
+
+    #[test]
+    fn erased_write_cursor_discipline_under_miri() {
+        let env = wm_env("walk");
+        let db = env.main_database();
+
+        // Seed uncommitted in-map state through the native txn, then wrap it
+        // in the adapter's RwTxn (the erasure target).
+        let mut zw = env.write_txn().expect("write txn");
+        assert!(zw.dirty_in_map_mode(), "in-place WRITE_MAP must be active");
+        for i in 0..40u32 {
+            let v = if i % 13 == 0 {
+                vec![b'O'; 5_000] // overflow run in the map
+            } else {
+                format!("val-{i:03}-xxxxxxxx").into_bytes()
+            };
+            db.put(&mut zw, format!("key-{i:03}").as_bytes(), &v)
+                .expect("seed put");
+        }
+        let mut wtxn = crate::RwTxn::from_zdb(zw);
+
+        // Forward walk with interleaved mutations through the cursor: the
+        // yielded borrows point into the map; the discipline (drop them
+        // before the next guts call) is exactly what the public `unsafe fn`
+        // surface demands of callers.
+        let mut guts = RwGuts::new(&mut wtxn, db, Dir::Fwd, Bound::Unbounded, Bound::Unbounded);
+        let mut seen = 0u32;
+        let mut deleted = 0u32;
+        let mut rewritten = 0u32;
+        while let Some(res) = guts.step() {
+            let (k, v) = res.expect("step");
+            assert!(k.starts_with(b"key-"), "key shape");
+            assert!(!v.is_empty());
+            let idx: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+            // Copy what we need out, then mutate through the cursor — an
+            // in-place rewrite of the map bytes the borrows pointed into.
+            if idx % 7 == 3 {
+                let key = k.to_vec();
+                // The borrows are dead past here (NLL) — the discipline the
+                // public `unsafe fn` surface demands of its callers.
+                guts.put_current(&key, b"rewritten-in-map")
+                    .expect("put_current");
+                rewritten += 1;
+            } else if idx % 7 == 5 {
+                assert!(guts.del_current().expect("del_current"));
+                deleted += 1;
+            }
+            seen += 1;
+        }
+        assert_eq!(seen, 40);
+        assert!(deleted > 0 && rewritten > 0);
+        drop(guts);
+
+        // Reverse walk over the mutated uncommitted state, then commit.
+        let mut guts = RwGuts::new(&mut wtxn, db, Dir::Rev, Bound::Unbounded, Bound::Unbounded);
+        let mut count = 0u32;
+        let mut prev: Option<Vec<u8>> = None;
+        while let Some(res) = guts.step() {
+            let (k, v) = res.expect("rev step");
+            if let Some(p) = &prev {
+                assert!(k < &p[..], "reverse order");
+            }
+            let idx: u32 = std::str::from_utf8(&k[4..]).unwrap().parse().unwrap();
+            if idx % 7 == 3 {
+                assert_eq!(v, b"rewritten-in-map", "cursor rewrite visible");
+            }
+            assert_ne!(idx % 7, 5, "deleted keys must not reappear");
+            prev = Some(k.to_vec());
+            count += 1;
+        }
+        assert_eq!(count, 40 - deleted);
+        drop(guts);
+
+        wtxn.commit().expect("commit");
+
+        // Committed state through a plain reader.
+        let r = env.read_txn().expect("reader");
+        let total = db.iter(&r).count() as u32;
+        assert_eq!(total, 40 - deleted);
+        assert_eq!(
+            db.get(&r, b"key-003").expect("get"),
+            Some(&b"rewritten-in-map"[..])
+        );
+        assert_eq!(db.get(&r, b"key-005").expect("get"), None);
+    }
+
+    #[test]
+    fn erased_range_bounds_under_miri() {
+        // The range shape: the bound test borrows the cursor's comparator
+        // while the stretched (k, v) are live — the one spot `step`
+        // deliberately orders the stretch before the bound check.
+        let env = wm_env("range");
+        let db = env.main_database();
+        let mut zw = env.write_txn().expect("write txn");
+        for i in 0..20u32 {
+            db.put(&mut zw, format!("r{i:02}").as_bytes(), &[i as u8; 64])
+                .expect("seed put");
+        }
+        let mut wtxn = crate::RwTxn::from_zdb(zw);
+        let mut guts = RwGuts::new(
+            &mut wtxn,
+            db,
+            Dir::Fwd,
+            Bound::Included(b"r05".to_vec()),
+            Bound::Excluded(b"r15".to_vec()),
+        );
+        let mut keys = Vec::new();
+        while let Some(res) = guts.step() {
+            let (k, _v) = res.expect("step");
+            keys.push(k.to_vec());
+        }
+        assert_eq!(keys.first().map(Vec::as_slice), Some(&b"r05"[..]));
+        assert_eq!(keys.last().map(Vec::as_slice), Some(&b"r14"[..]));
+        assert_eq!(keys.len(), 10);
+        drop(guts);
+        wtxn.abort();
+    }
+}

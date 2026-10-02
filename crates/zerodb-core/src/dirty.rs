@@ -20,8 +20,11 @@
 //! Frames of pages freed within the txn are dropped at the free point — a
 //! `&mut` boundary, so no borrow can alias them (TXN-43's soundness condition
 //! is met by construction; the store never drops a frame under a `&self`
-//! borrow). This module is pure safe Rust with no I/O; `miri` exercises it
-//! (TXN-49).
+//! borrow). This module does no I/O; its heap paths are pure safe Rust, and
+//! its one `unsafe` is the sanctioned call of the in-place WRITE_MAP map-slice
+//! broker ([`map_mut`]; CLAUDE.md unsafe policy, ADR-0021). `miri` exercises
+//! both realizations (TXN-49; `tests/writemap_in_place_miri.rs` over the
+//! heap-backed test map).
 //!
 //! **Frame reuse (PERF-GAP B3/B12; LMDB's `me_dpages` pool).** A freed or
 //! discarded one-page frame is not returned to the allocator immediately;
@@ -187,11 +190,63 @@ impl std::fmt::Debug for DirtyStore<'_> {
 /// immediately re-tied to `&mut DirtyStore` by its caller's signature.
 /// Panics only on a store-logic bug: every `Slot::Map` was created through
 /// the same broker with the same geometry.
-fn map_mut(broker: Option<&dyn Backing>, psize: u32, pgno: u64, len: usize) -> &mut [u8] {
+///
+/// This is the **sole sanctioned call site** of the `unsafe` map-slice broker
+/// (CLAUDE.md unsafe policy, ratified 2026-10-02; ADR-0021 B1): the broker is
+/// an `unsafe fn` because it mints `&mut [u8]` from `&self`, and this module
+/// discharges its contract. `map_mut` is itself an `unsafe fn` for the same
+/// reason — no safe function anywhere may mint `&mut` from a shared borrow.
+///
+/// # Safety
+///
+/// Callers are `&mut self` methods of [`DirtyStore`] and must (the brokered
+/// contract, discharged jointly with the `SAFETY` block below):
+/// re-tie the returned borrow to `&mut self` via their signature, never
+/// store it, hold no other view of the region across the call, and only
+/// name regions tracked (or being tracked) as this store's `Slot::Map`
+/// frames — TXN-62 pgnos of the single live write txn.
+// The crate's `unsafe_code` allows outside `page::raw` are exactly this
+// module's brokered map-slice path — the WRITE_MAP in-place write the policy
+// sanctions for `zerodb-core::dirty` (ADR-0021): this fn plus its five
+// `&mut self` callers' one-line `unsafe { map_mut(..) }` calls, and the
+// declaration-only allow on `Backing::map_dirty_page` in `env`.
+#[allow(unsafe_code)]
+// clippy's `mut_from_ref` fires on unsafe fns too (verified clippy 1.97);
+// this one's `# Safety` contract is exactly the exclusivity the lint fears.
+#[allow(clippy::mut_from_ref)]
+unsafe fn map_mut(broker: Option<&dyn Backing>, psize: u32, pgno: u64, len: usize) -> &mut [u8] {
     let b = broker.expect("Slot::Map exists only in an in-map store");
     let pages = (len / psize as usize) as u64;
-    b.map_dirty_page(pgno, psize, pages)
-        .expect("in-map frame region was brokered at insert and the map never shrinks")
+    // SAFETY (the brokered contract, `Backing::map_dirty_page` /
+    // `MmapWritable::slice_mut`; CLAUDE.md invariants for this sanction):
+    //  * Single writer (TXN-6): a `DirtyStore` exists only inside the one
+    //    live `RwTxn`, which holds the env's writer lock for its whole life;
+    //    no other thread can reach a broker of this env while it does.
+    //  * The target pgno is referenced by no live snapshot (TXN-62): every
+    //    `Slot::Map` is created for a pgno this txn **allocated** — beyond
+    //    the committed high-water or GC-reclaimed under the oldest-reader
+    //    gate — which the txn additionally re-checks with a typed
+    //    release-mode guard before any in-map frame is tracked
+    //    (`RwTxn::allocate`, ADR-0021 M2). Readers, nested readers and the
+    //    committed trees therefore never dereference the region.
+    //  * Exactly one live `&mut` per map region, tied to `&mut DirtyStore`,
+    //    never stored: every caller of this function is a `&mut self` method
+    //    of the store whose signature re-ties the returned borrow, the store
+    //    never retains it (only `Slot::Map { len }` bookkeeping), and no
+    //    caller invokes it twice without the previous borrow dying first.
+    //  * The whole-map `&[u8]` read view is re-derived after each spill
+    //    (`RwTxn::spill`, ADR-0021 B2) and — in in-map mode — re-borrowed
+    //    lazily on every access (`RwTxn::whole_map`; the M1 miri finding:
+    //    under Stacked Borrows even *copying* a stale view after an
+    //    in-place write is UB at the written locations), so no stale shared
+    //    borrow is ever created over, or read at, locations an in-place
+    //    write touched; shared views of dirty frames (`DirtyStore::bytes`)
+    //    likewise re-derive from `broker.bytes()` on every call and are
+    //    tied to `&self` (TXN-39/41).
+    unsafe {
+        b.map_dirty_page(pgno, psize, pages)
+            .expect("in-map frame region was brokered at insert and the map never shrinks")
+    }
 }
 
 impl<'env> DirtyStore<'env> {
@@ -357,6 +412,7 @@ impl<'env> DirtyStore<'env> {
     /// TXN-72): the spilled tree page's bytes already live in the map at
     /// `pgno` (they were written there in place), so unspilling is pure
     /// re-tracking — no copy. Returns the frame mutably.
+    #[allow(unsafe_code)] // sanctioned brokered-slice call (ADR-0021; see `map_mut`)
     pub fn unspill_in_place(&mut self, pgno: u64) -> &mut [u8] {
         debug_assert!(self.broker.is_some(), "in-place unspill needs the broker");
         debug_assert_eq!(
@@ -370,7 +426,10 @@ impl<'env> DirtyStore<'env> {
         if let Some(old) = self.frames.insert(pgno, Slot::Map { len }) {
             self.pages -= self.pages_of(old.len());
         }
-        map_mut(self.broker, self.psize, pgno, len)
+        // SAFETY: `&mut self` op re-tying the borrow via this signature; the
+        // region is this store's re-tracked `Slot::Map` frame (a TXN-62 pgno
+        // this txn wrote in place before spilling); no other view is live.
+        unsafe { map_mut(self.broker, self.psize, pgno, len) }
     }
 
     /// The frame bytes for `pgno`: exactly `psize` for a tree page, the whole
@@ -395,12 +454,15 @@ impl<'env> DirtyStore<'env> {
 
     /// Mutable frame bytes for `pgno` (a `&mut self` op; TXN-42 in-place edit).
     #[must_use]
+    #[allow(unsafe_code)] // sanctioned brokered-slice call (ADR-0021; see `map_mut`)
     pub fn bytes_mut(&mut self, pgno: u64) -> Option<&mut [u8]> {
         match self.frames.get_mut(&pgno)? {
             Slot::Heap(b) => Some(&mut **b),
-            // The brokered view is re-tied to `&mut self` by this signature,
-            // so it dies at the next store op like a heap-frame borrow.
-            Slot::Map { len } => Some(map_mut(self.broker, self.psize, pgno, *len)),
+            // SAFETY: `&mut self` op; the brokered view is re-tied to
+            // `&mut self` by this signature, so it dies at the next store op
+            // like a heap-frame borrow; the region is a tracked `Slot::Map`
+            // frame (TXN-62 pgno) and no other view of it is live.
+            Slot::Map { len } => Some(unsafe { map_mut(self.broker, self.psize, pgno, *len) }),
         }
     }
 
@@ -436,11 +498,16 @@ impl<'env> DirtyStore<'env> {
     /// a pooled spare when one is available, zero-filling it; in-map mode
     /// (ADR-0021) zero-fills the map page at `pgno` — callers rely on the
     /// frame being all-zero (e.g. `ZeroReserve` regions, TXN-47).
+    #[allow(unsafe_code)] // sanctioned brokered-slice call (ADR-0021; see `map_mut`)
     pub fn insert_tree_frame(&mut self, pgno: u64) -> &mut [u8] {
         let ps = self.psize as usize;
         if self.broker.is_some() {
             self.track(pgno, Slot::Map { len: ps });
-            let frame = map_mut(self.broker, self.psize, pgno, ps);
+            // SAFETY: `&mut self` op re-tying the borrow via this signature;
+            // the region was just tracked as this store's `Slot::Map` frame
+            // at a pgno the txn allocated (TXN-62, re-checked by the
+            // caller's release guard); no other view of it is live.
+            let frame = unsafe { map_mut(self.broker, self.psize, pgno, ps) };
             frame.fill(0);
             return frame;
         }
@@ -464,12 +531,16 @@ impl<'env> DirtyStore<'env> {
     /// `src` must be exactly one page and MUST NOT overlap the map page at
     /// `pgno` (it never does: `src` is a committed or spilled page, `pgno` a
     /// fresh allocation of this txn).
+    #[allow(unsafe_code)] // sanctioned brokered-slice call (ADR-0021; see `map_mut`)
     pub fn insert_copy(&mut self, pgno: u64, src: &[u8]) -> &mut [u8] {
         let ps = self.psize as usize;
         debug_assert_eq!(src.len(), ps, "insert_copy is one-page only");
         if self.broker.is_some() {
             self.track(pgno, Slot::Map { len: ps });
-            let frame = map_mut(self.broker, self.psize, pgno, ps);
+            // SAFETY: as `insert_tree_frame`; additionally `src` never
+            // overlaps the region (a committed/spilled page vs a fresh
+            // TXN-62 allocation — caller contract above).
+            let frame = unsafe { map_mut(self.broker, self.psize, pgno, ps) };
             frame.copy_from_slice(src);
             return frame;
         }
@@ -490,12 +561,16 @@ impl<'env> DirtyStore<'env> {
     /// Heap mode allocates the contiguous `pages * psize` box (TXN-41's run
     /// rule); in-map mode (ADR-0021) the run is realized in the map at its
     /// final offset — contiguity is the map's own layout.
+    #[allow(unsafe_code)] // sanctioned brokered-slice call (ADR-0021; see `map_mut`)
     pub fn insert_run_frame(&mut self, pgno: u64, pages: u64) -> &mut [u8] {
         let len = (pages as usize) * self.psize as usize;
         debug_assert!(pages > 0, "a run has at least one page");
         if self.broker.is_some() {
             self.track(pgno, Slot::Map { len });
-            let frame = map_mut(self.broker, self.psize, pgno, len);
+            // SAFETY: as `insert_tree_frame`, for the whole `pages`-page
+            // run region (every page of it is a TXN-62 allocation of this
+            // txn — the caller's release guard checks each one).
+            let frame = unsafe { map_mut(self.broker, self.psize, pgno, len) };
             frame.fill(0);
             return frame;
         }

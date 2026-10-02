@@ -204,6 +204,105 @@ Next step per the ADR: the production pass under `critical-implementer`, gated
 on the above, **after** the human calls B1 (unsafe-policy amendment vs typed
 token). The spike branch stays unmerged as the reference.
 
+## Production hardening pass (2026-10-02, critical-implementer; B1 called as unsafe-policy amendment)
+
+- **B1** — `MmapWritable::slice_mut` and `Backing::map_dirty_page` are
+  `unsafe fn`; the one sanctioned `unsafe` call lives in
+  `zerodb-core::dirty::map_mut` with the policy's four invariants in its
+  `SAFETY` block. On the lint: clippy's `mut_from_ref` fires on `unsafe fn`
+  too (verified, clippy 1.97), so the `#[allow]` could not be dropped
+  outright — but it now suppresses a documented false positive on an
+  `unsafe fn` whose `# Safety` contract is exactly the exclusivity the lint
+  fears, not a safe fn minting `&mut` from `&self` (B1's actual hazard,
+  which is gone). The trait keeps a declaration-only `#[allow(unsafe_code)]`
+  in `env.rs` (an `unsafe fn` signature with a trivially safe default body).
+  A witness token was considered and rejected: per-region exclusivity through
+  a `dyn Backing` cannot be typed by a token tied to one `&mut` without
+  freezing the store's disjoint-field borrows; the `unsafe fn` + single call
+  site is the honest shape.
+- **B2 (+ a stronger M1 finding)** — the heap-staged paths re-derive the
+  writer's whole-map `&[u8]` at every spill. Running the discipline under
+  miri (M1) then showed spill-time re-derivation is **insufficient under
+  Stacked Borrows for the in-place mode**: copying the stale view (every
+  `Source` construction), and even moving the `RwTxn` (whose reference
+  *field* is retagged on `commit(self)`), is UB at in-place-written
+  locations. In-place txns therefore hold **no** cached whole-map reference
+  at all (`bytes` is empty there) and borrow the view lazily per access,
+  like readers (`RwTxn::whole_map`). TXN-71 amended accordingly.
+- **B3** — the fault backend forwards `dirty_in_map`/`map_dirty_page` and
+  journals brokered regions (deduplicated; bytes resolved against the live
+  map at every `sync` seal point and at capture — `MS_ASYNC` seals preserve
+  per-commit versions for the ordered sub-model). The image mechanism opens
+  the real writable map for the WRITE_MAP modes, a vacuousness tripwire
+  fails any WRITE_MAP cycle that issues an fd data write, and
+  `crash_harness_smoke::writemap_image_cuts_run_in_place` pins non-vacuity
+  in `cargo test`. The harness summary reports the journaled region count.
+- **B4** — *loom:* no new model: in-place moves the writer's plain map
+  stores earlier in program order (allocation/edit time instead of C2), but
+  they stay single-threaded-writer work strictly before the same C3→C4→C6
+  publish edges the existing reader-table/stamp-cache models check; readers
+  still dereference only after the SeqCst pin/verify, nested children only
+  behind the ChildCounter pause + scoped-join edges (identical to heap
+  frames; TXN-35). No new atomic, lock, or ordering was introduced — `just
+  loom` runs unchanged. *Stress:* `stress_readers_vs_writemap_in_place_writer`
+  (8 readers × in-place churn writer with spills, 180 s under `just
+  stress`). *Adapter audit:* see "M1.13 adapter borrow audit" below; plus
+  `heed-zerodb::iterator::erased_cursor_in_place_tests` runs the
+  lifetime-erased write cursor under miri over the in-place realization.
+- **M1** — `zerodb_io::testmap::TestWriteMap` (`test-backing` feature;
+  `UnsafeCell<Box<[u8]>>`, brokered `&mut` from the cell root, fd writes as
+  reference-free raw copies) + `zerodb-core/tests/writemap_in_place_miri.rs`
+  (mixed ops, splits, runs, `put_reserved`, spill/unspill, nested reads,
+  abort, readers across commits). It caught the B2 insufficiency above on
+  its first run — the discipline is now machine-checked on every miri gate.
+- **M2** — `RwTxn::allocate` wraps every allocation in in-map mode with the
+  release-mode typed guard (`pgno > committed_last_pg ∨ reclaimed`, each
+  page of a run); failure errors the txn (`Io(other)`, only abort remains).
+- **M3** — WRITE_MAP twins added for abort-after-spill (`dirty_spill`), all
+  three nested fan-outs (`nested_fanout`, real threads over in-map dirty
+  state), and the `put_reserved` adversarial battery; each asserts
+  `dirty_in_map_mode()` so the twin cannot go vacuous. The crash battery
+  runs in-place via B3.
+- **m1** — TXN-71 and the §6.1/C5a "every frame C2 wrote" wording amended;
+  TXN-45b gained the B1/M1/M2/B3 rules.
+
+### M1.13 adapter borrow audit (contract 2, ADR-0021 B4)
+
+The adapter erases lifetimes in exactly one structure, `RwGuts`
+(`heed-zerodb/src/iterator.rs`): `RwGuts::new` reborrows `&'txn mut
+RwTxn<'_>` through a `NonNull` cast so the native `RwCursor<'txn, 'txn>` can
+carry the erased env lifetime, and `step` stretches the yielded `(k, v)` to
+`&'txn [u8]`. Findings:
+
+1. **No aliasing from the erasure itself.** The cast consumes an exclusive
+   `&'txn mut` and the original is unusable for `'txn` (the iterator holds
+   the borrow); the erased pointer only shortens the env lifetime parameter,
+   it never duplicates access.
+2. **The stretched borrows are governed by the same `unsafe fn` surface as
+   heed/LMDB.** Every safe method on the `Rw*` iterators either yields
+   (`next`, a `&mut` call that invalidates the previous pair before
+   producing the next) or is `unsafe` (`del_current`, `put_current*`), whose
+   documented contract — "no `&` borrow of the current entry may be live
+   across this call" — is precisely the exclusion in-place needs. Safe code
+   cannot hold `(k, v)` across a mutation of the same iterator (`next`
+   takes `&mut self`), and cannot reach the underlying txn while the
+   iterator lives (its `&mut` is captured).
+3. **What in-place changes is the failure mode, not the contract**: a
+   violator of the `unsafe` contract now reads rewritten map bytes (silent
+   wrong data — LMDB `MDB_WRITEMAP`'s own behavior) instead of stale heap
+   bytes. No adapter change is needed; the contract text already demands
+   the exclusion. The miri battery above pins the compliant discipline on
+   plain heap memory, where any internal slip (e.g. the bound test's
+   comparator borrow overlapping the stretched pair) would be reported.
+4. **`put_current_reserved_with_flags`** stages through a caller-side
+   `vec![0; size]` and a plain `put_with_flags`, so no `ReservedSpace`
+   points into the map from the erased cursor path at all.
+
+Residual (pre-existing, unchanged by this pass): the `unsafe fn` mutation
+surface relies on callers honoring the heed contract — under in-place the
+blast radius of a violation is wrong bytes rather than a crash; this is the
+fork's own WRITEMAP trade, accepted with the opt-in flag (Open question 3).
+
 ## Consequences
 
 - New `zerodb-io` map-slice API (`&mut [u8]` for a page offset); SAFETY: exclusive

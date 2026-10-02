@@ -160,7 +160,11 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
 
     // Real temp file + real mmap backing under the fault wrapper (ADR-0008 D1
     // Option B): the live view is production-identical; only durability is
-    // simulated.
+    // simulated. WRITE_MAP modes open the real writable map (ADR-0021 B3):
+    // the fault wrapper then forwards the brokered dirty-page slices, so the
+    // cycle runs the true in-place realization and the journal tracks the
+    // brokered regions instead of (never-issued) C2 writes.
+    let write_map = spec.mode.durability().write_map;
     let tmp = TempDir::new().map_err(|e| abandon(format!("tempdir: {e}")))?;
     let data_path = tmp.path().join("zerodb.dat");
     let opened = zerodb_io::open_or_create(
@@ -169,7 +173,7 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
         Some(spec.map_size),
         spec.map_size,
         false,
-        false,
+        write_map,
     )
     .map_err(|e| abandon(format!("open_or_create: {e}")))?;
     let (fault, handle) = FaultBacking::wrap(opened.backing, spec.page_size)
@@ -268,6 +272,24 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
     };
     env.set_commit_hook(None);
     drop(env); // release the registry entry; the fault journal lives on
+
+    // ADR-0021 B3 tripwires: under the WRITE_MAP modes the cycle must have
+    // run the in-place realization — every data page goes through the
+    // brokered map slice, never `write_at_page` (C2 and spills write nothing
+    // for in-map frames) — so any journaled fd *data* write means the
+    // in-place path silently disengaged and the crash coverage went vacuous.
+    let stats = handle.stats();
+    report.map_regions = stats.map_regions;
+    if write_map && stats.data_writes > 0 {
+        return Err(CutFail::Violation {
+            detail: format!(
+                "in-place WRITE_MAP cycle issued {} fd data write(s) — the brokered realization \
+                 disengaged (ADR-0021 B3 vacuousness tripwire)",
+                stats.data_writes
+            ),
+            artifact: None,
+        });
+    }
 
     // The cut: hook capture, else op-boundary capture, else end-of-run. Each
     // carries the acked txnid at cut time: a hook capture fires inside the

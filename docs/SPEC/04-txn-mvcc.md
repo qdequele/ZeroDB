@@ -594,8 +594,11 @@ dirty-page store must be built so it is.
   `static_read_txn`s do not use the cache, and dirty frames never do.
   **Commit seeds the cache** (same amendment): after commit step C5 — the
   commit is irrevocable and the txnid consumed forever — and before C6, the
-  committer publishes `(pgno, kind, txnid)` for every leaf or branch frame C2
-  wrote (engine-authored, stamped with the committing txnid, final). Failed
+  committer publishes `(pgno, kind, txnid)` for every leaf or branch frame of
+  the committed dirty set — written at C2, or already realized **in place**
+  in the map under TXN-45b (§6.4), where C2 writes nothing for it
+  (engine-authored, stamped with the committing txnid, final either way;
+  amended 2026-10-02, ADR-0021 m1). Failed
   or aborted commits publish nothing (their txnid is reused, TXN-2); pages
   still spilled at commit are not published (their mid-txn image was
   rewritable in place) and revalidate on first view; trusted-mode envs skip
@@ -720,9 +723,21 @@ spilling bullet there.)
   every page up to the bound (never-written pages in between read as zeros),
   and a stray reference into that range fails with a typed validation error,
   never a fault (under `WRITE_MAP` the whole map is backed anyway). A spilled
-  page's map bytes change only when a later spill rewrites it, and **every
-  spill resets the writer's validated-pages memo**, so a memo entry never
-  outlives the bytes it vouched for. The resolution hot path is unchanged
+  page's map bytes change when a later spill rewrites it — and, under the
+  in-place realization (TXN-45b, ADR-0021), at the in-place stores of this
+  txn's own dirty frames (allocation/edit time) — and **every spill resets
+  the writer's validated-pages memo**, so a memo entry never outlives the
+  bytes it vouched for. **Writer view re-derivation (amended 2026-10-02,
+  ADR-0021 B2/M1):** the writer's whole-map `&[u8]` read view is re-derived
+  from the backing at every spill — a view predating a page's write must
+  never serve it (under Stacked/Tree Borrows the write invalidates the stale
+  borrow at exactly the written locations) — and under the in-place
+  realization the view is not cached at all but borrowed lazily per access,
+  like a reader's (TXN-45b writes happen mid-txn, and under Stacked Borrows
+  even *copying* a stale whole-map reference after one is undefined behavior
+  at the written locations; caught by miri on the heap-backed test map,
+  `zerodb-core/tests/writemap_in_place_miri.rs`). The resolution hot path is
+  unchanged
   (PERF-GAP B13: an extra spilled-page lookup inlined into every descent cost
   read rungs 3–13 %). Nested read children read through the same source; no
   spill runs while one is live (TXN-29 guard precedes the check).
@@ -833,12 +848,35 @@ spilling bullet there.)
     out to a heap scratch first — the map region cannot be both source and
     destination. One page copy per general split, as LMDB's split makes under
     `MDB_WRITEMAP`.
-  - **unsafe containment (CLAUDE.md policy).** The map `unsafe` stays in
-    `zerodb-io` (`MmapWritable::slice_mut`); `zerodb-core` consumes the
-    brokered safe slices through `Backing::map_dirty_page`, whose exclusivity
-    contract (single writer, TXN-62 target, one live `&mut` per region via
-    the dirty store) is documented at both ends. The dirty store is the sole
-    sanctioned caller.
+  - **unsafe containment (CLAUDE.md policy; hardened 2026-10-02, ADR-0021
+    B1).** The broker is an **`unsafe fn`** end to end
+    (`MmapWritable::slice_mut` → `Backing::map_dirty_page`): no safe
+    function mints `&mut [u8]` from `&self`. The sole sanctioned caller is
+    `zerodb-core::dirty::map_mut`, whose `SAFETY` block discharges the
+    contract — single writer (TXN-6), TXN-62 target, exactly one live
+    `&mut` per region tied to `&mut DirtyStore` and never stored, and the
+    whole-map read view re-derived per spill / borrowed per access
+    (TXN-71 as amended).
+  - **The writer's whole-map view is lazy.** Because in-place stores mutate
+    map bytes mid-txn, the write txn holds **no** cached whole-map `&[u8]`
+    in this mode; `get`/descent resolutions borrow the view per access, as
+    readers do (TXN-71 as amended; ADR-0021 M1 — under Stacked Borrows a
+    cached reference field is re-asserted on every move of the txn, which
+    is UB at in-place-written locations).
+  - **Release-mode TXN-62 guard (ADR-0021 M2).** Every pgno the allocator
+    returns in this mode is checked `pgno > committed_last_pg ∨ pgno ∈
+    reclaimed` (each page of a run) **in release builds**, failing with a
+    typed error that marks the txn errored — an allocator bug must surface
+    as an error, never clobber committed data through the map. (The default
+    mode keeps the C2-time `debug_assert`, whose failure there corrupts
+    nothing committed until C2 and is caught by the crash/image harness.)
+  - **Crash coverage (ADR-0021 B3).** The fault-injection backend forwards
+    the broker and journals the brokered regions (bytes resolved at `sync`
+    seal points and at capture), so the image mechanism's torn/dropped/
+    reordered fates exercise the in-place realization — SIGKILL alone
+    cannot (the page cache survives it). Under `MAP_ASYNC` each flush seals
+    that commit's final region bytes, preserving the per-commit versions
+    the ordered-writeback sub-model (SPEC 06 REC-11) compares against.
 
 ### §6.5 — put_reserved / ReservedSpace rules
 

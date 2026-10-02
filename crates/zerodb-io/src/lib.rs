@@ -3,17 +3,22 @@
 //! from M1.4 on, commits through: positioned `pwrite` + `sync_data`).
 //!
 //! This crate is one of the two sanctioned homes for mmap `unsafe` (CLAUDE.md
-//! unsafe policy). The `unsafe` blocks live in [`mmap`] and the single `pwritev`
-//! call in [`file`] (PERF-GAP B4); everything else is
-//! safe `std` I/O — including the [`fault`] crash-injection backend (M1.11,
-//! ADR-0008 D1 Option B: it *wraps* a real backing, adding zero `unsafe`). The
-//! io_uring write backend arrives in Phase 3.5.
+//! unsafe policy). The `unsafe` blocks live in [`mmap`], the single `pwritev`
+//! call in [`file`] (PERF-GAP B4), and the test-only in-memory map stand-in
+//! (`testmap`, ADR-0021 M1, behind the `test-backing` feature); everything
+//! else is safe `std` I/O — including the [`fault`] crash-injection backend
+//! (M1.11, ADR-0008 D1 Option B: it *wraps* a real backing; its only
+//! `unsafe` is the mandatory `unsafe fn` forward of the ADR-0021 brokered
+//! map slice, which adds no obligation of its own). The io_uring write
+//! backend arrives in Phase 3.5.
 
 #![deny(missing_docs)]
 #[cfg(feature = "fault")]
 pub mod fault;
 mod file;
 mod mmap;
+#[cfg(feature = "test-backing")]
+pub mod testmap;
 
 use std::fs::File;
 use std::path::Path;
@@ -163,8 +168,11 @@ impl Backing for WriteMapBacking {
         true
     }
 
-    #[allow(clippy::mut_from_ref)] // brokered; see `MmapWritable::slice_mut`.
-    fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
+    // clippy cannot see that this is an `unsafe fn` whose documented contract
+    // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
+    // too — verified clippy 1.97); B1's substance is the `unsafe fn` itself.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
         // ADR-0021 brokered dirty-page slice. Bounds are typed (`None`), not
         // asserted: a pgno past `map_size` must already have failed
         // allocation as `MapFull`, so a miss here is a caller bug surfaced
@@ -176,7 +184,10 @@ impl Backing for WriteMapBacking {
         if len == 0 || end > self.mmap.len() {
             return None;
         }
-        Some(self.mmap.slice_mut(off, len))
+        // SAFETY: the caller of this `unsafe fn` discharges `slice_mut`'s
+        // brokered contract (single writer, TXN-62 region, one live `&mut`,
+        // read views re-derived per spill) — forwarded verbatim.
+        Some(unsafe { self.mmap.slice_mut(off, len) })
     }
 
     fn sync_data(&self) -> std::io::Result<()> {

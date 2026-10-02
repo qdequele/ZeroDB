@@ -143,16 +143,20 @@ impl MmapWritable {
         //    caller keeps the `File` alongside it — see `WriteMapBacking`);
         //  * the file was `set_len(map_size)` so every page in `[0, len)` is
         //    backed — a store never faults past EOF;
-        //  * writes go only through `write_at_page`, called only by the single
-        //    writer holding the write mutex (TXN-6) at commit C2/C4 or when it
-        //    spills (SPEC 04 §6.3a), and only to
+        //  * writes go only through `write_at_page` or the brokered
+        //    `slice_mut` (ADR-0021, in-place WRITE_MAP), called only by the
+        //    single writer holding the write mutex (TXN-6) — at commit C2/C4,
+        //    when it spills (SPEC 04 §6.3a), or at dirty-frame
+        //    allocation/edit time (TXN-45b) — and only to
         //    pages **no live snapshot references** (TXN-62: fresh pages beyond
         //    the committed high-water, or GC-reclaimed pages under the
         //    oldest-reader gate) and the meta slots 0/1 (never lent out as
         //    borrows — readers use the published snapshot object, TXN-18); a
         //    spilling write txn (SPEC 04 §6.3a) also writes those TXN-62 pages
         //    mid-txn, each only at the start of a `&mut` call when no borrow
-        //    into it is live (TXN-39). So no
+        //    into it is live (TXN-39), and re-derives its whole-map read view
+        //    after every spill before resolving a spilled page through it
+        //    (TXN-71, ADR-0021 B2). So no
         //    `&[u8]` a reader actually dereferences is mutated while borrowed;
         //  * the env is single-process (D-001): no other process writes/truncates.
         let inner = unsafe { memmap2::MmapOptions::new().len(len).map_mut(file)? };
@@ -211,29 +215,39 @@ impl MmapWritable {
     /// directly in the map at its freshly-COW'd page number, through this
     /// slice.
     ///
-    /// This is a **brokered** `&mut`: the signature alone cannot express the
-    /// exclusivity it relies on (two calls could alias), so the obligation is
-    /// discharged by the engine-core discipline, exactly as
-    /// [`MmapWritable::write_at`]'s is:
+    /// # Safety
+    ///
+    /// **The brokered contract (ADR-0021 B1).**
+    /// This mints `&mut [u8]` from `&self`: the signature cannot express the
+    /// exclusivity it relies on (two calls could alias), so the function is
+    /// `unsafe` and the obligation is the **caller's** — the sole sanctioned
+    /// caller is `zerodb-core::dirty` (CLAUDE.md unsafe policy), which must
+    /// guarantee, exactly as [`MmapWritable::write_at`]'s commit-path caller
+    /// does:
     ///
     /// - the region belongs to one page (or one overflow run) at a pgno the
     ///   active write txn **allocated** (TXN-62: beyond the committed
     ///   high-water, or GC-reclaimed under the oldest-reader gate), so no live
     ///   snapshot — reader, nested reader on an older txn, or the committed
     ///   trees — references it;
-    /// - there is exactly one write txn (TXN-6), and the core's `DirtyStore`
-    ///   hands out at most one live `&mut` into it at a time (every mutable
-    ///   access is tied to `&mut` on the store, TXN-39/41/42);
-    /// - the map is never remapped (ADR-0004 D4) and the file was
-    ///   `set_len(map_size)`, so the region is backed for the map's life.
+    /// - there is exactly one write txn (TXN-6), and at most one live `&mut`
+    ///   into the region exists at a time, tied to `&mut` on the dirty store
+    ///   and never stored (TXN-39/41/42);
+    /// - no live `&[u8]` view covering the region is read at the written
+    ///   locations afterwards — the writer's whole-map read view is
+    ///   re-derived after every spill, before any spilled page is resolved
+    ///   through it (SPEC 04 TXN-71, ADR-0021 B2).
     ///
     /// # Panics
     ///
     /// If `off + len` exceeds the mapped region (caller bug: allocation past
     /// `map_size` must have been rejected as `MapFull` first).
-    #[allow(clippy::mut_from_ref)] // brokered by design; see above.
     #[must_use]
-    pub fn slice_mut(&self, off: usize, len: usize) -> &mut [u8] {
+    // clippy cannot see that this is an `unsafe fn` whose documented contract
+    // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
+    // too — verified clippy 1.97); B1's substance is the `unsafe fn` itself.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn slice_mut(&self, off: usize, len: usize) -> &mut [u8] {
         let end = off.checked_add(len).expect("map slice overflows usize");
         assert!(
             end <= self.inner.len(),
@@ -245,10 +259,11 @@ impl MmapWritable {
         // map's root allocation (never through a `&[u8]` view), so writes
         // through it do not assert exclusivity over any shared view's tag —
         // the same provenance discipline as `write_at`. Exclusivity of the
-        // *region* is the brokered contract documented above (single writer,
-        // TXN-62 fresh pgno, one live `&mut` per page via the dirty store);
-        // readers never dereference these pages (TXN-62), so no `&[u8]` that
-        // safe code actually reads aliases this slice while it is live.
+        // *region* is the caller's contract above (single writer, TXN-62
+        // fresh pgno, one live `&mut` per region via the dirty store, read
+        // views re-derived after spills); readers never dereference these
+        // pages (TXN-62), so no `&[u8]` that safe code actually reads aliases
+        // this slice while it is live.
         unsafe { std::slice::from_raw_parts_mut(self.inner.as_ptr().cast_mut().add(off), len) }
     }
 

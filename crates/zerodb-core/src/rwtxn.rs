@@ -558,7 +558,18 @@ pub struct RwTxn<'env> {
     /// thread-agnostic [`crate::env`] writer-lock guard, not a
     /// `std::sync::MutexGuard`).
     _guard: crate::env::WriterGuard<'env>,
-    /// The mapped region (fallback source for untouched pages, TXN-38).
+    /// The mapped region (fallback source for untouched pages, TXN-38), heap
+    /// modes only. Re-derived from the backing at every spill (TXN-71,
+    /// ADR-0021 B2): a spill makes this-txn-written pages resolvable through
+    /// this view, and a view predating those writes must never serve them.
+    ///
+    /// Under in-place `WRITE_MAP` (TXN-45b) this is the **empty slice** and
+    /// every access goes through [`RwTxn::whole_map`]'s lazy borrow instead:
+    /// the writer mutates map bytes mid-txn, and under Stacked Borrows a
+    /// stale whole-map reference *field* is re-asserted (retagged) on every
+    /// move of the txn — `commit(self)` included — which is UB at the
+    /// written locations even if never read (ADR-0021 M1, caught by miri on
+    /// the `test-backing` stand-in).
     bytes: &'env [u8],
     /// The snapshot this txn grew from (`writer_txnid = base.txnid + 1`).
     base: Arc<Snapshot>,
@@ -758,7 +769,9 @@ impl Env {
             errored: false,
             oldest_cache: None,
             children: ChildCounter::new(),
-            bytes: inner.backing_bytes(),
+            // In-place WRITE_MAP keeps no whole-map reference in the struct
+            // (see the field docs; ADR-0021 M1) — `whole_map` borrows lazily.
+            bytes: if in_map { &[] } else { inner.backing_bytes() },
             base,
             _guard: guard,
             env: self,
@@ -879,7 +892,7 @@ impl TxnRead for RwTxn<'_> {
     fn source(&self) -> Source<'_> {
         Source::Writer {
             dirty: &self.dirty,
-            bytes: self.bytes,
+            bytes: self.whole_map(),
             // Bounds the map fallback only: pages this txn allocated beyond
             // the base snapshot live in `dirty` and resolve before the bound,
             // or were spilled below `read_high` (SPEC 04 TXN-71).
@@ -1083,6 +1096,32 @@ impl<'env> RwTxn<'env> {
         Ok(TreeId::Named(dbi))
     }
 
+    /// The whole-map read view this txn's resolutions go through (TXN-38).
+    ///
+    /// Under in-place `WRITE_MAP` (ADR-0021, TXN-45b) the writer mutates map
+    /// bytes **mid-txn** (through the brokered slices), so a view cached at
+    /// txn begin would predate those writes: under Stacked/Tree Borrows,
+    /// copying such a stale `&[u8]` — let alone reading a spilled page
+    /// through it — is undefined behavior at the written locations (caught
+    /// by miri on the `test-backing` stand-in, ADR-0021 M1). The in-map arm
+    /// therefore borrows the view **lazily per access**, exactly as `RoTxn`
+    /// does: a fresh borrow at a `&self` boundary postdates every in-place
+    /// write, and none can happen while it lives (TXN-39).
+    ///
+    /// Heap modes keep the cached view (`self.bytes`, re-derived per spill —
+    /// TXN-71, ADR-0021 B2): their mid-txn file writes go through the fd,
+    /// and the only Rust-visible map mutation is the commit/spill-time
+    /// `memcpy` of the heap-staged WRITE_MAP backing, which the spill-time
+    /// re-derivation postdates.
+    #[inline]
+    fn whole_map(&self) -> &'env [u8] {
+        if self.dirty.in_map_mode() {
+            self.env.inner().backing_bytes()
+        } else {
+            self.bytes
+        }
+    }
+
     fn load(&self, pgno: u64) -> Result<PageRef<'_>> {
         // Trusted-psize load (PERF-GAP A4): psize is env-validated at open.
         PageRef::new_trusted_psize(
@@ -1097,7 +1136,47 @@ impl<'env> RwTxn<'env> {
     /// `allocate(n)` (SPEC 05 GC-16, ADR-0005 D3): loose fast path, then a GC
     /// draw (skipped entirely inside `freelist_save` — GC-12), then file
     /// extend with the GC-17 bound.
+    ///
+    /// Under in-place `WRITE_MAP` (ADR-0021) every pgno this returns is
+    /// immediately realized **in the map** — a store to committed bytes, not
+    /// a heap frame — so the TXN-62 check that is a `debug_assert` at C2
+    /// (`write_frames`) is enforced here as a **typed release-mode guard**
+    /// (ADR-0021 M2): a future allocator bug must surface as an error, never
+    /// silently clobber committed data through the map.
     fn allocate(&mut self, n: u64) -> Result<u64> {
+        let p = self.allocate_raw(n)?;
+        if self.dirty.in_map_mode() && !self.in_map_target_ok(p, n) {
+            // Only abort remains: the allocator's bookkeeping can no longer
+            // be trusted (LMDB `MDB_TXN_ERROR` degradation, TXN-30).
+            self.errored = true;
+            return Err(Error::Io(std::io::Error::other(format!(
+                "TXN-62 violation refused (ADR-0021 M2): allocator returned page {p} (run of {n}) \
+                 at or below the committed high-water {} without a reclaim record — writing it \
+                 in place would clobber the live snapshot",
+                self.committed_last_pg
+            ))));
+        }
+        Ok(p)
+    }
+
+    /// The ADR-0021 M2 predicate: every page of the run is either beyond the
+    /// committed high-water or recorded as GC-reclaimed under the
+    /// oldest-reader gate this txn (`reclaimed` also covers loose re-draws:
+    /// a loose page was classified loose by exactly this predicate,
+    /// `RwTxn::free_page`/`free_run`).
+    fn in_map_target_ok(&self, p: u64, n: u64) -> bool {
+        // Fast path: a run starting beyond the high-water lies wholly beyond
+        // it (pgnos ascend through the run).
+        if p > self.committed_last_pg {
+            return true;
+        }
+        (p..p.saturating_add(n))
+            .all(|pg| pg > self.committed_last_pg || self.reclaimed.contains(&pg))
+    }
+
+    /// [`RwTxn::allocate`] without the ADR-0021 M2 guard (the guard wraps
+    /// every return point in one place).
+    fn allocate_raw(&mut self, n: u64) -> Result<u64> {
         debug_assert!(n >= 1);
         if n == 1 {
             if let Some(p) = self.loose.pop() {
@@ -1422,10 +1501,12 @@ impl<'env> RwTxn<'env> {
         let base = (pgno as usize)
             .checked_mul(ps)
             .ok_or(Error::Mdb(MdbError::Invalid))?;
-        // Copy the `&'env [u8]` map handle out of `self` (it is `Copy`, lifetime
-        // 'env) so the source borrow does not alias the `&mut self.dirty` op
-        // below — letting `insert_copy` copy straight into a pooled frame.
-        let map: &[u8] = self.bytes;
+        // Take the `&'env [u8]` map view out of `self` (lifetime 'env, so the
+        // source borrow does not alias the `&mut self.dirty` op below —
+        // letting `insert_copy` copy straight into a pooled frame). Under
+        // in-place WRITE_MAP this is a fresh per-access borrow postdating
+        // every brokered write (see `RwTxn::whole_map`).
+        let map: &[u8] = self.whole_map();
         let src = map
             .get(base..base + ps)
             .ok_or(Error::Mdb(MdbError::Invalid))?;
@@ -1605,7 +1686,25 @@ impl<'env> RwTxn<'env> {
         // touch already stored it in the fully-backed map), so the file backs
         // every page up to `high`; spilled pages resolve from the map below it.
         self.read_high = high;
-        // TXN-71: a spilled page's map bytes change only here, so a fresh
+        // TXN-71 / ADR-0021 B2: re-derive the cached whole-map read view. A
+        // spill is the moment pages this txn wrote (via `pwrite` or the
+        // heap-staged WRITE_MAP `memcpy`) become resolvable through the view
+        // (`read_high` above), so a view taken *before* those writes must
+        // never serve them: under Stacked/Tree Borrows a write through the
+        // map's root invalidates an older shared borrow at exactly the
+        // written locations, and the fd-write path mutates the same mapped
+        // bytes outside the borrow system entirely. A fresh borrow taken
+        // here — after every write to the newly spilled pages, at a `&mut`
+        // boundary with no other borrow live (TXN-39) — postdates them all.
+        // (Under in-place WRITE_MAP the writes happen mid-txn, not at spill,
+        // so the cache stays the empty slice and `RwTxn::whole_map`
+        // re-borrows per access instead — ADR-0021 M1's miri finding: a
+        // stale reference *field* is retagged on every move of the txn.)
+        if !self.dirty.in_map_mode() {
+            self.bytes = self.env.inner().backing_bytes();
+        }
+        // TXN-71: a spilled page's map bytes change only at in-place writes
+        // of this txn's own dirty frames (TXN-45b) and here, so a fresh
         // memo per spill keeps every memo entry true to the current bytes.
         // The env cache needs no reset: it cannot hold this txn's stamp
         // (only committed txnids are published, all below ours), so a
@@ -1639,6 +1738,15 @@ impl<'env> RwTxn<'env> {
     #[must_use]
     pub fn spilled_pgnos(&self) -> usize {
         self.dirty.spilled_len()
+    }
+
+    /// Whether this txn realizes dirty frames **in the writable map**
+    /// (ADR-0021, SPEC 04 §6.4 TXN-45b). Test and diagnostics hook: the
+    /// WRITE_MAP-parameterized batteries assert the mode is actually active.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn dirty_in_map_mode(&self) -> bool {
+        self.dirty.in_map_mode()
     }
 
     /// Read-only root-to-key descent (SPEC 03 §2), returning the path of
