@@ -41,18 +41,25 @@ const fn build_table() -> [u32; 256] {
     table
 }
 
+/// Fold `bytes` into a running (non-finalized) CRC32C state. The single source
+/// of the byte-wise table step, shared by [`crc32c`] and [`crc32c_concat`] so
+/// the two cannot drift if the table or algorithm ever changes.
+#[inline]
+fn crc_update(mut crc: u32, bytes: &[u8]) -> u32 {
+    for &byte in bytes {
+        let idx = ((crc ^ byte as u32) & 0xFF) as usize;
+        crc = (crc >> 8) ^ TABLE[idx];
+    }
+    crc
+}
+
 /// Compute the CRC32C (Castagnoli) checksum of `data`.
 ///
 /// Returns the finalized checksum (post final-XOR), i.e. the value written to a
 /// meta page's `meta_crc` field.
 #[must_use]
 pub fn crc32c(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &byte in data {
-        let idx = ((crc ^ byte as u32) & 0xFF) as usize;
-        crc = (crc >> 8) ^ TABLE[idx];
-    }
-    crc ^ 0xFFFF_FFFF
+    crc_update(0xFFFF_FFFF, data) ^ 0xFFFF_FFFF
 }
 
 /// CRC32C over the concatenation of `parts`, as one stream — equal to
@@ -63,10 +70,7 @@ pub fn crc32c(data: &[u8]) -> u32 {
 pub fn crc32c_concat(parts: &[&[u8]]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for part in parts {
-        for &byte in *part {
-            let idx = ((crc ^ byte as u32) & 0xFF) as usize;
-            crc = (crc >> 8) ^ TABLE[idx];
-        }
+        crc = crc_update(crc, part);
     }
     crc ^ 0xFFFF_FFFF
 }

@@ -233,7 +233,11 @@ At env open the engine reads both slots and validates each independently:
    inconsistent and is **discarded** (INV-2). This guards a torn write that
    updated one copy but not the other.
 5. `fl_count ≤ (psize − 176) / 8` (the annex fits the page; checked **before**
-   the CRC so a hostile count cannot drive an out-of-bounds CRC read), else
+   the CRC so a hostile count cannot drive an out-of-bounds CRC read). Here
+   `psize` is the **env's expected page size** (the one validation is called
+   with), not the slot's own `page_size` field — using the expected size is
+   conservative even when a hostile slot claims a larger `page_size`, since the
+   CRC read stays within the buffer the env actually mapped. Else
    the slot is discarded; then `meta_crc` matches the recomputed CRC32C over
    `[0, 172) ∪ [176, 176 + 8·fl_count)` (§3.3). A slot that fails either is
    **torn** and is discarded. (The annex *ids*' ordering/range are validated

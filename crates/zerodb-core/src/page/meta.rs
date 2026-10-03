@@ -207,9 +207,19 @@ impl MetaPage {
     }
 
     /// Encode this meta into `buf` with `annex` as the free-list annex ids
-    /// (SPEC 02 §3 format v2, ADR-0022; SPEC 05 §2a). The caller guarantees
-    /// the GC-29 shape (strictly ascending, unique, in range) — `freelist_save`
-    /// produces exactly that; this encoder only enforces the capacity bound.
+    /// (SPEC 02 §3 format v2, ADR-0022; SPEC 05 §2a). This encoder enforces only
+    /// the capacity bound; it does **not** check the GC-29 shape (strictly
+    /// ascending, unique, in range), and it is sound for it not to, because the
+    /// shape is never trusted on the way *out* of a meta — it is re-checked by
+    /// `validate_pil_ids` before any id is handed out (SPEC 05 GC-33). The two
+    /// callers and their inputs:
+    /// - `RwTxn::freelist_save` → the commit path: produces a GC-29-shaped list
+    ///   by construction, so what it encodes is well-formed.
+    /// - `copy::write_raw` → raw env copy: forwards the pinned snapshot's annex
+    ///   verbatim. That annex passed only the open-time count+CRC bound, **not**
+    ///   `validate_pil_ids`, so a hostile-but-CRC-valid source file is copied
+    ///   faithfully (ids unchanged) — the copy is as trustworthy as its source
+    ///   and no more, and the copy's own reader re-validates before any draw.
     ///
     /// # Errors
     ///
@@ -371,7 +381,9 @@ pub enum MetaValidity {
     /// `page_size` is not a power of two in range (the observed value).
     BadPageSize(u32),
     /// `fl_count` exceeds the page's annex capacity (SPEC 02 §3.2 rule 5,
-    /// format v2) — the slot is invalid (torn or hostile).
+    /// format v2) — the slot is **invalid and discarded** (as §3.3 / REC-8
+    /// word it). The cause is either a torn write or a hostile count; both are
+    /// rejected identically, before the CRC read, so the name covers both.
     BadAnnexCount(u32),
     /// Header txnid and body txnid disagree — a torn write (INV-2).
     TxnidMismatch {

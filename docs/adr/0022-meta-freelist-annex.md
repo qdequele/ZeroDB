@@ -6,6 +6,15 @@
   coordinating session, not directly from the maintainer; per CLAUDE.md rule 6
   this ADR still **awaits direct human ratification before merge**. Nothing is
   merged or pushed; the spike exists so the bench server can measure the win.
+- Result (2026-10-03): **measured win, gate green, spec-review clean.** Bench
+  server 3-column A/B (x86-64, turbo off, 5 interleaved rounds, CODEGEN_UNITS=1,
+  BASE = main 84582e8): `commit/batch/n1` 2.04× → **1.60×** LMDB (−22%,
+  after÷before 0.780), `commit/batch/n100` 1.09× → 1.02×; `n10k` and both sync
+  rungs flat (overhead amortized / fsync-bound — as predicted). Full gate: test
+  630/0, miri 0-fail, crash-test-quick all durability modes, loom 9/0, stress
+  180s 2/0, fuzz-quick 2.1M clean. Adversarial spec-review found no technical
+  blockers; its should-fix/nit items are addressed in the branch. Open for human
+  ratification (questions 1–3 below).
 - Milestone: perf track "non-copy per-commit CPU" lever #1 (cheaper free-list
   save), PERF-GAP-VS-LMDB §B12; forward-looking toward PLAN 3.1.
 - Date: 2026-10-03
