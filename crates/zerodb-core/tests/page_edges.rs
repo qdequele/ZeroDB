@@ -520,16 +520,18 @@ fn built_valid_meta(psize: u32) -> Vec<u8> {
     buf
 }
 
-/// Every single-byte flip in the CRC-covered region [0, META_CONTENT_LEN)
-/// must invalidate the slot; every single-byte flip in the excluded reserved
-/// tail [172, psize) must NOT (SPEC 02 §3.3 — the sector-tear reality of
-/// REC-22). The `meta_crc` field itself [168, 172) is not part of the hashed
-/// range but flipping it desyncs stored-vs-recomputed CRC, so it also
-/// invalidates.
+/// Every single-byte flip in the CRC-covered region [0, META_CONTENT_LEN =
+/// 172) — which since format v2 includes `fl_count` at [168, 172) (ADR-0022;
+/// a silently-zeroed annex count must tear the slot) — must invalidate the
+/// slot; every single-byte flip in the excluded reserved tail
+/// [176, psize) must NOT, for an empty-annex meta (SPEC 02 §3.3 — the
+/// sector-tear reality of REC-22). The `meta_crc` field itself [172, 176) is
+/// not part of the hashed range but flipping it desyncs stored-vs-recomputed
+/// CRC, so it also invalidates.
 fn meta_validation_rejection_matrix(psize: u32) {
     let buf = built_valid_meta(psize);
 
-    for i in 0..168usize {
+    for i in 0..172usize {
         let mut b = buf.clone();
         b[i] ^= 0xFF;
         let v = MetaPage::validate(&b, psize).unwrap();
@@ -538,7 +540,7 @@ fn meta_validation_rejection_matrix(psize: u32) {
             "byte {i} (CRC-covered) flip must invalidate meta"
         );
     }
-    for i in 168..172usize {
+    for i in 172..176usize {
         let mut b = buf.clone();
         b[i] ^= 0xFF;
         let v = MetaPage::validate(&b, psize).unwrap();
@@ -549,9 +551,11 @@ fn meta_validation_rejection_matrix(psize: u32) {
     }
     // Sample the reserved tail rather than iterating every byte (up to ~65KB)
     // to stay within the ~30s test-runtime budget; every sampled byte must
-    // NOT invalidate, documenting that this range is unprotected by the CRC.
-    let stride = ((psize as usize - 172) / 40).max(1);
-    for i in (172..psize as usize).step_by(stride) {
+    // NOT invalidate, documenting that this range is unprotected by the CRC
+    // when the annex is empty (with a non-empty annex the ids' bytes ARE
+    // covered — the spec02_format annex tests lock that).
+    let stride = ((psize as usize - 176) / 40).max(1);
+    for i in (176..psize as usize).step_by(stride) {
         let mut b = buf.clone();
         b[i] ^= 0xFF;
         let v = MetaPage::validate(&b, psize).unwrap();

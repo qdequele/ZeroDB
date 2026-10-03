@@ -8,11 +8,13 @@
 //! §3.2's numbered list), and the double-buffer selection formula
 //! ([`select`]).
 
-use super::crc32c::crc32c;
+use super::crc32c::crc32c_concat;
 use super::geometry::validate_page_size;
 use super::header::CommonHeader;
 use super::raw::{read_u16, read_u32, read_u64, write_u16, write_u32, write_u64};
-use super::{PageError, FORMAT_VERSION, MAGIC, META_CONTENT_LEN, PGNO_INVALID, P_META};
+use super::{
+    PageError, FORMAT_VERSION, MAGIC, META_ANNEX_OFF, META_CONTENT_LEN, PGNO_INVALID, P_META,
+};
 
 // Meta body field offsets (absolute within the page).
 const OFF_MAGIC: usize = 32;
@@ -24,7 +26,27 @@ const OFF_LAST_PG: usize = 56;
 const OFF_BODY_TXNID: usize = 64;
 const OFF_FREE_DB: usize = 72;
 const OFF_MAIN_DB: usize = 120;
-const OFF_META_CRC: usize = 168;
+const OFF_FL_COUNT: usize = 168;
+const OFF_META_CRC: usize = META_CONTENT_LEN; // 172 (SPEC 02 §3, format v2)
+
+/// Maximum number of free-list annex ids a meta page of `psize` bytes can
+/// carry (SPEC 02 §3, ADR-0022): the ids start at [`META_ANNEX_OFF`] and run
+/// to the end of the page.
+#[must_use]
+pub fn meta_annex_cap(psize: u32) -> usize {
+    (psize as usize).saturating_sub(META_ANNEX_OFF) / 8
+}
+
+/// The meta CRC32C with the ADR-0022 split coverage: `[0, 172)` followed by
+/// the `8·fl_count` annex-id bytes at [`META_ANNEX_OFF`], skipping the CRC
+/// field itself. `buf` must hold the whole page; `fl_count` must already be
+/// bounds-checked against [`meta_annex_cap`].
+fn meta_crc_of(buf: &[u8], fl_count: usize) -> u32 {
+    crc32c_concat(&[
+        &buf[..META_CONTENT_LEN],
+        &buf[META_ANNEX_OFF..META_ANNEX_OFF + 8 * fl_count],
+    ])
+}
 
 /// Size of a [`DBRecord`], in bytes.
 pub const DBRECORD_LEN: usize = 48;
@@ -147,6 +169,10 @@ pub struct MetaPage {
     pub free_db: DBRecord,
     /// Root/stats of the main/catalog DB.
     pub main_db: DBRecord,
+    /// Free-list annex id count (SPEC 02 §3 format v2, ADR-0022). The ids
+    /// themselves stay in the page buffer (offset [`META_ANNEX_OFF`]) and are
+    /// read with [`MetaPage::read_annex`]; this decoded struct stays `Copy`.
+    pub fl_count: u32,
 }
 
 impl MetaPage {
@@ -165,16 +191,32 @@ impl MetaPage {
             last_pg: 1,
             free_db: DBRecord::empty(),
             main_db: DBRecord::empty(),
+            fl_count: 0,
         }
     }
 
     /// Encode this meta into `buf` (which must be at least `page_size` bytes),
-    /// computing and writing the CRC and zeroing the reserved tail.
+    /// with an **empty** free-list annex, computing and writing the CRC and
+    /// zeroing the reserved tail. See [`MetaPage::encode_with_annex`].
     ///
     /// # Errors
     ///
     /// [`PageError::InvalidPageSize`] or [`PageError::BufferTooSmall`].
     pub fn encode(&self, buf: &mut [u8]) -> Result<(), PageError> {
+        self.encode_with_annex(buf, &[])
+    }
+
+    /// Encode this meta into `buf` with `annex` as the free-list annex ids
+    /// (SPEC 02 §3 format v2, ADR-0022; SPEC 05 §2a). The caller guarantees
+    /// the GC-29 shape (strictly ascending, unique, in range) — `freelist_save`
+    /// produces exactly that; this encoder only enforces the capacity bound.
+    ///
+    /// # Errors
+    ///
+    /// [`PageError::InvalidPageSize`], [`PageError::BufferTooSmall`], or
+    /// [`PageError::BadValueSize`] if `annex` exceeds [`meta_annex_cap`]
+    /// (engine bug: the save's fit check owns that bound).
+    pub fn encode_with_annex(&self, buf: &mut [u8], annex: &[u64]) -> Result<(), PageError> {
         validate_page_size(self.page_size)?;
         let psize = self.page_size as usize;
         if buf.len() < psize {
@@ -183,6 +225,14 @@ impl MetaPage {
                 psize,
             });
         }
+        if annex.len() > meta_annex_cap(self.page_size) {
+            return Err(PageError::BadValueSize(annex.len() as u64));
+        }
+        debug_assert_eq!(
+            self.fl_count as usize,
+            annex.len(),
+            "MetaPage.fl_count must match the annex slice (single source: the ids)"
+        );
         // Zero the whole page first so every reserved byte is 0.
         buf[..psize].fill(0);
         // Common header (zeros reserved0 + checksum; variant tail already 0).
@@ -202,10 +252,38 @@ impl MetaPage {
         write_u64(buf, OFF_BODY_TXNID, self.txnid);
         self.free_db.write(buf, OFF_FREE_DB);
         self.main_db.write(buf, OFF_MAIN_DB);
-        // CRC over [0, 168).
-        let crc = crc32c(&buf[..META_CONTENT_LEN]);
+        // Free-list annex (format v2): count at 168, ids from 176.
+        write_u32(buf, OFF_FL_COUNT, annex.len() as u32);
+        for (i, &id) in annex.iter().enumerate() {
+            write_u64(buf, META_ANNEX_OFF + 8 * i, id);
+        }
+        // CRC over [0, 172) ∪ the annex ids (SPEC 02 §3.3).
+        let crc = meta_crc_of(buf, annex.len());
         write_u32(buf, OFF_META_CRC, crc);
         Ok(())
+    }
+
+    /// Read the free-list annex ids out of a meta page buffer (SPEC 02 §3,
+    /// format v2). Returns `None` if `fl_count` exceeds the page's capacity —
+    /// callers treat that as a corrupt freelist (`MdbError::Invalid`), though
+    /// for a slot that passed [`MetaPage::validate`] the bound already held.
+    /// The ids' GC-29 shape (ascending, in range) is **not** checked here:
+    /// the consumer runs `validate_pil_ids` before any id is handed out
+    /// (SPEC 05 GC-33), exactly as for a tree PIL.
+    #[must_use]
+    pub fn read_annex(buf: &[u8], psize: u32) -> Option<Vec<u64>> {
+        if buf.len() < psize as usize {
+            return None;
+        }
+        let count = read_u32(buf, OFF_FL_COUNT) as usize;
+        if count > meta_annex_cap(psize) {
+            return None;
+        }
+        let mut ids = Vec::with_capacity(count);
+        for i in 0..count {
+            ids.push(read_u64(buf, META_ANNEX_OFF + 8 * i));
+        }
+        Some(ids)
     }
 
     /// Validate `buf` as a meta slot, following SPEC 02 §3.2's numbered list
@@ -251,9 +329,15 @@ impl MetaPage {
                 body: body_txnid,
             });
         }
-        // Rule 5: CRC over [0, 168).
+        // Rule 5 (format v2, ADR-0022): the annex count is bounds-checked
+        // BEFORE the CRC — a hostile count must not drive the CRC read out
+        // of the page — then the CRC covers [0, 172) ∪ the annex ids.
+        let fl_count = read_u32(buf, OFF_FL_COUNT) as usize;
+        if fl_count > meta_annex_cap(psize) {
+            return Ok(MetaValidity::BadAnnexCount(fl_count as u32));
+        }
         let stored = read_u32(buf, OFF_META_CRC);
-        let computed = crc32c(&buf[..META_CONTENT_LEN]);
+        let computed = meta_crc_of(buf, fl_count);
         if stored != computed {
             return Ok(MetaValidity::BadCrc { stored, computed });
         }
@@ -269,6 +353,7 @@ impl MetaPage {
             last_pg: read_u64(buf, OFF_LAST_PG),
             free_db: DBRecord::read(buf, OFF_FREE_DB),
             main_db: DBRecord::read(buf, OFF_MAIN_DB),
+            fl_count: fl_count as u32,
         }))
     }
 }
@@ -285,6 +370,9 @@ pub enum MetaValidity {
     BadVersion(u32),
     /// `page_size` is not a power of two in range (the observed value).
     BadPageSize(u32),
+    /// `fl_count` exceeds the page's annex capacity (SPEC 02 §3.2 rule 5,
+    /// format v2) — the slot is invalid (torn or hostile).
+    BadAnnexCount(u32),
     /// Header txnid and body txnid disagree — a torn write (INV-2).
     TxnidMismatch {
         /// Header stamp (offset 8).

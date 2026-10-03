@@ -16,15 +16,16 @@ const PSIZE: u32 = 4096;
 // §3.5 — creation meta, slot 0 (page size 4096, txnid 0, map_size 1 MiB)
 // ---------------------------------------------------------------------------
 
-/// Build the expected first-168 bytes of the §3.5 creation meta.
-fn expected_meta_content() -> [u8; 168] {
-    let mut e = [0u8; 168];
+/// Build the expected first-172 bytes of the §3.5 creation meta (format v2,
+/// ADR-0022: `fl_count` at 168 — zero for a creation meta — then the CRC).
+fn expected_meta_content() -> [u8; 172] {
+    let mut e = [0u8; 172];
     // off 0: pgno = 0 (all zero)
     // off 8: txnid = 0 (all zero)
     e[16] = 0x08; // flags = P_META (0x0008)
                   // off 18..32 reserved 0
     e[32..36].copy_from_slice(b"ZDB1"); // magic 5A 44 42 31
-    e[36] = 0x01; // format_version = 1
+    e[36] = 0x02; // format_version = 2 (ADR-0022)
     e[40] = 0x00;
     e[41] = 0x10; // page_size = 4096 (0x0000_1000)
                   // off 44 env_flags = 0
@@ -39,6 +40,7 @@ fn expected_meta_content() -> [u8; 168] {
         *b = 0xFF; // main_db.root = PGNO_INVALID
     }
     // off 128..168 main_db stats 0
+    // off 168..172 fl_count = 0 (empty free-list annex)
     e
 }
 
@@ -48,21 +50,22 @@ fn meta_creation_slot0_bytes() {
     let mut buf = vec![0u8; PSIZE as usize];
     meta.encode(&mut buf).unwrap();
 
-    // Lock [0, 168) byte-for-byte.
+    // Lock [0, 172) byte-for-byte.
     assert_eq!(
-        &buf[..168],
+        &buf[..172],
         &expected_meta_content()[..],
-        "meta content [0,168)"
+        "meta content [0,172)"
     );
 
-    // The CRC field must be exactly CRC32C over [0, 168).
-    let crc = page::crc32c(&buf[..168]);
-    let stored = u32::from_le_bytes([buf[168], buf[169], buf[170], buf[171]]);
-    assert_eq!(stored, crc, "meta_crc must cover [0,168)");
+    // The CRC field must be exactly CRC32C over [0, 172) — fl_count is 0, so
+    // no annex ids extend the coverage (SPEC 02 §3.3, format v2).
+    let crc = page::crc32c(&buf[..172]);
+    let stored = u32::from_le_bytes([buf[172], buf[173], buf[174], buf[175]]);
+    assert_eq!(stored, crc, "meta_crc must cover [0,172) when fl_count = 0");
 
-    // The reserved tail [172, psize) must be all zero (excluded from CRC).
+    // The reserved tail [176, psize) must be all zero (excluded from CRC).
     assert!(
-        buf[172..].iter().all(|&b| b == 0),
+        buf[176..].iter().all(|&b| b == 0),
         "reserved tail must be zero"
     );
 
@@ -94,7 +97,122 @@ fn meta_slots_identical_at_creation() {
     // Only the pgno field (offset 0) differs between the slots.
     assert_eq!(b0[0], 0);
     assert_eq!(b1[0], 1);
-    assert_eq!(&b0[8..168], &b1[8..168], "bodies identical apart from pgno");
+    assert_eq!(&b0[8..172], &b1[8..172], "bodies identical apart from pgno");
+}
+
+// ---------------------------------------------------------------------------
+// §3 format v2 — the meta free-list annex (ADR-0022; SPEC 05 §2a GC-29/33)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn meta_annex_encode_validate_read_roundtrip() {
+    let ids: Vec<u64> = vec![2, 5, 6, 7, 40];
+    let mut meta = MetaPage::create(0, PSIZE, 1024 * 1024);
+    meta.last_pg = 64;
+    meta.fl_count = ids.len() as u32;
+    let mut buf = vec![0u8; PSIZE as usize];
+    meta.encode_with_annex(&mut buf, &ids).unwrap();
+
+    // Field placement: fl_count at 168 (LE), ids from 176 (LE u64 each).
+    assert_eq!(&buf[168..172], &(ids.len() as u32).to_le_bytes());
+    for (i, id) in ids.iter().enumerate() {
+        assert_eq!(&buf[176 + 8 * i..184 + 8 * i], &id.to_le_bytes());
+    }
+    // CRC coverage = [0, 172) ∪ the annex ids (SPEC 02 §3.3), one stream.
+    let crc = page::crc32c_concat(&[&buf[..172], &buf[176..176 + 8 * ids.len()]]);
+    assert_eq!(&buf[172..176], &crc.to_le_bytes());
+    // Equivalence with the single-shot CRC over the joined bytes.
+    let mut joined = buf[..172].to_vec();
+    joined.extend_from_slice(&buf[176..176 + 8 * ids.len()]);
+    assert_eq!(crc, page::crc32c(&joined));
+
+    // Validates and decodes; the ids read back exactly.
+    match MetaPage::validate(&buf, PSIZE).unwrap() {
+        MetaValidity::Valid(decoded) => {
+            assert_eq!(decoded.fl_count, ids.len() as u32);
+            assert_eq!(decoded, meta);
+        }
+        other => panic!("expected Valid, got {other:?}"),
+    }
+    assert_eq!(MetaPage::read_annex(&buf, PSIZE).unwrap(), ids);
+}
+
+#[test]
+fn meta_annex_torn_id_rejected_by_crc() {
+    let ids: Vec<u64> = (2..60).collect();
+    let mut meta = MetaPage::create(0, PSIZE, 1024 * 1024);
+    meta.last_pg = 64;
+    meta.fl_count = ids.len() as u32;
+    let mut buf = vec![0u8; PSIZE as usize];
+    meta.encode_with_annex(&mut buf, &ids).unwrap();
+    // Flip one byte inside the LAST annex id — far past META_CONTENT_LEN.
+    buf[176 + 8 * (ids.len() - 1)] ^= 0xFF;
+    assert!(
+        matches!(
+            MetaPage::validate(&buf, PSIZE).unwrap(),
+            MetaValidity::BadCrc { .. }
+        ),
+        "a torn annex id must tear the slot (REC-8 annex note)"
+    );
+}
+
+#[test]
+fn meta_annex_zeroed_count_rejected_by_crc() {
+    // The leak guard: a torn write that silently zeroes `fl_count` (losing
+    // the freed-page record) must invalidate the slot, because fl_count is
+    // inside the main CRC coverage (SPEC 02 §3.3).
+    let ids: Vec<u64> = vec![2, 3, 4];
+    let mut meta = MetaPage::create(0, PSIZE, 1024 * 1024);
+    meta.last_pg = 8;
+    meta.fl_count = ids.len() as u32;
+    let mut buf = vec![0u8; PSIZE as usize];
+    meta.encode_with_annex(&mut buf, &ids).unwrap();
+    buf[168..172].fill(0); // fl_count := 0, stale CRC left in place
+    buf[176..176 + 24].fill(0); // ids zeroed too (torn-to-zeros tail)
+    assert!(
+        matches!(
+            MetaPage::validate(&buf, PSIZE).unwrap(),
+            MetaValidity::BadCrc { .. }
+        ),
+        "zeroing the annex must tear the slot, never read as 'no annex'"
+    );
+}
+
+#[test]
+fn meta_annex_count_over_cap_rejected_before_crc() {
+    let meta = MetaPage::create(0, PSIZE, 1024 * 1024);
+    let mut buf = vec![0u8; PSIZE as usize];
+    meta.encode(&mut buf).unwrap();
+    // A hostile count far past the page's capacity must be refused by the
+    // bound check (rule 5, before the CRC read), not read out of bounds.
+    buf[168..172].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert!(matches!(
+        MetaPage::validate(&buf, PSIZE).unwrap(),
+        MetaValidity::BadAnnexCount(_)
+    ));
+    assert_eq!(MetaPage::read_annex(&buf, PSIZE), None);
+    // Encoding more ids than fit is a typed error, never a panic.
+    let too_many: Vec<u64> = (2..2 + page::meta_annex_cap(PSIZE) as u64 + 1).collect();
+    let mut m2 = MetaPage::create(0, PSIZE, 1024 * 1024);
+    m2.fl_count = too_many.len() as u32;
+    assert!(m2.encode_with_annex(&mut buf, &too_many).is_err());
+}
+
+#[test]
+fn meta_annex_cap_arithmetic() {
+    // (psize − 176) / 8, per SPEC 02 §3.
+    assert_eq!(page::meta_annex_cap(4096), (4096 - 176) / 8);
+    assert_eq!(page::meta_annex_cap(65536), (65536 - 176) / 8);
+    // A full-cap annex encodes and validates.
+    let cap = page::meta_annex_cap(PSIZE);
+    let ids: Vec<u64> = (2..2 + cap as u64).collect();
+    let mut meta = MetaPage::create(0, PSIZE, 1024 * 1024);
+    meta.last_pg = ids.last().copied().unwrap() + 1;
+    meta.fl_count = cap as u32;
+    let mut buf = vec![0u8; PSIZE as usize];
+    meta.encode_with_annex(&mut buf, &ids).unwrap();
+    assert!(MetaPage::validate(&buf, PSIZE).unwrap().is_valid());
+    assert_eq!(MetaPage::read_annex(&buf, PSIZE).unwrap(), ids);
 }
 
 // ---------------------------------------------------------------------------

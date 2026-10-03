@@ -92,7 +92,7 @@ fn stat_prints_the_engine_identification_line() {
         .expect("stat must print an engine line");
     assert!(line.contains("zerodb"), "engine line: {line}");
     assert!(line.contains("ZDB1"), "engine line: {line}");
-    assert!(line.contains("format_version 1"), "engine line: {line}");
+    assert!(line.contains("format_version 2"), "engine line: {line}");
     assert!(line.contains("data.mdb"), "engine line: {line}");
 }
 

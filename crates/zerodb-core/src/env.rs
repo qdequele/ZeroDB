@@ -189,7 +189,7 @@ pub trait Backing: Send + Sync {
 /// state (SPEC 04 TXN-18). Readers `Arc`-clone the env's published snapshot at
 /// begin and never re-read a durable meta page (the slot a pinned txnid lived
 /// in is overwritten two commits later, TXN-63).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     /// The commit point of this snapshot.
     pub txnid: u64,
@@ -199,17 +199,28 @@ pub struct Snapshot {
     pub main_db: DBRecord,
     /// Root/stats of the free (GC) DB.
     pub free_db: DBRecord,
+    /// This snapshot's meta free-list annex (SPEC 02 §3 format v2, ADR-0022;
+    /// SPEC 05 §2a): the pages freed by txn `txnid`, exactly the `fl_ids` of
+    /// its meta. Pinned **in the snapshot** — the meta slot `txnid & 1` is
+    /// overwritten by txn `txnid + 2` even while this snapshot stays pinned
+    /// (TXN-63), so holders (`copy`, the next writer) must never re-read the
+    /// slot. `Arc<[u64]>` keeps `Snapshot` cheap to clone.
+    pub free_annex: std::sync::Arc<[u64]>,
 }
 
 impl Snapshot {
-    /// The snapshot a validated meta page describes.
+    /// The snapshot a validated meta page describes, with `annex` as the
+    /// meta's free-list annex ids (read via [`MetaPage::read_annex`] from the
+    /// same validated slot buffer; `annex.len()` must equal `meta.fl_count`).
     #[must_use]
-    pub fn from_meta(meta: &MetaPage) -> Snapshot {
+    pub fn from_meta(meta: &MetaPage, annex: Vec<u64>) -> Snapshot {
+        debug_assert_eq!(annex.len(), meta.fl_count as usize);
         Snapshot {
             txnid: meta.txnid,
             last_pg: meta.last_pg,
             main_db: meta.main_db,
             free_db: meta.free_db,
+            free_annex: annex.into(),
         }
     }
 }
@@ -1635,20 +1646,27 @@ pub fn open_with_backing_policy(
     let slot1 = read_slot(bytes, META_B_PGNO, ps, page_size)?;
 
     // Select the live snapshot (SPEC 02 §3.2 / SPEC 06 REC-2..5).
-    let meta = match select_meta(&slot0, &slot1, prev_snapshot) {
-        MetaChoice::Both { meta, .. } => meta,
-        MetaChoice::OnlyOne { meta, .. } => {
+    let (meta, chosen_slot) = match select_meta(&slot0, &slot1, prev_snapshot) {
+        MetaChoice::Both { meta, chosen } => (meta, chosen),
+        MetaChoice::OnlyOne { meta, chosen } => {
             if prev_snapshot {
                 // REC-2† (ratified 2026-07-16): one valid slot + PREV_SNAPSHOT is
                 // a hard error — there are not two committed snapshots to pick an
                 // older from.
                 return Err(Error::Mdb(MdbError::Invalid));
             }
-            meta
+            (meta, chosen)
         }
         // REC-3: both invalid → unrecoverable.
         MetaChoice::None => return Err(Error::Mdb(MdbError::Invalid)),
     };
+    // Format v2 (ADR-0022): read the selected slot's free-list annex ids —
+    // the one and only meta read, alongside the roots (TXN-18); the slot is
+    // overwritten two commits later, so the ids are pinned in the Snapshot.
+    // `fl_count` passed the §3.2 rule-5 bound + CRC; the ids' GC-29 shape is
+    // validated by the consumer before any id is handed out (GC-33).
+    let annex = MetaPage::read_annex(&bytes[chosen_slot * ps..(chosen_slot + 1) * ps], page_size)
+        .ok_or(Error::Mdb(MdbError::Invalid))?;
 
     // SPEC 06 REC-1a / SPEC 02 §3.2 step 6 (geometry validation): a slot can
     // carry a valid CRC and still name geometry the real file cannot back — a
@@ -1699,7 +1717,7 @@ pub fn open_with_backing_policy(
         map_size,
         // Seed the published-snapshot cell from the durable meta — the one
         // and only time a meta *page* is read for roots (SPEC 04 TXN-18).
-        snap_cell: SnapshotCell::new(Arc::new(Snapshot::from_meta(&meta))),
+        snap_cell: SnapshotCell::new(Arc::new(Snapshot::from_meta(&meta, annex))),
         write_mutex: WriterLock::new(),
         commit_hook: Mutex::new(None),
         poisoned: AtomicBool::new(false),

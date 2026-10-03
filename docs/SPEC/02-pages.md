@@ -73,7 +73,7 @@ LMDB struct is transliterated.
 | `FILL_THRESHOLD_PERMILLE` | `250` | 25.0 % — below this a page is a merge/borrow candidate (SPEC 03). |
 | `MIN_KEYS_LEAF` | `1` | Min entries a non-root leaf may hold after delete. |
 | `MIN_KEYS_BRANCH` | `2` | Min children a non-root branch may hold. |
-| `META_CONTENT_LEN` | `168` | Number of leading bytes of a meta page covered by its CRC (see §3). |
+| `META_CONTENT_LEN` | `172` | Number of leading bytes of a meta page covered by its CRC, before the annex ids (see §3/§3.3; format v2, ADR-0022). |
 
 **Page-type flags** (`u16`, in the common header `flags` field; a page has
 exactly one of the first four structural bits set):
@@ -177,8 +177,10 @@ body** begins at offset 32:
 | 64 | 8 | `txnid` | u64 | Commit txnid (== header `txnid`). |
 | 72 | 48 | `free_db` | DBRecord | Root/stats of the free (GC) DB — `FREE_DBI`. §3.1. |
 | 120 | 48 | `main_db` | DBRecord | Root/stats of the main/catalog DB — `MAIN_DBI`. §3.1. |
-| 168 | 4 | `meta_crc` | u32 | **Mandatory CRC32C** over bytes `[0, 168)` of this page (see §3.3). |
-| 172 | psize−172 | reserved | — | MUST be 0; **not** covered by the CRC. |
+| 168 | 4 | `fl_count` | u32 | **Free-list annex** id count (ADR-0022, format v2): `0 ≤ fl_count ≤ (psize − 176) / 8`. See the annex row below and SPEC 05 §2a. |
+| 172 | 4 | `meta_crc` | u32 | **Mandatory CRC32C** over bytes `[0, 172) ∪ [176, 176 + 8·fl_count)` of this page (see §3.3). |
+| 176 | 8·fl_count | `fl_ids` | u64[] | The annex: page ids freed by **this meta's txnid** (the PIL format v1 stored in the GC tree under `BE(txnid)`), little-endian, strictly ascending, unique, each in `[FIRST_DATA_PGNO, last_pg]`. Semantics are owned by SPEC 05 §2a (GC-29..33). |
+| 176+8·fl_count | to psize | reserved | — | MUST be 0; **not** covered by the CRC. |
 
 > **SPEC 04 interface note.** This layout fixes the fields the commit pipeline
 > reads/writes: `txnid`, `last_pg`, `map_size`, `free_db.root`, `main_db.root`.
@@ -230,8 +232,14 @@ At env open the engine reads both slots and validates each independently:
 4. Header `txnid` (offset 8) equals body `txnid` (offset 64), else the slot is
    inconsistent and is **discarded** (INV-2). This guards a torn write that
    updated one copy but not the other.
-5. `meta_crc` matches the recomputed CRC32C over `[0, 168)` (§3.3). A slot that
-   fails the CRC is **torn** and is discarded.
+5. `fl_count ≤ (psize − 176) / 8` (the annex fits the page; checked **before**
+   the CRC so a hostile count cannot drive an out-of-bounds CRC read), else
+   the slot is discarded; then `meta_crc` matches the recomputed CRC32C over
+   `[0, 172) ∪ [176, 176 + 8·fl_count)` (§3.3). A slot that fails either is
+   **torn** and is discarded. (The annex *ids*' ordering/range are validated
+   where they are consumed — the writer's parse and the checker, SPEC 05
+   GC-33 — not here; a CRC-valid slot with hostile ids must fail typed at
+   draw, exactly like a hostile tree PIL.)
 
 This numbered list is the **single owner** of the meta-slot validation
 predicate; SPEC 06 REC-1 references it rather than restating it.
@@ -273,14 +281,21 @@ Selection among the *CRC-valid* slots:
 ### §3.3 — CRC32C coverage (exact byte range)
 
 `meta_crc` = CRC32C (Castagnoli, polynomial `0x1EDC6F41`, reflected input/
-output, init `0xFFFFFFFF`, final XOR `0xFFFFFFFF`) computed over **exactly the
-first `META_CONTENT_LEN = 168` bytes of the meta page** — absolute offsets
-`[0, 168)`. That range covers the common header (including the reserved bytes
-18–31, which MUST be 0) and the meta body through the end of `main_db`. The
-`meta_crc` field itself (offset 168) and the reserved tail (`[172, psize)`) are
-**excluded**. Reserved bytes inside the covered range MUST be zero so the CRC is
-deterministic. Implementation of CRC32C is ADR-0002 §D1 (software table in
-Phase 1; ARMv8 `crc32c` instructions in Phase 3.9).
+output, init `0xFFFFFFFF`, final XOR `0xFFFFFFFF`) computed over **the first
+`META_CONTENT_LEN = 172` bytes of the meta page followed by the annex ids** —
+absolute offsets `[0, 172) ∪ [176, 176 + 8·fl_count)`, as one CRC stream in
+that byte order (ADR-0022, format v2; v1 covered `[0, 168)`). The covered
+prefix spans the common header (including the reserved bytes 18–31, which
+MUST be 0), the meta body through `main_db`, and `fl_count`; the `meta_crc`
+field itself (offset 172) and the reserved tail past the annex are
+**excluded**. Covering `fl_count` inside the main CRC is load-bearing: a torn
+meta write cannot silently zero the annex (which would leak its free pages)
+without tearing the slot as a whole — the torn-meta guarantee (REC-8) extends
+to the annex. Validation reads `fl_count` *before* the CRC is checked, so it
+is bounds-checked first (`fl_count ≤ (psize − 176) / 8`, else the slot is
+invalid) to bound the CRC read. Reserved bytes inside the covered range MUST
+be zero so the CRC is deterministic. Implementation of CRC32C is ADR-0002 §D1
+(software table in Phase 1; ARMv8 `crc32c` instructions in Phase 3.9).
 
 ### §3.4 — Env-creation protocol (both slots initialised, empty DB)
 
@@ -291,7 +306,8 @@ Creating a new env writes **both** meta slots (pages 0 and 1) as valid, identica
 2. Write slot 0 and slot 1 identically: `txnid = 0`, `magic`, `format_version`,
    `page_size`, `map_size`, `env_flags = 0`, `last_pg = 1` (pages 0 and 1 exist;
    no data page yet), `free_db` and `main_db` both **empty**
-   (`root = PGNO_INVALID`, all stats 0, `depth = 0`), fresh `meta_crc` on each.
+   (`root = PGNO_INVALID`, all stats 0, `depth = 0`), `fl_count = 0` (empty
+   free-list annex), fresh `meta_crc` on each.
 3. `fsync(data)` so both slots are durable.
 4. `fsync(parent dir)` so the data file's **directory entry** is durable
    (added 2026-07-22, issue #46): without it, a crash shortly after creation
@@ -320,7 +336,7 @@ off 18  : 00 00                     reserved0
 off 20  : 00 00 00 00               checksum (data-page CRC; unused, 0)
 off 24  : 00 00 00 00 00 00 00 00   reserved (meta variant tail)
 off 32  : 5A 44 42 31               magic "ZDB1"
-off 36  : 01 00 00 00               format_version = 1
+off 36  : 02 00 00 00               format_version = 2
 off 40  : 00 10 00 00               page_size = 4096 (0x1000)
 off 44  : 00 00 00 00               env_flags = 0
 off 48  : 00 00 10 00 00 00 00 00   map_size = 1 MiB (0x100000)
@@ -336,8 +352,10 @@ off 152 : 00 00 00 00 00 00 00 00   main_db.entries = 0
 off 160 : 00 00                     main_db.depth = 0  (empty)
 off 162 : 00 00                     main_db.flags = 0
 off 164 : 00 00 00 00               main_db.leaf2_ksize = 0
-off 168 : <c0 c1 c2 c3>             meta_crc = CRC32C over bytes [0,168)
-off 172 .. 4096 : 00                reserved tail (excluded from CRC)
+off 168 : 00 00 00 00               fl_count = 0  (empty free-list annex)
+off 172 : <c0 c1 c2 c3>             meta_crc = CRC32C over bytes [0,172)
+                                    (fl_count = 0: no annex ids follow)
+off 176 .. 4096 : 00                reserved tail (excluded from CRC)
 ```
 
 If the first commit (txn 1) then inserts one key, it allocates the root leaf at
@@ -625,8 +643,11 @@ owns; the *page* format is exactly §2/§4):
   overflow run exactly like any large value (§5); there is no bespoke spill
   format. The in-tree ordering of the ids within the list is SPEC 05's choice.
 
-The check tool treats GC entries as the authority for "free" in the
-reachability-xor-freeness invariant (INV-10, INV-14).
+Since format v2 (ADR-0022) the **newest** freeing-txn's PIL normally rides in
+the live meta's free-list annex (§3, SPEC 05 §2a) instead of this tree; the
+tree holds the spill/cold entries. The check tool treats GC entries **plus the
+selected meta's annex ids** as the authority for "free" in the
+reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
 
 ---
 

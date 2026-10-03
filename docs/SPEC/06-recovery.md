@@ -29,9 +29,11 @@ this section defines the **recovery decision** and its error taxonomy.
 
 - **REC-1** — **Validate each slot independently.** The validation predicate is
   owned by **SPEC 02 §3.2** (the numbered list: `magic`, `format_version`,
-  `page_size` ∈ {power of two, 4096–65536}, header `txnid` == body `txnid`, and —
-  mandatory — `meta_crc` over `[0,168)`, SPEC 02 §3.3). REC-1 does **not** restate
-  the list; it references SPEC 02 §3.2 as the single owner. A slot failing any
+  `page_size` ∈ {power of two, 4096–65536}, header `txnid` == body `txnid`, the
+  annex-count bound, and — mandatory — `meta_crc` over
+  `[0,172) ∪ [176, 176 + 8·fl_count)`, SPEC 02 §3.3 as amended by ADR-0022).
+  REC-1 does **not** restate the list; it references SPEC 02 §3.2 as the
+  single owner. A slot failing any
   check is **invalid** (torn or foreign) and is discarded from selection.
 - **REC-1a** — **Geometry validation of the selected slot** (added 2026-09-09,
   security review H1; predicate owned by SPEC 02 §3.2 step 6). A CRC-valid slot
@@ -181,6 +183,19 @@ open, REC-1/REC-2 select snapshot `X` and the check tool (SPEC 03 §11 + SPEC 05
   guard against sub-sector tears and foreign/garbage slots (data-page checksums stay
   Phase 3.9); it is **not** claimed to detect every torn meta — sector-aligned tears
   are caught by the double-buffer/txnid design, not the CRC.
+
+  **Format-v2 annex note (ADR-0022).** The CRC-covered region is
+  `[0,172) ∪ [176, 176 + 8·fl_count)` and may extend past the first 512-byte
+  sector when the free-list annex is large (`fl_count > 42` at 512-byte
+  sectors). The sub-sector argument is unchanged; additionally, a
+  **sector-aligned** tear that lands *inside* the covered annex now leaves the
+  CRC inconsistent and the slot is rejected — which is required, not
+  incidental: a half-written (or silently zeroed) annex would leak that
+  commit's freed pages while the rest of the slot looked complete. The
+  "complete old or complete new, both CRC-valid" outcome of a sector-aligned
+  tear therefore holds only when the covered region fits sector 0; otherwise
+  the tear degrades to a rejected slot and the intact other slot wins —
+  strictly more conservative, never less.
 
 ---
 

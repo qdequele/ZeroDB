@@ -152,7 +152,17 @@ fn regression_nometasync_reclaim_clobber_window_is_characterized() {
     // it never touches `Op` — so the mode guard below could not catch it).
     // The assertions are unchanged; only the vehicle was replaced, by searching
     // for a seed that still satisfies all four of them.
-    const SEED: u64 = 11_834_834_180_059_103_290;
+    //
+    // RE-PINNED 2026-10-03 (was 11_834_834_180_059_103_290): ADR-0022 (the
+    // meta free-list annex, format v2) changes which pages a txn reclaims
+    // when — small freed sets ride the meta and are reused one hop earlier —
+    // so the old seed's cut stopped producing a stale-fallback image (0
+    // stale; nothing was violated, the vehicle was lost again). Same re-pin
+    // protocol: seed 198 satisfies all four assertions (12 verified, 4 stale
+    // fallbacks, NoMetaSync, no violation). The clobber window itself is
+    // unchanged by the annex — the reclaimed-page TXN-62/GC-18 reasoning is
+    // identical whether the freed list lived in the tree or the meta.
+    const SEED: u64 = 198;
     assert_eq!(
         gen_spec(SEED).mode,
         Mode::NoMetaSync,

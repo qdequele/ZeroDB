@@ -196,6 +196,30 @@ impl Drain {
     }
 }
 
+/// Merge two strictly-ascending, mutually-disjoint id slices into one
+/// strictly-ascending vec (GC-3/GC-4; the `freelist_save` step-(c) merge of
+/// this txn's `freed` with the carried annex remainder, SPEC 05 §2a GC-30).
+/// Disjointness holds by provenance — an annex id was free in the base
+/// snapshot, a `freed` id was live in it — and is asserted in debug builds.
+fn merge_sorted_unique(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let mut out = Vec::with_capacity(a.len() + b.len());
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        if a[i] < b[j] {
+            out.push(a[i]);
+            i += 1;
+        } else {
+            debug_assert_ne!(a[i], b[j], "annex/freed overlap (INV-24)");
+            out.push(b[j]);
+            j += 1;
+        }
+    }
+    out.extend_from_slice(&a[i..]);
+    out.extend_from_slice(&b[j..]);
+    debug_assert!(out.windows(2).all(|w| w[0] < w[1]), "merge not ascending");
+    out
+}
+
 /// A root-to-leaf descent path: `(pgno, ki)` per level (SPEC 03 §1 cursor
 /// shape). `ki` is the chosen child index on branches and the entry/insertion
 /// slot on the leaf.
@@ -606,6 +630,18 @@ pub struct RwTxn<'env> {
     /// [`RwTxn::free_page`]. Pgno-hashed (issue #9): engine-authored keys,
     /// no HashDoS surface.
     reclaimed: HashSet<u64, PgnoBuildHasher>,
+    /// The base meta's free-list annex pool (SPEC 05 §2a, ADR-0022): the
+    /// pages freed by txn `base.txnid`, parsed (and `validate_pil_ids`-
+    /// checked, GC-33) at begin when `base.free_annex > 0`. Drawn by
+    /// [`RwTxn::annex_draw`] (allocate step 2b, gated per GC-31); whatever
+    /// remains is folded into `freed` at the top of `freelist_save` (the
+    /// GC-30 carry) — by then the pool is empty, so GcSave never sees it.
+    annex: Drain,
+    /// `freelist_save`'s GC-32 placement decision: `true` = this txn's own
+    /// entry rides in the meta annex (C4 encodes `freed` as `fl_ids`; no
+    /// GC-tree entry `BE(txnid)` exists), `false` = the v1 tree arm ran (or
+    /// `freed` is empty) and the annex is empty.
+    annex_out: bool,
     /// GC-12 allocation restriction (ADR-0005 D2).
     alloc_mode: AllocMode,
     /// Entries of `drains` whose `remaining` shrank via an **in-save pool
@@ -739,6 +775,19 @@ impl Env {
         if base.txnid >= crate::readers::MAX_COMMITTED_TXNID {
             return Err(Error::Mdb(MdbError::Invalid));
         }
+        // The base meta's free-list annex pool (SPEC 05 §2a, ADR-0022). The
+        // ids are pinned in the snapshot (the slot is overwritten two
+        // commits later, TXN-63) and are never trusted (GC-33): they must
+        // pass the same ascending/range validation as a tree PIL before any
+        // can be handed out — open-time slots only had the count bound and
+        // the CRC checked.
+        let annex = if base.free_annex.is_empty() {
+            Drain::new(Vec::new())
+        } else {
+            let ids = base.free_annex.to_vec();
+            validate_pil_ids(&ids, base.last_pg)?;
+            Drain::new(ids)
+        };
         Ok(RwTxn {
             txnid: base.txnid + 1, // TXN-2 (+ the reuse note in the module docs)
             next_pgno: base.last_pg + 1,
@@ -764,6 +813,8 @@ impl Env {
             loose: Vec::new(),
             drains: BTreeMap::new(),
             reclaimed: HashSet::default(),
+            annex,
+            annex_out: false,
             alloc_mode: AllocMode::Normal,
             save_touched: std::collections::BTreeSet::new(),
             errored: false,
@@ -904,6 +955,11 @@ impl TxnRead for RwTxn<'_> {
     }
     fn free_record(&self) -> &DBRecord {
         &self.free_db
+    }
+    fn free_annex_count(&self) -> u64 {
+        // Working-state view (like `free_record`): the base annex pool's
+        // live remainder — drawn ids are no longer free.
+        Drain::len(&self.annex) as u64
     }
     fn page_size(&self) -> u32 {
         self.psize
@@ -1196,6 +1252,13 @@ impl<'env> RwTxn<'env> {
                 if let Some(start) = self.gc_reclaim(n)? {
                     return Ok(start);
                 }
+                // GC-16 step 2b (SPEC 05 §2a, ADR-0022): the base meta's
+                // free-list annex pool, after the tree (the annex's
+                // freeing-txn is the newest possible, so tree-first keeps
+                // the GC-18/19 oldest-first order).
+                if let Some(start) = self.annex_draw(n) {
+                    return Ok(start);
+                }
             }
             AllocMode::GcSave => {
                 // GC-12 (as amended, ADR-0005): never *read* the GC tree
@@ -1208,6 +1271,14 @@ impl<'env> RwTxn<'env> {
                 // (`save_touched`), so no rewritten entry lists a handed-out
                 // page (the anti-leak property GC-12 exists for).
                 if let Some(start) = self.save_pool_draw(n) {
+                    return Ok(start);
+                }
+                // The carried annex pool (SPEC 05 §2a GC-30): gate-checked
+                // like every annex draw; the step-(c) placement re-reads
+                // `annex.live()` after every put, so a draw here can never
+                // leave a handed-out id in the persisted set — the exact
+                // GC-12-amended pool argument.
+                if let Some(start) = self.annex_draw(n) {
                     return Ok(start);
                 }
             }
@@ -1296,6 +1367,41 @@ impl<'env> RwTxn<'env> {
             debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
         }
         self.save_touched.insert(f);
+        Some(start)
+    }
+
+    /// Allocate step 2b (SPEC 05 §2a GC-31, ADR-0022): draw from the base
+    /// meta's free-list annex pool. The pool's freeing-txnid is `base.txnid`
+    /// (= `writer_txnid − 1`), so the gate `F ≤ oldest_reader()` admits the
+    /// draw exactly when no live reader is pinned **below** the base — a
+    /// reader pinned *at* the base is safe (pages freed by `base` left its
+    /// trees), and the crash-fallback meta is `base` itself, whose annex
+    /// still lists the drawn ids as free (the TXN-62 / GC-12 pool argument
+    /// verbatim). Deterministic like GC-19: smallest id / first contiguous
+    /// run of the (ascending) pool. Serves both allocation modes: during
+    /// ops as step 2b, and inside `freelist_save` as the carried pool
+    /// (GC-30 — the step-(c) placement re-reads `annex.live()` after every
+    /// tree write, so an in-save draw is always re-accounted).
+    // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
+    // arms stay separate so their size never moves it (PERF-GAP B13).
+    #[inline(never)]
+    fn annex_draw(&mut self, n: u64) -> Option<u64> {
+        if self.annex.len() == 0 {
+            return None;
+        }
+        let f = self.base.txnid;
+        if f > self.oldest_reader() {
+            return None; // GC-31 gate: a reader is pinned below the base.
+        }
+        let start = find_run(self.annex.live(), n)?;
+        // M1.8 shadow check, as in every other draw arm.
+        #[cfg(debug_assertions)]
+        self.debug_assert_gate(f);
+        self.annex.take_run(start, n);
+        for p in start..start + n {
+            let first_time = self.reclaimed.insert(p);
+            debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
+        }
         Some(start)
     }
 
@@ -4008,6 +4114,26 @@ impl<'env> RwTxn<'env> {
         debug_assert!(self.alloc_mode == AllocMode::Normal);
         self.alloc_mode = AllocMode::GcSave;
         debug_assert!(self.save_touched.is_empty());
+        // GC-30 carry (SPEC 05 §2a, ADR-0022): the base annex's unconsumed
+        // remainder must land in this txn's own entry (annex or tree) — meta
+        // `base` is overwritten by txn `base + 2`, so dropping it leaks.
+        // The remainder stays a live **in-save pool** (the GC-12-amended
+        // rule, exactly like the drain pool): its ids passed the gate with
+        // `F = base.txnid`, so the save's own allocations may consume them —
+        // without this, every save's GC-tree ops extend the file while the
+        // carried surplus sits unreachable in `freed`, an unbounded ratchet
+        // (caught by churn_parity_general during the ADR-0022 spike). The
+        // step-(c) placement merges `freed ∪ annex.live()` and re-loops if
+        // the put itself drew from the pool, so no persisted set ever lists
+        // a handed-out page. The pool is folded into `freed` only after the
+        // fixed point (annex arm) or spent into the tree entry (tree arm).
+        //
+        // GC-32 placement: this txn's own entry goes to the meta annex when
+        // the final merged set fits; once the tree arm runs it is sticky for
+        // this save (no flip-flop if a later drain rewrite grows `freed`).
+        let annex_cap = crate::page::meta_annex_cap(self.psize);
+        let mut tree_arm = false;
+        let mut annex_mode = false;
         // Every ops-drained entry needs its GC-20 rewrite at least once.
         let mut pending: std::collections::BTreeSet<u64> = self.drains.keys().copied().collect();
         // Release-active bound on the *inner* rewrite loop (GC-13 guard, ADR
@@ -4065,17 +4191,34 @@ impl<'env> RwTxn<'env> {
                     self.put_pil(f, &remaining)?;
                 }
             }
-            // (c) this txn's own entry under BE(writer_txnid).
+            // (c) this txn's own entry: the meta annex when it fits (GC-32),
+            // else the GC tree under BE(writer_txnid) as in format v1.
             self.freed.sort_unstable();
             let pre_dedup = self.freed.len();
             self.freed.dedup();
             debug_assert_eq!(self.freed.len(), pre_dedup, "page double-freed (GC-4)");
             let before = self.freed.len();
-            if before > 0 {
-                let ids = self.freed.clone();
-                self.put_pil(self.txnid, &ids)?;
-                if self.freed.len() != before {
-                    continue; // the put freed committed GC pages; the PIL must grow
+            let annex_before = Drain::len(&self.annex);
+            let total = before + annex_before;
+            if total > 0 {
+                if !tree_arm && total <= annex_cap {
+                    // GC-32 annex arm: `freed ∪ annex.live()` IS the annex
+                    // (merged after the loop; C4 encodes it as `fl_ids`).
+                    // The stash writes nothing into the tree, allocates
+                    // nothing and frees nothing, so the fixed point below
+                    // simply loses the step-(c) feedback edge.
+                    annex_mode = true;
+                } else {
+                    tree_arm = true; // sticky (GC-32)
+                    annex_mode = false;
+                    let ids = merge_sorted_unique(&self.freed, self.annex.live());
+                    self.put_pil(self.txnid, &ids)?;
+                    if self.freed.len() != before || Drain::len(&self.annex) != annex_before {
+                        // The put COW-freed committed GC pages (PIL must
+                        // grow) or drew from the annex pool (the written
+                        // PIL lists a handed-out page): rewrite next round.
+                        continue;
+                    }
                 }
             }
             // Fixed-point checks: no entry awaits a re-rewrite (anti-leak — a
@@ -4092,6 +4235,15 @@ impl<'env> RwTxn<'env> {
             }
             self.freed.extend(std::mem::take(&mut self.loose));
         }
+        // GC-30/GC-32 settle: in the annex arm the persisted annex is the
+        // merged set, materialized into `freed` for C4/C6; in the tree arm
+        // the pool's ids were written into the tree entry `BE(txnid)`. The
+        // pool is spent either way (no allocation runs after C1).
+        if annex_mode {
+            self.freed = merge_sorted_unique(&self.freed, self.annex.live());
+        }
+        self.annex = Drain::new(Vec::new());
+        self.annex_out = annex_mode;
         Ok(())
     }
 
@@ -4194,6 +4346,10 @@ impl<'env> RwTxn<'env> {
         // slot; the intact `N-1` slot is the crash fallback). -----
         let last_pg = self.next_pgno - 1;
         let slot = self.txnid & 1;
+        // GC-32 (ADR-0022): in annex mode this txn's freed PIL rides in the
+        // meta itself — `freed` is final after C1 and already sorted/deduped
+        // (GC-3/4); `freelist_save` guaranteed it fits the cap.
+        let annex: &[u64] = if self.annex_out { &self.freed } else { &[] };
         let meta = MetaPage {
             pgno: slot,
             txnid: self.txnid,
@@ -4205,9 +4361,10 @@ impl<'env> RwTxn<'env> {
             last_pg,
             free_db: self.free_db,
             main_db: self.main_db,
+            fl_count: annex.len() as u32,
         };
         let mut buf = vec![0u8; psize as usize];
-        meta.encode(&mut buf).map_err(corrupt)?;
+        meta.encode_with_annex(&mut buf, annex).map_err(corrupt)?;
         inner.backing_ref().write_at_page(slot, psize, &buf)?;
         inner.run_hook(HookPoint::H3);
         // Crash here: recovered snapshot is `N-1` (meta missing/torn → CRC
@@ -4270,6 +4427,11 @@ impl<'env> RwTxn<'env> {
             last_pg,
             main_db: self.main_db,
             free_db: self.free_db,
+            free_annex: if self.annex_out {
+                Arc::from(&self.freed[..])
+            } else {
+                Arc::from(&[][..])
+            },
         }));
         Ok(())
         // Drop of `self` releases the write mutex — the tail of C6.

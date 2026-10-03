@@ -55,6 +55,22 @@ pub fn crc32c(data: &[u8]) -> u32 {
     crc ^ 0xFFFF_FFFF
 }
 
+/// CRC32C over the concatenation of `parts`, as one stream — equal to
+/// `crc32c` of the parts joined into a single buffer, without the join.
+/// Used for the meta CRC's split coverage (SPEC 02 §3.3 as amended by
+/// ADR-0022: `[0, 172)` then the annex ids, skipping the CRC field itself).
+#[must_use]
+pub fn crc32c_concat(parts: &[&[u8]]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for part in parts {
+        for &byte in *part {
+            let idx = ((crc ^ byte as u32) & 0xFF) as usize;
+            crc = (crc >> 8) ^ TABLE[idx];
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
+
 #[cfg(test)]
 mod tests {
     use super::crc32c;
