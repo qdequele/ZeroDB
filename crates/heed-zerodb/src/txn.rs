@@ -36,7 +36,7 @@ use crate::Result;
 // ---------------------------------------------------------------------------
 
 /// Read transactions opened with Thread Local Storage (TLS) — `!Send`. A
-/// compile-only shim in Phase 1 (SPEC 00 second table: `WithTls` is SHOULD);
+/// compile-only shim (SPEC 00 second table: `WithTls` is SHOULD);
 /// ZeroDB's read txns are universally NOTLS, so `WithTls` behaves like
 /// `WithoutTls` at runtime (ADR-0003 Q5).
 #[derive(Debug, PartialEq, Eq)]
@@ -136,12 +136,11 @@ impl<'e, T> RoTxn<'e, T> {
         Ok(())
     }
 
-    /// This transaction's id (SPEC 00 second table — SHOULD, **landed in
-    /// milestone 2.7**; `mdb_txn_id`).
+    /// This transaction's id (SPEC 00 second table — SHOULD; `mdb_txn_id`).
     ///
     /// For a read txn this is the **pinned snapshot's** txnid — the commit
     /// this reader sees, which is also what `Env::reader_list` reports for its
-    /// slot (M2.2). For a write txn it is the id the txn *will* publish when
+    /// slot. For a write txn it is the id the txn *will* publish when
     /// it commits. A nested read txn reports its parent write txn's id, since
     /// that is the state it observes (SPEC 04 §5).
     #[must_use]
@@ -153,7 +152,7 @@ impl<'e, T> RoTxn<'e, T> {
         };
         // heed types this as `usize` (`mdb_txn_id` returns `size_t`); ZeroDB
         // txnids are `u64`. On a 32-bit target this would truncate, but the
-        // supported targets (CLAUDE.md: linux-aarch64 primary, linux-x86_64,
+        // supported targets (AGENTS.md: linux-aarch64 primary, linux-x86_64,
         // macOS aarch64) are all 64-bit, so the cast is lossless there.
         id as usize
     }

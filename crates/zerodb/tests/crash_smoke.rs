@@ -1,5 +1,5 @@
-//! M1.4 commit-pipeline crash smoke test (ADR-0004 D7 risk 3; the full
-//! ≥10k-cycle harness is M1.11). For each hook point H0..H4 (SPEC 04 §9), a
+//! Commit-pipeline crash smoke test (ADR-0004 D7 risk 3; the full ≥10k-cycle
+//! harness is the zerodb-oracle crash harness). For each hook point H0..H4 (SPEC 04 §9), a
 //! **child process** runs: commit txn 1 normally, then commit txn 2 with a
 //! [`CommitHook`] that aborts the process at the target point. The parent
 //! reopens the env and asserts the SPEC 06 REC-6 crash-stage row:
@@ -15,7 +15,7 @@
 //! Mechanism note (REC-17): process death does not tear writes — the OS page
 //! cache survives — so this validates the pipeline's *control-flow ordering*
 //! (steps happen in order, the meta is not written early, the publish does not
-//! precede durability). Torn/reordered-write coverage is M1.11's
+//! precede durability). Torn/reordered-write coverage is the crash harness's
 //! fault-injection backend (REC-19).
 
 use std::path::{Path, PathBuf};
@@ -151,7 +151,7 @@ fn h0_to_h4_kill_matrix_recovers_per_rec6() {
             assert_eq!(db.len(&rtxn).unwrap(), 599, "{hook}");
         }
         drop(rtxn);
-        // The recovered image passes the invariant walk (REC-18.3, M1.4 scope).
+        // The recovered image passes the invariant walk (REC-18.3).
         let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).unwrap();
         let v = check::check_image(&bytes, PS);
         assert!(v.is_empty(), "{hook}: invariant violations: {v:#?}");

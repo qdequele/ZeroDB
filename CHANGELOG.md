@@ -159,7 +159,8 @@ features is `docs/COMPATIBILITY.md`.
   offline checker uses checked arithmetic, a bounded depth and a seeded hasher;
   `max_readers`/`max_dbs` are bounded; files are created `0600` and never
   through a planted symlink. A new fuzz target feeds arbitrary bytes to `open`.
-  Details: `SECURITY.md`, D-017/D-018.
+  Details: `SECURITY.md` and `docs/DIVERGENCES.md` (meta pages beyond the
+  file; `max_readers`/`max_dbs` upper bound).
 
 ### Known gaps (deliberate, documented)
 

@@ -1,4 +1,4 @@
-//! End-to-end smoke test of the adapter over ZeroDB (milestone 1.13). Exercises
+//! End-to-end smoke test of the adapter over ZeroDB. Exercises
 //! the enum-dispatch read path, the pointer-based write cursor, nested readers,
 //! and the env lifecycle — the load-bearing pieces of the 1:1 surface.
 

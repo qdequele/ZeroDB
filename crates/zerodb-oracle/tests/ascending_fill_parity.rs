@@ -16,7 +16,7 @@
 //! offers no runtime override (4 KiB on Linux x86, 16 KiB on macOS ARM, up to
 //! 64 KiB on some ARM distros). A raw leaf-count band is only meaningful at
 //! equal page sizes, so the test **reads the fork's page size and opens zerodb
-//! to match** (zerodb's page size is runtime-chosen, CLAUDE.md), keeping the
+//! to match** (zerodb's page size is runtime-chosen, AGENTS.md), keeping the
 //! comparison valid on every platform instead of hard-coding 4 KiB.
 
 use std::path::{Path, PathBuf};

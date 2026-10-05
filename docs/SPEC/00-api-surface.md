@@ -138,10 +138,10 @@ cellulite is driven by milli's `WithoutTls` env and generic txn refs).
 | `Env::force_sync()` | `mdb_env_sync(force)` | **LANDED M2.5** | Not called; consumers rely on sync-on-commit. **M2.5:** `force_sync()` = `mdb_env_sync(env, 1)`; the full `force` parameter is exposed as the new `Env::sync(force)` (zerodb extension — heed has only the forced form), reproducing `mdb_env_sync0`'s three decisions exactly: `MDB_RDONLY` → `EACCES` first, flush only if `force \|\| !NO_SYNC`, and `MS_ASYNC` only when `MAP_ASYNC && !force`. Tests: `zerodb-oracle/tests/force_sync_durability.rs` (8, incl. the `FaultBacking` journal-drain proof and the `EACCES` differential), `heed-zerodb/tests/phase2_extensions.rs`. |
 | `Env::stat()` (env-level) / `EnvStat` | `mdb_stat` on main | **LANDED M2.1** | Only per-DB `stat()` (row 49) and `info().map_size` (row 20) are used. **M2.1:** `zerodb::Env::stat()` → `EnvStat { page_size, depth, branch_pages, leaf_pages, overflow_pages, entries }` over the main tree, read from the published snapshot (no read txn, so no reader slot). `EnvInfo` completed to the full `MDB_envinfo` shape (`map_size`, `last_pgno`, `last_txnid`, `max_readers`, `num_readers`, plus the `live_readers` extension); `me_mapaddr` is not exposed natively (`MDB_FIXEDMAP` is WON'T) and stays null in the adapter's mirrored struct. Tests: `zerodb/tests/env_stat_info.rs` (12), `zerodb-oracle/tests/env_info_differential.rs` (6), `heed-zerodb/tests/phase2_extensions.rs`. See D-011. |
 | `Env::clear_stale_readers()` | `mdb_reader_check` | **LANDED M2.2** | Single-process model has no stale cross-process readers. **M2.2:** kept (not removed) and returns **0**, which is the *correct* answer, not a stub — the reader table is process memory, every slot is owned by a `RoTxn` that releases it in `Drop`, and a dead process takes the table with it (D-001), so no abandoned slot can exist for `mdb_reader_check` to reap. Retained so heed code that calls it periodically compiles and no-ops. The introspection that *is* meaningful here landed alongside it as the new `Env::reader_list()` (third table). Tests: `zerodb/tests/reader_introspection.rs` (8), `heed-zerodb/tests/phase2_extensions.rs`. |
-| `Env::get_flags()` / `Env::flags()` getter / `FlagSetMode` / set-flags-after-open | `mdb_env_get_flags` / `mdb_env_set_flags` | getters **LANDED**; `set_flags` **DEFERRED** (left open by the M2.7 sweep, 2026-07-20) | Flags are only set at open (row 6); never read back or toggled at runtime. The **getters** (`flags()`, `get_flags()`) and the `FlagSetMode` type already exist on the adapter. **`Env::set_flags` is deliberately not implemented in 2.7**: `mdb_env_set_flags` post-open accepts only the durability subset (`NOSYNC`/`NOMETASYNC`/`MAPASYNC`/`NOMEMINIT`), and in ZeroDB those live in `EnvInner::durability`, an immutable-after-open value the commit pipeline reads with no synchronization. Making it mutable means atomics on the durability fields plus a decision about a flag flip racing an in-flight commit's fsync choices — a change to the durability path, which CLAUDE.md routes to `critical-implementer`, not to an API-completeness sweep. No consumer toggles flags. |
+| `Env::get_flags()` / `Env::flags()` getter / `FlagSetMode` / set-flags-after-open | `mdb_env_get_flags` / `mdb_env_set_flags` | getters **LANDED**; `set_flags` **DEFERRED** (left open by the M2.7 sweep, 2026-07-20) | Flags are only set at open (row 6); never read back or toggled at runtime. The **getters** (`flags()`, `get_flags()`) and the `FlagSetMode` type already exist on the adapter. **`Env::set_flags` is deliberately not implemented in 2.7**: `mdb_env_set_flags` post-open accepts only the durability subset (`NOSYNC`/`NOMETASYNC`/`MAPASYNC`/`NOMEMINIT`), and in ZeroDB those live in `EnvInner::durability`, an immutable-after-open value the commit pipeline reads with no synchronization. Making it mutable means atomics on the durability fields plus a decision about a flag flip racing an in-flight commit's fsync choices — a change to the durability path, which AGENTS.md treats as correctness-critical (ADR first, full gate), not an API-completeness sweep. No consumer toggles flags. |
 | `Env::max_readers()` getter, `Env::max_key_size()` | `mdb_env_get_maxreaders` / `mdb_env_get_maxkeysize` | **LANDED M2.1 / M2.7** | **M2.1:** `heed_zerodb::Env::max_readers()` returns the real reader-table capacity (it returned the hardcoded 126 in Phase 1), differentially verified against the fork at 1/8/126/1024. **M2.7:** `max_key_size()` now returns `zerodb::MAX_KEY_SIZE` instead of a hardcoded `511` — the same defect class, caught by the same sweep. The value is unchanged (511); what changed is that it is read from the engine's constant, so it cannot silently drift. |
 | `RoTxn::id()` / `RwTxn::id()` | `mdb_txn_id` | **LANDED M2.7** | Not used by any consumer. **M2.7:** `heed_zerodb::RoTxn::id()` (inherited by `RwTxn` through its `Deref`) returns the pinned snapshot txnid for a read txn, the id-to-be-published for a write txn, and the parent's id for a nested read txn. Agrees by construction with what `Env::reader_list()` reports for that reader's slot (asserted in `heed-zerodb/tests/phase2_extensions.rs`). |
-| `Database::get_or_put*` (4 variants) | `mdb_get`+`mdb_put` | SHOULD — **DEFERRED** (left open by the M2.7 sweep, 2026-07-20) | Not used; pure convenience wrappers over `get` + `put` with no engine behavior of their own, so nothing in the engine blocks them. Deferred because their exact heed semantics — what each returns when the key is present, and how `get_or_put_reserved*` composes `ReservedSpace` with `NO_OVERWRITE` — must be **read out of heed 0.22.1, not guessed** (CLAUDE.md rule 1), and a wrapper that silently differs from heed's is worse than an absent one. Cheap to land in a follow-up once that reading is done. |
+| `Database::get_or_put*` (4 variants) | `mdb_get`+`mdb_put` | SHOULD — **DEFERRED** (left open by the M2.7 sweep, 2026-07-20) | Not used; pure convenience wrappers over `get` + `put` with no engine behavior of their own, so nothing in the engine blocks them. Deferred because their exact heed semantics — what each returns when the key is present, and how `get_or_put_reserved*` composes `ReservedSpace` with `NO_OVERWRITE` — must be **read out of heed 0.22.1, not guessed** (AGENTS.md rule 1), and a wrapper that silently differs from heed's is worse than an absent one. Cheap to land in a follow-up once that reading is done. |
 | `Database::rev_iter` / `rev_iter_mut` / `range_mut` / `rev_range_mut` / `rev_prefix_iter_mut` | reverse/mut cursors | **LANDED** (present since M1.13; confirmed by the M2.7 sweep) | Consumers use only `rev_range`, `rev_prefix_iter`, `iter_mut`, `prefix_iter_mut` (rows 43–46). The remaining variants share the same machinery and were implemented alongside them; all five exist on `heed_zerodb::Database`. |
 | `Database::get_lower_than` / `get_greater_than_or_equal_to` | neighbor seeks | **LANDED** (present since M1.3/M1.13; confirmed by the M2.7 sweep) | The other two of the four neighbor-seek variants; only `get_greater_than` and `get_lower_than_or_equal_to` are used (rows 47/48). All four exist in the core cursor and on the adapter, and all four are asserted against a custom comparator in `zerodb/tests/custom_comparator.rs` (M2.4). |
 | `Database::get_duplicates` | `mdb_cursor_get(MDB_GET_MULTIPLE/NEXT_DUP)` | WON'T (Phase 1) | DUPSORT-only; no consumer uses DUPSORT (see below). |
@@ -161,8 +161,8 @@ cellulite is driven by milli's `WithoutTls` env and generic txn refs).
 Phase 2 adds capabilities LMDB lacks entirely, so there is no heed signature to
 mirror and no cross-engine differential to run — these are the "doc + unit tests
 where it's zerodb-defined" half of the Phase 2 acceptance line. Every one is
-**purely additive**: no existing heed-mirrored signature changes (PLAN ground
-rule 2), and code that never calls them behaves exactly as before.
+**purely additive**: no existing heed-mirrored signature changes (heed's surface
+is the frozen contract), and code that never calls them behaves exactly as before.
 
 | ZeroDB item | Nearest LMDB concept | Milestone | Notes / tests |
 |-------------|----------------------|-----------|---------------|
@@ -213,16 +213,16 @@ reader borrows bytes that may live in the writer's dirty pages; (3) Phase 3.8's
 `RwTxn::snapshot()` idea, which is a *cleaner* native replacement for exactly
 this pattern and should be designed with these five call sites as its target.
 
-### B. Consumer usage NOT covered (or mis-framed) by the current PLAN.md
+### B. Consumer usage NOT covered (or mis-framed) by the original roadmap
 
-(Listed for the maintainer; this document does **not** edit PLAN.md.)
+(Listed for the maintainer; this document does **not** edit the roadmap.)
 
 1. **DUPSORT/DUPFIXED (M1.7) is not used by any consumer.** No `DatabaseFlags`
    of any kind is ever passed; there is no `DUP_SORT`, `DUP_FIXED`,
    `INTEGER_KEY`, `get_duplicates`, `delete_one_duplicate`, or `APPEND_DUP`
    anywhere in milli, arroy, or hannoy. milli models facet/word-docids as
    composite keys + roaring-bitmap values (`FacetGroupKeyCodec`,
-   `CboRoaringBitmapCodec`), not LMDB duplicates. PLAN.md 1.7 states "milli's
+   `CboRoaringBitmapCodec`), not LMDB duplicates. Roadmap milestone M1.7 states "milli's
    facet/word-docids access patterns replayed with parity," which implies
    DUPSORT — that premise is **outdated**. Recommend reclassifying M1.7 as a
    **SHOULD** (heed exposes it; Phase 2) rather than a Phase-1 MUST. This removes
@@ -230,7 +230,7 @@ this pattern and should be designed with these five call sites as its target.
    Keep it a MUST only if the 1.13 heed-test-suite scope decision (0.5 ADR)
    requires DUPSORT tests to pass.
 
-2. **`nested_read_txn` (Finding §A)** — PLAN.md 1.9 anticipates "neither milli
+2. **`nested_read_txn` (Finding §A)** — roadmap milestone M1.9 anticipates "neither milli
    nor hannoy uses nested txns (expected)" and is framed entirely around nested
    *write* txns. Nested *read* txns are used pervasively and are unmentioned. Add
    them to M1.9 (or a new sub-milestone) as a MUST.
@@ -239,7 +239,7 @@ this pattern and should be designed with these five call sites as its target.
    reopens the env on the *older* meta page, i.e. it is a direct consumer of the
    M1.2 meta double-buffer. ZeroDB must expose "open previous snapshot."
 
-4. **`EnvFlags::WRITE_MAP`** (experimental writemap) — PLAN 1.10 mentions
+4. **`EnvFlags::WRITE_MAP`** (experimental writemap) — milestone M1.10 mentions
    durability flags generically but not WRITE_MAP. It changes how writes hit
    storage (writable mmap) and interacts with `put_reserved` and the dirty-page
    borrow model; needs explicit handling even though ZeroDB's I/O layer differs.
@@ -254,8 +254,8 @@ this pattern and should be designed with these five call sites as its target.
 
 7. **In-place cursor mutation with codec swap** — `put_current_with_options`
    (rewrite at cursor with a *different* data codec) and `del_current` are used
-   by all of milli/arroy/hannoy in `iter_mut`/`prefix_iter_mut` passes. PLAN
-   1.3/1.4 cover cursors generically; call out these specific unsafe write-cursor
+   by all of milli/arroy/hannoy in `iter_mut`/`prefix_iter_mut` passes. Milestones
+   M1.3/1.4 cover cursors generically; call out these specific unsafe write-cursor
    ops (and the value-borrow rule they require) explicitly.
 
 8. **Facet neighbor seeks** `get_greater_than` / `get_lower_than_or_equal_to`

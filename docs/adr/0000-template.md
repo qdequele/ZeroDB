@@ -1,7 +1,7 @@
 # ADR-NNNN: <title>
 
 - Status: Draft | Approved | Superseded by ADR-XXXX
-- Milestone: <PLAN.md milestone>
+- Related issue: <GitHub issue or PR, if any>
 - Date: YYYY-MM-DD
 
 ## Context

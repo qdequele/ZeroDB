@@ -15,7 +15,7 @@
 //! - nested read children see the writer's in-map dirty state;
 //! - `put_reserved` fills the in-map frame (inline and overflow-run).
 //!
-//! Do not weaken (CLAUDE.md rule 2).
+//! Do not weaken (AGENTS.md rule 2).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

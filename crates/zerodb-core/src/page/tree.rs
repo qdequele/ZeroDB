@@ -66,7 +66,7 @@ pub enum LeafValue<'a> {
 
 /// Compute the padded length of the leaf cell at absolute offset `abs`, bounds-
 /// checking every field read against `psize`.
-// Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+// Forced: LLVM inlines this only at -inline-threshold=1000.
 #[inline(always)]
 fn leaf_cell_len(buf: &[u8], abs: usize, psize: u32) -> Result<usize, PageError> {
     let body = body_size(psize);
@@ -182,7 +182,7 @@ impl<'a> LeafRef<'a> {
     /// validated, so this may only be used when **these same bytes** already
     /// passed [`LeafRef::new`] earlier — i.e. behind the txn-scoped
     /// validated-pages memo over an immutable source
-    /// (`btree::ValidatedPages`; docs/PERF-GAP-VS-LMDB.md A2).
+    /// (`btree::ValidatedPages`; docs/PERF-GAP-VS-LMDB.md, eager page validation).
     pub(crate) fn new_prevalidated(buf: &'a [u8], psize: u32) -> Result<LeafRef<'a>, PageError> {
         let flags = read_flags(buf);
         if page_type_of(flags)? != PageType::Leaf {
@@ -197,7 +197,7 @@ impl<'a> LeafRef<'a> {
     }
 
     /// [`new_prevalidated`](Self::new_prevalidated) minus every check — two
-    /// raw header reads (PERF-GAP A8). Only for a **kind-tagged memo hit**:
+    /// raw header reads. Only for a **kind-tagged memo hit**:
     /// these same bytes passed [`LeafRef::new`] earlier this txn *and* the
     /// memo key records that they validated as a **leaf**
     /// (`btree::ValidatedPages` tags the page kind), so not even the type
@@ -226,7 +226,7 @@ impl<'a> LeafRef<'a> {
         self.upper as usize - self.lower as usize
     }
 
-    /// Absolute offset of cell `i`'s header (A3: unchecked pointer-array
+    /// Absolute offset of cell `i`'s header (unchecked pointer-array
     /// read). Callers guarantee `i < num_keys` (public accessors `assert!`
     /// it; the lookup loops maintain it as a binary-search invariant).
     #[allow(unsafe_code)]
@@ -235,7 +235,7 @@ impl<'a> LeafRef<'a> {
         // SAFETY: `i < num_keys = lower/2`, so the slot at
         // `HEADER_SIZE + i*2` lies inside `[HEADER_SIZE, HEADER_SIZE+lower)`,
         // and `lower <= upper <= body_size` held at view construction (or is
-        // inherited via the A8 trusted-view / engine-authorship contract).
+        // inherited via the trusted-view / engine-authorship contract).
         HEADER_SIZE + unsafe { read_u16_unchecked(self.buf, HEADER_SIZE + i * 2) } as usize
     }
 
@@ -244,9 +244,9 @@ impl<'a> LeafRef<'a> {
     #[allow(unsafe_code)]
     pub fn node_flags(&self, i: usize) -> u16 {
         assert!(i < self.num_keys(), "leaf entry index out of range");
-        // SAFETY (A3 view contract): cell `i` was proven in-bounds by the
+        // SAFETY (unchecked-read view contract): cell `i` was proven in-bounds by the
         // full validation walk, or inherits that proof (kind-tagged memo hit
-        // / engine-authored dirty frame — batch 3/A8); its 8-byte header is
+        // / engine-authored dirty frame); its 8-byte header is
         // inside `buf`.
         unsafe { read_u16_unchecked(self.buf, self.cell_abs(i)) }
     }
@@ -257,7 +257,7 @@ impl<'a> LeafRef<'a> {
     pub fn key(&self, i: usize) -> &'a [u8] {
         assert!(i < self.num_keys(), "leaf entry index out of range");
         let abs = self.cell_abs(i);
-        // SAFETY (A3 view contract, as `node_flags`): validation bounded the
+        // SAFETY (view contract, as `node_flags`): validation bounded the
         // whole cell — header AND `header + ksize` key span — inside `buf`
         // (`leaf_cell_len`), so the unchecked `ksize` read and key slice are
         // in bounds.
@@ -275,7 +275,7 @@ impl<'a> LeafRef<'a> {
     pub fn value(&self, i: usize) -> LeafValue<'a> {
         assert!(i < self.num_keys(), "leaf entry index out of range");
         let abs = self.cell_abs(i);
-        // SAFETY (A3 view contract, as `key`): `leaf_cell_len` bounded the
+        // SAFETY (view contract, as `key`): `leaf_cell_len` bounded the
         // header, key span, and value area (`dsize` inline bytes, or the
         // 8-byte overflow head under `F_BIGDATA`) inside `buf`.
         unsafe {
@@ -300,7 +300,7 @@ impl<'a> LeafRef<'a> {
         leaf_lookup(self.buf, self.num_keys(), key, KeyCmp::Default)
     }
 
-    /// As [`Self::lookup`], under an explicit ordering (milestone 2.4).
+    /// As [`Self::lookup`], under an explicit ordering.
     pub fn lookup_with(&self, key: &[u8], cmp: KeyCmp<'_>) -> Result<usize, usize> {
         leaf_lookup(self.buf, self.num_keys(), key, cmp)
     }
@@ -353,10 +353,10 @@ impl<'a> LeafMut<'a> {
     ///
     /// Callers only ever hand this **engine-authored dirty frames** (a COW
     /// copy of a page fully validated on its first map access this txn, or
-    /// the output of this txn's own page encoders — PERF-GAP batch 3 / A8),
+    /// the output of this txn's own page encoders),
     /// so validation is the same O(1) structural checks the read-side dirty
     /// path uses ([`LeafRef::new_prevalidated`]: type, reserved fields,
-    /// bounds). Until A8 this silently re-ran the **full O(`num_keys`)**
+    /// bounds). Until the memo rework this silently re-ran the **full O(`num_keys`)**
     /// [`LeafRef::new`] cell walk — on every put (`insert_into_leaf` wraps
     /// the target leaf per call), which the milli write-phase profile showed
     /// as the single hottest zerodb cost.
@@ -393,7 +393,7 @@ impl<'a> LeafMut<'a> {
         leaf_lookup(self.buf, self.num_keys(), key, KeyCmp::Default)
     }
 
-    /// As [`Self::lookup`], under an explicit ordering (milestone 2.4).
+    /// As [`Self::lookup`], under an explicit ordering.
     pub fn lookup_with(&self, key: &[u8], cmp: KeyCmp<'_>) -> Result<usize, usize> {
         leaf_lookup(self.buf, self.num_keys(), key, cmp)
     }
@@ -554,7 +554,7 @@ impl<'a> LeafMut<'a> {
     ///
     /// [`PageError::CellOutOfBounds`] (or another cell-shape error) if the
     /// cell at `idx` does not decode. [`LeafMut::from_valid`] runs only the
-    /// O(1) structural checks since PERF-GAP A8, so a caller that wraps a
+    /// O(1) structural checks, so a caller that wraps a
     /// page whose cells were never fully validated (the constructor is `pub`)
     /// must get a typed error here, never a panic.
     pub fn remove(&mut self, idx: usize) -> Result<(), PageError> {
@@ -694,7 +694,7 @@ impl<'a> BranchRef<'a> {
 
     /// [`new_prevalidated`](Self::new_prevalidated) minus every check — same
     /// contract as [`LeafRef::new_trusted`], for a memo hit kind-tagged
-    /// **branch** (PERF-GAP A8).
+    /// **branch**.
     pub(crate) fn new_trusted(buf: &'a [u8]) -> BranchRef<'a> {
         debug_assert!(matches!(
             page_type_of(CommonHeader::read(buf).flags),
@@ -719,7 +719,7 @@ impl<'a> BranchRef<'a> {
         self.upper as usize - self.lower as usize
     }
 
-    /// Absolute offset of cell `i`'s header (A3 — same contract as
+    /// Absolute offset of cell `i`'s header (same contract as
     /// [`LeafRef`]'s `cell_abs`: callers guarantee `i < num_keys`).
     #[allow(unsafe_code)]
     fn cell_abs(&self, i: usize) -> usize {
@@ -735,7 +735,7 @@ impl<'a> BranchRef<'a> {
     #[allow(unsafe_code)]
     pub fn child_pgno(&self, i: usize) -> u64 {
         assert!(i < self.num_keys(), "branch entry index out of range");
-        // SAFETY (A3 view contract): cell `i` was proven in-bounds by the
+        // SAFETY (unchecked-read view contract): cell `i` was proven in-bounds by the
         // full validation walk, or inherits that proof (kind-tagged memo hit
         // / engine-authored dirty frame); its 10-byte header is inside `buf`.
         unsafe { read_u64_unchecked(self.buf, self.cell_abs(i)) }
@@ -748,7 +748,7 @@ impl<'a> BranchRef<'a> {
     pub fn key(&self, i: usize) -> &'a [u8] {
         assert!(i < self.num_keys(), "branch entry index out of range");
         let abs = self.cell_abs(i);
-        // SAFETY (A3 view contract, as `child_pgno`): `branch_cell_len`
+        // SAFETY (view contract, as `child_pgno`): `branch_cell_len`
         // bounded the header and `header + ksize` separator span in `buf`.
         unsafe {
             let ksize = read_u16_unchecked(self.buf, abs + 8) as usize;
@@ -764,9 +764,9 @@ impl<'a> BranchRef<'a> {
         self.child_index_with(key, KeyCmp::Default)
     }
 
-    /// As [`Self::child_index`], under an explicit ordering (milestone 2.4).
+    /// As [`Self::child_index`], under an explicit ordering.
     #[must_use]
-    // Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+    // Forced: LLVM inlines this only at -inline-threshold=1000.
     #[inline(always)]
     pub fn child_index_with(&self, key: &[u8], cmp: KeyCmp<'_>) -> usize {
         // Node 0 is -inf and always qualifies; scan separators 1..num_keys.
@@ -794,10 +794,10 @@ pub struct BranchMut<'a> {
 impl<'a> BranchMut<'a> {
     /// Wrap an already-validated branch page for mutation.
     ///
-    /// Same contract and same A8 change as [`LeafMut::from_valid`]: callers
+    /// Same contract and same memo-rework change as [`LeafMut::from_valid`]: callers
     /// only hand this engine-authored dirty frames, so validation is the
     /// O(1) structural checks ([`BranchRef::new_prevalidated`]) — the full
-    /// per-cell walk ran here on every parent-chain touch until A8.
+    /// per-cell walk ran here on every parent-chain touch until the memo rework.
     ///
     /// # Errors
     ///
@@ -975,10 +975,10 @@ fn remove_cell(
 }
 
 /// Binary-search a leaf's sorted pointer array for `key` under `cmp`
-/// (milestone 2.4: the ordering is the tree's, not necessarily memcmp —
+/// (the ordering is the tree's, not necessarily memcmp —
 /// SPEC 03 §2.0).
 ///
-/// A3 contract: `buf` is a validated/trusted leaf page's buffer and
+/// View contract: `buf` is a validated/trusted leaf page's buffer and
 /// `num_keys` is **that page's** entry count — every caller derives both from
 /// a constructed view (`LeafRef::lookup{,_with}`, `btree`'s descent over
 /// `leaf_view`s), so `mid < num_keys` makes the unchecked reads in-bounds by
@@ -994,7 +994,7 @@ pub(crate) fn leaf_lookup(
     let mut hi = num_keys;
     while lo < hi {
         let mid = lo + (hi - lo) / 2;
-        // SAFETY: `mid < num_keys` (binary-search invariant) and the A3 view
+        // SAFETY: `mid < num_keys` (binary-search invariant) and the view
         // contract above — pointer slot, cell header, and key span were all
         // bounds-proven when the page validated (or are engine-authored).
         let mid_key = unsafe {

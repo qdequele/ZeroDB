@@ -123,7 +123,7 @@ fn prefix_iter_mut_empty_prefix_is_bad_val_size_like_prefix_iter() {
     }
     wtxn.commit().unwrap();
 
-    // Read side (already pinned at M1.13): the reference behavior.
+    // Read side (already pinned by earlier tests): the reference behavior.
     let rtxn = env.read_txn().unwrap();
     assert!(
         matches!(

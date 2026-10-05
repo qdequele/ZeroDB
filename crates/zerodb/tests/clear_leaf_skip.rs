@@ -7,7 +7,7 @@
 //! one "both"), the stat counters, and the free-page count — that an
 //! overflow-bearing tree still takes the reading walk and frees its runs, and
 //! that the freed pages are actually reusable afterwards. Do not weaken
-//! (CLAUDE.md rule 2).
+//! (AGENTS.md rule 2).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

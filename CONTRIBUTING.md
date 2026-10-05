@@ -2,8 +2,8 @@
 
 ZeroDB is a clean-room, spec-first re-implementation of LMDB's engine behind
 heed's API. The rules that keep it honest are short and non-negotiable; they
-live in [`CLAUDE.md`](CLAUDE.md) and apply to humans and agents alike. The
-ones you will hit first:
+live in [`AGENTS.md`](AGENTS.md) and apply to humans and AI agents alike —
+read it before your first change. The ones you will hit first:
 
 - **The oracle decides LMDB semantics.** Never guess what LMDB does: write a
   differential test in `crates/zerodb-oracle` against the Meilisearch LMDB fork
@@ -49,8 +49,9 @@ description, with the machine named.
 
 | | |
 |---|---|
-| Roadmap | [`PLAN.md`](PLAN.md) |
-| Engineering log | [`PROGRESS.md`](PROGRESS.md) (append-only) |
+| Project rules | [`AGENTS.md`](AGENTS.md) |
+| Planned and open work | GitHub issues |
+| Release history | [`CHANGELOG.md`](CHANGELOG.md) |
 | Docs map | [`docs/README.md`](docs/README.md) |
 | Releasing | [`docs/RELEASING.md`](docs/RELEASING.md) |
 | Security | [`SECURITY.md`](SECURITY.md) |

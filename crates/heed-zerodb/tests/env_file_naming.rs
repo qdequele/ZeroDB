@@ -1,4 +1,4 @@
-//! ADR-0010 / D-012 — the env directory's data-file name at the heed boundary.
+//! ADR-0010 — the env directory's data-file name at the heed boundary.
 //!
 //! Before ADR-0010 an adapter-created env dir held exactly `["zerodb.dat"]`,
 //! while Meilisearch joins the literal `"data.mdb"` onto env paths in
@@ -105,7 +105,7 @@ fn dir_listing(dir: &std::path::Path) -> Vec<String> {
 
 /// A fresh env dir created through the adapter contains **exactly**
 /// `["data.mdb"]`: no `zerodb.dat`, and no `lock.mdb` (nothing in the consumer
-/// tree reads one — D-001 stands).
+/// tree reads one — ZeroDB stays single-process).
 #[test]
 fn adapter_env_dir_contains_exactly_data_mdb() {
     let dir = tempfile::tempdir().unwrap();

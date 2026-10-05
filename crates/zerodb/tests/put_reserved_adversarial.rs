@@ -1,4 +1,4 @@
-//! Milestone 1.4 coverage pass, area 3: `put_reserved` adversarial coverage
+//! Write-path coverage pass, area 3: `put_reserved` adversarial coverage
 //! (SPEC 00 row 35, SPEC 01 §S3, SPEC 04 TXN-47) not already exercised by
 //! `write_api.rs::put_reserved_through_commit` (exact full-fill, inline and
 //! overflow, no split) or `zerodb-core::rwtxn`'s `txn49_reserve_then_split`

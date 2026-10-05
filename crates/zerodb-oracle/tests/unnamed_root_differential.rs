@@ -1,8 +1,9 @@
-//! Milestone 1.6: the **true unnamed/root database** (`create_database(None)`),
+//! The **true unnamed/root database** (`create_database(None)`),
 //! LMDB fork vs zerodb, driven directly against both real APIs.
 //!
 //! The fuzzed `DbName::Unnamed` maps to milli's *named* `"main"` DB (so the root
-//! is a pure catalog, never read as data — see `op.rs` and DIVERGENCES D-008).
+//! is a pure catalog, never read as data — see `op.rs` and the catalog-record
+//! entry in docs/DIVERGENCES.md).
 //! The arroy/hannoy pattern is the opposite: they use ONLY the true unnamed/root
 //! DB and never create named DBs, so the root holds user data and no catalog
 //! entries — no format-specific record bytes are ever surfaced. This test covers

@@ -1,4 +1,4 @@
-//! Milestone 2.8a — the ADR-0011 Q5 DUPSORT pin list, FFI-only portion.
+//! DUPSORT support (parked) — the ADR-0011 Q5 DUPSORT pin list, FFI-only portion.
 //!
 //! heed 0.22.1 exposes no surface for `MDB_GET_BOTH`/`MDB_GET_BOTH_RANGE`,
 //! raw `mdb_dbi_open` flag bits, positioned dup-cursor steps, or the §S2-style
@@ -7,7 +7,7 @@
 //! `zerodb-oracle`, the one crate allowed to link C). Same pin protocol as
 //! `dup_pin_semantics.rs`: observation tables compared against pinned
 //! constants; a diff means the fork changed or a guess was wrong — never
-//! weaken, adjudicate (CLAUDE.md rules 1/2).
+//! weaken, adjudicate (AGENTS.md rules 1/2).
 
 use std::ffi::CString;
 use std::os::raw::{c_int, c_uint, c_void};

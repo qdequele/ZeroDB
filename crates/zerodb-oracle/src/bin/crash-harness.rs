@@ -1,4 +1,4 @@
-//! The M1.11 crash-consistency harness binary (ADR-0008 D3; SPEC 06 §5).
+//! The crash-consistency harness binary (ADR-0008 D3; SPEC 06 §5).
 //!
 //! ```text
 //! crash-harness [--cycles N] [--seed S] [--mechanism image|sigkill|both]

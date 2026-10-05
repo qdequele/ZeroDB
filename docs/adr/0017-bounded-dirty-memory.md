@@ -1,6 +1,6 @@
 # ADR-0017: Bounded dirty-page memory in large write transactions (spilling)
 
-- Status: Accepted (approved by Quentin 2026-09-30: "go continue, I should be closer to LMDB in memory usage")
+- Status: Accepted (approved by the maintainer, 2026-09-30, with the goal of LMDB-level memory usage)
 - Implementation note (2026-10-05): implemented and kept — 629e945 (`benches/results/perf-ledger.jsonl`). Under in-place `WRITE_MAP` (ADR-0021) spilling reduces to bookkeeping.
 - Milestone: Phase 3 (performance / memory), PERF-GAP C2, issue #3
 - Date: 2026-09-29
@@ -68,7 +68,7 @@ glibc retention (not Meilisearch's case) but not the peak.
 
 Option A, LMDB-style spill, specified in SPEC 04 §6.3a (TXN-68..72), with
 SPEC 06 REC-6 H0 amended. Answers to the review questions (2026-09-30,
-following the recommendation approved in chat):
+following the recommendation the maintainer approved):
 
 1. **Default threshold:** LMDB's — 131,072 dirty pages, counted in pages as
    LMDB counts them (512 MiB at 4 KiB pages; 2 GiB at 16 KiB, as with LMDB).

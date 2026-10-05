@@ -20,7 +20,7 @@
 //!
 //! Sized for miri (hundreds of ops, 4 KiB pages, small map). The native
 //! `cargo test` run executes it too, as a fast smoke. Do not weaken
-//! (CLAUDE.md rule 2).
+//! (AGENTS.md rule 2).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

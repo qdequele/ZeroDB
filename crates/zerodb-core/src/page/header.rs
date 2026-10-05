@@ -37,8 +37,8 @@ pub(crate) const OFF_VARIANT: usize = 24;
 
 /// The three universal fields of the common page header.
 ///
-/// `reserved0` and `checksum` (the Phase-3.9 data-page checksum) are always zero
-/// in Phase 1 and are not represented here; the variant tail (offsets 24–31) is
+/// `reserved0` and `checksum` (the planned data-page checksum) are always zero
+/// today and are not represented here; the variant tail (offsets 24–31) is
 /// interpreted by the type-specific views.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommonHeader {
@@ -85,7 +85,7 @@ impl CommonHeader {
         write_u64(buf, OFF_TXNID, self.txnid);
         write_u16(buf, OFF_FLAGS, self.flags);
         write_u16(buf, OFF_RESERVED0, 0);
-        // checksum (u32) reserved 0 in Phase 1.
+        // checksum (u32) reserved, always 0 today.
         buf[OFF_CHECKSUM..OFF_CHECKSUM + 4].fill(0);
     }
 }
@@ -125,7 +125,8 @@ impl<'a> PageRef<'a> {
     /// [`PageRef::new`] minus the `validate_page_size` re-check, for the
     /// engine's per-page-load hot path (`btree::load_page`): the page size is
     /// validated once at env open and is immutable after, so re-validating it
-    /// on every page load only costs time (docs/PERF-GAP-VS-LMDB.md A4). All
+    /// on every page load only costs time (docs/PERF-GAP-VS-LMDB.md,
+    /// `validate_page_size` on every page load). All
     /// per-buffer checks (length, type classification) are kept — this trusts
     /// only `psize`, never the bytes.
     pub(crate) fn new_trusted_psize(buf: &'a [u8], psize: u32) -> Result<PageRef<'a>, PageError> {
@@ -162,8 +163,8 @@ impl<'a> PageRef<'a> {
         read_u16(self.buf, OFF_FLAGS)
     }
 
-    /// The Phase-3.9 data-page checksum field (header offset 20). Always zero in
-    /// Phase 1; exposed for completeness and future use.
+    /// The planned data-page checksum field (header offset 20). Always zero
+    /// today; exposed for completeness and future use.
     #[must_use]
     pub fn checksum(&self) -> u32 {
         read_u32(self.buf, OFF_CHECKSUM)
@@ -257,7 +258,7 @@ impl<'a> PageRef<'a> {
 
 /// Validate the free-space bounds of a branch/leaf page against the body size,
 /// shared by the tree views. Returns `(lower, upper)` on success.
-// Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+// Forced: LLVM inlines this only at -inline-threshold=1000.
 #[inline(always)]
 pub(crate) fn read_and_check_bounds(buf: &[u8], psize: u32) -> Result<(u16, u16), PageError> {
     let body_size = psize as usize - HEADER_SIZE;

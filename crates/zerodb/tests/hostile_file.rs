@@ -1,7 +1,7 @@
 //! File-level regression tests for the first-release security review
 //! (2026-09): a corrupt or hostile **data file** yields a typed error —
 //! never a SIGBUS, panic, or silent write through an attacker-planted path —
-//! and env files are created owner-only. Do not weaken (CLAUDE.md rule 2).
+//! and env files are created owner-only. Do not weaken (AGENTS.md rule 2).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

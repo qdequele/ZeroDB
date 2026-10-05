@@ -6,3 +6,7 @@ fuzz/artifacts
 benches/results/*.tmp
 __pycache__/
 *.pyc
+# Local AI-assistant configuration (AGENTS.md is the shared, committed guide;
+# a local CLAUDE.md can import it with `@AGENTS.md`).
+/CLAUDE.md
+/.claude/

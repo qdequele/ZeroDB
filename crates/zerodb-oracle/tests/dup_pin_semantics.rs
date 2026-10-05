@@ -1,19 +1,19 @@
-//! Milestone 2.8a — the ADR-0011 Q5 pre-implementation DUPSORT pin list
+//! DUPSORT support (parked) — the ADR-0011 Q5 pre-implementation DUPSORT pin list
 //! (heed-reachable portion; the FFI-only portion is `dup_pin_ffi.rs`).
 //!
 //! Every test here observes the Meilisearch LMDB fork (heed =0.22.1 /
 //! lmdb-master-sys 0.2.6, `mdb.master.nested-rtxns`) and pins exactly what it
-//! returns, BEFORE any zerodb dup code exists (CLAUDE.md rule 1; ADR-0011
+//! returns, BEFORE any zerodb dup code exists (AGENTS.md rule 1; ADR-0011
 //! Decision 7.1 / Q5). The observed tables are transcribed into
 //! `docs/SPEC/03-btree.md` §12 in the same change. Do NOT weaken these
 //! assertions: they encode observed LMDB behavior, and a mismatch is a
-//! zerodb/spec bug for a human to adjudicate (CLAUDE.md rule 2).
+//! zerodb/spec bug for a human to adjudicate (AGENTS.md rule 2).
 //!
 //! Pin protocol: each test builds an observation table (one `id = value` line
 //! per probe) and compares it against the pinned constant. A behavior change in
 //! the fork (or a wrong guess) shows up as a full-table diff.
 
-#![allow(deprecated)] // INTEGER_DUP/INTEGER_KEY: the persisted-bit path is exactly what 2.8a pins
+#![allow(deprecated)] // INTEGER_DUP/INTEGER_KEY: these tests pin exactly the persisted-bit path
 
 use heed::types::Bytes;
 use heed::{Database, DatabaseFlags, EnvOpenOptions, PutFlags};
@@ -21,7 +21,7 @@ use zerodb_oracle::tempdir::TempDir;
 
 type BDb = Database<Bytes, Bytes>;
 
-const MAP_SIZE: usize = 32 << 20; // multiple of the 16 KiB macOS page (D-006)
+const MAP_SIZE: usize = 32 << 20; // multiple of the 16 KiB macOS page (map_size divergence)
 
 fn open_env(dir: &std::path::Path) -> heed::Env<heed::WithoutTls> {
     let mut opts = EnvOpenOptions::new().read_txn_without_tls();
@@ -729,8 +729,8 @@ fn pin_flags_persistence_open_mismatch() {
     // persistent-flags mismatch check on an existing named DB — the
     // persisted `md_flags` are silently adopted and the caller's requested
     // flags are silently ignored (`MDB_INCOMPATIBLE` on flag mismatch does
-    // not exist in this fork). Human adjudication required before 2.8a
-    // implements open-time flag semantics (see the 2.8a stop-report).
+    // not exist in this fork). Human adjudication required before DUPSORT
+    // support (ADR-0011) implements open-time flag semantics.
     t.assert_pinned(
         r#"
 same_env_open_dup_without_flags = Ok(is_some=true)

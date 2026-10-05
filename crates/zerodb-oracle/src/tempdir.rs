@@ -1,6 +1,6 @@
 //! A minimal self-cleaning temporary directory.
 //!
-//! Deliberately dependency-free: `tempfile` is not on the CLAUDE.md allowlist,
+//! Deliberately dependency-free: `tempfile` is not on the AGENTS.md allowlist,
 //! and the oracle only needs a unique, auto-removed directory to host an env.
 
 use std::path::{Path, PathBuf};

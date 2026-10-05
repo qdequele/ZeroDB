@@ -3,11 +3,12 @@
 //! Polynomial `0x1EDC6F41` (reflected form `0x82F6_3B78`), reflected input and
 //! output, initial value `0xFFFF_FFFF`, final XOR `0xFFFF_FFFF`. This is the
 //! algorithm mandated by [ADR-0002 §D1] and used for the mandatory meta-page CRC
-//! (SPEC 02 §3.3). Phase 1 uses this software table; Phase 3.9 will switch to
-//! the ARMv8-A `crc32c*` hardware instructions, which compute exactly this
+//! (SPEC 02 §3.3). ZeroDB uses this software table today; the planned page
+//! checksums would switch to the ARMv8-A `crc32c*` hardware instructions,
+//! which compute exactly this
 //! polynomial and must agree bit-for-bit with this table.
 //!
-//! No new dependency is used (CLAUDE.md / ADR-0002 §D1: an in-house table is
+//! No new dependency is used (AGENTS.md / ADR-0002 §D1: an in-house table is
 //! mandated because no CRC crate is on the allowlist).
 //!
 //! [ADR-0002 §D1]: ../../../../docs/adr/0002-on-disk-format.md

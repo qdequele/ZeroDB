@@ -29,7 +29,7 @@ cursor-op constant the fork defines, against the frozen consumer contract in
 - **MUST** — at least one SPEC 00 consumer uses it. Cites the SPEC 00 row and
   names the Phase 1 milestone that implements it.
 - **SHOULD** — heed 0.22.1 exposes it but no consumer uses it. Phase 2 (cites a
-  `2.x`), *unless* PLAN.md explicitly pulls its parity into Phase 1 (noted
+  `2.x`), *unless* the roadmap explicitly pulls its parity into Phase 1 (noted
   inline; see the durability-flag note in §S6 and the Mismatches section).
 - **WON'T** — not implemented in Phase 1; one-line justification citing a
   divergence (D-001 cross-process/locking, D-003 nested write txns, D-004
@@ -41,7 +41,7 @@ checklist for milestones 1.2 / 1.3 / 1.4 / 1.6 / 1.10 / 1.11 / 1.12.
 Consistency with SPEC 00 was verified both directions: every SPEC 01 **MUST**
 traces to a SPEC 00 MUST item, and every flag SPEC 00 marks MUST is **MUST**
 here. Result: **no MUST mismatch** (see Mismatches section for two non-blocking
-PLAN-vs-consumer scoping notes).
+roadmap-vs-consumer scoping notes).
 
 ---
 
@@ -55,21 +55,21 @@ through `EnvOpenOptions::read_txn_with_tls()` / `read_txn_without_tls()`.
 |------|-----|----------|-------|-----------|----------------|--------------------------------------------------|
 | `MDB_FIXEDMAP` | `0x01` | `EnvFlags::FIXED_MAP` | **WON'T** | — | — | "mmap at a fixed address (**experimental**)" per the header; upstream marks it experimental and it hard-codes a mmap address. No consumer. Rationale: experimental upstream, incompatible with our own-format mmap policy. |
 | `MDB_NOSUBDIR` | `0x4000` | `EnvFlags::NO_SUB_DIR` | **WON'T** | — | — | Store the env as two files `name` / `name-lock` instead of a directory. SPEC 00 row 7: every consumer opens a **directory** env (`data.mdb`/`lock.mdb`), never `NO_SUB_DIR`. zerodb defines its own on-disk layout (D-002); no consumer need. |
-| `MDB_NOSYNC` | `0x10000` | `EnvFlags::NO_SYNC` | **SHOULD** † | 1.10 | `durability_nosync_no_fsync` | Skip both data and meta fsync on commit; durability restored only by `mdb_env_sync`/next non-RDONLY commit. In `mdb_env_sync0` the fsync is elided when `NO_SYNC` set. No consumer passes it, but PLAN 1.10 scopes durability-flag parity into Phase 1 (†, §S6). Crash-tested in M1.11. |
+| `MDB_NOSYNC` | `0x10000` | `EnvFlags::NO_SYNC` | **SHOULD** † | 1.10 | `durability_nosync_no_fsync` | Skip both data and meta fsync on commit; durability restored only by `mdb_env_sync`/next non-RDONLY commit. In `mdb_env_sync0` the fsync is elided when `NO_SYNC` set. No consumer passes it, but M1.10 scopes durability-flag parity into Phase 1 (†, §S6). Crash-tested in M1.11. |
 | `MDB_RDONLY` | `0x20000` | `EnvFlags::READ_ONLY` | **SHOULD** | 1.10 | `env_rdonly_rejects_write` | *Env-level* read-only: `mdb_txn_begin` returns `EACCES` for a write txn (`env->me_flags & MDB_RDONLY & ~flags`); `mdb_env_sync0` returns `EACCES`. No consumer opens an RDONLY **env** (they all need `write_txn`). NB: the *txn-level* `MDB_RDONLY` set on every `read_txn()` is a separate, universal MUST covered by SPEC 00 rows 14/16 (M1.3/1.8), not this env bit. |
-| `MDB_NOMETASYNC` | `0x40000` | `EnvFlags::NO_META_SYNC` | **SHOULD** † | 1.10 | `durability_nometasync` | fsync data pages but skip the meta-page fsync on commit; the meta is flushed on the next sync. `mfd = (flags & (NOSYNC\|NOMETASYNC)) ? me_fd : me_mfd` — routes the meta write to the non-syncing fd. No consumer; PLAN 1.10 (†, §S6). Crash-tested in M1.11. |
+| `MDB_NOMETASYNC` | `0x40000` | `EnvFlags::NO_META_SYNC` | **SHOULD** † | 1.10 | `durability_nometasync` | fsync data pages but skip the meta-page fsync on commit; the meta is flushed on the next sync. `mfd = (flags & (NOSYNC\|NOMETASYNC)) ? me_fd : me_mfd` — routes the meta write to the non-syncing fd. No consumer; M1.10 (†, §S6). Crash-tested in M1.11. |
 | `MDB_WRITEMAP` | `0x80000` | `EnvFlags::WRITE_MAP` | **MUST** | 1.10 | `env_writemap_put_get_parity`, `env_writemap_put_reserved` | SPEC 00 row 8 (Meilisearch `index_map`, gated on experimental writemap). Writes go through a **writable** mmap (`mmap(PROT_WRITE)`), not `malloc`+`pwrite`; dirty bytes live in the map. Interacts with `put_reserved` (returns a pointer into the map) and the SPEC 04 value-borrow contract. Commit uses `msync` instead of `pwrite`+`fdatasync`. Excludes `NO_MEM_INIT`/readahead paths. Must be spec'd as a second write mode (§S7). |
-| `MDB_MAPASYNC` | `0x100000` | `EnvFlags::MAP_ASYNC` | **SHOULD** † | 1.10 | `durability_mapasync_writemap` | Only meaningful with `WRITE_MAP`: use `MS_ASYNC` instead of `MS_SYNC` for the commit `msync` (`flags = (MAPASYNC && !force) ? MS_ASYNC : MS_SYNC`). A crash can then lose/corrupt the last txns. No consumer; PLAN 1.10 (†, §S6). |
+| `MDB_MAPASYNC` | `0x100000` | `EnvFlags::MAP_ASYNC` | **SHOULD** † | 1.10 | `durability_mapasync_writemap` | Only meaningful with `WRITE_MAP`: use `MS_ASYNC` instead of `MS_SYNC` for the commit `msync` (`flags = (MAPASYNC && !force) ? MS_ASYNC : MS_SYNC`). A crash can then lose/corrupt the last txns. No consumer; M1.10 (†, §S6). |
 | `MDB_NOTLS` | `0x200000` | *(via `read_txn_without_tls()`; `EnvFlags::NO_TLS` **deprecated**)* | **MUST** | 1.2, 1.8 | `flag_notls_rotxn_is_send` | SPEC 00 rows 2/29: **every** production open is `WithoutTls`. Ties reader-table slots to the `MDB_txn` object instead of a thread-local, making `RoTxn: Send` (rayon/async fan-out). In the fork this is the branch taken in `mdb_txn_renew0` (`env->me_flags & MDB_NOTLS`). zerodb makes WithoutTls the default (and effectively only) mode; the WithTls path is a thin shim (SPEC 00 second table). The `EnvFlags::NO_TLS` constant is deprecated in heed 0.22 in favor of the `EnvOpenOptions` methods. |
 | `MDB_NOLOCK` | `0x400000` | `EnvFlags::NO_LOCK` | **WON'T** | — | — | "caller manages their own locks" — the cross-process locking escape hatch. D-001: zerodb is single-process with no lock file, so the concept does not apply. No consumer. |
 | `MDB_NORDAHEAD` | `0x800000` | `EnvFlags::NO_READ_AHEAD` | **SHOULD** | landed 2026-09-29 | `zerodb/tests/no_read_ahead.rs` | Turns off OS readahead (`madvise(MADV_RANDOM)`), no effect on Windows. **Honored since 2026-09-29, as LMDB does:** the map (read-only or `WRITE_MAP`) is advised `MADV_RANDOM` at open; the test checks the `rr` VmFlag on Linux. No consumer passes it (hannoy instead issues its own `madvise(WILLNEED)`, SPEC 00 §B.9), but rust-storage-bench's heed backend does, and without it a random-read workload larger than memory thrashes (Phase D: ~10 GB read in 60 s for a 1.5 GB DB under a 2 GB cap). |
 | `MDB_NOMEMINIT` | `0x1000000` | `EnvFlags::NO_MEM_INIT` | **SHOULD** | 2.7 | `env_nomeminit_accepted_noop` | Skip zero-filling `malloc`'d pages before writing them to the datafile (a data-leak/Valgrind trade-off). `clean_limit` in `mdb_page_dirty` keys off `(NOMEMINIT|WRITEMAP)`. No consumer; the header itself notes it "is not needed with `MDB_WRITEMAP`". zerodb controls its own dirty-page allocation, so this can be a documented no-op. |
 | `MDB_PREVSNAPSHOT` | `0x2000000` | `EnvFlags::PREV_SNAPSHOT` | **MUST** | 1.2, 1.10 | `env_prevsnapshot_opens_older_meta` | SPEC 00 row 9 (milli `Index::rollback`). Opens the env on the **older** of the two meta pages. `mdb_env_pick_meta` XORs the newer-meta selection with this flag: `metas[(m0.txnid < m1.txnid) ^ (flags & PREVSNAPSHOT)]`. Open protocol subtleties in §S5 (requires exclusive access; auto-cleared on first commit). |
 
-† **SHOULD but Phase-1-scheduled:** PLAN.md M1.10 explicitly implements
+† **SHOULD but Phase-1-scheduled:** milestone M1.10 explicitly implements
 `NO_SYNC`/`NO_META_SYNC`/`MAP_ASYNC` durability parity even though no consumer
 passes them. They are SHOULD by the "no consumer" rule but land in Phase 1 by
-PLAN scope. See §S6 and Mismatches note 1.
+roadmap scope. See §S6 and Mismatches note 1.
 
 ---
 
@@ -107,7 +107,7 @@ and never appear as a user-visible `PutFlags` bit; `MULTIPLE` is unexposed.
 
 | Flag | Bit | heed API | Class | Milestone | Diff-test slug | Behavior & error/precedence notes (from `mdb_cursor_put`) |
 |------|-----|----------|-------|-----------|----------------|-----------------------------------------------------------|
-| `MDB_NOOVERWRITE` | `0x10` | `PutFlags::NO_OVERWRITE` | **SHOULD** ‡ | 1.10 | `flag_no_overwrite_returns_existing` | If the key already exists, **do not overwrite**: LMDB copies the existing value into the caller's `data` (`*data = d2`) and returns `MDB_KEYEXIST` → heed `MdbError::KeyExist`. The returned-existing-value contract is load-bearing (§S2). No consumer passes it, but PLAN 1.10 lists it in Phase-1 scope (‡, Mismatches note 2). |
+| `MDB_NOOVERWRITE` | `0x10` | `PutFlags::NO_OVERWRITE` | **SHOULD** ‡ | 1.10 | `flag_no_overwrite_returns_existing` | If the key already exists, **do not overwrite**: LMDB copies the existing value into the caller's `data` (`*data = d2`) and returns `MDB_KEYEXIST` → heed `MdbError::KeyExist`. The returned-existing-value contract is load-bearing (§S2). No consumer passes it, but M1.10 lists it in Phase-1 scope (‡, Mismatches note 2). |
 | `MDB_NODUPDATA` | `0x20` | `PutFlags::NO_DUP_DATA` | **WON'T** (→2.8) | — | — | DUPSORT-only: skip if the key/value pair already exists; on `mdb_cursor_del` removes all dups. No consumer (no DUPSORT DB). D-004. |
 | `MDB_CURRENT` | `0x40` | `Cursor::put_current` (internal) | **MUST** | 1.4 | `cursor_put_current_overwrite`, `cursor_put_current_uninit_einval` | SPEC 00 row 33 (milli/arroy/hannoy/cellulite `put_current`/`put_current_with_options`). Overwrite the value at the current cursor position. Requires the cursor be positioned (`C_INITIALIZED`) else `EINVAL`. The `_with_options` form re-encodes with a different data codec. `unsafe`: no live borrow into the entry may span the call (§S3). |
 | `MDB_RESERVE` | `0x10000` | `Database::put_reserved` (internal) | **MUST** | 1.10 | `put_reserved_writes_into_map`, `put_reserved_overwrite_same_size` | SPEC 00 row 35 (milli word-prefix docids). Allocate space for the value and return a pointer to it (`data->mv_data = METADATA(page)` / `= olddata.mv_data`); the caller fills it in-place, avoiding a temp buffer. ~~Not valid with DUPSORT~~ **observed 2.8a pin: lmdb.h forbids it with DUPSORT but the fork does NOT reject it — the reserved bytes are stored as an ordinary dup value (SPEC 03 §12.1 O5; pinned by `zerodb-oracle/tests/dup_pin_semantics.rs`, adopted as spec text in the 2026-10-05 maintainer-authorized docs pass; the DUPSORT work itself stays parked, D-004)**. Lifetime + `WRITE_MAP` interaction in §S3/§S7. |
@@ -115,8 +115,8 @@ and never appear as a user-visible `PutFlags` bit; `MULTIPLE` is unexposed.
 | `MDB_APPENDDUP` | `0x40000` | `PutFlags::APPEND_DUP` | **WON'T** (→2.8) | — | — | DUPSORT append of a dup value in sorted order. No consumer (no DUPSORT DB). D-004. |
 | `MDB_MULTIPLE` | `0x80000` | *(unexposed by heed)* | **WON'T** (→2.8) | — | — | DUPFIXED-only bulk-store of many fixed-size dup values in one call; `data[1].mv_size` carries the count. Returns `MDB_INCOMPATIBLE` if the DB is not DUPFIXED. Not exposed by heed; no consumer. D-004. |
 
-‡ **SHOULD but Phase-1-scheduled:** PLAN.md M1.10 lists `NO_OVERWRITE` in
-Phase-1 scope though no consumer uses it. SHOULD by rule, Phase 1 by PLAN. See
+‡ **SHOULD but Phase-1-scheduled:** milestone M1.10 lists `NO_OVERWRITE` in
+Phase-1 scope though no consumer uses it. SHOULD by rule, Phase 1 by the roadmap. See
 Mismatches note 2.
 
 ---
@@ -310,7 +310,7 @@ layer differs — pwrite/io_uring vs writemap+msync):
 - `force` (an explicit `mdb_env_sync`) overrides `NO_SYNC` and downgrades
   `MAP_ASYNC` to a synchronous flush. `mdb_env_sync` on an `MDB_RDONLY` env →
   `EACCES`.
-- **PLAN note:** these three flags are SHOULD (no consumer) yet PLAN M1.10
+- **Roadmap note:** these three flags are SHOULD (no consumer) yet milestone M1.10
   implements their parity in Phase 1; the crash-consistency behavior above is
   validated by the M1.11 harness, not just unit tests. See Mismatches note 1.
 
@@ -405,12 +405,12 @@ row (`WRITE_MAP`→r8, `NO_TLS`→r2/r29, `PREV_SNAPSHOT`→r9, `CREATE`→r11/r
 cursor `FIRST/LAST/NEXT/PREV/SET/SET_RANGE/GET_CURRENT`→r30/r40–r48), and every
 flag SPEC 00 marks MUST is MUST here. No SPEC 00 edit is required or made.
 
-Two **non-blocking PLAN-vs-consumer scoping notes** (for maintainer awareness;
+Two **non-blocking roadmap-vs-consumer scoping notes** (for maintainer awareness;
 they are *not* SPEC 00↔01 MUST mismatches, since SPEC 00 correctly omits these
 from its MUST table):
 
 1. **Durability flags `NO_SYNC` / `NO_META_SYNC` / `MAP_ASYNC`** are SHOULD by
-   the "no consumer uses it" rule, yet **PLAN.md M1.10** explicitly implements
+   the "no consumer uses it" rule, yet **milestone M1.10** explicitly implements
    their parity in Phase 1 ("Env durability flags parity: NOSYNC / NOMETASYNC /
    MAPASYNC semantics"). Classified SHOULD here with milestone M1.10 noted (†).
    SPEC 00 row 140 already anticipates this ("Durability flags map onto the
@@ -419,7 +419,7 @@ from its MUST table):
    wants to promote them to a distinct "Phase-1 SHOULD" label.
 
 2. **`MDB_NOOVERWRITE`** is likewise SHOULD (no consumer passes `PutFlags::
-   NO_OVERWRITE` in any of the five repos) but **PLAN.md M1.10** lists it in
+   NO_OVERWRITE` in any of the five repos) but **milestone M1.10** lists it in
    Phase-1 scope ("APPEND …, NO_OVERWRITE, CURRENT, RESERVE"). Classified SHOULD
    with milestone M1.10 noted (‡). SPEC 00 does not list it as a MUST, so no
    SPEC 00 edit is warranted; flagged only so the M1.10 implementer knows the
@@ -451,10 +451,10 @@ from its MUST table):
 
 ## M1.10 landed flag matrix (write flags and modes)
 
-**Landed 2026-07-16** (PLAN §1.10). Every write-mode / durability / RDONLY flag
+**Landed 2026-07-16** (M1.10). Every write-mode / durability / RDONLY flag
 in Phase-1 scope, its landing test, and where it lives. The put-flag rows
 (`APPEND` / `NO_OVERWRITE` / `CURRENT` / `RESERVE`) landed earlier in M1.4/M1.6;
-they are re-listed here for a single flag-matrix view (PLAN §1.10 acceptance).
+they are re-listed here for a single flag-matrix view (M1.10 acceptance).
 
 | Flag | Table | Behavior (landed) | Landing test | Kind |
 |------|-------|-------------------|--------------|------|
@@ -497,7 +497,7 @@ matching LMDB. Proved against the M1.11 fault-injection backing in
 `force_sync`, and the crash-floor image must then read back every committed
 key).
 
-**Meilisearch indexing flag-combo replay** (PLAN §1.10 acceptance): the exact
+**Meilisearch indexing flag-combo replay** (M1.10 acceptance): the exact
 milli combo — `WithoutTls` + `map_size` + named DBs + `put`/`put_with_flags`
 (APPEND, sorted) + `del` + `clear` + **nested reads mid-txn** — is replayed on
 both engines and compared exhaustively by `milli_indexing_flag_combo_replay`

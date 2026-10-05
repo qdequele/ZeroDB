@@ -1,5 +1,5 @@
 #![no_main]
-//! Fuzz target `fuzz_page_decode` (PLAN §1.1 acceptance).
+//! Fuzz target `fuzz_page_decode` (page-codec acceptance: runs clean for 10 min).
 //!
 //! Feeds arbitrary bytes to the SPEC 02 page decoder under a page-size sweep
 //! (4096 / 8192 / 65536), forcing every page-type interpretation, and walks

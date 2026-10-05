@@ -16,8 +16,8 @@
 //! ## OUT (excluded, with reason)
 //! - `databases/encrypted_database.rs`, examples `custom-comparator`,
 //!   `custom-dupsort-comparator`: encryption / custom comparators are WON'T /
-//!   Phase 2.4 (SPEC 00 second table).
-//! - example `nested.rs` (nested **write** txns): D-003 — nested write txns are
+//!   a separate extension (SPEC 00 second table).
+//! - example `nested.rs` (nested **write** txns): nested write txns are
 //!   **unrepresentable** in the adapter (there is deliberately no
 //!   `Env::nested_write_txn` / `RwTxn::nested`; TXN-40). Replaced by the
 //!   `nested_write_txn_is_unrepresentable` compile-time note below.
@@ -25,7 +25,7 @@
 //! - inline `env.rs` `resize_database` / `open_database_with_nosubdir` /
 //!   `max_key_size` / `open_read_only_without_no_env_opened_before`: exercise
 //!   LMDB-specific `resize`/`NO_SUB_DIR`/platform max-key/read-only-open-create
-//!   behaviors outside the Phase-1 adapter surface (SPEC 01 / D-001).
+//!   behaviors outside the adapter surface (SPEC 01; ZeroDB is single-process).
 //! - inline `txn.rs` `rw_txns_are_send`: heed's `RwTxn` is `Send`; the adapter's
 //!   is deliberately `!Send` (its write-mutex guard must not cross threads — no
 //!   consumer moves a live write txn). Documented divergence, `txn.rs`.
@@ -108,7 +108,7 @@ fn all_types() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// heed example: `clear-database.rs` (clear then write in the same txn, M1.6).
+/// heed example: `clear-database.rs` (clear then write in the same txn).
 #[test]
 fn clear_database() -> Result<(), Box<dyn Error>> {
     let path = tempfile::tempdir()?;
@@ -144,8 +144,8 @@ fn clear_database() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// heed example: `cursor-append.rs` (APPEND via `put_current_with_options`,
-/// M1.10) across multiple databases.
+/// heed example: `cursor-append.rs` (APPEND via `put_current_with_options`)
+/// across multiple databases.
 #[test]
 fn cursor_append() -> Result<(), Box<dyn Error>> {
     let path = tempfile::tempdir()?;
@@ -175,8 +175,7 @@ fn cursor_append() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// heed example: `multi-env.rs` (registry/EnvAlreadyOpened across two envs,
-/// M1.13).
+/// heed example: `multi-env.rs` (registry/EnvAlreadyOpened across two envs).
 #[test]
 fn multi_env() -> Result<(), Box<dyn Error>> {
     type BEU32 = U32<BE>;
@@ -207,8 +206,8 @@ fn multi_env() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// heed example: `prev-snapshot.rs` (PREV_SNAPSHOT / the meta double-buffer,
-/// M1.2). `create_database(None)` = the main DB.
+/// heed example: `prev-snapshot.rs` (PREV_SNAPSHOT / the meta double-buffer).
+/// `create_database(None)` = the main DB.
 #[test]
 fn prev_snapshot() -> Result<(), Box<dyn Error>> {
     let path = tempfile::tempdir()?;
@@ -255,7 +254,7 @@ fn prev_snapshot() -> Result<(), Box<dyn Error>> {
 }
 
 /// heed example: `nested-rtxns.rs` (nested READ txns fanned out to threads —
-/// the single most important example, M1.9). Dependency-free adaptation: std
+/// the single most important example). Dependency-free adaptation: std
 /// threads instead of rayon, plain byte values instead of roaring/rand (no new
 /// dev-dependencies), but the same shape — N nested readers over an in-progress
 /// write txn, each read on its own thread, seeing uncommitted state.
@@ -413,7 +412,7 @@ fn error_taxonomy_variants_and_constructibility() {
     ));
 }
 
-/// D-003 (replaces heed's `nested.rs` example): nested **write** txns are
+/// Replaces heed's `nested.rs` example: nested **write** txns are
 /// unrepresentable in the adapter. This is enforced *by absence* — there is no
 /// `Env::nested_write_txn` and no `RwTxn::nested` — so a call to them does not
 /// compile (TXN-40, stronger than a runtime error). This test documents that

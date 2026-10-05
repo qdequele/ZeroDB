@@ -1,11 +1,11 @@
-//! Milestone 1.3 read-path differential tests: `LmdbEngine` vs the native
+//! Read-path differential tests: `LmdbEngine` vs the native
 //! `ZerodbEngine`.
 //!
 //! The zerodb side populates via the same `Put`/`PutFlagged`/`Del`/`Clear` op
 //! stream (buffered in a shadow, materialized through the bulk-load builder on
 //! commit) and then serves reads from the real B-tree read path. Every read /
 //! cursor / seek / iteration op is compared verbatim against the LMDB fork,
-//! which is populated identically via its own API (PLAN §1.3 acceptance).
+//! which is populated identically via its own API (read-path acceptance).
 
 use zerodb_oracle::{decode_ops, run, DbName, Key, LmdbEngine, Op, PutFlag, Value, ZerodbEngine};
 

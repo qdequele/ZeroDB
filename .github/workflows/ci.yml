@@ -1,4 +1,4 @@
-# ZeroDB CI — the CLAUDE.md gate battery, automated.
+# ZeroDB CI — the AGENTS.md check battery, automated.
 #
 # Per push / PR: fmt, clippy, tests (x86-64 and aarch64), an MSRV check, miri
 # on the core, loom on the reader table, the 10-minute differential fuzz (plus
@@ -7,7 +7,7 @@
 # The oracle crate links the real LMDB fork (lmdb-master-sys), so every job
 # needs a C toolchain — the GitHub Ubuntu images ship gcc.
 #
-# Still missing vs PLAN.md §Testing strategy: a 64K-page kernel. GitHub's
+# Still missing from the testing strategy: a 64K-page kernel. GitHub's
 # hosted aarch64 runners use 4K pages; a self-hosted Graviton box with a 64K
 # kernel (e.g. RHEL for ARM) has to be added by hand under `runs-on`.
 
@@ -183,8 +183,8 @@ jobs:
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
       - run: ZERODB_STRESS_SECS=180 cargo test -p zerodb --test reader_stress -- --nocapture stress_
       - run: cargo run -p zerodb-oracle --bin crash-harness -- --cycles 10000
-      # 4 h here; `just fuzz-long` is 6 h and the 24 h soak PLAN 1.14 asks for
-      # needs a self-hosted runner.
+      # 4 h here; `just fuzz-long` is 6 h and the 24 h soak the consumer
+      # integration gate asks for needs a self-hosted runner.
       - run: cargo +nightly fuzz run diff_ops -- -max_total_time=14400
       - name: keep any crash artifact
         if: failure()

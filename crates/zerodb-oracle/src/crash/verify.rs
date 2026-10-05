@@ -151,7 +151,7 @@ pub struct FullChecks<'a> {
     /// worker: a failed deregistration on the previous drop surfaces as
     /// `EnvAlreadyOpened` here (the ADR-0008 D6.2 residue tripwire).
     pub verify_path: &'a Path,
-    /// **`NO_META_SYNC` reclaim-clobber window** (REC-10 as amended M1.11;
+    /// **`NO_META_SYNC` reclaim-clobber window** (REC-10 as amended by the crash harness;
     /// harness find, seed 15797139550980166469): set by the caller only when
     /// the plan persisted at least one in-flight **data** write of a cut that
     /// also has the (single) previous commit's meta pending. If recovery then
@@ -160,7 +160,8 @@ pub struct FullChecks<'a> {
     /// `ceil` belong to snapshot `ceil − 1`, and txn `ceil + 1` may reclaim
     /// them (GC-18) with nothing barrier-ordering its writes against the
     /// un-fsynced meta. LMDB shares this window (`MDB_NOMETASYNC`; libmdbx's
-    /// steady/weak metas exist precisely to close it — Phase 3 candidate).
+    /// steady/weak metas exist precisely to close it — a candidate for a later
+    /// improvement).
     /// Walk/data obligations are waived for exactly those images; the window
     /// and txnid-taxonomy obligations still hold. Never set for
     /// default/`WRITE_MAP` — REC-6's full guarantees stand there.

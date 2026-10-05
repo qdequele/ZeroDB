@@ -44,13 +44,16 @@ same assumption LMDB makes.
   cause a panic or an out-of-memory in the offline `zerodb-tools`. Run
   `zerodb-tools check` on files you trust or in a sandbox.
 - **Cross-process access.** One process per environment; there is no lock
-  file and no reader table shared between processes (D-001). Opening the same
+  file and no reader table shared between processes (see
+  `docs/DIVERGENCES.md`). Opening the same
   environment from two processes is undefined.
 - **Encryption at rest, or protection from a local user with write access to
   the environment directory.** Files are created with mode `0600`.
-- **Bounded memory for a write transaction.** All dirty pages of a write
-  transaction are held in RAM until commit, and a single value may be up to
-  4 GiB. There is no `MDB_TXN_FULL` equivalent.
+- **Strictly bounded memory for a write transaction.** Past a dirty-page limit
+  (`EnvOpenOptions::max_dirty_bytes`, by default LMDB's 131,072 pages) a write
+  transaction spills dirty pages to the file, as LMDB does. But a single value
+  may be up to 4 GiB and is held in memory whole while it is written, and there
+  is no `MDB_TXN_FULL` equivalent.
 - **Anything about the C LMDB fork.** `zerodb-tools migrate-from-lmdb` (an
   opt-in build feature) parses an LMDB file with the C library; any LMDB
   memory-safety issue is in scope for that one command and no other part of
@@ -67,4 +70,4 @@ tags with GitHub release notes (ADR-0013); a fix ships as the next patch tag.
 behind a validated-view contract (`zerodb-core::page::raw`, `zerodb-io`), one
 `pwritev` and one `flock` FFI call, the differential oracle's LMDB FFI, and the
 few pointer-shaped constructs heed's own API forces on the adapter. Every block
-carries a `// SAFETY:` comment; the policy is in `CLAUDE.md`.
+carries a `// SAFETY:` comment; the policy is in `AGENTS.md`.

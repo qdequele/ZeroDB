@@ -1,4 +1,4 @@
-//! `migrate-from-lmdb` acceptance (M1.12, PLAN §1.12) — needs `migrate-lmdb`.
+//! `migrate-from-lmdb` acceptance — needs `migrate-lmdb`.
 //!
 //! (a) Round-trip: build a real LMDB env (multi-DB, overflow values, varied
 //!     sizes), migrate it into a fresh zerodb env, and assert `our dump of the
@@ -215,7 +215,7 @@ fn real_index_proxy_point_queries_match() {
 }
 
 // ---------------------------------------------------------------------------
-// ADR-0010 / D-012 — magic-based source discrimination.
+// ADR-0010 — magic-based source discrimination.
 // ---------------------------------------------------------------------------
 
 /// Since ADR-0010 a ZeroDB env can *also* be named `data.mdb` (that is exactly

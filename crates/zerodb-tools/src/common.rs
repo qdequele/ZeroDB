@@ -1,5 +1,5 @@
 //! Shared helpers for the read tools: open an env read-only and collect its
-//! logical content (M1.12).
+//! logical content.
 
 use zerodb::{
     collect_entries_flagged, named_databases, Database, Env, EnvFlags, EnvOpenOptions, RoTxn,

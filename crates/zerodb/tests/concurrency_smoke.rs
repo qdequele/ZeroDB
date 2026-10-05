@@ -1,7 +1,7 @@
-//! Milestone 1.4 coverage pass, area 7: real-OS-thread concurrency smoke
-//! (NOT the M1.8 reader table — that milestone tests lock-free reader-slot
+//! Write-path coverage pass, area 7: real-OS-thread concurrency smoke
+//! (NOT the reader table — its own tests cover lock-free reader-slot
 //! contention specifically; this is the much simpler TXN-6/7/9/11 surface
-//! that M1.4 already claims). No existing test spins a second OS thread.
+//! the write path already claims). No existing test spins a second OS thread.
 //!
 //! 1. Two threads racing `Env::write_txn()` must serialize on the
 //!    in-process write mutex (TXN-6/7): no lost update, no torn/interleaved

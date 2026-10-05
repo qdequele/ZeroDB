@@ -6,7 +6,7 @@
 //! a child process). The oracle cannot assert on UB, so `driver::classify`
 //! skips the combination symmetrically. These tests pin the guard itself.
 //!
-//! Do not weaken or remove (CLAUDE.md rule 2). Remove ONLY when the fork fix
+//! Do not weaken or remove (AGENTS.md rule 2). Remove ONLY when the fork fix
 //! lands upstream and the repro example no longer crashes.
 
 use zerodb_oracle::{run_self_test, DbName, Key, LmdbEngine, Op, PutFlag, Value};

@@ -10,7 +10,7 @@
 //! - short read txns (each one hitting the cache for pages an earlier txn
 //!   validated) return exactly the model's contents while pgnos are reused.
 //!
-//! Do not weaken (CLAUDE.md rule 2).
+//! Do not weaken (AGENTS.md rule 2).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};

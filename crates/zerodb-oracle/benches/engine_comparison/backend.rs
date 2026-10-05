@@ -193,7 +193,8 @@ macro_rules! bench_backend {
             /// `range_mut` + `del_current`, the loop milli writes at each of
             /// its nine `del_current` call sites. Distinct from
             /// `delete_range`, which materialises the key set and issues point
-            /// deletes: this is the path PERF-GAP B8a is about, and the only
+            /// deletes: this is the path the `del_current` re-descent item in
+            /// docs/PERF-GAP-VS-LMDB.md is about, and the only
             /// rung that exercises post-delete cursor position (SPEC 03 §5.4a).
             pub fn cursor_drain(env: &BEnv, db: Db, keys: &[Vec<u8>], _val: &[u8]) {
                 let (Some(lo), Some(hi)) = (keys.first(), keys.last()) else {

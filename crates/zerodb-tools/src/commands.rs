@@ -1,4 +1,4 @@
-//! `stat`, `dump`, `load`, `check` subcommand implementations (M1.12).
+//! `stat`, `dump`, `load`, `check` subcommand implementations.
 
 use std::fmt::Write as _;
 use std::fs::File;
@@ -175,7 +175,7 @@ pub fn cmd_load(dump_path: &Path, env_dir: &Path, psize: u32, map_size: u64) -> 
     }
     named_owned.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Stream the env straight into the data file (PERF-GAP C3 / issue #63):
+    // Stream the env straight into the data file (issue #63):
     // the old path materialized the whole env image in a second Vec
     // (`build_multi_db_image`) before one `fs::write`. Page content is
     // independent of `map_size` (only the meta pages record it), so if the

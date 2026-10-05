@@ -1,10 +1,10 @@
 # ADR-0008: Crash harness — fault-injection write backend, two-mechanism crash cycles, crash-harness binary
 
-- Status: **Approved** — Quentin, 2026-07-16, standing directive, session-lead review
+- Status: **Approved** — maintainer, 2026-07-16, standing directive, delegated review
 - Milestone: 1.11 (Recovery, torn writes, and crash consistency)
 - Date: 2026-07-16
 
-### Ratified answers to the open questions (Quentin, 2026-07-16)
+### Ratified answers to the open questions (maintainer, 2026-07-16)
 
 1. **Cycle accounting:** each recovered-and-verified crash state counts toward
    the ≥10k (one image variant / one SIGKILL recovery = one cycle) — the

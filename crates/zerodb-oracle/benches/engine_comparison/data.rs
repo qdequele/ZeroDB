@@ -5,7 +5,7 @@
 
 /// 1 GiB sparse map — larger than any dataset here, and a multiple of every
 /// supported page size (4K/8K/16K/32K/64K) so LMDB's OS-page-multiple rule and
-/// zerodb's D-006 check both accept it.
+/// zerodb's own `map_size` check both accept it.
 pub const MAP: usize = 1 << 30;
 
 /// The reference dataset size. Every ladder rung that is not itself sweeping
@@ -123,7 +123,7 @@ pub fn round_robin_probes(keys: &[Vec<u8>], dbs: usize, count: usize, seed: u64)
 /// `[4096, 65536]` power-of-two range so zerodb can be pinned to the same value.
 pub fn os_page_size() -> u32 {
     // SAFETY: `sysconf(_SC_PAGESIZE)` is a pure query — no preconditions, no side
-    // effects. FFI in the oracle crate is sanctioned by the CLAUDE.md unsafe
+    // effects. FFI in the oracle crate is sanctioned by the AGENTS.md unsafe
     // policy; this is bench-only code.
     let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     match u32::try_from(v) {

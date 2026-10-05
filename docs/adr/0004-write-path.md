@@ -1,7 +1,7 @@
 # ADR-0004: Write path — single-writer RwTxn, COW dirty store, commit pipeline
 
-- Status: Approved — Quentin, 2026-07-16 (relayed via session lead; standing
-  directive "continue until finished"). OQ1–OQ5 answered; resolutions recorded
+- Status: Approved — maintainer, 2026-07-16 (standing directive). OQ1–OQ5
+  answered; resolutions recorded
   at the end of this document.
 - Milestone: 1.4
 - Date: 2026-07-16
@@ -385,7 +385,7 @@ flip on in this milestone and not later.)
   (CLAUDE.md rule 3): expected touch points are SPEC 03 §5.4 (single-cursor
   fix-up scope) and SPEC 04 §6 (if miri forces any frame-lifetime refinement).
 
-## Open questions — RESOLVED (Quentin, 2026-07-16)
+## Open questions — RESOLVED (maintainer, 2026-07-16)
 
 1. **OQ1 — snapshot-cell placeholder (D3): APPROVED.** `Mutex<Arc<Snapshot>>`
    with the TXN-19 publish order ships in M1.4; TXN-9's lock-free guarantee

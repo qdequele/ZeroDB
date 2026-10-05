@@ -79,7 +79,7 @@ pub type Result<T> = result::Result<T, Error>;
 
 /// An LMDB error kind — the exact variant set of `heed::MdbError`
 /// (`mdb.master` branch; the `master3`-only encryption/checksum variants are
-/// out of Phase 1 scope, SPEC 00 WON'T). ZeroDB emits its own codes, so the
+/// out of scope, SPEC 00 WON'T). ZeroDB emits its own codes, so the
 /// raw-`c_int`→string mapping heed does over LMDB return codes is dropped
 /// (ADR-0003 heed-suite scoping: `lmdb_error.rs` is *partially IN* — keep the
 /// variant identities, drop the raw-rc assertions).

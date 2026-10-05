@@ -39,7 +39,7 @@ impl<'a> OverflowRef<'a> {
     ///
     /// [`PageError::WrongPageType`], [`PageError::BadOverflowRun`], or
     /// [`PageError::ReservedFieldNonZero`].
-    // Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+    // Forced: LLVM inlines this only at -inline-threshold=1000.
     #[inline(always)]
     pub fn new(buf: &'a [u8], psize: u32) -> Result<OverflowRef<'a>, PageError> {
         validate_page_size(psize)?;

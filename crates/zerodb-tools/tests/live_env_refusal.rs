@@ -1,6 +1,6 @@
-//! A tool pointed at a locked (simulated-live) env refuses cleanly (M1.12
-//! acceptance §7c, PLAN §1.12): "a tool invoked on a locked live env fails
-//! cleanly".
+//! A tool pointed at a locked (simulated-live) env refuses cleanly (tools
+//! acceptance criterion: "a tool invoked on a locked live env fails
+//! cleanly").
 #![cfg(unix)]
 
 use std::os::unix::io::AsRawFd;

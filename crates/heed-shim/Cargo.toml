@@ -2,7 +2,7 @@
 # `heed-zerodb` verbatim. Its sole purpose is to be the target of a consumer's
 # `[patch.crates-io] heed = { path = ".../crates/heed-shim" }`: cargo's `[patch]`
 # requires the replacement crate to share the *name* of the crate it replaces
-# (`heed`), and the `package =` rename is silently ignored (verified M1.13). The
+# (`heed`), and the `package =` rename is silently ignored (verified). The
 # real adapter lives in `heed-zerodb`; this is a 3-line pass-through so the
 # oracle can still link the genuine crates.io `heed` (real LMDB) alongside it.
 #

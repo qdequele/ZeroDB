@@ -1,15 +1,16 @@
-//! Milestone 1.9 differential tests: nested read transactions over a write
+//! Differential tests: nested read transactions over a write
 //! txn (`BeginNestedRo`/`EndNestedRo`), zerodb vs the Meilisearch LMDB fork
 //! (the only LMDB with this feature — ITS#10395, SPEC 04 §5).
 //!
-//! PLAN §1.9 acceptance: parity on write-then-nested-read sequences including
+//! Acceptance: parity on write-then-nested-read sequences including
 //! reads of **uncommitted** state. The op model drives one child at a time
 //! (`TxnState::RwNested`); while the child lives, every read is served
 //! through it on both engines and every write op is classified
 //! `Skip::WriteBlockedByNested` by the shared driver **before either engine
-//! runs** — the fork technically allows a write under a live child (D-005),
-//! zerodb forbids it, and the symmetric skip keeps that divergence
-//! unobservable exactly as ratified. Multi-child + real-thread fan-out
+//! runs** — the fork technically allows a write under a live child, zerodb
+//! forbids it, and the symmetric skip keeps that divergence unobservable
+//! exactly as approved (writer quiescence, docs/DIVERGENCES.md). Multi-child +
+//! real-thread fan-out
 //! parity is covered by `crates/zerodb/tests/nested_fanout.rs`.
 
 use zerodb_oracle::{run, DbName, Key, LmdbEngine, Op, PutFlag, Value, ZerodbEngine};
@@ -94,7 +95,7 @@ fn nested_child_sees_uncommitted_state() {
 }
 
 /// The paused-writer window: writes attempted while the child lives are the
-/// symmetric `WriteBlockedByNested` skip (D-005); after `EndNestedRo` the
+/// symmetric `WriteBlockedByNested` skip (writer quiescence); after `EndNestedRo` the
 /// writer resumes for real, and a second child sees both generations.
 #[test]
 fn write_blocked_while_nested_then_resume() {
@@ -102,7 +103,7 @@ fn write_blocked_while_nested_then_resume() {
     ops.extend([
         Op::BeginNestedRo,
         // All classified Skip::WriteBlockedByNested by the shared driver —
-        // neither engine executes them (D-005 kept unobservable).
+        // neither engine executes them (writer-quiescence divergence kept unobservable).
         Op::Put {
             db: 0,
             key: k(b"blocked"),

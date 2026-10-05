@@ -1,10 +1,10 @@
-//! Milestone 2.5 — explicit `sync(force)` / `force_sync()`, `mdb_env_sync`
-//! parity, proved against the M1.11 fault-injection backing.
+//! Explicit `sync(force)` / `force_sync()`, `mdb_env_sync` parity, proved
+//! against the crash harness's fault-injection backing.
 //!
 //! The claim "`force_sync` makes everything durable" is only meaningful if
 //! something can observe non-durability. [`FaultBacking`] is exactly that
 //! observer: it journals every un-barriered write and folds the journal into
-//! the durable image only on a real barrier. So the milestone reduces to two
+//! the durable image only on a real barrier. So the feature reduces to two
 //! checkable facts about a `NO_SYNC` env, which commits without any barrier:
 //!
 //!   1. **Before** `force_sync`, the journal is non-empty and the crash-floor
@@ -132,7 +132,7 @@ fn sample_keys(n: usize, tag: u8) -> BTreeMap<Vec<u8>, Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// The core milestone claim
+// The core claim
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -158,7 +158,7 @@ fn force_sync_on_a_nosync_env_empties_the_journal_and_makes_data_durable() {
         "NO_SYNC commit must not have issued a barrier"
     );
 
-    // (2) force_sync — the whole point of the milestone.
+    // (2) force_sync — the whole point of the feature.
     env.force_sync().expect("force_sync on a NO_SYNC env");
 
     let after = handle.capture();

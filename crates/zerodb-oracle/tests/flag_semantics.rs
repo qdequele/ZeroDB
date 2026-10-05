@@ -3,7 +3,7 @@
 //! `mdb.master.nested-rtxns` @ cd767228). These tests are ground-truth pins,
 //! not zerodb tests: they establish what the oracle says, the way
 //! `key_bounds.rs` already does for §S4. Do NOT weaken these assertions to
-//! make them pass (CLAUDE.md rule 2) — a mismatch with SPEC 01 prose is a
+//! make them pass (AGENTS.md rule 2) — a mismatch with SPEC 01 prose is a
 //! spec bug for a human to reconcile, not a test bug.
 //!
 //! Test names follow the SPEC 01 differential-test slug column where a slug
@@ -403,7 +403,7 @@ fn open_with_flags(dir: &std::path::Path, flags: EnvFlags) -> heed::Env<heed::Wi
     opts.map_size(10 << 20);
     opts.max_dbs(4);
     // SAFETY: PREV_SNAPSHOT / no flags only; private temp dir, single process,
-    // exclusive access (D-001) satisfied since only this handle is open at a
+    // exclusive access (single process) satisfied since only this handle is open at a
     // time (each open is paired with `prepare_for_closing().wait()` first).
     unsafe {
         opts.flags(flags);

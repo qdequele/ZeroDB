@@ -40,8 +40,8 @@ pub struct Key(pub Vec<u8>);
 /// threshold (~2 KiB at a 4 KiB page) and reaches **multi-page overflow runs**
 /// (up to ~16 pages) frequently.
 ///
-/// The large branch is deliberately bounded at 64 KiB (M1.3, not the multi-MB
-/// of the original M0.3 generator): the differential now populates a real LMDB
+/// The large branch is deliberately bounded at 64 KiB (since the read path landed;
+/// not the multi-MB of the original generator): the differential now populates a real LMDB
 /// env of a fixed [`DIFF_MAP_SIZE`](crate::DIFF_MAP_SIZE), so a 64-op sequence
 /// must stay well under the map to avoid `MapFull` (which the rebuild-on-commit
 /// zerodb harness does not model) and to keep per-iteration temp files small.
@@ -112,18 +112,19 @@ impl<'a> Arbitrary<'a> for Value {
 /// Selects which database an op targets by *name*, mapped to a bounded set of
 /// catalog names so fuzzing keeps hitting the same handful of databases.
 ///
-/// **Why `Unnamed` resolves to a *named* `"main"` DB (M1.6).** The differential
+/// **Why `Unnamed` resolves to a *named* `"main"` DB.** The differential
 /// mixes several databases in one env. If it stored user data in the true
 /// unnamed/root DB while also creating named DBs, iterating the root would
 /// surface the named DBs' catalog entries (SPEC 02 §6) — whose value is the
 /// engine's on-disk sub-DB **record**, a byte layout that legitimately differs
 /// between LMDB (`MDB_db`) and zerodb (`DBRecord`, SPEC 02 §3.1) because ZeroDB
-/// defines its own format (D-002). That is a raw-byte pattern **no consumer
+/// defines its own on-disk format. That is a raw-byte pattern **no consumer
 /// uses**: milli's primary DB is itself the *named* `"main"` DB, so the root is
 /// a pure catalog it never reads as data; arroy/hannoy use only the true
 /// unnamed DB and never create named DBs, so their root has no catalog entries.
 /// Modeling `Unnamed` as milli's named `"main"` keeps the fuzz faithful and
-/// avoids surfacing engine-internal records (DIVERGENCES D-008). The true
+/// avoids surfacing engine-internal records (the catalog-record divergence in
+/// docs/DIVERGENCES.md). The true
 /// unnamed/root DB is covered on its own — with no catalog mixing — by
 /// `tests/unnamed_root_differential.rs`.
 #[derive(Arbitrary, Debug, Clone, PartialEq, Eq)]
@@ -343,7 +344,8 @@ pub enum Op {
     ///
     /// [`Op::IterMutDelCurrent`] stops at the delete, so it compares the
     /// surviving *content* but never the surviving *position* — the exact
-    /// semantics SPEC 03 §7 pins and whose mechanism PERF-GAP B8a changed.
+    /// semantics SPEC 03 §7 pins and whose mechanism the retained-position
+    /// cursor delete changed (docs/PERF-GAP-VS-LMDB.md, `del_current` re-descent).
     /// This op puts the post-delete cursor position under the differential
     /// fuzzer: both engines must agree on every entry yielded afterwards,
     /// including across the leaf merges a long drain provokes.

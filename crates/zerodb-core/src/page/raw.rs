@@ -7,13 +7,13 @@
 //! - **Checked** (`read_*`/`write_*`): pure safe Rust — copy the exact bytes
 //!   into a stack array and use `from_le_bytes`/`to_le_bytes`. Panic on
 //!   out-of-bounds. Used by validation, mutation, and every cold path.
-//! - **Unchecked** (`read_*_unchecked`, PERF-GAP A3): `unsafe fn`s using
+//! - **Unchecked** (`read_*_unchecked`): `unsafe fn`s using
 //!   explicit offsets + [`core::ptr::read_unaligned`] — exactly the pattern
-//!   the CLAUDE.md unsafe policy prescribes, in one of its sanctioned homes
+//!   the AGENTS.md unsafe policy prescribes, in one of its sanctioned homes
 //!   (`zerodb-core::page`). Callers must guarantee `off + N <= buf.len()`;
 //!   the only callers are the `tree` view accessors, whose constructors prove
 //!   (full validation walk) or inherit (kind-tagged memo hit / engine-authored
-//!   dirty frame — the batch-3/A8 trust arguments) that every cell lies in
+//!   dirty frame — the memo and engine-authorship trust arguments) that every cell lies in
 //!   bounds. `debug_assert!`s keep the contract loud in test builds; the
 //!   differential fuzzer and miri referee it.
 //!

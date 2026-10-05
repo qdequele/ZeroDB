@@ -1,4 +1,4 @@
-//! Milestone 1.4 coverage pass: deep-tree rebalance storms. Op sequences that
+//! Write-path coverage pass: deep-tree rebalance storms. Op sequences that
 //! force multi-level splits (depth >= 3, confirmed independently in
 //! `crates/zerodb/tests/deep_tree_rebalance.rs` using `TxnRead::main_record`,
 //! since the `Op` model has no depth-introspection op) and then cascade

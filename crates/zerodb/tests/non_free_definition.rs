@@ -5,7 +5,7 @@
 //! per-database stats, with overflow values and churn, and under
 //! `WRITE_MAP`, where the file is extended to the whole map and a
 //! file-length formula would report almost the entire map as used. Do not
-//! weaken (CLAUDE.md rule 2).
+//! weaken (AGENTS.md rule 2).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

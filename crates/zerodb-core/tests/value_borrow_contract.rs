@@ -1,4 +1,4 @@
-//! Milestone 1.4 coverage pass, area 2: SPEC 04 §6 (TXN-37..49) value-borrow
+//! Write-path coverage: SPEC 04 §6 (TXN-37..49) value-borrow
 //! contract, exercised as a black-box consumer of `zerodb-core`'s public API
 //! (no crate-internal access — same posture as `page_edges.rs`) so this file
 //! runs under `cargo miri test -p zerodb-core` (deterministic, no mmap/file

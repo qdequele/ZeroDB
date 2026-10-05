@@ -1,4 +1,4 @@
-//! Milestone 1.4 coverage pass, area 4: abort/poison semantics not already
+//! Write-path coverage pass, area 4: abort/poison semantics not already
 //! covered.
 //!
 //! `crates/zerodb-core/src/rwtxn.rs`'s own `#[cfg(test)] mod tests` already

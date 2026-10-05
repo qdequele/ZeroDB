@@ -1,11 +1,11 @@
-//! Roadmap #5a — the leaf-skipping `clear` (SPEC 02 §6.1, LMDB `mdb_drop0`)
+//! The leaf-skipping `clear` (SPEC 02 §6.1, LMDB `mdb_drop0`)
 //! frees the lowest branch level's children WITHOUT reading them, so its
 //! bound check is the only thing between a crafted branch pointer and the
 //! free list. A child naming a meta slot (page 0/1), a pgno past the
 //! committed high-water, or the same leaf twice MUST yield the typed
 //! `MdbError::Invalid` (poisoning the txn, freeing nothing) — never feed the
 //! allocator. Crafted images over a heap backing, as `hostile_input.rs` (the
-//! suite also runs under miri). Do not weaken (CLAUDE.md rule 2).
+//! suite also runs under miri). Do not weaken (AGENTS.md rule 2).
 
 use zerodb_core::env::testutil::VecBacking;
 use zerodb_core::env::{open_with_backing, DurabilityFlags, Env};

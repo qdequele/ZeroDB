@@ -1,11 +1,12 @@
 //! `ReservedSpace` — heed's `MDB_RESERVE` write buffer (SPEC 00 row 35). heed
-//! reserves bytes *inside the map*; since PERF-GAP B6 (2026-07-21) the adapter
+//! reserves bytes *inside the map*; since 2026-07-21 the adapter
 //! does the equivalent: `Database::put_reserved` hands the caller a
 //! `ReservedSpace` wrapping the engine's **in-frame slot** (the mutable slice
 //! into the dirty page or overflow-run frame, SPEC 04 TXN-47) — no
 //! intermediate heap buffer, no copy. The slot may carry stale frame bytes
 //! (a COWed page's old cell heap), so the put path zeroes the unwritten tail
-//! after the caller's closure runs, preserving the pre-B6 zero-tail contract.
+//! after the caller's closure runs, preserving the earlier heap buffer's
+//! zero-tail contract.
 //! API-compatible with heed's: `io::Write` + `size`/`remaining`/`written_mut`/
 //! `fill_zeroes`.
 
@@ -19,7 +20,7 @@ pub struct ReservedSpace<'a> {
 }
 
 impl<'a> ReservedSpace<'a> {
-    /// Wrap the reserved slot (since B6: the engine's in-frame slice, whose
+    /// Wrap the reserved slot (the engine's in-frame slice, whose
     /// bytes may be stale until written or [`zero_unwritten_tail`]ed).
     pub(crate) fn new(bytes: &'a mut [u8]) -> ReservedSpace<'a> {
         ReservedSpace {
@@ -29,10 +30,10 @@ impl<'a> ReservedSpace<'a> {
         }
     }
 
-    /// Zero every byte past the written high-water mark (PERF-GAP B6): the
+    /// Zero every byte past the written high-water mark: the
     /// space wraps the engine's in-frame slot, whose bytes are whatever the
     /// (COWed) frame held there — zeroing the tail preserves the adapter's
-    /// shipped contract (the pre-B6 heap buffer was zero-initialized) and
+    /// shipped contract (the earlier heap buffer was zero-initialized) and
     /// keeps stores byte-deterministic.
     pub(crate) fn zero_unwritten_tail(&mut self) {
         self.bytes[self.written..].fill(0);
@@ -72,7 +73,7 @@ impl<'a> ReservedSpace<'a> {
         let len = self.bytes.len();
         let ptr = self.bytes.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>();
         // SAFETY: `MaybeUninit<u8>` has the same layout as `u8`; the slot is a
-        // live `&mut [u8]` (initialized memory — since B6 it is dirty-frame
+        // live `&mut [u8]` (initialized memory — it is dirty-frame
         // bytes, possibly *stale* in value but never uninitialized).
         unsafe { std::slice::from_raw_parts_mut(ptr, len) }
     }
@@ -84,7 +85,7 @@ impl<'a> ReservedSpace<'a> {
     /// The caller guarantees those bytes are initialized (always true here —
     /// the slot is a live `&mut [u8]`, so every byte is initialized memory;
     /// "written" only moves the high-water mark used by `remaining`/
-    /// `written_mut` and the B6 zero-tail).
+    /// `written_mut` and the zero-tail).
     #[inline]
     pub unsafe fn assume_written(&mut self, len: usize) {
         debug_assert!(len <= self.bytes.len());

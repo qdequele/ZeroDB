@@ -74,7 +74,7 @@ struct View {
     world: World,
     /// Whether this write txn dirtied any page (mirrors the engine's
     /// unchanged-commit skip: `commit()` bumps the txnid iff the dirty set is
-    /// non-empty — SPEC 04 §9 / M1.4). Set on: successful put (any, even
+    /// non-empty — SPEC 04 §9). Set on: successful put (any, even
     /// same-value — COW dirties), `del` that removed, any `clear` (the record
     /// dirties even when the db is already empty — probed), create of a new
     /// db, drop of an existing db.

@@ -16,11 +16,11 @@ picks were falsified during the July 2026 campaign.
 
 Every claim is cited. LMDB side: the vendored fork (`lmdb-master-sys 0.2.6`,
 `liblmdb/mdb.c` — the tree the oracle links; reading it for techniques is
-permitted by CLAUDE.md rule 4, nothing is transliterated). ZeroDB side:
+permitted by AGENTS.md rule 4, nothing is transliterated). ZeroDB side:
 file:line in this repo at the time of writing — those line numbers have
 drifted since; search by the function name.
 
-**Unsafe policy note.** CLAUDE.md already sanctions unsafe in
+**Unsafe policy note.** AGENTS.md already sanctions unsafe in
 `zerodb-core::page` and `zerodb-io` ("mmap access and page casting") and
 prescribes the mechanism ("explicit offsets + `read_unaligned`"). Items marked
 *unsafe (sanctioned)* were permitted but not taken when this was written —
@@ -623,8 +623,8 @@ Bench server (x86-64, 4 KiB, turbo off), `perf trace -s` over 3 s of
 `env/txn/rw_empty_commit`: ZeroDB **1,401,099 → 31** `futex` calls (LMDB: 31
 in the same binary). 5 interleaved rounds: 456 → 168 µs, **5.93× → 2.19×** vs
 LMDB, every round 436–460 → 163–174 µs. `bench-ab` itself returned `invalid`
-(LMDB drift 1.032 against a 0.03 limit), and Quentin approved the keep on the
-deterministic count (chat, 2026-09-25). `commit/batch/*` and
+(LMDB drift 1.032 against a 0.03 limit), and the maintainer approved the keep
+on the deterministic count (2026-09-25). `commit/batch/*` and
 `env/txn/ro_begin_abort` flat. The remaining 2.19× on this rung is the rest
 of ZeroDB's begin/commit path (`write_txn`, `RwTxn` drop glue,
 `SnapshotCell::clone_snapshot` in the profile).

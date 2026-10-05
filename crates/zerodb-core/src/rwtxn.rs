@@ -1,5 +1,5 @@
 //! The write transaction: single-writer `RwTxn`, COW mutation, and the commit
-//! pipeline (SPEC 04 §2/§6/§8/§9, SPEC 03 §5–§10, ADR-0004). Milestone 1.4.
+//! pipeline (SPEC 04 §2/§6/§8/§9, SPEC 03 §5–§10, ADR-0004).
 //!
 //! ## Shape (ADR-0004 D2)
 //!
@@ -17,7 +17,7 @@
 //! First touch copies a committed page into a fresh frame under a **new** pgno
 //! and rewrites the parent chain top-down (§5.1/§5.3). Allocation follows
 //! GC-16: the loose-page list (GC-7/8) for single pages, then a GC-DB draw
-//! ([`RwTxn::gc_reclaim`], gated by the oldest live reader — the M1.8
+//! ([`RwTxn::gc_reclaim`], gated by the oldest live reader — the
 //! lock-free reader-table scan, SPEC 04 TXN-20/21, cached per txn per
 //! TXN-22), then file extend
 //! (`next_pgno`, GC-15) with the GC-17 `MapFull` bound. Draws are recorded in
@@ -230,7 +230,7 @@ type Path = Vec<(u64, usize)>;
 /// smallest spill.
 const SPILL_NEED: u64 = 64;
 
-/// One tree's **rightmost-leaf finger** (SPEC 03 §6.6, roadmap #6): the full
+/// One tree's **rightmost-leaf finger** (SPEC 03 §6.6): the full
 /// root-to-rightmost-leaf descent path as of the tree's last end-of-tree
 /// insert. Every branch frame's `ki` is that page's `num_keys - 1` (the right
 /// spine); the leaf frame's `ki` is the slot of the establishing insert and is
@@ -299,20 +299,20 @@ const BRANCH_NODE_HEADER: usize = 10;
 /// Which B+tree a mutation targets (ADR-0005 D1). The GC (free) DB is an
 /// ordinary tree of `P_LEAF`/`P_BRANCH` pages (SPEC 02 §7), so it is mutated
 /// by exactly the same split/merge/COW code as the main tree — this selector
-/// is the only difference, and it is the seam M1.6's named-DB catalog extends.
+/// is the only difference, and it is the seam the named-DB catalog extends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TreeId {
     /// The main (unnamed) database — also the named-DB catalog (SPEC 02 §6).
     Main,
     /// The free (GC) database, `BE(txnid) → PIL` (SPEC 05 §1).
     Free,
-    /// A named database, addressed by its env-level dbi index (M1.6). Its
+    /// A named database, addressed by its env-level dbi index. Its
     /// working record lives in [`RwTxn::open`], loaded from the catalog on
     /// first touch and written back at commit (SPEC 04 TXN-10).
     Named(u32),
 }
 
-/// A named DB's per-txn working state (M1.6): the loaded/mutated `DBRecord`
+/// A named DB's per-txn working state: the loaded/mutated `DBRecord`
 /// plus its catalog name, kept in [`RwTxn::open`]. `dirty` marks that the
 /// record changed and must be written back into the main catalog at commit
 /// (SPEC 02 §6, before `freelist_save` — the LMDB sub-DB flush order).
@@ -395,7 +395,7 @@ enum AllocMode {
 /// that breaks the fixed point should be a loud panic, not a hang.
 const FREELIST_SAVE_MAX_ITERS: usize = 64;
 
-/// Put flags (SPEC 01 Table 3 subset in M1.4 scope). Hand-rolled bitset like
+/// Put flags (SPEC 01 Table 3 subset). Hand-rolled bitset like
 /// [`crate::env::Env`]'s flags — no `bitflags` dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PutFlags(u32);
@@ -444,8 +444,8 @@ impl ValSrc<'_> {
 enum ReserveLoc {
     /// Inline in the leaf. `at` carries the settled `(leaf pgno, cell index)`
     /// when the insert path can prove it final — every no-split arm, where
-    /// the receiving leaf and slot are in scope (PERF-GAP B6 residual /
-    /// issue #10: this makes the common `put_reserved` single-descent).
+    /// the receiving leaf and slot are in scope (issue #10: this makes
+    /// the common `put_reserved` single-descent).
     /// `None` (a split moved cells) falls back to a key search.
     Inline { at: Option<(u64, usize)> },
     /// On the overflow run headed at this pgno.
@@ -466,12 +466,12 @@ struct OwnedLeafCell {
     key: Vec<u8>,
     val: OwnedVal,
     /// Non-`F_BIGDATA` leaf-node flags to preserve across a rewrite (only
-    /// `F_SUBDATA` in Phase 1).
+    /// `F_SUBDATA` today).
     flags: u16,
 }
 
-/// A leaf split's new-cell payload, **borrowed** from the caller (PERF-GAP
-/// B2): `split_leaf` packs it straight into the target frame without ever
+/// A leaf split's new-cell payload, **borrowed** from the caller:
+/// `split_leaf` packs it straight into the target frame without ever
 /// materializing an owned cell.
 enum NewLeafVal<'v> {
     /// A plain inline value.
@@ -497,7 +497,7 @@ impl NewLeafVal<'_> {
 }
 
 /// §6.4 `used` term of existing cell `i` of a leaf view (borrowed twin of
-/// [`OwnedLeafCell::used`]; PERF-GAP B2).
+/// [`OwnedLeafCell::used`]).
 fn leaf_cell_used(leaf: &LeafRef<'_>, i: usize) -> usize {
     let varea = match leaf.value(i) {
         LeafValue::Inline(v) => v.len(),
@@ -600,7 +600,7 @@ pub struct RwTxn<'env> {
     txnid: u64,
     psize: u32,
     dirty: DirtyStore<'env>,
-    /// Map-sourced pages fully validated this txn (PERF-GAP A2). Sound for a
+    /// Map-sourced pages fully validated this txn. Sound for a
     /// writer because a map page's bytes can change during the txn only at
     /// pgnos this txn has **dirtied** — never at all in the default mode
     /// (mutations are buffered until commit C2, TXN-45a), and only at the
@@ -658,7 +658,7 @@ pub struct RwTxn<'env> {
     /// Working roots/stats (TXN-56); written to the meta at commit.
     main_db: DBRecord,
     free_db: DBRecord,
-    /// Per-txn named-DB working records (the dbi table's txn half; M1.6),
+    /// Per-txn named-DB working records (the dbi table's txn half),
     /// indexed by dbi. Loaded lazily from the catalog on first touch;
     /// `dirty` entries are written back to the main tree at commit before
     /// `freelist_save` ([`RwTxn::flush_catalog`]). Dropped-this-txn entries are
@@ -669,8 +669,8 @@ pub struct RwTxn<'env> {
     /// allocates. LMDB's cursor stack is likewise allocated once and reused;
     /// a fresh `Vec` per op cost an allocation, its growth and a free.
     path_buf: Path,
-    /// Rightmost-leaf fingers, at most one per tree (SPEC 03 §6.6, roadmap
-    /// #6): the cached right-spine descent a sequential/APPEND put re-uses
+    /// Rightmost-leaf fingers, at most one per tree (SPEC 03 §6.6):
+    /// the cached right-spine descent a sequential/APPEND put re-uses
     /// instead of descending. Writer-private — reads and nested read children
     /// never consult it (they descend from the records as always). Dropped by
     /// every structural or ownership change of its pages: any put miss, every
@@ -708,7 +708,7 @@ pub struct RwTxn<'env> {
     /// write txn"). The debug shadow check re-scans fresh at every draw.
     oldest_cache: Option<u64>,
     /// Live nested read children (SPEC 04 TXN-31, ADR-0007 D3). Checked by
-    /// [`RwTxn::guard_ok`] on every mutating entry (TXN-29, D-005) and at
+    /// [`RwTxn::guard_ok`] on every mutating entry (TXN-29) and at
     /// commit C0 (TXN-33); bumped/released by
     /// [`crate::nested::NestedRoTxn`].
     ///
@@ -733,7 +733,7 @@ impl Env {
     /// (SPEC 06 REC-13).
     pub fn write_txn(&self) -> Result<RwTxn<'_>> {
         let inner = self.inner();
-        // TXN-8 / SPEC 01 Table 1 (M1.10): a write txn on a read-only env is
+        // TXN-8 / SPEC 01 Table 1: a write txn on a read-only env is
         // `EACCES` (the fork's `mdb_txn_begin` returns `EACCES` when
         // `me_flags & MDB_RDONLY`). Checked before the write mutex is taken —
         // an RDONLY env never has a writer.
@@ -759,7 +759,7 @@ impl Env {
         let backing = inner.backing_ref();
         let in_map = inner.durability().write_map && backing.dirty_in_map();
         // Seed the dirty store's spare list with the frames recycled from
-        // earlier write txns (LMDB's `me_dpages`, PERF-GAP B12); they came
+        // earlier write txns (LMDB's `me_dpages`); they came
         // with the writer slot, so this takes no lock.
         let spare = guard.take_frames();
         let dirty = if in_map {
@@ -859,9 +859,9 @@ impl Env {
         Ok(Database::from_sel(DbSel::Named(dbi)))
     }
 
-    /// `create_database` with a **custom key comparator** (**milestone 2.4**;
-    /// LMDB's `mdb_dbi_open` + `MDB_CREATE` followed by `mdb_set_compare`,
-    /// which heed does not expose at all — SPEC 00 second table, D-004).
+    /// `create_database` with a **custom key comparator** (LMDB's
+    /// `mdb_dbi_open` + `MDB_CREATE` followed by `mdb_set_compare`,
+    /// which heed does not expose at all — SPEC 00 second table).
     ///
     /// The comparator is registered for this database on the environment and
     /// governs every subsequent search, insert, split, range bound, neighbor
@@ -875,7 +875,7 @@ impl Env {
     /// returns wrong answers and, once written to, is permanently corrupt.
     /// LMDB has the identical hazard; ZeroDB cannot do better without an
     /// on-disk format change (`DBRecord` is full — see [`crate::cmp`] and
-    /// D-014). Treat the comparator as part of your schema.
+    /// docs/DIVERGENCES.md). Treat the comparator as part of your schema.
     ///
     /// # Errors
     ///
@@ -898,10 +898,11 @@ impl Env {
     }
 
     /// Register `cmp` for `db` on `env`, mapping [`crate::cmp::ComparatorError`]
-    /// into the public taxonomy (**M2.4**).
+    /// into the public taxonomy.
     ///
     /// `Io(InvalidInput)` is the error kind ZeroDB already uses for open-time
-    /// argument rejection (cf. D-006 / D-010 / the 2.6 `page_size` selector);
+    /// argument rejection (cf. the `map_size` and `max_readers(0)` entries in
+    /// docs/DIVERGENCES.md, and the `page_size` selector);
     /// LMDB has no error to mirror here because `mdb_set_compare` simply returns
     /// `EINVAL` for a bad dbi and otherwise cannot fail.
     pub(crate) fn register_comparator_on(
@@ -1031,7 +1032,7 @@ impl<'env> RwTxn<'env> {
     /// resume — works as with the fork. While any child is alive this txn
     /// cannot mutate, commit, or abort: the child's shared borrow enforces it
     /// at compile time (TXN-30), and every mutating op additionally refuses
-    /// with [`MdbError::BadTxn`] at runtime (TXN-29, D-005). The writer
+    /// with [`MdbError::BadTxn`] at runtime (TXN-29). The writer
     /// resumes implicitly when the last child drops.
     ///
     /// # Errors
@@ -1045,7 +1046,7 @@ impl<'env> RwTxn<'env> {
         Ok(NestedRoTxn::open(self))
     }
 
-    /// The live-child counter (M1.9, ADR-0007 D3) — for `crate::nested` only.
+    /// The live-child counter (ADR-0007 D3) — for `crate::nested` only.
     pub(crate) fn children(&self) -> &ChildCounter {
         &self.children
     }
@@ -1056,7 +1057,7 @@ impl<'env> RwTxn<'env> {
         if self.errored {
             return Err(Error::Mdb(MdbError::BadTxn));
         }
-        // TXN-29 (D-005, ADR-0007 Q4): while any nested read child is live,
+        // TXN-29 (ADR-0007 Q4): while any nested read child is live,
         // the dirty set is frozen — every mutating entry funnels through here
         // and refuses with BadTxn (LMDB `MDB_BAD_TXN` = "transaction … has a
         // child") in BOTH debug and release. Normally unreachable (the child
@@ -1072,7 +1073,7 @@ impl<'env> RwTxn<'env> {
 
     /// The working `DBRecord` of `tree` (ADR-0005 D1 selector). A named tree's
     /// record must have been loaded by [`RwTxn::ensure_open`] first.
-    /// The key ordering of `tree` (**M2.4**, SPEC 03 §2.0).
+    /// The key ordering of `tree` (SPEC 03 §2.0).
     ///
     /// `Main` and `Free` are memcmp **unconditionally**: `Main` doubles as the
     /// named-DB catalog and `Free` is keyed by big-endian txnids whose memcmp
@@ -1179,7 +1180,7 @@ impl<'env> RwTxn<'env> {
     }
 
     fn load(&self, pgno: u64) -> Result<PageRef<'_>> {
-        // Trusted-psize load (PERF-GAP A4): psize is env-validated at open.
+        // Trusted-psize load: psize is env-validated at open.
         PageRef::new_trusted_psize(
             self.source()
                 .bytes_from(self.psize, pgno)
@@ -1296,7 +1297,7 @@ impl<'env> RwTxn<'env> {
     /// [`RwTxn::allocate`]). A loose run that abuts `next_pgno` may be
     /// completed by extension. Returns the run's head pgno.
     // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
-    // arms stay separate so their size never moves it (PERF-GAP B13).
+    // arms stay separate so their size never moves it (inlining budget).
     #[inline(never)]
     fn loose_run(&mut self, n: u64) -> Option<u64> {
         debug_assert!(self.alloc_mode == AllocMode::GcSave);
@@ -1344,7 +1345,7 @@ impl<'env> RwTxn<'env> {
     /// any reader that pins *after* that pins the published snapshot
     /// `≥ writer_txnid − 1 ≥ F`, from whose trees these pages are absent.
     // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
-    // arms stay separate so their size never moves it (PERF-GAP B13).
+    // arms stay separate so their size never moves it (inlining budget).
     #[inline(never)]
     fn save_pool_draw(&mut self, n: u64) -> Option<u64> {
         debug_assert!(self.alloc_mode == AllocMode::GcSave);
@@ -1356,7 +1357,7 @@ impl<'env> RwTxn<'env> {
             }
         }
         let (f, start) = hit?;
-        // M1.8 shadow check: gate compliance is inherited (doc above), but a
+        // Reader-table shadow check: gate compliance is inherited (doc above), but a
         // fresh table re-scan re-proves it at the hand-out moment.
         #[cfg(debug_assertions)]
         self.debug_assert_gate(f);
@@ -1383,7 +1384,7 @@ impl<'env> RwTxn<'env> {
     /// (GC-30 — the step-(c) placement re-reads `annex.live()` after every
     /// tree write, so an in-save draw is always re-accounted).
     // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
-    // arms stay separate so their size never moves it (PERF-GAP B13).
+    // arms stay separate so their size never moves it (inlining budget).
     #[inline(never)]
     fn annex_draw(&mut self, n: u64) -> Option<u64> {
         if self.annex.len() == 0 {
@@ -1394,7 +1395,7 @@ impl<'env> RwTxn<'env> {
             return None; // GC-31 gate: a reader is pinned below the base.
         }
         let start = find_run(self.annex.live(), n)?;
-        // M1.8 shadow check, as in every other draw arm.
+        // Reader-table shadow check, as in every other draw arm.
         #[cfg(debug_assertions)]
         self.debug_assert_gate(f);
         self.annex.take_run(start, n);
@@ -1407,7 +1408,7 @@ impl<'env> RwTxn<'env> {
 
     /// The GC reuse gate (SPEC 05 GC-18, SPEC 04 TXN-20/21): `min(smallest
     /// live reader snapshot txnid, writer_txnid − 1)`. The reader term is the
-    /// M1.8 lock-free reader-table SeqCst scan
+    /// lock-free reader-table SeqCst scan
     /// ([`crate::env::EnvInner::oldest_live_reader`]); this is its only
     /// consumer. Cached per write txn (TXN-22; ADR-0006 decision 6): the
     /// first draw scans, later draws reuse — always sound because a stale
@@ -1427,7 +1428,7 @@ impl<'env> RwTxn<'env> {
         o
     }
 
-    /// M1.8 debug shadow tracking (PLAN §1.8 acceptance: "GC never reclaims a
+    /// Debug shadow tracking (a reader-table acceptance requirement: "GC never reclaims a
     /// page a live reader can reach — assert via shadow tracking in debug
     /// builds"): at the moment pages from GC entry `F` are handed out,
     /// re-scan the reader table **fresh** (SeqCst, not the per-txn cache) and
@@ -1469,7 +1470,7 @@ impl<'env> RwTxn<'env> {
     /// `n > 1` — GC-15/21), record the drain in `self.drains` (the tree entry
     /// itself is rewritten only at C1, GC-20) and return the head pgno.
     // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
-    // arms stay separate so their size never moves it (PERF-GAP B13).
+    // arms stay separate so their size never moves it (inlining budget).
     #[inline(never)]
     fn gc_reclaim(&mut self, n: u64) -> Result<Option<u64>> {
         debug_assert!(
@@ -1536,7 +1537,7 @@ impl<'env> RwTxn<'env> {
         let Some(Pick { f, fresh, start }) = pick else {
             return Ok(None);
         };
-        // M1.8 shadow check: re-scan the live reader table at the hand-out
+        // Reader-table shadow check: re-scan the live reader table at the hand-out
         // moment (fresh, not the per-txn cache) — see `debug_assert_gate`.
         #[cfg(debug_assertions)]
         self.debug_assert_gate(f);
@@ -1677,7 +1678,7 @@ impl<'env> RwTxn<'env> {
     }
 
     /// Write the frames at `pgnos` (ascending) with the commit's page writer:
-    /// consecutive frames go out as one vectored write (PERF-GAP B4) — a frame
+    /// consecutive frames go out as one vectored write — a frame
     /// at `pgno` covering `n` pages (an overflow run) makes the run
     /// contiguous iff the next frame starts at `pgno + n`. Used by commit C2
     /// and by spilling (SPEC 04 TXN-69). Not yet durable.
@@ -1887,7 +1888,7 @@ impl<'env> RwTxn<'env> {
         let mut pgno = rec.root;
         let valid = Some(&self.validated);
         for _ in 0..=rec.depth {
-            // One source resolution per level (PERF-GAP issue #9); a non-tree
+            // One source resolution per level (issue #9); a non-tree
             // page type maps through `corrupt` to the same `Invalid` the old
             // two-step dispatch returned.
             match node_view(self.source(), self.psize, pgno, valid).map_err(corrupt)? {
@@ -1932,7 +1933,7 @@ impl<'env> RwTxn<'env> {
                         return Err(Error::Mdb(MdbError::Invalid));
                     }
                     path.push((pgno, n - 1));
-                    // M2.4: "strictly greater than the last key" is decided by
+                    // Custom comparators: "strictly greater than the last key" is decided by
                     // the target tree's ordering, not memcmp — otherwise
                     // APPEND on a custom-comparator DB would reject exactly
                     // the keys it should accept.
@@ -1980,7 +1981,7 @@ impl<'env> RwTxn<'env> {
         Ok(())
     }
 
-    // -- rightmost-leaf finger (SPEC 03 §6.6, roadmap #6) ----------------------
+    // -- rightmost-leaf finger (SPEC 03 §6.6) ----------------------------------
 
     /// Index of `tree`'s finger in the table, if one is live.
     fn finger_pos(&self, tree: TreeId) -> Option<usize> {
@@ -2201,7 +2202,7 @@ impl<'env> RwTxn<'env> {
     /// ADR-0015): `Some(result)` when the put took the fast path, `None` on a
     /// miss (the finger is dropped and the caller runs the normal path, whose
     /// descent re-establishes it). Out of line so that trees with the setting
-    /// off keep the put path's previous shape (PERF-GAP B13: the hot path
+    /// off keep the put path's previous shape (the hot path
     /// sits at LLVM's inlining threshold).
     #[inline(never)]
     fn put_finger(
@@ -2692,8 +2693,8 @@ impl<'env> RwTxn<'env> {
     /// keep the left half in the existing (dirty) frame, put the right half on
     /// a fresh page, and rise the right page's first key into the parent.
     ///
-    /// **End-of-page insert-point rule** (§6.4, ratified — Quentin,
-    /// 2026-07-16, standing directive): when the new cell lands at the end of
+    /// **End-of-page insert-point rule** (§6.4, ratified by the maintainer,
+    /// 2026-07-16): when the new cell lands at the end of
     /// the page (`newindx == nkeys`, i.e. `newindx == cells.len() - 1` after
     /// insertion) the split forces `s = nkeys` — ALL existing cells stay on the
     /// left (dirty) frame, the new cell alone starts the right page. This is
@@ -2725,7 +2726,7 @@ impl<'env> RwTxn<'env> {
         // `append` implies an end insert; the general `newindx == n_old` case
         // covers plain puts that land at the end too (ratified end-of-page
         // insert-point rule, §6.4): the new cell ALONE forms the right page.
-        // B2 fast path: the left (dirty) frame is byte-identical to the
+        // Fast path: the left (dirty) frame is byte-identical to the
         // pre-split page, so it is not touched at all — no extraction, no
         // rewrite, no per-cell allocation.
         if append || newindx == n_old {
@@ -2758,7 +2759,7 @@ impl<'env> RwTxn<'env> {
         // General split: pack both frames from cells **borrowed** out of the
         // old frame — removed from the store as an owned, address-stable
         // `Box` — plus the caller's new cell. No `OwnedLeafCell`
-        // materialization (PERF-GAP B2).
+        // materialization.
         let rpg = self.allocate(1)?;
         let old = self.dirty.remove(lpg).expect("leaf is dirty");
         let oldleaf = LeafRef::new_prevalidated(&old, psize).map_err(corrupt)?;
@@ -2795,7 +2796,7 @@ impl<'env> RwTxn<'env> {
     }
 
     /// Pack post-insert items `[from, to)` into a fresh frame at `pgno`
-    /// (PERF-GAP B2): item `j` is the caller's new cell when `j == newindx`,
+    /// (no owned-cell materialization): item `j` is the caller's new cell when `j == newindx`,
     /// else old cell `j`/`j-1` borrowed from `old`. The frame is
     /// zero-initialized by `insert_tree_frame`, so `ZeroReserve` regions are
     /// zero-filled without a scratch buffer (TXN-47).
@@ -3231,7 +3232,7 @@ impl<'env> RwTxn<'env> {
     /// `(is_leaf, num_keys, used_bytes)` of the dirty page at `pgno`.
     fn page_stats(&self, pgno: u64) -> Result<(bool, usize, usize)> {
         let frame = self.dirty.bytes(pgno).expect("page is dirty");
-        // A dirty frame is engine-authored (batch 3, see `btree::leaf_view`):
+        // A dirty frame is engine-authored (trusted, see `btree::leaf_view`):
         // O(1) structural checks only.
         let page = PageRef::new_trusted_psize(frame, self.psize).map_err(corrupt)?;
         let body = body_size(self.psize);
@@ -3537,7 +3538,7 @@ impl<'env> RwTxn<'env> {
                 // Remove at explicit, unshifted indices, HIGHEST FIRST: after
                 // `remove(0)` the real-keyed old node 1 would shift into
                 // index 0, where the node-0 sentinel rule (empty separator,
-                // SPEC 02 §4.1) rejects its key — the M1.4 coverage-pass bug
+                // SPEC 02 §4.1) rejects its key — a bug found by write-path test coverage
                 // (repeated `remove(0)`). So: drop old node 1 first (its child
                 // is re-inserted as the new sentinel), then the old node 0
                 // sentinel, then install the new sentinel.
@@ -3732,7 +3733,7 @@ impl<'env> RwTxn<'env> {
                 self.free_page(p);
             }
         }
-        // Reset to empty (persistent flags stay 0 in Phase 1). `record_mut`
+        // Reset to empty (persistent flags are always 0 today). `record_mut`
         // marks a named record dirty for the commit write-back.
         *self.record_mut(tree) = DBRecord::empty();
         Ok(())
@@ -4288,7 +4289,7 @@ impl<'env> RwTxn<'env> {
     fn commit_pipeline(&mut self) -> Result<()> {
         let inner = self.env.inner();
         let psize = self.psize;
-        // Durability lattice (SPEC 01 §S6, SPEC 06 REC-9; M1.10). `NO_SYNC` skips
+        // Durability lattice (SPEC 01 §S6, SPEC 06 REC-9). `NO_SYNC` skips
         // both barriers (C3+C5); `NO_META_SYNC` skips only the meta barrier (C5).
         // `MAP_ASYNC` (WRITE_MAP only) turns the barriers that *do* run into
         // `msync(MS_ASYNC)` — the backing honors `async_flush`, the core only
@@ -4299,7 +4300,7 @@ impl<'env> RwTxn<'env> {
         let async_flush = durability.map_async;
 
         // ----- C0 was checked in `commit()` (TXN-33: `children.live() == 0`,
-        // M1.9/ADR-0007 D4); the freed-page list is already accumulated
+        // ADR-0007 D4); the freed-page list is already accumulated
         // (GC-6). -----
 
         // ----- C1a: flush dirty named-DB records into the main catalog
@@ -4441,7 +4442,7 @@ impl<'env> RwTxn<'env> {
 impl Drop for RwTxn<'_> {
     fn drop(&mut self) {
         // Reclaim up to `SPARE_CAP` one-page frames into the writer slot's pool for
-        // the next write txn (LMDB's `me_dpages` reuse, PERF-GAP B12). This runs
+        // the next write txn (LMDB's `me_dpages` reuse). This runs
         // on every end-of-txn path — commit success, commit failure, and abort
         // (which is `drop(self)`) — and is safe on all of them:
         //   * The commit pipeline has fully returned before this drop begins, so
@@ -4685,7 +4686,7 @@ impl Database {
 }
 
 // ---------------------------------------------------------------------------
-// RwCursor — the mutable cursor (SPEC 03 §7, ADR-0004 D5; PERF-GAP B1)
+// RwCursor — the mutable cursor (SPEC 03 §7, ADR-0004 D5)
 // ---------------------------------------------------------------------------
 
 /// The write cursor's **semantic** position, used only when no parked stack
@@ -4720,7 +4721,7 @@ enum Step<'k> {
 /// most one cursor exists across any mutation** — cursor fix-up therefore
 /// reduces to this cursor's own position (ADR-0004 D5).
 ///
-/// **PERF-GAP B1 (2026-07-21):** between mutations the cursor persists its
+/// **Stack persistence (2026-07-21):** between mutations the cursor persists its
 /// root-to-leaf path as a parked [`SavedCursor`], so an advance is an O(1)
 /// amortized stack step (LMDB's `mc_pg[]`/`mc_ki[]` walk), not a fresh
 /// O(log n) descent; entries are yielded as **borrows** of the txn's frames
@@ -4728,13 +4729,14 @@ enum Step<'k> {
 /// in-place mutations safe at compile time). A mutation drops the parked path
 /// and records the key (`CurPos`); the next advance re-seeks once — LMDB
 /// avoids that seek with in-place fix-up, a difference that costs one descent
-/// per mutation and is recorded in `docs/PERF-GAP-VS-LMDB.md` (B1 residual).
+/// per mutation and is recorded in `docs/PERF-GAP-VS-LMDB.md` (`RwCursor`
+/// re-seek item, residual).
 /// The exclusivity argument is what makes `SavedCursor::resume`'s
 /// same-tree-state contract hold: no mutation can happen while a parked stack
 /// exists, because every mutating method of this cursor clears it.
 pub struct RwCursor<'t, 'env> {
     txn: &'t mut RwTxn<'env>,
-    /// Which database this cursor iterates/mutates (M1.6).
+    /// Which database this cursor iterates/mutates.
     sel: DbSel,
     /// Semantic fallback position (authoritative only when `saved` is `None`).
     pos: CurPos,
@@ -4762,7 +4764,7 @@ impl RwCursor<'_, '_> {
     fn drive(&mut self, op: Step<'_>) -> Result<Option<(&[u8], &[u8])>> {
         // A post-delete parked path names the vacated slot, which only `next`
         // knows how to read (it settles there rather than stepping). Every
-        // other op re-derives from `pos`, which is the pre-B8a behaviour
+        // other op re-derives from `pos`, which is the original behaviour
         // (SPEC 03 §5.4a: discarding is always a correct repair).
         let settle = self.on_vacated_slot && matches!(op, Step::Next);
         if self.on_vacated_slot && !settle {
@@ -5012,7 +5014,7 @@ impl RwCursor<'_, '_> {
             return Ok(existed);
         };
         // The parked path IS the live root-to-leaf path to this entry, so the
-        // delete needs no descent of its own (SPEC 03 §5.4a; PERF-GAP B8a).
+        // delete needs no descent of its own (SPEC 03 §5.4a).
         debug_assert!(
             saved.entry_pos().is_some(),
             "current_key returned Some, so the parked cursor is on an entry"
@@ -5026,7 +5028,7 @@ impl RwCursor<'_, '_> {
                 // not follow (left pairing, an ancestor split, an emptied
                 // tree): the parked path may name the wrong page or depth.
                 // Discard it — the next op re-seeks from `pos`, which is the
-                // pre-B8a behaviour and always a correct repair (§5.4a).
+                // original behaviour and always a correct repair (§5.4a).
                 self.saved = None;
             }
             fate => {
@@ -5273,7 +5275,7 @@ mod tests {
         assert_eq!(addr_before, addr_after, "frame moved under the index");
     }
 
-    /// PERF-GAP B1 referee: the stack-carrying write cursor against a
+    /// Write-cursor referee: the stack-carrying write cursor against a
     /// `BTreeMap` model. Deterministic pseudo-random walks (forward and
     /// reverse, each opened by a random seek — the consumer envelope: no
     /// mid-walk direction reversal) with mutations interleaved at yielded
@@ -5722,7 +5724,7 @@ mod tests {
 
     #[test]
     fn named_db_in_txn_create_put_read_clear_drop() {
-        // Exercises the M1.6 named-DB write path under mem_env (miri-clean, no
+        // Exercises the named-DB write path under mem_env (miri-clean, no
         // commit): create → put → read via the catalog-resolved record →
         // clear → drop, plus F_SUBDATA on the catalog entry.
         let env = mem_env(PS, MAP);
@@ -6343,7 +6345,7 @@ mod tests {
         }
     }
 
-    // -- rightmost-leaf finger (SPEC 03 §6.6, roadmap #6) ----------------------
+    // -- rightmost-leaf finger (SPEC 03 §6.6) ----------------------------------
 
     /// Everything visible in `db` through the txn, in key order.
     fn dump_db(db: &Database, txn: &RwTxn<'_>) -> Vec<(Vec<u8>, Vec<u8>)> {

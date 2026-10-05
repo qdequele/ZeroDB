@@ -1,5 +1,5 @@
-//! The [`Engine`] driven **through the `heed-zerodb` adapter** (milestone 1.13,
-//! ADR-0003 accept-criterion 6: "the oracle re-run *through* the adapter shows
+//! The [`Engine`] driven **through the `heed-zerodb` adapter** (ADR-0003
+//! accept-criterion 6: "the oracle re-run *through* the adapter shows
 //! zero divergences"). This is a near-verbatim copy of [`crate::lmdb`] with the
 //! backend import swapped `heed` → `heed_zerodb`, so the *same op driver* runs
 //! over the ZeroDB engine behind the heed surface. Paired against
@@ -17,7 +17,7 @@
 //! transaction lifetimes to `'static` with `mem::transmute` and uphold the
 //! borrows manually. The invariants are stated at each `unsafe` site; the whole
 //! construction is confined to this test-only oracle crate, exactly where the
-//! CLAUDE.md unsafe policy permits FFI-adjacent unsafe.
+//! AGENTS.md unsafe policy permits FFI-adjacent unsafe.
 
 use std::ops::Deref;
 
@@ -105,7 +105,7 @@ pub struct HeedZerodbEngine {
     /// guard fact (see `driver::classify` and `docs/UPSTREAM-BUGS.md`). Set in
     /// `clear_db`, reset at every txn boundary.
     cleared_in_txn: bool,
-    /// The env open mode (M1.10): `WRITE_MAP` / durability flags. Preserved
+    /// The env open mode: `WRITE_MAP` / durability flags. Preserved
     /// across `reopen` so a reopened env keeps the same write mode.
     mode: EngineMode,
     dir: TempDir,
@@ -192,12 +192,12 @@ impl HeedZerodbEngine {
         // Monotonic: never shrink below the current size, so a reopen can never
         // fail by cutting below the live data (models "reopen larger on MapFull").
         // Rounded to a 64 KiB multiple so heed accepts it and both engines agree
-        // on the effective size (DIVERGENCES D-006).
+        // on the effective size (the `map_size` entry in docs/DIVERGENCES.md).
         crate::round_map_size(want.max(self.map_size))
     }
 }
 
-/// The heed env flags for a mode (M1.10, SPEC 01 Table 1). `WithoutTls` is set
+/// The heed env flags for a mode (SPEC 01 Table 1). `WithoutTls` is set
 /// separately via `read_txn_without_tls()` (SPEC 00 rows 2/29); these are the
 /// durability / write-mode bits only.
 fn heed_flags(mode: EngineMode) -> heed_zerodb::EnvFlags {
@@ -227,7 +227,7 @@ fn open_env(
     opts.max_dbs(MAX_DBS);
     let flags = heed_flags(mode);
     // SAFETY: `open`/`flags` are `unsafe` only because LMDB env flags can enable
-    // cross-process behaviors; the flags we set (`WRITE_MAP` + durability, M1.10)
+    // cross-process behaviors; the flags we set (`WRITE_MAP` + durability)
     // are single-process-safe, and the path is a private temp dir used
     // single-threaded by this engine instance.
     unsafe {
@@ -295,7 +295,7 @@ impl Engine for HeedZerodbEngine {
             )));
         }
         // The shared driver is the single authority on op-validity/Skip
-        // (M1.2 hoist). If it says skip, do so without touching the backend; the
+        // (see `driver.rs`). If it says skip, do so without touching the backend; the
         // per-method `db_at`/`write_txn`/`read_source` helpers below only resolve
         // handles from here on (their skip arms are unreachable after this gate).
         if let Some(skip) = crate::driver::classify(
@@ -377,7 +377,7 @@ impl HeedZerodbEngine {
         // guard fact too, exactly as `commit`/`abort`/`begin_rw` do (and as
         // `ZerodbEngine::reopen` does). Without this the two engines' tracked
         // `cleared_in_txn` drift after a reopen-while-cleared, making the shared
-        // `classify` FORK-1 guard fire asymmetrically (found by the M1.3
+        // `classify` FORK-1 guard fire asymmetrically (found by the read-path
         // differential fuzz).
         self.active = Active::None;
         self.cleared_in_txn = false;

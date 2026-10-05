@@ -1,6 +1,6 @@
-//! `migrate-from-lmdb` — stream a real LMDB env into a fresh zerodb env
-//! (M1.12, PLAN §1.12: "the one place linking C is fine"). Behind the
-//! off-by-default `migrate-lmdb` feature (ADR-0001 M1.12 amendment).
+//! `migrate-from-lmdb` — stream a real LMDB env into a fresh zerodb env (the
+//! one place outside the oracle where linking C is accepted). Behind the
+//! off-by-default `migrate-lmdb` feature (ADR-0001 amendment, 2026-07-17).
 //!
 //! Opens the source LMDB env **read-only** via heed =0.22.1 (the Meilisearch
 //! fork), enumerates the main DB and every named sub-DB, and re-writes them into
@@ -72,7 +72,8 @@ pub fn cmd_migrate(
     // enable cross-process behaviors. We set only `READ_ONLY` (single-process
     // safe) and point at an existing on-disk env we open read-only; no pointers
     // are handled here. This is the migrate feature's sole `unsafe` (plus the
-    // flock in `lock.rs`); flagged for the CLAUDE.md unsafe-policy note.
+    // flock in `lock.rs`); listed in the AGENTS.md unsafe policy as in use and
+    // awaiting maintainer review.
     let src = unsafe {
         opts.flags(EnvFlags::READ_ONLY);
         opts.open(src_dir)?

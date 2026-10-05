@@ -299,8 +299,9 @@ after.
 `just bench-gate` runs the same comparison over the whole ladder against the
 merge base with `main`. `just bench-profile <rung> [lmdb]` shows where one
 rung's time goes. `just perf-ledger show` lists every earlier attempt, including
-the reverted ones. `.claude/commands/perf-iterate.md` chains these into the
-agent loop.
+the reverted ones. A performance iteration chains these: pick a rung, profile
+it, change one lever, A/B it against the base, keep or revert, and log the
+result in the ledger.
 
 ## Adding a rung
 

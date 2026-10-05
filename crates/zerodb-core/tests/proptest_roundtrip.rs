@@ -1,5 +1,5 @@
 //! Property-based encode -> decode round-trips for every page/node type
-//! (PLAN §1.1 acceptance). A test-writer pass will extend these.
+//! (the page model's acceptance tests).
 //!
 //! Excluded under Miri: the proptest harness itself reads `current_dir` for
 //! failure persistence, which Miri's isolation blocks (a harness limitation, not
@@ -155,10 +155,9 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// M1.1 test-writer pass additions (items 8-9 of the coverage task): strategies
-// biased toward SPEC 02 boundaries, plus the GC-DB big-endian key codec. These
-// are added alongside the implementer's strategies above, not in place of
-// them.
+// Additional strategies biased toward SPEC 02 boundaries, plus the GC-DB
+// big-endian key codec. These are added alongside the strategies above, not
+// in place of them.
 // ---------------------------------------------------------------------------
 
 proptest! {

@@ -6,7 +6,7 @@
 //! covered `F_BIGDATA` runs freed (and uncovered ones kept), and
 //! `check_image`'s full invariant sweep — INV-22's reachable-XOR-free
 //! partition would expose a leaked or double-freed page. Do not weaken
-//! (CLAUDE.md rule 2).
+//! (AGENTS.md rule 2).
 
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};

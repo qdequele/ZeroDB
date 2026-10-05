@@ -21,7 +21,7 @@
 //! loom model below checks exactly that.
 //!
 //! Stated limit: the cache assumes the file changes only through this
-//! process's commits (D-001). Bytes rewritten underneath the env with a
+//! process's commits (single-process model). Bytes rewritten underneath the env with a
 //! stamp they already carried would be trusted from the cache.
 
 use std::sync::OnceLock;
@@ -36,7 +36,7 @@ pub(crate) const SLOTS: usize = 1 << 16;
 pub(crate) const CHUNK_SLOTS: usize = 1 << 10;
 
 /// Which validated shape an entry vouches for; part of the key, as in the
-/// txn memo (PERF-GAP A8), so a page validated as a leaf never hits as a
+/// txn memo, so a page validated as a leaf never hits as a
 /// branch.
 #[derive(Clone, Copy)]
 pub(crate) enum StampKind {

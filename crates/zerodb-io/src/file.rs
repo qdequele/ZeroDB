@@ -5,7 +5,7 @@
 //! [`std::os::unix::fs::FileExt`] (no cursor movement, no `libc`). `fstat` for
 //! [`real_disk_size`] uses `File::metadata`, and fd duplication uses
 //! `File::try_clone`. The one `unsafe` here is the `pwritev` FFI call behind
-//! the vectored commit write (PERF-GAP B4), SAFETY-commented at the site.
+//! the vectored commit write, SAFETY-commented at the site.
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
@@ -51,7 +51,7 @@ pub fn read_page(file: &File, pgno: u64, psize: u32) -> std::io::Result<Vec<u8>>
 }
 
 /// Write `bytes` starting at page `pgno` (positioned). `bytes` is one page (or
-/// less), or — for an overflow run (M1.4 commit C2) — a whole multiple of
+/// less), or — for an overflow run (commit step C2) — a whole multiple of
 /// `psize` spanning the contiguous run.
 ///
 /// # Errors
@@ -64,7 +64,7 @@ pub fn write_page(file: &File, pgno: u64, psize: u32, bytes: &[u8]) -> std::io::
 }
 
 /// Vectored positioned write of consecutive page-multiple `frames` laid out
-/// back-to-back from `start_pgno * psize` (commit C2 batching, PERF-GAP B4):
+/// back-to-back from `start_pgno * psize` (commit C2 batching):
 /// one `pwritev` per chunk of up to [`MAX_IOV`] frames instead of one syscall
 /// per dirty page.
 ///

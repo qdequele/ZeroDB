@@ -8,7 +8,7 @@
 //! Regression tests for the first-release security review (2026-09):
 //! truncated-file geometry (open validation + the read-side `last_pg` bound),
 //! zero-child branches, hostile GC freelists, hostile tree depths, and the
-//! checker's checked arithmetic. Do not weaken these (CLAUDE.md rule 2).
+//! checker's checked arithmetic. Do not weaken these (AGENTS.md rule 2).
 
 use zerodb_core::check::check_image;
 use zerodb_core::env::testutil::VecBacking;
@@ -520,7 +520,7 @@ fn leaf_remove_on_corrupt_cell_is_typed() {
         leaf.insert_inline(0, b"key", 0, b"value").unwrap();
     }
     // Corrupt the cell's dsize so it runs past the page body. `from_valid`
-    // is O(1) structural checks only (PERF-GAP A8) and is `pub`, so the cell
+    // is O(1) structural checks only and is `pub`, so the cell
     // walk cannot be assumed; pre-fix `remove` hit an `expect` (panic).
     let lower = u16::from_le_bytes([buf[24], buf[25]]) as usize;
     assert_eq!(lower, 2, "one pointer");

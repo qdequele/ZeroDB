@@ -1,4 +1,4 @@
-//! Crash-harness smoke coverage for the normal test suite (M1.11): a small
+//! Crash-harness smoke coverage for the normal test suite: a small
 //! batch of image cuts across all durability modes, one deterministic and one
 //! asynchronous SIGKILL cycle, and determinism of a cut's verification. The
 //! volume runs live in `just crash-test-quick` / `crash-test-full`
@@ -132,13 +132,13 @@ fn regression_nometasync_acked_at_cut_not_at_end() {
 }
 
 /// Regression + characterization pin: the `NO_META_SYNC` reclaim-clobber
-/// window (REC-10 as amended M1.11; SPEC 06 conflict block item 4, human
-/// ratification pending). This seed's cut has `{meta k (un-fsynced), data of
+/// window (REC-10 as amended by the crash harness; SPEC 06 conflict block item
+/// 4, maintainer ratification pending). This seed's cut has `{meta k (un-fsynced), data of
 /// txn k+1}` pending; the `meta-subsector-torn` quota plan persists txn
 /// k+1's data while rejecting meta k, so recovery falls to snapshot k−1
 /// whose pages txn k+1 legally reclaimed (GC-18) — a REAL corruption window
 /// shared with LMDB's `MDB_NOMETASYNC` (libmdbx's steady/weak metas close
-/// it; Phase 3 candidate). The scoped verifier must classify those images as
+/// it; a candidate for later improvement). The scoped verifier must classify those images as
 /// stale fallbacks (window/taxonomy verified, walk/data waived), not as
 /// violations — and must still fully verify every image that recovers to the
 /// newest issued meta.
@@ -147,7 +147,7 @@ fn regression_nometasync_reclaim_clobber_window_is_characterized() {
     // RE-PINNED 2026-09-10 (was 15_797_139_550_980_166_469). The seed selects a
     // cut, but the *ops* come from `Spec::ops_for_round` → `decode_ops` → `Op`'s
     // `Arbitrary`, so adding any variant to `Op` re-shuffles what every seed
-    // decodes to. B8a's `Op::IterMutDelThenWalk` did exactly that and this seed
+    // decodes to. The cursor-delete work's `Op::IterMutDelThenWalk` did exactly that and this seed
     // stopped reaching the window (`gen_spec` kept returning NO_META_SYNC —
     // it never touches `Op` — so the mode guard below could not catch it).
     // The assertions are unchanged; only the vehicle was replaced, by searching
@@ -162,7 +162,7 @@ fn regression_nometasync_reclaim_clobber_window_is_characterized() {
     // fallbacks, NoMetaSync, no violation). The clobber window itself is
     // unchanged by the annex — the reclaimed-page TXN-62/GC-18 reasoning is
     // identical whether the freed list lived in the tree or the meta.
-    // Re-pin accepted by the maintainer (Quentin, 2026-10-05).
+    // Re-pin accepted by the maintainer (2026-10-05).
     const SEED: u64 = 198;
     assert_eq!(
         gen_spec(SEED).mode,

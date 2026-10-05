@@ -364,7 +364,7 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
         )
     };
     for plan in &full_plans {
-        // REC-10 as amended (M1.11 find, seed 15797139550980166469): under
+        // REC-10 as amended (crash-harness find, seed 15797139550980166469): under
         // NO_META_SYNC a plan that persists any in-flight **data** write while
         // the (single) pending meta is lost can legally clobber the fallback
         // snapshot — walk/data are waived for exactly those images (see

@@ -1,4 +1,4 @@
-//! Milestone 1.6 `Database::stat` parity: LMDB fork vs zerodb, driven directly
+//! `Database::stat` parity: LMDB fork vs zerodb, driven directly
 //! against both real APIs (not the fuzzed `Op` enum).
 //!
 //! **Stat-parity scope (documented).** `stat` reports `depth`, `branch_pages`,
@@ -12,7 +12,8 @@
 //!   for the format-independent cases (empty → 0, single leaf → 1) and bounded
 //!   to `±1` elsewhere.
 //! * Page counts (`branch_pages`/`leaf_pages`/`overflow_pages`) are **not**
-//!   compared cross-engine — they are format-specific by construction (D-002).
+//!   compared cross-engine — they are format-specific by construction (ZeroDB
+//!   has its own on-disk format).
 //!   ZeroDB's page counts are verified against a full tree walk by
 //!   `crates/zerodb/tests/named_db.rs` (the `check` invariant walker) instead.
 

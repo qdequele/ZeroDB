@@ -1,15 +1,15 @@
 //! B+tree read path — search, `get`, and the full cursor state machine
-//! ([SPEC 03](../../../../docs/SPEC/03-btree.md) §2–§4). Milestones 1.3/1.4.
+//! ([SPEC 03](../../../../docs/SPEC/03-btree.md) §2–§4).
 //!
 //! Everything here operates over a [`Source`] — either the immutable mapped
-//! env file (`Source::Map`, the M1.3 read path) or a write txn's view
+//! env file (`Source::Map`, the read-txn path) or a write txn's view
 //! (`Source::Writer`: the dirty-page store first, the map for untouched pages
 //! — SPEC 04 TXN-38, ADR-0004 D2). Reads are **zero-copy**: keys and values
 //! are `&'a [u8]` borrowed straight from the backing bytes (SPEC 04 TXN-37/41),
 //! and a `F_BIGDATA` value resolves to one contiguous slice spanning its
 //! overflow run (SPEC 03 §3; a dirty run is one contiguous frame, TXN-41).
 //! This module contains **no** `unsafe` (the crate is `#![deny(unsafe_code)]`,
-//! opened only in `page::raw` — PERF-GAP A3)
+//! opened only in `page::raw` for the unchecked field readers)
 //! and no I/O — it is pure logic over borrowed bytes, so `miri` exercises it.
 //!
 //! The cursor is a root-to-leaf path (`stack` of `(pgno, ki)` frames) plus the
@@ -45,8 +45,8 @@ pub type PosResult<'a> = Result<Option<Entry<'a>>, PageError>;
 /// view, which resolves the **dirty-page store first** and falls back to the
 /// map for pages the txn has not touched. A caller cannot tell which backing a
 /// borrow came from; the lifetime rules are identical (SPEC 04 §6.2). This is
-/// also the M1.9 seam (a nested reader is the writer's source, read-only) and
-/// the M1.10 seam (WRITE_MAP swaps the backing, TXN-46).
+/// also the nested-read-txn seam (a nested reader is the writer's source,
+/// read-only) and the WRITE_MAP seam (WRITE_MAP swaps the backing, TXN-46).
 #[derive(Clone, Copy)]
 pub enum Source<'a> {
     /// The read-only mapped env file.
@@ -106,7 +106,7 @@ impl<'a> Source<'a> {
     /// every spill resets that writer's memo (TXN-71), so no memo entry
     /// outlives the bytes it vouched for. Dirty frames mutate mid-txn and
     /// must never be trusted from a memo.
-    // Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+    // Forced: LLVM inlines this only at -inline-threshold=1000.
     #[inline(always)]
     pub(crate) fn bytes_from_classified(
         &self,
@@ -163,7 +163,7 @@ const MEMO_LEVELS: usize = 7;
 /// Slots in level 0 (8 KiB) — sized so short txns allocate once and small.
 const MEMO_BASE_SLOTS: usize = 1024;
 
-/// Which validated shape a memo entry vouches for (PERF-GAP A8). The kind is
+/// Which validated shape a memo entry vouches for (kind-tagged memo). The kind is
 /// part of the memo **key**, so a hit can hand out a fully *trusted* typed
 /// view (`new_trusted`, zero checks) while a pgno validated as one kind can
 /// never be trusted as the other — the mismatched lookup simply misses and
@@ -175,7 +175,8 @@ pub(crate) enum PageKind {
 }
 
 /// Txn-scoped memo of pages whose **cells** have already passed full
-/// validation this txn (docs/PERF-GAP-VS-LMDB.md A2; lock-free since A7).
+/// validation this txn (docs/PERF-GAP-VS-LMDB.md, eager page validation;
+/// lock-free since the memo-probe rework).
 ///
 /// `LeafRef::new`/`BranchRef::new` validate every cell — O(`num_keys`) per
 /// view construction — which multiplied every descent (get, seek, put
@@ -186,7 +187,7 @@ pub(crate) enum PageKind {
 /// ([`Source::bytes_from_classified`]), which are immutable for the owning
 /// txn's life; dirty frames never enter the memo.
 ///
-/// Concurrency (A7): milli shares one `RoTxn` across rayon workers, and the
+/// Concurrency: milli shares one `RoTxn` across rayon workers, and the
 /// previous `Mutex<HashSet>` probe was the second-hottest zerodb frame in the
 /// milli indexing profile. Now: insert-only open addressing over `AtomicU64`
 /// slots (`0` = empty, else `key`), in geometrically growing levels published
@@ -302,7 +303,7 @@ impl<'e> ValidatedPages<'e> {
         z ^ (z >> 31)
     }
 
-    // Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+    // Forced: LLVM inlines this only at -inline-threshold=1000.
     #[inline(always)]
     fn contains(&self, pgno: u64, kind: PageKind) -> bool {
         let key = Self::key_of(pgno, kind);
@@ -400,7 +401,7 @@ pub(crate) fn leaf_view<'a>(
     leaf_view_over(bytes, from_map, psize, pgno, valid)
 }
 
-/// [`leaf_view`] over bytes the caller already resolved (PERF-GAP issue #9:
+/// [`leaf_view`] over bytes the caller already resolved (issue #9:
 /// the descent resolves each page's bytes exactly once — see [`node_view`]).
 fn leaf_view_over<'a>(
     bytes: &'a [u8],
@@ -413,7 +414,7 @@ fn leaf_view_over<'a>(
         Some(v) => {
             if from_map {
                 if v.contains(pgno, PageKind::Leaf) {
-                    // Kind-tagged hit: zero checks (PERF-GAP A8).
+                    // Kind-tagged hit: zero checks.
                     Ok(LeafRef::new_trusted(bytes))
                 } else if v.trusts_file() {
                     // ADR-0014: the caller's `trust_contents` contract stands
@@ -430,7 +431,7 @@ fn leaf_view_over<'a>(
                     validate_leaf_miss(bytes, psize, pgno, v)
                 }
             } else {
-                // Engine-authored dirty frame (PERF-GAP batch 3): a frame is
+                // Engine-authored dirty frame (trusted by construction): a frame is
                 // either a COW copy of a page fully validated on its first
                 // map access this txn, or the output of this txn's own page
                 // encoders — never raw disk bytes, which always enter through
@@ -449,7 +450,7 @@ fn leaf_view_over<'a>(
 /// so the same immutable bytes — takes the zero-check view; otherwise the
 /// full cell walk runs and its success is published there. Either way the
 /// page enters this txn's memo. Out of line so the memo-hit path keeps its
-/// shape (PERF-GAP B13).
+/// shape (see docs/PERF-GAP-VS-LMDB.md, inlining threshold).
 #[inline(never)]
 fn validate_leaf_miss<'a>(
     bytes: &'a [u8],
@@ -536,7 +537,7 @@ fn branch_view_over<'a>(
         Some(v) => {
             if from_map {
                 if v.contains(pgno, PageKind::Branch) {
-                    // Kind-tagged hit: zero checks (PERF-GAP A8).
+                    // Kind-tagged hit: zero checks.
                     Ok(BranchRef::new_trusted(bytes))
                 } else if v.trusts_file() {
                     // ADR-0014 — see [`leaf_view`].
@@ -556,7 +557,7 @@ fn branch_view_over<'a>(
 }
 
 /// A tree page as its typed view, resolved and dispatched in **one** source
-/// resolution (PERF-GAP issue #9).
+/// resolution (issue #9).
 ///
 /// The descent previously resolved every page's bytes twice — once through
 /// [`load_page`] for the type dispatch, then again inside
@@ -570,7 +571,7 @@ pub(crate) enum NodeView<'a> {
     Branch(BranchRef<'a>),
 }
 
-// Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+// Forced: LLVM inlines this only at -inline-threshold=1000.
 #[inline(always)]
 pub(crate) fn node_view<'a>(
     src: Source<'a>,
@@ -640,7 +641,7 @@ pub struct Tree<'a> {
     psize: u32,
     root: u64,
     depth: u16,
-    /// The ordering this tree is stored under (milestone 2.4, SPEC 03 §2.0).
+    /// The ordering this tree is stored under (SPEC 03 §2.0).
     /// Carried by the `Tree` rather than looked up per comparison so every
     /// descent, seek and hit-test in this module uses the same ordering by
     /// construction — the only way to be sure none of them silently falls back
@@ -660,7 +661,7 @@ impl<'a> Tree<'a> {
         Tree::with_comparator(src, psize, root, depth, KeyCmp::Default)
     }
 
-    /// As [`Tree::new`], under an explicit ordering (**milestone 2.4**). Every
+    /// As [`Tree::new`], under an explicit ordering (custom comparators). Every
     /// engine path that serves a *named* database builds its tree through here;
     /// [`Tree::new`] (memcmp) remains correct for the main/catalog tree and the
     /// GC tree, which are memcmp by construction (SPEC 03 §2.0).
@@ -682,7 +683,7 @@ impl<'a> Tree<'a> {
         }
     }
 
-    /// Attach the owning txn's validated-pages memo (PERF-GAP A2). Descents
+    /// Attach the owning txn's validated-pages memo. Descents
     /// through this tree then skip re-validating cells of map-sourced pages
     /// already validated this txn; without it every view fully validates.
     #[must_use]
@@ -694,7 +695,7 @@ impl<'a> Tree<'a> {
         self
     }
 
-    /// The ordering this tree is stored under (milestone 2.4).
+    /// The ordering this tree is stored under.
     #[must_use]
     pub fn comparator(&self) -> KeyCmp<'a> {
         self.cmp
@@ -779,7 +780,7 @@ impl<'a> Tree<'a> {
         Cursor::new(*self)
     }
 
-    /// The entry at a known `(leaf pgno, cell index)` position (PERF-GAP B1):
+    /// The entry at a known `(leaf pgno, cell index)` position:
     /// used by the write cursor to re-materialize the borrows of a position it
     /// computed while holding a *different* borrow of the txn. Goes through the
     /// txn's validated-pages memo, so no re-validation on the hot path.
@@ -812,7 +813,7 @@ impl<'a> Tree<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// PathStack — inline root-to-leaf frame stack (PERF-GAP A6, issue #19)
+// PathStack — inline root-to-leaf frame stack (no heap allocation per cursor, issue #19)
 // ---------------------------------------------------------------------------
 
 /// Maximum root-to-leaf frames a cursor path can hold — LMDB's
@@ -920,7 +921,7 @@ pub struct Cursor<'a> {
     initialized: bool,
     /// The `EOF` flag (SPEC 03 §4): the cursor sits past the maximum entry.
     eof: bool,
-    /// The tree's ordering (milestone 2.4), copied from the [`Tree`] this
+    /// The tree's ordering, copied from the [`Tree`] this
     /// cursor was opened on so every seek uses it.
     cmp: KeyCmp<'a>,
     /// Memoized current leaf view, keyed by pgno.
@@ -936,7 +937,7 @@ pub struct Cursor<'a> {
     /// `&'a DirtyStore` are *immutable* borrows for `'a`. No mutation can occur
     /// while this cursor is alive, so a cached view can never go stale.
     leaf_cache: Cell<Option<(u64, LeafRef<'a>)>>,
-    /// The owning txn's validated-pages memo (PERF-GAP A2), copied from the
+    /// The owning txn's validated-pages memo, copied from the
     /// [`Tree`] this cursor was opened on.
     valid: Option<&'a ValidatedPages<'a>>,
 }
@@ -962,7 +963,7 @@ impl<'a> Cursor<'a> {
     /// The validated leaf view for `pgno`, reusing the memoized one while the
     /// cursor stays on the same page (see [`Cursor::leaf_cache`]). A miss goes
     /// through the txn's validated-pages memo ([`leaf_view`]).
-    // Forced: LLVM inlines this only at -inline-threshold=1000 (PERF-GAP B13).
+    // Forced: LLVM inlines this only at -inline-threshold=1000.
     #[inline(always)]
     fn leaf_at(&self, pgno: u64) -> Result<LeafRef<'a>, PageError> {
         if let Some((cached, leaf)) = self.leaf_cache.get() {
@@ -1323,8 +1324,8 @@ impl<'a> Cursor<'a> {
         self.current()
     }
 
-    /// The leaf **node flags** of the entry at the current position (M1.12
-    /// tools/copy): lets `dump`/`copy_to_file` tell an `F_SUBDATA` named-DB
+    /// The leaf **node flags** of the entry at the current position (tools and
+    /// copy): lets `dump`/`copy_to_file` tell an `F_SUBDATA` named-DB
     /// catalog record apart from a plain user-data key during an in-order scan
     /// (SPEC 02 §6). `None` if unpositioned, at `EOF`, or parked past a leaf's
     /// last entry — the same positions for which [`Cursor::get_current`] yields
@@ -1348,7 +1349,7 @@ impl<'a> Cursor<'a> {
         Ok(Some(leaf.node_flags(ki)))
     }
 
-    // -- park / resume (PERF-GAP B1: the write cursor's stack persistence) --
+    // -- park / resume (the write cursor's stack persistence) --
 
     /// Detach this cursor's position as plain data (no borrows), so a write
     /// cursor can persist it across `&mut RwTxn` calls and [`resume`]
@@ -1364,7 +1365,7 @@ impl<'a> Cursor<'a> {
 
     /// Rebuild a cursor over `t` from a parked position.
     ///
-    /// Caller contract (PERF-GAP B1): `saved` must have been parked from a
+    /// Caller contract: `saved` must have been parked from a
     /// cursor over the **same tree state** — same root, same pages, no
     /// mutation in between. The write cursor guarantees this by holding the
     /// `&mut RwTxn` exclusively and dropping its parked state on every
@@ -1386,7 +1387,7 @@ impl<'a> Cursor<'a> {
 
     /// The `(leaf pgno, cell index)` under the cursor, for callers that just
     /// received `Some(..)` from a positioning op and need the position as
-    /// plain data (PERF-GAP B1 two-phase yield). `None` when unpositioned/EOF
+    /// plain data (the write cursor's two-phase yield). `None` when unpositioned/EOF
     /// (mirrors [`get_current`](Self::get_current)'s `None` conditions except
     /// the past-leaf-end park, which positioning ops never yield `Some` from).
     pub(crate) fn entry_pos(&self) -> Option<(u64, usize)> {
@@ -1397,7 +1398,7 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// A [`Cursor`]'s position detached from its borrows (PERF-GAP B1): the
+/// A [`Cursor`]'s position detached from its borrows (write-cursor persistence): the
 /// root-to-leaf `(pgno, child/cell index)` stack plus the SPEC 03 §4
 /// `INITIALIZED`/`EOF` flags. Only meaningful for the exact tree state it was
 /// parked from (see [`Cursor::resume`]).
@@ -1500,7 +1501,7 @@ mod tests {
 
     #[test]
     fn path_stack_is_vec_shaped_and_rejects_overflow() {
-        // PERF-GAP A6 (#19): the inline stack must behave like the Vec it
+        // Issue #19: the inline stack must behave like the Vec it
         // replaced and fail typed (never grow, never panic) past the
         // CURSOR_STACK bound.
         let mut s = PathStack::new();
@@ -1733,7 +1734,7 @@ mod tests {
         assert_eq!(prefix_successor(b"a\xff\xff"), Some(b"b".to_vec()));
     }
 
-    /// PERF-GAP A8: the lock-free memo under concurrent insert/contains.
+    /// The lock-free memo under concurrent insert/contains.
     /// 4 threads × 2,000 keys with heavy overlap (every key inserted by two
     /// threads, both kinds) force level growth (level 0 holds 512 at the ½
     /// gate), CAS races on duplicate keys, and probes racing publications.

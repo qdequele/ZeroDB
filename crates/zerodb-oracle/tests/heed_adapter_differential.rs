@@ -1,4 +1,4 @@
-//! Milestone 1.13 acceptance (ADR-0003 #6): re-run the oracle op model **through
+//! heed adapter acceptance (ADR-0003 #6): re-run the oracle op model **through
 //! the `heed-zerodb` adapter** and show zero divergences against the LMDB fork.
 //!
 //! Identical to the native `LmdbEngine`-vs-`ZerodbEngine` suites, but the
@@ -310,7 +310,8 @@ proptest! {
     }
 }
 
-/// PERF-GAP B6 pin (2026-07-21): the fork's `put_reserved` semantics when the
+/// Reserved-put pin (2026-07-21; adapter `ReservedSpace` in
+/// docs/PERF-GAP-VS-LMDB.md): the fork's `put_reserved` semantics when the
 /// caller's closure FAILS. LMDB reserves the slot inside the page via
 /// `MDB_RESERVE` *before* the closure runs, so a closure error cannot un-put
 /// the entry. Pinned side by side: (a) whether the call errors, (b) whether
@@ -319,8 +320,8 @@ proptest! {
 /// page held (uninitialized from the API's point of view; zerodb zero-fills
 /// its tail, which this pin cannot and does not observe).
 ///
-/// The pre-B6 adapter diverged here: it filled a heap buffer first, so a
-/// closure error meant NO entry. B6 reserves in-frame first, matching the
+/// The earlier adapter diverged here: it filled a heap buffer first, so a
+/// closure error meant NO entry. It now reserves in-frame first, matching the
 /// fork.
 #[test]
 fn put_reserved_failing_closure_leaves_entry_parity() {

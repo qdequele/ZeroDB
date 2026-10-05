@@ -1,13 +1,12 @@
-//! M1.8 differential: reader-slot exhaustion (`MDB_READERS_FULL`, SPEC 04
+//! Differential: reader-slot exhaustion (`MDB_READERS_FULL`, SPEC 04
 //! TXN-16) — the LMDB fork vs zerodb, **directly through both engines' env
 //! APIs**, not through the op-model harness.
 //!
 //! Why direct: the oracle's `Op` state machine models **one active txn at a
-//! time** (M0.3 harness note), so "hold `max_readers` concurrent read txns,
+//! time** (a documented harness limitation), so "hold `max_readers` concurrent read txns,
 //! then open one more" is inexpressible as an op sequence. This test opens
 //! both engines side by side with the same `max_readers` and compares the
-//! observable behavior at and past the slot limit. (Noted per the M1.8
-//! handback requirement.)
+//! observable behavior at and past the slot limit.
 //!
 //! LMDB side: `MDB_NOTLS` (heed `read_txn_without_tls`, the only mode
 //! Meilisearch uses) lets one thread hold many read txns, each consuming a

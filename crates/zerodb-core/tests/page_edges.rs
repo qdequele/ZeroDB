@@ -1,10 +1,9 @@
-//! Adversarial edge-case coverage for the M1.1 page model (SPEC 02), added by
-//! a test-writer pass on top of the implementer's own `spec02_format.rs` /
-//! `proptest_roundtrip.rs`. These are deterministic (no proptest macro use),
-//! so — unlike `proptest_roundtrip.rs` — this file runs under `cargo miri
-//! test` too.
+//! Adversarial edge-case coverage for the page model (SPEC 02), on top of
+//! `spec02_format.rs` / `proptest_roundtrip.rs`. These are deterministic (no
+//! proptest macro use), so — unlike `proptest_roundtrip.rs` — this file runs
+//! under `cargo miri test` too.
 //!
-//! Section numbering below matches the M1.1 test-coverage task list:
+//! Sections below:
 //! 1. Page-full boundary exactness (leaf + branch, min/max cell, both psizes)
 //! 2. Insert-at-every-position ordering
 //! 3. Remove + heap compaction adversarial

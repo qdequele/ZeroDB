@@ -2,8 +2,8 @@
 //!
 //! [`Error`] mirrors `heed::Error`: an [`Error::Io`] wrapper, an [`Error::Mdb`]
 //! LMDB-code variant, and [`Error::EnvAlreadyOpened`] for the same-process
-//! registry (SPEC 04 TXN-51). The `heed-zerodb` adapter (M1.13) maps these 1:1
-//! onto `heed::Error`; until then the public `zerodb` crate re-exports them
+//! registry (SPEC 04 TXN-51). The `heed-zerodb` adapter maps these 1:1
+//! onto `heed::Error`; the public `zerodb` crate re-exports them
 //! verbatim.
 //!
 //! SPEC note: several distinct open-time failures (bad magic, wrong
@@ -66,7 +66,7 @@ pub enum MdbError {
     DbsFull,
 
     /// `MDB_INCOMPATIBLE` — a name is opened with flags/shape incompatible with
-    /// the existing entry: in Phase 1 this is a `create_database`/`open_database`
+    /// the existing entry: currently this is a `create_database`/`open_database`
     /// on a name that already exists in the main tree as a **plain user key**
     /// (not an `F_SUBDATA` sub-DB record). SPEC 01 §S8; SPEC 02 §6. `Debug`
     /// renders as `Incompatible`, matching `heed::MdbError::Incompatible`.
@@ -76,8 +76,8 @@ pub enum MdbError {
     /// `MDB_READERS_FULL` — every reader-table slot is occupied at
     /// `read_txn`/`static_read_txn` begin (SPEC 04 TXN-16; the table is sized
     /// by `EnvOpenOptions::max_readers`, default 126). Raised immediately —
-    /// under D-001 (single process) there are no stale cross-process slots to
-    /// reap first. `Debug` renders as `ReadersFull`, matching
+    /// ZeroDB is single-process (see docs/DIVERGENCES.md), so there are no
+    /// stale cross-process slots to reap first. `Debug` renders as `ReadersFull`, matching
     /// `heed::MdbError::ReadersFull` for oracle taxonomy parity.
     #[error("environment maxreaders limit reached")]
     ReadersFull,

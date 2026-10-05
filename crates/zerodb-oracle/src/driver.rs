@@ -2,14 +2,15 @@
 //! [`Op`], whether it applies given the tracked state, or is a structured
 //! [`Skip`].
 //!
-//! ## Why this exists (M1.2 precondition)
+//! ## Why this exists (a precondition for the native engine)
 //!
 //! Before this module, [`LmdbEngine`](crate::LmdbEngine) derived every skip
 //! decision inline from its own transaction/database fields. With a second
 //! engine landing (the native `ZerodbEngine`), those decisions had to move to
 //! one place so the two engines cannot *drift* on when an op is a no-op — a
-//! drift would masquerade as a real divergence (or hide one). The M0.3 handback
-//! flagged this hoist as a hard precondition for M1.2.
+//! drift would masquerade as a real divergence (or hide one). This hoist was
+//! flagged, when the harness was built, as a hard precondition for adding the
+//! native engine.
 //!
 //! Every engine calls [`classify`] at the top of its `apply`; if it returns
 //! `Some(skip)`, the engine returns `OpResult::Skipped(skip)` without touching
@@ -172,8 +173,9 @@ pub fn classify(op: &Op, txn: TxnState, dbs_empty: bool, cleared_in_txn: bool) -
         // A fresh independent read modeling a **post-commit** verification: it
         // opens its own read txn, so it needs a db to exist but no active txn —
         // and it must NOT run while a write txn is open (VerifyDuringWrite; see
-        // that `Skip`'s doc + DIVERGENCES D-009). Its concurrent-with-writer
-        // isolation is a M1.8 (reader table) concern.
+        // that `Skip`'s doc + the dropped-and-reused dbi entry in
+        // docs/DIVERGENCES.md). Its concurrent-with-writer isolation is a
+        // reader-table concern.
         VerifyGet { .. } => {
             if dbs_empty {
                 Some(Skip::NoDb)

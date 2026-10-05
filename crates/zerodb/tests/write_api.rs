@@ -1,13 +1,13 @@
-//! Milestone 1.4 write-path integration tests over **real files**: the commit
+//! Write-path integration tests over **real files**: the commit
 //! pipeline end-to-end (SPEC 04 §9), read-after-commit through the fixed
 //! full-`map_size` map (ADR-0004 D4), reopen durability, meta slot
 //! alternation (TXN-63), PREV_SNAPSHOT over real commits (TXN-65..67), split
 //! exact-fit boundaries at both page-size extremes (ADR-0004 D7 risk 2), and
-//! the multi-MB overflow value the coordinator scoped in.
+//! a multi-MB overflow value.
 //!
 //! Every committed image is validated with `zerodb::check::check_image`
-//! (SPEC 03 §11 + SPEC 05 §9, including INV-10/INV-22 reachable-XOR-free
-//! since M1.5). Do not weaken (CLAUDE.md rule 2).
+//! (SPEC 03 §11 + SPEC 05 §9, including INV-10/INV-22 reachable-XOR-free).
+//! Do not weaken (AGENTS.md rule 2).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -121,7 +121,7 @@ fn commit_then_reopen_durable() {
 
 #[test]
 fn multi_mb_overflow_value_through_commit() {
-    // Coordinator scope: unit-test a multi-MB overflow value through
+    // Scope: unit-test a multi-MB overflow value through
     // commit/reopen/read (the fuzz harness caps values at 64 KiB).
     let dir = TempDir::new();
     let big: Vec<u8> = (0..5_000_000u32).map(|i| (i % 251) as u8).collect();
@@ -241,7 +241,7 @@ fn meta_slots_alternate_and_prev_snapshot_rolls_back() {
 #[test]
 fn multi_commit_churn_stays_clean() {
     // put/del/clear churn across several commits; the invariant walk runs
-    // after each, including the INV-22 reachable-XOR-free partition (M1.5).
+    // after each, including the INV-22 reachable-XOR-free partition.
     let dir = TempDir::new();
     let env = open(dir.path(), MAP, PS);
     let db = env.main_database();

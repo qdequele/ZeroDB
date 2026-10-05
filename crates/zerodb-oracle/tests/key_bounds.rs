@@ -4,7 +4,7 @@
 //! records exactly what it returns. The answer it establishes is written back
 //! into `docs/SPEC/01-flags.md` §S4 in the same change. Do NOT weaken these
 //! assertions to make them pass: they encode observed LMDB behavior, and a
-//! mismatch is a zerodb/spec bug for a human to adjudicate (CLAUDE.md rule 2).
+//! mismatch is a zerodb/spec bug for a human to adjudicate (AGENTS.md rule 2).
 //!
 //! Observed 2026-07-15 (macOS aarch64, heed 0.22.1 / lmdb-master-sys 0.2.6,
 //! fork `mdb.master.nested-rtxns` @ cd767228):

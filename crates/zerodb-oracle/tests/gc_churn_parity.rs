@@ -1,5 +1,5 @@
-//! M1.5 acceptance: file-size parity with the LMDB fork under insert/delete
-//! churn (PLAN §1.5; ADR-0005 D5, bands approved 2026-07-16).
+//! GC acceptance: file-size parity with the LMDB fork under insert/delete
+//! churn (ADR-0005 D5, bands approved 2026-07-16).
 //!
 //! Two identical seeded workloads drive the fork (via heed, psize fixed 4096)
 //! and zerodb (psize 4096) side by side; `real_disk_size` is recorded after
@@ -14,7 +14,7 @@
 //!    (ii) different split-fill policies, and (iii) — dominant — GC-21's
 //!    within-PIL-only run search vs the fork's cross-entry `me_pghead`
 //!    merging, which lets LMDB reuse fragmented space for overflow runs where
-//!    zerodb extends (spec-sanctioned; Phase 3.1 fixes it). The no-overflow
+//!    zerodb extends (spec-sanctioned; a planned GC redesign fixes it). The no-overflow
 //!    variant removes (iii), hence the tighter band.
 //!
 //! `Env::real_disk_size` parity is also asserted structurally: zerodb's value

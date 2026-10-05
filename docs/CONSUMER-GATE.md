@@ -47,11 +47,12 @@ index registry's open/close churn with `EnvClosingEvent`, `max_readers`,
 `max_dbs`, and `static_read_txn` in async handlers. No test in either crate
 asserts LMDB-internal geometry, so a failure is a real behavioural difference.
 
-Suite results are logged in [`PROGRESS.md`](../PROGRESS.md) (search for
-"CONSUMER SUITES" and "CONSUMER GATE"); benchmark tables are in
-[`benches/results/`](../benches/results/). Known blind spot: Meilisearch ships no compaction or
-snapshot-restore round-trip test, which is how the `data.mdb` naming issue
-(D-012) stayed hidden behind a green suite; those paths are covered by
+Suite results for a release are recorded in [`CHANGELOG.md`](../CHANGELOG.md);
+benchmark tables are in [`benches/results/`](../benches/results/). Known blind
+spot: Meilisearch ships no compaction or snapshot-restore round-trip test, which
+is how the `data.mdb` naming issue (the env data-file name entry in
+[`DIVERGENCES.md`](DIVERGENCES.md)) stayed hidden behind a green suite; those
+paths are covered by
 `crates/heed-zerodb/tests/env_file_naming.rs` instead.
 
 ## hannoy (HNSW vector index)
@@ -71,8 +72,8 @@ the shim (with the same no-LMDB assertion), and its divan benches —
 `build_hnsw` (5 000 random vectors) and `search_hnsw` (10-NN over 50 000) at
 512, 768 and 1536 dimensions — once on stock LMDB and once on ZeroDB.
 [`scripts/divan-compare.py`](../scripts/divan-compare.py) puts the medians side
-by side. Default ref is `v0.1.7-nested-rtxns`, the tag the July 2026 numbers in
-PROGRESS.md were taken on (milli pins 0.1.3; override with `HANNOY_REF`).
+by side. Default ref is `v0.1.7-nested-rtxns`, the tag the July 2026 numbers
+were taken on (milli pins 0.1.3; override with `HANNOY_REF`).
 
 ## Benchmarks: Meilisearch on LMDB vs ZeroDB
 

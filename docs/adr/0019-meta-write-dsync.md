@@ -1,6 +1,6 @@
 # ADR-0019: Durable meta write through an O_DSYNC descriptor (one barrier per commit)
 
-- Status: Accepted (approved by Quentin 2026-10-01: Option A on **all
+- Status: Accepted (approved by the maintainer, 2026-10-01: Option A on **all
   platforms**, macOS included, and LMDB's failed-write scrub adopted; OQ4 and
   OQ5 left to the implementation and its bench)
 - Implementation note (2026-10-05): implementation parked 2026-10-01 — PR #86

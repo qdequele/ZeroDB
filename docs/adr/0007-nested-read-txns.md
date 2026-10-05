@@ -1,6 +1,6 @@
 # ADR-0007: Nested read transactions over a write txn — implementation strategy
 
-- Status: Approved — Quentin, 2026-07-16, standing directive, session-lead review
+- Status: Approved — maintainer, 2026-07-16, standing directive, delegated review
 - Milestone: 1.9
 - Date: 2026-07-16
 

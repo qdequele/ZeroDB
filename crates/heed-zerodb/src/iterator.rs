@@ -13,7 +13,7 @@
 //! mutate (`del_current`/`put_current`). ZeroDB's `RwTxn` is a Rust type, so we
 //! erase its env lifetime **once at construction** and hand the resulting
 //! `&'txn mut` to a native [`zerodb::RwCursor`] — the stack-carrying write
-//! cursor (PERF-GAP B1): an advance is an amortized O(1) page-stack step
+//! cursor: an advance is an amortized O(1) page-stack step
 //! (LMDB's `mc_pg[]`/`mc_ki[]` walk), not a fresh O(log n) seek by the last
 //! yielded key, and nothing is copied per step. The cursor yields lending
 //! borrows (they die at its next call); [`RwGuts::step`] stretches them to
@@ -22,8 +22,8 @@
 //! `del_current`/`put_current` are `unsafe fn`), and the yielded bytes live in
 //! the txn's committed map or its dirty frames, which only a mutation through
 //! this same iterator can replace. This is the single place the adapter needs
-//! raw pointers / lifetime erasure, exactly as heed does (the M1.13-sanctioned
-//! "lifetime-erased write cursor" unsafe).
+//! raw pointers / lifetime erasure, exactly as heed does (the
+//! "lifetime-erased write cursor" unsafe the AGENTS.md unsafe policy allows).
 
 use std::cmp::Ordering;
 use std::marker::PhantomData;
@@ -97,7 +97,7 @@ macro_rules! ro_iterator {
                 self.remap_types::<KC, LazyDecode<DC>>()
             }
 
-            /// Iteration method shim (no DUPSORT in Phase 1 — a no-op retag).
+            /// Iteration method shim (DUPSORT is unsupported — a no-op retag).
             #[must_use]
             pub fn move_between_keys(self) -> $name<'txn, KC, DC, MoveBetweenKeys> {
                 $name {
@@ -106,7 +106,7 @@ macro_rules! ro_iterator {
                 }
             }
 
-            /// Iteration method shim (no DUPSORT in Phase 1 — a no-op retag).
+            /// Iteration method shim (DUPSORT is unsupported — a no-op retag).
             #[must_use]
             pub fn move_through_duplicate_values(
                 self,
@@ -186,7 +186,7 @@ macro_rules! ro_range_iterator {
                 self.remap_types::<KC, LazyDecode<DC>>()
             }
 
-            /// Iteration method shim (no DUPSORT in Phase 1 — a no-op retag).
+            /// Iteration method shim (DUPSORT is unsupported — a no-op retag).
             #[must_use]
             pub fn move_between_keys(self) -> $name<'txn, KC, DC, C, MoveBetweenKeys> {
                 $name {
@@ -195,7 +195,7 @@ macro_rules! ro_range_iterator {
                 }
             }
 
-            /// Iteration method shim (no DUPSORT in Phase 1 — a no-op retag).
+            /// Iteration method shim (DUPSORT is unsupported — a no-op retag).
             #[must_use]
             pub fn move_through_duplicate_values(
                 self,
@@ -264,7 +264,7 @@ pub(crate) enum Dir {
 }
 
 /// Shared guts of every `Rw*` iterator: a native stack-carrying write cursor
-/// over the lifetime-erased txn, plus the range bounds (PERF-GAP B1). See the
+/// over the lifetime-erased txn, plus the range bounds. See the
 /// module docs for the safety contract.
 pub(crate) struct RwGuts<'txn> {
     cursor: zerodb::RwCursor<'txn, 'txn>,
@@ -322,7 +322,7 @@ impl<'txn> RwGuts<'txn> {
             Err(e) => Some(Err(e.into())),
             Ok(None) => None,
             Ok(Some((k, v))) => {
-                // SAFETY (lifetime stretch to `'txn` — the M1.13
+                // SAFETY (lifetime stretch to `'txn` — the unsafe policy's
                 // "lifetime-erased write cursor" clause): the yielded bytes
                 // live in the txn's committed map or its dirty frames, both
                 // stable until the next mutation through this iterator; heed's
@@ -753,7 +753,7 @@ rw_range_iterator!(RwRevPrefix, "A read-write reverse prefix iterator.");
 
 #[cfg(test)]
 mod erased_cursor_in_place_tests {
-    //! ADR-0021 B4 — the M1.13 **lifetime-erased write cursor** under miri,
+    //! ADR-0021 B4 — the adapter's **lifetime-erased write cursor** under miri,
     //! over the in-place `WRITE_MAP` realization (SPEC 04 TXN-45b).
     //!
     //! `RwGuts` is the one place the adapter erases lifetimes: it reborrows

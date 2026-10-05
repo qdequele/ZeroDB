@@ -34,7 +34,7 @@ the fork fix lands.
   fork is fixed and the repro exits 0.
 - **zerodb behavior (since its write path landed):** returns `KeyExist` per
   SPEC 01 §S1 — a crash is UB, not observable behavior to replicate (see
-  DIVERGENCES D-007).
+  `docs/DIVERGENCES.md`, the FORK-1 crash-case entry).
 
 ---
 

@@ -1,4 +1,4 @@
-//! Roadmap #10 — `free_page_count` counts from each GC entry's PIL `count`
+//! `free_page_count` counts from each GC entry's PIL `count`
 //! prefix (`pil_count`) instead of decoding the ids (`pil_decode`) just to take
 //! their length (SPEC 05 GC-23).
 //!

@@ -29,7 +29,7 @@
 //!
 //! Test infrastructure only (the `zerodb-core` and `heed-zerodb` dev-deps
 //! enable the feature); consumer builds never compile it. `unsafe` lives in
-//! `zerodb-io` per the CLAUDE.md policy (this module is the mmap stand-in).
+//! `zerodb-io` per the AGENTS.md policy (this module is the mmap stand-in).
 
 use std::cell::UnsafeCell;
 

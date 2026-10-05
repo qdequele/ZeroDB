@@ -1,9 +1,9 @@
-//! Milestone 2.6 — `EnvOpenOptions::page_size` as a supported public knob.
+//! `EnvOpenOptions::page_size` as a supported public knob.
 //!
 //! This is a **ZeroDB extension**: LMDB 0.9 derives its page size from the OS
 //! and exposes no selector, so there is no cross-engine differential to run
-//! (you cannot ask LMDB for a 64 K page and compare). Per the Phase 2
-//! acceptance line, this is therefore the "doc + unit tests where it's
+//! (you cannot ask LMDB for a 64 K page and compare). Per the acceptance rule
+//! for heed API extensions, this is therefore the "doc + unit tests where it's
 //! zerodb-defined" case, and the strongest available property is
 //! **zerodb-vs-zerodb self-consistency**: identical logical content from
 //! identical operation streams at every supported page size.
@@ -18,7 +18,7 @@
 //!     threshold;
 //!   * the reopen contract: the persisted page size wins, silently.
 //!
-//! Do not weaken these (CLAUDE.md rule 2).
+//! Do not weaken these (AGENTS.md rule 2).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -316,7 +316,7 @@ fn full_round_trip_at_64k() {
 
 #[test]
 fn identical_op_streams_produce_identical_content_at_every_page_size() {
-    // The strong new property this milestone buys: page size is a *storage*
+    // The strong new property page-size selection buys: page size is a *storage*
     // parameter with no logical effect. The same op stream must yield
     // byte-identical logical content — same keys, same values, same order —
     // at 4 K through 64 K, despite completely different page layouts,

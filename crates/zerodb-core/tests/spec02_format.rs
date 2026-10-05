@@ -2,7 +2,7 @@
 //!
 //! These transcribe the hex dumps from SPEC 02 §3.5 (creation meta), §4.3 (leaf)
 //! and §4.4 (branch), plus §5.1 (overflow). They are the strongest format locks
-//! in the milestone: a change to any offset, width, or endianness breaks them.
+//! in the test suite: a change to any offset, width, or endianness breaks them.
 
 use zerodb_core::page::{
     self, geometry, select_meta, write_overflow_head, BranchMut, BranchRef, DBRecord, LeafMut,
@@ -511,7 +511,7 @@ fn page_type_classification() {
     // Two structural bits -> error.
     z[16] = (page::P_LEAF | page::P_BRANCH) as u8;
     assert!(PageRef::new(&z, PSIZE).is_err());
-    // Reserved Phase-2.8 bit (P_LEAF2) set -> rejected.
+    // Reserved DUPFIXED bit (P_LEAF2) set -> rejected.
     z[16] = page::P_LEAF2 as u8;
     assert!(PageRef::new(&z, PSIZE).is_err());
 }

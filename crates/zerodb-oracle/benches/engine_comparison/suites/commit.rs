@@ -10,8 +10,9 @@
 //! **Durability** (`sync/*`): the same rungs with fsync ON. The delta against
 //! the matching nosync rung is the barrier, and on this machine it is a laptop
 //! SSD. It is the rung that will move most on the real target — Graviton + EBS
-//! gp3, where a barrier is a network round-trip and where PERF-GAP B4's
-//! coalesced writes are supposed to pay off. Numbers taken anywhere else are
+//! gp3, where a barrier is a network round-trip and where the coalesced
+//! commit writes (docs/PERF-GAP-VS-LMDB.md, one `pwrite` per dirty page) are
+//! supposed to pay off. Numbers taken anywhere else are
 //! indicative only.
 
 use criterion::{Criterion, Throughput};

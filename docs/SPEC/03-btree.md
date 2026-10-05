@@ -4,7 +4,7 @@ Status: **DONE** — 2026-07-15 (milestone 0.4). Algorithmic source of truth for
 the read path (M1.3), the write path (M1.4), and the check tool (M1.12). Formats
 are in [SPEC 02](02-pages.md); this document defines the operations over them.
 Pseudocode is illustrative, not code to transliterate; the LMDB fork was read to
-understand the *algorithms* (CLAUDE.md rule 4), and the semantics below are
+understand the *algorithms* (AGENTS.md rule 4), and the semantics below are
 pinned to the oracle (SPEC 00/01), not to LMDB's C.
 
 > **Revised 2026-10-05** — brought up to date with the merged engine: cursor-free
@@ -105,7 +105,7 @@ at open is the natural fix and there is nowhere to put one: `DBRecord` is
 exactly 48 bytes with every offset assigned (SPEC 02 §3.1), and its only two
 unused *values* — `flags` (offset 42) and `leaf2_ksize` (offset 44) — are
 already reserved for DUPSORT/DUPFIXED in milestone 2.8 (parked 2026-07-20, §12). Widening the record or
-repurposing those fields is an on-disk **format** change, which CLAUDE.md rule 6
+repurposing those fields is an on-disk **format** change, which AGENTS.md rule 5
 puts behind an ADR and human approval. **Deliberately not taken in 2.4**; the
 hazard is documented, filed as D-014, and left for a maintainer decision.
 
@@ -400,7 +400,7 @@ identity is the pgno, which spill/unspill never changes; a retained cursor path
 (§5.4a) keys on pgnos and stays valid; the §6.6 finger re-verifies per-frame
 dirtiness at use time, so a spilled frame is an ordinary miss.
 
-miri must exercise get-then-put sequences (PLAN 1.4): a `&[u8]` obtained by
+miri must exercise get-then-put sequences (M1.4): a `&[u8]` obtained by
 `get` before a `put` must not dangle — enforced by SPEC 04's dirty-page
 stability contract; this doc requires only that COW never *moves* an
 already-dirty page's backing storage while a borrow into it is live.
@@ -577,7 +577,7 @@ split(page P at insertion index newindx, new cell):
 
 ### §6.4 — Split-point policy (ADR-0002 §D6; end-of-page rule ADR-0005 D5)
 
-**[AMENDED 2026-07-16 by ADR-0005 D5; RATIFIED — Quentin, 2026-07-16, standing
+**[AMENDED 2026-07-16 by ADR-0005 D5; RATIFIED — maintainer, 2026-07-16, standing
 directive. The end-of-page insert-point rule below now governs *any* insert
 that lands at `newindx == nkeys` (plain puts included), not just APPEND; the
 median-fit-adjust rule is scoped to non-end inserts. The pre-amendment text is
@@ -640,7 +640,7 @@ pointer). A split is **feasible** at `s` iff `used(L) ≤ C` **and** `used(R) �
   - **Observable page-count parity.** This median-plus-fit-adjust follows the
     **same policy shape** as LMDB's split decision (`mdb_page_split`'s
     `split_indx`/`newindx` refinement); it is **not** claimed to pick a
-    byte-identical boundary in every case. The gate is the **PLAN 1.5 tolerance
+    byte-identical boundary in every case. The gate is the **M1.5 tolerance
     band**: page counts must track the oracle within that band, not exactly.
 
 - **Branch-split scope (ADR-0005 D5).** The end-of-page insert-point rule is
@@ -654,7 +654,7 @@ pointer). A split is **feasible** at `s` iff `used(L) ≤ C` **and** `used(R) �
   Leaves carry essentially all of the ascending-workload fill-factor effect
   (there are far more leaves than branches; ADR-0005 D5's ~2× ratio is a leaf
   phenomenon), so leaves-only captures the benefit without the branch-occupancy
-  hazard. The PLAN 1.5 tolerance band and the oracle page-count parity tests
+  hazard. The M1.5 tolerance band and the oracle page-count parity tests
   gate the resulting counts either way.
 
 - **Rising separator.** For a **leaf** split the separator promoted to the parent
@@ -1038,7 +1038,7 @@ some DB tree walked from a meta root. Applies to the live meta's snapshot.
   check tool therefore asserts only `≥ min_keys` on non-root pages (and the bounds
   of INV-9), **not** `≥ FILL_THRESHOLD`. The root is exempt from `min_keys`. The
   threshold governs *when delete rebalances*, and is verified indirectly by the
-  file-size tolerance band (PLAN 1.5), not as a per-page assertion.
+  file-size tolerance band (M1.5), not as a per-page assertion.
   **Decode-level floor (added 2026-09-09, security review H2):** independent of
   the invariant, the *decoder* rejects a branch page with **zero** children
   (`PageError::EmptyBranch`, SPEC 02 §4.1) — even a root branch — because
@@ -1100,8 +1100,8 @@ some DB tree walked from a meta root. Applies to the live meta's snapshot.
 No consumer uses duplicates (SPEC 00 §B.1; D-004 APPROVED — DUPSORT/DUPFIXED
 remain **unsupported**). Milestone 2.8 (ADR-0011, approved) was **parked
 2026-07-20**: stage 2.8a was implemented and reviewed but never merged or
-pushed — local work only, preserved per PROGRESS.md along with the resume
-preconditions. The design below is kept, not deleted; other documents
+pushed — local work only, preserved outside the repository along with the
+resume preconditions. The design below is kept, not deleted; other documents
 (SPEC 02 §10, ADR-0011, DIVERGENCES D-004) reference it. If revived, 2.8 would
 add, against the format hooks reserved in SPEC 02 §10:
 
@@ -1117,7 +1117,7 @@ add, against the format hooks reserved in SPEC 02 §10:
 
 The engine MUST NOT emit any of these structures; INV-21 rejects them. The
 differential-fuzz budget for this area (≥ 2 h clean) is deferred with the
-parked 2.8 (PLAN §2.8).
+parked 2.8.
 
 ### §12.1 — 2.8a pinned fork observations (2026-07-20; ADR-0011 Q5 first act)
 
@@ -1126,7 +1126,7 @@ Observed against the oracle (heed =0.22.1 / lmdb-master-sys 0.2.6, fork
 `crates/zerodb-oracle/tests/dup_pin_semantics.rs` and `dup_pin_ffi.rs` —
 **before any zerodb dup code exists**. These tables are the normative record
 a revived 2.8 implementation must match; the tests are the executable form and
-remain committed and green (the park kept exactly this pinning work, PROGRESS
+remain committed and green (the park kept exactly this pinning work,
 2026-07-20). Items marked ⚠ contradict previously written spec/ADR text — the
 observation is the truth about the fork; whether zerodb replicates or diverges
 is an open decision **for whoever resumes the parked 2.8** (the 2.8a

@@ -1,4 +1,4 @@
-//! Milestone 2.1 differential: `Env::info()` / `Env::stat()` vs the LMDB fork.
+//! Differential: `Env::info()` / `Env::stat()` vs the LMDB fork.
 //!
 //! **Comparison scope (documented, deliberate).** `MDB_envinfo` and `MDB_stat`
 //! mix format-independent facts with format-specific counts. Only the former
@@ -9,17 +9,17 @@
 //! | field | compared? | why |
 //! |---|---|---|
 //! | `me_mapaddr` | no | `MDB_FIXEDMAP` only; ZeroDB has no fixed map (always null). |
-//! | `me_mapsize` | no | Both echo the configured value; LMDB rounds to the OS page size, ZeroDB does not (D-006 is re-imposed at the adapter, not here). |
-//! | `me_last_pgno` | **no** | Same meaning, format-specific value (D-002). Compared as *monotonic growth* only. |
+//! | `me_mapsize` | no | Both echo the configured value; LMDB rounds to the OS page size, ZeroDB does not (the OS-page-multiple check is re-imposed at the adapter, not here; see docs/DIVERGENCES.md). |
+//! | `me_last_pgno` | **no** | Same meaning, format-specific value (own on-disk format). Compared as *monotonic growth* only. |
 //! | `me_last_txnid` | **yes, exactly** | Commit counter; same domain on both engines. |
 //! | `me_maxreaders` | **yes, exactly** | Echoes the configured reader-table size. |
-//! | `me_numreaders` | **yes, exactly** | High-water reader-slot count — see D-011: LMDB never decrements it. |
-//! | `ms_psize` | no | ZeroDB selects it (M2.6); LMDB derives it from the OS. |
-//! | `ms_depth` | bounded | Same meaning; value depends on fan-out (D-002). |
-//! | `ms_*_pages` | no | Format-specific by construction (D-002). |
+//! | `me_numreaders` | **yes, exactly** | High-water reader-slot count — LMDB never decrements it (see the `me_numreaders` entry in docs/DIVERGENCES.md). |
+//! | `ms_psize` | no | ZeroDB selects it (page-size selection at env creation); LMDB derives it from the OS. |
+//! | `ms_depth` | bounded | Same meaning; value depends on fan-out (own on-disk format). |
+//! | `ms_*_pages` | no | Format-specific by construction (own on-disk format). |
 //! | `ms_entries` | **yes, exactly** | Main-DB record count = number of named DBs. |
 //!
-//! Never change an expectation here to make ZeroDB pass (CLAUDE.md rule 1).
+//! Never change an expectation here to make ZeroDB pass (AGENTS.md rule 1).
 
 use heed::types::Bytes;
 use heed::EnvOpenOptions as LmdbOpts;
@@ -225,7 +225,8 @@ fn info_num_readers_matches_for_equivalent_reader_populations() {
     // it is a high-water mark (`mti_numreaders` is only ever incremented, by
     // `if (i == nr) ti->mti_numreaders = ++nr;`; ending a txn just clears
     // `mr_pid`). This was observed here, not assumed, and ZeroDB reproduces it
-    // rather than "fixing" it (CLAUDE.md rule 1). Logged as D-011.
+    // rather than "fixing" it (AGENTS.md rule 1). Logged in docs/DIVERGENCES.md
+    // (the `me_numreaders` entry).
     for remaining in (0..CAP).rev() {
         lheld.pop();
         zheld.pop();
@@ -253,7 +254,7 @@ fn info_num_readers_matches_for_equivalent_reader_populations() {
 
 #[test]
 fn num_readers_high_water_survives_a_full_drain_and_reuse() {
-    // Second, sharper probe of D-011: take 4 slots, release them all, then take
+    // Second, sharper probe of the high-water semantics: take 4 slots, release them all, then take
     // 1. LMDB's counter must still read 4 (slots are reused from index 0, and
     // the high-water is never lowered). ZeroDB must agree.
     let ldir = TempDir::new().unwrap();
@@ -348,8 +349,8 @@ fn env_stat_entries_and_depth_parity() {
             assert_eq!(ld, 0, "lmdb empty env-stat depth");
             assert_eq!(zd, 0, "zerodb empty env-stat depth");
         } else {
-            // Same meaning, fan-out-dependent value (D-002) — bounded, as in
-            // the M1.6 per-DB stat differential.
+            // Same meaning, fan-out-dependent value (own on-disk format) —
+            // bounded, as in the per-DB stat differential.
             assert!(
                 ld.abs_diff(zd) <= 1,
                 "env-stat depth diverges by >1 at n={n}: lmdb={ld} zerodb={zd}"

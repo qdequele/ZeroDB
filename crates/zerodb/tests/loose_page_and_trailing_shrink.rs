@@ -1,4 +1,4 @@
-//! Milestone 1.4 coverage pass, area 5: the loose-page fast path (GC-7/8) and
+//! Write-path coverage pass, area 5: the loose-page fast path (GC-7/8) and
 //! trailing-shrink (GC-10), ADR-0004 D4. Neither is exercised by an existing
 //! test through observable file-size + `check_image` assertions.
 

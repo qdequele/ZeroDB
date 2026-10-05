@@ -1,11 +1,11 @@
-//! Milestone 1.2 zerodb-only env-lifecycle tests (SPEC 02 §3.2, SPEC 06 §1,
+//! Zerodb-only env-lifecycle tests (SPEC 02 §3.2, SPEC 06 §1,
 //! SPEC 04 §7). These drive the public `zerodb::Env` API directly rather than
 //! through the oracle `Op` model, because the corrupted-meta / PREV_SNAPSHOT
 //! cases depend on **our** on-disk format, which LMDB does not share (the
 //! differential env-lifecycle parity tests live in `zerodb-oracle`).
 //!
 //! Each test names the REC rule / SPEC section it pins. Do not weaken these
-//! (CLAUDE.md rule 2).
+//! (AGENTS.md rule 2).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

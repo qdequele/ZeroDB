@@ -1,6 +1,6 @@
 # ADR-0018: Env-wide validated-pages cache across transactions
 
-- Status: Accepted (approved by Quentin 2026-09-29: "go adr 18"); implemented and measured 2026-09-30
+- Status: Accepted (approved by the maintainer, 2026-09-29); implemented and measured 2026-09-30
 - Milestone: Phase 3 (performance), follow-up of ADR-0016
 - Date: 2026-09-29
 
@@ -140,7 +140,7 @@ Answers to the review questions (2026-09-29):
 
 ## Amendment: publish at commit; writers probe but never publish (2026-10-01)
 
-Approved by Quentin 2026-10-01 ("go for all of those") as part of the
+Approved by the maintainer, 2026-10-01, as part of the
 one-operation-txn cost work.
 
 ### Problem

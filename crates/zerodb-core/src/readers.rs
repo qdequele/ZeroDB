@@ -1,5 +1,5 @@
 //! The MVCC reader table and the published-snapshot cell (SPEC 04 §3/§4,
-//! TXN-14..22; ADR-0006). Milestone 1.8.
+//! TXN-14..22; ADR-0006).
 //!
 //! This module is the only place a reader and the writer communicate. It
 //! contains **no** `unsafe` (the crate is `#![deny(unsafe_code)]`, opened only
@@ -13,13 +13,14 @@
 //! Concurrency primitives come from [`crate::sync`], so the identical source
 //! runs natively (and under miri) and is model-checked under
 //! `RUSTFLAGS="--cfg loom"` (`just loom`; the `loom_*` tests at the bottom of
-//! this file are the PLAN §1.8 loom suite, L1–L5 per ADR-0006).
+//! this file are the reader-table loom suite, L1–L5 per ADR-0006).
 //!
-//! Crash-safety note (rules of engagement #3): nothing in this module writes
+//! Crash-safety note: nothing in this module writes
 //! to disk. Every step here is in-process state; a crash at any point between
 //! any two operations leaves the durable file exactly as the commit pipeline
-//! (SPEC 04 §9) left it, and recovery never consults reader state (D-001:
-//! single process — a crashed process has no surviving readers to respect).
+//! (SPEC 04 §9) left it, and recovery never consults reader state (ZeroDB is
+//! single-process, see docs/DIVERGENCES.md — a crashed process has no
+//! surviving readers to respect).
 
 use std::sync::Arc;
 
@@ -64,7 +65,7 @@ pub(crate) const RDR_CLAIMED: u64 = u64::MAX - 1;
 /// other's cache lines (TXN-14).
 pub(crate) struct ReaderTable {
     slots: Box<[CachePadded<AtomicU64>]>,
-    /// LMDB `MDB_txninfo::mti_numreaders` parity (milestone 2.1): the
+    /// LMDB `MDB_txninfo::mti_numreaders` parity: the
     /// **high-water** slot count, i.e. `max(claimed slot index) + 1` over the
     /// env's lifetime. See [`ReaderTable::num_readers`] for why this is a
     /// high-water mark and not the live count.
@@ -87,8 +88,8 @@ impl ReaderTable {
     /// Claim a slot (SPEC 04 TXN-15): scan from 0; the first successful
     /// `compare_exchange(RDR_FREE → RDR_CLAIMED)` grants exclusive ownership.
     /// `None` after a full scan means the table is exhausted — the caller maps
-    /// it to `MdbError::ReadersFull` (TXN-16; no reaping path exists under
-    /// D-001, so the error is immediate).
+    /// it to `MdbError::ReadersFull` (TXN-16; no reaping path exists in a
+    /// single-process engine, so the error is immediate).
     ///
     /// There is no ABA hazard in this CAS: the compare value `RDR_FREE` means
     /// "free *now*", and ownership is conferred by the successful exchange
@@ -99,7 +100,7 @@ impl ReaderTable {
     ///
     /// **ADR-0006 D2 still holds** despite the `high_water` counter maintained
     /// below: that counter is written here but read *only* by
-    /// [`ReaderTable::num_readers`] (introspection, M2.1). Neither this scan
+    /// [`ReaderTable::num_readers`] (introspection). Neither this scan
     /// nor the writer's [`ReaderTable::oldest`] scan consults it — both still
     /// walk every slot, unconditionally.
     pub(crate) fn claim(&self) -> Option<u32> {
@@ -122,7 +123,7 @@ impl ReaderTable {
                 .compare_exchange(RDR_FREE, RDR_CLAIMED, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                // `mti_numreaders` parity (M2.1): LMDB bumps its counter only
+                // `mti_numreaders` parity: LMDB bumps its counter only
                 // when the first-fit scan lands *past* the current high-water
                 // (`if (i == nr) ti->mti_numreaders = ++nr;`), so the value is
                 // monotone. `fetch_max` is the same thing without LMDB's
@@ -176,8 +177,8 @@ impl ReaderTable {
     /// `RwTxn::oldest_reader`).
     ///
     /// Every load is `SeqCst`, pairing with `store_pin` (TXN-17). The
-    /// two-case correctness proof (SPEC 04 §4.5, as reviewed and fixed in
-    /// M0.4), with the writer in txn `N`:
+    /// two-case correctness proof (SPEC 04 §4.5, as reviewed and fixed when
+    /// the spec was written), with the writer in txn `N`:
     ///
     /// 1. *Already-pinned readers (real txnid `v`) are never missed.* The
     ///    reader published `v` with a SeqCst store and this scan loads SeqCst;
@@ -237,12 +238,11 @@ impl ReaderTable {
 
     /// The table's fixed slot count — `max_readers` as configured at open
     /// (TXN-14; `mdb_env_get_maxreaders` / `MDB_envinfo::me_maxreaders`).
-    /// Milestone 2.1.
     pub(crate) fn capacity(&self) -> u32 {
         self.slots.len() as u32
     }
 
-    /// `MDB_envinfo::me_numreaders` parity (milestone 2.1).
+    /// `MDB_envinfo::me_numreaders` parity.
     ///
     /// **This is a high-water mark, not a live count** — the surprising part,
     /// verified against the fork's `mdb.c`, not assumed. LMDB allocates a
@@ -262,11 +262,11 @@ impl ReaderTable {
     /// own header documents it as "number of reader slots used", which is
     /// misleading; the differential test in
     /// `zerodb-oracle/tests/env_info_differential.rs` observed the real
-    /// behavior. ZeroDB reproduces it exactly (CLAUDE.md rule 1) and offers
+    /// behavior. ZeroDB reproduces it exactly (AGENTS.md rule 1) and offers
     /// the genuinely-live count separately as [`ReaderTable::in_use`].
     ///
-    /// Logged as `D-011` in `docs/DIVERGENCES.md` (PROPOSED Phase 3 candidate,
-    /// not approved).
+    /// Logged in `docs/DIVERGENCES.md` (`me_numreaders` semantics; a PROPOSED
+    /// candidate for later redefinition, not approved).
     ///
     /// Relaxed load: introspection only, orders nothing (see [`ReaderTable::claim`]).
     pub(crate) fn num_readers(&self) -> u32 {
@@ -275,7 +275,7 @@ impl ReaderTable {
 
     /// Slots **currently** occupied — claimed *or* pinned. A ZeroDB extension:
     /// the number LMDB's `me_numreaders` looks like it should be but is not
-    /// (see [`ReaderTable::num_readers`]). Milestone 2.1.
+    /// (see [`ReaderTable::num_readers`]).
     ///
     /// This is an **introspection** read, not part of the pin protocol: the
     /// value is a sample of a concurrently-mutating table and is only
@@ -291,7 +291,7 @@ impl ReaderTable {
     }
 
     /// A **snapshot of the occupied slots** — the introspection primitive
-    /// behind `Env::reader_list` (`mdb_reader_list`, milestone 2.2).
+    /// behind `Env::reader_list` (`mdb_reader_list`).
     ///
     /// Returns `(slot index, pinned txnid)` for every slot that is not
     /// `RDR_FREE`, in slot order; `None` for the txnid means the slot is
@@ -476,7 +476,7 @@ mod tests {
     fn zero_capacity_table_is_always_full() {
         // max_readers = 0 is degenerate but must not panic: every read txn
         // fails ReadersFull. The fork instead rejects the open with EINVAL —
-        // filed as D-010 (PROPOSED, docs/DIVERGENCES.md); no consumer
+        // filed in docs/DIVERGENCES.md (`max_readers(0)` at open); no consumer
         // passes 0.
         let t = ReaderTable::new(0);
         assert_eq!(t.claim(), None);
@@ -540,12 +540,12 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// The loom suite (PLAN §1.8 acceptance gate 1; ADR-0006 L1–L5). Runs only
+// The loom suite (the reader table's model-checking gate; ADR-0006 L1–L5). Runs only
 // under `just loom` (`RUSTFLAGS="--cfg loom" cargo test -p zerodb-core --lib
 // loom_`). Models are deliberately tiny (≤ 2 spawned threads + main) so loom
 // explores them exhaustively.
 //
-// Mutation-check record (ADR-0006, done during M1.8 development + review, all
+// Mutation-check record (ADR-0006, done during reader-table development + review, all
 // mutations reverted):
 //
 // (a) Inverting the TXN-19 publish order (counter before object) fails

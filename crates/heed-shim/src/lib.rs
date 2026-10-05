@@ -1,4 +1,4 @@
-//! `heed` — a verbatim re-export of the `heed-zerodb` adapter (milestone 1.13).
+//! `heed` — a verbatim re-export of the `heed-zerodb` adapter.
 //!
 //! This crate exists only so a consumer's `[patch.crates-io] heed = { path =
 //! ".../crates/heed-shim" }` resolves (cargo `[patch]` matches by crate name).

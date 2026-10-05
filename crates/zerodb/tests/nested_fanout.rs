@@ -1,5 +1,5 @@
-//! Milestone 1.9 acceptance: replay of the milli/hannoy nested-read fan-out
-//! patterns on a **real file** with **real threads** (PLAN §1.9, SPEC 04 §5,
+//! Nested read transactions, acceptance: replay of the milli/hannoy nested-read
+//! fan-out patterns on a **real file** with **real threads** (SPEC 04 §5,
 //! ADR-0007 D5 item 4).
 //!
 //! The six consumer call sites (SPEC 00 Findings §A — milli ×5, hannoy ×1)

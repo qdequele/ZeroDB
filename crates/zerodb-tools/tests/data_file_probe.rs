@@ -1,4 +1,4 @@
-//! ADR-0010 / D-012 — the tools' two-name data-file probe.
+//! ADR-0010 — the tools' two-name data-file probe.
 //!
 //! Since ADR-0010 an env directory holds `zerodb.dat` (native) or `data.mdb`
 //! (created through the `heed-zerodb` adapter, so Meilisearch's hardcoded

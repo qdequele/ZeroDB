@@ -1,4 +1,4 @@
-//! Fault-injection write backend (M1.11, ADR-0008 D1; SPEC 06 REC-19/REC-20).
+//! Fault-injection write backend (ADR-0008 D1; SPEC 06 REC-19/REC-20).
 //!
 //! [`FaultBacking`] wraps a real [`Backing`] and journals every
 //! `write_at_page` issued since the last completed sync barrier. The wrapped

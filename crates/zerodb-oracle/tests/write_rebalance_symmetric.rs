@@ -1,4 +1,4 @@
-//! M1.4 fix follow-up: differential twins of
+//! Write-path fix follow-up: differential twins of
 //! `crates/zerodb/tests/deep_tree_rebalance_symmetric.rs` — the symmetric
 //! branch-rebalance directions (borrow/merge from the LEFT sibling, driven by
 //! descending deletes; interior-band deletes for both merge directions) run

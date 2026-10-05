@@ -1,4 +1,4 @@
-//! Milestone 1.8 acceptance gate 2 (PLAN §1.8; ADR-0006 §Test plan): N reader
+//! Reader-table acceptance gate 2 (ADR-0006 §Test plan): N reader
 //! threads + 1 GC-churn writer over a **real file**, with MVCC invariant
 //! checks on every pinned snapshot, plus the deterministic slot-lifecycle
 //! tests (`ReadersFull` exhaustion/recovery — TXN-16; `static_read_txn`
@@ -6,7 +6,7 @@
 //!
 //! Duration: ~5 s by default (runs in the normal suite); the minutes-long
 //! acceptance variant is `just stress` (`ZERODB_STRESS_SECS`, nightly CI +
-//! mandatory before the 1.14 gate — ADR-0006 ratification record (3)).
+//! mandatory before an integration gate — ADR-0006 ratification record (3)).
 //! Debug builds additionally arm the writer-side shadow gate
 //! (`RwTxn::debug_assert_gate`): every GC draw re-scans the live reader table
 //! and asserts no live reader is pinned below the entry's freeing txnid —

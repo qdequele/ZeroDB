@@ -1,18 +1,19 @@
-//! Milestone 2.2 — reader introspection (`Env::reader_list`) and
+//! Reader introspection (`Env::reader_list`) and
 //! `Env::clear_stale_readers`.
 //!
-//! Phase 2 acceptance: "differential semantics tests where LMDB has the
-//! feature, and doc + unit tests where it's zerodb-defined". There is **no
-//! differential half** here, and that is not an omission: heed exposes no
-//! reader introspection at all, so there is no through-heed path to drive C
-//! LMDB's `mdb_reader_list`, and LMDB's row shape (pid/thread columns over a
-//! shared `lock.mdb`) is meaningless under D-001 single-process anyway. The
+//! Acceptance rule for heed API extensions: "differential semantics tests
+//! where LMDB has the feature, and doc + unit tests where it's
+//! zerodb-defined". There is **no differential half** here, and that is not
+//! an omission: heed exposes no reader introspection at all, so there is no
+//! through-heed path to drive C LMDB's `mdb_reader_list`, and LMDB's row
+//! shape (pid/thread columns over a shared `lock.mdb`) is meaningless in a
+//! single-process engine anyway. The
 //! quantities that *are* cross-engine comparable — `max_readers` and the
 //! `me_numreaders` high-water mark — are already covered differentially by
-//! `zerodb-oracle/tests/env_info_differential.rs` (M2.1).
+//! `zerodb-oracle/tests/env_info_differential.rs`.
 //!
 //! What is pinned here is ZeroDB's own contract, cross-checked against the
-//! reader-table facts M2.1 already exposes (`live_readers`, `num_readers`)
+//! reader-table facts `Env::info()` already exposes (`live_readers`, `num_readers`)
 //! so the two views of the same table cannot disagree.
 
 use std::path::{Path, PathBuf};

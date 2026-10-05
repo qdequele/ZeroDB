@@ -1,9 +1,9 @@
 //! Tree invariant checker (SPEC 03 §11 INV-1..21 + SPEC 05 §9 INV-22..26).
-//! Milestones 1.4/1.5 (the M1.12 `zerodb-tools check` command wraps this walk).
+//! The `zerodb-tools check` command wraps this walk.
 //!
 //! [`check_image`] validates a whole env-file image against the live meta's
 //! snapshot and returns every violation found, each tagged with its INV id.
-//! Since M1.5 the **reachable-XOR-free** partition (INV-10/INV-22) is checked
+//! The **reachable-XOR-free** partition (INV-10/INV-22) is checked
 //! unconditionally: every page in `[FIRST_DATA_PGNO, last_pg]` is either
 //! reachable exactly once through a tree or listed exactly once as free in the
 //! GC DB — never both (reuse-while-referenced), never neither (leak).
@@ -224,8 +224,8 @@ impl<'a> Checker<'a> {
                 }
                 // Walk each named-DB sub-tree: its pages join `visited`
                 // (reachable-XOR-free) and its stats are validated against its
-                // own record (INV-18) — check.rs coverage extends to every DB
-                // (M1.6). `leaf` borrows the immutable image (not `&mut self`),
+                // own record (INV-18) — check.rs coverage extends to every
+                // named DB. `leaf` borrows the immutable image (not `&mut self`),
                 // so these `&mut self` calls are sound while it is in scope.
                 for (name, rec) in subdbs {
                     let label = format!("subdb {:?}", String::from_utf8_lossy(&name));
@@ -450,7 +450,7 @@ impl<'a> Checker<'a> {
     /// Validate a `DBRecord` (`name` labels it in violation messages) and walk
     /// its tree. `gc_tree` marks the free/GC DB; `catalog` marks the main DB
     /// (so its `F_SUBDATA` leaf entries are followed as named-DB records,
-    /// SPEC 02 §6, M1.6). A named DB's own tree is neither (`catalog = false`).
+    /// SPEC 02 §6). A named DB's own tree is neither (`catalog = false`).
     fn check_record(&mut self, name: &str, rec: &DBRecord, gc_tree: bool) {
         self.check_record_inner(name, rec, gc_tree, false);
     }
@@ -602,7 +602,7 @@ pub fn check_image(bytes: &[u8], psize: u32) -> Vec<String> {
     };
     checker.check_catalog_record("main_db", &meta.main_db);
     checker.check_record("free_db", &meta.free_db, true);
-    // INV-10 / INV-22 + INV-24 (reachable XOR free, unconditional since M1.5).
+    // INV-10 / INV-22 + INV-24 (reachable XOR free, unconditional).
     checker.check_reachable_xor_free();
     checker.violations
 }

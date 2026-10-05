@@ -14,7 +14,12 @@
 | [`CONSUMER-GATE.md`](CONSUMER-GATE.md) | Meilisearch on ZeroDB: the zero-source-change drop-in check, the consumer test suites, and the LMDB-vs-ZeroDB Meilisearch benchmark (`scripts/consumer.sh`) | Gate + bench procedure |
 | [`TOOLS.md`](TOOLS.md) | Manual for `zerodb-tools` (`stat`/`dump`/`load`/`check`/`migrate-from-lmdb`) | Manual |
 
-Top-level companions: [`PLAN.md`](../PLAN.md) (the milestone roadmap),
-[`PROGRESS.md`](../PROGRESS.md) (the append-only engineering log),
-[`CLAUDE.md`](../CLAUDE.md) (the development law: oracle rules, unsafe policy,
-gate battery).
+Top-level companions: [`AGENTS.md`](../AGENTS.md) (the project rules: oracle
+rules, unsafe policy, check battery), [`CONTRIBUTING.md`](../CONTRIBUTING.md)
+(how to send a change), [`CHANGELOG.md`](../CHANGELOG.md) (release history).
+Planned and open work is tracked in GitHub issues.
+
+The spec, the ADRs, `DIVERGENCES.md` and the performance documents keep their
+own index codes: milestone numbers of the original roadmap (`M1.4`, Phases
+0–3), divergence IDs (`D-001`…) and performance-inventory items (`B12`…). See
+the note at the top of [`DECISIONS.md`](DECISIONS.md).

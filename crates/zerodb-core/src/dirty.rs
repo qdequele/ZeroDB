@@ -1,5 +1,4 @@
 //! The write transaction's dirty-page store (SPEC 04 §6.3, ADR-0004 D1).
-//! Milestone 1.4.
 //!
 //! A [`DirtyStore`] holds a write txn's private, not-yet-committed page copies
 //! as **individually stable frames** indexed by pgno:
@@ -22,11 +21,11 @@
 //! is met by construction; the store never drops a frame under a `&self`
 //! borrow). This module does no I/O; its heap paths are pure safe Rust, and
 //! its one `unsafe` is the sanctioned call of the in-place WRITE_MAP map-slice
-//! broker ([`map_mut`]; CLAUDE.md unsafe policy, ADR-0021). `miri` exercises
+//! broker ([`map_mut`]; AGENTS.md unsafe policy, ADR-0021). `miri` exercises
 //! both realizations (TXN-49; `tests/writemap_in_place_miri.rs` over the
 //! heap-backed test map).
 //!
-//! **Frame reuse (PERF-GAP B3/B12; LMDB's `me_dpages` pool).** A freed or
+//! **Frame reuse (LMDB's `me_dpages` pool).** A freed or
 //! discarded one-page frame is not returned to the allocator immediately;
 //! [`DirtyStore::discard`] parks it on a bounded `spare` list, and
 //! [`DirtyStore::insert_tree_frame`] / [`DirtyStore::insert_copy`] reuse a
@@ -69,7 +68,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::env::Backing;
 
-/// Pgno hasher (PERF-GAP issue #9): every page load inside a write txn
+/// Pgno hasher (issue #9): every page load inside a write txn
 /// probes this store first (`Source::Writer`), and the hannoy-build call
 /// tree put the default `RandomState` SipHash among the top descent costs.
 /// Keys are page numbers authored by the engine itself — never
@@ -106,7 +105,7 @@ impl Hasher for PgnoHasher {
 pub(crate) type PgnoBuildHasher = BuildHasherDefault<PgnoHasher>;
 
 /// Cap on pooled one-page frames — both a store's `spare` list and the
-/// env-level pool it draws from (PERF-GAP B3/B12).
+/// env-level pool it draws from.
 ///
 /// LMDB's `me_dpages` pool has no such cap because LMDB *spills* dirty pages
 /// (`mdb_page_spill`), so its dirty set — and therefore its pool — is bounded
@@ -157,7 +156,7 @@ pub struct DirtyStore<'env> {
     /// and never stored (module docs).
     broker: Option<&'env dyn Backing>,
     /// Recycled one-page frames (exactly `psize` bytes each), reused by
-    /// `insert_tree_frame` / `insert_copy` before allocating (PERF-GAP B3).
+    /// `insert_tree_frame` / `insert_copy` before allocating.
     /// Frames only move to/from here inside `&mut` ops, preserving the TXN-41
     /// stability contract; bounded by [`SPARE_CAP`]. In-map stores still use
     /// it for the `remove` scratch copy.
@@ -192,7 +191,7 @@ impl std::fmt::Debug for DirtyStore<'_> {
 /// the same broker with the same geometry.
 ///
 /// This is the **sole sanctioned call site** of the `unsafe` map-slice broker
-/// (CLAUDE.md unsafe policy, ratified 2026-10-02; ADR-0021 B1): the broker is
+/// (AGENTS.md unsafe policy, ratified 2026-10-02; ADR-0021 B1): the broker is
 /// an `unsafe fn` because it mints `&mut [u8]` from `&self`, and this module
 /// discharges its contract. `map_mut` is itself an `unsafe fn` for the same
 /// reason — no safe function anywhere may mint `&mut` from a shared borrow.
@@ -218,7 +217,7 @@ unsafe fn map_mut(broker: Option<&dyn Backing>, psize: u32, pgno: u64, len: usiz
     let b = broker.expect("Slot::Map exists only in an in-map store");
     let pages = (len / psize as usize) as u64;
     // SAFETY (the brokered contract, `Backing::map_dirty_page` /
-    // `MmapWritable::slice_mut`; CLAUDE.md invariants for this sanction):
+    // `MmapWritable::slice_mut`; AGENTS.md invariants for this sanction):
     //  * Single writer (TXN-6): a `DirtyStore` exists only inside the one
     //    live `RwTxn`, which holds the env's writer lock for its whole life;
     //    no other thread can reach a broker of this env while it does.
@@ -257,8 +256,8 @@ impl<'env> DirtyStore<'env> {
     }
 
     /// An empty store seeded with a pool of recycled one-page frames (the
-    /// env's `me_dpages`-style pool handed in at write-txn begin, PERF-GAP
-    /// B12). The `Vec` is adopted as is, O(1): every write txn, empty ones
+    /// env's `me_dpages`-style pool handed in at write-txn begin). The `Vec`
+    /// is adopted as is, O(1): every write txn, empty ones
     /// included, pays for the pool hand-over, so it must not scale with the
     /// pool size (a per-frame filter here made `env/txn/rw_empty_commit` 6×
     /// slower). The pool only ever holds frames of this env's page size.
@@ -525,7 +524,7 @@ impl<'env> DirtyStore<'env> {
 
     /// Insert a one-page COW copy of `src` for `pgno` and return it mutably (the
     /// caller restamps the header). Heap mode reuses a pooled spare,
-    /// overwriting it with `src`, before allocating (PERF-GAP B3); in-map mode
+    /// overwriting it with `src`, before allocating; in-map mode
     /// (ADR-0021) copies `src` straight into the map page at `pgno` — the one
     /// copy COW inherently costs, with no heap frame and no commit write-back.
     /// `src` must be exactly one page and MUST NOT overlap the map page at
@@ -641,7 +640,7 @@ impl<'env> DirtyStore<'env> {
 
     /// Take up to `cap` one-page frames out of this store — spares first, then
     /// remaining one-page dirty heap frames — to hand back to the env pool at
-    /// end-of-txn (PERF-GAP B12). Called only after the commit pipeline has
+    /// end-of-txn. Called only after the commit pipeline has
     /// finished writing (or on abort, where the frames are discarded garbage):
     /// recycled contents never matter because every reuse zero-fills or fully
     /// overwrites. Run frames and in-map frames (ADR-0021 — the map's bytes
@@ -722,7 +721,7 @@ mod tests {
     fn discarded_one_page_frame_is_reused_and_zeroed() {
         // A discarded one-page frame is handed back to the next allocation
         // (same buffer, no fresh malloc), and `insert_tree_frame` returns it
-        // all-zero even though it last held data (PERF-GAP B3).
+        // all-zero even though it last held data.
         let mut s = DirtyStore::new(4096);
         s.insert_copy(7, &[0xAB; 4096]);
         let addr = s.bytes(7).unwrap().as_ptr() as usize;

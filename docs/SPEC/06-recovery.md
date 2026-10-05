@@ -16,9 +16,9 @@ relies on is [SPEC 05](05-gc.md) §4. Durability-flag semantics come from
 
 Clean-room note: the fork's `mdb_env_open`/`mdb_env_pick_meta` (meta selection)
 and `mdb_env_write_meta`/`mdb_env_sync0` (sync routing) were read to understand
-the *algorithm* (CLAUDE.md rule 4); the guarantees below are ZeroDB's own,
+the *algorithm* (AGENTS.md rule 4); the guarantees below are ZeroDB's own,
 strengthened by the **mandatory** meta CRC (torn-meta detection is Phase 1, not
-Phase 3 — PLAN 0.4). Normative rules are numbered **REC-n**.
+Phase 3 — M0.4). Normative rules are numbered **REC-n**.
 
 The crash-safety spine, stated once: **the meta write is the commit point, and it
 is never made durable before the data pages it references.** Everything else here
@@ -86,7 +86,7 @@ this section defines the **recovery decision** and its error taxonomy.
   unidentifiable — so ZeroDB fails `MdbError::Invalid` rather than guess. This is
   **zerodb-defined behavior**: the fork has no meta CRC, so its selection under a
   torn slot is not observable/pinnable, and there is no oracle to match here.
-  **Ratified 2026-07-16 (Quentin, chat)** — a maintainer may prefer to serve the
+  **Ratified 2026-07-16 (maintainer)** — a maintainer may prefer to serve the
   lone valid older slot instead; until ratified, the conservative hard error
   stands.
 - **REC-3** — **Both invalid → `MdbError::Invalid`** (heed maps to
@@ -101,7 +101,7 @@ this section defines the **recovery decision** and its error taxonomy.
   (log line / diagnostic) that a torn meta was detected and the older snapshot was
   used — the operator should know a commit was lost to a crash. This is not an
   error; it is the designed recovery. (No consumer branches on it; it is
-  observability, PLAN 1.2.)
+  observability, M1.2.)
 - **REC-5** — **PREV_SNAPSHOT recovery interaction** (SPEC 01 §S5, SPEC 04
   TXN-65..67). PREV_SNAPSHOT requires **both** slots valid to identify the older
   (REC-2): it selects the **lower**-txnid valid slot only when two valid slots
@@ -148,7 +148,7 @@ this section defines the **recovery decision** and its error taxonomy.
   guaranteed only against cleanly-committed history, and MUST NOT claim
   crash-proof rollback. The **exact guard** — e.g. refusing PREV_SNAPSHOT unless
   the older meta's referenced pages verify intact, or requiring both slots
-  cleanly valid — was **ratified 2026-07-16 (Quentin, chat): Phase 1 ships the warning only, no verification guard**; a stronger guard remains an ADR seam for Phase 3.
+  cleanly valid — was **ratified 2026-07-16 (maintainer): Phase 1 ships the warning only, no verification guard**; a stronger guard remains an ADR seam for Phase 3.
   This rule deliberately **does not overclaim**: Phase 1 provides best-effort
   single-step rollback with an honest warning, not a guaranteed crash-consistent
   rollback.
@@ -251,7 +251,7 @@ recovered) **except** where explicitly noted as FS-order-dependent.
   (SPEC 04 TXN-63), so the older intact slot is always available.
 
   **M1.11 amendment — the reclaim-clobber window (`NO_META_SYNC`) — RATIFIED
-  2026-07-17 (Quentin; see REC-10 item 4 at the end of this file. Found by
+  2026-07-17 (maintainer; see REC-10 item 4 at the end of this file. Found by
   the ADR-0008 crash harness, 2026-07-16; repro seed 15797139550980166469).** The argument above shows the recovered meta's
   pages were durable *when written*, not that they *remain unclobbered*. The
   hole: after commit `N` returns, its meta write is issued but un-fsynced
@@ -361,7 +361,7 @@ recovered) **except** where explicitly noted as FS-order-dependent.
 
 ---
 
-## §5 — Crash-test protocol (PLAN 1.11, two mechanisms)
+## §5 — Crash-test protocol (M1.11, two mechanisms)
 
 SIGKILL alone cannot tear a write — the OS page cache survives process death, so
 only power loss tears or reorders un-fsynced sectors. The harness therefore has
@@ -416,14 +416,14 @@ obligations (REC-18).
   data before C4 writes meta, no image can contain a durable meta `N` without
   durable `N`-data — the fault backend cannot construct that image, which is the
   formal statement of the crash-safety spine.
-- **REC-21** — **Coverage target** (PLAN 1.11 acceptance): ≥ 10k crash-recovery
+- **REC-21** — **Coverage target** (M1.11 acceptance): ≥ 10k crash-recovery
   cycles clean in CI across both mechanisms, over randomized write workloads
   (put/del/commit/abort, values 0 B–16 MB) and across the durability modes of §3
   (each mode asserting its own REC-18 obligation strength). A single clean run is
   not sufficient; the ≥10k-cycle bar is the milestone gate.
 
 **M1.11 amendments (ADR-0008, Approved 2026-07-16 — implementation of this
-section; behavior clarifications per CLAUDE.md rule 3):**
+section; behavior clarifications per AGENTS.md rule 3):**
 
 - **Cycle accounting (REC-21).** One *cycle* = one recovered-and-verified
   crash state: each materialized fault-plan image variant (mechanism 2) and
@@ -497,7 +497,7 @@ section; behavior clarifications per CLAUDE.md rule 3):**
 | fsync-gate / poison | REC-13 | SPEC 04 §8.1/TXN-60 |
 | file growth safety | REC-14..16 | SPEC 05 GC-16/GC-28 |
 | PREV_SNAPSHOT recovery + crash window | REC-5, REC-22 | SPEC 04 TXN-65..67 (self-resolving, §10) |
-| crash-test protocol | REC-17..21 | PLAN 1.11, `zerodb-io` fault backend |
+| crash-test protocol | REC-17..21 | M1.11, `zerodb-io` fault backend |
 
 **Rule count: REC-1 … REC-22 (22 normative rules; REC-22 is the PREV_SNAPSHOT
 crash-window warning, placed with §1's PREV_SNAPSHOT topic).**
@@ -517,7 +517,7 @@ crash-window warning, placed with §1's PREV_SNAPSHOT topic).**
 >    has no meta CRC, so its torn-slot behavior is unpinnable); **ratified 2026-07-16 — Phase 1 ships the documented warning only, no extra interlock; guard redesign deferred (Phase 3 candidate). Original note: human ratification
 >    pending** on whether to instead serve the lone valid older slot.
 > 4. **`NO_META_SYNC` reclaim-clobber window (REC-10 amendment, M1.11) —
->    RATIFIED 2026-07-17 (Quentin, standing directive, session lead): scoped claim adopted; steady-gated reclaim = Phase 3 candidate.** The ADR-0008 crash harness materialized a
+>    RATIFIED 2026-07-17 (maintainer, standing directive): scoped claim adopted; steady-gated reclaim = Phase 3 candidate.** The ADR-0008 crash harness materialized a
 >    legal power-loss image (repro seed 15797139550980166469) where the
 >    fallback snapshot is structurally corrupted by a younger txn's legally
 >    reclaimed pages — REC-10's original blanket "never corruption" overclaims.

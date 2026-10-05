@@ -1,4 +1,4 @@
-//! M1.4 fix follow-up: regression coverage for the **symmetric** branch-level
+//! Write-path fix follow-up: regression coverage for the **symmetric** branch-level
 //! rebalance paths that the ascending-delete storm tests
 //! (`deep_tree_rebalance.rs`, `write_rebalance_differential.rs`) do not reach.
 //!

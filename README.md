@@ -119,7 +119,7 @@ _(2026-09-30, indicative — 2 reps, feed and 100 M-key runs partial.)_
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | Architecture decision records |
 | [`docs/TOOLS.md`](docs/TOOLS.md) | `zerodb-tools`: stat / dump / load / check / migrate-from-lmdb |
 | [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) | Per-item heed coverage and every difference vs LMDB |
-| [`CLAUDE.md`](CLAUDE.md) | How it's built and verified: spec-first, differential-tested, full gate per change |
+| [`AGENTS.md`](AGENTS.md) | How it's built and verified: spec-first, differential-tested, full gate per change |
 
 Build and test: `cargo test --workspace`, `just fuzz-quick` (differential fuzz vs
 real LMDB), `just bench` (the LMDB-vs-zerodb microbench ladder).

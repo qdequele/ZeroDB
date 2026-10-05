@@ -5,8 +5,10 @@
 //! Everything wraps ZeroDB's native [`zerodb::Env`] (already `Arc`-cloneable,
 //! registry-deduped with `EnvAlreadyOpened`, and deferred-close, TXN-50..53).
 //! The adapter re-imposes three cheap fork boundary behaviors ZeroDB is lenient
-//! about (D-006/D-008/D-010) so the 1.14 gate sees exact parity — each is
-//! checked here, at the heed boundary, and covered by a test. A fourth
+//! about (`map_size` must be an OS-page multiple, `max_readers(0)` is refused,
+//! a NUL in a DB name panics; see docs/DIVERGENCES.md) so the consumer test
+//! suites see exact parity — each is checked here, at the heed boundary, and
+//! covered by a test. A fourth
 //! re-imposition landed with ADR-0010: the **data-file name** ([`DATA_FILE_NAME`]).
 
 use std::cmp::Ordering;
@@ -23,23 +25,24 @@ use crate::txn::{RoTxn, RwTxn, TlsUsage, WithTls, WithoutTls};
 use crate::{Database, DatabaseOpenOptions, Error, Result, Unspecified};
 
 /// The name of the data file an adapter-opened env directory contains
-/// (**ADR-0010**, D-012).
+/// (**ADR-0010**).
 ///
 /// Matches LMDB's directory-env contract, because that name is not private to
 /// LMDB: Meilisearch joins `"data.mdb"` onto an env path in production
 /// compaction (`process_batch.rs`, `routes/tasks/compact.rs`, `meilitool`) and
 /// snapshot code (`process_snapshot_creation.rs`, `enterprise_edition/s3.rs`).
 /// An adapter env dir therefore contains **exactly** this one file — no
-/// `zerodb.dat`, and no `lock.mdb` (nothing reads one; D-001).
+/// `zerodb.dat`, and no `lock.mdb` (nothing reads one; ZeroDB is
+/// single-process).
 ///
-/// The bytes inside are still ZeroDB's own `ZDB1` format (D-002): pointing
+/// The bytes inside are still ZeroDB's own `ZDB1` format: pointing
 /// `mdb_stat`/`mdb_dump` at one fails loudly with `MDB_INVALID` rather than
 /// misreading it. Use `zerodb-tools stat`, which reports the real engine.
 pub const DATA_FILE_NAME: &str = zerodb::HEED_DATA_FILE_NAME;
 
-/// The OS page size (`sysconf(_SC_PAGESIZE)`), for the D-006 boundary check.
+/// The OS page size (`sysconf(_SC_PAGESIZE)`), for the `map_size` boundary check.
 fn os_page_size() -> usize {
-    // SAFETY (adapter boundary, D-006): `sysconf` with a valid name is a pure
+    // SAFETY (adapter boundary, `map_size` check): `sysconf` with a valid name is a pure
     // query with no memory effects; the return is the page size (>0) or -1 on
     // failure, which we clamp to a safe default. This is the sole FFI call in
     // the adapter and mirrors heed's `page_size` crate dependency, used only to
@@ -64,7 +67,7 @@ pub struct EnvOpenOptions<T: TlsUsage = WithTls> {
     map_size: Option<usize>,
     max_readers: Option<u32>,
     max_dbs: u32,
-    /// M2.6 ZeroDB extension — no heed counterpart. `None` = engine default.
+    /// Page-size ZeroDB extension — no heed counterpart. `None` = engine default.
     page_size: Option<u32>,
     flags: EnvFlags,
     /// ADR-0014 ZeroDB extension — no heed counterpart.
@@ -115,7 +118,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         }
     }
 
-    /// Select TLS-backed read txns (`WithTls`). Compile-only shim in Phase 1.
+    /// Select TLS-backed read txns (`WithTls`). Compile-only shim.
     #[must_use]
     pub fn read_txn_with_tls(self) -> EnvOpenOptions<WithTls> {
         self.retag()
@@ -145,15 +148,15 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         self
     }
 
-    /// Select the DB page size (**milestone 2.6**).
+    /// Select the DB page size.
     ///
     /// **ZeroDB extension — heed has no such method**, because LMDB 0.9 derives
     /// its page size from the OS and offers no selector. Code that never calls
     /// it gets exactly what the fork would give it: new stores default to the
     /// **OS page size**, clamped to the engine window (LMDB parity —
-    /// `me_psize = me_os_psize`, capped at 64 K; SPEC 00 row 164). So the
-    /// frozen heed contract (PLAN ground rule 2) is untouched, and this method
-    /// only ever *overrides* that parity default.
+    /// `me_psize = me_os_psize`, capped at 64 K; SPEC 00 row 164). So heed's
+    /// existing API contract, which this crate never changes, is untouched,
+    /// and this method only ever *overrides* that parity default.
     ///
     /// `size` must be a power of two in
     /// `[`[`zerodb::MIN_PAGE_SIZE`]`, `[`zerodb::MAX_PAGE_SIZE`]`]`; an invalid
@@ -161,7 +164,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// The value applies only when **creating** a store — an existing env keeps
     /// its persisted page size (SPEC 02 §3.2). Read the effective value back
     /// from `Env::stat().page_size`. Note this is the **database** page size,
-    /// independent of the OS page size (which gates `map_size` under D-006).
+    /// independent of the OS page size (which gates `map_size` at open).
     pub fn page_size(&mut self, size: u32) -> &mut Self {
         self.page_size = Some(size);
         self
@@ -204,7 +207,8 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
 
     /// Set the env flags (SPEC 00 row 6). `unsafe` for heed signature parity —
     /// the unsafety is vestigial for ZeroDB (no reachable flag enables the
-    /// cross-process behaviors that make this unsafe in LMDB, D-001); the body
+    /// cross-process behaviors that make this unsafe in LMDB — ZeroDB is
+    /// single-process); the body
     /// contains no unsafe operation.
     ///
     /// # Safety
@@ -219,8 +223,8 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// `unsafe` for heed signature parity (see [`EnvOpenOptions::flags`]).
     ///
     /// Re-imposes the fork's open-time boundaries the native engine is lenient
-    /// about: `max_readers(0)` → `Io(InvalidInput)` (D-010), and `map_size` not
-    /// an OS-page multiple → `Io(InvalidInput)` (D-006).
+    /// about: `max_readers(0)` → `Io(InvalidInput)`, and `map_size` not an
+    /// OS-page multiple → `Io(InvalidInput)` (see docs/DIVERGENCES.md).
     ///
     /// # Safety
     ///
@@ -231,23 +235,23 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// [`Error::Io`] (boundary rejections, missing dir, I/O), `Error::Mdb`
     /// (`Invalid`) on a bad store, [`Error::EnvAlreadyOpened`] (TXN-51).
     pub unsafe fn open<P: AsRef<Path>>(&self, path: P) -> Result<Env<T>> {
-        // D-016: `MDB_NOSUBDIR` (env = two files `path` and `path-lock`) is not
+        // `MDB_NOSUBDIR` (env = two files `path` and `path-lock`) is not
         // supported — every ZeroDB env is a directory. Refuse loudly rather than
         // silently creating a directory where the caller expects a file.
         if self.flags.contains(EnvFlags::NO_SUB_DIR) {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                "ZeroDB does not support MDB_NOSUBDIR: an environment is always a directory (D-016)",
+                "ZeroDB does not support MDB_NOSUBDIR: an environment is always a directory",
             )));
         }
-        // D-010: the fork rejects `max_readers(0)` with EINVAL at open.
+        // The fork rejects `max_readers(0)` with EINVAL at open.
         if self.max_readers == Some(0) {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "max_readers must be greater than zero",
             )));
         }
-        // D-006: the fork rejects a `map_size` that is not a multiple of the OS
+        // The fork rejects a `map_size` that is not a multiple of the OS
         // page size.
         if let Some(ms) = self.map_size {
             let page = os_page_size();
@@ -267,7 +271,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         if let Some(r) = self.max_readers {
             opts.max_readers(r);
         }
-        // M2.6 extension. Absent = the **OS page size**, clamped to the engine
+        // Page-size extension. Absent = the **OS page size**, clamped to the engine
         // window — LMDB parity: the fork derives `me_psize` from
         // `sysconf(_SC_PAGE_SIZE)` at creation (capped at 64 K), so a store
         // created through the heed surface must get the same geometry the fork
@@ -282,11 +286,11 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
                 .clamp(zerodb::MIN_PAGE_SIZE, zerodb::MAX_PAGE_SIZE)
         });
         opts.page_size(ps);
-        // ADR-0010 / D-012: re-impose heed's on-disk contract at the heed
+        // ADR-0010: re-impose heed's on-disk contract at the heed
         // boundary — an env opened through this adapter materializes as
         // `<dir>/data.mdb`, the name Meilisearch hardcodes in its production
         // compaction and snapshot paths. No `lock.mdb` is created: ZeroDB is
-        // single-process (D-001) and nothing in the consumer tree reads one.
+        // single-process and nothing in the consumer tree reads one.
         opts.data_file_name(DATA_FILE_NAME);
         opts.flags(zerodb_env_flags(self.flags));
         opts.file_trust(self.file_trust);
@@ -303,8 +307,8 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
 }
 
 /// Translate heed `EnvFlags` → ZeroDB `EnvFlags` (SPEC 01 Table 1). Only the
-/// Phase-1 flags carry semantics; the rest (cross-process, no-op under D-001)
-/// are dropped.
+/// LMDB-parity flags carry semantics; the rest (cross-process, no-ops in a
+/// single-process engine) are dropped.
 fn zerodb_env_flags(flags: EnvFlags) -> zerodb::EnvFlags {
     let mut z = zerodb::EnvFlags::EMPTY;
     if flags.contains(EnvFlags::WRITE_MAP) {
@@ -426,14 +430,13 @@ impl<T> Env<T> {
         Ok(self.get_flags_bits().bits())
     }
 
-    /// Environment info (SPEC 00 rows 20/60; `mdb_env_info`). **Completed in
-    /// milestone 2.1** — every field is now populated from the live snapshot
-    /// and the reader table, where Phase 1 filled only `map_size`.
+    /// Environment info (SPEC 00 rows 20/60; `mdb_env_info`). Every field is
+    /// populated from the live snapshot and the reader table.
     ///
     /// `map_addr` is always null: it is `MDB_envinfo::me_mapaddr`, meaningful
     /// only under `MDB_FIXEDMAP`, which ZeroDB does not implement (SPEC 01).
     /// The field is kept for heed signature parity. `last_page_number` carries
-    /// LMDB's *meaning* but a ZeroDB-format *value* (D-002) — do not compare it
+    /// LMDB's *meaning* but a ZeroDB-format *value* — do not compare it
     /// against LMDB. See [`zerodb::EnvInfo`] for the full mapping table.
     #[must_use]
     pub fn info(&self) -> EnvInfo {
@@ -448,13 +451,13 @@ impl<T> Env<T> {
         }
     }
 
-    /// Env-level statistics (SPEC 00 second table — **landed in milestone
-    /// 2.1**): the main DB's `MDB_stat`. Delegates to [`zerodb::Env::stat`],
-    /// which reads the published snapshot directly — no read txn is opened, so
+    /// Env-level statistics (SPEC 00 second table): the main DB's `MDB_stat`.
+    /// Delegates to [`zerodb::Env::stat`], which reads the published snapshot
+    /// directly — no read txn is opened, so
     /// this no longer consumes a reader slot or fails silently to zeros when
     /// the reader table is full.
     ///
-    /// Page counts are ZeroDB-format values (D-002); see [`zerodb::EnvStat`].
+    /// Page counts are ZeroDB-format values; see [`zerodb::EnvStat`].
     #[must_use]
     pub fn stat(&self) -> EnvStat {
         let s = self.inner.stat();
@@ -490,7 +493,7 @@ impl<T> Env<T> {
     /// # Errors
     ///
     /// [`Error::Mdb`] (`BadValSize`/`Incompatible`) on a bad/colliding name;
-    /// `Error::Io` on an embedded NUL in `name` (D-008 boundary).
+    /// `Error::Io` on an embedded NUL in `name` (C-string name boundary).
     pub fn open_database<KC, DC>(
         &self,
         rtxn: &RoTxn,
@@ -619,7 +622,7 @@ impl<T> Env<T> {
         File::open(path.as_ref()).map_err(Into::into)
     }
 
-    /// Copy this environment to `path`, reporting progress (**milestone 2.3**).
+    /// Copy this environment to `path`, reporting progress.
     ///
     /// **ZeroDB extension — heed's copy is an opaque blocking call.** See
     /// [`zerodb::CopyToFile::copy_to_file_with_progress`] for the callback
@@ -652,9 +655,9 @@ impl<T> Env<T> {
             .map_err(Into::into)
     }
 
-    /// Force durability of all prior commits (SPEC 00 second table — **landed
-    /// in milestone 2.5**). Exactly `mdb_env_sync(env, 1)`; the only form heed
-    /// exposes. Equivalent to [`Env::sync`]`(true)`.
+    /// Force durability of all prior commits (SPEC 00 second table). Exactly
+    /// `mdb_env_sync(env, 1)`; the only form heed exposes. Equivalent to
+    /// [`Env::sync`]`(true)`.
     ///
     /// # Errors
     ///
@@ -663,8 +666,8 @@ impl<T> Env<T> {
         self.inner.force_sync().map_err(Into::into)
     }
 
-    /// Explicit environment sync — full `mdb_env_sync(env, force)` parity
-    /// (**milestone 2.5**). **ZeroDB extension:** heed exposes only
+    /// Explicit environment sync — full `mdb_env_sync(env, force)` parity.
+    /// **ZeroDB extension:** heed exposes only
     /// [`Env::force_sync`] (the `force = true` form), so there is no heed
     /// signature to mirror here.
     ///
@@ -686,19 +689,20 @@ impl<T> Env<T> {
         self.inner.path()
     }
 
-    /// The configured reader-table size (SPEC 00 second table — **landed in
-    /// milestone 2.1**; `mdb_env_get_maxreaders`). Reads the real table
-    /// capacity, where Phase 1 returned the LMDB default constant.
+    /// The configured reader-table size (SPEC 00 second table;
+    /// `mdb_env_get_maxreaders`). Reads the real table capacity rather than
+    /// returning the LMDB default constant.
     #[must_use]
     pub fn max_readers(&self) -> u32 {
         self.inner.info().max_readers
     }
 
-    /// Reader slots **currently** occupied (**milestone 2.1**).
+    /// Reader slots **currently** occupied.
     ///
     /// **ZeroDB extension — no heed/LMDB counterpart.** `EnvInfo`'s
     /// `number_of_readers` mirrors `MDB_envinfo::me_numreaders`, which is a
-    /// *high-water mark* that never decreases (D-011); this is the live count
+    /// *high-water mark* that never decreases (LMDB parity; see
+    /// docs/DIVERGENCES.md); this is the live count
     /// it is usually mistaken for. Exposed as a method rather than an `EnvInfo`
     /// field so the mirrored struct keeps heed's exact shape.
     #[must_use]
@@ -706,11 +710,11 @@ impl<T> Env<T> {
         self.inner.info().live_readers
     }
 
-    /// The maximum key size (SPEC 00 second table — SHOULD, **landed in
-    /// milestone 2.7**; `mdb_env_get_maxkeysize`, SPEC 03 §2.1).
+    /// The maximum key size (SPEC 00 second table — SHOULD;
+    /// `mdb_env_get_maxkeysize`, SPEC 03 §2.1).
     ///
-    /// Reports the engine's real [`zerodb::MAX_KEY_SIZE`]. Until 2.7 this
-    /// returned a hardcoded `511` — the same defect class 2.1 fixed in
+    /// Reports the engine's real [`zerodb::MAX_KEY_SIZE`]. This once returned
+    /// a hardcoded `511` — the same defect class once fixed in
     /// [`Env::max_readers`]: the value happened to be right, but it was a
     /// literal that would silently stop matching the engine the moment the
     /// constant moved.
@@ -719,7 +723,7 @@ impl<T> Env<T> {
         zerodb::MAX_KEY_SIZE
     }
 
-    /// List the environment's occupied reader slots (**milestone 2.2**).
+    /// List the environment's occupied reader slots.
     ///
     /// **ZeroDB extension — heed exposes no reader introspection.** This is
     /// the single-process analogue of `mdb_reader_list`. See
@@ -737,11 +741,10 @@ impl<T> Env<T> {
         EnvClosingEvent(self.inner.prepare_for_closing())
     }
 
-    /// Clear stale readers (SPEC 00 second table — SHOULD, **landed in
-    /// milestone 2.2**; `mdb_reader_check`).
+    /// Clear stale readers (SPEC 00 second table — SHOULD; `mdb_reader_check`).
     ///
     /// **Always 0, and that is the correct answer rather than a stub.** ZeroDB
-    /// is single-process (D-001): the reader table is process memory, every
+    /// is single-process (see docs/DIVERGENCES.md): the reader table is process memory, every
     /// slot is owned by a `RoTxn` that releases it in `Drop`, and a dead
     /// process takes the whole table with it. There is no cross-process
     /// abandoned slot for `mdb_reader_check` to reap. Kept so heed code that

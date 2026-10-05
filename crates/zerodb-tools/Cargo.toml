@@ -24,15 +24,15 @@ zerodb = { path = "../zerodb", version = "=0.1.0" }
 zerodb-core = { path = "../zerodb-core", version = "=0.1.0" }
 # Read-only file helpers (probe_page_size) for the offline `check` walk; no C.
 zerodb-io = { path = "../zerodb-io", version = "=0.1.0" }
-# `flock`-based advisory liveness guard on the data file (SPEC/D-001: no
-# cross-process protocol exists, so the guard is best-effort). libc is on the
-# CLAUDE.md allowlist; the single `unsafe` FFI block is confined to
-# `src/lock.rs` with a SAFETY comment. This EXPANDS the CLAUDE.md unsafe policy
-# (which lists only zerodb-core::page/readers and zerodb-io and the oracle) to
-# cover zerodb-tools flock — flagged for a human to record in CLAUDE.md.
+# `flock`-based advisory liveness guard on the data file (ZeroDB is
+# single-process, see docs/DIVERGENCES.md: no cross-process protocol exists, so
+# the guard is best-effort). libc is on the AGENTS.md allowlist; the single
+# `unsafe` FFI block is confined to `src/lock.rs` with a SAFETY comment. The
+# AGENTS.md unsafe policy lists this flock as in use and awaiting maintainer
+# review.
 libc.workspace = true
 # migrate-from-lmdb only: opens a real LMDB env read-only (the Meilisearch
-# fork). Off by default; see ADR-0001 M1.12 amendment.
+# fork). Off by default; see the ADR-0001 amendment (2026-07-17).
 heed = { version = "=0.22.1", optional = true }
 
 [features]
