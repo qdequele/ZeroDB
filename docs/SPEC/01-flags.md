@@ -1,5 +1,9 @@
 # SPEC 01 — LMDB flag & semantics matrix (Phase 0.2 deliverable)
 
+> Revised 2026-10-05: NO_READ_AHEAD landed status, WRITE_MAP in-place note
+> (§S7, ADR-0021), the two parked-2.8a observation pins (§S8, Table 3
+> `MDB_RESERVE`) adopted as spec text.
+
 Status: **DONE** — 2026-07-15. **M1.10 landed addendum** — 2026-07-16 (the
 env write-mode / durability / RDONLY flags implemented; see the *M1.10 landed
 flag matrix* at the end of this file for each flag's landing test).
@@ -58,7 +62,7 @@ through `EnvOpenOptions::read_txn_with_tls()` / `read_txn_without_tls()`.
 | `MDB_MAPASYNC` | `0x100000` | `EnvFlags::MAP_ASYNC` | **SHOULD** † | 1.10 | `durability_mapasync_writemap` | Only meaningful with `WRITE_MAP`: use `MS_ASYNC` instead of `MS_SYNC` for the commit `msync` (`flags = (MAPASYNC && !force) ? MS_ASYNC : MS_SYNC`). A crash can then lose/corrupt the last txns. No consumer; PLAN 1.10 (†, §S6). |
 | `MDB_NOTLS` | `0x200000` | *(via `read_txn_without_tls()`; `EnvFlags::NO_TLS` **deprecated**)* | **MUST** | 1.2, 1.8 | `flag_notls_rotxn_is_send` | SPEC 00 rows 2/29: **every** production open is `WithoutTls`. Ties reader-table slots to the `MDB_txn` object instead of a thread-local, making `RoTxn: Send` (rayon/async fan-out). In the fork this is the branch taken in `mdb_txn_renew0` (`env->me_flags & MDB_NOTLS`). zerodb makes WithoutTls the default (and effectively only) mode; the WithTls path is a thin shim (SPEC 00 second table). The `EnvFlags::NO_TLS` constant is deprecated in heed 0.22 in favor of the `EnvOpenOptions` methods. |
 | `MDB_NOLOCK` | `0x400000` | `EnvFlags::NO_LOCK` | **WON'T** | — | — | "caller manages their own locks" — the cross-process locking escape hatch. D-001: zerodb is single-process with no lock file, so the concept does not apply. No consumer. |
-| `MDB_NORDAHEAD` | `0x800000` | `EnvFlags::NO_READ_AHEAD` | **SHOULD** | 2.7 / 3.7 | `zerodb/tests/no_read_ahead.rs` | Turns off OS readahead (`madvise(MADV_RANDOM)`), no effect on Windows. **Honored since 2026-09-29, as LMDB does:** the map (read-only or `WRITE_MAP`) is advised `MADV_RANDOM` at open; the test checks the `rr` VmFlag on Linux. No consumer passes it (hannoy instead issues its own `madvise(WILLNEED)`, SPEC 00 §B.9), but rust-storage-bench's heed backend does, and without it a random-read workload larger than memory thrashes (Phase D: ~10 GB read in 60 s for a 1.5 GB DB under a 2 GB cap). |
+| `MDB_NORDAHEAD` | `0x800000` | `EnvFlags::NO_READ_AHEAD` | **SHOULD** | landed 2026-09-29 | `zerodb/tests/no_read_ahead.rs` | Turns off OS readahead (`madvise(MADV_RANDOM)`), no effect on Windows. **Honored since 2026-09-29, as LMDB does:** the map (read-only or `WRITE_MAP`) is advised `MADV_RANDOM` at open; the test checks the `rr` VmFlag on Linux. No consumer passes it (hannoy instead issues its own `madvise(WILLNEED)`, SPEC 00 §B.9), but rust-storage-bench's heed backend does, and without it a random-read workload larger than memory thrashes (Phase D: ~10 GB read in 60 s for a 1.5 GB DB under a 2 GB cap). |
 | `MDB_NOMEMINIT` | `0x1000000` | `EnvFlags::NO_MEM_INIT` | **SHOULD** | 2.7 | `env_nomeminit_accepted_noop` | Skip zero-filling `malloc`'d pages before writing them to the datafile (a data-leak/Valgrind trade-off). `clean_limit` in `mdb_page_dirty` keys off `(NOMEMINIT|WRITEMAP)`. No consumer; the header itself notes it "is not needed with `MDB_WRITEMAP`". zerodb controls its own dirty-page allocation, so this can be a documented no-op. |
 | `MDB_PREVSNAPSHOT` | `0x2000000` | `EnvFlags::PREV_SNAPSHOT` | **MUST** | 1.2, 1.10 | `env_prevsnapshot_opens_older_meta` | SPEC 00 row 9 (milli `Index::rollback`). Opens the env on the **older** of the two meta pages. `mdb_env_pick_meta` XORs the newer-meta selection with this flag: `metas[(m0.txnid < m1.txnid) ^ (flags & PREVSNAPSHOT)]`. Open protocol subtleties in §S5 (requires exclusive access; auto-cleared on first commit). |
 
@@ -106,7 +110,7 @@ and never appear as a user-visible `PutFlags` bit; `MULTIPLE` is unexposed.
 | `MDB_NOOVERWRITE` | `0x10` | `PutFlags::NO_OVERWRITE` | **SHOULD** ‡ | 1.10 | `flag_no_overwrite_returns_existing` | If the key already exists, **do not overwrite**: LMDB copies the existing value into the caller's `data` (`*data = d2`) and returns `MDB_KEYEXIST` → heed `MdbError::KeyExist`. The returned-existing-value contract is load-bearing (§S2). No consumer passes it, but PLAN 1.10 lists it in Phase-1 scope (‡, Mismatches note 2). |
 | `MDB_NODUPDATA` | `0x20` | `PutFlags::NO_DUP_DATA` | **WON'T** (→2.8) | — | — | DUPSORT-only: skip if the key/value pair already exists; on `mdb_cursor_del` removes all dups. No consumer (no DUPSORT DB). D-004. |
 | `MDB_CURRENT` | `0x40` | `Cursor::put_current` (internal) | **MUST** | 1.4 | `cursor_put_current_overwrite`, `cursor_put_current_uninit_einval` | SPEC 00 row 33 (milli/arroy/hannoy/cellulite `put_current`/`put_current_with_options`). Overwrite the value at the current cursor position. Requires the cursor be positioned (`C_INITIALIZED`) else `EINVAL`. The `_with_options` form re-encodes with a different data codec. `unsafe`: no live borrow into the entry may span the call (§S3). |
-| `MDB_RESERVE` | `0x10000` | `Database::put_reserved` (internal) | **MUST** | 1.10 | `put_reserved_writes_into_map`, `put_reserved_overwrite_same_size` | SPEC 00 row 35 (milli word-prefix docids). Allocate space for the value and return a pointer to it (`data->mv_data = METADATA(page)` / `= olddata.mv_data`); the caller fills it in-place, avoiding a temp buffer. ~~Not valid with DUPSORT~~ **observed 2.8a pin: lmdb.h forbids it with DUPSORT but the fork does NOT reject it — the reserved bytes are stored as an ordinary dup value (SPEC 03 §12.1 O5; ⚠ pending adjudication)**. Lifetime + `WRITE_MAP` interaction in §S3/§S7. |
+| `MDB_RESERVE` | `0x10000` | `Database::put_reserved` (internal) | **MUST** | 1.10 | `put_reserved_writes_into_map`, `put_reserved_overwrite_same_size` | SPEC 00 row 35 (milli word-prefix docids). Allocate space for the value and return a pointer to it (`data->mv_data = METADATA(page)` / `= olddata.mv_data`); the caller fills it in-place, avoiding a temp buffer. ~~Not valid with DUPSORT~~ **observed 2.8a pin: lmdb.h forbids it with DUPSORT but the fork does NOT reject it — the reserved bytes are stored as an ordinary dup value (SPEC 03 §12.1 O5; pinned by `zerodb-oracle/tests/dup_pin_semantics.rs`, adopted as spec text in the 2026-10-05 maintainer-authorized docs pass; the DUPSORT work itself stays parked, D-004)**. Lifetime + `WRITE_MAP` interaction in §S3/§S7. |
 | `MDB_APPEND` | `0x20000` | `PutFlags::APPEND` | **MUST** | 1.10 | `flag_append_out_of_order`, `flag_append_ascending_ok`, `flag_append_equal_key_keyexist` | SPEC 00 rows 32/33 (arroy bulk item append; milli facet bulk via `put_current_with_options`). Fast bulk insert assuming ascending key order: LMDB positions at the **last** key and compares (`md_cmp(key, last)`). If `key > last` → insert at end (no page split). If `key <= last` (**including equal**) → `MDB_KEYEXIST` → heed `KeyExist` → arroy `InvalidItemAppend`. Only the last key is checked, not full order (§S1). |
 | `MDB_APPENDDUP` | `0x40000` | `PutFlags::APPEND_DUP` | **WON'T** (→2.8) | — | — | DUPSORT append of a dup value in sorted order. No consumer (no DUPSORT DB). D-004. |
 | `MDB_MULTIPLE` | `0x80000` | *(unexposed by heed)* | **WON'T** (→2.8) | — | — | DUPFIXED-only bulk-store of many fixed-size dup values in one call; `data[1].mv_size` carries the count. Returns `MDB_INCOMPATIBLE` if the DB is not DUPFIXED. Not exposed by heed; no consumer. D-004. |
@@ -316,7 +320,10 @@ layer differs — pwrite/io_uring vs writemap+msync):
 several other rules:
 - Writes mutate the mapped file directly (writable mmap); there is no separate
   `malloc`'d dirty page to `pwrite`. Commit flushes with `msync` (sync or async
-  per `MAP_ASYNC`) plus, on macOS/Windows, an `fdatasync` of the data fd.
+  per `MAP_ASYNC`) plus, for a synchronous flush, an `fdatasync` of the data fd.
+  *(Revised 2026-10-05: the `fdatasync` was originally scoped to macOS/Windows,
+  where `msync` alone is not a full barrier; `WriteMapBacking::sync` runs it on
+  every platform — a strict superset, SPEC 06 REC-12.)*
 - `put_reserved` (§S3) returns a pointer straight into the writable map, so the
   reserved bytes are literally the on-disk bytes; the value-borrow contract
   (SPEC 04) must treat writemap and non-writemap dirty storage uniformly from the
@@ -326,8 +333,12 @@ several other rules:
   sync fd (`me_mfd`) at open (`if (!(flags & (RDONLY|WRITEMAP))) mdb_fopen(...)`).
 - `NO_SYNC | WRITE_MAP` is called out in the header as leaving "no hint for when
   to write transactions to disk"; `MAP_ASYNC | WRITE_MAP` is the intended relaxed
-  mode. zerodb should spec both the heap-buffer writer and the writemap writer as
-  two explicit modes (PLAN M1.10) and prove `put_reserved` parity in each.
+  mode. zerodb specs both the heap-buffer writer and the writemap writer as
+  two explicit modes (landed M1.10) and proves `put_reserved` parity in each.
+  Since ADR-0021 (PR #88) the `WRITE_MAP` mode is **truly in-place**: a write
+  txn's dirty frames are realized in the writable map at allocation/edit time
+  rather than in heap frames copied in at commit (SPEC 04 §6.4 TXN-45b;
+  `zerodb-io::mmap` brokered slice, `zerodb-core::dirty`).
 
 ### §S8 — `mdb_dbi_open` error precedence (named-DB catalog)
 
@@ -346,8 +357,10 @@ Order of checks, each with its exact code, for zerodb's M1.6 catalog to match:
 7. no free slot and `numdbs >= maxdbs` → `MDB_DBS_FULL`.
 8. ~~reopening an existing named DB with a **different** persistent-flags set →
    `MDB_INCOMPATIBLE` (checked against `PERSISTENT_FLAGS`)~~ — **FALSIFIED BY
-   OBSERVATION (2.8a pin, 2026-07-20; ⚠ human ratification of the corrected
-   text pending, see the 2.8a stop-report).** The fork's `mdb_dbi_open` has
+   OBSERVATION (2.8a pin, 2026-07-20; corrected text adopted in the
+   2026-10-05 maintainer-authorized docs pass — the observation is pinned by
+   the oracle test below and the 2.8a stop-report; the DUPSORT work itself
+   stays parked, D-004).** The fork's `mdb_dbi_open` has
    **no** persistent-flags mismatch check: for an existing named DB the
    persisted `md_flags` are copied into the dbi slot and the caller's
    requested flag bits are **silently ignored** (a DUPSORT DB opened
@@ -445,7 +458,7 @@ they are re-listed here for a single flag-matrix view (PLAN §1.10 acceptance).
 
 | Flag | Table | Behavior (landed) | Landing test | Kind |
 |------|-------|-------------------|--------------|------|
-| `MDB_WRITEMAP` | 1 | Writes go through a writable mmap (`zerodb-io::WriteMapBacking`); commit `msync` instead of `pwrite`+`fdatasync`. Realized as a commit-time write strategy — heap dirty frames during the txn, copied into the map at C2 (SPEC 04 §6.4, amended). *(As landed 2026-07-16; since ADR-0021, PR #88, the real map backing realizes dirty frames in the map at allocation instead — SPEC 04 TXN-45b.)* | `env_writemap_put_get_parity`, `env_writemap_put_reserved` (oracle, both engines in WRITE_MAP); `writemap_put_get_reserved_persist`, `writemap_reopened_as_writemap_sees_data` (`crates/zerodb/tests/write_flags.rs`) | differential + e2e |
+| `MDB_WRITEMAP` | 1 | Writes go through a writable mmap (`zerodb-io::WriteMapBacking`); commit `msync` (+ `fdatasync` on a synchronous flush) instead of `pwrite`+`fdatasync`. Realized as a commit-time write strategy — heap dirty frames during the txn, copied into the map at C2 (SPEC 04 §6.4, amended). *(As landed 2026-07-16; since ADR-0021, PR #88, the real map backing realizes dirty frames in the map at allocation instead — SPEC 04 TXN-45b.)* | `env_writemap_put_get_parity`, `env_writemap_put_reserved` (oracle, both engines in WRITE_MAP); `writemap_put_get_reserved_persist`, `writemap_reopened_as_writemap_sees_data` (`crates/zerodb/tests/write_flags.rs`) | differential + e2e |
 | `MDB_MAPASYNC` | 1 | With WRITE_MAP, C3/C5 use `msync(MS_ASYNC)`. | `durability_mapasync_writemap` (oracle); `map_async_makes_barriers_async` (barrier count); `mapasync_writemap_commit_and_force_sync` (e2e) | differential + control-flow |
 | `MDB_NOSYNC` | 1 | Skip **both** C3 and C5 fsync (SPEC 06 REC-9). Restored by `force_sync`. | `durability_nosync_no_fsync` (oracle); `no_sync_skips_both_barriers` / `no_sync_dominates_no_meta_sync` (barrier count) | differential + control-flow |
 | `MDB_NOMETASYNC` | 1 | fsync data (C3), skip meta fsync (C5); recovery falls back to newest durable meta, corruption-free (REC-10). | `durability_nometasync` (oracle); `no_meta_sync_skips_meta_barrier` (barrier count) | differential + control-flow |

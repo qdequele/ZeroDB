@@ -1,5 +1,9 @@
 # SPEC 04 — Transactions & MVCC
 
+Revised 2026-10-05 — docs sweep: snapshot-object field list brought up to the
+shipped shape (`last_pg`, free-list annex — ADR-0022), dirty-frame pool noted
+(commit 10c98a1).
+
 Status: **DONE** — 2026-07-15 (milestone 0.4). Behavioral source of truth for the
 transaction lifecycle (M1.4), the reader table and concurrency (M1.8), nested
 read transactions (M1.9), and the write-txn value-borrow contract that every
@@ -276,8 +280,15 @@ only a full fence / `SeqCst` does.
   LMDB-NOTLS read-open parity as the bar.)* `EnvInner` holds a
   **published-snapshot cell**: the current `Arc<Snapshot>` plus a mirroring
   `commit_point: AtomicU64` equal to the object's txnid. `Snapshot` is an
-  **immutable** value `{ txnid, main_db, free_db, catalog view }` (the roots and
-  DBRecords of one committed state). Rules:
+  **immutable** value `{ txnid, last_pg, main_db, free_db, free-list annex }`
+  (the roots and DBRecords of one committed state; the main record doubles as
+  the named-DB catalog view). `last_pg` is the snapshot's committed high-water
+  — the bound every committed-map resolution enforces (TXN-38) — and the
+  free-list annex is the meta's `fl_ids` (format v2, ADR-0022 / SPEC 05 §2a),
+  carried **in the snapshot** because the meta slot `txnid & 1` is overwritten
+  by txn `txnid + 2` even while this snapshot stays pinned (TXN-63), so holders
+  (the next writer's GC-30 carry, `free_page_count`, `copy`) must never re-read
+  the slot. Rules:
   - The writer builds a fresh `Arc<Snapshot>` at commit step **C6** (SPEC 04 §9),
     under the write mutex, and publishes it in **this order**: (1) swap the new
     `Arc<Snapshot>` into the cell, then (2) `commit_point.store(writer_txnid,
@@ -662,6 +673,13 @@ dirty-page store must be built so it is.
   Adding a new dirty page or run allocates a **new** frame; it never disturbs the
   address of any existing frame. The per-`psize` rule (above) governs tree pages;
   overflow runs are the contiguous-frame exception.
+  *(Realization note — frame pool, commit 10c98a1, PERF-GAP B3/B12; LMDB's
+  `me_dpages`.) One-page frames are recycled: within a txn a freed/spilled
+  frame parks on a bounded spare list, and at txn end up to `SPARE_CAP` (256)
+  spares ride back to an env-level pool that seeds the next write txn's store.
+  Reuse happens only at `&mut` boundaries within a txn (TXN-43) and across txn
+  ends otherwise, so the stability guarantee above is untouched; run frames and
+  in-map frames (TXN-45b) are never pooled.*
 - **TXN-42** — COW (SPEC 03 §5) allocates a fresh frame, `memcpy`s the source
   page into it, and inserts it; it never edits a frame's backing identity.
   Editing an already-dirty page (SPEC 03 §5 rule 2) writes in place within its

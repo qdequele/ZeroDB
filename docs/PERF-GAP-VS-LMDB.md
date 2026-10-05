@@ -669,9 +669,24 @@ fix), so their pre-fix numbers are not comparable.
 B7: `commit/batch/n1` 2.04× → 1.60×); lazy first-touch validation was
 measured and parked (ADR-0016), while the env-wide validation cache landed
 (ADR-0018, seeded at commit; writers probe it but never publish). The
-used-portion COW copy is not done: `touch` still copies the whole page. Under
-`WRITE_MAP`, B5 removes the heap COW frame and the commit write-back
-altogether.
+used-portion COW copy was tried and falsified (amendment below): `touch` keeps
+copying the whole page. Under `WRITE_MAP`, B5 removes the heap COW frame and
+the commit write-back altogether.
+
+**Amendment 2026-10-02 — used-portion COW copy is FALSIFIED, do not retry.**
+The census item "`touch` copies the whole page" was implemented as a used-portion
+copy (`cow_gap` skips the free gap on recycled frames, LMDB `mdb_page_copy`
+shape; local branch `qdequele/perf-b12-used-portion-cow`, green gate + clean
+spec-review, never merged). Three-column A/B on the bench server (x86-64, 3
+rounds): `commit/batch/n1` 1.95× → **1.93×** (after÷before 0.997 ±0.031), all
+17 commit/put/mixed rungs flat, 0 improved. **Reverted.** B18's dirty-frame pool
+had already removed the *allocation* cost the census attributed to `touch`; the
+remaining memcpy (≤ one page) is below the 3 % noise floor, and skipping the gap
+leaks stale cross-DB/aborted bytes into on-disk gaps for no measured gain. The
+per-op commit gap is the OTHER census items — free-list save (since moved into
+the meta page, ADR-0022), `allocate`, meta encode — plus validation, not the
+copy. (Recorded on 2026-10-02 in commit 279ceba on an unmerged branch; carried
+here 2026-10-05.)
 
 ### B13. Hot paths sit above LLVM's inlining threshold — **MEASURED 2026-09-26; source-level lever DONE (eb450ac)**
 Bench server (x86-64, 4 KiB, turbo off). The same commit is built four ways,
@@ -1113,8 +1128,8 @@ What remains, and its gate:
 - **Delete path:** B8, the rebalance itself (`del/bulk/*` 1.75×,
   `del/cursor/drain` 2.72× — B22 repaired only the leftmost pairing). Design
   change, ADR first; no tracking issue yet.
-- **Commit constants:** the rest of B12 — the used-portion COW copy is not
-  done; `commit/batch/n1` is 1.60× after ADR-0022 and
+- **Commit constants:** the rest of B12 (`allocate`, meta encode; the
+  used-portion COW copy was falsified 2026-10-02); `commit/batch/n1` is 1.60× after ADR-0022 and
   `env/txn/rw_empty_commit` 2.4–2.5× (B11, B18).
 - **Profile-gated micro levers:** A5 (branch-level cursor cache; one try read
   flat), A7 (#14 comparator monomorphization), the B1 residual (#7:

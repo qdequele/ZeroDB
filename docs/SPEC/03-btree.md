@@ -7,6 +7,14 @@ Pseudocode is illustrative, not code to transliterate; the LMDB fork was read to
 understand the *algorithms* (CLAUDE.md rule 4), and the semantics below are
 pinned to the oracle (SPEC 00/01), not to LMDB's C.
 
+> **Revised 2026-10-05** — brought up to date with the merged engine: cursor-free
+> point get (`Tree::find_exact`, §2); default-compare integer fast path (§2.0,
+> ef61096); dirty-frame staging, spilling and in-place WRITE_MAP cross-refs in §5
+> (ADR-0017/ADR-0021); §6.1 same-size fast path scoped to inline values;
+> single-descent `put_reserved` (3cee9aa); §8 allocation/free updated for the
+> meta free-list annex (ADR-0022) and the shipped M1.8 reader table; §12 DUPSORT
+> marked parked (milestone 2.8, 2026-07-20).
+
 > **AMENDED 2026-07-20 (milestone 2.4).** The ordering statement below was
 > absolute in Phase 1; it is now parameterized. Read §2.0 first — everything
 > after it that says "memcmp" means "the tree's ordering", which is memcmp for
@@ -36,6 +44,18 @@ ordering any consumer uses (SPEC 00 row 53); substitute `cmp` throughout.
 fixed for the tree's lifetime. All of §2, §4, §6, §7, §10 and the INV-5/INV-6
 invariants of §11 hold with respect to *that tree's* ordering, not with respect
 to byte order.
+
+**Default-ordering fast path (commit ef61096, kept).** The default comparison
+(`KeyCmp::Default`) compares two *equal-length* 8- or 4-byte keys as single
+big-endian integers instead of calling `memcmp` (milli/hannoy key the hot trees
+on fixed-width big-endian u32/u64 ids; PERF-GAP B13). For equal-length slices,
+big-endian integer order **is** memcmp order — the most significant differing
+byte decides both — so the result is exactly `a.cmp(b)` for every input; every
+other length pair falls through to the plain slice comparison. This is a
+code-path choice, not an ordering change; it is pinned by a proptest over all
+length pairs and an end-to-end binary-search equivalence test
+(`cmp.rs::fast_path_equals_slice_cmp_all_lengths`,
+`lookup_over_be_keys_matches_binary_search`).
 
 Why the main DB is excluded: it doubles as the named-DB **catalog** (SPEC 02
 §6). Its keys are database names and its `F_SUBDATA` values are engine-internal
@@ -84,7 +104,7 @@ with a different `Comparator::name` is refused (`Io(InvalidInput)`). The
 at open is the natural fix and there is nowhere to put one: `DBRecord` is
 exactly 48 bytes with every offset assigned (SPEC 02 §3.1), and its only two
 unused *values* — `flags` (offset 42) and `leaf2_ksize` (offset 44) — are
-already reserved for DUPSORT/DUPFIXED in milestone 2.8. Widening the record or
+already reserved for DUPSORT/DUPFIXED in milestone 2.8 (parked 2026-07-20, §12). Widening the record or
 repurposing those fields is an on-disk **format** change, which CLAUDE.md rule 6
 puts behind an ADR and human approval. **Deliberately not taken in 2.4**; the
 hazard is documented, filed as D-014, and left for a maintainer decision.
@@ -149,6 +169,14 @@ search(tree, key):
 `c.ki[top] < NUMKEYS(leaf)` and `entrykey(c.ki[top]) == key` → return value
 (inline slice, or read the overflow run for BIGDATA); else `None` (heed maps a
 missing key to `Ok(None)`, never an error — SPEC 00 rows 14/30).
+
+*(Realization note, perf track 2026-09-27: the engine implements point `get` as
+a cursor-free exact descent, `Tree::find_exact` — no path stack is built, and
+exactness comes straight from the leaf's binary search rather than a second
+compare of the found key, as LMDB's `mdb_node_search` reports it. Semantics,
+the error taxonomy and the §4 depth bound (`depth + 2` capped at
+`CURSOR_STACK`) are identical to the cursor form above; cursor-based `get`
+paths are unchanged.)*
 
 ### §2.1 — Key-size validation on reads vs. writes (observed via the oracle, M1.3)
 
@@ -355,7 +383,22 @@ copied and how pgnos propagate):
 
 5. **Overflow pages are COW'd as whole runs**: modifying a BIGDATA value frees
    the old run and allocates a new one (§8); overflow pages are never edited in
-   place across txns.
+   place across txns. This holds in every mode — there is no same-run-length
+   in-place overwrite (see §6.1).
+
+**Where dirty bytes live (ADR-0017, ADR-0021 — storage is SPEC 04's; noted here
+because §5's rules survive it).** By default dirty frames are heap-staged and
+written to the file at commit. Under `WRITE_MAP` the first-touch copy lands
+**in place in the map at the new pgno** (ADR-0021, merged PR #88) — safe
+mid-txn because `allocate` only returns pages no live snapshot references
+(SPEC 04 TXN-62) — and commit writes no tree pages back. Independently, a large
+txn may **spill** dirty tree pages to the file mid-txn (ADR-0017, SPEC 04
+TXN-68..71); a spilled page that is touched again is **unspilled** into a frame
+at the **same** pgno (TXN-72, LMDB `mdb_page_unspill`) — no new pgno, no
+parent-pointer rewrite, no free. Rules 1–4 are therefore unaffected: COW
+identity is the pgno, which spill/unspill never changes; a retained cursor path
+(§5.4a) keys on pgnos and stays valid; the §6.6 finger re-verifies per-frame
+dirtiness at use time, so a spilled frame is an ordinary miss.
 
 miri must exercise get-then-put sequences (PLAN 1.4): a `&[u8]` obtained by
 `get` before a `put` must not dangle — enforced by SPEC 04's dirty-page
@@ -399,9 +442,12 @@ repaired, whenever the mutation could have moved the entry it names. At minimum:
 Discarding is always a correct implementation of "repair"; it costs a re-seek,
 which is exactly the M1.4 mechanism applied selectively.
 
-**Implemented repair table (2026-09-27, leftmost pairing only).** The engine
-retains the path across `del_current` and repairs it for the structural cases
-below; everything else discards. The rebalance reports one of *unchanged*
+**Implemented repair table (2026-09-27, leftmost pairing only; c4ab096,
+17fdb24).** The retained-path repair applies to **deletes only**: `put` /
+`put_current` through the write cursor take the first mechanism — the mutation
+drops the parked path, records the key, and the next access re-seeks once. The
+engine retains the path across `del_current` and repairs it for the structural
+cases below; everything else discards. The rebalance reports one of *unchanged*
 (no structural change — the path is valid as-is), *kept* (repaired per this
 table), *kept + root pop* (as kept, plus frame 0 must be dropped), or
 *invalidated* (discard and re-seek). The repairs apply **only when the
@@ -467,13 +513,24 @@ put(key, value, flags):
 
 ### §6.1 — Replace an existing value
 
-- Same encoded cell size (inline↔inline same length, or BIGDATA↔BIGDATA same run
-  length): overwrite the value bytes in place on the (dirtied) leaf. This is the
-  `MDB_RESERVE` / `put_current` same-size fast path (SPEC 01 §S3).
-- Different size: delete the old node (freeing an old overflow run if any, §8)
-  and insert the new one at the same slot; may trigger a split (§6.2) or, if it
-  shrinks the page below threshold, is left to the caller's next rebalance (put
-  itself never merges — only delete does, §8/§10).
+- Same encoded cell size, **inline↔inline same length only**: overwrite the
+  value bytes in place on the (dirtied) leaf. This is the `MDB_RESERVE` /
+  `put_current` same-size fast path (SPEC 01 §S3). *(Scoped to inline values
+  2026-10-05 to match the code: an earlier revision also claimed an in-place
+  overwrite for a BIGDATA→BIGDATA replace of the same run length, which was
+  never implemented and contradicted §5 rule 5 — `put_apply` has only the
+  inline arm.)*
+- Anything else — different size, or an old/new BIGDATA value of **any** run
+  length: delete the old node (freeing an old overflow run if any, §8 and §5
+  rule 5) and insert the new one at the same slot; may trigger a split (§6.2)
+  or, if it shrinks the page below threshold, is left to the caller's next
+  rebalance (put itself never merges — only delete does, §8/§10).
+
+*(Single-descent RESERVE, 3cee9aa / issue #10: every no-split insert arm carries
+the settled `(leaf pgno, slot)` out of the insert (`ReserveLoc`), so
+`put_reserved` hands the caller its slice without a second descent; only a split
+falls back to a re-search by key, and in debug builds every carried position is
+cross-checked against a fresh descent.)*
 
 ### §6.2 — Insert into a leaf; split when full
 
@@ -732,8 +789,10 @@ heed because no live `&[u8]` borrow of the current entry may span the call.
 Requires `INITIALIZED` and not `EOF`, else `EINVAL` (SPEC 01 §S3). Rewrites the
 value of the entry at `ki[top]` **keeping the key**:
 
-- Same encoded size → in-place overwrite (fast path; the `_with_options` codec-
-  swap form re-encodes the value first, then must land the same or a new size).
+- Same encoded size → in-place overwrite (fast path; **inline values only**, as
+  §6.1 — a BIGDATA value always takes the free+reinsert arm per §5 rule 5; the
+  `_with_options` codec-swap form re-encodes the value first, then must land
+  the same or a new size).
 - Different size → delete+reinsert at the same key (may split, §6.2).
 - **`APPEND` via `put_current_with_options`** (milli facet bulk): heed passes the
   caller's `PutFlags` straight to the underlying put with **no forced
@@ -831,22 +890,28 @@ not a speed-up.
 
 ## §8 — Page allocation and overflow chain alloc/free
 
-- **Single page**: obtain a pgno from the GC DB's reusable set (SPEC 05 gates
-  reuse on the oldest live reader — until M1.8's reader table exists, the
-  oldest reader comes from the interim mutexed reader registry of SPEC 04
-  TXN-21 as amended by ADR-0005 OQ1, so only pages freed at-or-before the
-  oldest live reader's snapshot are reusable); if none, bump `next_pgno`
+- **Single page**: serve the txn's loose list first, else obtain a pgno from
+  the GC DB's reusable set, else from the base meta's **free-list annex pool**
+  (format v2, ADR-0022; SPEC 05 §2a — drawn after the tree, GC-16 step 2b, so
+  the oldest-first reclaim order holds). Reuse is gated on the oldest live
+  reader (SPEC 05; the oldest reader comes from the M1.8 lock-free reader
+  table, ADR-0006 — the interim mutexed registry of SPEC 04 TXN-21 / ADR-0005
+  OQ1 is retired), so only pages freed at-or-before the oldest live reader's
+  snapshot are reusable. If nothing is reusable, bump `next_pgno`
   (`= last_pg + 1`), growing the file, and
   fail with `MapFull` if it would exceed `map_size / psize` (SPEC 02 §8).
-- **Overflow run of N pages** needs `N` *contiguous* free pages. Try the GC DB
-  for a contiguous run of length `≥ N` (SPEC 05); else allocate `N` fresh
-  contiguous pages at end-of-file. `N = ceil((HEADER_SIZE + dsize) / psize)`
-  (SPEC 02 §5).
+- **Overflow run of N pages** needs `N` *contiguous* free pages. Try the GC DB,
+  then the annex pool, for a contiguous run of length `≥ N` (SPEC 05; the loose
+  list serves runs only inside `freelist_save`, GC-12 note); else allocate `N`
+  fresh contiguous pages at end-of-file.
+  `N = ceil((HEADER_SIZE + dsize) / psize)` (SPEC 02 §5).
 - **Free**: a page removed from the tree (COW-obsoleted, split donor emptied,
   merged-away, or an overflow run of a replaced/deleted BIGDATA value) is
-  recorded in the txn's freed-page list and written to the GC DB at commit,
-  keyed by the txn's id (SPEC 02 §7, SPEC 05). A whole overflow run frees all
-  `N` of its pgnos.
+  recorded in the txn's freed-page list and persisted at commit **into the
+  committing meta's free-list annex** when it fits (`fl_count`/`fl_ids`,
+  SPEC 02 §3), with the GC DB — keyed by the txn's id — as the spill/cold path
+  (format v2, ADR-0022; SPEC 05 §2a GC-29..33; SPEC 02 §7). A whole overflow
+  run frees all `N` of its pgnos.
 - The freed page is **not** reusable within the same txn by default (a reader on
   the pre-txn root may still reach it); the loose-page fast path (SPEC 05) is the
   narrow exception for pages allocated *and* freed inside the current txn.
@@ -1030,10 +1095,15 @@ some DB tree walked from a meta root. Applies to the live meta's snapshot.
 
 ---
 
-## §12 — DUPSORT trees (RESERVED — Phase 2.8, D-004)
+## §12 — DUPSORT trees (PARKED — milestone 2.8, D-004 APPROVED)
 
-No Phase 1 consumer uses duplicates (SPEC 00 §B.1, D-004). Phase 2.8 will add,
-against the format hooks reserved in SPEC 02 §10:
+No consumer uses duplicates (SPEC 00 §B.1; D-004 APPROVED — DUPSORT/DUPFIXED
+remain **unsupported**). Milestone 2.8 (ADR-0011, approved) was **parked
+2026-07-20**: stage 2.8a was implemented and reviewed but never merged or
+pushed — local work only, preserved per PROGRESS.md along with the resume
+preconditions. The design below is kept, not deleted; other documents
+(SPEC 02 §10, ADR-0011, DIVERGENCES D-004) reference it. If revived, 2.8 would
+add, against the format hooks reserved in SPEC 02 §10:
 
 - **Sub-page** encoding for small duplicate sets: the dup values live in an
   embedded `P_SUBP` mini-page inside the leaf value area; cursor dup-ops
@@ -1045,9 +1115,9 @@ against the format hooks reserved in SPEC 02 §10:
   `GET_MULTIPLE`/`MULTIPLE` bulk ops.
 - Dup-aware cursor ops and `APPEND_DUP` (SPEC 01 Table 3/5 dup rows).
 
-Phase 1 implementers MUST NOT emit any of these structures; INV-21 rejects them.
-The differential-fuzz budget for this area (≥ 2 h clean) is deferred to 2.8
-(PLAN §2.8).
+The engine MUST NOT emit any of these structures; INV-21 rejects them. The
+differential-fuzz budget for this area (≥ 2 h clean) is deferred with the
+parked 2.8 (PLAN §2.8).
 
 ### §12.1 — 2.8a pinned fork observations (2026-07-20; ADR-0011 Q5 first act)
 
@@ -1055,10 +1125,12 @@ Observed against the oracle (heed =0.22.1 / lmdb-master-sys 0.2.6, fork
 `mdb.master.nested-rtxns`, macOS aarch64) by
 `crates/zerodb-oracle/tests/dup_pin_semantics.rs` and `dup_pin_ffi.rs` —
 **before any zerodb dup code exists**. These tables are the normative record
-the 2.8 implementation must match; the tests are the executable form. Items
-marked ⚠ contradict previously written spec/ADR text and are **pending human
-adjudication (the 2.8a stop-report)** — the observation is the truth about the
-fork; whether zerodb replicates or diverges is the open decision.
+a revived 2.8 implementation must match; the tests are the executable form and
+remain committed and green (the park kept exactly this pinning work, PROGRESS
+2026-07-20). Items marked ⚠ contradict previously written spec/ADR text — the
+observation is the truth about the fork; whether zerodb replicates or diverges
+is an open decision **for whoever resumes the parked 2.8** (the 2.8a
+stop-report led to the 2026-07-20 park).
 
 **O1 — dup value size bound.** In a DUPSORT DB the value is bounded exactly
 like a key: len 0..=511 → `Ok` (empty dup values are legal), len ≥ 512 →

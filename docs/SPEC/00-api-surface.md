@@ -1,5 +1,9 @@
 # SPEC 00 — API surface contract (Phase 0.1 deliverable)
 
+> Revised 2026-10-05: WRITE_MAP row notes the in-place realization (ADR-0021).
+> The third table was re-verified against `crates/zerodb` and
+> `crates/heed-zerodb` as of this date; no surface change was needed.
+
 Status: **DONE** — 2026-07-15.
 
 > **M1.13 (2026-07-17):** the `heed-zerodb` adapter now **satisfies the full MUST
@@ -67,7 +71,7 @@ cellulite is driven by milli's `WithoutTls` env and generic txn refs).
 | 5 | `.max_readers(u32)` | ms (index_map only; `MEILI_EXPERIMENTAL_INDEX_MAX_READERS`, default 1024) | `mdb_env_set_maxreaders` | Sizes the reader table. Only one call site. Bounded at open: values above `MAX_READERS_LIMIT` (2^20) are `Io(InvalidInput)` — the table allocates one cache-padded slot per reader eagerly (SPEC 04 TXN-14; 2026-09-09, security review M6). | 1.8 |
 | 6 | `.flags(EnvFlags)` (unsafe) | milli, ms | `mdb_env_set_flags` bits at open | Only two flag *values* ever passed — rows 8, 9. Call is `unsafe`. | 1.10 |
 | 7 | `unsafe { options.open(path) }` | milli, ms, arroy(t), hannoy(t) | `mdb_env_create` + `mdb_env_open` | Directory env (`data.mdb`/`lock.mdb`); never `NO_SUB_DIR`. **ADR-0010 / D-012:** the adapter satisfies the **`data.mdb` half** of this convention — an env opened through `heed-zerodb` materializes as `<dir>/data.mdb` (via `zerodb::EnvOpenOptions::data_file_name`; the native engine's default stays `zerodb.dat`). Required because consumers hardcode the name outside heed (Meilisearch compaction/snapshot paths). **`lock.mdb` is intentionally absent** (D-001: single-process, no reader protocol; nothing in the consumer tree reads it). Contents are still ZeroDB's own format (D-002) — the `ZDB1` magic makes real LMDB reject the file loudly rather than misread it. `Env::path()` still returns the directory. | 1.2, ADR-0010 |
-| 8 | `EnvFlags::WRITE_MAP` | ms (index_map, gated on experimental writemap) | `MDB_WRITEMAP` | Writes go through the writable mmap instead of `malloc`+`pwrite`. Interacts with the dirty-page value-borrow model (SPEC 04) and `put_reserved` (row 35). Optional but present. | 1.10 |
+| 8 | `EnvFlags::WRITE_MAP` | ms (index_map, gated on experimental writemap) | `MDB_WRITEMAP` | Writes go through the writable mmap instead of `malloc`+`pwrite`. Interacts with the dirty-page value-borrow model (SPEC 04) and `put_reserved` (row 35). Optional but present. Since ADR-0021 (PR #88) ZeroDB realizes it truly in-place — dirty frames live in the writable map from allocation (SPEC 04 TXN-45b, SPEC 01 §S7). | 1.10 |
 | 9 | `EnvFlags::PREV_SNAPSHOT` | milli (`Index::rollback` only) | `MDB_PREVSNAPSHOT` | Opens the env on the **older** of the two meta pages — directly the meta double-buffer (SPEC 04). Used to roll an index back one committed txn. | 1.2, 1.10 |
 | 10 | `Env::open_database::<KC,DC>(txn, Some(name))` | ms (upgrades, meilitool), cellulite | `mdb_dbi_open` (no create) | Opens an existing named DB; `None` for the returned dbi means absent. cellulite opens 4 named DBs per instance (`{prefix}-item/-cell/-update/-metadata`). | 1.6 |
 | 11 | `Env::create_database(&mut wtxn, name)` | milli, arroy, hannoy, cellulite | `mdb_dbi_open` + `MDB_CREATE` | arroy/hannoy always create the **unnamed** DB (`None`); milli creates ~27 named DBs; cellulite creates 4 **named** DBs per instance (name-prefixed, so several cellulite indexes share one env). Create-in-write-txn. No `DatabaseFlags` argument (row 50). | 1.6 |
