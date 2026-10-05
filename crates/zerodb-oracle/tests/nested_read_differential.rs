@@ -9,8 +9,7 @@
 //! `Skip::WriteBlockedByNested` by the shared driver **before either engine
 //! runs** — the fork technically allows a write under a live child, zerodb
 //! forbids it, and the symmetric skip keeps that divergence unobservable
-//! exactly as approved (writer quiescence, docs/DIVERGENCES.md). Multi-child +
-//! real-thread fan-out
+//! (writer quiescence, docs/DIVERGENCES.md). Multi-child + real-thread fan-out
 //! parity is covered by `crates/zerodb/tests/nested_fanout.rs`.
 
 use zerodb_oracle::{run, DbName, Key, LmdbEngine, Op, PutFlag, Value, ZerodbEngine};
@@ -103,7 +102,7 @@ fn write_blocked_while_nested_then_resume() {
     ops.extend([
         Op::BeginNestedRo,
         // All classified Skip::WriteBlockedByNested by the shared driver —
-        // neither engine executes them (writer-quiescence divergence kept unobservable).
+        // neither engine executes them.
         Op::Put {
             db: 0,
             key: k(b"blocked"),

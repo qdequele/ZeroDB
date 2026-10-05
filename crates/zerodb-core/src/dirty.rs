@@ -109,9 +109,9 @@ pub(crate) type PgnoBuildHasher = BuildHasherDefault<PgnoHasher>;
 ///
 /// LMDB's `me_dpages` pool has no such cap because LMDB *spills* dirty pages
 /// (`mdb_page_spill`), so its dirty set — and therefore its pool — is bounded
-/// (`MDB_IDL_UM_MAX`). ZeroDB has no spill: the whole dirty set lives in RAM
-/// until commit (SPEC 04), so an uncapped pool would retain a large indexing
-/// txn's entire dirty set as spares for the rest of the env's life. 256
+/// (`MDB_IDL_UM_MAX`). ZeroDB spills too (SPEC 04 TXN-68), but its dirty limit
+/// defaults to 131,072 pages, so an uncapped pool could still retain up to
+/// that many frames as spares for the rest of the env's life. 256
 /// one-page frames is ≈ 1 MiB at a 4 KiB page size — enough to serve the
 /// small, bursty write txns that dominate, cheap to hold onto.
 pub(crate) const SPARE_CAP: usize = 256;
@@ -191,7 +191,7 @@ impl std::fmt::Debug for DirtyStore<'_> {
 /// the same broker with the same geometry.
 ///
 /// This is the **sole sanctioned call site** of the `unsafe` map-slice broker
-/// (AGENTS.md unsafe policy, ratified 2026-10-02; ADR-0021 B1): the broker is
+/// (AGENTS.md unsafe policy; ADR-0021 B1): the broker is
 /// an `unsafe fn` because it mints `&mut [u8]` from `&self`, and this module
 /// discharges its contract. `map_mut` is itself an `unsafe fn` for the same
 /// reason — no safe function anywhere may mint `&mut` from a shared borrow.
@@ -210,7 +210,7 @@ impl std::fmt::Debug for DirtyStore<'_> {
 // `&mut self` callers' one-line `unsafe { map_mut(..) }` calls, and the
 // declaration-only allow on `Backing::map_dirty_page` in `env`.
 #[allow(unsafe_code)]
-// clippy's `mut_from_ref` fires on unsafe fns too (verified clippy 1.97);
+// clippy's `mut_from_ref` fires on unsafe fns too;
 // this one's `# Safety` contract is exactly the exclusivity the lint fears.
 #[allow(clippy::mut_from_ref)]
 unsafe fn map_mut(broker: Option<&dyn Backing>, psize: u32, pgno: u64, len: usize) -> &mut [u8] {
@@ -235,9 +235,9 @@ unsafe fn map_mut(broker: Option<&dyn Backing>, psize: u32, pgno: u64, len: usiz
     //    caller invokes it twice without the previous borrow dying first.
     //  * The whole-map `&[u8]` read view is re-derived after each spill
     //    (`RwTxn::spill`, ADR-0021 B2) and — in in-map mode — re-borrowed
-    //    lazily on every access (`RwTxn::whole_map`; the M1 miri finding:
-    //    under Stacked Borrows even *copying* a stale view after an
-    //    in-place write is UB at the written locations), so no stale shared
+    //    lazily on every access (`RwTxn::whole_map`: under Stacked Borrows
+    //    even *copying* a stale view after an in-place write is UB at the
+    //    written locations), so no stale shared
     //    borrow is ever created over, or read at, locations an in-place
     //    write touched; shared views of dirty frames (`DirtyStore::bytes`)
     //    likewise re-derive from `broker.bytes()` on every call and are
@@ -465,8 +465,7 @@ impl<'env> DirtyStore<'env> {
         }
     }
 
-    /// Record the new frame slot for `pgno` and return the displaced slot, if
-    /// any, keeping the page count right.
+    /// Record the new frame slot for `pgno`, keeping the page count right.
     fn track(&mut self, pgno: u64, slot: Slot) {
         debug_assert!(
             !self.spilled.contains_key(&pgno),

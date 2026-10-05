@@ -1,8 +1,8 @@
 //! Write-path differential tests: deterministic sequences that
 //! pin every write op (put / put flags / put_reserved / del / clear /
 //! iter_mut put_current / del_current) plus commit/abort visibility and reopen
-//! durability, against the LMDB fork. Any divergence is a zerodb bug
-//! (AGENTS.md rule 1). The `ZerodbEngine` re-checks the on-disk image against
+//! durability, against the LMDB fork. Any divergence is a zerodb bug. The
+//! `ZerodbEngine` re-checks the on-disk image against
 //! the SPEC 03 §11 invariant walk after every commit (debug builds).
 
 use zerodb_oracle::{run, DbName, Key, LmdbEngine, Op, PutFlag, Value, ZerodbEngine};

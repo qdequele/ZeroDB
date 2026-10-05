@@ -10,8 +10,7 @@
 //!
 //! Hostile-image tests stay validating-only: under the trusting policy a
 //! corrupt file is undefined behaviour by contract, so no test here ever
-//! reads a corrupt file through a trusting env. Do not weaken (AGENTS.md
-//! rule 2).
+//! reads a corrupt file through a trusting env.
 
 use std::ops::Bound;
 use std::path::{Path, PathBuf};

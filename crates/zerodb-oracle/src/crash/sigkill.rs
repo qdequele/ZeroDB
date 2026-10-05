@@ -1,9 +1,9 @@
 //! Mechanism B — child-process SIGKILL crash cycles (REC-17, ADR-0008 D2):
 //! the real OS path (real file, real mmap/pwrite or writable map). A child
 //! runs the seeded workload and dies — deterministically (`abort()` at a
-//! seeded `(commit, hook)` via the commit pipeline's [`CommitHook`]) or asynchronously
-//! (parent SIGKILL after a seeded wall-clock delay, which can land *mid*-C2,
-//! a state the hooks cannot produce; ratified OQ2 keeps this in CI because
+//! seeded `(commit, hook)` via the commit pipeline's [`CommitHook`]) or
+//! asynchronously (parent SIGKILL after a seeded wall-clock delay, which can land *mid*-C2,
+//! a state the hooks cannot produce; ADR-0008 OQ2 keeps this in CI because
 //! verification tolerates any legal recovery point).
 //!
 //! SIGKILL does not tear writes (the OS page cache survives, REC-17), so

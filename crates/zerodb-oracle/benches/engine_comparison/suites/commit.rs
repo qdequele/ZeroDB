@@ -12,8 +12,7 @@
 //! SSD. It is the rung that will move most on the real target — Graviton + EBS
 //! gp3, where a barrier is a network round-trip and where the coalesced
 //! commit writes (docs/PERF-GAP-VS-LMDB.md, one `pwrite` per dirty page) are
-//! supposed to pay off. Numbers taken anywhere else are
-//! indicative only.
+//! supposed to pay off. Numbers taken anywhere else are indicative only.
 
 use criterion::{Criterion, Throughput};
 
@@ -80,10 +79,9 @@ fn case<B: Backend>(
             |f| {
                 B::commit_churn(&f.env, f.db, keys, val, per_txn);
                 // Return `f` instead of dropping it here: `iter_batched`
-                // collects routine outputs and drops them AFTER it stops the
-                // clock, so an explicit `drop(f)` inside this closure used to
-                // charge the fixture's teardown (env unmap, tempdir removal)
-                // to the timed commits. Only the commits above are measured.
+                // drops routine outputs AFTER it stops the clock, whereas a
+                // `drop(f)` inside this closure would charge the fixture's
+                // teardown (env unmap, tempdir removal) to the timed commits.
                 f
             },
             BatchSize::PerIteration,

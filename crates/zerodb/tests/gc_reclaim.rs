@@ -1,15 +1,14 @@
 //! Free-page GC guard tests (ADR-0005 D6) over **real files**: freed-page
 //! reclamation (SPEC 05 GC-14..20), the freelist-writes-to-itself commit step
 //! (GC-11..13), the partial-drain remainder rewrite (GC-20), the interim
-//! oldest-reader gate (ADR-0005 OQ1; SPEC 04 TXN-21 as amended), the huge-txn
-//! PIL spill (GC-5/GC-26 — the baseline for a huge-txn GC redesign),
+//! oldest-reader gate (ADR-0005 OQ1; SPEC 04 TXN-21), the huge-txn PIL spill
+//! (GC-5/GC-26),
 //! `non_free_pages_size` (GC-22..24, INV-27), and GC atomicity across crashes
 //! (GC-14, REC-6).
 //!
 //! Every committed image is validated with `zerodb::check::check_image`,
 //! **including** the INV-22 reachable-XOR-free partition — a leaked page
-//! ("neither") or a double-hand-out ("both") fails loudly. Do not weaken
-//! (AGENTS.md rule 2).
+//! ("neither") or a double-hand-out ("both") fails loudly.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -339,7 +338,7 @@ fn reader_gate_blocks_reuse_until_release() {
     );
 }
 
-/// INV-27 (SPEC 05 §9, amended 2026-09-29): every page of a committed
+/// INV-27 (SPEC 05 §9): every page of a committed
 /// image is exactly one of the two meta slots, a page of a user tree (main +
 /// named DBs, which `non_free_pages_size` counts), a page of the GC tree, or
 /// a free page (`free_page_count`), so

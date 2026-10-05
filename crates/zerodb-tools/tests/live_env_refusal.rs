@@ -1,6 +1,4 @@
-//! A tool pointed at a locked (simulated-live) env refuses cleanly (tools
-//! acceptance criterion: "a tool invoked on a locked live env fails
-//! cleanly").
+//! A tool pointed at a locked (simulated-live) env refuses cleanly.
 #![cfg(unix)]
 
 use std::os::unix::io::AsRawFd;
@@ -61,8 +59,8 @@ fn tools_refuse_a_locked_env() {
     assert!(zerodb_tools::commands::cmd_stat(&dir).is_ok());
 }
 
-/// A tool on a missing env fails cleanly (not a panic). Since ADR-0010 the
-/// message names **both** candidate data-file names, so an operator who pointed
+/// A tool on a missing env fails cleanly (not a panic). The message names
+/// **both** candidate data-file names (ADR-0010), so an operator who pointed
 /// the tool at the wrong directory can see what it looked for.
 #[test]
 fn tools_refuse_a_missing_env() {

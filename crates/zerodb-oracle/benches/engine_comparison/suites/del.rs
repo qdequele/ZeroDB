@@ -136,8 +136,8 @@ fn clear(c: &mut Criterion, cfg: &Cfg, keys: &[Vec<u8>], val: &[u8]) {
 /// and `range/half` both reach the tree by key; this one reaches it by
 /// cursor, so it is the only rung where post-delete cursor position costs
 /// anything (the `del_current` re-descent in docs/PERF-GAP-VS-LMDB.md,
-/// SPEC 03 §5.4a). Read it against `range/half`:
-/// same span, same result, different mechanism.
+/// SPEC 03 §5.4a). Read it against `range/half`: same span, same result,
+/// different mechanism.
 fn cursor(c: &mut Criterion, cfg: &Cfg, keys: &[Vec<u8>], val: &[u8]) {
     let half = &keys[..keys.len() / 2];
     let mut g = group(c, "del/cursor/drain", half.len());

@@ -1,11 +1,7 @@
-//! `Env::stat()` and the completed `Env::info()`.
-//!
-//! Acceptance rule for heed API extensions: "differential semantics tests
-//! where LMDB has the feature, and doc + unit tests where it's
-//! zerodb-defined". This file is the
-//! **zerodb-defined** half. The cross-engine half (`last_txnid`, `entries`,
-//! `num_readers`, `max_readers` — the fields whose values are format-
-//! independent) lives in `crates/zerodb-oracle/tests/env_info_differential.rs`.
+//! `Env::stat()` and `Env::info()` — the **zerodb-defined** half. The
+//! cross-engine half (`last_txnid`, `entries`, `num_readers`, `max_readers` —
+//! the fields whose values are format-independent) lives in
+//! `crates/zerodb-oracle/tests/env_info_differential.rs`.
 //!
 //! The page counts (`branch_pages` / `leaf_pages` / `overflow_pages`) are
 //! format-specific by construction (ZeroDB has its own on-disk format), so
@@ -17,8 +13,6 @@
 //!      the walk would fail the walk.
 //!   2. `Env::stat()` must equal `main_database().stat(&rtxn)` exactly — the
 //!      env-level and per-DB views of the same tree cannot disagree.
-//!
-//! Do not weaken these (AGENTS.md rule 2).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -163,8 +157,7 @@ fn env_stat_entries_counts_named_dbs_and_depth_grows() {
 #[test]
 fn env_stat_does_not_consume_a_reader_slot() {
     // `Env::stat()` reads the published snapshot, not a read txn. With every
-    // reader slot occupied it must still return real numbers — an earlier
-    // adapter implementation silently degraded to zeros here.
+    // reader slot occupied it must still return real numbers, not zeros.
     let dir = TempDir::new();
     let env = open_with(dir.path(), 4096, 8, 2);
     {

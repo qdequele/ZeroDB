@@ -88,8 +88,8 @@ pub trait Backend {
     fn copy_to(env: &Self::Env, dest: &Path, compact: bool);
 
     /// `non_free_pages_size()` — milli's used-bytes probe (SPEC 05 GC-23).
-    /// LMDB sums `mdb_stat` per DB; zerodb walks the GC tree. Returns the
-    /// figure so the call cannot be elided.
+    /// Both engines sum per-DB page counts (LMDB via `mdb_stat`, zerodb from
+    /// its catalog records). Returns the figure so the call cannot be elided.
     fn non_free_size(env: &Self::Env) -> u64;
     /// Build the fragmented-free-list fixture for `env/stat/non_free`: a filled
     /// DB deleted across `commits` committed txns under a pinned reader, so the
@@ -177,8 +177,7 @@ impl<B: Backend> Fixture<B> {
             dbs,
             dir,
         } = self;
-        // The handles are inert once the env is gone; the env must unmap before
-        // the directory is removed, so drop it explicitly and return `dir`.
+        // The handles are inert once the env is gone.
         drop(dbs);
         drop(env);
         dir

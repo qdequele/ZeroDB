@@ -2,21 +2,15 @@
 //! [`Op`], whether it applies given the tracked state, or is a structured
 //! [`Skip`].
 //!
-//! ## Why this exists (a precondition for the native engine)
+//! ## Why this exists
 //!
-//! Before this module, [`LmdbEngine`](crate::LmdbEngine) derived every skip
-//! decision inline from its own transaction/database fields. With a second
-//! engine landing (the native `ZerodbEngine`), those decisions had to move to
-//! one place so the two engines cannot *drift* on when an op is a no-op — a
-//! drift would masquerade as a real divergence (or hide one). This hoist was
-//! flagged, when the harness was built, as a hard precondition for adding the
-//! native engine.
+//! Skip decisions live in one place so two engines cannot *drift* on when an op
+//! is a no-op — a drift would masquerade as a real divergence (or hide one).
 //!
 //! Every engine calls [`classify`] at the top of its `apply`; if it returns
 //! `Some(skip)`, the engine returns `OpResult::Skipped(skip)` without touching
-//! its backend. The decision depends only on two facts about tracked state — the
-//! current transaction kind and whether any database is open — so no per-engine
-//! state can diverge here.
+//! its backend. The decision depends only on tracked-state facts derived from
+//! the op stream (see [`classify`]), so no per-engine state can diverge here.
 
 use crate::{Op, Skip};
 
@@ -60,8 +54,8 @@ impl TxnState {
 ///
 /// This is the single owner of the op-validity precedence. The precedence for
 /// database-targeting ops is: **no-database first**, then the transaction
-/// requirement — matching the historical `LmdbEngine` ordering exactly, so the
-/// hoist changes no observable result.
+/// requirement.
+///
 /// `cleared_in_txn` is the third tracked fact: whether the current write txn
 /// has executed a `ClearDb`. It exists solely for the [`Skip::KnownForkBug`]
 /// guard (`docs/UPSTREAM-BUGS.md` FORK-1): an `Append` put in a write txn that

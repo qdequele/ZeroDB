@@ -26,9 +26,9 @@
 //!   `max_key_size` / `open_read_only_without_no_env_opened_before`: exercise
 //!   LMDB-specific `resize`/`NO_SUB_DIR`/platform max-key/read-only-open-create
 //!   behaviors outside the adapter surface (SPEC 01; ZeroDB is single-process).
-//! - inline `txn.rs` `rw_txns_are_send`: heed's `RwTxn` is `Send`; the adapter's
-//!   is deliberately `!Send` (its write-mutex guard must not cross threads — no
-//!   consumer moves a live write txn). Documented divergence, `txn.rs`.
+//! - inline `txn.rs` `rw_txns_are_send`: not ported. The adapter's `RwTxn` is
+//!   `Send` like heed's (see `txn.rs`; the engine side is pinned by
+//!   `zerodb/tests/hostile_file.rs`).
 
 use std::error::Error;
 

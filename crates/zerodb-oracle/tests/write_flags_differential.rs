@@ -1,6 +1,6 @@
 //! Differential tests for write flags and modes (SPEC 01 Table 1, §S6/§S7).
 //! Every MUST flag, and every SHOULD flag scheduled for LMDB parity, from
-//! SPEC 01 Table 1 gets a differential test here (the flag-matrix acceptance):
+//! SPEC 01 Table 1 gets a differential test here:
 //!
 //! | Flag | Slug (test fn) |
 //! |------|----------------|
@@ -319,7 +319,7 @@ fn flag_notls_rotxn_is_send() {
 }
 
 // ---------------------------------------------------------------------------
-// Write-flag acceptance: Meilisearch's exact indexing flag combo replayed.
+// Meilisearch's exact indexing flag combo replayed.
 // ---------------------------------------------------------------------------
 
 #[test]

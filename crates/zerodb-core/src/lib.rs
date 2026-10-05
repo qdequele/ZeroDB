@@ -6,8 +6,8 @@
 //! - The [`env`] module — environment open/close, meta selection,
 //!   and the same-process registry (SPEC 02 §3.2, SPEC 06 §1, SPEC 04 §7), plus
 //!   the [`error`] taxonomy (SPEC 00 rows 54–58). All mmap `unsafe` lives in
-//!   `zerodb-io` behind [`env::Backing`]; this crate's only `unsafe` is the
-//!   `page::raw` unchecked field readers (see the lint note below).
+//!   `zerodb-io` behind [`env::Backing`]; this crate's own `unsafe` is confined
+//!   to the homes listed in the lint note below.
 //! - The [`btree`] read path and the [`rotxn`] read API.
 //! - The write path — [`dirty`] (the stable-frame dirty store,
 //!   SPEC 04 §6.3), [`rwtxn`] (single-writer txn, COW, split/rebalance, the
@@ -18,17 +18,14 @@
 //!   under loom via the [`sync`] shim (`just loom`).
 
 #![deny(missing_docs)]
-// `deny`, not `forbid`, since the unchecked page-field readers landed
-// (2026-07-22; docs/PERF-GAP-VS-LMDB.md, byte-copy field reads): the AGENTS.md
-// unsafe policy sanctions `zerodb-core::page` for page-casting unsafe (the
-// unchecked field readers in `page::raw`, allow on its `mod` declaration)
-// and, since 2026-10-02 (ADR-0021), `zerodb-core::dirty` for the one call of
-// the `unsafe` WRITE_MAP in-place map-slice broker (`dirty::map_mut`, allow
-// on that fn, SAFETY contract stated there). The `Backing::map_dirty_page`
-// trait method in `env` carries a declaration-only allow (an `unsafe fn`
-// signature with a trivially safe default body — ADR-0021 B1 requires the
-// broker to be `unsafe fn`). Everything else in this crate remains
-// unsafe-free and the lint keeps it that way.
+// `deny`, not `forbid`: the unsafe policy sanctions two homes in this crate —
+// the unchecked page-field readers in `page::raw` (allow on its `mod`
+// declaration; docs/PERF-GAP-VS-LMDB.md, byte-copy field reads) and the one
+// call of the WRITE_MAP in-place map-slice broker, `dirty::map_mut` (ADR-0021;
+// allow on that fn, SAFETY contract stated there). The `Backing::map_dirty_page`
+// trait method in `env` carries a declaration-only allow (ADR-0021 B1 requires
+// the broker to be an `unsafe fn`; its default body is trivially safe).
+// Everything else in this crate is unsafe-free and the lint keeps it that way.
 #![deny(unsafe_code)]
 
 pub mod btree;

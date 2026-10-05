@@ -1,12 +1,8 @@
-//! `copy_to_file_with_progress`.
-//!
-//! Acceptance rule for heed API extensions: "doc + unit tests where it's
-//! zerodb-defined". This is entirely zerodb-defined — `mdb_env_copy2` reports
-//! no progress and heed exposes no callback, so there is nothing to diff
-//! against. What the oracle already covers (that the *copy itself* is byte-correct in both
-//! modes, `zerodb-oracle/tests/copy_to_file_differential.rs`) is unchanged and
-//! not re-litigated here; these tests are about the callback contract and,
-//! critically, that adding it did not change the bytes.
+//! `copy_to_file_with_progress`: a zerodb-defined extension (`mdb_env_copy2`
+//! reports no progress and heed exposes no callback), so there is no oracle
+//! to diff against. Copy byte-correctness is covered by
+//! `zerodb-oracle/tests/copy_to_file_differential.rs`; these tests pin the
+//! callback contract and that instrumenting a copy does not change its bytes.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

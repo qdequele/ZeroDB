@@ -1,6 +1,6 @@
 //! Resolving which data file an env directory holds (**ADR-0010**).
 //!
-//! Since ADR-0010 the data-file name depends on *which stack created the env*:
+//! The data-file name depends on *which stack created the env*:
 //! a natively-opened env holds [`zerodb::DATA_FILE_NAME`] (`zerodb.dat`), while
 //! one created through the `heed-zerodb` adapter holds
 //! [`zerodb::HEED_DATA_FILE_NAME`] (`data.mdb`) so that heed consumers which

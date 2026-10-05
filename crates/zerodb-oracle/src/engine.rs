@@ -4,9 +4,8 @@ use crate::{EngineMode, Op, OpResult};
 
 /// A storage engine the oracle can drive.
 ///
-/// The LMDB reference side is [`crate::LmdbEngine`]. The native zerodb side
-/// is the second implementor; wiring it in only requires
-/// calling [`crate::run::<LmdbEngine, ZerodbEngine>`](crate::run).
+/// The LMDB reference side is [`crate::LmdbEngine`]; the native zerodb side is
+/// driven against it with [`crate::run::<LmdbEngine, ZerodbEngine>`](crate::run).
 ///
 /// Implementors own a private, freshly-created environment (e.g. a temp dir) so
 /// two instances never share state. [`Engine::new`] must therefore be
@@ -40,12 +39,10 @@ pub trait Engine {
     /// Whether this engine implements `op` at its current stage of development.
     ///
     /// The default is `true` (the LMDB reference implements the whole SPEC 00
-    /// surface). A partially-built native engine (the first `ZerodbEngine`, which
-    /// covered only the env-lifecycle subset) overrides this to return `false`
-    /// for ops it does not yet execute. [`crate::run`] gates on **both** engines
+    /// surface). A partially-built engine overrides this to return `false` for
+    /// ops it does not execute. [`crate::run`] gates on **both** engines
     /// implementing an op, so a differential run is symmetrically restricted to
-    /// the ops both sides support — letting later work fill ops in one at a time
-    /// without spurious divergences.
+    /// the ops both sides support, without spurious divergences.
     fn implements(&self, _op: &Op) -> bool {
         true
     }

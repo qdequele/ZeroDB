@@ -637,7 +637,8 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// # Errors
     ///
-    /// As [`Database::put`]; `Encoding` if `f` returns an error.
+    /// As [`Database::put`]; `Io` if `f` returns an error (the entry is still
+    /// written, as in LMDB).
     pub fn put_reserved<'a, F>(
         &self,
         txn: &mut RwTxn,
@@ -651,19 +652,17 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         self.assert_env(txn);
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
-        // Since 2026-07-21: hand the caller the engine's in-frame slot
-        // directly (the `MDB_RESERVE` shape) instead of a zeroed heap buffer
-        // copied in afterwards — one alloc + one full copy per reserved put
-        // gone. Two deliberate semantics, both fork-pinned by the oracle's
+        // Hand the caller the engine's in-frame slot directly (the
+        // `MDB_RESERVE` shape): no heap buffer, no copy. Two deliberate
+        // semantics, both fork-pinned by the oracle's
         // `put_reserved_failing_closure_leaves_entry_parity`:
         //  - the engine reserves the slot BEFORE the closure runs, so a
         //    closure error leaves the entry in place (LMDB cannot un-put a
-        //    reserve either) while the error still propagates as `Io` (the
-        //    fork's variant; before this the adapter returned `Encoding` and no
-        //    entry — a real divergence);
+        //    reserve either) while the error propagates as `Io` (the fork's
+        //    variant);
         //  - the slot may carry stale frame bytes (a COWed page's old cell
-        //    heap), so the unwritten tail is zeroed either way, preserving
-        //    the shipped zero-tail contract of the old heap buffer.
+        //    heap), so the unwritten tail is zeroed either way (the adapter's
+        //    zero-tail contract).
         let mut werr: Option<std::io::Error> = None;
         self.inner
             .put_reserved(txn.zdb_mut(), &kb, data_size, |slot| {
@@ -964,9 +963,8 @@ impl<T, KC, DC, C, CDUP> std::fmt::Debug for DatabaseOpenOptions<'_, '_, T, KC, 
 ///
 /// `C` appears only behind `fn() -> C`, a function-pointer type that is
 /// unconditionally `Send + Sync`, so this is `Send + Sync` for **any** `C`
-/// with no `unsafe impl` — which matters, because AGENTS.md's unsafe policy
-/// for this crate covers only what heed's pointer model forces, and this does
-/// not need to be on that list.
+/// with no `unsafe impl`, keeping this crate's `unsafe` to what heed's pointer
+/// model forces.
 struct HeedComparator<C>(PhantomData<fn() -> C>);
 
 impl<C: Comparator + 'static> zerodb::Comparator for HeedComparator<C> {
@@ -985,8 +983,7 @@ impl<C: Comparator + 'static> zerodb::Comparator for HeedComparator<C> {
 /// `DefaultComparator` is memcmp — exactly ZeroDB's built-in ordering — so
 /// registering a forwarder for it would trade an inlined `slice::cmp` for a
 /// vtable call on the hot path of every consumer, all of which use it (SPEC 00
-/// row 53). Returning `None` keeps the default path bit-for-bit what it was
-/// before custom comparators existed.
+/// row 53). Returning `None` keeps the default path on the built-in memcmp.
 fn custom_comparator<C: Comparator + 'static>() -> Option<Box<dyn zerodb::Comparator>> {
     if std::any::TypeId::of::<C>() == std::any::TypeId::of::<DefaultComparator>() {
         None

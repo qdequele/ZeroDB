@@ -15,8 +15,8 @@
 //! - **No `#[repr(C)]` casts of unaligned data.** All fields are read/written by
 //!   explicit offset through [`raw`]. The field readers in
 //!   [`raw`] are unchecked `read_unaligned` behind the validated-view contract
-//!   (the only `unsafe` in this crate; `#[allow(unsafe_code)]` on that one
-//!   module); the rest of this module is safe code.
+//!   (`#[allow(unsafe_code)]` on that one module); the rest of this module is
+//!   safe code.
 //! - **Body-relative offsets:** intra-page offsets (`lower`, `upper`, node
 //!   pointers) are measured from the first byte after the header (absolute
 //!   offset [`HEADER_SIZE`]).
@@ -28,9 +28,9 @@ pub mod geometry;
 mod header;
 pub mod meta;
 mod overflow;
-// The crate's single sanctioned `unsafe` home (AGENTS.md unsafe policy:
-// "page casting" in `zerodb-core::page`): the unchecked
-// little-endian field readers used by the validated/trusted view accessors.
+// Sanctioned `unsafe` home (unsafe policy: page casting in
+// `zerodb-core::page`): the unchecked little-endian field readers used by the
+// validated/trusted view accessors.
 #[allow(unsafe_code)]
 mod raw;
 mod tree;
@@ -98,7 +98,7 @@ pub const MIN_KEYS_LEAF: usize = 1;
 pub const MIN_KEYS_BRANCH: usize = 2;
 
 /// Number of leading bytes of a meta page covered by its CRC, before the
-/// free-list annex ids (SPEC 02 §3.3 as amended by ADR-0022: the full
+/// free-list annex ids (SPEC 02 §3.3, ADR-0022: the full
 /// coverage is `[0, META_CONTENT_LEN) ∪ [META_ANNEX_OFF, … + 8·fl_count)`).
 pub const META_CONTENT_LEN: usize = 172;
 

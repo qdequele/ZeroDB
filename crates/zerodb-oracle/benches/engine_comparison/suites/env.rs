@@ -147,18 +147,16 @@ fn case_empty_commit<B: Backend>(g: &mut Group<'_>, page: u32, keys: &[Vec<u8>],
 }
 
 /// `non_free_pages_size()` — the used-bytes figure milli reads before every
-/// register write txn and after every batch. Since SPEC 05 GC-23's 2026-09-29
-/// amendment both engines compute it the same way: the main DB's and every
-/// named DB's branch + leaf + overflow page counts times the page size (LMDB
-/// via `mdb_stat` per DB, zerodb from its catalog records), so the cost tracks
-/// the number of databases, not the free list.
+/// register write txn and after every batch. Both engines compute it the same
+/// way (SPEC 05 GC-23): the main DB's and every named DB's branch + leaf +
+/// overflow page counts times the page size (LMDB via `mdb_stat` per DB,
+/// zerodb from its catalog records), so the cost tracks the number of
+/// databases, not the free list.
 ///
-/// The fixture still carries a deliberately large, fragmented free list (see
-/// `case_non_free`): it is the regime the previous free-list walk paid for
-/// (the `non_free_pages_size` item in docs/PERF-GAP-VS-LMDB.md), and keeping
-/// it pins that the figure no longer
-/// depends on the free list's size — a regression back to a walk would show
-/// here at once.
+/// The fixture carries a deliberately large, fragmented free list (see
+/// `case_non_free`) to pin that the figure does not depend on the free list's
+/// size: a free-list walk (the `non_free_pages_size` item in
+/// docs/PERF-GAP-VS-LMDB.md) would show here at once.
 fn non_free_stat(c: &mut Criterion, cfg: &Cfg) {
     let keys = ascending_keys(FRAG_KEYS);
     let val = vec![0xABu8; VAL];

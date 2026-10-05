@@ -1,8 +1,8 @@
 //! The `Rw*` write iterators must behave like their `Ro*` siblings — same bound
 //! semantics (under the database's comparator, SPEC 03 §2.0) and the same
 //! boundary re-impositions (empty prefix → `BadValSize`, SPEC 03 §2.1). The
-//! write path was built as a parallel cursor rather than over the checked read
-//! path, and these are the seams where it drifted (codebase review, 2026-09-09).
+//! write path is a parallel cursor rather than the checked read path, so these
+//! are the seams where the two can drift.
 
 use std::ops::Bound;
 
@@ -123,7 +123,7 @@ fn prefix_iter_mut_empty_prefix_is_bad_val_size_like_prefix_iter() {
     }
     wtxn.commit().unwrap();
 
-    // Read side (already pinned by earlier tests): the reference behavior.
+    // Read side: the reference behavior.
     let rtxn = env.read_txn().unwrap();
     assert!(
         matches!(

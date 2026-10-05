@@ -2,7 +2,8 @@
 //!
 //! Pages 0 and 1 are the double-buffered meta slots. Each carries the common
 //! header (`flags = P_META`) followed by the meta body, and is protected by a
-//! mandatory CRC32C over its first [`META_CONTENT_LEN`] bytes. This module owns
+//! mandatory CRC32C over its first [`META_CONTENT_LEN`] bytes plus its
+//! free-list annex ids. This module owns
 //! the full field map ([`DBRecord`], [`MetaPage`]), the CRC coverage, the
 //! validation predicate ([`MetaPage::validate`], the single owner of SPEC 02
 //! §3.2's numbered list), and the double-buffer selection formula
@@ -396,7 +397,7 @@ pub enum MetaValidity {
     BadCrc {
         /// The stored `meta_crc`.
         stored: u32,
-        /// The recomputed CRC over `[0, 168)`.
+        /// The recomputed CRC over `[0, 172)` ∪ the annex ids (SPEC 02 §3.3).
         computed: u32,
     },
 }
@@ -432,7 +433,7 @@ pub enum MetaChoice {
     /// Exactly one slot was valid (torn-meta recovery): it wins regardless of
     /// txnid, and — because there is no older valid slot — regardless of
     /// `prev_snapshot`. See SPEC 06 REC-2 for how the env layer treats one
-    /// valid slot + `prev_snapshot` (policy ratified 2026-07-16).
+    /// valid slot + `prev_snapshot`.
     OnlyOne {
         /// The chosen slot index (0 or 1).
         chosen: usize,

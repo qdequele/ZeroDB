@@ -117,8 +117,7 @@ pub const MIN_PAGE_SIZE: u32 = 4096;
 /// The largest selectable DB page size (SPEC 02 §0).
 pub const MAX_PAGE_SIZE: u32 = 65536;
 
-/// Environment open flags (SPEC 01 Table 1). A hand-rolled bitset — no
-/// `bitflags` dependency (not on the AGENTS.md dependency allowlist).
+/// Environment open flags (SPEC 01 Table 1), as a hand-rolled bitset.
 ///
 /// LMDB-parity flags (all MUST/SHOULD per SPEC 01 Table 1):
 /// [`EnvFlags::PREV_SNAPSHOT`] (milli's `Index::rollback`), [`EnvFlags::READ_ONLY`]
@@ -249,9 +248,8 @@ impl EnvOpenOptions {
     ///
     /// This is a **ZeroDB extension**: LMDB 0.9 derives the page size from the
     /// OS and offers no selector, so there is no heed API to mirror and no
-    /// cross-engine differential to run. ZeroDB's page size has always been a
-    /// runtime value in the meta page (SPEC 02 §0/§3.2) — 2.6 promotes it to a
-    /// supported public knob.
+    /// cross-engine differential to run. The page size is a runtime value
+    /// persisted in the meta page (SPEC 02 §0/§3.2).
     ///
     /// Semantics:
     ///
@@ -422,7 +420,7 @@ impl EnvOpenOptions {
     ///
     /// - [`Error::Io`] (`InvalidInput`) if [`EnvOpenOptions::page_size`] is not
     ///   a power of two in `[`[`MIN_PAGE_SIZE`]`, `[`MAX_PAGE_SIZE`]`]`.
-    ///   `Io(InvalidInput)` is the taxonomy ZeroDB already uses for open-time
+    ///   `Io(InvalidInput)` is the taxonomy ZeroDB uses for open-time
     ///   argument rejection (cf. the `max_readers(0)` and non-page-multiple
     ///   `map_size` checks at the heed boundary); LMDB has no error for this
     ///   because it has no such option.

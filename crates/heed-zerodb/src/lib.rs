@@ -21,14 +21,14 @@
 //! The adapter reproduces heed's inherently pointer-based model, so it needs the
 //! same small `unsafe` heed itself carries: `unsafe impl Send for
 //! RoTxn<WithoutTls>` (SPEC 04 TXN-13; every inner ZeroDB txn is itself `Send`,
-//! the writer lock being thread-agnostic — `txn.rs`), the `repr(transparent)` TLS-marker deref retags (`txn.rs`), the
-//! lifetime-erased write cursor (`iterator.rs`, guarded by heed's documented
-//! "no live borrow across a mutating call" contract), the `ReservedSpace`
-//! uninit view and its `assume_written` (`reserved_space.rs`, heed's own
-//! signatures), and one `sysconf` query for the OS-page-multiple `map_size`
-//! check (`env.rs`). Each is documented at its site; this is the minimal
-//! adapter-shape `unsafe` the AGENTS.md unsafe policy allows, wrapping no UB
-//! under the stated contracts.
+//! the writer lock being thread-agnostic — `txn.rs`), the `repr(transparent)`
+//! TLS-marker deref retags (`txn.rs`), the lifetime-erased write cursor
+//! (`iterator.rs`, guarded by heed's documented "no live borrow across a
+//! mutating call" contract), the `ReservedSpace` uninit view and its
+//! `assume_written` (`reserved_space.rs`, heed's own signatures), and one
+//! `sysconf` query for the OS-page-multiple `map_size` check (`env.rs`). Each
+//! is documented at its site; this is the minimal adapter-shape `unsafe`,
+//! wrapping no UB under the stated contracts.
 
 #![allow(clippy::result_large_err)]
 

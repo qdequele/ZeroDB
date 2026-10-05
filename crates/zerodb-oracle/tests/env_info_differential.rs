@@ -19,7 +19,7 @@
 //! | `ms_*_pages` | no | Format-specific by construction (own on-disk format). |
 //! | `ms_entries` | **yes, exactly** | Main-DB record count = number of named DBs. |
 //!
-//! Never change an expectation here to make ZeroDB pass (AGENTS.md rule 1).
+//! Never change an expectation here to make ZeroDB pass.
 
 use heed::types::Bytes;
 use heed::EnvOpenOptions as LmdbOpts;
@@ -222,11 +222,10 @@ fn info_num_readers_matches_for_equivalent_reader_populations() {
     }
 
     // Releasing readers. **LMDB's `me_numreaders` does not go back down** —
-    // it is a high-water mark (`mti_numreaders` is only ever incremented, by
-    // `if (i == nr) ti->mti_numreaders = ++nr;`; ending a txn just clears
-    // `mr_pid`). This was observed here, not assumed, and ZeroDB reproduces it
-    // rather than "fixing" it (AGENTS.md rule 1). Logged in docs/DIVERGENCES.md
-    // (the `me_numreaders` entry).
+    // it is a high-water mark (`mti_numreaders` is only incremented, when
+    // `mdb_txn_renew0` claims a new slot; ending a txn just clears `mr_pid`).
+    // ZeroDB reproduces it rather than "fixing" it; see the `me_numreaders`
+    // entry in docs/DIVERGENCES.md.
     for remaining in (0..CAP).rev() {
         lheld.pop();
         zheld.pop();
@@ -254,9 +253,9 @@ fn info_num_readers_matches_for_equivalent_reader_populations() {
 
 #[test]
 fn num_readers_high_water_survives_a_full_drain_and_reuse() {
-    // Second, sharper probe of the high-water semantics: take 4 slots, release them all, then take
-    // 1. LMDB's counter must still read 4 (slots are reused from index 0, and
-    // the high-water is never lowered). ZeroDB must agree.
+    // High-water semantics: take 4 slots, release them all, then take 1.
+    // LMDB's counter must still read 4 (slots are reused from index 0, and the
+    // high-water is never lowered). ZeroDB must agree.
     let ldir = TempDir::new().unwrap();
     let mut o = LmdbOpts::new().read_txn_without_tls();
     o.map_size(MAP);

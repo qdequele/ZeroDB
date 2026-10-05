@@ -7,11 +7,11 @@
 //!               [--repro image:SEED|sigkill:SEED] [--keep-going] [--isolate]
 //! ```
 //!
-//! One **cycle** = one recovered-and-verified crash state (ratified ADR-0008
-//! OQ1). `--mechanism both` (default) targets ≈80% image / 20% SIGKILL **by
-//! cycle** (one image cut ≈ `--variants` cycles, one SIGKILL cut = 1, hence
-//! a 1:3 image:sigkill cut pattern); a full 10k run must land ≥1k verified
-//! SIGKILL cycles (ratified OQ6) — checked at the end of full-sized runs.
+//! One **cycle** = one recovered-and-verified crash state (ADR-0008 OQ1).
+//! `--mechanism both` (default) targets ≈80% image / 20% SIGKILL **by cycle**
+//! (one image cut ≈ `--variants` cycles, one SIGKILL cut = 1, hence a 1:3
+//! image:sigkill cut pattern); a full 10k run must land ≥1k verified SIGKILL
+//! cycles (ADR-0008 OQ6) — checked at the end of full-sized runs.
 //!
 //! Exit status: nonzero iff a violation (or an unmet SIGKILL floor on a
 //! ≥10k run) occurred. On a violation the seed, mode, cut, and repro
@@ -269,11 +269,11 @@ fn main() {
                         }
                     }
                     // ≈80/20 image/SIGKILL split **by counted cycle** (the
-                    // ratified OQ1 unit): one image cut yields ~`--variants`
+                    // ADR-0008 OQ1 unit): one image cut yields ~`--variants`
                     // (12) cycles, one SIGKILL cut yields 1, so a 1:3
                     // image:sigkill cut pattern lands 12:3 = 80/20 by cycles
                     // and comfortably clears the ≥1k SIGKILL floor on a 10k
-                    // run (ratified OQ6). Deterministic in the cut index so a
+                    // run (ADR-0008 OQ6). Deterministic in the cut index so a
                     // run's mechanism assignment is `--jobs`-independent.
                     let mech = match args.mechanism {
                         Mechanism::Image => Mechanism::Image,
@@ -360,7 +360,7 @@ fn main() {
             args.seed
         );
     }
-    // Ratified OQ6: a full-sized run must include ≥1k SIGKILL cycles.
+    // ADR-0008 OQ6: a full-sized run must include ≥1k SIGKILL cycles.
     if args.cycles >= 10_000 && args.mechanism == Mechanism::Both && t.sigkill_verified < 1_000 {
         failed = true;
         eprintln!(

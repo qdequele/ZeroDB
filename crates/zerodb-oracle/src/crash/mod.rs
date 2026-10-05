@@ -13,9 +13,9 @@
 //!   the parent reopens and verifies. The OS page cache survives, so this
 //!   validates control-flow ordering on the real mmap/pwrite path.
 //!
-//! One **cycle** = one recovered-and-verified crash state (ratified ADR-0008
-//! OQ1): each materialized image variant and each SIGKILL recovery counts as
-//! one toward the ≥10k acceptance bar.
+//! One **cycle** = one recovered-and-verified crash state (ADR-0008 OQ1):
+//! each materialized image variant and each SIGKILL recovery counts as one
+//! toward the ≥10k acceptance bar.
 //!
 //! [`CommitHook`]: zerodb::CommitHook
 
@@ -53,8 +53,8 @@ pub struct CutReport {
     /// Adversarial probes whose image also passed the full walk.
     pub adv_walk_clean: u64,
     /// Images that landed in the `NO_META_SYNC` reclaim-clobber window
-    /// (REC-10 as amended by the crash harness): window/taxonomy obligations verified,
-    /// walk/data waived. Counted for characterization.
+    /// (REC-10): window/taxonomy obligations verified, walk/data waived.
+    /// Counted for characterization.
     pub stale_fallback: u64,
     /// Write txns of the cycle that spilled before their commit or abort
     /// (ADR-0017), as the SIGKILL child acked them; the image mechanism is
@@ -64,6 +64,6 @@ pub struct CutReport {
     /// (ADR-0021 B3) — nonzero only for image cuts of the WRITE_MAP modes,
     /// where the workload runs the true in-place realization. A green run
     /// with zero here and nonzero writemap cycles would mean the in-place
-    /// crash coverage went vacuous again.
+    /// crash coverage went vacuous.
     pub map_regions: u64,
 }

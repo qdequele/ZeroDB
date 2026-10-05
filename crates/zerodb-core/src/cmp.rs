@@ -42,9 +42,9 @@
 //!   two unassigned *values* (`flags` at offset 42, `leaf2_ksize` at offset
 //!   44) are already earmarked for DUPSORT/DUPFIXED support.
 //!   Widening the record or repurposing those fields is an on-disk **format**
-//!   decision, which AGENTS.md rule 5 puts behind an ADR and maintainer approval —
-//!   deliberately not taken here. The hazard is therefore **documented, not
-//!   mitigated**, and is filed in docs/DIVERGENCES.md (comparator persistence).
+//!   decision that requires an ADR — deliberately not taken here. The hazard
+//!   is therefore **documented, not mitigated**, and is filed in
+//!   docs/DIVERGENCES.md (comparator persistence).
 //!
 //! ## Requirements on an implementation
 //!
@@ -52,10 +52,9 @@
 //! total, and *deterministic* — the same pair of byte strings must always
 //! compare the same way, for the life of the data, across processes and
 //! releases. Violating this does not trigger Rust unsafety (nothing here is
-//! `unsafe`; the crate is `#![deny(unsafe_code)]` outside `page::raw`), but it does corrupt
-//! the tree in the ordinary sense: a B+tree built under an inconsistent
-//! ordering has no correct search path, and `zerodb-tools check` will report
-//! INV-5/INV-6 violations.
+//! `unsafe`), but it does corrupt the tree in the ordinary sense: a B+tree
+//! built under an inconsistent ordering has no correct search path, and
+//! `zerodb-tools check` will report INV-5/INV-6 violations.
 //!
 //! A comparator that **panics** unwinds through the engine. Inside a write
 //! transaction that is safe in the RAII sense — the `RwTxn` is dropped and its
@@ -175,9 +174,9 @@ pub enum KeyCmp<'a> {
 /// differing byte decides both), so this returns exactly `a.cmp(b)` — but as one
 /// integer load and compare each rather than a `memcmp` call (the aarch64 hot
 /// path showed `bl _memcmp` on every probe; see docs/PERF-GAP-VS-LMDB.md,
-/// default key compare). Every
-/// other length pair, including 8-vs-4, falls through to the slice comparison,
-/// which never reads past either slice's length.
+/// default key compare). Every other length pair, including 8-vs-4, falls
+/// through to the slice comparison, which never reads past either slice's
+/// length.
 #[inline]
 fn default_cmp_fast(a: &[u8], b: &[u8]) -> Ordering {
     match (a.len(), b.len()) {

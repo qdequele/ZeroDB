@@ -3,11 +3,9 @@
 //!
 //! Every test here observes the Meilisearch LMDB fork (heed =0.22.1 /
 //! lmdb-master-sys 0.2.6, `mdb.master.nested-rtxns`) and pins exactly what it
-//! returns, BEFORE any zerodb dup code exists (AGENTS.md rule 1; ADR-0011
-//! Decision 7.1 / Q5). The observed tables are transcribed into
-//! `docs/SPEC/03-btree.md` §12 in the same change. Do NOT weaken these
-//! assertions: they encode observed LMDB behavior, and a mismatch is a
-//! zerodb/spec bug for a human to adjudicate (AGENTS.md rule 2).
+//! returns (ADR-0011 Decision 7.1 / Q5); the tables are mirrored in
+//! `docs/SPEC/03-btree.md` §12. Do NOT weaken these assertions: they encode
+//! observed LMDB behavior, and a mismatch is a zerodb/spec bug.
 //!
 //! Pin protocol: each test builds an observation table (one `id = value` line
 //! per probe) and compares it against the pinned constant. A behavior change in
@@ -729,8 +727,8 @@ fn pin_flags_persistence_open_mismatch() {
     // persistent-flags mismatch check on an existing named DB — the
     // persisted `md_flags` are silently adopted and the caller's requested
     // flags are silently ignored (`MDB_INCOMPATIBLE` on flag mismatch does
-    // not exist in this fork). Human adjudication required before DUPSORT
-    // support (ADR-0011) implements open-time flag semantics.
+    // not exist in this fork). Open-time flag semantics for DUPSORT support
+    // (ADR-0011) need a human decision.
     t.assert_pinned(
         r#"
 same_env_open_dup_without_flags = Ok(is_some=true)
@@ -882,8 +880,8 @@ fn pin_dupfixed_size_discipline() {
     // enforce DUPFIXED item-size uniformity on put — mismatched sizes are
     // silently ACCEPTED and the stored items become garbage (silent
     // corruption; neither a clean error nor an "un-fixing" of the page).
-    // 2.8c must adjudicate whether to replicate this (a DIVERGENCES
-    // candidate: BadValSize instead) before any DUPFIXED code lands.
+    // Whether to replicate this is undecided (DIVERGENCES candidate:
+    // BadValSize instead) and must be settled before any DUPFIXED code.
     t.assert_pinned(
         r#"
 first_item_len4 = Ok

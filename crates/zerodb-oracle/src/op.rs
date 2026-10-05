@@ -40,13 +40,12 @@ pub struct Key(pub Vec<u8>);
 /// threshold (~2 KiB at a 4 KiB page) and reaches **multi-page overflow runs**
 /// (up to ~16 pages) frequently.
 ///
-/// The large branch is deliberately bounded at 64 KiB (since the read path landed;
-/// not the multi-MB of the original generator): the differential now populates a real LMDB
-/// env of a fixed [`DIFF_MAP_SIZE`](crate::DIFF_MAP_SIZE), so a 64-op sequence
-/// must stay well under the map to avoid `MapFull` (which the rebuild-on-commit
-/// zerodb harness does not model) and to keep per-iteration temp files small.
-/// The overflow *algorithm* is length-independent, so 16-page runs exercise it
-/// as thoroughly as 750-page runs; a dedicated multi-MB overflow value is
+/// The large branch is deliberately bounded at 64 KiB: the differential populates
+/// a real LMDB env of a fixed [`DIFF_MAP_SIZE`](crate::DIFF_MAP_SIZE), so a 64-op
+/// sequence must stay well under the map to avoid `MapFull` (which the
+/// rebuild-on-commit zerodb harness does not model) and to keep per-iteration
+/// temp files small. The overflow *algorithm* is length-independent, so 16-page
+/// runs exercise it as thoroughly as 750-page runs; a multi-MB overflow value is
 /// unit-tested separately in the zerodb read path.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Value(pub Vec<u8>);
@@ -124,9 +123,8 @@ impl<'a> Arbitrary<'a> for Value {
 /// unnamed DB and never create named DBs, so their root has no catalog entries.
 /// Modeling `Unnamed` as milli's named `"main"` keeps the fuzz faithful and
 /// avoids surfacing engine-internal records (the catalog-record divergence in
-/// docs/DIVERGENCES.md). The true
-/// unnamed/root DB is covered on its own — with no catalog mixing — by
-/// `tests/unnamed_root_differential.rs`.
+/// docs/DIVERGENCES.md). The true unnamed/root DB is covered on its own — with
+/// no catalog mixing — by `tests/unnamed_root_differential.rs`.
 #[derive(Arbitrary, Debug, Clone, PartialEq, Eq)]
 pub enum DbName {
     /// The primary database, modeled as milli's named `"main"` DB.
@@ -164,7 +162,7 @@ pub enum Op {
     /// map size. heed 0.22 has no `Env::resize`; growth = drop env + reopen
     /// larger (SPEC 00 row 3).
     Reopen {
-        /// Extra map size, in units of 4 KiB, added on top of the 1 MiB base.
+        /// Extra map size, in units of 4 KiB, added on top of the base map size.
         map_size_kib: u16,
     },
 
@@ -344,8 +342,8 @@ pub enum Op {
     ///
     /// [`Op::IterMutDelCurrent`] stops at the delete, so it compares the
     /// surviving *content* but never the surviving *position* — the exact
-    /// semantics SPEC 03 §7 pins and whose mechanism the retained-position
-    /// cursor delete changed (docs/PERF-GAP-VS-LMDB.md, `del_current` re-descent).
+    /// semantics SPEC 03 §7 pins (mechanism: the retained-position cursor
+    /// delete, docs/PERF-GAP-VS-LMDB.md `del_current` re-descent).
     /// This op puts the post-delete cursor position under the differential
     /// fuzzer: both engines must agree on every entry yielded afterwards,
     /// including across the leaf merges a long drain provokes.

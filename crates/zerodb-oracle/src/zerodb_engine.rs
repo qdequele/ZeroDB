@@ -2,15 +2,14 @@
 //!
 //! ## Scope: named databases and the catalog
 //!
-//! Named DBs and `DropDb` are now differential (previously gated out): the
-//! engine holds real [`zerodb::Database`] handles created via
+//! The engine holds real [`zerodb::Database`] handles created via
 //! [`zerodb::Env::create_database`], resolved from the shared `dbs` table by
 //! index exactly as [`crate::LmdbEngine`] does, so the two engines exercise
 //! identical multi-DB workloads. Reads/writes target the resolved handle;
 //! `VerifyGet` opens the DB in a fresh read txn via
 //! [`zerodb::Env::open_database`].
 //!
-//! ## Nested read txns (SPEC 04 §5) — now differential
+//! ## Nested read txns (SPEC 04 §5)
 //!
 //! `BeginNestedRo`/`EndNestedRo` mirror [`crate::LmdbEngine`]'s
 //! `Active::RwNested`: while a nested child is open, every read is served
@@ -18,8 +17,8 @@
 //! `Skip::WriteBlockedByNested` — the shared driver classifies that skip
 //! *before either engine runs*, so the fork's technical allowance of
 //! writes-under-a-child (it does not enforce quiescence; zerodb does — see the
-//! writer-quiescence entry in docs/DIVERGENCES.md)
-//! stays unobservable and the two engines cannot drift. The op model holds
+//! writer-quiescence entry in docs/DIVERGENCES.md) stays unobservable and the
+//! two engines cannot drift. The op model holds
 //! **one** child at a time (like its one-txn limitation); multiple concurrent
 //! children + real thread fan-out are covered by
 //! `crates/zerodb/tests/nested_fanout.rs`.
@@ -30,9 +29,9 @@
 //! already boxes the txn (ADR-0007 D5); the nested child borrows the Box's
 //! target and both move together between `Active` variants.
 //!
-//! Earlier scope carries over: every write op runs zerodb's real COW write
-//! path, `Commit` runs the real C0–C6 pipeline (now incl. the C1a catalog
-//! write-back, SPEC 02 §6), and in debug builds every successful commit re-reads
+//! Every write op runs zerodb's real COW write path, `Commit` runs the real
+//! C0–C6 pipeline (incl. the C1a catalog write-back, SPEC 02 §6), and in debug
+//! builds every successful commit re-reads
 //! `zerodb.dat` and runs the SPEC 03 §11 + named-DB catalog invariant walk
 //! ([`zerodb::check::check_image`]).
 //!
@@ -43,7 +42,7 @@
 //! one struct — a self-referential shape safe Rust cannot express. The txn
 //! lifetimes are extended to `'static` with `mem::transmute`; the invariants
 //! are stated at each site and mirror the `LmdbEngine` construction exactly
-//! (AGENTS.md unsafe policy: confined to this test-only oracle crate).
+//! (confined to this test-only oracle crate).
 //!
 //! **Key-size taxonomy split** (SPEC 03 §2.1): zerodb-core's *write* path
 //! validates keys itself (`put*` → `BadValSize`); the *read/del* leniency
@@ -117,8 +116,8 @@ macro_rules! with_read {
 enum Active {
     None,
     Rw(Box<RwTxn<'static>>),
-    // Boxed: `RoTxn` carries the inline lock-free validated-pages memo
-    // since that memo went lock-free (~180 B), tripping `clippy::large_enum_variant`.
+    // Boxed: `RoTxn` carries an inline lock-free validated-pages memo (~180 B),
+    // which would trip `clippy::large_enum_variant`.
     Ro(Box<RoTxn<'static>>),
     /// A nested read child over the paused write txn (SPEC 04 §5).
     ///
@@ -138,21 +137,15 @@ struct DbEntry {
     db: Database,
     /// Whether the transaction that opened this handle has **committed**.
     ///
-    /// LMDB (`lmdb.h`): "The database handle will be private to the current
-    /// transaction until the transaction is successfully committed. If the
-    /// transaction is aborted the handle will be closed automatically."
-    /// `mdb.c`'s `mdb_dbis_update(txn, keep=0)` implements that close on the
-    /// abort path. So a handle whose creating txn aborted is DEAD, and using it
-    /// afterwards is an API-contract violation that LMDB reports as `EINVAL`
-    /// from the `TXN_DBI_EXIST` gate in `mdb_cursor_open` / `mdb_put`.
+    /// A dbi opened in a write txn is private to it until commit, and an abort
+    /// closes it (`lmdb.h` `mdb_dbi_open`; `mdb.c` `mdb_dbis_update(txn, keep=0)`).
+    /// A handle whose creating txn aborted is DEAD: using it is an API-contract
+    /// violation LMDB reports as `EINVAL` (the `TXN_DBI_EXIST` gate in
+    /// `mdb_cursor_open` / `mdb_put`).
     ///
-    /// This flag replaces the old positional `committed_dbs` watermark, which
-    /// was only correct while entries were append-only: `drop_db`'s
-    /// `dbs.remove(idx)` removes from the middle, after which
-    /// `truncate(committed_dbs)` retained the WRONG set — keeping an
-    /// uncommitted (dead) handle while discarding a committed one. That made
-    /// the harness drive both engines through a use-after-close and report the
-    /// resulting LMDB `EINVAL` as an engine divergence.
+    /// Tracked per entry rather than as a positional watermark because
+    /// `drop_db` removes entries from the middle of `dbs`; a watermark would then
+    /// keep a dead handle and discard a committed one.
     committed: bool,
 }
 
@@ -279,7 +272,7 @@ impl ZerodbEngine {
 
     fn reopen(&mut self, kib: u16) -> OpResult {
         // Reopen drops the active txn (a txn boundary: reset the FORK-1 fact)
-        // and all db handles; committed data persists in the real file now.
+        // and all db handles; committed data persists in the real file.
         self.active = Active::None;
         self.cleared_in_txn = false;
         self.dbs.clear();
@@ -817,9 +810,9 @@ impl ZerodbEngine {
         // is resolved by name through `open_database` — a committed catalog
         // lookup, matching `LmdbEngine::verify_get`.
         //
-        // Ordering matters (found by the named-DB differential): LMDB resolves and
-        // **opens** the DB before any key-size check, so an uncommitted /
-        // dropped name returns `None` regardless of the key. The empty-read-key
+        // Ordering matters: LMDB resolves and **opens** the DB before any
+        // key-size check, so an uncommitted / dropped name returns `None`
+        // regardless of the key. The empty-read-key
         // boundary shim (§2.1) must therefore be applied only once the DB
         // opens — at the `get`, exactly where LMDB's `mdb_get` would hit it.
         let name = match self.db_name_at(db) {
@@ -946,8 +939,7 @@ impl Engine for ZerodbEngine {
     }
 
     fn implements(&self, _op: &Op) -> bool {
-        // Every modeled op is differential (nested read txns were the last
-        // gated pair).
+        // Every modeled op is differential.
         true
     }
 

@@ -46,7 +46,7 @@
 //! meta ever recorded the aborted id), and the slot-parity scheme **requires**
 //! it: slot `N & 1` must be the older slot (TXN-63), which only holds when
 //! commit ids are consecutive. Non-reuse would make a post-abort commit
-//! overwrite the *live* snapshot's slot. (SPEC 04 §1 clarified in this change.)
+//! overwrite the *live* snapshot's slot.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
@@ -78,11 +78,6 @@ fn even(n: usize) -> usize {
     (n + 1) & !1
 }
 
-/// Find an `n`-page pick in a sorted-ascending, unique id list (SPEC 05
-/// GC-15/16/19): the **smallest id** for `n == 1`, else the head of the
-/// **first** contiguous run of length `≥ n`. Because the ids are strictly
-/// ascending and unique, `ids[i + n - 1] == ids[i] + n - 1` implies all `n`
-/// are consecutive.
 /// Saturating in-place stat update. `DBRecord` stats (`entries`,
 /// `leaf_pages`, `branch_pages`, `overflow_pages`, `depth`) are **on-disk
 /// data**: a hostile file can carry `u64::MAX` or `0`, so the write path's
@@ -120,6 +115,11 @@ pub(crate) fn validate_pil_ids(ids: &[u64], last_pg: u64) -> Result<()> {
     Ok(())
 }
 
+/// Find an `n`-page pick in a sorted-ascending, unique id list (SPEC 05
+/// GC-15/16/19): the **smallest id** for `n == 1`, else the head of the
+/// **first** contiguous run of length `≥ n`. Because the ids are strictly
+/// ascending and unique, `ids[i + n - 1] == ids[i] + n - 1` implies all `n`
+/// are consecutive.
 fn find_run(ids: &[u64], n: u64) -> Option<u64> {
     if n == 1 {
         return ids.first().copied();
@@ -151,8 +151,7 @@ fn find_run(ids: &[u64], n: u64) -> Option<u64> {
 ///
 /// The consumed prefix is never re-exposed: every read goes through
 /// [`Drain::live`], and the GC-20 rewrite at commit encodes exactly the live
-/// slice — the same remaining ids the drain-on-every-draw representation
-/// produced, so the on-disk result is unchanged.
+/// slice.
 #[derive(Debug, Clone)]
 struct Drain {
     /// Decoded PIL ids, ascending. `..head` consumed, `head..` live.
@@ -592,8 +591,7 @@ pub struct RwTxn<'env> {
     /// the writer mutates map bytes mid-txn, and under Stacked Borrows a
     /// stale whole-map reference *field* is re-asserted (retagged) on every
     /// move of the txn — `commit(self)` included — which is UB at the
-    /// written locations even if never read (ADR-0021 M1, caught by miri on
-    /// the `test-backing` stand-in).
+    /// written locations even if never read (ADR-0021 M1).
     bytes: &'env [u8],
     /// The snapshot this txn grew from (`writer_txnid = base.txnid + 1`).
     base: Arc<Snapshot>,
@@ -609,7 +607,7 @@ pub struct RwTxn<'env> {
     /// [`Source::bytes_from_classified`] (the dirty store is probed first,
     /// so a dirtied pgno's memo entry is never consulted again; spills reset
     /// the memo wholesale, TXN-71). Probes (never publishes) the
-    /// env-wide stamp cache (ADR-0018 amendment, 2026-10-01).
+    /// env-wide stamp cache (ADR-0018).
     validated: ValidatedPages<'env>,
     /// Committed pages obsoleted by this txn (GC-6). Written to the GC DB
     /// under `BE(writer_txnid)` at commit step C1 (`freelist_save`).
@@ -645,7 +643,7 @@ pub struct RwTxn<'env> {
     /// GC-12 allocation restriction (ADR-0005 D2).
     alloc_mode: AllocMode,
     /// Entries of `drains` whose `remaining` shrank via an **in-save pool
-    /// draw** (GC-12 as amended — see `freelist_save`): each must be
+    /// draw** (GC-12 — see `freelist_save`): each must be
     /// re-rewritten before the C1 fixed point is declared, so no rewritten
     /// entry ever lists a handed-out page.
     save_touched: std::collections::BTreeSet<u64>,
@@ -712,8 +710,8 @@ pub struct RwTxn<'env> {
     /// commit C0 (TXN-33); bumped/released by
     /// [`crate::nested::NestedRoTxn`].
     ///
-    /// **`RwTxn: Sync` standing contract (ADR-0007 Q1, ratified
-    /// 2026-07-16):** `NestedRoTxn` is `Send` purely because `&RwTxn: Send`,
+    /// **`RwTxn: Sync` standing contract (ADR-0007 Q1):** `NestedRoTxn` is
+    /// `Send` purely because `&RwTxn: Send`,
     /// i.e. because this struct is `Sync`. No field may introduce interior
     /// mutability usable through `&self` (`Cell`, `RefCell`, …) — use an
     /// atomic (like this one) or keep it behind `&mut`. The
@@ -805,7 +803,7 @@ impl Env {
             finger_hits: 0,
             psize: inner.page_size(),
             dirty,
-            // ADR-0018 amendment (2026-10-01): the writer probes the env
+            // ADR-0018: the writer probes the env
             // cache (the previous commit seeded it with the very pages this
             // txn's first descent walks) but never publishes from a miss.
             validated: ValidatedPages::for_writer(inner.file_trust(), Some(inner.stamp_cache())),
@@ -1071,8 +1069,6 @@ impl<'env> RwTxn<'env> {
         Ok(())
     }
 
-    /// The working `DBRecord` of `tree` (ADR-0005 D1 selector). A named tree's
-    /// record must have been loaded by [`RwTxn::ensure_open`] first.
     /// The key ordering of `tree` (SPEC 03 §2.0).
     ///
     /// `Main` and `Free` are memcmp **unconditionally**: `Main` doubles as the
@@ -1086,6 +1082,8 @@ impl<'env> RwTxn<'env> {
         }
     }
 
+    /// The working `DBRecord` of `tree` (ADR-0005 D1 selector). A named tree's
+    /// record must have been loaded by [`RwTxn::ensure_open`] first.
     fn record(&self, tree: TreeId) -> &DBRecord {
         match tree {
             TreeId::Main => &self.main_db,
@@ -1159,8 +1157,8 @@ impl<'env> RwTxn<'env> {
     /// bytes **mid-txn** (through the brokered slices), so a view cached at
     /// txn begin would predate those writes: under Stacked/Tree Borrows,
     /// copying such a stale `&[u8]` — let alone reading a spilled page
-    /// through it — is undefined behavior at the written locations (caught
-    /// by miri on the `test-backing` stand-in, ADR-0021 M1). The in-map arm
+    /// through it — is undefined behavior at the written locations
+    /// (ADR-0021 M1). The in-map arm
     /// therefore borrows the view **lazily per access**, exactly as `RoTxn`
     /// does: a fresh borrow at a `&self` boundary postdates every in-place
     /// write, and none can happen while it lives (TXN-39).
@@ -1262,7 +1260,7 @@ impl<'env> RwTxn<'env> {
                 }
             }
             AllocMode::GcSave => {
-                // GC-12 (as amended, ADR-0005): never *read* the GC tree
+                // GC-12 (ADR-0005): never *read* the GC tree
                 // in-save, but draws from the already-loaded drain pool are
                 // permitted — required for bounded file growth, since the
                 // in-save COW of a committed GC page can never reuse its own
@@ -1277,8 +1275,8 @@ impl<'env> RwTxn<'env> {
                 // The carried annex pool (SPEC 05 §2a GC-30): gate-checked
                 // like every annex draw; the step-(c) placement re-reads
                 // `annex.live()` after every put, so a draw here can never
-                // leave a handed-out id in the persisted set — the exact
-                // GC-12-amended pool argument.
+                // leave a handed-out id in the persisted set — the GC-12
+                // pool argument.
                 if let Some(start) = self.annex_draw(n) {
                     return Ok(start);
                 }
@@ -1337,7 +1335,7 @@ impl<'env> RwTxn<'env> {
         None
     }
 
-    /// In-save draw from the **already-loaded drain pool** (GC-12 as amended;
+    /// In-save draw from the **already-loaded drain pool** (GC-12;
     /// see [`RwTxn::allocate`]). Deterministic like GC-19: smallest
     /// reclaimable `F` first (`drains` is a `BTreeMap`), smallest id / first
     /// contiguous run within it. Gate compliance is inherited: every pool
@@ -1428,9 +1426,8 @@ impl<'env> RwTxn<'env> {
         o
     }
 
-    /// Debug shadow tracking (a reader-table acceptance requirement: "GC never reclaims a
-    /// page a live reader can reach — assert via shadow tracking in debug
-    /// builds"): at the moment pages from GC entry `F` are handed out,
+    /// Debug shadow tracking of the GC gate (GC never reclaims a page a live
+    /// reader can reach): at the moment pages from GC entry `F` are handed out,
     /// re-scan the reader table **fresh** (SeqCst, not the per-txn cache) and
     /// assert no live reader is pinned below `F`. A snapshot `t` references a
     /// page freed by `F` iff `t < F` (the page left `F`'s tree and every
@@ -1781,7 +1778,7 @@ impl<'env> RwTxn<'env> {
         // map-resident frames — their bytes already sit at their final file
         // offsets — so this spill is pure bookkeeping there: the frames are
         // released from tracking and the pgnos marked spilled (TXN-69's
-        // observable contract, unchanged).
+        // observable contract).
         if let Err(e) = self.write_frames(&chosen) {
             self.errored = true;
             return Err(e);
@@ -1805,8 +1802,8 @@ impl<'env> RwTxn<'env> {
         // boundary with no other borrow live (TXN-39) — postdates them all.
         // (Under in-place WRITE_MAP the writes happen mid-txn, not at spill,
         // so the cache stays the empty slice and `RwTxn::whole_map`
-        // re-borrows per access instead — ADR-0021 M1's miri finding: a
-        // stale reference *field* is retagged on every move of the txn.)
+        // re-borrows per access instead — ADR-0021 M1: a stale reference
+        // *field* is retagged on every move of the txn.)
         if !self.dirty.in_map_mode() {
             self.bytes = self.env.inner().backing_bytes();
         }
@@ -1889,8 +1886,7 @@ impl<'env> RwTxn<'env> {
         let valid = Some(&self.validated);
         for _ in 0..=rec.depth {
             // One source resolution per level (issue #9); a non-tree
-            // page type maps through `corrupt` to the same `Invalid` the old
-            // two-step dispatch returned.
+            // page type maps through `corrupt` to `Invalid`.
             match node_view(self.source(), self.psize, pgno, valid).map_err(corrupt)? {
                 NodeView::Leaf(leaf) => {
                     let (ki, found) = match leaf.lookup_with(key, cmp) {
@@ -2202,8 +2198,8 @@ impl<'env> RwTxn<'env> {
     /// ADR-0015): `Some(result)` when the put took the fast path, `None` on a
     /// miss (the finger is dropped and the caller runs the normal path, whose
     /// descent re-establishes it). Out of line so that trees with the setting
-    /// off keep the put path's previous shape (the hot path
-    /// sits at LLVM's inlining threshold).
+    /// off keep the put path's shape (the hot path sits at LLVM's inlining
+    /// threshold).
     #[inline(never)]
     fn put_finger(
         &mut self,
@@ -2300,8 +2296,8 @@ impl<'env> RwTxn<'env> {
             return Err(Error::Mdb(MdbError::BadValSize));
         }
         // Sequential-writes trees (ADR-0015) take the finger-aware copy of
-        // this path, out of line, so a tree with the setting off runs exactly
-        // the code it ran before the option existed plus this one branch.
+        // this path, out of line, so a tree with the setting off pays only
+        // this one branch.
         if self.seq_writes_on(tree) {
             return self.put_tree_seq(tree, key, flags, val, node_flags);
         }
@@ -2693,9 +2689,8 @@ impl<'env> RwTxn<'env> {
     /// keep the left half in the existing (dirty) frame, put the right half on
     /// a fresh page, and rise the right page's first key into the parent.
     ///
-    /// **End-of-page insert-point rule** (§6.4, ratified by the maintainer,
-    /// 2026-07-16): when the new cell lands at the end of
-    /// the page (`newindx == nkeys`, i.e. `newindx == cells.len() - 1` after
+    /// **End-of-page insert-point rule** (§6.4): when the new cell lands at
+    /// the end of the page (`newindx == nkeys`, i.e. `newindx == cells.len() - 1` after
     /// insertion) the split forces `s = nkeys` — ALL existing cells stay on the
     /// left (dirty) frame, the new cell alone starts the right page. This is
     /// APPEND's split behavior (§6.3) generalized to *any* end insert (plain
@@ -2724,7 +2719,7 @@ impl<'env> RwTxn<'env> {
         };
 
         // `append` implies an end insert; the general `newindx == n_old` case
-        // covers plain puts that land at the end too (ratified end-of-page
+        // covers plain puts that land at the end too (the end-of-page
         // insert-point rule, §6.4): the new cell ALONE forms the right page.
         // Fast path: the left (dirty) frame is byte-identical to the
         // pre-split page, so it is not touched at all — no extraction, no
@@ -3069,8 +3064,8 @@ impl<'env> RwTxn<'env> {
                 let key = leaf.key(end);
                 // The exact upper-bound test `RoRange` terminates on, under
                 // the tree's ordering (SPEC 03 §2.0) — anything else would
-                // stop the splice at a different entry than the per-entry
-                // walk this replaces.
+                // stop the splice at a different entry than a per-entry
+                // `RoRange` walk.
                 let covered = match upper {
                     Bound::Unbounded => true,
                     Bound::Included(h) => cmp.compare(key, h) != Ordering::Greater,
@@ -3254,7 +3249,7 @@ impl<'env> RwTxn<'env> {
     /// a sibling, recursing upward on merge. `empty_leaf_merges` is
     /// `delete_range`'s walk mode (SPEC 03 §10 empty-page rule): an emptied
     /// leaf takes the merge arm outright instead of borrowing; every other
-    /// delete path passes `false` and keeps the historical neighbor policy
+    /// delete path passes `false` and keeps the default neighbor policy
     /// bit-for-bit (the churn-flatness pins depend on it).
     /// Returns the [`PathFate`] of `path` (SPEC 03 §5.4a): `Unchanged` when
     /// the delete only removed a cell from its leaf; `Kept`/`KeptShrunk` when
@@ -3538,8 +3533,7 @@ impl<'env> RwTxn<'env> {
                 // Remove at explicit, unshifted indices, HIGHEST FIRST: after
                 // `remove(0)` the real-keyed old node 1 would shift into
                 // index 0, where the node-0 sentinel rule (empty separator,
-                // SPEC 02 §4.1) rejects its key — a bug found by write-path test coverage
-                // (repeated `remove(0)`). So: drop old node 1 first (its child
+                // SPEC 02 §4.1) rejects its key. So: drop old node 1 first (its child
                 // is re-inserted as the new sentinel), then the old node 0
                 // sentinel, then install the new sentinel.
                 b.remove(1).map_err(corrupt)?; // old node 1 (real key; child c1 survives below)
@@ -3929,7 +3923,7 @@ impl<'env> RwTxn<'env> {
     /// caller then frees nothing (collect-before-free). What is NOT checked is
     /// the page's type: a corrupt record that understates the depth frees the
     /// mis-typed page (in-bounds, so non-corrupting) and leaks its subtree,
-    /// where the full walk returned `Invalid`.
+    /// where the full walk returns `Invalid`.
     fn collect_tree_skip_leaves(
         &self,
         pgno: u64,
@@ -4075,8 +4069,8 @@ impl<'env> RwTxn<'env> {
         Ok(())
     }
 
-    /// Commit step C1 (SPEC 05 §4 GC-11..13 as amended by ADR-0005, SPEC 04
-    /// §9): release trailing loose pages (GC-10), merge the surviving loose
+    /// Commit step C1 (SPEC 05 §4 GC-11..13, ADR-0005; SPEC 04 §9): release
+    /// trailing loose pages (GC-10), merge the surviving loose
     /// pages into the freed set (GC-9, mirroring the fork's
     /// `mdb_freelist_save` loose merge), then loop to a fixed point: rewrite
     /// every drained entry's remainder / delete the empties (GC-20), and
@@ -4090,7 +4084,7 @@ impl<'env> RwTxn<'env> {
     /// the old `free_db` root whose entry `F` lists that page as free and
     /// whose trees do not reference it (`F ≤ oldest_reader() ≤ N−1`, TXN-62).
     ///
-    /// **Allocation restriction (GC-12 as amended):** `alloc_mode = GcSave`
+    /// **Allocation restriction (GC-12):** `alloc_mode = GcSave`
     /// for the whole procedure — `allocate` never **reads** the GC tree; it
     /// draws loose pages (including contiguous loose runs), pages from the
     /// **already-loaded drain pool** ([`RwTxn::save_pool_draw`]), or extends.
@@ -4098,7 +4092,7 @@ impl<'env> RwTxn<'env> {
     /// committed GC page cannot reuse its own predecessor (the `N−1` meta
     /// still references it, TXN-62), so a total draw ban would extend the
     /// file on every commit, unboundedly under churn. The anti-leak property
-    /// the ban existed for is provided by the fixed point instead: an entry
+    /// a ban would give is provided by the fixed point instead: an entry
     /// touched by a pool draw goes back on the `pending` rewrite set, and the
     /// loop only exits when no rewrite is pending — so the final tree state
     /// never lists a handed-out page.
@@ -4118,12 +4112,12 @@ impl<'env> RwTxn<'env> {
         // GC-30 carry (SPEC 05 §2a, ADR-0022): the base annex's unconsumed
         // remainder must land in this txn's own entry (annex or tree) — meta
         // `base` is overwritten by txn `base + 2`, so dropping it leaks.
-        // The remainder stays a live **in-save pool** (the GC-12-amended
-        // rule, exactly like the drain pool): its ids passed the gate with
+        // The remainder stays a live **in-save pool** (the GC-12 rule,
+        // exactly like the drain pool): its ids passed the gate with
         // `F = base.txnid`, so the save's own allocations may consume them —
         // without this, every save's GC-tree ops extend the file while the
         // carried surplus sits unreachable in `freed`, an unbounded ratchet
-        // (caught by churn_parity_general during the ADR-0022 spike). The
+        // (`churn_parity_general` pins this). The
         // step-(c) placement merges `freed ∪ annex.live()` and re-loops if
         // the put itself drew from the pool, so no persisted set ever lists
         // a handed-out page. The pool is folded into `freed` only after the
@@ -4137,8 +4131,8 @@ impl<'env> RwTxn<'env> {
         let mut annex_mode = false;
         // Every ops-drained entry needs its GC-20 rewrite at least once.
         let mut pending: std::collections::BTreeSet<u64> = self.drains.keys().copied().collect();
-        // Release-active bound on the *inner* rewrite loop (GC-13 guard, ADR
-        // review finding 2): each inner iteration consumes one pending entry,
+        // Release-active bound on the *inner* rewrite loop (GC-13 guard):
+        // each inner iteration consumes one pending entry,
         // and an entry only re-enters `pending` via an in-save pool draw,
         // which strictly shrinks the finite pool — so total inner iterations
         // across the whole save are bounded by (initial entries) + (total
@@ -4178,8 +4172,7 @@ impl<'env> RwTxn<'env> {
                     "freelist_save drain-rewrite loop exceeded its budget (GC-13)"
                 );
                 // GC-20 rewrite payload: exactly the live remainder — the
-                // consumed prefix never reaches the tree, so the encoded PIL
-                // is identical to the drain-on-every-draw representation's.
+                // consumed prefix never reaches the tree.
                 let remaining: Vec<u64> = self
                     .drains
                     .get(&f)
@@ -4387,8 +4380,8 @@ impl<'env> RwTxn<'env> {
         inner.run_hook(HookPoint::H4);
         // Crash here: `N` durable and selected (REC-6 H4).
 
-        // ----- C5a: seed the env-wide validated-pages cache (ADR-0018
-        // amendment, 2026-10-01; SPEC 04 TXN-38). Every frame C2 wrote is
+        // ----- C5a: seed the env-wide validated-pages cache (ADR-0018;
+        // SPEC 04 TXN-38). Every frame C2 wrote is
         // engine-authored, stamped with this txnid, and now final: C5 is
         // done, the commit can no longer fail, and txnid `N` is consumed
         // forever — so `(pgno, N)` names exactly these bytes for the env's
@@ -4583,7 +4576,7 @@ impl Database {
     /// COW + one rebalance per covered leaf instead of one descent + one
     /// rebalance per key, and no materialized key list. The observable result
     /// (count, survivors, bound semantics, comparator order) is identical to
-    /// the per-entry walk it replaces.
+    /// a per-entry cursor walk.
     ///
     /// # Errors
     ///
@@ -4611,7 +4604,7 @@ impl Database {
             // Read phase: the first still-covered key, through the same
             // iterator `range` uses, so every `Bound` combination, inverted
             // bounds, and a custom comparator (SPEC 03 §2.0) position
-            // identically to the per-entry walk this replaces.
+            // identically to a per-entry walk.
             let lo = match &resume {
                 None => lower,
                 Some(k) => std::ops::Bound::Excluded(k.as_slice()),
@@ -4721,7 +4714,7 @@ enum Step<'k> {
 /// most one cursor exists across any mutation** — cursor fix-up therefore
 /// reduces to this cursor's own position (ADR-0004 D5).
 ///
-/// **Stack persistence (2026-07-21):** between mutations the cursor persists its
+/// **Stack persistence:** between mutations the cursor persists its
 /// root-to-leaf path as a parked [`SavedCursor`], so an advance is an O(1)
 /// amortized stack step (LMDB's `mc_pg[]`/`mc_ki[]` walk), not a fresh
 /// O(log n) descent; entries are yielded as **borrows** of the txn's frames
@@ -4746,8 +4739,8 @@ pub struct RwCursor<'t, 'env> {
     /// holds that entry's successor (SPEC 03 §7 / §5.4a — LMDB's `C_DEL`).
     ///
     /// While set, the cursor is **not** on a live entry: `current_key` reports
-    /// `None`, so a second `del_current` or a `put_current` is a no-op exactly
-    /// as it was before the path was retained. Only `next` may use the path (it
+    /// `None`, so a second `del_current` or a `put_current` is a no-op.
+    /// Only `next` may use the path (it
     /// settles instead of stepping); every other op re-derives from `pos`.
     on_vacated_slot: bool,
     /// Deletes whose *structural* rebalance kept a repaired path instead of
@@ -4764,8 +4757,8 @@ impl RwCursor<'_, '_> {
     fn drive(&mut self, op: Step<'_>) -> Result<Option<(&[u8], &[u8])>> {
         // A post-delete parked path names the vacated slot, which only `next`
         // knows how to read (it settles there rather than stepping). Every
-        // other op re-derives from `pos`, which is the original behaviour
-        // (SPEC 03 §5.4a: discarding is always a correct repair).
+        // other op re-derives from `pos` (SPEC 03 §5.4a: discarding is
+        // always a correct repair).
         let settle = self.on_vacated_slot && matches!(op, Step::Next);
         if self.on_vacated_slot && !settle {
             self.saved = None;
@@ -5008,7 +5001,7 @@ impl RwCursor<'_, '_> {
         // discarded path, re-derives from.
         let Some(mut saved) = self.saved.take() else {
             // No parked path (fresh cursor, or the position came from `pos`
-            // after an earlier mutation): descend as before.
+            // after an earlier mutation): descend for the key.
             let existed = self.txn.delete_tree(tree, &key)?;
             self.pos = CurPos::AfterDelete(key);
             return Ok(existed);
@@ -5027,8 +5020,8 @@ impl RwCursor<'_, '_> {
                 // The rebalance moved entries in a way the repair table does
                 // not follow (left pairing, an ancestor split, an emptied
                 // tree): the parked path may name the wrong page or depth.
-                // Discard it — the next op re-seeks from `pos`, which is the
-                // original behaviour and always a correct repair (§5.4a).
+                // Discard it — the next op re-seeks from `pos`, which is
+                // always a correct repair (§5.4a).
                 self.saved = None;
             }
             fate => {
@@ -5135,11 +5128,11 @@ mod tests {
     }
 
     /// GC-20 byte-identity guarantee: for a mixed draw sequence, the live
-    /// remainder equals what the previous representation (binary_search +
+    /// remainder equals what a naive representation (binary_search +
     /// `Vec::drain` on every draw) would encode into the rewritten PIL.
     #[test]
     fn drain_remainder_matches_old_drain_algorithm() {
-        // Reference: the pre-Drain algorithm, verbatim.
+        // Reference: the naive drain-on-every-draw algorithm.
         fn naive_take(ids: &mut Vec<u64>, start: u64, n: u64) {
             let pos = ids.binary_search(&start).unwrap();
             ids.drain(pos..pos + n as usize);
@@ -6228,12 +6221,12 @@ mod tests {
             .to_vec()
     }
 
-    /// §10 empty-page rule, walk mode (SPEC 03, 2026-09-27): a leaf that
+    /// §10 empty-page rule, walk mode (SPEC 03): a leaf that
     /// `delete_range` empties is merged away by the very next rebalance —
     /// never borrowed into. Deleting exactly the first leaf's keys of a
     /// two-leaf tree must therefore collapse it to one full leaf in that same
     /// call; the borrow arm would instead pull one (uncovered) entry across
-    /// and leave both leaves standing. Point deletes keep the historical
+    /// and leave both leaves standing. Point deletes keep the default
     /// neighbor policy (the gc_reclaim churn-flatness pin depends on it).
     #[test]
     fn delete_range_merges_emptied_leaf_instead_of_borrowing() {
@@ -6321,8 +6314,8 @@ mod tests {
                     ),
                     // Overflow values (>= 2030 always overflows at 4 K for
                     // keys < 24 bytes): a (len, fill) pair, not a per-element
-                    // vec — element-random 2.5 KB values made this the miri
-                    // long pole for no extra coverage.
+                    // vec — element-random 2.5 KB values would make this the
+                    // miri long pole for no extra coverage.
                     1 => proptest::prelude::Strategy::prop_map(
                         (
                             2030..if cfg!(miri) { 2060usize } else { 3300 },

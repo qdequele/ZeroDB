@@ -3,11 +3,11 @@
 //! heed 0.22.1 exposes no surface for `MDB_GET_BOTH`/`MDB_GET_BOTH_RANGE`,
 //! raw `mdb_dbi_open` flag bits, positioned dup-cursor steps, or the §S2-style
 //! out-data contract, so this file drives the vendored fork directly through
-//! `lmdb-master-sys` (sanctioned: ADR-0011 Q2 — FFI differentials live in
-//! `zerodb-oracle`, the one crate allowed to link C). Same pin protocol as
+//! `lmdb-master-sys` (ADR-0011 Q2 — FFI differentials live in `zerodb-oracle`,
+//! the one crate allowed to link C). Same pin protocol as
 //! `dup_pin_semantics.rs`: observation tables compared against pinned
 //! constants; a diff means the fork changed or a guess was wrong — never
-//! weaken, adjudicate (AGENTS.md rules 1/2).
+//! weaken the pins.
 
 use std::ffi::CString;
 use std::os::raw::{c_int, c_uint, c_void};

@@ -119,7 +119,7 @@ pub trait Backing: Send + Sync {
     #[allow(unsafe_code)]
     // clippy cannot see that this is an `unsafe fn` whose documented contract
     // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
-    // too — verified clippy 1.97); ADR-0021 B1's substance is the `unsafe fn` itself.
+    // too); ADR-0021 B1's substance is the `unsafe fn` itself.
     #[allow(clippy::mut_from_ref)]
     unsafe fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
         let _ = (pgno, psize, pages);
@@ -329,12 +329,11 @@ impl WriterLock {
 
     /// Block until the writer slot is free, then claim it.
     fn acquire(&self) -> WriterGuard<'_> {
-        // A panicked writer used to poison the old `Mutex<()>` writer lock;
-        // the policy (unchanged) is that the lock guards no data — the dirty
-        // set lived in the RwTxn and was dropped during unwind (TXN-60
-        // implicit abort) — so clearing the poison is sound and keeps the env
-        // usable after a writer panic. The flag mutex is only ever held for
-        // the flag flip below, but the same recovery applies.
+        // Poison recovery: the lock guards no data — the dirty set lives in
+        // the RwTxn and is dropped during unwind (TXN-60 implicit abort) — so
+        // clearing a poison is sound and keeps the env usable after a writer
+        // panic. The flag mutex is only ever held for the flag flip below,
+        // but the same recovery applies.
         let mut g = self
             .occupied
             .lock()
@@ -478,9 +477,9 @@ fn next_env_id() -> u64 {
 /// resolves lazily from the transaction's catalog view (the main tree; SPEC 04
 /// TXN-10 step 3), so this table maps **only** dbi → name, never dbi → root.
 ///
-/// **Assignment is append-only within a process** (an interim simplification,
-/// like the early interim reader registry). LMDB frees a dbi when the txn that opened it
-/// aborts; ZeroDB keeps the slot and re-uses it on a later open of the same
+/// **Assignment is append-only within a process** (an accepted
+/// simplification). LMDB frees a dbi when the txn that opened it aborts;
+/// ZeroDB keeps the slot and re-uses it on a later open of the same
 /// name (`by_name`). This is **unobservable** through the heed/SPEC-00 surface:
 /// resolution is always catalog-driven, so a handle whose creation was aborted
 /// resolves to *absent* (its catalog entry was discarded with the dirty set),
@@ -488,10 +487,9 @@ fn next_env_id() -> u64 {
 /// is that `max_dbs` counts distinct names ever seen (incl. aborted) rather
 /// than currently-live ones, so `DbsFull` could fire one creation early after
 /// `max_dbs` *distinct* aborted-and-never-reused names — a case no consumer and
-/// no oracle sequence produces (names are a bounded reused set). The reader
-/// table work deliberately did **not** touch this: the full dbi lifecycle
-/// (abort-frees-slot) remains an accepted interim simplification, to be
-/// revisited with handle/introspection work if ever observable.
+/// no oracle sequence produces (names are a bounded reused set). The full dbi
+/// lifecycle (abort-frees-slot) is deliberately not implemented; revisit it if
+/// it ever becomes observable.
 #[derive(Debug)]
 struct NamedRegistry {
     /// dbi index → name. Append-only; index is the `DbSel::Named` payload.
@@ -557,8 +555,8 @@ pub struct EnvInner {
     /// thread-agnostic flag+condvar lock (see [`WriterLock`]) so the guard —
     /// and with it `RwTxn` — is `Send`.
     write_mutex: WriterLock,
-    /// The published-snapshot cell (SPEC 04 TXN-18 as amended, ratified
-    /// 2026-07-16; ADR-0006 Option B): the immutable `Arc<Snapshot>` behind a
+    /// The published-snapshot cell (SPEC 04 TXN-18; ADR-0006 Option B): the
+    /// immutable `Arc<Snapshot>` behind a
     /// bounded-O(1)-critical-section mutex, plus the mirroring SeqCst
     /// `commit_point` atomic that carries the whole lock-free pin protocol
     /// (TXN-17/19/20). Published in the TXN-19 order (swap the object, then
@@ -571,9 +569,9 @@ pub struct EnvInner {
     /// serves read txns from their pinned snapshots.
     poisoned: AtomicBool,
     /// The MVCC reader table (SPEC 04 §4; ADR-0006): `max_readers`
-    /// cache-padded single-`AtomicU64` slots. Replaces the earlier interim
-    /// mutexed reader registry wholesale (TXN-21). Readers claim/pin/release
-    /// slots lock-free; the writer's GC gate scans it (`oldest_live_reader`).
+    /// cache-padded single-`AtomicU64` slots. Readers claim/pin/release
+    /// slots lock-free; the writer's GC gate scans it (`oldest_live_reader`,
+    /// TXN-21).
     reader_table: ReaderTable,
     /// The named-DB registry (the dbi table, SPEC 02 §6). Guards the
     /// dbi ↔ name mapping only — records resolve from the catalog (TXN-10).
@@ -661,8 +659,8 @@ impl EnvInner {
         &self.meta
     }
 
-    /// `Arc`-clone the current published snapshot (SPEC 04 TXN-18 as
-    /// amended). The clone keeps the `(txnid, roots)` alive for the caller's
+    /// `Arc`-clone the current published snapshot (SPEC 04 TXN-18). The
+    /// clone keeps the `(txnid, roots)` alive for the caller's
     /// life regardless of later commits. Critical section: one refcount bump
     /// (ADR-0006 Option B).
     #[must_use]
@@ -683,7 +681,7 @@ impl EnvInner {
     /// current writer finishes; never errors. The returned guard releases
     /// from whatever thread drops it ([`WriterLock`]), so `RwTxn` is `Send`.
     /// The writer-panic poison-recovery policy lives in
-    /// [`WriterLock::acquire`], unchanged from the old `Mutex<()>` form.
+    /// [`WriterLock::acquire`].
     pub(crate) fn lock_writer(&self) -> WriterGuard<'_> {
         self.write_mutex.acquire()
     }
@@ -902,8 +900,8 @@ impl EnvInner {
         &self.stamp_cache
     }
 
-    /// Test/diagnostics hook (ADR-0018 amendment, 2026-10-01; the
-    /// [`crate::rwtxn::RwTxn::spills`] precedent): whether the env-wide
+    /// Test/diagnostics hook (ADR-0018; like
+    /// [`crate::rwtxn::RwTxn::spills`]): whether the env-wide
     /// validated-pages cache currently holds exactly the page version
     /// `(pgno, kind, stamp)` — `branch` selects the kind half of the key.
     /// Observes only; never part of the stable API.
@@ -1086,8 +1084,8 @@ impl EnvInner {
     }
 
     /// Whether allocating an `n`-page run at `next_pgno` would exceed the map
-    /// (SPEC 02 §8, `MdbError::MapFull`). No consumer of the write path exists
-    /// yet; exposed now so the geometry ceiling is testable at open.
+    /// (SPEC 02 §8, `MdbError::MapFull`). Exposed so the geometry ceiling is
+    /// testable at the env level; the write path checks `is_map_full` itself.
     #[must_use]
     pub fn would_map_full(&self, next_pgno: u64, n: u64) -> bool {
         is_map_full(next_pgno, n, map_pages(self.map_size, self.page_size))
@@ -1381,8 +1379,8 @@ impl Env {
 }
 
 /// Environment info (SPEC 00 rows 20/60; `mdb_env_info` / `MDB_envinfo`).
-/// Every field is populated; the LMDB-parity baseline populated only
-/// `map_size`, the sole field any consumer reads.
+/// Every field is populated, though `map_size` is the only one any consumer
+/// reads.
 ///
 /// ## LMDB `MDB_envinfo` field mapping
 ///
@@ -1544,8 +1542,7 @@ pub const MAX_DBS_LIMIT: u32 = 1 << 20;
 ///   under the one-valid + `PREV_SNAPSHOT` combination (SPEC 06 REC-2†).
 // The open parameters are all distinct scalars/flags the caller (zerodb-io / the
 // public crate) has already resolved; bundling them into a params struct would
-// only add indirection for this single internal entry point. The write-flag
-// work pushed the count from 7 to 8 with `durability`.
+// only add indirection for this single internal entry point.
 #[allow(clippy::too_many_arguments)]
 pub fn open_with_backing(
     canonical_path: PathBuf,
@@ -1651,7 +1648,7 @@ pub fn open_with_backing_policy(
         MetaChoice::Both { meta, chosen } => (meta, chosen),
         MetaChoice::OnlyOne { meta, chosen } => {
             if prev_snapshot {
-                // REC-2† (ratified 2026-07-16): one valid slot + PREV_SNAPSHOT is
+                // REC-2†: one valid slot + PREV_SNAPSHOT is
                 // a hard error — there are not two committed snapshots to pick an
                 // older from.
                 return Err(Error::Mdb(MdbError::Invalid));

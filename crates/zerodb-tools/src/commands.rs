@@ -175,13 +175,11 @@ pub fn cmd_load(dump_path: &Path, env_dir: &Path, psize: u32, map_size: u64) -> 
     }
     named_owned.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Stream the env straight into the data file (issue #63):
-    // the old path materialized the whole env image in a second Vec
-    // (`build_multi_db_image`) before one `fs::write`. Page content is
-    // independent of `map_size` (only the meta pages record it), so if the
-    // streamed file outgrows the requested map_size, re-stream once with a
-    // map_size that comfortably covers it — the same retry the batch build
-    // did, minus the image buffer. Txnid 1 = a fresh env's first state.
+    // Stream the env straight into the data file, with no in-memory image.
+    // Page content is independent of `map_size` (only the meta pages record
+    // it), so if the streamed file outgrows the requested map_size, re-stream
+    // once with a map_size that comfortably covers it. Txnid 1 = a fresh
+    // env's first state.
     let need = stream_env_to_file(&data, psize, map_size, &main_user, &named_owned)?;
     if need > map_size {
         let ms = round_up(need + need / 4, u64::from(psize));
@@ -208,7 +206,7 @@ pub fn cmd_load(dump_path: &Path, env_dir: &Path, psize: u32, map_size: u64) -> 
 
 /// A [`PageSink`] over the load destination: one positioned write per page,
 /// no userspace buffering (mirrors `zerodb::copy`'s file sink; durability is
-/// the caller's concern, as with the batch `fs::write` this replaces).
+/// the caller's concern).
 struct LoadSink {
     file: File,
     psize: u32,

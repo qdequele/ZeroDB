@@ -13,6 +13,9 @@ Ratio convention throughout: **`ratio = zerodb ÷ lmdb`**, so above 1.00 means
 zerodb is slower. `just bench-report` prints, per rung, both the ratio and its
 delta against the family's base rung (the column marked `Δfam`).
 
+The "implicates" columns below name topics from the performance inventory,
+[`PERF-GAP-VS-LMDB.md`](PERF-GAP-VS-LMDB.md).
+
 ## How to read a jump
 
 A single rung's ratio is weak evidence — it bundles every cost that rung pays.
@@ -29,13 +32,12 @@ the one added mechanism cancels. Three rules:
    finding however far its ratio sits from 1.00.
 
 And the standing caveat: macOS is indicative. It isolates CPU, allocator and
-memcpy, and a laptop-SSD fsync. Every claim about the deployed system —
-especially anything in `commit/sync/*` and `maint/*` — has to be re-run on
-linux-aarch64 (Graviton) + EBS gp3, where a page fault or a barrier is a
-network round-trip. Since 2026-09-25 the reference ladder runs on a quiet
+memcpy, and a laptop-SSD fsync, but adds macOS-only effects (`F_FULLFSYNC`,
+LMDB's POSIX-semaphore writer lock). The reference ladder runs on a quiet
 x86-64 Linux bench server (`benches/results/*-bench-server-linux-x86.md`).
-That removes the macOS-only effects (`F_FULLFSYNC`, LMDB's POSIX-semaphore
-writer lock; PERF-GAP B9, B11), but it is still not Graviton + EBS.
+Claims about the deployed system — especially anything in `commit/sync/*` and
+`maint/*` — still need a run on linux-aarch64 (Graviton) + EBS gp3, where a
+page fault or a barrier is a network round-trip.
 
 ## The ladder
 
@@ -48,11 +50,11 @@ extra mechanism added". Changing a base here means changing `LADDER_BASE` in
 
 | rung | isolates | implicates |
 |---|---|---|
-| `env/open/reopen` **(base)** | mapping and validating an existing image | D-017 geometry/txnid validation at open |
-| `env/open/create` | writing a fresh image: file creation, initial metas, the catalog write | PERF-GAP **B9** — two unconditional fsyncs, by design |
-| `env/txn/ro_begin_abort` **(base)** | the reader-table slot pin/unpin protocol, nothing else | ADR-0006 lock-free reader table |
+| `env/open/reopen` **(base)** | mapping and validating an existing image | geometry and txnid validation at open (divergence D-017) |
+| `env/open/create` | writing a fresh image: file creation, initial metas, the catalog write | env creation's two fsyncs, by design |
+| `env/txn/ro_begin_abort` **(base)** | the reader-table slot pin/unpin protocol, nothing else | lock-free reader table (ADR-0006) |
 | `env/txn/rw_empty_commit` | the same, plus the writer-lock handoff and the meta update, with **zero** dirty pages | the commit floor every `commit/*` rung sits on |
-| `env/stat/non_free` | `non_free_pages_size()` over a fragmented free list (~1M entries deleted across ~1k commits under a pinned reader → on the order of 10^5 free pages at 4 KiB, fewer at larger pages, in ~1k GC entries) | milli's per-write-txn used-bytes probe: both engines sum per-DB branch + leaf + overflow pages (LMDB via `mdb_stat`, zerodb from its catalog records, SPEC 05 GC-23 amended 2026-09-29), so the cost tracks the DB count; the large free list pins that it no longer depends on the free list (previously a GC-tree walk, PERF-GAP B20) |
+| `env/stat/non_free` | `non_free_pages_size()` over a fragmented free list (~1M entries deleted across ~1k commits under a pinned reader → on the order of 10^5 free pages at 4 KiB, in ~1k GC entries) | milli's per-write-txn used-bytes probe: both engines sum per-DB branch + leaf + overflow pages (LMDB via `mdb_stat`, zerodb from its catalog records), so the cost tracks the DB count; the large free list checks that it does not depend on the free list |
 
 `rw_empty_commit ÷ ro_begin_abort` is what a write transaction costs when it has
 nothing to write. Subtract it from `commit/batch/n1` to get the part of a
@@ -63,38 +65,34 @@ one-put commit that is actually about the put.
 | rung | isolates | implicates |
 |---|---|---|
 | `get/db/root` **(base)** | a descent with **no** catalog record to resolve | — |
-| `get/db/named` | the same descent plus named-DB resolution | PERF-GAP **A1** (per-txn `named_memo`) |
-| `get/db/named_x8` | resolution against eight different catalog records | A1's memo hit rate |
-| `get/access/hot` **(base)** | per-call overhead only: one key, everything resident, every memo warm | PERF-GAP **A6** (per-get allocation), **B17** (cursor-free exact get), adapter dispatch |
+| `get/db/named` | the same descent plus named-DB resolution | per-txn named-DB memo |
+| `get/db/named_x8` | resolution against eight different catalog records | that memo's hit rate |
+| `get/access/hot` **(base)** | per-call overhead only: one key, everything resident, every memo warm | per-get allocation, cursor-free point get, adapter dispatch |
 | `get/access/seq` | + ascending locality | cursor/leaf memo |
 | `get/access/rand` | + scattered access: cold pages, cold memo | page-cache and TLB behaviour |
 | `get/access/miss` | a full descent with **no** value returned | descent cost net of the value copy |
-| `get/size/n1k` **(base)** → `n50k` → `n1m` *(long)* | tree depth, and nothing else | PERF-GAP **A5** (branch levels re-resolved per descent) |
-| `get/key/k8` **(base)** → `k32` → `k128` | key width: comparison cost and cells per page | PERF-GAP **B19** (8/4-byte keys compare as one integer, so `k8` takes a fast path the wider rungs do not), leaf density; A7 (comparator vtable) only on custom-comparator DBs, which no rung uses |
+| `get/size/n1k` **(base)** → `n50k` → `n1m` *(long)* | tree depth, and nothing else | branch levels re-resolved per descent |
+| `get/key/k8` **(base)** → `k32` → `k128` | key width: comparison cost and cells per page | integer fast path for 8/4-byte key compares (so `k8` takes a path the wider rungs do not), leaf density; the custom-comparator call only matters on custom-comparator DBs, which no rung uses |
 | `get/val/v8` **(base)** → `v256` → `v4k` → `v2page` | value width; at 2×page it crosses into overflow pages | value memcpy, overflow handling |
-| `get/val/v8_touch` → `v4k_touch` → `v2page_touch` | the same value-width sweep, but every returned value is actually read | overflow-page chase + value memcpy net of an elided read |
+| `get/val/v8_touch` **(base)** → `v4k_touch` → `v2page_touch` | the same value-width sweep, but every returned value is actually read | overflow-page chase + value memcpy |
 
-`named ÷ root` is the price of A1. `n1m ÷ n50k` is roughly the price of one
-more tree level — read it against `n50k ÷ n1k` to see whether per-level cost is
-constant or growing.
+`named ÷ root` is the price of named-DB resolution. `n1m ÷ n50k` is roughly the
+price of one more tree level — read it against `n50k ÷ n1k` to see whether
+per-level cost is constant or growing.
 
-**2026-09-25:** `point_get` never reads the bytes behind the returned value, so
-on `v4k`/`v2page` the overflow-page chase and the value memcpy could be
-optimized away or never actually paid for — those two rungs measured an
-artifact, not real work. The `*_touch` rungs (`get/val/v8_touch`,
-`get/val/v4k_touch`, `get/val/v2page_touch`) add a `point_get_touch` operation,
-shared by both engines in `backend.rs`, that reads the first and last byte of
-every returned value through `std::hint::black_box`. `v8_touch` is the
-family-local control; compare `v4k_touch ÷ v8_touch` and `v2page_touch ÷
-v8_touch` to isolate what actually reading the value costs, the same way the
-non-touch rungs are read against `v8`. The original `v8`/`v256`/`v4k`/`v2page`
-rungs are unchanged, for history comparability.
+The plain `get/val/*` rungs (`point_get`) never read the bytes behind the
+returned value, so on `v4k`/`v2page` the overflow-page chase and the value
+memcpy can be optimized away or never paid for. The `*_touch` rungs use
+`point_get_touch`, shared by both engines in `backend.rs`, which reads the first
+and last byte of every returned value through `std::hint::black_box`.
+`v8_touch` is the family's own control: `v4k_touch ÷ v8_touch` and
+`v2page_touch ÷ v8_touch` isolate what actually reading the value costs.
 
 ### `scan` — cursor iteration
 
 | rung | isolates | implicates |
 |---|---|---|
-| `scan/full/fwd` **(base)** | one descent, then pure leaf walking | the cursor leaf memo (29× → 2.18×, 2026-07-21) |
+| `scan/full/fwd` **(base)** | one descent, then pure leaf walking | the cursor leaf memo |
 | `scan/full/rev` | the same walk against the sibling-link direction | reverse-iteration path |
 | `scan/range/1pct` **(base)** → `10pct` | a positioned descent plus a per-step bound test | `RoRange` bound handling |
 | `scan/prefix/bucket` | the same through the prefix API | `prefix_iter` / `MDB_SET_RANGE` |
@@ -109,7 +107,7 @@ in resolving the handle, not in the tree.
 
 | rung | isolates | implicates |
 |---|---|---|
-| `seek/ge/seq` **(base)** | ascending probes: whatever cursor state survives between seeks can show here | per-level cursor caching (A5) |
+| `seek/ge/seq` **(base)** | ascending probes: whatever cursor state survives between seeks can show here | per-level cursor caching |
 | `seek/ge/rand` | scattered probes, no locality to exploit | descent cost |
 | `seek/ge/gap` | probes that land *between* keys, so every seek settles forward | boundary/leaf-crossing path |
 
@@ -123,13 +121,13 @@ plain descent cost.
 |---|---|---|
 | `put/order/append` **(base)** | insertion the engine has been *told* is ascending | `MDB_APPEND` fast path |
 | `put/order/seq` | the same keys, ascending but not declared | what the engine failed to infer |
-| `put/order/rand` | the same keys, scattered: splits everywhere, far more dirty pages | PERF-GAP **B2** (split materialization, done), **B3** (dirty store, parked) / **B18** (frame pool) |
-| `put/val/v8` **(base)** → `v256` → `v4k` → `v2page` | value width, then overflow pages | value memcpy; BIGDATA zeroing (2026-09-09 review) |
+| `put/order/rand` | the same keys, scattered: splits everywhere, far more dirty pages | page splits, the dirty-page store, page frame reuse |
+| `put/val/v8` **(base)** → `v256` → `v4k` → `v2page` | value width, then overflow pages | value memcpy, overflow-page zeroing |
 | `put/api/plain` **(base)** | `put` | — |
-| `put/api/reserved` | `MDB_RESERVE` — milli's document-serialization path | PERF-GAP **B6** / issue #10 / D-015 |
+| `put/api/reserved` | `MDB_RESERVE` — milli's document-serialization path | reserved-space writes in the heed adapter (divergence D-015) |
 | `put/over/same_size` **(base)** | overwriting a cell that still fits | in-place replacement |
 | `put/over/grow` | overwriting a cell that no longer fits | page rearrangement and splits |
-| `put/gc/drain_big` | overwrites whose COW pages are all drawn from ONE large free-list entry (half of a 300k-key tree deleted first, then aged one commit so both engines' reuse gates admit it) | PERF-GAP **B7** (the O(1) front draw, 2026-09-26) and **B18**: cost per reused page vs free-list entry length (SPEC 05 GC-19/20). Every other rung starts with an empty or tiny free list |
+| `put/gc/drain_big` | overwrites whose COW pages are all drawn from ONE large free-list entry (half of a 300k-key tree deleted first, then aged one commit so both engines' reuse gates admit it) | free-list draw cost per reused page vs entry length (SPEC 05). Every other rung starts with an empty or tiny free list |
 
 `rand ÷ seq` is the split-and-COW cost. `seq ÷ append` is what an undeclared
 ascending order leaves on the table.
@@ -138,48 +136,31 @@ ascending order leaves on the table.
 
 | rung | isolates | implicates |
 |---|---|---|
-| `del/bulk/half` **(base)** | per-key deletion, tree stays populated: rebalance without collapse | PERF-GAP **B8** (delete + rebalance) |
-| `del/bulk/all` | per-key deletion down to empty: every leaf eventually merges | PERF-GAP **B8**, merge path |
-| `del/range/half` | the same span through **one** `delete_range` call | PERF-GAP **B23** — since 2026-09-27 a leaf-granular splice (≈0.92–0.95×), no longer a per-key delete; it was B8's sharpest rung before |
-| `del/cursor/drain` | the same span drained through the **write cursor** (`range_mut` + `del_current`) rather than by key | PERF-GAP **B8a**, **B22** — the only rung where post-delete cursor position costs anything |
-| `del/clear/all` | the whole tree dropped in one operation | page-list work, not per-key work — PERF-GAP **B21** (leaves freed from their parents unread) |
-| `del/churn/reinsert` | delete and re-insert alternating: freed pages must be reclaimed and handed straight back out | PERF-GAP **B7** / issue #29 (freelist churn), SPEC 05 GC |
+| `del/bulk/half` **(base)** | per-key deletion, tree stays populated: rebalance without collapse | delete and rebalance |
+| `del/bulk/all` | per-key deletion down to empty: every leaf eventually merges | delete and rebalance, merge path |
+| `del/range/half` | the same span through **one** `delete_range` call | range delete (a leaf-granular splice, not a per-key delete) |
+| `del/cursor/drain` | the same span drained through the **write cursor** (`range_mut` + `del_current`) rather than by key | cursor delete; the only rung where post-delete cursor position costs anything |
+| `del/clear/all` | the whole tree dropped in one operation | page-list work, not per-key work (leaves freed from their parents unread) |
+| `del/churn/reinsert` | delete and re-insert alternating: freed pages must be reclaimed and handed straight back out | free-list churn, SPEC 05 |
 
 A gap concentrated in `churn/reinsert` is a reclamation finding. A gap spread
-evenly across `bulk/*` is a tree finding. `range/half ÷ bulk/half` says whether
-the range API is actually saving descents. `cursor/drain ÷ range/half` was
-the cursor's own overhead while `delete_range` still point-deleted each key:
-the same span and the same result, reached by cursor instead of by key — it
-was 1.28 before B8a and 1.01 after. Since B23 `range/half` no longer deletes
-key by key, so read the cursor's own overhead as `cursor/drain ÷ bulk/half`
-(same span, by key) instead.
+evenly across `bulk/*` is a tree finding. `range/half ÷ bulk/half` says how much
+the range API saves over per-key deletes. `cursor/drain ÷ bulk/half` (same span,
+by key) is the write cursor's own overhead.
 
 ### `commit` — the transaction boundary
 
 | rung | isolates | implicates |
 |---|---|---|
-| `commit/batch/n10k` **(base)** | per-commit overhead amortized away; what is left is dirty-page write-out | PERF-GAP **B4** (write coalescing) |
+| `commit/batch/n10k` **(base)** | per-commit overhead amortized away; what is left is dirty-page write-out | write coalescing |
 | `commit/batch/n100` | a realistic batch | — |
-| `commit/batch/n1` | almost pure per-commit overhead | commit path, meta update |
+| `commit/batch/n1` | almost pure per-commit overhead | commit path, meta update, free-list save (ADR-0022) |
 | `commit/sync/n100` **(base)** | the same batch **with fsync on** | the durability barrier |
 | `commit/sync/n1` | one fsync per put | worst-case barrier cost |
 
 `sync/n1 ÷ batch/n1`, per engine, is that engine's barrier cost. On a laptop
 that is an SSD; the number that decides anything is the EBS gp3 one, which is
-also where B4's coalesced writes are supposed to pay for themselves (still
-unmeasured). On the Linux bench server (SATA mdraid) `commit/sync/*` is at
-parity, 0.97–1.03× (2026-09-28); the earlier ~1.8× was a macOS figure.
-`commit/batch/n1` is the rung ADR-0022 (free-list save in the meta page)
-moved: 2.04× → 1.60×.
-
-**2026-09-25:** every `commit/batch/*` and `commit/sync/*` rung shares one
-`case` function that ran the fixture teardown (`drop(f)`) as the last line of
-the `iter_batched` routine closure — inside the timed region. `f` now flows out
-of the routine as its return value instead; `iter_batched` collects routine
-outputs into a `Vec` and drops that `Vec` only after it stops the clock, so the
-env unmap and tempdir removal no longer count against the commits. Rung numbers
-for `commit/batch/*` (and `commit/sync/*`, same `case` function) from before
-this change are **not comparable** with numbers from after.
+also where coalesced writes are supposed to pay for themselves.
 
 ### `mixed` — the milli-shaped rung
 
@@ -188,44 +169,26 @@ lookup must consult the transaction's own uncommitted pages before the map.
 milli's extractor → `write_db` phase does exactly this, thousands of times per
 batch. Read it against `get/db/named_x8` (same fan-out, read-only txn) and
 `put/order/rand` (same writes, no reads): worse than both means the cost is the
-dirty-store lookup rather than either half alone. Implicates PERF-GAP **B3** and
-the `PgnoHasher` work of issue #9 (closed), and B14 (the write txn's dbi-indexed
-named-DB table).
+dirty-store lookup rather than either half alone. Implicates the dirty-page
+store and the write txn's named-DB table.
 
 ### `concurrent` *(long tier)* — MVCC under contention
 
 `concurrent/writer/r0` **(base)** → `r1` → `r4`: the timed value is the
-**writer's** work ONLY, while `r` reader threads full-scan in a loop. Every
-other suite is single-threaded, which hides exactly what MVCC exists to
-manage — the reader table under contention, and a writer whose page
-reclamation is pinned by the oldest live reader. `r0` runs the identical txn
-count and overwrites-per-txn as `r1`/`r4` with zero reader threads, so it is
-the family's same-shape base rung.
+**writer's** work only (first `write_txn` to last `commit`, measured inside
+`writer_under_readers` and reported through criterion's `iter_custom`), while
+`r` reader threads full-scan in a loop. Every other suite is single-threaded,
+which hides exactly what MVCC exists to manage — the reader table under
+contention, and a writer whose page reclamation is pinned by the oldest live
+reader. `r0` runs the identical txn count and overwrites-per-txn with zero
+reader threads, so it is the family's same-shape base rung. Reader threads poll
+the stop flag every 1024 entries, so their join stays short.
 
 Read `concurrent/writer/rN ÷ concurrent/writer/r0` **per engine**: that is what
-N readers cost that engine (historically this was read against
-`commit/batch/n100`, the same writer with nobody else in the environment — that
-comparison still holds, `r0` just gives the family its own base). A gap between
-the two engines' ratios is a reader-table (ADR-0006) or reclamation (SPEC 05)
-finding, not a tree finding. Long tier because on a laptop the reader threads
-compete with the writer for the same few cores, and the rung gets noisy.
-
-**2026-09-25:** the timed closure used to be the whole `iter_batched` routine,
-which included the reader threads' join tail and the fixture's drop. Each
-reader thread only checked the stop flag once per full 50k-entry `scan`, so
-after the writer's last commit the timed region could wait up to one whole scan
-before the closure returned — a real cost, but not the writer's cost, and not
-a fixed one (it scales with however slow that engine's own `scan` happens to
-be, which is exactly the kind of thing this rung is supposed to isolate on the
-writer side only). Fixed two ways: `backend.rs`'s `writer_under_readers` now
-returns the elapsed time of its own write-txn loop (first `write_txn` to last
-`commit`) and the suite times it with criterion's `iter_custom`, excluding the
-reader join and the drop entirely; and the reader loop
-(`scan_chunked_until_stop`) now polls the stop flag every 1024 entries instead
-of once per full scan, so even the reader threads' own wall-clock join is fast.
-Also added: the `r0` baseline rung described above. Rung numbers for
-`concurrent/writer/*` from before this change are **not comparable** with
-numbers from after.
+N readers cost that engine. A gap between the two engines' ratios is a
+reader-table (ADR-0006) or reclamation (SPEC 05) finding, not a tree finding.
+Long tier because on a laptop the reader threads compete with the writer for
+the same few cores, and the rung gets noisy.
 
 ### `maint` — whole-environment maintenance
 
@@ -236,22 +199,11 @@ plus the rebuild. Meilisearch calls this on every snapshot, so it is user-visibl
 latency.
 
 `compact ÷ raw`, per engine, is the price of compaction. Between engines, `raw`
-also reflects **on-disk size** — a denser store has less to copy (zerodb measured
-~17 % denser, 2026-07-22) — so a `raw` win may be density rather than speed.
-Check `zerodb-tools stat` before claiming either. Implicates PERF-GAP **B24**
-(both modes stream straight into the caller's file; the compacting copy
-overlaps packing and writing with a writer thread), which superseded **B10**,
-and **C1** (streaming compaction, bounded RAM).
-
-## Timing-fix log
-
-- **2026-09-26:** the shared write shapes (`wr_fresh`, `wr_loaded` in
-  `harness.rs`), `del/range/half`, `mixed/rw/8dbs` and `maint/copy/*` dropped
-  their fixture (env unmap, temp-dir removal, copied file) **inside** the timed
-  closure. They now return it, and criterion drops it after stopping the clock.
-  Every `put/*`, `del/*`, `mixed/*` and `maint/*` number from before this date
-  includes that teardown and is not comparable with later runs. (The same fix
-  landed for `commit/*` and `concurrent/*` on 2026-09-25.)
+also reflects **on-disk size** — a denser store has less to copy — so a `raw`
+win may be density rather than speed. Check `zerodb-tools stat` before claiming
+either. Implicates env copy (both modes stream straight into the caller's file;
+the compacting copy overlaps packing and writing with a writer thread) and
+streaming compaction with bounded RAM.
 
 ## Fairness properties
 
@@ -265,12 +217,15 @@ These are structural, not conventions to remember:
   `pair_shape!` / `pair_op!` macros name the shape and the operation exactly
   once. A paste cannot compare one engine's `scan` against the other's
   `rev_scan`.
+* **Teardown outside the clock.** Rungs that build a fresh fixture per
+  iteration (`put/*`, `del/*`, `commit/*`, `mixed/*`, `maint/*`) return it
+  (env unmap, temp-dir removal, copied file) from the timed routine; criterion
+  drops it after stopping the clock. `concurrent/*` times only the writer loop.
 * **Identical data.** Seeded splitmix64, no `rand`, so a Graviton run compares
   the same bytes in the same order as a laptop run.
 * **Identical page size.** LMDB is locked to the OS page size and exposes no
   selector, so zerodb is pinned to that value. Without this a 4 KiB-vs-16 KiB
-  geometry gap swamps everything — as it silently did in the pre-2026-07-22
-  hannoy numbers.
+  geometry gap swamps everything.
 * **Named databases by default.** How milli and hannoy actually use the store.
   `get/db/root` is the deliberate exception: it is the baseline the named rungs
   are measured against.

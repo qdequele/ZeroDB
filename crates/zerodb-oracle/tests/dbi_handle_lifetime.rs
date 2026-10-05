@@ -1,14 +1,9 @@
-//! Regression corpus for the **dbi-handle lifetime** rule (found 2026-07-20 by
-//! the `ZERODB_FUZZ_PAIR=heed` differential fuzzer, two artifacts).
+//! Regression corpus for the **dbi-handle lifetime** rule.
 //!
 //! ## The rule
 //!
-//! LMDB, `lmdb.h` on `mdb_dbi_open`:
-//!
-//! > "The database handle will be private to the current transaction until the
-//! > transaction is successfully committed. If the transaction is aborted the
-//! > handle will be closed automatically."
-//!
+//! A handle opened by `mdb_dbi_open` is private to its txn until commit and
+//! is closed automatically if that txn aborts (`lmdb.h`, `mdb_dbi_open`).
 //! `mdb.c` implements it in `mdb_dbis_update(txn, keep)`, called from
 //! `mdb_txn_end`: on the non-commit path (`keep == 0`) every dbi flagged
 //! `DB_NEW` — i.e. opened in this txn — has `me_dbflags[i]` cleared and
@@ -19,21 +14,13 @@
 //! Separately, `mdb_drop(txn, dbi, del=1)` calls `mdb_dbi_close(env, dbi)`
 //! directly — an **env-level** close that a subsequent abort does *not* undo.
 //!
-//! ## What the fuzzer actually found
+//! ## What these guard
 //!
-//! Both artifacts were **harness** defects, not engine bugs. The oracle tracked
-//! "which handles survive a rollback" with a positional watermark
-//! (`committed_dbs`) into the `dbs` vec, which is only sound while that vec is
-//! append-only. `drop_db` removes from the middle, and after that
-//! `dbs.truncate(committed_dbs)` retained the wrong set: it kept a handle whose
-//! creating txn was aborted (dead under the rule above) while discarding a
-//! committed one. The harness then issued a use-after-close; LMDB correctly
-//! answered `EINVAL`, ZeroDB — whose `Database` is a plain value, not an
-//! env-level dbi slot carrying a validity flag and sequence number — served the
-//! request. The watermark is now a per-entry `committed` flag.
-//!
-//! These tests pin the exact op shapes so the harness cannot regress into
-//! generating that use-after-close again.
+//! Regression: the harness must not keep a handle from an aborted txn (or drop
+//! a committed one) after `drop_db` removes from the middle of its handle list.
+//! Such a use-after-close gets `EINVAL` from LMDB, while ZeroDB — whose
+//! `Database` is a plain value, not an env-level dbi slot with a validity flag
+//! and sequence number — would serve the request.
 
 use zerodb_oracle::{run, DbName, HeedZerodbEngine, Key, LmdbEngine, Op, Value, ZerodbEngine};
 
@@ -55,8 +42,8 @@ fn v(s: &str) -> Value {
     Value(s.as_bytes().to_vec())
 }
 
-/// Artifact `crash-c48149179fae…`, minimized: commit a named DB, open a second
-/// DB in a txn that is never committed, drop the **committed** one, then abort.
+/// Commit a named DB, open a second DB in a txn that is never committed, drop
+/// the **committed** one, then abort.
 /// The abort closes the uncommitted handle (`mdb_dbis_update` keep=0) *and* the
 /// dropped handle stays closed (`mdb_drop` → `mdb_dbi_close`), so no usable
 /// handle survives. The cursor path (`iter_mut` → `mdb_cursor_open`) is what
@@ -91,11 +78,9 @@ fn cursor_after_abort_of_txn_that_opened_the_handle() {
     diff_both_pairs(&ops);
 }
 
-/// Artifact `crash-580edc9bd18e…`, minimized: the same stale-handle situation
-/// reached through `mdb_put` instead of a cursor. The reported key was an
-/// ordinary 14-byte key — the size was a red herring; `mdb_put`'s very first
-/// check is the same `TXN_DBI_EXIST` gate, so a dead dbi yields `EINVAL`
-/// regardless of key or value.
+/// The same stale-handle situation reached through `mdb_put` instead of a
+/// cursor. `mdb_put`'s very first check is the same `TXN_DBI_EXIST` gate, so a
+/// dead dbi yields `EINVAL` regardless of key or value.
 #[test]
 fn put_after_abort_of_txn_that_opened_the_handle() {
     let ops = vec![
@@ -121,9 +106,8 @@ fn put_after_abort_of_txn_that_opened_the_handle() {
     diff_both_pairs(&ops);
 }
 
-/// The positive control the watermark used to get wrong in the other direction:
-/// a handle whose creating txn **committed** must stay usable across a later
-/// unrelated abort.
+/// Positive control: a handle whose creating txn **committed** must stay usable
+/// across a later unrelated abort.
 #[test]
 fn committed_handle_survives_a_later_abort() {
     let ops = vec![

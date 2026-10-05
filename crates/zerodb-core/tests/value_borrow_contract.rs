@@ -1,14 +1,13 @@
-//! Write-path coverage: SPEC 04 §6 (TXN-37..49) value-borrow
-//! contract, exercised as a black-box consumer of `zerodb-core`'s public API
-//! (no crate-internal access — same posture as `page_edges.rs`) so this file
-//! runs under `cargo miri test -p zerodb-core` (deterministic, no mmap/file
-//! I/O — every env here is the `env::testutil` heap-backed `VecBacking`).
+//! The SPEC 04 §6 (TXN-37..49) value-borrow contract, exercised as a
+//! black-box consumer of `zerodb-core`'s public API (no crate-internal
+//! access — same posture as `page_edges.rs`) so this file runs under
+//! `cargo miri test -p zerodb-core` (deterministic, no mmap/file I/O — every
+//! env here is the `env::testutil` heap-backed `VecBacking`).
 //!
 //! `crates/zerodb-core/src/rwtxn.rs`'s own `#[cfg(test)] mod tests` already
 //! covers TXN-49 items 1/2/4 (`txn49_get_then_put`, `txn49_reserve_then_split`,
 //! `txn49_frame_stability_across_index_growth`) — not duplicated here. This
-//! file adds the two adversarial angles the coverage-pass brief calls out
-//! that were NOT already pinned:
+//! file adds two adversarial angles not pinned there:
 //!
 //! 1. A `RoTxn`'s borrow into **already-committed** page bytes must stay
 //!    valid and unmoved while a **separate, later** `RwTxn` COWs that same
@@ -20,8 +19,7 @@
 //!    variant of `txn49_frame_stability_across_index_growth`, which only
 //!    exercised an inline/tree-page frame).
 //!
-//! ## Why a live borrow can't span a mutation (item 3's "document as a
-//! comment" ask)
+//! ## Why a live borrow can't span a mutation
 //!
 //! `Database::get`/cursor reads take `&RwTxn`; every mutating op
 //! (`put`/`put_reserved`/`delete`/`clear`/`RwCursor::put_current`/

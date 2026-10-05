@@ -9,13 +9,13 @@
 //!   out-of-bounds. Used by validation, mutation, and every cold path.
 //! - **Unchecked** (`read_*_unchecked`): `unsafe fn`s using
 //!   explicit offsets + [`core::ptr::read_unaligned`] — exactly the pattern
-//!   the AGENTS.md unsafe policy prescribes, in one of its sanctioned homes
+//!   the unsafe policy prescribes, in one of its sanctioned homes
 //!   (`zerodb-core::page`). Callers must guarantee `off + N <= buf.len()`;
 //!   the only callers are the `tree` view accessors, whose constructors prove
 //!   (full validation walk) or inherit (kind-tagged memo hit / engine-authored
-//!   dirty frame — the memo and engine-authorship trust arguments) that every cell lies in
-//!   bounds. `debug_assert!`s keep the contract loud in test builds; the
-//!   differential fuzzer and miri referee it.
+//!   dirty frame) that every cell lies in bounds. `debug_assert!`s keep the
+//!   contract loud in test builds; the differential fuzzer and miri referee
+//!   it.
 //!
 //! Checked functions panic on out-of-bounds access; callers in this crate
 //! validate bounds against the page size before invoking them (the view

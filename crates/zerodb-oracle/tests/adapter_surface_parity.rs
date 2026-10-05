@@ -1,7 +1,7 @@
 //! Surface parity pins between real heed (LMDB fork) and `heed-zerodb`, for
 //! behaviours a consumer observes without touching a database: error message
 //! text, the environment/transaction pairing assertion, and how DUPSORT-only
-//! put flags are treated on a plain database (observed, not guessed — rule 1).
+//! put flags are treated on a plain database.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};

@@ -11,8 +11,6 @@
 //! - the dirty set stays near the limit through a large txn;
 //! - an abort after spilling leaves exactly the last commit;
 //! - a txn that stays under the limit never spills.
-//!
-//! Do not weaken (AGENTS.md rule 2).
 
 use std::collections::BTreeMap;
 use std::ops::Bound;

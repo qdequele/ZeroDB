@@ -310,19 +310,18 @@ proptest! {
     }
 }
 
-/// Reserved-put pin (2026-07-21; adapter `ReservedSpace` in
-/// docs/PERF-GAP-VS-LMDB.md): the fork's `put_reserved` semantics when the
-/// caller's closure FAILS. LMDB reserves the slot inside the page via
-/// `MDB_RESERVE` *before* the closure runs, so a closure error cannot un-put
-/// the entry. Pinned side by side: (a) whether the call errors, (b) whether
-/// the key is present afterwards, (c) the stored length. Value BYTES are
+/// Reserved-put pin (adapter `ReservedSpace`, docs/PERF-GAP-VS-LMDB.md): the
+/// fork's `put_reserved` semantics when the caller's closure FAILS. LMDB
+/// reserves the slot inside the page via `MDB_RESERVE` *before* the closure
+/// runs, so a closure error cannot un-put the entry. Pinned side by side:
+/// (a) whether the call errors, (b) whether the key is present afterwards,
+/// (c) the stored length. Value BYTES are
 /// deliberately not compared — LMDB's unwritten reserve tail is whatever the
 /// page held (uninitialized from the API's point of view; zerodb zero-fills
 /// its tail, which this pin cannot and does not observe).
 ///
-/// The earlier adapter diverged here: it filled a heap buffer first, so a
-/// closure error meant NO entry. It now reserves in-frame first, matching the
-/// fork.
+/// Regression: an adapter that fills a heap buffer before inserting leaves NO
+/// entry on a closure error, diverging from the fork.
 #[test]
 fn put_reserved_failing_closure_leaves_entry_parity() {
     use std::io::Write as _;

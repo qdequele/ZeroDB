@@ -8,9 +8,8 @@
 //!
 //! `compact / raw`, taken per engine, is the price of compaction. Between
 //! engines, `raw` also reports the **on-disk size** difference indirectly — a
-//! denser store has less to copy (zerodb measured ~17 % denser in July 2026),
-//! so a `raw` win here may be a density win rather than a speed win. Check
-//! `zerodb-tools stat` before claiming either.
+//! denser store has less to copy, so a `raw` win here may be a density win
+//! rather than a speed win. Check `zerodb-tools stat` before claiming either.
 
 use criterion::{BatchSize, Criterion, Throughput};
 

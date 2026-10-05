@@ -1,6 +1,6 @@
 //! The [`Engine`] driven **through the `heed-zerodb` adapter** (ADR-0003
-//! accept-criterion 6: "the oracle re-run *through* the adapter shows
-//! zero divergences"). This is a near-verbatim copy of [`crate::lmdb`] with the
+//! accept-criterion 6: zero divergences when the oracle re-runs *through* the
+//! adapter). This is a near-verbatim copy of [`crate::lmdb`] with the
 //! backend import swapped `heed` → `heed_zerodb`, so the *same op driver* runs
 //! over the ZeroDB engine behind the heed surface. Paired against
 //! [`crate::LmdbEngine`] (real LMDB) in
@@ -16,8 +16,8 @@
 //! without a helper crate (none are on the allowlist). We therefore extend the
 //! transaction lifetimes to `'static` with `mem::transmute` and uphold the
 //! borrows manually. The invariants are stated at each `unsafe` site; the whole
-//! construction is confined to this test-only oracle crate, exactly where the
-//! AGENTS.md unsafe policy permits FFI-adjacent unsafe.
+//! construction is confined to this test-only oracle crate, where the unsafe
+//! policy permits FFI-adjacent unsafe.
 
 use std::ops::Deref;
 
@@ -42,21 +42,15 @@ struct DbEntry {
     db: Db,
     /// Whether the transaction that opened this handle has **committed**.
     ///
-    /// LMDB (`lmdb.h`): "The database handle will be private to the current
-    /// transaction until the transaction is successfully committed. If the
-    /// transaction is aborted the handle will be closed automatically."
-    /// `mdb.c`'s `mdb_dbis_update(txn, keep=0)` implements that close on the
-    /// abort path. So a handle whose creating txn aborted is DEAD, and using it
-    /// afterwards is an API-contract violation that LMDB reports as `EINVAL`
-    /// from the `TXN_DBI_EXIST` gate in `mdb_cursor_open` / `mdb_put`.
+    /// A dbi opened in a write txn is private to it until commit, and an abort
+    /// closes it (`lmdb.h` `mdb_dbi_open`; `mdb.c` `mdb_dbis_update(txn, keep=0)`).
+    /// A handle whose creating txn aborted is DEAD: using it is an API-contract
+    /// violation LMDB reports as `EINVAL` (the `TXN_DBI_EXIST` gate in
+    /// `mdb_cursor_open` / `mdb_put`).
     ///
-    /// This flag replaces the old positional `committed_dbs` watermark, which
-    /// was only correct while entries were append-only: `drop_db`'s
-    /// `dbs.remove(idx)` removes from the middle, after which
-    /// `truncate(committed_dbs)` retained the WRONG set — keeping an
-    /// uncommitted (dead) handle while discarding a committed one. That made
-    /// the harness drive both engines through a use-after-close and report the
-    /// resulting LMDB `EINVAL` as an engine divergence.
+    /// Tracked per entry rather than as a positional watermark because
+    /// `drop_db` removes entries from the middle of `dbs`; a watermark would then
+    /// keep a dead handle and discard a committed one.
     committed: bool,
 }
 
@@ -72,9 +66,8 @@ struct DbEntry {
 // `RwTxn` moves), but `heed_zerodb`'s nested reader holds a genuine Rust borrow
 // into the parent `RwTxn`. When `begin_nested_ro` `mem::transmute`s that borrow
 // to `'static` and moves the wtxn into `Active::RwNested`, an unboxed wtxn would
-// relocate the borrowed `zerodb::RwTxn` and dangle the nested reader (observed:
-// SIGSEGV). Boxing keeps the pointee put — the same discipline this engine
-// already applies to `Env`.
+// relocate the borrowed `zerodb::RwTxn` and dangle the nested reader (SIGSEGV).
+// Boxing keeps the pointee put, as for `Env`.
 enum Active {
     None,
     Rw(Box<RwTxn<'static>>),
@@ -377,8 +370,7 @@ impl HeedZerodbEngine {
         // guard fact too, exactly as `commit`/`abort`/`begin_rw` do (and as
         // `ZerodbEngine::reopen` does). Without this the two engines' tracked
         // `cleared_in_txn` drift after a reopen-while-cleared, making the shared
-        // `classify` FORK-1 guard fire asymmetrically (found by the read-path
-        // differential fuzz).
+        // `classify` FORK-1 guard fire asymmetrically.
         self.active = Active::None;
         self.cleared_in_txn = false;
         self.dbs.clear();

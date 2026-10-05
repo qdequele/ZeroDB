@@ -197,7 +197,7 @@ fn steady_state_annex_only_gc_tree_stays_empty_inner(flags: EnvFlags) {
     );
     assert_clean(dir.path());
 
-    // free_page_count sees the annex ids (GC-23 as amended).
+    // free_page_count sees the annex ids (GC-23).
     let rtxn = env.read_txn().unwrap();
     let (_, fl_now, root_now) = live_meta(dir.path());
     assert_eq!(root_now, PGNO_INVALID);

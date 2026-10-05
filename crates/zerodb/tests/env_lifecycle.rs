@@ -4,8 +4,7 @@
 //! cases depend on **our** on-disk format, which LMDB does not share (the
 //! differential env-lifecycle parity tests live in `zerodb-oracle`).
 //!
-//! Each test names the REC rule / SPEC section it pins. Do not weaken these
-//! (AGENTS.md rule 2).
+//! Each test names the REC rule / SPEC section it pins.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -199,14 +198,12 @@ fn garbage_file_is_invalid() {
     assert!(matches!(e, Error::Mdb(MdbError::Invalid)));
 }
 
-/// SPEC 02 §3.2 step 0 (amended 2026-07-21): a non-empty file shorter than
-/// `2 * page_size` is rejected `Invalid` **before mapping**. Regression pin for
-/// a real SIGBUS: slot 1 is read at `[psize, 2*psize)` through the map, and a
-/// garbage file whose length leaves that range on OS pages wholly past EOF
-/// faulted instead of erroring. The 4 KiB-garbage + 16 K/64 K-psize shapes
-/// below reproduce it on any host whose OS page is ≤ the DB page size (the
-/// pre-fix crash was first observed via the adapter's OS-page-size default on
-/// a 16 K-page Mac; on 4 K-page Linux even the 4 K default was exposed).
+/// SPEC 02 §3.2 step 0: a non-empty file shorter than `2 * page_size` is
+/// rejected `Invalid` **before mapping**. Regression: slot 1 is read at
+/// `[psize, 2*psize)` through the map, so a garbage file whose length leaves
+/// that range on OS pages wholly past EOF would SIGBUS instead of erroring.
+/// The 4 KiB-garbage + 16 K/64 K-psize shapes below hit that range on any
+/// host whose OS page is ≤ the DB page size.
 #[test]
 fn garbage_file_shorter_than_both_meta_slots_is_invalid_not_sigbus() {
     for psize in [16384u32, 65536] {

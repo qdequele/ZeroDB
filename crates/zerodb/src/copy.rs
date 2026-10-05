@@ -93,21 +93,18 @@ pub trait CopyToFile {
     ///
     /// # Where the callback runs, and what a panic does
     ///
-    /// Every callback fires **before a single byte reaches `path`**. That is
-    /// a deliberate contract, not an accident of the implementation, and both
-    /// modes honor it by different means:
+    /// Every callback fires **before a single byte reaches `path`** — a
+    /// deliberate contract. Both modes stream the image into a sibling temp
+    /// file (`<name>.copy-tmp-<pid>-<nonce>` in `path`'s directory); `path`
+    /// itself is touched only by the final atomic `rename`, after the last
+    /// callback. On any error — or a panicking callback — the temp file is
+    /// removed by a drop guard.
     ///
-    /// Both modes stream the image into a sibling temp file
-    /// (`<name>.copy-tmp-<pid>-<nonce>` in `path`'s directory); `path` itself
-    /// is touched only by the final atomic `rename`, after the last callback.
-    /// On any error — or a panicking callback — the temp file is removed by a
-    /// drop guard.
-    ///
-    /// - `Disabled` (raw, **streamed since 2026-09-28**): the snapshot's data
-    ///   pages are written straight from the map in large chunks, as LMDB's
-    ///   `mdb_env_copyfd` writes from its map; no in-memory image.
-    /// - `Enabled` (compacting, **streamed since 2026-07-22**): pages land
-    ///   incrementally, bounded memory — O(tree depth × page size).
+    /// - `Disabled` (raw): the snapshot's data pages are written straight from
+    ///   the map in large chunks, as LMDB's `mdb_env_copyfd` writes from its
+    ///   map; no in-memory image.
+    /// - `Enabled` (compacting): pages land incrementally, bounded memory —
+    ///   O(tree depth × page size).
     ///
     /// In both modes therefore:
     ///
@@ -123,12 +120,12 @@ pub trait CopyToFile {
     ///
     /// The cost of that guarantee is that progress tracks *source pages
     /// processed*, not bytes landed at `path`, and that the final stretch
-    /// (the rename) is not covered by any callback. Callers wanting a progress bar that ends
-    /// exactly when the file is durable should treat `done == total` as
-    /// "reading finished", not "file written".
+    /// (the rename) is not covered by any callback. Callers wanting a progress
+    /// bar that ends exactly when the file is durable should treat
+    /// `done == total` as "reading finished", not "file written".
     ///
-    /// **Durability is the caller's concern** (LMDB `mdb_env_copy` parity —
-    /// deliberate, revisited for issue #46): no mode fsyncs the copy, and the
+    /// **Durability is the caller's concern** (LMDB `mdb_env_copy` parity,
+    /// deliberate): no mode fsyncs the copy, and the
     /// compacting mode does not fsync `path`'s directory after its rename. A
     /// caller that needs the snapshot crash-durable must fsync the produced
     /// file *and* its parent directory. (Contrast: *env creation* does both
@@ -440,9 +437,8 @@ fn write_raw(
 /// would produce a tree whose physical order is the comparator's but whose
 /// builder-side reasoning assumed memcmp — and the resulting file records no
 /// comparator identity, so nothing downstream (`zerodb-tools check`,
-/// `dump`/`load`) could tell. Refusing loudly is the only honest option until
-/// the builder, the dump format and the tools are made comparator-aware,
-/// which is a separate piece of work.
+/// `dump`/`load`) could tell. Refusing loudly is the only honest option while
+/// the builder, the dump format and the tools are memcmp-only.
 ///
 /// `CompactionOption::Disabled` (the raw page copy) is unaffected: it is a
 /// byte-level copy that preserves whatever order is on disk.

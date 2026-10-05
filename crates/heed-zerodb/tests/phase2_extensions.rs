@@ -4,13 +4,12 @@
 //!
 //! Two things are checked here that the native `zerodb` tests cannot:
 //!
-//!   1. The **completed** `Env::info()` / `Env::stat()` / `max_readers()`
-//!      reach the adapter with real values (an earlier adapter hardcoded zeros
-//!      and the 126 constant), *without* changing the mirrored heed struct
-//!      shapes.
-//!   2. The two **new** methods — `EnvOpenOptions::page_size` and
-//!      `Env::sync(force)` — exist, work, and are purely additive: heed has
-//!      neither, and code that never calls them behaves exactly as before.
+//!   1. `Env::info()` / `Env::stat()` / `max_readers()` reach the adapter
+//!      with real values (not zeros or the 126 constant), *without* changing
+//!      the mirrored heed struct shapes.
+//!   2. The extension methods `EnvOpenOptions::page_size` and
+//!      `Env::sync(force)` exist, work, and are purely additive: heed has
+//!      neither, and code that never calls them gets heed's behavior.
 
 use heed_zerodb::types::{Bytes, Str};
 use heed_zerodb::{Database, EnvOpenOptions};
@@ -101,8 +100,8 @@ fn env_stat_reports_the_main_tree_through_the_adapter() {
 
 #[test]
 fn env_stat_works_with_the_reader_table_exhausted() {
-    // An earlier adapter `stat()` opened its own read txn and silently returned
-    // all-zeros if that failed. It now reads the published snapshot instead.
+    // `stat()` reads the published snapshot, not a read txn, so a full reader
+    // table must not turn it into all-zeros.
     let dir = tempfile::tempdir().unwrap();
     let mut opts = env_opts();
     opts.map_size(1024 * 1024).max_dbs(4).max_readers(1);
@@ -224,14 +223,12 @@ fn page_size_is_selectable_through_the_adapter() {
 
 #[test]
 fn omitting_page_size_defaults_to_the_os_page_size() {
-    // LMDB parity (contract CHANGED 2026-07-21, perf-parity spike): the fork
-    // derives `me_psize` from `sysconf(_SC_PAGE_SIZE)` (capped 64 K) at store
-    // creation, so an adapter-created store must adopt the same geometry —
-    // 16 K on Apple Silicon, 4 K on x86_64 Linux — not the native engine's
-    // fixed 4 K default. Before this change the adapter silently created 4 K
-    // stores on 16 K-page hosts, a heed-observable divergence
-    // (`Env::stat().page_size`) and an unfair handicap vs LMDB. SPEC 00
-    // row 164 records the new default.
+    // LMDB parity (SPEC 00 row 164): the fork derives `me_psize` from
+    // `sysconf(_SC_PAGE_SIZE)` (capped 64 K) at store creation, so an
+    // adapter-created store must adopt the same geometry — 16 K on Apple
+    // Silicon, 4 K on x86_64 Linux — not the native engine's fixed 4 K
+    // default. A 4 K store on a 16 K-page host would be a heed-observable
+    // divergence (`Env::stat().page_size`) and an unfair handicap vs LMDB.
     let os_page = u32::try_from(unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) })
         .unwrap()
         .clamp(zerodb::MIN_PAGE_SIZE, zerodb::MAX_PAGE_SIZE);
@@ -257,7 +254,7 @@ fn an_invalid_page_size_is_rejected_at_open() {
 
 #[test]
 fn page_size_survives_the_tls_retag() {
-    // `read_txn_without_tls()` rebuilds the options struct; the new field must
+    // `read_txn_without_tls()` rebuilds the options struct; `page_size` must
     // be carried across (a field added to a builder is easy to drop in retag).
     let dir = tempfile::tempdir().unwrap();
     let mut opts = EnvOpenOptions::new();
@@ -383,11 +380,9 @@ impl heed_zerodb::Comparator for ReverseComparator {
 
 #[test]
 fn database_open_options_key_comparator_is_actually_applied() {
-    // Before custom comparators were wired through, the `C` type parameter on
-    // `DatabaseOpenOptions::key_comparator` was accepted and then silently
-    // ignored — every database was memcmp. A caller asking for a different
-    // ordering got no error and no effect. This asserts the ordering now
-    // reaches the engine.
+    // Regression: the `C` type parameter on
+    // `DatabaseOpenOptions::key_comparator` must reach the engine, not be
+    // accepted and silently ignored (every database memcmp).
     let dir = tempfile::tempdir().unwrap();
     let mut opts = env_opts();
     opts.map_size(8 * 1024 * 1024).max_dbs(4);

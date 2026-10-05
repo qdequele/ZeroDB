@@ -478,9 +478,9 @@ struct StreamLevel {
 /// driven one entry at a time and emitting every finished page straight to a
 /// [`PageSink`]. Peak memory is one leaf scratch frame + one overflow scratch
 /// frame + at most **two child lists per branch level** (≲ 2 pages' worth of
-/// separators each): O(depth × psize), independent of tree size — the batch
-/// path's whole-image + whole-entry-set residency (~2× env size on the
-/// compaction path) is gone.
+/// separators each): O(depth × psize), independent of tree size — where the
+/// batch path holds the whole image and entry set (~2× env size on the
+/// compaction path).
 ///
 /// Contract (as the batch builder): entries pushed in strictly-ascending
 /// unique key order; equality is memcmp (custom-comparator scope boundary —

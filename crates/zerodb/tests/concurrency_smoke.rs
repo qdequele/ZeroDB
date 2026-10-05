@@ -1,7 +1,5 @@
-//! Write-path coverage pass, area 7: real-OS-thread concurrency smoke
-//! (NOT the reader table — its own tests cover lock-free reader-slot
-//! contention specifically; this is the much simpler TXN-6/7/9/11 surface
-//! the write path already claims). No existing test spins a second OS thread.
+//! Real-OS-thread concurrency smoke for the TXN-6/7/9/11 surface (reader-slot
+//! contention is covered by the reader table's own tests).
 //!
 //! 1. Two threads racing `Env::write_txn()` must serialize on the
 //!    in-process write mutex (TXN-6/7): no lost update, no torn/interleaved

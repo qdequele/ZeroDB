@@ -9,8 +9,6 @@
 //!   earlier point always has the same bytes;
 //! - short read txns (each one hitting the cache for pages an earlier txn
 //!   validated) return exactly the model's contents while pgnos are reused.
-//!
-//! Do not weaken (AGENTS.md rule 2).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -234,7 +232,7 @@ fn no_entry_with_stamp(env: &Env, dir: &Path, stamp: u64) -> bool {
         && (0..pages).all(|p| !env.inner().stamp_cache_has(p, true, stamp))
 }
 
-/// ADR-0018 amendment (2026-10-01): a successful commit seeds the env-wide
+/// ADR-0018 amendment: a successful commit seeds the env-wide
 /// cache with the tree frames it wrote under the committing txnid; an abort
 /// seeds nothing, so the reused txnid (TXN-2) starts clean and the reuse
 /// commit's own seeding is the first entry under that stamp.

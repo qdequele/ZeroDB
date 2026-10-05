@@ -283,9 +283,9 @@ impl<'e> Exec<'e> {
                 let view = self.view.as_mut().unwrap();
                 view.world.get_mut(&nm).expect("resolved over view").clear();
                 // Effective even on an already-empty db: `clear` dirties the
-                // working record unconditionally (probed 2026-07-16 — the
-                // txnid bumps; matches LMDB's always-dirty `mdb_drop(dbi,0)`),
-                // so the catalog write-back COWs a main-tree leaf at C1a.
+                // working record unconditionally (the txnid bumps; matches
+                // LMDB's always-dirty `mdb_drop(dbi,0)`), so the catalog
+                // write-back COWs a main-tree leaf at C1a.
                 view.effective = true;
                 Ok(StepOutcome::Executed)
             }

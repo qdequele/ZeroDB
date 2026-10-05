@@ -1,8 +1,8 @@
 //! Best-effort exclusive lock on an env's data file.
 //!
 //! ZeroDB has **no cross-process reader protocol** (single-process by design,
-//! no lock file; see docs/DIVERGENCES.md). So a tool pointed at a *live* env would read a
-//! concurrently-mutated file. The tools therefore **require the env to be
+//! no lock file; see docs/DIVERGENCES.md). So a tool pointed at a *live* env
+//! would read a concurrently-mutated file. The tools therefore **require the env to be
 //! closed** and detect liveness only **best-effort**: they take an advisory
 //! `flock(LOCK_EX | LOCK_NB)` on the env's data file and refuse if it is already
 //! held. This detects *another tool invocation* (or any process that flocks the
@@ -11,11 +11,10 @@
 //!
 //! ## Unsafe policy note
 //!
-//! `std` has no stable file-locking API and the `fs2`/`fs4` crates are not on
-//! the allowlist, so the lock is one `libc::flock` FFI call. `libc` **is** on
-//! the AGENTS.md dependency allowlist. This single, SAFETY-commented block is
-//! listed in the AGENTS.md unsafe policy as in use and awaiting maintainer
-//! review: a maintainer still has to sanction or remove it.
+//! `std` has no stable file-locking API and the `fs2`/`fs4` crates are not
+//! dependencies, so the lock is one `libc::flock` FFI call (`libc` is an
+//! allowed dependency): a single, SAFETY-commented block, listed in the repo's
+//! unsafe policy (AGENTS.md).
 
 use std::fs::{File, OpenOptions};
 use std::io;

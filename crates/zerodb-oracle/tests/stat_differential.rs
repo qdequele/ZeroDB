@@ -1,7 +1,7 @@
 //! `Database::stat` parity: LMDB fork vs zerodb, driven directly
 //! against both real APIs (not the fuzzed `Op` enum).
 //!
-//! **Stat-parity scope (documented).** `stat` reports `depth`, `branch_pages`,
+//! **Stat-parity scope.** `stat` reports `depth`, `branch_pages`,
 //! `leaf_pages`, `overflow_pages`, `entries`. Only fields with *format-
 //! independent* values are compared cross-engine:
 //!

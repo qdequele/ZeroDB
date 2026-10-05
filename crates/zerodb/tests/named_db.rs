@@ -1,12 +1,11 @@
 //! Named-database integration tests over **real files**: the
 //! catalog (main DB) holding `F_SUBDATA` sub-DB records (SPEC 02 §6), the
 //! per-DB `stat`, `clear`/`drop`, `DbsFull`, and — critically — that the
-//! `check_image` invariant walk now follows every named-DB sub-tree from the
+//! `check_image` invariant walk follows every named-DB sub-tree from the
 //! catalog, so `F_SUBDATA` preservation across catalog-leaf splits is
 //! verified structurally.
 //!
-//! Every committed image is validated with `zerodb::check::check_image`. Do not
-//! weaken (AGENTS.md rule 2).
+//! Every committed image is validated with `zerodb::check::check_image`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

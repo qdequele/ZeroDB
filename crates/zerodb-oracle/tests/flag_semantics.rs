@@ -1,17 +1,16 @@
 //! Pins SPEC 01 §S1 / §S2 / §S5 as executable facts observed directly against
 //! the real Meilisearch LMDB fork (heed =0.22.1 / lmdb-master-sys 0.2.6,
-//! `mdb.master.nested-rtxns` @ cd767228). These tests are ground-truth pins,
-//! not zerodb tests: they establish what the oracle says, the way
-//! `key_bounds.rs` already does for §S4. Do NOT weaken these assertions to
-//! make them pass (AGENTS.md rule 2) — a mismatch with SPEC 01 prose is a
-//! spec bug for a human to reconcile, not a test bug.
+//! `mdb.master.nested-rtxns` @ cd767228). These are ground-truth pins of what
+//! the oracle says, not zerodb tests (`key_bounds.rs` does the same for §S4).
+//! Do NOT weaken them — a mismatch with SPEC 01 prose is a spec bug, not a
+//! test bug.
 //!
 //! Test names follow the SPEC 01 differential-test slug column where a slug
 //! exists (`flag_append_out_of_order`, `flag_append_ascending_ok`,
 //! `flag_append_equal_key_keyexist`, `flag_no_overwrite_returns_existing`,
 //! `env_prevsnapshot_opens_older_meta`).
 //!
-//! ## Coverage gaps (reported, not worked around)
+//! ## Coverage gaps
 //!
 //! * §S1 (`APPEND`) and part of §S2 (the plain `KeyExist` error path) are
 //!   reachable through the `Op`/`Engine` model (`Op::PutFlagged`), so those
@@ -22,9 +21,8 @@
 //!   0.22.1 *does* expose the right primitive — `Database::get_or_put(_with_flags)`,
 //!   which returns `Result<Option<DItem>>` (`None` = fresh insert, `Some(existing)`
 //!   = collision, existing value left untouched) — but nothing in `op.rs` emits
-//!   it. Per the task instructions this gap is reported rather than
-//!   worked around with new dependencies/unsafe: the test below drives heed
-//!   directly (same pattern as `key_bounds.rs`), not through `LmdbEngine`.
+//!   it, so the test below drives heed directly (same pattern as
+//!   `key_bounds.rs`), not through `LmdbEngine`.
 //! * §S5 (`PREV_SNAPSHOT`) is not reachable through the `Op` model either:
 //!   `Op::Reopen` has no flags parameter, and `LmdbEngine` always opens with
 //!   `EnvFlags::empty()`. Driven directly via heed's `EnvOpenOptions::flags`,
@@ -233,12 +231,11 @@ fn flag_no_overwrite_errors_and_does_not_modify() {
 // ---------------------------------------------------------------------
 // §S1 / SPEC 03 §7 — cursor put_current_with_options(APPEND): the write-cursor
 // APPEND path (milli facet bulk). heed's `put_current_with_options` passes the
-// caller's `PutFlags` straight to `mdb_cursor_put` (verified: cursor.rs
+// caller's `PutFlags` straight to `mdb_cursor_put` (cursor.rs
 // `put_current_with_flags` -> `flags.bits()`), with NO forced MDB_CURRENT. So
 // APPEND here behaves exactly like a plain `MDB_APPEND` put: mdb_cursor_put runs
 // its own `mdb_cursor_last` + last-key compare, IGNORING where the iterator is
-// currently positioned. These tests pin that observed behavior; SPEC 03 §7 is
-// annotated "confirmed via oracle self-test 2026-07-15".
+// currently positioned. These tests pin that behavior.
 //
 // NOT reachable through the Op/Engine model (no write-cursor op in op.rs);
 // driven directly via heed like the §S2/§S5 tests.
@@ -402,9 +399,9 @@ fn open_with_flags(dir: &std::path::Path, flags: EnvFlags) -> heed::Env<heed::Wi
     let mut opts = EnvOpenOptions::new();
     opts.map_size(10 << 20);
     opts.max_dbs(4);
-    // SAFETY: PREV_SNAPSHOT / no flags only; private temp dir, single process,
-    // exclusive access (single process) satisfied since only this handle is open at a
-    // time (each open is paired with `prepare_for_closing().wait()` first).
+    // SAFETY: PREV_SNAPSHOT / no flags only; private temp dir, single process;
+    // exclusive access holds since only this handle is open at a time (each
+    // open is paired with `prepare_for_closing().wait()` first).
     unsafe {
         opts.flags(flags);
     }

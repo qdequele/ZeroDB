@@ -1,7 +1,6 @@
-//! File-level regression tests for the first-release security review
-//! (2026-09): a corrupt or hostile **data file** yields a typed error —
-//! never a SIGBUS, panic, or silent write through an attacker-planted path —
-//! and env files are created owner-only. Do not weaken (AGENTS.md rule 2).
+//! Hostile-file hardening: a corrupt or hostile **data file** yields a typed
+//! error — never a SIGBUS, panic, or silent write through an attacker-planted
+//! path — and env files are created owner-only.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,7 +78,7 @@ fn patch_metas(dir: &Path, edit: impl Fn(&mut [u8])) {
 }
 
 // ---------------------------------------------------------------------------
-// H1 — a valid-CRC meta naming geometry past EOF must fail open, not SIGBUS
+// A valid-CRC meta naming geometry past EOF must fail open, not SIGBUS
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -87,8 +86,8 @@ fn open_rejects_valid_crc_meta_pointing_past_eof() {
     let dir = TempDir::new("h1-root");
     seed_env(dir.path());
     // Point the main root (and the high-water) at page 200: inside the 1 MiB
-    // map, far past the real few-KiB file. Pre-fix this opened fine and the
-    // first `get` dereferenced unbacked map bytes -> SIGBUS.
+    // map, far past the real few-KiB file. Accepting it would let the first
+    // `get` dereference unbacked map bytes -> SIGBUS.
     patch_metas(dir.path(), |s| {
         s[OFF_LAST_PG..OFF_LAST_PG + 8].copy_from_slice(&200u64.to_le_bytes());
         s[OFF_MAIN_DB + DB_OFF_ROOT..OFF_MAIN_DB + DB_OFF_ROOT + 8]
@@ -112,7 +111,7 @@ fn open_rejects_root_beyond_high_water_on_disk() {
 }
 
 // ---------------------------------------------------------------------------
-// M2 — env files are created owner-only (0600)
+// Env files are created owner-only (0600)
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -130,7 +129,7 @@ fn data_file_is_created_owner_only() {
 }
 
 // ---------------------------------------------------------------------------
-// M3 — creation does not write through a planted symlink
+// Creation does not write through a planted symlink
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -140,7 +139,7 @@ fn env_creation_refuses_planted_symlink() {
     let victim = dir.path().join("victim");
     std::fs::write(&victim, b"precious").unwrap();
     std::os::unix::fs::symlink(&victim, dir.path().join(DATA_FILE_NAME)).unwrap();
-    // Pre-fix: create(true).truncate(true) followed the symlink and clobbered
+    // A create(true).truncate(true) open would follow the symlink and clobber
     // the victim with a fresh env image.
     let r = open_env(dir.path());
     assert!(r.is_err(), "open through a planted symlink must fail");
@@ -158,9 +157,9 @@ fn copy_staging_does_not_write_through_planted_symlink() {
     seed_env(dir.path());
     let out = TempDir::new("copy-out");
     let dest = out.path().join("copy.zdb");
-    // Plant a symlink at the previously predictable staging name
-    // `<dest>.copy-tmp-<pid>`. The staging path now carries a random nonce
-    // and is opened with create_new, so the plant must be a no-op.
+    // Plant a symlink at the predictable name `<dest>.copy-tmp-<pid>`. The
+    // staging path carries a random nonce and is opened with create_new, so
+    // the plant must be a no-op.
     let victim = out.path().join("victim");
     std::fs::write(&victim, b"precious").unwrap();
     let planted = out
@@ -177,14 +176,14 @@ fn copy_staging_does_not_write_through_planted_symlink() {
         "the planted symlink target must be untouched"
     );
     assert!(dest.exists(), "the copy itself must have landed");
-    // The staged copy is owner-only too (M2).
+    // The staged copy is owner-only too.
     use std::os::unix::fs::PermissionsExt;
     let md = std::fs::metadata(&dest).unwrap();
     assert_eq!(md.permissions().mode() & 0o777, 0o600);
 }
 
 // ---------------------------------------------------------------------------
-// M6 — unbounded max_readers / max_dbs fail fast at open
+// Unbounded max_readers / max_dbs fail fast at open
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -211,7 +210,7 @@ fn open_rejects_unbounded_reader_and_db_counts() {
 }
 
 // ---------------------------------------------------------------------------
-// M1 — RwTxn is genuinely Send: the writer lock releases from any thread
+// RwTxn is genuinely Send: the writer lock releases from any thread
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -223,8 +222,8 @@ fn rwtxn_is_send_and_droppable_on_another_thread() {
     let dir = TempDir::new("send");
     let env = open_env(dir.path()).unwrap();
 
-    // Abort-by-drop on a foreign thread (pre-fix: unlocking a std Mutex from
-    // a thread that did not lock it — UB per std, an abort on macOS).
+    // Abort-by-drop on a foreign thread (unlocking a std Mutex from a thread
+    // that did not lock it would be UB per std, an abort on macOS).
     let txn = env.write_txn().unwrap();
     std::thread::scope(|s| {
         s.spawn(move || drop(txn));

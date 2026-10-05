@@ -6,7 +6,7 @@
 //!
 //! Duration: ~5 s by default (runs in the normal suite); the minutes-long
 //! acceptance variant is `just stress` (`ZERODB_STRESS_SECS`, nightly CI +
-//! mandatory before an integration gate — ADR-0006 ratification record (3)).
+//! mandatory before an integration gate — ADR-0006).
 //! Debug builds additionally arm the writer-side shadow gate
 //! (`RwTxn::debug_assert_gate`): every GC draw re-scans the live reader table
 //! and asserts no live reader is pinned below the entry's freeing txnid —

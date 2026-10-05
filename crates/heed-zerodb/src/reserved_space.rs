@@ -1,12 +1,11 @@
 //! `ReservedSpace` — heed's `MDB_RESERVE` write buffer (SPEC 00 row 35). heed
-//! reserves bytes *inside the map*; since 2026-07-21 the adapter
-//! does the equivalent: `Database::put_reserved` hands the caller a
-//! `ReservedSpace` wrapping the engine's **in-frame slot** (the mutable slice
-//! into the dirty page or overflow-run frame, SPEC 04 TXN-47) — no
-//! intermediate heap buffer, no copy. The slot may carry stale frame bytes
-//! (a COWed page's old cell heap), so the put path zeroes the unwritten tail
-//! after the caller's closure runs, preserving the earlier heap buffer's
-//! zero-tail contract.
+//! reserves bytes *inside the map*; the adapter does the equivalent:
+//! `Database::put_reserved` hands the caller a `ReservedSpace` wrapping the
+//! engine's **in-frame slot** (the mutable slice into the dirty page or
+//! overflow-run frame, SPEC 04 TXN-47) — no intermediate heap buffer, no copy.
+//! The slot may carry stale frame bytes (a COWed page's old cell heap), so the
+//! put path zeroes the unwritten tail after the caller's closure runs: bytes
+//! the caller did not write read back as zero.
 //! API-compatible with heed's: `io::Write` + `size`/`remaining`/`written_mut`/
 //! `fill_zeroes`.
 
@@ -32,9 +31,8 @@ impl<'a> ReservedSpace<'a> {
 
     /// Zero every byte past the written high-water mark: the
     /// space wraps the engine's in-frame slot, whose bytes are whatever the
-    /// (COWed) frame held there — zeroing the tail preserves the adapter's
-    /// shipped contract (the earlier heap buffer was zero-initialized) and
-    /// keeps stores byte-deterministic.
+    /// (COWed) frame held there — zeroing the tail keeps the adapter's
+    /// zero-tail contract and keeps stores byte-deterministic.
     pub(crate) fn zero_unwritten_tail(&mut self) {
         self.bytes[self.written..].fill(0);
     }

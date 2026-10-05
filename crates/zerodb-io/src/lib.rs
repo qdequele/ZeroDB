@@ -2,8 +2,8 @@
 //! [`Backing`] implementation the engine core reads env files through (and
 //! commits through: positioned `pwrite` + `sync_data`).
 //!
-//! This crate is one of the two sanctioned homes for mmap `unsafe` (AGENTS.md
-//! unsafe policy). The `unsafe` blocks live in [`mmap`], the single `pwritev`
+//! This crate is one of the two sanctioned homes for mmap `unsafe` (the
+//! repo's unsafe policy). The `unsafe` blocks live in [`mmap`], the single `pwritev`
 //! call in [`file`] (the vectored commit write), and the test-only in-memory
 //! map stand-in (`testmap`, ADR-0021 M1, behind the `test-backing` feature);
 //! everything else is safe `std` I/O — including the [`fault`] crash-injection
@@ -75,7 +75,7 @@ impl Backing for MmapBacking {
     }
 
     fn sync_data(&self) -> std::io::Result<()> {
-        // ADR-0004 D3 as amended (OQ3): std's `sync_data` semantics as-is —
+        // ADR-0004 D3 (OQ3): std's `sync_data` semantics as-is —
         // `fdatasync` on Linux (flushes data + the size metadata needed to
         // read it back, REC-14/GC-28), the full-flush path on macOS.
         self.file.sync_data()
@@ -170,7 +170,7 @@ impl Backing for WriteMapBacking {
 
     // clippy cannot see that this is an `unsafe fn` whose documented contract
     // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
-    // too — verified clippy 1.97); B1's substance is the `unsafe fn` itself.
+    // too); ADR-0021 B1's substance is the `unsafe fn` itself.
     #[allow(clippy::mut_from_ref)]
     unsafe fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
         // ADR-0021 brokered dirty-page slice. Bounds are typed (`None`), not

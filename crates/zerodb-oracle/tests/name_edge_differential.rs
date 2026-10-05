@@ -1,8 +1,8 @@
 //! Named-DB **name edge cases**: observed against the LMDB fork and matched by
-//! zerodb (AGENTS.md rule 1 — observe, never guess).
+//! zerodb.
 //!
 //! Driven directly against both real APIs (the fuzzed `DbName` only reaches a
-//! bounded name set). Observed LMDB behavior (empirically, this fork):
+//! bounded name set). Observed fork behavior:
 //!
 //! | name              | LMDB `create_database`      | zerodb            |
 //! |-------------------|-----------------------------|-------------------|
@@ -14,7 +14,7 @@
 //! The embedded-NUL row is a **heed adapter-boundary** difference, not a core
 //! one: heed names are C strings, so heed cannot even express a NUL-containing
 //! name; zerodb-core names are byte strings. The `heed-zerodb` adapter
-//! will impose heed's C-string restriction. No consumer uses NUL in a DB name.
+//! imposes heed's C-string restriction. No consumer uses NUL in a DB name.
 
 use heed::types::Bytes;
 use heed::EnvOpenOptions as LmdbOpts;

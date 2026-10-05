@@ -1,6 +1,6 @@
-//! Roadmap #6 — rightmost-leaf finger (SPEC 03 §6.6) end to end on real
-//! files. The finger is writer-private, in-memory state: nothing about the
-//! commit pipeline or the on-disk format may change. These tests drive the
+//! Rightmost-leaf finger (SPEC 03 §6.6) end to end on real files. The finger
+//! is writer-private, in-memory state: nothing about the commit pipeline or
+//! the on-disk format may change. These tests drive the
 //! workloads the finger accelerates — APPEND and plain-ascending loads,
 //! interleaved with out-of-order puts, deletes and a range delete, across
 //! commit AND abort cycles — and pin that every committed image stays

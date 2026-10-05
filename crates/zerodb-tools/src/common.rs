@@ -12,8 +12,7 @@ use crate::dump_format::DumpDb;
 /// DB assigns a dbi slot bounded by this.
 pub const MAX_TOOL_DBS: u32 = 1 << 16;
 
-/// A boxed error for the tool layer (no `anyhow` dependency — not on the
-/// allowlist).
+/// A boxed error for the tool layer (no `anyhow` dependency).
 pub type BoxErr = Box<dyn std::error::Error>;
 
 /// An owned key/value pair.

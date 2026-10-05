@@ -70,7 +70,7 @@ use zerodb_core::env::Backing;
 pub const SECTOR: usize = 512;
 
 // ---------------------------------------------------------------------------
-// Deterministic PRNG (ADR-0008 D1, ratified OQ4): splitmix64 seeding a
+// Deterministic PRNG (ADR-0008 D1, OQ4): splitmix64 seeding a
 // xoshiro256** core. In-house so fault plans are bit-stable across platforms,
 // crate versions, and time — a saved (seed, cycle) pair reproduces the exact
 // image forever. ~20 lines, test-infrastructure only (CRC32C precedent).
@@ -415,7 +415,7 @@ impl Backing for FaultBacking {
 
     // clippy cannot see that this is an `unsafe fn` whose documented contract
     // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
-    // too — verified clippy 1.97); B1's substance is the `unsafe fn` itself.
+    // too); ADR-0021 B1's substance is the `unsafe fn` itself.
     #[allow(clippy::mut_from_ref)]
     unsafe fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
         {

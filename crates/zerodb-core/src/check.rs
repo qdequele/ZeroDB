@@ -224,8 +224,7 @@ impl<'a> Checker<'a> {
                 }
                 // Walk each named-DB sub-tree: its pages join `visited`
                 // (reachable-XOR-free) and its stats are validated against its
-                // own record (INV-18) — check.rs coverage extends to every
-                // named DB. `leaf` borrows the immutable image (not `&mut self`),
+                // own record (INV-18). `leaf` borrows the immutable image (not `&mut self`),
                 // so these `&mut self` calls are sound while it is in scope.
                 for (name, rec) in subdbs {
                     let label = format!("subdb {:?}", String::from_utf8_lossy(&name));

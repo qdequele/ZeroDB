@@ -2,21 +2,17 @@
 //!
 //! Drives an identical sequence of [`Op`]s against two [`Engine`]s and compares
 //! every result op-by-op: return values, error codes, iteration order, and
-//! post-txn reads. This is the machinery rule 1 of AGENTS.md mandates: LMDB
-//! behavior is *observed*, never guessed.
+//! post-txn reads: LMDB behavior is *observed*, never guessed.
 //!
 //! * The reference engine is [`LmdbEngine`], backed by `heed =0.22.1` — the
 //!   Meilisearch LMDB fork (`mdb.master.nested-rtxns`), the exact C Meilisearch
 //!   runs. See ADR-0001.
-//! * The native [`ZerodbEngine`] is the second [`Engine`] implementor. When first
-//!   introduced it covered only the environment-lifecycle op ([`Op::Reopen`]);
-//!   any op an engine does not implement is gated out symmetrically by the driver
+//! * The native [`ZerodbEngine`] is the second [`Engine`] implementor. Any op an
+//!   engine does not implement is gated out symmetrically by the driver
 //!   ([`Engine::implements`]), so a `run::<LmdbEngine, ZerodbEngine>` differential
-//!   run restricts itself to the ops both engines support and grew as ops were
-//!   filled in.
-//! * [`run_self_test`] (`LmdbEngine` vs a second, independent `LmdbEngine`)
-//!   remains the harness's determinism/order-stability check and backs the
-//!   `diff_ops` fuzz target.
+//!   run restricts itself to the ops both engines support.
+//! * [`run_self_test`] (`LmdbEngine` vs a second, independent `LmdbEngine`) is the
+//!   harness's determinism/order-stability check.
 //!
 //! ```
 //! use zerodb_oracle::{run_self_test, Op, DbName};
@@ -30,7 +26,7 @@
 //! ```
 //!
 //! This crate is the sole place in the workspace permitted to link C LMDB
-//! (AGENTS.md unsafe/dependency policy; ADR-0001).
+//! (ADR-0001).
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
@@ -47,8 +43,6 @@ mod zerodb_engine;
 pub use driver::{classify, TxnState};
 pub use engine::Engine;
 pub use heed_zerodb_engine::HeedZerodbEngine;
-// `EngineMode` / `run_in_mode` are defined in this module; re-listed here for
-// discoverability alongside the other public items.
 pub use lmdb::LmdbEngine;
 pub use op::{DbName, Key, Op, PutFlag, Value};
 pub use result::{OpResult, OracleError, Skip};
@@ -122,8 +116,7 @@ pub const DIFF_MAP_SIZE: usize = 64 << 20;
 /// Round a map size up to a 64 KiB multiple — a multiple of every target OS
 /// page size (4 / 16 / 64 KiB), so heed never rejects it for not being an
 /// OS-page multiple (the `map_size` entry in docs/DIVERGENCES.md) and both
-/// engines agree on the effective
-/// size after an [`Op::Reopen`]. Both differential engines round identically.
+/// engines agree on the effective size after an [`Op::Reopen`].
 #[must_use]
 pub fn round_map_size(size: usize) -> usize {
     let q = 64 * 1024;
@@ -212,31 +205,16 @@ pub fn run_in_mode<A: Engine, B: Engine>(
                 b: rb,
             }));
         }
-        // GC file-size tripwire (ADR-0005 D5, approved bands): after every
-        // commit, the second engine's on-disk size must stay within
-        // `BASE + 1.5x` of the reference's — a cheap unbounded-GC-growth
-        // detector on every fuzz case / proptest sequence. `BASE` = 16 pages
-        // (16 x 4096 = 64 KiB).
-        //
-        // BASE was tightened from 72 to 16 pages when the SPEC 03 §6.4
-        // end-of-page insert-point rule was ratified (ADR-0005 D5 addendum,
-        // 2026-07-16). The old 72-page BASE existed almost entirely to absorb
-        // the sequential-plain-put fill-factor divergence: zerodb's median
-        // split left ~50%-full leaves on ascending inserts where the fork's
-        // `mdb_page_split` splits at the insert point, a ~2x leaf-page ratio
-        // (old `deep_split_cascade_then_delete_to_empty` peak: zerodb 263 vs
-        // fork 132 pages at 4 KiB → the old 65-page deterministic minimum).
-        // The amendment eliminates that divergence — measured post-amendment:
-        // zerodb@4K peak on the same workload is 154 pages (vs fork ~132),
-        // overage `sb - 1.5*sa = 154 - 198 = -44` pages (negative); at MATCHED
-        // page size small DBs are byte-identical (fixed overhead ~0); and the
-        // whole differential+proptest suite shows NO positive-overage commit
-        // (max observed -4 pages on this dev machine's fork@16K vs zerodb@4K).
-        // 16 pages is thus the ~0-page deterministic minimum plus a margin for
-        // GC-21 within-PIL-only overflow-fragmentation transients in fuzz
-        // overflow sequences, still a tight unbounded-growth tripwire (a real
-        // leak grows without bound and clears BASE + 1.5x within a few
-        // commits). See ADR-0005 D5 addendum for the full measurement.
+        // GC file-size tripwire (ADR-0005 D5): after every commit, the second
+        // engine's on-disk size must stay within `BASE + 1.5x` of the
+        // reference's — a cheap unbounded-GC-growth detector on every fuzz case
+        // / proptest sequence. `BASE` = 16 pages (16 x 4096 = 64 KiB). With the
+        // SPEC 03 §6.4 end-of-page insert-point rule (matching the fork's
+        // `mdb_page_split`), small DBs at matched page size are byte-identical,
+        // so BASE is only a margin for GC-21 within-PIL-only overflow-
+        // fragmentation transients in fuzz overflow sequences; a real leak grows
+        // without bound and clears the band within a few commits. Measurements:
+        // ADR-0005 D5 addendum.
         if size_tripwire && matches!(op, Op::Commit) {
             if let (Some(sa), Some(sb)) = (a.real_disk_size(), b.real_disk_size()) {
                 const BASE: u64 = 16 * 4096;
@@ -276,11 +254,3 @@ pub fn decode_ops(data: &[u8], max: usize) -> Vec<Op> {
 pub fn run_self_test(ops: &[Op]) -> Result<(), Box<Divergence>> {
     run::<LmdbEngine, LmdbEngine>(ops)
 }
-
-// The native differential is `run::<LmdbEngine, ZerodbEngine>(&ops)`. In the
-// first native engine only `Op::Reopen` was implemented (see `ZerodbEngine`), so
-// its dedicated env-lifecycle tests live in
-// `tests/env_lifecycle_differential.rs`. The `diff_ops` fuzz target stays on
-// `run_self_test` until enough ops are implemented to make a differential fuzz
-// worthwhile (it will also need `Op::Reopen` map sizes normalized to the OS page
-// size — see the `map_size` entry in docs/DIVERGENCES.md — before graduating).

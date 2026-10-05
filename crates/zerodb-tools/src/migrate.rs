@@ -1,6 +1,6 @@
 //! `migrate-from-lmdb` — stream a real LMDB env into a fresh zerodb env (the
 //! one place outside the oracle where linking C is accepted). Behind the
-//! off-by-default `migrate-lmdb` feature (ADR-0001 amendment, 2026-07-17).
+//! off-by-default `migrate-lmdb` feature (ADR-0001 amendment).
 //!
 //! Opens the source LMDB env **read-only** via heed =0.22.1 (the Meilisearch
 //! fork), enumerates the main DB and every named sub-DB, and re-writes them into
@@ -43,9 +43,9 @@ pub fn cmd_migrate(
     map_size: usize,
     page_size: u32,
 ) -> Result<String, BoxErr> {
-    // The source must actually be an LMDB env. Since ADR-0010 a ZeroDB env can
-    // *also* be named `data.mdb` (adapter-created), so the file name no longer
-    // discriminates — the magic does (SPEC 02 §3). Check it up front and say so
+    // The source must actually be an LMDB env. A ZeroDB env can *also* be
+    // named `data.mdb` (adapter-created, ADR-0010), so the file name does not
+    // discriminate — the magic does (SPEC 02 §3). Check it up front and say so
     // explicitly, rather than letting heed return an opaque MDB_INVALID.
     let src_data = src_dir.join(zerodb::HEED_DATA_FILE_NAME);
     if src_data.exists() && crate::naming::is_zerodb_image(&src_data)? {
@@ -72,8 +72,7 @@ pub fn cmd_migrate(
     // enable cross-process behaviors. We set only `READ_ONLY` (single-process
     // safe) and point at an existing on-disk env we open read-only; no pointers
     // are handled here. This is the migrate feature's sole `unsafe` (plus the
-    // flock in `lock.rs`); listed in the AGENTS.md unsafe policy as in use and
-    // awaiting maintainer review.
+    // flock in `lock.rs`).
     let src = unsafe {
         opts.flags(EnvFlags::READ_ONLY);
         opts.open(src_dir)?

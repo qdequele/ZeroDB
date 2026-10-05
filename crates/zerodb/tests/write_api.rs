@@ -7,7 +7,6 @@
 //!
 //! Every committed image is validated with `zerodb::check::check_image`
 //! (SPEC 03 §11 + SPEC 05 §9, including INV-10/INV-22 reachable-XOR-free).
-//! Do not weaken (AGENTS.md rule 2).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

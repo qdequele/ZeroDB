@@ -1,7 +1,7 @@
 //! Randomized read-workload differential (proptest): populate both
 //! engines via identical op streams (decoded from arbitrary bytes, the same path
 //! the `diff_ops` fuzz target uses) and compare every read / cursor / seek /
-//! iteration result. Any divergence is a zerodb bug (AGENTS.md rule 1).
+//! iteration result. Any divergence is a zerodb bug.
 
 use proptest::prelude::*;
 use zerodb_oracle::{decode_ops, run, LmdbEngine, Op, ZerodbEngine};

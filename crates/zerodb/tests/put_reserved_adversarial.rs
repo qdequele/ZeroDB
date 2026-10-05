@@ -1,29 +1,21 @@
-//! Write-path coverage pass, area 3: `put_reserved` adversarial coverage
-//! (SPEC 00 row 35, SPEC 01 §S3, SPEC 04 TXN-47) not already exercised by
-//! `write_api.rs::put_reserved_through_commit` (exact full-fill, inline and
-//! overflow, no split) or `zerodb-core::rwtxn`'s `txn49_reserve_then_split`
-//! (in-txn only, no commit, closure fully writes).
+//! `put_reserved` adversarial cases (SPEC 00 row 35, SPEC 01 §S3, SPEC 04
+//! TXN-47) beyond `write_api.rs::put_reserved_through_commit` (exact
+//! full-fill, no split) and `zerodb-core::rwtxn`'s `txn49_reserve_then_split`
+//! (in-txn only, no commit):
 //!
-//! Added here:
 //! 1. Reserve exactly at the inline/overflow boundary (both sides), through
 //!    commit + reopen.
 //! 2. Reserve that forces a leaf split (the ADR-0004 §6.2 "zero-filled
 //!    placeholder the caller then overwrites" path), through commit +
-//!    reopen — `txn49_reserve_then_split` never commits, so the placeholder
-//!    materializing correctly through the C0–C6 pipeline was unverified.
+//!    reopen, so the placeholder is verified through the C0–C6 pipeline.
 //! 3. Adversarial partial fill: the closure violates its "must fully write"
-//!    contract (SPEC 04 TXN-47) and only writes part of the reserved region.
-//!    `rwtxn.rs`'s own doc comment (§6.2, "a RESERVE that splits
-//!    materializes as a zero-filled placeholder") only documents the
-//!    *split* path as zero-filled; TXN-47 elsewhere says the engine "MUST
-//!    NOT zero the reserved region" (parity with writemap peek — the caller
-//!    sees uninitialized-but-owned space), which is a *non-mandate* on the
-//!    non-split path, not a promise of any particular content. This test
-//!    pins the **actually observed** implementation behavior (not a spec
-//!    guarantee) so a future change to the dirty-frame allocation strategy
-//!    that silently starts leaking stale committed bytes into unfilled
-//!    RESERVE regions is caught as a behavior change, not silently
-//!    unnoticed.
+//!    contract (TXN-47) and only writes part of the reserved region. Only the
+//!    *split* path is documented as zero-filled; TXN-47 says the engine "MUST
+//!    NOT zero the reserved region" (parity with writemap peek), a
+//!    *non-mandate* on the non-split path rather than a promise of any
+//!    content. The test pins the **observed** behavior (not a spec guarantee)
+//!    so a dirty-frame allocation change that starts leaking stale committed
+//!    bytes into unfilled RESERVE regions shows up as a behavior change.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -191,16 +183,14 @@ fn reserve_forcing_split(flags: EnvFlags) {
 /// bytes" contract. This is misuse — no engine code path enforces it — but
 /// the behavior must still be *safe* (no crash/UB, checked further under
 /// miri by `crates/zerodb-core/tests/value_borrow_contract.rs`) and
-/// deterministic. Observed on the current implementation: a `put_reserved`
-/// that does **not** force a split lands in a page frame that, for these
-/// setup conditions (fresh dirty leaf, never-before-written region — see
-/// `dirty.rs::DirtyStore::insert_tree_frame`, which zero-initializes new
-/// frames), is zero-filled — **not** because the engine actively zeros the
-/// RESERVE region (TXN-47 forbids that), but because the underlying fresh
+/// deterministic. A `put_reserved` that does **not** force a split lands in
+/// a page frame that, for these setup conditions (fresh dirty leaf,
+/// never-before-written region — `dirty.rs::DirtyStore::insert_tree_frame`
+/// zero-initializes new frames), is zero-filled — **not** because the engine
+/// zeros the RESERVE region (TXN-47 forbids that), but because the fresh
 /// frame started as zero. This is an implementation detail, not a spec
-/// promise (TXN-47 explicitly reserves the right to leave stale bytes); this
-/// test pins today's observed value so a change is visible, not a
-/// guaranteed contract for callers to rely on.
+/// promise (TXN-47 reserves the right to leave stale bytes); the test pins
+/// the observed value so a change is visible, not a contract for callers.
 #[test]
 fn reserve_partial_fill_unfilled_tail_is_observed_deterministic() {
     reserve_partial_fill(EnvFlags::EMPTY);
@@ -236,8 +226,8 @@ fn reserve_partial_fill(flags: EnvFlags) {
     // re-randomized garbage on every read.
     let got2 = db.get(&wtxn, b"half-filled").unwrap().unwrap().to_vec();
     assert_eq!(got, got2, "unfilled tail must be stable across reads");
-    // Pinning today's observed content for the unfilled tail (see doc
-    // comment above): zero, because this reserve landed in a fresh
+    // The observed content of the unfilled tail (see doc comment above):
+    // zero, because this reserve landed in a fresh
     // zero-initialized leaf frame, not because RESERVE zeroes on purpose.
     assert_eq!(
         &got[100..],

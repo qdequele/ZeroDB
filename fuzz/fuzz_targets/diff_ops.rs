@@ -6,7 +6,7 @@
 //! the `ZERODB_FUZZ_PAIR` env var, so a single target covers both the native and
 //! the adapter paths:
 //!
-//! - unset / any other value (**default, unchanged**): `LmdbEngine` vs the
+//! - unset / any other value (**default**): `LmdbEngine` vs the
 //!   **native** `ZerodbEngine`.
 //! - `ZERODB_FUZZ_PAIR=heed`: `LmdbEngine` vs `HeedZerodbEngine` — the whole op
 //!   model re-run **through the `heed-zerodb` adapter** (ADR-0003 accept #6).

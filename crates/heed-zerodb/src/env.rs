@@ -8,8 +8,8 @@
 //! about (`map_size` must be an OS-page multiple, `max_readers(0)` is refused,
 //! a NUL in a DB name panics; see docs/DIVERGENCES.md) so the consumer test
 //! suites see exact parity — each is checked here, at the heed boundary, and
-//! covered by a test. A fourth
-//! re-imposition landed with ADR-0010: the **data-file name** ([`DATA_FILE_NAME`]).
+//! covered by a test. It also imposes heed's **data-file name**
+//! ([`DATA_FILE_NAME`], ADR-0010).
 
 use std::cmp::Ordering;
 use std::ffi::c_void;
@@ -154,9 +154,8 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// its page size from the OS and offers no selector. Code that never calls
     /// it gets exactly what the fork would give it: new stores default to the
     /// **OS page size**, clamped to the engine window (LMDB parity —
-    /// `me_psize = me_os_psize`, capped at 64 K; SPEC 00 row 164). So heed's
-    /// existing API contract, which this crate never changes, is untouched,
-    /// and this method only ever *overrides* that parity default.
+    /// `me_psize = me_os_psize`, capped at 64 K; SPEC 00 row 164). This method
+    /// only ever *overrides* that parity default.
     ///
     /// `size` must be a power of two in
     /// `[`[`zerodb::MIN_PAGE_SIZE`]`, `[`zerodb::MAX_PAGE_SIZE`]`]`; an invalid
@@ -208,8 +207,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// Set the env flags (SPEC 00 row 6). `unsafe` for heed signature parity —
     /// the unsafety is vestigial for ZeroDB (no reachable flag enables the
     /// cross-process behaviors that make this unsafe in LMDB — ZeroDB is
-    /// single-process); the body
-    /// contains no unsafe operation.
+    /// single-process); the body contains no unsafe operation.
     ///
     /// # Safety
     ///
@@ -453,9 +451,8 @@ impl<T> Env<T> {
 
     /// Env-level statistics (SPEC 00 second table): the main DB's `MDB_stat`.
     /// Delegates to [`zerodb::Env::stat`], which reads the published snapshot
-    /// directly — no read txn is opened, so
-    /// this no longer consumes a reader slot or fails silently to zeros when
-    /// the reader table is full.
+    /// directly — no read txn is opened, so it consumes no reader slot and
+    /// still returns real numbers when the reader table is full.
     ///
     /// Page counts are ZeroDB-format values; see [`zerodb::EnvStat`].
     #[must_use]
@@ -630,7 +627,7 @@ impl<T> Env<T> {
     /// reaches `path`, so a panicking callback leaves no partial copy.
     ///
     /// The heed-mirrored [`Env::copy_to_file`] / [`Env::copy_to_path`]
-    /// signatures are unchanged and behave identically to before.
+    /// produce the same bytes without a callback.
     ///
     /// # Errors
     ///
@@ -702,9 +699,9 @@ impl<T> Env<T> {
     /// **ZeroDB extension — no heed/LMDB counterpart.** `EnvInfo`'s
     /// `number_of_readers` mirrors `MDB_envinfo::me_numreaders`, which is a
     /// *high-water mark* that never decreases (LMDB parity; see
-    /// docs/DIVERGENCES.md); this is the live count
-    /// it is usually mistaken for. Exposed as a method rather than an `EnvInfo`
-    /// field so the mirrored struct keeps heed's exact shape.
+    /// docs/DIVERGENCES.md); this is the live count it is usually mistaken
+    /// for. Exposed as a method rather than an `EnvInfo` field so the mirrored
+    /// struct keeps heed's exact shape.
     #[must_use]
     pub fn live_readers(&self) -> u32 {
         self.inner.info().live_readers
@@ -713,11 +710,8 @@ impl<T> Env<T> {
     /// The maximum key size (SPEC 00 second table — SHOULD;
     /// `mdb_env_get_maxkeysize`, SPEC 03 §2.1).
     ///
-    /// Reports the engine's real [`zerodb::MAX_KEY_SIZE`]. This once returned
-    /// a hardcoded `511` — the same defect class once fixed in
-    /// [`Env::max_readers`]: the value happened to be right, but it was a
-    /// literal that would silently stop matching the engine the moment the
-    /// constant moved.
+    /// Reports the engine's real [`zerodb::MAX_KEY_SIZE`] rather than a
+    /// literal, so it cannot drift from the engine.
     #[must_use]
     pub fn max_key_size(&self) -> usize {
         zerodb::MAX_KEY_SIZE
@@ -744,9 +738,9 @@ impl<T> Env<T> {
     /// Clear stale readers (SPEC 00 second table — SHOULD; `mdb_reader_check`).
     ///
     /// **Always 0, and that is the correct answer rather than a stub.** ZeroDB
-    /// is single-process (see docs/DIVERGENCES.md): the reader table is process memory, every
-    /// slot is owned by a `RoTxn` that releases it in `Drop`, and a dead
-    /// process takes the whole table with it. There is no cross-process
+    /// is single-process (see docs/DIVERGENCES.md): the reader table is process
+    /// memory, every slot is owned by a `RoTxn` that releases it in `Drop`, and
+    /// a dead process takes the whole table with it. There is no cross-process
     /// abandoned slot for `mdb_reader_check` to reap. Kept so heed code that
     /// calls it periodically keeps compiling and no-ops.
     ///

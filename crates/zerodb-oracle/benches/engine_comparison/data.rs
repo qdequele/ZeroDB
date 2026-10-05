@@ -123,8 +123,7 @@ pub fn round_robin_probes(keys: &[Vec<u8>], dbs: usize, count: usize, seed: u64)
 /// `[4096, 65536]` power-of-two range so zerodb can be pinned to the same value.
 pub fn os_page_size() -> u32 {
     // SAFETY: `sysconf(_SC_PAGESIZE)` is a pure query — no preconditions, no side
-    // effects. FFI in the oracle crate is sanctioned by the AGENTS.md unsafe
-    // policy; this is bench-only code.
+    // effects.
     let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     match u32::try_from(v) {
         Ok(p) if (4096..=65536).contains(&p) && p.is_power_of_two() => p,

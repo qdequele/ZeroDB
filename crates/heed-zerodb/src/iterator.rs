@@ -22,8 +22,7 @@
 //! `del_current`/`put_current` are `unsafe fn`), and the yielded bytes live in
 //! the txn's committed map or its dirty frames, which only a mutation through
 //! this same iterator can replace. This is the single place the adapter needs
-//! raw pointers / lifetime erasure, exactly as heed does (the
-//! "lifetime-erased write cursor" unsafe the AGENTS.md unsafe policy allows).
+//! raw pointers / lifetime erasure, exactly as heed does.
 
 use std::cmp::Ordering;
 use std::marker::PhantomData;
@@ -322,15 +321,15 @@ impl<'txn> RwGuts<'txn> {
             Err(e) => Some(Err(e.into())),
             Ok(None) => None,
             Ok(Some((k, v))) => {
-                // SAFETY (lifetime stretch to `'txn` — the unsafe policy's
-                // "lifetime-erased write cursor" clause): the yielded bytes
-                // live in the txn's committed map or its dirty frames, both
-                // stable until the next mutation through this iterator; heed's
-                // contract forbids holding these borrows across such a
-                // mutation (`del_current`/`put_current` are `unsafe fn` for
-                // exactly this). The stretch happens before the bound test
-                // only so the test can borrow the cursor's comparator; an
-                // out-of-range pair is dropped here and never yielded.
+                // SAFETY (lifetime stretch to `'txn`, the lifetime-erased
+                // write cursor): the yielded bytes live in the txn's committed
+                // map or its dirty frames, both stable until the next mutation
+                // through this iterator; heed's contract forbids holding these
+                // borrows across such a mutation (`del_current`/`put_current`
+                // are `unsafe fn` for exactly this). The stretch happens before
+                // the bound test only so the test can borrow the cursor's
+                // comparator; an out-of-range pair is dropped here and never
+                // yielded.
                 let (k, v): (&'txn [u8], &'txn [u8]) = unsafe {
                     (
                         std::slice::from_raw_parts(k.as_ptr(), k.len()),

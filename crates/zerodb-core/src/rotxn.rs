@@ -157,8 +157,8 @@ pub struct RoTxn<'env> {
     slot: u32,
     /// Per-txn memo of resolved named-DB records, keyed by dbi.
     ///
-    /// Without it every read op on a named DB re-did the registry lock + name
-    /// clone + a full catalog descent (`resolve_named_record`) — roughly
+    /// Without it every read op on a named DB would redo the registry lock +
+    /// name clone + a full catalog descent (`resolve_named_record`) — roughly
     /// doubling the tree work per `get` (docs/PERF-GAP-VS-LMDB.md, named-DB
     /// record re-resolved on every read).
     ///
@@ -482,8 +482,8 @@ impl Env {
         Ok(Some(db))
     }
 
-    /// `non_free_pages_size()` (SPEC 00 row 19 — MUST; SPEC 05 GC-23/GC-24,
-    /// amended 2026-09-29): the bytes held by the env's databases — the main
+    /// `non_free_pages_size()` (SPEC 00 row 19 — MUST; SPEC 05 GC-23/GC-24):
+    /// the bytes held by the env's databases — the main
     /// DB's branch, leaf and overflow pages plus those of every named DB,
     /// times the page size — under a fresh read snapshot. This is heed's
     /// definition (heed 0.22.1 `Env::non_free_pages_size` sums `mdb_stat`

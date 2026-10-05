@@ -96,7 +96,7 @@ fn writemap_image_cuts_run_in_place() {
 
 #[test]
 fn image_cut_reports_are_deterministic() {
-    // Same seed ⇒ same spec, plans, and verdict (ratified OQ4 end-to-end).
+    // Same seed ⇒ same spec, plans, and verdict (ADR-0008 OQ4 end-to-end).
     let a = run_image_cut(4242, &opts(1));
     let b = run_image_cut(4242, &opts(1));
     assert_eq!(a.verified, b.verified);
@@ -105,16 +105,13 @@ fn image_cut_reports_are_deterministic() {
     assert!(a.violation.is_none(), "{:?}", a.violation);
 }
 
-/// Regression: acked-at-cut vs acked-at-workload-end (found by the harness's
-/// own shakedown, 2026-07-16). Under `NO_META_SYNC`, this seed's cut is a
-/// commit-hook capture early in the run; the pre-fix verifier compared the
-/// cut's `ceil` against the **workload-end** acked txnid and spuriously
-/// reported "acked txnid 1 not even issued (ceil 0) — REC-10 window broken".
-/// REC-10 quantifies over commits acked **at the crash instant** (C4 is
+/// Regression: the verifier must compare the cut's `ceil` against the txnid
+/// acked **at the cut**, not at workload end (a spurious "REC-10 window
+/// broken"). REC-10 quantifies over commits acked at the crash instant (C4 is
 /// issued before `commit()` returns; only C5's fsync is relaxed), so the
-/// obligation is `ceil(cut) ≥ acked(cut)`, never `ceil(cut) ≥ acked(end)` —
-/// with capture-and-continue those differ. The engine's ordering was and is
-/// correct; the verifier now carries acked-at-cut with every capture.
+/// obligation is `ceil(cut) ≥ acked(cut)` — with capture-and-continue,
+/// `acked(end)` is later. This seed's cut is an early commit-hook capture
+/// under `NO_META_SYNC`.
 #[test]
 fn regression_nometasync_acked_at_cut_not_at_end() {
     const SEED: u64 = 8_467_876_453_780_440_666;
@@ -132,37 +129,27 @@ fn regression_nometasync_acked_at_cut_not_at_end() {
 }
 
 /// Regression + characterization pin: the `NO_META_SYNC` reclaim-clobber
-/// window (REC-10 as amended by the crash harness; SPEC 06 conflict block item
-/// 4, maintainer ratification pending). This seed's cut has `{meta k (un-fsynced), data of
-/// txn k+1}` pending; the `meta-subsector-torn` quota plan persists txn
-/// k+1's data while rejecting meta k, so recovery falls to snapshot k−1
-/// whose pages txn k+1 legally reclaimed (GC-18) — a REAL corruption window
-/// shared with LMDB's `MDB_NOMETASYNC` (libmdbx's steady/weak metas close
-/// it; a candidate for later improvement). The scoped verifier must classify those images as
-/// stale fallbacks (window/taxonomy verified, walk/data waived), not as
+/// window (REC-10; SPEC 06 conflict block item 4). This seed's cut has
+/// `{meta k (un-fsynced), data of txn k+1}` pending; the `meta-subsector-torn`
+/// quota plan persists txn k+1's data while rejecting meta k, so recovery
+/// falls to snapshot k−1 whose pages txn k+1 legally reclaimed (GC-18) — a
+/// REAL corruption window shared with LMDB's `MDB_NOMETASYNC` (libmdbx's
+/// steady/weak metas close it). The scoped verifier must classify those
+/// images as stale fallbacks (window/taxonomy verified, walk/data waived), not as
 /// violations — and must still fully verify every image that recovers to the
 /// newest issued meta.
 #[test]
 fn regression_nometasync_reclaim_clobber_window_is_characterized() {
-    // RE-PINNED 2026-09-10 (was 15_797_139_550_980_166_469). The seed selects a
-    // cut, but the *ops* come from `Spec::ops_for_round` → `decode_ops` → `Op`'s
-    // `Arbitrary`, so adding any variant to `Op` re-shuffles what every seed
-    // decodes to. The cursor-delete work's `Op::IterMutDelThenWalk` did exactly that and this seed
-    // stopped reaching the window (`gen_spec` kept returning NO_META_SYNC —
-    // it never touches `Op` — so the mode guard below could not catch it).
-    // The assertions are unchanged; only the vehicle was replaced, by searching
-    // for a seed that still satisfies all four of them.
-    //
-    // RE-PINNED 2026-10-03 (was 11_834_834_180_059_103_290): ADR-0022 (the
-    // meta free-list annex, format v2) changes which pages a txn reclaims
-    // when — small freed sets ride the meta and are reused one hop earlier —
-    // so the old seed's cut stopped producing a stale-fallback image (0
-    // stale; nothing was violated, the vehicle was lost again). Same re-pin
-    // protocol: seed 198 satisfies all four assertions (12 verified, 4 stale
-    // fallbacks, NoMetaSync, no violation). The clobber window itself is
-    // unchanged by the annex — the reclaimed-page TXN-62/GC-18 reasoning is
-    // identical whether the freed list lived in the tree or the meta.
-    // Re-pin accepted by the maintainer (2026-10-05).
+    // The seed is a vehicle found by search: it maps to NO_META_SYNC and its
+    // cut yields stale-fallback images alongside fully verified ones, i.e. it
+    // satisfies all four assertions below. The *ops* come from
+    // `Spec::ops_for_round` → `decode_ops` → `Op`'s `Arbitrary`, so adding an
+    // `Op` variant — or changing which pages a txn reclaims when — can make a
+    // seed stop reaching the window with no violation, and the mode guard
+    // cannot catch it (`gen_spec` never touches `Op`). If `stale_fallback`
+    // drops to 0 that way, re-search for a seed; never loosen the assertions.
+    // The window's TXN-62/GC-18 reasoning holds whether the freed list lives
+    // in the tree or in the meta (ADR-0022).
     const SEED: u64 = 198;
     assert_eq!(
         gen_spec(SEED).mode,

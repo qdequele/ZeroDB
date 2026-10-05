@@ -3,13 +3,11 @@
 //! Polynomial `0x1EDC6F41` (reflected form `0x82F6_3B78`), reflected input and
 //! output, initial value `0xFFFF_FFFF`, final XOR `0xFFFF_FFFF`. This is the
 //! algorithm mandated by [ADR-0002 §D1] and used for the mandatory meta-page CRC
-//! (SPEC 02 §3.3). ZeroDB uses this software table today; the planned page
-//! checksums would switch to the ARMv8-A `crc32c*` hardware instructions,
-//! which compute exactly this
-//! polynomial and must agree bit-for-bit with this table.
+//! (SPEC 02 §3.3). Any hardware path (the ARMv8-A `crc32c*` instructions
+//! compute exactly this polynomial) must agree bit-for-bit with this table.
 //!
-//! No new dependency is used (AGENTS.md / ADR-0002 §D1: an in-house table is
-//! mandated because no CRC crate is on the allowlist).
+//! In-house rather than a dependency (ADR-0002 §D1: no CRC crate is on the
+//! allowlist).
 //!
 //! [ADR-0002 §D1]: ../../../../docs/adr/0002-on-disk-format.md
 
@@ -65,7 +63,7 @@ pub fn crc32c(data: &[u8]) -> u32 {
 
 /// CRC32C over the concatenation of `parts`, as one stream — equal to
 /// `crc32c` of the parts joined into a single buffer, without the join.
-/// Used for the meta CRC's split coverage (SPEC 02 §3.3 as amended by
+/// Used for the meta CRC's split coverage (SPEC 02 §3.3,
 /// ADR-0022: `[0, 172)` then the annex ids, skipping the CRC field itself).
 #[must_use]
 pub fn crc32c_concat(parts: &[&[u8]]) -> u32 {

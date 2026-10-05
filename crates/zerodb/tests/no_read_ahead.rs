@@ -1,9 +1,9 @@
 //! `EnvFlags::NO_READ_AHEAD` (`MDB_NORDAHEAD`, SPEC 01 Table 1): the map is
 //! advised `MADV_RANDOM`, as LMDB does, so a page fault reads only its page
 //! instead of a readahead window — what keeps random reads over a dataset
-//! larger than memory from thrashing (added 2026-09-29). The flag changes no
-//! result; on Linux the advice is visible as the `rr` VmFlag of the data file's
-//! mapping in `/proc/self/smaps`. Do not weaken (AGENTS.md rule 2).
+//! larger than memory from thrashing. The flag changes no result; on Linux the
+//! advice is visible as the `rr` VmFlag of the data file's mapping in
+//! `/proc/self/smaps`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

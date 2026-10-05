@@ -1,18 +1,15 @@
 //! Where a write cursor is left after `del_current`, observed against the fork.
 //!
 //! SPEC 03 §7 states the contract ("a following `next` yields the entry that
-//! followed the deleted one") and §5 rule 4 currently *mandates the mechanism*:
-//! the write cursor "tracks its position by key and re-seeks after each of its
-//! own mutations". docs/PERF-GAP-VS-LMDB.md (the `del_current` re-descent)
-//! proposes replacing that re-seek with a retained
-//! path (LMDB's `C_DEL`), which is a change of mechanism, not of contract.
+//! followed the deleted one"); §5 rule 4 mandates the mechanism (the write
+//! cursor re-seeks by key after each of its own mutations).
+//! docs/PERF-GAP-VS-LMDB.md (the `del_current` re-descent) proposes replacing
+//! that re-seek with a retained path (LMDB's `C_DEL`) — a change of mechanism,
+//! not of contract.
 //!
-//! Nothing pinned the contract. The existing `Op::IterMutDelCurrent` deletes and
-//! **stops** — it never iterates afterwards — so only the resulting content was
-//! differential, never the resulting position. These tests pin the position, so
-//! that change has something to be correct against (rule 1: observe the fork,
-//! do not reason about it; rule 2: this test may not be weakened to let an
-//! optimization pass).
+//! `Op::IterMutDelCurrent` deletes and **stops**, so it only makes the
+//! resulting content differential. These tests pin the resulting *position*;
+//! do not weaken them to let an optimization pass.
 //!
 //! Each case records an event trace through the **heed surface consumers use**
 //! (`iter_mut` / `prefix_iter_mut` / `range_mut`, the shapes milli writes at its
@@ -37,8 +34,7 @@ fn keys() -> Vec<Vec<u8>> {
 /// incomparable for reasons that have nothing to do with cursor position.
 fn os_page_size() -> u32 {
     // SAFETY: `sysconf(_SC_PAGESIZE)` is a pure query with no preconditions and
-    // no side effects. FFI in the oracle crate is sanctioned by the AGENTS.md
-    // unsafe policy.
+    // no side effects.
     let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     match u32::try_from(v) {
         Ok(p) if (4096..=65536).contains(&p) && p.is_power_of_two() => p,

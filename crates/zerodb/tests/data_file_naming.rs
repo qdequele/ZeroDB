@@ -66,8 +66,7 @@ fn get(env: &Env, k: &[u8]) -> Option<Vec<u8>> {
     db.get(&rtxn, k).unwrap().map(<[u8]>::to_vec)
 }
 
-/// Regression: the native default is unchanged — a plain `open` creates
-/// `zerodb.dat` and nothing else.
+/// The native default: a plain `open` creates `zerodb.dat` and nothing else.
 #[test]
 fn native_default_is_zerodb_dat() {
     let dir = TempDir::new();

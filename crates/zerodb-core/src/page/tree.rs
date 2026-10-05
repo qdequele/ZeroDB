@@ -353,13 +353,12 @@ impl<'a> LeafMut<'a> {
     ///
     /// Callers only ever hand this **engine-authored dirty frames** (a COW
     /// copy of a page fully validated on its first map access this txn, or
-    /// the output of this txn's own page encoders),
-    /// so validation is the same O(1) structural checks the read-side dirty
-    /// path uses ([`LeafRef::new_prevalidated`]: type, reserved fields,
-    /// bounds). Until the memo rework this silently re-ran the **full O(`num_keys`)**
-    /// [`LeafRef::new`] cell walk — on every put (`insert_into_leaf` wraps
-    /// the target leaf per call), which the milli write-phase profile showed
-    /// as the single hottest zerodb cost.
+    /// the output of this txn's own page encoders), so validation is the same
+    /// O(1) structural checks the read-side dirty path uses
+    /// ([`LeafRef::new_prevalidated`]: type, reserved fields, bounds). The
+    /// **full O(`num_keys`)** [`LeafRef::new`] cell walk here would run on every
+    /// put (`insert_into_leaf` wraps the target leaf per call); the milli
+    /// write-phase profile measured it as the single hottest zerodb cost.
     ///
     /// # Errors
     ///
@@ -794,10 +793,10 @@ pub struct BranchMut<'a> {
 impl<'a> BranchMut<'a> {
     /// Wrap an already-validated branch page for mutation.
     ///
-    /// Same contract and same memo-rework change as [`LeafMut::from_valid`]: callers
-    /// only hand this engine-authored dirty frames, so validation is the
-    /// O(1) structural checks ([`BranchRef::new_prevalidated`]) — the full
-    /// per-cell walk ran here on every parent-chain touch until the memo rework.
+    /// Same contract as [`LeafMut::from_valid`]: callers only hand this
+    /// engine-authored dirty frames, so validation is the O(1) structural
+    /// checks ([`BranchRef::new_prevalidated`]), not a per-cell walk on every
+    /// parent-chain touch.
     ///
     /// # Errors
     ///

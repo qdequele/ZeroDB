@@ -1,7 +1,7 @@
 //! Memory maps over an env data file (SPEC 02 §8): the read-only [`Mmap`]
 //! (default backing) and the writable [`MmapWritable`] (`EnvFlags::WRITE_MAP`).
 //!
-//! This is one of the sanctioned homes for `unsafe` (AGENTS.md unsafe policy:
+//! This is one of the sanctioned homes for `unsafe` (the unsafe policy:
 //! mmap access). There are four `unsafe` blocks: [`Mmap::map`] (read map),
 //! [`MmapWritable::map`] (writable map), [`MmapWritable::write_at`] (the
 //! `memcpy` into the writable map), and [`MmapWritable::slice_mut`] (the
@@ -220,7 +220,7 @@ impl MmapWritable {
     /// This mints `&mut [u8]` from `&self`: the signature cannot express the
     /// exclusivity it relies on (two calls could alias), so the function is
     /// `unsafe` and the obligation is the **caller's** — the sole sanctioned
-    /// caller is `zerodb-core::dirty` (AGENTS.md unsafe policy), which must
+    /// caller is `zerodb-core::dirty` (per the unsafe policy), which must
     /// guarantee, exactly as [`MmapWritable::write_at`]'s commit-path caller
     /// does:
     ///
@@ -244,7 +244,7 @@ impl MmapWritable {
     #[must_use]
     // clippy cannot see that this is an `unsafe fn` whose documented contract
     // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
-    // too — verified clippy 1.97); B1's substance is the `unsafe fn` itself.
+    // too); ADR-0021 B1's substance is the `unsafe fn` itself.
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn slice_mut(&self, off: usize, len: usize) -> &mut [u8] {
         let end = off.checked_add(len).expect("map slice overflows usize");

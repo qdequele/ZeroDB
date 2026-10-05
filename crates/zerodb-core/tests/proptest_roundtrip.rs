@@ -155,9 +155,8 @@ proptest! {
 }
 
 // ---------------------------------------------------------------------------
-// Additional strategies biased toward SPEC 02 boundaries, plus the GC-DB
-// big-endian key codec. These are added alongside the strategies above, not
-// in place of them.
+// Strategies biased toward SPEC 02 boundaries, complementing the uniform ones
+// above, plus the GC-DB big-endian key codec.
 // ---------------------------------------------------------------------------
 
 proptest! {
@@ -165,9 +164,9 @@ proptest! {
 
     /// Leaf round-trip biased toward MAX_KEY_SIZE-adjacent keys (1, 2, 510,
     /// 511 bytes) and inline/overflow-threshold-adjacent values (±2 bytes
-    /// around `max_node_size`), rather than the original strategy's uniform
-    /// small sizes (item 8). Also checks `free_space` against the exact
-    /// theoretical accounting, which the original `leaf_roundtrip` does not.
+    /// around `max_node_size`), unlike `leaf_roundtrip`'s uniform small
+    /// sizes. Also checks `free_space` against the exact theoretical
+    /// accounting.
     #[test]
     fn leaf_roundtrip_boundary_biased(
         psize_idx in 0usize..3,
@@ -217,9 +216,9 @@ proptest! {
         }
     }
 
-    /// Branch round-trip biased toward MAX_KEY_SIZE-adjacent separator keys
-    /// (item 8), filling the page much fuller than the original strategy's
-    /// `0..30` uniform-small-key entries.
+    /// Branch round-trip biased toward MAX_KEY_SIZE-adjacent separator keys,
+    /// filling the page much fuller than `branch_roundtrip`'s `0..30`
+    /// uniform-small-key entries.
     #[test]
     fn branch_roundtrip_boundary_biased(
         psize_idx in 0usize..3,
@@ -260,8 +259,8 @@ proptest! {
     }
 
     /// Overflow round-trip biased toward exact page-multiple boundaries
-    /// (`N*psize - HEADER_SIZE` +/- a small delta) rather than the original
-    /// strategy's `0..20_000` uniform range (item 8).
+    /// (`N*psize - HEADER_SIZE` +/- a small delta) rather than a uniform
+    /// `0..20_000` range.
     #[test]
     fn overflow_roundtrip_boundary_biased(
         psize_idx in 0usize..3,
@@ -290,15 +289,15 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// The GC-DB txnid key codec (SPEC 02 §7) is big-endian byte-for-byte
-    /// (item 9), not merely "ordered like" big-endian.
+    /// The GC-DB txnid key codec (SPEC 02 §7) is big-endian byte-for-byte,
+    /// not merely "ordered like" big-endian.
     #[test]
     fn gc_key_encode_is_byte_exact_big_endian(txnid in any::<u64>()) {
         prop_assert_eq!(geometry::gc_key_encode(txnid), txnid.to_be_bytes());
     }
 
     /// memcmp order over the encoded bytes equals numeric order over the
-    /// txnid, in both directions (item 9) — the property SPEC 05's
+    /// txnid, in both directions — the property SPEC 05's
     /// reclamation scan depends on.
     #[test]
     fn gc_key_order_matches_numeric_order(a in any::<u64>(), b in any::<u64>()) {

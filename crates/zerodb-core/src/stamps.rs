@@ -32,7 +32,7 @@ use crate::sync::{fence, AtomicU64, Ordering};
 pub(crate) const SLOTS: usize = 1 << 16;
 
 /// Slots per lazily allocated chunk (32 KiB), so a first publish never
-/// zero-fills the whole table (measured 2026-09-29 on `env/open/reopen`).
+/// zero-fills the whole table (measured on `env/open/reopen`).
 pub(crate) const CHUNK_SLOTS: usize = 1 << 10;
 
 /// Which validated shape an entry vouches for; part of the key, as in the
@@ -117,9 +117,9 @@ impl StampCache {
     /// `(chunk, slot within chunk)` for `pgno`: the pgno itself, masked, not
     /// a hash. Pages the file holds side by side (a bulk-loaded tree's
     /// leaves, a sequential writer's) then sit in adjacent slots, so a scan
-    /// probes the table almost sequentially. Hashed slots made a full scan
+    /// probes the table almost sequentially. Hashed slots make a full scan
     /// touch one random line and page of the table per leaf: `scan/full/*`
-    /// +5 % from cache and TLB misses (perf, 2026-09-30). A pgno is one kind
+    /// measured +5 % from cache and TLB misses. A pgno is one kind
     /// at a time, so leaf and branch share its slot.
     fn index(&self, pgno: u64) -> (usize, usize) {
         let i = (pgno as usize) & (self.len - 1);

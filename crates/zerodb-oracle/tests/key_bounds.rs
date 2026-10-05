@@ -1,23 +1,16 @@
-//! SPEC 01 §S4 — empirical confirmation of the fork's key-size bounds.
+//! SPEC 01 §S4 — the fork's key-size bounds, observed directly through heed.
 //!
-//! This test observes the Meilisearch LMDB fork (via heed =0.22.1) directly and
-//! records exactly what it returns. The answer it establishes is written back
-//! into `docs/SPEC/01-flags.md` §S4 in the same change. Do NOT weaken these
-//! assertions to make them pass: they encode observed LMDB behavior, and a
-//! mismatch is a zerodb/spec bug for a human to adjudicate (AGENTS.md rule 2).
-//!
-//! Observed 2026-07-15 (macOS aarch64, heed 0.22.1 / lmdb-master-sys 0.2.6,
-//! fork `mdb.master.nested-rtxns` @ cd767228):
+//! Observed with heed 0.22.1 / lmdb-master-sys 0.2.6 (fork
+//! `mdb.master.nested-rtxns`):
 //!   * `Env::max_key_size()` == 511, identical for map sizes 1 MiB and 64 MiB.
 //!   * key len 1..=511  -> Ok
 //!   * key len 0        -> Err(Mdb(BadValSize))  (empty keys rejected)
 //!   * key len 512+     -> Err(Mdb(BadValSize))
 //!
-//! Note on "page-size-independent": heed 0.22 does not expose page-size
-//! selection, and in this fork build `MDB_MAXKEYSIZE` is the compile-time
-//! constant 511, so the bound cannot vary with page size. We confirm the
-//! observable invariant — the bound is constant across map sizes — which is the
-//! strongest statement reachable through the frozen heed 0.22 surface.
+//! heed 0.22 does not expose page-size selection, and in this fork build
+//! `MDB_MAXKEYSIZE` is the compile-time constant 511, so the bound cannot vary
+//! with page size; the reachable invariant is that it is constant across map
+//! sizes.
 
 use heed::types::Bytes;
 use heed::{Database, EnvOpenOptions, MdbError};

@@ -1,12 +1,11 @@
-//! Write-path fix follow-up: regression coverage for the **symmetric** branch-level
-//! rebalance paths that the ascending-delete storm tests
-//! (`deep_tree_rebalance.rs`, `write_rebalance_differential.rs`) do not reach.
+//! The **symmetric** branch-level rebalance paths that the ascending-delete
+//! tests (`deep_tree_rebalance.rs`, `write_rebalance_differential.rs`) do not
+//! reach: branch borrow-from-**left** and branch **merge** in both directions.
 //!
-//! The fixed bug (repeated `remove(0)` in branch borrow-from-**right**: after
-//! the sentinel is removed, the real-keyed old node 1 shifts into index 0 and
-//! the node-0 empty-separator rule panics) has two symmetric siblings audited
-//! in the same pass: branch borrow-from-**left** and branch **merge** (both
-//! directions). Ascending deletes underfill the *leftmost* subtree first
+//! Regression class: in branch borrow-from-right, a repeated `remove(0)`
+//! shifts the real-keyed node 1 into index 0, where the node-0
+//! empty-separator rule panics; these tests guard the mirrored paths.
+//! Ascending deletes underfill the *leftmost* subtree first
 //! (`pki == 0` → sibling on the right); **descending** deletes underfill the
 //! *rightmost* subtree (`pki >= 1` → sibling on the left), driving
 //! borrow-from-left while the left sibling is still full and merge-from-left

@@ -51,9 +51,9 @@ pub struct CommonHeader {
 }
 
 /// The `flags` field alone (header offset 16), for the page-view constructors
-/// that only classify the page: decoding the whole [`CommonHeader`] also read
-/// `pgno` and `txnid`, two bounds-checked loads LLVM cannot drop even though
-/// nothing uses them (the out-of-line `read_u64` in the hannoy search
+/// that only classify the page: decoding the whole [`CommonHeader`] would also
+/// read `pgno` and `txnid`, two bounds-checked loads LLVM cannot drop even
+/// though nothing uses them (an out-of-line `read_u64` in the hannoy search
 /// profile). LMDB reads just the field it tests (`IS_LEAF(mp)`).
 ///
 /// The caller must guarantee `buf.len() >= HEADER_SIZE`.
@@ -126,9 +126,9 @@ impl<'a> PageRef<'a> {
     /// engine's per-page-load hot path (`btree::load_page`): the page size is
     /// validated once at env open and is immutable after, so re-validating it
     /// on every page load only costs time (docs/PERF-GAP-VS-LMDB.md,
-    /// `validate_page_size` on every page load). All
-    /// per-buffer checks (length, type classification) are kept — this trusts
-    /// only `psize`, never the bytes.
+    /// `validate_page_size` on every page load). All per-buffer checks (length,
+    /// type classification) are kept — this trusts only `psize`, never the
+    /// bytes.
     pub(crate) fn new_trusted_psize(buf: &'a [u8], psize: u32) -> Result<PageRef<'a>, PageError> {
         if buf.len() < psize as usize {
             return Err(PageError::BufferTooSmall {
