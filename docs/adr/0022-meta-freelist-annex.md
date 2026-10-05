@@ -1,11 +1,10 @@
 # ADR-0022: Meta free-list annex — the per-commit freed PIL rides in the meta page
 
-- Status: **Spike** — implemented for measurement on maintainer approval
-  relayed 2026-10-02/03 (format-change + session constraints lifted for the
-  commit-CPU lever track). The approval reached this change through the
-  coordinating session, not directly from the maintainer; per CLAUDE.md rule 6
-  this ADR still **awaits direct human ratification before merge**. Nothing is
-  merged or pushed; the spike exists so the bench server can measure the win.
+- Status: **Accepted (2026-10-05, Quentin)** — format change (`FORMAT_VERSION`
+  1→2) directly ratified per CLAUDE.md rule 6, together with the crash-harness
+  seed re-pin (198). Implemented first as a spike on approval relayed
+  2026-10-02/03; re-gated on main after ADR-0021 (in-place WRITE_MAP) merged,
+  with WRITE_MAP in-place twins of the annex battery.
 - Result (2026-10-03): **measured win, gate green, spec-review clean.** Bench
   server 3-column A/B (x86-64, turbo off, 5 interleaved rounds, CODEGEN_UNITS=1,
   BASE = main 84582e8): `commit/batch/n1` 2.04× → **1.60×** LMDB (−22%,
@@ -201,10 +200,9 @@ API-visible behavior, which is unchanged).
 
 ## Open questions for human review
 
-1. Ratify the format change itself (CLAUDE.md rule 6 — this ADR was
-   implemented as a spike on relayed approval; it needs your direct sign-off
-   before merge).
-2. Cap policy: full `(psize − 176)/8` (chosen) vs a smaller policy cap to
-   bound the parked-reader re-encode cost earlier.
+1. ~~Ratify the format change itself (CLAUDE.md rule 6).~~ **Resolved
+   2026-10-05:** ratified directly by Quentin.
+2. ~~Cap policy: full `(psize − 176)/8` (chosen) vs a smaller policy cap.~~
+   **Resolved 2026-10-05:** the full cap is accepted with the ADR.
 3. Whether PLAN 3.1 should absorb this as its first stage (the annex is the
    hot tier of any future freelist redesign) or whether 3.1 supersedes it.

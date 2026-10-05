@@ -162,6 +162,7 @@ fn regression_nometasync_reclaim_clobber_window_is_characterized() {
     // fallbacks, NoMetaSync, no violation). The clobber window itself is
     // unchanged by the annex — the reclaimed-page TXN-62/GC-18 reasoning is
     // identical whether the freed list lived in the tree or the meta.
+    // Re-pin accepted by the maintainer (Quentin, 2026-10-05).
     const SEED: u64 = 198;
     assert_eq!(
         gen_spec(SEED).mode,
