@@ -119,8 +119,15 @@ into the meta. Freeing-txnid = the meta's own txnid; no separate field.
   so trying the tree first preserves the GC-18/19 oldest-first determinism.
   The annex draw is gated exactly like any GC draw: `F ≤ oldest_reader()`
   (here: no live reader pinned below base). Drawn ids enter `reclaimed`.
-  Inside `freelist_save` (GcSave mode) the annex pool is never consulted —
-  it was folded into `freed` before the loop, so GC-12/13 are untouched.
+  Inside `freelist_save` (GcSave mode) the annex pool **is** consulted, as
+  the carried pool (GC-30): after the drain pool (`save_pool_draw`) is
+  exhausted, `allocate()`'s GcSave arm falls through to the same
+  `annex_draw`, gated the same way. This is safe only because the Write-side
+  step (c) placement re-reads `annex.live()` after every tree put before
+  deciding what to persist, so a draw here can never leave a handed-out id in
+  the persisted set — the GC-12-amended anti-leak argument applies to this
+  draw exactly as it does to `save_pool_draw` (`crates/zerodb-core/src/
+  rwtxn.rs`, the `AllocMode::GcSave` arm of `allocate`, ~line 1277).
 - **Crash safety.** The annex is CRC-covered by the meta it belongs to: a
   torn meta write that corrupts the annex tears the whole slot, which the
   §3.2 selection discards (fallback to N−1, whose own annex+tree state is
