@@ -74,11 +74,12 @@ pooling across write txns; equal-length integer key comparison; `clear` and
 
 ## [0.1.0] - 2026-09-09
 
-> Prepared as release notes on 2026-09-09, but the `v0.1.0` tag was never
-> pushed: as of 2026-10-05 there is no GitHub release and the crates are not on
-> crates.io. The section describes the tree as of that date.
+> **Not released.** These notes were prepared on 2026-09-09, but the `v0.1.0`
+> tag was never pushed: there is no GitHub release, no prebuilt binaries, and
+> nothing on crates.io. Until a release exists, depend on the git repository.
+> The section describes the tree as of 2026-09-09.
 
-First tagged release. **On-disk `format_version` 1.** Not compatible with LMDB
+Planned as the first tagged release. **On-disk `format_version` 1.** Not compatible with LMDB
 files (migration is logical: `zerodb-tools migrate-from-lmdb`, or `dump` on
 LMDB and `load` here). Files written by this release open unchanged in every
 later release that keeps `format_version` 1.
@@ -90,10 +91,10 @@ architecture (single writer, lock-free MVCC readers, copy-on-write B+tree,
 double-buffered CRC32C meta pages, reader-gated free-page GC) behind a 1:1
 re-implementation of heed 0.22.1's API. Meilisearch and hannoy build against it
 with **zero source changes** through `[patch.crates-io] heed = { git =
-"https://github.com/qdequele/ZeroDB", tag = "v0.1.0" }`. The engine crates
-`zerodb`, `zerodb-core`, `zerodb-io` and `zerodb-tools` are published on
-crates.io at this version (the heed adapter is git-only: cargo needs a crate
-*named* `heed` for the patch). The full coverage matrix of heed items and LMDB
+"https://github.com/qdequele/ZeroDB" }`. The engine crates `zerodb`,
+`zerodb-core`, `zerodb-io` and `zerodb-tools` were to be published on crates.io
+at this version (the heed adapter is git-only: cargo needs a crate *named*
+`heed` for the patch). The full coverage matrix of heed items and LMDB
 features is `docs/COMPATIBILITY.md`.
 
 ### Verified on this release
@@ -126,8 +127,8 @@ features is `docs/COMPATIBILITY.md`.
   O(tree depth × page size) peak memory.
 - `zerodb-tools`: `stat`, `dump` (mdb_dump-shaped logical format), `load`,
   `check` (invariant checker), `migrate-from-lmdb` (opt-in feature, links C
-  LMDB), `--version`. Prebuilt binaries for linux x86-64, linux aarch64 and
-  macOS aarch64 are attached to the release.
+  LMDB), `--version`. The release workflow builds binaries for linux x86-64,
+  linux aarch64 and macOS aarch64 when a version is tagged.
 - Consumer gate tooling: `scripts/consumer.sh` (Meilisearch drop-in check,
   test suites, LMDB-vs-ZeroDB benchmark on Meilisearch's own workloads) and
   `scripts/hannoy.sh`; `docs/CONSUMER-GATE.md`.
@@ -175,5 +176,4 @@ features is `docs/COMPATIBILITY.md`.
 - `heed`'s `WithTls` read transactions compile but are not thread-pinned;
   `clear_stale_readers` returns 0 (correct in a single-process engine).
 
-[Unreleased]: https://github.com/qdequele/ZeroDB/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/qdequele/ZeroDB/releases/tag/v0.1.0
+[Unreleased]: https://github.com/qdequele/ZeroDB/commits/main
