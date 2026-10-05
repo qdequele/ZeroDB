@@ -137,7 +137,7 @@ impl Backing for TestWriteMap {
 
     fn write_at_page(&self, pgno: u64, psize: u32, data: &[u8]) -> std::io::Result<()> {
         let ps = psize as usize;
-        debug_assert!(!data.is_empty() && data.len() % ps == 0);
+        debug_assert!(!data.is_empty() && data.len().is_multiple_of(ps));
         let (off, _) = self
             .region(pgno, psize, (data.len() / ps) as u64)
             .ok_or_else(|| {
