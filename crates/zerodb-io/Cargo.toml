@@ -22,3 +22,7 @@ default = []
 # Crash-injection write backend for the differential crash harness (ADR-0008,
 # M1.11). Test infrastructure: the oracle enables it; consumer builds never do.
 fault = []
+# Heap-backed writable-map stand-in so the in-place WRITE_MAP brokered
+# discipline runs under miri (ADR-0021 M1). Test infrastructure: the
+# zerodb-core / heed-zerodb dev-deps enable it; consumer builds never do.
+test-backing = []

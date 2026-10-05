@@ -148,6 +148,9 @@ struct Totals {
     adv_walk_clean: u64,
     stale_fallback: u64,
     sigkill_spilled: u64,
+    /// In-map dirty regions journaled by WRITE_MAP image cuts (ADR-0021 B3:
+    /// proof the in-place realization was exercised, not the heap path).
+    map_regions: u64,
     by_mode: std::collections::BTreeMap<&'static str, u64>,
     violations: Vec<String>,
 }
@@ -170,6 +173,7 @@ impl Totals {
         self.adv_walk_clean += r.adv_walk_clean;
         self.stale_fallback += r.stale_fallback;
         self.sigkill_spilled += r.spilled_txns;
+        self.map_regions += r.map_regions;
         if let Some(m) = r.mode {
             *self.by_mode.entry(m.name()).or_default() += r.verified;
         }
@@ -324,6 +328,7 @@ fn main() {
          adversarial     : {} probes — {} opened, {} designed-Invalid, {} walk-clean (characterization, not gated)\n\
          stale fallbacks : {} (NO_META_SYNC reclaim-clobber window, REC-10 as amended — walk/data waived)\n\
          spilling txns   : {} image, {} sigkill (ADR-0017 spill cycles)\n\
+         in-place regions: {} (ADR-0021 B3 — brokered map regions journaled by WRITE_MAP image cuts)\n\
          wall time       : {:.1}s ({:.1} cycles/s)",
         t.verified,
         t.image_cuts,
@@ -338,6 +343,7 @@ fn main() {
         t.stale_fallback,
         zerodb_oracle::crash::model::SPILLED_TXNS.load(Ordering::Relaxed),
         t.sigkill_spilled,
+        t.map_regions,
         secs,
         t.verified as f64 / secs.max(0.001),
     );
