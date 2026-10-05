@@ -1015,7 +1015,7 @@ pub(crate) fn leaf_lookup(
 /// and its header start is in-body.
 fn check_ptr_in_heap(rel: usize, upper: u16, psize: u32) -> Result<(), PageError> {
     let body = body_size(psize);
-    if rel % 2 != 0 || rel < upper as usize || rel >= body {
+    if !rel.is_multiple_of(2) || rel < upper as usize || rel >= body {
         return Err(PageError::CellOutOfBounds {
             offset: rel,
             needed: 0,

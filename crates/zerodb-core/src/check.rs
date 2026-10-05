@@ -377,7 +377,7 @@ impl<'a> Checker<'a> {
                 }
             }
         };
-        if pil.len() < 8 || pil.len() % 8 != 0 {
+        if pil.len() < 8 || !pil.len().is_multiple_of(8) {
             self.fail(
                 "INV-26",
                 format!("GC entry {txnid}: PIL length {}", pil.len()),
@@ -390,8 +390,8 @@ impl<'a> Checker<'a> {
             return;
         }
         let mut prev: Option<u64> = None;
-        for chunk in pil[8..].chunks_exact(8) {
-            let id = u64::from_le_bytes(chunk.try_into().expect("8 bytes"));
+        for chunk in pil[8..].as_chunks::<8>().0 {
+            let id = u64::from_le_bytes(*chunk);
             if id < FIRST_DATA_PGNO || id > self.last_pg {
                 self.fail(
                     "INV-25",
@@ -530,7 +530,7 @@ pub fn check_image(bytes: &[u8], psize: u32) -> Vec<String> {
         }
     };
     // INV-3: whole-page file.
-    if bytes.len() % ps != 0 {
+    if !bytes.len().is_multiple_of(ps) {
         violations.push(format!(
             "INV-3: file length {} not a multiple of psize {psize}",
             bytes.len()

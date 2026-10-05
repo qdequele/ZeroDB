@@ -405,9 +405,9 @@ fn iter_mut_ops_through_commit() {
         // Rewrite every third entry, delete every seventh (iter_mut pass).
         let mut i = 0u32;
         while let Some((_k, _v)) = cur.move_next().unwrap() {
-            if i % 7 == 0 {
+            if i.is_multiple_of(7) {
                 cur.del_current().unwrap();
-            } else if i % 3 == 0 {
+            } else if i.is_multiple_of(3) {
                 cur.put_current(format!("rewritten-{i}").as_bytes())
                     .unwrap();
             }

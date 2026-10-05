@@ -105,7 +105,7 @@ impl<'e> Exec<'e> {
     #[must_use]
     pub fn new(env: Option<&'e Env>) -> Exec<'e> {
         debug_assert!(
-            env.map_or(true, |e| e.txnid() == 0),
+            env.is_none_or(|e| e.txnid() == 0),
             "Exec expects a fresh env"
         );
         let mut states = BTreeMap::new();
@@ -337,7 +337,7 @@ impl<'e> Exec<'e> {
                     match flag {
                         // SPEC 01 §S1: APPEND requires key strictly above the
                         // current last key (empty db always accepts).
-                        PutFlag::Append => dbm.last_key_value().map_or(true, |(k, _)| key.0 > *k),
+                        PutFlag::Append => dbm.last_key_value().is_none_or(|(k, _)| key.0 > *k),
                         // SPEC 01 §S2: NO_OVERWRITE requires absence.
                         PutFlag::NoOverwrite => !dbm.contains_key(&key.0),
                     }

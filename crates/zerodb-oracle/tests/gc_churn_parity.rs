@@ -96,7 +96,7 @@ fn make_cycles(seed: u64, overflow: bool) -> Vec<Cycle> {
         }
         let mut dels = Vec::with_capacity(KEYS as usize / 2);
         for i in 0..KEYS {
-            if rng.next() % 2 == 0 {
+            if rng.next().is_multiple_of(2) {
                 dels.push(format!("key{i:06}").into_bytes());
             }
         }

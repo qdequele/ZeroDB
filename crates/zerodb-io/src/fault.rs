@@ -389,7 +389,7 @@ impl Backing for FaultBacking {
             // asserted here on every write of every crash cycle.
             debug_assert_eq!(psize, st.psize, "write psize drifted from env psize");
             debug_assert!(
-                !data.is_empty() && data.len() % psize as usize == 0,
+                !data.is_empty() && data.len().is_multiple_of(psize as usize),
                 "ADR-0008 D5: non-page-multiple commit write ({} bytes)",
                 data.len()
             );

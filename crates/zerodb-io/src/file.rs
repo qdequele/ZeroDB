@@ -58,7 +58,7 @@ pub fn read_page(file: &File, pgno: u64, psize: u32) -> std::io::Result<Vec<u8>>
 ///
 /// Propagates the positioned-write I/O error.
 pub fn write_page(file: &File, pgno: u64, psize: u32, bytes: &[u8]) -> std::io::Result<()> {
-    debug_assert!(bytes.len() <= psize as usize || bytes.len() % psize as usize == 0);
+    debug_assert!(bytes.len() <= psize as usize || bytes.len().is_multiple_of(psize as usize));
     let off = page_offset(pgno, psize)?;
     file.write_all_at(bytes, off)
 }

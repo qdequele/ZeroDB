@@ -126,10 +126,10 @@ fn round(env: &Env, db: Database, model: &mut BTreeMap<Vec<u8>, Vec<u8>>, seed: 
                     if i >= 20 {
                         break;
                     }
-                    if i % 4 == 0 {
+                    if i.is_multiple_of(4) {
                         cur.del_current().unwrap();
                         model.remove(&kk);
-                    } else if i % 3 == 0 {
+                    } else if i.is_multiple_of(3) {
                         let v = format!("cur{r}.{i}").into_bytes();
                         cur.put_current(&v).unwrap();
                         model.insert(kk, v);
