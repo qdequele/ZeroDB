@@ -263,7 +263,7 @@ impl DirtyStore {
     /// non-zero multiple of `psize` (1 page for tree frames, `n` for runs).
     pub fn insert(&mut self, pgno: u64, frame: Box<[u8]>) {
         debug_assert!(
-            !frame.is_empty() && frame.len() % self.psize as usize == 0,
+            !frame.is_empty() && frame.len().is_multiple_of(self.psize as usize),
             "frame length {} must be a positive multiple of psize {}",
             frame.len(),
             self.psize

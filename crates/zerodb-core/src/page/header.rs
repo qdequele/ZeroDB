@@ -264,7 +264,7 @@ pub(crate) fn read_and_check_bounds(buf: &[u8], psize: u32) -> Result<(u16, u16)
     let lower = read_u16(buf, tree::OFF_LOWER);
     let upper = read_u16(buf, tree::OFF_UPPER);
     // lower must be even (whole u16 pointers), lower <= upper <= body_size.
-    if lower % 2 != 0 || lower as usize > upper as usize || upper as usize > body_size {
+    if !lower.is_multiple_of(2) || lower as usize > upper as usize || upper as usize > body_size {
         return Err(PageError::BadBounds {
             lower,
             upper,

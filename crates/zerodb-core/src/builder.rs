@@ -842,9 +842,7 @@ impl<S: PageSink> EnvStream<S> {
         feed: impl FnOnce(&mut TreeStream<'_, S>) -> Result<(), StreamBuildError>,
     ) -> Result<(), StreamBuildError> {
         debug_assert!(
-            self.catalog
-                .last()
-                .map_or(true, |(n, _)| n.as_slice() < name),
+            self.catalog.last().is_none_or(|(n, _)| n.as_slice() < name),
             "named DBs must be added in ascending name order"
         );
         let mut ts = TreeStream::new(&mut self.sink, self.psize, self.txnid, self.fill)?;

@@ -40,6 +40,11 @@ pooling across write txns; equal-length integer key comparison; `clear` and
 
 - Dependencies refreshed: `thiserror` 1 → 2, `criterion` 0.5 → 0.8, lockfiles
   updated (#81).
+- **MSRV 1.80 → 1.98**, the toolchain Meilisearch pins. Under ADR-0013 rule 6
+  this makes the next release a minor (0.2.0). Lockfiles refreshed again
+  (semver-compatible only; `heed`/`lmdb-master-sys` stay pinned at the oracle's
+  0.22.1/0.2.6), and the CI actions moved to `checkout` v7, `upload-artifact`
+  v7, `download-artifact` v8 (digest mismatches now fail the download).
 
 ## [0.1.0] - 2026-09-09
 

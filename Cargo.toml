@@ -16,9 +16,9 @@ exclude = ["crates/heed-shim"]
 
 [workspace.package]
 edition = "2021"
-# 1.80: `check-cfg` under [lints.rust.unexpected_cfgs] (zerodb-core) needs cargo 1.80.
-# Verified by the `msrv` CI job.
-rust-version = "1.80"
+# 1.98: the toolchain Meilisearch pins (its rust-toolchain.toml, 1.98.1), the
+# primary consumer — no point promising older. Verified by the `msrv` CI job.
+rust-version = "1.98"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/qdequele/ZeroDB"
 authors = ["Quentin de Quelen <quentin@meilisearch.com>"]

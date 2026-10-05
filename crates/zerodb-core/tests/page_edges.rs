@@ -47,7 +47,7 @@ fn leaf_value_len_for_exact_cost(ksize: usize, target_cost: usize) -> Option<usi
         return None;
     }
     let clen = target_cost - 2;
-    if clen % 2 != 0 || clen < 8 + ksize {
+    if !clen.is_multiple_of(2) || clen < 8 + ksize {
         return None;
     }
     Some(clen - (8 + ksize))

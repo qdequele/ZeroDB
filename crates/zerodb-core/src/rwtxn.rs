@@ -5683,7 +5683,7 @@ mod tests {
                 let mut i = 0u32;
                 while let Some((key, _v)) = cur.move_next().unwrap() {
                     let key = key.to_vec();
-                    if i % k == 0 {
+                    if i.is_multiple_of(k) {
                         proptest::prop_assert!(cur.del_current().unwrap());
                         model.remove(&key);
                     }

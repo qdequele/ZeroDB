@@ -88,7 +88,7 @@ fn interior_range_multi_leaf_with_overflow() {
     let db = env.main_database();
 
     const N: u32 = 3000;
-    let is_big = |i: u32| i % 300 == 0; // 10 overflow runs, spread out
+    let is_big = |i: u32| i.is_multiple_of(300); // 10 overflow runs, spread out
     let mut txn = env.write_txn().unwrap();
     for i in 0..N {
         let v = if is_big(i) { big_val(i) } else { inline_val(i) };

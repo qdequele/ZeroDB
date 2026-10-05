@@ -69,7 +69,7 @@ fn key_bytes(key: u64) -> [u8; 8] {
 /// Deterministic value for `(key, gen)`. Every 16th key gets a multi-page
 /// (~3.5-page) value so the fan-out reads dirty **overflow runs**.
 fn value_for(key: u64, generation: u64) -> Vec<u8> {
-    let len = if key % 16 == 0 {
+    let len = if key.is_multiple_of(16) {
         14_000
     } else {
         24 + ((key.wrapping_mul(31) ^ generation.wrapping_mul(17)) % 300) as usize

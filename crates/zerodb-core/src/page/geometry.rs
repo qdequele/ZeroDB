@@ -150,7 +150,7 @@ pub fn pil_encode_into(ids: &[u64], buf: &mut [u8]) {
 /// validated where they are drawn for reuse (`gc_reclaim`), not on the count.
 #[must_use]
 pub fn pil_count(bytes: &[u8]) -> Option<u64> {
-    if bytes.len() < 8 || bytes.len() % 8 != 0 {
+    if bytes.len() < 8 || !bytes.len().is_multiple_of(8) {
         return None;
     }
     let count = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
@@ -171,8 +171,10 @@ pub fn pil_decode(bytes: &[u8]) -> Option<Vec<u64>> {
     pil_count(bytes)?;
     Some(
         bytes[8..]
-            .chunks_exact(8)
-            .map(|c| u64::from_le_bytes(c.try_into().expect("8-byte chunk")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_le_bytes(*c))
             .collect(),
     )
 }

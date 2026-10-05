@@ -153,10 +153,10 @@ fn big_txn(env: &Env, dbs: &[Database; 3], model: &mut Model, rng: &mut Rng, rou
                     if i >= 40 {
                         break;
                     }
-                    if i % 5 == 0 {
+                    if i.is_multiple_of(5) {
                         cur.del_current().unwrap();
                         model[d].remove(&k);
-                    } else if i % 3 == 0 {
+                    } else if i.is_multiple_of(3) {
                         let v = format!("cur{round}.{i}").into_bytes();
                         cur.put_current(&v).unwrap();
                         model[d].insert(k, v);
@@ -362,7 +362,7 @@ fn a_txn_under_the_limit_never_spills() {
 fn fill_until_spilled(db: Database, w: &mut RwTxn<'_>, tag: &str) -> Vec<Vec<u8>> {
     let mut keys = Vec::new();
     let mut i = 0u32;
-    while w.spilled_pgnos() == 0 || i % 500 != 0 {
+    while w.spilled_pgnos() == 0 || !i.is_multiple_of(500) {
         let k = format!("{tag}{i:07}").into_bytes();
         db.put(w, &k, &[b'i'; 300]).unwrap();
         keys.push(k);

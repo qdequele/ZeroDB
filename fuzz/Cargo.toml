@@ -3,7 +3,7 @@ name = "zerodb-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
-rust-version = "1.78"
+rust-version = "1.98"
 license = "MIT OR Apache-2.0"
 
 # The fuzz crate is intentionally NOT a member of the root workspace: cargo-fuzz
