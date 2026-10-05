@@ -1,6 +1,7 @@
 # ADR-0011: DUPSORT / DUPFIXED — encoding, second ordering, cursor model, staging
 
 - Status: Approved — Quentin, 2026-07-20 (standing directive, session-lead review). All five open questions resolved below.
+- Implementation note (2026-10-05): milestone 2.8 parked 2026-07-20; stage A was never merged or pushed (local work only) (PLAN §2.8, PROGRESS.md). DUPSORT/DUPFIXED remain unsupported (D-004).
 - Milestone: 2.8 (descoped from 1.7 on 2026-07-15, D-004)
 - Date: 2026-07-20
 

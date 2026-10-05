@@ -49,20 +49,25 @@ assert_eq!(db.get(&rtxn, b"1984")?, Some(&b"Orwell"[..]));
 
 ## Status
 
-**v0.1.** LMDB parity is complete and verified; Meilisearch v1.53.1 and hannoy
+**0.1, not yet released** (no tag, nothing on crates.io; depend on the git
+repository). LMDB parity is complete and verified; Meilisearch v1.53.1 and hannoy
 pass their full test suites on it unmodified. Not yet production-hardened on the
-target hardware (the 24 h fuzz soak and Graviton 4K/64K bench are open) — see
-[`CHANGELOG.md`](CHANGELOG.md).
+target hardware: Graviton4 benchmarks have run, but the 24 h fuzz soak and a
+64K-page-kernel run are still open — see [`CHANGELOG.md`](CHANGELOG.md).
 
 Three things to know: the data file is **not** an LMDB file (own format; migrate
 with `zerodb-tools`), it is **one process per environment**, and keys are ≤ 511
-bytes. Full list: [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
+bytes. The on-disk format is now version 2: files written by the tree before
+2026-10-05 are refused at open and need a `zerodb-tools` dump and reload. Full
+list: [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
 
 ## Performance
 
 On its real consumers, ZeroDB runs at **LMDB-level performance**: Meilisearch
 indexing 1.01× (movies) and 0.99× (incremental hackernews additions), search
-0.94× — time relative to LMDB, lower is better; hannoy search 0.95×.
+0.94× — time relative to LMDB, lower is better; hannoy search 0.95×. (x86-64
+bench server; Meilisearch 2026-10-05, hannoy
+[2026-09-28](benches/results/2026-09-28-evening-bench-server-linux-x86.md).)
 
 **ZeroDB vs LMDB, current tree** — YCSB on a Graviton4 with local NVMe,
 10 M × 128 B, kops/s (higher is better). `WRITE_MAP` is opt-in on both engines

@@ -1,6 +1,7 @@
 # ADR-0020: Shrink the 32-byte common page header
 
 - Status: Spike approved (Quentin 2026-10-01: "test version first"); the format change itself is not approved — it waits for the spike's numbers
+- Implementation note (2026-10-05): the spike ran 2026-10-01 on the local, unpushed branch `qdequele/zerodb-header24-spike` (ca34d35, no PR); its "Spike results" section exists only in that branch's copy of this ADR. The real-milli-dump measurement the abandon gate names has not been recorded.
 - Milestone: Phase 3 (performance / on-disk format); **STOP zone — on-disk
   format change, human approval required before any implementation**
 - Date: 2026-10-01

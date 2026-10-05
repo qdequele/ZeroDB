@@ -796,7 +796,7 @@ spilling bullet there.)
     entry — both are observably identical to the fork through the heed /
     oracle surface.
 
-- **TXN-45b — in-place realization (ADR-0021, accepted 2026-10-02; spike).**
+- **TXN-45b — in-place realization (ADR-0021, accepted 2026-10-02; spike, then production hardening, merged PR #88).**
   When the backing brokers mutable map slices (`Backing::dirty_in_map`,
   implemented by the writable-map backing only), the write txn realizes every
   dirty frame **in the writable map at the frame's own page number**: COW

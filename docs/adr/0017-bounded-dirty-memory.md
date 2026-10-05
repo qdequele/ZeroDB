@@ -1,6 +1,7 @@
 # ADR-0017: Bounded dirty-page memory in large write transactions (spilling)
 
 - Status: Accepted (approved by Quentin 2026-09-30: "go continue, I should be closer to LMDB in memory usage")
+- Implementation note (2026-10-05): implemented and kept — 629e945 (`benches/results/perf-ledger.jsonl`). Under in-place `WRITE_MAP` (ADR-0021) spilling reduces to bookkeeping.
 - Milestone: Phase 3 (performance / memory), PERF-GAP C2, issue #3
 - Date: 2026-09-29
 

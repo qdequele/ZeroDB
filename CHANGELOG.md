@@ -6,11 +6,17 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
-A large LMDB-parity performance campaign (merged in #83) plus a follow-up (#85).
-Per-lever detail is in [`docs/PERF-GAP-VS-LMDB.md`](docs/PERF-GAP-VS-LMDB.md) and
+**On-disk `format_version` 2 — breaking.** Files written with `format_version` 1
+(everything before #89) are rejected at open. Migrate with `zerodb-tools dump`
+built from a format-1 commit, then `zerodb-tools load` from this tree.
+
+A large LMDB-parity performance campaign (merged in #83) plus follow-ups (#85,
+#88, #89). Per-lever detail is in [`docs/PERF-GAP-VS-LMDB.md`](docs/PERF-GAP-VS-LMDB.md) and
 [`benches/results/perf-ledger.jsonl`](benches/results/perf-ledger.jsonl); the
 cross-engine results are in
-[`benches/results/2026-09-30-public-suite-nvme.md`](benches/results/2026-09-30-public-suite-nvme.md).
+[`benches/results/2026-09-30-public-suite-nvme.md`](benches/results/2026-09-30-public-suite-nvme.md),
+the current ZeroDB-vs-LMDB results in
+[`benches/results/2026-10-05-meta-annex-real-case.md`](benches/results/2026-10-05-meta-annex-real-case.md).
 
 ### Added
 
@@ -36,8 +42,28 @@ buffer; flags-only page-header reads; O(1) free-list front draws; dirty-frame
 pooling across write txns; equal-length integer key comparison; `clear` and
 `delete_range` done leaf-wise; and env copies that write each byte once.
 
+- **In-place `WRITE_MAP`** (ADR-0021, #88): under `WRITE_MAP` a write
+  transaction's dirty pages now live directly in the writable map, as with
+  LMDB's `MDB_WRITEMAP` — no heap staging and no copy into the map at commit.
+  The default (non-`WRITE_MAP`) path is unchanged. On Graviton4 NVMe, YCSB
+  no-sync with `WRITE_MAP` runs at 1.6–1.7× default LMDB, still behind LMDB's
+  own `WRITE_MAP`.
+- **Meta free-list annex** (ADR-0022, #89): each commit's freed-page list is
+  stored in its own meta page instead of the free-list B-tree, so a steady-state
+  commit writes one page fewer. Write p50 −14 % to −25 % across YCSB
+  configurations; durable YCSB B 1.08× LMDB on NVMe; Meilisearch flat. This is
+  the `format_version` 2 change above.
+
 ### Changed
 
+- **On-disk `format_version` 1 → 2** (ADR-0022): the meta page carries the
+  free-list annex; version-1 files are rejected at open (see the top of this
+  section for the migration path). Under ADR-0013 this makes the next release a
+  minor.
+- `NO_READ_AHEAD` is honored as in LMDB (the map is advised `MADV_RANDOM`); it
+  was an accepted no-op in 0.1.0.
+- `non_free_pages_size` uses heed's definition (per-database page counts from
+  the catalog), which also makes it correct under `WRITE_MAP`.
 - Dependencies refreshed: `thiserror` 1 → 2, `criterion` 0.5 → 0.8, lockfiles
   updated (#81).
 - **MSRV 1.80 → 1.98**, the toolchain Meilisearch pins. Under ADR-0013 rule 6
@@ -47,6 +73,10 @@ pooling across write txns; equal-length integer key comparison; `clear` and
   v7, `download-artifact` v8 (digest mismatches now fail the download).
 
 ## [0.1.0] - 2026-09-09
+
+> Prepared as release notes on 2026-09-09, but the `v0.1.0` tag was never
+> pushed: as of 2026-10-05 there is no GitHub release and the crates are not on
+> crates.io. The section describes the tree as of that date.
 
 First tagged release. **On-disk `format_version` 1.** Not compatible with LMDB
 files (migration is logical: `zerodb-tools migrate-from-lmdb`, or `dump` on

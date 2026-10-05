@@ -3,7 +3,9 @@
 Status: full inventory, 2026-07-21 (second, deeper pass — supersedes the
 first "LMDB techniques" listing; that pass compared against LMDB's design
 choices, this one also sweeps zerodb's own hot paths for every copy,
-allocation, redundant computation, lock, and RAM sink).
+allocation, redundant computation, lock, and RAM sink). Items B8–B24 were
+added as later measurements found them; status markers are current as of
+2026-10-05 (see "State of play" at the end).
 
 **Measuring these items.** `just bench` runs a microbench *ladder* built so
 that each rung isolates one of the mechanisms inventoried below; `just
@@ -15,15 +17,24 @@ picks were falsified during the July 2026 campaign.
 Every claim is cited. LMDB side: the vendored fork (`lmdb-master-sys 0.2.6`,
 `liblmdb/mdb.c` — the tree the oracle links; reading it for techniques is
 permitted by CLAUDE.md rule 4, nothing is transliterated). ZeroDB side:
-file:line in this repo at the time of writing.
+file:line in this repo at the time of writing — those line numbers have
+drifted since; search by the function name.
 
 **Unsafe policy note.** CLAUDE.md already sanctions unsafe in
 `zerodb-core::page` and `zerodb-io` ("mmap access and page casting") and
 prescribes the mechanism ("explicit offsets + `read_unaligned`"). Items marked
-*unsafe (sanctioned)* are permitted today and simply not taken — Phase 1 chose
-`#![forbid(unsafe_code)]` in the page codec as a correctness-first default.
+*unsafe (sanctioned)* were permitted but not taken when this was written —
+Phase 1 chose `#![forbid(unsafe_code)]` in the page codec as a
+correctness-first default. A3 (2026-07-22) took it: `zerodb-core` is now
+`deny(unsafe_code)` with scoped `#[allow]`s (`page::raw` and its call sites;
+since ADR-0021 also the WRITE_MAP map-slice calls in `dirty`).
 
 ## Top of the stack — what one `get` on a named DB actually costs
+
+*July 2026 baseline, kept as the starting point. Since then items 2–3 were
+removed by A1, item 5 by A6 and B17, and item 4 reduced to a once-per-page
+validation shared across txns (A2/A3/A4/A8, ADR-0018). On the bench server
+`get/access/hot` is now 0.77–0.80× LMDB (B19).*
 
 Reads through the adapter on a named DB (how milli and hannoy do ~all reads):
 
@@ -94,10 +105,14 @@ in both builds (`benches/results/2026-09-30-validation-cache.md`).
 once per txn at first map entry; every later view is `new_prevalidated`
 (O(1)) or, since A8, `new_trusted` (two raw header reads). Engine-authored
 dirty frames trusted by construction (batch 3, same commit).
-**Open (b):** the lazy/checked-per-access variant (validate O(log K) per
-descent instead of O(K) at first touch) — tracked as issue #21 (`needs-adr`:
-it bundles an opt-in trusted-file mode). Superseded in practice by (a); re-open
-only if a profile names first-visit validation. Original analysis kept below.
+**Parked (b):** the lazy/checked-per-access variant (validate O(log K) per
+descent instead of O(K) at first touch), issue #21. Its two halves were split
+into ADRs: the opt-in trusted-file mode landed (ADR-0014, see section D), and
+lazy validation was measured over four variants and not adopted (ADR-0016,
+parked 2026-09-29: 1M-key tree −23 %, but seq/miss +11–23 %). The env-wide
+cache (c) then removed most of the repeat cost lazy validation targeted.
+Re-open only if a profile names first-visit validation. Original analysis
+kept below.
 `LeafRef::new`/`BranchRef::new` walk every cell (`page/tree.rs:161-179`,
 `:509+`). Cursor iteration no longer repays it (leaf memoized — scan went
 29× → 2.18×), but **every descent still does**: root + each branch + leaf,
@@ -144,6 +159,10 @@ raw header reads), so what remains per level is the page lookup + header
 parse. LMDB keeps a resolved `MDB_page*` per level (`mc_pg[CURSOR_STACK]`,
 mdb.c:1470). Extend the proven leaf-memo pattern per level. No unsafe.
 Effort: low. No tracking issue (this ledger is its home); profile-gated.
+**Tried 2026-09-27, reverted:** one cached parent `BranchRef` in `Cursor`
+(the scan half of this item) gained a consistent 2–4 % on the `scan/*` rungs
+at CGU1, under the noise bar, so the verdict was flat: a branch re-resolution
+is already a memo hit (perf ledger). Still open.
 
 ### A6. Heap allocation per get / per cursor — **DONE 2026-07-22** — issue [#19](https://github.com/qdequele/ZeroDB/issues/19)
 Was: `Tree::get` built a `Cursor` with a heap `Vec` stack per call — one
@@ -165,9 +184,11 @@ samples on both sides); correctness gates all green (fmt/clippy/81 suites/
 miri/37,891-run differential fuzz 0 divergences/crash 212 cycles).
 
 ### A7. Custom-comparator vtable call per key comparison — issue [#14](https://github.com/qdequele/ZeroDB/issues/14)
-`KeyCmp::Custom(&dyn Comparator)` (`cmp.rs:160-172`) — indirect call per
+`KeyCmp::Custom(&dyn Comparator)` (`cmp.rs`) — indirect call per
 comparison on custom-comparator DBs (milli sets one). LMDB uses a plain fn
-pointer. Monomorphize the search over the comparator. Effort: low.
+pointer. Monomorphize the search over the comparator. Effort: low. Open;
+the default ordering's compare was sped up separately (B19), this item is
+the custom-comparator path only.
 (Not to be confused with the memo work stamped below — the old task list
 briefly used "A7" for what this ledger numbers A8.)
 
@@ -225,7 +246,11 @@ zero. **Residual (deliberate):** a mutation (`put_current`/`del_current`/
 once — LMDB's in-place cursor fix-up avoids that descent. Costs one descent
 per *mutation* (was: one per *step* + one per mutation). Revisit only if a
 consumer bench still shows it (put_tree path adoption is the escalation);
-tracked as issue [#7](https://github.com/qdequele/ZeroDB/issues/7).
+tracked as issue [#7](https://github.com/qdequele/ZeroDB/issues/7). The
+`del_current` half of this residual was since mostly removed (B8a: the cursor
+keeps its path across a delete that does not rebalance; B22: also across the
+leftmost-pairing rebalances); `put_current` and cursor `put` still
+drop the parked stack and re-seek once.
 `put_reserved`'s inline re-locate second descent has the same shape (noted
 below).
 
@@ -268,6 +293,12 @@ without touching the parked arena/TXN-41 design: issue #9 (splitmix64
 `PgnoHasher` on the frames map, the GC `reclaimed` set, and the check
 walker's maps) + the `node_view` single-resolution descent (see A6). The
 parked scope is now only the allocation/pooling redesign itself.
+**Amendment 2026-09-27/30:** the frame-reuse half of that redesign landed as
+B18 (a bounded spare-frame pool, LMDB's `me_dpages`; frames stay individually
+boxed, so TXN-41 is untouched), and dirty memory is bounded by spilling (C2,
+ADR-0017). What stays parked is the `HashMap` → sorted-array swap (issue #5)
+and the per-commit sort; issue #4 (per-page allocation and zero-fill) is
+partly addressed by B18.
 
 ### B4. One `pwrite` syscall per dirty page at commit; no coalescing — **DONE 2026-07-21 (3c6a064); EBS validation PENDING**
 Was: `for pgno in sorted_pgnos { backing.write_at_page(...) }` — one syscall
@@ -278,15 +309,39 @@ per dirty page. LMDB's `mdb_page_flush` coalesces contiguous runs into
 this exists for is Graviton + EBS gp3, where per-syscall latency dominates —
 the laptop page cache hides it, so it is implemented but *unmeasured on
 target*. Same hardware gate as the ~1.8× durable-commit number.
+**Update 2026-10-05:** that ~1.8× was a macOS laptop figure
+(`benches/results/2026-09-10-engine-ladder-macos.md`). On Linux, durable
+commits are at parity: `commit/sync/*` 0.97–1.03× on the x86-64 bench server
+(`2026-09-28-evening-bench-server-linux-x86.md`), and on durable YCSB B on
+Graviton4 local NVMe ZeroDB does 258k ops/s against LMDB's 238k after
+ADR-0022 (`2026-10-05-meta-annex-real-case.md`). An EBS gp3 run is still
+owed.
 
-### B5. WRITEMAP copies at commit instead of mutating the map — *unsafe (sanctioned)* — issue [#13](https://github.com/qdequele/ZeroDB/issues/13)
+### B5. WRITEMAP copies at commit instead of mutating the map — **DONE 2026-10-05 (ADR-0021, PR #88, opt-in under `WRITE_MAP`)** — issue [#13](https://github.com/qdequele/ZeroDB/issues/13)
+**Done:** under `WRITE_MAP`, dirty pages are now realized in the writable map
+at their final offset (COW copy, new page, overflow run), with no heap staging
+and no commit write-back; abort leaves them unreferenced by not advancing the
+meta (SPEC 04 TXN-45b). The default heap-staged path is unchanged. Merged via
+PR #88 (8b066a6) after the production pass (unsafe-policy amendment for the
+`dirty` map-slice call, map-aware crash backend, miri test backing, release
+guard on the brokered path; ADR-0021 "Production hardening pass"). Spike A/B
+(`commit_census`, macOS arm64, NO_SYNC, 20k single-put commits): total
+29.8–43.5 µs → 8.6–11.1 µs per commit. On Graviton4 NVMe YCSB no-sync,
+ZeroDB-`WRITE_MAP` still trails LMDB-`WRITE_MAP` (A 408k vs 545k ops/s, B
+847k vs 1,199k; `benches/results/2026-10-05-meta-annex-real-case.md`).
+**Not done** (issue #13 is still open): prefault/`fallocate` of the map, a
+ranged `msync` of only the changed pages (issue #45), the heap-staged vs
+in-place A/B on Graviton, and ADR-0021's open questions (sub-flag or not,
+whether to advise Meilisearch to set `WRITE_MAP`). Original analysis kept
+below.
 M1.10 implemented WRITE_MAP as commit-time copy (heap dirty store → map at
 C2) to keep the value-borrow contract, nested-reader dirty reads, and
 abort-by-drop identical. Costs a full memcpy of every dirty page per commit +
 the B3 allocation. LMDB with `MDB_WRITEMAP` mutates mapped pages in place and
 skips the write entirely (mdb_page_flush early-out). Already flagged in
 PROGRESS as "true zero-copy live-map mutation deferred to Phase 3". Effort:
-high (abort semantics + borrow contract redesign). Do last, if at all.
+high (abort semantics + borrow contract redesign). ~~Do last, if at all.~~
+(Done, see above.)
 
 ### B6. Adapter `ReservedSpace` = alloc + zero + copy — **DONE 2026-07-21**
 Was: heed's `MDB_RESERVE` hands the caller a pointer *into the page*; the
@@ -314,11 +369,23 @@ as issue [#10](https://github.com/qdequele/ZeroDB/issues/10)):
   measurably diverge from the fork; recorded, pending maintainer decision
   rather than built unilaterally).
 
-### B7. Freelist bookkeeping allocation churn — issue [#29](https://github.com/qdequele/ZeroDB/issues/29)
+### B7. Freelist bookkeeping allocation churn — **open, measure-first; front draw DONE 2026-09-26; per-commit save moved to the meta page 2026-10-05 (ADR-0022)** — issue [#29](https://github.com/qdequele/ZeroDB/issues/29)
 `drains: BTreeMap<u64, Vec<u64>>` + `reclaimed: HashSet` + PIL decode `Vec`
-per GC entry touched (`rwtxn.rs:924-998`); `freelist_save` fixed-point loop
-per commit. LMDB: sorted `MDB_IDL` arrays manipulated in place. Effort:
-medium. Only matters under GC churn; measure before redesigning.
+per GC entry touched (`RwTxn::gc_reclaim` and the `RwTxn` free-list fields);
+`freelist_save` fixed-point loop per commit. LMDB: sorted `MDB_IDL` arrays
+manipulated in place. Effort: medium. Only matters under GC churn; measure
+before redesigning. (Since written: a drain entry is now a `Drain` — decoded
+ids plus a consumed-prefix offset, amendment below — and `reclaimed` uses the
+splitmix64 `PgnoHasher`, issue #9.)
+
+**Amendment 2026-10-05: the common-case save left the GC tree.** ADR-0022
+(PR #89, on-disk `FORMAT_VERSION` 2) writes a commit's freed-page list into
+its own meta page, under the meta CRC: when the list fits the annex cap
+(`(psize − 176) / 8` ids) the per-commit GC-tree put of that list, and its
+COW touch of the GC leaf, are gone; drain rewrites (GC-20) still go to the
+tree. `commit/batch/n1` 2.04× → 1.60× LMDB (bench server, CGU1, 5 rounds).
+This is a deliberate non-LMDB lever: LMDB keeps its freelist in `FREE_DBI`
+and pays the tree ops on every commit.
 
 **Amendment 2026-09-26: the front draw is O(1).** Every single-page GC draw
 takes the entry's smallest id (GC-19), and `Vec::drain(0..1)` memmoved the
@@ -334,7 +401,15 @@ because it re-laid-out neighbouring write code (B13 point 3). Bench server,
 x86-64, 4 KiB: `put/gc/drain_big` 2.21× → 1.68× (CGU16) and 2.23× → 1.70×
 (CGU1); the other 17 `put/*` and `del/*` rungs flat in both builds.
 
-### B8. Delete-time rebalance moves entries cell-by-cell — **DIAGNOSED + CONSUMER-CONFIRMED 2026-09-10, open**
+### B8. Delete-time rebalance moves entries cell-by-cell — **DIAGNOSED + CONSUMER-CONFIRMED 2026-09-10, open (narrowed by B15/B16/B22/B23)**
+*Status 2026-10-05:* the rebalance lever itself (fewer cell operations per
+borrow, or a direct `move_entry`) is not done: `borrow_entry` still
+materializes an `OwnedLeafCell`. Shared-path levers narrowed the per-key
+rungs, and `delete_range` left this path (B23). Bench server ladder,
+2026-09-28 evening (x86-64, CGU16, default options): `del/bulk/half` 1.75×,
+`del/bulk/all` 1.75×, `del/churn/reinsert` 1.40×, `del/cursor/drain` 2.72×,
+`del/range/half` 0.95×. The macOS figures below are the original diagnosis.
+
 The largest steady-state gap the microbench ladder finds, and the only cluster
 in this inventory that was never predicted from reading `mdb.c`. On the first
 ladder run (`benches/results/2026-09-10-engine-ladder-macos.md`, Apple M1 Pro,
@@ -431,6 +506,7 @@ neither.
 `Database::delete_range` sidesteps this by collecting every key into a `Vec`
 first and issuing point deletes, which is why it tracks the point-delete number
 rather than the cursor one — at the cost of materialising the whole key set.
+(Until B23, which replaced that with one leaf-granular pass.)
 
 **This is not a hypothetical API.** `del_current` appears at **nine call sites
 in milli, four of them in the current indexer** (`update/new/indexer/mod.rs`) —
@@ -478,7 +554,9 @@ through the cursor cost **28 % more** than the same span deleted by key
 (31.19 vs 24.31 ms) — LMDB's cursor drain is *cheaper* than its by-key delete.
 After, the two are at parity (25.35 vs 25.12 ms). **The cursor-specific penalty
 is gone**; the residual 2.46× is B8, which every delete path pays alike, and
-which is now the only thing left in this cluster.
+which is now the only thing left in this cluster. (B22 later found one more
+cursor-only cost: the path was still discarded on every delete that
+rebalanced.)
 
 Not yet re-measured at consumer level: the `delete_prefixes` 3.63× should fall
 toward the by-key ratio, but that claim needs another
@@ -504,7 +582,7 @@ Gate: fmt / clippy `-D warnings` / `cargo test --workspace` 543 pass /
 
 ### B9. Env creation costs two `fsync`s — **BY DESIGN, recorded 2026-09-10**
 `env/open/create` is 10.85× (LMDB 0.51 ms, ZeroDB 5.5 ms per env). Fully
-explained: `create_env_file` (`zerodb-io/src/file.rs:245-250`) does
+explained: `create_env_file` (`zerodb-io/src/file.rs`) does
 `file.sync_all()` and then `fsync_parent_dir`, unconditionally and regardless of
 `NO_SYNC`; LMDB does neither. On macOS Rust's `sync_all` is `F_FULLFSYNC`
 (~2.5 ms each on a laptop SSD), which accounts for the entire gap.
@@ -586,7 +664,16 @@ free-list save; and lazy first-touch validation (A2(b), ADR). The
 `commit/batch/*` rungs no longer time the fixture drop (2026-09-25 harness
 fix), so their pre-fix numbers are not comparable.
 
-### B13. Hot paths sit above LLVM's inlining threshold — **MEASURED 2026-09-26**
+**Lever status 2026-10-05:** frame reuse landed (B18, `commit/batch/n1`
+2.05× → 1.93×); the free-list save moved into the meta page (ADR-0022, see
+B7: `commit/batch/n1` 2.04× → 1.60×); lazy first-touch validation was
+measured and parked (ADR-0016), while the env-wide validation cache landed
+(ADR-0018, seeded at commit; writers probe it but never publish). The
+used-portion COW copy is not done: `touch` still copies the whole page. Under
+`WRITE_MAP`, B5 removes the heap COW frame and the commit write-back
+altogether.
+
+### B13. Hot paths sit above LLVM's inlining threshold — **MEASURED 2026-09-26; source-level lever DONE (eb450ac)**
 Bench server (x86-64, 4 KiB, turbo off). The same commit is built four ways,
 each in its own target dir, and measured in two passes (forward, then reverse
 order; pass-to-pass spread 0.3–1.3 %). LMDB's C core is compiled by gcc and
@@ -641,8 +728,9 @@ heed-zerodb `Database::get`) gives, at CGU1 (Meilisearch's build):
 10–12 % faster, `mixed/rw/8dbs` 1.20× → 1.10×. It improved 37 rungs at CGU1
 and 31 at CGU16, and regressed none in either build (bench server).
 
-Lever: consumers will not set an LLVM flag, so the fix is at the source level.
-Shrink the hot bodies below the default threshold: `#[cold]` /
+*Original lever statement (before the amendment above; its `#[cold]` half was
+the reverted first try):* consumers will not set an LLVM flag, so the fix is
+at the source level. Shrink the hot bodies below the default threshold: `#[cold]` /
 `#[inline(never)]` on the memo-miss, full-validation, error and
 multi-page-allocation arms, and `#[inline]` on the small hot helpers. Judge it
 by how much of V2's gain the default build keeps, at both CGU1 and CGU16.
@@ -760,8 +848,9 @@ of one-page frames (freed frames go there; `touch` copies into one, new pages
 zero-fill one), and the spares ride across txns in the writer slot's state,
 under the writer lock's own mutex as LMDB keeps `me_dpages` under its writer
 mutex, so the hand-over costs no lock of its own. Capped at 256 frames (1 MiB
-at 4 KiB): LMDB's pool is bounded because it spills dirty pages, ZeroDB has no
-spill. Frames stay individually boxed (TXN-41), and every reuse overwrites or
+at 4 KiB): LMDB's pool is bounded because it spills dirty pages, ZeroDB had
+no spill then (spilling landed 2026-09-30, C2). Frames stay individually
+boxed (TXN-41), and every reuse overwrites or
 zero-fills the frame, so the file bytes are unchanged.
 
 Bench server, x86-64, 4 KiB, CGU1 (bench-ab, 3 rounds, on top of B17):
@@ -882,7 +971,10 @@ cursor deletes keep the old policy. SPEC 03 describes the walk.
 
 Bench server, x86-64, 4 KiB: `del/range/half` 2.63× → **0.92×** (CGU1, 3 rounds,
 0.351) and 2.58× → 0.97× (CGU16, 1 round, 0.375); the other 17 `put/*` and
-`del/*` rungs flat in both builds.
+`del/*` rungs flat in both builds. The walk is leaf-granular; unlinking whole
+covered subtrees from their parent in one step (WiredTiger-style fast
+truncate) is issue [#12](https://github.com/qdequele/ZeroDB/issues/12), still
+open (its text predates B23).
 
 ### B24. Env copies wrote every byte two or three times — **DONE 2026-09-28**
 heed's `Env::copy_to_file(&mut File)` (what the ladder's `maint/copy/*`
@@ -916,7 +1008,7 @@ where LMDB copies pages; at parity that is no longer worth a new algorithm.
 
 ## C. RAM (peak memory)
 
-### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path)**
+### C1. Compaction / `copy_to_file(Enabled)` / `load`: ~2× env size in RAM — **DONE 2026-07-22 (compaction path; `load` output side too); `load` input + check residual open (#63)**
 **Done:** push-driven streaming rebuild — `PageSink` trait in core (core keeps
 its no-I/O policy; the positioned-write `FileSink` lives in `zerodb::copy`),
 `TreeStream` (the batch packer's greedy fill + last-two rebalance, driven one
@@ -934,12 +1026,14 @@ economy — same page counts per kind, same depth; layout order legitimately
 differs) + the existing copy differentials/round-trips/tools acceptance.
 **Residual resolved 2026-07-22:** `zerodb-tools load` now streams straight
 into the data file (a tools-side `PageSink`; the whole-image `Vec` and its
-`fs::write` are gone — the load half of issue
-[#63](https://github.com/qdequele/ZeroDB/issues/63); #63 stays open for its
-double-buffered-writer idea). Two bounds remain by choice: the dump-text
-parse is still in-memory (input side), and the post-load invariant check
-reads the file back (same `fs::read` the `check` subcommand uses) — peak is
-now max(parse, check) instead of parse + image. Correction to the original
+`fs::write` are gone). Two bounds remain: the dump-text parse is still
+in-memory (input side), and the post-load invariant check reads the file
+back (same `fs::read` the `check` subcommand uses) — peak is now
+max(parse, check) instead of parse + image. Those two are what issue
+[#63](https://github.com/qdequele/ZeroDB/issues/63) now tracks ("Bound peak
+memory in zerodb-tools load: stream the dump parse and the post-load check",
+with an optional writer thread for `load`); the compacting copy's writer
+thread already landed (B24, 7dc3d1c). Correction to the original
 note: `migrate-from-lmdb` never used the batch builder — it streams through
 batched write txns. Original analysis kept below.
 `collect_entries_flagged` copies **every key and value in the DB into owned
@@ -961,7 +1055,10 @@ rust-storage-bench, 10M items, 2 GB cap: the unsorted YCSB C load no longer
 dies at the cap (539 MiB anonymous peak vs LMDB's 520 MiB); with the memory
 back for the page cache, YCSB A 0.58× → 0.76× LMDB and YCSB B 0.31× → 0.69×
 (`benches/results/2026-09-30-bounded-dirty-memory.md`). Engine ladder flat.
-Original analysis kept below.
+Issue #3 is still open. Of the other mitigations named below, the frame pool
+landed as B18 and in-place `WRITE_MAP` as B5 (under `WRITE_MAP` the dirty
+set lives in the map, so spilling only does bookkeeping there). Original
+analysis kept below.
 Inherent to the heap dirty store (B3/B5): a write txn holds `Box` copies of
 every touched page + overflow run. LMDB WRITEMAP holds zero (mutates the
 map); LMDB default holds the same order but pool-recycled. Bounded by txn
@@ -973,9 +1070,10 @@ analogue, tracked as issue
 ### C3. Env-image builder for `load`/`migrate` (same as C1's second half) — **DONE 2026-07-22**
 Was: `build_single/multi_db_image` return the whole file as `Vec<u8>` — fine
 for tests, wrong for tools at scale.
-**Done:** `load` streams (see the C1 residual note above); `migrate` never
-had the problem (batched write txns). The batch `build_*_image` wrappers
-remain for tests and the stream-vs-batch differential referee.
+**Done:** `load` streams its output (see the C1 residual note above; the
+input parse and post-load check are issue #63); `migrate` never had the
+problem (batched write txns). The batch `build_*_image` wrappers remain for
+tests and the stream-vs-batch differential referee.
 
 ## D. Deliberate — keep, do not "optimize"
 
@@ -989,36 +1087,51 @@ remain for tests and the stream-vs-batch differential referee.
   `FileTrust::trust_contents()` open policy, which reads map pages as LMDB
   does; the default stays validating.
 
-## State of play (2026-07-22 — supersedes the original sequencing)
+## State of play (updated 2026-10-05)
 
-The original sequencing ran to completion: A1, A4, A2(a), B1, B6, B2, B4,
-A8, A3, C1 are **DONE** (stamps above, each behind the full gate + referee);
-B3 is **PARKED** on profile evidence. Scoreboard at this point (alternated
+*As of 2026-07-22 (supersedes the original sequencing):* the original
+sequencing ran to completion: A1, A4, A2(a), B1, B6, B2, B4, A8, A3, C1 are
+**DONE** (stamps above, each behind the full gate + referee); B3 is
+**PARKED** on profile evidence. Scoreboard at that point (alternated
 same-run medians vs the fork, matched 16 K geometry, Apple M-series): milli
 end-to-end indexing 2.68× → **1.12×**; hannoy search **0.95×** (faster, all
 dims); hannoy build 1.27–1.49×; micro get/scan/overflow ≈ parity; on-disk
 17 % denser; compaction peak RAM 2× env → ~100 KB.
 
+*Since then:* A6, A2(c) (ADR-0018), B5 (ADR-0021, opt-in `WRITE_MAP`), B8a,
+B11, B13–B24 and C2 (spilling, ADR-0017) are **DONE** (C3 landed
+2026-07-22 with C1); B7's front draw and per-commit save (ADR-0022) landed;
+A2(b)'s lazy-validation half is
+**PARKED** (ADR-0016) and its trusted-file half shipped as an opt-in
+(ADR-0014). Bench-server scoreboard, 2026-09-28 evening (x86-64, default
+options; `benches/results/2026-09-28-evening-bench-server-linux-x86.md`):
+Meilisearch indexing 0.99×, search 0.95×; hannoy build 0.84–0.89×, search
+0.95×; durable commits at parity.
+
 What remains, and its gate:
 
-- **Profile-gated micro levers:** A5 (branch-level cursor cache), A7 (#14
-  comparator monomorphization), plus the B1 residual (#7) and the cursor half
-  of B6 (#10 / D-015). A6 (#19) landed 2026-07-22. Implement only what a
-  consumer call-tree names — two blind picks were falsified this campaign.
-- **Hardware-gated validation:** B4 is built but unmeasured on its target
-  (Graviton + EBS); same run validates the durable-commit path (~1.8× on
-  laptop, unknown on EBS).
-- **ADR-gated:** B5 (#13, WRITEMAP in-place — last, if at all), A2(b) (#21,
-  lazy validation + trusted-file mode).
-- **Measure-first:** B7 (#29) — only matters under GC churn.
-- **Inherent, mitigations tracked:** C2 → spilling (#3), B5 (#13), or B3
-  pooling (parked).
-- **Tooling residual:** C3 landed 2026-07-22 (`load` streams; #63's load
-  half). *Closed 2026-09-28 (B24):* the raw copy streams from the map into
-  a staging file (it held 1× env in RAM before), and the adapter's
-  `heed::Env::copy_to_file` writes straight into the caller's handle through
-  `CopyToFile::copy_to_open_file` (it staged the image in a private directory
-  and `io::copy`'d it across, writing every byte twice).
+- **Delete path:** B8, the rebalance itself (`del/bulk/*` 1.75×,
+  `del/cursor/drain` 2.72× — B22 repaired only the leftmost pairing). Design
+  change, ADR first; no tracking issue yet.
+- **Commit constants:** the rest of B12 — the used-portion COW copy is not
+  done; `commit/batch/n1` is 1.60× after ADR-0022 and
+  `env/txn/rw_empty_commit` 2.4–2.5× (B11, B18).
+- **Profile-gated micro levers:** A5 (branch-level cursor cache; one try read
+  flat), A7 (#14 comparator monomorphization), the B1 residual (#7:
+  `put_current` still re-seeks) and the cursor half of B6 (#10 / D-015).
+  Implement only what a consumer call-tree names — two blind picks were
+  falsified in the July campaign.
+- **Hardware-gated validation:** B4 on its target (Graviton + EBS gp3) is
+  still owed. The durable-commit path is at parity on Linux (bench server
+  SATA, Graviton4 NVMe); the old ~1.8× was a macOS laptop figure.
+- **B5 follow-ups:** ranged `msync` (#45), prefault/`fallocate` of the map,
+  the Graviton A/B, and ADR-0021's open questions.
+- **Parked:** A2(b) lazy validation (ADR-0016; issue #21 still open), the B3
+  dirty-store arena / sorted map (#5; #4 partly covered by B18).
+- **Measure-first:** the rest of B7 (#29) — only matters under GC churn.
+- **Tooling residual:** `zerodb-tools load` still parses the whole dump in
+  memory and reads the built file back for its check (#63). Env copies are
+  at parity and stream (B24).
 
 The broader Phase-3 technique backlog (beyond this inventory's LMDB-parity
 scope) lives in the GitHub issues, filed 2026-07-22: prefetch/madvise, io_uring,

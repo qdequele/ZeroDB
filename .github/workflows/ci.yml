@@ -1,8 +1,9 @@
 # ZeroDB CI — the CLAUDE.md gate battery, automated.
 #
-# Per push / PR: fmt, clippy, tests (x86-64 and aarch64), miri on the core,
-# loom on the reader table, the 10-minute differential fuzz and the crash
-# smoke. Nightly: the long fuzz, the full crash run and the reader stress.
+# Per push / PR: fmt, clippy, tests (x86-64 and aarch64), an MSRV check, miri
+# on the core, loom on the reader table, the 10-minute differential fuzz (plus
+# 2 minutes each of page-decode and image-open fuzzing) and the crash smoke.
+# Nightly: the long fuzz, the full crash run and the reader stress.
 # The oracle crate links the real LMDB fork (lmdb-master-sys), so every job
 # needs a C toolchain — the GitHub Ubuntu images ship gcc.
 #

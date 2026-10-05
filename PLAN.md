@@ -59,7 +59,9 @@ zerodb/
     DIVERGENCES.md      # intentional behavior differences vs LMDB
     DECISIONS.md        # ADR index (one line per ADR)
     adr/                # ADRs, one file per significant choice
-  benches/              # criterion micro + macro benches
+  benches/results/      # bench reports + perf-ledger.jsonl (the criterion ladder itself
+                        #   is crates/zerodb-oracle/benches/engine_comparison/)
+  scripts/              # bench A/B, profiling, perf ledger, consumer gates (Meilisearch, hannoy)
 ```
 
 ---
@@ -393,7 +395,8 @@ Add to heed (as the zerodb backend's extension or upstreamed):
   `zerodb/tests/page_size_selection.rs` (10), `heed-zerodb/tests/phase2_extensions.rs`.
 - 2.7 Anything found in 0.1 marked SHOULD but unexposed.
 - 2.8 DUPSORT / DUPFIXED — **PARKED 2026-07-20** (stage A implemented, reviewed, and
-  reverted to a git stash; the pin list is kept. No consumer uses it, and stage A
+  reverted to a git stash — never merged or pushed (local work only); the
+  pin list is kept. No consumer uses it, and stage A
   broke three consumer-facing paths — see PROGRESS.md for the resume preconditions.)
   Original scope (descoped from 1.7 — no Phase 1 consumer): sub-page
   then sub-tree encoding, dup cursors (first_dup/next_dup/get_both...),
@@ -410,7 +413,30 @@ feature, and doc + unit tests where it's zerodb-defined.
 
 Ordering chosen by expected impact for Meilisearch/hannoy on Graviton + EBS/NVMe.
 
+**Status (2026-10-05).** None of 3.1–3.11 has shipped as specified below. The
+Phase 3 work that did land is an LMDB-parity performance track that the
+numbering below never had, each item behind an ADR (index: `docs/DECISIONS.md`;
+results: `benches/results/`, `benches/results/perf-ledger.jsonl`):
+
+| Lever | Status | Pointer |
+|---|---|---|
+| Opt-in trusted-file mode | landed, opt-in | `docs/adr/0014-trusted-file-mode.md`, 5ec996d (D-019) |
+| Opt-in sequential-writes fast path | landed, opt-in, default off | `docs/adr/0015-sequential-writes-option.md`, 1fece73 (D-020) |
+| Lazy read-time validation | measured, not adopted | `docs/adr/0016-lazy-validation.md`, d67682c |
+| Bounded dirty memory (spilling) | landed | `docs/adr/0017-bounded-dirty-memory.md`, 629e945 (D-021) |
+| Env-wide validated-pages cache | landed | `docs/adr/0018-cross-txn-validation-cache.md`, d8a2f79 + 382e437 (PR #85) |
+| Meta write through an O_DSYNC fd | ADR accepted; implementation parked (no measured gain), PR #86 closed | `docs/adr/0019-meta-write-dsync.md` |
+| 24-byte page header | spike only (local branch `qdequele/zerodb-header24-spike`); format change not approved | `docs/adr/0020-compact-page-header.md` |
+| True in-place `WRITE_MAP` | landed, active whenever `WRITE_MAP` is set; ranged msync still open (issue #45) | `docs/adr/0021-writemap-in-place.md`, PR #88 (8b066a6) |
+| Meta free-list annex, `FORMAT_VERSION` 2 | landed | `docs/adr/0022-meta-freelist-annex.md`, PR #89 (d155fe6) (D-022) |
+| `NO_READ_AHEAD` honored (`madvise(MADV_RANDOM)`) | landed | 93b2740 |
+
 ### 3.1 GC redesign for huge write transactions
+- **Status (2026-10-05): redesign not started.** Two landed pieces touch it:
+  the meta free-list annex (ADR-0022, PR #89) moves the per-commit free-list
+  save into the meta page and leaves the GC tree as the spill/cold path (its
+  open question 3 asks whether 3.1 absorbs or supersedes the annex); spilling
+  (ADR-0017, 629e945) bounds a huge txn's dirty memory, not its free-list cost.
 - Replace flat freelist with a structure that stays O(log n) under
   million-page txns (mdbx-inspired reclaiming; design in an ADR first).
 - Bench: Meilisearch full reindex of a large dataset; target: eliminate the
@@ -446,6 +472,10 @@ Ordering chosen by expected impact for Meilisearch/hannoy on Graviton + EBS/NVMe
   `bulk_load` would lift that whole-image-in-RAM ceiling — a real win, but for
   **tooling**, not milli indexing throughput. Revisit under that framing if/when
   large-index compaction memory becomes a constraint.
+  *(Update: that ceiling is gone without `bulk_load` — compaction streams
+  pages through `builder::EnvStream` (fd517fe; writer thread 7dc3d1c) and
+  `zerodb-tools load` streams its output (f5ad086). What remains whole-file in
+  `load` is the dump parse and the post-load check: issue #63.)*
 - Superseded for this pass by **3.7** (prefetch/access hints), which has a
   verified live consumer (hannoy's hand-rolled madvise). See ADR-0012.
 - Bench (if revived): indexing throughput on EBS gp3.
@@ -465,6 +495,9 @@ Ordering chosen by expected impact for Meilisearch/hannoy on Graviton + EBS/NVMe
   storage.
 
 ### 3.7 Prefetch and access hints — CHOSEN 2026-07-20; ADR-0012 is a **Draft** awaiting human approval, no code exists yet (CLAUDE.md rule 6: Phase 3 is ADR-first)
+- **Status (2026-10-05):** still Draft and unimplemented; tracked by issue #57.
+  The only madvise in the engine is the env-wide `NO_READ_AHEAD` →
+  `MADV_RANDOM` (93b2740), which is LMDB parity, not this per-range hint.
 - `db.prefetch(keys)` / `txn.advise(range, Willneed|Random|Sequential)`
   mapping to madvise; replaces hannoy's env-var hack.
 - **Verified live consumer:** hannoy `Reader::prefetch_graph`

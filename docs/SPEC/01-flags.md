@@ -29,7 +29,7 @@ cursor-op constant the fork defines, against the frozen consumer contract in
   inline; see the durability-flag note in §S6 and the Mismatches section).
 - **WON'T** — not implemented in Phase 1; one-line justification citing a
   divergence (D-001 cross-process/locking, D-003 nested write txns, D-004
-  DUPSORT/DatabaseFlags → revived in Phase 2.8) or a written rationale.
+  DUPSORT/DatabaseFlags → deferred to Phase 2.8, parked 2026-07-20) or a written rationale.
 
 Every **MUST**/**SHOULD** row carries a **differential-test slug** — the oracle
 checklist for milestones 1.2 / 1.3 / 1.4 / 1.6 / 1.10 / 1.11 / 1.12.
@@ -74,7 +74,7 @@ PLAN scope. See §S6 and Mismatches note 1.
 `lmdb.h` group `mdb_dbi_open`. heed exposes them as `DatabaseFlags` /
 `AllDatabaseFlags`. **No consumer passes any `DatabaseFlags`** (SPEC 00 §B.1,
 verified across all five consumers) → every persistent DB flag is **WON'T** in
-Phase 1 under **D-004**, revived in **Phase 2.8**. `MDB_CREATE` is the sole
+Phase 1 under **D-004**, deferred to **Phase 2.8** (parked 2026-07-20). `MDB_CREATE` is the sole
 exception: it is not a persistent flag and is a MUST.
 
 | Flag | Bit | heed API | Class | Milestone | Diff-test slug | Behavior & error/precedence notes (from `mdb.c`) |
@@ -430,7 +430,7 @@ from its MUST table):
   M1.10, M1.11, M1.12.
 - All 23 WON'T rows are justified: **20 by D-004** (6 DUPSORT/DUPFIXED/integer/
   reverse DB flags + 3 dup put-flags `NODUPDATA`/`APPENDDUP`/`MULTIPLE` + 11 dup
-  cursor-ops, all revived in Phase 2.8) and **3 by D-001/written rationale**
+  cursor-ops, all deferred to Phase 2.8, parked 2026-07-20) and **3 by D-001/written rationale**
   (`FIXEDMAP` experimental upstream, `NOSUBDIR` own-format, `NOLOCK` cross-process
   per D-001).
 
@@ -445,7 +445,7 @@ they are re-listed here for a single flag-matrix view (PLAN §1.10 acceptance).
 
 | Flag | Table | Behavior (landed) | Landing test | Kind |
 |------|-------|-------------------|--------------|------|
-| `MDB_WRITEMAP` | 1 | Writes go through a writable mmap (`zerodb-io::WriteMapBacking`); commit `msync` instead of `pwrite`+`fdatasync`. Realized as a commit-time write strategy — heap dirty frames during the txn, copied into the map at C2 (SPEC 04 §6.4, amended). | `env_writemap_put_get_parity`, `env_writemap_put_reserved` (oracle, both engines in WRITE_MAP); `writemap_put_get_reserved_persist`, `writemap_reopened_as_writemap_sees_data` (`crates/zerodb/tests/write_flags.rs`) | differential + e2e |
+| `MDB_WRITEMAP` | 1 | Writes go through a writable mmap (`zerodb-io::WriteMapBacking`); commit `msync` instead of `pwrite`+`fdatasync`. Realized as a commit-time write strategy — heap dirty frames during the txn, copied into the map at C2 (SPEC 04 §6.4, amended). *(As landed 2026-07-16; since ADR-0021, PR #88, the real map backing realizes dirty frames in the map at allocation instead — SPEC 04 TXN-45b.)* | `env_writemap_put_get_parity`, `env_writemap_put_reserved` (oracle, both engines in WRITE_MAP); `writemap_put_get_reserved_persist`, `writemap_reopened_as_writemap_sees_data` (`crates/zerodb/tests/write_flags.rs`) | differential + e2e |
 | `MDB_MAPASYNC` | 1 | With WRITE_MAP, C3/C5 use `msync(MS_ASYNC)`. | `durability_mapasync_writemap` (oracle); `map_async_makes_barriers_async` (barrier count); `mapasync_writemap_commit_and_force_sync` (e2e) | differential + control-flow |
 | `MDB_NOSYNC` | 1 | Skip **both** C3 and C5 fsync (SPEC 06 REC-9). Restored by `force_sync`. | `durability_nosync_no_fsync` (oracle); `no_sync_skips_both_barriers` / `no_sync_dominates_no_meta_sync` (barrier count) | differential + control-flow |
 | `MDB_NOMETASYNC` | 1 | fsync data (C3), skip meta fsync (C5); recovery falls back to newest durable meta, corruption-free (REC-10). | `durability_nometasync` (oracle); `no_meta_sync_skips_meta_barrier` (barrier count) | differential + control-flow |

@@ -47,8 +47,9 @@ index registry's open/close churn with `EnvClosingEvent`, `max_readers`,
 `max_dbs`, and `static_read_txn` in async handlers. No test in either crate
 asserts LMDB-internal geometry, so a failure is a real behavioural difference.
 
-Results so far are logged in [`PROGRESS.md`](../PROGRESS.md) (search for
-"CONSUMER SUITES"). Known blind spot: Meilisearch ships no compaction or
+Suite results are logged in [`PROGRESS.md`](../PROGRESS.md) (search for
+"CONSUMER SUITES" and "CONSUMER GATE"); benchmark tables are in
+[`benches/results/`](../benches/results/). Known blind spot: Meilisearch ships no compaction or
 snapshot-restore round-trip test, which is how the `data.mdb` naming issue
 (D-012) stayed hidden behind a green suite; those paths are covered by
 `crates/heed-zerodb/tests/env_file_naming.rs` instead.
@@ -98,14 +99,16 @@ ZeroDB is faster).
 
 Caveats that apply to any number these produce:
 
-- A laptop run is indicative. The representative numbers are Graviton + EBS
-  gp3, the production target — see PLAN.md §1.14 and `docs/PERF-GAP-VS-LMDB.md`.
+- A laptop run is indicative. The representative numbers come from a quiet
+  Linux server or the Graviton target (e.g.
+  `benches/results/2026-10-05-meta-annex-real-case.md`, an x86-64 bench
+  server); see also `docs/PERF-GAP-VS-LMDB.md`.
 - The workloads include HTTP overhead and the indexer's own CPU work; the
   storage engine is one span family among many. Read the per-span table, not
   just the total.
-- Allocator: Meilisearch builds with its production allocator either way, so
-  unlike the in-repo criterion bench (issue #67) this comparison is
-  allocator-fair.
+- Allocator: Meilisearch builds with its production allocator (mimalloc)
+  either way, so unlike the in-repo criterion ladder, which runs both engines
+  under the system allocator, this comparison is allocator-fair.
 - Workload assets are downloaded once into `target/consumer/assets/` (the
   movies dataset is ~100 MB; the hackernews ones are larger).
 - The runner spawns the server on port 7700. If something local holds it (a

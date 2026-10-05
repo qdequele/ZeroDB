@@ -25,7 +25,8 @@
   save), PERF-GAP-VS-LMDB §B12; forward-looking toward PLAN 3.1.
 - Date: 2026-10-03
 - Numbering note: ADR-0021 (WRITE_MAP in-place) lives on its own open branch;
-  this ADR takes 0022 to avoid colliding with it.
+  this ADR takes 0022 to avoid colliding with it. (ADR-0021 has since merged,
+  PR #88; this ADR merged as PR #89, d155fe6.)
 
 ## Context
 

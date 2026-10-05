@@ -1,6 +1,7 @@
 # ADR-0014: Opt-in trusted-file mode (LMDB parity for page reads)
 
 - Status: Accepted (2026-09-28); the lever is kept only if the measurement gate below passes
+- Implementation note (2026-10-05): gate passed, kept — 5ec996d (`benches/results/perf-ledger.jsonl`); overflow amendment kept, 3433c1c.
 - Milestone: Phase 3 (performance), PERF-GAP A2(b) / issue #21
 - Date: 2026-09-28
 
