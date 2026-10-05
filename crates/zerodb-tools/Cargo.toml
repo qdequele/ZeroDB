@@ -1,6 +1,6 @@
 [package]
 name = "zerodb-tools"
-version = "0.1.0"
+version = "0.2.0"
 description = "Offline utilities for ZeroDB environments: stat, dump, load, check and migrate-from-lmdb."
 edition.workspace = true
 rust-version.workspace = true
@@ -20,10 +20,10 @@ name = "zerodb-tools"
 path = "src/main.rs"
 
 [dependencies]
-zerodb = { path = "../zerodb", version = "=0.1.0" }
-zerodb-core = { path = "../zerodb-core", version = "=0.1.0" }
+zerodb = { path = "../zerodb", version = "=0.2.0" }
+zerodb-core = { path = "../zerodb-core", version = "=0.2.0" }
 # Read-only file helpers (probe_page_size) for the offline `check` walk; no C.
-zerodb-io = { path = "../zerodb-io", version = "=0.1.0" }
+zerodb-io = { path = "../zerodb-io", version = "=0.2.0" }
 # `flock`-based advisory liveness guard on the data file (ZeroDB is
 # single-process, see docs/DIVERGENCES.md: no cross-process protocol exists, so
 # the guard is best-effort). libc is on the AGENTS.md allowlist; the single

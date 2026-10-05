@@ -19,13 +19,13 @@ zerodb-tools --version          # crate version + on-disk format version
 zerodb-tools --help
 ```
 
-**Installing.** No release has been cut yet, so today install from source:
-`cargo install --path crates/zerodb-tools`. Once releases exist, each GitHub
-release ships prebuilt tarballs for `x86_64-unknown-linux-gnu`,
-`aarch64-unknown-linux-gnu` and `aarch64-apple-darwin` with a SHA-256 sum next
-to each, and `cargo install zerodb-tools` works from crates.io. Either way, add
-`--features migrate-lmdb` for `migrate-from-lmdb`, which links the C LMDB fork
-and is therefore not in the prebuilt binaries.
+**Installing.** `cargo install zerodb-tools` from crates.io, or download a
+prebuilt tarball from the [releases page](https://github.com/qdequele/ZeroDB/releases)
+(`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` and
+`aarch64-apple-darwin`, each with a SHA-256 sum). From a checkout:
+`cargo install --path crates/zerodb-tools`. Add `--features migrate-lmdb` for
+`migrate-from-lmdb`, which links the C LMDB fork and is therefore not in the
+prebuilt binaries.
 
 **Exit codes.** `0` success; `1` = `check` found violations; `2` = usage error
 or any other failure (unknown subcommand or option, unreadable env, …). Unknown

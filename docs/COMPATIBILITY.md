@@ -121,7 +121,7 @@ and integer key orders are available through `key_comparator` instead.
 | Item | Status | Notes |
 |---|---|---|
 | `RoIter`, `RoRevIter`, `RwIter`, `RwRevIter` `<'txn, KC, DC, IM>` | Same | |
-| `RoRange`, `RoRevRange`, `RoPrefix`, `RoRevPrefix`, `RwRange`, `RwRevRange`, `RwPrefix`, `RwRevPrefix` `<'txn, KC, DC, C, IM>` | Same | Since 0.1.0 (the comparator parameter was missing before) |
+| `RoRange`, `RoRevRange`, `RoPrefix`, `RoRevPrefix`, `RwRange`, `RwRevRange`, `RwPrefix`, `RwRevPrefix` `<'txn, KC, DC, C, IM>` | Same | Same (the comparator parameter is included) |
 | `next`, `Debug`, `remap_types`, `remap_key_type`, `remap_data_type`, `lazily_decode_data` | Same | |
 | `move_between_keys`, `move_through_duplicate_values`, `iteration_method::*` | No-op | Retags only (no duplicates); `MoveOnCurrentKeyDuplicates` is unreachable |
 | `unsafe del_current`, `unsafe put_current`, `unsafe put_current_with_options` | Same | `put_current` always returns `Ok(true)` |
