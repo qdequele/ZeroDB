@@ -1,5 +1,5 @@
 #![no_main]
-//! Fuzz target `fuzz_image_open` (first-release security review, 2026-09).
+//! Fuzz target `fuzz_image_open`.
 //!
 //! Treats the fuzz input as a whole env-file **image** (padded/truncated to
 //! whole pages), opens it through the same I/O-free core entry point the real
@@ -7,8 +7,8 @@
 //! opens — drives the read API and the invariant checker over it.
 //!
 //! The oracle: **a typed error or a clean result, never a panic, hang,
-//! unbounded allocation, or out-of-bounds read.** (The SIGBUS half of the
-//! open-validation fix is covered by `zerodb/tests/hostile_file.rs`; a heap
+//! unbounded allocation, or out-of-bounds read.** (The SIGBUS half of open
+//! validation is covered by `zerodb/tests/hostile_file.rs`; a heap
 //! backing turns any would-be wild map read into an OOB slice index, which
 //! the sanitizer catches here.)
 //!

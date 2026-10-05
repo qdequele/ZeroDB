@@ -1,14 +1,14 @@
-//! Milestone 1.5 GC guard tests (ADR-0005 D6) over **real files**: freed-page
+//! Free-page GC guard tests (ADR-0005 D6) over **real files**: freed-page
 //! reclamation (SPEC 05 GC-14..20), the freelist-writes-to-itself commit step
 //! (GC-11..13), the partial-drain remainder rewrite (GC-20), the interim
-//! oldest-reader gate (ADR-0005 OQ1; SPEC 04 TXN-21 as amended), the huge-txn
-//! PIL spill (GC-5/GC-26 — the Phase 3.1 baseline), `non_free_pages_size`
-//! (GC-22..24, INV-27), and GC atomicity across crashes (GC-14, REC-6).
+//! oldest-reader gate (ADR-0005 OQ1; SPEC 04 TXN-21), the huge-txn PIL spill
+//! (GC-5/GC-26),
+//! `non_free_pages_size` (GC-22..24, INV-27), and GC atomicity across crashes
+//! (GC-14, REC-6).
 //!
 //! Every committed image is validated with `zerodb::check::check_image`,
 //! **including** the INV-22 reachable-XOR-free partition — a leaked page
-//! ("neither") or a double-hand-out ("both") fails loudly. Do not weaken
-//! (CLAUDE.md rule 2).
+//! ("neither") or a double-hand-out ("both") fails loudly.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -64,7 +64,7 @@ fn file_size(dir: &Path) -> u64 {
         .len()
 }
 
-/// Bounded file growth on insert/delete churn (PLAN §1.5 acceptance;
+/// Bounded file growth on insert/delete churn (GC acceptance criterion;
 /// ADR-0005 D5 flatness bound): with a constant live set, reclamation must
 /// hold the file at a steady state — size at the last cycle within 1.05× of
 /// the size at the halfway cycle. The INV-22 walk after every commit is the
@@ -196,8 +196,8 @@ fn partial_drain_remainder_survives_commits() {
 /// huge-txn spill: one txn frees far more than the `c >= 251` (psize 4096)
 /// spill threshold, so the PIL goes to an overflow run, and `freelist_save`'s
 /// own tree writes free/allocate GC pages mid-save. INV-22 catches any page
-/// the loop leaks or double-lists. Also records the Phase-3.1 baseline
-/// numbers (GC-26) in the test output.
+/// the loop leaks or double-lists. Also records the baseline numbers (GC-26)
+/// for a huge-txn GC redesign in the test output.
 #[test]
 fn freelist_self_write_split_and_spill() {
     let dir = TempDir::new();
@@ -229,7 +229,7 @@ fn freelist_self_write_split_and_spill() {
         free > 251,
         "expected a spilled PIL (> 251 freed pages at psize 4096, GC-26), got {free}"
     );
-    // GC-26 baseline for Phase 3.1 (printed, not asserted).
+    // GC-26 baseline for a huge-txn GC redesign (printed, not asserted).
     println!(
         "GC-26 baseline: freed_pages={free} file_size={} clear_commit={:?}",
         file_size(dir.path()),
@@ -338,7 +338,7 @@ fn reader_gate_blocks_reuse_until_release() {
     );
 }
 
-/// INV-27 (SPEC 05 §9, amended 2026-09-29): every page of a committed
+/// INV-27 (SPEC 05 §9): every page of a committed
 /// image is exactly one of the two meta slots, a page of a user tree (main +
 /// named DBs, which `non_free_pages_size` counts), a page of the GC tree, or
 /// a free page (`free_page_count`), so
@@ -386,7 +386,7 @@ fn non_free_pages_size_identity() {
 
 // ---------------------------------------------------------------------------
 // GC atomicity across crashes (GC-14; ADR-0005 D6, crash-churn variant of the
-// M1.4 smoke — the full harness is M1.11).
+// commit-pipeline crash smoke — the full crash harness lives in zerodb-oracle).
 // ---------------------------------------------------------------------------
 
 const CHILD_ENV_VAR: &str = "ZDB_GC_CRASH_CHILD_HOOK";

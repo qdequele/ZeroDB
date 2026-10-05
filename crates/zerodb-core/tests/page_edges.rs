@@ -1,10 +1,9 @@
-//! Adversarial edge-case coverage for the M1.1 page model (SPEC 02), added by
-//! a test-writer pass on top of the implementer's own `spec02_format.rs` /
-//! `proptest_roundtrip.rs`. These are deterministic (no proptest macro use),
-//! so — unlike `proptest_roundtrip.rs` — this file runs under `cargo miri
-//! test` too.
+//! Adversarial edge-case coverage for the page model (SPEC 02), on top of
+//! `spec02_format.rs` / `proptest_roundtrip.rs`. These are deterministic (no
+//! proptest macro use), so — unlike `proptest_roundtrip.rs` — this file runs
+//! under `cargo miri test` too.
 //!
-//! Section numbering below matches the M1.1 test-coverage task list:
+//! Sections below:
 //! 1. Page-full boundary exactness (leaf + branch, min/max cell, both psizes)
 //! 2. Insert-at-every-position ordering
 //! 3. Remove + heap compaction adversarial
@@ -12,6 +11,7 @@
 //! 5. Meta double-buffer selection truth-table completion (tie-break)
 //! 6. 511-boundary keys / inline-overflow threshold in page context
 //! 7. Overflow run math (exact page-multiple boundaries, typed errors)
+//! 8. `remove_span` (the bulk arm of `delete_range`)
 
 use zerodb_core::page::{
     geometry, select_meta, write_overflow_head, BranchMut, BranchRef, DBRecord, LeafMut, LeafRef,
@@ -178,9 +178,8 @@ fn branch_min_key_boundary(psize: u32) {
     };
 
     // `build` fully re-derives the "almost full" state deterministically, so
-    // it is called once per live `BranchMut` we need rather than trying to
-    // reopen a previously-populated buffer (there is no `BranchMut::from_valid`
-    // reopen API, unlike `LeafMut`).
+    // it is called once per live `BranchMut` we need rather than reopening a
+    // previously-populated buffer.
     let mut probe_buf = vec![0u8; psize as usize];
     let remainder = build(&mut probe_buf);
     assert!(
@@ -521,7 +520,7 @@ fn built_valid_meta(psize: u32) -> Vec<u8> {
 }
 
 /// Every single-byte flip in the CRC-covered region [0, META_CONTENT_LEN =
-/// 172) — which since format v2 includes `fl_count` at [168, 172) (ADR-0022;
+/// 172) — which includes `fl_count` at [168, 172) (ADR-0022;
 /// a silently-zeroed annex count must tear the slot) — must invalidate the
 /// slot; every single-byte flip in the excluded reserved tail
 /// [176, psize) must NOT, for an empty-annex meta (SPEC 02 §3.3 — the

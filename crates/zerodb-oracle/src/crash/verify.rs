@@ -12,7 +12,7 @@
 //!    (`floor ≥ acked` in strict modes — an acked commit can never sit above
 //!    the durable floor).
 //!
-//! Adversarial probing (`NO_SYNC`/`MAP_ASYNC` reorder sub-model, ratified
+//! Adversarial probing (`NO_SYNC`/`MAP_ASYNC` reorder sub-model, ADR-0008
 //! OQ3): assert only *no panic* and the designed error taxonomy; walk/open
 //! outcomes are counted for characterization, never gated (REC-11 promises
 //! nothing stronger).
@@ -151,16 +151,15 @@ pub struct FullChecks<'a> {
     /// worker: a failed deregistration on the previous drop surfaces as
     /// `EnvAlreadyOpened` here (the ADR-0008 D6.2 residue tripwire).
     pub verify_path: &'a Path,
-    /// **`NO_META_SYNC` reclaim-clobber window** (REC-10 as amended M1.11;
-    /// harness find, seed 15797139550980166469): set by the caller only when
-    /// the plan persisted at least one in-flight **data** write of a cut that
+    /// **`NO_META_SYNC` reclaim-clobber window** (REC-10): set by the caller
+    /// only when the plan persisted at least one in-flight **data** write of a cut that
     /// also has the (single) previous commit's meta pending. If recovery then
     /// falls **below** `ceil` (that meta torn/dropped), the recovered
     /// snapshot's pages may have been legally clobbered — pages freed by txn
     /// `ceil` belong to snapshot `ceil − 1`, and txn `ceil + 1` may reclaim
     /// them (GC-18) with nothing barrier-ordering its writes against the
     /// un-fsynced meta. LMDB shares this window (`MDB_NOMETASYNC`; libmdbx's
-    /// steady/weak metas exist precisely to close it — Phase 3 candidate).
+    /// steady/weak metas exist precisely to close it).
     /// Walk/data obligations are waived for exactly those images; the window
     /// and txnid-taxonomy obligations still hold. Never set for
     /// default/`WRITE_MAP` — REC-6's full guarantees stand there.
@@ -174,7 +173,7 @@ pub enum FullOutcome {
     Verified,
     /// The image landed in the `NO_META_SYNC` reclaim-clobber window
     /// (`stale_data_exempt` and recovered < ceil): window/taxonomy
-    /// obligations held; walk/data waived per REC-10 as amended. Counted
+    /// obligations held; walk/data waived per REC-10. Counted
     /// separately for characterization.
     StaleFallback,
 }
@@ -217,7 +216,7 @@ pub fn verify_image_full(mut img: Vec<u8>, c: &FullChecks<'_>) -> Result<FullOut
         let world = states
             .get(&r)
             .ok_or_else(|| format!("recovered txnid {r} has no recorded committed state"))?;
-        // REC-10 as amended: falling below the newest issued meta while a
+        // REC-10: falling below the newest issued meta while a
         // younger txn's data persisted exempts walk/data (see FullChecks).
         if exempt && r < ceil {
             return Ok(FullOutcome::StaleFallback);
@@ -250,7 +249,7 @@ pub struct AdvOutcome {
 
 /// Probe an adversarial (`NO_SYNC`/`MAP_ASYNC` reorder) image: no panic, and
 /// only the designed taxonomy (`Ok` or `Invalid`). Nothing else is asserted —
-/// REC-11 makes no stronger promise under reordering (ratified OQ3).
+/// REC-11 makes no stronger promise under reordering (ADR-0008 OQ3).
 ///
 /// # Errors
 ///

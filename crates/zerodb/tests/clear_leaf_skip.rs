@@ -1,13 +1,12 @@
-//! Roadmap #5a — leaf-skipping `clear`/`drop` (LMDB `mdb_drop0` parity,
-//! SPEC 02 §6.1): a tree whose record says `overflow_pages == 0` is cleared by
-//! reading only its branch pages; the leaf pgnos are freed straight from the
-//! lowest branch level, unread. These tests pin that the freed set is exactly
-//! the set the reading walk freed — via `check_image`'s INV-22
-//! reachable-XOR-free partition (a leaked leaf is "neither", a double-freed
-//! one "both"), the stat counters, and the free-page count — that an
-//! overflow-bearing tree still takes the reading walk and frees its runs, and
-//! that the freed pages are actually reusable afterwards. Do not weaken
-//! (CLAUDE.md rule 2).
+//! Leaf-skipping `clear`/`drop` (LMDB `mdb_drop0` parity, SPEC 02 §6.1): a
+//! tree whose record says `overflow_pages == 0` is cleared by reading only its
+//! branch pages; the leaf pgnos are freed straight from the lowest branch
+//! level, unread. These tests pin that the freed set is exactly the set the
+//! reading walk frees — via `check_image`'s INV-22 reachable-XOR-free
+//! partition (a leaked leaf is "neither", a double-freed one "both"), the stat
+//! counters, and the free-page count — that an overflow-bearing tree still
+//! takes the reading walk and frees its runs, and that the freed pages are
+//! actually reusable afterwards.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -1,5 +1,5 @@
 //! Compacting / raw environment copy — `Env::copy_to_file` parity (SPEC 00
-//! row 17, `mdb_env_copy2`; ADR-0009). Milestone 1.12.
+//! row 17, `mdb_env_copy2`; ADR-0009).
 //!
 //! Meilisearch snapshots the whole env with `copy_to_file`, in both modes:
 //! `CompactionOption::Enabled` (`MDB_CP_COMPACT`, the normal snapshot/compaction
@@ -10,7 +10,7 @@
 //! The API is an extension trait ([`CopyToFile`]) rather than an inherent
 //! method: [`Env`] lives in `zerodb-core`, which is deliberately I/O-free and
 //! `miri`-clean, so the file-writing copy logic lives here in the public
-//! `zerodb` crate. The `heed-zerodb` adapter (M1.13) maps heed's inherent
+//! `zerodb` crate. The `heed-zerodb` adapter maps heed's inherent
 //! `Env::copy_to_file` onto this trait.
 //!
 //! ## Correctness under a concurrent writer (ADR-0009)
@@ -48,8 +48,7 @@ pub enum CompactionOption {
     Disabled,
 }
 
-/// How far along a [`CopyToFile::copy_to_file_with_progress`] run is
-/// (**milestone 2.3**).
+/// How far along a [`CopyToFile::copy_to_file_with_progress`] run is.
 ///
 /// A **ZeroDB extension**: `mdb_env_copy2` reports nothing, and heed's
 /// `copy_to_file` is a blocking call with no observation point, which makes a
@@ -84,8 +83,7 @@ pub trait CopyToFile {
     /// - [`MdbError::Invalid`] if the source is structurally corrupt.
     fn copy_to_file(&self, path: impl AsRef<Path>, option: CompactionOption) -> Result<()>;
 
-    /// As [`CopyToFile::copy_to_file`], reporting progress to `on_progress`
-    /// (**milestone 2.3**).
+    /// As [`CopyToFile::copy_to_file`], reporting progress to `on_progress`.
     ///
     /// `on_progress` is called at least twice — once with `done == 0` before
     /// any work, once with `done == total` when the image is complete — and
@@ -95,21 +93,18 @@ pub trait CopyToFile {
     ///
     /// # Where the callback runs, and what a panic does
     ///
-    /// Every callback fires **before a single byte reaches `path`**. That is
-    /// a deliberate contract, not an accident of the implementation, and both
-    /// modes honor it by different means:
+    /// Every callback fires **before a single byte reaches `path`** — a
+    /// deliberate contract. Both modes stream the image into a sibling temp
+    /// file (`<name>.copy-tmp-<pid>-<nonce>` in `path`'s directory); `path`
+    /// itself is touched only by the final atomic `rename`, after the last
+    /// callback. On any error — or a panicking callback — the temp file is
+    /// removed by a drop guard.
     ///
-    /// Both modes stream the image into a sibling temp file
-    /// (`<name>.copy-tmp-<pid>-<nonce>` in `path`'s directory); `path` itself
-    /// is touched only by the final atomic `rename`, after the last callback.
-    /// On any error — or a panicking callback — the temp file is removed by a
-    /// drop guard.
-    ///
-    /// - `Disabled` (raw, **streamed since 2026-09-28**): the snapshot's data
-    ///   pages are written straight from the map in large chunks, as LMDB's
-    ///   `mdb_env_copyfd` writes from its map; no in-memory image.
-    /// - `Enabled` (compacting, **streamed since PERF-GAP C1**): pages land
-    ///   incrementally, bounded memory — O(tree depth × page size).
+    /// - `Disabled` (raw): the snapshot's data pages are written straight from
+    ///   the map in large chunks, as LMDB's `mdb_env_copyfd` writes from its
+    ///   map; no in-memory image.
+    /// - `Enabled` (compacting): pages land incrementally, bounded memory —
+    ///   O(tree depth × page size).
     ///
     /// In both modes therefore:
     ///
@@ -125,12 +120,12 @@ pub trait CopyToFile {
     ///
     /// The cost of that guarantee is that progress tracks *source pages
     /// processed*, not bytes landed at `path`, and that the final stretch
-    /// (the rename) is not covered by any callback. Callers wanting a progress bar that ends
-    /// exactly when the file is durable should treat `done == total` as
-    /// "reading finished", not "file written".
+    /// (the rename) is not covered by any callback. Callers wanting a progress
+    /// bar that ends exactly when the file is durable should treat
+    /// `done == total` as "reading finished", not "file written".
     ///
-    /// **Durability is the caller's concern** (LMDB `mdb_env_copy` parity —
-    /// deliberate, revisited for issue #46): no mode fsyncs the copy, and the
+    /// **Durability is the caller's concern** (LMDB `mdb_env_copy` parity,
+    /// deliberate): no mode fsyncs the copy, and the
     /// compacting mode does not fsync `path`'s directory after its rename. A
     /// caller that needs the snapshot crash-durable must fsync the produced
     /// file *and* its parent directory. (Contrast: *env creation* does both
@@ -223,7 +218,7 @@ impl Plan {
     fn new(env: &Env, txn: &RoTxn<'_>, option: CompactionOption) -> Result<Plan> {
         let snap = txn.snapshot();
         match option {
-            // M2.3: the raw copy's page count is exact — every page in the
+            // Progress: the raw copy's page count is exact — every page in the
             // snapshot is copied verbatim.
             CompactionOption::Disabled => Ok(Plan {
                 option,
@@ -232,7 +227,7 @@ impl Plan {
             }),
             CompactionOption::Enabled => {
                 refuse_custom_comparator(env)?;
-                // M2.3: the compacting copy's unit of work is *reading* the
+                // Progress: the compacting copy's unit of work is *reading* the
                 // source's live pages; how many pages it writes is only known
                 // once packing finishes, so `total` is the source's reachable
                 // page count (see `CopyProgress::total`). The main tree's
@@ -432,8 +427,8 @@ fn write_raw(
     Ok(data_end as u64)
 }
 
-/// The M2.4 scope boundary (SPEC 03 §2.0): refuse a compacting copy of an env
-/// with a custom key comparator.
+/// The custom-comparator scope boundary (SPEC 03 §2.0): refuse a compacting
+/// copy of an env with a custom key comparator.
 ///
 /// The compacting rebuild goes through the bulk builder, whose ordering
 /// contract is memcmp end to end: it packs the main catalog by
@@ -442,9 +437,8 @@ fn write_raw(
 /// would produce a tree whose physical order is the comparator's but whose
 /// builder-side reasoning assumed memcmp — and the resulting file records no
 /// comparator identity, so nothing downstream (`zerodb-tools check`,
-/// `dump`/`load`) could tell. Refusing loudly is the only honest option until
-/// the builder, the dump format and the tools are made comparator-aware,
-/// which is its own milestone.
+/// `dump`/`load`) could tell. Refusing loudly is the only honest option while
+/// the builder, the dump format and the tools are memcmp-only.
 ///
 /// `CompactionOption::Disabled` (the raw page copy) is unaffected: it is a
 /// byte-level copy that preserves whatever order is on disk.
@@ -452,7 +446,7 @@ fn refuse_custom_comparator(env: &Env) -> Result<()> {
     if env.has_custom_comparator() {
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "compacting copy is not supported on an environment with a custom key comparator              (milestone 2.4, SPEC 03 §2.0); use CompactionOption::Disabled",
+            "compacting copy is not supported on an environment with a custom key comparator (SPEC 03 §2.0); use CompactionOption::Disabled",
         )));
     }
     Ok(())
@@ -460,8 +454,9 @@ fn refuse_custom_comparator(env: &Env) -> Result<()> {
 
 /// Compacting copy: read every live entry of every DB under the snapshot and
 /// rebuild a fresh, densely-packed image (the `MDB_CP_COMPACT` shape),
-/// streamed into `file` at `base` (PERF-GAP C1: peak memory O(tree depth ×
-/// psize) plus the write buffer). Returns the image length.
+/// streamed into `file` at `base` (peak memory O(tree depth × psize) plus the
+/// write buffer; see docs/PERF-GAP-VS-LMDB.md, compaction RAM). Returns the
+/// image length.
 ///
 /// The walk and the writes overlap, as in LMDB's compacting copy
 /// (`mdb_env_copyfd1` hands full buffers to a writer thread): this thread

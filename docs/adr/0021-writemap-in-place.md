@@ -1,6 +1,7 @@
 # ADR-0021: True in-place WRITE_MAP — dirty pages live in the map, no heap staging, no commit write-back
 
-- Status: **Accepted (2026-10-02, Quentin) — spike first**. Opt-in behind `WRITE_MAP`; default (heap-staged) path unchanged. Implementation via `critical-implementer`, full gate (loom for commit/meta ordering, crash, stress) + the adapter borrow audit; never merged without a green gate + spec-review. (Was: Draft, gated on the spike numbers below and human approval — rule 6: write-path + concurrency + unsafe.)
+- Status: **Accepted (2026-10-02, maintainer) — spike first**. Opt-in behind `WRITE_MAP`; default (heap-staged) path unchanged. Implementation via `critical-implementer`, full gate (loom for commit/meta ordering, crash, stress) + the adapter borrow audit; never merged without a green gate + spec-review. (Was: Draft, gated on the spike numbers below and human approval — rule 6: write-path + concurrency + unsafe.)
+- Implementation note (2026-10-05): spike plus the production hardening pass below merged as PR #88 (8b066a6, 2026-10-05; the PR title still read "DRAFT, do not merge"). In-place is now what `WRITE_MAP` does. Still open: ranged msync (issue #45), the open questions at the end.
 - Milestone: Phase 3 (performance), PERF-GAP B5 / issue #13; supersedes ADR-0017 (spilling) **for WRITE_MAP envs only**
 - Date: 2026-10-01
 

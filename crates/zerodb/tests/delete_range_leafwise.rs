@@ -1,12 +1,11 @@
-//! Roadmap #5c — leaf-granular `Database::delete_range` (SPEC 00 row 37,
-//! SPEC 03 delete_range note): the range is deleted one leaf span at a time
-//! (one COW + one splice + one rebalance per covered leaf) instead of one
-//! descent + rebalance per key. These tests pin the **committed image** after
-//! such deletes: exact survivors, exact `entries`/`overflow_pages` stats,
-//! covered `F_BIGDATA` runs freed (and uncovered ones kept), and
-//! `check_image`'s full invariant sweep — INV-22's reachable-XOR-free
-//! partition would expose a leaked or double-freed page. Do not weaken
-//! (CLAUDE.md rule 2).
+//! Leaf-granular `Database::delete_range` (SPEC 00 row 37, SPEC 03
+//! delete_range note): the range is deleted one leaf span at a time (one COW +
+//! one splice + one rebalance per covered leaf) rather than one descent +
+//! rebalance per key. These tests pin the **committed image** after such
+//! deletes: exact survivors, exact `entries`/`overflow_pages` stats, covered
+//! `F_BIGDATA` runs freed (and uncovered ones kept), and `check_image`'s full
+//! invariant sweep — INV-22's reachable-XOR-free partition would expose a
+//! leaked or double-freed page.
 
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};

@@ -37,7 +37,8 @@ const FRAG_COMMITS: usize = 1_000;
 /// pinned reader accumulates every freed page **and** its copy-on-write
 /// replacements without reclaiming, so the peak file outgrows the live data.
 /// The map is sparse — only touched pages cost anything — and 2 GiB is a
-/// multiple of every supported page size (D-006).
+/// multiple of every supported page size (see the `map_size` entry in
+/// docs/DIVERGENCES.md).
 const FRAG_MAP: usize = 2 << 30;
 
 pub fn run(c: &mut Criterion, cfg: &Cfg) {
@@ -86,7 +87,8 @@ fn case_open_create<B: Backend>(g: &mut Group<'_>, page: u32) {
 
 /// Reopen an env already holding `N` entries, `N_OPEN` times. The delta against
 /// `open/create` is what mapping + geometry validation costs on an existing
-/// image (zerodb validates rather more of it than LMDB does — D-017).
+/// image (zerodb validates rather more of it than LMDB does — see
+/// docs/DIVERGENCES.md).
 fn reopen(c: &mut Criterion, cfg: &Cfg) {
     let keys = ascending_keys(N);
     let val = vec![0xABu8; VAL];
@@ -145,17 +147,16 @@ fn case_empty_commit<B: Backend>(g: &mut Group<'_>, page: u32, keys: &[Vec<u8>],
 }
 
 /// `non_free_pages_size()` — the used-bytes figure milli reads before every
-/// register write txn and after every batch. Since SPEC 05 GC-23's 2026-09-29
-/// amendment both engines compute it the same way: the main DB's and every
-/// named DB's branch + leaf + overflow page counts times the page size (LMDB
-/// via `mdb_stat` per DB, zerodb from its catalog records), so the cost tracks
-/// the number of databases, not the free list.
+/// register write txn and after every batch. Both engines compute it the same
+/// way (SPEC 05 GC-23): the main DB's and every named DB's branch + leaf +
+/// overflow page counts times the page size (LMDB via `mdb_stat` per DB,
+/// zerodb from its catalog records), so the cost tracks the number of
+/// databases, not the free list.
 ///
-/// The fixture still carries a deliberately large, fragmented free list (see
-/// `case_non_free`): it is the regime the previous free-list walk paid for
-/// (roadmap #10, PERF-GAP B20), and keeping it pins that the figure no longer
-/// depends on the free list's size — a regression back to a walk would show
-/// here at once.
+/// The fixture carries a deliberately large, fragmented free list (see
+/// `case_non_free`) to pin that the figure does not depend on the free list's
+/// size: a free-list walk (the `non_free_pages_size` item in
+/// docs/PERF-GAP-VS-LMDB.md) would show here at once.
 fn non_free_stat(c: &mut Criterion, cfg: &Cfg) {
     let keys = ascending_keys(FRAG_KEYS);
     let val = vec![0xABu8; VAL];

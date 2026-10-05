@@ -1,4 +1,4 @@
-//! Milestone 0.3 acceptance: a trivial op sequence through `run_self_test`
+//! Harness acceptance: a trivial op sequence through `run_self_test`
 //! (LmdbEngine vs a second independent LmdbEngine), plus a few structured
 //! sequences that exercise the harness surface.
 
@@ -11,7 +11,7 @@ fn v(bytes: &[u8]) -> zerodb_oracle::Value {
     zerodb_oracle::Value(bytes.to_vec())
 }
 
-/// The milestone acceptance test: open, put, get, commit, reopen, get.
+/// The harness acceptance test: open, put, get, commit, reopen, get.
 #[test]
 fn trivial_sequence_self_test() {
     let ops = vec![

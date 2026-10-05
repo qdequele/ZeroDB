@@ -1,24 +1,12 @@
-//! Milestone 1.4 coverage pass, area 4: abort/poison semantics not already
-//! covered.
+//! Abort/poison semantics (SPEC 04 TXN-59, REC-13). The `MapFull`-poisons
+//! case lives in `zerodb-core/src/rwtxn.rs`'s unit tests.
 //!
-//! `crates/zerodb-core/src/rwtxn.rs`'s own `#[cfg(test)] mod tests` already
-//! has `map_full_poisons_txn` (area 4b: a mid-mutation `MapFull` poisons the
-//! txn — subsequent mutation AND commit both return `BadTxn`, matching
-//! SPEC 04 TXN-59/REC-13/§8.1) and `key_and_value_bounds` (empty/oversized
-//! key -> `BadValSize`, followed by a *successful* put in the same txn,
-//! which already implies non-poisoning but doesn't say so). This file adds:
-//!
-//! 4a. An explicit, dedicated test that an oversized-key `BadValSize` does
-//!     NOT poison the txn (LMDB only poisons on internal errors, per
-//!     `rwtxn.rs::put_main`'s early-return-before-`self.errored=true` shape,
-//!     confirmed by reading the source: the key/value size checks return
-//!     before `put_apply` is ever called, so `self.errored` is never
-//!     touched) — every subsequent op on the same txn, including commit,
-//!     must still work.
-//! 4c. Abort after a heavy, overflow-run-heavy mutation: extends
-//!     `write_api.rs::abort_leaves_disk_untouched`'s byte-identical-file
-//!     assertion to a txn that allocates and frees several multi-page
-//!     overflow runs before aborting.
+//! - An up-front validation error (`BadValSize` on an oversized or empty
+//!   key) does NOT poison the txn: LMDB only poisons on internal errors, and
+//!   the size checks return before any mutation starts. Every later op on
+//!   the same txn, including commit, must still work.
+//! - Abort after an overflow-run-heavy mutation leaves the data file
+//!   byte-identical.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

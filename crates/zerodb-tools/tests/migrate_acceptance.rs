@@ -1,4 +1,4 @@
-//! `migrate-from-lmdb` acceptance (M1.12, PLAN §1.12) — needs `migrate-lmdb`.
+//! `migrate-from-lmdb` acceptance — needs `migrate-lmdb`.
 //!
 //! (a) Round-trip: build a real LMDB env (multi-DB, overflow values, varied
 //!     sizes), migrate it into a fresh zerodb env, and assert `our dump of the
@@ -7,8 +7,8 @@
 //! (b) Real-Meilisearch-index proxy: a milli-shaped env (BE-u32-keyed docids →
 //!     roaring-bitmap-like blobs, str-keyed word DB, a large overflow value),
 //!     migrated, compared by full iteration (the dump equality) **and** by point
-//!     queries — byte-identical values. A true milli index replay is a 1.14-gate
-//!     item; this proxy stands in for it here.
+//!     queries — byte-identical values. This proxy stands in for a true milli
+//!     index replay.
 #![cfg(feature = "migrate-lmdb")]
 
 use std::path::{Path, PathBuf};
@@ -215,11 +215,11 @@ fn real_index_proxy_point_queries_match() {
 }
 
 // ---------------------------------------------------------------------------
-// ADR-0010 / D-012 — magic-based source discrimination.
+// ADR-0010 — magic-based source discrimination.
 // ---------------------------------------------------------------------------
 
-/// Since ADR-0010 a ZeroDB env can *also* be named `data.mdb` (that is exactly
-/// what the `heed-zerodb` adapter creates), so the file name no longer tells an
+/// A ZeroDB env can *also* be named `data.mdb` (that is exactly what the
+/// `heed-zerodb` adapter creates, ADR-0010), so the file name does not tell an
 /// LMDB env from a ZeroDB one. The **magic** does (SPEC 02 §3), and
 /// `migrate-from-lmdb` must say so explicitly rather than surfacing an opaque
 /// `MDB_INVALID` from heed.

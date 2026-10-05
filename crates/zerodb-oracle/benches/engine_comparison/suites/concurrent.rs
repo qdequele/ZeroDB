@@ -8,24 +8,20 @@
 //! The timed value is the **writer's** work ONLY — `writer_under_readers`
 //! returns the elapsed time of its own write-txn loop (first `write_txn` to
 //! last `commit`), measured via criterion's `iter_custom` while `r` reader
-//! threads full-scan in a loop. Earlier, the timed closure spanned the whole
-//! `iter_batched` routine, which included the reader threads' join tail (a
-//! reader only checked the stop flag once per full 50k-entry scan, so the
-//! timed region could wait up to a whole scan after the writer finished) and
-//! the fixture's drop; readers now poll the stop flag every 1024 entries
-//! (`READER_STOP_POLL_CHUNK` in `backend.rs`) so that tail is negligible, and
-//! `iter_custom` excludes it and the drop from the timed value entirely.
+//! threads full-scan in a loop. Timing the whole routine instead would include
+//! the reader threads' join tail and the fixture's drop; `iter_custom`
+//! excludes both, and readers poll the stop flag every 1024 entries
+//! (`READER_STOP_POLL_CHUNK` in `backend.rs`) rather than once per full scan,
+//! so the tail is negligible anyway.
 //!
 //! `r0` is a same-shape baseline: identical txn count and overwrites per txn
 //! as `r1`/`r4`, with zero reader threads. It gives the family a base rung so
 //! `r1 ÷ r0` and `r4 ÷ r0` read as "what N readers cost", rather than `r1`
 //! alone standing in for "no contention".
 //!
-//! Read `rN ÷ r0` (or, historically, `rN` against `commit/batch/n100`, which is
-//! the same writer with nobody else in the environment) per engine: the ratio
-//! is what concurrency costs that engine. A gap between the two engines'
-//! ratios is a reader-table or reclamation finding (ADR-0006, SPEC 05) rather
-//! than a tree finding.
+//! Read `rN ÷ r0` per engine: the ratio is what concurrency costs that engine.
+//! A gap between the two engines' ratios is a reader-table or reclamation
+//! finding (ADR-0006, SPEC 05) rather than a tree finding.
 //!
 //! Long tier only: it is the slowest rung here and the noisiest on a laptop,
 //! where reader threads compete with the writer for the same few cores.

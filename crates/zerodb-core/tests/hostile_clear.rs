@@ -1,11 +1,11 @@
-//! Roadmap #5a — the leaf-skipping `clear` (SPEC 02 §6.1, LMDB `mdb_drop0`)
+//! The leaf-skipping `clear` (SPEC 02 §6.1, LMDB `mdb_drop0`)
 //! frees the lowest branch level's children WITHOUT reading them, so its
 //! bound check is the only thing between a crafted branch pointer and the
 //! free list. A child naming a meta slot (page 0/1), a pgno past the
 //! committed high-water, or the same leaf twice MUST yield the typed
 //! `MdbError::Invalid` (poisoning the txn, freeing nothing) — never feed the
 //! allocator. Crafted images over a heap backing, as `hostile_input.rs` (the
-//! suite also runs under miri). Do not weaken (CLAUDE.md rule 2).
+//! suite also runs under miri).
 
 use zerodb_core::env::testutil::VecBacking;
 use zerodb_core::env::{open_with_backing, DurabilityFlags, Env};
@@ -167,7 +167,7 @@ fn clear_refuses_aliased_unread_child() {
 
 /// The hostile-depth guard carries over to the leaf-skipping walk: an on-disk
 /// `depth` past the cursor bound fails typed, no unbounded recursion (the
-/// no-overflow record routes `clear` through the new walk).
+/// no-overflow record routes `clear` through the leaf-skipping walk).
 #[test]
 fn clear_leaf_skip_bounds_hostile_depth() {
     let img = craft_image(

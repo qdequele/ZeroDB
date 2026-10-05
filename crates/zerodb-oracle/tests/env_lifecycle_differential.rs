@@ -1,12 +1,9 @@
-//! Milestone 1.2 differential env-lifecycle tests: `LmdbEngine` vs the native
+//! Differential env-lifecycle tests: `LmdbEngine` vs the native
 //! `ZerodbEngine`.
 //!
-//! Only the environment-lifecycle op ([`Op::Reopen`]) is implemented by
-//! `ZerodbEngine` at M1.2; every other op is gated out symmetrically by the
-//! driver (`Engine::implements`), so these sequences exercise **create / open /
-//! reopen / reopen-with-larger-map-size** at parity while the data ops are
-//! skipped on both sides. As later milestones fill ops in, the same sequences
-//! start exercising more.
+//! These sequences exercise **create / open / reopen /
+//! reopen-with-larger-map-size** ([`Op::Reopen`]) at parity, with data ops
+//! interspersed around the reopens.
 //!
 //! ## Map-size units (why `map_size_kib` values are multiples of 16 here)
 //!
@@ -15,15 +12,16 @@
 //! records that every consumer clamps `map_size` to the page size before the
 //! call (`clamp_to_page_size`). zerodb is more lenient — it stores `map_size`
 //! and maps the file length, so it accepts un-clamped values (logged in
-//! `docs/DIVERGENCES.md` D-006, PROPOSED). To keep these differential tests on
-//! the *shared* semantic rather than heed's input-validation quirk, every
+//! `docs/DIVERGENCES.md`, the `map_size` validation entry). To keep these
+//! differential tests on the *shared* semantic rather than heed's
+//! input-validation quirk, every
 //! `Reopen` here uses `map_size_kib` that is a multiple of 16, so the resulting
 //! `map_size` (`1 MiB + kib*4096`) is a multiple of 64 KiB — hence a multiple of
 //! the OS page size on 4 KiB, 16 KiB, and 64 KiB kernels alike.
 //!
 //! Separately, `garbage_store_error_kind_parity` is a genuine cross-engine
 //! parity check on the *error kind* for a foreign/garbage store file: it feeds
-//! each engine its own on-disk garbage (the formats differ — SPEC 02 D-002 — so
+//! each engine its own on-disk garbage (the formats differ — SPEC 02 — so
 //! the *bytes* cannot be shared) and asserts both normalize to
 //! [`OracleError::Invalid`]. The corrupted-meta / PREV_SNAPSHOT recovery tests
 //! that depend on our specific format are zerodb-only self-tests in
@@ -39,13 +37,12 @@ fn v(bytes: &[u8]) -> zerodb_oracle::Value {
     zerodb_oracle::Value(bytes.to_vec())
 }
 
-/// create → open → reopen cycles at parity. Data ops are interspersed (gated out
-/// on both engines) to prove the symmetric-skip seam holds around real work.
+/// create → open → reopen cycles at parity, with data ops interspersed.
 #[test]
 fn differential_create_open_reopen_cycles() {
     let ops = vec![
         Op::Reopen { map_size_kib: 0 },
-        // These are gated (not yet implemented by zerodb) → skipped on both.
+        // Data work between reopens.
         Op::BeginRw,
         Op::CreateDb {
             name: DbName::Unnamed,
@@ -56,7 +53,7 @@ fn differential_create_open_reopen_cycles() {
             val: v(b"v"),
         },
         Op::Commit,
-        // Reopen again after the gated work.
+        // Reopen again after the data work.
         Op::Reopen { map_size_kib: 32 },
         Op::Reopen { map_size_kib: 16 }, // a smaller request: monotonic, still Ok
     ];
@@ -78,9 +75,8 @@ fn differential_reopen_with_larger_map_size() {
     }
 }
 
-/// A mixed sequence of every op kind: all non-env ops are gated out, so the
-/// differential reduces to the reopen parity, proving the gate does not leak a
-/// spurious divergence on a realistic script.
+/// A mixed sequence of every op kind, with reopens interleaved, must not
+/// diverge.
 #[test]
 fn differential_mixed_sequence_only_env_survives() {
     let ops = vec![
@@ -115,13 +111,12 @@ fn differential_mixed_sequence_only_env_survives() {
 }
 
 /// Randomized differential: arbitrary op sequences (the same decode path the
-/// fuzz target uses) must never diverge between LMDB and zerodb at M1.2 — the
-/// gate restricts to `Reopen`, and reopen parity must hold for every sequence.
+/// fuzz target uses) must never diverge between LMDB and zerodb.
 ///
 /// `Reopen` map sizes are normalized to multiples of 16 KiB-of-`map_size_kib`
 /// (→ 64 KiB `map_size` steps) so every request is a multiple of the OS page
 /// size on 4 KiB/16 KiB/64 KiB kernels; see the module doc (heed rejects
-/// non-page-multiple map sizes; zerodb is more lenient — DIVERGENCES D-006).
+/// non-page-multiple map sizes; zerodb is more lenient — see docs/DIVERGENCES.md).
 #[test]
 fn differential_random_sequences_do_not_diverge() {
     // A handful of deterministic seeds (no proptest harness needed; keeps this
@@ -178,8 +173,7 @@ fn normalize_zerodb(e: zerodb::Error) -> OracleError {
 
 /// Feeding each engine a garbage store file (its own layout — the formats differ,
 /// so the bytes can't be shared) yields the same normalized error **kind**:
-/// `Invalid`. This is the differential form of the "wrong page size / foreign
-/// file → error parity" acceptance point.
+/// `Invalid` ("wrong page size / foreign file → error parity").
 #[test]
 fn garbage_store_error_kind_parity() {
     // LMDB side: garbage `data.mdb` in a directory env.
@@ -215,10 +209,10 @@ fn garbage_store_error_kind_parity() {
 }
 
 /// ADR-0010 extension of the case above. Since the `heed-zerodb` adapter names
-/// its data file `data.mdb` (D-012), the garbage-file case becomes a *true*
-/// same-name differential: both engines are handed a garbage file at the
-/// **identical path**, differing only in which engine reads it. Both must still
-/// report `Invalid`.
+/// its data file `data.mdb` (see docs/DIVERGENCES.md), the garbage-file case
+/// becomes a *true* same-name differential: both engines are handed a garbage
+/// file at the **identical path**, differing only in which engine reads it.
+/// Both must still report `Invalid`.
 ///
 /// This is also the sharpest available check that the adapter reads the name it
 /// writes: if it looked at `zerodb.dat`, it would ignore the garbage entirely
@@ -251,7 +245,7 @@ fn garbage_data_mdb_error_kind_parity_through_the_adapter() {
         opts.map_size(1 << 20);
         opts.max_dbs(4);
         // SAFETY: as above; the adapter's `open` is unsafe only for heed
-        // signature parity (D-001 — no reachable cross-process flag).
+        // signature parity (ZeroDB is single-process — no reachable cross-process flag).
         match unsafe { opts.open(dir.path()) } {
             Ok(_) => panic!(
                 "the adapter opened a garbage data.mdb — it must be reading the \
@@ -277,7 +271,7 @@ fn garbage_data_mdb_error_kind_parity_through_the_adapter() {
 /// adapter, and its directory carries exactly the file layout LMDB consumers
 /// expect minus the lock file — `data.mdb` and nothing else. LMDB, handed the
 /// same directory, rejects it loudly on the magic (`ZDB1` ≠ LMDB) rather than
-/// misreading it: the file name is shared, the format is not (D-002).
+/// misreading it: the file name is shared, the format is not.
 #[test]
 fn adapter_env_dir_is_loudly_rejected_by_real_lmdb() {
     use heed_zerodb::types::Bytes;

@@ -1,11 +1,10 @@
-//! SPEC 05 GC-23 (amended 2026-09-29): `non_free_pages_size` is heed's
+//! SPEC 05 GC-23: `non_free_pages_size` is heed's
 //! definition — the branch, leaf and overflow pages of the main DB and of
 //! every named DB, times the page size — computed from the catalog records,
 //! not from the file length or a free-list walk. Pinned here against the
 //! per-database stats, with overflow values and churn, and under
 //! `WRITE_MAP`, where the file is extended to the whole map and a
-//! file-length formula would report almost the entire map as used. Do not
-//! weaken (CLAUDE.md rule 2).
+//! file-length formula would report almost the entire map as used.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

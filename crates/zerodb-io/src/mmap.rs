@@ -1,8 +1,7 @@
 //! Memory maps over an env data file (SPEC 02 §8): the read-only [`Mmap`]
-//! (default backing) and the writable [`MmapWritable`] (`EnvFlags::WRITE_MAP`,
-//! M1.10).
+//! (default backing) and the writable [`MmapWritable`] (`EnvFlags::WRITE_MAP`).
 //!
-//! This is one of the sanctioned homes for `unsafe` (CLAUDE.md unsafe policy:
+//! This is one of the sanctioned homes for `unsafe` (the unsafe policy:
 //! mmap access). There are four `unsafe` blocks: [`Mmap::map`] (read map),
 //! [`MmapWritable::map`] (writable map), [`MmapWritable::write_at`] (the
 //! `memcpy` into the writable map), and [`MmapWritable::slice_mut`] (the
@@ -13,9 +12,9 @@ use std::fs::File;
 /// A read-only memory map over an env data file.
 ///
 /// Exposes the mapped bytes as `&[u8]` and individual pages by page number.
-/// From M1.4 on (ADR-0004 D4) the map covers the **full `map_size`** — which
+/// The map (ADR-0004 D4) covers the **full `map_size`** — which
 /// may extend past the current end-of-file. The file grows underneath the
-/// fixed mapping via `pwrite` (commit C2); no remap ever happens in Phase 1.
+/// fixed mapping via `pwrite` (commit C2); no remap ever happens.
 pub struct Mmap {
     inner: memmap2::Mmap,
 }
@@ -35,14 +34,14 @@ impl Mmap {
     pub fn map(file: &File, len: usize) -> std::io::Result<Mmap> {
         // SAFETY: memmap2's `map` is `unsafe` because a memory map aliases the
         // file's contents and the borrow checker cannot see writers through
-        // the fd. Our invariants (SPEC 02 §8, SPEC 04 §9, D-001):
+        // the fd. Our invariants (SPEC 02 §8, SPEC 04 §9, single-process):
         //  * `file` is a live, open regular file for the whole lifetime of the
         //    returned `Mmap` (the caller keeps the `File` alive alongside it —
         //    see `MmapBacking`);
         //  * accesses are confined to pages referenced by some committed
         //    snapshot, all of which lie within the real file length (REC-14),
         //    so no dereference faults past EOF even though `len` may exceed it;
-        //  * the env is single-process (D-001): no *other* process writes or
+        //  * the env is single-process: no *other* process writes or
         //    truncates the file. Our *own* commit path writes through the fd
         //    (`MmapBacking::write_at_page`), which mutates the mapped memory —
         //    but only at pages **no live snapshot references** (TXN-62: fresh
@@ -138,7 +137,7 @@ impl MmapWritable {
         // SAFETY: the same aliasing contract as `Mmap::map`, extended to writes.
         // memmap2's `map_mut` is `unsafe` because the mapping aliases the file
         // and the borrow checker cannot see writers through the fd. Our
-        // invariants (SPEC 04 §9 TXN-62, §6.4, D-001, single-writer TXN-6):
+        // invariants (SPEC 04 §9 TXN-62, §6.4, single-process, single-writer TXN-6):
         //  * `file` stays open for the whole life of the returned map (the
         //    caller keeps the `File` alongside it — see `WriteMapBacking`);
         //  * the file was `set_len(map_size)` so every page in `[0, len)` is
@@ -158,7 +157,7 @@ impl MmapWritable {
         //    after every spill before resolving a spilled page through it
         //    (TXN-71, ADR-0021 B2). So no
         //    `&[u8]` a reader actually dereferences is mutated while borrowed;
-        //  * the env is single-process (D-001): no other process writes/truncates.
+        //  * the env is single-process: no other process writes/truncates.
         let inner = unsafe { memmap2::MmapOptions::new().len(len).map_mut(file)? };
         Ok(MmapWritable { inner })
     }
@@ -221,7 +220,7 @@ impl MmapWritable {
     /// This mints `&mut [u8]` from `&self`: the signature cannot express the
     /// exclusivity it relies on (two calls could alias), so the function is
     /// `unsafe` and the obligation is the **caller's** — the sole sanctioned
-    /// caller is `zerodb-core::dirty` (CLAUDE.md unsafe policy), which must
+    /// caller is `zerodb-core::dirty` (per the unsafe policy), which must
     /// guarantee, exactly as [`MmapWritable::write_at`]'s commit-path caller
     /// does:
     ///
@@ -245,7 +244,7 @@ impl MmapWritable {
     #[must_use]
     // clippy cannot see that this is an `unsafe fn` whose documented contract
     // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
-    // too — verified clippy 1.97); B1's substance is the `unsafe fn` itself.
+    // too); ADR-0021 B1's substance is the `unsafe fn` itself.
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn slice_mut(&self, off: usize, len: usize) -> &mut [u8] {
         let end = off.checked_add(len).expect("map slice overflows usize");

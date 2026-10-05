@@ -1,17 +1,17 @@
-//! Bottom-up B+tree builder — the M1.3 test loader and the **prototype of
-//! milestone 3.4's `Database::bulk_load`** (PLAN §1.3/§3.4). Milestone 1.3.
+//! Bottom-up B+tree builder — the read-path test loader and the **prototype of
+//! a possible future `Database::bulk_load`**.
 //!
 //! Given a stream of **pre-sorted, unique** `(key, value)` pairs it packs leaves
 //! at a configurable fill factor, builds branch levels upward, spills big values
 //! to overflow runs (SPEC 02 §5), and emits a complete env-file image (two meta
 //! slots + data pages) whose `main_db` `DBRecord` points at the built tree. The
 //! result is a byte-for-byte valid file that [`crate::env::open_with_backing`]
-//! opens and the [`crate::btree`] read path (and the M1.12 `check` tool) treat
-//! identically to a write-path tree — which is what lets M1.4 differential-test
-//! the write path against this loader.
+//! opens and the [`crate::btree`] read path (and the `zerodb-tools check` tool)
+//! treat identically to a write-path tree — which is what lets the write path
+//! be differential-tested against this loader.
 //!
-//! It is written to be **promoted, not discarded** (PLAN §1.3): the packing and
-//! upward-build logic is exactly what 3.4 needs; only the page sink changes
+//! It is written to be **promoted, not discarded**: the packing and
+//! upward-build logic is exactly what a bulk loader needs; only the page sink changes
 //! (an in-memory image here; the txn dirty set + writer there).
 //!
 //! Pure logic over a growable `Vec<u8>` page buffer — no I/O, no `unsafe`, so
@@ -365,10 +365,11 @@ fn finalize_image(
 }
 
 // ===========================================================================
-// Streaming builder (PERF-GAP C1) — bounded-memory compaction
+// Streaming builder — bounded-memory compaction (docs/PERF-GAP-VS-LMDB.md,
+// compaction RAM)
 // ===========================================================================
 
-/// Where a streaming build lands its pages (PERF-GAP C1). `zerodb-core` has
+/// Where a streaming build lands its pages. `zerodb-core` has
 /// no I/O policy, so the file-backed implementation lives engine-side
 /// (`zerodb::copy`); [`VecSink`] is the in-memory implementation the batch
 /// wrappers and tests use. Pages may be emitted out of pgno order only for
@@ -471,19 +472,19 @@ struct StreamLevel {
     cur_used: usize,
 }
 
-/// Push-style bottom-up B+tree bulk loader (PERF-GAP C1): the batch
+/// Push-style bottom-up B+tree bulk loader (bounded-memory compaction): the batch
 /// [`build_tree_into`] logic — same greedy fill targets, same
 /// [`fix_branch_groups`] last-two rebalance, same overflow spill rule — but
 /// driven one entry at a time and emitting every finished page straight to a
 /// [`PageSink`]. Peak memory is one leaf scratch frame + one overflow scratch
 /// frame + at most **two child lists per branch level** (≲ 2 pages' worth of
-/// separators each): O(depth × psize), independent of tree size — the batch
-/// path's whole-image + whole-entry-set residency (~2× env size on the
-/// compaction path) is gone.
+/// separators each): O(depth × psize), independent of tree size — where the
+/// batch path holds the whole image and entry set (~2× env size on the
+/// compaction path).
 ///
 /// Contract (as the batch builder): entries pushed in strictly-ascending
-/// unique key order; equality is memcmp (M2.4 scope boundary — the caller
-/// refuses custom-comparator envs).
+/// unique key order; equality is memcmp (custom-comparator scope boundary —
+/// the caller refuses custom-comparator envs).
 pub struct TreeStream<'s, S: PageSink> {
     sink: &'s mut S,
     psize: u32,
@@ -754,7 +755,7 @@ impl<'s, S: PageSink> TreeStream<'s, S> {
     }
 }
 
-/// Streaming multi-DB env-image assembly (PERF-GAP C1): the
+/// Streaming multi-DB env-image assembly (bounded-memory compaction): the
 /// [`build_multi_db_image`] shape — named DBs first, then the main tree with
 /// `F_SUBDATA` catalog records merged in key order, then both meta slots —
 /// but push-driven over a [`PageSink`], with [`TreeStream`]'s bounded memory.
@@ -944,7 +945,7 @@ pub fn build_single_db_image(
 /// (`main_user` = its plain user entries) plus every named DB in `named`, each
 /// referenced from the main catalog by an inline `F_SUBDATA` record (SPEC 02
 /// §6). This is the compaction primitive for `Env::copy_to_file(Enabled)` and
-/// the `zerodb-tools load` reload path (M1.12): every tree is packed bottom-up
+/// the `zerodb-tools load` reload path: every tree is packed bottom-up
 /// and densely, dropping fragmentation and all stale GC state.
 ///
 /// Build order: each named DB's tree is packed first (so its root pgno is
@@ -1214,7 +1215,7 @@ mod tests {
         assert_eq!(crate::check::check_image(&img, PS), Vec::<String>::new());
     }
 
-    /// PERF-GAP C1 referee: the streaming builder against the batch builder,
+    /// Bounded-memory compaction referee: the streaming builder against the batch builder,
     /// same mixed corpus (multi-level trees, single-leaf tree, empty named
     /// DBs on both sides of the user keyspace, multi-page overflow values).
     /// Layout (pgno order) legitimately differs; everything semantic must

@@ -1,18 +1,15 @@
-//! Milestone 1.4 coverage pass: deep-tree rebalance storms. Op sequences that
-//! force multi-level splits (depth >= 3, confirmed independently in
-//! `crates/zerodb/tests/deep_tree_rebalance.rs` using `TxnRead::main_record`,
+//! Deep-tree rebalance storms: op sequences that force multi-level splits
+//! (depth >= 3, confirmed in `crates/zerodb/tests/deep_tree_rebalance.rs`,
 //! since the `Op` model has no depth-introspection op) and then cascade
 //! deletes back down through merges/borrows to empty, at psize 4096 (the
 //! `ZerodbEngine` fixed page size). Interleaves puts/deletes crossing
 //! SPEC 03 §10 `FILL_THRESHOLD`/`MIN_KEYS` boundaries in both directions.
-//! `ZerodbEngine::debug_check_image` already runs the SPEC 03 §11 invariant
-//! walk after every commit (see `write_differential.rs`'s module docs) — no
-//! extra plumbing needed here.
+//! `ZerodbEngine::debug_check_image` runs the SPEC 03 §11 invariant walk after
+//! every commit.
 //!
 //! Keys are ~500 bytes (near the SPEC 01 §S4 511-byte max) so branch fanout is
 //! small (~7 entries/page at 4 KiB), reaching depth 3 in a few hundred entries
-//! instead of tens of thousands — keeps the whole file's C-LMDB-linked runtime
-//! well under the 60 s coverage-pass budget.
+//! instead of tens of thousands, which keeps the C-LMDB-linked runtime short.
 
 use zerodb_oracle::{run, DbName, Key, LmdbEngine, Op, Value, ZerodbEngine};
 
@@ -48,8 +45,7 @@ fn deep_split_cascade_then_delete_to_empty() {
     let mut ops = setup();
     // Enough wide-keyed entries to push past depth 2 (branch-of-branches):
     // ~7 entries/leaf and ~7 entries/branch at this key size means >~49
-    // leaves forces a second branch level; 400 entries comfortably clears it
-    // (independently confirmed in deep_tree_rebalance.rs).
+    // leaves forces a second branch level; 400 entries comfortably clears it.
     let n = 400u32;
     for i in 0..n {
         ops.push(Op::Put {

@@ -1,21 +1,21 @@
-//! M1.5 acceptance: file-size parity with the LMDB fork under insert/delete
-//! churn (PLAN §1.5; ADR-0005 D5, bands approved 2026-07-16).
+//! GC acceptance: file-size parity with the LMDB fork under insert/delete
+//! churn (ADR-0005 D5).
 //!
-//! Two identical seeded workloads drive the fork (via heed, psize fixed 4096)
-//! and zerodb (psize 4096) side by side; `real_disk_size` is recorded after
+//! Two identical seeded workloads drive the fork (via heed, at the OS page
+//! size) and zerodb (psize 4096) side by side; `real_disk_size` is recorded after
 //! every commit, giving two growth curves. Assertions:
 //!
 //! 1. **Boundedness** (the real acceptance): zerodb's curve reaches a steady
 //!    state — `size(last) <= 1.05 x size(half)`.
 //! 2. **Tolerance band**: final steady-state zerodb size within
 //!    `[0.5x, 1.5x]` of LMDB's for the general (overflow-bearing) workload,
-//!    and within `+/-25%` for the no-overflow variant. The general band is
+//!    and within `[0.60x, 1.25x]` for the no-overflow variant. The general band is
 //!    asymmetric-generous because of (i) 32-vs-16-byte page/overflow headers,
 //!    (ii) different split-fill policies, and (iii) — dominant — GC-21's
 //!    within-PIL-only run search vs the fork's cross-entry `me_pghead`
 //!    merging, which lets LMDB reuse fragmented space for overflow runs where
-//!    zerodb extends (spec-sanctioned; Phase 3.1 fixes it). The no-overflow
-//!    variant removes (iii), hence the tighter band.
+//!    zerodb extends (spec-sanctioned). The no-overflow variant removes (iii),
+//!    hence the tighter band.
 //!
 //! `Env::real_disk_size` parity is also asserted structurally: zerodb's value
 //! must equal the data file's `fstat` length (SPEC 00 row 18 / GC-22).
@@ -174,7 +174,7 @@ fn run_zerodb(dir: &Path, cycles: &[Cycle]) -> Vec<u64> {
 }
 
 fn assert_curves(tag: &str, lmdb: &[u64], zdb: &[u64], lo: f64, hi: f64) {
-    // 1. Boundedness (flatness), approved 1.05x half-to-full.
+    // 1. Boundedness (flatness): 1.05x half-to-full.
     let half = zdb[CYCLES / 2] as f64;
     let last = zdb[CYCLES - 1] as f64;
     assert!(
@@ -207,7 +207,7 @@ fn churn_parity_general() {
     assert_curves("general", &lmdb, &zdb, 0.5, 1.5);
 }
 
-/// No-overflow churn (values 50..800 B, always inline): band +/-25%.
+/// No-overflow churn (values 50..800 B, always inline): band `[0.60x, 1.25x]`.
 #[test]
 fn churn_parity_no_overflow() {
     let cycles = make_cycles(0x5EED_0002, false);
@@ -215,9 +215,8 @@ fn churn_parity_no_overflow() {
     let zdir = TempDir::new("z-inl");
     let lmdb = run_lmdb(ldir.path(), &cycles);
     let zdb = run_zerodb(zdir.path(), &cycles);
-    // Lower edge 0.60 (was 0.75): ratified 2026-07-16 with the SPEC 03 §6.4
-    // insert-point split amendment (ADR-0005 D5 addendum, option a). The edge is
-    // a sanity bound, not the acceptance — bounded growth + the upper edge are.
+    // Lower edge 0.60 (ADR-0005 D5 addendum; SPEC 03 §6.4 insert-point split)
+    // is a sanity bound, not the acceptance — bounded growth + the upper edge are.
     // zerodb legitimately packs ascending churn tighter than the fork, and the
     // fork's page size here is the OS page size (16 KiB on macOS ARM) vs
     // zerodb's pinned 4 KiB, skewing the ratio down platform-dependently; on a

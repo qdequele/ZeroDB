@@ -20,7 +20,7 @@ pub enum Mode {
     NoMetaSync,
     /// `NO_SYNC`: no barriers; structural consistency only under ordered
     /// writeback (REC-11) — verified under the ordered sub-model, only
-    /// characterized under the adversarial one (ratified OQ3).
+    /// characterized under the adversarial one (ADR-0008 OQ3).
     NoSync,
     /// `WRITE_MAP | MAP_ASYNC`: async msync — same window as `NO_SYNC`
     /// (REC-9/REC-11).

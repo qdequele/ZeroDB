@@ -17,14 +17,12 @@
 //! heed declares `unsafe impl Send for RoTxn<WithoutTls>` and `RwTxn: Send`, and
 //! both are load-bearing: consumers move `RoTxn<WithoutTls>` (nested readers,
 //! `static_read_txn`) onto rayon/async threads, and milli moves `&mut RwTxn`
-//! into a rayon `install`/join scope during indexing. We reproduce both. The
-//! reader and nested variants are genuinely `Send` (ZeroDB's TXN-13). The
-//! `InnerTxn::Rw` variant owns a `zerodb::RwTxn` whose write-mutex guard is
-//! `!Send`; asserting it sendable mirrors heed's own bet on its `MDB_txn` — the
-//! single-writer txn is handed to a *joined* worker, so the guard is locked and
-//! dropped on the owning thread while only mutable access crosses into the
-//! rayon-join-ordered worker. `RwTxn` inherits `Send` from its sole
-//! `RoTxn<WithoutTls>` field.
+//! into a rayon `install`/join scope during indexing. We reproduce both. Every
+//! variant is genuinely `Send` (ZeroDB's TXN-13): the reader and nested ones
+//! by construction, and `InnerTxn::Rw` because `zerodb::RwTxn`'s writer lock
+//! is thread-agnostic (SPEC 04 TXN-6), so the txn may be committed or dropped
+//! on any thread. `RwTxn` inherits `Send` from its sole `RoTxn<WithoutTls>`
+//! field.
 
 use std::marker::PhantomData;
 use std::ops::Deref;
@@ -36,7 +34,7 @@ use crate::Result;
 // ---------------------------------------------------------------------------
 
 /// Read transactions opened with Thread Local Storage (TLS) — `!Send`. A
-/// compile-only shim in Phase 1 (SPEC 00 second table: `WithTls` is SHOULD);
+/// compile-only shim (SPEC 00 second table: `WithTls` is SHOULD);
 /// ZeroDB's read txns are universally NOTLS, so `WithTls` behaves like
 /// `WithoutTls` at runtime (ADR-0003 Q5).
 #[derive(Debug, PartialEq, Eq)]
@@ -97,13 +95,12 @@ pub struct RoTxn<'e, T = AnyTls> {
 
 // SAFETY (SPEC 04 TXN-13; heed parity, see module docs): every variant of
 // `InnerTxn` is `Send` by ZeroDB's own guarantees — `zerodb::RoTxn`,
-// `zerodb::NestedRoTxn`, and (since the 2026-09-09 hardening) `zerodb::RwTxn`,
-// whose writer lock is a thread-agnostic occupied flag (`WriterLock`, SPEC 04
-// TXN-6) rather than a std `MutexGuard`, so dropping or committing it on
-// another thread is sound. This impl therefore adds no capability the auto
-// trait would not derive; it exists because the `T` marker parameter is not
-// `Send`-bounded and heed spells the impl out the same way. No thread-affinity
-// argument is relied on any more.
+// `zerodb::NestedRoTxn`, and `zerodb::RwTxn`, whose writer lock is a
+// thread-agnostic occupied flag (`WriterLock`, SPEC 04 TXN-6) rather than a std
+// `MutexGuard`, so dropping or committing it on another thread is sound. This
+// impl therefore adds no capability the auto trait would not derive; it exists
+// because the `T` marker parameter is not `Send`-bounded and heed spells the
+// impl out the same way. No thread-affinity argument is relied on.
 unsafe impl Send for RoTxn<'_, WithoutTls> {}
 
 impl<'e, T> RoTxn<'e, T> {
@@ -136,12 +133,11 @@ impl<'e, T> RoTxn<'e, T> {
         Ok(())
     }
 
-    /// This transaction's id (SPEC 00 second table — SHOULD, **landed in
-    /// milestone 2.7**; `mdb_txn_id`).
+    /// This transaction's id (SPEC 00 second table — SHOULD; `mdb_txn_id`).
     ///
     /// For a read txn this is the **pinned snapshot's** txnid — the commit
     /// this reader sees, which is also what `Env::reader_list` reports for its
-    /// slot (M2.2). For a write txn it is the id the txn *will* publish when
+    /// slot. For a write txn it is the id the txn *will* publish when
     /// it commits. A nested read txn reports its parent write txn's id, since
     /// that is the state it observes (SPEC 04 §5).
     #[must_use]
@@ -153,8 +149,8 @@ impl<'e, T> RoTxn<'e, T> {
         };
         // heed types this as `usize` (`mdb_txn_id` returns `size_t`); ZeroDB
         // txnids are `u64`. On a 32-bit target this would truncate, but the
-        // supported targets (CLAUDE.md: linux-aarch64 primary, linux-x86_64,
-        // macOS aarch64) are all 64-bit, so the cast is lossless there.
+        // supported targets (linux-aarch64, linux-x86_64, macOS aarch64) are
+        // all 64-bit, so the cast is lossless there.
         id as usize
     }
 }
@@ -195,10 +191,8 @@ impl<'a> Deref for RoTxn<'a, WithoutTls> {
 /// via the `unsafe impl Send for RoTxn<WithoutTls>` above (its only field), and
 /// that is genuinely sound: `zerodb::RwTxn` holds a thread-agnostic writer lock
 /// (`WriterLock`, SPEC 04 TXN-6), so the transaction may be dropped, aborted or
-/// committed on any thread — pinned by `zerodb/tests/hostile_file.rs`. (Before
-/// 2026-09-09 the engine held a std `MutexGuard` there and the impl rested on
-/// the caller dropping on the owning thread.) `Sync` too, so `&RwTxn` — hence a
-/// nested reader — is `Send` (SPEC 04 §5).
+/// committed on any thread — pinned by `zerodb/tests/hostile_file.rs`. `Sync`
+/// too, so `&RwTxn` — hence a nested reader — is `Send` (SPEC 04 §5).
 pub struct RwTxn<'p> {
     pub(crate) txn: RoTxn<'p, WithoutTls>,
 }

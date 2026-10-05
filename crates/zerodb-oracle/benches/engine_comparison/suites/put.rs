@@ -11,7 +11,8 @@
 //!   and at 2×page crosses into overflow pages.
 //! * `api/{plain,reserved}` — the same bytes written through `put` and through
 //!   `MDB_RESERVE`. milli serializes documents through the reserved path, so a
-//!   gap here is a gap in milli's hottest write call (PERF-GAP B6, issue #10).
+//!   gap here is a gap in milli's hottest write call (adapter `ReservedSpace`
+//!   in docs/PERF-GAP-VS-LMDB.md, issue #10).
 //! * `over/{same_size,grow}` — overwriting into a populated tree. Same-size can
 //!   be replaced where it sits; growing may force the page to split. The delta
 //!   is that split.
@@ -19,7 +20,7 @@
 //!   large free-list entry (a contiguous half of a 300k-key tree was deleted
 //!   first). Every other rung starts with an empty or tiny free list, so this
 //!   is the only one where the cost of drawing reused pages scales with the
-//!   entry's length (roadmap #1, SPEC 05 GC-19/20).
+//!   entry's length (the O(1) free-list front draw, SPEC 05 GC-19/20).
 
 use criterion::{BatchSize, Criterion, Throughput};
 

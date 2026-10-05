@@ -1,21 +1,15 @@
-//! Milestone 2.4 — custom key comparators.
+//! Custom key comparators.
 //!
 //! ## Why there is no differential half, and what replaces it
 //!
-//! Phase 2's acceptance line asks for "differential semantics tests where LMDB
-//! has the feature". LMDB *has* `mdb_set_compare` — but **heed never calls
-//! it**, and the oracle's LMDB engine drives C LMDB *through heed 0.22.1*
-//! (`zerodb-oracle/src/lmdb.rs`, ADR-0001). There is therefore no way to make
-//! the oracle's LMDB side use a custom comparator without either (a) bypassing
-//! heed to call `lmdb_master_sys::mdb_set_compare` on a raw dbi, which means
-//! standing up a second, hand-rolled LMDB driver whose txn/dbi lifetimes are
-//! managed outside the harness that the rest of Phase 1 was validated with, or
-//! (b) changing the oracle's engine abstraction. Neither is worth it here,
-//! because a differential would only be checking that *our* comparator and
-//! *their* comparator — the same closure, expressed twice — sort the same way.
-//! That is a tautology, not a parity risk: the parity risk in this milestone is
-//! entirely about whether **every** engine path routes through the comparator,
-//! which a cross-engine diff would not expose any better than the tests below.
+//! LMDB *has* `mdb_set_compare`, but **heed never calls it**, and the
+//! oracle's LMDB engine drives C LMDB *through heed 0.22.1*
+//! (`zerodb-oracle/src/lmdb.rs`, ADR-0001). A differential would need a
+//! second, hand-rolled LMDB driver calling `mdb_set_compare` on a raw dbi, and
+//! would only check that the same closure, expressed twice, sorts the same
+//! way — a tautology. The real parity risk is whether **every** engine path
+//! routes through the comparator, which a cross-engine diff would not expose
+//! any better than the tests below.
 //!
 //! So this file pins the property that actually matters, three ways:
 //!
@@ -29,8 +23,6 @@
 //!   3. **The tree is still structurally valid**, checked by walking the
 //!      committed image, plus a memcmp control DB in the same env that must be
 //!      unaffected.
-//!
-//! Do not weaken these (CLAUDE.md rule 2).
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};

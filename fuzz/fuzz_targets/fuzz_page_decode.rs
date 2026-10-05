@@ -1,5 +1,5 @@
 #![no_main]
-//! Fuzz target `fuzz_page_decode` (PLAN §1.1 acceptance).
+//! Fuzz target `fuzz_page_decode`.
 //!
 //! Feeds arbitrary bytes to the SPEC 02 page decoder under a page-size sweep
 //! (4096 / 8192 / 65536), forcing every page-type interpretation, and walks
@@ -53,12 +53,10 @@ fn walk_branch(branch: &BranchRef<'_>) {
         let _ = branch.key(i);
         let _ = branch.child_pgno(i);
     }
-    // H2 regression (2026-09 security review): the descent dereferences
+    // Regression (H2, SPEC 02 §4.1): the descent dereferences
     // `child_pgno(child_index(..))` unconditionally, so exercise that exact
-    // pair on every constructed view — a zero-key branch used to construct
-    // and then panic here (`child_index` returns 0, `child_pgno(0)` asserts).
-    // Since the fix a zero-child branch never constructs (EmptyBranch), so
-    // these calls are total.
+    // pair on every constructed view. A zero-child branch never constructs
+    // (`EmptyBranch`), so these calls must be total.
     let i = branch.child_index(b"probe");
     let _ = branch.child_pgno(i);
     let i0 = branch.child_index(&[]);

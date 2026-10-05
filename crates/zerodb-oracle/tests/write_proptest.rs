@@ -1,5 +1,5 @@
-//! Milestone 1.4 randomized **write-workload** differential (PLAN §1.4
-//! acceptance: randomized single-threaded put/del/commit/abort workloads).
+//! Randomized **write-workload** differential (write-path acceptance:
+//! randomized single-threaded put/del/commit/abort workloads).
 //!
 //! Unlike `read_proptest` (raw `decode_ops` bytes, whose op density is
 //! whatever `Arbitrary` yields), this generator is **write-biased and

@@ -1,4 +1,4 @@
-//! ADR-0010 / D-012 — `EnvOpenOptions::data_file_name` on the native engine.
+//! ADR-0010 — `EnvOpenOptions::data_file_name` on the native engine.
 //!
 //! The engine keeps `zerodb.dat` as its default and resolves the name **once**,
 //! at open, with **no fallback probing**: it opens exactly the name it was
@@ -66,8 +66,7 @@ fn get(env: &Env, k: &[u8]) -> Option<Vec<u8>> {
     db.get(&rtxn, k).unwrap().map(<[u8]>::to_vec)
 }
 
-/// Regression: the native default is unchanged — a plain `open` creates
-/// `zerodb.dat` and nothing else.
+/// The native default: a plain `open` creates `zerodb.dat` and nothing else.
 #[test]
 fn native_default_is_zerodb_dat() {
     let dir = TempDir::new();
@@ -151,7 +150,7 @@ fn two_names_are_two_independent_envs() {
 }
 
 /// A name that is not a single path component is rejected at open with
-/// `Io(InvalidInput)` — the D-006/D-010 open-time taxonomy. It must never be
+/// `Io(InvalidInput)` — the open-time argument-rejection taxonomy. It must never be
 /// able to name a file outside the env directory.
 #[test]
 fn invalid_names_are_invalid_input() {

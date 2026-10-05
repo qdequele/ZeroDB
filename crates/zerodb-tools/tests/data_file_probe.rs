@@ -1,6 +1,6 @@
-//! ADR-0010 / D-012 — the tools' two-name data-file probe.
+//! ADR-0010 — the tools' two-name data-file probe.
 //!
-//! Since ADR-0010 an env directory holds `zerodb.dat` (native) or `data.mdb`
+//! An env directory holds `zerodb.dat` (native) or `data.mdb`
 //! (created through the `heed-zerodb` adapter, so Meilisearch's hardcoded
 //! `data.mdb` paths work). The read tools must work on either without the
 //! operator knowing which stack wrote the env — and must **refuse** a directory
@@ -61,9 +61,8 @@ fn tools_read_a_native_named_env() {
     assert!(clean, "check report: {report}");
 }
 
-/// The regression this ADR exists for: `stat`/`dump`/`check` all work on an
-/// **adapter-created** env (`data.mdb`). Before the two-name probe these
-/// reported "no zerodb env here".
+/// Regression: `stat`/`dump`/`check` all work on an **adapter-created** env
+/// (`data.mdb`), rather than reporting "no zerodb env here".
 #[test]
 fn tools_read_an_adapter_named_env() {
     let dir = tmp_dir("adapter");

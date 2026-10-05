@@ -12,15 +12,13 @@
 //!   `&mut` on the dirty store (TXN-39/41/42);
 //! - the writer's whole-map `&[u8]` is re-derived at every spill (ADR-0021
 //!   B2), so no stale shared borrow is ever read at locations an in-place
-//!   write touched (TXN-71) — the exact Tree-Borrows hazard the ADR review
-//!   flagged;
+//!   write touched (TXN-71) — the Tree-Borrows hazard ADR-0021 B2 names;
 //! - readers holding snapshots across in-place commits, nested read children
 //!   of the writer, `put_reserved` closures, the general split's scratch
 //!   copy and abort-by-drop all stay inside the discipline.
 //!
 //! Sized for miri (hundreds of ops, 4 KiB pages, small map). The native
-//! `cargo test` run executes it too, as a fast smoke. Do not weaken
-//! (CLAUDE.md rule 2).
+//! `cargo test` run executes it too, as a fast smoke.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

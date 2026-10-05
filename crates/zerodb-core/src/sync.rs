@@ -4,7 +4,7 @@
 //! (`just loom`) — the **same source** is model-checked and shipped
 //! (ADR-0006 §loom).
 //!
-//! Scope: only `crate::readers`, `crate::nested` (the M1.9 child counter,
+//! Scope: only `crate::readers`, `crate::nested` (the nested-txn child counter,
 //! ADR-0007 D3), `crate::stamps` (the ADR-0018 slot seqlock) and the
 //! `EnvInner` fields they own import from here. The rest
 //! of the crate uses `std::sync` directly — loom tests drive the

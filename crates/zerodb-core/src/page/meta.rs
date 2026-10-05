@@ -2,7 +2,8 @@
 //!
 //! Pages 0 and 1 are the double-buffered meta slots. Each carries the common
 //! header (`flags = P_META`) followed by the meta body, and is protected by a
-//! mandatory CRC32C over its first [`META_CONTENT_LEN`] bytes. This module owns
+//! mandatory CRC32C over its first [`META_CONTENT_LEN`] bytes plus its
+//! free-list annex ids. This module owns
 //! the full field map ([`DBRecord`], [`MetaPage`]), the CRC coverage, the
 //! validation predicate ([`MetaPage::validate`], the single owner of SPEC 02
 //! §3.2's numbered list), and the double-buffer selection formula
@@ -76,9 +77,9 @@ pub struct DBRecord {
     pub entries: u64,
     /// Tree height (0 = empty, 1 = root-is-leaf).
     pub depth: u16,
-    /// Persistent DB flags — reserved (Phase 2.8); 0 in Phase 1.
+    /// Persistent DB flags — reserved for DUPSORT/DUPFIXED; always 0 today.
     pub flags: u16,
-    /// Reserved (Phase 2.8 DUPFIXED); 0 in Phase 1.
+    /// Reserved (DUPFIXED); always 0 today.
     pub leaf2_ksize: u32,
 }
 
@@ -159,7 +160,7 @@ pub struct MetaPage {
     pub format_version: u32,
     /// The DB's page size (authoritative record).
     pub page_size: u32,
-    /// Persistent env flags (reserved; 0 in Phase 1).
+    /// Persistent env flags (reserved; always 0 today).
     pub env_flags: u32,
     /// Configured map size in bytes.
     pub map_size: u64,
@@ -368,7 +369,7 @@ impl MetaPage {
     }
 }
 
-/// The verdict of validating one meta slot (SPEC 02 §3.2). The env layer (M1.2)
+/// The verdict of validating one meta slot (SPEC 02 §3.2). The env layer
 /// maps these to `MdbError` values; this crate never panics on a bad slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetaValidity {
@@ -396,7 +397,7 @@ pub enum MetaValidity {
     BadCrc {
         /// The stored `meta_crc`.
         stored: u32,
-        /// The recomputed CRC over `[0, 168)`.
+        /// The recomputed CRC over `[0, 172)` ∪ the annex ids (SPEC 02 §3.3).
         computed: u32,
     },
 }
@@ -431,8 +432,8 @@ pub enum MetaChoice {
     },
     /// Exactly one slot was valid (torn-meta recovery): it wins regardless of
     /// txnid, and — because there is no older valid slot — regardless of
-    /// `prev_snapshot`. See the M1.1 report note on REC-2 (pending human
-    /// ratification of the one-valid + `prev_snapshot` policy).
+    /// `prev_snapshot`. See SPEC 06 REC-2 for how the env layer treats one
+    /// valid slot + `prev_snapshot`.
     OnlyOne {
         /// The chosen slot index (0 or 1).
         chosen: usize,

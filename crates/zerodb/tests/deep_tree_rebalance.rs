@@ -1,13 +1,10 @@
-//! Milestone 1.4 coverage pass, area 1: independent confirmation that the
-//! wide-key geometry used by
+//! Confirms that the wide-key geometry used by
 //! `crates/zerodb-oracle/tests/write_rebalance_differential.rs` actually
 //! reaches depth >= 3 (branch-of-branches), and that the delete cascade walks
-//! all the way back down to an empty, depth-0 tree. The `Op` model the
-//! oracle differential drives has no depth-introspection op, so this is
-//! asserted here directly against `TxnRead::main_record` (same technique as
-//! `write_api.rs`'s `split_exact_fit_boundary_*`), on a real file-backed env
-//! so `check::check_image` runs at every step (CLAUDE.md rule 1/2: never
-//! weaken, so every commit is validated).
+//! all the way back down to an empty, depth-0 tree. The oracle's `Op` model
+//! has no depth-introspection op, so depth is asserted here against
+//! `TxnRead::main_record`, on a file-backed env so `check::check_image`
+//! validates every commit.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -1,16 +1,15 @@
-//! Roadmap #10 — `free_page_count` counts from each GC entry's PIL `count`
-//! prefix (`pil_count`) instead of decoding the ids (`pil_decode`) just to take
-//! their length (SPEC 05 GC-23).
+//! `free_page_count` counts from each GC entry's PIL `count` prefix
+//! (`pil_count`) rather than decoding the ids (`pil_decode`) just to take their
+//! length (SPEC 05 GC-23).
 //!
 //! `free_page_count`'s body is a fold of one per-entry function over the GC
-//! cursor walk, and the walk itself is unchanged. So the arithmetic is
-//! preserved exactly iff, for every entry value, `pil_count` returns the same
-//! number the old `pil_decode(..).len()` did, and rejects the same malformed
-//! values (a rejection is what makes `free_page_count` return the identical
-//! `MdbError::Invalid`). These tests pin that equivalence — including the
-//! zero-ids entry and the malformed-length entry the task calls out — over an
-//! entry list standing in for a GC tree's several entries. The real B+tree walk
-//! is covered end to end in `crates/zerodb/tests/non_free_fragmented.rs`.
+//! cursor walk, so its arithmetic is exact iff, for every entry value,
+//! `pil_count` returns the same number as `pil_decode(..).len()` and rejects
+//! the same malformed values (a rejection is what makes `free_page_count`
+//! return `MdbError::Invalid`). These tests pin that equivalence — including a
+//! zero-ids entry and a malformed-length entry — over an entry list standing
+//! in for a GC tree's several entries. The real B+tree walk is covered end to
+//! end in `crates/zerodb/tests/non_free_fragmented.rs`.
 
 use proptest::prelude::*;
 use zerodb_core::page::geometry::{pil_count, pil_decode};
@@ -27,7 +26,7 @@ fn make_pil(ids: &[u64]) -> Vec<u8> {
     v
 }
 
-/// The old decode-based per-entry contribution: decode the ids, take the length.
+/// The decode-based per-entry contribution: decode the ids, take the length.
 fn decode_len(bytes: &[u8]) -> Option<u64> {
     pil_decode(bytes).map(|ids| ids.len() as u64)
 }
@@ -62,8 +61,8 @@ fn count_matches_decode_over_gc_entries() {
 #[test]
 fn malformed_pil_rejected_like_decode() {
     // Each of these is malformed in the length/count shape. `free_page_count`
-    // turns a `None` here into `MdbError::Invalid`, exactly as it did through
-    // `pil_decode` before — so both codecs MUST reject the same bytes.
+    // turns a `None` here into `MdbError::Invalid`, so both codecs MUST reject
+    // the same bytes.
     let bad: &[Vec<u8>] = &[
         vec![],        // empty (< 8)
         vec![0u8; 4],  // shorter than the prefix
@@ -101,8 +100,8 @@ fn cfg() -> ProptestConfig {
 proptest! {
     #![proptest_config(cfg())]
 
-    /// Over ARBITRARY bytes (well-formed or not), `pil_count` agrees with the
-    /// old `pil_decode(..).len()` on both the value and the accept/reject
+    /// Over ARBITRARY bytes (well-formed or not), `pil_count` agrees with
+    /// `pil_decode(..).len()` on both the value and the accept/reject
     /// decision — the exact substitution `free_page_count` makes.
     #[test]
     fn count_equiv_decode_arbitrary(bytes in proptest::collection::vec(any::<u8>(), 0..80)) {

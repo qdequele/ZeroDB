@@ -1,5 +1,4 @@
 //! Nested read transactions over a write txn (SPEC 04 §5, ADR-0007).
-//! Milestone 1.9.
 //!
 //! A [`NestedRoTxn`] is a read-only child of the active [`RwTxn`] that sees the
 //! writer's **uncommitted, in-progress state** (the fork's ITS#10395 feature,
@@ -11,10 +10,10 @@
 //! ## The safety story (ADR-0007 D1, zero `unsafe`)
 //!
 //! The child holds a real `&'p RwTxn` — so the borrow checker itself enforces
-//! writer quiescence (TXN-29/30, D-005): while any child is alive, no
+//! writer quiescence (TXN-29/30; see docs/DIVERGENCES.md): while any child is alive, no
 //! `&mut RwTxn` method can be called. The child is [`Send`] **by compiler
 //! derivation**: `&RwTxn: Send ⇔ RwTxn: Sync`, and `RwTxn` is `Sync` as a
-//! **standing asserted contract** (ADR-0007 Q1, ratified 2026-07-16): it has
+//! **standing asserted contract** (ADR-0007 Q1): it has
 //! no interior mutability on any `&self` path — the compile-time assertions in
 //! this module's tests turn any future violation into a build failure, not an
 //! unsoundness. There is no `unsafe impl` anywhere in this design (contrast
@@ -34,7 +33,7 @@
 //! opened in one paused window sees the identical state — there is no window
 //! in which snapshotting could differ from delegating.
 //!
-//! ## The runtime backstop (TXN-29, D-005) and its memory ordering
+//! ## The runtime backstop (TXN-29) and its memory ordering
 //!
 //! The counter exists for the world where the borrow checker was bypassed
 //! (`unsafe`/FFI at an adapter boundary — e.g. the oracle's lifetime-erased
@@ -64,7 +63,7 @@ use crate::rotxn::{DbSel, TxnRead};
 use crate::rwtxn::RwTxn;
 use crate::sync::{AtomicUsize, Ordering};
 
-/// The live-child counter on a write txn (SPEC 04 TXN-31 as ratified by
+/// The live-child counter on a write txn (SPEC 04 TXN-31,
 /// ADR-0007 D3: `AtomicUsize`, **not** `Cell` — a `Cell` would destroy
 /// `RwTxn: Sync` and children really do drop on worker threads at all six
 /// consumer call sites). Factored into its own type so the loom L6 model
@@ -88,7 +87,7 @@ impl ChildCounter {
     /// A child dropped. `Release`: pairs with the `Acquire` in
     /// [`ChildCounter::live`] so every read the child performed
     /// happens-before the writer observes quiescence and resumes mutating
-    /// (SPEC 04 TXN-31 as amended: this Release/Acquire pair is normative by
+    /// (SPEC 04 TXN-31: this Release/Acquire pair is normative by
     /// per-site comment — loom L6a machine-checks the protocol shape but cannot
     /// detect an all-Relaxed weakening of this edge; see the mutation-check
     /// record below).
@@ -117,7 +116,7 @@ impl ChildCounter {
 /// (TXN-29 → [`MdbError::BadTxn`](crate::error::MdbError)). The child cannot
 /// outlive its parent (TXN-31/33).
 ///
-/// Covariant in `'p` (like heed's `RoTxn`): the M1.13 adapter narrows a
+/// Covariant in `'p` (like heed's `RoTxn`): the heed adapter narrows a
 /// child's lifetime when wrapping it.
 pub struct NestedRoTxn<'p> {
     parent: &'p RwTxn<'p>,
@@ -185,26 +184,24 @@ impl TxnRead for NestedRoTxn<'_> {
     }
     fn validated_pages(&self) -> Option<&crate::btree::ValidatedPages<'_>> {
         // The parent writer is immutably borrowed for this nested reader's
-        // whole life, so its map-gated memo stays sound here (PERF-GAP A2).
+        // whole life, so its map-gated memo stays sound here.
         self.parent.validated_pages()
     }
 }
 
 // ---------------------------------------------------------------------------
-// loom L6 (ADR-0007 D3/Q5; CLAUDE.md rule: a loom test for every new
-// lock-free interaction). Run via `just loom` (RUSTFLAGS="--cfg loom", tests
-// filtered `loom_`). Models are tiny (2 spawned threads + main) so loom
+// loom L6 (ADR-0007 D3/Q5). Run via `just loom` (RUSTFLAGS="--cfg loom",
+// tests filtered `loom_`). Models are tiny (2 spawned threads + main) so loom
 // explores them exhaustively.
 //
-// Mutation-check record (M1.9, following the M1.8 discipline; mutation
-// reverted): weakening BOTH counter orderings to `Relaxed`
+// Mutation-check record: weakening BOTH counter orderings to `Relaxed`
 // (`release`/`live`) is NOT caught by L6a/L6b — the violating execution is
 // **load-buffering-shaped** (the child's frame load would have to read a
 // *future* store, one that executes later in every loom interleaving because
 // the writer's store is control-dependent on observing the decrements), and
 // loom 0.7 explores store buffering via stale values only, never
-// future-store reads (the same explorer limitation class recorded for M1.8's
-// withdrawn L2b, tokio-rs/loom#180 family). The weakening is nevertheless
+// future-store reads (the explorer limitation recorded in the reader table's
+// mutation-check record, tokio-rs/loom#180 family). The weakening is nevertheless
 // REAL on AArch64: without Release, the child's plain frame load may be
 // satisfied after its younger relaxed RMW decrement becomes globally visible
 // (load→store reordering is architecturally allowed), so the writer could
@@ -329,14 +326,8 @@ mod tests {
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
 
-    /// The ADR-0007 Q1 standing contract, machine-enforced (risk R2): `RwTxn`
-    /// stays `Sync` (no interior mutability on `&self` paths) and therefore
-    /// `NestedRoTxn` — a `&RwTxn` newtype — is `Send` **by compiler
-    /// derivation**, with no `unsafe impl`. If a future `RwTxn` field breaks
-    /// `Sync`, this fails to build (soundness is never at stake — only the
-    /// build).
     /// ADR-0007 D6: `NestedRoTxn<'p>` covariance in `'p` is a design
-    /// requirement for the M1.13 heed adapter (heed returns a plain covariant
+    /// requirement for the heed adapter (heed returns a plain covariant
     /// `RoTxn<'a>`). This function only compiles while the type stays
     /// covariant — an invariant-making field (`fn(&'p _)`, `Cell<&'p _>`, …)
     /// breaks the build here, not silently in the adapter.
@@ -345,6 +336,12 @@ mod tests {
         x
     }
 
+    /// The ADR-0007 Q1 standing contract, machine-enforced (risk R2): `RwTxn`
+    /// stays `Sync` (no interior mutability on `&self` paths) and therefore
+    /// `NestedRoTxn` — a `&RwTxn` newtype — is `Send` **by compiler
+    /// derivation**, with no `unsafe impl`. If a future `RwTxn` field breaks
+    /// `Sync`, this fails to build (soundness is never at stake — only the
+    /// build).
     #[test]
     fn rwtxn_sync_contract_and_child_send() {
         assert_sync::<RwTxn<'static>>();
@@ -460,10 +457,8 @@ mod tests {
         let env = mem_env(PS, MAP);
         let db = env.main_database();
         let mut txn = env.write_txn().unwrap();
-        // Drive the txn into the errored state: an oversized-key put fails
-        // *validation* (not errored)… so instead force MapFull by exhausting
-        // the tiny map — cheaper: use the documented errored path via a
-        // failed mid-mutation. Simplest deterministic route: MapFull.
+        // Try to drive the txn into the errored state with a map-sized value
+        // (MapFull).
         let huge = vec![0u8; MAP as usize]; // provably exceeds the map
         match db.put(&mut txn, b"huge", &huge) {
             Err(_) => {}

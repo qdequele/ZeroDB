@@ -193,7 +193,8 @@ macro_rules! bench_backend {
             /// `range_mut` + `del_current`, the loop milli writes at each of
             /// its nine `del_current` call sites. Distinct from
             /// `delete_range`, which materialises the key set and issues point
-            /// deletes: this is the path PERF-GAP B8a is about, and the only
+            /// deletes: this is the path the `del_current` re-descent item in
+            /// docs/PERF-GAP-VS-LMDB.md is about, and the only
             /// rung that exercises post-delete cursor position (SPEC 03 §5.4a).
             pub fn cursor_drain(env: &BEnv, db: Db, keys: &[Vec<u8>], _val: &[u8]) {
                 let (Some(lo), Some(hi)) = (keys.first(), keys.last()) else {
@@ -417,8 +418,7 @@ macro_rules! bench_backend {
             /// done within a fraction of a full scan rather than up to one whole
             /// scan late. Not part of `Backend`: it exists only to give
             /// `writer_under_readers`'s reader threads a responsive stop
-            /// condition, and it is generated identically for both engines by
-            /// this same macro body.
+            /// condition.
             fn scan_chunked_until_stop(
                 env: &BEnv,
                 db: Db,
@@ -507,17 +507,17 @@ macro_rules! bench_backend {
             }
 
             /// `non_free_pages_size()` — the used-bytes figure milli reads
-            /// before every register write txn and after every batch. LMDB sums
-            /// `mdb_stat` per database (`mdb_env_stat` + one `mdb_stat` per DB)
-            /// and never touches the freelist; zerodb walks the GC tree summing
-            /// each PIL's count prefix (SPEC 05 GC-23). Returned so neither
-            /// engine's call can be elided.
+            /// before every register write txn and after every batch. Neither
+            /// engine touches the free list: LMDB sums `mdb_stat` per database
+            /// (`mdb_env_stat` + one `mdb_stat` per DB), zerodb sums the same
+            /// page counts from its catalog records (SPEC 05 GC-23). Returned so
+            /// neither engine's call can be elided.
             pub fn non_free_size(env: &BEnv) -> u64 {
                 env.non_free_pages_size().expect("non_free_pages_size")
             }
 
-            /// Build an env whose free DB holds MANY small entries — the shape
-            /// `non_free_size` costs the most over on zerodb. Fill one named DB,
+            /// Build an env whose free DB holds MANY small entries — the regime
+            /// a free-list walk in `non_free_size` would pay for. Fill one named DB,
             /// then delete it in `commits` separate committed txns while a reader
             /// pinned at the just-filled snapshot blocks reclamation (the
             /// oldest-reader gate): every commit's freed pages accumulate as

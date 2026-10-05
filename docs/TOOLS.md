@@ -2,11 +2,13 @@
 
 Offline utilities for a zerodb env directory. **All tools operate offline**:
 they take a best-effort exclusive `flock` on the env's data file and refuse if
-the env may be live (D-001: zerodb has no cross-process reader protocol, so
-pointing a tool at a running env would be unsafe — close it first).
+the env may be live (zerodb is single-process and has no cross-process reader
+protocol — see `DIVERGENCES.md` — so pointing a tool at a running env would be
+unsafe; close it first).
 
 The data file is `zerodb.dat` in a natively-created env and `data.mdb` in one
-created through the `heed-zerodb` adapter (ADR-0010 / D-012). The read tools
+created through the `heed-zerodb` adapter (ADR-0010; the file-name entry in
+`DIVERGENCES.md`). The read tools
 probe **both** names; a directory holding both is a hard error rather than a
 silent pick, and `stat` prints an engine-identification line read from the
 file's own `ZDB1` magic.
@@ -17,11 +19,11 @@ zerodb-tools --version          # crate version + on-disk format version
 zerodb-tools --help
 ```
 
-**Installing.** Every GitHub release ships prebuilt tarballs for
-`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` and
-`aarch64-apple-darwin` with a SHA-256 sum next to each; unpack and put
-`zerodb-tools` on your `PATH`. From crates.io: `cargo install zerodb-tools`.
-From source: `cargo install --path crates/zerodb-tools`. Either way, add
+**Installing.** No release has been cut yet, so today install from source:
+`cargo install --path crates/zerodb-tools`. Once releases exist, each GitHub
+release ships prebuilt tarballs for `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu` and `aarch64-apple-darwin` with a SHA-256 sum next
+to each, and `cargo install zerodb-tools` works from crates.io. Either way, add
 `--features migrate-lmdb` for `migrate-from-lmdb`, which links the C LMDB fork
 and is therefore not in the prebuilt binaries.
 
@@ -44,12 +46,15 @@ or any other failure (unknown subcommand or option, unreadable env, …). Unknow
 
 - **`load <dump-file> <env-dir> [--page-size N] [--map-size BYTES]`** — rebuild
   a **fresh** env from a dump using the **streaming** bulk builder
-  (bottom-up packed, O(tree depth × page size) build memory; the dump-text
-  parse itself is still in-memory). Refuses a non-empty target.
+  (bottom-up packed, O(tree depth × page size) build memory, pages written
+  straight to the data file). Two steps still hold a whole file in memory: the
+  dump-text parse and the post-load invariant check of the produced env
+  (issue #63). Refuses a non-empty target.
 
 - **`check <env-dir>`** — run the invariant walker (SPEC 03 §11 / SPEC 05 §9)
   over the data file and report; exits non-zero on any violation. Tolerant of
-  a corrupt file (which is exactly when it matters).
+  a corrupt file (which is exactly when it matters). Reads the whole data file
+  into memory.
 
 - **`migrate-from-lmdb <src-lmdb-dir> <dst-env-dir> [--page-size N] [--map-size BYTES]`**
   — open a real LMDB env read-only and stream every DB (main + named sub-DBs)
@@ -64,7 +69,8 @@ byte-identical to LMDB's own content rendered in the same format.
 The engine also provides a compacting/raw snapshot copy (heed's `copy_to_file`
 parity): `zerodb::CopyToFile::copy_to_file(path, CompactionOption::{Enabled,Disabled})`.
 `Enabled` **streams** a fresh compact env (no free pages, O(tree depth × page
-size) peak memory, atomic-rename destination); `Disabled` copies the
-snapshot's pages verbatim, freelist preserved. Both open their own internal
-read snapshot and are safe on a live env. See ADR-0009 and
-`PERF-GAP-VS-LMDB.md` C1.
+size) peak memory, a writer thread overlapping the tree walk as LMDB's copy
+does, atomic-rename destination); `Disabled` copies the snapshot's pages
+verbatim from the map, freelist preserved. Both open their own internal read
+snapshot and are safe on a live env. See ADR-0009 (copy and tools design) and
+the compaction-memory entry in `PERF-GAP-VS-LMDB.md`.

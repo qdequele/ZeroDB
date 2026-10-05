@@ -1,6 +1,5 @@
-//! Milestone 1.4 coverage pass, area 5: the loose-page fast path (GC-7/8) and
-//! trailing-shrink (GC-10), ADR-0004 D4. Neither is exercised by an existing
-//! test through observable file-size + `check_image` assertions.
+//! The loose-page fast path (GC-7/8) and trailing-shrink (GC-10), ADR-0004 D4,
+//! pinned through observable file-size + `check_image` assertions.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,10 +54,9 @@ fn assert_clean(dir: &Path) {
 /// pre-existing committed leaf that "big"/"small" write into (SPEC 03 §5.1:
 /// first touch of a committed page always copies to a fresh pgno) — the
 /// 5-page overflow run itself must be fully reclaimed by GC-10, not just
-/// "not grow further". (Confirmed by hand-tracing `allocate`/`free_run`/
-/// `release_trailing_loose` in `rwtxn.rs`: this is exact, not an
-/// approximation — see the arithmetic in this test's git history/PR
-/// discussion if the exact-equality assertion below ever needs revisiting.)
+/// "not grow further". The equality below is exact, not an approximation
+/// (follows from `allocate`/`free_run`/`release_trailing_loose` in
+/// `rwtxn.rs`).
 #[test]
 fn same_txn_alloc_then_free_overflow_reused_leaves_only_the_leaf_cow() {
     let dir = TempDir::new();

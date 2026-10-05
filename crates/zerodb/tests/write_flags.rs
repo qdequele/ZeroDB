@@ -1,4 +1,4 @@
-//! M1.10 — write flags and modes: WRITE_MAP write path, durability flags,
+//! Write flags and modes: WRITE_MAP write path, durability flags,
 //! READ_ONLY envs, and `force_sync`, exercised on real files (SPEC 01 Table 1,
 //! §S6/§S7; SPEC 04 §6.4; SPEC 06 §3). Oracle *parity* lives in
 //! `crates/zerodb-oracle/tests/`; these are zerodb-only end-to-end checks that

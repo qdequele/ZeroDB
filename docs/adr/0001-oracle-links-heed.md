@@ -1,6 +1,6 @@
 # ADR-0001: The oracle crate links heed =0.22.1 (the Meilisearch LMDB fork)
 
-- Status: Approved — Quentin, 2026-07-16 (chat: 'continue' on the presented Phase 0 ratification queue, per recommendations)
+- Status: Approved — maintainer, 2026-07-16 (Phase 0 ratification queue, per recommendations)
 - Milestone: 0.3 (Oracle harness)
 - Date: 2026-07-15
 
@@ -103,7 +103,7 @@ boundary explicit and opt-in, consistent with the oracle-only spirit of the
 original decision: the migrate path is a one-off operational tool, not part of
 the engine.
 
-Ratification: **session lead under standing directive 2026-07-17.**
+Ratification: **delegated review under the maintainer's standing directive, 2026-07-17.**
 
 ## Consequences
 

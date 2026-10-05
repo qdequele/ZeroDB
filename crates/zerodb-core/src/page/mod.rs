@@ -13,10 +13,10 @@
 //!   is the GC-DB txnid key, which is big-endian (SPEC 05); see
 //!   [`geometry::gc_key_encode`].
 //! - **No `#[repr(C)]` casts of unaligned data.** All fields are read/written by
-//!   explicit offset through [`raw`]. Since PERF-GAP A3 the field readers in
+//!   explicit offset through [`raw`]. The field readers in
 //!   [`raw`] are unchecked `read_unaligned` behind the validated-view contract
-//!   (the only `unsafe` in this crate; `#[allow(unsafe_code)]` on that one
-//!   module); the rest of this module is safe code.
+//!   (`#[allow(unsafe_code)]` on that one module); the rest of this module is
+//!   safe code.
 //! - **Body-relative offsets:** intra-page offsets (`lower`, `upper`, node
 //!   pointers) are measured from the first byte after the header (absolute
 //!   offset [`HEADER_SIZE`]).
@@ -28,9 +28,9 @@ pub mod geometry;
 mod header;
 pub mod meta;
 mod overflow;
-// The crate's single sanctioned `unsafe` home (CLAUDE.md unsafe policy:
-// "page casting" in `zerodb-core::page`; PERF-GAP A3): the unchecked
-// little-endian field readers used by the validated/trusted view accessors.
+// Sanctioned `unsafe` home (unsafe policy: page casting in
+// `zerodb-core::page`): the unchecked little-endian field readers used by the
+// validated/trusted view accessors.
 #[allow(unsafe_code)]
 mod raw;
 mod tree;
@@ -77,7 +77,7 @@ pub const META_B_PGNO: u64 = 1;
 /// Lowest page number a tree/overflow page may occupy.
 pub const FIRST_DATA_PGNO: u64 = 2;
 
-/// Maximum key length, in bytes (Phase 1 parity, SPEC 01 §S4). An empty key
+/// Maximum key length, in bytes (LMDB parity, SPEC 01 §S4). An empty key
 /// (length 0) is invalid for leaf/user keys.
 pub const MAX_KEY_SIZE: usize = 511;
 
@@ -98,7 +98,7 @@ pub const MIN_KEYS_LEAF: usize = 1;
 pub const MIN_KEYS_BRANCH: usize = 2;
 
 /// Number of leading bytes of a meta page covered by its CRC, before the
-/// free-list annex ids (SPEC 02 §3.3 as amended by ADR-0022: the full
+/// free-list annex ids (SPEC 02 §3.3, ADR-0022: the full
 /// coverage is `[0, META_CONTENT_LEN) ∪ [META_ANNEX_OFF, … + 8·fl_count)`).
 pub const META_CONTENT_LEN: usize = 172;
 
@@ -125,9 +125,9 @@ pub const P_BRANCH: u16 = 0x0002;
 pub const P_OVERFLOW: u16 = 0x0004;
 /// Meta page (slots 0 and 1 only).
 pub const P_META: u16 = 0x0008;
-/// **Reserved, Phase 2.8** — DUPFIXED packed-key leaf. Never set in Phase 1.
+/// **Reserved for DUPFIXED** — packed-key leaf. Never set today.
 pub const P_LEAF2: u16 = 0x0020;
-/// **Reserved, Phase 2.8** — DUPSORT embedded sub-page. Never set in Phase 1.
+/// **Reserved for DUPSORT** — embedded sub-page. Never set today.
 pub const P_SUBP: u16 = 0x0040;
 
 /// Mask of the four structural page-type bits.
@@ -141,12 +141,13 @@ pub const STRUCTURAL_MASK: u16 = P_LEAF | P_BRANCH | P_OVERFLOW | P_META;
 /// head pgno of the run. `dsize` still holds the true logical value length.
 pub const F_BIGDATA: u16 = 0x0001;
 /// Leaf value is a 48-byte sub-DB [`DBRecord`] (a named-DB catalog entry).
-/// Active in Phase 1 (M1.6); its DUPSORT interaction is deferred to Phase 2.8.
+/// Active (named databases); its DUPSORT interaction is deferred with DUPSORT itself.
 pub const F_SUBDATA: u16 = 0x0002;
-/// **Reserved, Phase 2.8** — value is a DUPSORT sub-page/sub-tree (D-004).
+/// **Reserved for DUPSORT** — value is a DUPSORT sub-page/sub-tree
+/// (unsupported, see docs/DIVERGENCES.md).
 pub const F_DUPDATA: u16 = 0x0004;
 
-/// Mask of leaf-node flags that are valid to *see set* in Phase 1. `F_DUPDATA`
+/// Mask of leaf-node flags that are valid to *see set* today. `F_DUPDATA`
 /// and all higher bits are rejected by the leaf decoder (SPEC 02 §10).
 pub const LEAF_FLAGS_PHASE1_MASK: u16 = F_BIGDATA | F_SUBDATA;
 
@@ -180,8 +181,8 @@ impl PageType {
     }
 }
 
-/// Classify a `flags` field into a [`PageType`], enforcing the Phase-1 rule:
-/// exactly one structural bit set and no reserved bit (including the Phase-2.8
+/// Classify a `flags` field into a [`PageType`], enforcing the current rule:
+/// exactly one structural bit set and no reserved bit (including the DUPSORT/DUPFIXED
 /// `P_LEAF2`/`P_SUBP` hooks) set (SPEC 02 §1, §10).
 ///
 /// # Errors
@@ -242,7 +243,7 @@ pub enum PageError {
         flags: u16,
     },
 
-    /// A reserved flag bit (including Phase-2.8 hooks) is set in Phase 1.
+    /// A reserved flag bit (including the DUPSORT/DUPFIXED hooks) is set.
     #[error("reserved flag bit set in flags {flags:#06x}")]
     ReservedFlagSet {
         /// The offending flags value.
@@ -258,7 +259,7 @@ pub enum PageError {
         found: PageType,
     },
 
-    /// A reserved header/body field that must be zero in Phase 1 was non-zero.
+    /// A reserved header/body field that must currently be zero was non-zero.
     #[error("reserved field {field} must be zero, found {value:#x}")]
     ReservedFieldNonZero {
         /// A short name of the field.

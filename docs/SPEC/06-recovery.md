@@ -1,5 +1,10 @@
 # SPEC 06 — Durability & recovery
 
+Revised 2026-10-05 — docs sweep: format-v2 CRC offsets in REC-8/REC-22
+(ADR-0022), v1-store rejection noted at REC-1, REC-12 brought to the shipped
+whole-map-msync barriers (ranged msync stays planned, issue #45), ADR-0019's
+parked single-barrier meta write noted at REC-7.
+
 Status: **DONE** — 2026-07-15 (milestone 0.4). Behavioral source of truth for
 open-time meta selection under crash (M1.2), the durability guarantee at every
 commit-pipeline cut point (M1.4), the durability-flag crash windows (M1.10), and
@@ -11,9 +16,9 @@ relies on is [SPEC 05](05-gc.md) §4. Durability-flag semantics come from
 
 Clean-room note: the fork's `mdb_env_open`/`mdb_env_pick_meta` (meta selection)
 and `mdb_env_write_meta`/`mdb_env_sync0` (sync routing) were read to understand
-the *algorithm* (CLAUDE.md rule 4); the guarantees below are ZeroDB's own,
+the *algorithm* (AGENTS.md rule 4); the guarantees below are ZeroDB's own,
 strengthened by the **mandatory** meta CRC (torn-meta detection is Phase 1, not
-Phase 3 — PLAN 0.4). Normative rules are numbered **REC-n**.
+Phase 3 — M0.4). Normative rules are numbered **REC-n**.
 
 The crash-safety spine, stated once: **the meta write is the commit point, and it
 is never made durable before the data pages it references.** Everything else here
@@ -35,6 +40,11 @@ this section defines the **recovery decision** and its error taxonomy.
   REC-1 does **not** restate the list; it references SPEC 02 §3.2 as the
   single owner. A slot failing any
   check is **invalid** (torn or foreign) and is discarded from selection.
+  **Format-version note (ADR-0022):** `FORMAT_VERSION` is **2** since the meta
+  free-list annex landed (PR #89); a version-1 store fails the
+  `format_version` check on both slots and opens as `MdbError::Invalid`
+  (REC-3). There is no in-place migration — sanctioned pre-release (ADR-0022
+  consequences; `migrate-from-lmdb` output is v2 implicitly).
 - **REC-1a** — **Geometry validation of the selected slot** (added 2026-09-09,
   security review H1; predicate owned by SPEC 02 §3.2 step 6). A CRC-valid slot
   can still name geometry the real file cannot back — a truncated or hostile
@@ -76,7 +86,7 @@ this section defines the **recovery decision** and its error taxonomy.
   unidentifiable — so ZeroDB fails `MdbError::Invalid` rather than guess. This is
   **zerodb-defined behavior**: the fork has no meta CRC, so its selection under a
   torn slot is not observable/pinnable, and there is no oracle to match here.
-  **Ratified 2026-07-16 (Quentin, chat)** — a maintainer may prefer to serve the
+  **Ratified 2026-07-16 (maintainer)** — a maintainer may prefer to serve the
   lone valid older slot instead; until ratified, the conservative hard error
   stands.
 - **REC-3** — **Both invalid → `MdbError::Invalid`** (heed maps to
@@ -91,7 +101,7 @@ this section defines the **recovery decision** and its error taxonomy.
   (log line / diagnostic) that a torn meta was detected and the older snapshot was
   used — the operator should know a commit was lost to a crash. This is not an
   error; it is the designed recovery. (No consumer branches on it; it is
-  observability, PLAN 1.2.)
+  observability, M1.2.)
 - **REC-5** — **PREV_SNAPSHOT recovery interaction** (SPEC 01 §S5, SPEC 04
   TXN-65..67). PREV_SNAPSHOT requires **both** slots valid to identify the older
   (REC-2): it selects the **lower**-txnid valid slot only when two valid slots
@@ -112,9 +122,13 @@ this section defines the **recovery decision** and its error taxonomy.
   two disk properties that hold after a *clean* commit but are **not** guaranteed
   after a crash:
   1. **Sector-aligned tears yield a fully valid *stale* meta (not a CRC
-     collision).** The entire CRC-covered region `[0,168)` **and** the `meta_crc`
-     field (offset 168) both lie within the meta page's **first 512-byte sector**,
-     and the rest of the page is zeros (SPEC 02 §3). So a power cut that tears the
+     collision).** The CRC-covered region (`[0,172)` plus the annex ids,
+     format v2 — ADR-0022) **and** the `meta_crc` field (offset 172) lie within
+     the meta page's **first 512-byte sector** whenever `fl_count ≤ 42`, and
+     the rest of the page is zeros (SPEC 02 §3). (With a larger annex the
+     coverage extends past sector 0 and a sector-aligned tear is instead
+     CRC-rejected — REC-8's format-v2 note; strictly more conservative, so
+     this item's hazard only narrows.) So a power cut that tears the
      meta write at **sector granularity** leaves the slot holding either the
      *complete old* content (sector 0 not yet written) or the *complete new* content
      (sector 0 written) — **both CRC-valid**. The CRC therefore does **not** reject
@@ -134,7 +148,7 @@ this section defines the **recovery decision** and its error taxonomy.
   guaranteed only against cleanly-committed history, and MUST NOT claim
   crash-proof rollback. The **exact guard** — e.g. refusing PREV_SNAPSHOT unless
   the older meta's referenced pages verify intact, or requiring both slots
-  cleanly valid — was **ratified 2026-07-16 (Quentin, chat): Phase 1 ships the warning only, no verification guard**; a stronger guard remains an ADR seam for Phase 3.
+  cleanly valid — was **ratified 2026-07-16 (maintainer): Phase 1 ships the warning only, no verification guard**; a stronger guard remains an ADR seam for Phase 3.
   This rule deliberately **does not overclaim**: Phase 1 provides best-effort
   single-step rollback with an honest warning, not a guaranteed crash-consistent
   rollback.
@@ -166,10 +180,19 @@ open, REC-1/REC-2 select snapshot `X` and the check tool (SPEC 03 §11 + SPEC 05
   slot only. This is what makes H3 safe: an accepted meta `N` can only reference
   already-durable pages. Reordering C3 after C4 would allow a crash to accept a
   meta pointing at unwritten data — the one corruption this design forbids.
+  *(Pipeline cost note: a durable default-mode commit therefore pays **two**
+  `fdatasync`s (C3, C5). ADR-0019 — collapsing C5 into an `O_DSYNC` meta
+  write for a single barrier — is Accepted on paper but its implementation is
+  **parked**: PR #86 was closed after the mechanism verified with no measured
+  win on the available flush devices; the two-barrier pipeline above is what
+  ships.)*
 - **REC-8** — **Meta CRC catches *sub-sector* tears; *sector-aligned* tears are
   handled by txnid selection.** The meta is exactly one `psize` page with a CRC over
-  `[0,168)` (SPEC 02 §3.3), and both the covered region and the CRC field sit in the
-  first 512-byte sector (the tail is zeros). Two crash cases:
+  `[0,172) ∪ [176, 176 + 8·fl_count)` and the `meta_crc` field at offset 172
+  (SPEC 02 §3.3 as amended by ADR-0022 — format v2; v1 covered `[0,168)`).
+  With a small annex (`fl_count ≤ 42`) the covered region and the CRC field
+  sit in the first 512-byte sector (the tail is zeros); the format-v2 note
+  below handles the larger-annex case. Two crash cases:
   - A **sub-sector** partial write (a tear that splits sector 0) leaves the CRC
     inconsistent with the covered bytes → the slot is rejected at open (REC-1), and
     the intact other slot wins.
@@ -228,7 +251,7 @@ recovered) **except** where explicitly noted as FS-order-dependent.
   (SPEC 04 TXN-63), so the older intact slot is always available.
 
   **M1.11 amendment — the reclaim-clobber window (`NO_META_SYNC`) — RATIFIED
-  2026-07-17 (Quentin; see REC-10 item 4 at the end of this file. Found by
+  2026-07-17 (maintainer; see REC-10 item 4 at the end of this file. Found by
   the ADR-0008 crash harness, 2026-07-16; repro seed 15797139550980166469).** The argument above shows the recovered meta's
   pages were durable *when written*, not that they *remain unclobbered*. The
   hole: after commit `N` returns, its meta write is issued but un-fsynced
@@ -271,14 +294,26 @@ recovered) **except** where explicitly noted as FS-order-dependent.
   a synchronous flush (SPEC 01 §S6). These flags are crash-tested in M1.11
   (§5) to characterize — not to guarantee-away — their window.
 - **REC-12** — **`WRITE_MAP` msync ordering** (SPEC 01 §S7). Under `WRITE_MAP`,
-  C2 writes dirty bytes straight into the writable map and C3/C5 are `msync`s
-  instead of `pwrite`+`fdatasync`. The **same ordering** as REC-7 applies:
-  `msync(data range, MS_SYNC)` (C3) MUST complete before writing the meta into the
-  map (C4) and `msync(meta page, MS_SYNC)` (C5). On macOS/Windows an additional
-  `fdatasync` of the data fd is issued (SPEC 01 §S7) because `msync` alone is not
-  a durability barrier there. A writemap env opens **no** separate meta sync fd
-  (SPEC 01 §S7): the meta durability is the meta-page `msync`. The crash-stage
-  table (REC-6) holds verbatim with `msync` substituted for fsync.
+  dirty bytes reach the file through the writable map (in place at
+  allocation/edit time under TXN-45b, or memcpy'd at C2 under TXN-45a) and the
+  C3/C5 barriers are `msync`s instead of `fdatasync` over `pwrite`s. The
+  **same ordering** as REC-7 applies: the C3 barrier MUST complete before the
+  meta is written into the map (C4), followed by the C5 barrier.
+  **Shipped barrier (amended 2026-10-05, docs sweep):** each synchronous
+  barrier is `MmapWritable::flush` — an `msync(MS_SYNC)` of the **whole map**
+  — followed unconditionally by an `fdatasync` of the data fd
+  (`WriteMapBacking::sync`; the fdatasync exists because `msync` alone is not
+  a durability barrier on macOS, and it currently runs on every platform).
+  Both are strict supersets of the minimal barrier, so every REC-7 ordering
+  claim holds: C3's flush covers at least all data pages, C5's covers the
+  meta page. The *ranged* form this rule originally described —
+  `msync(data range)` at C3, `msync(meta page)` at C5 — is the intended
+  optimization and remains **planned, not implemented** (issue #45).
+  A writemap env opens **no** separate meta sync fd (SPEC 01 §S7): the meta
+  durability is the C5 barrier. Under `MAP_ASYNC` the barriers that run are
+  `msync(MS_ASYNC)` with **no** fdatasync (relaxed, REC-9/REC-11). The
+  crash-stage table (REC-6) holds verbatim with the msync barrier substituted
+  for fsync.
 
 ---
 
@@ -326,7 +361,7 @@ recovered) **except** where explicitly noted as FS-order-dependent.
 
 ---
 
-## §5 — Crash-test protocol (PLAN 1.11, two mechanisms)
+## §5 — Crash-test protocol (M1.11, two mechanisms)
 
 SIGKILL alone cannot tear a write — the OS page cache survives process death, so
 only power loss tears or reorders un-fsynced sectors. The harness therefore has
@@ -381,14 +416,14 @@ obligations (REC-18).
   data before C4 writes meta, no image can contain a durable meta `N` without
   durable `N`-data — the fault backend cannot construct that image, which is the
   formal statement of the crash-safety spine.
-- **REC-21** — **Coverage target** (PLAN 1.11 acceptance): ≥ 10k crash-recovery
+- **REC-21** — **Coverage target** (M1.11 acceptance): ≥ 10k crash-recovery
   cycles clean in CI across both mechanisms, over randomized write workloads
   (put/del/commit/abort, values 0 B–16 MB) and across the durability modes of §3
   (each mode asserting its own REC-18 obligation strength). A single clean run is
   not sufficient; the ≥10k-cycle bar is the milestone gate.
 
 **M1.11 amendments (ADR-0008, Approved 2026-07-16 — implementation of this
-section; behavior clarifications per CLAUDE.md rule 3):**
+section; behavior clarifications per AGENTS.md rule 3):**
 
 - **Cycle accounting (REC-21).** One *cycle* = one recovered-and-verified
   crash state: each materialized fault-plan image variant (mechanism 2) and
@@ -462,7 +497,7 @@ section; behavior clarifications per CLAUDE.md rule 3):**
 | fsync-gate / poison | REC-13 | SPEC 04 §8.1/TXN-60 |
 | file growth safety | REC-14..16 | SPEC 05 GC-16/GC-28 |
 | PREV_SNAPSHOT recovery + crash window | REC-5, REC-22 | SPEC 04 TXN-65..67 (self-resolving, §10) |
-| crash-test protocol | REC-17..21 | PLAN 1.11, `zerodb-io` fault backend |
+| crash-test protocol | REC-17..21 | M1.11, `zerodb-io` fault backend |
 
 **Rule count: REC-1 … REC-22 (22 normative rules; REC-22 is the PREV_SNAPSHOT
 crash-window warning, placed with §1's PREV_SNAPSHOT topic).**
@@ -482,7 +517,7 @@ crash-window warning, placed with §1's PREV_SNAPSHOT topic).**
 >    has no meta CRC, so its torn-slot behavior is unpinnable); **ratified 2026-07-16 — Phase 1 ships the documented warning only, no extra interlock; guard redesign deferred (Phase 3 candidate). Original note: human ratification
 >    pending** on whether to instead serve the lone valid older slot.
 > 4. **`NO_META_SYNC` reclaim-clobber window (REC-10 amendment, M1.11) —
->    RATIFIED 2026-07-17 (Quentin, standing directive, session lead): scoped claim adopted; steady-gated reclaim = Phase 3 candidate.** The ADR-0008 crash harness materialized a
+>    RATIFIED 2026-07-17 (maintainer, standing directive): scoped claim adopted; steady-gated reclaim = Phase 3 candidate.** The ADR-0008 crash harness materialized a
 >    legal power-loss image (repro seed 15797139550980166469) where the
 >    fallback snapshot is structurally corrupted by a younger txn's legally
 >    reclaimed pages — REC-10's original blanket "never corruption" overclaims.

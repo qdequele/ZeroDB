@@ -1,11 +1,9 @@
-//! Milestone 1.3 read-path differential tests: `LmdbEngine` vs the native
+//! Read-path differential tests: `LmdbEngine` vs the native
 //! `ZerodbEngine`.
 //!
-//! The zerodb side populates via the same `Put`/`PutFlagged`/`Del`/`Clear` op
-//! stream (buffered in a shadow, materialized through the bulk-load builder on
-//! commit) and then serves reads from the real B-tree read path. Every read /
-//! cursor / seek / iteration op is compared verbatim against the LMDB fork,
-//! which is populated identically via its own API (PLAN §1.3 acceptance).
+//! Both engines are populated by the same `Put`/`PutFlagged`/`Del`/`Clear` op
+//! stream; every read / cursor / seek / iteration op is then compared verbatim
+//! against the LMDB fork.
 
 use zerodb_oracle::{decode_ops, run, DbName, Key, LmdbEngine, Op, PutFlag, Value, ZerodbEngine};
 
@@ -200,8 +198,7 @@ fn empty_and_oversized_keys_match_lmdb() {
     ops.push(Op::Commit);
     // `del` (a write op) with empty / oversized keys inside a write txn: empty
     // → BadValSize, oversized → Ok(false) (del searches, it does not validate
-    // maxkey up front — unlike `put`, which rejects oversized). Regression for
-    // the fuzz-found divergence at `Del { oversized }`.
+    // maxkey up front — unlike `put`, which rejects oversized).
     ops.push(Op::BeginRw);
     ops.push(Op::Del { db: 0, key: k(b"") });
     ops.push(Op::Del {
@@ -224,8 +221,8 @@ fn empty_and_oversized_keys_match_lmdb() {
 
 #[test]
 fn writes_visible_within_txn_then_committed() {
-    // Reads inside the write txn see uncommitted state (served from the shadow);
-    // after commit the same reads go through the real tree.
+    // Reads inside the write txn see uncommitted state; after commit the same
+    // reads go through a committed snapshot.
     let ops = vec![
         Op::BeginRw,
         Op::CreateDb {
@@ -239,7 +236,7 @@ fn writes_visible_within_txn_then_committed() {
         Op::Get {
             db: 0,
             key: k(b"x"),
-        }, // in-txn read (shadow)
+        }, // in-txn read (uncommitted)
         Op::Put {
             db: 0,
             key: k(b"y"),
@@ -258,7 +255,7 @@ fn writes_visible_within_txn_then_committed() {
         Op::Get {
             db: 0,
             key: k(b"x"),
-        }, // committed read (real tree)
+        }, // committed read
         Op::Iter { db: 0 },
         Op::Commit,
     ];
@@ -335,7 +332,7 @@ fn clear_then_read() {
     diff(&ops);
 }
 
-/// Regression for a fuzz-found harness drift: a `Reopen` is a txn boundary, so
+/// Regression for a harness drift: a `Reopen` is a txn boundary, so
 /// both engines must reset their `cleared_in_txn` FORK-1-guard fact there. If
 /// only one does, a later `PutFlagged { Append }` makes the shared `classify`
 /// guard fire asymmetrically (`KnownForkBug` vs `NoDb`).

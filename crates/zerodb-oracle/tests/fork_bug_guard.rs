@@ -6,12 +6,12 @@
 //! a child process). The oracle cannot assert on UB, so `driver::classify`
 //! skips the combination symmetrically. These tests pin the guard itself.
 //!
-//! Do not weaken or remove (CLAUDE.md rule 2). Remove ONLY when the fork fix
-//! lands upstream and the repro example no longer crashes.
+//! Remove ONLY when the fork fix lands upstream and the repro example no
+//! longer crashes.
 
 use zerodb_oracle::{run_self_test, DbName, Key, LmdbEngine, Op, PutFlag, Value};
 
-/// The exact minimized crash sequence must now complete without a SEGV —
+/// The exact minimized crash sequence must complete without a SEGV —
 /// the APPEND puts after the clear classify as `Skip::KnownForkBug`.
 #[test]
 fn fork1_crash_sequence_is_guarded() {

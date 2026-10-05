@@ -1,5 +1,5 @@
 //! Shared helpers for the read tools: open an env read-only and collect its
-//! logical content (M1.12).
+//! logical content.
 
 use zerodb::{
     collect_entries_flagged, named_databases, Database, Env, EnvFlags, EnvOpenOptions, RoTxn,
@@ -12,8 +12,7 @@ use crate::dump_format::DumpDb;
 /// DB assigns a dbi slot bounded by this.
 pub const MAX_TOOL_DBS: u32 = 1 << 16;
 
-/// A boxed error for the tool layer (no `anyhow` dependency — not on the
-/// allowlist).
+/// A boxed error for the tool layer (no `anyhow` dependency).
 pub type BoxErr = Box<dyn std::error::Error>;
 
 /// An owned key/value pair.

@@ -1,22 +1,18 @@
-//! Milestone 2.1 — `Env::stat()` and the completed `Env::info()`.
-//!
-//! Phase 2 acceptance: "differential semantics tests where LMDB has the
-//! feature, and doc + unit tests where it's zerodb-defined". This file is the
-//! **zerodb-defined** half. The cross-engine half (`last_txnid`, `entries`,
-//! `num_readers`, `max_readers` — the fields whose values are format-
-//! independent) lives in `crates/zerodb-oracle/tests/env_info_differential.rs`.
+//! `Env::stat()` and `Env::info()` — the **zerodb-defined** half. The
+//! cross-engine half (`last_txnid`, `entries`, `num_readers`, `max_readers` —
+//! the fields whose values are format-independent) lives in
+//! `crates/zerodb-oracle/tests/env_info_differential.rs`.
 //!
 //! The page counts (`branch_pages` / `leaf_pages` / `overflow_pages`) are
-//! format-specific by construction (D-002), so they are **not** compared to
-//! LMDB. They are instead pinned to ZeroDB's own truth two ways:
+//! format-specific by construction (ZeroDB has its own on-disk format), so
+//! they are **not** compared to LMDB. They are instead pinned to ZeroDB's own
+//! truth two ways:
 //!
 //!   1. `check::check_image` walks the committed image and validates the stored
 //!      counters against the real tree (INV-18) — a stat that disagreed with
 //!      the walk would fail the walk.
 //!   2. `Env::stat()` must equal `main_database().stat(&rtxn)` exactly — the
 //!      env-level and per-DB views of the same tree cannot disagree.
-//!
-//! Do not weaken these (CLAUDE.md rule 2).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -161,8 +157,7 @@ fn env_stat_entries_counts_named_dbs_and_depth_grows() {
 #[test]
 fn env_stat_does_not_consume_a_reader_slot() {
     // `Env::stat()` reads the published snapshot, not a read txn. With every
-    // reader slot occupied it must still return real numbers — the Phase-1
-    // adapter implementation silently degraded to zeros here.
+    // reader slot occupied it must still return real numbers, not zeros.
     let dir = TempDir::new();
     let env = open_with(dir.path(), 4096, 8, 2);
     {
@@ -278,7 +273,7 @@ fn env_info_max_readers_is_the_configured_table_size() {
 fn env_info_live_readers_tracks_live_read_txns() {
     // `live_readers` is the ZeroDB extension: the count that actually follows
     // the reader population. (`num_readers` is the LMDB-parity high-water mark
-    // — see `env_info_num_readers_is_a_high_water_mark` and D-011.)
+    // — see `env_info_num_readers_is_a_high_water_mark` and docs/DIVERGENCES.md.)
     let dir = TempDir::new();
     let env = open_with(dir.path(), 4096, 8, 16);
     assert_eq!(env.info().live_readers, 0, "no readers on a fresh env");
@@ -305,7 +300,7 @@ fn env_info_live_readers_tracks_live_read_txns() {
 
 #[test]
 fn env_info_num_readers_is_a_high_water_mark() {
-    // LMDB parity (D-011): `MDB_envinfo::me_numreaders` is monotone — it is the
+    // LMDB parity: `MDB_envinfo::me_numreaders` is monotone — it is the
     // maximum number of simultaneously live readers ever observed, and ending a
     // read txn does not lower it. The cross-engine proof is in
     // `zerodb-oracle/tests/env_info_differential.rs`; this pins the native side.

@@ -1,5 +1,5 @@
 # heed-zerodb — a 1:1 re-implementation of heed 0.22.1's public surface over
-# ZeroDB's native API (ADR-0003 Option C/D, milestone 1.13).
+# ZeroDB's native API (ADR-0003 Option C/D).
 #
 # The crate's *package* name stays `heed-zerodb` inside this workspace so it does
 # not collide with the real `heed = "=0.22.1"` the oracle links (ADR-0001): the
@@ -9,12 +9,12 @@
 # literally named `heed` that re-exports this one (docs/CONSUMER-GATE.md). A
 # `package = "heed-zerodb"` rename inside `[patch]` does NOT work: cargo requires
 # the replacement to share the patched crate's name and ignores the rename
-# (verified M1.13; see crates/heed-shim/Cargo.toml).
+# (verified; see crates/heed-shim/Cargo.toml).
 [package]
 name = "heed-zerodb"
 # Version tracks the heed line it reproduces (0.22.1) so the `heed-shim` patch
 # target that re-exports it satisfies a consumer's `heed = "0.22.1"`
-# requirement (scripts/consumer.sh, milestone 1.13). The crate
+# requirement (scripts/consumer.sh). The crate
 # is never published (ADR-0003 OQ1); the version is only for patch resolution.
 version = "0.22.1"
 # Never published (ADR-0003 OQ1, ADR-0013): consumed only through crates/heed-shim.
@@ -40,7 +40,7 @@ heed-types = { version = "=0.21.0", default-features = false, features = [
 # `heed::byteorder::BigEndian`. Part of the sanctioned heed-surface re-export
 # (heed-types already pulls it transitively), not a new engine dependency.
 byteorder = "1.5"
-# Allow-listed (CLAUDE.md). One `sysconf` call re-imposes the fork's D-006
+# Allow-listed (AGENTS.md). One `sysconf` call re-imposes the fork's
 # `map_size` OS-page-multiple check at the heed boundary (heed uses `page_size`).
 libc = { workspace = true }
 
@@ -48,7 +48,7 @@ libc = { workspace = true }
 tempfile = "3"
 # For the OS-page-size probe in the page-size parity test (allowlisted dep).
 libc.workspace = true
-# ADR-0021 B4 (M1.13 adapter borrow audit): the lifetime-erased write cursor
+# ADR-0021 B4 (adapter borrow audit): the lifetime-erased write cursor
 # is exercised under miri over the heap-backed writable-map stand-in —
 # workspace-internal test infrastructure, not new external dependencies.
 zerodb-core = { path = "../zerodb-core" }

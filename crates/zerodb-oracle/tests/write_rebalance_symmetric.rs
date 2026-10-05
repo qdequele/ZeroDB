@@ -1,10 +1,9 @@
-//! M1.4 fix follow-up: differential twins of
-//! `crates/zerodb/tests/deep_tree_rebalance_symmetric.rs` — the symmetric
-//! branch-rebalance directions (borrow/merge from the LEFT sibling, driven by
-//! descending deletes; interior-band deletes for both merge directions) run
-//! against the LMDB fork. The fixed borrow-from-right shifted-index bug
-//! (repeated `remove(0)`) had these as its audit siblings; this pins them
-//! differentially. `ZerodbEngine` runs the invariant walk after every commit.
+//! Differential twins of `crates/zerodb/tests/deep_tree_rebalance_symmetric.rs`:
+//! the symmetric branch-rebalance directions (borrow/merge from the LEFT
+//! sibling, driven by descending deletes; interior-band deletes for both merge
+//! directions) run against the LMDB fork. Guards the mirror directions of the
+//! borrow-from-right shifted-index bug (repeated `remove(0)`). `ZerodbEngine`
+//! runs the invariant walk after every commit.
 
 use zerodb_oracle::{run, DbName, Key, LmdbEngine, Op, Value, ZerodbEngine};
 

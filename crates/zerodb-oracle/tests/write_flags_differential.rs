@@ -1,6 +1,6 @@
-//! M1.10 — differential tests for write flags and modes (SPEC 01 Table 1,
-//! §S6/§S7). Every MUST/SHOULD-Phase-1 flag from SPEC 01 Table 1 gets a
-//! differential test here (the flag-matrix acceptance in PLAN §1.10):
+//! Differential tests for write flags and modes (SPEC 01 Table 1, §S6/§S7).
+//! Every MUST flag, and every SHOULD flag scheduled for LMDB parity, from
+//! SPEC 01 Table 1 gets a differential test here:
 //!
 //! | Flag | Slug (test fn) |
 //! |------|----------------|
@@ -163,7 +163,7 @@ fn env_writemap_put_reserved() {
 #[test]
 fn durability_mapasync_writemap() {
     // WRITE_MAP | MAP_ASYNC: both engines accept the flags and commit; the
-    // observable data is identical (crash windows are M1.11's concern).
+    // observable data is identical (crash windows are the crash harness's concern).
     if let Err(d) = run_in_mode::<LmdbEngine, ZerodbEngine>(&storm(), EngineMode::WRITE_MAP_ASYNC) {
         panic!("WRITE_MAP|MAP_ASYNC divergence:\n{d}");
     }
@@ -319,7 +319,7 @@ fn flag_notls_rotxn_is_send() {
 }
 
 // ---------------------------------------------------------------------------
-// PLAN §1.10 acceptance: Meilisearch's exact indexing flag combo replayed.
+// Meilisearch's exact indexing flag combo replayed.
 // ---------------------------------------------------------------------------
 
 #[test]

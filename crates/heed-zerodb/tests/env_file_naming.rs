@@ -1,16 +1,13 @@
-//! ADR-0010 / D-012 — the env directory's data-file name at the heed boundary.
+//! ADR-0010 — the env directory's data-file name at the heed boundary.
 //!
-//! Before ADR-0010 an adapter-created env dir held exactly `["zerodb.dat"]`,
-//! while Meilisearch joins the literal `"data.mdb"` onto env paths in
-//! **production** code: index compaction (`process_batch.rs`,
-//! `routes/tasks/compact.rs`, `meilitool`) and snapshot creation
-//! (`process_snapshot_creation.rs`, `enterprise_edition/s3.rs`). Compaction
-//! failed loudly on the `fs::metadata` probe; snapshot restore failed
-//! *silently*, producing a directory that reopened as a fresh empty env — data
-//! loss behind a green suite, because index-scheduler ships no compaction or
-//! snapshot round-trip test.
-//!
-//! The two round-trip tests below are exactly the shapes those suites miss.
+//! Meilisearch joins the literal `"data.mdb"` onto env paths in **production**
+//! code: index compaction (`process_batch.rs`, `routes/tasks/compact.rs`,
+//! `meilitool`) and snapshot creation (`process_snapshot_creation.rs`,
+//! `enterprise_edition/s3.rs`). With any other file name, compaction fails on
+//! the `fs::metadata` probe and snapshot restore *silently* reopens as a fresh
+//! empty env — data loss that index-scheduler's own suite would not catch, as
+//! it has no compaction or snapshot round-trip test. The round-trip tests
+//! below are exactly those shapes.
 
 use std::fs;
 
@@ -100,12 +97,12 @@ fn dir_listing(dir: &std::path::Path) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Criterion 1 — adapter naming
+// Adapter naming
 // ---------------------------------------------------------------------------
 
 /// A fresh env dir created through the adapter contains **exactly**
 /// `["data.mdb"]`: no `zerodb.dat`, and no `lock.mdb` (nothing in the consumer
-/// tree reads one — D-001 stands).
+/// tree reads one — ZeroDB stays single-process).
 #[test]
 fn adapter_env_dir_contains_exactly_data_mdb() {
     let dir = tempfile::tempdir().unwrap();
@@ -114,14 +111,14 @@ fn adapter_env_dir_contains_exactly_data_mdb() {
 
     assert_eq!(dir_listing(dir.path()), vec!["data.mdb".to_string()]);
     assert_eq!(heed_zerodb::DATA_FILE_NAME, "data.mdb");
-    // `Env::path()` still returns the *directory*, not the data file — heed
-    // parity, unchanged by ADR-0010. (Compared canonicalized: the engine
+    // `Env::path()` returns the *directory*, not the data file — heed
+    // parity. (Compared canonicalized: the engine
     // canonicalizes for its registry key, and macOS temp dirs are symlinked.)
     assert_eq!(env.path(), dir.path().canonicalize().unwrap());
 }
 
 /// The compaction call sites' very first step: `fs::metadata` on the joined
-/// path. This is the ENOENT that used to abort every compaction task.
+/// path must not ENOENT.
 #[test]
 fn metadata_probe_on_live_adapter_env_succeeds() {
     let dir = tempfile::tempdir().unwrap();
@@ -135,13 +132,12 @@ fn metadata_probe_on_live_adapter_env_succeeds() {
 }
 
 // ---------------------------------------------------------------------------
-// Criterion 3 — snapshot round-trip (process_snapshot_creation.rs shape)
+// Snapshot round-trip (process_snapshot_creation.rs shape)
 // ---------------------------------------------------------------------------
 
 /// `copy_to_path(dst.join("data.mdb"), option)` → reopen `dst` through the
 /// adapter → full logical equality. Run for **both** compaction options.
-///
-/// This is the test whose absence made snapshot restore silently yield an
+/// Regression: a mismatched file name makes the restore silently yield an
 /// empty env.
 fn snapshot_round_trip(option: CompactionOption) {
     let src_dir = tempfile::tempdir().unwrap();
@@ -158,8 +154,8 @@ fn snapshot_round_trip(option: CompactionOption) {
     // The snapshot dir looks like an LMDB env dir.
     assert_eq!(dir_listing(dst_dir.path()), vec!["data.mdb".to_string()]);
 
-    // Restore: extract, open the directory. Before ADR-0010 this produced a
-    // fresh EMPTY env instead of the snapshot's contents.
+    // Restore: extract, open the directory — must yield the snapshot's
+    // contents, not a fresh EMPTY env.
     let restored = unsafe { opts().open(dst_dir.path()).unwrap() };
     assert_eq!(contents(&restored), expected);
 }
@@ -175,7 +171,7 @@ fn snapshot_round_trip_compaction_enabled() {
 }
 
 // ---------------------------------------------------------------------------
-// Criterion 4 — compaction-persist round-trip (process_batch.rs shape)
+// Compaction-persist round-trip (process_batch.rs shape)
 // ---------------------------------------------------------------------------
 
 /// The full Meilisearch index-compaction sequence:
@@ -208,7 +204,7 @@ fn compaction_persist_round_trip(option: CompactionOption, delete_first: bool) {
     }
     let expected = contents(&env);
 
-    // Step 1 — the probe that used to ENOENT.
+    // Step 1 — the `fs::metadata` probe.
     let src_path = dir.path().join("data.mdb");
     let size_before = fs::metadata(&src_path).unwrap().len();
 

@@ -1,10 +1,10 @@
-//! Milestone 1.6 named-database differential tests: `LmdbEngine` vs the native
+//! Named-database differential tests: `LmdbEngine` vs the native
 //! `ZerodbEngine`.
 //!
-//! Covers the M1.6 acceptance surface (PLAN §1.6): multi-DB workloads
+//! Covers the named-database acceptance surface: multi-DB workloads
 //! interleaved across the primary DB + several named DBs, create-in-txn-then-
 //! abort parity, create-then-reopen persistence, `clear`/`drop` parity, and
-//! `DbsFull`/`Incompatible` edge cases — all verified by exact `OpResult`
+//! overflow values in named DBs — all verified by exact `OpResult`
 //! comparison against the LMDB fork. (Per-DB `stat` parity and name-edge cases
 //! are `stat_differential.rs` / `name_edge_differential.rs`.)
 

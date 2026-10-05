@@ -1,10 +1,10 @@
-//! M1.10 — durability-flag control-flow parity (SPEC 01 §S6, SPEC 06 REC-9).
+//! Durability-flag control-flow parity (SPEC 01 §S6, SPEC 06 REC-9).
 //!
 //! The oracle differential tests confirm that a commit under each durability
 //! flag produces identical *data*. This test confirms the other half: that the
 //! commit pipeline runs exactly the right fsync/msync **barriers** per flag —
 //! the control flow the flags are *for* (their crash-window semantics are then
-//! validated by the M1.11 harness). It drives a real commit through a counting
+//! validated by the crash-consistency harness). It drives a real commit through a counting
 //! [`Backing`] and asserts the number and kind of `sync` calls:
 //!
 //! | Flags | C3 (data) | C5 (meta) | `sync` calls | async? |

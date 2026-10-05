@@ -1,4 +1,4 @@
-//! Milestone 1.3 zerodb-only read-API tests. These drive the public
+//! Zerodb-only read-API tests. These drive the public
 //! `zerodb::{Env, RoTxn, Database}` read surface directly over a file produced
 //! by the bulk-load builder — covering `range`/`rev_range` (all `Bound`
 //! combinations) and a multi-megabyte overflow value, which the oracle `Op`

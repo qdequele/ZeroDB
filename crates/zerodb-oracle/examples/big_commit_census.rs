@@ -1,5 +1,5 @@
-//! Large-commit census for the gap Meilisearch's hackernews indexing showed
-//! (`indexing::scheduler::commit` 1.23× LMDB at 1M documents): batches shaped
+//! Large-commit census for Meilisearch's indexing commit
+//! (`indexing::scheduler::commit`, hackernews at 1M documents): batches shaped
 //! like a milli indexing txn — one write txn per batch, many puts in random
 //! key order spread over several named databases, a Meilisearch-like value
 //! size mix (mostly tiny bitmaps, some mid-size, a few overflow values), and

@@ -1,4 +1,4 @@
-//! `dump` -> `load` -> `dump` round-trip over a zerodb env (M1.12 acceptance,
+//! `dump` -> `load` -> `dump` round-trip over a zerodb env (tools acceptance,
 //! pure zerodb — no heed): the two dumps are byte-identical and the reloaded env
 //! is invariant-clean.
 

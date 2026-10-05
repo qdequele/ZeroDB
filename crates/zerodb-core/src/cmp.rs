@@ -1,10 +1,10 @@
-//! Custom key comparators (**milestone 2.4**; SPEC 03 §2.0, D-004).
+//! Custom key comparators (SPEC 03 §2.0; see docs/DIVERGENCES.md, DatabaseFlags).
 //!
 //! LMDB exposes `mdb_set_compare(txn, dbi, MDB_cmp_func*)` — a raw C function
 //! pointer installed per-dbi, per-open. heed hides it completely: its
 //! `Comparator` trait exists but every `Database` is `DefaultComparator`, and
-//! nothing in heed's open path ever reaches `mdb_set_compare`. Phase 1
-//! therefore assumed unsigned lexicographic byte order everywhere (SPEC 00
+//! nothing in heed's open path ever reaches `mdb_set_compare`. The LMDB-parity
+//! baseline therefore assumed unsigned lexicographic byte order everywhere (SPEC 00
 //! row 53, SPEC 03 §2 invariant BT-1). This module lifts that assumption for
 //! **named** databases, as a safe Rust trait rather than a function pointer.
 //!
@@ -12,7 +12,7 @@
 //!
 //! | Tree | Comparator | Why |
 //! |---|---|---|
-//! | A named DB | caller's, or memcmp | the whole point of this milestone |
+//! | A named DB | caller's, or memcmp | the whole point of this module |
 //! | The main / unnamed DB | **always memcmp** | it doubles as the named-DB catalog (SPEC 02 §6). Catalog keys are DB *names* and catalog values are engine-internal `DBRecord` bytes; re-ordering them under caller-supplied logic would put engine metadata at the mercy of user code, and a panicking or inconsistent comparator would corrupt the catalog rather than one database. See [`ComparatorError::MainDatabase`]. |
 //! | The GC / free tree | **always memcmp** | keys are big-endian txnids (SPEC 05); memcmp order *is* numeric order, and the GC gate depends on it. Not reachable from the public API at all. |
 //!
@@ -40,11 +40,11 @@
 //!   is exactly 48 bytes with every byte assigned (SPEC 02 §3.1 — `root`,
 //!   4 × page/entry counters, `depth`, `flags`, `leaf2_ksize`), and its only
 //!   two unassigned *values* (`flags` at offset 42, `leaf2_ksize` at offset
-//!   44) are already earmarked for DUPSORT/DUPFIXED in milestone 2.8.
+//!   44) are already earmarked for DUPSORT/DUPFIXED support.
 //!   Widening the record or repurposing those fields is an on-disk **format**
-//!   decision, which CLAUDE.md rule 6 puts behind an ADR and human approval —
-//!   deliberately not taken here. The hazard is therefore **documented, not
-//!   mitigated**, and is filed as D-014.
+//!   decision that requires an ADR — deliberately not taken here. The hazard
+//!   is therefore **documented, not mitigated**, and is filed in
+//!   docs/DIVERGENCES.md (comparator persistence).
 //!
 //! ## Requirements on an implementation
 //!
@@ -52,10 +52,9 @@
 //! total, and *deterministic* — the same pair of byte strings must always
 //! compare the same way, for the life of the data, across processes and
 //! releases. Violating this does not trigger Rust unsafety (nothing here is
-//! `unsafe`; the crate is `#![deny(unsafe_code)]` outside `page::raw`), but it does corrupt
-//! the tree in the ordinary sense: a B+tree built under an inconsistent
-//! ordering has no correct search path, and `zerodb-tools check` will report
-//! INV-5/INV-6 violations.
+//! `unsafe`), but it does corrupt the tree in the ordinary sense: a B+tree
+//! built under an inconsistent ordering has no correct search path, and
+//! `zerodb-tools check` will report INV-5/INV-6 violations.
 //!
 //! A comparator that **panics** unwinds through the engine. Inside a write
 //! transaction that is safe in the RAII sense — the `RwTxn` is dropped and its
@@ -66,7 +65,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-/// A total order over raw key bytes (**milestone 2.4**) — ZeroDB's safe
+/// A total order over raw key bytes — ZeroDB's safe
 /// replacement for LMDB's `MDB_cmp_func` C function pointer.
 ///
 /// Implementations must be a deterministic total order; see the [module
@@ -173,10 +172,11 @@ pub enum KeyCmp<'a> {
 /// two slices of the same length 8 or 4. For equal-length slices, comparing them
 /// as big-endian integers is *identical* to memcmp order (the most significant
 /// differing byte decides both), so this returns exactly `a.cmp(b)` — but as one
-/// integer load and compare each rather than a `memcmp` call (roadmap 7e; the
-/// aarch64 hot path showed `bl _memcmp` on every probe, PERF-GAP B13). Every
-/// other length pair, including 8-vs-4, falls through to the slice comparison,
-/// which never reads past either slice's length.
+/// integer load and compare each rather than a `memcmp` call (the aarch64 hot
+/// path showed `bl _memcmp` on every probe; see docs/PERF-GAP-VS-LMDB.md,
+/// default key compare). Every other length pair, including 8-vs-4, falls
+/// through to the slice comparison, which never reads past either slice's
+/// length.
 #[inline]
 fn default_cmp_fast(a: &[u8], b: &[u8]) -> Ordering {
     match (a.len(), b.len()) {
@@ -231,7 +231,7 @@ impl std::fmt::Debug for KeyCmp<'_> {
     }
 }
 
-/// Why registering a comparator was refused (milestone 2.4).
+/// Why registering a comparator was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComparatorError {
     /// A comparator was requested for the main / unnamed database. Refused
@@ -244,7 +244,7 @@ pub enum ComparatorError {
     ///
     /// Refused rather than resolved: silently keeping either one would leave
     /// half the process reading the database under an ordering it did not ask
-    /// for, which is the exact failure mode this milestone is trying to make
+    /// for, which is the exact failure mode this module is trying to make
     /// impossible to reach by accident.
     Mismatch {
         /// The [`Comparator::name`] already registered for this database.
@@ -275,7 +275,7 @@ impl std::fmt::Display for ComparatorError {
 
 impl std::error::Error for ComparatorError {}
 
-/// The environment's per-database comparator table (milestone 2.4).
+/// The environment's per-database comparator table.
 ///
 /// Sized `max_dbs` at env open and indexed by dbi, so a lookup on the read
 /// path is an index and a `OnceLock::get` — no lock, no allocation. Each slot
@@ -445,7 +445,7 @@ mod tests {
         assert!(r.get(9).is_default());
     }
 
-    // --- roadmap 7e: equal-length integer-compare fast path ---
+    // --- equal-length integer-compare fast path ---
 
     /// The 8-/4-byte fast path must return exactly memcmp order on the edges
     /// that a naive integer compare could get wrong.

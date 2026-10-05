@@ -1,10 +1,10 @@
-//! Roadmap #10 — `free_page_count` over a real, fragmented GC tree.
+//! `free_page_count` over a real, fragmented GC tree.
 //!
 //! Complements the entry-level equivalence proof in
 //! `crates/zerodb-core/tests/free_count_prefix.rs`: here the count is taken from
 //! an actual B+tree free DB holding many small PIL entries — the shape milli's
-//! `non_free_pages_size()` probe pays for, and the one roadmap #10's
-//! count-prefix-only walk (SPEC 05 GC-23) optimises. A filled DB is torn down
+//! `non_free_pages_size()` probe pays for, and the one the count-prefix-only
+//! walk (SPEC 05 GC-23) optimises. A filled DB is torn down
 //! across several committed txns under a pinned reader so each commit's freed
 //! pages accumulate as their own GC entry instead of recycling the previous
 //! one, then the count is checked for internal consistency (INV-27) against an
@@ -112,7 +112,7 @@ fn free_page_count_over_fragmented_gc_tree() {
     let gc_tree = g.branch_pages + g.leaf_pages + g.overflow_pages;
     drop(rtxn);
 
-    // INV-27 (SPEC 05 §9, amended 2026-09-29) over the same several-entry
+    // INV-27 (SPEC 05 §9) over the same several-entry
     // tree: user-tree pages (`non_free_pages_size`), GC-tree pages, free pages
     // and the two meta slots partition the file exactly.
     let disk = env.real_disk_size().unwrap();

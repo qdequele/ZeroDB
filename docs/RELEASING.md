@@ -19,7 +19,7 @@ publish of the four engine crates (`zerodb-core`, `zerodb-io`, `zerodb`,
 
 ## Before tagging
 
-1. **Gate, all of it** (CLAUDE.md "Commands"), on the release commit:
+1. **Gate, all of it** (the "Checks" section of `AGENTS.md`), on the release commit:
 
    ```sh
    cargo fmt --all -- --check
@@ -49,7 +49,7 @@ publish of the four engine crates (`zerodb-core`, `zerodb-io`, `zerodb`,
 3. **Truth pass on the docs.** README status paragraph, `docs/COMPATIBILITY.md`
    (every heed item and LMDB feature with its status), `docs/DIVERGENCES.md`
    (nothing PROPOSED that the release depends on), `docs/DECISIONS.md` matching
-   each ADR's own status line, `PROGRESS.md` entry for the release.
+   each ADR's own status line.
 
 4. **Versions.** Bump `version` in every engine crate (`zerodb-core`,
    `zerodb-io`, `zerodb`, `zerodb-tools`, `zerodb-oracle`) to the same value.
@@ -68,7 +68,7 @@ publish of the four engine crates (`zerodb-core`, `zerodb-io`, `zerodb`,
 6. **On-disk format.** If `FORMAT_VERSION` (`crates/zerodb-core/src/page/mod.rs`)
    changed since the last release, the entry must say so in its first line and
    give the migration path (`zerodb-tools dump` on the old binary, `load` on the
-   new one). A format bump is an ADR (CLAUDE.md rule 6) and a minor-version bump
+   new one). A format bump is an ADR (`AGENTS.md` rule 5) and a minor-version bump
    at least while 0.x.
 
 7. **Publish dry run** on the release commit (CI does the manifest-only

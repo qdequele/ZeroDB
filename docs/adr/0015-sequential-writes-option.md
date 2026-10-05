@@ -1,7 +1,8 @@
 # ADR-0015: Opt-in sequential-writes fast path (env option, per-database override)
 
 - Status: Accepted (2026-09-28); kept only if the measurement gate below passes
-- Milestone: Phase 3 (performance), PERF-GAP roadmap #6
+- Implementation note (2026-10-05): gate passed, kept — 1fece73 + 7f6a36b (`benches/results/perf-ledger.jsonl`).
+- Milestone: Phase 3 (performance)
 - Date: 2026-09-28
 
 ## Context

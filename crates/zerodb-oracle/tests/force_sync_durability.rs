@@ -1,10 +1,10 @@
-//! Milestone 2.5 — explicit `sync(force)` / `force_sync()`, `mdb_env_sync`
-//! parity, proved against the M1.11 fault-injection backing.
+//! Explicit `sync(force)` / `force_sync()`, `mdb_env_sync` parity, proved
+//! against the crash harness's fault-injection backing.
 //!
 //! The claim "`force_sync` makes everything durable" is only meaningful if
 //! something can observe non-durability. [`FaultBacking`] is exactly that
 //! observer: it journals every un-barriered write and folds the journal into
-//! the durable image only on a real barrier. So the milestone reduces to two
+//! the durable image only on a real barrier. So the feature reduces to two
 //! checkable facts about a `NO_SYNC` env, which commits without any barrier:
 //!
 //!   1. **Before** `force_sync`, the journal is non-empty and the crash-floor
@@ -13,16 +13,11 @@
 //!      opens and reads back every committed key — i.e. a power cut at that
 //!      instant loses nothing.
 //!
-//! The `force` parameter's semantics come from the fork's `mdb_env_sync0`,
-//! read at `lmdb-master-sys-0.2.6/lmdb/libraries/liblmdb/mdb.c`:
-//!
-//! ```text
-//! if (env->me_flags & MDB_RDONLY) return EACCES;
-//! if (force || !(env->me_flags & MDB_NOSYNC)) { ...flush... }
-//! ```
-//!
-//! so `sync(false)` on a `NO_SYNC` env is a **no-op returning success** — the
-//! one behavioral difference between the two `force` values, asserted below.
+//! The `force` parameter's semantics come from the fork's `mdb_env_sync0`
+//! (`mdb.c`): a read-only env returns `EACCES` first; otherwise it flushes
+//! only if `force || !MDB_NOSYNC` — so `sync(false)` on a `NO_SYNC` env is a
+//! **no-op returning success**, the one behavioral difference between the
+//! two `force` values, asserted below.
 //! heed exposes only `force_sync()` (= `force = true`), so there is no heed
 //! API to run a cross-engine differential against for `force = false`; the
 //! LMDB side is pinned by reading the fork and by the `EACCES` differential,
@@ -132,7 +127,7 @@ fn sample_keys(n: usize, tag: u8) -> BTreeMap<Vec<u8>, Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
-// The core milestone claim
+// The core claim
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -158,7 +153,7 @@ fn force_sync_on_a_nosync_env_empties_the_journal_and_makes_data_durable() {
         "NO_SYNC commit must not have issued a barrier"
     );
 
-    // (2) force_sync — the whole point of the milestone.
+    // (2) force_sync — the whole point of the feature.
     env.force_sync().expect("force_sync on a NO_SYNC env");
 
     let after = handle.capture();
@@ -227,7 +222,7 @@ fn force_sync_is_idempotent_and_always_issues_a_barrier() {
 }
 
 // ---------------------------------------------------------------------------
-// The `force` parameter (the 2.5 API addition)
+// The `force` parameter
 // ---------------------------------------------------------------------------
 
 #[test]

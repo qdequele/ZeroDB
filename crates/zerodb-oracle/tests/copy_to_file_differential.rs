@@ -1,8 +1,8 @@
 //! `copy_to_file` differential: heed (the LMDB fork) vs zerodb, both compaction
-//! options (M1.12, PLAN §1.12; SPEC 00 rows 17/59). We copy an equivalent env
+//! options (SPEC 00 rows 17/59). We copy an equivalent env
 //! through each engine's `copy_to_file`, reopen the **copies**, and assert their
 //! logical content is identical — dump-equality, not byte-equality (the on-disk
-//! formats differ, D-002).
+//! formats differ).
 //!
 //! copy_to_file ops are deliberately NOT added to the fuzz op model (they take
 //! their own internal read txn and produce a file, not an in-env state change);

@@ -18,7 +18,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 zerodb-oracle = { path = "../crates/zerodb-oracle" }
 # zerodb-core carries no C linkage; the fuzz crate is its own workspace, so this
-# is safe to add for the page-decode target (M1.1).
+# is safe to add for the page-decode target.
 zerodb-core = { path = "../crates/zerodb-core" }
 
 [[bin]]

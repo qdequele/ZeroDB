@@ -2,7 +2,7 @@
 //!
 //! Every page view in this module rests on one contract: the cells an
 //! accessor reads without bounds checks were proven in-bounds when the view
-//! was built (the A3 view contract). By default ZeroDB proves it itself, by
+//! was built (the unchecked-read view contract). By default ZeroDB proves it itself, by
 //! walking every cell of a map page the first time a txn sees it. An env
 //! opened with [`FileTrust::trust_contents`] instead takes the proof from the
 //! caller, as LMDB does for every page: only the O(1) header checks (page

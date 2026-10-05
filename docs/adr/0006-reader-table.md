@@ -1,9 +1,8 @@
 # ADR-0006: MVCC reader table — implementation strategy (slot table, publish cell, oldest-reader, loom/stress plan)
 
-- Status: Approved — 2026-07-16, via **session-lead review under Quentin's
+- Status: Approved — 2026-07-16, via **delegated review under the maintainer's
   standing directive of 2026-07-16** (not a direct per-document sign-off; the
-  standing directive delegates ratification of M1.8 decisions to session-lead
-  review, and the spec-review verdict of the same day — "committable
+  standing directive delegates ratification of M1.8 decisions to that review, and the spec-review verdict of the same day — "committable
   conditionally, protocol passes site-by-site on ARM" — is incorporated with
   its conditions applied below)
 - Milestone: 1.8 (MVCC reader table and concurrency)

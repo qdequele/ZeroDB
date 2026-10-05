@@ -1,4 +1,4 @@
-//! `zerodb-tools` binary entry point (M1.12). Parses argv and dispatches
+//! `zerodb-tools` binary entry point. Parses argv and dispatches
 //! through [`zerodb_tools::run`]; all logic lives in the library so it is
 //! testable.
 

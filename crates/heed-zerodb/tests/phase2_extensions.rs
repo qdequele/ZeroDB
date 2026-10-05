@@ -1,13 +1,15 @@
-//! Phase 2 tranche A at the adapter boundary (milestones 2.1, 2.5, 2.6).
+//! heed API extensions at the adapter boundary: env stat/info, `sync(force)`,
+//! page-size selection, reader introspection, copy with progress, custom
+//! comparators and the remaining SHOULD items.
 //!
 //! Two things are checked here that the native `zerodb` tests cannot:
 //!
-//!   1. The **completed** `Env::info()` / `Env::stat()` / `max_readers()`
-//!      reach the adapter with real values (Phase 1 hardcoded zeros and the
-//!      126 constant), *without* changing the mirrored heed struct shapes.
-//!   2. The two **new** methods — `EnvOpenOptions::page_size` and
-//!      `Env::sync(force)` — exist, work, and are purely additive: heed has
-//!      neither, and code that never calls them behaves exactly as before.
+//!   1. `Env::info()` / `Env::stat()` / `max_readers()` reach the adapter
+//!      with real values (not zeros or the 126 constant), *without* changing
+//!      the mirrored heed struct shapes.
+//!   2. The extension methods `EnvOpenOptions::page_size` and
+//!      `Env::sync(force)` exist, work, and are purely additive: heed has
+//!      neither, and code that never calls them gets heed's behavior.
 
 use heed_zerodb::types::{Bytes, Str};
 use heed_zerodb::{Database, EnvOpenOptions};
@@ -17,7 +19,7 @@ fn env_opts() -> EnvOpenOptions<heed_zerodb::WithoutTls> {
 }
 
 // ---------------------------------------------------------------------------
-// 2.1 — stat / info
+// stat / info
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -60,7 +62,7 @@ fn env_info_is_fully_populated_through_the_adapter() {
     assert_eq!(env.live_readers(), 2);
     drop(r1);
     drop(r2);
-    // D-011: `number_of_readers` mirrors LMDB's high-water `me_numreaders`, so
+    // LMDB parity: `number_of_readers` mirrors LMDB's high-water `me_numreaders`, so
     // it stays at 2; the ZeroDB extension `live_readers` drops to 0.
     assert_eq!(
         env.info().number_of_readers,
@@ -98,8 +100,8 @@ fn env_stat_reports_the_main_tree_through_the_adapter() {
 
 #[test]
 fn env_stat_works_with_the_reader_table_exhausted() {
-    // Phase 1's adapter `stat()` opened its own read txn and silently returned
-    // all-zeros if that failed. 2.1 reads the published snapshot instead.
+    // `stat()` reads the published snapshot, not a read txn, so a full reader
+    // table must not turn it into all-zeros.
     let dir = tempfile::tempdir().unwrap();
     let mut opts = env_opts();
     opts.map_size(1024 * 1024).max_dbs(4).max_readers(1);
@@ -120,7 +122,7 @@ fn env_stat_works_with_the_reader_table_exhausted() {
 }
 
 // ---------------------------------------------------------------------------
-// 2.5 — sync(force)
+// sync(force)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -137,7 +139,7 @@ fn sync_and_force_sync_are_both_reachable_and_succeed() {
 
     // heed's form.
     env.force_sync().expect("force_sync");
-    // The 2.5 extension, both values. On a default (non-NO_SYNC) env both
+    // The `sync(force)` extension, both values. On a default (non-NO_SYNC) env both
     // flush, so both simply succeed; the behavioral split is only visible
     // under NO_SYNC and is asserted in
     // `zerodb-oracle/tests/force_sync_durability.rs` against the fault backing.
@@ -186,7 +188,7 @@ fn sync_on_a_readonly_env_is_eacces() {
 }
 
 // ---------------------------------------------------------------------------
-// 2.6 — page_size
+// page_size
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -221,14 +223,12 @@ fn page_size_is_selectable_through_the_adapter() {
 
 #[test]
 fn omitting_page_size_defaults_to_the_os_page_size() {
-    // LMDB parity (contract CHANGED 2026-07-21, perf-parity spike): the fork
-    // derives `me_psize` from `sysconf(_SC_PAGE_SIZE)` (capped 64 K) at store
-    // creation, so an adapter-created store must adopt the same geometry —
-    // 16 K on Apple Silicon, 4 K on x86_64 Linux — not the native engine's
-    // fixed 4 K default. Before this change the adapter silently created 4 K
-    // stores on 16 K-page hosts, a heed-observable divergence
-    // (`Env::stat().page_size`) and an unfair handicap vs LMDB. SPEC 00
-    // row 164 records the new default.
+    // LMDB parity (SPEC 00 row 164): the fork derives `me_psize` from
+    // `sysconf(_SC_PAGE_SIZE)` (capped 64 K) at store creation, so an
+    // adapter-created store must adopt the same geometry — 16 K on Apple
+    // Silicon, 4 K on x86_64 Linux — not the native engine's fixed 4 K
+    // default. A 4 K store on a 16 K-page host would be a heed-observable
+    // divergence (`Env::stat().page_size`) and an unfair handicap vs LMDB.
     let os_page = u32::try_from(unsafe { libc::sysconf(libc::_SC_PAGE_SIZE) })
         .unwrap()
         .clamp(zerodb::MIN_PAGE_SIZE, zerodb::MAX_PAGE_SIZE);
@@ -254,7 +254,7 @@ fn an_invalid_page_size_is_rejected_at_open() {
 
 #[test]
 fn page_size_survives_the_tls_retag() {
-    // `read_txn_without_tls()` rebuilds the options struct; the new field must
+    // `read_txn_without_tls()` rebuilds the options struct; `page_size` must
     // be carried across (a field added to a builder is easy to drop in retag).
     let dir = tempfile::tempdir().unwrap();
     let mut opts = EnvOpenOptions::new();
@@ -266,10 +266,10 @@ fn page_size_survives_the_tls_retag() {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 2 tranche B (milestones 2.2, 2.3, 2.4, 2.7) at the adapter boundary
+// Reader introspection, copy progress, comparators, SHOULD leftovers
 // ---------------------------------------------------------------------------
 
-// 2.2 — reader introspection -------------------------------------------------
+// reader introspection -------------------------------------------------------
 
 #[test]
 fn reader_list_through_the_adapter_tracks_live_read_txns() {
@@ -326,7 +326,7 @@ fn clear_stale_readers_through_the_adapter_is_zero_and_harmless() {
     drop(r);
 }
 
-// 2.3 — copy with progress ---------------------------------------------------
+// copy with progress ---------------------------------------------------------
 
 #[test]
 fn copy_to_path_with_progress_through_the_adapter() {
@@ -367,7 +367,7 @@ fn copy_to_path_with_progress_through_the_adapter() {
     }
 }
 
-// 2.4 — heed's type-level comparator is finally honored -----------------------
+// heed's type-level comparator is honored ------------------------------------
 
 /// Descending byte order, in heed's type-level `Comparator` shape.
 enum ReverseComparator {}
@@ -380,10 +380,9 @@ impl heed_zerodb::Comparator for ReverseComparator {
 
 #[test]
 fn database_open_options_key_comparator_is_actually_applied() {
-    // Before 2.4 the `C` type parameter on `DatabaseOpenOptions::key_comparator`
-    // was accepted and then silently ignored — every database was memcmp. A
-    // caller asking for a different ordering got no error and no effect. This
-    // asserts the ordering now reaches the engine.
+    // Regression: the `C` type parameter on
+    // `DatabaseOpenOptions::key_comparator` must reach the engine, not be
+    // accepted and silently ignored (every database memcmp).
     let dir = tempfile::tempdir().unwrap();
     let mut opts = env_opts();
     opts.map_size(8 * 1024 * 1024).max_dbs(4);
@@ -430,8 +429,9 @@ fn database_open_options_key_comparator_is_actually_applied() {
 
 #[test]
 fn default_comparator_databases_are_unaffected_by_the_2_4_plumbing() {
-    // The whole consumer tree is DefaultComparator (SPEC 00 row 53). 2.4 must
-    // be a strict no-op for them — no registration, no behavior change.
+    // The whole consumer tree is DefaultComparator (SPEC 00 row 53). The
+    // comparator plumbing must be a strict no-op for them — no registration,
+    // no behavior change.
     let dir = tempfile::tempdir().unwrap();
     let mut opts = env_opts();
     opts.map_size(4 * 1024 * 1024).max_dbs(4);
@@ -462,7 +462,7 @@ fn default_comparator_databases_are_unaffected_by_the_2_4_plumbing() {
     assert!(out.exists());
 }
 
-// 2.7 — SHOULD leftovers -----------------------------------------------------
+// SHOULD leftovers -----------------------------------------------------------
 
 #[test]
 fn max_key_size_reflects_the_engine_constant() {

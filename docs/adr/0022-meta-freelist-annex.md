@@ -1,6 +1,6 @@
 # ADR-0022: Meta free-list annex — the per-commit freed PIL rides in the meta page
 
-- Status: **Accepted (2026-10-05, Quentin)** — format change (`FORMAT_VERSION`
+- Status: **Accepted (2026-10-05, maintainer)** — format change (`FORMAT_VERSION`
   1→2) directly ratified per CLAUDE.md rule 6, together with the crash-harness
   seed re-pin (198). Implemented first as a spike on approval relayed
   2026-10-02/03; re-gated on main after ADR-0021 (in-place WRITE_MAP) merged,
@@ -25,7 +25,8 @@
   save), PERF-GAP-VS-LMDB §B12; forward-looking toward PLAN 3.1.
 - Date: 2026-10-03
 - Numbering note: ADR-0021 (WRITE_MAP in-place) lives on its own open branch;
-  this ADR takes 0022 to avoid colliding with it.
+  this ADR takes 0022 to avoid colliding with it. (ADR-0021 has since merged,
+  PR #88; this ADR merged as PR #89, d155fe6.)
 
 ## Context
 
@@ -208,7 +209,7 @@ API-visible behavior, which is unchanged).
 ## Open questions for human review
 
 1. ~~Ratify the format change itself (CLAUDE.md rule 6).~~ **Resolved
-   2026-10-05:** ratified directly by Quentin.
+   2026-10-05:** ratified directly by the maintainer.
 2. ~~Cap policy: full `(psize − 176)/8` (chosen) vs a smaller policy cap.~~
    **Resolved 2026-10-05:** the full cap is accepted with the ADR.
 3. Whether PLAN 3.1 should absorb this as its first stage (the annex is the

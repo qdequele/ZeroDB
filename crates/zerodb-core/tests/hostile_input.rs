@@ -5,10 +5,9 @@
 //! txn entry points the real I/O layer uses, over a heap backing so the whole
 //! suite also runs under miri.
 //!
-//! Regression tests for the first-release security review (2026-09):
-//! truncated-file geometry (open validation + the read-side `last_pg` bound),
-//! zero-child branches, hostile GC freelists, hostile tree depths, and the
-//! checker's checked arithmetic. Do not weaken these (CLAUDE.md rule 2).
+//! Covers truncated-file geometry (open validation + the read-side `last_pg`
+//! bound), zero-child branches, hostile GC freelists, hostile tree depths,
+//! hostile record stats, and the checker's checked arithmetic.
 
 use zerodb_core::check::check_image;
 use zerodb_core::env::testutil::VecBacking;
@@ -75,14 +74,14 @@ fn leaf_frame(pgno: u64, txnid: u64, key: &[u8], val: &[u8]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// H1 — open-time geometry validation (SPEC 06 REC-1a / SPEC 02 §3.2 step 6)
+// Open-time geometry validation (SPEC 06 REC-1a / SPEC 02 §3.2 step 6)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn open_rejects_last_pg_past_file_end() {
     // Valid CRC, but last_pg names pages the 2-page "file" cannot back. On a
-    // real env the mapping covers the whole map_size, so pre-fix the first
-    // read of such a page was a SIGBUS on unbacked bytes.
+    // real env the mapping covers the whole map_size, so without this check
+    // the first read of such a page would SIGBUS on unbacked bytes.
     let img = craft_image(2, |m| m.last_pg = 100, &[]);
     let e = open_image(img, "lastpg").unwrap_err();
     assert!(matches!(e, Error::Mdb(MdbError::Invalid)), "got {e:?}");
@@ -98,11 +97,11 @@ fn open_rejects_last_pg_overflow() {
 
 #[test]
 fn open_rejects_txnid_in_sentinel_band() {
-    // Found by fuzz_image_open: the reader table encodes slot occupancy in
-    // the top-of-u64 sentinel band (RDR_FREE/RDR_CLAIMED), so a hostile meta
-    // txnid up there panicked the pin protocol's TXN-14 assumption (debug)
-    // or aliased the sentinels (release); the writer's `txnid + 1` can also
-    // wrap. Must be rejected at open.
+    // The reader table encodes slot occupancy in the top-of-u64 sentinel band
+    // (RDR_FREE/RDR_CLAIMED), so a hostile meta txnid up there would break
+    // the pin protocol's TXN-14 assumption (debug panic) or alias the
+    // sentinels (release); the writer's `txnid + 1` can also wrap. Must be
+    // rejected at open.
     // The bound leaves a 2^32 margin below the band; everything from the
     // margin up is refused, not just the three sentinel-adjacent values.
     let limit = u64::MAX - 1 - (1u64 << 32); // readers::MAX_COMMITTED_TXNID
@@ -124,7 +123,7 @@ fn open_rejects_txnid_in_sentinel_band() {
 
 #[test]
 fn writer_refuses_to_commit_into_the_sentinel_band() {
-    // Spec review 2026-09-09: an open-time check alone is one commit deep — a
+    // An open-time check alone is one commit deep — a
     // meta exactly at the bound would be accepted and reach RDR_CLAIMED two
     // commits later. The writer re-enforces the bound: at `base.txnid ==
     // MAX_COMMITTED_TXNID` the store still opens (reads work) but no write
@@ -205,7 +204,7 @@ fn open_accepts_valid_geometry() {
 }
 
 // ---------------------------------------------------------------------------
-// H1b — the read-side page resolver refuses pgnos beyond the snapshot
+// The read-side page resolver refuses pgnos beyond the snapshot
 // high-water (typed error, not an out-of-bounds map read)
 // ---------------------------------------------------------------------------
 
@@ -237,7 +236,7 @@ fn read_refuses_reference_past_high_water() {
 }
 
 // ---------------------------------------------------------------------------
-// H2 — a branch page with zero children is rejected at decode
+// A branch page with zero children is rejected at decode
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -266,15 +265,15 @@ fn zero_child_branch_as_root_reads_typed_error() {
     let env = open_image(img, "empty-branch").unwrap();
     let txn = env.read_txn().unwrap();
     let db = env.main_database();
-    // Pre-fix: BranchRef::new accepted the page and descend_min's
-    // `child_pgno(0)` panicked on the index assert.
+    // Regression: descend_min's `child_pgno(0)` must not reach its index
+    // assert on a zero-child branch.
     assert!(db.get(&txn, b"k").is_err());
     assert!(db.first(&txn).is_err());
     assert!(db.last(&txn).is_err());
 }
 
 // ---------------------------------------------------------------------------
-// H4 — a hostile GC freelist must not hand out pages
+// A hostile GC freelist must not hand out pages
 // ---------------------------------------------------------------------------
 
 /// An image whose GC DB holds one entry `{txnid 1 -> pil}`.
@@ -303,9 +302,9 @@ fn gc_image(pil_ids: &[u64]) -> Vec<u8> {
 
 #[test]
 fn gc_freelist_naming_meta_page_is_invalid() {
-    // A hostile PIL listing page 0 (a meta slot). Pre-fix `gc_reclaim` handed
-    // it out and commit C2 clobbered the meta. The allocation-triggering put
-    // must fail typed instead.
+    // A hostile PIL listing page 0 (a meta slot). Handing it out would let
+    // commit C2 clobber the meta; the allocation-triggering put must fail
+    // typed instead.
     let env = open_image(gc_image(&[0]), "gc-meta").unwrap();
     let mut txn = env.write_txn().unwrap();
     let db = env.main_database();
@@ -327,8 +326,8 @@ fn gc_freelist_past_high_water_is_invalid() {
 
 #[test]
 fn gc_freelist_unsorted_is_invalid() {
-    // find_run/binary_search assume ascending ids; unsorted input previously
-    // reached an `expect` (panic) instead of a typed error. Both ids are in
+    // find_run/binary_search assume ascending ids; unsorted input must yield
+    // a typed error, not reach an `expect` (panic). Both ids are in
     // range (last_pg = 5 below), so only the ordering check can reject them.
     let ps = PS as usize;
     let mut pil = Vec::new();
@@ -358,7 +357,7 @@ fn gc_freelist_unsorted_is_invalid() {
 }
 
 // ---------------------------------------------------------------------------
-// M7/M8 — hostile depth: bounded everywhere, typed errors
+// Hostile depth: bounded everywhere, typed errors
 // ---------------------------------------------------------------------------
 
 /// A self-cycle branch (child 0 -> itself): with a hostile huge `depth` this
@@ -393,7 +392,7 @@ fn hostile_depth_read_and_write_paths_fail_typed() {
         assert!(db.first(&txn).is_err());
     }
     // Write path: search_path / rightmost_path gate the on-disk depth before
-    // building a path (pre-fix: a 65k-frame heap path whose delete-side
+    // building a path (otherwise: a 65k-frame heap path whose delete-side
     // rebalance recursion overflows the stack).
     {
         let mut txn = env.write_txn().unwrap();
@@ -412,10 +411,10 @@ fn hostile_depth_read_and_write_paths_fail_typed() {
 
 #[test]
 fn hostile_stat_counters_do_not_panic_the_write_path() {
-    // Found by fuzz_image_open: DBRecord stats are on-disk data; a hostile
-    // `entries = u64::MAX` (or 0) overflow/underflow-panicked the write
-    // path's `+= 1` / `-= 1` bookkeeping in debug builds. The mutation must
-    // proceed (stats saturate; INV-18 reports the drift), never panic.
+    // DBRecord stats are on-disk data; a hostile `entries = u64::MAX` (or 0)
+    // must not overflow/underflow-panic the write path's `+= 1` / `-= 1`
+    // bookkeeping in debug builds. The mutation must proceed (stats
+    // saturate; INV-18 reports the drift), never panic.
     let make = |entries: u64| {
         craft_image(
             3,
@@ -445,13 +444,14 @@ fn hostile_stat_counters_do_not_panic_the_write_path() {
 }
 
 // ---------------------------------------------------------------------------
-// H3 — the checker on hostile geometry: fast, checked, early-returning
+// The checker on hostile geometry: fast, checked, early-returning
 // ---------------------------------------------------------------------------
 
 #[test]
 fn checker_survives_last_pg_u64_max() {
-    // Pre-fix: `(last_pg + 1) * ps` wrapped, INV-17 did not return, and the
-    // reachable-XOR-free sweep looped ~2^64 times pushing a String per page.
+    // Guards against `(last_pg + 1) * ps` wrapping and INV-17 not returning,
+    // which would loop the reachable-XOR-free sweep ~2^64 times pushing a
+    // String per page.
     let img = craft_image(2, |m| m.last_pg = u64::MAX, &[]);
     let v = check_image(&img, PS);
     assert!(
@@ -473,7 +473,8 @@ fn checker_bounds_hostile_depth() {
         },
         &[(2, cycle_branch_frame(2, 1))],
     );
-    // Pre-fix: `walk` recursed one frame per level -> stack overflow.
+    // `walk` recurses one frame per level: an unbounded depth would overflow
+    // the stack.
     let v = check_image(&img, PS);
     assert!(
         v.iter()
@@ -509,7 +510,7 @@ fn checker_survives_hostile_overflow_run() {
 }
 
 // ---------------------------------------------------------------------------
-// Low-1 — `LeafMut::remove` over an unvalidated cell returns a typed error
+// `LeafMut::remove` over an unvalidated cell returns a typed error
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -520,8 +521,8 @@ fn leaf_remove_on_corrupt_cell_is_typed() {
         leaf.insert_inline(0, b"key", 0, b"value").unwrap();
     }
     // Corrupt the cell's dsize so it runs past the page body. `from_valid`
-    // is O(1) structural checks only (PERF-GAP A8) and is `pub`, so the cell
-    // walk cannot be assumed; pre-fix `remove` hit an `expect` (panic).
+    // is O(1) structural checks only and is `pub`, so the cell
+    // walk cannot be assumed; `remove` must not hit an `expect` (panic).
     let lower = u16::from_le_bytes([buf[24], buf[25]]) as usize;
     assert_eq!(lower, 2, "one pointer");
     let cpos = u16::from_le_bytes([buf[32], buf[33]]) as usize;
@@ -533,12 +534,12 @@ fn leaf_remove_on_corrupt_cell_is_typed() {
 }
 
 // ---------------------------------------------------------------------------
-// M6 — max_readers / max_dbs upper bounds
+// max_readers / max_dbs upper bounds
 // ---------------------------------------------------------------------------
 
 #[test]
 fn open_rejects_unbounded_max_readers_and_max_dbs() {
-    // Pre-fix: `max_readers(u32::MAX)` eagerly allocated u32::MAX cache-padded
+    // `max_readers(u32::MAX)` would eagerly allocate u32::MAX cache-padded
     // reader slots -> allocation-failure abort. Must be a fast typed error.
     let img = craft_image(2, |_| {}, &[]);
     let e = open_with_backing(

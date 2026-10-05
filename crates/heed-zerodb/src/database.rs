@@ -38,7 +38,7 @@ pub struct DatabaseStat {
 }
 
 /// Map heed `PutFlags` → ZeroDB `PutFlags` (SPEC 01 Table 3). Dup flags are
-/// dropped (no DUPSORT in Phase 1, D-004).
+/// dropped (DUPSORT is unsupported; see docs/DIVERGENCES.md).
 pub(crate) fn to_zdb_put_flags(f: PutFlags) -> zerodb::PutFlags {
     let mut z = zerodb::PutFlags::EMPTY;
     if f.contains(PutFlags::APPEND) {
@@ -51,8 +51,8 @@ pub(crate) fn to_zdb_put_flags(f: PutFlags) -> zerodb::PutFlags {
 }
 
 /// LMDB read-key size validation, re-imposed at the heed boundary (SPEC 03
-/// §2.1; the taxonomy the native engine's `bad_read_key` models, which SPEC
-/// notes "the caller applies … heed-zerodb at M1.13"). An **empty** key errors
+/// §2.1; the taxonomy the native engine's `bad_read_key` models, which the
+/// SPEC leaves to the caller — here, heed-zerodb). An **empty** key errors
 /// with `BadValSize` on `get`/`del`/neighbor-seeks/forward-prefix (both the
 /// read-only `prefix_iter` and the write cursor's `prefix_iter_mut` — heed
 /// realizes each as `MDB_SET_RANGE(prefix)`); an oversized key is *not* rejected
@@ -190,7 +190,8 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     /// # Errors
     ///
     /// `Encoding`/`Decoding` on codec failure; `Mdb(Invalid)` on corruption.
-    // Hint: inlined only at a raised LLVM threshold (PERF-GAP B13).
+    // Hint: inlined only at a raised LLVM threshold (see
+    // docs/PERF-GAP-VS-LMDB.md, hot paths above LLVM's inlining threshold).
     #[inline]
     pub fn get<'a, 'txn>(&self, txn: &'txn RoTxn, key: &'a KC::EItem) -> Result<Option<DC::DItem>>
     where
@@ -636,7 +637,8 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// # Errors
     ///
-    /// As [`Database::put`]; `Encoding` if `f` returns an error.
+    /// As [`Database::put`]; `Io` if `f` returns an error (the entry is still
+    /// written, as in LMDB).
     pub fn put_reserved<'a, F>(
         &self,
         txn: &mut RwTxn,
@@ -650,19 +652,17 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         self.assert_env(txn);
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
-        // PERF-GAP B6 (2026-07-21): hand the caller the engine's in-frame slot
-        // directly (the `MDB_RESERVE` shape) instead of a zeroed heap buffer
-        // copied in afterwards — one alloc + one full copy per reserved put
-        // gone. Two deliberate semantics, both fork-pinned by the oracle's
+        // Hand the caller the engine's in-frame slot directly (the
+        // `MDB_RESERVE` shape): no heap buffer, no copy. Two deliberate
+        // semantics, both fork-pinned by the oracle's
         // `put_reserved_failing_closure_leaves_entry_parity`:
         //  - the engine reserves the slot BEFORE the closure runs, so a
         //    closure error leaves the entry in place (LMDB cannot un-put a
-        //    reserve either) while the error still propagates as `Io` (the
-        //    fork's variant; pre-B6 this adapter returned `Encoding` and no
-        //    entry — a real divergence);
+        //    reserve either) while the error propagates as `Io` (the fork's
+        //    variant);
         //  - the slot may carry stale frame bytes (a COWed page's old cell
-        //    heap), so the unwritten tail is zeroed either way, preserving
-        //    the shipped zero-tail contract of the old heap buffer.
+        //    heap), so the unwritten tail is zeroed either way (the adapter's
+        //    zero-tail contract).
         let mut werr: Option<std::io::Error> = None;
         self.inner
             .put_reserved(txn.zdb_mut(), &kb, data_size, |slot| {
@@ -847,8 +847,8 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         self
     }
 
-    /// Set the database flags (SPEC 00 second table; D-004: non-empty rejected
-    /// at create).
+    /// Set the database flags (SPEC 00 second table; database flags are
+    /// unsupported, so a non-empty value is rejected at create).
     pub fn flags(&mut self, flags: DatabaseFlags) -> &mut Self {
         self.flags = flags;
         self
@@ -856,7 +856,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
 }
 
 /// Convert a heed `&str` name to ZeroDB bytes, re-imposing the fork's C-string
-/// rule (D-008 secondary). heed builds the dbi name with
+/// rule (see docs/DIVERGENCES.md). heed builds the dbi name with
 /// `CString::new(name).unwrap()`, so an embedded NUL **panics** — that is the
 /// fork's observable behavior (probed against heed =0.22.1's `raw_open_dbi`),
 /// which we reproduce exactly rather than inventing a clean error. No consumer
@@ -871,9 +871,9 @@ fn name_bytes(name: Option<&str>) -> Option<&[u8]> {
 
 impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP> {
     fn check_flags(&self) -> Result<()> {
-        // D-004: no consumer passes any DatabaseFlags; DUPSORT/INTEGER_KEY/etc.
-        // are unsupported in Phase 1. Reject a non-empty value cleanly rather
-        // than silently ignoring it (documented divergence note, D-004).
+        // No consumer passes any DatabaseFlags; DUPSORT/INTEGER_KEY/etc. are
+        // unsupported. Reject a non-empty value cleanly rather than silently
+        // ignoring it (documented in docs/DIVERGENCES.md).
         if !self.flags.is_empty() {
             return Err(Error::Mdb(MdbError::Incompatible));
         }
@@ -884,7 +884,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
     ///
     /// # Errors
     ///
-    /// `Mdb`(`BadValSize`/`Incompatible`); `Io` on an embedded-NUL name (D-008).
+    /// `Mdb`(`BadValSize`/`Incompatible`); `Io` on an embedded-NUL name.
     pub fn open(&self, rtxn: &RoTxn) -> Result<Option<Database<KC, DC, C, CDUP>>>
     where
         KC: 'static,
@@ -955,8 +955,7 @@ impl<T, KC, DC, C, CDUP> std::fmt::Debug for DatabaseOpenOptions<'_, '_, T, KC, 
 }
 
 /// Bridge from heed's **type-level** [`Comparator`] (an associated `compare`
-/// function, no receiver) to ZeroDB's object-safe `zerodb::Comparator`
-/// (**milestone 2.4**).
+/// function, no receiver) to ZeroDB's object-safe `zerodb::Comparator`.
 ///
 /// heed's shape is a marker type, so this is a zero-sized forwarder; the
 /// `type_name` is a stable-enough identity for ZeroDB's in-process
@@ -964,9 +963,8 @@ impl<T, KC, DC, C, CDUP> std::fmt::Debug for DatabaseOpenOptions<'_, '_, T, KC, 
 ///
 /// `C` appears only behind `fn() -> C`, a function-pointer type that is
 /// unconditionally `Send + Sync`, so this is `Send + Sync` for **any** `C`
-/// with no `unsafe impl` — which matters, because CLAUDE.md's unsafe policy
-/// for this crate covers only what heed's pointer model forces, and this does
-/// not need to be on that list.
+/// with no `unsafe impl`, keeping this crate's `unsafe` to what heed's pointer
+/// model forces.
 struct HeedComparator<C>(PhantomData<fn() -> C>);
 
 impl<C: Comparator + 'static> zerodb::Comparator for HeedComparator<C> {
@@ -980,14 +978,12 @@ impl<C: Comparator + 'static> zerodb::Comparator for HeedComparator<C> {
 }
 
 /// The ZeroDB comparator to register for a database typed with heed
-/// comparator `C`, or `None` when `C` is heed's [`DefaultComparator`]
-/// (**milestone 2.4**).
+/// comparator `C`, or `None` when `C` is heed's [`DefaultComparator`].
 ///
 /// `DefaultComparator` is memcmp — exactly ZeroDB's built-in ordering — so
 /// registering a forwarder for it would trade an inlined `slice::cmp` for a
 /// vtable call on the hot path of every consumer, all of which use it (SPEC 00
-/// row 53). Returning `None` keeps the default path bit-for-bit what it was
-/// before this milestone.
+/// row 53). Returning `None` keeps the default path on the built-in memcmp.
 fn custom_comparator<C: Comparator + 'static>() -> Option<Box<dyn zerodb::Comparator>> {
     if std::any::TypeId::of::<C>() == std::any::TypeId::of::<DefaultComparator>() {
         None

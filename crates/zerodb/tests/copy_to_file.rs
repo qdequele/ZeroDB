@@ -1,4 +1,4 @@
-//! `Env::copy_to_file` (M1.12): both compaction options produce a copy whose
+//! `Env::copy_to_file`: both compaction options produce a copy whose
 //! logical content equals the source and which passes the invariant walker.
 
 use std::path::{Path, PathBuf};

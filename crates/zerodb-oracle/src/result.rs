@@ -2,7 +2,7 @@
 
 /// The normalized error taxonomy the oracle compares on. Maps from
 /// `heed::Error` / `heed::MdbError` on the LMDB side; the native zerodb engine
-/// (M1.2+) must map its errors into the same variants under the same conditions
+/// must map its errors into the same variants under the same conditions
 /// (see `docs/SPEC` error-taxonomy notes and SPEC 00 rows 54–58).
 #[derive(Clone, PartialEq, Eq, Debug, thiserror::Error)]
 pub enum OracleError {
@@ -53,10 +53,11 @@ pub enum Skip {
     /// with a write txn that has dropped-and-reused that dbi number trips an
     /// LMDB dbi-reuse hazard (`EINVAL` from `mdb_get` on the reused slot) that
     /// no consumer exercises — zerodb returns the correct MVCC answer (absent →
-    /// `None`). See DIVERGENCES D-009. Concurrent reader-vs-writer isolation is
-    /// exercised properly with the M1.8 reader table.
+    /// `None`). See the dropped-and-reused dbi entry in docs/DIVERGENCES.md.
+    /// Concurrent reader-vs-writer isolation is exercised properly through the
+    /// reader table.
     VerifyDuringWrite,
-    /// The op is not yet implemented by one of the engines in this milestone, so
+    /// The op is not yet implemented by one of the engines, so
     /// [`crate::run`] skips it symmetrically on both sides (see
     /// [`crate::Engine::implements`]). A differential run restricts itself to the
     /// ops both engines support.

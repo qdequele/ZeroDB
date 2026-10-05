@@ -1,9 +1,9 @@
 # ADR-0010: Env directory presentation — the data-file name (`zerodb.dat` vs heed's `data.mdb` contract)
 
-- Status: **Approved** — Option A adopted (approved by Quentin, 2026-07-20,
-  standing directive as session lead). **Implemented 2026-07-20**; see
-  §Consequences for the acceptance criteria and PROGRESS.md for the landing
-  note. D-012 is flipped to APPROVED/resolved.
+- Status: **Approved** — Option A adopted (approved by the maintainer, 2026-07-20,
+  standing directive). **Implemented 2026-07-20**; see
+  §Consequences for the acceptance criteria and the engineering log (PROGRESS.md
+  at the time) for the landing note. D-012 is flipped to APPROVED/resolved.
 - Milestone: filed against the **M1.14 gate remainder** (this was a gate
   blocker: compaction and snapshot-restore were latent-broken behind a green
   suite).

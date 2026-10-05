@@ -8,7 +8,7 @@
 #
 # Environment:
 #   HANNOY_REF    git ref (default: v0.1.7-nested-rtxns — the latest tag, and the one
-#                 the July 2026 numbers in PROGRESS.md were taken on; milli pins 0.1.3)
+#                 the July 2026 hannoy numbers were taken on; milli pins 0.1.3)
 #   HANNOY_SRC    local checkout to `git clone --shared` from (never modified)
 #   HANNOY_CLONE  reuse this clone
 #   WORKDIR       scratch root (default: <zerodb>/target/consumer)

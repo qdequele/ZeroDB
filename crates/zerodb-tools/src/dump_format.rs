@@ -1,4 +1,4 @@
-//! The logical dump text format — `mdb_dump`-shaped (M1.12, PLAN §1.12).
+//! The logical dump text format — `mdb_dump`-shaped.
 //!
 //! ## Format (read clean-room from the fork's `mdb_dump.c` / `mdb_load.c`)
 //!
@@ -15,8 +15,9 @@
 //! that real `mdb_dump` includes. That omission is what lets a dump compare
 //! **byte-identically across engines and geometries** (LMDB vs ZeroDB, 4 K vs
 //! 64 K pages): logical content is engine-independent, physical layout is not
-//! (D-002). Names are hex-encoded (`database=<hex>`) rather than escaped, so a
-//! name containing `0x00`/newlines (valid in ZeroDB, D-008) round-trips
+//! (ZeroDB has its own on-disk format). Names are hex-encoded
+//! (`database=<hex>`) rather than escaped, so a name containing
+//! `0x00`/newlines (valid in ZeroDB, unlike heed's C-string names) round-trips
 //! unambiguously.
 //!
 //! ### Grammar
@@ -255,7 +256,7 @@ mod tests {
 
     #[test]
     fn name_with_nul_round_trips() {
-        // D-008: a name with an embedded 0x00 is valid in zerodb; hex encoding
+        // A name with an embedded 0x00 is valid in zerodb; hex encoding
         // round-trips it.
         let dbs = vec![DumpDb {
             name: Some(vec![b'x', 0, b'y']),

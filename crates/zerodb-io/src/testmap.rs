@@ -29,7 +29,7 @@
 //!
 //! Test infrastructure only (the `zerodb-core` and `heed-zerodb` dev-deps
 //! enable the feature); consumer builds never compile it. `unsafe` lives in
-//! `zerodb-io` per the CLAUDE.md policy (this module is the mmap stand-in).
+//! `zerodb-io` per the unsafe policy (this module is the mmap stand-in).
 
 use std::cell::UnsafeCell;
 
@@ -165,7 +165,7 @@ impl Backing for TestWriteMap {
 
     // clippy cannot see that this is an `unsafe fn` whose documented contract
     // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
-    // too — verified clippy 1.97); B1's substance is the `unsafe fn` itself.
+    // too); ADR-0021 B1's substance is the `unsafe fn` itself.
     #[allow(clippy::mut_from_ref)]
     unsafe fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
         let (off, len) = self.region(pgno, psize, pages)?;

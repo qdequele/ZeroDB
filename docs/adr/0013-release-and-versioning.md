@@ -1,7 +1,7 @@
 # ADR-0013: Release and versioning policy for the 0.x line
 
 - Status: Proposed (agent-drafted 2026-09-09 for the first release; Q1 and Q2
-  answered by Quentin the same day in chat — publish the engine crates to
+  answered by the maintainer the same day — publish the engine crates to
   crates.io, ship 0.1 with the open Phase 1 items as known gaps; Q3 defaults to
   plain annotated tags unless a maintainer objects before tagging)
 - Milestone: first release (v0.1.0)
@@ -83,7 +83,7 @@ A tag and a changelog, no binaries.
 
 ## Decision
 
-**Option B** (Quentin, 2026-09-09): the release is a git tag, a GitHub release
+**Option B** (maintainer, 2026-09-09): the release is a git tag, a GitHub release
 with prebuilt `zerodb-tools`, **and** a crates.io publish of the four engine
 crates. The heed drop-in path stays the git `[patch]` on the shim — crates.io
 cannot carry it (see Context).
@@ -161,11 +161,11 @@ Publishing rules:
 ## Open questions for human review
 
 1. ~~Is the "no crates.io for 0.x" call acceptable, or is docs.rs presence
-   wanted from day one (Option B)?~~ **Answered 2026-09-09 (Quentin, chat):
+   wanted from day one (Option B)?~~ **Answered 2026-09-09 (maintainer):
    publish to crates.io (Option B); the token is set as a repository secret by
    the maintainer.**
 2. ~~Should `v0.1.0` wait for the 24 h fuzz soak?~~ **Answered 2026-09-09
-   (Quentin, chat): ship 0.1 with the 24 h soak, the Graviton bench and the
+   (maintainer): ship 0.1 with the 24 h soak, the Graviton bench and the
    64K-page kernel listed as known gaps in the release notes.**
 3. Tag signing: plain annotated tags, or require signed tags from a maintainer
    key? **Default if unanswered: plain annotated tags** (the workflow's

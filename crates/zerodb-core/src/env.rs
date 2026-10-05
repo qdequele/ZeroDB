@@ -1,5 +1,5 @@
 //! Environment open/close, meta selection, and the same-process registry
-//! (SPEC 02 §3.2, SPEC 06 §1, SPEC 04 §7). Milestone 1.2.
+//! (SPEC 02 §3.2, SPEC 06 §1, SPEC 04 §7).
 //!
 //! This module owns the *behavioral* half of env lifecycle and is deliberately
 //! I/O-free so it stays `miri`-clean: the mapped file bytes reach it through the
@@ -7,12 +7,12 @@
 //! envs and which tests implement over a plain `Vec<u8>`. All `unsafe` (the
 //! mmap) lives behind that trait in `zerodb-io`; this module contains none.
 //!
-//! What is implemented here (M1.2 scope): reading both meta slots, validating
-//! each via the M1.1 predicate ([`crate::page::MetaPage::validate`]), selecting
+//! What is implemented here: reading both meta slots, validating
+//! each via the page-layer predicate ([`crate::page::MetaPage::validate`]), selecting
 //! the live snapshot (normal / `PREV_SNAPSHOT`), mapping the SPEC 06 REC error
 //! taxonomy onto [`Error`], the process registry with `EnvAlreadyOpened`, the
 //! refcounted [`EnvInner`] behind [`Env`] (`Clone`), and deferred close with
-//! [`EnvClosingEvent`] (SPEC 04 TXN-52/53). Since M1.8 the inner also owns the
+//! [`EnvClosingEvent`] (SPEC 04 TXN-52/53). The inner also owns the
 //! MVCC reader table and the published-snapshot cell (`crate::readers`,
 //! SPEC 04 §3/§4, ADR-0006); the write path lives in `crate::rwtxn`.
 
@@ -84,7 +84,7 @@ pub trait Backing: Send + Sync {
     /// (`EnvFlags::WRITE_MAP`), where [`Backing::map_dirty_page`] returns
     /// slices and the write txn realizes dirty pages directly in the map.
     /// Default `false`: dirty pages are heap frames written at commit C2
-    /// (TXN-45a), the Phase-1 behavior of every other backing.
+    /// (TXN-45a), the LMDB-parity baseline behavior of every other backing.
     fn dirty_in_map(&self) -> bool {
         false
     }
@@ -100,7 +100,7 @@ pub trait Backing: Send + Sync {
     /// **The brokered contract (ADR-0021 B1).**
     /// This mints `&mut [u8]` from `&self`; the signature cannot express the
     /// exclusivity it needs, so the obligation is the caller's. The sole
-    /// sanctioned caller is the write txn's `DirtyStore` (CLAUDE.md unsafe
+    /// sanctioned caller is the write txn's `DirtyStore` (AGENTS.md unsafe
     /// policy; see `zerodb_io::MmapWritable::slice_mut` for the full
     /// statement). The caller must guarantee:
     ///
@@ -114,12 +114,12 @@ pub trait Backing: Send + Sync {
     ///   after every spill (TXN-71, ADR-0021 B2).
     // `unsafe fn` *declaration* only (ADR-0021 B1: no safe fn may mint `&mut`
     // from `&self`); the default body is trivially safe and the one unsafe
-    // *call* lives in `crate::dirty::map_mut`, the home the CLAUDE.md policy
+    // *call* lives in `crate::dirty::map_mut`, the home the AGENTS.md policy
     // sanctions for the WRITE_MAP in-place brokered map-slice write.
     #[allow(unsafe_code)]
     // clippy cannot see that this is an `unsafe fn` whose documented contract
     // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
-    // too — verified clippy 1.97); B1's substance is the `unsafe fn` itself.
+    // too); ADR-0021 B1's substance is the `unsafe fn` itself.
     #[allow(clippy::mut_from_ref)]
     unsafe fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
         let _ = (pgno, psize, pages);
@@ -127,7 +127,7 @@ pub trait Backing: Send + Sync {
     }
 
     /// Vectored positioned write of **consecutive** frames starting at
-    /// `start_pgno` (commit C2 batching, PERF-GAP B4): `frames` are
+    /// `start_pgno` (commit C2 batching, coalesced writes): `frames` are
     /// page-multiple buffers laid out back-to-back on disk from
     /// `start_pgno * psize`.
     ///
@@ -163,8 +163,8 @@ pub trait Backing: Send + Sync {
         ))
     }
 
-    /// The durability barrier the commit pipeline invokes at C3/C5 (M1.10,
-    /// SPEC 06 REC-9/REC-12). `async_flush` is honored only by the writable-map
+    /// The durability barrier the commit pipeline invokes at C3/C5
+    /// (SPEC 06 REC-9/REC-12). `async_flush` is honored only by the writable-map
     /// backing (`WRITE_MAP` + `MAP_ASYNC` → `msync(MS_ASYNC)`); the default
     /// heap/pwrite backing ignores it and calls [`Backing::sync_data`]
     /// (`fdatasync`). Whether this method is called *at all* is decided by the
@@ -242,8 +242,8 @@ pub enum HookPoint {
 
 /// A commit-pipeline observer (ADR-0004 D3/OQ5: **always compiled**, default
 /// absent, so the crash-tested pipeline is byte-for-byte the shipped one).
-/// M1.11's harnesses install hooks that kill/tear at a chosen [`HookPoint`];
-/// the M1.4 smoke test aborts the process at each point in turn.
+/// The crash-consistency harnesses install hooks that kill/tear at a chosen
+/// [`HookPoint`]; the commit smoke test aborts the process at each point in turn.
 pub trait CommitHook: Send + Sync {
     /// Called between commit steps, at `point`. May abort/kill the process.
     fn at(&self, point: HookPoint);
@@ -276,7 +276,7 @@ struct WriterSlot {
     /// cost one syscall per write txn (`env/txn/rw_empty_commit`).
     waiters: u32,
     /// Reusable one-page dirty-frame buffers carried across write txns
-    /// (LMDB's `me_dpages`, PERF-GAP B12). Kept under the writer lock's own
+    /// (LMDB's `me_dpages`). Kept under the writer lock's own
     /// mutex, as LMDB keeps `me_dpages` under its writer mutex: the frames
     /// move out with the acquire and back with the release, so the pool costs
     /// no lock operation of its own (a separate `Mutex` made every write txn,
@@ -329,12 +329,11 @@ impl WriterLock {
 
     /// Block until the writer slot is free, then claim it.
     fn acquire(&self) -> WriterGuard<'_> {
-        // A panicked writer used to poison the old `Mutex<()>` writer lock;
-        // the policy (unchanged) is that the lock guards no data — the dirty
-        // set lived in the RwTxn and was dropped during unwind (TXN-60
-        // implicit abort) — so clearing the poison is sound and keeps the env
-        // usable after a writer panic. The flag mutex is only ever held for
-        // the flag flip below, but the same recovery applies.
+        // Poison recovery: the lock guards no data — the dirty set lives in
+        // the RwTxn and is dropped during unwind (TXN-60 implicit abort) — so
+        // clearing a poison is sound and keeps the env usable after a writer
+        // panic. The flag mutex is only ever held for the flag flip below,
+        // but the same recovery applies.
         let mut g = self
             .occupied
             .lock()
@@ -415,7 +414,7 @@ impl SignalEvent {
     }
 }
 
-/// Env-level durability / write-mode flags (SPEC 01 Table 1, §S6/§S7; M1.10).
+/// Env-level durability / write-mode flags (SPEC 01 Table 1, §S6/§S7).
 /// Selected once at open and immutable for the env's life. The commit pipeline
 /// reads them to decide which fsync/msync barriers run (SPEC 06 REC-9/REC-12);
 /// the backing implementation chooses the *primitive* (`fdatasync` vs `msync`).
@@ -469,7 +468,7 @@ fn next_env_id() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Named-DB registry (the dbi table, SPEC 02 §6, SPEC 04 TXN-10; M1.6)
+// Named-DB registry (the dbi table, SPEC 02 §6, SPEC 04 TXN-10)
 // ---------------------------------------------------------------------------
 
 /// The env-level named-database registry — ZeroDB's analogue of LMDB's
@@ -478,9 +477,9 @@ fn next_env_id() -> u64 {
 /// resolves lazily from the transaction's catalog view (the main tree; SPEC 04
 /// TXN-10 step 3), so this table maps **only** dbi → name, never dbi → root.
 ///
-/// **Assignment is append-only within a process** (an interim simplification,
-/// like the M1.5 reader registry). LMDB frees a dbi when the txn that opened it
-/// aborts; ZeroDB keeps the slot and re-uses it on a later open of the same
+/// **Assignment is append-only within a process** (an accepted
+/// simplification). LMDB frees a dbi when the txn that opened it aborts;
+/// ZeroDB keeps the slot and re-uses it on a later open of the same
 /// name (`by_name`). This is **unobservable** through the heed/SPEC-00 surface:
 /// resolution is always catalog-driven, so a handle whose creation was aborted
 /// resolves to *absent* (its catalog entry was discarded with the dirty set),
@@ -488,10 +487,9 @@ fn next_env_id() -> u64 {
 /// is that `max_dbs` counts distinct names ever seen (incl. aborted) rather
 /// than currently-live ones, so `DbsFull` could fire one creation early after
 /// `max_dbs` *distinct* aborted-and-never-reused names — a case no consumer and
-/// no oracle sequence produces (names are a bounded reused set). M1.8 (the
-/// reader table) deliberately did **not** touch this: the full dbi lifecycle
-/// (abort-frees-slot) remains an accepted interim simplification, revisited
-/// with the Phase 2 handle/introspection work (PLAN 2.2) if ever observable.
+/// no oracle sequence produces (names are a bounded reused set). The full dbi
+/// lifecycle (abort-frees-slot) is deliberately not implemented; revisit it if
+/// it ever becomes observable.
 #[derive(Debug)]
 struct NamedRegistry {
     /// dbi index → name. Append-only; index is the `DbSel::Named` payload.
@@ -557,8 +555,8 @@ pub struct EnvInner {
     /// thread-agnostic flag+condvar lock (see [`WriterLock`]) so the guard —
     /// and with it `RwTxn` — is `Send`.
     write_mutex: WriterLock,
-    /// The published-snapshot cell (SPEC 04 TXN-18 as amended, ratified
-    /// 2026-07-16; ADR-0006 Option B): the immutable `Arc<Snapshot>` behind a
+    /// The published-snapshot cell (SPEC 04 TXN-18; ADR-0006 Option B): the
+    /// immutable `Arc<Snapshot>` behind a
     /// bounded-O(1)-critical-section mutex, plus the mirroring SeqCst
     /// `commit_point` atomic that carries the whole lock-free pin protocol
     /// (TXN-17/19/20). Published in the TXN-19 order (swap the object, then
@@ -570,24 +568,25 @@ pub struct EnvInner {
     /// (Acquire) at every write-txn begin and commit. A poisoned env still
     /// serves read txns from their pinned snapshots.
     poisoned: AtomicBool,
-    /// The MVCC reader table (M1.8, SPEC 04 §4; ADR-0006): `max_readers`
-    /// cache-padded single-`AtomicU64` slots. Replaces the M1.5 interim
-    /// mutexed reader registry wholesale (TXN-21). Readers claim/pin/release
-    /// slots lock-free; the writer's GC gate scans it (`oldest_live_reader`).
+    /// The MVCC reader table (SPEC 04 §4; ADR-0006): `max_readers`
+    /// cache-padded single-`AtomicU64` slots. Readers claim/pin/release
+    /// slots lock-free; the writer's GC gate scans it (`oldest_live_reader`,
+    /// TXN-21).
     reader_table: ReaderTable,
-    /// The named-DB registry (the dbi table, SPEC 02 §6; M1.6). Guards the
+    /// The named-DB registry (the dbi table, SPEC 02 §6). Guards the
     /// dbi ↔ name mapping only — records resolve from the catalog (TXN-10).
     named: Mutex<NamedRegistry>,
-    /// Env-level durability / write-mode flags (SPEC 01 §S6/§S7; M1.10).
+    /// Env-level durability / write-mode flags (SPEC 01 §S6/§S7).
     /// Immutable after open; read by the commit pipeline and by `write_txn` /
     /// `force_sync`.
     durability: DurabilityFlags,
-    /// Per-named-database key comparators (**M2.4**, SPEC 03 §2.0). Empty
+    /// Per-named-database key comparators (SPEC 03 §2.0). Empty
     /// unless a caller opened a database through one of the
     /// `*_with_comparator` entry points; the main/catalog tree and the GC tree
     /// are never represented here and are always memcmp.
     ///
-    /// **Not persisted** — see `crate::cmp` for the reopen hazard (D-014).
+    /// **Not persisted** — see `crate::cmp` for the reopen hazard
+    /// (docs/DIVERGENCES.md, comparator persistence).
     comparators: ComparatorRegistry,
     /// Catalog capacity (`max_dbs`), immutable after open. Duplicated out of
     /// the `named` registry so read txns can size their dbi-indexed record
@@ -660,8 +659,8 @@ impl EnvInner {
         &self.meta
     }
 
-    /// `Arc`-clone the current published snapshot (SPEC 04 TXN-18 as
-    /// amended). The clone keeps the `(txnid, roots)` alive for the caller's
+    /// `Arc`-clone the current published snapshot (SPEC 04 TXN-18). The
+    /// clone keeps the `(txnid, roots)` alive for the caller's
     /// life regardless of later commits. Critical section: one refcount bump
     /// (ADR-0006 Option B).
     #[must_use]
@@ -682,7 +681,7 @@ impl EnvInner {
     /// current writer finishes; never errors. The returned guard releases
     /// from whatever thread drops it ([`WriterLock`]), so `RwTxn` is `Send`.
     /// The writer-panic poison-recovery policy lives in
-    /// [`WriterLock::acquire`], unchanged from the old `Mutex<()>` form.
+    /// [`WriterLock::acquire`].
     pub(crate) fn lock_writer(&self) -> WriterGuard<'_> {
         self.write_mutex.acquire()
     }
@@ -702,7 +701,7 @@ impl EnvInner {
     }
 
     /// Install (or clear) the commit-pipeline crash hook (ADR-0004 D3). Test
-    /// infrastructure for M1.4's smoke test and M1.11's crash harness; the
+    /// infrastructure for the commit smoke test and the crash harness; the
     /// default (`None`) makes every hook site a no-op.
     pub fn set_commit_hook(&self, hook: Option<Arc<dyn CommitHook>>) {
         *self.commit_hook.lock().expect("hook cell poisoned") = hook;
@@ -726,7 +725,7 @@ impl EnvInner {
             .expect("backing present while the env is open")
     }
 
-    /// Pin a snapshot for a new read txn (SPEC 04 TXN-10 steps 1–3, M1.8):
+    /// Pin a snapshot for a new read txn (SPEC 04 TXN-10 steps 1–3):
     /// claim a reader-table slot, run the TXN-17 SeqCst publish-and-verify
     /// loop against the commit point, and clone the published snapshot
     /// (adopting a newer one if a commit raced the clone — the TXN-17 tail).
@@ -750,7 +749,7 @@ impl EnvInner {
     }
 
     /// The reader table's fixed slot count (`max_readers` as configured at
-    /// open; `MDB_envinfo::me_maxreaders`). Milestone 2.1.
+    /// open; `MDB_envinfo::me_maxreaders`).
     #[must_use]
     pub fn max_readers(&self) -> u32 {
         self.reader_table.capacity()
@@ -759,23 +758,22 @@ impl EnvInner {
     /// `MDB_envinfo::me_numreaders` parity: the **high-water** reader-slot
     /// count, which never decreases when a read txn ends. See
     /// [`crate::readers::ReaderTable::num_readers`] for the fork evidence and
-    /// D-011. Milestone 2.1.
+    /// docs/DIVERGENCES.md (`me_numreaders` semantics).
     #[must_use]
     pub fn num_readers(&self) -> u32 {
         self.reader_table.num_readers()
     }
 
     /// Reader slots **currently** occupied — a ZeroDB extension, and the
-    /// number [`EnvInner::num_readers`] misleadingly looks like (D-011).
+    /// number [`EnvInner::num_readers`] misleadingly looks like.
     /// A concurrently-sampled diagnostic count, not a synchronization point.
-    /// Milestone 2.1.
     #[must_use]
     pub fn live_readers(&self) -> u32 {
         self.reader_table.in_use()
     }
 
-    /// The ordering in force for the database `sel` addresses (**M2.4**,
-    /// SPEC 03 §2.0).
+    /// The ordering in force for the database `sel` addresses
+    /// (SPEC 03 §2.0).
     ///
     /// [`DbSel::Main`] is **always** [`KeyCmp::Default`]: the main tree is
     /// also the named-DB catalog, whose keys are DB names and whose values are
@@ -789,7 +787,7 @@ impl EnvInner {
         }
     }
 
-    /// Register a comparator for named database `dbi` (**M2.4**). Called from
+    /// Register a comparator for named database `dbi`. Called from
     /// the `*_with_comparator` open paths, never directly by users.
     pub(crate) fn register_comparator(
         &self,
@@ -799,7 +797,7 @@ impl EnvInner {
         self.comparators.register(dbi, cmp)
     }
 
-    /// Whether any custom comparator is registered on this env (**M2.4**).
+    /// Whether any custom comparator is registered on this env.
     /// Gates the memcmp-only compacting-copy path (SPEC 03 §2.0).
     #[must_use]
     pub fn has_custom_comparator(&self) -> bool {
@@ -807,7 +805,7 @@ impl EnvInner {
     }
 
     /// Per-slot reader introspection — `mdb_reader_list` in a single-process
-    /// world (milestone 2.2). See [`Env::reader_list`] for the full contract;
+    /// world. See [`Env::reader_list`] for the full contract;
     /// this is the raw form.
     #[must_use]
     pub fn reader_list(&self) -> Vec<ReaderEntry> {
@@ -885,7 +883,7 @@ impl EnvInner {
         self.prev_snapshot
     }
 
-    /// The env-level durability / write-mode flags (SPEC 01 §S6/§S7; M1.10).
+    /// The env-level durability / write-mode flags (SPEC 01 §S6/§S7).
     #[must_use]
     pub fn durability(&self) -> DurabilityFlags {
         self.durability
@@ -902,8 +900,8 @@ impl EnvInner {
         &self.stamp_cache
     }
 
-    /// Test/diagnostics hook (ADR-0018 amendment, 2026-10-01; the
-    /// [`crate::rwtxn::RwTxn::spills`] precedent): whether the env-wide
+    /// Test/diagnostics hook (ADR-0018; like
+    /// [`crate::rwtxn::RwTxn::spills`]): whether the env-wide
     /// validated-pages cache currently holds exactly the page version
     /// `(pgno, kind, stamp)` — `branch` selects the kind half of the key.
     /// Observes only; never part of the stable API.
@@ -985,7 +983,7 @@ impl EnvInner {
     }
 
     /// Explicit environment sync — full `mdb_env_sync(env, force)` parity
-    /// (milestone 2.5, SPEC 01 §S6). heed exposes only the `force = true` form
+    /// (SPEC 01 §S6). heed exposes only the `force = true` form
     /// ([`EnvInner::force_sync`]); `force = false` is a ZeroDB extension.
     ///
     /// The fork's `mdb_env_sync0` decides three things, reproduced exactly:
@@ -1086,8 +1084,8 @@ impl EnvInner {
     }
 
     /// Whether allocating an `n`-page run at `next_pgno` would exceed the map
-    /// (SPEC 02 §8, `MdbError::MapFull`). No consumer of the write path exists
-    /// yet (M1.4); exposed now so the geometry ceiling is testable at open.
+    /// (SPEC 02 §8, `MdbError::MapFull`). Exposed so the geometry ceiling is
+    /// testable at the env level; the write path checks `is_map_full` itself.
     #[must_use]
     pub fn would_map_full(&self, next_pgno: u64, n: u64) -> bool {
         is_map_full(next_pgno, n, map_pages(self.map_size, self.page_size))
@@ -1119,7 +1117,7 @@ impl Drop for EnvInner {
 ///
 /// `Clone` bumps the refcount; it never reopens the file. The underlying
 /// [`EnvInner`] is torn down only when the last clone (and every outstanding
-/// txn, in later milestones) drops.
+/// txn) drops.
 #[derive(Clone)]
 pub struct Env {
     inner: Arc<EnvInner>,
@@ -1160,8 +1158,8 @@ impl Env {
         self.inner.map_size()
     }
 
-    /// Environment info (SPEC 00 rows 20/60; `mdb_env_info`). Milestone 2.1
-    /// completes the struct — see [`EnvInfo`] for the field-by-field
+    /// Environment info (SPEC 00 rows 20/60; `mdb_env_info`). The struct is
+    /// complete — see [`EnvInfo`] for the field-by-field
     /// `MDB_envinfo` mapping and which values are format-specific.
     ///
     /// All fields are read from the **live published snapshot** plus the reader
@@ -1181,12 +1179,12 @@ impl Env {
     }
 
     /// Environment-level statistics (`mdb_env_stat`): the [`EnvStat`] of the
-    /// **main** DB of the live snapshot. Milestone 2.1.
+    /// **main** DB of the live snapshot.
     ///
     /// Like [`Env::info`] this reads the published snapshot directly rather
     /// than opening a read txn, so it neither blocks nor occupies a reader
     /// slot. See [`EnvStat`] for the `MDB_stat` field mapping; the page counts
-    /// are ZeroDB-format values (D-002) and must not be compared to LMDB's.
+    /// are ZeroDB-format values (own on-disk format) and must not be compared to LMDB's.
     #[must_use]
     pub fn stat(&self) -> EnvStat {
         let snap = self.inner.snapshot();
@@ -1201,15 +1199,15 @@ impl Env {
         }
     }
 
-    /// List the environment's **occupied** reader slots (**milestone 2.2**) —
+    /// List the environment's **occupied** reader slots —
     /// ZeroDB's answer to `mdb_reader_list`, which heed does not expose at all.
     ///
     /// One [`ReaderEntry`] per slot that is currently owned by a read
     /// transaction, in slot order. Free slots are omitted, exactly as
     /// `mdb_reader_list` skips slots with `mr_pid == 0`: presence in the
     /// returned vector *is* the liveness answer, and `max_readers() -
-    /// reader_list().len()` is the number of free slots. Under D-001
-    /// (single-process) every listed reader belongs to this process, so unlike
+    /// reader_list().len()` is the number of free slots. ZeroDB being
+    /// single-process, every listed reader belongs to this process, so unlike
     /// LMDB there is no pid/tid column to report — a slot index, the pinned
     /// snapshot txnid, and its age are the whole truth.
     ///
@@ -1232,7 +1230,7 @@ impl Env {
         self.inner.reader_list()
     }
 
-    /// Reclaim reader slots abandoned by dead processes (**milestone 2.2**) —
+    /// Reclaim reader slots abandoned by dead processes —
     /// `mdb_reader_check`. **Always returns 0, and that is the correct
     /// answer**, not a stub.
     ///
@@ -1242,7 +1240,7 @@ impl Env {
     /// `mdb_reader_check` exists to scan those slots and free the ones whose
     /// `mr_pid` no longer names a live process.
     ///
-    /// ZeroDB is **single-process** (D-001): the reader table is plain process
+    /// ZeroDB is **single-process** (see docs/DIVERGENCES.md): the reader table is plain process
     /// memory with no lock file and no cross-process sharing. Every slot is
     /// owned by a `RoTxn` in *this* address space, and a `RoTxn` releases its
     /// slot in `Drop` — including while unwinding from a panic. The only way
@@ -1264,7 +1262,7 @@ impl Env {
     }
 
     /// Whether any custom key comparator is registered on this environment
-    /// (**milestone 2.4**). Gates the memcmp-only compacting-copy path
+    /// Gates the memcmp-only compacting-copy path
     /// (SPEC 03 §2.0).
     #[must_use]
     pub fn has_custom_comparator(&self) -> bool {
@@ -1320,7 +1318,7 @@ impl Env {
     }
 
     /// Explicit environment sync with full `mdb_env_sync(env, force)` parity
-    /// (milestone 2.5). `force = false` is a ZeroDB extension — heed exposes
+    /// `force = false` is a ZeroDB extension — heed exposes
     /// only [`Env::force_sync`]. See [`EnvInner::sync`] for the exact
     /// three-way semantics (`EACCES`, the `force || !NO_SYNC` gate, and the
     /// `MAP_ASYNC` downgrade).
@@ -1358,7 +1356,8 @@ impl Env {
     }
 
     /// Install (or clear) the commit-pipeline crash hook (ADR-0004 D3). See
-    /// [`EnvInner::set_commit_hook`]; test infrastructure (M1.4 smoke, M1.11).
+    /// [`EnvInner::set_commit_hook`]; test infrastructure (commit smoke test,
+    /// crash harness).
     pub fn set_commit_hook(&self, hook: Option<Arc<dyn CommitHook>>) {
         self.inner.set_commit_hook(hook);
     }
@@ -1380,8 +1379,8 @@ impl Env {
 }
 
 /// Environment info (SPEC 00 rows 20/60; `mdb_env_info` / `MDB_envinfo`).
-/// Completed in **milestone 2.1** — Phase 1 populated only `map_size`, the sole
-/// field any consumer reads.
+/// Every field is populated, though `map_size` is the only one any consumer
+/// reads.
 ///
 /// ## LMDB `MDB_envinfo` field mapping
 ///
@@ -1392,7 +1391,7 @@ impl Env {
 /// | `me_last_pgno` | [`EnvInfo::last_pgno`] | identical *meaning* (id of the last used page), but the **value is format-specific**: it counts ZeroDB pages of ZeroDB's layout, not LMDB's. Never compare it cross-engine. |
 /// | `me_last_txnid` | [`EnvInfo::last_txnid`] | identical meaning and value domain: the id of the last committed txn. Comparable cross-engine. |
 /// | `me_maxreaders` | [`EnvInfo::max_readers`] | identical: the configured reader-table size. |
-/// | `me_numreaders` | [`EnvInfo::num_readers`] | identical — **including LMDB's surprise**: it is a *high-water mark*, not a live count (D-011). Single-process (D-001), so it only ever covers *this* process's readers; under LMDB it spans every process sharing the lock file. |
+/// | `me_numreaders` | [`EnvInfo::num_readers`] | identical — **including LMDB's surprise**: it is a *high-water mark*, not a live count (see docs/DIVERGENCES.md). Single-process, so it only ever covers *this* process's readers; under LMDB it spans every process sharing the lock file. |
 /// | *(none)* | [`EnvInfo::live_readers`] | **ZeroDB extension**: the genuinely-live occupied-slot count that `me_numreaders` looks like but is not. |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvInfo {
@@ -1408,7 +1407,7 @@ pub struct EnvInfo {
     /// `me_numreaders`: the **high-water** reader-slot count — the maximum
     /// number of simultaneously live readers ever observed. It does **not**
     /// decrease when a read txn ends; that is LMDB's actual behavior, verified
-    /// against the fork and reproduced here (D-011). For the live count, use
+    /// against the fork and reproduced here. For the live count, use
     /// [`EnvInfo::live_readers`].
     pub num_readers: u32,
     /// **ZeroDB extension** (no `MDB_envinfo` counterpart): reader slots
@@ -1417,12 +1416,12 @@ pub struct EnvInfo {
 }
 
 /// One occupied reader-table slot, as reported by [`Env::reader_list`]
-/// (**milestone 2.2**; the single-process analogue of one `MDB_reader` row in
+/// (the single-process analogue of one `MDB_reader` row in
 /// `mdb_reader_list` output).
 ///
 /// A **ZeroDB extension**: heed exposes no reader introspection whatsoever, so
 /// there is no signature to mirror. Compared to LMDB's row there is no `pid`
-/// or `thread` column — under D-001 every reader is in this process, and a
+/// or `thread` column — ZeroDB is single-process, so every reader is in this process, and a
 /// `RoTxn` is `Send`, so the owning thread is not a stable property worth
 /// reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1451,18 +1450,18 @@ pub struct ReaderEntry {
 }
 
 /// Environment-level statistics (`mdb_env_stat` / `MDB_stat` over the **main**
-/// DB). Milestone 2.1; the per-database form is
+/// DB). The per-database form is
 /// [`crate::rotxn::DatabaseStat`] (SPEC 00 row 49).
 ///
 /// ## LMDB `MDB_stat` field mapping
 ///
 /// | `MDB_stat` | here | note |
 /// |---|---|---|
-/// | `ms_psize` | [`EnvStat::page_size`] | identical meaning; the value is whatever the env was created with (SPEC 02 §0, milestone 2.6). |
-/// | `ms_depth` | [`EnvStat::depth`] | identical meaning (tree height, 0 = empty). The *value* depends on per-page fan-out and therefore on the on-disk format (D-002) — comparable in kind, not exactly, cross-engine. |
-/// | `ms_branch_pages` | [`EnvStat::branch_pages`] | identical meaning; **format-specific value** (D-002). |
-/// | `ms_leaf_pages` | [`EnvStat::leaf_pages`] | identical meaning; **format-specific value** (D-002). |
-/// | `ms_overflow_pages` | [`EnvStat::overflow_pages`] | identical meaning; **format-specific value** (D-002). |
+/// | `ms_psize` | [`EnvStat::page_size`] | identical meaning; the value is whatever the env was created with (SPEC 02 §0, runtime page-size selection). |
+/// | `ms_depth` | [`EnvStat::depth`] | identical meaning (tree height, 0 = empty). The *value* depends on per-page fan-out and therefore on the on-disk format (ZeroDB's own) — comparable in kind, not exactly, cross-engine. |
+/// | `ms_branch_pages` | [`EnvStat::branch_pages`] | identical meaning; **format-specific value** (own on-disk format). |
+/// | `ms_leaf_pages` | [`EnvStat::leaf_pages`] | identical meaning; **format-specific value** (own on-disk format). |
+/// | `ms_overflow_pages` | [`EnvStat::overflow_pages`] | identical meaning; **format-specific value** (own on-disk format). |
 /// | `ms_entries` | [`EnvStat::entries`] | identical meaning **and value**: for the env-level stat this is the number of entries in the main DB, which under a named-DB env is the number of named-DB catalog records. Comparable cross-engine. |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvStat {
@@ -1543,8 +1542,7 @@ pub const MAX_DBS_LIMIT: u32 = 1 << 20;
 ///   under the one-valid + `PREV_SNAPSHOT` combination (SPEC 06 REC-2†).
 // The open parameters are all distinct scalars/flags the caller (zerodb-io / the
 // public crate) has already resolved; bundling them into a params struct would
-// only add indirection for this single internal entry point. M1.10 pushed the
-// count from 7 to 8 with `durability`.
+// only add indirection for this single internal entry point.
 #[allow(clippy::too_many_arguments)]
 pub fn open_with_backing(
     canonical_path: PathBuf,
@@ -1617,7 +1615,7 @@ pub fn open_with_backing_policy(
     sequential_writes: bool,
     dirty_limit: Option<u64>,
 ) -> Result<Env, Error> {
-    // D-006-style open-time argument rejection (`Io(InvalidInput)`): both
+    // Open-time argument rejection (`Io(InvalidInput)`, see docs/DIVERGENCES.md): both
     // values size eager allocations (`max_readers` cache-padded reader slots,
     // `max_dbs` comparator `OnceLock`s), so an unbounded value — e.g.
     // `max_readers(u32::MAX)` — is an allocation-failure abort, not an error.
@@ -1650,7 +1648,7 @@ pub fn open_with_backing_policy(
         MetaChoice::Both { meta, chosen } => (meta, chosen),
         MetaChoice::OnlyOne { meta, chosen } => {
             if prev_snapshot {
-                // REC-2† (ratified 2026-07-16): one valid slot + PREV_SNAPSHOT is
+                // REC-2†: one valid slot + PREV_SNAPSHOT is
                 // a hard error — there are not two committed snapshots to pick an
                 // older from.
                 return Err(Error::Mdb(MdbError::Invalid));
@@ -1839,7 +1837,7 @@ pub mod testutil {
         }
         let path = PathBuf::from(format!("/virtual/mem-env-{}", next_env_id()));
         // A generous named-DB capacity for tests (real envs pass the caller's
-        // `max_dbs`; SPEC 02 §6 / M1.6); max_readers = 126, the TXN-14
+        // `max_dbs`; SPEC 02 §6); max_readers = 126, the TXN-14
         // default.
         match open_with_backing_policy(
             path,

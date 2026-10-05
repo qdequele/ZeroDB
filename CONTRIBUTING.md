@@ -2,8 +2,8 @@
 
 ZeroDB is a clean-room, spec-first re-implementation of LMDB's engine behind
 heed's API. The rules that keep it honest are short and non-negotiable; they
-live in [`CLAUDE.md`](CLAUDE.md) and apply to humans and agents alike. The
-ones you will hit first:
+live in [`AGENTS.md`](AGENTS.md) and apply to humans and AI agents alike —
+read it before your first change. The ones you will hit first:
 
 - **The oracle decides LMDB semantics.** Never guess what LMDB does: write a
   differential test in `crates/zerodb-oracle` against the Meilisearch LMDB fork
@@ -33,8 +33,10 @@ just fuzz-quick                           # 10-minute differential fuzz vs real 
 just crash-test-quick                     # when touching the write or commit path
 ```
 
-CI runs the same battery on x86-64 and aarch64, plus a build of the consumer
-crates on the workspace `rust-version` (the MSRV is for consumers; developing
+CI runs the same battery on every PR — fmt, clippy, tests and the 10-minute
+fuzz on both x86-64 and aarch64; miri, loom and the crash smoke on x86-64 — plus
+a build of the consumer crates on the workspace `rust-version`, currently 1.98
+(the MSRV is for consumers; developing
 ZeroDB itself needs a current stable toolchain because of the bench and fuzz
 tooling). For changes that could affect
 Meilisearch or hannoy, run the consumer gate too
@@ -47,8 +49,9 @@ description, with the machine named.
 
 | | |
 |---|---|
-| Roadmap | [`PLAN.md`](PLAN.md) |
-| Engineering log | [`PROGRESS.md`](PROGRESS.md) (append-only) |
+| Project rules | [`AGENTS.md`](AGENTS.md) |
+| Planned and open work | GitHub issues |
+| Release history | [`CHANGELOG.md`](CHANGELOG.md) |
 | Docs map | [`docs/README.md`](docs/README.md) |
 | Releasing | [`docs/RELEASING.md`](docs/RELEASING.md) |
 | Security | [`SECURITY.md`](SECURITY.md) |

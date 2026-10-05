@@ -1,22 +1,20 @@
 //! Parity of leaf-page fill on ascending plain-put workloads (SPEC 03 §6.4
-//! end-of-page insert-point rule, ADR-0005 D5, ratified 2026-07-16).
+//! end-of-page insert-point rule, ADR-0005 D5).
 //!
 //! milli's dominant write pattern is ascending keys (facet ids, docids, sorted
-//! bulk). Before the amendment, zerodb's §6.4 median-fit split left a cascade
-//! of ~50 %-full leaves on such loads — ~2× the fork's leaf count (ADR-0005 D5:
-//! 400 ascending ~500 B puts → 132 leaves zerodb vs ~68 fork at 4 KiB pages).
-//! The ratified end-of-page insert-point rule (all existing cells stay left,
-//! the new key alone starts the right page for any `newindx == nkeys` insert,
-//! matching `mdb_page_split`) closes that gap. This test drives identical
-//! ascending plain puts (NOT `MDB_APPEND` — the whole point is plain puts now
-//! pack too) into the fork (via heed) and zerodb and asserts the leaf counts
-//! track within a tight ±20 % band.
+//! bulk). A median-fit split leaves ~50 %-full leaves on such loads, ~2× the
+//! fork's leaf count. The end-of-page insert-point rule (all existing cells
+//! stay left, the new key alone starts the right page for any
+//! `newindx == nkeys` insert, matching `mdb_page_split`) packs like the fork.
+//! This test drives identical ascending plain puts (NOT `MDB_APPEND` — plain
+//! puts must pack too) into the fork (via heed) and zerodb and asserts the
+//! leaf counts track within a ±20 % band.
 //!
 //! **Page size.** LMDB fixes its page size to the OS page at env creation and
 //! offers no runtime override (4 KiB on Linux x86, 16 KiB on macOS ARM, up to
 //! 64 KiB on some ARM distros). A raw leaf-count band is only meaningful at
 //! equal page sizes, so the test **reads the fork's page size and opens zerodb
-//! to match** (zerodb's page size is runtime-chosen, CLAUDE.md), keeping the
+//! to match** (zerodb's page size is runtime-chosen), keeping the
 //! comparison valid on every platform instead of hard-coding 4 KiB.
 
 use std::path::{Path, PathBuf};
@@ -129,9 +127,8 @@ fn assert_leaf_parity(tag: &str, n: u32, wide: bool, vlen: usize, tol: f64) {
     );
 }
 
-/// D5's exact shape: 400 ascending ~500 B keys, tiny values. Pre-amendment this
-/// was ~1.9× the fork's leaf count (median split → ~50 %-full leaves); the
-/// ratified rule must bring it into a tight band around 1.0.
+/// D5's exact shape: 400 ascending ~500 B keys, tiny values. A median split
+/// gives ~1.9× the fork's leaf count; the §6.4 rule must land near 1.0.
 #[test]
 fn ascending_wide_keys_400() {
     assert_leaf_parity("wide400", 400, true, 4, 0.20);

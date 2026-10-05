@@ -62,21 +62,22 @@ pub use zerodb_core::rotxn::{
 pub use zerodb_core::rwtxn::{PutFlags, RwCursor, RwTxn};
 
 /// The **native default** name of the single data file inside an env directory
-/// (D-002, SPEC 02 §8).
+/// (ZeroDB's own file format, SPEC 02 §8).
 ///
 /// This is only a default: the opener chooses the name via
 /// [`EnvOpenOptions::data_file_name`]. Envs opened through the `heed-zerodb`
 /// adapter use [`HEED_DATA_FILE_NAME`] instead, so that heed consumers that
 /// hardcode LMDB's `data.mdb` (Meilisearch does, in production paths) see the
-/// file they expect (ADR-0010, D-012).
+/// file they expect (ADR-0010).
 pub const DATA_FILE_NAME: &str = "zerodb.dat";
 
 /// The data-file name the `heed-zerodb` adapter uses, matching LMDB's
-/// directory-env contract (ADR-0010, D-012).
+/// directory-env contract (ADR-0010).
 ///
 /// Exposed here so the adapter, `zerodb-tools`' two-name probe, and tests all
 /// agree on one constant. No `lock.mdb` is ever created — ZeroDB is
-/// single-process (D-001) and nothing in the consumer tree reads it.
+/// single-process (see docs/DIVERGENCES.md) and nothing in the consumer tree
+/// reads it.
 pub const HEED_DATA_FILE_NAME: &str = "data.mdb";
 
 /// Whether `name` is a single, non-empty path component — i.e. it names a file
@@ -106,23 +107,22 @@ fn is_single_component(name: &OsStr) -> bool {
 /// default only matters for tests.
 const DEFAULT_MAP_SIZE: u64 = 1 << 20;
 
-/// Default DB page size when not overridden (SPEC 02 §0). Selectable since
-/// milestone 2.6 via [`EnvOpenOptions::page_size`].
+/// Default DB page size when not overridden (SPEC 02 §0). Selectable via
+/// [`EnvOpenOptions::page_size`].
 pub const DEFAULT_PAGE_SIZE: u32 = 4096;
 
-/// The smallest selectable DB page size (SPEC 02 §0, milestone 2.6).
+/// The smallest selectable DB page size (SPEC 02 §0).
 pub const MIN_PAGE_SIZE: u32 = 4096;
 
-/// The largest selectable DB page size (SPEC 02 §0, milestone 2.6).
+/// The largest selectable DB page size (SPEC 02 §0).
 pub const MAX_PAGE_SIZE: u32 = 65536;
 
-/// Environment open flags (SPEC 01 Table 1). A hand-rolled bitset — no
-/// `bitflags` dependency (not on the CLAUDE.md allowlist).
+/// Environment open flags (SPEC 01 Table 1), as a hand-rolled bitset.
 ///
-/// Phase-1 in-scope flags (all MUST/SHOULD-Phase-1 per SPEC 01 Table 1):
+/// LMDB-parity flags (all MUST/SHOULD per SPEC 01 Table 1):
 /// [`EnvFlags::PREV_SNAPSHOT`] (milli's `Index::rollback`), [`EnvFlags::READ_ONLY`]
-/// (write-txn → `EACCES`), [`EnvFlags::WRITE_MAP`] (writable-mmap write path,
-/// M1.10), and the durability flags [`EnvFlags::NO_SYNC`] /
+/// (write-txn → `EACCES`), [`EnvFlags::WRITE_MAP`] (writable-mmap write
+/// path), and the durability flags [`EnvFlags::NO_SYNC`] /
 /// [`EnvFlags::NO_META_SYNC`] / [`EnvFlags::MAP_ASYNC`] (SPEC 01 §S6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EnvFlags(u32);
@@ -134,13 +134,13 @@ impl EnvFlags {
     /// §S6). Durability restored by [`Env::force_sync`].
     pub const NO_SYNC: EnvFlags = EnvFlags(0x0001_0000);
     /// `MDB_RDONLY` — env-level read-only (SPEC 01 Table 1). A write txn on such
-    /// an env returns `EACCES` (M1.10).
+    /// an env returns `EACCES`.
     pub const READ_ONLY: EnvFlags = EnvFlags(0x0002_0000);
     /// `MDB_NOMETASYNC` — fsync data but skip the meta fsync this commit
     /// (SPEC 01 Table 1, §S6, REC-10).
     pub const NO_META_SYNC: EnvFlags = EnvFlags(0x0004_0000);
     /// `MDB_WRITEMAP` — writes go through a writable mmap instead of
-    /// heap-buffer + `pwrite` (SPEC 01 Table 1, §S7, SPEC 04 §6.4; M1.10).
+    /// heap-buffer + `pwrite` (SPEC 01 Table 1, §S7, SPEC 04 §6.4).
     pub const WRITE_MAP: EnvFlags = EnvFlags(0x0008_0000);
     /// `MDB_MAPASYNC` — with `WRITE_MAP`, use `msync(MS_ASYNC)` for the commit
     /// flushes (SPEC 01 Table 1, §S6). No effect without `WRITE_MAP`.
@@ -210,7 +210,7 @@ impl EnvOpenOptions {
             map_size: None,
             max_dbs: 0,
             // LMDB's default max readers is 126; consumers override it (SPEC 00
-            // row 5). Stored now; the reader table is sized in M1.8.
+            // row 5). The reader table is sized from it at open.
             max_readers: 126,
             page_size: DEFAULT_PAGE_SIZE,
             flags: EnvFlags::EMPTY,
@@ -228,8 +228,8 @@ impl EnvOpenOptions {
         self
     }
 
-    /// Set the named-DB catalog capacity (SPEC 00 row 4). Stored; consumed when
-    /// named DBs land (M1.6).
+    /// Set the named-DB catalog capacity (SPEC 00 row 4): the number of distinct
+    /// named DBs the env can open.
     pub fn max_dbs(&mut self, n: u32) -> &mut EnvOpenOptions {
         self.max_dbs = n;
         self
@@ -244,13 +244,12 @@ impl EnvOpenOptions {
         self
     }
 
-    /// Select the DB page size (**milestone 2.6**; SPEC 02 §0).
+    /// Select the DB page size (SPEC 02 §0).
     ///
     /// This is a **ZeroDB extension**: LMDB 0.9 derives the page size from the
     /// OS and offers no selector, so there is no heed API to mirror and no
-    /// cross-engine differential to run. ZeroDB's page size has always been a
-    /// runtime value in the meta page (SPEC 02 §0/§3.2) — 2.6 promotes it to a
-    /// supported public knob.
+    /// cross-engine differential to run. The page size is a runtime value
+    /// persisted in the meta page (SPEC 02 §0/§3.2).
     ///
     /// Semantics:
     ///
@@ -275,23 +274,23 @@ impl EnvOpenOptions {
         self
     }
 
-    /// The configured page size (milestone 2.6). For a value that reflects an
+    /// The configured page size. For a value that reflects an
     /// *existing* store, use [`Env::page_size`] after opening.
     #[must_use]
     pub fn get_page_size(&self) -> u32 {
         self.page_size
     }
 
-    /// Set the env flags (SPEC 00 row 6). All Phase-1 flags are honored:
+    /// Set the env flags (SPEC 00 row 6). All LMDB-parity flags are honored:
     /// `PREV_SNAPSHOT`, `READ_ONLY`, `WRITE_MAP`, `NO_SYNC`, `NO_META_SYNC`,
-    /// `MAP_ASYNC` (SPEC 01 Table 1; M1.10).
+    /// `MAP_ASYNC` (SPEC 01 Table 1).
     pub fn flags(&mut self, flags: EnvFlags) -> &mut EnvOpenOptions {
         self.flags = flags;
         self
     }
 
-    /// Choose the name of the data file inside the env directory (**ADR-0010**,
-    /// D-012). Default: [`DATA_FILE_NAME`] (`zerodb.dat`).
+    /// Choose the name of the data file inside the env directory
+    /// (**ADR-0010**). Default: [`DATA_FILE_NAME`] (`zerodb.dat`).
     ///
     /// This is an **integration knob**, not a format knob: the name lives
     /// outside the on-disk format (`format_version` is unaffected) and is
@@ -303,7 +302,8 @@ impl EnvOpenOptions {
     /// hardcodes it in production compaction and snapshot paths. The
     /// `heed-zerodb` adapter therefore sets [`HEED_DATA_FILE_NAME`]
     /// unconditionally, re-imposing the heed contract at the heed boundary
-    /// (the D-006/D-008/D-010 pattern) while the native engine keeps its honest
+    /// (the same pattern as the adapter's `map_size`, `max_readers(0)` and
+    /// NUL-in-DB-name checks) while the native engine keeps its honest
     /// `ZDB1`-format name.
     ///
     /// **There is no fallback probing.** `open` uses exactly the configured
@@ -413,16 +413,17 @@ impl EnvOpenOptions {
     /// env is created there (SPEC 02 §3.4).
     ///
     /// Unlike heed, this is a safe function: no `EnvFlags` value reachable here
-    /// enables cross-process behavior (D-001).
+    /// enables cross-process behavior (ZeroDB is single-process; see
+    /// docs/DIVERGENCES.md).
     ///
     /// # Errors
     ///
     /// - [`Error::Io`] (`InvalidInput`) if [`EnvOpenOptions::page_size`] is not
-    ///   a power of two in `[`[`MIN_PAGE_SIZE`]`, `[`MAX_PAGE_SIZE`]`]`
-    ///   (milestone 2.6). `Io(InvalidInput)` is the taxonomy ZeroDB already
-    ///   uses for open-time argument rejection (cf. the `max_readers(0)` and
-    ///   non-page-multiple `map_size` boundaries, D-010 / D-006); LMDB has no
-    ///   error for this because it has no such option.
+    ///   a power of two in `[`[`MIN_PAGE_SIZE`]`, `[`MAX_PAGE_SIZE`]`]`.
+    ///   `Io(InvalidInput)` is the taxonomy ZeroDB uses for open-time
+    ///   argument rejection (cf. the `max_readers(0)` and non-page-multiple
+    ///   `map_size` checks at the heed boundary); LMDB has no error for this
+    ///   because it has no such option.
     /// - [`Error::Io`] (`InvalidInput`) if
     ///   [`EnvOpenOptions::data_file_name`] is empty or is not a single path
     ///   component (ADR-0010).
@@ -435,7 +436,7 @@ impl EnvOpenOptions {
     ///   for the same canonical path (SPEC 04 TXN-51).
     pub fn open(&self, path: impl AsRef<Path>) -> Result<Env> {
         let dir = path.as_ref();
-        // M2.6: validate the page-size selector here rather than in the setter
+        // Validate the page-size selector here rather than in the setter
         // so the builder stays chainable.
         if self.page_size < MIN_PAGE_SIZE
             || self.page_size > MAX_PAGE_SIZE

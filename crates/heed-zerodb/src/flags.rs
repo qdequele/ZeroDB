@@ -1,10 +1,9 @@
 //! `EnvFlags` / `DatabaseFlags` / `PutFlags` — the exact type paths and LMDB bit
-//! values heed exposes (SPEC 00 row 61). Hand-rolled (no `bitflags` dependency;
-//! not on the CLAUDE.md allowlist) but API-compatible with the `bitflags 2`
-//! surface consumers use: `empty()`, `all()`, `bits()`, `from_bits_truncate`,
-//! `contains`, `intersects`, `insert`, `remove`, `is_empty`, and the bit
-//! operators. Bit values match `MDB_*` so a consumer reading `.bits()` sees the
-//! same integer as heed.
+//! values heed exposes (SPEC 00 row 61). Hand-rolled (no `bitflags` dependency)
+//! but API-compatible with the `bitflags 2` surface consumers use: `empty()`,
+//! `all()`, `bits()`, `from_bits_truncate`, `contains`, `intersects`,
+//! `insert`, `remove`, `is_empty`, and the bit operators. Bit values match
+//! `MDB_*` so a consumer reading `.bits()` sees the same integer as heed.
 
 /// Generate a `bitflags`-shaped flag type with the given named bits.
 macro_rules! flags {
@@ -132,8 +131,9 @@ flags! {
 }
 
 flags! {
-    /// LMDB database flags (SPEC 00 row 61; D-004: any non-empty value errors at
-    /// create in Phase 1 — no consumer passes one). Bit values match `MDB_*`.
+    /// LMDB database flags (SPEC 00 row 61; DUPSORT and the other database
+    /// flags are unsupported, so any non-empty value errors at create — no
+    /// consumer passes one; see docs/DIVERGENCES.md). Bit values match `MDB_*`.
     pub struct DatabaseFlags: u32 {
         /// Use reverse string keys.
         const REVERSE_KEY = 0x02;

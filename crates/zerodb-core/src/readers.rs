@@ -1,25 +1,24 @@
 //! The MVCC reader table and the published-snapshot cell (SPEC 04 §3/§4,
-//! TXN-14..22; ADR-0006). Milestone 1.8.
+//! TXN-14..22; ADR-0006).
 //!
 //! This module is the only place a reader and the writer communicate. It
-//! contains **no** `unsafe` (the crate is `#![deny(unsafe_code)]`, opened only
-//! in `page::raw` —
-//! ADR-0006 Option B): the load-bearing lock-free protocol is carried entirely
-//! by the slot atomics and the `commit_point` atomic; the snapshot cell's
-//! mutex only manages the `Arc<Snapshot>`'s lifetime, with critical sections
-//! that are all bounded O(1) pointer operations (TXN-18 as amended, ratified
-//! 2026-07-16).
+//! contains **no** `unsafe` (ADR-0006 Option B): the load-bearing lock-free
+//! protocol is carried entirely by the slot atomics and the `commit_point`
+//! atomic; the snapshot cell's mutex only manages the `Arc<Snapshot>`'s
+//! lifetime, with critical sections that are all bounded O(1) pointer
+//! operations (TXN-18).
 //!
 //! Concurrency primitives come from [`crate::sync`], so the identical source
 //! runs natively (and under miri) and is model-checked under
 //! `RUSTFLAGS="--cfg loom"` (`just loom`; the `loom_*` tests at the bottom of
-//! this file are the PLAN §1.8 loom suite, L1–L5 per ADR-0006).
+//! this file are the reader-table loom suite, L1–L5 per ADR-0006).
 //!
-//! Crash-safety note (rules of engagement #3): nothing in this module writes
+//! Crash-safety note: nothing in this module writes
 //! to disk. Every step here is in-process state; a crash at any point between
 //! any two operations leaves the durable file exactly as the commit pipeline
-//! (SPEC 04 §9) left it, and recovery never consults reader state (D-001:
-//! single process — a crashed process has no surviving readers to respect).
+//! (SPEC 04 §9) left it, and recovery never consults reader state (ZeroDB is
+//! single-process, see docs/DIVERGENCES.md — a crashed process has no
+//! surviving readers to respect).
 
 use std::sync::Arc;
 
@@ -44,7 +43,7 @@ pub(crate) const RDR_FREE: u64 = u64::MAX;
 /// `base.txnid >= MAX_COMMITTED_TXNID`): an accepted file can therefore
 /// never *commit its way* into the band, however many transactions follow.
 /// (A margin of only a few ids would let a boundary-value hostile meta reach
-/// `RDR_CLAIMED` two commits after a successful open — spec review 2026-09-09.)
+/// `RDR_CLAIMED` two commits after a successful open.)
 pub(crate) const MAX_COMMITTED_TXNID: u64 = RDR_CLAIMED - (1 << 32);
 
 /// Slot sentinel: reserved by a reader that has not yet published a real
@@ -64,7 +63,7 @@ pub(crate) const RDR_CLAIMED: u64 = u64::MAX - 1;
 /// other's cache lines (TXN-14).
 pub(crate) struct ReaderTable {
     slots: Box<[CachePadded<AtomicU64>]>,
-    /// LMDB `MDB_txninfo::mti_numreaders` parity (milestone 2.1): the
+    /// LMDB `MDB_txninfo::mti_numreaders` parity: the
     /// **high-water** slot count, i.e. `max(claimed slot index) + 1` over the
     /// env's lifetime. See [`ReaderTable::num_readers`] for why this is a
     /// high-water mark and not the live count.
@@ -87,8 +86,8 @@ impl ReaderTable {
     /// Claim a slot (SPEC 04 TXN-15): scan from 0; the first successful
     /// `compare_exchange(RDR_FREE → RDR_CLAIMED)` grants exclusive ownership.
     /// `None` after a full scan means the table is exhausted — the caller maps
-    /// it to `MdbError::ReadersFull` (TXN-16; no reaping path exists under
-    /// D-001, so the error is immediate).
+    /// it to `MdbError::ReadersFull` (TXN-16; no reaping path exists in a
+    /// single-process engine, so the error is immediate).
     ///
     /// There is no ABA hazard in this CAS: the compare value `RDR_FREE` means
     /// "free *now*", and ownership is conferred by the successful exchange
@@ -99,7 +98,7 @@ impl ReaderTable {
     ///
     /// **ADR-0006 D2 still holds** despite the `high_water` counter maintained
     /// below: that counter is written here but read *only* by
-    /// [`ReaderTable::num_readers`] (introspection, M2.1). Neither this scan
+    /// [`ReaderTable::num_readers`] (introspection). Neither this scan
     /// nor the writer's [`ReaderTable::oldest`] scan consults it — both still
     /// walk every slot, unconditionally.
     pub(crate) fn claim(&self) -> Option<u32> {
@@ -122,7 +121,7 @@ impl ReaderTable {
                 .compare_exchange(RDR_FREE, RDR_CLAIMED, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                // `mti_numreaders` parity (M2.1): LMDB bumps its counter only
+                // `mti_numreaders` parity: LMDB bumps its counter only
                 // when the first-fit scan lands *past* the current high-water
                 // (`if (i == nr) ti->mti_numreaders = ++nr;`), so the value is
                 // monotone. `fetch_max` is the same thing without LMDB's
@@ -176,8 +175,7 @@ impl ReaderTable {
     /// `RwTxn::oldest_reader`).
     ///
     /// Every load is `SeqCst`, pairing with `store_pin` (TXN-17). The
-    /// two-case correctness proof (SPEC 04 §4.5, as reviewed and fixed in
-    /// M0.4), with the writer in txn `N`:
+    /// two-case correctness proof (SPEC 04 §4.5), with the writer in txn `N`:
     ///
     /// 1. *Already-pinned readers (real txnid `v`) are never missed.* The
     ///    reader published `v` with a SeqCst store and this scan loads SeqCst;
@@ -237,36 +235,27 @@ impl ReaderTable {
 
     /// The table's fixed slot count — `max_readers` as configured at open
     /// (TXN-14; `mdb_env_get_maxreaders` / `MDB_envinfo::me_maxreaders`).
-    /// Milestone 2.1.
     pub(crate) fn capacity(&self) -> u32 {
         self.slots.len() as u32
     }
 
-    /// `MDB_envinfo::me_numreaders` parity (milestone 2.1).
+    /// `MDB_envinfo::me_numreaders` parity.
     ///
     /// **This is a high-water mark, not a live count** — the surprising part,
-    /// verified against the fork's `mdb.c`, not assumed. LMDB allocates a
+    /// verified against the fork's `mdb.c` (`mdb_txn_renew0`). LMDB allocates a
     /// reader slot by first-fit scan and only ever *increments*
-    /// `mti_numreaders`, when the scan lands past the current high-water:
-    ///
-    /// ```text
-    /// nr = ti->mti_numreaders;
-    /// for (i=0; i<nr; i++) if (ti->mti_readers[i].mr_pid == 0) break;
-    /// ...
-    /// if (i == nr) ti->mti_numreaders = ++nr;
-    /// ```
-    ///
+    /// `mti_numreaders`, when the scan lands past the current high-water.
     /// Ending a read txn clears the slot's `mr_pid` but leaves the counter
     /// alone, so `me_numreaders` is the **maximum number of simultaneously
     /// live readers ever observed** by the env, and it never decreases. LMDB's
     /// own header documents it as "number of reader slots used", which is
     /// misleading; the differential test in
     /// `zerodb-oracle/tests/env_info_differential.rs` observed the real
-    /// behavior. ZeroDB reproduces it exactly (CLAUDE.md rule 1) and offers
+    /// behavior. ZeroDB reproduces it exactly (LMDB parity) and offers
     /// the genuinely-live count separately as [`ReaderTable::in_use`].
     ///
-    /// Logged as `D-011` in `docs/DIVERGENCES.md` (PROPOSED Phase 3 candidate,
-    /// not approved).
+    /// Logged in `docs/DIVERGENCES.md` (`me_numreaders` semantics; a PROPOSED
+    /// candidate for later redefinition, not approved).
     ///
     /// Relaxed load: introspection only, orders nothing (see [`ReaderTable::claim`]).
     pub(crate) fn num_readers(&self) -> u32 {
@@ -275,7 +264,7 @@ impl ReaderTable {
 
     /// Slots **currently** occupied — claimed *or* pinned. A ZeroDB extension:
     /// the number LMDB's `me_numreaders` looks like it should be but is not
-    /// (see [`ReaderTable::num_readers`]). Milestone 2.1.
+    /// (see [`ReaderTable::num_readers`]).
     ///
     /// This is an **introspection** read, not part of the pin protocol: the
     /// value is a sample of a concurrently-mutating table and is only
@@ -291,7 +280,7 @@ impl ReaderTable {
     }
 
     /// A **snapshot of the occupied slots** — the introspection primitive
-    /// behind `Env::reader_list` (`mdb_reader_list`, milestone 2.2).
+    /// behind `Env::reader_list` (`mdb_reader_list`).
     ///
     /// Returns `(slot index, pinned txnid)` for every slot that is not
     /// `RDR_FREE`, in slot order; `None` for the txnid means the slot is
@@ -330,13 +319,12 @@ impl ReaderTable {
     }
 }
 
-/// The published-snapshot cell (SPEC 04 TXN-18 as amended — ratified
-/// 2026-07-16; ADR-0006 Option B): a `Mutex<Arc<Snapshot>>` whose critical
-/// sections are all bounded O(1) pointer operations (the writer's single swap
-/// per commit at C6; a reader's clone at pin), never held across I/O,
-/// allocation, or tree work — so no reader ever blocks on the write
-/// *transaction* (TXN-9), and the LMDB-NOTLS read-open parity bar (one mutex
-/// per open) is met. The mirroring `commit_point` atomic carries the entire
+/// The published-snapshot cell (SPEC 04 TXN-18; ADR-0006 Option B): a
+/// `Mutex<Arc<Snapshot>>` whose critical sections are all bounded O(1) pointer
+/// operations (the writer's single swap per commit at C6; a reader's clone at
+/// pin), never held across I/O, allocation, or tree work — so no reader ever
+/// blocks on the write *transaction* (TXN-9), and the LMDB-NOTLS read-open
+/// parity bar (one mutex per open) is met. The mirroring `commit_point` atomic carries the entire
 /// lock-free pin protocol.
 pub(crate) struct SnapshotCell {
     /// The immutable `(txnid, roots)` object readers `Arc`-clone (TXN-18).
@@ -367,7 +355,7 @@ impl SnapshotCell {
 
     /// `Arc`-clone the published snapshot. The clone keeps the
     /// `(txnid, roots)` alive for the caller's life regardless of later
-    /// commits. Critical section: one refcount bump (TXN-18 as amended).
+    /// commits. Critical section: one refcount bump (TXN-18).
     pub(crate) fn clone_snapshot(&self) -> Arc<Snapshot> {
         Arc::clone(&self.cell.lock().expect("snapshot cell poisoned"))
     }
@@ -393,8 +381,8 @@ impl SnapshotCell {
         self.commit_point.store(txnid, Ordering::SeqCst);
         // Drop the previous snapshot's Arc only after unlocking: if this was
         // its last reference, deallocation runs here, outside the critical
-        // section — keeping the section strictly O(1) pointer ops as the
-        // amended TXN-18 requires.
+        // section — keeping the section strictly O(1) pointer ops as TXN-18
+        // requires.
         drop(old);
     }
 
@@ -476,7 +464,7 @@ mod tests {
     fn zero_capacity_table_is_always_full() {
         // max_readers = 0 is degenerate but must not panic: every read txn
         // fails ReadersFull. The fork instead rejects the open with EINVAL —
-        // filed as D-010 (PROPOSED, docs/DIVERGENCES.md); no consumer
+        // filed in docs/DIVERGENCES.md (`max_readers(0)` at open); no consumer
         // passes 0.
         let t = ReaderTable::new(0);
         assert_eq!(t.claim(), None);
@@ -540,19 +528,18 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// The loom suite (PLAN §1.8 acceptance gate 1; ADR-0006 L1–L5). Runs only
+// The loom suite (the reader table's model-checking gate; ADR-0006 L1–L5). Runs only
 // under `just loom` (`RUSTFLAGS="--cfg loom" cargo test -p zerodb-core --lib
 // loom_`). Models are deliberately tiny (≤ 2 spawned threads + main) so loom
 // explores them exhaustively.
 //
-// Mutation-check record (ADR-0006, done during M1.8 development + review, all
-// mutations reverted):
+// Mutation-check record (ADR-0006):
 //
 // (a) Inverting the TXN-19 publish order (counter before object) fails
 //     L2 + L4 + L5 — the genuinely load-bearing order under Option B is
 //     machine-checked.
 // (b) Weakening the pin store to `Release` or the scan load to `Relaxed`
-//     does NOT fail this suite. Two stacked reasons, established in review:
+//     does NOT fail this suite, for two stacked reasons:
 //     (i) in the faithful with-mutex models the weakenings are genuinely
 //     safe — the cell mutex creates happens-before chains (an old reader's
 //     pin-completing clone-unlock HB every later publish/begin lock HB the
@@ -560,7 +547,7 @@ mod tests {
 //     `≥ N − 1` and is safe to miss (TXN-20 case 2); (ii) loom 0.7 CANNOT
 //     detect SC-access weakenings at all — a mutex-free "L2b" model (pin via
 //     `publish_and_verify` against a bare commit-point atomic, the ADR-0006
-//     Option-D/E fallback world) was built and REJECTED because loom reports
+//     Option-D/E fallback world) is not committable because loom reports
 //     the Dekker violation even for the correct all-SeqCst code, and a
 //     minimal all-SeqCst store-buffer litmus run under loom 0.7 confirms it
 //     explores the both-miss outcome C++20 (P0668) and AArch64 RCsc forbid:
@@ -568,9 +555,9 @@ mod tests {
 //     fence-oriented; tokio-rs/loom#180 class). A test that fails on correct
 //     code cannot be committed.
 // The SeqCst sites are therefore guarded by SPEC 04 TXN-17/20 (normative),
-// the per-site justification comments, this record, and ADR-0006 R1 as
-// amended: any future migration to the Option-D/E lock-free cell MUST bring
-// its own StoreLoad verification (an SC-fence reformulation loom can check,
+// the per-site justification comments, this record, and ADR-0006 R1: any
+// future migration to the Option-D/E lock-free cell MUST bring its own
+// StoreLoad verification (an SC-fence reformulation loom can check,
 // a different checker, or hardware litmus runs) as a precondition — the
 // mutex HB chains that make the weakenings survivable today vanish there.
 // ---------------------------------------------------------------------------
@@ -659,7 +646,7 @@ mod loom_tests {
     /// reclamation back) but never anything else; after the join the slot is
     /// observably free and reclaimable (TXN-18a / TXN-20 closing argument).
     ///
-    /// Honesty note: this is a **one-sided** (never-unsafe) property. The
+    /// Note: this is a **one-sided** (never-unsafe) property. The
     /// test cannot distinguish "the scan read a stale pre-release value" from
     /// "the scan simply ran before the release" — both yield `Some(5)` — so
     /// it pins conservatism and post-join visibility, not scan precision.
@@ -687,8 +674,7 @@ mod loom_tests {
     /// `slot value ≤ cloned snapshot txnid` (pinning older than what it reads
     /// is conservative; the reverse is the unsafe direction) and with roots
     /// no older than its verified commit point. A TXN-19 publish-order
-    /// inversion (counter before object) fails this test — verified by
-    /// mutation during development (ADR-0006 R3).
+    /// inversion (counter before object) fails this test (ADR-0006 R3).
     #[test]
     fn loom_l4_publish_vs_pin_retry() {
         loom::model(|| {

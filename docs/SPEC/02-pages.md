@@ -1,5 +1,8 @@
 # SPEC 02 — On-disk page formats
 
+> Revised 2026-10-05: `FORMAT_VERSION` 2 (ADR-0022), `META_ANNEX_OFF` constant,
+> `non_free_pages_size` definition (GC-23), DUPSORT hooks marked parked.
+
 Status: **DONE** — 2026-07-15 (milestone 0.4). Source of truth for the encode/
 decode implementation in `zerodb-core::page` (M1.1) and the meta protocol in
 M1.2. **This is our own format** (D-002): it is *not* byte-compatible with LMDB
@@ -9,7 +12,7 @@ sharing a file. Algorithms that consume these layouts live in
 [ADR-0002](../adr/0002-on-disk-format.md).
 
 Reading note: the LMDB fork sources were read to understand *what information a
-page must carry and why* (clean-room, CLAUDE.md rule 4). The layouts below are
+page must carry and why* (clean-room, AGENTS.md rule 4). The layouts below are
 ZeroDB's own design; where a field mirrors an LMDB idea it is called out, but no
 LMDB struct is transliterated.
 
@@ -22,7 +25,7 @@ LMDB struct is transliterated.
   variant. (Consumer *keys* are frequently big-endian — SPEC 00 row 52 — but
   that is codec-level key content, opaque to the engine; it does not change how
   the engine stores its own integer fields.)
-- **No `#[repr(C)]` casting of possibly-unaligned data** (CLAUDE.md unsafe
+- **No `#[repr(C)]` casting of possibly-unaligned data** (AGENTS.md unsafe
   policy). Every field is defined by an explicit byte **offset** and **width**
   and is read/written with `read_unaligned`-style accessors. The layouts below
   are chosen to keep the load-bearing integers **naturally aligned relative to
@@ -62,7 +65,7 @@ LMDB struct is transliterated.
 | Name | Value | Meaning |
 |------|-------|---------|
 | `MAGIC` | bytes `5A 44 42 31` (ASCII `"ZDB1"`) | 4-byte file identifier, stored as a byte array (endianness-free). |
-| `FORMAT_VERSION` | `1` (`u32`) | On-disk format version. Bumped only on an incompatible change (ADR-0002 §D8). |
+| `FORMAT_VERSION` | `2` (`u32`) | On-disk format version. Bumped only on an incompatible change (ADR-0002 §D8). Version 2 (ADR-0022, merged as #89) adds the meta free-list annex: `fl_count` at offset 168, `meta_crc` moved to 172 with split coverage, annex ids at 176 (§3/§3.3). A v1 file is refused at open (§3.2 step 2); migration is logical, `dump` then `load`. |
 | `HEADER_SIZE` | `32` | Size of the common page header, bytes. |
 | `PGNO_INVALID` | `0xFFFF_FFFF_FFFF_FFFF` | Sentinel "no page". |
 | `META_A_PGNO` / `META_B_PGNO` | `0` / `1` | The two fixed meta-page slots. |
@@ -74,6 +77,7 @@ LMDB struct is transliterated.
 | `MIN_KEYS_LEAF` | `1` | Min entries a non-root leaf may hold after delete. |
 | `MIN_KEYS_BRANCH` | `2` | Min children a non-root branch may hold. |
 | `META_CONTENT_LEN` | `172` | Number of leading bytes of a meta page covered by its CRC, before the annex ids (see §3/§3.3; format v2, ADR-0022). |
+| `META_ANNEX_OFF` | `176` | Absolute byte offset of the meta free-list annex ids (§3; format v2, ADR-0022). Annex capacity = `(psize − META_ANNEX_OFF) / 8` ids (`zerodb_core::page::meta_annex_cap`). |
 
 **Page-type flags** (`u16`, in the common header `flags` field; a page has
 exactly one of the first four structural bits set):
@@ -84,8 +88,8 @@ exactly one of the first four structural bits set):
 | `0x0002` | `P_BRANCH` | Branch (internal) page (separator key → child pgno). |
 | `0x0004` | `P_OVERFLOW` | Overflow page: head of a contiguous run holding one large value. |
 | `0x0008` | `P_META` | Meta page (slots 0 and 1 only). |
-| `0x0020` | `P_LEAF2` | **Reserved, Phase 2.8** — DUPFIXED packed-key leaf. Never set in Phase 1. |
-| `0x0040` | `P_SUBP` | **Reserved, Phase 2.8** — DUPSORT embedded sub-page. Never set in Phase 1. |
+| `0x0020` | `P_LEAF2` | **Reserved — DUPFIXED packed-key leaf** (Phase 2.8, parked 2026-07-20; §10). Never set; the decoder rejects it. |
+| `0x0040` | `P_SUBP` | **Reserved — DUPSORT embedded sub-page** (Phase 2.8, parked 2026-07-20; §10). Never set; the decoder rejects it. |
 
 Bits `0x0010`, `0x0080`–`0x8000` are reserved and MUST be zero in Phase 1. (In-
 memory-only markers such as LMDB's `P_DIRTY`/`P_LOOSE`/`P_KEEP` are **not**
@@ -105,7 +109,7 @@ the variant tail (§2.1).
 | 8 | 8 | `txnid` | u64 | txnid of the write transaction that last wrote this page (the "writer stamp", LMDB-1.0 idea). Feeds Phase 3.10 incremental page shipping. Always `≤` the live meta's txnid (INV-20). |
 | 16 | 2 | `flags` | u16 | Page-type bitfield (§1). |
 | 18 | 2 | `reserved0` | u16 | Reserved, MUST be 0 in Phase 1. |
-| 20 | 4 | `checksum` | u32 | **Data-page** CRC32C over the page body — **Phase 3.9**. MUST be written as `0` and ignored on read in Phase 1. (The *meta* page uses a separate mandatory CRC in §3; this field stays 0 even on meta pages.) |
+| 20 | 4 | `checksum` | u32 | **Reserved** — data-page CRC32C over the page body, a **Phase 3.9** item not yet started. MUST be written as `0` and is ignored on read (still the case as of 2026-10-05; `CommonHeader::write` zero-fills it). (The *meta* page uses a separate mandatory CRC in §3; this field stays 0 even on meta pages.) |
 | 24 | 8 | *variant tail* | — | Interpreted per page type; see §2.1. |
 
 `checksum` deliberately occupies a fixed slot now so enabling Phase 3.9 is a
@@ -119,7 +123,7 @@ behavior flag, not a format-version bump.
 |----:|-----:|------|------|---------|
 | 24 | 2 | `lower` | u16 | Body-relative offset of the end of the node-pointer array. `num_keys = lower / 2`. Grows **up** as entries are added. |
 | 26 | 2 | `upper` | u16 | Body-relative offset of the start of the cell heap. Cells grow **down** from `psize − HEADER_SIZE`. Free space = `upper − lower`. |
-| 28 | 2 | `leaf2_ksize` | u16 | **Reserved, Phase 2.8** (DUPFIXED fixed key size). MUST be 0 in Phase 1. |
+| 28 | 2 | `leaf2_ksize` | u16 | **Reserved** (DUPFIXED fixed key size; Phase 2.8, parked — §10). MUST be 0; a non-zero value is rejected at decode (`check_reserved_tail_fields`). |
 | 30 | 2 | `reserved1` | u16 | Reserved, MUST be 0. |
 
 **Overflow pages** — run length instead of bounds:
@@ -205,8 +209,8 @@ A DBRecord captures one B+tree's root and statistics. Two live in every meta
 | 24 | 8 | `overflow_pages` | u64 | Count of overflow pages (sum of all runs). |
 | 32 | 8 | `entries` | u64 | Number of key/value pairs (`Database::len`, SPEC 00 row 39). |
 | 40 | 2 | `depth` | u16 | Tree height (0 = empty, 1 = root-is-leaf). |
-| 42 | 2 | `flags` | u16 | Persistent DB flags — **reserved, Phase 2.8** (D-004; DUPSORT/INTEGERKEY/… land here). 0 in Phase 1. |
-| 44 | 4 | `leaf2_ksize` | u32 | **Reserved, Phase 2.8** (DUPFIXED). 0 in Phase 1. |
+| 42 | 2 | `flags` | u16 | Persistent DB flags — **reserved** (D-004; DUPSORT/INTEGERKEY/… would land here; Phase 2.8, parked — §10). Always 0 today. |
+| 44 | 4 | `leaf2_ksize` | u32 | **Reserved** (DUPFIXED; Phase 2.8, parked — §10). Always 0 today. |
 
 ### §3.2 — Double-buffer selection (open protocol)
 
@@ -269,7 +273,7 @@ Selection among the *CRC-valid* slots:
   committed snapshot — and use its `main_db.root` / `free_db.root`.
 - If exactly one slot is CRC-valid (the other torn by a power-cut mid-write),
   the valid one wins **regardless of txnid** — this is the torn-meta recovery
-  guarantee (PLAN §1.2). Because a writer only ever overwrites the *older* slot,
+  guarantee (M1.2). Because a writer only ever overwrites the *older* slot,
   the surviving slot is always a complete, consistent earlier snapshot.
 - If **both** slots fail validation → `MdbError::Invalid` (unrecoverable;
   M1.11 must never produce this from a single torn write).
@@ -413,7 +417,7 @@ Leaf-node flags:
 |-----|------|---------|
 | `0x0001` | `F_BIGDATA` | Value is stored on an overflow run. The leaf cell's value area is exactly 8 bytes: the `u64` head pgno of the run. `dsize` still gives the true value length. |
 | `0x0002` | `F_SUBDATA` | **Active in Phase 1** — the leaf value is a 48-byte sub-DB `DBRecord`, i.e. a named-DB catalog entry (M1.6; see §6). Only its *DUPSORT* interaction (`F_SUBDATA\|F_DUPDATA`, §10) is deferred to Phase 2.8; the plain catalog use is Phase 1. |
-| `0x0004` | `F_DUPDATA` | **Reserved, Phase 2.8** — value is a DUPSORT sub-page/sub-tree (D-004). |
+| `0x0004` | `F_DUPDATA` | **Reserved** — value is a DUPSORT sub-page/sub-tree (D-004; Phase 2.8, parked — §10). Never set; rejected at decode. |
 
 - Inline: cell length = `8 + ksize + dsize`, rounded up to even.
 - BIGDATA: cell length = `8 + ksize + 8`, rounded up to even; the 8-byte value
@@ -733,9 +737,13 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     254,255 with `254 + 2 = 256 ≤ 256` → **allowed**, exactly filling the map.)
 - **real_disk_size** (SPEC 00 row 18) = actual on-disk file length (`fstat`),
   `= (last_pg + 1) * psize` for a freshly grown file. **non_free_pages_size**
-  (SPEC 00 row 19) = `real_disk_size − (free-page count from the GC DB) * psize`;
-  the GC-DB walk that yields the free-page count is ZeroDB's native replacement
-  for milli reading LMDB's freelist DB (SPEC 05 provides the walk; M1.5).
+  (SPEC 00 row 19; definition amended 2026-09-29, SPEC 05 GC-23) = the sum of
+  `(branch + leaf + overflow pages) × psize` over the main DB and every named
+  DB's DBRecord — heed's definition, computed from ZeroDB's own catalog
+  records. It excludes meta, GC-tree and free pages and is independent of the
+  file length (the original `real_disk_size − free-page count × psize` formula
+  was retired: it misreported under `WRITE_MAP` and walked the whole GC tree
+  per call).
 
 ---
 
@@ -749,16 +757,20 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
   at offset 32).
 - Cell (node) contents are only **2-byte** aligned. `child_pgno` (u64) and
   `dsize` (u32) inside cells are read with `read_unaligned`. This is the primary
-  reason `#[repr(C)]` casting is forbidden here (CLAUDE.md).
+  reason `#[repr(C)]` casting is forbidden here (AGENTS.md).
 - Phase 3.6 (hannoy) will add an *opt-in* value-alignment table type; the Phase
   1 B+tree makes **no** value-alignment promise beyond 2-byte cell alignment.
 
 ---
 
-## §10 — DUPSORT format hooks (reserved — Phase 2.8, D-004)
+## §10 — DUPSORT format hooks (reserved — D-004; Phase 2.8 **parked**)
 
-No Phase 1 consumer uses duplicates (SPEC 00 §B.1, D-004). The format reserves,
-but does not implement:
+No consumer uses duplicates (SPEC 00 §B.1, D-004). A staged DUPSORT
+implementation (M2.8a) was built, reviewed and **parked on 2026-07-20**
+(the scope rule, AGENTS.md rule 6) — the engine-side work is not merged;
+only the oracle observation pins landed (`zerodb-oracle/tests/dup_pin_semantics.rs`
+/ `dup_pin_ffi.rs`, SPEC 03 §12.1). The format still reserves, but does not
+implement:
 
 - Leaf-node flags `F_DUPDATA` (0x04) and `F_SUBDATA` (0x02) combined → the leaf
   value is either an **embedded sub-page** (`P_SUBP`, small dup sets packed in
@@ -769,10 +781,12 @@ but does not implement:
   `LEAF2KEY(p,i) = body + i*leaf2_ksize`).
 - DBRecord.flags (offset 42) → persistent `DUP_SORT`/`DUP_FIXED`/… bits.
 
-In Phase 1 all these fields MUST be zero and the flags MUST never be set; the
-decoder MUST reject a page that sets them (defensive; a Phase-2.8 file is not a
-valid Phase-1 file). Cross-reference SPEC 01 Table 2 (all DB flags WON'T→2.8)
-and SPEC 03 §12.
+All these fields MUST be zero and the flags MUST never be set; the decoder
+MUST reject a page that sets them (defensive; today it does:
+`PageError::ReservedFlagSet` for `P_LEAF2`/`P_SUBP`, `ReservedFieldNonZero`
+for `leaf2_ksize`, and the leaf-cell flag mask `LEAF_FLAGS_PHASE1_MASK` for
+`F_DUPDATA`). Cross-reference SPEC 01 Table 2 (all DB flags WON'T, parked) and
+SPEC 03 §12.
 
 ---
 

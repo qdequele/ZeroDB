@@ -1,4 +1,4 @@
-//! `zerodb-tools` — offline utilities for zerodb env files (M1.12, PLAN §1.12).
+//! `zerodb-tools` — offline utilities for zerodb env files.
 //!
 //! A single binary with subcommands:
 //!
@@ -11,7 +11,8 @@
 //!
 //! ## Offline / liveness
 //!
-//! ZeroDB has no cross-process reader protocol (D-001), so pointing a tool at a
+//! ZeroDB has no cross-process reader protocol (it is single-process by
+//! design; see docs/DIVERGENCES.md), so pointing a tool at a
 //! **live** env is unsafe. Every tool takes a best-effort exclusive `flock` on
 //! the env's data file and **refuses** if it is held (`crate::lock`); the
 //! documented contract is that tools run against a **closed** env.
@@ -166,7 +167,7 @@ Subcommands:
   -h, --help                            this text
 
 All tools operate OFFLINE: they take an exclusive flock on the data file and
-refuse if the env may be live (D-001: no cross-process reader protocol).";
+refuse if the env may be live (ZeroDB has no cross-process reader protocol).";
 
 /// Parsed optional flags shared by several subcommands.
 #[derive(Default)]

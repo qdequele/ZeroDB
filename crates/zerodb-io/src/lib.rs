@@ -1,16 +1,16 @@
 //! zerodb-io — the I/O layer: read-only mmap, plain-file helpers, and the
-//! [`Backing`] implementation the engine core reads env files through (and,
-//! from M1.4 on, commits through: positioned `pwrite` + `sync_data`).
+//! [`Backing`] implementation the engine core reads env files through (and
+//! commits through: positioned `pwrite` + `sync_data`).
 //!
-//! This crate is one of the two sanctioned homes for mmap `unsafe` (CLAUDE.md
-//! unsafe policy). The `unsafe` blocks live in [`mmap`], the single `pwritev`
-//! call in [`file`] (PERF-GAP B4), and the test-only in-memory map stand-in
-//! (`testmap`, ADR-0021 M1, behind the `test-backing` feature); everything
-//! else is safe `std` I/O — including the [`fault`] crash-injection backend
-//! (M1.11, ADR-0008 D1 Option B: it *wraps* a real backing; its only
+//! This crate is one of the two sanctioned homes for mmap `unsafe` (the
+//! repo's unsafe policy). The `unsafe` blocks live in [`mmap`], the single `pwritev`
+//! call in [`file`] (the vectored commit write), and the test-only in-memory
+//! map stand-in (`testmap`, ADR-0021 M1, behind the `test-backing` feature);
+//! everything else is safe `std` I/O — including the [`fault`] crash-injection
+//! backend (ADR-0008 D1 Option B: it *wraps* a real backing; its only
 //! `unsafe` is the mandatory `unsafe fn` forward of the ADR-0021 brokered
-//! map slice, which adds no obligation of its own). The io_uring write
-//! backend arrives in Phase 3.5.
+//! map slice, which adds no obligation of its own). An io_uring write
+//! backend is not implemented yet.
 
 #![deny(missing_docs)]
 #[cfg(feature = "fault")]
@@ -67,7 +67,7 @@ impl Backing for MmapBacking {
     }
 
     fn write_pages_at(&self, start_pgno: u64, psize: u32, frames: &[&[u8]]) -> std::io::Result<()> {
-        // Batched C2 (PERF-GAP B4): one pwritev per chunk instead of one
+        // Batched C2 (commit-write coalescing): one pwritev per chunk instead of one
         // pwrite per dirty page. Same TXN-62 safety argument as
         // `write_at_page` — the target pages are unreferenced by any live
         // snapshot, so racing readers cannot observe the writes.
@@ -75,7 +75,7 @@ impl Backing for MmapBacking {
     }
 
     fn sync_data(&self) -> std::io::Result<()> {
-        // ADR-0004 D3 as amended (OQ3): std's `sync_data` semantics as-is —
+        // ADR-0004 D3 (OQ3): std's `sync_data` semantics as-is —
         // `fdatasync` on Linux (flushes data + the size metadata needed to
         // read it back, REC-14/GC-28), the full-flush path on macOS.
         self.file.sync_data()
@@ -91,7 +91,7 @@ impl MmapBacking {
 }
 
 /// A [`Backing`] over a **writable** memory-mapped env data file
-/// (`EnvFlags::WRITE_MAP`, SPEC 01 §S7, SPEC 04 §6.4; M1.10).
+/// (`EnvFlags::WRITE_MAP`, SPEC 01 §S7, SPEC 04 §6.4).
 ///
 /// The commit path writes dirty pages *through the map* (`write_at_page` =
 /// `memcpy` into the map) and flushes with `msync` (`sync`) instead of the
@@ -170,7 +170,7 @@ impl Backing for WriteMapBacking {
 
     // clippy cannot see that this is an `unsafe fn` whose documented contract
     // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
-    // too — verified clippy 1.97); B1's substance is the `unsafe fn` itself.
+    // too); ADR-0021 B1's substance is the `unsafe fn` itself.
     #[allow(clippy::mut_from_ref)]
     unsafe fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
         // ADR-0021 brokered dirty-page slice. Bounds are typed (`None`), not

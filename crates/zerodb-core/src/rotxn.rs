@@ -1,9 +1,9 @@
 //! Read transactions and the heed-shaped read API over the [`btree`] cursor
-//! (SPEC 04 §3, SPEC 00 read-op rows). Milestones 1.3/1.4.
+//! (SPEC 04 §3, SPEC 00 read-op rows).
 //!
 //! A [`RoTxn`] pins the env's **published snapshot** at open: it claims a
 //! reader-table slot, runs the SeqCst publish-and-verify pin (SPEC 04
-//! TXN-10/15/17; M1.8, ADR-0006), and `Arc`-clones the current [`Snapshot`]
+//! TXN-10/15/17; ADR-0006), and `Arc`-clones the current [`Snapshot`]
 //! object (TXN-18 — never re-reading a durable meta page, whose slot a later
 //! commit overwrites). The pinned slot is what stops the writer's GC from
 //! reclaiming any page this snapshot can reach (TXN-20/21); it is released
@@ -17,7 +17,7 @@
 //! reproduced: reads take `&Txn` and return `&'txn [u8]`; mutations take
 //! `&mut RwTxn`, so no read borrow can span a mutation (TXN-39).
 //!
-//! Named databases (M1.6): a [`Database`] handle carries a [`DbSel`] — the
+//! Named databases: a [`Database`] handle carries a [`DbSel`] — the
 //! main/unnamed DB or a named DB addressed by its env-level *dbi index*
 //! ([`Env::open_database`] / [`Env::create_database`]). A named DB's
 //! `DBRecord` (root/depth/stats) is **not** stored in the [`RoTxn`] snapshot;
@@ -65,12 +65,12 @@ pub trait TxnRead {
     /// yields [`DBRecord::empty`] (a lenient read view — the strict
     /// `Incompatible` check lives in `open`/`create`).
     fn record_for(&self, sel: DbSel) -> DBRecord;
-    /// The key ordering in force for the database `sel` addresses (**M2.4**,
-    /// SPEC 03 §2.0). [`DbSel::Main`] is always memcmp — it is the named-DB
+    /// The key ordering in force for the database `sel` addresses
+    /// (SPEC 03 §2.0). [`DbSel::Main`] is always memcmp — it is the named-DB
     /// catalog. Every tree this module builds for a *user* database routes
     /// through here.
     fn comparator_for(&self, sel: DbSel) -> KeyCmp<'_>;
-    /// The txn's validated-pages memo, if it keeps one (PERF-GAP A2): pages
+    /// The txn's validated-pages memo, if it keeps one: pages
     /// whose cells were fully validated earlier this txn and may be re-wrapped
     /// without the O(`num_keys`) cell walk. Default `None` = always fully
     /// validate.
@@ -146,8 +146,9 @@ enum EnvHandle<'e> {
 /// is safe Rust and cannot be prevented; the slot then pins its txnid
 /// forever, the GC gate stops advancing past it, and the file grows. Same
 /// failure mode as a stale LMDB reader, minus the cross-process reap (under
-/// D-001 there is nothing to reap — the owner provably is this process).
-/// Reader introspection is Phase 2.2; no reaping path exists.
+/// the single-process model there is nothing to reap — the owner provably is
+/// this process). Reader introspection (`Env::reader_list`) lists such slots;
+/// no reaping path exists.
 pub struct RoTxn<'env> {
     env: EnvHandle<'env>,
     psize: u32,
@@ -156,13 +157,14 @@ pub struct RoTxn<'env> {
     slot: u32,
     /// Per-txn memo of resolved named-DB records, keyed by dbi.
     ///
-    /// Without it every read op on a named DB re-did the registry lock + name
-    /// clone + a full catalog descent (`resolve_named_record`) — roughly
-    /// doubling the tree work per `get` (docs/PERF-GAP-VS-LMDB.md A1).
+    /// Without it every read op on a named DB would redo the registry lock +
+    /// name clone + a full catalog descent (`resolve_named_record`) — roughly
+    /// doubling the tree work per `get` (docs/PERF-GAP-VS-LMDB.md, named-DB
+    /// record re-resolved on every read).
     ///
     /// Soundness: this txn pins an immutable [`Snapshot`] (its catalog cannot
     /// change while pinned, TXN-18/20) and the dbi→name registry is
-    /// append-only for the process (M1.6), so a (dbi → record) resolution is
+    /// append-only for the process, so a (dbi → record) resolution is
     /// constant for the txn's life.
     ///
     /// Two tiers. `named_dense` is the hot path: a dbi-indexed table of
@@ -175,7 +177,7 @@ pub struct RoTxn<'env> {
     /// `RoTxn` auto-`Sync`.
     named_dense: OnceLock<Box<[OnceLock<DBRecord>]>>,
     named_memo: Mutex<Vec<(u32, DBRecord)>>,
-    /// Pages fully validated this txn (PERF-GAP A2; see
+    /// Pages fully validated this txn (see
     /// [`ValidatedPages`]). Sound here because every page this snapshot can
     /// reach is immutable while its reader slot is held (TXN-20/21).
     validated: ValidatedPages<'env>,
@@ -189,7 +191,7 @@ impl RoTxn<'_> {
     }
 
     /// The committed [`Snapshot`] this txn pins (roots + `last_pg`, SPEC 04
-    /// TXN-18). M1.12's `Env::copy_to_file` reads `last_pg`/`main_db`/`free_db`
+    /// TXN-18). `Env::copy_to_file` reads `last_pg`/`main_db`/`free_db`
     /// from here to bound a raw range copy and to synthesize the copy's meta
     /// pages.
     #[must_use]
@@ -198,7 +200,7 @@ impl RoTxn<'_> {
     }
 
     /// The whole mapped env file as bytes, borrowed for the txn's life
-    /// (SPEC 04 TXN-37). M1.12's non-compact `copy_to_file` copies the pinned
+    /// (SPEC 04 TXN-37). The non-compact `copy_to_file` copies the pinned
     /// snapshot's pages directly from here; pages this snapshot references are
     /// immutable while the txn's reader slot is held (TXN-20/21), so the copy
     /// is torn-free for reachable pages.
@@ -450,13 +452,14 @@ impl Env {
         }
     }
 
-    /// `open_database` with a **custom key comparator** (**milestone 2.4**;
-    /// `mdb_dbi_open` + `mdb_set_compare`). See
+    /// `open_database` with a **custom key comparator**
+    /// (`mdb_dbi_open` + `mdb_set_compare`). See
     /// [`Env::create_database_with_comparator`] for the full contract — in
     /// particular that the comparator is **not stored in the file**, so this
     /// call is where you take responsibility for passing the same ordering the
     /// database was built under. Passing a different one is undetectable and
-    /// silently returns wrong results (D-014).
+    /// silently returns wrong results (see docs/DIVERGENCES.md, comparator
+    /// persistence).
     ///
     /// The comparator is registered even though the database already exists:
     /// registration is an environment-level fact about a dbi, not a
@@ -479,8 +482,8 @@ impl Env {
         Ok(Some(db))
     }
 
-    /// `non_free_pages_size()` (SPEC 00 row 19 — MUST; SPEC 05 GC-23/GC-24,
-    /// amended 2026-09-29): the bytes held by the env's databases — the main
+    /// `non_free_pages_size()` (SPEC 00 row 19 — MUST; SPEC 05 GC-23/GC-24):
+    /// the bytes held by the env's databases — the main
     /// DB's branch, leaf and overflow pages plus those of every named DB,
     /// times the page size — under a fresh read snapshot. This is heed's
     /// definition (heed 0.22.1 `Env::non_free_pages_size` sums `mdb_stat`
@@ -543,11 +546,11 @@ pub fn free_page_count<T: TxnRead>(txn: &T) -> Result<u64> {
     Ok(total)
 }
 
-/// One owned, flagged entry: `(key, leaf-node flags, value)` (M1.12 tools/copy).
+/// One owned, flagged entry: `(key, leaf-node flags, value)` (tools and copy).
 pub type FlaggedEntry = (Vec<u8>, u16, Vec<u8>);
 
 /// Collect every entry of the database `db` addresses, in key order, as owned
-/// bytes together with each entry's leaf **node flags** (M1.12 tools/copy).
+/// bytes together with each entry's leaf **node flags** (tools and copy).
 ///
 /// The flags let a caller separate `F_SUBDATA` named-DB catalog records (which
 /// live inline on the **main** tree, SPEC 02 §6) from plain user data:
@@ -576,7 +579,7 @@ pub fn collect_entries_flagged<T: TxnRead>(db: &Database, txn: &T) -> Result<Vec
 
 /// Walk `db`'s entries in key order, handing each `(key, node_flags, value)`
 /// to `f` as **borrows** of the snapshot — the streaming-compaction feed
-/// (PERF-GAP C1; the owned sibling is [`collect_entries_flagged`]). Errors
+/// (bounded-memory compaction; the owned sibling is [`collect_entries_flagged`]). Errors
 /// share [`StreamBuildError`] with the streaming builder so a
 /// [`crate::builder::TreeStream::push`] call inside `f` needs no conversion;
 /// walk-side page errors surface as `StreamBuildError::Page`.
@@ -604,7 +607,7 @@ pub fn for_each_entry_flagged<T: TxnRead>(
     Ok(())
 }
 
-/// The names of every named database, in key (name) order (M1.12 tools/copy):
+/// The names of every named database, in key (name) order (tools and copy):
 /// the `F_SUBDATA` catalog entries on the main tree (SPEC 02 §6). An env with
 /// no named DBs yields an empty list. Works over any readable txn: a committed
 /// `RoTxn`, or an `RwTxn`'s working catalog view.
@@ -630,7 +633,7 @@ pub fn named_databases<T: TxnRead>(txn: &T) -> Result<Vec<Vec<u8>>> {
 /// methods are pure tree searches: an empty or oversized key is not rejected,
 /// it simply matches nothing. LMDB's heed-observed read-key error taxonomy
 /// (SPEC 03 §2.1) is a heed-API-boundary concern applied by the caller (the
-/// oracle adapter today; `heed-zerodb` at M1.13). **Write** methods do
+/// oracle adapter and `heed-zerodb`). **Write** methods do
 /// validate (SPEC 03 §6: `put*` rejects an empty or `> 511`-byte key and an
 /// oversized value with `BadValSize`) — the split machinery's termination
 /// proof relies on the key bound.
@@ -677,7 +680,7 @@ impl Database {
 
     pub(crate) fn tree<'txn, T: TxnRead + ?Sized>(&self, txn: &'txn T) -> Tree<'txn> {
         let rec = txn.record_for(self.sel);
-        // M2.4: the tree carries its database's ordering, so every descent,
+        // The tree carries its database's ordering, so every descent,
         // seek, range bound and hit-test below uses it (SPEC 03 §2.0).
         Tree::with_comparator(
             txn.source(),
@@ -924,7 +927,7 @@ enum Dir {
 /// borrow it holds forbids any mutation while it is alive (SPEC 04 TXN-39).
 pub struct RoRange<'txn> {
     cursor: Cursor<'txn>,
-    /// The database's ordering (**M2.4**), copied from the tree so the
+    /// The database's ordering, copied from the tree so the
     /// termination test below agrees with the seek the cursor performed. A
     /// memcmp bound test over a comparator-ordered cursor would stop the scan
     /// at an arbitrary point.

@@ -1,12 +1,8 @@
-//! Milestone 2.3 — `copy_to_file_with_progress`.
-//!
-//! Phase 2 acceptance: "doc + unit tests where it's zerodb-defined". This is
-//! entirely zerodb-defined — `mdb_env_copy2` reports no progress and heed
-//! exposes no callback, so there is nothing to diff against. What the M1.12
-//! oracle already covers (that the *copy itself* is byte-correct in both
-//! modes, `zerodb-oracle/tests/copy_to_file_differential.rs`) is unchanged and
-//! not re-litigated here; these tests are about the callback contract and,
-//! critically, that adding it did not change the bytes.
+//! `copy_to_file_with_progress`: a zerodb-defined extension (`mdb_env_copy2`
+//! reports no progress and heed exposes no callback), so there is no oracle
+//! to diff against. Copy byte-correctness is covered by
+//! `zerodb-oracle/tests/copy_to_file_differential.rs`; these tests pin the
+//! callback contract and that instrumenting a copy does not change its bytes.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -141,8 +137,8 @@ fn compacting_copy_progress_reaches_the_total_monotonically() {
 
 #[test]
 fn progress_callback_does_not_change_the_bytes_written() {
-    // The no-callback signature is heed parity and must be untouched (PLAN
-    // ground rule for this tranche). Prove it by producing both ways and
+    // The no-callback signature is heed parity and must be untouched (heed's
+    // existing API is never changed). Prove it by producing both ways and
     // comparing byte for byte, in both modes.
     for option in [CompactionOption::Disabled, CompactionOption::Enabled] {
         let dir = TempDir::new();
