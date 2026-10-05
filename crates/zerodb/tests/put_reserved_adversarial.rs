@@ -28,7 +28,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use zerodb::{check, Env, EnvOpenOptions};
+use zerodb::{check, Env, EnvFlags, EnvOpenOptions};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -58,10 +58,14 @@ impl Drop for TempDir {
 const PS: u32 = 4096;
 const MAP: usize = 8 << 20;
 
-fn open(dir: &Path) -> Env {
+/// The battery runs in both dirty-page realizations (ADR-0021 M3): default
+/// heap frames, and in-place `WRITE_MAP` (TXN-45b), where the reserved
+/// slice the closure fills points straight into the writable map.
+fn open_flags(dir: &Path, flags: EnvFlags) -> Env {
     let mut opts = EnvOpenOptions::new();
     opts.map_size(MAP);
     opts.page_size(PS);
+    opts.flags(flags);
     opts.open(dir).expect("open env")
 }
 
@@ -76,13 +80,27 @@ fn assert_clean(dir: &Path) {
 /// at `2022`.
 #[test]
 fn reserve_at_inline_overflow_boundary_both_sides() {
+    reserve_at_boundary(EnvFlags::EMPTY);
+}
+
+/// ADR-0021 M3: the boundary reserves with the slice in the writable map.
+#[test]
+fn reserve_at_inline_overflow_boundary_both_sides_writemap_in_place() {
+    reserve_at_boundary(EnvFlags::WRITE_MAP);
+}
+
+fn reserve_at_boundary(flags: EnvFlags) {
     let dir = TempDir::new();
-    let env = open(dir.path());
+    let env = open_flags(dir.path(), flags);
     let db = env.main_database();
     let inline_val: Vec<u8> = (0..2021u32).map(|i| (i % 250) as u8).collect();
     let overflow_val: Vec<u8> = (0..2022u32).map(|i| (i % 250) as u8).collect();
 
     let mut wtxn = env.write_txn().unwrap();
+    assert_eq!(
+        wtxn.dirty_in_map_mode(),
+        flags.contains(EnvFlags::WRITE_MAP)
+    );
     db.put_reserved(&mut wtxn, b"k", inline_val.len(), |buf| {
         buf.copy_from_slice(&inline_val);
     })
@@ -106,9 +124,21 @@ fn reserve_at_inline_overflow_boundary_both_sides() {
 
 #[test]
 fn reserve_forcing_split_lands_correctly_through_commit_and_reopen() {
+    reserve_forcing_split(EnvFlags::EMPTY);
+}
+
+/// ADR-0021 M3: the split-materializing reserve under in-place `WRITE_MAP`
+/// (the general split's scratch copy of a map frame, then the placeholder
+/// overwrite — all in the map), through commit + reopen.
+#[test]
+fn reserve_forcing_split_through_commit_and_reopen_writemap_in_place() {
+    reserve_forcing_split(EnvFlags::WRITE_MAP);
+}
+
+fn reserve_forcing_split(flags: EnvFlags) {
     let dir = TempDir::new();
     {
-        let env = open(dir.path());
+        let env = open_flags(dir.path(), flags);
         let db = env.main_database();
         let mut wtxn = env.write_txn().unwrap();
         // Pack a leaf near-full with regular puts first (same technique as
@@ -142,7 +172,7 @@ fn reserve_forcing_split_lands_correctly_through_commit_and_reopen() {
     assert_clean(dir.path());
     // Reopen: the split-materialized reserve must have survived the commit
     // pipeline (C0-C6) intact, not just the in-txn dirty-frame view.
-    let env = open(dir.path());
+    let env = open_flags(dir.path(), flags);
     let db = env.main_database();
     let rtxn = env.read_txn().unwrap();
     assert_eq!(
@@ -173,10 +203,26 @@ fn reserve_forcing_split_lands_correctly_through_commit_and_reopen() {
 /// guaranteed contract for callers to rely on.
 #[test]
 fn reserve_partial_fill_unfilled_tail_is_observed_deterministic() {
+    reserve_partial_fill(EnvFlags::EMPTY);
+}
+
+/// ADR-0021 M3: same misuse under in-place `WRITE_MAP` — the fresh frame is
+/// the zero-filled map page (`insert_tree_frame` zero-fills the map region
+/// exactly as it zero-fills a heap frame), so the observed tail matches.
+#[test]
+fn reserve_partial_fill_unfilled_tail_writemap_in_place() {
+    reserve_partial_fill(EnvFlags::WRITE_MAP);
+}
+
+fn reserve_partial_fill(flags: EnvFlags) {
     let dir = TempDir::new();
-    let env = open(dir.path());
+    let env = open_flags(dir.path(), flags);
     let db = env.main_database();
     let mut wtxn = env.write_txn().unwrap();
+    assert_eq!(
+        wtxn.dirty_in_map_mode(),
+        flags.contains(EnvFlags::WRITE_MAP)
+    );
     let len = 200usize;
     db.put_reserved(&mut wtxn, b"half-filled", len, |buf| {
         // Contract violation: only write the first half.

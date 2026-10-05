@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
-use zerodb::{Database, Env, EnvOpenOptions, NestedRoTxn, TxnRead};
+use zerodb::{Database, Env, EnvFlags, EnvOpenOptions, NestedRoTxn, TxnRead};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -54,12 +54,25 @@ const MAP: usize = 64 << 20;
 const N_WORKERS: usize = 9;
 const KEYSPACE: u64 = 800;
 
-fn open(dir: &Path) -> Env {
+fn open(dir: &Path, flags: EnvFlags) -> Env {
     let mut opts = EnvOpenOptions::new();
     opts.map_size(MAP);
     opts.page_size(PS);
     opts.max_dbs(4);
+    opts.flags(flags);
     opts.open(dir).expect("open env")
+}
+
+/// The fan-out batteries run in both dirty-page realizations (ADR-0021 M3):
+/// the default heap-staged store, and in-place `WRITE_MAP` (TXN-45b), where
+/// the children read the writer's uncommitted state straight from the
+/// writable map. The writemap twins assert the mode actually engaged.
+fn assert_mode(wtxn: &zerodb::RwTxn<'_>, flags: EnvFlags) {
+    assert_eq!(
+        wtxn.dirty_in_map_mode(),
+        flags.contains(EnvFlags::WRITE_MAP),
+        "dirty-page realization does not match the env flags"
+    );
 }
 
 fn key_bytes(key: u64) -> [u8; 8] {
@@ -123,8 +136,19 @@ fn worker_read_pass<T: TxnRead>(
 /// generations (gen-1 keys rewritten to gen 2 between the windows).
 #[test]
 fn milli_fanout_two_windows_then_commit() {
+    milli_fanout_two_windows(EnvFlags::EMPTY);
+}
+
+/// The same milli fan-out with in-place `WRITE_MAP` (ADR-0021 M3): workers
+/// read dirty leaves and overflow runs directly out of the writable map.
+#[test]
+fn milli_fanout_two_windows_then_commit_writemap_in_place() {
+    milli_fanout_two_windows(EnvFlags::WRITE_MAP);
+}
+
+fn milli_fanout_two_windows(flags: EnvFlags) {
     let dir = TempDir::new();
-    let env = open(dir.path());
+    let env = open(dir.path(), flags);
     let db = env.main_database();
 
     // A committed baseline for half the keyspace, so children also read
@@ -137,6 +161,7 @@ fn milli_fanout_two_windows_then_commit() {
     wtxn.commit().unwrap();
 
     let mut wtxn = env.write_txn().unwrap();
+    assert_mode(&wtxn, flags);
     // Stage the other half uncommitted (gen 1).
     for key in KEYSPACE / 2..KEYSPACE {
         db.put(&mut wtxn, &key_bytes(key), &value_for(key, 1))
@@ -220,11 +245,23 @@ fn milli_fanout_two_windows_then_commit() {
 /// worker threads (the Release-decrement path runs off the writer thread).
 #[test]
 fn hannoy_channel_pool_fanout() {
+    hannoy_channel_pool(EnvFlags::EMPTY);
+}
+
+/// The hannoy pool fan-out with in-place `WRITE_MAP` (ADR-0021 M3): the
+/// children drop on worker threads while the dirty state lives in the map.
+#[test]
+fn hannoy_channel_pool_fanout_writemap_in_place() {
+    hannoy_channel_pool(EnvFlags::WRITE_MAP);
+}
+
+fn hannoy_channel_pool(flags: EnvFlags) {
     let dir = TempDir::new();
-    let env = open(dir.path());
+    let env = open(dir.path(), flags);
     let db = env.main_database();
 
     let mut wtxn = env.write_txn().unwrap();
+    assert_mode(&wtxn, flags);
     for key in 0..KEYSPACE {
         db.put(&mut wtxn, &key_bytes(key), &value_for(key, 1))
             .unwrap();
@@ -292,10 +329,21 @@ fn hannoy_channel_pool_fanout() {
 /// `record_for` delegation, ADR-0007 D2).
 #[test]
 fn fanout_reads_uncommitted_named_db() {
+    fanout_uncommitted_named_db(EnvFlags::EMPTY);
+}
+
+/// Named-DB fan-out with in-place `WRITE_MAP` (ADR-0021 M3).
+#[test]
+fn fanout_reads_uncommitted_named_db_writemap_in_place() {
+    fanout_uncommitted_named_db(EnvFlags::WRITE_MAP);
+}
+
+fn fanout_uncommitted_named_db(flags: EnvFlags) {
     let dir = TempDir::new();
-    let env = open(dir.path());
+    let env = open(dir.path(), flags);
 
     let mut wtxn = env.write_txn().unwrap();
+    assert_mode(&wtxn, flags);
     let named = env.create_database(&mut wtxn, Some(b"vectors")).unwrap();
     for key in 0..200u64 {
         named

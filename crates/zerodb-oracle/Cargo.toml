@@ -29,7 +29,7 @@ zerodb-core = { path = "../zerodb-core" }
 heed-zerodb = { path = "../heed-zerodb" }
 # The fault-injection write backend + deterministic PRNG for the M1.11 crash
 # harness (ADR-0008). Workspace-internal.
-zerodb-io = { path = "../zerodb-io", features = ["fault"] }
+zerodb-io = { path = "../zerodb-io", features = ["fault", "test-backing"] }
 
 [[bin]]
 name = "crash-harness"

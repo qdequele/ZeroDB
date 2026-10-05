@@ -19,11 +19,15 @@
 
 #![deny(missing_docs)]
 // `deny`, not `forbid`, since PERF-GAP A3 (2026-07-22): the CLAUDE.md unsafe
-// policy sanctions `zerodb-core::page` for page-casting unsafe, and the A3
-// unchecked field readers live in exactly one module there — `page::raw`,
-// which carries the only `#[allow(unsafe_code)]` in the crate (on its `mod`
-// declaration, with the safety contract in the module docs). Everything else
-// in this crate remains unsafe-free and the lint keeps it that way.
+// policy sanctions `zerodb-core::page` for page-casting unsafe (the A3
+// unchecked field readers in `page::raw`, allow on its `mod` declaration)
+// and, since 2026-10-02 (ADR-0021), `zerodb-core::dirty` for the one call of
+// the `unsafe` WRITE_MAP in-place map-slice broker (`dirty::map_mut`, allow
+// on that fn, SAFETY contract stated there). The `Backing::map_dirty_page`
+// trait method in `env` carries a declaration-only allow (an `unsafe fn`
+// signature with a trivially safe default body — ADR-0021 B1 requires the
+// broker to be `unsafe fn`). Everything else in this crate remains
+// unsafe-free and the lint keeps it that way.
 #![deny(unsafe_code)]
 
 pub mod btree;

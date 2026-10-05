@@ -60,4 +60,10 @@ pub struct CutReport {
     /// (ADR-0017), as the SIGKILL child acked them; the image mechanism is
     /// counted process-wide in `model::SPILLED_TXNS` instead.
     pub spilled_txns: u64,
+    /// Distinct in-map dirty regions the cycle's fault journal recorded
+    /// (ADR-0021 B3) — nonzero only for image cuts of the WRITE_MAP modes,
+    /// where the workload runs the true in-place realization. A green run
+    /// with zero here and nonzero writemap cycles would mean the in-place
+    /// crash coverage went vacuous again.
+    pub map_regions: u64,
 }

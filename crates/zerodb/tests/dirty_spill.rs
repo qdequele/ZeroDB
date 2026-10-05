@@ -294,10 +294,29 @@ fn dirty_memory_stays_near_the_limit() {
 
 #[test]
 fn abort_after_spilling_leaves_the_last_commit() {
+    abort_after_spill(EnvFlags::EMPTY);
+}
+
+/// ADR-0021 M3: abort-after-spill under in-place `WRITE_MAP` (TXN-45b) —
+/// the "spilled" pages were stored in the map at allocation time and the
+/// spill was pure bookkeeping, so the abort leaves them as unreferenced
+/// scribbles; the last commit survives intact, also across reopen, and the
+/// space is reused.
+#[test]
+fn abort_after_spilling_leaves_the_last_commit_writemap_in_place() {
+    abort_after_spill(EnvFlags::WRITE_MAP);
+}
+
+fn abort_after_spill(flags: EnvFlags) {
     let dir = TempDir::new();
-    let env = open(dir.path(), Some(TINY), EnvFlags::EMPTY);
+    let env = open(dir.path(), Some(TINY), flags);
     let db = env.main_database();
     let mut w = env.write_txn().unwrap();
+    assert_eq!(
+        w.dirty_in_map_mode(),
+        flags.contains(EnvFlags::WRITE_MAP),
+        "dirty-page realization must match the env flags (ADR-0021)"
+    );
     for i in 0..2_000u32 {
         db.put(&mut w, format!("base{i:05}").as_bytes(), b"committed")
             .unwrap();
@@ -323,7 +342,7 @@ fn abort_after_spilling_leaves_the_last_commit() {
     assert_clean(dir.path());
     drop(env);
 
-    let env = open(dir.path(), Some(TINY), EnvFlags::EMPTY);
+    let env = open(dir.path(), Some(TINY), flags);
     assert_eq!(
         contents(&env.read_txn().unwrap(), db),
         before,

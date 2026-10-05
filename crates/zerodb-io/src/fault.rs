@@ -28,9 +28,40 @@
 //! the harness's REC-18 verification would fail — that is the tripwire this
 //! module arms (and the mutation self-test proves it fires, ADR-0008 D6.1).
 //!
-//! Everything here is safe Rust (ADR-0008 D1 Option B): the live view is the
-//! wrapped backing's — no new aliasing, no new `unsafe`.
+//! ## In-place `WRITE_MAP` (ADR-0021 B3)
+//!
+//! When the wrapped backing brokers map slices (`Backing::dirty_in_map`),
+//! dirty pages never pass through `write_at_page` — the engine stores them
+//! **directly into the map** at allocation/edit time (SPEC 04 TXN-45b). This
+//! wrapper forwards the broker and journals each brokered **region**
+//! (offset, length — deduplicated, since every mutable access re-brokers).
+//! A region's *bytes* are not knowable at broker time (they are written
+//! through the slice afterwards), so regions are **resolved** — snapshotted
+//! from the live map into ordinary pending [`WriteRecord`]s — at the
+//! earliest of:
+//!
+//! - any `sync` call (synchronous *or* `MS_ASYNC`): C3 runs before C4, so
+//!   the records keep the data-before-meta issue order, and under
+//!   `MAP_ASYNC` (where nothing folds) each commit's final region bytes are
+//!   sealed per commit — a page re-dirtied by a later txn re-enters the
+//!   journal as a new record, preserving per-commit versions exactly as the
+//!   fd-path journal does;
+//! - a [`FaultHandle::capture`] (which resolves into the snapshot without
+//!   touching the journal).
+//!
+//! The crash semantics this models: the kernel may persist **any subset of
+//! dirty map bytes, torn at any granularity**, between two barriers — which
+//! is exactly the adversarial fate machinery below. (Intermediate byte
+//! states between two seal points are not enumerated; under the
+//! bounded-window modes they can only land on pages no durable meta
+//! references, and under `MAP_ASYNC` the adversarial sub-model is
+//! probe-only, ADR-0008 D4.)
+//!
+//! The live view stays the wrapped backing's — no new aliasing. The only
+//! `unsafe` is the mandatory `unsafe fn` forward of the brokered map slice
+//! (ADR-0021 B1), which adds no obligation of its own.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use zerodb_core::env::Backing;
@@ -136,6 +167,17 @@ pub struct FaultStats {
     /// Asynchronous flushes observed (deliberately **not** barriers, REC-9:
     /// `msync(MS_ASYNC)` gives no completion guarantee).
     pub async_flushes: u64,
+    /// Distinct in-map dirty regions journaled (ADR-0021 B3: brokered map
+    /// slices, deduplicated per seal window). Nonzero iff the wrapped
+    /// backing runs the in-place WRITE_MAP realization.
+    pub map_regions: u64,
+    /// `write_at_page` calls targeting **data** pages (offset past the two
+    /// meta slots). Under in-place WRITE_MAP this must stay 0 — every data
+    /// page is realized through the broker, and C2/spill write nothing — so
+    /// the harness uses it as a vacuousness tripwire (ADR-0021 B3): a
+    /// nonzero value under a WRITE_MAP cycle means the in-place realization
+    /// silently disengaged.
+    pub data_writes: u64,
 }
 
 #[derive(Debug)]
@@ -149,6 +191,11 @@ struct FaultState {
     durable_len: u64,
     /// Writes since the last barrier, in issue order.
     pending: Vec<WriteRecord>,
+    /// In-map dirty regions brokered since the last seal point (ADR-0021
+    /// B3): byte offset → region length. Deduplicated (every mutable access
+    /// re-brokers its region); content is read from the live map at the next
+    /// seal (any `sync`) or capture — see the module docs.
+    map_regions: BTreeMap<u64, u64>,
     /// Mutation self-test mode (ADR-0008 D6.1): barriers fold ONLY meta-page
     /// writes; data writes stay pending forever. This models a pipeline whose
     /// data fsync is ineffective/misordered — the harness MUST catch the
@@ -158,6 +205,41 @@ struct FaultState {
 }
 
 impl FaultState {
+    /// Resolve the brokered map regions against the live map `live` and
+    /// append them to `pending` (ascending offset — regions never overlap
+    /// `write_at_page` records: data pages are brokered, the meta slots and
+    /// heap frames are written through the fd path). The seal point of the
+    /// module docs.
+    fn seal_map_regions(&mut self, live: &[u8]) {
+        if self.map_regions.is_empty() {
+            return;
+        }
+        for (&off, &len) in &self.map_regions {
+            let (start, end) = (off as usize, (off + len) as usize);
+            debug_assert!(end <= live.len(), "brokered region outside the map");
+            self.pending.push(WriteRecord {
+                offset: off,
+                data: live[start..end.min(live.len())].into(),
+            });
+        }
+        self.map_regions.clear();
+    }
+
+    /// `pending` plus the still-unsealed map regions resolved against `live`
+    /// — the capture view (leaves the journal untouched).
+    fn pending_with_regions(&self, live: &[u8]) -> Vec<WriteRecord> {
+        let mut out = self.pending.clone();
+        for (&off, &len) in &self.map_regions {
+            let (start, end) = (off as usize, (off + len) as usize);
+            debug_assert!(end <= live.len(), "brokered region outside the map");
+            out.push(WriteRecord {
+                offset: off,
+                data: live[start..end.min(live.len())].into(),
+            });
+        }
+        out
+    }
+
     fn fold_barrier(&mut self) {
         self.stats.barriers += 1;
         let broken = self.broken_data_barriers;
@@ -185,12 +267,18 @@ impl FaultState {
 #[derive(Clone)]
 pub struct FaultHandle {
     state: Arc<Mutex<FaultState>>,
+    /// The wrapped live backing (shared with the [`FaultBacking`]): capture
+    /// resolves un-sealed in-map regions against it (ADR-0021 B3), and the
+    /// `Arc` keeps the map alive for captures after the env dropped.
+    live: Arc<dyn Backing>,
 }
 
 impl FaultHandle {
     /// Snapshot the `(durable, pending)` pair — the simulated power cut. The
     /// running env is untouched (capture, don't kill: the cut point is frozen
-    /// while the workload continues, ADR-0008 D2).
+    /// while the workload continues, ADR-0008 D2). In-map dirty regions
+    /// (ADR-0021 B3) are resolved against the live map into the snapshot;
+    /// the journal itself is not mutated.
     #[must_use]
     pub fn capture(&self) -> CapturedDisk {
         let st = self.state.lock().expect("fault state lock");
@@ -198,7 +286,7 @@ impl FaultHandle {
             psize: st.psize,
             durable: st.durable.clone(),
             durable_len: st.durable_len,
-            pending: st.pending.clone(),
+            pending: st.pending_with_regions(self.live.bytes()),
         }
     }
 
@@ -221,17 +309,21 @@ impl FaultHandle {
 ///
 /// Reads (`bytes`) delegate to the wrapped backing — the live process view,
 /// identical to production where the page cache serves un-fsynced writes.
-/// Writes journal, then delegate. `sync(false)` folds the journal (the REC-20
-/// pending→durable transition); `sync(true)` (`MAP_ASYNC`) deliberately does
-/// **not** — the most adversarial sound model of `msync(MS_ASYNC)`.
+/// Writes journal, then delegate; brokered in-map dirty regions (ADR-0021
+/// B3) are journaled at broker time and resolved at seal points (module
+/// docs). `sync(false)` folds the journal (the REC-20 pending→durable
+/// transition); `sync(true)` (`MAP_ASYNC`) deliberately does **not** — the
+/// most adversarial sound model of `msync(MS_ASYNC)`.
 pub struct FaultBacking {
-    inner: Box<dyn Backing>,
+    inner: Arc<dyn Backing>,
     state: Arc<Mutex<FaultState>>,
 }
 
 impl FaultBacking {
     /// Wrap `inner`, seeding the durable image from its current on-disk
-    /// content (a freshly created env's two creation metas, typically).
+    /// content (a freshly created env's two creation metas, typically; under
+    /// `WRITE_MAP` the file is already `set_len(map_size)`, so the durable
+    /// image starts at the full, mostly-zero map — the real on-disk state).
     ///
     /// # Errors
     ///
@@ -257,16 +349,19 @@ impl FaultBacking {
         durable: Vec<u8>,
         durable_len: u64,
     ) -> std::io::Result<(FaultBacking, FaultHandle)> {
+        let inner: Arc<dyn Backing> = Arc::from(inner);
         let state = Arc::new(Mutex::new(FaultState {
             psize,
             durable,
             durable_len,
             pending: Vec::new(),
+            map_regions: BTreeMap::new(),
             broken_data_barriers: false,
             stats: FaultStats::default(),
         }));
         let handle = FaultHandle {
             state: Arc::clone(&state),
+            live: Arc::clone(&inner),
         };
         Ok((FaultBacking { inner, state }, handle))
     }
@@ -299,12 +394,52 @@ impl Backing for FaultBacking {
                 data.len()
             );
             st.stats.writes += 1;
+            let offset = pgno * u64::from(psize);
+            if offset >= 2 * u64::from(st.psize) {
+                st.stats.data_writes += 1;
+            }
             st.pending.push(WriteRecord {
-                offset: pgno * u64::from(psize),
+                offset,
                 data: data.into(),
             });
         }
         self.inner.write_at_page(pgno, psize, data)
+    }
+
+    fn dirty_in_map(&self) -> bool {
+        // ADR-0021 B3: forward the in-place realization so WRITE_MAP crash
+        // cycles exercise it — the journal tracks brokered regions instead
+        // of (never-issued) C2 writes.
+        self.inner.dirty_in_map()
+    }
+
+    // clippy cannot see that this is an `unsafe fn` whose documented contract
+    // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
+    // too — verified clippy 1.97); B1's substance is the `unsafe fn` itself.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
+        {
+            let mut st = self.state.lock().expect("fault state lock");
+            debug_assert_eq!(psize, st.psize, "broker psize drifted from env psize");
+            let off = pgno * u64::from(psize);
+            let len = pages * u64::from(psize);
+            // Deduplicate: every mutable access re-brokers its region. Keep
+            // the widest length seen at an offset (a shorter later frame at
+            // the same head only re-dirties a prefix; over-recording is
+            // safe — the kernel could persist any subset of dirty map bytes).
+            let fresh = !st.map_regions.contains_key(&off);
+            let entry = st.map_regions.entry(off).or_insert(0);
+            *entry = (*entry).max(len);
+            if fresh {
+                st.stats.map_regions += 1;
+            }
+        }
+        // SAFETY: a pure forward — the engine-core caller (the dirty store,
+        // the sole sanctioned broker client) discharges the brokered
+        // contract of `Backing::map_dirty_page`; journaling the region adds
+        // no aliasing (the journal copies bytes only at seal points, through
+        // fresh `bytes()` views with no brokered `&mut` live).
+        unsafe { self.inner.map_dirty_page(pgno, psize, pages) }
     }
 
     fn sync_data(&self) -> std::io::Result<()> {
@@ -314,6 +449,11 @@ impl Backing for FaultBacking {
     fn sync(&self, async_flush: bool) -> std::io::Result<()> {
         {
             let mut st = self.state.lock().expect("fault state lock");
+            // ADR-0021 B3: any flush call is a seal point — resolve the
+            // brokered regions' current bytes into pending records (C3 runs
+            // before C4, so data records precede the meta's; under MAP_ASYNC
+            // this also seals per-commit versions without folding).
+            st.seal_map_regions(self.inner.bytes());
             if async_flush {
                 // REC-9/REC-11: MS_ASYNC completes with no durability
                 // guarantee — pending stays pending (not a barrier).
@@ -968,6 +1108,120 @@ mod tests {
             2 * u64::from(PS),
             "no data extension folded"
         );
+    }
+
+    /// ADR-0021 B3 — the in-map journal model, over the heap-backed
+    /// `testmap::TestWriteMap` (enabled whenever the `test-backing` feature
+    /// is on, as the workspace test build has it).
+    #[cfg(feature = "test-backing")]
+    mod in_map {
+        use super::*;
+        use crate::testmap::TestWriteMap;
+
+        const MP: usize = 16 * PS as usize;
+
+        fn wrap_map() -> (FaultBacking, FaultHandle) {
+            let inner = TestWriteMap::new(MP, &[]);
+            FaultBacking::wrap(Box::new(inner), PS).unwrap()
+        }
+
+        /// Write `fill` through a freshly brokered slice of page `pgno`.
+        fn broker_write(b: &FaultBacking, pgno: u64, fill: u8) {
+            // SAFETY: test-local discipline — one transient `&mut`, no other
+            // view of the region live, single thread.
+            #[allow(unsafe_code)]
+            let s = unsafe { b.map_dirty_page(pgno, PS, 1) }.expect("in bounds");
+            s.fill(fill);
+        }
+
+        #[test]
+        fn regions_resolve_at_capture_time() {
+            let (b, h) = wrap_map();
+            assert!(b.dirty_in_map(), "forwarded from the inner backing");
+            broker_write(&b, 5, 0xAA);
+            let cap = h.capture();
+            assert_eq!(cap.pending.len(), 1);
+            assert_eq!(cap.pending[0].offset, 5 * u64::from(PS));
+            assert!(cap.pending[0].data.iter().all(|&x| x == 0xAA));
+            // Later bytes, same (deduplicated) region: a fresh capture sees
+            // the *current* content; the journal holds one region.
+            broker_write(&b, 5, 0xBB);
+            let cap = h.capture();
+            assert_eq!(cap.pending.len(), 1, "region deduplicated");
+            assert!(cap.pending[0].data.iter().all(|&x| x == 0xBB));
+            assert_eq!(h.stats().map_regions, 1);
+            assert_eq!(h.stats().data_writes, 0);
+        }
+
+        #[test]
+        fn sync_seals_then_folds_before_the_meta() {
+            // The commit shape: in-place data stores → C3 sync (seal+fold) →
+            // C4 meta write → capture at H3 ⇒ pending = {meta} only, data
+            // durable (REC-6 H3 for the in-place realization).
+            let (b, h) = wrap_map();
+            broker_write(&b, 7, 0xCC);
+            b.sync(false).unwrap();
+            b.write_at_page(1, PS, &page(0x11)).unwrap(); // meta slot 1
+            let cap = h.capture();
+            assert_eq!(cap.pending.len(), 1, "only the meta is pending");
+            assert_eq!(cap.pending[0].offset, u64::from(PS));
+            assert_eq!(cap.durable[7 * PS as usize], 0xCC, "region folded");
+            assert_eq!(h.stats().barriers, 1);
+        }
+
+        #[test]
+        fn async_flush_seals_per_commit_versions_without_folding() {
+            // MAP_ASYNC: nothing folds, but each flush seals the regions'
+            // bytes — a page re-dirtied by a later txn enters the journal
+            // again, so ordered-prefix plans keep per-commit versions.
+            let (b, h) = wrap_map();
+            broker_write(&b, 3, 0x61);
+            b.sync(true).unwrap(); // txn 1's C3 (MS_ASYNC)
+            broker_write(&b, 3, 0x62);
+            let cap = h.capture();
+            assert_eq!(cap.pending.len(), 2, "sealed v1 + live v2");
+            assert!(cap.pending[0].data.iter().all(|&x| x == 0x61));
+            assert!(cap.pending[1].data.iter().all(|&x| x == 0x62));
+            assert_eq!(cap.durable_len, MP as u64, "no fold happened");
+            assert!(cap.durable[3 * PS as usize] == 0, "durable untouched");
+            assert_eq!(h.stats().async_flushes, 1);
+            assert_eq!(h.stats().map_regions, 2, "re-dirty after seal re-records");
+        }
+
+        #[test]
+        fn run_regions_widen_and_materialize() {
+            // An overflow-run region (3 pages) journals once at its head and
+            // materializes whole; a later one-page re-broker at the head
+            // keeps the widest length.
+            let (b, h) = wrap_map();
+            {
+                // SAFETY: as `broker_write`.
+                #[allow(unsafe_code)]
+                let s = unsafe { b.map_dirty_page(9, PS, 3) }.expect("in bounds");
+                s.fill(0xEE);
+            }
+            broker_write(&b, 9, 0xEF); // head page only, re-brokered
+            let cap = h.capture();
+            assert_eq!(cap.pending.len(), 1);
+            assert_eq!(cap.pending[0].data.len(), 3 * PS as usize, "widest kept");
+            let img = cap.ceil_image();
+            assert!(img[9 * PS as usize..10 * PS as usize]
+                .iter()
+                .all(|&x| x == 0xEF));
+            assert!(img[10 * PS as usize..12 * PS as usize]
+                .iter()
+                .all(|&x| x == 0xEE));
+        }
+
+        #[test]
+        fn data_write_tripwire_counts_fd_data_writes_only() {
+            let (b, h) = wrap_map();
+            b.write_at_page(0, PS, &page(1)).unwrap(); // meta slot 0
+            b.write_at_page(1, PS, &page(2)).unwrap(); // meta slot 1
+            assert_eq!(h.stats().data_writes, 0);
+            b.write_at_page(4, PS, &page(3)).unwrap(); // data
+            assert_eq!(h.stats().data_writes, 1);
+        }
     }
 
     #[test]
