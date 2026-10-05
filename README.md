@@ -60,11 +60,33 @@ bytes. Full list: [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
 
 ## Performance
 
-On its real consumers, ZeroDB runs at **LMDB-level performance** (Meilisearch
-indexing 1.00×, search 1.03×; hannoy search 0.95×). Against the field — the
+On its real consumers, ZeroDB runs at **LMDB-level performance**: Meilisearch
+indexing 1.01× (movies) and 0.99× (incremental hackernews additions), search
+0.94× — time relative to LMDB, lower is better; hannoy search 0.95×.
+
+**ZeroDB vs LMDB, current tree** — YCSB on a Graviton4 with local NVMe,
+10 M × 128 B, kops/s (higher is better). `WRITE_MAP` is opt-in on both engines
+(LMDB's `MDB_WRITEMAP`, ZeroDB's in-place `WRITE_MAP`):
+
+| Workload | LMDB | zerodb | LMDB `WRITE_MAP` | zerodb `WRITE_MAP` |
+|---|---:|---:|---:|---:|
+| YCSB A (no-sync, 2 GiB cap) | 256 | 211 | 545 | 408 |
+| YCSB B (no-sync, 2 GiB cap) | 490 | 355 | 1,199 | 847 |
+| YCSB B (fsync) | 238 | **258** | — | — |
+
+Durable writes are ahead of LMDB (1.08×); no-sync writes trail it by 18–27%, and
+`WRITE_MAP` makes ZeroDB 1.6–1.7× faster than default LMDB, still behind LMDB's
+own `WRITE_MAP`. Details:
+[`benches/results/2026-10-05-meta-annex-real-case.md`](benches/results/2026-10-05-meta-annex-real-case.md).
+_(2026-10-05, 2 reps.)_
+
+**Against the field** — the
 [rust-storage-bench](https://github.com/marvin-j97/rust-storage-bench) suite
 behind the *fjall 3* article, on a Graviton4 with local NVMe — throughput
-in kops/s (higher is better; per-row winner in **bold**):
+in kops/s (higher is better; per-row winner in **bold**). This run predates
+in-place `WRITE_MAP` and the meta free-list annex, and uses a different setup
+(8 GiB cap, 2 GiB cache, 100 B values), so its numbers don't compare with the
+table above:
 
 | Workload | LMDB | zerodb | fjall 3 | rocksdb | redb | sqlite |
 |---|---:|---:|---:|---:|---:|---:|
@@ -74,7 +96,7 @@ in kops/s (higher is better; per-row winner in **bold**):
 | feed | **55** | 42 | 37 | 31 | 16 | 38 |
 | 100 M keys | **93** | 79 | 76 | 65 | 15 | 36 |
 
-ZeroDB tracks LMDB closely — at parity on durable writes (YCSB B), a little ahead
+In that run ZeroDB tracked LMDB closely — at parity on durable writes (YCSB B), a little ahead
 on 4 KB values, behind on the write-heavy no-sync mix (its weakest path). The LSM
 engines (fjall, rocksdb) take the raw write-throughput rows; the B-trees (LMDB and
 ZeroDB) keep read p99 in microseconds where the LSMs run to hundreds. Per-engine

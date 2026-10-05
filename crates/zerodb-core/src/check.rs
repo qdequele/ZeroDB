@@ -39,9 +39,13 @@ struct Checker<'a> {
     /// otherwise choose ids that all collide (HashDoS). The engine's
     /// dirty-store hasher is unaffected — its keys are engine-authored.
     visited: HashSet<u64>,
-    /// Free page ids collected from every GC PIL → occurrence count
-    /// (INV-22/INV-24; SPEC 05 §9). Randomly seeded, see `visited`.
+    /// Free page ids collected from every GC PIL **and the selected meta's
+    /// free-list annex** → occurrence count (INV-22/INV-24/INV-28; SPEC 05
+    /// §9/§2a). Randomly seeded, see `visited`.
     free: HashMap<u64, u64>,
+    /// The selected meta's annex id count (INV-28/GC-29: `> 0` forbids a GC
+    /// tree entry keyed `BE(meta_txnid)`).
+    annex_count: usize,
     violations: Vec<String>,
 }
 
@@ -353,6 +357,15 @@ impl<'a> Checker<'a> {
         if txnid > self.meta_txnid {
             self.fail("INV-23", format!("GC entry keyed by future txn {txnid}"));
         }
+        // INV-28/GC-29 (format v2): a meta with a non-empty annex holds the
+        // newest freeing-txn's PIL itself — a tree entry under the same
+        // txnid would be the forbidden split placement (GC-32).
+        if txnid == self.meta_txnid && self.annex_count > 0 {
+            self.fail(
+                "INV-28",
+                format!("GC entry {txnid} coexists with a non-empty meta annex (GC-29/GC-32)"),
+            );
+        }
         let pil: Vec<u8> = match val {
             LeafValue::Inline(v) => v.to_vec(),
             LeafValue::Overflow { head_pgno, dsize } => {
@@ -522,9 +535,9 @@ pub fn check_image(bytes: &[u8], psize: u32) -> Vec<String> {
         (Ok(a), Ok(b)) => (a, b),
         _ => return vec!["INV-1: meta slots undecodable".into()],
     };
-    let meta = match select_meta(&v0, &v1, false) {
-        crate::page::MetaChoice::Both { meta, .. }
-        | crate::page::MetaChoice::OnlyOne { meta, .. } => meta,
+    let (meta, chosen) = match select_meta(&v0, &v1, false) {
+        crate::page::MetaChoice::Both { meta, chosen }
+        | crate::page::MetaChoice::OnlyOne { meta, chosen } => (meta, chosen),
         crate::page::MetaChoice::None => {
             return vec!["INV-2: no valid meta slot (both torn/foreign)".into()]
         }
@@ -557,13 +570,34 @@ pub fn check_image(bytes: &[u8], psize: u32) -> Vec<String> {
             return violations;
         }
     }
+    // Format v2 (ADR-0022): the selected meta's free-list annex ids are free
+    // pages (SPEC 05 §2a). Validate their GC-29 shape (the INV-25/26
+    // analogues, labelled INV-28) and count them into the free set for the
+    // INV-22/24 partition.
+    let annex = MetaPage::read_annex(&bytes[chosen * ps..(chosen + 1) * ps], psize)
+        .expect("annex count was bounds-checked by MetaPage::validate");
+    let mut free: HashMap<u64, u64> = HashMap::new();
+    let mut prev: Option<u64> = None;
+    for &id in &annex {
+        if id < FIRST_DATA_PGNO || id > meta.last_pg {
+            violations.push(format!("INV-28: annex free id {id} out of range"));
+        }
+        if let Some(p) = prev {
+            if p >= id {
+                violations.push("INV-28: annex ids not strictly ascending".into());
+            }
+        }
+        prev = Some(id);
+        *free.entry(id).or_insert(0) += 1;
+    }
     let mut checker = Checker {
         bytes,
         psize,
         meta_txnid: meta.txnid,
         last_pg: meta.last_pg,
         visited: HashSet::new(),
-        free: HashMap::new(),
+        free,
+        annex_count: annex.len(),
         violations,
     };
     checker.check_catalog_record("main_db", &meta.main_db);
@@ -607,8 +641,10 @@ mod tests {
             let base = slot * PS as usize;
             let e_off = base + 120 + 32; // main_db record + entries offset
             img[e_off] = 99;
-            let crc = crate::page::crc32c(&img[base..base + 168]);
-            img[base + 168..base + 172].copy_from_slice(&crc.to_le_bytes());
+            // Format v2 CRC: fl_count (offset 168) is 0 in builder images,
+            // so the coverage is exactly [0, 172); the CRC field sits at 172.
+            let crc = crate::page::crc32c(&img[base..base + 172]);
+            img[base + 172..base + 176].copy_from_slice(&crc.to_le_bytes());
         }
         let v = check_image(&img, PS);
         assert!(

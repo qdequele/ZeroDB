@@ -355,6 +355,7 @@ fn finalize_image(
         last_pg,
         free_db: DBRecord::empty(),
         main_db,
+        fl_count: 0,
     };
     m0.encode(&mut buf[0..psize as usize])?;
     let mut m1 = m0;
@@ -894,6 +895,7 @@ impl<S: PageSink> EnvStream<S> {
             last_pg,
             free_db: DBRecord::empty(),
             main_db,
+            fl_count: 0,
         };
         meta.encode(&mut frame)?;
         sink.emit(0, &frame)?;

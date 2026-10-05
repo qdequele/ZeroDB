@@ -77,6 +77,13 @@ pub trait TxnRead {
     fn validated_pages(&self) -> Option<&ValidatedPages<'_>> {
         None
     }
+    /// The meta free-list annex id count this txn observes (SPEC 05 §2a,
+    /// ADR-0022; feeds [`free_page_count`]). A reader reports its snapshot's
+    /// count; the writer reports its pool's live remainder (a working-state
+    /// view, like [`TxnRead::free_record`]).
+    fn free_annex_count(&self) -> u64 {
+        0
+    }
 }
 
 /// Which database a [`Database`] handle addresses (SPEC 02 §6). `Copy` so the
@@ -264,6 +271,9 @@ impl TxnRead for RoTxn<'_> {
     }
     fn free_record(&self) -> &DBRecord {
         &self.snap.free_db
+    }
+    fn free_annex_count(&self) -> u64 {
+        self.snap.free_annex.len() as u64
     }
     fn page_size(&self) -> u32 {
         self.psize
@@ -516,7 +526,9 @@ pub fn free_page_count<T: TxnRead>(txn: &T) -> Result<u64> {
     let source = txn.source();
     let tree = Tree::new(source, txn.page_size(), rec.root, rec.depth);
     let mut cursor = tree.cursor();
-    let mut total = 0u64;
+    // Format v2 (SPEC 05 §2a/GC-23): the snapshot's meta annex ids are free
+    // pages too; the snapshot carries their count, so no meta re-read.
+    let mut total = txn.free_annex_count();
     let mut entry = cursor.first().map_err(map_page_err)?;
     while let Some((_key, val)) = entry {
         // GC-23: sum only each PIL's `count` prefix — no `Vec<u64>` decode and

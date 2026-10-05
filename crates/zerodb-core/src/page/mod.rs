@@ -38,11 +38,14 @@ mod tree;
 // validation; it contains no unsafe operation.
 mod trust;
 
-pub use crc32c::crc32c;
+pub use crc32c::{crc32c, crc32c_concat};
 pub(crate) use header::read_flags;
 pub(crate) use header::read_page_txnid;
 pub use header::{CommonHeader, PageRef};
-pub use meta::{select as select_meta, DBRecord, MetaChoice, MetaPage, MetaValidity, DBRECORD_LEN};
+pub use meta::{
+    meta_annex_cap, select as select_meta, DBRecord, MetaChoice, MetaPage, MetaValidity,
+    DBRECORD_LEN,
+};
 pub use overflow::{write_overflow_head, OverflowRef};
 pub use tree::{BranchMut, BranchRef, LeafMut, LeafRef, LeafValue};
 pub use trust::FileTrust;
@@ -54,8 +57,10 @@ pub use trust::FileTrust;
 /// File identifier, ASCII `"ZDB1"`. Stored as a byte array (endianness-free).
 pub const MAGIC: [u8; 4] = *b"ZDB1";
 
-/// On-disk format version. Bumped only on an incompatible change (ADR-0002 §D8).
-pub const FORMAT_VERSION: u32 = 1;
+/// On-disk format version. Bumped only on an incompatible change (ADR-0002
+/// §D8). Version 2 (ADR-0022): the meta free-list annex — `fl_count` at
+/// offset 168, `meta_crc` moved to 172 with split coverage, annex ids at 176.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Size of the common page header, in bytes.
 pub const HEADER_SIZE: usize = 32;
@@ -92,8 +97,14 @@ pub const MIN_KEYS_LEAF: usize = 1;
 /// Minimum children a non-root branch may hold.
 pub const MIN_KEYS_BRANCH: usize = 2;
 
-/// Number of leading bytes of a meta page covered by its CRC (SPEC 02 §3.3).
-pub const META_CONTENT_LEN: usize = 168;
+/// Number of leading bytes of a meta page covered by its CRC, before the
+/// free-list annex ids (SPEC 02 §3.3 as amended by ADR-0022: the full
+/// coverage is `[0, META_CONTENT_LEN) ∪ [META_ANNEX_OFF, … + 8·fl_count)`).
+pub const META_CONTENT_LEN: usize = 172;
+
+/// Absolute byte offset of the meta free-list annex ids (SPEC 02 §3,
+/// ADR-0022). The annex capacity is `(psize - META_ANNEX_OFF) / 8` ids.
+pub const META_ANNEX_OFF: usize = 176;
 
 /// Smallest permitted page size, in bytes.
 pub const MIN_PAGE_SIZE: u32 = 4096;

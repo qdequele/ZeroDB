@@ -171,6 +171,9 @@ impl TxnRead for NestedRoTxn<'_> {
     fn free_record(&self) -> &DBRecord {
         self.parent.free_record()
     }
+    fn free_annex_count(&self) -> u64 {
+        self.parent.free_annex_count()
+    }
     fn page_size(&self) -> u32 {
         self.parent.page_size()
     }

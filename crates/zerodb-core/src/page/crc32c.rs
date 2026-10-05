@@ -41,16 +41,36 @@ const fn build_table() -> [u32; 256] {
     table
 }
 
+/// Fold `bytes` into a running (non-finalized) CRC32C state. The single source
+/// of the byte-wise table step, shared by [`crc32c`] and [`crc32c_concat`] so
+/// the two cannot drift if the table or algorithm ever changes.
+#[inline]
+fn crc_update(mut crc: u32, bytes: &[u8]) -> u32 {
+    for &byte in bytes {
+        let idx = ((crc ^ byte as u32) & 0xFF) as usize;
+        crc = (crc >> 8) ^ TABLE[idx];
+    }
+    crc
+}
+
 /// Compute the CRC32C (Castagnoli) checksum of `data`.
 ///
 /// Returns the finalized checksum (post final-XOR), i.e. the value written to a
 /// meta page's `meta_crc` field.
 #[must_use]
 pub fn crc32c(data: &[u8]) -> u32 {
+    crc_update(0xFFFF_FFFF, data) ^ 0xFFFF_FFFF
+}
+
+/// CRC32C over the concatenation of `parts`, as one stream — equal to
+/// `crc32c` of the parts joined into a single buffer, without the join.
+/// Used for the meta CRC's split coverage (SPEC 02 §3.3 as amended by
+/// ADR-0022: `[0, 172)` then the annex ids, skipping the CRC field itself).
+#[must_use]
+pub fn crc32c_concat(parts: &[&[u8]]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
-    for &byte in data {
-        let idx = ((crc ^ byte as u32) & 0xFF) as usize;
-        crc = (crc >> 8) ^ TABLE[idx];
+    for part in parts {
+        crc = crc_update(crc, part);
     }
     crc ^ 0xFFFF_FFFF
 }

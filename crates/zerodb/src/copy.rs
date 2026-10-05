@@ -388,6 +388,10 @@ fn write_raw(
 
     // Synthesize both meta slots from the pinned snapshot — the copy is a
     // self-contained env at snapshot T, freelist preserved (SPEC 02 §3).
+    // Format v2 (ADR-0022): the snapshot's free-list annex rides along —
+    // the ids are pinned in `Snapshot` (the live env's slot may already
+    // hold a newer meta, TXN-63), and dropping them would leak those pages
+    // in the copy (INV-22/INV-28).
     let mut metas = vec![0u8; 2 * ps];
     let mut meta = MetaPage {
         pgno: 0,
@@ -400,10 +404,13 @@ fn write_raw(
         last_pg: snap.last_pg,
         free_db: snap.free_db,
         main_db: snap.main_db,
+        fl_count: snap.free_annex.len() as u32,
     };
-    meta.encode(&mut metas[0..ps]).map_err(corrupt)?;
+    meta.encode_with_annex(&mut metas[0..ps], &snap.free_annex)
+        .map_err(corrupt)?;
     meta.pgno = 1;
-    meta.encode(&mut metas[ps..2 * ps]).map_err(corrupt)?;
+    meta.encode_with_annex(&mut metas[ps..2 * ps], &snap.free_annex)
+        .map_err(corrupt)?;
     file.write_all_at(&metas, base)?;
 
     // Data pages in chunks, so progress is observable. The chunk is sized

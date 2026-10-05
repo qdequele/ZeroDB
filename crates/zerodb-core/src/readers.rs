@@ -454,6 +454,7 @@ mod tests {
             last_pg: 1,
             main_db: DBRecord::empty(),
             free_db: DBRecord::empty(),
+            free_annex: Arc::from(&[][..]),
         })
     }
 
@@ -586,6 +587,7 @@ mod loom_tests {
             last_pg: 1,
             main_db: DBRecord::empty(),
             free_db: DBRecord::empty(),
+            free_annex: Arc::from(&[][..]),
         })
     }
 
