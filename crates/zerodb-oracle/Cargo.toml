@@ -1,6 +1,6 @@
 [package]
 name = "zerodb-oracle"
-version = "0.1.0"
+version = "0.2.0"
 description = "ZeroDB differential test harness against the Meilisearch LMDB fork (links C LMDB; never published)."
 publish = false
 edition.workspace = true

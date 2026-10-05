@@ -11,11 +11,11 @@ against real LMDB.
 
 ```toml
 # Use the engine directly:
-zerodb = { git = "https://github.com/qdequele/ZeroDB" }
+zerodb = "0.2"
 
 # …or drop it under a heed/LMDB consumer — one line, no code changes:
 [patch.crates-io]
-heed = { git = "https://github.com/qdequele/ZeroDB" }
+heed = { git = "https://github.com/qdequele/ZeroDB", tag = "v0.2.0" }
 ```
 
 ```rust
@@ -49,16 +49,18 @@ assert_eq!(db.get(&rtxn, b"1984")?, Some(&b"Orwell"[..]));
 
 ## Status
 
-**0.1, not yet released** (no tag, nothing on crates.io; depend on the git
-repository). LMDB parity is complete and verified; Meilisearch v1.53.1 and hannoy
-pass their full test suites on it unmodified. Not yet production-hardened on the
+**0.2** — the first published release ([release notes](CHANGELOG.md),
+[crates.io](https://crates.io/crates/zerodb), prebuilt `zerodb-tools` on the
+[releases page](https://github.com/qdequele/ZeroDB/releases)). LMDB parity is
+complete and verified; Meilisearch v1.53.1 and hannoy run on it unmodified. Not yet production-hardened on the
 target hardware: Graviton4 benchmarks have run, but the 24 h fuzz soak and a
 64K-page-kernel run are still open — see [`CHANGELOG.md`](CHANGELOG.md).
 
 Three things to know: the data file is **not** an LMDB file (own format; migrate
 with `zerodb-tools`), it is **one process per environment**, and keys are ≤ 511
-bytes. The on-disk format is now version 2: files written by the tree before
-2026-10-05 are refused at open and need a `zerodb-tools` dump and reload. Full
+bytes. The on-disk format is version 2: files from development builds before
+2026-10-05 (version 1) are refused at open and need a `zerodb-tools` dump and
+reload. Full
 list: [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
 
 ## Performance

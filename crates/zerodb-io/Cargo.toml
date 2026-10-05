@@ -1,6 +1,6 @@
 [package]
 name = "zerodb-io"
-version = "0.1.0"
+version = "0.2.0"
 description = "ZeroDB I/O layer: memory-mapped reads, pwrite/pwritev commit backends and fsync strategies."
 edition.workspace = true
 rust-version.workspace = true
@@ -12,7 +12,7 @@ keywords = ["lmdb", "heed", "key-value", "mmap", "fsync"]
 categories = ["database-implementations", "filesystem"]
 
 [dependencies]
-zerodb-core = { path = "../zerodb-core", version = "=0.1.0" }
+zerodb-core = { path = "../zerodb-core", version = "=0.2.0" }
 memmap2.workspace = true
 # pwritev for the vectored commit write path; allowlisted.
 libc.workspace = true

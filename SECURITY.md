@@ -67,7 +67,9 @@ tags with GitHub release notes (ADR-0013); a fix ships as the next patch tag.
 ## Where the `unsafe` is
 
 `unsafe` is confined to the memory map and the unchecked page-field readers
-behind a validated-view contract (`zerodb-core::page::raw`, `zerodb-io`), one
-`pwritev` and one `flock` FFI call, the differential oracle's LMDB FFI, and the
-few pointer-shaped constructs heed's own API forces on the adapter. Every block
+behind a validated-view contract (`zerodb-core::page::raw`, `zerodb-io`), the
+in-place `WRITE_MAP` path that writes dirty pages straight into the writable map
+(`zerodb-core::dirty`, ADR-0021), one `pwritev` and one `flock` FFI call, the
+differential oracle's LMDB FFI, and the few pointer-shaped constructs heed's own
+API forces on the adapter. Every block
 carries a `// SAFETY:` comment; the policy is in `AGENTS.md`.
