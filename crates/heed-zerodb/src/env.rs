@@ -32,8 +32,9 @@ use crate::{Database, DatabaseOpenOptions, Error, Result, Unspecified};
 /// compaction (`process_batch.rs`, `routes/tasks/compact.rs`, `meilitool`) and
 /// snapshot code (`process_snapshot_creation.rs`, `enterprise_edition/s3.rs`).
 /// An adapter env dir therefore contains **exactly** this one file — no
-/// `zerodb.dat`, and no `lock.mdb` (nothing reads one; ZeroDB is
-/// single-process).
+/// `zerodb.dat`. In this release a `lock.mdb` next to it appears only when
+/// [`EnvOpenOptions::lock_file`] is turned on (ADR-0023); it is off by
+/// default, so a default env still contains only `data.mdb`.
 ///
 /// The bytes inside are still ZeroDB's own `ZDB1` format: pointing
 /// `mdb_stat`/`mdb_dump` at one fails loudly with `MDB_INVALID` rather than
@@ -76,6 +77,8 @@ pub struct EnvOpenOptions<T: TlsUsage = WithTls> {
     sequential_writes: bool,
     /// ADR-0017 ZeroDB extension — no heed counterpart.
     max_dirty_bytes: Option<usize>,
+    /// ADR-0023 ZeroDB extension — no heed counterpart yet.
+    lock_file: bool,
     _tls: std::marker::PhantomData<T>,
 }
 
@@ -98,6 +101,7 @@ impl EnvOpenOptions<WithTls> {
             file_trust: zerodb::FileTrust::VALIDATE,
             sequential_writes: false,
             max_dirty_bytes: None,
+            lock_file: false,
             _tls: std::marker::PhantomData,
         }
     }
@@ -114,6 +118,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
             file_trust: self.file_trust,
             sequential_writes: self.sequential_writes,
             max_dirty_bytes: self.max_dirty_bytes,
+            lock_file: self.lock_file,
             _tls: std::marker::PhantomData,
         }
     }
@@ -201,6 +206,16 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// LMDB does; results and committed files never depend on it.
     pub fn max_dirty_bytes(&mut self, bytes: usize) -> &mut Self {
         self.max_dirty_bytes = Some(bytes);
+        self
+    }
+
+    /// Let other processes open this environment at the same time
+    /// (ADR-0023), with LMDB's lock-file name `lock.mdb`.
+    ///
+    /// **ZeroDB extension.** In this release it is opt-in; a later release
+    /// makes it the default and honors heed's `NO_LOCK` to turn it off.
+    pub fn lock_file(&mut self, on: bool) -> &mut Self {
+        self.lock_file = on;
         self
     }
 
@@ -295,6 +310,9 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         opts.sequential_writes(self.sequential_writes);
         if let Some(b) = self.max_dirty_bytes {
             opts.max_dirty_bytes(b);
+        }
+        if self.lock_file {
+            opts.lock_file(true).lock_file_name("lock.mdb");
         }
         let env = opts.open(path).map_err(Error::from)?;
         Ok(Env {

@@ -80,6 +80,9 @@ pub const DATA_FILE_NAME: &str = "zerodb.dat";
 /// reads it.
 pub const HEED_DATA_FILE_NAME: &str = "data.mdb";
 
+/// The native lock-file name of a multi-process environment (ADR-0023).
+pub const LOCK_FILE_NAME: &str = "zerodb.lock";
+
 /// Whether `name` is a single, non-empty path component — i.e. it names a file
 /// directly inside the env directory and cannot escape it (ADR-0010).
 ///
@@ -194,6 +197,10 @@ pub struct EnvOpenOptions {
     sequential_writes: bool,
     /// Dirty limit in bytes (ADR-0017); `None` = LMDB's default.
     max_dirty_bytes: Option<usize>,
+    /// Whether to coordinate through a cross-process lock file (ADR-0023).
+    lock_file: bool,
+    /// The lock file's name, when `lock_file` is set.
+    lock_file_name: OsString,
 }
 
 impl Default for EnvOpenOptions {
@@ -218,6 +225,8 @@ impl EnvOpenOptions {
             file_trust: FileTrust::VALIDATE,
             sequential_writes: false,
             max_dirty_bytes: None,
+            lock_file: false,
+            lock_file_name: OsString::from(LOCK_FILE_NAME),
         }
     }
 
@@ -392,6 +401,33 @@ impl EnvOpenOptions {
         self.max_dirty_bytes
     }
 
+    /// Let other processes open this environment at the same time, through a
+    /// shared lock file next to the data file (ADR-0023). Off by default in
+    /// this release; the heed adapter maps LMDB's default to it.
+    pub fn lock_file(&mut self, on: bool) -> &mut EnvOpenOptions {
+        self.lock_file = on;
+        self
+    }
+
+    /// Whether the lock file is enabled (ADR-0023).
+    #[must_use]
+    pub fn get_lock_file(&self) -> bool {
+        self.lock_file
+    }
+
+    /// The lock file's name inside the environment directory: a single path
+    /// component. Default [`LOCK_FILE_NAME`]; the heed adapter uses `lock.mdb`.
+    pub fn lock_file_name(&mut self, name: impl Into<OsString>) -> &mut EnvOpenOptions {
+        self.lock_file_name = name.into();
+        self
+    }
+
+    /// The configured lock-file name (ADR-0023).
+    #[must_use]
+    pub fn get_lock_file_name(&self) -> &OsStr {
+        &self.lock_file_name
+    }
+
     /// The configured max DBs.
     #[must_use]
     pub fn get_max_dbs(&self) -> u32 {
@@ -413,8 +449,9 @@ impl EnvOpenOptions {
     /// env is created there (SPEC 02 §3.4).
     ///
     /// Unlike heed, this is a safe function: no `EnvFlags` value reachable here
-    /// enables cross-process behavior (ZeroDB is single-process; see
-    /// docs/DIVERGENCES.md).
+    /// enables cross-process behavior; cross-process access is instead opt-in
+    /// through [`EnvOpenOptions::lock_file`] (ADR-0023). Without it, ZeroDB is
+    /// single-process (see docs/DIVERGENCES.md).
     ///
     /// # Errors
     ///
@@ -426,14 +463,18 @@ impl EnvOpenOptions {
     ///   because it has no such option.
     /// - [`Error::Io`] (`InvalidInput`) if
     ///   [`EnvOpenOptions::data_file_name`] is empty or is not a single path
-    ///   component (ADR-0010).
+    ///   component (ADR-0010); likewise for
+    ///   [`EnvOpenOptions::lock_file_name`] when
+    ///   [`EnvOpenOptions::lock_file`] is on (ADR-0023).
     /// - [`Error::Io`] if the directory does not exist, on any file/mmap I/O
     ///   error, or if a `READ_ONLY` open finds no existing store.
     /// - [`Error::Mdb`]`(`[`MdbError::Invalid`]`)` if the file is not a valid
     ///   zerodb env (bad magic/version/page-size, both meta slots torn, or the
     ///   one-valid + `PREV_SNAPSHOT` combination — SPEC 06 REC-2†).
     /// - [`Error::EnvAlreadyOpened`] if this process already holds a live handle
-    ///   for the same canonical path (SPEC 04 TXN-51).
+    ///   for the same canonical path (SPEC 04 TXN-51), or, with
+    ///   [`EnvOpenOptions::lock_file`] on, already has that lock file open
+    ///   (ADR-0023).
     pub fn open(&self, path: impl AsRef<Path>) -> Result<Env> {
         let dir = path.as_ref();
         // Validate the page-size selector here rather than in the setter
@@ -461,10 +502,42 @@ impl EnvOpenOptions {
                 ),
             )));
         }
+        // ADR-0023: the lock-file name must also be a single path component.
+        if self.lock_file && !is_single_component(&self.lock_file_name) {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "lock_file_name ({:?}) must be a single, non-empty path component",
+                    self.lock_file_name
+                ),
+            )));
+        }
         // Canonicalize the directory so the registry keys one env per real path
         // (SPEC 04 TXN-51). The directory must exist (LMDB parity).
         let canonical_dir = dir.canonicalize().map_err(Error::Io)?;
         let data_path = canonical_dir.join(&self.data_file_name);
+
+        // ADR-0023 §1: the lock file is opened (the election) *before* the
+        // data file, so a joining process waits for the initializer rather
+        // than racing it to create the data file.
+        let lock = if self.lock_file {
+            let path = canonical_dir.join(&self.lock_file_name);
+            match zerodb_io::lockfile::LockFile::open(&path, self.max_readers) {
+                Ok(l) => Some(l),
+                Err(zerodb_io::lockfile::LockOpenError::AlreadyOpen) => {
+                    return Err(Error::EnvAlreadyOpened)
+                }
+                Err(zerodb_io::lockfile::LockOpenError::Mismatch(m)) => {
+                    return Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        m,
+                    )))
+                }
+                Err(zerodb_io::lockfile::LockOpenError::Io(e)) => return Err(Error::Io(e)),
+            }
+        } else {
+            None
+        };
 
         let read_only = self.flags.contains(EnvFlags::READ_ONLY);
         let prev_snapshot = self.flags.contains(EnvFlags::PREV_SNAPSHOT);
@@ -488,7 +561,11 @@ impl EnvOpenOptions {
             self.flags.contains(EnvFlags::NO_READ_AHEAD),
         )?;
 
-        zerodb_core::env::open_with_backing_policy(
+        if let Some(l) = &lock {
+            l.bind_page_size(opened.page_size).map_err(Error::Io)?;
+        }
+
+        let env = zerodb_core::env::open_with_backing_shared(
             canonical_dir,
             opened.backing,
             opened.page_size,
@@ -501,6 +578,14 @@ impl EnvOpenOptions {
             self.sequential_writes,
             self.max_dirty_bytes
                 .map(|b| zerodb_core::env::dirty_limit_pages(Some(b), opened.page_size)),
-        )
+            lock.clone()
+                .map(|l| l as std::sync::Arc<dyn zerodb_core::shared::SharedRegion>),
+        )?;
+
+        if let Some(l) = &lock {
+            // Let joiners in only after T is seeded (ADR-0023 §1).
+            l.finish_open().map_err(Error::Io)?;
+        }
+        Ok(env)
     }
 }
