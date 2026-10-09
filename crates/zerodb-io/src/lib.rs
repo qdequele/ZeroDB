@@ -4,8 +4,10 @@
 //!
 //! This crate is one of the two sanctioned homes for mmap `unsafe` (the
 //! repo's unsafe policy). The `unsafe` blocks live in [`mmap`], the single `pwritev`
-//! call in [`file`] (the vectored commit write), and the test-only in-memory
-//! map stand-in (`testmap`, ADR-0021 M1, behind the `test-backing` feature);
+//! call in [`file`] (the vectored commit write), the test-only in-memory
+//! map stand-in (`testmap`, ADR-0021 M1, behind the `test-backing` feature), and
+//! the shared-memory primitives in [`lockfile`] (atomic views over the lock
+//! file, `fcntl` record locks, the Linux futex; ADR-0023);
 //! everything else is safe `std` I/O — including the [`fault`] crash-injection
 //! backend (ADR-0008 D1 Option B: it *wraps* a real backing; its only
 //! `unsafe` is the mandatory `unsafe fn` forward of the ADR-0021 brokered
@@ -16,6 +18,7 @@
 #[cfg(feature = "fault")]
 pub mod fault;
 mod file;
+pub mod lockfile;
 mod mmap;
 #[cfg(feature = "test-backing")]
 pub mod testmap;
