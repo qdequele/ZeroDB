@@ -1,8 +1,8 @@
 # ADR-0023: Multi-process access — lock file, shared reader table, cross-process writer lock
 
-- Status: **Draft** — design agreed with the maintainer in conversation
-  (2026-10-09); this written ADR awaits approval before any implementation
-  (CLAUDE.md rules 5 and 6).
+- Status: **Approved (2026-10-09, maintainer)** — open questions resolved to
+  the proposed defaults (see the end of this ADR). Implementation proceeds by
+  stage; stage 1 reports before stage 2 starts.
 - Related issue: [#70](https://github.com/qdequele/ZeroDB/issues/70); retires
   divergence D-001 and the lock-file half of D-012.
 - Date: 2026-10-09
@@ -251,9 +251,10 @@ updated. New invariants for the lock file get fresh IDs.
 
 ## Open questions for human review
 
-1. The native lock-file name (`zerodb.lock` proposed).
-2. Should `ReadersFull` trigger one reap-and-retry? LMDB's behavior is to be
-   observed first; the default is to match it exactly.
-3. Whether stage 1 lands on `main` behind `NO_LOCK`-by-default until stage 2
-   (so the default never ships without reader reaping), or stays on a branch
-   until stage 3.
+Resolved 2026-10-09 (maintainer approval of the proposed defaults):
+
+1. The native lock-file name is `zerodb.lock`.
+2. `ReadersFull` does exactly what LMDB is observed to do; no reap-and-retry
+   unless the oracle shows LMDB does one.
+3. Stage 1 stays on a branch and does not merge to `main` until stage 2's reader
+   reaping is in, so the default never ships without it.
