@@ -43,18 +43,18 @@ pub trait SharedRegion: Send + Sync {
 
 /// An in-process [`SharedRegion`] for unit tests and miri: heap atomics and a
 /// flag lock. Not a cross-process implementation.
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 pub(crate) struct HeapRegion {
     pub(crate) t: AtomicU64,
     pub(crate) txnids: Box<[AtomicU64]>,
     pub(crate) pids: Box<[AtomicU32]>,
     pub(crate) pid: u32,
     pub(crate) initializer: bool,
-    writer: std::sync::Mutex<bool>,
+    pub(crate) writer: std::sync::Mutex<bool>,
     cv: std::sync::Condvar,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 impl HeapRegion {
     pub(crate) fn new(slots: u32, pid: u32, initializer: bool) -> HeapRegion {
         HeapRegion {
@@ -71,7 +71,7 @@ impl HeapRegion {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(loom)))]
 impl SharedRegion for HeapRegion {
     fn published_txnid(&self) -> &AtomicU64 {
         &self.t

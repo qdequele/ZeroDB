@@ -56,12 +56,7 @@ enum Slots {
     Local(Box<[CachePadded<AtomicU64>]>),
     // loom models the in-process protocol only; the shared region holds
     // `std` atomics that loom cannot instrument.
-    //
-    // `allow(dead_code)`: only `ReaderTable::new_shared` constructs this
-    // variant, and nothing outside tests calls it yet — `Env::open` learns to
-    // in Task 4 (ADR-0023 stage 1).
     #[cfg(not(loom))]
-    #[allow(dead_code)]
     Shared(std::sync::Arc<dyn crate::shared::SharedRegion>),
 }
 
@@ -103,11 +98,7 @@ impl ReaderTable {
     /// A table whose slots live in a cross-process region (ADR-0023 §3). The
     /// claim, pin and release protocol is the same; claims also record the
     /// owner PID so a later stage can reap a dead process's slots.
-    ///
-    /// `allow(dead_code)`: not yet called outside tests — `Env::open` wires
-    /// this in once the lock-file path lands (Task 4, ADR-0023 stage 1).
     #[cfg(not(loom))]
-    #[allow(dead_code)]
     pub(crate) fn new_shared(
         region: std::sync::Arc<dyn crate::shared::SharedRegion>,
     ) -> ReaderTable {
@@ -228,10 +219,13 @@ impl ReaderTable {
     pub(crate) fn release(&self, slot: u32) {
         #[cfg(not(loom))]
         if let Slots::Shared(r) = &self.slots {
-            // PID cleared *before* the slot reads FREE (ADR-0023 §3): the FREE
-            // store below is Release, so anyone who observes FREE also
-            // observes PID 0, and a reaper can never attribute a re-claimed
-            // slot to this (possibly later dead) process.
+            // PID cleared *before* the slot reads FREE (ADR-0023 §3). The FREE
+            // store below is Release, so whoever *acquires* FREE — the next
+            // claimer's Acquire CAS in `claim` — also observes PID 0 and then
+            // stores its own PID; a reaper can never attribute a re-claimed
+            // slot to this (possibly later dead) process. `claim`'s Relaxed
+            // pre-filter load of FREE carries no such guarantee; only the
+            // CAS that wins the slot does.
             r.slot_pid(slot).store(0, Ordering::Release);
         }
         self.slot(slot as usize).store(RDR_FREE, Ordering::Release);
@@ -450,6 +444,24 @@ impl SnapshotCell {
         // its last reference, deallocation runs here, outside the critical
         // section — keeping the section strictly O(1) pointer ops as TXN-18
         // requires.
+        drop(old);
+    }
+
+    /// Replace the cached snapshot with `snap` if it is newer (ADR-0023 §4:
+    /// a snapshot decoded after another process committed). Only snapshots
+    /// validated against the published txnid are ever passed here. Does not
+    /// touch `commit_point`, which lock-file environments do not pin against.
+    ///
+    /// Critical section: one comparison and one pointer swap (TXN-18); the
+    /// displaced `Arc` is dropped after the unlock, as in [`Self::publish`].
+    pub(crate) fn install_if_newer(&self, snap: Arc<Snapshot>) {
+        let old = {
+            let mut g = self.cell.lock().expect("snapshot cell poisoned");
+            if snap.txnid <= g.txnid {
+                return;
+            }
+            std::mem::replace(&mut *g, snap)
+        };
         drop(old);
     }
 
