@@ -302,8 +302,8 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         // ADR-0010: re-impose heed's on-disk contract at the heed
         // boundary — an env opened through this adapter materializes as
         // `<dir>/data.mdb`, the name Meilisearch hardcodes in its production
-        // compaction and snapshot paths. No `lock.mdb` is created: ZeroDB is
-        // single-process and nothing in the consumer tree reads one.
+        // compaction and snapshot paths. A `lock.mdb` next to it appears only
+        // when `lock_file` is on (ADR-0023); it is off by default.
         opts.data_file_name(DATA_FILE_NAME);
         opts.flags(zerodb_env_flags(self.flags));
         opts.file_trust(self.file_trust);
@@ -755,12 +755,16 @@ impl<T> Env<T> {
 
     /// Clear stale readers (SPEC 00 second table — SHOULD; `mdb_reader_check`).
     ///
-    /// **Always 0, and that is the correct answer rather than a stub.** ZeroDB
-    /// is single-process (see docs/DIVERGENCES.md): the reader table is process
-    /// memory, every slot is owned by a `RoTxn` that releases it in `Drop`, and
-    /// a dead process takes the whole table with it. There is no cross-process
-    /// abandoned slot for `mdb_reader_check` to reap. Kept so heed code that
-    /// calls it periodically keeps compiling and no-ops.
+    /// **Always 0 today.** By default ZeroDB is single-process (see
+    /// docs/DIVERGENCES.md): the reader table is process memory, every slot
+    /// is owned by a `RoTxn` that releases it in `Drop`, and a dead process
+    /// takes the whole table with it — `0` is the correct answer, not a
+    /// stub, on that path. With `EnvOpenOptions::lock_file` on (ADR-0023) the
+    /// reader table is shared across processes and a dead process's slot can
+    /// go stale; cross-process reaping here is a known gap left for a later
+    /// stage (ADR-0023 §3) — a stale slot is still cleared at the next
+    /// first-opener election. Kept so heed code that calls it periodically
+    /// keeps compiling and no-ops.
     ///
     /// See [`zerodb::Env::clear_stale_readers`] for the full argument, and
     /// [`Env::reader_list`] for the introspection that *is* meaningful here.

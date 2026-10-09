@@ -75,9 +75,10 @@ pub const DATA_FILE_NAME: &str = "zerodb.dat";
 /// directory-env contract (ADR-0010).
 ///
 /// Exposed here so the adapter, `zerodb-tools`' two-name probe, and tests all
-/// agree on one constant. No `lock.mdb` is ever created — ZeroDB is
-/// single-process (see docs/DIVERGENCES.md) and nothing in the consumer tree
-/// reads it.
+/// agree on one constant. A `lock.mdb` next to it appears only when
+/// [`EnvOpenOptions::lock_file`] is turned on (ADR-0023); it is off by
+/// default, so a default adapter-opened env dir still contains only this one
+/// file.
 pub const HEED_DATA_FILE_NAME: &str = "data.mdb";
 
 /// The native lock-file name of a multi-process environment (ADR-0023).

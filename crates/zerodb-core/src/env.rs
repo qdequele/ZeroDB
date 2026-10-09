@@ -1399,8 +1399,7 @@ impl Env {
     }
 
     /// Reclaim reader slots abandoned by dead processes —
-    /// `mdb_reader_check`. **Always returns 0, and that is the correct
-    /// answer**, not a stub.
+    /// `mdb_reader_check`. **Always returns 0** today.
     ///
     /// LMDB's reader table lives in a shared `lock.mdb` mapped by every
     /// process that opens the env, so a process that dies without ending its
@@ -1408,15 +1407,24 @@ impl Env {
     /// `mdb_reader_check` exists to scan those slots and free the ones whose
     /// `mr_pid` no longer names a live process.
     ///
-    /// ZeroDB is **single-process** (see docs/DIVERGENCES.md): the reader table is plain process
-    /// memory with no lock file and no cross-process sharing. Every slot is
-    /// owned by a `RoTxn` in *this* address space, and a `RoTxn` releases its
-    /// slot in `Drop` — including while unwinding from a panic. The only way
-    /// to leak a slot is to `mem::forget` a live `RoTxn`, which is exactly as
+    /// By default ZeroDB is **single-process** (see docs/DIVERGENCES.md): the
+    /// reader table is plain process memory, every slot is owned by a
+    /// `RoTxn` in *this* address space, and a `RoTxn` releases its slot in
+    /// `Drop` — including while unwinding from a panic. The only way to leak
+    /// a slot is to `mem::forget` a live `RoTxn`, which is exactly as
     /// unrecoverable as leaking any other resource and is not what
     /// `mdb_reader_check` is for. If this process dies, the table dies with
-    /// it. **There is therefore no such thing as a stale reader here, and a
-    /// nonzero return would be a lie.**
+    /// it, so `0` is the correct answer on this path, not a stub.
+    ///
+    /// With the public `lock_file` option on (the `zerodb`/`heed-zerodb`
+    /// `EnvOpenOptions::lock_file`, ADR-0023), the reader table *is* shared
+    /// across processes, and a dead process's slot can genuinely go stale.
+    /// This method still unconditionally returns `0` on that path too:
+    /// cross-process reaping here is a known gap, tracked by ADR-0023 §3
+    /// ("in `clear_stale_readers` (today it returns 0; it will return the
+    /// reaped count)") and left for a later stage. A dead process's reader
+    /// slot is still reclaimed at the next first-opener election, which wipes
+    /// the whole table (ADR-0023 §3 "When").
     ///
     /// It is kept (rather than omitted) so that code written against heed's
     /// `Env::clear_stale_readers` compiles and behaves sensibly on ZeroDB: a
