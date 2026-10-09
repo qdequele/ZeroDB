@@ -59,6 +59,11 @@ trusted-file mode) so the default stays a faithful drop-in.
 `unsafe` is allowed only in:
 
 - mmap access and page casting (`zerodb-core::page`, `zerodb-io`);
+- shared-memory synchronization primitives in `zerodb-io::lockfile`
+  (ADR-0023): atomic views over the mapped lock file
+  (`AtomicU64::from_ptr` / `AtomicU32::from_ptr`), the Linux `futex`
+  syscall, and `fcntl` record locks. They are exposed to `zerodb-core` only
+  through the safe `SharedRegion` trait;
 - the in-place `WRITE_MAP` path in `zerodb-core::dirty` (ADR-0021), detailed
   below;
 - FFI inside `zerodb-oracle`;

@@ -194,6 +194,33 @@ stays `forbid(unsafe_code)`. AGENTS.md's `unsafe` policy is amended in the same
 change as the implementation. Every block carries a `// SAFETY:` comment; every
 atomic states its `Ordering` and why, assuming a weak memory model.
 
+## Amendments (stage-1 planning, 2026-10-09)
+
+1. **Shared reader slots move into stage 1.** Without them a writer in one
+   process can reuse pages a reader in another process still holds, so
+   cross-process tests would be unsound. Stage 1 claims, pins and releases
+   shared slots (with the `pid` word); stage 2 adds liveness-based reaping and
+   its loom models.
+2. **POSIX `fcntl` record locks on both platforms** for the election (byte 0),
+   liveness (byte `LIVENESS_BASE + pid`) and the macOS writer lock (byte 1),
+   instead of OFD locks on Linux. One code path, LMDB's own choice, atomic
+   exclusive→shared conversion. The per-process pitfall (closing any descriptor
+   drops every lock) is closed by refusing a second in-process open of the same
+   lock file *before* opening a descriptor.
+3. **macOS writer lock is an `fcntl` write lock on byte 1**, not `flock`: on BSD
+   systems `flock` and `fcntl` locks on one file may interact. POSIX locks are
+   per process, so any thread may release it; the in-process writer lock
+   already serializes threads.
+4. **Meta reads use `pread`** (`Backing::read_meta_copy`), not a slice of the
+   map: another process may be rewriting the slot, and a kernel copy avoids a
+   data race on borrowed memory. A torn copy fails its CRC and is retried.
+5. **A joining process seeds its snapshot cache from `T`**, never from the
+   newest valid meta: a meta written but not yet published (or whose commit then
+   failed) must never enter the cache.
+6. **Stage 1 is opt-in** (`EnvOpenOptions::lock_file(true)`, default off) so the
+   existing suite is untouched; stage 3 flips the default and updates the two
+   tests that assert the single-process behavior.
+
 ## Consequences
 
 ### Staging (rule 6: the riskiest assumption first)
