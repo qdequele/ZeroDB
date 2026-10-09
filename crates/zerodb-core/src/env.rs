@@ -55,6 +55,26 @@ pub trait Backing: Send + Sync {
     /// [`Env::real_disk_size`] (SPEC 00 row 18).
     fn real_disk_size(&self) -> std::io::Result<u64>;
 
+    /// Copy meta slot `slot` (0 or 1) into `buf` (`psize` bytes). Readers of
+    /// a lock-file environment (ADR-0023 §4) decode metas from this copy,
+    /// never from a borrowed map slice: another process may be rewriting the
+    /// slot, and a torn copy is caught by its CRC. The default copies from
+    /// [`Backing::bytes`] (heap test backings); file backings use `pread`.
+    ///
+    /// # Errors
+    ///
+    /// The read error, or `UnexpectedEof` if the slot is outside the backing.
+    fn read_meta_copy(&self, slot: u64, psize: u32, buf: &mut [u8]) -> std::io::Result<()> {
+        let ps = psize as usize;
+        let start = slot as usize * ps;
+        let src = self
+            .bytes()
+            .get(start..start + ps)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+        buf[..ps].copy_from_slice(src);
+        Ok(())
+    }
+
     /// `dup()` the backing data-file descriptor (SPEC 00 row 22,
     /// [`Env::try_clone_inner_file`]). Requires the env to be a single regular
     /// data file (SPEC 02 §8).
@@ -1771,6 +1791,44 @@ fn read_slot(
     MetaPage::validate(&bytes[base..end], page_size).map_err(|_| Error::Mdb(MdbError::Invalid))
 }
 
+/// The snapshot committed as txnid `t`, decoded from a copy of meta slot
+/// `t & 1` (ADR-0023 §4). `Ok(None)` means the slot no longer holds `t`: it
+/// was overwritten by `t + 2`, or the copy was torn by a concurrent rewrite.
+/// The caller re-reads the published txnid and retries. Geometry is checked
+/// as at open (SPEC 06 REC-1a), against the file as it is now.
+#[allow(dead_code)] // Task 4 (ADR-0023 stage 1 multi-process reader) is the first caller.
+pub(crate) fn read_snapshot_at(
+    backing: &dyn Backing,
+    page_size: u32,
+    t: u64,
+) -> Result<Option<Snapshot>, Error> {
+    let mut buf = vec![0u8; page_size as usize];
+    backing
+        .read_meta_copy(t & 1, page_size, &mut buf)
+        .map_err(Error::Io)?;
+    let meta = match MetaPage::validate(&buf, page_size) {
+        Ok(MetaValidity::Valid(m)) => m,
+        // A failed CRC is a torn copy of a slot being rewritten; retry.
+        Ok(_) => return Ok(None),
+        Err(_) => return Err(Error::Mdb(MdbError::Invalid)),
+    };
+    if meta.txnid != t {
+        return Ok(None);
+    }
+    if meta.txnid > crate::readers::MAX_COMMITTED_TXNID {
+        return Err(Error::Mdb(MdbError::Invalid));
+    }
+    for rec in [&meta.main_db, &meta.free_db] {
+        if rec.root != crate::page::PGNO_INVALID
+            && (rec.root < crate::page::FIRST_DATA_PGNO || rec.root > meta.last_pg)
+        {
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
+    }
+    let annex = MetaPage::read_annex(&buf, page_size).ok_or(Error::Mdb(MdbError::Invalid))?;
+    Ok(Some(Snapshot::from_meta(&meta, annex)))
+}
+
 /// Test-only helpers: a heap-backed [`Backing`] and an in-memory env
 /// constructor, so txn/mutation logic runs under `miri` (no mmap, no file
 /// I/O). **Not part of the stable API** — used by this crate's tests, the
@@ -1986,5 +2044,77 @@ mod tests {
         // map_size 1 MiB, psize 4096 → 256 pages, valid pgnos 0..255.
         assert!(!env.inner().would_map_full(255, 1));
         assert!(env.inner().would_map_full(256, 1));
+    }
+}
+
+#[cfg(test)]
+mod shared_meta_tests {
+    use super::testutil::VecBacking;
+    use super::*;
+    use crate::page::{DBRecord, MetaPage, FORMAT_VERSION, MAGIC};
+
+    const PS: u32 = 4096;
+
+    fn meta(txnid: u64, last_pg: u64) -> MetaPage {
+        MetaPage {
+            pgno: txnid & 1,
+            txnid,
+            magic: MAGIC,
+            format_version: FORMAT_VERSION,
+            page_size: PS,
+            env_flags: 0,
+            map_size: 1 << 20,
+            last_pg,
+            free_db: DBRecord::empty(),
+            main_db: DBRecord::empty(),
+            fl_count: 0,
+        }
+    }
+
+    /// Two meta slots plus `extra` zeroed data pages.
+    fn image(m0: &MetaPage, m1: &MetaPage, extra: usize) -> VecBacking {
+        let ps = PS as usize;
+        let mut bytes = vec![0u8; ps * (2 + extra)];
+        m0.encode_with_annex(&mut bytes[..ps], &[]).unwrap();
+        m1.encode_with_annex(&mut bytes[ps..2 * ps], &[]).unwrap();
+        VecBacking(bytes)
+    }
+
+    #[test]
+    fn reads_the_slot_holding_t() {
+        let b = image(&meta(4, 2), &meta(5, 3), 2);
+        let s = read_snapshot_at(&b, PS, 5)
+            .unwrap()
+            .expect("slot 1 holds 5");
+        assert_eq!((s.txnid, s.last_pg), (5, 3));
+        let s = read_snapshot_at(&b, PS, 4)
+            .unwrap()
+            .expect("slot 0 holds 4");
+        assert_eq!(s.txnid, 4);
+    }
+
+    #[test]
+    fn overwritten_slot_reads_as_none() {
+        // Slot 1 was overwritten by txnid 7 while the caller pinned 5.
+        let b = image(&meta(6, 2), &meta(7, 3), 2);
+        assert!(read_snapshot_at(&b, PS, 5).unwrap().is_none());
+    }
+
+    #[test]
+    fn torn_slot_reads_as_none() {
+        let mut b = image(&meta(4, 2), &meta(5, 3), 2);
+        b.0[PS as usize + 100] ^= 0xFF; // corrupt slot 1 → CRC fails
+        assert!(read_snapshot_at(&b, PS, 5).unwrap().is_none());
+    }
+
+    #[test]
+    fn root_beyond_last_pg_is_invalid() {
+        let mut m = meta(5, 3);
+        m.main_db.root = 50;
+        let b = image(&meta(4, 2), &m, 2);
+        assert!(matches!(
+            read_snapshot_at(&b, PS, 5),
+            Err(Error::Mdb(MdbError::Invalid))
+        ));
     }
 }

@@ -55,6 +55,13 @@ impl Backing for MmapBacking {
         self.file.try_clone()
     }
 
+    fn read_meta_copy(&self, slot: u64, psize: u32, buf: &mut [u8]) -> std::io::Result<()> {
+        // A kernel copy rather than a map slice (ADR-0023 §4): another process
+        // may be rewriting this slot, and borrowing bytes under a concurrent
+        // write would be a data race. A torn copy fails its CRC.
+        file::read_page_into(&self.file, slot, psize, &mut buf[..psize as usize])
+    }
+
     fn write_at_page(&self, pgno: u64, psize: u32, data: &[u8]) -> std::io::Result<()> {
         // Positioned write through the fd (commit C2/C4, SPEC 04 §9). Writing
         // past EOF extends the file; the MAP_SHARED read map observes the new
@@ -125,6 +132,13 @@ impl Backing for WriteMapBacking {
 
     fn try_clone_file(&self) -> std::io::Result<File> {
         self.file.try_clone()
+    }
+
+    fn read_meta_copy(&self, slot: u64, psize: u32, buf: &mut [u8]) -> std::io::Result<()> {
+        // A kernel copy rather than a map slice (ADR-0023 §4): another process
+        // may be rewriting this slot, and borrowing bytes under a concurrent
+        // write would be a data race. A torn copy fails its CRC.
+        file::read_page_into(&self.file, slot, psize, &mut buf[..psize as usize])
     }
 
     fn write_at_page(&self, pgno: u64, psize: u32, data: &[u8]) -> std::io::Result<()> {

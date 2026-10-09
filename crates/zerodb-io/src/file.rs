@@ -50,6 +50,19 @@ pub fn read_page(file: &File, pgno: u64, psize: u32) -> std::io::Result<Vec<u8>>
     Ok(buf)
 }
 
+/// Positioned read of exactly `buf.len()` bytes at page `pgno` (a kernel copy,
+/// not a borrowed map slice — ADR-0023 §4): used to decode a meta slot that
+/// another process may be rewriting concurrently.
+///
+/// # Errors
+///
+/// Propagates the positioned-read I/O error, or `UnexpectedEof` on a short
+/// read.
+pub fn read_page_into(file: &File, pgno: u64, psize: u32, buf: &mut [u8]) -> std::io::Result<()> {
+    let off = page_offset(pgno, psize)?;
+    file.read_exact_at(buf, off)
+}
+
 /// Write `bytes` starting at page `pgno` (positioned). `bytes` is one page (or
 /// less), or — for an overflow run (commit step C2) — a whole multiple of
 /// `psize` spanning the contiguous run.

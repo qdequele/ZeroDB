@@ -380,6 +380,12 @@ impl Backing for FaultBacking {
         self.inner.try_clone_file()
     }
 
+    fn read_meta_copy(&self, slot: u64, psize: u32, buf: &mut [u8]) -> std::io::Result<()> {
+        // ADR-0008 D1 Option B: this backing wraps a real one and injects no
+        // behavior of its own on the read path — forward verbatim.
+        self.inner.read_meta_copy(slot, psize, buf)
+    }
+
     fn write_at_page(&self, pgno: u64, psize: u32, data: &[u8]) -> std::io::Result<()> {
         {
             let mut st = self.state.lock().expect("fault state lock");
