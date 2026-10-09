@@ -161,6 +161,9 @@ fn registry_key(path: &Path) -> std::io::Result<PathBuf> {
 /// this process's record locks, and only then is the path released in the
 /// registry — so no second descriptor of this file can be opened by this
 /// process while the first is still open.
+///
+/// Sharing one `LockFile` across threads is sound: all shared state is reached
+/// through atomics over the mapping or through `fcntl` on the descriptor.
 pub struct LockFile {
     map: memmap2::MmapRaw,
     file: File,
@@ -305,7 +308,12 @@ impl LockFile {
     }
 
     /// Whether process `pid` currently has this environment open (holds its
-    /// liveness lock). Immune to PID reuse: a recycled PID holds no lock.
+    /// liveness lock). For another PID this is immune to reuse: a dead
+    /// process's recycled PID holds no lock unless a live process with that PID
+    /// has the environment open. For this process's own PID it always returns
+    /// `true`, even when the PID was recorded by a dead predecessor that had
+    /// the same PID; callers that may see such a stale PID must handle that
+    /// case themselves (as `lock_writer` does on Linux).
     ///
     /// # Errors
     ///
@@ -374,6 +382,28 @@ impl SharedRegion for LockFile {
                 Err(cur) => cur,
             };
             let owner = cur & !WAITERS;
+            if owner == self.pid {
+                // The word names this process, but this process does not hold
+                // the lock: the core calls `lock_writer` only while holding its
+                // in-process writer lock, so no other thread of this process
+                // can own it. The word is therefore stale, left by a dead
+                // process that had the same PID. Waiting would never end
+                // (`is_alive` reports this PID alive, and other processes see
+                // this process's liveness lock), so take it over at once.
+                // Acquire as above; the waiters bit is kept so this owner's
+                // release wakes the others.
+                if w.compare_exchange(
+                    cur,
+                    self.pid | (cur & WAITERS),
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+                {
+                    return Ok(());
+                }
+                continue; // the word changed; re-read it
+            }
             // Relaxed: setting the waiters bit publishes no data; it only
             // tells the owner's release to issue a wake. The futex syscall
             // re-checks the word against `cur | WAITERS` in the kernel.
@@ -543,10 +573,16 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
+    /// A fresh directory per call. The counter keeps parallel tests apart
+    /// when the clock (microsecond resolution on macOS) repeats.
     fn tmp() -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // Relaxed: only uniqueness of the value matters.
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!(
-            "zerodb-lock-{}-{}",
+            "zerodb-lock-{}-{}-{}",
             std::process::id(),
+            n,
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -611,6 +647,28 @@ mod tests {
             LockFile::open(&other, 4),
             Err(LockOpenError::AlreadyOpen)
         ));
+    }
+
+    /// A writer word naming this process's PID, as a dead predecessor with
+    /// the same PID would leave it, is taken over at once rather than waited
+    /// on forever.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_writer_word_with_own_pid_is_taken_over() {
+        let path = tmp();
+        let l = LockFile::open(&path, 4).expect("open");
+        for stale in [l.pid(), l.pid() | WAITERS] {
+            l.writer_word().store(stale, Ordering::SeqCst);
+            let start = std::time::Instant::now();
+            l.lock_writer().unwrap();
+            assert!(
+                start.elapsed() < OWNER_PROBE,
+                "waited on a stale own-PID word"
+            );
+            assert_eq!(l.writer_word().load(Ordering::SeqCst) & !WAITERS, l.pid());
+            l.unlock_writer();
+            assert_eq!(l.writer_word().load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]
