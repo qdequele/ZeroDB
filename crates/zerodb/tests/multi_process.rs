@@ -1,6 +1,7 @@
 //! Two-process tests for lock-file environments (ADR-0023 stage 1). The test
 //! binary re-runs itself as the second process (see `child_entry`).
 
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,13 +51,41 @@ fn open(dir: &Path) -> Env {
     o.open(dir).expect("open lock-file env")
 }
 
-fn child(role: &str, dir: &Path) -> Child {
-    Command::new(std::env::current_exe().unwrap())
+/// A spawned child process that is killed and reaped when dropped, so a
+/// test that panics mid-way (for example on a `wait_for` deadline) never
+/// leaves its child running. It dereferences to the `Child`, so the happy
+/// path calls `wait`/`kill` on it directly; killing an already reaped child
+/// on drop is harmless and its error is ignored.
+struct ChildGuard(Child);
+
+impl Deref for ChildGuard {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn child(role: &str, dir: &Path) -> ChildGuard {
+    let c = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "child_entry", "--nocapture", "--test-threads=1"])
         .env(ROLE, role)
         .env(DIR, dir)
         .spawn()
-        .expect("spawn child")
+        .expect("spawn child");
+    ChildGuard(c)
 }
 
 fn wait_for(path: &Path, deadline: Duration) {
