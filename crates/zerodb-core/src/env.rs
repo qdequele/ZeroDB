@@ -2072,7 +2072,9 @@ pub(crate) fn read_snapshot_at(
 /// underneath (ADR-0023 §4). Each retry means a commit landed or a slot was
 /// mid-rewrite; a slot that never decodes is a corrupt file, reported as
 /// [`MdbError::Invalid`] once the bound is reached instead of spinning.
-const META_RETRY_LIMIT: u32 = 10_000;
+// Lower under miri only to keep its runtime bounded; the bounded-retry →
+// `Invalid` behavior is identical.
+const META_RETRY_LIMIT: u32 = if cfg!(miri) { 64 } else { 10_000 };
 
 /// The seed snapshot of a process joining a lock-file environment: the one
 /// committed as the published txnid `T` (ADR-0023 amendment 5).
@@ -2693,10 +2695,34 @@ mod shared_env_tests {
         assert!(writer_held(&region));
         drop(guard);
         assert!(!writer_held(&region));
-        // `sync`'s in-process-only guard never touches the shared lock.
+        // The in-process guard alone (what `lock_writer` returns before
+        // `lock_writer_shared` is called) never takes the shared lock.
         let guard = env.inner.lock_writer();
         assert!(!writer_held(&region));
         drop(guard);
+    }
+
+    #[test]
+    fn cache_newer_than_t_decodes_t_and_keeps_the_cache() {
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(4, O::SeqCst);
+        let env = open(backing(4, 5), region.clone());
+        region.published_txnid().store(5, O::SeqCst);
+        let (snap, slot) = env.inner.pin_reader().expect("pin 5");
+        assert_eq!(snap.txnid, 5);
+        env.inner.release_reader(slot);
+        assert_eq!(env.inner.snapshot().txnid, 5, "cache refreshed to 5");
+        // T reads 4 again (as a reader racing this process's own publish,
+        // between the cache swap and the T store, would see it).
+        region.published_txnid().store(4, O::SeqCst);
+        let (snap, slot) = env.inner.pin_reader().expect("pin 4");
+        assert_eq!(snap.txnid, 4, "decoded from meta slot 0");
+        env.inner.release_reader(slot);
+        assert_eq!(
+            env.inner.snapshot().txnid,
+            5,
+            "install_if_newer never downgrades the cache"
+        );
     }
 
     #[test]
