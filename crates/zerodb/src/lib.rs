@@ -417,7 +417,8 @@ impl EnvOpenOptions {
     }
 
     /// The lock file's name inside the environment directory: a single path
-    /// component. Default [`LOCK_FILE_NAME`]; the heed adapter uses `lock.mdb`.
+    /// component that differs from the data-file name. Default
+    /// [`LOCK_FILE_NAME`]; the heed adapter uses `lock.mdb`.
     pub fn lock_file_name(&mut self, name: impl Into<OsString>) -> &mut EnvOpenOptions {
         self.lock_file_name = name.into();
         self
@@ -466,7 +467,8 @@ impl EnvOpenOptions {
     ///   [`EnvOpenOptions::data_file_name`] is empty or is not a single path
     ///   component (ADR-0010); likewise for
     ///   [`EnvOpenOptions::lock_file_name`] when
-    ///   [`EnvOpenOptions::lock_file`] is on (ADR-0023).
+    ///   [`EnvOpenOptions::lock_file`] is on (ADR-0023), or when that name
+    ///   equals the data-file name.
     /// - [`Error::Io`] if the directory does not exist, on any file/mmap I/O
     ///   error, or if a `READ_ONLY` open finds no existing store.
     /// - [`Error::Mdb`]`(`[`MdbError::Invalid`]`)` if the file is not a valid
@@ -509,6 +511,18 @@ impl EnvOpenOptions {
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "lock_file_name ({:?}) must be a single, non-empty path component",
+                    self.lock_file_name
+                ),
+            )));
+        }
+        // ADR-0023: the lock file must not be the data file. The lock-file
+        // initializer truncates its file, so sharing the name would destroy
+        // the data; reject it before either file is opened.
+        if self.lock_file && self.lock_file_name == self.data_file_name {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "lock_file_name ({:?}) must differ from data_file_name",
                     self.lock_file_name
                 ),
             )));

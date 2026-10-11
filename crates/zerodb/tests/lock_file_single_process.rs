@@ -164,3 +164,33 @@ fn failed_engine_open_releases_lock_file() {
     let r = env.read_txn().unwrap();
     assert_eq!(env.main_database().get(&r, b"k").unwrap(), None);
 }
+
+/// A lock-file name equal to the data-file name would make the lock-file
+/// initializer truncate the data file. The open must be rejected before any
+/// file is touched, and the data must survive.
+#[test]
+fn lock_file_name_equal_to_data_file_name_is_rejected() {
+    let dir = TempDir::new();
+    {
+        let mut o = EnvOpenOptions::new();
+        o.map_size(16 << 20).page_size(4096);
+        let env = o.open(dir.path()).expect("open");
+        let mut w = env.write_txn().unwrap();
+        env.main_database().put(&mut w, b"keep", b"me").unwrap();
+        w.commit().unwrap();
+    }
+    let mut bad = opts();
+    bad.lock_file_name(zerodb::DATA_FILE_NAME);
+    match bad.open(dir.path()) {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        other => panic!("expected Io(InvalidInput), got {other:?}"),
+    }
+    let mut o = EnvOpenOptions::new();
+    o.map_size(16 << 20).page_size(4096);
+    let env = o.open(dir.path()).expect("plain reopen");
+    let r = env.read_txn().unwrap();
+    assert_eq!(
+        env.main_database().get(&r, b"keep").unwrap(),
+        Some(&b"me"[..])
+    );
+}
