@@ -277,8 +277,12 @@ fn killed_reader_then_clear_stale_readers_matches_lmdb() {
         env.commit_one();
         let pid = kill_child("lmdb_hold_readers:2", dir.path());
         let listed = env.reader_pids().iter().filter(|&&p| p == pid).count();
-        (listed, env.reader_check(), env.reader_check())
+        assert_eq!(listed, 2, "setup: the dead child's two slots are listed");
+        let first = env.reader_check();
+        assert!(first > 0, "setup: the first check finds the dead slots");
+        (listed, first, env.reader_check())
     };
+    eprintln!("lmdb (listed, first, second) = {lmdb:?}");
     let zdb = {
         let dir = TempDir::new().unwrap();
         let env = zdb_open(dir.path());
@@ -289,12 +293,12 @@ fn killed_reader_then_clear_stale_readers_matches_lmdb() {
             .iter()
             .filter(|e| e.pid == Some(pid))
             .count();
-        (
-            listed,
-            env.clear_stale_readers().unwrap() as i32,
-            env.clear_stale_readers().unwrap() as i32,
-        )
+        assert_eq!(listed, 2, "setup: the dead child's two slots are listed");
+        let first = env.clear_stale_readers().unwrap() as i32;
+        assert!(first > 0, "setup: the first check finds the dead slots");
+        (listed, first, env.clear_stale_readers().unwrap() as i32)
     };
+    eprintln!("zdb (listed, first, second) = {zdb:?}");
     assert_eq!(zdb, lmdb, "(listed, first check, second check)");
 }
 
@@ -309,22 +313,37 @@ fn killed_writer_takeover_matches_lmdb() {
         let env = Lmdb::open(dir.path(), MAX_READERS);
         env.commit_one();
         let rpid = kill_child("lmdb_hold_readers:1", dir.path());
+        assert!(
+            env.reader_pids().contains(&rpid),
+            "setup: the dead reader is listed before the takeover"
+        );
         kill_child("lmdb_hold_writer", dir.path());
         env.commit_one();
-        (env.reader_pids().contains(&rpid), env.has_key(b"doomed"))
+        let t = (env.reader_pids().contains(&rpid), env.has_key(b"doomed"));
+        eprintln!("lmdb (reader listed, doomed present) = {t:?}");
+        t
     };
     let run_zdb = || {
         let dir = TempDir::new().unwrap();
         let env = zdb_open(dir.path());
         zdb_commit_one(&env);
         let rpid = kill_child("zdb_hold_readers:1", dir.path());
+        assert!(
+            env.reader_list().iter().any(|e| e.pid == Some(rpid)),
+            "setup: the dead reader is listed before the takeover"
+        );
         kill_child("zdb_hold_writer", dir.path());
         zdb_commit_one(&env);
+        // List first, as the LMDB side does, so the read txn's own slot is
+        // not yet registered when sampling.
+        let listed = env.reader_list().iter().any(|e| e.pid == Some(rpid));
         let r = env.read_txn().unwrap();
-        (
-            env.reader_list().iter().any(|e| e.pid == Some(rpid)),
+        let t = (
+            listed,
             env.main_database().get(&r, b"doomed").unwrap().is_some(),
-        )
+        );
+        eprintln!("zdb (reader listed, doomed present) = {t:?}");
+        t
     };
     assert_eq!(
         run_zdb(),
