@@ -1590,7 +1590,7 @@ Task 2 observed (macOS and Linux x86-64, 3 runs each, identical): read txn begin
 
 | Observation | Code |
 |---|---|
-| `OBS_WRITER_TAKEOVER_REAPS` (Linux) | Add `EnvInner::reap_quietly(&self)`, which runs `clear_stale_readers` and ignores a probe error, because a writer must not fail on a janitor probe. Change `SharedRegion::lock_writer` to return `std::io::Result<bool>`, `true` when the lock was taken from a dead owner. The `LockFile` Linux arm returns `true` from both takeover CASes (dead owner, and stale own-PID word) and `false` from the uncontended CAS; macOS returns `false`, because an `fcntl` lock reports no previous owner; `HeapRegion` gets a test switch to return `true` once. In `lock_writer_region`, `if region.lock_writer().map_err(Error::Io)? { self.reap_quietly(); }`. |
+| `OBS_WRITER_TAKEOVER_REAPS` (Linux) | After a takeover, run `clear_stale_readers`; a probe error fails the write-txn begin and releases the writer lock, as the fork's `mdb_mutex_failed` does (ruled during execution; the first draft ignored the error). Change `SharedRegion::lock_writer` to return `std::io::Result<bool>`, `true` when the lock was taken from a dead owner. The `LockFile` Linux arm returns `true` from both takeover CASes (dead owner, and stale own-PID word) and `false` from the uncontended CAS; macOS returns `false`, because an `fcntl` lock reports no previous owner; `HeapRegion` gets a test switch to return `true` once. In `lock_writer_region`, `if region.lock_writer().map_err(Error::Io)? { self.clear_stale_readers()?; }`, with the guard already recording the region so the error path releases the lock. |
 
 `clear_stale_readers` counts slots (no change to `reap_dead`).
 
