@@ -11,7 +11,7 @@
 //! Concurrency primitives come from [`crate::sync`], so the identical source
 //! runs natively (and under miri) and is model-checked under
 //! `RUSTFLAGS="--cfg loom"` (`just loom`; the `loom_*` tests at the bottom of
-//! this file are the reader-table loom suite, L1–L5 per ADR-0006).
+//! this file are the reader-table loom suite, L1–L11 per ADR-0006 and ADR-0023).
 //!
 //! Crash-safety note: nothing in this module writes
 //! to disk. Every step here is in-process state; a crash at any point between
@@ -393,8 +393,8 @@ impl ReaderTable {
     ///
     /// The lock-file reader (`EnvInner::pin_shared`, ADR-0023 §4) and the
     /// loom model of that protocol both run this function.
-    // Under loom only the loom models call it (ADR-0023 stage 2).
-    #[cfg_attr(loom, allow(dead_code))]
+    // Under loom the library build (without the loom models) does not call it.
+    #[cfg_attr(all(loom, not(test)), allow(dead_code))]
     pub(crate) fn pin_against<S, E>(
         &self,
         slot: u32,
@@ -1203,7 +1203,8 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// The loom suite (the reader table's model-checking gate; ADR-0006 L1–L5). Runs only
+// The loom suite (the reader table's model-checking gate; ADR-0006 and
+// ADR-0023, L1–L11). Runs only
 // under `just loom` (`RUSTFLAGS="--cfg loom" cargo test -p zerodb-core --lib
 // loom_`). Models are deliberately tiny (≤ 2 spawned threads + main) so loom
 // explores them exhaustively.
@@ -1414,6 +1415,189 @@ mod loom_tests {
                     // released — the table must be observably empty.
                     assert_eq!(table.oldest(), None);
                 }
+            }
+        });
+    }
+
+    use crate::sync::{AtomicU64 as LAtomicU64, Ordering as O};
+    use loom::sync::atomic::AtomicBool;
+
+    /// L6 — two reapers race on one dead slot: it is freed exactly once
+    /// (the counts sum to 1), and afterwards the slot is FREE, unowned and
+    /// claimable (ADR-0023 §3, amendment 8).
+    #[test]
+    fn loom_l6_two_reapers_one_dead_slot() {
+        loom::model(|| {
+            let t = Arc::new(ReaderTable::new(1));
+            let s = t.claim_as(Some(2)).unwrap();
+            t.store_pin(s, 5); // process 2 pinned 5, then died
+            let t2 = Arc::clone(&t);
+            let r2 = thread::spawn(move || t2.reap_dead(3, |p| Ok(p != 2)).unwrap());
+            let n1 = t.reap_dead(4, |p| Ok(p != 2)).unwrap();
+            let n2 = r2.join().unwrap();
+            assert_eq!(n1 + n2, 1, "one dead slot freed {n1}+{n2} times");
+            assert_eq!(t.oldest(), None);
+            assert_eq!(t.claim_as(Some(5)), Some(0));
+        });
+    }
+
+    /// L7 — a reaper that read P's PID races P's release, P's death, and Q's
+    /// re-claim of the same slot. The reaper must never free Q's slot: after
+    /// the joins, if Q claimed, Q's pin is still in place and Q still owns the
+    /// slot.
+    #[test]
+    fn loom_l7_reaper_vs_release_and_reclaim() {
+        loom::model(|| {
+            let t = Arc::new(ReaderTable::new(1));
+            let p_dead = Arc::new(AtomicBool::new(false));
+            let s = t.claim_as(Some(2)).unwrap();
+            t.store_pin(s, 5);
+            let (tp, pd) = (Arc::clone(&t), Arc::clone(&p_dead));
+            let p = thread::spawn(move || {
+                tp.release_as(s, true);
+                pd.store(true, O::SeqCst); // P exits after releasing
+            });
+            let tq = Arc::clone(&t);
+            let q = thread::spawn(move || {
+                let got = tq.claim_as(Some(3));
+                if let Some(slot) = got {
+                    tq.store_pin(slot, 6);
+                }
+                got
+            });
+            let pd = Arc::clone(&p_dead);
+            let n = t
+                .reap_dead(4, move |pid| Ok(pid != 2 || !pd.load(O::SeqCst)))
+                .unwrap();
+            p.join().unwrap();
+            let q_slot = q.join().unwrap();
+            assert_eq!(n, 0, "nothing was ever dead and owned");
+            if let Some(slot) = q_slot {
+                assert_eq!(t.raw(slot), 6, "a reaper freed Q's live slot");
+            }
+        });
+    }
+
+    /// L8 — claim / pin / release by a live process races a reap scan that
+    /// sees no dead owners, against the writer's `oldest()` scan: the scan
+    /// never reports a value other than the live pin or nothing, and a
+    /// reaper never frees a live slot (ADR-0023 §3, TXN-20).
+    #[test]
+    fn loom_l8_live_reader_vs_reaper_and_scan() {
+        loom::model(|| {
+            let t = Arc::new(ReaderTable::new(1));
+            let t1 = Arc::clone(&t);
+            let reader = thread::spawn(move || {
+                let s = t1.claim_as(Some(2)).unwrap();
+                t1.store_pin(s, 5);
+                t1.release_as(s, true);
+            });
+            let t2 = Arc::clone(&t);
+            let reaper = thread::spawn(move || t2.reap_dead(3, |_| Ok(true)).unwrap());
+            let o = t.oldest();
+            reader.join().unwrap();
+            assert_eq!(reaper.join().unwrap(), 0);
+            assert!(o.is_none() || o == Some(5), "scan saw {o:?}");
+            assert_eq!(t.oldest(), None);
+        });
+    }
+
+    /// L9 — publish-and-verify against a shared T, with the meta read
+    /// modeled. The writer writes meta slot `N & 1` (a plain data write,
+    /// modeled `Relaxed`; it is a `pwrite`), then stores T = N `SeqCst`, then
+    /// (as the next writer) computes the GC gate with seed N. The reader runs
+    /// `pin_against`, resolving t by reading meta slot `t & 1` and accepting
+    /// only a txnid equal to t (ADR-0023 §4, amendment 4). In every
+    /// interleaving the reader resolves a snapshot whose txnid equals its
+    /// pin.
+    ///
+    /// The other half of the property, that the reader's pin is `>=` the
+    /// writer's GC gate (TXN-20), is the store-buffering (Dekker) pattern:
+    /// the reader stores its pin then re-reads T, the writer stores T then
+    /// scans the pins, all `SeqCst`. Loom 0.7 reports a both-miss outcome
+    /// for it even though C++20 and AArch64 forbid it (see the mutation-check
+    /// record above, tokio-rs/loom#180), so that assertion cannot be made
+    /// here: with it, this model fails on the correct code, and it passes
+    /// only once `SeqCst` fences are added on both sides. It is guarded by
+    /// TXN-17/20 and the per-site comments instead.
+    #[test]
+    fn loom_l9_pin_against_shared_t() {
+        loom::model(|| {
+            let t_word = Arc::new(LAtomicU64::new(5));
+            let metas = Arc::new([LAtomicU64::new(4), LAtomicU64::new(5)]);
+            let table = Arc::new(ReaderTable::new(1));
+            let (tr, wr, mr) = (Arc::clone(&table), Arc::clone(&t_word), Arc::clone(&metas));
+            let reader = thread::spawn(move || {
+                let s = tr.claim_as(Some(2)).unwrap();
+                let got: Result<Option<u64>, ()> = tr.pin_against(s, &wr, 4, |t| {
+                    // Acquire: a pread after the SeqCst load of T sees the
+                    // meta written before T was stored.
+                    let m = mr[(t & 1) as usize].load(O::Acquire);
+                    Ok((m == t).then_some(t))
+                });
+                (got.unwrap(), tr.raw(s))
+            });
+            metas[0].store(6, O::Relaxed); // commit 6 writes meta slot 0
+            t_word.store(6, O::SeqCst); // then publishes T
+            let (resolved, pinned) = reader.join().unwrap();
+            let snap = resolved.expect("4 attempts suffice with one racing commit");
+            assert!(snap == 5 || snap == 6, "resolved {snap}");
+            assert_eq!(pinned, snap, "pinned {pinned} but resolved {snap}");
+        });
+    }
+
+    /// L10 — own-PID stale reaping at open races another process's reaper
+    /// that already judged the PID dead: the slot is freed exactly once.
+    #[test]
+    fn loom_l10_own_stale_vs_foreign_reaper() {
+        loom::model(|| {
+            let t = Arc::new(ReaderTable::new(1));
+            let s = t.claim_as(Some(2)).unwrap();
+            t.store_pin(s, 5); // a dead predecessor with PID 2
+            let t2 = Arc::clone(&t);
+            // The foreign reaper probed PID 2 before the new process took
+            // its liveness lock, so it believes 2 is dead.
+            let foreign = thread::spawn(move || t2.reap_dead(3, |_| Ok(false)).unwrap());
+            let own = t.reap_own_stale(2);
+            let n = foreign.join().unwrap();
+            assert_eq!(own + n, 1, "freed {own}+{n} times");
+            assert_eq!(t.oldest(), None);
+        });
+    }
+
+    /// L11 — PID reuse (ADR-0023 amendment 14): a reaper holding a stale
+    /// "dead" verdict on PID 2 races a new process that also has PID 2,
+    /// which frees its predecessor's slot and re-claims it. The claim
+    /// generation makes the reaper's CAS fail: the new process's pin
+    /// survives in every interleaving.
+    #[test]
+    fn loom_l11_reaper_vs_same_pid_reclaim() {
+        loom::model(|| {
+            let t = Arc::new(ReaderTable::new(1));
+            let s = t.claim_as(Some(2)).unwrap();
+            t.store_pin(s, 5); // the old process 2 pinned 5, then died
+            let t2 = Arc::clone(&t);
+            // The reaper's probe answered "dead" for the old process 2.
+            // The probe answers "dead" until the new process 2 announces
+            // itself (it takes its liveness lock before freeing stale slots
+            // and claiming), then "alive": a snapshot taken after the new
+            // claim is probed after the new process's lock, so the stale
+            // verdict can only pair with a snapshot of the old word.
+            let new_up = Arc::new(AtomicBool::new(false));
+            let nu = Arc::clone(&new_up);
+            let reaper =
+                thread::spawn(move || t2.reap_dead(3, move |_| Ok(nu.load(O::SeqCst))).unwrap());
+            // The new process 2 frees its predecessor's slot, then claims.
+            new_up.store(true, O::SeqCst);
+            let own = t.reap_own_stale(2);
+            let mine = t.claim_as(Some(2));
+            if let Some(slot) = mine {
+                t.store_pin(slot, 6);
+            }
+            let reaped = reaper.join().unwrap();
+            assert_eq!(own + reaped, 1, "the old slot is freed exactly once");
+            if let Some(slot) = mine {
+                assert_eq!(t.raw(slot), 6, "a reaper freed the new process's live slot");
             }
         });
     }
