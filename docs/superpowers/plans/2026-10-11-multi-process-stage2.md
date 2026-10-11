@@ -1477,6 +1477,8 @@ git commit -m "zerodb-io: liveness on the region, joiner re-election, magic stor
   - `EnvInner::clear_stale_readers(&self) -> Result<usize, Error>`.
   - `Env::clear_stale_readers` returns the reaped count in a lock-file env.
 
+> **Since this task was written (Task 3, amendment 14):** the slot's PID is the low half of a 64-bit `owner` word (`ReaderSlot::owner()`, helpers `owner_pid` / `owner_generation` / `owner_word` in `shared.rs`), and `reap_dead` snapshots every owner word before probing. `HeapRegion`'s slots are reached through `SharedRegion::slots(&*region)` (the struct has a `slots` field that shadows the trait method). Task 3 left `#[allow(dead_code)]` on `owner_pid`, `reap_dead` and `reap_own_stale`; remove each once this task calls it. `reap_own_stale` runs only at open, where the in-process lock-file registry already refuses a second open of the same lock file, so no live slot of this process can exist then (state this in the call-site comment).
+
 - [ ] **Step 1: Write the failing tests (`env.rs` `mod tests`)**
 
 Find the existing tests that open an env over a `HeapRegion` (search for `HeapRegion::new` in `env.rs`) and reuse their helper. The helper is referred to below as `open_shared(region)`; use whatever name the file already has.
@@ -1515,8 +1517,10 @@ Find the existing tests that open an env over a `HeapRegion` (search for `HeapRe
             let env = open_shared(Arc::clone(&region)); // seeds T
             drop(env);
         }
-        region.slots()[2].pid().store(5, Ordering::SeqCst);
-        region.slots()[2].txnid().store(1, Ordering::SeqCst);
+        crate::shared::SharedRegion::slots(&*region)[2]
+            .owner()
+            .store(crate::shared::owner_word(1, 5), Ordering::SeqCst);
+        crate::shared::SharedRegion::slots(&*region)[2].txnid().store(1, Ordering::SeqCst);
         let joiner = crate::shared::HeapRegion::rejoin(&region); // is_initializer false
         let env = open_shared(Arc::clone(&joiner));
         assert!(env.reader_list().is_empty(), "the stale own-PID slot survived open");
