@@ -281,7 +281,8 @@ atomic states its `Ordering` and why, assuming a weak memory model.
     `None` on the default path, and for a slot being claimed or released.
 14. **Claim generation in the owner word (closes a PID-reuse ABA).** The
     slot's owner field is a 64-bit word: the owner PID in the low 32 bits,
-    a claim generation in the high 32 bits, which every claim increments.
+    a claim generation in the high 32 bits, which every claim and every
+    adoption increments.
     Without it, a reaper that read a dead PID P could adopt the slot after a
     new process with the same PID P freed it (amendment 9) and re-claimed
     it, because the word would read P again; the reaper would then free a
@@ -290,6 +291,14 @@ atomic states its `Ordering` and why, assuming a weak memory model.
     PID under its reader mutex; ZeroDB's slot claims are lock-free, so the
     check moves into the word itself. Wrap-around needs 2³² claims of one
     slot while one reaper is paused between its load and its CAS.
+    A reaper also loads every owner word *before* it probes the PIDs it
+    found, and adopts only by a CAS against the word it loaded: a process
+    holds its liveness lock from open until after its last slot is released,
+    so a probe that finds PID P dead proves every word carrying P that was
+    loaded earlier is still a dead process's, unless the word has changed —
+    which the generation makes the CAS detect. Probing first and loading
+    later would let a new process with a reused PID be judged by a stale
+    verdict.
 
 ## Consequences
 

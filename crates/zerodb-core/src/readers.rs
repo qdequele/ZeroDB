@@ -462,35 +462,48 @@ impl ReaderTable {
     }
 
     /// Free every slot whose owner process is dead (ADR-0023 §3 and
-    /// amendment 8); returns how many slots were freed. `reaper` is this
-    /// process's PID: its own slots are never probed (a probe cannot see this
-    /// process's own lock, and its stale own-PID slots were freed at open).
-    /// `is_alive` is probed at most once per PID per scan.
+    /// amendments 8 and 14); returns how many slots were freed. `reaper` is
+    /// this process's PID: its own slots are never probed (a probe cannot see
+    /// this process's own lock, and its stale own-PID slots were freed at
+    /// open). `is_alive` is called at most once per distinct PID per call.
     ///
-    /// Per slot: load the owner word `w` (`Acquire`, pairing with the
+    /// Two invariants make the adoption safe:
+    ///
+    /// - **A: the owner word is ABA-free.** Every write that stores a
+    ///   non-zero PID into the word (a claim, an adoption) increments the
+    ///   generation. A word with PID 0 is never a CAS target, so its
+    ///   recurrence is harmless. A word that is compared against therefore
+    ///   never recurs, short of 2^32 claims or adoptions of one slot while a
+    ///   reaper is paused, which is accepted.
+    /// - **B: load before probe.** A slot is adopted only by a CAS against a
+    ///   word loaded before the probe that judged its PID dead. A process
+    ///   holds its liveness lock from open until after its last slot is
+    ///   released, so a probe that finds no lock on PID `P` proves that every
+    ///   process that wrote `P` into a word loaded earlier has exited or has
+    ///   released that slot; a release changes the word. By A, a successful
+    ///   CAS against the earlier-loaded word proves the word is still that
+    ///   dead process's.
+    ///
+    /// Passes: (1) load every owner word (`Acquire`, pairing with the
     /// claimer's `Release` store, so a non-zero PID implies the claim CAS
-    /// that preceded it). Skip PID 0 (free, being claimed, or being released:
-    /// presumed live). Probe the owner. If it is dead, adopt the slot with
-    /// `CAS w -> (generation of w, reaper)` (`AcqRel` on success: it is the
-    /// single linearization point that two reapers, or a reaper and a
-    /// re-claim, contend on; the `Acquire` half makes the dead owner's last
-    /// stores visible before this reaper overwrites the slot). Then run the
-    /// owner's release sequence. A reaper that dies after the CAS leaves a
-    /// slot carrying its own PID, which the next reaper frees.
+    /// that preceded it), keeping those with a non-zero PID other than
+    /// `reaper` (PID 0 means free, being claimed or being released:
+    /// presumed live); (2) probe each distinct PID found; (3) for each
+    /// snapshot entry judged dead, `CAS word -> (generation + 1, reaper)`
+    /// (`AcqRel` on success: it is the single linearization point that two
+    /// reapers, or a reaper and a re-claim, contend on, and the `Acquire`
+    /// half makes the dead owner's last stores visible before this reaper
+    /// overwrites the slot; `Relaxed` on failure, which carries no data),
+    /// then run the owner's release sequence. A reaper that dies after the
+    /// CAS leaves a slot carrying its own PID, which the next reaper frees.
     ///
-    /// The CAS is free of PID-reuse ABA (ADR-0023 amendment 14): every claim
-    /// of the slot increments the generation in the word, so a slot freed and
-    /// re-claimed since `w` was loaded, even by a new process with the same
-    /// PID, fails the CAS. Wrap-around needs 2^32 claims of one slot while a
-    /// reaper is paused between its load and its CAS, which is accepted.
-    ///
-    /// The scan can miss a slot that dies while it runs, and can see a
-    /// released-then-reclaimed slot under its new owner; both only leave a
-    /// slot for the next scan, never free a live one.
+    /// The scan can miss a slot that dies while it runs; that only leaves the
+    /// slot for the next call, and never frees a live one.
     ///
     /// # Errors
     ///
-    /// The first probe error; slots freed before it stay freed.
+    /// The first probe error; nothing has been freed by then, because every
+    /// probe precedes every adoption.
     // Called once the open and claim paths use reaping (ADR-0023 stage 2);
     // exercised only by unit tests until then.
     #[allow(dead_code)]
@@ -499,32 +512,33 @@ impl ReaderTable {
         reaper: u32,
         mut is_alive: impl FnMut(u32) -> std::io::Result<bool>,
     ) -> std::io::Result<u32> {
-        let mut verdicts: Vec<(u32, bool)> = Vec::new();
-        let mut freed = 0;
+        let mut snapshot: Vec<(usize, u64)> = Vec::new();
         for (i, rs) in self.slots().iter().enumerate() {
             let w = rs.owner().load(Ordering::Acquire);
             let pid = owner_pid(w);
-            if pid == 0 || pid == reaper {
-                continue;
+            if pid != 0 && pid != reaper {
+                snapshot.push((i, w));
             }
-            let alive = match verdicts.iter().find(|(p, _)| *p == pid) {
-                Some(&(_, a)) => a,
-                None => {
-                    let a = is_alive(pid)?;
-                    verdicts.push((pid, a));
-                    a
-                }
-            };
+        }
+        let mut verdicts: Vec<(u32, bool)> = Vec::new();
+        for &(_, w) in &snapshot {
+            let pid = owner_pid(w);
+            if !verdicts.iter().any(|(p, _)| *p == pid) {
+                verdicts.push((pid, is_alive(pid)?));
+            }
+        }
+        let mut freed = 0;
+        for (i, w) in snapshot {
+            let alive = verdicts.iter().any(|&(p, a)| p == owner_pid(w) && a);
             if alive {
                 continue;
             }
-            // Relaxed on failure: a lost race (another reaper, or the slot
-            // changed owner) carries no data; skip the slot.
+            let rs = &self.slots()[i];
             if rs
                 .owner()
                 .compare_exchange(
                     w,
-                    owner_word(owner_generation(w), reaper),
+                    owner_word(owner_generation(w).wrapping_add(1), reaper),
                     Ordering::AcqRel,
                     Ordering::Relaxed,
                 )
@@ -550,9 +564,9 @@ impl ReaderTable {
     /// `CAS w -> (generation of w, PID 0)` (`AcqRel`, as in
     /// [`ReaderTable::reap_dead`]) is what excludes another process's reaper.
     /// That reaper may have probed `me` as dead before this process took its
-    /// liveness lock; the word has changed, so its pending CAS fails. If this
-    /// process later re-claims the slot, the claim increments the generation,
-    /// so the reaper's CAS still fails. Then `txnid = FREE` (`Release`).
+    /// liveness lock; the word has changed, so its pending CAS fails. Any
+    /// later claim or adoption of the slot increments the generation
+    /// (invariant A of [`ReaderTable::reap_dead`]), so that CAS keeps failing. Then `txnid = FREE` (`Release`).
     /// Dying between the two stores leaves a pinned slot with PID 0 until
     /// the next first-opener wipe: a one-store window, documented in the ADR.
     // Called once the open and claim paths use reaping (ADR-0023 stage 2);
@@ -855,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_claim_records_pid_and_release_clears_it_first() {
+    fn shared_claim_records_pid_and_release_clears_it() {
         use crate::shared::{HeapRegion, SharedRegion};
         let region = Arc::new(HeapRegion::new(2, 4242, true));
         let t = ReaderTable::new_shared(region.clone());
@@ -1092,6 +1106,67 @@ mod tests {
         );
         assert_eq!(t.raw(s), 6);
         assert_eq!(t.list(), vec![(s, Some(6), Some(2))]);
+    }
+
+    #[test]
+    fn reaper_chain_cannot_double_adopt_a_slot() {
+        // Dead P (2) pinned slot 0. Reaper R3 snapshots (g,2); meanwhile
+        // R1 adopts and dies, and a new process with reused PID 2 adopts
+        // dead R1's slot. R3's stale CAS must fail.
+        let (region, t) = shared_table(1, 1);
+        let s = t.claim_as(Some(2)).unwrap();
+        t.store_pin(s, 5);
+        let n = t
+            .reap_dead(3, |pid| {
+                assert_eq!(pid, 2);
+                // R1 (PID 4) adopts the slot, then dies mid-reap: model its
+                // adoption and nothing else.
+                let slot0 = &crate::shared::SharedRegion::slots(&*region)[0];
+                let w = slot0.owner().load(Ordering::SeqCst);
+                let adopted = owner_word(owner_generation(w).wrapping_add(1), 4);
+                slot0
+                    .owner()
+                    .compare_exchange(w, adopted, Ordering::SeqCst, Ordering::SeqCst)
+                    .unwrap();
+                // The new process with PID 2 reaps dead R1's slot.
+                assert_eq!(t.reap_dead(2, |p| Ok(p != 4)).unwrap(), 1);
+                // ...and re-claims it.
+                let again = t.claim_as(Some(2)).unwrap();
+                t.store_pin(again, 6);
+                Ok(false) // R3's verdict on the old process 2
+            })
+            .unwrap();
+        assert_eq!(n, 0, "a stale reaper adopted a slot through a reaper chain");
+        assert_eq!(t.raw(s), 6);
+    }
+
+    #[test]
+    fn a_verdict_never_judges_a_word_loaded_after_it() {
+        // Dead P (2) holds slot 0. During the probe of PID 2, a new process
+        // with PID 2 frees slot 0, another process (5) takes slot 0, and the
+        // new process 2 claims slot 1. The scan must not free slot 1.
+        let (_region, t) = shared_table(2, 1);
+        let s0 = t.claim_as(Some(2)).unwrap();
+        t.store_pin(s0, 5);
+        let n = t
+            .reap_dead(3, |pid| {
+                if pid == 2 {
+                    assert_eq!(t.reap_own_stale(2), 1);
+                    let other = t.claim_as(Some(5)).unwrap();
+                    assert_eq!(other, s0);
+                    t.store_pin(other, 6);
+                    let mine = t.claim_as(Some(2)).unwrap();
+                    t.store_pin(mine, 7);
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            })
+            .unwrap();
+        assert_eq!(n, 0);
+        let mut pins: Vec<u64> = t.list().iter().filter_map(|e| e.1).collect();
+        pins.sort_unstable();
+        assert_eq!(pins, vec![6, 7], "a live slot was freed");
     }
 
     #[test]

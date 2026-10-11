@@ -25,10 +25,11 @@ pub const READER_SLOT_SIZE: usize = 128;
 /// | 8 | owner `u64`: low 32 bits the owner PID (`0` = none), high 32 bits the claim generation; written only in a lock file |
 /// | 16 | padding up to 128 bytes, unused by the slot protocol |
 ///
-/// The owner word's generation is incremented by every claim of the slot and
-/// kept by every release, so the word never returns to a value it held
-/// before: a reaper that compare-and-swaps the whole word cannot be fooled by
-/// a PID that was freed and then claimed again under the same PID
+/// The owner word's generation is incremented by every write that stores a
+/// non-zero PID (a claim or a reaper's adoption) and kept by every release
+/// (which stores PID 0). A word with a non-zero PID therefore never recurs: a
+/// reaper that compare-and-swaps the whole word cannot be fooled by a PID
+/// that was freed and then claimed again under the same PID
 /// (ADR-0023 amendment 14). See [`owner_pid`], [`owner_generation`] and
 /// [`owner_word`].
 ///
