@@ -303,8 +303,8 @@ fn observe_reader_check_count() {
     assert_eq!(counted, OBS_CHECK_COUNTS_SLOTS);
 }
 
-/// Linux only: on macOS the fork's writer mutex is not robust, so a dead
-/// writer blocks the next one forever.
+/// Linux only: the writer takeover is not observed on macOS; the takeover
+/// scenario runs only on Linux.
 #[cfg(target_os = "linux")]
 #[test]
 fn observe_writer_takeover() {
@@ -316,6 +316,10 @@ fn observe_writer_takeover() {
     wait_for(&dir.path().join("held"));
     w.0.kill().unwrap();
     w.0.wait().unwrap();
+    assert!(
+        env.reader_pids().contains(&reader_pid),
+        "baseline: the dead reader is still listed before the takeover"
+    );
     env.commit_one(); // takes over the dead writer's mutex
     let reaped = !env.reader_pids().contains(&reader_pid);
     println!("writer takeover reaps: {reaped}");

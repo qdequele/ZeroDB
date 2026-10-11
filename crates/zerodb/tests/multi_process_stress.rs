@@ -14,7 +14,8 @@
 //! could still reach them. A second key, `__commits`, is incremented by every
 //! writer transaction in either process; at the end it must equal the sum of
 //! the commits both writers reported (a writer working from a stale root
-//! loses increments), and each reader thread checks it never decreases. `just stress` runs the 180 s variant.
+//! loses increments), and each reader thread checks it never decreases.
+//! `just stress` runs the 180 s variant.
 
 use std::hash::{DefaultHasher, Hasher};
 use std::ops::{Deref, DerefMut};
@@ -181,7 +182,7 @@ fn seed(env: &Env) {
 
 /// One writer transaction: rewrites 1..=64 random keys and keeps `__sum`
 /// current by subtracting each replaced value's hash and adding the new one.
-fn write_once(env: &Env, rng: &mut Lcg, generation: u64, skip_counter: bool) {
+fn write_once(env: &Env, rng: &mut Lcg, generation: u64) {
     let db = env.main_database();
     let mut w = env.write_txn().expect("begin write txn");
     let raw = db.get(&w, SUM_KEY).expect("read sum").expect("sum present");
@@ -199,17 +200,15 @@ fn write_once(env: &Env, rng: &mut Lcg, generation: u64, skip_counter: bool) {
     }
     db.put(&mut w, SUM_KEY, &sum.to_le_bytes())
         .expect("put sum");
-    if !skip_counter {
-        // Every commit from either process bumps this counter, so a writer
-        // working from a stale root loses an increment and is detected.
-        let raw = db
-            .get(&w, COMMITS_KEY)
-            .expect("read counter")
-            .expect("counter present");
-        let c = u64::from_le_bytes(raw.try_into().expect("counter is 8 bytes"));
-        db.put(&mut w, COMMITS_KEY, &(c + 1).to_le_bytes())
-            .expect("put counter");
-    }
+    // Every commit from either process bumps this counter, so a writer
+    // working from a stale root loses an increment and is detected.
+    let raw = db
+        .get(&w, COMMITS_KEY)
+        .expect("read counter")
+        .expect("counter present");
+    let c = u64::from_le_bytes(raw.try_into().expect("counter is 8 bytes"));
+    db.put(&mut w, COMMITS_KEY, &(c + 1).to_le_bytes())
+        .expect("put counter");
     w.commit().expect("commit");
 }
 
@@ -249,7 +248,7 @@ fn read_once(env: &Env) -> u64 {
 
 /// Runs 3 reader threads and 1 writer thread until `deadline`. Returns
 /// `(commits, read_txns)`.
-fn run_peer(env: &Env, deadline: Instant, skip_counter: bool) -> (u64, u64) {
+fn run_peer(env: &Env, deadline: Instant) -> (u64, u64) {
     let commits = AtomicU64::new(0);
     let reads = AtomicU64::new(0);
     let seed_rng = u64::from(std::process::id()) ^ 0x9e37_79b9_7f4a_7c15;
@@ -258,7 +257,7 @@ fn run_peer(env: &Env, deadline: Instant, skip_counter: bool) -> (u64, u64) {
             let mut rng = Lcg(seed_rng);
             let mut generation = 1u64;
             while Instant::now() < deadline {
-                write_once(env, &mut rng, generation, skip_counter);
+                write_once(env, &mut rng, generation);
                 generation += 1;
                 commits.fetch_add(1, Ordering::Relaxed);
             }
@@ -298,11 +297,7 @@ fn child_entry() {
     let env = open(&dir);
     match role.as_str() {
         "peer" => {
-            let (commits, reads) = run_peer(
-                &env,
-                Instant::now() + stress_duration(),
-                std::env::var("ZERODB_MP_SKIP_COUNTER").is_ok(),
-            );
+            let (commits, reads) = run_peer(&env, Instant::now() + stress_duration());
             std::fs::write(dir.join("peer-commits"), commits.to_string()).unwrap();
             std::fs::write(dir.join("peer-reads"), reads.to_string()).unwrap();
         }
@@ -356,7 +351,7 @@ fn stress_two_processes() {
                 std::thread::sleep(Duration::from_millis(100));
             }
         });
-        run_peer(&env, deadline, false)
+        run_peer(&env, deadline)
     });
 
     // The respawn loop is stopped and reaped; free any slots of the last kill.

@@ -302,7 +302,8 @@ fn killed_reader_then_clear_stale_readers_matches_lmdb() {
     assert_eq!(zdb, lmdb, "(listed, first check, second check)");
 }
 
-/// Linux only (the fork's macOS writer mutex is not robust): a SIGKILLed
+/// Linux only (the writer takeover is not observed on macOS; the takeover
+/// scenario runs only on Linux): a SIGKILLed
 /// writer's lock is taken over, its uncommitted write is absent, and a dead
 /// reader is reaped or not exactly as LMDB does at takeover.
 #[cfg(target_os = "linux")]

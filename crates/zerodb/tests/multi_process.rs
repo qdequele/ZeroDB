@@ -506,7 +506,20 @@ fn writer_lock_released_on_another_thread_admits_another_process() {
     std::thread::scope(|s| {
         s.spawn(move || w.commit().unwrap());
     });
-    assert!(c.wait().unwrap().success());
+    // Bounded: a child that never gets the lock would hang the suite. On
+    // timeout the panic drops `c`, whose `ChildGuard` kills the child.
+    let end = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(status) = c.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < end,
+            "the child did not finish within 60 s of the lock's release"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert!(status.success());
     let r = env.read_txn().unwrap();
     assert_eq!(db.get(&r, b"child").unwrap(), Some(&b"2"[..]));
 }

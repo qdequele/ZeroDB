@@ -54,6 +54,8 @@ const MARKER_KEY: &[u8] = b"__mp_marker";
 const MARKER_VAL: &[u8] = b"mp";
 /// How long the parent waits for a child's marker file.
 const MARKER_WAIT: Duration = Duration::from_secs(120);
+/// How long the parent waits for the reader to exit once told to stop.
+const READER_EXIT_WAIT: Duration = Duration::from_secs(60);
 /// A reader that is never told to stop (its parent died) gives up after this.
 const READER_MAX_LIFETIME: Duration = Duration::from_secs(600);
 
@@ -343,6 +345,22 @@ pub fn run_mp_cycle(seed: u64, opts: &SigkillOpts) -> CutReport {
             return report;
         }
     };
+    // The join must have happened while the reader process was live, or the
+    // cycle did not exercise a joiner alongside a foreign reader.
+    match reader.0.try_wait() {
+        Ok(None) => {}
+        Ok(Some(s)) => {
+            report.violation = violation(format!(
+                "reader not live at join (exited {s}): {}",
+                reader_fail_msg(dir)
+            ));
+            return report;
+        }
+        Err(e) => {
+            report.violation = violation(format!("reader not live at join: {e}"));
+            return report;
+        }
+    }
     let r = env.txnid();
     // Legal recovered set. The joiner reads the txnid the last writer
     // published, which a commit stores only after H4: a hook kill leaves the
@@ -409,16 +427,31 @@ pub fn run_mp_cycle(seed: u64, opts: &SigkillOpts) -> CutReport {
         report.violation = violation(format!("writing {READER_STOP}: {e}"));
         return report;
     }
-    match reader.0.wait() {
-        Ok(s) if s.success() => {}
-        Ok(s) => {
-            report.violation = violation(format!("reader failed ({s}): {}", reader_fail_msg(dir)));
-            return report;
+    // Bounded: a reader that never sees the stop marker is a violation, not
+    // a hang. On an early return the `ChildGuard` kills it.
+    let reader_deadline = Instant::now() + READER_EXIT_WAIT;
+    let reader_status = loop {
+        match reader.0.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if Instant::now() >= reader_deadline => {
+                report.violation = violation(format!(
+                    "reader did not exit within {READER_EXIT_WAIT:?} of {READER_STOP}"
+                ));
+                return report;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+            Err(e) => {
+                report.violation = violation(format!("waiting for the reader: {e}"));
+                return report;
+            }
         }
-        Err(e) => {
-            report.violation = violation(format!("waiting for the reader: {e}"));
-            return report;
-        }
+    };
+    if !reader_status.success() {
+        report.violation = violation(format!(
+            "reader failed ({reader_status}): {}",
+            reader_fail_msg(dir)
+        ));
+        return report;
     }
 
     // 8. Close, check the image, reopen without a lock file.
