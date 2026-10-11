@@ -11,7 +11,7 @@
 //! | 16 | `max_readers` `u32` |
 //! | 64 | published txnid `T` `u64` (own cache line) |
 //! | 128 | writer-lock word `u32`: owner PID, bit 31 = waiters (Linux) |
-//! | 192 + i·128 | reader slot `i`: txnid `u64` at +0, owner PID `u32` at +8 |
+//! | 192 + i·128 | reader slot `i`: txnid `u64` at +0, owner `u64` at +8 (PID low 32 bits, claim generation high 32 bits) |
 //!
 //! Record locks (POSIX `fcntl`, per process; ADR-0023 amendment 2): byte 0 is
 //! the first-opener election, byte 1 the macOS writer lock, and byte
@@ -242,7 +242,7 @@ impl LockFile {
                 // and no other process can map the file before the election
                 // byte is downgraded.
                 rs.txnid().store(READER_SLOT_FREE, Ordering::Relaxed);
-                rs.pid().store(0, Ordering::Relaxed);
+                rs.owner().store(0, Ordering::Relaxed);
             }
             // Relaxed: published by the Release store of the magic below.
             lock.u32_at(OFF_FORMAT)
@@ -627,7 +627,7 @@ mod tests {
                 l.slots()[i].txnid().load(Ordering::SeqCst),
                 READER_SLOT_FREE
             );
-            assert_eq!(l.slots()[i].pid().load(Ordering::SeqCst), 0);
+            assert_eq!(l.slots()[i].owner().load(Ordering::SeqCst), 0);
         }
         assert_eq!(l.published_txnid().load(Ordering::SeqCst), 0);
         assert_eq!(l.pid(), std::process::id());

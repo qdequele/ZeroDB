@@ -25,6 +25,7 @@ use std::sync::Arc;
 use crate::env::Snapshot;
 #[cfg(not(loom))]
 use crate::shared::ReaderSlot as Slot;
+use crate::shared::{owner_generation, owner_pid, owner_word};
 
 /// The local slot type under loom: [`crate::shared::ReaderSlot`]'s fields and
 /// accessors over loom's atomics, which loom must see to model the protocol.
@@ -33,7 +34,7 @@ use crate::shared::ReaderSlot as Slot;
 #[cfg(loom)]
 struct Slot {
     txnid: AtomicU64,
-    pid: crate::sync::AtomicU32,
+    owner: crate::sync::AtomicU64,
 }
 
 #[cfg(loom)]
@@ -41,14 +42,14 @@ impl Slot {
     fn new_free() -> Slot {
         Slot {
             txnid: AtomicU64::new(RDR_FREE),
-            pid: crate::sync::AtomicU32::new(0),
+            owner: crate::sync::AtomicU64::new(0),
         }
     }
     fn txnid(&self) -> &AtomicU64 {
         &self.txnid
     }
-    fn pid(&self) -> &crate::sync::AtomicU32 {
-        &self.pid
+    fn owner(&self) -> &crate::sync::AtomicU64 {
+        &self.owner
     }
 }
 use crate::sync::{AtomicU64, Mutex, Ordering};
@@ -213,10 +214,21 @@ impl ReaderTable {
                 .is_ok()
             {
                 if let Some(pid) = owner {
-                    // Release: a later reaper (ADR-0023 §3, stage 2) loads the
-                    // PID with Acquire before judging the slot; this store
-                    // must be visible no later than the pin that follows it.
-                    rs.pid().store(pid, Ordering::Release);
+                    // Relaxed load: the Acquire CAS above synchronizes with
+                    // the previous releaser's Release store of FREE, which
+                    // follows its owner-word store. While the txnid is not
+                    // FREE only this claimer writes the word: a reaper's CAS
+                    // needs a non-zero PID, and the word's PID is 0.
+                    let w = rs.owner().load(Ordering::Relaxed);
+                    // Release: a later reaper (ADR-0023 §3) loads the word
+                    // with Acquire before judging the slot; this store must
+                    // be visible no later than the pin that follows it. The
+                    // generation increment makes the word unique to this
+                    // claim (ADR-0023 amendment 14).
+                    rs.owner().store(
+                        owner_word(owner_generation(w).wrapping_add(1), pid),
+                        Ordering::Release,
+                    );
                 }
                 // `mti_numreaders` parity: LMDB bumps its counter only
                 // when the first-fit scan lands *past* the current high-water
@@ -276,14 +288,15 @@ impl ReaderTable {
     ///    reads before the GC gate can stop counting this slot (the TXN-18a
     ///    argument). A death after this store leaves `CLAIMED` plus the dead
     ///    PID, which a reaper frees.
-    /// 2. `pid = 0` (`Release`): disowns. A death after this store leaves
-    ///    `CLAIMED` with no PID, the known leak (ADR-0023 §3), which pins
-    ///    nothing.
+    /// 2. owner word with PID 0 and the generation kept (`Release`):
+    ///    disowns. A death after this store leaves `CLAIMED` with no PID, the
+    ///    known leak (ADR-0023 §3), which pins nothing. The word is loaded
+    ///    `Relaxed` first: its only writer while the owner lives is the owner.
     /// 3. `txnid = FREE` (`Release`): hands the slot over. The next claimer's
-    ///    `Acquire` CAS on FREE also sees `pid == 0` before it stores its own
-    ///    PID, so the PID word's modification order is `old, 0, new`. A
-    ///    reaper's `CAS old -> reaper` can then succeed only before step 2,
-    ///    and a reaper acts only on a dead owner, which cannot be mid-release.
+    ///    `Acquire` CAS on FREE also sees PID 0 before it stores its own word
+    ///    with the generation incremented. A reaper's CAS on the old word can
+    ///    then succeed only before step 2, and a reaper acts only on a dead
+    ///    owner, which cannot be mid-release.
     ///
     /// A local table (`owned == false`) does step 3 alone, as before
     /// (TXN-18a).
@@ -291,7 +304,9 @@ impl ReaderTable {
         let rs = &self.slots()[slot as usize];
         if owned {
             rs.txnid().store(RDR_CLAIMED, Ordering::Release);
-            rs.pid().store(0, Ordering::Release);
+            let w = rs.owner().load(Ordering::Relaxed);
+            rs.owner()
+                .store(owner_word(owner_generation(w), 0), Ordering::Release);
         }
         rs.txnid().store(RDR_FREE, Ordering::Release);
     }
@@ -452,16 +467,22 @@ impl ReaderTable {
     /// process's own lock, and its stale own-PID slots were freed at open).
     /// `is_alive` is probed at most once per PID per scan.
     ///
-    /// Per slot: load the PID (`Acquire`, pairing with the claimer's
-    /// `Release` PID store, so a non-zero PID implies the claim CAS that
-    /// preceded it). Skip PID 0 (free, being claimed, or being released:
+    /// Per slot: load the owner word `w` (`Acquire`, pairing with the
+    /// claimer's `Release` store, so a non-zero PID implies the claim CAS
+    /// that preceded it). Skip PID 0 (free, being claimed, or being released:
     /// presumed live). Probe the owner. If it is dead, adopt the slot with
-    /// `CAS pid P -> reaper` (`AcqRel` on success: it is the single
-    /// linearization point that two reapers, or a reaper and a re-claim,
-    /// contend on; the `Acquire` half makes the dead owner's last stores
-    /// visible before this reaper overwrites the slot). Then run the owner's
-    /// release sequence. A reaper that dies after the CAS leaves a slot
-    /// carrying its own PID, which the next reaper frees.
+    /// `CAS w -> (generation of w, reaper)` (`AcqRel` on success: it is the
+    /// single linearization point that two reapers, or a reaper and a
+    /// re-claim, contend on; the `Acquire` half makes the dead owner's last
+    /// stores visible before this reaper overwrites the slot). Then run the
+    /// owner's release sequence. A reaper that dies after the CAS leaves a
+    /// slot carrying its own PID, which the next reaper frees.
+    ///
+    /// The CAS is free of PID-reuse ABA (ADR-0023 amendment 14): every claim
+    /// of the slot increments the generation in the word, so a slot freed and
+    /// re-claimed since `w` was loaded, even by a new process with the same
+    /// PID, fails the CAS. Wrap-around needs 2^32 claims of one slot while a
+    /// reaper is paused between its load and its CAS, which is accepted.
     ///
     /// The scan can miss a slot that dies while it runs, and can see a
     /// released-then-reclaimed slot under its new owner; both only leave a
@@ -481,7 +502,8 @@ impl ReaderTable {
         let mut verdicts: Vec<(u32, bool)> = Vec::new();
         let mut freed = 0;
         for (i, rs) in self.slots().iter().enumerate() {
-            let pid = rs.pid().load(Ordering::Acquire);
+            let w = rs.owner().load(Ordering::Acquire);
+            let pid = owner_pid(w);
             if pid == 0 || pid == reaper {
                 continue;
             }
@@ -499,8 +521,13 @@ impl ReaderTable {
             // Relaxed on failure: a lost race (another reaper, or the slot
             // changed owner) carries no data; skip the slot.
             if rs
-                .pid()
-                .compare_exchange(pid, reaper, Ordering::AcqRel, Ordering::Relaxed)
+                .owner()
+                .compare_exchange(
+                    w,
+                    owner_word(owner_generation(w), reaper),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
             {
                 debug_assert_ne!(
@@ -520,10 +547,12 @@ impl ReaderTable {
     /// so any such slot was left by a dead process that had the same PID.
     /// Returns how many slots were freed.
     ///
-    /// `CAS pid me -> 0` (`AcqRel`, as in [`ReaderTable::reap_dead`]) is what
-    /// excludes another process's reaper. That reaper may have probed `me`
-    /// as dead before this process took its liveness lock; its pending
-    /// `CAS me -> reaper` now fails. Then `txnid = FREE` (`Release`).
+    /// `CAS w -> (generation of w, PID 0)` (`AcqRel`, as in
+    /// [`ReaderTable::reap_dead`]) is what excludes another process's reaper.
+    /// That reaper may have probed `me` as dead before this process took its
+    /// liveness lock; the word has changed, so its pending CAS fails. If this
+    /// process later re-claims the slot, the claim increments the generation,
+    /// so the reaper's CAS still fails. Then `txnid = FREE` (`Release`).
     /// Dying between the two stores leaves a pinned slot with PID 0 until
     /// the next first-opener wipe: a one-store window, documented in the ADR.
     // Called once the open and claim paths use reaping (ADR-0023 stage 2);
@@ -532,10 +561,16 @@ impl ReaderTable {
     pub(crate) fn reap_own_stale(&self, me: u32) -> u32 {
         let mut freed = 0;
         for rs in self.slots() {
-            if rs.pid().load(Ordering::Acquire) == me
+            let w = rs.owner().load(Ordering::Acquire);
+            if owner_pid(w) == me
                 && rs
-                    .pid()
-                    .compare_exchange(me, 0, Ordering::AcqRel, Ordering::Relaxed)
+                    .owner()
+                    .compare_exchange(
+                        w,
+                        owner_word(owner_generation(w), 0),
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
                     .is_ok()
             {
                 rs.txnid().store(RDR_FREE, Ordering::Release);
@@ -580,7 +615,7 @@ impl ReaderTable {
             };
             let pid = match self.owner_pid {
                 None => None,
-                Some(_) => Some(rs.pid().load(Ordering::Acquire)).filter(|&p| p != 0),
+                Some(_) => Some(owner_pid(rs.owner().load(Ordering::Acquire))).filter(|&p| p != 0),
             };
             out.push((i as u32, txnid, pid));
         }
@@ -827,7 +862,7 @@ mod tests {
         assert_eq!(t.capacity(), 2);
         let s = t.claim().expect("slot");
         assert_eq!(
-            region.slots()[s as usize].pid().load(Ordering::SeqCst),
+            owner_pid(region.slots()[s as usize].owner().load(Ordering::SeqCst)),
             4242
         );
         assert_eq!(
@@ -837,7 +872,10 @@ mod tests {
         t.store_pin(s, 7);
         assert_eq!(t.oldest(), Some(7));
         t.release(s);
-        assert_eq!(region.slots()[s as usize].pid().load(Ordering::SeqCst), 0);
+        assert_eq!(
+            owner_pid(region.slots()[s as usize].owner().load(Ordering::SeqCst)),
+            0
+        );
         assert_eq!(
             region.slots()[s as usize].txnid().load(Ordering::SeqCst),
             RDR_FREE
@@ -850,7 +888,9 @@ mod tests {
         use crate::shared::{HeapRegion, SharedRegion};
         let region = Arc::new(HeapRegion::new(3, 1, true));
         // Slot 2 pinned at txnid 5 by "another process" (written directly).
-        region.slots()[2].pid().store(99, Ordering::SeqCst);
+        region.slots()[2]
+            .owner()
+            .store(owner_word(1, 99), Ordering::SeqCst);
         region.slots()[2].txnid().store(5, Ordering::SeqCst);
         let t = ReaderTable::new_shared(region.clone());
         let mine = t.claim().expect("slot");
@@ -875,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn release_unpins_before_it_disowns() {
+    fn release_leaves_a_free_unowned_slot() {
         // The owner's release order is CLAIMED, pid 0, FREE (ADR-0023
         // amendment 7); the end state is a free, unowned slot.
         let (region, t) = shared_table(1, 7);
@@ -884,9 +924,11 @@ mod tests {
         t.release(s);
         assert_eq!(t.raw(s), RDR_FREE);
         assert_eq!(
-            crate::shared::SharedRegion::slots(&*region)[0]
-                .pid()
-                .load(Ordering::SeqCst),
+            owner_pid(
+                crate::shared::SharedRegion::slots(&*region)[0]
+                    .owner()
+                    .load(Ordering::SeqCst)
+            ),
             0
         );
     }
@@ -1026,6 +1068,47 @@ mod tests {
         assert_eq!(t.raw(s), 6);
         let none: Result<Option<u64>, ()> = t.pin_against(s, &word, 2, |_| Ok(None));
         assert_eq!(none, Ok(None), "gives up after `limit` attempts");
+    }
+
+    #[test]
+    fn reap_cannot_free_a_slot_reclaimed_under_a_reused_pid() {
+        let (_region, t) = shared_table(1, 1);
+        let s = t.claim_as(Some(2)).unwrap();
+        t.store_pin(s, 5); // process 2 pinned 5, then died
+        let n = t
+            .reap_dead(3, |pid| {
+                assert_eq!(pid, 2);
+                // While the reaper holds its stale load: a new process with
+                // PID 2 frees its predecessor's slot and re-claims it.
+                assert_eq!(t.reap_own_stale(2), 1);
+                let again = t.claim_as(Some(2)).unwrap();
+                t.store_pin(again, 6);
+                Ok(false) // the reaper's verdict on the old process 2
+            })
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "the reaper freed a slot re-claimed under the same PID"
+        );
+        assert_eq!(t.raw(s), 6);
+        assert_eq!(t.list(), vec![(s, Some(6), Some(2))]);
+    }
+
+    #[test]
+    fn each_claim_bumps_the_generation_and_release_keeps_it() {
+        let (region, t) = shared_table(1, 1);
+        let word = || {
+            crate::shared::SharedRegion::slots(&*region)[0]
+                .owner()
+                .load(Ordering::SeqCst)
+        };
+        let s = t.claim().unwrap();
+        let g1 = owner_generation(word());
+        assert_eq!(owner_pid(word()), 1);
+        t.release(s);
+        assert_eq!(word(), owner_word(g1, 0));
+        t.claim().unwrap();
+        assert_eq!(owner_generation(word()), g1.wrapping_add(1));
     }
 }
 

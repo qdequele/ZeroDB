@@ -2560,7 +2560,10 @@ mod shared_env_tests {
         let (snap, slot) = env.inner.pin_reader().expect("pin");
         assert_eq!(snap.txnid, 4);
         assert_eq!(region.slots()[slot as usize].txnid().load(O::SeqCst), 4);
-        assert_eq!(region.slots()[slot as usize].pid().load(O::SeqCst), 2);
+        assert_eq!(
+            crate::shared::owner_pid(region.slots()[slot as usize].owner().load(O::SeqCst)),
+            2
+        );
         env.inner.release_reader(slot);
         assert_eq!(
             region.slots()[slot as usize].txnid().load(O::SeqCst),
@@ -2639,7 +2642,7 @@ mod shared_env_tests {
         ));
         for rs in region.slots() {
             assert_eq!(rs.txnid().load(O::SeqCst), RDR_FREE);
-            assert_eq!(rs.pid().load(O::SeqCst), 0);
+            assert_eq!(crate::shared::owner_pid(rs.owner().load(O::SeqCst)), 0);
         }
     }
 

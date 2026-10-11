@@ -279,6 +279,17 @@ atomic states its `Ordering` and why, assuming a weak memory model.
 
 13. **`reader_list` reports the owner PID** (`ReaderEntry::pid`). It is
     `None` on the default path, and for a slot being claimed or released.
+14. **Claim generation in the owner word (closes a PID-reuse ABA).** The
+    slot's owner field is a 64-bit word: the owner PID in the low 32 bits,
+    a claim generation in the high 32 bits, which every claim increments.
+    Without it, a reaper that read a dead PID P could adopt the slot after a
+    new process with the same PID P freed it (amendment 9) and re-claimed
+    it, because the word would read P again; the reaper would then free a
+    live reader's slot. With the generation, any re-claim changes the word
+    and the reaper's CAS fails. LMDB avoids the same race by re-checking the
+    PID under its reader mutex; ZeroDB's slot claims are lock-free, so the
+    check moves into the word itself. Wrap-around needs 2³² claims of one
+    slot while one reaper is paused between its load and its CAS.
 
 ## Consequences
 

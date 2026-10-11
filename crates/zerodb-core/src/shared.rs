@@ -6,7 +6,7 @@
 //! this crate sees only safe atomics and lock calls, so it stays free of
 //! `unsafe`.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8};
+use std::sync::atomic::{AtomicU64, AtomicU8};
 
 /// Reader-slot txnid value meaning "free" (SPEC 04 TXN-14). A lock-file
 /// initializer writes it into every slot.
@@ -22,8 +22,15 @@ pub const READER_SLOT_SIZE: usize = 128;
 /// | offset | field |
 /// |---|---|
 /// | 0 | txnid `u64`: the pinned snapshot txnid, or a sentinel (TXN-14) |
-/// | 8 | owner PID `u32`: written only in a lock file; `0` while free |
-/// | 12 | padding up to 128 bytes, unused by the slot protocol |
+/// | 8 | owner `u64`: low 32 bits the owner PID (`0` = none), high 32 bits the claim generation; written only in a lock file |
+/// | 16 | padding up to 128 bytes, unused by the slot protocol |
+///
+/// The owner word's generation is incremented by every claim of the slot and
+/// kept by every release, so the word never returns to a value it held
+/// before: a reaper that compare-and-swaps the whole word cannot be fooled by
+/// a PID that was freed and then claimed again under the same PID
+/// (ADR-0023 amendment 14). See [`owner_pid`], [`owner_generation`] and
+/// [`owner_word`].
 ///
 /// The padding is atomic bytes too, so the whole slot is interior-mutable:
 /// another process may still write those bytes (a later initializer that
@@ -43,8 +50,8 @@ pub const READER_SLOT_SIZE: usize = 128;
 #[repr(C, align(64))]
 pub struct ReaderSlot {
     txnid: AtomicU64,
-    pid: AtomicU32,
-    _pad: [AtomicU8; 116],
+    owner: AtomicU64,
+    _pad: [AtomicU8; 112],
 }
 
 // The lock-file layout depends on these (ADR-0023 §3).
@@ -52,16 +59,31 @@ const _: () = {
     assert!(std::mem::size_of::<ReaderSlot>() == READER_SLOT_SIZE);
     assert!(std::mem::align_of::<ReaderSlot>() == 64);
     assert!(std::mem::offset_of!(ReaderSlot, txnid) == 0);
-    assert!(std::mem::offset_of!(ReaderSlot, pid) == 8);
+    assert!(std::mem::offset_of!(ReaderSlot, owner) == 8);
 };
+
+/// The owner PID in an owner word (`0` = none).
+pub const fn owner_pid(word: u64) -> u32 {
+    word as u32
+}
+
+/// The claim generation in an owner word.
+pub const fn owner_generation(word: u64) -> u32 {
+    (word >> 32) as u32
+}
+
+/// An owner word from a generation and a PID.
+pub const fn owner_word(generation: u32, pid: u32) -> u64 {
+    ((generation as u64) << 32) | pid as u64
+}
 
 impl ReaderSlot {
     /// A free slot: txnid [`READER_SLOT_FREE`], no owner.
     pub fn new_free() -> ReaderSlot {
         ReaderSlot {
             txnid: AtomicU64::new(READER_SLOT_FREE),
-            pid: AtomicU32::new(0),
-            _pad: [const { AtomicU8::new(0) }; 116],
+            owner: AtomicU64::new(0),
+            _pad: [const { AtomicU8::new(0) }; 112],
         }
     }
 
@@ -70,9 +92,11 @@ impl ReaderSlot {
         &self.txnid
     }
 
-    /// The slot's owner PID; `0` while free, being claimed or released.
-    pub fn pid(&self) -> &AtomicU32 {
-        &self.pid
+    /// The slot's owner word: the owner PID in the low 32 bits (`0` while
+    /// free, being claimed or released) and the claim generation in the high
+    /// 32 bits.
+    pub fn owner(&self) -> &AtomicU64 {
+        &self.owner
     }
 }
 
