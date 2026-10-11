@@ -221,6 +221,53 @@ atomic states its `Ordering` and why, assuming a weak memory model.
    existing suite is untouched; stage 3 flips the default and updates the two
    tests that assert the single-process behavior.
 
+## Amendments (stage-2 planning, 2026-10-11)
+
+7. **Release unpins before it disowns.** The owner's release is now three
+   stores: `txnid = CLAIMED`, then `pid = 0`, then `txnid = FREE`. With the
+   §3 order (`pid = 0`, then `FREE`), a process dying between the two stores
+   left a *pinned* txnid with `pid == 0`. No reaper could attribute it, and it
+   held the GC gate back until the next first-opener wipe. Now a death at any
+   point leaves one of two states. `CLAIMED` with the dead PID is reapable.
+   `CLAIMED` with `pid == 0` is the known leak, which pins nothing.
+   The local (single-process) table keeps its one-store release.
+8. **A reaper adopts, then releases.** Reaping a dead process P's slot is
+   `CAS pid P → reaper_pid` (the single linearization point of §3), then the
+   owner's release sequence (amendment 7). A reaper that dies mid-reap leaves
+   a slot carrying its own PID, which the next reaper frees.
+9. **Own-PID stale slots are freed at open.** A slot carrying this process's
+   PID before this process has claimed anything was left by a dead process
+   with the same PID. The liveness probe cannot see that process is dead,
+   because this process now holds that PID's liveness lock. A joining process
+   frees every such slot during open, before its first claim. It uses
+   `CAS pid P → 0` (which excludes a concurrent reaper's adoption), then
+   `txnid = FREE`. Dying between those two stores leaks one pinned slot until
+   the next wipe; the window is a single store, accepted and documented.
+10. **Joiner re-election and magic-last.** The initializer stores the magic in
+    `finish_open`, after `T` is seeded, so a joiner that sees the magic also
+    sees a seeded `T`. After a joiner is granted the shared election lock, it
+    tries the exclusive lock once more. POSIX converts its shared lock in
+    place, and the upgrade succeeds only when no other process holds the
+    byte, which means every process exited while it waited. If the upgrade
+    succeeds, the joiner initializes. A joiner that loses the upgrade and
+    finds no magic drops its lock and retries the election, a bounded number
+    of times. This happens when an initializer died before finishing while
+    another joiner also holds the lock.
+11. **Slot table at offset 256, lock-format version 2.** Slot 0 moves off the
+    writer word's 128-byte line pair. The version bump makes a stage-1 lock
+    file of a still-running process fail validation instead of being misread.
+12. **Reap points, as observed in the oracle.** Task 2 of the stage-2 plan
+    fills the table below from
+    `crates/zerodb-oracle/tests/lmdb_reaping_observation.rs`. ZeroDB reaps at
+    exactly these points:
+
+    | Event after a reader process died | LMDB reaps? |
+    |---|---|
+    | (filled by stage-2 Task 2) | |
+
+13. **`reader_list` reports the owner PID** (`ReaderEntry::pid`). It is
+    `None` on the default path, and for a slot being claimed or released.
+
 ## Consequences
 
 ### Staging (rule 6: the riskiest assumption first)
