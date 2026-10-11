@@ -33,14 +33,14 @@ pub const MAX_ROUNDS: u32 = 8;
 
 /// How a child dies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kill {
+pub(crate) enum Kill {
     /// `abort()` at the `commit`-th pipeline entry, at hook `point` (0..=4).
     Hook { commit: u64, point: u8 },
     /// Parent sends SIGKILL after this many milliseconds.
     AsyncMs(u64),
 }
 
-fn kill_arg(k: Kill) -> String {
+pub(crate) fn kill_arg(k: Kill) -> String {
     match k {
         Kill::Hook { commit, point } => format!("hook:{commit}:{point}"),
         Kill::AsyncMs(_) => "none".to_string(),
@@ -93,7 +93,7 @@ pub struct SigkillOpts {
 /// killed). Written after `commit` returns and flushed — SIGKILL preserves
 /// the page cache, so the parent reads it verbatim; it can lag the true
 /// acked count by at most the in-flight append.
-const SIDECAR: &str = "acked.log";
+pub(crate) const SIDECAR: &str = "acked.log";
 
 // ---------------------------------------------------------------------------
 // Child
@@ -103,7 +103,14 @@ const SIDECAR: &str = "acked.log";
 /// per-mode real flags, ack commits to the sidecar, die per `kill`. Exits the
 /// process; never returns. Invoked by the binary as
 /// `crash-harness --crash-child <seed> <dir> <kill>`.
-pub fn child_run(seed: u64, dir: &Path, kill: &str) -> ! {
+///
+/// With `lock_file` (the multi-process mechanism, `crash-harness
+/// --crash-child-lock`), the env is opened with a lock file (ADR-0023); once
+/// it is open the child writes the `writer-open` marker and waits up to 30 s
+/// for the reader process's `reader-up` marker before running the workload,
+/// so that every kill lands while a reader process is live. On a timeout it
+/// acks `ABANDON no reader` and exits.
+pub fn child_run(seed: u64, dir: &Path, kill: &str, lock_file: bool) -> ! {
     let spec = gen_spec(seed);
     let mut sidecar = match std::fs::File::create(dir.join(SIDECAR)) {
         Ok(f) => f,
@@ -117,7 +124,8 @@ pub fn child_run(seed: u64, dir: &Path, kill: &str) -> ! {
     opts.map_size(spec.map_size as usize)
         .page_size(spec.page_size)
         .max_dbs(16)
-        .flags(spec.mode.env_flags());
+        .flags(spec.mode.env_flags())
+        .lock_file(lock_file);
     if let Some(pages) = spec.dirty_limit {
         opts.max_dirty_bytes(pages as usize * spec.page_size as usize);
     }
@@ -128,6 +136,20 @@ pub fn child_run(seed: u64, dir: &Path, kill: &str) -> ! {
             std::process::exit(0);
         }
     };
+    if lock_file {
+        if std::fs::write(dir.join(super::multiproc::WRITER_OPEN), b"").is_err() {
+            mark("ABANDON writer-open marker".to_string());
+            std::process::exit(0);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !dir.join(super::multiproc::READER_UP).exists() {
+            if std::time::Instant::now() >= deadline {
+                mark("ABANDON no reader".to_string());
+                std::process::exit(0);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
     if let Some(rest) = kill.strip_prefix("hook:") {
         let mut it = rest.split(':');
         let commit: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -175,16 +197,16 @@ pub fn child_run(seed: u64, dir: &Path, kill: &str) -> ! {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-struct Sidecar {
-    commits: Vec<u64>,
-    done: bool,
-    abandon: Option<String>,
-    drift: Option<String>,
+pub(crate) struct Sidecar {
+    pub(crate) commits: Vec<u64>,
+    pub(crate) done: bool,
+    pub(crate) abandon: Option<String>,
+    pub(crate) drift: Option<String>,
     /// Txns the child acked as having spilled (ADR-0017).
-    spilled: u64,
+    pub(crate) spilled: u64,
 }
 
-fn read_sidecar(dir: &Path) -> Sidecar {
+pub(crate) fn read_sidecar(dir: &Path) -> Sidecar {
     let mut s = Sidecar {
         commits: Vec::new(),
         done: false,

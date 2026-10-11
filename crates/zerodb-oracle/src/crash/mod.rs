@@ -12,6 +12,10 @@
 //!   seeded `(commit, hook)`, or an asynchronous SIGKILL from the parent);
 //!   the parent reopens and verifies. The OS page cache survives, so this
 //!   validates control-flow ordering on the real mmap/pwrite path.
+//! - [`multiproc`] — the multi-process variant of mechanism B (ADR-0023): the
+//!   child opens a lock-file env and is killed mid-commit while a reader
+//!   process stays live; the parent joins through the lock file, verifies,
+//!   and commits over the dead writer.
 //!
 //! One **cycle** = one recovered-and-verified crash state (ADR-0008 OQ1):
 //! each materialized image variant and each SIGKILL recovery counts as one
@@ -21,12 +25,14 @@
 
 pub mod image;
 pub mod model;
+pub mod multiproc;
 pub mod sigkill;
 pub mod verify;
 pub mod workload;
 
 pub use image::{run_image_cut, ImageOpts};
 pub use model::{Exec, ExecErr, StepOutcome, World};
+pub use multiproc::{reader_run, run_mp_cycle};
 pub use sigkill::{child_run, run_sigkill_cycle, SigkillOpts};
 pub use workload::{gen_spec, Mode, Spec};
 
