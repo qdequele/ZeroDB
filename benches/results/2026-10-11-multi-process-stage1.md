@@ -13,7 +13,14 @@ parts:
 The lock file is opt-in (`EnvOpenOptions::lock_file(true)`, off by default), so
 this run also checks that the default path did not regress.
 
-## Verdict
+> **Update, same day: after the fix (section "After the fix" below).** The
+> default-path regression is gone: every rung is flat against `main` with the
+> lock file off. With the lock file on, the residual cost is +15 ns per read txn
+> (`ro_begin_abort` +19%), about +20 ns per empty write txn (+10%, within this
+> run's noise) and nothing measurable on `commit/batch/*`. The numbers directly
+> below are the original run, kept as they were measured.
+
+## Verdict (original run, before the fix)
 
 - **Part 1 holds.** All 7 two-process tests pass 5 times out of 5 on Linux
   x86-64, and they pass on macOS aarch64. The Linux futex path compiles with
@@ -154,6 +161,146 @@ this run.
 A `perf record` of the two `env/txn` rungs was dominated by criterion's own
 analysis (sorting samples), so it did not attribute the delta further.
 
+## After the fix (`2b53e88`)
+
+### What changed
+
+Two commits on top of `ca27d00`; there is no protocol change.
+
+- **`5f9b238` — reader slots resolved once per operation.**
+  - `zerodb_core::shared::ReaderSlot` is a `repr(C, align(64))` slot: txnid
+    `u64` at +0, owner PID `u32` at +8, padded to 128 bytes. That is the lock
+    file's slot stride, and compile-time asserts pin the size, alignment and
+    field offsets.
+  - `SharedRegion` hands out the whole table as `&[ReaderSlot]` instead of one
+    virtual call per slot. `zerodb-io` builds the slice over the mapping with
+    a single `slice::from_raw_parts`, which has a `// SAFETY:` comment.
+  - The local table is `Box<[ReaderSlot]>`, which replaces `CachePadded`, so
+    `crossbeam-utils` leaves `zerodb-core`.
+  - `claim`, `release`, `store_pin`, `oldest` and the introspection scans
+    resolve the slice once and loop directly. `ReaderTable::claim` is inlined
+    again, as on `main` (checked with `nm`).
+  - loom builds model the table over a local slot type with loom atomics.
+- **`2b53e88` — lock-file arms of the write-txn path moved out of line.**
+  `lock_writer_shared` and `current_snapshot` branch inline and call
+  `#[inline(never)]` helpers for the lock-file case. Without this,
+  `write_txn` grew enough that `DirtyStore::with_spare` stopped being inlined.
+
+### Per-transaction syscalls with the lock file on: none
+
+`strace -c -f` of `commit/batch/n1` (142,504 commits in the traced run) and of
+`env/txn/rw_empty_commit` shows the same per-commit syscalls with the lock
+file on and off: the `pwrite64` count is identical, and there are 37 `pread64`
+calls in both modes, so meta copies are not read per transaction.
+
+The lock file adds only per-env-open calls: `fcntl` (+315), `futex` (+171) and
+`ftruncate`. The cached-snapshot fast path in `snapshot_at` is taken when `T`
+is unchanged, because the committing process re-caches its own snapshot.
+
+The remaining lock-on cost is therefore CPU, from:
+
+- two locked read-modify-write operations on the futex writer word per write
+  txn;
+- the `SeqCst` store of `T`;
+- the owner-PID stores;
+- one virtual call per operation for the slot slice and for `T`.
+
+### Instruction counts per operation
+
+Measured with a micro loop outside the repo: heed API, `NO_SYNC`, x86-64,
+`perf stat -e instructions:u`. Instruction counts are exact; the cycle counts
+of the same loop moved ±5% between repeats, so they are not shown.
+
+| loop | main | lock off, fixed | lock on, fixed | lock off, `ca27d00` | lock on, `ca27d00` |
+|---|---:|---:|---:|---:|---:|
+| read txn begin + abort | 376 | 397 (+21) | 481 (+105) | 387¹ | 471¹ |
+| empty write txn | 1,307 | 1,336 (+29) | 1,478 (+171) | 1,362 (+54) | 1,458 |
+| single-put commit | 14,847 | 14,926 (+79) | 15,092 (+245) | 14,952 (+105) | 15,072 |
+
+¹ Measured in an earlier session of the same loop in which `main` read 367;
+compare these with each other, not with the fixed columns.
+
+### Bench after the fix
+
+Same three-sided driver, filter, `CODEGEN_UNITS=1` and 5 rounds as the
+original run, on `2b53e88`. The after binary contains `lock_writer_region` and
+`current_snapshot_shared` (both new in `2b53e88`) and 22 `zerodb_io::lockfile`
+symbols, and `ReaderTable::claim` is no longer a separate symbol. This run was
+noisier than the original: LMDB moved 11–18% between halves in some rounds of
+the `env/txn` rungs.
+
+| rung | LMDB | ZeroDB before | after, lock on | after, lock off | ÷ LMDB: before → on / off | on ÷ before | off ÷ before |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `commit/batch/n1` | 13.514 ms | 20.009 ms | 20.132 ms | 20.020 ms | 1.48× → 1.49× / 1.47× | 1.014 ±0.082 (flat) | 1.001 ±0.066 (flat) |
+| `commit/batch/n100` | 12.314 ms | 12.471 ms | 12.506 ms | 12.474 ms | 1.01× → 1.02× / 1.01× | 1.007 ±0.037 (flat) | 1.002 ±0.030 (flat) |
+| `commit/sync/n1` | 297.336 ms | 282.676 ms | 287.205 ms | 278.724 ms | 0.95× → 0.97× / 0.93× | 1.029 ±0.142 (flat) | 1.004 ±0.194 (flat) |
+| `commit/sync/n100` | 584.311 ms | 567.780 ms | 554.958 ms | 612.817 ms | 0.97× → 0.95× / 1.05× | 0.970 ±0.156 (drift) | 1.025 ±0.183 (drift) |
+| `env/txn/ro_begin_abort` | 1.257 ms | 815.2 µs | 966.3 µs | 831.2 µs | 0.65× → 0.77× / 0.63× | 1.186 ±0.164 (**slower**) | 1.007 ±0.182 (flat) |
+| `env/txn/rw_empty_commit` | 75.4 µs | 220.0 µs | 240.1 µs | 217.2 µs | 2.92× → 3.18× / 2.86× | 1.102 ±0.108 (flat) | 1.000 ±0.040 (flat) |
+| `get/access/hot` | 1.803 ms | 1.377 ms | 1.400 ms | 1.401 ms | 0.76× → 0.78× / 0.78× | 1.008 ±0.030 (flat) | 1.019 ±0.030 (flat) |
+| `get/access/miss` | 1.267 ms | 1.228 ms | 1.251 ms | 1.247 ms | 0.97× → 0.99× / 0.98× | 1.021 ±0.030 (flat) | 1.012 ±0.030 (flat) |
+| `get/access/rand` | 3.570 ms | 3.386 ms | 3.508 ms | 3.410 ms | 0.95× → 0.98× / 0.95× | 1.022 ±0.080 (flat) | 0.994 ±0.033 (flat) |
+| `get/access/seq` | 1.865 ms | 1.669 ms | 1.670 ms | 1.666 ms | 0.90× → 0.90× / 0.89× | 1.001 ±0.030 (flat) | 1.001 ±0.030 (flat) |
+| `get/db/named` | 3.569 ms | 3.358 ms | 3.375 ms | 3.383 ms | 0.94× → 0.95× / 0.95× | 1.004 ±0.093 (flat) | 1.002 ±0.038 (flat) |
+| `get/db/named_x8` | 3.302 ms | 3.328 ms | 3.355 ms | 3.294 ms | 1.01× → 1.02× / 1.00× | 0.994 ±0.102 (flat) | 0.992 ±0.065 (flat) |
+| `get/db/root` | 3.557 ms | 3.426 ms | 3.335 ms | 3.341 ms | 0.96× → 0.94× / 0.94× | 0.978 ±0.044 (flat) | 0.977 ±0.036 (flat) |
+| `get/key/k128` | 4.834 ms | 5.472 ms | 5.494 ms | 5.499 ms | 1.13× → 1.14× / 1.14× | 1.003 ±0.030 (flat) | 1.000 ±0.049 (flat) |
+| `get/key/k32` | 3.869 ms | 4.397 ms | 4.410 ms | 4.447 ms | 1.14× → 1.14× / 1.15× | 1.003 ±0.030 (flat) | 1.009 ±0.067 (flat) |
+| `get/key/k8` | 3.710 ms | 3.510 ms | 3.565 ms | 3.438 ms | 0.95× → 0.96× / 0.95× | 1.001 ±0.045 (flat) | 0.979 ±0.088 (drift) |
+| `get/size/n1k` | 1.773 ms | 1.641 ms | 1.629 ms | 1.632 ms | 0.93× → 0.92× / 0.92× | 0.992 ±0.030 (flat) | 0.994 ±0.030 (flat) |
+| `get/size/n50k` | 3.681 ms | 3.428 ms | 3.530 ms | 3.390 ms | 0.93× → 0.96× / 0.94× | 1.021 ±0.070 (flat) | 1.003 ±0.075 (drift) |
+| `get/val/v256` | 2.542 ms | 2.383 ms | 2.357 ms | 2.371 ms | 0.94× → 0.93× / 0.93× | 0.989 ±0.030 (flat) | 0.995 ±0.030 (flat) |
+| `get/val/v2page` | 2.297 ms | 2.912 ms | 2.877 ms | 2.878 ms | 1.27× → 1.25× / 1.25× | 0.995 ±0.030 (flat) | 0.991 ±0.030 (flat) |
+| `get/val/v2page_touch` | 3.234 ms | 3.706 ms | 3.663 ms | 3.662 ms | 1.15× → 1.13× / 1.13× | 0.988 ±0.030 (flat) | 0.991 ±0.030 (flat) |
+| `get/val/v4k` | 2.248 ms | 2.878 ms | 2.868 ms | 2.862 ms | 1.28× → 1.28× / 1.27× | 0.992 ±0.030 (flat) | 0.995 ±0.030 (flat) |
+| `get/val/v4k_touch` | 3.173 ms | 3.652 ms | 3.633 ms | 3.618 ms | 1.15× → 1.14× / 1.14× | 0.996 ±0.030 (flat) | 0.991 ±0.030 (flat) |
+| `get/val/v8` | 2.230 ms | 1.977 ms | 1.967 ms | 1.965 ms | 0.89× → 0.88× / 0.88× | 0.992 ±0.030 (flat) | 0.994 ±0.030 (flat) |
+| `get/val/v8_touch` | 2.216 ms | 1.972 ms | 1.949 ms | 1.946 ms | 0.89× → 0.88× / 0.88× | 0.990 ±0.030 (flat) | 0.987 ±0.030 (flat) |
+
+bench-ab.py's run verdicts:
+
+- **Lock off: `flat`.** 22 rungs flat, 3 drift, none regressed.
+- **Lock on: `regressed`, on `ro_begin_abort` only.** 23 rungs flat, 1 drift.
+
+Per round (ZeroDB after ÷ before; LMDB after ÷ before):
+
+| rung | variant | rounds 1–5, ZeroDB | rounds 1–5, LMDB |
+|---|---|---|---|
+| `env/txn/ro_begin_abort` | lock on | 1.245 1.186 1.193 1.027 1.156 | 0.889 0.987 0.985 0.999 0.876 |
+| `env/txn/ro_begin_abort` | lock off | 1.147 1.007 1.009 0.892 0.998 | 0.978 0.894 1.082 1.001 0.889 |
+| `env/txn/rw_empty_commit` | lock on | 1.102 1.055 1.153 1.188 1.079 | 0.829 0.852 0.999 0.983 0.986 |
+| `env/txn/rw_empty_commit` | lock off | 0.975 1.000 1.022 1.019 0.988 | 0.824 0.848 0.998 0.996 1.004 |
+| `commit/batch/n1` | lock on | 1.006 1.016 1.017 1.014 0.922 | 0.988 0.993 0.931 0.980 0.974 |
+| `commit/batch/n1` | lock off | 0.992 1.002 1.005 1.001 0.927 | 0.977 0.990 0.947 0.979 0.997 |
+
+Per operation (medians):
+
+| rung | before | lock off | lock on |
+|---|---:|---:|---:|
+| read txn begin + abort | 81.5 ns | 83.1 ns (+1.6) | 96.6 ns (+15.1) |
+| empty write txn | 220 ns | 217 ns (−3) | 240 ns (+20) |
+| single-put commit | 10.00 µs | 10.01 µs | 10.07 µs (+0.06) |
+
+**Intermediate run** (`5f9b238` alone, same method; numbers not repeated
+here): lock off had `ro_begin_abort` at +0.6% but `rw_empty_commit` still at
++6–8% in four of five rounds. That residual led to `2b53e88`.
+
+### Verdict after the fix
+
+- **The default path no longer regresses.** Lock off is flat against `main`
+  on every rung (`ro_begin_abort` 1.007, `rw_empty_commit` 1.000, `n1` 1.001,
+  every `get/*` within ±2.3%).
+- **With the lock file on, reads are within noise and commits are flat.**
+  `get/*` and `commit/batch/*` are unchanged (n1 1.014, flat).
+- **Residual lock-on cost is per transaction.**
+  - +15 ns per read txn (`ro_begin_abort` +19%): a virtual call for the slot
+    slice and for `T`, owner-PID stores and the `Result` plumbing of
+    `pin_shared`.
+  - About +20 ns per empty write txn (+10%, inside this run's noise band):
+    the futex lock and unlock RMWs plus the `SeqCst` `T` store.
+  - ZeroDB stays ahead of LMDB on read-txn begin/abort with the lock file on
+    (0.77×).
+
 ## Linux and macOS test runs
 
 Bench server, Linux 6.1 x86-64, run natively. This is the first time the futex
@@ -180,6 +327,11 @@ on `zerodb-core` (226 passed), `just loom` (9 passed), `just fuzz-quick`
   futex path is untested on a weak memory model.
 - The brief's `clippy --target x86_64-unknown-linux-gnu` on the Mac: that target
   is not installed there. Native Linux clippy above replaces it.
+
+After the fix (`2b53e88`), on the same server: fmt and clippy clean,
+`zerodb-io` 6/6, `multi_process` 7/7 in each of 5 runs, `lock_file_single_process`
+4/4 and workspace 694 passed. On the Mac: fmt, clippy, workspace (693), miri
+(226) and `just loom` (9) all green.
 
 ## Reproduce
 
