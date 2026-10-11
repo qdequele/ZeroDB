@@ -13,12 +13,14 @@
 //! `RUSTFLAGS="--cfg loom"` (`just loom`; the `loom_*` tests at the bottom of
 //! this file are the reader-table loom suite, L1–L11 per ADR-0006 and ADR-0023).
 //!
-//! Crash-safety note: nothing in this module writes
-//! to disk. Every step here is in-process state; a crash at any point between
-//! any two operations leaves the durable file exactly as the commit pipeline
-//! (SPEC 04 §9) left it, and recovery never consults reader state (ZeroDB is
-//! single-process, see docs/DIVERGENCES.md — a crashed process has no
-//! surviving readers to respect).
+//! Crash-safety note: nothing in this module writes to the data file. A crash
+//! at any point between any two operations leaves the durable file exactly as
+//! the commit pipeline (SPEC 04 §9) left it, and recovery never consults
+//! reader state. Without a lock file the table is in-process state, so a
+//! crashed process leaves no readers behind. With a lock file (ADR-0023) the
+//! table lives in the shared lock-file mapping and outlives a crashed process;
+//! that process's slots are then reaped by liveness (ADR-0023 §3,
+//! `ReaderTable::reap_dead`), or wiped by the next first opener.
 
 use std::sync::Arc;
 
@@ -130,7 +132,7 @@ impl ReaderTable {
 
     /// A table whose slots live in a cross-process region (ADR-0023 §3). The
     /// claim, pin and release protocol is the same; claims also record the
-    /// owner PID so a later stage can reap a dead process's slots.
+    /// owner PID, which is how a dead process's slots are reaped.
     #[cfg(not(loom))]
     pub(crate) fn new_shared(
         region: std::sync::Arc<dyn crate::shared::SharedRegion>,
@@ -169,8 +171,9 @@ impl ReaderTable {
     /// Claim a slot (SPEC 04 TXN-15): scan from 0; the first successful
     /// `compare_exchange(RDR_FREE → RDR_CLAIMED)` grants exclusive ownership.
     /// `None` after a full scan means the table is exhausted — the caller maps
-    /// it to `MdbError::ReadersFull` (TXN-16; no reaping path exists in a
-    /// single-process engine, so the error is immediate).
+    /// it to `MdbError::ReadersFull` (TXN-16). No reaping happens at claim,
+    /// so the error is immediate; LMDB does none there either (ADR-0023
+    /// amendment 12).
     ///
     /// There is no ABA hazard in this CAS: the compare value `RDR_FREE` means
     /// "free *now*", and ownership is conferred by the successful exchange
@@ -478,7 +481,11 @@ impl ReaderTable {
     ///
     /// Passes: (1) load every owner word (`Acquire`, pairing with the
     /// claimer's `Release` store, so a non-zero PID implies the claim CAS
-    /// that preceded it), keeping those with a non-zero PID other than
+    /// that preceded it; the same `Acquire` is also what orders every one of
+    /// these loads before the liveness probes of pass 2, which invariant B
+    /// depends on under a weak memory model: with `Relaxed` loads, ARM could
+    /// satisfy a load after the probe and break B), keeping those with a
+    /// non-zero PID other than
     /// `reaper` (PID 0 means free, being claimed or being released:
     /// presumed live); (2) probe each distinct PID found; (3) for each
     /// snapshot entry judged dead, `CAS word -> (generation + 1, reaper)`
@@ -558,7 +565,8 @@ impl ReaderTable {
     /// That reaper may have probed `me` as dead before this process took its
     /// liveness lock; the word has changed, so its pending CAS fails. Any
     /// later claim or adoption of the slot increments the generation
-    /// (invariant A of [`ReaderTable::reap_dead`]), so that CAS keeps failing. Then `txnid = FREE` (`Release`).
+    /// (invariant A of [`ReaderTable::reap_dead`]), so that CAS keeps
+    /// failing. Then `txnid = FREE` (`Release`).
     /// Dying between the two stores leaves a pinned slot with PID 0 until
     /// the next first-opener wipe: a one-store window, documented in the ADR.
     // loom builds compile no lock-file environment, so only the loom models

@@ -745,12 +745,18 @@ impl EnvInner {
 
     /// Take the cross-process writer lock on top of the in-process one
     /// (ADR-0023 §2); a no-op without a lock file. The guard releases it on
-    /// drop, before the in-process slot.
+    /// drop, before the in-process slot. A writer that took the lock over
+    /// from a dead owner then frees dead processes' reader slots (see
+    /// [`EnvInner::lock_writer_region`]).
     ///
     /// # Errors
     ///
-    /// The I/O error of the underlying lock call; the guard then holds only
-    /// the in-process lock.
+    /// The I/O error of the lock call, or of a liveness probe during the
+    /// takeover reap. After a failed lock call the guard holds only the
+    /// in-process lock. After a failed takeover reap it holds both locks, and
+    /// dropping it (as the failing write-txn begin does) releases both, as
+    /// LMDB's lock recovery releases the writer mutex when its reader check
+    /// fails.
     #[inline]
     pub(crate) fn lock_writer_shared<'a>(
         &'a self,

@@ -251,8 +251,16 @@ atomic states its `Ordering` and why, assuming a weak memory model.
     byte, which means every process exited while it waited. If the upgrade
     succeeds, the joiner initializes. A joiner that loses the upgrade and
     finds no magic drops its lock and retries the election, a bounded number
-    of times. This happens when an initializer died before finishing while
-    another joiner also holds the lock.
+    of times, and exhausting the retries fails the open. This happens when
+    an initializer died before finishing while another joiner also holds the
+    lock. The magic is stored with Release and loaded with Acquire. A magic
+    found by a joiner that lost the upgrade may also be left over from a
+    previous run: an initializer may have died before truncating, or every
+    process may have exited while this joiner waited. Joiners that collide
+    then adopt the previous run's table. That is the same state as joining a
+    table whose processes all exited, which the protocol tolerates: `T` is
+    the last published value, dead PIDs are reapable, and a stale writer word
+    is taken over.
 11. **Slot table at offset 256, lock-format version 2.** Slot 0 moves off the
     writer word's 128-byte line pair. The version bump makes a stage-1 lock
     file of a still-running process fail validation instead of being misread.
@@ -260,7 +268,7 @@ atomic states its `Ordering` and why, assuming a weak memory model.
     by `crates/zerodb-oracle/tests/lmdb_reaping_observation.rs`, which
     SIGKILLs a reader process and then checks whether `mdb_reader_list` still
     shows its slot. Results are identical on macOS aarch64 and Linux x86-64
-    and stable over repeated runs. ZeroDB reaps at exactly these points:
+    for every scenario run on both, and stable over repeated runs. ZeroDB reaps at exactly these points:
 
     | Event after a reader process died | LMDB reaps? |
     |---|---|
@@ -272,10 +280,9 @@ atomic states its `Ordering` and why, assuming a weak memory model.
     | First opener of the environment | Yes: the lock table is reinitialized |
     | Explicit `mdb_reader_check` | Yes |
 
-    On macOS the fork's writer mutex is not robust, so a dead writer blocks
-    the next one and there is no takeover point. `mdb_reader_check` counts
-    slots, not processes: a process that died holding two reader slots
-    reports 2.
+    The writer-takeover row is not observed on macOS; the takeover scenario
+    runs only on Linux. `mdb_reader_check` counts slots, not processes: a
+    process that died holding two reader slots reports 2.
 
 13. **`reader_list` reports the owner PID** (`ReaderEntry::pid`). It is
     `None` on the default path, and for a slot being claimed or released.
