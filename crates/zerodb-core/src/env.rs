@@ -855,25 +855,23 @@ impl EnvInner {
             .reader_table
             .claim()
             .ok_or(Error::Mdb(MdbError::ReadersFull))?;
-        for _ in 0..META_RETRY_LIMIT {
-            // TXN-17 publish-and-verify against the shared T: once verified,
-            // no writer in any process can reclaim pages of snapshot t.
-            let t = self
-                .reader_table
-                .publish_and_verify(slot, region.published_txnid());
-            match self.snapshot_at(t) {
-                Ok(Some(snap)) => return Ok((snap, slot)),
-                // Meta slot `t & 1` moved on (or was mid-rewrite): a newer T
-                // is published; pin again.
-                Ok(None) => std::thread::yield_now(),
-                Err(e) => {
-                    self.reader_table.release(slot);
-                    return Err(e);
-                }
+        // TXN-17 publish-and-verify against the shared T, then the snapshot
+        // for the verified txnid; `None` means meta slot `t & 1` moved on.
+        match self
+            .reader_table
+            .pin_against(slot, region.published_txnid(), META_RETRY_LIMIT, |t| {
+                self.snapshot_at(t)
+            }) {
+            Ok(Some(snap)) => Ok((snap, slot)),
+            Ok(None) => {
+                self.reader_table.release(slot);
+                Err(Error::Mdb(MdbError::Invalid))
+            }
+            Err(e) => {
+                self.reader_table.release(slot);
+                Err(e)
             }
         }
-        self.reader_table.release(slot);
-        Err(Error::Mdb(MdbError::Invalid))
     }
 
     /// The snapshot for published txnid `t`: the cached one when it matches
@@ -1008,7 +1006,7 @@ impl EnvInner {
         self.reader_table
             .list()
             .into_iter()
-            .map(|(slot, txnid)| ReaderEntry {
+            .map(|(slot, txnid, _pid)| ReaderEntry {
                 slot,
                 txnid,
                 // `saturating_sub`, not a subtraction: a reader can publish a

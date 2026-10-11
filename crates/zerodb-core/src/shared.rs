@@ -91,6 +91,16 @@ pub trait SharedRegion: Send + Sync {
     /// Whether this process initialized the region (no other process had the
     /// environment open), and so must seed `T` from the data file.
     fn is_initializer(&self) -> bool;
+    /// Whether process `pid` currently has this environment open (holds its
+    /// liveness lock, ADR-0023 §3). Immune to PID reuse for other processes.
+    /// For this process's own PID it is always `true`, even when the PID was
+    /// recorded by a dead predecessor with the same PID; the reader table
+    /// frees those slots at open instead (ADR-0023 amendment 9).
+    ///
+    /// # Errors
+    ///
+    /// The I/O error of the underlying probe.
+    fn is_alive(&self, pid: u32) -> std::io::Result<bool>;
     /// Block until this process holds the cross-process writer lock. Called
     /// only while the in-process writer lock is held, so at most one thread
     /// per process waits here.
@@ -113,6 +123,7 @@ pub(crate) struct HeapRegion {
     pub(crate) initializer: bool,
     pub(crate) writer: std::sync::Mutex<bool>,
     cv: std::sync::Condvar,
+    dead: std::sync::Mutex<Vec<u32>>,
 }
 
 #[cfg(all(test, not(loom)))]
@@ -125,7 +136,13 @@ impl HeapRegion {
             initializer,
             writer: std::sync::Mutex::new(false),
             cv: std::sync::Condvar::new(),
+            dead: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Mark `pid` dead for [`SharedRegion::is_alive`].
+    pub(crate) fn kill(&self, pid: u32) {
+        self.dead.lock().expect("test region poisoned").push(pid);
     }
 }
 
@@ -142,6 +159,14 @@ impl SharedRegion for HeapRegion {
     }
     fn is_initializer(&self) -> bool {
         self.initializer
+    }
+    fn is_alive(&self, pid: u32) -> std::io::Result<bool> {
+        Ok(pid == self.pid
+            || !self
+                .dead
+                .lock()
+                .expect("test region poisoned")
+                .contains(&pid))
     }
     fn lock_writer(&self) -> std::io::Result<()> {
         let mut held = self.writer.lock().expect("test region poisoned");

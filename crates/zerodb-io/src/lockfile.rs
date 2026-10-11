@@ -391,6 +391,9 @@ impl SharedRegion for LockFile {
     fn is_initializer(&self) -> bool {
         self.initializer
     }
+    fn is_alive(&self, pid: u32) -> std::io::Result<bool> {
+        LockFile::is_alive(self, pid)
+    }
 
     #[cfg(target_os = "linux")]
     fn lock_writer(&self) -> std::io::Result<()> {
