@@ -181,6 +181,20 @@ fn child_entry() {
             mark(&dir, "child-holds-lock");
             std::thread::sleep(Duration::from_secs(600)); // killed by the parent
         }
+        "hold_reader" => {
+            // Hold a read txn until told to stop, then exit cleanly.
+            let r = env.read_txn().unwrap();
+            mark(&dir, "child-reading");
+            wait_for(&dir.join("child-stop"), Duration::from_secs(60));
+            drop(r);
+        }
+        "hold_readers_and_die" => {
+            let a = env.read_txn().unwrap();
+            let b = env.read_txn().unwrap();
+            mark(&dir, "child-reading");
+            std::thread::sleep(Duration::from_secs(600)); // killed by the parent
+            drop((a, b));
+        }
         other => panic!("unknown role {other}"),
     }
 }
@@ -364,4 +378,164 @@ fn child_entry_other_readers() {
         Err(zerodb::Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
         other => panic!("expected a max_readers mismatch error, got {other:?}"),
     }
+}
+
+/// Rewrite every seeded key `rounds` times. Returns the growth of
+/// `last_pgno` across the rewrites.
+fn churn_growth(env: &Env, rounds: u32) -> u64 {
+    let db = env.main_database();
+    let before = env.info().last_pgno;
+    for round in 0..rounds {
+        let mut w = env.write_txn().unwrap();
+        for i in 0..200u32 {
+            db.put(
+                &mut w,
+                format!("k{i:04}").as_bytes(),
+                format!("r{round}").repeat(40).as_bytes(),
+            )
+            .unwrap();
+        }
+        w.commit().unwrap();
+    }
+    env.info().last_pgno - before
+}
+
+#[test]
+fn killed_readers_slots_are_reaped_by_clear_stale_readers() {
+    let dir = TempDir::new();
+    let env = open(dir.path());
+    seed(&env);
+    let mut c = child("hold_readers_and_die", dir.path());
+    wait_for(&dir.path().join("child-reading"), Duration::from_secs(30));
+    let pid = c.id();
+    c.kill().unwrap();
+    c.wait().unwrap();
+    let listed = env.reader_list();
+    assert_eq!(
+        listed.iter().filter(|e| e.pid == Some(pid)).count(),
+        2,
+        "{listed:?}"
+    );
+    // LMDB counts slots, not processes (OBS_CHECK_COUNTS_SLOTS in
+    // lmdb_reaping_observation.rs), so the two-reader child gives 2.
+    assert_eq!(env.clear_stale_readers().unwrap(), 2);
+    assert!(env.reader_list().is_empty());
+    assert_eq!(env.clear_stale_readers().unwrap(), 0);
+}
+
+#[test]
+fn reaping_never_touches_a_live_process() {
+    let dir = TempDir::new();
+    let env = open(dir.path());
+    seed(&env);
+    let mut c = child("hold_reader", dir.path());
+    wait_for(&dir.path().join("child-reading"), Duration::from_secs(30));
+    assert_eq!(env.clear_stale_readers().unwrap(), 0);
+    assert_eq!(
+        env.reader_list()
+            .iter()
+            .filter(|e| e.pid == Some(c.id()))
+            .count(),
+        1
+    );
+    mark(dir.path(), "child-stop");
+    assert!(c.wait().unwrap().success());
+}
+
+#[test]
+fn reaped_slot_lets_the_writer_reuse_pages() {
+    let dir = TempDir::new();
+    let env = open(dir.path());
+    seed(&env);
+    let mut c = child("hold_readers_and_die", dir.path());
+    wait_for(&dir.path().join("child-reading"), Duration::from_secs(30));
+    c.kill().unwrap();
+    c.wait().unwrap();
+    // The dead reader pins the seed snapshot: every rewrite allocates fresh
+    // pages.
+    let pinned = churn_growth(&env, 20);
+    assert!(pinned > 0, "the pinned churn did not grow the file");
+    assert_eq!(env.clear_stale_readers().unwrap(), 2);
+    churn_growth(&env, 2); // let the freelist catch up
+    let freed = churn_growth(&env, 20);
+    assert!(
+        freed * 4 < pinned,
+        "pages are not reused after reaping: growth {freed} vs {pinned} while pinned"
+    );
+}
+
+/// With no dead writer to take over from, a plain write txn and commit do
+/// not reap: only `clear_stale_readers` and a writer takeover (Linux) do.
+#[test]
+fn plain_write_txn_does_not_reap_a_dead_reader() {
+    let dir = TempDir::new();
+    let env = open(dir.path());
+    seed(&env);
+    let mut c = child("hold_readers_and_die", dir.path());
+    wait_for(&dir.path().join("child-reading"), Duration::from_secs(30));
+    let pid = c.id();
+    c.kill().unwrap();
+    c.wait().unwrap();
+    let db = env.main_database();
+    let mut w = env.write_txn().unwrap();
+    db.put(&mut w, b"plain", b"1").unwrap();
+    w.commit().unwrap();
+    let listed = env.reader_list();
+    assert_eq!(
+        listed.iter().filter(|e| e.pid == Some(pid)).count(),
+        2,
+        "a plain write reaped the dead reader: {listed:?}"
+    );
+}
+
+/// The two-process form of the zerodb-io unit test
+/// `writer_lock_releases_from_another_thread`. On macOS that unit test
+/// cannot tell a released POSIX lock from a held one (a process never
+/// conflicts with itself); another process can.
+#[test]
+fn writer_lock_released_on_another_thread_admits_another_process() {
+    let dir = TempDir::new();
+    let env = open(dir.path());
+    let db = env.main_database();
+    let mut w = env.write_txn().unwrap();
+    db.put(&mut w, b"parent", b"1").unwrap();
+    let mut c = child("write_when_free", dir.path());
+    wait_for(&dir.path().join("child-waiting"), Duration::from_secs(30));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(!dir.path().join("child-got-lock").exists(), "lock not held");
+    std::thread::scope(|s| {
+        s.spawn(move || w.commit().unwrap());
+    });
+    assert!(c.wait().unwrap().success());
+    let r = env.read_txn().unwrap();
+    assert_eq!(db.get(&r, b"child").unwrap(), Some(&b"2"[..]));
+}
+
+/// Linux only: the futex writer lock reports a dead owner's takeover, and
+/// the new writer then reaps dead readers, as the LMDB fork does. On macOS
+/// the `fcntl` writer lock cannot tell a takeover from a normal acquire.
+#[cfg(target_os = "linux")]
+#[test]
+fn writer_takeover_reaps_a_dead_readers_slot() {
+    let dir = TempDir::new();
+    let env = open(dir.path());
+    seed(&env);
+    let mut r = child("hold_readers_and_die", dir.path());
+    wait_for(&dir.path().join("child-reading"), Duration::from_secs(30));
+    let reader_pid = r.id();
+    r.kill().unwrap();
+    r.wait().unwrap();
+    let mut w = child("hold_and_die", dir.path());
+    wait_for(
+        &dir.path().join("child-holds-lock"),
+        Duration::from_secs(30),
+    );
+    w.kill().unwrap();
+    w.wait().unwrap();
+    assert!(env.reader_list().iter().any(|e| e.pid == Some(reader_pid)));
+    drop(env.write_txn().expect("take over the dead writer's lock"));
+    assert!(
+        !env.reader_list().iter().any(|e| e.pid == Some(reader_pid)),
+        "the takeover did not reap the dead reader"
+    );
 }

@@ -702,6 +702,10 @@ mod tests {
         LockFile::open(&path, 4).expect("reopen");
     }
 
+    /// On macOS this cannot tell a released POSIX lock from a held one (a
+    /// process never conflicts with itself); the two-process test
+    /// `writer_lock_released_on_another_thread_admits_another_process` in
+    /// `crates/zerodb/tests/multi_process.rs` covers that case.
     #[test]
     fn writer_lock_releases_from_another_thread() {
         let path = tmp();
