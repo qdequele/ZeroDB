@@ -311,14 +311,6 @@ impl ReaderTable {
         rs.txnid().store(RDR_FREE, Ordering::Release);
     }
 
-    /// This table's owner PID: `Some` for a shared table.
-    // Called once the open and claim paths use reaping (ADR-0023 stage 2);
-    // exercised only by unit tests until then.
-    #[allow(dead_code)]
-    pub(crate) fn owner_pid(&self) -> Option<u32> {
-        self.owner_pid
-    }
-
     /// The minimum pinned snapshot txnid across all slots, or `None` if no
     /// slot holds a real txnid (SPEC 04 TXN-20 — the reader term of the GC
     /// gate; the `min(_, writer_txnid − 1)` fold lives in the caller,

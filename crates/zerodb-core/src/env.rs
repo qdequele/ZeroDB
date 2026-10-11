@@ -768,8 +768,15 @@ impl EnvInner {
     ///
     /// A writer that took the lock over from a dead owner then frees dead
     /// processes' reader slots, as LMDB's writer does when it recovers the
-    /// lock from a dead owner on Linux (ADR-0023 amendment 12). The guard
-    /// records the lock first, so it is released even if reaping unwinds.
+    /// lock from a dead owner on Linux (ADR-0023 amendment 12).
+    ///
+    /// # Errors
+    ///
+    /// The I/O error of the lock call, or of a liveness probe during the
+    /// takeover reap. In the second case the guard already records the
+    /// cross-process lock, so dropping it (as the failing write txn does)
+    /// releases the lock, as LMDB's lock recovery releases the writer mutex
+    /// when its reader check fails.
     #[inline(never)]
     fn lock_writer_region<'a>(
         &'a self,
@@ -779,7 +786,7 @@ impl EnvInner {
         let took_over = region.lock_writer().map_err(Error::Io)?;
         guard.shared = Some(region);
         if took_over {
-            self.reap_quietly();
+            self.clear_stale_readers()?;
         }
         Ok(())
     }
@@ -803,19 +810,6 @@ impl EnvInner {
             return Ok(n as usize);
         }
         Ok(0)
-    }
-
-    /// [`EnvInner::clear_stale_readers`] for a writer that has just taken the
-    /// writer lock over from a dead owner. A probe error is ignored, so the
-    /// write txn never fails because of a cleanup pass it did not ask for;
-    /// the dead slots then stay for the next `clear_stale_readers` call.
-    /// This differs from the LMDB fork, whose lock recovery
-    /// (`mdb_mutex_failed`) returns a reader-check error from the lock call
-    /// and releases the writer mutex.
-    fn reap_quietly(&self) {
-        // The count only matters to an explicit caller, and a probe error
-        // leaves every slot as it was (see `clear_stale_readers`).
-        let _ = self.clear_stale_readers();
     }
 
     /// Whether a failed commit fsync poisoned the env (SPEC 06 REC-13).
@@ -3006,18 +3000,22 @@ mod shared_env_tests {
     }
 
     #[test]
-    fn a_failed_probe_fails_clear_stale_readers_but_not_a_takeover() {
+    fn a_failed_probe_fails_clear_stale_readers_and_a_takeover_write_txn() {
+        // As LMDB's lock recovery: a failed reader check fails the lock call
+        // and releases the writer lock.
         let region = Arc::new(HeapRegion::new(4, 1, true));
         let env = open(backing(4, 5), region.clone());
         pin_as(&env, 2, 4);
         region.kill(2);
-        region.fail_liveness_probes();
+        region.set_liveness_probes_fail(true);
         assert!(matches!(env.clear_stale_readers(), Err(Error::Io(_))));
         region.simulate_takeover_on_next_lock();
-        let txn = env
-            .write_txn()
-            .expect("a probe error during the takeover reap is ignored");
+        assert!(matches!(env.write_txn(), Err(Error::Io(_))));
         assert_eq!(listed_pids(&env), vec![Some(2)], "nothing was freed");
+        assert!(!writer_held(&region), "the failed begin released the lock");
+        region.set_liveness_probes_fail(false);
+        // Would block forever if the failed begin had kept the lock.
+        let txn = env.write_txn().expect("the writer lock is free again");
         drop(txn);
     }
 }

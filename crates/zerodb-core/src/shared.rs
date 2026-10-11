@@ -218,11 +218,11 @@ impl HeapRegion {
     }
 
     /// Make every later [`SharedRegion::is_alive`] probe fail with an I/O
-    /// error.
-    pub(crate) fn fail_liveness_probes(&self) {
+    /// error (`true`) or answer normally again (`false`).
+    pub(crate) fn set_liveness_probes_fail(&self, fail: bool) {
         // Relaxed: a test knob set and read on the same thread.
         self.probes_fail
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -241,7 +241,7 @@ impl SharedRegion for HeapRegion {
         self.initializer
     }
     fn is_alive(&self, pid: u32) -> std::io::Result<bool> {
-        // Relaxed: a test knob, see `fail_liveness_probes`.
+        // Relaxed: a test knob, see `set_liveness_probes_fail`.
         if self.probes_fail.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(std::io::Error::other("test probe failure"));
         }
