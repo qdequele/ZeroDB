@@ -11,7 +11,10 @@
 //! | 16 | `max_readers` `u32` |
 //! | 64 | published txnid `T` `u64` (own cache line) |
 //! | 128 | writer-lock word `u32`: owner PID, bit 31 = waiters (Linux) |
-//! | 192 + i·128 | reader slot `i`: txnid `u64` at +0, owner `u64` at +8 (PID low 32 bits, claim generation high 32 bits) |
+//! | 256 + i·128 | reader slot `i`: txnid `u64` at +0, owner `u64` at +8 (PID low 32 bits, claim generation high 32 bits) |
+//!
+//! Offsets 136–255 are unused: they keep slot 0 off the writer word's 128-byte
+//! line pair (ADR-0023 amendment 11).
 //!
 //! Record locks (POSIX `fcntl`, per process; ADR-0023 amendment 2): byte 0 is
 //! the first-opener election, byte 1 the macOS writer lock, and byte
@@ -30,7 +33,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use zerodb_core::shared::{ReaderSlot, SharedRegion, READER_SLOT_FREE, READER_SLOT_SIZE};
 
 const LOCK_MAGIC: u64 = u64::from_le_bytes(*b"ZDBLOCK1");
-const LOCK_FORMAT: u32 = 1;
+const LOCK_FORMAT: u32 = 2;
 const OFF_MAGIC: usize = 0;
 const OFF_FORMAT: usize = 8;
 const OFF_PAGE_SIZE: usize = 12;
@@ -38,7 +41,7 @@ const OFF_MAX_READERS: usize = 16;
 const OFF_T: usize = 64;
 #[cfg(target_os = "linux")]
 const OFF_WRITER: usize = 128;
-const OFF_SLOTS: usize = 192;
+const OFF_SLOTS: usize = 256;
 const SLOT_STRIDE: usize = 128;
 // The slot table is viewed as a `&[ReaderSlot]` (see `LockFile::slots`): the
 // stride must be the slot type's size, and the table's offset a multiple of
@@ -204,11 +207,44 @@ impl LockFile {
             .create(true)
             .truncate(false)
             .open(path)?;
-        let initializer = record_lock(&file, libc::F_SETLK, WRLCK, ELECTION_BYTE)?;
-        if !initializer {
-            // Blocks until the initializer downgrades in `finish_open`.
+        /// How often a joiner that finds a half-built lock file retries the
+        /// election before failing (ADR-0023 amendment 10).
+        const ELECTION_RETRIES: u32 = 100;
+        let mut attempt = 0;
+        let initializer = loop {
+            if record_lock(&file, libc::F_SETLK, WRLCK, ELECTION_BYTE)? {
+                break true;
+            }
+            // Blocks until the initializer downgrades in `finish_open`, or
+            // exits.
             record_lock(&file, libc::F_SETLKW, RDLCK, ELECTION_BYTE)?;
-        }
+            // Every other process may have exited while this one waited,
+            // including an initializer that died before finishing. POSIX
+            // converts this process's shared lock in place, and the upgrade
+            // succeeds only when no other process holds the byte. A failed
+            // F_SETLK leaves the shared lock held.
+            if record_lock(&file, libc::F_SETLK, WRLCK, ELECTION_BYTE)? {
+                break true;
+            }
+            // Another process holds the byte too. If the initializer
+            // finished, the magic is set; otherwise it died mid-way and the
+            // other holder is a joiner in the same position. Drop the lock
+            // and retry the election so one of them initializes.
+            if read_u64_at(&file, OFF_MAGIC)? == LOCK_MAGIC {
+                break false;
+            }
+            record_lock(&file, libc::F_SETLK, UNLCK, ELECTION_BYTE)?;
+            attempt += 1;
+            if attempt == ELECTION_RETRIES {
+                return Err(LockOpenError::Mismatch(
+                    "lock file never finished initializing".into(),
+                ));
+            }
+            // Stagger retries by PID so two joiners do not keep colliding.
+            std::thread::sleep(std::time::Duration::from_millis(
+                1 + u64::from(std::process::id() % 7),
+            ));
+        };
         // A joiner reads `max_readers` with `pread` before mapping. It holds
         // the shared election lock, so the initializer has finished writing.
         let slots = if initializer {
@@ -238,19 +274,17 @@ impl LockFile {
         };
         if initializer {
             for rs in lock.slots() {
-                // Relaxed: published by the Release store of the magic below,
-                // and no other process can map the file before the election
+                // Relaxed: published by the Release store of the magic in
+                // `finish_open`, and no other process can map the file before the election
                 // byte is downgraded.
                 rs.txnid().store(READER_SLOT_FREE, Ordering::Relaxed);
                 rs.owner().store(0, Ordering::Relaxed);
             }
-            // Relaxed: published by the Release store of the magic below.
+            // Relaxed: published by the Release store of the magic in
+            // `finish_open`.
             lock.u32_at(OFF_FORMAT)
                 .store(LOCK_FORMAT, Ordering::Relaxed);
             lock.u32_at(OFF_MAX_READERS).store(slots, Ordering::Relaxed);
-            // Release: every field above is visible to a joiner that loads the
-            // magic with Acquire.
-            lock.u64_at(OFF_MAGIC).store(LOCK_MAGIC, Ordering::Release);
         } else {
             // Acquire: pairs with the initializer's Release store of the
             // magic. The format load is ordered after it, so Relaxed suffices.
@@ -300,37 +334,24 @@ impl LockFile {
         }
     }
 
-    /// Let other processes in: the initializer converts its exclusive
-    /// election lock to a shared one (atomic for POSIX locks). No-op for a
-    /// joiner, which already holds it shared.
+    /// Publish the header and let other processes in: the initializer stores
+    /// the magic, then converts its exclusive election lock to a shared one
+    /// (atomic for POSIX locks). No-op for a joiner, which already holds it
+    /// shared.
     ///
     /// # Errors
     ///
     /// The `fcntl` error.
     pub fn finish_open(&self) -> std::io::Result<()> {
         if self.initializer {
+            // Release: the header fields stored in `open` and `T`, seeded by
+            // the core since, are visible to any joiner that loads the magic
+            // with Acquire. A joiner that sees the magic therefore sees a
+            // seeded `T` (ADR-0023 amendment 10).
+            self.u64_at(OFF_MAGIC).store(LOCK_MAGIC, Ordering::Release);
             record_lock(&self.file, libc::F_SETLK, RDLCK, ELECTION_BYTE)?;
         }
         Ok(())
-    }
-
-    /// Whether process `pid` currently has this environment open (holds its
-    /// liveness lock). For another PID this is immune to reuse: a dead
-    /// process's recycled PID holds no lock unless a live process with that PID
-    /// has the environment open. For this process's own PID it always returns
-    /// `true`, even when the PID was recorded by a dead predecessor that had
-    /// the same PID; callers that may see such a stale PID must handle that
-    /// case themselves (as `lock_writer` does on Linux).
-    ///
-    /// # Errors
-    ///
-    /// The `fcntl` error.
-    pub fn is_alive(&self, pid: u32) -> std::io::Result<bool> {
-        if pid == self.pid {
-            // F_GETLK never reports the caller's own locks.
-            return Ok(true);
-        }
-        probe_locked(&self.file, LIVENESS_BASE + i64::from(pid))
     }
 
     fn u64_at(&self, off: usize) -> &AtomicU64 {
@@ -391,8 +412,23 @@ impl SharedRegion for LockFile {
     fn is_initializer(&self) -> bool {
         self.initializer
     }
+    /// Whether process `pid` currently has this environment open (holds its
+    /// liveness lock). For another PID this is immune to reuse: a dead
+    /// process's recycled PID holds no lock unless a live process with that PID
+    /// has the environment open. For this process's own PID it always returns
+    /// `true`, even when the PID was recorded by a dead predecessor that had
+    /// the same PID; callers that may see such a stale PID must handle that
+    /// case themselves (as `lock_writer` does on Linux).
+    ///
+    /// # Errors
+    ///
+    /// The `fcntl` error.
     fn is_alive(&self, pid: u32) -> std::io::Result<bool> {
-        LockFile::is_alive(self, pid)
+        if pid == self.pid {
+            // F_GETLK never reports the caller's own locks.
+            return Ok(true);
+        }
+        probe_locked(&self.file, LIVENESS_BASE + i64::from(pid))
     }
 
     #[cfg(target_os = "linux")]
@@ -540,6 +576,17 @@ fn one_byte_flock(kind: libc::c_short, start: i64) -> libc::flock {
     fl.l_start = start;
     fl.l_len = 1;
     fl
+}
+
+fn read_u64_at(file: &File, off: usize) -> std::io::Result<u64> {
+    use std::os::unix::fs::FileExt;
+    let mut b = [0u8; 8];
+    match file.read_exact_at(&mut b, off as u64) {
+        Ok(()) => Ok(u64::from_le_bytes(b)),
+        // A file shorter than the magic was never initialized.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
+        Err(e) => Err(e),
+    }
 }
 
 fn read_u32_at(file: &File, off: usize) -> std::io::Result<u32> {
