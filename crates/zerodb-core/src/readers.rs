@@ -1170,6 +1170,21 @@ mod tests {
     }
 
     #[test]
+    fn adoption_bumps_the_generation() {
+        let (region, t) = shared_table(1, 1);
+        t.claim_as(Some(2)).unwrap();
+        let word = || {
+            crate::shared::SharedRegion::slots(&*region)[0]
+                .owner()
+                .load(Ordering::SeqCst)
+        };
+        let g = owner_generation(word());
+        assert_eq!(t.reap_dead(3, |p| Ok(p != 2)).unwrap(), 1);
+        // Adopted at g+1, then released (PID cleared, generation kept).
+        assert_eq!(word(), owner_word(g.wrapping_add(1), 0));
+    }
+
+    #[test]
     fn each_claim_bumps_the_generation_and_release_keeps_it() {
         let (region, t) = shared_table(1, 1);
         let word = || {
