@@ -256,14 +256,26 @@ atomic states its `Ordering` and why, assuming a weak memory model.
 11. **Slot table at offset 256, lock-format version 2.** Slot 0 moves off the
     writer word's 128-byte line pair. The version bump makes a stage-1 lock
     file of a still-running process fail validation instead of being misread.
-12. **Reap points, as observed in the oracle.** Task 2 of the stage-2 plan
-    fills the table below from
-    `crates/zerodb-oracle/tests/lmdb_reaping_observation.rs`. ZeroDB reaps at
-    exactly these points:
+12. **Reap points, as observed in the oracle.** The table below is observed
+    by `crates/zerodb-oracle/tests/lmdb_reaping_observation.rs`, which
+    SIGKILLs a reader process and then checks whether `mdb_reader_list` still
+    shows its slot. Results are identical on macOS aarch64 and Linux x86-64
+    and stable over repeated runs. ZeroDB reaps at exactly these points:
 
     | Event after a reader process died | LMDB reaps? |
     |---|---|
-    | (filled by stage-2 Task 2) | |
+    | Read transaction begin | No |
+    | Write transaction commit | No |
+    | Another process opening and closing the environment | No |
+    | Reader table full (`ReadersFull`) | No: the error is returned, no reap-and-retry |
+    | Writer takeover after the previous writer died (Linux; the robust writer mutex reports the dead owner) | Yes |
+    | First opener of the environment | Yes: the lock table is reinitialized |
+    | Explicit `mdb_reader_check` | Yes |
+
+    On macOS the fork's writer mutex is not robust, so a dead writer blocks
+    the next one and there is no takeover point. `mdb_reader_check` counts
+    slots, not processes: a process that died holding two reader slots
+    reports 2.
 
 13. **`reader_list` reports the owner PID** (`ReaderEntry::pid`). It is
     `None` on the default path, and for a slot being claimed or released.
