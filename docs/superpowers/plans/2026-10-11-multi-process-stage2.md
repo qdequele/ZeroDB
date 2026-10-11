@@ -1111,20 +1111,50 @@ Under loom the local `Slot` already has a loom `pid` word. A model plays several
             assert_eq!(t.oldest(), None);
         });
     }
+    /// L11 — PID reuse (ADR-0023 amendment 14): a reaper holding a stale
+    /// "dead" verdict on PID 2 races a new process that also has PID 2,
+    /// which frees its predecessor's slot and re-claims it. The claim
+    /// generation makes the reaper's CAS fail: the new process's pin
+    /// survives in every interleaving.
+    #[test]
+    fn loom_l11_reaper_vs_same_pid_reclaim() {
+        loom::model(|| {
+            let t = Arc::new(ReaderTable::new(1));
+            let s = t.claim_as(Some(2)).unwrap();
+            t.store_pin(s, 5); // the old process 2 pinned 5, then died
+            let t2 = Arc::clone(&t);
+            // The reaper's probe answered "dead" for the old process 2.
+            let reaper = thread::spawn(move || t2.reap_dead(3, |_| Ok(false)).unwrap());
+            // The new process 2 frees its predecessor's slot, then claims.
+            let own = t.reap_own_stale(2);
+            let mine = t.claim_as(Some(2));
+            if let Some(slot) = mine {
+                t.store_pin(slot, 6);
+            }
+            let reaped = reaper.join().unwrap();
+            assert_eq!(own + reaped, 1, "the old slot is freed exactly once");
+            if let Some(slot) = mine {
+                assert_eq!(t.raw(slot), 6, "a reaper freed the new process's live slot");
+            }
+        });
+    }
+
 ```
 
-Update the header comment of `mod loom_tests` (search for "L1–L5"), and the module doc at the top of `readers.rs`, to say L1–L10.
+Update the header comment of `mod loom_tests` (search for "L1–L5"), and the module doc at the top of `readers.rs`, to say L1–L11.
 
 - [ ] **Step 2: Run loom**
 
 Run: `just loom`
-Expected: `loom_l1`…`loom_l10` all pass. If the registry cache misbehaves, use `CARGO_HOME=<scratchpad>/cargo-home just loom` (memory: cargo-registry-cache-corrupted).
+Expected: `loom_l1`…`loom_l11` all pass. If the registry cache misbehaves, use `CARGO_HOME=<scratchpad>/cargo-home just loom` (memory: cargo-registry-cache-corrupted).
 
 - [ ] **Step 3: Mutation check (do not commit the mutation)**
 
 Temporarily revert `release_as` to the §3 order: `pid = 0`, then `FREE`, with no `CLAIMED` store. Rerun `just loom`. All models still pass, because amendment 7 is about process death between the stores, which loom does not model. Record this in the commit message.
 
 Next, temporarily change the CAS in `reap_dead` to a plain `rs.pid().store(reaper, …)`. Rerun: `loom_l6` or `loom_l10` must fail. Revert.
+
+Then temporarily drop the generation increment in `claim_as` (store `owner_word(owner_generation(w), pid)`). Rerun: `loom_l11` must fail. Revert.
 
 - [ ] **Step 4: Commit**
 
