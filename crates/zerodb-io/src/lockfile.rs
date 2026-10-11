@@ -115,45 +115,109 @@ impl std::error::Error for LockOpenError {
     }
 }
 
-/// The lock-file paths this process has open. A poisoned registry is still
-/// consistent (insert and remove do not panic midway), so poison is ignored.
-fn open_paths() -> MutexGuard<'static, HashSet<PathBuf>> {
-    static PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    PATHS
+/// The lock files this process has open, by [`RegistryKey`]. A poisoned
+/// registry is still consistent (insert and remove do not panic midway), so
+/// poison is ignored.
+fn open_files() -> MutexGuard<'static, HashSet<RegistryKey>> {
+    static FILES: OnceLock<Mutex<HashSet<RegistryKey>>> = OnceLock::new();
+    FILES
         .get_or_init(|| Mutex::new(HashSet::new()))
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
 }
 
-/// This process's claim on one lock-file path in the registry. Dropping it
-/// removes the path, so every error path and every [`LockFile`] drop releases
-/// it exactly once.
+/// How the registry identifies one lock file.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RegistryKey {
+    /// An existing file, by device and inode number. Every name of the file
+    /// (another spelling of the path, a symbolic link, a hard link) has the
+    /// same identity.
+    File { dev: u64, ino: u64 },
+    /// A file that does not exist yet, by its canonical directory joined with
+    /// its file name. A missing file cannot be another name of a file this
+    /// process has open: that file exists for as long as the descriptor is
+    /// open.
+    Missing(PathBuf),
+}
+
+/// This process's claim on one lock file in the registry. Dropping it removes
+/// the entry, so every error path and every [`LockFile`] drop releases it
+/// exactly once.
 struct Registration {
-    key: PathBuf,
+    key: RegistryKey,
 }
 
 impl Registration {
-    /// Claim `path`, keyed by its canonical directory so two spellings of one
-    /// file share an entry. Fails with `AlreadyOpen` if already claimed.
+    /// Claim the lock file at `path`, keyed by its file identity (see
+    /// [`registry_key`]) so that every name of one file shares an entry.
+    /// Fails with `AlreadyOpen` if already claimed.
     fn claim(path: &Path) -> Result<Registration, LockOpenError> {
         let key = registry_key(path)?;
-        if !open_paths().insert(key.clone()) {
+        if !open_files().insert(key.clone()) {
             return Err(LockOpenError::AlreadyOpen);
         }
         Ok(Registration { key })
+    }
+
+    /// Re-key this claim by the identity of `file`, the descriptor just
+    /// opened for it. A claim made while the file did not exist is keyed by
+    /// path; once the open has created the file, keying it by identity is
+    /// what makes a later hard or symbolic link to it collide. The identity
+    /// can also differ from the one `stat`ed in [`Registration::claim`] if
+    /// the name was replaced in between.
+    ///
+    /// Fails with `AlreadyOpen` if another claim of this process already
+    /// holds that identity. The caller must then not close `file`: closing it
+    /// would drop the other handle's record locks.
+    fn rekey(&mut self, file: &File) -> Result<(), LockOpenError> {
+        use std::os::unix::fs::MetadataExt;
+        let m = file.metadata()?;
+        let key = RegistryKey::File {
+            dev: m.dev(),
+            ino: m.ino(),
+        };
+        if key == self.key {
+            return Ok(());
+        }
+        let mut files = open_files();
+        if !files.insert(key.clone()) {
+            return Err(LockOpenError::AlreadyOpen);
+        }
+        files.remove(&self.key);
+        self.key = key;
+        Ok(())
     }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        open_paths().remove(&self.key);
+        open_files().remove(&self.key);
     }
 }
 
-/// The canonical path of the directory holding `path`, joined with the file
-/// name. Only the directory is canonicalized because the file may not exist
-/// yet.
-fn registry_key(path: &Path) -> std::io::Result<PathBuf> {
+/// The registry key of the lock file at `path`, computed without opening a
+/// descriptor (opening one and closing it again would drop this process's
+/// record locks on that file, ADR-0023 amendment 2).
+///
+/// An existing file is keyed by `(st_dev, st_ino)` from a `stat` that follows
+/// symbolic links, so a symbolic link, a hard link or another spelling of a
+/// file this process has open is refused. A file that does not exist is keyed
+/// by its canonical directory joined with its file name (only the directory
+/// can be canonicalized). If another process creates the file between this
+/// `stat` and the open, this process still holds no other entry for that
+/// inode, because it had no descriptor to it.
+fn registry_key(path: &Path) -> std::io::Result<RegistryKey> {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(path) {
+        Ok(m) => {
+            return Ok(RegistryKey::File {
+                dev: m.dev(),
+                ino: m.ino(),
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let name = path.file_name().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -164,7 +228,7 @@ fn registry_key(path: &Path) -> std::io::Result<PathBuf> {
         Some(d) if !d.as_os_str().is_empty() => d,
         _ => Path::new("."),
     };
-    Ok(dir.canonicalize()?.join(name))
+    Ok(RegistryKey::Missing(dir.canonicalize()?.join(name)))
 }
 
 /// The mapped lock file. Field order matters for `Drop`: the map is
@@ -192,21 +256,31 @@ impl LockFile {
     ///
     /// # Errors
     ///
-    /// [`LockOpenError::AlreadyOpen`] if this process has it open,
-    /// [`LockOpenError::Mismatch`] on a format or `max_readers` mismatch, and
-    /// I/O errors.
+    /// [`LockOpenError::AlreadyOpen`] if this process has it open (under any
+    /// name), [`LockOpenError::Mismatch`] on a format or `max_readers`
+    /// mismatch, an [`LockOpenError::Io`] of kind `TimedOut` when the election
+    /// retries run out before any process finishes initializing the file, and
+    /// other I/O errors.
     pub fn open(path: &Path, max_readers: u32) -> Result<Arc<LockFile>, LockOpenError> {
         // Claimed before any descriptor exists: POSIX record locks belong to
         // the process, and closing a second descriptor would drop the first
         // handle's locks (ADR-0023 amendment 2). On every error below the
         // registration (or the `LockFile` owning it) drops and releases it.
-        let registration = Registration::claim(path)?;
+        let mut registration = Registration::claim(path)?;
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path)?;
+        if let Err(e) = registration.rekey(&file) {
+            // The descriptor reached a file this process already has open
+            // (its name was replaced by a link to it between the `stat` and
+            // the open). Closing it would drop that handle's record locks, so
+            // the descriptor is leaked instead.
+            std::mem::forget(file);
+            return Err(e);
+        }
         /// How often a joiner that finds a half-built lock file retries the
         /// election before failing (ADR-0023 amendment 10).
         const ELECTION_RETRIES: u32 = 100;
@@ -226,19 +300,28 @@ impl LockFile {
             if record_lock(&file, libc::F_SETLK, WRLCK, ELECTION_BYTE)? {
                 break true;
             }
-            // Another process holds the byte too. If the initializer
-            // finished, the magic is set; otherwise it died mid-way and the
-            // other holder is a joiner in the same position. Drop the lock
-            // and retry the election so one of them initializes.
+            // Another process holds the byte too. If the magic is not set,
+            // the initializer died mid-way and the other holder is a joiner
+            // in the same position: drop the lock and retry the election so
+            // one of them initializes. A set magic usually means the
+            // initializer finished, but it may also be left over from a
+            // previous run: an initializer may have died before truncating,
+            // or every process may have exited while this joiner waited.
+            // Joiners that collide then adopt the previous run's table. That
+            // is the same state as joining a table whose processes all
+            // exited, which the protocol tolerates: `T` is the last published
+            // value, dead PIDs are reapable, and a stale writer word is taken
+            // over (ADR-0023 amendment 10).
             if read_u64_at(&file, OFF_MAGIC)? == LOCK_MAGIC {
                 break false;
             }
             record_lock(&file, libc::F_SETLK, UNLCK, ELECTION_BYTE)?;
             attempt += 1;
             if attempt == ELECTION_RETRIES {
-                return Err(LockOpenError::Mismatch(
-                    "lock file never finished initializing".into(),
-                ));
+                return Err(LockOpenError::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "lock file never finished initializing",
+                )));
             }
             // Stagger retries by PID so two joiners do not keep colliding.
             std::thread::sleep(std::time::Duration::from_millis(
@@ -390,9 +473,9 @@ impl SharedRegion for LockFile {
         // - Length: `open` maps exactly `OFF_SLOTS + SLOT_STRIDE * slots`
         //   bytes, and `SLOT_STRIDE == size_of::<ReaderSlot>()`, so the slice
         //   lies inside the mapping.
-        // - Validity: `ReaderSlot` is `repr(C)` with an `AtomicU64` at +0, an
-        //   `AtomicU32` at +8 and `AtomicU8` padding; every bit pattern is a
-        //   valid value of each.
+        // - Validity: `ReaderSlot` is `repr(C)` with an `AtomicU64` txnid at
+        //   +0, an `AtomicU64` owner word at +8 and `AtomicU8` padding; every
+        //   bit pattern is a valid value of each.
         // - Lifetime: the slice borrows `self`, and the mapping lives as long
         //   as `self` and is never remapped.
         // - Aliasing: other processes may write any byte of a slot
@@ -730,6 +813,33 @@ mod tests {
         let other = dir.join(".").join("zerodb.lock");
         assert!(matches!(
             LockFile::open(&other, 4),
+            Err(LockOpenError::AlreadyOpen)
+        ));
+    }
+
+    /// A hard link names the same file under another name. Opening it would
+    /// give this process a second descriptor to its own lock file.
+    #[test]
+    fn a_hard_link_to_an_open_lock_file_is_refused() {
+        let path = tmp();
+        let _a = LockFile::open(&path, 4).expect("open");
+        let link = path.parent().unwrap().join("hard-link.lock");
+        std::fs::hard_link(&path, &link).unwrap();
+        assert!(matches!(
+            LockFile::open(&link, 4),
+            Err(LockOpenError::AlreadyOpen)
+        ));
+    }
+
+    /// The same through a symbolic link.
+    #[test]
+    fn a_symlink_to_an_open_lock_file_is_refused() {
+        let path = tmp();
+        let _a = LockFile::open(&path, 4).expect("open");
+        let link = path.parent().unwrap().join("sym-link.lock");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(matches!(
+            LockFile::open(&link, 4),
             Err(LockOpenError::AlreadyOpen)
         ));
     }
