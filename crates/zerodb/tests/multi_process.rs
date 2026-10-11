@@ -140,6 +140,34 @@ fn child_entry() {
                 w.commit().unwrap();
             }
         }
+        "write_many" => {
+            // Rewrite a run of keys the parent seeded, so this commit moves
+            // pages a stale writer in the parent would overwrite.
+            let mut w = env.write_txn().unwrap();
+            for i in 0..200u32 {
+                db.put(&mut w, format!("k{i:04}").as_bytes(), b"child")
+                    .unwrap();
+            }
+            db.put(&mut w, b"from-child", b"1").unwrap();
+            w.commit().unwrap();
+        }
+        "write_after_parent" => {
+            // Open first, then let the parent commit, then write on top.
+            mark(&dir, "child-open");
+            wait_for(&dir.join("parent-committed"), Duration::from_secs(30));
+            let mut w = env.write_txn().unwrap();
+            assert_eq!(
+                db.get(&w, b"from-parent").unwrap(),
+                Some(&b"1"[..]),
+                "the child's write txn misses the parent's commit"
+            );
+            for i in 0..200u32 {
+                db.put(&mut w, format!("k{i:04}").as_bytes(), b"child")
+                    .unwrap();
+            }
+            db.put(&mut w, b"from-child", b"1").unwrap();
+            w.commit().unwrap();
+        }
         "write_when_free" => {
             mark(&dir, "child-waiting");
             let mut w = env.write_txn().unwrap(); // blocks while the parent writes
@@ -167,6 +195,74 @@ fn commit_in_one_process_is_visible_in_another() {
         env.main_database().get(&r, b"from-child").unwrap(),
         Some(&b"1"[..])
     );
+}
+
+/// Seed 200 keys so the tree spans several pages.
+fn seed(env: &Env) {
+    let db = env.main_database();
+    let mut w = env.write_txn().unwrap();
+    for i in 0..200u32 {
+        db.put(
+            &mut w,
+            format!("k{i:04}").as_bytes(),
+            format!("seed{i}").repeat(10).as_bytes(),
+        )
+        .unwrap();
+    }
+    w.commit().unwrap();
+}
+
+/// Both processes' keys are present and the file is consistent.
+fn assert_both_writes(env: &Env, dir: &Path) {
+    let db = env.main_database();
+    let r = env.read_txn().unwrap();
+    assert_eq!(db.get(&r, b"from-child").unwrap(), Some(&b"1"[..]));
+    assert_eq!(db.get(&r, b"from-parent").unwrap(), Some(&b"1"[..]));
+    for i in 0..200u32 {
+        assert!(
+            db.get(&r, format!("k{i:04}").as_bytes()).unwrap().is_some(),
+            "key {i} lost"
+        );
+    }
+    drop(r);
+    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).unwrap();
+    let problems = zerodb::check::check_image(&bytes, 4096);
+    assert!(problems.is_empty(), "check_image: {problems:?}");
+}
+
+#[test]
+fn writer_builds_on_another_processes_commit() {
+    let dir = TempDir::new();
+    let env = open(dir.path());
+    seed(&env);
+    // The parent's env was open (and had committed) before the child's commit.
+    assert!(child("write_many", dir.path()).wait().unwrap().success());
+    let db = env.main_database();
+    let mut w = env.write_txn().unwrap();
+    assert_eq!(
+        db.get(&w, b"from-child").unwrap(),
+        Some(&b"1"[..]),
+        "the parent's write txn misses the child's commit"
+    );
+    db.put(&mut w, b"from-parent", b"1").unwrap();
+    w.commit().unwrap();
+    assert_both_writes(&env, dir.path());
+}
+
+#[test]
+fn other_process_writer_builds_on_this_processes_commit() {
+    let dir = TempDir::new();
+    let env = open(dir.path());
+    seed(&env);
+    let mut c = child("write_after_parent", dir.path());
+    wait_for(&dir.path().join("child-open"), Duration::from_secs(30));
+    let db = env.main_database();
+    let mut w = env.write_txn().unwrap();
+    db.put(&mut w, b"from-parent", b"1").unwrap();
+    w.commit().unwrap();
+    mark(dir.path(), "parent-committed");
+    assert!(c.wait().unwrap().success());
+    assert_both_writes(&env, dir.path());
 }
 
 #[test]
