@@ -1686,8 +1686,8 @@ impl EnvClosingEvent {
 // ---------------------------------------------------------------------------
 
 /// Upper bound accepted for `max_readers` (SPEC 00 row 5, SPEC 04 TXN-14).
-/// The reader table eagerly allocates one cache-padded slot (128 bytes on
-/// aarch64) per reader — 1 Mi slots is 128 MiB, already far beyond any real
+/// The reader table eagerly allocates one cache-padded slot (128 bytes,
+/// `ReaderSlot`) per reader — 1 Mi slots is 128 MiB, already far beyond any real
 /// configuration; anything larger is treated as a caller bug
 /// (`Io(InvalidInput)`) rather than an allocation-failure abort.
 pub const MAX_READERS_LIMIT: u32 = 1 << 20;
@@ -2528,10 +2528,13 @@ mod shared_env_tests {
         assert_eq!(env.inner.snapshot().txnid, 4);
         let (snap, slot) = env.inner.pin_reader().expect("pin");
         assert_eq!(snap.txnid, 4);
-        assert_eq!(region.slot_txnid(slot).load(O::SeqCst), 4);
-        assert_eq!(region.slot_pid(slot).load(O::SeqCst), 2);
+        assert_eq!(region.slots()[slot as usize].txnid().load(O::SeqCst), 4);
+        assert_eq!(region.slots()[slot as usize].pid().load(O::SeqCst), 2);
         env.inner.release_reader(slot);
-        assert_eq!(region.slot_txnid(slot).load(O::SeqCst), RDR_FREE);
+        assert_eq!(
+            region.slots()[slot as usize].txnid().load(O::SeqCst),
+            RDR_FREE
+        );
     }
 
     #[test]
@@ -2603,9 +2606,9 @@ mod shared_env_tests {
             env.inner.current_snapshot(),
             Err(Error::Mdb(MdbError::Invalid))
         ));
-        for i in 0..region.slot_count() {
-            assert_eq!(region.slot_txnid(i).load(O::SeqCst), RDR_FREE);
-            assert_eq!(region.slot_pid(i).load(O::SeqCst), 0);
+        for rs in region.slots() {
+            assert_eq!(rs.txnid().load(O::SeqCst), RDR_FREE);
+            assert_eq!(rs.pid().load(O::SeqCst), 0);
         }
     }
 

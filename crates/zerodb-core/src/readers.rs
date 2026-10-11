@@ -22,9 +22,35 @@
 
 use std::sync::Arc;
 
-use crossbeam_utils::CachePadded;
-
 use crate::env::Snapshot;
+#[cfg(not(loom))]
+use crate::shared::ReaderSlot as Slot;
+
+/// The local slot type under loom: [`crate::shared::ReaderSlot`]'s fields and
+/// accessors over loom's atomics, which loom must see to model the protocol.
+/// The shipped build uses `ReaderSlot` itself, whose `std` atomics have the
+/// fixed lock-file layout (ADR-0023 §3).
+#[cfg(loom)]
+struct Slot {
+    txnid: AtomicU64,
+    pid: crate::sync::AtomicU32,
+}
+
+#[cfg(loom)]
+impl Slot {
+    fn new_free() -> Slot {
+        Slot {
+            txnid: AtomicU64::new(RDR_FREE),
+            pid: crate::sync::AtomicU32::new(0),
+        }
+    }
+    fn txnid(&self) -> &AtomicU64 {
+        &self.txnid
+    }
+    fn pid(&self) -> &crate::sync::AtomicU32 {
+        &self.pid
+    }
+}
 use crate::sync::{AtomicU64, Mutex, Ordering};
 
 /// Slot sentinel: unoccupied (SPEC 04 TXN-14).
@@ -51,9 +77,10 @@ pub(crate) const MAX_COMMITTED_TXNID: u64 = RDR_CLAIMED - (1 << 32);
 pub(crate) const RDR_CLAIMED: u64 = u64::MAX - 1;
 
 /// Where the reader slots live: on this process's heap (the default), or in a
-/// lock file shared with other processes (ADR-0023).
+/// lock file shared with other processes (ADR-0023). Every operation resolves
+/// this once, to a slot slice, and then walks the slice directly.
 enum Slots {
-    Local(Box<[CachePadded<AtomicU64>]>),
+    Local(Box<[Slot]>),
     // loom models the in-process protocol only; the shared region holds
     // `std` atomics that loom cannot instrument.
     #[cfg(not(loom))]
@@ -68,13 +95,17 @@ enum Slots {
 /// `< RDR_CLAIMED`: ids start at 1 and grow by one per commit). One word per
 /// slot means every observation of a slot is atomic — a state+txnid two-field
 /// design would admit torn observations and need its own inter-field ordering
-/// protocol (ADR-0006 D1). `CachePadded` (≥ 64-byte alignment; 128 on
-/// aarch64) keeps a pinning reader's store and the writer's scan off each
-/// other's cache lines (TXN-14). A table opened with [`ReaderTable::new_shared`]
-/// keeps the same per-slot layout, but the slots themselves live in a region
-/// shared with other processes (ADR-0023 §3) instead of on this heap.
+/// protocol (ADR-0006 D1). Each [`crate::shared::ReaderSlot`] is 64-byte
+/// aligned and 128 bytes long, which keeps a pinning reader's store and the
+/// writer's scan off each other's cache lines (TXN-14). A table opened with
+/// [`ReaderTable::new_shared`] has the same slot layout, but the slots live in
+/// a region shared with other processes (ADR-0023 §3) instead of on this heap.
 pub(crate) struct ReaderTable {
     slots: Slots,
+    /// This process's PID when the slots are shared (ADR-0023 §3): a claim
+    /// records it in the slot's owner field and a release clears it. `None`
+    /// for a local table, whose owner field is never written.
+    owner_pid: Option<u32>,
     /// LMDB `MDB_txninfo::mti_numreaders` parity: the
     /// **high-water** slot count, i.e. `max(claimed slot index) + 1` over the
     /// env's lifetime. See [`ReaderTable::num_readers`] for why this is a
@@ -86,11 +117,12 @@ impl ReaderTable {
     /// Allocate the table with every slot `RDR_FREE`.
     pub(crate) fn new(max_readers: u32) -> ReaderTable {
         let slots = (0..max_readers)
-            .map(|_| CachePadded::new(AtomicU64::new(RDR_FREE)))
+            .map(|_| Slot::new_free())
             .collect::<Vec<_>>()
             .into_boxed_slice();
         ReaderTable {
             slots: Slots::Local(slots),
+            owner_pid: None,
             high_water: AtomicU64::new(0),
         }
     }
@@ -102,27 +134,22 @@ impl ReaderTable {
     pub(crate) fn new_shared(
         region: std::sync::Arc<dyn crate::shared::SharedRegion>,
     ) -> ReaderTable {
+        let pid = region.pid();
         ReaderTable {
             slots: Slots::Shared(region),
+            owner_pid: Some(pid),
             high_water: AtomicU64::new(0),
         }
     }
 
-    /// Slot `i`'s txnid word, regardless of where it is stored.
-    fn slot(&self, i: usize) -> &AtomicU64 {
+    /// The slot array, wherever it is stored. Resolved once per operation;
+    /// callers then walk or index the slice directly.
+    #[inline]
+    fn slots(&self) -> &[Slot] {
         match &self.slots {
-            Slots::Local(s) => &s[i],
+            Slots::Local(s) => s,
             #[cfg(not(loom))]
-            Slots::Shared(r) => r.slot_txnid(i as u32),
-        }
-    }
-
-    /// The table's slot count, regardless of where the slots are stored.
-    fn len(&self) -> usize {
-        match &self.slots {
-            Slots::Local(s) => s.len(),
-            #[cfg(not(loom))]
-            Slots::Shared(r) => r.slot_count() as usize,
+            Slots::Shared(r) => r.slots(),
         }
     }
 
@@ -145,8 +172,8 @@ impl ReaderTable {
     /// nor the writer's [`ReaderTable::oldest`] scan consults it — both still
     /// walk every slot, unconditionally.
     pub(crate) fn claim(&self) -> Option<u32> {
-        for i in 0..self.len() {
-            let slot = self.slot(i);
+        for (i, rs) in self.slots().iter().enumerate() {
+            let slot = rs.txnid();
             // Relaxed pre-filter: a pure optimization to skip occupied slots
             // without a CAS. Carries no ordering obligation — the CAS below
             // is the sole authority on the slot's state.
@@ -165,12 +192,11 @@ impl ReaderTable {
                 .compare_exchange(RDR_FREE, RDR_CLAIMED, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                #[cfg(not(loom))]
-                if let Slots::Shared(r) = &self.slots {
+                if let Some(pid) = self.owner_pid {
                     // Release: a later reaper (ADR-0023 §3, stage 2) loads the
                     // PID with Acquire before judging the slot; this store
                     // must be visible no later than the pin that follows it.
-                    r.slot_pid(i as u32).store(r.pid(), Ordering::Release);
+                    rs.pid().store(pid, Ordering::Release);
                 }
                 // `mti_numreaders` parity: LMDB bumps its counter only
                 // when the first-fit scan lands *past* the current high-water
@@ -202,7 +228,9 @@ impl ReaderTable {
             txnid < RDR_CLAIMED,
             "a real snapshot txnid never reaches the sentinel band (TXN-14)"
         );
-        self.slot(slot as usize).store(txnid, Ordering::SeqCst);
+        self.slots()[slot as usize]
+            .txnid()
+            .store(txnid, Ordering::SeqCst);
     }
 
     /// Release an owned slot (SPEC 04 TXN-18a): store `RDR_FREE` with
@@ -217,8 +245,8 @@ impl ReaderTable {
     /// have done), never larger, so it can never authorize reclaiming a page
     /// a live reader needs (TXN-20, closing paragraph). Exercised by loom L3.
     pub(crate) fn release(&self, slot: u32) {
-        #[cfg(not(loom))]
-        if let Slots::Shared(r) = &self.slots {
+        let rs = &self.slots()[slot as usize];
+        if self.owner_pid.is_some() {
             // PID cleared *before* the slot reads FREE (ADR-0023 §3). The FREE
             // store below is Release, so whoever *acquires* FREE — the next
             // claimer's Acquire CAS in `claim` — also observes PID 0 and then
@@ -226,9 +254,9 @@ impl ReaderTable {
             // slot to this (possibly later dead) process. `claim`'s Relaxed
             // pre-filter load of FREE carries no such guarantee; only the
             // CAS that wins the slot does.
-            r.slot_pid(slot).store(0, Ordering::Release);
+            rs.pid().store(0, Ordering::Release);
         }
-        self.slot(slot as usize).store(RDR_FREE, Ordering::Release);
+        rs.txnid().store(RDR_FREE, Ordering::Release);
     }
 
     /// The minimum pinned snapshot txnid across all slots, or `None` if no
@@ -257,8 +285,8 @@ impl ReaderTable {
     /// once per write txn (TXN-22 caching, ADR-0006 decision 6).
     pub(crate) fn oldest(&self) -> Option<u64> {
         let mut oldest: Option<u64> = None;
-        for i in 0..self.len() {
-            let v = self.slot(i).load(Ordering::SeqCst);
+        for rs in self.slots() {
+            let v = rs.txnid().load(Ordering::SeqCst);
             if v == RDR_FREE || v == RDR_CLAIMED {
                 continue;
             }
@@ -298,7 +326,7 @@ impl ReaderTable {
     /// The table's fixed slot count — `max_readers` as configured at open
     /// (TXN-14; `mdb_env_get_maxreaders` / `MDB_envinfo::me_maxreaders`).
     pub(crate) fn capacity(&self) -> u32 {
-        self.len() as u32
+        self.slots().len() as u32
     }
 
     /// `MDB_envinfo::me_numreaders` parity.
@@ -335,8 +363,9 @@ impl ReaderTable {
     /// word (TXN-17/19/20); the cost is irrelevant on a diagnostic path and
     /// using a weaker ordering here would need its own justification.
     pub(crate) fn in_use(&self) -> u32 {
-        (0..self.len())
-            .filter(|&i| self.slot(i).load(Ordering::SeqCst) != RDR_FREE)
+        self.slots()
+            .iter()
+            .filter(|rs| rs.txnid().load(Ordering::SeqCst) != RDR_FREE)
             .count() as u32
     }
 
@@ -363,8 +392,8 @@ impl ReaderTable {
     /// irrelevant on a diagnostic path.
     pub(crate) fn list(&self) -> Vec<(u32, Option<u64>)> {
         let mut out = Vec::new();
-        for i in 0..self.len() {
-            match self.slot(i).load(Ordering::SeqCst) {
+        for (i, rs) in self.slots().iter().enumerate() {
+            match rs.txnid().load(Ordering::SeqCst) {
                 RDR_FREE => {}
                 RDR_CLAIMED => out.push((i as u32, None)),
                 txnid => out.push((i as u32, Some(txnid))),
@@ -376,7 +405,7 @@ impl ReaderTable {
     /// Raw slot value (tests only).
     #[cfg(test)]
     pub(crate) fn raw(&self, slot: u32) -> u64 {
-        self.slot(slot as usize).load(Ordering::SeqCst)
+        self.slots()[slot as usize].txnid().load(Ordering::SeqCst)
     }
 }
 
@@ -612,13 +641,22 @@ mod tests {
         let t = ReaderTable::new_shared(region.clone());
         assert_eq!(t.capacity(), 2);
         let s = t.claim().expect("slot");
-        assert_eq!(region.slot_pid(s).load(Ordering::SeqCst), 4242);
-        assert_eq!(region.slot_txnid(s).load(Ordering::SeqCst), RDR_CLAIMED);
+        assert_eq!(
+            region.slots()[s as usize].pid().load(Ordering::SeqCst),
+            4242
+        );
+        assert_eq!(
+            region.slots()[s as usize].txnid().load(Ordering::SeqCst),
+            RDR_CLAIMED
+        );
         t.store_pin(s, 7);
         assert_eq!(t.oldest(), Some(7));
         t.release(s);
-        assert_eq!(region.slot_pid(s).load(Ordering::SeqCst), 0);
-        assert_eq!(region.slot_txnid(s).load(Ordering::SeqCst), RDR_FREE);
+        assert_eq!(region.slots()[s as usize].pid().load(Ordering::SeqCst), 0);
+        assert_eq!(
+            region.slots()[s as usize].txnid().load(Ordering::SeqCst),
+            RDR_FREE
+        );
         assert_eq!(t.oldest(), None);
     }
 
@@ -627,8 +665,8 @@ mod tests {
         use crate::shared::{HeapRegion, SharedRegion};
         let region = Arc::new(HeapRegion::new(3, 1, true));
         // Slot 2 pinned at txnid 5 by "another process" (written directly).
-        region.slot_pid(2).store(99, Ordering::SeqCst);
-        region.slot_txnid(2).store(5, Ordering::SeqCst);
+        region.slots()[2].pid().store(99, Ordering::SeqCst);
+        region.slots()[2].txnid().store(5, Ordering::SeqCst);
         let t = ReaderTable::new_shared(region.clone());
         let mine = t.claim().expect("slot");
         assert_eq!(mine, 0);

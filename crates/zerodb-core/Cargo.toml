@@ -13,9 +13,6 @@ categories = ["database-implementations"]
 
 [dependencies]
 thiserror.workspace = true
-# Cache-line padding for the reader-table slots (SPEC 04 TXN-14; ADR-0006 D1).
-# On the AGENTS.md dependency allowlist.
-crossbeam-utils.workspace = true
 
 # loom is compiled ONLY under `RUSTFLAGS="--cfg loom"` (`just loom`) — never in
 # a normal, miri, or release build. Sanctioned by ADR-0006 (test infrastructure

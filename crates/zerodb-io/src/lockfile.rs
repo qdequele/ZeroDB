@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use zerodb_core::shared::{SharedRegion, READER_SLOT_FREE};
+use zerodb_core::shared::{ReaderSlot, SharedRegion, READER_SLOT_FREE, READER_SLOT_SIZE};
 
 const LOCK_MAGIC: u64 = u64::from_le_bytes(*b"ZDBLOCK1");
 const LOCK_FORMAT: u32 = 1;
@@ -40,6 +40,14 @@ const OFF_T: usize = 64;
 const OFF_WRITER: usize = 128;
 const OFF_SLOTS: usize = 192;
 const SLOT_STRIDE: usize = 128;
+// The slot table is viewed as a `&[ReaderSlot]` (see `LockFile::slots`): the
+// stride must be the slot type's size, and the table's offset a multiple of
+// its alignment (the map itself is page-aligned).
+const _: () = {
+    assert!(SLOT_STRIDE == READER_SLOT_SIZE);
+    assert!(SLOT_STRIDE == std::mem::size_of::<ReaderSlot>());
+    assert!(OFF_SLOTS.is_multiple_of(std::mem::align_of::<ReaderSlot>()));
+};
 /// Record-lock offset of the election byte.
 const ELECTION_BYTE: i64 = 0;
 /// Record-lock offset of the macOS writer lock.
@@ -229,13 +237,12 @@ impl LockFile {
             slots,
         };
         if initializer {
-            for i in 0..slots {
+            for rs in lock.slots() {
                 // Relaxed: published by the Release store of the magic below,
                 // and no other process can map the file before the election
                 // byte is downgraded.
-                lock.slot_txnid(i)
-                    .store(READER_SLOT_FREE, Ordering::Relaxed);
-                lock.slot_pid(i).store(0, Ordering::Relaxed);
+                rs.txnid().store(READER_SLOT_FREE, Ordering::Relaxed);
+                rs.pid().store(0, Ordering::Relaxed);
             }
             // Relaxed: published by the Release store of the magic below.
             lock.u32_at(OFF_FORMAT)
@@ -353,16 +360,31 @@ impl SharedRegion for LockFile {
     fn published_txnid(&self) -> &AtomicU64 {
         self.u64_at(OFF_T)
     }
-    fn slot_count(&self) -> u32 {
-        self.slots
-    }
-    fn slot_txnid(&self, i: u32) -> &AtomicU64 {
-        assert!(i < self.slots, "reader slot out of range");
-        self.u64_at(OFF_SLOTS + i as usize * SLOT_STRIDE)
-    }
-    fn slot_pid(&self, i: u32) -> &AtomicU32 {
-        assert!(i < self.slots, "reader slot out of range");
-        self.u32_at(OFF_SLOTS + i as usize * SLOT_STRIDE + 8)
+    fn slots(&self) -> &[ReaderSlot] {
+        debug_assert!(OFF_SLOTS + SLOT_STRIDE * self.slots as usize <= self.map.len());
+        // SAFETY:
+        // - Alignment: the map is page-aligned and `OFF_SLOTS` is a multiple
+        //   of `ReaderSlot`'s 64-byte alignment (checked at compile time
+        //   above), so the base pointer is aligned for `ReaderSlot`.
+        // - Length: `open` maps exactly `OFF_SLOTS + SLOT_STRIDE * slots`
+        //   bytes, and `SLOT_STRIDE == size_of::<ReaderSlot>()`, so the slice
+        //   lies inside the mapping.
+        // - Validity: `ReaderSlot` is `repr(C)` with an `AtomicU64` at +0, an
+        //   `AtomicU32` at +8 and plain `u8` padding; every bit pattern is a
+        //   valid value of each.
+        // - Lifetime: the slice borrows `self`, and the mapping lives as long
+        //   as `self` and is never remapped.
+        // - Aliasing: other processes mutate the slot words concurrently, but
+        //   only through atomics (the txnid and PID fields are `UnsafeCell`
+        //   atomics, so shared references to them permit those writes).
+        //   Nobody writes the padding after the initializer's truncation,
+        //   which happens before any process maps the file.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.map.as_mut_ptr().add(OFF_SLOTS).cast::<ReaderSlot>(),
+                self.slots as usize,
+            )
+        }
     }
     fn pid(&self) -> u32 {
         self.pid
@@ -597,10 +619,13 @@ mod tests {
         let path = tmp();
         let l = LockFile::open(&path, 8).expect("open");
         assert!(l.is_initializer());
-        assert_eq!(l.slot_count(), 8);
+        assert_eq!(l.slots().len(), 8);
         for i in 0..8 {
-            assert_eq!(l.slot_txnid(i).load(Ordering::SeqCst), READER_SLOT_FREE);
-            assert_eq!(l.slot_pid(i).load(Ordering::SeqCst), 0);
+            assert_eq!(
+                l.slots()[i].txnid().load(Ordering::SeqCst),
+                READER_SLOT_FREE
+            );
+            assert_eq!(l.slots()[i].pid().load(Ordering::SeqCst), 0);
         }
         assert_eq!(l.published_txnid().load(Ordering::SeqCst), 0);
         assert_eq!(l.pid(), std::process::id());
