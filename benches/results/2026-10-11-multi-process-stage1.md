@@ -448,8 +448,8 @@ checkout was synced at `164e0e9` with no uncommitted changes.
   - ZeroDB stays ahead of LMDB on read-txn begin/abort with the lock file on
     (0.75x).
 - The lock file stays opt-in, so the lock-on increase is a cost on the opt-in
-  path only. It is not a blocker under the task's rule (the default path is the
-  gate), but it is a measured step up from stage 1 and is reported as such.
+  path only. It is not a blocker, because the default path is the gate for this
+  stage, but it is a measured step up from stage 1 and is reported as such.
 
 ### Platform runs (stage 2)
 
@@ -457,4 +457,4 @@ checkout was synced at `164e0e9` with no uncommitted changes.
 |---|---|
 | Linux x86-64 (bench server) | `cargo clippy --workspace --all-targets -- -D warnings` ok; `cargo test --workspace` ok (all suites 0 failed); `multi_process` 5 runs, 15/15 each; `crash-harness --mechanism mp --cycles 2000`: 2007 cycles verified, 0 failures, 173 s; `reader_stress` 180 s ok (3 variants); `multi_process_stress` 180 s ok: commits parent=23544 peer=19606, reaped-reader kills=356, reaped slots=712 |
 | macOS aarch64 | fmt, clippy (host and `x86_64-unknown-linux-gnu`), `cargo test --workspace` (773 passed), miri on `zerodb-core`, `just loom` (15 passed), `crash-test-quick` (229 + 57 cycles verified), `just fuzz-quick` (`diff_ops` 600 s: 49,891 runs; `fuzz_image_open` 120 s: 7,487,334 runs; no crash) all green |
-| Linux aarch64 (Graviton) | **not run.** The instances named in the notes (`i-09be5edd06d7c78a6`, `i-006e6cbbcb4ebf85a`) no longer exist in eu-west-1, so there was no host to start. aarch64 coverage is CI's only. |
+| Linux aarch64 (Graviton) | **not run.** The Graviton test instances no longer exist, so there was no host to start. aarch64 coverage is CI's only. |
