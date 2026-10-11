@@ -1755,6 +1755,40 @@ fn writer_lock_released_on_another_thread_admits_another_process() {
 }
 ```
 
+Add the real takeover-reap test (Task 6 wired it; LMDB reaps at writer takeover on Linux, ADR-0023 amendment 12):
+
+```rust
+/// Linux only: the futex writer lock reports a dead owner's takeover, and
+/// the new writer then reaps dead readers, as the LMDB fork does. On macOS
+/// the `fcntl` writer lock cannot tell a takeover from a normal acquire.
+#[cfg(target_os = "linux")]
+#[test]
+fn writer_takeover_reaps_a_dead_readers_slot() {
+    let dir = TempDir::new();
+    let env = open(dir.path());
+    seed(&env);
+    let mut r = child("hold_readers_and_die", dir.path());
+    wait_for(&dir.path().join("child-reading"), Duration::from_secs(30));
+    let reader_pid = r.id();
+    r.kill().unwrap();
+    r.wait().unwrap();
+    let mut w = child("hold_and_die", dir.path());
+    wait_for(&dir.path().join("child-holds-lock"), Duration::from_secs(30));
+    w.kill().unwrap();
+    w.wait().unwrap();
+    assert!(env.reader_list().iter().any(|e| e.pid == Some(reader_pid)));
+    drop(env.write_txn().expect("take over the dead writer's lock"));
+    assert!(
+        !env.reader_list().iter().any(|e| e.pid == Some(reader_pid)),
+        "the takeover did not reap the dead reader"
+    );
+}
+```
+
+Also add the "never reaps" counterpart: after `hold_readers_and_die` is killed, a plain `env.write_txn()` + commit with no dead writer leaves the dead reader listed (`assert!(env.reader_list().iter().any(|e| e.pid == Some(pid)))`), on every OS.
+
+The expected `clear_stale_readers()` count for the 2-reader child is **2**: LMDB counts slots (`OBS_CHECK_COUNTS_SLOTS = true`).
+
 If the moved `RwTxn` does not compile (`'static` bound on `thread::spawn`), use `std::thread::scope(|s| { s.spawn(move || w.commit().unwrap()); })`.
 
 Add a doc line on the zerodb-io unit test `writer_lock_releases_from_another_thread`, pointing to this test for the macOS case. Leave the unit test itself unchanged.
