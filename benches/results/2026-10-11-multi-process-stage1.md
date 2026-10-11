@@ -344,3 +344,117 @@ F='^(env/txn/|get/|commit/batch/n1/|commit/batch/n100/|commit/sync/)'
 # after without it, rotating the order; then lay out <run>/round-N/{before,after}
 # for each after-variant and run scripts/bench-ab.py <run> --target "$F".
 ```
+
+## Stage 2 (2026-10-12, `164e0e9`)
+
+Stage 2 adds reaping of dead readers' slots and changes the lock-file release
+order (ADR-0023 amendment 7 adds one store to the release). This run checks
+that the default path (lock file off) is still flat against `main`, and measures
+what the lock-file path costs now.
+
+Same three-sided driver as stage 1 (`job3.sh`, retargeted to a new job
+directory), same filter, `CARGO_PROFILE_BENCH_CODEGEN_UNITS=1`, 5 interleaved
+rounds, base `7002d6e` (main), bench server (Xeon E3-1230 v2, turbo off). The
+checkout was synced at `164e0e9` with no uncommitted changes.
+
+### Lock file off (default path)
+
+| rung | LMDB | ZeroDB before | ZeroDB after | vs LMDB before → after | after ÷ before | LMDB drift | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `commit/batch/n1` | 13.722 ms | 20.092 ms | 20.244 ms | 1.46× → **1.48×** | 1.015 (±0.034) | 0.992 | flat |
+| `commit/batch/n100` | 12.337 ms | 12.477 ms | 12.565 ms | 1.01× → **1.02×** | 1.007 (±0.030) | 1.001 | flat |
+| `commit/sync/n1` 🎯 | 295.775 ms | 276.133 ms | 283.816 ms | 0.93× → **0.96×** | 1.014 (±0.080) | 1.027 | flat |
+| `commit/sync/n100` 🎯 | 567.945 ms | 560.906 ms | 593.713 ms | 0.99× → **1.05×** | 0.999 (±0.143) | 0.982 | flat |
+| `env/txn/ro_begin_abort` 🎯 | 1.359 ms | 815.574 µs | 825.127 µs | 0.60× → **0.61×** | 1.012 (±0.030) | 1.079 | ⚠ drift |
+| `env/txn/rw_empty_commit` 🎯 | 75.695 µs | 211.063 µs | 216.501 µs | 2.79× → **2.86×** | 1.026 (±0.052) | 1.012 | flat |
+| `get/access/hot` 🎯 | 1.801 ms | 1.375 ms | 1.378 ms | 0.76× → **0.77×** | 1.002 (±0.030) | 1.003 | flat |
+| `get/access/miss` 🎯 | 1.274 ms | 1.226 ms | 1.229 ms | 0.96× → **0.97×** | 1.003 (±0.030) | 0.996 | flat |
+| `get/access/rand` 🎯 | 3.555 ms | 3.342 ms | 3.372 ms | 0.94× → **0.95×** | 1.010 (±0.030) | 1.007 | flat |
+| `get/access/seq` 🎯 | 1.864 ms | 1.664 ms | 1.657 ms | 0.89× → **0.89×** | 0.996 (±0.030) | 1.004 | flat |
+| `get/db/named` 🎯 | 3.552 ms | 3.348 ms | 3.360 ms | 0.94× → **0.95×** | 1.005 (±0.030) | 1.005 | flat |
+| `get/db/named_x8` 🎯 | 3.253 ms | 3.234 ms | 3.255 ms | 0.99× → **1.00×** | 1.003 (±0.042) | 0.998 | flat |
+| `get/db/root` 🎯 | 3.544 ms | 3.324 ms | 3.340 ms | 0.94× → **0.94×** | 1.003 (±0.030) | 1.010 | flat |
+| `get/key/k128` 🎯 | 4.832 ms | 5.456 ms | 5.476 ms | 1.13× → **1.13×** | 1.005 (±0.038) | 1.010 | flat |
+| `get/key/k32` 🎯 | 3.860 ms | 4.403 ms | 4.383 ms | 1.14× → **1.14×** | 0.994 (±0.058) | 1.005 | flat |
+| `get/key/k8` 🎯 | 3.608 ms | 3.407 ms | 3.430 ms | 0.94× → **0.95×** | 1.004 (±0.060) | 1.003 | flat |
+| `get/size/n1k` 🎯 | 1.767 ms | 1.639 ms | 1.630 ms | 0.93× → **0.92×** | 0.995 (±0.030) | 1.009 | flat |
+| `get/size/n50k` 🎯 | 3.551 ms | 3.355 ms | 3.371 ms | 0.94× → **0.95×** | 1.003 (±0.050) | 1.003 | flat |
+| `get/val/v256` 🎯 | 2.539 ms | 2.377 ms | 2.379 ms | 0.94× → **0.94×** | 1.001 (±0.030) | 1.004 | flat |
+| `get/val/v2page` 🎯 | 2.297 ms | 2.893 ms | 2.876 ms | 1.26× → **1.25×** | 0.995 (±0.030) | 1.008 | flat |
+| `get/val/v2page_touch` 🎯 | 3.231 ms | 3.693 ms | 3.673 ms | 1.14× → **1.14×** | 0.998 (±0.030) | 0.990 | flat |
+| `get/val/v4k` 🎯 | 2.251 ms | 2.880 ms | 2.865 ms | 1.28× → **1.27×** | 0.994 (±0.030) | 1.006 | flat |
+| `get/val/v4k_touch` 🎯 | 3.185 ms | 3.654 ms | 3.631 ms | 1.15× → **1.14×** | 0.993 (±0.030) | 0.992 | flat |
+| `get/val/v8` 🎯 | 2.225 ms | 1.972 ms | 1.956 ms | 0.89× → **0.88×** | 0.992 (±0.030) | 1.004 | flat |
+| `get/val/v8_touch` 🎯 | 2.217 ms | 1.973 ms | 1.969 ms | 0.89× → **0.89×** | 1.001 (±0.030) | 0.990 | flat |
+
+**Verdict: flat**. Improved: 0, regressed: 0, flat: 24, unreliable (LMDB drift > 3%): 1. 5 interleaved round(s); before = `7002d6eb7`, after = `164e0e9e lock_file=off`, host `Linux x86_64`.
+
+### Lock file on
+
+| rung | LMDB | ZeroDB before | ZeroDB after | vs LMDB before → after | after ÷ before | LMDB drift | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `commit/batch/n1` | 13.810 ms | 20.092 ms | 20.771 ms | 1.45× → **1.50×** | 1.034 (±0.041) | 1.001 | flat |
+| `commit/batch/n100` | 12.351 ms | 12.477 ms | 12.633 ms | 1.01× → **1.02×** | 1.017 (±0.030) | 1.002 | flat |
+| `commit/sync/n1` 🎯 | 291.777 ms | 276.133 ms | 277.043 ms | 0.95× → **0.95×** | 1.004 (±0.082) | 1.038 | ⚠ drift |
+| `commit/sync/n100` 🎯 | 557.060 ms | 560.906 ms | 558.146 ms | 1.01× → **1.00×** | 1.003 (±0.098) | 0.956 | ⚠ drift |
+| `env/txn/ro_begin_abort` 🎯 | 1.312 ms | 815.574 µs | 989.410 µs | 0.62× → **0.75×** | 1.213 (±0.030) | 1.034 | ⚠ drift |
+| `env/txn/rw_empty_commit` 🎯 | 75.419 µs | 211.063 µs | 255.894 µs | 2.80× → **3.39×** | 1.166 (±0.101) | 1.009 | ❌ slower |
+| `get/access/hot` 🎯 | 1.801 ms | 1.375 ms | 1.387 ms | 0.76× → **0.77×** | 1.009 (±0.030) | 1.001 | flat |
+| `get/access/miss` 🎯 | 1.274 ms | 1.226 ms | 1.229 ms | 0.96× → **0.97×** | 1.003 (±0.030) | 0.996 | flat |
+| `get/access/rand` 🎯 | 3.558 ms | 3.342 ms | 3.363 ms | 0.94× → **0.95×** | 1.007 (±0.030) | 1.007 | flat |
+| `get/access/seq` 🎯 | 1.869 ms | 1.664 ms | 1.662 ms | 0.89× → **0.89×** | 0.999 (±0.030) | 1.008 | flat |
+| `get/db/named` 🎯 | 3.551 ms | 3.348 ms | 3.369 ms | 0.94× → **0.95×** | 1.005 (±0.030) | 1.001 | flat |
+| `get/db/named_x8` 🎯 | 3.257 ms | 3.234 ms | 3.217 ms | 0.99× → **0.99×** | 0.997 (±0.030) | 0.997 | flat |
+| `get/db/root` 🎯 | 3.536 ms | 3.324 ms | 3.335 ms | 0.94× → **0.94×** | 1.003 (±0.030) | 1.005 | flat |
+| `get/key/k128` 🎯 | 4.818 ms | 5.456 ms | 5.463 ms | 1.13× → **1.13×** | 1.004 (±0.030) | 1.008 | flat |
+| `get/key/k32` 🎯 | 3.862 ms | 4.403 ms | 4.382 ms | 1.14× → **1.13×** | 0.995 (±0.030) | 1.006 | flat |
+| `get/key/k8` 🎯 | 3.610 ms | 3.407 ms | 3.440 ms | 0.94× → **0.95×** | 1.008 (±0.038) | 1.007 | flat |
+| `get/size/n1k` 🎯 | 1.764 ms | 1.639 ms | 1.630 ms | 0.93× → **0.92×** | 0.995 (±0.030) | 0.998 | flat |
+| `get/size/n50k` 🎯 | 3.550 ms | 3.355 ms | 3.384 ms | 0.95× → **0.95×** | 1.008 (±0.047) | 1.006 | flat |
+| `get/val/v256` 🎯 | 2.532 ms | 2.377 ms | 2.382 ms | 0.94× → **0.94×** | 1.002 (±0.030) | 1.003 | flat |
+| `get/val/v2page` 🎯 | 2.295 ms | 2.893 ms | 2.880 ms | 1.26× → **1.26×** | 0.997 (±0.030) | 1.015 | flat |
+| `get/val/v2page_touch` 🎯 | 3.234 ms | 3.693 ms | 3.677 ms | 1.14× → **1.14×** | 0.995 (±0.030) | 0.991 | flat |
+| `get/val/v4k` 🎯 | 2.251 ms | 2.880 ms | 2.863 ms | 1.28× → **1.27×** | 0.993 (±0.030) | 1.009 | flat |
+| `get/val/v4k_touch` 🎯 | 3.179 ms | 3.654 ms | 3.630 ms | 1.15× → **1.14×** | 0.994 (±0.030) | 0.990 | flat |
+| `get/val/v8` 🎯 | 2.228 ms | 1.972 ms | 1.967 ms | 0.88× → **0.88×** | 0.997 (±0.030) | 1.005 | flat |
+| `get/val/v8_touch` 🎯 | 2.220 ms | 1.973 ms | 1.966 ms | 0.89× → **0.89×** | 0.999 (±0.030) | 0.991 | flat |
+
+**Verdict: regressed**. Improved: 0, regressed: 1, flat: 21, unreliable (LMDB drift > 3%): 3. 5 interleaved round(s); before = `7002d6eb7`, after = `164e0e9e lock_file=on`, host `Linux x86_64`.
+
+### Verdict
+
+- **Lock off: `flat`, not a regression.** 24 rungs flat, 1 drift, none
+  regressed. The one `drift` rung is `env/txn/ro_begin_abort`, where LMDB moved
+  +8% between halves in the median round; ZeroDB's after/before is 1.000-1.013 in
+  all five rounds, so it is flat.
+  - `env/txn/ro_begin_abort`: 1.012 (82.5 ns vs 81.6 ns per read txn).
+  - `env/txn/rw_empty_commit`: 1.026 (216.5 ns vs 211.1 ns, +5 ns, inside the
+    0.052 threshold; rounds 0.98-1.05).
+  - `commit/batch/n1`: 1.015 (rounds 1.00-1.04).
+  - Every `get/*` rung is within +-1%.
+  - Stage 1 after the fix had 1.007, 1.000 and 1.001 on those three; the small
+    rise on `rw_empty_commit` is inside noise but is the one number to watch.
+- **Lock on: `regressed`, on `rw_empty_commit` only.** 21 flat, 3 drift.
+  - `env/txn/rw_empty_commit`: 1.166 (255.9 ns vs 211.1 ns, +45 ns per empty
+    write txn; rounds 1.11-1.24, so it holds in every round). Stage 1 after the
+    fix was +20 ns (1.102, flagged flat only because that run's noise band was
+    wider). Stage 2 adds about 25 ns here.
+  - `env/txn/ro_begin_abort`: 1.213 (98.9 ns vs 81.6 ns, +17 ns per read txn;
+    rounds 1.198-1.232). bench-ab marks it `drift` because LMDB moved, but the
+    ZeroDB ratio is stable. Stage 1 after the fix was +15 ns.
+  - `commit/batch/n1`: 1.034 (+0.34 us per commit; rounds 1.005-1.048; flat
+    under its 0.041 threshold). Stage 1 was 1.014 (+0.06 us).
+  - `commit/batch/n100`, `commit/sync/*` and every `get/*` rung are flat.
+  - ZeroDB stays ahead of LMDB on read-txn begin/abort with the lock file on
+    (0.75x).
+- The lock file stays opt-in, so the lock-on increase is a cost on the opt-in
+  path only. It is not a blocker under the task's rule (the default path is the
+  gate), but it is a measured step up from stage 1 and is reported as such.
+
+### Platform runs (stage 2)
+
+| platform | result |
+|---|---|
+| Linux x86-64 (bench server) | `cargo clippy --workspace --all-targets -- -D warnings` ok; `cargo test --workspace` ok (all suites 0 failed); `multi_process` 5 runs, 15/15 each; `crash-harness --mechanism mp --cycles 2000`: 2007 cycles verified, 0 failures, 173 s; `reader_stress` 180 s ok (3 variants); `multi_process_stress` 180 s ok: commits parent=23544 peer=19606, reaped-reader kills=356, reaped slots=712 |
+| macOS aarch64 | fmt, clippy (host and `x86_64-unknown-linux-gnu`), `cargo test --workspace` (773 passed), miri on `zerodb-core`, `just loom` (15 passed), `crash-test-quick` (229 + 57 cycles verified), `just fuzz-quick` (`diff_ops` 600 s: 49,891 runs; `fuzz_image_open` 120 s: 7,487,334 runs; no crash) all green |
+| Linux aarch64 (Graviton) | **not run.** The instances named in the notes (`i-09be5edd06d7c78a6`, `i-006e6cbbcb4ebf85a`) no longer exist in eu-west-1, so there was no host to start. aarch64 coverage is CI's only. |
