@@ -751,14 +751,27 @@ impl EnvInner {
     ///
     /// The I/O error of the underlying lock call; the guard then holds only
     /// the in-process lock.
+    #[inline]
     pub(crate) fn lock_writer_shared<'a>(
         &'a self,
         guard: &mut WriterGuard<'a>,
     ) -> Result<(), Error> {
-        if let Some(region) = &self.shared {
-            region.lock_writer().map_err(Error::Io)?;
-            guard.shared = Some(region.as_ref());
+        match &self.shared {
+            None => Ok(()),
+            Some(region) => Self::lock_writer_region(region.as_ref(), guard),
         }
+    }
+
+    /// The lock-file arm of [`EnvInner::lock_writer_shared`]. Out of line so
+    /// the default (no lock file) write-txn path stays as small as it was
+    /// before lock files existed.
+    #[inline(never)]
+    fn lock_writer_region<'a>(
+        region: &'a dyn crate::shared::SharedRegion,
+        guard: &mut WriterGuard<'a>,
+    ) -> Result<(), Error> {
+        region.lock_writer().map_err(Error::Io)?;
+        guard.shared = Some(region);
         Ok(())
     }
 
@@ -893,10 +906,21 @@ impl EnvInner {
     ///
     /// In a lock-file environment, [`MdbError::Invalid`] when the snapshot at
     /// `T` cannot be decoded or lies outside this process's map or the file.
+    #[inline]
     pub(crate) fn current_snapshot(&self) -> Result<Arc<Snapshot>, Error> {
-        let Some(region) = &self.shared else {
-            return Ok(self.snapshot());
-        };
+        match &self.shared {
+            None => Ok(self.snapshot()),
+            Some(region) => self.current_snapshot_shared(region.as_ref()),
+        }
+    }
+
+    /// The lock-file arm of [`EnvInner::current_snapshot`]: the snapshot at
+    /// the shared `T`. Out of line so the default write-txn path stays small.
+    #[inline(never)]
+    fn current_snapshot_shared(
+        &self,
+        region: &dyn crate::shared::SharedRegion,
+    ) -> Result<Arc<Snapshot>, Error> {
         for _ in 0..META_RETRY_LIMIT {
             // SeqCst: pairs with the committing writer's SeqCst store of T
             // (the same total order as TXN-17/19).
