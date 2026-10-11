@@ -1242,6 +1242,8 @@ mod tests {
 mod loom_tests {
     use super::*;
     use crate::page::DBRecord;
+    use crate::sync::{AtomicU64 as LAtomicU64, Ordering as O};
+    use loom::sync::atomic::AtomicBool;
     use loom::thread;
 
     fn snap(txnid: u64) -> Arc<Snapshot> {
@@ -1419,9 +1421,6 @@ mod loom_tests {
         });
     }
 
-    use crate::sync::{AtomicU64 as LAtomicU64, Ordering as O};
-    use loom::sync::atomic::AtomicBool;
-
     /// L6 — two reapers race on one dead slot: it is freed exactly once
     /// (the counts sum to 1), and afterwards the slot is FREE, unowned and
     /// claimable (ADR-0023 §3, amendment 8).
@@ -1479,9 +1478,11 @@ mod loom_tests {
     }
 
     /// L8 — claim / pin / release by a live process races a reap scan that
-    /// sees no dead owners, against the writer's `oldest()` scan: the scan
-    /// never reports a value other than the live pin or nothing, and a
-    /// reaper never frees a live slot (ADR-0023 §3, TXN-20).
+    /// sees no dead owners, against the writer's `oldest()` scan: the
+    /// reaper's loads do not disturb the live reader's claim, pin or release,
+    /// nor the scan, which reports only the live pin or nothing (ADR-0023 §3,
+    /// TXN-20). That a reaper never frees a live slot is carried by L7 and
+    /// L11.
     #[test]
     fn loom_l8_live_reader_vs_reaper_and_scan() {
         loom::model(|| {
@@ -1522,28 +1523,51 @@ mod loom_tests {
     /// TXN-17/20 and the per-site comments instead.
     #[test]
     fn loom_l9_pin_against_shared_t() {
-        loom::model(|| {
+        use std::sync::atomic::{AtomicBool as StdBool, Ordering as SO};
+        // Set (outside loom's control) when some interleaving makes the
+        // reader reject a meta slot and retry: proves the retry branch of
+        // `pin_against` is explored.
+        let retried = Arc::new(StdBool::new(false));
+        let retried_in = Arc::clone(&retried);
+        loom::model(move || {
+            let retried = Arc::clone(&retried_in);
             let t_word = Arc::new(LAtomicU64::new(5));
             let metas = Arc::new([LAtomicU64::new(4), LAtomicU64::new(5)]);
             let table = Arc::new(ReaderTable::new(1));
             let (tr, wr, mr) = (Arc::clone(&table), Arc::clone(&t_word), Arc::clone(&metas));
             let reader = thread::spawn(move || {
                 let s = tr.claim_as(Some(2)).unwrap();
+                let mut accepted = None;
                 let got: Result<Option<u64>, ()> = tr.pin_against(s, &wr, 4, |t| {
                     // Acquire: a pread after the SeqCst load of T sees the
                     // meta written before T was stored.
                     let m = mr[(t & 1) as usize].load(O::Acquire);
-                    Ok((m == t).then_some(t))
+                    if m == t {
+                        accepted = Some(m);
+                        Ok(Some(t))
+                    } else {
+                        retried.store(true, SO::Relaxed);
+                        Ok(None)
+                    }
                 });
-                (got.unwrap(), tr.raw(s))
+                (got.unwrap(), accepted, tr.raw(s))
             });
-            metas[0].store(6, O::Relaxed); // commit 6 writes meta slot 0
-            t_word.store(6, O::SeqCst); // then publishes T
-            let (resolved, pinned) = reader.join().unwrap();
-            let snap = resolved.expect("4 attempts suffice with one racing commit");
-            assert!(snap == 5 || snap == 6, "resolved {snap}");
+            // Commit 6 overwrites meta slot 0, commit 7 overwrites slot 1
+            // (the slot a reader that loaded T = 5 resolves through).
+            metas[0].store(6, O::Relaxed);
+            t_word.store(6, O::SeqCst);
+            metas[1].store(7, O::Relaxed);
+            t_word.store(7, O::SeqCst);
+            let (resolved, accepted, pinned) = reader.join().unwrap();
+            let snap = resolved.expect("4 attempts suffice with two racing commits");
+            assert!((5..=7).contains(&snap), "resolved {snap}");
+            assert_eq!(accepted, Some(snap), "accepted meta did not hold {snap}");
             assert_eq!(pinned, snap, "pinned {pinned} but resolved {snap}");
         });
+        assert!(
+            retried.load(SO::Relaxed),
+            "no interleaving exercised the meta-mismatch retry"
+        );
     }
 
     /// L10 — own-PID stale reaping at open races another process's reaper
@@ -1577,7 +1601,6 @@ mod loom_tests {
             let s = t.claim_as(Some(2)).unwrap();
             t.store_pin(s, 5); // the old process 2 pinned 5, then died
             let t2 = Arc::clone(&t);
-            // The reaper's probe answered "dead" for the old process 2.
             // The probe answers "dead" until the new process 2 announces
             // itself (it takes its liveness lock before freeing stale slots
             // and claiming), then "alive": a snapshot taken after the new
