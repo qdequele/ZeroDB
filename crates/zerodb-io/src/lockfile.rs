@@ -431,14 +431,16 @@ impl SharedRegion for LockFile {
         probe_locked(&self.file, LIVENESS_BASE + i64::from(pid))
     }
 
+    /// Returns `true` from both takeovers (a dead owner, and a stale word
+    /// naming this process's PID), `false` from an ordinary acquisition.
     #[cfg(target_os = "linux")]
-    fn lock_writer(&self) -> std::io::Result<()> {
+    fn lock_writer(&self) -> std::io::Result<bool> {
         let w = self.writer_word();
         loop {
             // Acquire: synchronizes with the previous owner's Release in
             // `unlock_writer`, so its T store and meta write are visible.
             let cur = match w.compare_exchange(0, self.pid, Ordering::Acquire, Ordering::Relaxed) {
-                Ok(_) => return Ok(()),
+                Ok(_) => return Ok(false),
                 Err(cur) => cur,
             };
             let owner = cur & !WAITERS;
@@ -460,7 +462,7 @@ impl SharedRegion for LockFile {
                 )
                 .is_ok()
                 {
-                    return Ok(());
+                    return Ok(true);
                 }
                 continue; // the word changed; re-read it
             }
@@ -489,7 +491,7 @@ impl SharedRegion for LockFile {
                     )
                     .is_ok()
                 {
-                    return Ok(());
+                    return Ok(true);
                 }
             }
         }
@@ -505,11 +507,13 @@ impl SharedRegion for LockFile {
         }
     }
 
+    /// Always `false`: a POSIX record lock reports no previous owner, so a
+    /// takeover from a dead process cannot be told apart.
     #[cfg(not(target_os = "linux"))]
-    fn lock_writer(&self) -> std::io::Result<()> {
+    fn lock_writer(&self) -> std::io::Result<bool> {
         // POSIX record locks belong to the process, so any thread may release
         // it, and the kernel drops it if the process dies (ADR-0023 §2).
-        record_lock(&self.file, libc::F_SETLKW, WRLCK, WRITER_BYTE).map(|_| ())
+        record_lock(&self.file, libc::F_SETLKW, WRLCK, WRITER_BYTE).map(|_| false)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -702,7 +706,10 @@ mod tests {
     fn writer_lock_releases_from_another_thread() {
         let path = tmp();
         let l = LockFile::open(&path, 4).expect("open");
-        l.lock_writer().unwrap();
+        assert!(
+            !l.lock_writer().unwrap(),
+            "an uncontended lock is no takeover"
+        );
         let l2 = Arc::clone(&l);
         std::thread::spawn(move || l2.unlock_writer())
             .join()
@@ -734,7 +741,7 @@ mod tests {
         for stale in [l.pid(), l.pid() | WAITERS] {
             l.writer_word().store(stale, Ordering::SeqCst);
             let start = std::time::Instant::now();
-            l.lock_writer().unwrap();
+            assert!(l.lock_writer().unwrap(), "reported as a takeover");
             assert!(
                 start.elapsed() < OWNER_PROBE,
                 "waited on a stale own-PID word"

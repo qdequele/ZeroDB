@@ -229,7 +229,10 @@ claim/release a pinned snapshot without blocking the writer.
   matches LMDB (`mti_numreaders == env->me_maxreaders → MDB_READERS_FULL`). Under
   D-001 there are no *stale* cross-process slots to reap first (LMDB's
   `mdb_reader_check`), so the error is raised immediately; Phase 2.2 adds reader
-  introspection, not a reaping path.
+  introspection, not a reaping path. With a lock file (ADR-0023) dead processes'
+  slots can be stale, and the error is still raised immediately without reaping,
+  as the LMDB fork does (ADR-0023 amendment 12); `Env::clear_stale_readers`
+  frees them.
 
 ### §4.3 — Publish-and-verify (the pin) and its memory-ordering correctness
 

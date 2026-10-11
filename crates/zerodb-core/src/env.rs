@@ -758,21 +758,64 @@ impl EnvInner {
     ) -> Result<(), Error> {
         match &self.shared {
             None => Ok(()),
-            Some(region) => Self::lock_writer_region(region.as_ref(), guard),
+            Some(region) => self.lock_writer_region(region.as_ref(), guard),
         }
     }
 
     /// The lock-file arm of [`EnvInner::lock_writer_shared`]. Out of line so
     /// the default (no lock file) write-txn path stays as small as it was
     /// before lock files existed.
+    ///
+    /// A writer that took the lock over from a dead owner then frees dead
+    /// processes' reader slots, as LMDB's writer does when it recovers the
+    /// lock from a dead owner on Linux (ADR-0023 amendment 12). The guard
+    /// records the lock first, so it is released even if reaping unwinds.
     #[inline(never)]
     fn lock_writer_region<'a>(
+        &'a self,
         region: &'a dyn crate::shared::SharedRegion,
         guard: &mut WriterGuard<'a>,
     ) -> Result<(), Error> {
-        region.lock_writer().map_err(Error::Io)?;
+        let took_over = region.lock_writer().map_err(Error::Io)?;
         guard.shared = Some(region);
+        if took_over {
+            self.reap_quietly();
+        }
         Ok(())
+    }
+
+    /// Free the reader slots of dead processes (`mdb_reader_check`,
+    /// ADR-0023 §3). Returns the number of slots freed (the fork's
+    /// `mdb_reader_check` also counts slots, ADR-0023 amendment 12); always 0
+    /// without a lock file, where every slot belongs to this process.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error of a liveness probe. Nothing has been freed then: every
+    /// probe runs before any slot is touched.
+    pub(crate) fn clear_stale_readers(&self) -> Result<usize, Error> {
+        #[cfg(not(loom))]
+        if let Some(region) = &self.shared {
+            let n = self
+                .reader_table
+                .reap_dead(region.pid(), |p| region.is_alive(p))
+                .map_err(Error::Io)?;
+            return Ok(n as usize);
+        }
+        Ok(0)
+    }
+
+    /// [`EnvInner::clear_stale_readers`] for a writer that has just taken the
+    /// writer lock over from a dead owner. A probe error is ignored, so the
+    /// write txn never fails because of a cleanup pass it did not ask for;
+    /// the dead slots then stay for the next `clear_stale_readers` call.
+    /// This differs from the LMDB fork, whose lock recovery
+    /// (`mdb_mutex_failed`) returns a reader-check error from the lock call
+    /// and releases the writer mutex.
+    fn reap_quietly(&self) {
+        // The count only matters to an explicit caller, and a probe error
+        // leaves every slot as it was (see `clear_stale_readers`).
+        let _ = self.clear_stale_readers();
     }
 
     /// Whether a failed commit fsync poisoned the env (SPEC 06 REC-13).
@@ -994,9 +1037,8 @@ impl EnvInner {
         self.comparators.any_custom()
     }
 
-    /// Per-slot reader introspection — `mdb_reader_list` in a single-process
-    /// world. See [`Env::reader_list`] for the full contract;
-    /// this is the raw form.
+    /// Per-slot reader introspection — `mdb_reader_list`. See
+    /// [`Env::reader_list`] for the full contract; this is the raw form.
     #[must_use]
     pub fn reader_list(&self) -> Vec<ReaderEntry> {
         // Sample the commit point *once* so every age in the returned vector
@@ -1006,9 +1048,10 @@ impl EnvInner {
         self.reader_table
             .list()
             .into_iter()
-            .map(|(slot, txnid, _pid)| ReaderEntry {
+            .map(|(slot, txnid, pid)| ReaderEntry {
                 slot,
                 txnid,
+                pid,
                 // `saturating_sub`, not a subtraction: a reader can publish a
                 // pin *newer* than the commit point we sampled a moment ago
                 // (it read a commit that landed in between), which would
@@ -1405,10 +1448,11 @@ impl Env {
     /// transaction, in slot order. Free slots are omitted, exactly as
     /// `mdb_reader_list` skips slots with `mr_pid == 0`: presence in the
     /// returned vector *is* the liveness answer, and `max_readers() -
-    /// reader_list().len()` is the number of free slots. ZeroDB being
-    /// single-process, every listed reader belongs to this process, so unlike
-    /// LMDB there is no pid/tid column to report — a slot index, the pinned
-    /// snapshot txnid, and its age are the whole truth.
+    /// reader_list().len()` is the number of free slots. Each entry gives the
+    /// slot index, the pinned snapshot txnid, its age, and, in an environment
+    /// opened with a lock file, the owner's PID (LMDB's `pid` column). There
+    /// is no thread column: a `RoTxn` is `Send`, so its thread is not a
+    /// stable property.
     ///
     /// # This is a sample, not a snapshot
     ///
@@ -1430,7 +1474,7 @@ impl Env {
     }
 
     /// Reclaim reader slots abandoned by dead processes —
-    /// `mdb_reader_check`. **Always returns 0** today.
+    /// `mdb_reader_check`. Returns the number of slots freed.
     ///
     /// LMDB's reader table lives in a shared `lock.mdb` mapped by every
     /// process that opens the env, so a process that dies without ending its
@@ -1445,27 +1489,34 @@ impl Env {
     /// a slot is to `mem::forget` a live `RoTxn`, which is exactly as
     /// unrecoverable as leaking any other resource and is not what
     /// `mdb_reader_check` is for. If this process dies, the table dies with
-    /// it, so `0` is the correct answer on this path, not a stub.
+    /// it, so this path always returns `0`, which is the correct answer, not
+    /// a stub.
     ///
     /// With the public `lock_file` option on (the `zerodb`/`heed-zerodb`
-    /// `EnvOpenOptions::lock_file`, ADR-0023), the reader table *is* shared
-    /// across processes, and a dead process's slot can genuinely go stale.
-    /// This method still unconditionally returns `0` on that path too:
-    /// cross-process reaping here is a known gap, tracked by ADR-0023 §3
-    /// ("in `clear_stale_readers` (today it returns 0; it will return the
-    /// reaped count)") and left for a later stage. A dead process's reader
-    /// slot is still reclaimed at the next first-opener election, which wipes
-    /// the whole table (ADR-0023 §3 "When").
+    /// `EnvOpenOptions::lock_file`, ADR-0023), the reader table is shared
+    /// across processes, and a process that dies inside a read txn leaves its
+    /// slot pinned. This method then probes the owner of every occupied slot
+    /// and frees the slots of processes that no longer have the environment
+    /// open (ADR-0023 §3). Like `mdb_reader_check`, it counts **slots**, not
+    /// processes: one dead process that held two slots counts 2.
     ///
-    /// It is kept (rather than omitted) so that code written against heed's
-    /// `Env::clear_stale_readers` compiles and behaves sensibly on ZeroDB: a
-    /// periodic janitor call is a no-op instead of a compile error.
+    /// As in LMDB, the engine reaps on its own in only one other place: a
+    /// writer that takes over the writer lock from a dead owner (Linux)
+    /// frees dead readers' slots too. Beginning a read txn, committing, and
+    /// joining an environment that another process has open never reap
+    /// another process's slots, and a full reader table fails with
+    /// `ReadersFull` without reaping; call this method to recover the slots.
+    /// (The first process to open the environment wipes the whole table, as
+    /// no other process has it open; and a joining process frees the slots
+    /// left under its own PID by a dead predecessor, since no probe can tell
+    /// those from its own, ADR-0023 amendment 9.)
     ///
     /// # Errors
     ///
-    /// Never. The [`Result`] exists for heed shape.
+    /// The I/O error of a liveness probe. Nothing has been freed then: every
+    /// probe runs before any slot is touched.
     pub fn clear_stale_readers(&self) -> Result<usize, Error> {
-        Ok(0)
+        self.inner.clear_stale_readers()
     }
 
     /// Whether any custom key comparator is registered on this environment
@@ -1623,14 +1674,14 @@ pub struct EnvInfo {
 }
 
 /// One occupied reader-table slot, as reported by [`Env::reader_list`]
-/// (the single-process analogue of one `MDB_reader` row in
-/// `mdb_reader_list` output).
+/// (one `MDB_reader` row in `mdb_reader_list` output).
 ///
 /// A **ZeroDB extension**: heed exposes no reader introspection whatsoever, so
-/// there is no signature to mirror. Compared to LMDB's row there is no `pid`
-/// or `thread` column — ZeroDB is single-process, so every reader is in this process, and a
-/// `RoTxn` is `Send`, so the owning thread is not a stable property worth
-/// reporting.
+/// there is no signature to mirror. Compared to LMDB's row there is no
+/// `thread` column, since a `RoTxn` is `Send` and the owning thread is not a
+/// stable property worth reporting. The `pid` column is reported in an
+/// environment opened with a lock file ([`ReaderEntry::pid`]); without one
+/// every reader is in this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReaderEntry {
     /// The slot's index in the reader table, in `0..max_readers`. Stable for
@@ -1654,6 +1705,11 @@ pub struct ReaderEntry {
     /// the whole [`Env::reader_list`] call, and saturates at 0 rather than
     /// underflowing if a reader pinned a commit that landed after that sample.
     pub age: Option<u64>,
+    /// The PID of the process that owns the slot, in an environment opened
+    /// with a lock file (ADR-0023 amendment 13). `None` without a lock file
+    /// (every reader is in this process) and for a slot being claimed or
+    /// released. LMDB's `mdb_reader_list` prints the same column.
+    pub pid: Option<u32>,
 }
 
 /// Environment-level statistics (`mdb_env_stat` / `MDB_stat` over the **main**
@@ -1989,6 +2045,19 @@ pub fn open_with_backing_shared(
         // The reader table is sized once at open and never resized (TXN-14).
         _ => ReaderTable::new(max_readers),
     };
+    // A joining process frees the slots that carry its own PID (ADR-0023
+    // amendment 9): a dead process that had the same PID left them, and no
+    // liveness probe can tell them apart from this process's own slots. None
+    // of them is live: this runs before this process's first claim, and the
+    // lock-file layer refuses a second open of the same lock file within one
+    // process, so no other environment handle here shares these slots. An
+    // initializer has already wiped every slot.
+    #[cfg(not(loom))]
+    if let Some(region) = &shared {
+        if !region.is_initializer() {
+            reader_table.reap_own_stale(region.pid());
+        }
+    }
 
     // Register under the process registry (SPEC 04 TXN-51). Hold the lock across
     // check + insert so two concurrent opens of one path cannot both succeed.
@@ -2778,5 +2847,177 @@ mod shared_env_tests {
             env.inner.current_snapshot().unwrap().txnid,
             env.inner.txnid()
         );
+    }
+
+    // Reaping (ADR-0023 §3, amendment 12). The LMDB fork, observed by
+    // `zerodb-oracle/tests/lmdb_reaping_observation.rs`, reaps dead readers
+    // in `mdb_reader_check` and when a writer takes over a dead writer's lock
+    // (Linux), and nowhere else: not at read-txn begin, write commit, a
+    // joiner's open or a full table. The tests below pin each of those.
+
+    /// Claim and pin a slot on behalf of process `pid`, as that process would
+    /// have before it died.
+    fn pin_as(env: &Env, pid: u32, txnid: u64) -> u32 {
+        let s = env
+            .inner
+            .reader_table
+            .claim_as(Some(pid))
+            .expect("a free slot");
+        env.inner.reader_table.store_pin(s, txnid);
+        s
+    }
+
+    fn listed_pids(env: &Env) -> Vec<Option<u32>> {
+        env.reader_list().into_iter().map(|e| e.pid).collect()
+    }
+
+    #[test]
+    fn clear_stale_readers_frees_a_dead_processes_slots() {
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let env = open(backing(4, 5), region.clone());
+        pin_as(&env, 2, 1);
+        assert_eq!(env.clear_stale_readers().unwrap(), 0, "process 2 is alive");
+        region.kill(2);
+        assert_eq!(env.clear_stale_readers().unwrap(), 1);
+        assert_eq!(env.clear_stale_readers().unwrap(), 0);
+        assert!(env.reader_list().is_empty());
+    }
+
+    #[test]
+    fn clear_stale_readers_counts_slots_not_processes() {
+        // `mdb_reader_check` counts slots (amendment 12).
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let env = open(backing(4, 5), region.clone());
+        pin_as(&env, 2, 4);
+        pin_as(&env, 2, 5);
+        region.kill(2);
+        assert_eq!(env.clear_stale_readers().unwrap(), 2);
+    }
+
+    #[test]
+    fn clear_stale_readers_is_zero_without_a_lock_file() {
+        let env = testutil::mem_env(PS, 1 << 20);
+        let r = env.read_txn().unwrap();
+        assert_eq!(env.clear_stale_readers().unwrap(), 0);
+        assert_eq!(listed_pids(&env), vec![None], "no PID without a lock file");
+        drop(r);
+    }
+
+    #[test]
+    fn reader_list_reports_pids_in_a_lock_file_env() {
+        let region = Arc::new(HeapRegion::new(4, 7, true));
+        let env = open(backing(4, 5), region.clone());
+        let r = env.read_txn().unwrap();
+        let list = env.reader_list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].pid, Some(7));
+        drop(r);
+    }
+
+    #[test]
+    fn joiner_frees_slots_left_under_its_own_pid() {
+        // A region whose initializer (another process) is alive, and in
+        // which a dead predecessor with this process's PID (5) left a pin.
+        let region = Arc::new(HeapRegion::new(4, 5, true));
+        {
+            let env = open(backing(4, 5), region.clone()); // seeds T
+            drop(env);
+        }
+        SharedRegion::slots(&*region)[2]
+            .owner()
+            .store(crate::shared::owner_word(1, 5), O::SeqCst);
+        SharedRegion::slots(&*region)[2].txnid().store(1, O::SeqCst);
+        let joiner = HeapRegion::rejoin(&region); // is_initializer false
+        let env = open(backing(4, 5), joiner.clone());
+        assert!(
+            env.reader_list().is_empty(),
+            "the stale own-PID slot survived open"
+        );
+    }
+
+    #[test]
+    fn joiner_open_does_not_reap_another_dead_process() {
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let first = open(backing(4, 5), region.clone());
+        pin_as(&first, 3, 4);
+        drop(first);
+        let joiner = HeapRegion::rejoin(&region);
+        joiner.kill(3);
+        let env = open(backing(4, 5), joiner.clone());
+        assert_eq!(listed_pids(&env), vec![Some(3)]);
+        assert_eq!(env.clear_stale_readers().unwrap(), 1);
+    }
+
+    #[test]
+    fn full_table_gives_readers_full_and_does_not_reap() {
+        let region = Arc::new(HeapRegion::new(1, 1, true));
+        let env = open(backing(4, 5), region.clone());
+        pin_as(&env, 2, 1);
+        region.kill(2);
+        assert!(matches!(
+            env.read_txn(),
+            Err(Error::Mdb(MdbError::ReadersFull))
+        ));
+        assert_eq!(env.clear_stale_readers().unwrap(), 1);
+        env.read_txn().expect("the reaped slot is free again");
+    }
+
+    #[test]
+    fn read_txn_begin_does_not_reap() {
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let env = open(backing(4, 5), region.clone());
+        pin_as(&env, 2, 4);
+        region.kill(2);
+        let r = env.read_txn().unwrap();
+        assert_eq!(listed_pids(&env), vec![Some(2), Some(1)]);
+        drop(r);
+        assert_eq!(listed_pids(&env), vec![Some(2)]);
+    }
+
+    #[test]
+    fn write_txn_without_takeover_does_not_reap() {
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let env = open(backing(4, 5), region.clone());
+        pin_as(&env, 2, 4);
+        region.kill(2);
+        let txn = env.write_txn().unwrap();
+        assert_eq!(listed_pids(&env), vec![Some(2)], "begin does not reap");
+        // An unchanged commit runs the commit path without I/O (the heap
+        // backing has no file to write).
+        txn.commit().unwrap();
+        assert_eq!(listed_pids(&env), vec![Some(2)], "commit does not reap");
+    }
+
+    #[test]
+    fn writer_takeover_reaps_dead_readers() {
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let env = open(backing(4, 5), region.clone());
+        pin_as(&env, 2, 4);
+        pin_as(&env, 3, 4);
+        region.kill(2);
+        region.simulate_takeover_on_next_lock();
+        let txn = env.write_txn().unwrap();
+        assert_eq!(
+            listed_pids(&env),
+            vec![Some(3)],
+            "the takeover freed the dead process's slot, and only it"
+        );
+        drop(txn);
+    }
+
+    #[test]
+    fn a_failed_probe_fails_clear_stale_readers_but_not_a_takeover() {
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let env = open(backing(4, 5), region.clone());
+        pin_as(&env, 2, 4);
+        region.kill(2);
+        region.fail_liveness_probes();
+        assert!(matches!(env.clear_stale_readers(), Err(Error::Io(_))));
+        region.simulate_takeover_on_next_lock();
+        let txn = env
+            .write_txn()
+            .expect("a probe error during the takeover reap is ignored");
+        assert_eq!(listed_pids(&env), vec![Some(2)], "nothing was freed");
+        drop(txn);
     }
 }

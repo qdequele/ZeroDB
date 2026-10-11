@@ -504,9 +504,9 @@ impl ReaderTable {
     ///
     /// The first probe error; nothing has been freed by then, because every
     /// probe precedes every adoption.
-    // Called once the open and claim paths use reaping (ADR-0023 stage 2);
-    // exercised only by unit tests until then.
-    #[allow(dead_code)]
+    // loom builds compile no lock-file environment, so only the loom models
+    // call this there.
+    #[cfg_attr(all(loom, not(test)), allow(dead_code))]
     pub(crate) fn reap_dead(
         &self,
         reaper: u32,
@@ -569,9 +569,9 @@ impl ReaderTable {
     /// (invariant A of [`ReaderTable::reap_dead`]), so that CAS keeps failing. Then `txnid = FREE` (`Release`).
     /// Dying between the two stores leaves a pinned slot with PID 0 until
     /// the next first-opener wipe: a one-store window, documented in the ADR.
-    // Called once the open and claim paths use reaping (ADR-0023 stage 2);
-    // exercised only by unit tests until then.
-    #[allow(dead_code)]
+    // loom builds compile no lock-file environment, so only the loom models
+    // call this there.
+    #[cfg_attr(all(loom, not(test)), allow(dead_code))]
     pub(crate) fn reap_own_stale(&self, me: u32) -> u32 {
         let mut freed = 0;
         for rs in self.slots() {

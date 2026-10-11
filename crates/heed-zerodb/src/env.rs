@@ -738,7 +738,8 @@ impl<T> Env<T> {
     /// List the environment's occupied reader slots.
     ///
     /// **ZeroDB extension — heed exposes no reader introspection.** This is
-    /// the single-process analogue of `mdb_reader_list`. See
+    /// ZeroDB's `mdb_reader_list`, with owner PIDs in a lock-file
+    /// environment. See
     /// [`zerodb::Env::reader_list`] for the full contract, in particular that
     /// the result is a *sample* of a lock-free table and entries may be stale
     /// by the time it returns.
@@ -754,24 +755,24 @@ impl<T> Env<T> {
     }
 
     /// Clear stale readers (SPEC 00 second table — SHOULD; `mdb_reader_check`).
+    /// Returns the number of reader slots freed.
     ///
-    /// **Always 0 today.** By default ZeroDB is single-process (see
-    /// docs/DIVERGENCES.md): the reader table is process memory, every slot
-    /// is owned by a `RoTxn` that releases it in `Drop`, and a dead process
-    /// takes the whole table with it — `0` is the correct answer, not a
-    /// stub, on that path. With `EnvOpenOptions::lock_file` on (ADR-0023) the
-    /// reader table is shared across processes and a dead process's slot can
-    /// go stale; cross-process reaping here is a known gap left for a later
-    /// stage (ADR-0023 §3) — a stale slot is still cleared at the next
-    /// first-opener election. Kept so heed code that calls it periodically
-    /// keeps compiling and no-ops.
+    /// By default ZeroDB is single-process (see docs/DIVERGENCES.md): the
+    /// reader table is process memory, every slot is owned by a `RoTxn` that
+    /// releases it in `Drop`, and a dead process takes the whole table with
+    /// it, so this returns `0` — the correct answer, not a stub. With
+    /// `EnvOpenOptions::lock_file` on (ADR-0023) the reader table is shared
+    /// across processes: this frees the slots of processes that died inside
+    /// a read txn and returns how many slots it freed (slots, not processes,
+    /// as LMDB counts).
     ///
-    /// See [`zerodb::Env::clear_stale_readers`] for the full argument, and
-    /// [`Env::reader_list`] for the introspection that *is* meaningful here.
+    /// See [`zerodb::Env::clear_stale_readers`] for the full contract,
+    /// including where the engine reaps on its own, and
+    /// [`Env::reader_list`] for the slots and their owner PIDs.
     ///
     /// # Errors
     ///
-    /// Never. The [`Result`] exists for heed shape.
+    /// The I/O error of a liveness probe (lock-file environments only).
     pub fn clear_stale_readers(&self) -> Result<usize> {
         Ok(self.inner.clear_stale_readers()?)
     }

@@ -130,10 +130,17 @@ pub trait SharedRegion: Send + Sync {
     /// only while the in-process writer lock is held, so at most one thread
     /// per process waits here.
     ///
+    /// Returns `true` when the lock was taken over from a dead owner (or from
+    /// a stale word naming this process's PID, left by a dead predecessor),
+    /// `false` when it was acquired normally. An implementation that cannot
+    /// tell (a POSIX record lock reports no previous owner) returns `false`.
+    /// The environment reaps dead readers after a takeover, as LMDB does
+    /// (ADR-0023 amendment 12).
+    ///
     /// # Errors
     ///
     /// The I/O error of the underlying lock call.
-    fn lock_writer(&self) -> std::io::Result<()>;
+    fn lock_writer(&self) -> std::io::Result<bool>;
     /// Release the cross-process writer lock. Callable from any thread.
     fn unlock_writer(&self);
 }
@@ -142,42 +149,90 @@ pub trait SharedRegion: Send + Sync {
 /// flag lock. Not a cross-process implementation.
 #[cfg(all(test, not(loom)))]
 pub(crate) struct HeapRegion {
-    pub(crate) t: AtomicU64,
-    pub(crate) slots: Box<[ReaderSlot]>,
+    /// The published txnid and the slots, shared with every region made by
+    /// [`HeapRegion::rejoin`] (which plays another opener of the same file).
+    table: std::sync::Arc<HeapTable>,
     pub(crate) pid: u32,
     pub(crate) initializer: bool,
     pub(crate) writer: std::sync::Mutex<bool>,
     cv: std::sync::Condvar,
     dead: std::sync::Mutex<Vec<u32>>,
+    /// When set, the next [`SharedRegion::lock_writer`] reports a takeover
+    /// from a dead owner (and clears the flag).
+    next_lock_is_takeover: std::sync::atomic::AtomicBool,
+    /// When set, every [`SharedRegion::is_alive`] probe fails.
+    probes_fail: std::sync::atomic::AtomicBool,
+}
+
+/// The part of a [`HeapRegion`] that models the lock file's contents.
+#[cfg(all(test, not(loom)))]
+struct HeapTable {
+    t: AtomicU64,
+    slots: Box<[ReaderSlot]>,
 }
 
 #[cfg(all(test, not(loom)))]
 impl HeapRegion {
     pub(crate) fn new(slots: u32, pid: u32, initializer: bool) -> HeapRegion {
         HeapRegion {
-            t: AtomicU64::new(0),
-            slots: (0..slots).map(|_| ReaderSlot::new_free()).collect(),
+            table: std::sync::Arc::new(HeapTable {
+                t: AtomicU64::new(0),
+                slots: (0..slots).map(|_| ReaderSlot::new_free()).collect(),
+            }),
             pid,
             initializer,
             writer: std::sync::Mutex::new(false),
             cv: std::sync::Condvar::new(),
             dead: std::sync::Mutex::new(Vec::new()),
+            next_lock_is_takeover: std::sync::atomic::AtomicBool::new(false),
+            probes_fail: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// A region over the same published txnid and slots, with the same PID,
+    /// that did not initialize them: a later opener of the same lock file.
+    pub(crate) fn rejoin(&self) -> std::sync::Arc<HeapRegion> {
+        std::sync::Arc::new(HeapRegion {
+            table: std::sync::Arc::clone(&self.table),
+            pid: self.pid,
+            initializer: false,
+            writer: std::sync::Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+            dead: std::sync::Mutex::new(Vec::new()),
+            next_lock_is_takeover: std::sync::atomic::AtomicBool::new(false),
+            probes_fail: std::sync::atomic::AtomicBool::new(false),
+        })
     }
 
     /// Mark `pid` dead for [`SharedRegion::is_alive`].
     pub(crate) fn kill(&self, pid: u32) {
         self.dead.lock().expect("test region poisoned").push(pid);
     }
+
+    /// Make the next [`SharedRegion::lock_writer`] report that it took the
+    /// lock over from a dead owner, as the lock-file region does on Linux.
+    pub(crate) fn simulate_takeover_on_next_lock(&self) {
+        // Relaxed: a test knob set and read on the same thread.
+        self.next_lock_is_takeover
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Make every later [`SharedRegion::is_alive`] probe fail with an I/O
+    /// error.
+    pub(crate) fn fail_liveness_probes(&self) {
+        // Relaxed: a test knob set and read on the same thread.
+        self.probes_fail
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(all(test, not(loom)))]
 impl SharedRegion for HeapRegion {
     fn published_txnid(&self) -> &AtomicU64 {
-        &self.t
+        &self.table.t
     }
     fn slots(&self) -> &[ReaderSlot] {
-        &self.slots
+        &self.table.slots
     }
     fn pid(&self) -> u32 {
         self.pid
@@ -186,6 +241,10 @@ impl SharedRegion for HeapRegion {
         self.initializer
     }
     fn is_alive(&self, pid: u32) -> std::io::Result<bool> {
+        // Relaxed: a test knob, see `fail_liveness_probes`.
+        if self.probes_fail.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::other("test probe failure"));
+        }
         Ok(pid == self.pid
             || !self
                 .dead
@@ -193,13 +252,16 @@ impl SharedRegion for HeapRegion {
                 .expect("test region poisoned")
                 .contains(&pid))
     }
-    fn lock_writer(&self) -> std::io::Result<()> {
+    fn lock_writer(&self) -> std::io::Result<bool> {
         let mut held = self.writer.lock().expect("test region poisoned");
         while *held {
             held = self.cv.wait(held).expect("test region poisoned");
         }
         *held = true;
-        Ok(())
+        // Relaxed: a test knob, set on the thread that takes the lock.
+        Ok(self
+            .next_lock_is_takeover
+            .swap(false, std::sync::atomic::Ordering::Relaxed))
     }
     fn unlock_writer(&self) {
         *self.writer.lock().expect("test region poisoned") = false;
