@@ -98,3 +98,69 @@ fn reopen_after_close_reinitializes() {
     let r = env.read_txn().unwrap();
     assert_eq!(env.main_database().get(&r, b"x").unwrap(), Some(&b"1"[..]));
 }
+
+/// `EnvClosingEvent::wait` promises the environment is fully closed (SPEC 04
+/// TXN-53), so an immediate reopen must succeed. With a lock file this
+/// includes releasing the lock file: the last handle may drop on another
+/// thread, and the close event must not fire while that handle's lock file is
+/// still open in this process.
+#[test]
+fn reopen_after_closing_event_wait_succeeds() {
+    let dir = TempDir::new();
+    for i in 0..200 {
+        let env = opts()
+            .open(dir.path())
+            .unwrap_or_else(|e| panic!("open {i} failed: {e:?}"));
+        let clone = env.clone();
+        let (go, wait_go) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            let r = clone.read_txn().expect("read txn");
+            drop(r);
+            wait_go.recv().expect("go");
+            // The last handle: the environment closes on this thread.
+            drop(clone);
+        });
+        let closing = env.prepare_for_closing();
+        go.send(()).expect("send go");
+        closing.wait();
+        // Reopen before joining, so nothing but the close event orders the
+        // reopen after the other thread's teardown.
+        let reopened = opts().open(dir.path());
+        t.join().expect("thread");
+        reopened.unwrap_or_else(|e| panic!("reopen {i} after wait failed: {e:?}"));
+    }
+    let env = opts().open(dir.path()).expect("final reopen");
+    drop(env);
+}
+
+/// An open that fails after the lock file was opened releases it, so a later
+/// open of the same directory succeeds. Here the data file name is taken by a
+/// directory, so opening the data file fails.
+#[test]
+fn failed_open_after_lock_file_releases_it() {
+    let dir = TempDir::new();
+    std::fs::create_dir(dir.path().join("taken")).expect("mkdir");
+    let mut bad = opts();
+    bad.data_file_name("taken");
+    assert!(bad.open(dir.path()).is_err(), "a directory is no data file");
+    let env = opts().open(dir.path()).expect("open after a failed open");
+    let mut w = env.write_txn().unwrap();
+    env.main_database().put(&mut w, b"k", b"v").unwrap();
+    w.commit().unwrap();
+}
+
+/// An open that fails in the engine (the data file is not a ZeroDB file)
+/// releases the lock file too.
+#[test]
+fn failed_engine_open_releases_lock_file() {
+    let dir = TempDir::new();
+    let data = dir.path().join("garbage.mdb");
+    std::fs::write(&data, vec![0xA5u8; 4096 * 4]).expect("write garbage");
+    let mut bad = opts();
+    bad.data_file_name("garbage.mdb");
+    assert!(bad.open(dir.path()).is_err(), "garbage is no env");
+    std::fs::remove_file(&data).expect("rm garbage");
+    let env = bad.open(dir.path()).expect("open after a failed open");
+    let r = env.read_txn().unwrap();
+    assert_eq!(env.main_database().get(&r, b"k").unwrap(), None);
+}

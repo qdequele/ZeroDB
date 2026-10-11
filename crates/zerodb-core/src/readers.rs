@@ -142,6 +142,18 @@ impl ReaderTable {
         }
     }
 
+    /// Drop this table's reference to the cross-process region (ADR-0023),
+    /// leaving an empty local table. Called only from the environment's
+    /// teardown, which needs the region released before it fires the close
+    /// event (SPEC 04 TXN-53); `&mut self` proves no reader is using the
+    /// slots. A no-op for a local table.
+    pub(crate) fn release_region(&mut self) {
+        #[cfg(not(loom))]
+        if matches!(self.slots, Slots::Shared(_)) {
+            self.slots = Slots::Local(Box::new([]));
+        }
+    }
+
     /// The slot array, wherever it is stored. Resolved once per operation;
     /// callers then walk or index the slice directly.
     #[inline]

@@ -1301,6 +1301,15 @@ impl Drop for EnvInner {
         // (the last `Arc` reference is gone), so taking the backing here races
         // with no reader.
         drop(self.backing.take());
+        // Release the cross-process region (ADR-0023) before the close event
+        // too: dropping the last reference closes the lock file, which
+        // releases its record locks and this process's claim on its path. A
+        // waiter woken by the event may reopen at once, and would otherwise
+        // find the lock file still open (`EnvAlreadyOpened`). The reader table
+        // holds the only other reference; write txns borrow the region and
+        // cannot outlive this `EnvInner`.
+        self.reader_table.release_region();
+        drop(self.shared.take());
         self.closing.signal();
     }
 }
