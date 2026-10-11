@@ -6,7 +6,7 @@
 //! this crate sees only safe atomics and lock calls, so it stays free of
 //! `unsafe`.
 
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8};
 
 /// Reader-slot txnid value meaning "free" (SPEC 04 TXN-14). A lock-file
 /// initializer writes it into every slot.
@@ -23,7 +23,13 @@ pub const READER_SLOT_SIZE: usize = 128;
 /// |---|---|
 /// | 0 | txnid `u64`: the pinned snapshot txnid, or a sentinel (TXN-14) |
 /// | 8 | owner PID `u32`: written only in a lock file; `0` while free |
-/// | 12 | padding up to 128 bytes, never read or written |
+/// | 12 | padding up to 128 bytes, unused by the slot protocol |
+///
+/// The padding is atomic bytes too, so the whole slot is interior-mutable:
+/// another process may still write those bytes (a later initializer that
+/// truncates and re-extends the file, for example) while this one holds a
+/// `&ReaderSlot` over the mapping, and that must not be a data race on plain
+/// memory.
 ///
 /// The 64-byte alignment and 128-byte size keep a reader's stores to its own
 /// slot and the writer's scan of the table off each other's cache lines
@@ -38,7 +44,7 @@ pub const READER_SLOT_SIZE: usize = 128;
 pub struct ReaderSlot {
     txnid: AtomicU64,
     pid: AtomicU32,
-    _pad: [u8; 116],
+    _pad: [AtomicU8; 116],
 }
 
 // The lock-file layout depends on these (ADR-0023 §3).
@@ -55,7 +61,7 @@ impl ReaderSlot {
         ReaderSlot {
             txnid: AtomicU64::new(READER_SLOT_FREE),
             pid: AtomicU32::new(0),
-            _pad: [0; 116],
+            _pad: [const { AtomicU8::new(0) }; 116],
         }
     }
 

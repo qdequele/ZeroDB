@@ -370,15 +370,14 @@ impl SharedRegion for LockFile {
         //   bytes, and `SLOT_STRIDE == size_of::<ReaderSlot>()`, so the slice
         //   lies inside the mapping.
         // - Validity: `ReaderSlot` is `repr(C)` with an `AtomicU64` at +0, an
-        //   `AtomicU32` at +8 and plain `u8` padding; every bit pattern is a
+        //   `AtomicU32` at +8 and `AtomicU8` padding; every bit pattern is a
         //   valid value of each.
         // - Lifetime: the slice borrows `self`, and the mapping lives as long
         //   as `self` and is never remapped.
-        // - Aliasing: other processes mutate the slot words concurrently, but
-        //   only through atomics (the txnid and PID fields are `UnsafeCell`
-        //   atomics, so shared references to them permit those writes).
-        //   Nobody writes the padding after the initializer's truncation,
-        //   which happens before any process maps the file.
+        // - Aliasing: other processes may write any byte of a slot
+        //   concurrently. Every field, the padding included, is an atomic
+        //   (an `UnsafeCell`), so a shared reference to the slot permits
+        //   those writes and there is no non-atomic data race.
         unsafe {
             std::slice::from_raw_parts(
                 self.map.as_mut_ptr().add(OFF_SLOTS).cast::<ReaderSlot>(),
