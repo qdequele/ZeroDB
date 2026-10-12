@@ -65,6 +65,19 @@ this section defines the **recovery decision** and its error taxonomy.
   committed-map resolution ever dereferences a pgno above the pinned
   snapshot's `last_pg` — REC-14's "no recovered reference exceeds the file"
   is thereby enforced, not assumed, on corrupt input).
+  **Snapshots decoded after open (ADR-0023 amendment 15).** In a lock-file
+  environment a txn begin may decode a newer snapshot another process
+  committed (the published txnid `T`). Each such snapshot is checked against
+  one load of the backing's view (mapped bytes and logical map size) and the
+  file, with checked arithmetic on `needed = (last_pg + 1) * page_size`:
+  `needed` beyond the logical map size is `MdbError::MapResized` (a process
+  with a larger map committed past this one; LMDB's `MDB_MAP_RESIZED`); within
+  it but beyond the mapped bytes, or beyond the file length (`fstat`), is
+  `MdbError::Invalid`. A larger `meta.map_size` alone is not an error. A
+  write begin also checks its base when it came from the snapshot cache, but
+  against the view only (map size and mapped bytes): a cached base passed the
+  file check when it was decoded, and a process-local base was committed
+  through this backing.
 - **REC-2** — **Selection among valid slots:**
 
   | Valid slots | PREV_SNAPSHOT off | PREV_SNAPSHOT on |

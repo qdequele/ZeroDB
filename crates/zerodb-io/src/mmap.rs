@@ -14,7 +14,7 @@
 
 use std::fs::File;
 use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 /// A read-only memory map over an env data file.
 ///
@@ -349,6 +349,13 @@ unsafe impl Send for MapRegions {}
 // under the mutex.
 unsafe impl Sync for MapRegions {}
 
+// Pins the `Send`/`Sync` argument above: every mapping type the raw pointers
+// own must itself be `Send + Sync`, or this fails to compile.
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    let _ = assert_send_sync::<Mapping>;
+};
+
 impl MapRegions {
     /// Publishes view 0 over `first`.
     pub(crate) fn new(first: Mapping, map_size: u64) -> MapRegions {
@@ -414,7 +421,9 @@ impl MapRegions {
 
 impl Drop for MapRegions {
     fn drop(&mut self) {
-        let owned = self.owned.get_mut().expect("map regions poisoned");
+        // A poisoned mutex still holds every pointer: free them anyway, so no
+        // mapping outlives the descriptor and Drop never panics mid-unwind.
+        let owned = self.owned.get_mut().unwrap_or_else(PoisonError::into_inner);
         for v in owned.views.drain(..) {
             // SAFETY: each pointer came from `Box::into_raw` exactly once and
             // is freed exactly once; `&mut self` proves no borrow is live.

@@ -248,17 +248,14 @@ impl Backing for WriteMapBacking {
 }
 
 /// The result of opening (or creating) an env data file: the [`Backing`] plus
-/// the authoritative page size, the effective runtime map size, and whether the
-/// file was freshly created.
+/// the authoritative page size and whether the file was freshly created. The
+/// runtime map size is the backing's: `backing.view().map_size` (ADR-0023
+/// amendment 15).
 pub struct Opened {
     /// The mmap-backed reader, boxed as the engine's [`Backing`].
     pub backing: Box<dyn Backing>,
     /// The DB page size (from the file, or the requested size for a new env).
     pub page_size: u32,
-    /// The effective runtime map size (the requested size, else the persisted
-    /// one; SPEC 02 §8), raised to `(last_pg + 1) * page_size` when smaller
-    /// (ADR-0023 amendment 15). The backing's view carries the same size.
-    pub map_size: u64,
     /// Whether the file was created by this call.
     pub created: bool,
 }
@@ -359,7 +356,6 @@ pub fn open_or_create_with_advice(
         return Ok(Opened {
             backing,
             page_size: requested_page_size,
-            map_size,
             created: true,
         });
     }
@@ -414,7 +410,6 @@ pub fn open_or_create_with_advice(
     Ok(Opened {
         backing,
         page_size,
-        map_size,
         created: false,
     })
 }
