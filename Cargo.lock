@@ -1504,6 +1504,7 @@ name = "zerodb-tools"
 version = "0.2.0"
 dependencies = [
  "heed",
+ "heed-zerodb",
  "libc",
  "zerodb",
  "zerodb-core",

@@ -79,9 +79,8 @@ trusted-file mode) so the default stays a faithful drop-in.
   size, and the `unsafe fn resize` signature heed declares (ADR-0023
   amendment 15; its body holds no `unsafe` block) — nothing beyond what the
   mirrored heed surface forces;
-- `zerodb-tools`: one `libc::flock` (`src/lock.rs`, the guard against opening a
-  live environment) and the `migrate-lmdb` feature's heed `open`
-  (`src/migrate.rs`). These two are in use and awaiting maintainer review.
+- `zerodb-tools`: the `migrate-lmdb` feature's heed `open`
+  (`src/migrate.rs`), in use and awaiting maintainer review.
 
 The in-place `WRITE_MAP` exception covers only calling `zerodb-io`'s `unsafe`
 map-slice broker to realize a dirty page in the writable map at a freshly

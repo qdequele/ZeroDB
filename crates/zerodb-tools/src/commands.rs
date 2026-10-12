@@ -4,17 +4,15 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::path::Path;
 
-use zerodb::{
-    check::check_image, EnvStream, PageSink, StreamBuildError, DATA_FILE_NAME,
-    DEFAULT_FILL_PERMILLE, FIRST_DATA_PGNO,
-};
+use zerodb::{check::check_image, check::check_snapshot, Env, EnvOpenOptions, MdbError};
 
-use crate::common::{collect_dump, open_ro, BoxErr};
+use crate::common::{collect_dump, open_ro, read_txn, BoxErr};
 use crate::dump_format;
-use crate::lock;
 use crate::naming;
 
-/// `stat <env-dir>`: env-level and per-DB statistics. Offline (exclusive lock).
+/// `stat <env-dir>`: env-level and per-DB statistics. Attaches to the env
+/// read-only through its lock file, so it also runs while other processes have
+/// the env open (ADR-0023 amendment 18).
 ///
 /// Probes both data-file names (ADR-0010) and prints an engine-identification
 /// line naming the file, the magic and the format version — so an operator
@@ -23,12 +21,12 @@ use crate::naming;
 ///
 /// # Errors
 ///
-/// [`lock::LockError`] if the env is busy, missing, or ambiguous (both names
-/// present), or any read error.
+/// [`naming::NameError`] if the env is missing or ambiguous (both names
+/// present), the open's error, or any read error.
 pub fn cmd_stat(env_dir: &Path) -> Result<String, BoxErr> {
-    let (_guard, data) = lock::acquire_existing(env_dir)?;
+    let data = naming::resolve(env_dir)?;
     let env = open_ro(env_dir, data.name)?;
-    let txn = env.read_txn()?;
+    let txn = read_txn(&env)?;
     let snap = txn.snapshot();
     let psize = env.page_size();
 
@@ -128,39 +126,44 @@ fn printable_name(name: &[u8]) -> String {
     }
 }
 
-/// `dump <env-dir>`: logical dump text (mdb_dump-shaped) of every DB. Offline.
-/// Probes both data-file names (ADR-0010).
+/// `dump <env-dir>`: logical dump text (mdb_dump-shaped) of every DB, from one
+/// read snapshot. Attaches to the env read-only through its lock file, like
+/// `stat`. Probes both data-file names (ADR-0010).
 ///
 /// # Errors
 ///
-/// [`lock::LockError`] if the env is busy, missing, or ambiguous, or any read
-/// error.
+/// [`naming::NameError`] if the env is missing or ambiguous, the open's error,
+/// or any read error.
 pub fn cmd_dump(env_dir: &Path) -> Result<String, BoxErr> {
-    let (_guard, data) = lock::acquire_existing(env_dir)?;
+    let data = naming::resolve(env_dir)?;
     let env = open_ro(env_dir, data.name)?;
-    let txn = env.read_txn()?;
+    let txn = read_txn(&env)?;
     let dbs = collect_dump(&env, &txn)?;
     Ok(dump_format::render(&dbs))
 }
 
-/// `load <dump-file> <env-dir>`: build a fresh env from a logical dump. Uses the
-/// bulk builder (every DB's records are sorted+unique in a valid dump); falls
-/// back to sorting if a hand-edited dump is out of order. The target dir must
-/// hold no existing env under **either** data-file name (ADR-0010); the env it
-/// creates is a native one, named [`zerodb::DATA_FILE_NAME`].
+/// `load <dump-file> <env-dir>`: build a fresh env from a logical dump.
+///
+/// The target dir must hold no existing env under **either** data-file name
+/// (ADR-0010); the env it creates is a native one, named
+/// [`zerodb::DATA_FILE_NAME`], with its lock file. It is opened through the
+/// engine and must be opened exclusively ([`Env::opened_exclusively`]): a
+/// destination another process has open is refused, and the `Env` is held
+/// for the whole load (ADR-0023 amendment 18). The records go in through
+/// ordinary write txns with sequential writes (ADR-0015), as LMDB's
+/// `mdb_load` uses txns; every DB's records are sorted and unique in a valid
+/// dump, and a hand-edited dump is sorted first. The map grows when it fills.
 ///
 /// # Errors
 ///
-/// [`lock::LockError`], parse errors, or a page-build error.
+/// A refusal, parse errors, or an engine error.
 pub fn cmd_load(dump_path: &Path, env_dir: &Path, psize: u32, map_size: u64) -> Result<(), BoxErr> {
     std::fs::create_dir_all(env_dir)?;
     refuse_existing_env(env_dir, "load into")?;
-    let data = env_dir.join(DATA_FILE_NAME);
-    // Lock the (to-be-created) data file for the duration.
-    let _guard = lock::acquire_or_create(env_dir)?;
 
     let text = std::fs::read_to_string(dump_path)?;
     let dbs = dump_format::parse(&text)?;
+    drop(text);
 
     // Split into main user data + named DBs; sort+dedup each defensively.
     let mut main_user: Vec<crate::common::Kv> = Vec::new();
@@ -175,27 +178,24 @@ pub fn cmd_load(dump_path: &Path, env_dir: &Path, psize: u32, map_size: u64) -> 
     }
     named_owned.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // Stream the env straight into the data file, with no in-memory image.
-    // Page content is independent of `map_size` (only the meta pages record
-    // it), so if the streamed file outgrows the requested map_size, re-stream
-    // once with a map_size that comfortably covers it. Txnid 1 = a fresh
-    // env's first state.
-    let need = stream_env_to_file(&data, psize, map_size, &main_user, &named_owned)?;
-    if need > map_size {
-        let ms = round_up(need + need / 4, u64::from(psize));
-        stream_env_to_file(&data, psize, ms, &main_user, &named_owned)?;
-    }
+    let map_size = usize::try_from(map_size).map_err(|_| "map size does not fit in usize")?;
+    let env = open_exclusive_destination(env_dir, psize, map_size, "load into")?;
 
-    // Verify the produced image is structurally clean before returning. Drop
-    // the parse buffers first so peak RAM is max(parse, check), not the sum.
+    // Named DBs first, so each catalog record exists before any write lands
+    // next to it; the main DB's user records last.
+    for (name, entries) in &named_owned {
+        write_db_batched(&env, Some(name), entries)?;
+    }
+    write_db_batched(&env, None, &main_user)?;
     drop(named_owned);
     drop(main_user);
-    drop(text);
-    let img = std::fs::read(&data)?;
-    let violations = check_image(&img, psize);
+
+    // Verify the produced env is structurally clean before returning.
+    let txn = read_txn(&env)?;
+    let violations = check_snapshot(txn.map_bytes(), env.page_size(), txn.snapshot());
     if !violations.is_empty() {
         return Err(format!(
-            "loaded image failed the invariant check ({} violations): {:?}",
+            "loaded env failed the invariant check ({} violations): {:?}",
             violations.len(),
             violations
         )
@@ -204,77 +204,122 @@ pub fn cmd_load(dump_path: &Path, env_dir: &Path, psize: u32, map_size: u64) -> 
     Ok(())
 }
 
-/// A [`PageSink`] over the load destination: one positioned write per page,
-/// no userspace buffering (mirrors `zerodb::copy`'s file sink; durability is
-/// the caller's concern).
-struct LoadSink {
-    file: File,
+/// Open a fresh destination env (native name, lock file on) for `load` or
+/// `migrate-from-lmdb`, and refuse it unless this process opened it alone
+/// and it is still empty (ADR-0023 amendment 18).
+///
+/// The empty-destination check before the open ([`refuse_existing_env`]) ran
+/// without holding anything, so it is repeated here, now that the `Env` is
+/// held: another process may have created and filled the environment in
+/// between and closed it again. A process that opens it after this check
+/// joins as with `mdb_load` (a reader sees each commit; a writer interleaves
+/// its txns).
+///
+/// # Errors
+///
+/// A refusal naming `verb`, or the open's error.
+pub(crate) fn open_exclusive_destination(
+    env_dir: &Path,
     psize: u32,
-    next: u64,
+    map_size: usize,
+    verb: &str,
+) -> Result<Env, BoxErr> {
+    let env = EnvOpenOptions::new()
+        .map_size(map_size)
+        .max_dbs(crate::common::MAX_TOOL_DBS)
+        .page_size(psize)
+        .sequential_writes(true)
+        .lock_file(true)
+        .open(env_dir)?;
+    if !env.opened_exclusively() {
+        return Err(format!(
+            "refusing to {verb} {}: another process has the env open",
+            env_dir.display()
+        )
+        .into());
+    }
+    let txn = read_txn(&env)?;
+    if txn.snapshot().main_db.entries != 0 {
+        return Err(format!(
+            "refusing to {verb} a non-empty env: {} already holds data",
+            env_dir.join(zerodb::DATA_FILE_NAME).display()
+        )
+        .into());
+    }
+    drop(txn);
+    for candidate in naming::existing_data_files(env_dir) {
+        if candidate.name != zerodb::DATA_FILE_NAME && std::fs::metadata(&candidate.path)?.len() > 0
+        {
+            return Err(format!(
+                "refusing to {verb} a non-empty env: {} already exists",
+                candidate.path.display()
+            )
+            .into());
+        }
+    }
+    Ok(env)
 }
 
-impl PageSink for LoadSink {
-    fn alloc(&mut self, n: u64) -> u64 {
-        let p = self.next;
-        self.next += n;
-        p
-    }
-    fn next_pgno(&self) -> u64 {
-        self.next
-    }
-    fn emit(&mut self, pgno: u64, frame: &[u8]) -> std::io::Result<()> {
-        use std::os::unix::fs::FileExt;
-        self.file.write_all_at(frame, pgno * u64::from(self.psize))
-    }
-}
+/// Commit a write txn after this many bytes of keys and values, so one txn
+/// never holds a large DB's dirty pages in memory.
+const BATCH_BYTES: usize = 64 << 20;
 
-/// Stream `(main, named)` into a fresh env file at `data`, returning the
-/// resulting file size in bytes (`(last_pg + 1) * psize`). Truncates any
-/// previous content, so the oversized-map_size retry can simply re-run it.
-fn stream_env_to_file(
-    data: &Path,
-    psize: u32,
-    map_size: u64,
-    main_user: &[crate::common::Kv],
-    named: &[crate::common::NamedDb],
+/// Write `entries` (sorted, unique) into `name`, or the main DB, through
+/// write txns of at most [`BATCH_BYTES`] of records each. Creates a named DB
+/// even when it is empty, so its catalog record exists. When the map fills,
+/// the txn is aborted, the map doubled ([`Env::resize`]) and the batch
+/// retried. Returns the number of records written.
+///
+/// # Errors
+///
+/// An engine error other than a full map.
+fn write_db_batched(
+    env: &Env,
+    name: Option<&[u8]>,
+    entries: &[crate::common::Kv],
 ) -> Result<u64, BoxErr> {
-    // Owner-only, like the engine's own env creation (the lock step already
-    // created this file 0600; keep the mode if a future path creates fresh).
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(data)?
-    };
-    let sink = LoadSink {
-        file,
-        psize,
-        next: FIRST_DATA_PGNO,
-    };
-    let stream_err = |e: StreamBuildError| -> BoxErr { format!("stream build: {e:?}").into() };
-    let mut es = EnvStream::new(sink, psize, 1, DEFAULT_FILL_PERMILLE)
-        .map_err(|e| -> BoxErr { format!("stream build: {e:?}").into() })?;
-    for (name, entries) in named {
-        es.named_db(name, |ts| {
-            for (k, v) in entries {
-                ts.push(k, 0, v)?;
+    let mut start = 0;
+    loop {
+        let mut end = start;
+        let mut bytes = 0;
+        while end < entries.len() && (end == start || bytes < BATCH_BYTES) {
+            bytes += entries[end].0.len() + entries[end].1.len();
+            end += 1;
+        }
+        match write_batch(env, name, &entries[start..end]) {
+            Ok(()) => {}
+            Err(zerodb::Error::Mdb(MdbError::MapFull)) => {
+                let grown = env
+                    .map_size()
+                    .checked_mul(2)
+                    .ok_or("map size overflow while growing the map")?;
+                env.resize(grown)?;
+                continue;
             }
-            Ok(())
-        })
-        .map_err(stream_err)?;
+            Err(e) => return Err(e.into()),
+        }
+        start = end;
+        if start == entries.len() {
+            return Ok(entries.len() as u64);
+        }
     }
-    let sink = es
-        .finish_main(map_size, |ms| {
-            for (k, v) in main_user {
-                ms.push(k, v)?;
-            }
-            Ok(())
-        })
-        .map_err(stream_err)?;
-    Ok(sink.next_pgno() * u64::from(psize))
+}
+
+/// One write txn: create or open the DB and put `batch` into it.
+fn write_batch(
+    env: &Env,
+    name: Option<&[u8]>,
+    batch: &[crate::common::Kv],
+) -> Result<(), zerodb::Error> {
+    let mut wtxn = env.write_txn()?;
+    let db = match name {
+        None => env.main_database(),
+        Some(n) => env.create_database(&mut wtxn, Some(n))?,
+    };
+    for (k, v) in batch {
+        db.put(&mut wtxn, k, v)?;
+    }
+    wtxn.commit()
 }
 
 /// Refuse to create an env in `env_dir` if it already holds a non-empty data
@@ -298,13 +343,8 @@ pub fn refuse_existing_env(env_dir: &Path, verb: &str) -> Result<(), BoxErr> {
     Ok(())
 }
 
-/// Round `n` up to the next multiple of `m` (`m > 0`).
-fn round_up(n: u64, m: u64) -> u64 {
-    n.div_ceil(m) * m
-}
-
-/// Sort by key and drop duplicate keys so the bulk builder sees
-/// strictly-ascending, unique input. A valid dump is already sorted and unique
+/// Sort by key and drop duplicate keys so the write txns see
+/// strictly-ascending, unique input (the case sequential writes serve best). A valid dump is already sorted and unique
 /// (this is purely defensive against a hand-edited dump); on a duplicate key the
 /// first occurrence is kept.
 fn normalize(entries: &mut Vec<crate::common::Kv>) {
@@ -312,18 +352,86 @@ fn normalize(entries: &mut Vec<crate::common::Kv>) {
     entries.dedup_by(|a, b| a.0 == b.0);
 }
 
-/// `check <env-dir>`: run the SPEC 03 §11 / SPEC 05 §9 invariant walker over the
-/// data file and report. Returns `(report, clean)`; the caller exits nonzero
-/// when `!clean`. Offline (exclusive lock); tolerant of a corrupt file (it is
-/// exactly when `check` matters).
+/// `check <env-dir>`: run the SPEC 03 §11 / SPEC 05 §9 invariant walker and
+/// report. Returns `(report, clean)`; the caller exits nonzero when `!clean`.
+///
+/// It attaches to the env read-only through its lock file, like `stat`, and
+/// walks the snapshot its read txn pins: that snapshot's roots, free tree and
+/// `last_pg`, through the txn's map (ADR-0023 amendment 18). So it runs while
+/// other processes have the env open, and never reads a page the snapshot
+/// lists as free.
+///
+/// If the env does not open as a valid one ([`MdbError::Invalid`], which is
+/// when `check` matters most), it walks the raw data file instead, but only
+/// while holding the env's lock file exclusively ([`zerodb::ExclusiveLock`]),
+/// so no process opens the env during the walk. If another process has the
+/// env open, it refuses. On read-only media, where no lock file can be
+/// created, the raw walk runs and its report says it had no liveness
+/// guarantee.
 ///
 /// # Errors
 ///
-/// [`lock::LockError`] if the env is busy/missing, or file I/O errors.
+/// [`naming::NameError`] if the env is missing or ambiguous, a refusal while
+/// the env is in use, or other open and file I/O errors.
 pub fn cmd_check(env_dir: &Path) -> Result<(String, bool), BoxErr> {
-    let (_guard, resolved) = lock::acquire_existing(env_dir)?;
-    let data = resolved.path;
-    let file = File::open(&data)?;
+    let resolved = naming::resolve(env_dir)?;
+    let env = match open_ro(env_dir, resolved.name) {
+        Ok(env) => env,
+        Err(zerodb::Error::Mdb(MdbError::Invalid)) => {
+            return check_raw_exclusively(env_dir, &resolved);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let txn = read_txn(&env)?;
+    let psize = env.page_size();
+    let violations = check_snapshot(txn.map_bytes(), psize, txn.snapshot());
+    let mut out = String::new();
+    writeln!(
+        out,
+        "check {} (page_size={psize}, txnid={})",
+        env_dir.display(),
+        txn.txnid()
+    )?;
+    Ok(report(out, &violations))
+}
+
+/// `check`'s raw-file fallback for an env that does not open: take the env's
+/// lock file exclusively, then walk the data file's bytes.
+fn check_raw_exclusively(
+    env_dir: &Path,
+    data: &naming::EnvDataFile,
+) -> Result<(String, bool), BoxErr> {
+    let opts = crate::common::tool_open_options(env_dir, data.name)?;
+    let (_guard, note) = match zerodb::ExclusiveLock::acquire(env_dir, &opts) {
+        Ok(guard) => (Some(guard), None),
+        Err(zerodb::Error::Io(e)) if e.raw_os_error() == Some(libc::EROFS) => (
+            None,
+            Some(
+                "  note: read-only media, so no lock file: walked the raw file offline, \
+                 without a guarantee that no other process has the env open",
+            ),
+        ),
+        Err(zerodb::Error::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(format!(
+                "the env at {} does not open as a valid env, and another process has it \
+                 open ({e}); the raw-file check needs every other process to close it",
+                env_dir.display()
+            )
+            .into());
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let (mut out, clean) = check_raw_file(env_dir, &data.path)?;
+    if let Some(note) = note {
+        writeln!(out, "{note}")?;
+    }
+    Ok((out, clean))
+}
+
+/// Walk the raw data file at `data` ([`check_image`]). Tolerant of a corrupt
+/// file.
+fn check_raw_file(env_dir: &Path, data: &Path) -> Result<(String, bool), BoxErr> {
+    let file = File::open(data)?;
     let psize = match zerodb_io::probe_page_size(&file)? {
         Some(p) => p,
         None => {
@@ -337,18 +445,27 @@ pub fn cmd_check(env_dir: &Path) -> Result<(String, bool), BoxErr> {
         }
     };
     drop(file);
-    let bytes = std::fs::read(&data)?;
+    let bytes = std::fs::read(data)?;
     let violations = check_image(&bytes, psize);
     let mut out = String::new();
-    writeln!(out, "check {} (page_size={psize})", env_dir.display())?;
+    writeln!(
+        out,
+        "check {} (page_size={psize}, raw file: the env did not open)",
+        env_dir.display()
+    )?;
+    Ok(report(out, &violations))
+}
+
+/// Append the verdict to a `check` report.
+fn report(mut out: String, violations: &[String]) -> (String, bool) {
     if violations.is_empty() {
-        writeln!(out, "  OK: no invariant violations")?;
-        Ok((out, true))
+        out.push_str("  OK: no invariant violations\n");
+        (out, true)
     } else {
-        writeln!(out, "  {} violation(s):", violations.len())?;
-        for v in &violations {
-            writeln!(out, "    {v}")?;
+        let _ = writeln!(out, "  {} violation(s):", violations.len());
+        for v in violations {
+            let _ = writeln!(out, "    {v}");
         }
-        Ok((out, false))
+        (out, false)
     }
 }

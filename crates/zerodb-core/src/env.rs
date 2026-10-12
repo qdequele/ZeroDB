@@ -1524,6 +1524,22 @@ impl Env {
         self.inner.map_size()
     }
 
+    /// Whether this process opened the environment alone: it won the lock
+    /// file's first-opener election, so no other process had the environment
+    /// open at that moment (ADR-0023 amendment 18). Always `true` without a
+    /// lock file, where the environment is single-process.
+    ///
+    /// The answer describes the open only: another process can join later.
+    /// `zerodb-tools load` uses it to refuse a destination that another
+    /// process has open.
+    #[must_use]
+    pub fn opened_exclusively(&self) -> bool {
+        self.inner
+            .shared
+            .as_ref()
+            .is_none_or(|r| r.is_initializer())
+    }
+
     /// Change the map size, as `mdb_env_set_mapsize` on an open env
     /// (ADR-0023 amendment 15).
     ///

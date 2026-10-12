@@ -9,6 +9,10 @@
 //! GC DB — never both (reuse-while-referenced), never neither (leak).
 //! (INV-27, the `non_free_pages_size` identity, is asserted at the API level —
 //! this walk has no `fstat`.)
+//!
+//! [`check_snapshot`] runs the same walk over one committed snapshot of a
+//! live environment, read through a read txn's map, without the meta slots
+//! (ADR-0023 amendment 18).
 
 use std::collections::{HashMap, HashSet};
 
@@ -570,15 +574,89 @@ pub fn check_image(bytes: &[u8], psize: u32) -> Vec<String> {
         }
     }
     // Format v2 (ADR-0022): the selected meta's free-list annex ids are free
-    // pages (SPEC 05 §2a). Validate their GC-29 shape (the INV-25/26
-    // analogues, labelled INV-28) and count them into the free set for the
-    // INV-22/24 partition.
+    // pages (SPEC 05 §2a).
     let annex = MetaPage::read_annex(&bytes[chosen * ps..(chosen + 1) * ps], psize)
         .expect("annex count was bounds-checked by MetaPage::validate");
+    check_state(
+        bytes,
+        psize,
+        &SnapshotRoots {
+            txnid: meta.txnid,
+            last_pg: meta.last_pg,
+            main_db: &meta.main_db,
+            free_db: &meta.free_db,
+            annex: &annex,
+        },
+        violations,
+    )
+}
+
+/// Check one committed snapshot of a live environment (ADR-0023 amendment
+/// 18): its roots, its free tree, its free-list annex and its `last_pg`, read
+/// through `map`, the mapped data file a read txn pinning `snap` borrows
+/// ([`crate::rotxn::RoTxn::map_bytes`]). Returns the violations (empty =
+/// clean), as [`check_image`].
+///
+/// Unlike [`check_image`] it never reads the meta slots, which another
+/// process may be overwriting, and it reads only pages the snapshot
+/// references: the pages it lists as free may be rewritten by a writer while
+/// the walk runs. `map` may be longer than the file; the file-length
+/// invariants are asserted against `(last_pg + 1) * psize` instead.
+#[must_use]
+pub fn check_snapshot(map: &[u8], psize: u32, snap: &crate::env::Snapshot) -> Vec<String> {
+    let needed = snap
+        .last_pg
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(u64::from(psize)))
+        .and_then(|n| usize::try_from(n).ok());
+    let bytes = match needed {
+        Some(n) if n <= map.len() => &map[..n],
+        _ => {
+            return vec![format!(
+                "INV-17: map length {} < (last_pg {} + 1) * psize",
+                map.len(),
+                snap.last_pg
+            )]
+        }
+    };
+    check_state(
+        bytes,
+        psize,
+        &SnapshotRoots {
+            txnid: snap.txnid,
+            last_pg: snap.last_pg,
+            main_db: &snap.main_db,
+            free_db: &snap.free_db,
+            annex: &snap.free_annex,
+        },
+        Vec::new(),
+    )
+}
+
+/// The parts of a committed state the walk starts from.
+struct SnapshotRoots<'a> {
+    txnid: u64,
+    last_pg: u64,
+    main_db: &'a DBRecord,
+    free_db: &'a DBRecord,
+    annex: &'a [u64],
+}
+
+/// Walk the state `roots` describes over `bytes`, which covers at least
+/// pages `0..=roots.last_pg`, appending to `violations`.
+fn check_state(
+    bytes: &[u8],
+    psize: u32,
+    roots: &SnapshotRoots<'_>,
+    mut violations: Vec<String>,
+) -> Vec<String> {
+    // Validate the annex's GC-29 shape (the INV-25/26 analogues, labelled
+    // INV-28) and count its ids into the free set for the INV-22/24
+    // partition.
     let mut free: HashMap<u64, u64> = HashMap::new();
     let mut prev: Option<u64> = None;
-    for &id in &annex {
-        if id < FIRST_DATA_PGNO || id > meta.last_pg {
+    for &id in roots.annex {
+        if id < FIRST_DATA_PGNO || id > roots.last_pg {
             violations.push(format!("INV-28: annex free id {id} out of range"));
         }
         if let Some(p) = prev {
@@ -592,15 +670,15 @@ pub fn check_image(bytes: &[u8], psize: u32) -> Vec<String> {
     let mut checker = Checker {
         bytes,
         psize,
-        meta_txnid: meta.txnid,
-        last_pg: meta.last_pg,
+        meta_txnid: roots.txnid,
+        last_pg: roots.last_pg,
         visited: HashSet::new(),
         free,
-        annex_count: annex.len(),
+        annex_count: roots.annex.len(),
         violations,
     };
-    checker.check_catalog_record("main_db", &meta.main_db);
-    checker.check_record("free_db", &meta.free_db, true);
+    checker.check_catalog_record("main_db", roots.main_db);
+    checker.check_record("free_db", roots.free_db, true);
     // INV-10 / INV-22 + INV-24 (reachable XOR free, unconditional).
     checker.check_reachable_xor_free();
     checker.violations
@@ -625,6 +703,48 @@ mod tests {
             .collect();
         let img = build_single_db_image(PS, 8 << 20, 3, &entries, 900).unwrap();
         assert_eq!(check_image(&img, PS), Vec::<String>::new());
+    }
+
+    /// The snapshot walk reads the same state as the image walk, from a map
+    /// that may run past the file, and never the meta slots.
+    #[test]
+    fn snapshot_walk_matches_the_image_walk() {
+        let entries: Vec<_> = (0u32..3000)
+            .map(|i| (format!("key{i:06}").into_bytes(), b"v".to_vec()))
+            .collect();
+        let img = build_single_db_image(PS, 8 << 20, 3, &entries, 900).unwrap();
+        let ps = PS as usize;
+        let slot = |i: usize| match MetaPage::validate(&img[i * ps..(i + 1) * ps], PS) {
+            Ok(crate::page::MetaValidity::Valid(m)) => Some(m),
+            _ => None,
+        };
+        let (meta, i) = match (slot(0), slot(1)) {
+            (Some(a), Some(b)) if b.txnid > a.txnid => (b, 1),
+            (Some(a), _) => (a, 0),
+            (None, Some(b)) => (b, 1),
+            (None, None) => panic!("no valid meta slot"),
+        };
+        let annex = MetaPage::read_annex(&img[i * ps..(i + 1) * ps], PS).unwrap();
+        let snap = crate::env::Snapshot::from_meta(&meta, annex);
+
+        // A map longer than the file, with both meta slots zeroed: still clean.
+        let mut map = img.clone();
+        map.resize(img.len() + 4 * ps, 0);
+        map[..2 * ps].fill(0);
+        assert_eq!(check_snapshot(&map, PS, &snap), Vec::<String>::new());
+
+        // A map that does not reach last_pg.
+        let short = &img[..img.len() - ps];
+        let v = check_snapshot(short, PS, &snap);
+        assert!(
+            v.iter().any(|s| s.starts_with("INV-17")),
+            "expected INV-17, got {v:?}"
+        );
+
+        // A reachable page corrupted in the map is reported.
+        let mut bad = img.clone();
+        bad[2 * ps + 8..2 * ps + 16].copy_from_slice(&999u64.to_le_bytes());
+        assert!(!check_snapshot(&bad, PS, &snap).is_empty());
     }
 
     #[test]

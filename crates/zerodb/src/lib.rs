@@ -477,6 +477,45 @@ impl EnvOpenOptions {
         self.max_readers
     }
 
+    /// ADR-0010: the data-file name must be a single path component, so it
+    /// can only ever name a file *inside* the env directory.
+    fn check_data_file_name(&self) -> Result<()> {
+        if !is_single_component(&self.data_file_name) {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "data_file_name ({:?}) must be a single, non-empty path component",
+                    self.data_file_name
+                ),
+            )));
+        }
+        Ok(())
+    }
+
+    /// ADR-0023: the lock-file name must be a single path component, and
+    /// must not be the data file. The lock-file initializer truncates its
+    /// file, so sharing the name would destroy the data; it is rejected before
+    /// either file is opened. Other names of the data file (hard links, case
+    /// variants) are caught by the same-file guard in `LockFile::open`
+    /// (amendment 16).
+    fn check_lock_file_name(&self, lock_file_name: &OsStr) -> Result<()> {
+        if !is_single_component(lock_file_name) {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "lock_file_name ({lock_file_name:?}) must be a single, non-empty path component"
+                ),
+            )));
+        }
+        if lock_file_name == self.data_file_name {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("lock_file_name ({lock_file_name:?}) must differ from data_file_name"),
+            )));
+        }
+        Ok(())
+    }
+
     /// Open (or create) the environment at `path` (SPEC 00 row 7).
     ///
     /// `path` is a **directory** (the directory-env convention, SPEC 00 row 7);
@@ -536,39 +575,12 @@ impl EnvOpenOptions {
                 ),
             )));
         }
-        // ADR-0010: the data-file name must be a single path component, so it
-        // can only ever name a file *inside* the env directory.
-        if !is_single_component(&self.data_file_name) {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "data_file_name ({:?}) must be a single, non-empty path component",
-                    self.data_file_name
-                ),
-            )));
-        }
+        self.check_data_file_name()?;
         // ADR-0023 amendment 16: the explicit lock-file name, or the one
         // derived from the data-file name.
         let lock_file_name = self.get_lock_file_name();
-        // ADR-0023: the lock-file name must also be a single path component.
-        if self.lock_file && !is_single_component(&lock_file_name) {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "lock_file_name ({lock_file_name:?}) must be a single, non-empty path component"
-                ),
-            )));
-        }
-        // ADR-0023: the lock file must not be the data file. The lock-file
-        // initializer truncates its file, so sharing the name would destroy
-        // the data; reject it before either file is opened. Other names of
-        // the data file (hard links, case variants) are caught by the
-        // same-file guard in `LockFile::open` (amendment 16).
-        if self.lock_file && lock_file_name == self.data_file_name {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("lock_file_name ({lock_file_name:?}) must differ from data_file_name"),
-            )));
+        if self.lock_file {
+            self.check_lock_file_name(&lock_file_name)?;
         }
         // Reject out-of-range limits before any file exists: the lock file is
         // sized from `max_readers`, and its initializer writes every slot.
@@ -652,5 +664,73 @@ impl EnvOpenOptions {
             l.finish_open().map_err(Error::Io)?;
         }
         Ok(env)
+    }
+}
+
+/// Holds an environment's lock file as an unfinished initializer: every other
+/// opener waits in the first-opener election until this guard drops (ADR-0023
+/// amendment 18).
+///
+/// `zerodb-tools check` takes it before walking the raw data file of an
+/// environment that does not open, so no process opens the environment, and
+/// so writes the file, during the walk. It is the process's only descriptor
+/// of the lock file: the in-process registry refuses a second open of it,
+/// including an [`EnvOpenOptions::open`] of the same environment, while the
+/// guard lives.
+pub struct ExclusiveLock {
+    _lock: std::sync::Arc<zerodb_io::lockfile::LockFile>,
+}
+
+impl std::fmt::Debug for ExclusiveLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExclusiveLock").finish_non_exhaustive()
+    }
+}
+
+impl ExclusiveLock {
+    /// Take the lock file of the environment in directory `dir`, opened as
+    /// `opts` would open it: the data file is
+    /// [`EnvOpenOptions::get_data_file_name`] and the lock file
+    /// [`EnvOpenOptions::get_lock_file_name`] (whether or not
+    /// [`EnvOpenOptions::lock_file`] is on), with
+    /// [`EnvOpenOptions::get_max_readers`] slots.
+    ///
+    /// Succeeds only if this process wins the first-opener election at once,
+    /// that is, no other process has the environment open or is opening it.
+    /// It never waits. On success the lock file is initialized as by a first
+    /// opener that has not finished opening; dropping the guard leaves it in
+    /// a state the next opener accepts.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] of kind `WouldBlock` ("environment in use") if another
+    ///   process holds the election.
+    /// - [`Error::EnvAlreadyOpened`] if this process already has the lock
+    ///   file open.
+    /// - [`Error::Io`] (`InvalidInput`) for an invalid data-file or lock-file
+    ///   name, or when a lock-file guard refuses the file (as
+    ///   [`EnvOpenOptions::open`]); other I/O errors, including the error of
+    ///   creating the lock file on read-only media.
+    pub fn acquire(dir: &Path, opts: &EnvOpenOptions) -> Result<ExclusiveLock> {
+        opts.check_data_file_name()?;
+        let lock_file_name = opts.get_lock_file_name();
+        opts.check_lock_file_name(&lock_file_name)?;
+        zerodb_core::env::check_open_limits(opts.max_readers, opts.max_dbs)?;
+        let canonical_dir = dir.canonicalize().map_err(Error::Io)?;
+        let data_path = canonical_dir.join(&opts.data_file_name);
+        let path = canonical_dir.join(&lock_file_name);
+        match zerodb_io::lockfile::LockFile::try_open_exclusive(&path, &data_path, opts.max_readers)
+        {
+            Ok(Some(lock)) => Ok(ExclusiveLock { _lock: lock }),
+            Ok(None) => Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "environment in use",
+            ))),
+            Err(zerodb_io::lockfile::LockOpenError::AlreadyOpen) => Err(Error::EnvAlreadyOpened),
+            Err(zerodb_io::lockfile::LockOpenError::Mismatch(m)) => Err(Error::Io(
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, m),
+            )),
+            Err(zerodb_io::lockfile::LockOpenError::Io(e)) => Err(Error::Io(e)),
+        }
     }
 }

@@ -241,6 +241,46 @@ fn registry_key(path: &Path) -> std::io::Result<RegistryKey> {
     Ok(RegistryKey::Missing(dir.canonicalize()?.join(name)))
 }
 
+/// How [`LockFile::open_with`] takes part in the first-opener election.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Election {
+    /// Become the initializer, or wait for the initializer and join.
+    Wait,
+    /// Become the initializer, or give up at once.
+    TryExclusive,
+}
+
+/// The `max_readers` recorded in the lock file at `path`, if it is a
+/// finished ZeroDB lock file (it carries the final magic); `Ok(None)` if the
+/// file does not exist or is not finished.
+///
+/// A process that joins a running environment must open it with that value
+/// ([`LockFile::open`] refuses another one); a tool that attaches to an
+/// environment it did not create reads it here first. The value can change
+/// before the open if every process closes and another reinitializes the
+/// file, which the open then reports as a mismatch.
+///
+/// The read uses its own short-lived descriptor, claimed in this process's
+/// registry like an open, so it never closes a descriptor of a lock file
+/// this process has open (which would drop that handle's record locks).
+///
+/// # Errors
+///
+/// [`LockOpenError::AlreadyOpen`] if this process has the lock file open,
+/// and I/O errors other than a missing file.
+pub fn published_max_readers(path: &Path) -> Result<Option<u32>, LockOpenError> {
+    let _registration = Registration::claim(path)?;
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if read_u64_at(&file, OFF_MAGIC)? != LOCK_MAGIC {
+        return Ok(None);
+    }
+    Ok(Some(read_u32_at(&file, OFF_MAX_READERS)?))
+}
+
 /// The mapped lock file. Field order matters for `Drop`: the map is
 /// unmapped before the descriptor closes, closing the descriptor releases
 /// this process's record locks, and only then is the path released in the
@@ -301,6 +341,44 @@ impl LockFile {
         data_path: &Path,
         max_readers: u32,
     ) -> Result<Arc<LockFile>, LockOpenError> {
+        match Self::open_with(path, data_path, max_readers, Election::Wait)? {
+            Some(lock) => Ok(lock),
+            // `Election::Wait` never gives up on the election.
+            None => unreachable!("a waiting open returned without a lock file"),
+        }
+    }
+
+    /// Open the lock file at `path` only if this process wins the
+    /// first-opener election at once; never wait for another opener
+    /// (ADR-0023 amendment 18). `Ok(None)` means another process holds the
+    /// election byte, that is, has the environment open or is opening it;
+    /// the descriptor is closed and nothing in the file is changed.
+    ///
+    /// On success this process is the initializer, exactly as after
+    /// [`LockFile::open`]: the file is validated by the same guards,
+    /// truncated and re-initialized, and the election byte stays
+    /// write-locked until [`LockFile::finish_open`] or the drop. A caller that
+    /// never calls `finish_open` holds every other opener in the election for
+    /// the handle's life; dropping it leaves the initializing magic, which the
+    /// next initializer accepts.
+    ///
+    /// # Errors
+    ///
+    /// As [`LockFile::open`], except that it never times out in the election.
+    pub fn try_open_exclusive(
+        path: &Path,
+        data_path: &Path,
+        max_readers: u32,
+    ) -> Result<Option<Arc<LockFile>>, LockOpenError> {
+        Self::open_with(path, data_path, max_readers, Election::TryExclusive)
+    }
+
+    fn open_with(
+        path: &Path,
+        data_path: &Path,
+        max_readers: u32,
+        election: Election,
+    ) -> Result<Option<Arc<LockFile>>, LockOpenError> {
         // Claimed before any descriptor exists: POSIX record locks belong to
         // the process, and closing a second descriptor would drop the first
         // handle's locks (ADR-0023 amendment 2). On every error below the
@@ -323,6 +401,12 @@ impl LockFile {
         let initializer = loop {
             if record_lock(&file, libc::F_SETLK, WRLCK, ELECTION_BYTE)? {
                 break true;
+            }
+            if election == Election::TryExclusive {
+                // Another process holds the byte. This process holds no record
+                // lock on the file, so closing the descriptor (with the
+                // registration) drops nothing.
+                return Ok(None);
             }
             // Blocks until the initializer downgrades in `finish_open`, or
             // exits.
@@ -439,7 +523,7 @@ impl LockFile {
                 "liveness lock already held",
             )));
         }
-        Ok(Arc::new(lock))
+        Ok(Some(Arc::new(lock)))
     }
 
     /// Record the data page size (initializer) or check it (joiner).
@@ -917,6 +1001,49 @@ mod tests {
         assert_eq!(l.pid(), std::process::id());
         l.bind_page_size(4096).unwrap();
         l.finish_open().unwrap();
+    }
+
+    /// A try-exclusive open with no other opener initializes the file and
+    /// leaves the initializing magic; the next opener accepts it.
+    #[test]
+    fn try_open_exclusive_initializes_without_publishing() {
+        let path = tmp();
+        let data = path.with_file_name("zerodb.dat");
+        let l = LockFile::try_open_exclusive(&path, &data, 8)
+            .expect("open")
+            .expect("no other opener");
+        assert!(l.is_initializer());
+        assert_eq!(l.slots().len(), 8);
+        assert_eq!(read_u64_at(&l.file, OFF_MAGIC).unwrap(), LOCK_MAGIC_INIT);
+        assert!(matches!(
+            LockFile::try_open_exclusive(&path, &data, 8),
+            Err(LockOpenError::AlreadyOpen)
+        ));
+        drop(l);
+        let l = LockFile::open(&path, &data, 8).expect("reopen");
+        assert!(l.is_initializer());
+    }
+
+    /// The recorded `max_readers` is read only from a finished lock file, and
+    /// never through a second descriptor of one this process has open.
+    #[test]
+    fn published_max_readers_reads_a_finished_file() {
+        let path = tmp();
+        let data = path.with_file_name("zerodb.dat");
+        assert_eq!(published_max_readers(&path).unwrap(), None, "missing");
+        let l = LockFile::try_open_exclusive(&path, &data, 8)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            published_max_readers(&path),
+            Err(LockOpenError::AlreadyOpen)
+        ));
+        drop(l);
+        assert_eq!(published_max_readers(&path).unwrap(), None, "unfinished");
+        let l = LockFile::open(&path, &data, 12).unwrap();
+        l.finish_open().unwrap();
+        drop(l);
+        assert_eq!(published_max_readers(&path).unwrap(), Some(12));
     }
 
     #[test]

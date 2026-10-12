@@ -1,17 +1,30 @@
-# `zerodb-tools` — offline env utilities
+# `zerodb-tools` — env utilities
 
-Offline utilities for a zerodb env directory. **All tools operate offline**:
-they take a best-effort exclusive `flock` on the env's data file and refuse if
-the env may be live (zerodb is single-process and has no cross-process reader
-protocol — see `DIVERGENCES.md` — so pointing a tool at a running env would be
-unsafe; close it first).
+Utilities for a zerodb env directory. They work on a **live** environment, as
+LMDB's `mdb_stat` and `mdb_dump` do (ADR-0023 amendment 18):
+
+- `stat`, `dump` and `check` open the env read-only through the engine, with
+  its lock file, and so attach to an env that other processes have open. They
+  take a reader slot and read one consistent snapshot while writers keep
+  committing; a long `dump` or `check` pins that snapshot, so the file can
+  grow while it runs, as with `mdb_dump` holding a read txn. The first tool to
+  open a closed env creates its lock file, as any opener does.
+- `load` and `migrate-from-lmdb` create a fresh env. They refuse a destination
+  that holds data, or that another process has open, and keep the env open for
+  the whole run. A process that opens the env after that check joins it, as
+  with `mdb_load`: a reader sees each commit, a writer interleaves its txns.
 
 The data file is `zerodb.dat` in a natively-created env and `data.mdb` in one
 created through the `heed-zerodb` adapter (ADR-0010; the file-name entry in
 `DIVERGENCES.md`). The read tools
-probe **both** names; a directory holding both is a hard error rather than a
-silent pick, and `stat` prints an engine-identification line read from the
-file's own `ZDB1` magic.
+probe **both** names and use the lock file named after the one found
+(`zerodb.lock` or `lock.mdb`), the same one the processes using the env open;
+a directory holding both data files is a hard error rather than a silent
+pick, and `stat` prints an engine-identification line read from the file's own
+`ZDB1` magic. A tool joining a running env adopts the `max_readers` its lock
+file records; one that opens a closed env sizes the lock file with the default
+(126), and while it runs a process opening the env with another `max_readers`
+is refused, as two processes with different values always are.
 
 ```
 zerodb-tools <SUBCOMMAND> [ARGS]
@@ -45,16 +58,24 @@ or any other failure (unknown subcommand or option, unreadable env, …). Unknow
   engines and page sizes. Writes to stdout unless `--out` is given.
 
 - **`load <dump-file> <env-dir> [--page-size N] [--map-size BYTES]`** — rebuild
-  a **fresh** env from a dump using the **streaming** bulk builder
-  (bottom-up packed, O(tree depth × page size) build memory, pages written
-  straight to the data file). Two steps still hold a whole file in memory: the
-  dump-text parse and the post-load invariant check of the produced env
-  (issue #63). Refuses a non-empty target.
+  a **fresh** env from a dump through ordinary write txns with sequential
+  writes (ADR-0015), as `mdb_load` does, committing every 64 MiB of records;
+  the map doubles whenever it fills, so `--map-size` is a starting size. The
+  dump-text parse still holds the whole dump in memory (issue #63). The
+  produced env is checked through the map before the command returns.
+  Refuses a target that holds data under either data-file name, or that
+  another process has open.
 
 - **`check <env-dir>`** — run the invariant walker (SPEC 03 §11 / SPEC 05 §9)
-  over the data file and report; exits non-zero on any violation. Tolerant of
-  a corrupt file (which is exactly when it matters). Reads the whole data file
-  into memory.
+  and report; exits non-zero on any violation. Attached, it walks the
+  snapshot its read txn pins (that snapshot's roots, free tree and `last_pg`,
+  through the map) and never reads a page that snapshot lists as free. If the
+  env does not open as a valid one (which is exactly when `check` matters), it
+  falls back to the raw data file, read whole into memory, but only while it
+  holds the env's lock file exclusively, so no process can open the env
+  during the walk; if another process has the env open it refuses and says
+  so. On read-only media, where no lock file can exist, the raw walk runs and
+  its report says it had no liveness guarantee.
 
 - **`migrate-from-lmdb <src-lmdb-dir> <dst-env-dir> [--page-size N] [--map-size BYTES]`**
   — open a real LMDB env read-only and stream every DB (main + named sub-DBs)

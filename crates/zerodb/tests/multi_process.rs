@@ -858,3 +858,80 @@ fn two_processes_with_different_data_names_use_different_lock_files() {
     let r = a.read_txn().unwrap();
     assert_eq!(a.main_database().get(&r, b"who").unwrap(), Some(&b"a2"[..]));
 }
+
+/// The lock-file options `open` uses, for `ExclusiveLock::acquire`.
+fn lock_opts() -> EnvOpenOptions {
+    let mut o = EnvOpenOptions::new();
+    o.max_readers(16).lock_file(true);
+    o
+}
+
+/// ADR-0023 amendment 18: `Env::opened_exclusively` is `true` for the
+/// process that opens the environment alone and `false` for one that joins
+/// another, and `ExclusiveLock::acquire` succeeds only when no other process
+/// has the environment open, never waiting for one.
+#[test]
+fn opened_exclusively_and_exclusive_lock_see_another_process() {
+    let dir = TempDir::new();
+    {
+        let env = open(dir.path());
+        assert!(env.opened_exclusively(), "the sole opener");
+    }
+    {
+        let env = EnvOpenOptions::new().open(dir.path()).unwrap();
+        assert!(env.opened_exclusively(), "no lock file");
+    }
+
+    let mut c = child("hold_reader", dir.path());
+    wait_for(&dir.path().join("child-reading"), Duration::from_secs(30));
+    {
+        let env = open(dir.path());
+        assert!(!env.opened_exclusively(), "a joiner");
+    }
+    let started = Instant::now();
+    match zerodb::ExclusiveLock::acquire(dir.path(), &lock_opts()) {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{e}"),
+        other => panic!("expected WouldBlock, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "acquire waited for the other process"
+    );
+    mark(dir.path(), "child-stop");
+    wait_success(&mut c, Duration::from_secs(30));
+
+    let guard = zerodb::ExclusiveLock::acquire(dir.path(), &lock_opts()).expect("alone");
+    assert!(
+        matches!(lock_opts().open(dir.path()), Err(Error::EnvAlreadyOpened)),
+        "the guard is this process's descriptor of the lock file"
+    );
+    drop(guard);
+    // The guard left the initializing magic; the next opener accepts it.
+    let env = open(dir.path());
+    assert!(env.opened_exclusively());
+    let r = env.read_txn().unwrap();
+    drop(r);
+}
+
+/// While this process holds the `ExclusiveLock`, another process's open
+/// waits in the election, and proceeds once the guard drops.
+#[test]
+fn exclusive_lock_holds_other_openers_in_the_election() {
+    let dir = TempDir::new();
+    drop(open(dir.path()));
+    let guard = zerodb::ExclusiveLock::acquire(dir.path(), &lock_opts()).expect("alone");
+    let mut c = child("write_one", dir.path());
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        c.try_wait().unwrap().is_none(),
+        "the child opened while the guard was held"
+    );
+    drop(guard);
+    wait_success(&mut c, Duration::from_secs(30));
+    let env = open(dir.path());
+    let r = env.read_txn().unwrap();
+    assert_eq!(
+        env.main_database().get(&r, b"from-child").unwrap(),
+        Some(&b"1"[..])
+    );
+}
