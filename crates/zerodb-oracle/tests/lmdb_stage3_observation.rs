@@ -1,7 +1,8 @@
 //! What the Meilisearch LMDB fork does at the multi-process parity points
 //! ADR-0023 stage 3 still has to match: map growth by another process,
 //! `mdb_env_set_mapsize`, `MDB_PREVSNAPSHOT`, read-only opens, `MDB_NOLOCK`, and
-//! `mdb_env_info` / `mdb_env_stat` seeing another process's commit.
+//! `mdb_env_info` / `mdb_env_stat` seeing another process's commit, and a
+//! joiner's reader-table size.
 //! AGENTS.md rule 1: observed, not guessed. Drives the vendored fork through
 //! `lmdb-master-sys`; the test binary re-runs itself as the second process.
 //!
@@ -63,6 +64,24 @@ const OBS_RDONLY_LOCK_DIR_UNWRITABLE: i32 = libc::EACCES;
 /// `MDB_RDONLY` open of an env with no `lock.mdb` on a read-only filesystem.
 /// -1 when no read-only filesystem could be made here.
 const OBS_RDONLY_LOCK_READONLY_FS: i32 = 0;
+/// A joiner asks for 126 reader slots while another process holds the env
+/// with 200: the open's rc, and `mdb_env_get_maxreaders` afterwards. The
+/// joiner adopts the lock file's count. macOS (Darwin 27.0.0), 2026-10-13.
+const OBS_JOINER_FEWER_MAXREADERS: (i32, u32) = (0, 200);
+/// A joiner asks for 200 reader slots while another process holds the env
+/// with 126: the open's rc, and `mdb_env_get_maxreaders` afterwards. The
+/// joiner adopts the lock file's count. macOS (Darwin 27.0.0), 2026-10-13.
+const OBS_JOINER_MORE_MAXREADERS: (i32, u32) = (0, 126);
+/// A sole opener asks for 126 reader slots after a previous run (now
+/// closed) left a lock file sized for 200: `mdb_env_get_maxreaders`. LMDB
+/// never shrinks the lock file, and sizes the table from it. macOS (Darwin
+/// 27.0.0), 2026-10-13.
+const OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS: u32 = 200;
+/// `MDB_RDONLY` open on a read-only filesystem with no `lock.mdb` (it runs
+/// without a lock file): whether `mdb_env_get_flags` then reports
+/// `MDB_NOLOCK` (it reports `MDB_RDONLY | MDB_NOTLS` only). macOS (Darwin
+/// 27.0.0, `hdiutil` read-only image), 2026-10-13.
+const OBS_RDONLY_READONLY_FS_REPORTS_NOLOCK: bool = false;
 
 struct Lmdb {
     env: *mut ffi::MDB_env,
@@ -72,13 +91,23 @@ impl Lmdb {
     /// Open `dir` with the given map size and flags (`MDB_NOTLS` is added);
     /// the raw return code on failure.
     fn try_open(dir: &Path, mapsize: u64, flags: c_uint) -> Result<Lmdb, c_int> {
+        Lmdb::try_open_readers(dir, mapsize, flags, 8)
+    }
+
+    /// [`Lmdb::try_open`] with `maxreaders` reader slots requested.
+    fn try_open_readers(
+        dir: &Path,
+        mapsize: u64,
+        flags: c_uint,
+        maxreaders: c_uint,
+    ) -> Result<Lmdb, c_int> {
         let path = CString::new(dir.to_str().unwrap()).unwrap();
         let mut env = ptr::null_mut();
         // SAFETY: plain C API calls on a fresh env handle; `path` outlives
         // `mdb_env_open`. On failure the handle is closed as the C API requires.
         unsafe {
             assert_eq!(ffi::mdb_env_create(&mut env), 0);
-            assert_eq!(ffi::mdb_env_set_maxreaders(env, 8), 0);
+            assert_eq!(ffi::mdb_env_set_maxreaders(env, maxreaders), 0);
             assert_eq!(ffi::mdb_env_set_mapsize(env, mapsize as _), 0);
             let rc = ffi::mdb_env_open(env, path.as_ptr(), MDB_NOTLS | flags, 0o644);
             if rc != 0 {
@@ -156,6 +185,20 @@ impl Lmdb {
 
     fn psize(&self) -> u64 {
         self.stat().ms_psize as u64
+    }
+
+    fn maxreaders(&self) -> u32 {
+        let mut n: c_uint = 0;
+        // SAFETY: plain call on an open env; `n` outlives it.
+        assert_eq!(unsafe { ffi::mdb_env_get_maxreaders(self.env, &mut n) }, 0);
+        n
+    }
+
+    fn flags(&self) -> c_uint {
+        let mut f: c_uint = 0;
+        // SAFETY: plain call on an open env; `f` outlives it.
+        assert_eq!(unsafe { ffi::mdb_env_get_flags(self.env, &mut f) }, 0);
+        f
     }
 
     fn set_mapsize(&self, size: u64) -> c_int {
@@ -305,6 +348,13 @@ fn child_entry() {
         "hold_open" | "hold_writer" => {
             let env = Lmdb::try_open(&dir, mapsize, 0).unwrap();
             let _txn = (name == "hold_writer").then(|| env.begin(0).unwrap());
+            std::fs::write(dir.join("held"), b"").unwrap();
+            std::thread::sleep(Duration::from_secs(600));
+        }
+        // Hold the env open with `maxreaders` reader slots (the role's
+        // number) until killed.
+        "hold_readers" => {
+            let _env = Lmdb::try_open_readers(&dir, MIB, 0, mapsize as c_uint).unwrap();
             std::fs::write(dir.join("held"), b"").unwrap();
             std::thread::sleep(Duration::from_secs(600));
         }
@@ -827,4 +877,65 @@ fn observe_rdonly_lock_readonly_fs() {
     if rc != -1 {
         assert_eq!(rc, OBS_RDONLY_LOCK_READONLY_FS);
     }
+}
+
+/// Open with `mine` reader slots while a child holds the env with `held`:
+/// `(rc, mdb_env_get_maxreaders)` (`0` readers when the open fails).
+fn joiner_maxreaders(held: u32, mine: u32) -> (i32, u32) {
+    let dir = TempDir::new().unwrap();
+    let _c = {
+        let c = spawn(&format!("hold_readers:{held}"), dir.path());
+        wait_for(&dir.path().join("held"));
+        c
+    };
+    match Lmdb::try_open_readers(dir.path(), MIB, 0, mine) {
+        Ok(env) => (0, env.maxreaders()),
+        Err(rc) => (rc, 0),
+    }
+}
+
+#[test]
+fn observe_joiner_fewer_maxreaders() {
+    let got = joiner_maxreaders(200, 126);
+    println!("joiner maxreaders 126, lock file sized for 200: (rc, maxreaders) {got:?}");
+    assert_eq!(got, OBS_JOINER_FEWER_MAXREADERS);
+}
+
+#[test]
+fn observe_joiner_more_maxreaders() {
+    let got = joiner_maxreaders(126, 200);
+    println!("joiner maxreaders 200, lock file sized for 126: (rc, maxreaders) {got:?}");
+    assert_eq!(got, OBS_JOINER_MORE_MAXREADERS);
+}
+
+#[test]
+fn observe_sole_opener_after_larger_run_maxreaders() {
+    let dir = TempDir::new().unwrap();
+    drop(Lmdb::try_open_readers(dir.path(), MIB, 0, 200).unwrap());
+    let got = Lmdb::try_open_readers(dir.path(), MIB, 0, 126)
+        .unwrap()
+        .maxreaders();
+    println!("sole opener maxreaders 126 after a run with 200: maxreaders {got}");
+    assert_eq!(got, OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS);
+}
+
+#[test]
+fn observe_rdonly_readonly_fs_reports_nolock() {
+    let src = TempDir::new().unwrap();
+    env_without_lock(src.path());
+    let fs = match read_only_fs(src.path()) {
+        Ok(fs) => fs,
+        Err(why) => {
+            println!("SKIPPED: no read-only filesystem here ({why})");
+            return;
+        }
+    };
+    let env = Lmdb::try_open(&fs.mount, MIB, MDB_RDONLY).unwrap();
+    let nolock = env.flags() & ffi::MDB_NOLOCK != 0;
+    println!(
+        "MDB_RDONLY on a read-only filesystem: flags {:#x}, NOLOCK {nolock}",
+        env.flags()
+    );
+    drop(env);
+    assert_eq!(nolock, OBS_RDONLY_READONLY_FS_REPORTS_NOLOCK);
 }
