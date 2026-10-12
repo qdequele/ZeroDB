@@ -372,6 +372,19 @@ impl Backing for FaultBacking {
         self.inner.view()
     }
 
+    fn grow_map(&self, map_size: u64) -> std::io::Result<()> {
+        // ADR-0023 amendment 15: forward, so crash cycles run over a backing
+        // that can grow. Growth writes no page content: a grown file reads as
+        // zeros past its old end, which the durable image already models (it
+        // grows only as writes are folded).
+        self.inner.grow_map(map_size)
+    }
+
+    fn ensure_file_len(&self, len: u64) -> std::io::Result<()> {
+        // As `grow_map`: a forward; no page content is written.
+        self.inner.ensure_file_len(len)
+    }
+
     fn real_disk_size(&self) -> std::io::Result<u64> {
         self.inner.real_disk_size()
     }
@@ -1116,6 +1129,48 @@ mod tests {
             cap.durable_len,
             2 * u64::from(PS),
             "no data extension folded"
+        );
+    }
+
+    /// An inner backing that records the map-growth calls it receives.
+    struct GrowLog(Arc<Mutex<Vec<(&'static str, u64)>>>);
+
+    impl Backing for GrowLog {
+        fn view(&self) -> MapView<'_> {
+            MapView {
+                bytes: &[],
+                map_size: 0,
+            }
+        }
+        fn grow_map(&self, map_size: u64) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(("grow_map", map_size));
+            Ok(())
+        }
+        fn ensure_file_len(&self, len: u64) -> std::io::Result<()> {
+            self.0.lock().unwrap().push(("ensure_file_len", len));
+            Ok(())
+        }
+        fn real_disk_size(&self) -> std::io::Result<u64> {
+            Ok(0)
+        }
+        fn try_clone_file(&self) -> std::io::Result<std::fs::File> {
+            Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "log"))
+        }
+    }
+
+    /// Map growth (ADR-0023 amendment 15) reaches the wrapped backing, so
+    /// the crash harness runs over a backing that can grow.
+    #[test]
+    fn map_growth_is_forwarded() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (b, _h) =
+            FaultBacking::wrap_with_initial(Box::new(GrowLog(Arc::clone(&log))), PS, Vec::new(), 0)
+                .unwrap();
+        b.grow_map(1 << 20).unwrap();
+        b.ensure_file_len(2 << 20).unwrap();
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[("grow_map", 1 << 20), ("ensure_file_len", 2 << 20)]
         );
     }
 

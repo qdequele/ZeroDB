@@ -815,6 +815,16 @@ spilling bullet there.)
   - The writable map covers the full `map_size` and the file is `set_len` to
     `map_size` at open (matching the fork's `ftruncate`-to-mapsize under
     writemap) so a store to any mapped page never faults past EOF (ADR-0004 D4).
+    *(Amended by ADR-0023 amendment 15, decision 4.)* The file only ever grows,
+    and only under both writer locks while other processes may be alive: at
+    open only when this process is alone (no lock file, or the lock file's
+    initializer); in `Env::resize`; and at every write-txn begin, after both
+    writer locks are taken, which grows the file to this process's logical
+    `map_size` when it is shorter (an `fstat` re-read, then `set_len`; one
+    cached comparison when it is already long enough). A joining process maps
+    its logical size even past the file's end; it writes through the map only
+    inside a write txn, after that begin-time growth, and readers touch only
+    pages a committed snapshot references, which lie inside the file.
   - True zero-copy **live-map mutation during the txn** is the TXN-45b
     realization below (ADR-0021). TXN-45a remains the realization for every
     backing that does not broker map slices: the default mode, the miri test

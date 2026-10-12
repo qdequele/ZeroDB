@@ -262,9 +262,11 @@ predicate; SPEC 06 REC-1 references it rather than restating it.
    SPEC 04 TXN-14). Failure → `MdbError::Invalid`. Rationale: the mapping covers the full
    `map_size` (ADR-0004 D4), so a CRC-valid slot naming a page inside the map
    but past EOF would otherwise hand readers unbacked bytes — a SIGBUS on
-   first touch, not an error. Under `WRITE_MAP` the file is grown to
-   `map_size` before this check, so the length half is trivially satisfied
-   there; the root-range half still applies. This step validates only the
+   first touch, not an error. Under `WRITE_MAP`, without a lock file or for
+   the lock file's initializer, the file is grown to `map_size` before this
+   check, so the length half is trivially satisfied there; a joining process
+   does not grow the file at open (ADR-0023 amendment 15), so for it the
+   length half is a real check. The root-range half always applies. This step validates only the
    slot actually selected (a discarded slot's geometry is irrelevant).
 
 Selection among the *CRC-valid* slots:
@@ -692,8 +694,8 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
 - **map_size.** `meta.map_size` is the size of the mmap region and the ceiling
   on the data file. It is set at env creation and read back via
   `Env::info().map_size` (SPEC 00 row 20). Growth beyond it is *not* automatic
-  in Phase 1 (auto-geometry is Phase 3.2): heed callers grow by reopening with a
-  larger `map_size` after a `MapFull` (SPEC 00 rows 3, 55).
+  (auto-geometry is Phase 3.2): callers grow with `Env::resize` (below) or by
+  reopening with a larger `map_size` after a `MapFull` (SPEC 00 rows 3, 55).
   - **Runtime `map_size` selection (M1.2).** At open the effective `map_size` is
     the caller's `EnvOpenOptions::map_size` when set, else the persisted
     `meta.map_size`. It is then raised to `(last_pg + 1) · psize` of the newest
@@ -715,11 +717,28 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     (another process with a larger map committed past this one); a larger
     `meta.map_size` alone does not. Beyond the mapped bytes but within the
     logical size, or beyond the file, is `MdbError::Invalid`.
-  - **Mapping strategy (amended M1.4, ADR-0004 D4/OQ2 — approved).** The read
-    mmap covers `max(map_size, file length)` from open, so the base address is
-    fixed for the env's life and **no remap ever happens in Phase 1** (file
-    growth happens *underneath* the fixed `MAP_SHARED` mapping via the commit's
-    positioned writes). Pages beyond EOF are mapped but never dereferenced: a
+  - **`Env::resize` (ADR-0023 amendment 15; heed's `unsafe fn resize`,
+    `mdb_env_set_mapsize` on an open env).** It refuses with `Io` and raw OS
+    error `EINVAL` while a write txn of this env is live
+    (`OBS_SET_MAPSIZE_WITH_WRITE_TXN`); live read txns do not block it. In a
+    lock-file environment it takes the cross-process writer lock (LMDB takes
+    none), so no commit lands while it reads the newest snapshot. The size is
+    `meta.map_size` of the newest snapshot for `0`
+    (`OBS_SET_MAPSIZE_ZERO_ADOPTS`), else the requested size, then raised to
+    `(last_pg + 1) · psize` (checked arithmetic; overflow is `Invalid`). Above
+    `MAX_MAP_SIZE` a requested size is `Io(InvalidInput)` and an adopted one
+    `MdbError::Invalid`. The new size is published through the backing's
+    grow-only mappings (below); a smaller size lowers only the logical size.
+  - **Mapping strategy (amended M1.4, ADR-0004 D4/OQ2 — approved; amended by
+    ADR-0023 amendment 15).** The read mmap covers `max(map_size, file length)`
+    from open. A mapping is **never remapped in place**: when `resize` needs
+    more than the current mapping, a new mapping of `max(new size, 2 × current
+    length)` bytes is added (retried at exactly the new size on `ENOMEM`) and
+    published with the new logical size; every earlier mapping stays mapped
+    until the env closes, so no borrow is ever invalidated, and the retained
+    address space stays below twice the largest mapping. Within a mapping,
+    file growth happens *underneath* the `MAP_SHARED` mapping via the commit's
+    positioned writes. Pages beyond EOF are mapped but never dereferenced: a
     committed meta only references pages made durable before it (SPEC 06
     REC-7/REC-14), and the writer reads its own new pages from the dirty set,
     never the map (SPEC 04 TXN-38). *(Supersedes the M1.2 map-the-file-length

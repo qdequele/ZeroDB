@@ -31,6 +31,12 @@ use crate::page::{
 use crate::readers::{ReaderTable, SnapshotCell};
 use crate::stamps::StampCache;
 
+/// `EINVAL`, the error `mdb_env_set_mapsize` returns while the env has a
+/// live write txn (`Env::resize`). `zerodb-core` has no `libc`; the value is
+/// 22 on both supported targets (Linux and macOS).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const EINVAL: i32 = 22;
+
 /// A consistent (mapped bytes, logical map size) pair (ADR-0023 amendment 15),
 /// from one [`Backing::view`] call. No `Debug`: it would print the whole map.
 #[derive(Clone, Copy)]
@@ -79,8 +85,10 @@ pub trait Backing: Send + Sync {
     /// max(map_size, 2 × current) when the current one is shorter (on
     /// ENOMEM, retry exactly map_size, else Io). Under WRITE_MAP, grows the
     /// file first, only if it is shorter. Caller holds the in-process writer
-    /// lock and, with a lock file, the cross-process one (ADR-0023 amendment
-    /// 15).
+    /// lock and, with a lock file, the cross-process one (`Env::resize`), or
+    /// runs at open before the backing is shared and only for a size inside
+    /// the file (a joiner's seed), so publications are serialized and the
+    /// file grows only under both writer locks (ADR-0023 amendment 15).
     ///
     /// The default refuses: the backing cannot grow its map.
     ///
@@ -94,6 +102,23 @@ pub trait Backing: Send + Sync {
             std::io::ErrorKind::Unsupported,
             "backing cannot grow its map",
         ))
+    }
+
+    /// Grow the data file to at least `len` bytes; never shrink it. Called
+    /// at a `WRITE_MAP` write-txn begin, with both writer locks held, so a
+    /// joiner whose mapping extends past the file end has every page below
+    /// its logical map size backed before it writes through the map
+    /// (ADR-0023 amendment 15, decision 4).
+    ///
+    /// The default does nothing: a backing that writes with `pwrite` extends
+    /// the file as it writes.
+    ///
+    /// # Errors
+    ///
+    /// The `fstat` or `set_len` error of a backing that grows its file.
+    fn ensure_file_len(&self, len: u64) -> std::io::Result<()> {
+        let _ = len;
+        Ok(())
     }
 
     /// The actual on-disk length of the backing file (`fstat`), for
@@ -399,6 +424,26 @@ impl WriterLock {
             occupied: Mutex::new(WriterSlot::default()),
             cv: Condvar::new(),
         }
+    }
+
+    /// Claim the writer slot if it is free; `None` while a write txn of
+    /// this env is live. Never waits (`Env::resize`, ADR-0023 amendment 15).
+    fn try_acquire(&self) -> Option<WriterGuard<'_>> {
+        // Poison recovery as in `acquire`.
+        let mut g = self
+            .occupied
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if g.occupied {
+            return None;
+        }
+        g.occupied = true;
+        let frames = std::mem::take(&mut g.frames.0);
+        Some(WriterGuard {
+            lock: self,
+            frames,
+            shared: None,
+        })
     }
 
     /// Block until the writer slot is free, then claim it.
@@ -1028,6 +1073,31 @@ impl EnvInner {
         Err(Error::Mdb(MdbError::Invalid))
     }
 
+    /// The newest published snapshot, without the map check: in a lock-file
+    /// environment the snapshot committed as `T`, decoded from a `pread`
+    /// copy of its meta slot (no map access); otherwise the process-local
+    /// cell. For `Env::resize`, which holds both writer locks, so `T` cannot
+    /// move while it runs (ADR-0023 amendment 15, step 3).
+    ///
+    /// # Errors
+    ///
+    /// [`MdbError::Invalid`] when the published slot never decodes, or its
+    /// meta is corrupt; the I/O error of the meta read.
+    fn newest_snapshot_unchecked(&self) -> Result<Arc<Snapshot>, Error> {
+        let Some(region) = &self.shared else {
+            return Ok(self.snapshot());
+        };
+        for _ in 0..META_RETRY_LIMIT {
+            // SeqCst: pairs with the committing writer's SeqCst store of T.
+            let t = region.published_txnid().load(Ordering::SeqCst);
+            if let Some(s) = read_snapshot_at(self.backing_ref(), self.page_size, t)? {
+                return Ok(Arc::new(s));
+            }
+            std::thread::yield_now();
+        }
+        Err(Error::Mdb(MdbError::Invalid))
+    }
+
     /// Release a reader-table slot (SPEC 04 TXN-18a: `Release` store of
     /// `RDR_FREE`). Called from `RoTxn::drop`, from whatever thread the
     /// `Send` txn ended up on (TXN-13).
@@ -1452,6 +1522,78 @@ impl Env {
     #[must_use]
     pub fn map_size(&self) -> u64 {
         self.inner.map_size()
+    }
+
+    /// Change the map size, as `mdb_env_set_mapsize` on an open env
+    /// (ADR-0023 amendment 15).
+    ///
+    /// - `0` adopts the map size recorded in the newest committed meta
+    ///   (`OBS_SET_MAPSIZE_ZERO_ADOPTS`), the answer to a
+    ///   [`MdbError::MapResized`] begin.
+    /// - A size below the newest snapshot's data rounds up to exactly
+    ///   `(last_pg + 1) * page_size`, silently, as LMDB does.
+    /// - A smaller size than the current mapping lowers only the logical
+    ///   size: nothing is ever unmapped before the env closes.
+    ///
+    /// Live read txns do not block it, and every value they borrowed stays
+    /// valid (grow-only mappings). In a lock-file environment it takes the
+    /// cross-process writer lock, waiting like a write begin, so no commit
+    /// lands while it rounds up; LMDB takes no lock here. Under `WRITE_MAP`
+    /// it grows the data file to the new size, never shrinking it.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] with raw OS error `EINVAL` (22) while a write txn of
+    ///   this env is live (`OBS_SET_MAPSIZE_WITH_WRITE_TXN`).
+    /// - [`Error::Io`] (`InvalidInput`) for a requested size above
+    ///   [`MAX_MAP_SIZE`](crate::page::geometry::MAX_MAP_SIZE);
+    ///   [`MdbError::Invalid`] when `0` adopts a meta size above it (a corrupt
+    ///   meta), or the newest meta cannot be read.
+    /// - The I/O error of the cross-process lock, of the `mmap`, or of the
+    ///   file growth.
+    pub fn resize(&self, new_size: u64) -> Result<(), Error> {
+        let inner = self.inner();
+        // OBS_SET_MAPSIZE_WITH_WRITE_TXN: EINVAL while a write txn is live.
+        let mut guard = inner
+            .write_mutex
+            .try_acquire()
+            .ok_or_else(|| Error::Io(std::io::Error::from_raw_os_error(EINVAL)))?;
+        // Step 2: the cross-process writer lock (a no-op without a lock
+        // file), through the write begin's path, which reaps after a
+        // dead-owner takeover. Every error below drops `guard`, releasing
+        // both locks.
+        inner.lock_writer_shared(&mut guard)?;
+        let snap = inner.newest_snapshot_unchecked()?;
+        let min = snap
+            .last_pg
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(u64::from(inner.page_size())))
+            .ok_or(Error::Mdb(MdbError::Invalid))?;
+        // OBS_SET_MAPSIZE_ZERO_ADOPTS: 0 adopts the newest meta's size.
+        let (size, from_meta) = if new_size == 0 {
+            (snap.map_size, true)
+        } else {
+            (new_size, false)
+        };
+        // LMDB rounds up silently.
+        let size = size.max(min);
+        if size > crate::page::geometry::MAX_MAP_SIZE {
+            return Err(if from_meta {
+                Error::Mdb(MdbError::Invalid)
+            } else {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "map size ({size}) exceeds the supported maximum {}",
+                        crate::page::geometry::MAX_MAP_SIZE
+                    ),
+                ))
+            });
+        }
+        inner.backing_ref().grow_map(size).map_err(Error::Io)?;
+        // The guard's drop releases both writer locks.
+        drop(guard);
+        Ok(())
     }
 
     /// Environment info (SPEC 00 rows 20/60; `mdb_env_info`). The struct is
@@ -2060,9 +2202,10 @@ pub fn open_with_backing_shared(
     // must not wrap the multiply):
     //  - the file must cover `(last_pg + 1) * page_size` bytes;
     //  - each root is `PGNO_INVALID` or within `[FIRST_DATA_PGNO, last_pg]`.
-    // Under WRITE_MAP the file was already grown to `map_size` at map time,
-    // so the length check is trivially true there; the roots check still
-    // applies.
+    // Under WRITE_MAP a process alone on the file grew it to `map_size` at
+    // map time, so the length check is trivially true there; a joining
+    // process does not grow the file at open (ADR-0023 amendment 15), so for
+    // it the check is real. The roots check always applies.
     // Also part of REC-1a: the committed txnid itself. The reader table
     // encodes slot occupancy in the top-of-u64 sentinel band (SPEC 04 TXN-14)
     // and the next writer txnid is `meta.txnid + 1`; a txnid at or above the
@@ -2256,12 +2399,56 @@ fn seed_from_published(
         // SeqCst: pairs with the committing writer's SeqCst store of T.
         let t = region.published_txnid().load(Ordering::SeqCst);
         if let Some(s) = read_snapshot_at(backing, page_size, t)? {
+            match check_snapshot_backed(backing, page_size, &s) {
+                // Another process committed past this map between the
+                // header read that sized it and this seed: grow to the
+                // seed and check again (below).
+                Err(Error::Mdb(MdbError::MapResized)) => grow_to_seed(backing, page_size, &s)?,
+                other => other?,
+            }
             check_snapshot_backed(backing, page_size, &s)?;
             return Ok(s);
         }
         std::thread::yield_now();
     }
     Err(Error::Mdb(MdbError::Invalid))
+}
+
+/// Grow a joiner's map to its seed's `(last_pg + 1) * page_size`, as LMDB's
+/// open rounds a small map up to its data and never fails with
+/// `MDB_MAP_RESIZED` (ADR-0023 amendment 15). The seed is never used
+/// unchecked: the cached read fast path does no check of its own, so the
+/// caller re-checks it against the grown view.
+///
+/// Runs at open, before the backing is shared, so no writer lock is needed to
+/// serialize the publication. It never grows the data file: a seed past the
+/// file's end is corrupt (SPEC 06 REC-1a) and is refused before any growth,
+/// so under `WRITE_MAP` the file is already long enough.
+///
+/// # Errors
+///
+/// [`MdbError::Invalid`] when the seed needs more than
+/// [`MAX_MAP_SIZE`](crate::page::geometry::MAX_MAP_SIZE) or more than the
+/// file holds. [`MdbError::MapResized`] when the backing cannot grow its map
+/// (a heap test backing); the I/O error of a failed growth.
+fn grow_to_seed(backing: &dyn Backing, page_size: u32, seed: &Snapshot) -> Result<(), Error> {
+    let needed = seed
+        .last_pg
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(u64::from(page_size)))
+        .ok_or(Error::Mdb(MdbError::Invalid))?;
+    if needed > crate::page::geometry::MAX_MAP_SIZE
+        || needed > backing.real_disk_size().map_err(Error::Io)?
+    {
+        return Err(Error::Mdb(MdbError::Invalid));
+    }
+    match backing.grow_map(needed) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            Err(Error::Mdb(MdbError::MapResized))
+        }
+        Err(e) => Err(Error::Io(e)),
+    }
 }
 
 /// Check that a snapshot decoded after open lies inside this process's map
@@ -2945,6 +3132,169 @@ mod shared_env_tests {
 
     fn writer_held(region: &HeapRegion) -> bool {
         *region.writer.lock().expect("test region poisoned")
+    }
+
+    /// The grow log of a [`GrowBacking`]: `(map_size, cross-process writer
+    /// lock held)` per call.
+    type GrowLog = Arc<Mutex<Vec<(u64, bool)>>>;
+
+    /// A heap backing whose logical map size grows through `grow_map`, as
+    /// the mmap backings' do (ADR-0023 amendment 15). It records every grow
+    /// and whether the cross-process writer lock was held at the time.
+    struct GrowBacking {
+        bytes: Vec<u8>,
+        map_size: AtomicU64,
+        real: u64,
+        region: Option<Arc<HeapRegion>>,
+        grows: GrowLog,
+    }
+
+    impl Backing for GrowBacking {
+        fn view(&self) -> MapView<'_> {
+            MapView {
+                bytes: &self.bytes,
+                // Relaxed: the tests grow and read on one thread.
+                map_size: self.map_size.load(O::Relaxed),
+            }
+        }
+        fn grow_map(&self, map_size: u64) -> std::io::Result<()> {
+            let held = self.region.as_deref().is_some_and(writer_held);
+            self.grows
+                .lock()
+                .expect("test grows poisoned")
+                .push((map_size, held));
+            // Relaxed: as in `view`.
+            self.map_size.store(map_size, O::Relaxed);
+            Ok(())
+        }
+        fn real_disk_size(&self) -> std::io::Result<u64> {
+            Ok(self.real)
+        }
+        fn try_clone_file(&self) -> std::io::Result<std::fs::File> {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+    }
+
+    /// A [`GrowBacking`] over [`grown_image`]`(256)` with a `map_pages` map
+    /// and a file `real_pages` long; also returns its grow log.
+    fn grow_backing(
+        map_pages: u64,
+        real_pages: u64,
+        region: Option<Arc<HeapRegion>>,
+    ) -> (Box<dyn Backing>, GrowLog) {
+        let grows = Arc::new(Mutex::new(Vec::new()));
+        let b = Box::new(GrowBacking {
+            bytes: grown_image(256),
+            map_size: AtomicU64::new(map_pages * u64::from(PS)),
+            real: real_pages * u64::from(PS),
+            region,
+            grows: Arc::clone(&grows),
+        });
+        (b, grows)
+    }
+
+    #[test]
+    fn joiner_grows_its_map_when_t_lies_past_it() {
+        // Another process committed txnid 7 (last_pg 200) between this
+        // process's header read and its seed: the map from the header is 4
+        // pages. LMDB never fails an open this way, so the seed grows the
+        // map to the snapshot's minimum and re-checks.
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(7, O::SeqCst);
+        let (b, grows) = grow_backing(4, 256, None);
+        let env = open(b, region.clone());
+        assert_eq!(env.inner.snapshot().txnid, 7);
+        assert_eq!(env.inner.map_size(), 201 * u64::from(PS));
+        assert_eq!(
+            grows.lock().unwrap().as_slice(),
+            &[(201 * u64::from(PS), false)]
+        );
+    }
+
+    #[test]
+    fn joiner_never_grows_its_map_past_the_file() {
+        // T names last_pg 200, but the file holds only 4 pages: corruption
+        // (SPEC 06 REC-1a), reported before any growth.
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(7, O::SeqCst);
+        let (b, grows) = grow_backing(4, 4, None);
+        assert!(matches!(
+            try_open(b, region),
+            Err(Error::Mdb(MdbError::Invalid))
+        ));
+        assert!(grows.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resize_zero_adopts_t_under_the_cross_process_lock() {
+        // Open at T = 4 (4-page map), then another process publishes 7
+        // (last_pg 200, meta map size 1 MiB): reads fail with MapResized
+        // until `resize(0)` adopts the meta's size, which it does holding
+        // the cross-process writer lock (decision 3).
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(4, O::SeqCst);
+        let (b, grows) = grow_backing(4, 256, Some(Arc::clone(&region)));
+        let env = open(b, region.clone());
+        region.published_txnid().store(7, O::SeqCst);
+        assert!(matches!(
+            env.inner.pin_reader(),
+            Err(Error::Mdb(MdbError::MapResized))
+        ));
+        env.resize(0).expect("resize(0)");
+        assert_eq!(grows.lock().unwrap().as_slice(), &[(1 << 20, true)]);
+        assert!(!writer_held(&region), "resize releases the lock");
+        let (snap, slot) = env.inner.pin_reader().expect("pin after resize");
+        assert_eq!(snap.txnid, 7);
+        env.inner.release_reader(slot);
+        // A size below the newest snapshot rounds up to it.
+        env.resize(u64::from(PS)).expect("resize(1 page)");
+        assert_eq!(env.inner.map_size(), 201 * u64::from(PS));
+    }
+
+    #[test]
+    fn resize_with_a_live_write_txn_is_einval() {
+        let region = Arc::new(HeapRegion::new(4, 2, true));
+        let (b, grows) = grow_backing(256, 256, Some(Arc::clone(&region)));
+        let env = open(b, region);
+        let w = env.write_txn().expect("write txn");
+        match env.resize(1 << 20) {
+            Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(22)),
+            other => panic!("expected Io(EINVAL), got {other:?}"),
+        }
+        drop(w);
+        assert!(grows.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resize_above_the_cap_is_refused_by_source() {
+        let region = Arc::new(HeapRegion::new(4, 2, true));
+        let (b, grows) = grow_backing(256, 256, Some(Arc::clone(&region)));
+        let env = open(b, region);
+        match env.resize(crate::page::geometry::MAX_MAP_SIZE + 1) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+            other => panic!("expected Io(InvalidInput), got {other:?}"),
+        }
+        assert!(grows.lock().unwrap().is_empty());
+        drop(env);
+
+        // A meta-supplied size above the cap is a corrupt meta: `Invalid`.
+        let ps = PS as usize;
+        let mut bytes = grown_image(256);
+        let mut huge = meta_with(7, 200);
+        huge.map_size = crate::page::geometry::MAX_MAP_SIZE + u64::from(PS);
+        huge.encode_with_annex(&mut bytes[ps..2 * ps], &[]).unwrap();
+        let region = Arc::new(HeapRegion::new(4, 2, true));
+        let grows = Arc::new(Mutex::new(Vec::new()));
+        let b = Box::new(GrowBacking {
+            bytes,
+            map_size: AtomicU64::new(256 * u64::from(PS)),
+            real: 256 * u64::from(PS),
+            region: Some(Arc::clone(&region)),
+            grows: Arc::clone(&grows),
+        });
+        let env = open(b, region);
+        assert!(matches!(env.resize(0), Err(Error::Mdb(MdbError::Invalid))));
+        assert!(grows.lock().unwrap().is_empty());
     }
 
     #[test]

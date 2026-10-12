@@ -339,6 +339,12 @@ several other rules:
   txn's dirty frames are realized in the writable map at allocation/edit time
   rather than in heap frames copied in at commit (SPEC 04 §6.4 TXN-45b;
   `zerodb-io::mmap` brokered slice, `zerodb-core::dirty`).
+- The fork `ftruncate`s the file to the map size at open. ZeroDB does so only
+  when the process is alone (no lock file, or the lock file's initializer);
+  otherwise the file grows only under both writer locks, in `Env::resize` and
+  at a write-txn begin, and never shrinks, so no process's mapping loses its
+  backing (`SIGBUS`) to another's smaller size (ADR-0023 amendment 15,
+  decision 4; SPEC 04 §6.4).
 
 ### §S8 — `mdb_dbi_open` error precedence (named-DB catalog)
 

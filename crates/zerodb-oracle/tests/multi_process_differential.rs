@@ -137,6 +137,12 @@ impl Lmdb {
         }
     }
 
+    /// `mdb_env_set_mapsize`'s raw return code.
+    fn set_mapsize(&self, size: u64) -> c_int {
+        // SAFETY: `self.env` is open; the call takes a plain size.
+        unsafe { ffi::mdb_env_set_mapsize(self.env, size as _) }
+    }
+
     fn abort(txn: *mut ffi::MDB_txn) {
         // SAFETY: `txn` came from `mdb_txn_begin` and is ended exactly once.
         unsafe { ffi::mdb_txn_abort(txn) }
@@ -630,4 +636,77 @@ fn open_below_last_pg_matches_lmdb() {
     };
     eprintln!("zdb open below last_pg = {zdb}");
     assert_eq!(zdb, lmdb, "map size after an open below last_pg");
+}
+
+/// Normalize a `resize` / `mdb_env_set_mapsize` result: `ok`, or the raw OS
+/// error code.
+fn zdb_rc(r: zerodb::Result<()>) -> String {
+    match r {
+        Ok(()) => "ok".to_string(),
+        Err(zerodb::Error::Io(e)) if e.raw_os_error().is_some() => {
+            format!("rc={}", e.raw_os_error().unwrap())
+        }
+        Err(e) => format!("{e:?}"),
+    }
+}
+
+fn lmdb_rc(rc: c_int) -> String {
+    if rc == 0 {
+        "ok".to_string()
+    } else {
+        format!("rc={rc}")
+    }
+}
+
+/// After an 8 MiB process committed past this process's 1 MiB map,
+/// `resize(0)` / `mdb_env_set_mapsize(0)`: `(result, adopted map size, read
+/// begin afterwards)` (ADR-0023 amendment 15; `OBS_SET_MAPSIZE_ZERO_ADOPTS`).
+#[test]
+fn set_mapsize_zero_after_another_process_grew_matches_lmdb() {
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        let env = Lmdb::open(dir.path(), MAX_READERS);
+        env.commit_one();
+        run_child("lmdb_grow", dir.path());
+        let rc = lmdb_rc(env.set_mapsize(0));
+        (rc, env.map_info().0, env.begin_outcome(MDB_RDONLY))
+    };
+    eprintln!("lmdb (set_mapsize(0), map size, read begin) = {lmdb:?}");
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        let env = zdb_open(dir.path());
+        zdb_commit_one(&env);
+        run_child("zdb_grow", dir.path());
+        let rc = zdb_rc(env.resize(0));
+        (rc, env.info().map_size, zdb_outcome(env.read_txn()))
+    };
+    eprintln!("zdb (resize(0), map size, read begin) = {zdb:?}");
+    assert_eq!(zdb, lmdb, "(resize(0), adopted map size, read begin)");
+}
+
+/// `resize` / `mdb_env_set_mapsize` while this env has a live write txn
+/// (`OBS_SET_MAPSIZE_WITH_WRITE_TXN`).
+#[test]
+fn set_mapsize_with_a_write_txn_matches_lmdb() {
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        let env = Lmdb::open(dir.path(), MAX_READERS);
+        env.commit_one();
+        let txn = env.try_begin(0).unwrap();
+        let rc = lmdb_rc(env.set_mapsize(2 * MIB));
+        Lmdb::abort(txn);
+        rc
+    };
+    eprintln!("lmdb set_mapsize with a write txn = {lmdb}");
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        let env = zdb_open(dir.path());
+        zdb_commit_one(&env);
+        let w = env.write_txn().unwrap();
+        let rc = zdb_rc(env.resize(2 * MIB));
+        drop(w);
+        rc
+    };
+    eprintln!("zdb resize with a write txn = {zdb}");
+    assert_eq!(zdb, lmdb, "resize with a live write txn");
 }

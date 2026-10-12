@@ -446,6 +446,37 @@ impl<T> Env<T> {
         Ok(self.get_flags_bits().bits())
     }
 
+    /// Changes the map size, as heed 0.22.1's `Env::resize`
+    /// (`mdb_env_set_mapsize`; ADR-0023 amendment 15). `0` adopts the size
+    /// recorded in the newest committed meta, the answer to a
+    /// `MdbError::MapResized` begin; a size below the committed data rounds
+    /// up to it.
+    ///
+    /// # Safety
+    ///
+    /// Mirrors heed's signature; ZeroDB keeps every live transaction and every
+    /// borrowed value valid across a resize, so no caller obligation remains.
+    ///
+    /// # Errors
+    ///
+    /// `Io(InvalidInput)` with heed's message when `new_size` is not a
+    /// multiple of the OS page size; `Io` with OS error 22 (`EINVAL`) while a
+    /// write txn of this env is live; otherwise as `zerodb::Env::resize`.
+    pub unsafe fn resize(&self, new_size: usize) -> Result<()> {
+        let os = os_page_size();
+        if !new_size.is_multiple_of(os) {
+            let msg = format!(
+                "map size ({}) must be a multiple of the system page size ({})",
+                new_size, os
+            );
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                msg,
+            )));
+        }
+        self.inner.resize(new_size as u64).map_err(Error::from)
+    }
+
     /// Environment info (SPEC 00 rows 20/60; `mdb_env_info`). Every field is
     /// populated from the live snapshot and the reader table.
     ///

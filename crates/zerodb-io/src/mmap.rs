@@ -21,7 +21,9 @@ use std::sync::{Mutex, PoisonError};
 /// Exposes the mapped bytes as `&[u8]` and individual pages by page number.
 /// The map (ADR-0004 D4) covers the **full `map_size`** — which
 /// may extend past the current end-of-file. The file grows underneath the
-/// fixed mapping via `pwrite` (commit C2); no remap ever happens.
+/// mapping via `pwrite` (commit C2); a mapping is never remapped in place, and
+/// `Env::resize` adds a longer one beside it (`MapRegions`, ADR-0023
+/// amendment 15).
 pub struct Mmap {
     inner: memmap2::Mmap,
 }
@@ -113,12 +115,15 @@ impl Mmap {
 /// (`sync`), replacing the heap-buffer `pwrite`+`fdatasync` primitive of the
 /// default backing.
 ///
-/// The file MUST be `set_len(map_size)` before mapping (SPEC 04 §6.4, matching
-/// the fork's `ftruncate`-to-mapsize under writemap): the whole `[0, map_size)`
-/// region is then backed by real (sparse) blocks, so a store anywhere in it —
-/// including pages beyond the current logical high-water — never faults with
-/// `SIGBUS`. ADR-0004 D4 (map once, no remap) holds: the map covers the full
-/// `map_size` for the env's life.
+/// Every page below the logical `map_size` MUST be inside the file before
+/// anything is stored through the map (SPEC 04 §6.4, matching the fork's
+/// `ftruncate`-to-mapsize under writemap): the region is then backed by real
+/// (sparse) blocks, so a store anywhere in it — including pages beyond the
+/// current logical high-water — never faults with `SIGBUS`. The file is grown
+/// at open when the process is alone, and otherwise under both writer locks,
+/// at `resize` and at every write-txn begin (ADR-0023 amendment 15); a
+/// joiner's map may extend past the file's end until its first write txn.
+/// A mapping is never remapped in place; `resize` adds a longer one.
 pub struct MmapWritable {
     inner: memmap2::MmapMut,
 }
@@ -134,8 +139,9 @@ impl MmapWritable {
     }
 
     /// Map the first `len` bytes of `file` read/write (`MAP_SHARED`,
-    /// `PROT_READ | PROT_WRITE`). `file` must be open read+write and at least
-    /// `len` bytes long (the caller `set_len`s it first, SPEC 04 §6.4).
+    /// `PROT_READ | PROT_WRITE`). `file` must be open read+write. `len` may
+    /// exceed the file; nothing may be stored past the file's end (the
+    /// writer grows the file to its logical size first, SPEC 04 §6.4).
     ///
     /// # Errors
     ///
@@ -147,8 +153,13 @@ impl MmapWritable {
         // invariants (SPEC 04 §9 TXN-62, §6.4, single-process, single-writer TXN-6):
         //  * `file` stays open for the whole life of the returned map (the
         //    caller keeps the `File` alongside it — see `WriteMapBacking`);
-        //  * the file was `set_len(map_size)` so every page in `[0, len)` is
-        //    backed — a store never faults past EOF;
+        //  * every page a store targets is inside the file: stores happen
+        //    only inside a write txn, below the logical map size, after that
+        //    txn's begin grew the file to the logical size under both writer
+        //    locks (SPEC 04 §6.4, ADR-0023 amendment 15) — a store never
+        //    faults past EOF. Pages of the mapping past the file's end (a
+        //    joiner's map, or a geometric mapping longer than the logical
+        //    size) are never touched; the file never shrinks;
         //  * writes go only through `write_at_page` or the brokered
         //    `slice_mut` (ADR-0021, in-place WRITE_MAP), called only by the
         //    single writer holding the write mutex (TXN-6) — at commit C2/C4,
@@ -389,13 +400,6 @@ impl MapRegions {
 
     /// Publish `map_size`, adding `new_mapping` if given. Callers hold the
     /// writer lock, so publications are serialized.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "map growth (`Backing::grow_map`) is the caller, ADR-0023 amendment 15"
-        )
-    )]
     pub(crate) fn publish(&self, new_mapping: Option<Mapping>, map_size: u64) {
         let mut owned = self.owned.lock().expect("map regions poisoned");
         let mapping = match new_mapping {

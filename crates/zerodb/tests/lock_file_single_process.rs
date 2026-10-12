@@ -334,3 +334,155 @@ fn smaller_map_commit_keeps_the_larger_meta_size_in_one_process() {
         );
     }
 }
+
+/// Every combination the `resize` tests run over: with and without a lock
+/// file, with the default backing and with `WRITE_MAP`.
+const RESIZE_MODES: [(bool, bool); 4] =
+    [(false, false), (true, false), (false, true), (true, true)];
+
+/// [`opts_with`], with `WRITE_MAP` when `write_map`.
+fn resize_opts(lock_file: bool, write_map: bool, map_size: usize) -> EnvOpenOptions {
+    let mut o = opts_with(lock_file, Some(map_size));
+    if write_map {
+        o.flags(zerodb::EnvFlags::WRITE_MAP);
+    }
+    o
+}
+
+/// `resize` while this env has a live write txn fails with `EINVAL`, as
+/// `mdb_env_set_mapsize` does (`OBS_SET_MAPSIZE_WITH_WRITE_TXN`, ADR-0023
+/// amendment 15). The map is unchanged and the write txn still commits.
+#[test]
+fn resize_with_a_live_write_txn_is_refused() {
+    for (lock_file, write_map) in RESIZE_MODES {
+        let dir = TempDir::new();
+        let env = resize_opts(lock_file, write_map, MIB)
+            .open(dir.path())
+            .unwrap();
+        let mut w = env.write_txn().unwrap();
+        env.main_database().put(&mut w, b"k", b"v").unwrap();
+        match env.resize(2 * MIB as u64) {
+            Err(Error::Io(e)) => assert_eq!(
+                e.raw_os_error(),
+                Some(22),
+                "lock_file {lock_file}, write_map {write_map}: {e:?}"
+            ),
+            other => panic!(
+                "lock_file {lock_file}, write_map {write_map}: expected Io(EINVAL), got {other:?}"
+            ),
+        }
+        assert_eq!(env.info().map_size, MIB as u64);
+        w.commit().unwrap();
+        // With the write txn gone, the same call succeeds.
+        env.resize(2 * MIB as u64).unwrap();
+        assert_eq!(env.info().map_size, 2 * MIB as u64);
+    }
+}
+
+/// A live read txn does not block `resize` (decision 5, LMDB's return code).
+/// Its borrowed value and a whole-map borrow stay valid and readable across
+/// the resize, and a write after it can use the larger map.
+#[test]
+fn resize_with_a_live_read_txn_succeeds_and_the_value_stays_readable() {
+    for (lock_file, write_map) in RESIZE_MODES {
+        let dir = TempDir::new();
+        let env = resize_opts(lock_file, write_map, MIB)
+            .open(dir.path())
+            .unwrap();
+        let db = env.main_database();
+        let mut w = env.write_txn().unwrap();
+        db.put(&mut w, b"held", &[9u8; 3000]).unwrap();
+        w.commit().unwrap();
+
+        let r = env.read_txn().unwrap();
+        let value = db.get(&r, b"held").unwrap().expect("held value");
+        let whole = env.inner().backing_bytes();
+        let head = whole[..64].to_vec();
+        env.resize(2 * MIB as u64)
+            .unwrap_or_else(|e| panic!("lock_file {lock_file}, write_map {write_map}: {e:?}"));
+        assert_eq!(env.info().map_size, 2 * MIB as u64);
+        // Both borrows outlived the resize.
+        assert_eq!(value, &[9u8; 3000][..]);
+        assert_eq!(&whole[..64], &head[..]);
+        assert_eq!(db.get(&r, b"held").unwrap(), Some(&[9u8; 3000][..]));
+        drop(r);
+
+        // Fill past the old 1 MiB map: no MapFull.
+        let mut w = env.write_txn().unwrap();
+        for i in 0..300u32 {
+            db.put(&mut w, format!("f{i:04}").as_bytes(), &[5u8; 4000])
+                .unwrap();
+        }
+        w.commit().unwrap();
+        assert!((env.info().last_pgno + 1) * 4096 > MIB as u64);
+        if write_map {
+            // WRITE_MAP grew the file to the logical size under the writer
+            // locks.
+            assert!(env.real_disk_size().unwrap() >= 2 * MIB as u64);
+        }
+        let r = env.read_txn().unwrap();
+        assert_eq!(db.get(&r, b"f0299").unwrap(), Some(&[5u8; 4000][..]));
+    }
+}
+
+/// `resize` below the committed data rounds up to exactly
+/// `(last_pg + 1) * page_size`, as LMDB does silently (ADR-0023 amendment
+/// 15, step 4).
+#[test]
+fn resize_rounds_up_to_the_last_page() {
+    for (lock_file, write_map) in RESIZE_MODES {
+        let dir = TempDir::new();
+        let env = resize_opts(lock_file, write_map, 4 * MIB)
+            .open(dir.path())
+            .unwrap();
+        let db = env.main_database();
+        let mut w = env.write_txn().unwrap();
+        for i in 0..400u32 {
+            db.put(&mut w, format!("k{i:04}").as_bytes(), &[3u8; 4000])
+                .unwrap();
+        }
+        w.commit().unwrap();
+        env.resize(4096).unwrap();
+        let info = env.info();
+        assert_eq!(
+            info.map_size,
+            (info.last_pgno + 1) * 4096,
+            "lock_file {lock_file}, write_map {write_map}"
+        );
+        let r = env.read_txn().unwrap();
+        assert_eq!(db.get(&r, b"k0399").unwrap(), Some(&[3u8; 4000][..]));
+        drop(r);
+        // New data soon allocates past the rounded map.
+        let mut w = env.write_txn().unwrap();
+        let full = (0..50u32).any(|i| {
+            matches!(
+                db.put(&mut w, format!("over{i:02}").as_bytes(), &[1u8; 8000]),
+                Err(Error::Mdb(zerodb::MdbError::MapFull))
+            )
+        });
+        assert!(
+            full,
+            "lock_file {lock_file}, write_map {write_map}: no MapFull"
+        );
+    }
+}
+
+/// A caller-supplied size above `MAX_MAP_SIZE` is `Io(InvalidInput)`; the
+/// map is unchanged (ADR-0023 amendment 15, decision 6).
+#[test]
+fn resize_above_the_cap_is_refused() {
+    for (lock_file, write_map) in RESIZE_MODES {
+        let dir = TempDir::new();
+        let env = resize_opts(lock_file, write_map, MIB)
+            .open(dir.path())
+            .unwrap();
+        match env.resize(zerodb::MAX_MAP_SIZE + 4096) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+            other => panic!(
+                "lock_file {lock_file}, write_map {write_map}: expected Io(InvalidInput), got {other:?}"
+            ),
+        }
+        assert_eq!(env.info().map_size, MIB as u64);
+        assert!(env.real_disk_size().unwrap() <= 2 * MIB as u64);
+    }
+}

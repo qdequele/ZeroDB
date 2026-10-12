@@ -752,6 +752,18 @@ impl Env {
         if inner.is_poisoned() {
             return Err(poisoned_error());
         }
+        // ADR-0023 amendment 15, decision 4: under WRITE_MAP the data file
+        // grows to this process's logical map size here, with both writer
+        // locks held (and after any dead-owner takeover reap), so every page
+        // this txn can allocate below the map size is inside the file before
+        // anything is written through the map. A joiner's open never grows
+        // the file. One comparison when the file is already long enough.
+        if inner.durability().write_map {
+            inner
+                .backing_ref()
+                .ensure_file_len(inner.map_size())
+                .map_err(Error::Io)?;
+        }
         // The latest published snapshot, which in a lock-file env may be
         // another process's commit (ADR-0023 §4): never the process-local
         // cell. Without a lock file this is the cell, as before.

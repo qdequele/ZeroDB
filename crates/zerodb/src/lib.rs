@@ -578,6 +578,11 @@ impl EnvOpenOptions {
             read_only,
             durability.write_map,
             self.flags.contains(EnvFlags::NO_READ_AHEAD),
+            // ADR-0023 amendment 15, decision 4: only the sole process may
+            // grow a WRITE_MAP data file at open. A joiner's write txns grow
+            // it under both writer locks.
+            lock.as_ref()
+                .is_none_or(|l| zerodb_core::shared::SharedRegion::is_initializer(l.as_ref())),
         )?;
 
         if let Some(l) = &lock {

@@ -146,6 +146,12 @@ fn child_entry() {
         return;
     };
     let dir = PathBuf::from(dir);
+    // The WRITE_MAP roles open their own env (ADR-0023 amendment 15).
+    match role.as_str() {
+        "wm_resizer" => return wm_resizer(&dir),
+        "wm_writer" => return wm_writer(&dir),
+        _ => {}
+    }
     let env = match std::env::var(MAP) {
         Ok(m) => open_sized(&dir, m.parse().expect("map size")),
         Err(_) => open(&dir),
@@ -678,4 +684,124 @@ fn smaller_map_process_commit_keeps_the_larger_meta_size() {
     o.page_size(4096).max_readers(16).lock_file(true);
     let env = o.open(dir.path()).unwrap();
     assert_eq!(env.info().map_size, 8 * MIB as u64);
+}
+
+/// After another process grew the environment past this process's map,
+/// `resize(0)` adopts the persisted map size and the next read sees the
+/// other process's data (ADR-0023 amendment 15; `OBS_SET_MAPSIZE_ZERO_ADOPTS`).
+#[test]
+fn resize_zero_adopts_the_grown_map_and_reads_succeed() {
+    let dir = TempDir::new();
+    let env = open_sized(dir.path(), MIB);
+    wait_success(
+        &mut child_sized("write_4mib", dir.path(), 8 * MIB),
+        Duration::from_secs(60),
+    );
+    match env.read_txn() {
+        Err(Error::Mdb(MdbError::MapResized)) => {}
+        other => panic!("read begin: expected MapResized, got {:?}", other.err()),
+    }
+    env.resize(0).expect("resize(0)");
+    assert_eq!(env.info().map_size, 8 * MIB as u64);
+    let db = env.main_database();
+    let r = env.read_txn().expect("read begin after resize(0)");
+    assert_eq!(
+        db.get(&r, b"big070127").unwrap(),
+        Some(&[7u8; 4000][..]),
+        "the child's last value"
+    );
+    drop(r);
+    let mut w = env.write_txn().expect("write begin after resize(0)");
+    db.put(&mut w, b"from-parent", b"1").unwrap();
+    w.commit().unwrap();
+}
+
+/// A `WRITE_MAP` lock-file env at `map_size` bytes.
+fn open_write_map(dir: &Path, map_size: usize) -> Env {
+    let mut o = EnvOpenOptions::new();
+    o.map_size(map_size)
+        .page_size(4096)
+        .max_readers(16)
+        .flags(zerodb::EnvFlags::WRITE_MAP)
+        .lock_file(true);
+    o.open(dir).expect("open WRITE_MAP lock-file env")
+}
+
+/// Grows the map 24 times, by 1 MiB each, committing one 64 KiB value after
+/// each, so the data passes the writer's 1 MiB map midway.
+fn wm_resizer(dir: &Path) {
+    let env = open_write_map(dir, MIB);
+    let db = env.main_database();
+    for i in 0..24u32 {
+        env.resize(((2 + i) as usize * MIB) as u64)
+            .expect("resize up");
+        let mut w = env.write_txn().expect("resizer write begin");
+        db.put(
+            &mut w,
+            format!("resizer{i:04}").as_bytes(),
+            &[1u8; 64 << 10],
+        )
+        .unwrap();
+        w.commit().unwrap();
+    }
+}
+
+/// 300 small write txns on a 1 MiB map; a `MapResized` begin adopts the
+/// newer size with `resize(0)` and retries.
+fn wm_writer(dir: &Path) {
+    let env = open_write_map(dir, MIB);
+    let db = env.main_database();
+    let mut i = 0u32;
+    while i < 300 {
+        let mut w = match env.write_txn() {
+            Ok(w) => w,
+            Err(Error::Mdb(MdbError::MapResized)) => {
+                env.resize(0).expect("adopt the grown map");
+                continue;
+            }
+            Err(e) => panic!("writer write begin: {e:?}"),
+        };
+        db.put(&mut w, format!("writer{i:04}").as_bytes(), &[2u8; 64])
+            .unwrap();
+        w.commit().unwrap();
+        i += 1;
+    }
+}
+
+/// Two `WRITE_MAP` processes, one growing the map and one writing on a
+/// smaller map: the data file never shrinks, and neither process dies (a
+/// shrink under another process's mapping is a `SIGBUS`). The file grows
+/// only under both writer locks (ADR-0023 amendment 15, decision 4).
+#[test]
+fn write_map_processes_never_shrink_the_file() {
+    let dir = TempDir::new();
+    let env = open_write_map(dir.path(), MIB);
+    let data = dir.path().join(zerodb::DATA_FILE_NAME);
+    let mut resizer = child("wm_resizer", dir.path());
+    let mut writer = child("wm_writer", dir.path());
+    let end = Instant::now() + Duration::from_secs(120);
+    let mut last = std::fs::metadata(&data).unwrap().len();
+    let (mut r_done, mut w_done) = (None, None);
+    while r_done.is_none() || w_done.is_none() {
+        let len = std::fs::metadata(&data).unwrap().len();
+        assert!(len >= last, "the data file shrank from {last} to {len}");
+        last = len;
+        if r_done.is_none() {
+            r_done = resizer.try_wait().unwrap();
+        }
+        if w_done.is_none() {
+            w_done = writer.try_wait().unwrap();
+        }
+        assert!(Instant::now() < end, "timed out waiting for the children");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (r_st, w_st) = (r_done.unwrap(), w_done.unwrap());
+    assert!(r_st.success(), "resizer failed: {r_st}");
+    assert!(w_st.success(), "writer failed: {w_st}");
+    // Both processes' commits are present.
+    env.resize(0).expect("adopt the grown map");
+    let db = env.main_database();
+    let r = env.read_txn().unwrap();
+    assert!(db.get(&r, b"resizer0023").unwrap().is_some());
+    assert!(db.get(&r, b"writer0299").unwrap().is_some());
 }

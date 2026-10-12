@@ -75,8 +75,10 @@ trusted-file mode) so the default stays a faithful drop-in.
 - FFI inside `zerodb-oracle`;
 - the minimal API-shape `unsafe` in `heed-zerodb` that heed's pointer model
   requires: `Send` impls, TLS-marker retags, the lifetime-erased write cursor,
-  the `ReservedSpace` uninitialized view, and one `sysconf` for the OS page
-  size — nothing beyond what the mirrored heed surface forces;
+  the `ReservedSpace` uninitialized view, one `sysconf` for the OS page
+  size, and the `unsafe fn resize` signature heed declares (ADR-0023
+  amendment 15; its body holds no `unsafe` block) — nothing beyond what the
+  mirrored heed surface forces;
 - `zerodb-tools`: one `libc::flock` (`src/lock.rs`, the guard against opening a
   live environment) and the `migrate-lmdb` feature's heed `open`
   (`src/migrate.rs`). These two are in use and awaiting maintainer review.

@@ -24,7 +24,7 @@ Behavior differences from LMDB, approved or proposed, are recorded in
 | Page size is chosen at creation: power of two in 4 K–64 K, independent of the OS page size. Adapter default = OS page size (LMDB parity); native default 4 K. Reopen adopts the persisted value. | SPEC 02 §0 |
 | **Max key 511 bytes**, empty key rejected (`BadValSize`), as LMDB. Max DB name 511 bytes, C-string (embedded NUL panics like heed). Max value 4 GiB − 1. | SPEC 01 §S4, SPEC 02, DIVERGENCES.md (named-DB catalog record) |
 | A custom key comparator is **not persisted** (LMDB parity): reopening with a different comparator corrupts silently; an in-process mismatch is refused. | DIVERGENCES.md (comparator persistence), SPEC 03 §2.0 |
-| `map_size` is fixed for the life of an open env; grow it by reopening. There is no `Env::resize`. | SPEC 02 §8, row below |
+| `map_size` can change on an open env with `Env::resize` (heed's `unsafe fn resize`), as `mdb_env_set_mapsize` does: `0` adopts the size recorded by another process, a size below the data rounds up to it, and a live write txn gets `EINVAL`. Unlike LMDB, live read txns and their borrowed values stay valid across it, and in a lock-file env it waits for the cross-process writer lock. | SPEC 02 §8, ADR-0023 amendment 15, row below |
 | Files are created mode `0600`; the env directory must exist. | SECURITY.md |
 
 ## Crate root
@@ -76,7 +76,7 @@ Behavior differences from LMDB, approved or proposed, are recorded in
 | `flags()` / `get_flags()` | Emulated | Reconstructed from the durability mode: only `WRITE_MAP`, `READ_ONLY`, `NO_SYNC`, `NO_META_SYNC` and `MAP_ASYNC` are ever reported |
 | `clear_stale_readers()` | No-op | Returns `Ok(0)`, which is correct: ZeroDB is single-process, so no cross-process readers can exist |
 | `set_flags(EnvFlags, FlagSetMode)` | Unsupported | Runtime durability toggling is deferred (SPEC 00) |
-| `resize(usize)` | Unsupported | Not present; reopen with a larger `map_size` after `MapFull` |
+| `resize(usize)` | Same | `unsafe` as in heed; a size that is not a multiple of the OS page size is `Io(InvalidInput)` with heed's message, a live write txn is `Io` (`EINVAL`). The caller's promise heed asks for (no live txns) is not needed: read txns and borrowed values survive a resize. Answers `MdbError::MapResized` with `resize(0)` |
 | `copy_to_fd` | Unsupported | Takes an LMDB FFI handle type |
 | `nested_write_txn` | Unsupported | Nested **write** transactions do not exist (an approved divergence) |
 | `sync(force)`, `live_readers()`, `reader_list()`, `copy_to_path_with_progress` | Extension | |
@@ -149,7 +149,8 @@ always initialised; seek error text differs).
 | `DUPSORT`, `DUPFIXED`, `INTEGERKEY`, `INTEGERDUP`, `REVERSEKEY`, `REVERSEDUP`, dup cursor ops, `MDB_MULTIPLE` | Unsupported | DIVERGENCES.md (DUPSORT), ADR-0011 (parked) |
 | `mdb_set_compare` | Emulated (safe trait, named DBs, not persisted) | SPEC 03 §2.0, DIVERGENCES.md (comparator persistence) |
 | `mdb_set_dupsort` | No-op | this file |
-| `mdb_env_set_flags` at runtime, `mdb_env_set_mapsize` at runtime (`resize`) | Unsupported | this file |
+| `mdb_env_set_flags` at runtime | Unsupported | this file |
+| `mdb_env_set_mapsize` at runtime (`resize`) | Supported | SPEC 02 §8, ADR-0023 amendment 15 |
 | `MDB_APPEND`, `MDB_NOOVERWRITE`, `MDB_CURRENT`, `MDB_RESERVE` | Supported | SPEC 01 §S1–S3 |
 | `MDB_CP_COMPACT` | Supported | ADR-0009 |
 | Max key 511, max DB name 511, empty key invalid | Supported | SPEC 01 §S4 |
