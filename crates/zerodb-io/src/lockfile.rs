@@ -94,6 +94,12 @@ pub enum LockOpenError {
     AlreadyOpen,
     /// The lock file was initialized with incompatible parameters.
     Mismatch(String),
+    /// The lock file cannot be created or opened for writing because it lies
+    /// on a read-only filesystem (`EROFS`). A read-only environment then runs
+    /// without a lock file, as LMDB does (ADR-0023 amendment 17,
+    /// `OBS_RDONLY_LOCK_READONLY_FS`); any other caller treats it as the
+    /// `EROFS` I/O error it is.
+    ReadOnlyFs,
     /// An I/O error.
     Io(std::io::Error),
 }
@@ -111,6 +117,7 @@ impl std::fmt::Display for LockOpenError {
                 f.write_str("the lock file is already open in this process")
             }
             LockOpenError::Mismatch(m) => write!(f, "lock file mismatch: {m}"),
+            LockOpenError::ReadOnlyFs => f.write_str("the lock file is on a read-only filesystem"),
             LockOpenError::Io(e) => write!(f, "lock file I/O error: {e}"),
         }
     }
@@ -254,11 +261,12 @@ enum Election {
 /// finished ZeroDB lock file (it carries the final magic); `Ok(None)` if the
 /// file does not exist or is not finished.
 ///
-/// A process that joins a running environment must open it with that value
-/// ([`LockFile::open`] refuses another one); a tool that attaches to an
-/// environment it did not create reads it here first. The value can change
-/// before the open if every process closes and another reinitializes the
-/// file, which the open then reports as a mismatch.
+/// A process that joins a running environment adopts that value whatever it
+/// asks for ([`LockFile::open`]), as LMDB does. A tool that attaches to an
+/// environment it did not create reads it here first, so that, if every
+/// other process closes before the tool opens, the tool reinitializes the
+/// file with the same count. The value can change before the open if every
+/// process closes and another reinitializes the file.
 ///
 /// The read uses its own short-lived descriptor, claimed in this process's
 /// registry like an open, so it never closes a descriptor of a lock file
@@ -337,8 +345,9 @@ impl LockFile {
     /// # Errors
     ///
     /// [`LockOpenError::AlreadyOpen`] if this process has it open (under any
-    /// name), [`LockOpenError::Mismatch`] on a format or `max_readers`
-    /// mismatch, an [`LockOpenError::Io`] of kind `InvalidInput` when a guard
+    /// name), [`LockOpenError::Mismatch`] on a format mismatch,
+    /// [`LockOpenError::ReadOnlyFs`] when the file cannot be created or
+    /// opened for writing on a read-only filesystem, an [`LockOpenError::Io`] of kind `InvalidInput` when a guard
     /// above refuses the file, of kind `TimedOut` when the election retries
     /// run out before any process finishes initializing the file, and other
     /// I/O errors.
@@ -390,7 +399,13 @@ impl LockFile {
         // handle's locks (ADR-0023 amendment 2). On every error below the
         // registration (or the `LockFile` owning it) drops and releases it.
         let mut registration = Registration::claim(path)?;
-        let (file, created) = open_or_create(path)?;
+        let (file, created) = match open_or_create(path) {
+            Ok(opened) => opened,
+            Err(e) if e.raw_os_error() == Some(libc::EROFS) => {
+                return Err(LockOpenError::ReadOnlyFs)
+            }
+            Err(e) => return Err(e.into()),
+        };
         if let Err(e) = registration.rekey(&file) {
             // The descriptor reached a file this process already has open
             // (its name was replaced by a link to it between the `stat` and
@@ -455,10 +470,20 @@ impl LockFile {
         };
         // A joiner reads `max_readers` with `pread` before mapping. It holds
         // the shared election lock, so the initializer has finished writing.
+        // It adopts that count whatever it asked for, as an LMDB joiner sizes
+        // its reader table from the lock file (`OBS_JOINER_FEWER_MAXREADERS`,
+        // `OBS_JOINER_MORE_MAXREADERS`; ADR-0023 §1 as amended). A count no
+        // initializer can write means the file is not a usable lock file.
         let slots = if initializer {
             max_readers
         } else {
-            read_u32_at(&file, OFF_MAX_READERS)?
+            let n = read_u32_at(&file, OFF_MAX_READERS)?;
+            if n == 0 || n > zerodb_core::env::MAX_READERS_LIMIT {
+                return Err(LockOpenError::Mismatch(format!(
+                    "the lock file records {n} reader slots"
+                )));
+            }
+            n
         };
         let len = OFF_SLOTS + SLOT_STRIDE * slots as usize;
         if initializer {
@@ -511,11 +536,6 @@ impl LockFile {
                 return Err(LockOpenError::Mismatch(
                     "not a ZeroDB lock file of this version".into(),
                 ));
-            }
-            if slots != max_readers {
-                return Err(LockOpenError::Mismatch(format!(
-                    "max_readers {max_readers} differs from the running environment's {slots}"
-                )));
             }
         }
         // This process's liveness lock (ADR-0023 §3), held for the handle's life.

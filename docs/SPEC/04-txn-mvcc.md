@@ -183,7 +183,11 @@ claim/release a pinned snapshot without blocking the writer.
   1024). When the caller does **not** set it, the default is **126** (LMDB
   parity: `DEFAULT_READERS`), not an arbitrary number — a differential detail the
   oracle can probe. It is allocated once and never resized during the env's life
-  (matching LMDB, whose reader count is fixed at open). Because the slots are
+  (matching LMDB, whose reader count is fixed at open). With a lock file
+  (ADR-0023) the table lives in it and the first opener sizes it; a process
+  that joins adopts that size whatever its own `max_readers` says, as an LMDB
+  joiner does (`OBS_JOINER_FEWER_MAXREADERS`, `OBS_JOINER_MORE_MAXREADERS`;
+  ADR-0023 §1 as amended). Because the slots are
   allocated **eagerly** (one cache-padded word per slot), `max_readers` is
   bounded at open: values above `MAX_READERS_LIMIT` (2^20) are rejected with
   `Io(InvalidInput)` rather than aborting on allocation failure

@@ -1540,6 +1540,16 @@ impl Env {
             .is_none_or(|r| r.is_initializer())
     }
 
+    /// Whether this environment runs with a lock file shared with other
+    /// processes (ADR-0023 amendment 17). `false` when it was opened without
+    /// one, and for a read-only environment on read-only media, where no
+    /// lock file can be created and the open proceeds without one, as LMDB
+    /// does.
+    #[must_use]
+    pub fn has_lock_file(&self) -> bool {
+        self.inner.shared.is_some()
+    }
+
     /// Change the map size, as `mdb_env_set_mapsize` on an open env
     /// (ADR-0023 amendment 15).
     ///

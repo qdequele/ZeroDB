@@ -275,6 +275,11 @@ impl EnvOpenOptions {
     /// = LMDB `DEFAULT_READERS`). The table is allocated once at open and
     /// never resized; when it is exhausted, `read_txn` fails with
     /// [`MdbError::ReadersFull`] (TXN-16).
+    ///
+    /// With [`EnvOpenOptions::lock_file`] on, the process that opens the
+    /// environment first sizes the shared table; a process that joins it
+    /// adopts that size whatever it asks for, as LMDB does (ADR-0023 §1 as
+    /// amended). [`Env::info`] reports the size in use.
     pub fn max_readers(&mut self, n: u32) -> &mut EnvOpenOptions {
         self.max_readers = n;
         self
@@ -430,7 +435,8 @@ impl EnvOpenOptions {
 
     /// Let other processes open this environment at the same time, through a
     /// shared lock file next to the data file (ADR-0023). Off by default in
-    /// this release; the heed adapter maps LMDB's default to it.
+    /// this release; the heed adapter turns it on unless heed's `NO_LOCK` is
+    /// set (ADR-0023 amendment 17).
     pub fn lock_file(&mut self, on: bool) -> &mut EnvOpenOptions {
         self.lock_file = on;
         self
@@ -552,6 +558,13 @@ impl EnvOpenOptions {
     ///   exact rule). Neither file is modified.
     /// - [`Error::Io`] if the directory does not exist, on any file/mmap I/O
     ///   error, or if a `READ_ONLY` open finds no existing store.
+    /// - [`Error::Io`] (`EROFS`), with [`EnvOpenOptions::lock_file`] on, if
+    ///   the lock file cannot be created or opened for writing on a read-only
+    ///   filesystem and the open is not [`EnvFlags::READ_ONLY`]. A `READ_ONLY`
+    ///   open there proceeds without a lock file, as LMDB does
+    ///   ([`Env::has_lock_file`] is then `false`; ADR-0023 amendment 17).
+    ///   Any other lock-file error, such as `EACCES` in a directory this
+    ///   process cannot write, fails the open, also when `READ_ONLY`.
     /// - [`Error::Mdb`]`(`[`MdbError::Invalid`]`)` if the file is not a valid
     ///   zerodb env (bad magic/version/page-size, both meta slots torn, or the
     ///   one-valid + `PREV_SNAPSHOT` combination — SPEC 06 REC-2†).
@@ -598,10 +611,18 @@ impl EnvOpenOptions {
         // ADR-0023 §1: the lock file is opened (the election) *before* the
         // data file, so a joining process waits for the initializer rather
         // than racing it to create the data file.
+        let read_only = self.flags.contains(EnvFlags::READ_ONLY);
         let lock = if self.lock_file {
             let path = canonical_dir.join(&lock_file_name);
             match zerodb_io::lockfile::LockFile::open(&path, &data_path, self.max_readers) {
                 Ok(l) => Some(l),
+                // ADR-0023 amendment 17 (`OBS_RDONLY_LOCK_READONLY_FS = 0`): a
+                // read-only env on read-only media runs without a lock file,
+                // as LMDB does. A writable env fails with the `EROFS`.
+                Err(zerodb_io::lockfile::LockOpenError::ReadOnlyFs) if read_only => None,
+                Err(zerodb_io::lockfile::LockOpenError::ReadOnlyFs) => {
+                    return Err(Error::Io(std::io::Error::from_raw_os_error(libc::EROFS)))
+                }
                 Err(zerodb_io::lockfile::LockOpenError::AlreadyOpen) => {
                     return Err(Error::EnvAlreadyOpened)
                 }
@@ -617,7 +638,6 @@ impl EnvOpenOptions {
             None
         };
 
-        let read_only = self.flags.contains(EnvFlags::READ_ONLY);
         let prev_snapshot = self.flags.contains(EnvFlags::PREV_SNAPSHOT);
         // ADR-0023 §5: `PREV_SNAPSHOT` requires winning the first-opener
         // election (no other process alive), matching LMDB as observed
@@ -727,8 +747,8 @@ impl ExclusiveLock {
     ///   file open.
     /// - [`Error::Io`] (`InvalidInput`) for an invalid data-file or lock-file
     ///   name, or when a lock-file guard refuses the file (as
-    ///   [`EnvOpenOptions::open`]); other I/O errors, including the error of
-    ///   creating the lock file on read-only media.
+    ///   [`EnvOpenOptions::open`]); other I/O errors, including `EROFS` when
+    ///   the lock file cannot be created on read-only media.
     pub fn acquire(dir: &Path, opts: &EnvOpenOptions) -> Result<ExclusiveLock> {
         opts.check_data_file_name()?;
         let lock_file_name = opts.get_lock_file_name();
@@ -745,6 +765,9 @@ impl ExclusiveLock {
                 "environment in use",
             ))),
             Err(zerodb_io::lockfile::LockOpenError::AlreadyOpen) => Err(Error::EnvAlreadyOpened),
+            Err(zerodb_io::lockfile::LockOpenError::ReadOnlyFs) => {
+                Err(Error::Io(std::io::Error::from_raw_os_error(libc::EROFS)))
+            }
             Err(zerodb_io::lockfile::LockOpenError::Mismatch(m)) => Err(Error::Io(
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, m),
             )),

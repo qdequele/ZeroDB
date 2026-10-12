@@ -84,6 +84,12 @@ Option C. The design has six parts.
   every slot — which also recovers from any crash — then downgrades to a shared
   lock. Otherwise it waits for a shared lock and validates the header; a
   version, page-size or `max_readers` mismatch fails the open.
+  - **Amendment (2026-10-13, stage 3 Task 8):** the `max_readers` part of
+    this rule now follows LMDB, as observed. A joiner adopts the lock file's
+    reader count whatever it asks for, in both directions
+    (`OBS_JOINER_FEWER_MAXREADERS = (0, 200)`,
+    `OBS_JOINER_MORE_MAXREADERS = (0, 126)`); only a version or page-size
+    mismatch fails the open. The adopted size is what `Env::info` reports.
 - Within one process, `EnvAlreadyOpened` (TXN-51) is unchanged. The lock file
   coordinates processes, not handles.
 - **`NO_LOCK`** (engine: an `EnvOpenOptions` flag; adapter: heed's `NO_LOCK`,

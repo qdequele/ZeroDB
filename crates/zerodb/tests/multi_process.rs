@@ -250,6 +250,17 @@ fn child_entry() {
             wait_for(&dir.join("child-stop"), Duration::from_secs(60));
             drop(r);
         }
+        "commit_and_hold_writer" => {
+            // Commit `from-child`, then hold a write txn until told to stop.
+            let mut w = env.write_txn().unwrap();
+            db.put(&mut w, b"from-child", b"1").unwrap();
+            w.commit().unwrap();
+            let mut w = env.write_txn().unwrap();
+            db.put(&mut w, b"pending", b"x").unwrap();
+            mark(&dir, "child-writing");
+            wait_for(&dir.join("child-stop"), Duration::from_secs(60));
+            drop(w);
+        }
         "hold_open" => {
             // Just hold the env open (no txn) until told to stop.
             mark(&dir, "held");
@@ -420,31 +431,51 @@ fn killed_writer_lock_is_taken_over() {
     assert_eq!(env.main_database().get(&r, b"doomed").unwrap(), None);
 }
 
+/// A joiner that asks for another `max_readers` than the running
+/// environment's adopts the lock file's reader count, in both directions, as
+/// LMDB does (`OBS_JOINER_FEWER_MAXREADERS`, `OBS_JOINER_MORE_MAXREADERS`;
+/// ADR-0023 §1 as amended).
 #[test]
-fn second_process_with_other_max_readers_is_refused() {
+fn second_process_with_other_max_readers_adopts_the_lock_files() {
     let dir = TempDir::new();
-    let _env = open(dir.path()); // max_readers 16
-    let status = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "child_entry_other_readers", "--nocapture"])
-        .env(DIR, dir.path())
-        .status()
-        .unwrap();
-    assert!(status.success());
+    let env = open(dir.path()); // max_readers 16
+    for asked in [32u32, 4] {
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "child_entry_other_readers", "--nocapture"])
+            .env(DIR, dir.path())
+            .env(MAP, asked.to_string())
+            .status()
+            .unwrap();
+        assert!(status.success(), "child asking for {asked} readers");
+    }
+    assert_eq!(env.info().max_readers, 16);
+    let r = env.read_txn().unwrap();
+    assert_eq!(
+        env.main_database().get(&r, b"from-child").unwrap(),
+        Some(&b"1"[..])
+    );
 }
 
-/// Child entry point for the `max_readers` mismatch case.
+/// Child entry point for the `max_readers` adoption case: opens with the
+/// reader count in `MAP`, expects the running environment's 16, and commits.
 #[test]
 fn child_entry_other_readers() {
     let Ok(dir) = std::env::var(DIR) else { return };
+    let asked: u32 = std::env::var(MAP).unwrap().parse().unwrap();
     let mut o = EnvOpenOptions::new();
     o.map_size(64 << 20)
         .page_size(4096)
-        .max_readers(32)
+        .max_readers(asked)
         .lock_file(true);
-    match o.open(Path::new(&dir)) {
-        Err(zerodb::Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
-        other => panic!("expected a max_readers mismatch error, got {other:?}"),
-    }
+    let env = o
+        .open(Path::new(&dir))
+        .expect("a joiner with another max_readers");
+    assert_eq!(env.info().max_readers, 16, "adopted the lock file's count");
+    let mut w = env.write_txn().unwrap();
+    env.main_database()
+        .put(&mut w, b"from-child", b"1")
+        .unwrap();
+    w.commit().unwrap();
 }
 
 /// Rewrite every seeded key `rounds` times. Returns the growth of
@@ -971,4 +1002,183 @@ fn exclusive_lock_holds_other_openers_in_the_election() {
         env.main_database().get(&r, b"from-child").unwrap(),
         Some(&b"1"[..])
     );
+}
+
+/// ADR-0023 amendment 17 (`OBS_RDONLY_EXISTING_LOCK = 0`): a `READ_ONLY` open
+/// while another process holds a write txn joins the existing lock file. It
+/// reads the other process's commit (not its pending write), and its read
+/// txn takes a slot in the shared reader table under this process's PID.
+#[test]
+fn read_only_env_joins_the_existing_lock_file() {
+    let dir = TempDir::new();
+    let mut c = child("commit_and_hold_writer", dir.path());
+    wait_for(&dir.path().join("child-writing"), Duration::from_secs(30));
+
+    let mut o = lock_opts();
+    o.flags(zerodb::EnvFlags::READ_ONLY);
+    let env = o.open(dir.path()).expect("read-only joiner");
+    assert!(env.has_lock_file());
+    assert!(!env.opened_exclusively(), "joined the child's lock file");
+    let r = env.read_txn().unwrap();
+    let db = env.main_database();
+    assert_eq!(db.get(&r, b"from-child").unwrap(), Some(&b"1"[..]));
+    assert_eq!(db.get(&r, b"pending").unwrap(), None);
+    let me = std::process::id();
+    assert!(
+        env.reader_list().iter().any(|e| e.pid == Some(me)),
+        "no reader slot under this process's PID: {:?}",
+        env.reader_list()
+    );
+    drop(r);
+    drop(env);
+    mark(dir.path(), "child-stop");
+    wait_success(&mut c, Duration::from_secs(30));
+}
+
+/// A `READ_ONLY` open of an environment without a lock file, in a directory
+/// this process cannot write, fails with `EACCES` and creates nothing
+/// (`OBS_RDONLY_LOCK_DIR_UNWRITABLE`). Root ignores file modes, so it is
+/// skipped there.
+#[test]
+fn read_only_open_in_an_unwritable_dir_fails_and_creates_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: plain libc query with no memory effects.
+    if unsafe { libc::geteuid() } == 0 {
+        println!("SKIPPED: running as root, which ignores directory modes");
+        return;
+    }
+    let dir = TempDir::new();
+    drop(EnvOpenOptions::new().open(dir.path()).unwrap());
+    std::fs::set_permissions(dir.path(), PermissionsExt::from_mode(0o555)).unwrap();
+    let mut o = lock_opts();
+    o.flags(zerodb::EnvFlags::READ_ONLY);
+    let r = o.open(dir.path());
+    let created = dir.path().join("zerodb.lock").exists();
+    std::fs::set_permissions(dir.path(), PermissionsExt::from_mode(0o755)).unwrap();
+    match r {
+        Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EACCES), "{e}"),
+        other => panic!("expected Io(EACCES), got {other:?}"),
+    }
+    assert!(!created, "the failed open created a lock file");
+}
+
+/// Run `cmd` to completion within 60 s; `false` on a failure exit, a spawn
+/// error or the timeout (the child is then killed).
+fn run_bounded(cmd: &mut Command) -> bool {
+    let Ok(mut child) = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return st.success(),
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// A read-only filesystem holding a copy of a directory, unmounted on drop.
+struct ReadOnlyFs {
+    mount: PathBuf,
+    _keep: TempDir,
+}
+
+impl Drop for ReadOnlyFs {
+    fn drop(&mut self) {
+        if cfg!(target_os = "macos") {
+            run_bounded(
+                Command::new("hdiutil")
+                    .arg("detach")
+                    .arg("-force")
+                    .arg(&self.mount),
+            );
+        } else {
+            run_bounded(Command::new("umount").arg(&self.mount));
+        }
+    }
+}
+
+/// Make a read-only filesystem with `src`'s files, or say why not: a
+/// read-only disk image on macOS (`hdiutil`), a read-only bind mount on
+/// Linux (needs `CAP_SYS_ADMIN`, for example a privileged container).
+fn read_only_fs(src: &Path) -> Result<ReadOnlyFs, String> {
+    let keep = TempDir::new();
+    let mount = keep.path().join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    if cfg!(target_os = "macos") {
+        let img = keep.path().join("ro.dmg");
+        if !run_bounded(
+            Command::new("hdiutil")
+                .args(["create", "-quiet", "-format", "UDRO", "-srcfolder"])
+                .arg(src)
+                .arg(&img),
+        ) {
+            return Err("hdiutil create failed".into());
+        }
+        if !run_bounded(
+            Command::new("hdiutil")
+                .args(["attach", "-quiet", "-readonly", "-nobrowse", "-mountpoint"])
+                .arg(&mount)
+                .arg(&img),
+        ) {
+            return Err("hdiutil attach failed".into());
+        }
+    } else {
+        if !run_bounded(Command::new("mount").arg("--bind").arg(src).arg(&mount)) {
+            return Err("bind mount failed (needs CAP_SYS_ADMIN)".into());
+        }
+        if !run_bounded(
+            Command::new("mount")
+                .args(["-o", "remount,bind,ro"])
+                .arg(&mount),
+        ) {
+            run_bounded(Command::new("umount").arg(&mount));
+            return Err("read-only remount failed".into());
+        }
+    }
+    Ok(ReadOnlyFs { mount, _keep: keep })
+}
+
+/// ADR-0023 amendment 17 (`OBS_RDONLY_LOCK_READONLY_FS = 0`): on read-only
+/// media, where no lock file can be created, a `READ_ONLY` open proceeds
+/// without one and serves read txns. A writable open there still fails with
+/// `EROFS`.
+#[test]
+fn read_only_env_on_read_only_media_opens_without_a_lock_file() {
+    let src = TempDir::new();
+    {
+        let env = EnvOpenOptions::new().open(src.path()).unwrap();
+        let mut w = env.write_txn().unwrap();
+        env.main_database().put(&mut w, b"k", b"v").unwrap();
+        w.commit().unwrap();
+    }
+    let fs = match read_only_fs(src.path()) {
+        Ok(fs) => fs,
+        Err(why) => {
+            println!("SKIPPED: no read-only filesystem here ({why})");
+            return;
+        }
+    };
+    {
+        let mut o = lock_opts();
+        o.flags(zerodb::EnvFlags::READ_ONLY);
+        let env = o.open(&fs.mount).expect("READ_ONLY on read-only media");
+        assert!(!env.has_lock_file());
+        let r = env.read_txn().unwrap();
+        assert_eq!(env.main_database().get(&r, b"k").unwrap(), Some(&b"v"[..]));
+    }
+    assert!(!fs.mount.join("zerodb.lock").exists());
+    match lock_opts().open(&fs.mount) {
+        Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EROFS), "{e}"),
+        other => panic!("expected Io(EROFS) for a writable open, got {other:?}"),
+    }
 }

@@ -29,8 +29,11 @@ pub type NamedDb = (Vec<u8>, Vec<Kv>);
 /// from the data file ([`zerodb::derived_lock_file_name`]), so the tool joins
 /// the environment as any other process does (ADR-0023 amendment 18).
 ///
-/// `max_readers` is the value the environment's lock file records when a
-/// process has it open (a joiner must match it); otherwise the engine default.
+/// `max_readers` is the value the environment's lock file records, if any;
+/// otherwise the engine default. A tool that joins a running environment
+/// adopts that environment's count anyway (ADR-0023 §1 as amended); reading
+/// it first keeps the count when every other process has closed and the
+/// tool's open reinitializes the lock file.
 ///
 /// # Errors
 ///
@@ -69,9 +72,8 @@ fn recorded_max_readers(env_dir: &Path, opts: &EnvOpenOptions) -> Result<Option<
 /// (`crate::naming::resolve`) — the engine itself never guesses, so the tool
 /// must tell it which file the directory actually holds.
 ///
-/// If the open fails on a `max_readers` mismatch because every process
-/// closed the environment and another reopened it with another value between
-/// reading the lock file and the open, it retries once with the new value.
+/// On read-only media no lock file can be created, and the open proceeds
+/// without one, as LMDB's tools do (ADR-0023 amendment 17).
 ///
 /// # Errors
 ///
@@ -81,17 +83,9 @@ pub fn open_ro(env_dir: &Path, data_file_name: &str) -> Result<Env, zerodb::Erro
         Ok(e) => *e,
         Err(e) => zerodb::Error::Io(std::io::Error::other(e.to_string())),
     };
-    let opts = tool_open_options(env_dir, data_file_name).map_err(to_zerodb)?;
-    match opts.open(env_dir) {
-        Err(zerodb::Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
-            let retry = tool_open_options(env_dir, data_file_name).map_err(to_zerodb)?;
-            if retry.get_max_readers() == opts.get_max_readers() {
-                return Err(zerodb::Error::Io(e));
-            }
-            retry.open(env_dir)
-        }
-        r => r,
-    }
+    tool_open_options(env_dir, data_file_name)
+        .map_err(to_zerodb)?
+        .open(env_dir)
 }
 
 /// Begin a read txn on a tool's env. A [`MdbError::MapResized`] (another

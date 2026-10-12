@@ -39,11 +39,17 @@ macro_rules! bench_backend {
                 opts.map_size(map_size);
                 opts.max_dbs(16);
                 bench_backend!(@setpage opts, page, $setpage);
-                // SAFETY: single-process, private temp dir; the only flag ever
-                // set is NO_SYNC (durability, not a cross-process behavior).
+                let mut flags = EnvFlags::empty();
+                if no_sync {
+                    flags |= EnvFlags::NO_SYNC;
+                }
+                bench_backend!(@lockflag flags, $setpage);
+                // SAFETY: single-process, private temp dir: no other process
+                // opens it, which is what NO_LOCK (zerodb only) requires;
+                // NO_SYNC is durability, not a cross-process behavior.
                 unsafe {
-                    if no_sync {
-                        opts.flags(EnvFlags::NO_SYNC);
+                    if !flags.is_empty() {
+                        opts.flags(flags);
                     }
                     opts.open(dir)
                 }
@@ -716,13 +722,19 @@ macro_rules! bench_backend {
         if crate::backend::bench_knob("ZERODB_BENCH_SEQUENTIAL_WRITES") {
             $opts.sequential_writes(true);
         }
+    };
+    (@lockflag $flags:ident, set) => {
         // ADR-0023 bench axis: `ZERODB_BENCH_LOCK_FILE=1` opens every zerodb
         // env with the multi-process lock file, to measure its single-process
-        // cost against the default. Off unless set.
-        if std::env::var("ZERODB_BENCH_LOCK_FILE").as_deref() == Ok("1") {
-            $opts.lock_file(true);
+        // cost. Off unless set: the zerodb env then gets heed's `NO_LOCK`, so
+        // the bench keeps measuring the engine without a lock file now that
+        // the adapter has one by default (ADR-0023 amendment 17).
+        if std::env::var("ZERODB_BENCH_LOCK_FILE").as_deref() != Ok("1") {
+            $flags |= EnvFlags::NO_LOCK;
         }
     };
+    // LMDB always runs with its lock file.
+    (@lockflag $flags:ident, noset) => {};
     (@setpage $opts:ident, $page:ident, noset) => {
         // LMDB derives its page size from the OS; nothing to set.
         let _ = $page;

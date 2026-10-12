@@ -80,6 +80,14 @@ impl Lmdb {
         Ok(Lmdb { env })
     }
 
+    /// `mdb_env_get_maxreaders`.
+    fn maxreaders(&self) -> u32 {
+        let mut n: c_uint = 0;
+        // SAFETY: plain call on an open env; `n` outlives it.
+        assert_eq!(unsafe { ffi::mdb_env_get_maxreaders(self.env, &mut n) }, 0);
+        n
+    }
+
     /// Begin a read txn; the raw return code on failure.
     fn try_read(&self) -> Result<*mut ffi::MDB_txn, c_int> {
         self.try_begin(MDB_RDONLY)
@@ -1031,4 +1039,59 @@ fn set_mapsize_with_a_write_txn_matches_lmdb() {
     };
     eprintln!("zdb resize with a write txn = {zdb}");
     assert_eq!(zdb, lmdb, "resize with a live write txn");
+}
+
+/// While another process holds the environment with [`MAX_READERS`] reader
+/// slots, a joiner that asks for fewer and one that asks for more: each
+/// open's outcome and the reader count it ends up with (ADR-0023 §1 as
+/// amended; `OBS_JOINER_FEWER_MAXREADERS`, `OBS_JOINER_MORE_MAXREADERS`). A
+/// differential tuple for
+/// `multi_process.rs::second_process_with_other_max_readers_adopts_the_lock_files`.
+#[test]
+fn joiner_with_other_max_readers_matches_lmdb() {
+    let asks = [MAX_READERS / 2, MAX_READERS * 4];
+    let lmdb: Vec<(String, u32)> = {
+        let dir = TempDir::new().unwrap();
+        let mut c = spawn("lmdb_hold_open", dir.path());
+        wait_for(&dir.path().join("held"));
+        let got = asks
+            .iter()
+            .map(|&n| match Lmdb::try_open_flags(dir.path(), n, MIB, 0) {
+                Ok(env) => ("ok".to_string(), env.maxreaders()),
+                Err(rc) => (lmdb_rc(rc), 0),
+            })
+            .collect();
+        std::fs::write(dir.path().join("stop"), b"").unwrap();
+        wait_exit(&mut c, "lmdb_hold_open");
+        got
+    };
+    eprintln!("lmdb (outcome, maxreaders) per ask {asks:?} = {lmdb:?}");
+
+    let zdb: Vec<(String, u32)> = {
+        let dir = TempDir::new().unwrap();
+        let mut c = spawn("zdb_hold_open", dir.path());
+        wait_for(&dir.path().join("held"));
+        let got = asks
+            .iter()
+            .map(|&n| {
+                let mut o = zerodb::EnvOpenOptions::new();
+                o.page_size(PSIZE as u32)
+                    .max_readers(n)
+                    .lock_file(true)
+                    .map_size(usize::try_from(MIB).unwrap());
+                match o.open(dir.path()) {
+                    Ok(env) => ("ok".to_string(), env.info().max_readers),
+                    Err(e) => (zdb_open_rc(Err(e)), 0),
+                }
+            })
+            .collect();
+        std::fs::write(dir.path().join("stop"), b"").unwrap();
+        wait_exit(&mut c, "zdb_hold_open");
+        got
+    };
+    eprintln!("zdb (outcome, maxreaders) per ask {asks:?} = {zdb:?}");
+    assert_eq!(
+        zdb, lmdb,
+        "(outcome, maxreaders) of joiners with other counts"
+    );
 }

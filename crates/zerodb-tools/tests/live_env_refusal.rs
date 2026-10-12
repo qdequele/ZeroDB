@@ -129,9 +129,8 @@ fn wait_stop(ctl: &Path) {
 fn hold_adapter(dir: &Path, ctl: &Path) {
     use heed_zerodb::types::Bytes;
     let mut opts = heed_zerodb::EnvOpenOptions::new();
-    opts.map_size(16 << 20)
-        .max_readers(CHILD_MAX_READERS)
-        .lock_file(true);
+    // The adapter opens with a lock file by default (ADR-0023 amendment 17).
+    opts.map_size(16 << 20).max_readers(CHILD_MAX_READERS);
     // SAFETY: heed signature parity only; the adapter's open performs no
     // unsafe operation.
     let env = unsafe { opts.open(dir) }.expect("open adapter env");

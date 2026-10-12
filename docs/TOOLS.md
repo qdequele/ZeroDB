@@ -25,9 +25,10 @@ pick, and `stat` prints an engine-identification line read from the file's own
 records, whether a process has the env open or an earlier run left the lock
 file finished. It falls back to the default (126) only when the lock file
 records none: no lock file yet, or one left with the initializing magic by an
-opener that never finished. While a tool runs, a process opening the env with
-another `max_readers` (for example, a consumer that changed it between runs)
-is refused, as two processes with different values always are.
+opener that never finished. A process that joins the env while a tool runs
+adopts that count whatever it asks for, as LMDB joiners do. On read-only
+media, where no lock file can be created, the tools open the env read-only
+without one, as LMDB's tools do.
 
 ```
 zerodb-tools <SUBCOMMAND> [ARGS]
