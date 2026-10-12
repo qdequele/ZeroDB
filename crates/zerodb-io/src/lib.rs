@@ -406,6 +406,7 @@ pub fn open_or_create(
         write_map,
         false,
         true,
+        false,
     )
 }
 
@@ -418,6 +419,15 @@ pub fn open_or_create(
 /// (the only process), `false` for a joiner. A joiner maps the logical size,
 /// which may extend past the file's end, and its first write txn grows the
 /// file under both writer locks (ADR-0023 amendment 15, decision 4).
+///
+/// `prev_snapshot` mirrors the engine's `EnvFlags::PREV_SNAPSHOT`: the
+/// persisted map size this open adopts
+/// (when `requested_map_size` is `None`) and the minimum it rounds a small
+/// requested size up to both come from the **older** valid meta generation,
+/// not the newest — the LMDB fork reads its header with the `prev` flag, so
+/// its minimum and default map size come from that older meta too
+/// (`OBS_PREV_SNAPSHOT_MINSIZE_FROM`, `OBS_PREV_SNAPSHOT_ZERO_MAPSIZE_FROM` =
+/// "prev"). With only one valid meta, that one is used either way.
 ///
 /// # Errors
 ///
@@ -432,6 +442,7 @@ pub fn open_or_create_with_advice(
     write_map: bool,
     random_access: bool,
     grow_file: bool,
+    prev_snapshot: bool,
 ) -> Result<Opened, Error> {
     // `WRITE_MAP` needs write access; it is meaningless (and unsupported here)
     // on a read-only env, which maps read-only. LMDB likewise maps a
@@ -496,22 +507,29 @@ pub fn open_or_create_with_advice(
     // Probe the persisted map size from a small head read before mapping, so
     // the mapping can cover the full effective map_size (ADR-0004 D4).
     let head = file::read_head(&file, file_len.min(2 * page_size as usize))?;
-    let newest = newest_meta_geometry(&head, page_size);
-    if let Some((persisted, _)) = newest {
+    // `PREV_SNAPSHOT` takes its geometry from the older meta generation, as
+    // LMDB does; a normal open takes the newest (see the doc comment above).
+    let geometry = if prev_snapshot {
+        prev_meta_geometry(&head, page_size)
+    } else {
+        newest_meta_geometry(&head, page_size)
+    };
+    if let Some((persisted, _)) = geometry {
         // A persisted size above the cap is corrupt (ADR-0023 amendment 15).
         if persisted > MAX_MAP_SIZE {
             return Err(Error::Mdb(MdbError::Invalid));
         }
     }
     let mut map_size = requested_map_size
-        .or(newest.map(|(m, _)| m))
+        .or(geometry.map(|(m, _)| m))
         .unwrap_or(default_map_size);
-    // A map below the newest commit's data rounds up to exactly
+    // A map below the selected generation's data rounds up to exactly
     // `(last_pg + 1) * page_size`, as LMDB does (`OBS_OPEN_BELOW_LAST_PG =
-    // "minsize"`). Only within the file: a meta naming pages past the file
-    // end is corrupt, and the engine core rejects it (SPEC 06 REC-1a) —
-    // never grow a map, or under WRITE_MAP the file, for it.
-    if let Some((_, last_pg)) = newest {
+    // "minsize"`, `OBS_PREV_SNAPSHOT_MINSIZE_FROM = "prev"`). Only within the
+    // file: a meta naming pages past the file end is corrupt, and the engine
+    // core rejects it (SPEC 06 REC-1a) — never grow a map, or under
+    // WRITE_MAP the file, for it.
+    if let Some((_, last_pg)) = geometry {
         let min = last_pg
             .checked_add(1)
             .and_then(|n| n.checked_mul(u64::from(page_size)));
@@ -598,6 +616,30 @@ fn newest_meta_geometry(bytes: &[u8], page_size: u32) -> Option<(u64, u64)> {
         }
     }
     best.map(|(_, ms, lp)| (ms, lp))
+}
+
+/// The persisted `(map_size, last_pg)` of the **older** valid meta slot (the
+/// lower-txnid one, when both decode), or of whichever single slot decodes
+/// otherwise. This is the generation `PREV_SNAPSHOT` serves, and so the meta
+/// the LMDB fork reads its `PREVSNAPSHOT` open-time map size and minimum
+/// from, observed as `OBS_PREV_SNAPSHOT_MINSIZE_FROM` and
+/// `OBS_PREV_SNAPSHOT_ZERO_MAPSIZE_FROM` (both `"prev"`,
+/// `lmdb_stage3_observation.rs`).
+fn prev_meta_geometry(bytes: &[u8], page_size: u32) -> Option<(u64, u64)> {
+    let ps = page_size as usize;
+    let mut valid: Vec<(u64, u64, u64)> = Vec::new(); // (txnid, map_size, last_pg)
+    for slot in [0usize, 1] {
+        let base = slot * ps;
+        let end = base.checked_add(ps)?;
+        if end > bytes.len() {
+            continue;
+        }
+        if let Ok(MetaValidity::Valid(m)) = MetaPage::validate(&bytes[base..end], page_size) {
+            valid.push((m.txnid, m.map_size, m.last_pg));
+        }
+    }
+    valid.sort_by_key(|m| m.0);
+    valid.first().map(|&(_, ms, lp)| (ms, lp))
 }
 
 #[cfg(test)]

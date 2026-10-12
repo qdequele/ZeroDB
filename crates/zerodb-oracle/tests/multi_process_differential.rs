@@ -54,6 +54,32 @@ impl Lmdb {
         Lmdb { env }
     }
 
+    /// Open with `mapsize` and extra `flags` (`MDB_NOTLS` is added); the raw
+    /// return code on failure.
+    fn try_open_flags(
+        dir: &Path,
+        max_readers: u32,
+        mapsize: u64,
+        flags: c_uint,
+    ) -> Result<Lmdb, c_int> {
+        let path = CString::new(dir.to_str().unwrap()).unwrap();
+        let mut env = ptr::null_mut();
+        // SAFETY: plain C API calls on a fresh env handle; on failure the
+        // handle is closed as the C API requires, and `path` outlives the
+        // `mdb_env_open` call.
+        unsafe {
+            assert_eq!(ffi::mdb_env_create(&mut env), 0);
+            assert_eq!(ffi::mdb_env_set_maxreaders(env, max_readers), 0);
+            assert_eq!(ffi::mdb_env_set_mapsize(env, mapsize as _), 0);
+            let rc = ffi::mdb_env_open(env, path.as_ptr(), MDB_NOTLS | flags, 0o644);
+            if rc != 0 {
+                ffi::mdb_env_close(env);
+                return Err(rc);
+            }
+        }
+        Ok(Lmdb { env })
+    }
+
     /// Begin a read txn; the raw return code on failure.
     fn try_read(&self) -> Result<*mut ffi::MDB_txn, c_int> {
         self.try_begin(MDB_RDONLY)
@@ -169,6 +195,39 @@ impl Lmdb {
                 mv_data: b"v".as_ptr() as *mut c_void,
             };
             assert_eq!(ffi::mdb_put(txn, dbi, &mut k, &mut v, 0), 0);
+            assert_eq!(ffi::mdb_txn_commit(txn), 0);
+        }
+    }
+
+    /// Put `n` 1000-byte values in **one** txn and commit, so the meta's
+    /// `last_pg` moves well past a small env in a single generation (unlike
+    /// [`Lmdb::grow`], which commits many small txns and so would make the
+    /// on-disk "previous" meta the second-to-last of those, not whatever the
+    /// caller committed before calling this).
+    fn commit_many(&self, n: u32) {
+        let value = [7u8; 1000];
+        // SAFETY: standard begin/dbi_open/put/commit sequence on an open
+        // env; every pointer is live for the duration of its call.
+        unsafe {
+            let mut txn = ptr::null_mut();
+            assert_eq!(
+                ffi::mdb_txn_begin(self.env, ptr::null_mut(), 0, &mut txn),
+                0
+            );
+            let mut dbi = 0;
+            assert_eq!(ffi::mdb_dbi_open(txn, ptr::null(), 0, &mut dbi), 0);
+            for i in 0..n {
+                let key = format!("g{i:08}");
+                let mut k = ffi::MDB_val {
+                    mv_size: key.len(),
+                    mv_data: key.as_ptr() as *mut c_void,
+                };
+                let mut v = ffi::MDB_val {
+                    mv_size: value.len(),
+                    mv_data: value.as_ptr() as *mut c_void,
+                };
+                assert_eq!(ffi::mdb_put(txn, dbi, &mut k, &mut v, 0), 0);
+            }
             assert_eq!(ffi::mdb_txn_commit(txn), 0);
         }
     }
@@ -300,9 +359,42 @@ fn lmdb_meta_mapsize(dir: &Path, psize: u64) -> u64 {
         .1
 }
 
+/// Both meta slots' `(mm_mapsize, mm_last_pg, mm_txnid)`, ascending by
+/// `mm_txnid`: `[0]` is the older ("prev") generation, `[1]` the newest. Same
+/// offsets as [`lmdb_meta_mapsize`]; mirrors
+/// `lmdb_stage3_observation.rs::read_metas`.
+fn lmdb_meta_generations(dir: &Path, psize: u64) -> Vec<(u64, u64, u64)> {
+    let bytes = std::fs::read(dir.join("data.mdb")).unwrap();
+    let u64_at = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+    let mut metas: Vec<(u64, u64, u64)> = (0..2)
+        .map(|i| {
+            let base = (i * psize) as usize;
+            let magic = u32::from_le_bytes(bytes[base + 16..base + 20].try_into().unwrap());
+            assert_eq!(magic, 0xBEEF_C0DE, "meta magic");
+            (u64_at(base + 32), u64_at(base + 136), u64_at(base + 144))
+        })
+        .collect();
+    metas.sort_by_key(|m| m.2);
+    metas
+}
+
 fn zdb_commit_one(env: &zerodb::Env) {
     let mut w = env.write_txn().unwrap();
     env.main_database().put(&mut w, b"k", b"v").unwrap();
+    w.commit().unwrap();
+}
+
+/// [`zdb_commit_one`], but `n` 1000-byte values in **one** txn, so the meta's
+/// `last_pg` moves well past a small env in a single generation (see
+/// [`Lmdb::commit_many`] for why that matters here).
+fn zdb_commit_many(env: &zerodb::Env, n: u32) {
+    let db = env.main_database();
+    let value = vec![7u8; 1000];
+    let mut w = env.write_txn().unwrap();
+    for i in 0..n {
+        db.put(&mut w, format!("g{i:08}").as_bytes(), &value)
+            .unwrap();
+    }
     w.commit().unwrap();
 }
 
@@ -636,6 +728,140 @@ fn open_below_last_pg_matches_lmdb() {
     };
     eprintln!("zdb open below last_pg = {zdb}");
     assert_eq!(zdb, lmdb, "map size after an open below last_pg");
+}
+
+/// Two meta generations with different `last_pg` (a small first commit, then
+/// a resize and a much larger second commit) and different persisted map
+/// sizes: `MDB_PREVSNAPSHOT`'s minimum (a requested map below both
+/// generations' `(last_pg + 1) * psize`) and its map-size-0 default both
+/// come from the **older** generation, not the newest
+/// (`OBS_PREV_SNAPSHOT_MINSIZE_FROM`, `OBS_PREV_SNAPSHOT_ZERO_MAPSIZE_FROM` =
+/// "prev"). This test checks ZeroDB mirrors that (ADR-0023 stage 3, extra
+/// item on Task 7).
+#[test]
+fn prev_snapshot_rounding_matches_lmdb() {
+    let classify = |got: u64, prev: u64, newest: u64| {
+        if got == prev {
+            "prev".to_string()
+        } else if got == newest {
+            "newest".to_string()
+        } else {
+            format!("other={got}")
+        }
+    };
+
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        let psize = {
+            let env = Lmdb::open_sized(dir.path(), MAX_READERS, 2 * MIB);
+            env.commit_one();
+            env.psize()
+            // Dropped: exactly two meta generations now sit on disk (the
+            // creation meta is long gone), so the raw read below sees
+            // exactly the "prev" (commit_one) and this big commit's
+            // "newest" generation, not an intermediate one (a `grow` loop
+            // of many small commits would make the on-disk "prev" meta the
+            // *second-to-last* loop commit, not `commit_one`'s).
+        };
+        {
+            let env = Lmdb::open_sized(dir.path(), MAX_READERS, 16 * MIB);
+            env.commit_many(300);
+        }
+        let metas = lmdb_meta_generations(dir.path(), psize);
+        assert_eq!(metas.len(), 2);
+        let (prev_mapsize, prev_last_pg) = (metas[0].0, metas[0].1);
+        let (newest_mapsize, newest_last_pg) = (metas[1].0, metas[1].1);
+        assert!(
+            newest_last_pg > prev_last_pg,
+            "setup: the second commit moved last_pg past the first's"
+        );
+        assert_ne!(prev_mapsize, newest_mapsize, "setup: lmdb mapsize changed");
+        let prev_minsize = (prev_last_pg + 1) * psize;
+        let newest_minsize = (newest_last_pg + 1) * psize;
+        let requested = psize;
+        assert!(
+            requested < prev_minsize,
+            "setup: the requested map is below both minimums"
+        );
+        let minsize_from =
+            match Lmdb::try_open_flags(dir.path(), MAX_READERS, requested, ffi::MDB_PREVSNAPSHOT) {
+                Ok(e) => classify(e.map_info().0, prev_minsize, newest_minsize),
+                Err(rc) => format!("rc={rc}"),
+            };
+        let zero_from =
+            match Lmdb::try_open_flags(dir.path(), MAX_READERS, 0, ffi::MDB_PREVSNAPSHOT) {
+                Ok(e) => classify(e.map_info().0, prev_mapsize, newest_mapsize),
+                Err(rc) => format!("rc={rc}"),
+            };
+        (minsize_from, zero_from)
+    };
+    eprintln!("lmdb (minsize_from, zero_from) = {lmdb:?}");
+
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        let prev_info = {
+            let mut o = zerodb::EnvOpenOptions::new();
+            o.page_size(PSIZE as u32)
+                .max_readers(MAX_READERS)
+                .lock_file(true)
+                .map_size(usize::try_from(2 * MIB).unwrap());
+            let env = o.open(dir.path()).expect("open lock-file env");
+            zdb_commit_one(&env);
+            let info = env.info();
+            // Dropped before the second generation, for the same reason as
+            // the LMDB side above: exactly two generations end up on disk.
+            info
+        };
+        let newest_info = {
+            let mut o = zerodb::EnvOpenOptions::new();
+            o.page_size(PSIZE as u32)
+                .max_readers(MAX_READERS)
+                .lock_file(true)
+                .map_size(usize::try_from(16 * MIB).unwrap());
+            let env = o.open(dir.path()).expect("open lock-file env");
+            zdb_commit_many(&env, 300);
+            env.info()
+        };
+        assert!(
+            newest_info.last_pgno > prev_info.last_pgno,
+            "setup: the second commit moved last_pg past the first's"
+        );
+        assert_ne!(
+            prev_info.map_size, newest_info.map_size,
+            "setup: zdb mapsize changed"
+        );
+        let prev_minsize = (prev_info.last_pgno + 1) * PSIZE;
+        let newest_minsize = (newest_info.last_pgno + 1) * PSIZE;
+        let requested = PSIZE;
+        assert!(
+            requested < prev_minsize,
+            "setup: the requested map is below both minimums"
+        );
+
+        let mut po = zerodb::EnvOpenOptions::new();
+        po.page_size(PSIZE as u32)
+            .max_readers(MAX_READERS)
+            .lock_file(true)
+            .flags(zerodb::EnvFlags::PREV_SNAPSHOT)
+            .map_size(usize::try_from(requested).unwrap());
+        let minsize_from = match po.open(dir.path()) {
+            Ok(e) => classify(e.info().map_size, prev_minsize, newest_minsize),
+            Err(e) => format!("{e:?}"),
+        };
+
+        let mut zo = zerodb::EnvOpenOptions::new();
+        zo.page_size(PSIZE as u32)
+            .max_readers(MAX_READERS)
+            .lock_file(true)
+            .flags(zerodb::EnvFlags::PREV_SNAPSHOT);
+        let zero_from = match zo.open(dir.path()) {
+            Ok(e) => classify(e.info().map_size, prev_info.map_size, newest_info.map_size),
+            Err(e) => format!("{e:?}"),
+        };
+        (minsize_from, zero_from)
+    };
+    eprintln!("zdb (minsize_from, zero_from) = {zdb:?}");
+    assert_eq!(zdb, lmdb, "(minsize_from, zero_from) under PREV_SNAPSHOT");
 }
 
 /// Normalize a `resize` / `mdb_env_set_mapsize` result: `ok`, or the raw OS

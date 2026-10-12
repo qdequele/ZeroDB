@@ -250,6 +250,11 @@ fn child_entry() {
             wait_for(&dir.join("child-stop"), Duration::from_secs(60));
             drop(r);
         }
+        "hold_open" => {
+            // Just hold the env open (no txn) until told to stop.
+            mark(&dir, "held");
+            wait_for(&dir.join("child-stop"), Duration::from_secs(60));
+        }
         "hold_readers_and_die" => {
             let a = env.read_txn().unwrap();
             let b = env.read_txn().unwrap();
@@ -864,6 +869,38 @@ fn lock_opts() -> EnvOpenOptions {
     let mut o = EnvOpenOptions::new();
     o.max_readers(16).lock_file(true);
     o
+}
+
+/// ADR-0023 §5: `PREV_SNAPSHOT` requires winning the first-opener election
+/// (no other process alive). Joining an environment another process already
+/// has open fails with `EAGAIN`, matching the LMDB fork
+/// (`OBS_PREV_SNAPSHOT_JOINER`); the lock file is released by the failed
+/// open, so a plain (non-`PREV_SNAPSHOT`) open still joins normally, and
+/// once the other process lets go, the same `PREV_SNAPSHOT` open succeeds as
+/// the sole opener.
+#[test]
+fn prev_snapshot_open_fails_while_another_process_has_the_env() {
+    let dir = TempDir::new();
+    let mut c = child("hold_open", dir.path());
+    wait_for(&dir.path().join("held"), Duration::from_secs(30));
+
+    let mut o = lock_opts();
+    o.flags(zerodb::EnvFlags::PREV_SNAPSHOT);
+    match o.open(dir.path()) {
+        Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EAGAIN), "{e}"),
+        other => panic!("expected Io(EAGAIN), got {other:?}"),
+    }
+    let joined = open(dir.path());
+    assert!(!joined.opened_exclusively(), "a joiner");
+    drop(joined);
+
+    mark(dir.path(), "child-stop");
+    wait_success(&mut c, Duration::from_secs(30));
+
+    let env = o
+        .open(dir.path())
+        .expect("sole opener: PREV_SNAPSHOT succeeds");
+    assert!(env.opened_exclusively());
 }
 
 /// ADR-0023 amendment 18: `Env::opened_exclusively` is `true` for the

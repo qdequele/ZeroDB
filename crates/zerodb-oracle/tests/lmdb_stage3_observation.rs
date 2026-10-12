@@ -38,6 +38,16 @@ const OBS_SET_MAPSIZE_WITH_WRITE_TXN: i32 = libc::EINVAL;
 const OBS_COMMIT_PERSISTS_OWN_MAPSIZE: bool = false;
 const OBS_OPEN_SMALLER_THAN_META: u64 = MIB;
 const OBS_PREV_SNAPSHOT_JOINER: i32 = libc::EAGAIN;
+/// With two meta generations whose `last_pg` differ, `MDB_PREVSNAPSHOT` opened
+/// with a map size below both metas' `(last_pg + 1) * psize`: "prev" (the
+/// minimum comes from the older meta, the one `MDB_PREVSNAPSHOT` reads) or
+/// "newest" (the usual, non-`PREVSNAPSHOT` rule). macOS (Darwin 25.0.0),
+/// 2026-10-12.
+const OBS_PREV_SNAPSHOT_MINSIZE_FROM: &str = "prev";
+/// `MDB_PREVSNAPSHOT` opened with map size 0, where the two generations
+/// persisted different `mm_mapsize` values: the resulting `me_mapsize` is
+/// "prev" (the older meta's) or "newest". macOS (Darwin 25.0.0), 2026-10-12.
+const OBS_PREV_SNAPSHOT_ZERO_MAPSIZE_FROM: &str = "prev";
 const OBS_RDONLY_EXISTING_LOCK: i32 = 0;
 const OBS_RDONLY_LOCK_UNWRITABLE: i32 = libc::EACCES;
 const OBS_NOLOCK_CREATES_LOCK_FILE: bool = false;
@@ -177,6 +187,23 @@ fn read_meta(dir: &Path, psize: u64) -> (u64, u64, u64) {
         })
         .collect();
     *metas.iter().max_by_key(|m| m.2).unwrap()
+}
+
+/// Both meta slots' `(mm_mapsize, mm_last_pg, mm_txnid)`, ascending by
+/// `mm_txnid`: `[0]` is the older ("prev") generation, `[1]` the newest.
+fn read_metas(dir: &Path, psize: u64) -> Vec<(u64, u64, u64)> {
+    let bytes = std::fs::read(dir.join("data.mdb")).unwrap();
+    let u64_at = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+    let mut metas: Vec<(u64, u64, u64)> = (0..2)
+        .map(|i| {
+            let base = (i * psize) as usize;
+            let magic = u32::from_le_bytes(bytes[base + 16..base + 20].try_into().unwrap());
+            assert_eq!(magic, 0xBEEF_C0DE, "meta magic");
+            (u64_at(base + 32), u64_at(base + 136), u64_at(base + 144))
+        })
+        .collect();
+    metas.sort_by_key(|m| m.2);
+    metas
 }
 
 struct ChildGuard(Child);
@@ -553,6 +580,100 @@ fn observe_open_below_last_pg() {
     };
     println!("open below last_pg: {got}");
     assert_eq!(got, OBS_OPEN_BELOW_LAST_PG);
+}
+
+/// An env with two commits whose meta generations differ both in `last_pg`
+/// (a small first commit, then a much larger second one) and in `mm_mapsize`
+/// (a resize between the two commits), so the two tests below can tell which
+/// generation `MDB_PREVSNAPSHOT` reads from. Returns the directory, the page
+/// size, and the two generations ascending by txnid (`[0]` = prev, `[1]` =
+/// newest).
+fn two_meta_generations() -> (TempDir, u64, Vec<(u64, u64, u64)>) {
+    let dir = TempDir::new().unwrap();
+    let a = Lmdb::open(dir.path(), 2 * MIB);
+    a.commit_key(b"a");
+    let psize = a.psize();
+    assert_eq!(a.set_mapsize(16 * MIB), 0);
+    let value = [7u8; 4000];
+    let keys: Vec<String> = (0..300).map(|i| format!("big{i:04}")).collect();
+    let pairs: Vec<(&[u8], &[u8])> = keys.iter().map(|k| (k.as_bytes(), &value[..])).collect();
+    a.commit(&pairs);
+    drop(a);
+    let metas = read_metas(dir.path(), psize);
+    assert_eq!(metas.len(), 2);
+    assert_eq!(metas[0].0, 2 * MIB, "precondition: prev meta's mm_mapsize");
+    assert_eq!(
+        metas[1].0,
+        16 * MIB,
+        "precondition: newest meta's mm_mapsize"
+    );
+    assert!(
+        metas[1].1 > metas[0].1,
+        "precondition: the second commit moved last_pg past the first's"
+    );
+    (dir, psize, metas)
+}
+
+/// With two meta generations whose `last_pg` differ, `MDB_PREVSNAPSHOT`
+/// opened with a map size below both generations' `(last_pg + 1) * psize`:
+/// which generation's minimum wins.
+#[test]
+fn observe_prev_snapshot_minsize() {
+    let (dir, psize, metas) = two_meta_generations();
+    let prev_minsize = (metas[0].1 + 1) * psize;
+    let newest_minsize = (metas[1].1 + 1) * psize;
+    assert!(
+        prev_minsize < newest_minsize,
+        "precondition: prev meta's minimum is smaller than newest's"
+    );
+    let requested = psize;
+    assert!(
+        requested < prev_minsize,
+        "precondition: the requested map is below both minimums"
+    );
+    let got = match Lmdb::try_open(dir.path(), requested, ffi::MDB_PREVSNAPSHOT) {
+        Ok(env) => {
+            let m = env.info().me_mapsize as u64;
+            if m == prev_minsize {
+                "prev".to_string()
+            } else if m == newest_minsize {
+                "newest".to_string()
+            } else {
+                format!("other={m}")
+            }
+        }
+        Err(rc) => format!("rc={rc}"),
+    };
+    println!(
+        "MDB_PREVSNAPSHOT open below both minsizes: {got} (prev_minsize {prev_minsize}, newest_minsize {newest_minsize})"
+    );
+    assert_eq!(got, OBS_PREV_SNAPSHOT_MINSIZE_FROM);
+}
+
+/// `MDB_PREVSNAPSHOT` opened with map size 0 (adopt): which generation's
+/// persisted `mm_mapsize` the resulting `me_mapsize` matches.
+#[test]
+fn observe_prev_snapshot_zero_mapsize() {
+    let (dir, _psize, metas) = two_meta_generations();
+    let prev_mapsize = metas[0].0;
+    let newest_mapsize = metas[1].0;
+    let got = match Lmdb::try_open(dir.path(), 0, ffi::MDB_PREVSNAPSHOT) {
+        Ok(env) => {
+            let m = env.info().me_mapsize as u64;
+            if m == prev_mapsize {
+                "prev".to_string()
+            } else if m == newest_mapsize {
+                "newest".to_string()
+            } else {
+                format!("other={m}")
+            }
+        }
+        Err(rc) => format!("rc={rc}"),
+    };
+    println!(
+        "MDB_PREVSNAPSHOT open with map size 0: {got} (prev_mapsize {prev_mapsize}, newest_mapsize {newest_mapsize})"
+    );
+    assert_eq!(got, OBS_PREV_SNAPSHOT_ZERO_MAPSIZE_FROM);
 }
 
 /// An env whose `lock.mdb` was removed, closed, in `dir`.

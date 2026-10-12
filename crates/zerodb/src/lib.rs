@@ -559,6 +559,11 @@ impl EnvOpenOptions {
     ///   for the same canonical path (SPEC 04 TXN-51), or, with
     ///   [`EnvOpenOptions::lock_file`] on, already has that lock file open
     ///   (ADR-0023).
+    /// - [`Error::Io`] (`EAGAIN`) with [`EnvFlags::PREV_SNAPSHOT`] and
+    ///   [`EnvOpenOptions::lock_file`] both on, if another process already
+    ///   has the environment open: `PREV_SNAPSHOT` requires winning the
+    ///   lock file's first-opener election, matching LMDB as observed
+    ///   (ADR-0023 §5, `OBS_PREV_SNAPSHOT_JOINER`).
     pub fn open(&self, path: impl AsRef<Path>) -> Result<Env> {
         let dir = path.as_ref();
         // Validate the page-size selector here rather than in the setter
@@ -614,6 +619,18 @@ impl EnvOpenOptions {
 
         let read_only = self.flags.contains(EnvFlags::READ_ONLY);
         let prev_snapshot = self.flags.contains(EnvFlags::PREV_SNAPSHOT);
+        // ADR-0023 §5: `PREV_SNAPSHOT` requires winning the first-opener
+        // election (no other process alive), matching LMDB as observed
+        // (`OBS_PREV_SNAPSHOT_JOINER = EAGAIN`). A joiner's lock file is
+        // released before the error returns; the data file is never opened.
+        if prev_snapshot {
+            if let Some(l) = &lock {
+                if !zerodb_core::shared::SharedRegion::is_initializer(l.as_ref()) {
+                    drop(lock);
+                    return Err(Error::Io(std::io::Error::from_raw_os_error(libc::EAGAIN)));
+                }
+            }
+        }
         // `WRITE_MAP` is meaningful only on a writable env; the backing maps
         // read-only under `READ_ONLY` regardless (LMDB parity).
         let durability = DurabilityFlags {
@@ -637,6 +654,7 @@ impl EnvOpenOptions {
             // it under both writer locks.
             lock.as_ref()
                 .is_none_or(|l| zerodb_core::shared::SharedRegion::is_initializer(l.as_ref())),
+            prev_snapshot,
         )?;
 
         if let Some(l) = &lock {
