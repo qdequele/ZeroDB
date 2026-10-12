@@ -507,9 +507,10 @@ impl EnvOpenOptions {
     /// - [`Error::Io`] (`InvalidInput`), with [`EnvOpenOptions::lock_file`]
     ///   on, if the lock file is the data file under another name (a hard
     ///   link, or a case variant on a case-insensitive filesystem), or if it
-    ///   is a non-empty file that is not a lock file and whose first 256
-    ///   bytes are not all zero, such as another environment's data file
-    ///   (ADR-0023 amendment 16). Neither file is modified.
+    ///   is a non-empty file that is neither a ZeroDB lock file nor the
+    ///   all-zero remains of one, such as another environment's data file or
+    ///   a stale LMDB `lock.mdb` (ADR-0023 amendment 16; SPEC 02 §8 gives the
+    ///   exact rule). Neither file is modified.
     /// - [`Error::Io`] if the directory does not exist, on any file/mmap I/O
     ///   error, or if a `READ_ONLY` open finds no existing store.
     /// - [`Error::Mdb`]`(`[`MdbError::Invalid`]`)` if the file is not a valid

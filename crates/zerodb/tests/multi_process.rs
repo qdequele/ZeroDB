@@ -150,6 +150,7 @@ fn child_entry() {
     match role.as_str() {
         "wm_resizer" => return wm_resizer(&dir),
         "wm_writer" => return wm_writer(&dir),
+        "hold_b_db" => return hold_b_db(&dir),
         _ => {}
     }
     let env = match std::env::var(MAP) {
@@ -804,4 +805,56 @@ fn write_map_processes_never_shrink_the_file() {
     let r = env.read_txn().unwrap();
     assert!(db.get(&r, b"resizer0023").unwrap().is_some());
     assert!(db.get(&r, b"writer0299").unwrap().is_some());
+}
+
+/// Open the lock-file env whose data file is `data_name` in `dir`.
+fn open_named(dir: &Path, data_name: &str) -> Env {
+    let mut o = EnvOpenOptions::new();
+    o.map_size(16 * MIB)
+        .page_size(4096)
+        .max_readers(16)
+        .data_file_name(data_name)
+        .lock_file(true);
+    o.open(dir).expect("open named lock-file env")
+}
+
+/// Commit `who` under the key `who` and read it back.
+fn commit_and_read_own(env: &Env, who: &[u8]) {
+    let db = env.main_database();
+    let mut w = env.write_txn().unwrap();
+    db.put(&mut w, b"who", who).unwrap();
+    w.commit().unwrap();
+    let r = env.read_txn().unwrap();
+    assert_eq!(db.get(&r, b"who").unwrap(), Some(who));
+}
+
+/// Child role: hold the `b.db` env open until the parent says stop.
+fn hold_b_db(dir: &Path) {
+    let env = open_named(dir, "b.db");
+    commit_and_read_own(&env, b"b");
+    mark(dir, "b-open");
+    wait_for(&dir.join("b-stop"), Duration::from_secs(60));
+    commit_and_read_own(&env, b"b2");
+}
+
+/// Two processes hold envs with different data names in one directory at the
+/// same time. Each derives its own lock file (`a.db-lock`, `b.db-lock`,
+/// ADR-0023 amendment 16), so they do not share a reader table or writer
+/// lock, and each commits and reads its own data.
+#[test]
+fn two_processes_with_different_data_names_use_different_lock_files() {
+    let dir = TempDir::new();
+    let a = open_named(dir.path(), "a.db");
+    commit_and_read_own(&a, b"a");
+    let mut c = child("hold_b_db", dir.path());
+    wait_for(&dir.path().join("b-open"), Duration::from_secs(30));
+    assert!(dir.path().join("a.db-lock").exists());
+    assert!(dir.path().join("b.db-lock").exists());
+    assert!(!dir.path().join(zerodb::LOCK_FILE_NAME).exists());
+    // Both alive: this process keeps writing its own env.
+    commit_and_read_own(&a, b"a2");
+    mark(dir.path(), "b-stop");
+    wait_success(&mut c, Duration::from_secs(30));
+    let r = a.read_txn().unwrap();
+    assert_eq!(a.main_database().get(&r, b"who").unwrap(), Some(&b"a2"[..]));
 }

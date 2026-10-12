@@ -278,12 +278,15 @@ impl LockFile {
     /// - **Foreign file.** The initializer accepts a file only if it is
     ///   empty, carries a lock magic (final, or the initializing one left by
     ///   an initializer that died), or has an all-zero header (the first 256
-    ///   bytes, or the whole file if shorter): a power loss can keep the
-    ///   file's length and lose the block holding the magic. Any other file
-    ///   is refused without being modified. A ZeroDB or LMDB data file always
-    ///   has a non-zero header, so this refuses every *initialized* data
-    ///   file. A foreign file whose first 256 bytes are zero is accepted and
-    ///   overwritten, whatever its length.
+    ///   bytes, or the whole file if shorter) *and* a length an initializer
+    ///   can leave: 8 (the initializing magic written to an empty file) or
+    ///   256 + 128·k for k ≥ 1 (a header plus k reader slots). A power loss
+    ///   can keep such a length and lose the block holding the magic. Any
+    ///   other file is refused without being modified, including a stale
+    ///   LMDB `lock.mdb`. A ZeroDB or LMDB data file always has a non-zero
+    ///   header, so this refuses every *initialized* data file; a foreign
+    ///   file with a zero header and one of those lengths is accepted and
+    ///   overwritten.
     ///
     /// # Errors
     ///
@@ -369,7 +372,7 @@ impl LockFile {
         };
         let len = OFF_SLOTS + SLOT_STRIDE * slots as usize;
         if initializer {
-            check_lock_file_shape(&file)?;
+            check_lock_file_shape(&file, path)?;
             // Truncate to zero first so no field survives from a previous
             // life, then mark the file as being initialized before it grows:
             // a process crash from here on leaves an empty file or one that
@@ -780,12 +783,23 @@ fn check_not_data_file(
     ))
 }
 
+/// Whether `len` is a length an initializer can leave behind: the
+/// initializing magic alone in a truncated file, or the header plus at least
+/// one reader slot.
+fn is_initializer_length(len: u64) -> bool {
+    let magic_only = (OFF_MAGIC + 8) as u64;
+    let header = OFF_SLOTS as u64;
+    let slot = SLOT_STRIDE as u64;
+    len == magic_only || (len >= header + slot && (len - header).is_multiple_of(slot))
+}
+
 /// The foreign-file guard (ADR-0023 amendment 16), run by the initializer
-/// before it truncates: accept an empty file, a file carrying
-/// [`LOCK_MAGIC`] or [`LOCK_MAGIC_INIT`], or one whose header (the first
-/// `OFF_SLOTS` bytes, or the whole file if shorter) is all zero; refuse
+/// before it truncates the lock file at `path`: accept an empty file, a file
+/// carrying [`LOCK_MAGIC`] or [`LOCK_MAGIC_INIT`], or one whose header (the
+/// first `OFF_SLOTS` bytes, or the whole file if shorter) is all zero and
+/// whose length an initializer can leave ([`is_initializer_length`]); refuse
 /// anything else with `InvalidInput`, leaving it untouched.
-fn check_lock_file_shape(file: &File) -> std::io::Result<()> {
+fn check_lock_file_shape(file: &File, path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     let len = file.metadata()?.len();
     if len == 0 {
@@ -797,12 +811,18 @@ fn check_lock_file_shape(file: &File) -> std::io::Result<()> {
         .get(OFF_MAGIC..OFF_MAGIC + 8)
         .and_then(|b| b.try_into().ok())
         .map(u64::from_le_bytes);
-    if matches!(magic, Some(LOCK_MAGIC | LOCK_MAGIC_INIT)) || header.iter().all(|&b| b == 0) {
+    if matches!(magic, Some(LOCK_MAGIC | LOCK_MAGIC_INIT))
+        || (is_initializer_length(len) && header.iter().all(|&b| b == 0))
+    {
         return Ok(());
     }
     Err(std::io::Error::new(
         std::io::ErrorKind::InvalidInput,
-        "the lock file holds data that is not a ZeroDB lock file; refusing to overwrite it",
+        format!(
+            "the lock file {} holds data that is not a ZeroDB lock file; \
+             refusing to overwrite it (remove it if it is not needed)",
+            path.display()
+        ),
     ))
 }
 
@@ -1048,12 +1068,18 @@ mod tests {
     }
 
     /// A lock file whose whole header reads as zero (power loss kept the
-    /// length and lost the magic block) is accepted as never initialized,
-    /// whatever its length: here the slot area holds garbage and the length
-    /// matches neither this `max_readers` nor any other.
+    /// length and lost the magic block) is accepted as never initialized
+    /// when its length is one an initializer leaves: 8, or the header plus
+    /// k ≥ 1 slots, for any k (here not this `max_readers`). The slot area
+    /// holds garbage.
     #[test]
     fn all_zero_lock_header_is_reinitialized() {
-        for len in [1usize, 8, OFF_SLOTS, OFF_SLOTS + 3 * SLOT_STRIDE + 17] {
+        for len in [
+            8usize,
+            OFF_SLOTS + SLOT_STRIDE,
+            OFF_SLOTS + 3 * SLOT_STRIDE,
+            OFF_SLOTS + 64 * SLOT_STRIDE,
+        ] {
             let path = tmp();
             let mut bytes = vec![0u8; len];
             for b in bytes.iter_mut().skip(OFF_SLOTS) {
@@ -1066,18 +1092,62 @@ mod tests {
         }
     }
 
+    /// An all-zero file whose length no initializer leaves is refused
+    /// untouched: each length sits just off an accepted one.
+    #[test]
+    fn all_zero_file_of_another_length_is_refused() {
+        for len in [
+            1usize,
+            7,
+            9,
+            OFF_SLOTS,
+            OFF_SLOTS + SLOT_STRIDE - 1,
+            OFF_SLOTS + SLOT_STRIDE + 1,
+            OFF_SLOTS + 3 * SLOT_STRIDE + 17,
+        ] {
+            let path = tmp();
+            let bytes = vec![0u8; len];
+            std::fs::write(&path, &bytes).unwrap();
+            assert_invalid_input(LockFile::open(&path, &data_of(&path), 4));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "length {len}");
+        }
+    }
+
     /// A non-empty file with neither lock magic and a non-zero header is
-    /// refused, and its bytes are left as they were.
+    /// refused, and its bytes are left as they were. The inputs include an
+    /// LMDB data file's shape (`0xBEEFC0DE` at byte 16) and a stale LMDB lock
+    /// file (`0xBEEFC0DE` at byte 0), both with an otherwise zero, otherwise
+    /// accepted length.
     #[test]
     fn foreign_file_is_refused_without_truncating() {
         let mut zero_but_one = vec![0u8; 4096];
         zero_but_one[OFF_SLOTS - 1] = 1;
         let mut zdb1 = vec![0u8; 8192];
         zdb1[32..36].copy_from_slice(b"ZDB1");
-        for bytes in [b"not a lock file".to_vec(), zero_but_one, zdb1] {
+        let mut lmdb_data = vec![0u8; 8192];
+        lmdb_data[16..20].copy_from_slice(&0xBEEF_C0DEu32.to_le_bytes());
+        let mut lmdb_lock = vec![0u8; 8192];
+        lmdb_lock[0..4].copy_from_slice(&0xBEEF_C0DEu32.to_le_bytes());
+        for bytes in [
+            b"not a lock file".to_vec(),
+            zero_but_one,
+            zdb1,
+            lmdb_data,
+            lmdb_lock,
+        ] {
             let path = tmp();
             std::fs::write(&path, &bytes).unwrap();
-            assert_invalid_input(LockFile::open(&path, &data_of(&path), 4));
+            match LockFile::open(&path, &data_of(&path), 4) {
+                Err(LockOpenError::Io(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                    assert!(
+                        e.to_string().contains(&path.display().to_string()),
+                        "the message names the lock file: {e}"
+                    );
+                }
+                Err(other) => panic!("expected Io(InvalidInput), got {other:?}"),
+                Ok(_) => panic!("expected Io(InvalidInput), got a lock file"),
+            }
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
             // The refusal released the registry entry.
             std::fs::remove_file(&path).unwrap();

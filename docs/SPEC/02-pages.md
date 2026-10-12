@@ -697,7 +697,11 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     convention). Two data names in one directory therefore never share a lock
     file. `EnvOpenOptions::lock_file_name` overrides the derived name; the
     explicit name must be a single path component and differ from the
-    data-file name.
+    data-file name. On a case-insensitive filesystem a case variant of a
+    default data name (e.g. `ZERODB.DAT`) derives a different lock name
+    (`ZERODB.DAT-lock`), so two processes that spell one data file
+    differently do not share a lock file; this is the same class as reaching
+    one file through two paths, which LMDB does not guard against either.
   - **Lock-file guards (ADR-0023 amendment 16).** The lock-file initializer
     truncates the file, so two guards keep it from destroying data. Both fail
     the open with `Io(InvalidInput)` and modify neither file.
@@ -712,12 +716,15 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
       empty, carries the final lock magic or the initializing magic (written
       with `pwrite` right after truncating to zero, replaced by the final
       magic when the open completes), or its header (the first 256 bytes, or
-      the whole file if shorter) is all zero, whatever its length: nothing
-      fsyncs the lock file, so a power loss can keep its length and lose the
-      magic block. Everything else is refused. This refuses every
-      *initialized* ZeroDB or LMDB data file (non-zero bytes at 32 and 16
-      respectively), but not every foreign file: a file whose first 256 bytes
-      are zero is accepted and overwritten, and so is a data file caught
+      the whole file if shorter) is all zero and its length is one an
+      initializer can leave: 8 (the initializing magic in the truncated
+      file) or 256 + 128·k for k ≥ 1 (header plus k reader slots). Nothing
+      fsyncs the lock file, so a power loss can keep such a length and lose
+      the magic block. Everything else is refused, including a stale LMDB
+      `lock.mdb` (`0xBEEFC0DE` at byte 0). This refuses every *initialized*
+      ZeroDB or LMDB data file (non-zero bytes at 32 and 16 respectively),
+      but not every foreign file: a file with a zero header and one of those
+      lengths is accepted and overwritten, and so is a data file caught
       between its creation and its first meta write (the residual window of
       amendment 16). Joiners treat anything but the final magic as
       unfinished.
