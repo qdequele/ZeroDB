@@ -486,3 +486,177 @@ fn resize_above_the_cap_is_refused() {
         assert!(env.real_disk_size().unwrap() <= 2 * MIB as u64);
     }
 }
+
+// --- Lock-file naming and the file guards (ADR-0023 amendment 16) ---
+
+#[test]
+fn lock_file_name_is_derived_from_the_data_file_name() {
+    assert_eq!(
+        zerodb::derived_lock_file_name("zerodb.dat".as_ref()),
+        "zerodb.lock"
+    );
+    assert_eq!(
+        zerodb::derived_lock_file_name("data.mdb".as_ref()),
+        "lock.mdb"
+    );
+    assert_eq!(
+        zerodb::derived_lock_file_name("index.db".as_ref()),
+        "index.db-lock"
+    );
+}
+
+/// The options report the derived name until an explicit one is set.
+#[test]
+fn get_lock_file_name_reports_the_derived_name_until_overridden() {
+    let mut o = opts();
+    assert_eq!(o.get_lock_file_name(), LOCK_FILE_NAME);
+    o.data_file_name(zerodb::HEED_DATA_FILE_NAME);
+    assert_eq!(o.get_lock_file_name(), "lock.mdb");
+    o.data_file_name("index.db");
+    assert_eq!(o.get_lock_file_name(), "index.db-lock");
+    o.lock_file_name("mine.lock");
+    assert_eq!(o.get_lock_file_name(), "mine.lock");
+}
+
+/// Two native envs with different data names in one directory get different
+/// lock files. The envs are opened one after the other: this process's env
+/// registry is keyed by directory (SPEC 04 TXN-51), so one process cannot
+/// hold both at once; two processes can, and then each needs its own lock
+/// file.
+#[test]
+fn two_native_envs_with_different_data_names_get_different_lock_files() {
+    let dir = TempDir::new();
+    let a = opts()
+        .data_file_name("a.db")
+        .open(dir.path())
+        .expect("open a");
+    drop(a);
+    let b = opts()
+        .data_file_name("b.db")
+        .open(dir.path())
+        .expect("open b");
+    drop(b);
+    assert!(dir.path().join("a.db-lock").exists());
+    assert!(dir.path().join("b.db-lock").exists());
+    assert!(!dir.path().join(LOCK_FILE_NAME).exists());
+}
+
+#[test]
+fn lock_file_that_is_the_data_file_is_refused_without_truncating() {
+    let dir = TempDir::new();
+    {
+        let env = opts().data_file_name("data.mdb").open(dir.path()).unwrap();
+        let mut w = env.write_txn().unwrap();
+        env.main_database().put(&mut w, b"k", b"v").unwrap();
+        w.commit().unwrap();
+    }
+    let len = std::fs::metadata(dir.path().join("data.mdb"))
+        .unwrap()
+        .len();
+    std::fs::hard_link(dir.path().join("data.mdb"), dir.path().join("alias")).unwrap();
+    let e = opts()
+        .data_file_name("data.mdb")
+        .lock_file_name("alias")
+        .open(dir.path())
+        .unwrap_err();
+    match e {
+        Error::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput),
+        other => panic!("expected Io(InvalidInput), got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::metadata(dir.path().join("data.mdb"))
+            .unwrap()
+            .len(),
+        len
+    );
+    assert!(
+        dir.path().join("alias").exists(),
+        "the alias names the data file and must not be unlinked"
+    );
+}
+
+/// Env 2's derived lock name is env 1's data file (another file, not a link):
+/// the foreign-file guard refuses it and the data survives.
+#[test]
+fn lock_file_named_like_another_envs_data_file_is_refused() {
+    let dir = TempDir::new();
+    {
+        let env = opts()
+            .data_file_name("x.db-lock")
+            .open(dir.path())
+            .expect("env 1");
+        let mut w = env.write_txn().unwrap();
+        env.main_database().put(&mut w, b"keep", b"me").unwrap();
+        w.commit().unwrap();
+    }
+    let data = dir.path().join("x.db-lock");
+    let before = std::fs::read(&data).unwrap();
+    match opts().data_file_name("x.db").open(dir.path()) {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        other => panic!("expected Io(InvalidInput), got {:?}", other.err()),
+    }
+    assert_eq!(
+        std::fs::read(&data).unwrap(),
+        before,
+        "env 1's data changed"
+    );
+    let env = opts()
+        .data_file_name("x.db-lock")
+        .open(dir.path())
+        .expect("env 1 reopens");
+    let r = env.read_txn().unwrap();
+    assert_eq!(
+        env.main_database().get(&r, b"keep").unwrap(),
+        Some(&b"me"[..])
+    );
+}
+
+/// Whether `dir` sits on a case-insensitive filesystem (default APFS).
+fn case_insensitive(dir: &Path) -> bool {
+    std::fs::write(dir.join("case-probe"), b"").unwrap();
+    let insensitive = dir.join("CASE-PROBE").exists();
+    std::fs::remove_file(dir.join("case-probe")).unwrap();
+    insensitive
+}
+
+/// On a case-insensitive filesystem a lock name that differs from the data
+/// name only by case names the data file. The open is refused and the data
+/// is intact. Skipped on a case-sensitive filesystem.
+#[test]
+fn lock_name_differing_only_by_case_is_refused_on_a_case_insensitive_fs() {
+    let dir = TempDir::new();
+    if !case_insensitive(dir.path()) {
+        eprintln!("SKIPPED: case-sensitive filesystem");
+        return;
+    }
+    {
+        let env = opts().open(dir.path()).unwrap();
+        let mut w = env.write_txn().unwrap();
+        env.main_database().put(&mut w, b"keep", b"me").unwrap();
+        w.commit().unwrap();
+    }
+    let data = dir.path().join(zerodb::DATA_FILE_NAME);
+    let before = std::fs::read(&data).unwrap();
+    match opts().lock_file_name("ZERODB.DAT").open(dir.path()) {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        other => panic!("expected Io(InvalidInput), got {:?}", other.err()),
+    }
+    assert_eq!(std::fs::read(&data).unwrap(), before, "the data changed");
+}
+
+/// The same with no data file yet: the lock open creates the file, finds it
+/// is the data file's name, and removes what it created, leaving no file.
+#[test]
+fn lock_name_differing_only_by_case_creates_nothing_on_a_case_insensitive_fs() {
+    let dir = TempDir::new();
+    if !case_insensitive(dir.path()) {
+        eprintln!("SKIPPED: case-sensitive filesystem");
+        return;
+    }
+    match opts().lock_file_name("ZERODB.DAT").open(dir.path()) {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+        other => panic!("expected Io(InvalidInput), got {:?}", other.err()),
+    }
+    assert!(!dir.path().join(zerodb::DATA_FILE_NAME).exists());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}

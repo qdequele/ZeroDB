@@ -76,14 +76,38 @@ pub const DATA_FILE_NAME: &str = "zerodb.dat";
 /// directory-env contract (ADR-0010).
 ///
 /// Exposed here so the adapter, `zerodb-tools`' two-name probe, and tests all
-/// agree on one constant. A `lock.mdb` next to it appears only when
+/// agree on one constant. A `lock.mdb` next to it (the name
+/// [`derived_lock_file_name`] gives it) appears only when
 /// [`EnvOpenOptions::lock_file`] is turned on (ADR-0023); it is off by
 /// default, so a default adapter-opened env dir still contains only this one
 /// file.
 pub const HEED_DATA_FILE_NAME: &str = "data.mdb";
 
-/// The native lock-file name of a multi-process environment (ADR-0023).
+/// The lock-file name of a multi-process environment whose data file has the
+/// native default name [`DATA_FILE_NAME`] (ADR-0023). Other data-file names
+/// derive other lock names; see [`derived_lock_file_name`].
 pub const LOCK_FILE_NAME: &str = "zerodb.lock";
+
+/// The lock-file name derived from a data-file name (ADR-0023 amendment 16):
+/// [`DATA_FILE_NAME`] (`zerodb.dat`) gives [`LOCK_FILE_NAME`]
+/// (`zerodb.lock`), [`HEED_DATA_FILE_NAME`] (`data.mdb`) gives LMDB's
+/// `lock.mdb`, and any other name `<data_file_name>-lock` (LMDB's
+/// `MDB_NOSUBDIR` convention). Two environments with different data-file
+/// names in one directory therefore never share a lock file.
+///
+/// [`EnvOpenOptions::lock_file_name`] overrides the derived name.
+#[must_use]
+pub fn derived_lock_file_name(data_file_name: &OsStr) -> OsString {
+    if data_file_name == DATA_FILE_NAME {
+        OsString::from(LOCK_FILE_NAME)
+    } else if data_file_name == HEED_DATA_FILE_NAME {
+        OsString::from("lock.mdb")
+    } else {
+        let mut name = data_file_name.to_os_string();
+        name.push("-lock");
+        name
+    }
+}
 
 /// Whether `name` is a single, non-empty path component — i.e. it names a file
 /// directly inside the env directory and cannot escape it (ADR-0010).
@@ -201,8 +225,9 @@ pub struct EnvOpenOptions {
     max_dirty_bytes: Option<usize>,
     /// Whether to coordinate through a cross-process lock file (ADR-0023).
     lock_file: bool,
-    /// The lock file's name, when `lock_file` is set.
-    lock_file_name: OsString,
+    /// The lock file's explicit name, when `lock_file` is set; `None` derives
+    /// it from the data-file name ([`derived_lock_file_name`]).
+    lock_file_name: Option<OsString>,
 }
 
 impl Default for EnvOpenOptions {
@@ -228,7 +253,7 @@ impl EnvOpenOptions {
             sequential_writes: false,
             max_dirty_bytes: None,
             lock_file: false,
-            lock_file_name: OsString::from(LOCK_FILE_NAME),
+            lock_file_name: None,
         }
     }
 
@@ -417,18 +442,27 @@ impl EnvOpenOptions {
         self.lock_file
     }
 
-    /// The lock file's name inside the environment directory: a single path
-    /// component that differs from the data-file name. Default
-    /// [`LOCK_FILE_NAME`]; the heed adapter uses `lock.mdb`.
+    /// Override the lock file's name inside the environment directory: a
+    /// single path component that differs from the data-file name, and that
+    /// must not name the data file under another spelling (a hard link, or a
+    /// case variant on a case-insensitive filesystem), which the open refuses.
+    /// By default the name is derived from the data-file name
+    /// ([`derived_lock_file_name`]: `zerodb.lock`, `lock.mdb` for the heed
+    /// adapter's `data.mdb`, otherwise `<data_file_name>-lock`).
     pub fn lock_file_name(&mut self, name: impl Into<OsString>) -> &mut EnvOpenOptions {
-        self.lock_file_name = name.into();
+        self.lock_file_name = Some(name.into());
         self
     }
 
-    /// The configured lock-file name (ADR-0023).
+    /// The lock-file name an open would use (ADR-0023): the explicit
+    /// [`EnvOpenOptions::lock_file_name`] if set, otherwise the name
+    /// [`derived_lock_file_name`] gives the current data-file name.
     #[must_use]
-    pub fn get_lock_file_name(&self) -> &OsStr {
-        &self.lock_file_name
+    pub fn get_lock_file_name(&self) -> OsString {
+        match &self.lock_file_name {
+            Some(name) => name.clone(),
+            None => derived_lock_file_name(&self.data_file_name),
+        }
     }
 
     /// The configured max DBs.
@@ -470,6 +504,12 @@ impl EnvOpenOptions {
     ///   [`EnvOpenOptions::lock_file_name`] when
     ///   [`EnvOpenOptions::lock_file`] is on (ADR-0023), or when that name
     ///   equals the data-file name.
+    /// - [`Error::Io`] (`InvalidInput`), with [`EnvOpenOptions::lock_file`]
+    ///   on, if the lock file is the data file under another name (a hard
+    ///   link, or a case variant on a case-insensitive filesystem), or if it
+    ///   is a non-empty file that is not a lock file and whose first 256
+    ///   bytes are not all zero, such as another environment's data file
+    ///   (ADR-0023 amendment 16). Neither file is modified.
     /// - [`Error::Io`] if the directory does not exist, on any file/mmap I/O
     ///   error, or if a `READ_ONLY` open finds no existing store.
     /// - [`Error::Mdb`]`(`[`MdbError::Invalid`]`)` if the file is not a valid
@@ -506,26 +546,27 @@ impl EnvOpenOptions {
                 ),
             )));
         }
+        // ADR-0023 amendment 16: the explicit lock-file name, or the one
+        // derived from the data-file name.
+        let lock_file_name = self.get_lock_file_name();
         // ADR-0023: the lock-file name must also be a single path component.
-        if self.lock_file && !is_single_component(&self.lock_file_name) {
+        if self.lock_file && !is_single_component(&lock_file_name) {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
-                    "lock_file_name ({:?}) must be a single, non-empty path component",
-                    self.lock_file_name
+                    "lock_file_name ({lock_file_name:?}) must be a single, non-empty path component"
                 ),
             )));
         }
         // ADR-0023: the lock file must not be the data file. The lock-file
         // initializer truncates its file, so sharing the name would destroy
-        // the data; reject it before either file is opened.
-        if self.lock_file && self.lock_file_name == self.data_file_name {
+        // the data; reject it before either file is opened. Other names of
+        // the data file (hard links, case variants) are caught by the
+        // same-file guard in `LockFile::open` (amendment 16).
+        if self.lock_file && lock_file_name == self.data_file_name {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                format!(
-                    "lock_file_name ({:?}) must differ from data_file_name",
-                    self.lock_file_name
-                ),
+                format!("lock_file_name ({lock_file_name:?}) must differ from data_file_name"),
             )));
         }
         // Reject out-of-range limits before any file exists: the lock file is
@@ -540,8 +581,8 @@ impl EnvOpenOptions {
         // data file, so a joining process waits for the initializer rather
         // than racing it to create the data file.
         let lock = if self.lock_file {
-            let path = canonical_dir.join(&self.lock_file_name);
-            match zerodb_io::lockfile::LockFile::open(&path, self.max_readers) {
+            let path = canonical_dir.join(&lock_file_name);
+            match zerodb_io::lockfile::LockFile::open(&path, &data_path, self.max_readers) {
                 Ok(l) => Some(l),
                 Err(zerodb_io::lockfile::LockOpenError::AlreadyOpen) => {
                     return Err(Error::EnvAlreadyOpened)

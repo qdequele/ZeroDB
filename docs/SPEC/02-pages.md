@@ -686,8 +686,41 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     name. A directory holding both names is two independent databases.
     `zerodb-tools`, which only reads, probes both and treats both-present as a
     hard error.
-  - **No lock file is ever created** under either name (D-001, single-process;
-    nothing in the consumer tree reads `lock.mdb` — one doc comment aside).
+  - **No lock file is created** unless the opener turns on the opt-in lock
+    file (`EnvOpenOptions::lock_file`, ADR-0023; without it the env is
+    single-process, D-001).
+  - **Lock-file name (ADR-0023 amendment 16).** The lock file lives next to
+    the data file and its default name is derived from the data-file name
+    (`zerodb::derived_lock_file_name`): `zerodb.dat` → `zerodb.lock`,
+    `data.mdb` → `lock.mdb` (so the adapter gets LMDB's name without setting
+    it), and any other name `<data_file_name>-lock` (LMDB's `MDB_NOSUBDIR`
+    convention). Two data names in one directory therefore never share a lock
+    file. `EnvOpenOptions::lock_file_name` overrides the derived name; the
+    explicit name must be a single path component and differ from the
+    data-file name.
+  - **Lock-file guards (ADR-0023 amendment 16).** The lock-file initializer
+    truncates the file, so two guards keep it from destroying data. Both fail
+    the open with `Io(InvalidInput)` and modify neither file.
+    - *Same file:* before anything is truncated, every opener compares the
+      lock descriptor's `(st_dev, st_ino)` with a `stat` of the data path; a
+      match (hard link; a case variant on a case-insensitive filesystem) is
+      refused. A missing data file skips the check. The open tries
+      `create_new` first, and if it created the lock file and the file is
+      still empty, the refusal unlinks it; otherwise the name is left alone,
+      since it designates the data file.
+    - *Foreign file:* the initializer accepts the existing file only if it is
+      empty, carries the final lock magic or the initializing magic (written
+      with `pwrite` right after truncating to zero, replaced by the final
+      magic when the open completes), or its header (the first 256 bytes, or
+      the whole file if shorter) is all zero, whatever its length: nothing
+      fsyncs the lock file, so a power loss can keep its length and lose the
+      magic block. Everything else is refused. This refuses every
+      *initialized* ZeroDB or LMDB data file (non-zero bytes at 32 and 16
+      respectively), but not every foreign file: a file whose first 256 bytes
+      are zero is accepted and overwritten, and so is a data file caught
+      between its creation and its first meta write (the residual window of
+      amendment 16). Joiners treat anything but the final magic as
+      unfinished.
   - The layout remains ZeroDB's own, never LMDB's, regardless of file name
     (D-002); the `ZDB1` magic at byte 32 (§3) is the authoritative
     discriminator, and `zerodb-tools stat` reports it.

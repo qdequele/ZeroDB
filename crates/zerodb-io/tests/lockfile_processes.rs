@@ -71,14 +71,14 @@ fn child_entry() {
         // Win the election, never finish: stand in for an initializer that
         // dies (SIGKILL) before seeding T.
         "init_and_hang" => {
-            let l = LockFile::open(&path, 8).unwrap();
+            let l = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 8).unwrap();
             assert!(l.is_initializer());
             std::fs::write(dir.join("initializing"), b"").unwrap();
             std::thread::sleep(Duration::from_secs(600));
         }
         // Join (or initialize), finish, report, exit.
         "join_and_report" => {
-            let l = LockFile::open(&path, 8).unwrap();
+            let l = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 8).unwrap();
             l.bind_page_size(4096).unwrap();
             l.finish_open().unwrap();
             let name = if l.is_initializer() {
@@ -103,7 +103,9 @@ fn joiner_whose_initializer_died_reinitializes() {
     let mut init = spawn("init_and_hang", &dir.0);
     wait_for(&dir.0.join("initializing"));
     let path = dir.0.join("zerodb.lock");
-    let opener = std::thread::spawn(move || LockFile::open(&path, 8).map(|l| l.is_initializer()));
+    let opener = std::thread::spawn(move || {
+        LockFile::open(&path, &path.with_file_name("zerodb.dat"), 8).map(|l| l.is_initializer())
+    });
     std::thread::sleep(Duration::from_millis(200)); // the joiner is now blocked
     init.0.kill().unwrap();
     init.0.wait().unwrap();
@@ -128,7 +130,8 @@ fn three_way_race_after_initializer_death() {
         let child = spawn("join_and_report", &dir.0);
         let path = dir.0.join("zerodb.lock");
         let parent = std::thread::spawn(move || {
-            let l = LockFile::open(&path, 8).expect("parent open");
+            let l =
+                LockFile::open(&path, &path.with_file_name("zerodb.dat"), 8).expect("parent open");
             l.bind_page_size(4096).unwrap();
             l.finish_open().unwrap();
             l
@@ -155,7 +158,7 @@ fn three_way_race_after_initializer_death() {
 fn liveness_probe_sees_death() {
     let dir = TempDir::new();
     let path = dir.0.join("zerodb.lock");
-    let l = LockFile::open(&path, 8).unwrap();
+    let l = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 8).unwrap();
     l.bind_page_size(4096).unwrap();
     l.finish_open().unwrap();
     let mut c = spawn("join_and_report", &dir.0);

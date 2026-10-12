@@ -303,7 +303,8 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         // boundary — an env opened through this adapter materializes as
         // `<dir>/data.mdb`, the name Meilisearch hardcodes in its production
         // compaction and snapshot paths. A `lock.mdb` next to it appears only
-        // when `lock_file` is on (ADR-0023); it is off by default.
+        // when `lock_file` is on (ADR-0023); it is off by default. The engine
+        // derives that name from `data.mdb` (amendment 16).
         opts.data_file_name(DATA_FILE_NAME);
         opts.flags(zerodb_env_flags(self.flags));
         opts.file_trust(self.file_trust);
@@ -312,7 +313,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
             opts.max_dirty_bytes(b);
         }
         if self.lock_file {
-            opts.lock_file(true).lock_file_name("lock.mdb");
+            opts.lock_file(true);
         }
         let env = opts.open(path).map_err(Error::from)?;
         Ok(Env {
