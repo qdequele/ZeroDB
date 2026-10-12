@@ -289,6 +289,43 @@ fn commit_in_one_process_is_visible_in_another() {
     );
 }
 
+/// `Env::info()`/`Env::stat()` follow the shared published txnid `T`
+/// (ADR-0023 §4), so another process's commit is visible without this
+/// process opening a read txn of its own. Pinned by the LMDB observation
+/// `OBS_INFO_SEES_OTHER_COMMIT`/`OBS_STAT_SEES_OTHER_COMMIT`
+/// (`crates/zerodb-oracle/tests/lmdb_stage3_observation.rs`), both `true`.
+#[test]
+fn info_and_stat_see_another_processes_commit() {
+    let dir = TempDir::new();
+    let env = open(dir.path());
+    let mut w = env.write_txn().unwrap();
+    env.main_database().put(&mut w, b"a", b"1").unwrap();
+    w.commit().unwrap();
+    let info_before = env.info();
+    let stat_before = env.stat();
+    assert!(child("write_one", dir.path()).wait().unwrap().success());
+    let info_after = env.info();
+    let stat_after = env.stat();
+    assert!(
+        info_after.last_txnid > info_before.last_txnid,
+        "info().last_txnid did not advance after another process's commit: \
+         before {}, after {}",
+        info_before.last_txnid,
+        info_after.last_txnid
+    );
+    assert!(
+        info_after.last_pgno >= info_before.last_pgno,
+        "info().last_pgno went backwards after another process's commit"
+    );
+    assert!(
+        stat_after.entries > stat_before.entries,
+        "stat().entries did not advance after another process's commit: \
+         before {}, after {}",
+        stat_before.entries,
+        stat_after.entries
+    );
+}
+
 /// Seed 200 keys so the tree spans several pages.
 fn seed(env: &Env) {
     let db = env.main_database();

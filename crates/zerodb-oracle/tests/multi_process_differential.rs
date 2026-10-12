@@ -139,6 +139,28 @@ impl Lmdb {
         (i.me_mapsize as u64, i.me_last_pgno as u64)
     }
 
+    /// `mdb_env_info`'s `me_last_txnid`.
+    fn last_txnid(&self) -> u64 {
+        // SAFETY: MDB_envinfo is plain data; LMDB fills it.
+        let i = unsafe {
+            let mut i: ffi::MDB_envinfo = std::mem::zeroed();
+            assert_eq!(ffi::mdb_env_info(self.env, &mut i), 0);
+            i
+        };
+        i.me_last_txnid as u64
+    }
+
+    /// `mdb_env_stat`'s `ms_entries` (the main DB's entry count).
+    fn entries(&self) -> u64 {
+        // SAFETY: MDB_stat is plain data; LMDB fills it.
+        let st = unsafe {
+            let mut st: ffi::MDB_stat = std::mem::zeroed();
+            assert_eq!(ffi::mdb_env_stat(self.env, &mut st), 0);
+            st
+        };
+        st.ms_entries as u64
+    }
+
     /// Commit batches of 1000-byte values until the file's last page lies
     /// past [`GROW_TARGET`].
     fn grow(&self) {
@@ -1128,4 +1150,46 @@ fn sole_opener_after_a_larger_run_matches_lmdb() {
     };
     eprintln!("zdb maxreaders per sequential sole open {asks:?} = {zdb:?}");
     assert_eq!(zdb, lmdb, "maxreaders of sequential sole opens");
+}
+
+/// `info()`/`stat()` (`mdb_env_info`/`mdb_env_stat`) see another process's
+/// commit without this process opening a read txn of its own:
+/// `(last_txnid advanced, entries advanced)`
+/// (`OBS_INFO_SEES_OTHER_COMMIT`/`OBS_STAT_SEES_OTHER_COMMIT`, both `true` —
+/// `crates/zerodb-oracle/tests/lmdb_stage3_observation.rs`). A differential
+/// tuple for
+/// `multi_process.rs::info_and_stat_see_another_processes_commit`.
+#[test]
+fn info_and_stat_see_other_commit_matches_lmdb() {
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        let env = Lmdb::open(dir.path(), MAX_READERS);
+        // One distinct key so a later, different key from the child is a
+        // genuine entry-count increase, not an overwrite.
+        env.commit_many(1);
+        let txnid_before = env.last_txnid();
+        let entries_before = env.entries();
+        run_child("lmdb_commit_one", dir.path());
+        let t = (
+            env.last_txnid() > txnid_before,
+            env.entries() > entries_before,
+        );
+        eprintln!("lmdb (last_txnid advanced, entries advanced) = {t:?}");
+        t
+    };
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        let env = zdb_open(dir.path());
+        zdb_commit_many(&env, 1);
+        let txnid_before = env.info().last_txnid;
+        let entries_before = env.stat().entries;
+        run_child("zdb_commit_one", dir.path());
+        let t = (
+            env.info().last_txnid > txnid_before,
+            env.stat().entries > entries_before,
+        );
+        eprintln!("zdb (last_txnid advanced, entries advanced) = {t:?}");
+        t
+    };
+    assert_eq!(zdb, lmdb, "(last_txnid advanced, entries advanced)");
 }

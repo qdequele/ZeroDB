@@ -789,9 +789,23 @@ impl EnvInner {
         }
     }
 
-    /// The meta selected **at open** (creation-time geometry). Live roots must
-    /// come from [`EnvInner::snapshot`] — this field goes stale after the first
-    /// commit (TXN-18: the durable meta page is read only once, at open).
+    /// The meta selected at open, possibly unpublished in a joiner: the
+    /// durable meta page this process read once when it opened the
+    /// environment (TXN-18), kept only to seed the published snapshot cell.
+    /// In a lock-file environment (ADR-0023) a process that *joins* an
+    /// environment another process already has open may select an
+    /// older meta than the one the first opener is about to publish, or the
+    /// shared published txnid `T` may already be ahead of it by the time this
+    /// call returns — so this is never current once another writer has run.
+    ///
+    /// **Do not read roots or txnids from this for anything that must be
+    /// correct across processes or across commits** (the main/free-DB roots,
+    /// `txnid`, `last_pg`): use [`EnvInner::snapshot`] for the process-local
+    /// published view, or [`EnvInner::current_snapshot`] for the one that
+    /// also follows another process's commits. This accessor exists only for
+    /// open-time/debugging use (geometry recorded at the moment this process
+    /// opened, e.g. in [`std::fmt::Debug`]); it goes stale after the first
+    /// commit, by this process or any other.
     #[must_use]
     pub fn meta(&self) -> &MetaPage {
         &self.meta
@@ -1628,10 +1642,22 @@ impl Env {
     ///
     /// All fields are read from the **live published snapshot** plus the reader
     /// table; no transaction is opened, so this never blocks a writer and never
-    /// consumes a reader slot.
+    /// consumes a reader slot. In a lock-file environment the snapshot follows
+    /// the shared published txnid `T` ([`EnvInner::current_snapshot`]), so
+    /// `last_pgno`/`last_txnid` reflect another process's commit as soon as it
+    /// publishes (`OBS_INFO_SEES_OTHER_COMMIT`, ADR-0023 §4). This call stays
+    /// infallible: if the snapshot at `T` cannot be read right now (for
+    /// example [`MdbError::MapResized`], when `T` has moved past a commit that
+    /// grew the map beyond this process's current mapping), it falls back to
+    /// this process's own cached snapshot ([`EnvInner::snapshot`]) rather than
+    /// surfacing the error, which can under-report a page/txnid that another
+    /// process has already published.
     #[must_use]
     pub fn info(&self) -> EnvInfo {
-        let snap = self.inner.snapshot();
+        let snap = self
+            .inner
+            .current_snapshot()
+            .unwrap_or_else(|_| self.inner.snapshot());
         EnvInfo {
             map_size: self.inner.map_size(),
             last_pgno: snap.last_pg,
@@ -1649,9 +1675,16 @@ impl Env {
     /// than opening a read txn, so it neither blocks nor occupies a reader
     /// slot. See [`EnvStat`] for the `MDB_stat` field mapping; the page counts
     /// are ZeroDB-format values (own on-disk format) and must not be compared to LMDB's.
+    /// In a lock-file environment this follows the shared published txnid `T`
+    /// the same way [`Env::info`] does, so another process's commit is visible
+    /// as soon as it publishes (`OBS_STAT_SEES_OTHER_COMMIT`), with the same
+    /// fall back to the cached snapshot if the read at `T` fails.
     #[must_use]
     pub fn stat(&self) -> EnvStat {
-        let snap = self.inner.snapshot();
+        let snap = self
+            .inner
+            .current_snapshot()
+            .unwrap_or_else(|_| self.inner.snapshot());
         let rec = snap.main_db;
         EnvStat {
             page_size: self.inner.page_size(),

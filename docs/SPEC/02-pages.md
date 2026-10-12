@@ -763,6 +763,22 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     (another process with a larger map committed past this one); a larger
     `meta.map_size` alone does not. Beyond the mapped bytes but within the
     logical size, or beyond the file, is `MdbError::Invalid`.
+  - **Cross-process `Env::info()`/`Env::stat()` (ADR-0023 §4, stage 3 Task
+    9).** `last_pgno`, `last_txnid` (`Env::info()`) and the main-DB counts
+    (`Env::stat()`) are read from the snapshot at the shared published txnid
+    `T` (`EnvInner::current_snapshot`, SPEC 04 TXN-18), not this process's
+    own cached snapshot, so another process's commit is visible as soon as it
+    publishes — `OBS_INFO_SEES_OTHER_COMMIT`/`OBS_STAT_SEES_OTHER_COMMIT`
+    (both `true`, `crates/zerodb-oracle/tests/lmdb_stage3_observation.rs`).
+    `map_size`, `max_readers`, `num_readers` and `live_readers` already come
+    from the backing's published view and the shared reader table (above;
+    SPEC 04 §4). Both calls stay infallible: if the read at `T` fails (for
+    example `MdbError::MapResized`, when `T` has moved past a commit that grew
+    the map beyond this process's current mapping), they fall back to this
+    process's own cached snapshot rather than surfacing the error — a
+    deliberate trade-off that can transiently under-report a page/txnid
+    another process already published, preferred over turning two previously
+    infallible accessors into fallible ones.
   - **`Env::resize` (ADR-0023 amendment 15; heed's `unsafe fn resize`,
     `mdb_env_set_mapsize` on an open env).** It refuses with `Io` and raw OS
     error `EINVAL` while a write txn of this env is live

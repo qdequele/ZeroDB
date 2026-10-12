@@ -214,7 +214,17 @@ fn tools_attach_to_a_live_env_in_another_process() {
             "the tools' open did not join the live env through its lock file"
         );
         assert_eq!(env.info().max_readers, CHILD_MAX_READERS);
+        // `info()` now follows the shared published snapshot (Task 9), so
+        // this tool's own reader slot shows up in the shared reader table's
+        // live count as soon as its read txn begins — cross-process `info()`
+        // and the reader table agree on what "this process" means.
+        let live_before = env.info().live_readers;
         let r = zerodb_tools::common::read_txn(&env).unwrap();
+        assert_eq!(
+            env.info().live_readers,
+            live_before + 1,
+            "the tool's own read txn is not visible in info().live_readers"
+        );
         assert_eq!(
             env.main_database().get(&r, b"live").unwrap(),
             Some(&b"committed"[..])
