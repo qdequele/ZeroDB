@@ -2558,19 +2558,20 @@ fn check_snapshot_in_view(
 }
 
 impl EnvInner {
-    /// The write-begin check of the writer's base against the current view
-    /// (ADR-0023 amendment 15), also for a base that came from the cache: a
-    /// write txn never starts with a base outside its logical map size, which
-    /// would otherwise make every allocation `MapFull`. The file-length half
-    /// is not repeated: a cached snapshot passed it when it was decoded, and
-    /// a process-local one was committed through this backing.
+    /// The write-begin check of the writer's base against `view`, the map
+    /// view the begin loaded (ADR-0023 amendment 15), also for a base that
+    /// came from the cache: a write txn never starts with a base outside its
+    /// logical map size, which would otherwise make every allocation
+    /// `MapFull`. The file-length half is not repeated: a cached snapshot
+    /// passed it when it was decoded, and a process-local one was committed
+    /// through this backing.
     ///
     /// # Errors
     ///
     /// [`MdbError::MapResized`] past the logical map size;
     /// [`MdbError::Invalid`] past the mapped bytes.
-    pub(crate) fn check_base_in_view(&self, base: &Snapshot) -> Result<(), Error> {
-        check_snapshot_in_view(self.backing_ref().view(), self.page_size, base).map(|_| ())
+    pub(crate) fn check_base_in(&self, view: MapView<'_>, base: &Snapshot) -> Result<(), Error> {
+        check_snapshot_in_view(view, self.page_size, base).map(|_| ())
     }
 }
 

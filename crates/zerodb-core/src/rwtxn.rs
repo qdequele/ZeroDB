@@ -567,6 +567,19 @@ fn read_only_error() -> Error {
     Error::Io(std::io::Error::from_raw_os_error(13))
 }
 
+/// The `WRITE_MAP` arm of a write-txn begin (ADR-0023 amendment 15, decision
+/// 4): grow the data file to this process's logical map size. Out of line so
+/// the default write-txn begin stays small enough for its own callees to be
+/// inlined.
+#[cold]
+#[inline(never)]
+fn grow_file_to_map(inner: &crate::env::EnvInner) -> Result<()> {
+    inner
+        .backing_ref()
+        .ensure_file_len(inner.map_size())
+        .map_err(Error::Io)
+}
+
 // ---------------------------------------------------------------------------
 // RwTxn
 // ---------------------------------------------------------------------------
@@ -758,29 +771,30 @@ impl Env {
         // this txn can allocate below the map size is inside the file before
         // anything is written through the map. A joiner's open never grows
         // the file. One comparison when the file is already long enough.
-        if inner.durability().write_map {
-            inner
-                .backing_ref()
-                .ensure_file_len(inner.map_size())
-                .map_err(Error::Io)?;
+        let write_map = inner.durability().write_map;
+        if write_map {
+            grow_file_to_map(inner)?;
         }
         // The latest published snapshot, which in a lock-file env may be
         // another process's commit (ADR-0023 §4): never the process-local
         // cell. Without a lock file this is the cell, as before.
         let base = inner.current_snapshot()?;
+        // The map view, loaded once for the whole begin: the base check
+        // below and the txn's read view (`bytes`) both come from it.
+        let backing = inner.backing_ref();
+        let view = backing.view();
         // ADR-0023 amendment 15: the base must lie inside this process's
         // logical map size, even when it came from the cache; otherwise the
         // begin fails with `MapResized` (`OBS_WRITE_BEGIN_SMALL_MAP`). Either
         // error drops `guard`, releasing both writer locks.
-        inner.check_base_in_view(&base)?;
+        inner.check_base_in(view, &base)?;
         // ADR-0021 (SPEC 04 §6.4 TXN-45b): under WRITE_MAP, with a backing
         // that brokers map slices, dirty pages are realized **in the map** at
         // their freshly-COW'd pgnos — no heap staging, no commit write-back.
         // Every other combination keeps the heap-staged store (TXN-45a):
         // the default mode, the miri test backing, the fault-injection
         // backend (whose crash journal only sees fd-path writes).
-        let backing = inner.backing_ref();
-        let in_map = inner.durability().write_map && backing.dirty_in_map();
+        let in_map = write_map && backing.dirty_in_map();
         // Seed the dirty store's spare list with the frames recycled from
         // earlier write txns (LMDB's `me_dpages`); they came
         // with the writer slot, so this takes no lock.
@@ -845,7 +859,7 @@ impl Env {
             children: ChildCounter::new(),
             // In-place WRITE_MAP keeps no whole-map reference in the struct
             // (see the field docs; ADR-0021 M1) — `whole_map` borrows lazily.
-            bytes: if in_map { &[] } else { inner.backing_bytes() },
+            bytes: if in_map { &[] } else { view.bytes },
             base,
             _guard: guard,
             env: self,
