@@ -330,7 +330,10 @@ impl Env {
     /// # Errors
     ///
     /// [`MdbError::ReadersFull`] when every reader-table slot is occupied
-    /// (TXN-16; the table holds `max_readers` slots, default 126).
+    /// (TXN-16; the table holds `max_readers` slots, default 126). In a
+    /// lock-file environment, [`MdbError::MapResized`] when another process
+    /// committed beyond this process's logical map size (ADR-0023 amendment
+    /// 15).
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
         let (snap, slot) = self.inner().pin_reader()?;
         Ok(RoTxn {
@@ -357,8 +360,7 @@ impl Env {
     ///
     /// # Errors
     ///
-    /// [`MdbError::ReadersFull`] when every reader-table slot is occupied
-    /// (TXN-16).
+    /// As [`Env::read_txn`].
     pub fn static_read_txn(self) -> Result<RoTxn<'static>> {
         let (snap, slot) = self.inner().pin_reader()?;
         // ADR-0018: an env-owning txn cannot borrow the env's cache and does

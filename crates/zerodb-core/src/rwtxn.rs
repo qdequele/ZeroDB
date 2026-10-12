@@ -728,7 +728,9 @@ impl Env {
     /// # Errors
     ///
     /// [`Error::Io`] if the env is poisoned by an earlier fsync failure
-    /// (SPEC 06 REC-13).
+    /// (SPEC 06 REC-13). [`MdbError::MapResized`] if the newest snapshot lies
+    /// beyond this process's logical map size: another process with a larger
+    /// map committed past it (ADR-0023 amendment 15).
     pub fn write_txn(&self) -> Result<RwTxn<'_>> {
         let inner = self.inner();
         // TXN-8 / SPEC 01 Table 1: a write txn on a read-only env is
@@ -754,6 +756,11 @@ impl Env {
         // another process's commit (ADR-0023 §4): never the process-local
         // cell. Without a lock file this is the cell, as before.
         let base = inner.current_snapshot()?;
+        // ADR-0023 amendment 15: the base must lie inside this process's
+        // logical map size, even when it came from the cache; otherwise the
+        // begin fails with `MapResized` (`OBS_WRITE_BEGIN_SMALL_MAP`). Either
+        // error drops `guard`, releasing both writer locks.
+        inner.check_base_in_view(&base)?;
         // ADR-0021 (SPEC 04 §6.4 TXN-45b): under WRITE_MAP, with a backing
         // that brokers map slices, dirty pages are realized **in the map** at
         // their freshly-COW'd pgnos — no heap staging, no commit write-back.
@@ -4346,6 +4353,10 @@ impl<'env> RwTxn<'env> {
         // slot; the intact `N-1` slot is the crash fallback). -----
         let last_pg = self.next_pgno - 1;
         let slot = self.txnid & 1;
+        // ADR-0023 amendment 15: a commit never lowers the persisted map size
+        // (`OBS_COMMIT_PERSISTS_OWN_MAPSIZE` = false): a process with a
+        // smaller map keeps the larger size another process recorded.
+        let map_size = self.base.map_size.max(inner.map_size());
         // GC-32 (ADR-0022): in annex mode this txn's freed PIL rides in the
         // meta itself — `freed` is final after C1 and already sorted/deduped
         // (GC-3/4); `freelist_save` guaranteed it fits the cap.
@@ -4357,7 +4368,7 @@ impl<'env> RwTxn<'env> {
             format_version: FORMAT_VERSION,
             page_size: psize,
             env_flags: 0,
-            map_size: inner.map_size(),
+            map_size,
             last_pg,
             free_db: self.free_db,
             main_db: self.main_db,
@@ -4425,6 +4436,7 @@ impl<'env> RwTxn<'env> {
         inner.publish_snapshot(Arc::new(Snapshot {
             txnid: self.txnid,
             last_pg,
+            map_size,
             main_db: self.main_db,
             free_db: self.free_db,
             free_annex: if self.annex_out {

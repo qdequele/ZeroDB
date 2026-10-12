@@ -1,13 +1,20 @@
 //! Memory maps over an env data file (SPEC 02 §8): the read-only [`Mmap`]
 //! (default backing) and the writable [`MmapWritable`] (`EnvFlags::WRITE_MAP`).
 //!
+//! It also holds [`MapRegions`], the grow-only cell of mappings a backing
+//! reads through (ADR-0023 amendment 15).
+//!
 //! This is one of the sanctioned homes for `unsafe` (the unsafe policy:
-//! mmap access). There are four `unsafe` blocks: [`Mmap::map`] (read map),
+//! mmap access). The `unsafe` here: [`Mmap::map`] (read map),
 //! [`MmapWritable::map`] (writable map), [`MmapWritable::write_at`] (the
-//! `memcpy` into the writable map), and [`MmapWritable::slice_mut`] (the
-//! ADR-0021 brokered dirty-page slice); each states its safety contract.
+//! `memcpy` into the writable map), [`MmapWritable::slice_mut`] (the
+//! ADR-0021 brokered dirty-page slice), and in [`MapRegions`] the view and
+//! mapping dereferences, the `Box::from_raw` calls in its `Drop`, and its
+//! `Send`/`Sync` impls. Each states its safety contract.
 
 use std::fs::File;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Mutex;
 
 /// A read-only memory map over an env data file.
 ///
@@ -278,5 +285,211 @@ impl MmapWritable {
         } else {
             self.inner.flush()
         }
+    }
+}
+
+/// One mmap of the data file (ADR-0023 amendment 15).
+pub(crate) enum Mapping {
+    /// A read-only map (the default backing).
+    Read(Mmap),
+    /// A writable map (`WRITE_MAP`).
+    Write(MmapWritable),
+    /// Heap bytes standing in for a map, so the [`MapRegions`] protocol runs
+    /// under miri, which cannot see OS mappings.
+    #[cfg(test)]
+    Heap(Box<[u8]>),
+}
+
+impl Mapping {
+    /// The whole mapped region.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        match self {
+            Mapping::Read(m) => m.bytes(),
+            Mapping::Write(m) => m.bytes(),
+            #[cfg(test)]
+            Mapping::Heap(b) => b,
+        }
+    }
+}
+
+/// A published (mapping, logical map size) pair. Immutable once published.
+pub(crate) struct ViewCell {
+    mapping: *const Mapping,
+    map_size: u64,
+}
+
+/// Every mapping and view a [`MapRegions`] ever created, freed only in its
+/// `Drop`.
+struct Owned {
+    mappings: Vec<*mut Mapping>,
+    views: Vec<*mut ViewCell>,
+}
+
+/// Grow-only mappings (ADR-0023 amendment 15). Every mapping and view is
+/// created with `Box::into_raw`, recorded in `owned`, and freed only in Drop.
+///
+/// `current` points to the newest view. One `Acquire` load of it gives a
+/// consistent (mapping, logical map size) pair: the logical size is never
+/// stored apart from the mapping it fits in. A new mapping is added only when
+/// it is longer than the current one, so mapping lengths never decrease in
+/// publication order. A mapping stays mapped until the backing drops, so no
+/// borrow of an older mapping is ever invalidated.
+pub struct MapRegions {
+    current: AtomicPtr<ViewCell>,
+    owned: Mutex<Owned>,
+}
+
+// SAFETY: the raw pointers are uniquely owned boxes of `Send + Sync` types
+// (`Mmap`/`MmapWritable` are `Send + Sync`, as is `Box<[u8]>`); `owned` is
+// mutated only under its mutex and `current` is atomic. Nothing is freed
+// before Drop.
+unsafe impl Send for MapRegions {}
+// SAFETY: as for `Send`. Shared access only loads `current` (atomically) and
+// reads immutable, never-freed views and mappings; `publish` mutates `owned`
+// under the mutex.
+unsafe impl Sync for MapRegions {}
+
+impl MapRegions {
+    /// Publishes view 0 over `first`.
+    pub(crate) fn new(first: Mapping, map_size: u64) -> MapRegions {
+        let mapping = Box::into_raw(Box::new(first));
+        let view = Box::into_raw(Box::new(ViewCell {
+            mapping: mapping.cast_const(),
+            map_size,
+        }));
+        MapRegions {
+            current: AtomicPtr::new(view),
+            owned: Mutex::new(Owned {
+                mappings: vec![mapping],
+                views: vec![view],
+            }),
+        }
+    }
+
+    /// One Acquire load: a consistent (bytes, map_size).
+    pub(crate) fn view(&self) -> (&Mapping, u64) {
+        // Acquire: pairs with the Release in `publish`; the view and its
+        // mapping were fully built before the store.
+        let v = self.current.load(Ordering::Acquire);
+        // SAFETY: `v` came from `Box::into_raw` in `publish`/`new` and is
+        // recorded in `owned`; views and mappings are freed only in Drop
+        // (`&mut self`), so both outlive `&self`. No `&mut` to them ever
+        // exists after publication.
+        let v = unsafe { &*v };
+        // SAFETY: as above, for the mapping `v` points to.
+        (unsafe { &*v.mapping }, v.map_size)
+    }
+
+    /// Publish `map_size`, adding `new_mapping` if given. Callers hold the
+    /// writer lock, so publications are serialized.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "map growth (`Backing::grow_map`) is the caller, ADR-0023 amendment 15"
+        )
+    )]
+    pub(crate) fn publish(&self, new_mapping: Option<Mapping>, map_size: u64) {
+        let mut owned = self.owned.lock().expect("map regions poisoned");
+        let mapping = match new_mapping {
+            Some(m) => {
+                let p = Box::into_raw(Box::new(m));
+                owned.mappings.push(p);
+                p.cast_const()
+            }
+            None => {
+                // Relaxed: under the mutex, which orders this load after the
+                // previous publish's store.
+                let cur = self.current.load(Ordering::Relaxed);
+                // SAFETY: as in `view`: `cur` is a published, never-freed view.
+                unsafe { (*cur).mapping }
+            }
+        };
+        let v = Box::into_raw(Box::new(ViewCell { mapping, map_size }));
+        owned.views.push(v);
+        // Release: the view and its mapping are fully constructed first.
+        self.current.store(v, Ordering::Release);
+    }
+}
+
+impl Drop for MapRegions {
+    fn drop(&mut self) {
+        let owned = self.owned.get_mut().expect("map regions poisoned");
+        for v in owned.views.drain(..) {
+            // SAFETY: each pointer came from `Box::into_raw` exactly once and
+            // is freed exactly once; `&mut self` proves no borrow is live.
+            drop(unsafe { Box::from_raw(v) });
+        }
+        for m in owned.mappings.drain(..) {
+            // SAFETY: as above.
+            drop(unsafe { Box::from_raw(m) });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MapRegions, Mapping};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// A heap mapping of `len` bytes, every byte `fill`.
+    fn heap(len: usize, fill: u8) -> Mapping {
+        Mapping::Heap(vec![fill; len].into_boxed_slice())
+    }
+
+    /// One thread publishes three growing views while two threads read
+    /// through `view()`. Every view a reader loads is consistent: the mapping
+    /// covers the logical size, and the last byte of the logical size holds
+    /// the generation that mapping was built with. Under miri, the data-race
+    /// detector checks the Release/Acquire pairing that makes the mapping's
+    /// bytes visible to a reader that loaded its view.
+    #[test]
+    fn map_regions_publish_is_seen_consistently() {
+        // Generations: 64 bytes of 1s (sizes 48, then 64 without a new
+        // mapping), 128 bytes of 2s (size 100), 512 bytes of 3s (size 300).
+        let regions = Arc::new(MapRegions::new(heap(64, 1), 48));
+        let done = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let regions = Arc::clone(&regions);
+                let done = Arc::clone(&done);
+                std::thread::spawn(move || {
+                    let mut last = 0u64;
+                    loop {
+                        // Acquire: pairs with the Release store of `done`
+                        // after the final publish.
+                        let finished = done.load(Ordering::Acquire);
+                        let (m, size) = regions.view();
+                        let bytes = m.bytes();
+                        assert!(bytes.len() as u64 >= size, "mapping shorter than its size");
+                        assert!(size >= last, "a later load returned an older view");
+                        last = size;
+                        let tail = bytes[size as usize - 1];
+                        let want = match size {
+                            48 | 64 => 1,
+                            100 => 2,
+                            300 => 3,
+                            other => panic!("unexpected size {other}"),
+                        };
+                        assert_eq!(tail, want, "size {size}");
+                        if finished {
+                            assert_eq!(size, 300, "the final view is visible");
+                            return;
+                        }
+                    }
+                })
+            })
+            .collect();
+        regions.publish(None, 64);
+        regions.publish(Some(heap(128, 2)), 100);
+        regions.publish(Some(heap(512, 3)), 300);
+        // Release: orders the publishes before a reader's Acquire of `done`.
+        done.store(true, Ordering::Release);
+        for r in readers {
+            r.join().expect("reader");
+        }
+        let (m, size) = regions.view();
+        assert_eq!((m.bytes().len(), size), (512, 300));
     }
 }

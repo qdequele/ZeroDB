@@ -88,6 +88,14 @@ pub enum MdbError {
     /// parity; SPEC 04 TXN-59 clean-abort guarantee).
     #[error("transaction must abort")]
     BadTxn,
+
+    /// `MDB_MAP_RESIZED` (LMDB code `-30785`) — a transaction begin found the
+    /// newest committed snapshot past this environment's logical map size:
+    /// another process grew the database beyond it (ADR-0023 amendment 15).
+    /// A larger map size recorded in the meta alone does not raise it.
+    /// `Debug` renders as `MapResized`, matching `heed::MdbError::MapResized`.
+    #[error("database contents grew beyond environment mapsize")]
+    MapResized,
 }
 
 /// A convenience result alias for engine operations.

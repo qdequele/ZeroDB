@@ -1,8 +1,11 @@
-//! Differential test of dead-process handling (ADR-0023 stage 2): the same
+//! Differential tests of multi-process behavior (ADR-0023): the same
 //! scenario run against the Meilisearch LMDB fork (through `lmdb-master-sys`)
 //! and against ZeroDB with a lock file, comparing what each engine reports.
+//! Stage 2 covers dead-process handling; stage 3 covers map growth across
+//! processes (amendment 15).
 //!
-//! The test binary re-runs itself as the child process that gets SIGKILLed.
+//! The test binary re-runs itself as the child process (SIGKILLed for the
+//! dead-process cases).
 //! A mismatch between the engines is a ZeroDB bug unless recorded in
 //! `docs/DIVERGENCES.md`; never edit an expectation to make ZeroDB pass.
 
@@ -21,6 +24,12 @@ const MDB_RDONLY: c_uint = 0x0002_0000;
 const ROLE: &str = "ZERODB_MPDIFF_ROLE";
 const DIR: &str = "ZERODB_MPDIFF_DIR";
 const MAX_READERS: u32 = 8;
+const MIB: u64 = 1 << 20;
+/// ZeroDB's page size in these tests. LMDB uses the OS page size
+/// ([`Lmdb::psize`]); each engine's sizes are computed with its own.
+const PSIZE: u64 = 4096;
+/// Past 1 MiB (so a 1 MiB map cannot hold it) and under 2 MiB.
+const GROW_TARGET: u64 = MIB + MIB / 4;
 
 struct Lmdb {
     env: *mut ffi::MDB_env,
@@ -28,6 +37,10 @@ struct Lmdb {
 
 impl Lmdb {
     fn open(dir: &Path, max_readers: u32) -> Lmdb {
+        Lmdb::open_sized(dir, max_readers, MIB)
+    }
+
+    fn open_sized(dir: &Path, max_readers: u32, mapsize: u64) -> Lmdb {
         let path = CString::new(dir.to_str().unwrap()).unwrap();
         let mut env = ptr::null_mut();
         // SAFETY: plain C API calls on a fresh env handle owned by this
@@ -35,7 +48,7 @@ impl Lmdb {
         unsafe {
             assert_eq!(ffi::mdb_env_create(&mut env), 0);
             assert_eq!(ffi::mdb_env_set_maxreaders(env, max_readers), 0);
-            assert_eq!(ffi::mdb_env_set_mapsize(env, 1 << 20), 0);
+            assert_eq!(ffi::mdb_env_set_mapsize(env, mapsize as _), 0);
             assert_eq!(ffi::mdb_env_open(env, path.as_ptr(), MDB_NOTLS, 0o644), 0);
         }
         Lmdb { env }
@@ -43,9 +56,14 @@ impl Lmdb {
 
     /// Begin a read txn; the raw return code on failure.
     fn try_read(&self) -> Result<*mut ffi::MDB_txn, c_int> {
+        self.try_begin(MDB_RDONLY)
+    }
+
+    /// Begin a txn with `flags`; the raw return code on failure.
+    fn try_begin(&self, flags: c_uint) -> Result<*mut ffi::MDB_txn, c_int> {
         let mut txn = ptr::null_mut();
         // SAFETY: `self.env` is open; `txn` receives a handle we own.
-        let rc = unsafe { ffi::mdb_txn_begin(self.env, ptr::null_mut(), MDB_RDONLY, &mut txn) };
+        let rc = unsafe { ffi::mdb_txn_begin(self.env, ptr::null_mut(), flags, &mut txn) };
         if rc == 0 {
             Ok(txn)
         } else {
@@ -53,7 +71,72 @@ impl Lmdb {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    /// Begin and abort a txn with `flags`, normalized for comparison.
+    fn begin_outcome(&self, flags: c_uint) -> String {
+        match self.try_begin(flags) {
+            Ok(txn) => {
+                Lmdb::abort(txn);
+                "ok".to_string()
+            }
+            Err(ffi::MDB_MAP_RESIZED) => "MapResized".to_string(),
+            Err(rc) => format!("rc={rc}"),
+        }
+    }
+
+    /// The page size (LMDB uses the OS page size: 16 KiB on macOS aarch64).
+    fn psize(&self) -> u64 {
+        // SAFETY: MDB_stat is plain data; LMDB fills it.
+        let st = unsafe {
+            let mut st: ffi::MDB_stat = std::mem::zeroed();
+            assert_eq!(ffi::mdb_env_stat(self.env, &mut st), 0);
+            st
+        };
+        u64::from(st.ms_psize)
+    }
+
+    /// `(me_mapsize, me_last_pgno)`.
+    fn map_info(&self) -> (u64, u64) {
+        // SAFETY: MDB_envinfo is plain data; LMDB fills it.
+        let i = unsafe {
+            let mut i: ffi::MDB_envinfo = std::mem::zeroed();
+            assert_eq!(ffi::mdb_env_info(self.env, &mut i), 0);
+            i
+        };
+        (i.me_mapsize as u64, i.me_last_pgno as u64)
+    }
+
+    /// Commit batches of 1000-byte values until the file's last page lies
+    /// past [`GROW_TARGET`].
+    fn grow(&self) {
+        let value = [7u8; 1000];
+        let psize = self.psize();
+        let mut i = 0u32;
+        while (self.map_info().1 + 1) * psize <= GROW_TARGET {
+            // SAFETY: standard begin/dbi_open/put/commit sequence on an open
+            // env; every pointer is live for the duration of its call.
+            unsafe {
+                let txn = self.try_begin(0).unwrap();
+                let mut dbi = 0;
+                assert_eq!(ffi::mdb_dbi_open(txn, ptr::null(), 0, &mut dbi), 0);
+                for j in 0..8 {
+                    let key = format!("g{:08}", i * 8 + j);
+                    let mut k = ffi::MDB_val {
+                        mv_size: key.len(),
+                        mv_data: key.as_ptr() as *mut c_void,
+                    };
+                    let mut v = ffi::MDB_val {
+                        mv_size: value.len(),
+                        mv_data: value.as_ptr() as *mut c_void,
+                    };
+                    assert_eq!(ffi::mdb_put(txn, dbi, &mut k, &mut v, 0), 0);
+                }
+                assert_eq!(ffi::mdb_txn_commit(txn), 0);
+            }
+            i += 1;
+            assert!(i < 100_000, "never grew");
+        }
+    }
+
     fn abort(txn: *mut ffi::MDB_txn) {
         // SAFETY: `txn` came from `mdb_txn_begin` and is ended exactly once.
         unsafe { ffi::mdb_txn_abort(txn) }
@@ -153,9 +236,62 @@ impl Drop for Lmdb {
 }
 
 fn zdb_open(dir: &Path) -> zerodb::Env {
+    zdb_open_sized(dir, Some(MIB))
+}
+
+/// A lock-file env at `map_size` bytes, or at the persisted size for `None`.
+fn zdb_open_sized(dir: &Path, map_size: Option<u64>) -> zerodb::Env {
     let mut o = zerodb::EnvOpenOptions::new();
-    o.map_size(1 << 20).max_readers(MAX_READERS).lock_file(true);
+    o.page_size(PSIZE as u32)
+        .max_readers(MAX_READERS)
+        .lock_file(true);
+    if let Some(m) = map_size {
+        o.map_size(usize::try_from(m).unwrap());
+    }
     o.open(dir).expect("open lock-file env")
+}
+
+/// Normalize a ZeroDB begin result for comparison with [`Lmdb::begin_outcome`].
+fn zdb_outcome<T>(r: zerodb::Result<T>) -> String {
+    match r {
+        Ok(_) => "ok".to_string(),
+        Err(zerodb::Error::Mdb(zerodb::MdbError::MapResized)) => "MapResized".to_string(),
+        Err(e) => format!("{e:?}"),
+    }
+}
+
+/// [`Lmdb::grow`] for ZeroDB: the same batches, until the same bound.
+fn zdb_grow(env: &zerodb::Env) {
+    let db = env.main_database();
+    let value = [7u8; 1000];
+    let mut i = 0u32;
+    while (env.info().last_pgno + 1) * PSIZE <= GROW_TARGET {
+        let mut w = env.write_txn().unwrap();
+        for j in 0..8 {
+            db.put(&mut w, format!("g{:08}", i * 8 + j).as_bytes(), &value)
+                .unwrap();
+        }
+        w.commit().unwrap();
+        i += 1;
+        assert!(i < 100_000, "never grew");
+    }
+}
+
+/// `mm_mapsize` of the newest meta page in LMDB's `data.mdb` (page size
+/// `psize`), read from the file. Offsets inside a meta page: 16-byte page
+/// header, then magic u32, version u32, address u64, mapsize u64 (@32), two
+/// 48-byte MDB_db records, last_pg u64 (@136), txnid u64 (@144).
+fn lmdb_meta_mapsize(dir: &Path, psize: u64) -> u64 {
+    let bytes = std::fs::read(dir.join("data.mdb")).unwrap();
+    let u64_at = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+    let magic = |base: usize| u32::from_le_bytes(bytes[base + 16..base + 20].try_into().unwrap());
+    (0..2)
+        .map(|i| (i * psize) as usize)
+        .inspect(|&base| assert_eq!(magic(base), 0xBEEF_C0DE, "meta magic"))
+        .map(|base| (u64_at(base + 144), u64_at(base + 32)))
+        .max()
+        .unwrap()
+        .1
 }
 
 fn zdb_commit_one(env: &zerodb::Env) {
@@ -207,9 +343,26 @@ fn kill_child(role: &str, dir: &Path) -> u32 {
     pid
 }
 
+/// Run a child role to completion; panics on a failure exit or a 60 s
+/// timeout.
+fn run_child(role: &str, dir: &Path) {
+    let mut c = spawn(role, dir);
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(st) = c.0.try_wait().unwrap() {
+            assert!(st.success(), "child {role} failed: {st}");
+            return;
+        }
+        assert!(Instant::now() < end, "timed out waiting for child {role}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Child entry point: a no-op unless run by `spawn`. Roles are
 /// `{zdb,lmdb}_hold_readers:<n>` and `{zdb,lmdb}_hold_writer`; the writer
-/// roles put `doomed` in an uncommitted write txn before signaling.
+/// roles put `doomed` in an uncommitted write txn before signaling. The map
+/// roles open with an 8 MiB map and exit: `{zdb,lmdb}_grow` commit past
+/// [`GROW_TARGET`], `{zdb,lmdb}_commit_one` commit one small key.
 #[test]
 fn child_entry() {
     let (Ok(role), Ok(dir)) = (std::env::var(ROLE), std::env::var(DIR)) else {
@@ -218,6 +371,13 @@ fn child_entry() {
     let dir = PathBuf::from(dir);
     let signal = || std::fs::write(dir.join("held"), b"").unwrap();
     let park = || std::thread::sleep(Duration::from_secs(600));
+    match role.as_str() {
+        "lmdb_grow" => return Lmdb::open_sized(&dir, MAX_READERS, 8 * MIB).grow(),
+        "lmdb_commit_one" => return Lmdb::open_sized(&dir, MAX_READERS, 8 * MIB).commit_one(),
+        "zdb_grow" => return zdb_grow(&zdb_open_sized(&dir, Some(8 * MIB))),
+        "zdb_commit_one" => return zdb_commit_one(&zdb_open_sized(&dir, Some(8 * MIB))),
+        _ => {}
+    }
     if let Some(n) = role.strip_prefix("lmdb_hold_readers:") {
         let env = Lmdb::open(&dir, MAX_READERS);
         let txns: Vec<_> = (0..n.parse::<u32>().unwrap())
@@ -351,4 +511,123 @@ fn killed_writer_takeover_matches_lmdb() {
         run_lmdb(),
         "(dead reader still listed, doomed key present)"
     );
+}
+
+/// A process with a 1 MiB map, after an 8 MiB process committed past it:
+/// `(read begin, write begin)` (ADR-0023 amendment 15;
+/// `OBS_READ_BEGIN_SMALL_MAP`, `OBS_WRITE_BEGIN_SMALL_MAP`).
+#[test]
+fn begins_on_a_small_map_after_another_process_grew_match_lmdb() {
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        let env = Lmdb::open(dir.path(), MAX_READERS);
+        env.commit_one();
+        run_child("lmdb_grow", dir.path());
+        (env.begin_outcome(MDB_RDONLY), env.begin_outcome(0))
+    };
+    eprintln!("lmdb (read, write) = {lmdb:?}");
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        let env = zdb_open(dir.path());
+        zdb_commit_one(&env);
+        run_child("zdb_grow", dir.path());
+        (zdb_outcome(env.read_txn()), zdb_outcome(env.write_txn()))
+    };
+    eprintln!("zdb (read, write) = {zdb:?}");
+    assert_eq!(zdb, lmdb, "(read begin, write begin) on a small map");
+}
+
+/// A larger map size in the meta alone, while the data still fits this
+/// process's map: `(read begin, write begin)`
+/// (`OBS_BIGGER_META_MAPSIZE_ALONE_RESIZES` = false).
+#[test]
+fn begins_with_only_a_bigger_meta_size_match_lmdb() {
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        let env = Lmdb::open(dir.path(), MAX_READERS);
+        env.commit_one();
+        run_child("lmdb_commit_one", dir.path());
+        assert_eq!(lmdb_meta_mapsize(dir.path(), env.psize()), 8 * MIB, "setup");
+        (env.begin_outcome(MDB_RDONLY), env.begin_outcome(0))
+    };
+    eprintln!("lmdb (read, write) = {lmdb:?}");
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        let env = zdb_open(dir.path());
+        zdb_commit_one(&env);
+        run_child("zdb_commit_one", dir.path());
+        (zdb_outcome(env.read_txn()), zdb_outcome(env.write_txn()))
+    };
+    eprintln!("zdb (read, write) = {zdb:?}");
+    assert_eq!(
+        zdb, lmdb,
+        "(read begin, write begin) with a bigger meta size"
+    );
+}
+
+/// A 1 MiB process commits after an 8 MiB process recorded 8 MiB in the
+/// meta: the persisted map size afterwards
+/// (`OBS_COMMIT_PERSISTS_OWN_MAPSIZE` = false).
+#[test]
+fn smaller_map_commit_keeps_the_meta_size_like_lmdb() {
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        let env = Lmdb::open(dir.path(), MAX_READERS);
+        env.commit_one();
+        run_child("lmdb_commit_one", dir.path());
+        env.commit_one();
+        let psize = env.psize();
+        drop(env);
+        lmdb_meta_mapsize(dir.path(), psize)
+    };
+    eprintln!("lmdb persisted map size = {lmdb}");
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        let env = zdb_open(dir.path());
+        zdb_commit_one(&env);
+        run_child("zdb_commit_one", dir.path());
+        zdb_commit_one(&env);
+        drop(env);
+        // Reopened without a map size, the env adopts the persisted one.
+        zdb_open_sized(dir.path(), None).info().map_size
+    };
+    eprintln!("zdb persisted map size = {zdb}");
+    assert_eq!(zdb, lmdb, "persisted map size after the smaller-map commit");
+}
+
+/// Open with a 1 MiB map below the committed data: the resulting map size,
+/// classified against the request and `(last_pg + 1) * page_size`
+/// (`OBS_OPEN_BELOW_LAST_PG = "minsize"`).
+#[test]
+fn open_below_last_pg_matches_lmdb() {
+    let classify = |map_size: u64, last_pg: u64, psize: u64| {
+        let minsize = (last_pg + 1) * psize;
+        assert!(minsize > MIB, "setup: the data is past 1 MiB");
+        if map_size == MIB {
+            "requested".to_string()
+        } else if map_size == minsize {
+            "minsize".to_string()
+        } else {
+            format!("other={map_size}")
+        }
+    };
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        run_child("lmdb_grow", dir.path());
+        let env = Lmdb::open(dir.path(), MAX_READERS);
+        let (m, last) = env.map_info();
+        Lmdb::abort(env.try_read().unwrap());
+        classify(m, last, env.psize())
+    };
+    eprintln!("lmdb open below last_pg = {lmdb}");
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        run_child("zdb_grow", dir.path());
+        let env = zdb_open(dir.path());
+        let info = env.info();
+        drop(env.read_txn().unwrap());
+        classify(info.map_size, info.last_pgno, PSIZE)
+    };
+    eprintln!("zdb open below last_pg = {zdb}");
+    assert_eq!(zdb, lmdb, "map size after an open below last_pg");
 }

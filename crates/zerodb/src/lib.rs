@@ -54,6 +54,7 @@ pub use zerodb_core::env::{
 };
 pub use zerodb_core::error::{Error, MdbError, Result};
 pub use zerodb_core::nested::NestedRoTxn;
+pub use zerodb_core::page::geometry::MAX_MAP_SIZE;
 pub use zerodb_core::page::{FileTrust, FIRST_DATA_PGNO, MAX_KEY_SIZE};
 pub use zerodb_core::rotxn::{
     collect_entries_flagged, for_each_entry_flagged, free_page_count, named_databases, Database,
@@ -587,7 +588,6 @@ impl EnvOpenOptions {
             canonical_dir,
             opened.backing,
             opened.page_size,
-            opened.map_size,
             prev_snapshot,
             self.max_dbs,
             self.max_readers,

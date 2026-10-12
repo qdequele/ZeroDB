@@ -31,6 +31,19 @@ use crate::page::{
 use crate::readers::{ReaderTable, SnapshotCell};
 use crate::stamps::StampCache;
 
+/// A consistent (mapped bytes, logical map size) pair (ADR-0023 amendment 15),
+/// from one [`Backing::view`] call. No `Debug`: it would print the whole map.
+#[derive(Clone, Copy)]
+pub struct MapView<'a> {
+    /// The mapped bytes. A mapping is at least `map_size` long, and longer
+    /// when the file is (the mapping covers the whole file); a heap test
+    /// backing may be shorter.
+    pub bytes: &'a [u8],
+    /// The logical map size: `MapFull` beyond it, and `MapResized` at a txn
+    /// begin whose snapshot lies beyond it.
+    pub map_size: u64,
+}
+
 /// Read (and, for the write path, page-granular write) access to a
 /// memory-mapped (or, in tests, heap) env file.
 ///
@@ -44,12 +57,44 @@ use crate::stamps::StampCache;
 /// Implementors must be `Send + Sync`: an [`EnvInner`] is shared across threads
 /// through an `Arc` and read txns hand out `Send` borrows.
 pub trait Backing: Send + Sync {
-    /// The whole mapped region as bytes. Slot 0 is `[0, page_size)`, slot 1 is
-    /// `[page_size, 2*page_size)`; data pages follow. The region may extend
-    /// past the current file length (ADR-0004 D4: the map covers the full
-    /// `map_size`); callers only dereference pages a committed snapshot
-    /// references, which are always within the file (SPEC 06 REC-14).
-    fn bytes(&self) -> &[u8];
+    /// The current mapped bytes and logical map size, as one consistent pair
+    /// (ADR-0023 amendment 15). A mapped backing's bytes are at least as long
+    /// as the logical size; a heap test backing models a file and may be
+    /// shorter. A backing whose map can grow publishes a new pair without
+    /// ever invalidating bytes it lent earlier; a heap backing returns its
+    /// fixed pair.
+    fn view(&self) -> MapView<'_>;
+
+    /// The whole mapped region as bytes: [`Backing::view`]'s bytes. Slot 0 is
+    /// `[0, page_size)`, slot 1 is `[page_size, 2*page_size)`; data pages
+    /// follow. The region may extend past the current file length (ADR-0004
+    /// D4: the map covers the full `map_size`); callers only dereference pages
+    /// a committed snapshot references, which are always within the file
+    /// (SPEC 06 REC-14).
+    fn bytes(&self) -> &[u8] {
+        self.view().bytes
+    }
+
+    /// Set the logical map size to `map_size`, adding a mapping of
+    /// max(map_size, 2 × current) when the current one is shorter (on
+    /// ENOMEM, retry exactly map_size, else Io). Under WRITE_MAP, grows the
+    /// file first, only if it is shorter. Caller holds the in-process writer
+    /// lock and, with a lock file, the cross-process one (ADR-0023 amendment
+    /// 15).
+    ///
+    /// The default refuses: the backing cannot grow its map.
+    ///
+    /// # Errors
+    ///
+    /// `Unsupported` by default; a backing that grows reports its `mmap` or
+    /// file-growth error.
+    fn grow_map(&self, map_size: u64) -> std::io::Result<()> {
+        let _ = map_size;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "backing cannot grow its map",
+        ))
+    }
 
     /// The actual on-disk length of the backing file (`fstat`), for
     /// [`Env::real_disk_size`] (SPEC 00 row 18).
@@ -215,6 +260,10 @@ pub struct Snapshot {
     pub txnid: u64,
     /// File high-water as of this commit (`next_pgno - 1`, SPEC 05 GC-15).
     pub last_pg: u64,
+    /// The map size this snapshot's meta records (ADR-0023 amendment 15). A
+    /// commit persists `max(base.map_size, the committing process's logical
+    /// map size)`, so it never lowers the recorded size.
+    pub map_size: u64,
     /// Root/stats of the main/catalog DB.
     pub main_db: DBRecord,
     /// Root/stats of the free (GC) DB.
@@ -238,6 +287,7 @@ impl Snapshot {
         Snapshot {
             txnid: meta.txnid,
             last_pg: meta.last_pg,
+            map_size: meta.map_size,
             main_db: meta.main_db,
             free_db: meta.free_db,
             free_annex: annex.into(),
@@ -571,10 +621,9 @@ pub struct EnvInner {
     /// crate. `Backing: Send + Sync` keeps `EnvInner: Sync`.
     backing: Option<Box<dyn Backing>>,
     /// The DB page size (from the live meta; authoritative — SPEC 02 §3.2).
+    /// The runtime map size is not stored here: it lives in the backing's
+    /// published view with the mapping it fits in (ADR-0023 amendment 15).
     page_size: u32,
-    /// The runtime map size (SPEC 02 §8): the caller's `map_size` if given, else
-    /// the live meta's. Returned by [`Env::info`].
-    map_size: u64,
     /// The meta selected **at open** (higher-txnid, or older under
     /// `PREV_SNAPSHOT`). Read once to seed the published snapshot (TXN-18);
     /// steady-state reads use [`EnvInner::snapshot`], never this field, because
@@ -660,7 +709,7 @@ impl std::fmt::Debug for EnvInner {
             .field("id", &self.id)
             .field("path", &self.path)
             .field("page_size", &self.page_size)
-            .field("map_size", &self.map_size)
+            .field("map_size", &self.map_size())
             .field("txnid", &self.meta.txnid)
             .field("prev_snapshot", &self.prev_snapshot)
             .finish_non_exhaustive()
@@ -674,10 +723,11 @@ impl EnvInner {
         self.page_size
     }
 
-    /// The runtime map size (SPEC 00 row 20, `Env::info().map_size`).
+    /// The runtime map size (SPEC 00 row 20, `Env::info().map_size`): the
+    /// logical size of the backing's current view (ADR-0023 amendment 15).
     #[must_use]
     pub fn map_size(&self) -> u64 {
-        self.map_size
+        self.backing_ref().view().map_size
     }
 
     /// The txnid of the current live snapshot (the commit point; advances on
@@ -871,8 +921,10 @@ impl EnvInner {
     /// # Errors
     ///
     /// [`MdbError::ReadersFull`] when every slot is occupied (TXN-16). In a
-    /// lock-file environment also [`MdbError::Invalid`] when the snapshot at
-    /// `T` cannot be decoded or lies outside this process's map or the file.
+    /// lock-file environment also [`MdbError::MapResized`] when the snapshot
+    /// at `T` lies beyond this process's logical map size, and
+    /// [`MdbError::Invalid`] when it cannot be decoded or lies beyond the
+    /// file.
     pub(crate) fn pin_reader(&self) -> Result<(Arc<Snapshot>, u32), Error> {
         // loom builds have no shared reader table (`ReaderTable::new_shared`
         // is not compiled), and the open path refuses a region there.
@@ -945,8 +997,10 @@ impl EnvInner {
     ///
     /// # Errors
     ///
-    /// In a lock-file environment, [`MdbError::Invalid`] when the snapshot at
-    /// `T` cannot be decoded or lies outside this process's map or the file.
+    /// In a lock-file environment, [`MdbError::MapResized`] when the snapshot
+    /// at `T` lies beyond this process's logical map size, and
+    /// [`MdbError::Invalid`] when it cannot be decoded or lies beyond the
+    /// file.
     #[inline]
     pub(crate) fn current_snapshot(&self) -> Result<Arc<Snapshot>, Error> {
         match &self.shared {
@@ -1321,7 +1375,7 @@ impl EnvInner {
     /// testable at the env level; the write path checks `is_map_full` itself.
     #[must_use]
     pub fn would_map_full(&self, next_pgno: u64, n: u64) -> bool {
-        is_map_full(next_pgno, n, map_pages(self.map_size, self.page_size))
+        is_map_full(next_pgno, n, map_pages(self.map_size(), self.page_size))
     }
 }
 
@@ -1817,8 +1871,9 @@ pub fn check_open_limits(max_readers: u32, max_dbs: u32) -> Result<(), Error> {
 /// Open an env over an already-constructed [`Backing`] (SPEC 02 §3.2, SPEC 06
 /// §1). This is the I/O-free core of open: the caller (`zerodb-io` / the public
 /// `zerodb` crate) has already opened, created-if-new, and mapped the file, and
-/// determined `page_size` (from the meta, or the creation option) and the
-/// runtime `map_size`.
+/// determined `page_size` (from the meta, or the creation option). The
+/// runtime map size is the backing's: [`Backing::view`] (ADR-0023 amendment
+/// 15).
 ///
 /// Steps: registry dedup (`EnvAlreadyOpened`) → validate both slots → select →
 /// map REC taxonomy to [`Error`] → build & register [`EnvInner`].
@@ -1841,7 +1896,6 @@ pub fn open_with_backing(
     canonical_path: PathBuf,
     backing: Box<dyn Backing>,
     page_size: u32,
-    map_size: u64,
     prev_snapshot: bool,
     max_dbs: u32,
     max_readers: u32,
@@ -1851,7 +1905,6 @@ pub fn open_with_backing(
         canonical_path,
         backing,
         page_size,
-        map_size,
         prev_snapshot,
         max_dbs,
         max_readers,
@@ -1899,7 +1952,6 @@ pub fn open_with_backing_policy(
     canonical_path: PathBuf,
     backing: Box<dyn Backing>,
     page_size: u32,
-    map_size: u64,
     prev_snapshot: bool,
     max_dbs: u32,
     max_readers: u32,
@@ -1912,7 +1964,6 @@ pub fn open_with_backing_policy(
         canonical_path,
         backing,
         page_size,
-        map_size,
         prev_snapshot,
         max_dbs,
         max_readers,
@@ -1942,14 +1993,14 @@ pub fn open_with_backing_policy(
 /// # Errors
 ///
 /// As [`open_with_backing`]; with a region, also [`MdbError::Invalid`] when
-/// the meta slot holding `T` never decodes, or its snapshot lies outside this
-/// process's map or the file.
+/// the meta slot holding `T` never decodes or its snapshot lies beyond the
+/// file, and [`MdbError::MapResized`] when that snapshot lies beyond this
+/// process's logical map size.
 #[allow(clippy::too_many_arguments)]
 pub fn open_with_backing_shared(
     canonical_path: PathBuf,
     backing: Box<dyn Backing>,
     page_size: u32,
-    map_size: u64,
     prev_snapshot: bool,
     max_dbs: u32,
     max_readers: u32,
@@ -2079,7 +2130,6 @@ pub fn open_with_backing_shared(
         path: canonical_path.clone(),
         backing: Some(backing),
         page_size,
-        map_size,
         // Seed the published-snapshot cell from the durable meta — the one
         // and only time a meta *page* is read for roots (SPEC 04 TXN-18). A
         // lock-file environment re-reads metas when another process commits
@@ -2215,29 +2265,67 @@ fn seed_from_published(
 }
 
 /// Check that a snapshot decoded after open lies inside this process's map
-/// and inside the file as it is now (SPEC 06 REC-1a, the open-time geometry
-/// check). Another process with a larger `map_size` may have grown the file
-/// past this process's map; ADR-0023 §5 maps that case to `MapResized` once
-/// LMDB's behavior is observed (stage 3). Checked arithmetic: a hostile
-/// `last_pg` must not wrap the multiply.
+/// and inside the file as it is now (ADR-0023 amendment 15; SPEC 06 REC-1a,
+/// the open-time geometry check). Checked arithmetic: a hostile `last_pg`
+/// must not wrap the multiply.
+///
+/// - Past the logical map size: [`MdbError::MapResized`]. Another process
+///   with a larger map committed beyond this one's (`OBS_READ_BEGIN_SMALL_MAP`,
+///   `OBS_WRITE_BEGIN_SMALL_MAP`). A larger map size in the meta alone passes.
+/// - Past the mapped bytes but inside the logical size: [`MdbError::Invalid`];
+///   a mapping always covers its logical size, so this is a bug or corruption.
+/// - Past the file's real length: [`MdbError::Invalid`] (REC-1a).
 fn check_snapshot_backed(
     backing: &dyn Backing,
     page_size: u32,
     snap: &Snapshot,
 ) -> Result<(), Error> {
+    let needed = check_snapshot_in_view(backing.view(), page_size, snap)?;
+    if needed > backing.real_disk_size().map_err(Error::Io)? {
+        // REC-1a: the file is shorter than last_pg.
+        return Err(Error::Mdb(MdbError::Invalid));
+    }
+    Ok(())
+}
+
+/// The map half of [`check_snapshot_backed`], against one view (a consistent
+/// pair from one `Acquire` load). Returns the bytes the snapshot needs,
+/// `(last_pg + 1) * page_size`.
+fn check_snapshot_in_view(
+    view: MapView<'_>,
+    page_size: u32,
+    snap: &Snapshot,
+) -> Result<u64, Error> {
     let needed = snap
         .last_pg
         .checked_add(1)
         .and_then(|n| n.checked_mul(u64::from(page_size)))
         .ok_or(Error::Mdb(MdbError::Invalid))?;
-    if needed > backing.bytes().len() as u64 {
+    if needed > view.map_size {
+        return Err(Error::Mdb(MdbError::MapResized));
+    }
+    if needed > view.bytes.len() as u64 {
+        // A map shorter than its logical size: a bug or corruption.
         return Err(Error::Mdb(MdbError::Invalid));
     }
-    let real = backing.real_disk_size().map_err(Error::Io)?;
-    if needed > real {
-        return Err(Error::Mdb(MdbError::Invalid));
+    Ok(needed)
+}
+
+impl EnvInner {
+    /// The write-begin check of the writer's base against the current view
+    /// (ADR-0023 amendment 15), also for a base that came from the cache: a
+    /// write txn never starts with a base outside its logical map size, which
+    /// would otherwise make every allocation `MapFull`. The file-length half
+    /// is not repeated: a cached snapshot passed it when it was decoded, and
+    /// a process-local one was committed through this backing.
+    ///
+    /// # Errors
+    ///
+    /// [`MdbError::MapResized`] past the logical map size;
+    /// [`MdbError::Invalid`] past the mapped bytes.
+    pub(crate) fn check_base_in_view(&self, base: &Snapshot) -> Result<(), Error> {
+        check_snapshot_in_view(self.backing_ref().view(), self.page_size, base).map(|_| ())
     }
-    Ok(())
 }
 
 /// Test-only helpers: a heap-backed [`Backing`] and an in-memory env
@@ -2249,21 +2337,43 @@ fn check_snapshot_backed(
 /// are tested against real files in `crates/zerodb`.
 #[doc(hidden)]
 pub mod testutil {
-    use super::{next_env_id, open_with_backing_policy, Backing, Env};
+    use super::{next_env_id, open_with_backing_policy, Backing, Env, MapView};
     use crate::error::Error;
     use crate::page::FileTrust;
     use crate::page::MetaPage;
     use std::path::PathBuf;
 
-    /// A heap-backed read-only [`Backing`].
-    pub struct VecBacking(pub Vec<u8>);
+    /// A heap-backed read-only [`Backing`]: the bytes model the file, and the
+    /// logical map size is fixed at construction.
+    pub struct VecBacking {
+        bytes: Vec<u8>,
+        map_size: u64,
+    }
+
+    impl VecBacking {
+        /// A backing over `bytes` (the file's contents) with a logical map
+        /// size of `map_size`, which may exceed `bytes.len()`: pages past the
+        /// file are never read, as with a real map past the end of the file.
+        #[must_use]
+        pub fn new(bytes: Vec<u8>, map_size: u64) -> VecBacking {
+            VecBacking { bytes, map_size }
+        }
+
+        /// The file's contents, for a test that edits them in place.
+        pub fn bytes_mut(&mut self) -> &mut [u8] {
+            &mut self.bytes
+        }
+    }
 
     impl Backing for VecBacking {
-        fn bytes(&self) -> &[u8] {
-            &self.0
+        fn view(&self) -> MapView<'_> {
+            MapView {
+                bytes: &self.bytes,
+                map_size: self.map_size,
+            }
         }
         fn real_disk_size(&self) -> std::io::Result<u64> {
-            Ok(self.0.len() as u64)
+            Ok(self.bytes.len() as u64)
         }
         fn try_clone_file(&self) -> std::io::Result<std::fs::File> {
             Err(std::io::Error::new(
@@ -2310,9 +2420,8 @@ pub mod testutil {
         // default.
         match open_with_backing_policy(
             path,
-            Box::new(VecBacking(buf)),
+            Box::new(VecBacking::new(buf, map_size)),
             page_size,
-            map_size,
             false,
             128,
             126,
@@ -2363,9 +2472,8 @@ mod tests {
     fn open(buf: Vec<u8>, prev: bool, path: PathBuf) -> Result<Env, Error> {
         open_with_backing(
             path,
-            Box::new(VecBacking(buf)),
+            Box::new(VecBacking::new(buf, MAP)),
             PS,
-            MAP,
             prev,
             128,
             126,
@@ -2488,7 +2596,7 @@ mod shared_meta_tests {
         let mut bytes = vec![0u8; ps * (2 + extra)];
         m0.encode_with_annex(&mut bytes[..ps], &[]).unwrap();
         m1.encode_with_annex(&mut bytes[ps..2 * ps], &[]).unwrap();
-        VecBacking(bytes)
+        VecBacking::new(bytes, 1 << 20)
     }
 
     #[test]
@@ -2514,7 +2622,7 @@ mod shared_meta_tests {
     #[test]
     fn torn_slot_reads_as_none() {
         let mut b = image(&meta(4, 2), &meta(5, 3), 2);
-        b.0[PS as usize + 100] ^= 0xFF; // corrupt slot 1 → CRC fails
+        b.bytes_mut()[PS as usize + 100] ^= 0xFF; // corrupt slot 1 → CRC fails
         assert!(read_snapshot_at(&b, PS, 5).unwrap().is_none());
     }
 
@@ -2575,7 +2683,7 @@ mod shared_env_tests {
     }
 
     fn backing(t0: u64, t1: u64) -> Box<dyn Backing> {
-        Box::new(VecBacking(image(t0, t1)))
+        Box::new(VecBacking::new(image(t0, t1), 1 << 20))
     }
 
     fn try_open(b: Box<dyn Backing>, region: Arc<dyn SharedRegion>) -> Result<Env, Error> {
@@ -2584,7 +2692,6 @@ mod shared_env_tests {
             dir,
             b,
             PS,
-            1 << 20,
             false,
             4,
             4,
@@ -2602,15 +2709,19 @@ mod shared_env_tests {
 
     /// A heap backing whose reported file length can change after open, to
     /// model a file another process grew or that is shorter than a meta
-    /// claims.
+    /// claims. Its logical map size is `map_size`.
     struct SizedBacking {
         bytes: Vec<u8>,
+        map_size: u64,
         real: Arc<AtomicU64>,
     }
 
     impl Backing for SizedBacking {
-        fn bytes(&self) -> &[u8] {
-            &self.bytes
+        fn view(&self) -> MapView<'_> {
+            MapView {
+                bytes: &self.bytes,
+                map_size: self.map_size,
+            }
         }
         fn real_disk_size(&self) -> std::io::Result<u64> {
             // Relaxed: a test knob set before the call under test, on the
@@ -2697,7 +2808,7 @@ mod shared_env_tests {
         let region = Arc::new(HeapRegion::new(4, 2, false));
         region.published_txnid().store(5, O::SeqCst);
         assert!(matches!(
-            try_open(Box::new(VecBacking(bytes)), region),
+            try_open(Box::new(VecBacking::new(bytes, 1 << 20)), region),
             Err(Error::Mdb(MdbError::Invalid))
         ));
     }
@@ -2710,7 +2821,7 @@ mod shared_env_tests {
         bytes[PS as usize + 100] ^= 0xFF;
         let region = Arc::new(HeapRegion::new(4, 2, false));
         region.published_txnid().store(4, O::SeqCst);
-        let env = open(Box::new(VecBacking(bytes)), region.clone());
+        let env = open(Box::new(VecBacking::new(bytes, 1 << 20)), region.clone());
         region.published_txnid().store(5, O::SeqCst);
         assert!(matches!(
             env.inner.pin_reader(),
@@ -2745,6 +2856,7 @@ mod shared_env_tests {
         let real = Arc::new(AtomicU64::new(256 * u64::from(PS)));
         let b = Box::new(SizedBacking {
             bytes: grown_image(256),
+            map_size: 256 * u64::from(PS),
             real: Arc::clone(&real),
         });
         let region = Arc::new(HeapRegion::new(4, 2, false));
@@ -2768,9 +2880,42 @@ mod shared_env_tests {
     #[test]
     fn refresh_rejects_a_snapshot_past_this_process_map() {
         // The file reaches page 200, but this process mapped only 4 pages: a
-        // process with a larger map_size grew it (ADR-0023 §5).
+        // process with a larger map_size grew it. ADR-0023 amendment 15 maps
+        // this case to `MapResized`, as LMDB does (`OBS_READ_BEGIN_SMALL_MAP`,
+        // `OBS_WRITE_BEGIN_SMALL_MAP`); before the observation it was
+        // `Invalid`.
         let b = Box::new(SizedBacking {
             bytes: grown_image(4),
+            map_size: 4 * u64::from(PS),
+            real: Arc::new(AtomicU64::new(256 * u64::from(PS))),
+        });
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(4, O::SeqCst);
+        let env = open(b, region.clone());
+        region.published_txnid().store(7, O::SeqCst);
+        assert!(matches!(
+            env.inner.pin_reader(),
+            Err(Error::Mdb(MdbError::MapResized))
+        ));
+        assert!(matches!(
+            env.inner.current_snapshot(),
+            Err(Error::Mdb(MdbError::MapResized))
+        ));
+        // The refused write begin releases the cross-process writer lock.
+        assert!(matches!(
+            env.write_txn(),
+            Err(Error::Mdb(MdbError::MapResized))
+        ));
+        assert!(!writer_held(&region));
+    }
+
+    #[test]
+    fn snapshot_past_the_mapped_bytes_inside_the_map_size_is_invalid() {
+        // A logical map size the mapping does not cover is a bug or
+        // corruption, never `MapResized` (ADR-0023 amendment 15).
+        let b = Box::new(SizedBacking {
+            bytes: grown_image(4),
+            map_size: 256 * u64::from(PS),
             real: Arc::new(AtomicU64::new(256 * u64::from(PS))),
         });
         let region = Arc::new(HeapRegion::new(4, 2, false));
@@ -2781,10 +2926,21 @@ mod shared_env_tests {
             env.inner.pin_reader(),
             Err(Error::Mdb(MdbError::Invalid))
         ));
+    }
+
+    #[test]
+    fn write_begin_checks_a_cached_base_against_the_map() {
+        // The writer's base is the cached snapshot (T is unchanged since
+        // open); it still must lie inside the logical map size. Here a
+        // 1-page map size models a view that no longer covers it.
+        let b = Box::new(VecBacking::new(image(4, 5), u64::from(PS)));
+        let region = Arc::new(HeapRegion::new(4, 2, true));
+        let env = open(b, region.clone());
         assert!(matches!(
-            env.inner.current_snapshot(),
-            Err(Error::Mdb(MdbError::Invalid))
+            env.write_txn(),
+            Err(Error::Mdb(MdbError::MapResized))
         ));
+        assert!(!writer_held(&region), "the refused begin releases the lock");
     }
 
     fn writer_held(region: &HeapRegion) -> bool {

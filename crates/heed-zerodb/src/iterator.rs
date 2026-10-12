@@ -786,7 +786,6 @@ mod erased_cursor_in_place_tests {
             PathBuf::from(format!("/virtual/heed-erased-{}-{tag}", std::process::id())),
             Box::new(backing),
             PS,
-            MAP,
             false,
             4,
             8,

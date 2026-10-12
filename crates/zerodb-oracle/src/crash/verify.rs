@@ -195,9 +195,8 @@ pub fn verify_image_full(mut img: Vec<u8>, c: &FullChecks<'_>) -> Result<FullOut
         // Obligation 1: a legally materialized post-commit image must open.
         let env = open_with_backing(
             path,
-            Box::new(VecBacking(img)),
+            Box::new(VecBacking::new(img, map_size)),
             psize,
-            map_size,
             false,
             16,
             126,
@@ -266,9 +265,8 @@ pub fn probe_image_adversarial(
     let result = catch_unwind(AssertUnwindSafe(move || {
         open_with_backing(
             path,
-            Box::new(VecBacking(img)),
+            Box::new(VecBacking::new(img, map_size)),
             psize,
-            map_size,
             false,
             16,
             126,

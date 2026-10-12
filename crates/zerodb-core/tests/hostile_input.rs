@@ -55,9 +55,8 @@ fn craft_image(
 fn open_image(buf: Vec<u8>, tag: &str) -> Result<Env, Error> {
     open_with_backing(
         unique_path(tag),
-        Box::new(VecBacking(buf)),
+        Box::new(VecBacking::new(buf, MAP)),
         PS,
-        MAP,
         false,
         8,
         8,
@@ -544,9 +543,8 @@ fn open_rejects_unbounded_max_readers_and_max_dbs() {
     let img = craft_image(2, |_| {}, &[]);
     let e = open_with_backing(
         unique_path("readers-max"),
-        Box::new(VecBacking(img.clone())),
+        Box::new(VecBacking::new(img.clone(), MAP)),
         PS,
-        MAP,
         false,
         8,
         u32::MAX,
@@ -560,9 +558,8 @@ fn open_rejects_unbounded_max_readers_and_max_dbs() {
 
     let e = open_with_backing(
         unique_path("dbs-max"),
-        Box::new(VecBacking(img)),
+        Box::new(VecBacking::new(img, MAP)),
         PS,
-        MAP,
         false,
         u32::MAX,
         8,
@@ -579,9 +576,8 @@ fn open_rejects_unbounded_max_readers_and_max_dbs() {
     let img2 = craft_image(2, |_| {}, &[]);
     assert!(open_with_backing(
         unique_path("readers-ok"),
-        Box::new(VecBacking(img2)),
+        Box::new(VecBacking::new(img2, MAP)),
         PS,
-        MAP,
         false,
         8,
         1024,

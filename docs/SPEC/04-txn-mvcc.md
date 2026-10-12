@@ -1011,6 +1011,7 @@ spilling bullet there.)
 | reader slots exhausted | `MdbError::ReadersFull` | TXN-16 |
 | second open of live path | `Error::EnvAlreadyOpened` | TXN-51 |
 | allocation exceeds map_size | `MdbError::MapFull` | SPEC 02 §8, SPEC 05 GC-17 |
+| txn begin: snapshot beyond this env's map_size (another process grew the data) | `MdbError::MapResized` | SPEC 02 §8, ADR-0023 amendment 15 |
 | nested write txn attempt | unsupported (D-003) | TXN-40 |
 | fsync failed (poisoned) | `Error::Io` / poisoned | SPEC 06 REC-13 |
 

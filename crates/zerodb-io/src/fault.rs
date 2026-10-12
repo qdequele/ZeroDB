@@ -64,7 +64,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use zerodb_core::env::Backing;
+use zerodb_core::env::{Backing, MapView};
 
 /// The tear granularity of REC-19/REC-20: one disk sector.
 pub const SECTOR: usize = 512;
@@ -368,8 +368,8 @@ impl FaultBacking {
 }
 
 impl Backing for FaultBacking {
-    fn bytes(&self) -> &[u8] {
-        self.inner.bytes()
+    fn view(&self) -> MapView<'_> {
+        self.inner.view()
     }
 
     fn real_disk_size(&self) -> std::io::Result<u64> {
@@ -863,8 +863,11 @@ mod tests {
     struct NullInner;
 
     impl Backing for NullInner {
-        fn bytes(&self) -> &[u8] {
-            &[]
+        fn view(&self) -> MapView<'_> {
+            MapView {
+                bytes: &[],
+                map_size: 0,
+            }
         }
         fn real_disk_size(&self) -> std::io::Result<u64> {
             Ok(0)

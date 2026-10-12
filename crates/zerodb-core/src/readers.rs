@@ -782,6 +782,7 @@ mod tests {
         Arc::new(Snapshot {
             txnid,
             last_pg: 1,
+            map_size: 1 << 20,
             main_db: DBRecord::empty(),
             free_db: DBRecord::empty(),
             free_annex: Arc::from(&[][..]),
@@ -1250,6 +1251,7 @@ mod loom_tests {
         Arc::new(Snapshot {
             txnid,
             last_pg: 1,
+            map_size: 1 << 20,
             main_db: DBRecord::empty(),
             free_db: DBRecord::empty(),
             free_annex: Arc::from(&[][..]),

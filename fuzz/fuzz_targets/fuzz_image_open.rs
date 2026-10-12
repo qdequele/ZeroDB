@@ -43,9 +43,8 @@ fn exercise(img: Vec<u8>) {
     let map_size = img.len() as u64;
     let opened: Result<Env, _> = open_with_backing(
         path,
-        Box::new(VecBacking(img)),
+        Box::new(VecBacking::new(img, map_size)),
         PS,
-        map_size,
         false,
         4,
         4,

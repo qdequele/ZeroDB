@@ -3,7 +3,8 @@
 //! commits through: positioned `pwrite` + `sync_data`).
 //!
 //! This crate is one of the two sanctioned homes for mmap `unsafe` (the
-//! repo's unsafe policy). The `unsafe` blocks live in [`mmap`], the single `pwritev`
+//! repo's unsafe policy). The `unsafe` blocks live in [`mmap`] (the maps and
+//! the grow-only `MapRegions` cell, ADR-0023 amendment 15), the single `pwritev`
 //! call in [`file`] (the vectored commit write), the test-only in-memory
 //! map stand-in (`testmap`, ADR-0021 M1, behind the `test-backing` feature), and
 //! the shared-memory primitives in [`lockfile`] (atomic views over the lock
@@ -31,23 +32,36 @@ pub use file::{
 };
 pub use mmap::{Mmap, MmapWritable};
 
-use zerodb_core::env::Backing;
+use mmap::{MapRegions, Mapping};
+use zerodb_core::env::{Backing, MapView};
 use zerodb_core::error::{Error, MdbError};
+use zerodb_core::page::geometry::MAX_MAP_SIZE;
 use zerodb_core::page::{MetaPage, MetaValidity};
+
+/// The current view of `regions` as the engine's [`MapView`].
+fn map_view(regions: &MapRegions) -> MapView<'_> {
+    let (mapping, map_size) = regions.view();
+    MapView {
+        bytes: mapping.bytes(),
+        map_size,
+    }
+}
 
 /// A [`Backing`] over a memory-mapped env data file.
 ///
-/// Field order is load-bearing for `Drop`: `mmap` is declared **before** `file`
-/// so the map is unmapped before the descriptor is closed (SPEC 04 TXN-53 — "the
-/// mmap is unmapped before the file is closed").
+/// It reads through grow-only `MapRegions` (ADR-0023 amendment 15) holding
+/// read-only maps. Field order is load-bearing for `Drop`: `regions` is
+/// declared **before** `file` so every mapping is unmapped before the
+/// descriptor is closed (SPEC 04 TXN-53 — "the mmap is unmapped before the
+/// file is closed").
 pub struct MmapBacking {
-    mmap: Mmap,
+    regions: MapRegions,
     file: File,
 }
 
 impl Backing for MmapBacking {
-    fn bytes(&self) -> &[u8] {
-        self.mmap.bytes()
+    fn view(&self) -> MapView<'_> {
+        map_view(&self.regions)
     }
 
     fn real_disk_size(&self) -> std::io::Result<u64> {
@@ -92,14 +106,6 @@ impl Backing for MmapBacking {
     }
 }
 
-impl MmapBacking {
-    /// Access the mapped bytes (used by the engine core through [`Backing`]).
-    #[must_use]
-    pub fn map(&self) -> &Mmap {
-        &self.mmap
-    }
-}
-
 /// A [`Backing`] over a **writable** memory-mapped env data file
 /// (`EnvFlags::WRITE_MAP`, SPEC 01 §S7, SPEC 04 §6.4).
 ///
@@ -119,14 +125,28 @@ impl MmapBacking {
 /// realization (TXN-45a) remains the behavior of every backing that does not
 /// broker slices (the default mode, the miri test backing, the
 /// fault-injection backend).
+///
+/// Its `MapRegions` hold only writable maps; writes go through the current
+/// one. Field order is load-bearing for `Drop` (`regions` before `file`).
 pub struct WriteMapBacking {
-    mmap: MmapWritable,
+    regions: MapRegions,
     file: File,
 }
 
+impl WriteMapBacking {
+    /// The current writable map.
+    fn map(&self) -> &MmapWritable {
+        match self.regions.view().0 {
+            Mapping::Write(m) => m,
+            // Construction publishes only writable maps into these regions.
+            _ => unreachable!("a WriteMapBacking holds only writable maps"),
+        }
+    }
+}
+
 impl Backing for WriteMapBacking {
-    fn bytes(&self) -> &[u8] {
-        self.mmap.bytes()
+    fn view(&self) -> MapView<'_> {
+        map_view(&self.regions)
     }
 
     fn real_disk_size(&self) -> std::io::Result<u64> {
@@ -166,16 +186,17 @@ impl Backing for WriteMapBacking {
                 "page write overflows usize",
             )
         })?;
-        if end > self.mmap.bytes().len() {
+        let map = self.map();
+        if end > map.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "page write [{off}, {end}) outside the writable map ({} bytes)",
-                    self.mmap.bytes().len()
+                    map.len()
                 ),
             ));
         }
-        self.mmap.write_at(off, data);
+        map.write_at(off, data);
         Ok(())
     }
 
@@ -198,13 +219,14 @@ impl Backing for WriteMapBacking {
         let off = (pgno as usize).checked_mul(ps)?;
         let len = (pages as usize).checked_mul(ps)?;
         let end = off.checked_add(len)?;
-        if len == 0 || end > self.mmap.len() {
+        let map = self.map();
+        if len == 0 || end > map.len() {
             return None;
         }
         // SAFETY: the caller of this `unsafe fn` discharges `slice_mut`'s
         // brokered contract (single writer, TXN-62 region, one live `&mut`,
         // read views re-derived per spill) — forwarded verbatim.
-        Some(unsafe { self.mmap.slice_mut(off, len) })
+        Some(unsafe { map.slice_mut(off, len) })
     }
 
     fn sync_data(&self) -> std::io::Result<()> {
@@ -217,19 +239,11 @@ impl Backing for WriteMapBacking {
         // not a full barrier, so a synchronous flush additionally `fdatasync`s
         // the data fd (SPEC 01 §S7); an async flush deliberately does neither
         // (relaxed durability, REC-9).
-        self.mmap.flush(async_flush)?;
+        self.map().flush(async_flush)?;
         if !async_flush {
             self.file.sync_data()?;
         }
         Ok(())
-    }
-}
-
-impl WriteMapBacking {
-    /// Access the writable map (used by the engine core through [`Backing`]).
-    #[must_use]
-    pub fn map(&self) -> &MmapWritable {
-        &self.mmap
     }
 }
 
@@ -242,7 +256,8 @@ pub struct Opened {
     /// The DB page size (from the file, or the requested size for a new env).
     pub page_size: u32,
     /// The effective runtime map size (the requested size, else the persisted
-    /// one; SPEC 02 §8).
+    /// one; SPEC 02 §8), raised to `(last_pg + 1) * page_size` when smaller
+    /// (ADR-0023 amendment 15). The backing's view carries the same size.
     pub map_size: u64,
     /// Whether the file was created by this call.
     pub created: bool,
@@ -259,12 +274,18 @@ pub struct Opened {
 ///   `default_map_size` if neither slot is decodable (the file is then invalid
 ///   and the core will reject it).
 ///
+/// The effective map size is raised to `(last_pg + 1) * page_size` of the
+/// newest valid meta when it is smaller, as LMDB does
+/// (`OBS_OPEN_BELOW_LAST_PG = "minsize"`, ADR-0023 amendment 15).
+///
 /// This function performs all filesystem I/O for open; the engine core
 /// ([`zerodb_core::env::open_with_backing`]) does the I/O-free selection.
 ///
 /// # Errors
 ///
-/// Propagates I/O errors as [`Error::Io`].
+/// Propagates I/O errors as [`Error::Io`]. A requested map size above
+/// [`MAX_MAP_SIZE`] is `Io(InvalidInput)` and a persisted one is
+/// [`MdbError::Invalid`], both before any file is created, grown or mapped.
 pub fn open_or_create(
     data_path: &Path,
     requested_page_size: u32,
@@ -306,6 +327,17 @@ pub fn open_or_create_with_advice(
     // `WRITEMAP|RDONLY` env read-only. So the writable path is taken only when
     // `write_map && !read_only`.
     let write_map = write_map && !read_only;
+
+    // ADR-0023 amendment 15, decision 6: refuse a map above the cap before
+    // any file is created, grown or mapped.
+    if let Some(requested) = requested_map_size {
+        if requested > MAX_MAP_SIZE {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("map_size ({requested}) exceeds the supported maximum {MAX_MAP_SIZE}"),
+            )));
+        }
+    }
 
     let exists_nonempty = match std::fs::metadata(data_path) {
         Ok(m) => m.len() > 0,
@@ -354,8 +386,29 @@ pub fn open_or_create_with_advice(
     // Probe the persisted map size from a small head read before mapping, so
     // the mapping can cover the full effective map_size (ADR-0004 D4).
     let head = file::read_head(&file, file_len.min(2 * page_size as usize))?;
-    let persisted = persisted_map_size(&head, page_size);
-    let map_size = requested_map_size.or(persisted).unwrap_or(default_map_size);
+    let newest = newest_meta_geometry(&head, page_size);
+    if let Some((persisted, _)) = newest {
+        // A persisted size above the cap is corrupt (ADR-0023 amendment 15).
+        if persisted > MAX_MAP_SIZE {
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
+    }
+    let mut map_size = requested_map_size
+        .or(newest.map(|(m, _)| m))
+        .unwrap_or(default_map_size);
+    // A map below the newest commit's data rounds up to exactly
+    // `(last_pg + 1) * page_size`, as LMDB does (`OBS_OPEN_BELOW_LAST_PG =
+    // "minsize"`). Only within the file: a meta naming pages past the file
+    // end is corrupt, and the engine core rejects it (SPEC 06 REC-1a) —
+    // never grow a map, or under WRITE_MAP the file, for it.
+    if let Some((_, last_pg)) = newest {
+        let min = last_pg
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(u64::from(page_size)));
+        if let Some(min) = min.filter(|&m| m <= file_len as u64) {
+            map_size = map_size.max(min);
+        }
+    }
     let backing = map_backing(file, map_size, write_map, random_access)?;
 
     Ok(Opened {
@@ -368,9 +421,11 @@ pub fn open_or_create_with_advice(
 
 /// Map `file` at the effective `map_size` and box it as a [`Backing`]: the
 /// read-only [`MmapBacking`] (default) or the writable [`WriteMapBacking`]
-/// (`WRITE_MAP`). ADR-0004 D4: the map covers the full `map_size` once, no
-/// remap. Under `WRITE_MAP` the file is first `set_len(map_size)` so every
-/// mapped page is backed (SPEC 04 §6.4 — no `SIGBUS` on a store past EOF).
+/// (`WRITE_MAP`). The mapping covers `max(file length, map_size)` and is
+/// published as view 0 of the backing's grow-only regions, with `map_size` as
+/// the logical size (ADR-0023 amendment 15). Under `WRITE_MAP` the file is
+/// first `set_len(map_size)` so every mapped page is backed (SPEC 04 §6.4 — no
+/// `SIGBUS` on a store past EOF).
 fn map_backing(
     file: File,
     map_size: u64,
@@ -389,21 +444,24 @@ fn map_backing(
         if random_access {
             mmap.advise_random()?;
         }
-        Ok(Box::new(WriteMapBacking { mmap, file }))
+        let regions = MapRegions::new(Mapping::Write(mmap), map_size);
+        Ok(Box::new(WriteMapBacking { regions, file }))
     } else {
         let mmap = Mmap::map(&file, want)?;
         if random_access {
             mmap.advise_random()?;
         }
-        Ok(Box::new(MmapBacking { mmap, file }))
+        let regions = MapRegions::new(Mapping::Read(mmap), map_size);
+        Ok(Box::new(MmapBacking { regions, file }))
     }
 }
 
-/// The persisted `map_size` from whichever meta slot validates (prefer the
-/// higher-txnid valid slot), or `None` if neither decodes.
-fn persisted_map_size(bytes: &[u8], page_size: u32) -> Option<u64> {
+/// The persisted `(map_size, last_pg)` of the newest valid meta slot (the
+/// higher-txnid one), or `None` if neither decodes. This is the meta LMDB
+/// reads its open-time map size and minimum from.
+fn newest_meta_geometry(bytes: &[u8], page_size: u32) -> Option<(u64, u64)> {
     let ps = page_size as usize;
-    let mut best: Option<(u64, u64)> = None; // (txnid, map_size)
+    let mut best: Option<(u64, u64, u64)> = None; // (txnid, map_size, last_pg)
     for slot in [0usize, 1] {
         let base = slot * ps;
         let end = base.checked_add(ps)?;
@@ -412,10 +470,65 @@ fn persisted_map_size(bytes: &[u8], page_size: u32) -> Option<u64> {
         }
         if let Ok(MetaValidity::Valid(m)) = MetaPage::validate(&bytes[base..end], page_size) {
             match best {
-                Some((t, _)) if t >= m.txnid => {}
-                _ => best = Some((m.txnid, m.map_size)),
+                Some((t, _, _)) if t >= m.txnid => {}
+                _ => best = Some((m.txnid, m.map_size, m.last_pg)),
             }
         }
     }
-    best.map(|(_, ms)| ms)
+    best.map(|(_, ms, lp)| (ms, lp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{open_or_create, MAX_MAP_SIZE};
+    use zerodb_core::error::{Error, MdbError};
+
+    /// A fresh path in the temp dir, removed on drop.
+    struct TempFile(std::path::PathBuf);
+
+    impl TempFile {
+        fn new(tag: &str) -> TempFile {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let name = format!("zerodb-io-{tag}-{}-{nanos}", std::process::id());
+            TempFile(std::env::temp_dir().join(name))
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A persisted meta `map_size` above `MAX_MAP_SIZE` is corrupt: the open
+    /// fails with `Invalid` before mapping it, whatever size is requested
+    /// (ADR-0023 amendment 15, decision 6).
+    #[test]
+    fn persisted_map_size_above_the_cap_is_invalid() {
+        let path = TempFile::new("cap");
+        drop(super::create_env_file(&path.0, 4096, MAX_MAP_SIZE + 4096).expect("create"));
+        for requested in [None, Some(1 << 20)] {
+            match open_or_create(&path.0, 4096, requested, 1 << 20, false, false) {
+                Err(Error::Mdb(MdbError::Invalid)) => {}
+                Err(e) => panic!("requested {requested:?}: expected Invalid, got {e:?}"),
+                Ok(_) => panic!("requested {requested:?}: expected Invalid, got an env"),
+            }
+        }
+    }
+
+    /// A requested `map_size` above the cap is refused before the data file
+    /// is created.
+    #[test]
+    fn requested_map_size_above_the_cap_creates_nothing() {
+        let path = TempFile::new("cap-req");
+        match open_or_create(&path.0, 4096, Some(MAX_MAP_SIZE + 1), 1 << 20, false, false) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+            Err(e) => panic!("expected Io(InvalidInput), got {e:?}"),
+            Ok(_) => panic!("expected Io(InvalidInput), got an env"),
+        }
+        assert!(!path.0.exists());
+    }
 }

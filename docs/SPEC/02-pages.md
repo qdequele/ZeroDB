@@ -696,7 +696,25 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
   larger `map_size` after a `MapFull` (SPEC 00 rows 3, 55).
   - **Runtime `map_size` selection (M1.2).** At open the effective `map_size` is
     the caller's `EnvOpenOptions::map_size` when set, else the persisted
-    `meta.map_size`.
+    `meta.map_size`. It is then raised to `(last_pg + 1) · psize` of the newest
+    valid meta when smaller, as LMDB does (ADR-0023 amendment 15;
+    `OBS_OPEN_BELOW_LAST_PG = "minsize"`). A size that is smaller but still
+    holds the data is kept (`OBS_OPEN_SMALLER_THAN_META`).
+  - **Map size cap (ADR-0023 amendment 15, decision 6).** `MAX_MAP_SIZE` is
+    2^47 bytes. Before any file is created, grown or mapped, a requested
+    `map_size` above it fails the open with `Io(InvalidInput)` and a persisted
+    one above it with `MdbError::Invalid` (the meta is corrupt).
+  - **Persisted `map_size` on commit (ADR-0023 amendment 15).** A commit writes
+    `max(base snapshot's meta map_size, the committing env's map_size)`: a
+    process with a smaller map never lowers the recorded size
+    (`OBS_COMMIT_PERSISTS_OWN_MAPSIZE = false`).
+  - **Logical size and `MapResized` (ADR-0023 amendment 15).** The runtime
+    `map_size` lives with the mapping in one published view (one `Acquire`
+    load gives a consistent pair). A txn begin whose snapshot needs
+    `(last_pg + 1) · psize` bytes beyond it fails with `MdbError::MapResized`
+    (another process with a larger map committed past this one); a larger
+    `meta.map_size` alone does not. Beyond the mapped bytes but within the
+    logical size, or beyond the file, is `MdbError::Invalid`.
   - **Mapping strategy (amended M1.4, ADR-0004 D4/OQ2 — approved).** The read
     mmap covers `max(map_size, file length)` from open, so the base address is
     fixed for the env's life and **no remap ever happens in Phase 1** (file

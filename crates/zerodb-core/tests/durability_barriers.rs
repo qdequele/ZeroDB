@@ -16,7 +16,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use zerodb_core::env::{open_with_backing, Backing, DurabilityFlags};
+use zerodb_core::env::{open_with_backing, Backing, DurabilityFlags, MapView};
 use zerodb_core::page::MetaPage;
 
 const PS: u32 = 4096;
@@ -46,8 +46,11 @@ struct CountingBacking {
 }
 
 impl Backing for CountingBacking {
-    fn bytes(&self) -> &[u8] {
-        &self.data
+    fn view(&self) -> MapView<'_> {
+        MapView {
+            bytes: &self.data,
+            map_size: self.data.len() as u64,
+        }
     }
     fn real_disk_size(&self) -> std::io::Result<u64> {
         Ok(self.data.len() as u64)
@@ -84,8 +87,8 @@ fn commit_and_record(durability: DurabilityFlags) -> Vec<bool> {
         std::process::id(),
         durability
     ));
-    let env = open_with_backing(path, Box::new(backing), PS, MAP, false, 8, 16, durability)
-        .expect("open");
+    let env =
+        open_with_backing(path, Box::new(backing), PS, false, 8, 16, durability).expect("open");
     let mut w = env.write_txn().expect("write txn");
     let db = env.create_database(&mut w, None).expect("main db");
     db.put(&mut w, b"k", b"v").expect("put");

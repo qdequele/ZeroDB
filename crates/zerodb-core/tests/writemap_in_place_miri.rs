@@ -43,7 +43,6 @@ fn wm_env(dirty_limit: Option<u64>) -> Env {
         path,
         Box::new(backing),
         PS,
-        MAP,
         false,
         8,
         16,

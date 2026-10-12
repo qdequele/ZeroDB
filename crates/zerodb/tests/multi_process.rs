@@ -7,7 +7,7 @@ use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use zerodb::{Env, EnvOpenOptions};
+use zerodb::{Env, EnvOpenOptions, Error, MdbError};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -41,10 +41,18 @@ impl Drop for TempDir {
 
 const ROLE: &str = "ZERODB_MP_ROLE";
 const DIR: &str = "ZERODB_MP_DIR";
+/// Optional map size for the child, in bytes (default 64 MiB).
+const MAP: &str = "ZERODB_MP_MAP";
+
+const MIB: usize = 1 << 20;
 
 fn open(dir: &Path) -> Env {
+    open_sized(dir, 64 * MIB)
+}
+
+fn open_sized(dir: &Path, map_size: usize) -> Env {
     let mut o = EnvOpenOptions::new();
-    o.map_size(64 << 20)
+    o.map_size(map_size)
         .page_size(4096)
         .max_readers(16)
         .lock_file(true);
@@ -88,6 +96,33 @@ fn child(role: &str, dir: &Path) -> ChildGuard {
     ChildGuard(c)
 }
 
+/// [`child`], with the child opening the environment at `map_size` bytes.
+fn child_sized(role: &str, dir: &Path, map_size: usize) -> ChildGuard {
+    let c = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "child_entry", "--nocapture", "--test-threads=1"])
+        .env(ROLE, role)
+        .env(DIR, dir)
+        .env(MAP, map_size.to_string())
+        .spawn()
+        .expect("spawn child");
+    ChildGuard(c)
+}
+
+/// Wait for `c` to exit and assert it succeeded, failing the test after
+/// `deadline` instead of hanging (for example on a writer lock never
+/// released).
+fn wait_success(c: &mut ChildGuard, deadline: Duration) {
+    let end = Instant::now() + deadline;
+    loop {
+        if let Some(st) = c.try_wait().unwrap() {
+            assert!(st.success(), "child failed: {st}");
+            return;
+        }
+        assert!(Instant::now() < end, "timed out waiting for the child");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn wait_for(path: &Path, deadline: Duration) {
     let end = Instant::now() + deadline;
     while !path.exists() {
@@ -111,9 +146,29 @@ fn child_entry() {
         return;
     };
     let dir = PathBuf::from(dir);
-    let env = open(&dir);
+    let env = match std::env::var(MAP) {
+        Ok(m) => open_sized(&dir, m.parse().expect("map size")),
+        Err(_) => open(&dir),
+    };
     let db = env.main_database();
     match role.as_str() {
+        "write_4mib" => {
+            // About 4 MiB of one-page overflow values, so the file's last page
+            // lies far past a 1 MiB map.
+            let value = vec![7u8; 4000];
+            for batch in 0..8u32 {
+                let mut w = env.write_txn().unwrap();
+                for i in 0..128u32 {
+                    db.put(&mut w, format!("big{batch:02}{i:04}").as_bytes(), &value)
+                        .unwrap();
+                }
+                w.commit().unwrap();
+            }
+            assert!(
+                (env.info().last_pgno + 1) * 4096 >= 4 * MIB as u64,
+                "the child wrote less than 4 MiB"
+            );
+        }
         "write_one" => {
             let mut w = env.write_txn().unwrap();
             db.put(&mut w, b"from-child", b"1").unwrap();
@@ -551,4 +606,76 @@ fn writer_takeover_reaps_a_dead_readers_slot() {
         !env.reader_list().iter().any(|e| e.pid == Some(reader_pid)),
         "the takeover did not reap the dead reader"
     );
+}
+
+/// A process whose map is smaller than the data another process committed
+/// gets `MapResized` at both begins (ADR-0023 amendment 15;
+/// `OBS_READ_BEGIN_SMALL_MAP`, `OBS_WRITE_BEGIN_SMALL_MAP`). The failed write
+/// begin releases both writer locks: another process can still write.
+#[test]
+fn small_map_process_gets_map_resized_after_a_bigger_process_grows_the_file() {
+    let dir = TempDir::new();
+    let env = open_sized(dir.path(), MIB);
+    wait_success(
+        &mut child_sized("write_4mib", dir.path(), 8 * MIB),
+        Duration::from_secs(60),
+    );
+    match env.read_txn() {
+        Err(Error::Mdb(MdbError::MapResized)) => {}
+        other => panic!("read begin: expected MapResized, got {:?}", other.err()),
+    }
+    match env.write_txn() {
+        Err(Error::Mdb(MdbError::MapResized)) => {}
+        other => panic!("write begin: expected MapResized, got {:?}", other.err()),
+    }
+    // The refused write begin released the cross-process writer lock.
+    wait_success(
+        &mut child_sized("write_one", dir.path(), 8 * MIB),
+        Duration::from_secs(30),
+    );
+}
+
+/// A larger map size in the meta alone does not fail a begin: the other
+/// process's commit still fits this map (`OBS_BIGGER_META_MAPSIZE_ALONE_RESIZES`
+/// = false).
+#[test]
+fn bigger_meta_size_alone_does_not_trigger_map_resized() {
+    let dir = TempDir::new();
+    let env = open_sized(dir.path(), MIB);
+    wait_success(
+        &mut child_sized("write_one", dir.path(), 8 * MIB),
+        Duration::from_secs(60),
+    );
+    let db = env.main_database();
+    let r = env.read_txn().expect("read begin");
+    assert_eq!(db.get(&r, b"from-child").unwrap(), Some(&b"1"[..]));
+    drop(r);
+    let mut w = env.write_txn().expect("write begin");
+    db.put(&mut w, b"from-parent", b"1").unwrap();
+    w.commit().unwrap();
+}
+
+/// A process with a smaller map commits on top of a meta recording a larger
+/// map size: the meta keeps the larger size (`OBS_COMMIT_PERSISTS_OWN_MAPSIZE`
+/// = false).
+#[test]
+fn smaller_map_process_commit_keeps_the_larger_meta_size() {
+    let dir = TempDir::new();
+    {
+        let env = open_sized(dir.path(), MIB);
+        wait_success(
+            &mut child_sized("write_one", dir.path(), 8 * MIB),
+            Duration::from_secs(60),
+        );
+        let mut w = env.write_txn().unwrap();
+        env.main_database()
+            .put(&mut w, b"from-parent", b"1")
+            .unwrap();
+        w.commit().unwrap();
+    }
+    // Reopen without a map size: the environment adopts the persisted one.
+    let mut o = EnvOpenOptions::new();
+    o.page_size(4096).max_readers(16).lock_file(true);
+    let env = o.open(dir.path()).unwrap();
+    assert_eq!(env.info().map_size, 8 * MIB as u64);
 }

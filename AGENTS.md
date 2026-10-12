@@ -58,7 +58,11 @@ trusted-file mode) so the default stays a faithful drop-in.
 
 `unsafe` is allowed only in:
 
-- mmap access and page casting (`zerodb-core::page`, `zerodb-io`);
+- mmap access and page casting (`zerodb-core::page`, `zerodb-io`),
+  including the grow-only mapping cell (`zerodb-io::mmap::MapRegions`): an
+  `AtomicPtr` to views and mappings freed only on drop — the view and mapping
+  dereferences, the `Box::from_raw` calls in its `Drop` — with its
+  `Send`/`Sync` impls (ADR-0023 amendment 15);
 - shared-memory synchronization primitives in `zerodb-io::lockfile`
   (ADR-0023): atomic views over the mapped lock file
   (`AtomicU64::from_ptr` / `AtomicU32::from_ptr`, and one

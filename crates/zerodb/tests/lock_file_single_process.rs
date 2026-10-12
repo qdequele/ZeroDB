@@ -221,3 +221,116 @@ fn out_of_range_limits_are_rejected_before_the_lock_file_exists() {
         );
     }
 }
+
+const MIB: usize = 1 << 20;
+
+fn opts_with(lock_file: bool, map_size: Option<usize>) -> EnvOpenOptions {
+    let mut o = EnvOpenOptions::new();
+    o.page_size(4096).lock_file(lock_file);
+    if let Some(m) = map_size {
+        o.map_size(m);
+    }
+    o
+}
+
+/// Opening with a map smaller than the committed data rounds the map up to
+/// exactly `(last_pg + 1) * page_size`, as LMDB does
+/// (`OBS_OPEN_BELOW_LAST_PG = "minsize"`, ADR-0023 amendment 15).
+#[test]
+fn open_below_last_pg_rounds_up_to_the_minimum() {
+    for lock_file in [false, true] {
+        let dir = TempDir::new();
+        {
+            let env = opts_with(lock_file, Some(8 * MIB))
+                .open(dir.path())
+                .unwrap();
+            let db = env.main_database();
+            let value = vec![3u8; 4000];
+            let mut w = env.write_txn().unwrap();
+            for i in 0..400u32 {
+                db.put(&mut w, format!("k{i:04}").as_bytes(), &value)
+                    .unwrap();
+            }
+            w.commit().unwrap();
+            assert!(
+                (env.info().last_pgno + 1) * 4096 > MIB as u64,
+                "setup: the data is past 1 MiB"
+            );
+        }
+        let env = opts_with(lock_file, Some(MIB)).open(dir.path()).unwrap();
+        let info = env.info();
+        assert_eq!(
+            info.map_size,
+            (info.last_pgno + 1) * 4096,
+            "lock_file {lock_file}: the map rounds up to the minimum"
+        );
+        let r = env.read_txn().unwrap();
+        let db = env.main_database();
+        for i in [0u32, 199, 399] {
+            assert_eq!(
+                db.get(&r, format!("k{i:04}").as_bytes())
+                    .unwrap()
+                    .map(<[u8]>::len),
+                Some(4000),
+                "lock_file {lock_file}: key {i}"
+            );
+        }
+    }
+}
+
+/// A requested map size above `MAX_MAP_SIZE` is refused with
+/// `Io(InvalidInput)` before the data file is created (ADR-0023 amendment 15,
+/// decision 6).
+#[test]
+fn open_rejects_a_map_size_above_the_cap() {
+    for lock_file in [false, true] {
+        let dir = TempDir::new();
+        let size = usize::try_from(zerodb::MAX_MAP_SIZE + 4096).unwrap();
+        match opts_with(lock_file, Some(size)).open(dir.path()) {
+            Err(Error::Io(e)) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "lock_file {lock_file}"
+            ),
+            other => panic!(
+                "lock_file {lock_file}: expected Io(InvalidInput), got {:?}",
+                other.err()
+            ),
+        }
+        assert!(
+            !dir.path().join(zerodb::DATA_FILE_NAME).exists(),
+            "lock_file {lock_file}: the data file was created"
+        );
+    }
+}
+
+/// A commit never lowers the persisted map size: an environment opened with a
+/// smaller map than the meta records keeps the meta's larger size
+/// (`OBS_COMMIT_PERSISTS_OWN_MAPSIZE` = false).
+#[test]
+fn smaller_map_commit_keeps_the_larger_meta_size_in_one_process() {
+    for lock_file in [false, true] {
+        let dir = TempDir::new();
+        {
+            let env = opts_with(lock_file, Some(8 * MIB))
+                .open(dir.path())
+                .unwrap();
+            let mut w = env.write_txn().unwrap();
+            env.main_database().put(&mut w, b"a", b"1").unwrap();
+            w.commit().unwrap();
+        }
+        {
+            let env = opts_with(lock_file, Some(MIB)).open(dir.path()).unwrap();
+            assert_eq!(env.info().map_size, MIB as u64, "the data fits 1 MiB");
+            let mut w = env.write_txn().unwrap();
+            env.main_database().put(&mut w, b"b", b"2").unwrap();
+            w.commit().unwrap();
+        }
+        let env = opts_with(lock_file, None).open(dir.path()).unwrap();
+        assert_eq!(
+            env.info().map_size,
+            8 * MIB as u64,
+            "lock_file {lock_file}: the meta keeps 8 MiB"
+        );
+    }
+}
