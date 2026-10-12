@@ -190,7 +190,11 @@ pub fn cmd_load(dump_path: &Path, env_dir: &Path, psize: u32, map_size: u64) -> 
     drop(named_owned);
     drop(main_user);
 
-    // Verify the produced env is structurally clean before returning.
+    // Verify the produced env is structurally clean before returning. Unlike
+    // the old `check_image` over the file, this does not re-verify the meta
+    // slots or the file length: the engine wrote and validated those itself
+    // (each commit writes a checksummed meta; this read txn's open accepted
+    // it), and the walk covers every page the committed snapshot references.
     let txn = read_txn(&env)?;
     let violations = check_snapshot(txn.map_bytes(), env.page_size(), txn.snapshot());
     if !violations.is_empty() {
@@ -344,7 +348,8 @@ pub fn refuse_existing_env(env_dir: &Path, verb: &str) -> Result<(), BoxErr> {
 }
 
 /// Sort by key and drop duplicate keys so the write txns see
-/// strictly-ascending, unique input (the case sequential writes serve best). A valid dump is already sorted and unique
+/// strictly-ascending, unique input (the case sequential writes serve
+/// best). A valid dump is already sorted and unique
 /// (this is purely defensive against a hand-edited dump); on a duplicate key the
 /// first occurrence is kept.
 fn normalize(entries: &mut Vec<crate::common::Kv>) {
@@ -404,7 +409,7 @@ fn check_raw_exclusively(
     let opts = crate::common::tool_open_options(env_dir, data.name)?;
     let (_guard, note) = match zerodb::ExclusiveLock::acquire(env_dir, &opts) {
         Ok(guard) => (Some(guard), None),
-        Err(zerodb::Error::Io(e)) if e.raw_os_error() == Some(libc::EROFS) => (
+        Err(zerodb::Error::Io(e)) if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem => (
             None,
             Some(
                 "  note: read-only media, so no lock file: walked the raw file offline, \

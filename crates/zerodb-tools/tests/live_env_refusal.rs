@@ -202,6 +202,24 @@ fn tools_attach_to_a_live_env_in_another_process() {
     );
     let (report, clean) = zerodb_tools::commands::cmd_check(&dir).expect("check attaches");
     assert!(clean, "check report: {report}");
+    // The attached walk's header, not the raw-file fallback's.
+    assert!(report.contains("txnid="), "check report: {report}");
+
+    // The tools' own open joins the child's environment through the lock
+    // file: only a lock-file joiner did not open it exclusively.
+    {
+        let env = zerodb_tools::common::open_ro(&dir, HEED_DATA_FILE_NAME).expect("attach");
+        assert!(
+            !env.opened_exclusively(),
+            "the tools' open did not join the live env through its lock file"
+        );
+        assert_eq!(env.info().max_readers, CHILD_MAX_READERS);
+        let r = zerodb_tools::common::read_txn(&env).unwrap();
+        assert_eq!(
+            env.main_database().get(&r, b"live").unwrap(),
+            Some(&b"committed"[..])
+        );
+    }
 
     let expected: BTreeSet<String> = [HEED_DATA_FILE_NAME, "lock.mdb"]
         .iter()

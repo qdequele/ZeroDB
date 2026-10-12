@@ -21,9 +21,12 @@ probe **both** names and use the lock file named after the one found
 (`zerodb.lock` or `lock.mdb`), the same one the processes using the env open;
 a directory holding both data files is a hard error rather than a silent
 pick, and `stat` prints an engine-identification line read from the file's own
-`ZDB1` magic. A tool joining a running env adopts the `max_readers` its lock
-file records; one that opens a closed env sizes the lock file with the default
-(126), and while it runs a process opening the env with another `max_readers`
+`ZDB1` magic. A tool opens with the `max_readers` its env's lock file
+records, whether a process has the env open or an earlier run left the lock
+file finished. It falls back to the default (126) only when the lock file
+records none: no lock file yet, or one left with the initializing magic by an
+opener that never finished. While a tool runs, a process opening the env with
+another `max_readers` (for example, a consumer that changed it between runs)
 is refused, as two processes with different values always are.
 
 ```

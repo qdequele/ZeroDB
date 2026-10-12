@@ -278,7 +278,13 @@ pub fn published_max_readers(path: &Path) -> Result<Option<u32>, LockOpenError> 
     if read_u64_at(&file, OFF_MAGIC)? != LOCK_MAGIC {
         return Ok(None);
     }
-    Ok(Some(read_u32_at(&file, OFF_MAX_READERS)?))
+    match read_u32_at(&file, OFF_MAX_READERS) {
+        Ok(n) => Ok(Some(n)),
+        // A new initializer truncated the file between the two reads (every
+        // process had closed the environment): the value is unknown again.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// The mapped lock file. Field order matters for `Drop`: the map is
