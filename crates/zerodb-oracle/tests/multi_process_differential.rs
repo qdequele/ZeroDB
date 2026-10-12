@@ -456,11 +456,31 @@ fn run_child(role: &str, dir: &Path) {
     }
 }
 
+/// Wait for an already-spawned child to exit successfully (30 s deadline),
+/// for a role that exits on its own once told to (unlike [`run_child`],
+/// which spawns too, and unlike [`kill_child`], which SIGKILLs).
+fn wait_exit(c: &mut ChildGuard, role: &str) {
+    let end = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(st) = c.0.try_wait().unwrap() {
+            assert!(st.success(), "child {role} failed: {st}");
+            return;
+        }
+        assert!(
+            Instant::now() < end,
+            "timed out waiting for child {role} to exit"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Child entry point: a no-op unless run by `spawn`. Roles are
 /// `{zdb,lmdb}_hold_readers:<n>` and `{zdb,lmdb}_hold_writer`; the writer
 /// roles put `doomed` in an uncommitted write txn before signaling. The map
 /// roles open with an 8 MiB map and exit: `{zdb,lmdb}_grow` commit past
 /// [`GROW_TARGET`], `{zdb,lmdb}_commit_one` commit one small key.
+/// `{zdb,lmdb}_hold_open` just hold the env open (no txn) until `stop` is
+/// written, then exit cleanly.
 #[test]
 fn child_entry() {
     let (Ok(role), Ok(dir)) = (std::env::var(ROLE), std::env::var(DIR)) else {
@@ -474,6 +494,18 @@ fn child_entry() {
         "lmdb_commit_one" => return Lmdb::open_sized(&dir, MAX_READERS, 8 * MIB).commit_one(),
         "zdb_grow" => return zdb_grow(&zdb_open_sized(&dir, Some(8 * MIB))),
         "zdb_commit_one" => return zdb_commit_one(&zdb_open_sized(&dir, Some(8 * MIB))),
+        "lmdb_hold_open" => {
+            let _env = Lmdb::open(&dir, MAX_READERS);
+            signal();
+            wait_for(&dir.join("stop"));
+            return;
+        }
+        "zdb_hold_open" => {
+            let _env = zdb_open(&dir);
+            signal();
+            wait_for(&dir.join("stop"));
+            return;
+        }
         _ => {}
     }
     if let Some(n) = role.strip_prefix("lmdb_hold_readers:") {
@@ -864,6 +896,47 @@ fn prev_snapshot_rounding_matches_lmdb() {
     assert_eq!(zdb, lmdb, "(minsize_from, zero_from) under PREV_SNAPSHOT");
 }
 
+/// `PREV_SNAPSHOT` requires winning the first-opener election (ADR-0023 §5):
+/// opening while another process already has the environment open fails
+/// (`OBS_PREV_SNAPSHOT_JOINER = EAGAIN`); once that process lets go, the same
+/// open succeeds. A differential tuple for
+/// `multi_process.rs::prev_snapshot_open_fails_while_another_process_has_the_env`.
+#[test]
+fn prev_snapshot_joiner_matches_lmdb() {
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        let mut c = spawn("lmdb_hold_open", dir.path());
+        wait_for(&dir.path().join("held"));
+        let while_held = lmdb_rc(
+            Lmdb::try_open_flags(dir.path(), MAX_READERS, MIB, ffi::MDB_PREVSNAPSHOT)
+                .map(|_| 0)
+                .unwrap_or_else(|rc| rc),
+        );
+        std::fs::write(dir.path().join("stop"), b"").unwrap();
+        wait_exit(&mut c, "lmdb_hold_open");
+        let after = lmdb_rc(
+            Lmdb::try_open_flags(dir.path(), MAX_READERS, MIB, ffi::MDB_PREVSNAPSHOT)
+                .map(|_| 0)
+                .unwrap_or_else(|rc| rc),
+        );
+        (while_held, after)
+    };
+    eprintln!("lmdb (while_held, after) = {lmdb:?}");
+
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        let mut c = spawn("zdb_hold_open", dir.path());
+        wait_for(&dir.path().join("held"));
+        let while_held = zdb_open_rc(zdb_prev_snapshot_open(dir.path()));
+        std::fs::write(dir.path().join("stop"), b"").unwrap();
+        wait_exit(&mut c, "zdb_hold_open");
+        let after = zdb_open_rc(zdb_prev_snapshot_open(dir.path()));
+        (while_held, after)
+    };
+    eprintln!("zdb (while_held, after) = {zdb:?}");
+    assert_eq!(zdb, lmdb, "(while_held, after) under PREV_SNAPSHOT");
+}
+
 /// Normalize a `resize` / `mdb_env_set_mapsize` result: `ok`, or the raw OS
 /// error code.
 fn zdb_rc(r: zerodb::Result<()>) -> String {
@@ -882,6 +955,29 @@ fn lmdb_rc(rc: c_int) -> String {
     } else {
         format!("rc={rc}")
     }
+}
+
+/// [`zdb_rc`], for an open result instead of a unit result: `ok` (the env is
+/// dropped immediately, releasing its lock file), or the raw OS error code.
+fn zdb_open_rc(r: zerodb::Result<zerodb::Env>) -> String {
+    match r {
+        Ok(_) => "ok".to_string(),
+        Err(zerodb::Error::Io(e)) if e.raw_os_error().is_some() => {
+            format!("rc={}", e.raw_os_error().unwrap())
+        }
+        Err(e) => format!("{e:?}"),
+    }
+}
+
+/// A lock-file env open with `EnvFlags::PREV_SNAPSHOT`.
+fn zdb_prev_snapshot_open(dir: &Path) -> zerodb::Result<zerodb::Env> {
+    let mut o = zerodb::EnvOpenOptions::new();
+    o.page_size(PSIZE as u32)
+        .max_readers(MAX_READERS)
+        .lock_file(true)
+        .flags(zerodb::EnvFlags::PREV_SNAPSHOT)
+        .map_size(usize::try_from(MIB).unwrap());
+    o.open(dir)
 }
 
 /// After an 8 MiB process committed past this process's 1 MiB map,
