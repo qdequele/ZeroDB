@@ -474,8 +474,17 @@ impl LockFile {
         // its reader table from the lock file (`OBS_JOINER_FEWER_MAXREADERS`,
         // `OBS_JOINER_MORE_MAXREADERS`; ADR-0023 §1 as amended). A count no
         // initializer can write means the file is not a usable lock file.
+        if initializer {
+            check_lock_file_shape(&file, path)?;
+        }
         let slots = if initializer {
-            max_readers
+            // An initializer never shrinks the reader table of a finished
+            // lock file left by an earlier run: as LMDB, which sizes its
+            // table from the lock file's length and never shortens it, the
+            // count is the larger of the requested one and the recorded one
+            // (`OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS`; ADR-0023 §1 as
+            // amended). The slots themselves are wiped below as always.
+            previous_run_slots(&file)?.map_or(max_readers, |n| n.max(max_readers))
         } else {
             let n = read_u32_at(&file, OFF_MAX_READERS)?;
             if n == 0 || n > zerodb_core::env::MAX_READERS_LIMIT {
@@ -487,7 +496,6 @@ impl LockFile {
         };
         let len = OFF_SLOTS + SLOT_STRIDE * slots as usize;
         if initializer {
-            check_lock_file_shape(&file, path)?;
             // Truncate to zero first so no field survives from a previous
             // life, then mark the file as being initialized before it grows:
             // a process crash from here on leaves an empty file or one that
@@ -830,6 +838,23 @@ fn read_u64_at(file: &File, off: usize) -> std::io::Result<u64> {
     }
 }
 
+/// The reader-slot count a finished lock file records, if `file` is one (it
+/// carries the final magic) and is long enough to hold that many slots.
+/// `None` for an empty, unfinished or inconsistent file, or a count outside
+/// `1..=MAX_READERS_LIMIT`.
+fn previous_run_slots(file: &File) -> std::io::Result<Option<u32>> {
+    let len = file.metadata()?.len();
+    if len < OFF_SLOTS as u64 || read_u64_at(file, OFF_MAGIC)? != LOCK_MAGIC {
+        return Ok(None);
+    }
+    let n = read_u32_at(file, OFF_MAX_READERS)?;
+    let needed = OFF_SLOTS as u64 + SLOT_STRIDE as u64 * u64::from(n);
+    if n == 0 || n > zerodb_core::env::MAX_READERS_LIMIT || len < needed {
+        return Ok(None);
+    }
+    Ok(Some(n))
+}
+
 /// Open the lock file at `path`, creating it if missing, and report whether
 /// this call created it. `create_new` is tried first so the answer is exact;
 /// if the file exists, it is opened as is. A file removed between the two
@@ -1048,6 +1073,34 @@ mod tests {
         drop(l);
         let l = LockFile::open(&path, &data, 8).expect("reopen");
         assert!(l.is_initializer());
+    }
+
+    /// An initializer never shrinks the reader table of a finished lock file
+    /// from an earlier run, as LMDB
+    /// (`OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS`), grows it when asked
+    /// for more, and ignores the count of an unfinished file.
+    #[test]
+    fn initializer_keeps_a_larger_finished_table() {
+        let path = tmp();
+        let data = path.with_file_name("zerodb.dat");
+        let open_finished = |n: u32| {
+            let l = LockFile::open(&path, &data, n).unwrap();
+            assert!(l.is_initializer());
+            l.finish_open().unwrap();
+            l.slots().len()
+        };
+        assert_eq!(open_finished(12), 12);
+        assert_eq!(open_finished(4), 12, "kept the larger table");
+        assert_eq!(open_finished(20), 20, "grew");
+        assert_eq!(open_finished(4), 20);
+        // An unfinished file (initializing magic only) records no count, so
+        // the next initializer sizes the table as asked.
+        drop(
+            LockFile::try_open_exclusive(&path, &data, 30)
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(open_finished(4), 4, "an unfinished file's count is ignored");
     }
 
     /// The recorded `max_readers` is read only from a finished lock file, and

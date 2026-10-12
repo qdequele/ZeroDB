@@ -283,13 +283,15 @@ fn streamed_inner_file_bytes_reopen_as_env() {
 // NO_LOCK (ADR-0023 amendment 17)
 // ---------------------------------------------------------------------------
 
-/// heed's `NO_LOCK` maps to the engine's `lock_file(false)`: the env dir holds
-/// no `lock.mdb` (`OBS_NOLOCK_CREATES_LOCK_FILE = false`), while an env opened
-/// without it has one.
+/// heed's `NO_LOCK` maps to the engine's `lock_file(false)` and wins over the
+/// adapter's lock-file setting: with the lock file turned on, `NO_LOCK` still
+/// leaves no `lock.mdb` in the env dir (`OBS_NOLOCK_CREATES_LOCK_FILE =
+/// false`), while the same options without `NO_LOCK` create one.
 #[test]
 fn no_lock_creates_no_lock_file() {
     let dir = tempfile::tempdir().unwrap();
     let mut o = opts();
+    o.lock_file(true);
     // SAFETY: heed signature parity only; setting flags performs no unsafe
     // operation in the adapter.
     unsafe { o.flags(heed_zerodb::EnvFlags::NO_LOCK) };
@@ -299,7 +301,9 @@ fn no_lock_creates_no_lock_file() {
     drop(env);
 
     let locked = tempfile::tempdir().unwrap();
-    let env = unsafe { opts().open(locked.path()).unwrap() };
+    let mut o = opts();
+    o.lock_file(true);
+    let env = unsafe { o.open(locked.path()).unwrap() };
     populate(&env, 8);
     assert_eq!(
         dir_listing(locked.path()),
@@ -308,7 +312,8 @@ fn no_lock_creates_no_lock_file() {
 }
 
 /// `Env::flags()` reports `NO_LOCK` for an env opened with it, and not for
-/// one opened without it, as `mdb_env_get_flags` does.
+/// one opened without it (with or without a lock file), as
+/// `mdb_env_get_flags` does.
 #[test]
 fn flags_report_no_lock() {
     use heed_zerodb::EnvFlags;
@@ -323,9 +328,13 @@ fn flags_report_no_lock() {
     assert_ne!(env.get_flags().unwrap() & EnvFlags::NO_LOCK.bits(), 0);
     drop(env);
 
-    let locked = tempfile::tempdir().unwrap();
-    let env = unsafe { opts().open(locked.path()).unwrap() };
-    let flags = env.flags().unwrap().unwrap();
-    assert!(!flags.contains(EnvFlags::NO_LOCK), "{flags:?}");
-    assert_eq!(env.get_flags().unwrap() & EnvFlags::NO_LOCK.bits(), 0);
+    for lock_file in [false, true] {
+        let other = tempfile::tempdir().unwrap();
+        let mut o = opts();
+        o.lock_file(lock_file);
+        let env = unsafe { o.open(other.path()).unwrap() };
+        let flags = env.flags().unwrap().unwrap();
+        assert!(!flags.contains(EnvFlags::NO_LOCK), "{lock_file}: {flags:?}");
+        assert_eq!(env.get_flags().unwrap() & EnvFlags::NO_LOCK.bits(), 0);
+    }
 }

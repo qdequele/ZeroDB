@@ -90,6 +90,10 @@ Option C. The design has six parts.
     (`OBS_JOINER_FEWER_MAXREADERS = (0, 200)`,
     `OBS_JOINER_MORE_MAXREADERS = (0, 126)`); only a version or page-size
     mismatch fails the open. The adopted size is what `Env::info` reports.
+    The first opener likewise never shrinks the table of a finished lock
+    file left by an earlier run: it uses the larger of its own `max_readers`
+    and the recorded count, and still wipes every slot
+    (`OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS = 200`).
 - Within one process, `EnvAlreadyOpened` (TXN-51) is unchanged. The lock file
   coordinates processes, not handles.
 - **`NO_LOCK`** (engine: an `EnvOpenOptions` flag; adapter: heed's `NO_LOCK`,

@@ -187,7 +187,10 @@ claim/release a pinned snapshot without blocking the writer.
   (ADR-0023) the table lives in it and the first opener sizes it; a process
   that joins adopts that size whatever its own `max_readers` says, as an LMDB
   joiner does (`OBS_JOINER_FEWER_MAXREADERS`, `OBS_JOINER_MORE_MAXREADERS`;
-  ADR-0023 §1 as amended). Because the slots are
+  ADR-0023 §1 as amended). A first opener that finds a finished lock file
+  from an earlier run never shrinks its table: the size is the larger of its
+  `max_readers` and the recorded count, as LMDB
+  (`OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS`). Because the slots are
   allocated **eagerly** (one cache-padded word per slot), `max_readers` is
   bounded at open: values above `MAX_READERS_LIMIT` (2^20) are rejected with
   `Io(InvalidInput)` rather than aborting on allocation failure

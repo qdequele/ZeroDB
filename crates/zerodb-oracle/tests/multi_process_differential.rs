@@ -1095,3 +1095,37 @@ fn joiner_with_other_max_readers_matches_lmdb() {
         "(outcome, maxreaders) of joiners with other counts"
     );
 }
+
+/// A sole opener after an earlier, closed run: the reader count it ends up
+/// with when it asks for fewer slots than that run used (LMDB keeps the
+/// larger table, `OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS`), then for
+/// more (the table grows). ADR-0023 §1 as amended.
+#[test]
+fn sole_opener_after_a_larger_run_matches_lmdb() {
+    let asks = [MAX_READERS * 4, MAX_READERS, MAX_READERS * 8];
+    let lmdb: Vec<u32> = {
+        let dir = TempDir::new().unwrap();
+        asks.iter()
+            .map(|&n| Lmdb::open(dir.path(), n).maxreaders())
+            .collect()
+    };
+    eprintln!("lmdb maxreaders per sequential sole open {asks:?} = {lmdb:?}");
+
+    let zdb: Vec<u32> = {
+        let dir = TempDir::new().unwrap();
+        asks.iter()
+            .map(|&n| {
+                let mut o = zerodb::EnvOpenOptions::new();
+                o.page_size(PSIZE as u32)
+                    .max_readers(n)
+                    .lock_file(true)
+                    .map_size(usize::try_from(MIB).unwrap());
+                let env = o.open(dir.path()).expect("sole open");
+                assert!(env.opened_exclusively());
+                env.info().max_readers
+            })
+            .collect()
+    };
+    eprintln!("zdb maxreaders per sequential sole open {asks:?} = {zdb:?}");
+    assert_eq!(zdb, lmdb, "maxreaders of sequential sole opens");
+}

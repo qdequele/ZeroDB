@@ -277,8 +277,9 @@ impl EnvOpenOptions {
     /// [`MdbError::ReadersFull`] (TXN-16).
     ///
     /// With [`EnvOpenOptions::lock_file`] on, the process that opens the
-    /// environment first sizes the shared table; a process that joins it
-    /// adopts that size whatever it asks for, as LMDB does (ADR-0023 §1 as
+    /// environment first sizes the shared table, never below the size a
+    /// finished lock file from an earlier run records; a process that joins
+    /// it adopts that size whatever it asks for, as LMDB does (ADR-0023 §1 as
     /// amended). [`Env::info`] reports the size in use.
     pub fn max_readers(&mut self, n: u32) -> &mut EnvOpenOptions {
         self.max_readers = n;
@@ -435,8 +436,8 @@ impl EnvOpenOptions {
 
     /// Let other processes open this environment at the same time, through a
     /// shared lock file next to the data file (ADR-0023). Off by default in
-    /// this release; the heed adapter turns it on unless heed's `NO_LOCK` is
-    /// set (ADR-0023 amendment 17).
+    /// this release. The heed adapter maps heed's `NO_LOCK` to `false`
+    /// (ADR-0023 amendment 17).
     pub fn lock_file(&mut self, on: bool) -> &mut EnvOpenOptions {
         self.lock_file = on;
         self

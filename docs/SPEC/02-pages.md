@@ -688,8 +688,9 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     hard error.
   - **No lock file is created** unless the opener turns on the opt-in lock
     file (`EnvOpenOptions::lock_file`, ADR-0023; without it the env is
-    single-process, D-001). The heed adapter turns it on unless heed's
-    `NO_LOCK` is set (ADR-0023 amendment 17). A `READ_ONLY` open whose lock
+    single-process, D-001). Through the heed adapter, heed's `NO_LOCK` keeps
+    it off whatever the adapter's setting (ADR-0023 amendment 17). A
+    `READ_ONLY` open whose lock
     file cannot be created or opened for writing because the filesystem is
     read-only (`EROFS`) proceeds without one, as LMDB does
     (`OBS_RDONLY_LOCK_READONLY_FS = 0`); any other lock-file error fails the
