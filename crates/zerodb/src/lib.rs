@@ -527,6 +527,9 @@ impl EnvOpenOptions {
                 ),
             )));
         }
+        // Reject out-of-range limits before any file exists: the lock file is
+        // sized from `max_readers`, and its initializer writes every slot.
+        zerodb_core::env::check_open_limits(self.max_readers, self.max_dbs)?;
         // Canonicalize the directory so the registry keys one env per real path
         // (SPEC 04 TXN-51). The directory must exist (LMDB parity).
         let canonical_dir = dir.canonicalize().map_err(Error::Io)?;

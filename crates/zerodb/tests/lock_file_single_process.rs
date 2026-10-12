@@ -194,3 +194,30 @@ fn lock_file_name_equal_to_data_file_name_is_rejected() {
         Some(&b"me"[..])
     );
 }
+
+/// An out-of-range `max_readers` or `max_dbs` is rejected before the lock
+/// file is created. The lock file is sized from `max_readers` and its
+/// initializer writes every slot, so creating it first would allocate up to
+/// 512 GiB on disk for `max_readers(u32::MAX)` before the open failed.
+#[test]
+fn out_of_range_limits_are_rejected_before_the_lock_file_exists() {
+    // Both limits are 1 << 20 (SPEC 00 rows 4 and 5).
+    let limit: u32 = 1 << 20;
+    for (readers, dbs) in [(limit + 1, 8), (126, limit + 1)] {
+        let dir = TempDir::new();
+        let e = opts()
+            .max_readers(readers)
+            .max_dbs(dbs)
+            .open(dir.path())
+            .unwrap_err();
+        match e {
+            Error::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput),
+            other => panic!("expected Io(InvalidInput), got {other:?}"),
+        }
+        assert!(
+            !dir.path().join(LOCK_FILE_NAME).exists(),
+            "the lock file was created before the limits were checked \
+             (max_readers {readers}, max_dbs {dbs})"
+        );
+    }
+}

@@ -1784,6 +1784,36 @@ pub const MAX_READERS_LIMIT: u32 = 1 << 20;
 /// eagerly).
 pub const MAX_DBS_LIMIT: u32 = 1 << 20;
 
+/// Rejects a `max_readers` or `max_dbs` above its limit with
+/// `Io(InvalidInput)` (see docs/DIVERGENCES.md).
+///
+/// Both values size eager allocations: `max_readers` reader slots (in this
+/// process, or in the lock file of a lock-file environment, ADR-0023) and
+/// `max_dbs` comparator `OnceLock`s. An unbounded value, e.g.
+/// `max_readers(u32::MAX)`, would be an allocation-failure abort or a
+/// 512 GiB lock file, not an error. The bounds (SPEC 00 rows 4/5, SPEC 04
+/// TXN-14) are far above any real deployment (Meilisearch's ceiling is 1024
+/// readers / ~30 dbs). The engine calls this before it creates any file, and
+/// the core open functions call it again for callers that build a
+/// backing themselves.
+pub fn check_open_limits(max_readers: u32, max_dbs: u32) -> Result<(), Error> {
+    if max_readers > MAX_READERS_LIMIT {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "max_readers ({max_readers}) exceeds the supported maximum {MAX_READERS_LIMIT}"
+            ),
+        )));
+    }
+    if max_dbs > MAX_DBS_LIMIT {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("max_dbs ({max_dbs}) exceeds the supported maximum {MAX_DBS_LIMIT}"),
+        )));
+    }
+    Ok(())
+}
+
 /// Open an env over an already-constructed [`Backing`] (SPEC 02 §3.2, SPEC 06
 /// §1). This is the I/O-free core of open: the caller (`zerodb-io` / the public
 /// `zerodb` crate) has already opened, created-if-new, and mapped the file, and
@@ -1938,26 +1968,7 @@ pub fn open_with_backing_shared(
             "lock-file environments are not available under loom",
         )));
     }
-    // Open-time argument rejection (`Io(InvalidInput)`, see docs/DIVERGENCES.md): both
-    // values size eager allocations (`max_readers` cache-padded reader slots,
-    // `max_dbs` comparator `OnceLock`s), so an unbounded value — e.g.
-    // `max_readers(u32::MAX)` — is an allocation-failure abort, not an error.
-    // The bounds (SPEC 00 rows 4/5, SPEC 04 TXN-14) are far above any real
-    // deployment (Meilisearch's ceiling is 1024 readers / ~30 dbs).
-    if max_readers > MAX_READERS_LIMIT {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "max_readers ({max_readers}) exceeds the supported maximum {MAX_READERS_LIMIT}"
-            ),
-        )));
-    }
-    if max_dbs > MAX_DBS_LIMIT {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("max_dbs ({max_dbs}) exceeds the supported maximum {MAX_DBS_LIMIT}"),
-        )));
-    }
+    check_open_limits(max_readers, max_dbs)?;
     // Validate the two meta slots from the mapped bytes (SPEC 02 §3.2). A
     // decode error here (bad page size / truncated buffer) means the file is not
     // a usable env → Invalid.
