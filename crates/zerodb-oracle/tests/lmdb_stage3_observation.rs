@@ -437,7 +437,9 @@ fn observe_rdonly_lock_unwritable() {
     let root = unsafe { libc::geteuid() } == 0;
     let rc: i32 = if root {
         // Root ignores file modes, so open as `nobody` in a child process. If
-        // that is impossible, record -1 and skip the assertion.
+        // that is impossible, record -1 and skip the assertion. The child
+        // writes its answer into the directory, so let `nobody` write there.
+        std::fs::set_permissions(dir.path(), PermissionsExt::from_mode(0o777)).unwrap();
         run_child("ro_nobody", dir.path());
         match std::fs::read_to_string(dir.path().join("result"))
             .unwrap()
