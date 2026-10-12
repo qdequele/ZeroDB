@@ -92,31 +92,247 @@ The riskiest assumptions are what LMDB does at map growth and at the other parit
 - [ ] **Step 3:** Commit `docs: ADR-0023 amendments 15–18 (map growth, lock name, NO_LOCK, tools) for approval`.
 - [ ] **Step 4: STOP.** The controller asks the user to approve amendments 15–18 (AGENTS.md rule 5). After approval, the controller revises Tasks 3–4 of this plan with the chosen mechanism's exact code and commits the revision before dispatching Task 3.
 
-### Task 3: `MapResized` at txn begin (after approval)
+### Task 3: Grow-only map regions, `MapResized` at txn begin, open rounding (amendment 15, approved 2026-10-12)
+
+ADR-0023 amendment 15 is the authority; read it first. Decisions 1, 2 and 6 apply.
 
 **Files:**
-- Modify: `crates/zerodb-core/src/error.rs` (add `MdbError::MapResized`, code `-30785`, LMDB's `MDB_MAP_RESIZED`); `crates/zerodb-core/src/env.rs` `check_snapshot_backed` (~2219–2240). Return `MapResized` where Task 1 says LMDB does, and keep `Invalid` when the *file* is shorter than `last_pg` (corruption).
-- Modify: `crates/heed-zerodb/src/error.rs` (map the engine's `MapResized` to the existing adapter variant at :117).
-- Test: `crates/zerodb/tests/multi_process.rs`, and `crates/zerodb-oracle/tests/multi_process_differential.rs` (a tuple on both engines).
+- Modify: `crates/zerodb-io/src/mmap.rs` (add `MapRegions`; `MmapBacking` and `WriteMapBacking` hold `regions: MapRegions` before `file: File` so every mapping unmaps before the fd closes, TXN-53).
+- Modify: `crates/zerodb-core/src/env.rs`:
+  - add `MapView` and `Backing::view` (heap backings return their fixed pair; `bytes()` becomes a default method over `view()`);
+  - add `Backing::grow_map` with a default that returns `Unsupported` (Task 4 implements it);
+  - drop `EnvInner`'s `map_size` field: `pub fn map_size(&self) -> u64 { self.backing_ref().view().map_size }`, and `Env::info().map_size` uses it;
+  - `Snapshot` gains `pub map_size: u64`; `from_meta` sets it from the meta, and the commit sets the value it persists;
+  - the commit's meta gets `map_size: self.base.map_size.max(inner.map_size())` (`OBS_COMMIT_PERSISTS_OWN_MAPSIZE = false`: a commit never lowers it);
+  - rewrite `check_snapshot_backed` (below);
+  - write begin (`Env::write_txn`, after `current_snapshot`) calls `check_snapshot_backed` even on a cached base, and its `MapResized` releases both writer locks through the guard drop.
+- Modify: `crates/zerodb-core/src/error.rs`: add `MdbError::MapResized`, code `-30785` (LMDB's `MDB_MAP_RESIZED`).
+- Modify: `crates/zerodb-core/src/page` geometry: `pub const MAX_MAP_SIZE: u64 = 1 << 47;`.
+- Modify: `crates/zerodb-io/src/lib.rs` `open_or_create_with_advice`:
+  - before any `set_len` or `mmap`, a persisted meta `map_size` above `MAX_MAP_SIZE` → `Invalid`, and a requested one → `Io(InvalidInput)`;
+  - after the seed meta is selected, set the logical map size to `max(chosen, (seed.last_pg + 1) * page_size)` before publishing view 0 (`OBS_OPEN_BELOW_LAST_PG = "minsize"`). Today ZeroDB keeps the smaller size.
+- Modify: `crates/heed-zerodb/src/error.rs`: map the engine's `MapResized` to the existing adapter variant `MdbError::MapResized`.
+- Modify: `AGENTS.md` `unsafe` policy, `zerodb-io` bullet: name the `MapRegions` view/mapping derefs, the `Box::from_raw` calls in `Drop`, and `unsafe impl Send`/`Sync for MapRegions`.
+- Test: `crates/zerodb-io` unit tests, `crates/zerodb/tests/multi_process.rs`, `crates/zerodb/tests/lock_file_single_process.rs`, `crates/zerodb-oracle/tests/multi_process_differential.rs`.
 
-- [ ] **Step 1:** Write `small_map_process_gets_map_resized_after_a_bigger_process_grows_the_file`. The child opens with 8 MiB and writes 4 MiB of values; the parent was opened with 1 MiB before that. The parent's `read_txn()` returns `Err(Error::Mdb(MdbError::MapResized))` if `OBS_READ_BEGIN_SMALL_MAP` is `MDB_MAP_RESIZED`; `write_txn()` follows `OBS_WRITE_BEGIN_SMALL_MAP`.
-- [ ] **Step 2:** Run it and check it fails with `Invalid`.
-- [ ] **Step 3:** Implement per amendment 15.
-- [ ] **Step 4:** Add the differential tuple `(read_begin_rc, write_begin_rc)`, equal on both engines.
-- [ ] **Step 5:** Commit.
+**Interfaces:**
+- Produces, for Task 4:
+  - `MapRegions::publish(&self, new_mapping: Option<Mapping>, map_size: u64)`;
+  - `Backing::grow_map(&self, map_size: u64) -> io::Result<()>`;
+  - `MapView { bytes, map_size }`;
+  - `Snapshot::map_size`;
+  - `MAX_MAP_SIZE`;
+  - `MdbError::MapResized`.
 
-### Task 4: `Env::resize` and the adapter's `unsafe fn resize` (after approval; exact code added by the Task 2 revision)
+`crates/zerodb-io/src/mmap.rs` (exact shape, ADR amendment 15):
+
+```rust
+/// One mmap of the data file.
+pub(crate) enum Mapping { Read(Mmap), Write(MmapWritable) }
+
+/// A published (mapping, logical map size) pair. Immutable once published.
+pub(crate) struct ViewCell { mapping: *const Mapping, map_size: u64 }
+
+struct Owned { mappings: Vec<*mut Mapping>, views: Vec<*mut ViewCell> }
+
+/// Grow-only mappings (ADR-0023 amendment 15). Every mapping and view is
+/// created with `Box::into_raw`, recorded in `owned`, and freed only in Drop.
+pub struct MapRegions {
+    current: AtomicPtr<ViewCell>,
+    owned: Mutex<Owned>,
+}
+
+// SAFETY: the raw pointers are uniquely owned boxes of `Send + Sync` types
+// (`Mmap`/`MmapWritable` are `Send + Sync`); `owned` is mutated only under its
+// mutex and `current` is atomic. Nothing is freed before Drop.
+unsafe impl Send for MapRegions {}
+unsafe impl Sync for MapRegions {}
+
+impl MapRegions {
+    /// Publishes view 0 over `first`.
+    pub(crate) fn new(first: Mapping, map_size: u64) -> MapRegions { /* Box::into_raw both, push, store */ }
+
+    /// One Acquire load: a consistent (bytes, map_size).
+    pub(crate) fn view(&self) -> (&Mapping, u64) {
+        // Acquire: pairs with the Release in `publish`; the view and its
+        // mapping were fully built before the store.
+        let v = self.current.load(Ordering::Acquire);
+        // SAFETY: `v` came from `Box::into_raw` in `publish`/`new` and is
+        // recorded in `owned`; views and mappings are freed only in Drop
+        // (`&mut self`), so both outlive `&self`. No `&mut` to them ever
+        // exists after publication.
+        let v = unsafe { &*v };
+        // SAFETY: as above, for the mapping `v` points to.
+        (unsafe { &*v.mapping }, v.map_size)
+    }
+
+    /// Publish `map_size`, adding `new_mapping` if given. Callers hold the
+    /// writer lock, so publications are serialized.
+    pub(crate) fn publish(&self, new_mapping: Option<Mapping>, map_size: u64) {
+        let mut owned = self.owned.lock().expect("map regions poisoned");
+        let mapping = match new_mapping {
+            Some(m) => {
+                let p = Box::into_raw(Box::new(m));
+                owned.mappings.push(p);
+                p as *const Mapping
+            }
+            None => {
+                // Relaxed: under the mutex, which orders this load after the
+                // previous publish's store.
+                let cur = self.current.load(Ordering::Relaxed);
+                // SAFETY: as in `view`: `cur` is a published, never-freed view.
+                unsafe { (*cur).mapping }
+            }
+        };
+        let v = Box::into_raw(Box::new(ViewCell { mapping, map_size }));
+        owned.views.push(v);
+        // Release: the view and its mapping are fully constructed first.
+        self.current.store(v, Ordering::Release);
+    }
+}
+
+impl Drop for MapRegions {
+    fn drop(&mut self) {
+        let owned = self.owned.get_mut().expect("map regions poisoned");
+        // SAFETY: each pointer came from `Box::into_raw` exactly once and is
+        // freed exactly once; `&mut self` proves no borrow is live.
+        for v in owned.views.drain(..) { drop(unsafe { Box::from_raw(v) }); }
+        // SAFETY: as above.
+        for m in owned.mappings.drain(..) { drop(unsafe { Box::from_raw(m) }); }
+    }
+}
+```
+
+`crates/zerodb-core/src/env.rs` `Backing` additions:
+
+```rust
+/// A consistent (mapped bytes, logical map size) pair (ADR-0023 amendment 15).
+#[derive(Clone, Copy)]
+pub struct MapView<'a> { pub bytes: &'a [u8], pub map_size: u64 }
+
+fn view(&self) -> MapView<'_>;                  // required
+fn bytes(&self) -> &[u8] { self.view().bytes }  // default, signature unchanged
+/// Set the logical map size to `map_size`, adding a mapping of
+/// max(map_size, 2 × current) when the current one is shorter (on ENOMEM,
+/// retry exactly map_size, else Io). Under WRITE_MAP, grows the file first,
+/// only if it is shorter. Caller holds the in-process writer lock and, with a
+/// lock file, the cross-process one.
+fn grow_map(&self, map_size: u64) -> std::io::Result<()> {
+    let _ = map_size;
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "backing cannot grow its map"))
+}
+```
+
+`check_snapshot_backed`:
+
+```rust
+fn check_snapshot_backed(backing: &dyn Backing, page_size: u32, snap: &Snapshot) -> Result<(), Error> {
+    let needed = snap.last_pg.checked_add(1)
+        .and_then(|n| n.checked_mul(u64::from(page_size)))
+        .ok_or(Error::Mdb(MdbError::Invalid))?;
+    let view = backing.view(); // one Acquire load: a consistent pair
+    if needed > view.map_size {
+        return Err(Error::Mdb(MdbError::MapResized)); // OBS_READ/WRITE_BEGIN_SMALL_MAP
+    }
+    if needed > view.bytes.len() as u64 {
+        return Err(Error::Mdb(MdbError::Invalid)); // map shorter than its logical size: a bug or corruption
+    }
+    if needed > backing.real_disk_size().map_err(Error::Io)? {
+        return Err(Error::Mdb(MdbError::Invalid)); // REC-1a: the file is shorter than last_pg
+    }
+    Ok(())
+}
+```
+
+- [ ] **Step 1:** Write the failing tests:
+  - `small_map_process_gets_map_resized_after_a_bigger_process_grows_the_file` (`multi_process.rs`). The parent opens with 1 MiB; a child opens with 8 MiB and writes 4 MiB of values. Afterwards the parent's `read_txn()` and `write_txn()` each return `Err(Error::Mdb(MdbError::MapResized))` (`OBS_READ_BEGIN_SMALL_MAP`, `OBS_WRITE_BEGIN_SMALL_MAP`).
+  - `bigger_meta_size_alone_does_not_trigger_map_resized` (`OBS_BIGGER_META_MAPSIZE_ALONE_RESIZES = false`): the child opens with 8 MiB and commits one small key; the parent's begins succeed.
+  - `open_below_last_pg_rounds_up_to_the_minimum` (`lock_file_single_process.rs`, lock on and off): fill an 8 MiB env past 1 MiB, reopen with 1 MiB, assert `info().map_size == (last_pg + 1) * page_size` and reads succeed.
+  - `open_rejects_a_map_size_above_the_cap`: `map_size(MAX_MAP_SIZE + page)` → `Io(InvalidInput)`, no data file created.
+  - `smaller_map_process_commit_keeps_the_larger_meta_size` (`OBS_COMMIT_PERSISTS_OWN_MAPSIZE = false`).
+  - A `zerodb-io` unit test of `MapRegions` over heap mappings, run under miri. One thread publishes three growing views while two threads loop `view()` and read the last byte of the bytes and the map size. Swap `Acquire` for `Relaxed` once locally to confirm miri flags it; do not commit that.
+- [ ] **Step 2:** Run them and confirm they fail (the first one with `Invalid`).
+- [ ] **Step 3:** Implement as above.
+- [ ] **Step 4:** Add the differential tuples on both engines: `(read_begin_rc, write_begin_rc)` with the small map; begin with only a bigger meta size; a smaller-map process commit keeps the larger meta size; open below `last_pg` → minimum. Run the guarded suite: `ulimit -f 4194304; cargo test -p zerodb-io -p zerodb-core -p zerodb -p heed-zerodb`, `cargo test -p zerodb-oracle --test multi_process_differential`, `cargo +nightly miri test -p zerodb-io <MapRegions test>` (or `-p zerodb-core` if the test lives there over a heap mapping), fmt, clippy (also `--target x86_64-unknown-linux-gnu` on the non-oracle crates).
+- [ ] **Step 5:** Commit `zerodb: grow-only map regions, MapResized at txn begin, open rounds up to last_pg (ADR-0023 amendment 15)`.
+
+### Task 4: `Env::resize`, `WRITE_MAP` file growth, and the adapter's `unsafe fn resize` (amendment 15, approved 2026-10-12)
+
+ADR-0023 amendment 15 is the authority. Decisions 3, 4 and 5 apply: `resize` takes the cross-process writer lock; the file grows only under both writer locks; live read txns do not block `resize`.
 
 **Files:**
-- `crates/zerodb-core/src/env.rs`, `crates/zerodb-io/src/{lib,mmap}.rs`, `crates/zerodb/src/lib.rs`, `crates/heed-zerodb/src/env.rs`, AGENTS.md (if amendment 15 adds `unsafe`), `docs/COMPATIBILITY.md:27,79,152`.
-- Tests:
-  - `resize_zero_adopts_the_grown_map_and_reads_succeed` (two processes);
-  - `resize_with_a_live_txn_is_refused` (single process; a read txn held across the call keeps its value readable afterwards);
-  - `resize_rounds_up_to_the_last_page` (per LMDB's silent round-up);
-  - the adapter `unsafe fn resize` rejects a size that is not a multiple of the OS page size with `Io(InvalidInput)` (heed 0.22.1 does the same);
-  - a differential tuple for `OBS_SET_MAPSIZE_ZERO_ADOPTS` and `OBS_SET_MAPSIZE_WITH_WRITE_TXN`;
-  - a loom model if amendment 15 picks a lock-free generation flag (resize racing a reader begin: either the reader fails its begin or the remap waits/fails; never both proceed).
-- [ ] Steps: RED test, implement per amendment 15, GREEN, miri on any non-mmap logic, loom, commit.
+- Modify: `crates/zerodb-io/src/mmap.rs`: implement `grow_map` for `MmapBacking` and `WriteMapBacking`, and `ensure_file_len` for `WriteMapBacking`. Cache the begin-time `fstat` length per process (the file never shrinks; ledger minor from Task 2) so `ensure_file_len` is one comparison when the file is already long enough.
+- Modify: `crates/zerodb-io/src/lib.rs` `map_backing`: add `grow_file: bool`. `zerodb::EnvOpenOptions::open` passes `true` without a lock file or for the initializer (`LockFile::is_initializer()`), and `false` for a joiner. A joiner maps the logical size and never calls `set_len` at open.
+- Modify: `crates/zerodb-core/src/env.rs`:
+  - new `Backing` method `fn ensure_file_len(&self, len: u64) -> io::Result<()> { Ok(()) }` (default no-op);
+  - in `RwTxn` begin, after `lock_writer_shared` (so after any takeover reap), only when `durability.write_map`: `inner.backing_ref().ensure_file_len(inner.map_size())?`;
+  - `WriterLock::try_acquire(&self) -> Option<WriterGuard<'_>>`, which never waits;
+  - `newest_snapshot_unchecked`: the `seed_from_published` loop without `check_snapshot_backed`;
+  - `Env::resize` (below).
+- Modify: `crates/zerodb/src/lib.rs`: re-export `resize` on the public `Env`.
+- Modify: `crates/heed-zerodb/src/env.rs`: add `pub unsafe fn resize` (below).
+- Modify: `docs/COMPATIBILITY.md` lines that list `resize` as unsupported (~27, 79, 152).
+- Test: `crates/zerodb/tests/multi_process.rs`, `crates/zerodb/tests/lock_file_single_process.rs`, `crates/heed-zerodb/tests/`, `crates/zerodb-oracle/tests/multi_process_differential.rs`.
+
+**Interfaces:**
+- Consumes: Task 3's `MapRegions::publish`, `Backing::grow_map`, `Snapshot::map_size`, `MAX_MAP_SIZE`, `MdbError::MapResized`.
+- Produces: `zerodb_core::env::Env::resize(&self, new_size: u64) -> Result<()>`, `zerodb::Env::resize`, `heed_zerodb::Env::resize` (`unsafe`).
+
+```rust
+pub fn resize(&self, new_size: u64) -> Result<()> {
+    let inner = self.inner();
+    // OBS_SET_MAPSIZE_WITH_WRITE_TXN: EINVAL while a write txn is live.
+    let mut guard = inner.write_mutex.try_acquire()
+        .ok_or_else(|| Error::Io(io::Error::from_raw_os_error(EINVAL)))?;
+    inner.lock_writer_shared(&mut guard)?;            // no-op without a lock file
+    let snap = inner.newest_snapshot_unchecked()?;
+    let min = snap.last_pg.checked_add(1)
+        .and_then(|n| n.checked_mul(u64::from(inner.page_size())))
+        .ok_or(Error::Mdb(MdbError::Invalid))?;
+    // OBS_SET_MAPSIZE_ZERO_ADOPTS: 0 adopts the newest meta's size.
+    let (size, from_meta) = if new_size == 0 { (snap.map_size, true) } else { (new_size, false) };
+    let size = size.max(min);                         // LMDB rounds up silently
+    if size > MAX_MAP_SIZE {
+        return Err(if from_meta { Error::Mdb(MdbError::Invalid) }
+                   else { Error::Io(io::ErrorKind::InvalidInput.into()) });
+    }
+    inner.backing_ref().grow_map(size).map_err(Error::Io)?;
+    Ok(()) // the guard's drop releases both writer locks
+}
+```
+
+`zerodb-core` has no `libc`: define `const EINVAL: i32 = 22;` under `#[cfg(any(target_os = "linux", target_os = "macos"))]` with a comment that it is the same value on both targets. A smaller size than the current mapping only lowers the logical size (publish with `None`); it never unmaps.
+
+Adapter:
+
+```rust
+/// Changes the map size, as heed 0.22.1's `Env::resize`.
+///
+/// # Safety
+/// Mirrors heed's signature; ZeroDB keeps every live transaction and every
+/// borrowed value valid across a resize, so no caller obligation remains.
+pub unsafe fn resize(&self, new_size: usize) -> Result<()> {
+    let os = os_page_size();
+    if !new_size.is_multiple_of(os) {
+        let msg = format!("map size ({}) must be a multiple of the system page size ({})", new_size, os);
+        return Err(Error::Io(io::Error::new(io::ErrorKind::InvalidInput, msg)));
+    }
+    self.inner.resize(new_size as u64).map_err(Error::from)
+}
+```
+
+- [ ] **Step 1:** Write the failing tests:
+  - `resize_zero_adopts_the_grown_map_and_reads_succeed` (two processes): after the child grows the env, the parent's `read_txn()` returns `MapResized`, `resize(0)` succeeds, and then the read sees the child's values.
+  - `resize_with_a_live_write_txn_is_refused`: `Io` with raw OS error 22.
+  - `resize_with_a_live_read_txn_succeeds_and_the_value_stays_readable`: hold a read txn and a `get` value (and `backing_bytes()` where exposed) across `resize(2 × size)`, then read both.
+  - `resize_rounds_up_to_the_last_page`: `resize(page_size)` on a filled env → `info().map_size == (last_pg + 1) * page_size`.
+  - `resize_above_the_cap_is_refused`: `Io(InvalidInput)`.
+  - Adapter: `unsafe { env.resize(os_page + 1) }` → `Io(InvalidInput)`; `resize(2 × current)` → `info().map_size` grows.
+  - `write_map_processes_never_shrink_the_file` (two processes, `WRITE_MAP`): one loops resizes up, the other loops write txns; the parent samples the file length and asserts it never decreases and no child dies from `SIGBUS`.
+- [ ] **Step 2:** Run them and confirm they fail.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** Add the differential tuples on both engines for `OBS_SET_MAPSIZE_ZERO_ADOPTS` and `OBS_SET_MAPSIZE_WITH_WRITE_TXN`. Run the guarded suite as in Task 3, plus miri on `zerodb-core`. No new loom model: reader and writer protocols are unchanged and `resize` uses the existing writer locks.
+- [ ] **Step 5:** Commit `zerodb: Env::resize and the heed adapter's resize; WRITE_MAP grows the file only under the writer locks (ADR-0023 amendment 15)`.
 
 ### Task 5: Lock-file name derivation and same-file guard
 
@@ -182,6 +398,19 @@ fn lock_file_that_is_the_data_file_is_refused_without_truncating() {
 - [ ] **Step 4:** Run `cargo test -p zerodb --test lock_file_single_process --test multi_process` and `-p zerodb-io`.
 - [ ] **Step 5:** Commit `zerodb: derive the lock-file name from the data-file name and refuse a lock file that is the data file (ADR-0023 amendment 16)`.
 
+**Approved amendment 16 additions (2026-10-12; ADR-0023 amendment 16 is the authority, decisions 7 and 8):**
+- `LockFile::open(path, data_path, max_readers)`:
+  1. Try `OpenOptions::create_new`; on `AlreadyExists`, open the existing file. Remember `created`.
+  2. Same-file guard: if the data file exists, compare `fstat(lock)` with `stat(data_path)` on `(dev, ino)`. If equal, `unlink(path)` when `created && len == 0`, then return `Io(InvalidInput)`.
+  3. Election as today.
+  4. Foreign-file guard: the initializer accepts the file only if `len == 0`, or its magic is `LOCK_MAGIC` or the new provisional `LOCK_MAGIC_INIT`, or its header is all zero (power loss lost the magic block). Accept the all-zero header only when `len` equals the initialized lock length for this `max_readers`, or else word the docs so they do not claim every foreign file is refused (Task 2 ledger minor). Otherwise return `Io(InvalidInput)` without truncating.
+  5. Initialize as `set_len(0)`, `pwrite(LOCK_MAGIC_INIT @ OFF_MAGIC)`, `set_len(len)`, the header, and the final magic in `finish_open` (unchanged).
+- Extra tests:
+  - `lock_file_named_like_another_envs_data_file_is_refused`: env 2's lock name resolves to env 1's data file under a different name → `Io(InvalidInput)`, data intact;
+  - `crashed_initializer_with_provisional_magic_is_reinitialized`;
+  - `all_zero_lock_header_is_reinitialized`;
+  - on a case-insensitive filesystem (skip if case-sensitive), a lock name that differs from the data name only by case is refused and the data file is intact.
+
 ### Task 6: zerodb-tools attach to a live environment
 
 **Files:**
@@ -194,6 +423,27 @@ fn lock_file_that_is_the_data_file_is_refused_without_truncating() {
 - [ ] **Step 3:** Implement.
 - [ ] **Step 4:** Run `cargo test -p zerodb-tools` under the disk guard.
 - [ ] **Step 5:** Commit `zerodb-tools: attach to a live environment through its lock file (ADR-0023 amendment 18)`.
+
+**Approved amendment 18 additions (2026-10-12; ADR-0023 amendment 18 is the authority, decisions 10 and 11):**
+- `stat`, `dump` and `check` open `READ_ONLY` through the engine and attach to the live env.
+- `check`'s raw-file fallback runs only under a new `zerodb::ExclusiveLock`:
+
+```rust
+/// Holds an env's lock file as an unfinished initializer: every other opener
+/// waits in the election until this drops (ADR-0023 amendment 18).
+pub struct ExclusiveLock { _lock: Arc<zerodb_io::lockfile::LockFile> }
+impl ExclusiveLock {
+    /// `Err(Error::Io(WouldBlock, "environment in use"))` unless this process
+    /// wins the first-opener election. Never calls `finish_open`.
+    pub fn acquire(dir: &Path, opts: &EnvOpenOptions) -> Result<ExclusiveLock>;
+}
+```
+
+  It uses the derived lock name and the same in-process registry as `EnvOpenOptions::open`. It needs a non-blocking try-exclusive that never enters the joiner path (Task 2 ledger minor): if the election is lost, drop the lock file and return the error without waiting.
+- `load` and `migrate` open the destination through the engine, then call the new `Env::opened_exclusively(&self) -> bool` (`self.inner.shared.as_ref().map_or(true, |r| r.is_initializer())`) and refuse if it is `false`. They hold the `Env` for the whole run, and re-check that the destination is empty after `opened_exclusively()` (Task 2 ledger minor).
+- `load` writes through write txns with sequential writes, as `mdb_load` does, instead of streaming raw pages.
+- The `libc::flock` in `crates/zerodb-tools/src/lock.rs` is removed; delete the AGENTS.md `zerodb-tools` `flock` exception (keep the `migrate-lmdb` heed `open` one).
+- Extra tests: `load_refuses_a_destination_another_process_has_open`; `check_raw_fallback_refuses_while_the_env_is_live`; `load_round_trips_a_dump` keeps passing.
 
 ### Task 7: `PREV_SNAPSHOT` in a second process
 
@@ -216,6 +466,10 @@ fn lock_file_that_is_the_data_file_is_refused_without_truncating() {
   - `crates/heed-zerodb/tests/env_file_naming.rs`: `no_lock_creates_no_lock_file`, `flags_report_no_lock`;
   - `crates/zerodb/tests/multi_process.rs::read_only_env_joins_the_existing_lock_file`. A child writer holds the env; the parent opens READ_ONLY, reads the child's commit, and `reader_list` shows the parent's PID.
 - [ ] Steps: RED, implement, GREEN, commit `heed-zerodb: honor NO_LOCK; read-only envs join the lock file (ADR-0023 amendment 17)`.
+
+**Approved amendment 17 additions (2026-10-12; ADR-0023 amendment 17 is the authority, decision 9):**
+- `LockFile::open` returns a distinct `LockOpenError::ReadOnlyFs` when the env is `READ_ONLY` and creating or opening the lock file fails with `EROFS`. `zerodb::EnvOpenOptions::open` then continues with no lock file (`OBS_RDONLY_LOCK_READONLY_FS = 0`). Other errors (`OBS_RDONLY_LOCK_DIR_UNWRITABLE = EACCES`) fail the open and create nothing.
+- Extra test, macOS only via an `hdiutil` read-only image or Linux only via a read-only bind mount, skipping with `SKIPPED: <reason>` when unavailable: `read_only_env_on_read_only_media_opens_without_a_lock_file`.
 
 ### Task 9: Cross-process `info()`/`stat()` and the joiner's `meta()`
 

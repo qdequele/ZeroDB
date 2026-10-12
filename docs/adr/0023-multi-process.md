@@ -309,8 +309,8 @@ atomic states its `Ordering` and why, assuming a weak memory model.
 
 ## Amendments (stage-3 planning, 2026-10-12)
 
-Status: **Proposed, awaiting maintainer approval** (AGENTS.md rule 5). Nothing
-is implemented before approval. The LMDB behavior cited here is pinned by the
+Status: **Approved (2026-10-12, maintainer)**: all twelve decisions at the end of
+amendment 18 are accepted as proposed. The LMDB behavior cited here is pinned by the
 `OBS_*` constants of `crates/zerodb-oracle/tests/lmdb_stage3_observation.rs`.
 Each value was observed on both macOS aarch64 and Linux aarch64. The Linux
 results come from a privileged container (`--privileged`), which allowed the
@@ -328,7 +328,7 @@ Terms used below:
   and 2. Stage 3 turns it on by default.
 
 15. **Map growth: `MapResized`, `Env::resize`, and grow-only mappings.**
-    Proposed, awaiting maintainer approval.
+    Approved 2026-10-12.
 
     *Observed LMDB behavior (binding, rule 1).*
 
@@ -622,8 +622,7 @@ Terms used below:
     - ADR-0004 D4 ("map once, no remap") is amended by reference: a mapping
       is never remapped in place; a larger one is added.
 
-16. **Lock-file name derivation and the file guards.** Proposed, awaiting
-    maintainer approval.
+16. **Lock-file name derivation and the file guards.** Approved 2026-10-12.
     - The default lock name is derived from the data-file name: `zerodb.dat`
       → `zerodb.lock`, `data.mdb` → `lock.mdb`, and any other name
       `<data_file_name>-lock` (LMDB's `MDB_NOSUBDIR` convention). An explicit
@@ -684,7 +683,7 @@ Terms used below:
         renamed, which is a new protocol, not proposed here.
     - SPEC 02 §8 (naming) and `docs/COMPATIBILITY.md` record the rule.
 
-17. **`NO_LOCK` and read-only.** Proposed, awaiting maintainer approval.
+17. **`NO_LOCK` and read-only.** Approved 2026-10-12.
     - The engine's opt-out is `EnvOpenOptions::lock_file(false)`. The default
       becomes `true` (the default flip), gated as below.
     - heed's `NO_LOCK` maps to `lock_file(false)`. The adapter's flag
@@ -732,7 +731,7 @@ Terms used below:
       DIVERGENCES D-016 (it says `NO_LOCK` is an accepted no-op) and
       `docs/COMPATIBILITY.md` are updated.
 
-18. **Tools attach as readers.** Proposed, awaiting maintainer approval.
+18. **Tools attach as readers.** Approved 2026-10-12.
     - `stat`, `dump` and `check` open the environment `READ_ONLY` through
       `EnvOpenOptions`, with the data name the tool found and the lock name
       derived from it (amendment 16).
@@ -796,7 +795,7 @@ Terms used below:
     - The "tools run offline" text in the `zerodb-tools` crate docs and usage
       string, `docs/TOOLS.md`, and AGENTS.md change with it.
 
-    **Decisions for the maintainer** (approve or override each one):
+    **Decisions** (approved 2026-10-12 by the maintainer, all as proposed):
 
     1. **Remap mechanism:** grow-only mappings kept until close.
        *Alternative:* the mapping's `Arc` in `Snapshot`, which unmaps
