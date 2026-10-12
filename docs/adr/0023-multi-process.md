@@ -312,8 +312,12 @@ atomic states its `Ordering` and why, assuming a weak memory model.
 Status: **Proposed, awaiting maintainer approval** (AGENTS.md rule 5). Nothing
 is implemented before approval. The LMDB behavior cited here is pinned by the
 `OBS_*` constants of `crates/zerodb-oracle/tests/lmdb_stage3_observation.rs`.
-Each value was observed on both macOS aarch64 and Linux aarch64. The choices
-that need a decision are collected at the end of amendment 18.
+Each value was observed on both macOS aarch64 and Linux aarch64. The Linux
+results come from a privileged container (`--privileged`), which allowed the
+read-only bind mount and dropping to `nobody`. Without those privileges the
+read-only-filesystem and run-as-`nobody` cases print `SKIPPED: <reason>` and
+record nothing. The choices that need a decision are collected at the end of
+amendment 18.
 
 Terms used below:
 - **Mapping:** one `mmap` of the data file.
@@ -349,6 +353,11 @@ Terms used below:
     file. The open in `zerodb_io::open_or_create_with_advice` now sets the
     logical map size to `max(requested or persisted, (last_pg + 1) *
     page_size)`, as LMDB does.
+
+    The same `MAX_MAP_SIZE` cap as `resize` (below) applies at open, before
+    any `set_len` or `mmap`. A persisted meta `map_size` above it is corrupt
+    and fails the open with `Invalid`. A requested size above it fails with
+    `Io(InvalidInput)`.
 
     *Where the logical size lives.* A published `MapView` holds two values:
     a reference to a mapping and the logical map size. One `Acquire` load of
@@ -407,12 +416,13 @@ Terms used below:
     3. Read the newest snapshot: at `T` with `pread`, without the map check,
        or the process-local cell without a lock file.
     4. Compute `size = if new_size == 0 { snapshot.map_size } else { new_size }`,
-       then round it up to `(last_pg + 1) * page_size`.
-    5. Validate it. `0`, or a size above `MAX_MAP_SIZE` (2^47 bytes, 128 TiB,
-       the x86-64 user address space), is refused: a meta-supplied size with
-       `Invalid` (the meta is corrupt), a caller-supplied size with
-       `Io(InvalidInput)`. This keeps a corrupt meta from causing a huge
-       `set_len` under `WRITE_MAP`.
+       then round it up to `(last_pg + 1) * page_size`, computed with checked
+       arithmetic: an overflow is `Invalid`. The result is never 0, since it
+       is at least two pages.
+    5. Refuse a size above `MAX_MAP_SIZE` (2^47 bytes, 128 TiB, the x86-64
+       user address space): a meta-supplied size with `Invalid` (the meta is
+       corrupt), a caller-supplied size with `Io(InvalidInput)`. This keeps a
+       corrupt meta from causing a huge `set_len` under `WRITE_MAP`.
     6. Call `Backing::grow_map(size)`, which publishes the new view.
     7. Release the locks.
 
@@ -492,19 +502,38 @@ Terms used below:
     cross-process writer lock. A check-then-`set_len` without it can shrink
     the file under another process's mapping: A reads 8 MiB, B grows the file
     to 32 MiB, then A sets 16 MiB, and B gets `SIGBUS`.
-    - **In `resize`**, the lock is held from step 2. `grow_map` re-reads the
-      file length (`fstat`) and calls `set_len(map_size)` only if the file is
-      shorter.
+
+    - **In `resize`**, both writer locks are held from step 2, taken through
+      the core's ordinary path, which reaps dead readers after a dead-owner
+      takeover (amendment 12). `grow_map` re-reads the file length (`fstat`)
+      and calls `set_len(map_size)` only if the file is shorter.
     - **At open**, today `map_backing` calls `set_len` unguarded. Instead:
       - an *initializer*, which won the first-opener election and is the only
         process, grows the file as today;
-      - a *joiner* opening with `WRITE_MAP` takes the cross-process writer
-        lock around the length check and `set_len`. It holds no in-process
-        writer lock yet (the env does not exist), and a process holding the
-        writer lock never waits on the election, so no cycle exists. The
-        joiner may wait for another process's write txn to finish, as a
-        write begin does.
+      - a *joiner* opening with `WRITE_MAP` does **not** grow the file at
+        open. It maps the logical size, which may extend past the file's
+        end.
       - Without a lock file, the single-process path is unchanged.
+    - **At a write-txn begin**, after both writer locks are held (and after
+      the takeover reap, if any), a `WRITE_MAP` env grows the file to its
+      logical map size if it is shorter: an `fstat` re-read, then `set_len`.
+
+    Why a joiner's mapping past the file's end is safe:
+    - A mapped page past the end of the file faults only when accessed.
+    - Readers touch only pages up to their snapshot's `last_pg`. Those lie
+      inside the file: the writer that committed them extended the file
+      under the writer lock, through its own begin-time growth or by
+      `pwrite`, before publishing `T`.
+    - In-place `WRITE_MAP` writes (the ADR-0021 broker and `write_at`) happen
+      only inside a write txn, after that txn's begin-time growth to the
+      logical size. Every page allocated below the logical size (`MapFull`)
+      is therefore inside the file.
+
+    This also keeps every call of the cross-process writer lock inside the
+    in-process writer lock. The Linux same-PID-stale takeover in
+    `LockFile::lock_writer` keeps its stated reason unchanged: no other
+    thread of this process can own the cross-process lock while the caller
+    holds the in-process one.
 
     With this, §5's "`WRITE_MAP` only ever grows the file while other
     processes may be alive" holds.
@@ -518,7 +547,10 @@ Terms used below:
 
     *`unsafe`.* It is all in `zerodb-io`, in the mmap-access category, each
     instance with a `// SAFETY:` comment:
-    - the dereference of `current` in `view()`;
+    - the dereference of the view pointer loaded from `current` in `view()`,
+      and of that view's `mapping` pointer;
+    - in `publish`, the dereference of the current view (and its `mapping`)
+      to reuse the mapping when no new one is added;
     - the `Box::from_raw` calls in `Drop for MapRegions`;
     - `unsafe impl Send for MapRegions` and `unsafe impl Sync for MapRegions`.
       Raw pointers are neither `Send` nor `Sync`. These are sound because
@@ -627,9 +659,29 @@ Terms used below:
         "ours". The initializer therefore truncates to 0 and then writes an
         initializing magic with `pwrite` at the magic offset, before
         `set_len` and before the final magic (amendment 10).
-      - A crash at any point leaves an empty file, or one carrying the
-        initializing or final magic. All three are accepted.
+      - A *process* crash at any point leaves an empty file, or one carrying
+        the initializing or final magic. All three are accepted.
+      - Nothing fsyncs the lock file, so an *OS* crash or power loss can
+        keep the new length and lose the block holding the magic. The file
+        then reads as zeros with a non-zero length. The initializer
+        therefore also accepts a file whose whole header (the first 256
+        bytes, up to the slot table) is zero, as never initialized. LMDB never
+        refuses here, and neither does this rule.
+      - An initialized data file can never match. A ZeroDB data file's page
+        0 is a meta page with the magic `ZDB1` at byte 32, and an LMDB data
+        file's page 0 carries `0xBEEFC0DE` at byte 16. Both lie inside the
+        first 256 bytes and are non-zero.
       - Joiners keep treating anything but the final magic as unfinished.
+      - **Residual window.** A data file is created under its final name
+        (`create_env_file`: `O_EXCL`, then `set_len` to two pages, then the
+        two meta writes and an fsync). Between the create and the first meta
+        write it is empty or all zero. If, in that window, another env's
+        initializer opens the same file as its lock file (only possible with
+        the naming collision above), the guard accepts it, and both envs
+        fail. The window is a few syscalls, and the derived names already
+        narrow the case to a deliberately colliding data name. Closing it
+        would need the data file to be built under a temporary name and
+        renamed, which is a new protocol, not proposed here.
     - SPEC 02 §8 (naming) and `docs/COMPATIBILITY.md` record the rule.
 
 17. **`NO_LOCK` and read-only.** Proposed, awaiting maintainer approval.
@@ -669,9 +721,10 @@ Terms used below:
         fails with `EROFS` continues on the single-process path, with no
         lock file, as if `NO_LOCK` were set. Every other lock-file error
         fails the open, as `Io`.
-      - The fourth row was made with a read-only disk image on macOS and a
-        read-only bind mount on Linux. The errno LMDB reacted to is
-        inferred from the setup, not printed.
+      - The fourth row was made with a read-only disk image (`hdiutil`) on
+        macOS, and with a read-only bind mount in the privileged Linux
+        container. The errno LMDB reacted to is inferred from the setup, not
+        printed.
       - A read-only process may win the election and initialize the lock
         file. It seeds `T` from the meta and never writes the data file or
         takes the writer lock.
@@ -695,21 +748,45 @@ Terms used below:
       meta slots, and it never reads the content of pages that are free in
       that snapshot.
     - If the open fails as `Invalid` (a corrupt file, which is when `check`
-      matters most), `check` falls back to the raw-image walker, after a
-      liveness probe:
-      - it tests the lock file's election byte with `F_GETLK`; every process
-        with the env open holds it;
-      - if another process holds it, `check` refuses;
-      - otherwise, or when there is no lock file, it walks the raw image and
-        says it did so offline.
+      matters most), `check` falls back to the raw-image walker, while
+      holding the env exclusively:
+      - A new engine API,
+        `zerodb::ExclusiveLock::acquire(dir, &EnvOpenOptions) -> Result<ExclusiveLock>`,
+        opens the env's lock file through `LockFile::open`. It succeeds only
+        if this process wins the first-opener election, and returns an
+        "env in use" error otherwise. It never calls `finish_open`, so the
+        election byte stays write-locked until the guard drops.
+      - Every other opener waits in the election meanwhile. Dropping the
+        guard leaves the initializing magic, which the next opener accepts
+        (amendment 16).
+      - It is the engine's own lock-file descriptor, the only one. The
+        in-process registry refuses a second open of that lock file before
+        any descriptor exists (amendment 2), and the tool opens no `Env`
+        while it holds the guard. So POSIX's per-process record locks cannot
+        be dropped or shadowed by another descriptor. The walker reads the
+        *data* file, whose descriptors do not affect lock-file locks.
+      - If no lock file can exist (read-only media, amendment 17), the raw
+        walk runs and says it ran offline without a liveness guarantee, as
+        LMDB tools would.
     - A `MapResized` at begin is answered with `resize(0)` and one retry.
     - `load` and `migrate-from-lmdb` keep refusing a non-empty destination
       (`refuse_existing_env`). Their destination `flock` excludes another
       tool but not a ZeroDB process, so it is replaced:
-      - the tool holds the destination lock file's election byte
-        *exclusively* for the whole build, through a `zerodb-io` helper, so
-        any ZeroDB opener waits until the build is done;
-      - the AGENTS.md `libc::flock` exception and `zerodb_tools::lock` are
+      - They open the destination through the engine, with the lock file
+        on, and refuse unless this process won the first-opener election.
+        This uses a new engine API, `Env::opened_exclusively() -> bool`,
+        backed by `SharedRegion::is_initializer`, which is `true` without a
+        lock file.
+      - They hold that `Env` for the whole run and write through ordinary
+        write txns. `migrate` already does. `load` moves from streaming raw
+        pages into the data file to write txns with sequential writes
+        (ADR-0015), as LMDB's `mdb_load` uses txns. Streaming raw pages under
+        an open env would truncate and rewrite a file another process may
+        have mapped.
+      - Another process can still join after the check, as with `mdb_load`.
+        A joining reader sees each commit through `T` and is harmless to a
+        fresh load. A joining writer interleaves its own txns, as with LMDB.
+      - The AGENTS.md `libc::flock` exception and `zerodb_tools::lock` are
         retired.
     - `crates/zerodb-tools/tests/live_env_refusal.rs` changes behavior.
       `tools_refuse_a_locked_env` is rewritten to hold a live env with an
@@ -732,25 +809,31 @@ Terms used below:
        no commit lands while it rounds up. *Alternative:* LMDB's lock-free
        `set_mapsize`, which relies on the write-begin check and gives up
        invariant 2 for cached read snapshots.
-    4. **The data file grows only under the cross-process writer lock**,
-       both at a `WRITE_MAP` joiner's open and in `resize`. *Alternative:*
-       refuse `WRITE_MAP` growth while other processes are alive.
+    4. **The data file grows only under both writer locks**, in `resize`
+       and at a `WRITE_MAP` write-txn begin. A `WRITE_MAP` joiner never
+       grows it at open. *Alternative:* refuse `WRITE_MAP` growth while
+       other processes are alive.
     5. **`resize` with live read txns succeeds**, as LMDB's return code
        does. *Alternative:* refuse while any in-process txn is live.
-    6. **`MAX_MAP_SIZE` = 2^47** for `resize`. *Alternative:* no cap; only an
-       `mmap` failure stops it.
+    6. **`MAX_MAP_SIZE` = 2^47**, for `resize` and at open. *Alternative:*
+       no cap; only an `mmap` failure stops it.
     7. **Derived lock names** for non-default data names, reversing open
        question 1 there. *Alternative:* keep `zerodb.lock` and refuse a
        second data name in one directory.
-    8. **Foreign-file guard with an initializing magic.** *Alternative:* the
-       same-file guard only.
+    8. **Foreign-file guard** with an initializing magic, which also accepts
+       an all-zero header. The creation window stays open. *Alternative:*
+       the same-file guard only.
     9. **Read-only media:** `EROFS` on the lock file proceeds without a lock
        file, mirroring LMDB. *Alternative:* fail the open.
-    10. **`check`'s raw fallback refuses while the election byte is held.**
-        *Alternative:* warn and walk anyway.
-    11. **`load` and `migrate` hold the destination's election byte**, which
-        retires the `flock`. *Alternative:* keep the `flock`, which excludes
-        tools only.
+    10. **`check`'s raw fallback runs only under `ExclusiveLock`**, which
+        holds the election byte for the whole walk. *Alternative:* warn and
+        walk anyway.
+    11. **`load` and `migrate` open the destination through the engine**,
+        refuse unless `Env::opened_exclusively()`, and write through txns.
+        `load` drops raw streaming, which retires the `flock`.
+        *Alternative:* keep `load`'s raw streaming under `ExclusiveLock` for
+        the whole build. That is faster, and every opener waits, but the
+        tool would hold no `Env`.
     12. **The default flip is gated** on the Linux three-column bench.
         *Alternative:* flip now and measure in the PR.
 
