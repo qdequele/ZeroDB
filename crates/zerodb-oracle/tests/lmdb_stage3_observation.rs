@@ -470,7 +470,10 @@ fn observe_rdonly_lock_unwritable() {
             .unwrap()
             .as_str()
         {
-            "skip" => -1,
+            "skip" => {
+                println!("SKIPPED: running as root and cannot drop to uid 65534");
+                -1
+            }
             n => n.parse().unwrap(),
         }
     } else {
@@ -575,7 +578,10 @@ fn rdonly_open_rc(dir: &Path) -> i32 {
     let out = out_dir.path().join("result");
     run_child_out("ro_nobody", dir, Some(&out));
     match std::fs::read_to_string(&out).unwrap().as_str() {
-        "skip" => -1,
+        "skip" => {
+            println!("SKIPPED: running as root and cannot drop to uid 65534");
+            -1
+        }
         n => n.parse().unwrap(),
     }
 }
@@ -592,6 +598,30 @@ fn observe_rdonly_lock_dir_unwritable() {
     println!("MDB_RDONLY, no lock.mdb, directory mode 0555: rc {rc}, lock created {created}");
     if rc != -1 {
         assert_eq!(rc, OBS_RDONLY_LOCK_DIR_UNWRITABLE);
+        assert!(
+            !created,
+            "a RDONLY open of an unwritable dir created lock.mdb"
+        );
+    }
+}
+
+/// Run `cmd` to completion within 60 s; `false` on a failure exit, a spawn
+/// error or the timeout (the child is then killed).
+fn run_bounded(cmd: &mut Command) -> bool {
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return st.success(),
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
     }
 }
 
@@ -605,11 +635,9 @@ impl Drop for ReadOnlyFs {
     fn drop(&mut self) {
         let m = self.mount.to_str().unwrap();
         if cfg!(target_os = "macos") {
-            let _ = Command::new("hdiutil")
-                .args(["detach", "-force", m])
-                .status();
+            run_bounded(Command::new("hdiutil").args(["detach", "-force", m]));
         } else {
-            let _ = Command::new("umount").arg(m).status();
+            run_bounded(Command::new("umount").arg(m));
         }
     }
 }
@@ -621,7 +649,7 @@ fn read_only_fs(src: &Path) -> Result<ReadOnlyFs, String> {
     let keep = TempDir::new().unwrap();
     let mount = keep.path().join("mnt");
     std::fs::create_dir(&mount).unwrap();
-    let ok = |c: &mut Command| c.status().map(|s| s.success()).unwrap_or(false);
+    let ok = run_bounded;
     if cfg!(target_os = "macos") {
         let img = keep.path().join("ro.dmg");
         if !ok(Command::new("hdiutil")
@@ -646,7 +674,7 @@ fn read_only_fs(src: &Path) -> Result<ReadOnlyFs, String> {
             .args(["-o", "remount,bind,ro"])
             .arg(&mount))
         {
-            let _ = Command::new("umount").arg(&mount).status();
+            run_bounded(Command::new("umount").arg(&mount));
             return Err("read-only remount failed".into());
         }
     }
@@ -671,7 +699,7 @@ fn observe_rdonly_lock_readonly_fs() {
             rc
         }
         Err(why) => {
-            println!("MDB_RDONLY on a read-only filesystem: not observed here ({why})");
+            println!("SKIPPED: MDB_RDONLY on a read-only filesystem not observed here ({why})");
             -1
         }
     };
