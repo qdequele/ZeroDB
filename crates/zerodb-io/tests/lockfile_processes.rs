@@ -69,15 +69,28 @@ fn child_entry() {
     let path = dir.join("zerodb.lock");
     match role.as_str() {
         // Win the election, never finish: stand in for an initializer that
-        // dies (SIGKILL) before seeding T.
+        // dies (SIGKILL) before seeding T. The parent kills it; should the
+        // parent die first (a test-runner crash), it exits instead of
+        // lingering for the full 600 s.
         "init_and_hang" => {
             let l = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 8).unwrap();
             assert!(l.is_initializer());
             std::fs::write(dir.join("initializing"), b"").unwrap();
-            std::thread::sleep(Duration::from_secs(600));
+            // SAFETY: `getppid` is a pure query with no memory effects.
+            let parent = unsafe { libc::getppid() };
+            let end = Instant::now() + Duration::from_secs(600);
+            // An orphan is reparented, so its parent PID changes.
+            // SAFETY: as above.
+            while Instant::now() < end && unsafe { libc::getppid() } == parent {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::process::exit(1);
         }
         // Join (or initialize), finish, report, exit.
         "join_and_report" => {
+            // Written before the open, which blocks while an initializer
+            // holds the election lock.
+            std::fs::write(dir.join("child-opening"), b"").unwrap();
             let l = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 8).unwrap();
             l.bind_page_size(4096).unwrap();
             l.finish_open().unwrap();
@@ -106,7 +119,12 @@ fn joiner_whose_initializer_died_reinitializes() {
     let opener = std::thread::spawn(move || {
         LockFile::open(&path, &path.with_file_name("zerodb.dat"), 8).map(|l| l.is_initializer())
     });
-    std::thread::sleep(Duration::from_millis(200)); // the joiner is now blocked
+    std::thread::sleep(Duration::from_millis(200));
+    // The joiner is blocked behind the live initializer, not done.
+    assert!(
+        !opener.is_finished(),
+        "the joiner's open returned while the initializer was alive"
+    );
     init.0.kill().unwrap();
     init.0.wait().unwrap();
     let became_initializer = opener
@@ -136,13 +154,40 @@ fn three_way_race_after_initializer_death() {
             l.finish_open().unwrap();
             l
         });
+        // Both joiners are blocked behind the live initializer before it is
+        // killed: each has started its open and neither has finished it.
+        wait_for(&dir.0.join("child-opening"));
         std::thread::sleep(Duration::from_millis(100));
+        let mut child = child;
+        assert!(
+            !parent.is_finished(),
+            "the parent's open returned while the initializer was alive"
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none()
+                && !dir.0.join("child-init").exists()
+                && !dir.0.join("child-join").exists(),
+            "the child's open returned while the initializer was alive"
+        );
         init.0.kill().unwrap();
         init.0.wait().unwrap();
         let l = parent.join().unwrap();
         std::fs::write(dir.0.join("parent-open"), b"").unwrap();
-        let mut child = child;
-        assert!(child.0.wait().unwrap().success(), "child open failed");
+        let status = child.0.wait().unwrap();
+        if !status.success() {
+            // The child reports its open before it waits for `parent-open`,
+            // so a marker means the open succeeded and the child failed
+            // later (for example on its `wait_for` deadline).
+            let opened = dir.0.join("child-init").exists() || dir.0.join("child-join").exists();
+            panic!(
+                "child {} ({status})",
+                if opened {
+                    "opened, then failed waiting for the parent"
+                } else {
+                    "open failed"
+                }
+            );
+        }
         let child_init = dir.0.join("child-init").exists();
         assert!(
             l.is_initializer() != child_init,

@@ -162,6 +162,9 @@ pub(crate) struct HeapRegion {
     next_lock_is_takeover: std::sync::atomic::AtomicBool,
     /// When set, every [`SharedRegion::is_alive`] probe fails.
     probes_fail: std::sync::atomic::AtomicBool,
+    /// When set, the next [`SharedRegion::lock_writer`] fails with an I/O
+    /// error without taking the lock (and clears the flag).
+    next_lock_fails: std::sync::atomic::AtomicBool,
 }
 
 /// The part of a [`HeapRegion`] that models the lock file's contents.
@@ -186,6 +189,7 @@ impl HeapRegion {
             dead: std::sync::Mutex::new(Vec::new()),
             next_lock_is_takeover: std::sync::atomic::AtomicBool::new(false),
             probes_fail: std::sync::atomic::AtomicBool::new(false),
+            next_lock_fails: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -201,6 +205,7 @@ impl HeapRegion {
             dead: std::sync::Mutex::new(Vec::new()),
             next_lock_is_takeover: std::sync::atomic::AtomicBool::new(false),
             probes_fail: std::sync::atomic::AtomicBool::new(false),
+            next_lock_fails: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -214,6 +219,14 @@ impl HeapRegion {
     pub(crate) fn simulate_takeover_on_next_lock(&self) {
         // Relaxed: a test knob set and read on the same thread.
         self.next_lock_is_takeover
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Make the next [`SharedRegion::lock_writer`] call fail with an I/O
+    /// error, without taking the lock.
+    pub(crate) fn fail_next_lock(&self) {
+        // Relaxed: a test knob set and read on the same thread.
+        self.next_lock_fails
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -253,6 +266,13 @@ impl SharedRegion for HeapRegion {
                 .contains(&pid))
     }
     fn lock_writer(&self) -> std::io::Result<bool> {
+        // Relaxed: a test knob, set on the thread that takes the lock.
+        if self
+            .next_lock_fails
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(std::io::Error::other("test lock failure"));
+        }
         let mut held = self.writer.lock().expect("test region poisoned");
         while *held {
             held = self.cv.wait(held).expect("test region poisoned");

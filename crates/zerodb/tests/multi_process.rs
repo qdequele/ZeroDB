@@ -231,11 +231,33 @@ fn child_entry() {
             w.commit().unwrap();
         }
         "write_when_free" => {
-            mark(&dir, "child-waiting");
-            let mut w = env.write_txn().unwrap(); // blocks while the parent writes
-            mark(&dir, "child-got-lock");
-            db.put(&mut w, b"child", b"2").unwrap();
-            w.commit().unwrap();
+            // A helper thread begins the write txn, which blocks while the
+            // parent writes. This thread confirms the block from inside the
+            // child: once the begin has been under way for 300 ms without
+            // returning, it writes `child-blocked`. The parent waits for
+            // that marker instead of timing the child from outside.
+            let started = std::sync::atomic::AtomicBool::new(false);
+            let got = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    // SeqCst (both flags): a two-flag handshake with the
+                    // checking thread below; ordering cost is irrelevant.
+                    started.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let mut w = env.write_txn().unwrap(); // blocks while the parent writes
+                    got.store(true, std::sync::atomic::Ordering::SeqCst);
+                    mark(&dir, "child-got-lock");
+                    db.put(&mut w, b"child", b"2").unwrap();
+                    w.commit().unwrap();
+                });
+                mark(&dir, "child-waiting");
+                while !started.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(Duration::from_millis(300));
+                if !got.load(std::sync::atomic::Ordering::SeqCst) {
+                    mark(&dir, "child-blocked");
+                }
+            });
         }
         "hold_and_die" => {
             let mut w = env.write_txn().unwrap();
@@ -424,6 +446,27 @@ fn foreign_reader_holds_back_page_reuse() {
     assert!(zerodb::check::check_image(&bytes, 4096).is_empty());
 }
 
+/// Wait until a `write_when_free` child reports that its write-txn begin
+/// stayed blocked for 300 ms (`child-blocked`). Fails if the child got the
+/// writer lock instead (`child-got-lock`): the parent holds it, so it must not.
+fn wait_child_blocked(dir: &Path) {
+    let end = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            !dir.join("child-got-lock").exists(),
+            "child took the writer lock while the parent held it"
+        );
+        if dir.join("child-blocked").exists() {
+            return;
+        }
+        assert!(
+            Instant::now() < end,
+            "timed out waiting for the child to block on the writer lock"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn writers_in_two_processes_exclude_each_other() {
     let dir = TempDir::new();
@@ -431,12 +474,7 @@ fn writers_in_two_processes_exclude_each_other() {
     let db = env.main_database();
     let mut w = env.write_txn().unwrap();
     let mut c = child("write_when_free", dir.path());
-    wait_for(&dir.path().join("child-waiting"), Duration::from_secs(30));
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        !dir.path().join("child-got-lock").exists(),
-        "child took the writer lock while the parent held it"
-    );
+    wait_child_blocked(dir.path());
     db.put(&mut w, b"parent", b"1").unwrap();
     w.commit().unwrap();
     assert!(c.wait().unwrap().success());
@@ -477,13 +515,15 @@ fn second_process_with_other_max_readers_adopts_the_lock_files() {
     let dir = TempDir::new();
     let env = open(dir.path()); // max_readers 16
     for asked in [32u32, 4] {
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "child_entry_other_readers", "--nocapture"])
-            .env(DIR, dir.path())
-            .env(MAP, asked.to_string())
-            .status()
-            .unwrap();
-        assert!(status.success(), "child asking for {asked} readers");
+        let mut c = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "child_entry_other_readers", "--nocapture"])
+                .env(DIR, dir.path())
+                .env(MAP, asked.to_string())
+                .spawn()
+                .unwrap(),
+        );
+        wait_success(&mut c, Duration::from_secs(60));
     }
     assert_eq!(env.info().max_readers, 16);
     let r = env.read_txn().unwrap();
@@ -591,11 +631,14 @@ fn reaped_slot_lets_the_writer_reuse_pages() {
     let pinned = churn_growth(&env, 20);
     assert!(pinned > 0, "the pinned churn did not grow the file");
     assert_eq!(env.clear_stale_readers().unwrap(), 2);
-    churn_growth(&env, 2); // let the freelist catch up
+    // With no reader left, every page the pinned churn freed is reusable at
+    // once, and there are far more of them than one rewrite needs: the same
+    // churn now allocates every page from the freelist and the file does not
+    // grow by a single page.
     let freed = churn_growth(&env, 20);
-    assert!(
-        freed * 4 < pinned,
-        "pages are not reused after reaping: growth {freed} vs {pinned} while pinned"
+    assert_eq!(
+        freed, 0,
+        "pages are not reused after reaping: growth {freed} pages (vs {pinned} while pinned)"
     );
 }
 
@@ -635,9 +678,7 @@ fn writer_lock_released_on_another_thread_admits_another_process() {
     let mut w = env.write_txn().unwrap();
     db.put(&mut w, b"parent", b"1").unwrap();
     let mut c = child("write_when_free", dir.path());
-    wait_for(&dir.path().join("child-waiting"), Duration::from_secs(30));
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(!dir.path().join("child-got-lock").exists(), "lock not held");
+    wait_child_blocked(dir.path());
     std::thread::scope(|s| {
         s.spawn(move || w.commit().unwrap());
     });
@@ -820,16 +861,26 @@ fn wm_resizer(dir: &Path) {
     }
 }
 
-/// 300 small write txns on a 1 MiB map; a `MapResized` begin adopts the
-/// newer size with `resize(0)` and retries.
+/// At least 300 small write txns on a 1 MiB map; a `MapResized` begin adopts
+/// the newer size with `resize(0)` and retries. It keeps writing past 300
+/// until it has seen at least one `MapResized` (the resizer's data passes
+/// the 1 MiB map midway, so one comes), so the run always exercises growth
+/// by another process; the retry count goes to `writer-retries`.
 fn wm_writer(dir: &Path) {
     let env = open_write_map(dir, MIB);
     let db = env.main_database();
     let mut i = 0u32;
-    while i < 300 {
+    let mut retries = 0u32;
+    let end = Instant::now() + Duration::from_secs(90);
+    while i < 300 || retries == 0 {
+        assert!(
+            Instant::now() < end,
+            "no MapResized within 90 s ({i} commits)"
+        );
         let mut w = match env.write_txn() {
             Ok(w) => w,
             Err(Error::Mdb(MdbError::MapResized)) => {
+                retries += 1;
                 env.resize(0).expect("adopt the grown map");
                 continue;
             }
@@ -840,6 +891,7 @@ fn wm_writer(dir: &Path) {
         w.commit().unwrap();
         i += 1;
     }
+    std::fs::write(dir.join("writer-retries"), retries.to_string()).unwrap();
 }
 
 /// Two `WRITE_MAP` processes, one growing the map and one writing on a
@@ -872,6 +924,16 @@ fn write_map_processes_never_shrink_the_file() {
     let (r_st, w_st) = (r_done.unwrap(), w_done.unwrap());
     assert!(r_st.success(), "resizer failed: {r_st}");
     assert!(w_st.success(), "writer failed: {w_st}");
+    // The writer met the resizer's growth at least once, so the run
+    // exercised cross-process growth rather than two disjoint runs.
+    let retries: u32 = std::fs::read_to_string(dir.path().join("writer-retries"))
+        .expect("the writer's retry count")
+        .parse()
+        .unwrap();
+    assert!(
+        retries >= 1,
+        "the writer never got MapResized: no cross-process growth"
+    );
     // Both processes' commits are present.
     env.resize(0).expect("adopt the grown map");
     let db = env.main_database();

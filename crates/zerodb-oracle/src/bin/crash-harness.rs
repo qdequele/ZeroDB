@@ -22,7 +22,7 @@
 //! <dir> <kill>` — see `crash::sigkill`. Multi-process mechanism (`--mechanism
 //! mp`, opt-in, never part of `both`): the lock-file writer child
 //! `--crash-child-lock <seed> <dir> <kill>` and the reader child
-//! `--crash-reader <dir> <page_size> <map_size>` — see `crash::multiproc`.
+//! `--crash-reader <dir> <page_size> <map_size> <seed>` — see `crash::multiproc`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -149,6 +149,10 @@ struct Totals {
     image_cuts: u64,
     sigkill_cycles: u64,
     sigkill_verified: u64,
+    /// Multi-process cycles (`--mechanism mp`, ADR-0023), counted apart from
+    /// the single-process SIGKILL cycles.
+    mp_cycles: u64,
+    mp_verified: u64,
     abandoned: u64,
     adv_probes: u64,
     adv_opened: u64,
@@ -166,11 +170,16 @@ struct Totals {
 impl Totals {
     fn absorb(&mut self, r: &CutReport, mech: Mechanism) {
         self.verified += r.verified;
-        if mech == Mechanism::Image {
-            self.image_cuts += 1;
-        } else {
-            self.sigkill_cycles += 1;
-            self.sigkill_verified += r.verified;
+        match mech {
+            Mechanism::Image => self.image_cuts += 1,
+            Mechanism::Mp => {
+                self.mp_cycles += 1;
+                self.mp_verified += r.verified;
+            }
+            Mechanism::Sigkill | Mechanism::Both => {
+                self.sigkill_cycles += 1;
+                self.sigkill_verified += r.verified;
+            }
         }
         if r.abandoned {
             self.abandoned += 1;
@@ -211,13 +220,14 @@ fn main() {
         child_run(seed, &dir, &argv[4], true); // never returns
     }
     if argv.get(1).map(String::as_str) == Some("--crash-reader") {
-        if argv.len() != 5 {
+        if argv.len() != 6 {
             usage();
         }
         let dir = PathBuf::from(&argv[2]);
         let page_size: u32 = argv[3].parse().unwrap_or_else(|_| usage());
         let map_size: usize = argv[4].parse().unwrap_or_else(|_| usage());
-        reader_run(&dir, page_size, map_size); // never returns
+        let seed: u64 = argv[5].parse().unwrap_or_else(|_| usage());
+        reader_run(&dir, page_size, map_size, seed); // never returns
     }
 
     let args = parse_args();
@@ -362,18 +372,20 @@ fn main() {
     let secs = started.elapsed().as_secs_f64();
     println!(
         "\n=== crash-harness summary ===\n\
-         cycles verified : {} ({} image cuts, {} sigkill cycles → {} sigkill-verified)\n\
+         cycles verified : {} ({} image cuts, {} sigkill cycles → {} sigkill-verified, {} mp cycles → {} mp-verified)\n\
          abandoned cuts  : {}\n\
          by mode         : {:?}\n\
          adversarial     : {} probes — {} opened, {} designed-Invalid, {} walk-clean (characterization, not gated)\n\
          stale fallbacks : {} (NO_META_SYNC reclaim-clobber window, REC-10 as amended — walk/data waived)\n\
-         spilling txns   : {} image, {} sigkill (ADR-0017 spill cycles)\n\
+         spilling txns   : {} image, {} sigkill + mp (ADR-0017 spill cycles)\n\
          in-place regions: {} (ADR-0021 B3 — brokered map regions journaled by WRITE_MAP image cuts)\n\
          wall time       : {:.1}s ({:.1} cycles/s)",
         t.verified,
         t.image_cuts,
         t.sigkill_cycles,
         t.sigkill_verified,
+        t.mp_cycles,
+        t.mp_verified,
         t.abandoned,
         t.by_mode,
         t.adv_probes,

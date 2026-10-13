@@ -878,7 +878,7 @@ impl EnvInner {
     }
 
     /// The lock-file arm of [`EnvInner::lock_writer_shared`]. Out of line so
-    /// the default (no lock file) write-txn path stays as small as it was
+    /// the write-txn path without a lock file stays as small as it was
     /// before lock files existed.
     ///
     /// A writer that took the lock over from a dead owner then frees dead
@@ -1488,7 +1488,20 @@ impl Drop for EnvInner {
         // holds the only other reference; write txns borrow the region and
         // cannot outlive this `EnvInner`.
         self.reader_table.release_region();
-        drop(self.shared.take());
+        let shared = self.shared.take();
+        // With the reader table's reference released, this is the last one,
+        // so the drop below really closes the lock file before the close
+        // event fires. (Unit tests keep their own reference to the in-memory
+        // test region they open with, so the check is for every other build.)
+        #[cfg(not(test))]
+        if let Some(region) = &shared {
+            debug_assert_eq!(
+                Arc::strong_count(region),
+                1,
+                "the lock-file region outlives its environment"
+            );
+        }
+        drop(shared);
         self.closing.signal();
     }
 }
@@ -3391,6 +3404,131 @@ mod shared_env_tests {
         let guard = env.inner.lock_writer();
         assert!(!writer_held(&region));
         drop(guard);
+    }
+
+    /// The error path of `lock_writer_shared`: a failed cross-process lock
+    /// call fails the write-txn begin with that I/O error, leaves the guard
+    /// without the shared lock (so its drop issues no unlock for a lock never
+    /// taken), and the failed begin releases the in-process writer lock.
+    #[test]
+    fn failed_shared_lock_call_fails_the_begin_and_frees_the_writer() {
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(4, O::SeqCst);
+        let env = open(backing(4, 5), region.clone());
+
+        let mut guard = env.inner.lock_writer();
+        region.fail_next_lock();
+        match env.inner.lock_writer_shared(&mut guard) {
+            Err(Error::Io(e)) => assert_eq!(e.to_string(), "test lock failure"),
+            other => panic!("expected the lock call's Io error, got {other:?}"),
+        }
+        assert!(guard.shared.is_none(), "the guard recorded a failed lock");
+        assert!(!writer_held(&region));
+        drop(guard);
+
+        region.fail_next_lock();
+        match env.write_txn() {
+            Err(Error::Io(e)) => assert_eq!(e.to_string(), "test lock failure"),
+            Err(other) => panic!("expected the lock call's Io error, got {other:?}"),
+            Ok(_) => panic!("the write txn began without the shared lock"),
+        }
+        assert!(!writer_held(&region));
+        // Would block forever if the failed begin had kept the in-process
+        // writer lock.
+        let txn = env.write_txn().expect("the writer lock is free again");
+        assert!(writer_held(&region));
+        drop(txn);
+        assert!(!writer_held(&region));
+    }
+
+    /// A published meta slot with a bad magic or a bad format version (a
+    /// torn copy of a slot being rewritten reads as either) is retried, like
+    /// a bad CRC: `read_snapshot_at` answers "re-read T" rather than failing,
+    /// and only a slot that never decodes ends in `Invalid` once the retry
+    /// bound is reached.
+    #[test]
+    fn bad_magic_or_version_in_the_published_slot_is_retried() {
+        // Offsets of the magic and the format version in a meta page
+        // (SPEC 02 §3.1).
+        for (offset, what) in [(32usize, "magic"), (36, "format version")] {
+            let mut bytes = image(4, 5);
+            bytes[PS as usize + offset] ^= 0xFF;
+            let verdict = MetaPage::validate(&bytes[PS as usize..2 * PS as usize], PS).unwrap();
+            match (offset, &verdict) {
+                (32, MetaValidity::BadMagic) | (36, MetaValidity::BadVersion(_)) => {}
+                _ => panic!("{what}: unexpected verdict {verdict:?}"),
+            }
+            let b = VecBacking::new(bytes.clone(), 1 << 20);
+            assert!(
+                matches!(read_snapshot_at(&b, PS, 5), Ok(None)),
+                "{what}: a bad slot must ask for a retry"
+            );
+            // The sound slot still decodes.
+            let s = read_snapshot_at(&b, PS, 4).unwrap().expect("slot 0");
+            assert_eq!(s.txnid, 4);
+
+            // A joiner whose published slot stays bad gives up with Invalid.
+            let region = Arc::new(HeapRegion::new(4, 2, false));
+            region.published_txnid().store(5, O::SeqCst);
+            assert!(
+                matches!(
+                    try_open(Box::new(VecBacking::new(bytes.clone(), 1 << 20)), region),
+                    Err(Error::Mdb(MdbError::Invalid))
+                ),
+                "{what}: a slot that never decodes must end in Invalid"
+            );
+
+            // A slot that reads bad for a few copies and then decodes (a
+            // rewrite in progress, then finished) is retried until it does:
+            // the joiner seeds from T = 5.
+            let region = Arc::new(HeapRegion::new(4, 2, false));
+            region.published_txnid().store(5, O::SeqCst);
+            let bad_reads = Arc::new(std::sync::atomic::AtomicU32::new(3));
+            let torn = TornMetaBacking {
+                inner: VecBacking::new(image(4, 5), 1 << 20),
+                offset,
+                bad_reads: Arc::clone(&bad_reads),
+            };
+            let env = try_open(Box::new(torn), region).expect("retried until the slot decoded");
+            assert_eq!(env.inner.snapshot().txnid, 5, "{what}");
+            // Relaxed: read back on the thread that ran the open.
+            assert_eq!(
+                bad_reads.load(O::Relaxed),
+                0,
+                "{what}: the bad copies were read"
+            );
+        }
+    }
+
+    /// A [`VecBacking`] whose first `bad_reads` meta-slot copies have the
+    /// byte at `offset` flipped, as a copy torn by a concurrent rewrite of
+    /// the slot would read.
+    struct TornMetaBacking {
+        inner: VecBacking,
+        offset: usize,
+        bad_reads: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl Backing for TornMetaBacking {
+        fn view(&self) -> MapView<'_> {
+            self.inner.view()
+        }
+        fn real_disk_size(&self) -> std::io::Result<u64> {
+            self.inner.real_disk_size()
+        }
+        fn try_clone_file(&self) -> std::io::Result<std::fs::File> {
+            self.inner.try_clone_file()
+        }
+        fn read_meta_copy(&self, slot: u64, psize: u32, buf: &mut [u8]) -> std::io::Result<()> {
+            self.inner.read_meta_copy(slot, psize, buf)?;
+            // Relaxed: a counter touched only by the test's own thread.
+            let left = self.bad_reads.load(O::Relaxed);
+            if left > 0 {
+                self.bad_reads.store(left - 1, O::Relaxed);
+                buf[self.offset] ^= 0xFF;
+            }
+            Ok(())
+        }
     }
 
     #[test]

@@ -1016,9 +1016,37 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
-    /// A fresh directory per call. The counter keeps parallel tests apart
-    /// when the clock (microsecond resolution on macOS) repeats.
-    fn tmp() -> std::path::PathBuf {
+    /// The path of a lock file in a fresh directory, which is removed with
+    /// everything in it when this is dropped.
+    struct TmpLock {
+        path: std::path::PathBuf,
+    }
+
+    impl std::ops::Deref for TmpLock {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::path::Path> for TmpLock {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TmpLock {
+        fn drop(&mut self) {
+            if let Some(dir) = self.path.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// A lock-file path in a fresh directory per call. The counter keeps
+    /// parallel tests apart when the clock (microsecond resolution on macOS)
+    /// repeats.
+    fn tmp() -> TmpLock {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         // Relaxed: only uniqueness of the value matters.
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -1032,7 +1060,9 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
-        p.join("zerodb.lock")
+        TmpLock {
+            path: p.join("zerodb.lock"),
+        }
     }
 
     #[test]
