@@ -6,7 +6,8 @@
 //! holds a write txn, `mdb_env_info`'s reader count with readers in
 //! another process, the data-file length a `MDB_WRITEMAP` joiner leaves, and
 //! whether a process can join an `MDB_PREVSNAPSHOT` env before its first
-//! commit.
+//! commit, with the txn ids and snapshots around that env's first two
+//! commits and what a waiting process gets when the opener ends first.
 //! AGENTS.md rule 1: observed, not guessed. Drives the vendored fork through
 //! `lmdb-master-sys`; the test binary re-runs itself as the second process.
 //!
@@ -134,6 +135,83 @@ const OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT: [&str; 3] = ["blocked", "ok:pr
 /// names the older one); after the second they see it ("a_commit2").
 /// macOS (Darwin 27.0.0), 2026-10-13.
 const OBS_PREV_SNAPSHOT_FIRST_COMMIT_READ_VIEW: [&str; 2] = ["prev", "a_commit2"];
+/// A second process opens with `MDB_PREVSNAPSHOT` while the first
+/// `MDB_PREVSNAPSHOT` opener has not committed: its outcome within 3 s, then
+/// within 10 s after the opener's first commit ("ok:<snapshot>", "EAGAIN" or
+/// "rc=<rc>"). It waits for the opener's exclusive lock, then joins and
+/// fails with `EAGAIN`, as any `MDB_PREVSNAPSHOT` joiner does
+/// ([`OBS_PREV_SNAPSHOT_JOINER`]). macOS (Darwin 27.0.0), 2026-10-13.
+const OBS_PREV_SNAPSHOT_SECOND_PREV_OPENER: [&str; 2] = ["blocked", "EAGAIN"];
+/// A sole process opens with `MDB_RDONLY | MDB_PREVSNAPSHOT`, which can never
+/// commit; a second process opens without flags. Its outcome within 3 s,
+/// then within 10 s after the first process closes. The read-only opener
+/// keeps the exclusive lock for its whole life. On macOS its close then
+/// removes the SysV semaphores, so the waiter fails with `EINVAL`, as in
+/// [`OBS_PREV_SNAPSHOT_OPENER_CLOSES_BEFORE_COMMIT`]. macOS (Darwin 27.0.0),
+/// 2026-10-13.
+#[cfg(target_os = "macos")]
+const OBS_PREV_SNAPSHOT_READ_ONLY_OPENER: [&str; 2] = ["blocked", "rc=22"];
+/// As the macOS pin, on Linux: after the close the waiter joins and reads
+/// the older generation, as in the Linux
+/// [`OBS_PREV_SNAPSHOT_OPENER_CLOSES_BEFORE_COMMIT`]. Linux aarch64
+/// (OrbStack container, kernel 7.2.9), 2026-10-13.
+#[cfg(not(target_os = "macos"))]
+const OBS_PREV_SNAPSHOT_READ_ONLY_OPENER: [&str; 2] = ["blocked", "ok:prev"];
+/// The `MDB_PREVSNAPSHOT` opener commits a write txn with no changes while a
+/// process waits to join; the waiter's outcome within 3 s, then within 10 s
+/// after a commit that writes a key. The empty commit writes no meta and
+/// keeps the exclusive lock. macOS (Darwin 27.0.0), 2026-10-13.
+const OBS_PREV_SNAPSHOT_EMPTY_COMMIT_KEEPS_LOCK: [&str; 2] = ["blocked", "ok:prev"];
+/// `MDB_NOLOCK | MDB_PREVSNAPSHOT`, one process, two commits: `(snapshot
+/// after the first, snapshot after the second, the second keeps the first
+/// commit's key)`. Without a lock file the first commit is current at once
+/// and the second builds on it. macOS (Darwin 27.0.0), 2026-10-13.
+const OBS_PREV_SNAPSHOT_NOLOCK_COMMITS: (&str, &str, bool) = ("a_commit", "a_commit2", true);
+/// One process opens [`two_meta_generations`]'s env with `MDB_PREVSNAPSHOT`
+/// (16 MiB map) and commits twice. For each commit: `(write txn id, id of a
+/// fresh read txn right after it, me_last_txnid right after it)`. Both
+/// commits are txn 2, both written to the meta slot of the generation the
+/// open rolled back: the first commit leaves the shared txnid on the older
+/// meta (read txn 1), so the second write txn is again `1 + 1` and rebuilds
+/// from the older meta. `me_last_txnid` names the newest meta on disk.
+/// macOS (Darwin 27.0.0), 2026-10-13.
+const OBS_PREV_SNAPSHOT_COMMIT_TXNIDS: [(u64, u64, u64); 2] = [(2, 1, 2), (2, 2, 2)];
+/// In [`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`]'s run, whether the snapshot after
+/// the second commit still holds the first commit's key: it does not; the
+/// second commit's base is the older meta, so the first commit is lost.
+/// macOS (Darwin 27.0.0), 2026-10-13.
+const OBS_PREV_SNAPSHOT_SECOND_COMMIT_KEEPS_FIRST: bool = false;
+/// One `MDB_PREVSNAPSHOT` commit, then the env is closed and opened again
+/// without flags: the snapshot the fresh open serves (see [`snapshot_of`]).
+/// macOS (Darwin 27.0.0), 2026-10-13.
+const OBS_PREV_SNAPSHOT_ONE_COMMIT_THEN_REOPEN: &str = "a_commit";
+/// A process joins a `MDB_PREVSNAPSHOT` env after the opener's first commit
+/// (the opener still open): "ok:<read txn id> <me_last_txnid> <snapshot>".
+/// The joiner reads the older generation (txn 1) while its `mdb_env_info`
+/// names the newest meta on disk (txn 2, the opener's first commit).
+/// macOS (Darwin 27.0.0), 2026-10-13.
+const OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT: &str = "ok:1 2 prev";
+/// A process waits to join a `MDB_PREVSNAPSHOT` env; the opener closes the
+/// env without committing. The waiter's outcome within 3 s of starting, and
+/// within 10 s after the close (as in
+/// [`OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT`]). On macOS the fork uses
+/// SysV semaphores, which the closing opener removes because it still holds
+/// the exclusive lock; the waiter then gets the shared lock as a joiner and
+/// fails with `EINVAL` (22). macOS (Darwin 27.0.0), 2026-10-13.
+#[cfg(target_os = "macos")]
+const OBS_PREV_SNAPSHOT_OPENER_CLOSES_BEFORE_COMMIT: [&str; 2] = ["blocked", "rc=22"];
+/// As the macOS pin, on Linux, where the fork's mutexes live in the lock
+/// file: the waiter joins the lock file as the closed opener left it and
+/// reads the older generation, the one the opener rolled back to. Linux
+/// aarch64 (OrbStack container, kernel 7.2.9), 2026-10-13.
+#[cfg(not(target_os = "macos"))]
+const OBS_PREV_SNAPSHOT_OPENER_CLOSES_BEFORE_COMMIT: [&str; 2] = ["blocked", "ok:prev"];
+/// As [`OBS_PREV_SNAPSHOT_OPENER_CLOSES_BEFORE_COMMIT`], but the opener is
+/// killed (`SIGKILL`) instead of closing. The waiter joins the lock file as
+/// the dead opener left it and reads the older generation, the one the
+/// opener rolled back to. macOS (Darwin 27.0.0) and Linux aarch64 (OrbStack
+/// container, kernel 7.2.9), 2026-10-13.
+const OBS_PREV_SNAPSHOT_OPENER_DIES_BEFORE_COMMIT: [&str; 2] = ["blocked", "ok:prev"];
 
 struct Lmdb {
     env: *mut ffi::MDB_env,
@@ -521,6 +599,44 @@ fn child_entry() {
                 Err(rc) => format!("rc={rc}"),
             };
             write_result(&dir, &out);
+        }
+        // As `join_report`, but "ok:<read txn id> <me_last_txnid> <snapshot>"
+        // goes to `result`.
+        "join_info" => {
+            let out = match Lmdb::try_open(&dir, mapsize, 0) {
+                Ok(env) => {
+                    let txn = env.begin(MDB_RDONLY).unwrap();
+                    // SAFETY: `txn` is a live read txn.
+                    let id = unsafe { ffi::mdb_txn_id(txn) };
+                    let snap = snapshot_of(txn);
+                    Lmdb::abort(txn);
+                    format!("ok:{id} {} {snap}", env.info().me_last_txnid)
+                }
+                Err(rc) => format!("rc={rc}"),
+            };
+            write_result(&dir, &out);
+        }
+        // Open with `MDB_PREVSNAPSHOT` at the role's map size and begin a
+        // read txn: "ok:<snapshot>", "EAGAIN" or "rc=<rc>" goes to `result`.
+        "prev_join_report" => {
+            let out = match Lmdb::try_open(&dir, mapsize, ffi::MDB_PREVSNAPSHOT) {
+                Ok(env) => {
+                    let txn = env.begin(MDB_RDONLY).unwrap();
+                    let snap = snapshot_of(txn);
+                    Lmdb::abort(txn);
+                    format!("ok:{snap}")
+                }
+                Err(libc::EAGAIN) => "EAGAIN".to_string(),
+                Err(rc) => format!("rc={rc}"),
+            };
+            write_result(&dir, &out);
+        }
+        // Open with `MDB_PREVSNAPSHOT` at the role's map size, signal
+        // `held`, and park until killed (never commits).
+        "prev_hold" => {
+            let _env = Lmdb::try_open(&dir, mapsize, ffi::MDB_PREVSNAPSHOT).unwrap();
+            std::fs::write(dir.join("held"), b"").unwrap();
+            std::thread::sleep(Duration::from_secs(600));
         }
         _ => panic!("unknown role {role}"),
     }
@@ -1306,4 +1422,236 @@ fn observe_prev_snapshot_join_before_first_commit() {
     println!("A's read view after its first and second commits: [{first}, {second}]");
     assert_eq!(b, OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT);
     assert_eq!([first, second], OBS_PREV_SNAPSHOT_FIRST_COMMIT_READ_VIEW);
+}
+
+/// Commit `key` in one write txn, returning the write txn's id
+/// (`mdb_txn_id`).
+fn commit_key_id(env: &Lmdb, key: &[u8]) -> u64 {
+    let txn = env.begin(0).unwrap();
+    // SAFETY: standard txn_id/dbi_open/put/commit sequence on a live write
+    // txn; every pointer is live for the duration of its call.
+    unsafe {
+        let id = ffi::mdb_txn_id(txn) as u64;
+        let mut dbi = 0;
+        assert_eq!(ffi::mdb_dbi_open(txn, ptr::null(), 0, &mut dbi), 0);
+        let mut k = ffi::MDB_val {
+            mv_size: key.len(),
+            mv_data: key.as_ptr() as *mut c_void,
+        };
+        let mut v = ffi::MDB_val {
+            mv_size: 1,
+            mv_data: b"v".as_ptr() as *mut c_void,
+        };
+        assert_eq!(ffi::mdb_put(txn, dbi, &mut k, &mut v, 0), 0);
+        assert_eq!(ffi::mdb_txn_commit(txn), 0);
+        id
+    }
+}
+
+/// The finer-grained form of [`OBS_PREV_SNAPSHOT_FIRST_COMMIT_READ_VIEW`],
+/// in one process: txn ids around a `MDB_PREVSNAPSHOT` env's first two
+/// commits ([`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`]), whether the second commit
+/// keeps the first one's key ([`OBS_PREV_SNAPSHOT_SECOND_COMMIT_KEEPS_FIRST`]),
+/// and what a fresh open sees after one commit and a close
+/// ([`OBS_PREV_SNAPSHOT_ONE_COMMIT_THEN_REOPEN`]).
+#[test]
+fn observe_prev_snapshot_commit_txnids() {
+    let (dir, psize, _) = two_meta_generations();
+    let a = Lmdb::try_open(dir.path(), 16 * MIB, ffi::MDB_PREVSNAPSHOT).unwrap();
+    let after_commit = |a: &Lmdb, write_id: u64| {
+        let t = a.begin(MDB_RDONLY).unwrap();
+        // SAFETY: `t` is a live read txn.
+        let read_id = unsafe { ffi::mdb_txn_id(t) } as u64;
+        let has_after = Lmdb::txn_has_key(t, b"after");
+        Lmdb::abort(t);
+        let last = a.info().me_last_txnid as u64;
+        println!(
+            "write txn {write_id}; then read txn {read_id}, me_last_txnid {last}, \
+             holds `after` {has_after}; metas on disk {:?}",
+            read_metas(dir.path(), psize)
+        );
+        ((write_id, read_id, last), has_after)
+    };
+    let id1 = commit_key_id(&a, b"after");
+    let (first, _) = after_commit(&a, id1);
+    let id2 = commit_key_id(&a, b"after2");
+    let (second, keeps_first) = after_commit(&a, id2);
+    drop(a);
+    println!("(write id, read id, me_last_txnid): [{first:?}, {second:?}]; second keeps first: {keeps_first}");
+    assert_eq!([first, second], OBS_PREV_SNAPSHOT_COMMIT_TXNIDS);
+    assert_eq!(keeps_first, OBS_PREV_SNAPSHOT_SECOND_COMMIT_KEEPS_FIRST);
+
+    let (dir, _, _) = two_meta_generations();
+    {
+        let a = Lmdb::try_open(dir.path(), 16 * MIB, ffi::MDB_PREVSNAPSHOT).unwrap();
+        a.commit_key(b"after");
+    }
+    let env = Lmdb::try_open(dir.path(), 16 * MIB, 0).unwrap();
+    let t = env.begin(MDB_RDONLY).unwrap();
+    let reopened = snapshot_of(t);
+    Lmdb::abort(t);
+    println!("one PREVSNAPSHOT commit, close, fresh open: {reopened}");
+    assert_eq!(reopened, OBS_PREV_SNAPSHOT_ONE_COMMIT_THEN_REOPEN);
+}
+
+/// Process B joins a `MDB_PREVSNAPSHOT` env after the opener's first commit,
+/// while the opener still has it open: B's read txn id, `me_last_txnid` and
+/// snapshot ([`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`]).
+#[test]
+fn observe_prev_snapshot_joiner_info_after_first_commit() {
+    let (dir, _, _) = two_meta_generations();
+    let a = Lmdb::try_open(dir.path(), 16 * MIB, ffi::MDB_PREVSNAPSHOT).unwrap();
+    a.commit_key(b"after");
+    run_child(&format!("join_info:{}", 16 * MIB), dir.path());
+    let got = std::fs::read_to_string(dir.path().join("result")).unwrap();
+    drop(a);
+    println!("B joining after a PREVSNAPSHOT env's first commit: {got}");
+    assert_eq!(got, OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT);
+}
+
+/// B waits to join a `MDB_PREVSNAPSHOT` env; the opener A ends before any
+/// commit, by closing the env (`kill` false: A is this process) or by being
+/// killed (`kill` true: A is a child). B's outcome within 3 s of starting,
+/// then within 10 s after A ends, as in
+/// [`OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT`].
+fn prev_snapshot_opener_ends_before_commit(kill: bool) -> [String; 2] {
+    let (dir, _, _) = two_meta_generations();
+    let result = dir.path().join("result");
+    let (mut a_child, a_env) = if kill {
+        let c = spawn(&format!("prev_hold:{}", 16 * MIB), dir.path());
+        wait_for(&dir.path().join("held"));
+        (Some(c), None)
+    } else {
+        let a = Lmdb::try_open(dir.path(), 16 * MIB, ffi::MDB_PREVSNAPSHOT).unwrap();
+        (None, Some(a))
+    };
+    let _b = spawn(&format!("join_report:{}", 16 * MIB), dir.path());
+    let s0 = poll_file(&result, Duration::from_secs(3)).unwrap_or_else(|| "blocked".into());
+    if let Some(c) = a_child.as_mut() {
+        c.0.kill().unwrap();
+        c.0.wait().unwrap();
+    }
+    drop(a_env);
+    let s1 = if s0 == "blocked" {
+        poll_file(&result, Duration::from_secs(10)).unwrap_or_else(|| "blocked".into())
+    } else {
+        "-".to_string()
+    };
+    [s0, s1]
+}
+
+#[test]
+fn observe_prev_snapshot_opener_closes_before_commit() {
+    let got = prev_snapshot_opener_ends_before_commit(false);
+    println!("B waiting while the PREVSNAPSHOT opener closes uncommitted: {got:?}");
+    assert_eq!(got, OBS_PREV_SNAPSHOT_OPENER_CLOSES_BEFORE_COMMIT);
+}
+
+#[test]
+fn observe_prev_snapshot_opener_dies_before_commit() {
+    let got = prev_snapshot_opener_ends_before_commit(true);
+    println!("B waiting while the PREVSNAPSHOT opener is killed uncommitted: {got:?}");
+    assert_eq!(got, OBS_PREV_SNAPSHOT_OPENER_DIES_BEFORE_COMMIT);
+}
+
+/// A second process opens with `MDB_PREVSNAPSHOT` while the first
+/// `MDB_PREVSNAPSHOT` opener has not committed yet: its outcome within 3 s,
+/// then within 10 s after the opener's first commit
+/// ([`OBS_PREV_SNAPSHOT_SECOND_PREV_OPENER`]).
+#[test]
+fn observe_prev_snapshot_second_prev_opener() {
+    let (dir, _, _) = two_meta_generations();
+    let result = dir.path().join("result");
+    let a = Lmdb::try_open(dir.path(), 16 * MIB, ffi::MDB_PREVSNAPSHOT).unwrap();
+    let _c = spawn(&format!("prev_join_report:{}", 16 * MIB), dir.path());
+    let s0 = poll_file(&result, Duration::from_secs(3)).unwrap_or_else(|| "blocked".into());
+    a.commit_key(b"after");
+    let s1 = if s0 == "blocked" {
+        poll_file(&result, Duration::from_secs(10)).unwrap_or_else(|| "blocked".into())
+    } else {
+        "-".to_string()
+    };
+    drop(a);
+    let got = [s0, s1];
+    println!("a second PREVSNAPSHOT opener before the first one's commit: {got:?}");
+    assert_eq!(got, OBS_PREV_SNAPSHOT_SECOND_PREV_OPENER);
+}
+
+/// A sole process opens with `MDB_RDONLY | MDB_PREVSNAPSHOT` (it can never
+/// commit); a second process then opens without flags. The second
+/// process's outcome within 3 s, then within 10 s after the first closes
+/// ([`OBS_PREV_SNAPSHOT_READ_ONLY_OPENER`]).
+#[test]
+fn observe_prev_snapshot_read_only_opener() {
+    let (dir, _, _) = two_meta_generations();
+    let result = dir.path().join("result");
+    let a = Lmdb::try_open(dir.path(), 16 * MIB, MDB_RDONLY | ffi::MDB_PREVSNAPSHOT).unwrap();
+    let _b = spawn(&format!("join_report:{}", 16 * MIB), dir.path());
+    let s0 = poll_file(&result, Duration::from_secs(3)).unwrap_or_else(|| "blocked".into());
+    drop(a);
+    let s1 = if s0 == "blocked" {
+        poll_file(&result, Duration::from_secs(10)).unwrap_or_else(|| "blocked".into())
+    } else {
+        "-".to_string()
+    };
+    let got = [s0, s1];
+    println!("joining a sole MDB_RDONLY|MDB_PREVSNAPSHOT opener: {got:?}");
+    assert_eq!(got, OBS_PREV_SNAPSHOT_READ_ONLY_OPENER);
+}
+
+/// The `MDB_PREVSNAPSHOT` opener commits a write txn that changes nothing
+/// while another process waits to join: the waiter's outcome within 3 s of
+/// that empty commit, then within 10 s after a commit that writes a key
+/// ([`OBS_PREV_SNAPSHOT_EMPTY_COMMIT_KEEPS_LOCK`]).
+#[test]
+fn observe_prev_snapshot_empty_commit_keeps_lock() {
+    let (dir, _, _) = two_meta_generations();
+    let result = dir.path().join("result");
+    let a = Lmdb::try_open(dir.path(), 16 * MIB, ffi::MDB_PREVSNAPSHOT).unwrap();
+    let _b = spawn(&format!("join_report:{}", 16 * MIB), dir.path());
+    let txn = a.begin(0).unwrap();
+    // SAFETY: `txn` is a live write txn with no changes; committed once.
+    assert_eq!(unsafe { ffi::mdb_txn_commit(txn) }, 0);
+    let s0 = poll_file(&result, Duration::from_secs(3)).unwrap_or_else(|| "blocked".into());
+    a.commit_key(b"after");
+    let s1 = if s0 == "blocked" {
+        poll_file(&result, Duration::from_secs(10)).unwrap_or_else(|| "blocked".into())
+    } else {
+        "-".to_string()
+    };
+    drop(a);
+    let got = [s0, s1];
+    println!("joining after an empty PREVSNAPSHOT commit, then a real one: {got:?}");
+    assert_eq!(got, OBS_PREV_SNAPSHOT_EMPTY_COMMIT_KEEPS_LOCK);
+}
+
+/// `MDB_NOLOCK | MDB_PREVSNAPSHOT`, one process, two commits: the snapshot
+/// a fresh read txn sees after each, and whether the second commit keeps the
+/// first commit's key ([`OBS_PREV_SNAPSHOT_NOLOCK_COMMITS`]).
+#[test]
+fn observe_prev_snapshot_nolock_commits() {
+    let (dir, _, _) = two_meta_generations();
+    let a = Lmdb::try_open(
+        dir.path(),
+        16 * MIB,
+        ffi::MDB_NOLOCK | ffi::MDB_PREVSNAPSHOT,
+    )
+    .unwrap();
+    let view = |a: &Lmdb| {
+        let t = a.begin(MDB_RDONLY).unwrap();
+        let snap = snapshot_of(t);
+        let has_after = Lmdb::txn_has_key(t, b"after");
+        Lmdb::abort(t);
+        (snap, has_after)
+    };
+    a.commit_key(b"after");
+    let (first, _) = view(&a);
+    a.commit_key(b"after2");
+    let (second, keeps_first) = view(&a);
+    drop(a);
+    let got = (first, second, keeps_first);
+    println!(
+        "NOLOCK|PREVSNAPSHOT: after 1st {first}, after 2nd {second}, keeps first {keeps_first}"
+    );
+    assert_eq!(got, OBS_PREV_SNAPSHOT_NOLOCK_COMMITS);
 }
