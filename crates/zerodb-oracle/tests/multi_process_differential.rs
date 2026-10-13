@@ -2,8 +2,9 @@
 //! scenario run against the Meilisearch LMDB fork (through `lmdb-master-sys`)
 //! and against ZeroDB with a lock file, comparing what each engine reports.
 //! Stage 2 covers dead-process handling; stage 3 covers map growth across
-//! processes (amendment 15) and the reader count with readers in another
-//! process.
+//! processes (amendment 15), the reader count with readers in another
+//! process, the data-file length a `WRITE_MAP` joiner leaves, and joining a
+//! `PREV_SNAPSHOT` environment before its first commit.
 //!
 //! The test binary re-runs itself as the child process (SIGKILLed for the
 //! dead-process cases).
@@ -513,6 +514,11 @@ fn wait_exit(c: &mut ChildGuard, role: &str) {
 /// `{zdb,lmdb}_hold_open` just hold the env open (no txn) until `stop` is
 /// written, then exit cleanly. `{zdb,lmdb}_reads_until:<n>` begin n read
 /// txns, end them when `release` is written, and exit when `stop` is.
+/// `{zdb,lmdb}_join_writemap:<map>` open with `WRITE_MAP` at `<map>` bytes
+/// and commit once, writing the data-file lengths to `result` (see
+/// [`write_map_joiner_lengths`]). `{zdb,lmdb}_join_report` open (16 MiB map)
+/// and write the snapshot a read txn sees to `result` (see
+/// [`join_before_prev_snapshot_commit`]).
 #[test]
 fn child_entry() {
     let (Ok(role), Ok(dir)) = (std::env::var(ROLE), std::env::var(DIR)) else {
@@ -538,7 +544,57 @@ fn child_entry() {
             wait_for(&dir.join("stop"));
             return;
         }
+        "lmdb_join_report" => {
+            let out = match Lmdb::try_open_flags(&dir, MAX_READERS, 16 * MIB, 0) {
+                Ok(env) => {
+                    let txn = env.try_read().unwrap();
+                    let snap = lmdb_snapshot_of(txn);
+                    Lmdb::abort(txn);
+                    format!("ok:{snap}")
+                }
+                Err(rc) => lmdb_rc(rc),
+            };
+            return write_result(&dir, &out);
+        }
+        "zdb_join_report" => {
+            let out = match zdb_try_open(&dir, Some(16 * MIB), zerodb::EnvFlags::EMPTY) {
+                Ok(env) => format!("ok:{}", zdb_snapshot_of(&env)),
+                Err(e) => zdb_open_rc(Err(e)),
+            };
+            return write_result(&dir, &out);
+        }
         _ => {}
+    }
+    if let Some(map) = role.strip_prefix("lmdb_join_writemap:") {
+        let len = || std::fs::metadata(dir.join("data.mdb")).unwrap().len();
+        let before = len();
+        let env = Lmdb::try_open_flags(&dir, MAX_READERS, map.parse().unwrap(), ffi::MDB_WRITEMAP)
+            .unwrap();
+        let after_open = len();
+        env.commit_one();
+        let after_write = len();
+        drop(env);
+        return write_result(&dir, &format!("{before} {after_open} {after_write}"));
+    }
+    if let Some(map) = role.strip_prefix("zdb_join_writemap:") {
+        let len = || {
+            std::fs::metadata(dir.join(zerodb::DATA_FILE_NAME))
+                .unwrap()
+                .len()
+        };
+        let before = len();
+        let env = zdb_try_open(
+            &dir,
+            Some(map.parse().unwrap()),
+            zerodb::EnvFlags::WRITE_MAP,
+        )
+        .unwrap();
+        assert!(!env.opened_exclusively(), "the joiner joins a running env");
+        let after_open = len();
+        zdb_commit_one(&env);
+        let after_write = len();
+        drop(env);
+        return write_result(&dir, &format!("{before} {after_open} {after_write}"));
     }
     // `{lmdb,zdb}_reads_until:<n>`: begin n read txns, signal `held`; end
     // them when `release` appears and signal `released`; exit cleanly when
@@ -1287,5 +1343,334 @@ fn reader_count_with_readers_in_another_process_matches_lmdb() {
     assert_eq!(
         zdb, lmdb,
         "(num_readers, reader-list entries): held elsewhere, ended, exited, own reader"
+    );
+}
+
+/// A lock-file env with `flags` at `map_size` bytes (the persisted size for
+/// `None`).
+fn zdb_try_open(
+    dir: &Path,
+    map_size: Option<u64>,
+    flags: zerodb::EnvFlags,
+) -> zerodb::Result<zerodb::Env> {
+    let mut o = zerodb::EnvOpenOptions::new();
+    o.page_size(PSIZE as u32)
+        .max_readers(MAX_READERS)
+        .lock_file(true)
+        .flags(flags);
+    if let Some(m) = map_size {
+        o.map_size(usize::try_from(m).unwrap());
+    }
+    o.open(dir)
+}
+
+/// Write `out` to `dir/result` atomically (a reader never sees it partial).
+fn write_result(dir: &Path, out: &str) {
+    std::fs::write(dir.join("result.tmp"), out).unwrap();
+    std::fs::rename(dir.join("result.tmp"), dir.join("result")).unwrap();
+}
+
+/// The contents of `path` once it exists, or `None` after `timeout`.
+fn poll_file(path: &Path, timeout: Duration) -> Option<String> {
+    let end = Instant::now() + timeout;
+    loop {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            return Some(s);
+        }
+        if Instant::now() >= end {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Classify a data-file length against the one before the joiner's open and
+/// the joiner's map size.
+fn classify_len(len: u64, before: u64, joiner_map: u64) -> String {
+    if len == before {
+        "unchanged".to_string()
+    } else if len == joiner_map {
+        "joiner_map".to_string()
+    } else {
+        format!("other={len}")
+    }
+}
+
+/// This process holds the env open (one commit); a child joins it with
+/// `WRITE_MAP` at `joiner_map` bytes and commits once. The data-file length
+/// right after the joiner's open and right after its commit, each classified
+/// by [`classify_len`]. `holder_write_map` opens the holder with `WRITE_MAP`
+/// at 8 MiB (its file is then 8 MiB long), otherwise without it at 1 MiB.
+fn write_map_joiner_lengths(holder_write_map: bool, joiner_map: u64) -> [(String, String); 2] {
+    let parse = |dir: &Path| -> (u64, u64, u64) {
+        let out = std::fs::read_to_string(dir.join("result")).unwrap();
+        let v: Vec<u64> = out.split(' ').map(|n| n.parse().unwrap()).collect();
+        (v[0], v[1], v[2])
+    };
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        let (flags, map) = if holder_write_map {
+            (ffi::MDB_WRITEMAP, 8 * MIB)
+        } else {
+            (0, MIB)
+        };
+        let env = Lmdb::try_open_flags(dir.path(), MAX_READERS, map, flags).unwrap();
+        env.commit_one();
+        run_child(&format!("lmdb_join_writemap:{joiner_map}"), dir.path());
+        let (before, open, write) = parse(dir.path());
+        eprintln!("lmdb lengths: before {before}, after open {open}, after commit {write}");
+        drop(env);
+        (
+            classify_len(open, before, joiner_map),
+            classify_len(write, before, joiner_map),
+        )
+    };
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        let env = if holder_write_map {
+            zdb_try_open(dir.path(), Some(8 * MIB), zerodb::EnvFlags::WRITE_MAP).unwrap()
+        } else {
+            zdb_open(dir.path())
+        };
+        zdb_commit_one(&env);
+        run_child(&format!("zdb_join_writemap:{joiner_map}"), dir.path());
+        let (before, open, write) = parse(dir.path());
+        eprintln!("zdb lengths: before {before}, after open {open}, after commit {write}");
+        drop(env);
+        (
+            classify_len(open, before, joiner_map),
+            classify_len(write, before, joiner_map),
+        )
+    };
+    [lmdb, zdb]
+}
+
+/// A process joins a running env with `WRITE_MAP` and a larger map (8 MiB)
+/// than the 1 MiB holder's file: LMDB's open truncates the file up to its
+/// map size (`OBS_WRITE_MAP_JOINER_LARGER_MAP = "joiner_map"`); ZeroDB's
+/// open leaves the file as it is and its first write txn grows it to the
+/// same length (docs/DIVERGENCES.md D-024; ADR-0023 amendment 15, decision
+/// 4). After the joiner's first commit both files have the joiner's map
+/// size.
+#[test]
+fn write_map_joiner_with_a_larger_map_file_length_vs_lmdb() {
+    let [lmdb, zdb] = write_map_joiner_lengths(false, 8 * MIB);
+    eprintln!("(after open, after commit): lmdb {lmdb:?}, zdb {zdb:?}");
+    assert_eq!(
+        lmdb,
+        ("joiner_map".to_string(), "joiner_map".to_string()),
+        "LMDB as observed"
+    );
+    assert_eq!(
+        zdb,
+        ("unchanged".to_string(), "joiner_map".to_string()),
+        "ZeroDB as D-024 records"
+    );
+}
+
+/// [`write_map_joiner_with_a_larger_map_file_length_vs_lmdb`] with the holder
+/// opened `WRITE_MAP` at 8 MiB and the joiner at 2 MiB: LMDB's open shrinks
+/// the file to 2 MiB under the holder's 8 MiB mapping
+/// (`OBS_WRITE_MAP_JOINER_SMALLER_MAP = "joiner_map"`); ZeroDB never shrinks
+/// it (D-024).
+#[test]
+fn write_map_joiner_with_a_smaller_map_file_length_vs_lmdb() {
+    let [lmdb, zdb] = write_map_joiner_lengths(true, 2 * MIB);
+    eprintln!("(after open, after commit): lmdb {lmdb:?}, zdb {zdb:?}");
+    assert_eq!(
+        lmdb,
+        ("joiner_map".to_string(), "joiner_map".to_string()),
+        "LMDB as observed"
+    );
+    assert_eq!(
+        zdb,
+        ("unchanged".to_string(), "unchanged".to_string()),
+        "ZeroDB as D-024 records"
+    );
+}
+
+/// Whether the main database holds `key` in the read txn `txn`.
+fn lmdb_txn_has_key(txn: *mut ffi::MDB_txn, key: &[u8]) -> bool {
+    // SAFETY: dbi_open/get on a live read txn; `key` outlives the call and
+    // the returned data pointer is not used.
+    unsafe {
+        let mut dbi = 0;
+        assert_eq!(ffi::mdb_dbi_open(txn, ptr::null(), 0, &mut dbi), 0);
+        let mut k = ffi::MDB_val {
+            mv_size: key.len(),
+            mv_data: key.as_ptr() as *mut c_void,
+        };
+        let mut v = ffi::MDB_val {
+            mv_size: 0,
+            mv_data: ptr::null_mut(),
+        };
+        match ffi::mdb_get(txn, dbi, &mut k, &mut v) {
+            0 => true,
+            ffi::MDB_NOTFOUND => false,
+            rc => panic!("mdb_get failed: {rc}"),
+        }
+    }
+}
+
+/// Classify a snapshot of [`join_before_prev_snapshot_commit`]'s env by the
+/// keys `has` finds: "a_commit2" (`after2`), "a_commit" (`after`), "newest"
+/// (`g00000000`, the generation `PREV_SNAPSHOT` rolled back) or "prev".
+fn snapshot_by(has: impl Fn(&[u8]) -> bool) -> &'static str {
+    if has(b"after2") {
+        "a_commit2"
+    } else if has(b"after") {
+        "a_commit"
+    } else if has(b"g00000000") {
+        "newest"
+    } else {
+        "prev"
+    }
+}
+
+fn lmdb_snapshot_of(txn: *mut ffi::MDB_txn) -> &'static str {
+    snapshot_by(|k| lmdb_txn_has_key(txn, k))
+}
+
+/// The snapshot a fresh read txn of `env` sees.
+fn zdb_snapshot_of(env: &zerodb::Env) -> &'static str {
+    let r = env.read_txn().unwrap();
+    let db = env.main_database();
+    snapshot_by(|k| db.get(&r, k).unwrap().is_some())
+}
+
+/// B's outcome at three points, as in `OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT`
+/// (`lmdb_stage3_observation.rs`): within 3 s of starting B, within 10 s after
+/// A's first commit, within 10 s after A closes; then A's own read view
+/// after its first and second commits.
+type JoinTimeline = ([String; 3], [&'static str; 2]);
+
+/// Process A (this one) opens an env with two meta generations with
+/// `PREV_SNAPSHOT`; process B (`role`) opens it before A's first commit.
+/// `open_prev` opens A, `commit` commits one key through it, `view` reads
+/// A's snapshot.
+fn join_before_prev_snapshot_commit<E>(
+    dir: &Path,
+    role: &str,
+    open_prev: impl FnOnce() -> E,
+    commit: impl Fn(&E, &[u8]),
+    view: impl Fn(&E) -> &'static str,
+) -> JoinTimeline {
+    let result = dir.join("result");
+    let a = open_prev();
+    let _b = spawn(role, dir);
+    let mut pending = true;
+    let mut step = |timeout: Duration| {
+        if !pending {
+            return "-".to_string();
+        }
+        match poll_file(&result, timeout) {
+            Some(s) => {
+                pending = false;
+                s
+            }
+            None => "blocked".to_string(),
+        }
+    };
+    let s0 = step(Duration::from_secs(3));
+    commit(&a, b"after");
+    let first = view(&a);
+    let s1 = step(Duration::from_secs(10));
+    commit(&a, b"after2");
+    let second = view(&a);
+    drop(a);
+    let s2 = step(Duration::from_secs(10));
+    ([s0, s1, s2], [first, second])
+}
+
+/// A process joins an environment that another process opened with
+/// `PREV_SNAPSHOT`, before that process's first commit. LMDB holds the
+/// joiner's open until the first commit, after which the joiner and the
+/// rolling-back process both read the generation rolled back to until a
+/// second commit (`OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT`,
+/// `OBS_PREV_SNAPSHOT_FIRST_COMMIT_READ_VIEW`). ZeroDB lets the joiner in at
+/// the end of the open and publishes the first commit at once (SPEC 04
+/// §12.1). This test pins both engines' current behavior; the difference
+/// is reported and awaits a maintainer ruling, and it is not an approved
+/// divergence.
+#[test]
+fn join_before_prev_snapshot_first_commit_vs_lmdb() {
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        {
+            let env = Lmdb::open_sized(dir.path(), MAX_READERS, 2 * MIB);
+            env.commit_one();
+        }
+        {
+            let env = Lmdb::open_sized(dir.path(), MAX_READERS, 16 * MIB);
+            env.commit_many(300);
+        }
+        join_before_prev_snapshot_commit(
+            dir.path(),
+            "lmdb_join_report",
+            || {
+                Lmdb::try_open_flags(dir.path(), MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT)
+                    .unwrap()
+            },
+            |e, key| {
+                // SAFETY: standard begin/dbi_open/put/commit sequence on an
+                // open env; every pointer is live for its call.
+                unsafe {
+                    let txn = e.try_begin(0).unwrap();
+                    let mut dbi = 0;
+                    assert_eq!(ffi::mdb_dbi_open(txn, ptr::null(), 0, &mut dbi), 0);
+                    let mut k = ffi::MDB_val {
+                        mv_size: key.len(),
+                        mv_data: key.as_ptr() as *mut c_void,
+                    };
+                    let mut v = ffi::MDB_val {
+                        mv_size: 1,
+                        mv_data: b"v".as_ptr() as *mut c_void,
+                    };
+                    assert_eq!(ffi::mdb_put(txn, dbi, &mut k, &mut v, 0), 0);
+                    assert_eq!(ffi::mdb_txn_commit(txn), 0);
+                }
+            },
+            |e| {
+                let txn = e.try_read().unwrap();
+                let snap = lmdb_snapshot_of(txn);
+                Lmdb::abort(txn);
+                snap
+            },
+        )
+    };
+    eprintln!("lmdb (B's timeline, A's view) = {lmdb:?}");
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        {
+            let env = zdb_open_sized(dir.path(), Some(2 * MIB));
+            zdb_commit_one(&env);
+        }
+        {
+            let env = zdb_open_sized(dir.path(), Some(16 * MIB));
+            zdb_commit_many(&env, 300);
+        }
+        join_before_prev_snapshot_commit(
+            dir.path(),
+            "zdb_join_report",
+            || zdb_try_open(dir.path(), Some(16 * MIB), zerodb::EnvFlags::PREV_SNAPSHOT).unwrap(),
+            |e, key| {
+                let mut w = e.write_txn().unwrap();
+                e.main_database().put(&mut w, key, b"v").unwrap();
+                w.commit().unwrap();
+            },
+            zdb_snapshot_of,
+        )
+    };
+    eprintln!("zdb (B's timeline, A's view) = {zdb:?}");
+    let s = |v: [&str; 3]| v.map(str::to_string);
+    assert_eq!(
+        lmdb,
+        (s(["blocked", "ok:prev", "-"]), ["prev", "a_commit2"]),
+        "LMDB as observed"
+    );
+    assert_eq!(
+        zdb,
+        (s(["ok:prev", "-", "-"]), ["a_commit", "a_commit2"]),
+        "ZeroDB as SPEC 04 §12.1 states"
     );
 }

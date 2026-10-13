@@ -3,8 +3,10 @@
 //! `mdb_env_set_mapsize`, `MDB_PREVSNAPSHOT`, read-only opens, `MDB_NOLOCK`, and
 //! `mdb_env_info` / `mdb_env_stat` seeing another process's commit, a
 //! joiner's reader-table size, `mdb_env_set_mapsize` while another process
-//! holds a write txn, and `mdb_env_info`'s reader count with readers in
-//! another process.
+//! holds a write txn, `mdb_env_info`'s reader count with readers in
+//! another process, the data-file length a `MDB_WRITEMAP` joiner leaves, and
+//! whether a process can join an `MDB_PREVSNAPSHOT` env before its first
+//! commit.
 //! AGENTS.md rule 1: observed, not guessed. Drives the vendored fork through
 //! `lmdb-master-sys`; the test binary re-runs itself as the second process.
 //!
@@ -24,6 +26,7 @@ use zerodb_oracle::tempdir::TempDir;
 const MDB_NOTLS: c_uint = 0x0020_0000;
 const MDB_RDONLY: c_uint = 0x0002_0000;
 const MDB_NOSYNC: c_uint = 0x0001_0000;
+const MDB_WRITEMAP: c_uint = ffi::MDB_WRITEMAP;
 const ROLE: &str = "ZERODB_S3_OBS_ROLE";
 const DIR: &str = "ZERODB_S3_OBS_DIR";
 /// Where a `ro_nobody` child writes its result when the env directory itself
@@ -102,6 +105,35 @@ const OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER_RDONLY: &str = "returned:0";
 /// readers and never decreasing; `mdb_reader_list` lists the live ones.
 /// macOS (Darwin 27.0.0), 2026-10-13.
 const OBS_NUMREADERS_OTHER_PROCESS: [(u32, usize); 4] = [(3, 3), (3, 0), (3, 0), (3, 1)];
+/// A process joins a running env (held open, one commit, 1 MiB map, no
+/// `MDB_WRITEMAP`) with `MDB_WRITEMAP` and an 8 MiB map: the `data.mdb`
+/// length right after its open, "unchanged" (as before the open) or
+/// "joiner_map" (the joiner's map size). The open truncates the file to its
+/// map size (49,152 bytes before, 8 MiB after). macOS (Darwin 27.0.0),
+/// 2026-10-13.
+const OBS_WRITE_MAP_JOINER_LARGER_MAP: &str = "joiner_map";
+/// [`OBS_WRITE_MAP_JOINER_LARGER_MAP`] with the holder opened `MDB_WRITEMAP`
+/// at 8 MiB (so `data.mdb` is 8 MiB, longer than the joiner's map) and the
+/// joiner at 2 MiB: the joiner's open shrinks the file to 2 MiB under the
+/// holder's 8 MiB mapping. macOS (Darwin 27.0.0), 2026-10-13.
+const OBS_WRITE_MAP_JOINER_SMALLER_MAP: &str = "joiner_map";
+/// Process A opens an env with two meta generations with `MDB_PREVSNAPSHOT`;
+/// process B then opens it (no flags) before A's first commit. B's outcome
+/// at three points: within 3 s of starting B ("blocked" while B's open has
+/// not returned), within 10 s after A's first commit, and within 10 s after
+/// A closes the env ("-" once B has already returned). A returned open is
+/// "ok:<snapshot>", the snapshot B's first read txn sees (see
+/// [`snapshot_of`]), or "rc=<rc>". B's open waits until A's first commit,
+/// then sees "prev": the generation A rolled back to, not A's commit. macOS
+/// (Darwin 27.0.0), 2026-10-13.
+const OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT: [&str; 3] = ["blocked", "ok:prev", "-"];
+/// In [`OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT`]'s run, the snapshot a
+/// fresh read txn of A sees right after A's first commit, and right after
+/// its second. After the first commit A's own readers still see "prev" (the
+/// commit is on disk as the newest meta, but the shared snapshot txnid
+/// names the older one); after the second they see it ("a_commit2").
+/// macOS (Darwin 27.0.0), 2026-10-13.
+const OBS_PREV_SNAPSHOT_FIRST_COMMIT_READ_VIEW: [&str; 2] = ["prev", "a_commit2"];
 
 struct Lmdb {
     env: *mut ffi::MDB_env,
@@ -224,6 +256,29 @@ impl Lmdb {
     fn set_mapsize(&self, size: u64) -> c_int {
         // SAFETY: plain call on an open env.
         unsafe { ffi::mdb_env_set_mapsize(self.env, size as _) }
+    }
+
+    /// Whether the main database holds `key` in the read txn `txn`.
+    fn txn_has_key(txn: *mut ffi::MDB_txn, key: &[u8]) -> bool {
+        // SAFETY: dbi_open/get on a live read txn; `key` outlives the call
+        // and the returned data pointer is not used.
+        unsafe {
+            let mut dbi = 0;
+            assert_eq!(ffi::mdb_dbi_open(txn, ptr::null(), 0, &mut dbi), 0);
+            let mut k = ffi::MDB_val {
+                mv_size: key.len(),
+                mv_data: key.as_ptr() as *mut c_void,
+            };
+            let mut v = ffi::MDB_val {
+                mv_size: 0,
+                mv_data: ptr::null_mut(),
+            };
+            match ffi::mdb_get(txn, dbi, &mut k, &mut v) {
+                0 => true,
+                ffi::MDB_NOTFOUND => false,
+                rc => panic!("mdb_get failed: {rc}"),
+            }
+        }
     }
 
     /// The number of entries `mdb_reader_list` prints (one per reader slot
@@ -442,7 +497,69 @@ fn child_entry() {
                 .unwrap_or_else(|_| dir.join("result"));
             std::fs::write(path, out).unwrap();
         }
+        // Record `data.mdb`'s length, open with `MDB_WRITEMAP` at the role's
+        // map size, record it again, close; "<before> <after>" goes to
+        // `result`.
+        "join_writemap" => {
+            let len = || std::fs::metadata(dir.join("data.mdb")).unwrap().len();
+            let before = len();
+            let env = Lmdb::try_open(&dir, mapsize, MDB_WRITEMAP).unwrap();
+            let after = len();
+            drop(env);
+            write_result(&dir, &format!("{before} {after}"));
+        }
+        // Open (no flags) at the role's map size and begin a read txn:
+        // "ok:<snapshot>" (see `snapshot_of`) or "rc=<rc>" goes to `result`.
+        "join_report" => {
+            let out = match Lmdb::try_open(&dir, mapsize, 0) {
+                Ok(env) => {
+                    let txn = env.begin(MDB_RDONLY).unwrap();
+                    let snap = snapshot_of(txn);
+                    Lmdb::abort(txn);
+                    format!("ok:{snap}")
+                }
+                Err(rc) => format!("rc={rc}"),
+            };
+            write_result(&dir, &out);
+        }
         _ => panic!("unknown role {role}"),
+    }
+}
+
+/// Which generation of [`two_meta_generations`]'s env, as rolled back and
+/// written by [`observe_prev_snapshot_join_before_first_commit`], the read
+/// txn `txn` sees: "a_commit2" (holds key `after2`), "a_commit" (`after`),
+/// "newest" (`big0000`, the generation `MDB_PREVSNAPSHOT` rolled back), or
+/// "prev" (none of them).
+fn snapshot_of(txn: *mut ffi::MDB_txn) -> &'static str {
+    if Lmdb::txn_has_key(txn, b"after2") {
+        "a_commit2"
+    } else if Lmdb::txn_has_key(txn, b"after") {
+        "a_commit"
+    } else if Lmdb::txn_has_key(txn, b"big0000") {
+        "newest"
+    } else {
+        "prev"
+    }
+}
+
+/// Write `out` to `dir/result` atomically (a reader never sees it partial).
+fn write_result(dir: &Path, out: &str) {
+    std::fs::write(dir.join("result.tmp"), out).unwrap();
+    std::fs::rename(dir.join("result.tmp"), dir.join("result")).unwrap();
+}
+
+/// The contents of `path` once it exists, or `None` after `timeout`.
+fn poll_file(path: &Path, timeout: Duration) -> Option<String> {
+    let end = Instant::now() + timeout;
+    loop {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            return Some(s);
+        }
+        if Instant::now() >= end {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
@@ -1090,4 +1207,103 @@ fn observe_numreaders_other_process() {
         "(me_numreaders, reader_list entries): 3 held elsewhere {held:?}, ended {ended:?}, other process exited {exited:?}, one own reader {own:?}"
     );
     assert_eq!(got, OBS_NUMREADERS_OTHER_PROCESS);
+}
+
+/// This process holds the env open with `holder_flags` at `holder_map` and
+/// one commit; a child joins with `MDB_WRITEMAP` at `joiner_map` and reports
+/// the `data.mdb` length before and after its open: "unchanged" or
+/// "joiner_map".
+fn write_map_joiner_file_len(holder_flags: c_uint, holder_map: u64, joiner_map: u64) -> String {
+    let dir = TempDir::new().unwrap();
+    let a = Lmdb::try_open(dir.path(), holder_map, holder_flags).unwrap();
+    a.commit_key(b"a");
+    let held_len = std::fs::metadata(dir.path().join("data.mdb"))
+        .unwrap()
+        .len();
+    run_child(&format!("join_writemap:{joiner_map}"), dir.path());
+    let out = std::fs::read_to_string(dir.path().join("result")).unwrap();
+    let (before, after) = out.split_once(' ').unwrap();
+    let (before, after): (u64, u64) = (before.parse().unwrap(), after.parse().unwrap());
+    let closed_len = std::fs::metadata(dir.path().join("data.mdb"))
+        .unwrap()
+        .len();
+    println!(
+        "WRITEMAP joiner (holder flags {holder_flags:#x}, holder map {holder_map}, joiner map {joiner_map}): \
+         length held {held_len}, before open {before}, after open {after}, after joiner closed {closed_len}"
+    );
+    assert_eq!(before, held_len, "nothing else touched the file");
+    drop(a);
+    if after == before {
+        "unchanged".to_string()
+    } else if after == joiner_map {
+        "joiner_map".to_string()
+    } else {
+        format!("other={after}")
+    }
+}
+
+#[test]
+fn observe_write_map_joiner_larger_map() {
+    let got = write_map_joiner_file_len(0, MIB, 8 * MIB);
+    println!("WRITEMAP joiner with a larger map: {got}");
+    assert_eq!(got, OBS_WRITE_MAP_JOINER_LARGER_MAP);
+}
+
+#[test]
+fn observe_write_map_joiner_smaller_map() {
+    let got = write_map_joiner_file_len(MDB_WRITEMAP, 8 * MIB, 2 * MIB);
+    println!("WRITEMAP joiner with a smaller map: {got}");
+    assert_eq!(got, OBS_WRITE_MAP_JOINER_SMALLER_MAP);
+}
+
+/// Process A rolls back with `MDB_PREVSNAPSHOT`; process B opens before A's
+/// first commit. Pins B's outcome ([`OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT`])
+/// and what A's own read txns see after its first and second commits
+/// ([`OBS_PREV_SNAPSHOT_FIRST_COMMIT_READ_VIEW`]).
+#[test]
+fn observe_prev_snapshot_join_before_first_commit() {
+    let (dir, psize, metas) = two_meta_generations();
+    let result = dir.path().join("result");
+    let a = Lmdb::try_open(dir.path(), 16 * MIB, ffi::MDB_PREVSNAPSHOT).unwrap();
+    let _b = spawn(&format!("join_report:{}", 16 * MIB), dir.path());
+    let a_view = |a: &Lmdb| {
+        let t = a.begin(MDB_RDONLY).unwrap();
+        // SAFETY: `t` is a live read txn.
+        let id = unsafe { ffi::mdb_txn_id(t) };
+        let snap = snapshot_of(t);
+        Lmdb::abort(t);
+        println!(
+            "A's read txn: id {id}, sees {snap}; me_last_txnid {}; metas on disk {:?}",
+            a.info().me_last_txnid,
+            read_metas(dir.path(), psize)
+        );
+        snap
+    };
+    println!("metas before A's open: {metas:?}");
+    let mut b = Vec::new();
+    let mut pending = true;
+    let mut step = |timeout: Duration| {
+        if !pending {
+            return "-".to_string();
+        }
+        match poll_file(&result, timeout) {
+            Some(s) => {
+                pending = false;
+                s
+            }
+            None => "blocked".to_string(),
+        }
+    };
+    b.push(step(Duration::from_secs(3)));
+    a.commit_key(b"after");
+    let first = a_view(&a);
+    b.push(step(Duration::from_secs(10)));
+    a.commit_key(b"after2");
+    let second = a_view(&a);
+    drop(a);
+    b.push(step(Duration::from_secs(10)));
+    println!("B joining before a PREVSNAPSHOT env's first commit: {b:?}");
+    println!("A's read view after its first and second commits: [{first}, {second}]");
+    assert_eq!(b, OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT);
+    assert_eq!([first, second], OBS_PREV_SNAPSHOT_FIRST_COMMIT_READ_VIEW);
 }
