@@ -71,8 +71,9 @@ retires divergence D-001 (single-process only).
   rounds up to the data, and a live write txn gets `EINVAL`. Live read
   transactions and the values they borrowed stay valid: a resize adds a
   longer mapping and keeps the old ones until the env closes. In a lock-file
-  env it waits for the cross-process writer lock, which LMDB does not take
-  (a proposed divergence).
+  env it waits for the cross-process writer lock (a proposed divergence:
+  LMDB's behavior here is unobserved; the ADR's design reading of LMDB is
+  that `set_mapsize` takes no cross-process lock).
 - **`MdbError::MapResized`** in the engine, returned at transaction begin
   when another process committed past this process's map size (the heed
   adapter's existing variant of that name now occurs); answer with `resize(0)` and begin

@@ -1547,5 +1547,6 @@ against LMDB unless it says so.
   published `T`. Whether LMDB admits a joiner in that window is unobserved.
 - **`Env::resize` waits for the cross-process writer lock**, also on a
   `READ_ONLY` environment (its lock file is open read-write, so the lock is
-  available to it). LMDB's `mdb_env_set_mapsize` takes no lock (ADR-0023
-  decision 3); see `docs/DIVERGENCES.md`.
+  available to it). LMDB's behavior is unobserved; the ADR's design reading
+  of LMDB is that `set_mapsize` takes no cross-process lock (ADR-0023
+  decision 3). See `docs/DIVERGENCES.md` (D-023).
