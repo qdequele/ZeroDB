@@ -1,16 +1,18 @@
 //! What the Meilisearch LMDB fork does at the multi-process parity points
 //! ADR-0023 stage 3 still has to match: map growth by another process,
 //! `mdb_env_set_mapsize`, `MDB_PREVSNAPSHOT`, read-only opens, `MDB_NOLOCK`, and
-//! `mdb_env_info` / `mdb_env_stat` seeing another process's commit, and a
-//! joiner's reader-table size.
+//! `mdb_env_info` / `mdb_env_stat` seeing another process's commit, a
+//! joiner's reader-table size, `mdb_env_set_mapsize` while another process
+//! holds a write txn, and `mdb_env_info`'s reader count with readers in
+//! another process.
 //! AGENTS.md rule 1: observed, not guessed. Drives the vendored fork through
 //! `lmdb-master-sys`; the test binary re-runs itself as the second process.
 //!
 //! The `OBS_*` constants pin what the fork does; a diff means the fork changed
 //! or the pin was wrong — never edit a pin to make ZeroDB pass.
 
-use std::ffi::CString;
-use std::os::raw::{c_int, c_uint, c_void};
+use std::ffi::{CStr, CString};
+use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::ptr;
@@ -82,6 +84,24 @@ const OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS: u32 = 200;
 /// `MDB_NOLOCK` (it reports `MDB_RDONLY | MDB_NOTLS` only). macOS (Darwin
 /// 27.0.0, `hdiutil` read-only image), 2026-10-13.
 const OBS_RDONLY_READONLY_FS_REPORTS_NOLOCK: bool = false;
+/// `mdb_env_set_mapsize` (2 MiB) in one process while another process holds
+/// a write txn on the env: "returned:<rc>" when the call returns while the
+/// other process still holds the txn, "blocked" when it waits for the txn
+/// to end. It returns: LMDB takes no lock to resize. macOS (Darwin 27.0.0),
+/// 2026-10-13.
+const OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER: &str = "returned:0";
+/// [`OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER`] with the resizing process opened
+/// `MDB_RDONLY`. It returns too. macOS (Darwin 27.0.0), 2026-10-13.
+const OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER_RDONLY: &str = "returned:0";
+/// Another process holds 3 read txns; this process holds none. The
+/// `(me_numreaders, mdb_reader_list entries)` this process sees: `[0]` while
+/// the 3 txns are held, `[1]` after the other process ends them (its env
+/// still open), `[2]` after it closes the env and exits, `[3]` while this
+/// process then holds one read txn of its own. `me_numreaders` is the
+/// shared high-water mark of reader slots used, counting every process's
+/// readers and never decreasing; `mdb_reader_list` lists the live ones.
+/// macOS (Darwin 27.0.0), 2026-10-13.
+const OBS_NUMREADERS_OTHER_PROCESS: [(u32, usize); 4] = [(3, 3), (3, 0), (3, 0), (3, 1)];
 
 struct Lmdb {
     env: *mut ffi::MDB_env,
@@ -204,6 +224,36 @@ impl Lmdb {
     fn set_mapsize(&self, size: u64) -> c_int {
         // SAFETY: plain call on an open env.
         unsafe { ffi::mdb_env_set_mapsize(self.env, size as _) }
+    }
+
+    /// The number of entries `mdb_reader_list` prints (one per reader slot
+    /// with an owner PID, in any process).
+    fn reader_list_len(&self) -> usize {
+        unsafe extern "C" fn collect(msg: *const c_char, ctx: *mut c_void) -> c_int {
+            // SAFETY: `ctx` is the `&mut Vec<String>` passed below, live for
+            // the call; `msg` is a NUL-terminated string from LMDB.
+            let out = unsafe { &mut *(ctx as *mut Vec<String>) };
+            out.push(
+                unsafe { CStr::from_ptr(msg) }
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            0
+        }
+        let mut lines: Vec<String> = Vec::new();
+        // SAFETY: the callback only touches `lines`, which outlives the call.
+        unsafe {
+            ffi::mdb_reader_list(self.env, Some(collect), &mut lines as *mut _ as *mut c_void);
+        }
+        lines
+            .iter()
+            .flat_map(|l| l.lines())
+            .filter(|l| {
+                l.split_whitespace()
+                    .next()
+                    .is_some_and(|w| w.parse::<u32>().is_ok())
+            })
+            .count()
     }
 }
 
@@ -350,6 +400,20 @@ fn child_entry() {
             let _txn = (name == "hold_writer").then(|| env.begin(0).unwrap());
             std::fs::write(dir.join("held"), b"").unwrap();
             std::thread::sleep(Duration::from_secs(600));
+        }
+        // Begin N read txns (the role's number), signal `held`; end them
+        // when `release` appears and signal `released`; exit when `stop`
+        // appears.
+        "hold_reads" => {
+            let env = Lmdb::try_open(&dir, MIB, 0).unwrap();
+            let txns: Vec<_> = (0..mapsize)
+                .map(|_| env.begin(MDB_RDONLY).unwrap())
+                .collect();
+            std::fs::write(dir.join("held"), b"").unwrap();
+            wait_for(&dir.join("release"));
+            txns.into_iter().for_each(Lmdb::abort);
+            std::fs::write(dir.join("released"), b"").unwrap();
+            wait_for(&dir.join("stop"));
         }
         // Hold the env open with `maxreaders` reader slots (the role's
         // number) until killed.
@@ -938,4 +1002,89 @@ fn observe_rdonly_readonly_fs_reports_nolock() {
     );
     drop(env);
     assert_eq!(nolock, OBS_RDONLY_READONLY_FS_REPORTS_NOLOCK);
+}
+
+/// This process opens the env with `flags` while a child process holds a
+/// write txn on it, then calls `mdb_env_set_mapsize(2 MiB)` on a helper
+/// thread and waits up to 3 s: "returned:<rc>" if the call returned while
+/// the child still held its txn, "blocked" if not (the child is then killed,
+/// which releases the writer lock, and the call is joined).
+fn set_mapsize_while_other_process_writes(flags: c_uint) -> String {
+    let dir = TempDir::new().unwrap();
+    let mut c = spawn("hold_writer", dir.path());
+    wait_for(&dir.path().join("held"));
+    let env = Lmdb::try_open(dir.path(), MIB, flags).unwrap();
+    let raw = env.env as usize;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t = std::thread::spawn(move || {
+        // SAFETY: the env stays open until this thread is joined below, and
+        // no other thread uses it meanwhile; the call takes a plain size.
+        let rc = unsafe { ffi::mdb_env_set_mapsize(raw as *mut ffi::MDB_env, (2 * MIB) as _) };
+        let _ = tx.send(rc);
+    });
+    let got = match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(rc) => {
+            assert!(
+                c.0.try_wait().unwrap().is_none(),
+                "the writer child must still hold its txn when the call returns"
+            );
+            format!("returned:{rc}")
+        }
+        Err(_) => "blocked".to_string(),
+    };
+    drop(c);
+    t.join().unwrap();
+    println!(
+        "set_mapsize(2 MiB), flags {flags:#x}, another process writing: {got}, me_mapsize {}",
+        env.info().me_mapsize
+    );
+    got
+}
+
+#[test]
+fn observe_set_mapsize_other_process_writer() {
+    let got = set_mapsize_while_other_process_writes(0);
+    assert_eq!(got, OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER);
+}
+
+#[test]
+fn observe_set_mapsize_other_process_writer_rdonly() {
+    let got = set_mapsize_while_other_process_writes(MDB_RDONLY);
+    assert_eq!(got, OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER_RDONLY);
+}
+
+#[test]
+fn observe_numreaders_other_process() {
+    let dir = TempDir::new().unwrap();
+    let env = Lmdb::open(dir.path(), MIB);
+    env.commit_key(b"a");
+    let sample = |env: &Lmdb| (env.info().me_numreaders, env.reader_list_len());
+    let mut c = spawn("hold_reads:3", dir.path());
+    wait_for(&dir.path().join("held"));
+    let held = sample(&env);
+    std::fs::write(dir.path().join("release"), b"").unwrap();
+    wait_for(&dir.path().join("released"));
+    let ended = sample(&env);
+    std::fs::write(dir.path().join("stop"), b"").unwrap();
+    let end = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Some(st) = c.0.try_wait().unwrap() {
+            assert!(st.success(), "child hold_reads failed: {st}");
+            break;
+        }
+        assert!(
+            Instant::now() < end,
+            "timed out waiting for child hold_reads"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let exited = sample(&env);
+    let txn = env.begin(MDB_RDONLY).unwrap();
+    let own = sample(&env);
+    Lmdb::abort(txn);
+    let got = [held, ended, exited, own];
+    println!(
+        "(me_numreaders, reader_list entries): 3 held elsewhere {held:?}, ended {ended:?}, other process exited {exited:?}, one own reader {own:?}"
+    );
+    assert_eq!(got, OBS_NUMREADERS_OTHER_PROCESS);
 }
