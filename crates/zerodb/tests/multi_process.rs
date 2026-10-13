@@ -844,9 +844,22 @@ fn open_write_map(dir: &Path, map_size: usize) -> Env {
 
 /// Grows the map 24 times, by 1 MiB each, committing one 64 KiB value after
 /// each, so the data passes the writer's 1 MiB map midway.
+///
+/// It starts growing only once the writer has opened (`writer-open`), so at
+/// least one growth lands after the writer mapped its initial 1 MiB: a
+/// writer that opened after the growth would adopt the grown size at open
+/// and never see `MapResized`.
 fn wm_resizer(dir: &Path) {
     let env = open_write_map(dir, MIB);
     let db = env.main_database();
+    let end = Instant::now() + Duration::from_secs(60);
+    while !dir.join("writer-open").exists() {
+        assert!(
+            Instant::now() < end,
+            "wm_resizer: the writer did not open (no writer-open marker) within 60 s"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     for i in 0..24u32 {
         env.resize(((2 + i) as usize * MIB) as u64)
             .expect("resize up");
@@ -868,6 +881,8 @@ fn wm_resizer(dir: &Path) {
 /// by another process; the retry count goes to `writer-retries`.
 fn wm_writer(dir: &Path) {
     let env = open_write_map(dir, MIB);
+    // The resizer waits for this before it grows the map.
+    mark(dir, "writer-open");
     let db = env.main_database();
     let mut i = 0u32;
     let mut retries = 0u32;

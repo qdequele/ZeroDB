@@ -76,20 +76,19 @@ fn child_entry() {
             let l = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 8).unwrap();
             assert!(l.is_initializer());
             std::fs::write(dir.join("initializing"), b"").unwrap();
-            // SAFETY: `getppid` is a pure query with no memory effects.
-            let parent = unsafe { libc::getppid() };
+            let parent = std::os::unix::process::parent_id();
             let end = Instant::now() + Duration::from_secs(600);
             // An orphan is reparented, so its parent PID changes.
-            // SAFETY: as above.
-            while Instant::now() < end && unsafe { libc::getppid() } == parent {
+            while Instant::now() < end && std::os::unix::process::parent_id() == parent {
                 std::thread::sleep(Duration::from_millis(50));
             }
             std::process::exit(1);
         }
         // Join (or initialize), finish, report, exit.
         "join_and_report" => {
-            // Written before the open, which blocks while an initializer
-            // holds the election lock.
+            // Written just before the open (which blocks while an initializer
+            // holds the election lock), so the parent knows the open has
+            // been reached.
             std::fs::write(dir.join("child-opening"), b"").unwrap();
             let l = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 8).unwrap();
             l.bind_page_size(4096).unwrap();
@@ -154,8 +153,12 @@ fn three_way_race_after_initializer_death() {
             l.finish_open().unwrap();
             l
         });
-        // Both joiners are blocked behind the live initializer before it is
-        // killed: each has started its open and neither has finished it.
+        // Before the initializer is killed, neither joiner is done: the
+        // parent's open has not returned, and the child, which wrote
+        // `child-opening` just before calling its open, has neither reported
+        // an open nor exited 100 ms later. This shows both opens did not
+        // complete while the initializer lived; it does not prove the child
+        // is parked inside the open itself rather than about to enter it.
         wait_for(&dir.0.join("child-opening"));
         std::thread::sleep(Duration::from_millis(100));
         let mut child = child;
