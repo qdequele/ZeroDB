@@ -283,8 +283,9 @@ Two caveats on scope:
   in-process holds the env (SPEC 04 TXN-51), and, with a lock file (the
   default, ADR-0023), if another process has the env open: the open must win
   the lock file's first-opener election, and a joiner fails with `Io` and raw
-  OS error `EAGAIN`, as observed in LMDB (`OBS_PREV_SNAPSHOT_JOINER`, SPEC 04
-  TXN-66). *(Amended 2026-10-13: this bullet used to say the case was
+  OS error `EAGAIN`, as observed in LMDB for a writable joiner
+  (`OBS_PREV_SNAPSHOT_JOINER`, SPEC 04 TXN-66). LMDB skips the check for
+  `RDONLY`; zerodb does not (D-025, below). *(Amended 2026-10-13: this bullet used to say the case was
   "naturally satisfied" by the single-process model, D-001, now retired.)*
 - Geometry: the sole opener takes its map geometry from the older meta, the
   one it selects. A map below that meta's data rounds up to its
@@ -293,10 +294,11 @@ Two caveats on scope:
   `OBS_PREV_SNAPSHOT_ZERO_MAPSIZE_FROM`, both `"prev"`, observed on macOS).
 - Auto-clear: after the **first commit** on a prev-snapshot env, LMDB clears the
   flag (`env->me_flags ^= MDB_PREVSNAPSHOT`) and re-shares locks — subsequent
-  meta picks revert to newest. This is exactly milli's `Index::rollback`: open on
-  the older meta, commit once to make it the live root, then behave normally.
-  zerodb's rollback path must replicate the "one committed txn rewrites history,
-  then normal" behavior, not leave the env permanently pinned to the old meta.
+  meta picks revert to newest. milli's `Index::rollback` relies on this: open on
+  the older meta, commit once, close. That commit becomes the live root for
+  the next open; within the same session, with a lock file, it is not
+  published (next bullet). zerodb's rollback path must replicate this, not
+  leave the env permanently pinned to the old meta.
   With a lock file the fork does more, and zerodb mirrors it (ADR-0023
   amendment 19; SPEC 04 TXN-66/67, observed on macOS and Linux aarch64):
   - The opener keeps the lock file's exclusive lock past its open, so
@@ -317,12 +319,16 @@ Two caveats on scope:
     milli's case: it commits once and closes.
   - With `NO_LOCK` neither happens: the first commit is current at once and
     the second builds on it (`OBS_PREV_SNAPSHOT_NOLOCK_COMMITS`).
+  - A process that joins after the first commit reads the older snapshot,
+    and its `Env::info`/`Env::stat` name the newest meta on disk, as LMDB's
+    (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`).
   - Not mirrored, docs/DIVERGENCES.md D-025 (PROPOSED): when the opener
     closes or dies before its first commit, a waiting zerodb process becomes
     the first opener and serves the newest meta, while the fork's waiter
     reads the older meta (or, on macOS after a close, fails with `EINVAL`);
-    and a joiner's `Env::info`/`Env::stat` between the first and the second
-    commit report the older snapshot, not the newest meta on disk.
+    and a `RDONLY` prev-snapshot open that joins a running env fails with
+    `EAGAIN` in zerodb, while the fork admits it and moves every process
+    back to the older meta (`OBS_PREV_SNAPSHOT_READ_ONLY_JOINER`).
 
 ### §S6 — durability lattice: `NO_SYNC` / `NO_META_SYNC` / `MAP_ASYNC` (× `WRITE_MAP`)
 

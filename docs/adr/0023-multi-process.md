@@ -220,7 +220,8 @@ original text of this section is in git history.)*
   breaks this argument, the fallback is to disable it when a lock file is in
   use.
 - **`PREV_SNAPSHOT`** requires winning the first-opener election (no other
-  process alive); otherwise open fails, matching LMDB as observed. It keeps
+  process alive); otherwise open fails, matching LMDB as observed for a
+  writable open (a `READ_ONLY` one is D-025, amendment 19). It keeps
   the election until its first commit, which is not published (amendment
   19).
 - **Process-local and harmless:** comparators, the dbi registry, sequential-write

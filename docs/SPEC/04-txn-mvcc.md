@@ -1284,14 +1284,19 @@ every hook; this section defines the steps and their ordering. Both write modes
   the commit pipeline, which finishes it after the meta write and its fsync
   (TXN-67). An unchanged commit writes nothing and keeps it. Until then
   every other opener waits in the election: an ordinary open then joins and
-  reads the older snapshot; a second `PREV_SNAPSHOT` open joins and then
-  fails with `EAGAIN` as above (`OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT`,
+  reads the older snapshot; a second writable `PREV_SNAPSHOT` open joins and
+  then fails with `EAGAIN` as above (`OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT`,
   `OBS_PREV_SNAPSHOT_EMPTY_COMMIT_KEEPS_LOCK`,
   `OBS_PREV_SNAPSHOT_SECOND_PREV_OPENER`). A `READ_ONLY` `PREV_SNAPSHOT`
   open never commits, so it holds the election until it closes
   (`OBS_PREV_SNAPSHOT_READ_ONLY_OPENER`). If the initializer closes or dies
   first, a waiting process wins the election and re-initializes the lock
   file from the newest meta; LMDB differs there (D-025, PROPOSED).
+  A `READ_ONLY` `PREV_SNAPSHOT` open that joins a running environment also
+  fails with `EAGAIN`. LMDB admits it and its open moves the shared txnid
+  back to the older meta for every process
+  (`OBS_PREV_SNAPSHOT_READ_ONLY_JOINER`); ZeroDB never moves `T` backwards
+  (TXN-17), D-025 (PROPOSED).
 - **TXN-67** — **Auto-clear on first commit** (SPEC 01 §S5, milli
   `Index::rollback`): the first `commit()` on a PREV_SNAPSHOT env is txn
   `older_txnid + 1` (TXN-2) and writes slot `(older_txnid + 1) & 1`. **This slot
@@ -1317,15 +1322,22 @@ every hook; this section defines the steps and their ordering. Both write modes
   commit's meta slot, which drops the first commit's data. That commit
   publishes `T` as usual. In this process, `Env::info`, `Env::stat`,
   `Env::txnid` and `Env::resize` use the unpublished commit while it is newer
-  than the snapshot at `T`, as LMDB reports the newest meta on disk
+  than the snapshot at `T`, as LMDB reports the newest meta on disk; a
+  process that joins after the first commit keeps the newest meta it selected
+  at open for the same calls while it is newer than `T`
+  (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`), and its read txns
+  stay at `T`
   (`OBS_PREV_SNAPSHOT_FIRST_COMMIT_READ_VIEW`, `OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`,
   `OBS_PREV_SNAPSHOT_SECOND_COMMIT_KEEPS_FIRST = false`). A fresh open after
   every process has closed re-initializes the lock file and serves the
   first commit (`OBS_PREV_SNAPSHOT_ONE_COMMIT_THEN_REOPEN`), so milli's
   "commit once, close, reopen" still makes the rollback live. A crash during
   the second commit can leave the first commit's meta naming pages the
-  second commit rewrote, a window LMDB has by the same mechanism (ADR-0023
-  amendment 19). Without a lock file the first commit is published at once
+  second commit rewrote: LMDB's second commit writes its root to the page
+  the first commit's meta names
+  (`OBS_PREV_SNAPSHOT_SECOND_COMMIT_REWRITES_FIRST_ROOT = true`), and ZeroDB
+  builds on the same older free space (inferred from that observation;
+  ADR-0023 amendment 19). Without a lock file the first commit is published at once
   (`OBS_PREV_SNAPSHOT_NOLOCK_COMMITS`).
 
 > **Conflicts for human review (SPEC 04):**
@@ -1408,7 +1420,8 @@ and the futex), `zerodb-core::shared` (the safe interface the core sees) and
   **initializer** and builds the file (LCK-2), keeping byte 0 exclusive until
   the environment is fully open, then converts the lock to a shared one in
   place. A `PREV_SNAPSHOT` initializer keeps it exclusive until its first
-  commit instead (TXN-66, ADR-0023 amendment 19). Otherwise it is a **joiner**: it waits for a shared lock on byte 0,
+  commit instead (TXN-66, ADR-0023 amendment 19). Otherwise it is a
+  **joiner**: it waits for a shared lock on byte 0,
   which it holds until it closes. Once granted, it tries the exclusive lock
   once more; that succeeds only when every other process has exited
   meanwhile, and the joiner then initializes instead. A joiner that loses
@@ -1598,20 +1611,21 @@ against LMDB unless it says so.
   process serializes with this process's commits, not with a commit in
   another process. Whether LMDB's `mdb_env_sync` takes its writer mutex is
   unobserved.
-- **`PREV_SNAPSHOT`: what is not mirrored.** The election hold and the
-  unpublished first commit follow LMDB (TXN-66, TXN-67; ADR-0023 amendment
-  19; `multi_process_differential.rs::
+- **`PREV_SNAPSHOT`: what is not mirrored.** The election hold, the
+  unpublished first commit and the joiner's `info`/`stat` follow LMDB
+  (TXN-66, TXN-67; ADR-0023 amendment 19; `multi_process_differential.rs::
   join_before_prev_snapshot_first_commit_vs_lmdb` and its neighbors). Two
-  cases differ, docs/DIVERGENCES.md D-025 (PROPOSED). If the opener closes or
-  dies before its first commit, a waiting ZeroDB process becomes the first
-  opener and serves the newest meta; LMDB's waiter joins the lock file as
-  the opener left it and reads the older meta, or, on macOS after a clean
-  close, fails with `EINVAL` (`OBS_PREV_SNAPSHOT_OPENER_CLOSES_BEFORE_COMMIT`,
+  cases differ, docs/DIVERGENCES.md D-025 (PROPOSED). If the opener closes
+  or dies before its first commit, a waiting ZeroDB process becomes the
+  first opener and serves the newest meta; LMDB's waiter joins the lock
+  file as the opener left it and reads the older meta, or, on macOS after a
+  clean close, fails with `EINVAL`
+  (`OBS_PREV_SNAPSHOT_OPENER_CLOSES_BEFORE_COMMIT`,
   `OBS_PREV_SNAPSHOT_OPENER_DIES_BEFORE_COMMIT`,
-  `OBS_PREV_SNAPSHOT_READ_ONLY_OPENER`). And a process that joins between
-  the first and the second commit reports the older snapshot in
-  `Env::info`/`Env::stat`, while LMDB's reports the newest meta on disk
-  (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`); its read txns match.
+  `OBS_PREV_SNAPSHOT_READ_ONLY_OPENER`). And a `READ_ONLY` `PREV_SNAPSHOT`
+  open that joins a running environment fails with `EAGAIN`, while LMDB's
+  opens and rolls every process back to the older meta
+  (`OBS_PREV_SNAPSHOT_READ_ONLY_JOINER`).
 - **`Env::resize` waits for the cross-process writer lock**, also on a
   `READ_ONLY` environment (its lock file is open read-write, so the lock is
   available to it). LMDB takes no lock: its `mdb_env_set_mapsize` returns

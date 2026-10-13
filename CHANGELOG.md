@@ -66,8 +66,11 @@ retires divergence D-001 (single-process only).
   the first commit's changes. A fresh open after the env is closed serves
   the first commit, so milli's rollback (one commit, then close) is
   unchanged. Without a lock file the first commit is published at once, as
-  before. Two cases differ from LMDB (D-025, proposed): an opener that ends
-  before its first commit, and a joiner's `Env::info` after that commit.
+  before. A process that joins after the first commit reports that commit
+  in `Env::info`/`Env::stat`, as LMDB. Two cases differ from LMDB (D-025,
+  proposed): an opener that ends before its first commit, and a `READ_ONLY`
+  `PREV_SNAPSHOT` open joining a running env, which ZeroDB refuses with
+  `EAGAIN` while LMDB rolls every process back.
 - **`zerodb-tools` attach to live environments**: `stat`, `dump` and `check`
   open the env read-only through its lock file and read one pinned snapshot
   while other processes keep writing, as `mdb_stat` and `mdb_dump` do.
