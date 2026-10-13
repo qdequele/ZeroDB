@@ -786,8 +786,10 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     `mdb_env_set_mapsize` on an open env).** It refuses with `Io` and raw OS
     error `EINVAL` while a write txn of this env is live
     (`OBS_SET_MAPSIZE_WITH_WRITE_TXN`); live read txns do not block it. In a
-    lock-file environment it takes the cross-process writer lock (LMDB takes
-    none), so no commit lands while it reads the newest snapshot. The size is
+    lock-file environment it takes the cross-process writer lock, so no
+    commit lands while it reads the newest snapshot. LMDB takes none: its
+    `mdb_env_set_mapsize` returns while another process holds a write txn
+    (`OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER`; D-023). The size is
     `meta.map_size` of the newest snapshot for `0`
     (`OBS_SET_MAPSIZE_ZERO_ADOPTS`), else the requested size, then raised to
     `(last_pg + 1) · psize` (checked arithmetic; overflow is `Invalid`). Above

@@ -458,7 +458,10 @@ Terms used below:
        `Error::Io(os error 22)`, as with heed.
     2. In a lock-file environment, take the cross-process writer lock. This
        waits like a write begin, and it is the deliberate difference from
-       LMDB, which takes no lock here (decision 3). Without a lock file, this
+       LMDB, which takes no lock here (decision 3): its `mdb_env_set_mapsize`
+       returns while another process holds a write txn, also `MDB_RDONLY`
+       (observed 2026-10-13, `OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER`,
+       `OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER_RDONLY`). Without a lock file, this
        step does nothing.
     3. Read the newest snapshot: at `T` with `pread`, without the map check,
        or the process-local cell without a lock file.

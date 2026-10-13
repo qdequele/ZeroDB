@@ -1594,8 +1594,11 @@ impl Env {
     /// Live read txns do not block it, and every value they borrowed stays
     /// valid (grow-only mappings). In a lock-file environment it takes the
     /// cross-process writer lock, waiting like a write begin, so no commit
-    /// lands while it rounds up; LMDB takes no lock here. Under `WRITE_MAP`
-    /// it grows the data file to the new size, never shrinking it.
+    /// lands while it rounds up. LMDB takes no lock here: its
+    /// `mdb_env_set_mapsize` returns while another process holds a write txn
+    /// (`OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER`; docs/DIVERGENCES.md D-023).
+    /// Under `WRITE_MAP` it grows the data file to the new size, never
+    /// shrinking it.
     ///
     /// # Errors
     ///
