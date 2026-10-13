@@ -999,10 +999,14 @@ Terms used below:
     - **A joiner's `Env::info` and `Env::stat`** (amended in fix round 1).
       A joiner selects the newest meta on disk at open and seeds its reads
       from `T`. When that meta is newer than `T` (the opener's unpublished
-      first commit), the joiner keeps it as its own unpublished snapshot,
-      so `info`, `stat`, `txnid` and `resize` report it as LMDB's do
+      first commit), the joiner keeps it, so `info`, `stat` and `resize`
+      report it as LMDB's `mdb_env_info`, `mdb_env_stat` and
+      `mdb_env_set_mapsize` do
       (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT = "ok:1 2 prev"`),
-      while its read txns stay at `T`. Outside a `PREV_SNAPSHOT` window
+      while its read txns stay at `T`. `Env::txnid`, ZeroDB's own call for
+      the published txnid (§4), stays at `T` in a joiner: the
+      multi-process crash harness reads it as the published txnid after a
+      writer died between its meta write and its `T` store. Outside a `PREV_SNAPSHOT` window
       the condition holds only for a joiner that opens between another
       process's meta write and its `T` store, where LMDB's `mdb_env_info`
       also reports the newer meta. The value is dropped once a published

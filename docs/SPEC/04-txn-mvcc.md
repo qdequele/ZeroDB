@@ -1324,9 +1324,9 @@ every hook; this section defines the steps and their ordering. Both write modes
   `Env::txnid` and `Env::resize` use the unpublished commit while it is newer
   than the snapshot at `T`, as LMDB reports the newest meta on disk; a
   process that joins after the first commit keeps the newest meta it selected
-  at open for the same calls while it is newer than `T`
-  (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`), and its read txns
-  stay at `T`
+  at open for `Env::info`, `Env::stat` and `Env::resize` while it is newer
+  than `T` (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`); its
+  `Env::txnid` and its read txns stay at `T`
   (`OBS_PREV_SNAPSHOT_FIRST_COMMIT_READ_VIEW`, `OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`,
   `OBS_PREV_SNAPSHOT_SECOND_COMMIT_KEEPS_FIRST = false`). A fresh open after
   every process has closed re-initializes the lock file and serves the
