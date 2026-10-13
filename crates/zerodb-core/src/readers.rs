@@ -442,7 +442,8 @@ impl ReaderTable {
     /// increments it, a release keeps it, and the initializer wipes it to 0)
     /// or that is occupied now. The one gap: a slot whose generation wraps
     /// to 0 after 2^32 claims and is then free reads as never claimed; this
-    /// process's own claims still count through the local counter.
+    /// process's own claims still count through the local counter. SPEC 04
+    /// TXN-73 states the rule and the invariants it depends on.
     ///
     /// Logged in `docs/DIVERGENCES.md` (`me_numreaders` semantics; a PROPOSED
     /// candidate for later redefinition, not approved).
@@ -454,17 +455,36 @@ impl ReaderTable {
             Slots::Local(_) => local,
             #[cfg(not(loom))]
             Slots::Shared(r) => {
-                // Relaxed loads: an introspection sample, like `in_use`, that
-                // no correctness decision reads and that orders no other
-                // access. Each slot only moves from "never claimed" to
-                // "claimed" while the lock file lives, so a stale load can
-                // only under-report a claim racing with this scan.
+                // A slot counts as used once claimed since the lock file was
+                // initialized: its txnid is not FREE now, or its owner
+                // generation is non-zero. The txnid is loaded first, with
+                // `Acquire`; the owner word after it, `Relaxed`.
+                //
+                // - A non-FREE txnid counts the slot whatever the owner word
+                //   says, which covers a claim whose generation store is not
+                //   visible yet.
+                // - A FREE written by a release (`release_as`, the owner's or
+                //   a reaper's) is a `Release` store that follows, in its
+                //   thread, the store of a generation >= 1: the claimer's
+                //   own claim, or the reaper's adoption. Reading that FREE
+                //   with `Acquire` makes the generation visible, so a slot
+                //   that was claimed and released still counts.
+                // - A FREE written by the initializer comes with generation
+                //   0: the slot was never claimed and does not count.
+                //
+                // So a call that counted a slot keeps counting it on every
+                // later call ordered after it (read-read coherence on each
+                // word): the count never decreases, as LMDB's
+                // `mti_numreaders`. Without the `Acquire`, ARM could pair a
+                // released FREE with a stale generation 0 and drop the count
+                // by one. Nothing else reads this value; it orders no other
+                // access. SPEC 04 TXN-73.
                 let used = r
                     .slots()
                     .iter()
                     .rposition(|rs| {
-                        owner_generation(rs.owner().load(Ordering::Relaxed)) != 0
-                            || rs.txnid().load(Ordering::Relaxed) != RDR_FREE
+                        rs.txnid().load(Ordering::Acquire) != RDR_FREE
+                            || owner_generation(rs.owner().load(Ordering::Relaxed)) != 0
                     })
                     .map_or(0, |i| i as u32 + 1);
                 local.max(used)
