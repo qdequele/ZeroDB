@@ -200,6 +200,9 @@ original text of this section is in git history.)*
   page cache, which every process's `MAP_SHARED` map sees on Linux and macOS.
   `msync` is needed only for durability, as today.
 - **`NO_LOCK`** keeps the in-process cell and `commit_point` unchanged.
+- **Exception (amendment 19):** the first commit of a `PREV_SNAPSHOT` open
+  does not store `T`, so readers keep the older generation and the next
+  writer rebuilds from it, as LMDB was observed to.
 
 ### 5. Per-process state and map growth
 
@@ -217,7 +220,9 @@ original text of this section is in git history.)*
   breaks this argument, the fallback is to disable it when a lock file is in
   use.
 - **`PREV_SNAPSHOT`** requires winning the first-opener election (no other
-  process alive); otherwise open fails, matching LMDB as observed.
+  process alive); otherwise open fails, matching LMDB as observed. It keeps
+  the election until its first commit, which is not published (amendment
+  19).
 - **Process-local and harmless:** comparators, the dbi registry, sequential-write
   overrides, the frame pool, the commit hook, the poisoned flag. Comparators
   must agree across processes — the existing D-014 hazard, not a new one.
@@ -917,6 +922,116 @@ Terms used below:
         tool would hold no `Env`.
     12. **The default flip is gated** on the Linux three-column bench.
         *Alternative:* flip now and measure in the PR.
+
+## Amendment 19 (stage 3 Task 13c, 2026-10-13)
+
+19. **`PREV_SNAPSHOT` holds the election until its first commit, and that
+    commit is not published.** Approved 2026-10-13 by the maintainer
+    (mirror LMDB).
+
+    *Observed LMDB behavior (binding, rule 1).* Every row was observed on
+    macOS aarch64 and on Linux aarch64 (OrbStack container), with the same
+    result unless the row says otherwise. The env has two meta generations,
+    txn 1 ("prev") and txn 2 ("newest"); process A opens it with
+    `MDB_PREVSNAPSHOT`.
+
+    | Case | LMDB | Constant |
+    |---|---|---|
+    | B opens (no flags) before A's first commit | B's open blocks until A's first commit, then B reads "prev" | `OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT = ["blocked", "ok:prev", "-"]` |
+    | A's own fresh read txn after its first, then its second commit | "prev", then A's second commit | `OBS_PREV_SNAPSHOT_FIRST_COMMIT_READ_VIEW = ["prev", "a_commit2"]` |
+    | A's two commits: `(write txn id, next read txn id, me_last_txnid)` | `(2, 1, 2)`, then `(2, 2, 2)` | `OBS_PREV_SNAPSHOT_COMMIT_TXNIDS` |
+    | A's second commit keeps the first commit's key | no | `OBS_PREV_SNAPSHOT_SECOND_COMMIT_KEEPS_FIRST = false` |
+    | One commit, close, fresh open without flags | serves A's first commit | `OBS_PREV_SNAPSHOT_ONE_COMMIT_THEN_REOPEN = "a_commit"` |
+    | B joins after A's first commit: read txn id, `me_last_txnid`, snapshot | `1`, `2`, "prev" | `OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT = "ok:1 2 prev"` |
+    | A commits a write txn with no changes while B waits | B still blocked; joins after a real commit | `OBS_PREV_SNAPSHOT_EMPTY_COMMIT_KEEPS_LOCK = ["blocked", "ok:prev"]` |
+    | C opens with `MDB_PREVSNAPSHOT` before A's first commit | blocks, then `EAGAIN` after A's first commit | `OBS_PREV_SNAPSHOT_SECOND_PREV_OPENER = ["blocked", "EAGAIN"]` |
+    | B waits; A closes without committing | macOS: `EINVAL` (22). Linux: B reads "prev" | `OBS_PREV_SNAPSHOT_OPENER_CLOSES_BEFORE_COMMIT` |
+    | B waits; A is killed without committing | B reads "prev" | `OBS_PREV_SNAPSHOT_OPENER_DIES_BEFORE_COMMIT = ["blocked", "ok:prev"]` |
+    | A opens `MDB_RDONLY \| MDB_PREVSNAPSHOT` alone; B opens | B blocks until A closes; then as the close row | `OBS_PREV_SNAPSHOT_READ_ONLY_OPENER` |
+    | `MDB_NOLOCK \| MDB_PREVSNAPSHOT`: views after two commits | the first commit at once, then the second, which keeps the first | `OBS_PREV_SNAPSHOT_NOLOCK_COMMITS = ("a_commit", "a_commit2", true)` |
+
+    *The mechanism these observations pin.* The open keeps its exclusive
+    election lock and sets the shared txnid to the older meta's. The first
+    commit is txn `older + 1`, written to the meta slot of the abandoned
+    newest generation (TXN-67). Only then does the opener downgrade its lock,
+    and the downgrade sets the shared txnid from the meta chosen by the
+    `PREV_SNAPSHOT` rule, which is still in force at that moment: the older
+    meta. So the shared txnid stays on the older generation, and every new
+    read txn, in the opener or in a joiner, reads it. The next write txn
+    starts from the shared txnid, so it is again `older + 1`, built on the
+    older meta, and it overwrites the first commit's meta slot: the first
+    commit's data is lost. Only after that second commit does the shared
+    txnid move on. `mdb_env_info` and `mdb_env_stat` name the newest meta on
+    disk, so they report the first commit while readers do not see it. A
+    fresh open after every process has closed re-initializes the lock file
+    from the newest meta and so serves the first commit. A commit that
+    changes nothing writes no meta and keeps the lock. With `MDB_NOLOCK`
+    there is no election and no shared txnid: the first commit is current at
+    once and the second builds on it.
+
+    *Protocol change.*
+    - **The election.** A lock-file open with `PREV_SNAPSHOT` (which is
+      always the initializer, §5) does not finish the election at the end
+      of its open: it keeps byte 0 write-locked, with the initializing
+      magic, past the open. Its first write commit that runs the commit
+      pipeline (the commit of an unchanged txn writes nothing and does not,
+      as observed) finishes it after
+      the meta write and its fsync in the durable modes: it stores the final
+      magic and downgrades byte 0 to shared, exactly as at the end of an
+      ordinary open (LCK-1, LCK-2). Joiners wait in their blocking shared
+      lock until then. If that downgrade fails, the commit returns the I/O
+      error; its meta is durable but unpublished, the election stays held,
+      and the next commit tries again.
+    - **The snapshot rule.** That first commit is not published. `T` keeps
+      the older txnid, the process's published-snapshot cell keeps the older
+      snapshot, and the ADR-0018 validated-pages cache is not seeded from
+      it, because the next commit reuses its txnid (TXN-2, as after a failed
+      commit). Every new read txn, in the opener or in a process that joins
+      after the downgrade, therefore pins the older generation; the next
+      write txn begins from `T` as always (§4), is again `older + 1`, is
+      built on the older meta and writes the same meta slot, and publishes
+      `T` normally. The opener's `Env::info`, `Env::stat`, `Env::txnid`
+      and `Env::resize` use the unpublished commit while it is newer than
+      the snapshot at `T`, as LMDB's do through the newest meta.
+    - **The opener closes or dies before its first commit.** Its record
+      locks go with it, leaving the initializing magic. A waiting process
+      wins the election, re-initializes the lock file (LCK-1) and seeds `T`
+      from the newest meta: the rollback, which wrote nothing, is abandoned.
+      LMDB differs, and by platform: its waiter fails with `EINVAL` on macOS
+      when the opener closes, and otherwise joins the lock file as the
+      opener left it and reads the older generation. Mirroring that needs a
+      joiner to adopt a lock file its initializer never finished, a change
+      to the election of every environment, so it is not mirrored here; it
+      is filed as `docs/DIVERGENCES.md` D-025 (PROPOSED).
+    - **A joiner's `Env::info` and `Env::stat` between the first and the
+      second commit** report the snapshot at `T` (the older generation),
+      not the newest meta on disk as LMDB's do
+      (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`). Only the opener
+      knows of the unpublished commit, and reading the newest meta on every
+      call would change these calls for every environment. Also D-025.
+    - **`READ_ONLY` with `PREV_SNAPSHOT`** never commits, so a sole opener
+      holds the election for its whole life and every joiner waits until it
+      closes, as observed.
+    - **Interaction with the joiner rule (§5, Task 7).** Unchanged: a
+      `PREV_SNAPSHOT` open that does not win the election fails with
+      `EAGAIN`. A second `PREV_SNAPSHOT` opener that arrives before the
+      first one's first commit waits in the election, joins after the
+      downgrade, and then fails with `EAGAIN`, as observed.
+    - **`NO_LOCK`** is unchanged: no election, and the first commit is
+      published at once, as observed.
+
+    *Crash window (inherited from LMDB).* Between the first and the second
+    commit the newest meta on disk is the first commit, while the second
+    write txn allocates from the older generation's free space, which
+    includes the pages the first commit wrote. A crash during the second
+    commit, after it rewrote such a page and before its meta write, leaves a
+    newest meta that references a rewritten page. LMDB has the same window,
+    by the same mechanism. milli's `Index::rollback` commits once and closes
+    the environment, so it never enters the window.
+
+    No lock-file or data-file format change. Environments not opened with
+    `PREV_SNAPSHOT` are unaffected. SPEC 01 §S5, SPEC 04 TXN-66, TXN-67,
+    LCK-1, LCK-2 and §12.1 follow.
 
 ## Consequences
 
