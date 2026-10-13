@@ -1,8 +1,11 @@
 # ADR-0023: Multi-process access — lock file, shared reader table, cross-process writer lock
 
-- Status: **Approved (2026-10-09, maintainer)** — open questions resolved to
-  the proposed defaults (see the end of this ADR). Implementation proceeds by
-  stage; stage 1 reports before stage 2 starts.
+- Status: **Accepted, implemented** (stages 1–3, 2026-10-13). Approved
+  2026-10-09 by the maintainer, open questions resolved to the proposed
+  defaults (see the end of this ADR); stage-3 amendments 15–18 approved
+  2026-10-12. The lock file is on by default. The decision text below is
+  reconciled with the amendments; where a sentence was superseded, it says
+  so inline. SPEC 04 §12 (`LCK-1` …) states the resulting invariants.
 - Related issue: [#70](https://github.com/qdequele/ZeroDB/issues/70); retires
   divergence D-001 and the lock-file half of D-012.
 - Date: 2026-10-09
@@ -75,9 +78,12 @@ Option C. The design has six parts.
   own, not byte-compatible with LMDB's (as D-002 for the data file).
 - It is mapped `MAP_SHARED`. Layout: a header — magic, lock-format version, page
   size, `max_readers`, the **published txnid word `T`**, the **writer-lock
-  word**, a waiters bit — then cache-line-padded reader slots of
-  `{txnid: AtomicU64, pid: AtomicU32}`. All access is by explicit offset over
-  atomics; no `#[repr(C)]` casts.
+  word**, a waiters bit — then 128-byte reader slots at offset `256 + i·128`
+  (amendment 11), each a `txnid: AtomicU64` at +0 and a 64-bit owner word at
+  +8 holding the owner PID and a claim generation (amendment 14). All access
+  is by explicit offset over atomics, never by casting the mapping to a
+  struct; the slot table is viewed as a slice of the core's `ReaderSlot`
+  type, whose layout is fixed and checked at compile time (SPEC 04 LCK-3).
 - **First-opener election** (LMDB's technique). On open a process tries an
   exclusive `fcntl` lock on byte 0 of the lock file. If it gets it, no other
   process has the environment open: it (re)initializes the header and wipes
@@ -100,7 +106,9 @@ Option C. The design has six parts.
   no longer dropped) creates no lock file and runs exactly today's
   single-process code, at today's cost.
 - A read-only environment still needs a lock file, as in LMDB; if it cannot be
-  created, open fails unless `NO_LOCK` is set.
+  created, open fails unless `NO_LOCK` is set. *(Amended by amendment 17: on
+  a read-only filesystem, `EROFS`, a read-only open proceeds without one, as
+  LMDB was observed to.)*
 
 ### 2. Writer lock (two layers, both thread-agnostic)
 
@@ -115,6 +123,8 @@ Option C. The design has six parts.
      bit was set.
    - **macOS:** an exclusive `flock` on a dedicated lock-file descriptor,
      released by the kernel on death and releasable from any thread.
+     *(Superseded by amendments 2 and 3: an `fcntl` write lock on byte 1 of
+     the one lock-file descriptor.)*
 - **Writer death needs no repair.** A commit becomes visible only through the
   atomic meta write and the later store to `T` (§4), so a dead writer leaves at
   most unreferenced pages, as after any crash. The new owner rebuilds its state
@@ -125,33 +135,51 @@ Option C. The design has six parts.
 
 ### 3. Shared reader slots, liveness and reaping
 
-- **Claim:** `CAS txnid FREE → CLAIMED`, then store `pid = me`, then pin (§4).
-  `pid == 0` means "being claimed or released — presumed live".
-- **Release (owner):** store `pid = 0`, *then* `txnid = FREE`. This order keeps
-  a reaper from mistaking a newly claimed slot for a dead process's slot.
-- **Liveness:** each process holds an `fcntl` byte-range lock at offset = its
-  PID in the lock file; "is P alive?" is an `F_GETLK` probe on byte P (LMDB's
-  technique). A kernel lock, unlike `kill(pid, 0)`, is immune to PID reuse.
-  Linux uses OFD locks. macOS has only POSIX record locks, which a process loses
-  when *any* of its descriptors to the file closes; the implementation keeps one
-  descriptor open for the environment's life, and the SPEC records the pitfall
-  (LMDB shares it).
-- **Reap:** a reaper claims a dead process's slot with `CAS pid P → 0`, then
-  stores `txnid = FREE`. The `pid` CAS is the single linearization point: two
-  reapers cannot both free a slot, and no reaper can free a slot a live process
-  re-claimed.
+*(Reconciled 2026-10-13 with amendments 2, 7, 8, 9, 11, 12, 13 and 14; the
+original text of this section is in git history.)*
+
+- **Slot:** 128 bytes at offset `256 + i·128` (amendment 11): a `txnid` word
+  and an owner word holding the owner PID (low 32 bits; `0` means "being
+  claimed or released, or free — presumed live") and a claim generation
+  (high 32 bits) that every claim and every adoption increments
+  (amendment 14).
+- **Claim:** `CAS txnid FREE → CLAIMED`, then store the owner word
+  `(generation + 1, me)`, then pin (§4).
+- **Release (owner):** three stores, `txnid = CLAIMED`, then the owner word
+  with PID 0 (generation kept), then `txnid = FREE` (amendment 7). It unpins
+  before it disowns, so a death at any point leaves either `CLAIMED` with
+  the dead PID, which a reaper frees, or `CLAIMED` with PID 0, which pins
+  nothing.
+- **Liveness:** each process holds an `fcntl` byte-range lock at offset
+  `2^32 + pid` in the lock file; "is P alive?" is an `F_GETLK` probe of that
+  byte (LMDB's technique). A kernel lock, unlike `kill(pid, 0)`, is immune to
+  PID reuse. Both platforms use POSIX record locks (amendment 2), which a
+  process loses when *any* of its descriptors to the file closes; the
+  implementation keeps one descriptor open for the environment's life and
+  refuses a second in-process open of the lock file before opening a
+  descriptor. LMDB shares the pitfall.
+- **Reap:** a reaper loads every owner word, probes each PID found, and
+  adopts a dead process's slot by a CAS of the word it loaded to
+  `(generation + 1, reaper_pid)`, then runs the owner's release
+  (amendment 8). The owner-word CAS is the single linearization point: two
+  reapers cannot both adopt a slot, and the generation makes the CAS fail if
+  the slot was freed and re-claimed in between, even under the same PID
+  (amendment 14). A process's own-PID stale slots are freed at open
+  (amendment 9).
 - **When:** at first-opener election (the whole table is wiped); in
-  `clear_stale_readers` (today it returns 0; it will return the reaped count);
-  and at whatever other points LMDB reaps, as observed in the oracle — not
-  guessed (rule 1).
-- **Known leak window:** a process that dies between its claim CAS and its
-  `pid` store leaves a `CLAIMED` slot with `pid == 0` that no reaper can
-  attribute. It pins nothing (`oldest()` skips `CLAIMED`) and costs one slot
-  until the next first-opener wipe. LMDB avoids it by allocating slots under a
-  reader mutex; this design accepts one leaked slot per such crash to keep slot
+  `clear_stale_readers`, which returns the number of slots freed; and when a
+  writer takes the writer lock over from a dead owner on Linux. Those are
+  the points at which the LMDB fork was observed to reap (amendment 12); no
+  other point reaps.
+- **Known leak:** a process that dies between its claim CAS and its owner
+  store, or between the second and third stores of its release, leaves a
+  `CLAIMED` slot with PID 0 that no reaper can attribute. It pins nothing
+  (`oldest()` skips `CLAIMED`) and costs one slot until the next
+  first-opener wipe. LMDB avoids it by allocating slots under a reader
+  mutex; this design accepts one leaked slot per such crash to keep slot
   claims lock-free.
 - `oldest()` (the GC gate) is unchanged: it reads only the `txnid` words.
-- `reader_list` gains a PID column.
+- `reader_list` gains a PID column (amendment 13).
 
 ### 4. Snapshot selection and the writer's base
 
@@ -177,7 +205,9 @@ Option C. The design has six parts.
 
 - **Map size**, as LMDB (exact codes observed in the oracle): a txn begin whose
   meta has a larger `map_size`, or a `last_pg` beyond this process's map, fails
-  with `MapResized`; `Env::resize` adopts the new size. In-place `WRITE_MAP`
+  with `MapResized`; `Env::resize` adopts the new size. *(Corrected by
+  amendment 15: only a `last_pg` beyond the logical map size fails; a larger
+  `map_size` alone does not, as observed.)* In-place `WRITE_MAP`
   (ADR-0021) only ever grows the file while other processes may be alive.
 - **ADR-0018 validated-pages cache:** it is seeded only from this process's
   *published* commits, keyed by page number and writing txnid. A txnid is unique
@@ -241,6 +271,9 @@ atomic states its `Ordering` and why, assuming a weak memory model.
    point leaves one of two states. `CLAIMED` with the dead PID is reapable.
    `CLAIMED` with `pid == 0` is the known leak, which pins nothing.
    The local (single-process) table keeps its one-store release.
+   *Leak cost, restated:* a death between the second and third stores, like
+   a death between a claim's CAS and its owner store, costs one reader slot
+   until the next first-opener wipe; it never holds back the GC gate.
 8. **A reaper adopts, then releases.** Reaping a dead process P's slot is
    `CAS pid P → reaper_pid` (the single linearization point of §3), then the
    owner's release sequence (amendment 7). A reaper that dies mid-reap leaves
@@ -251,7 +284,11 @@ atomic states its `Ordering` and why, assuming a weak memory model.
    because this process now holds that PID's liveness lock. A joining process
    frees every such slot during open, before its first claim. It uses
    `CAS pid P → 0` (which excludes a concurrent reaper's adoption), then
-   `txnid = FREE`. Dying between those two stores leaks one pinned slot until
+   `txnid = FREE`. It cannot first store `txnid = CLAIMED`, as amendment 7's
+   release does: until the CAS succeeds this process does not own the slot.
+   A concurrent reaper may already have adopted and freed it, and another
+   process re-claimed it, so a store to its `txnid` before the CAS could unpin
+   a live reader. Dying between those two stores leaks one pinned slot until
    the next wipe; the window is a single store, accepted and documented.
 10. **Joiner re-election and magic-last.** The initializer stores the magic in
     `finish_open`, after `T` is seeded, so a joiner that sees the magic also
@@ -283,7 +320,7 @@ atomic states its `Ordering` and why, assuming a weak memory model.
     | Event after a reader process died | LMDB reaps? |
     |---|---|
     | Read transaction begin | No |
-    | Write transaction commit | No |
+    | Write transaction commit (the scenario begins a write txn and commits it, so it covers the begin too) | No |
     | Another process opening and closing the environment | No |
     | Reader table full (`ReadersFull`) | No: the error is returned, no reap-and-retry |
     | Writer takeover after the previous writer died (Linux; the robust writer mutex reports the dead owner) | Yes |
@@ -466,8 +503,11 @@ Terms used below:
         below).
       - Either way it creates a new `MapView` with the logical size and
         publishes it with a `Release` store.
-    - The trait default returns `Unsupported`. The fault backend forwards,
-      and the heap test backing implements it over heap mappings.
+    - The trait default returns `Unsupported`. The fault backend forwards.
+      The heap test backings (`zerodb-io`'s `TestWriteMap`, the core's
+      `VecBacking`) keep the default; `MapRegions` itself has a heap
+      mapping variant, which its miri test uses. *(Corrected 2026-10-13: this
+      bullet said the heap test backing implements `grow_map`.)*
 
     *Address-space bound.* Each new mapping is at least twice the previous
     one, so all earlier mappings together are shorter than the newest one.
@@ -660,22 +700,31 @@ Terms used below:
         and it is still empty. Otherwise the name now designates the data
         file, which must not be removed.
     - **Foreign-file guard.** The initializer refuses to truncate a non-empty
-      file that does not carry a lock magic, with `Io(InvalidInput)`. That
-      covers every foreign file, including another env's data file whose name
-      equals this env's derived lock name (data `a` derives `a-lock`, while
-      another env uses `a-lock` as its data name).
+      file that does not carry a lock magic, with `Io(InvalidInput)`: the
+      final magic `ZDBLOCK1`, or the initializing magic `ZDBLOCK0`
+      (`LOCK_MAGIC_INIT`). The one exception is an all-zero header (below),
+      accepted only at a length an initializer can leave: 8 bytes, or
+      `256 + 128·k` for `k ≥ 1`. This refuses every *initialized* data file,
+      including another env's data file whose name equals this env's derived
+      lock name (data `a` derives `a-lock`, while another env uses `a-lock`
+      as its data name). It does not refuse every foreign file: a file with
+      a zero header at one of those lengths is accepted and overwritten.
+      *(Reworded 2026-10-13: this bullet said the guard covers every foreign
+      file.)*
       - A data file's first bytes are often zero, so "zero" cannot mean
-        "ours". The initializer therefore truncates to 0 and then writes an
-        initializing magic with `pwrite` at the magic offset, before
-        `set_len` and before the final magic (amendment 10).
+        "ours". The initializer therefore truncates to 0 and then writes the
+        initializing magic `LOCK_MAGIC_INIT` (`ZDBLOCK0`) with `pwrite` at
+        the magic offset, before `set_len` and before the final magic
+        (amendment 10).
       - A *process* crash at any point leaves an empty file, or one carrying
         the initializing or final magic. All three are accepted.
       - Nothing fsyncs the lock file, so an *OS* crash or power loss can
         keep the new length and lose the block holding the magic. The file
         then reads as zeros with a non-zero length. The initializer
         therefore also accepts a file whose whole header (the first 256
-        bytes, up to the slot table) is zero, as never initialized. LMDB never
-        refuses here, and neither does this rule.
+        bytes, up to the slot table, or the whole file if shorter) is zero,
+        as never initialized, if its length is one an initializer can leave
+        (8, or `256 + 128·k`, `k ≥ 1`).
       - An initialized data file can never match. A ZeroDB data file's page
         0 is a meta page with the magic `ZDB1` at byte 32, and an LMDB data
         file's page 0 carries `0xBEEFC0DE` at byte 16. Both lie inside the
@@ -761,10 +810,17 @@ Terms used below:
       holding the env exclusively:
       - A new engine API,
         `zerodb::ExclusiveLock::acquire(dir, &EnvOpenOptions) -> Result<ExclusiveLock>`,
-        opens the env's lock file through `LockFile::open`. It succeeds only
-        if this process wins the first-opener election, and returns an
-        "env in use" error otherwise. It never calls `finish_open`, so the
+        opens the env's lock file through the non-blocking
+        `LockFile::try_open_exclusive`, which tries the election once and
+        never enters the joiner path. It succeeds only if this process wins
+        the first-opener election, and returns an "env in use" error
+        (`Io(WouldBlock)`) otherwise. It never calls `finish_open`, so the
         election byte stays write-locked until the guard drops.
+      - The tools size the guard, and their attached open, from the reader
+        count the lock file records, read first with
+        `zerodb_io::lockfile::published_max_readers`. A released guard
+        leaves the initializing magic, which records no count, so the next
+        sole opener uses the count it asks for.
       - Every other opener waits in the election meanwhile. Dropping the
         guard leaves the initializing magic, which the next opener accepts
         (amendment 16).

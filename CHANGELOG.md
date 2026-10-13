@@ -6,6 +6,95 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### Multi-process access (ADR-0023)
+
+Several processes can now open one environment at the same time and read or
+write it, as with LMDB. The environment's lock file is **on by default**. This
+retires divergence D-001 (single-process only).
+
+#### Changed
+
+- **A lock file is created next to the data file by default**: `lock.mdb`
+  through the heed adapter (as LMDB), `zerodb.lock` for the native
+  `zerodb.dat`. It holds the shared reader table, the last published txnid
+  and the cross-process writer lock. Its format is ZeroDB's own, not LMDB's.
+  The writer lock is a futex word on Linux and an `fcntl` record lock on
+  macOS; process liveness is an `fcntl` record lock per process, so a
+  reused PID is never mistaken for a dead process.
+- **`NO_LOCK` is honored** by the heed adapter (it was silently dropped): it
+  creates no lock file and keeps the single-process mode, and `Env::flags()`
+  reports it. The native opt-out is `EnvOpenOptions::lock_file(false)`. The
+  adapter's own `lock_file(bool)` setter, which never shipped in a release,
+  is removed: `NO_LOCK` is the opt-out.
+- A **`READ_ONLY` open on a read-only filesystem** runs without a lock file
+  and serves read transactions, as LMDB does. Any other lock-file error, such
+  as `EACCES` in a directory the process cannot write, fails the open.
+- **Lock-file name derivation**: the default name follows the data-file name,
+  `zerodb.dat` → `zerodb.lock`, `data.mdb` → `lock.mdb`, any other name
+  `<name>-lock`; `lock_file_name` overrides it. The open refuses, without
+  modifying anything, a lock file that is the data file under another name
+  (a hard link, or a case variant on a case-insensitive filesystem) and a
+  non-empty file that is not a ZeroDB lock file, such as another env's data
+  file or a stale LMDB `lock.mdb`.
+- **`max_readers` and `max_dbs` limits are checked before the lock file is
+  created**, so an out-of-range value leaves nothing behind. A process that
+  joins a running env adopts the lock file's reader count whatever it asks
+  for, and a first opener never shrinks the count an earlier run recorded,
+  as LMDB.
+- **`Env::clear_stale_readers` returns a count**: in a lock-file env it frees
+  the reader slots of processes that died holding them and returns how many
+  slots it freed, as `mdb_reader_check` counts. It returns 0 with `NO_LOCK`.
+  As in LMDB, a writer that takes the writer lock over from a dead process
+  (Linux) also frees them; nothing else reaps.
+- **`ReaderEntry::pid`**: `Env::reader_list()` reports each slot's owner PID
+  in a lock-file env (`None` with `NO_LOCK`). This adds a public field to a
+  struct without `#[non_exhaustive]`, so code that builds a `ReaderEntry` with
+  a struct literal or destructures it exhaustively must add the field.
+- `Env::info()` and `Env::stat()` include other processes' commits as soon as
+  they are published, as LMDB's do.
+- A `PREV_SNAPSHOT` open fails with `EAGAIN` while another process has the
+  env open, as LMDB; the geometry of such an open comes from the older meta
+  it selects.
+- **`zerodb-tools` attach to live environments**: `stat`, `dump` and `check`
+  open the env read-only through its lock file and read one pinned snapshot
+  while other processes keep writing, as `mdb_stat` and `mdb_dump` do.
+  `check` falls back to walking the raw file only when the env does not
+  open, and only while holding its lock file exclusively. `load` and
+  `migrate-from-lmdb` refuse a destination another process has open, and
+  `load` now writes through ordinary write transactions. The data-file
+  `flock` the tools used to take is gone.
+
+#### Added
+
+- **`Env::resize`** (heed's `unsafe fn resize`), as `mdb_env_set_mapsize` on
+  an open env: `0` adopts the size another process recorded, a smaller size
+  rounds up to the data, and a live write txn gets `EINVAL`. Live read
+  transactions and the values they borrowed stay valid: a resize adds a
+  longer mapping and keeps the old ones until the env closes. In a lock-file
+  env it waits for the cross-process writer lock, which LMDB does not take
+  (a proposed divergence).
+- **`MdbError::MapResized`** in the engine, returned at transaction begin
+  when another process committed past this process's map size (the heed
+  adapter's existing variant of that name now occurs); answer with `resize(0)` and begin
+  again. Opening with a map below the data now rounds the map up to it, as
+  LMDB does. A map size above 2^47 bytes is refused.
+- Native API: `EnvOpenOptions::lock_file`/`lock_file_name` and their getters,
+  `derived_lock_file_name`, `Env::has_lock_file`, `Env::opened_exclusively`
+  and `ExclusiveLock`.
+
+#### Removed
+
+- The `crossbeam-utils` dependency: reader slots use their own padded type,
+  shared with the lock file's layout.
+
+#### Known limits
+
+- Using an `Env` in a child after `fork()`, and sharing an env across PID
+  namespaces, are unsupported. On macOS a writer that follows a dead writer
+  does not free dead readers' slots (call `clear_stale_readers`).
+  `Env::sync` serializes only with this process's commits. Details: SPEC 04
+  §12.1.
+
 ## [0.2.0] - 2026-10-05
 
 First published release. **On-disk `format_version` 2.** Files are not LMDB

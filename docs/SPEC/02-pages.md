@@ -686,15 +686,17 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     name. A directory holding both names is two independent databases.
     `zerodb-tools`, which only reads, probes both and treats both-present as a
     hard error.
-  - **No lock file is created** unless the opener turns on the opt-in lock
-    file (`EnvOpenOptions::lock_file`, ADR-0023; without it the env is
-    single-process, D-001). Through the heed adapter, heed's `NO_LOCK` keeps
-    it off whatever the adapter's setting (ADR-0023 amendment 17). A
-    `READ_ONLY` open whose lock
+  - **A lock file is created unless `NO_LOCK`** (amended 2026-10-13,
+    ADR-0023 amendment 17). Every open creates or joins the lock file next to
+    the data file (SPEC 04 §12), so other processes can open the env at the
+    same time. `EnvOpenOptions::lock_file(false)`, or heed's `NO_LOCK`
+    through the adapter, creates none and runs the env single-process
+    (`OBS_NOLOCK_CREATES_LOCK_FILE = false`). A `READ_ONLY` open whose lock
     file cannot be created or opened for writing because the filesystem is
     read-only (`EROFS`) proceeds without one, as LMDB does
     (`OBS_RDONLY_LOCK_READONLY_FS = 0`); any other lock-file error fails the
-    open.
+    open. *(Before stage 3 of ADR-0023 the lock file was opt-in, and before
+    ADR-0023 no lock file existed at all, D-001, now retired.)*
   - **Lock-file name (ADR-0023 amendment 16).** The lock file lives next to
     the data file and its default name is derived from the data-file name
     (`zerodb::derived_lock_file_name`): `zerodb.dat` → `zerodb.lock`,
@@ -763,8 +765,7 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     (another process with a larger map committed past this one); a larger
     `meta.map_size` alone does not. Beyond the mapped bytes but within the
     logical size, or beyond the file, is `MdbError::Invalid`.
-  - **Cross-process `Env::info()`/`Env::stat()` (ADR-0023 §4, stage 3 Task
-    9).** `last_pgno`, `last_txnid` (`Env::info()`) and the main-DB counts
+  - **Cross-process `Env::info()`/`Env::stat()` (ADR-0023 §4).** `last_pgno`, `last_txnid` (`Env::info()`) and the main-DB counts
     (`Env::stat()`) are read from the snapshot at the shared published txnid
     `T` (`EnvInner::current_snapshot`, SPEC 04 TXN-18), not this process's
     own cached snapshot, so another process's commit is visible as soon as it
@@ -778,7 +779,9 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     process's own cached snapshot rather than surfacing the error — a
     deliberate trade-off that can transiently under-report a page/txnid
     another process already published, preferred over turning two previously
-    infallible accessors into fallible ones.
+    infallible accessors into fallible ones. That fallback has no dedicated
+    test. (These two accessors live here because `info().map_size` belongs to
+    this cluster; SPEC 04 TXN-18 points here.)
   - **`Env::resize` (ADR-0023 amendment 15; heed's `unsafe fn resize`,
     `mdb_env_set_mapsize` on an open env).** It refuses with `Io` and raw OS
     error `EINVAL` while a write txn of this env is live

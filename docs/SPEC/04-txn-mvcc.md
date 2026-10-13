@@ -4,6 +4,12 @@ Revised 2026-10-05 — docs sweep: snapshot-object field list brought up to the
 shipped shape (`last_pg`, free-list annex — ADR-0022), dirty-frame pool noted
 (commit 10c98a1).
 
+Revised 2026-10-13 — multi-process access (ADR-0023, stages 1–3): the lock
+file is on by default, D-001 is retired, and the rules below that assumed a
+single process are amended in place (§0, §2, TXN-6/7/9, §4, TXN-14/16/17/18/19,
+TXN-38, TXN-45b, TXN-50/51/53, TXN-56, TXN-66). The lock file's own invariants
+are the new §12 (`LCK-1` …).
+
 Status: **DONE** — 2026-07-15 (milestone 0.4). Behavioral source of truth for the
 transaction lifecycle (M1.4), the reader table and concurrency (M1.8), nested
 read transactions (M1.9), and the write-txn value-borrow contract that every
@@ -17,7 +23,10 @@ to understand the *algorithms* — reader-slot claiming, `mdb_find_oldest`, the
 nested-read patch (ITS#10395), and the commit sequence (AGENTS.md rule 4). The
 protocols below are ZeroDB's own design; where a rule mirrors an LMDB idea it is
 called out, but no C is transliterated. Binding decisions (not relitigated):
-single-process, in-process reader table only (**D-001**); nested WRITE txns
+several processes may open one environment through a shared lock file, on by
+default (**ADR-0023**; it retired the founding single-process decision D-001),
+and `NO_LOCK` (`EnvOpenOptions::lock_file(false)`) keeps the single-process
+path with an in-process reader table; nested WRITE txns
 unsupported (**D-003**); nested READ txns over the active write txn are a
 hot-path MUST with see-uncommitted semantics (M1.9); meta CRC + double-buffer
 per SPEC 02 §3; commit ordering encoded in one function with crash hooks
@@ -38,9 +47,18 @@ Normative rules are numbered **TXN-n** so tests and the check tool can cite them
 - **txnid** is a strictly monotonic `u64` (SPEC 02 §2 header stamp; §3 meta
   `txnid`). It only ever increases; ZeroDB does not wrap it (at 1 commit/µs a
   `u64` lasts ~584,000 years).
-- **Single process, single writer.** There is exactly one `Env` per path per
-  process (registry, §7) and at most one live write txn per env at a time
-  (§2). No lock file, no cross-process readers, no robust mutex (D-001).
+- **One handle per process, one writer across processes.** There is exactly
+  one `Env` per path per process (registry, §7) and at most one live write txn
+  per environment at a time, across every process that has it open (§2).
+  *(Amended 2026-10-13, ADR-0023; this bullet used to say "single process, no
+  lock file", D-001, now retired.)* By default the environment is
+  coordinated through a **lock file** next to the data file (§12): it holds
+  the published txnid `T`, the reader slots (§4) and the cross-process writer
+  lock, so any process may read or write. With `NO_LOCK`
+  (`EnvOpenOptions::lock_file(false)`, heed's `NO_LOCK`), or for a
+  `READ_ONLY` open on read-only media, there is no lock file: the reader table
+  is process memory, and the caller must keep other processes out, as with
+  LMDB's `MDB_NOLOCK`. There is no robust mutex in either mode (§2).
 - **Dirty page / dirty set.** A write txn's private, not-yet-committed page
   copies. Storage and stability rules are §6 (the value-borrow contract).
 - **WithoutTls is the only real mode** (SPEC 00 rows 2/29, SPEC 01 §S7
@@ -86,13 +104,20 @@ Normative rules are numbered **TXN-n** so tests and the check tool can cite them
 
 ---
 
-## §2 — Single-writer protocol (no lock file)
+## §2 — Single-writer protocol (two-layer writer lock)
 
 - **TXN-6** — `Env::write_txn()` acquires the env's in-process **writer lock**
   (a field on the shared `EnvInner`, §7). The guard is held for the entire life
-  of the `RwTxn` and released on commit or abort. There is **no** lock file and
-  **no** cross-process coordination (D-001); the lock serialises only the
-  threads of this process, which is the whole world under D-001.
+  of the `RwTxn` and released on commit or abort.
+  **Two layers (amended 2026-10-13, ADR-0023 §2).** In a lock-file
+  environment the guard then also takes the **cross-process writer lock**
+  (LCK-4), always *inside* the in-process one, so threads of one process never
+  contend on the cross-process lock. The guard's drop releases the
+  cross-process lock first, then the in-process one; both releases are
+  thread-agnostic, so `RwTxn: Send` holds in both layers. Without a lock file
+  the in-process lock alone serialises writers, as before: the original text
+  ("there is no lock file and no cross-process coordination", D-001) now
+  describes only that mode.
   **Lock construction (amended 2026-09-09, security review M1):** the lock is
   a **thread-agnostic** `occupied: Mutex<bool>` flag plus a `Condvar`, NOT a
   `Mutex<()>` whose `MutexGuard` lives inside the txn. `RwTxn` is `Send` (and
@@ -116,6 +141,14 @@ Normative rules are numbered **TXN-n** so tests and the check tool can cite them
   (LMDB blocks on `me_wmutex`). It does not error. (Consumers hold a write txn
   briefly or structure their own scheduling; ZeroDB does not add a try-lock
   Phase-1 API.)
+  **Cross-process wait (amended 2026-10-13, ADR-0023 §2).** In a lock-file
+  environment a writer in another process blocks this one the same way, after
+  it has the in-process lock: on Linux it sleeps on the writer word's futex
+  and, every 100 ms, checks whether the owner process is still alive (LCK-4),
+  taking the lock over from a dead owner; on macOS it blocks in a POSIX
+  record lock (`F_SETLKW`), which the kernel releases when its owner dies.
+  It never errors because another process holds the lock; only an I/O error
+  of the lock call or of the takeover's reader reap (LCK-7) fails the begin.
 - **TXN-8** — On an env opened read-only (`EnvFlags::READ_ONLY`, SPEC 01 Table 1,
   SHOULD/M1.10), `write_txn()` returns the error mapping of LMDB `EACCES`
   (heed `MdbError` path; §8 error table). No write mutex is taken.
@@ -127,6 +160,12 @@ Normative rules are numbered **TXN-n** so tests and the check tool can cite them
   operations (one swap per commit, one clone per pin) but never on any part
   of the writer's *transaction* — see TXN-18 as amended (ratified 2026-07-16,
   ADR-0006 Option B) for the precise scope of this guarantee.
+  **Lock-file note (2026-10-13, ADR-0023 §4).** The guarantee holds across
+  processes. A reader in any process pins against the shared published txnid
+  `T` (TXN-17) and claims a slot lock-free (§4.2); it never takes either
+  writer lock. A reader that finds `T` ahead of its cached snapshot decodes
+  that commit's meta from a `pread` copy (TXN-18), a bounded amount of I/O
+  that waits on no writer.
 
 ---
 
@@ -169,10 +208,14 @@ snapshot references.
 
 ---
 
-## §4 — The reader table (in-process, lock-free read path)
+## §4 — The reader table (lock-free read path)
 
-The reader table is the only place a reader and the writer communicate. It is an
-in-process array (D-001: no shared-memory lock file). Its job: let the writer
+The reader table is the only place a reader and the writer communicate. In a
+lock-file environment (the default, ADR-0023) it is the slot table of the
+shared lock file, mapped by every process that has the environment open
+(§12); without a lock file it is an array in this process's memory. Both
+run the same protocol below. *(Amended 2026-10-13: this section used to
+describe an in-process array only, D-001.)* Its job: let the writer
 compute the **oldest live snapshot** without blocking readers, and let readers
 claim/release a pinned snapshot without blocking the writer.
 
@@ -191,15 +234,21 @@ claim/release a pinned snapshot without blocking the writer.
   from an earlier run never shrinks its table: the size is the larger of its
   `max_readers` and the recorded count, as LMDB
   (`OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS`). Because the slots are
-  allocated **eagerly** (one cache-padded word per slot), `max_readers` is
+  allocated **eagerly** (one 128-byte slot each, in process memory or in the
+  lock file, whose length is `256 + 128 · max_readers` bytes), `max_readers` is
   bounded at open: values above `MAX_READERS_LIMIT` (2^20) are rejected with
   `Io(InvalidInput)` rather than aborting on allocation failure
   (added 2026-09-09, security review M6; `max_dbs` has the same bound,
   `MAX_DBS_LIMIT` = 2^20, for the comparator-registry slots — SPEC 00
-  rows 4/5).
+  rows 4/5). The bound is checked before the lock file is created
+  (amended 2026-10-13).
 - Each **slot** is cache-line padded (≥ 64 bytes, aligned) to avoid false
   sharing between a reader touching its slot and the writer scanning the array.
-  A slot carries exactly one load-bearing atomic field:
+  *(Amended 2026-10-13, ADR-0023 §3.)* Both modes use one slot type,
+  `zerodb_core::shared::ReaderSlot`: 128 bytes, 64-byte aligned, a txnid word
+  at offset 0 and an owner word at offset 8, the rest atomic padding. The
+  lock file stores its slots with exactly that stride (LCK-3). The txnid
+  word is the one load-bearing field of the pin protocol:
 
   | Field | Type | Meaning |
   |-------|------|---------|
@@ -216,11 +265,12 @@ claim/release a pinned snapshot without blocking the writer.
   MAX_COMMITTED_TXNID = RDR_CLAIMED - 2^32` (SPEC 06 REC-1a) and `write_txn`
   refuses to start once `base.txnid >= MAX_COMMITTED_TXNID`, so the 2^32 margin
   can never be consumed by commits.
-  Because occupancy is encoded in `txnid` alone, no separate `pid`/`tid` fields
-  are needed (D-001 deletes LMDB's `mr_pid`/`mr_tid`). In a lock-file
-  environment (ADR-0023), each slot also carries a 64-bit owner word, holding
-  the owner PID (low 32 bits) and a claim generation (high 32 bits) (ADR-0023
-  amendments 7 and 14), which reaping uses.
+  Occupancy is encoded in `txnid` alone, so the pin protocol needs no
+  `pid`/`tid` field (LMDB's `mr_pid`/`mr_tid`). In a lock-file environment
+  each slot's 64-bit owner word holds the owner PID (low 32 bits) and a claim
+  generation (high 32 bits) (ADR-0023 amendments 7 and 14), which only
+  reaping (LCK-7) and `reader_list` read. Without a lock file the owner word
+  stays 0.
 
 ### §4.2 — Claim (lock-free)
 
@@ -236,13 +286,12 @@ claim/release a pinned snapshot without blocking the writer.
 - **TXN-16** — If **no** slot is free (every CAS failed after a full scan), the
   read txn fails with the LMDB `MDB_READERS_FULL` mapping (heed
   `MdbError::ReadersFull`; §8). This is the observable overflow behavior and
-  matches LMDB (`mti_numreaders == env->me_maxreaders → MDB_READERS_FULL`). Under
-  D-001 there are no *stale* cross-process slots to reap first (LMDB's
-  `mdb_reader_check`), so the error is raised immediately; Phase 2.2 adds reader
-  introspection, not a reaping path. With a lock file (ADR-0023) dead processes'
-  slots can be stale, and the error is still raised immediately without reaping,
-  as the LMDB fork does (ADR-0023 amendment 12); `Env::clear_stale_readers`
-  frees them.
+  matches LMDB (`mti_numreaders == env->me_maxreaders → MDB_READERS_FULL`).
+  Without a lock file there are no *stale* cross-process slots to reap first
+  (LMDB's `mdb_reader_check`), so the error is raised immediately. With a lock
+  file (ADR-0023) dead processes' slots can be stale, and the error is still
+  raised immediately without reaping, as the LMDB fork does (ADR-0023
+  amendment 12, observed); `Env::clear_stale_readers` frees them (LCK-7).
 
 ### §4.3 — Publish-and-verify (the pin) and its memory-ordering correctness
 
@@ -284,6 +333,15 @@ only a full fence / `SeqCst` does.
   (TXN-10 step 3); if that object's own txnid is `> t` (a commit landed between
   the verify and the clone), the reader adopts the newer object and re-stores its
   txnid into the slot — monotone and still a validly pinned, newer snapshot.
+  **Lock-file environments (amended 2026-10-13, ADR-0023 §4).** The commit
+  point is the shared published txnid `T` in the lock file, not the
+  process-local `commit_point`: the loop runs unchanged against `T`
+  (`ReaderTable::pin_against`), with the same `SeqCst` accesses, and pairs with
+  the committing writer's `SeqCst` store of `T` in whichever process commits.
+  The verified `t` is then resolved to a snapshot (TXN-18 below); if meta slot
+  `t & 1` has already moved on, the loop re-reads `T` and pins again, the slot
+  keeping its last pin meanwhile (conservative for the GC gate, TXN-20). The
+  tail's adopt-newer step does not apply: the snapshot is the one for `t`.
 - **TXN-18** — **The published-snapshot object.** *(Amended 2026-07-16,
   ratified — maintainer, standing directive, ADR-0006 Option B: the original
   text required an ArcSwap-style lock-free cell "in the reader-table module
@@ -321,7 +379,28 @@ only a full fence / `SeqCst` does.
   - The **durable meta page is read only once, at env open** (SPEC 02 §3.2), to
     seed the first `Arc<Snapshot>`. Steady-state reads *never* touch a meta page;
     they use the published object. This is what removes the "read the meta slot
-    after open" race entirely.
+    after open" race entirely. *(This bullet holds without a lock file only.)*
+  - **Meta re-read at `T` (amended 2026-10-13, ADR-0023 §4 and amendments 4
+    and 5).** In a lock-file environment another process may commit, so a
+    meta *is* read after open: when a reader's verified `t`, or a writer's
+    base (TXN-56), differs from the txnid of this process's cached snapshot,
+    the engine decodes meta slot `t & 1` from a `pread` copy
+    (`Backing::read_meta_copy`), never from a slice of the map, because
+    another process may be rewriting that slot. A copy that fails its CRC, or
+    whose txnid is not `t`, means the slot moved on (`t + 2` overwrote it)
+    or was torn; the caller re-reads `T` and retries, a bounded number of
+    times, then fails with `MdbError::Invalid`. The decoded snapshot is
+    checked against this process's map and the file (SPEC 06 REC-1a; a
+    snapshot past the logical map size is `MdbError::MapResized`, TXN-38) and
+    then installed in the cell if it is newer than the cached one. When `t`
+    equals the cached snapshot's txnid, the cache is used with no decode and
+    no check (the single-process fast path). A process that *joins* an
+    environment others have open seeds its first snapshot from the meta at
+    `T`, never from the newest valid meta, which may belong to a commit that
+    is still in flight or that failed.
+  - `Env::info()` and `Env::stat()` follow `T` the same way, as LMDB's do
+    (`OBS_INFO_SEES_OTHER_COMMIT`, `OBS_STAT_SEES_OTHER_COMMIT`); SPEC 02 §8
+    states their fallback.
 
 ### §4.4 — Release
 
@@ -344,6 +423,18 @@ only a full fence / `SeqCst` does.
   moment new readers begin to see the new snapshot, and is the writer half of the
   pairing in TXN-17. The object-before-counter order guarantees a reader that
   sees the new counter can load the matching roots.
+  **Lock-file environments (amended 2026-10-13, ADR-0023 §4).** After step
+  (2) the writer also stores `writer_txnid` into the shared `T` (`SeqCst`),
+  still holding both writer locks. That store is the moment other processes
+  see the commit; it follows the meta write, and its fsync in the durable
+  modes (C4/C5), so no process can pin a commit before it is durable. Only
+  the holder of the cross-process writer lock stores `T` (besides the lock
+  file's initializer, which seeds it once at open, LCK-2). On Linux the
+  writer word's `Release` swap at unlock and the next owner's `Acquire` CAS
+  order one writer's `T` store and meta write before the next writer's begin;
+  on macOS the writer lock is a kernel record lock, whose unlock and lock
+  system calls separate the two writers. The oldest-reader
+  scan (TXN-20) reads the shared slots with the same `SeqCst` loads.
 - **TXN-20** — `oldest_reader()` returns the minimum pinned snapshot the GC must
   respect:
 
@@ -638,7 +729,19 @@ dirty-page store must be built so it is.
   page reachable from a published snapshot. A reused page therefore carries a
   newer stamp and misses; no invalidation is needed. The cache starts empty
   at open, so a corrupt or hostile file is still validated on its first view.
-  It assumes the file changes only through this process's commits (D-001).
+  **Several processes (amended 2026-10-13, ADR-0023 §5).** The cache is per
+  process and stays on in a lock-file environment. Its entries come from
+  this process's own committed dirty sets and from its readers' successful
+  validations of pages reachable from a published snapshot, which may be
+  another process's commit. The page-version identity above holds across
+  processes, because every process commits under the same rules and only
+  one writes at a time (TXN-6): a page another process rewrote was reused by
+  a later txn and carries that txn's newer stamp, so it misses. A failed
+  commit's txnid is reused by the next writer, in any process, but the
+  failed commit published no `T`, so no reader in any process reached its
+  pages, and no cache holds its stamps. The original text said the cache
+  assumes the file changes only through this process's commits (D-001);
+  it now assumes the file changes only through ZeroDB commits.
   The table is fixed-size (allocated in chunks as publishes land) and
   direct-mapped by pgno; each slot is a seqlock, so a
   lookup racing a publish or a collision only misses (loom model
@@ -647,6 +750,21 @@ dirty-page store must be built so it is.
   overflow values, named DBs, aborts and delayed reuse; short read txns
   against a model), `stamps::tests`,
   `btree::tests::stamp_cache_serves_the_exact_page_version_across_txns`.
+  **Snapshots past this process's map (added 2026-10-13, ADR-0023 amendment
+  15).** In a lock-file environment another process with a larger map may
+  commit pages beyond this process's logical map size. A read or write txn
+  begin whose snapshot needs `(last_pg + 1) · page_size` bytes beyond the
+  logical map size fails with `MdbError::MapResized` before any page is
+  resolved, as LMDB's begin returns `MDB_MAP_RESIZED`
+  (`OBS_READ_BEGIN_SMALL_MAP`, `OBS_WRITE_BEGIN_SMALL_MAP`); a larger
+  `map_size` in the meta alone is not an error
+  (`OBS_BIGGER_META_MAPSIZE_ALONE_RESIZES = false`). The caller answers with
+  `Env::resize(0)` and begins again. So a committed-map resolution never
+  needs a page outside this process's mapping. The check is SPEC 06 REC-1a's;
+  a write begin applies it to its base even when the base came from the
+  cache. The read fast path (the cached snapshot is current) needs no check:
+  mappings never shrink, and `resize` never sets the logical size below the
+  newest published snapshot, so every cached snapshot still fits.
 
 ### §6.2 — Which operations invalidate which borrows
 
@@ -861,8 +979,11 @@ spilling bullet there.)
     "nothing written" relaxed to "only unreferenced pages written", exactly as
     §6.3a already relaxed it for spills).
   - **The borrow contract (TXN-39/41/42/46) is unchanged.** A map frame's
-    address is stable for the txn's life (the map is mapped once, ADR-0004
-    D4, and never remapped — growth is `MapFull`); shared views of a dirty
+    address is stable for the txn's life: a mapping is never remapped in
+    place, and `Env::resize`, which adds a longer mapping beside it, refuses
+    to run while a write txn of the env is live (ADR-0023 amendment 15;
+    within a txn, growth past the map is `MapFull`). Earlier mappings stay
+    mapped until the env closes. Shared views of a dirty
     frame are tied to `&txn`, mutable views to `&mut txn`, exactly as heap
     frames are. The brokered `&mut` slices are created transiently inside
     `&mut` ops of the dirty store and never stored.
@@ -968,12 +1089,27 @@ spilling bullet there.)
   published-snapshot cell (the atomically-swappable `Arc<Snapshot>`, TXN-18) and
   its mirroring in-memory `commit_point` atomic (§4.3), and the process-registry
   back-reference. `Clone` bumps the refcount; it does not reopen the file.
+  **Lock region (amended 2026-10-13, ADR-0023).** In a lock-file environment
+  `EnvInner` also owns the **lock region**: the mapped lock file and its one
+  descriptor, through which it reaches the published txnid `T`, the shared
+  reader slots and the cross-process writer lock (§12). The reader table
+  holds the only other reference to it. Without a lock file there is none.
 - **TXN-51** — **Same-process registry** (SPEC 00 row 26): a process-global map
   `path → Weak<EnvInner>` guards uniqueness. `open` on a path whose `Weak` still
   upgrades returns the LMDB `EnvAlreadyOpened` mapping (heed
   `Error::EnvAlreadyOpened`; §8). `Index::rollback` (drop-then-reopen-with-
   PREV_SNAPSHOT) and the IndexMap LRU depend on this exact behavior. The registry
   entry is cleared when the last handle drops (close, TXN-53).
+  **Lock-file registry (amended 2026-10-13, ADR-0023 amendment 2).** A second,
+  process-global registry, in `zerodb-io`, records every lock file this
+  process has open, keyed by the file's identity (`st_dev`, `st_ino`), or by
+  its canonical path while it does not exist yet. A second open of the same
+  lock file in this process, under any name (another spelling, a symbolic or
+  hard link), is refused with `EnvAlreadyOpened` *before* a descriptor is
+  opened. POSIX record locks belong to the process, so closing a second
+  descriptor of the file would silently drop the first handle's election and
+  liveness locks. The lock file coordinates processes; this rule and the path
+  registry above keep one handle per environment within a process.
 - **TXN-52** — `Env::prepare_for_closing()` consumes the public `Env`, returns an
   `EnvClosingEvent` (SPEC 00 rows 23/24), and marks the env *closing*. The
   underlying `EnvInner` is **not** torn down until the last strong reference
@@ -985,6 +1121,15 @@ spilling bullet there.)
   `wait_timeout(dur)` block until that teardown has run (a `SignalEvent` fired
   from the teardown path). The IndexMap waits on this before reopening a path on
   resize/delete.
+  **Lock-file teardown (amended 2026-10-13, ADR-0023).** After the data file's
+  mappings and descriptor are released, and still before the close event
+  fires, the teardown drops the lock region: the lock file is unmapped, its
+  descriptor closed, which releases this process's record locks (its shared
+  election lock and its liveness lock), and only then is its entry in the
+  lock-file registry removed. A waiter woken by the event can therefore
+  reopen the environment at once. Every reader slot of this process is
+  already released by then, because every read txn holds the env alive
+  (TXN-52).
 - **TXN-54** — Because close is deferred to the last reference, a read borrow
   `&[u8]` handed to another thread via a `Send` `RoTxn` (TXN-13) can never
   outlive the mmap: the txn keeps the env alive, and the borrow is tied to the
@@ -1003,6 +1148,19 @@ spilling bullet there.)
   initialise an empty dirty set and freed-page list, snapshot the working
   `DBRecord`s (roots/stats) from the meta for in-txn mutation. On a read-only env,
   fail per TXN-8.
+  **Base at `T` (amended 2026-10-13, ADR-0023 §4 and amendment 15).** In a
+  lock-file environment "the live meta" is the snapshot published as `T`,
+  read *after both writer locks are held* (TXN-6), never the process-local
+  cell: another process may have committed since this process last looked.
+  It is the cached snapshot when `T` matches its txnid, else decoded at `T`
+  (TXN-18). The begin then runs, in order: the takeover reap, when the
+  cross-process lock was taken over from a dead owner (LCK-7); under
+  `WRITE_MAP`, growing the data file to this process's logical map size
+  (§6.4); reading the base at `T`; and checking the base against the map view
+  the txn will read through (`MdbError::MapResized` past the logical size,
+  TXN-38). `writer_txnid` is the base's txnid + 1. Every failure releases both
+  writer locks. Without a lock file the base is the process-local cell, as
+  before.
 - **TXN-57** — **mutate**: `put`/`del`/cursor writes run SPEC 03 §5–§10 against
   the dirty set (COW top-down, TXN-42), record freed pages (SPEC 05), and update
   working `DBRecord` stats. Reads interleave under §6. Nested readers may be
@@ -1084,7 +1242,20 @@ every hook; this section defines the steps and their ordering. Both write modes
 - **TXN-66** — **Exclusivity**: a PREV_SNAPSHOT open requires the env not already
   be open in-process (TXN-51 already enforces one handle per path; a PREV_SNAPSHOT
   open while another handle is live is refused, matching the fork's `EAGAIN`
-  requirement, SPEC 01 §S5). Under D-001 this is the natural single-handle case.
+  requirement, SPEC 01 §S5).
+  **Other processes (amended 2026-10-13, ADR-0023 §5).** In a lock-file
+  environment a `PREV_SNAPSHOT` open must win the first-opener election
+  (LCK-1), that is, no other process has the environment open. A process
+  that joins instead fails the open with `Io` and raw OS error `EAGAIN`,
+  after releasing the lock file and before opening the data file, as LMDB
+  does (`OBS_PREV_SNAPSHOT_JOINER = EAGAIN`). Without a lock file the caller
+  keeps other processes out. A `PREV_SNAPSHOT` open takes its map geometry
+  from the older meta, the one it selects: a map below that meta's data
+  rounds up to its `(last_pg + 1) · page_size`, and an unset map size adopts
+  that meta's `map_size`, as LMDB does (`OBS_PREV_SNAPSHOT_MINSIZE_FROM`,
+  `OBS_PREV_SNAPSHOT_ZERO_MAPSIZE_FROM`, both `"prev"`; observed on macOS
+  only). The original closing sentence ("under D-001 this is the natural
+  single-handle case") is retired.
 - **TXN-67** — **Auto-clear on first commit** (SPEC 01 §S5, milli
   `Index::rollback`): the first `commit()` on a PREV_SNAPSHOT env is txn
   `older_txnid + 1` (TXN-2) and writes slot `(older_txnid + 1) & 1`. **This slot
@@ -1136,9 +1307,11 @@ every hook; this section defines the steps and their ordering. Both write modes
 | env clone/close/registry | TXN-50..55 | SPEC 00 rows 23–26 |
 | commit pipeline | TXN-61..64 | SPEC 06 REC-1..12 |
 | PREV_SNAPSHOT | TXN-65..67 | SPEC 01 §S5, SPEC 02 §3.2, SPEC 06 REC-5 |
+| lock file (multi-process) | LCK-1..11 (§12); TXN-6/7, TXN-17..19, TXN-51/53, TXN-56, TXN-66 as amended | ADR-0023; SPEC 02 §8; SPEC 06 REC-1a; loom models in `zerodb-core/src/readers.rs`; `zerodb/tests/multi_process*.rs`; `zerodb-oracle/tests/multi_process_differential.rs`, `lmdb_reaping_observation.rs`, `lmdb_stage3_observation.rs` |
 
 **Rule count: TXN-1 … TXN-67 (67 normative rules; §4.4 adds sub-rule TXN-18a for
-slot release).** TXN-40 (nested write unsupported, D-003) is referenced from
+slot release), plus the later TXN-68 … TXN-72 (§6.3a) and LCK-1 … LCK-11
+(§12, added 2026-10-13).** TXN-40 (nested write unsupported, D-003) is referenced from
 §5/§8 and defined here:
 
 - **TXN-40** — A nested **write** txn is **unsupported** (D-003) and, as
@@ -1156,3 +1329,223 @@ slot release).** TXN-40 (nested write unsupported, D-003) is referenced from
   - *Pre-amendment text (superseded): "it returns a clean, documented
     'unsupported' error (mapped through the heed error taxonomy, §8.1), never
     a panic and never partial state."*
+
+---
+
+## §12 — The lock file (multi-process access, ADR-0023)
+
+Added 2026-10-13. An environment opened with a lock file (the default; §0) is
+coordinated through one file next to the data file, mapped `MAP_SHARED` by
+every process that has the environment open. This section states its
+invariants; the rules in §2, §4 and §7–§10 say how transactions use it. The
+design follows LMDB's lock file in technique (a first-opener election, PID
+liveness by record locks, a shared reader table), not in byte layout: the
+file is ZeroDB's own format, never LMDB's. Normative rules are numbered
+**LCK-n**. Implementation: `zerodb-io::lockfile` (the file, its record locks
+and the futex), `zerodb-core::shared` (the safe interface the core sees) and
+`zerodb-core::readers` (the slot protocol).
+
+- **LCK-1 — First-opener election (ADR-0023 §1, amendments 2 and 10).** Every
+  opener takes POSIX `fcntl` record locks, which belong to the process. On
+  open it tries an exclusive (write) lock on byte 0 without waiting. If it
+  gets it, no other process has the environment open: it is the
+  **initializer** and builds the file (LCK-2), keeping byte 0 exclusive until
+  the environment is fully open, then converts the lock to a shared one in
+  place. Otherwise it is a **joiner**: it waits for a shared lock on byte 0,
+  which it holds until it closes. Once granted, it tries the exclusive lock
+  once more; that succeeds only when every other process has exited
+  meanwhile, and the joiner then initializes instead. A joiner that loses
+  that upgrade and finds no final magic (LCK-2) drops its lock and runs the
+  election again, at most 100 times with a short PID-staggered sleep, then
+  fails the open with `Io(TimedOut)`. A joiner that loses the upgrade but
+  finds a final magic left by a previous run adopts that run's table, which
+  is the same state as joining a table whose processes all exited.
+  `zerodb::ExclusiveLock` runs the election without waiting and never
+  finishes it, so every other opener waits until the guard drops (used by
+  `zerodb-tools check` on a file that does not open, ADR-0023 amendment 18).
+- **LCK-2 — Initialization and the magic (ADR-0023 amendments 10 and 16).**
+  The initializer truncates the file to zero, writes the initializing magic
+  `ZDBLOCK0` at offset 0 with `pwrite`, sets the file's length, wipes every
+  reader slot (txnid `RDR_FREE`, owner word 0) and stores the format version
+  and the slot count. The engine then binds the data page size and seeds `T`
+  from the meta it selected. Only then is the final magic `ZDBLOCK1` stored,
+  with `Release`, and byte 0 downgraded. A joiner loads the magic with
+  `Acquire`, so a joiner that sees the final magic also sees every header
+  field and a seeded `T`. A joiner refuses the open with `Io(InvalidInput)`
+  when the format version differs, when the recorded slot count is 0 or
+  above `MAX_READERS_LIMIT`, or when the file is shorter than that count
+  needs, and with `Io(InvalidData)` when the bound page size differs from the
+  data file's.
+  - **Reader count.** A joiner adopts the recorded slot count whatever its
+    own `max_readers` asks (TXN-14). An initializer that finds a finished
+    file from an earlier run uses the larger of its `max_readers` and the
+    recorded count, and still wipes every slot. A file left with only the
+    initializing magic (an initializer that died, or a released
+    `ExclusiveLock`) records no count, so the next initializer uses its own.
+- **LCK-3 — Layout (ADR-0023 §1, amendments 11 and 14).** All fields are
+  little-endian and reached only through atomics at explicit offsets, never
+  through a cast of the mapping to a struct. The mapping is page-aligned.
+
+  | Offset | Field |
+  |---|---|
+  | 0 | magic `u64`: `ZDBLOCK0` while being built, `ZDBLOCK1` once published |
+  | 8 | lock-format version `u32`, currently 2 |
+  | 12 | data page size `u32`, 0 until bound |
+  | 16 | slot count `u32` (`max_readers`) |
+  | 64 | published txnid `T` `u64`, on its own cache line |
+  | 128 | Linux writer word `u32`: owner PID, bit 31 = waiters |
+  | 136–255 | unused, keeping slot 0 off the writer word's 128-byte line pair |
+  | 256 + 128·i | reader slot `i` (128 bytes, `ReaderSlot`, TXN-14) |
+
+  The file is `256 + 128 · max_readers` bytes. A slot holds its txnid word
+  at +0 and its **owner word** at +8: the owner PID in the low 32 bits (0 =
+  no owner: free, being claimed or being released, presumed live) and a
+  claim generation in the high 32 bits. Every write that stores a non-zero
+  PID in the word (a claim, or a reaper's adoption) increments the
+  generation; a release stores PID 0 and keeps the generation. Record-lock
+  offsets are separate from the mapped bytes: byte 0 is the election, byte 1
+  the macOS writer lock, and byte `2^32 + pid` each process's liveness lock.
+- **LCK-4 — Cross-process writer lock (ADR-0023 §2, amendment 3).** Taken only
+  while holding the in-process writer lock (TXN-6), by a write-txn begin and
+  by `Env::resize`.
+  - *Linux:* acquire is `CAS 0 → my_pid` (`Acquire`). A contended waiter sets
+    the waiters bit and sleeps on the word's futex for at most 100 ms; after
+    each timeout it probes the owner's liveness (LCK-5) and, if the owner is
+    dead, takes the lock over by a CAS from the dead PID to its own, keeping
+    the waiters bit. A word naming this process's own PID cannot be held by
+    another thread of this process (they are excluded by the in-process lock),
+    so it was left by a dead process with the same PID and is taken over at
+    once. Release swaps in 0 (`Release`) and wakes the waiters only if the
+    bit was set; it may run on any thread.
+  - *macOS:* an exclusive `fcntl` lock on byte 1, waited for with `F_SETLKW`
+    and released with `F_SETLK`; the kernel releases it if the process dies.
+    A failed release aborts the process rather than leaving other processes
+    blocked. A takeover from a dead process cannot be told apart from an
+    ordinary acquisition.
+  - A writer that dies holding the lock needs no repair: its commit is
+    visible only through the meta write and the later store of `T`, so it
+    leaves at most unreferenced pages, as after a crash. The next owner
+    rebuilds its base from the meta at `T` (TXN-56).
+- **LCK-5 — Liveness (ADR-0023 §3, amendment 2).** Each process holds an
+  exclusive record lock on byte `2^32 + pid` from its open until its
+  environment closes, which is after its last reader slot is released.
+  "Is process P alive?" is an `F_GETLK` probe of that byte. A kernel record
+  lock, unlike `kill(pid, 0)`, is immune to PID reuse: a recycled PID holds
+  the lock only if a live process with that PID has the environment open. A
+  probe of this process's own PID always answers alive, because `F_GETLK`
+  never reports the caller's own locks. POSIX drops all of a process's
+  record locks on a file when *any* of its descriptors to that file closes,
+  so a process keeps exactly one descriptor per lock file (TXN-51, the
+  lock-file registry).
+- **LCK-6 — Slot claim and the three-store release (ADR-0023 §3, amendments
+  7 and 13).** A claim is the TXN-15 CAS `RDR_FREE → RDR_CLAIMED`
+  (`Acquire`), then the owner word `(generation + 1, my_pid)` (`Release`),
+  then the TXN-17 pin. The owner's release is three `Release` stores:
+  `txnid = RDR_CLAIMED` (unpins), then the owner word with PID 0 and the
+  generation kept (disowns), then `txnid = RDR_FREE` (hands the slot over).
+  A death at any point therefore leaves either `RDR_CLAIMED` with the dead
+  PID, which a reaper frees, or `RDR_CLAIMED` with PID 0, which pins nothing
+  (`oldest()` skips `RDR_CLAIMED`). The second state, and a death between
+  the claim CAS and the owner store, is the **known leak**: one slot no
+  reaper can attribute, lost until the next initializer wipes the table.
+  ZeroDB accepts it to keep claims lock-free; LMDB avoids it by allocating
+  slots under a reader mutex. `reader_list` reports a slot's PID, or `None`
+  while it has none.
+- **LCK-7 — Reaping (ADR-0023 §3, amendments 8, 12 and 14).** A reaper frees
+  the slots of dead processes:
+  1. it loads every owner word (`Acquire`), keeping those with a non-zero PID
+     other than its own;
+  2. it probes each distinct PID once (LCK-5);
+  3. for each slot whose PID was judged dead, it adopts the slot by a CAS
+     of the owner word it loaded in step 1 to `(generation + 1, reaper_pid)`
+     (`AcqRel`), and on success runs the owner's release (LCK-6).
+
+  Two invariants make the adoption safe:
+  - **A — the owner word is ABA-free.** A word with a non-zero PID never
+    recurs, because every write of a non-zero PID increments the
+    generation; a word with PID 0 is never a CAS target. Wrap-around needs
+    2^32 claims of one slot while one reaper is paused, which is accepted.
+  - **B — load before probe.** A slot is adopted only by a CAS against a
+    word loaded *before* the probe that judged its PID dead. Since a process
+    holds its liveness lock until after its last slot is released (LCK-5), a
+    probe that finds P dead proves that every word carrying P loaded earlier
+    still belongs to a dead process, unless the word changed, which A makes
+    the CAS detect. The `Acquire` loads keep the step-1 loads ahead of the
+    probes on a weakly ordered machine.
+
+  A reaper that dies after its CAS leaves a slot carrying its own PID, which
+  the next reaper frees. Reaping counts slots, not processes. **Reap
+  points**, as observed in the LMDB fork (amendment 12,
+  `crates/zerodb-oracle/tests/lmdb_reaping_observation.rs`): an explicit
+  `Env::clear_stale_readers` (`mdb_reader_check`); a writer that took the
+  writer lock over from a dead owner (Linux; LCK-4), whose reap failure
+  fails the write-txn begin and releases both locks; and the initializer,
+  which wipes the whole table. Nothing else reaps: not a read-txn begin, a
+  commit, a joining open, nor a full reader table (TXN-16).
+- **LCK-8 — Own-PID stale slots at join (ADR-0023 amendment 9).** A joiner
+  frees, during open and before its first claim, every slot whose owner word
+  carries its own PID: a dead process with the same PID left them, and the
+  liveness probe cannot tell them apart from this process's own slots. Each
+  is a CAS of the word to `(same generation, PID 0)` (`AcqRel`), which makes
+  a concurrent reaper's pending adoption fail, then `txnid = RDR_FREE`
+  (`Release`). Dying between the two stores leaks one *pinned* slot until
+  the next initializer; the window is a single store, accepted.
+- **LCK-9 — Name (ADR-0023 amendment 16).** The lock file sits in the
+  environment directory. Its default name is derived from the data-file
+  name: `zerodb.dat` → `zerodb.lock`, `data.mdb` → `lock.mdb`, any other
+  name `<data_file_name>-lock`; `EnvOpenOptions::lock_file_name` overrides it
+  with a single path component that differs from the data-file name.
+  Distinct data names in one directory therefore never share a lock file.
+  SPEC 02 §8 states the rule and the two file guards below.
+- **LCK-10 — File guards (ADR-0023 amendment 16).** Before anything is
+  truncated, every opener refuses a lock file that is the data file under
+  another name (same `st_dev` and `st_ino`), and the initializer refuses a
+  non-empty file that carries neither magic and is not an all-zero header
+  (the first 256 bytes, or the whole file if shorter) at a length an
+  initializer can leave (8, or `256 + 128·k` for `k ≥ 1`). Both refusals are
+  `Io(InvalidInput)` and modify neither file. SPEC 02 §8 gives the details
+  and the accepted residual window.
+- **LCK-11 — Without a lock file (ADR-0023 amendment 17).** `NO_LOCK`
+  (`lock_file(false)`) creates and opens no lock file
+  (`OBS_NOLOCK_CREATES_LOCK_FILE = false`), and so does a `READ_ONLY` open
+  whose lock file cannot be created or opened for writing on a read-only
+  filesystem (`EROFS`; `OBS_RDONLY_LOCK_READONLY_FS = 0`). The environment
+  then runs the single-process path: the in-process reader table and
+  published-snapshot cell, and the in-process writer lock only. Every other
+  lock-file error fails the open, `READ_ONLY` included; a `READ_ONLY` open
+  opens the lock file read-write, as LMDB does, and may itself be the
+  initializer, which seeds `T` but never writes the data file.
+
+### §12.1 — Documented limitations
+
+These are stated limits of the current design, not rules. None is observed
+against LMDB unless it says so.
+
+- **`fork()` after open is unsupported.** The lock region records the PID of
+  the process that opened it, and POSIX record locks are not inherited by a
+  child process: a child using the parent's `Env` would claim slots and
+  writer locks under the parent's PID without holding its liveness lock.
+  Open the environment in the process that uses it.
+- **PID namespaces are unsupported.** Owner words, the writer word and the
+  liveness-lock offsets use PIDs as each process sees them. Processes in
+  different PID namespaces sharing one lock file can name unrelated processes
+  by one PID. Not tested.
+- **macOS writer takeover does not reap.** On macOS the writer lock is a
+  record lock that reports no previous owner (LCK-4), so a writer that
+  follows a dead writer does not free dead readers' slots; only
+  `clear_stale_readers` and the next initializer do. LMDB's writer takeover
+  was observed on Linux only (amendment 12); its macOS behavior is
+  unobserved.
+- **`Env::sync` takes only the in-process writer lock.** A sync in one
+  process serializes with this process's commits, not with a commit in
+  another process. Whether LMDB's `mdb_env_sync` takes its writer mutex is
+  unobserved.
+- **`PREV_SNAPSHOT` lets joiners in at the end of its open.** The election
+  byte is downgraded when the open completes (LCK-1), not after the first
+  commit, so a process may join a rolled-back environment before the commit
+  that makes the rollback durable; it sees the older snapshot, which is the
+  published `T`. Whether LMDB admits a joiner in that window is unobserved.
+- **`Env::resize` waits for the cross-process writer lock**, also on a
+  `READ_ONLY` environment (its lock file is open read-write, so the lock is
+  available to it). LMDB's `mdb_env_set_mapsize` takes no lock (ADR-0023
+  decision 3); see `docs/DIVERGENCES.md`.

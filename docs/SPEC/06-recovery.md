@@ -78,6 +78,12 @@ this section defines the **recovery decision** and its error taxonomy.
   against the view only (map size and mapped bytes): a cached base passed the
   file check when it was decoded, and a process-local base was committed
   through this backing.
+  A process that *joins* an environment others have open seeds its first
+  snapshot from the meta at `T` (SPEC 04 TXN-18) with the same check, except
+  that `MapResized` does not fail the open: as LMDB's open rounds a small map
+  up to the data (`OBS_OPEN_BELOW_LAST_PG`), the joiner grows its map to the seed's `needed` bytes and
+  checks again. A seed beyond the file, or above `MAX_MAP_SIZE`, is
+  `MdbError::Invalid`, and the file itself is never grown for it.
 - **REC-2** — **Selection among valid slots:**
 
   | Valid slots | PREV_SNAPSHOT off | PREV_SNAPSHOT on |
@@ -346,6 +352,12 @@ recovered) **except** where explicitly noted as FS-order-dependent.
   is weaker, and treating a failed barrier as fatal is a strengthening ZeroDB
   adopts (recorded, not a consumer-visible divergence — consumers surface it as an
   `Io` error either way).
+  **Per process (ADR-0023 §2).** In a lock-file environment the poison flag
+  stays per process. Other processes never saw the failed commit: its `T`
+  was never published, so they keep committing from the last published
+  snapshot, and the next writer reuses the failed commit's txnid (SPEC 04
+  TXN-2). Only the process whose barrier failed refuses writes until it
+  reopens.
 - **REC-14** — **File growth crash safety.** Growing the file (SPEC 05 GC-16
   extend; durability ordering GC-28) writes new data pages into the extended
   region and fsyncs them (C2/C3) **before**

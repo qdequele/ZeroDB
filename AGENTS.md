@@ -161,7 +161,7 @@ error taxonomy. Public items are documented. No `TODO` in merged code — open a
 issue instead.
 
 No new dependency without an ADR. Current allowlist: `memmap2`, `libc`,
-`thiserror`, `crossbeam-utils`, `rand` (allowed, currently unused), `proptest`,
+`thiserror`, `rand` (allowed, currently unused), `proptest`,
 `arbitrary`, `criterion`; the heed-surface re-exports `heed-traits`,
 `heed-types` and `byteorder` in `heed-zerodb` only (ADR-0003); `loom` under
 `cfg(loom)` in `zerodb-core` only (ADR-0006); `libfuzzer-sys` in `fuzz/` only
