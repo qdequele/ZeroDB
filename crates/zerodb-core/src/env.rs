@@ -753,10 +753,20 @@ pub struct EnvInner {
     /// [`Env::info`], [`Env::stat`], [`Env::txnid`] and [`Env::resize`] while
     /// it is newer than the published snapshot, as LMDB reports the newest
     /// meta on disk; cleared once a publish reaches it.
-    unpublished: Mutex<Option<Arc<Snapshot>>>,
+    unpublished: Mutex<Option<Unpublished>>,
     /// Whether [`EnvInner::unpublished`] may hold a value: lets the common
     /// case skip its mutex.
     has_unpublished: AtomicBool,
+}
+
+/// A durable commit newer than the published snapshot (ADR-0023
+/// amendment 19), kept in [`EnvInner`] for `info`, `stat` and `resize`.
+struct Unpublished {
+    snap: Arc<Snapshot>,
+    /// This process's own unpublished first `PREV_SNAPSHOT` commit, which
+    /// [`Env::txnid`] also reports; `false` for a newer meta a joiner found
+    /// on disk at open.
+    own_commit: bool,
 }
 
 /// [`EnvInner`] sequential-writes override: follow the env default.
@@ -805,9 +815,10 @@ impl EnvInner {
             Some(region) => region.published_txnid().load(Ordering::SeqCst),
             None => self.snap_cell.commit_point(),
         };
-        // ADR-0023 amendment 19: a `PREV_SNAPSHOT` opener's unpublished first
-        // commit, while it is newer than `T`.
-        self.newer_unpublished(t).map_or(t, |u| u.txnid)
+        // ADR-0023 amendment 19: a `PREV_SNAPSHOT` opener's own unpublished
+        // first commit, while it is newer than `T`. A joiner's newer meta on
+        // disk is left out: `txnid` stays the published txnid there.
+        self.newer_unpublished(t, true).map_or(t, |u| u.txnid)
     }
 
     /// Whether this process still holds the first-opener election past its
@@ -821,7 +832,9 @@ impl EnvInner {
 
     /// The unpublished first commit of a `PREV_SNAPSHOT` opener
     /// (ADR-0023 amendment 19), if its txnid is above `txnid`.
-    fn newer_unpublished(&self, txnid: u64) -> Option<Arc<Snapshot>> {
+    /// With `own_only`, only this process's own unpublished commit counts,
+    /// not a newer meta a joiner found on disk at open.
+    fn newer_unpublished(&self, txnid: u64, own_only: bool) -> Option<Arc<Snapshot>> {
         // Acquire: pairs with the Release store made after the cell is
         // filled. The flag only lets this call skip the mutex; the value
         // itself is read under the mutex, which orders it. A stale `false`
@@ -833,7 +846,9 @@ impl EnvInner {
         }
         let mut cell = self.unpublished.lock().expect("unpublished cell poisoned");
         match cell.as_ref() {
-            Some(u) if u.txnid > txnid => Some(Arc::clone(u)),
+            Some(u) if u.snap.txnid > txnid => {
+                (u.own_commit || !own_only).then(|| Arc::clone(&u.snap))
+            }
             Some(_) => {
                 // A published snapshot reached it (`T` never decreases), so
                 // it can never be newer again.
@@ -851,7 +866,7 @@ impl EnvInner {
     /// disk, which LMDB's `mdb_env_info`, `mdb_env_stat` and
     /// `mdb_env_set_mapsize` read.
     fn or_newer_unpublished(&self, snap: Arc<Snapshot>) -> Arc<Snapshot> {
-        self.newer_unpublished(snap.txnid).unwrap_or(snap)
+        self.newer_unpublished(snap.txnid, false).unwrap_or(snap)
     }
 
     /// Finish a commit while this process holds the election
@@ -871,7 +886,10 @@ impl EnvInner {
     pub(crate) fn finish_held_election(&self, committed: Arc<Snapshot>) -> Result<(), Error> {
         {
             let mut cell = self.unpublished.lock().expect("unpublished cell poisoned");
-            *cell = Some(committed);
+            *cell = Some(Unpublished {
+                snap: committed,
+                own_commit: true,
+            });
             // Release: after the cell is filled; see `newer_unpublished`.
             self.has_unpublished.store(true, Ordering::Release);
         }
@@ -2429,7 +2447,10 @@ pub fn open_with_backing_shared(
             // LMDB's `mdb_env_info`/`mdb_env_stat` report
             // (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`). Kept
             // for those calls only; reads still use `T`.
-            let newer = (selected.txnid > seed.txnid).then(|| Arc::new(selected));
+            let newer = (selected.txnid > seed.txnid).then(|| Unpublished {
+                snap: Arc::new(selected),
+                own_commit: false,
+            });
             (seed, newer)
         }
         _ => (selected, None),
@@ -3183,7 +3204,7 @@ mod shared_env_tests {
             4
         );
         assert_eq!(env.info().last_txnid, 5);
-        assert_eq!(env.inner.txnid(), 5);
+        assert_eq!(env.inner.txnid(), 4, "txnid stays the published one");
         assert!(env.inner.has_unpublished.load(O::Relaxed));
         region.published_txnid().store(5, O::SeqCst);
         assert_eq!(env.inner.txnid(), 5);
