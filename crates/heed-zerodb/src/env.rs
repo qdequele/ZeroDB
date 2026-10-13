@@ -744,7 +744,8 @@ impl<T> Env<T> {
         self.inner.info().max_readers
     }
 
-    /// Reader slots **currently** occupied.
+    /// Reader slots **currently** occupied, by any process when the env has
+    /// a lock file.
     ///
     /// **ZeroDB extension — no heed/LMDB counterpart.** `EnvInfo`'s
     /// `number_of_readers` mirrors `MDB_envinfo::me_numreaders`, which is a

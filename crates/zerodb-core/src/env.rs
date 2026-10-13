@@ -1130,7 +1130,8 @@ impl EnvInner {
     }
 
     /// `MDB_envinfo::me_numreaders` parity: the **high-water** reader-slot
-    /// count, which never decreases when a read txn ends. See
+    /// count, which never decreases when a read txn ends, over every
+    /// process's readers in a lock-file environment. See
     /// [`crate::readers::ReaderTable::num_readers`] for the fork evidence and
     /// docs/DIVERGENCES.md (`me_numreaders` semantics).
     #[must_use]
@@ -1923,7 +1924,7 @@ impl Env {
 /// | `me_last_pgno` | [`EnvInfo::last_pgno`] | identical *meaning* (id of the last used page), but the **value is format-specific**: it counts ZeroDB pages of ZeroDB's layout, not LMDB's. Never compare it cross-engine. |
 /// | `me_last_txnid` | [`EnvInfo::last_txnid`] | identical meaning and value domain: the id of the last committed txn. Comparable cross-engine. |
 /// | `me_maxreaders` | [`EnvInfo::max_readers`] | identical: the reader-table size (configured, or adopted from the lock file by a joining process). |
-/// | `me_numreaders` | [`EnvInfo::num_readers`] | identical — **including LMDB's surprise**: it is a *high-water mark*, not a live count (see docs/DIVERGENCES.md). It is computed from the slots *this* process claimed, also in a lock-file environment, where other processes' readers share the table. |
+/// | `me_numreaders` | [`EnvInfo::num_readers`] | identical — **including LMDB's surprise**: it is a *high-water mark*, not a live count (see docs/DIVERGENCES.md). In a lock-file environment it counts every process's readers, as LMDB's shared counter does (`OBS_NUMREADERS_OTHER_PROCESS`): it is derived from the shared reader slots, so it restarts from 0 only when a first opener initializes the lock file. |
 /// | *(none)* | [`EnvInfo::live_readers`] | **ZeroDB extension**: the genuinely-live occupied-slot count that `me_numreaders` looks like but is not. |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvInfo {
@@ -1940,11 +1941,13 @@ pub struct EnvInfo {
     /// `me_numreaders`: the **high-water** reader-slot count — the maximum
     /// number of simultaneously live readers ever observed. It does **not**
     /// decrease when a read txn ends; that is LMDB's actual behavior, verified
-    /// against the fork and reproduced here. For the live count, use
-    /// [`EnvInfo::live_readers`].
+    /// against the fork and reproduced here. In a lock-file environment it
+    /// covers every process's readers, as LMDB's does. For the live count,
+    /// use [`EnvInfo::live_readers`].
     pub num_readers: u32,
     /// **ZeroDB extension** (no `MDB_envinfo` counterpart): reader slots
-    /// currently occupied. A concurrently sampled diagnostic count.
+    /// currently occupied, by any process in a lock-file environment. A
+    /// concurrently sampled diagnostic count.
     pub live_readers: u32,
 }
 

@@ -2,7 +2,8 @@
 //! scenario run against the Meilisearch LMDB fork (through `lmdb-master-sys`)
 //! and against ZeroDB with a lock file, comparing what each engine reports.
 //! Stage 2 covers dead-process handling; stage 3 covers map growth across
-//! processes (amendment 15).
+//! processes (amendment 15) and the reader count with readers in another
+//! process.
 //!
 //! The test binary re-runs itself as the child process (SIGKILLed for the
 //! dead-process cases).
@@ -510,7 +511,8 @@ fn wait_exit(c: &mut ChildGuard, role: &str) {
 /// roles open with an 8 MiB map and exit: `{zdb,lmdb}_grow` commit past
 /// [`GROW_TARGET`], `{zdb,lmdb}_commit_one` commit one small key.
 /// `{zdb,lmdb}_hold_open` just hold the env open (no txn) until `stop` is
-/// written, then exit cleanly.
+/// written, then exit cleanly. `{zdb,lmdb}_reads_until:<n>` begin n read
+/// txns, end them when `release` is written, and exit when `stop` is.
 #[test]
 fn child_entry() {
     let (Ok(role), Ok(dir)) = (std::env::var(ROLE), std::env::var(DIR)) else {
@@ -537,6 +539,33 @@ fn child_entry() {
             return;
         }
         _ => {}
+    }
+    // `{lmdb,zdb}_reads_until:<n>`: begin n read txns, signal `held`; end
+    // them when `release` appears and signal `released`; exit cleanly when
+    // `stop` appears.
+    let released = || {
+        std::fs::write(dir.join("released"), b"").unwrap();
+        wait_for(&dir.join("stop"));
+    };
+    if let Some(n) = role.strip_prefix("lmdb_reads_until:") {
+        let env = Lmdb::open(&dir, MAX_READERS);
+        let txns: Vec<_> = (0..n.parse::<u32>().unwrap())
+            .map(|_| env.try_read().unwrap())
+            .collect();
+        signal();
+        wait_for(&dir.join("release"));
+        txns.into_iter().for_each(Lmdb::abort);
+        return released();
+    }
+    if let Some(n) = role.strip_prefix("zdb_reads_until:") {
+        let env = zdb_open(&dir);
+        let txns: Vec<_> = (0..n.parse::<u32>().unwrap())
+            .map(|_| env.read_txn().unwrap())
+            .collect();
+        signal();
+        wait_for(&dir.join("release"));
+        drop(txns);
+        return released();
     }
     if let Some(n) = role.strip_prefix("lmdb_hold_readers:") {
         let env = Lmdb::open(&dir, MAX_READERS);
@@ -1192,4 +1221,71 @@ fn info_and_stat_see_other_commit_matches_lmdb() {
         t
     };
     assert_eq!(zdb, lmdb, "(last_txnid advanced, entries advanced)");
+}
+
+/// Run `role` (a `*_reads_until:3` child) while this process, holding no
+/// reader, samples `(reader count, reader-list entries)` with `sample`: while
+/// the child holds its 3 read txns, after it ends them, after it exits, and
+/// with `own`, which samples while this process holds one read txn of its
+/// own.
+fn reader_counts<E>(
+    dir: &Path,
+    env: &E,
+    role: &str,
+    sample: impl Fn(&E) -> (u32, usize),
+    own: impl Fn(&E) -> (u32, usize),
+) -> [(u32, usize); 4] {
+    let mut c = spawn(role, dir);
+    wait_for(&dir.join("held"));
+    let held = sample(env);
+    std::fs::write(dir.join("release"), b"").unwrap();
+    wait_for(&dir.join("released"));
+    let ended = sample(env);
+    std::fs::write(dir.join("stop"), b"").unwrap();
+    wait_exit(&mut c, role);
+    [held, ended, sample(env), own(env)]
+}
+
+/// `EnvInfo::num_readers` (`me_numreaders`) and the reader list with readers
+/// in another process (`OBS_NUMREADERS_OTHER_PROCESS`): LMDB's count is the
+/// shared high-water mark of reader slots, so this process sees the other
+/// process's readers, and the count never drops.
+#[test]
+fn reader_count_with_readers_in_another_process_matches_lmdb() {
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        let env = Lmdb::open(dir.path(), MAX_READERS);
+        env.commit_one();
+        let sample = |e: &Lmdb| {
+            // SAFETY: MDB_envinfo is plain data; LMDB fills it.
+            let i = unsafe {
+                let mut i: ffi::MDB_envinfo = std::mem::zeroed();
+                assert_eq!(ffi::mdb_env_info(e.env, &mut i), 0);
+                i
+            };
+            (i.me_numreaders, e.reader_pids().len())
+        };
+        reader_counts(dir.path(), &env, "lmdb_reads_until:3", sample, |e| {
+            let txn = e.try_read().unwrap();
+            let got = sample(e);
+            Lmdb::abort(txn);
+            got
+        })
+    };
+    eprintln!("lmdb (numreaders, listed) = {lmdb:?}");
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        let env = zdb_open(dir.path());
+        zdb_commit_one(&env);
+        let sample = |e: &zerodb::Env| (e.info().num_readers, e.reader_list().len());
+        reader_counts(dir.path(), &env, "zdb_reads_until:3", sample, |e| {
+            let _txn = e.read_txn().unwrap();
+            sample(e)
+        })
+    };
+    eprintln!("zdb (numreaders, listed) = {zdb:?}");
+    assert_eq!(
+        zdb, lmdb,
+        "(num_readers, reader-list entries): held elsewhere, ended, exited, own reader"
+    );
 }

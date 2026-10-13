@@ -773,7 +773,10 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     (both `true`, `crates/zerodb-oracle/tests/lmdb_stage3_observation.rs`).
     `map_size`, `max_readers`, `num_readers` and `live_readers` already come
     from the backing's published view and the shared reader table (above;
-    SPEC 04 §4). Both calls stay infallible: if the read at `T` fails (for
+    SPEC 04 §4). `num_readers` is LMDB's shared high-water mark, counting
+    every process's readers (`OBS_NUMREADERS_OTHER_PROCESS`); with a lock
+    file it is derived from the slots (one past the last slot ever claimed
+    since the lock file was initialized), so the lock file holds no counter. Both calls stay infallible: if the read at `T` fails (for
     example `MdbError::MapResized`, when `T` has moved past a commit that grew
     the map beyond this process's current mapping), they fall back to this
     process's own cached snapshot rather than surfacing the error — a

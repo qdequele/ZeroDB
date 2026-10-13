@@ -51,7 +51,10 @@ retires divergence D-001 (single-process only).
   struct without `#[non_exhaustive]`, so code that builds a `ReaderEntry` with
   a struct literal or destructures it exhaustively must add the field.
 - `Env::info()` and `Env::stat()` include other processes' commits as soon as
-  they are published, as LMDB's do.
+  they are published, as LMDB's do. `info().num_readers` (heed's
+  `number_of_readers`) counts other processes' readers too: as LMDB's
+  `me_numreaders`, it is the high-water mark of reader slots used by any
+  process since the lock file was initialized, and never decreases.
 - A `PREV_SNAPSHOT` open fails with `EAGAIN` while another process has the
   env open, as LMDB; the geometry of such an open comes from the older meta
   it selects.

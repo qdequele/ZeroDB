@@ -431,12 +431,45 @@ impl ReaderTable {
     /// behavior. ZeroDB reproduces it exactly (LMDB parity) and offers
     /// the genuinely-live count separately as [`ReaderTable::in_use`].
     ///
+    /// LMDB keeps the counter in the lock file, so with several processes it
+    /// counts every process's readers, and it restarts from 0 only when a
+    /// first opener initializes the lock file
+    /// (`OBS_NUMREADERS_OTHER_PROCESS`). A shared table derives the same
+    /// value from the slots instead, without a counter in the lock file:
+    /// claims are first-fit, so the slots ever claimed since the lock file
+    /// was initialized are a prefix of the table, and the value is one past
+    /// the last slot whose owner generation is non-zero (every claim
+    /// increments it, a release keeps it, and the initializer wipes it to 0)
+    /// or that is occupied now. The one gap: a slot whose generation wraps
+    /// to 0 after 2^32 claims and is then free reads as never claimed; this
+    /// process's own claims still count through the local counter.
+    ///
     /// Logged in `docs/DIVERGENCES.md` (`me_numreaders` semantics; a PROPOSED
     /// candidate for later redefinition, not approved).
     ///
     /// Relaxed load: introspection only, orders nothing (see [`ReaderTable::claim`]).
     pub(crate) fn num_readers(&self) -> u32 {
-        self.high_water.load(Ordering::Relaxed) as u32
+        let local = self.high_water.load(Ordering::Relaxed) as u32;
+        match &self.slots {
+            Slots::Local(_) => local,
+            #[cfg(not(loom))]
+            Slots::Shared(r) => {
+                // Relaxed loads: an introspection sample, like `in_use`, that
+                // no correctness decision reads and that orders no other
+                // access. Each slot only moves from "never claimed" to
+                // "claimed" while the lock file lives, so a stale load can
+                // only under-report a claim racing with this scan.
+                let used = r
+                    .slots()
+                    .iter()
+                    .rposition(|rs| {
+                        owner_generation(rs.owner().load(Ordering::Relaxed)) != 0
+                            || rs.txnid().load(Ordering::Relaxed) != RDR_FREE
+                    })
+                    .map_or(0, |i| i as u32 + 1);
+                local.max(used)
+            }
+        }
     }
 
     /// Slots **currently** occupied — claimed *or* pinned. A ZeroDB extension:
@@ -927,6 +960,29 @@ mod tests {
         let table =
             ReaderTable::new_shared(Arc::clone(&region) as Arc<dyn crate::shared::SharedRegion>);
         (region, table)
+    }
+
+    #[test]
+    fn shared_num_readers_counts_other_processes_and_never_drops() {
+        // `OBS_NUMREADERS_OTHER_PROCESS`: LMDB's `me_numreaders` is the
+        // shared high-water mark, so a process holding no reader sees another
+        // process's readers, and the count stays after they end.
+        let (region, other) = shared_table(8, 2);
+        let me = ReaderTable::new_shared(region.rejoin());
+        let held: Vec<u32> = (0..3).map(|_| other.claim().unwrap()).collect();
+        assert_eq!(me.num_readers(), 3);
+        assert_eq!(me.in_use(), 3);
+        held.into_iter().for_each(|s| other.release(s));
+        assert_eq!(me.num_readers(), 3);
+        assert_eq!(me.in_use(), 0);
+        // First-fit: this process's claim reuses slot 0, so the mark holds.
+        let mine = me.claim().unwrap();
+        assert_eq!(mine, 0);
+        assert_eq!(me.num_readers(), 3);
+        me.release(mine);
+        // A freshly initialized lock file starts again from 0.
+        let (_fresh_region, fresh) = shared_table(8, 3);
+        assert_eq!(fresh.num_readers(), 0);
     }
 
     #[test]
