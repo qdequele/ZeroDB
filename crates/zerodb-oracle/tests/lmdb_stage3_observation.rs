@@ -171,6 +171,25 @@ const OBS_PREV_SNAPSHOT_EMPTY_COMMIT_KEEPS_LOCK: [&str; 2] = ["blocked", "ok:pre
 /// (OrbStack container, kernel 7.2.9), 2026-10-13.
 const OBS_PREV_SNAPSHOT_NOLOCK_COMMITS: (&str, &str, bool) = ("a_commit", "a_commit2", true);
 /// One process opens [`two_meta_generations`]'s env with `MDB_PREVSNAPSHOT`
+/// and commits twice: whether the second commit writes its main DB root to
+/// the page number that the newest meta on disk names after the first
+/// commit. It does (page 3 both times): between the two commits the newest
+/// meta on disk is the first commit, and the second commit overwrites a page
+/// that meta references before it replaces the meta, so a crash in between
+/// leaves that meta naming a rewritten page. macOS (Darwin 27.0.0) and
+/// Linux aarch64 (OrbStack container, kernel 7.2.9), 2026-10-13.
+const OBS_PREV_SNAPSHOT_SECOND_COMMIT_REWRITES_FIRST_ROOT: bool = true;
+/// A process holds an env open (no flags, two meta generations); a second
+/// process opens it with `MDB_RDONLY | MDB_PREVSNAPSHOT`. `[the joiner's
+/// "ok:<read txn id> <snapshot>", the holder's next read txn "<id>
+/// <snapshot>" after the joiner closed, the holder's next write txn id]`.
+/// The read-only joiner is not refused: it opens, reads the older
+/// generation, and its open sets the shared txnid to the older meta for
+/// every process, so the holder's readers roll back to txn 1 and its next
+/// write txn is txn 2, built on the older meta. macOS (Darwin 27.0.0) and
+/// Linux aarch64 (OrbStack container, kernel 7.2.9), 2026-10-13.
+const OBS_PREV_SNAPSHOT_READ_ONLY_JOINER: [&str; 3] = ["ok:1 prev", "1 prev", "2"];
+/// One process opens [`two_meta_generations`]'s env with `MDB_PREVSNAPSHOT`
 /// (16 MiB map) and commits twice. For each commit: `(write txn id, id of a
 /// fresh read txn right after it, me_last_txnid right after it)`. Both
 /// commits are txn 2, both written to the meta slot of the generation the
@@ -632,6 +651,24 @@ fn child_entry() {
                     let snap = snapshot_of(txn);
                     Lmdb::abort(txn);
                     format!("ok:{snap}")
+                }
+                Err(libc::EAGAIN) => "EAGAIN".to_string(),
+                Err(rc) => format!("rc={rc}"),
+            };
+            write_result(&dir, &out);
+        }
+        // Open with `MDB_RDONLY | MDB_PREVSNAPSHOT` at the role's map size
+        // and begin a read txn: "ok:<read txn id> <snapshot>", "EAGAIN" or
+        // "rc=<rc>" goes to `result`; then close.
+        "rdonly_prev_join" => {
+            let out = match Lmdb::try_open(&dir, mapsize, MDB_RDONLY | ffi::MDB_PREVSNAPSHOT) {
+                Ok(env) => {
+                    let txn = env.begin(MDB_RDONLY).unwrap();
+                    // SAFETY: `txn` is a live read txn.
+                    let id = unsafe { ffi::mdb_txn_id(txn) };
+                    let snap = snapshot_of(txn);
+                    Lmdb::abort(txn);
+                    format!("ok:{id} {snap}")
                 }
                 Err(libc::EAGAIN) => "EAGAIN".to_string(),
                 Err(rc) => format!("rc={rc}"),
@@ -1661,4 +1698,66 @@ fn observe_prev_snapshot_nolock_commits() {
         "NOLOCK|PREVSNAPSHOT: after 1st {first}, after 2nd {second}, keeps first {keeps_first}"
     );
     assert_eq!(got, OBS_PREV_SNAPSHOT_NOLOCK_COMMITS);
+}
+
+/// The main DB root page number of the newest meta in `data.mdb` (the
+/// `md_root` of the main `MDB_db`, at offset 128 of a meta page: 88 for the
+/// record, plus 40).
+fn newest_main_root(dir: &Path, psize: u64) -> u64 {
+    let bytes = std::fs::read(dir.join("data.mdb")).unwrap();
+    let u64_at = |off: usize| u64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+    (0..2)
+        .map(|i| {
+            let base = (i * psize) as usize;
+            (u64_at(base + 144), u64_at(base + 128))
+        })
+        .max()
+        .unwrap()
+        .1
+}
+
+/// The crash window between a `MDB_PREVSNAPSHOT` env's first and second
+/// commits: the main DB root page of the newest meta after the first
+/// commit, and whether the second commit wrote its own root to that same
+/// page number ([`OBS_PREV_SNAPSHOT_SECOND_COMMIT_REWRITES_FIRST_ROOT`]).
+#[test]
+fn observe_prev_snapshot_second_commit_rewrites_first_root() {
+    let (dir, psize, _) = two_meta_generations();
+    let a = Lmdb::try_open(dir.path(), 16 * MIB, ffi::MDB_PREVSNAPSHOT).unwrap();
+    a.commit_key(b"after");
+    let first_root = newest_main_root(dir.path(), psize);
+    let first_metas = read_metas(dir.path(), psize);
+    a.commit_key(b"after2");
+    let second_root = newest_main_root(dir.path(), psize);
+    let second_metas = read_metas(dir.path(), psize);
+    drop(a);
+    println!(
+        "main root after the 1st commit {first_root} (metas {first_metas:?}), after the 2nd {second_root} (metas {second_metas:?})"
+    );
+    assert_eq!(
+        first_root == second_root,
+        OBS_PREV_SNAPSHOT_SECOND_COMMIT_REWRITES_FIRST_ROOT
+    );
+}
+
+/// A process holds an env open (no flags, [`two_meta_generations`]); a
+/// second process opens it with `MDB_RDONLY | MDB_PREVSNAPSHOT`, reads and
+/// closes. Then the holder begins a read txn and a write txn
+/// ([`OBS_PREV_SNAPSHOT_READ_ONLY_JOINER`]).
+#[test]
+fn observe_prev_snapshot_read_only_joiner() {
+    let (dir, _, _) = two_meta_generations();
+    let a = Lmdb::try_open(dir.path(), 16 * MIB, 0).unwrap();
+    run_child(&format!("rdonly_prev_join:{}", 16 * MIB), dir.path());
+    let joiner = std::fs::read_to_string(dir.path().join("result")).unwrap();
+    let t = a.begin(MDB_RDONLY).unwrap();
+    // SAFETY: `t` is a live read txn.
+    let read_id = unsafe { ffi::mdb_txn_id(t) };
+    let holder_view = format!("{read_id} {}", snapshot_of(t));
+    Lmdb::abort(t);
+    let write_id = commit_key_id(&a, b"after").to_string();
+    drop(a);
+    let got = [joiner, holder_view, write_id];
+    println!("RDONLY|PREVSNAPSHOT joiner on a running env: {got:?}");
+    assert_eq!(got, OBS_PREV_SNAPSHOT_READ_ONLY_JOINER);
 }
