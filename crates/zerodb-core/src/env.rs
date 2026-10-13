@@ -746,12 +746,17 @@ pub struct EnvInner {
     /// finishes the election instead of publishing. Read and written only
     /// at open and by the write-lock holder.
     holds_election: AtomicBool,
-    /// The commit that finished a held election (amendment 19): durable,
-    /// never published, its txnid reused by the next commit. Reported by
+    /// A durable commit newer than the published snapshot (amendment 19):
+    /// the commit that finished a held election (never published, its
+    /// txnid reused by the next commit), or, in a joiner, the newest meta
+    /// on disk when it was newer than `T` at open. Reported by
     /// [`Env::info`], [`Env::stat`], [`Env::txnid`] and [`Env::resize`] while
     /// it is newer than the published snapshot, as LMDB reports the newest
-    /// meta on disk.
+    /// meta on disk; cleared once a publish reaches it.
     unpublished: Mutex<Option<Arc<Snapshot>>>,
+    /// Whether [`EnvInner::unpublished`] may hold a value: lets the common
+    /// case skip its mutex.
+    has_unpublished: AtomicBool,
 }
 
 /// [`EnvInner`] sequential-writes override: follow the env default.
@@ -817,12 +822,28 @@ impl EnvInner {
     /// The unpublished first commit of a `PREV_SNAPSHOT` opener
     /// (ADR-0023 amendment 19), if its txnid is above `txnid`.
     fn newer_unpublished(&self, txnid: u64) -> Option<Arc<Snapshot>> {
-        self.unpublished
-            .lock()
-            .expect("unpublished cell poisoned")
-            .as_ref()
-            .filter(|u| u.txnid > txnid)
-            .map(Arc::clone)
+        // Acquire: pairs with the Release store made after the cell is
+        // filled. The flag only lets this call skip the mutex; the value
+        // itself is read under the mutex, which orders it. A stale `false`
+        // answers as a call made just before the cell was filled (or just
+        // after it was cleared) would, which is a valid order on any memory
+        // model, ARM's included.
+        if !self.has_unpublished.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut cell = self.unpublished.lock().expect("unpublished cell poisoned");
+        match cell.as_ref() {
+            Some(u) if u.txnid > txnid => Some(Arc::clone(u)),
+            Some(_) => {
+                // A published snapshot reached it (`T` never decreases), so
+                // it can never be newer again.
+                *cell = None;
+                // Release: under the mutex, after the cell is emptied.
+                self.has_unpublished.store(false, Ordering::Release);
+                None
+            }
+            None => None,
+        }
     }
 
     /// `snap`, or the unpublished first commit of a `PREV_SNAPSHOT` opener
@@ -848,7 +869,12 @@ impl EnvInner {
     ///
     /// [`SharedRegion::finish_open`]: crate::shared::SharedRegion::finish_open
     pub(crate) fn finish_held_election(&self, committed: Arc<Snapshot>) -> Result<(), Error> {
-        *self.unpublished.lock().expect("unpublished cell poisoned") = Some(committed);
+        {
+            let mut cell = self.unpublished.lock().expect("unpublished cell poisoned");
+            *cell = Some(committed);
+            // Release: after the cell is filled; see `newer_unpublished`.
+            self.has_unpublished.store(true, Ordering::Release);
+        }
         let region = self
             .shared
             .as_ref()
@@ -2389,15 +2415,24 @@ pub fn open_with_backing_shared(
         }
     }
 
-    let seed = match &shared {
+    let selected = Snapshot::from_meta(&meta, annex);
+    let (seed, newer_on_disk) = match &shared {
         // A joining process seeds from the published txnid, never from the
         // newest valid meta: that meta may belong to a commit still in flight
         // or one that failed, whose txnid the next writer reuses (TXN-2;
         // ADR-0023 amendment 5).
         Some(region) if !region.is_initializer() => {
-            seed_from_published(backing.as_ref(), page_size, region.as_ref())?
+            let seed = seed_from_published(backing.as_ref(), page_size, region.as_ref())?;
+            // ADR-0023 amendment 19: a newer meta on disk than `T` (the
+            // unpublished first commit of a `PREV_SNAPSHOT` opener, or a
+            // commit between its meta write and its `T` store) is what
+            // LMDB's `mdb_env_info`/`mdb_env_stat` report
+            // (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`). Kept
+            // for those calls only; reads still use `T`.
+            let newer = (selected.txnid > seed.txnid).then(|| Arc::new(selected));
+            (seed, newer)
         }
-        _ => Snapshot::from_meta(&meta, annex),
+        _ => (selected, None),
     };
     let reader_table = match &shared {
         // In shared mode the slot count comes from the region, fixed by the
@@ -2458,7 +2493,8 @@ pub fn open_with_backing_shared(
         holds_election: AtomicBool::new(
             prev_snapshot && shared.as_ref().is_some_and(|r| r.is_initializer()),
         ),
-        unpublished: Mutex::new(None),
+        has_unpublished: AtomicBool::new(newer_on_disk.is_some()),
+        unpublished: Mutex::new(newer_on_disk),
         shared: shared.clone(),
     });
 
@@ -3126,6 +3162,47 @@ mod shared_env_tests {
         env.main_database().put(&mut w, key, b"v")?;
         w.commit()?;
         Ok(id)
+    }
+
+    /// ADR-0023 amendment 19 (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`):
+    /// a joiner that finds a meta newer than `T` on disk reads at `T` but
+    /// reports the newer meta in `info`, until a publish reaches it.
+    #[test]
+    fn joiner_reports_a_newer_meta_on_disk_until_t_reaches_it() {
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(4, O::SeqCst);
+        let env = open(backing(4, 5), region.clone());
+        assert_eq!(
+            env.inner
+                .pin_reader()
+                .map(|(s, slot)| {
+                    env.inner.release_reader(slot);
+                    s.txnid
+                })
+                .unwrap(),
+            4
+        );
+        assert_eq!(env.info().last_txnid, 5);
+        assert_eq!(env.inner.txnid(), 5);
+        assert!(env.inner.has_unpublished.load(O::Relaxed));
+        region.published_txnid().store(5, O::SeqCst);
+        assert_eq!(env.inner.txnid(), 5);
+        assert!(
+            !env.inner.has_unpublished.load(O::Relaxed),
+            "cleared once T reaches it"
+        );
+        assert_eq!(env.info().last_txnid, 5);
+    }
+
+    /// An ordinary joiner whose newest meta is `T` keeps no unpublished
+    /// snapshot, so `info` and `txnid` skip the mutex.
+    #[test]
+    fn joiner_at_the_newest_meta_keeps_nothing_unpublished() {
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(5, O::SeqCst);
+        let env = open(backing(4, 5), region.clone());
+        assert!(!env.inner.has_unpublished.load(O::Relaxed));
+        assert_eq!(env.info().last_txnid, 5);
     }
 
     #[test]

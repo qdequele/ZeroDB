@@ -4290,6 +4290,13 @@ impl<'env> RwTxn<'env> {
     ///   commit is an implicit abort).
     /// - [`Error::Io`] on a write/fsync failure — a failed **fsync** also
     ///   poisons the env (SPEC 06 REC-13).
+    /// - [`Error::Io`] when this is the first commit of a `PREV_SNAPSHOT`
+    ///   env with a lock file and letting other processes in (the lock-file
+    ///   downgrade) fails after the meta write (ADR-0023 amendment 19). The
+    ///   commit is then **durable** although `Err` is returned; as for every
+    ///   first `PREV_SNAPSHOT` commit, it is not published, the next commit
+    ///   reuses its txnid on the older snapshot, and that commit retries the
+    ///   downgrade.
     pub fn commit(mut self) -> Result<()> {
         if self.errored {
             return Err(Error::Mdb(MdbError::BadTxn));

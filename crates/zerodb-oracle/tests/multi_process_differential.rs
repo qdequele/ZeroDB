@@ -605,6 +605,39 @@ fn child_entry() {
             };
             return write_result(&dir, &out);
         }
+        "lmdb_rdonly_prev_join" => {
+            let out = match Lmdb::try_open_flags(
+                &dir,
+                MAX_READERS,
+                16 * MIB,
+                MDB_RDONLY | ffi::MDB_PREVSNAPSHOT,
+            ) {
+                Ok(env) => {
+                    let (id, snap) = lmdb_read_view(&env);
+                    format!("ok:{id} {snap}")
+                }
+                Err(libc::EAGAIN) => "EAGAIN".to_string(),
+                Err(rc) => lmdb_rc(rc),
+            };
+            return write_result(&dir, &out);
+        }
+        "zdb_rdonly_prev_join" => {
+            let out = match zdb_try_open(
+                &dir,
+                Some(16 * MIB),
+                zerodb::EnvFlags::READ_ONLY | zerodb::EnvFlags::PREV_SNAPSHOT,
+            ) {
+                Ok(env) => {
+                    let (id, snap) = zdb_read_view(&env);
+                    format!("ok:{id} {snap}")
+                }
+                Err(zerodb::Error::Io(e)) if e.raw_os_error() == Some(libc::EAGAIN) => {
+                    "EAGAIN".to_string()
+                }
+                Err(e) => zdb_open_rc(Err(e)),
+            };
+            return write_result(&dir, &out);
+        }
         "lmdb_prev_hold" => {
             let _env =
                 Lmdb::try_open_flags(&dir, MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT).unwrap();
@@ -1873,10 +1906,9 @@ fn prev_snapshot_commit_txnids_vs_lmdb() {
 /// A process joins a `PREV_SNAPSHOT` env after the opener's first commit,
 /// the opener still open: `"ok:<read txn id> <last txnid> <snapshot>"`
 /// (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`). The joiner reads
-/// the older generation in both engines. LMDB's `mdb_env_info` names the
-/// newest meta on disk (txn 2); a ZeroDB joiner's `Env::info` names the
-/// published snapshot (txn 1). That last field is docs/DIVERGENCES.md D-025
-/// (PROPOSED), pinned here.
+/// the older generation in both engines, and both engines' `info` name the
+/// newest meta on disk (txn 2), which the joiner selected at open (ADR-0023
+/// amendment 19).
 #[test]
 fn prev_snapshot_joiner_after_first_commit_vs_lmdb() {
     let lmdb = {
@@ -1898,10 +1930,7 @@ fn prev_snapshot_joiner_after_first_commit_vs_lmdb() {
     };
     eprintln!("lmdb = {lmdb:?}, zdb = {zdb:?}");
     assert_eq!(lmdb, "ok:1 2 prev", "LMDB as observed");
-    assert_eq!(
-        zdb, "ok:1 1 prev",
-        "ZeroDB: D-025 (the joiner's last txnid)"
-    );
+    assert_eq!(zdb, lmdb, "ZeroDB mirrors LMDB (ADR-0023 amendment 19)");
 }
 
 /// B waits to join a `PREV_SNAPSHOT` env; the opener A ends before any
@@ -2209,4 +2238,39 @@ fn prev_snapshot_without_a_lock_file_vs_lmdb() {
     eprintln!("lmdb = {lmdb:?}, zdb = {zdb:?}");
     assert_eq!(lmdb, ("a_commit", "a_commit2", true), "LMDB as observed");
     assert_eq!(zdb, lmdb, "ZeroDB without a lock file (unchanged)");
+}
+
+/// A process holds an env open; another opens it `READ_ONLY | PREV_SNAPSHOT`,
+/// reads and closes; then the holder begins a read txn and a write txn
+/// (`OBS_PREV_SNAPSHOT_READ_ONLY_JOINER`): `[joiner outcome, holder's read
+/// "<id> <snapshot>", holder's write txn id]`. LMDB admits the read-only
+/// joiner and its open rolls every process back to the older meta; ZeroDB
+/// refuses it with `EAGAIN` and the holder is untouched. Not mirrored:
+/// docs/DIVERGENCES.md D-025 (PROPOSED), pinned here.
+#[test]
+fn prev_snapshot_read_only_joiner_vs_lmdb() {
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        lmdb_two_generations(dir.path());
+        let a = Lmdb::try_open_flags(dir.path(), MAX_READERS, 16 * MIB, 0).unwrap();
+        run_child("lmdb_rdonly_prev_join", dir.path());
+        let joiner = std::fs::read_to_string(dir.path().join("result")).unwrap();
+        let (id, snap) = lmdb_read_view(&a);
+        let w = lmdb_commit_key(&a, b"after");
+        [joiner, format!("{id} {snap}"), w.to_string()]
+    };
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        zdb_two_generations(dir.path());
+        let a = zdb_try_open(dir.path(), Some(16 * MIB), zerodb::EnvFlags::EMPTY).unwrap();
+        run_child("zdb_rdonly_prev_join", dir.path());
+        let joiner = std::fs::read_to_string(dir.path().join("result")).unwrap();
+        let (id, snap) = zdb_read_view(&a);
+        let w = zdb_commit_key(&a, b"after");
+        [joiner, format!("{id} {snap}"), w.to_string()]
+    };
+    eprintln!("lmdb = {lmdb:?}, zdb = {zdb:?}");
+    let s = |v: [&str; 3]| v.map(str::to_string);
+    assert_eq!(lmdb, s(["ok:1 prev", "1 prev", "2"]), "LMDB as observed");
+    assert_eq!(zdb, s(["EAGAIN", "2 newest", "3"]), "ZeroDB: D-025");
 }
