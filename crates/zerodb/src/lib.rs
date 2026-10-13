@@ -700,11 +700,9 @@ impl EnvOpenOptions {
             lock.clone()
                 .map(|l| l as std::sync::Arc<dyn zerodb_core::shared::SharedRegion>),
         )?;
-
-        if let Some(l) = &lock {
-            // Let joiners in only after T is seeded (ADR-0023 §1).
-            l.finish_open().map_err(Error::Io)?;
-        }
+        // The core open let joiners in once `T` was seeded (ADR-0023 §1),
+        // or, for `PREV_SNAPSHOT`, keeps them out until the first commit
+        // (amendment 19).
         Ok(env)
     }
 }

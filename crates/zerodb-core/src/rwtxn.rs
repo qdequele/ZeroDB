@@ -4423,6 +4423,29 @@ impl<'env> RwTxn<'env> {
         inner.run_hook(HookPoint::H4);
         // Crash here: `N` durable and selected (REC-6 H4).
 
+        let snapshot = Arc::new(Snapshot {
+            txnid: self.txnid,
+            last_pg,
+            map_size,
+            main_db: self.main_db,
+            free_db: self.free_db,
+            free_annex: if self.annex_out {
+                Arc::from(&self.freed[..])
+            } else {
+                Arc::from(&[][..])
+            },
+        });
+
+        // ----- ADR-0023 amendment 19: the first commit of a `PREV_SNAPSHOT`
+        // open that holds the election is durable but not published, as
+        // LMDB's (`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`): C5a and C6 are skipped,
+        // because the next commit reuses this txnid (TXN-2) and builds on the
+        // older snapshot. The election is finished instead, letting waiting
+        // processes join. -----
+        if inner.holds_election() {
+            return inner.finish_held_election(snapshot);
+        }
+
         // ----- C5a: seed the env-wide validated-pages cache (ADR-0018;
         // SPEC 04 TXN-38). Every frame C2 wrote is
         // engine-authored, stamped with this txnid, and now final: C5 is
@@ -4459,18 +4482,7 @@ impl<'env> RwTxn<'env> {
         // ----- C6: publish the snapshot (TXN-18/19 order: swap the object,
         // then store the commit point SeqCst) — only after C5, so no reader
         // can pin `N` before it is durable (TXN-64). -----
-        inner.publish_snapshot(Arc::new(Snapshot {
-            txnid: self.txnid,
-            last_pg,
-            map_size,
-            main_db: self.main_db,
-            free_db: self.free_db,
-            free_annex: if self.annex_out {
-                Arc::from(&self.freed[..])
-            } else {
-                Arc::from(&[][..])
-            },
-        }));
+        inner.publish_snapshot(snapshot);
         Ok(())
         // Drop of `self` releases the write mutex — the tail of C6.
     }

@@ -140,7 +140,8 @@ const OBS_PREV_SNAPSHOT_FIRST_COMMIT_READ_VIEW: [&str; 2] = ["prev", "a_commit2"
 /// within 10 s after the opener's first commit ("ok:<snapshot>", "EAGAIN" or
 /// "rc=<rc>"). It waits for the opener's exclusive lock, then joins and
 /// fails with `EAGAIN`, as any `MDB_PREVSNAPSHOT` joiner does
-/// ([`OBS_PREV_SNAPSHOT_JOINER`]). macOS (Darwin 27.0.0), 2026-10-13.
+/// ([`OBS_PREV_SNAPSHOT_JOINER`]). macOS (Darwin 27.0.0) and Linux aarch64
+/// (OrbStack container, kernel 7.2.9), 2026-10-13.
 const OBS_PREV_SNAPSHOT_SECOND_PREV_OPENER: [&str; 2] = ["blocked", "EAGAIN"];
 /// A sole process opens with `MDB_RDONLY | MDB_PREVSNAPSHOT`, which can never
 /// commit; a second process opens without flags. Its outcome within 3 s,
@@ -160,12 +161,14 @@ const OBS_PREV_SNAPSHOT_READ_ONLY_OPENER: [&str; 2] = ["blocked", "ok:prev"];
 /// The `MDB_PREVSNAPSHOT` opener commits a write txn with no changes while a
 /// process waits to join; the waiter's outcome within 3 s, then within 10 s
 /// after a commit that writes a key. The empty commit writes no meta and
-/// keeps the exclusive lock. macOS (Darwin 27.0.0), 2026-10-13.
+/// keeps the exclusive lock. macOS (Darwin 27.0.0) and Linux aarch64
+/// (OrbStack container, kernel 7.2.9), 2026-10-13.
 const OBS_PREV_SNAPSHOT_EMPTY_COMMIT_KEEPS_LOCK: [&str; 2] = ["blocked", "ok:prev"];
 /// `MDB_NOLOCK | MDB_PREVSNAPSHOT`, one process, two commits: `(snapshot
 /// after the first, snapshot after the second, the second keeps the first
 /// commit's key)`. Without a lock file the first commit is current at once
-/// and the second builds on it. macOS (Darwin 27.0.0), 2026-10-13.
+/// and the second builds on it. macOS (Darwin 27.0.0) and Linux aarch64
+/// (OrbStack container, kernel 7.2.9), 2026-10-13.
 const OBS_PREV_SNAPSHOT_NOLOCK_COMMITS: (&str, &str, bool) = ("a_commit", "a_commit2", true);
 /// One process opens [`two_meta_generations`]'s env with `MDB_PREVSNAPSHOT`
 /// (16 MiB map) and commits twice. For each commit: `(write txn id, id of a
@@ -174,22 +177,26 @@ const OBS_PREV_SNAPSHOT_NOLOCK_COMMITS: (&str, &str, bool) = ("a_commit", "a_com
 /// open rolled back: the first commit leaves the shared txnid on the older
 /// meta (read txn 1), so the second write txn is again `1 + 1` and rebuilds
 /// from the older meta. `me_last_txnid` names the newest meta on disk.
-/// macOS (Darwin 27.0.0), 2026-10-13.
+/// macOS (Darwin 27.0.0) and Linux aarch64
+/// (OrbStack container, kernel 7.2.9), 2026-10-13.
 const OBS_PREV_SNAPSHOT_COMMIT_TXNIDS: [(u64, u64, u64); 2] = [(2, 1, 2), (2, 2, 2)];
 /// In [`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`]'s run, whether the snapshot after
 /// the second commit still holds the first commit's key: it does not; the
 /// second commit's base is the older meta, so the first commit is lost.
-/// macOS (Darwin 27.0.0), 2026-10-13.
+/// macOS (Darwin 27.0.0) and Linux aarch64
+/// (OrbStack container, kernel 7.2.9), 2026-10-13.
 const OBS_PREV_SNAPSHOT_SECOND_COMMIT_KEEPS_FIRST: bool = false;
 /// One `MDB_PREVSNAPSHOT` commit, then the env is closed and opened again
 /// without flags: the snapshot the fresh open serves (see [`snapshot_of`]).
-/// macOS (Darwin 27.0.0), 2026-10-13.
+/// macOS (Darwin 27.0.0) and Linux aarch64
+/// (OrbStack container, kernel 7.2.9), 2026-10-13.
 const OBS_PREV_SNAPSHOT_ONE_COMMIT_THEN_REOPEN: &str = "a_commit";
 /// A process joins a `MDB_PREVSNAPSHOT` env after the opener's first commit
 /// (the opener still open): "ok:<read txn id> <me_last_txnid> <snapshot>".
 /// The joiner reads the older generation (txn 1) while its `mdb_env_info`
 /// names the newest meta on disk (txn 2, the opener's first commit).
-/// macOS (Darwin 27.0.0), 2026-10-13.
+/// macOS (Darwin 27.0.0) and Linux aarch64
+/// (OrbStack container, kernel 7.2.9), 2026-10-13.
 const OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT: &str = "ok:1 2 prev";
 /// A process waits to join a `MDB_PREVSNAPSHOT` env; the opener closes the
 /// env without committing. The waiter's outcome within 3 s of starting, and

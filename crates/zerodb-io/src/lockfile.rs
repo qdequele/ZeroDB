@@ -631,6 +631,9 @@ impl SharedRegion for LockFile {
     fn published_txnid(&self) -> &AtomicU64 {
         self.u64_at(OFF_T)
     }
+    fn finish_open(&self) -> std::io::Result<()> {
+        LockFile::finish_open(self)
+    }
     fn slots(&self) -> &[ReaderSlot] {
         debug_assert!(OFF_SLOTS + SLOT_STRIDE * self.slots as usize <= self.map.len());
         // SAFETY:

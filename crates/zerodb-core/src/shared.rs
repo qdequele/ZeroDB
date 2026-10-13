@@ -143,6 +143,16 @@ pub trait SharedRegion: Send + Sync {
     fn lock_writer(&self) -> std::io::Result<bool>;
     /// Release the cross-process writer lock. Callable from any thread.
     fn unlock_writer(&self);
+    /// Let other processes join (ADR-0023 §1, LCK-2): the initializer
+    /// publishes the finished header and downgrades its exclusive election
+    /// lock to a shared one. A no-op for a joiner, which already holds it
+    /// shared. The environment calls it once, at the end of its open, or,
+    /// for a `PREV_SNAPSHOT` open, at its first commit (amendment 19).
+    ///
+    /// # Errors
+    ///
+    /// The I/O error of the lock conversion.
+    fn finish_open(&self) -> std::io::Result<()>;
 }
 
 /// An in-process [`SharedRegion`] for unit tests and miri: heap atomics and a
@@ -165,6 +175,11 @@ pub(crate) struct HeapRegion {
     /// When set, the next [`SharedRegion::lock_writer`] fails with an I/O
     /// error without taking the lock (and clears the flag).
     next_lock_fails: std::sync::atomic::AtomicBool,
+    /// How many times [`SharedRegion::finish_open`] ran.
+    pub(crate) finish_opens: std::sync::atomic::AtomicU32,
+    /// When set, the next [`SharedRegion::finish_open`] fails with an I/O
+    /// error (and clears the flag).
+    next_finish_fails: std::sync::atomic::AtomicBool,
 }
 
 /// The part of a [`HeapRegion`] that models the lock file's contents.
@@ -190,6 +205,8 @@ impl HeapRegion {
             next_lock_is_takeover: std::sync::atomic::AtomicBool::new(false),
             probes_fail: std::sync::atomic::AtomicBool::new(false),
             next_lock_fails: std::sync::atomic::AtomicBool::new(false),
+            finish_opens: std::sync::atomic::AtomicU32::new(0),
+            next_finish_fails: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -206,6 +223,8 @@ impl HeapRegion {
             next_lock_is_takeover: std::sync::atomic::AtomicBool::new(false),
             probes_fail: std::sync::atomic::AtomicBool::new(false),
             next_lock_fails: std::sync::atomic::AtomicBool::new(false),
+            finish_opens: std::sync::atomic::AtomicU32::new(0),
+            next_finish_fails: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -227,6 +246,14 @@ impl HeapRegion {
     pub(crate) fn fail_next_lock(&self) {
         // Relaxed: a test knob set and read on the same thread.
         self.next_lock_fails
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Make the next [`SharedRegion::finish_open`] call fail with an I/O
+    /// error.
+    pub(crate) fn fail_next_finish_open(&self) {
+        // Relaxed: a test knob set and read on the same thread.
+        self.next_finish_fails
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -286,5 +313,17 @@ impl SharedRegion for HeapRegion {
     fn unlock_writer(&self) {
         *self.writer.lock().expect("test region poisoned") = false;
         self.cv.notify_one();
+    }
+    fn finish_open(&self) -> std::io::Result<()> {
+        // Relaxed: test knobs and a counter, set and read on the test thread.
+        if self
+            .next_finish_fails
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(std::io::Error::other("test finish_open failure"));
+        }
+        self.finish_opens
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 }

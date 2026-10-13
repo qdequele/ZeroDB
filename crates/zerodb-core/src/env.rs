@@ -740,6 +740,18 @@ pub struct EnvInner {
     /// The cross-process region when opened with a lock file (ADR-0023);
     /// `None` keeps the single-process path unchanged.
     shared: Option<Arc<dyn crate::shared::SharedRegion>>,
+    /// Whether this process still holds the first-opener election past its
+    /// open (ADR-0023 amendment 19): set at open for a `PREV_SNAPSHOT` open
+    /// that initialized the lock file, cleared by its first commit, which
+    /// finishes the election instead of publishing. Read and written only
+    /// at open and by the write-lock holder.
+    holds_election: AtomicBool,
+    /// The commit that finished a held election (amendment 19): durable,
+    /// never published, its txnid reused by the next commit. Reported by
+    /// [`Env::info`], [`Env::stat`], [`Env::txnid`] and [`Env::resize`] while
+    /// it is newer than the published snapshot, as LMDB reports the newest
+    /// meta on disk.
+    unpublished: Mutex<Option<Arc<Snapshot>>>,
 }
 
 /// [`EnvInner`] sequential-writes override: follow the env default.
@@ -783,11 +795,68 @@ impl EnvInner {
     /// includes other processes' commits (ADR-0023 §4).
     #[must_use]
     pub fn txnid(&self) -> u64 {
-        match &self.shared {
+        let t = match &self.shared {
             // SeqCst: the same total order as the T stores (TXN-17/19).
             Some(region) => region.published_txnid().load(Ordering::SeqCst),
             None => self.snap_cell.commit_point(),
-        }
+        };
+        // ADR-0023 amendment 19: a `PREV_SNAPSHOT` opener's unpublished first
+        // commit, while it is newer than `T`.
+        self.newer_unpublished(t).map_or(t, |u| u.txnid)
+    }
+
+    /// Whether this process still holds the first-opener election past its
+    /// open (ADR-0023 amendment 19).
+    pub(crate) fn holds_election(&self) -> bool {
+        // Relaxed: set before the env is shared, and afterwards read and
+        // written only by the holder of the writer locks, whose
+        // acquire/release orders every access.
+        self.holds_election.load(Ordering::Relaxed)
+    }
+
+    /// The unpublished first commit of a `PREV_SNAPSHOT` opener
+    /// (ADR-0023 amendment 19), if its txnid is above `txnid`.
+    fn newer_unpublished(&self, txnid: u64) -> Option<Arc<Snapshot>> {
+        self.unpublished
+            .lock()
+            .expect("unpublished cell poisoned")
+            .as_ref()
+            .filter(|u| u.txnid > txnid)
+            .map(Arc::clone)
+    }
+
+    /// `snap`, or the unpublished first commit of a `PREV_SNAPSHOT` opener
+    /// when that one is newer (ADR-0023 amendment 19): the newest meta on
+    /// disk, which LMDB's `mdb_env_info`, `mdb_env_stat` and
+    /// `mdb_env_set_mapsize` read.
+    fn or_newer_unpublished(&self, snap: Arc<Snapshot>) -> Arc<Snapshot> {
+        self.newer_unpublished(snap.txnid).unwrap_or(snap)
+    }
+
+    /// Finish a commit while this process holds the election
+    /// (ADR-0023 amendment 19). The commit is durable; it is not published,
+    /// as LMDB's first `MDB_PREVSNAPSHOT` commit leaves the shared txnid on
+    /// the older meta (`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`): `T` and the
+    /// published-snapshot cell keep the older snapshot, so the next writer
+    /// begins from it and reuses this txnid (TXN-2). Then the election is
+    /// finished, letting the processes that wait in it join.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error of [`SharedRegion::finish_open`]. The election stays
+    /// held and the next commit tries again.
+    ///
+    /// [`SharedRegion::finish_open`]: crate::shared::SharedRegion::finish_open
+    pub(crate) fn finish_held_election(&self, committed: Arc<Snapshot>) -> Result<(), Error> {
+        *self.unpublished.lock().expect("unpublished cell poisoned") = Some(committed);
+        let region = self
+            .shared
+            .as_ref()
+            .expect("the election is held only with a lock file");
+        region.finish_open().map_err(Error::Io)?;
+        // Relaxed: see `holds_election`.
+        self.holds_election.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     /// The meta selected at open, possibly unpublished in a joiner: the
@@ -1623,7 +1692,9 @@ impl Env {
         // dead-owner takeover. Every error below drops `guard`, releasing
         // both locks.
         inner.lock_writer_shared(&mut guard)?;
-        let snap = inner.newest_snapshot_unchecked()?;
+        // ADR-0023 amendment 19: the newest meta on disk, as LMDB's
+        // `mdb_env_set_mapsize`, including an unpublished first commit.
+        let snap = inner.or_newer_unpublished(inner.newest_snapshot_unchecked()?);
         let min = snap
             .last_pg
             .checked_add(1)
@@ -1678,6 +1749,9 @@ impl Env {
             .inner
             .current_snapshot()
             .unwrap_or_else(|_| self.inner.snapshot());
+        // ADR-0023 amendment 19: an unpublished first `PREV_SNAPSHOT` commit
+        // is the newest meta on disk, which LMDB's `mdb_env_info` reports.
+        let snap = self.inner.or_newer_unpublished(snap);
         EnvInfo {
             map_size: self.inner.map_size(),
             last_pgno: snap.last_pg,
@@ -1705,6 +1779,8 @@ impl Env {
             .inner
             .current_snapshot()
             .unwrap_or_else(|_| self.inner.snapshot());
+        // As in `info` (ADR-0023 amendment 19).
+        let snap = self.inner.or_newer_unpublished(snap);
         let rec = snap.main_db;
         EnvStat {
             page_size: self.inner.page_size(),
@@ -2377,6 +2453,12 @@ pub fn open_with_backing_shared(
         meta,
         prev_snapshot,
         closing,
+        // ADR-0023 amendment 19: a `PREV_SNAPSHOT` initializer keeps the
+        // election until its first commit, as LMDB does.
+        holds_election: AtomicBool::new(
+            prev_snapshot && shared.as_ref().is_some_and(|r| r.is_initializer()),
+        ),
+        unpublished: Mutex::new(None),
         shared: shared.clone(),
     });
 
@@ -2400,6 +2482,15 @@ pub fn open_with_backing_shared(
             }
         }
         reg.insert(canonical_path, (id, Arc::downgrade(&inner)));
+    }
+
+    // ADR-0023 §1: let joiners in only after `T` is seeded and the env is
+    // registered. A `PREV_SNAPSHOT` initializer keeps the election until its
+    // first commit instead (amendment 19; `RwTxn::commit`).
+    if let Some(region) = &shared {
+        if !inner.holds_election() {
+            region.finish_open().map_err(Error::Io)?;
+        }
     }
 
     Ok(Env { inner })
@@ -2976,6 +3067,126 @@ mod shared_env_tests {
 
     fn open(b: Box<dyn Backing>, region: Arc<dyn SharedRegion>) -> Env {
         try_open(b, region).expect("open")
+    }
+
+    /// A heap backing over [`image`] whose writes and syncs succeed without
+    /// storing anything: enough to run the commit pipeline when a test
+    /// checks only txnids, `T` and the election, and reads nothing a commit
+    /// wrote.
+    struct SinkBacking(VecBacking);
+
+    impl Backing for SinkBacking {
+        fn view(&self) -> MapView<'_> {
+            self.0.view()
+        }
+        fn real_disk_size(&self) -> std::io::Result<u64> {
+            self.0.real_disk_size()
+        }
+        fn try_clone_file(&self) -> std::io::Result<std::fs::File> {
+            self.0.try_clone_file()
+        }
+        fn write_at_page(&self, _pgno: u64, _psize: u32, _data: &[u8]) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn sync(&self, _async_flush: bool) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// [`open`] with `PREV_SNAPSHOT`, over a [`SinkBacking`] of
+    /// `image(t0, t1)`.
+    fn open_prev(t0: u64, t1: u64, region: Arc<dyn SharedRegion>) -> Env {
+        let dir = std::env::temp_dir().join(format!("zerodb-shared-{}", next_env_id()));
+        open_with_backing_shared(
+            dir,
+            Box::new(SinkBacking(VecBacking::new(image(t0, t1), 1 << 20))),
+            PS,
+            true,
+            4,
+            4,
+            DurabilityFlags::default(),
+            crate::page::FileTrust::VALIDATE,
+            false,
+            None,
+            Some(region),
+        )
+        .expect("open")
+    }
+
+    /// Begin a write txn: its txnid, and whether its base holds `key`.
+    fn write_base(env: &Env, key: &[u8]) -> (u64, bool) {
+        let w = env.write_txn().unwrap();
+        let has = env.main_database().get(&w, key).unwrap().is_some();
+        (w.txnid(), has)
+    }
+
+    fn put_commit(env: &Env, key: &[u8]) -> Result<u64, Error> {
+        let mut w = env.write_txn()?;
+        let id = w.txnid();
+        env.main_database().put(&mut w, key, b"v")?;
+        w.commit()?;
+        Ok(id)
+    }
+
+    #[test]
+    fn an_ordinary_initializer_finishes_the_election_at_open() {
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let _env = open(backing(4, 5), region.clone());
+        assert_eq!(region.finish_opens.load(O::Relaxed), 1);
+    }
+
+    /// ADR-0023 amendment 19: a `PREV_SNAPSHOT` initializer keeps the
+    /// election past its open; an unchanged commit keeps it; the first real
+    /// commit finishes it and is not published, so readers keep the older
+    /// snapshot and the next write txn reuses its txnid on that base.
+    #[test]
+    fn prev_snapshot_initializer_holds_the_election_until_its_first_commit() {
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let env = open_prev(4, 5, region.clone());
+        assert_eq!(region.published_txnid().load(O::SeqCst), 4);
+        assert_eq!(region.finish_opens.load(O::Relaxed), 0);
+        env.write_txn().unwrap().commit().unwrap();
+        assert_eq!(region.finish_opens.load(O::Relaxed), 0, "unchanged commit");
+
+        assert_eq!(put_commit(&env, b"first").unwrap(), 5);
+        assert_eq!(region.finish_opens.load(O::Relaxed), 1);
+        assert!(!env.inner.holds_election());
+        assert_eq!(region.published_txnid().load(O::SeqCst), 4, "T unchanged");
+        let r = env.read_txn().unwrap();
+        assert_eq!(r.txnid(), 4, "readers keep the older snapshot");
+        assert!(env.main_database().get(&r, b"first").unwrap().is_none());
+        drop(r);
+        assert_eq!(env.inner.txnid(), 5, "names the unpublished commit");
+        assert_eq!(env.info().last_txnid, 5);
+        assert_eq!(
+            write_base(&env, b"first"),
+            (5, false),
+            "reused on the older base"
+        );
+
+        assert_eq!(put_commit(&env, b"second").unwrap(), 5);
+        assert_eq!(region.finish_opens.load(O::Relaxed), 1);
+        assert_eq!(region.published_txnid().load(O::SeqCst), 5, "published");
+        assert_eq!(env.inner.txnid(), 5);
+        assert_eq!(env.info().last_txnid, 5);
+    }
+
+    /// If finishing the election fails, the commit reports it, the election
+    /// stays held and nothing is published; the next commit tries again.
+    #[test]
+    fn a_failed_election_finish_is_retried_by_the_next_commit() {
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let env = open_prev(4, 5, region.clone());
+        region.fail_next_finish_open();
+        assert!(matches!(put_commit(&env, b"first"), Err(Error::Io(_))));
+        assert_eq!(region.finish_opens.load(O::Relaxed), 0);
+        assert!(env.inner.holds_election());
+        assert_eq!(region.published_txnid().load(O::SeqCst), 4);
+        assert!(!writer_held(&region), "the failed commit releases the lock");
+        assert_eq!(put_commit(&env, b"again").unwrap(), 5);
+        assert_eq!(region.finish_opens.load(O::Relaxed), 1);
+        assert!(!env.inner.holds_election());
+        assert_eq!(region.published_txnid().load(O::SeqCst), 4);
     }
 
     /// A heap backing whose reported file length can change after open, to

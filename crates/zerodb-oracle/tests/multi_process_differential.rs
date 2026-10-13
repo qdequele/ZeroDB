@@ -518,7 +518,10 @@ fn wait_exit(c: &mut ChildGuard, role: &str) {
 /// and commit once, writing the data-file lengths to `result` (see
 /// [`write_map_joiner_lengths`]). `{zdb,lmdb}_join_report` open (16 MiB map)
 /// and write the snapshot a read txn sees to `result` (see
-/// [`join_before_prev_snapshot_commit`]).
+/// [`join_before_prev_snapshot_commit`]); `{zdb,lmdb}_join_info` also write
+/// the read txn's id and the env's last txnid. `{zdb,lmdb}_prev_join_report`
+/// do the same as `join_report` with `PREV_SNAPSHOT` ("EAGAIN" when refused),
+/// and `{zdb,lmdb}_prev_hold` open with `PREV_SNAPSHOT`, signal and park.
 #[test]
 fn child_entry() {
     let (Ok(role), Ok(dir)) = (std::env::var(ROLE), std::env::var(DIR)) else {
@@ -562,6 +565,58 @@ fn child_entry() {
                 Err(e) => zdb_open_rc(Err(e)),
             };
             return write_result(&dir, &out);
+        }
+        "lmdb_join_info" => {
+            let out = match Lmdb::try_open_flags(&dir, MAX_READERS, 16 * MIB, 0) {
+                Ok(env) => {
+                    let (id, snap) = lmdb_read_view(&env);
+                    format!("ok:{id} {} {snap}", env.last_txnid())
+                }
+                Err(rc) => lmdb_rc(rc),
+            };
+            return write_result(&dir, &out);
+        }
+        "zdb_join_info" => {
+            let out = match zdb_try_open(&dir, Some(16 * MIB), zerodb::EnvFlags::EMPTY) {
+                Ok(env) => {
+                    let (id, snap) = zdb_read_view(&env);
+                    format!("ok:{id} {} {snap}", env.info().last_txnid)
+                }
+                Err(e) => zdb_open_rc(Err(e)),
+            };
+            return write_result(&dir, &out);
+        }
+        "lmdb_prev_join_report" => {
+            let out = match Lmdb::try_open_flags(&dir, MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT)
+            {
+                Ok(env) => format!("ok:{}", lmdb_read_view(&env).1),
+                Err(libc::EAGAIN) => "EAGAIN".to_string(),
+                Err(rc) => lmdb_rc(rc),
+            };
+            return write_result(&dir, &out);
+        }
+        "zdb_prev_join_report" => {
+            let out = match zdb_try_open(&dir, Some(16 * MIB), zerodb::EnvFlags::PREV_SNAPSHOT) {
+                Ok(env) => format!("ok:{}", zdb_snapshot_of(&env)),
+                Err(zerodb::Error::Io(e)) if e.raw_os_error() == Some(libc::EAGAIN) => {
+                    "EAGAIN".to_string()
+                }
+                Err(e) => zdb_open_rc(Err(e)),
+            };
+            return write_result(&dir, &out);
+        }
+        "lmdb_prev_hold" => {
+            let _env =
+                Lmdb::try_open_flags(&dir, MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT).unwrap();
+            signal();
+            park();
+            return;
+        }
+        "zdb_prev_hold" => {
+            let _env = zdb_try_open(&dir, Some(16 * MIB), zerodb::EnvFlags::PREV_SNAPSHOT).unwrap();
+            signal();
+            park();
+            return;
         }
         _ => {}
     }
@@ -1587,11 +1642,8 @@ fn join_before_prev_snapshot_commit<E>(
 /// joiner's open until the first commit, after which the joiner and the
 /// rolling-back process both read the generation rolled back to until a
 /// second commit (`OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT`,
-/// `OBS_PREV_SNAPSHOT_FIRST_COMMIT_READ_VIEW`). ZeroDB lets the joiner in at
-/// the end of the open and publishes the first commit at once (SPEC 04
-/// §12.1). This test pins both engines' current behavior; the difference
-/// is reported and awaits a maintainer ruling, and it is not an approved
-/// divergence.
+/// `OBS_PREV_SNAPSHOT_FIRST_COMMIT_READ_VIEW`). ZeroDB mirrors it (ADR-0023
+/// amendment 19, SPEC 04 §12.1).
 #[test]
 fn join_before_prev_snapshot_first_commit_vs_lmdb() {
     let lmdb = {
@@ -1668,9 +1720,493 @@ fn join_before_prev_snapshot_first_commit_vs_lmdb() {
         (s(["blocked", "ok:prev", "-"]), ["prev", "a_commit2"]),
         "LMDB as observed"
     );
+    assert_eq!(zdb, lmdb, "ZeroDB mirrors LMDB (ADR-0023 amendment 19)");
+}
+
+/// Two meta generations in an LMDB env, as in
+/// [`join_before_prev_snapshot_first_commit_vs_lmdb`]: txn 1 ("prev", key
+/// `k`, 2 MiB map), then txn 2 (300 values, 16 MiB map).
+fn lmdb_two_generations(dir: &Path) {
+    {
+        let env = Lmdb::open_sized(dir, MAX_READERS, 2 * MIB);
+        env.commit_one();
+    }
+    let env = Lmdb::open_sized(dir, MAX_READERS, 16 * MIB);
+    env.commit_many(300);
+}
+
+/// [`lmdb_two_generations`] for ZeroDB.
+fn zdb_two_generations(dir: &Path) {
+    {
+        let env = zdb_open_sized(dir, Some(2 * MIB));
+        zdb_commit_one(&env);
+    }
+    let env = zdb_open_sized(dir, Some(16 * MIB));
+    zdb_commit_many(&env, 300);
+}
+
+/// Commit `key` in one write txn; the write txn's id.
+fn lmdb_commit_key(e: &Lmdb, key: &[u8]) -> u64 {
+    let txn = e.try_begin(0).unwrap();
+    // SAFETY: standard txn_id/dbi_open/put/commit sequence on a live write
+    // txn; every pointer is live for its call.
+    unsafe {
+        let id = ffi::mdb_txn_id(txn) as u64;
+        let mut dbi = 0;
+        assert_eq!(ffi::mdb_dbi_open(txn, ptr::null(), 0, &mut dbi), 0);
+        let mut k = ffi::MDB_val {
+            mv_size: key.len(),
+            mv_data: key.as_ptr() as *mut c_void,
+        };
+        let mut v = ffi::MDB_val {
+            mv_size: 1,
+            mv_data: b"v".as_ptr() as *mut c_void,
+        };
+        assert_eq!(ffi::mdb_put(txn, dbi, &mut k, &mut v, 0), 0);
+        assert_eq!(ffi::mdb_txn_commit(txn), 0);
+        id
+    }
+}
+
+/// [`lmdb_commit_key`] for ZeroDB.
+fn zdb_commit_key(e: &zerodb::Env, key: &[u8]) -> u64 {
+    let mut w = e.write_txn().unwrap();
+    let id = w.txnid();
+    e.main_database().put(&mut w, key, b"v").unwrap();
+    w.commit().unwrap();
+    id
+}
+
+/// A fresh read txn's id and snapshot (see [`snapshot_by`]).
+fn lmdb_read_view(e: &Lmdb) -> (u64, &'static str) {
+    let txn = e.try_read().unwrap();
+    // SAFETY: `txn` is a live read txn.
+    let id = unsafe { ffi::mdb_txn_id(txn) } as u64;
+    let snap = lmdb_snapshot_of(txn);
+    Lmdb::abort(txn);
+    (id, snap)
+}
+
+/// [`lmdb_read_view`] for ZeroDB.
+fn zdb_read_view(e: &zerodb::Env) -> (u64, &'static str) {
+    let r = e.read_txn().unwrap();
+    let db = e.main_database();
+    (r.txnid(), snapshot_by(|k| db.get(&r, k).unwrap().is_some()))
+}
+
+/// `([(write txn id, read txn id after, last txnid after); 2], second
+/// commit keeps the first's key, snapshot of a fresh open after one commit
+/// and a close)`, as in `OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`,
+/// `OBS_PREV_SNAPSHOT_SECOND_COMMIT_KEEPS_FIRST` and
+/// `OBS_PREV_SNAPSHOT_ONE_COMMIT_THEN_REOPEN`.
+type CommitTxnids = ([(u64, u64, u64); 2], bool, &'static str);
+
+/// A `PREV_SNAPSHOT` env's first two commits, in one process: the first
+/// commit is not published, so readers keep the older generation and the
+/// second commit (the same txnid) rebuilds from it, dropping the first
+/// commit's data; a fresh open after one commit and a close serves that
+/// commit (ADR-0023 amendment 19).
+#[test]
+fn prev_snapshot_commit_txnids_vs_lmdb() {
+    let lmdb: CommitTxnids = {
+        let dir = TempDir::new().unwrap();
+        lmdb_two_generations(dir.path());
+        let a =
+            Lmdb::try_open_flags(dir.path(), MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT).unwrap();
+        let step = |key: &[u8]| {
+            let w = lmdb_commit_key(&a, key);
+            let (r, _) = lmdb_read_view(&a);
+            (w, r, a.last_txnid())
+        };
+        let first = step(b"after");
+        let second = step(b"after2");
+        let txn = a.try_read().unwrap();
+        let keeps_first = lmdb_txn_has_key(txn, b"after");
+        Lmdb::abort(txn);
+        drop(a);
+        let dir2 = TempDir::new().unwrap();
+        lmdb_two_generations(dir2.path());
+        {
+            let a = Lmdb::try_open_flags(dir2.path(), MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT)
+                .unwrap();
+            lmdb_commit_key(&a, b"after");
+        }
+        let env = Lmdb::try_open_flags(dir2.path(), MAX_READERS, 16 * MIB, 0).unwrap();
+        ([first, second], keeps_first, lmdb_read_view(&env).1)
+    };
+    eprintln!("lmdb = {lmdb:?}");
+    let zdb: CommitTxnids = {
+        let dir = TempDir::new().unwrap();
+        zdb_two_generations(dir.path());
+        let a = zdb_try_open(dir.path(), Some(16 * MIB), zerodb::EnvFlags::PREV_SNAPSHOT).unwrap();
+        let step = |key: &[u8]| {
+            let w = zdb_commit_key(&a, key);
+            let (r, _) = zdb_read_view(&a);
+            (w, r, a.info().last_txnid)
+        };
+        let first = step(b"after");
+        let second = step(b"after2");
+        let keeps_first = {
+            let r = a.read_txn().unwrap();
+            a.main_database().get(&r, b"after").unwrap().is_some()
+        };
+        drop(a);
+        let dir2 = TempDir::new().unwrap();
+        zdb_two_generations(dir2.path());
+        {
+            let a =
+                zdb_try_open(dir2.path(), Some(16 * MIB), zerodb::EnvFlags::PREV_SNAPSHOT).unwrap();
+            zdb_commit_key(&a, b"after");
+        }
+        let env = zdb_try_open(dir2.path(), Some(16 * MIB), zerodb::EnvFlags::EMPTY).unwrap();
+        ([first, second], keeps_first, zdb_read_view(&env).1)
+    };
+    eprintln!("zdb = {zdb:?}");
     assert_eq!(
-        zdb,
-        (s(["ok:prev", "-", "-"]), ["a_commit", "a_commit2"]),
-        "ZeroDB as SPEC 04 §12.1 states"
+        lmdb,
+        ([(2, 1, 2), (2, 2, 2)], false, "a_commit"),
+        "LMDB as observed"
     );
+    assert_eq!(zdb, lmdb, "ZeroDB mirrors LMDB (ADR-0023 amendment 19)");
+}
+
+/// A process joins a `PREV_SNAPSHOT` env after the opener's first commit,
+/// the opener still open: `"ok:<read txn id> <last txnid> <snapshot>"`
+/// (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`). The joiner reads
+/// the older generation in both engines. LMDB's `mdb_env_info` names the
+/// newest meta on disk (txn 2); a ZeroDB joiner's `Env::info` names the
+/// published snapshot (txn 1). That last field is docs/DIVERGENCES.md D-025
+/// (PROPOSED), pinned here.
+#[test]
+fn prev_snapshot_joiner_after_first_commit_vs_lmdb() {
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        lmdb_two_generations(dir.path());
+        let a =
+            Lmdb::try_open_flags(dir.path(), MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT).unwrap();
+        lmdb_commit_key(&a, b"after");
+        run_child("lmdb_join_info", dir.path());
+        std::fs::read_to_string(dir.path().join("result")).unwrap()
+    };
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        zdb_two_generations(dir.path());
+        let a = zdb_try_open(dir.path(), Some(16 * MIB), zerodb::EnvFlags::PREV_SNAPSHOT).unwrap();
+        zdb_commit_key(&a, b"after");
+        run_child("zdb_join_info", dir.path());
+        std::fs::read_to_string(dir.path().join("result")).unwrap()
+    };
+    eprintln!("lmdb = {lmdb:?}, zdb = {zdb:?}");
+    assert_eq!(lmdb, "ok:1 2 prev", "LMDB as observed");
+    assert_eq!(
+        zdb, "ok:1 1 prev",
+        "ZeroDB: D-025 (the joiner's last txnid)"
+    );
+}
+
+/// B waits to join a `PREV_SNAPSHOT` env; the opener A ends before any
+/// commit, by closing (`kill` false: A is this process) or by being killed
+/// (`kill` true: A is a child). B's outcome within 3 s of starting, then
+/// within 10 s after A ends.
+fn prev_snapshot_opener_ends<E>(
+    dir: &Path,
+    kill: bool,
+    hold_role: &str,
+    join_role: &str,
+    open_prev: impl FnOnce() -> E,
+) -> [String; 2] {
+    let result = dir.join("result");
+    let (mut a_child, a_env) = if kill {
+        let c = spawn(hold_role, dir);
+        wait_for(&dir.join("held"));
+        (Some(c), None)
+    } else {
+        (None, Some(open_prev()))
+    };
+    let _b = spawn(join_role, dir);
+    let s0 = poll_file(&result, Duration::from_secs(3)).unwrap_or_else(|| "blocked".into());
+    if let Some(c) = a_child.as_mut() {
+        c.0.kill().unwrap();
+        c.0.wait().unwrap();
+    }
+    drop(a_env);
+    let s1 = if s0 == "blocked" {
+        poll_file(&result, Duration::from_secs(10)).unwrap_or_else(|| "blocked".into())
+    } else {
+        "-".to_string()
+    };
+    [s0, s1]
+}
+
+/// `(LMDB, ZeroDB)` for [`prev_snapshot_opener_ends`].
+fn prev_snapshot_opener_ends_both(kill: bool) -> ([String; 2], [String; 2]) {
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        lmdb_two_generations(dir.path());
+        prev_snapshot_opener_ends(
+            dir.path(),
+            kill,
+            "lmdb_prev_hold",
+            "lmdb_join_report",
+            || {
+                Lmdb::try_open_flags(dir.path(), MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT)
+                    .unwrap()
+            },
+        )
+    };
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        zdb_two_generations(dir.path());
+        prev_snapshot_opener_ends(dir.path(), kill, "zdb_prev_hold", "zdb_join_report", || {
+            zdb_try_open(dir.path(), Some(16 * MIB), zerodb::EnvFlags::PREV_SNAPSHOT).unwrap()
+        })
+    };
+    eprintln!("kill {kill}: lmdb = {lmdb:?}, zdb = {zdb:?}");
+    (lmdb, zdb)
+}
+
+/// The `PREV_SNAPSHOT` opener closes before its first commit while another
+/// process waits to join (`OBS_PREV_SNAPSHOT_OPENER_CLOSES_BEFORE_COMMIT`).
+/// Both engines hold the waiter while the opener is open. After the close,
+/// LMDB's waiter fails with `EINVAL` on macOS and joins the rolled-back
+/// generation on Linux; ZeroDB's waiter becomes the first opener and serves
+/// the newest generation. The second field is docs/DIVERGENCES.md D-025
+/// (PROPOSED), pinned here.
+#[test]
+fn prev_snapshot_opener_closes_before_commit_vs_lmdb() {
+    let (lmdb, zdb) = prev_snapshot_opener_ends_both(false);
+    let s = |v: [&str; 2]| v.map(str::to_string);
+    let lmdb_expected = if cfg!(target_os = "macos") {
+        ["blocked", "rc=22"]
+    } else {
+        ["blocked", "ok:prev"]
+    };
+    assert_eq!(lmdb, s(lmdb_expected), "LMDB as observed");
+    assert_eq!(zdb, s(["blocked", "ok:newest"]), "ZeroDB: D-025");
+}
+
+/// As [`prev_snapshot_opener_closes_before_commit_vs_lmdb`], but the opener
+/// is killed (`OBS_PREV_SNAPSHOT_OPENER_DIES_BEFORE_COMMIT`): LMDB's waiter
+/// joins the rolled-back generation; ZeroDB's waiter becomes the first
+/// opener and serves the newest one (D-025, PROPOSED).
+#[test]
+fn prev_snapshot_opener_dies_before_commit_vs_lmdb() {
+    let (lmdb, zdb) = prev_snapshot_opener_ends_both(true);
+    let s = |v: [&str; 2]| v.map(str::to_string);
+    assert_eq!(lmdb, s(["blocked", "ok:prev"]), "LMDB as observed");
+    assert_eq!(zdb, s(["blocked", "ok:newest"]), "ZeroDB: D-025");
+}
+
+/// A second process opens with `PREV_SNAPSHOT` while the first
+/// `PREV_SNAPSHOT` opener has not committed: it waits for the opener's first
+/// commit, then fails with `EAGAIN` as any `PREV_SNAPSHOT` joiner
+/// (`OBS_PREV_SNAPSHOT_SECOND_PREV_OPENER`; ADR-0023 amendment 19).
+#[test]
+fn second_prev_snapshot_opener_vs_lmdb() {
+    fn run<E>(
+        dir: &Path,
+        role: &str,
+        open_prev: impl FnOnce() -> E,
+        commit: impl Fn(&E),
+    ) -> [String; 2] {
+        let result = dir.join("result");
+        let a = open_prev();
+        let _c = spawn(role, dir);
+        let s0 = poll_file(&result, Duration::from_secs(3)).unwrap_or_else(|| "blocked".into());
+        commit(&a);
+        let s1 = if s0 == "blocked" {
+            poll_file(&result, Duration::from_secs(10)).unwrap_or_else(|| "blocked".into())
+        } else {
+            "-".to_string()
+        };
+        [s0, s1]
+    }
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        lmdb_two_generations(dir.path());
+        run(
+            dir.path(),
+            "lmdb_prev_join_report",
+            || {
+                Lmdb::try_open_flags(dir.path(), MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT)
+                    .unwrap()
+            },
+            |a| {
+                lmdb_commit_key(a, b"after");
+            },
+        )
+    };
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        zdb_two_generations(dir.path());
+        run(
+            dir.path(),
+            "zdb_prev_join_report",
+            || zdb_try_open(dir.path(), Some(16 * MIB), zerodb::EnvFlags::PREV_SNAPSHOT).unwrap(),
+            |a| {
+                zdb_commit_key(a, b"after");
+            },
+        )
+    };
+    eprintln!("lmdb = {lmdb:?}, zdb = {zdb:?}");
+    let s = |v: [&str; 2]| v.map(str::to_string);
+    assert_eq!(lmdb, s(["blocked", "EAGAIN"]), "LMDB as observed");
+    assert_eq!(zdb, lmdb, "ZeroDB mirrors LMDB (ADR-0023 amendment 19)");
+}
+
+/// A sole `READ_ONLY | PREV_SNAPSHOT` opener, which can never commit, holds
+/// the election for its whole life: a joiner waits until it closes
+/// (`OBS_PREV_SNAPSHOT_READ_ONLY_OPENER`). After the close the engines
+/// differ as in [`prev_snapshot_opener_closes_before_commit_vs_lmdb`]
+/// (D-025, PROPOSED).
+#[test]
+fn prev_snapshot_read_only_opener_vs_lmdb() {
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        lmdb_two_generations(dir.path());
+        prev_snapshot_opener_ends(dir.path(), false, "-", "lmdb_join_report", || {
+            Lmdb::try_open_flags(
+                dir.path(),
+                MAX_READERS,
+                16 * MIB,
+                MDB_RDONLY | ffi::MDB_PREVSNAPSHOT,
+            )
+            .unwrap()
+        })
+    };
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        zdb_two_generations(dir.path());
+        prev_snapshot_opener_ends(dir.path(), false, "-", "zdb_join_report", || {
+            zdb_try_open(
+                dir.path(),
+                Some(16 * MIB),
+                zerodb::EnvFlags::READ_ONLY | zerodb::EnvFlags::PREV_SNAPSHOT,
+            )
+            .unwrap()
+        })
+    };
+    eprintln!("lmdb = {lmdb:?}, zdb = {zdb:?}");
+    let s = |v: [&str; 2]| v.map(str::to_string);
+    let lmdb_expected = if cfg!(target_os = "macos") {
+        ["blocked", "rc=22"]
+    } else {
+        ["blocked", "ok:prev"]
+    };
+    assert_eq!(lmdb, s(lmdb_expected), "LMDB as observed");
+    assert_eq!(zdb, s(["blocked", "ok:newest"]), "ZeroDB: D-025");
+}
+
+/// The `PREV_SNAPSHOT` opener commits a write txn with no changes while
+/// another process waits to join: the waiter stays blocked until a commit
+/// that writes (`OBS_PREV_SNAPSHOT_EMPTY_COMMIT_KEEPS_LOCK`; ADR-0023
+/// amendment 19).
+#[test]
+fn prev_snapshot_empty_commit_keeps_the_election_vs_lmdb() {
+    fn run<E>(
+        dir: &Path,
+        role: &str,
+        open_prev: impl FnOnce() -> E,
+        empty_commit: impl Fn(&E),
+        commit: impl Fn(&E),
+    ) -> [String; 2] {
+        let result = dir.join("result");
+        let a = open_prev();
+        let _b = spawn(role, dir);
+        empty_commit(&a);
+        let s0 = poll_file(&result, Duration::from_secs(3)).unwrap_or_else(|| "blocked".into());
+        commit(&a);
+        let s1 = if s0 == "blocked" {
+            poll_file(&result, Duration::from_secs(10)).unwrap_or_else(|| "blocked".into())
+        } else {
+            "-".to_string()
+        };
+        [s0, s1]
+    }
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        lmdb_two_generations(dir.path());
+        run(
+            dir.path(),
+            "lmdb_join_report",
+            || {
+                Lmdb::try_open_flags(dir.path(), MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT)
+                    .unwrap()
+            },
+            |a| {
+                let txn = a.try_begin(0).unwrap();
+                // SAFETY: `txn` is a live write txn with no changes,
+                // committed once.
+                assert_eq!(unsafe { ffi::mdb_txn_commit(txn) }, 0);
+            },
+            |a| {
+                lmdb_commit_key(a, b"after");
+            },
+        )
+    };
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        zdb_two_generations(dir.path());
+        run(
+            dir.path(),
+            "zdb_join_report",
+            || zdb_try_open(dir.path(), Some(16 * MIB), zerodb::EnvFlags::PREV_SNAPSHOT).unwrap(),
+            |a| a.write_txn().unwrap().commit().unwrap(),
+            |a| {
+                zdb_commit_key(a, b"after");
+            },
+        )
+    };
+    eprintln!("lmdb = {lmdb:?}, zdb = {zdb:?}");
+    let s = |v: [&str; 2]| v.map(str::to_string);
+    assert_eq!(lmdb, s(["blocked", "ok:prev"]), "LMDB as observed");
+    assert_eq!(zdb, lmdb, "ZeroDB mirrors LMDB (ADR-0023 amendment 19)");
+}
+
+/// Without a lock file a `PREV_SNAPSHOT` env's first commit is current at
+/// once and the second builds on it (`OBS_PREV_SNAPSHOT_NOLOCK_COMMITS`):
+/// `(snapshot after the first commit, after the second, the second keeps
+/// the first's key)`.
+#[test]
+fn prev_snapshot_without_a_lock_file_vs_lmdb() {
+    let lmdb = {
+        let dir = TempDir::new().unwrap();
+        lmdb_two_generations(dir.path());
+        let a = Lmdb::try_open_flags(
+            dir.path(),
+            MAX_READERS,
+            16 * MIB,
+            ffi::MDB_NOLOCK | ffi::MDB_PREVSNAPSHOT,
+        )
+        .unwrap();
+        lmdb_commit_key(&a, b"after");
+        let first = lmdb_read_view(&a).1;
+        lmdb_commit_key(&a, b"after2");
+        let second = lmdb_read_view(&a).1;
+        let txn = a.try_read().unwrap();
+        let keeps_first = lmdb_txn_has_key(txn, b"after");
+        Lmdb::abort(txn);
+        (first, second, keeps_first)
+    };
+    let zdb = {
+        let dir = TempDir::new().unwrap();
+        zdb_two_generations(dir.path());
+        let mut o = zerodb::EnvOpenOptions::new();
+        o.page_size(PSIZE as u32)
+            .max_readers(MAX_READERS)
+            .lock_file(false)
+            .flags(zerodb::EnvFlags::PREV_SNAPSHOT)
+            .map_size(usize::try_from(16 * MIB).unwrap());
+        let a = o.open(dir.path()).unwrap();
+        zdb_commit_key(&a, b"after");
+        let first = zdb_read_view(&a).1;
+        zdb_commit_key(&a, b"after2");
+        let second = zdb_read_view(&a).1;
+        let r = a.read_txn().unwrap();
+        let keeps_first = a.main_database().get(&r, b"after").unwrap().is_some();
+        (first, second, keeps_first)
+    };
+    eprintln!("lmdb = {lmdb:?}, zdb = {zdb:?}");
+    assert_eq!(lmdb, ("a_commit", "a_commit2", true), "LMDB as observed");
+    assert_eq!(zdb, lmdb, "ZeroDB without a lock file (unchanged)");
 }
