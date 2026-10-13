@@ -65,7 +65,7 @@ through `EnvOpenOptions::read_txn_with_tls()` / `read_txn_without_tls()`.
 | `MDB_NOLOCK` | `0x400000` | `EnvFlags::NO_LOCK` | **MUST** | ADR-0023 stage 3 | `heed-zerodb/tests/env_file_naming.rs` (`no_lock_creates_no_lock_file`, `flags_report_no_lock`) | "caller manages their own locks" — the cross-process locking escape hatch. Was WON'T under D-001 (no lock file at all); ADR-0023 amendment 17 makes it MUST: the adapter maps it to the engine's `lock_file(false)`, so no lock file is created (`OBS_NOLOCK_CREATES_LOCK_FILE = false`) and the env runs the single-process path; `Env::flags()` reports it. A read-only env on read-only media also runs without a lock file but does not report `NO_LOCK` (`OBS_RDONLY_READONLY_FS_REPORTS_NOLOCK = false`). No consumer. |
 | `MDB_NORDAHEAD` | `0x800000` | `EnvFlags::NO_READ_AHEAD` | **SHOULD** | landed 2026-09-29 | `zerodb/tests/no_read_ahead.rs` | Turns off OS readahead (`madvise(MADV_RANDOM)`), no effect on Windows. **Honored since 2026-09-29, as LMDB does:** the map (read-only or `WRITE_MAP`) is advised `MADV_RANDOM` at open; the test checks the `rr` VmFlag on Linux. No consumer passes it (hannoy instead issues its own `madvise(WILLNEED)`, SPEC 00 §B.9), but rust-storage-bench's heed backend does, and without it a random-read workload larger than memory thrashes (Phase D: ~10 GB read in 60 s for a 1.5 GB DB under a 2 GB cap). |
 | `MDB_NOMEMINIT` | `0x1000000` | `EnvFlags::NO_MEM_INIT` | **SHOULD** | 2.7 | `env_nomeminit_accepted_noop` | Skip zero-filling `malloc`'d pages before writing them to the datafile (a data-leak/Valgrind trade-off). `clean_limit` in `mdb_page_dirty` keys off `(NOMEMINIT|WRITEMAP)`. No consumer; the header itself notes it "is not needed with `MDB_WRITEMAP`". zerodb controls its own dirty-page allocation, so this can be a documented no-op. |
-| `MDB_PREVSNAPSHOT` | `0x2000000` | `EnvFlags::PREV_SNAPSHOT` | **MUST** | 1.2, 1.10 | `env_prevsnapshot_opens_older_meta` | SPEC 00 row 9 (milli `Index::rollback`). Opens the env on the **older** of the two meta pages. `mdb_env_pick_meta` XORs the newer-meta selection with this flag: `metas[(m0.txnid < m1.txnid) ^ (flags & PREVSNAPSHOT)]`. Open protocol subtleties in §S5 (requires exclusive access; auto-cleared on first commit). |
+| `MDB_PREVSNAPSHOT` | `0x2000000` | `EnvFlags::PREV_SNAPSHOT` | **MUST** | 1.2, 1.10 | `env_prevsnapshot_opens_older_meta` | SPEC 00 row 9 (milli `Index::rollback`). Opens the env on the **older** of the two meta pages. `mdb_env_pick_meta` XORs the newer-meta selection with this flag: `metas[(m0.txnid < m1.txnid) ^ (flags & PREVSNAPSHOT)]`. Open protocol subtleties in §S5 (requires exclusive access; auto-cleared on first commit; with a lock file, holds it until the first commit, which is not published). |
 
 † **SHOULD but Phase-1-scheduled:** milestone M1.10 explicitly implements
 `NO_SYNC`/`NO_META_SYNC`/`MAP_ASYNC` durability parity even though no consumer
@@ -297,10 +297,32 @@ Two caveats on scope:
   the older meta, commit once to make it the live root, then behave normally.
   zerodb's rollback path must replicate the "one committed txn rewrites history,
   then normal" behavior, not leave the env permanently pinned to the old meta.
-  With a lock file, zerodb lets other processes join at the end of the
-  `PREV_SNAPSHOT` open, not after its first commit; a process that joins in
-  between sees the older snapshot, which is what the opener published. LMDB
-  differs in that window (observed; SPEC 04 §12.1).
+  With a lock file the fork does more, and zerodb mirrors it (ADR-0023
+  amendment 19; SPEC 04 TXN-66/67, observed on macOS and Linux aarch64):
+  - The opener keeps the lock file's exclusive lock past its open, so
+    another process's open waits until the opener's first commit
+    (`OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT`). A commit with no changes
+    writes nothing and keeps the lock
+    (`OBS_PREV_SNAPSHOT_EMPTY_COMMIT_KEEPS_LOCK`).
+  - "Re-shares locks" re-derives the shared txnid from the meta picked while
+    the flag is still set: the older meta. So after the first commit every
+    new read txn, in the opener or in a process that joins, still reads the
+    older snapshot; `mdb_env_info`/`mdb_env_stat` name the first commit,
+    the newest meta on disk. The second write txn is again `older + 1`,
+    built on the older meta, and overwrites the first commit's meta slot:
+    the first commit's data is lost (`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`,
+    `OBS_PREV_SNAPSHOT_SECOND_COMMIT_KEEPS_FIRST = false`). A fresh open
+    after every process has closed serves the first commit
+    (`OBS_PREV_SNAPSHOT_ONE_COMMIT_THEN_REOPEN = "a_commit"`), which is
+    milli's case: it commits once and closes.
+  - With `NO_LOCK` neither happens: the first commit is current at once and
+    the second builds on it (`OBS_PREV_SNAPSHOT_NOLOCK_COMMITS`).
+  - Not mirrored, docs/DIVERGENCES.md D-025 (PROPOSED): when the opener
+    closes or dies before its first commit, a waiting zerodb process becomes
+    the first opener and serves the newest meta, while the fork's waiter
+    reads the older meta (or, on macOS after a close, fails with `EINVAL`);
+    and a joiner's `Env::info`/`Env::stat` between the first and the second
+    commit report the older snapshot, not the newest meta on disk.
 
 ### §S6 — durability lattice: `NO_SYNC` / `NO_META_SYNC` / `MAP_ASYNC` (× `WRITE_MAP`)
 

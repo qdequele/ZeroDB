@@ -58,6 +58,16 @@ retires divergence D-001 (single-process only).
 - A `PREV_SNAPSHOT` open fails with `EAGAIN` while another process has the
   env open, as LMDB; the geometry of such an open comes from the older meta
   it selects.
+- **A `PREV_SNAPSHOT` open with a lock file behaves as LMDB's** (ADR-0023
+  amendment 19): other processes' opens wait until its first commit, and
+  that commit is durable but not published. Read txns, in this process and
+  in processes that join, keep the older snapshot; the second write txn
+  reuses the first commit's txnid, starts from the older snapshot and drops
+  the first commit's changes. A fresh open after the env is closed serves
+  the first commit, so milli's rollback (one commit, then close) is
+  unchanged. Without a lock file the first commit is published at once, as
+  before. Two cases differ from LMDB (D-025, proposed): an opener that ends
+  before its first commit, and a joiner's `Env::info` after that commit.
 - **`zerodb-tools` attach to live environments**: `stat`, `dump` and `check`
   open the env read-only through its lock file and read one pinned snapshot
   while other processes keep writing, as `mdb_stat` and `mdb_dump` do.
