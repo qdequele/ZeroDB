@@ -413,6 +413,27 @@ only a full fence / `SeqCst` does.
   In a lock-file environment the release is three `Release` stores instead:
   `txnid = RDR_CLAIMED`, then the owner PID cleared in the owner word, then
   `txnid = RDR_FREE` (ADR-0023 amendment 7).
+- **TXN-73 (reader count in a lock-file env)** — `EnvInfo::num_readers` is
+  LMDB's `mti_numreaders`: the high-water mark of reader slots used by any
+  process since the lock file was initialized, never decreasing
+  (`OBS_NUMREADERS_OTHER_PROCESS`). The lock file holds no counter for it.
+  It is derived from the slots: one past the highest slot whose txnid is not
+  `RDR_FREE` or whose owner generation is not 0, or this process's own
+  high-water mark if that is larger. Each txnid is loaded with `Acquire`
+  before the owner word, so a `RDR_FREE` written by a release (TXN-18a)
+  shows the generation stored before it. The derivation relies on three
+  invariants, which any change to claiming or slot initialization must keep:
+  1. claiming is first-fit (TXN-15, no scan hint or slot affinity), so the
+     slots ever claimed are a prefix of the table;
+  2. a claimed slot's generation is never 0, because every claim and every
+     reaper adoption increments it and a release keeps it (ADR-0023
+     amendment 14). The exception is the wrap after 2^32 claims of one
+     slot: if the highest used slot has just wrapped and is free, the count
+     is one short until it is claimed again;
+  3. the initializer wipes every slot to `RDR_FREE` with owner word 0, which
+     is LMDB's reset of `mti_numreaders` to 0.
+
+  Without a lock file the count is this process's own high-water mark.
 
 ### §4.5 — Oldest-reader computation (writer side) and its correctness
 
@@ -1307,11 +1328,11 @@ every hook; this section defines the steps and their ordering. Both write modes
 | env clone/close/registry | TXN-50..55 | SPEC 00 rows 23–26 |
 | commit pipeline | TXN-61..64 | SPEC 06 REC-1..12 |
 | PREV_SNAPSHOT | TXN-65..67 | SPEC 01 §S5, SPEC 02 §3.2, SPEC 06 REC-5 |
-| lock file (multi-process) | LCK-1..11 (§12); TXN-6/7, TXN-17..19, TXN-51/53, TXN-56, TXN-66 as amended | ADR-0023; SPEC 02 §8; SPEC 06 REC-1a; loom models in `zerodb-core/src/readers.rs`; `zerodb/tests/multi_process*.rs`; `zerodb-oracle/tests/multi_process_differential.rs`, `lmdb_reaping_observation.rs`, `lmdb_stage3_observation.rs` |
+| lock file (multi-process) | LCK-1..11 (§12); TXN-73 (§4.4); TXN-6/7, TXN-17..19, TXN-51/53, TXN-56, TXN-66 as amended | ADR-0023; SPEC 02 §8; SPEC 06 REC-1a; loom models in `zerodb-core/src/readers.rs`; `zerodb/tests/multi_process*.rs`; `zerodb-oracle/tests/multi_process_differential.rs`, `lmdb_reaping_observation.rs`, `lmdb_stage3_observation.rs` |
 
 **Rule count: TXN-1 … TXN-67 (67 normative rules; §4.4 adds sub-rule TXN-18a for
-slot release), plus the later TXN-68 … TXN-72 (§6.3a) and LCK-1 … LCK-11
-(§12, added 2026-10-13).** TXN-40 (nested write unsupported, D-003) is referenced from
+slot release), plus the later TXN-68 … TXN-72 (§6.3a), TXN-73 (§4.4, added
+2026-10-13) and LCK-1 … LCK-11 (§12, added 2026-10-13).** TXN-40 (nested write unsupported, D-003) is referenced from
 §5/§8 and defined here:
 
 - **TXN-40** — A nested **write** txn is **unsupported** (D-003) and, as

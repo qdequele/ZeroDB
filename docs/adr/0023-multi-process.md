@@ -353,6 +353,15 @@ atomic states its `Ordering` and why, assuming a weak memory model.
     which the generation makes the CAS detect. Probing first and loading
     later would let a new process with a reused PID be judged by a stale
     verdict.
+    *Note (2026-10-13, stage 3 Task 12b):* `Env::info().num_readers` in a
+    lock-file env now relies on this word too. It is LMDB's shared
+    `mti_numreaders` high-water mark (`OBS_NUMREADERS_OTHER_PROCESS`), derived
+    without a lock-file counter as one past the highest slot whose txnid is
+    not FREE or whose generation is non-zero (SPEC 04 TXN-73). A later change
+    that adds a claim scan hint or slot affinity, so that claims stop being
+    first-fit, that lets a claimed slot keep generation 0, or that stops the
+    initializer from wiping the slots must keep that count correct or
+    replace the derivation.
 
 ## Amendments (stage-3 planning, 2026-10-12)
 
@@ -875,8 +884,9 @@ Terms used below:
        retention.
     3. **`resize` takes the cross-process writer lock** with a lock file, so
        no commit lands while it rounds up. *Alternative:* LMDB's lock-free
-       `set_mapsize`, which relies on the write-begin check and gives up
-       invariant 2 for cached read snapshots.
+       `set_mapsize`, which returns while another process holds a write txn
+       (observed: `OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER`), relies on the
+       write-begin check, and gives up invariant 2 for cached read snapshots.
     4. **The data file grows only under both writer locks**, in `resize`
        and at a `WRITE_MAP` write-txn begin. A `WRITE_MAP` joiner never
        grows it at open. *Alternative:* refuse `WRITE_MAP` growth while

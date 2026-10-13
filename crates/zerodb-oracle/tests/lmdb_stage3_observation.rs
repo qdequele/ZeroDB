@@ -231,9 +231,12 @@ impl Lmdb {
     fn reader_list_len(&self) -> usize {
         unsafe extern "C" fn collect(msg: *const c_char, ctx: *mut c_void) -> c_int {
             // SAFETY: `ctx` is the `&mut Vec<String>` passed below, live for
-            // the call; `msg` is a NUL-terminated string from LMDB.
+            // the call, and no other reference to it exists meanwhile.
             let out = unsafe { &mut *(ctx as *mut Vec<String>) };
             out.push(
+                // SAFETY: LMDB passes a valid NUL-terminated string that
+                // lives for the duration of this callback; it is copied out
+                // before the callback returns.
                 unsafe { CStr::from_ptr(msg) }
                     .to_string_lossy()
                     .into_owned(),
