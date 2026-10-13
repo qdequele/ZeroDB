@@ -1737,18 +1737,18 @@ impl Env {
     /// `mdb_reader_check` exists to scan those slots and free the ones whose
     /// `mr_pid` no longer names a live process.
     ///
-    /// By default ZeroDB is **single-process** (see docs/DIVERGENCES.md): the
-    /// reader table is plain process memory, every slot is owned by a
-    /// `RoTxn` in *this* address space, and a `RoTxn` releases its slot in
-    /// `Drop` — including while unwinding from a panic. The only way to leak
-    /// a slot is to `mem::forget` a live `RoTxn`, which is exactly as
-    /// unrecoverable as leaking any other resource and is not what
-    /// `mdb_reader_check` is for. If this process dies, the table dies with
-    /// it, so this path always returns `0`, which is the correct answer, not
-    /// a stub.
+    /// Without a lock file ZeroDB is **single-process** (see
+    /// docs/DIVERGENCES.md): the reader table is plain process memory, every
+    /// slot is owned by a `RoTxn` in *this* address space, and a `RoTxn`
+    /// releases its slot in `Drop` — including while unwinding from a panic.
+    /// The only way to leak a slot is to `mem::forget` a live `RoTxn`, which is
+    /// exactly as unrecoverable as leaking any other resource and is not what
+    /// `mdb_reader_check` is for. If this process dies, the table dies with it,
+    /// so this path always returns `0`, which is the correct answer, not a
+    /// stub.
     ///
-    /// With the public `lock_file` option on (the `zerodb`/`heed-zerodb`
-    /// `EnvOpenOptions::lock_file`, ADR-0023), the reader table is shared
+    /// With the lock file on (the default; `zerodb::EnvOpenOptions::lock_file`,
+    /// heed's `NO_LOCK` off, ADR-0023), the reader table is shared
     /// across processes, and a process that dies inside a read txn leaves its
     /// slot pinned. This method then probes the owner of every occupied slot
     /// and frees the slots of processes that no longer have the environment

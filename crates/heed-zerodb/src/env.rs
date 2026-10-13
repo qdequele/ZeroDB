@@ -32,21 +32,14 @@ use crate::{Database, DatabaseOpenOptions, Error, Result, Unspecified};
 /// compaction (`process_batch.rs`, `routes/tasks/compact.rs`, `meilitool`) and
 /// snapshot code (`process_snapshot_creation.rs`, `enterprise_edition/s3.rs`).
 /// An adapter env dir therefore contains **exactly** this one file — no
-/// `zerodb.dat`. In this release no `lock.mdb` is created next to it: the
-/// adapter's lock file stays off until ADR-0023's default flip, after which
-/// a `lock.mdb` sits next to it, as with LMDB, unless the env is opened with
-/// heed's `NO_LOCK` (ADR-0023 amendment 17) or read-only on read-only media.
+/// `zerodb.dat`. A `lock.mdb` sits next to it, as with LMDB (ADR-0023),
+/// unless the env is opened with heed's `NO_LOCK` (ADR-0023 amendment 17) or
+/// read-only on read-only media.
 ///
 /// The bytes inside are still ZeroDB's own `ZDB1` format: pointing
 /// `mdb_stat`/`mdb_dump` at one fails loudly with `MDB_INVALID` rather than
 /// misreading it. Use `zerodb-tools stat`, which reports the real engine.
 pub const DATA_FILE_NAME: &str = zerodb::HEED_DATA_FILE_NAME;
-
-/// Whether an env opened through the adapter has a lock file when heed's
-/// `NO_LOCK` is not set (ADR-0023). `false` until ADR-0023's default flip,
-/// which flips it, gated on the stage-3 three-column bench (amendment 17,
-/// decision 12). `NO_LOCK` turns the lock file off either way.
-const LOCK_FILE_BY_DEFAULT: bool = false;
 
 /// The OS page size (`sysconf(_SC_PAGESIZE)`), for the `map_size` boundary check.
 fn os_page_size() -> usize {
@@ -84,9 +77,6 @@ pub struct EnvOpenOptions<T: TlsUsage = WithTls> {
     sequential_writes: bool,
     /// ADR-0017 ZeroDB extension — no heed counterpart.
     max_dirty_bytes: Option<usize>,
-    /// ADR-0023 ZeroDB extension — no heed counterpart. Defaults to
-    /// [`LOCK_FILE_BY_DEFAULT`].
-    lock_file: bool,
     _tls: std::marker::PhantomData<T>,
 }
 
@@ -109,7 +99,6 @@ impl EnvOpenOptions<WithTls> {
             file_trust: zerodb::FileTrust::VALIDATE,
             sequential_writes: false,
             max_dirty_bytes: None,
-            lock_file: LOCK_FILE_BY_DEFAULT,
             _tls: std::marker::PhantomData,
         }
     }
@@ -126,7 +115,6 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
             file_trust: self.file_trust,
             sequential_writes: self.sequential_writes,
             max_dirty_bytes: self.max_dirty_bytes,
-            lock_file: self.lock_file,
             _tls: std::marker::PhantomData,
         }
     }
@@ -214,19 +202,6 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// LMDB does; results and committed files never depend on it.
     pub fn max_dirty_bytes(&mut self, bytes: usize) -> &mut Self {
         self.max_dirty_bytes = Some(bytes);
-        self
-    }
-
-    /// Let other processes open this environment at the same time
-    /// (ADR-0023), with LMDB's lock-file name `lock.mdb`. heed's `NO_LOCK`
-    /// overrides it.
-    ///
-    /// **ZeroDB extension.** The lock file is off by default in this release.
-    /// ADR-0023's default flip turns it on by default and removes this
-    /// setter (amendment 17), leaving `NO_LOCK` as the only switch, as in
-    /// heed.
-    pub fn lock_file(&mut self, on: bool) -> &mut Self {
-        self.lock_file = on;
         self
     }
 
@@ -323,10 +298,10 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         if let Some(b) = self.max_dirty_bytes {
             opts.max_dirty_bytes(b);
         }
-        // ADR-0023 amendment 17: heed's `NO_LOCK` always turns the lock file
-        // off (`OBS_NOLOCK_CREATES_LOCK_FILE = false`); otherwise the
-        // `lock_file` setting applies, `LOCK_FILE_BY_DEFAULT` unless set.
-        opts.lock_file(self.lock_file && !self.flags.contains(EnvFlags::NO_LOCK));
+        // ADR-0023 amendment 17: the lock file (`lock.mdb`) is on, as in
+        // LMDB; heed's `NO_LOCK` turns it off
+        // (`OBS_NOLOCK_CREATES_LOCK_FILE = false`).
+        opts.lock_file(!self.flags.contains(EnvFlags::NO_LOCK));
         let env = opts.open(path).map_err(Error::from)?;
         Ok(Env {
             inner: env,

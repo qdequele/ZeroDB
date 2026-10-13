@@ -77,10 +77,10 @@ pub const DATA_FILE_NAME: &str = "zerodb.dat";
 ///
 /// Exposed here so the adapter, `zerodb-tools`' two-name probe, and tests all
 /// agree on one constant. A `lock.mdb` next to it (the name
-/// [`derived_lock_file_name`] gives it) appears only when
-/// [`EnvOpenOptions::lock_file`] is turned on (ADR-0023); it is off by
-/// default, so a default adapter-opened env dir still contains only this one
-/// file.
+/// [`derived_lock_file_name`] gives it) appears when
+/// [`EnvOpenOptions::lock_file`] is on (ADR-0023), which is the default, so a
+/// default adapter-opened env dir contains `data.mdb` and `lock.mdb`, as an
+/// LMDB env dir does. heed's `NO_LOCK` turns it off.
 pub const HEED_DATA_FILE_NAME: &str = "data.mdb";
 
 /// The lock-file name of a multi-process environment whose data file has the
@@ -252,7 +252,9 @@ impl EnvOpenOptions {
             file_trust: FileTrust::VALIDATE,
             sequential_writes: false,
             max_dirty_bytes: None,
-            lock_file: false,
+            // ADR-0023: the lock file is on by default, as in LMDB;
+            // `lock_file(false)` (heed's `NO_LOCK`) opts out.
+            lock_file: true,
             lock_file_name: None,
         }
     }
@@ -435,9 +437,10 @@ impl EnvOpenOptions {
     }
 
     /// Let other processes open this environment at the same time, through a
-    /// shared lock file next to the data file (ADR-0023). Off by default in
-    /// this release. The heed adapter maps heed's `NO_LOCK` to `false`
-    /// (ADR-0023 amendment 17).
+    /// shared lock file next to the data file (ADR-0023). On by default, as in
+    /// LMDB; `false` makes the environment single-process and creates no lock
+    /// file. The heed adapter maps heed's `NO_LOCK` to `false` (ADR-0023
+    /// amendment 17).
     pub fn lock_file(&mut self, on: bool) -> &mut EnvOpenOptions {
         self.lock_file = on;
         self
@@ -531,10 +534,10 @@ impl EnvOpenOptions {
     /// exist (LMDB parity). If the data file is absent or empty, a fresh empty
     /// env is created there (SPEC 02 §3.4).
     ///
-    /// Unlike heed, this is a safe function: no `EnvFlags` value reachable here
-    /// enables cross-process behavior; cross-process access is instead opt-in
-    /// through [`EnvOpenOptions::lock_file`] (ADR-0023). Without it, ZeroDB is
-    /// single-process (see docs/DIVERGENCES.md).
+    /// Unlike heed, this is a safe function: cross-process access is always
+    /// coordinated through the lock file, which is on by default (ADR-0023).
+    /// With [`EnvOpenOptions::lock_file`] off, ZeroDB is single-process (see
+    /// docs/DIVERGENCES.md).
     ///
     /// # Errors
     ///

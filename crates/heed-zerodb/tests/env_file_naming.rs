@@ -101,15 +101,18 @@ fn dir_listing(dir: &std::path::Path) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// A fresh env dir created through the adapter contains **exactly**
-/// `["data.mdb"]`: no `zerodb.dat`, and no `lock.mdb` (nothing in the consumer
-/// tree reads one — ZeroDB stays single-process).
+/// `["data.mdb", "lock.mdb"]`, as an LMDB env dir does: no `zerodb.dat`, and
+/// the lock file is on by default (ADR-0023).
 #[test]
-fn adapter_env_dir_contains_exactly_data_mdb() {
+fn adapter_env_dir_contains_exactly_data_mdb_and_lock_mdb() {
     let dir = tempfile::tempdir().unwrap();
     let env = unsafe { opts().open(dir.path()).unwrap() };
     populate(&env, 32);
 
-    assert_eq!(dir_listing(dir.path()), vec!["data.mdb".to_string()]);
+    assert_eq!(
+        dir_listing(dir.path()),
+        vec!["data.mdb".to_string(), "lock.mdb".to_string()]
+    );
     assert_eq!(heed_zerodb::DATA_FILE_NAME, "data.mdb");
     // `Env::path()` returns the *directory*, not the data file — heed
     // parity. (Compared canonicalized: the engine
@@ -151,7 +154,8 @@ fn snapshot_round_trip(option: CompactionOption) {
     env.copy_to_path(dst_dir.path().join("data.mdb"), option)
         .unwrap();
 
-    // The snapshot dir looks like an LMDB env dir.
+    // The snapshot dir looks like an LMDB env dir after `mdb_env_copy`: the
+    // data file only; the lock file appears when the env is opened.
     assert_eq!(dir_listing(dst_dir.path()), vec!["data.mdb".to_string()]);
 
     // Restore: extract, open the directory — must yield the snapshot's
@@ -224,7 +228,10 @@ fn compaction_persist_round_trip(option: CompactionOption, delete_first: bool) {
     // Step 5 — reopen the same directory and verify.
     let reopened = unsafe { opts().open(dir.path()).unwrap() };
     assert_eq!(contents(&reopened), expected);
-    assert_eq!(dir_listing(dir.path()), vec!["data.mdb".to_string()]);
+    assert_eq!(
+        dir_listing(dir.path()),
+        vec!["data.mdb".to_string(), "lock.mdb".to_string()]
+    );
 
     if delete_first && matches!(option, CompactionOption::Enabled) {
         let size_after = fs::metadata(&src_path).unwrap().len();
@@ -283,15 +290,14 @@ fn streamed_inner_file_bytes_reopen_as_env() {
 // NO_LOCK (ADR-0023 amendment 17)
 // ---------------------------------------------------------------------------
 
-/// heed's `NO_LOCK` maps to the engine's `lock_file(false)` and wins over the
-/// adapter's lock-file setting: with the lock file turned on, `NO_LOCK` still
-/// leaves no `lock.mdb` in the env dir (`OBS_NOLOCK_CREATES_LOCK_FILE =
-/// false`), while the same options without `NO_LOCK` create one.
+/// heed's `NO_LOCK` maps to the engine's `lock_file(false)` and turns off the
+/// lock file the adapter has by default: `NO_LOCK` leaves no `lock.mdb` in
+/// the env dir (`OBS_NOLOCK_CREATES_LOCK_FILE = false`), while the same
+/// options without `NO_LOCK` create one.
 #[test]
 fn no_lock_creates_no_lock_file() {
     let dir = tempfile::tempdir().unwrap();
     let mut o = opts();
-    o.lock_file(true);
     // SAFETY: heed signature parity only; setting flags performs no unsafe
     // operation in the adapter.
     unsafe { o.flags(heed_zerodb::EnvFlags::NO_LOCK) };
@@ -301,8 +307,7 @@ fn no_lock_creates_no_lock_file() {
     drop(env);
 
     let locked = tempfile::tempdir().unwrap();
-    let mut o = opts();
-    o.lock_file(true);
+    let o = opts();
     let env = unsafe { o.open(locked.path()).unwrap() };
     populate(&env, 8);
     assert_eq!(
@@ -312,7 +317,7 @@ fn no_lock_creates_no_lock_file() {
 }
 
 /// `Env::flags()` reports `NO_LOCK` for an env opened with it, and not for
-/// one opened without it (with or without a lock file), as
+/// one opened without it (which has the default lock file), as
 /// `mdb_env_get_flags` does.
 #[test]
 fn flags_report_no_lock() {
@@ -328,13 +333,10 @@ fn flags_report_no_lock() {
     assert_ne!(env.get_flags().unwrap() & EnvFlags::NO_LOCK.bits(), 0);
     drop(env);
 
-    for lock_file in [false, true] {
-        let other = tempfile::tempdir().unwrap();
-        let mut o = opts();
-        o.lock_file(lock_file);
-        let env = unsafe { o.open(other.path()).unwrap() };
-        let flags = env.flags().unwrap().unwrap();
-        assert!(!flags.contains(EnvFlags::NO_LOCK), "{lock_file}: {flags:?}");
-        assert_eq!(env.get_flags().unwrap() & EnvFlags::NO_LOCK.bits(), 0);
-    }
+    let other = tempfile::tempdir().unwrap();
+    let env = unsafe { opts().open(other.path()).unwrap() };
+    assert!(other.path().join("lock.mdb").exists());
+    let flags = env.flags().unwrap().unwrap();
+    assert!(!flags.contains(EnvFlags::NO_LOCK), "{flags:?}");
+    assert_eq!(env.get_flags().unwrap() & EnvFlags::NO_LOCK.bits(), 0);
 }

@@ -123,15 +123,14 @@ fn wait_stop(ctl: &Path) {
     wait_for(&ctl.join("stop"), Duration::from_secs(120));
 }
 
-/// Open the environment through the heed adapter (`data.mdb`, `lock.mdb`), as
+/// Open the environment through the heed adapter with its defaults
+/// (`data.mdb`, and the `lock.mdb` the adapter creates by default), as
 /// Meilisearch does; commit `live`; then hold a read txn and a write txn
 /// whose `pending` is never committed.
 fn hold_adapter(dir: &Path, ctl: &Path) {
     use heed_zerodb::types::Bytes;
     let mut opts = heed_zerodb::EnvOpenOptions::new();
-    opts.map_size(16 << 20)
-        .max_readers(CHILD_MAX_READERS)
-        .lock_file(true);
+    opts.map_size(16 << 20).max_readers(CHILD_MAX_READERS);
     // SAFETY: heed signature parity only; the adapter's open performs no
     // unsafe operation.
     let env = unsafe { opts.open(dir) }.expect("open adapter env");

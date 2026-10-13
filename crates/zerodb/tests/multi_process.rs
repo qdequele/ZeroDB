@@ -1085,7 +1085,14 @@ fn read_only_open_in_an_unwritable_dir_fails_and_creates_nothing() {
         return;
     }
     let dir = TempDir::new();
-    drop(EnvOpenOptions::new().open(dir.path()).unwrap());
+    // The environment is created without a lock file (`lock_file(false)`;
+    // the default would create one).
+    drop(
+        EnvOpenOptions::new()
+            .lock_file(false)
+            .open(dir.path())
+            .unwrap(),
+    );
     std::fs::set_permissions(dir.path(), PermissionsExt::from_mode(0o555)).unwrap();
     let mut o = lock_opts();
     o.flags(zerodb::EnvFlags::READ_ONLY);
@@ -1193,7 +1200,12 @@ fn read_only_fs(src: &Path) -> Result<ReadOnlyFs, String> {
 fn read_only_env_on_read_only_media_opens_without_a_lock_file() {
     let src = TempDir::new();
     {
-        let env = EnvOpenOptions::new().open(src.path()).unwrap();
+        // Created without a lock file (`lock_file(false)`; the default would
+        // create one), so the read-only copy has none.
+        let env = EnvOpenOptions::new()
+            .lock_file(false)
+            .open(src.path())
+            .unwrap();
         let mut w = env.write_txn().unwrap();
         env.main_database().put(&mut w, b"k", b"v").unwrap();
         w.commit().unwrap();

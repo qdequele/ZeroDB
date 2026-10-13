@@ -268,8 +268,9 @@ fn garbage_data_mdb_error_kind_parity_through_the_adapter() {
 }
 
 /// The positive half: an env *created* through the adapter is reopenable by the
-/// adapter, and its directory carries exactly the file layout LMDB consumers
-/// expect minus the lock file — `data.mdb` and nothing else. LMDB, handed the
+/// adapter, and its directory carries exactly the file layout an LMDB env
+/// directory has — `data.mdb` and `lock.mdb` (the lock file is on by default,
+/// ADR-0023), as a real LMDB env created the same way shows. LMDB, handed the
 /// same directory, rejects it loudly on the magic (`ZDB1` ≠ LMDB) rather than
 /// misreading it: the file name is shared, the format is not.
 #[test]
@@ -295,7 +296,33 @@ fn adapter_env_dir_is_loudly_rejected_by_real_lmdb() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     names.sort();
-    assert_eq!(names, vec!["data.mdb".to_string()], "no lock.mdb (D-001)");
+    assert_eq!(
+        names,
+        vec!["data.mdb".to_string(), "lock.mdb".to_string()],
+        "zerodb adapter env dir"
+    );
+
+    // The same layout real LMDB creates by default.
+    let lmdb_dir = TempDir::new().unwrap();
+    {
+        let mut opts = heed::EnvOpenOptions::new().read_txn_without_tls();
+        opts.map_size(1 << 20);
+        opts.max_dbs(4);
+        // SAFETY: no cross-process flags; private temp dir, single-threaded.
+        let env = unsafe { opts.open(lmdb_dir.path()).unwrap() };
+        let mut wtxn = env.write_txn().unwrap();
+        let db: heed::Database<heed::types::Bytes, heed::types::Bytes> =
+            env.create_database(&mut wtxn, None).unwrap();
+        db.put(&mut wtxn, b"k", b"v").unwrap();
+        wtxn.commit().unwrap();
+        env.prepare_for_closing().wait();
+    }
+    let mut lmdb_names: Vec<String> = std::fs::read_dir(lmdb_dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    lmdb_names.sort();
+    assert_eq!(lmdb_names, names, "LMDB env dir vs zerodb adapter env dir");
 
     // Real LMDB must reject it — loudly, not by misreading ZDB1 bytes.
     let mut opts = heed::EnvOpenOptions::new().read_txn_without_tls();

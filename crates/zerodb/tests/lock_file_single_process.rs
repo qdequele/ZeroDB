@@ -1,8 +1,9 @@
-//! Single-process coverage for the opt-in lock-file environment (ADR-0023).
+//! Single-process coverage for the lock-file environment (ADR-0023), on by
+//! default.
 //!
-//! These tests run entirely within one process: they check that turning
-//! `lock_file(true)` on changes nothing observable about reads/writes, that
-//! the file only appears when asked for, and that the existing
+//! These tests run entirely within one process: they check that the lock
+//! file changes nothing observable about reads/writes, that it appears by
+//! default and not with `lock_file(false)`, and that the existing
 //! `EnvAlreadyOpened` / reopen-after-close behavior is unaffected. True
 //! multi-process coordination is covered elsewhere (Task 7+); this file is
 //! the "did wiring it up break the default path" smoke test.
@@ -62,13 +63,100 @@ fn lock_file_env_reads_and_writes_like_the_default() {
     assert_eq!(db.get(&r, b"k").unwrap(), Some(&b"v"[..]));
 }
 
+/// The lock file is on by default (ADR-0023), as in LMDB.
 #[test]
-fn default_env_creates_no_lock_file() {
+fn default_env_creates_the_lock_file() {
     let dir = TempDir::new();
     let mut o = EnvOpenOptions::new();
     o.map_size(16 << 20);
-    let _env = o.open(dir.path()).expect("open");
+    assert!(o.get_lock_file());
+    let env = o.open(dir.path()).expect("open");
+    assert!(dir.path().join(LOCK_FILE_NAME).exists());
+    assert!(env.has_lock_file());
+}
+
+/// `lock_file(false)` (heed's `NO_LOCK`) opts out: no lock file is created.
+#[test]
+fn lock_file_false_creates_no_lock_file() {
+    let dir = TempDir::new();
+    let mut o = EnvOpenOptions::new();
+    o.map_size(16 << 20).lock_file(false);
+    let env = o.open(dir.path()).expect("open");
     assert!(!dir.path().join(LOCK_FILE_NAME).exists());
+    assert!(!env.has_lock_file());
+    let mut w = env.write_txn().unwrap();
+    env.main_database().put(&mut w, b"k", b"v").unwrap();
+    w.commit().unwrap();
+    assert!(!dir.path().join(LOCK_FILE_NAME).exists());
+}
+
+/// The number of file descriptors this process has open: the entries of
+/// `/proc/self/fd` (Linux) or `/dev/fd` (macOS and other Unixes). The
+/// directory handle the listing itself holds is counted every time, so
+/// differences between two counts are exact.
+fn open_fd_count() -> usize {
+    let dir = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    std::fs::read_dir(dir).expect("list open fds").count()
+}
+
+/// Set in the child process that runs the body of
+/// `thousand_sequential_envs_leak_no_descriptors` alone.
+const FD_LEAK_CHILD: &str = "ZERODB_FD_LEAK_CHILD";
+
+/// Opening and dropping 1,000 default (lock-file) environments, each in a
+/// fresh directory, leaks no file descriptor: the data file, the lock file
+/// and anything else an open holds are all closed on drop.
+///
+/// The body runs in a child process (this test binary, filtered to this
+/// test), so the other tests of this binary, running on parallel threads,
+/// cannot open or close descriptors between the two counts.
+#[test]
+fn thousand_sequential_envs_leak_no_descriptors() {
+    if std::env::var_os(FD_LEAK_CHILD).is_none() {
+        let exe = std::env::current_exe().expect("current test binary");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--exact",
+                "thousand_sequential_envs_leak_no_descriptors",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(FD_LEAK_CHILD, "1")
+            .output()
+            .expect("spawn the fd-leak child");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "fd-leak child failed: {}\nstdout:\n{stdout}\nstderr:\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // The filter matched this test and it ran in the child.
+        assert!(stdout.contains("1 passed"), "child stdout:\n{stdout}");
+        return;
+    }
+
+    let root = TempDir::new();
+    let before = open_fd_count();
+    for i in 0..1000 {
+        let dir = root.path().join(format!("env-{i}"));
+        std::fs::create_dir(&dir).unwrap();
+        let mut o = EnvOpenOptions::new();
+        o.map_size(1 << 20);
+        let env = o.open(&dir).expect("open");
+        assert!(env.has_lock_file());
+        drop(env);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    let after = open_fd_count();
+    assert!(
+        after <= before + 8,
+        "open file descriptors grew from {before} to {after} over 1,000 envs"
+    );
 }
 
 #[test]
