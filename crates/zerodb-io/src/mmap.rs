@@ -43,21 +43,29 @@ impl Mmap {
     pub fn map(file: &File, len: usize) -> std::io::Result<Mmap> {
         // SAFETY: memmap2's `map` is `unsafe` because a memory map aliases the
         // file's contents and the borrow checker cannot see writers through
-        // the fd. Our invariants (SPEC 02 §8, SPEC 04 §9, single-process):
+        // the fd. Our invariants (SPEC 02 §8, SPEC 04 §9 and §12):
         //  * `file` is a live, open regular file for the whole lifetime of the
         //    returned `Mmap` (the caller keeps the `File` alive alongside it —
         //    see `MmapBacking`);
         //  * accesses are confined to pages referenced by some committed
         //    snapshot, all of which lie within the real file length (REC-14),
         //    so no dereference faults past EOF even though `len` may exceed it;
-        //  * the env is single-process: no *other* process writes or
-        //    truncates the file. Our *own* commit path writes through the fd
+        //  * every process that writes the file is a ZeroDB writer obeying
+        //    the same rules: one writer at a time across processes (the
+        //    cross-process writer lock, ADR-0023 §2), writing only the pages
+        //    and meta slots described next, and no process ever truncates or
+        //    shrinks the file. Without a lock file the caller keeps other
+        //    processes out (`NO_LOCK`, as LMDB). A writer's commit path writes
+        //    through the fd
         //    (`MmapBacking::write_at_page`), which mutates the mapped memory —
         //    but only at pages **no live snapshot references** (TXN-62: fresh
         //    pages beyond the committed high-water) and at the meta slots
         //    0/1, which are never handed out as borrows (readers clone the
-        //    published snapshot *object*, TXN-18, and never read a meta page
-        //    after open). A write txn that spills (SPEC 04 §6.3a) writes
+        //    published snapshot *object*, TXN-18; after open a meta is read
+        //    only as a `pread` copy, ADR-0023 amendment 4 — at open a joining
+        //    process validates both slots from the map once, and a CRC
+        //    rejects a slot torn by a concurrent rewrite). A write txn that
+        //    spills (SPEC 04 §6.3a) writes
         //    the same TXN-62 pages earlier and may read them back through
         //    the map; it rewrites one only at the start of a later `&mut`
         //    call of that txn, when no borrow into it is live (TXN-39). So no
@@ -150,7 +158,8 @@ impl MmapWritable {
         // SAFETY: the same aliasing contract as `Mmap::map`, extended to writes.
         // memmap2's `map_mut` is `unsafe` because the mapping aliases the file
         // and the borrow checker cannot see writers through the fd. Our
-        // invariants (SPEC 04 §9 TXN-62, §6.4, single-process, single-writer TXN-6):
+        // invariants (SPEC 04 §9 TXN-62, §6.4, §12, single writer across
+        // processes TXN-6):
         //  * `file` stays open for the whole life of the returned map (the
         //    caller keeps the `File` alongside it — see `WriteMapBacking`);
         //  * every page a store targets is inside the file: stores happen
@@ -162,7 +171,7 @@ impl MmapWritable {
         //    size) are never touched; the file never shrinks;
         //  * writes go only through `write_at_page` or the brokered
         //    `slice_mut` (ADR-0021, in-place WRITE_MAP), called only by the
-        //    single writer holding the write mutex (TXN-6) — at commit C2/C4,
+        //    single writer holding both writer locks (TXN-6) — at commit C2/C4,
         //    when it spills (SPEC 04 §6.3a), or at dirty-frame
         //    allocation/edit time (TXN-45b) — and only to
         //    pages **no live snapshot references** (TXN-62: fresh pages beyond
@@ -175,7 +184,11 @@ impl MmapWritable {
         //    after every spill before resolving a spilled page through it
         //    (TXN-71, ADR-0021 B2). So no
         //    `&[u8]` a reader actually dereferences is mutated while borrowed;
-        //  * the env is single-process: no other process writes/truncates.
+        //  * every other process that writes the file obeys the same rules
+        //    (one writer at a time across processes, ADR-0023 §2), and no
+        //    process truncates or shrinks it: `WRITE_MAP` growth only ever
+        //    extends the file, under both writer locks (ADR-0023 amendment
+        //    15). Without a lock file the caller keeps other processes out.
         let inner = unsafe { memmap2::MmapOptions::new().len(len).map_mut(file)? };
         Ok(MmapWritable { inner })
     }

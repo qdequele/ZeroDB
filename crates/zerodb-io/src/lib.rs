@@ -88,7 +88,9 @@ fn grow_regions(
             map(map_len(map_size)?)?
         }
         Err(e) if wanted > map_size && e.kind() == std::io::ErrorKind::InvalidInput => {
-            // `wanted` does not fit a `usize`; `map_size` may.
+            // `wanted` does not fit a `usize`, or `mmap` refused the length
+            // with `EINVAL` (which the standard library reports as
+            // `InvalidInput`); `map_size` may still fit.
             map(map_len(map_size)?)?
         }
         Err(e) => return Err(e),

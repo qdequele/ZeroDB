@@ -485,9 +485,9 @@ impl ReaderTable {
     /// these loads before the liveness probes of pass 2, which invariant B
     /// depends on under a weak memory model: with `Relaxed` loads, ARM could
     /// satisfy a load after the probe and break B), keeping those with a
-    /// non-zero PID other than
-    /// `reaper` (PID 0 means free, being claimed or being released:
-    /// presumed live); (2) probe each distinct PID found; (3) for each
+    /// non-zero PID other than `reaper` (PID 0 means free, being claimed or
+    /// being released: presumed live); (2) probe each distinct PID found;
+    /// (3) for each
     /// snapshot entry judged dead, `CAS word -> (generation + 1, reaper)`
     /// (`AcqRel` on success: it is the single linearization point that two
     /// reapers, or a reaper and a re-claim, contend on, and the `Acquire`

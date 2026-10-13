@@ -31,7 +31,7 @@ use crate::{Database, DatabaseOpenOptions, Error, Result, Unspecified};
 /// LMDB: Meilisearch joins `"data.mdb"` onto an env path in production
 /// compaction (`process_batch.rs`, `routes/tasks/compact.rs`, `meilitool`) and
 /// snapshot code (`process_snapshot_creation.rs`, `enterprise_edition/s3.rs`).
-/// An adapter env dir therefore contains **exactly** this one file — no
+/// An adapter env dir therefore contains **exactly** this one data file — no
 /// `zerodb.dat`. A `lock.mdb` sits next to it, as with LMDB (ADR-0023),
 /// unless the env is opened with heed's `NO_LOCK` (ADR-0023 amendment 17) or
 /// read-only on read-only media.

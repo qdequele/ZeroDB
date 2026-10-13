@@ -696,8 +696,9 @@ pub struct EnvInner {
     /// (Acquire) at every write-txn begin and commit. A poisoned env still
     /// serves read txns from their pinned snapshots.
     poisoned: AtomicBool,
-    /// The MVCC reader table (SPEC 04 §4; ADR-0006): `max_readers`
-    /// cache-padded single-`AtomicU64` slots. Readers claim/pin/release
+    /// The MVCC reader table (SPEC 04 §4; ADR-0006): `max_readers` 128-byte
+    /// slots, in this process's memory or, in a lock-file environment, in
+    /// the shared lock file (ADR-0023 §3). Readers claim/pin/release
     /// slots lock-free; the writer's GC gate scans it (`oldest_live_reader`,
     /// TXN-21).
     reader_table: ReaderTable,
@@ -1119,8 +1120,10 @@ impl EnvInner {
         self.reader_table.release(slot);
     }
 
-    /// The reader table's fixed slot count (`max_readers` as configured at
-    /// open; `MDB_envinfo::me_maxreaders`).
+    /// The reader table's fixed slot count (`MDB_envinfo::me_maxreaders`):
+    /// `max_readers` as configured at open, or, in a lock-file environment,
+    /// the count recorded in the lock file, which a joining process adopts
+    /// (ADR-0023 §1 as amended).
     #[must_use]
     pub fn max_readers(&self) -> u32 {
         self.reader_table.capacity()
@@ -1664,7 +1667,7 @@ impl Env {
     /// grew the map beyond this process's current mapping), it falls back to
     /// this process's own cached snapshot ([`EnvInner::snapshot`]) rather than
     /// surfacing the error, which can under-report a page/txnid that another
-    /// process has already published.
+    /// process has already published. That fallback has no dedicated test.
     #[must_use]
     pub fn info(&self) -> EnvInfo {
         let snap = self
@@ -1916,8 +1919,8 @@ impl Env {
 /// | `me_mapsize` | [`EnvInfo::map_size`] | identical meaning. |
 /// | `me_last_pgno` | [`EnvInfo::last_pgno`] | identical *meaning* (id of the last used page), but the **value is format-specific**: it counts ZeroDB pages of ZeroDB's layout, not LMDB's. Never compare it cross-engine. |
 /// | `me_last_txnid` | [`EnvInfo::last_txnid`] | identical meaning and value domain: the id of the last committed txn. Comparable cross-engine. |
-/// | `me_maxreaders` | [`EnvInfo::max_readers`] | identical: the configured reader-table size. |
-/// | `me_numreaders` | [`EnvInfo::num_readers`] | identical — **including LMDB's surprise**: it is a *high-water mark*, not a live count (see docs/DIVERGENCES.md). Single-process, so it only ever covers *this* process's readers; under LMDB it spans every process sharing the lock file. |
+/// | `me_maxreaders` | [`EnvInfo::max_readers`] | identical: the reader-table size (configured, or adopted from the lock file by a joining process). |
+/// | `me_numreaders` | [`EnvInfo::num_readers`] | identical — **including LMDB's surprise**: it is a *high-water mark*, not a live count (see docs/DIVERGENCES.md). It is computed from the slots *this* process claimed, also in a lock-file environment, where other processes' readers share the table. |
 /// | *(none)* | [`EnvInfo::live_readers`] | **ZeroDB extension**: the genuinely-live occupied-slot count that `me_numreaders` looks like but is not. |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvInfo {
@@ -1928,7 +1931,8 @@ pub struct EnvInfo {
     pub last_pgno: u64,
     /// Id of the last committed transaction (`me_last_txnid`).
     pub last_txnid: u64,
-    /// Configured reader-table size (`me_maxreaders`).
+    /// Reader-table size (`me_maxreaders`): configured, or adopted from the
+    /// lock file by a process that joined a running environment.
     pub max_readers: u32,
     /// `me_numreaders`: the **high-water** reader-slot count — the maximum
     /// number of simultaneously live readers ever observed. It does **not**
@@ -2314,9 +2318,10 @@ pub fn open_with_backing_shared(
         _ => Snapshot::from_meta(&meta, annex),
     };
     let reader_table = match &shared {
-        // In shared mode the slot count comes from the region (fixed by the
-        // first opener); the lock-file layer validates it against
-        // `max_readers`.
+        // In shared mode the slot count comes from the region, fixed by the
+        // first opener: a joining process adopts it whatever its own
+        // `max_readers` asks for, as an LMDB joiner does (ADR-0023 §1 as
+        // amended).
         #[cfg(not(loom))]
         Some(region) => ReaderTable::new_shared(Arc::clone(region)),
         // The reader table is sized once at open and never resized (TXN-14).

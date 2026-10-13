@@ -372,7 +372,9 @@ fn normalize(entries: &mut Vec<crate::common::Kv>) {
 /// so no process opens the env during the walk. If another process has the
 /// env open, it refuses. On read-only media, where no lock file can be
 /// created, the raw walk runs and its report says it had no liveness
-/// guarantee.
+/// guarantee. The walk leaves the lock file carrying only the initializing
+/// magic, which records no reader count, so the next process to open the
+/// env alone sizes the reader table from its own `max_readers`.
 ///
 /// # Errors
 ///

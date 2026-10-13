@@ -222,7 +222,10 @@ impl Drop for Registration {
 /// by its canonical directory joined with its file name (only the directory
 /// can be canonicalized). If another process creates the file between this
 /// `stat` and the open, this process still holds no other entry for that
-/// inode, because it had no descriptor to it.
+/// inode, because it had no descriptor to it; and once the open has a
+/// descriptor, [`Registration::rekey`] re-keys the claim by the file's
+/// identity, which also catches a name that was replaced by a link to a
+/// file this process already has open.
 fn registry_key(path: &Path) -> std::io::Result<RegistryKey> {
     use std::os::unix::fs::MetadataExt;
     match std::fs::metadata(path) {
@@ -297,9 +300,10 @@ pub fn published_max_readers(path: &Path) -> Result<Option<u32>, LockOpenError> 
 
 /// The mapped lock file. Field order matters for `Drop`: the map is
 /// unmapped before the descriptor closes, closing the descriptor releases
-/// this process's record locks, and only then is the path released in the
-/// registry — so no second descriptor of this file can be opened by this
-/// process while the first is still open.
+/// this process's record locks, and only then is the file's entry removed
+/// from the registry (keyed by the file's identity, not its path) — so no
+/// second descriptor of this file can be opened by this process while the
+/// first is still open.
 ///
 /// Sharing one `LockFile` across threads is sound: all shared state is reached
 /// through atomics over the mapping or through `fcntl` on the descriptor.
@@ -347,10 +351,11 @@ impl LockFile {
     /// [`LockOpenError::AlreadyOpen`] if this process has it open (under any
     /// name), [`LockOpenError::Mismatch`] on a format mismatch,
     /// [`LockOpenError::ReadOnlyFs`] when the file cannot be created or
-    /// opened for writing on a read-only filesystem, an [`LockOpenError::Io`] of kind `InvalidInput` when a guard
-    /// above refuses the file, of kind `TimedOut` when the election retries
-    /// run out before any process finishes initializing the file, and other
-    /// I/O errors.
+    /// opened for writing on a read-only filesystem, an
+    /// [`LockOpenError::Io`] of kind `InvalidInput` when a guard above
+    /// refuses the file, of kind `TimedOut` when the election retries run out
+    /// before any process finishes initializing the file, and other I/O
+    /// errors.
     pub fn open(
         path: &Path,
         data_path: &Path,

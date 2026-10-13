@@ -20,9 +20,12 @@
 //! protocol must never pair one publish's key with another's stamp; the
 //! loom model below checks exactly that.
 //!
-//! Stated limit: the cache assumes the file changes only through this
-//! process's commits (single-process model). Bytes rewritten underneath the env with a
-//! stamp they already carried would be trusted from the cache.
+//! Stated limit: the cache assumes the file changes only through ZeroDB
+//! commits, by this process or by another process sharing the lock file
+//! (ADR-0023 §5). Such a commit stamps every page it writes with its own
+//! txnid, so a page another process rewrote misses. Bytes rewritten
+//! underneath the env by anything else, with a stamp they already carried,
+//! would be trusted from the cache.
 
 use std::sync::OnceLock;
 

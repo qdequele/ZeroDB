@@ -557,7 +557,16 @@ Per operation (ns per txn, from the medians; `+x` is the change against
 | `env/txn/ro_begin_abort` | 84.7 | 67.4 | 72.9 (+5.5) 1.083 | 73.9 (+6.5) 1.102 | 73.8 (+6.4) 1.097 | 67.1 (-0.3) 0.995 | 67.4 (+0.0) 1.003 | 67.6 (+0.2) 1.006 |
 | `env/txn/rw_empty_commit` | 54.6 | 155.5 | 185.3 (+29.8) 1.189 | 191.4 (+35.9) 1.228 | 183.0 (+27.6) 1.177 | 158.4 (+3.0) 1.019 | 163.0 (+7.5) 1.048 | 154.4 (-1.0) 0.993 |
 | `commit/batch/n1` | 3.63 µs | 5.08 µs | 5.17 µs (+0.10) 1.026 | 5.15 µs (+0.07) 1.017 | 5.15 µs (+0.08) 1.013 | 5.08 µs (+0.00) 1.006 | 5.16 µs (+0.09) 1.017 | 5.14 µs (+0.06) 1.010 |
-| `commit/batch/n100` | 5.926 ms | 6.541 ms | 6.532 ms 1.004 | 6.609 ms 1.010 | 6.739 ms 1.006 | 6.550 ms 1.000 | 6.674 ms 1.003 | 6.734 ms 1.006 |
+| `commit/batch/n100` | 5.926 ms | 6.541 ms | 6.532 ms (-0.009) 1.004 | 6.609 ms (+0.068) 1.010 | 6.739 ms (+0.198) 1.006 | 6.550 ms (+0.009) 1.000 | 6.674 ms (+0.133) 1.003 | 6.734 ms (+0.193) 1.006 |
+
+The `commit/batch/n100` changes are in ms. For this rung the change of the
+medians (up to +3.0%) is larger than bench-ab's ratio, which is the value
+bench-ab judges and stays inside its ±0.030 threshold.
+
+The LMDB column's source runs are not recorded in this report. The bench-ab
+tables below report LMDB at 85.8 and 85.6 ns per `ro_begin_abort` txn
+(857.768 and 856.094 µs per 10,000 txns), not 84.7 ns, and flag that rung's
+LMDB drift (1.043 and 1.038). Read the LMDB column as indicative.
 
 Per round (ZeroDB variant ÷ `main`):
 
@@ -653,9 +662,14 @@ The other variants' bench-ab verdicts in the same run:
   - Write: the lock-on cost of an empty write txn goes from +35.9 ns to
     +27.6 ns against `main`. Stage 1 on this host is +29.8 ns.
   - Read: the lock-on cost of a read txn is +6.4 ns (stage 1: +5.5 ns,
-    before: +6.5 ns). The 0.9 ns gap to stage 1 is inside bench-ab's ±0.030
-    threshold (1.097 vs 1.083). It is stage 2's extra release store
-    (amendment 7, approved), not a stage-3 addition.
+    before: +6.5 ns). The 0.9 ns over stage 1 is systematic, not noise: the
+    per-round ranges do not overlap (stage 1 1.080–1.092, after 1.095–1.100).
+    It is attributed to stage 2's extra release store (amendment 7,
+    approved), not to a stage-3 addition, and it is inside bench-ab's ±0.030
+    threshold (1.097 vs 1.083).
+  - Lock off, `ro_begin_abort`: round 3 of the after variant is an outlier
+    (1.050 against 1.001–1.009 in the other rounds); the median absorbs
+    it.
 - **Lock off is flat against `main` again:** bench-ab `flat`, with
   `rw_empty_commit` at 0.993 (−1.0 ns), against 1.048 before.
 - `commit/batch/n1` (1.013 on, 1.010 off), `commit/batch/n100`,
@@ -692,6 +706,8 @@ F='^(env/txn/|get/|commit/batch/n1/|commit/batch/n100/|commit/sync/)'
 #   main, s1:on, s1:off, head:on, head:off, e1:on, e1:off
 # A side runs its own binary with CRITERION_HOME=<run>/round-N/<side> and
 # TMPDIR on the io2 volume; ":on" adds ZERODB_BENCH_LOCK_FILE=1.
+# (After the default flip the knob is inverted: the harness now opens with
+# the lock file by default, and ZERODB_BENCH_NO_LOCK=1 turns it off.)
 # For each variant, lay out <dir>/round-N/{before=main,after=variant}
 # and run scripts/bench-ab.py <dir> --target "$F".
 ```

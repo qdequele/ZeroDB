@@ -741,7 +741,9 @@ impl ExclusiveLock {
     /// that is, no other process has the environment open or is opening it.
     /// It never waits. On success the lock file is initialized as by a first
     /// opener that has not finished opening; dropping the guard leaves it in
-    /// a state the next opener accepts.
+    /// a state the next opener accepts: the initializing magic, with no
+    /// recorded reader count, so the next opener (necessarily a first opener)
+    /// uses its own `max_readers`.
     ///
     /// # Errors
     ///

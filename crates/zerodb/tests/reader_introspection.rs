@@ -2,15 +2,17 @@
 //!
 //! There is deliberately **no differential half**: heed exposes no reader
 //! introspection, so there is no through-heed path to drive C LMDB's
-//! `mdb_reader_list`, and LMDB's row shape (pid/thread columns over a shared
-//! `lock.mdb`) is meaningless in a single-process engine. The quantities that
-//! *are* cross-engine comparable — `max_readers` and the `me_numreaders`
-//! high-water mark — are covered by
+//! `mdb_reader_list`. The quantities that *are* cross-engine comparable —
+//! `max_readers` and the `me_numreaders` high-water mark — are covered by
 //! `zerodb-oracle/tests/env_info_differential.rs`.
 //!
 //! What is pinned here is ZeroDB's own contract, cross-checked against the
 //! reader-table facts `Env::info()` already exposes (`live_readers`, `num_readers`)
-//! so the two views of the same table cannot disagree.
+//! so the two views of the same table cannot disagree. The envs here use the
+//! default options, so they run with a lock file (ADR-0023), within one
+//! process: every reader is alive, so `clear_stale_readers` frees nothing.
+//! Reaping the slots of dead processes, and the PID column, are covered by
+//! `multi_process.rs` and `zerodb-oracle/tests/multi_process_differential.rs`.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
