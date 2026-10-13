@@ -871,6 +871,7 @@ dependencies = [
 name = "zerodb"
 version = "0.2.0"
 dependencies = [
+ "libc",
  "zerodb-core",
  "zerodb-io",
 ]
@@ -879,7 +880,6 @@ dependencies = [
 name = "zerodb-core"
 version = "0.2.0"
 dependencies = [
- "crossbeam-utils",
  "loom",
  "thiserror",
 ]
