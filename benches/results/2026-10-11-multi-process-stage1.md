@@ -458,3 +458,240 @@ checkout was synced at `164e0e9` with no uncommitted changes.
 | Linux x86-64 (bench server) | `cargo clippy --workspace --all-targets -- -D warnings` ok; `cargo test --workspace` ok (all suites 0 failed); `multi_process` 5 runs, 15/15 each; `crash-harness --mechanism mp --cycles 2000`: 2007 cycles verified, 0 failures, 173 s; `reader_stress` 180 s ok (3 variants); `multi_process_stress` 180 s ok: commits parent=23544 peer=19606, reaped-reader kills=356, reaped slots=712 |
 | macOS aarch64 | fmt, clippy (host and `x86_64-unknown-linux-gnu`), `cargo test --workspace` (773 passed), miri on `zerodb-core`, `just loom` (15 passed), `crash-test-quick` (229 + 57 cycles verified), `just fuzz-quick` (`diff_ops` 600 s: 49,891 runs; `fuzz_image_open` 120 s: 7,487,334 runs; no crash) all green |
 | Linux aarch64 (Graviton) | **not run.** The Graviton test instances no longer exist, so there was no host to start. aarch64 coverage is CI's only. |
+
+## Stage 3 (Graviton4, 2026-10-13)
+
+Stage 3 (tasks 3–9) added a begin-time map check to every write txn, a
+`WRITE_MAP` file-growth step and the cross-process `info()`/`stat()` view. This
+run asks whether the lock file's single-process cost is back within the ADR's
+budget ("one shared load and one slot store per txn begin, plus one uncontended
+CAS per write txn"). The stage-1 and stage-2 runs above were on the x86 bench
+server, which no longer exists, so the stage-1 commit is re-measured here as
+the target column.
+
+**Target:** the lock-on overhead against `main` is at or below stage 1's on the
+same host, within bench-ab noise, and the lock-off path is flat against `main`.
+
+### Setup
+
+| | |
+|---|---|
+| Host | AWS c8g.xlarge: Graviton4 (Neoverse-V2), 4 vCPU, 8 GiB, Ubuntu 24.04 arm64, kernel 7.0, 4 KiB OS pages. No cpufreq governor is exposed. apt, sysstat, snapd and the other timers were stopped; the host ran nothing else. |
+| Disk | EBS io2, 3000 IOPS (`/data`). Bench temp dirs were placed on it (`TMPDIR`). |
+| Toolchain | rustc 1.99.0 |
+| Build | criterion bench profile, `CARGO_PROFILE_BENCH_CODEGEN_UNITS=1`, one target dir per commit |
+| LMDB | heed 0.22.1 (the Meilisearch LMDB fork), in every binary, as the drift control |
+| Columns | `main` `7002d6e`; stage 1 `2b53e88`; before = `f2603c3` (stage-3 HEAD, tasks 1–9); after = `c77e822` (this task) |
+| Rungs | the stage-2 filter: `^(env/txn/\|get/\|commit/batch/n1/\|commit/batch/n100/\|commit/sync/)` |
+| Rounds | 5 interleaved rounds of 7 sides (main; stage 1, before, after, each with lock on and off), the starting side rotating each round |
+
+Method: the three-sided driver of stage 1, extended to seven sides. Each side
+runs its own binary; the lock-on sides set `ZERODB_BENCH_LOCK_FILE=1` (present
+in the stage-1, before and after harnesses). Every variant is fed to
+`scripts/bench-ab.py` against the same `main` measurements. The `main` binary
+has no `zerodb_io::lockfile` symbols; the others have them.
+
+### Attribution (profile of the before commit)
+
+Criterion's own analysis drowns a `perf record` of the bench binary, so the
+cost was attributed with a micro loop outside the repo (heed API, `NO_SYNC`,
+pinned to one core, warm env): 20 M read txns or 5 M empty write txns, under
+`perf stat -e instructions:u,cycles:u` minus an empty run, median of 5
+interleaved runs; and `perf record -e cycles:u` per symbol. 1 ns ≈ 2.8 cycles.
+
+| loop | main | stage 1 off | before off | after off | stage 1 on | before on | after on |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| read txn, instructions | 466 | 490 | 492 | 492 | 575 | 585 | 585 |
+| read txn, cycles | 226 | 221–225 | 231 | 232 | 249 | 251 | 255 |
+| empty write txn, instructions | 1,028 | 1,053 | 1,095 | **1,028** | 1,205 | 1,262 | **1,195** |
+| empty write txn, cycles | 406 | 420 | 428 | **398** | 487 | 513 | **469** |
+
+Where the before commit's extra write-txn cycles went:
+
+| cost | on / off | cycles | what it is | in the ADR budget? |
+|---|---|---:|---|---|
+| stage-3 begin additions | both | ≈ +22 | a second `dyn Backing::view` call (Acquire load of the view cell) for the base check, on top of the one that derives the txn's read view; the `WRITE_MAP` growth arm inline in `write_txn`, which made the begin larger | no: not a lock-file cost at all, and it made the lock-off path +4.8% |
+| writer-word release (`swap`, Release) | on | ≈ +30 | the futex unlock; `__aarch64_swp4_rel` is the largest single delta in the profile | yes: LMDB's mutex unlock is also a release RMW |
+| writer-word claim (`compare_exchange`, Acquire) | on | ≈ +5–8 | the "one uncontended CAS" | yes |
+| `T` load and snapshot lookup | on | ≈ +10–15 | `published_txnid()` through the vtable, the SeqCst load, `current_snapshot_shared` and its retry loop; the snapshot clone itself is also paid without a lock file | yes ("one shared load") |
+| lock call chain | on | ≈ +10 | `lock_writer_region` → `dyn SharedRegion::lock_writer` → `Result<bool>`; the takeover check is one untaken branch | plumbing around the budgeted CAS |
+| `T` publish | — | 0 | an empty commit publishes nothing; on a real commit it is one SeqCst store | yes |
+
+The read txn is unchanged by stage 3's tasks beyond stage 2's release: its
+lock-on cost is the slot claim CAS and owner-word store, stage 2's three-store
+release (ADR-0023 amendment 7, ≈ +5–8 cycles in `RoTxn::drop`), and the
+`slots()` and `published_txnid()` vtable calls (≈ +6 cycles each).
+
+So the only cost outside the budget was the stage-3 begin additions, which
+the lock-on and lock-off paths share.
+
+### What changed
+
+- **`c77e822`: one map view per write-txn begin; `WRITE_MAP` growth out of
+  line.** The begin loads the backing's map view once and uses it for both the
+  base check (ADR-0023 amendment 15) and the txn's read view, which it used to
+  load a second time through `backing_bytes()`. The `WRITE_MAP` file growth
+  moved into a `#[cold]` out-of-line helper. Same checks, same order, same
+  errors; no protocol change. This is not an LMDB technique: it removes
+  overhead stage 3 added. Empty write txn: 1,095 → 1,028 instructions (main:
+  1,028), 428 → 398 cycles.
+- **Tried and reverted: capture the map's page limit at begin.** A review
+  suggested storing `map_size / page_size` in the txn instead of an Acquire
+  load and a vtable call per page-extension allocation. It is valid (this
+  process's `resize` refuses while a write txn is live), but steady-state
+  commits take their pages from GC and loose reuse, not from file extension,
+  so the saving never shows. The begin pays a division and a wider struct
+  instead: empty write txn +18 instructions, cycles within noise; single-put
+  commit +26 instructions. It does not simplify anything either, so it was
+  reverted (perf ledger).
+
+### Results
+
+Per operation (ns per txn, from the medians; `+x` is the change against
+`main`, then after ÷ before as bench-ab reports it). `ro_begin_abort` runs
+10,000 read txns per iteration, `rw_empty_commit` 1,000 empty write txns,
+`commit/batch/n1` 2,000 single-put commits.
+
+| rung | LMDB | main | stage 1 on | before on | **after on** | stage 1 off | before off | **after off** |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `env/txn/ro_begin_abort` | 84.7 | 67.4 | 72.9 (+5.5) 1.083 | 73.9 (+6.5) 1.102 | 73.8 (+6.4) 1.097 | 67.1 (-0.3) 0.995 | 67.4 (+0.0) 1.003 | 67.6 (+0.2) 1.006 |
+| `env/txn/rw_empty_commit` | 54.6 | 155.5 | 185.3 (+29.8) 1.189 | 191.4 (+35.9) 1.228 | 183.0 (+27.6) 1.177 | 158.4 (+3.0) 1.019 | 163.0 (+7.5) 1.048 | 154.4 (-1.0) 0.993 |
+| `commit/batch/n1` | 3.63 µs | 5.08 µs | 5.17 µs (+0.10) 1.026 | 5.15 µs (+0.07) 1.017 | 5.15 µs (+0.08) 1.013 | 5.08 µs (+0.00) 1.006 | 5.16 µs (+0.09) 1.017 | 5.14 µs (+0.06) 1.010 |
+| `commit/batch/n100` | 5.926 ms | 6.541 ms | 6.532 ms 1.004 | 6.609 ms 1.010 | 6.739 ms 1.006 | 6.550 ms 1.000 | 6.674 ms 1.003 | 6.734 ms 1.006 |
+
+Per round (ZeroDB variant ÷ `main`):
+
+| rung | variant | rounds 1–5 | LMDB, rounds 1–5 |
+|---|---|---|---|
+| `env/txn/ro_begin_abort` | stage 1, lock on | 1.083 1.092 1.081 1.080 1.087 | 1.017 1.060 0.999 1.026 1.057 |
+| `env/txn/ro_begin_abort` | before, lock on | 1.117 1.102 1.091 1.104 1.095 | 1.029 1.091 1.045 1.048 1.066 |
+| `env/txn/ro_begin_abort` | after, lock on | 1.097 1.099 1.097 1.095 1.100 | 1.028 1.071 1.038 1.034 1.107 |
+| `env/txn/ro_begin_abort` | stage 1, lock off | 1.000 1.002 0.994 0.995 0.992 | 1.007 1.047 1.002 1.010 1.123 |
+| `env/txn/ro_begin_abort` | before, lock off | 1.003 1.004 1.003 1.000 1.003 | 1.041 1.080 1.031 1.038 1.052 |
+| `env/txn/ro_begin_abort` | after, lock off | 1.006 1.009 1.050 1.002 1.001 | 1.043 1.087 1.035 1.040 1.072 |
+| `env/txn/rw_empty_commit` | stage 1, lock on | 1.184 1.192 1.189 1.185 1.198 | 1.003 1.017 1.004 1.001 1.004 |
+| `env/txn/rw_empty_commit` | before, lock on | 1.211 1.240 1.226 1.228 1.232 | 1.016 1.020 1.014 1.029 1.003 |
+| `env/txn/rw_empty_commit` | after, lock on | 1.181 1.177 1.134 1.168 1.179 | 0.997 0.990 1.000 0.999 0.996 |
+| `env/txn/rw_empty_commit` | stage 1, lock off | 1.026 1.020 1.019 1.010 1.010 | 1.004 0.998 0.997 1.009 1.006 |
+| `env/txn/rw_empty_commit` | before, lock off | 1.058 1.051 1.046 1.043 1.048 | 1.020 1.019 1.002 1.009 1.001 |
+| `env/txn/rw_empty_commit` | after, lock off | 0.994 0.992 0.988 0.993 0.994 | 0.994 0.993 0.997 0.992 1.002 |
+
+#### After (`c77e822`), lock file off, against `main`
+
+| rung | LMDB | ZeroDB before | ZeroDB after | vs LMDB before → after | after ÷ before | LMDB drift | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `commit/batch/n1` | 7.274 ms | 10.154 ms | 10.271 ms | 1.40× → **1.41×** | 1.010 (±0.034) | 1.007 | flat |
+| `commit/batch/n100` | 5.997 ms | 6.541 ms | 6.734 ms | 1.09× → **1.12×** | 1.006 (±0.030) | 1.003 | flat |
+| `commit/sync/n1` 🎯 | 282.829 ms | 245.165 ms | 245.226 ms | 0.87× → **0.87×** | 1.000 (±0.030) | 1.000 | flat |
+| `commit/sync/n100` 🎯 | 432.683 ms | 437.673 ms | 437.884 ms | 1.01× → **1.01×** | 1.000 (±0.030) | 1.000 | flat |
+| `env/txn/ro_begin_abort` 🎯 | 857.768 µs | 674.104 µs | 676.476 µs | 0.79× → **0.79×** | 1.006 (±0.041) | 1.043 | ⚠ drift |
+| `env/txn/rw_empty_commit` 🎯 | 54.517 µs | 155.453 µs | 154.436 µs | 2.85× → **2.83×** | 0.993 (±0.030) | 0.994 | flat |
+| `get/access/hot` 🎯 | 1.254 ms | 939.024 µs | 936.013 µs | 0.75× → **0.75×** | 0.996 (±0.030) | 0.990 | flat |
+| `get/access/miss` 🎯 | 854.902 µs | 910.999 µs | 912.569 µs | 1.07× → **1.07×** | 1.002 (±0.030) | 1.001 | flat |
+| `get/access/rand` 🎯 | 2.630 ms | 2.314 ms | 2.308 ms | 0.88× → **0.88×** | 0.994 (±0.047) | 1.013 | flat |
+| `get/access/seq` 🎯 | 1.423 ms | 1.236 ms | 1.241 ms | 0.87× → **0.87×** | 1.004 (±0.030) | 1.004 | flat |
+| `get/db/named` 🎯 | 2.611 ms | 2.320 ms | 2.323 ms | 0.89× → **0.89×** | 0.998 (±0.037) | 1.001 | flat |
+| `get/db/named_x8` 🎯 | 2.273 ms | 2.166 ms | 2.184 ms | 0.95× → **0.96×** | 1.008 (±0.030) | 1.011 | flat |
+| `get/db/root` 🎯 | 2.660 ms | 2.340 ms | 2.364 ms | 0.88× → **0.89×** | 1.006 (±0.030) | 0.974 | flat |
+| `get/key/k128` 🎯 | 3.305 ms | 3.590 ms | 3.669 ms | 1.09× → **1.11×** | 0.994 (±0.042) | 0.982 | flat |
+| `get/key/k32` 🎯 | 2.766 ms | 2.862 ms | 2.911 ms | 1.03× → **1.05×** | 1.010 (±0.035) | 1.041 | ⚠ drift |
+| `get/key/k8` 🎯 | 2.623 ms | 2.316 ms | 2.330 ms | 0.88× → **0.89×** | 1.009 (±0.046) | 1.005 | flat |
+| `get/size/n1k` 🎯 | 1.357 ms | 1.201 ms | 1.194 ms | 0.88× → **0.88×** | 0.994 (±0.030) | 1.004 | flat |
+| `get/size/n50k` 🎯 | 2.632 ms | 2.302 ms | 2.310 ms | 0.87× → **0.88×** | 1.001 (±0.057) | 1.021 | flat |
+| `get/val/v256` 🎯 | 2.196 ms | 1.784 ms | 1.794 ms | 0.81× → **0.82×** | 1.004 (±0.030) | 1.027 | flat |
+| `get/val/v2page` 🎯 | 1.839 ms | 1.758 ms | 1.767 ms | 0.96× → **0.96×** | 0.996 (±0.066) | 1.001 | flat |
+| `get/val/v2page_touch` 🎯 | 2.302 ms | 1.842 ms | 1.974 ms | 0.80× → **0.86×** | 1.028 (±0.110) | 0.981 | flat |
+| `get/val/v4k` 🎯 | 1.826 ms | 1.765 ms | 1.786 ms | 0.97× → **0.98×** | 1.001 (±0.043) | 0.999 | flat |
+| `get/val/v4k_touch` 🎯 | 2.227 ms | 1.839 ms | 1.918 ms | 0.83× → **0.86×** | 0.998 (±0.180) | 0.999 | flat |
+| `get/val/v8` 🎯 | 1.796 ms | 1.463 ms | 1.469 ms | 0.81× → **0.82×** | 1.004 (±0.030) | 1.003 | flat |
+| `get/val/v8_touch` 🎯 | 1.803 ms | 1.479 ms | 1.476 ms | 0.82× → **0.82×** | 0.998 (±0.030) | 0.999 | flat |
+
+**Verdict: flat**. Improved: 0, regressed: 0, flat: 23, unreliable (LMDB drift > 3%): 2. 5 interleaved round(s); before = `main-off`, after = `e1-off`, host `Linux aarch64 Graviton4 c8g.xlarge`.
+
+#### After (`c77e822`), lock file on, against `main`
+
+| rung | LMDB | ZeroDB before | ZeroDB after | vs LMDB before → after | after ÷ before | LMDB drift | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `commit/batch/n1` | 7.272 ms | 10.154 ms | 10.307 ms | 1.40× → **1.42×** | 1.013 (±0.030) | 1.001 | flat |
+| `commit/batch/n100` | 5.964 ms | 6.541 ms | 6.739 ms | 1.10× → **1.13×** | 1.006 (±0.030) | 1.000 | flat |
+| `commit/sync/n1` 🎯 | 282.817 ms | 245.165 ms | 245.105 ms | 0.87× → **0.87×** | 1.000 (±0.030) | 1.000 | flat |
+| `commit/sync/n100` 🎯 | 432.718 ms | 437.673 ms | 437.791 ms | 1.01× → **1.01×** | 1.000 (±0.030) | 1.000 | flat |
+| `env/txn/ro_begin_abort` 🎯 | 856.094 µs | 674.104 µs | 738.436 µs | 0.79× → **0.86×** | 1.097 (±0.030) | 1.038 | ⚠ drift |
+| `env/txn/rw_empty_commit` 🎯 | 54.508 µs | 155.453 µs | 183.043 µs | 2.85× → **3.36×** | 1.177 (±0.039) | 0.997 | ❌ slower |
+| `get/access/hot` 🎯 | 1.257 ms | 939.024 µs | 934.129 µs | 0.75× → **0.74×** | 0.996 (±0.030) | 0.992 | flat |
+| `get/access/miss` 🎯 | 854.778 µs | 910.999 µs | 913.220 µs | 1.07× → **1.07×** | 1.000 (±0.030) | 1.001 | flat |
+| `get/access/rand` 🎯 | 2.651 ms | 2.314 ms | 2.321 ms | 0.87× → **0.88×** | 0.993 (±0.043) | 1.015 | flat |
+| `get/access/seq` 🎯 | 1.423 ms | 1.236 ms | 1.243 ms | 0.87× → **0.87×** | 1.005 (±0.030) | 1.002 | flat |
+| `get/db/named` 🎯 | 2.634 ms | 2.320 ms | 2.324 ms | 0.88× → **0.88×** | 0.987 (±0.030) | 1.016 | flat |
+| `get/db/named_x8` 🎯 | 2.287 ms | 2.166 ms | 2.201 ms | 0.95× → **0.96×** | 1.000 (±0.051) | 1.004 | flat |
+| `get/db/root` 🎯 | 2.641 ms | 2.340 ms | 2.346 ms | 0.89× → **0.89×** | 0.999 (±0.030) | 0.978 | flat |
+| `get/key/k128` 🎯 | 3.255 ms | 3.590 ms | 3.744 ms | 1.10× → **1.15×** | 1.029 (±0.066) | 1.018 | flat |
+| `get/key/k32` 🎯 | 2.784 ms | 2.862 ms | 2.943 ms | 1.03× → **1.06×** | 1.016 (±0.087) | 1.008 | flat |
+| `get/key/k8` 🎯 | 2.633 ms | 2.316 ms | 2.356 ms | 0.88× → **0.90×** | 1.004 (±0.064) | 1.024 | flat |
+| `get/size/n1k` 🎯 | 1.356 ms | 1.201 ms | 1.197 ms | 0.89× → **0.88×** | 0.995 (±0.030) | 1.001 | flat |
+| `get/size/n50k` 🎯 | 2.651 ms | 2.302 ms | 2.319 ms | 0.87× → **0.87×** | 1.004 (±0.030) | 1.013 | flat |
+| `get/val/v256` 🎯 | 2.204 ms | 1.784 ms | 1.775 ms | 0.81× → **0.81×** | 0.994 (±0.030) | 1.019 | flat |
+| `get/val/v2page` 🎯 | 1.839 ms | 1.758 ms | 1.769 ms | 0.96× → **0.96×** | 1.006 (±0.100) | 1.004 | flat |
+| `get/val/v2page_touch` 🎯 | 2.203 ms | 1.842 ms | 1.903 ms | 0.84× → **0.86×** | 1.005 (±0.046) | 0.964 | ⚠ drift |
+| `get/val/v4k` 🎯 | 1.827 ms | 1.765 ms | 1.749 ms | 0.97× → **0.96×** | 0.989 (±0.030) | 1.001 | flat |
+| `get/val/v4k_touch` 🎯 | 2.216 ms | 1.839 ms | 1.871 ms | 0.83× → **0.84×** | 0.994 (±0.134) | 0.998 | flat |
+| `get/val/v8` 🎯 | 1.794 ms | 1.463 ms | 1.471 ms | 0.82× → **0.82×** | 1.003 (±0.030) | 0.999 | flat |
+| `get/val/v8_touch` 🎯 | 1.803 ms | 1.479 ms | 1.479 ms | 0.82× → **0.82×** | 0.999 (±0.030) | 0.999 | flat |
+
+**Verdict: regressed**. Improved: 0, regressed: 1, flat: 22, unreliable (LMDB drift > 3%): 2. 5 interleaved round(s); before = `main-off`, after = `e1-on`, host `Linux aarch64 Graviton4 c8g.xlarge`.
+
+The other variants' bench-ab verdicts in the same run:
+
+- stage 1, lock off: `flat` (23 flat, 2 drift). Lock on: `regressed` on
+  `ro_begin_abort` (1.083) and `rw_empty_commit` (1.189).
+- before, lock off: `regressed` on `rw_empty_commit` only (1.048, +7.5 ns,
+  every round 1.043–1.058). Lock on: `regressed` on `rw_empty_commit` (1.228).
+
+### Verdict (stage 3)
+
+- **Target met.**
+  - Write: the lock-on cost of an empty write txn goes from +35.9 ns to
+    +27.6 ns against `main`. Stage 1 on this host is +29.8 ns.
+  - Read: the lock-on cost of a read txn is +6.4 ns (stage 1: +5.5 ns,
+    before: +6.5 ns). The 0.9 ns gap to stage 1 is inside bench-ab's ±0.030
+    threshold (1.097 vs 1.083). It is stage 2's extra release store
+    (amendment 7, approved), not a stage-3 addition.
+- **Lock off is flat against `main` again:** bench-ab `flat`, with
+  `rw_empty_commit` at 0.993 (−1.0 ns), against 1.048 before.
+- `commit/batch/n1` (1.013 on, 1.010 off), `commit/batch/n100`,
+  `commit/sync/*` and every `get/*` rung are flat in both modes.
+- **What remains with the lock file on** is the budget itself:
+  - per write txn, the futex writer word's acquire CAS and release swap,
+    the `T` load, and the dynamic-dispatch plumbing around them (about 63
+    cycles, 22–28 ns);
+  - per read txn, the shared slot's claim, the owner word and the release
+    stores (about 6 ns).
+
+  LMDB pays a lock RMW and an unlock RMW per write txn too. ZeroDB keeps its
+  in-process writer lock under the cross-process one (ADR-0023 §2), so the
+  remaining gap cannot be closed without changing the lock protocol.
+- ZeroDB stays ahead of LMDB on read-txn begin/abort with the lock file on
+  (0.86×). The empty write txn is 3.36× LMDB with the lock on and 2.83× with it
+  off (`main`: 2.85×).
+
+### Platform runs (stage 3, after `c77e822`)
+
+| platform | result |
+|---|---|
+| Linux aarch64 (Graviton4, native) | `cargo clippy --workspace --all-targets -- -D warnings` ok; `cargo test --workspace`: 914 passed, 0 failed, 181 suites |
+| macOS aarch64 | fmt, clippy (host and `x86_64-unknown-linux-gnu`), `cargo test --workspace` (908 passed, 0 failed), miri on `zerodb-core` (all suites ok), `just crash-test-quick` (215 + 57 cycles verified) |
+
+### Reproduce (stage 3)
+
+```bash
+# Graviton host, one worktree and one CARGO_TARGET_DIR per commit:
+# main 7002d6e, s1 2b53e88, head f2603c3, e1 c77e822.
+export CARGO_PROFILE_BENCH_CODEGEN_UNITS=1
+F='^(env/txn/|get/|commit/batch/n1/|commit/batch/n100/|commit/sync/)'
+# Each round runs every side once, rotating the starting side:
+#   main, s1:on, s1:off, head:on, head:off, e1:on, e1:off
+# A side runs its own binary with CRITERION_HOME=<run>/round-N/<side> and
+# TMPDIR on the io2 volume; ":on" adds ZERODB_BENCH_LOCK_FILE=1.
+# For each variant, lay out <dir>/round-N/{before=main,after=variant}
+# and run scripts/bench-ab.py <dir> --target "$F".
+```
