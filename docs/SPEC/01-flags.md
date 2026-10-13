@@ -299,8 +299,8 @@ Two caveats on scope:
   then normal" behavior, not leave the env permanently pinned to the old meta.
   With a lock file, zerodb lets other processes join at the end of the
   `PREV_SNAPSHOT` open, not after its first commit; a process that joins in
-  between sees the older snapshot, which is what the opener published. LMDB's
-  behavior in that window is unobserved (SPEC 04 §12.1).
+  between sees the older snapshot, which is what the opener published. LMDB
+  differs in that window (observed; SPEC 04 §12.1).
 
 ### §S6 — durability lattice: `NO_SYNC` / `NO_META_SYNC` / `MAP_ASYNC` (× `WRITE_MAP`)
 
@@ -353,7 +353,11 @@ several other rules:
   txn's dirty frames are realized in the writable map at allocation/edit time
   rather than in heap frames copied in at commit (SPEC 04 §6.4 TXN-45b;
   `zerodb-io::mmap` brokered slice, `zerodb-core::dirty`).
-- The fork `ftruncate`s the file to the map size at open. ZeroDB does so only
+- The fork `ftruncate`s the file to the map size at open, also when other
+  processes hold the env, and also downward: a 2 MiB joiner shrinks an
+  8 MiB file under the holder's 8 MiB mapping
+  (`OBS_WRITE_MAP_JOINER_LARGER_MAP`, `OBS_WRITE_MAP_JOINER_SMALLER_MAP`,
+  observed on macOS; docs/DIVERGENCES.md D-024). ZeroDB does so only
   when the process is alone (no lock file, or the lock file's initializer);
   otherwise the file grows only under both writer locks, in `Env::resize` and
   at a write-txn begin, and never shrinks, so no process's mapping loses its

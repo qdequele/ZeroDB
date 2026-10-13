@@ -1565,7 +1565,15 @@ against LMDB unless it says so.
   byte is downgraded when the open completes (LCK-1), not after the first
   commit, so a process may join a rolled-back environment before the commit
   that makes the rollback durable; it sees the older snapshot, which is the
-  published `T`. Whether LMDB admits a joiner in that window is unobserved.
+  published `T`, and the opener's first commit is published at once. LMDB
+  differs (observed on macOS, 2026-10-13): a joiner's open waits until the
+  opener's first commit, and after that commit both the joiner and the
+  opener's own new read txns still see the older snapshot until a second
+  commit (`OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT = ["blocked",
+  "ok:prev", "-"]`, `OBS_PREV_SNAPSHOT_FIRST_COMMIT_READ_VIEW = ["prev",
+  "a_commit2"]`; `multi_process_differential.rs::
+  join_before_prev_snapshot_first_commit_vs_lmdb` pins both engines). The
+  difference is not an approved divergence; it awaits a maintainer ruling.
 - **`Env::resize` waits for the cross-process writer lock**, also on a
   `READ_ONLY` environment (its lock file is open read-write, so the lock is
   available to it). LMDB takes no lock: its `mdb_env_set_mapsize` returns

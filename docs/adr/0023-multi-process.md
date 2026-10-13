@@ -889,8 +889,11 @@ Terms used below:
        write-begin check, and gives up invariant 2 for cached read snapshots.
     4. **The data file grows only under both writer locks**, in `resize`
        and at a `WRITE_MAP` write-txn begin. A `WRITE_MAP` joiner never
-       grows it at open. *Alternative:* refuse `WRITE_MAP` growth while
-       other processes are alive.
+       grows it at open. LMDB's joiner truncates the file to its own map
+       size at open, up or down, a shrink under the other processes'
+       mappings included (observed: `OBS_WRITE_MAP_JOINER_LARGER_MAP`,
+       `OBS_WRITE_MAP_JOINER_SMALLER_MAP`; D-024). *Alternative:* refuse
+       `WRITE_MAP` growth while other processes are alive.
     5. **`resize` with live read txns succeeds**, as LMDB's return code
        does. *Alternative:* refuse while any in-process txn is live.
     6. **`MAX_MAP_SIZE` = 2^47**, for `resize` and at open. *Alternative:*
