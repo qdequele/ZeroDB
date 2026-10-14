@@ -3,7 +3,8 @@
 - Status: **Accepted, implemented** (stages 1–3, 2026-10-13). Approved
   2026-10-09 by the maintainer, open questions resolved to the proposed
   defaults (see the end of this ADR); stage-3 amendments 15–18 approved
-  2026-10-12. The lock file is on by default. The decision text below is
+  2026-10-12, amendment 19 (`PREV_SNAPSHOT`) approved 2026-10-13. The lock
+  file is on by default. The decision text below is
   reconciled with the amendments; where a sentence was superseded, it says
   so inline. SPEC 04 §12 (`LCK-1` …) states the resulting invariants.
 - Related issue: [#70](https://github.com/qdequele/ZeroDB/issues/70); retires
@@ -1110,6 +1111,21 @@ updated. New invariants for the lock file get fresh IDs.
 - Default single-process use pays one shared load and one slot store per txn
   begin, plus one uncontended CAS per write txn on Linux (a `flock` pair on
   macOS). Stage 1's bench decides whether that is acceptable.
+- Measured at stage 3 on Graviton4 (EBS io2, ext4), lock file on against the
+  release before it
+  (`benches/results/2026-10-13-multi-process-stage3-graviton.md`): +29.8 ns
+  per write commit, +6.8 ns per read txn begin/abort, +7 ns per `stat` (it
+  reads the shared `T`), +155 µs per env create, and env reopen 17 → 347 µs,
+  9.6× LMDB. With `NO_LOCK` every rung is flat.
+- The env-open cost comes from the first opener truncating the lock file and
+  rebuilding it (amendment 10): on ext4 that frees and reallocates the file's
+  blocks on every open. LMDB's first opener reinitializes its lock file in
+  place. Maintainer ruling, 2026-10-14: the cost is accepted for this stage
+  (about 0.3 ms per index open for Meilisearch). A follow-up, amendment 20,
+  will reinitialize the lock file in place, as LMDB does; it changes
+  amendment 10's crash-safety argument (truncate, then magic last), so it
+  needs its own approved amendment first (rule 5). It is tracked as a GitHub
+  issue to open.
 - The macOS POSIX-lock pitfall (§3) and Linux-only futex give two writer-lock
   implementations to test on CI.
 - A bug here corrupts data rather than crashing — the reason for stage-1-first,

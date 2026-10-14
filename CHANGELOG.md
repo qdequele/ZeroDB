@@ -104,6 +104,18 @@ retires divergence D-001 (single-process only).
 - The `crossbeam-utils` dependency: reader slots use their own padded type,
   shared with the lock file's layout.
 
+#### Performance
+
+- **The lock file has a cost**, measured on Graviton4 (EBS io2, ext4;
+  `benches/results/2026-10-13-multi-process-stage3-graviton.md`) against
+  0.2.0: +29.8 ns per write commit, +6.8 ns per read txn begin/abort, +7 ns
+  per `Env::stat`, +155 µs per env create, and env reopen 17 → 347 µs
+  (9.6× LMDB; about 0.3 ms per index open for Meilisearch). The reopen cost
+  comes from the first opener truncating the lock file and rebuilding it
+  (ADR-0023 amendment 10); reinitializing it in place, as LMDB does, is the
+  planned follow-up (ADR-0023 amendment 20, tracked as a GitHub issue to
+  open). With `NO_LOCK` (`lock_file(false)` natively) every rung is flat.
+
 #### Known limits
 
 - Using an `Env` in a child after `fork()`, and sharing an env across PID
