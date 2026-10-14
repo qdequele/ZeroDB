@@ -1155,13 +1155,14 @@ fn read_only_env_joins_the_existing_lock_file() {
 /// skipped there.
 #[test]
 fn read_only_open_in_an_unwritable_dir_fails_and_creates_nothing() {
-    use std::os::unix::fs::PermissionsExt;
-    // SAFETY: plain libc query with no memory effects.
-    if unsafe { libc::geteuid() } == 0 {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = TempDir::new();
+    // The directory this process just created is owned by its effective uid,
+    // so this tells root apart without FFI.
+    if std::fs::metadata(dir.path()).unwrap().uid() == 0 {
         println!("SKIPPED: running as root, which ignores directory modes");
         return;
     }
-    let dir = TempDir::new();
     // The environment is created without a lock file (`lock_file(false)`;
     // the default would create one).
     drop(
