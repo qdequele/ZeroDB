@@ -1293,8 +1293,8 @@ every hook; this section defines the steps and their ordering. Both write modes
   first, a waiting process wins the election and re-initializes the lock
   file from the newest meta; LMDB differs there (D-025, PROPOSED).
   A `READ_ONLY` `PREV_SNAPSHOT` open that joins a running environment also
-  fails with `EAGAIN`. LMDB admits it and its open moves the shared txnid
-  back to the older meta for every process
+  fails with `EAGAIN`. LMDB admits it, and after its open and close the
+  shared txnid is back at the older meta for every process
   (`OBS_PREV_SNAPSHOT_READ_ONLY_JOINER`); ZeroDB never moves `T` backwards
   (TXN-17), D-025 (PROPOSED).
 - **TXN-67** — **Auto-clear on first commit** (SPEC 01 §S5, milli
@@ -1336,9 +1336,14 @@ every hook; this section defines the steps and their ordering. Both write modes
   second commit rewrote: LMDB's second commit writes its root to the page
   the first commit's meta names
   (`OBS_PREV_SNAPSHOT_SECOND_COMMIT_REWRITES_FIRST_ROOT = true`), and ZeroDB
-  builds on the same older free space (inferred from that observation;
-  ADR-0023 amendment 19). Without a lock file the first commit is published at once
-  (`OBS_PREV_SNAPSHOT_NOLOCK_COMMITS`).
+  builds on the same older free space; that it reuses the same page number
+  is inferred from that observation, not observed in ZeroDB (ADR-0023
+  amendment 19). A process reports only a newer meta it found at open: a
+  meta written after its open and never published (a writer that died
+  between its meta write and its `T` store) is not reported by its
+  `Env::info` or `Env::stat` until the next commit publishes, while LMDB
+  re-reads the metas on every call. Without a lock file the first commit is
+  published at once (`OBS_PREV_SNAPSHOT_NOLOCK_COMMITS`).
 
 > **Conflicts for human review (SPEC 04):**
 > 1. **PREV_SNAPSHOT abandoned slot — largely self-resolving (TXN-67, REC-5).**

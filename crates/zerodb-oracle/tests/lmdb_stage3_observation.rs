@@ -183,10 +183,12 @@ const OBS_PREV_SNAPSHOT_SECOND_COMMIT_REWRITES_FIRST_ROOT: bool = true;
 /// process opens it with `MDB_RDONLY | MDB_PREVSNAPSHOT`. `[the joiner's
 /// "ok:<read txn id> <snapshot>", the holder's next read txn "<id>
 /// <snapshot>" after the joiner closed, the holder's next write txn id]`.
-/// The read-only joiner is not refused: it opens, reads the older
-/// generation, and its open sets the shared txnid to the older meta for
-/// every process, so the holder's readers roll back to txn 1 and its next
-/// write txn is txn 2, built on the older meta. macOS (Darwin 27.0.0) and
+/// The read-only joiner is not refused: it opens and reads the older
+/// generation, and after its open and close the shared txnid is the older
+/// meta's for every process, so the holder's readers roll back to txn 1 and
+/// its next write txn is txn 2, built on the older meta. The holder is
+/// observed only after the joiner closed, so whether the open or the close
+/// moves the shared txnid is not observed. macOS (Darwin 27.0.0) and
 /// Linux aarch64 (OrbStack container, kernel 7.2.9), 2026-10-13.
 const OBS_PREV_SNAPSHOT_READ_ONLY_JOINER: [&str; 3] = ["ok:1 prev", "1 prev", "2"];
 /// One process opens [`two_meta_generations`]'s env with `MDB_PREVSNAPSHOT`

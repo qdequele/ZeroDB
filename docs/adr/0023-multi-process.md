@@ -952,10 +952,13 @@ Terms used below:
     | A opens `MDB_RDONLY \| MDB_PREVSNAPSHOT` alone; B opens | B blocks until A closes; then as the close row | `OBS_PREV_SNAPSHOT_READ_ONLY_OPENER` |
     | `MDB_NOLOCK \| MDB_PREVSNAPSHOT`: views after two commits | the first commit at once, then the second, which keeps the first | `OBS_PREV_SNAPSHOT_NOLOCK_COMMITS = ("a_commit", "a_commit2", true)` |
     | The second commit's main root page vs the one the first commit's meta names | the same page (page 3 both times) | `OBS_PREV_SNAPSHOT_SECOND_COMMIT_REWRITES_FIRST_ROOT = true` |
-    | Another process holds the env (no flags); B opens `MDB_RDONLY \| MDB_PREVSNAPSHOT`, reads, closes; then the holder reads and writes | B opens and reads "prev"; its open moves the shared txnid back to the older meta, so the holder then reads txn 1 ("prev") and its next write txn is 2 | `OBS_PREV_SNAPSHOT_READ_ONLY_JOINER = ["ok:1 prev", "1 prev", "2"]` |
+    | Another process holds the env (no flags); B opens `MDB_RDONLY \| MDB_PREVSNAPSHOT`, reads, closes; then the holder reads and writes | B opens and reads "prev"; after B's open and close the shared txnid is back at the older meta, so the holder then reads txn 1 ("prev") and its next write txn is 2 | `OBS_PREV_SNAPSHOT_READ_ONLY_JOINER = ["ok:1 prev", "1 prev", "2"]` |
 
-    *The mechanism these observations pin.* The open keeps its exclusive
-    election lock and sets the shared txnid to the older meta's. The first
+    *The mechanism these observations pin.* The observations pin the
+    values of the shared txnid at each point; which LMDB step stores each
+    value is read from LMDB's design, not observed. The open keeps its
+    exclusive election lock and sets the shared txnid to the older meta's.
+    The first
     commit is txn `older + 1`, written to the meta slot of the abandoned
     newest generation (TXN-67). Only then does the opener downgrade its lock,
     and the downgrade sets the shared txnid from the meta chosen by the
@@ -1007,12 +1010,21 @@ Terms used below:
       while its read txns stay at `T`. `Env::txnid`, ZeroDB's own call for
       the published txnid (§4), stays at `T` in a joiner: the
       multi-process crash harness reads it as the published txnid after a
-      writer died between its meta write and its `T` store. Outside a `PREV_SNAPSHOT` window
-      the condition holds only for a joiner that opens between another
-      process's meta write and its `T` store, where LMDB's `mdb_env_info`
-      also reports the newer meta. The value is dropped once a published
-      snapshot reaches it, and an atomic flag lets the common case skip the
-      mutex that holds it.
+      writer died between its meta write and its `T` store. Outside a
+      `PREV_SNAPSHOT` window the condition holds only for a joiner that
+      opens between another process's meta write and its `T` store. That
+      LMDB's `mdb_env_info` also reports the newer meta there is inferred
+      from the `PREV_SNAPSHOT` observation (it reads the newest meta on
+      disk), not observed for this case. The value is dropped once a
+      published snapshot reaches it, and an atomic flag lets the common case
+      skip the mutex that holds it. A process keeps only the newer meta it
+      found at open: a newer meta written after it opened and never
+      published (a writer that died between its meta write and its `T`
+      store) does not show in its `info` or `stat`, which stay at `T` until
+      the next commit publishes. LMDB re-reads the metas on every call, so
+      its `mdb_env_info` would report that meta (inferred, not observed).
+      This limitation is accepted: the next writer reuses that txnid
+      (TXN-2) and overwrites that meta anyway.
     - **The opener closes or dies before its first commit.** Its record
       locks go with it, leaving the initializing magic. A waiting process
       wins the election, re-initializes the lock file (LCK-1) and seeds `T`
@@ -1033,10 +1045,11 @@ Terms used below:
       election, joins after the downgrade, and then fails with `EAGAIN`, as
       observed (`OBS_PREV_SNAPSHOT_SECOND_PREV_OPENER`). A `READ_ONLY`
       `PREV_SNAPSHOT` open that joins a running env is not refused by LMDB:
-      it opens, reads the older meta, and moves the shared txnid back to
-      the older meta for every process, whose readers then roll back and
-      whose next writer builds on the older meta
-      (`OBS_PREV_SNAPSHOT_READ_ONLY_JOINER`). ZeroDB keeps refusing it with
+      it opens and reads the older meta, and after its open and close the
+      shared txnid is back at the older meta for every process, whose
+      readers then roll back and whose next writer builds on the older meta
+      (`OBS_PREV_SNAPSHOT_READ_ONLY_JOINER`; whether its open or its close
+      moves it is not observed). ZeroDB keeps refusing it with
       `EAGAIN`: moving `T` backwards under live processes would let their
       next writer reuse pages their readers at the newer snapshot still
       read, which breaks TXN-17's monotonic `T` and the GC's reader pin.
@@ -1054,8 +1067,9 @@ Terms used below:
     commit's meta names (`OBS_PREV_SNAPSHOT_SECOND_COMMIT_REWRITES_FIRST_ROOT
     = true`). ZeroDB's second commit builds on the same older free space by
     the same mechanism; that it reuses the same page number is inferred from
-    that observation, not observed in ZeroDB. milli's `Index::rollback` commits once and closes
-    the environment, so it never enters the window.
+    that observation, not observed in ZeroDB. milli's `Index::rollback`
+    commits once and closes the environment, so it never enters the
+    window.
 
     No lock-file or data-file format change. Environments not opened with
     `PREV_SNAPSHOT` are unaffected. SPEC 01 §S5, SPEC 04 TXN-66, TXN-67,
