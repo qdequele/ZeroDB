@@ -808,6 +808,13 @@ impl EnvInner {
     /// `crate::readers` for the TXN-17/19/20 StoreLoad pairing argument. In a
     /// lock-file environment it is the shared published txnid `T`, so it
     /// includes other processes' commits (ADR-0023 §4).
+    ///
+    /// One exception (ADR-0023 amendment 19, SPEC 04 TXN-67): in a
+    /// `PREV_SNAPSHOT` opener with a lock file, between its first and second
+    /// commit, it is the first commit's txnid. That commit is durable but not
+    /// published, so no read txn can pin it: read txns still begin at `T`. In
+    /// a process that joined, it stays `T` even when [`Env::info`] reports a
+    /// newer meta found on disk at open.
     #[must_use]
     pub fn txnid(&self) -> u64 {
         let t = match &self.shared {
@@ -1787,6 +1794,17 @@ impl Env {
     /// this process's own cached snapshot ([`EnvInner::snapshot`]) rather than
     /// surfacing the error, which can under-report a page/txnid that another
     /// process has already published. That fallback has no dedicated test.
+    ///
+    /// It can also report a commit that no read txn sees yet, as LMDB's
+    /// `mdb_env_info` reports the newest meta on disk (ADR-0023 amendment 19,
+    /// SPEC 04 TXN-67): a `PREV_SNAPSHOT` opener's unpublished first commit,
+    /// and, in a process that joined, a meta newer than `T` that it found on
+    /// disk at open (such an opener's first commit, or another process's
+    /// commit between its meta write and its `T` store). Either is reported
+    /// until `T` reaches it, and `last_txnid` can then exceed
+    /// [`Env::txnid`]. The metas are not re-read per call, so a newer meta
+    /// written after this process opened and never published (a writer that
+    /// died before storing `T`) is not reported; LMDB's would report it.
     #[must_use]
     pub fn info(&self) -> EnvInfo {
         let snap = self
@@ -1817,6 +1835,11 @@ impl Env {
     /// the same way [`Env::info`] does, so another process's commit is visible
     /// as soon as it publishes (`OBS_STAT_SEES_OTHER_COMMIT`), with the same
     /// fall back to the cached snapshot if the read at `T` fails.
+    ///
+    /// Like [`Env::info`], it reports an unpublished `PREV_SNAPSHOT` first
+    /// commit, or a joiner's newer meta found on disk at open, until `T`
+    /// reaches it, so its counts can describe a commit no read txn sees yet
+    /// (ADR-0023 amendment 19, SPEC 04 TXN-67).
     #[must_use]
     pub fn stat(&self) -> EnvStat {
         let snap = self
@@ -1928,7 +1951,14 @@ impl Env {
         self.inner.path()
     }
 
-    /// The txnid of the live snapshot.
+    /// The txnid of the live snapshot: in a lock-file environment, the
+    /// shared published txnid `T`, which includes other processes' commits.
+    ///
+    /// In a `PREV_SNAPSHOT` opener with a lock file, between its first and
+    /// second commit, it is the first commit's txnid, which is durable but
+    /// not published: read txns still pin the older snapshot (ADR-0023
+    /// amendment 19, SPEC 04 TXN-67). In a process that joined, it stays at
+    /// `T` even while [`Env::info`] and [`Env::stat`] report a newer meta.
     #[must_use]
     pub fn txnid(&self) -> u64 {
         self.inner.txnid()
