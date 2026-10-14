@@ -716,6 +716,12 @@ macro_rules! bench_backend {
         if crate::backend::bench_knob("ZERODB_BENCH_SEQUENTIAL_WRITES") {
             $opts.sequential_writes(true);
         }
+        // ADR-0023 bench axis: `ZERODB_BENCH_LOCK_FILE=1` opens every zerodb
+        // env with the multi-process lock file, to measure its single-process
+        // cost against the default. Off unless set.
+        if std::env::var("ZERODB_BENCH_LOCK_FILE").as_deref() == Ok("1") {
+            $opts.lock_file(true);
+        }
     };
     (@setpage $opts:ident, $page:ident, noset) => {
         // LMDB derives its page size from the OS; nothing to set.

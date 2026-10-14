@@ -23,6 +23,7 @@ loom:
 # the normal `cargo test` suite.
 stress:
     ZERODB_STRESS_SECS=180 cargo test -p zerodb --test reader_stress -- --nocapture stress_
+    ZERODB_STRESS_SECS=180 cargo test -p zerodb --test multi_process_stress -- --nocapture stress_
 
 # Differential fuzz gate for every change (10 min diff_ops + 2 min hostile-image
 # open; cargo-fuzz needs nightly)
@@ -39,6 +40,12 @@ fuzz-long:
 # Crash-consistency smoke
 crash-test-quick:
     cargo run -p zerodb-oracle --bin crash-harness -- --cycles 200
+    cargo run -p zerodb-oracle --bin crash-harness -- --mechanism mp --cycles 50
+
+# Multi-process crash cycles: a writer killed mid-commit while a reader
+# process stays live (ADR-0023).
+crash-test-mp CYCLES='500':
+    cargo run -p zerodb-oracle --bin crash-harness -- --mechanism mp --cycles {{CYCLES}}
 
 crash-test-full:
     cargo run -p zerodb-oracle --bin crash-harness -- --cycles 10000

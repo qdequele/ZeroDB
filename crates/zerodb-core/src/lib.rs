@@ -40,6 +40,7 @@ pub mod page;
 pub(crate) mod readers;
 pub mod rotxn;
 pub mod rwtxn;
+pub mod shared;
 pub(crate) mod stamps;
 pub(crate) mod sync;
 

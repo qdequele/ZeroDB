@@ -742,12 +742,18 @@ impl Env {
             return Err(poisoned_error());
         }
         let mut guard = inner.lock_writer();
+        // In a lock-file environment, also the cross-process writer lock
+        // (ADR-0023 §2); a no-op otherwise.
+        inner.lock_writer_shared(&mut guard)?;
         // Recheck under the lock: a concurrent commit may have failed while we
         // blocked on the mutex.
         if inner.is_poisoned() {
             return Err(poisoned_error());
         }
-        let base = inner.snapshot();
+        // The latest published snapshot, which in a lock-file env may be
+        // another process's commit (ADR-0023 §4): never the process-local
+        // cell. Without a lock file this is the cell, as before.
+        let base = inner.current_snapshot()?;
         // ADR-0021 (SPEC 04 §6.4 TXN-45b): under WRITE_MAP, with a backing
         // that brokers map slices, dirty pages are realized **in the map** at
         // their freshly-COW'd pgnos — no heap staging, no commit write-back.

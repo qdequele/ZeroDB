@@ -55,6 +55,26 @@ pub trait Backing: Send + Sync {
     /// [`Env::real_disk_size`] (SPEC 00 row 18).
     fn real_disk_size(&self) -> std::io::Result<u64>;
 
+    /// Copy meta slot `slot` (0 or 1) into `buf` (`psize` bytes). Readers of
+    /// a lock-file environment (ADR-0023 §4) decode metas from this copy,
+    /// never from a borrowed map slice: another process may be rewriting the
+    /// slot, and a torn copy is caught by its CRC. The default copies from
+    /// [`Backing::bytes`] (heap test backings); file backings use `pread`.
+    ///
+    /// # Errors
+    ///
+    /// The read error, or `UnexpectedEof` if the slot is outside the backing.
+    fn read_meta_copy(&self, slot: u64, psize: u32, buf: &mut [u8]) -> std::io::Result<()> {
+        let ps = psize as usize;
+        let start = slot as usize * ps;
+        let src = self
+            .bytes()
+            .get(start..start + ps)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+        buf[..ps].copy_from_slice(src);
+        Ok(())
+    }
+
     /// `dup()` the backing data-file descriptor (SPEC 00 row 22,
     /// [`Env::try_clone_inner_file`]). Requires the env to be a single regular
     /// data file (SPEC 02 §8).
@@ -302,6 +322,10 @@ pub(crate) struct WriterGuard<'env> {
     /// The recycled frames: taken from the slot at acquire, handed to the
     /// txn's dirty store, given back at txn end, stored at release.
     frames: Vec<Box<[u8]>>,
+    /// The cross-process writer lock, when this guard also holds it
+    /// (ADR-0023 §2; set by [`EnvInner::lock_writer_shared`]). Released
+    /// before the in-process slot on drop.
+    shared: Option<&'env dyn crate::shared::SharedRegion>,
 }
 
 impl WriterGuard<'_> {
@@ -351,12 +375,22 @@ impl WriterLock {
         }
         g.occupied = true;
         let frames = std::mem::take(&mut g.frames.0);
-        WriterGuard { lock: self, frames }
+        WriterGuard {
+            lock: self,
+            frames,
+            shared: None,
+        }
     }
 }
 
 impl Drop for WriterGuard<'_> {
     fn drop(&mut self) {
+        // Cross-process lock first, then the in-process slot: a thread of this
+        // process woken by the slot release then competes fairly with other
+        // processes for the shared lock.
+        if let Some(region) = self.shared.take() {
+            region.unlock_writer();
+        }
         let mut g = self
             .lock
             .occupied
@@ -608,6 +642,9 @@ pub struct EnvInner {
     /// main DB, slot `1 + dbi` a named DB. [`SEQ_FOLLOW`] = the env default,
     /// [`SEQ_OFF`] / [`SEQ_ON`] = forced. Runtime state, never persisted.
     sequential_overrides: Box<[AtomicU8]>,
+    /// The cross-process region when opened with a lock file (ADR-0023);
+    /// `None` keeps the single-process path unchanged.
+    shared: Option<Arc<dyn crate::shared::SharedRegion>>,
 }
 
 /// [`EnvInner`] sequential-writes override: follow the env default.
@@ -645,10 +682,16 @@ impl EnvInner {
 
     /// The txnid of the current live snapshot (the commit point; advances on
     /// every commit, SPEC 04 TXN-19). SeqCst load inside the cell — see
-    /// `crate::readers` for the TXN-17/19/20 StoreLoad pairing argument.
+    /// `crate::readers` for the TXN-17/19/20 StoreLoad pairing argument. In a
+    /// lock-file environment it is the shared published txnid `T`, so it
+    /// includes other processes' commits (ADR-0023 §4).
     #[must_use]
     pub fn txnid(&self) -> u64 {
-        self.snap_cell.commit_point()
+        match &self.shared {
+            // SeqCst: the same total order as the T stores (TXN-17/19).
+            Some(region) => region.published_txnid().load(Ordering::SeqCst),
+            None => self.snap_cell.commit_point(),
+        }
     }
 
     /// The meta selected **at open** (creation-time geometry). Live roots must
@@ -673,8 +716,22 @@ impl EnvInner {
     /// commit point `SeqCst`. Object-before-counter guarantees a reader that
     /// sees the new counter can load the matching (or newer) roots. See
     /// `crate::readers::SnapshotCell::publish` for the ordering comments.
+    ///
+    /// In a lock-file environment the shared published txnid `T` is stored
+    /// last, which is the moment other processes begin to see the commit
+    /// (ADR-0023 §4).
     pub(crate) fn publish_snapshot(&self, snap: Arc<Snapshot>) {
+        let txnid = snap.txnid;
         self.snap_cell.publish(snap);
+        if let Some(region) = &self.shared {
+            // ADR-0023 §4: T is stored after the meta write (and its fsync in
+            // the durable modes, C4/C5), and after the cache swap (TXN-19
+            // object-before-counter). SeqCst pairs with every reader's
+            // publish-and-verify and with the writer's SeqCst slot scan,
+            // across processes. Only the cross-process writer-lock holder
+            // advances T.
+            region.published_txnid().store(txnid, Ordering::SeqCst);
+        }
     }
 
     /// Acquire the single-writer lock (SPEC 04 TXN-6/7): blocks until the
@@ -684,6 +741,81 @@ impl EnvInner {
     /// [`WriterLock::acquire`].
     pub(crate) fn lock_writer(&self) -> WriterGuard<'_> {
         self.write_mutex.acquire()
+    }
+
+    /// Take the cross-process writer lock on top of the in-process one
+    /// (ADR-0023 §2); a no-op without a lock file. The guard releases it on
+    /// drop, before the in-process slot. A writer that took the lock over
+    /// from a dead owner then frees dead processes' reader slots (see
+    /// [`EnvInner::lock_writer_region`]).
+    ///
+    /// # Errors
+    ///
+    /// The I/O error of the lock call, or of a liveness probe during the
+    /// takeover reap. After a failed lock call the guard holds only the
+    /// in-process lock. After a failed takeover reap it holds both locks, and
+    /// dropping it (as the failing write-txn begin does) releases both, as
+    /// LMDB's lock recovery releases the writer mutex when its reader check
+    /// fails.
+    #[inline]
+    pub(crate) fn lock_writer_shared<'a>(
+        &'a self,
+        guard: &mut WriterGuard<'a>,
+    ) -> Result<(), Error> {
+        match &self.shared {
+            None => Ok(()),
+            Some(region) => self.lock_writer_region(region.as_ref(), guard),
+        }
+    }
+
+    /// The lock-file arm of [`EnvInner::lock_writer_shared`]. Out of line so
+    /// the default (no lock file) write-txn path stays as small as it was
+    /// before lock files existed.
+    ///
+    /// A writer that took the lock over from a dead owner then frees dead
+    /// processes' reader slots, as LMDB's writer does when it recovers the
+    /// lock from a dead owner on Linux (ADR-0023 amendment 12).
+    ///
+    /// # Errors
+    ///
+    /// The I/O error of the lock call, or of a liveness probe during the
+    /// takeover reap. In the second case the guard already records the
+    /// cross-process lock, so dropping it (as the failing write txn does)
+    /// releases the lock, as LMDB's lock recovery releases the writer mutex
+    /// when its reader check fails.
+    #[inline(never)]
+    fn lock_writer_region<'a>(
+        &'a self,
+        region: &'a dyn crate::shared::SharedRegion,
+        guard: &mut WriterGuard<'a>,
+    ) -> Result<(), Error> {
+        let took_over = region.lock_writer().map_err(Error::Io)?;
+        guard.shared = Some(region);
+        if took_over {
+            self.clear_stale_readers()?;
+        }
+        Ok(())
+    }
+
+    /// Free the reader slots of dead processes (`mdb_reader_check`,
+    /// ADR-0023 §3). Returns the number of slots freed (the fork's
+    /// `mdb_reader_check` also counts slots, ADR-0023 amendment 12); always 0
+    /// without a lock file, where every slot belongs to this process.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error of a liveness probe. Nothing has been freed then: every
+    /// probe runs before any slot is touched.
+    pub(crate) fn clear_stale_readers(&self) -> Result<usize, Error> {
+        #[cfg(not(loom))]
+        if let Some(region) = &self.shared {
+            let n = self
+                .reader_table
+                .reap_dead(region.pid(), |p| region.is_alive(p))
+                .map_err(Error::Io)?;
+            return Ok(n as usize);
+        }
+        Ok(0)
     }
 
     /// Whether a failed commit fsync poisoned the env (SPEC 06 REC-13).
@@ -732,13 +864,114 @@ impl EnvInner {
     /// Returns the pinned snapshot and the owned slot index; the caller
     /// (`RoTxn`) releases the slot at drop via [`EnvInner::release_reader`].
     ///
+    /// In a lock-file environment the commit point is the shared published
+    /// txnid `T` and the snapshot comes from [`EnvInner::snapshot_at`]
+    /// (ADR-0023 §4).
+    ///
     /// # Errors
     ///
-    /// [`MdbError::ReadersFull`] when every slot is occupied (TXN-16).
+    /// [`MdbError::ReadersFull`] when every slot is occupied (TXN-16). In a
+    /// lock-file environment also [`MdbError::Invalid`] when the snapshot at
+    /// `T` cannot be decoded or lies outside this process's map or the file.
     pub(crate) fn pin_reader(&self) -> Result<(Arc<Snapshot>, u32), Error> {
+        // loom builds have no shared reader table (`ReaderTable::new_shared`
+        // is not compiled), and the open path refuses a region there.
+        #[cfg(not(loom))]
+        if let Some(region) = &self.shared {
+            return self.pin_shared(region.as_ref());
+        }
         self.snap_cell
             .pin(&self.reader_table)
             .ok_or(Error::Mdb(MdbError::ReadersFull))
+    }
+
+    /// The lock-file arm of [`EnvInner::pin_reader`]: claim a shared slot,
+    /// run TXN-17 against `T`, then resolve the snapshot for the verified
+    /// txnid. The slot keeps the verified pin while the meta is read, so a
+    /// retry after the slot moved on is conservative (GC holds back, TXN-20).
+    #[cfg(not(loom))]
+    fn pin_shared(
+        &self,
+        region: &dyn crate::shared::SharedRegion,
+    ) -> Result<(Arc<Snapshot>, u32), Error> {
+        let slot = self
+            .reader_table
+            .claim()
+            .ok_or(Error::Mdb(MdbError::ReadersFull))?;
+        // TXN-17 publish-and-verify against the shared T, then the snapshot
+        // for the verified txnid; `None` means meta slot `t & 1` moved on.
+        match self
+            .reader_table
+            .pin_against(slot, region.published_txnid(), META_RETRY_LIMIT, |t| {
+                self.snapshot_at(t)
+            }) {
+            Ok(Some(snap)) => Ok((snap, slot)),
+            Ok(None) => {
+                self.reader_table.release(slot);
+                Err(Error::Mdb(MdbError::Invalid))
+            }
+            Err(e) => {
+                self.reader_table.release(slot);
+                Err(e)
+            }
+        }
+    }
+
+    /// The snapshot for published txnid `t`: the cached one when it matches
+    /// (the single-process fast path), else decoded from the data file and
+    /// cached. `None` when meta slot `t & 1` has moved on or was torn.
+    ///
+    /// The decoded snapshot is checked against this process's map and the
+    /// current file length before it is used or cached (SPEC 06 REC-1a). The
+    /// cache hit skips both checks: a cached snapshot passed them already.
+    fn snapshot_at(&self, t: u64) -> Result<Option<Arc<Snapshot>>, Error> {
+        let cached = self.snap_cell.clone_snapshot();
+        if cached.txnid == t {
+            return Ok(Some(cached));
+        }
+        let backing = self.backing_ref();
+        let Some(snap) = read_snapshot_at(backing, self.page_size, t)? else {
+            return Ok(None);
+        };
+        check_snapshot_backed(backing, self.page_size, &snap)?;
+        let snap = Arc::new(snap);
+        self.snap_cell.install_if_newer(Arc::clone(&snap));
+        Ok(Some(snap))
+    }
+
+    /// The latest published snapshot. In a lock-file environment it follows
+    /// the shared `T`, so it includes other processes' commits (ADR-0023 §4);
+    /// otherwise it is [`EnvInner::snapshot`]. The writer's base.
+    ///
+    /// # Errors
+    ///
+    /// In a lock-file environment, [`MdbError::Invalid`] when the snapshot at
+    /// `T` cannot be decoded or lies outside this process's map or the file.
+    #[inline]
+    pub(crate) fn current_snapshot(&self) -> Result<Arc<Snapshot>, Error> {
+        match &self.shared {
+            None => Ok(self.snapshot()),
+            Some(region) => self.current_snapshot_shared(region.as_ref()),
+        }
+    }
+
+    /// The lock-file arm of [`EnvInner::current_snapshot`]: the snapshot at
+    /// the shared `T`. Out of line so the default write-txn path stays small.
+    #[inline(never)]
+    fn current_snapshot_shared(
+        &self,
+        region: &dyn crate::shared::SharedRegion,
+    ) -> Result<Arc<Snapshot>, Error> {
+        for _ in 0..META_RETRY_LIMIT {
+            // SeqCst: pairs with the committing writer's SeqCst store of T
+            // (the same total order as TXN-17/19).
+            let t = region.published_txnid().load(Ordering::SeqCst);
+            if let Some(s) = self.snapshot_at(t)? {
+                return Ok(s);
+            }
+            std::thread::yield_now();
+        }
+        Err(Error::Mdb(MdbError::Invalid))
     }
 
     /// Release a reader-table slot (SPEC 04 TXN-18a: `Release` store of
@@ -804,9 +1037,8 @@ impl EnvInner {
         self.comparators.any_custom()
     }
 
-    /// Per-slot reader introspection — `mdb_reader_list` in a single-process
-    /// world. See [`Env::reader_list`] for the full contract;
-    /// this is the raw form.
+    /// Per-slot reader introspection — `mdb_reader_list`. See
+    /// [`Env::reader_list`] for the full contract; this is the raw form.
     #[must_use]
     pub fn reader_list(&self) -> Vec<ReaderEntry> {
         // Sample the commit point *once* so every age in the returned vector
@@ -816,9 +1048,10 @@ impl EnvInner {
         self.reader_table
             .list()
             .into_iter()
-            .map(|(slot, txnid)| ReaderEntry {
+            .map(|(slot, txnid, pid)| ReaderEntry {
                 slot,
                 txnid,
+                pid,
                 // `saturating_sub`, not a subtraction: a reader can publish a
                 // pin *newer* than the commit point we sampled a moment ago
                 // (it read a commit that landed in between), which would
@@ -1109,6 +1342,15 @@ impl Drop for EnvInner {
         // (the last `Arc` reference is gone), so taking the backing here races
         // with no reader.
         drop(self.backing.take());
+        // Release the cross-process region (ADR-0023) before the close event
+        // too: dropping the last reference closes the lock file, which
+        // releases its record locks and this process's claim on its path. A
+        // waiter woken by the event may reopen at once, and would otherwise
+        // find the lock file still open (`EnvAlreadyOpened`). The reader table
+        // holds the only other reference; write txns borrow the region and
+        // cannot outlive this `EnvInner`.
+        self.reader_table.release_region();
+        drop(self.shared.take());
         self.closing.signal();
     }
 }
@@ -1206,10 +1448,11 @@ impl Env {
     /// transaction, in slot order. Free slots are omitted, exactly as
     /// `mdb_reader_list` skips slots with `mr_pid == 0`: presence in the
     /// returned vector *is* the liveness answer, and `max_readers() -
-    /// reader_list().len()` is the number of free slots. ZeroDB being
-    /// single-process, every listed reader belongs to this process, so unlike
-    /// LMDB there is no pid/tid column to report — a slot index, the pinned
-    /// snapshot txnid, and its age are the whole truth.
+    /// reader_list().len()` is the number of free slots. Each entry gives the
+    /// slot index, the pinned snapshot txnid, its age, and, in an environment
+    /// opened with a lock file, the owner's PID (LMDB's `pid` column). There
+    /// is no thread column: a `RoTxn` is `Send`, so its thread is not a
+    /// stable property.
     ///
     /// # This is a sample, not a snapshot
     ///
@@ -1231,8 +1474,7 @@ impl Env {
     }
 
     /// Reclaim reader slots abandoned by dead processes —
-    /// `mdb_reader_check`. **Always returns 0, and that is the correct
-    /// answer**, not a stub.
+    /// `mdb_reader_check`. Returns the number of slots freed.
     ///
     /// LMDB's reader table lives in a shared `lock.mdb` mapped by every
     /// process that opens the env, so a process that dies without ending its
@@ -1240,25 +1482,41 @@ impl Env {
     /// `mdb_reader_check` exists to scan those slots and free the ones whose
     /// `mr_pid` no longer names a live process.
     ///
-    /// ZeroDB is **single-process** (see docs/DIVERGENCES.md): the reader table is plain process
-    /// memory with no lock file and no cross-process sharing. Every slot is
-    /// owned by a `RoTxn` in *this* address space, and a `RoTxn` releases its
-    /// slot in `Drop` — including while unwinding from a panic. The only way
-    /// to leak a slot is to `mem::forget` a live `RoTxn`, which is exactly as
+    /// By default ZeroDB is **single-process** (see docs/DIVERGENCES.md): the
+    /// reader table is plain process memory, every slot is owned by a
+    /// `RoTxn` in *this* address space, and a `RoTxn` releases its slot in
+    /// `Drop` — including while unwinding from a panic. The only way to leak
+    /// a slot is to `mem::forget` a live `RoTxn`, which is exactly as
     /// unrecoverable as leaking any other resource and is not what
     /// `mdb_reader_check` is for. If this process dies, the table dies with
-    /// it. **There is therefore no such thing as a stale reader here, and a
-    /// nonzero return would be a lie.**
+    /// it, so this path always returns `0`, which is the correct answer, not
+    /// a stub.
     ///
-    /// It is kept (rather than omitted) so that code written against heed's
-    /// `Env::clear_stale_readers` compiles and behaves sensibly on ZeroDB: a
-    /// periodic janitor call is a no-op instead of a compile error.
+    /// With the public `lock_file` option on (the `zerodb`/`heed-zerodb`
+    /// `EnvOpenOptions::lock_file`, ADR-0023), the reader table is shared
+    /// across processes, and a process that dies inside a read txn leaves its
+    /// slot pinned. This method then probes the owner of every occupied slot
+    /// and frees the slots of processes that no longer have the environment
+    /// open (ADR-0023 §3). Like `mdb_reader_check`, it counts **slots**, not
+    /// processes: one dead process that held two slots counts 2.
+    ///
+    /// As in LMDB, the engine reaps on its own in only one other place: a
+    /// writer that takes over the writer lock from a dead owner (Linux)
+    /// frees dead readers' slots too. Beginning a read txn, committing, and
+    /// joining an environment that another process has open never reap
+    /// another process's slots, and a full reader table fails with
+    /// `ReadersFull` without reaping; call this method to recover the slots.
+    /// (The first process to open the environment wipes the whole table, as
+    /// no other process has it open; and a joining process frees the slots
+    /// left under its own PID by a dead predecessor, since no probe can tell
+    /// those from its own, ADR-0023 amendment 9.)
     ///
     /// # Errors
     ///
-    /// Never. The [`Result`] exists for heed shape.
+    /// The I/O error of a liveness probe. Nothing has been freed then: every
+    /// probe runs before any slot is touched.
     pub fn clear_stale_readers(&self) -> Result<usize, Error> {
-        Ok(0)
+        self.inner.clear_stale_readers()
     }
 
     /// Whether any custom key comparator is registered on this environment
@@ -1416,14 +1674,14 @@ pub struct EnvInfo {
 }
 
 /// One occupied reader-table slot, as reported by [`Env::reader_list`]
-/// (the single-process analogue of one `MDB_reader` row in
-/// `mdb_reader_list` output).
+/// (one `MDB_reader` row in `mdb_reader_list` output).
 ///
 /// A **ZeroDB extension**: heed exposes no reader introspection whatsoever, so
-/// there is no signature to mirror. Compared to LMDB's row there is no `pid`
-/// or `thread` column — ZeroDB is single-process, so every reader is in this process, and a
-/// `RoTxn` is `Send`, so the owning thread is not a stable property worth
-/// reporting.
+/// there is no signature to mirror. Compared to LMDB's row there is no
+/// `thread` column, since a `RoTxn` is `Send` and the owning thread is not a
+/// stable property worth reporting. The `pid` column is reported in an
+/// environment opened with a lock file ([`ReaderEntry::pid`]); without one
+/// every reader is in this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReaderEntry {
     /// The slot's index in the reader table, in `0..max_readers`. Stable for
@@ -1447,6 +1705,11 @@ pub struct ReaderEntry {
     /// the whole [`Env::reader_list`] call, and saturates at 0 rather than
     /// underflowing if a reader pinned a commit that landed after that sample.
     pub age: Option<u64>,
+    /// The PID of the process that owns the slot, in an environment opened
+    /// with a lock file (ADR-0023 amendment 13). `None` without a lock file
+    /// (every reader is in this process) and for a slot being claimed or
+    /// released. LMDB's `mdb_reader_list` prints the same column.
+    pub pid: Option<u32>,
 }
 
 /// Environment-level statistics (`mdb_env_stat` / `MDB_stat` over the **main**
@@ -1510,8 +1773,8 @@ impl EnvClosingEvent {
 // ---------------------------------------------------------------------------
 
 /// Upper bound accepted for `max_readers` (SPEC 00 row 5, SPEC 04 TXN-14).
-/// The reader table eagerly allocates one cache-padded slot (128 bytes on
-/// aarch64) per reader — 1 Mi slots is 128 MiB, already far beyond any real
+/// The reader table eagerly allocates one cache-padded slot (128 bytes,
+/// `ReaderSlot`) per reader — 1 Mi slots is 128 MiB, already far beyond any real
 /// configuration; anything larger is treated as a caller bug
 /// (`Io(InvalidInput)`) rather than an allocation-failure abort.
 pub const MAX_READERS_LIMIT: u32 = 1 << 20;
@@ -1520,6 +1783,36 @@ pub const MAX_READERS_LIMIT: u32 = 1 << 20;
 /// [`MAX_READERS_LIMIT`] (the comparator registry allocates `max_dbs` slots
 /// eagerly).
 pub const MAX_DBS_LIMIT: u32 = 1 << 20;
+
+/// Rejects a `max_readers` or `max_dbs` above its limit with
+/// `Io(InvalidInput)` (see docs/DIVERGENCES.md).
+///
+/// Both values size eager allocations: `max_readers` reader slots (in this
+/// process, or in the lock file of a lock-file environment, ADR-0023) and
+/// `max_dbs` comparator `OnceLock`s. An unbounded value, e.g.
+/// `max_readers(u32::MAX)`, would be an allocation-failure abort or a
+/// 512 GiB lock file, not an error. The bounds (SPEC 00 rows 4/5, SPEC 04
+/// TXN-14) are far above any real deployment (Meilisearch's ceiling is 1024
+/// readers / ~30 dbs). The engine calls this before it creates any file, and
+/// the core open functions call it again for callers that build a
+/// backing themselves.
+pub fn check_open_limits(max_readers: u32, max_dbs: u32) -> Result<(), Error> {
+    if max_readers > MAX_READERS_LIMIT {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "max_readers ({max_readers}) exceeds the supported maximum {MAX_READERS_LIMIT}"
+            ),
+        )));
+    }
+    if max_dbs > MAX_DBS_LIMIT {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("max_dbs ({max_dbs}) exceeds the supported maximum {MAX_DBS_LIMIT}"),
+        )));
+    }
+    Ok(())
+}
 
 /// Open an env over an already-constructed [`Backing`] (SPEC 02 §3.2, SPEC 06
 /// §1). This is the I/O-free core of open: the caller (`zerodb-io` / the public
@@ -1615,26 +1908,67 @@ pub fn open_with_backing_policy(
     sequential_writes: bool,
     dirty_limit: Option<u64>,
 ) -> Result<Env, Error> {
-    // Open-time argument rejection (`Io(InvalidInput)`, see docs/DIVERGENCES.md): both
-    // values size eager allocations (`max_readers` cache-padded reader slots,
-    // `max_dbs` comparator `OnceLock`s), so an unbounded value — e.g.
-    // `max_readers(u32::MAX)` — is an allocation-failure abort, not an error.
-    // The bounds (SPEC 00 rows 4/5, SPEC 04 TXN-14) are far above any real
-    // deployment (Meilisearch's ceiling is 1024 readers / ~30 dbs).
-    if max_readers > MAX_READERS_LIMIT {
+    open_with_backing_shared(
+        canonical_path,
+        backing,
+        page_size,
+        map_size,
+        prev_snapshot,
+        max_dbs,
+        max_readers,
+        durability,
+        file_trust,
+        sequential_writes,
+        dirty_limit,
+        None,
+    )
+}
+
+/// [`open_with_backing_policy`] for an environment coordinated through a
+/// cross-process lock-file region (ADR-0023). `shared = None` is exactly
+/// [`open_with_backing_policy`].
+///
+/// With a region:
+/// - the reader slots live in the region (its slot count replaces
+///   `max_readers`);
+/// - the region's initializer (no other process had the environment open)
+///   seeds its snapshot from the selected meta, as a single-process open
+///   does, and publishes that txnid as `T`;
+/// - a joining process seeds its snapshot from the meta slot holding the
+///   published `T`, never from the newest valid meta (ADR-0023 amendment 5);
+/// - pins, the writer's base and [`EnvInner::txnid`] follow `T`, and the
+///   writer also takes the region's cross-process lock.
+///
+/// # Errors
+///
+/// As [`open_with_backing`]; with a region, also [`MdbError::Invalid`] when
+/// the meta slot holding `T` never decodes, or its snapshot lies outside this
+/// process's map or the file.
+#[allow(clippy::too_many_arguments)]
+pub fn open_with_backing_shared(
+    canonical_path: PathBuf,
+    backing: Box<dyn Backing>,
+    page_size: u32,
+    map_size: u64,
+    prev_snapshot: bool,
+    max_dbs: u32,
+    max_readers: u32,
+    durability: DurabilityFlags,
+    file_trust: FileTrust,
+    sequential_writes: bool,
+    dirty_limit: Option<u64>,
+    shared: Option<Arc<dyn crate::shared::SharedRegion>>,
+) -> Result<Env, Error> {
+    // loom builds model the in-process reader protocol only; the shared reader
+    // table is not compiled there, so a region cannot be honored.
+    #[cfg(loom)]
+    if shared.is_some() {
         return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "max_readers ({max_readers}) exceeds the supported maximum {MAX_READERS_LIMIT}"
-            ),
+            std::io::ErrorKind::Unsupported,
+            "lock-file environments are not available under loom",
         )));
     }
-    if max_dbs > MAX_DBS_LIMIT {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!("max_dbs ({max_dbs}) exceeds the supported maximum {MAX_DBS_LIMIT}"),
-        )));
-    }
+    check_open_limits(max_readers, max_dbs)?;
     // Validate the two meta slots from the mapped bytes (SPEC 02 §3.2). A
     // decode error here (bad page size / truncated buffer) means the file is not
     // a usable env → Invalid.
@@ -1703,6 +2037,39 @@ pub fn open_with_backing_policy(
         }
     }
 
+    let seed = match &shared {
+        // A joining process seeds from the published txnid, never from the
+        // newest valid meta: that meta may belong to a commit still in flight
+        // or one that failed, whose txnid the next writer reuses (TXN-2;
+        // ADR-0023 amendment 5).
+        Some(region) if !region.is_initializer() => {
+            seed_from_published(backing.as_ref(), page_size, region.as_ref())?
+        }
+        _ => Snapshot::from_meta(&meta, annex),
+    };
+    let reader_table = match &shared {
+        // In shared mode the slot count comes from the region (fixed by the
+        // first opener); the lock-file layer validates it against
+        // `max_readers`.
+        #[cfg(not(loom))]
+        Some(region) => ReaderTable::new_shared(Arc::clone(region)),
+        // The reader table is sized once at open and never resized (TXN-14).
+        _ => ReaderTable::new(max_readers),
+    };
+    // A joining process frees the slots that carry its own PID (ADR-0023
+    // amendment 9): a dead process that had the same PID left them, and no
+    // liveness probe can tell them apart from this process's own slots. None
+    // of them is live: this runs before this process's first claim, and the
+    // lock-file layer refuses a second open of the same lock file within one
+    // process, so no other environment handle here shares these slots. An
+    // initializer has already wiped every slot.
+    #[cfg(not(loom))]
+    if let Some(region) = &shared {
+        if !region.is_initializer() {
+            reader_table.reap_own_stale(region.pid());
+        }
+    }
+
     // Register under the process registry (SPEC 04 TXN-51). Hold the lock across
     // check + insert so two concurrent opens of one path cannot both succeed.
     let id = next_env_id();
@@ -1714,13 +2081,14 @@ pub fn open_with_backing_policy(
         page_size,
         map_size,
         // Seed the published-snapshot cell from the durable meta — the one
-        // and only time a meta *page* is read for roots (SPEC 04 TXN-18).
-        snap_cell: SnapshotCell::new(Arc::new(Snapshot::from_meta(&meta, annex))),
+        // and only time a meta *page* is read for roots (SPEC 04 TXN-18). A
+        // lock-file environment re-reads metas when another process commits
+        // (ADR-0023 §4, `EnvInner::snapshot_at`).
+        snap_cell: SnapshotCell::new(Arc::new(seed)),
         write_mutex: WriterLock::new(),
         commit_hook: Mutex::new(None),
         poisoned: AtomicBool::new(false),
-        // The reader table is sized once at open and never resized (TXN-14).
-        reader_table: ReaderTable::new(max_readers),
+        reader_table,
         named: Mutex::new(NamedRegistry::new(max_dbs)),
         durability,
         comparators: ComparatorRegistry::new(max_dbs),
@@ -1733,7 +2101,18 @@ pub fn open_with_backing_policy(
         meta,
         prev_snapshot,
         closing,
+        shared: shared.clone(),
     });
+
+    if let Some(region) = &shared {
+        if region.is_initializer() {
+            // SeqCst: the same total order as every later T store and
+            // every reader's publish-and-verify (SPEC 04 TXN-17/19).
+            region
+                .published_txnid()
+                .store(inner.snapshot().txnid, Ordering::SeqCst);
+        }
+    }
 
     {
         let mut reg = registry().lock().expect("registry mutex poisoned");
@@ -1769,6 +2148,96 @@ fn read_slot(
     // is impossible here because `page_size` is validated by the caller, but map
     // any such error to Invalid defensively.
     MetaPage::validate(&bytes[base..end], page_size).map_err(|_| Error::Mdb(MdbError::Invalid))
+}
+
+/// The snapshot committed as txnid `t`, decoded from a copy of meta slot
+/// `t & 1` (ADR-0023 §4). `Ok(None)` means the slot no longer holds `t`: it
+/// was overwritten by `t + 2`, or the copy was torn by a concurrent rewrite.
+/// The caller re-reads the published txnid and retries. Geometry is checked
+/// as at open (SPEC 06 REC-1a), against the file as it is now.
+pub(crate) fn read_snapshot_at(
+    backing: &dyn Backing,
+    page_size: u32,
+    t: u64,
+) -> Result<Option<Snapshot>, Error> {
+    let mut buf = vec![0u8; page_size as usize];
+    backing
+        .read_meta_copy(t & 1, page_size, &mut buf)
+        .map_err(Error::Io)?;
+    let meta = match MetaPage::validate(&buf, page_size) {
+        Ok(MetaValidity::Valid(m)) => m,
+        // A failed CRC is a torn copy of a slot being rewritten; retry.
+        Ok(_) => return Ok(None),
+        Err(_) => return Err(Error::Mdb(MdbError::Invalid)),
+    };
+    if meta.txnid != t {
+        return Ok(None);
+    }
+    if meta.txnid > crate::readers::MAX_COMMITTED_TXNID {
+        return Err(Error::Mdb(MdbError::Invalid));
+    }
+    for rec in [&meta.main_db, &meta.free_db] {
+        if rec.root != crate::page::PGNO_INVALID
+            && (rec.root < crate::page::FIRST_DATA_PGNO || rec.root > meta.last_pg)
+        {
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
+    }
+    let annex = MetaPage::read_annex(&buf, page_size).ok_or(Error::Mdb(MdbError::Invalid))?;
+    Ok(Some(Snapshot::from_meta(&meta, annex)))
+}
+
+/// Bound on re-reads of the published txnid when its meta slot keeps changing
+/// underneath (ADR-0023 §4). Each retry means a commit landed or a slot was
+/// mid-rewrite; a slot that never decodes is a corrupt file, reported as
+/// [`MdbError::Invalid`] once the bound is reached instead of spinning.
+// Lower under miri only to keep its runtime bounded; the bounded-retry →
+// `Invalid` behavior is identical.
+const META_RETRY_LIMIT: u32 = if cfg!(miri) { 64 } else { 10_000 };
+
+/// The seed snapshot of a process joining a lock-file environment: the one
+/// committed as the published txnid `T` (ADR-0023 amendment 5).
+fn seed_from_published(
+    backing: &dyn Backing,
+    page_size: u32,
+    region: &dyn crate::shared::SharedRegion,
+) -> Result<Snapshot, Error> {
+    for _ in 0..META_RETRY_LIMIT {
+        // SeqCst: pairs with the committing writer's SeqCst store of T.
+        let t = region.published_txnid().load(Ordering::SeqCst);
+        if let Some(s) = read_snapshot_at(backing, page_size, t)? {
+            check_snapshot_backed(backing, page_size, &s)?;
+            return Ok(s);
+        }
+        std::thread::yield_now();
+    }
+    Err(Error::Mdb(MdbError::Invalid))
+}
+
+/// Check that a snapshot decoded after open lies inside this process's map
+/// and inside the file as it is now (SPEC 06 REC-1a, the open-time geometry
+/// check). Another process with a larger `map_size` may have grown the file
+/// past this process's map; ADR-0023 §5 maps that case to `MapResized` once
+/// LMDB's behavior is observed (stage 3). Checked arithmetic: a hostile
+/// `last_pg` must not wrap the multiply.
+fn check_snapshot_backed(
+    backing: &dyn Backing,
+    page_size: u32,
+    snap: &Snapshot,
+) -> Result<(), Error> {
+    let needed = snap
+        .last_pg
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(u64::from(page_size)))
+        .ok_or(Error::Mdb(MdbError::Invalid))?;
+    if needed > backing.bytes().len() as u64 {
+        return Err(Error::Mdb(MdbError::Invalid));
+    }
+    let real = backing.real_disk_size().map_err(Error::Io)?;
+    if needed > real {
+        return Err(Error::Mdb(MdbError::Invalid));
+    }
+    Ok(())
 }
 
 /// Test-only helpers: a heap-backed [`Backing`] and an in-memory env
@@ -1986,5 +2455,584 @@ mod tests {
         // map_size 1 MiB, psize 4096 → 256 pages, valid pgnos 0..255.
         assert!(!env.inner().would_map_full(255, 1));
         assert!(env.inner().would_map_full(256, 1));
+    }
+}
+
+#[cfg(test)]
+mod shared_meta_tests {
+    use super::testutil::VecBacking;
+    use super::*;
+    use crate::page::{DBRecord, MetaPage, FORMAT_VERSION, MAGIC};
+
+    const PS: u32 = 4096;
+
+    fn meta(txnid: u64, last_pg: u64) -> MetaPage {
+        MetaPage {
+            pgno: txnid & 1,
+            txnid,
+            magic: MAGIC,
+            format_version: FORMAT_VERSION,
+            page_size: PS,
+            env_flags: 0,
+            map_size: 1 << 20,
+            last_pg,
+            free_db: DBRecord::empty(),
+            main_db: DBRecord::empty(),
+            fl_count: 0,
+        }
+    }
+
+    /// Two meta slots plus `extra` zeroed data pages.
+    fn image(m0: &MetaPage, m1: &MetaPage, extra: usize) -> VecBacking {
+        let ps = PS as usize;
+        let mut bytes = vec![0u8; ps * (2 + extra)];
+        m0.encode_with_annex(&mut bytes[..ps], &[]).unwrap();
+        m1.encode_with_annex(&mut bytes[ps..2 * ps], &[]).unwrap();
+        VecBacking(bytes)
+    }
+
+    #[test]
+    fn reads_the_slot_holding_t() {
+        let b = image(&meta(4, 2), &meta(5, 3), 2);
+        let s = read_snapshot_at(&b, PS, 5)
+            .unwrap()
+            .expect("slot 1 holds 5");
+        assert_eq!((s.txnid, s.last_pg), (5, 3));
+        let s = read_snapshot_at(&b, PS, 4)
+            .unwrap()
+            .expect("slot 0 holds 4");
+        assert_eq!(s.txnid, 4);
+    }
+
+    #[test]
+    fn overwritten_slot_reads_as_none() {
+        // Slot 1 was overwritten by txnid 7 while the caller pinned 5.
+        let b = image(&meta(6, 2), &meta(7, 3), 2);
+        assert!(read_snapshot_at(&b, PS, 5).unwrap().is_none());
+    }
+
+    #[test]
+    fn torn_slot_reads_as_none() {
+        let mut b = image(&meta(4, 2), &meta(5, 3), 2);
+        b.0[PS as usize + 100] ^= 0xFF; // corrupt slot 1 → CRC fails
+        assert!(read_snapshot_at(&b, PS, 5).unwrap().is_none());
+    }
+
+    #[test]
+    fn root_beyond_last_pg_is_invalid() {
+        let mut m = meta(5, 3);
+        m.main_db.root = 50;
+        let b = image(&meta(4, 2), &m, 2);
+        assert!(matches!(
+            read_snapshot_at(&b, PS, 5),
+            Err(Error::Mdb(MdbError::Invalid))
+        ));
+    }
+}
+
+// `HeapRegion` exists only in non-loom test builds (loom models the
+// in-process protocol, not the shared region).
+#[cfg(all(test, not(loom)))]
+mod shared_env_tests {
+    use super::testutil::VecBacking;
+    use super::*;
+    use crate::page::{DBRecord, MetaPage, FORMAT_VERSION, MAGIC};
+    use crate::readers::RDR_FREE;
+    use crate::shared::{HeapRegion, SharedRegion};
+    use std::sync::atomic::Ordering as O;
+
+    const PS: u32 = 4096;
+
+    fn meta_with(txnid: u64, last_pg: u64) -> MetaPage {
+        MetaPage {
+            pgno: txnid & 1,
+            txnid,
+            magic: MAGIC,
+            format_version: FORMAT_VERSION,
+            page_size: PS,
+            env_flags: 0,
+            map_size: 1 << 20,
+            last_pg,
+            free_db: DBRecord::empty(),
+            main_db: DBRecord::empty(),
+            fl_count: 0,
+        }
+    }
+
+    fn meta(txnid: u64) -> MetaPage {
+        meta_with(txnid, 3)
+    }
+
+    /// A four-page image: meta slots holding `t0` and `t1`, two data pages.
+    fn image(t0: u64, t1: u64) -> Vec<u8> {
+        let ps = PS as usize;
+        let mut bytes = vec![0u8; ps * 4];
+        meta(t0).encode_with_annex(&mut bytes[..ps], &[]).unwrap();
+        meta(t1)
+            .encode_with_annex(&mut bytes[ps..2 * ps], &[])
+            .unwrap();
+        bytes
+    }
+
+    fn backing(t0: u64, t1: u64) -> Box<dyn Backing> {
+        Box::new(VecBacking(image(t0, t1)))
+    }
+
+    fn try_open(b: Box<dyn Backing>, region: Arc<dyn SharedRegion>) -> Result<Env, Error> {
+        let dir = std::env::temp_dir().join(format!("zerodb-shared-{}", next_env_id()));
+        open_with_backing_shared(
+            dir,
+            b,
+            PS,
+            1 << 20,
+            false,
+            4,
+            4,
+            DurabilityFlags::default(),
+            crate::page::FileTrust::VALIDATE,
+            false,
+            None,
+            Some(region),
+        )
+    }
+
+    fn open(b: Box<dyn Backing>, region: Arc<dyn SharedRegion>) -> Env {
+        try_open(b, region).expect("open")
+    }
+
+    /// A heap backing whose reported file length can change after open, to
+    /// model a file another process grew or that is shorter than a meta
+    /// claims.
+    struct SizedBacking {
+        bytes: Vec<u8>,
+        real: Arc<AtomicU64>,
+    }
+
+    impl Backing for SizedBacking {
+        fn bytes(&self) -> &[u8] {
+            &self.bytes
+        }
+        fn real_disk_size(&self) -> std::io::Result<u64> {
+            // Relaxed: a test knob set before the call under test, on the
+            // same thread.
+            Ok(self.real.load(O::Relaxed))
+        }
+        fn try_clone_file(&self) -> std::io::Result<std::fs::File> {
+            Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+        }
+    }
+
+    #[test]
+    fn initializer_publishes_the_newest_meta_as_t() {
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let env = open(backing(4, 5), region.clone());
+        assert_eq!(region.published_txnid().load(O::SeqCst), 5);
+        assert_eq!(env.inner.txnid(), 5);
+    }
+
+    #[test]
+    fn joiner_seeds_from_published_txnid_not_newest_meta() {
+        // Slot 1 holds txnid 5, written but not yet published: T is still 4.
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(4, O::SeqCst);
+        let env = open(backing(4, 5), region.clone());
+        assert_eq!(env.inner.snapshot().txnid, 4);
+        let (snap, slot) = env.inner.pin_reader().expect("pin");
+        assert_eq!(snap.txnid, 4);
+        assert_eq!(region.slots()[slot as usize].txnid().load(O::SeqCst), 4);
+        assert_eq!(
+            crate::shared::owner_pid(region.slots()[slot as usize].owner().load(O::SeqCst)),
+            2
+        );
+        env.inner.release_reader(slot);
+        assert_eq!(
+            region.slots()[slot as usize].txnid().load(O::SeqCst),
+            RDR_FREE
+        );
+    }
+
+    #[test]
+    fn pin_follows_t_published_by_another_process() {
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(4, O::SeqCst);
+        let env = open(backing(4, 5), region.clone());
+        // Another process publishes 5.
+        region.published_txnid().store(5, O::SeqCst);
+        let (snap, slot) = env.inner.pin_reader().expect("pin");
+        assert_eq!(snap.txnid, 5);
+        env.inner.release_reader(slot);
+        // The cache was refreshed: the fast path now serves 5.
+        assert_eq!(env.inner.snapshot().txnid, 5);
+    }
+
+    #[test]
+    fn current_snapshot_follows_t() {
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(4, O::SeqCst);
+        let env = open(backing(4, 5), region.clone());
+        region.published_txnid().store(5, O::SeqCst);
+        assert_eq!(env.inner.current_snapshot().unwrap().txnid, 5);
+        assert_eq!(env.inner.txnid(), 5);
+    }
+
+    #[test]
+    fn shared_readers_full_reports_readers_full() {
+        let region = Arc::new(HeapRegion::new(1, 2, false));
+        region.published_txnid().store(4, O::SeqCst);
+        let env = open(backing(4, 5), region.clone());
+        let (_snap, slot) = env.inner.pin_reader().expect("pin");
+        assert!(matches!(
+            env.inner.pin_reader(),
+            Err(Error::Mdb(MdbError::ReadersFull))
+        ));
+        env.inner.release_reader(slot);
+    }
+
+    #[test]
+    fn joiner_with_undecodable_published_slot_fails_instead_of_hanging() {
+        // T = 5 names slot 1, whose CRC never verifies: the seed retry loop
+        // must give up with Invalid rather than spin forever.
+        let mut bytes = image(4, 5);
+        bytes[PS as usize + 100] ^= 0xFF;
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(5, O::SeqCst);
+        assert!(matches!(
+            try_open(Box::new(VecBacking(bytes)), region),
+            Err(Error::Mdb(MdbError::Invalid))
+        ));
+    }
+
+    #[test]
+    fn pin_of_undecodable_published_slot_fails_and_frees_the_slot() {
+        // Open at T = 4 (slot 0 is sound); another process then "publishes" 5,
+        // whose slot never decodes. Pin and the writer's base both give up.
+        let mut bytes = image(4, 5);
+        bytes[PS as usize + 100] ^= 0xFF;
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(4, O::SeqCst);
+        let env = open(Box::new(VecBacking(bytes)), region.clone());
+        region.published_txnid().store(5, O::SeqCst);
+        assert!(matches!(
+            env.inner.pin_reader(),
+            Err(Error::Mdb(MdbError::Invalid))
+        ));
+        assert!(matches!(
+            env.inner.current_snapshot(),
+            Err(Error::Mdb(MdbError::Invalid))
+        ));
+        for rs in region.slots() {
+            assert_eq!(rs.txnid().load(O::SeqCst), RDR_FREE);
+            assert_eq!(crate::shared::owner_pid(rs.owner().load(O::SeqCst)), 0);
+        }
+    }
+
+    /// An image whose slot 0 holds txnid 4 (`last_pg` 3) and slot 1 holds
+    /// txnid 7 with `last_pg` 200, `pages` pages long.
+    fn grown_image(pages: usize) -> Vec<u8> {
+        let ps = PS as usize;
+        let mut bytes = vec![0u8; ps * pages];
+        meta(4).encode_with_annex(&mut bytes[..ps], &[]).unwrap();
+        meta_with(7, 200)
+            .encode_with_annex(&mut bytes[ps..2 * ps], &[])
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn refresh_rejects_a_snapshot_past_the_file_end() {
+        // The map covers page 200, but the file (as now measured) does not
+        // (SPEC 06 REC-1a, re-checked when a foreign commit is observed).
+        let real = Arc::new(AtomicU64::new(256 * u64::from(PS)));
+        let b = Box::new(SizedBacking {
+            bytes: grown_image(256),
+            real: Arc::clone(&real),
+        });
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(4, O::SeqCst);
+        let env = open(b, region.clone());
+        region.published_txnid().store(7, O::SeqCst);
+        // Shrink the reported length below page 200. Relaxed: read back on
+        // this same thread.
+        real.store(4 * u64::from(PS), O::Relaxed);
+        assert!(matches!(
+            env.inner.pin_reader(),
+            Err(Error::Mdb(MdbError::Invalid))
+        ));
+        // The fast path never re-measures the file: T = 4 again pins fine.
+        region.published_txnid().store(4, O::SeqCst);
+        let (snap, slot) = env.inner.pin_reader().expect("cached snapshot");
+        assert_eq!(snap.txnid, 4);
+        env.inner.release_reader(slot);
+    }
+
+    #[test]
+    fn refresh_rejects_a_snapshot_past_this_process_map() {
+        // The file reaches page 200, but this process mapped only 4 pages: a
+        // process with a larger map_size grew it (ADR-0023 §5).
+        let b = Box::new(SizedBacking {
+            bytes: grown_image(4),
+            real: Arc::new(AtomicU64::new(256 * u64::from(PS))),
+        });
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(4, O::SeqCst);
+        let env = open(b, region.clone());
+        region.published_txnid().store(7, O::SeqCst);
+        assert!(matches!(
+            env.inner.pin_reader(),
+            Err(Error::Mdb(MdbError::Invalid))
+        ));
+        assert!(matches!(
+            env.inner.current_snapshot(),
+            Err(Error::Mdb(MdbError::Invalid))
+        ));
+    }
+
+    fn writer_held(region: &HeapRegion) -> bool {
+        *region.writer.lock().expect("test region poisoned")
+    }
+
+    #[test]
+    fn write_txn_holds_the_cross_process_lock_and_builds_on_t() {
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(4, O::SeqCst);
+        let env = open(backing(4, 5), region.clone());
+        // Another process committed 5 after this one opened.
+        region.published_txnid().store(5, O::SeqCst);
+        assert!(!writer_held(&region));
+        let txn = env.write_txn().expect("write txn");
+        assert!(writer_held(&region), "the write txn holds the shared lock");
+        assert_eq!(
+            txn.txnid(),
+            6,
+            "the base is the snapshot at T, not the cache"
+        );
+        drop(txn);
+        assert!(!writer_held(&region), "dropping the txn releases it");
+    }
+
+    #[test]
+    fn writer_guard_releases_the_shared_lock_on_drop() {
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(4, O::SeqCst);
+        let env = open(backing(4, 5), region.clone());
+        let mut guard = env.inner.lock_writer();
+        env.inner.lock_writer_shared(&mut guard).expect("lock");
+        assert!(writer_held(&region));
+        drop(guard);
+        assert!(!writer_held(&region));
+        // The in-process guard alone (what `lock_writer` returns before
+        // `lock_writer_shared` is called) never takes the shared lock.
+        let guard = env.inner.lock_writer();
+        assert!(!writer_held(&region));
+        drop(guard);
+    }
+
+    #[test]
+    fn cache_newer_than_t_decodes_t_and_keeps_the_cache() {
+        let region = Arc::new(HeapRegion::new(4, 2, false));
+        region.published_txnid().store(4, O::SeqCst);
+        let env = open(backing(4, 5), region.clone());
+        region.published_txnid().store(5, O::SeqCst);
+        let (snap, slot) = env.inner.pin_reader().expect("pin 5");
+        assert_eq!(snap.txnid, 5);
+        env.inner.release_reader(slot);
+        assert_eq!(env.inner.snapshot().txnid, 5, "cache refreshed to 5");
+        // T reads 4 again (as a reader racing this process's own publish,
+        // between the cache swap and the T store, would see it).
+        region.published_txnid().store(4, O::SeqCst);
+        let (snap, slot) = env.inner.pin_reader().expect("pin 4");
+        assert_eq!(snap.txnid, 4, "decoded from meta slot 0");
+        env.inner.release_reader(slot);
+        assert_eq!(
+            env.inner.snapshot().txnid,
+            5,
+            "install_if_newer never downgrades the cache"
+        );
+    }
+
+    #[test]
+    fn single_process_path_is_unchanged() {
+        let env = testutil::mem_env(PS, 1 << 20);
+        assert!(env.inner.shared.is_none());
+        assert_eq!(
+            env.inner.current_snapshot().unwrap().txnid,
+            env.inner.txnid()
+        );
+    }
+
+    // Reaping (ADR-0023 §3, amendment 12). The LMDB fork, observed by
+    // `zerodb-oracle/tests/lmdb_reaping_observation.rs`, reaps dead readers
+    // in `mdb_reader_check` and when a writer takes over a dead writer's lock
+    // (Linux), and nowhere else: not at read-txn begin, write commit, a
+    // joiner's open or a full table. The tests below pin each of those.
+
+    /// Claim and pin a slot on behalf of process `pid`, as that process would
+    /// have before it died.
+    fn pin_as(env: &Env, pid: u32, txnid: u64) -> u32 {
+        let s = env
+            .inner
+            .reader_table
+            .claim_as(Some(pid))
+            .expect("a free slot");
+        env.inner.reader_table.store_pin(s, txnid);
+        s
+    }
+
+    fn listed_pids(env: &Env) -> Vec<Option<u32>> {
+        env.reader_list().into_iter().map(|e| e.pid).collect()
+    }
+
+    #[test]
+    fn clear_stale_readers_frees_a_dead_processes_slots() {
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let env = open(backing(4, 5), region.clone());
+        pin_as(&env, 2, 1);
+        assert_eq!(env.clear_stale_readers().unwrap(), 0, "process 2 is alive");
+        region.kill(2);
+        assert_eq!(env.clear_stale_readers().unwrap(), 1);
+        assert_eq!(env.clear_stale_readers().unwrap(), 0);
+        assert!(env.reader_list().is_empty());
+    }
+
+    #[test]
+    fn clear_stale_readers_counts_slots_not_processes() {
+        // `mdb_reader_check` counts slots (amendment 12).
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let env = open(backing(4, 5), region.clone());
+        pin_as(&env, 2, 4);
+        pin_as(&env, 2, 5);
+        region.kill(2);
+        assert_eq!(env.clear_stale_readers().unwrap(), 2);
+    }
+
+    #[test]
+    fn clear_stale_readers_is_zero_without_a_lock_file() {
+        let env = testutil::mem_env(PS, 1 << 20);
+        let r = env.read_txn().unwrap();
+        assert_eq!(env.clear_stale_readers().unwrap(), 0);
+        assert_eq!(listed_pids(&env), vec![None], "no PID without a lock file");
+        drop(r);
+    }
+
+    #[test]
+    fn reader_list_reports_pids_in_a_lock_file_env() {
+        let region = Arc::new(HeapRegion::new(4, 7, true));
+        let env = open(backing(4, 5), region.clone());
+        let r = env.read_txn().unwrap();
+        let list = env.reader_list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].pid, Some(7));
+        drop(r);
+    }
+
+    #[test]
+    fn joiner_frees_slots_left_under_its_own_pid() {
+        // A region whose initializer (another process) is alive, and in
+        // which a dead predecessor with this process's PID (5) left a pin.
+        let region = Arc::new(HeapRegion::new(4, 5, true));
+        {
+            let env = open(backing(4, 5), region.clone()); // seeds T
+            drop(env);
+        }
+        SharedRegion::slots(&*region)[2]
+            .owner()
+            .store(crate::shared::owner_word(1, 5), O::SeqCst);
+        SharedRegion::slots(&*region)[2].txnid().store(1, O::SeqCst);
+        let joiner = HeapRegion::rejoin(&region); // is_initializer false
+        let env = open(backing(4, 5), joiner.clone());
+        assert!(
+            env.reader_list().is_empty(),
+            "the stale own-PID slot survived open"
+        );
+    }
+
+    #[test]
+    fn joiner_open_does_not_reap_another_dead_process() {
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let first = open(backing(4, 5), region.clone());
+        pin_as(&first, 3, 4);
+        drop(first);
+        let joiner = HeapRegion::rejoin(&region);
+        joiner.kill(3);
+        let env = open(backing(4, 5), joiner.clone());
+        assert_eq!(listed_pids(&env), vec![Some(3)]);
+        assert_eq!(env.clear_stale_readers().unwrap(), 1);
+    }
+
+    #[test]
+    fn full_table_gives_readers_full_and_does_not_reap() {
+        let region = Arc::new(HeapRegion::new(1, 1, true));
+        let env = open(backing(4, 5), region.clone());
+        pin_as(&env, 2, 1);
+        region.kill(2);
+        assert!(matches!(
+            env.read_txn(),
+            Err(Error::Mdb(MdbError::ReadersFull))
+        ));
+        assert_eq!(env.clear_stale_readers().unwrap(), 1);
+        env.read_txn().expect("the reaped slot is free again");
+    }
+
+    #[test]
+    fn read_txn_begin_does_not_reap() {
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let env = open(backing(4, 5), region.clone());
+        pin_as(&env, 2, 4);
+        region.kill(2);
+        let r = env.read_txn().unwrap();
+        assert_eq!(listed_pids(&env), vec![Some(2), Some(1)]);
+        drop(r);
+        assert_eq!(listed_pids(&env), vec![Some(2)]);
+    }
+
+    #[test]
+    fn write_txn_without_takeover_does_not_reap() {
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let env = open(backing(4, 5), region.clone());
+        pin_as(&env, 2, 4);
+        region.kill(2);
+        let txn = env.write_txn().unwrap();
+        assert_eq!(listed_pids(&env), vec![Some(2)], "begin does not reap");
+        // An unchanged commit runs the commit path without I/O (the heap
+        // backing has no file to write).
+        txn.commit().unwrap();
+        assert_eq!(listed_pids(&env), vec![Some(2)], "commit does not reap");
+    }
+
+    #[test]
+    fn writer_takeover_reaps_dead_readers() {
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let env = open(backing(4, 5), region.clone());
+        pin_as(&env, 2, 4);
+        pin_as(&env, 3, 4);
+        region.kill(2);
+        region.simulate_takeover_on_next_lock();
+        let txn = env.write_txn().unwrap();
+        assert_eq!(
+            listed_pids(&env),
+            vec![Some(3)],
+            "the takeover freed the dead process's slot, and only it"
+        );
+        drop(txn);
+    }
+
+    #[test]
+    fn a_failed_probe_fails_clear_stale_readers_and_a_takeover_write_txn() {
+        // As LMDB's lock recovery: a failed reader check fails the lock call
+        // and releases the writer lock.
+        let region = Arc::new(HeapRegion::new(4, 1, true));
+        let env = open(backing(4, 5), region.clone());
+        pin_as(&env, 2, 4);
+        region.kill(2);
+        region.set_liveness_probes_fail(true);
+        assert!(matches!(env.clear_stale_readers(), Err(Error::Io(_))));
+        region.simulate_takeover_on_next_lock();
+        assert!(matches!(env.write_txn(), Err(Error::Io(_))));
+        assert_eq!(listed_pids(&env), vec![Some(2)], "nothing was freed");
+        assert!(!writer_held(&region), "the failed begin released the lock");
+        region.set_liveness_probes_fail(false);
+        // Would block forever if the failed begin had kept the lock.
+        let txn = env.write_txn().expect("the writer lock is free again");
+        drop(txn);
     }
 }

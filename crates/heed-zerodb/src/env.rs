@@ -32,8 +32,9 @@ use crate::{Database, DatabaseOpenOptions, Error, Result, Unspecified};
 /// compaction (`process_batch.rs`, `routes/tasks/compact.rs`, `meilitool`) and
 /// snapshot code (`process_snapshot_creation.rs`, `enterprise_edition/s3.rs`).
 /// An adapter env dir therefore contains **exactly** this one file — no
-/// `zerodb.dat`, and no `lock.mdb` (nothing reads one; ZeroDB is
-/// single-process).
+/// `zerodb.dat`. In this release a `lock.mdb` next to it appears only when
+/// [`EnvOpenOptions::lock_file`] is turned on (ADR-0023); it is off by
+/// default, so a default env still contains only `data.mdb`.
 ///
 /// The bytes inside are still ZeroDB's own `ZDB1` format: pointing
 /// `mdb_stat`/`mdb_dump` at one fails loudly with `MDB_INVALID` rather than
@@ -76,6 +77,8 @@ pub struct EnvOpenOptions<T: TlsUsage = WithTls> {
     sequential_writes: bool,
     /// ADR-0017 ZeroDB extension — no heed counterpart.
     max_dirty_bytes: Option<usize>,
+    /// ADR-0023 ZeroDB extension — no heed counterpart yet.
+    lock_file: bool,
     _tls: std::marker::PhantomData<T>,
 }
 
@@ -98,6 +101,7 @@ impl EnvOpenOptions<WithTls> {
             file_trust: zerodb::FileTrust::VALIDATE,
             sequential_writes: false,
             max_dirty_bytes: None,
+            lock_file: false,
             _tls: std::marker::PhantomData,
         }
     }
@@ -114,6 +118,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
             file_trust: self.file_trust,
             sequential_writes: self.sequential_writes,
             max_dirty_bytes: self.max_dirty_bytes,
+            lock_file: self.lock_file,
             _tls: std::marker::PhantomData,
         }
     }
@@ -204,6 +209,16 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         self
     }
 
+    /// Let other processes open this environment at the same time
+    /// (ADR-0023), with LMDB's lock-file name `lock.mdb`.
+    ///
+    /// **ZeroDB extension.** In this release it is opt-in; a later release
+    /// makes it the default and honors heed's `NO_LOCK` to turn it off.
+    pub fn lock_file(&mut self, on: bool) -> &mut Self {
+        self.lock_file = on;
+        self
+    }
+
     /// Set the env flags (SPEC 00 row 6). `unsafe` for heed signature parity —
     /// the unsafety is vestigial for ZeroDB (no reachable flag enables the
     /// cross-process behaviors that make this unsafe in LMDB — ZeroDB is
@@ -287,14 +302,17 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         // ADR-0010: re-impose heed's on-disk contract at the heed
         // boundary — an env opened through this adapter materializes as
         // `<dir>/data.mdb`, the name Meilisearch hardcodes in its production
-        // compaction and snapshot paths. No `lock.mdb` is created: ZeroDB is
-        // single-process and nothing in the consumer tree reads one.
+        // compaction and snapshot paths. A `lock.mdb` next to it appears only
+        // when `lock_file` is on (ADR-0023); it is off by default.
         opts.data_file_name(DATA_FILE_NAME);
         opts.flags(zerodb_env_flags(self.flags));
         opts.file_trust(self.file_trust);
         opts.sequential_writes(self.sequential_writes);
         if let Some(b) = self.max_dirty_bytes {
             opts.max_dirty_bytes(b);
+        }
+        if self.lock_file {
+            opts.lock_file(true).lock_file_name("lock.mdb");
         }
         let env = opts.open(path).map_err(Error::from)?;
         Ok(Env {
@@ -720,7 +738,8 @@ impl<T> Env<T> {
     /// List the environment's occupied reader slots.
     ///
     /// **ZeroDB extension — heed exposes no reader introspection.** This is
-    /// the single-process analogue of `mdb_reader_list`. See
+    /// ZeroDB's `mdb_reader_list`, with owner PIDs in a lock-file
+    /// environment. See
     /// [`zerodb::Env::reader_list`] for the full contract, in particular that
     /// the result is a *sample* of a lock-free table and entries may be stale
     /// by the time it returns.
@@ -736,20 +755,24 @@ impl<T> Env<T> {
     }
 
     /// Clear stale readers (SPEC 00 second table — SHOULD; `mdb_reader_check`).
+    /// Returns the number of reader slots freed.
     ///
-    /// **Always 0, and that is the correct answer rather than a stub.** ZeroDB
-    /// is single-process (see docs/DIVERGENCES.md): the reader table is process
-    /// memory, every slot is owned by a `RoTxn` that releases it in `Drop`, and
-    /// a dead process takes the whole table with it. There is no cross-process
-    /// abandoned slot for `mdb_reader_check` to reap. Kept so heed code that
-    /// calls it periodically keeps compiling and no-ops.
+    /// By default ZeroDB is single-process (see docs/DIVERGENCES.md): the
+    /// reader table is process memory, every slot is owned by a `RoTxn` that
+    /// releases it in `Drop`, and a dead process takes the whole table with
+    /// it, so this returns `0` — the correct answer, not a stub. With
+    /// `EnvOpenOptions::lock_file` on (ADR-0023) the reader table is shared
+    /// across processes: this frees the slots of processes that died inside
+    /// a read txn and returns how many slots it freed (slots, not processes,
+    /// as LMDB counts).
     ///
-    /// See [`zerodb::Env::clear_stale_readers`] for the full argument, and
-    /// [`Env::reader_list`] for the introspection that *is* meaningful here.
+    /// See [`zerodb::Env::clear_stale_readers`] for the full contract,
+    /// including where the engine reaps on its own, and
+    /// [`Env::reader_list`] for the slots and their owner PIDs.
     ///
     /// # Errors
     ///
-    /// Never. The [`Result`] exists for heed shape.
+    /// The I/O error of a liveness probe (lock-file environments only).
     pub fn clear_stale_readers(&self) -> Result<usize> {
         Ok(self.inner.clear_stale_readers()?)
     }

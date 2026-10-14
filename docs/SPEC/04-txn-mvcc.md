@@ -210,7 +210,10 @@ claim/release a pinned snapshot without blocking the writer.
   refuses to start once `base.txnid >= MAX_COMMITTED_TXNID`, so the 2^32 margin
   can never be consumed by commits.
   Because occupancy is encoded in `txnid` alone, no separate `pid`/`tid` fields
-  are needed (D-001 deletes LMDB's `mr_pid`/`mr_tid`).
+  are needed (D-001 deletes LMDB's `mr_pid`/`mr_tid`). In a lock-file
+  environment (ADR-0023), each slot also carries a 64-bit owner word, holding
+  the owner PID (low 32 bits) and a claim generation (high 32 bits) (ADR-0023
+  amendments 7 and 14), which reaping uses.
 
 ### §4.2 — Claim (lock-free)
 
@@ -229,7 +232,10 @@ claim/release a pinned snapshot without blocking the writer.
   matches LMDB (`mti_numreaders == env->me_maxreaders → MDB_READERS_FULL`). Under
   D-001 there are no *stale* cross-process slots to reap first (LMDB's
   `mdb_reader_check`), so the error is raised immediately; Phase 2.2 adds reader
-  introspection, not a reaping path.
+  introspection, not a reaping path. With a lock file (ADR-0023) dead processes'
+  slots can be stale, and the error is still raised immediately without reaping,
+  as the LMDB fork does (ADR-0023 amendment 12); `Env::clear_stale_readers`
+  frees them.
 
 ### §4.3 — Publish-and-verify (the pin) and its memory-ordering correctness
 
@@ -318,6 +324,9 @@ only a full fence / `SeqCst` does.
   pairing with a later claimer's `Acquire` CAS (§4.2) it hands the slot over
   cleanly. A full fence is unnecessary — releasing a slot only needs to not be
   reordered *before* the reader's own accesses, which `Release` provides.
+  In a lock-file environment the release is three `Release` stores instead:
+  `txnid = RDR_CLAIMED`, then the owner PID cleared in the owner word, then
+  `txnid = RDR_FREE` (ADR-0023 amendment 7).
 
 ### §4.5 — Oldest-reader computation (writer side) and its correctness
 

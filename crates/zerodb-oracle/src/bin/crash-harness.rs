@@ -1,10 +1,10 @@
 //! The crash-consistency harness binary (ADR-0008 D3; SPEC 06 §5).
 //!
 //! ```text
-//! crash-harness [--cycles N] [--seed S] [--mechanism image|sigkill|both]
+//! crash-harness [--cycles N] [--seed S] [--mechanism image|sigkill|both|mp]
 //!               [--jobs J] [--variants V]
 //!               [--modes all|default|writemap|nometasync|nosync|mapasync]
-//!               [--repro image:SEED|sigkill:SEED] [--keep-going] [--isolate]
+//!               [--repro image:SEED|sigkill:SEED|mp:SEED] [--keep-going] [--isolate]
 //! ```
 //!
 //! One **cycle** = one recovered-and-verified crash state (ADR-0008 OQ1).
@@ -19,7 +19,10 @@
 //! `target/crash-repro/`, and `--repro <mech>:<seed>` replays that cycle.
 //!
 //! Hidden child mode (mechanism B): `crash-harness --crash-child <seed>
-//! <dir> <kill>` — see `crash::sigkill`.
+//! <dir> <kill>` — see `crash::sigkill`. Multi-process mechanism (`--mechanism
+//! mp`, opt-in, never part of `both`): the lock-file writer child
+//! `--crash-child-lock <seed> <dir> <kill>` and the reader child
+//! `--crash-reader <dir> <page_size> <map_size>` — see `crash::multiproc`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -29,6 +32,7 @@ use zerodb_io::fault::splitmix64;
 use zerodb_oracle::crash::{
     gen_spec,
     image::{run_image_cut, ImageOpts},
+    multiproc::{reader_run, run_mp_cycle},
     sigkill::{child_run, run_sigkill_cycle, SigkillOpts},
     CutReport, Mode,
 };
@@ -38,6 +42,8 @@ enum Mechanism {
     Image,
     Sigkill,
     Both,
+    /// Multi-process cycles (ADR-0023); opt-in only.
+    Mp,
 }
 
 struct Args {
@@ -57,9 +63,9 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: crash-harness [--cycles N] [--seed S] [--mechanism image|sigkill|both] \
+        "usage: crash-harness [--cycles N] [--seed S] [--mechanism image|sigkill|both|mp] \
          [--jobs J] [--variants V] [--modes all|default|writemap|nometasync|nosync|mapasync] \
-         [--repro image:SEED|sigkill:SEED] [--keep-going] [--isolate]"
+         [--repro image:SEED|sigkill:SEED|mp:SEED] [--keep-going] [--isolate]"
     );
     std::process::exit(2)
 }
@@ -112,6 +118,7 @@ fn parse_args() -> Args {
                     "image" => Mechanism::Image,
                     "sigkill" => Mechanism::Sigkill,
                     "both" => Mechanism::Both,
+                    "mp" => Mechanism::Mp,
                     _ => usage(),
                 }
             }
@@ -121,6 +128,7 @@ fn parse_args() -> Args {
                 let mech = match m {
                     "image" => Mechanism::Image,
                     "sigkill" => Mechanism::Sigkill,
+                    "mp" => Mechanism::Mp,
                     _ => usage(),
                 };
                 args.repro = Some((mech, s.parse().unwrap_or_else(|_| usage())));
@@ -192,7 +200,24 @@ fn main() {
         }
         let seed: u64 = argv[2].parse().unwrap_or_else(|_| usage());
         let dir = PathBuf::from(&argv[3]);
-        child_run(seed, &dir, &argv[4]); // never returns
+        child_run(seed, &dir, &argv[4], false); // never returns
+    }
+    if argv.get(1).map(String::as_str) == Some("--crash-child-lock") {
+        if argv.len() != 5 {
+            usage();
+        }
+        let seed: u64 = argv[2].parse().unwrap_or_else(|_| usage());
+        let dir = PathBuf::from(&argv[3]);
+        child_run(seed, &dir, &argv[4], true); // never returns
+    }
+    if argv.get(1).map(String::as_str) == Some("--crash-reader") {
+        if argv.len() != 5 {
+            usage();
+        }
+        let dir = PathBuf::from(&argv[2]);
+        let page_size: u32 = argv[3].parse().unwrap_or_else(|_| usage());
+        let map_size: usize = argv[4].parse().unwrap_or_else(|_| usage());
+        reader_run(&dir, page_size, map_size); // never returns
     }
 
     let args = parse_args();
@@ -207,6 +232,13 @@ fn main() {
                 opts.variants = args.variants;
                 run_image_cut(seed, &opts)
             }
+            Mechanism::Mp => run_mp_cycle(
+                seed,
+                &SigkillOpts {
+                    exe,
+                    repro_dir: Some(repro_dir),
+                },
+            ),
             _ => run_sigkill_cycle(
                 seed,
                 &SigkillOpts {
@@ -278,6 +310,7 @@ fn main() {
                     let mech = match args.mechanism {
                         Mechanism::Image => Mechanism::Image,
                         Mechanism::Sigkill => Mechanism::Sigkill,
+                        Mechanism::Mp => Mechanism::Mp,
                         Mechanism::Both => {
                             if cut % 4 == 3 {
                                 Mechanism::Image
@@ -287,6 +320,13 @@ fn main() {
                         }
                     };
                     let report = match mech {
+                        Mechanism::Mp => run_mp_cycle(
+                            seed,
+                            &SigkillOpts {
+                                exe: exe.clone(),
+                                repro_dir: Some(repro_dir.clone()),
+                            },
+                        ),
                         Mechanism::Sigkill => run_sigkill_cycle(
                             seed,
                             &SigkillOpts {
