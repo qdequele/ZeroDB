@@ -2334,6 +2334,11 @@ pub fn open_with_backing_policy(
 /// - pins, the writer's base and [`EnvInner::txnid`] follow `T`, and the
 ///   writer also takes the region's cross-process lock.
 ///
+/// The region is moved in, and the caller keeps no other strong reference to
+/// it: the environment is then its only holder, so dropping the environment,
+/// or an open that fails after building it, releases the region (closes the
+/// lock file) before the error or the close event is seen.
+///
 /// # Errors
 ///
 /// As [`open_with_backing`]; with a region, also [`MdbError::Invalid`] when
@@ -2483,6 +2488,13 @@ pub fn open_with_backing_shared(
     // check + insert so two concurrent opens of one path cannot both succeed.
     let id = next_env_id();
     let closing = Arc::new(SignalEvent::new());
+    // ADR-0023 amendment 19: a `PREV_SNAPSHOT` initializer keeps the
+    // election until its first commit, as LMDB does.
+    let holds_election = prev_snapshot && shared.as_ref().is_some_and(|r| r.is_initializer());
+    // `shared` moves into the `EnvInner` rather than being cloned: from here
+    // on the environment (and its reader table) holds every reference this
+    // open owns, so an error return below drops `inner` as the last holder
+    // and the lock file closes with it (the check in `EnvInner::drop`).
     let inner = Arc::new(EnvInner {
         id,
         path: canonical_path.clone(),
@@ -2509,17 +2521,13 @@ pub fn open_with_backing_shared(
         meta,
         prev_snapshot,
         closing,
-        // ADR-0023 amendment 19: a `PREV_SNAPSHOT` initializer keeps the
-        // election until its first commit, as LMDB does.
-        holds_election: AtomicBool::new(
-            prev_snapshot && shared.as_ref().is_some_and(|r| r.is_initializer()),
-        ),
+        holds_election: AtomicBool::new(holds_election),
         has_unpublished: AtomicBool::new(newer_on_disk.is_some()),
         unpublished: Mutex::new(newer_on_disk),
-        shared: shared.clone(),
+        shared,
     });
 
-    if let Some(region) = &shared {
+    if let Some(region) = &inner.shared {
         if region.is_initializer() {
             // SeqCst: the same total order as every later T store and
             // every reader's publish-and-verify (SPEC 04 TXN-17/19).
@@ -2544,7 +2552,7 @@ pub fn open_with_backing_shared(
     // ADR-0023 §1: let joiners in only after `T` is seeded and the env is
     // registered. A `PREV_SNAPSHOT` initializer keeps the election until its
     // first commit instead (amendment 19; `RwTxn::commit`).
-    if let Some(region) = &shared {
+    if let Some(region) = &inner.shared {
         if !inner.holds_election() {
             region.finish_open().map_err(Error::Io)?;
         }

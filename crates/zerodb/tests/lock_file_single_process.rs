@@ -629,6 +629,36 @@ fn two_native_envs_with_different_data_names_get_different_lock_files() {
     assert!(!dir.path().join(LOCK_FILE_NAME).exists());
 }
 
+/// Two data-file names in one directory, open at the same time: the lock
+/// files differ (`zerodb.lock`, `lock.mdb`), so the lock layer admits the
+/// second open, and the environment registry, keyed by directory (SPEC 04
+/// TXN-51), refuses it. The open fails with `EnvAlreadyOpened`, without a
+/// debug-build panic, and closes its lock file: once the first environment
+/// closes, the second name opens.
+#[test]
+fn second_data_name_in_an_open_directory_is_refused_cleanly() {
+    let dir = TempDir::new();
+    let first = opts().open(dir.path()).expect("open zerodb.dat");
+    let e = opts()
+        .data_file_name("data.mdb")
+        .open(dir.path())
+        .unwrap_err();
+    assert!(
+        matches!(e, Error::EnvAlreadyOpened),
+        "expected EnvAlreadyOpened, got {e:?}"
+    );
+    // The first environment is untouched by the refused open.
+    let mut w = first.write_txn().unwrap();
+    first.main_database().put(&mut w, b"k", b"v").unwrap();
+    w.commit().unwrap();
+    drop(first);
+    let second = opts()
+        .data_file_name("data.mdb")
+        .open(dir.path())
+        .expect("the refused open released its lock file");
+    drop(second);
+}
+
 #[test]
 fn lock_file_that_is_the_data_file_is_refused_without_truncating() {
     let dir = TempDir::new();

@@ -697,8 +697,10 @@ impl EnvOpenOptions {
             self.sequential_writes,
             self.max_dirty_bytes
                 .map(|b| zerodb_core::env::dirty_limit_pages(Some(b), opened.page_size)),
-            lock.clone()
-                .map(|l| l as std::sync::Arc<dyn zerodb_core::shared::SharedRegion>),
+            // Moved, not cloned: the environment becomes the only holder of
+            // the lock file, so an open that fails after building it closes
+            // the lock file before returning the error.
+            lock.map(|l| l as std::sync::Arc<dyn zerodb_core::shared::SharedRegion>),
         )?;
         // The core open let joiners in once `T` was seeded (ADR-0023 §1),
         // or, for `PREV_SNAPSHOT`, keeps them out until the first commit
