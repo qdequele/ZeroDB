@@ -113,8 +113,7 @@ retires divergence D-001 (single-process only).
   (9.6× LMDB; about 0.3 ms per index open for Meilisearch). The reopen cost
   comes from the first opener truncating the lock file and rebuilding it
   (ADR-0023 amendment 10); reinitializing it in place, as LMDB does, is the
-  planned follow-up (ADR-0023 amendment 20, tracked as a GitHub issue to
-  open). With `NO_LOCK` (`lock_file(false)` natively) every rung is flat.
+  planned follow-up (ADR-0023 amendment 20, tracked in issue #94). With `NO_LOCK` (`lock_file(false)` natively) every rung is flat.
 
 #### Known limits
 

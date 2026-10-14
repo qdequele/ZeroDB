@@ -1138,8 +1138,7 @@ updated. New invariants for the lock file get fresh IDs.
   (about 0.3 ms per index open for Meilisearch). A follow-up, amendment 20,
   will reinitialize the lock file in place, as LMDB does; it changes
   amendment 10's crash-safety argument (truncate, then magic last), so it
-  needs its own approved amendment first (rule 5). It is tracked as a GitHub
-  issue to open.
+  needs its own approved amendment first (rule 5). It is tracked in issue #94.
 - The macOS POSIX-lock pitfall (§3) and Linux-only futex give two writer-lock
   implementations to test on CI.
 - A bug here corrupts data rather than crashing — the reason for stage-1-first,

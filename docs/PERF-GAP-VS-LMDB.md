@@ -268,7 +268,7 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
   (ADR-0023 amendment 10); on ext4 that frees and reallocates its blocks on
   every open. LMDB reinitializes its lock file in place. Accepted for stage 3
   (maintainer ruling, 2026-10-14); the follow-up, ADR-0023 amendment 20
-  (reinitialize in place, as LMDB), is tracked as a GitHub issue to open. For
+  (reinitialize in place, as LMDB), is tracked in issue #94. For
   Meilisearch it is about 0.3 ms per index open.
 - **Scans** — 1.3–1.8× by default; range scans 1.2× in trusted mode. A cursor keeps only its leaf;
   branch levels are re-resolved per cursor step (a memo hit, so cheap; one
