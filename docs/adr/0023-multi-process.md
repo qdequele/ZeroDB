@@ -1293,6 +1293,10 @@ updated. New invariants for the lock file get fresh IDs.
   will reinitialize the lock file in place, as LMDB does; it changes
   amendment 10's crash-safety argument (truncate, then magic last), so it
   needs its own approved amendment first (rule 5). It is tracked in issue #94.
+  *Resolved by amendment 20 (approved and implemented 2026-10-14):* on
+  Graviton4, env reopen with the lock file on is 36.4 µs per open against
+  LMDB's 37.8 µs (0.96×), and env create is 1.13 ms per env faster
+  (`benches/results/2026-10-15-lock-file-in-place-graviton.md`).
 - The macOS POSIX-lock pitfall (§3) and Linux-only futex give two writer-lock
   implementations to test on CI.
 - A bug here corrupts data rather than crashing — the reason for stage-1-first,
