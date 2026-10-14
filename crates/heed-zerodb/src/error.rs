@@ -220,6 +220,7 @@ impl From<zerodb::MdbError> for MdbError {
             zerodb::MdbError::Incompatible => MdbError::Incompatible,
             zerodb::MdbError::ReadersFull => MdbError::ReadersFull,
             zerodb::MdbError::BadTxn => MdbError::BadTxn,
+            zerodb::MdbError::MapResized => MdbError::MapResized,
             // `zerodb::MdbError` is #[non_exhaustive]; map a future code to the
             // generic `Problem` until it earns a dedicated peer.
             _ => MdbError::Problem,

@@ -7,7 +7,7 @@ use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use zerodb::{Env, EnvOpenOptions};
+use zerodb::{Env, EnvOpenOptions, Error, MdbError};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -41,10 +41,18 @@ impl Drop for TempDir {
 
 const ROLE: &str = "ZERODB_MP_ROLE";
 const DIR: &str = "ZERODB_MP_DIR";
+/// Optional map size for the child, in bytes (default 64 MiB).
+const MAP: &str = "ZERODB_MP_MAP";
+
+const MIB: usize = 1 << 20;
 
 fn open(dir: &Path) -> Env {
+    open_sized(dir, 64 * MIB)
+}
+
+fn open_sized(dir: &Path, map_size: usize) -> Env {
     let mut o = EnvOpenOptions::new();
-    o.map_size(64 << 20)
+    o.map_size(map_size)
         .page_size(4096)
         .max_readers(16)
         .lock_file(true);
@@ -88,6 +96,33 @@ fn child(role: &str, dir: &Path) -> ChildGuard {
     ChildGuard(c)
 }
 
+/// [`child`], with the child opening the environment at `map_size` bytes.
+fn child_sized(role: &str, dir: &Path, map_size: usize) -> ChildGuard {
+    let c = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "child_entry", "--nocapture", "--test-threads=1"])
+        .env(ROLE, role)
+        .env(DIR, dir)
+        .env(MAP, map_size.to_string())
+        .spawn()
+        .expect("spawn child");
+    ChildGuard(c)
+}
+
+/// Wait for `c` to exit and assert it succeeded, failing the test after
+/// `deadline` instead of hanging (for example on a writer lock never
+/// released).
+fn wait_success(c: &mut ChildGuard, deadline: Duration) {
+    let end = Instant::now() + deadline;
+    loop {
+        if let Some(st) = c.try_wait().unwrap() {
+            assert!(st.success(), "child failed: {st}");
+            return;
+        }
+        assert!(Instant::now() < end, "timed out waiting for the child");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn wait_for(path: &Path, deadline: Duration) {
     let end = Instant::now() + deadline;
     while !path.exists() {
@@ -111,9 +146,36 @@ fn child_entry() {
         return;
     };
     let dir = PathBuf::from(dir);
-    let env = open(&dir);
+    // The WRITE_MAP roles open their own env (ADR-0023 amendment 15).
+    match role.as_str() {
+        "wm_resizer" => return wm_resizer(&dir),
+        "wm_writer" => return wm_writer(&dir),
+        "hold_b_db" => return hold_b_db(&dir),
+        _ => {}
+    }
+    let env = match std::env::var(MAP) {
+        Ok(m) => open_sized(&dir, m.parse().expect("map size")),
+        Err(_) => open(&dir),
+    };
     let db = env.main_database();
     match role.as_str() {
+        "write_4mib" => {
+            // About 4 MiB of one-page overflow values, so the file's last page
+            // lies far past a 1 MiB map.
+            let value = vec![7u8; 4000];
+            for batch in 0..8u32 {
+                let mut w = env.write_txn().unwrap();
+                for i in 0..128u32 {
+                    db.put(&mut w, format!("big{batch:02}{i:04}").as_bytes(), &value)
+                        .unwrap();
+                }
+                w.commit().unwrap();
+            }
+            assert!(
+                (env.info().last_pgno + 1) * 4096 >= 4 * MIB as u64,
+                "the child wrote less than 4 MiB"
+            );
+        }
         "write_one" => {
             let mut w = env.write_txn().unwrap();
             db.put(&mut w, b"from-child", b"1").unwrap();
@@ -169,11 +231,33 @@ fn child_entry() {
             w.commit().unwrap();
         }
         "write_when_free" => {
-            mark(&dir, "child-waiting");
-            let mut w = env.write_txn().unwrap(); // blocks while the parent writes
-            mark(&dir, "child-got-lock");
-            db.put(&mut w, b"child", b"2").unwrap();
-            w.commit().unwrap();
+            // A helper thread begins the write txn, which blocks while the
+            // parent writes. This thread confirms the block from inside the
+            // child: once the begin has been under way for 300 ms without
+            // returning, it writes `child-blocked`. The parent waits for
+            // that marker instead of timing the child from outside.
+            let started = std::sync::atomic::AtomicBool::new(false);
+            let got = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    // SeqCst (both flags): a two-flag handshake with the
+                    // checking thread below; ordering cost is irrelevant.
+                    started.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let mut w = env.write_txn().unwrap(); // blocks while the parent writes
+                    got.store(true, std::sync::atomic::Ordering::SeqCst);
+                    mark(&dir, "child-got-lock");
+                    db.put(&mut w, b"child", b"2").unwrap();
+                    w.commit().unwrap();
+                });
+                mark(&dir, "child-waiting");
+                while !started.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(Duration::from_millis(300));
+                if !got.load(std::sync::atomic::Ordering::SeqCst) {
+                    mark(&dir, "child-blocked");
+                }
+            });
         }
         "hold_and_die" => {
             let mut w = env.write_txn().unwrap();
@@ -187,6 +271,22 @@ fn child_entry() {
             mark(&dir, "child-reading");
             wait_for(&dir.join("child-stop"), Duration::from_secs(60));
             drop(r);
+        }
+        "commit_and_hold_writer" => {
+            // Commit `from-child`, then hold a write txn until told to stop.
+            let mut w = env.write_txn().unwrap();
+            db.put(&mut w, b"from-child", b"1").unwrap();
+            w.commit().unwrap();
+            let mut w = env.write_txn().unwrap();
+            db.put(&mut w, b"pending", b"x").unwrap();
+            mark(&dir, "child-writing");
+            wait_for(&dir.join("child-stop"), Duration::from_secs(60));
+            drop(w);
+        }
+        "hold_open" => {
+            // Just hold the env open (no txn) until told to stop.
+            mark(&dir, "held");
+            wait_for(&dir.join("child-stop"), Duration::from_secs(60));
         }
         "hold_readers_and_die" => {
             let a = env.read_txn().unwrap();
@@ -208,6 +308,43 @@ fn commit_in_one_process_is_visible_in_another() {
     assert_eq!(
         env.main_database().get(&r, b"from-child").unwrap(),
         Some(&b"1"[..])
+    );
+}
+
+/// `Env::info()`/`Env::stat()` follow the shared published txnid `T`
+/// (ADR-0023 §4), so another process's commit is visible without this
+/// process opening a read txn of its own. Pinned by the LMDB observation
+/// `OBS_INFO_SEES_OTHER_COMMIT`/`OBS_STAT_SEES_OTHER_COMMIT`
+/// (`crates/zerodb-oracle/tests/lmdb_stage3_observation.rs`), both `true`.
+#[test]
+fn info_and_stat_see_another_processes_commit() {
+    let dir = TempDir::new();
+    let env = open(dir.path());
+    let mut w = env.write_txn().unwrap();
+    env.main_database().put(&mut w, b"a", b"1").unwrap();
+    w.commit().unwrap();
+    let info_before = env.info();
+    let stat_before = env.stat();
+    assert!(child("write_one", dir.path()).wait().unwrap().success());
+    let info_after = env.info();
+    let stat_after = env.stat();
+    assert!(
+        info_after.last_txnid > info_before.last_txnid,
+        "info().last_txnid did not advance after another process's commit: \
+         before {}, after {}",
+        info_before.last_txnid,
+        info_after.last_txnid
+    );
+    assert!(
+        info_after.last_pgno >= info_before.last_pgno,
+        "info().last_pgno went backwards after another process's commit"
+    );
+    assert!(
+        stat_after.entries > stat_before.entries,
+        "stat().entries did not advance after another process's commit: \
+         before {}, after {}",
+        stat_before.entries,
+        stat_after.entries
     );
 }
 
@@ -309,6 +446,27 @@ fn foreign_reader_holds_back_page_reuse() {
     assert!(zerodb::check::check_image(&bytes, 4096).is_empty());
 }
 
+/// Wait until a `write_when_free` child reports that its write-txn begin
+/// stayed blocked for 300 ms (`child-blocked`). Fails if the child got the
+/// writer lock instead (`child-got-lock`): the parent holds it, so it must not.
+fn wait_child_blocked(dir: &Path) {
+    let end = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            !dir.join("child-got-lock").exists(),
+            "child took the writer lock while the parent held it"
+        );
+        if dir.join("child-blocked").exists() {
+            return;
+        }
+        assert!(
+            Instant::now() < end,
+            "timed out waiting for the child to block on the writer lock"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn writers_in_two_processes_exclude_each_other() {
     let dir = TempDir::new();
@@ -316,12 +474,7 @@ fn writers_in_two_processes_exclude_each_other() {
     let db = env.main_database();
     let mut w = env.write_txn().unwrap();
     let mut c = child("write_when_free", dir.path());
-    wait_for(&dir.path().join("child-waiting"), Duration::from_secs(30));
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        !dir.path().join("child-got-lock").exists(),
-        "child took the writer lock while the parent held it"
-    );
+    wait_child_blocked(dir.path());
     db.put(&mut w, b"parent", b"1").unwrap();
     w.commit().unwrap();
     assert!(c.wait().unwrap().success());
@@ -353,31 +506,53 @@ fn killed_writer_lock_is_taken_over() {
     assert_eq!(env.main_database().get(&r, b"doomed").unwrap(), None);
 }
 
+/// A joiner that asks for another `max_readers` than the running
+/// environment's adopts the lock file's reader count, in both directions, as
+/// LMDB does (`OBS_JOINER_FEWER_MAXREADERS`, `OBS_JOINER_MORE_MAXREADERS`;
+/// ADR-0023 §1 as amended).
 #[test]
-fn second_process_with_other_max_readers_is_refused() {
+fn second_process_with_other_max_readers_adopts_the_lock_files() {
     let dir = TempDir::new();
-    let _env = open(dir.path()); // max_readers 16
-    let status = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "child_entry_other_readers", "--nocapture"])
-        .env(DIR, dir.path())
-        .status()
-        .unwrap();
-    assert!(status.success());
+    let env = open(dir.path()); // max_readers 16
+    for asked in [32u32, 4] {
+        let mut c = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "child_entry_other_readers", "--nocapture"])
+                .env(DIR, dir.path())
+                .env(MAP, asked.to_string())
+                .spawn()
+                .unwrap(),
+        );
+        wait_success(&mut c, Duration::from_secs(60));
+    }
+    assert_eq!(env.info().max_readers, 16);
+    let r = env.read_txn().unwrap();
+    assert_eq!(
+        env.main_database().get(&r, b"from-child").unwrap(),
+        Some(&b"1"[..])
+    );
 }
 
-/// Child entry point for the `max_readers` mismatch case.
+/// Child entry point for the `max_readers` adoption case: opens with the
+/// reader count in `MAP`, expects the running environment's 16, and commits.
 #[test]
 fn child_entry_other_readers() {
     let Ok(dir) = std::env::var(DIR) else { return };
+    let asked: u32 = std::env::var(MAP).unwrap().parse().unwrap();
     let mut o = EnvOpenOptions::new();
     o.map_size(64 << 20)
         .page_size(4096)
-        .max_readers(32)
+        .max_readers(asked)
         .lock_file(true);
-    match o.open(Path::new(&dir)) {
-        Err(zerodb::Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
-        other => panic!("expected a max_readers mismatch error, got {other:?}"),
-    }
+    let env = o
+        .open(Path::new(&dir))
+        .expect("a joiner with another max_readers");
+    assert_eq!(env.info().max_readers, 16, "adopted the lock file's count");
+    let mut w = env.write_txn().unwrap();
+    env.main_database()
+        .put(&mut w, b"from-child", b"1")
+        .unwrap();
+    w.commit().unwrap();
 }
 
 /// Rewrite every seeded key `rounds` times. Returns the growth of
@@ -456,11 +631,14 @@ fn reaped_slot_lets_the_writer_reuse_pages() {
     let pinned = churn_growth(&env, 20);
     assert!(pinned > 0, "the pinned churn did not grow the file");
     assert_eq!(env.clear_stale_readers().unwrap(), 2);
-    churn_growth(&env, 2); // let the freelist catch up
+    // With no reader left, every page the pinned churn freed is reusable at
+    // once, and there are far more of them than one rewrite needs: the same
+    // churn now allocates every page from the freelist and the file does not
+    // grow by a single page.
     let freed = churn_growth(&env, 20);
-    assert!(
-        freed * 4 < pinned,
-        "pages are not reused after reaping: growth {freed} vs {pinned} while pinned"
+    assert_eq!(
+        freed, 0,
+        "pages are not reused after reaping: growth {freed} pages (vs {pinned} while pinned)"
     );
 }
 
@@ -500,9 +678,7 @@ fn writer_lock_released_on_another_thread_admits_another_process() {
     let mut w = env.write_txn().unwrap();
     db.put(&mut w, b"parent", b"1").unwrap();
     let mut c = child("write_when_free", dir.path());
-    wait_for(&dir.path().join("child-waiting"), Duration::from_secs(30));
-    std::thread::sleep(Duration::from_millis(300));
-    assert!(!dir.path().join("child-got-lock").exists(), "lock not held");
+    wait_child_blocked(dir.path());
     std::thread::scope(|s| {
         s.spawn(move || w.commit().unwrap());
     });
@@ -551,4 +727,585 @@ fn writer_takeover_reaps_a_dead_readers_slot() {
         !env.reader_list().iter().any(|e| e.pid == Some(reader_pid)),
         "the takeover did not reap the dead reader"
     );
+}
+
+/// A process whose map is smaller than the data another process committed
+/// gets `MapResized` at both begins (ADR-0023 amendment 15;
+/// `OBS_READ_BEGIN_SMALL_MAP`, `OBS_WRITE_BEGIN_SMALL_MAP`). The failed write
+/// begin releases both writer locks: another process can still write.
+#[test]
+fn small_map_process_gets_map_resized_after_a_bigger_process_grows_the_file() {
+    let dir = TempDir::new();
+    let env = open_sized(dir.path(), MIB);
+    wait_success(
+        &mut child_sized("write_4mib", dir.path(), 8 * MIB),
+        Duration::from_secs(60),
+    );
+    match env.read_txn() {
+        Err(Error::Mdb(MdbError::MapResized)) => {}
+        other => panic!("read begin: expected MapResized, got {:?}", other.err()),
+    }
+    match env.write_txn() {
+        Err(Error::Mdb(MdbError::MapResized)) => {}
+        other => panic!("write begin: expected MapResized, got {:?}", other.err()),
+    }
+    // The refused write begin released the cross-process writer lock.
+    wait_success(
+        &mut child_sized("write_one", dir.path(), 8 * MIB),
+        Duration::from_secs(30),
+    );
+}
+
+/// A larger map size in the meta alone does not fail a begin: the other
+/// process's commit still fits this map (`OBS_BIGGER_META_MAPSIZE_ALONE_RESIZES`
+/// = false).
+#[test]
+fn bigger_meta_size_alone_does_not_trigger_map_resized() {
+    let dir = TempDir::new();
+    let env = open_sized(dir.path(), MIB);
+    wait_success(
+        &mut child_sized("write_one", dir.path(), 8 * MIB),
+        Duration::from_secs(60),
+    );
+    let db = env.main_database();
+    let r = env.read_txn().expect("read begin");
+    assert_eq!(db.get(&r, b"from-child").unwrap(), Some(&b"1"[..]));
+    drop(r);
+    let mut w = env.write_txn().expect("write begin");
+    db.put(&mut w, b"from-parent", b"1").unwrap();
+    w.commit().unwrap();
+}
+
+/// A process with a smaller map commits on top of a meta recording a larger
+/// map size: the meta keeps the larger size (`OBS_COMMIT_PERSISTS_OWN_MAPSIZE`
+/// = false).
+#[test]
+fn smaller_map_process_commit_keeps_the_larger_meta_size() {
+    let dir = TempDir::new();
+    {
+        let env = open_sized(dir.path(), MIB);
+        wait_success(
+            &mut child_sized("write_one", dir.path(), 8 * MIB),
+            Duration::from_secs(60),
+        );
+        let mut w = env.write_txn().unwrap();
+        env.main_database()
+            .put(&mut w, b"from-parent", b"1")
+            .unwrap();
+        w.commit().unwrap();
+    }
+    // Reopen without a map size: the environment adopts the persisted one.
+    let mut o = EnvOpenOptions::new();
+    o.page_size(4096).max_readers(16).lock_file(true);
+    let env = o.open(dir.path()).unwrap();
+    assert_eq!(env.info().map_size, 8 * MIB as u64);
+}
+
+/// After another process grew the environment past this process's map,
+/// `resize(0)` adopts the persisted map size and the next read sees the
+/// other process's data (ADR-0023 amendment 15; `OBS_SET_MAPSIZE_ZERO_ADOPTS`).
+#[test]
+fn resize_zero_adopts_the_grown_map_and_reads_succeed() {
+    let dir = TempDir::new();
+    let env = open_sized(dir.path(), MIB);
+    wait_success(
+        &mut child_sized("write_4mib", dir.path(), 8 * MIB),
+        Duration::from_secs(60),
+    );
+    match env.read_txn() {
+        Err(Error::Mdb(MdbError::MapResized)) => {}
+        other => panic!("read begin: expected MapResized, got {:?}", other.err()),
+    }
+    env.resize(0).expect("resize(0)");
+    assert_eq!(env.info().map_size, 8 * MIB as u64);
+    let db = env.main_database();
+    let r = env.read_txn().expect("read begin after resize(0)");
+    assert_eq!(
+        db.get(&r, b"big070127").unwrap(),
+        Some(&[7u8; 4000][..]),
+        "the child's last value"
+    );
+    drop(r);
+    let mut w = env.write_txn().expect("write begin after resize(0)");
+    db.put(&mut w, b"from-parent", b"1").unwrap();
+    w.commit().unwrap();
+}
+
+/// A `WRITE_MAP` lock-file env at `map_size` bytes.
+fn open_write_map(dir: &Path, map_size: usize) -> Env {
+    let mut o = EnvOpenOptions::new();
+    o.map_size(map_size)
+        .page_size(4096)
+        .max_readers(16)
+        .flags(zerodb::EnvFlags::WRITE_MAP)
+        .lock_file(true);
+    o.open(dir).expect("open WRITE_MAP lock-file env")
+}
+
+/// Grows the map 24 times, by 1 MiB each, committing one 64 KiB value after
+/// each, so the data passes the writer's 1 MiB map midway.
+///
+/// It starts growing only once the writer has opened (`writer-open`), so at
+/// least one growth lands after the writer mapped its initial 1 MiB: a
+/// writer that opened after the growth would adopt the grown size at open
+/// and never see `MapResized`.
+fn wm_resizer(dir: &Path) {
+    let env = open_write_map(dir, MIB);
+    let db = env.main_database();
+    let end = Instant::now() + Duration::from_secs(60);
+    while !dir.join("writer-open").exists() {
+        assert!(
+            Instant::now() < end,
+            "wm_resizer: the writer did not open (no writer-open marker) within 60 s"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for i in 0..24u32 {
+        env.resize(((2 + i) as usize * MIB) as u64)
+            .expect("resize up");
+        let mut w = env.write_txn().expect("resizer write begin");
+        db.put(
+            &mut w,
+            format!("resizer{i:04}").as_bytes(),
+            &[1u8; 64 << 10],
+        )
+        .unwrap();
+        w.commit().unwrap();
+    }
+}
+
+/// At least 300 small write txns on a 1 MiB map; a `MapResized` begin adopts
+/// the newer size with `resize(0)` and retries. It keeps writing past 300
+/// until it has seen at least one `MapResized` (the resizer's data passes
+/// the 1 MiB map midway, so one comes), so the run always exercises growth
+/// by another process; the retry count goes to `writer-retries`.
+fn wm_writer(dir: &Path) {
+    let env = open_write_map(dir, MIB);
+    // The resizer waits for this before it grows the map.
+    mark(dir, "writer-open");
+    let db = env.main_database();
+    let mut i = 0u32;
+    let mut retries = 0u32;
+    let end = Instant::now() + Duration::from_secs(90);
+    while i < 300 || retries == 0 {
+        assert!(
+            Instant::now() < end,
+            "no MapResized within 90 s ({i} commits)"
+        );
+        let mut w = match env.write_txn() {
+            Ok(w) => w,
+            Err(Error::Mdb(MdbError::MapResized)) => {
+                retries += 1;
+                env.resize(0).expect("adopt the grown map");
+                continue;
+            }
+            Err(e) => panic!("writer write begin: {e:?}"),
+        };
+        db.put(&mut w, format!("writer{i:04}").as_bytes(), &[2u8; 64])
+            .unwrap();
+        w.commit().unwrap();
+        i += 1;
+    }
+    std::fs::write(dir.join("writer-retries"), retries.to_string()).unwrap();
+}
+
+/// Two `WRITE_MAP` processes, one growing the map and one writing on a
+/// smaller map: the data file never shrinks, and neither process dies (a
+/// shrink under another process's mapping is a `SIGBUS`). The file grows
+/// only under both writer locks (ADR-0023 amendment 15, decision 4).
+#[test]
+fn write_map_processes_never_shrink_the_file() {
+    let dir = TempDir::new();
+    let env = open_write_map(dir.path(), MIB);
+    let data = dir.path().join(zerodb::DATA_FILE_NAME);
+    let mut resizer = child("wm_resizer", dir.path());
+    let mut writer = child("wm_writer", dir.path());
+    let end = Instant::now() + Duration::from_secs(120);
+    let mut last = std::fs::metadata(&data).unwrap().len();
+    let (mut r_done, mut w_done) = (None, None);
+    while r_done.is_none() || w_done.is_none() {
+        let len = std::fs::metadata(&data).unwrap().len();
+        assert!(len >= last, "the data file shrank from {last} to {len}");
+        last = len;
+        if r_done.is_none() {
+            r_done = resizer.try_wait().unwrap();
+        }
+        if w_done.is_none() {
+            w_done = writer.try_wait().unwrap();
+        }
+        assert!(Instant::now() < end, "timed out waiting for the children");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (r_st, w_st) = (r_done.unwrap(), w_done.unwrap());
+    assert!(r_st.success(), "resizer failed: {r_st}");
+    assert!(w_st.success(), "writer failed: {w_st}");
+    // The writer met the resizer's growth at least once, so the run
+    // exercised cross-process growth rather than two disjoint runs.
+    let retries: u32 = std::fs::read_to_string(dir.path().join("writer-retries"))
+        .expect("the writer's retry count")
+        .parse()
+        .unwrap();
+    assert!(
+        retries >= 1,
+        "the writer never got MapResized: no cross-process growth"
+    );
+    // Both processes' commits are present.
+    env.resize(0).expect("adopt the grown map");
+    let db = env.main_database();
+    let r = env.read_txn().unwrap();
+    assert!(db.get(&r, b"resizer0023").unwrap().is_some());
+    assert!(db.get(&r, b"writer0299").unwrap().is_some());
+}
+
+/// Open the lock-file env whose data file is `data_name` in `dir`.
+fn open_named(dir: &Path, data_name: &str) -> Env {
+    let mut o = EnvOpenOptions::new();
+    o.map_size(16 * MIB)
+        .page_size(4096)
+        .max_readers(16)
+        .data_file_name(data_name)
+        .lock_file(true);
+    o.open(dir).expect("open named lock-file env")
+}
+
+/// Commit `who` under the key `who` and read it back.
+fn commit_and_read_own(env: &Env, who: &[u8]) {
+    let db = env.main_database();
+    let mut w = env.write_txn().unwrap();
+    db.put(&mut w, b"who", who).unwrap();
+    w.commit().unwrap();
+    let r = env.read_txn().unwrap();
+    assert_eq!(db.get(&r, b"who").unwrap(), Some(who));
+}
+
+/// Child role: hold the `b.db` env open until the parent says stop.
+fn hold_b_db(dir: &Path) {
+    let env = open_named(dir, "b.db");
+    commit_and_read_own(&env, b"b");
+    mark(dir, "b-open");
+    wait_for(&dir.join("b-stop"), Duration::from_secs(60));
+    commit_and_read_own(&env, b"b2");
+}
+
+/// Two processes hold envs with different data names in one directory at the
+/// same time. Each derives its own lock file (`a.db-lock`, `b.db-lock`,
+/// ADR-0023 amendment 16), so they do not share a reader table or writer
+/// lock, and each commits and reads its own data.
+#[test]
+fn two_processes_with_different_data_names_use_different_lock_files() {
+    let dir = TempDir::new();
+    let a = open_named(dir.path(), "a.db");
+    commit_and_read_own(&a, b"a");
+    let mut c = child("hold_b_db", dir.path());
+    wait_for(&dir.path().join("b-open"), Duration::from_secs(30));
+    assert!(dir.path().join("a.db-lock").exists());
+    assert!(dir.path().join("b.db-lock").exists());
+    assert!(!dir.path().join(zerodb::LOCK_FILE_NAME).exists());
+    // Both alive: this process keeps writing its own env.
+    commit_and_read_own(&a, b"a2");
+    mark(dir.path(), "b-stop");
+    wait_success(&mut c, Duration::from_secs(30));
+    let r = a.read_txn().unwrap();
+    assert_eq!(a.main_database().get(&r, b"who").unwrap(), Some(&b"a2"[..]));
+}
+
+/// The lock-file options `open` uses, for `ExclusiveLock::acquire`.
+fn lock_opts() -> EnvOpenOptions {
+    let mut o = EnvOpenOptions::new();
+    o.max_readers(16).lock_file(true);
+    o
+}
+
+/// ADR-0023 §5: `PREV_SNAPSHOT` requires winning the first-opener election
+/// (no other process alive). Joining an environment another process already
+/// has open fails with `EAGAIN`, matching the LMDB fork
+/// (`OBS_PREV_SNAPSHOT_JOINER`); the lock file is released by the failed
+/// open, so a plain (non-`PREV_SNAPSHOT`) open still joins normally, and
+/// once the other process lets go, the same `PREV_SNAPSHOT` open succeeds as
+/// the sole opener.
+#[test]
+fn prev_snapshot_open_fails_while_another_process_has_the_env() {
+    let dir = TempDir::new();
+    let mut c = child("hold_open", dir.path());
+    wait_for(&dir.path().join("held"), Duration::from_secs(30));
+
+    let mut o = lock_opts();
+    o.flags(zerodb::EnvFlags::PREV_SNAPSHOT);
+    match o.open(dir.path()) {
+        Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EAGAIN), "{e}"),
+        other => panic!("expected Io(EAGAIN), got {other:?}"),
+    }
+    let joined = open(dir.path());
+    assert!(!joined.opened_exclusively(), "a joiner");
+    drop(joined);
+
+    mark(dir.path(), "child-stop");
+    wait_success(&mut c, Duration::from_secs(30));
+
+    let env = o
+        .open(dir.path())
+        .expect("sole opener: PREV_SNAPSHOT succeeds");
+    assert!(env.opened_exclusively());
+}
+
+/// ADR-0023 amendment 18: `Env::opened_exclusively` is `true` for the
+/// process that opens the environment alone and `false` for one that joins
+/// another, and `ExclusiveLock::acquire` succeeds only when no other process
+/// has the environment open, never waiting for one.
+#[test]
+fn opened_exclusively_and_exclusive_lock_see_another_process() {
+    let dir = TempDir::new();
+    {
+        let env = open(dir.path());
+        assert!(env.opened_exclusively(), "the sole opener");
+    }
+    {
+        let env = EnvOpenOptions::new().open(dir.path()).unwrap();
+        assert!(env.opened_exclusively(), "no lock file");
+    }
+
+    let mut c = child("hold_reader", dir.path());
+    wait_for(&dir.path().join("child-reading"), Duration::from_secs(30));
+    {
+        let env = open(dir.path());
+        assert!(!env.opened_exclusively(), "a joiner");
+    }
+    let started = Instant::now();
+    match zerodb::ExclusiveLock::acquire(dir.path(), &lock_opts()) {
+        Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{e}"),
+        other => panic!("expected WouldBlock, got {other:?}"),
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "acquire waited for the other process"
+    );
+    mark(dir.path(), "child-stop");
+    wait_success(&mut c, Duration::from_secs(30));
+
+    let guard = zerodb::ExclusiveLock::acquire(dir.path(), &lock_opts()).expect("alone");
+    assert!(
+        matches!(lock_opts().open(dir.path()), Err(Error::EnvAlreadyOpened)),
+        "the guard is this process's descriptor of the lock file"
+    );
+    drop(guard);
+    // The guard left the initializing magic; the next opener accepts it.
+    let env = open(dir.path());
+    assert!(env.opened_exclusively());
+    let r = env.read_txn().unwrap();
+    drop(r);
+}
+
+/// While this process holds the `ExclusiveLock`, another process's open
+/// waits in the election, and proceeds once the guard drops.
+#[test]
+fn exclusive_lock_holds_other_openers_in_the_election() {
+    let dir = TempDir::new();
+    drop(open(dir.path()));
+    let guard = zerodb::ExclusiveLock::acquire(dir.path(), &lock_opts()).expect("alone");
+    let mut c = child("write_one", dir.path());
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        c.try_wait().unwrap().is_none(),
+        "the child opened while the guard was held"
+    );
+    drop(guard);
+    wait_success(&mut c, Duration::from_secs(30));
+    let env = open(dir.path());
+    let r = env.read_txn().unwrap();
+    assert_eq!(
+        env.main_database().get(&r, b"from-child").unwrap(),
+        Some(&b"1"[..])
+    );
+}
+
+/// ADR-0023 amendment 17 (`OBS_RDONLY_EXISTING_LOCK = 0`): a `READ_ONLY` open
+/// while another process holds a write txn joins the existing lock file. It
+/// reads the other process's commit (not its pending write), and its read
+/// txn takes a slot in the shared reader table under this process's PID.
+#[test]
+fn read_only_env_joins_the_existing_lock_file() {
+    let dir = TempDir::new();
+    let mut c = child("commit_and_hold_writer", dir.path());
+    wait_for(&dir.path().join("child-writing"), Duration::from_secs(30));
+
+    let mut o = lock_opts();
+    o.flags(zerodb::EnvFlags::READ_ONLY);
+    let env = o.open(dir.path()).expect("read-only joiner");
+    assert!(env.has_lock_file());
+    assert!(!env.opened_exclusively(), "joined the child's lock file");
+    let r = env.read_txn().unwrap();
+    let db = env.main_database();
+    assert_eq!(db.get(&r, b"from-child").unwrap(), Some(&b"1"[..]));
+    assert_eq!(db.get(&r, b"pending").unwrap(), None);
+    let me = std::process::id();
+    assert!(
+        env.reader_list().iter().any(|e| e.pid == Some(me)),
+        "no reader slot under this process's PID: {:?}",
+        env.reader_list()
+    );
+    drop(r);
+    drop(env);
+    mark(dir.path(), "child-stop");
+    wait_success(&mut c, Duration::from_secs(30));
+}
+
+/// A `READ_ONLY` open of an environment without a lock file, in a directory
+/// this process cannot write, fails with `EACCES` and creates nothing
+/// (`OBS_RDONLY_LOCK_DIR_UNWRITABLE`). Root ignores file modes, so it is
+/// skipped there.
+#[test]
+fn read_only_open_in_an_unwritable_dir_fails_and_creates_nothing() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = TempDir::new();
+    // The directory this process just created is owned by its effective uid,
+    // so this tells root apart without FFI.
+    if std::fs::metadata(dir.path()).unwrap().uid() == 0 {
+        println!("SKIPPED: running as root, which ignores directory modes");
+        return;
+    }
+    // The environment is created without a lock file (`lock_file(false)`;
+    // the default would create one).
+    drop(
+        EnvOpenOptions::new()
+            .lock_file(false)
+            .open(dir.path())
+            .unwrap(),
+    );
+    std::fs::set_permissions(dir.path(), PermissionsExt::from_mode(0o555)).unwrap();
+    let mut o = lock_opts();
+    o.flags(zerodb::EnvFlags::READ_ONLY);
+    let r = o.open(dir.path());
+    let created = dir.path().join("zerodb.lock").exists();
+    std::fs::set_permissions(dir.path(), PermissionsExt::from_mode(0o755)).unwrap();
+    match r {
+        Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EACCES), "{e}"),
+        other => panic!("expected Io(EACCES), got {other:?}"),
+    }
+    assert!(!created, "the failed open created a lock file");
+}
+
+/// Run `cmd` to completion within 60 s; `false` on a failure exit, a spawn
+/// error or the timeout (the child is then killed).
+fn run_bounded(cmd: &mut Command) -> bool {
+    let Ok(mut child) = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return st.success(),
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// A read-only filesystem holding a copy of a directory, unmounted on drop.
+struct ReadOnlyFs {
+    mount: PathBuf,
+    _keep: TempDir,
+}
+
+impl Drop for ReadOnlyFs {
+    fn drop(&mut self) {
+        if cfg!(target_os = "macos") {
+            run_bounded(
+                Command::new("hdiutil")
+                    .arg("detach")
+                    .arg("-force")
+                    .arg(&self.mount),
+            );
+        } else {
+            run_bounded(Command::new("umount").arg(&self.mount));
+        }
+    }
+}
+
+/// Make a read-only filesystem with `src`'s files, or say why not: a
+/// read-only disk image on macOS (`hdiutil`), a read-only bind mount on
+/// Linux (needs `CAP_SYS_ADMIN`, for example a privileged container).
+fn read_only_fs(src: &Path) -> Result<ReadOnlyFs, String> {
+    let keep = TempDir::new();
+    let mount = keep.path().join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    if cfg!(target_os = "macos") {
+        let img = keep.path().join("ro.dmg");
+        if !run_bounded(
+            Command::new("hdiutil")
+                .args(["create", "-quiet", "-format", "UDRO", "-srcfolder"])
+                .arg(src)
+                .arg(&img),
+        ) {
+            return Err("hdiutil create failed".into());
+        }
+        if !run_bounded(
+            Command::new("hdiutil")
+                .args(["attach", "-quiet", "-readonly", "-nobrowse", "-mountpoint"])
+                .arg(&mount)
+                .arg(&img),
+        ) {
+            return Err("hdiutil attach failed".into());
+        }
+    } else {
+        if !run_bounded(Command::new("mount").arg("--bind").arg(src).arg(&mount)) {
+            return Err("bind mount failed (needs CAP_SYS_ADMIN)".into());
+        }
+        if !run_bounded(
+            Command::new("mount")
+                .args(["-o", "remount,bind,ro"])
+                .arg(&mount),
+        ) {
+            run_bounded(Command::new("umount").arg(&mount));
+            return Err("read-only remount failed".into());
+        }
+    }
+    Ok(ReadOnlyFs { mount, _keep: keep })
+}
+
+/// ADR-0023 amendment 17 (`OBS_RDONLY_LOCK_READONLY_FS = 0`): on read-only
+/// media, where no lock file can be created, a `READ_ONLY` open proceeds
+/// without one and serves read txns. A writable open there still fails with
+/// `EROFS`.
+#[test]
+fn read_only_env_on_read_only_media_opens_without_a_lock_file() {
+    let src = TempDir::new();
+    {
+        // Created without a lock file (`lock_file(false)`; the default would
+        // create one), so the read-only copy has none.
+        let env = EnvOpenOptions::new()
+            .lock_file(false)
+            .open(src.path())
+            .unwrap();
+        let mut w = env.write_txn().unwrap();
+        env.main_database().put(&mut w, b"k", b"v").unwrap();
+        w.commit().unwrap();
+    }
+    let fs = match read_only_fs(src.path()) {
+        Ok(fs) => fs,
+        Err(why) => {
+            println!("SKIPPED: no read-only filesystem here ({why})");
+            return;
+        }
+    };
+    {
+        let mut o = lock_opts();
+        o.flags(zerodb::EnvFlags::READ_ONLY);
+        let env = o.open(&fs.mount).expect("READ_ONLY on read-only media");
+        assert!(!env.has_lock_file());
+        let r = env.read_txn().unwrap();
+        assert_eq!(env.main_database().get(&r, b"k").unwrap(), Some(&b"v"[..]));
+    }
+    assert!(!fs.mount.join("zerodb.lock").exists());
+    match lock_opts().open(&fs.mount) {
+        Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EROFS), "{e}"),
+        other => panic!("expected Io(EROFS) for a writable open, got {other:?}"),
+    }
 }

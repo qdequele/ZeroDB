@@ -39,11 +39,19 @@ macro_rules! bench_backend {
                 opts.map_size(map_size);
                 opts.max_dbs(16);
                 bench_backend!(@setpage opts, page, $setpage);
-                // SAFETY: single-process, private temp dir; the only flag ever
-                // set is NO_SYNC (durability, not a cross-process behavior).
+                let mut flags = EnvFlags::empty();
+                if no_sync {
+                    flags |= EnvFlags::NO_SYNC;
+                }
+                bench_backend!(@nolock flags, $setpage);
+                // SAFETY: single-process, private temp dir; the flags are
+                // NO_SYNC (durability, not a cross-process behavior) and, on
+                // the zerodb side with `ZERODB_BENCH_NO_LOCK=1`, NO_LOCK, whose
+                // contract (no other process opens the env) a private temp dir
+                // in one process meets.
                 unsafe {
-                    if no_sync {
-                        opts.flags(EnvFlags::NO_SYNC);
+                    if flags != EnvFlags::empty() {
+                        opts.flags(flags);
                     }
                     opts.open(dir)
                 }
@@ -716,16 +724,23 @@ macro_rules! bench_backend {
         if crate::backend::bench_knob("ZERODB_BENCH_SEQUENTIAL_WRITES") {
             $opts.sequential_writes(true);
         }
-        // ADR-0023 bench axis: `ZERODB_BENCH_LOCK_FILE=1` opens every zerodb
-        // env with the multi-process lock file, to measure its single-process
-        // cost against the default. Off unless set.
-        if std::env::var("ZERODB_BENCH_LOCK_FILE").as_deref() == Ok("1") {
-            $opts.lock_file(true);
-        }
     };
     (@setpage $opts:ident, $page:ident, noset) => {
         // LMDB derives its page size from the OS; nothing to set.
         let _ = $page;
+    };
+    (@nolock $flags:ident, set) => {
+        // ADR-0023 bench axis: the lock file is on by default, as in LMDB.
+        // `ZERODB_BENCH_NO_LOCK=1` opens every zerodb env with heed's
+        // `NO_LOCK` (the engine's `lock_file(false)`), to measure the
+        // single-process cost of the lock file against the default.
+        if crate::backend::bench_knob("ZERODB_BENCH_NO_LOCK") {
+            $flags |= EnvFlags::NO_LOCK;
+        }
+    };
+    (@nolock $flags:ident, noset) => {
+        // The LMDB side always runs with its default lock file.
+        let _ = &mut $flags;
     };
 }
 

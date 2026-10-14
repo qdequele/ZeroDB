@@ -1,20 +1,29 @@
 //! Memory maps over an env data file (SPEC 02 §8): the read-only [`Mmap`]
 //! (default backing) and the writable [`MmapWritable`] (`EnvFlags::WRITE_MAP`).
 //!
+//! It also holds [`MapRegions`], the grow-only cell of mappings a backing
+//! reads through (ADR-0023 amendment 15).
+//!
 //! This is one of the sanctioned homes for `unsafe` (the unsafe policy:
-//! mmap access). There are four `unsafe` blocks: [`Mmap::map`] (read map),
+//! mmap access). The `unsafe` here: [`Mmap::map`] (read map),
 //! [`MmapWritable::map`] (writable map), [`MmapWritable::write_at`] (the
-//! `memcpy` into the writable map), and [`MmapWritable::slice_mut`] (the
-//! ADR-0021 brokered dirty-page slice); each states its safety contract.
+//! `memcpy` into the writable map), [`MmapWritable::slice_mut`] (the
+//! ADR-0021 brokered dirty-page slice), and in [`MapRegions`] the view and
+//! mapping dereferences, the `Box::from_raw` calls in its `Drop`, and its
+//! `Send`/`Sync` impls. Each states its safety contract.
 
 use std::fs::File;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 /// A read-only memory map over an env data file.
 ///
 /// Exposes the mapped bytes as `&[u8]` and individual pages by page number.
 /// The map (ADR-0004 D4) covers the **full `map_size`** — which
 /// may extend past the current end-of-file. The file grows underneath the
-/// fixed mapping via `pwrite` (commit C2); no remap ever happens.
+/// mapping via `pwrite` (commit C2); a mapping is never remapped in place, and
+/// `Env::resize` adds a longer one beside it (`MapRegions`, ADR-0023
+/// amendment 15).
 pub struct Mmap {
     inner: memmap2::Mmap,
 }
@@ -34,21 +43,29 @@ impl Mmap {
     pub fn map(file: &File, len: usize) -> std::io::Result<Mmap> {
         // SAFETY: memmap2's `map` is `unsafe` because a memory map aliases the
         // file's contents and the borrow checker cannot see writers through
-        // the fd. Our invariants (SPEC 02 §8, SPEC 04 §9, single-process):
+        // the fd. Our invariants (SPEC 02 §8, SPEC 04 §9 and §12):
         //  * `file` is a live, open regular file for the whole lifetime of the
         //    returned `Mmap` (the caller keeps the `File` alive alongside it —
         //    see `MmapBacking`);
         //  * accesses are confined to pages referenced by some committed
         //    snapshot, all of which lie within the real file length (REC-14),
         //    so no dereference faults past EOF even though `len` may exceed it;
-        //  * the env is single-process: no *other* process writes or
-        //    truncates the file. Our *own* commit path writes through the fd
+        //  * every process that writes the file is a ZeroDB writer obeying
+        //    the same rules: one writer at a time across processes (the
+        //    cross-process writer lock, ADR-0023 §2), writing only the pages
+        //    and meta slots described next, and no process ever truncates or
+        //    shrinks the file. Without a lock file the caller keeps other
+        //    processes out (`NO_LOCK`, as LMDB). A writer's commit path writes
+        //    through the fd
         //    (`MmapBacking::write_at_page`), which mutates the mapped memory —
         //    but only at pages **no live snapshot references** (TXN-62: fresh
         //    pages beyond the committed high-water) and at the meta slots
         //    0/1, which are never handed out as borrows (readers clone the
-        //    published snapshot *object*, TXN-18, and never read a meta page
-        //    after open). A write txn that spills (SPEC 04 §6.3a) writes
+        //    published snapshot *object*, TXN-18; after open a meta is read
+        //    only as a `pread` copy, ADR-0023 amendment 4 — at open a joining
+        //    process validates both slots from the map once, and a CRC
+        //    rejects a slot torn by a concurrent rewrite). A write txn that
+        //    spills (SPEC 04 §6.3a) writes
         //    the same TXN-62 pages earlier and may read them back through
         //    the map; it rewrites one only at the start of a later `&mut`
         //    call of that txn, when no borrow into it is live (TXN-39). So no
@@ -106,12 +123,15 @@ impl Mmap {
 /// (`sync`), replacing the heap-buffer `pwrite`+`fdatasync` primitive of the
 /// default backing.
 ///
-/// The file MUST be `set_len(map_size)` before mapping (SPEC 04 §6.4, matching
-/// the fork's `ftruncate`-to-mapsize under writemap): the whole `[0, map_size)`
-/// region is then backed by real (sparse) blocks, so a store anywhere in it —
-/// including pages beyond the current logical high-water — never faults with
-/// `SIGBUS`. ADR-0004 D4 (map once, no remap) holds: the map covers the full
-/// `map_size` for the env's life.
+/// Every page below the logical `map_size` MUST be inside the file before
+/// anything is stored through the map (SPEC 04 §6.4, matching the fork's
+/// `ftruncate`-to-mapsize under writemap): the region is then backed by real
+/// (sparse) blocks, so a store anywhere in it — including pages beyond the
+/// current logical high-water — never faults with `SIGBUS`. The file is grown
+/// at open when the process is alone, and otherwise under both writer locks,
+/// at `resize` and at every write-txn begin (ADR-0023 amendment 15); a
+/// joiner's map may extend past the file's end until its first write txn.
+/// A mapping is never remapped in place; `resize` adds a longer one.
 pub struct MmapWritable {
     inner: memmap2::MmapMut,
 }
@@ -127,8 +147,9 @@ impl MmapWritable {
     }
 
     /// Map the first `len` bytes of `file` read/write (`MAP_SHARED`,
-    /// `PROT_READ | PROT_WRITE`). `file` must be open read+write and at least
-    /// `len` bytes long (the caller `set_len`s it first, SPEC 04 §6.4).
+    /// `PROT_READ | PROT_WRITE`). `file` must be open read+write. `len` may
+    /// exceed the file; nothing may be stored past the file's end (the
+    /// writer grows the file to its logical size first, SPEC 04 §6.4).
     ///
     /// # Errors
     ///
@@ -137,14 +158,20 @@ impl MmapWritable {
         // SAFETY: the same aliasing contract as `Mmap::map`, extended to writes.
         // memmap2's `map_mut` is `unsafe` because the mapping aliases the file
         // and the borrow checker cannot see writers through the fd. Our
-        // invariants (SPEC 04 §9 TXN-62, §6.4, single-process, single-writer TXN-6):
+        // invariants (SPEC 04 §9 TXN-62, §6.4, §12, single writer across
+        // processes TXN-6):
         //  * `file` stays open for the whole life of the returned map (the
         //    caller keeps the `File` alongside it — see `WriteMapBacking`);
-        //  * the file was `set_len(map_size)` so every page in `[0, len)` is
-        //    backed — a store never faults past EOF;
+        //  * every page a store targets is inside the file: stores happen
+        //    only inside a write txn, below the logical map size, after that
+        //    txn's begin grew the file to the logical size under both writer
+        //    locks (SPEC 04 §6.4, ADR-0023 amendment 15) — a store never
+        //    faults past EOF. Pages of the mapping past the file's end (a
+        //    joiner's map, or a geometric mapping longer than the logical
+        //    size) are never touched; the file never shrinks;
         //  * writes go only through `write_at_page` or the brokered
         //    `slice_mut` (ADR-0021, in-place WRITE_MAP), called only by the
-        //    single writer holding the write mutex (TXN-6) — at commit C2/C4,
+        //    single writer holding both writer locks (TXN-6) — at commit C2/C4,
         //    when it spills (SPEC 04 §6.3a), or at dirty-frame
         //    allocation/edit time (TXN-45b) — and only to
         //    pages **no live snapshot references** (TXN-62: fresh pages beyond
@@ -157,7 +184,11 @@ impl MmapWritable {
         //    after every spill before resolving a spilled page through it
         //    (TXN-71, ADR-0021 B2). So no
         //    `&[u8]` a reader actually dereferences is mutated while borrowed;
-        //  * the env is single-process: no other process writes/truncates.
+        //  * every other process that writes the file obeys the same rules
+        //    (one writer at a time across processes, ADR-0023 §2), and no
+        //    process truncates or shrinks it: `WRITE_MAP` growth only ever
+        //    extends the file, under both writer locks (ADR-0023 amendment
+        //    15). Without a lock file the caller keeps other processes out.
         let inner = unsafe { memmap2::MmapOptions::new().len(len).map_mut(file)? };
         Ok(MmapWritable { inner })
     }
@@ -278,5 +309,213 @@ impl MmapWritable {
         } else {
             self.inner.flush()
         }
+    }
+}
+
+/// One mmap of the data file (ADR-0023 amendment 15).
+pub(crate) enum Mapping {
+    /// A read-only map (the default backing).
+    Read(Mmap),
+    /// A writable map (`WRITE_MAP`).
+    Write(MmapWritable),
+    /// Heap bytes standing in for a map, so the [`MapRegions`] protocol runs
+    /// under miri, which cannot see OS mappings.
+    #[cfg(test)]
+    Heap(Box<[u8]>),
+}
+
+impl Mapping {
+    /// The whole mapped region.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        match self {
+            Mapping::Read(m) => m.bytes(),
+            Mapping::Write(m) => m.bytes(),
+            #[cfg(test)]
+            Mapping::Heap(b) => b,
+        }
+    }
+}
+
+/// A published (mapping, logical map size) pair. Immutable once published.
+pub(crate) struct ViewCell {
+    mapping: *const Mapping,
+    map_size: u64,
+}
+
+/// Every mapping and view a [`MapRegions`] ever created, freed only in its
+/// `Drop`.
+struct Owned {
+    mappings: Vec<*mut Mapping>,
+    views: Vec<*mut ViewCell>,
+}
+
+/// Grow-only mappings (ADR-0023 amendment 15). Every mapping and view is
+/// created with `Box::into_raw`, recorded in `owned`, and freed only in Drop.
+///
+/// `current` points to the newest view. One `Acquire` load of it gives a
+/// consistent (mapping, logical map size) pair: the logical size is never
+/// stored apart from the mapping it fits in. A new mapping is added only when
+/// it is longer than the current one, so mapping lengths never decrease in
+/// publication order. A mapping stays mapped until the backing drops, so no
+/// borrow of an older mapping is ever invalidated.
+pub struct MapRegions {
+    current: AtomicPtr<ViewCell>,
+    owned: Mutex<Owned>,
+}
+
+// SAFETY: the raw pointers are uniquely owned boxes of `Send + Sync` types
+// (`Mmap`/`MmapWritable` are `Send + Sync`, as is `Box<[u8]>`); `owned` is
+// mutated only under its mutex and `current` is atomic. Nothing is freed
+// before Drop.
+unsafe impl Send for MapRegions {}
+// SAFETY: as for `Send`. Shared access only loads `current` (atomically) and
+// reads immutable, never-freed views and mappings; `publish` mutates `owned`
+// under the mutex.
+unsafe impl Sync for MapRegions {}
+
+// Pins the `Send`/`Sync` argument above: every mapping type the raw pointers
+// own must itself be `Send + Sync`, or this fails to compile.
+const _: () = {
+    fn assert_send_sync<T: Send + Sync>() {}
+    let _ = assert_send_sync::<Mapping>;
+};
+
+impl MapRegions {
+    /// Publishes view 0 over `first`.
+    pub(crate) fn new(first: Mapping, map_size: u64) -> MapRegions {
+        let mapping = Box::into_raw(Box::new(first));
+        let view = Box::into_raw(Box::new(ViewCell {
+            mapping: mapping.cast_const(),
+            map_size,
+        }));
+        MapRegions {
+            current: AtomicPtr::new(view),
+            owned: Mutex::new(Owned {
+                mappings: vec![mapping],
+                views: vec![view],
+            }),
+        }
+    }
+
+    /// One Acquire load: a consistent (bytes, map_size).
+    pub(crate) fn view(&self) -> (&Mapping, u64) {
+        // Acquire: pairs with the Release in `publish`; the view and its
+        // mapping were fully built before the store.
+        let v = self.current.load(Ordering::Acquire);
+        // SAFETY: `v` came from `Box::into_raw` in `publish`/`new` and is
+        // recorded in `owned`; views and mappings are freed only in Drop
+        // (`&mut self`), so both outlive `&self`. No `&mut` to them ever
+        // exists after publication.
+        let v = unsafe { &*v };
+        // SAFETY: as above, for the mapping `v` points to.
+        (unsafe { &*v.mapping }, v.map_size)
+    }
+
+    /// Publish `map_size`, adding `new_mapping` if given. Callers hold the
+    /// writer lock, so publications are serialized.
+    pub(crate) fn publish(&self, new_mapping: Option<Mapping>, map_size: u64) {
+        let mut owned = self.owned.lock().expect("map regions poisoned");
+        let mapping = match new_mapping {
+            Some(m) => {
+                let p = Box::into_raw(Box::new(m));
+                owned.mappings.push(p);
+                p.cast_const()
+            }
+            None => {
+                // Relaxed: under the mutex, which orders this load after the
+                // previous publish's store.
+                let cur = self.current.load(Ordering::Relaxed);
+                // SAFETY: as in `view`: `cur` is a published, never-freed view.
+                unsafe { (*cur).mapping }
+            }
+        };
+        let v = Box::into_raw(Box::new(ViewCell { mapping, map_size }));
+        owned.views.push(v);
+        // Release: the view and its mapping are fully constructed first.
+        self.current.store(v, Ordering::Release);
+    }
+}
+
+impl Drop for MapRegions {
+    fn drop(&mut self) {
+        // A poisoned mutex still holds every pointer: free them anyway, so no
+        // mapping outlives the descriptor and Drop never panics mid-unwind.
+        let owned = self.owned.get_mut().unwrap_or_else(PoisonError::into_inner);
+        for v in owned.views.drain(..) {
+            // SAFETY: each pointer came from `Box::into_raw` exactly once and
+            // is freed exactly once; `&mut self` proves no borrow is live.
+            drop(unsafe { Box::from_raw(v) });
+        }
+        for m in owned.mappings.drain(..) {
+            // SAFETY: as above.
+            drop(unsafe { Box::from_raw(m) });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MapRegions, Mapping};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    /// A heap mapping of `len` bytes, every byte `fill`.
+    fn heap(len: usize, fill: u8) -> Mapping {
+        Mapping::Heap(vec![fill; len].into_boxed_slice())
+    }
+
+    /// One thread publishes three growing views while two threads read
+    /// through `view()`. Every view a reader loads is consistent: the mapping
+    /// covers the logical size, and the last byte of the logical size holds
+    /// the generation that mapping was built with. Under miri, the data-race
+    /// detector checks the Release/Acquire pairing that makes the mapping's
+    /// bytes visible to a reader that loaded its view.
+    #[test]
+    fn map_regions_publish_is_seen_consistently() {
+        // Generations: 64 bytes of 1s (sizes 48, then 64 without a new
+        // mapping), 128 bytes of 2s (size 100), 512 bytes of 3s (size 300).
+        let regions = Arc::new(MapRegions::new(heap(64, 1), 48));
+        let done = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let regions = Arc::clone(&regions);
+                let done = Arc::clone(&done);
+                std::thread::spawn(move || {
+                    let mut last = 0u64;
+                    loop {
+                        // Acquire: pairs with the Release store of `done`
+                        // after the final publish.
+                        let finished = done.load(Ordering::Acquire);
+                        let (m, size) = regions.view();
+                        let bytes = m.bytes();
+                        assert!(bytes.len() as u64 >= size, "mapping shorter than its size");
+                        assert!(size >= last, "a later load returned an older view");
+                        last = size;
+                        let tail = bytes[size as usize - 1];
+                        let want = match size {
+                            48 | 64 => 1,
+                            100 => 2,
+                            300 => 3,
+                            other => panic!("unexpected size {other}"),
+                        };
+                        assert_eq!(tail, want, "size {size}");
+                        if finished {
+                            assert_eq!(size, 300, "the final view is visible");
+                            return;
+                        }
+                    }
+                })
+            })
+            .collect();
+        regions.publish(None, 64);
+        regions.publish(Some(heap(128, 2)), 100);
+        regions.publish(Some(heap(512, 3)), 300);
+        // Release: orders the publishes before a reader's Acquire of `done`.
+        done.store(true, Ordering::Release);
+        for r in readers {
+            r.join().expect("reader");
+        }
+        let (m, size) = regions.view();
+        assert_eq!((m.bytes().len(), size), (512, 300));
     }
 }

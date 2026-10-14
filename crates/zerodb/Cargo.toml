@@ -14,3 +14,7 @@ categories = ["database-implementations", "database"]
 [dependencies]
 zerodb-core = { path = "../zerodb-core", version = "=0.2.0" }
 zerodb-io = { path = "../zerodb-io", version = "=0.2.0" }
+# EAGAIN for the PREV_SNAPSHOT joiner refusal and EROFS for a writable open on
+# read-only media (ADR-0023 stage 3, `Env::open`);
+# allowlisted (AGENTS.md).
+libc.workspace = true

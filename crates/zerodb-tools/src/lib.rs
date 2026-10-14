@@ -1,4 +1,4 @@
-//! `zerodb-tools` — offline utilities for zerodb env files.
+//! `zerodb-tools` — utilities for zerodb env directories.
 //!
 //! A single binary with subcommands:
 //!
@@ -9,24 +9,34 @@
 //! - `migrate-from-lmdb <src> <dst>` — stream a real LMDB env into a fresh
 //!   zerodb env (needs the `migrate-lmdb` feature).
 //!
-//! ## Offline / liveness
+//! ## Live environments (ADR-0023 amendment 18)
 //!
-//! ZeroDB has no cross-process reader protocol (it is single-process by
-//! design; see docs/DIVERGENCES.md), so pointing a tool at a
-//! **live** env is unsafe. Every tool takes a best-effort exclusive `flock` on
-//! the env's data file and **refuses** if it is held (`crate::lock`); the
-//! documented contract is that tools run against a **closed** env.
+//! `stat`, `dump` and `check` open the env `READ_ONLY` through the engine,
+//! with its lock file, and so attach to an env that other processes have
+//! open, as LMDB's `mdb_stat` and `mdb_dump` do: they take a reader slot and
+//! read one pinned snapshot, while writers keep committing. `check` walks
+//! that snapshot; only when the env does not open as a valid one does it walk
+//! the raw file, and then only while holding the lock file exclusively
+//! ([`zerodb::ExclusiveLock`]), refusing if another process has the env open.
+//!
+//! `load` and `migrate-from-lmdb` create a fresh env: they refuse a
+//! non-empty destination, open it through the engine, refuse it unless this
+//! process opened it alone ([`zerodb::Env::opened_exclusively`]), and hold it
+//! for the whole run, writing through ordinary write txns.
 //!
 //! ## Which data file? (ADR-0010)
 //!
 //! The data-file name depends on the stack that created the env — `zerodb.dat`
 //! natively, `data.mdb` through the `heed-zerodb` adapter. The read tools
-//! (`stat`/`dump`/`check`) and the flock guard therefore **probe both names**
-//! (`crate::naming`); a directory holding *both* is a hard error, never a
-//! silent pick. `stat` reports the engine and format read from the file's own
-//! magic, so an operator never has to infer it from the name.
+//! (`stat`/`dump`/`check`) therefore **probe both names** (`crate::naming`)
+//! and open the lock file named after the one found
+//! ([`zerodb::derived_lock_file_name`]: `zerodb.lock` or `lock.mdb`), the
+//! same lock file as the processes they attach to; a directory holding *both*
+//! data files is a hard error, never a silent pick. `stat` reports the engine
+//! and format read from the file's own magic, so an operator never has to
+//! infer it from the name.
 //!
-//! The crate is a library (so the dump format, lock, and command functions are
+//! The crate is a library (so the dump format and command functions are
 //! unit- and integration-testable) plus a thin `main.rs` that parses argv and
 //! dispatches through [`run`].
 
@@ -34,7 +44,6 @@
 pub mod commands;
 pub mod common;
 pub mod dump_format;
-pub mod lock;
 pub mod naming;
 
 #[cfg(feature = "migrate-lmdb")]
@@ -166,8 +175,9 @@ Subcommands:
   -V, --version                         print the zerodb-tools version
   -h, --help                            this text
 
-All tools operate OFFLINE: they take an exclusive flock on the data file and
-refuse if the env may be live (ZeroDB has no cross-process reader protocol).";
+stat, dump and check attach read-only to an env other processes have open,
+through its lock file, and read one consistent snapshot. load and
+migrate-from-lmdb refuse a destination that is non-empty or open elsewhere.";
 
 /// Parsed optional flags shared by several subcommands.
 #[derive(Default)]

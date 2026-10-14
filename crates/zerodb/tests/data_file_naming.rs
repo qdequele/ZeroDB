@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use zerodb::{Env, EnvOpenOptions, Error, DATA_FILE_NAME, HEED_DATA_FILE_NAME};
+use zerodb::{Env, EnvOpenOptions, Error, DATA_FILE_NAME, HEED_DATA_FILE_NAME, LOCK_FILE_NAME};
 
 const MAP_SIZE: usize = 1024 * 1024;
 
@@ -66,7 +66,8 @@ fn get(env: &Env, k: &[u8]) -> Option<Vec<u8>> {
     db.get(&rtxn, k).unwrap().map(<[u8]>::to_vec)
 }
 
-/// The native default: a plain `open` creates `zerodb.dat` and nothing else.
+/// The native default: a plain `open` creates `zerodb.dat` and its lock file
+/// `zerodb.lock` (on by default, ADR-0023), and nothing else.
 #[test]
 fn native_default_is_zerodb_dat() {
     let dir = TempDir::new();
@@ -76,12 +77,17 @@ fn native_default_is_zerodb_dat() {
     let env = o.open(dir.path()).unwrap();
     put(&env, b"k", b"v");
 
-    assert_eq!(dir_listing(dir.path()), vec![DATA_FILE_NAME.to_string()]);
+    assert_eq!(
+        dir_listing(dir.path()),
+        vec![DATA_FILE_NAME.to_string(), LOCK_FILE_NAME.to_string()]
+    );
     assert_eq!(DATA_FILE_NAME, "zerodb.dat");
+    assert_eq!(LOCK_FILE_NAME, "zerodb.lock");
 }
 
 /// The knob works natively: an env opened with the adapter's name materializes
-/// under that name and round-trips.
+/// under that name, next to the lock file derived from it (`lock.mdb`), and
+/// round-trips.
 #[test]
 fn configured_name_is_used_and_reopens() {
     let dir = TempDir::new();
@@ -89,7 +95,10 @@ fn configured_name_is_used_and_reopens() {
     o.map_size(MAP_SIZE).data_file_name(HEED_DATA_FILE_NAME);
     let env = o.open(dir.path()).unwrap();
     put(&env, b"k", b"v");
-    assert_eq!(dir_listing(dir.path()), vec!["data.mdb".to_string()]);
+    assert_eq!(
+        dir_listing(dir.path()),
+        vec!["data.mdb".to_string(), "lock.mdb".to_string()]
+    );
     env.prepare_for_closing().wait();
 
     let reopened = o.open(dir.path()).unwrap();
@@ -118,11 +127,17 @@ fn name_mismatch_creates_a_fresh_env_and_does_not_adopt() {
     let fresh = heed_named.open(dir.path()).unwrap();
     // Fresh and empty: the `zerodb.dat` next door was not adopted.
     assert_eq!(get(&fresh, b"native"), None);
-    // Both files now exist side by side — two separate databases. (This is the
-    // state `zerodb-tools` refuses as ambiguous.)
+    // Both data files now exist side by side — two separate databases, each
+    // with its own derived lock file. (This is the state `zerodb-tools`
+    // refuses as ambiguous.)
     assert_eq!(
         dir_listing(dir.path()),
-        vec!["data.mdb".to_string(), "zerodb.dat".to_string()]
+        vec![
+            "data.mdb".to_string(),
+            "lock.mdb".to_string(),
+            "zerodb.dat".to_string(),
+            "zerodb.lock".to_string()
+        ]
     );
 }
 
@@ -172,7 +187,7 @@ fn invalid_names_are_invalid_input() {
 }
 
 /// A valid-but-unusual name is accepted: the knob is a general integration
-/// point, not a two-value enum.
+/// point, not a two-value enum. Its lock file is `<name>-lock`.
 #[test]
 fn arbitrary_single_component_name_works() {
     let dir = TempDir::new();
@@ -180,5 +195,8 @@ fn arbitrary_single_component_name_works() {
     o.map_size(MAP_SIZE).data_file_name("tasks.store");
     let env = o.open(dir.path()).unwrap();
     put(&env, b"k", b"v");
-    assert_eq!(dir_listing(dir.path()), vec!["tasks.store".to_string()]);
+    assert_eq!(
+        dir_listing(dir.path()),
+        vec!["tasks.store".to_string(), "tasks.store-lock".to_string()]
+    );
 }

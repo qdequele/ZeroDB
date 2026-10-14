@@ -58,7 +58,11 @@ trusted-file mode) so the default stays a faithful drop-in.
 
 `unsafe` is allowed only in:
 
-- mmap access and page casting (`zerodb-core::page`, `zerodb-io`);
+- mmap access and page casting (`zerodb-core::page`, `zerodb-io`),
+  including the grow-only mapping cell (`zerodb-io::mmap::MapRegions`): an
+  `AtomicPtr` to views and mappings freed only on drop — the view and mapping
+  dereferences, the `Box::from_raw` calls in its `Drop` — with its
+  `Send`/`Sync` impls (ADR-0023 amendment 15);
 - shared-memory synchronization primitives in `zerodb-io::lockfile`
   (ADR-0023): atomic views over the mapped lock file
   (`AtomicU64::from_ptr` / `AtomicU32::from_ptr`, and one
@@ -71,11 +75,12 @@ trusted-file mode) so the default stays a faithful drop-in.
 - FFI inside `zerodb-oracle`;
 - the minimal API-shape `unsafe` in `heed-zerodb` that heed's pointer model
   requires: `Send` impls, TLS-marker retags, the lifetime-erased write cursor,
-  the `ReservedSpace` uninitialized view, and one `sysconf` for the OS page
-  size — nothing beyond what the mirrored heed surface forces;
-- `zerodb-tools`: one `libc::flock` (`src/lock.rs`, the guard against opening a
-  live environment) and the `migrate-lmdb` feature's heed `open`
-  (`src/migrate.rs`). These two are in use and awaiting maintainer review.
+  the `ReservedSpace` uninitialized view, one `sysconf` for the OS page
+  size, and the `unsafe fn resize` signature heed declares (ADR-0023
+  amendment 15; its body holds no `unsafe` block) — nothing beyond what the
+  mirrored heed surface forces;
+- `zerodb-tools`: the `migrate-lmdb` feature's heed `open`
+  (`src/migrate.rs`), in use and awaiting maintainer review.
 
 The in-place `WRITE_MAP` exception covers only calling `zerodb-io`'s `unsafe`
 map-slice broker to realize a dirty page in the writable map at a freshly
@@ -156,7 +161,7 @@ error taxonomy. Public items are documented. No `TODO` in merged code — open a
 issue instead.
 
 No new dependency without an ADR. Current allowlist: `memmap2`, `libc`,
-`thiserror`, `crossbeam-utils`, `rand` (allowed, currently unused), `proptest`,
+`thiserror`, `rand` (allowed, currently unused), `proptest`,
 `arbitrary`, `criterion`; the heed-surface re-exports `heed-traits`,
 `heed-types` and `byteorder` in `heed-zerodb` only (ADR-0003); `loom` under
 `cfg(loom)` in `zerodb-core` only (ADR-0006); `libfuzzer-sys` in `fuzz/` only

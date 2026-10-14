@@ -41,12 +41,15 @@ same assumption LMDB makes.
   references, zero-child branch pages, and hostile free-page lists with typed
   errors, and added a fuzz target that feeds arbitrary bytes to `open`. That
   work is a best effort, not a guarantee: a crafted file can still be able to
-  cause a panic or an out-of-memory in the offline `zerodb-tools`. Run
+  cause a panic or an out-of-memory in `zerodb-tools`. Run
   `zerodb-tools check` on files you trust or in a sandbox.
-- **Cross-process access.** One process per environment; there is no lock
-  file and no reader table shared between processes (see
-  `docs/DIVERGENCES.md`). Opening the same
-  environment from two processes is undefined.
+- **Cross-process access by untrusted processes.** Several processes may
+  open one environment through its lock file (on by default, ADR-0023), but
+  every one of them must be a cooperating ZeroDB process: any process that
+  can write the lock file or the data file can corrupt the environment or
+  stall its readers and writers. With `NO_LOCK` there is no lock file, and
+  opening the environment from two processes is undefined, as with LMDB's
+  `MDB_NOLOCK`.
 - **Encryption at rest, or protection from a local user with write access to
   the environment directory.** Files are created with mode `0600`.
 - **Strictly bounded memory for a write transaction.** Past a dirty-page limit
@@ -69,7 +72,9 @@ tags with GitHub release notes (ADR-0013); a fix ships as the next patch tag.
 `unsafe` is confined to the memory map and the unchecked page-field readers
 behind a validated-view contract (`zerodb-core::page::raw`, `zerodb-io`), the
 in-place `WRITE_MAP` path that writes dirty pages straight into the writable map
-(`zerodb-core::dirty`, ADR-0021), one `pwritev` and one `flock` FFI call, the
+(`zerodb-core::dirty`, ADR-0021), the grow-only mapping cell, the lock
+file's shared-memory atomics with its `fcntl` record locks and Linux `futex`
+calls (`zerodb-io::lockfile`, ADR-0023), one `pwritev` FFI call, the
 differential oracle's LMDB FFI, and the few pointer-shaped constructs heed's own
 API forces on the adapter. Every block
 carries a `// SAFETY:` comment; the policy is in `AGENTS.md`.

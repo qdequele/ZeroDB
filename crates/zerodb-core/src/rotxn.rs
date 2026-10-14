@@ -145,10 +145,12 @@ enum EnvHandle<'e> {
 /// **Leaked readers (documented stall, ADR-0006 R5):** `mem::forget(ro_txn)`
 /// is safe Rust and cannot be prevented; the slot then pins its txnid
 /// forever, the GC gate stops advancing past it, and the file grows. Same
-/// failure mode as a stale LMDB reader, minus the cross-process reap (under
-/// the single-process model there is nothing to reap — the owner provably is
-/// this process). Reader introspection (`Env::reader_list`) lists such slots;
-/// no reaping path exists.
+/// failure mode as a stale LMDB reader, except that no reap frees it while
+/// this process lives: the slot's owner is this process, which is alive. In a
+/// lock-file environment (ADR-0023) the slot is freed once this process has
+/// exited, by `Env::clear_stale_readers` in another process or by the next
+/// first opener; without a lock file it dies with the process. Reader
+/// introspection (`Env::reader_list`) lists such slots.
 pub struct RoTxn<'env> {
     env: EnvHandle<'env>,
     psize: u32,
@@ -330,7 +332,10 @@ impl Env {
     /// # Errors
     ///
     /// [`MdbError::ReadersFull`] when every reader-table slot is occupied
-    /// (TXN-16; the table holds `max_readers` slots, default 126).
+    /// (TXN-16; the table holds `max_readers` slots, default 126). In a
+    /// lock-file environment, [`MdbError::MapResized`] when another process
+    /// committed beyond this process's logical map size (ADR-0023 amendment
+    /// 15).
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
         let (snap, slot) = self.inner().pin_reader()?;
         Ok(RoTxn {
@@ -357,8 +362,7 @@ impl Env {
     ///
     /// # Errors
     ///
-    /// [`MdbError::ReadersFull`] when every reader-table slot is occupied
-    /// (TXN-16).
+    /// As [`Env::read_txn`].
     pub fn static_read_txn(self) -> Result<RoTxn<'static>> {
         let (snap, slot) = self.inner().pin_reader()?;
         // ADR-0018: an env-owning txn cannot borrow the env's cache and does

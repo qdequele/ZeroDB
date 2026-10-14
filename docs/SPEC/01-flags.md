@@ -32,7 +32,8 @@ cursor-op constant the fork defines, against the frozen consumer contract in
   `2.x`), *unless* the roadmap explicitly pulls its parity into Phase 1 (noted
   inline; see the durability-flag note in §S6 and the Mismatches section).
 - **WON'T** — not implemented in Phase 1; one-line justification citing a
-  divergence (D-001 cross-process/locking, D-003 nested write txns, D-004
+  divergence (D-001 cross-process/locking, retired 2026-10-13 by ADR-0023;
+  D-003 nested write txns, D-004
   DUPSORT/DatabaseFlags → deferred to Phase 2.8, parked 2026-07-20) or a written rationale.
 
 Every **MUST**/**SHOULD** row carries a **differential-test slug** — the oracle
@@ -61,10 +62,10 @@ through `EnvOpenOptions::read_txn_with_tls()` / `read_txn_without_tls()`.
 | `MDB_WRITEMAP` | `0x80000` | `EnvFlags::WRITE_MAP` | **MUST** | 1.10 | `env_writemap_put_get_parity`, `env_writemap_put_reserved` | SPEC 00 row 8 (Meilisearch `index_map`, gated on experimental writemap). Writes go through a **writable** mmap (`mmap(PROT_WRITE)`), not `malloc`+`pwrite`; dirty bytes live in the map. Interacts with `put_reserved` (returns a pointer into the map) and the SPEC 04 value-borrow contract. Commit flushes the whole map with `msync` (`MS_SYNC`, or `MS_ASYNC` under `MAP_ASYNC`) instead of `pwrite`+`fdatasync`; a synchronous flush also `fdatasync`s the data fd on every platform (SPEC 06 REC-12). Excludes `NO_MEM_INIT`/readahead paths. Must be spec'd as a second write mode (§S7). |
 | `MDB_MAPASYNC` | `0x100000` | `EnvFlags::MAP_ASYNC` | **SHOULD** † | 1.10 | `durability_mapasync_writemap` | Only meaningful with `WRITE_MAP`: use `MS_ASYNC` instead of `MS_SYNC` for the commit `msync` (`flags = (MAPASYNC && !force) ? MS_ASYNC : MS_SYNC`). A crash can then lose/corrupt the last txns. No consumer; M1.10 (†, §S6). |
 | `MDB_NOTLS` | `0x200000` | *(via `read_txn_without_tls()`; `EnvFlags::NO_TLS` **deprecated**)* | **MUST** | 1.2, 1.8 | `flag_notls_rotxn_is_send` | SPEC 00 rows 2/29: **every** production open is `WithoutTls`. Ties reader-table slots to the `MDB_txn` object instead of a thread-local, making `RoTxn: Send` (rayon/async fan-out). In the fork this is the branch taken in `mdb_txn_renew0` (`env->me_flags & MDB_NOTLS`). zerodb makes WithoutTls the default (and effectively only) mode; the WithTls path is a thin shim (SPEC 00 second table). The `EnvFlags::NO_TLS` constant is deprecated in heed 0.22 in favor of the `EnvOpenOptions` methods. |
-| `MDB_NOLOCK` | `0x400000` | `EnvFlags::NO_LOCK` | **WON'T** | — | — | "caller manages their own locks" — the cross-process locking escape hatch. D-001: zerodb is single-process with no lock file, so the concept does not apply. No consumer. |
+| `MDB_NOLOCK` | `0x400000` | `EnvFlags::NO_LOCK` | **MUST** | ADR-0023 stage 3 | `heed-zerodb/tests/env_file_naming.rs` (`no_lock_creates_no_lock_file`, `flags_report_no_lock`) | "caller manages their own locks" — the cross-process locking escape hatch. Was WON'T under D-001 (no lock file at all); ADR-0023 amendment 17 makes it MUST: the adapter maps it to the engine's `lock_file(false)`, so no lock file is created (`OBS_NOLOCK_CREATES_LOCK_FILE = false`) and the env runs the single-process path; `Env::flags()` reports it. A read-only env on read-only media also runs without a lock file but does not report `NO_LOCK` (`OBS_RDONLY_READONLY_FS_REPORTS_NOLOCK = false`). No consumer. |
 | `MDB_NORDAHEAD` | `0x800000` | `EnvFlags::NO_READ_AHEAD` | **SHOULD** | landed 2026-09-29 | `zerodb/tests/no_read_ahead.rs` | Turns off OS readahead (`madvise(MADV_RANDOM)`), no effect on Windows. **Honored since 2026-09-29, as LMDB does:** the map (read-only or `WRITE_MAP`) is advised `MADV_RANDOM` at open; the test checks the `rr` VmFlag on Linux. No consumer passes it (hannoy instead issues its own `madvise(WILLNEED)`, SPEC 00 §B.9), but rust-storage-bench's heed backend does, and without it a random-read workload larger than memory thrashes (Phase D: ~10 GB read in 60 s for a 1.5 GB DB under a 2 GB cap). |
 | `MDB_NOMEMINIT` | `0x1000000` | `EnvFlags::NO_MEM_INIT` | **SHOULD** | 2.7 | `env_nomeminit_accepted_noop` | Skip zero-filling `malloc`'d pages before writing them to the datafile (a data-leak/Valgrind trade-off). `clean_limit` in `mdb_page_dirty` keys off `(NOMEMINIT|WRITEMAP)`. No consumer; the header itself notes it "is not needed with `MDB_WRITEMAP`". zerodb controls its own dirty-page allocation, so this can be a documented no-op. |
-| `MDB_PREVSNAPSHOT` | `0x2000000` | `EnvFlags::PREV_SNAPSHOT` | **MUST** | 1.2, 1.10 | `env_prevsnapshot_opens_older_meta` | SPEC 00 row 9 (milli `Index::rollback`). Opens the env on the **older** of the two meta pages. `mdb_env_pick_meta` XORs the newer-meta selection with this flag: `metas[(m0.txnid < m1.txnid) ^ (flags & PREVSNAPSHOT)]`. Open protocol subtleties in §S5 (requires exclusive access; auto-cleared on first commit). |
+| `MDB_PREVSNAPSHOT` | `0x2000000` | `EnvFlags::PREV_SNAPSHOT` | **MUST** | 1.2, 1.10 | `env_prevsnapshot_opens_older_meta` | SPEC 00 row 9 (milli `Index::rollback`). Opens the env on the **older** of the two meta pages. `mdb_env_pick_meta` XORs the newer-meta selection with this flag: `metas[(m0.txnid < m1.txnid) ^ (flags & PREVSNAPSHOT)]`. Open protocol subtleties in §S5 (requires exclusive access; auto-cleared on first commit; with a lock file, holds it until the first commit, which is not published). |
 
 † **SHOULD but Phase-1-scheduled:** milestone M1.10 explicitly implements
 `NO_SYNC`/`NO_META_SYNC`/`MAP_ASYNC` durability parity even though no consumer
@@ -278,15 +279,56 @@ Two caveats on scope:
   picks the **older** one — the previous committed snapshot.
 - Exclusivity: opening with `PREVSNAPSHOT` requires **exclusive** access. In
   `mdb_env_open`, `if ((flags & MDB_PREVSNAPSHOT) && !excl) return EAGAIN;` (when
-  not RDONLY/NOLOCK). Under D-001 (single-process, exclusive by construction)
-  this is naturally satisfied, but zerodb must still refuse a prev-snapshot open
-  if another handle in-process holds the env.
+  not RDONLY/NOLOCK). zerodb refuses a prev-snapshot open if another handle
+  in-process holds the env (SPEC 04 TXN-51), and, with a lock file (the
+  default, ADR-0023), if another process has the env open: the open must win
+  the lock file's first-opener election, and a joiner fails with `Io` and raw
+  OS error `EAGAIN`, as observed in LMDB for a writable joiner
+  (`OBS_PREV_SNAPSHOT_JOINER`, SPEC 04 TXN-66). LMDB skips the check for
+  `RDONLY`; zerodb does not (D-025, below). *(Amended 2026-10-13: this bullet used to say the case was
+  "naturally satisfied" by the single-process model, D-001, now retired.)*
+- Geometry: the sole opener takes its map geometry from the older meta, the
+  one it selects. A map below that meta's data rounds up to its
+  `(last_pg + 1) · page_size`, and an unset map size adopts that meta's
+  `map_size` (`OBS_PREV_SNAPSHOT_MINSIZE_FROM`,
+  `OBS_PREV_SNAPSHOT_ZERO_MAPSIZE_FROM`, both `"prev"`, observed on macOS).
 - Auto-clear: after the **first commit** on a prev-snapshot env, LMDB clears the
   flag (`env->me_flags ^= MDB_PREVSNAPSHOT`) and re-shares locks — subsequent
-  meta picks revert to newest. This is exactly milli's `Index::rollback`: open on
-  the older meta, commit once to make it the live root, then behave normally.
-  zerodb's rollback path must replicate the "one committed txn rewrites history,
-  then normal" behavior, not leave the env permanently pinned to the old meta.
+  meta picks revert to newest. milli's `Index::rollback` relies on this: open on
+  the older meta, commit once, close. That commit becomes the live root for
+  the next open; within the same session, with a lock file, it is not
+  published (next bullet). zerodb's rollback path must replicate this, not
+  leave the env permanently pinned to the old meta.
+  With a lock file the fork does more, and zerodb mirrors it (ADR-0023
+  amendment 19; SPEC 04 TXN-66/67, observed on macOS and Linux aarch64):
+  - The opener keeps the lock file's exclusive lock past its open, so
+    another process's open waits until the opener's first commit
+    (`OBS_PREV_SNAPSHOT_JOIN_BEFORE_FIRST_COMMIT`). A commit with no changes
+    writes nothing and keeps the lock
+    (`OBS_PREV_SNAPSHOT_EMPTY_COMMIT_KEEPS_LOCK`).
+  - "Re-shares locks" re-derives the shared txnid from the meta picked while
+    the flag is still set: the older meta. So after the first commit every
+    new read txn, in the opener or in a process that joins, still reads the
+    older snapshot; `mdb_env_info`/`mdb_env_stat` name the first commit,
+    the newest meta on disk. The second write txn is again `older + 1`,
+    built on the older meta, and overwrites the first commit's meta slot:
+    the first commit's data is lost (`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`,
+    `OBS_PREV_SNAPSHOT_SECOND_COMMIT_KEEPS_FIRST = false`). A fresh open
+    after every process has closed serves the first commit
+    (`OBS_PREV_SNAPSHOT_ONE_COMMIT_THEN_REOPEN = "a_commit"`), which is
+    milli's case: it commits once and closes.
+  - With `NO_LOCK` neither happens: the first commit is current at once and
+    the second builds on it (`OBS_PREV_SNAPSHOT_NOLOCK_COMMITS`).
+  - A process that joins after the first commit reads the older snapshot,
+    and its `Env::info`/`Env::stat` name the newest meta on disk, as LMDB's
+    (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`).
+  - Not mirrored, docs/DIVERGENCES.md D-025 (PROPOSED): when the opener
+    closes or dies before its first commit, a waiting zerodb process becomes
+    the first opener and serves the newest meta, while the fork's waiter
+    reads the older meta (or, on macOS after a close, fails with `EINVAL`);
+    and a `RDONLY` prev-snapshot open that joins a running env fails with
+    `EAGAIN` in zerodb, while the fork admits it and moves every process
+    back to the older meta (`OBS_PREV_SNAPSHOT_READ_ONLY_JOINER`).
 
 ### §S6 — durability lattice: `NO_SYNC` / `NO_META_SYNC` / `MAP_ASYNC` (× `WRITE_MAP`)
 
@@ -339,6 +381,16 @@ several other rules:
   txn's dirty frames are realized in the writable map at allocation/edit time
   rather than in heap frames copied in at commit (SPEC 04 §6.4 TXN-45b;
   `zerodb-io::mmap` brokered slice, `zerodb-core::dirty`).
+- The fork `ftruncate`s the file to the map size at open, also when other
+  processes hold the env, and also downward: a 2 MiB joiner shrinks an
+  8 MiB file under the holder's 8 MiB mapping
+  (`OBS_WRITE_MAP_JOINER_LARGER_MAP`, `OBS_WRITE_MAP_JOINER_SMALLER_MAP`,
+  observed on macOS; docs/DIVERGENCES.md D-024). ZeroDB does so only
+  when the process is alone (no lock file, or the lock file's initializer);
+  otherwise the file grows only under both writer locks, in `Env::resize` and
+  at a write-txn begin, and never shrinks, so no process's mapping loses its
+  backing (`SIGBUS`) to another's smaller size (ADR-0023 amendment 15,
+  decision 4; SPEC 04 §6.4).
 
 ### §S8 — `mdb_dbi_open` error precedence (named-DB catalog)
 
@@ -432,20 +484,20 @@ from its MUST table):
 
 | Table | Rows | MUST | SHOULD | WON'T |
 |-------|------|------|--------|-------|
-| 1 — Environment flags | 12 | 3 | 6 | 3 |
+| 1 — Environment flags | 12 | 4 | 6 | 2 |
 | 2 — Database flags | 7 | 1 | 0 | 6 |
 | 3 — Write / put flags | 7 | 3 | 1 | 3 |
 | 4 — Copy flags | 1 | 1 | 0 | 0 |
 | 5 — Cursor operations | 19 | 7 | 1 | 11 |
-| **Total** | **46** | **15** | **8** | **23** |
+| **Total** | **46** | **16** | **8** | **22** |
 
 - MUST diff-test slugs feed the oracle checklist for M1.2, M1.3, M1.4, M1.6,
   M1.10, M1.11, M1.12.
-- All 23 WON'T rows are justified: **20 by D-004** (6 DUPSORT/DUPFIXED/integer/
+- All 22 WON'T rows are justified: **20 by D-004** (6 DUPSORT/DUPFIXED/integer/
   reverse DB flags + 3 dup put-flags `NODUPDATA`/`APPENDDUP`/`MULTIPLE` + 11 dup
-  cursor-ops, all deferred to Phase 2.8, parked 2026-07-20) and **3 by D-001/written rationale**
-  (`FIXEDMAP` experimental upstream, `NOSUBDIR` own-format, `NOLOCK` cross-process
-  per D-001).
+  cursor-ops, all deferred to Phase 2.8, parked 2026-07-20) and **2 by written rationale**
+  (`FIXEDMAP` experimental upstream, `NOSUBDIR` own-format). `NOLOCK` moved
+  from WON'T to MUST with ADR-0023 amendment 17.
 
 ---
 

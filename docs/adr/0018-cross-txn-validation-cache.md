@@ -60,7 +60,10 @@ memo stays in front of it.
   visible versions of a pgno share a stamp.
 - **Limits:** a file modified by another process while open breaks the
   immutability the cache relies on — already outside the single-process model
-  (D-001), but it must be stated.
+  (D-001), but it must be stated. *(Amended 2026-10-13: ADR-0023 retired
+  D-001. The cache stays on with several processes, because another
+  process's rewrite of a page carries a newer stamp; ADR-0023 §5 and SPEC 04
+  TXN-38 state the argument.)*
 - **Cost:** one extra header read and one probe on a txn-memo miss; a fixed
   memory footprint per env.
 

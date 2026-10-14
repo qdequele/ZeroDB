@@ -82,9 +82,10 @@ oldest-reader gate depends on that.
   a comparator-aware compaction is a separate piece of work spanning the
   builder, the dump format and the tools. `CompactionOption::Disabled` (the raw
   page copy) is byte-level and unaffected.
-- **`check` / `zerodb-tools check` is memcmp-defined.** It walks a *file*, which
-  carries no comparator, so INV-5 (ascending keys in a page) and INV-6
-  (separator bounds) are evaluated in byte order and a custom-comparator
+- **`check` / `zerodb-tools check` is memcmp-defined.** It walks a file, or a
+  live env's pinned snapshot through the map, and neither carries a
+  comparator, so INV-5 (ascending keys in a page) and INV-6 (separator
+  bounds) are evaluated in byte order and a custom-comparator
   database legitimately reports violations of exactly those two. Every other
   invariant — page typing, reachability, depth uniformity, counter accuracy,
   GC structure — is ordering-independent and must still pass.

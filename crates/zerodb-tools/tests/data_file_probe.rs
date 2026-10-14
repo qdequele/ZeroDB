@@ -137,31 +137,34 @@ fn both_names_present_is_a_hard_error() {
     );
 }
 
-/// The flock guard itself resolves both names, and reports ambiguity.
+/// The probe every tool resolves its data file with (and so its lock file,
+/// ADR-0023 amendment 16) finds both names, and reports ambiguity. This was
+/// the flock guard's test; ADR-0023 amendment 18 retired that guard, and the
+/// tools now resolve the name with `naming::resolve` alone.
 #[test]
-fn lock_guard_probes_both_names() {
+fn name_probe_resolves_both_names() {
     let native = tmp_dir("lock-native");
     build_env(&native, DATA_FILE_NAME, b"n");
-    let (_g, resolved) = zerodb_tools::lock::acquire_existing(&native).unwrap();
+    let resolved = zerodb_tools::naming::resolve(&native).unwrap();
     assert_eq!(resolved.name, DATA_FILE_NAME);
 
     let adapter = tmp_dir("lock-adapter");
     build_env(&adapter, HEED_DATA_FILE_NAME, b"a");
-    let (_g, resolved) = zerodb_tools::lock::acquire_existing(&adapter).unwrap();
+    let resolved = zerodb_tools::naming::resolve(&adapter).unwrap();
     assert_eq!(resolved.name, HEED_DATA_FILE_NAME);
 
     let both = tmp_dir("lock-both");
     build_env(&both, DATA_FILE_NAME, b"n");
     build_env(&both, HEED_DATA_FILE_NAME, b"a");
     assert!(matches!(
-        zerodb_tools::lock::acquire_existing(&both),
-        Err(zerodb_tools::lock::LockError::Ambiguous(_))
+        zerodb_tools::naming::resolve(&both),
+        Err(zerodb_tools::naming::NameError::Ambiguous(_))
     ));
 
     let empty = tmp_dir("lock-empty");
     assert!(matches!(
-        zerodb_tools::lock::acquire_existing(&empty),
-        Err(zerodb_tools::lock::LockError::Missing(_))
+        zerodb_tools::naming::resolve(&empty),
+        Err(zerodb_tools::naming::NameError::Missing(_))
     ));
 }
 

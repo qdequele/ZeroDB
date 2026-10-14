@@ -567,6 +567,19 @@ fn read_only_error() -> Error {
     Error::Io(std::io::Error::from_raw_os_error(13))
 }
 
+/// The `WRITE_MAP` arm of a write-txn begin (ADR-0023 amendment 15, decision
+/// 4): grow the data file to this process's logical map size. Out of line so
+/// the default write-txn begin stays small enough for its own callees to be
+/// inlined.
+#[cold]
+#[inline(never)]
+fn grow_file_to_map(inner: &crate::env::EnvInner) -> Result<()> {
+    inner
+        .backing_ref()
+        .ensure_file_len(inner.map_size())
+        .map_err(Error::Io)
+}
+
 // ---------------------------------------------------------------------------
 // RwTxn
 // ---------------------------------------------------------------------------
@@ -728,7 +741,9 @@ impl Env {
     /// # Errors
     ///
     /// [`Error::Io`] if the env is poisoned by an earlier fsync failure
-    /// (SPEC 06 REC-13).
+    /// (SPEC 06 REC-13). [`MdbError::MapResized`] if the newest snapshot lies
+    /// beyond this process's logical map size: another process with a larger
+    /// map committed past it (ADR-0023 amendment 15).
     pub fn write_txn(&self) -> Result<RwTxn<'_>> {
         let inner = self.inner();
         // TXN-8 / SPEC 01 Table 1: a write txn on a read-only env is
@@ -750,18 +765,36 @@ impl Env {
         if inner.is_poisoned() {
             return Err(poisoned_error());
         }
+        // ADR-0023 amendment 15, decision 4: under WRITE_MAP the data file
+        // grows to this process's logical map size here, with both writer
+        // locks held (and after any dead-owner takeover reap), so every page
+        // this txn can allocate below the map size is inside the file before
+        // anything is written through the map. A joiner's open never grows
+        // the file. One comparison when the file is already long enough.
+        let write_map = inner.durability().write_map;
+        if write_map {
+            grow_file_to_map(inner)?;
+        }
         // The latest published snapshot, which in a lock-file env may be
         // another process's commit (ADR-0023 §4): never the process-local
         // cell. Without a lock file this is the cell, as before.
         let base = inner.current_snapshot()?;
+        // The map view, loaded once for the whole begin: the base check
+        // below and the txn's read view (`bytes`) both come from it.
+        let backing = inner.backing_ref();
+        let view = backing.view();
+        // ADR-0023 amendment 15: the base must lie inside this process's
+        // logical map size, even when it came from the cache; otherwise the
+        // begin fails with `MapResized` (`OBS_WRITE_BEGIN_SMALL_MAP`). Either
+        // error drops `guard`, releasing both writer locks.
+        inner.check_base_in(view, &base)?;
         // ADR-0021 (SPEC 04 §6.4 TXN-45b): under WRITE_MAP, with a backing
         // that brokers map slices, dirty pages are realized **in the map** at
         // their freshly-COW'd pgnos — no heap staging, no commit write-back.
         // Every other combination keeps the heap-staged store (TXN-45a):
         // the default mode, the miri test backing, the fault-injection
         // backend (whose crash journal only sees fd-path writes).
-        let backing = inner.backing_ref();
-        let in_map = inner.durability().write_map && backing.dirty_in_map();
+        let in_map = write_map && backing.dirty_in_map();
         // Seed the dirty store's spare list with the frames recycled from
         // earlier write txns (LMDB's `me_dpages`); they came
         // with the writer slot, so this takes no lock.
@@ -826,7 +859,7 @@ impl Env {
             children: ChildCounter::new(),
             // In-place WRITE_MAP keeps no whole-map reference in the struct
             // (see the field docs; ADR-0021 M1) — `whole_map` borrows lazily.
-            bytes: if in_map { &[] } else { inner.backing_bytes() },
+            bytes: if in_map { &[] } else { view.bytes },
             base,
             _guard: guard,
             env: self,
@@ -4257,6 +4290,13 @@ impl<'env> RwTxn<'env> {
     ///   commit is an implicit abort).
     /// - [`Error::Io`] on a write/fsync failure — a failed **fsync** also
     ///   poisons the env (SPEC 06 REC-13).
+    /// - [`Error::Io`] when this is the first commit of a `PREV_SNAPSHOT`
+    ///   env with a lock file and letting other processes in (the lock-file
+    ///   downgrade) fails after the meta write (ADR-0023 amendment 19). The
+    ///   commit is then **durable** although `Err` is returned; as for every
+    ///   first `PREV_SNAPSHOT` commit, it is not published, the next commit
+    ///   reuses its txnid on the older snapshot, and that commit retries the
+    ///   downgrade.
     pub fn commit(mut self) -> Result<()> {
         if self.errored {
             return Err(Error::Mdb(MdbError::BadTxn));
@@ -4346,6 +4386,10 @@ impl<'env> RwTxn<'env> {
         // slot; the intact `N-1` slot is the crash fallback). -----
         let last_pg = self.next_pgno - 1;
         let slot = self.txnid & 1;
+        // ADR-0023 amendment 15: a commit never lowers the persisted map size
+        // (`OBS_COMMIT_PERSISTS_OWN_MAPSIZE` = false): a process with a
+        // smaller map keeps the larger size another process recorded.
+        let map_size = self.base.map_size.max(inner.map_size());
         // GC-32 (ADR-0022): in annex mode this txn's freed PIL rides in the
         // meta itself — `freed` is final after C1 and already sorted/deduped
         // (GC-3/4); `freelist_save` guaranteed it fits the cap.
@@ -4357,7 +4401,7 @@ impl<'env> RwTxn<'env> {
             format_version: FORMAT_VERSION,
             page_size: psize,
             env_flags: 0,
-            map_size: inner.map_size(),
+            map_size,
             last_pg,
             free_db: self.free_db,
             main_db: self.main_db,
@@ -4385,6 +4429,29 @@ impl<'env> RwTxn<'env> {
         }
         inner.run_hook(HookPoint::H4);
         // Crash here: `N` durable and selected (REC-6 H4).
+
+        let snapshot = Arc::new(Snapshot {
+            txnid: self.txnid,
+            last_pg,
+            map_size,
+            main_db: self.main_db,
+            free_db: self.free_db,
+            free_annex: if self.annex_out {
+                Arc::from(&self.freed[..])
+            } else {
+                Arc::from(&[][..])
+            },
+        });
+
+        // ----- ADR-0023 amendment 19: the first commit of a `PREV_SNAPSHOT`
+        // open that holds the election is durable but not published, as
+        // LMDB's (`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`): C5a and C6 are skipped,
+        // because the next commit reuses this txnid (TXN-2) and builds on the
+        // older snapshot. The election is finished instead, letting waiting
+        // processes join. -----
+        if inner.holds_election() {
+            return inner.finish_held_election(snapshot);
+        }
 
         // ----- C5a: seed the env-wide validated-pages cache (ADR-0018;
         // SPEC 04 TXN-38). Every frame C2 wrote is
@@ -4422,17 +4489,7 @@ impl<'env> RwTxn<'env> {
         // ----- C6: publish the snapshot (TXN-18/19 order: swap the object,
         // then store the commit point SeqCst) — only after C5, so no reader
         // can pin `N` before it is durable (TXN-64). -----
-        inner.publish_snapshot(Arc::new(Snapshot {
-            txnid: self.txnid,
-            last_pg,
-            main_db: self.main_db,
-            free_db: self.free_db,
-            free_annex: if self.annex_out {
-                Arc::from(&self.freed[..])
-            } else {
-                Arc::from(&[][..])
-            },
-        }));
+        inner.publish_snapshot(snapshot);
         Ok(())
         // Drop of `self` releases the write mutex — the tail of C6.
     }

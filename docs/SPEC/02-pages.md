@@ -262,9 +262,11 @@ predicate; SPEC 06 REC-1 references it rather than restating it.
    SPEC 04 TXN-14). Failure → `MdbError::Invalid`. Rationale: the mapping covers the full
    `map_size` (ADR-0004 D4), so a CRC-valid slot naming a page inside the map
    but past EOF would otherwise hand readers unbacked bytes — a SIGBUS on
-   first touch, not an error. Under `WRITE_MAP` the file is grown to
-   `map_size` before this check, so the length half is trivially satisfied
-   there; the root-range half still applies. This step validates only the
+   first touch, not an error. Under `WRITE_MAP`, without a lock file or for
+   the lock file's initializer, the file is grown to `map_size` before this
+   check, so the length half is trivially satisfied there; a joining process
+   does not grow the file at open (ADR-0023 amendment 15), so for it the
+   length half is a real check. The root-range half always applies. This step validates only the
    slot actually selected (a discarded slot's geometry is irrelevant).
 
 Selection among the *CRC-valid* slots:
@@ -684,24 +686,130 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     name. A directory holding both names is two independent databases.
     `zerodb-tools`, which only reads, probes both and treats both-present as a
     hard error.
-  - **No lock file is ever created** under either name (D-001, single-process;
-    nothing in the consumer tree reads `lock.mdb` — one doc comment aside).
+  - **A lock file is created unless `NO_LOCK`** (amended 2026-10-13,
+    ADR-0023 amendment 17). Every open creates or joins the lock file next to
+    the data file (SPEC 04 §12), so other processes can open the env at the
+    same time. `EnvOpenOptions::lock_file(false)`, or heed's `NO_LOCK`
+    through the adapter, creates none and runs the env single-process
+    (`OBS_NOLOCK_CREATES_LOCK_FILE = false`). A `READ_ONLY` open whose lock
+    file cannot be created or opened for writing because the filesystem is
+    read-only (`EROFS`) proceeds without one, as LMDB does
+    (`OBS_RDONLY_LOCK_READONLY_FS = 0`); any other lock-file error fails the
+    open. *(Before stage 3 of ADR-0023 the lock file was opt-in, and before
+    ADR-0023 no lock file existed at all, D-001, now retired.)*
+  - **Lock-file name (ADR-0023 amendment 16).** The lock file lives next to
+    the data file and its default name is derived from the data-file name
+    (`zerodb::derived_lock_file_name`): `zerodb.dat` → `zerodb.lock`,
+    `data.mdb` → `lock.mdb` (so the adapter gets LMDB's name without setting
+    it), and any other name `<data_file_name>-lock` (LMDB's `MDB_NOSUBDIR`
+    convention). Two data names in one directory therefore never share a lock
+    file. `EnvOpenOptions::lock_file_name` overrides the derived name; the
+    explicit name must be a single path component and differ from the
+    data-file name. On a case-insensitive filesystem a case variant of a
+    default data name (e.g. `ZERODB.DAT`) derives a different lock name
+    (`ZERODB.DAT-lock`), so two processes that spell one data file
+    differently do not share a lock file; this is the same class as reaching
+    one file through two paths, which LMDB does not guard against either.
+  - **Lock-file guards (ADR-0023 amendment 16).** The lock-file initializer
+    truncates the file, so two guards keep it from destroying data. Both fail
+    the open with `Io(InvalidInput)` and modify neither file.
+    - *Same file:* before anything is truncated, every opener compares the
+      lock descriptor's `(st_dev, st_ino)` with a `stat` of the data path; a
+      match (hard link; a case variant on a case-insensitive filesystem) is
+      refused. A missing data file skips the check. The open tries
+      `create_new` first, and if it created the lock file and the file is
+      still empty, the refusal unlinks it; otherwise the name is left alone,
+      since it designates the data file.
+    - *Foreign file:* the initializer accepts the existing file only if it is
+      empty, carries the final lock magic or the initializing magic (written
+      with `pwrite` right after truncating to zero, replaced by the final
+      magic when the open completes), or its header (the first 256 bytes, or
+      the whole file if shorter) is all zero and its length is one an
+      initializer can leave: 8 (the initializing magic in the truncated
+      file) or 256 + 128·k for k ≥ 1 (header plus k reader slots). Nothing
+      fsyncs the lock file, so a power loss can keep such a length and lose
+      the magic block. Everything else is refused, including a stale LMDB
+      `lock.mdb` (`0xBEEFC0DE` at byte 0). This refuses every *initialized*
+      ZeroDB or LMDB data file (non-zero bytes at 32 and 16 respectively),
+      but not every foreign file: a file with a zero header and one of those
+      lengths is accepted and overwritten, and so is a data file caught
+      between its creation and its first meta write (the residual window of
+      amendment 16). Joiners treat anything but the final magic as
+      unfinished.
   - The layout remains ZeroDB's own, never LMDB's, regardless of file name
     (D-002); the `ZDB1` magic at byte 32 (§3) is the authoritative
     discriminator, and `zerodb-tools stat` reports it.
 - **map_size.** `meta.map_size` is the size of the mmap region and the ceiling
   on the data file. It is set at env creation and read back via
   `Env::info().map_size` (SPEC 00 row 20). Growth beyond it is *not* automatic
-  in Phase 1 (auto-geometry is Phase 3.2): heed callers grow by reopening with a
-  larger `map_size` after a `MapFull` (SPEC 00 rows 3, 55).
+  (auto-geometry is Phase 3.2): callers grow with `Env::resize` (below) or by
+  reopening with a larger `map_size` after a `MapFull` (SPEC 00 rows 3, 55).
   - **Runtime `map_size` selection (M1.2).** At open the effective `map_size` is
     the caller's `EnvOpenOptions::map_size` when set, else the persisted
-    `meta.map_size`.
-  - **Mapping strategy (amended M1.4, ADR-0004 D4/OQ2 — approved).** The read
-    mmap covers `max(map_size, file length)` from open, so the base address is
-    fixed for the env's life and **no remap ever happens in Phase 1** (file
-    growth happens *underneath* the fixed `MAP_SHARED` mapping via the commit's
-    positioned writes). Pages beyond EOF are mapped but never dereferenced: a
+    `meta.map_size`. It is then raised to `(last_pg + 1) · psize` of the newest
+    valid meta when smaller, as LMDB does (ADR-0023 amendment 15;
+    `OBS_OPEN_BELOW_LAST_PG = "minsize"`). A size that is smaller but still
+    holds the data is kept (`OBS_OPEN_SMALLER_THAN_META`).
+  - **Map size cap (ADR-0023 amendment 15, decision 6).** `MAX_MAP_SIZE` is
+    2^47 bytes. Before any file is created, grown or mapped, a requested
+    `map_size` above it fails the open with `Io(InvalidInput)` and a persisted
+    one above it with `MdbError::Invalid` (the meta is corrupt).
+  - **Persisted `map_size` on commit (ADR-0023 amendment 15).** A commit writes
+    `max(base snapshot's meta map_size, the committing env's map_size)`: a
+    process with a smaller map never lowers the recorded size
+    (`OBS_COMMIT_PERSISTS_OWN_MAPSIZE = false`).
+  - **Logical size and `MapResized` (ADR-0023 amendment 15).** The runtime
+    `map_size` lives with the mapping in one published view (one `Acquire`
+    load gives a consistent pair). A txn begin whose snapshot needs
+    `(last_pg + 1) · psize` bytes beyond it fails with `MdbError::MapResized`
+    (another process with a larger map committed past this one); a larger
+    `meta.map_size` alone does not. Beyond the mapped bytes but within the
+    logical size, or beyond the file, is `MdbError::Invalid`.
+  - **Cross-process `Env::info()`/`Env::stat()` (ADR-0023 §4).** `last_pgno`, `last_txnid` (`Env::info()`) and the main-DB counts
+    (`Env::stat()`) are read from the snapshot at the shared published txnid
+    `T` (`EnvInner::current_snapshot`, SPEC 04 TXN-18), not this process's
+    own cached snapshot, so another process's commit is visible as soon as it
+    publishes — `OBS_INFO_SEES_OTHER_COMMIT`/`OBS_STAT_SEES_OTHER_COMMIT`
+    (both `true`, `crates/zerodb-oracle/tests/lmdb_stage3_observation.rs`).
+    `map_size`, `max_readers`, `num_readers` and `live_readers` already come
+    from the backing's published view and the shared reader table (above;
+    SPEC 04 §4). `num_readers` is LMDB's shared high-water mark, counting
+    every process's readers (`OBS_NUMREADERS_OTHER_PROCESS`); with a lock
+    file it is derived from the slots (one past the last slot ever claimed
+    since the lock file was initialized; SPEC 04 TXN-73), so the lock file
+    holds no counter. Both calls stay infallible: if the read at `T` fails
+    (for example `MdbError::MapResized`, when `T` has moved past a commit that grew
+    the map beyond this process's current mapping), they fall back to this
+    process's own cached snapshot rather than surfacing the error — a
+    deliberate trade-off that can transiently under-report a page/txnid
+    another process already published, preferred over turning two previously
+    infallible accessors into fallible ones. That fallback has no dedicated
+    test. (These two accessors live here because `info().map_size` belongs to
+    this cluster; SPEC 04 TXN-18 points here.)
+  - **`Env::resize` (ADR-0023 amendment 15; heed's `unsafe fn resize`,
+    `mdb_env_set_mapsize` on an open env).** It refuses with `Io` and raw OS
+    error `EINVAL` while a write txn of this env is live
+    (`OBS_SET_MAPSIZE_WITH_WRITE_TXN`); live read txns do not block it. In a
+    lock-file environment it takes the cross-process writer lock, so no
+    commit lands while it reads the newest snapshot. LMDB takes none: its
+    `mdb_env_set_mapsize` returns while another process holds a write txn
+    (`OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER`; D-023). The size is
+    `meta.map_size` of the newest snapshot for `0`
+    (`OBS_SET_MAPSIZE_ZERO_ADOPTS`), else the requested size, then raised to
+    `(last_pg + 1) · psize` (checked arithmetic; overflow is `Invalid`). Above
+    `MAX_MAP_SIZE` a requested size is `Io(InvalidInput)` and an adopted one
+    `MdbError::Invalid`. The new size is published through the backing's
+    grow-only mappings (below); a smaller size lowers only the logical size.
+  - **Mapping strategy (amended M1.4, ADR-0004 D4/OQ2 — approved; amended by
+    ADR-0023 amendment 15).** The read mmap covers `max(map_size, file length)`
+    from open. A mapping is **never remapped in place**: when `resize` needs
+    more than the current mapping, a new mapping of `max(new size, 2 × current
+    length)` bytes is added (retried at exactly the new size on `ENOMEM`) and
+    published with the new logical size; every earlier mapping stays mapped
+    until the env closes, so no borrow is ever invalidated, and the retained
+    address space stays below twice the largest mapping. Within a mapping,
+    file growth happens *underneath* the `MAP_SHARED` mapping via the commit's
+    positioned writes. Pages beyond EOF are mapped but never dereferenced: a
     committed meta only references pages made durable before it (SPEC 06
     REC-7/REC-14), and the writer reads its own new pages from the dirty set,
     never the map (SPEC 04 TXN-38). *(Supersedes the M1.2 map-the-file-length

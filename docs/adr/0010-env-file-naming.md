@@ -7,6 +7,10 @@
 - Milestone: filed against the **M1.14 gate remainder** (this was a gate
   blocker: compaction and snapshot-restore were latent-broken behind a green
   suite).
+- Amended (2026-10-13): the "no `lock.mdb`" half below relied on D-001,
+  which ADR-0023 retired. An adapter env directory now holds `data.mdb` and
+  `lock.mdb` by default; heed's `NO_LOCK` omits the lock file (ADR-0023
+  amendments 16 and 17).
 - Date: 2026-07-20
 - **Numbering note (resolved):** ADR number 0009 is taken by
   [`0009-copy-and-tools.md`](0009-copy-and-tools.md); this document is

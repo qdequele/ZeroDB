@@ -23,10 +23,9 @@ use std::path::Path;
 use heed::types::Bytes;
 use heed::{EnvFlags, EnvOpenOptions};
 
-use zerodb::{collect_entries_flagged, EnvOpenOptions as ZEnvOpenOptions};
+use zerodb::collect_entries_flagged;
 
 use crate::common::{BoxErr, MAX_TOOL_DBS};
-use crate::lock;
 
 /// Commit every `BATCH` puts so a single write txn never holds the whole DB.
 const BATCH: usize = 10_000;
@@ -58,11 +57,13 @@ pub fn cmd_migrate(
         )
         .into());
     }
-    // The destination must be fresh under either name; hold its lock for the
-    // whole migration.
+    // The destination must be fresh under either name, and opened by this
+    // process alone; the `Env` is held for the whole migration (ADR-0023
+    // amendment 18).
     std::fs::create_dir_all(dst_dir)?;
     crate::commands::refuse_existing_env(dst_dir, "migrate into")?;
-    let _dst_guard = lock::acquire_or_create(dst_dir)?;
+    let dst =
+        crate::commands::open_exclusive_destination(dst_dir, page_size, map_size, "migrate into")?;
 
     // --- Source: open LMDB read-only via heed ---
     let mut opts = EnvOpenOptions::new();
@@ -71,8 +72,7 @@ pub fn cmd_migrate(
     // SAFETY: heed's `open`/`flags` are `unsafe` only because LMDB env flags can
     // enable cross-process behaviors. We set only `READ_ONLY` (single-process
     // safe) and point at an existing on-disk env we open read-only; no pointers
-    // are handled here. This is the migrate feature's sole `unsafe` (plus the
-    // flock in `lock.rs`).
+    // are handled here. This is the migrate feature's sole `unsafe`.
     let src = unsafe {
         opts.flags(EnvFlags::READ_ONLY);
         opts.open(src_dir)?
@@ -98,13 +98,6 @@ pub fn cmd_migrate(
             None => main_user.push((k.to_vec(), v.to_vec())),
         }
     }
-
-    // --- Destination: fresh zerodb env ---
-    let dst = ZEnvOpenOptions::new()
-        .map_size(map_size)
-        .max_dbs(MAX_TOOL_DBS)
-        .page_size(page_size)
-        .open(dst_dir)?;
 
     let mut report = String::new();
     writeln!(

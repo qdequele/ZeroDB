@@ -81,7 +81,8 @@ Prior art (clean-room, algorithm-level):
   Cross-process concerns (pid liveness, robust mutexes) dominate both designs;
   **D-001 (single-process) deletes that entire axis for ZeroDB** — no lock
   file, no pids, no reaping — which is why TXN-14's slot is a single
-  `AtomicU64`.
+  `AtomicU64`. *(Historical: ADR-0023 retired D-001 and added that axis back,
+  behind the same single-word pin; see D1's amendment.)*
 
 Constraints from standing law: `zerodb-core` is `#![forbid(unsafe_code)]`
 (M1.1 posture; zero unsafe blocks to date — CLAUDE.md *permits* unsafe in the
@@ -99,6 +100,17 @@ These follow directly from SPEC 04; recorded here so the implementation diff
 can cite one place.
 
 ### D1 — Slot structure: `Box<[CachePadded<AtomicU64>]>`, one word per slot
+
+> **Amended 2026-10-13 (ADR-0023).** The slot is now
+> `zerodb_core::shared::ReaderSlot`, not `CachePadded<AtomicU64>`: a
+> `#[repr(C, align(64))]` 128-byte type with the `txnid` word at offset 0, a
+> 64-bit owner word at offset 8 (owner PID and claim generation, used only by
+> lock-file reaping) and atomic padding. The same type is the slot layout of
+> the shared lock file, so the table lives either in process memory or in the
+> lock-file mapping. The `txnid` word keeps every rule below: occupancy and
+> the pin are still one atomic word, and the pin protocol never reads the
+> owner word. `crossbeam-utils` is no longer a dependency. The text below is
+> the original decision.
 
 ```rust
 // zerodb-core/src/readers.rs (new module; no unsafe — forbid stays)

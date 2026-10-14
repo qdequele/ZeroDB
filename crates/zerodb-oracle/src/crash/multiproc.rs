@@ -5,8 +5,10 @@
 //! 1. a writer child (`crash-harness --crash-child-lock`) opens the env with a
 //!    lock file, writes `writer-open`, and waits for a reader;
 //! 2. a reader child (`crash-harness --crash-reader`) opens the env as a
-//!    second process, writes `reader-up`, and walks every database in a loop
-//!    until told to stop;
+//!    second process, writes `reader-up`, and reads in a loop until told to
+//!    stop: each pass compares the snapshot it pinned with the model's state
+//!    at that txnid (the reader replays the same seed), and once the
+//!    parent's marker commit is in, only walks every database;
 //! 3. the writer dies like a mechanism-B child: an `abort()` at a seeded
 //!    commit-pipeline hook, or a SIGKILL after a seeded delay that starts
 //!    once the reader is up;
@@ -16,7 +18,8 @@
 //! 5. the parent commits one marker write txn, which takes over the dead
 //!    writer's lock, then stops the reader (which must exit cleanly);
 //! 6. the parent closes, checks the file image, and reopens without a lock
-//!    file to confirm the marker commit is the latest one.
+//!    file (`lock_file(false)`) to confirm the marker commit is the latest
+//!    one.
 //!
 //! The legal recovered set differs from single-process recovery: a joiner
 //! takes its snapshot from the txnid the last writer *published* to the lock
@@ -33,9 +36,9 @@ use zerodb::check::check_image;
 use zerodb::{named_databases, Database, EnvOpenOptions, RoTxn};
 use zerodb_io::fault::{splitmix64, Rng};
 
-use super::model::Exec;
+use super::model::{Exec, World};
 use super::sigkill::{kill_arg, read_sidecar, Kill, SigkillOpts, MAX_ROUNDS};
-use super::verify::compare_env_world;
+use super::verify::{compare_env_world, compare_rtxn_world};
 use super::workload::gen_spec;
 use super::CutReport;
 use crate::tempdir::TempDir;
@@ -83,10 +86,47 @@ fn walk_db(db: &Database, rtxn: &RoTxn<'_>, what: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// One reader pass: a read txn over the main database and every named
+/// The model's committed state for every txnid the writer of `seed` can
+/// reach: the parent's replay, run in the reader process.
+fn replay_states(seed: u64) -> std::collections::BTreeMap<u64, World> {
+    let spec = gen_spec(seed);
+    let mut exec = Exec::new(None);
+    for round in 0..MAX_ROUNDS {
+        for op in spec.ops_for_round(round) {
+            // Standalone replay is infallible (no env to disagree with).
+            let _ = exec.step(&op);
+        }
+    }
+    exec.finish();
+    exec.states
+}
+
+/// One reader pass in one read txn. Until the parent's marker commit, every
+/// published txnid is one of the writer's commits, so the snapshot must
+/// equal the model's state at its txnid, keys and values. After it (the
+/// marker reuses a txnid the model may also hold, for a commit the writer
+/// never published), the pass walks the main database and every named
 /// database its catalog lists.
-fn reader_pass(env: &zerodb::Env) -> Result<(), String> {
+fn reader_pass(
+    env: &zerodb::Env,
+    states: &std::collections::BTreeMap<u64, World>,
+) -> Result<(), String> {
     let rtxn = env.read_txn().map_err(|e| format!("read_txn: {e}"))?;
+    let marker = env
+        .main_database()
+        .get(&rtxn, MARKER_KEY)
+        .map_err(|e| format!("marker lookup: {e}"))?
+        .is_some();
+    if !marker {
+        let t = rtxn.txnid();
+        let Some(world) = states.get(&t) else {
+            return Err(format!(
+                "reader pinned txnid {t}, which has no modeled state"
+            ));
+        };
+        return compare_rtxn_world(env, &rtxn, world)
+            .map_err(|e| format!("reader snapshot at txnid {t}: {e}"));
+    }
     walk_db(&env.main_database(), &rtxn, "main database")?;
     let names = named_databases(&rtxn).map_err(|e| format!("named_databases: {e}"))?;
     for name in names {
@@ -102,10 +142,12 @@ fn reader_pass(env: &zerodb::Env) -> Result<(), String> {
 
 /// The reader child body: open the lock-file env at `dir` as a second
 /// process, write `reader-up`, and walk every database in a fresh read txn
-/// until `reader-stop` exists. On any error it writes `reader-fail` with the
-/// message and exits 1; when stopped it exits 0. Never returns. Invoked by
-/// the binary as `crash-harness --crash-reader <dir> <page_size> <map_size>`.
-pub fn reader_run(dir: &Path, page_size: u32, map_size: usize) -> ! {
+/// until `reader-stop` exists, checking each snapshot's contents against the
+/// replayed model of `seed` (see `reader_pass`). On any error it writes
+/// `reader-fail` with the message and exits 1; when stopped it exits 0.
+/// Never returns. Invoked by the binary as
+/// `crash-harness --crash-reader <dir> <page_size> <map_size> <seed>`.
+pub fn reader_run(dir: &Path, page_size: u32, map_size: usize, seed: u64) -> ! {
     let fail = |msg: String| -> ! {
         let _ = std::fs::write(dir.join(READER_FAIL), msg.as_bytes());
         std::process::exit(1);
@@ -115,6 +157,7 @@ pub fn reader_run(dir: &Path, page_size: u32, map_size: usize) -> ! {
         .page_size(page_size)
         .max_dbs(16)
         .lock_file(true);
+    let states = replay_states(seed);
     let env = match opts.open(dir) {
         Ok(e) => e,
         Err(e) => fail(format!("open: {e}")),
@@ -127,7 +170,7 @@ pub fn reader_run(dir: &Path, page_size: u32, map_size: usize) -> ! {
         if started.elapsed() > READER_MAX_LIFETIME {
             fail("never told to stop".to_string());
         }
-        if let Err(e) = reader_pass(&env) {
+        if let Err(e) = reader_pass(&env, &states) {
             fail(e);
         }
     }
@@ -263,6 +306,7 @@ pub fn run_mp_cycle(seed: u64, opts: &SigkillOpts) -> CutReport {
         .arg(dir)
         .arg(spec.page_size.to_string())
         .arg(spec.map_size.to_string())
+        .arg(seed.to_string())
         .spawn()
     {
         Ok(c) => ChildGuard(c),
@@ -470,7 +514,7 @@ pub fn run_mp_cycle(seed: u64, opts: &SigkillOpts) -> CutReport {
         }
     }
     let mut ropts = EnvOpenOptions::new();
-    ropts.max_dbs(16);
+    ropts.max_dbs(16).lock_file(false);
     let env = match ropts.open(dir) {
         Ok(e) => e,
         Err(e) => {

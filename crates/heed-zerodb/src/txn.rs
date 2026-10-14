@@ -233,6 +233,12 @@ impl<'p> RwTxn<'p> {
     ///
     /// The commit pipeline's failures (`MapFull`, poisoned env, a live nested
     /// child → `BadTxn`), mapped to [`crate::Error`].
+    ///
+    /// The first commit of a `PREV_SNAPSHOT` env with a lock file can return
+    /// an I/O error after its meta write, when letting other processes in
+    /// fails (ADR-0023 amendment 19): the commit is then durable although
+    /// `Err` is returned, and is not published, as every first
+    /// `PREV_SNAPSHOT` commit; the next commit retries.
     pub fn commit(self) -> Result<()> {
         self.into_zdb().commit().map_err(Into::into)
     }

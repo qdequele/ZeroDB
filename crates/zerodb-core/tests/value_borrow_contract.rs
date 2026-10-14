@@ -85,9 +85,8 @@ fn committed_env_with_one_entry(map_size: u64, key: &[u8], val: &[u8]) -> Env {
     ));
     open_with_backing(
         path,
-        Box::new(VecBacking(buf)),
+        Box::new(VecBacking::new(buf, map_size)),
         PS,
-        map_size,
         false,
         128,
         126,

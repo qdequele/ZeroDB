@@ -237,6 +237,98 @@ fn meta_slots_alternate_and_prev_snapshot_rolls_back() {
     );
 }
 
+/// Two commits ("one" as txn 1, "two" as txn 2), then a `PREV_SNAPSHOT`
+/// open with or without a lock file.
+fn prev_snapshot_env(dir: &Path, lock_file: bool) -> Env {
+    {
+        let env = open(dir, MAP, PS);
+        let db = env.main_database();
+        for v in [b"one", b"two"] {
+            let mut wtxn = env.write_txn().unwrap();
+            db.put(&mut wtxn, b"state", v).unwrap();
+            wtxn.commit().unwrap();
+        }
+    }
+    let mut opts = EnvOpenOptions::new();
+    opts.map_size(MAP).page_size(PS).lock_file(lock_file);
+    opts.flags(EnvFlags::PREV_SNAPSHOT);
+    opts.open(dir).unwrap()
+}
+
+/// ADR-0023 amendment 19, as LMDB (`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`,
+/// `OBS_PREV_SNAPSHOT_SECOND_COMMIT_KEEPS_FIRST`): with a lock file, the
+/// first commit of a `PREV_SNAPSHOT` env is durable but not published. Read
+/// txns keep the older snapshot; `Env::txnid` and `Env::info` name the
+/// commit, as LMDB's `me_last_txnid` names the newest meta. The second write
+/// txn is the same txnid, built on the older snapshot, so the first
+/// commit's change is lost; a fresh open after one commit serves it.
+#[test]
+fn prev_snapshot_first_commit_is_not_published_with_a_lock_file() {
+    let dir = TempDir::new();
+    let env = prev_snapshot_env(dir.path(), true);
+    let db = env.main_database();
+    let mut wtxn = env.write_txn().unwrap();
+    assert_eq!(wtxn.txnid(), 2);
+    db.put(&mut wtxn, b"state", b"first").unwrap();
+    wtxn.commit().unwrap();
+    assert_eq!(env.txnid(), 2, "names the unpublished commit");
+    assert_eq!(env.info().last_txnid, 2);
+    {
+        let rtxn = env.read_txn().unwrap();
+        assert_eq!(rtxn.txnid(), 1, "readers keep the older snapshot");
+        assert_eq!(db.get(&rtxn, b"state").unwrap(), Some(b"one".as_slice()));
+    }
+    let mut wtxn = env.write_txn().unwrap();
+    assert_eq!(wtxn.txnid(), 2, "the second write txn reuses the txnid");
+    assert_eq!(
+        db.get(&wtxn, b"state").unwrap(),
+        Some(b"one".as_slice()),
+        "built on the older snapshot"
+    );
+    db.put(&mut wtxn, b"extra", b"x").unwrap();
+    wtxn.commit().unwrap();
+    {
+        let rtxn = env.read_txn().unwrap();
+        assert_eq!(rtxn.txnid(), 2);
+        assert_eq!(db.get(&rtxn, b"state").unwrap(), Some(b"one".as_slice()));
+        assert_eq!(db.get(&rtxn, b"extra").unwrap(), Some(b"x".as_slice()));
+    }
+    assert_eq!(env.txnid(), 2);
+    drop(env);
+    assert_clean(dir.path(), PS);
+    let env = open(dir.path(), MAP, PS);
+    assert_eq!(env.txnid(), 2);
+    let rtxn = env.read_txn().unwrap();
+    let db = env.main_database();
+    assert_eq!(db.get(&rtxn, b"state").unwrap(), Some(b"one".as_slice()));
+    assert_eq!(db.get(&rtxn, b"extra").unwrap(), Some(b"x".as_slice()));
+}
+
+/// Without a lock file a `PREV_SNAPSHOT` env's first commit is published at
+/// once and the second builds on it, as LMDB with `MDB_NOLOCK`
+/// (`OBS_PREV_SNAPSHOT_NOLOCK_COMMITS`; ADR-0023 amendment 19).
+#[test]
+fn prev_snapshot_first_commit_is_published_without_a_lock_file() {
+    let dir = TempDir::new();
+    let env = prev_snapshot_env(dir.path(), false);
+    let db = env.main_database();
+    let mut wtxn = env.write_txn().unwrap();
+    db.put(&mut wtxn, b"state", b"first").unwrap();
+    wtxn.commit().unwrap();
+    {
+        let rtxn = env.read_txn().unwrap();
+        assert_eq!(rtxn.txnid(), 2);
+        assert_eq!(db.get(&rtxn, b"state").unwrap(), Some(b"first".as_slice()));
+    }
+    let mut wtxn = env.write_txn().unwrap();
+    assert_eq!(wtxn.txnid(), 3);
+    db.put(&mut wtxn, b"extra", b"x").unwrap();
+    wtxn.commit().unwrap();
+    let rtxn = env.read_txn().unwrap();
+    assert_eq!(db.get(&rtxn, b"state").unwrap(), Some(b"first".as_slice()));
+    assert_eq!(db.get(&rtxn, b"extra").unwrap(), Some(b"x".as_slice()));
+}
+
 #[test]
 fn multi_commit_churn_stays_clean() {
     // put/del/clear churn across several commits; the invariant walk runs

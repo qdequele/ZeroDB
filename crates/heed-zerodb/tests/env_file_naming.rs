@@ -101,15 +101,18 @@ fn dir_listing(dir: &std::path::Path) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// A fresh env dir created through the adapter contains **exactly**
-/// `["data.mdb"]`: no `zerodb.dat`, and no `lock.mdb` (nothing in the consumer
-/// tree reads one — ZeroDB stays single-process).
+/// `["data.mdb", "lock.mdb"]`, as an LMDB env dir does: no `zerodb.dat`, and
+/// the lock file is on by default (ADR-0023).
 #[test]
-fn adapter_env_dir_contains_exactly_data_mdb() {
+fn adapter_env_dir_contains_exactly_data_mdb_and_lock_mdb() {
     let dir = tempfile::tempdir().unwrap();
     let env = unsafe { opts().open(dir.path()).unwrap() };
     populate(&env, 32);
 
-    assert_eq!(dir_listing(dir.path()), vec!["data.mdb".to_string()]);
+    assert_eq!(
+        dir_listing(dir.path()),
+        vec!["data.mdb".to_string(), "lock.mdb".to_string()]
+    );
     assert_eq!(heed_zerodb::DATA_FILE_NAME, "data.mdb");
     // `Env::path()` returns the *directory*, not the data file — heed
     // parity. (Compared canonicalized: the engine
@@ -151,7 +154,8 @@ fn snapshot_round_trip(option: CompactionOption) {
     env.copy_to_path(dst_dir.path().join("data.mdb"), option)
         .unwrap();
 
-    // The snapshot dir looks like an LMDB env dir.
+    // The snapshot dir looks like an LMDB env dir after `mdb_env_copy`: the
+    // data file only; the lock file appears when the env is opened.
     assert_eq!(dir_listing(dst_dir.path()), vec!["data.mdb".to_string()]);
 
     // Restore: extract, open the directory — must yield the snapshot's
@@ -224,7 +228,10 @@ fn compaction_persist_round_trip(option: CompactionOption, delete_first: bool) {
     // Step 5 — reopen the same directory and verify.
     let reopened = unsafe { opts().open(dir.path()).unwrap() };
     assert_eq!(contents(&reopened), expected);
-    assert_eq!(dir_listing(dir.path()), vec!["data.mdb".to_string()]);
+    assert_eq!(
+        dir_listing(dir.path()),
+        vec!["data.mdb".to_string(), "lock.mdb".to_string()]
+    );
 
     if delete_first && matches!(option, CompactionOption::Enabled) {
         let size_after = fs::metadata(&src_path).unwrap().len();
@@ -277,4 +284,195 @@ fn streamed_inner_file_bytes_reopen_as_env() {
     fs::write(dst_dir.path().join("data.mdb"), &bytes).unwrap();
     let restored = unsafe { opts().open(dst_dir.path()).unwrap() };
     assert_eq!(contents(&restored), expected);
+}
+
+// ---------------------------------------------------------------------------
+// NO_LOCK (ADR-0023 amendment 17)
+// ---------------------------------------------------------------------------
+
+/// heed's `NO_LOCK` maps to the engine's `lock_file(false)` and turns off the
+/// lock file the adapter has by default: `NO_LOCK` leaves no `lock.mdb` in
+/// the env dir (`OBS_NOLOCK_CREATES_LOCK_FILE = false`), while the same
+/// options without `NO_LOCK` create one.
+#[test]
+fn no_lock_creates_no_lock_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts();
+    // SAFETY: heed signature parity only; setting flags performs no unsafe
+    // operation in the adapter.
+    unsafe { o.flags(heed_zerodb::EnvFlags::NO_LOCK) };
+    let env = unsafe { o.open(dir.path()).unwrap() };
+    populate(&env, 8);
+    assert_eq!(dir_listing(dir.path()), vec!["data.mdb".to_string()]);
+    drop(env);
+
+    let locked = tempfile::tempdir().unwrap();
+    let o = opts();
+    let env = unsafe { o.open(locked.path()).unwrap() };
+    populate(&env, 8);
+    assert_eq!(
+        dir_listing(locked.path()),
+        vec!["data.mdb".to_string(), "lock.mdb".to_string()]
+    );
+}
+
+/// `Env::flags()` reports `NO_LOCK` for an env opened with it, and not for
+/// one opened without it (which has the default lock file), as
+/// `mdb_env_get_flags` does.
+#[test]
+fn flags_report_no_lock() {
+    use heed_zerodb::EnvFlags;
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts();
+    // SAFETY: as in `no_lock_creates_no_lock_file`.
+    unsafe { o.flags(EnvFlags::NO_LOCK | EnvFlags::NO_SYNC) };
+    let env = unsafe { o.open(dir.path()).unwrap() };
+    let flags = env.flags().unwrap().unwrap();
+    assert!(flags.contains(EnvFlags::NO_LOCK), "{flags:?}");
+    assert!(flags.contains(EnvFlags::NO_SYNC), "{flags:?}");
+    assert_ne!(env.get_flags().unwrap() & EnvFlags::NO_LOCK.bits(), 0);
+    drop(env);
+
+    let other = tempfile::tempdir().unwrap();
+    let env = unsafe { opts().open(other.path()).unwrap() };
+    assert!(other.path().join("lock.mdb").exists());
+    let flags = env.flags().unwrap().unwrap();
+    assert!(!flags.contains(EnvFlags::NO_LOCK), "{flags:?}");
+    assert_eq!(env.get_flags().unwrap() & EnvFlags::NO_LOCK.bits(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Read-only media (ADR-0023 amendment 17)
+// ---------------------------------------------------------------------------
+
+/// Run `cmd` to completion within 60 s; `false` on a failure exit, a spawn
+/// error or the timeout (the child is then killed).
+fn run_bounded(cmd: &mut std::process::Command) -> bool {
+    use std::time::{Duration, Instant};
+    let Ok(mut child) = cmd
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let end = Instant::now() + Duration::from_secs(60);
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return st.success(),
+            Ok(None) if Instant::now() < end => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// A read-only filesystem holding a copy of a directory, unmounted on drop.
+struct ReadOnlyFs {
+    mount: std::path::PathBuf,
+    _keep: tempfile::TempDir,
+}
+
+impl Drop for ReadOnlyFs {
+    fn drop(&mut self) {
+        use std::process::Command;
+        if cfg!(target_os = "macos") {
+            run_bounded(
+                Command::new("hdiutil")
+                    .arg("detach")
+                    .arg("-force")
+                    .arg(&self.mount),
+            );
+        } else {
+            run_bounded(Command::new("umount").arg(&self.mount));
+        }
+    }
+}
+
+/// Make a read-only filesystem with `src`'s files, or say why not: a
+/// read-only disk image on macOS (`hdiutil`), a read-only bind mount on
+/// Linux (needs `CAP_SYS_ADMIN`, for example a privileged container).
+fn read_only_fs(src: &std::path::Path) -> Result<ReadOnlyFs, String> {
+    use std::process::Command;
+    let keep = tempfile::tempdir().unwrap();
+    let mount = keep.path().join("mnt");
+    fs::create_dir(&mount).unwrap();
+    if cfg!(target_os = "macos") {
+        let img = keep.path().join("ro.dmg");
+        if !run_bounded(
+            Command::new("hdiutil")
+                .args(["create", "-quiet", "-format", "UDRO", "-srcfolder"])
+                .arg(src)
+                .arg(&img),
+        ) {
+            return Err("hdiutil create failed".into());
+        }
+        if !run_bounded(
+            Command::new("hdiutil")
+                .args(["attach", "-quiet", "-readonly", "-nobrowse", "-mountpoint"])
+                .arg(&mount)
+                .arg(&img),
+        ) {
+            return Err("hdiutil attach failed".into());
+        }
+    } else {
+        if !run_bounded(Command::new("mount").arg("--bind").arg(src).arg(&mount)) {
+            return Err("bind mount failed (needs CAP_SYS_ADMIN)".into());
+        }
+        if !run_bounded(
+            Command::new("mount")
+                .args(["-o", "remount,bind,ro"])
+                .arg(&mount),
+        ) {
+            run_bounded(Command::new("umount").arg(&mount));
+            return Err("read-only remount failed".into());
+        }
+    }
+    Ok(ReadOnlyFs { mount, _keep: keep })
+}
+
+/// The one way an adapter env runs without a lock file and without
+/// `NO_LOCK`: a `READ_ONLY` open on read-only media, where no `lock.mdb`
+/// can be created (`OBS_RDONLY_LOCK_READONLY_FS = 0`). It opens and reads,
+/// creates no lock file, and `flags()` does **not** report `NO_LOCK`
+/// (`OBS_RDONLY_READONLY_FS_REPORTS_NOLOCK = false`). The adapter-level
+/// counterpart of the engine's
+/// `multi_process::read_only_env_on_read_only_media_opens_without_a_lock_file`.
+#[test]
+fn read_only_media_env_has_no_lock_file_and_does_not_report_no_lock() {
+    use heed_zerodb::EnvFlags;
+    let src = tempfile::tempdir().unwrap();
+    {
+        let mut o = opts();
+        // SAFETY: heed signature parity only; private temp dir, one process.
+        // `NO_LOCK` here only keeps `lock.mdb` out of the read-only copy.
+        unsafe { o.flags(EnvFlags::NO_LOCK) };
+        let env = unsafe { o.open(src.path()).unwrap() };
+        populate(&env, 8);
+        env.prepare_for_closing().wait();
+    }
+    assert_eq!(dir_listing(src.path()), vec!["data.mdb".to_string()]);
+    let ro = match read_only_fs(src.path()) {
+        Ok(fs) => fs,
+        Err(why) => {
+            println!("SKIPPED: no read-only filesystem here ({why})");
+            return;
+        }
+    };
+    {
+        let mut o = opts();
+        // SAFETY: as above.
+        unsafe { o.flags(EnvFlags::READ_ONLY) };
+        let env = unsafe { o.open(&ro.mount) }.expect("READ_ONLY on read-only media");
+        let flags = env.flags().unwrap().unwrap();
+        assert!(!flags.contains(EnvFlags::NO_LOCK), "{flags:?}");
+        assert_eq!(env.get_flags().unwrap() & EnvFlags::NO_LOCK.bits(), 0);
+        let rtxn = env.read_txn().unwrap();
+        let main: Database<Bytes, Bytes> = env.open_database(&rtxn, None).unwrap().unwrap();
+        assert!(main.get(&rtxn, b"key-000000").unwrap().is_some());
+    }
+    assert!(!ro.mount.join("lock.mdb").exists());
 }

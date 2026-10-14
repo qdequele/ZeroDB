@@ -22,7 +22,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
 
 use zerodb::check::check_image;
-use zerodb::Env;
+use zerodb::{Env, RoTxn};
 use zerodb_core::env::{open_with_backing, testutil::VecBacking, DurabilityFlags};
 use zerodb_core::error::{Error, MdbError};
 use zerodb_core::page::{MetaPage, MetaValidity};
@@ -77,10 +77,19 @@ pub fn pad_image(img: &mut Vec<u8>, psize: u32) {
 /// A human-readable mismatch description.
 pub fn compare_env_world(env: &Env, world: &World) -> Result<(), String> {
     let rtxn = env.read_txn().map_err(|e| format!("read_txn: {e}"))?;
+    compare_rtxn_world(env, &rtxn, world)
+}
+
+/// [`compare_env_world`] under a read txn the caller already holds.
+///
+/// # Errors
+///
+/// A human-readable mismatch description.
+pub fn compare_rtxn_world(env: &Env, rtxn: &RoTxn<'_>, world: &World) -> Result<(), String> {
     // The true root is a pure catalog (the workload writes only named DBs):
     // its entry count is the db count — extra/missing DBs surface here.
     let root = env.main_database();
-    let catalog_len = root.len(&rtxn).map_err(|e| format!("catalog len: {e}"))?;
+    let catalog_len = root.len(rtxn).map_err(|e| format!("catalog len: {e}"))?;
     if catalog_len != world.len() as u64 {
         return Err(format!(
             "catalog count mismatch: recovered {catalog_len} dbs, model {}",
@@ -88,14 +97,14 @@ pub fn compare_env_world(env: &Env, world: &World) -> Result<(), String> {
         ));
     }
     for (name, entries) in world {
-        let db = match env.open_database(&rtxn, Some(name.as_bytes())) {
+        let db = match env.open_database(rtxn, Some(name.as_bytes())) {
             Ok(Some(db)) => db,
             Ok(None) => return Err(format!("model db {name:?} missing after recovery")),
             Err(e) => return Err(format!("open_database({name:?}): {e}")),
         };
         let mut got = 0u64;
         let mut model_iter = entries.iter();
-        for pair in db.iter(&rtxn) {
+        for pair in db.iter(rtxn) {
             let (k, v) = pair.map_err(|e| format!("iter({name:?}): {e}"))?;
             got += 1;
             match model_iter.next() {
@@ -195,9 +204,8 @@ pub fn verify_image_full(mut img: Vec<u8>, c: &FullChecks<'_>) -> Result<FullOut
         // Obligation 1: a legally materialized post-commit image must open.
         let env = open_with_backing(
             path,
-            Box::new(VecBacking(img)),
+            Box::new(VecBacking::new(img, map_size)),
             psize,
-            map_size,
             false,
             16,
             126,
@@ -266,9 +274,8 @@ pub fn probe_image_adversarial(
     let result = catch_unwind(AssertUnwindSafe(move || {
         open_with_backing(
             path,
-            Box::new(VecBacking(img)),
+            Box::new(VecBacking::new(img, map_size)),
             psize,
-            map_size,
             false,
             16,
             126,

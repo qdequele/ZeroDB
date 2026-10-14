@@ -53,9 +53,8 @@ fn craft_image(
 fn open_image(buf: Vec<u8>, tag: &str) -> Result<Env, Error> {
     open_with_backing(
         unique_path(tag),
-        Box::new(VecBacking(buf)),
+        Box::new(VecBacking::new(buf, MAP)),
         PS,
-        MAP,
         false,
         8,
         8,

@@ -3,7 +3,8 @@
 //! commits through: positioned `pwrite` + `sync_data`).
 //!
 //! This crate is one of the two sanctioned homes for mmap `unsafe` (the
-//! repo's unsafe policy). The `unsafe` blocks live in [`mmap`], the single `pwritev`
+//! repo's unsafe policy). The `unsafe` blocks live in [`mmap`] (the maps and
+//! the grow-only `MapRegions` cell, ADR-0023 amendment 15), the single `pwritev`
 //! call in [`file`] (the vectored commit write), the test-only in-memory
 //! map stand-in (`testmap`, ADR-0021 M1, behind the `test-backing` feature), and
 //! the shared-memory primitives in [`lockfile`] (atomic views over the lock
@@ -25,29 +26,109 @@ pub mod testmap;
 
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use file::{
     create_env_file, open_file, probe_page_size, read_page, real_disk_size, write_page,
 };
 pub use mmap::{Mmap, MmapWritable};
 
-use zerodb_core::env::Backing;
+use mmap::{MapRegions, Mapping};
+use zerodb_core::env::{Backing, MapView};
 use zerodb_core::error::{Error, MdbError};
+use zerodb_core::page::geometry::MAX_MAP_SIZE;
 use zerodb_core::page::{MetaPage, MetaValidity};
+
+/// The current view of `regions` as the engine's [`MapView`].
+fn map_view(regions: &MapRegions) -> MapView<'_> {
+    let (mapping, map_size) = regions.view();
+    MapView {
+        bytes: mapping.bytes(),
+        map_size,
+    }
+}
+
+/// `n` bytes as a mapping length.
+fn map_len(n: u64) -> std::io::Result<usize> {
+    usize::try_from(n).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("map size ({n}) exceeds the address space"),
+        )
+    })
+}
+
+/// Publish logical size `map_size` in `regions` (ADR-0023 amendment 15).
+///
+/// When the current mapping is shorter, a new one of
+/// `max(map_size, 2 × current length)` bytes is created with `map` and
+/// published with it; if that `mmap` fails with `ENOMEM`, it is retried at
+/// exactly `map_size`, and a second failure is returned. Otherwise the current
+/// mapping is kept and only the logical size changes: nothing is unmapped.
+///
+/// Callers serialize publications: they hold the writer locks (`resize`), or
+/// run at open before the backing is shared (a joiner's seed).
+fn grow_regions(
+    regions: &MapRegions,
+    map_size: u64,
+    map: impl Fn(usize) -> std::io::Result<Mapping>,
+) -> std::io::Result<()> {
+    let current = regions.view().0.bytes().len() as u64;
+    if map_size <= current {
+        regions.publish(None, map_size);
+        return Ok(());
+    }
+    // Geometric growth bounds the address space all mappings keep: each is
+    // at least twice the previous, so together they stay below twice the
+    // newest (decision 2).
+    let wanted = map_size.max(current.saturating_mul(2));
+    let mapping = match map_len(wanted).and_then(&map) {
+        Ok(m) => m,
+        Err(e) if wanted > map_size && e.raw_os_error() == Some(libc::ENOMEM) => {
+            map(map_len(map_size)?)?
+        }
+        Err(e) if wanted > map_size && e.kind() == std::io::ErrorKind::InvalidInput => {
+            // `wanted` does not fit a `usize`, or `mmap` refused the length
+            // with `EINVAL` (which the standard library reports as
+            // `InvalidInput`); `map_size` may still fit.
+            map(map_len(map_size)?)?
+        }
+        Err(e) => return Err(e),
+    };
+    regions.publish(Some(mapping), map_size);
+    Ok(())
+}
 
 /// A [`Backing`] over a memory-mapped env data file.
 ///
-/// Field order is load-bearing for `Drop`: `mmap` is declared **before** `file`
-/// so the map is unmapped before the descriptor is closed (SPEC 04 TXN-53 — "the
-/// mmap is unmapped before the file is closed").
+/// It reads through grow-only `MapRegions` (ADR-0023 amendment 15) holding
+/// read-only maps. Field order is load-bearing for `Drop`: `regions` is
+/// declared **before** `file` so every mapping is unmapped before the
+/// descriptor is closed (SPEC 04 TXN-53 — "the mmap is unmapped before the
+/// file is closed").
 pub struct MmapBacking {
-    mmap: Mmap,
+    regions: MapRegions,
     file: File,
+    /// `MDB_NORDAHEAD`: every new mapping is advised `MADV_RANDOM`.
+    random_access: bool,
 }
 
 impl Backing for MmapBacking {
-    fn bytes(&self) -> &[u8] {
-        self.mmap.bytes()
+    fn view(&self) -> MapView<'_> {
+        map_view(&self.regions)
+    }
+
+    fn grow_map(&self, map_size: u64) -> std::io::Result<()> {
+        // A read-only map past the file's end is safe: pages there fault only
+        // when touched, and readers touch only pages a checked snapshot
+        // references, which lie inside the file (SPEC 06 REC-1a).
+        grow_regions(&self.regions, map_size, |len| {
+            let m = Mmap::map(&self.file, len)?;
+            if self.random_access {
+                m.advise_random()?;
+            }
+            Ok(Mapping::Read(m))
+        })
     }
 
     fn real_disk_size(&self) -> std::io::Result<u64> {
@@ -92,14 +173,6 @@ impl Backing for MmapBacking {
     }
 }
 
-impl MmapBacking {
-    /// Access the mapped bytes (used by the engine core through [`Backing`]).
-    #[must_use]
-    pub fn map(&self) -> &Mmap {
-        &self.mmap
-    }
-}
-
 /// A [`Backing`] over a **writable** memory-mapped env data file
 /// (`EnvFlags::WRITE_MAP`, SPEC 01 §S7, SPEC 04 §6.4).
 ///
@@ -119,14 +192,69 @@ impl MmapBacking {
 /// realization (TXN-45a) remains the behavior of every backing that does not
 /// broker slices (the default mode, the miri test backing, the
 /// fault-injection backend).
+///
+/// Its `MapRegions` hold only writable maps; writes go through the current
+/// one. Field order is load-bearing for `Drop` (`regions` before `file`).
 pub struct WriteMapBacking {
-    mmap: MmapWritable,
+    regions: MapRegions,
     file: File,
+    /// `MDB_NORDAHEAD`: every new mapping is advised `MADV_RANDOM`.
+    random_access: bool,
+    /// A lower bound of the data file's length: the last length this process
+    /// measured or set. The file never shrinks (ADR-0023 amendment 15), so
+    /// [`Backing::ensure_file_len`] is one comparison when the file is
+    /// already long enough.
+    file_len: AtomicU64,
+}
+
+impl WriteMapBacking {
+    /// The current writable map.
+    fn map(&self) -> &MmapWritable {
+        match self.regions.view().0 {
+            Mapping::Write(m) => m,
+            // Construction publishes only writable maps into these regions.
+            _ => unreachable!("a WriteMapBacking holds only writable maps"),
+        }
+    }
 }
 
 impl Backing for WriteMapBacking {
-    fn bytes(&self) -> &[u8] {
-        self.mmap.bytes()
+    fn view(&self) -> MapView<'_> {
+        map_view(&self.regions)
+    }
+
+    fn grow_map(&self, map_size: u64) -> std::io::Result<()> {
+        // The file first, so every page below the new logical size is backed
+        // before the size is published (ADR-0023 amendment 15). Only grows.
+        self.ensure_file_len(map_size)?;
+        grow_regions(&self.regions, map_size, |len| {
+            let m = MmapWritable::map(&self.file, len)?;
+            if self.random_access {
+                m.advise_random()?;
+            }
+            Ok(Mapping::Write(m))
+        })
+    }
+
+    fn ensure_file_len(&self, len: u64) -> std::io::Result<()> {
+        // Relaxed: the value is only a lower bound of a length that never
+        // decreases, so any value read, however stale, is still a lower
+        // bound; a stale one costs one `fstat`. Callers hold both writer
+        // locks (or run at open, before the backing is shared), whose
+        // mutexes order every update with the next caller's read.
+        if self.file_len.load(Ordering::Relaxed) >= len {
+            return Ok(());
+        }
+        // Re-read the length: another process may have grown the file under
+        // the writer lock since this one last looked. Grow only if it is
+        // shorter, so the file never shrinks under another mapping.
+        let real = file::real_disk_size(&self.file)?;
+        if real < len {
+            self.file.set_len(len)?;
+        }
+        // Relaxed: as for the load above.
+        self.file_len.fetch_max(real.max(len), Ordering::Relaxed);
+        Ok(())
     }
 
     fn real_disk_size(&self) -> std::io::Result<u64> {
@@ -166,16 +294,17 @@ impl Backing for WriteMapBacking {
                 "page write overflows usize",
             )
         })?;
-        if end > self.mmap.bytes().len() {
+        let map = self.map();
+        if end > map.len() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!(
                     "page write [{off}, {end}) outside the writable map ({} bytes)",
-                    self.mmap.bytes().len()
+                    map.len()
                 ),
             ));
         }
-        self.mmap.write_at(off, data);
+        map.write_at(off, data);
         Ok(())
     }
 
@@ -198,13 +327,14 @@ impl Backing for WriteMapBacking {
         let off = (pgno as usize).checked_mul(ps)?;
         let len = (pages as usize).checked_mul(ps)?;
         let end = off.checked_add(len)?;
-        if len == 0 || end > self.mmap.len() {
+        let map = self.map();
+        if len == 0 || end > map.len() {
             return None;
         }
         // SAFETY: the caller of this `unsafe fn` discharges `slice_mut`'s
         // brokered contract (single writer, TXN-62 region, one live `&mut`,
         // read views re-derived per spill) — forwarded verbatim.
-        Some(unsafe { self.mmap.slice_mut(off, len) })
+        Some(unsafe { map.slice_mut(off, len) })
     }
 
     fn sync_data(&self) -> std::io::Result<()> {
@@ -217,7 +347,7 @@ impl Backing for WriteMapBacking {
         // not a full barrier, so a synchronous flush additionally `fdatasync`s
         // the data fd (SPEC 01 §S7); an async flush deliberately does neither
         // (relaxed durability, REC-9).
-        self.mmap.flush(async_flush)?;
+        self.map().flush(async_flush)?;
         if !async_flush {
             self.file.sync_data()?;
         }
@@ -225,25 +355,15 @@ impl Backing for WriteMapBacking {
     }
 }
 
-impl WriteMapBacking {
-    /// Access the writable map (used by the engine core through [`Backing`]).
-    #[must_use]
-    pub fn map(&self) -> &MmapWritable {
-        &self.mmap
-    }
-}
-
 /// The result of opening (or creating) an env data file: the [`Backing`] plus
-/// the authoritative page size, the effective runtime map size, and whether the
-/// file was freshly created.
+/// the authoritative page size and whether the file was freshly created. The
+/// runtime map size is the backing's: `backing.view().map_size` (ADR-0023
+/// amendment 15).
 pub struct Opened {
     /// The mmap-backed reader, boxed as the engine's [`Backing`].
     pub backing: Box<dyn Backing>,
     /// The DB page size (from the file, or the requested size for a new env).
     pub page_size: u32,
-    /// The effective runtime map size (the requested size, else the persisted
-    /// one; SPEC 02 §8).
-    pub map_size: u64,
     /// Whether the file was created by this call.
     pub created: bool,
 }
@@ -259,12 +379,18 @@ pub struct Opened {
 ///   `default_map_size` if neither slot is decodable (the file is then invalid
 ///   and the core will reject it).
 ///
+/// The effective map size is raised to `(last_pg + 1) * page_size` of the
+/// newest valid meta when it is smaller, as LMDB does
+/// (`OBS_OPEN_BELOW_LAST_PG = "minsize"`, ADR-0023 amendment 15).
+///
 /// This function performs all filesystem I/O for open; the engine core
 /// ([`zerodb_core::env::open_with_backing`]) does the I/O-free selection.
 ///
 /// # Errors
 ///
-/// Propagates I/O errors as [`Error::Io`].
+/// Propagates I/O errors as [`Error::Io`]. A requested map size above
+/// [`MAX_MAP_SIZE`] is `Io(InvalidInput)` and a persisted one is
+/// [`MdbError::Invalid`], both before any file is created, grown or mapped.
 pub fn open_or_create(
     data_path: &Path,
     requested_page_size: u32,
@@ -281,12 +407,29 @@ pub fn open_or_create(
         read_only,
         write_map,
         false,
+        true,
+        false,
     )
 }
 
 /// [`open_or_create`] with the `MDB_NORDAHEAD` access hint: `random_access`
 /// advises the kernel that the map is read at random (`MADV_RANDOM`, no
 /// readahead), as LMDB does for that flag. The hint changes no result.
+///
+/// `grow_file` says whether a `WRITE_MAP` open may grow the data file to the
+/// map size: `true` without a lock file and for the lock file's initializer
+/// (the only process), `false` for a joiner. A joiner maps the logical size,
+/// which may extend past the file's end, and its first write txn grows the
+/// file under both writer locks (ADR-0023 amendment 15, decision 4).
+///
+/// `prev_snapshot` mirrors the engine's `EnvFlags::PREV_SNAPSHOT`: the
+/// persisted map size this open adopts
+/// (when `requested_map_size` is `None`) and the minimum it rounds a small
+/// requested size up to both come from the **older** valid meta generation,
+/// not the newest — the LMDB fork reads its header with the `prev` flag, so
+/// its minimum and default map size come from that older meta too
+/// (`OBS_PREV_SNAPSHOT_MINSIZE_FROM`, `OBS_PREV_SNAPSHOT_ZERO_MAPSIZE_FROM` =
+/// "prev"). With only one valid meta, that one is used either way.
 ///
 /// # Errors
 ///
@@ -300,12 +443,25 @@ pub fn open_or_create_with_advice(
     read_only: bool,
     write_map: bool,
     random_access: bool,
+    grow_file: bool,
+    prev_snapshot: bool,
 ) -> Result<Opened, Error> {
     // `WRITE_MAP` needs write access; it is meaningless (and unsupported here)
     // on a read-only env, which maps read-only. LMDB likewise maps a
     // `WRITEMAP|RDONLY` env read-only. So the writable path is taken only when
     // `write_map && !read_only`.
     let write_map = write_map && !read_only;
+
+    // ADR-0023 amendment 15, decision 6: refuse a map above the cap before
+    // any file is created, grown or mapped.
+    if let Some(requested) = requested_map_size {
+        if requested > MAX_MAP_SIZE {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("map_size ({requested}) exceeds the supported maximum {MAX_MAP_SIZE}"),
+            )));
+        }
+    }
 
     let exists_nonempty = match std::fs::metadata(data_path) {
         Ok(m) => m.len() > 0,
@@ -323,11 +479,10 @@ pub fn open_or_create_with_advice(
         }
         let map_size = requested_map_size.unwrap_or(default_map_size);
         let file = file::create_env_file(data_path, requested_page_size, map_size)?;
-        let backing = map_backing(file, map_size, write_map, random_access)?;
+        let backing = map_backing(file, map_size, write_map, random_access, grow_file)?;
         return Ok(Opened {
             backing,
             page_size: requested_page_size,
-            map_size,
             created: true,
         });
     }
@@ -354,56 +509,101 @@ pub fn open_or_create_with_advice(
     // Probe the persisted map size from a small head read before mapping, so
     // the mapping can cover the full effective map_size (ADR-0004 D4).
     let head = file::read_head(&file, file_len.min(2 * page_size as usize))?;
-    let persisted = persisted_map_size(&head, page_size);
-    let map_size = requested_map_size.or(persisted).unwrap_or(default_map_size);
-    let backing = map_backing(file, map_size, write_map, random_access)?;
+    // `PREV_SNAPSHOT` takes its geometry from the older meta generation, as
+    // LMDB does; a normal open takes the newest (see the doc comment above).
+    let geometry = if prev_snapshot {
+        prev_meta_geometry(&head, page_size)
+    } else {
+        newest_meta_geometry(&head, page_size)
+    };
+    if let Some((persisted, _)) = geometry {
+        // A persisted size above the cap is corrupt (ADR-0023 amendment 15).
+        if persisted > MAX_MAP_SIZE {
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
+    }
+    let mut map_size = requested_map_size
+        .or(geometry.map(|(m, _)| m))
+        .unwrap_or(default_map_size);
+    // A map below the selected generation's data rounds up to exactly
+    // `(last_pg + 1) * page_size`, as LMDB does (`OBS_OPEN_BELOW_LAST_PG =
+    // "minsize"`, `OBS_PREV_SNAPSHOT_MINSIZE_FROM = "prev"`). Only within the
+    // file: a meta naming pages past the file end is corrupt, and the engine
+    // core rejects it (SPEC 06 REC-1a) — never grow a map, or under
+    // WRITE_MAP the file, for it.
+    if let Some((_, last_pg)) = geometry {
+        let min = last_pg
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(u64::from(page_size)));
+        if let Some(min) = min.filter(|&m| m <= file_len as u64) {
+            map_size = map_size.max(min);
+        }
+    }
+    let backing = map_backing(file, map_size, write_map, random_access, grow_file)?;
 
     Ok(Opened {
         backing,
         page_size,
-        map_size,
         created: false,
     })
 }
 
 /// Map `file` at the effective `map_size` and box it as a [`Backing`]: the
 /// read-only [`MmapBacking`] (default) or the writable [`WriteMapBacking`]
-/// (`WRITE_MAP`). ADR-0004 D4: the map covers the full `map_size` once, no
-/// remap. Under `WRITE_MAP` the file is first `set_len(map_size)` so every
-/// mapped page is backed (SPEC 04 §6.4 — no `SIGBUS` on a store past EOF).
+/// (`WRITE_MAP`). The mapping covers `max(file length, map_size)` and is
+/// published as view 0 of the backing's grow-only regions, with `map_size` as
+/// the logical size (ADR-0023 amendment 15). Under `WRITE_MAP`, when
+/// `grow_file` is set, the file is first `set_len(map_size)` so every mapped
+/// page is backed (SPEC 04 §6.4 — no `SIGBUS` on a store past EOF). A joiner
+/// (`grow_file` false) leaves the file alone: its write txns grow it under
+/// both writer locks before writing through the map.
 fn map_backing(
     file: File,
     map_size: u64,
     write_map: bool,
     random_access: bool,
+    grow_file: bool,
 ) -> Result<Box<dyn Backing>, Error> {
-    let file_len = file::real_disk_size(&file)? as usize;
-    let want = file_len.max(map_size as usize);
+    let mut file_len = file::real_disk_size(&file)?;
+    let want = map_len(file_len.max(map_size)).map_err(Error::Io)?;
     if write_map {
         // Grow the file to cover the whole map so writes anywhere in
         // `[0, map_size)` land in backed (sparse) blocks, not past EOF.
-        if (file_len as u64) < map_size {
+        if grow_file && file_len < map_size {
             file.set_len(map_size)?;
+            file_len = map_size;
         }
         let mmap = MmapWritable::map(&file, want)?;
         if random_access {
             mmap.advise_random()?;
         }
-        Ok(Box::new(WriteMapBacking { mmap, file }))
+        let regions = MapRegions::new(Mapping::Write(mmap), map_size);
+        Ok(Box::new(WriteMapBacking {
+            regions,
+            file,
+            random_access,
+            file_len: AtomicU64::new(file_len),
+        }))
     } else {
         let mmap = Mmap::map(&file, want)?;
         if random_access {
             mmap.advise_random()?;
         }
-        Ok(Box::new(MmapBacking { mmap, file }))
+        let regions = MapRegions::new(Mapping::Read(mmap), map_size);
+        Ok(Box::new(MmapBacking {
+            regions,
+            file,
+            random_access,
+        }))
     }
 }
 
-/// The persisted `map_size` from whichever meta slot validates (prefer the
-/// higher-txnid valid slot), or `None` if neither decodes.
-fn persisted_map_size(bytes: &[u8], page_size: u32) -> Option<u64> {
+/// The persisted `(map_size, last_pg)` of the newest valid meta slot (the
+/// higher-txnid one), or `None` if neither decodes. This is the meta LMDB
+/// reads its open-time map size and minimum from.
+fn newest_meta_geometry(bytes: &[u8], page_size: u32) -> Option<(u64, u64)> {
     let ps = page_size as usize;
-    let mut best: Option<(u64, u64)> = None; // (txnid, map_size)
+    let mut best: Option<(u64, u64, u64)> = None; // (txnid, map_size, last_pg)
     for slot in [0usize, 1] {
         let base = slot * ps;
         let end = base.checked_add(ps)?;
@@ -412,10 +612,144 @@ fn persisted_map_size(bytes: &[u8], page_size: u32) -> Option<u64> {
         }
         if let Ok(MetaValidity::Valid(m)) = MetaPage::validate(&bytes[base..end], page_size) {
             match best {
-                Some((t, _)) if t >= m.txnid => {}
-                _ => best = Some((m.txnid, m.map_size)),
+                Some((t, _, _)) if t >= m.txnid => {}
+                _ => best = Some((m.txnid, m.map_size, m.last_pg)),
             }
         }
     }
-    best.map(|(_, ms)| ms)
+    best.map(|(_, ms, lp)| (ms, lp))
+}
+
+/// The persisted `(map_size, last_pg)` of the **older** valid meta slot (the
+/// lower-txnid one, when both decode), or of whichever single slot decodes
+/// otherwise. This is the generation `PREV_SNAPSHOT` serves, and so the meta
+/// the LMDB fork reads its `PREVSNAPSHOT` open-time map size and minimum
+/// from, observed as `OBS_PREV_SNAPSHOT_MINSIZE_FROM` and
+/// `OBS_PREV_SNAPSHOT_ZERO_MAPSIZE_FROM` (both `"prev"`,
+/// `lmdb_stage3_observation.rs`).
+fn prev_meta_geometry(bytes: &[u8], page_size: u32) -> Option<(u64, u64)> {
+    let ps = page_size as usize;
+    let mut valid: Vec<(u64, u64, u64)> = Vec::new(); // (txnid, map_size, last_pg)
+    for slot in [0usize, 1] {
+        let base = slot * ps;
+        let end = base.checked_add(ps)?;
+        if end > bytes.len() {
+            continue;
+        }
+        if let Ok(MetaValidity::Valid(m)) = MetaPage::validate(&bytes[base..end], page_size) {
+            valid.push((m.txnid, m.map_size, m.last_pg));
+        }
+    }
+    valid.sort_by_key(|m| m.0);
+    valid.first().map(|&(_, ms, lp)| (ms, lp))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{open_or_create, MAX_MAP_SIZE};
+    use zerodb_core::error::{Error, MdbError};
+
+    /// A fresh path in the temp dir, removed on drop.
+    struct TempFile(std::path::PathBuf);
+
+    impl TempFile {
+        fn new(tag: &str) -> TempFile {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let name = format!("zerodb-io-{tag}-{}-{nanos}", std::process::id());
+            TempFile(std::env::temp_dir().join(name))
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    /// A persisted meta `map_size` above `MAX_MAP_SIZE` is corrupt: the open
+    /// fails with `Invalid` before mapping it, whatever size is requested
+    /// (ADR-0023 amendment 15, decision 6).
+    #[test]
+    fn persisted_map_size_above_the_cap_is_invalid() {
+        let path = TempFile::new("cap");
+        drop(super::create_env_file(&path.0, 4096, MAX_MAP_SIZE + 4096).expect("create"));
+        for requested in [None, Some(1 << 20)] {
+            match open_or_create(&path.0, 4096, requested, 1 << 20, false, false) {
+                Err(Error::Mdb(MdbError::Invalid)) => {}
+                Err(e) => panic!("requested {requested:?}: expected Invalid, got {e:?}"),
+                Ok(_) => panic!("requested {requested:?}: expected Invalid, got an env"),
+            }
+        }
+    }
+
+    /// `grow_regions` (ADR-0023 amendment 15): a size inside the current
+    /// mapping only changes the logical size; a larger one adds a mapping of
+    /// at least twice the current length, falls back to the exact size on
+    /// `ENOMEM`, and returns a second failure.
+    #[test]
+    fn grow_regions_is_geometric_with_an_enomem_fallback() {
+        use super::grow_regions;
+        use crate::mmap::{MapRegions, Mapping};
+        use std::cell::RefCell;
+
+        let heap = |len: usize| Ok(Mapping::Heap(vec![0u8; len].into_boxed_slice()));
+        let regions = MapRegions::new(Mapping::Heap(vec![0u8; 100].into_boxed_slice()), 80);
+        let lens = |r: &MapRegions| {
+            let (m, size) = r.view();
+            (m.bytes().len(), size)
+        };
+
+        // Inside the mapping: no new mapping, smaller or larger.
+        grow_regions(&regions, 40, |_| panic!("no mapping expected")).unwrap();
+        assert_eq!(lens(&regions), (100, 40));
+        grow_regions(&regions, 100, |_| panic!("no mapping expected")).unwrap();
+        assert_eq!(lens(&regions), (100, 100));
+
+        // Past it: 2x the current mapping.
+        let asked = RefCell::new(Vec::new());
+        grow_regions(&regions, 150, |len| {
+            asked.borrow_mut().push(len);
+            heap(len)
+        })
+        .unwrap();
+        assert_eq!(lens(&regions), (200, 150));
+        assert_eq!(asked.take(), vec![200]);
+
+        // ENOMEM on the doubled length: retry at exactly the size.
+        grow_regions(&regions, 300, |len| {
+            asked.borrow_mut().push(len);
+            if len == 400 {
+                Err(std::io::Error::from_raw_os_error(libc::ENOMEM))
+            } else {
+                heap(len)
+            }
+        })
+        .unwrap();
+        assert_eq!(lens(&regions), (300, 300));
+        assert_eq!(asked.take(), vec![400, 300]);
+
+        // A second failure is returned and nothing is published.
+        let err = grow_regions(&regions, 1000, |_| {
+            Err(std::io::Error::from_raw_os_error(libc::ENOMEM))
+        })
+        .unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOMEM));
+        assert_eq!(lens(&regions), (300, 300));
+    }
+
+    /// A requested `map_size` above the cap is refused before the data file
+    /// is created.
+    #[test]
+    fn requested_map_size_above_the_cap_creates_nothing() {
+        let path = TempFile::new("cap-req");
+        match open_or_create(&path.0, 4096, Some(MAX_MAP_SIZE + 1), 1 << 20, false, false) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
+            Err(e) => panic!("expected Io(InvalidInput), got {e:?}"),
+            Ok(_) => panic!("expected Io(InvalidInput), got an env"),
+        }
+        assert!(!path.0.exists());
+    }
 }

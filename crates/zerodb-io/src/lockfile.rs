@@ -5,7 +5,7 @@
 //!
 //! | offset | field |
 //! |---|---|
-//! | 0 | magic `u64` (`LOCK_MAGIC`, stored last by the initializer) |
+//! | 0 | magic `u64`: `LOCK_MAGIC_INIT` while the initializer builds the file, `LOCK_MAGIC` once it is published |
 //! | 8 | lock-format version `u32` |
 //! | 12 | data page size `u32` (0 until bound) |
 //! | 16 | `max_readers` `u32` |
@@ -15,6 +15,10 @@
 //!
 //! Offsets 136–255 are unused: they keep slot 0 off the writer word's 128-byte
 //! line pair (ADR-0023 amendment 11).
+//!
+//! Before it truncates anything, every opener checks that the lock file is
+//! not the data file, and the initializer refuses a non-empty file that does
+//! not look like a lock file (ADR-0023 amendment 16; see [`LockFile::open`]).
 //!
 //! Record locks (POSIX `fcntl`, per process; ADR-0023 amendment 2): byte 0 is
 //! the first-opener election, byte 1 the macOS writer lock, and byte
@@ -33,6 +37,12 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use zerodb_core::shared::{ReaderSlot, SharedRegion, READER_SLOT_FREE, READER_SLOT_SIZE};
 
 const LOCK_MAGIC: u64 = u64::from_le_bytes(*b"ZDBLOCK1");
+/// The initializing magic: written with `pwrite` right after the initializer
+/// truncates the file, and replaced by [`LOCK_MAGIC`] in
+/// [`LockFile::finish_open`]. A file carrying it was left by an initializer
+/// that died mid-way; the next initializer accepts it, and a joiner treats it
+/// as unfinished (ADR-0023 amendment 16).
+const LOCK_MAGIC_INIT: u64 = u64::from_le_bytes(*b"ZDBLOCK0");
 const LOCK_FORMAT: u32 = 2;
 const OFF_MAGIC: usize = 0;
 const OFF_FORMAT: usize = 8;
@@ -84,6 +94,12 @@ pub enum LockOpenError {
     AlreadyOpen,
     /// The lock file was initialized with incompatible parameters.
     Mismatch(String),
+    /// The lock file cannot be created or opened for writing because it lies
+    /// on a read-only filesystem (`EROFS`). A read-only environment then runs
+    /// without a lock file, as LMDB does (ADR-0023 amendment 17,
+    /// `OBS_RDONLY_LOCK_READONLY_FS`); any other caller treats it as the
+    /// `EROFS` I/O error it is.
+    ReadOnlyFs,
     /// An I/O error.
     Io(std::io::Error),
 }
@@ -101,6 +117,7 @@ impl std::fmt::Display for LockOpenError {
                 f.write_str("the lock file is already open in this process")
             }
             LockOpenError::Mismatch(m) => write!(f, "lock file mismatch: {m}"),
+            LockOpenError::ReadOnlyFs => f.write_str("the lock file is on a read-only filesystem"),
             LockOpenError::Io(e) => write!(f, "lock file I/O error: {e}"),
         }
     }
@@ -205,7 +222,10 @@ impl Drop for Registration {
 /// by its canonical directory joined with its file name (only the directory
 /// can be canonicalized). If another process creates the file between this
 /// `stat` and the open, this process still holds no other entry for that
-/// inode, because it had no descriptor to it.
+/// inode, because it had no descriptor to it; and once the open has a
+/// descriptor, [`Registration::rekey`] re-keys the claim by the file's
+/// identity, which also catches a name that was replaced by a link to a
+/// file this process already has open.
 fn registry_key(path: &Path) -> std::io::Result<RegistryKey> {
     use std::os::unix::fs::MetadataExt;
     match std::fs::metadata(path) {
@@ -231,11 +251,59 @@ fn registry_key(path: &Path) -> std::io::Result<RegistryKey> {
     Ok(RegistryKey::Missing(dir.canonicalize()?.join(name)))
 }
 
+/// How [`LockFile::open_with`] takes part in the first-opener election.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Election {
+    /// Become the initializer, or wait for the initializer and join.
+    Wait,
+    /// Become the initializer, or give up at once.
+    TryExclusive,
+}
+
+/// The `max_readers` recorded in the lock file at `path`, if it is a
+/// finished ZeroDB lock file (it carries the final magic); `Ok(None)` if the
+/// file does not exist or is not finished.
+///
+/// A process that joins a running environment adopts that value whatever it
+/// asks for ([`LockFile::open`]), as LMDB does. A tool that attaches to an
+/// environment it did not create reads it here first, so that, if every
+/// other process closes before the tool opens, the tool reinitializes the
+/// file with the same count. The value can change before the open if every
+/// process closes and another reinitializes the file.
+///
+/// The read uses its own short-lived descriptor, claimed in this process's
+/// registry like an open, so it never closes a descriptor of a lock file
+/// this process has open (which would drop that handle's record locks).
+///
+/// # Errors
+///
+/// [`LockOpenError::AlreadyOpen`] if this process has the lock file open,
+/// and I/O errors other than a missing file.
+pub fn published_max_readers(path: &Path) -> Result<Option<u32>, LockOpenError> {
+    let _registration = Registration::claim(path)?;
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if read_u64_at(&file, OFF_MAGIC)? != LOCK_MAGIC {
+        return Ok(None);
+    }
+    match read_u32_at(&file, OFF_MAX_READERS) {
+        Ok(n) => Ok(Some(n)),
+        // A new initializer truncated the file between the two reads (every
+        // process had closed the environment): the value is unknown again.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// The mapped lock file. Field order matters for `Drop`: the map is
 /// unmapped before the descriptor closes, closing the descriptor releases
-/// this process's record locks, and only then is the path released in the
-/// registry — so no second descriptor of this file can be opened by this
-/// process while the first is still open.
+/// this process's record locks, and only then is the file's entry removed
+/// from the registry (keyed by the file's identity, not its path) — so no
+/// second descriptor of this file can be opened by this process while the
+/// first is still open.
 ///
 /// Sharing one `LockFile` across threads is sound: all shared state is reached
 /// through atomics over the mapping or through `fcntl` on the descriptor.
@@ -254,25 +322,95 @@ impl LockFile {
     /// the file and holds the election byte exclusively until
     /// [`LockFile::finish_open`]; later openers wait for that, then validate.
     ///
+    /// `data_path` is the environment's data file. Two guards keep the
+    /// initializer from truncating a file that is not a lock file (ADR-0023
+    /// amendment 16):
+    ///
+    /// - **Same file.** Every opener compares the lock file's identity with
+    ///   the data file's (`st_dev`, `st_ino`), so a hard link, or a name that
+    ///   a case-insensitive filesystem resolves to the data file, is refused.
+    ///   A missing data file cannot be the lock file, and the check is
+    ///   skipped. If this open created the lock file and it is still empty,
+    ///   the refusal removes it; otherwise the name designates the data file
+    ///   and is left alone.
+    /// - **Foreign file.** The initializer accepts a file only if it is
+    ///   empty, carries a lock magic (final, or the initializing one left by
+    ///   an initializer that died), or has an all-zero header (the first 256
+    ///   bytes, or the whole file if shorter) *and* a length an initializer
+    ///   can leave: 8 (the initializing magic written to an empty file) or
+    ///   256 + 128·k for k ≥ 1 (a header plus k reader slots). A power loss
+    ///   can keep such a length and lose the block holding the magic. Any
+    ///   other file is refused without being modified, including a stale
+    ///   LMDB `lock.mdb`. A ZeroDB or LMDB data file always has a non-zero
+    ///   header, so this refuses every *initialized* data file; a foreign
+    ///   file with a zero header and one of those lengths is accepted and
+    ///   overwritten.
+    ///
     /// # Errors
     ///
     /// [`LockOpenError::AlreadyOpen`] if this process has it open (under any
-    /// name), [`LockOpenError::Mismatch`] on a format or `max_readers`
-    /// mismatch, an [`LockOpenError::Io`] of kind `TimedOut` when the election
-    /// retries run out before any process finishes initializing the file, and
-    /// other I/O errors.
-    pub fn open(path: &Path, max_readers: u32) -> Result<Arc<LockFile>, LockOpenError> {
+    /// name), [`LockOpenError::Mismatch`] on a format mismatch,
+    /// [`LockOpenError::ReadOnlyFs`] when the file cannot be created or
+    /// opened for writing on a read-only filesystem, an
+    /// [`LockOpenError::Io`] of kind `InvalidInput` when a guard above
+    /// refuses the file, of kind `TimedOut` when the election retries run out
+    /// before any process finishes initializing the file, and other I/O
+    /// errors.
+    pub fn open(
+        path: &Path,
+        data_path: &Path,
+        max_readers: u32,
+    ) -> Result<Arc<LockFile>, LockOpenError> {
+        match Self::open_with(path, data_path, max_readers, Election::Wait)? {
+            Some(lock) => Ok(lock),
+            // `Election::Wait` never gives up on the election.
+            None => unreachable!("a waiting open returned without a lock file"),
+        }
+    }
+
+    /// Open the lock file at `path` only if this process wins the
+    /// first-opener election at once; never wait for another opener
+    /// (ADR-0023 amendment 18). `Ok(None)` means another process holds the
+    /// election byte, that is, has the environment open or is opening it;
+    /// the descriptor is closed and nothing in the file is changed.
+    ///
+    /// On success this process is the initializer, exactly as after
+    /// [`LockFile::open`]: the file is validated by the same guards,
+    /// truncated and re-initialized, and the election byte stays
+    /// write-locked until [`LockFile::finish_open`] or the drop. A caller that
+    /// never calls `finish_open` holds every other opener in the election for
+    /// the handle's life; dropping it leaves the initializing magic, which the
+    /// next initializer accepts.
+    ///
+    /// # Errors
+    ///
+    /// As [`LockFile::open`], except that it never times out in the election.
+    pub fn try_open_exclusive(
+        path: &Path,
+        data_path: &Path,
+        max_readers: u32,
+    ) -> Result<Option<Arc<LockFile>>, LockOpenError> {
+        Self::open_with(path, data_path, max_readers, Election::TryExclusive)
+    }
+
+    fn open_with(
+        path: &Path,
+        data_path: &Path,
+        max_readers: u32,
+        election: Election,
+    ) -> Result<Option<Arc<LockFile>>, LockOpenError> {
         // Claimed before any descriptor exists: POSIX record locks belong to
         // the process, and closing a second descriptor would drop the first
         // handle's locks (ADR-0023 amendment 2). On every error below the
         // registration (or the `LockFile` owning it) drops and releases it.
         let mut registration = Registration::claim(path)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        let (file, created) = match open_or_create(path) {
+            Ok(opened) => opened,
+            Err(e) if e.raw_os_error() == Some(libc::EROFS) => {
+                return Err(LockOpenError::ReadOnlyFs)
+            }
+            Err(e) => return Err(e.into()),
+        };
         if let Err(e) = registration.rekey(&file) {
             // The descriptor reached a file this process already has open
             // (its name was replaced by a link to it between the `stat` and
@@ -281,6 +419,7 @@ impl LockFile {
             std::mem::forget(file);
             return Err(e);
         }
+        check_not_data_file(&file, created, path, data_path)?;
         /// How often a joiner that finds a half-built lock file retries the
         /// election before failing (ADR-0023 amendment 10).
         const ELECTION_RETRIES: u32 = 100;
@@ -288,6 +427,12 @@ impl LockFile {
         let initializer = loop {
             if record_lock(&file, libc::F_SETLK, WRLCK, ELECTION_BYTE)? {
                 break true;
+            }
+            if election == Election::TryExclusive {
+                // Another process holds the byte. This process holds no record
+                // lock on the file, so closing the descriptor (with the
+                // registration) drops nothing.
+                return Ok(None);
             }
             // Blocks until the initializer downgrades in `finish_open`, or
             // exits.
@@ -330,15 +475,42 @@ impl LockFile {
         };
         // A joiner reads `max_readers` with `pread` before mapping. It holds
         // the shared election lock, so the initializer has finished writing.
+        // It adopts that count whatever it asked for, as an LMDB joiner sizes
+        // its reader table from the lock file (`OBS_JOINER_FEWER_MAXREADERS`,
+        // `OBS_JOINER_MORE_MAXREADERS`; ADR-0023 §1 as amended). A count no
+        // initializer can write means the file is not a usable lock file.
+        if initializer {
+            check_lock_file_shape(&file, path)?;
+        }
         let slots = if initializer {
-            max_readers
+            // An initializer never shrinks the reader table of a finished
+            // lock file left by an earlier run: as LMDB, which sizes its
+            // table from the lock file's length and never shortens it, the
+            // count is the larger of the requested one and the recorded one
+            // (`OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS`; ADR-0023 §1 as
+            // amended). The slots themselves are wiped below as always.
+            previous_run_slots(&file)?.map_or(max_readers, |n| n.max(max_readers))
         } else {
-            read_u32_at(&file, OFF_MAX_READERS)?
+            let n = read_u32_at(&file, OFF_MAX_READERS)?;
+            if n == 0 || n > zerodb_core::env::MAX_READERS_LIMIT {
+                return Err(LockOpenError::Mismatch(format!(
+                    "the lock file records {n} reader slots"
+                )));
+            }
+            n
         };
         let len = OFF_SLOTS + SLOT_STRIDE * slots as usize;
         if initializer {
-            // Truncate to zero first so no field survives from a previous life.
+            // Truncate to zero first so no field survives from a previous
+            // life, then mark the file as being initialized before it grows:
+            // a process crash from here on leaves an empty file or one that
+            // carries a lock magic, both of which the foreign-file guard
+            // accepts. The final magic replaces this one in `finish_open`.
             file.set_len(0)?;
+            {
+                use std::os::unix::fs::FileExt;
+                file.write_all_at(&LOCK_MAGIC_INIT.to_le_bytes(), OFF_MAGIC as u64)?;
+            }
             file.set_len(len as u64)?;
         } else if file.metadata()?.len() < len as u64 {
             return Err(LockOpenError::Mismatch(
@@ -378,11 +550,6 @@ impl LockFile {
                     "not a ZeroDB lock file of this version".into(),
                 ));
             }
-            if slots != max_readers {
-                return Err(LockOpenError::Mismatch(format!(
-                    "max_readers {max_readers} differs from the running environment's {slots}"
-                )));
-            }
         }
         // This process's liveness lock (ADR-0023 §3), held for the handle's life.
         if !record_lock(
@@ -395,7 +562,7 @@ impl LockFile {
                 "liveness lock already held",
             )));
         }
-        Ok(Arc::new(lock))
+        Ok(Some(Arc::new(lock)))
     }
 
     /// Record the data page size (initializer) or check it (joiner).
@@ -463,6 +630,9 @@ impl LockFile {
 impl SharedRegion for LockFile {
     fn published_txnid(&self) -> &AtomicU64 {
         self.u64_at(OFF_T)
+    }
+    fn finish_open(&self) -> std::io::Result<()> {
+        LockFile::finish_open(self)
     }
     fn slots(&self) -> &[ReaderSlot] {
         debug_assert!(OFF_SLOTS + SLOT_STRIDE * self.slots as usize <= self.map.len());
@@ -676,6 +846,129 @@ fn read_u64_at(file: &File, off: usize) -> std::io::Result<u64> {
     }
 }
 
+/// The reader-slot count a finished lock file records, if `file` is one (it
+/// carries the final magic) and is long enough to hold that many slots.
+/// `None` for an empty, unfinished or inconsistent file, or a count outside
+/// `1..=MAX_READERS_LIMIT`.
+fn previous_run_slots(file: &File) -> std::io::Result<Option<u32>> {
+    let len = file.metadata()?.len();
+    if len < OFF_SLOTS as u64 || read_u64_at(file, OFF_MAGIC)? != LOCK_MAGIC {
+        return Ok(None);
+    }
+    let n = read_u32_at(file, OFF_MAX_READERS)?;
+    let needed = OFF_SLOTS as u64 + SLOT_STRIDE as u64 * u64::from(n);
+    if n == 0 || n > zerodb_core::env::MAX_READERS_LIMIT || len < needed {
+        return Ok(None);
+    }
+    Ok(Some(n))
+}
+
+/// Open the lock file at `path`, creating it if missing, and report whether
+/// this call created it. `create_new` is tried first so the answer is exact;
+/// if the file exists, it is opened as is. A file removed between the two
+/// attempts is retried a bounded number of times.
+fn open_or_create(path: &Path) -> std::io::Result<(File, bool)> {
+    const ATTEMPTS: u32 = 8;
+    let mut attempt = 0;
+    loop {
+        match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(f) => return Ok((f, true)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(f) => return Ok((f, false)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt + 1 < ATTEMPTS => {
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// The same-file guard (ADR-0023 amendment 16): fail with `InvalidInput` if
+/// `file`, the lock file just opened at `path`, is the data file at
+/// `data_path`. A missing data file cannot be the lock file. On refusal, the
+/// lock file is removed only if this open `created` it and it is still empty;
+/// otherwise the name designates the data file, which must not be removed.
+fn check_not_data_file(
+    file: &File,
+    created: bool,
+    path: &Path,
+    data_path: &Path,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let data = match std::fs::metadata(data_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let lock = file.metadata()?;
+    if (lock.dev(), lock.ino()) != (data.dev(), data.ino()) {
+        return Ok(());
+    }
+    if created && lock.len() == 0 {
+        // Best effort: the refusal below is the result either way.
+        let _ = std::fs::remove_file(path);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "the lock file {} is the data file {}",
+            path.display(),
+            data_path.display()
+        ),
+    ))
+}
+
+/// Whether `len` is a length an initializer can leave behind: the
+/// initializing magic alone in a truncated file, or the header plus at least
+/// one reader slot.
+fn is_initializer_length(len: u64) -> bool {
+    let magic_only = (OFF_MAGIC + 8) as u64;
+    let header = OFF_SLOTS as u64;
+    let slot = SLOT_STRIDE as u64;
+    len == magic_only || (len >= header + slot && (len - header).is_multiple_of(slot))
+}
+
+/// The foreign-file guard (ADR-0023 amendment 16), run by the initializer
+/// before it truncates the lock file at `path`: accept an empty file, a file
+/// carrying [`LOCK_MAGIC`] or [`LOCK_MAGIC_INIT`], or one whose header (the
+/// first `OFF_SLOTS` bytes, or the whole file if shorter) is all zero and
+/// whose length an initializer can leave ([`is_initializer_length`]); refuse
+/// anything else with `InvalidInput`, leaving it untouched.
+fn check_lock_file_shape(file: &File, path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut header = vec![0u8; OFF_SLOTS.min(usize::try_from(len).unwrap_or(OFF_SLOTS))];
+    file.read_exact_at(&mut header, 0)?;
+    let magic = header
+        .get(OFF_MAGIC..OFF_MAGIC + 8)
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_le_bytes);
+    if matches!(magic, Some(LOCK_MAGIC | LOCK_MAGIC_INIT))
+        || (is_initializer_length(len) && header.iter().all(|&b| b == 0))
+    {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "the lock file {} holds data that is not a ZeroDB lock file; \
+             refusing to overwrite it (remove it if it is not needed)",
+            path.display()
+        ),
+    ))
+}
+
 fn read_u32_at(file: &File, off: usize) -> std::io::Result<u32> {
     use std::os::unix::fs::FileExt;
     let mut b = [0u8; 4];
@@ -731,9 +1024,37 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
-    /// A fresh directory per call. The counter keeps parallel tests apart
-    /// when the clock (microsecond resolution on macOS) repeats.
-    fn tmp() -> std::path::PathBuf {
+    /// The path of a lock file in a fresh directory, which is removed with
+    /// everything in it when this is dropped.
+    struct TmpLock {
+        path: std::path::PathBuf,
+    }
+
+    impl std::ops::Deref for TmpLock {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl AsRef<std::path::Path> for TmpLock {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TmpLock {
+        fn drop(&mut self) {
+            if let Some(dir) = self.path.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    /// A lock-file path in a fresh directory per call. The counter keeps
+    /// parallel tests apart when the clock (microsecond resolution on macOS)
+    /// repeats.
+    fn tmp() -> TmpLock {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         // Relaxed: only uniqueness of the value matters.
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -747,13 +1068,15 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&p).unwrap();
-        p.join("zerodb.lock")
+        TmpLock {
+            path: p.join("zerodb.lock"),
+        }
     }
 
     #[test]
     fn first_opener_initializes_every_slot_free() {
         let path = tmp();
-        let l = LockFile::open(&path, 8).expect("open");
+        let l = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 8).expect("open");
         assert!(l.is_initializer());
         assert_eq!(l.slots().len(), 8);
         for i in 0..8 {
@@ -769,12 +1092,83 @@ mod tests {
         l.finish_open().unwrap();
     }
 
+    /// A try-exclusive open with no other opener initializes the file and
+    /// leaves the initializing magic; the next opener accepts it.
+    #[test]
+    fn try_open_exclusive_initializes_without_publishing() {
+        let path = tmp();
+        let data = path.with_file_name("zerodb.dat");
+        let l = LockFile::try_open_exclusive(&path, &data, 8)
+            .expect("open")
+            .expect("no other opener");
+        assert!(l.is_initializer());
+        assert_eq!(l.slots().len(), 8);
+        assert_eq!(read_u64_at(&l.file, OFF_MAGIC).unwrap(), LOCK_MAGIC_INIT);
+        assert!(matches!(
+            LockFile::try_open_exclusive(&path, &data, 8),
+            Err(LockOpenError::AlreadyOpen)
+        ));
+        drop(l);
+        let l = LockFile::open(&path, &data, 8).expect("reopen");
+        assert!(l.is_initializer());
+    }
+
+    /// An initializer never shrinks the reader table of a finished lock file
+    /// from an earlier run, as LMDB
+    /// (`OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS`), grows it when asked
+    /// for more, and ignores the count of an unfinished file.
+    #[test]
+    fn initializer_keeps_a_larger_finished_table() {
+        let path = tmp();
+        let data = path.with_file_name("zerodb.dat");
+        let open_finished = |n: u32| {
+            let l = LockFile::open(&path, &data, n).unwrap();
+            assert!(l.is_initializer());
+            l.finish_open().unwrap();
+            l.slots().len()
+        };
+        assert_eq!(open_finished(12), 12);
+        assert_eq!(open_finished(4), 12, "kept the larger table");
+        assert_eq!(open_finished(20), 20, "grew");
+        assert_eq!(open_finished(4), 20);
+        // An unfinished file (initializing magic only) records no count, so
+        // the next initializer sizes the table as asked.
+        drop(
+            LockFile::try_open_exclusive(&path, &data, 30)
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(open_finished(4), 4, "an unfinished file's count is ignored");
+    }
+
+    /// The recorded `max_readers` is read only from a finished lock file, and
+    /// never through a second descriptor of one this process has open.
+    #[test]
+    fn published_max_readers_reads_a_finished_file() {
+        let path = tmp();
+        let data = path.with_file_name("zerodb.dat");
+        assert_eq!(published_max_readers(&path).unwrap(), None, "missing");
+        let l = LockFile::try_open_exclusive(&path, &data, 8)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            published_max_readers(&path),
+            Err(LockOpenError::AlreadyOpen)
+        ));
+        drop(l);
+        assert_eq!(published_max_readers(&path).unwrap(), None, "unfinished");
+        let l = LockFile::open(&path, &data, 12).unwrap();
+        l.finish_open().unwrap();
+        drop(l);
+        assert_eq!(published_max_readers(&path).unwrap(), Some(12));
+    }
+
     #[test]
     fn second_open_in_process_is_refused_before_any_fd() {
         let path = tmp();
-        let a = LockFile::open(&path, 4).expect("open");
+        let a = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4).expect("open");
         assert!(matches!(
-            LockFile::open(&path, 4),
+            LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4),
             Err(LockOpenError::AlreadyOpen)
         ));
         // `a` still holds its locks and works.
@@ -782,7 +1176,7 @@ mod tests {
         a.unlock_writer();
         drop(a);
         // After the first handle is gone, the path can be opened again.
-        LockFile::open(&path, 4).expect("reopen");
+        LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4).expect("reopen");
     }
 
     /// On macOS this cannot tell a released POSIX lock from a held one (a
@@ -792,7 +1186,7 @@ mod tests {
     #[test]
     fn writer_lock_releases_from_another_thread() {
         let path = tmp();
-        let l = LockFile::open(&path, 4).expect("open");
+        let l = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4).expect("open");
         assert!(
             !l.lock_writer().unwrap(),
             "an uncontended lock is no takeover"
@@ -808,11 +1202,11 @@ mod tests {
     #[test]
     fn another_spelling_of_an_open_path_is_refused() {
         let path = tmp();
-        let _a = LockFile::open(&path, 4).expect("open");
+        let _a = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4).expect("open");
         let dir = path.parent().unwrap();
         let other = dir.join(".").join("zerodb.lock");
         assert!(matches!(
-            LockFile::open(&other, 4),
+            LockFile::open(&other, &other.with_file_name("zerodb.dat"), 4),
             Err(LockOpenError::AlreadyOpen)
         ));
     }
@@ -822,11 +1216,11 @@ mod tests {
     #[test]
     fn a_hard_link_to_an_open_lock_file_is_refused() {
         let path = tmp();
-        let _a = LockFile::open(&path, 4).expect("open");
+        let _a = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4).expect("open");
         let link = path.parent().unwrap().join("hard-link.lock");
         std::fs::hard_link(&path, &link).unwrap();
         assert!(matches!(
-            LockFile::open(&link, 4),
+            LockFile::open(&link, &link.with_file_name("zerodb.dat"), 4),
             Err(LockOpenError::AlreadyOpen)
         ));
     }
@@ -835,11 +1229,11 @@ mod tests {
     #[test]
     fn a_symlink_to_an_open_lock_file_is_refused() {
         let path = tmp();
-        let _a = LockFile::open(&path, 4).expect("open");
+        let _a = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4).expect("open");
         let link = path.parent().unwrap().join("sym-link.lock");
         std::os::unix::fs::symlink(&path, &link).unwrap();
         assert!(matches!(
-            LockFile::open(&link, 4),
+            LockFile::open(&link, &link.with_file_name("zerodb.dat"), 4),
             Err(LockOpenError::AlreadyOpen)
         ));
     }
@@ -851,7 +1245,7 @@ mod tests {
     #[test]
     fn stale_writer_word_with_own_pid_is_taken_over() {
         let path = tmp();
-        let l = LockFile::open(&path, 4).expect("open");
+        let l = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4).expect("open");
         for stale in [l.pid(), l.pid() | WAITERS] {
             l.writer_word().store(stale, Ordering::SeqCst);
             let start = std::time::Instant::now();
@@ -869,8 +1263,176 @@ mod tests {
     #[test]
     fn page_size_rebind_with_another_value_fails() {
         let path = tmp();
-        let l = LockFile::open(&path, 4).expect("open");
+        let l = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4).expect("open");
         l.bind_page_size(4096).unwrap();
         assert!(l.bind_page_size(8192).is_err());
+    }
+
+    // --- File guards (ADR-0023 amendment 16) ---
+
+    /// The data-file path next to the lock file `path`.
+    fn data_of(path: &Path) -> PathBuf {
+        path.with_file_name("zerodb.dat")
+    }
+
+    fn assert_invalid_input(r: Result<Arc<LockFile>, LockOpenError>) {
+        match r {
+            Err(LockOpenError::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}")
+            }
+            Err(other) => panic!("expected Io(InvalidInput), got {other:?}"),
+            Ok(_) => panic!("expected Io(InvalidInput), got a lock file"),
+        }
+    }
+
+    /// Asserts `l` is a freshly initialized table of `n` slots and finishes it.
+    fn assert_fresh(l: &LockFile, n: usize) {
+        assert!(l.is_initializer());
+        assert_eq!(l.slots().len(), n);
+        for s in l.slots() {
+            assert_eq!(s.txnid().load(Ordering::SeqCst), READER_SLOT_FREE);
+            assert_eq!(s.owner().load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(l.published_txnid().load(Ordering::SeqCst), 0);
+        assert_eq!(l.u32_at(OFF_PAGE_SIZE).load(Ordering::SeqCst), 0);
+        l.finish_open().unwrap();
+        assert_eq!(l.u64_at(OFF_MAGIC).load(Ordering::SeqCst), LOCK_MAGIC);
+    }
+
+    /// An initializer killed after writing the initializing magic leaves it in
+    /// the file; the next opener accepts the file and initializes it.
+    #[test]
+    fn crashed_initializer_with_provisional_magic_is_reinitialized() {
+        let path = tmp();
+        let mut bytes = vec![0xA5u8; OFF_SLOTS + 4 * SLOT_STRIDE];
+        bytes[..8].copy_from_slice(&LOCK_MAGIC_INIT.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let l = LockFile::open(&path, &data_of(&path), 4).expect("open");
+        assert_fresh(&l, 4);
+    }
+
+    /// A lock file whose whole header reads as zero (power loss kept the
+    /// length and lost the magic block) is accepted as never initialized
+    /// when its length is one an initializer leaves: 8, or the header plus
+    /// k ≥ 1 slots, for any k (here not this `max_readers`). The slot area
+    /// holds garbage.
+    #[test]
+    fn all_zero_lock_header_is_reinitialized() {
+        for len in [
+            8usize,
+            OFF_SLOTS + SLOT_STRIDE,
+            OFF_SLOTS + 3 * SLOT_STRIDE,
+            OFF_SLOTS + 64 * SLOT_STRIDE,
+        ] {
+            let path = tmp();
+            let mut bytes = vec![0u8; len];
+            for b in bytes.iter_mut().skip(OFF_SLOTS) {
+                *b = 0xA5;
+            }
+            std::fs::write(&path, &bytes).unwrap();
+            let l = LockFile::open(&path, &data_of(&path), 4)
+                .unwrap_or_else(|e| panic!("length {len}: {e}"));
+            assert_fresh(&l, 4);
+        }
+    }
+
+    /// An all-zero file whose length no initializer leaves is refused
+    /// untouched: each length sits just off an accepted one.
+    #[test]
+    fn all_zero_file_of_another_length_is_refused() {
+        for len in [
+            1usize,
+            7,
+            9,
+            OFF_SLOTS,
+            OFF_SLOTS + SLOT_STRIDE - 1,
+            OFF_SLOTS + SLOT_STRIDE + 1,
+            OFF_SLOTS + 3 * SLOT_STRIDE + 17,
+        ] {
+            let path = tmp();
+            let bytes = vec![0u8; len];
+            std::fs::write(&path, &bytes).unwrap();
+            assert_invalid_input(LockFile::open(&path, &data_of(&path), 4));
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "length {len}");
+        }
+    }
+
+    /// A non-empty file with neither lock magic and a non-zero header is
+    /// refused, and its bytes are left as they were. The inputs include an
+    /// LMDB data file's shape (`0xBEEFC0DE` at byte 16) and a stale LMDB lock
+    /// file (`0xBEEFC0DE` at byte 0), both with an otherwise zero, otherwise
+    /// accepted length.
+    #[test]
+    fn foreign_file_is_refused_without_truncating() {
+        let mut zero_but_one = vec![0u8; 4096];
+        zero_but_one[OFF_SLOTS - 1] = 1;
+        let mut zdb1 = vec![0u8; 8192];
+        zdb1[32..36].copy_from_slice(b"ZDB1");
+        let mut lmdb_data = vec![0u8; 8192];
+        lmdb_data[16..20].copy_from_slice(&0xBEEF_C0DEu32.to_le_bytes());
+        let mut lmdb_lock = vec![0u8; 8192];
+        lmdb_lock[0..4].copy_from_slice(&0xBEEF_C0DEu32.to_le_bytes());
+        for bytes in [
+            b"not a lock file".to_vec(),
+            zero_but_one,
+            zdb1,
+            lmdb_data,
+            lmdb_lock,
+        ] {
+            let path = tmp();
+            std::fs::write(&path, &bytes).unwrap();
+            match LockFile::open(&path, &data_of(&path), 4) {
+                Err(LockOpenError::Io(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+                    assert!(
+                        e.to_string().contains(&path.display().to_string()),
+                        "the message names the lock file: {e}"
+                    );
+                }
+                Err(other) => panic!("expected Io(InvalidInput), got {other:?}"),
+                Ok(_) => panic!("expected Io(InvalidInput), got a lock file"),
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            // The refusal released the registry entry.
+            std::fs::remove_file(&path).unwrap();
+            LockFile::open(&path, &data_of(&path), 4).expect("open after removal");
+        }
+    }
+
+    /// A lock path that is a hard link to the data file is refused before
+    /// anything is truncated, and the link is not removed.
+    #[test]
+    fn lock_file_that_is_the_data_file_is_refused() {
+        let path = tmp();
+        let data = data_of(&path);
+        let bytes = vec![0u8; 8192];
+        std::fs::write(&data, &bytes).unwrap();
+        std::fs::hard_link(&data, &path).unwrap();
+        assert_invalid_input(LockFile::open(&path, &data, 4));
+        assert_eq!(std::fs::read(&data).unwrap(), bytes);
+        assert!(path.exists(), "the name designates the data file");
+    }
+
+    /// When the lock open itself created the file and it turns out to be the
+    /// data file (here the data path is a symbolic link to the lock path, the
+    /// portable stand-in for a case-insensitive name), the refusal removes the
+    /// empty file it created.
+    #[test]
+    fn a_created_lock_file_that_is_the_data_file_is_removed() {
+        let path = tmp();
+        let data = data_of(&path);
+        std::os::unix::fs::symlink(&path, &data).unwrap();
+        assert_invalid_input(LockFile::open(&path, &data, 4));
+        assert!(!path.exists(), "the created lock file was left behind");
+    }
+
+    /// A missing data file cannot be the lock file: the check is skipped and
+    /// the open initializes as usual.
+    #[test]
+    fn missing_data_file_skips_the_same_file_check() {
+        let path = tmp();
+        assert!(!data_of(&path).exists());
+        let l = LockFile::open(&path, &data_of(&path), 4).expect("open");
+        assert_fresh(&l, 4);
     }
 }

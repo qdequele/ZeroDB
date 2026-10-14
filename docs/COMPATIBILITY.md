@@ -4,7 +4,7 @@ The release contract. Every public item of heed 0.22.1 and every LMDB feature a
 heed user can reach, with its status on the `heed-zerodb` adapter (what a
 consumer sees as `heed::` through `crates/heed-shim`). Derived by reading both
 sides' signatures, re-verified 2026-09-09; ZeroDB extensions and file facts
-updated 2026-10-05. Keep this file in the same change as
+updated 2026-10-05; multi-process access (ADR-0023) 2026-10-13. Keep this file in the same change as
 any adapter surface change (`docs/RELEASING.md`).
 
 Statuses: **Same** identical signature and semantics · **Emulated** heed's
@@ -19,12 +19,14 @@ Behavior differences from LMDB, approved or proposed, are recorded in
 | Fact | Where it is decided |
 |---|---|
 | The data file is **not an LMDB file**. Magic `ZDB1`, own page format, `format_version` 2 in each meta page (since 2026-10-05: the meta page carries the commit's freed-page list). Files with `format_version` 1, written by earlier trees, are refused at open; dump them with a format-1 `zerodb-tools` and `load` here. LMDB tools fail loudly on it (`MDB_INVALID`); use `zerodb-tools`. | DIVERGENCES.md (file format; free-list placement), ADR-0002, ADR-0022, SPEC 02 |
-| Through the adapter an env directory contains exactly one file, **`data.mdb`** (Meilisearch hardcodes that name for compaction and snapshots); the native API defaults to `zerodb.dat`. **No `lock.mdb` is ever created.** | ADR-0010; DIVERGENCES.md (env data-file name; process model) |
+| Through the adapter an env directory contains **`data.mdb`** (Meilisearch hardcodes that name for compaction and snapshots) and, as with LMDB, **`lock.mdb`**: the lock file is on by default, so several processes can open the env at once (ADR-0023). heed's `NO_LOCK` creates no lock file and leaves the env single-process; a read-only env on read-only media also runs without one (ADR-0023 amendment 17). The native API defaults to `zerodb.dat` and `zerodb.lock`. `lock.mdb` is ZeroDB's own format, not LMDB's: never share an env directory between LMDB and ZeroDB processes. | ADR-0010; ADR-0023; DIVERGENCES.md (env data-file name) |
+| The lock file's name is derived from the data-file name: `zerodb.dat` → `zerodb.lock`, `data.mdb` → `lock.mdb` (as LMDB), any other name `<name>-lock` (LMDB's `MDB_NOSUBDIR` convention); an explicit `lock_file_name` overrides it. The open refuses (`Io(InvalidInput)`, nothing modified) a lock file that is the data file under another name (hard link, case variant on a case-insensitive filesystem) and a non-empty lock file that is not a ZeroDB lock file (or the all-zero remains of one), such as another env's data file or a stale LMDB `lock.mdb`. | SPEC 02 §8, ADR-0023 amendment 16 |
 | Migration from LMDB is logical: `zerodb-tools migrate-from-lmdb <src> <dst>` (build with `--features migrate-lmdb`) or `mdb_dump` → `zerodb-tools load`. Dumps are `mdb_dump`-shaped and round-trip. | docs/TOOLS.md |
 | Page size is chosen at creation: power of two in 4 K–64 K, independent of the OS page size. Adapter default = OS page size (LMDB parity); native default 4 K. Reopen adopts the persisted value. | SPEC 02 §0 |
 | **Max key 511 bytes**, empty key rejected (`BadValSize`), as LMDB. Max DB name 511 bytes, C-string (embedded NUL panics like heed). Max value 4 GiB − 1. | SPEC 01 §S4, SPEC 02, DIVERGENCES.md (named-DB catalog record) |
 | A custom key comparator is **not persisted** (LMDB parity): reopening with a different comparator corrupts silently; an in-process mismatch is refused. | DIVERGENCES.md (comparator persistence), SPEC 03 §2.0 |
-| `map_size` is fixed for the life of an open env; grow it by reopening. There is no `Env::resize`. | SPEC 02 §8, row below |
+| `map_size` can change on an open env with `Env::resize` (heed's `unsafe fn resize`), as `mdb_env_set_mapsize` does: `0` adopts the size recorded by another process, a size below the data rounds up to it, and a live write txn gets `EINVAL`. A txn begin that finds another process committed past this process's map fails with `MdbError::MapResized`; answer with `resize(0)` and begin again, as with LMDB. Unlike LMDB, live read txns and their borrowed values stay valid across it, and in a lock-file env it waits for the cross-process writer lock (a proposed divergence). | SPEC 02 §8, ADR-0023 amendment 15, row below |
+| Multi-process limits: do not use an `Env` in a child after `fork()`; processes in different PID namespaces must not share an env; `Env::sync` serializes only with this process's commits. | SPEC 04 §12.1 |
 | Files are created mode `0600`; the env directory must exist. | SECURITY.md |
 
 ## Crate root
@@ -48,7 +50,7 @@ Behavior differences from LMDB, approved or proposed, are recorded in
 |---|---|---|
 | `new`, `Default`, `Clone`, `Debug`, `PartialEq`, `Eq` | Same | |
 | `read_txn_with_tls` | No-op | Retag only; `WithTls` read txns are not thread-pinned |
-| `read_txn_without_tls`, `map_size`, `max_readers`, `max_dbs`, `unsafe flags`, `unsafe open` | Same | `open` re-imposes the fork's checks, which the native engine relaxes: `map_size` must be an OS-page multiple, `max_readers(0)` is `Io(InvalidInput)` |
+| `read_txn_without_tls`, `map_size`, `max_readers`, `max_dbs`, `unsafe flags`, `unsafe open` | Same | `open` re-imposes the fork's checks, which the native engine relaxes: `map_size` must be an OS-page multiple, `max_readers(0)` is `Io(InvalidInput)`. A process joining a running env adopts the lock file's reader count whatever `max_readers` asks for, and a first opener never shrinks the count an earlier run's lock file records, as LMDB (ADR-0023 §1 as amended) |
 | `page_size(u32)` | Extension | |
 | `file_trust(FileTrust)` | Extension | Opt-in: `unsafe` `FileTrust::trust_contents()` skips read-path page validation, as LMDB never validates; default validating (ADR-0014; an approved divergence) |
 | `sequential_writes(bool)` | Extension | Opt-in rightmost-leaf fast path for ascending/APPEND loads, default off; identical results and files (ADR-0015; an approved divergence) |
@@ -59,10 +61,13 @@ Behavior differences from LMDB, approved or proposed, are recorded in
 
 | Flag | Status |
 |---|---|
-| `WRITE_MAP`, `NO_SYNC`, `NO_META_SYNC`, `MAP_ASYNC`, `READ_ONLY`, `PREV_SNAPSHOT`, `NO_TLS` | Same — under `WRITE_MAP` dirty pages are written in place in the map, as LMDB does (ADR-0021) |
+| `WRITE_MAP`, `NO_SYNC`, `NO_META_SYNC`, `MAP_ASYNC`, `READ_ONLY`, `NO_TLS` | Same — under `WRITE_MAP` dirty pages are written in place in the map, as LMDB does (ADR-0021) |
+| `PREV_SNAPSHOT` | Same, with two proposed divergences (D-025). With the lock file, as in LMDB: other processes' opens wait until the opener's first commit; that commit is durable but not published, so read txns keep the older snapshot, and the second commit in the same session rebuilds from the older snapshot and drops the first commit's changes; a fresh open after close serves the first commit (ADR-0023 amendment 19). A writable open fails with `EAGAIN` while another process has the env open. D-025: an opener that ends before its first commit, and a `READ_ONLY` `PREV_SNAPSHOT` open joining a running env, which ZeroDB refuses with `EAGAIN`. With `NO_LOCK` the first commit is published at once |
 | `NO_SUB_DIR` | Unsupported — **refused at `open`** with `Io(Unsupported)` (an approved divergence) |
 | `NO_READ_AHEAD` | Honored as in LMDB: the map is advised `madvise(MADV_RANDOM)` (no readahead around page faults) |
-| `FIXED_MAP`, `NO_LOCK`, `NO_MEM_INIT` | No-op — accepted, no observable effect (no lock file, no fixed mapping) |
+| `NO_LOCK` | Same — no lock file is created or used, and the env runs single-process; the caller must keep other processes out, as with LMDB (ADR-0023 amendment 17) |
+| `READ_ONLY` and the lock file | Same — joins an existing lock file; on read-only media, where none can be created, opens without one and serves read txns; any other lock-file error (such as `EACCES`) fails the open (ADR-0023 amendment 17) |
+| `FIXED_MAP`, `NO_MEM_INIT` | No-op — accepted, no observable effect (no fixed mapping) |
 | bitflags API: `empty`, `all`, `bits`, `from_bits`, `from_bits_truncate`, `contains`, `intersects`, `insert`, `remove`, `union`, bit operators | Same |
 | bitflags API: `from_bits_retain`, `from_name`, `iter`, `iter_names`, `set`, `toggle`, `difference`, `symmetric_difference`, `complement`, `Extend`/`FromIterator`, hex/binary formatting, `serde` | Unsupported |
 | `Debug` output | Emulated — prints the numeric value, not the flag names |
@@ -71,12 +76,12 @@ Behavior differences from LMDB, approved or proposed, are recorded in
 
 | Method | Status | Notes |
 |---|---|---|
-| `real_disk_size`, `try_clone_inner_file`, `info`, `stat`, `non_free_pages_size`, `database_options`, `open_database`, `create_database`, `write_txn`, `read_txn`, `static_read_txn`, `copy_to_file`, `copy_to_path`, `force_sync`, `path`, `max_readers`, `max_key_size`, `prepare_for_closing`, `Clone`, `Debug` | Same | `info().map_addr` is always null; page counts are ZeroDB's |
+| `real_disk_size`, `try_clone_inner_file`, `info`, `stat`, `non_free_pages_size`, `database_options`, `open_database`, `create_database`, `write_txn`, `read_txn`, `static_read_txn`, `copy_to_file`, `copy_to_path`, `force_sync`, `path`, `max_readers`, `max_key_size`, `prepare_for_closing`, `Clone`, `Debug` | Same | `info().map_addr` is always null; page counts are ZeroDB's. `info().number_of_readers` is LMDB's high-water mark and, with a lock file, counts other processes' readers too, as LMDB |
 | `nested_read_txn(&RwTxn)` | Same | Available on every `T` (heed: `WithoutTls` only). The writer must not mutate while children live: enforced by the borrow (an approved divergence; the fork leaves it to convention) |
-| `flags()` / `get_flags()` | Emulated | Reconstructed from the durability mode: only `WRITE_MAP`, `READ_ONLY`, `NO_SYNC`, `NO_META_SYNC` and `MAP_ASYNC` are ever reported |
-| `clear_stale_readers()` | No-op | Returns `Ok(0)`, which is correct: ZeroDB is single-process, so no cross-process readers can exist |
+| `flags()` / `get_flags()` | Emulated | Reconstructed from the durability mode and the open: only `WRITE_MAP`, `READ_ONLY`, `NO_SYNC`, `NO_META_SYNC`, `MAP_ASYNC` and `NO_LOCK` are ever reported. `NO_LOCK` is reported only for an env opened with it, not for a read-only env on read-only media, as LMDB (`OBS_RDONLY_READONLY_FS_REPORTS_NOLOCK`) |
+| `clear_stale_readers()` | Same | Frees the reader slots of processes that died holding them and returns how many slots it freed, as `mdb_reader_check` counts. Returns `Ok(0)` with `NO_LOCK`, where every slot belongs to this process |
 | `set_flags(EnvFlags, FlagSetMode)` | Unsupported | Runtime durability toggling is deferred (SPEC 00) |
-| `resize(usize)` | Unsupported | Not present; reopen with a larger `map_size` after `MapFull` |
+| `resize(usize)` | Same | `unsafe` as in heed; a size that is not a multiple of the OS page size is `Io(InvalidInput)` with heed's message, a live write txn is `Io` (`EINVAL`). The caller's promise heed asks for (no live txns) is not needed: read txns and borrowed values survive a resize. Answers `MdbError::MapResized` with `resize(0)`. With a lock file it waits for the cross-process writer lock, also on a `READ_ONLY` env, while another process holds a write txn (a proposed divergence, D-023: heed over LMDB returns at once there, since `mdb_env_set_mapsize` takes no lock, `OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER`) |
 | `copy_to_fd` | Unsupported | Takes an LMDB FFI handle type |
 | `nested_write_txn` | Unsupported | Nested **write** transactions do not exist (an approved divergence) |
 | `sync(force)`, `live_readers()`, `reader_list()`, `copy_to_path_with_progress` | Extension | |
@@ -141,15 +146,17 @@ always initialised; seek error text differs).
 |---|---|---|
 | Nested **read** transactions inside a write transaction (fork feature) | Supported | SPEC 04 §5, ADR-0007, DIVERGENCES.md (writer quiescence) |
 | Nested **write** transactions | Unsupported, unrepresentable | DIVERGENCES.md (nested write txns) |
-| Multi-process access, lock file, `mdb_reader_check` | Unsupported (single process) | DIVERGENCES.md (process model) |
+| Multi-process access, lock file, `mdb_reader_check` | Supported, on by default; the lock file is ZeroDB's own format | ADR-0023, SPEC 04 §12 |
 | `MDB_WRITEMAP`, `NOSYNC`, `NOMETASYNC`, `MAPASYNC`, `RDONLY`, `PREVSNAPSHOT`, `NOTLS` | Supported (`WRITE_MAP` in place, as LMDB) | SPEC 01, ADR-0021 |
 | `MDB_NOSUBDIR` | Unsupported, refused at open | DIVERGENCES.md (`MDB_NOSUBDIR`) |
 | `MDB_NORDAHEAD` | Honored (`MADV_RANDOM`) | SPEC 01 Table 1 |
-| `MDB_FIXEDMAP`, `NOLOCK`, `NOMEMINIT` | Accepted no-ops | this file |
+| `MDB_NOLOCK` | Supported (no lock file, single process) | ADR-0023 amendment 17 |
+| `MDB_FIXEDMAP`, `NOMEMINIT` | Accepted no-ops | this file |
 | `DUPSORT`, `DUPFIXED`, `INTEGERKEY`, `INTEGERDUP`, `REVERSEKEY`, `REVERSEDUP`, dup cursor ops, `MDB_MULTIPLE` | Unsupported | DIVERGENCES.md (DUPSORT), ADR-0011 (parked) |
 | `mdb_set_compare` | Emulated (safe trait, named DBs, not persisted) | SPEC 03 §2.0, DIVERGENCES.md (comparator persistence) |
 | `mdb_set_dupsort` | No-op | this file |
-| `mdb_env_set_flags` at runtime, `mdb_env_set_mapsize` at runtime (`resize`) | Unsupported | this file |
+| `mdb_env_set_flags` at runtime | Unsupported | this file |
+| `mdb_env_set_mapsize` at runtime (`resize`) | Supported | SPEC 02 §8, ADR-0023 amendment 15 |
 | `MDB_APPEND`, `MDB_NOOVERWRITE`, `MDB_CURRENT`, `MDB_RESERVE` | Supported | SPEC 01 §S1–S3 |
 | `MDB_CP_COMPACT` | Supported | ADR-0009 |
 | Max key 511, max DB name 511, empty key invalid | Supported | SPEC 01 §S4 |

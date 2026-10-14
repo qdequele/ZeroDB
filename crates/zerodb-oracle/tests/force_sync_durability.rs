@@ -49,7 +49,6 @@ fn open_faulted(dir: &Path, durability: DurabilityFlags) -> (Env, FaultHandle) {
         dir.to_path_buf(),
         Box::new(fault),
         PS,
-        MAP,
         false,
         16,
         126,
@@ -87,9 +86,8 @@ fn assert_floor_has(cut: &CapturedDisk, verify_path: &Path, keys: &BTreeMap<Vec<
     }
     let env = open_with_backing(
         verify_path.to_path_buf(),
-        Box::new(VecBacking(img)),
+        Box::new(VecBacking::new(img, MAP)),
         PS,
-        MAP,
         false,
         16,
         126,

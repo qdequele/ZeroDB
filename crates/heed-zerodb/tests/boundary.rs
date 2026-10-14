@@ -106,3 +106,47 @@ fn no_sub_dir_is_refused_at_open() {
     }
     assert!(!dir.path().join("env").exists(), "nothing must be created");
 }
+
+/// `Env::resize` with a size that is not a multiple of the OS page size →
+/// `Io(InvalidInput)` with heed 0.22.1's message; the map is unchanged.
+#[test]
+fn resize_non_page_multiple_is_invalid_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts();
+    o.map_size(os_page() * 16);
+    let env = unsafe { o.open(dir.path()) }.unwrap();
+    let bad = os_page() + 1;
+    match unsafe { env.resize(bad) } {
+        Err(Error::Io(e)) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "map size ({bad}) must be a multiple of the system page size ({})",
+                    os_page()
+                )
+            );
+        }
+        other => panic!("expected Io(InvalidInput), got {other:?}"),
+    }
+    assert_eq!(env.info().map_size, os_page() * 16);
+}
+
+/// `Env::resize` to twice the current size grows `info().map_size`, and the
+/// env keeps working.
+#[test]
+fn resize_grows_the_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut o = opts();
+    o.map_size(os_page() * 64);
+    let env = unsafe { o.open(dir.path()) }.unwrap();
+    let current = env.info().map_size;
+    unsafe { env.resize(2 * current) }.unwrap();
+    assert_eq!(env.info().map_size, 2 * current);
+    let mut w = env.write_txn().unwrap();
+    let db: Database<Bytes, Bytes> = env.create_database(&mut w, None).unwrap();
+    db.put(&mut w, b"k", b"v").unwrap();
+    w.commit().unwrap();
+    let r = env.read_txn().unwrap();
+    assert_eq!(db.get(&r, b"k").unwrap(), Some(&b"v"[..]));
+}

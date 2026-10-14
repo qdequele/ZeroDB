@@ -6,7 +6,9 @@
 //!
 //! It implements exactly the [`Backing`] surface the in-place path uses:
 //!
-//! - [`Backing::bytes`] mints a fresh whole-buffer `&[u8]` per call (as a
+//! - [`Backing::view`] (and so [`Backing::bytes`]) mints a fresh
+//!   whole-buffer `&[u8]` per call, with the buffer's length as the logical
+//!   map size (as a
 //!   remapped-never `MAP_SHARED` view, this is what the engine's read paths
 //!   hold — the writer re-derives its copy per spill, ADR-0021 B2);
 //! - [`Backing::map_dirty_page`] (the `unsafe fn` broker, ADR-0021 B1) mints
@@ -33,7 +35,7 @@
 
 use std::cell::UnsafeCell;
 
-use zerodb_core::env::Backing;
+use zerodb_core::env::{Backing, MapView};
 use zerodb_core::page::MetaPage;
 
 /// The in-memory writable "map". See the module docs.
@@ -92,7 +94,23 @@ impl TestWriteMap {
     }
 
     fn len(&self) -> usize {
-        self.bytes().len()
+        self.whole().len()
+    }
+
+    /// The whole buffer as a fresh shared view.
+    #[allow(unsafe_code)]
+    fn whole(&self) -> &[u8] {
+        // SAFETY: a fresh whole-buffer shared view per call, derived from the
+        // cell's root (no `&mut` is created on the way — `addr_of!` projects
+        // the place raw). Sound under the map contract (see `Sync` above):
+        // the single writer mutates only TXN-62 regions and re-derives its
+        // own read view after each spill, so no caller reads this view at
+        // locations a later in-place write touched. miri enforces exactly
+        // that: a stale read at written locations is reported.
+        unsafe {
+            let b = self.bytes.get();
+            &*std::ptr::addr_of!(**b)
+        }
     }
 
     /// Page-region bounds as a byte range, or `None` when out of the map.
@@ -110,17 +128,11 @@ impl TestWriteMap {
 
 #[allow(unsafe_code)]
 impl Backing for TestWriteMap {
-    fn bytes(&self) -> &[u8] {
-        // SAFETY: a fresh whole-buffer shared view per call, derived from the
-        // cell's root (no `&mut` is created on the way — `addr_of!` projects
-        // the place raw). Sound under the map contract (see `Sync` above):
-        // the single writer mutates only TXN-62 regions and re-derives its
-        // own read view after each spill, so no caller reads this view at
-        // locations a later in-place write touched. miri enforces exactly
-        // that: a stale read at written locations is reported.
-        unsafe {
-            let b = self.bytes.get();
-            &*std::ptr::addr_of!(**b)
+    fn view(&self) -> MapView<'_> {
+        let bytes = self.whole();
+        MapView {
+            bytes,
+            map_size: bytes.len() as u64,
         }
     }
 
