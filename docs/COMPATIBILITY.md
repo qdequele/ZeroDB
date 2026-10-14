@@ -61,7 +61,8 @@ Behavior differences from LMDB, approved or proposed, are recorded in
 
 | Flag | Status |
 |---|---|
-| `WRITE_MAP`, `NO_SYNC`, `NO_META_SYNC`, `MAP_ASYNC`, `READ_ONLY`, `PREV_SNAPSHOT`, `NO_TLS` | Same — under `WRITE_MAP` dirty pages are written in place in the map, as LMDB does (ADR-0021) |
+| `WRITE_MAP`, `NO_SYNC`, `NO_META_SYNC`, `MAP_ASYNC`, `READ_ONLY`, `NO_TLS` | Same — under `WRITE_MAP` dirty pages are written in place in the map, as LMDB does (ADR-0021) |
+| `PREV_SNAPSHOT` | Same, with two proposed divergences (D-025). With the lock file, as in LMDB: other processes' opens wait until the opener's first commit; that commit is durable but not published, so read txns keep the older snapshot, and the second commit in the same session rebuilds from the older snapshot and drops the first commit's changes; a fresh open after close serves the first commit (ADR-0023 amendment 19). A writable open fails with `EAGAIN` while another process has the env open. D-025: an opener that ends before its first commit, and a `READ_ONLY` `PREV_SNAPSHOT` open joining a running env, which ZeroDB refuses with `EAGAIN`. With `NO_LOCK` the first commit is published at once |
 | `NO_SUB_DIR` | Unsupported — **refused at `open`** with `Io(Unsupported)` (an approved divergence) |
 | `NO_READ_AHEAD` | Honored as in LMDB: the map is advised `madvise(MADV_RANDOM)` (no readahead around page faults) |
 | `NO_LOCK` | Same — no lock file is created or used, and the env runs single-process; the caller must keep other processes out, as with LMDB (ADR-0023 amendment 17) |
