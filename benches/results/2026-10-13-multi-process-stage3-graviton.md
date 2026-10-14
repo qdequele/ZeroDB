@@ -44,13 +44,20 @@ The compiled test binaries were run with `sudo` (CAP_SYS_ADMIN), so the
 | suite | ZeroDB | stock LMDB | note |
 |---|---|---|---|
 | hannoy `v0.1.7-nested-rtxns` (`scripts/hannoy.sh suites`) | 34 passed, 10 failed, 1 ignored | 34 passed, 10 failed, 1 ignored, same 10 tests | Every failure is an insta snapshot diff of one line: `Version { … patch: 6 }` vs `patch: 7`. The tag bumped the crate version without refreshing its snapshots. This was already recorded in `2026-09-09-hannoy-v0.1.7-macos.md`, and it is not engine behavior. |
-| index-scheduler v1.53.1 | 80 passed | (not rerun) | |
+| index-scheduler v1.53.1 | 80 passed | (not rerun) | Not run on stock LMDB: see the note below the table. |
 | milli v1.53.1 `--lib` | 270 passed, 3 ignored, 1 skipped (`filter_depth`, see below) | OOM-killed too (see below) | |
 | milli v1.53.1 `tests/` | 92 passed | | |
 | doc-tests (milli, index-scheduler) | 2 + 1 passed, 1 ignored | | |
 
 `lmdb-master-sys` is absent from the dependency trees of milli and
 index-scheduler with the shim patched in, as asserted by the script.
+
+The stock-LMDB runs of the Meilisearch suites were made only to check
+whether the milli lib OOM below depends on the engine; the task record gives
+no other reason, and index-scheduler, milli `tests/` and the doc-tests were
+not rerun on stock LMDB. That is acceptable for this gate: ZeroDB passed
+every test it ran there, so there is no failure for a stock-LMDB baseline to
+explain. The baseline matters only where a suite fails, as for hannoy above.
 
 What had to change to run the suites on this host. No test or engine source
 was changed.
