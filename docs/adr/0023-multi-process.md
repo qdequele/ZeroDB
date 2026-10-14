@@ -1118,9 +1118,12 @@ Terms used below:
        bytes, the same write as today, without the truncation before it).
     2. A `set_len(256 + 128·slots)` only when the file's length differs
        from it. A finished file from an earlier run with an unchanged count
-       skips it. A longer file is cut back to the exact length; that happens
-       only when no finished table was found (an all-zero header at a larger
-       initializer length), so the truncation stays off the common path.
+       skips it. A longer file is cut back to the exact length. That happens
+       only when the file records no usable table at that length: an
+       all-zero header at a larger initializer length, a file left with the
+       initializing magic, or a finished file longer than its recorded count
+       needs (which an OS crash can leave). None of these is the common
+       path.
     3. A `pwrite` of zeros over the rest of the header, bytes 8–255. Every
        header field, including the bound page size, `T`, the writer-lock
        word and the unused bytes, then starts at zero, as it did after the
@@ -1193,20 +1196,29 @@ Terms used below:
 
     *Tests.*
     - Existing tests stay as they are.
-    - New tests:
+    - New unit tests in `zerodb-io::lockfile`:
       - A finished lock file from an earlier run, with a bound page size,
-        a non-zero `T`, a stale writer word and non-zero unused header
-        bytes, is reopened by an initializer with another page size.
-        Expected: binding succeeds, `T` is the new seed, the writer word is
-        free, and the unused header bytes are zero.
-      - An all-zero header at a larger initializer length is cut back to
-        the exact length.
-      - A reopen with an unchanged count keeps the file's length and its
-        allocated block count (`st_blocks`), which a truncation would
-        change.
-      - A child killed after each of steps 1, 2 and 3 (the existing
-        `init_and_hang`-style harness) leaves a file the next opener
-        accepts and initializes.
+        a non-zero `T`, a stale writer word, non-zero unused header bytes
+        and a claimed slot, is rebuilt by an initializer that then binds
+        another page size. Expected: binding succeeds, every header byte
+        but the magic, format and count is zero, every slot is free, the
+        length is unchanged, and a marker in a slot's unused bytes
+        survives. The marker is what shows the file was not truncated: the
+        test fails with the truncation restored.
+      - The initializer cuts a longer all-zero file back to the exact
+        length, and grows a shorter one.
+      - For each starting file (empty, finished with the same count,
+        finished with a smaller count, an all-zero longer file) and each
+        prefix of the rebuild's steps (none, 1, 1–2, 1–3, run by the real
+        rebuild code), the next opener accepts the file and initializes
+        it. Each state is checked twice: as a process crash left it, and
+        as an OS crash that also lost the header page left it (the header
+        zeroed at the length reached). The second check pins the step
+        order: with steps 2 and 3 swapped, an empty file passes through
+        length 256 and the test fails.
+    - The real-process tests of the election
+      (`zerodb-io/tests/lockfile_processes.rs`: an initializer SIGKILLed
+      before it finishes) run unchanged.
     - The multi-process, crash (`crash-test-mp`) and stress suites run on
       Linux.
 

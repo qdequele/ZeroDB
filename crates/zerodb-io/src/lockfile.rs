@@ -293,11 +293,11 @@ pub fn published_max_readers(path: &Path) -> Result<Option<u32>, LockOpenError> 
     }
     match read_u32_at(&file, OFF_MAX_READERS) {
         // A new initializer started rebuilding the file between the two reads
-        // (every process had closed the environment) and zeroed the header,
-        // or cut the file back: the value is unknown again (ADR-0023
-        // amendment 20).
+        // (every process had closed the environment) and zeroed the header:
+        // the value is unknown again (ADR-0023 amendment 20).
         Ok(0) => Ok(None),
         Ok(n) => Ok(Some(n)),
+        // A file shorter than the header, which no initializer leaves.
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -1451,6 +1451,10 @@ mod tests {
     /// An initializer killed after any step of the rebuild, starting from
     /// any file it accepts, leaves a file the next opener accepts and
     /// initializes. Each state is the real rebuild's first `steps` steps.
+    /// Each is also checked as an OS crash that lost the header page left
+    /// it (the header reads as zeros at the length reached): that pins the
+    /// step order, since zeroing the header before setting the length would
+    /// take a new, empty file through length 256, which the guard refuses.
     #[test]
     fn rebuild_interrupted_after_each_step_is_reinitialized() {
         let finished = |n: u32| {
@@ -1486,9 +1490,33 @@ mod tests {
                     .open(&*path)
                     .unwrap();
                 rebuild_steps(&f, len, steps).unwrap();
-                drop(f);
                 let l = LockFile::open(&path, &data_of(&path), 4)
                     .unwrap_or_else(|e| panic!("{what}, killed after {steps} steps: {e}"));
+                assert_fresh(&l, 4);
+                drop(l);
+                // Again from the same start, then lose the header page.
+                let path = match what {
+                    "empty" => empty(),
+                    "finished, same count" => finished(4),
+                    "finished, smaller count" => finished(2),
+                    _ => zero_header(),
+                };
+                let f = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&*path)
+                    .unwrap();
+                rebuild_steps(&f, len, steps).unwrap();
+                let reached = f.metadata().unwrap().len();
+                {
+                    use std::os::unix::fs::FileExt;
+                    let lost = usize::try_from(reached).unwrap().min(OFF_SLOTS);
+                    f.write_all_at(&vec![0u8; lost], 0).unwrap();
+                }
+                drop(f);
+                let l = LockFile::open(&path, &data_of(&path), 4).unwrap_or_else(|e| {
+                    panic!("{what}, OS crash after {steps} steps (length {reached}): {e}")
+                });
                 assert_fresh(&l, 4);
             }
         }
@@ -1567,7 +1595,7 @@ mod tests {
     }
 
     /// A lock path that is a hard link to the data file is refused before
-    /// anything is truncated, and the link is not removed.
+    /// anything is written, and the link is not removed.
     #[test]
     fn lock_file_that_is_the_data_file_is_refused() {
         let path = tmp();
