@@ -16,9 +16,11 @@
 //! Offsets 136–255 are unused: they keep slot 0 off the writer word's 128-byte
 //! line pair (ADR-0023 amendment 11).
 //!
-//! Before it truncates anything, every opener checks that the lock file is
+//! Before it writes anything, every opener checks that the lock file is
 //! not the data file, and the initializer refuses a non-empty file that does
 //! not look like a lock file (ADR-0023 amendment 16; see [`LockFile::open`]).
+//! The initializer then rebuilds the file in place, never truncating it to
+//! zero (amendment 20; see `rebuild_in_place`).
 //!
 //! Record locks (POSIX `fcntl`, per process; ADR-0023 amendment 2): byte 0 is
 //! the first-opener election, byte 1 the macOS writer lock, and byte
@@ -37,8 +39,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use zerodb_core::shared::{ReaderSlot, SharedRegion, READER_SLOT_FREE, READER_SLOT_SIZE};
 
 const LOCK_MAGIC: u64 = u64::from_le_bytes(*b"ZDBLOCK1");
-/// The initializing magic: written with `pwrite` right after the initializer
-/// truncates the file, and replaced by [`LOCK_MAGIC`] in
+/// The initializing magic: the initializer's first write to the file (with
+/// `pwrite`, ADR-0023 amendment 20), replaced by [`LOCK_MAGIC`] in
 /// [`LockFile::finish_open`]. A file carrying it was left by an initializer
 /// that died mid-way; the next initializer accepts it, and a joiner treats it
 /// as unfinished (ADR-0023 amendment 16).
@@ -290,9 +292,12 @@ pub fn published_max_readers(path: &Path) -> Result<Option<u32>, LockOpenError> 
         return Ok(None);
     }
     match read_u32_at(&file, OFF_MAX_READERS) {
+        // A new initializer started rebuilding the file between the two reads
+        // (every process had closed the environment) and zeroed the header,
+        // or cut the file back: the value is unknown again (ADR-0023
+        // amendment 20).
+        Ok(0) => Ok(None),
         Ok(n) => Ok(Some(n)),
-        // A new initializer truncated the file between the two reads (every
-        // process had closed the environment): the value is unknown again.
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
         Err(e) => Err(e.into()),
     }
@@ -323,7 +328,7 @@ impl LockFile {
     /// [`LockFile::finish_open`]; later openers wait for that, then validate.
     ///
     /// `data_path` is the environment's data file. Two guards keep the
-    /// initializer from truncating a file that is not a lock file (ADR-0023
+    /// initializer from overwriting a file that is not a lock file (ADR-0023
     /// amendment 16):
     ///
     /// - **Same file.** Every opener compares the lock file's identity with
@@ -375,8 +380,8 @@ impl LockFile {
     /// the descriptor is closed and nothing in the file is changed.
     ///
     /// On success this process is the initializer, exactly as after
-    /// [`LockFile::open`]: the file is validated by the same guards,
-    /// truncated and re-initialized, and the election byte stays
+    /// [`LockFile::open`]: the file is validated by the same guards and
+    /// rebuilt in place, and the election byte stays
     /// write-locked until [`LockFile::finish_open`] or the drop. A caller that
     /// never calls `finish_open` holds every other opener in the election for
     /// the handle's life; dropping it leaves the initializing magic, which the
@@ -450,7 +455,7 @@ impl LockFile {
             // in the same position: drop the lock and retry the election so
             // one of them initializes. A set magic usually means the
             // initializer finished, but it may also be left over from a
-            // previous run: an initializer may have died before truncating,
+            // previous run: an initializer may have died before its first write,
             // or every process may have exited while this joiner waited.
             // Joiners that collide then adopt the previous run's table. That
             // is the same state as joining a table whose processes all
@@ -501,17 +506,7 @@ impl LockFile {
         };
         let len = OFF_SLOTS + SLOT_STRIDE * slots as usize;
         if initializer {
-            // Truncate to zero first so no field survives from a previous
-            // life, then mark the file as being initialized before it grows:
-            // a process crash from here on leaves an empty file or one that
-            // carries a lock magic, both of which the foreign-file guard
-            // accepts. The final magic replaces this one in `finish_open`.
-            file.set_len(0)?;
-            {
-                use std::os::unix::fs::FileExt;
-                file.write_all_at(&LOCK_MAGIC_INIT.to_le_bytes(), OFF_MAGIC as u64)?;
-            }
-            file.set_len(len as u64)?;
+            rebuild_in_place(&file, len as u64)?;
         } else if file.metadata()?.len() < len as u64 {
             return Err(LockOpenError::Mismatch(
                 "lock file shorter than its header says".into(),
@@ -846,6 +841,45 @@ fn read_u64_at(file: &File, off: usize) -> std::io::Result<u64> {
     }
 }
 
+/// The initializer's in-place rebuild of the lock file's header (ADR-0023
+/// amendment 20), run after the file guards and before the file is mapped.
+/// The file is never truncated to zero: on ext4 that frees its blocks and the
+/// writes after it allocate them again, which made every initializing open
+/// cost about 330 µs. As LMDB, the file keeps its blocks and is resized only
+/// when its length differs from `len`.
+///
+/// 1. Mark the file as being initialized: from here on a process crash
+///    leaves a file carrying a lock magic, which the foreign-file guard
+///    accepts and a joiner treats as unfinished. The final magic replaces
+///    this one in `finish_open`.
+/// 2. Set the exact length, before the header write below, so that write
+///    never extends the file: a new, empty file goes from length 0 to 8 to
+///    `len`, each a length the guard's all-zero rule accepts after an OS
+///    crash that lost the header.
+/// 3. Zero the rest of the header, so no field survives from a previous life
+///    (the bound page size, `T`, the writer-lock word, unused bytes). The
+///    slots are wiped through the mapping by the caller.
+fn rebuild_in_place(file: &File, len: u64) -> std::io::Result<()> {
+    rebuild_steps(file, len, 3)
+}
+
+/// The first `steps` steps of [`rebuild_in_place`]. Fewer than 3 only in
+/// tests, which use them to reproduce the file an initializer killed between
+/// two steps leaves.
+fn rebuild_steps(file: &File, len: u64, steps: u8) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    if steps >= 1 {
+        file.write_all_at(&LOCK_MAGIC_INIT.to_le_bytes(), OFF_MAGIC as u64)?;
+    }
+    if steps >= 2 && file.metadata()?.len() != len {
+        file.set_len(len)?;
+    }
+    if steps >= 3 {
+        file.write_all_at(&[0u8; OFF_SLOTS - (OFF_MAGIC + 8)], (OFF_MAGIC + 8) as u64)?;
+    }
+    Ok(())
+}
+
 /// The reader-slot count a finished lock file records, if `file` is one (it
 /// carries the final magic) and is long enough to hold that many slots.
 /// `None` for an empty, unfinished or inconsistent file, or a count outside
@@ -927,8 +961,8 @@ fn check_not_data_file(
 }
 
 /// Whether `len` is a length an initializer can leave behind: the
-/// initializing magic alone in a truncated file, or the header plus at least
-/// one reader slot.
+/// initializing magic alone in a file that was empty, or the header plus at
+/// least one reader slot (ADR-0023 amendment 20, step order).
 fn is_initializer_length(len: u64) -> bool {
     let magic_only = (OFF_MAGIC + 8) as u64;
     let header = OFF_SLOTS as u64;
@@ -937,7 +971,7 @@ fn is_initializer_length(len: u64) -> bool {
 }
 
 /// The foreign-file guard (ADR-0023 amendment 16), run by the initializer
-/// before it truncates the lock file at `path`: accept an empty file, a file
+/// before it writes to the lock file at `path`: accept an empty file, a file
 /// carrying [`LOCK_MAGIC`] or [`LOCK_MAGIC_INIT`], or one whose header (the
 /// first `OFF_SLOTS` bytes, or the whole file if shorter) is all zero and
 /// whose length an initializer can leave ([`is_initializer_length`]); refuse
@@ -1333,6 +1367,139 @@ mod tests {
             let l = LockFile::open(&path, &data_of(&path), 4)
                 .unwrap_or_else(|e| panic!("length {len}: {e}"));
             assert_fresh(&l, 4);
+        }
+    }
+
+    // --- In-place rebuild (ADR-0023 amendment 20) ---
+
+    /// A finished lock file from an earlier run, with a bound page size, a
+    /// published txnid, a stale writer word, garbage in the unused header
+    /// bytes and a claimed slot, is rebuilt by the next initializer: every
+    /// header field starts at zero, so a new page size binds, and every slot
+    /// is free. The file is not truncated: its length is unchanged, and a
+    /// marker in a slot's unused bytes, which nothing rewrites, survives.
+    #[test]
+    fn finished_file_is_rebuilt_in_place_without_stale_fields() {
+        use std::os::unix::fs::FileExt;
+        let path = tmp();
+        let data = data_of(&path);
+        {
+            let l = LockFile::open(&path, &data, 8).unwrap();
+            l.bind_page_size(4096).unwrap();
+            l.finish_open().unwrap();
+            l.published_txnid().store(99, Ordering::SeqCst);
+            l.slots()[3].txnid().store(42, Ordering::SeqCst);
+            l.slots()[3]
+                .owner()
+                .store(zerodb_core::shared::owner_word(7, 12345), Ordering::SeqCst);
+        }
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        // The writer word (offset 128 on Linux; unused on macOS) and the
+        // unused header bytes.
+        f.write_all_at(&12345u32.to_le_bytes(), 128).unwrap();
+        for range in [20..64usize, 72..128, 132..256] {
+            f.write_all_at(&vec![0xA5u8; range.len()], range.start as u64)
+                .unwrap();
+        }
+        let marker_at = (OFF_SLOTS + 3 * SLOT_STRIDE + 64) as u64;
+        f.write_all_at(&[0x5A], marker_at).unwrap();
+        let len_before = f.metadata().unwrap().len();
+        drop(f);
+
+        let l = LockFile::open(&path, &data, 8).unwrap();
+        assert!(l.is_initializer());
+        let mut header = vec![0u8; OFF_SLOTS];
+        l.file.read_exact_at(&mut header, 0).unwrap();
+        assert_eq!(&header[..8], &LOCK_MAGIC_INIT.to_le_bytes());
+        assert_eq!(&header[8..12], &LOCK_FORMAT.to_le_bytes());
+        assert_eq!(&header[16..20], &8u32.to_le_bytes());
+        for (i, b) in header.iter().enumerate() {
+            if !(0..12).contains(&i) && !(16..20).contains(&i) {
+                assert_eq!(*b, 0, "header byte {i} survived the rebuild");
+            }
+        }
+        assert_eq!(l.file.metadata().unwrap().len(), len_before);
+        let mut marker = [0u8];
+        l.file.read_exact_at(&mut marker, marker_at).unwrap();
+        assert_eq!(marker, [0x5A], "the file was truncated");
+        l.bind_page_size(8192).expect("a new page size binds");
+        assert_fresh_slots(&l, 8);
+        l.finish_open().unwrap();
+    }
+
+    /// The initializer resizes the file only to the exact length it needs:
+    /// it grows a shorter one, and cuts back a longer all-zero one that
+    /// records no table.
+    #[test]
+    fn initializer_sets_the_exact_length() {
+        let exact = |n: usize| (OFF_SLOTS + n * SLOT_STRIDE) as u64;
+        let path = tmp();
+        std::fs::write(&path, vec![0u8; exact(64) as usize]).unwrap();
+        let l = LockFile::open(&path, &data_of(&path), 4).unwrap();
+        assert_eq!(l.file.metadata().unwrap().len(), exact(4), "cut back");
+        assert_fresh(&l, 4);
+        drop(l);
+        let l = LockFile::open(&path, &data_of(&path), 10).unwrap();
+        assert_eq!(l.file.metadata().unwrap().len(), exact(10), "grown");
+        assert_fresh(&l, 10);
+    }
+
+    /// An initializer killed after any step of the rebuild, starting from
+    /// any file it accepts, leaves a file the next opener accepts and
+    /// initializes. Each state is the real rebuild's first `steps` steps.
+    #[test]
+    fn rebuild_interrupted_after_each_step_is_reinitialized() {
+        let finished = |n: u32| {
+            let path = tmp();
+            let l = LockFile::open(&path, &data_of(&path), n).unwrap();
+            l.bind_page_size(4096).unwrap();
+            l.finish_open().unwrap();
+            l.published_txnid().store(7, Ordering::SeqCst);
+            drop(l);
+            path
+        };
+        let empty = || {
+            let path = tmp();
+            std::fs::write(&path, b"").unwrap();
+            path
+        };
+        let zero_header = || {
+            let path = tmp();
+            std::fs::write(&path, vec![0u8; OFF_SLOTS + 64 * SLOT_STRIDE]).unwrap();
+            path
+        };
+        for steps in 0..=3u8 {
+            for (what, path, target) in [
+                ("empty", empty(), 4u32),
+                ("finished, same count", finished(4), 4),
+                ("finished, smaller count", finished(2), 4),
+                ("zero header, longer", zero_header(), 4),
+            ] {
+                let len = (OFF_SLOTS + target as usize * SLOT_STRIDE) as u64;
+                let f = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&*path)
+                    .unwrap();
+                rebuild_steps(&f, len, steps).unwrap();
+                drop(f);
+                let l = LockFile::open(&path, &data_of(&path), 4)
+                    .unwrap_or_else(|e| panic!("{what}, killed after {steps} steps: {e}"));
+                assert_fresh(&l, 4);
+            }
+        }
+    }
+
+    /// Asserts every slot of `l` is free and owned by no one.
+    fn assert_fresh_slots(l: &LockFile, n: usize) {
+        assert_eq!(l.slots().len(), n);
+        for s in l.slots() {
+            assert_eq!(s.txnid().load(Ordering::SeqCst), READER_SLOT_FREE);
+            assert_eq!(s.owner().load(Ordering::SeqCst), 0);
         }
     }
 

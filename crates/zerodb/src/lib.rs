@@ -503,7 +503,7 @@ impl EnvOpenOptions {
     }
 
     /// ADR-0023: the lock-file name must be a single path component, and
-    /// must not be the data file. The lock-file initializer truncates its
+    /// must not be the data file. The lock-file initializer overwrites its
     /// file, so sharing the name would destroy the data; it is rejected before
     /// either file is opened. Other names of the data file (hard links, case
     /// variants) are caught by the same-file guard in `LockFile::open`

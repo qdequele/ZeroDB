@@ -4,7 +4,7 @@
   2026-10-09 by the maintainer, open questions resolved to the proposed
   defaults (see the end of this ADR); stage-3 amendments 15–18 approved
   2026-10-12, amendment 19 (`PREV_SNAPSHOT`) approved 2026-10-13, amendment
-  20 (in-place lock-file initialization, issue #94) proposed 2026-10-14. The lock
+  20 (in-place lock-file initialization, issue #94) approved 2026-10-14. The lock
   file is on by default. The decision text below is
   reconciled with the amendments; where a sentence was superseded, it says
   so inline. SPEC 04 §12 (`LCK-1` …) states the resulting invariants.
@@ -709,7 +709,8 @@ Terms used below:
     - The explicit-name checks stay: the name differs from the data name and
       is a single path component.
     - **Same-file guard.** `LockFile::open` also receives the data-file path.
-      Before anything is truncated, every opener compares the lock
+      Before anything is truncated (written, since amendment 20), every
+      opener compares the lock
       descriptor's `fstat` `(st_dev, st_ino)` with a `stat` of the data path.
       If they are the same file, the open fails with `Io(InvalidInput)`.
       This catches case-insensitive and normalizing filesystems (default
@@ -719,7 +720,8 @@ Terms used below:
       - On refusal, the lock file is unlinked only if this open created it
         and it is still empty. Otherwise the name now designates the data
         file, which must not be removed.
-    - **Foreign-file guard.** The initializer refuses to truncate a non-empty
+    - **Foreign-file guard.** The initializer refuses to truncate (since
+      amendment 20: to overwrite) a non-empty
       file that does not carry a lock magic, with `Io(InvalidInput)`: the
       final magic `ZDBLOCK1`, or the initializing magic `ZDBLOCK0`
       (`LOCK_MAGIC_INIT`). The one exception is an all-zero header (below),
@@ -735,7 +737,9 @@ Terms used below:
         "ours". The initializer therefore truncates to 0 and then writes the
         initializing magic `LOCK_MAGIC_INIT` (`ZDBLOCK0`) with `pwrite` at
         the magic offset, before `set_len` and before the final magic
-        (amendment 10).
+        (amendment 10). *(Superseded by amendment 20: no truncation; the
+        initializing magic is the first write, then the length, then the
+        rest of the header.)*
       - A *process* crash at any point leaves an empty file, or one carrying
         the initializing or final magic. All three are accepted.
       - Nothing fsyncs the lock file, so an *OS* crash or power loss can
@@ -1079,8 +1083,9 @@ Terms used below:
 ## Amendment 20 (issue #94, 2026-10-14)
 
 20. **The initializer rebuilds the lock file in place instead of truncating
-    it.** Status: **Proposed**, awaiting maintainer approval. No code
-    changes before approval (rule 5).
+    it.** Status: **Approved (2026-10-14, maintainer)**, after a review of
+    the trade-offs below (a small absolute gain, one new crash assumption
+    whose failure mode is a refused open, not data loss).
 
     *Problem.* With the lock file on, an env open by a process that becomes
     the initializer costs about 330 µs more than with `NO_LOCK` on Linux
@@ -1111,15 +1116,19 @@ Terms used below:
     count chosen as today (LCK-2's reader-count rule), the initializer runs:
     1. A `pwrite` of the initializing magic `ZDBLOCK0` at offset 0 (8
        bytes, the same write as today, without the truncation before it).
-    2. A `pwrite` of zeros over the rest of the header, bytes 8–255. Every
-       header field, including the bound page size, `T`, the writer-lock
-       word and the unused bytes, then starts at zero, as it did after the
-       truncation. No header field survives from a previous life.
-    3. A `set_len(256 + 128·slots)` only when the file's length differs
+    2. A `set_len(256 + 128·slots)` only when the file's length differs
        from it. A finished file from an earlier run with an unchanged count
        skips it. A longer file is cut back to the exact length; that happens
        only when no finished table was found (an all-zero header at a larger
        initializer length), so the truncation stays off the common path.
+    3. A `pwrite` of zeros over the rest of the header, bytes 8–255. Every
+       header field, including the bound page size, `T`, the writer-lock
+       word and the unused bytes, then starts at zero, as it did after the
+       truncation. No header field survives from a previous life. The
+       length is set before this write so the write never extends the
+       file: a new, empty lock file goes from length 0 to 8 (step 1) to the
+       full length (step 2), each a length the all-zero rule accepts, and
+       never passes through 256, which it does not.
     4. The rest as today: map, wipe every slot (txnid `RDR_FREE`, owner word
        0), store the format and the slot count with `Relaxed`; then the
        engine binds the page size and seeds `T`, and `finish_open` stores
@@ -1149,7 +1158,7 @@ Terms used below:
         lock magic.
       - A file whose length changed while its header page was lost reads
         either as the old non-zero header or as all zeros at an initializer
-        length (the old length, or `256 + 128·slots`). The all-zero rule of
+        length (8, the old length, or `256 + 128·slots`). The all-zero rule of
         amendment 16 accepts the latter, unchanged.
       - No process survives an OS crash, so whatever the slots hold is
         wiped by the next initializer.
