@@ -24,8 +24,11 @@ heed = { path = "<zerodb>/crates/heed-shim" }
 Since v1.55 Meilisearch has its own `[patch.crates-io]` section, which points
 `heed` at a git branch of Meilisearch's heed fork. The script then puts the
 shim line inside that section and comments out Meilisearch's `heed` line, so
-the LMDB build is the one Meilisearch ships and the ZeroDB build replaces it
-(`scripts/patch-heed.py`).
+the LMDB build is the one Meilisearch ships and the ZeroDB build replaces it.
+Some of its dependencies (cellulite) take heed from that git repository
+directly, which `[patch.crates-io]` does not reach, so every git source of heed
+in Meilisearch's `Cargo.lock` gets a `[patch."<url>"]` table pointing at the
+shim as well (`scripts/patch-heed.py`).
 
 `heed-shim` is a crate literally named `heed` at version 0.22.1 that re-exports
 `heed-zerodb`, the 1:1 re-implementation of heed's surface over the ZeroDB
