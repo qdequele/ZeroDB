@@ -134,8 +134,29 @@ port_teardown() {
     fi
 }
 
+# The xtask runner stops a server with `kill -TERM` and starts the next run
+# without waiting for that server to exit (its `kill_meili` returns once the
+# `kill` command does). A slow shutdown then still holds the port and the next
+# server fails with "Address already in use". The runner therefore starts each
+# server through this wrapper, which waits until nothing listens on the port.
+# The wait happens before the server starts, so no measured span includes it.
+write_port_wait_wrapper() { # $1 = lmdb | zerodb
+    local wrapper="$WORKDIR/bin/meilisearch-$1-wait-port"
+    cat > "$wrapper" <<EOF
+#!/usr/bin/env bash
+for _ in \$(seq 1 600); do
+    (exec 3<>/dev/tcp/127.0.0.1/$MEILI_PORT) 2>/dev/null || break
+    sleep 0.1
+done
+exec "$WORKDIR/bin/meilisearch-$1" "\$@"
+EOF
+    chmod +x "$wrapper"
+    echo "$wrapper"
+}
+
 run_bench() { # $1 = lmdb | zerodb, $2 = round
-    local bin="$WORKDIR/bin/meilisearch-$1"
+    local bin
+    bin="$(write_port_wait_wrapper "$1")"
     local reports="$WORKDIR/reports/$1"
     log "xtask bench ($1, round $2, port $MEILI_PORT): $WORKLOADS"
     # shellcheck disable=SC2086
