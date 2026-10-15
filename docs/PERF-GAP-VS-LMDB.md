@@ -52,6 +52,7 @@ set today. Source keys:
 - **[P]** [`2026-09-30-public-suite-nvme.md`](../benches/results/2026-09-30-public-suite-nvme.md) — the fjall-3 public suite, Graviton4 NVMe, indicative (2 reps)
 - **[L]** the perf ledger line for the change
 - **[G]** [`2026-10-13-multi-process-stage3-graviton.md`](../benches/results/2026-10-13-multi-process-stage3-graviton.md) — full ladder on Graviton4 (c8g, EBS io2, ext4, CGU1) with the lock file on (the default since ADR-0023) and off (`NO_LOCK`)
+- **[C]** [`2026-10-15-meilisearch-v1.53.1-graviton-xlarge.md`](../benches/results/2026-10-15-meilisearch-v1.53.1-graviton-xlarge.md) — Meilisearch v1.53.1 and hannoy on Graviton4 `c8g.xlarge` (8 GiB, gp3), lock file on
 - **[G2]** [`2026-10-15-lock-file-in-place-graviton.md`](../benches/results/2026-10-15-lock-file-in-place-graviton.md) — `env/*` and a sample of other rungs on Graviton4 (c8g, EBS gp3, ext4, CGU1) after the lock file is rebuilt in place (ADR-0023 amendment 20)
 
 Rungs that [V] re-measured are quoted from [V]; the rest come from [E], which
@@ -149,13 +150,13 @@ on, five rungs regress, and their rows below give both figures.
 
 | Workload | Ratio | Source |
 |---|---:|---|
-| Meilisearch indexing, movies | 0.99× (E), 1.01× (M) | E, M |
+| Meilisearch indexing, movies | 0.99× (E, C), 1.01× (M) | E, M, C |
 | Meilisearch indexing, hackernews 1M docs | 0.99× | E |
-| Meilisearch hackernews incremental additions | 0.99× | M |
-| Meilisearch search, movies | 0.95× (E), 0.94× (M) | E, M |
+| Meilisearch hackernews incremental additions | 0.99× (M); **1.15×** on Graviton4 with 8 GiB, merge spans 2.1× (C, cause not yet separated) | M, C |
+| Meilisearch search, movies | 0.95× (E), 0.94× (M), 0.99× (C) | E, M, C |
 | Meilisearch search, hackernews | 1.01× | E |
-| hannoy build, 512 / 768 / 1536 dims | 0.84× / 0.84× / 0.89× | E |
-| hannoy search, 512 / 768 / 1536 dims | 0.95× | E |
+| hannoy build, 512 / 768 / 1536 dims | 0.84× / 0.84× / 0.89× (E); 0.94× / 0.95× / 0.97× (C) | E, C |
+| hannoy search, 512 / 768 / 1536 dims | 0.95× (E); 0.94× / 0.94× / 0.83× (C) | E, C |
 | Public suite, Graviton4: YCSB B fsync / 4 KB values / YCSB A no-sync | 1.00× / 0.90× / 2.01× | P |
 
 The consumers run at parity. The gaps that remain are in micro-operations they
