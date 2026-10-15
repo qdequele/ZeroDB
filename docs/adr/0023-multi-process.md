@@ -1039,7 +1039,7 @@ Terms used below:
       opener left it and reads the older generation. Mirroring that needs a
       joiner to adopt a lock file its initializer never finished, a change
       to the election of every environment, so it is not mirrored here; it
-      is filed as `docs/DIVERGENCES.md` D-025 (PROPOSED).
+      is filed as `docs/DIVERGENCES.md` D-025 (approved).
     - **`READ_ONLY` with `PREV_SNAPSHOT`** never commits, so a sole opener
       holds the election for its whole life and every joiner waits until it
       closes, as observed.
@@ -1058,7 +1058,7 @@ Terms used below:
       `EAGAIN`: moving `T` backwards under live processes would let their
       next writer reuse pages their readers at the newer snapshot still
       read, which breaks TXN-17's monotonic `T` and the GC's reader pin.
-      Filed in D-025 (PROPOSED).
+      Filed in D-025 (approved).
     - **`NO_LOCK`** is unchanged: no election, and the first commit is
       published at once, as observed.
 

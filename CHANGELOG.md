@@ -68,7 +68,7 @@ retires divergence D-001 (single-process only).
   unchanged. Without a lock file the first commit is published at once, as
   before. A process that joins after the first commit reports that commit
   in `Env::info`/`Env::stat`, as LMDB. Two cases differ from LMDB (D-025,
-  proposed): an opener that ends before its first commit, and a `READ_ONLY`
+  approved): an opener that ends before its first commit, and a `READ_ONLY`
   `PREV_SNAPSHOT` open joining a running env, which ZeroDB refuses with
   `EAGAIN` while LMDB rolls every process back.
 - **`zerodb-tools` attach to live environments**: `stat`, `dump` and `check`
@@ -87,7 +87,7 @@ retires divergence D-001 (single-process only).
   rounds up to the data, and a live write txn gets `EINVAL`. Live read
   transactions and the values they borrowed stay valid: a resize adds a
   longer mapping and keeps the old ones until the env closes. In a lock-file
-  env it waits for the cross-process writer lock (a proposed divergence:
+  env it waits for the cross-process writer lock (an approved divergence, D-023:
   LMDB's `mdb_env_set_mapsize` takes no lock and returns while another
   process holds a write txn, `OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER`).
 - **`MdbError::MapResized`** in the engine, returned at transaction begin

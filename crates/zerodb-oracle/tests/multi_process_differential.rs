@@ -2000,7 +2000,7 @@ fn prev_snapshot_opener_ends_both(kill: bool) -> ([String; 2], [String; 2]) {
 /// LMDB's waiter fails with `EINVAL` on macOS and joins the rolled-back
 /// generation on Linux; ZeroDB's waiter becomes the first opener and serves
 /// the newest generation. The second field is docs/DIVERGENCES.md D-025
-/// (PROPOSED), pinned here.
+/// (approved), pinned here.
 #[test]
 fn prev_snapshot_opener_closes_before_commit_vs_lmdb() {
     let (lmdb, zdb) = prev_snapshot_opener_ends_both(false);
@@ -2017,7 +2017,7 @@ fn prev_snapshot_opener_closes_before_commit_vs_lmdb() {
 /// As [`prev_snapshot_opener_closes_before_commit_vs_lmdb`], but the opener
 /// is killed (`OBS_PREV_SNAPSHOT_OPENER_DIES_BEFORE_COMMIT`): LMDB's waiter
 /// joins the rolled-back generation; ZeroDB's waiter becomes the first
-/// opener and serves the newest one (D-025, PROPOSED).
+/// opener and serves the newest one (D-025, approved).
 #[test]
 fn prev_snapshot_opener_dies_before_commit_vs_lmdb() {
     let (lmdb, zdb) = prev_snapshot_opener_ends_both(true);
@@ -2087,7 +2087,7 @@ fn second_prev_snapshot_opener_vs_lmdb() {
 /// the election for its whole life: a joiner waits until it closes
 /// (`OBS_PREV_SNAPSHOT_READ_ONLY_OPENER`). After the close the engines
 /// differ as in [`prev_snapshot_opener_closes_before_commit_vs_lmdb`]
-/// (D-025, PROPOSED).
+/// (D-025, approved).
 #[test]
 fn prev_snapshot_read_only_opener_vs_lmdb() {
     let lmdb = {
@@ -2246,7 +2246,7 @@ fn prev_snapshot_without_a_lock_file_vs_lmdb() {
 /// "<id> <snapshot>", holder's write txn id]`. LMDB admits the read-only
 /// joiner and its open rolls every process back to the older meta; ZeroDB
 /// refuses it with `EAGAIN` and the holder is untouched. Not mirrored:
-/// docs/DIVERGENCES.md D-025 (PROPOSED), pinned here.
+/// docs/DIVERGENCES.md D-025 (approved), pinned here.
 #[test]
 fn prev_snapshot_read_only_joiner_vs_lmdb() {
     let lmdb = {

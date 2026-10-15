@@ -1291,12 +1291,12 @@ every hook; this section defines the steps and their ordering. Both write modes
   open never commits, so it holds the election until it closes
   (`OBS_PREV_SNAPSHOT_READ_ONLY_OPENER`). If the initializer closes or dies
   first, a waiting process wins the election and re-initializes the lock
-  file from the newest meta; LMDB differs there (D-025, PROPOSED).
+  file from the newest meta; LMDB differs there (D-025, approved).
   A `READ_ONLY` `PREV_SNAPSHOT` open that joins a running environment also
   fails with `EAGAIN`. LMDB admits it, and after its open and close the
   shared txnid is back at the older meta for every process
   (`OBS_PREV_SNAPSHOT_READ_ONLY_JOINER`); ZeroDB never moves `T` backwards
-  (TXN-17), D-025 (PROPOSED).
+  (TXN-17), D-025 (approved).
 - **TXN-67** — **Auto-clear on first commit** (SPEC 01 §S5, milli
   `Index::rollback`): the first `commit()` on a PREV_SNAPSHOT env is txn
   `older_txnid + 1` (TXN-2) and writes slot `(older_txnid + 1) & 1`. **This slot
@@ -1625,7 +1625,7 @@ against LMDB unless it says so.
   unpublished first commit and the joiner's `info`/`stat` follow LMDB
   (TXN-66, TXN-67; ADR-0023 amendment 19; `multi_process_differential.rs::
   join_before_prev_snapshot_first_commit_vs_lmdb` and its neighbors). Two
-  cases differ, docs/DIVERGENCES.md D-025 (PROPOSED). If the opener closes
+  cases differ, docs/DIVERGENCES.md D-025 (approved). If the opener closes
   or dies before its first commit, a waiting ZeroDB process becomes the
   first opener and serves the newest meta; LMDB's waiter joins the lock
   file as the opener left it and reads the older meta, or, on macOS after a
