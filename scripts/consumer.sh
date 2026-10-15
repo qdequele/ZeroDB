@@ -68,27 +68,10 @@ ensure_clone() {
     fi
 }
 
-# Remove any previous patch block, then (if $1 = on) append a fresh one.
+# Patch heed to the shim ($1 = on) or restore the manifest ($1 = off); see scripts/patch-heed.py.
 set_patch() {
-    local manifest="$CLONE/Cargo.toml"
-    python3 - "$manifest" "$MARK_BEGIN" "$MARK_END" <<'EOF'
-import sys
-path, b, e = sys.argv[1:4]
-s = open(path).read()
-i, j = s.find(b), s.find(e)
-if i != -1 and j != -1:
-    s = s[:i].rstrip('\n') + '\n' + s[j + len(e):].lstrip('\n')
-open(path, 'w').write(s)
-EOF
-    if [ "$1" = on ]; then
-        cat >> "$manifest" <<EOF
-
-$MARK_BEGIN
-[patch.crates-io]
-heed = { path = "$ZERODB/crates/heed-shim" }
-$MARK_END
-EOF
-    fi
+    python3 "$ZERODB/scripts/patch-heed.py" "$CLONE/Cargo.toml" "$1" \
+        "$MARK_BEGIN" "$MARK_END" "$ZERODB/crates/heed-shim"
 }
 
 assert_no_lmdb() {

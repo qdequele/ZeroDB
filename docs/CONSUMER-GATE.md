@@ -13,13 +13,19 @@ Both are driven by [`scripts/consumer.sh`](../scripts/consumer.sh)
 
 ## How the swap works
 
-Meilisearch depends on `heed = "0.22.1"`. The script appends this to the
+Meilisearch depends on `heed = "0.22.1"`. The script adds this to the
 Meilisearch `Cargo.toml` (between marker comments, removed again afterwards):
 
 ```toml
 [patch.crates-io]
 heed = { path = "<zerodb>/crates/heed-shim" }
 ```
+
+Since v1.55 Meilisearch has its own `[patch.crates-io]` section, which points
+`heed` at a git branch of Meilisearch's heed fork. The script then puts the
+shim line inside that section and comments out Meilisearch's `heed` line, so
+the LMDB build is the one Meilisearch ships and the ZeroDB build replaces it
+(`scripts/patch-heed.py`).
 
 `heed-shim` is a crate literally named `heed` at version 0.22.1 that re-exports
 `heed-zerodb`, the 1:1 re-implementation of heed's surface over the ZeroDB
