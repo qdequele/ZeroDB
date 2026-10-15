@@ -1438,12 +1438,17 @@ and the futex), `zerodb-core::shared` (the safe interface the core sees) and
   `zerodb::ExclusiveLock` runs the election without waiting and never
   finishes it, so every other opener waits until the guard drops (used by
   `zerodb-tools check` on a file that does not open, ADR-0023 amendment 18).
-- **LCK-2 — Initialization and the magic (ADR-0023 amendments 10 and 16).**
-  The initializer truncates the file to zero, writes the initializing magic
-  `ZDBLOCK0` at offset 0 with `pwrite`, sets the file's length, wipes every
-  reader slot (txnid `RDR_FREE`, owner word 0) and stores the format version
-  and the slot count. The engine then binds the data page size and seeds `T`
-  from the meta it selected. Only then is the final magic `ZDBLOCK1` stored,
+- **LCK-2 — Initialization and the magic (ADR-0023 amendments 10, 16 and
+  20).** The initializer rebuilds the file in place and never truncates it to
+  zero. It writes the initializing magic `ZDBLOCK0` at offset 0 with
+  `pwrite`; sets the file's length to `256 + 128·slots` only when the length
+  differs (before the next write, so that write never extends the file);
+  writes zeros over the rest of the header (bytes 8–255), so no header field
+  survives from a previous life; then wipes every reader slot (txnid
+  `RDR_FREE`, owner word 0) and stores the format version and the slot count.
+  The unused bytes inside a slot are not rewritten, and nothing reads them.
+  The engine then binds the data page size and seeds `T` from the meta it
+  selected. Only then is the final magic `ZDBLOCK1` stored,
   with `Release`, and byte 0 downgraded: at the end of the open, or, for a
   `PREV_SNAPSHOT` open, at its first commit (TXN-66). A joiner loads the magic with
   `Acquire`, so a joiner that sees the final magic also sees every header
@@ -1574,7 +1579,7 @@ and the futex), `zerodb-core::shared` (the safe interface the core sees) and
   Distinct data names in one directory therefore never share a lock file.
   SPEC 02 §8 states the rule and the two file guards below.
 - **LCK-10 — File guards (ADR-0023 amendment 16).** Before anything is
-  truncated, every opener refuses a lock file that is the data file under
+  written, every opener refuses a lock file that is the data file under
   another name (same `st_dev` and `st_ino`), and the initializer refuses a
   non-empty file that carries neither magic and is not an all-zero header
   (the first 256 bytes, or the whole file if shorter) at a length an

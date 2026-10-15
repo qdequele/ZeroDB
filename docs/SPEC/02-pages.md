@@ -711,9 +711,10 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     differently do not share a lock file; this is the same class as reaching
     one file through two paths, which LMDB does not guard against either.
   - **Lock-file guards (ADR-0023 amendment 16).** The lock-file initializer
-    truncates the file, so two guards keep it from destroying data. Both fail
-    the open with `Io(InvalidInput)` and modify neither file.
-    - *Same file:* before anything is truncated, every opener compares the
+    overwrites the file (in place, ADR-0023 amendment 20; SPEC 04 LCK-2), so
+    two guards keep it from destroying data. Both fail the open with
+    `Io(InvalidInput)` and modify neither file.
+    - *Same file:* before anything is written, every opener compares the
       lock descriptor's `(st_dev, st_ino)` with a `stat` of the data path; a
       match (hard link; a case variant on a case-insensitive filesystem) is
       refused. A missing data file skips the check. The open tries
@@ -721,12 +722,12 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
       still empty, the refusal unlinks it; otherwise the name is left alone,
       since it designates the data file.
     - *Foreign file:* the initializer accepts the existing file only if it is
-      empty, carries the final lock magic or the initializing magic (written
-      with `pwrite` right after truncating to zero, replaced by the final
-      magic when the open completes), or its header (the first 256 bytes, or
-      the whole file if shorter) is all zero and its length is one an
-      initializer can leave: 8 (the initializing magic in the truncated
-      file) or 256 + 128·k for k ≥ 1 (header plus k reader slots). Nothing
+      empty, carries the final lock magic or the initializing magic (the
+      initializer's first write, with `pwrite`, replaced by the final magic
+      when the open completes), or its header (the first 256 bytes, or the
+      whole file if shorter) is all zero and its length is one an
+      initializer can leave: 8 (the initializing magic in a file that was
+      empty) or 256 + 128·k for k ≥ 1 (header plus k reader slots). Nothing
       fsyncs the lock file, so a power loss can keep such a length and lose
       the magic block. Everything else is refused, including a stale LMDB
       `lock.mdb` (`0xBEEFC0DE` at byte 0). This refuses every *initialized*

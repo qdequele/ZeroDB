@@ -52,6 +52,7 @@ set today. Source keys:
 - **[P]** [`2026-09-30-public-suite-nvme.md`](../benches/results/2026-09-30-public-suite-nvme.md) — the fjall-3 public suite, Graviton4 NVMe, indicative (2 reps)
 - **[L]** the perf ledger line for the change
 - **[G]** [`2026-10-13-multi-process-stage3-graviton.md`](../benches/results/2026-10-13-multi-process-stage3-graviton.md) — full ladder on Graviton4 (c8g, EBS io2, ext4, CGU1) with the lock file on (the default since ADR-0023) and off (`NO_LOCK`)
+- **[G2]** [`2026-10-15-lock-file-in-place-graviton.md`](../benches/results/2026-10-15-lock-file-in-place-graviton.md) — `env/*` and a sample of other rungs on Graviton4 (c8g, EBS gp3, ext4, CGU1) after the lock file is rebuilt in place (ADR-0023 amendment 20)
 
 Rungs that [V] re-measured are quoted from [V]; the rest come from [E], which
 predates the cache, so read paths in [E] are slightly pessimistic.
@@ -141,7 +142,7 @@ on, five rungs regress, and their rows below give both figures.
 | Raw env copy (`maint/copy/raw`) | 0.94× | E |
 | Compacting copy (`maint/copy/compact`) | 0.99× | E |
 | `non_free_pages_size` (`env/stat/non_free`) | 0.41× (L); Graviton4: 0.48× lock file on (+7 ns per call), 0.44× `NO_LOCK` | L (2026-09-29, CGU1), G |
-| Reopen an env (`env/open/reopen`) | 9.65× lock file on (17 → 347 µs per open, 20.3× the release before); 0.49× `NO_LOCK` | G |
+| Reopen an env (`env/open/reopen`) | 0.96× lock file on (36.4 µs per open, LMDB 37.8 µs; was 9.65× before the lock file was rebuilt in place); 0.49× `NO_LOCK` | G2, G |
 | Create an env (`env/open/create`) | 10.50× lock file on (+155 µs per create); 9.04× `NO_LOCK`, by design (see [Deliberate differences](#deliberate-differences)) | G |
 
 ### Consumers end to end
@@ -262,14 +263,6 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
   write-txn containers (#8), free-list bookkeeping (#29, measure first; only
   matters under GC churn), per-page allocation and zero-fill (#4, partly done
   by the frame pool).
-- **Env open with the lock file** — `env/open/reopen` 9.65× LMDB with the
-  lock file on (347 µs per open, was 17 µs), `env/open/create` +155 µs [G].
-  The first opener of an env truncates the lock file and rebuilds it
-  (ADR-0023 amendment 10); on ext4 that frees and reallocates its blocks on
-  every open. LMDB reinitializes its lock file in place. Accepted for stage 3
-  (maintainer ruling, 2026-10-14); the follow-up, ADR-0023 amendment 20
-  (reinitialize in place, as LMDB), is tracked in issue #94. For
-  Meilisearch it is about 0.3 ms per index open.
 - **Scans** — 1.3–1.8× by default; range scans 1.2× in trusted mode. A cursor keeps only its leaf;
   branch levels are re-resolved per cursor step (a memo hit, so cheap; one
   try to cache the parent read flat). Ideas: cache-line prefetch (#17),
@@ -318,10 +311,13 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
   Paid once per env lifetime; it is why `env/open/create` is 8.55× [E]
   (9.04× on Graviton4 without a lock file [G]).
 - **Lock file on by default** (ADR-0023) — multi-process access costs, on
-  Graviton4 [G], +29.8 ns per write commit, +6.8 ns per read txn begin/abort,
-  +7 ns per `stat`, +155 µs per env create and 17 → 347 µs per env reopen.
-  `NO_LOCK` (`lock_file(false)` natively) is flat. The reopen cost has a
-  planned fix (see [What remains](#what-remains)).
+  Graviton4 [G], +29.8 ns per write commit, +6.8 ns per read txn begin/abort
+  and +7 ns per `stat`. `NO_LOCK` (`lock_file(false)` natively) is flat.
+  Env open first cost +155 µs per create and 17 → 347 µs per reopen, because
+  the first opener truncated the lock file and rebuilt it. Since ADR-0023
+  amendment 20 it rebuilds the file in place, as LMDB does, and reopen is at
+  parity with LMDB: 36.4 µs per open against LMDB's 37.8 µs (issue #94,
+  [G2]).
 
 ## Former item codes
 

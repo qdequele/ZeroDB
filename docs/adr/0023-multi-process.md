@@ -3,7 +3,8 @@
 - Status: **Accepted, implemented** (stages 1–3, 2026-10-13). Approved
   2026-10-09 by the maintainer, open questions resolved to the proposed
   defaults (see the end of this ADR); stage-3 amendments 15–18 approved
-  2026-10-12, amendment 19 (`PREV_SNAPSHOT`) approved 2026-10-13. The lock
+  2026-10-12, amendment 19 (`PREV_SNAPSHOT`) approved 2026-10-13, amendment
+  20 (in-place lock-file initialization, issue #94) approved 2026-10-14. The lock
   file is on by default. The decision text below is
   reconciled with the amendments; where a sentence was superseded, it says
   so inline. SPEC 04 §12 (`LCK-1` …) states the resulting invariants.
@@ -708,7 +709,8 @@ Terms used below:
     - The explicit-name checks stay: the name differs from the data name and
       is a single path component.
     - **Same-file guard.** `LockFile::open` also receives the data-file path.
-      Before anything is truncated, every opener compares the lock
+      Before anything is truncated (written, since amendment 20), every
+      opener compares the lock
       descriptor's `fstat` `(st_dev, st_ino)` with a `stat` of the data path.
       If they are the same file, the open fails with `Io(InvalidInput)`.
       This catches case-insensitive and normalizing filesystems (default
@@ -718,7 +720,8 @@ Terms used below:
       - On refusal, the lock file is unlinked only if this open created it
         and it is still empty. Otherwise the name now designates the data
         file, which must not be removed.
-    - **Foreign-file guard.** The initializer refuses to truncate a non-empty
+    - **Foreign-file guard.** The initializer refuses to truncate (since
+      amendment 20: to overwrite) a non-empty
       file that does not carry a lock magic, with `Io(InvalidInput)`: the
       final magic `ZDBLOCK1`, or the initializing magic `ZDBLOCK0`
       (`LOCK_MAGIC_INIT`). The one exception is an all-zero header (below),
@@ -734,7 +737,9 @@ Terms used below:
         "ours". The initializer therefore truncates to 0 and then writes the
         initializing magic `LOCK_MAGIC_INIT` (`ZDBLOCK0`) with `pwrite` at
         the magic offset, before `set_len` and before the final magic
-        (amendment 10).
+        (amendment 10). *(Superseded by amendment 20: no truncation; the
+        initializing magic is the first write, then the length, then the
+        rest of the header.)*
       - A *process* crash at any point leaves an empty file, or one carrying
         the initializing or final magic. All three are accepted.
       - Nothing fsyncs the lock file, so an *OS* crash or power loss can
@@ -1075,6 +1080,155 @@ Terms used below:
     `PREV_SNAPSHOT` are unaffected. SPEC 01 §S5, SPEC 04 TXN-66, TXN-67,
     LCK-1, LCK-2 and §12.1 follow.
 
+## Amendment 20 (issue #94, 2026-10-14)
+
+20. **The initializer rebuilds the lock file in place instead of truncating
+    it.** Status: **Approved (2026-10-14, maintainer)**, after a review of
+    the trade-offs below (a small absolute gain, one new crash assumption
+    whose failure mode is a refused open, not data loss).
+
+    *Problem.* With the lock file on, an env open by a process that becomes
+    the initializer costs about 330 µs more than with `NO_LOCK` on Linux
+    (`env/open/reopen` 17 → 347 µs, 9.6× LMDB;
+    `benches/results/2026-10-13-multi-process-stage3-graviton.md`). Every
+    open of an env that no other process holds is such an open, which
+    includes every open in a single-process consumer like Meilisearch. The
+    cost is LCK-2's first step:
+    - `set_len(0)` frees the file's blocks;
+    - the `pwrite` of the initializing magic and the stores through the
+      fresh mapping allocate them again.
+
+    On ext4, `perf` shows `LockFile::open` at 12.8 % of samples, in
+    `do_truncate` / `ext4_setattr` and the buffered-write path. On macOS,
+    `ftruncate` is the top self-time symbol.
+
+    *LMDB (design reading of the vendored `mdb.c`, not an observation; the
+    lock file is not a shared format, D-002).*
+    - LMDB's first opener never truncates its lock file. It grows the file
+      only when it is shorter than the reader table needs (`ftruncate` to
+      the larger size), and otherwise sizes the table from the file.
+    - It then rewrites the header fields through the mapping.
+    - ZeroDB already follows LMDB's never-shrink rule for the slot count
+      (`OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS`). This amendment
+      extends that to the file's blocks.
+
+    *Decision.* After the two file guards (LCK-10) pass, and with the slot
+    count chosen as today (LCK-2's reader-count rule), the initializer runs:
+    1. A `pwrite` of the initializing magic `ZDBLOCK0` at offset 0 (8
+       bytes, the same write as today, without the truncation before it).
+    2. A `set_len(256 + 128·slots)` only when the file's length differs
+       from it. A finished file from an earlier run with an unchanged count
+       skips it. A longer file is cut back to the exact length. That happens
+       only when the file records no usable table at that length: an
+       all-zero header at a larger initializer length, a file left with the
+       initializing magic, or a finished file longer than its recorded count
+       needs (which an OS crash can leave). None of these is the common
+       path.
+    3. A `pwrite` of zeros over the rest of the header, bytes 8–255. Every
+       header field, including the bound page size, `T`, the writer-lock
+       word and the unused bytes, then starts at zero, as it did after the
+       truncation. No header field survives from a previous life. The
+       length is set before this write so the write never extends the
+       file: a new, empty lock file goes from length 0 to 8 (step 1) to the
+       full length (step 2), each a length the all-zero rule accepts, and
+       never passes through 256, which it does not.
+    4. The rest as today: map, wipe every slot (txnid `RDR_FREE`, owner word
+       0), store the format and the slot count with `Relaxed`; then the
+       engine binds the page size and seeds `T`, and `finish_open` stores
+       `ZDBLOCK1` with `Release` and downgrades byte 0.
+
+    Unused bytes inside a reader slot (bytes 16–127 of each 128-byte slot)
+    are not rewritten. Nothing reads them. A future format that uses them
+    bumps the lock-format version, and the version check refuses the
+    mismatch before any of them is read.
+
+    *Crash safety, restated.* Amendment 10 and amendment 16's guards argue
+    from "truncate, then magic". The same argument holds without the
+    truncation:
+    - **Process crash.**
+      - Before step 1, the file is exactly as the guards accepted it.
+      - From step 1 on, it carries `ZDBLOCK0` or `ZDBLOCK1`, which the next
+        initializer accepts and a joiner treats as unfinished (LCK-1,
+        LCK-2), as today.
+      - Step 1 relies on an 8-byte `pwrite` at offset 0 landing whole, the
+        same assumption as today's protocol.
+    - **OS crash or power loss** (nothing fsyncs the lock file).
+      - The file may come back with any mix of old and new pages, and with
+        the old or the new length.
+      - The header lies in one 512-byte sector, so it reads as the old
+        header or the new one.
+      - The old header was accepted by the guards. The new one carries a
+        lock magic.
+      - A file whose length changed while its header page was lost reads
+        either as the old non-zero header or as all zeros at an initializer
+        length (8, the old length, or `256 + 128·slots`). The all-zero rule of
+        amendment 16 accepts the latter, unchanged.
+      - No process survives an OS crash, so whatever the slots hold is
+        wiped by the next initializer.
+    - **Joiners** never see the intermediate states: the initializer holds
+      byte 0 exclusive from before step 1 until `finish_open`, as today.
+    - **The guards are unchanged.** They still run before the first write,
+      still refuse a foreign non-empty file without modifying it, and still
+      accept the same set of files.
+
+    *Expected effect (throwaway spike, macOS aarch64, APFS, 2026-10-14; not
+    a gate).* An open/close loop of the native engine on one env, best of 7
+    runs of 1000 opens:
+
+    | Variant | µs per open |
+    |---|---:|
+    | lock file on, today (truncate) | 220–238 |
+    | lock file on, steps 1–3 above | 104–113 |
+    | `NO_LOCK` | 48–55 |
+
+    The rest of the lock-on cost is syscalls: the lock file's open, stat,
+    `mmap`/`munmap`, `fcntl` locks and close. LMDB makes the same kinds of
+    calls. Opening the existing file before trying `create_new` was also
+    tried; it gave nothing measurable and is not proposed.
+
+    *Gate.*
+    - The engine-comparison `env/open/create` and `env/open/reopen` rungs,
+      with the lock file on and off, in three columns: LMDB, ZeroDB before,
+      ZeroDB after. This needs a quiet Linux aarch64 host.
+    - The target is lock-on reopen at or below LMDB's. If a gap remains, it
+      is profiled and reported in `docs/PERF-GAP-VS-LMDB.md`, not hidden.
+    - No other rung may move.
+
+    *Tests.*
+    - Existing tests stay as they are.
+    - New unit tests in `zerodb-io::lockfile`:
+      - A finished lock file from an earlier run, with a bound page size,
+        a non-zero `T`, a stale writer word, non-zero unused header bytes
+        and a claimed slot, is rebuilt by an initializer that then binds
+        another page size. Expected: binding succeeds, every header byte
+        but the magic, format and count is zero, every slot is free, the
+        length is unchanged, and a marker in a slot's unused bytes
+        survives. The marker is what shows the file was not truncated: the
+        test fails with the truncation restored.
+      - The initializer cuts a longer all-zero file back to the exact
+        length, and grows a shorter one.
+      - For each starting file (empty, finished with the same count,
+        finished with a smaller count, an all-zero longer file) and each
+        prefix of the rebuild's steps (none, 1, 1–2, 1–3, run by the real
+        rebuild code), the next opener accepts the file and initializes
+        it. Each state is checked twice: as a process crash left it, and
+        as an OS crash that also lost the header page left it (the header
+        zeroed at the length reached). The second check pins the step
+        order: with steps 2 and 3 swapped, an empty file passes through
+        length 256 and the test fails.
+    - The real-process tests of the election
+      (`zerodb-io/tests/lockfile_processes.rs`: an initializer SIGKILLed
+      before it finishes) run unchanged.
+    - The multi-process, crash (`crash-test-mp`) and stress suites run on
+      Linux.
+
+    No lock-file format change (the layout and version 2 are unchanged), no
+    data-file change, no API change. Implementation is local to
+    `zerodb-io::lockfile` (`LockFile::open_with` and the module doc). SPEC
+    04 LCK-2 ("truncates the file to zero") and LCK-10 ("before anything is
+    truncated" becomes "before anything is written") follow. Amendment 16's
+    guard text and SPEC 02 §8 are reworded the same way.
+
 ## Consequences
 
 ### Staging (rule 6: the riskiest assumption first)
@@ -1139,6 +1293,10 @@ updated. New invariants for the lock file get fresh IDs.
   will reinitialize the lock file in place, as LMDB does; it changes
   amendment 10's crash-safety argument (truncate, then magic last), so it
   needs its own approved amendment first (rule 5). It is tracked in issue #94.
+  *Resolved by amendment 20 (approved and implemented 2026-10-14):* on
+  Graviton4, env reopen with the lock file on is 36.4 µs per open against
+  LMDB's 37.8 µs (0.96×), and env create is 1.13 ms per env faster
+  (`benches/results/2026-10-15-lock-file-in-place-graviton.md`).
 - The macOS POSIX-lock pitfall (§3) and Linux-only futex give two writer-lock
   implementations to test on CI.
 - A bug here corrupts data rather than crashing — the reason for stage-1-first,

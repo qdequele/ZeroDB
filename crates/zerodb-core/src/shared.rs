@@ -35,7 +35,7 @@ pub const READER_SLOT_SIZE: usize = 128;
 ///
 /// The padding is atomic bytes too, so the whole slot is interior-mutable:
 /// another process may still write those bytes (a later initializer that
-/// truncates and re-extends the file, for example) while this one holds a
+/// rebuilds the file, for example) while this one holds a
 /// `&ReaderSlot` over the mapping, and that must not be a data race on plain
 /// memory.
 ///

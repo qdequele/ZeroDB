@@ -109,11 +109,17 @@ retires divergence D-001 (single-process only).
 - **The lock file has a cost**, measured on Graviton4 (EBS io2, ext4;
   `benches/results/2026-10-13-multi-process-stage3-graviton.md`) against
   0.2.0: +29.8 ns per write commit, +6.8 ns per read txn begin/abort, +7 ns
-  per `Env::stat`, +155 µs per env create, and env reopen 17 → 347 µs
-  (9.6× LMDB; about 0.3 ms per index open for Meilisearch). The reopen cost
-  comes from the first opener truncating the lock file and rebuilding it
-  (ADR-0023 amendment 10); reinitializing it in place, as LMDB does, is the
-  planned follow-up (ADR-0023 amendment 20, tracked in issue #94). With `NO_LOCK` (`lock_file(false)` natively) every rung is flat.
+  per `Env::stat`. With `NO_LOCK` (`lock_file(false)` natively) every rung
+  is flat.
+- **Opening an env with the lock file is at parity with LMDB.** The first
+  opener of an env now rebuilds the lock file in place instead of truncating
+  it to zero, as LMDB does (ADR-0023 amendment 20, issue #94). Truncating
+  made ext4 free and reallocate the file's blocks on every open. On Graviton4
+  (EBS gp3, ext4; `benches/results/2026-10-15-lock-file-in-place-graviton.md`),
+  env reopen went from 1016 µs to 36.4 µs per open (LMDB 37.8 µs), and env
+  create got 1.13 ms faster. Before this, the lock-file default had cost
+  +155 µs per create and 17 → 347 µs per reopen on the io2 host of the
+  stage-3 ladder.
 
 #### Known limits
 
