@@ -68,7 +68,8 @@ ensure_clone() {
     fi
 }
 
-# Patch heed to the shim ($1 = on) or restore the manifest ($1 = off); see scripts/patch-heed.py.
+# Patch heed to the shim ($1 = on), prepare a stock build ($1 = stock) or restore
+# the manifest ($1 = off); see scripts/patch-heed.py.
 set_patch() {
     python3 "$ZERODB/scripts/patch-heed.py" "$CLONE/Cargo.toml" "$1" \
         "$MARK_BEGIN" "$MARK_END" "$ZERODB/crates/heed-shim"
@@ -105,7 +106,7 @@ do_suites() {
 
 build_binary() { # $1 = lmdb | zerodb
     local out="$WORKDIR/bin/meilisearch-$1"
-    if [ "$1" = zerodb ]; then set_patch on; else set_patch off; fi
+    if [ "$1" = zerodb ]; then set_patch on; else set_patch stock; fi
     log "building meilisearch ($1) → $out"
     (cd "$CLONE" && cargo build --release -p meilisearch)
     if [ "$1" = zerodb ]; then assert_no_lmdb meilisearch; fi

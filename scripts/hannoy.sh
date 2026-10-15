@@ -79,7 +79,7 @@ do_suites() {
 run_bench() { # $1 = lmdb | zerodb, $2 = round
     local out="$WORKDIR/reports/hannoy/$1-round-$2.txt"
     mkdir -p "$(dirname "$out")"
-    if [ "$1" = zerodb ]; then set_patch on; else set_patch off; fi
+    if [ "$1" = zerodb ]; then set_patch on; else set_patch stock; fi
     log "cargo bench --bench benchmark ($1, round $2) → $out"
     # shellcheck disable=SC2086
     (cd "$CLONE" && cargo bench --bench benchmark -- $BENCH_ARGS) | tee "$out"

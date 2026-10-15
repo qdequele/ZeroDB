@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Point a consumer's `heed` dependency at the ZeroDB shim, or undo it.
 
-Usage: patch-heed.py <Cargo.toml> on|off <begin marker> <end marker> [<heed-shim path>]
+Usage: patch-heed.py <Cargo.toml> on|stock|off <begin marker> <end marker> [<heed-shim path>]
 
 `on` adds `heed = { path = "<heed-shim>" }` under `[patch.crates-io]`. When the
 manifest already has that section (Meilisearch does, for its own heed fork),
@@ -10,9 +10,10 @@ since cargo refuses a second `[patch.crates-io]` table and two `heed` keys.
 Otherwise a new section is appended. Crates that take heed from a git
 repository instead (Meilisearch v1.55's cellulite takes it from Meilisearch's
 heed fork) are not reached by `[patch.crates-io]`: every git source of heed in
-the consumer's `Cargo.lock` gets its own `[patch."<url>"]` table. A
-manifest with no `[workspace]` table gets an empty one, so a consumer cloned
-under this repository's `target/` is not taken for a member of its workspace.
+the consumer's `Cargo.lock` gets its own `[patch."<url>"]` table. 
+`stock` leaves heed alone for the LMDB build. Both `on` and `stock` give a
+manifest with no `[workspace]` table an empty one, so a consumer cloned under
+this repository's `target/` is not taken for a member of its workspace.
 
 Every edit is fenced by the markers or tagged, so `off` restores the manifest
 byte for byte, also after a run died with the patch in place.
@@ -69,6 +70,7 @@ def heed_git_sources(manifest):
 
 
 def on(s, begin, end, shim, git_urls):
+    """`shim` None is the stock build: only the `[workspace]` table, if missing."""
     entry = f'heed = {{ path = "{shim}" }}'
     lines = s.split("\n")
     header = next(
@@ -76,7 +78,9 @@ def on(s, begin, end, shim, git_urls):
         None,
     )
     tail = []
-    if header is None:
+    if shim is None:
+        pass
+    elif header is None:
         tail += ["[patch.crates-io]", entry]
     else:
         k = header + 1
@@ -85,7 +89,7 @@ def on(s, begin, end, shim, git_urls):
                 lines[k] = TAG + lines[k]
             k += 1
         lines[header + 1:header + 1] = [begin, entry, end]
-    for url in git_urls:
+    for url in git_urls if shim is not None else []:
         tail += [f'[patch."{url}"]', entry]
     if not any(re.fullmatch(r"\[workspace\]\s*", l) for l in lines):
         tail += ["[workspace]"]
@@ -103,6 +107,10 @@ def main():
     s = off(s, begin, end)
     if mode == "on":
         s = on(s, begin, end, sys.argv[5], heed_git_sources(path))
+    elif mode == "stock":
+        s = on(s, begin, end, None, [])
+    elif mode != "off":
+        sys.exit(f"unknown mode {mode!r}: expected on, stock or off")
     open(path, "w").write(s)
 
 
