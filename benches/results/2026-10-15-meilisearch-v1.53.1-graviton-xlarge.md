@@ -29,15 +29,17 @@ All the ignored tests are ignored upstream. milli's `filter_depth`, which ran ou
 
 ## Meilisearch benchmarks
 
-`ROUNDS=3 scripts/consumer.sh bench` with `workloads/movies.json`, `workloads/search/movies.json` and `workloads/hackernews-add-new-documents.json`. Each round runs both engines, and even rounds flip the order. Total = sum of every span's self time per run, median over runs.
+`ROUNDS=3 scripts/consumer.sh bench` with `workloads/movies.json`, `workloads/search/movies.json` and `workloads/hackernews-add-new-documents.json`. Each round runs both engines, and even rounds flip the order.
 
-| workload | runs per engine | LMDB | ZeroDB | ZeroDB ÷ LMDB |
-|---|---:|---:|---:|---:|
-| movies indexing | 30 | 6.636 s | 6.557 s | **0.99×** |
-| movies search | 30 | 8.9 ms | 8.9 ms | **0.99×** |
-| hackernews incremental additions | 9 | 60.330 s | 69.541 s | **1.15×** |
+The headline figure is the median server-side time of a run, the `::meta::total` span, as in the earlier reports. `scripts/bench-compare.py` also prints a sum of every span's self time per run; spans that run at the same time on different threads are all counted, so that sum overstates the time a run takes and is given here only for reference.
 
-Hackernews additions, run totals per round (seconds):
+| workload | runs per engine | LMDB | ZeroDB | ZeroDB ÷ LMDB | self-time sum ratio |
+|---|---:|---:|---:|---:|---:|
+| movies indexing | 30 | 4.346 s | 4.436 s | **1.02×** | 0.99× |
+| movies search | 30 | 9.6 ms | 9.5 ms | **0.99×** | 0.99× |
+| hackernews incremental additions | 9 | 45.666 s | 46.880 s | **1.03×** | 1.15× |
+
+Hackernews additions, self-time sums per run and round (seconds):
 
 | | round 1 | round 2 | round 3 |
 |---|---|---|---|
@@ -55,7 +57,8 @@ Hackernews additions, the spans that move (median inclusive time per run):
 | `indexing::post_processing::post_process` | 8.429 s | 5.402 s | 0.64× |
 
 - Movies indexing and search are at parity, as on the x86 server.
-- **Hackernews incremental additions are 15% slower on ZeroDB.** The x86 server measured this workload at 0.99× on 2026-10-05. The gap is in the merge spans, which read the existing posting lists back from the database while merging new ones, and they take twice as long. Commit and post-processing are faster on ZeroDB.
+- **Hackernews incremental additions take 3% longer on ZeroDB** (1.2 s per run). The x86 server measured this workload at 0.99× on 2026-10-05, on the same span.
+- Inside it, the two merge spans take twice as long on ZeroDB. They read the existing posting lists back from the database while merging the new ones. They run in parallel with other work, so they raise `indexing::write_db::all` by 5 s (1.19×) rather than the whole run, and ZeroDB gets 3.7 s back in commit and post-processing.
 - Three things differ from the 0.99× run: this host has 8 GiB against a larger x86 server; the lock file is now on by default; and the architecture is aarch64. ZeroDB's peak memory on this workload was already slightly above LMDB's (`docs/PERF-GAP-VS-LMDB.md`), and an 8 GiB host leaves little page cache. This run cannot separate these causes.
 
 ## hannoy benchmarks

@@ -150,9 +150,9 @@ on, five rungs regress, and their rows below give both figures.
 
 | Workload | Ratio | Source |
 |---|---:|---|
-| Meilisearch indexing, movies | 0.99× (E, C), 1.01× (M) | E, M, C |
+| Meilisearch indexing, movies | 0.99× (E), 1.01× (M), 1.02× (C) | E, M, C |
 | Meilisearch indexing, hackernews 1M docs | 0.99× | E |
-| Meilisearch hackernews incremental additions | 0.99× (M); **1.15×** on Graviton4 with 8 GiB, merge spans 2.1× (C, cause not yet separated) | M, C |
+| Meilisearch hackernews incremental additions | 0.99× (M); 1.03× on Graviton4 with 8 GiB, merge spans 2.1× (C, cause not yet separated) | M, C |
 | Meilisearch search, movies | 0.95× (E), 0.94× (M), 0.99× (C) | E, M, C |
 | Meilisearch search, hackernews | 1.01× | E |
 | hannoy build, 512 / 768 / 1536 dims | 0.84× / 0.84× / 0.89× (E); 0.94× / 0.95× / 0.97× (C) | E, C |
