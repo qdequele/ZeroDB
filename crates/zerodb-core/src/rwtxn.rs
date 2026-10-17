@@ -2790,27 +2790,76 @@ impl<'env> RwTxn<'env> {
             let leaf = LeafRef::new_prevalidated(frame, psize).map_err(corrupt)?;
             leaf_cell_used(&leaf, n_old - 1) + val.used(key.len()) <= body_size(psize)
         };
-        // `append` implies an end insert (the end-of-page rule, §6.4): the new
-        // cell ALONE forms the right page. Fast path: the left (dirty) frame
-        // is byte-identical to the pre-split page, so it is not touched at
-        // all — no extraction, no rewrite, no per-cell allocation.
-        if append || (newindx == n_old && !end_pair) {
+        // End split (§6.4) without repacking the left frame. APPEND, or a
+        // plain put whose pair does not fit: the new cell ALONE forms the
+        // right page and the left frame is not touched at all. A plain put:
+        // the old last cell moves to the right page first, removed from the
+        // left frame in place. On an ascending page that cell is the top of
+        // the cell heap, so removing it moves no other cell.
+        if append || newindx == n_old {
+            enum Moved {
+                Inline(Vec<u8>),
+                Big { head: u64, dsize: u32 },
+            }
+            let moved = if end_pair {
+                let frame = self.dirty.bytes_mut(lpg).expect("leaf is dirty");
+                let i = n_old - 1;
+                let (mkey, mflags, mval) = {
+                    let leaf = LeafRef::new_prevalidated(&*frame, psize).map_err(corrupt)?;
+                    // Preserve non-BIGDATA node flags (F_SUBDATA) across the
+                    // move (SPEC 02 §6); F_BIGDATA is re-derived on write.
+                    let flags = leaf.node_flags(i) & !crate::page::F_BIGDATA;
+                    let v = match leaf.value(i) {
+                        LeafValue::Inline(v) => Moved::Inline(v.to_vec()),
+                        LeafValue::Overflow { head_pgno, dsize } => Moved::Big {
+                            head: head_pgno,
+                            dsize,
+                        },
+                    };
+                    (leaf.key(i).to_vec(), flags, v)
+                };
+                LeafMut::from_valid(&mut *frame, psize)
+                    .map_err(corrupt)?
+                    .remove(i)
+                    .map_err(corrupt)?;
+                Some((mkey, mflags, mval))
+            } else {
+                None
+            };
             let rpg = self.allocate(1)?;
             {
                 let txnid = self.txnid;
                 let frame = self.dirty.insert_tree_frame(rpg);
                 let mut leaf = LeafMut::init(frame, psize, rpg, txnid).map_err(corrupt)?;
-                match &val {
-                    NewLeafVal::Inline(v) => leaf.insert_inline(0, key, node_flags, v),
-                    NewLeafVal::ZeroReserve(n) => {
-                        leaf.insert_inline_reserved(0, key, *n as u32).map(|_| ())
+                let slot = match &moved {
+                    Some((mkey, mflags, Moved::Inline(v))) => {
+                        leaf.insert_inline(0, mkey, *mflags, v).map_err(corrupt)?;
+                        1
                     }
-                    NewLeafVal::Big { head, dsize } => leaf.insert_bigdata(0, key, *dsize, *head),
+                    Some((mkey, _, Moved::Big { head, dsize })) => {
+                        leaf.insert_bigdata(0, mkey, *dsize, *head)
+                            .map_err(corrupt)?;
+                        1
+                    }
+                    None => 0,
+                };
+                match &val {
+                    NewLeafVal::Inline(v) => leaf.insert_inline(slot, key, node_flags, v),
+                    NewLeafVal::ZeroReserve(n) => leaf
+                        .insert_inline_reserved(slot, key, *n as u32)
+                        .map(|_| ()),
+                    NewLeafVal::Big { head, dsize } => {
+                        leaf.insert_bigdata(slot, key, *dsize, *head)
+                    }
                 }
                 .map_err(corrupt)?;
             }
             sat_add(&mut self.record_mut(tree).leaf_pages, 1);
-            let sep = key.to_vec(); // sep = first key of R = the new key (§6.4)
+            // sep = first key of R (§6.4): the moved old last key, or the new key.
+            let sep = match moved {
+                Some((mkey, _, _)) => mkey,
+                None => key.to_vec(),
+            };
             return if top == 0 {
                 self.insert_into_branch(tree, path, -1, 0, sep, rpg)
                     .map(|_| ())
@@ -2838,11 +2887,7 @@ impl<'env> RwTxn<'env> {
             });
         }
         let cap = body_size(psize);
-        let s = if end_pair {
-            n_old - 1
-        } else {
-            choose_split(&sizes, cap)
-        };
+        let s = choose_split(&sizes, cap);
         // sep = first key of R (§6.4).
         let sep = match s.cmp(&newindx) {
             Ordering::Less => oldleaf.key(s).to_vec(),
@@ -5408,19 +5453,11 @@ mod tests {
             let k = format!("a{i:04}").into_bytes();
             db.put(&mut txn, &k, b"stable-value").unwrap();
         }
-        // The first `z` puts land at the end of the leaf holding the `a` keys
-        // and split it, which rewrites it (§6.4). Measure after that split:
-        // from then on the leaf holding `a0000` is untouched.
-        let z = |i: u32| format!("z{i:04}").into_bytes();
-        let mut i = 0u32;
-        while txn.main_record().leaf_pages < 2 {
-            db.put(&mut txn, &z(i), &[0x22u8; 64]).unwrap();
-            i += 1;
-        }
         let addr_before = db.get(&txn, b"a0000").unwrap().unwrap().as_ptr() as usize;
         // Grow the dirty index with many later-subtree pages.
-        for i in i..600u32 {
-            db.put(&mut txn, &z(i), &[0x22u8; 64]).unwrap();
+        for i in 0..600u32 {
+            let k = format!("z{i:04}").into_bytes();
+            db.put(&mut txn, &k, &[0x22u8; 64]).unwrap();
         }
         let addr_after = db.get(&txn, b"a0000").unwrap().unwrap().as_ptr() as usize;
         assert_eq!(addr_before, addr_after, "frame moved under the index");
