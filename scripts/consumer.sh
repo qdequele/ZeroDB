@@ -68,27 +68,11 @@ ensure_clone() {
     fi
 }
 
-# Remove any previous patch block, then (if $1 = on) append a fresh one.
+# Patch heed to the shim ($1 = on), prepare a stock build ($1 = stock) or restore
+# the manifest ($1 = off); see scripts/patch-heed.py.
 set_patch() {
-    local manifest="$CLONE/Cargo.toml"
-    python3 - "$manifest" "$MARK_BEGIN" "$MARK_END" <<'EOF'
-import sys
-path, b, e = sys.argv[1:4]
-s = open(path).read()
-i, j = s.find(b), s.find(e)
-if i != -1 and j != -1:
-    s = s[:i].rstrip('\n') + '\n' + s[j + len(e):].lstrip('\n')
-open(path, 'w').write(s)
-EOF
-    if [ "$1" = on ]; then
-        cat >> "$manifest" <<EOF
-
-$MARK_BEGIN
-[patch.crates-io]
-heed = { path = "$ZERODB/crates/heed-shim" }
-$MARK_END
-EOF
-    fi
+    python3 "$ZERODB/scripts/patch-heed.py" "$CLONE/Cargo.toml" "$1" \
+        "$MARK_BEGIN" "$MARK_END" "$ZERODB/crates/heed-shim"
 }
 
 assert_no_lmdb() {
@@ -122,7 +106,7 @@ do_suites() {
 
 build_binary() { # $1 = lmdb | zerodb
     local out="$WORKDIR/bin/meilisearch-$1"
-    if [ "$1" = zerodb ]; then set_patch on; else set_patch off; fi
+    if [ "$1" = zerodb ]; then set_patch on; else set_patch stock; fi
     log "building meilisearch ($1) → $out"
     (cd "$CLONE" && cargo build --release -p meilisearch)
     if [ "$1" = zerodb ]; then assert_no_lmdb meilisearch; fi
@@ -150,8 +134,29 @@ port_teardown() {
     fi
 }
 
+# The xtask runner stops a server with `kill -TERM` and starts the next run
+# without waiting for that server to exit (its `kill_meili` returns once the
+# `kill` command does). A slow shutdown then still holds the port and the next
+# server fails with "Address already in use". The runner therefore starts each
+# server through this wrapper, which waits until nothing listens on the port.
+# The wait happens before the server starts, so no measured span includes it.
+write_port_wait_wrapper() { # $1 = lmdb | zerodb
+    local wrapper="$WORKDIR/bin/meilisearch-$1-wait-port"
+    cat > "$wrapper" <<EOF
+#!/usr/bin/env bash
+for _ in \$(seq 1 600); do
+    (exec 3<>/dev/tcp/127.0.0.1/$MEILI_PORT) 2>/dev/null || break
+    sleep 0.1
+done
+exec "$WORKDIR/bin/meilisearch-$1" "\$@"
+EOF
+    chmod +x "$wrapper"
+    echo "$wrapper"
+}
+
 run_bench() { # $1 = lmdb | zerodb, $2 = round
-    local bin="$WORKDIR/bin/meilisearch-$1"
+    local bin
+    bin="$(write_port_wait_wrapper "$1")"
     local reports="$WORKDIR/reports/$1"
     log "xtask bench ($1, round $2, port $MEILI_PORT): $WORKLOADS"
     # shellcheck disable=SC2086
