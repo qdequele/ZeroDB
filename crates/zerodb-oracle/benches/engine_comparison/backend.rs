@@ -44,11 +44,18 @@ macro_rules! bench_backend {
                     flags |= EnvFlags::NO_SYNC;
                 }
                 bench_backend!(@nolock flags, $setpage);
+                // `ZERODB_BENCH_WRITE_MAP=1` opens every env, LMDB's and
+                // zerodb's alike, with `WRITE_MAP`: the writable-map write
+                // path and its `msync` commit barriers (SPEC 06 REC-12).
+                if crate::backend::bench_knob("ZERODB_BENCH_WRITE_MAP") {
+                    flags |= EnvFlags::WRITE_MAP;
+                }
                 // SAFETY: single-process, private temp dir; the flags are
-                // NO_SYNC (durability, not a cross-process behavior) and, on
-                // the zerodb side with `ZERODB_BENCH_NO_LOCK=1`, NO_LOCK, whose
-                // contract (no other process opens the env) a private temp dir
-                // in one process meets.
+                // NO_SYNC and WRITE_MAP (durability and write path, not
+                // cross-process behaviors) and, on the zerodb side with
+                // `ZERODB_BENCH_NO_LOCK=1`, NO_LOCK, whose contract (no other
+                // process opens the env) a private temp dir in one process
+                // meets.
                 unsafe {
                     if flags != EnvFlags::empty() {
                         opts.flags(flags);

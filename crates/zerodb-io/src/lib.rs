@@ -355,8 +355,8 @@ impl Backing for WriteMapBacking {
     }
 
     fn ranged_sync(&self) -> bool {
-        // SPEC 06 REC-12: the commit barriers `msync` only the pages the
-        // commit wrote.
+        // SPEC 06 REC-12: the commit barriers `msync` the used prefix and
+        // the meta page, not the whole map.
         true
     }
 

@@ -273,8 +273,9 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
 - **Wider keys** — `get/key/k32`/`k128` 1.26–1.33× [E]; extending the integer
   compare to other key shapes is #15.
 - **`WRITE_MAP` follow-ups** (#13) — ZeroDB's in-place `WRITE_MAP` still
-  trails LMDB's by 1.34–1.42× on no-sync YCSB [M]. Open: ranged `msync` of
-  only the changed pages (#45, proposed in ADR-0026, not yet measured), prefault / preallocation of the map (#42), the
+  trails LMDB's by 1.34–1.42× on no-sync YCSB [M]. Durable commits now
+  `msync` the used prefix, as LMDB (#45, ADR-0026). Open: prefault /
+  preallocation of the map (#42), the
   Graviton A/B, and whether Meilisearch should set `WRITE_MAP`.
 - **Short read txns** — one read txn + one get is 1.55× [V]; reusing read txns
   is #25.

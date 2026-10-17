@@ -1,8 +1,7 @@
 # ADR-0026: Ranged `msync` for `WRITE_MAP` commits
 
-- Status: **Proposed** (2026-10-17). Implemented on the branch
-  `qdequele/writemap-ranged-msync` for review; AGENTS.md rule 5 requires
-  maintainer approval of this ADR before the change merges.
+- Status: **Accepted (Option B, maintainer, 2026-10-17)**. First proposed
+  with Option C; reworked to Option B before merge.
 - Related issue: #45 (follow-up list: #13)
 - Date: 2026-10-17
 
@@ -81,44 +80,75 @@ used-prefix `msync` covers them. Option C covers them only through the
 `fdatasync`: on Linux it writes back every dirty page of the file; on macOS
 it is not guaranteed to flush pages dirtied through another process's map.
 
-## Decision (proposed)
+## Decision
 
-Option C, as implemented on the branch, because it is what #45 asks for and
-the narrowest flush. The `fdatasync` is unchanged, so on Linux durability is
-unchanged in practice. The approver should weigh Option B: it is LMDB's own
-technique and has no cross-process residual.
+**Option B**, LMDB's technique (approved by the maintainer, 2026-10-17):
+
+- **C3** `msync`s the used prefix `[0, next_pgno)`, with `next_pgno` the
+  txn's high-water at commit. The prefix holds every page any snapshot up to
+  this commit can reference: this txn's frames and spilled pages, both meta
+  slots, and pages earlier commits wrote and never flushed (`NO_SYNC`, in
+  this process or another). Flushing the other meta slot keeps the REC-10
+  window under `NO_META_SYNC` bounded, as before.
+- **C5** `msync`s the meta slot C4 wrote.
+- The range start is rounded down to the OS page (POSIX `msync`).
+- The `fdatasync` after a synchronous barrier **stays on every platform**.
+  Dropping it on Linux, as LMDB does, would be a separate durability change
+  with its own ADR.
+- `Env::sync` / `force_sync` keep the whole-map flush.
+
+Why B over C: B is LMDB's own technique (rule 7), it needs no per-commit
+range building, and it has no cross-process residual. On a database that
+fills most of its map, B flushes about as much as the whole-map `msync`.
+The gain is on maps much larger than the data, which is how Meilisearch
+sizes its maps.
+
+Answers to the review questions:
+
+1. Option B.
+2. Keep the `fdatasync` on Linux.
+3. A win measured on macOS only is enough to merge. Linux is not expected to
+   move (see Context).
 
 ## Consequences
 
 - New `Backing` methods `ranged_sync()` (default `false`) and
   `sync_pages(async, psize, ranges)` (default: `sync`, a superset). Only
   `WriteMapBacking` and the fault wrapper override them. The default
-  backing's path is unchanged and builds no ranges.
+  backing's path is unchanged.
 - New `MmapWritable::flush_range` over memmap2's
   `flush_range`/`flush_async_range`. No new `unsafe`.
 - The fault backing models a ranged barrier strictly: it folds only the
   journaled bytes inside the exact requested page ranges, leaving the rest
   pending. The crash harness gets a tripwire that fails a `WRITE_MAP` cycle
-  whose synchronous barriers were never ranged. Under this model, dropping
-  spilled pages from the ranges gave 65 violations in 3,000 `WRITE_MAP`
-  image cycles; the shipped ranges gave none.
+  whose synchronous barriers were never ranged. The ranged-barrier tests
+  catch a shortened prefix: leaving out the meta slots, the last page, or
+  the upper half of the prefix each fails them.
+- The bench ladder gets a `ZERODB_BENCH_WRITE_MAP=1` switch, which opens
+  both engines' envs with `WRITE_MAP`.
 - SPEC 06 REC-12, SPEC 01 (`MDB_WRITEMAP` row, §S7) and SPEC 04 TXN-45b are
   updated.
-- Performance: not measured yet. Only durable `WRITE_MAP` commits run the
-  changed barriers (`NO_SYNC` skips them). The criterion ladder has durable
-  commit rungs (`commit/sync/n1`, `commit/sync/n100`) but no `WRITE_MAP`
-  switch (its `ZERODB_BENCH_*` options are `TIER`, `TRUST_FILE`,
-  `SEQUENTIAL_WRITES` and `NO_LOCK`). `WRITE_MAP` has been measured through
-  rust-storage-bench's durable YCSB `*-wm` runs. Measuring this change
-  needs either those runs, on a map much larger than the data, or a
-  `WRITE_MAP` switch on the `commit/sync/*` rungs.
+- Performance: see below.
 
-## Open questions for human review
+## Performance
 
-1. Option B or C? (See the cross-process residual.)
-2. Should Linux drop the `fdatasync` after a synchronous `msync`, as LMDB
-   does? That would halve the device flushes per durable `WRITE_MAP`
-   commit. It is a separate durability change and would make Option C's
-   ranges load-bearing on Linux.
-3. Is a measured win on macOS alone, a development platform, enough to merge
-   this?
+`scripts/bench-ab.sh` with `ZERODB_BENCH_WRITE_MAP=1`, 3 interleaved
+rounds, Apple M-series Mac. Before = `0d26fdf` (whole-map `msync`), after =
+this change. `commit/sync/n1_map16g` is `commit/sync/n1` on a 16 GiB map.
+
+| rung | LMDB | ZeroDB before | ZeroDB after | vs LMDB before → after | after ÷ before | verdict |
+|---|---:|---:|---:|---:|---:|---|
+| `commit/sync/n1` | 801.7 ms | 1.607 s | 1.530 s | 2.00× → 1.91× | 0.952 (±0.070) | flat |
+| `commit/sync/n100` | 843.0 ms | 1.564 s | 1.572 s | 1.85× → 1.87× | 1.006 (±0.085) | flat |
+| `commit/sync/n1_map16g` | 793.4 ms | 1.605 s | 1.486 s | 2.02× → 1.87× | 0.986 (±0.085) | flat |
+
+Every rung is flat. The whole-map `msync` did not cost more on a 16 GiB map
+than on a 1 GiB one (1.605 s against 1.607 s before the change), so on
+macOS the cost #45 describes is not visible at these sizes, and Linux was
+not expected to move. The change is kept for LMDB parity of the barrier
+ranges, with no measured speedup.
+
+The 2× gap to LMDB on these rungs is elsewhere. On macOS each durable
+ZeroDB `WRITE_MAP` commit issues two `fdatasync`s (after C3 and after C5);
+LMDB issues one, after its data `msync`, and none after the meta `msync`.
+That is the separate durability question this ADR leaves open.

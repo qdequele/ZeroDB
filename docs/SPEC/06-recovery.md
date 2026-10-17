@@ -1,7 +1,8 @@
 # SPEC 06 — Durability & recovery
 
 Revised 2026-10-17 — REC-12: the `WRITE_MAP` commit barriers are ranged
-`msync`s of the pages the commit wrote (issue #45, ADR-0026 — proposed).
+`msync`s, of the used prefix at C3 and of the meta page at C5, as LMDB's
+(issue #45, ADR-0026).
 
 Revised 2026-10-05 — docs sweep: format-v2 CRC offsets in REC-8/REC-22
 (ADR-0022), v1-store rejection noted at REC-1, REC-12 brought to the shipped
@@ -321,22 +322,20 @@ recovered) **except** where explicitly noted as FS-order-dependent.
   C3/C5 barriers are `msync`s instead of `fdatasync` over `pwrite`s. The
   **same ordering** as REC-7 applies: the C3 barrier MUST complete before the
   meta is written into the map (C4), followed by the C5 barrier.
-  **Ranged barriers (amended 2026-10-17, issue #45, ADR-0026 — proposed):**
-  the commit barriers `msync` only the pages the commit wrote
+  **Ranged barriers (amended 2026-10-17, issue #45, ADR-0026):** the commit
+  barriers `msync` only part of the map, as LMDB's do
   (`Backing::sync_pages`, `WriteMapBacking` → `MmapWritable::flush_range`):
-  - **C3** flushes every page the txn wrote — each dirty frame (an overflow
-    run counts its `n` pages; under TXN-45b the frame lives in the map) and
-    each page it spilled (SPEC 04 §6.3a) — plus **both meta slots** (pages 0
-    and 1). Flushing the other slot makes the previous commit's meta durable
-    here, as LMDB's `msync` of the used prefix `[0, next_pgno)` does; under
-    `NO_META_SYNC` this keeps the REC-10 window bounded by this commit's C3.
-    A page the txn wrote and then freed needs no flush (no meta references
-    it, TXN-62), so the frame and spilled sets at C3 are complete.
+  - **C3** flushes the used prefix `[0, next_pgno)`, `next_pgno` being the
+    txn's high-water at commit. It holds every page a meta up to this commit
+    can reference: the txn's dirty frames (under TXN-45b they live in the
+    map) and spilled pages (SPEC 04 §6.3a), pages earlier commits wrote and
+    left unflushed (`NO_SYNC`, in this process or another), and **both meta
+    slots** (pages 0 and 1). Flushing the other slot makes the previous
+    commit's meta durable here; under `NO_META_SYNC` this keeps the REC-10
+    window bounded by this commit's C3.
   - **C5** flushes the meta slot C4 wrote.
-  - Each range is a page multiple; its start is rounded down to the OS page
-    (POSIX `msync`), and ranges closer than 64 KiB (the largest OS page
-    ZeroDB targets) are merged into one call. Both only widen the flushed
-    region.
+  - A range's start is rounded down to the OS page (POSIX `msync`), which
+    only widens the flushed region.
   - A synchronous barrier is still followed by an `fdatasync` of the data fd
     on every platform (`msync` alone is not a durability barrier on macOS).
     On Linux that `fdatasync` writes back every dirty page of the file, so

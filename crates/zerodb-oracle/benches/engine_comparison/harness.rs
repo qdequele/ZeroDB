@@ -140,8 +140,18 @@ impl<B: Backend> Fixture<B> {
 
     /// Build an empty single-DB fixture (for rungs that time the first write).
     pub fn empty(page: u32, name: Option<&str>, no_sync: bool) -> Fixture<B> {
+        Self::empty_with_map(page, name, no_sync, MAP)
+    }
+
+    /// [`Fixture::empty`] with a `map_size`-byte map instead of [`MAP`].
+    pub fn empty_with_map(
+        page: u32,
+        name: Option<&str>,
+        no_sync: bool,
+        map_size: usize,
+    ) -> Fixture<B> {
         let dir = TempDir::new().expect("tempdir");
-        let env = B::open(dir.path(), MAP, no_sync, page);
+        let env = B::open(dir.path(), map_size, no_sync, page);
         let db = B::create_db(&env, name);
         Fixture {
             env,

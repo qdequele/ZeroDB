@@ -59,8 +59,8 @@
 //!
 //! ## Ranged barriers (SPEC 06 REC-12)
 //!
-//! Under `WRITE_MAP` the commit barriers are ranged: C3 flushes the pages
-//! the txn wrote plus both meta slots, C5 the meta slot it wrote. This
+//! Under `WRITE_MAP` the commit barriers are ranged: C3 flushes the used
+//! prefix `[0, next_pgno)`, C5 the meta slot C4 wrote. This
 //! wrapper forwards `Backing::ranged_sync`, and a synchronous
 //! `sync_pages` folds only the pending bytes inside the requested page
 //! ranges — exactly those, not widened to OS pages — leaving the rest

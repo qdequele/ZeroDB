@@ -2,9 +2,10 @@
 //! writes is covered by the `msync` ranges its barriers flush.
 //!
 //! Under `WRITE_MAP` the commit pipeline no longer flushes the whole map: C3
-//! flushes the pages the txn wrote (its dirty frames, in the map, and its
-//! spilled pages) plus both meta slots, and C5 the meta slot C4 wrote. A page
-//! missing from those ranges would be a silent durability bug: the commit
+//! flushes the used prefix `[0, next_pgno)` (as LMDB does), which holds the
+//! txn's dirty frames, in the map, its spilled pages and both meta slots, and
+//! C5 the meta slot C4 wrote. A page missing from those ranges would be a
+//! silent durability bug: the commit
 //! returns `Ok`, but a power cut can lose the page while the durable meta
 //! references it.
 //!

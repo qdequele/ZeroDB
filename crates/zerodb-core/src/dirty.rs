@@ -370,13 +370,6 @@ impl<'env> DirtyStore<'env> {
             .map(move |(&p, f)| (p, (f.len() / ps) as u64))
     }
 
-    /// Every spilled pgno as `(pgno, pages)` (a run head counts its `n`
-    /// pages): the pages this txn already wrote to the file, which the
-    /// ranged commit barrier must cover alongside the frames (SPEC 06 REC-12).
-    pub fn spilled_extents(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
-        self.spilled.iter().map(|(&p, &n)| (p, n))
-    }
-
     /// Record that `pgno`'s frame has been written to the file and release it
     /// (SPEC 04 TXN-69): the frame goes to the spare pool (or is dropped) and
     /// `pgno` becomes spilled. The caller must have written the frame's

@@ -273,7 +273,7 @@ pub trait Backing: Send + Sync {
     /// Whether [`Backing::sync_pages`] flushes only the page ranges it is
     /// given (SPEC 06 REC-12, ranged `WRITE_MAP` barrier). `true` only for
     /// the writable-map backing, whose barrier is an `msync` and can be
-    /// limited to the pages a commit wrote. Default `false`: the commit
+    /// limited to the file's used prefix. Default `false`: the commit
     /// pipeline then calls [`Backing::sync`] and skips building the ranges.
     fn ranged_sync(&self) -> bool {
         false
@@ -283,8 +283,8 @@ pub trait Backing: Send + Sync {
     /// at least every byte of the `pages`-page runs starting at each
     /// `start_pgno` of `ranges` (`(start_pgno, pages)`, ascending and
     /// non-overlapping). The commit pipeline calls it only when
-    /// [`Backing::ranged_sync`] is `true`, with every page the txn wrote at
-    /// C3 (plus both meta slots) and the meta slot it wrote at C5.
+    /// [`Backing::ranged_sync`] is `true`, with the used prefix
+    /// `[0, next_pgno)` at C3 and the meta slot it wrote at C5.
     /// `async_flush` has the meaning it has for [`Backing::sync`].
     ///
     /// The default ignores `ranges` and calls [`Backing::sync`], which

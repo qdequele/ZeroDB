@@ -220,25 +220,6 @@ fn merge_sorted_unique(a: &[u64], b: &[u64]) -> Vec<u64> {
     out
 }
 
-/// Sort page extents `(start_pgno, pages)` and merge the ones that overlap or
-/// touch, giving the ascending, non-overlapping ranges of the ranged commit
-/// barrier (SPEC 06 REC-12). Empty extents are dropped. The union of the
-/// output is exactly the union of the input.
-fn coalesce_page_ranges(mut extents: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
-    extents.retain(|&(_, n)| n > 0);
-    extents.sort_unstable_by_key(|&(p, _)| p);
-    let mut out: Vec<(u64, u64)> = Vec::with_capacity(extents.len());
-    for (p, n) in extents {
-        match out.last_mut() {
-            Some((start, len)) if p <= *start + *len => {
-                *len = (*len).max(p + n - *start);
-            }
-            _ => out.push((p, n)),
-        }
-    }
-    out
-}
-
 /// A root-to-leaf descent path: `(pgno, ki)` per level (SPEC 03 §1 cursor
 /// shape). `ki` is the chosen child index on branches and the entry/insertion
 /// slot on the leaf.
@@ -1804,21 +1785,6 @@ impl<'env> RwTxn<'env> {
             backing.write_pages_at(run_start, psize, &run)?;
         }
         Ok(())
-    }
-
-    /// The page ranges the ranged C3 barrier flushes (SPEC 06 REC-12), as
-    /// ascending, non-overlapping `(start_pgno, pages)`: both meta slots,
-    /// every frame (an overflow run counts its `n` pages) and every spilled
-    /// page. These are all the pages this txn wrote: a dirty page lives in
-    /// exactly one of the frame and spilled sets until it is freed, and a
-    /// freed page is referenced by no meta (SPEC 04 TXN-62).
-    fn commit_ranges(&self) -> Vec<(u64, u64)> {
-        let mut extents: Vec<(u64, u64)> =
-            Vec::with_capacity(1 + self.dirty.frame_extents().size_hint().0);
-        extents.push((0, 2));
-        extents.extend(self.dirty.frame_extents());
-        extents.extend(self.dirty.spilled_extents());
-        coalesce_page_ranges(extents)
     }
 
     /// The spill check (SPEC 04 TXN-68): spill if the dirty set is within
@@ -4536,17 +4502,18 @@ impl<'env> RwTxn<'env> {
         // ----- C3: fsync(data) — MUST complete before C4 (REC-7). Skipped
         // under NO_SYNC/MAP_ASYNC-none (SPEC 06 REC-9): the pages are written
         // (C2) but not made durable this commit. -----
-        // Under WRITE_MAP the barrier is a ranged `msync` (SPEC 06 REC-12):
-        // every page this txn wrote — its frames (in the map or written at
-        // C2) and its spilled pages — plus both meta slots, so the previous
-        // commit's meta is flushed here as LMDB's `msync` of the used prefix
-        // does (the REC-10 window bound under `NO_META_SYNC`).
+        // Under WRITE_MAP the barrier is a ranged `msync` (SPEC 06 REC-12) of
+        // the used prefix `[0, next_pgno)`, as LMDB's: every page any snapshot
+        // up to this one can reference, which includes both meta slots (the
+        // previous commit's meta is flushed here, the REC-10 window bound
+        // under `NO_META_SYNC`) and pages earlier commits wrote under
+        // `NO_SYNC`, in this process or another.
         let ranged = inner.backing_ref().ranged_sync();
         if sync_data {
             let res = if ranged {
                 inner
                     .backing_ref()
-                    .sync_pages(async_flush, psize, &self.commit_ranges())
+                    .sync_pages(async_flush, psize, &[(0, self.next_pgno)])
             } else {
                 inner.backing_ref().sync(async_flush)
             };
@@ -5314,42 +5281,6 @@ mod tests {
 
     const PS: u32 = 4096;
     const MAP: u64 = 1 << 20;
-
-    /// SPEC 06 REC-12: the ranged barrier's ranges are ascending, disjoint,
-    /// and cover exactly the input pages — overlapping and touching extents
-    /// merge, gaps stay, overflow runs keep their length.
-    #[test]
-    fn coalesce_page_ranges_merges_and_covers_exactly() {
-        assert_eq!(coalesce_page_ranges(vec![]), vec![]);
-        assert_eq!(
-            coalesce_page_ranges(vec![(9, 1), (0, 2), (2, 1), (5, 3), (6, 1), (12, 0)]),
-            vec![(0, 3), (5, 3), (9, 1)]
-        );
-        // A run swallowing a later single page, then a touching page.
-        assert_eq!(
-            coalesce_page_ranges(vec![(10, 4), (11, 1), (14, 1), (20, 2)]),
-            vec![(10, 5), (20, 2)]
-        );
-        // Exhaustive coverage check on a pseudo-random extent set.
-        let mut x = 0x9E37_79B9_7F4A_7C15u64;
-        let mut extents = Vec::new();
-        for _ in 0..500 {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            extents.push((x % 2000, 1 + (x >> 32) % 4));
-        }
-        let ranges = coalesce_page_ranges(extents.clone());
-        assert!(
-            ranges.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0),
-            "ranges ascend with gaps between them"
-        );
-        let covered = |pg: u64| ranges.iter().any(|&(p, n)| pg >= p && pg < p + n);
-        let input = |pg: u64| extents.iter().any(|&(p, n)| pg >= p && pg < p + n);
-        for pg in 0..2100 {
-            assert_eq!(covered(pg), input(pg), "page {pg}");
-        }
-    }
 
     #[test]
     fn find_run_picks_deterministically() {
