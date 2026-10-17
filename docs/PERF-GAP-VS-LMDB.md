@@ -320,6 +320,55 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
   parity with LMDB: 36.4 µs per open against LMDB's 37.8 µs (issue #94,
   [G2]).
 
+## Deliberate — keep, do not optimize
+
+During the broader performance investigation, several well-known
+storage-engine techniques were evaluated for ZeroDB's design and explicitly
+rejected. Each entry states the technique and the specific reason it does not
+fit ZeroDB, so a future contributor does not re-propose one of these and
+re-derive the same conclusion from scratch.
+
+- **`O_DIRECT` commit writes** — a Linux flag that makes writes bypass the OS
+  page cache. Incompatible with ZeroDB's read path, which maps the file with
+  `MAP_SHARED` and reads straight out of the page cache: Linux does not
+  guarantee invalidating already-mapped pages when a file is written with
+  `O_DIRECT`, so readers could see stale data. The "double buffering" problem
+  `O_DIRECT` normally avoids — one copy in the application's write buffer, one
+  in the page cache — doesn't exist here, because the mmap'd pages are the
+  same page-cache pages the write call fills.
+- **Bε-trees / buffered writes** — buffering writes in internal nodes and
+  flushing them down in batches (as in BetrFS/TokuDB) to turn random writes
+  into sequential ones. This would force every read to merge in pending
+  buffered writes, destroying the zero-copy reads mmap currently gives and
+  adding read latency. `milli`'s workload is read-bound, so this trade is
+  wrong for ZeroDB's main consumer.
+- **Per-page compression** — the two dominant value types ZeroDB stores don't
+  compress well: Roaring-bitmap-encoded document ID sets and float32 vectors
+  for `hannoy`'s HNSW index. It would also require a buffer pool (a scratch
+  area to decompress into) that ZeroDB doesn't have yet.
+- **A hash-table sub-database type** — an alternative to the B+tree, for O(1)
+  lookup. The actual cost of walking down the tree has already been sharply
+  reduced by other read-path fixes landed in this repo (per-transaction
+  caching of resolved records and validated pages). A hash table would make
+  the real remaining costs — page faults and memory locality — worse, and
+  would lose ordered iteration, which both `milli` and `hannoy` rely on for
+  range scans.
+- **Bloom filter sidecars** — a probabilistic structure some engines use to
+  skip lookups for keys that don't exist. `milli` already gates word
+  existence with its own FSTs (finite-state transducers used for fast
+  prefix/existence lookups) before ever touching the store, so a bloom filter
+  would be redundant — and keeping one transactionally consistent under MVCC
+  costs more than it saves.
+- **Pointer swizzling** — replacing on-disk page IDs with in-memory pointers
+  once a page is loaded, used by buffer-pool engines like LeanStore's
+  `vmcache`. ZeroDB's mapped pages are immutable, shared, and already have
+  stable addresses via mmap — exactly the property swizzling exists to
+  provide, and ZeroDB gets it for free from the OS.
+- **`MDB_FIXEDMAP`** — an LMDB flag that maps the database at a fixed virtual
+  address instead of letting the OS choose. Experimental and unstable
+  upstream, fights address-space-layout randomization, doesn't handle file
+  resizes cleanly, and no consumer needs it.
+
 ## Former item codes
 
 Older ADRs, specs, bench reports and the perf ledger cite this page by item
