@@ -1710,8 +1710,14 @@ the LMDB fork returns, except DBI-9 (divergence D-026). They are pinned by
   first-opening one name share the slot (DBI-3), which is published when
   either commits; LMDB frees it when the first ends, and the handle the
   second committed gets `MDB_BAD_DBI` in later txns.
-- **DBI-10 (cost)** — A check is lock-free when the txn's memo for the slot
-  holds the current epoch and the slot's generation matches: four `Acquire`
-  loads (the memo table, the epoch, the memo entry, the generation). Otherwise it takes the table lock once and memoizes a valid verdict.
-  Slots past 256 are always checked under the lock. A read txn's begin loads
-  the epoch; its end takes the lock only if it opened a database.
+- **DBI-10 (cost)** — A check is lock-free when the txn's memo cell for the
+  slot holds the current epoch and the handle's generation. The cell is
+  written only under the table lock and read as a seqlock (epoch, generation,
+  epoch again), so a reader never pairs one write's generation with another's
+  epoch (loom model `loom_memo_cell_never_mixes_two_writes`). A read txn keeps
+  the cell beside its record memo for the slot, so a named read looks the
+  slot up once. Otherwise the check takes the table lock once and memoizes a
+  valid verdict. Slots past 256 are always checked under the lock. A txn's
+  handle state is two words and one lazily allocated box, allocated only by a
+  txn that opens or removes a database, or a write or nested read txn that
+  checks one; a read txn's end takes the lock only if it opened a database.

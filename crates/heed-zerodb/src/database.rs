@@ -70,14 +70,12 @@ fn check_read_key(kb: &[u8]) -> Result<()> {
 /// monomorphizes over the concrete `zerodb` txn type (all `TxnRead`).
 macro_rules! with_read {
     // Database operation: check the handle/txn environment pairing first.
-    // Then the handle's validity in this txn (ADR-0024): `EINVAL` or
-    // `MDB_BAD_DBI` before any work, as LMDB returns them.
+    // The handle's validity in this txn (ADR-0024) is checked by every
+    // fallible engine read itself; the iterator constructors, whose engine
+    // calls defer the error, check it first (`check_handle`).
     ($db:expr, $txn:expr, |$t:ident| $e:expr) => {{
         $db.assert_env($txn);
-        with_read!($txn, |$t| {
-            zerodb::TxnRead::check_db($t, &$db.inner)?;
-            $e
-        })
+        with_read!($txn, |$t| $e)
     }};
     ($txn:expr, |$t:ident| $e:expr) => {
         match &$txn.inner {
@@ -373,6 +371,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// Infallible construction; returns [`Result`] for heed shape.
     pub fn iter<'txn>(&self, txn: &'txn RoTxn) -> Result<RoIter<'txn, KC, DC>> {
+        self.check_handle(txn)?;
         Ok(RoIter::new(with_read!(self, txn, |t| self.inner.iter(t))))
     }
 
@@ -382,6 +381,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// As [`Database::iter`].
     pub fn rev_iter<'txn>(&self, txn: &'txn RoTxn) -> Result<RoRevIter<'txn, KC, DC>> {
+        self.check_handle(txn)?;
         Ok(RoRevIter::new(with_read!(self, txn, |t| self
             .inner
             .rev_iter(t))))
@@ -403,6 +403,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
         let (lo, hi) = (as_bound(&lo), as_bound(&hi));
+        self.check_handle(txn)?;
         Ok(RoRange::new(with_read!(self, txn, |t| self
             .inner
             .range(t, lo, hi))))
@@ -424,6 +425,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
         let (lo, hi) = (as_bound(&lo), as_bound(&hi));
+        self.check_handle(txn)?;
         Ok(RoRevRange::new(with_read!(self, txn, |t| self
             .inner
             .rev_range(t, lo, hi))))
@@ -445,6 +447,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
         check_read_key(&pb)?;
+        self.check_handle(txn)?;
         Ok(RoPrefix::new(with_read!(self, txn, |t| self
             .inner
             .prefix_iter(t, &pb))))
@@ -465,6 +468,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         C: LexicographicComparator,
     {
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
+        self.check_handle(txn)?;
         Ok(RoRevPrefix::new(with_read!(self, txn, |t| self
             .inner
             .rev_prefix_iter(t, &pb))))

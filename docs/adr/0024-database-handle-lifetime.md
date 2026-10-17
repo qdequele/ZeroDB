@@ -211,20 +211,17 @@ removes and re-creates databases under a long read.
 
 ### Cost
 
-Each check is four `Acquire` loads in the common case:
-- the transaction's memo table (a `OnceLock`);
-- the epoch;
-- the transaction's memo for the slot, which holds the epoch of its last
-  successful check;
-- the slot's generation.
+A check is lock-free in the common case: the transaction's memo cell for the
+slot holds the epoch of its last valid verdict and the generation it was for.
+The cell is written under the table lock and read as a seqlock, checked by a
+loom model. A read txn keeps the cell beside its record memo, so a named read
+looks its slot up once. The table lock is taken once per slot after a slot
+change. Per-transaction state is two words plus a box allocated only by a
+transaction that opens or removes a database.
 
-The table lock is taken only when the memo is stale, which happens once per
-slot after a slot change. The memo is sized like the record memo
-(`DENSE_DBI_LIMIT`). The record memo is keyed by generation as well, since a
-slot can now change name.
-
-Transactions get an owner id only when they open a database, so read-txn
-begin gains one load (the epoch) and no shared write.
+Measured on an Apple Silicon Mac against the commit before the change, three
+interleaved rounds, with LMDB as the drift control: the numbers are in the
+implementation PR.
 
 ### Divergence D-026 (stricter than LMDB)
 

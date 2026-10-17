@@ -16,7 +16,7 @@
 //! verdict it memoized for a slot still holds.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use crate::error::{Error, MdbError, Result};
@@ -83,9 +83,6 @@ pub struct HandleTable {
     table: Mutex<Table>,
     /// Bumped, under the table lock, on every slot change.
     epoch: AtomicU64,
-    /// Slot → generation for the slots below [`DENSE_SLOT_LIMIT`], read by
-    /// the lock-free check and written under the table lock.
-    generations: Box<[AtomicU32]>,
     /// The catalog capacity (`max_dbs`): the number of slots.
     max_dbs: u32,
 }
@@ -100,11 +97,68 @@ pub struct TxnHandles {
     /// The owner id, assigned on the transaction's first open or remove; 0
     /// until then. Written under the table lock.
     owner: AtomicU64,
+    /// What only a transaction that opens or removes a database, or a write
+    /// or nested read txn that checks one, needs; most read txns never
+    /// allocate it.
+    rare: OnceLock<Box<Rare>>,
+}
+
+#[derive(Debug, Default)]
+struct Rare {
     /// `(slot, inc)` of every slot instance this transaction opened.
     opened: Mutex<Vec<(u32, u64)>>,
     /// Slot → `epoch + 1` of the last check that found the slot's current
     /// generation valid here; 0 = none. Allocated on the first such check.
-    memo: OnceLock<Box<[AtomicU64]>>,
+    /// Read txns keep theirs beside their record memo instead
+    /// ([`HandleTable::check_with`]).
+    memo: OnceLock<Box<[MemoCell]>>,
+}
+
+/// One slot's memo of a valid check: the epoch it held at and the handle
+/// generation it was for (ADR-0024; SPEC 04 DBI-10). Written only under the
+/// table lock, read lock-free.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct MemoCell {
+    /// `epoch + 1` of the verdict; 0 = none.
+    epoch: crate::sync::AtomicU64,
+    generation: crate::sync::AtomicU32,
+}
+
+impl Default for MemoCell {
+    fn default() -> MemoCell {
+        MemoCell {
+            epoch: crate::sync::AtomicU64::new(0),
+            generation: crate::sync::AtomicU32::new(0),
+        }
+    }
+}
+
+impl MemoCell {
+    /// Whether a handle of `generation` was found valid at epoch `e`.
+    #[inline]
+    fn holds(&self, e: u64, generation: u32) -> bool {
+        // A seqlock read of the pair: `set` clears `epoch`, writes the
+        // generation, then writes `epoch`. Epochs only grow, so a rewrite
+        // never brings an old value back: the same `e + 1` before and after
+        // the generation load means that generation was written with it.
+        // Acquire (all three): pair with `set`'s Release stores, and keep
+        // the second epoch load after the generation load.
+        self.epoch.load(crate::sync::Ordering::Acquire) == e + 1
+            && self.generation.load(crate::sync::Ordering::Acquire) == generation
+            && self.epoch.load(crate::sync::Ordering::Acquire) == e + 1
+    }
+
+    /// Record a valid verdict for `generation` at epoch `e`. Called with the
+    /// table lock held, so writers never interleave.
+    fn set(&self, e: u64, generation: u32) {
+        // Release (all three): pair with `holds`' Acquire loads. The clear is
+        // ordered before the generation store by that store's Release.
+        self.epoch.store(0, crate::sync::Ordering::Release);
+        self.generation
+            .store(generation, crate::sync::Ordering::Release);
+        self.epoch.store(e + 1, crate::sync::Ordering::Release);
+    }
 }
 
 impl TxnHandles {
@@ -113,12 +167,25 @@ impl TxnHandles {
     pub(crate) fn is_idle(&mut self) -> bool {
         *self.owner.get_mut() == 0
     }
+
+    fn rare(&self) -> &Rare {
+        self.rare.get_or_init(Box::default)
+    }
+
+    /// Whether this transaction opened instance `inc` of `slot`.
+    fn has_opened(&self, slot: u32, inc: u64) -> bool {
+        self.rare.get().is_some_and(|r| {
+            r.opened
+                .lock()
+                .expect("opened list poisoned")
+                .contains(&(slot, inc))
+        })
+    }
 }
 
 impl HandleTable {
     /// An empty table for `max_dbs` named databases.
     pub(crate) fn new(max_dbs: u32) -> HandleTable {
-        let dense = max_dbs.min(DENSE_SLOT_LIMIT);
         HandleTable {
             table: Mutex::new(Table {
                 slots: Vec::new(),
@@ -126,7 +193,6 @@ impl HandleTable {
                 next_owner: 1,
             }),
             epoch: AtomicU64::new(0),
-            generations: (0..dense).map(|_| AtomicU32::new(0)).collect(),
             max_dbs,
         }
     }
@@ -142,8 +208,7 @@ impl HandleTable {
             // this load is seen published by this transaction's checks.
             begin: self.epoch.load(Ordering::Acquire),
             owner: AtomicU64::new(0),
-            opened: Mutex::new(Vec::new()),
-            memo: OnceLock::new(),
+            rare: OnceLock::new(),
         }
     }
 
@@ -193,7 +258,7 @@ impl HandleTable {
         let mut guard = self.lock();
         let t = &mut *guard;
         let owner = Self::owner_of(t, txn);
-        let mut opened = txn.opened.lock().expect("opened list poisoned");
+        let mut opened = txn.rare().opened.lock().expect("opened list poisoned");
         if let Some(&i) = t.by_name.get(name) {
             self.bump(t);
             let s = &mut t.slots[i as usize];
@@ -228,10 +293,6 @@ impl HandleTable {
                 s.generation = s.generation.wrapping_add(1);
                 s.inc += 1;
                 s.state = State::Pending(vec![owner]);
-                if let Some(g) = self.generations.get(i) {
-                    // Release: pairs with the Acquire load in `check`.
-                    g.store(s.generation, Ordering::Release);
-                }
                 i
             }
             None => {
@@ -266,7 +327,7 @@ impl HandleTable {
         let t = &mut *guard;
         // Relaxed: written under the table lock, which is held.
         let owner = txn.owner.load(Ordering::Relaxed);
-        let mut opened = txn.opened.lock().expect("opened list poisoned");
+        let mut opened = txn.rare().opened.lock().expect("opened list poisoned");
         let e = self.bump(t);
         let Some(s) = t.slots.get_mut(slot as usize) else {
             return;
@@ -311,7 +372,10 @@ impl HandleTable {
     /// with none. Takes `&mut` (every caller is a commit or a drop), so a
     /// transaction that opened nothing returns without touching the lock.
     pub(crate) fn end(&self, txn: &mut TxnHandles, committed: bool) {
-        let opened = std::mem::take(txn.opened.get_mut().expect("opened list poisoned"));
+        let Some(rare) = txn.rare.get_mut() else {
+            return;
+        };
+        let opened = std::mem::take(rare.opened.get_mut().expect("opened list poisoned"));
         if opened.is_empty() {
             return;
         }
@@ -344,6 +408,7 @@ impl HandleTable {
     /// # Errors
     ///
     /// `Error::Io` with raw OS error `EINVAL` (22), or [`MdbError::BadDbi`].
+    #[inline]
     pub(crate) fn check(
         &self,
         txn: &TxnHandles,
@@ -351,19 +416,53 @@ impl HandleTable {
         slot: u32,
         generation: u32,
     ) -> Result<()> {
-        if let (Some(memo), Some(g)) = (txn.memo.get(), self.generations.get(slot as usize)) {
-            // Acquire: pairs with `bump`'s Release. The same epoch as when the
-            // memo was written means no slot has changed since.
-            let e = self.epoch.load(Ordering::Acquire);
-            // Acquire: pairs with the Release store in `check_locked`.
-            if memo[slot as usize].load(Ordering::Acquire) == e + 1
-                // Acquire: pairs with the Release store in `open`.
-                && g.load(Ordering::Acquire) == generation
-            {
+        if let Some(cell) = txn
+            .rare
+            .get()
+            .and_then(|r| r.memo.get())
+            .and_then(|m| m.get(slot as usize))
+        {
+            if cell.holds(self.epoch(), generation) {
                 return Ok(());
             }
         }
-        self.check_locked(txn, parent, slot, generation)
+        self.check_locked(txn, parent, slot, generation, |epoch| {
+            let memo = txn.rare().memo.get_or_init(|| {
+                (0..self.max_dbs.min(DENSE_SLOT_LIMIT))
+                    .map(|_| MemoCell::default())
+                    .collect()
+            });
+            if let Some(m) = memo.get(slot as usize) {
+                m.set(epoch, generation);
+            }
+        })
+    }
+
+    /// [`HandleTable::check`] with the memo cell supplied by the caller: a
+    /// read txn keeps it beside its record memo for the slot, so a check
+    /// costs no lookup of its own.
+    #[inline]
+    pub(crate) fn check_with(
+        &self,
+        txn: &TxnHandles,
+        slot: u32,
+        generation: u32,
+        cell: &MemoCell,
+    ) -> Result<()> {
+        if cell.holds(self.epoch(), generation) {
+            return Ok(());
+        }
+        self.check_locked(txn, None, slot, generation, |epoch| {
+            cell.set(epoch, generation);
+        })
+    }
+
+    /// The current epoch.
+    #[inline]
+    fn epoch(&self) -> u64 {
+        // Acquire: pairs with `bump`'s Release. The same epoch as when a memo
+        // was written means no slot has changed since.
+        self.epoch.load(Ordering::Acquire)
     }
 
     #[cold]
@@ -373,6 +472,7 @@ impl HandleTable {
         parent: Option<&TxnHandles>,
         slot: u32,
         generation: u32,
+        on_valid: impl FnOnce(u64),
     ) -> Result<()> {
         let t = self.lock();
         let Some(s) = t.slots.get(slot as usize) else {
@@ -391,17 +491,9 @@ impl HandleTable {
             }
         }
         if verdict.is_ok() && slot < DENSE_SLOT_LIMIT {
-            let memo = txn.memo.get_or_init(|| {
-                (0..self.generations.len())
-                    .map(|_| AtomicU64::new(0))
-                    .collect()
-            });
-            if let Some(m) = memo.get(slot as usize) {
-                // Relaxed load: the epoch only changes under the lock, held.
-                let e = self.epoch.load(Ordering::Relaxed);
-                // Release: pairs with the Acquire load in `check`.
-                m.store(e + 1, Ordering::Release);
-            }
+            // Memoized under the lock, at the epoch the verdict holds for.
+            // Relaxed load: the epoch only changes under the lock, held.
+            on_valid(self.epoch.load(Ordering::Relaxed));
         }
         verdict
     }
@@ -409,11 +501,7 @@ impl HandleTable {
     /// Rules 2–6 for one transaction.
     fn verdict(s: &Slot, slot: u32, txn: &TxnHandles) -> Result<()> {
         let free = matches!(s.state, State::Free);
-        let opened = txn
-            .opened
-            .lock()
-            .expect("opened list poisoned")
-            .contains(&(slot, s.inc));
+        let opened = txn.has_opened(slot, s.inc);
         // Rule 2: this transaction opened the slot's current instance.
         if opened && !free {
             return Ok(());
@@ -596,5 +684,35 @@ mod tests {
         let w = h.begin();
         h.remove(&w, s, g);
         assert!(is_bad_dbi(h.check(&r, None, s, g)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// loom: the MemoCell seqlock (run via `just loom`, tests filtered `loom_`).
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::MemoCell;
+    use loom::thread;
+    use std::sync::Arc;
+
+    /// A reader racing a rewrite from (epoch 1, generation 7) to (epoch 2,
+    /// generation 8) must never see generation 8 paired with epoch 1, nor
+    /// generation 7 with epoch 2.
+    #[test]
+    fn loom_memo_cell_never_mixes_two_writes() {
+        loom::model(|| {
+            let c = Arc::new(MemoCell::default());
+            c.set(1, 7);
+            let w = {
+                let c = Arc::clone(&c);
+                thread::spawn(move || c.set(2, 8))
+            };
+            assert!(!c.holds(1, 8));
+            assert!(!c.holds(2, 7));
+            w.join().unwrap();
+            assert!(c.holds(2, 8));
+        });
     }
 }

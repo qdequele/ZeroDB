@@ -35,7 +35,7 @@ use crate::builder::StreamBuildError;
 use crate::cmp::KeyCmp;
 use crate::env::{Env, Snapshot};
 use crate::error::{Error, MdbError, Result};
-use crate::handles::{HandleTable, TxnHandles};
+use crate::handles::{HandleTable, MemoCell, TxnHandles};
 use crate::page::{DBRecord, PageError, F_SUBDATA};
 use std::cmp::Ordering;
 
@@ -79,6 +79,7 @@ pub trait TxnRead {
     /// `Error::Io` with raw OS error `EINVAL` (22) for a handle that is not
     /// valid here; [`MdbError::BadDbi`] for one that was valid when this
     /// transaction began and whose database was removed since.
+    #[inline]
     fn check_db(&self, db: &Database) -> Result<()> {
         match db.sel {
             DbSel::Main => Ok(()),
@@ -201,7 +202,7 @@ pub struct RoTxn<'env> {
     /// `named_memo` (a locked `Vec` scan) serves only dbis past that cap, so a
     /// huge `max_dbs` never costs a huge per-txn allocation. Both keep
     /// `RoTxn` auto-`Sync`.
-    named_dense: OnceLock<Box<[OnceLock<GenRecord>]>>,
+    named_dense: OnceLock<Box<[NamedEntry]>>,
     named_memo: Mutex<Vec<(u32, u32, DBRecord)>>,
     /// This transaction's state in the env's slot table (ADR-0024).
     handles: TxnHandles,
@@ -252,6 +253,20 @@ impl RoTxn<'_> {
         self.env_ref().ident()
     }
 
+    /// The dense memo entry for named DB `dbi`, allocating the table on the
+    /// first named access; `None` past [`DENSE_DBI_LIMIT`].
+    #[inline]
+    fn dense_entry(&self, dbi: u32) -> Option<&NamedEntry> {
+        if dbi >= DENSE_DBI_LIMIT {
+            return None;
+        }
+        let table = self.named_dense.get_or_init(|| {
+            let n = self.env_ref().inner().max_dbs().min(DENSE_DBI_LIMIT);
+            (0..n).map(|_| NamedEntry::default()).collect()
+        });
+        table.get(dbi as usize)
+    }
+
     /// End this txn in the slot table (ADR-0024): publish what it opened on
     /// a commit, free it otherwise. A txn that opened nothing returns at once.
     fn end_handles(&mut self, committed: bool) {
@@ -287,6 +302,15 @@ impl RoTxn<'_> {
 
 /// A memoized named-DB record and the slot generation it was resolved for.
 type GenRecord = (u32, DBRecord);
+
+/// One slot of [`RoTxn`]'s dense memo: the resolved record, and the handle
+/// check's memo cell (ADR-0024, [`HandleTable::check_with`]), kept together so
+/// a read touches one table.
+#[derive(Default)]
+struct NamedEntry {
+    rec: OnceLock<GenRecord>,
+    checked: MemoCell,
+}
 
 /// Dbis below this get [`RoTxn`]'s lock-free record table (see
 /// `named_dense`). Meilisearch opens ~30 named DBs per env and hannoy a
@@ -342,25 +366,19 @@ impl TxnRead for RoTxn<'_> {
             DbSel::Named(dbi) => {
                 // The resolution is constant for this txn's life (see the
                 // `named_dense` field docs).
-                if dbi < DENSE_DBI_LIMIT {
-                    let table = self.named_dense.get_or_init(|| {
-                        let n = self.env_ref().inner().max_dbs().min(DENSE_DBI_LIMIT);
-                        (0..n).map(|_| OnceLock::new()).collect()
-                    });
-                    if let Some(slot) = table.get(dbi as usize) {
-                        match slot.get() {
-                            Some(&(g, rec)) if g == generation => return rec,
-                            // Another generation of the slot: rare (a remove
-                            // and a reuse during this txn), resolve uncached.
-                            Some(_) => return self.resolve_named(dbi),
-                            None => {}
-                        }
-                        let rec = self.resolve_named(dbi);
-                        // A racing thread may have filled the slot first; it
-                        // resolved the same constant record, so either wins.
-                        let _ = slot.set((generation, rec));
-                        return rec;
+                if let Some(entry) = self.dense_entry(dbi) {
+                    match entry.rec.get() {
+                        Some(&(g, rec)) if g == generation => return rec,
+                        // Another generation of the slot: rare (a remove and
+                        // a reuse during this txn), resolve uncached.
+                        Some(_) => return self.resolve_named(dbi),
+                        None => {}
                     }
+                    let rec = self.resolve_named(dbi);
+                    // A racing thread may have filled the slot first; it
+                    // resolved the same constant record, so either wins.
+                    let _ = entry.rec.set((generation, rec));
+                    return rec;
                 }
                 let mut memo = self.named_memo.lock().expect("named memo poisoned");
                 if let Some(&(_, _, rec)) =
@@ -376,6 +394,17 @@ impl TxnRead for RoTxn<'_> {
     }
     fn handle_state(&self) -> (&HandleTable, &TxnHandles, Option<&TxnHandles>) {
         (self.env_ref().inner().handles(), &self.handles, None)
+    }
+    #[inline]
+    fn check_db(&self, db: &Database) -> Result<()> {
+        let DbSel::Named(slot) = db.sel else {
+            return Ok(());
+        };
+        let table = self.env_ref().inner().handles();
+        match self.dense_entry(slot) {
+            Some(e) => table.check_with(&self.handles, slot, db.generation, &e.checked),
+            None => table.check(&self.handles, None, slot, db.generation),
+        }
     }
     fn comparator_for(&self, sel: DbSel) -> KeyCmp<'_> {
         self.env_ref().inner().comparator_for(sel)
@@ -786,6 +815,7 @@ impl Database {
     /// # Errors
     ///
     /// As [`TxnRead::check_db`].
+    #[inline]
     pub(crate) fn checked_tree<'txn, T: TxnRead + ?Sized>(
         &self,
         txn: &'txn T,
