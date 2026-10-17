@@ -96,6 +96,13 @@ pub enum MdbError {
     /// `Debug` renders as `MapResized`, matching `heed::MdbError::MapResized`.
     #[error("database contents grew beyond environment mapsize")]
     MapResized,
+
+    /// `MDB_BAD_DBI` (LMDB code `-30780`) — the database handle was valid when
+    /// this transaction began, and its database has since been removed or its
+    /// handle slot reused (ADR-0024). `Debug` renders as `BadDbi`, matching
+    /// `heed::MdbError::BadDbi`.
+    #[error("the specified DBI handle was closed/changed unexpectedly")]
+    BadDbi,
 }
 
 /// A convenience result alias for engine operations.

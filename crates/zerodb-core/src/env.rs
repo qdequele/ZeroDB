@@ -597,50 +597,6 @@ fn next_env_id() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Named-DB registry (the dbi table, SPEC 02 §6, SPEC 04 TXN-10)
-// ---------------------------------------------------------------------------
-
-/// The env-level named-database registry — ZeroDB's analogue of LMDB's
-/// `me_dbxs` array (the stable dbi ↔ name mapping). A named `Database` handle
-/// carries a small integer *dbi index* into `names`; the record itself always
-/// resolves lazily from the transaction's catalog view (the main tree; SPEC 04
-/// TXN-10 step 3), so this table maps **only** dbi → name, never dbi → root.
-///
-/// **Assignment is append-only within a process** (an accepted
-/// simplification). LMDB frees a dbi when the txn that opened it aborts;
-/// ZeroDB keeps the slot and re-uses it on a later open of the same
-/// name (`by_name`). This is **unobservable** through the heed/SPEC-00 surface:
-/// resolution is always catalog-driven, so a handle whose creation was aborted
-/// resolves to *absent* (its catalog entry was discarded with the dirty set),
-/// and re-creating the name re-uses the same dbi. The only theoretical effect
-/// is that `max_dbs` counts distinct names ever seen (incl. aborted) rather
-/// than currently-live ones, so `DbsFull` could fire one creation early after
-/// `max_dbs` *distinct* aborted-and-never-reused names — a case no consumer and
-/// no oracle sequence produces (names are a bounded reused set). The full dbi
-/// lifecycle (abort-frees-slot) is deliberately not implemented; revisit it if
-/// it ever becomes observable.
-#[derive(Debug)]
-struct NamedRegistry {
-    /// dbi index → name. Append-only; index is the `DbSel::Named` payload.
-    names: Vec<Box<[u8]>>,
-    /// name → dbi index, for `open`/`create` lookup.
-    by_name: HashMap<Box<[u8]>, u32>,
-    /// Catalog capacity (number of **named** DBs; the main DB is not counted,
-    /// matching LMDB's `mdb_env_set_maxdbs` semantics).
-    max_dbs: u32,
-}
-
-impl NamedRegistry {
-    fn new(max_dbs: u32) -> NamedRegistry {
-        NamedRegistry {
-            names: Vec::new(),
-            by_name: HashMap::new(),
-            max_dbs,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // EnvInner / Env
 // ---------------------------------------------------------------------------
 
@@ -702,9 +658,9 @@ pub struct EnvInner {
     /// slots lock-free; the writer's GC gate scans it (`oldest_live_reader`,
     /// TXN-21).
     reader_table: ReaderTable,
-    /// The named-DB registry (the dbi table, SPEC 02 §6). Guards the
-    /// dbi ↔ name mapping only — records resolve from the catalog (TXN-10).
-    named: Mutex<NamedRegistry>,
+    /// The named-database slot table (SPEC 02 §6.2, ADR-0024): slot ↔ name
+    /// and each slot's lifetime. Records resolve from the catalog (TXN-10).
+    handles: crate::handles::HandleTable,
     /// Env-level durability / write-mode flags (SPEC 01 §S6/§S7).
     /// Immutable after open; read by the commit pipeline and by `write_txn` /
     /// `force_sync`.
@@ -1334,23 +1290,16 @@ impl EnvInner {
         self.reader_table.oldest()
     }
 
-    /// The dbi index for `name`, assigning a fresh one if absent (SPEC 02 §6).
-    /// Returns `None` when the catalog is full (`DbsFull`): the number of
-    /// distinct named DBs has reached `max_dbs`.
-    #[must_use]
-    pub(crate) fn named_dbi_assign(&self, name: &[u8]) -> Option<u32> {
-        let mut r = self.named.lock().expect("named registry poisoned");
-        if let Some(&dbi) = r.by_name.get(name) {
-            return Some(dbi);
-        }
-        if r.names.len() as u64 >= u64::from(r.max_dbs) {
-            return None;
-        }
-        let dbi = r.names.len() as u32;
-        let boxed: Box<[u8]> = name.into();
-        r.names.push(boxed.clone());
-        r.by_name.insert(boxed, dbi);
-        Some(dbi)
+    /// The named-database slot table (ADR-0024).
+    pub(crate) fn handles(&self) -> &crate::handles::HandleTable {
+        &self.handles
+    }
+
+    /// Whether a free slot may take another database's name: not when a
+    /// custom comparator is registered for it, since that registration is
+    /// per slot and permanent (ADR-0024).
+    pub(crate) fn slot_reusable(&self, slot: u32) -> bool {
+        matches!(self.comparators.get(slot), KeyCmp::Default)
     }
 
     /// The catalog capacity this env was opened with (`max_dbs`). Every dbi
@@ -1364,12 +1313,7 @@ impl EnvInner {
     /// assigned. Cloned out so no registry lock is held by the caller.
     #[must_use]
     pub(crate) fn named_name(&self, dbi: u32) -> Option<Box<[u8]>> {
-        self.named
-            .lock()
-            .expect("named registry poisoned")
-            .names
-            .get(dbi as usize)
-            .cloned()
+        self.handles.name(dbi)
     }
 
     /// Whether this env was opened on the previous (older) snapshot.
@@ -2539,7 +2483,7 @@ pub fn open_with_backing_shared(
         commit_hook: Mutex::new(None),
         poisoned: AtomicBool::new(false),
         reader_table,
-        named: Mutex::new(NamedRegistry::new(max_dbs)),
+        handles: crate::handles::HandleTable::new(max_dbs),
         durability,
         comparators: ComparatorRegistry::new(max_dbs),
         max_dbs,

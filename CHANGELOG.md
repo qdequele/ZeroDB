@@ -6,6 +6,25 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### Database handles follow LMDB's lifetime (ADR-0024)
+
+A database handle opened in a transaction that ends without committing, or
+whose database was removed, is now refused, as LMDB refuses it. Operations
+through such a handle return `EINVAL` (`Error::Io`, OS error 22), or
+`MDB_BAD_DBI` for a read transaction that began while the handle was still
+valid. Before, ZeroDB kept serving the handle, and a write through a handle
+from an aborted `create_database` re-created and committed that database.
+
+- Read transactions, and nested read transactions, gain `commit`: as in LMDB,
+  committing one keeps the databases it opened, and dropping it closes them.
+- Freed handle slots are reused, and `max_dbs` counts the databases open now,
+  not every name ever opened.
+- Two cases are stricter than LMDB (divergence D-026): a handle whose slot
+  was reused by another database is refused instead of reading that
+  database, and two transactions opening one database for the first time
+  share its handle.
+- New error variant `MdbError::BadDbi`.
+
 ### Multi-process access (ADR-0023)
 
 Several processes can now open one environment at the same time and read or

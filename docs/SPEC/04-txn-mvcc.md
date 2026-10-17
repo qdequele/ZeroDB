@@ -1380,11 +1380,13 @@ every hook; this section defines the steps and their ordering. Both write modes
 | env clone/close/registry | TXN-50..55 | SPEC 00 rows 23–26 |
 | commit pipeline | TXN-61..64 | SPEC 06 REC-1..12 |
 | PREV_SNAPSHOT | TXN-65..67 | SPEC 01 §S5, SPEC 02 §3.2, SPEC 06 REC-5 |
+| database handle lifetime | DBI-1..10 (§13) | ADR-0024; SPEC 02 §6.1; D-026; `zerodb-oracle/tests/lmdb_dbi_handle_observation.rs`; unit tests in `zerodb-core/src/handles.rs` |
 | lock file (multi-process) | LCK-1..11 (§12); TXN-73 (§4.4); TXN-6/7, TXN-17..19, TXN-51/53, TXN-56, TXN-66 as amended | ADR-0023; SPEC 02 §8; SPEC 06 REC-1a; loom models in `zerodb-core/src/readers.rs`; `zerodb/tests/multi_process*.rs`; `zerodb-oracle/tests/multi_process_differential.rs`, `lmdb_reaping_observation.rs`, `lmdb_stage3_observation.rs` |
 
 **Rule count: TXN-1 … TXN-67 (67 normative rules; §4.4 adds sub-rule TXN-18a for
 slot release), plus the later TXN-68 … TXN-72 (§6.3a), TXN-73 (§4.4, added
-2026-10-13) and LCK-1 … LCK-11 (§12, added 2026-10-13).** TXN-40 (nested write unsupported, D-003) is referenced from
+2026-10-13), LCK-1 … LCK-11 (§12, added 2026-10-13) and DBI-1 … DBI-10 (§13,
+added 2026-10-17).** TXN-40 (nested write unsupported, D-003) is referenced from
 §5/§8 and defined here:
 
 - **TXN-40** — A nested **write** txn is **unsupported** (D-003) and, as
@@ -1646,3 +1648,79 @@ against LMDB unless it says so.
   (`OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER`,
   `OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER_RDONLY`). The wait is deliberate
   (ADR-0023 decision 3). See `docs/DIVERGENCES.md` (D-023).
+
+## §13 — Database handle lifetime (ADR-0024)
+
+A named database's handle is `(slot, generation)` into the env's slot table
+(`zerodb-core/src/handles.rs`; SPEC 02 §6.1). The main database's handle has
+no slot and is valid in every txn. The rules below reproduce what heed over
+the LMDB fork returns, except DBI-9 (divergence D-026). They are pinned by
+`crates/zerodb-oracle/tests/lmdb_dbi_handle_observation.rs`.
+
+- **DBI-1 (slot states)** — A slot is *pending* while the live txns that
+  opened it (its openers) have not committed, *published* once one of them
+  commits, and *free* once every opener ended without a commit or its
+  database was removed. A free slot keeps its name.
+- **DBI-2 (epoch)** — The env keeps an epoch, bumped on every slot change.
+  Every txn (read, write, nested read) records it at begin.
+- **DBI-3 (open)** — `open_database` and `create_database` of a database
+  present in the txn's catalog view (or created by it) make the txn an opener
+  of the name's slot:
+  - a pending slot gains the txn as an opener;
+  - a published slot records the txn as having opened it;
+  - otherwise the txn takes, in this order, the free slot that holds the same
+    name (same generation), the lowest free slot without a custom comparator
+    (generation bumped, name replaced, the sequential-writes override
+    cleared), or a new slot.
+
+  With none available, `DbsFull`: `max_dbs` counts slots in use. A create
+  that fails before its catalog entry exists gives the slot back.
+- **DBI-4 (end)** — A write txn's successful commit, and a read or nested read
+  txn's `commit`, publish the pending slots it opened, after the commit is
+  published (C6) and before the writer lock is released. Any other end
+  (abort, drop, failed commit) removes the txn from its slots' openers and
+  frees a slot left with none.
+- **DBI-5 (remove)** — `drop_db` (heed's `Database::remove`) frees the slot
+  when it succeeds, for every txn at once. An abort of the removing txn does
+  not undo it; its catalog entry, which the abort restores, can be opened
+  again.
+- **DBI-6 (check)** — Every operation on a named database, reads included,
+  checks the handle in the txn before any work:
+  1. the slot's generation differs from the handle's: `EINVAL`;
+  2. the txn opened the slot's current instance, and the slot is not free:
+     valid;
+  3. the slot is free and this txn freed it: `EINVAL`;
+  4. the slot was freed after the txn began, and the freed instance was
+     published before it began: `MDB_BAD_DBI`;
+  5. the slot was published at or before the txn began and not freed since:
+     valid;
+  6. otherwise: `EINVAL`.
+
+  `EINVAL` is `Error::Io` with raw OS error 22, as heed reports it.
+  `MDB_BAD_DBI` is `MdbError::BadDbi`. Rule 4 looks at the most recent free
+  only.
+- **DBI-7 (nested read txns)** — A nested read child is a txn of its own for
+  DBI-3/4: what it opens is freed when it is dropped and published when it
+  commits; the parent, begun before, does not gain it. The child accepts
+  every handle its parent accepts.
+- **DBI-8 (where the check runs)** — Native reads check through
+  `TxnRead::check_db`; a range or iterator yields the error as its first
+  item. Writes and write-cursor steps check in `RwTxn::ensure_open`. The heed
+  adapter checks before every read, and before creating a write iterator,
+  so heed's callers get the error from the call itself, as from LMDB.
+- **DBI-9 (D-026, stricter than LMDB)** — A handle whose slot was reused by
+  another name is `EINVAL` (rule 1); LMDB reads the other database. Two txns
+  first-opening one name share the slot (DBI-3), which is published when
+  either commits; LMDB frees it when the first ends, and the handle the
+  second committed gets `MDB_BAD_DBI` in later txns.
+- **DBI-10 (cost)** — A check is lock-free when the txn's memo cell for the
+  slot holds the current epoch and the handle's generation. The cell is
+  written only under the table lock and read as a seqlock (epoch, generation,
+  epoch again), so a reader never pairs one write's generation with another's
+  epoch (loom model `loom_memo_cell_never_mixes_two_writes`). A read txn keeps
+  the cell beside its record memo for the slot, so a named read looks the
+  slot up once. Otherwise the check takes the table lock once and memoizes a
+  valid verdict. Slots past 256 are always checked under the lock. A txn's
+  handle state is two words and one lazily allocated box, allocated only by a
+  txn that opens or removes a database, or a write or nested read txn that
+  checks one; a read txn's end takes the lock only if it opened a database.

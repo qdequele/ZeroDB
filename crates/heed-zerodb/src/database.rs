@@ -70,6 +70,9 @@ fn check_read_key(kb: &[u8]) -> Result<()> {
 /// monomorphizes over the concrete `zerodb` txn type (all `TxnRead`).
 macro_rules! with_read {
     // Database operation: check the handle/txn environment pairing first.
+    // The handle's validity in this txn (ADR-0024) is checked by every
+    // fallible engine read itself; the iterator constructors, whose engine
+    // calls defer the error, check it first (`check_handle`).
     ($db:expr, $txn:expr, |$t:ident| $e:expr) => {{
         $db.assert_env($txn);
         with_read!($txn, |$t| $e)
@@ -183,6 +186,12 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
             self.env_ident == txn.env_ident(),
             "The database environment doesn't match the transaction's environment"
         );
+    }
+
+    /// Whether this handle may be used in `txn` (ADR-0024): what heed's
+    /// cursor-opening calls get from LMDB's `mdb_cursor_open` up front.
+    fn check_handle(&self, txn: &RoTxn) -> Result<()> {
+        with_read!(txn, |t| zerodb::TxnRead::check_db(t, &self.inner)).map_err(Into::into)
     }
 
     /// `get(txn, key)` (SPEC 00 row 30): the value for `key`, or `None`.
@@ -362,6 +371,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// Infallible construction; returns [`Result`] for heed shape.
     pub fn iter<'txn>(&self, txn: &'txn RoTxn) -> Result<RoIter<'txn, KC, DC>> {
+        self.check_handle(txn)?;
         Ok(RoIter::new(with_read!(self, txn, |t| self.inner.iter(t))))
     }
 
@@ -371,6 +381,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// As [`Database::iter`].
     pub fn rev_iter<'txn>(&self, txn: &'txn RoTxn) -> Result<RoRevIter<'txn, KC, DC>> {
+        self.check_handle(txn)?;
         Ok(RoRevIter::new(with_read!(self, txn, |t| self
             .inner
             .rev_iter(t))))
@@ -392,6 +403,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
         let (lo, hi) = (as_bound(&lo), as_bound(&hi));
+        self.check_handle(txn)?;
         Ok(RoRange::new(with_read!(self, txn, |t| self
             .inner
             .range(t, lo, hi))))
@@ -413,6 +425,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
         let (lo, hi) = (as_bound(&lo), as_bound(&hi));
+        self.check_handle(txn)?;
         Ok(RoRevRange::new(with_read!(self, txn, |t| self
             .inner
             .rev_range(t, lo, hi))))
@@ -434,6 +447,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
         check_read_key(&pb)?;
+        self.check_handle(txn)?;
         Ok(RoPrefix::new(with_read!(self, txn, |t| self
             .inner
             .prefix_iter(t, &pb))))
@@ -454,6 +468,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         C: LexicographicComparator,
     {
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
+        self.check_handle(txn)?;
         Ok(RoRevPrefix::new(with_read!(self, txn, |t| self
             .inner
             .rev_prefix_iter(t, &pb))))
@@ -468,6 +483,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     /// Infallible construction; returns [`Result`] for heed shape.
     pub fn iter_mut<'txn>(&self, txn: &'txn mut RwTxn) -> Result<RwIter<'txn, KC, DC>> {
         self.assert_env(txn);
+        self.check_handle(txn)?;
         Ok(RwIter::new(RwGuts::new(
             txn,
             self.inner,
@@ -484,6 +500,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     /// As [`Database::iter_mut`].
     pub fn rev_iter_mut<'txn>(&self, txn: &'txn mut RwTxn) -> Result<RwRevIter<'txn, KC, DC>> {
         self.assert_env(txn);
+        self.check_handle(txn)?;
         Ok(RwRevIter::new(RwGuts::new(
             txn,
             self.inner,
@@ -508,6 +525,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         R: RangeBounds<KC::EItem>,
     {
         self.assert_env(txn);
+        self.check_handle(txn)?;
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
         Ok(RwRange::new(RwGuts::new(txn, self.inner, Dir::Fwd, lo, hi)))
     }
@@ -527,6 +545,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         R: RangeBounds<KC::EItem>,
     {
         self.assert_env(txn);
+        self.check_handle(txn)?;
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
         Ok(RwRevRange::new(RwGuts::new(
             txn,
@@ -553,6 +572,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         C: LexicographicComparator,
     {
         self.assert_env(txn);
+        self.check_handle(txn)?;
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
         check_read_key(&pb)?;
         let (lo, hi) = prefix_bounds(&pb);
@@ -580,6 +600,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         C: LexicographicComparator,
     {
         self.assert_env(txn);
+        self.check_handle(txn)?;
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
         let (lo, hi) = prefix_bounds(&pb);
         Ok(RwRevPrefix::new(RwGuts::new(

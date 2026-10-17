@@ -121,16 +121,25 @@ impl<'e, T> RoTxn<'e, T> {
         }
     }
 
-    /// Commit a read transaction (SPEC 00 — `RoTxn::commit`). For ZeroDB a read
-    /// txn commit is a plain release (no cross-process metadata sync to do); it
-    /// simply drops the pinned snapshot / reader slot.
+    /// Commit a read transaction (SPEC 00 — `RoTxn::commit`): release the
+    /// snapshot and reader slot, keeping the databases this txn opened for
+    /// transactions that begin after it. Dropping it instead closes them, as
+    /// in LMDB (ADR-0024).
     ///
     /// # Errors
     ///
     /// Infallible in ZeroDB; returns [`Result`] for API shape.
     pub fn commit(self) -> Result<()> {
-        drop(self);
-        Ok(())
+        match self.inner {
+            InnerTxn::Ro(t) => t.commit().map_err(Into::into),
+            InnerTxn::Nested(t) => t.commit().map_err(Into::into),
+            // Not reachable through heed's API (a write txn commits through
+            // `RwTxn::commit`); a drop is an abort.
+            InnerTxn::Rw(t) => {
+                drop(t);
+                Ok(())
+            }
+        }
     }
 
     /// This transaction's id (SPEC 00 second table — SHOULD; `mdb_txn_id`).

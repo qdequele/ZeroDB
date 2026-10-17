@@ -163,14 +163,16 @@ always initialised; seek error text differs).
 | Page size selection (LMDB 1.0) | Extension | SPEC 02 §0 |
 | Encryption at rest (LMDB 1.0) | Unsupported | not planned yet (a possible later improvement, with page checksums) |
 | Error text (`mdb_strerror`) | Same | oracle-pinned |
+| Database handle after an aborted, dropped or removing txn | Same, except D-026 | `EINVAL` / `MDB_BAD_DBI` as LMDB (ADR-0024, SPEC 04 §13); two cases are stricter (D-026) |
 
 ## What Meilisearch and hannoy actually touch
 
 Everything they use is **Same** or a supported LMDB feature above. Verified on
 Meilisearch v1.53.1 and hannoy v0.1.7-nested-rtxns by compiling and running
 their test suites on the shim with zero source changes (`docs/CONSUMER-GATE.md`).
-Differences a code path *could* observe and their current standing: the stale
-dbi handle and the cursor reserved put (both proposed divergences in
-`DIVERGENCES.md`), `RoTxn: Sync` (a widening),
+Differences a code path *could* observe and their current standing: database
+handles in two stale-handle cases (D-026, stricter than LMDB: `EINVAL` where
+LMDB would read another database), the cursor reserved put (a proposed
+divergence in `DIVERGENCES.md`), `RoTxn: Sync` (a widening),
 `put_reserved` zero-fill (a widening), and `IntegerComparator` on unequal-length
 keys (a bug fix relative to heed). None is reached by either consumer.

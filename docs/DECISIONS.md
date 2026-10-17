@@ -32,3 +32,4 @@ issues.
 | 0021 | [True in-place WRITE_MAP](adr/0021-writemap-in-place.md) | Accepted; merged in #88 | Performance (writes) |
 | 0022 | [Meta free-list annex (format v2)](adr/0022-meta-freelist-annex.md) | Accepted; merged in #89 | On-disk format, page reclamation |
 | 0023 | [Multi-process access: lock file, shared reader table, cross-process writer lock](adr/0023-multi-process.md) | Accepted, implemented (stages 1–3; lock file on by default); amendment 20 approved (#94) | Concurrency |
+| 0024 | [Database handle lifetime: stale handles after abort and remove](adr/0024-database-handle-lifetime.md) | Accepted (Option A, 2026-10-17); implementation in progress (#73) | API, LMDB parity |
