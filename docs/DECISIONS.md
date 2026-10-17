@@ -33,3 +33,4 @@ issues.
 | 0022 | [Meta free-list annex (format v2)](adr/0022-meta-freelist-annex.md) | Accepted; merged in #89 | On-disk format, page reclamation |
 | 0023 | [Multi-process access: lock file, shared reader table, cross-process writer lock](adr/0023-multi-process.md) | Accepted, implemented (stages 1–3; lock file on by default); amendment 20 approved (#94) | Concurrency |
 | 0024 | [Database handle lifetime: stale handles after abort and remove](adr/0024-database-handle-lifetime.md) | Accepted (Option A, 2026-10-17); implementation in progress (#73) | API, LMDB parity |
+| 0025 | [Nested write transactions](adr/0025-nested-write-txns.md) | Draft, awaiting approval (#71) | Concurrency |
