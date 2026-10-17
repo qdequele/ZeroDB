@@ -322,7 +322,7 @@ Two caveats on scope:
   - A process that joins after the first commit reads the older snapshot,
     and its `Env::info`/`Env::stat` name the newest meta on disk, as LMDB's
     (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`).
-  - Not mirrored, docs/DIVERGENCES.md D-025 (PROPOSED): when the opener
+  - Not mirrored, docs/DIVERGENCES.md D-025 (approved): when the opener
     closes or dies before its first commit, a waiting zerodb process becomes
     the first opener and serves the newest meta, while the fork's waiter
     reads the older meta (or, on macOS after a close, fails with `EINVAL`);
