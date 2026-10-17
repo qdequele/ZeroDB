@@ -2750,14 +2750,16 @@ impl<'env> RwTxn<'env> {
     /// keep the left half in the existing (dirty) frame, put the right half on
     /// a fresh page, and rise the right page's first key into the parent.
     ///
-    /// **End-of-page insert-point rule** (§6.4): when the new cell lands at
-    /// the end of the page (`newindx == nkeys`, i.e. `newindx == cells.len() - 1` after
-    /// insertion) the split forces `s = nkeys` — ALL existing cells stay on the
-    /// left (dirty) frame, the new cell alone starts the right page. This is
-    /// APPEND's split behavior (§6.3) generalized to *any* end insert (plain
-    /// puts included); it matches the fork's `mdb_page_split` and roughly
-    /// doubles leaf fill on ascending workloads (milli's dominant pattern).
-    /// All non-end inserts keep the median-fit-adjust rule (`choose_split`).
+    /// **End-of-page rules** (§6.4), as the fork's `mdb_page_split`, for a new
+    /// cell that lands at the end of the page (`newindx == nkeys`):
+    /// - an APPEND forces `s = nkeys`: all existing cells stay on the left
+    ///   (dirty) frame and the new cell alone starts the right page;
+    /// - a plain put forces `s = nkeys - 1`: the old last cell and the new one
+    ///   form the right page, every other cell stays left.
+    ///
+    /// Both keep ascending loads' leaves nearly full (milli's dominant
+    /// pattern). All non-end inserts keep the median-fit-adjust rule
+    /// (`choose_split`).
     #[allow(clippy::too_many_arguments)] // house pattern (insert_into_leaf): pre-resolved scalars
     fn split_leaf(
         &mut self,
@@ -2779,13 +2781,20 @@ impl<'env> RwTxn<'env> {
                 .num_keys()
         };
 
-        // `append` implies an end insert; the general `newindx == n_old` case
-        // covers plain puts that land at the end too (the end-of-page
-        // insert-point rule, §6.4): the new cell ALONE forms the right page.
-        // Fast path: the left (dirty) frame is byte-identical to the
-        // pre-split page, so it is not touched at all — no extraction, no
-        // rewrite, no per-cell allocation.
-        if append || newindx == n_old {
+        // A plain put at the end moves the old last cell along with the new
+        // one (§6.4). It needs two old cells, and both cells must fit on one
+        // page, which `max_node_size` guarantees (SPEC 02 §4.2); otherwise
+        // the new cell goes alone, as for an APPEND.
+        let end_pair = !append && newindx == n_old && n_old >= 2 && {
+            let frame = self.dirty.bytes(lpg).expect("leaf is dirty");
+            let leaf = LeafRef::new_prevalidated(frame, psize).map_err(corrupt)?;
+            leaf_cell_used(&leaf, n_old - 1) + val.used(key.len()) <= body_size(psize)
+        };
+        // `append` implies an end insert (the end-of-page rule, §6.4): the new
+        // cell ALONE forms the right page. Fast path: the left (dirty) frame
+        // is byte-identical to the pre-split page, so it is not touched at
+        // all — no extraction, no rewrite, no per-cell allocation.
+        if append || (newindx == n_old && !end_pair) {
             let rpg = self.allocate(1)?;
             {
                 let txnid = self.txnid;
@@ -2829,7 +2838,11 @@ impl<'env> RwTxn<'env> {
             });
         }
         let cap = body_size(psize);
-        let s = choose_split(&sizes, cap);
+        let s = if end_pair {
+            n_old - 1
+        } else {
+            choose_split(&sizes, cap)
+        };
         // sep = first key of R (§6.4).
         let sep = match s.cmp(&newindx) {
             Ordering::Less => oldleaf.key(s).to_vec(),
@@ -2963,8 +2976,8 @@ impl<'env> RwTxn<'env> {
     /// fork's `mdb_page_split` split point for an end insert on a branch, and
     /// it keeps branches packed on ascending workloads where the median rule
     /// leaves them about half full. A branch must keep two children (INV-8),
-    /// so the new cell cannot start the right page alone as it does for a
-    /// leaf. Non-end inserts keep the median-fit-adjust rule (`choose_split`).
+    /// so the new cell cannot start the right page alone as it does for an
+    /// APPEND on a leaf. Non-end inserts keep the median-fit-adjust rule (`choose_split`).
     fn split_branch(
         &mut self,
         tree: TreeId,
@@ -5395,11 +5408,19 @@ mod tests {
             let k = format!("a{i:04}").into_bytes();
             db.put(&mut txn, &k, b"stable-value").unwrap();
         }
+        // The first `z` puts land at the end of the leaf holding the `a` keys
+        // and split it, which rewrites it (§6.4). Measure after that split:
+        // from then on the leaf holding `a0000` is untouched.
+        let z = |i: u32| format!("z{i:04}").into_bytes();
+        let mut i = 0u32;
+        while txn.main_record().leaf_pages < 2 {
+            db.put(&mut txn, &z(i), &[0x22u8; 64]).unwrap();
+            i += 1;
+        }
         let addr_before = db.get(&txn, b"a0000").unwrap().unwrap().as_ptr() as usize;
         // Grow the dirty index with many later-subtree pages.
-        for i in 0..600u32 {
-            let k = format!("z{i:04}").into_bytes();
-            db.put(&mut txn, &k, &[0x22u8; 64]).unwrap();
+        for i in i..600u32 {
+            db.put(&mut txn, &z(i), &[0x22u8; 64]).unwrap();
         }
         let addr_after = db.get(&txn, b"a0000").unwrap().unwrap().as_ptr() as usize;
         assert_eq!(addr_before, addr_after, "frame moved under the index");

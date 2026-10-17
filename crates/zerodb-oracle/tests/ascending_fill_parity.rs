@@ -3,12 +3,14 @@
 //!
 //! milli's dominant write pattern is ascending keys (facet ids, docids, sorted
 //! bulk). A median-fit split leaves ~50 %-full leaves on such loads, ~2× the
-//! fork's leaf count. The end-of-page insert-point rule (all existing cells
-//! stay left, the new key alone starts the right page for any
-//! `newindx == nkeys` insert, matching `mdb_page_split`) packs like the fork.
-//! This test drives identical ascending plain puts (NOT `MDB_APPEND` — plain
-//! puts must pack too) into the fork (via heed) and zerodb and asserts the
-//! leaf counts track within a ±20 % band.
+//! fork's leaf count. The end-of-page rules of `mdb_page_split` pack them
+//! instead: an `MDB_APPEND` at the end of a full leaf leaves it as it is and
+//! starts the right page with the new entry alone; a plain put there moves
+//! the old last entry to the right page with the new one. The band tests
+//! drive identical ascending plain puts into the fork (via heed) and zerodb
+//! and assert the leaf counts track within ±20 %; the `*_leaf_model*` tests
+//! check each engine's exact leaf count, plain and `MDB_APPEND`, against the
+//! count those rules predict.
 //!
 //! The same rule governs branch splits: every leaf split of an ascending load
 //! inserts its separator at the end of the parent branch, and the fork splits
@@ -87,6 +89,11 @@ struct Shape {
 
 /// Tree shape + page size for the fork after inserting `pairs` in order.
 fn lmdb_stat(dir: &Path, pairs: &[(Vec<u8>, Vec<u8>)]) -> (Shape, u32) {
+    lmdb_stat_with(dir, pairs, false)
+}
+
+/// [`lmdb_stat`], with every put made with `MDB_APPEND` when `append`.
+fn lmdb_stat_with(dir: &Path, pairs: &[(Vec<u8>, Vec<u8>)], append: bool) -> (Shape, u32) {
     let mut opts = HeedOpts::new().read_txn_without_tls();
     opts.map_size(MAP);
     // SAFETY: no cross-process env flags; private temp dir, single-threaded.
@@ -96,7 +103,12 @@ fn lmdb_stat(dir: &Path, pairs: &[(Vec<u8>, Vec<u8>)]) -> (Shape, u32) {
         .create_database(&mut wtxn, None)
         .expect("create unnamed db");
     for (k, v) in pairs {
-        db.put(&mut wtxn, k, v).expect("put");
+        if append {
+            db.put_with_flags(&mut wtxn, heed::PutFlags::APPEND, k, v)
+                .expect("append");
+        } else {
+            db.put(&mut wtxn, k, v).expect("put");
+        }
     }
     wtxn.commit().expect("commit");
     let rtxn = env.read_txn().expect("rtxn");
@@ -111,6 +123,11 @@ fn lmdb_stat(dir: &Path, pairs: &[(Vec<u8>, Vec<u8>)]) -> (Shape, u32) {
 
 /// Tree shape for zerodb (at page size `ps`) after the same puts.
 fn zerodb_shape(dir: &Path, ps: u32, pairs: &[(Vec<u8>, Vec<u8>)]) -> Shape {
+    zerodb_shape_with(dir, ps, pairs, false)
+}
+
+/// [`zerodb_shape`], with every put made with `APPEND` when `append`.
+fn zerodb_shape_with(dir: &Path, ps: u32, pairs: &[(Vec<u8>, Vec<u8>)], append: bool) -> Shape {
     let mut opts = zerodb::EnvOpenOptions::new();
     opts.map_size(MAP);
     opts.page_size(ps);
@@ -118,7 +135,12 @@ fn zerodb_shape(dir: &Path, ps: u32, pairs: &[(Vec<u8>, Vec<u8>)]) -> Shape {
     let db = env.main_database();
     let mut wtxn = env.write_txn().expect("wtxn");
     for (k, v) in pairs {
-        db.put(&mut wtxn, k, v).expect("put");
+        if append {
+            db.put_with_flags(&mut wtxn, zerodb::PutFlags::APPEND, k, v)
+                .expect("append");
+        } else {
+            db.put(&mut wtxn, k, v).expect("put");
+        }
     }
     let rec = *zerodb::TxnRead::main_record(&wtxn);
     let shape = Shape {
@@ -307,4 +329,113 @@ fn ascending_medium_keys_branch_parity() {
 #[test]
 fn ascending_compact_keys_branch_parity() {
     assert_branch_parity("compact400k", 400_000, 0, 50, false);
+}
+
+/// Entries a full leaf page of the fork holds when every key is `ksize` bytes
+/// and every value `vsize` bytes, inline. Fork page format (`mdb.c`): a 16-byte
+/// page header, then per node a 2-byte slot plus an 8-byte node header, the
+/// key and the value, rounded up to an even size. Checked against the fork's
+/// own `stat` through the leaf model below.
+fn lmdb_leaf_capacity(ps: u32, ksize: usize, vsize: usize) -> u64 {
+    let even = |x: usize| (x + 1) & !1;
+    ((ps as usize - 16) / (even(8 + ksize + vsize) + 2)) as u64
+}
+
+/// Entries a full zerodb leaf page holds for `ksize`-byte keys and
+/// `vsize`-byte inline values, measured by filling an empty leaf page until it
+/// reports full.
+fn zerodb_leaf_capacity(ps: u32, ksize: usize, vsize: usize) -> u64 {
+    let mut buf = vec![0u8; ps as usize];
+    let mut leaf = zerodb_core::page::LeafMut::init(&mut buf, ps, 3, 1).expect("init leaf");
+    let val = vec![0u8; vsize];
+    let mut n = 0usize;
+    loop {
+        let key = format!("{n:0ksize$}").into_bytes();
+        if leaf.insert_inline(n, &key, 0, &val).is_err() {
+            return n as u64;
+        }
+        n += 1;
+    }
+}
+
+/// Leaf pages an ascending load of `n` entries builds, for leaves of `cap`
+/// entries, under the fork's two end-of-page leaf splits (SPEC 03 §6.4):
+///
+/// - a plain put at the end of a full leaf moves the old last entry and the
+///   new one to the new right page, so every full leaf keeps `cap - 1`
+///   entries: `1 + ceil((n - cap) / (cap - 1))` leaves;
+/// - an `APPEND` put leaves the full leaf as it is and puts the new entry
+///   alone on the new page, so every leaf keeps `cap`: `ceil(n / cap)`.
+fn ascending_leaf_model(n: u64, cap: u64, append: bool) -> u64 {
+    if n <= cap {
+        1
+    } else if append {
+        n.div_ceil(cap)
+    } else {
+        1 + (n - cap).div_ceil(cap - 1)
+    }
+}
+
+/// Assert that both engines split leaves on an ascending load the way the
+/// fork does: each engine's leaf count must equal [`ascending_leaf_model`]
+/// for its own leaf capacity, for plain puts and for `APPEND` puts. As for
+/// branches, raw counts are not compared: the page formats differ, so the
+/// capacities can differ by an entry.
+fn assert_leaf_model(tag: &str, n: u32, klen: usize, vlen: usize, append: bool) {
+    let pairs = make_pairs_klen(n, klen, vlen);
+    let ksize = pairs[0].0.len();
+    let ldir = TempDir::new(&format!("lm-{tag}"));
+    let zdir = TempDir::new(&format!("zm-{tag}"));
+    let (lmdb, ps) = lmdb_stat_with(ldir.path(), &pairs, append);
+    let zdb = zerodb_shape_with(zdir.path(), ps, &pairs, append);
+    let (lcap, zcap) = (
+        lmdb_leaf_capacity(ps, ksize, vlen),
+        zerodb_leaf_capacity(ps, ksize, vlen),
+    );
+    let (lmodel, zmodel) = (
+        ascending_leaf_model(u64::from(n), lcap, append),
+        ascending_leaf_model(u64::from(n), zcap, append),
+    );
+    println!(
+        "[{tag}] n={n} ksize={ksize} vlen={vlen} psize={ps} append={append}: \
+         lmdb leaves={} cap={lcap} model={lmodel} | zerodb leaves={} cap={zcap} model={zmodel}",
+        lmdb.leaf_pages, zdb.leaf_pages
+    );
+    assert_eq!(
+        lmdb.leaf_pages, lmodel,
+        "[{tag}] the fork's leaf count differs from the end-of-page leaf split \
+         model at psize {ps}: the model, not zerodb, is wrong"
+    );
+    assert_eq!(
+        zdb.leaf_pages, zmodel,
+        "[{tag}] zerodb's leaf count differs from the end-of-page leaf split model \
+         at psize {ps} (append = {append}); a plain end insert on a full leaf must \
+         move the old last entry and the new one to the right page, and an \
+         APPEND must put the new entry alone there, as the fork does (SPEC 03 §6.4)"
+    );
+}
+
+/// ~500 B keys, tiny values: few entries per leaf, so the one-entry
+/// difference between the two split forms is large.
+#[test]
+fn ascending_wide_keys_leaf_model() {
+    assert_leaf_model("wide20k", 20_000, 500, 4, false);
+}
+
+/// The same load with `APPEND`.
+#[test]
+fn ascending_wide_keys_leaf_model_append() {
+    assert_leaf_model("wide20k-append", 20_000, 500, 4, true);
+}
+
+/// Compact 9 B keys and 50 B values: many entries per leaf.
+#[test]
+fn ascending_compact_keys_leaf_model() {
+    assert_leaf_model("compact20k", 20_000, 0, 50, false);
+}
+
+/// The same load with `APPEND`.
+#[test]
+fn ascending_compact_keys_leaf_model_append() {
+    assert_leaf_model("compact20k-append", 20_000, 0, 50, true);
 }
