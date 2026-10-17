@@ -2750,14 +2750,16 @@ impl<'env> RwTxn<'env> {
     /// keep the left half in the existing (dirty) frame, put the right half on
     /// a fresh page, and rise the right page's first key into the parent.
     ///
-    /// **End-of-page insert-point rule** (§6.4): when the new cell lands at
-    /// the end of the page (`newindx == nkeys`, i.e. `newindx == cells.len() - 1` after
-    /// insertion) the split forces `s = nkeys` — ALL existing cells stay on the
-    /// left (dirty) frame, the new cell alone starts the right page. This is
-    /// APPEND's split behavior (§6.3) generalized to *any* end insert (plain
-    /// puts included); it matches the fork's `mdb_page_split` and roughly
-    /// doubles leaf fill on ascending workloads (milli's dominant pattern).
-    /// All non-end inserts keep the median-fit-adjust rule (`choose_split`).
+    /// **End-of-page rules** (§6.4), as the fork's `mdb_page_split`, for a new
+    /// cell that lands at the end of the page (`newindx == nkeys`):
+    /// - an APPEND forces `s = nkeys`: all existing cells stay on the left
+    ///   (dirty) frame and the new cell alone starts the right page;
+    /// - a plain put forces `s = nkeys - 1`: the old last cell and the new one
+    ///   form the right page, every other cell stays left.
+    ///
+    /// Both keep ascending loads' leaves nearly full (milli's dominant
+    /// pattern). All non-end inserts keep the median-fit-adjust rule
+    /// (`choose_split`).
     #[allow(clippy::too_many_arguments)] // house pattern (insert_into_leaf): pre-resolved scalars
     fn split_leaf(
         &mut self,
@@ -2779,29 +2781,85 @@ impl<'env> RwTxn<'env> {
                 .num_keys()
         };
 
-        // `append` implies an end insert; the general `newindx == n_old` case
-        // covers plain puts that land at the end too (the end-of-page
-        // insert-point rule, §6.4): the new cell ALONE forms the right page.
-        // Fast path: the left (dirty) frame is byte-identical to the
-        // pre-split page, so it is not touched at all — no extraction, no
-        // rewrite, no per-cell allocation.
+        // A plain put at the end moves the old last cell along with the new
+        // one (§6.4). It needs two old cells, and both cells must fit on one
+        // page, which `max_node_size` guarantees (SPEC 02 §4.2); otherwise
+        // the new cell goes alone, as for an APPEND.
+        let end_pair = !append && newindx == n_old && n_old >= 2 && {
+            let frame = self.dirty.bytes(lpg).expect("leaf is dirty");
+            let leaf = LeafRef::new_prevalidated(frame, psize).map_err(corrupt)?;
+            leaf_cell_used(&leaf, n_old - 1) + val.used(key.len()) <= body_size(psize)
+        };
+        // End split (§6.4) without repacking the left frame. APPEND, or a
+        // plain put whose pair does not fit: the new cell ALONE forms the
+        // right page and the left frame is not touched at all. A plain put:
+        // the old last cell moves to the right page first, removed from the
+        // left frame in place. On an ascending page that cell is the top of
+        // the cell heap, so removing it moves no other cell.
         if append || newindx == n_old {
+            enum Moved {
+                Inline(Vec<u8>),
+                Big { head: u64, dsize: u32 },
+            }
+            let moved = if end_pair {
+                let frame = self.dirty.bytes_mut(lpg).expect("leaf is dirty");
+                let i = n_old - 1;
+                let (mkey, mflags, mval) = {
+                    let leaf = LeafRef::new_prevalidated(&*frame, psize).map_err(corrupt)?;
+                    // Preserve non-BIGDATA node flags (F_SUBDATA) across the
+                    // move (SPEC 02 §6); F_BIGDATA is re-derived on write.
+                    let flags = leaf.node_flags(i) & !crate::page::F_BIGDATA;
+                    let v = match leaf.value(i) {
+                        LeafValue::Inline(v) => Moved::Inline(v.to_vec()),
+                        LeafValue::Overflow { head_pgno, dsize } => Moved::Big {
+                            head: head_pgno,
+                            dsize,
+                        },
+                    };
+                    (leaf.key(i).to_vec(), flags, v)
+                };
+                LeafMut::from_valid(&mut *frame, psize)
+                    .map_err(corrupt)?
+                    .remove(i)
+                    .map_err(corrupt)?;
+                Some((mkey, mflags, mval))
+            } else {
+                None
+            };
             let rpg = self.allocate(1)?;
             {
                 let txnid = self.txnid;
                 let frame = self.dirty.insert_tree_frame(rpg);
                 let mut leaf = LeafMut::init(frame, psize, rpg, txnid).map_err(corrupt)?;
-                match &val {
-                    NewLeafVal::Inline(v) => leaf.insert_inline(0, key, node_flags, v),
-                    NewLeafVal::ZeroReserve(n) => {
-                        leaf.insert_inline_reserved(0, key, *n as u32).map(|_| ())
+                let slot = match &moved {
+                    Some((mkey, mflags, Moved::Inline(v))) => {
+                        leaf.insert_inline(0, mkey, *mflags, v).map_err(corrupt)?;
+                        1
                     }
-                    NewLeafVal::Big { head, dsize } => leaf.insert_bigdata(0, key, *dsize, *head),
+                    Some((mkey, _, Moved::Big { head, dsize })) => {
+                        leaf.insert_bigdata(0, mkey, *dsize, *head)
+                            .map_err(corrupt)?;
+                        1
+                    }
+                    None => 0,
+                };
+                match &val {
+                    NewLeafVal::Inline(v) => leaf.insert_inline(slot, key, node_flags, v),
+                    NewLeafVal::ZeroReserve(n) => leaf
+                        .insert_inline_reserved(slot, key, *n as u32)
+                        .map(|_| ()),
+                    NewLeafVal::Big { head, dsize } => {
+                        leaf.insert_bigdata(slot, key, *dsize, *head)
+                    }
                 }
                 .map_err(corrupt)?;
             }
             sat_add(&mut self.record_mut(tree).leaf_pages, 1);
-            let sep = key.to_vec(); // sep = first key of R = the new key (§6.4)
+            // sep = first key of R (§6.4): the moved old last key, or the new key.
+            let sep = match moved {
+                Some((mkey, _, _)) => mkey,
+                None => key.to_vec(),
+            };
             return if top == 0 {
                 self.insert_into_branch(tree, path, -1, 0, sep, rpg)
                     .map(|_| ())
@@ -2963,8 +3021,8 @@ impl<'env> RwTxn<'env> {
     /// fork's `mdb_page_split` split point for an end insert on a branch, and
     /// it keeps branches packed on ascending workloads where the median rule
     /// leaves them about half full. A branch must keep two children (INV-8),
-    /// so the new cell cannot start the right page alone as it does for a
-    /// leaf. Non-end inserts keep the median-fit-adjust rule (`choose_split`).
+    /// so the new cell cannot start the right page alone as it does for an
+    /// APPEND on a leaf. Non-end inserts keep the median-fit-adjust rule (`choose_split`).
     fn split_branch(
         &mut self,
         tree: TreeId,
