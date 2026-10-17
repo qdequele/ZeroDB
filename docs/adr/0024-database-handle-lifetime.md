@@ -1,6 +1,6 @@
 # ADR-0024: Database handle lifetime (stale handles after abort and remove)
 
-- Status: Draft
+- Status: Approved (Option A), maintainer, 2026-10-17
 - Related issue: #73 (divergence D-013)
 - Date: 2026-10-17
 
@@ -25,7 +25,7 @@ data that should not exist.
 
 ### What LMDB does, and what ZeroDB does today
 
-Observed through heed 0.22.1 on both engines,
+Observed through heed 0.22.1 on both engines, 20 cases,
 `crates/zerodb-oracle/tests/lmdb_dbi_handle_observation.rs` (LMDB pinned,
 macOS aarch64, 2026-10-17). "a" and "b" are named databases, `k` a key.
 
@@ -44,6 +44,13 @@ macOS aarch64, 2026-10-17). "a" and "b" are named databases, `k` a key.
 | `a` created in an aborted txn, then `b` created with `k = b`; read through the `a` handle | **`b`** (slot reused) | not found |
 | `a` created in an aborted txn and created again (`k = 2`) as a second handle; the first handle reads, then writes `k = 1` | `2`, ok, and the second handle reads `1` | the same |
 | `a` cleared in a txn that aborts; read | the value | the value |
+| `a` removed, then the handle used in the same write txn | `EINVAL` | ok |
+| existing `a`, first opened in a nested read txn of a write txn; the child dropped; read from the parent; the parent commits; read | `EINVAL`, `EINVAL` | the value, the value |
+| the same, the parent aborts; read | `EINVAL` | the value |
+| the same, but the child committed; read from the parent; the parent commits; read | `EINVAL`, the value | the value, the value |
+| the same, the child committed, the parent aborts; read | the value | the value |
+| a nested read child uses handles its parent created, or first opened, and has not committed | the values | the values |
+| two read txns both first-open `a`; the first is dropped; read from the second; it commits; read through each handle from new txns | the value, `MDB_BAD_DBI`, `MDB_BAD_DBI` | the value, the value, the value |
 
 Two things follow.
 
@@ -144,29 +151,106 @@ creating the database.
 
 ## Decision
 
-**Recommended: Option A**, with one stricter-than-LMDB divergence, filed as
-D-026: a handle whose slot was reused by another name returns `EINVAL`
-instead of reading the other database. Reading another database through a
-stale handle is the hazard this ADR exists to remove. Matching it would
-make ZeroDB serve the wrong data, a worse leniency than the one #73 reports.
-D-013 is then retired; its row is kept with the ID, as D-001's is.
+**Option A**, approved by the maintainer on 2026-10-17. The recommended answers
+to questions 2 and 3 stand: a slot reused by another name gives `EINVAL`, and
+a remove under an open read txn gives `MDB_BAD_DBI`, as LMDB does.
 
-Option B costs about as much as A once the engine fix it still needs is
-counted, and it leaves two behaviors. Option C keeps most of the gap.
+### The rules
 
-Awaiting maintainer approval; no implementation before it (AGENTS.md rule 5).
+The env keeps one slot table for named databases. The main database has no
+slot and its handle is always valid.
+
+- **Slot.** A slot holds a name, a generation, and a state:
+  - *Pending*, with the set of live transactions that opened it;
+  - *Published*, with the handle epoch at which it was published;
+  - *Free*, remembering when it was freed, by which transaction, and when the
+    freed instance had been published (if it ever was).
+
+  A handle is `(slot, generation)`.
+- **Epoch.** An env-wide counter, bumped on every slot change.
+- **Transaction begin.** Every transaction (read, write, nested read) records
+  the epoch at its begin.
+- **Open and create.** `open_database` / `create_database` find the name's
+  slot:
+  - A Pending slot: the transaction joins its openers.
+  - A Published slot: the transaction is recorded as an opener of that
+    instance, so it can use the handle even if the slot was published after
+    it began.
+  - No slot, or a Free one: the transaction takes a slot and becomes its only
+    opener. It reuses the Free slot that held the same name (same
+    generation), else the lowest Free slot (the generation is bumped and the
+    name changes), else a new slot. With no Free slot and `max_dbs` slots in
+    use: `DbsFull`.
+- **Commit.** A write txn's commit, or a read txn's `commit`, publishes the
+  Pending slots it opened, after the commit succeeds. Ending without a commit
+  removes the transaction from its slots' openers. A Pending slot left with no
+  opener is freed. A failed write commit counts as an abort.
+- **Remove.** `Database::remove` (`drop_db`) frees the slot at once. An abort
+  does not undo it.
+- **Check.** Every operation on a named database, reads included, first checks
+  its handle against the transaction, in this order:
+  1. The slot's generation differs from the handle's: `EINVAL`.
+  2. The transaction opened this instance of the slot, and the slot is not
+     Free: valid.
+  3. The slot is Free and this transaction freed it: `EINVAL`.
+  4. The slot was freed after the transaction began, and the freed instance
+     was published before it began: `MDB_BAD_DBI`.
+  5. The slot is Published, at or before the transaction began, and was not
+     freed since: valid.
+  6. Otherwise: `EINVAL`.
+
+  A nested read child also accepts every handle its parent accepts.
+
+`EINVAL` is `Error::Io` with raw OS error 22, as heed reports it. `MDB_BAD_DBI`
+is a new core `MdbError::BadDbi`, mapped to heed's `MdbError::BadDbi`.
+
+Rule 4 looks at the most recent free only. If a slot is freed twice while one
+transaction is live, that transaction can get `EINVAL` where LMDB's sequence
+check would say `MDB_BAD_DBI`. Both outcomes are errors, and no consumer
+removes and re-creates databases under a long read.
+
+### Cost
+
+Each check is three `Acquire` loads in the common case:
+- the epoch;
+- the transaction's memo for the slot, which holds the epoch of its last
+  successful check;
+- the slot's generation.
+
+The table lock is taken only when the memo is stale, which happens once per
+slot after a slot change. The memo is sized like the record memo
+(`DENSE_DBI_LIMIT`). The record memo is keyed by generation as well, since a
+slot can now change name.
+
+Transactions get an owner id only when they open a database, so read-txn
+begin gains one load (the epoch) and no shared write.
+
+### Divergence D-026 (stricter than LMDB)
+
+Two cases, both where LMDB serves a stale or inconsistent answer:
+
+1. A handle whose slot was reused by another name returns `EINVAL`. LMDB reads
+   the other database.
+2. Two transactions first-opening the same name share the slot. It stays
+   pending while either is live, and is published when either commits. LMDB
+   frees it when the first ends, and the handle the second committed then
+   gets `MDB_BAD_DBI` in later transactions.
+
+D-013 is retired, its row kept with the ID.
 
 ## Consequences
 
-- **Engine.** `NamedRegistry` becomes the slot table described in Option A.
-  `Database` gains a generation. Every named-database operation checks the
+- **Engine.** `NamedRegistry` becomes the slot table described above.
+  `Database` gains a generation. Read txns and nested read txns gain a
+  `commit`. Freeing a slot clears its comparator and sequential-writes
+  registrations, which are per slot. Every named-database operation checks the
   handle. The write-back can no longer insert a catalog entry for a handle
   that was never valid. `MdbError::BadDbi` is added.
 - **Adapter.** heed-zerodb carries the generation and maps the two errors to
   heed's (`Error::Io` errno 22, `MdbError::BadDbi`).
 - **Tests.**
   - The observation file becomes differential: each case asserts that ZeroDB
-    matches the LMDB pin, except the `a`/`b` case, which asserts the D-026
+    matches the LMDB pin, except the two D-026 cases, which assert ZeroDB's
     outcome.
   - New engine unit tests: slot reuse, generation wrap at `u32::MAX` (a slot
     reused 2^32 times must not validate an old handle), `max_dbs` after
@@ -183,11 +267,11 @@ Awaiting maintainer approval; no implementation before it (AGENTS.md rule 5).
 
 ## Open questions for human review
 
-1. **Option A, B or C?**
-2. **The `a`/`b` case:** `EINVAL` (recommended), or match LMDB and read `b`?
-3. **The open-read-during-remove case:** match LMDB's `MDB_BAD_DBI`
-   (recommended, so consumers see one error taxonomy), or keep serving the
-   read txn's snapshot, the MVCC answer D-009 chose for a similar race?
-4. **Nested read txns:** whether a database first opened inside a nested read
-   txn is freed when that child ends is not yet observed. It will be pinned in
-   the oracle before implementation; the default is to follow LMDB.
+All resolved on 2026-10-17:
+1. Option A (maintainer).
+2. `EINVAL` for a reused slot (maintainer, the recommended answer).
+3. `MDB_BAD_DBI` for a remove under an open read txn, as LMDB (maintainer,
+   the recommended answer).
+4. Nested read txns: observed and pinned. Dropping a child frees what it
+   opened; a child's commit publishes it, for transactions begun after; and a
+   child accepts its parent's handles.

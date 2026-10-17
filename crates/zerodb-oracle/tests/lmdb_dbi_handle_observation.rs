@@ -1,6 +1,6 @@
 //! What the Meilisearch LMDB fork does with a database handle (`dbi`) once the
 //! transaction that opened it has ended, observed through heed 0.22.1, the
-//! API consumers call. Input for the design of issue #73 (divergence D-013).
+//! API consumers call. Input for the design of issue #73 (divergence D-013, ADR-0024).
 //! AGENTS.md rule 1: observed, not guessed.
 //!
 //! Each case is a short script of heed calls; every step's outcome is recorded
@@ -55,6 +55,36 @@ const OBS_CREATE_ABORTED_THEN_OTHER_NAME: &[&str] = &["b", "none"];
 /// from a new one. The open read txn gets `MDB_BAD_DBI`, not its snapshot's
 /// value.
 const OBS_REMOVE_UNDER_OPEN_READ: &[&str] = &["BAD_DBI", "EINVAL"];
+/// An existing database first opened inside a nested read txn of a write txn,
+/// the child then dropped: get through the handle from the parent, then the
+/// parent commits and a new read txn gets through it.
+/// Dropping the child frees the handle, as any txn end without a commit does.
+const OBS_FIRST_OPEN_IN_NESTED_READ_PARENT_COMMITS: &[&str] = &["EINVAL", "EINVAL"];
+/// The same, but the parent aborts: get from a new read txn.
+const OBS_FIRST_OPEN_IN_NESTED_READ_PARENT_ABORTS: &[&str] = &["EINVAL"];
+/// The child committed (`RoTxn::commit`) instead of dropped: get from the
+/// parent, then from a new read txn after the parent commits.
+/// The child's commit publishes the handle for txns begun after it; the
+/// parent, begun before, still gets `EINVAL`.
+const OBS_NESTED_READ_COMMITTED_PARENT_COMMITS: &[&str] = &["EINVAL", "v"];
+/// The child committed, then the parent aborts: get from a new read txn. The
+/// parent's abort does not undo the child's publication.
+const OBS_NESTED_READ_COMMITTED_PARENT_ABORTS: &[&str] = &["v"];
+/// Two read txns, both begun, each first-open `a` (`h1`, `h2`); the first is
+/// dropped: get through `h2` from its own txn, then that txn commits and new
+/// read txns get through `h2` and through `h1`. Both handles are one slot:
+/// the first txn's drop frees it under the second, whose commit then leaves
+/// it valid in txns but with a changed sequence, so later txns get
+/// `MDB_BAD_DBI` even through the committed handle.
+const OBS_TWO_READERS_FIRST_OPEN: &[&str] = &["v", "BAD_DBI", "BAD_DBI"];
+/// A committed database removed, then the handle used in the same write txn:
+/// put through it.
+const OBS_REMOVE_THEN_USE_SAME_TXN: &[&str] = &["EINVAL"];
+/// Handles the parent write txn opened and has not committed, used from a
+/// nested read child: `a` created in the parent (get through it in the
+/// child), and an existing `b` first opened in the parent (get in the child).
+/// The child sees every handle its parent can use.
+const OBS_PARENT_HANDLES_IN_NESTED_READ: &[&str] = &["a", "b"];
 /// A committed database cleared in a txn that aborts: get through the handle.
 const OBS_CLEAR_ABORTED: &[&str] = &["ok", "v"];
 
@@ -274,6 +304,90 @@ macro_rules! cases {
                 vec![old, get(&env, db)]
             }
 
+            pub fn first_open_in_nested_read_parent_commits(dir: &Path) -> Vec<String> {
+                let env = reopened(dir);
+                let w = env.write_txn().unwrap();
+                let child = env.nested_read_txn(&w).unwrap();
+                let db: Db = env.open_database(&child, Some("a")).unwrap().unwrap();
+                drop(child);
+                let in_parent = value(db.get(&w, b"k"));
+                w.commit().unwrap();
+                vec![in_parent, get(&env, db)]
+            }
+
+            pub fn first_open_in_nested_read_parent_aborts(dir: &Path) -> Vec<String> {
+                let env = reopened(dir);
+                let w = env.write_txn().unwrap();
+                let child = env.nested_read_txn(&w).unwrap();
+                let db: Db = env.open_database(&child, Some("a")).unwrap().unwrap();
+                drop(child);
+                w.abort();
+                vec![get(&env, db)]
+            }
+
+            pub fn nested_read_committed_parent_commits(dir: &Path) -> Vec<String> {
+                let env = reopened(dir);
+                let w = env.write_txn().unwrap();
+                let child = env.nested_read_txn(&w).unwrap();
+                let db: Db = env.open_database(&child, Some("a")).unwrap().unwrap();
+                child.commit().unwrap();
+                let in_parent = value(db.get(&w, b"k"));
+                w.commit().unwrap();
+                vec![in_parent, get(&env, db)]
+            }
+
+            pub fn nested_read_committed_parent_aborts(dir: &Path) -> Vec<String> {
+                let env = reopened(dir);
+                let w = env.write_txn().unwrap();
+                let child = env.nested_read_txn(&w).unwrap();
+                let db: Db = env.open_database(&child, Some("a")).unwrap().unwrap();
+                child.commit().unwrap();
+                w.abort();
+                vec![get(&env, db)]
+            }
+
+            pub fn two_readers_first_open(dir: &Path) -> Vec<String> {
+                let env = reopened(dir);
+                let r1 = env.read_txn().unwrap();
+                let r2 = env.read_txn().unwrap();
+                let h1: Db = env.open_database(&r1, Some("a")).unwrap().unwrap();
+                let h2: Db = env.open_database(&r2, Some("a")).unwrap().unwrap();
+                drop(r1);
+                let own = value(h2.get(&r2, b"k"));
+                r2.commit().unwrap();
+                vec![own, get(&env, h2), get(&env, h1)]
+            }
+
+            pub fn remove_then_use_same_txn(dir: &Path) -> Vec<String> {
+                let env = open(dir);
+                let db = committed(&env);
+                let mut w = env.write_txn().unwrap();
+                // SAFETY: as above.
+                unsafe { db.remove(&mut w) }.unwrap();
+                let put = outcome(db.put(&mut w, b"k", b"v"));
+                w.abort();
+                vec![put]
+            }
+
+            pub fn parent_handles_in_nested_read(dir: &Path) -> Vec<String> {
+                let env = open(dir);
+                let mut w = env.write_txn().unwrap();
+                let b: Db = env.create_database(&mut w, Some("b")).unwrap();
+                b.put(&mut w, b"k", b"b").unwrap();
+                w.commit().unwrap();
+                close(env);
+                let env = open(dir);
+                let mut w = env.write_txn().unwrap();
+                let a: Db = env.create_database(&mut w, Some("a")).unwrap();
+                a.put(&mut w, b"k", b"a").unwrap();
+                let b: Db = env.open_database(&w, Some("b")).unwrap().unwrap();
+                let child = env.nested_read_txn(&w).unwrap();
+                let out = vec![value(a.get(&child, b"k")), value(b.get(&child, b"k"))];
+                drop(child);
+                w.abort();
+                out
+            }
+
             pub fn clear_aborted(dir: &Path) -> Vec<String> {
                 let env = open(dir);
                 let db = committed(&env);
@@ -330,3 +444,25 @@ observe!(
     OBS_CREATE_ABORTED_THEN_OTHER_NAME
 );
 observe!(remove_under_open_read, OBS_REMOVE_UNDER_OPEN_READ);
+observe!(
+    first_open_in_nested_read_parent_commits,
+    OBS_FIRST_OPEN_IN_NESTED_READ_PARENT_COMMITS
+);
+observe!(
+    first_open_in_nested_read_parent_aborts,
+    OBS_FIRST_OPEN_IN_NESTED_READ_PARENT_ABORTS
+);
+observe!(
+    nested_read_committed_parent_commits,
+    OBS_NESTED_READ_COMMITTED_PARENT_COMMITS
+);
+observe!(
+    nested_read_committed_parent_aborts,
+    OBS_NESTED_READ_COMMITTED_PARENT_ABORTS
+);
+observe!(two_readers_first_open, OBS_TWO_READERS_FIRST_OPEN);
+observe!(remove_then_use_same_txn, OBS_REMOVE_THEN_USE_SAME_TXN);
+observe!(
+    parent_handles_in_nested_read,
+    OBS_PARENT_HANDLES_IN_NESTED_READ
+);
