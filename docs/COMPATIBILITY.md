@@ -83,7 +83,7 @@ Behavior differences from LMDB, approved or proposed, are recorded in
 | `set_flags(EnvFlags, FlagSetMode)` | Unsupported | Runtime durability toggling is deferred (SPEC 00) |
 | `resize(usize)` | Same | `unsafe` as in heed; a size that is not a multiple of the OS page size is `Io(InvalidInput)` with heed's message, a live write txn is `Io` (`EINVAL`). The caller's promise heed asks for (no live txns) is not needed: read txns and borrowed values survive a resize. Answers `MdbError::MapResized` with `resize(0)`. With a lock file it waits for the cross-process writer lock, also on a `READ_ONLY` env, while another process holds a write txn (an approved divergence, D-023: heed over LMDB returns at once there, since `mdb_env_set_mapsize` takes no lock, `OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER`) |
 | `copy_to_fd` | Unsupported | Takes an LMDB FFI handle type |
-| `nested_write_txn` | Unsupported | Nested **write** transactions do not exist (an approved divergence) |
+| `nested_write_txn` | Unsupported | Nested **write** transactions do not exist (an approved divergence, D-003): the method is absent, so a call does not compile. heed exposes it publicly (issue #71) |
 | `sync(force)`, `live_readers()`, `reader_list()`, `copy_to_path_with_progress` | Extension | |
 | `set_sequential_writes(&db, Option<bool>)`, `sequential_writes(&db)` | Extension | Per-database override of the env's sequential-writes default; runtime state, not persisted (ADR-0015) |
 | `EnvInfo`, `EnvClosingEvent` (`wait`, `wait_timeout`), `CompactionOption`, `FlagSetMode`, `DefaultComparator` | Same | `EnvClosingEvent` is additionally `Clone` |

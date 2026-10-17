@@ -1394,9 +1394,12 @@ added 2026-10-17).** TXN-40 (nested write unsupported, D-003) is referenced from
   public API**: zerodb exposes **no** nested-write entry point at all — no
   `Env::nested_write_txn`, no `RwTxn::nested` — which is a strictly stronger
   form of the original "clean error" clause (nothing to call, so never a
-  panic and never partial state). heed itself keeps `RwTxn::nested`
-  `pub(crate)`, so the heed-zerodb adapter (M1.13) likewise surfaces no
-  nested-write entry point and no error variant is needed. Should any future
+  panic and never partial state). The heed-zerodb adapter (M1.13) likewise
+  surfaces no nested-write entry point and no error variant is needed. heed
+  itself keeps only `RwTxn::nested` `pub(crate)`: its `Env::nested_write_txn`
+  is public (heed 0.22.1 and Meilisearch's fork), so a consumer calling it
+  does not compile against the adapter (issue #71; corrected 2026-10-17, the
+  ratified text said heed exposed no entry point). Should any future
   surface be forced to exist (e.g. an FFI shim), it must return a clean
   documented "unsupported" error mapped through the heed taxonomy (§8.1).
   Zero consumer call sites (SPEC 00 §A). The 1.14 heed-suite gate excludes
