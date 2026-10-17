@@ -2949,10 +2949,22 @@ impl<'env> RwTxn<'env> {
         }
     }
 
-    /// Branch split (§6.5): the median rises and is **removed from both
+    /// Branch split (§6.5): the split key rises and is **removed from both
     /// children** — the right page's node 0 keeps the rising key's child under
     /// the empty separator. Always returns `true` (it *is* a split), after
     /// propagating the rising key.
+    ///
+    /// **End-of-page insert-point rule** (§6.4): when the new cell lands at
+    /// the end of the page (`at == nkeys`, the pattern every leaf split of an
+    /// ascending load produces in its parent) the split point is
+    /// `s = nkeys - 1`: the old last cell rises and its child becomes the
+    /// right page's node 0, the new cell is node 1 — exactly two children on
+    /// the right page, all other children stay on the left. This is the
+    /// fork's `mdb_page_split` split point for an end insert on a branch, and
+    /// it keeps branches packed on ascending workloads where the median rule
+    /// leaves them about half full. A branch must keep two children (INV-8),
+    /// so the new cell cannot start the right page alone as it does for a
+    /// leaf. Non-end inserts keep the median-fit-adjust rule (`choose_split`).
     fn split_branch(
         &mut self,
         tree: TreeId,
@@ -2964,10 +2976,23 @@ impl<'env> RwTxn<'env> {
     ) -> Result<bool> {
         let (ppg, _) = path[lvl];
         let mut cells = self.extract_branch_cells(ppg)?;
+        let n_old = cells.len();
         cells.insert(at, OwnedBranchCell { key, child });
-        let cap = body_size(self.psize);
-        let sizes: Vec<usize> = cells.iter().map(OwnedBranchCell::used).collect();
-        let s = choose_split(&sizes, cap);
+        // End insert (§6.4): left keeps the first `n_old - 1` children, the
+        // right page gets the old last child plus the new one. Both sides fit
+        // by construction: the left is a subset of the full page, and the
+        // right holds one key-less node 0 plus one cell whose key is at most
+        // `MAX_KEY_SIZE` bytes, far below an empty page's capacity. The
+        // `n_old >= 3` guard keeps the left at two or more children (INV-8);
+        // a full branch always holds more than that at supported page sizes,
+        // but the median rule is the safe fallback.
+        let s = if at == n_old && n_old >= 3 {
+            n_old - 1
+        } else {
+            let cap = body_size(self.psize);
+            let sizes: Vec<usize> = cells.iter().map(OwnedBranchCell::used).collect();
+            choose_split(&sizes, cap)
+        };
         let rising = cells[s].key.clone();
         let rpg = self.allocate(1)?;
         self.dirty.insert_tree_frame(rpg);
