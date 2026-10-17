@@ -353,6 +353,79 @@ impl Backing for WriteMapBacking {
         }
         Ok(())
     }
+
+    fn ranged_sync(&self) -> bool {
+        // SPEC 06 REC-12: the commit barriers `msync` the used prefix and
+        // the meta page, not the whole map.
+        true
+    }
+
+    fn sync_pages(
+        &self,
+        async_flush: bool,
+        psize: u32,
+        ranges: &[(u64, u64)],
+    ) -> std::io::Result<()> {
+        // SPEC 06 REC-12, ranged barrier: one `msync` per byte range, then —
+        // for a synchronous flush — the same `fdatasync` of the data fd as
+        // the whole-map barrier (`sync` above), which `msync` alone does not
+        // replace on macOS. `MAP_ASYNC` issues `MS_ASYNC` and no fdatasync.
+        let map = self.map();
+        for (off, len) in msync_byte_ranges(psize, ranges)? {
+            map.flush_range(off, len, async_flush)?;
+        }
+        if !async_flush {
+            self.file.sync_data()?;
+        }
+        Ok(())
+    }
+}
+
+/// The largest OS page size ZeroDB targets (64 KiB, ARM distributions).
+/// Two page ranges closer than this may share an OS page, which `msync`
+/// flushes whole, so [`msync_byte_ranges`] merges them into one call.
+const MAX_OS_PAGE: usize = 64 * 1024;
+
+/// Byte ranges `(offset, len)` of the page ranges `(start_pgno, pages)`
+/// (ascending, non-overlapping) for the ranged `msync` (SPEC 06 REC-12).
+/// Ranges whose gap is under [`MAX_OS_PAGE`] are merged: the merged range
+/// contains both, and this avoids flushing an OS page shared by two ranges
+/// twice. The output covers every input byte.
+///
+/// # Errors
+///
+/// `InvalidInput` if a range's byte offset overflows `usize`.
+fn msync_byte_ranges(psize: u32, ranges: &[(u64, u64)]) -> std::io::Result<Vec<(usize, usize)>> {
+    let overflow = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "msync range overflows usize",
+        )
+    };
+    let ps = psize as usize;
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for &(pgno, pages) in ranges {
+        if pages == 0 {
+            continue;
+        }
+        let off = usize::try_from(pgno)
+            .ok()
+            .and_then(|p| p.checked_mul(ps))
+            .ok_or_else(overflow)?;
+        let len = usize::try_from(pages)
+            .ok()
+            .and_then(|n| n.checked_mul(ps))
+            .ok_or_else(overflow)?;
+        let end = off.checked_add(len).ok_or_else(overflow)?;
+        match out.last_mut() {
+            Some((start, l)) if off < *start + *l + MAX_OS_PAGE => {
+                debug_assert!(off >= *start, "msync ranges must ascend");
+                *l = (*l).max(end - *start);
+            }
+            _ => out.push((off, len)),
+        }
+    }
+    Ok(out)
 }
 
 /// The result of opening (or creating) an env data file: the [`Backing`] plus
@@ -646,8 +719,56 @@ fn prev_meta_geometry(bytes: &[u8], page_size: u32) -> Option<(u64, u64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{open_or_create, MAX_MAP_SIZE};
+    use super::{msync_byte_ranges, open_or_create, MAX_MAP_SIZE, MAX_OS_PAGE};
     use zerodb_core::error::{Error, MdbError};
+
+    /// SPEC 06 REC-12: the ranged barrier's byte ranges cover every page it
+    /// was given; ranges closer than the largest OS page merge into one call.
+    #[test]
+    fn msync_byte_ranges_cover_every_page() {
+        const PS: u32 = 4096;
+        let ps = PS as usize;
+        let far = (MAX_OS_PAGE / ps) as u64 + 2; // a gap no OS page spans
+        let pages = [(0u64, 2u64), (3, 1), (3 + far, 5), (3 + 2 * far, 0)];
+        let bytes = msync_byte_ranges(PS, &pages).unwrap();
+        assert_eq!(
+            bytes,
+            vec![(0, 4 * ps), ((3 + far as usize) * ps, 5 * ps)],
+            "near ranges merge, far ones stay apart, empty ones vanish"
+        );
+        for &(p, n) in &pages {
+            for pg in p..p + n {
+                let (lo, hi) = (pg as usize * ps, (pg as usize + 1) * ps);
+                assert!(
+                    bytes.iter().any(|&(o, l)| o <= lo && hi <= o + l),
+                    "page {pg} not covered by {bytes:?}"
+                );
+            }
+        }
+        assert!(msync_byte_ranges(PS, &[(u64::MAX, 1)]).is_err());
+    }
+
+    /// The ranged barrier runs on a real writable map, and a range past the
+    /// map is an error, not a panic or a silent no-op.
+    #[test]
+    fn writemap_sync_pages_flushes_ranges_and_rejects_out_of_map() {
+        const PS: u32 = 4096;
+        const MAP: u64 = 1 << 20;
+        let tmp = TempFile::new("ranged-msync");
+        let opened = open_or_create(&tmp.0, PS, Some(MAP), MAP, false, true).unwrap();
+        let b = opened.backing;
+        assert!(b.ranged_sync(), "the writable map flushes ranges");
+        b.write_at_page(5, PS, &[0xA5; PS as usize]).unwrap();
+        b.sync_pages(false, PS, &[(0, 2), (5, 1)]).unwrap();
+        b.sync_pages(true, PS, &[(5, 1)]).unwrap();
+        assert_eq!(
+            &b.bytes()[5 * PS as usize..6 * PS as usize],
+            &[0xA5; PS as usize][..]
+        );
+        let past = MAP / u64::from(PS);
+        let err = b.sync_pages(false, PS, &[(past, 1)]).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
 
     /// A fresh path in the temp dir, removed on drop.
     struct TempFile(std::path::PathBuf);

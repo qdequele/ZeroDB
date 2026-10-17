@@ -269,6 +269,39 @@ pub trait Backing: Send + Sync {
         let _ = async_flush;
         self.sync_data()
     }
+
+    /// Whether [`Backing::sync_pages`] flushes only the page ranges it is
+    /// given (SPEC 06 REC-12, ranged `WRITE_MAP` barrier). `true` only for
+    /// the writable-map backing, whose barrier is an `msync` and can be
+    /// limited to the file's used prefix. Default `false`: the commit
+    /// pipeline then calls [`Backing::sync`] and skips building the ranges.
+    fn ranged_sync(&self) -> bool {
+        false
+    }
+
+    /// The commit barrier limited to `ranges` (SPEC 06 REC-12): make durable
+    /// at least every byte of the `pages`-page runs starting at each
+    /// `start_pgno` of `ranges` (`(start_pgno, pages)`, ascending and
+    /// non-overlapping). The commit pipeline calls it only when
+    /// [`Backing::ranged_sync`] is `true`, with the used prefix
+    /// `[0, next_pgno)` at C3 and the meta slot it wrote at C5.
+    /// `async_flush` has the meaning it has for [`Backing::sync`].
+    ///
+    /// The default ignores `ranges` and calls [`Backing::sync`], which
+    /// flushes a superset.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the fsync/msync I/O error (the caller poisons the env, REC-13).
+    fn sync_pages(
+        &self,
+        async_flush: bool,
+        psize: u32,
+        ranges: &[(u64, u64)],
+    ) -> std::io::Result<()> {
+        let _ = (psize, ranges);
+        self.sync(async_flush)
+    }
 }
 
 // ---------------------------------------------------------------------------

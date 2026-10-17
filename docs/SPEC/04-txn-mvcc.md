@@ -988,6 +988,8 @@ spilling bullet there.)
   offsets, and in-frame edits (TXN-42 rule 2) mutate the map bytes directly.
   Commit C2 therefore writes nothing for these frames; C3's `msync` is the
   barrier that makes the in-place stores durable, and C4/C5 are unchanged.
+  That `msync` is ranged (SPEC 06 REC-12): it covers the used prefix
+  `[0, next_pgno)`, which holds every frame and spilled page of the txn.
   Rules and consequences:
   - **Reader safety is TXN-62's, applied earlier.** Every in-place store
     targets a pgno this txn **allocated** (beyond the committed high-water, or
