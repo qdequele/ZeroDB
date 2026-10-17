@@ -12,6 +12,7 @@
 | [`RELEASING.md`](RELEASING.md) | How a version is cut: gate, consumer gate, docs truth pass, versions, CHANGELOG, tag, release workflow (ADR-0013) | Procedure |
 | [`BENCH-MAP.md`](BENCH-MAP.md) | The LMDB-vs-ZeroDB microbench ladder: what every rung isolates, which PERF-GAP item it implicates, and how to read a jump between adjacent rungs (`just bench`, `just bench-report`) | Bench procedure |
 | [`CONSUMER-GATE.md`](CONSUMER-GATE.md) | Meilisearch on ZeroDB: the zero-source-change drop-in check, the consumer test suites, and the LMDB-vs-ZeroDB Meilisearch benchmark (`scripts/consumer.sh`) | Gate + bench procedure |
+| [`BUILD-GUIDE.md`](BUILD-GUIDE.md) | Build-time guidance for consumers: what's already settled on `codegen-units`/LTO/inlining, and the open Graviton `target-cpu` and PGO/BOLT questions | Guide |
 | [`TOOLS.md`](TOOLS.md) | Manual for `zerodb-tools` (`stat`/`dump`/`load`/`check`/`migrate-from-lmdb`) | Manual |
 
 Top-level companions: [`AGENTS.md`](../AGENTS.md) (the project rules: oracle
