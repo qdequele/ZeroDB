@@ -25,6 +25,26 @@ from an aborted `create_database` re-created and committed that database.
   share its handle.
 - New error variant `MdbError::BadDbi`.
 
+### Branch pages packed on ascending inserts
+
+#### Changed
+
+- **A full branch page that takes a new last child now splits with two
+  children on the new page** and keeps all the others, instead of splitting
+  near the middle — the split point LMDB uses (SPEC 03 §6.4). Ascending
+  loads (sorted bulk loads, increasing ids) leave branch pages nearly full
+  rather than about half full: at 4 KiB pages, 20 000 ascending 500-byte
+  keys now build 480 branch pages and a 6-level tree, against 949 pages and
+  7 levels before.
+- **A plain put at the end of a full leaf now moves the old last entry to the
+  new page with the new one**, as LMDB does; only an `APPEND` put starts the
+  new page with the new entry alone. Before, every end insert did that, so
+  ZeroDB's leaves on ascending plain puts held one entry more than LMDB's
+  (4 KiB pages, 20 000 ascending 500-byte entries: 2858 leaves, LMDB 3334).
+  At 16 KiB pages both engines now build exactly the leaf count this rule
+  predicts. Files built by ascending plain puts grow
+  accordingly; `APPEND` loads do not change.
+
 ### Multi-process access (ADR-0023)
 
 Several processes can now open one environment at the same time and read or

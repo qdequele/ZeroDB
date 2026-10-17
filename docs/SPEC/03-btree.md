@@ -565,10 +565,9 @@ split(page P at insertion index newindx, new cell):
   split with the **end-of-page insert-point policy** (§6.4): put the *new* key
   alone on a fresh right page instead of splitting the full page in half — this
   keeps sequentially-loaded pages ~100 % full and avoids repeated half-empty
-  pages (milli facet bulk / arroy item append). *(As of the 2026-07-16
-  ADR-0005 D5 amendment this split behavior is no longer APPEND-specific — it is
-  the general behavior for any end-of-page insert, §6.4. APPEND's distinctness
-  is now only its **last-key-compare validation** below, not its split rule.)*
+  pages (milli facet bulk / arroy item append). *(A plain put at the end of a
+  full leaf also avoids the median split, but moves the old last entry to the
+  right page with the new one, §6.4; only APPEND puts the new key alone.)*
 - `key == last_key` or `key < last_key`: `KeyExist` (`MDB_KEYEXIST` → heed
   `KeyExist` → arroy `InvalidItemAppend`). Equal-to-last is an error, **not** a
   silent overwrite (contrast plain put).
@@ -593,19 +592,35 @@ belongs to `R`). Let `C = psize − HEADER_SIZE` be the body capacity and, for a
 page holding a set of cells, `used = Σ(cell_size + 2)` (each cell plus its 2-byte
 pointer). A split is **feasible** at `s` iff `used(L) ≤ C` **and** `used(R) ≤ C`.
 
-- **End-of-page insert-point split (`newindx == nkeys`) — MUST.** When the new
-  cell lands at the very end of the page (`newindx == nkeys`; the new key is
-  greater than every existing key on the page), force `s = nkeys`: **all**
-  `nkeys` existing cells stay on `L`, and the new cell alone starts `R`. This
-  is the fork's `mdb_page_split` behavior for any end insert — it keeps
-  sequentially-loaded pages ~100 % full and roughly doubles leaf fill on
-  ascending workloads (milli's dominant put pattern), where the median rule
-  would instead leave a cascade of ~50 %-full leaves (ADR-0005 D5: measured
-  400 ascending ~500 B puts → ~132 leaves under the median rule vs ~68 for the
-  fork). APPEND (§6.3) is one case of this rule; it keeps its distinct
-  last-key-compare validation (§6.3) but its split behavior is now the general
-  end-of-page behavior. This rule is applied to **leaf splits** (see the
-  branch-scope note below).
+- **End-of-page split, leaves (`newindx == nkeys`) — MUST (AMENDED
+  2026-10-17, issue #105).** When the new cell lands at the very end of a full
+  leaf (`newindx == nkeys`; the new key is greater than every existing key on
+  the page), the split point depends on how the cell was put, as in the
+  fork's `mdb_page_split`:
+  - **APPEND (§6.3):** force `s = nkeys`. **All** `nkeys` existing cells stay
+    on `L`, and the new cell alone starts `R`.
+  - **Plain put:** force `s = nkeys − 1`. The old last cell and the new cell
+    form `R`; the first `nkeys − 1` cells stay on `L`. If the full page holds
+    fewer than two cells, or the two cells do not fit on one page (not
+    reachable: `max_node_size` guarantees two entries fit, SPEC 02 §4.2), the
+    APPEND form applies instead.
+
+  Observed through the oracle (`crates/zerodb-oracle/tests/ascending_fill_parity.rs`,
+  `*_leaf_model*` tests): an ascending load of `n` entries over leaves of
+  `cap` entries builds `ceil(n / cap)` leaves with APPEND and
+  `1 + ceil((n − cap) / (cap − 1))` with plain puts, in both engines. Both
+  forms keep sequentially loaded leaves nearly full, where the median rule
+  would leave a cascade of ~50 %-full leaves (ADR-0005 D5: 400 ascending
+  ~500 B puts gave ~132 leaves under the median rule against ~68 for the
+  fork). Branch splits apply the rule in the two-children form described in
+  the branch-split note below.
+
+  Pre-amendment text (superseded 2026-10-17, preserved for the record): the
+  rule forced `s = nkeys` for every end insert, plain puts included, and
+  described that as the fork's behavior. The fork does that only for APPEND;
+  on a plain end put it moves the old last cell too, so zerodb's leaves were
+  one entry denser than the fork's (4 KiB pages, 20 000 ascending 500 B puts:
+  2858 leaves against the fork's 3334).
 
 - **Normal split — median then fit-adjust (exact) — non-end inserts
   (`newindx < nkeys`):**
@@ -644,24 +659,55 @@ pointer). A split is **feasible** at `s` iff `used(L) ≤ C` **and** `used(R) �
     byte-identical boundary in every case. The gate is the **M1.5 tolerance
     band**: page counts must track the oracle within that band, not exactly.
 
-- **Branch-split scope (ADR-0005 D5).** The end-of-page insert-point rule is
-  applied to **leaf splits only** in Phase 1. Branch splits (§6.5) keep the
-  median-fit-adjust `choose_split` for every `newindx`, including
-  `newindx == nkeys`. Rationale: a literal "new cell alone on `R`" would leave
-  the right branch with a single child (node 0 only), violating the branch
-  `min_keys = 2` occupancy invariant (INV-8) — the fork itself does not put the
-  new child alone but lands its end-insert split at `nkeys − 1` (two children on
-  `R`) via a fit loop, a different computation from the leaf "new alone" case.
-  Leaves carry essentially all of the ascending-workload fill-factor effect
-  (there are far more leaves than branches; ADR-0005 D5's ~2× ratio is a leaf
-  phenomenon), so leaves-only captures the benefit without the branch-occupancy
-  hazard. The M1.5 tolerance band and the oracle page-count parity tests
-  gate the resulting counts either way.
+- **Branch splits — end-of-page rule, two-children form (AMENDED 2026-10-17,
+  issue #11; extends ADR-0005 D5 to branches) — MUST.** When the new cell
+  lands at the end of a full **branch** (`newindx == nkeys`), force
+  `s = nkeys − 1`: the old last cell is the rising separator (§6.5), its child
+  becomes node 0 of `R`, and the new cell is node 1 of `R` — exactly **two
+  children on `R`**; the first `nkeys − 1` children stay on `L`. A literal
+  "new cell alone on `R`" would leave the right branch with a single child,
+  violating the branch two-children minimum (INV-8). This is the fork's
+  `mdb_page_split` split point for an end insert on a branch (observed via
+  the oracle: `crates/zerodb-oracle/tests/ascending_fill_parity.rs`, whose
+  `*_branch_parity` tests check both engines' branch counts and heights
+  against this rule at 4 KiB and 16 KiB pages). Both sides are feasible by
+  construction: `L` is a subset of the full page, and `R` holds a key-less
+  node 0 plus one cell of at most `MAX_KEY_SIZE` bytes. If the full page holds
+  fewer than three children (not reachable at supported page sizes, where a
+  full branch holds at least seven), the median-fit-adjust rule applies
+  instead so `L` keeps two children. Non-end branch inserts
+  (`newindx < nkeys`) keep the median-fit-adjust `choose_split`.
+
+  Why it matters: every leaf split of an ascending load inserts its separator
+  at the end of the parent branch, so under the median rule branches settled
+  about half full (roughly twice the fork's branch count and, on narrow
+  fanouts, one extra tree level). Under this rule a non-rightmost branch on an
+  ascending load holds one child fewer than a full page — measured at 4 KiB
+  pages with 500-byte keys over 20 000 ascending puts: 949 branch pages,
+  depth 7 before; 480, depth 6 after (fork: 558, depth 6, over more leaves).
+
+  Pre-amendment text (superseded 2026-10-17, preserved for the record):
+
+  > *Branch-split scope (ADR-0005 D5).* The end-of-page insert-point rule is
+  > applied to **leaf splits only** in Phase 1. Branch splits (§6.5) keep the
+  > median-fit-adjust `choose_split` for every `newindx`, including
+  > `newindx == nkeys`. Rationale: a literal "new cell alone on `R`" would
+  > leave the right branch with a single child (node 0 only), violating the
+  > branch `min_keys = 2` occupancy invariant (INV-8) — the fork itself does
+  > not put the new child alone but lands its end-insert split at `nkeys − 1`
+  > (two children on `R`) via a fit loop, a different computation from the
+  > leaf "new alone" case. Leaves carry essentially all of the
+  > ascending-workload fill-factor effect (there are far more leaves than
+  > branches; ADR-0005 D5's ~2× ratio is a leaf phenomenon), so leaves-only
+  > captures the benefit without the branch-occupancy hazard. The M1.5
+  > tolerance band and the oracle page-count parity tests gate the resulting
+  > counts either way.
 
 - **Rising separator.** For a **leaf** split the separator promoted to the parent
-  is the first key of `R` (the key at post-insert index `s`, or the sole new
-  cell under the end-of-page rule); for a **branch** split it is the removed
-  median key (§6.5).
+  is the first key of `R` (the key at post-insert index `s`: the new key for
+  an APPEND end split, the old last key for a plain end split); for a **branch** split it is the key at
+  `s`, removed from both pages (§6.5) — the split-point key under the
+  median rule, or the old last key under the end-of-page rule.
 
 **Pre-amendment text (superseded 2026-07-16, ADR-0005 D5 — preserved for the
 record).** Before the ratified end-of-page rule, the median-fit-adjust
