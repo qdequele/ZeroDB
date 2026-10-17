@@ -289,6 +289,20 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
             artifact: None,
         });
     }
+    // SPEC 06 REC-12: WRITE_MAP commit barriers are ranged, and the fault
+    // journal folds only the requested ranges — so a WRITE_MAP cycle whose
+    // synchronous barriers were all whole-file would test nothing about the
+    // ranges.
+    if write_map && stats.barriers > 0 && stats.ranged_barriers == 0 {
+        return Err(CutFail::Violation {
+            detail: format!(
+                "WRITE_MAP cycle ran {} synchronous barrier(s), none ranged — the ranged msync \
+                 barrier disengaged (SPEC 06 REC-12 vacuousness tripwire)",
+                stats.barriers
+            ),
+            artifact: None,
+        });
+    }
 
     // The cut: hook capture, else op-boundary capture, else end-of-run. Each
     // carries the acked txnid at cut time: a hook capture fires inside the

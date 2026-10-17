@@ -57,6 +57,17 @@
 //! references, and under `MAP_ASYNC` the adversarial sub-model is
 //! probe-only, ADR-0008 D4.)
 //!
+//! ## Ranged barriers (SPEC 06 REC-12)
+//!
+//! Under `WRITE_MAP` the commit barriers are ranged: C3 flushes the pages
+//! the txn wrote plus both meta slots, C5 the meta slot it wrote. This
+//! wrapper forwards `Backing::ranged_sync`, and a synchronous
+//! `sync_pages` folds only the pending bytes inside the requested page
+//! ranges — exactly those, not widened to OS pages — leaving the rest
+//! pending. The model is therefore stricter than the real barrier (which
+//! also `fdatasync`s the file): it checks that the ranges alone cover
+//! everything the new meta references.
+//!
 //! The live view stays the wrapped backing's — no new aliasing. The only
 //! `unsafe` is the mandatory `unsafe fn` forward of the brokered map slice
 //! (ADR-0021 B1), which adds no obligation of its own.
@@ -162,8 +173,13 @@ pub struct WriteRecord {
 pub struct FaultStats {
     /// `write_at_page` calls journaled.
     pub writes: u64,
-    /// Synchronous barriers completed (pending folded into durable).
+    /// Synchronous barriers completed (pending folded into durable), whole
+    /// or ranged.
     pub barriers: u64,
+    /// Of `barriers`, the ranged ones (`sync_pages`, SPEC 06 REC-12): each
+    /// folds only the pending bytes inside its page ranges. Nonzero iff a
+    /// WRITE_MAP commit ran a synchronous barrier.
+    pub ranged_barriers: u64,
     /// Asynchronous flushes observed (deliberately **not** barriers, REC-9:
     /// `msync(MS_ASYNC)` gives no completion guarantee).
     pub async_flushes: u64,
@@ -260,6 +276,70 @@ impl FaultState {
             self.durable_len = self.durable_len.max(end);
         }
     }
+
+    /// A ranged barrier (SPEC 06 REC-12): fold into `durable` only the
+    /// pending bytes inside `ranges` (byte `(offset, len)`, ascending,
+    /// non-overlapping); every byte outside them stays pending, split off
+    /// into its own record. Records are folded in issue order, so a range
+    /// ends up with its newest bytes — the page-cache content the real
+    /// `msync` writes — and an older pending record at the same bytes is
+    /// consumed with it, never replayed over the newer durable bytes. The
+    /// ranges are the exact page ranges the engine asked for, not widened to
+    /// OS pages: a missed page stays pending and the harness can drop it.
+    fn fold_ranges(&mut self, ranges: &[(u64, u64)]) {
+        debug_assert!(
+            ranges.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0),
+            "ranged barrier ranges must ascend without overlap"
+        );
+        self.stats.barriers += 1;
+        self.stats.ranged_barriers += 1;
+        let broken = self.broken_data_barriers;
+        let meta_end = 2 * u64::from(self.psize);
+        let pending = std::mem::take(&mut self.pending);
+        for rec in pending {
+            let (start, end) = (rec.offset, rec.offset + rec.data.len() as u64);
+            // Split `[start, end)` at the range bounds: inside pieces fold,
+            // outside pieces stay pending in order.
+            let mut cur = start;
+            for &(r_off, r_len) in ranges {
+                let r_end = r_off + r_len;
+                if r_end <= cur {
+                    continue;
+                }
+                if r_off >= end {
+                    break;
+                }
+                let (lo, hi) = (r_off.max(cur), r_end.min(end));
+                if lo > cur {
+                    self.keep_pending(&rec, cur, lo);
+                }
+                if broken && rec.offset >= meta_end {
+                    // ADR-0008 D6.1 self-test: data durability is dropped.
+                    self.keep_pending(&rec, lo, hi);
+                } else {
+                    if self.durable.len() < hi as usize {
+                        self.durable.resize(hi as usize, 0);
+                    }
+                    let src = &rec.data[(lo - start) as usize..(hi - start) as usize];
+                    self.durable[lo as usize..hi as usize].copy_from_slice(src);
+                    self.durable_len = self.durable_len.max(hi);
+                }
+                cur = hi;
+            }
+            if cur < end {
+                self.keep_pending(&rec, cur, end);
+            }
+        }
+    }
+
+    /// Re-queue the bytes `[lo, hi)` of `rec` (absolute offsets) as pending.
+    fn keep_pending(&mut self, rec: &WriteRecord, lo: u64, hi: u64) {
+        let base = rec.offset;
+        self.pending.push(WriteRecord {
+            offset: lo,
+            data: rec.data[(lo - base) as usize..(hi - base) as usize].into(),
+        });
+    }
 }
 
 /// The harness's handle onto a [`FaultBacking`]'s journal: capture simulated
@@ -313,7 +393,10 @@ impl FaultHandle {
 /// B3) are journaled at broker time and resolved at seal points (module
 /// docs). `sync(false)` folds the journal (the REC-20 pending→durable
 /// transition); `sync(true)` (`MAP_ASYNC`) deliberately does **not** — the
-/// most adversarial sound model of `msync(MS_ASYNC)`.
+/// most adversarial sound model of `msync(MS_ASYNC)`. The ranged barrier
+/// `sync_pages(false, ..)` (`WRITE_MAP`, SPEC 06 REC-12) folds only the
+/// pending bytes inside the page ranges the engine passed, so a page the
+/// engine forgot to flush stays pending and a crash image can lose it.
 pub struct FaultBacking {
     inner: Arc<dyn Backing>,
     state: Arc<Mutex<FaultState>>,
@@ -482,6 +565,36 @@ impl Backing for FaultBacking {
             }
         }
         self.inner.sync(async_flush)
+    }
+
+    fn ranged_sync(&self) -> bool {
+        // Forward, so WRITE_MAP crash cycles run the ranged barrier the
+        // production writable map runs (SPEC 06 REC-12).
+        self.inner.ranged_sync()
+    }
+
+    fn sync_pages(
+        &self,
+        async_flush: bool,
+        psize: u32,
+        ranges: &[(u64, u64)],
+    ) -> std::io::Result<()> {
+        {
+            let mut st = self.state.lock().expect("fault state lock");
+            debug_assert_eq!(psize, st.psize, "sync psize drifted from env psize");
+            // A seal point like `sync`: the brokered regions' current bytes
+            // become pending records first, so the ranged fold sees them.
+            st.seal_map_regions(self.inner.bytes());
+            if async_flush {
+                st.stats.async_flushes += 1;
+            } else {
+                let ps = u64::from(psize);
+                let bytes: Vec<(u64, u64)> =
+                    ranges.iter().map(|&(p, n)| (p * ps, n * ps)).collect();
+                st.fold_ranges(&bytes);
+            }
+        }
+        self.inner.sync_pages(async_flush, psize, ranges)
     }
 }
 
@@ -923,6 +1036,54 @@ mod tests {
         );
         assert_eq!(cap.durable[5 * PS as usize], 0xAA);
         assert_eq!(h.stats().barriers, 1);
+    }
+
+    /// SPEC 06 REC-12 model: a ranged barrier folds only the pending bytes
+    /// inside its page ranges. A page outside them — the "missed range" the
+    /// ranged barrier must never produce — stays pending, so a crash image
+    /// can lose it.
+    #[test]
+    fn ranged_barrier_folds_only_its_ranges() {
+        let (b, h) = setup(2);
+        b.write_at_page(4, PS, &page(0xA4)).unwrap();
+        // A 3-page run straddling the range bound: page 6 folds, 7..9 stay.
+        let run: Vec<u8> = [page(0xB6), page(0xB7), page(0xB8)].concat();
+        b.write_at_page(6, PS, &run).unwrap();
+        b.write_at_page(9, PS, &page(0xA9)).unwrap();
+        b.sync_pages(false, PS, &[(4, 1), (6, 1), (9, 1)]).unwrap();
+        let cap = h.capture();
+        let ps = PS as usize;
+        assert_eq!(cap.durable[4 * ps], 0xA4);
+        assert_eq!(cap.durable[6 * ps], 0xB6);
+        assert_eq!(cap.durable[9 * ps], 0xA9);
+        assert_eq!(cap.pending.len(), 1, "only the uncovered tail of the run");
+        assert_eq!(cap.pending[0].offset, 7 * u64::from(PS));
+        assert_eq!(cap.pending[0].data.len(), 2 * ps);
+        assert_eq!(cap.pending[0].data[ps], 0xB8);
+        let s = h.stats();
+        assert_eq!((s.barriers, s.ranged_barriers), (1, 1));
+        // An async ranged flush folds nothing.
+        b.sync_pages(true, PS, &[(7, 2)]).unwrap();
+        assert_eq!(h.capture().pending.len(), 1);
+        // A later ranged barrier over those bytes folds them.
+        b.sync_pages(false, PS, &[(7, 2)]).unwrap();
+        assert!(h.capture().pending.is_empty());
+    }
+
+    /// A ranged barrier consumes an older pending record at the bytes it
+    /// folds: the newer version is durable, and no crash image may replay
+    /// the older one over it.
+    #[test]
+    fn ranged_barrier_supersedes_older_pending_bytes() {
+        let (b, h) = setup(2);
+        b.write_at_page(5, PS, &page(0x01)).unwrap();
+        b.sync_pages(false, PS, &[(0, 2)]).unwrap();
+        assert_eq!(h.capture().pending.len(), 1, "page 5 was not in range");
+        b.write_at_page(5, PS, &page(0x02)).unwrap();
+        b.sync_pages(false, PS, &[(5, 1)]).unwrap();
+        let cap = h.capture();
+        assert!(cap.pending.is_empty(), "both versions folded");
+        assert_eq!(cap.durable[5 * PS as usize], 0x02, "newest bytes win");
     }
 
     #[test]
