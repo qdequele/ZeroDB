@@ -70,9 +70,14 @@ fn check_read_key(kb: &[u8]) -> Result<()> {
 /// monomorphizes over the concrete `zerodb` txn type (all `TxnRead`).
 macro_rules! with_read {
     // Database operation: check the handle/txn environment pairing first.
+    // Then the handle's validity in this txn (ADR-0024): `EINVAL` or
+    // `MDB_BAD_DBI` before any work, as LMDB returns them.
     ($db:expr, $txn:expr, |$t:ident| $e:expr) => {{
         $db.assert_env($txn);
-        with_read!($txn, |$t| $e)
+        with_read!($txn, |$t| {
+            zerodb::TxnRead::check_db($t, &$db.inner)?;
+            $e
+        })
     }};
     ($txn:expr, |$t:ident| $e:expr) => {
         match &$txn.inner {
@@ -183,6 +188,12 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
             self.env_ident == txn.env_ident(),
             "The database environment doesn't match the transaction's environment"
         );
+    }
+
+    /// Whether this handle may be used in `txn` (ADR-0024): what heed's
+    /// cursor-opening calls get from LMDB's `mdb_cursor_open` up front.
+    fn check_handle(&self, txn: &RoTxn) -> Result<()> {
+        with_read!(txn, |t| zerodb::TxnRead::check_db(t, &self.inner)).map_err(Into::into)
     }
 
     /// `get(txn, key)` (SPEC 00 row 30): the value for `key`, or `None`.
@@ -468,6 +479,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     /// Infallible construction; returns [`Result`] for heed shape.
     pub fn iter_mut<'txn>(&self, txn: &'txn mut RwTxn) -> Result<RwIter<'txn, KC, DC>> {
         self.assert_env(txn);
+        self.check_handle(txn)?;
         Ok(RwIter::new(RwGuts::new(
             txn,
             self.inner,
@@ -484,6 +496,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     /// As [`Database::iter_mut`].
     pub fn rev_iter_mut<'txn>(&self, txn: &'txn mut RwTxn) -> Result<RwRevIter<'txn, KC, DC>> {
         self.assert_env(txn);
+        self.check_handle(txn)?;
         Ok(RwRevIter::new(RwGuts::new(
             txn,
             self.inner,
@@ -508,6 +521,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         R: RangeBounds<KC::EItem>,
     {
         self.assert_env(txn);
+        self.check_handle(txn)?;
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
         Ok(RwRange::new(RwGuts::new(txn, self.inner, Dir::Fwd, lo, hi)))
     }
@@ -527,6 +541,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         R: RangeBounds<KC::EItem>,
     {
         self.assert_env(txn);
+        self.check_handle(txn)?;
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
         Ok(RwRevRange::new(RwGuts::new(
             txn,
@@ -553,6 +568,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         C: LexicographicComparator,
     {
         self.assert_env(txn);
+        self.check_handle(txn)?;
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
         check_read_key(&pb)?;
         let (lo, hi) = prefix_bounds(&pb);
@@ -580,6 +596,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         C: LexicographicComparator,
     {
         self.assert_env(txn);
+        self.check_handle(txn)?;
         let pb = KC::bytes_encode(prefix).map_err(Error::Encoding)?;
         let (lo, hi) = prefix_bounds(&pb);
         Ok(RwRevPrefix::new(RwGuts::new(

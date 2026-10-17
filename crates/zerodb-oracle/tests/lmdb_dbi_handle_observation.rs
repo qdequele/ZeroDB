@@ -8,9 +8,10 @@
 //! for `MDB_BAD_DBI`).
 //! The `OBS_*` constants pin LMDB's outcomes; a diff means the fork changed or
 //! the pin was wrong, never edit a pin to make ZeroDB pass. Pins observed on
-//! macOS (Darwin 27.0.0, aarch64), 2026-10-17. ZeroDB runs the
-//! same scripts and its outcomes are printed beside LMDB's (`--nocapture`),
-//! not asserted: they differ today, and the design decides which must match.
+//! macOS (Darwin 27.0.0, aarch64), 2026-10-17. ZeroDB runs the same scripts
+//! and must match each pin, except in the two cases of divergence D-026
+//! (ADR-0024), where it is held to its own, stricter outcome. Both are
+//! printed side by side with `--nocapture`.
 
 use zerodb_oracle::tempdir::TempDir;
 
@@ -404,7 +405,12 @@ cases!(lmdb, heed);
 cases!(zerodb, heed_zerodb);
 
 macro_rules! observe {
+    // ZeroDB must match LMDB's pin.
     ($test:ident, $pin:ident) => {
+        observe!($test, $pin, $pin);
+    };
+    // ZeroDB is held to its own outcome: an approved divergence.
+    ($test:ident, $pin:ident, $zerodb:expr) => {
         #[test]
         fn $test() {
             let (a, b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
@@ -418,6 +424,8 @@ macro_rules! observe {
                 if l == z { "" } else { "  DIFFERS" }
             );
             assert_eq!(l, $pin, "LMDB outcome changed for {}", stringify!($test));
+            let want: &[&str] = $zerodb;
+            assert_eq!(z, want, "ZeroDB outcome for {}", stringify!($test));
         }
     };
 }
@@ -439,9 +447,11 @@ observe!(remove_committed, OBS_REMOVE_COMMITTED);
 observe!(remove_aborted, OBS_REMOVE_ABORTED);
 observe!(uncommitted_handle_in_read, OBS_UNCOMMITTED_HANDLE_IN_READ);
 observe!(clear_aborted, OBS_CLEAR_ABORTED);
+// D-026: the stale handle does not reach the database that took its slot.
 observe!(
     create_aborted_then_other_name,
-    OBS_CREATE_ABORTED_THEN_OTHER_NAME
+    OBS_CREATE_ABORTED_THEN_OTHER_NAME,
+    &["EINVAL", "none"]
 );
 observe!(remove_under_open_read, OBS_REMOVE_UNDER_OPEN_READ);
 observe!(
@@ -460,7 +470,12 @@ observe!(
     nested_read_committed_parent_aborts,
     OBS_NESTED_READ_COMMITTED_PARENT_ABORTS
 );
-observe!(two_readers_first_open, OBS_TWO_READERS_FIRST_OPEN);
+// D-026: co-openers share the slot; the committed handle stays valid.
+observe!(
+    two_readers_first_open,
+    OBS_TWO_READERS_FIRST_OPEN,
+    &["v", "v", "v"]
+);
 observe!(remove_then_use_same_txn, OBS_REMOVE_THEN_USE_SAME_TXN);
 observe!(
     parent_handles_in_nested_read,

@@ -211,7 +211,8 @@ removes and re-creates databases under a long read.
 
 ### Cost
 
-Each check is three `Acquire` loads in the common case:
+Each check is four `Acquire` loads in the common case:
+- the transaction's memo table (a `OnceLock`);
 - the epoch;
 - the transaction's memo for the slot, which holds the epoch of its last
   successful check;

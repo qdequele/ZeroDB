@@ -575,18 +575,20 @@ name with mismatched flags → `MdbError::Incompatible` (SPEC 01 §S8). All the
 
 ### §6.1 — M1.6 implementation notes (open/create/clear/drop, write-back)
 
-- **dbi table.** A named `Database` handle carries a small integer *dbi index*
-  into an env-level registry (`EnvInner::named`, ZeroDB's analogue of LMDB's
-  `me_dbxs`) that maps dbi → **name only**. The record always resolves lazily
-  from the transaction's catalog view (SPEC 04 TXN-10 step 3): `open_database`
-  searches the main tree for the name; `create_database` inserts an empty
-  `F_SUBDATA` record eagerly (LMDB `MDB_CREATE` semantics) so it is visible
-  in-txn and discarded with the dirty set on abort. Assignment is append-only
-  within a process (an interim simplification like the M1.5 reader registry);
-  it is unobservable through the SPEC-00 surface because resolution is always
-  catalog-driven (an aborted create resolves to *absent*; re-creating re-uses
-  the dbi). `max_dbs` counts distinct named DBs; the `max_dbs+1`-th distinct
-  name → `MdbError::DbsFull`.
+- **dbi table.** A named `Database` handle carries a slot index and the
+  slot's generation, into the env-level slot table (`EnvInner::handles`,
+  ZeroDB's analogue of LMDB's `me_dbxs` and `me_dbflags`). The table maps
+  slot → name and tracks each slot's lifetime: a handle opened in a txn that
+  ends without committing, or whose database was removed, is refused with
+  LMDB's `EINVAL` or `MDB_BAD_DBI` (SPEC 04 §13, DBI-1..10; ADR-0024). The
+  record always resolves lazily from the transaction's catalog view (SPEC 04
+  TXN-10 step 3): `open_database` searches the main tree for the name;
+  `create_database` inserts an empty `F_SUBDATA` record eagerly (LMDB
+  `MDB_CREATE` semantics) so it is visible in-txn and discarded with the
+  dirty set on abort. Freed slots are reused, as LMDB reuses dbis, and
+  `max_dbs` counts slots in use; the `max_dbs+1`-th → `MdbError::DbsFull`.
+  (Before ADR-0024 the table was append-only and kept no lifetime, which let
+  a write through a handle from an aborted create re-create the database.)
 - **`F_SUBDATA` preservation.** A catalog value is always a 48-byte inline
   record, never `F_BIGDATA`. The `F_SUBDATA` node flag is threaded through the
   write path (`OwnedLeafCell.flags`) so it survives leaf splits, merges, and

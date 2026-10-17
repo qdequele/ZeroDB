@@ -120,6 +120,10 @@ impl ChildCounter {
 /// child's lifetime when wrapping it.
 pub struct NestedRoTxn<'p> {
     parent: &'p RwTxn<'p>,
+    /// This child's own state in the env's slot table (ADR-0024): what it
+    /// opens is its own, freed when it is dropped and published when it
+    /// commits. It also accepts every handle its parent accepts.
+    handles: crate::handles::TxnHandles,
 }
 
 impl<'p> NestedRoTxn<'p> {
@@ -136,7 +140,33 @@ impl<'p> NestedRoTxn<'p> {
     /// `MDB_BAD_TXN`).
     pub(crate) fn open(parent: &'p RwTxn<'p>) -> NestedRoTxn<'p> {
         parent.children().bump();
-        NestedRoTxn { parent }
+        NestedRoTxn {
+            parent,
+            handles: parent.env_inner().handles().begin(),
+        }
+    }
+
+    /// `commit` (heed's `RoTxn::commit` on a nested read txn): end the child,
+    /// keeping the databases it opened for transactions that begin after it.
+    /// Its parent, begun before, does not gain them (ADR-0024, as LMDB).
+    ///
+    /// # Errors
+    ///
+    /// Infallible; returns [`crate::error::Result`] for heed's API shape.
+    pub fn commit(mut self) -> crate::error::Result<()> {
+        self.end_handles(true);
+        Ok(())
+    }
+
+    fn end_handles(&mut self, committed: bool) {
+        if self.handles.is_idle() {
+            return;
+        }
+        let parent = self.parent;
+        parent
+            .env_inner()
+            .handles()
+            .end(&mut self.handles, committed);
     }
 
     /// The snapshot this child observes: the **writer's** txnid (TXN-26 —
@@ -152,6 +182,8 @@ impl Drop for NestedRoTxn<'_> {
         // TXN-31: decrement with `Release` (see ChildCounter::release) — may
         // run on a worker thread. The parent resumes implicitly (RAII, heed
         // parity): the next `&mut` op simply passes the TXN-29 guard.
+        // ADR-0024: an end without a commit frees what this child opened.
+        self.end_handles(false);
         self.parent.children().release();
     }
 }
@@ -176,8 +208,18 @@ impl TxnRead for NestedRoTxn<'_> {
     fn page_size(&self) -> u32 {
         self.parent.page_size()
     }
-    fn record_for(&self, sel: DbSel) -> DBRecord {
-        self.parent.record_for(sel)
+    fn record_for(&self, db: &crate::rotxn::Database) -> DBRecord {
+        self.parent.record_for(db)
+    }
+    fn handle_state(
+        &self,
+    ) -> (
+        &crate::handles::HandleTable,
+        &crate::handles::TxnHandles,
+        Option<&crate::handles::TxnHandles>,
+    ) {
+        let (table, parent, _) = self.parent.handle_state();
+        (table, &self.handles, Some(parent))
     }
     fn comparator_for(&self, sel: DbSel) -> crate::cmp::KeyCmp<'_> {
         self.parent.comparator_for(sel)
