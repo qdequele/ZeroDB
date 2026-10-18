@@ -168,6 +168,17 @@ retires divergence D-001 (single-process only).
   `Env::sync` serializes only with this process's commits. Details: SPEC 04
   §12.1.
 
+### `WRITE_MAP` commits flush the used prefix, as LMDB (#45, ADR-0026)
+
+#### Changed
+
+- A durable `WRITE_MAP` commit no longer `msync`s the whole map. Its data
+  barrier flushes the used part of the file, `[0, next_pgno)`, both meta
+  pages included, and its meta barrier flushes the meta page it wrote: the
+  ranges LMDB flushes. The `fdatasync` that follows a synchronous barrier is
+  unchanged, and `Env::sync` / `force_sync` still flush the whole map.
+  Measured flat on macOS, including on a 16 GiB map. SPEC 06 REC-12.
+
 ## [0.2.0] - 2026-10-05
 
 First published release. **On-disk `format_version` 2.** Files are not LMDB

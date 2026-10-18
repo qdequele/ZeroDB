@@ -4502,8 +4502,22 @@ impl<'env> RwTxn<'env> {
         // ----- C3: fsync(data) — MUST complete before C4 (REC-7). Skipped
         // under NO_SYNC/MAP_ASYNC-none (SPEC 06 REC-9): the pages are written
         // (C2) but not made durable this commit. -----
+        // Under WRITE_MAP the barrier is a ranged `msync` (SPEC 06 REC-12) of
+        // the used prefix `[0, next_pgno)`, as LMDB's: every page any snapshot
+        // up to this one can reference, which includes both meta slots (the
+        // previous commit's meta is flushed here, the REC-10 window bound
+        // under `NO_META_SYNC`) and pages earlier commits wrote under
+        // `NO_SYNC`, in this process or another.
+        let ranged = inner.backing_ref().ranged_sync();
         if sync_data {
-            if let Err(e) = inner.backing_ref().sync(async_flush) {
+            let res = if ranged {
+                inner
+                    .backing_ref()
+                    .sync_pages(async_flush, psize, &[(0, self.next_pgno)])
+            } else {
+                inner.backing_ref().sync(async_flush)
+            };
+            if let Err(e) = res {
                 inner.poison(); // REC-13
                 return Err(e.into());
             }
@@ -4551,7 +4565,16 @@ impl<'env> RwTxn<'env> {
         // (REC-2), which is corruption-free under NO_META_SYNC because C3 still
         // fsynced the data. -----
         if sync_meta {
-            if let Err(e) = inner.backing_ref().sync(async_flush) {
+            // Ranged (SPEC 06 REC-12): the meta slot C4 wrote; C3 already
+            // made every data page durable.
+            let res = if ranged {
+                inner
+                    .backing_ref()
+                    .sync_pages(async_flush, psize, &[(slot, 1)])
+            } else {
+                inner.backing_ref().sync(async_flush)
+            };
+            if let Err(e) = res {
                 inner.poison(); // REC-13
                 return Err(e.into());
             }

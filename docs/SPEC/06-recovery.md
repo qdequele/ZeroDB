@@ -1,5 +1,9 @@
 # SPEC 06 — Durability & recovery
 
+Revised 2026-10-17 — REC-12: the `WRITE_MAP` commit barriers are ranged
+`msync`s, of the used prefix at C3 and of the meta page at C5, as LMDB's
+(issue #45, ADR-0026).
+
 Revised 2026-10-05 — docs sweep: format-v2 CRC offsets in REC-8/REC-22
 (ADR-0022), v1-store rejection noted at REC-1, REC-12 brought to the shipped
 whole-map-msync barriers (ranged msync stays planned, issue #45), ADR-0019's
@@ -318,16 +322,33 @@ recovered) **except** where explicitly noted as FS-order-dependent.
   C3/C5 barriers are `msync`s instead of `fdatasync` over `pwrite`s. The
   **same ordering** as REC-7 applies: the C3 barrier MUST complete before the
   meta is written into the map (C4), followed by the C5 barrier.
-  **Shipped barrier (amended 2026-10-05, docs sweep):** each synchronous
-  barrier is `MmapWritable::flush` — an `msync(MS_SYNC)` of the **whole map**
-  — followed unconditionally by an `fdatasync` of the data fd
-  (`WriteMapBacking::sync`; the fdatasync exists because `msync` alone is not
-  a durability barrier on macOS, and it currently runs on every platform).
-  Both are strict supersets of the minimal barrier, so every REC-7 ordering
-  claim holds: C3's flush covers at least all data pages, C5's covers the
-  meta page. The *ranged* form this rule originally described —
-  `msync(data range)` at C3, `msync(meta page)` at C5 — is the intended
-  optimization and remains **planned, not implemented** (issue #45).
+  **Ranged barriers (amended 2026-10-17, issue #45, ADR-0026):** the commit
+  barriers `msync` only part of the map, as LMDB's do
+  (`Backing::sync_pages`, `WriteMapBacking` → `MmapWritable::flush_range`):
+  - **C3** flushes the used prefix `[0, next_pgno)`, `next_pgno` being the
+    txn's high-water at commit. It holds every page a meta up to this commit
+    can reference: the txn's dirty frames (under TXN-45b they live in the
+    map) and spilled pages (SPEC 04 §6.3a), pages earlier commits wrote and
+    left unflushed (`NO_SYNC`, in this process or another), and **both meta
+    slots** (pages 0 and 1). Flushing the other slot makes the previous
+    commit's meta durable here; under `NO_META_SYNC` this keeps the REC-10
+    window bounded by this commit's C3.
+  - **C5** flushes the meta slot C4 wrote.
+  - A range's start is rounded down to the OS page (POSIX `msync`), which
+    only widens the flushed region.
+  - A synchronous barrier is still followed by an `fdatasync` of the data fd
+    on every platform (`msync` alone is not a durability barrier on macOS).
+    On Linux that `fdatasync` writes back every dirty page of the file, so
+    there the ranged `msync` narrows nothing that matters for durability.
+  - `Env::sync` / `force_sync` keep the whole-map barrier
+    (`MmapWritable::flush`): they must cover commits whose barriers were
+    skipped (`NO_SYNC`) or asynchronous (`MAP_ASYNC`).
+  The crash harness's fault backing models a ranged barrier strictly: it
+  folds into the durable image only the journaled bytes inside the exact
+  page ranges requested (no OS-page widening, no `fdatasync`), so a missed
+  page is a page the harness can drop.
+  *(Before 2026-10-17 each synchronous barrier was an `msync(MS_SYNC)` of the
+  whole map followed by the `fdatasync` — a strict superset.)*
   A writemap env opens **no** separate meta sync fd (SPEC 01 §S7): the meta
   durability is the C5 barrier. Under `MAP_ASYNC` the barriers that run are
   `msync(MS_ASYNC)` with **no** fdatasync (relaxed, REC-9/REC-11). The

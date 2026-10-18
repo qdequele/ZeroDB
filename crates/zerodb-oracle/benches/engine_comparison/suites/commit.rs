@@ -13,6 +13,12 @@
 //! gp3, where a barrier is a network round-trip and where the coalesced
 //! commit writes (docs/PERF-GAP-VS-LMDB.md, one `pwrite` per dirty page) are
 //! supposed to pay off. Numbers taken anywhere else are indicative only.
+//!
+//! **Map size** (`sync/n1_map16g`): `sync/n1` on a 16 GiB map instead of
+//! 1 GiB, the data unchanged. A barrier whose cost follows the map rather
+//! than the data shows here; production maps (Meilisearch's) are far larger
+//! than the data. Run it with `ZERODB_BENCH_WRITE_MAP=1` for the `msync`
+//! barriers (SPEC 06 REC-12).
 
 use criterion::{Criterion, Throughput};
 
@@ -63,6 +69,34 @@ fn durable(c: &mut Criterion, cfg: &Cfg) {
     crate::durable(&mut g);
     pair_shape!(case, &mut g, cfg.page, false, &keys, &val, 100);
     g.finish();
+
+    let keys = ascending_keys(N_COMMIT);
+    let mut g = c.benchmark_group("commit/sync/n1_map16g");
+    g.throughput(Throughput::Elements(N_COMMIT as u64));
+    crate::durable(&mut g);
+    pair_shape!(case_map, &mut g, cfg.page, &keys, &val, 16 << 30);
+    g.finish();
+}
+
+/// One durable single-put txn per key, on a `map_size`-byte map.
+fn case_map<B: Backend>(
+    g: &mut Group<'_>,
+    page: u32,
+    keys: &[Vec<u8>],
+    val: &[u8],
+    map_size: usize,
+) {
+    g.bench_function(B::NAME, |b| {
+        b.iter_batched(
+            || Fixture::<B>::empty_with_map(page, Some("bench"), false, map_size),
+            |f| {
+                B::commit_churn(&f.env, f.db, keys, val, 1);
+                // Returned, not dropped, for the reason given in `case`.
+                f
+            },
+            BatchSize::PerIteration,
+        )
+    });
 }
 
 fn case<B: Backend>(

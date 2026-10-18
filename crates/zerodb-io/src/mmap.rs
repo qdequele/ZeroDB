@@ -310,6 +310,39 @@ impl MmapWritable {
             self.inner.flush()
         }
     }
+
+    /// `msync` the `len` bytes of the map starting at byte offset `off`
+    /// (the ranged `WRITE_MAP` barrier, SPEC 06 REC-12). The start is rounded
+    /// down to an OS page boundary (memmap2 does this; POSIX requires it), so
+    /// the flushed region always contains the requested one. `async_flush`
+    /// as for [`MmapWritable::flush`].
+    ///
+    /// # Errors
+    ///
+    /// `InvalidInput` if the range leaves the mapped region; otherwise
+    /// propagates the `msync` I/O error.
+    pub fn flush_range(&self, off: usize, len: usize, async_flush: bool) -> std::io::Result<()> {
+        match off.checked_add(len) {
+            Some(end) if end <= self.inner.len() => {}
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "msync range at {off} (+{len}) outside the writable map ({} bytes)",
+                        self.inner.len()
+                    ),
+                ))
+            }
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        if async_flush {
+            self.inner.flush_async_range(off, len)
+        } else {
+            self.inner.flush_range(off, len)
+        }
+    }
 }
 
 /// One mmap of the data file (ADR-0023 amendment 15).
