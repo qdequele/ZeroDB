@@ -1,8 +1,8 @@
 # ADR-0028: Delete rebalance moves cells page to page, as LMDB
 
-- Status: **Proposed** (2026-10-18). Correctness-critical B+tree change
-  (AGENTS.md rule 5): needs approval before any implementation, and the spike
-  below runs first (rule 6).
+- Status: **Accepted (Option A, maintainer, 2026-10-18)**. Correctness-critical
+  B+tree change (AGENTS.md rule 5); staged implementation, spike measurements
+  first (rule 6). Open questions answered under "Resolution" below.
 - Related issue: none yet. Background: the delete-rebalance entry in
   [`docs/PERF-GAP-VS-LMDB.md`](../PERF-GAP-VS-LMDB.md) ("What remains"), and
   the 2026-09-10 `blocked-adr` entry in `benches/results/perf-ledger.jsonl`.
@@ -332,7 +332,25 @@ Staged implementation after approval: (1) golden digests test on main;
 (2) leaf borrow with the SPEC 03 §10 amendment; (3) merge and branch borrow.
 Each stage carries its own three-column report.
 
-## Open questions for human review
+## Resolution (maintainer, 2026-10-18)
+
+Option A approved ("go for option A"). ZeroDB has no users yet, so choices
+that only protect ZeroDB-before's internal layout are free. The open questions
+below are settled as follows:
+
+1. **Bar:** logically identical image (pgnos, entries, free space, `stat`);
+   heap order inside a page may differ.
+2. **Branch separators:** keep ZeroDB's choice (the parent separator moves
+   down; no extra descent). Not observable through the API; not a divergence.
+3. **Two-frame access:** the per-txn scratch buffer; no new `unsafe`.
+4. **Option B:** not adopted. A separate opt-in ADR only if a gap remains
+   after Option A and the profile blames rebalance frequency.
+5. **Bar for keeping each stage:** every targeted delete rung improves beyond
+   noise (bench-ab's 3 % effect gate, LMDB drift ≤ 3 %) and no other rung
+   regresses; every stage reports a scorecard (faster, behavior, safety,
+   durability, security).
+
+## Open questions (as proposed)
 
 1. **Bar for "identical".** Is a logically identical image (same pgnos,
    entries, free space, stat; heap order may differ) the right bar, given
