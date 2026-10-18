@@ -34,6 +34,8 @@ LMDB ops/s ÷ ZeroDB ops/s, which is the same time ratio.
 - **Consumers end to end** — Meilisearch v1.53.1 (`cargo xtask bench`
   workloads, through `scripts/consumer.sh`) and hannoy v0.1.7 (its divan
   benches), each built once against LMDB and once against ZeroDB.
+  Meilisearch v1.55 builds against a heed fork whose API the shim does not
+  cover yet (#102), so the gate stays on v1.53.1 until that lands.
 
 Raw numbers live in [`benches/results/*.md`](../benches/results/), one report
 per run. Every lever ever tried, kept or reverted, is one line in
@@ -57,6 +59,12 @@ set today. Source keys:
 
 Rungs that [V] re-measured are quoted from [V]; the rest come from [E], which
 predates the cache, so read paths in [E] are slightly pessimistic.
+
+The rungs changed since these sources were run were re-measured only on an
+Apple M-series laptop (perf ledger, 2026-10-17). Checking database handle
+lifetimes (ADR-0024) made named-database gets 2–8 % slower and read-txn begin
+6 % slower; packing branch pages on ascending inserts made gets for missing
+keys 26 % faster. Both are described below.
 
 The lock file (ADR-0023) is on by default since stage 3. [E], [V], [M], [S]
 and [P] predate it and measure ZeroDB without one. [G] measures both: with
@@ -202,6 +210,8 @@ are bench server ratios, before → after, unless stated.
 | **Spilling** | Past LMDB's dirty limit (131,072 pages; `max_dirty_bytes`), a write txn writes its highest-numbered dirty pages to the file and drops them, as `mdb_page_spill` does. | YCSB C loads instead of being killed; YCSB A 0.58 → 0.76, B 0.31 → 0.69 of LMDB's throughput [S]; ladder flat | ADR-0017 |
 | **In-place `WRITE_MAP`** (opt-in) | Under `WRITE_MAP`, dirty pages live in the writable map at their final offset: no heap copy, no write-back, as `MDB_WRITEMAP`. | spike, macOS arm64, single-put no-sync commits: 29.8–43.5 → 8.6–11.1 µs | ADR-0021, PR #88 |
 | **Meta free-list annex** | A commit's freed-page list goes into its own meta page when it fits, instead of a free-list tree put per commit (beyond LMDB). On-disk format 2. | `commit/batch/n1` 2.04× → 1.60×; durable YCSB B on Graviton4 239k → 258k ops/s; Meilisearch flat [M] | ADR-0022, PR #89 |
+| **Branch splits on ascending inserts** | A full branch page took a middle split even on an end insert, so ascending loads left every branch page half full. It now splits at the end, as LMDB does. SPEC 03. | 4 KiB pages, 20k ascending keys: 949 → 480 branch pages (LMDB 558); writes flat; `get/access/miss` −26 %, `get/access/hot` +5.5 % (laptop) [L] | #111 |
+| **Leaf end-insert split** | A plain put at the end of a full leaf now moves the old last entry to the new page with it, as LMDB does, so ascending loads build LMDB's leaf count. The cell is removed in place from the top of the left page's cell heap, so nothing else moves. | measured rungs flat, `get/access/hot` −4.5 % (laptop) [L] | #113 |
 | **Sequential-writes option** (opt-in) | A per-tree rightmost-leaf finger lets ascending puts skip the descent (PostgreSQL's nbtree fast path; LMDB has none). Off by default: random puts are 3–4 % slower. | `put/val/v8` 0.83× → 0.66× [E] | ADR-0015 |
 
 ### Deletes
@@ -239,6 +249,9 @@ are bench server ratios, before → after, unless stated.
 | One-pass overflow resolver | flat; the cost is the cache miss on the overflow header, which only trusted mode skips | ledger, 2b18e13 |
 | Writers publishing into the validation cache; hashed cache slots | `put/val/v8` +12 %; `scan/full/*` +5 % | ADR-0018 §Implementation |
 | Spilled-page lookup inside the page resolver | read rungs +3–13 %; spilled pages now resolve through the ordinary map path | [S] |
+| Branchless page search (`select_unpredictable` in leaf and branch search, #16) | gets 8–25 % slower on Apple M-series (`get/key/k128` +25 %); retry only with a Graviton A/B | ledger, 17acfb4 |
+| Integer compare for any keys of at most 8 bytes, not only equal-length ones (#15) | gets and seeks flat, `scan/prefix/bucket` +18 %; equal-length 4- and 8-byte keys already take the fast path | ledger, e1ee099 |
+| Leaf end-insert split by repacking both pages | `put/order/seq` +10.5 %; replaced by moving the one cell in place (#113) | ledger, 43a9e45 |
 | Rightmost-leaf finger on by default | random and mixed puts +3–5 %; shipped as the opt-in sequential-writes option | ledger, c7c8b24; ADR-0015 |
 
 ## What remains
@@ -259,35 +272,42 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
   No issue yet. A cursor delete that rebalances outside the leftmost pairing
   still re-descends.
 - **Per-commit CPU** — `commit/batch/n1` 1.60×, empty write txn 2.46×, and
-  YCSB no-sync on Graviton4 1.21–1.38× [M]. What is left is CPU per commit
-  (page allocation, meta encoding, txn setup), not I/O. Related: reuse
-  write-txn containers (#8), free-list bookkeeping (#29, measure first; only
-  matters under GC churn), per-page allocation and zero-fill (#4, partly done
-  by the frame pool).
+  YCSB no-sync on Graviton4 1.21–1.38× [M]. What is left is CPU per commit,
+  not I/O. Most write-txn containers already start empty and do not allocate,
+  so the next step is a profile of the empty and one-put commits on Graviton.
+  Likely suspects: the copy of the freed-page list carried in the meta page,
+  meta encoding and txn setup. Tracked in #8 and #4 (per-page allocation and
+  zero-fill, partly done by the frame pool).
 - **Scans** — 1.3–1.8× by default; range scans 1.2× in trusted mode. A cursor keeps only its leaf;
   branch levels are re-resolved per cursor step (a memo hit, so cheap; one
-  try to cache the parent read flat). Ideas: cache-line prefetch (#17),
-  branchless page search (#16).
+  try to cache the parent read flat). Open idea: cache-line prefetch (#17).
+  Branchless page search (#16) was tried and slowed gets down.
 - **Overflow values** — 1.3× by default, because the overflow header is read
   and checked; with both engines trusting the file it is 0.89–0.91×.
-- **Wider keys** — `get/key/k32`/`k128` 1.26–1.33× [E]; extending the integer
-  compare to other key shapes is #15.
+- **Wider keys** — `get/key/k32`/`k128` 1.26–1.33× [E]. Extending the integer
+  compare to all keys of at most 8 bytes (#15) was tried and not adopted.
 - **`WRITE_MAP` follow-ups** (#13) — ZeroDB's in-place `WRITE_MAP` still
   trails LMDB's by 1.34–1.42× on no-sync YCSB [M]. Durable commits now
-  `msync` the used prefix, as LMDB (#45, ADR-0026). Open: prefault /
-  preallocation of the map (#42), the
-  Graviton A/B, and whether Meilisearch should set `WRITE_MAP`.
+  `msync` the used prefix, as LMDB (#45, ADR-0026), flat on macOS even with a
+  16 GiB map. Durable `WRITE_MAP` commits on macOS are 1.87–1.91× LMDB [L]
+  because ZeroDB issues a second `fdatasync` after the meta write, which LMDB
+  does not. Open: prefault / preallocation of the map (#42), the Graviton A/B,
+  and whether Meilisearch should set `WRITE_MAP`.
 - **Short read txns** — one read txn + one get is 1.55× [V]; reusing read txns
   is #25.
 - **Page fill under random inserts** — the unsorted 10M load makes an 8 %
   larger file than LMDB's [S]. No issue yet.
-- **`zerodb-tools load` memory** — parses the whole dump and reads the built
-  file back for its check (#63).
+- **`zerodb-tools load` memory** — reads the whole dump into memory, then
+  sorts and de-duplicates it there (#63). The check after a load now runs over
+  the memory map.
 
 **Not yet measured**
 
-- Custom comparators pay a virtual call per key comparison (#14; milli sets
-  one comparator).
+- Free-page run search (#29): a multi-page value looks for a run of
+  contiguous free pages inside one freed-page record at a time, where LMDB
+  first merges several records into its in-memory free list, so the file can
+  grow even when a fitting run spans two records. A differential test against
+  LMDB comes first. Only matters under GC churn.
 - Write cursor re-seek after `put_current` (#7) and the cursor reserved put
   (#10): no consumer profile names them.
 - Durable commits on EBS gp3, where per-syscall latency should favour the
@@ -383,7 +403,7 @@ code. Each maps to the entry above.
 | A4 | `validate_page_size` on every page load | B12 | Per-commit CPU (single-put commit census) |
 | A5 | Scans: branch levels re-resolved per cursor step | B13 | Hot paths above LLVM's inlining threshold |
 | A6 | Allocation per get | B14 | dbi-indexed write-txn table |
-| A7 | Custom comparators (#14) | B15 | Reused descent path and in-place APPEND check |
+| A7 | Custom comparators (#14, closed: neither milli nor hannoy registers one, and the default order has its own inlined path) | B15 | Reused descent path and in-place APPEND check |
 | A8 | Eager page validation (lock-free memo) | B16 | Page views read only the flags |
 | B1 | `RwCursor` re-seek | B17 | Cursor-free point get |
 | B2 | Splits without materializing the page | B18 | Dirty frame pool |
