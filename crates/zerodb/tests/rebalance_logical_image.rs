@@ -113,7 +113,7 @@ impl Run {
     fn new(psize: u32, flags: EnvFlags) -> Run {
         let dir = TempDir::new();
         let mut opts = EnvOpenOptions::new();
-        opts.map_size(512 << 20).page_size(psize).flags(flags);
+        opts.map_size(64 << 20).page_size(psize).flags(flags);
         let env = opts.open(dir.path()).expect("open env");
         let db = env.main_database();
         let path = dir.path().to_path_buf();
@@ -432,16 +432,17 @@ fn churn_reinsert(flags: EnvFlags) -> u64 {
     r.finish()
 }
 
-/// Recorded before the ADR-0028 change (see the module docs to regenerate).
+/// Recorded on the engine before the ADR-0028 change (main at f98cd08), at a
+/// 64 MiB map (see the module docs to regenerate).
 const GOLDEN: &[(&str, Workload, u64)] = &[
-    ("ascending_drain", ascending_drain, 0x48e7002ccc58c51a),
-    ("descending_drain", descending_drain, 0xbce43ef4e8f25555),
-    ("cursor_drain", cursor_drain, 0x65d57c9bae84e1cd),
-    ("crud_random", crud_random, 0xbb640a391f0a89df),
-    ("variable_keys", variable_keys, 0x4c4bac7e346af2b7),
-    ("wide_keys_deep", wide_keys_deep, 0xfcac61fb85b5a6fe),
-    ("overflow_mix", overflow_mix, 0x67d30f6159969b8c),
-    ("churn_reinsert", churn_reinsert, 0x6caf1130b0b8ba31),
+    ("ascending_drain", ascending_drain, 0x0bbfd378eedf36aa),
+    ("descending_drain", descending_drain, 0x6738322c1de4c585),
+    ("cursor_drain", cursor_drain, 0x641245be963b8e41),
+    ("crud_random", crud_random, 0xb6f370b6839111ab),
+    ("variable_keys", variable_keys, 0x615ffce7ec930f9f),
+    ("wide_keys_deep", wide_keys_deep, 0xf631cac21fb2d132),
+    ("overflow_mix", overflow_mix, 0x1d2d5cccd96c3ca4),
+    ("churn_reinsert", churn_reinsert, 0xdb7fa7ecf7640449),
 ];
 
 #[test]
