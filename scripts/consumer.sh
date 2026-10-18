@@ -10,8 +10,9 @@
 #                                #   run the same `cargo xtask bench` workloads on both
 #
 # Environment:
-#   MEILISEARCH_REF    git ref to test (default: v1.53.1 — the pin last verified;
-#                      v1.55.0 builds against Meilisearch's heed fork, see HEED_SHIM)
+#   MEILISEARCH_REF    git ref to test (default: v1.55.0, which builds against
+#                      Meilisearch's heed fork, see HEED_SHIM; v1.53.1 is the
+#                      last release on stock heed 0.22.1)
 #   MEILISEARCH_SRC    a local Meilisearch checkout to `git clone --shared` from
 #                      (saves the network clone; the checkout itself is never touched)
 #   MEILISEARCH_CLONE  reuse this clone instead of creating one under WORKDIR
@@ -39,7 +40,7 @@ set -euo pipefail
 
 ZERODB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="${1:-check}"
-MEILISEARCH_REF="${MEILISEARCH_REF:-v1.53.1}"
+MEILISEARCH_REF="${MEILISEARCH_REF:-v1.55.0}"
 WORKDIR="${WORKDIR:-$ZERODB/target/consumer}"
 CLONE="${MEILISEARCH_CLONE:-$WORKDIR/meilisearch}"
 WORKLOADS="${WORKLOADS:-workloads/movies.json workloads/search/movies.json}"

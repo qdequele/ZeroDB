@@ -144,8 +144,8 @@ Option B, mirroring the fork exactly:
 
 - Meilisearch v1.55 and later can build on ZeroDB:
   `MEILISEARCH_REF=v1.55.0 scripts/consumer.sh check` picks the new shim.
-  The gate's default ref stays v1.53.1 until the v1.55 suites and benchmark
-  are recorded.
+  The gate's default ref is v1.55.0; v1.53.1, the last release on stock
+  heed 0.22.1, stays runnable with `MEILISEARCH_REF=v1.53.1`.
 - Two shim crates to keep in step. Both re-export the same crate, and their
   feature lists must match.
 - CI gains a `heed-zerodb` test run with `--features unique-txns` and a check
@@ -179,6 +179,5 @@ Option B, mirroring the fork exactly:
    `crates/heed-shim-unique-txns` name the API, not Meilisearch's branch
    (`mutexify-open-dbi`), so they still fit if upstream heed adopts it.
    Acceptable?
-2. **Gate default.** Should `scripts/consumer.sh` move its default
-   `MEILISEARCH_REF` to v1.55.0 once the suites pass, or stay on v1.53.1
-   as the last heed 0.22.1 release, with v1.55 run alongside?
+2. ~~**Gate default.**~~ Resolved 2026-10-18 by the maintainer: the default
+   `MEILISEARCH_REF` moves to v1.55.0 now.

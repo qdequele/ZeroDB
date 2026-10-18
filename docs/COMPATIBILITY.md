@@ -186,8 +186,9 @@ always initialised; seek error text differs).
 ## What Meilisearch and hannoy actually touch
 
 Everything they use is **Same** or a supported LMDB feature above. Verified on
-Meilisearch v1.53.1 and hannoy v0.1.7-nested-rtxns by compiling and running
-their test suites on the shim with zero source changes (`docs/CONSUMER-GATE.md`).
+Meilisearch v1.53.1, Meilisearch v1.55.0 (through the `unique-txns` shim, see
+above) and hannoy v0.1.7-nested-rtxns by compiling and running their test
+suites on the shim with zero source changes (`docs/CONSUMER-GATE.md`).
 Differences a code path *could* observe and their current standing: database
 handles in two stale-handle cases (D-026, stricter than LMDB: `EINVAL` where
 LMDB would read another database), the cursor reserved put (a proposed

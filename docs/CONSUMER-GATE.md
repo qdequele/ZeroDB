@@ -54,7 +54,8 @@ still links LMDB would prove nothing.
 MEILISEARCH_SRC=~/Projects/Meilisearch/meilisearch just consumer-check
 MEILISEARCH_SRC=~/Projects/Meilisearch/meilisearch just consumer-suites
 FULL=1 MEILISEARCH_SRC=... scripts/consumer.sh suites   # + meilisearch --lib, meilisearch-auth
-MEILISEARCH_REF=main scripts/consumer.sh suites         # any ref; default v1.53.1
+MEILISEARCH_REF=main scripts/consumer.sh suites         # any ref; default v1.55.0
+MEILISEARCH_REF=v1.53.1 scripts/consumer.sh suites      # last release on stock heed 0.22.1
 ```
 
 `suites` runs `cargo test -p milli -p index-scheduler` on ZeroDB. index-scheduler
