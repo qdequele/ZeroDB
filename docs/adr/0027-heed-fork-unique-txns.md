@@ -1,6 +1,6 @@
 # ADR-0027: The API of Meilisearch's heed fork, behind a feature
 
-- Status: Draft, implemented alongside for review (#102)
+- Status: Accepted (Option B, maintainer, 2026-10-18), implemented (#115). Both open questions resolved below.
 - Related issue: #102
 - Date: 2026-10-18
 
@@ -173,11 +173,12 @@ Option B, mirroring the fork exactly:
   this ADR is amended. If upstream heed adopts the API, the feature may
   become the default.
 
-## Open questions for human review
+## Resolved questions
 
-1. **Feature and crate names.** `unique-txns` and
-   `crates/heed-shim-unique-txns` name the API, not Meilisearch's branch
-   (`mutexify-open-dbi`), so they still fit if upstream heed adopts it.
-   Acceptable?
-2. ~~**Gate default.**~~ Resolved 2026-10-18 by the maintainer: the default
-   `MEILISEARCH_REF` moves to v1.55.0 now.
+Both resolved by the maintainer on 2026-10-18.
+
+1. **Feature and crate names.** Kept: `unique-txns` and
+   `crates/heed-shim-unique-txns`. They name the API, not Meilisearch's
+   branch (`mutexify-open-dbi`), so they still fit if upstream heed adopts
+   it.
+2. **Gate default.** The default `MEILISEARCH_REF` moves to v1.55.0 now.
