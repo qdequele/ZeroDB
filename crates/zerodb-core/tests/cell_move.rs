@@ -18,12 +18,20 @@ use proptest::prelude::*;
 use proptest::test_runner::Config;
 use zerodb_core::page::{BranchMut, BranchRef, LeafMut, LeafRef, LeafValue, PageError};
 
-const PSIZES: [u32; 2] = [4096, 16384];
+/// Under miri only the smallest page size: the primitives do not depend on
+/// it, and every byte moved costs interpretation time.
+const PSIZES: [u32; 2] = if cfg!(miri) {
+    [4096, 4096]
+} else {
+    [4096, 16384]
+};
 
 fn config() -> Config {
     Config {
         failure_persistence: None,
-        cases: if cfg!(miri) { 16 } else { 256 },
+        // Each case builds and rewrites whole pages; under miri even a
+        // handful of cases takes minutes, so miri samples a few.
+        cases: if cfg!(miri) { 3 } else { 256 },
         ..Config::default()
     }
 }

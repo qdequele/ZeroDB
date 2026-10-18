@@ -1,8 +1,8 @@
 # ADR-0028: Delete rebalance moves cells page to page, as LMDB
 
-- Status: **Accepted (Option A, maintainer, 2026-10-18)**. Correctness-critical
-  B+tree change (AGENTS.md rule 5); staged implementation, spike measurements
-  first (rule 6). Open questions answered under "Resolution" below.
+- Status: **Accepted (Option A, maintainer, 2026-10-18), implemented**.
+  Correctness-critical B+tree change (AGENTS.md rule 5); the spike's profile
+  ran first (rule 6). Open questions answered under "Resolution" below.
 - Related issue: none yet. Background: the delete-rebalance entry in
   [`docs/PERF-GAP-VS-LMDB.md`](../PERF-GAP-VS-LMDB.md) ("What remains"), and
   the 2026-09-10 `blocked-adr` entry in `benches/results/perf-ledger.jsonl`.
@@ -335,6 +335,34 @@ decisions — is arithmetic (shown above) and is pinned by the proptest.
 Staged implementation after approval: (1) golden digests test on main;
 (2) leaf borrow with the SPEC 03 §10 amendment; (3) merge and branch borrow.
 Each stage carries its own three-column report.
+
+## Implementation (2026-10-18)
+
+Landed in one stage after the spike's profile confirmed the premise
+(`benches/results/2026-10-18-delete-rebalance-node-move-mac.md`): before the
+change, `rebalance` was 68 % of `del/bulk/half`'s delete time and the
+separator remove + re-insert alone 31 %.
+
+- Page primitives `LeafMut::cell_bytes` / `LeafRef::cell_bytes`,
+  `LeafMut::insert_cell_bytes`, `BranchMut::set_key`
+  (`crates/zerodb-core/src/page/tree.rs`), with proptests against the
+  operations they replace (`crates/zerodb-core/tests/cell_move.rs`).
+- `RwTxn::borrow_entry` (leaf arms), `update_parent_key` and `merge_pages`
+  use them through the per-txn `cell_scratch` buffer; the owned-cell types
+  they needed are gone.
+- Golden logical images (`crates/zerodb/tests/rebalance_logical_image.rs`),
+  recorded before the change, are reproduced exactly.
+- SPEC 03 §10.1 numbers the rules REB-1..REB-5.
+
+Scorecard:
+
+| | result |
+|---|---|
+| Faster | Criterion ladder, macOS, 3 rounds (busy host, LMDB as drift control): `del/bulk/half` 2.46× → 1.30× LMDB, `del/bulk/all` 2.26× → 1.37×, `del/cursor/drain` 2.59× → 1.50×, `del/churn/reinsert` 1.67× → 1.21×, `del/range/half` 0.67× → 0.24×; ZeroDB after ÷ before 0.39–0.66 on every round of every rebalance rung. crud-bench deletes: ~+10–15 % (0.39× → ~0.48× LMDB), because that workload is bound by per-commit meta encoding, not by the rebalance (see the report). |
+| Behavior | Tree shape, page allocation, `stat`, dump and compaction output identical to before (golden images); LMDB differential suites unchanged and green; no new divergence. |
+| Safe | Proptests of each primitive against the code it replaces; golden images in default and `WRITE_MAP` modes; `cargo test --workspace`; miri on `zerodb-core`; `just fuzz-quick`; clippy on macOS and Linux. A malformed cell yields a typed error, never a panic. |
+| Durable | Commit ordering, fsync, meta writes, spilling and GC untouched; `just crash-test-quick`. |
+| Secure | No new `unsafe`; the scratch buffer avoids a second live `&mut` into the map under `WRITE_MAP`. |
 
 ## Resolution (maintainer, 2026-10-18)
 
