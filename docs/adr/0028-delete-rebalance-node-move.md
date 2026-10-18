@@ -170,9 +170,13 @@ move:
    split decisions, so the same pgno allocations.
 4. **Merge** appends the right page's cells through the same move primitive,
    in order, instead of `extract_leaf_cells` / `extract_branch_cells`.
-5. **Branch borrows and merges** use the same two primitives, keeping today's
-   separator values (the parent separator moves down; node 0 stays
-   empty-keyed per SPEC 02 §4.1).
+5. **Branch borrows and merges** keep today's separator values (the parent
+   separator moves down; node 0 stays empty-keyed per SPEC 02 §4.1). Their
+   parent separator rewrite is in place (item 3); a branch merge appends the
+   right page's nodes from a scratch copy of that page instead of owned
+   per-node copies; the one- or two-node rebuild inside the pages of a branch
+   borrow stays remove + insert (branch borrows are rare, and the node-0
+   empty-key rule makes an in-place rewrite of that node awkward).
 
 Pros: copies LMDB's technique for the path (rule 7); no behavior, shape or
 format change; the per-borrow cost becomes LMDB's plus one small copy.
