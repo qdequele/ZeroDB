@@ -53,6 +53,11 @@ jobs:
       - run: cargo test --workspace
       # heed-shim is excluded from the workspace on purpose; make sure it still builds.
       - run: cargo check --manifest-path crates/heed-shim/Cargo.toml
+      # The API of Meilisearch's heed fork (ADR-0027): not additive, so it is
+      # built and tested on its own, never with the rest of the workspace.
+      - run: cargo clippy -p heed-zerodb --all-targets --features unique-txns -- -D warnings
+      - run: cargo test -p heed-zerodb --features unique-txns
+      - run: cargo check --manifest-path crates/heed-shim-unique-txns/Cargo.toml
       # The four engine crates must stay publishable (ADR-0013 rule 10): manifest
       # metadata, versioned internal deps, readme paths. No upload, no build.
       - run: cargo publish --workspace --dry-run --no-verify
@@ -78,6 +83,7 @@ jobs:
       # tests, which track current stable).
       - run: cargo check -p zerodb-core -p zerodb-io -p zerodb -p heed-zerodb -p zerodb-tools
       - run: cargo check --manifest-path crates/heed-shim/Cargo.toml
+      - run: cargo check --manifest-path crates/heed-shim-unique-txns/Cargo.toml
 
   miri:
     name: miri (zerodb-core)

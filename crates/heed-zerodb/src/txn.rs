@@ -129,7 +129,16 @@ impl<'e, T> RoTxn<'e, T> {
     /// # Errors
     ///
     /// Infallible in ZeroDB; returns [`Result`] for API shape.
+    ///
+    /// Not available with the `unique-txns` feature: Meilisearch's heed fork
+    /// moves it to [`crate::UniqueRoTxn::commit`] (ADR-0027).
+    #[cfg(not(feature = "unique-txns"))]
     pub fn commit(self) -> Result<()> {
+        self.commit_inner()
+    }
+
+    /// The body of `RoTxn::commit` and `UniqueRoTxn::commit`.
+    pub(crate) fn commit_inner(self) -> Result<()> {
         match self.inner {
             InnerTxn::Ro(t) => t.commit().map_err(Into::into),
             InnerTxn::Nested(t) => t.commit().map_err(Into::into),

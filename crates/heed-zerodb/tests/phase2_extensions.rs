@@ -11,6 +11,10 @@
 //!      `Env::sync(force)` exist, work, and are purely additive: heed has
 //!      neither, and code that never calls them gets heed's behavior.
 
+// heed 0.22.1's API; the `unique-txns` feature replaces it with the heed
+// fork's (ADR-0027), covered by `unique_txns.rs`.
+#![cfg(not(feature = "unique-txns"))]
+
 use heed_zerodb::types::{Bytes, Str};
 use heed_zerodb::{Database, EnvOpenOptions};
 

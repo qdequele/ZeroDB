@@ -4,6 +4,10 @@
 //! write path is a parallel cursor rather than the checked read path, so these
 //! are the seams where the two can drift.
 
+// heed 0.22.1's API; the `unique-txns` feature replaces it with the heed
+// fork's (ADR-0027), covered by `unique_txns.rs`.
+#![cfg(not(feature = "unique-txns"))]
+
 use std::ops::Bound;
 
 use heed_zerodb::types::{Bytes, Str};

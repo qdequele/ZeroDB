@@ -16,6 +16,19 @@
 //! this one (a `package =` rename inside `[patch]` is silently ignored by cargo;
 //! see `crates/heed-shim/Cargo.toml` and `docs/CONSUMER-GATE.md`).
 //!
+//! ## Meilisearch's heed fork (`unique-txns` feature, ADR-0027)
+//!
+//! From v1.55, Meilisearch builds against its own heed fork
+//! (`meilisearch/heed@mutexify-open-dbi`), which serializes opening and
+//! creating databases behind a per-environment mutex. The `unique-txns`
+//! feature switches this crate to that fork's API: `UniqueRoTxn`,
+//! `UniqueRwTxn`, `AsUniqueTxnRef` and the `Env::unique_*` constructors;
+//! databases open through a unique transaction only; `RoTxn::commit` becomes
+//! `UniqueRoTxn::commit`; `Env::non_free_pages_size` gives way to
+//! `EnvStat::non_free_page_size` and `DatabaseStat::non_free_page_size`.
+//! The feature changes signatures, so it is not additive: a build uses one
+//! API or the other. Consumers reach it through `crates/heed-shim-unique-txns`.
+//!
 //! ## Adapter `unsafe` (see per-site `SAFETY:` comments)
 //!
 //! The adapter reproduces heed's inherently pointer-based model, so it needs the
@@ -46,6 +59,8 @@ pub mod iteration_method;
 mod iterator;
 mod reserved_space;
 mod txn;
+#[cfg(feature = "unique-txns")]
+mod unique;
 
 pub use self::database::{Database, DatabaseOpenOptions, DatabaseStat};
 pub use self::env::{
@@ -60,6 +75,8 @@ pub use self::iterator::{
 };
 pub use self::reserved_space::ReservedSpace;
 pub use self::txn::{AnyTls, RoTxn, RwTxn, TlsUsage, WithTls, WithoutTls};
+#[cfg(feature = "unique-txns")]
+pub use self::unique::{AsUniqueTxnRef, UniqueRoTxn, UniqueRwTxn};
 
 /// An unspecified codec placeholder (SPEC 00 rows 12/51): used when opening a
 /// database whose types are remapped per call. Does not implement the codec

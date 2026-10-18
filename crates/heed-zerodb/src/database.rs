@@ -37,6 +37,16 @@ pub struct DatabaseStat {
     pub entries: usize,
 }
 
+#[cfg(feature = "unique-txns")]
+impl DatabaseStat {
+    /// The bytes this database's pages take: branch, leaf and overflow pages
+    /// times the page size (Meilisearch's heed fork, ADR-0027).
+    #[must_use]
+    pub fn non_free_page_size(&self) -> usize {
+        (self.leaf_pages + self.branch_pages + self.overflow_pages) * self.page_size as usize
+    }
+}
+
 /// Map heed `PutFlags` → ZeroDB `PutFlags` (SPEC 01 Table 3). Dup flags are
 /// dropped (DUPSORT is unsupported; see docs/DIVERGENCES.md).
 pub(crate) fn to_zdb_put_flags(f: PutFlags) -> zerodb::PutFlags {
@@ -906,10 +916,35 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
     /// # Errors
     ///
     /// `Mdb`(`BadValSize`/`Incompatible`); `Io` on an embedded-NUL name.
+    #[cfg(not(feature = "unique-txns"))]
     pub fn open(&self, rtxn: &RoTxn) -> Result<Option<Database<KC, DC, C, CDUP>>>
     where
         KC: 'static,
         DC: 'static,
+        C: Comparator + 'static,
+    {
+        self.open_in(rtxn)
+    }
+
+    /// Open an existing database through a transaction that holds the
+    /// environment's database-open mutex (Meilisearch's heed fork, ADR-0027).
+    ///
+    /// # Errors
+    ///
+    /// `Mdb`(`BadValSize`/`Incompatible`); `Io` on an embedded-NUL name.
+    #[cfg(feature = "unique-txns")]
+    pub fn open<U>(&self, rtxn: &U) -> Result<Option<Database<KC, DC, C, CDUP>>>
+    where
+        KC: 'static,
+        DC: 'static,
+        C: Comparator + 'static,
+        U: crate::AsUniqueTxnRef<'e>,
+    {
+        self.open_in(&rtxn.as_unique_txn_ref())
+    }
+
+    fn open_in(&self, rtxn: &RoTxn) -> Result<Option<Database<KC, DC, C, CDUP>>>
+    where
         C: Comparator + 'static,
     {
         self.check_flags()?;
@@ -929,10 +964,35 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
     /// # Errors
     ///
     /// As [`DatabaseOpenOptions::open`], plus `Mdb(DbsFull)`.
+    #[cfg(not(feature = "unique-txns"))]
     pub fn create(&self, wtxn: &mut RwTxn) -> Result<Database<KC, DC, C, CDUP>>
     where
         KC: 'static,
         DC: 'static,
+        C: Comparator + 'static,
+    {
+        self.create_in(wtxn)
+    }
+
+    /// Create the database if absent, through a write transaction that holds
+    /// the environment's database-open mutex (Meilisearch's heed fork,
+    /// ADR-0027).
+    ///
+    /// # Errors
+    ///
+    /// As [`DatabaseOpenOptions::open`], plus `Mdb(DbsFull)`.
+    #[cfg(feature = "unique-txns")]
+    pub fn create(&self, wtxn: &mut crate::UniqueRwTxn) -> Result<Database<KC, DC, C, CDUP>>
+    where
+        KC: 'static,
+        DC: 'static,
+        C: Comparator + 'static,
+    {
+        self.create_in(wtxn)
+    }
+
+    fn create_in(&self, wtxn: &mut RwTxn) -> Result<Database<KC, DC, C, CDUP>>
+    where
         C: Comparator + 'static,
     {
         self.check_flags()?;

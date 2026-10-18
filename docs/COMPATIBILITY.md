@@ -99,6 +99,24 @@ Behavior differences from LMDB, approved or proposed, are recorded in
 | `RwTxn<'p>`: `nested_read_txn`, `commit`, `abort`, `Deref` to `RoTxn<WithoutTls>`, `Send` | Same | |
 | Environment/transaction pairing | Same | Every `Database` operation and `open`/`create` panics with heed's message when the transaction belongs to another environment |
 
+## Meilisearch's heed fork (`unique-txns` feature)
+
+From v1.55, Meilisearch builds against its own heed fork,
+`meilisearch/heed@mutexify-open-dbi`, which serializes opening and creating
+databases behind one mutex per environment. `heed-zerodb`'s `unique-txns`
+feature switches to that fork's API, and `crates/heed-shim-unique-txns` is
+the patch target with the feature on (ADR-0027). Without the feature the
+crate is heed 0.22.1, as described in the rest of this page. The feature
+changes signatures, so it is not additive: a build has one API or the other.
+
+| Item | Status | Notes |
+|---|---|---|
+| `UniqueRwTxn<'e>` (`commit`, `abort`, `Deref`/`DerefMut` to `RwTxn`), `UniqueRoTxn<'e, T>` (`commit`, `Deref` to `RoTxn`), `AsUniqueTxnRef<'e>` | Same | Each holds the environment's mutex until it ends, so neither is `Send`, as in the fork. `UniqueRoTxn::commit` keeps the databases the txn opened, as `RoTxn::commit` does without the feature |
+| `Env::unique_write_txn`, `unique_read_txn`, `try_unique_write_txn`, `try_unique_read_txn` | Same | The mutex is shared by every clone of the `Env` and taken before the transaction begins. The blocking forms clear a poisoned mutex; the `try_` forms return `Ok(None)` while it is held. `read_txn` and `write_txn` do not take it |
+| `Env::open_database::<KC, DC, U>`, `DatabaseOpenOptions::open` taking `&U: AsUniqueTxnRef`; `Env::create_database`, `DatabaseOpenOptions::create` taking `&mut UniqueRwTxn` | Same | A plain `RoTxn`/`RwTxn` cannot open or create a database. ZeroDB itself does not need the mutex (ADR-0024); it is kept for the fork's waiting behaviour |
+| `EnvStat::non_free_page_size`, `DatabaseStat::non_free_page_size` | Same | Branch + leaf + overflow pages × page size |
+| `RoTxn::commit`, `Env::non_free_pages_size` | Absent | Removed by the fork; a call does not compile |
+
 ## `Database` and `DatabaseOpenOptions`
 
 | Item | Status | Notes |

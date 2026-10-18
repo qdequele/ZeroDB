@@ -306,6 +306,8 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         Ok(Env {
             inner: env,
             no_lock: self.flags.contains(EnvFlags::NO_LOCK),
+            #[cfg(feature = "unique-txns")]
+            dbi_open: std::sync::Arc::default(),
             _tls: std::marker::PhantomData,
         })
     }
@@ -356,6 +358,11 @@ pub struct Env<T = WithTls> {
     /// env on read-only media has none either, and LMDB does not report
     /// `NO_LOCK` for it (`OBS_RDONLY_READONLY_FS_REPORTS_NOLOCK = false`).
     no_lock: bool,
+    /// The database-open mutex of Meilisearch's heed fork (ADR-0027), shared
+    /// by every clone. A second open of the same env in this process fails
+    /// with `EnvAlreadyOpened`, so one env has exactly one mutex.
+    #[cfg(feature = "unique-txns")]
+    dbi_open: std::sync::Arc<crate::unique::DbiOpenMutex>,
     _tls: std::marker::PhantomData<T>,
 }
 
@@ -364,6 +371,8 @@ impl<T> Clone for Env<T> {
         Env {
             inner: self.inner.clone(),
             no_lock: self.no_lock,
+            #[cfg(feature = "unique-txns")]
+            dbi_open: self.dbi_open.clone(),
             _tls: std::marker::PhantomData,
         }
     }
@@ -523,6 +532,11 @@ impl<T> Env<T> {
     /// # Errors
     ///
     /// [`Error::Io`] from `fstat`; `Mdb(Invalid)` on a corrupt GC DB.
+    ///
+    /// Not available with the `unique-txns` feature: Meilisearch's heed fork
+    /// removes it in favour of [`EnvStat`] and [`crate::DatabaseStat`]'s
+    /// `non_free_page_size` (ADR-0027).
+    #[cfg(not(feature = "unique-txns"))]
     pub fn non_free_pages_size(&self) -> Result<u64> {
         self.inner.non_free_pages_size().map_err(Into::into)
     }
@@ -541,6 +555,7 @@ impl<T> Env<T> {
     ///
     /// [`Error::Mdb`] (`BadValSize`/`Incompatible`) on a bad/colliding name;
     /// `Error::Io` on an embedded NUL in `name` (C-string name boundary).
+    #[cfg(not(feature = "unique-txns"))]
     pub fn open_database<KC, DC>(
         &self,
         rtxn: &RoTxn,
@@ -562,6 +577,7 @@ impl<T> Env<T> {
     /// # Errors
     ///
     /// As [`Env::open_database`], plus `Mdb(DbsFull)` when the catalog is full.
+    #[cfg(not(feature = "unique-txns"))]
     pub fn create_database<KC, DC>(
         &self,
         wtxn: &mut RwTxn,
@@ -576,6 +592,109 @@ impl<T> Env<T> {
             options.name(name);
         }
         options.create(wtxn)
+    }
+
+    /// Open a typed database that already exists, through a transaction that
+    /// holds the database-open mutex (Meilisearch's heed fork, ADR-0027).
+    ///
+    /// # Errors
+    ///
+    /// As heed 0.22.1's `open_database`.
+    #[cfg(feature = "unique-txns")]
+    pub fn open_database<'e, KC, DC, U>(
+        &'e self,
+        rtxn: &U,
+        name: Option<&str>,
+    ) -> Result<Option<Database<KC, DC>>>
+    where
+        KC: 'static,
+        DC: 'static,
+        U: crate::AsUniqueTxnRef<'e>,
+    {
+        let mut options = self.database_options().types::<KC, DC>();
+        if let Some(name) = name {
+            options.name(name);
+        }
+        options.open(rtxn)
+    }
+
+    /// Create a typed database, if absent, through a write transaction that
+    /// holds the database-open mutex (Meilisearch's heed fork, ADR-0027).
+    ///
+    /// # Errors
+    ///
+    /// As heed 0.22.1's `create_database`, plus `Mdb(DbsFull)`.
+    #[cfg(feature = "unique-txns")]
+    pub fn create_database<KC, DC>(
+        &self,
+        wtxn: &mut crate::UniqueRwTxn,
+        name: Option<&str>,
+    ) -> Result<Database<KC, DC>>
+    where
+        KC: 'static,
+        DC: 'static,
+    {
+        let mut options = self.database_options().types::<KC, DC>();
+        if let Some(name) = name {
+            options.name(name);
+        }
+        options.create(wtxn)
+    }
+
+    /// Begin a write transaction holding the database-open mutex, waiting
+    /// for the current unique transaction to end first (Meilisearch's heed
+    /// fork, ADR-0027). The mutex is taken before the writer lock, as in the
+    /// fork.
+    ///
+    /// # Errors
+    ///
+    /// As [`Env::write_txn`].
+    #[cfg(feature = "unique-txns")]
+    pub fn unique_write_txn(&self) -> Result<crate::UniqueRwTxn<'_>> {
+        let lock = self.dbi_open.lock();
+        Ok(crate::UniqueRwTxn::new(self.write_txn()?, lock))
+    }
+
+    /// As [`Env::unique_write_txn`], but `Ok(None)` instead of waiting when
+    /// another unique transaction holds the mutex. It still waits for the
+    /// writer lock.
+    ///
+    /// # Errors
+    ///
+    /// As [`Env::write_txn`].
+    #[cfg(feature = "unique-txns")]
+    pub fn try_unique_write_txn(&self) -> Result<Option<crate::UniqueRwTxn<'_>>> {
+        self.dbi_open
+            .try_lock()
+            .map(|lock| Ok(crate::UniqueRwTxn::new(self.write_txn()?, lock)))
+            .transpose()
+    }
+
+    /// Begin a read transaction holding the database-open mutex, waiting
+    /// for the current unique transaction to end first (Meilisearch's heed
+    /// fork, ADR-0027).
+    ///
+    /// # Errors
+    ///
+    /// As [`Env::read_txn`].
+    #[cfg(feature = "unique-txns")]
+    pub fn unique_read_txn(&self) -> Result<crate::UniqueRoTxn<'_, T>> {
+        let lock = self.dbi_open.lock();
+        Ok(crate::UniqueRoTxn::new(self.read_txn()?, lock))
+    }
+
+    /// As [`Env::unique_read_txn`], but `Ok(None)` instead of waiting when
+    /// another unique transaction holds the mutex.
+    ///
+    /// # Errors
+    ///
+    /// As [`Env::read_txn`].
+    #[cfg(feature = "unique-txns")]
+    pub fn try_unique_read_txn(&self) -> Result<Option<crate::UniqueRoTxn<'_, T>>> {
+        self.dbi_open
+            .try_lock()
+            .map(|lock| Ok(crate::UniqueRoTxn::new(self.read_txn()?, lock)))
+            .transpose()
     }
 
     /// Begin a write transaction (SPEC 00 row 13).
@@ -851,6 +970,16 @@ pub struct EnvStat {
     pub overflow_pages: usize,
     /// Number of data items.
     pub entries: usize,
+}
+
+#[cfg(feature = "unique-txns")]
+impl EnvStat {
+    /// The bytes the main database's pages take: branch, leaf and overflow
+    /// pages times the page size (Meilisearch's heed fork, ADR-0027).
+    #[must_use]
+    pub fn non_free_page_size(&self) -> usize {
+        (self.leaf_pages + self.branch_pages + self.overflow_pages) * self.page_size as usize
+    }
 }
 
 /// A signal fired once the environment is fully closed (SPEC 00 rows 23/24).

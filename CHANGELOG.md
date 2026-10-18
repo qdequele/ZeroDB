@@ -6,6 +6,30 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### Meilisearch v1.55's heed fork (ADR-0027, #102)
+
+Meilisearch v1.55 builds against its own heed fork, whose API differs from
+heed 0.22.1's: opening and creating databases goes through *unique*
+transactions, which hold a per-environment mutex. `heed-zerodb` gains a
+`unique-txns` feature with that API, and `crates/heed-shim-unique-txns` is
+the matching patch target. Without the feature nothing changes.
+
+- New with the feature: `UniqueRwTxn`, `UniqueRoTxn`, `AsUniqueTxnRef`,
+  `Env::unique_write_txn`, `unique_read_txn` and their `try_` forms,
+  `EnvStat::non_free_page_size`, `DatabaseStat::non_free_page_size`.
+- Changed with the feature: `open_database` and `DatabaseOpenOptions::open`
+  take a unique transaction; `create_database` and
+  `DatabaseOpenOptions::create` take `&mut UniqueRwTxn`.
+- Removed with the feature, as in the fork: `RoTxn::commit` (now
+  `UniqueRoTxn::commit`) and `Env::non_free_pages_size`.
+- `scripts/consumer.sh` picks the shim from the consumer's lock file;
+  `HEED_SHIM` overrides it.
+- Meilisearch v1.55.0 on ZeroDB (macOS arm64): milli and index-scheduler
+  compile with no C LMDB in their trees, and their suites pass, 447 tests
+  with 0 failures (5 ignored by Meilisearch). Two HuggingFace embedder tests
+  fail when run in parallel, on a lock while downloading the model, and pass
+  when run alone.
+
 ### Database handles follow LMDB's lifetime (ADR-0024)
 
 A database handle opened in a transaction that ends without committing, or
