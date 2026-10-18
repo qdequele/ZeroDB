@@ -10,7 +10,9 @@
 #                                #   run the same `cargo xtask bench` workloads on both
 #
 # Environment:
-#   MEILISEARCH_REF    git ref to test (default: v1.53.1 — the pin last verified)
+#   MEILISEARCH_REF    git ref to test (default: v1.55.0, which builds against
+#                      Meilisearch's heed fork, see HEED_SHIM; v1.53.1 is the
+#                      last release on stock heed 0.22.1)
 #   MEILISEARCH_SRC    a local Meilisearch checkout to `git clone --shared` from
 #                      (saves the network clone; the checkout itself is never touched)
 #   MEILISEARCH_CLONE  reuse this clone instead of creating one under WORKDIR
@@ -20,12 +22,17 @@
 #   ROUNDS             bench rounds; each round runs LMDB then ZeroDB, and even rounds
 #                      flip the order so thermal drift is not attributed to one engine
 #                      (default: 1)
+#   HEED_SHIM          the patch target (default: chosen from the clone's Cargo.lock —
+#                      crates/heed-shim-unique-txns when it resolves heed from
+#                      Meilisearch's mutexify-open-dbi fork, as v1.55 and later do,
+#                      crates/heed-shim otherwise; see ADR-0027)
 #   MEILI_PORT         port the benched server listens on (default: 7700). The xtask
 #                      runner hardcodes 7700; another value patches that constant in
 #                      the clone's xtask for the run and sets MEILI_HTTP_ADDR for the
 #                      spawned server. Useful when a local container holds 7700.
 #
 # The shim is patched in through `[patch.crates-io] heed = { path = .../heed-shim }`
+# (or `.../heed-shim-unique-txns` for Meilisearch's heed fork, see HEED_SHIM)
 # (the only form that works — see crates/heed-shim/Cargo.toml). The patch is
 # appended to the clone's Cargo.toml between marker lines and removed again for
 # the stock build, so the clone can be reused across runs.
@@ -33,7 +40,7 @@ set -euo pipefail
 
 ZERODB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="${1:-check}"
-MEILISEARCH_REF="${MEILISEARCH_REF:-v1.53.1}"
+MEILISEARCH_REF="${MEILISEARCH_REF:-v1.55.0}"
 WORKDIR="${WORKDIR:-$ZERODB/target/consumer}"
 CLONE="${MEILISEARCH_CLONE:-$WORKDIR/meilisearch}"
 WORKLOADS="${WORKLOADS:-workloads/movies.json workloads/search/movies.json}"
@@ -72,7 +79,21 @@ ensure_clone() {
 # the manifest ($1 = off); see scripts/patch-heed.py.
 set_patch() {
     python3 "$ZERODB/scripts/patch-heed.py" "$CLONE/Cargo.toml" "$1" \
-        "$MARK_BEGIN" "$MARK_END" "$ZERODB/crates/heed-shim"
+        "$MARK_BEGIN" "$MARK_END" "$(heed_shim)"
+}
+
+# The shim matching the heed API the clone builds against (ADR-0027). Reads
+# the committed lock file: a build with the shim patched in rewrites the one
+# on disk without the fork's entry. `grep -c`, not `grep -q`: an early exit
+# would kill `git show` with SIGPIPE and fail the pipe under `pipefail`.
+heed_shim() {
+    if [ -n "${HEED_SHIM:-}" ]; then
+        echo "$HEED_SHIM"
+    elif git -C "$CLONE" show HEAD:Cargo.lock 2>/dev/null | grep -c 'heed?branch=mutexify-open-dbi' >/dev/null; then
+        echo "$ZERODB/crates/heed-shim-unique-txns"
+    else
+        echo "$ZERODB/crates/heed-shim"
+    fi
 }
 
 assert_no_lmdb() {
@@ -88,6 +109,7 @@ assert_no_lmdb() {
 
 do_check() {
     set_patch on
+    log "heed patched to $(heed_shim)"
     log "cargo check -p milli -p index-scheduler on the ZeroDB shim"
     (cd "$CLONE" && cargo check -p milli -p index-scheduler)
     assert_no_lmdb milli

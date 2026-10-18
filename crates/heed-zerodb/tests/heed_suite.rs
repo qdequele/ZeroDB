@@ -30,6 +30,10 @@
 //!   `Send` like heed's (see `txn.rs`; the engine side is pinned by
 //!   `zerodb/tests/hostile_file.rs`).
 
+// heed 0.22.1's API; the `unique-txns` feature replaces it with the heed
+// fork's (ADR-0027), covered by `unique_txns.rs`.
+#![cfg(not(feature = "unique-txns"))]
+
 use std::error::Error;
 
 use heed_zerodb::byteorder::BE;

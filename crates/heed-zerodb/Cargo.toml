@@ -44,6 +44,14 @@ byteorder = "1.5"
 # `map_size` OS-page-multiple check at the heed boundary (heed uses `page_size`).
 libc = { workspace = true }
 
+[features]
+# Mirror the API of Meilisearch's heed fork (`meilisearch/heed@mutexify-open-dbi`,
+# Meilisearch v1.55 and later) instead of heed 0.22.1's (ADR-0027). Not
+# additive: it changes `open_database`/`create_database` signatures and
+# removes `RoTxn::commit` and `Env::non_free_pages_size`, as the fork does.
+# Enabled by `crates/heed-shim-unique-txns`, never by the workspace.
+unique-txns = []
+
 [dev-dependencies]
 tempfile = "3"
 # For the OS-page-size probe in the page-size parity test (allowlisted dep).

@@ -5,6 +5,10 @@
 //! docs/DIVERGENCES.md authorizes the adapter to re-impose the check at the
 //! heed boundary.
 
+// heed 0.22.1's API; the `unique-txns` feature replaces it with the heed
+// fork's (ADR-0027), covered by `unique_txns.rs`.
+#![cfg(not(feature = "unique-txns"))]
+
 use heed_zerodb::types::Bytes;
 use heed_zerodb::{Database, EnvOpenOptions, Error, WithoutTls};
 

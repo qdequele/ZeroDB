@@ -12,7 +12,7 @@ members = [
 # re-exports `heed-zerodb`; it is the target of the consumer `[patch.crates-io]`
 # (milestone 1.13). Excluded so its `heed` name never collides with the oracle's
 # real crates.io `heed` (real LMDB) inside this workspace.
-exclude = ["crates/heed-shim"]
+exclude = ["crates/heed-shim", "crates/heed-shim-unique-txns"]
 
 [workspace.package]
 edition = "2021"

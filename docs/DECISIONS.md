@@ -35,3 +35,4 @@ issues.
 | 0024 | [Database handle lifetime: stale handles after abort and remove](adr/0024-database-handle-lifetime.md) | Accepted (Option A, 2026-10-17); implementation in progress (#73) | API, LMDB parity |
 | 0025 | [Nested write transactions](adr/0025-nested-write-txns.md) | Draft, awaiting approval (#71) | Concurrency |
 | 0026 | [Ranged `msync` for `WRITE_MAP` commits](adr/0026-writemap-ranged-msync.md) | Accepted (Option B, 2026-10-17), implemented (#45) | Durability |
+| 0027 | [The API of Meilisearch's heed fork, behind a feature](adr/0027-heed-fork-unique-txns.md) | Accepted (Option B, 2026-10-18), implemented (#115) | API, consumer compatibility |

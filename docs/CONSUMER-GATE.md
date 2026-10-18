@@ -30,6 +30,13 @@ directly, which `[patch.crates-io]` does not reach, so every git source of heed
 in Meilisearch's `Cargo.lock` gets a `[patch."<url>"]` table pointing at the
 shim as well (`scripts/patch-heed.py`).
 
+The fork changes heed's API (unique transactions, which alone open and create
+databases). Its counterpart is `crates/heed-shim-unique-txns`, the same shim
+with `heed-zerodb`'s `unique-txns` feature on (ADR-0027). The script picks it
+when Meilisearch's committed `Cargo.lock` resolves heed from the
+`mutexify-open-dbi` branch, and `crates/heed-shim` otherwise; `HEED_SHIM=<path>`
+overrides the choice.
+
 `heed-shim` is a crate literally named `heed` at version 0.22.1 that re-exports
 `heed-zerodb`, the 1:1 re-implementation of heed's surface over the ZeroDB
 engine (ADR-0003). That is the only patch form cargo honours — a `package =`
@@ -47,7 +54,8 @@ still links LMDB would prove nothing.
 MEILISEARCH_SRC=~/Projects/Meilisearch/meilisearch just consumer-check
 MEILISEARCH_SRC=~/Projects/Meilisearch/meilisearch just consumer-suites
 FULL=1 MEILISEARCH_SRC=... scripts/consumer.sh suites   # + meilisearch --lib, meilisearch-auth
-MEILISEARCH_REF=main scripts/consumer.sh suites         # any ref; default v1.53.1
+MEILISEARCH_REF=main scripts/consumer.sh suites         # any ref; default v1.55.0
+MEILISEARCH_REF=v1.53.1 scripts/consumer.sh suites      # last release on stock heed 0.22.1
 ```
 
 `suites` runs `cargo test -p milli -p index-scheduler` on ZeroDB. index-scheduler

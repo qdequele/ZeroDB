@@ -2,6 +2,10 @@
 //! the enum-dispatch read path, the pointer-based write cursor, nested readers,
 //! and the env lifecycle — the load-bearing pieces of the 1:1 surface.
 
+// heed 0.22.1's API; the `unique-txns` feature replaces it with the heed
+// fork's (ADR-0027), covered by `unique_txns.rs`.
+#![cfg(not(feature = "unique-txns"))]
+
 use heed_zerodb::types::{Bytes, Str, U32};
 use heed_zerodb::{byteorder::BigEndian, Database, EnvOpenOptions};
 

@@ -9,6 +9,10 @@
 //! it has no compaction or snapshot round-trip test. The round-trip tests
 //! below are exactly those shapes.
 
+// heed 0.22.1's API; the `unique-txns` feature replaces it with the heed
+// fork's (ADR-0027), covered by `unique_txns.rs`.
+#![cfg(not(feature = "unique-txns"))]
+
 use std::fs;
 
 use heed_zerodb::types::Bytes;

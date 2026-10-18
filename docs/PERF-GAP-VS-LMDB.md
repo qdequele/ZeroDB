@@ -31,11 +31,12 @@ LMDB ops/s ÷ ZeroDB ops/s, which is the same time ratio.
 - **YCSB** — [rust-storage-bench](https://github.com/marvin-j97/rust-storage-bench)
   with a `zerodb` backend next to its heed one: 10M items, one txn per
   operation, usually under a 2 GB memory cap so the data does not fit in RAM.
-- **Consumers end to end** — Meilisearch v1.53.1 (`cargo xtask bench`
-  workloads, through `scripts/consumer.sh`) and hannoy v0.1.7 (its divan
-  benches), each built once against LMDB and once against ZeroDB.
-  Meilisearch v1.55 builds against a heed fork whose API the shim does not
-  cover yet (#102), so the gate stays on v1.53.1 until that lands.
+- **Consumers end to end** — Meilisearch (`cargo xtask bench` workloads,
+  through `scripts/consumer.sh`) and hannoy v0.1.7 (its divan benches), each
+  built once against LMDB and once against ZeroDB. The recorded Meilisearch
+  numbers are on v1.53.1. The gate now defaults to v1.55.0, which builds
+  against Meilisearch's heed fork through the `unique-txns` shim (ADR-0027);
+  no v1.55 benchmark is recorded yet.
 
 Raw numbers live in [`benches/results/*.md`](../benches/results/), one report
 per run. Every lever ever tried, kept or reverted, is one line in
