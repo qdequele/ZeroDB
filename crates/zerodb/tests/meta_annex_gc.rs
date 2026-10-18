@@ -427,3 +427,77 @@ fn reopen_reparses_annex_and_reuses() {
     );
     assert_clean(dir.path());
 }
+
+/// Every meta slot on disk is byte-for-byte the canonical full-page encode of
+/// the meta it holds (fields, annex ids, CRC and an all-zero tail) while the
+/// annex grows to near its capacity and shrinks back. The commit encodes into
+/// one buffer it reuses across commits and clears only the prefix it wrote,
+/// so a shorter annex after a longer one must not leave stale ids behind.
+#[test]
+fn meta_slots_stay_canonical_as_the_annex_grows_and_shrinks() {
+    meta_slots_stay_canonical_inner(EnvFlags::EMPTY);
+}
+
+#[test]
+fn meta_slots_stay_canonical_as_the_annex_grows_and_shrinks_writemap_in_place() {
+    meta_slots_stay_canonical_inner(EnvFlags::WRITE_MAP);
+}
+
+/// Assert both meta slots of the file at `dir` are canonical; returns the
+/// larger annex length of the two.
+fn assert_meta_slots_canonical(dir: &Path) -> usize {
+    let bytes = std::fs::read(data_file(dir)).unwrap();
+    let ps = PS as usize;
+    let mut max_annex = 0;
+    for slot in 0..2 {
+        let page = &bytes[slot * ps..(slot + 1) * ps];
+        let MetaValidity::Valid(m) = MetaPage::validate(page, PS).unwrap() else {
+            panic!("meta slot {slot} is not valid");
+        };
+        let annex = MetaPage::read_annex(page, PS).expect("annex in bounds");
+        // Pre-filled with non-zero bytes: the full encode must overwrite all.
+        let mut canonical = vec![0xEEu8; ps];
+        m.encode_with_annex(&mut canonical, &annex).unwrap();
+        assert!(
+            page == canonical.as_slice(),
+            "meta slot {slot} (txn {}, {} annex ids) differs from its canonical encode",
+            m.txnid,
+            annex.len()
+        );
+        max_annex = max_annex.max(annex.len());
+    }
+    max_annex
+}
+
+fn meta_slots_stay_canonical_inner(flags: EnvFlags) {
+    let dir = TempDir::new();
+    let env = open(dir.path(), flags);
+    let db = env.main_database();
+    let cap = zerodb_core::page::meta_annex_cap(PS);
+    let commit = |f: &dyn Fn(&mut zerodb::RwTxn<'_>)| {
+        let mut w = env.write_txn().unwrap();
+        assert_mode(&w, flags);
+        f(&mut w);
+        w.commit().unwrap();
+        assert_meta_slots_canonical(dir.path())
+    };
+    // A large overflow value, freed in the next txn: the annex fills up to
+    // near its capacity. Re-inserting a similar value draws it back down.
+    let big = vec![0x5Au8; (cap - 10) * PS as usize];
+    let mut max_annex = commit(&|w| db.put(w, b"big", &big).unwrap());
+    max_annex = max_annex.max(commit(&|w| assert!(db.delete(w, b"big").unwrap())));
+    max_annex = max_annex.max(commit(&|w| db.put(w, b"big2", &big).unwrap()));
+    for i in 0u32..6 {
+        commit(&|w| db.put(w, &i.to_be_bytes(), b"small").unwrap());
+    }
+    assert!(
+        max_annex > cap / 2,
+        "the annex never filled up ({max_annex} ids): the shrink case went untested"
+    );
+    let (_, fl, _) = live_meta(dir.path());
+    assert!(
+        (fl as usize) < cap / 2,
+        "the annex never shrank back ({fl} ids): the shrink case went untested"
+    );
+    assert_clean(dir.path());
+}
