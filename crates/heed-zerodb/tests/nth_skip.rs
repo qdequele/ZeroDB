@@ -319,6 +319,8 @@ fn skip_does_not_read_skipped_overflow_values() {
     assert_eq!(k, &key(400)[..]);
 }
 
+type BoxedIter<'t> = Box<dyn Iterator<Item = heed_zerodb::Result<(&'t [u8], &'t [u8])>> + 't>;
+
 /// A page error met while a skip crosses leaves is the item `nth` returns,
 /// and the iterator ends after it.
 #[test]
@@ -330,7 +332,7 @@ fn skip_reports_a_damaged_leaf_it_crosses() {
     let r = env.read_txn().unwrap();
 
     for rev in [false, true] {
-        let mut it: Box<dyn Iterator<Item = heed_zerodb::Result<(&[u8], &[u8])>>> = if rev {
+        let mut it: BoxedIter<'_> = if rev {
             Box::new(db.rev_iter(&r).unwrap())
         } else {
             Box::new(db.iter(&r).unwrap())
