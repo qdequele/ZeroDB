@@ -480,10 +480,8 @@ Discarding is always a correct implementation of "repair"; it costs a re-seek,
 which is exactly the M1.4 mechanism applied selectively.
 
 **Implemented repair table (2026-09-27, leftmost pairing only; c4ab096,
-17fdb24).** The retained-path repair applies to **deletes only**: `put` /
-`put_current` through the write cursor take the first mechanism — the mutation
-drops the parked path, records the key, and the next access re-seeks once. The
-engine retains the path across `del_current` and repairs it for the structural
+17fdb24).** This table covers deletes; puts through the write cursor follow
+§5.4b. The engine retains the path across `del_current` and repairs it for the structural
 cases below; everything else discards. The rebalance reports one of *unchanged*
 (no structural change — the path is valid as-is), *kept* (repaired per this
 table), *kept + root pop* (as kept, plus frame 0 must be dropped), or
@@ -524,6 +522,33 @@ milli, four of them in the current indexer. Measured on the real server, the
 (PERF-GAP **B8a**; `benches/results/2026-09-10-meilisearch-delete-heavy-macos.md`).
 The contract above is what the fork actually guarantees; the re-seek was never
 part of it.
+
+### §5.4b — Retained path across a cursor put (2026-10-19)
+
+A write-cursor put whose key is byte-equal to the key of the entry under the
+cursor — `put_current`, and the plain (no-flag) general cursor put that heed's
+`put_current` maps to — is an overwrite **at the cursor's position**: the
+engine applies the §6.1 replace at the parked root-to-leaf path, without
+searching for the key. LMDB's `MDB_CURRENT` put likewise writes at
+`mc_pg[top]`/`mc_ki[top]` with no search.
+
+| outcome of the replace | effect on the retained path |
+|---|---|
+| fits in its leaf (same-size in place, or remove + reinsert at the same slot) | keep: `touch_path` remapped every pgno during COW, and the entry is back at the same `ki` with the same key, so no separator above it changed |
+| leaf split (§6.2; may cascade to branch splits and a root grow) | discard; the cursor re-seeks by key on its next access |
+| error that poisons the txn | no obligation |
+
+A split is detected as a change in the tree's depth, leaf-page or branch-page
+count across the replace. The keyed put is taken instead — and the path dropped,
+as before — for every other cursor put: any put flag (`NO_OVERWRITE`, `APPEND`,
+…), a key other than the current one (including one equal only under a custom
+comparator), a cursor sitting on a slot a delete just vacated, and trees with
+the sequential-writes setting (their §6.6 finger bookkeeping lives on the keyed
+path).
+
+**Debug shadow check.** As for deletes: after every put that keeps the path, a
+debug build re-runs a fresh search for the key and asserts it is found at
+exactly the kept path, same `pgno` and `ki` at every level.
 
 ---
 

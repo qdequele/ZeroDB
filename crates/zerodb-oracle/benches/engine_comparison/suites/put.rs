@@ -16,6 +16,9 @@
 //! * `over/{same_size,grow}` — overwriting into a populated tree. Same-size can
 //!   be replaced where it sits; growing may force the page to split. The delta
 //!   is that split.
+//! * `cursor/rewrite` — the same-size overwrites of `over/same_size`, reached
+//!   through the write cursor (`range_mut` + `put_current`) instead of by key:
+//!   the only rung where the cursor's position after a put costs anything.
 //! * `gc/drain_big` — overwrites whose copy-on-write pages all come from ONE
 //!   large free-list entry (a contiguous half of a 300k-key tree was deleted
 //!   first). Every other rung starts with an empty or tiny free list, so this
@@ -133,6 +136,20 @@ fn family_over(c: &mut Criterion, cfg: &Cfg) {
         &Seed::named(cfg.page, &keys, &seed_val),
         hits,
         &big_val
+    );
+    g.finish();
+
+    // The same-size rewrite reached through the write cursor (`range_mut` +
+    // `put_current`) instead of by key: read it against `over/same_size`.
+    let rewrite_val = vec![0xCDu8; VAL];
+    let mut g = group(c, "put/cursor/rewrite", hits.len());
+    pair!(
+        wr_loaded,
+        cursor_rewrite,
+        &mut g,
+        &Seed::named(cfg.page, &keys, &seed_val),
+        hits,
+        &rewrite_val
     );
     g.finish();
 }

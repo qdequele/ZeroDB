@@ -231,6 +231,36 @@ macro_rules! bench_backend {
                 w.commit().expect("commit");
             }
 
+            /// Rewrite every value in `[keys.first(), keys.last()]` through the
+            /// WRITE CURSOR — `range_mut` + `put_current`, the read-modify-write
+            /// loop milli and hannoy run over stored entries. Distinct from
+            /// `bulk_put` over existing keys, which reaches each entry by key:
+            /// this is the only rung where the cursor's position after a put
+            /// costs anything.
+            pub fn cursor_rewrite(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
+                let (Some(lo), Some(hi)) = (keys.first(), keys.last()) else {
+                    return;
+                };
+                let mut w = env.write_txn().expect("write_txn");
+                {
+                    let span = (
+                        Bound::Included(lo.as_slice()),
+                        Bound::Included(hi.as_slice()),
+                    );
+                    let mut it = db.range_mut(&mut w, &span).expect("range_mut");
+                    let mut key = Vec::new();
+                    while let Some(kv) = it.next() {
+                        let (k, _) = kv.expect("entry");
+                        key.clear();
+                        key.extend_from_slice(k);
+                        // SAFETY: the key was copied out and the entry borrow
+                        // from `next` is dead before this call.
+                        unsafe { it.put_current(&key, val) }.expect("put_current");
+                    }
+                }
+                w.commit().expect("commit");
+            }
+
             /// Drop every entry (`MDB_DROP` with the handle kept).
             pub fn clear_db(env: &BEnv, db: Db) {
                 let mut w = env.write_txn().expect("write_txn");
@@ -664,6 +694,9 @@ macro_rules! bench_backend {
                 }
                 fn cursor_drain(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
                     cursor_drain(env, db, keys, val)
+                }
+                fn cursor_rewrite(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
+                    cursor_rewrite(env, db, keys, val)
                 }
                 fn delete_reinsert(
                     env: &BEnv,

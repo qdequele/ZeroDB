@@ -244,6 +244,21 @@ retires divergence D-001 (single-process only).
   `Env::sync` serializes only with this process's commits. Details: SPEC 04
   §12.1.
 
+### Write-cursor puts keep their position (#7)
+
+#### Changed
+
+- **A put through the write cursor of the key it sits on now writes at the
+  cursor's position**, as LMDB's `MDB_CURRENT` put does: no search from the
+  root for the put, and none for the next step, which resumes from the kept
+  path. This covers `RwCursor::put_current` and heed's `put_current` on
+  `iter_mut` / `range_mut` / `prefix_iter_mut` and their reverse forms. A
+  put that splits its leaf, a put with flags, or a put of another key still
+  takes the keyed path and re-seeks once (SPEC 03 §5.4b). The new
+  `put/cursor/rewrite` benchmark (10 000 same-size rewrites through
+  `range_mut` + `put_current`) went from 5.47× to 2.49× LMDB's time on
+  macOS arm64 (ZeroDB 5.33 ms → 2.43 ms).
+
 ### `WRITE_MAP` commits flush the used prefix, as LMDB (#45, ADR-0026)
 
 #### Changed

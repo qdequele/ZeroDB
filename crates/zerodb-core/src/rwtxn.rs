@@ -3083,6 +3083,65 @@ impl<'env> RwTxn<'env> {
         }
     }
 
+    /// Overwrite the value of the existing entry at the end of `path` — the
+    /// write cursor's put at its parked position (SPEC 03 §5.4b): the same
+    /// §6.1 replace as [`put_tree`](Self::put_tree) on a found key, minus the
+    /// descent. Returns whether `path` still descends to the rewritten entry:
+    /// `true` when the replace stayed inside its leaf (same slot, the pgnos
+    /// remapped in place by `touch_path`), `false` when it split the leaf and
+    /// the path must be discarded.
+    ///
+    /// `path` MUST be the live root-to-leaf path to an existing entry whose
+    /// key is `key`, as for [`delete_at_path`](Self::delete_at_path). The
+    /// caller handles the sequential-writes and flag variants of a put; this
+    /// is the plain overwrite.
+    fn put_at_path(
+        &mut self,
+        tree: TreeId,
+        path: &mut [(u64, usize)],
+        key: &[u8],
+        val: &[u8],
+    ) -> Result<bool> {
+        self.guard_ok()?;
+        // The key is the stored one, so it already passed the key bounds;
+        // the value is new (SPEC 03 §6 up-front validation).
+        if val.len() as u64 > MAX_DATA_SIZE as u64 {
+            return Err(Error::Mdb(MdbError::BadValSize));
+        }
+        let before = *self.record(tree);
+        match self.put_apply(tree, path, true, key, ValSrc::Val(val), 0) {
+            Ok(_) => {
+                // A replace adds no entry; the only structural change it can
+                // make is a leaf split (§6.2), which adds a leaf page.
+                let after = *self.record(tree);
+                Ok(after.depth == before.depth
+                    && after.leaf_pages == before.leaf_pages
+                    && after.branch_pages == before.branch_pages)
+            }
+            Err(e) => {
+                // Mid-mutation failure: poison (TXN-59), as `put_tree` does.
+                self.errored = true;
+                Err(e)
+            }
+        }
+    }
+
+    /// Debug-build check for [`put_at_path`](Self::put_at_path): a path the
+    /// cursor keeps after a put must equal a fresh descent for the key, which
+    /// must be found there.
+    #[cfg(debug_assertions)]
+    fn shadow_check_put_path(&self, tree: TreeId, kept: &[(u64, usize)], key: &[u8]) {
+        let (fresh, found) = self
+            .search_path(tree, key)
+            .expect("shadow re-descent failed on a kept put path");
+        assert!(found, "key missing after a cursor put");
+        assert_eq!(
+            fresh.as_slice(),
+            kept,
+            "kept cursor path diverges from a fresh descent after a put"
+        );
+    }
+
     /// Returns [`rebalance`](Self::rebalance)'s [`PathFate`].
     fn delete_apply(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<PathFate> {
         self.touch_path(tree, path)?;
@@ -4896,14 +4955,15 @@ enum Step<'k> {
 /// amortized stack step (LMDB's `mc_pg[]`/`mc_ki[]` walk), not a fresh
 /// O(log n) descent; entries are yielded as **borrows** of the txn's frames
 /// (lending style — the borrow dies at the next call, which is what makes the
-/// in-place mutations safe at compile time). A mutation drops the parked path
-/// and records the key (`CurPos`); the next advance re-seeks once — LMDB
-/// avoids that seek with in-place fix-up, a difference that costs one descent
-/// per mutation and is recorded in `docs/PERF-GAP-VS-LMDB.md` (`RwCursor`
-/// re-seek item, residual).
+/// in-place mutations safe at compile time). A `del_current`, and a put of the
+/// key under the cursor that stays inside its leaf, mutate at the parked path
+/// and keep it, repaired in place (SPEC 03 §5.4a / §5.4b, LMDB's in-place
+/// cursor fix-up). Any other mutation drops the parked path and records the
+/// key (`CurPos`); the next advance re-seeks once.
 /// The exclusivity argument is what makes `SavedCursor::resume`'s
 /// same-tree-state contract hold: no mutation can happen while a parked stack
-/// exists, because every mutating method of this cursor clears it.
+/// exists except through this cursor, and each of its mutating methods either
+/// repairs the stack to the post-mutation tree or clears it.
 pub struct RwCursor<'t, 'env> {
     txn: &'t mut RwTxn<'env>,
     /// Which database this cursor iterates/mutates.
@@ -5123,8 +5183,9 @@ impl RwCursor<'_, '_> {
     /// Rewrite the value of the current entry, keeping the key (`MDB_CURRENT`,
     /// SPEC 03 §7): same-size rewrites happen in place; a different size
     /// deletes and re-inserts (which may split). Returns `false` if the cursor
-    /// is not positioned on an entry. Drops the parked path (the next advance
-    /// re-seeks once).
+    /// is not positioned on an entry. Writes at the parked path and keeps it
+    /// unless the rewrite splits the leaf (SPEC 03 §5.4b); after a split the
+    /// next advance re-seeks once.
     ///
     /// # Errors
     ///
@@ -5134,12 +5195,67 @@ impl RwCursor<'_, '_> {
             return Ok(false);
         };
         let tree = self.txn.ensure_open(&self.db)?;
+        if self.put_at_parked(tree, &key, value)? {
+            return Ok(true);
+        }
         self.txn
             .put_tree(tree, &key, PutFlags::EMPTY, ValSrc::Val(value))
             .map(|_| ())?;
         self.saved = None;
         self.on_vacated_slot = false;
         self.pos = CurPos::At(key);
+        Ok(true)
+    }
+
+    /// The cursor-position put (SPEC 03 §5.4b): when the cursor has a parked
+    /// path on a live entry whose key is byte-equal to `key`, overwrite that
+    /// entry at the path — no descent — and keep the path if the overwrite
+    /// stayed inside its leaf, so the next step resumes without a seek
+    /// either. Returns `false`, having changed nothing, when the fast path
+    /// does not apply; the caller then runs the keyed put.
+    ///
+    /// Sequential-writes trees take the keyed put: their rightmost-leaf
+    /// finger bookkeeping lives on that path.
+    fn put_at_parked(&mut self, tree: TreeId, key: &[u8], value: &[u8]) -> Result<bool> {
+        if self.on_vacated_slot || self.txn.seq_writes_on(tree) {
+            return Ok(false);
+        }
+        let Some((pgno, ki)) = self.saved.as_ref().and_then(SavedCursor::entry_pos) else {
+            return Ok(false);
+        };
+        {
+            let t = self.db.checked_tree(&*self.txn)?;
+            let (k, _) = t.entry_at(pgno, ki).map_err(map_page_err)?;
+            if k != key {
+                return Ok(false);
+            }
+        }
+        // The path stays parked during the put: an error that rejects the put
+        // before any mutation (an oversized value, a poisoned txn) leaves the
+        // cursor exactly where it was, as the keyed put's error does.
+        let saved = self.saved.as_mut().expect("checked above");
+        if self.txn.put_at_path(tree, saved.frames_mut(), key, value)? {
+            #[cfg(debug_assertions)]
+            {
+                self.repaired_keeps += 1;
+                self.txn
+                    .shadow_check_put_path(tree, saved.frames_mut(), key);
+            }
+        } else {
+            self.saved = None;
+        }
+        // `pos` is the fallback for a discarded path (a split) and for every
+        // op that re-derives its position by key. A cursor rewriting entry
+        // after entry reuses the buffer instead of allocating per put.
+        match &mut self.pos {
+            CurPos::At(k) | CurPos::AfterDelete(k) => {
+                k.clear();
+                k.extend_from_slice(key);
+                let k = std::mem::take(k);
+                self.pos = CurPos::At(k);
+            }
+            CurPos::Start => self.pos = CurPos::At(key.to_vec()),
+        }
         Ok(true)
     }
 
@@ -5153,6 +5269,12 @@ impl RwCursor<'_, '_> {
     /// As [`Database::put_with_flags`].
     pub fn put(&mut self, flags: PutFlags, key: &[u8], value: &[u8]) -> Result<()> {
         let tree = self.txn.ensure_open(&self.db)?;
+        // A plain put of the key under the cursor is an overwrite at the
+        // cursor's position (heed's `put_current`); every flag keeps the keyed
+        // path, which owns their semantics.
+        if flags == PutFlags::EMPTY && self.put_at_parked(tree, key, value)? {
+            return Ok(());
+        }
         self.txn
             .put_tree(tree, key, flags, ValSrc::Val(value))
             .map(|_| ())?;
@@ -6212,6 +6334,160 @@ mod tests {
             let survivors: Vec<Vec<u8>> = model.keys().cloned().collect();
             proptest::prop_assert_eq!(rest, survivors);
             proptest::prop_assert_eq!(db.len(&txn).unwrap(), 0);
+        }
+    }
+
+    // -- put at the cursor position (SPEC 03 §5.4b) ---------------------------
+
+    /// A rewrite of every entry through the cursor over a depth-3 tree, in
+    /// both directions and through both put entry points, with values that
+    /// keep their size, shrink, and grow past what the leaf can hold (so some
+    /// puts split and drop the path). Every entry must be visited exactly
+    /// once, in order, and end with its new value; the debug shadow check
+    /// re-derives every kept path.
+    #[test]
+    fn cursor_rewrite_visits_every_entry_once() {
+        let n = miri_scaled(150, 80);
+        for backward in [false, true] {
+            let env = mem_env(PS, 8 << 20);
+            let db = env.main_database();
+            let mut txn = env.write_txn().unwrap();
+            let mut model = std::collections::BTreeMap::new();
+            for i in 0..n {
+                let (k, v) = wide_kv(i);
+                db.put(&mut txn, &k, &v).unwrap();
+                model.insert(k, v);
+            }
+            assert!(txn.main_record().depth >= 3);
+            let mut seen = Vec::new();
+            {
+                let mut cur = db.rw_cursor(&mut txn);
+                let mut i = 0usize;
+                loop {
+                    let e = if backward {
+                        cur.move_prev().unwrap()
+                    } else {
+                        cur.move_next().unwrap()
+                    };
+                    let Some((k, v)) = e else { break };
+                    let (k, old_len) = (k.to_vec(), v.len());
+                    let new_len = match i % 4 {
+                        0 | 1 => old_len,
+                        2 => old_len / 2,
+                        _ => old_len * 3,
+                    };
+                    let nv = vec![b'a' + (i % 26) as u8; new_len];
+                    if i.is_multiple_of(2) {
+                        assert!(cur.put_current(&nv).unwrap());
+                    } else {
+                        cur.put(PutFlags::EMPTY, &k, &nv).unwrap();
+                    }
+                    model.insert(k.clone(), nv);
+                    seen.push(k);
+                    i += 1;
+                }
+                #[cfg(debug_assertions)]
+                assert!(
+                    cur.repaired_keeps >= n as u64 / 2,
+                    "cursor puts kept only {} paths",
+                    cur.repaired_keeps
+                );
+            }
+            let mut expected: Vec<Vec<u8>> = model.keys().cloned().collect();
+            if backward {
+                expected.reverse();
+            }
+            assert_eq!(seen, expected, "rewrite skipped or repeated entries");
+            let want: Vec<(Vec<u8>, Vec<u8>)> = model.into_iter().collect();
+            assert_eq!(dump(&txn), want);
+        }
+    }
+
+    /// A cursor put of a key other than the one under the cursor is a keyed
+    /// put that moves the cursor there; a flagged put of the current key
+    /// keeps its flag semantics.
+    #[test]
+    fn cursor_put_other_key_and_flags() {
+        let env = mem_env(PS, MAP);
+        let db = env.main_database();
+        let mut txn = env.write_txn().unwrap();
+        for k in [b"a", b"c", b"e"] {
+            db.put(&mut txn, k, b"0").unwrap();
+        }
+        let mut cur = db.rw_cursor(&mut txn);
+        assert_eq!(cur.move_next().unwrap().unwrap().0, b"a");
+        cur.put(PutFlags::EMPTY, b"d", b"new").unwrap();
+        assert_eq!(cur.move_next().unwrap().unwrap().0, b"e");
+        assert_eq!(cur.move_prev().unwrap().unwrap().0, b"d");
+        let r = cur.put(PutFlags::NO_OVERWRITE, b"d", b"x");
+        assert!(matches!(r, Err(Error::Mdb(MdbError::KeyExist))));
+        cur.put(PutFlags::EMPTY, b"d", b"same").unwrap();
+        assert_eq!(cur.move_next().unwrap().unwrap(), (&b"e"[..], &b"0"[..]));
+        assert_eq!(cur.move_prev().unwrap().unwrap(), (&b"d"[..], &b"same"[..]));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            failure_persistence: None,
+            cases: if cfg!(miri) { 16 } else { 256 },
+            ..Default::default()
+        })]
+
+        /// Random trees, random walk mixing rewrites of random sizes (some
+        /// split), deletes and plain steps through one cursor: the visited
+        /// sequence must be every key exactly once, in order, and the final
+        /// content must equal a `BTreeMap` model.
+        #[test]
+        fn cursor_rewrite_walk_matches_model(
+            entries in proptest::collection::btree_map(
+                proptest::collection::vec(proptest::prelude::any::<u8>(), 1..24),
+                proptest::collection::vec(
+                    proptest::prelude::any::<u8>(),
+                    0..if cfg!(miri) { 80 } else { 400 },
+                ),
+                1..if cfg!(miri) { 40usize } else { 120 },
+            ),
+            actions in proptest::collection::vec((0..4u8, 0..600usize), 1..64),
+        ) {
+            let env = mem_env(PS, 8 << 20);
+            let db = env.main_database();
+            let mut txn = env.write_txn().unwrap();
+            let mut model = entries.clone();
+            for (key, val) in &entries {
+                db.put(&mut txn, key, val).unwrap();
+            }
+            let mut seen = Vec::new();
+            {
+                let mut cur = db.rw_cursor(&mut txn);
+                let mut i = 0usize;
+                while let Some((key, _v)) = cur.move_next().unwrap() {
+                    let key = key.to_vec();
+                    let (act, len) = actions[i % actions.len()];
+                    let nv = vec![(i % 251) as u8; len];
+                    match act {
+                        0 => {
+                            proptest::prop_assert!(cur.put_current(&nv).unwrap());
+                            model.insert(key.clone(), nv);
+                        }
+                        1 => {
+                            cur.put(PutFlags::EMPTY, &key, &nv).unwrap();
+                            model.insert(key.clone(), nv);
+                        }
+                        2 => {
+                            proptest::prop_assert!(cur.del_current().unwrap());
+                            model.remove(&key);
+                        }
+                        _ => {}
+                    }
+                    seen.push(key);
+                    i += 1;
+                }
+            }
+            let all: Vec<Vec<u8>> = entries.keys().cloned().collect();
+            proptest::prop_assert_eq!(&seen, &all);
+            let want: Vec<(Vec<u8>, Vec<u8>)> =
+                model.iter().map(|(a, b)| (a.clone(), b.clone())).collect();
+            proptest::prop_assert_eq!(dump(&txn), want);
         }
     }
 
