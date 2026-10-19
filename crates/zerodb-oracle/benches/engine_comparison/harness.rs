@@ -44,6 +44,7 @@ pub trait Backend {
 
     // -- write -----------------------------------------------------------
     fn bulk_put(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8]);
+    fn bulk_put_abort(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8]);
     fn bulk_put_append(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8]);
     fn bulk_put_reserved(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8]);
     fn commit_churn(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8], per_txn: usize);
