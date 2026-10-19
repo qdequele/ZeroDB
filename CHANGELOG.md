@@ -6,6 +6,21 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### Short read transactions reuse their memory (#25)
+
+A read transaction that reads one key used to allocate, zero and free two
+per-transaction structures: the first 8 KiB level of the validated-pages
+memo and the named-database record table. Both are now cleared when the
+transaction drops and handed to the next one opened on the same thread (one
+of each is kept per thread). The memo clears exactly the slots it wrote; no
+entry is ever carried from one transaction to the next. heed 0.22.1 exposes
+no `mdb_txn_reset` / `mdb_txn_renew`, so the reuse is internal and needs no
+API change.
+
+- New rung `env/txn/ro_get_one` (begin, one named-DB `get`, drop). Memo
+  reuse alone, Apple M-series: 0.57x -> 0.42x LMDB's time (after / before
+  0.735); `env/txn/ro_begin_abort` flat.
+
 ### Multi-page values reuse free pages freed by different transactions (ADR-0029, #29)
 
 A value larger than a page needs a run of contiguous free pages. ZeroDB
