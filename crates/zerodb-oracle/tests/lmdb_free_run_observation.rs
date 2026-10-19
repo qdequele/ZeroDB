@@ -1,7 +1,7 @@
 //! Where the Meilisearch LMDB fork places a multi-page value when the free
 //! pages that could hold it were freed by different transactions, observed
 //! through heed 0.22.1. Input for issue #29 (the free-page run search) and
-//! its design record, docs/adr/0028-free-page-run-search.md.
+//! its design record, docs/adr/0029-free-page-run-search.md.
 //! AGENTS.md rule 1: observed, not guessed.
 //!
 //! A value larger than a page is stored in a run of contiguous overflow

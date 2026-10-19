@@ -15,6 +15,10 @@ pinned to the oracle (SPEC 00/01), not to LMDB's C.
 > meta free-list annex (ADR-0022) and the shipped M1.8 reader table; §12 DUPSORT
 > marked parked (milestone 2.8, 2026-07-20).
 
+> **Revised 2026-10-18** — §10.1 numbers the rebalance rules (REB-1..REB-5):
+> borrows and merges move encoded cells verbatim and separators are rewritten
+> in place (ADR-0028).
+
 > **AMENDED 2026-07-20 (milestone 2.4).** The ordering statement below was
 > absolute in Phase 1; it is now parameterized. Read §2.0 first — everything
 > after it that says "memcmp" means "the tree's ordering", which is memcmp for
@@ -1034,6 +1038,47 @@ rebalance(page P at cursor):
 - Merges can cascade: merging leaves removes a branch separator, which may make
   the branch underful, recursing to the root. A root branch left with one child
   collapses (§9), reducing depth.
+
+### §10.1 — Rebalance rules (ADR-0028, 2026-10-18)
+
+Numbered so code and tests can cite them. The algorithm above is unchanged;
+these rules fix how entries move, matching LMDB's technique (observed in the
+fork's rebalance, node-move, page-merge and key-update steps; ADR-0028).
+
+- **REB-1** — Trigger and pairing are as written above and as in LMDB: a
+  non-root leaf rebalances below 25.0 % fill or below 1 entry, a non-root
+  branch below 2 children; child 0 pairs with its right sibling, any other
+  child with its left; the sibling gives up one entry when it is at or above
+  the threshold and holds more than the minimum, otherwise the right page of
+  the pair merges into the left.
+- **REB-2** — A leaf borrow moves exactly one entry, and moves its **encoded
+  cell verbatim**: node header (flags, key size, data size), key, inline value
+  bytes or overflow head pgno, and pad byte are copied unchanged into the
+  underfull page, then the cell is removed from the sibling. An overflow run
+  is neither copied nor freed by a move. A branch borrow moves one child; the
+  moved node takes the parent separator as its key (from the right), or the
+  underfull page's node 0 is re-keyed with it (from the left).
+- **REB-3** — A parent separator is rewritten **in place** when the new key's
+  padded cell growth fits the parent's free space (same padded size: only key
+  bytes and key size change; otherwise the heap below the cell slides by the
+  difference). When it does not fit, the separator node is removed and the
+  new one inserted through the splitting branch insert (§6.5). Both need
+  `new_cell_len − old_cell_len ≤ free`, so the in-place rewrite succeeds in
+  exactly the cases a remove + insert would not split.
+- **REB-4** — A merge appends the right page's entries to the left page in
+  order: leaf cells verbatim (as REB-2); branch cells with the right page's
+  node 0 re-keyed by the parent separator being dropped.
+- **REB-5** — The order of cells inside a page's heap is not part of any
+  contract. What is: each page's ordered entries, its free-space count, and
+  its pgno. REB-3 leaves a rewritten separator where it was in the heap,
+  where a remove + insert would have moved it to the top.
+
+Separator values differ from LMDB's in one place, deliberately: when LMDB
+moves or merges a branch node it re-derives the node's key as the lowest key
+of the moved subtree (one extra descent); ZeroDB reuses the parent separator.
+Both are valid lower bounds (INV-6) and route every search identically; only
+the stored separator bytes, and so branch fill under variable-length keys,
+can differ. Not observable through the API (ADR-0028).
 
 ---
 

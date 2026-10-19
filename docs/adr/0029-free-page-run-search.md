@@ -1,4 +1,4 @@
-# ADR-0028: Free-page run search across freed-page records
+# ADR-0029: Free-page run search across freed-page records
 
 - Status: Proposed (draft, awaiting maintainer review; no engine change yet)
 - Related issue: #29 (also tracks the cross-record part of closed #31);
