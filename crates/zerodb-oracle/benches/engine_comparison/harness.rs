@@ -64,6 +64,10 @@ pub trait Backend {
     fn point_get_hot(env: &Self::Env, db: Self::Db, key: &[u8], n: usize) -> usize;
     fn scan(env: &Self::Env, db: Self::Db) -> usize;
     fn rev_scan(env: &Self::Env, db: Self::Db) -> usize;
+    /// `iter.skip(skip).take(take)`; returns the yielded count.
+    fn skip_take(env: &Self::Env, db: Self::Db, skip: usize, take: usize) -> usize;
+    /// `rev_iter.skip(skip).take(take)`; returns the yielded count.
+    fn rev_skip_take(env: &Self::Env, db: Self::Db, skip: usize, take: usize) -> usize;
     fn range_scan(env: &Self::Env, db: Self::Db, lo: &[u8], hi: &[u8]) -> usize;
     fn prefix_scan(env: &Self::Env, db: Self::Db, prefix: &[u8]) -> usize;
     fn first_last(env: &Self::Env, db: Self::Db, n: usize) -> usize;
