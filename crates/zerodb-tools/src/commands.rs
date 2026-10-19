@@ -2,9 +2,10 @@
 
 use std::fmt::Write as _;
 use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
 
-use zerodb::{check::check_image, check::check_snapshot, Env, EnvOpenOptions, MdbError};
+use zerodb::{check::check_image, check::check_snapshot, Env, EnvOpenOptions, MdbError, PutFlags};
 
 use crate::common::{collect_dump, open_ro, read_txn, BoxErr};
 use crate::dump_format;
@@ -151,44 +152,65 @@ pub fn cmd_dump(env_dir: &Path) -> Result<String, BoxErr> {
 /// destination another process has open is refused, and the `Env` is held
 /// for the whole load (ADR-0023 amendment 18). The records go in through
 /// ordinary write txns with sequential writes (ADR-0015), as LMDB's
-/// `mdb_load` uses txns; every DB's records are sorted and unique in a valid
-/// dump, and a hand-edited dump is sorted first. The map grows when it fills.
+/// `mdb_load` uses txns. The map grows when it fills.
+///
+/// The dump is read twice, a line at a time ([`dump_format::DumpReader`]),
+/// so memory stays bounded by one write txn's batch whatever the dump's size:
+/// a first pass checks the whole dump's syntax before the destination is
+/// touched, the second writes it. Every DB's records are sorted and unique in
+/// a valid dump; in a hand-edited one, out-of-order records are still
+/// placed in key order by the B+tree, and of several records with the same
+/// key in a database the first one in the dump is kept.
 ///
 /// # Errors
 ///
 /// A refusal, parse errors, or an engine error.
 pub fn cmd_load(dump_path: &Path, env_dir: &Path, psize: u32, map_size: u64) -> Result<(), BoxErr> {
+    load_batched(dump_path, env_dir, psize, map_size, BATCH_BYTES)
+}
+
+/// [`cmd_load`] committing a write txn after every `batch_bytes` of keys and
+/// values (tests use a small value to cross many batches).
+fn load_batched(
+    dump_path: &Path,
+    env_dir: &Path,
+    psize: u32,
+    map_size: u64,
+    batch_bytes: usize,
+) -> Result<(), BoxErr> {
     std::fs::create_dir_all(env_dir)?;
     refuse_existing_env(env_dir, "load into")?;
 
-    let text = std::fs::read_to_string(dump_path)?;
-    let dbs = dump_format::parse(&text)?;
-    drop(text);
-
-    // Split into main user data + named DBs; sort+dedup each defensively.
-    let mut main_user: Vec<crate::common::Kv> = Vec::new();
-    let mut named_owned: Vec<crate::common::NamedDb> = Vec::new();
-    for db in dbs {
-        let mut entries = db.entries;
-        normalize(&mut entries);
-        match db.name {
-            None => main_user = entries,
-            Some(name) => named_owned.push((name, entries)),
-        }
-    }
-    named_owned.sort_by(|a, b| a.0.cmp(&b.0));
+    // Pass 1: reject a malformed dump before creating anything.
+    let mut reader = open_dump(dump_path)?;
+    while reader.next_db()?.is_some() {}
 
     let map_size = usize::try_from(map_size).map_err(|_| "map size does not fit in usize")?;
     let env = open_exclusive_destination(env_dir, psize, map_size, "load into")?;
 
-    // Named DBs first, so each catalog record exists before any write lands
-    // next to it; the main DB's user records last.
-    for (name, entries) in &named_owned {
-        write_db_batched(&env, Some(name), entries)?;
+    // Pass 2: write each block's records in batches, in dump order (the main
+    // DB first, then the named DBs).
+    let mut reader = open_dump(dump_path)?;
+    let mut batch = Batch::default();
+    let (mut key, mut val) = (Vec::new(), Vec::new());
+    while let Some(name) = reader.next_db()? {
+        batch.clear();
+        let mut written = false;
+        while reader.next_record(&mut key, &mut val)? {
+            batch.push(&key, &val);
+            if batch.data.len() >= batch_bytes {
+                write_batch_growing(&env, name.as_deref(), &batch)?;
+                batch.clear();
+                written = true;
+            }
+        }
+        // The last partial batch; an empty one still creates an empty named
+        // DB's catalog record.
+        if !batch.is_empty() || !written {
+            write_batch_growing(&env, name.as_deref(), &batch)?;
+        }
     }
-    write_db_batched(&env, None, &main_user)?;
-    drop(named_owned);
-    drop(main_user);
+    drop(batch);
 
     // Verify the produced env is structurally clean before returning. Unlike
     // the old `check_image` over the file, this does not re-verify the meta
@@ -268,60 +290,93 @@ pub(crate) fn open_exclusive_destination(
 /// never holds a large DB's dirty pages in memory.
 const BATCH_BYTES: usize = 64 << 20;
 
-/// Write `entries` (sorted, unique) into `name`, or the main DB, through
-/// write txns of at most [`BATCH_BYTES`] of records each. Creates a named DB
-/// even when it is empty, so its catalog record exists. When the map fills,
-/// the txn is aborted, the map doubled ([`Env::resize`]) and the batch
-/// retried. Returns the number of records written.
+/// Open `path` for streaming through the dump parser.
+fn open_dump(path: &Path) -> Result<dump_format::DumpReader<BufReader<File>>, BoxErr> {
+    let file = File::open(path)?;
+    Ok(dump_format::DumpReader::new(BufReader::with_capacity(
+        1 << 20,
+        file,
+    ))?)
+}
+
+/// One write txn's records, packed into one buffer: about [`BATCH_BYTES`]
+/// of keys and values, kept until the txn commits so a full map can be grown
+/// and the batch retried.
+#[derive(Default)]
+struct Batch {
+    /// Every record's key then value, back to back.
+    data: Vec<u8>,
+    /// Each record's `(key length, value length)`, in `data` order.
+    lens: Vec<(usize, usize)>,
+}
+
+impl Batch {
+    fn push(&mut self, key: &[u8], val: &[u8]) {
+        self.data.extend_from_slice(key);
+        self.data.extend_from_slice(val);
+        self.lens.push((key.len(), val.len()));
+    }
+
+    fn clear(&mut self) {
+        self.data.clear();
+        self.lens.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lens.is_empty()
+    }
+
+    /// The records, in the order they were pushed.
+    fn records(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        let mut at = 0;
+        self.lens.iter().map(move |&(klen, vlen)| {
+            let key = &self.data[at..at + klen];
+            let val = &self.data[at + klen..at + klen + vlen];
+            at += klen + vlen;
+            (key, val)
+        })
+    }
+}
+
+/// Write `batch` into `name`, or the main DB, in one write txn. Creates a
+/// named DB even when the batch is empty, so its catalog record exists. When
+/// the map fills, the txn is aborted, the map doubled ([`Env::resize`]) and
+/// the batch retried.
 ///
 /// # Errors
 ///
 /// An engine error other than a full map.
-fn write_db_batched(
-    env: &Env,
-    name: Option<&[u8]>,
-    entries: &[crate::common::Kv],
-) -> Result<u64, BoxErr> {
-    let mut start = 0;
+fn write_batch_growing(env: &Env, name: Option<&[u8]>, batch: &Batch) -> Result<(), BoxErr> {
     loop {
-        let mut end = start;
-        let mut bytes = 0;
-        while end < entries.len() && (end == start || bytes < BATCH_BYTES) {
-            bytes += entries[end].0.len() + entries[end].1.len();
-            end += 1;
-        }
-        match write_batch(env, name, &entries[start..end]) {
-            Ok(()) => {}
+        match write_batch(env, name, batch) {
+            Ok(()) => return Ok(()),
             Err(zerodb::Error::Mdb(MdbError::MapFull)) => {
                 let grown = env
                     .map_size()
                     .checked_mul(2)
                     .ok_or("map size overflow while growing the map")?;
                 env.resize(grown)?;
-                continue;
             }
             Err(e) => return Err(e.into()),
-        }
-        start = end;
-        if start == entries.len() {
-            return Ok(entries.len() as u64);
         }
     }
 }
 
-/// One write txn: create or open the DB and put `batch` into it.
-fn write_batch(
-    env: &Env,
-    name: Option<&[u8]>,
-    batch: &[crate::common::Kv],
-) -> Result<(), zerodb::Error> {
+/// One write txn: create or open the DB and put `batch` into it. A record
+/// whose key the DB already holds is skipped (`NO_OVERWRITE`), so the first
+/// record of a duplicated key wins. A valid dump has no duplicates, and its
+/// ascending keys take the sequential-writes path whatever the flag.
+fn write_batch(env: &Env, name: Option<&[u8]>, batch: &Batch) -> Result<(), zerodb::Error> {
     let mut wtxn = env.write_txn()?;
     let db = match name {
         None => env.main_database(),
         Some(n) => env.create_database(&mut wtxn, Some(n))?,
     };
-    for (k, v) in batch {
-        db.put(&mut wtxn, k, v)?;
+    for (k, v) in batch.records() {
+        match db.put_with_flags(&mut wtxn, PutFlags::NO_OVERWRITE, k, v) {
+            Ok(()) | Err(zerodb::Error::Mdb(MdbError::KeyExist)) => {}
+            Err(e) => return Err(e),
+        }
     }
     wtxn.commit()
 }
@@ -345,16 +400,6 @@ pub fn refuse_existing_env(env_dir: &Path, verb: &str) -> Result<(), BoxErr> {
         }
     }
     Ok(())
-}
-
-/// Sort by key and drop duplicate keys so the write txns see
-/// strictly-ascending, unique input (the case sequential writes serve
-/// best). A valid dump is already sorted and unique
-/// (this is purely defensive against a hand-edited dump); on a duplicate key the
-/// first occurrence is kept.
-fn normalize(entries: &mut Vec<crate::common::Kv>) {
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    entries.dedup_by(|a, b| a.0 == b.0);
 }
 
 /// `check <env-dir>`: run the SPEC 03 §11 / SPEC 05 §9 invariant walker and
@@ -474,5 +519,110 @@ fn report(mut out: String, violations: &[String]) -> (String, bool) {
             let _ = writeln!(out, "    {v}");
         }
         (out, false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dump_format::{render, DumpDb};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        // Relaxed: the counter only makes names unique within this process.
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let p = std::env::temp_dir().join(format!(
+            "zerodb-tools-unit-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn kv(k: &[u8], v: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        (k.to_vec(), v.to_vec())
+    }
+
+    /// A hand-edited dump, written across many tiny batches into a map
+    /// that must grow: out-of-order records land in key order and, of
+    /// duplicated keys, the first in the dump is kept, also when the
+    /// duplicate falls in a later batch.
+    #[test]
+    fn load_across_batches_sorts_and_keeps_first_duplicate() {
+        let mut main = Vec::new();
+        for i in (0u32..3000).rev() {
+            main.push(kv(format!("k{i:05}").as_bytes(), &[b'a'; 40]));
+        }
+        main.push(kv(b"k00007", b"second"));
+        main.insert(0, kv(b"k02999", b"first"));
+        let named = vec![
+            kv(b"z", b"1"),
+            kv(b"a", b"2"),
+            kv(b"z", b"3"),
+            kv(b"m", &[7u8; 50_000]),
+        ];
+        let input = render(&[
+            DumpDb {
+                name: None,
+                entries: main,
+            },
+            DumpDb {
+                name: Some(b"n".to_vec()),
+                entries: named,
+            },
+            DumpDb {
+                name: Some(b"empty".to_vec()),
+                entries: vec![],
+            },
+        ]);
+        let dir = tmp_dir("batches");
+        let dump = dir.join("in.dump");
+        std::fs::write(&dump, input).unwrap();
+        let env_dir = dir.join("env");
+        load_batched(&dump, &env_dir, 4096, 64 << 10, 1000).unwrap();
+
+        let mut want_main: Vec<_> = (0u32..3000)
+            .map(|i| kv(format!("k{i:05}").as_bytes(), &[b'a'; 40]))
+            .collect();
+        want_main[2999].1 = b"first".to_vec();
+        let want = render(&[
+            DumpDb {
+                name: None,
+                entries: want_main,
+            },
+            DumpDb {
+                name: Some(b"empty".to_vec()),
+                entries: vec![],
+            },
+            DumpDb {
+                name: Some(b"n".to_vec()),
+                entries: vec![kv(b"a", b"2"), kv(b"m", &[7u8; 50_000]), kv(b"z", b"1")],
+            },
+        ]);
+        assert_eq!(cmd_dump(&env_dir).unwrap(), want);
+        let (report, clean) = cmd_check(&env_dir).unwrap();
+        assert!(clean, "{report}");
+    }
+
+    /// A dump that is malformed anywhere, even after many valid records, is
+    /// rejected before the destination env is created.
+    #[test]
+    fn malformed_dump_leaves_destination_untouched() {
+        let mut text = render(&[DumpDb {
+            name: None,
+            entries: (0u32..500).map(|i| kv(&i.to_be_bytes(), b"v")).collect(),
+        }]);
+        text.push_str("format=bytevalue\nHEADER=END\n 6b\n zz\nDATA=END\n");
+        let dir = tmp_dir("malformed");
+        let dump = dir.join("in.dump");
+        std::fs::write(&dump, text).unwrap();
+        let env_dir = dir.join("env");
+        let err = load_batched(&dump, &env_dir, 4096, 1 << 20, 100).unwrap_err();
+        assert!(err.to_string().contains("bad hex"), "{err}");
+        assert!(naming::existing_data_files(&env_dir).is_empty());
     }
 }

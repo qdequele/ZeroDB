@@ -65,8 +65,13 @@ or any other failure (unknown subcommand or option, unreadable env, …). Unknow
   a **fresh** env from a dump through ordinary write txns with sequential
   writes (ADR-0015), as `mdb_load` does, committing every 64 MiB of records;
   the map doubles whenever it fills, so `--map-size` is a starting size. The
-  dump-text parse still holds the whole dump in memory (issue #63). The
-  produced env is checked through the map before the command returns.
+  dump is read a line at a time, twice: a first pass rejects a malformed dump
+  before the destination is created, the second writes the databases in dump
+  order. Memory stays at about one 64 MiB batch plus its write txn's dirty
+  pages, whatever the dump's size. In a hand-edited dump, records out of
+  order still land in key order, and of several records with the same key in
+  a database the first is kept. The produced env is checked through the map
+  before the command returns.
   Refuses a target that holds data under either data-file name, or that
   another process has open.
 
