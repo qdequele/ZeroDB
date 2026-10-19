@@ -455,24 +455,6 @@ enum ReserveLoc {
     Big(u64),
 }
 
-/// An owned leaf-cell value extracted during a split/borrow/merge rewrite.
-enum OwnedVal {
-    Inline(Vec<u8>),
-    Big { head: u64, dsize: u32 },
-}
-
-/// An owned leaf cell (key + value + node flags), the currency of page
-/// rewrites. `flags` carries the leaf-node flags (`F_SUBDATA` for a named-DB
-/// catalog entry, SPEC 02 §6) so splits/merges/rebalances preserve them;
-/// `F_BIGDATA` is implied by [`OwnedVal::Big`] and re-derived on write.
-struct OwnedLeafCell {
-    key: Vec<u8>,
-    val: OwnedVal,
-    /// Non-`F_BIGDATA` leaf-node flags to preserve across a rewrite (only
-    /// `F_SUBDATA` today).
-    flags: u16,
-}
-
 /// A leaf split's new-cell payload, **borrowed** from the caller:
 /// `split_leaf` packs it straight into the target frame without ever
 /// materializing an owned cell.
@@ -488,7 +470,7 @@ enum NewLeafVal<'v> {
 }
 
 impl NewLeafVal<'_> {
-    /// §6.4 `used` term for the new cell (mirrors [`OwnedLeafCell::used`]).
+    /// §6.4 `used` term for the new cell (mirrors [`leaf_cell_used`]).
     fn used(&self, key_len: usize) -> usize {
         let varea = match self {
             NewLeafVal::Inline(v) => v.len(),
@@ -499,8 +481,7 @@ impl NewLeafVal<'_> {
     }
 }
 
-/// §6.4 `used` term of existing cell `i` of a leaf view (borrowed twin of
-/// [`OwnedLeafCell::used`]).
+/// §6.4 `used` term of existing cell `i` of a leaf view.
 fn leaf_cell_used(leaf: &LeafRef<'_>, i: usize) -> usize {
     let varea = match leaf.value(i) {
         LeafValue::Inline(v) => v.len(),
@@ -686,6 +667,13 @@ pub struct RwTxn<'env> {
     /// allocates. LMDB's cursor stack is likewise allocated once and reused;
     /// a fresh `Vec` per op cost an allocation, its growth and a free.
     path_buf: Path,
+    /// Byte buffer the delete rebalance moves cells through (ADR-0028,
+    /// SPEC 03 §10 REB-2/REB-4): a cell or a whole page is copied out of
+    /// one dirty frame, then written into another. Kept across ops, so only
+    /// the first rebalance of the txn allocates; it avoids holding two dirty
+    /// frames at once, which under `WRITE_MAP` would take a second live
+    /// `&mut` into the map.
+    cell_scratch: Vec<u8>,
     /// Rightmost-leaf fingers, at most one per tree (SPEC 03 §6.6):
     /// the cached right-spine descent a sequential/APPEND put re-uses
     /// instead of descending. Writer-private — reads and nested read children
@@ -840,6 +828,7 @@ impl Env {
             open: OpenTable::default(),
             handles: inner.handles().begin(),
             path_buf: Path::new(),
+            cell_scratch: Vec::new(),
             fingers: Vec::new(),
             seq_main: inner.sequential_writes_for(None),
             dirty_limit: inner.dirty_limit(),
@@ -2695,30 +2684,6 @@ impl<'env> RwTxn<'env> {
 
     // -- split machinery (§6.2/§6.4/§6.5, ADR-0004 D5) ------------------------
 
-    fn extract_leaf_cells(&self, pgno: u64) -> Result<Vec<OwnedLeafCell>> {
-        let frame = self.dirty.bytes(pgno).expect("page is dirty");
-        let leaf = LeafRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
-        let mut cells = Vec::with_capacity(leaf.num_keys());
-        for i in 0..leaf.num_keys() {
-            let val = match leaf.value(i) {
-                LeafValue::Inline(v) => OwnedVal::Inline(v.to_vec()),
-                LeafValue::Overflow { head_pgno, dsize } => OwnedVal::Big {
-                    head: head_pgno,
-                    dsize,
-                },
-            };
-            // Preserve non-BIGDATA node flags (F_SUBDATA) across the rewrite
-            // (SPEC 02 §6); F_BIGDATA is re-derived from the value on write.
-            let flags = leaf.node_flags(i) & !crate::page::F_BIGDATA;
-            cells.push(OwnedLeafCell {
-                key: leaf.key(i).to_vec(),
-                val,
-                flags,
-            });
-        }
-        Ok(cells)
-    }
-
     fn extract_branch_cells(&self, pgno: u64) -> Result<Vec<OwnedBranchCell>> {
         let frame = self.dirty.bytes(pgno).expect("page is dirty");
         let br = BranchRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
@@ -2872,8 +2837,7 @@ impl<'env> RwTxn<'env> {
 
         // General split: pack both frames from cells **borrowed** out of the
         // old frame — removed from the store as an owned, address-stable
-        // `Box` — plus the caller's new cell. No `OwnedLeafCell`
-        // materialization.
+        // `Box` — plus the caller's new cell. No owned per-cell copies.
         let rpg = self.allocate(1)?;
         let old = self.dirty.remove(lpg).expect("leaf is dirty");
         let oldleaf = LeafRef::new_prevalidated(&old, psize).map_err(corrupt)?;
@@ -3552,75 +3516,40 @@ impl<'env> RwTxn<'env> {
         let (_, pki) = path[level - 1];
         let psize = self.psize;
         if is_leaf {
-            if fromleft {
-                // Sibling's last entry becomes P's first; P's separator = the
-                // moved key.
-                let cell = {
-                    let frame = self.dirty.bytes(sib).expect("sibling touched");
-                    let leaf = LeafRef::new_prevalidated(frame, psize).map_err(corrupt)?;
-                    let i = leaf.num_keys() - 1;
-                    OwnedLeafCell {
-                        key: leaf.key(i).to_vec(),
-                        val: match leaf.value(i) {
-                            LeafValue::Inline(v) => OwnedVal::Inline(v.to_vec()),
-                            LeafValue::Overflow { head_pgno, dsize } => OwnedVal::Big {
-                                head: head_pgno,
-                                dsize,
-                            },
-                        },
-                        flags: leaf.node_flags(i) & !crate::page::F_BIGDATA,
-                    }
-                };
-                {
-                    let frame = self.dirty.bytes_mut(sib).expect("sibling touched");
-                    let mut l = LeafMut::from_valid(frame, psize).map_err(corrupt)?;
-                    let i = l.num_keys() - 1;
-                    l.remove(i).map_err(corrupt)?;
-                }
-                self.insert_owned_leaf_cell(pg, 0, &cell)?;
-                let newkey = cell.key.clone();
-                self.update_parent_key(tree, path, level - 1, pki, newkey)
-            } else {
-                // Sibling's first entry becomes P's last; the sibling's
-                // separator = its new first key.
-                let cell = {
-                    let frame = self.dirty.bytes(sib).expect("sibling touched");
-                    let leaf = LeafRef::new_prevalidated(frame, psize).map_err(corrupt)?;
-                    OwnedLeafCell {
-                        key: leaf.key(0).to_vec(),
-                        val: match leaf.value(0) {
-                            LeafValue::Inline(v) => OwnedVal::Inline(v.to_vec()),
-                            LeafValue::Overflow { head_pgno, dsize } => OwnedVal::Big {
-                                head: head_pgno,
-                                dsize,
-                            },
-                        },
-                        flags: leaf.node_flags(0) & !crate::page::F_BIGDATA,
-                    }
-                };
-                {
-                    let frame = self.dirty.bytes_mut(sib).expect("sibling touched");
-                    LeafMut::from_valid(frame, psize)
-                        .map_err(corrupt)?
-                        .remove(0)
-                        .map_err(corrupt)?;
-                }
-                let new_first = {
-                    let frame = self.dirty.bytes(sib).expect("sibling touched");
-                    LeafRef::new_prevalidated(frame, psize)
-                        .map_err(corrupt)?
-                        .key(0)
-                        .to_vec()
-                };
-                let p_n = {
-                    let frame = self.dirty.bytes(pg).expect("page is dirty");
-                    LeafRef::new_prevalidated(frame, psize)
-                        .map_err(corrupt)?
-                        .num_keys()
-                };
-                self.insert_owned_leaf_cell(pg, p_n, &cell)?;
-                self.update_parent_key(tree, path, level - 1, pki + 1, new_first)
+            // REB-2: the boundary cell moves verbatim (flags, key, inline
+            // value or overflow head) through the txn's scratch buffer — no
+            // decode, no owned key/value copies.
+            let mut cell = std::mem::take(&mut self.cell_scratch);
+            cell.clear();
+            let src_idx = {
+                let frame = self.dirty.bytes_mut(sib).expect("sibling touched");
+                let mut l = LeafMut::from_valid(frame, psize).map_err(corrupt)?;
+                let i = if fromleft { l.num_keys() - 1 } else { 0 };
+                cell.extend_from_slice(l.cell_bytes(i).map_err(corrupt)?);
+                l.remove(i).map_err(corrupt)?;
+                i
+            };
+            debug_assert!(fromleft || src_idx == 0);
+            {
+                let frame = self.dirty.bytes_mut(pg).expect("page is dirty");
+                let mut l = LeafMut::from_valid(frame, psize).map_err(corrupt)?;
+                // From the left the sibling's last entry becomes P's first;
+                // from the right the sibling's first becomes P's last.
+                let at = if fromleft { 0 } else { l.num_keys() };
+                l.insert_cell_bytes(at, &cell).map_err(corrupt)?;
             }
+            // The rewritten separator: from the left, P's (the moved key);
+            // from the right, the sibling's (its new first key).
+            let (key_pg, sep_idx) = if fromleft { (pg, pki) } else { (sib, pki + 1) };
+            cell.clear();
+            {
+                let frame = self.dirty.bytes(key_pg).expect("page is dirty");
+                let l = LeafRef::new_prevalidated(frame, psize).map_err(corrupt)?;
+                cell.extend_from_slice(l.key(0));
+            }
+            let split = self.update_parent_key(tree, path, level - 1, sep_idx, &cell);
+            self.cell_scratch = cell;
+            split
         } else if fromleft {
             // Branch borrow from the left sibling: its last child becomes P's
             // new node 0; P's old node 0 gets P's old parent separator; the
@@ -3660,7 +3589,7 @@ impl<'env> RwTxn<'env> {
                 b.insert(0, &[], c).map_err(corrupt)?;
                 b.insert(1, &old_sep, c0).map_err(corrupt)?;
             }
-            self.update_parent_key(tree, path, level - 1, pki, k_m)
+            self.update_parent_key(tree, path, level - 1, pki, &k_m)
         } else {
             // Branch borrow from the right sibling: its node 0 moves to P's
             // end carrying the sibling's old parent separator; the sibling's
@@ -3698,42 +3627,38 @@ impl<'env> RwTxn<'env> {
                 let n = b.num_keys();
                 b.insert(n, &old_sep, c).map_err(corrupt)?;
             }
-            self.update_parent_key(tree, path, level - 1, pki + 1, k1)
+            self.update_parent_key(tree, path, level - 1, pki + 1, &k1)
         }
     }
 
-    fn insert_owned_leaf_cell(
-        &mut self,
-        pgno: u64,
-        idx: usize,
-        cell: &OwnedLeafCell,
-    ) -> Result<()> {
-        let frame = self.dirty.bytes_mut(pgno).expect("page is dirty");
-        let mut leaf = LeafMut::from_valid(frame, self.psize).map_err(corrupt)?;
-        match &cell.val {
-            OwnedVal::Inline(v) => leaf
-                .insert_inline(idx, &cell.key, cell.flags, v)
-                .map_err(corrupt),
-            OwnedVal::Big { head, dsize } => leaf
-                .insert_bigdata(idx, &cell.key, *dsize, *head)
-                .map_err(corrupt),
-        }
-    }
-
-    /// Rewrite the parent separator for `child_idx` (never node 0): remove the
-    /// old node and re-insert with the new key through the generic branch
-    /// insert, which splits the parent if the longer key no longer fits.
-    /// Returns [`insert_into_branch`](Self::insert_into_branch)'s split flag.
+    /// Rewrite the parent separator for `child_idx` (never node 0). REB-3:
+    /// in place when the new key's padded growth fits the parent's free
+    /// space (LMDB's in-place key update); otherwise remove the old node and
+    /// re-insert through the generic branch insert, which splits the parent.
+    /// The in-place rewrite fits in exactly the cases the re-insert would
+    /// not split, so split decisions (and page allocation) are unchanged.
+    /// Returns whether the parent split
+    /// ([`insert_into_branch`](Self::insert_into_branch)'s flag).
     fn update_parent_key(
         &mut self,
         tree: TreeId,
         path: &mut [(u64, usize)],
         parent_level: usize,
         child_idx: usize,
-        new_key: Vec<u8>,
+        new_key: &[u8],
     ) -> Result<bool> {
         debug_assert!(child_idx >= 1, "node 0's separator is always empty");
         let (ppg, _) = path[parent_level];
+        {
+            let frame = self.dirty.bytes_mut(ppg).expect("parent is dirty");
+            let fitted = BranchMut::from_valid(frame, self.psize)
+                .map_err(corrupt)?
+                .set_key(child_idx, new_key)
+                .map_err(corrupt)?;
+            if fitted {
+                return Ok(false);
+            }
+        }
         let child = {
             let frame = self.dirty.bytes(ppg).expect("parent is dirty");
             BranchRef::new_prevalidated(frame, self.psize)
@@ -3747,7 +3672,14 @@ impl<'env> RwTxn<'env> {
                 .remove(child_idx)
                 .map_err(corrupt)?;
         }
-        self.insert_into_branch(tree, path, parent_level as isize, child_idx, new_key, child)
+        self.insert_into_branch(
+            tree,
+            path,
+            parent_level as isize,
+            child_idx,
+            new_key.to_vec(),
+            child,
+        )
     }
 
     /// §10 MERGE, always right-into-left: append the right page's entries to
@@ -3769,16 +3701,23 @@ impl<'env> RwTxn<'env> {
         } else {
             (pg, sib, pki + 1)
         };
+        let psize = self.psize;
+        // REB-4: the right page's cells are appended to the left page in
+        // order, read from a scratch copy of the right page (so only one
+        // dirty frame is borrowed at a time) — no owned per-cell copies.
+        let mut src = std::mem::take(&mut self.cell_scratch);
+        src.clear();
+        src.extend_from_slice(self.dirty.bytes(right).expect("right is dirty"));
         if is_leaf {
-            let cells = self.extract_leaf_cells(right)?;
-            let base = {
-                let frame = self.dirty.bytes(left).expect("left is dirty");
-                LeafRef::new_prevalidated(frame, self.psize)
-                    .map_err(corrupt)?
-                    .num_keys()
-            };
-            for (j, c) in cells.iter().enumerate() {
-                self.insert_owned_leaf_cell(left, base + j, c)?;
+            {
+                let r = LeafRef::new_prevalidated(&src, psize).map_err(corrupt)?;
+                let frame = self.dirty.bytes_mut(left).expect("left is dirty");
+                let mut l = LeafMut::from_valid(frame, psize).map_err(corrupt)?;
+                let base = l.num_keys();
+                for j in 0..r.num_keys() {
+                    l.insert_cell_bytes(base + j, r.cell_bytes(j, psize).map_err(corrupt)?)
+                        .map_err(corrupt)?;
+                }
             }
             sat_sub(&mut self.record_mut(tree).leaf_pages, 1);
         } else {
@@ -3786,23 +3725,25 @@ impl<'env> RwTxn<'env> {
             // separator being dropped (§10 merge / §6.5 inverse).
             let sep = {
                 let frame = self.dirty.bytes(ppg).expect("parent is dirty");
-                BranchRef::new_prevalidated(frame, self.psize)
+                BranchRef::new_prevalidated(frame, psize)
                     .map_err(corrupt)?
                     .key(right_idx)
                     .to_vec()
             };
-            let cells = self.extract_branch_cells(right)?;
             {
+                let r = BranchRef::new_prevalidated(&src, psize).map_err(corrupt)?;
                 let frame = self.dirty.bytes_mut(left).expect("left is dirty");
-                let mut b = BranchMut::from_valid(frame, self.psize).map_err(corrupt)?;
+                let mut b = BranchMut::from_valid(frame, psize).map_err(corrupt)?;
                 let base = b.num_keys();
-                b.insert(base, &sep, cells[0].child).map_err(corrupt)?;
-                for (j, c) in cells.iter().enumerate().skip(1) {
-                    b.insert(base + j, &c.key, c.child).map_err(corrupt)?;
+                b.insert(base, &sep, r.child_pgno(0)).map_err(corrupt)?;
+                for j in 1..r.num_keys() {
+                    b.insert(base + j, r.key(j), r.child_pgno(j))
+                        .map_err(corrupt)?;
                 }
             }
             sat_sub(&mut self.record_mut(tree).branch_pages, 1);
         }
+        self.cell_scratch = src;
         {
             let frame = self.dirty.bytes_mut(ppg).expect("parent is dirty");
             BranchMut::from_valid(frame, self.psize)

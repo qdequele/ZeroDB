@@ -633,6 +633,96 @@ impl<'a> LeafMut<'a> {
         write_u16(self.buf, OFF_UPPER, write_pos as u16);
         Ok(())
     }
+
+    /// The encoded bytes of entry `idx`'s cell — node header, key, value area
+    /// and even-pad byte — exactly as stored. With
+    /// [`insert_cell_bytes`](LeafMut::insert_cell_bytes) this moves an entry
+    /// between pages without decoding it (ADR-0028, SPEC 03 §10 REB-2).
+    ///
+    /// # Errors
+    ///
+    /// A cell-shape error if the cell does not decode (as
+    /// [`remove`](LeafMut::remove)).
+    pub fn cell_bytes(&self, idx: usize) -> Result<&[u8], PageError> {
+        leaf_cell_slice(self.buf, idx, self.psize)
+    }
+
+    /// Insert an encoded cell, as returned by [`LeafRef::cell_bytes`] or
+    /// [`cell_bytes`](LeafMut::cell_bytes), verbatim at sorted index `idx`.
+    /// The flags (including `F_BIGDATA` and its overflow head pgno), key and
+    /// value bytes are kept exactly; nothing is re-encoded.
+    ///
+    /// # Errors
+    ///
+    /// A cell-shape error if `cell` is not exactly one well-formed leaf cell
+    /// (its header's sizes must account for every byte), or
+    /// [`PageError::PageFull`] if it does not fit.
+    pub fn insert_cell_bytes(&mut self, idx: usize, cell: &[u8]) -> Result<(), PageError> {
+        let clen = cell.len();
+        if clen < LEAF_NODE_HEADER {
+            return Err(PageError::CellOutOfBounds {
+                offset: 0,
+                needed: LEAF_NODE_HEADER,
+                body_size: clen,
+            });
+        }
+        let flags = read_u16(cell, 0);
+        let ksize = read_u16(cell, 2) as usize;
+        let dsize = read_u32(cell, 4);
+        if flags & !LEAF_FLAGS_PHASE1_MASK != 0 {
+            return Err(PageError::ReservedFlagSet { flags });
+        }
+        if ksize == 0 || ksize > MAX_KEY_SIZE {
+            return Err(PageError::BadKeySize { ksize });
+        }
+        let area = if flags & F_BIGDATA != 0 {
+            BIGDATA_VALUE_LEN
+        } else {
+            dsize as usize
+        };
+        if even(LEAF_NODE_HEADER + ksize + area) != clen {
+            return Err(PageError::CellOutOfBounds {
+                offset: 0,
+                needed: even(LEAF_NODE_HEADER + ksize + area),
+                body_size: clen,
+            });
+        }
+        let num_keys = self.num_keys();
+        debug_assert!(idx <= num_keys, "insert index out of range");
+        let avail = self.free_space();
+        if clen + 2 > avail {
+            return Err(PageError::PageFull {
+                needed: clen + 2,
+                available: avail,
+            });
+        }
+        let new_upper = self.upper() as usize - clen;
+        let abs = HEADER_SIZE + new_upper;
+        self.buf[abs..abs + clen].copy_from_slice(cell);
+        insert_pointer(self.buf, idx, num_keys, new_upper as u16);
+        Ok(())
+    }
+}
+
+impl<'a> LeafRef<'a> {
+    /// As [`LeafMut::cell_bytes`], over a read-only view of a page of size
+    /// `psize`.
+    ///
+    /// # Errors
+    ///
+    /// A cell-shape error if the cell does not decode.
+    pub fn cell_bytes(&self, idx: usize, psize: u32) -> Result<&'a [u8], PageError> {
+        leaf_cell_slice(self.buf, idx, psize)
+    }
+}
+
+/// The bounds-checked encoded bytes of leaf cell `idx` in `buf`.
+fn leaf_cell_slice(buf: &[u8], idx: usize, psize: u32) -> Result<&[u8], PageError> {
+    let num_keys = read_u16(buf, OFF_LOWER) as usize / 2;
+    assert!(idx < num_keys, "leaf entry index out of range");
+    let abs = HEADER_SIZE + ptr_at(buf, idx) as usize;
+    let clen = leaf_cell_len(buf, abs, psize)?;
+    Ok(&buf[abs..abs + clen])
 }
 
 // ===========================================================================
@@ -919,6 +1009,71 @@ impl<'a> BranchMut<'a> {
         let clen = branch_cell_len(self.buf, abs, self.psize, idx == 0)?;
         remove_cell(self.buf, idx, num_keys, cpos, clen, self.upper() as usize);
         Ok(())
+    }
+
+    /// Replace the separator key of child entry `idx` **in place**, keeping
+    /// its child pgno and its index (ADR-0028, SPEC 03 §10 REB-3; LMDB's
+    /// in-place key update). When the padded cell length is unchanged only
+    /// the key bytes are rewritten; otherwise the cells below it in the heap
+    /// shift by the difference. Returns `Ok(false)`, with the page untouched,
+    /// when a longer key does not fit the free space — exactly the case in
+    /// which removing the cell and inserting the new one would return
+    /// [`PageError::PageFull`] (both need `new_len - old_len <= free`), so
+    /// the caller falls back to remove + a splitting insert.
+    ///
+    /// # Errors
+    ///
+    /// [`PageError::BadKeySize`] for a key invalid at `idx` (node 0 takes
+    /// only the empty key), or a cell-shape error if the existing cell does
+    /// not decode.
+    pub fn set_key(&mut self, idx: usize, key: &[u8]) -> Result<bool, PageError> {
+        if idx == 0 {
+            if !key.is_empty() {
+                return Err(PageError::BadKeySize { ksize: key.len() });
+            }
+        } else if key.is_empty() || key.len() > MAX_KEY_SIZE {
+            return Err(PageError::BadKeySize { ksize: key.len() });
+        }
+        let num_keys = self.num_keys();
+        assert!(idx < num_keys, "branch entry index out of range");
+        let cpos = ptr_at(self.buf, idx) as usize;
+        let abs = HEADER_SIZE + cpos;
+        let old_clen = branch_cell_len(self.buf, abs, self.psize, idx == 0)?;
+        let new_clen = even(BRANCH_NODE_HEADER + key.len());
+        let upper = self.upper() as usize;
+        if new_clen != old_clen {
+            if new_clen > old_clen && new_clen - old_clen > self.free_space() {
+                return Ok(false);
+            }
+            // The cell keeps its END offset (cells above it do not move);
+            // the heap below it, plus this cell's fixed header, slides by
+            // the size difference. `new_upper` stays >= `lower` by the free
+            // space check above.
+            let new_upper = upper + old_clen - new_clen;
+            self.buf.copy_within(
+                HEADER_SIZE + upper..abs + BRANCH_NODE_HEADER,
+                HEADER_SIZE + new_upper,
+            );
+            for j in 0..num_keys {
+                let p = ptr_at(self.buf, j) as usize;
+                if p <= cpos {
+                    write_u16(
+                        self.buf,
+                        HEADER_SIZE + j * 2,
+                        (p + old_clen - new_clen) as u16,
+                    );
+                }
+            }
+            write_u16(self.buf, OFF_UPPER, new_upper as u16);
+        }
+        let nabs = HEADER_SIZE + ptr_at(self.buf, idx) as usize;
+        write_u16(self.buf, nabs + 8, key.len() as u16);
+        self.buf[nabs + BRANCH_NODE_HEADER..nabs + BRANCH_NODE_HEADER + key.len()]
+            .copy_from_slice(key);
+        if new_clen > BRANCH_NODE_HEADER + key.len() {
+            self.buf[nabs + BRANCH_NODE_HEADER + key.len()] = 0;
+        }
+        Ok(true)
     }
 }
 
