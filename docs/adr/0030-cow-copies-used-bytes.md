@@ -1,9 +1,9 @@
 # ADR-0030: A copy-on-write copies only a page's used bytes, as LMDB
 
-- Status: **Draft, awaiting approval.** It changes which bytes a committed
-  page carries in its free gap (never read, but written to disk), so it is
-  decided before it is implemented (AGENTS.md rule 5). A spike measured it
-  first (rule 6).
+- Status: **Accepted (Option A, maintainer, 2026-10-19), implemented.** It
+  changes which bytes a committed page carries in its free gap (never read,
+  but written to disk), so it was decided before it was implemented
+  (AGENTS.md rule 5). A spike measured it first (rule 6).
 - Related issue: none yet. Background:
   [`benches/results/2026-10-19-crud-scan-count-and-batch-delete.md`](../../benches/results/2026-10-19-crud-scan-count-and-batch-delete.md).
 - Date: 2026-10-19
@@ -83,7 +83,7 @@ and is more than ZeroDB does today (`remove_cell` leaves stale bytes).
 
 ## Decision
 
-Proposed: **Option A**, as LMDB. Not implemented until approved.
+**Option A**, as LMDB.
 
 ## Consequences
 
@@ -105,3 +105,14 @@ Proposed: **Option A**, as LMDB. Not implemented until approved.
 2. Should heap mode and in-place `WRITE_MAP` keep producing byte-identical
    files (which would need Option C, or a full copy in one of the two
    modes)?
+
+## Resolution (2026-10-19)
+
+The maintainer chose Option A ("A", 2026-10-19), after the trade-offs above
+were laid out. That settles both open questions:
+
+1. Yes: a page's free gap may carry bytes from an earlier page at its page
+   number. Gaps already carry stale cell bytes, and nothing reads them.
+2. No: heap mode and in-place `WRITE_MAP` need not write byte-identical files.
+   Their live page contents stay identical, and each mode stays deterministic
+   for a given sequence of operations.

@@ -6,6 +6,16 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### Copy-on-write copies only a page's used bytes (ADR-0030)
+
+When a write transaction first modifies a page, ZeroDB copied all of it. It now
+copies the header with the pointer array and the cell area and skips the free
+gap between them, as LMDB's `mdb_page_copy` does. The gap of a copied page keeps
+whatever its new page held before; nothing reads it, and ZeroDB already left
+stale bytes there when a cell was removed. The on-disk format and recovery are
+unchanged. Files written in heap mode and in in-place `WRITE_MAP` mode can now
+differ in those gap bytes. New benchmark rung `del/batch/k1000`.
+
 ### Faster full scans over large trees under the trusting policy
 
 A full scan (`iter().count()`, a `for` loop over `iter`) over a tree much larger

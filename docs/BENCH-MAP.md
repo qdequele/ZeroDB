@@ -144,6 +144,7 @@ ascending order leaves on the table.
 | `del/cursor/drain` | the same span drained through the **write cursor** (`range_mut` + `del_current`) rather than by key | cursor delete; the only rung where post-delete cursor position costs anything |
 | `del/clear/all` | the whole tree dropped in one operation | page-list work, not per-key work (leaves freed from their parents unread) |
 | `del/churn/reinsert` | delete and re-insert alternating: freed pages must be reclaimed and handed straight back out | free-list churn, SPEC 05 |
+| `del/batch/k1000` | 10,000 random deletes in 1,000-key txns from 50k random-order inserts of 1,200-byte values | the copy-on-write copy (ADR-0030) and descent misses: crud-bench `batch_delete_1000` |
 
 A gap concentrated in `churn/reinsert` is a reclamation finding. A gap spread
 evenly across `bulk/*` is a tree finding. `range/half ÷ bulk/half` says how much

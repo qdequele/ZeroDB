@@ -47,6 +47,7 @@ pub use meta::{
     DBRECORD_LEN,
 };
 pub use overflow::{write_overflow_head, OverflowRef};
+pub(crate) use tree::copy_tree_page;
 pub use tree::{BranchMut, BranchRef, LeafMut, LeafRef, LeafValue};
 pub use trust::FileTrust;
 

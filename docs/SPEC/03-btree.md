@@ -393,8 +393,14 @@ The rules (SPEC 04 owns dirty-set *storage*; this section owns *when* pages are
 copied and how pgnos propagate):
 
 1. **First-touch copy.** Before modifying page `P` reachable from the committed
-   root, allocate a fresh page `P'` (a new pgno, §8), `memcpy` `P`'s contents,
-   stamp `P'.txnid = current_txnid`, and add `P'` to the txn's dirty set. All
+   root, allocate a fresh page `P'` (a new pgno, §8), copy `P`'s contents,
+   stamp `P'.txnid = current_txnid`, and add `P'` to the txn's dirty set.
+   *(Amended 2026-10-19, ADR-0030.)* The copy moves only `P`'s used bytes, the
+   header and pointer array `[0, HEADER + lower)` and the cell heap
+   `[HEADER + upper, psize)`, as LMDB's `mdb_page_copy` does; the free gap
+   between them keeps whatever `P'`'s frame or map page held. No reader,
+   checker or recovery path reads a gap. A source whose bounds do not check is
+   copied whole, and a freshly allocated heap frame is always filled whole. All
    further edits in this txn hit `P'`. `P` (the old version) is scheduled for
    the GC DB at commit (SPEC 05) — readers on the old root still see it.
 2. **Already-dirty pages** (created or copied earlier in this same txn, i.e.
