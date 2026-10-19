@@ -241,7 +241,13 @@ records are unchanged. A page listed by two sources fails the allocation with
 `MdbError::Invalid` (the records are untrusted input). A request at least as
 long as one that already missed after reading every gated record skips the
 search for the rest of the transaction, since a write transaction's reusable
-pages only shrink during its operations.
+pages only shrink during its operations. The merged list is built on the
+first miss and kept for the transaction, as LMDB keeps its free list: a
+first version rebuilt it on every miss and made `put/gc/ovf_across` (200
+six-page values into two interleaved records) about 2.5× slower than
+before. Ids the other draw arms take later stay in the list until a
+candidate run meets them; every draw records its pages in `reclaimed`, so
+a candidate is checked against it and a taken id is dropped then.
 
 **The riskiest assumption held.** `free_run_churn` (macOS aarch64, 16 KiB
 pages; file pages, deterministic; ZeroDB / LMDB in brackets):
