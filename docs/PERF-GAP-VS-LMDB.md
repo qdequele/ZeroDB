@@ -295,8 +295,9 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
   because ZeroDB issues a second `fdatasync` after the meta write, which LMDB
   does not. Open: prefault / preallocation of the map (#42), the Graviton A/B,
   and whether Meilisearch should set `WRITE_MAP`.
-- **Short read txns** — one read txn + one get is 1.55× [V]; reusing read txns
-  is #25.
+- **Short read txns** — one read txn + one get is 1.55× [V]. The memo level
+  and the named-DB table are now reused across txns on a thread (#25,
+  `env/txn/ro_get_one` −26 % on macOS); a Linux re-measure is pending.
 - **Page fill under random inserts** — the unsorted 10M load makes an 8 %
   larger file than LMDB's [S]. No issue yet.
 - **`zerodb-tools load` memory** — reads the whole dump into memory, then
