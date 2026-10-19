@@ -6,6 +6,24 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### Faster full scans over large trees under the trusting policy
+
+A full scan (`iter().count()`, a `for` loop over `iter`) over a tree much larger
+than the CPU caches ran at about half LMDB's speed. Two causes, both fixed:
+
+- Under the trusting file policy (ADR-0014), every leaf a scan visited was
+  recorded in the read transaction's validated-pages memo. A scan sees each leaf
+  once, so the memo grew to megabytes and every probe missed through all its
+  levels. Trusted leaves are no longer recorded; branches still are (ADR-0014
+  amendment 2026-10-19). The header checks on each leaf view are unchanged, and
+  the default validating policy is untouched.
+- A cursor step within a leaf now reads the entry from the leaf view it already
+  holds, as LMDB's `mdb_cursor_next` does, instead of re-deriving the position.
+
+In a crud-bench-shaped repro (500k entries, ~0.9 GB), a full count went from
+0.57× to about 1.0× LMDB. New benchmark rung `scan/full/big`. Numbers:
+`benches/results/2026-10-19-crud-scan-count-and-batch-delete.md`.
+
 ### `skip` crosses whole leaves instead of stepping each entry
 
 The read iterators (`iter`, `rev_iter`, `range`, `rev_range`, `prefix_iter`,

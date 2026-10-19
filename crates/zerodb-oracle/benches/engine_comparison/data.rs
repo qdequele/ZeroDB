@@ -28,6 +28,13 @@ pub const N_DBS: usize = 8;
 /// The reference inline value size (bytes).
 pub const VAL: usize = 256;
 
+/// Keys for the larger-than-cache scan rung (`scan/full/big`): with
+/// [`VAL_BIG`] values the tree is ~300 MB, far past any CPU cache.
+pub const N_BIG: usize = 200_000;
+/// Inline value size of the `scan/full/big` rung — about a crud-bench
+/// document, so a 16 KiB leaf holds roughly ten entries.
+pub const VAL_BIG: usize = 1_200;
+
 /// splitmix64 — a tiny deterministic PRNG so shuffles are reproducible across
 /// platforms without pulling in `rand`.
 pub fn splitmix64(state: &mut u64) -> u64 {

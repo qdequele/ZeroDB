@@ -709,8 +709,9 @@ dirty-page store must be built so it is.
   views it, and re-wrapped without checks on later views through the
   txn-scoped validated-pages memo. An env opened with the trusting
   `FileTrust` policy skips the cell walk for map pages: on a memo miss they
-  take the O(1) header checks dirty frames take, then enter the memo (page type, reserved fields,
-  free-space bounds). The high-water bound above and the free-list id checks
+  take the O(1) header checks dirty frames take (page type, reserved fields,
+  free-space bounds); a branch then enters the memo, a leaf does not (ADR-0014
+  amendment 2026-10-19: a scan views each leaf once). The high-water bound above and the free-list id checks
   (SPEC 05 GC-18) apply under both policies. Under the trusting policy an
   overflow value is sliced from its head page without reading the run's header
   (ADR-0014 amendment, 2026-09-29); the slice stays bounded by the high-water. Under the
