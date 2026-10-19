@@ -37,3 +37,4 @@ issues.
 | 0026 | [Ranged `msync` for `WRITE_MAP` commits](adr/0026-writemap-ranged-msync.md) | Accepted (Option B, 2026-10-17), implemented (#45) | Durability |
 | 0027 | [The API of Meilisearch's heed fork, behind a feature](adr/0027-heed-fork-unique-txns.md) | Accepted (Option B, 2026-10-18), implemented (#115) | API, consumer compatibility |
 | 0028 | [Delete rebalance moves cells page to page, as LMDB](adr/0028-delete-rebalance-node-move.md) | Accepted (Option A, 2026-10-18), implemented | Performance (deletes), B+tree |
+| 0030 | [A copy-on-write copies only a page's used bytes, as LMDB](adr/0030-cow-copies-used-bytes.md) | Draft, awaiting approval | Performance (writes), bytes on disk |
