@@ -27,6 +27,24 @@ that.
   the item rather than ending the iterator silently.
 - New benchmark rungs `scan/skip_take/fwd` and `scan/skip_take/rev`.
 
+### Faster deletes: rebalance moves cells page to page (ADR-0028)
+
+When a delete leaves a page under a quarter full, ZeroDB borrows an entry
+from a neighbor page or merges the two. It used to decode each moved entry
+into owned buffers, re-encode it, and rewrite the parent's separator by
+removing and re-inserting it. It now copies the entry's encoded bytes
+directly and rewrites the separator in place, as LMDB does. The resulting
+tree is identical (same pages, same page numbers, same `stat`); only the
+work to get there shrinks.
+
+- Criterion ladder (Apple M-series, busy host): `del/bulk/half` 2.46× →
+  1.30× LMDB's time, `del/cursor/drain` 2.59× → 1.50×, `del/churn/reinsert`
+  1.67× → 1.21×, `del/range/half` 0.67× → 0.24×.
+- crud-bench deletes (one delete per transaction) gain ~10–15 %: that
+  workload is bound by commit, not by the rebalance.
+- SPEC 03 §10.1 numbers the rebalance rules (REB-1..REB-5). New golden test
+  `rebalance_logical_image` pins the tree shape deletes leave behind.
+
 ### Meilisearch v1.55's heed fork (ADR-0027, #102)
 
 Meilisearch v1.55 builds against its own heed fork, whose API differs from

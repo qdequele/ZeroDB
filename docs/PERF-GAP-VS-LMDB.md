@@ -56,6 +56,7 @@ set today. Source keys:
 - **[L]** the perf ledger line for the change
 - **[G]** [`2026-10-13-multi-process-stage3-graviton.md`](../benches/results/2026-10-13-multi-process-stage3-graviton.md) — full ladder on Graviton4 (c8g, EBS io2, ext4, CGU1) with the lock file on (the default since ADR-0023) and off (`NO_LOCK`)
 - **[C]** [`2026-10-15-meilisearch-v1.53.1-graviton-xlarge.md`](../benches/results/2026-10-15-meilisearch-v1.53.1-graviton-xlarge.md) — Meilisearch v1.53.1 and hannoy on Graviton4 `c8g.xlarge` (8 GiB, gp3), lock file on
+- **[D]** [`2026-10-18-delete-rebalance-node-move-mac.md`](../benches/results/2026-10-18-delete-rebalance-node-move-mac.md) — `del/*` rungs and crud-bench before/after ADR-0028, Apple M-series laptop (busy host; indicative)
 - **[G2]** [`2026-10-15-lock-file-in-place-graviton.md`](../benches/results/2026-10-15-lock-file-in-place-graviton.md) — `env/*` and a sample of other rungs on Graviton4 (c8g, EBS gp3, ext4, CGU1) after the lock file is rebuilt in place (ADR-0023 amendment 20)
 
 Rungs that [V] re-measured are quoted from [V]; the rest come from [E], which
@@ -115,10 +116,11 @@ on, five rungs regress, and their rows below give both figures.
 
 | What | Ratio | Source |
 |---|---:|---|
-| Per-key deletes (`del/bulk/half`, `del/bulk/all`) | 1.75× | E |
-| Delete + re-insert churn (`del/churn/reinsert`) | 1.40× | E |
-| Draining through the write cursor (`del/cursor/drain`) | 2.72× | E |
-| `delete_range` (`del/range/half`) | 0.95× | E |
+| Per-key deletes (`del/bulk/half`, `del/bulk/all`) | 1.30–1.37× | D |
+| Delete + re-insert churn (`del/churn/reinsert`) | 1.21× | D |
+| Draining through the write cursor (`del/cursor/drain`) | 1.50× | D |
+| `delete_range` (`del/range/half`) | 0.24× | D |
+| One delete per txn, 48 threads (crud-bench, 16 KiB pages) | ~2.1× (~0.48× the throughput) | D |
 | `clear` (`del/clear/all`) | 1.84× | E |
 
 ### Commits
@@ -221,6 +223,7 @@ are bench server ratios, before → after, unless stated.
 |---|---|---|---|
 | **Cursor delete keeps its position (the `del_current` re-descent)** | `del_current` re-descended to delete, then again for the next step, so a cursor drain cost 28 % more than deleting by key. It now deletes at the path it holds and settles on the successor (LMDB's `C_DEL`), and keeps the path across leftmost-pairing rebalances (`mdb_cursor_del0`). SPEC 03 §5.4a; pinned by `tests/cursor_delete_position.rs`. | `del/cursor/drain` 3.38× → 2.46× (laptop), then 2.91× → 2.63× | c4ab096, 17fdb24 |
 | **`delete_range` as one leaf walk** | Collected every key, then point-deleted each; now splices covered cells leaf by leaf and rebalances each leaf once (beyond LMDB, which has no range delete). | `del/range/half` 2.63× → 0.92× | 3512269 |
+| **Rebalance moves cells page to page** | A borrow decoded the moved entry into owned key/value buffers, re-encoded it, and rewrote the parent separator as remove + re-insert; a merge did the same per entry. Cells now move verbatim through a per-txn scratch buffer and separators are rewritten in place, as LMDB's node move and key update do. Tree shape unchanged. ADR-0028, SPEC 03 §10.1. | `del/bulk/half` 2.46× → 1.30×, `del/cursor/drain` 2.59× → 1.50×, `del/range/half` 0.67× → 0.24× (laptop, [D]) | ADR-0028 |
 | **`clear` frees leaves unread** | Without overflow pages, leaf page numbers are freed from their parents without loading the leaves (LMDB's `mdb_drop0`). | `del/clear/all` 12.73× → 1.78× | c60a31e |
 
 ### Copies, stats and tools
@@ -262,16 +265,14 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
 
 **Measured**
 
-- **Delete rebalance** — per-key deletes 1.75×, cursor drains 2.72× [E]. A
-  borrow moves one entry through a full remove + insert round trip, so
-  rebalancing fires on almost every delete near the fill threshold (2.54 cell
-  removals per delete where one is needed). LMDB runs the same algorithm but
-  moves node bytes page to page. Fix: move several entries per borrow, or a
-  direct move primitive; needs an ADR. On Meilisearch's delete-heavy
-  settings change this showed as 1.07× end to end
-  ([`2026-09-10-meilisearch-delete-heavy-macos.md`](../benches/results/2026-09-10-meilisearch-delete-heavy-macos.md)).
-  No issue yet. A cursor delete that rebalances outside the leftmost pairing
-  still re-descends.
+- **Deletes after ADR-0028** — per-key deletes 1.30–1.37×, cursor drains
+  1.50× [D]. The rebalance now moves cells as LMDB does; what remains is the
+  rest of the delete (descent, COW of the sibling). A cursor delete that
+  rebalances outside the leftmost pairing still re-descends. Workloads with
+  one delete per transaction are bound by commit instead: in crud-bench's
+  delete phase ~78 % of commit is re-encoding the meta page's free-list annex
+  (`MetaPage::encode_with_annex`, ADR-0022), which a delete-heavy run keeps
+  full. No issue yet.
 - **Per-commit CPU** — `commit/batch/n1` 1.60×, empty write txn 2.46×, and
   YCSB no-sync on Graviton4 1.21–1.38× [M]. What is left is CPU per commit,
   not I/O. Most write-txn containers already start empty and do not allocate,
