@@ -21,7 +21,7 @@
 | row | cause | result |
 |---|---|---|
 | `start(5000) limit(100)` | `skip` stepped every skipped entry | already fixed by #118 (`Iterator::nth` crosses whole leaves): ZeroDB is now 2.2–4.6× LMDB's throughput in every round |
-| full `count()` | per-txn validated-pages memo bookkeeping for every leaf, and a long per-entry step | **fixed here**: repro 20 → 34 ops/s against LMDB's 33 (single thread) |
+| full `count()` | per-txn validated-pages memo bookkeeping for every leaf, and a long per-entry step | **fixed here**: repro 20 → 34 ops/s against LMDB's 33 (single thread); Graviton4 `scan/full/*` 2.05× → 1.02× LMDB's time, no rung regressed |
 | `batch_delete_1000` | the copy-on-write copy moves the whole 16 KiB page; LMDB copies only the used bytes | **not fixed**: ADR-0030 drafted (it changes the bytes written into a page's free gap); spike ~11 % faster per delete |
 
 ## Full `count()`
@@ -113,8 +113,8 @@ found that recording *nothing* cost hot reads 4–5 %). Same key, 1M gets in one
 read transaction, best of 10, 5 interleaved rounds at load 20–30: before
 349–377 ns, step-only 334–389 ns, both 345–392 ns. No difference the host can
 resolve. An earlier 4-round run read +4–12 %, but the next run did not
-reproduce it. **This needs a quiet-host check** (`get/access/hot` with
-`ZERODB_BENCH_TRUST_FILE=1`).
+reproduce it. The Graviton4 gate below settles it: `get/access/hot` is faster
+(0.89–0.90× of before) in both policies.
 
 **Criterion** (`scripts/bench-ab.sh '^(scan|get|seek)/'`, 3 rounds each):
 
@@ -198,11 +198,82 @@ there (`remove_cell` does not zero what it vacates). It is still a change to the
 bytes written to disk, so it is written up as **ADR-0030 (draft)** and not
 implemented.
 
+## Graviton4 gate (quiet host)
+
+`c8g.xlarge` (Graviton4, 4 vCPU, 8 GiB, Ubuntu 24.04, **4 KiB pages**, CGU1),
+load ~1. `scripts/bench-ab.sh '^(scan|get|seek)/'`, 3 interleaved rounds each,
+before = `e96ea4a`, after = this change. Both verdicts: **improved, 0 regressed**.
+Excerpt: every scan rung, the `get/access` rungs and a few others. No rung
+outside the excerpt regressed either; all are faster or flat.
+
+### Validating policy (the default)
+
+| rung | LMDB | ZeroDB before | ZeroDB after | vs LMDB before → after | after ÷ before | LMDB drift | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `get/access/hot` | 1.262 ms | 1.115 ms | 1.007 ms | 0.88× → **0.80×** | 0.903 (±0.030) | 0.956 | ⚠ drift |
+| `get/access/miss` | 861.675 µs | 945.599 µs | 909.761 µs | 1.10× → **1.06×** | 0.960 (±0.030) | 0.978 | ✅ faster |
+| `get/access/rand` | 3.326 ms | 3.060 ms | 2.958 ms | 0.92× → **0.89×** | 0.942 (±0.037) | 1.001 | ✅ faster |
+| `get/access/seq` | 1.437 ms | 1.394 ms | 1.317 ms | 0.97× → **0.92×** | 0.945 (±0.030) | 0.975 | ✅ faster |
+| `get/db/root` | 3.283 ms | 3.113 ms | 2.966 ms | 0.95× → **0.90×** | 0.959 (±0.053) | 0.980 | flat |
+| `get/val/v8` | 1.808 ms | 1.634 ms | 1.560 ms | 0.90× → **0.86×** | 0.955 (±0.030) | 0.977 | ✅ faster |
+| `scan/edge/first_last` | 1.028 ms | 1.832 ms | 1.474 ms | 1.78× → **1.43×** | 0.805 (±0.030) | 1.000 | ✅ faster |
+| `scan/full/big` 🎯 | 17.224 ms | 30.376 ms | 28.285 ms | 1.76× → **1.64×** | 0.933 (±0.030) | 0.998 | ✅ faster |
+| `scan/full/fwd` 🎯 | 478.738 µs | 1.076 ms | 692.790 µs | 2.25× → **1.45×** | 0.641 (±0.030) | 1.000 | ✅ faster |
+| `scan/full/rev` 🎯 | 480.016 µs | 1.053 ms | 699.496 µs | 2.19× → **1.46×** | 0.664 (±0.030) | 1.000 | ✅ faster |
+| `scan/meta/len` | 67.428 µs | 76.186 µs | 75.738 µs | 1.13× → **1.12×** | 0.994 (±0.030) | 0.984 | flat |
+| `scan/prefix/bucket` | 3.391 µs | 6.674 µs | 4.515 µs | 1.97× → **1.33×** | 0.676 (±0.030) | 1.000 | ✅ faster |
+| `scan/range/10pct` | 80.130 µs | 105.085 µs | 66.289 µs | 1.31× → **0.83×** | 0.631 (±0.045) | 0.996 | ✅ faster |
+| `scan/range/1pct` | 8.457 µs | 11.644 µs | 7.468 µs | 1.38× → **0.88×** | 0.645 (±0.031) | 0.990 | ✅ faster |
+| `scan/skip_take/fwd` | 49.213 µs | 24.059 µs | 23.036 µs | 0.49× → **0.47×** | 0.957 (±0.030) | 0.997 | ✅ faster |
+| `scan/skip_take/rev` | 49.804 µs | 24.393 µs | 23.385 µs | 0.49× → **0.47×** | 0.959 (±0.030) | 1.000 | ✅ faster |
+| `seek/ge/rand` | 3.516 ms | 3.275 ms | 3.253 ms | 0.93× → **0.93×** | 0.984 (±0.089) | 1.024 | flat |
+
+**Verdict: improved**. Improved: 17, regressed: 0, flat: 10, unreliable (LMDB drift > 3%): 5.
+
+### Trusting policy (`ZERODB_BENCH_TRUST_FILE=1`, both sides)
+
+| rung | LMDB | ZeroDB before | ZeroDB after | vs LMDB before → after | after ÷ before | LMDB drift | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `get/access/hot` | 1.258 ms | 1.118 ms | 1.000 ms | 0.89× → **0.79×** | 0.893 (±0.044) | 0.999 | ✅ faster |
+| `get/access/miss` | 856.085 µs | 947.186 µs | 903.422 µs | 1.11× → **1.06×** | 0.953 (±0.030) | 1.000 | ✅ faster |
+| `get/access/rand` | 3.238 ms | 3.028 ms | 2.812 ms | 0.94× → **0.87×** | 0.934 (±0.030) | 1.000 | ✅ faster |
+| `get/access/seq` | 1.427 ms | 1.367 ms | 1.299 ms | 0.96× → **0.91×** | 0.948 (±0.030) | 0.999 | ✅ faster |
+| `get/db/root` | 3.234 ms | 3.083 ms | 2.833 ms | 0.95× → **0.88×** | 0.919 (±0.030) | 1.001 | ✅ faster |
+| `get/val/v8` | 1.799 ms | 1.630 ms | 1.563 ms | 0.91× → **0.87×** | 0.960 (±0.030) | 0.998 | ✅ faster |
+| `scan/edge/first_last` | 1.029 ms | 1.853 ms | 1.493 ms | 1.80× → **1.45×** | 0.806 (±0.030) | 1.001 | ✅ faster |
+| `scan/full/big` 🎯 | 16.755 ms | 23.395 ms | 17.187 ms | 1.40× → **1.03×** | 0.725 (±0.038) | 0.943 | ⚠ drift |
+| `scan/full/fwd` 🎯 | 499.079 µs | 1.021 ms | 510.048 µs | 2.05× → **1.02×** | 0.500 (±0.030) | 1.080 | ⚠ drift |
+| `scan/full/rev` 🎯 | 481.028 µs | 977.998 µs | 510.349 µs | 2.03× → **1.06×** | 0.522 (±0.030) | 1.002 | ✅ faster |
+| `scan/meta/len` | 67.290 µs | 74.741 µs | 75.240 µs | 1.11× → **1.12×** | 0.997 (±0.030) | 1.004 | flat |
+| `scan/prefix/bucket` | 3.392 µs | 6.194 µs | 3.833 µs | 1.83× → **1.13×** | 0.619 (±0.053) | 1.018 | ✅ faster |
+| `scan/range/10pct` | 80.196 µs | 100.485 µs | 56.157 µs | 1.25× → **0.70×** | 0.557 (±0.030) | 1.000 | ✅ faster |
+| `scan/range/1pct` | 8.468 µs | 10.860 µs | 6.245 µs | 1.28× → **0.74×** | 0.575 (±0.030) | 1.000 | ✅ faster |
+| `scan/skip_take/fwd` | 49.310 µs | 19.214 µs | 11.886 µs | 0.39× → **0.24×** | 0.617 (±0.030) | 1.000 | ✅ faster |
+| `scan/skip_take/rev` | 49.880 µs | 19.552 µs | 12.010 µs | 0.39× → **0.24×** | 0.614 (±0.030) | 1.001 | ✅ faster |
+| `seek/ge/rand` | 3.575 ms | 3.215 ms | 3.031 ms | 0.90× → **0.85×** | 0.943 (±0.053) | 1.017 | ✅ faster |
+
+**Verdict: improved**. Improved: 22, regressed: 0, flat: 8, unreliable (LMDB drift > 3%): 2.
+
+Reading it:
+
+- Full scans: 2.0–2.25× → **1.02–1.06× LMDB's time** under trust, 1.45× when
+  validating. The step change helps both policies; the memo change only the
+  trusting one.
+- `scan/full/big` (the crud-bench `count()` shape) 1.40× → 1.03× under trust.
+  When validating it moves less (1.76× → 1.64×): there, each leaf's first view
+  pays the cell walk, which this change does not touch.
+- Range scans move ahead of LMDB (0.70–0.74× trusted, 0.83–0.88× validating).
+- **Hot point gets are faster, not slower**: `get/access/hot` 0.893 (±0.044)
+  trusted, 0.903 validating. The 2026-09-28 "record nothing" variant lost 4–5 %
+  there; keeping branches in the memo avoids that, and the inlined inline-value
+  arm of `resolve_value` speeds every get by 3–10 %.
+- Every other get and seek rung: faster or flat in both policies.
+
 ## Scorecard (the kept change: count scan)
 
 | | |
 |---|---|
-| **Faster** | Full `count()` over a 500k-entry, 0.9 GB tree: 0.57× → ~1.0× LMDB in the repro (single thread), 0.45× → 1.01× in crud-bench medians on a loaded host. The new `scan/full/big` rung reads 1.47× → 0.91× LMDB's time (noisy run). No regression resolved on the ladder, but both criterion verdicts are invalid: **needs a quiet-host or Graviton run**, `get/access/hot` under the trusting policy in particular. |
+| **Faster** | Full `count()` over a 500k-entry, 0.9 GB tree: 0.57× → ~1.0× LMDB in the repro (single thread), 0.45× → 1.01× in crud-bench medians on a loaded host. Graviton4 (quiet): both policies **improved, 0 regressed**; full scans 2.05× → 1.02× LMDB under trust (1.45× validating), `scan/full/big` 1.40× → 1.03×, range scans 0.70–0.88× LMDB, `get/access/hot` 0.89–0.90× of before. |
 | **Behavior** | Unchanged. `next`/`prev` return the same entries and errors. The memo is a cache: a trusted leaf not recorded is re-checked the same way on its next view. `cargo test --workspace` passes, including the cursor model tests and the oracle differentials. New unit test `trusting_policy_memoizes_branches_but_not_leaves`. |
 | **Safe** | No new `unsafe`. `resolve_value` / `resolve_overflow` are the same code split in two. Clippy `-D warnings` is clean on the host and on `x86_64-unknown-linux-gnu`, and fmt is clean. `cargo +nightly miri test -p zerodb-core` passes. Differential fuzz `just fuzz-quick`: `diff_ops` 44,530 runs in 10 min, image-open 3.18 M runs, no finding. |
 | **Durable** | No write path touched. `just crash-test-quick` passes: 229 single-process cycles (15 image cuts, 45 SIGKILL) and 57 multi-process cycles verified. |
@@ -210,8 +281,6 @@ implemented.
 
 ## What is left
 
-- A quiet-host or Graviton run of `^(scan|get|seek)/` in both policies, to certify
-  the hot-get rungs flat.
 - ADR-0030 (partial copy-on-write copy), awaiting a decision. After it, a ladder
   rung for random batched deletes on a larger-than-cache tree (`del/bulk/half`
   is ascending keys on a cache-resident tree).

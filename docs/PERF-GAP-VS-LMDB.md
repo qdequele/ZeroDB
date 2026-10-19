@@ -58,7 +58,7 @@ set today. Source keys:
 - **[C]** [`2026-10-15-meilisearch-v1.53.1-graviton-xlarge.md`](../benches/results/2026-10-15-meilisearch-v1.53.1-graviton-xlarge.md) — Meilisearch v1.53.1 and hannoy on Graviton4 `c8g.xlarge` (8 GiB, gp3), lock file on
 - **[D]** [`2026-10-18-delete-rebalance-node-move-mac.md`](../benches/results/2026-10-18-delete-rebalance-node-move-mac.md) — `del/*` rungs and crud-bench before/after ADR-0028, Apple M-series laptop (busy host; indicative)
 - **[G2]** [`2026-10-15-lock-file-in-place-graviton.md`](../benches/results/2026-10-15-lock-file-in-place-graviton.md) — `env/*` and a sample of other rungs on Graviton4 (c8g, EBS gp3, ext4, CGU1) after the lock file is rebuilt in place (ADR-0023 amendment 20)
-- **[X]** [`2026-10-19-crud-scan-count-and-batch-delete.md`](../benches/results/2026-10-19-crud-scan-count-and-batch-delete.md) — crud-bench `count()`, `start(5000) limit(100)` and `batch_delete_1000`, repro and crud-bench, Apple M-series laptop (busy host; indicative)
+- **[X]** [`2026-10-19-crud-scan-count-and-batch-delete.md`](../benches/results/2026-10-19-crud-scan-count-and-batch-delete.md) — crud-bench `count()`, `start(5000) limit(100)` and `batch_delete_1000` (repro and crud-bench on an M-series laptop, indicative), plus the `^(scan|get|seek)/` gate on Graviton4 in both policies
 
 Rungs that [V] re-measured are quoted from [V]; the rest come from [E], which
 predates the cache, so read paths in [E] are slightly pessimistic.
@@ -98,7 +98,8 @@ on, five rungs regress, and their rows below give both figures.
 | First/last (`scan/edge/first_last`) | 1.66× | E |
 | `len` of a DB (`scan/meta/len`) | 1.00× | E |
 | Range scans, opt-in trusted mode | 1.19–1.21× | E |
-| Full scan over a 0.9 GB tree, opt-in trusted mode (crud-bench `count()` repro) | ~1.0× (was 1.75×) | X |
+| Full scan, opt-in trusted mode (`scan/full/fwd`, Graviton4) | 1.02× (was 2.05×) | X |
+| Full scan over a 300 MB tree, opt-in trusted mode (`scan/full/big`, Graviton4) | 1.03× (was 1.40×) | X |
 
 ### Writes
 
@@ -197,7 +198,7 @@ are bench server ratios, before → after, unless stated.
 | **Cursor-free point get** | A `get` built a full cursor and compared the key twice; it now walks root to leaf and takes exactness from the leaf search (`mdb_node_search`). | `get/access/hot` 1.11× → 0.94× | 79f37ed |
 | **Default key compare** | Equal-length 8- or 4-byte keys compare as one big-endian integer instead of a `memcmp` call; same order (beyond LMDB). Kept because Meilisearch's and hannoy's hot trees use 4- and 8-byte ids. | `get/access/hot` 1.00× → 0.80×; `get/key/k128` +4–5 % | ef61096 |
 | **Cursor leaf memoization** | A cursor keeps its current leaf instead of reloading it per step. | scan 29× → 2.18× (July 2026, laptop) | — |
-| **Scan step and trusted-leaf memo** | Under the trusting policy every leaf a scan visited was recorded in the read txn's validated-pages memo, which grew until each probe missed through every level; trusted leaves are no longer recorded (branches are). A step within a leaf reads the entry from the leaf view in hand, as `mdb_cursor_next` does. | full count over 0.9 GB, repro: 1.75× → ~1.0× [X] | ADR-0014 amendment 2026-10-19 |
+| **Scan step and trusted-leaf memo** | Under the trusting policy every leaf a scan visited was recorded in the read txn's validated-pages memo, which grew until each probe missed through every level; trusted leaves are no longer recorded (branches are). A step within a leaf reads the entry from the leaf view in hand, as `mdb_cursor_next` does. | `scan/full/fwd` 2.25× → 1.45× (validating), 2.05× → 1.02× (trusted), Graviton4 [X] | ADR-0014 amendment 2026-10-19 |
 | **`NO_READ_AHEAD` honored** | The flag was a no-op, so each page fault read a whole readahead window; it now advises the map `MADV_RANDOM`, as LMDB does. | bigger-than-RAM YCSB: ~10 GB read in 60 s for a 1.5 GB DB → 7–11× less | 93b2740, [report](../benches/results/2026-09-29-ycsb-bigger-than-ram.md) |
 
 ### Write path and commits

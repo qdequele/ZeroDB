@@ -21,7 +21,10 @@ than the CPU caches ran at about half LMDB's speed. Two causes, both fixed:
   holds, as LMDB's `mdb_cursor_next` does, instead of re-deriving the position.
 
 In a crud-bench-shaped repro (500k entries, ~0.9 GB), a full count went from
-0.57× to about 1.0× LMDB. New benchmark rung `scan/full/big`. Numbers:
+0.57× to about 1.0× LMDB. On Graviton4, full scans take 1.45× LMDB's time
+(was 2.25×) under the default policy and 1.02× (was 2.05×) under the trusting
+one; range scans and point gets got faster too, and no rung regressed. New
+benchmark rung `scan/full/big`. Numbers:
 `benches/results/2026-10-19-crud-scan-count-and-batch-delete.md`.
 
 ### `skip` crosses whole leaves instead of stepping each entry
