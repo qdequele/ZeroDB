@@ -217,6 +217,28 @@ impl Drain {
 /// per allocation instead of a walk of the whole free-page database.
 const CROSS_RUN_RECORDS_PER_PAGE: u64 = 60;
 
+/// A source of the cross-record run search: a GC-tree record by key, with the
+/// ids the search read when this txn had not drawn from it yet, or the base
+/// meta's annex pool.
+enum CrossSource {
+    Tree { f: u64, fresh: Option<Vec<u64>> },
+    Annex,
+}
+
+/// The cross-record run search's state for one write txn
+/// ([`RwTxn::cross_record_run`]): the free ids of its sources merged into
+/// one ascending list, each tagged with the index of its source.
+struct CrossRunCache {
+    /// `(page id, index into sources)`, ascending by id. May still hold ids
+    /// another draw arm took since it was built (they are in `reclaimed`).
+    merged: Vec<(u64, u32)>,
+    sources: Vec<CrossSource>,
+    /// The record budget it was built with.
+    budget: u64,
+    /// Whether the budget stopped the read before the last gated record.
+    truncated: bool,
+}
+
 /// Merge two strictly-ascending, mutually-disjoint id slices into one
 /// strictly-ascending vec (GC-3/GC-4; the `freelist_save` step-(c) merge of
 /// this txn's `freed` with the carried annex remainder, SPEC 05 §2a GC-30).
@@ -745,6 +767,9 @@ pub struct RwTxn<'env> {
     /// nothing adds any until `freelist_save`), so a later request for a run
     /// at least as long cannot succeed either and skips the search.
     cross_miss: Option<u64>,
+    /// The cross-record run search's merged list of free ids, built on its
+    /// first use in this txn ([`RwTxn::cross_record_run`]).
+    cross_cache: Option<CrossRunCache>,
     /// Live nested read children (SPEC 04 TXN-31, ADR-0007 D3). Checked by
     /// [`RwTxn::guard_ok`] on every mutating entry (TXN-29) and at
     /// commit C0 (TXN-33); bumped/released by
@@ -888,6 +913,7 @@ impl Env {
             errored: false,
             oldest_cache: None,
             cross_miss: None,
+            cross_cache: None,
             children: ChildCounter::new(),
             // In-place WRITE_MAP keeps no whole-map reference in the struct
             // (see the field docs; ADR-0021 M1) — `whole_map` borrows lazily.
@@ -1663,6 +1689,12 @@ impl<'env> RwTxn<'env> {
     /// in exactly one source (INV-24), so no page is handed out twice, and
     /// every source's share is removed, so none leaks.
     ///
+    /// The merged list is built once per txn and kept ([`CrossRunCache`]),
+    /// as LMDB keeps its in-memory free list for the whole txn. Ids the
+    /// other draw arms take afterwards stay in it until a candidate run
+    /// meets them: every draw records its pages in `reclaimed`, so a
+    /// candidate is checked against it and a taken id is dropped there.
+    ///
     /// Every page drawn passed the same gate as a single-record draw, so no
     /// live snapshot and no crash-fallback meta can reach it (GC-18).
     // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
@@ -1674,15 +1706,95 @@ impl<'env> RwTxn<'env> {
             return Ok(None);
         }
         let run_len = usize::try_from(n).map_err(|_| Error::Mdb(MdbError::Invalid))?;
-        let oldest = self.oldest_reader();
         let budget = n.saturating_mul(CROSS_RUN_RECORDS_PER_PAGE);
-        // Source of a merged id: a tree record by key (with its ids when this
-        // txn has not drawn from it yet), or the annex pool.
-        enum Source {
-            Tree { f: u64, fresh: Option<Vec<u64>> },
-            Annex,
+        let mut cache = match self.cross_cache.take() {
+            // A cache that read every gated record, or at least as many as
+            // this request may read, serves it.
+            Some(c) if !c.truncated || c.budget >= budget => c,
+            _ => self.build_cross_cache(budget)?,
+        };
+        // Search from the low end. A candidate whose ids all are still free
+        // is the pick; an id another draw arm took since the cache was built
+        // is dropped, and the search resumes at the first window it could
+        // have hidden.
+        let mut from = 0usize;
+        let hit = loop {
+            let ids = &cache.merged;
+            let Some(at) = (from..ids.len().saturating_sub(run_len - 1))
+                .find(|&i| ids[i + run_len - 1].0 == ids[i].0 + (n - 1))
+            else {
+                break None;
+            };
+            match (at..at + run_len).find(|&j| self.reclaimed.contains(&ids[j].0)) {
+                None => break Some(at),
+                Some(j) => {
+                    cache.merged.remove(j);
+                    from = j.saturating_sub(run_len - 1);
+                }
+            }
+        };
+        let Some(at) = hit else {
+            if !cache.truncated {
+                self.cross_miss = Some(self.cross_miss.map_or(n, |m| m.min(n)));
+            }
+            self.cross_cache = Some(cache);
+            return Ok(None);
+        };
+        let start = cache.merged[at].0;
+        // Each source's share of the run: its first id and its count. A
+        // source's ids inside the run are consecutive positions of its own
+        // list (`Drain::take_span`).
+        let mut shares: Vec<(u32, u64, usize)> = Vec::new();
+        for &(p, i) in &cache.merged[at..at + run_len] {
+            match shares.iter_mut().find(|s| s.0 == i) {
+                Some(s) => s.2 += 1,
+                None => shares.push((i, p, 1)),
+            }
         }
-        let mut sources: Vec<Source> = Vec::new();
+        cache.merged.drain(at..at + run_len);
+        debug_assert!(shares.len() >= 2, "a single-source run was missed upstream");
+        for (i, first, count) in shares {
+            match &mut cache.sources[i as usize] {
+                CrossSource::Tree { f, fresh } => {
+                    let f = *f;
+                    // Reader-table shadow check, as in every other draw arm.
+                    #[cfg(debug_assertions)]
+                    self.debug_assert_gate(f);
+                    // A record first drawn here enters `drains` with the ids
+                    // the cache read; if `gc_reclaim` loaded it meanwhile,
+                    // its entry is the live one.
+                    let drain = match fresh.take() {
+                        Some(ids) => self.drains.entry(f).or_insert(Drain::new(ids)),
+                        None => self.drains.get_mut(&f).expect("drain entry present"),
+                    };
+                    drain.take_span(first, count);
+                }
+                CrossSource::Annex => {
+                    #[cfg(debug_assertions)]
+                    self.debug_assert_gate(self.base.txnid);
+                    self.annex.take_span(first, count);
+                }
+            }
+        }
+        self.cross_cache = Some(cache);
+        for p in start..start + n {
+            let first_time = self.reclaimed.insert(p);
+            debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
+        }
+        #[cfg(debug_assertions)]
+        {
+            self.cross_runs += 1;
+        }
+        Ok(Some(start))
+    }
+
+    /// Build the cross-record run search's merged list
+    /// ([`RwTxn::cross_record_run`]): the live ids of the gated GC-tree
+    /// records, oldest first and at most `budget` of them, and of the annex
+    /// pool when GC-31 admits it, each tagged with its source.
+    fn build_cross_cache(&mut self, budget: u64) -> Result<CrossRunCache> {
+        let oldest = self.oldest_reader();
+        let mut sources: Vec<CrossSource> = Vec::new();
         let mut truncated = false;
         if self.free_db.root != PGNO_INVALID {
             let rec = self.free_db;
@@ -1702,13 +1814,13 @@ impl<'env> RwTxn<'env> {
                 read += 1;
                 match self.drains.get(&f) {
                     Some(d) if d.len() == 0 => {}
-                    Some(_) => sources.push(Source::Tree { f, fresh: None }),
+                    Some(_) => sources.push(CrossSource::Tree { f, fresh: None }),
                     None => {
                         let ids = pil_decode(val).ok_or(Error::Mdb(MdbError::Invalid))?;
                         // The GC-18 validation rule, as in `gc_reclaim`.
                         validate_pil_ids(&ids, self.committed_last_pg)?;
                         if !ids.is_empty() {
-                            sources.push(Source::Tree {
+                            sources.push(CrossSource::Tree {
                                 f,
                                 fresh: Some(ids),
                             });
@@ -1719,98 +1831,41 @@ impl<'env> RwTxn<'env> {
             }
         }
         if self.annex.len() > 0 && self.base.txnid <= oldest {
-            sources.push(Source::Annex);
+            sources.push(CrossSource::Annex);
         }
+        let mut merged: Vec<(u64, u32)> = Vec::new();
         // Every single source was already searched in full, so a run needs
-        // two sources at least.
-        if sources.len() < 2 {
-            if !truncated {
-                self.cross_miss = Some(self.cross_miss.map_or(n, |m| m.min(n)));
+        // two sources at least; with fewer the list stays empty.
+        if sources.len() >= 2 {
+            for (i, s) in sources.iter().enumerate() {
+                let i = u32::try_from(i).map_err(|_| Error::Mdb(MdbError::Invalid))?;
+                let live: &[u64] = match s {
+                    CrossSource::Tree {
+                        fresh: Some(ids), ..
+                    } => ids,
+                    CrossSource::Tree { f, fresh: None } => self.drains[f].live(),
+                    CrossSource::Annex => self.annex.live(),
+                };
+                merged.extend(live.iter().map(|&p| (p, i)));
             }
-            return Ok(None);
-        }
-        fn live<'a>(
-            s: &'a Source,
-            drains: &'a BTreeMap<u64, Drain>,
-            annex: &'a Drain,
-        ) -> &'a [u64] {
-            match s {
-                Source::Tree {
-                    fresh: Some(ids), ..
-                } => ids,
-                Source::Tree { f, fresh: None } => drains[f].live(),
-                Source::Annex => annex.live(),
-            }
-        }
-        // Merge: every id tagged with its source's index. The sources'
-        // lists are each ascending, so the stable sort merges runs.
-        let total: usize = sources
-            .iter()
-            .map(|s| live(s, &self.drains, &self.annex).len())
-            .sum();
-        let mut merged: Vec<(u64, u32)> = Vec::with_capacity(total);
-        for (i, s) in sources.iter().enumerate() {
-            let i = u32::try_from(i).map_err(|_| Error::Mdb(MdbError::Invalid))?;
-            merged.extend(live(s, &self.drains, &self.annex).iter().map(|&p| (p, i)));
-        }
-        merged.sort_by_key(|&(p, _)| p);
-        // INV-24: a free page is listed by exactly one source. The records
-        // are on-disk data and never trusted (GC-18): a page listed twice
-        // would be handed out while still listed free, so a corrupt free
-        // list fails the allocation like any other invalid record.
-        if merged.windows(2).any(|w| w[0].0 == w[1].0) {
-            return Err(Error::Mdb(MdbError::Invalid));
-        }
-        let hit = (0..merged.len().saturating_sub(run_len - 1))
-            .find(|&i| merged[i + run_len - 1].0 == merged[i].0 + (n - 1));
-        let Some(at) = hit else {
-            if !truncated {
-                self.cross_miss = Some(self.cross_miss.map_or(n, |m| m.min(n)));
-            }
-            return Ok(None);
-        };
-        let start = merged[at].0;
-        // Each source's share of the run: its first id and its count. A
-        // source's ids inside the run are consecutive positions of its own
-        // list (`Drain::take_span`).
-        let mut shares: Vec<(u32, u64, usize)> = Vec::new();
-        for &(p, i) in &merged[at..at + run_len] {
-            match shares.iter_mut().find(|s| s.0 == i) {
-                Some(s) => s.2 += 1,
-                None => shares.push((i, p, 1)),
+            // The sources' lists are each ascending: the stable sort merges
+            // runs.
+            merged.sort_by_key(|&(p, _)| p);
+            // INV-24: a free page is listed by exactly one source. The
+            // records are on-disk data and never trusted (GC-18): a page
+            // listed twice would be handed out while still listed free, so a
+            // corrupt free list fails the allocation like any other invalid
+            // record.
+            if merged.windows(2).any(|w| w[0].0 == w[1].0) {
+                return Err(Error::Mdb(MdbError::Invalid));
             }
         }
-        drop(merged);
-        debug_assert!(shares.len() >= 2, "a single-source run was missed upstream");
-        for (i, first, count) in shares {
-            match &mut sources[i as usize] {
-                Source::Tree { f, fresh } => {
-                    let f = *f;
-                    // Reader-table shadow check, as in every other draw arm.
-                    #[cfg(debug_assertions)]
-                    self.debug_assert_gate(f);
-                    let drain = match fresh.take() {
-                        Some(ids) => self.drains.entry(f).or_insert(Drain::new(ids)),
-                        None => self.drains.get_mut(&f).expect("drain entry present"),
-                    };
-                    drain.take_span(first, count);
-                }
-                Source::Annex => {
-                    #[cfg(debug_assertions)]
-                    self.debug_assert_gate(self.base.txnid);
-                    self.annex.take_span(first, count);
-                }
-            }
-        }
-        for p in start..start + n {
-            let first_time = self.reclaimed.insert(p);
-            debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
-        }
-        #[cfg(debug_assertions)]
-        {
-            self.cross_runs += 1;
-        }
-        Ok(Some(start))
+        Ok(CrossRunCache {
+            merged,
+            sources,
+            budget,
+            truncated,
+        })
     }
 
     /// Record `pgno` as freed (GC-6), dropping its dirty frame if it has one.

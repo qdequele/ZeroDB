@@ -228,6 +228,48 @@ as LMDB's do. Replacing `drains` and `reclaimed` for CPU alone (the issue's
 title) is not recommended: the profile puts the bookkeeping at about 2 % of
 a small commit.
 
+## Outcome (implementation, 2026-10-19)
+
+Implemented as allocate step 2c (`RwTxn::cross_record_run`,
+`crates/zerodb-core/src/rwtxn.rs`; SPEC 05 GC-16, GC-21). For `n > 1`, only
+after the per-record search and the annex pool miss: the live ids of the
+gated tree records (oldest first, at most `n * 60` records, LMDB's bound) and
+of the annex pool (when GC-31 admits it) are merged into one sorted list, and
+the first run of `n` consecutive ids from the low end is taken. Each source
+gives up its share (`Drain::take_span`), so `freelist_save` and the on-disk
+records are unchanged. A page listed by two sources fails the allocation with
+`MdbError::Invalid` (the records are untrusted input). A request at least as
+long as one that already missed after reading every gated record skips the
+search for the rest of the transaction, since a write transaction's reusable
+pages only shrink during its operations.
+
+**The riskiest assumption held.** `free_run_churn` (macOS aarch64, 16 KiB
+pages; file pages, deterministic; ZeroDB / LMDB in brackets):
+
+| Workload | LMDB | ZeroDB before | ZeroDB after |
+|----------|------|---------------|--------------|
+| 2,000 rewrites per commit, 200 commits | 121,032 | 197,960 (1.64) | 128,710 (1.06) |
+| 2,000 rewrites per commit, 400 commits | 121,713 | 295,585 (2.43) | 134,357 (1.10) |
+| 100 rewrites per commit, 400 commits | 101,111 | 99,315 (0.98) | 98,762 (0.98) |
+| inline values only, 2,000 per commit, 200 commits | 9,405 | 7,555 (0.80) | 7,555 (0.80) |
+
+The cross-record miss was the cause of the growth; the residual (ZeroDB's
+file still grows 4 % from 200 to 400 commits, LMDB's 0.6 %) is what
+Option B would add (leftovers coalesced on disk) and is left open.
+`gc_churn_parity` is unchanged (its values never need a run across records).
+
+**Differential test.** In `lmdb_free_run_observation.rs` the two new
+`_cushioned` cases (a run across two GC-tree records, or a GC-tree record and
+the annex, still whole when the value is written) now match LMDB (reused,
+file +0); ZeroDB before placed the value at the end of the file. The two
+original cross-record cases still differ: there ZeroDB's own bookkeeping
+pages (the leaf, the GC-tree leaf, the records' overflow values) are drawn
+from the lowest free ids, the front of `a`, starting in the transaction right
+after the one that freed `a` — which LMDB's gate does not allow (D-027 (a)).
+Traced at 16 KiB pages, 10 of `a`'s pages are gone before `c`, leaving a free
+run 7 pages short. Closing that needs D-027 (a) decided, not more search;
+those two cases stay held to ZeroDB's outcome, now attributed to (a).
+
 ## Consequences
 
 - Option B or C: SPEC 05 GC-16, GC-18, GC-21 (and for B GC-11..13, GC-20,
@@ -245,8 +287,9 @@ a small commit.
 
 ## Open questions for human review
 
-1. Close the cross-record gap (Option B or C), or approve it as a divergence
-   (Option A)?
-2. If closed: is re-keying leftover pages (Option B) acceptable, given the
-   check tool and the crash harness assume today's keys?
-3. Sanction D-027 (a), ZeroDB's one-transaction-earlier reuse?
+1. ~~Close the cross-record gap (Option B or C), or approve it as a
+   divergence (Option A)?~~ Closed with Option C (2026-10-19).
+2. Option B (leftovers coalesced on disk, re-keyed) stays open: worth it only
+   if the residual growth above matters.
+3. Sanction D-027 (a), ZeroDB's one-transaction-earlier reuse? It is now the
+   only reason the two uncushioned observation cases differ from LMDB.
