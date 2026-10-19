@@ -116,3 +116,11 @@ were laid out. That settles both open questions:
 2. No: heap mode and in-place `WRITE_MAP` need not write byte-identical files.
    Their live page contents stay identical, and each mode stays deterministic
    for a given sequence of operations.
+
+## Measured after implementation (2026-10-19)
+
+Graviton4 `c8g.xlarge`, 4 KiB pages: `^(del|put|commit/batch)/` flat (0
+regressed, `commit/batch/n1` 0.960), the batch-delete repro within 3 %. At
+4 KiB a leaf of ~1.2 KB values has little gap to skip, so the gain is the Mac
+spike's ~11 % at 16 KiB pages only. Details:
+`benches/results/2026-10-19-crud-scan-count-and-batch-delete.md`.

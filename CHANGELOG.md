@@ -14,7 +14,9 @@ gap between them, as LMDB's `mdb_page_copy` does. The gap of a copied page keeps
 whatever its new page held before; nothing reads it, and ZeroDB already left
 stale bytes there when a cell was removed. The on-disk format and recovery are
 unchanged. Files written in heap mode and in in-place `WRITE_MAP` mode can now
-differ in those gap bytes. New benchmark rung `del/batch/k1000`.
+differ in those gap bytes. Batch deletes at 16 KiB pages gain about 11 %; at
+4 KiB pages (Graviton4) the change is flat, with nothing regressed. New
+benchmark rung `del/batch/k1000`.
 
 ### Faster full scans over large trees under the trusting policy
 

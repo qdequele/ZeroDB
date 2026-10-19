@@ -22,7 +22,7 @@
 |---|---|---|
 | `start(5000) limit(100)` | `skip` stepped every skipped entry | already fixed by #118 (`Iterator::nth` crosses whole leaves): ZeroDB is now 2.2–4.6× LMDB's throughput in every round |
 | full `count()` | per-txn validated-pages memo bookkeeping for every leaf, and a long per-entry step | **fixed here**: repro 20 → 34 ops/s against LMDB's 33 (single thread); Graviton4 `scan/full/*` 2.05× → 1.02× LMDB's time, no rung regressed |
-| `batch_delete_1000` | the copy-on-write copy moves the whole 16 KiB page; LMDB copies only the used bytes | **not fixed**: ADR-0030 drafted (it changes the bytes written into a page's free gap); spike ~11 % faster per delete |
+| `batch_delete_1000` | at 16 KiB the copy-on-write copy moving the whole page; LMDB copies only the used bytes | **ADR-0030 accepted and implemented**: ~11 % per delete at 16 KiB (Mac spike), flat at 4 KiB on Graviton4, no rung regressed; the 4 KiB gap (0.78×) is elsewhere |
 
 ## Full `count()`
 
@@ -187,7 +187,7 @@ heap (`[upper, end)`), and skips the free gap between them. ZeroDB's
 `insert_copy` copies all 16 KiB. With ~10 entries of ~1.2 KB per leaf, the gap is
 often 2–4 KiB.
 
-### Spike (not kept)
+### Spike
 
 A scratch build copied only the used bytes. In 5 interleaved rounds (load 10–13,
 one outlier round dropped), it ran ~2.43 µs per delete against ~2.73 µs, about
@@ -195,8 +195,8 @@ one outlier round dropped), it ran ~2.43 µs per delete against ~2.73 µs, about
 page carries in its gap: the earlier contents of its new page number instead of
 its source's gap. Nothing reads gap bytes, and ZeroDB already leaves stale bytes
 there (`remove_cell` does not zero what it vacates). It is still a change to the
-bytes written to disk, so it is written up as **ADR-0030 (draft)** and not
-implemented.
+bytes written to disk, so it went through **ADR-0030**, accepted (Option A)
+and implemented; the Graviton4 measurement is further below.
 
 ## Graviton4 gate (quiet host)
 
@@ -269,6 +269,61 @@ Reading it:
   arm of `resolve_value` speeds every get by 3–10 %.
 - Every other get and seek rung: faster or flat in both policies.
 
+## ADR-0030 on Graviton4 (implemented, commit `2142004`)
+
+`c8g.xlarge`, Ubuntu 24.04, **4 KiB pages**, load ~1. Before = `3dfb457`.
+
+**Repro** (`batch_delete_1000` shape, 5 interleaved rounds, ns per delete):
+
+| round | LMDB | ZeroDB before | ZeroDB after |
+|---|---:|---:|---:|
+| r1 | 2,315 | 2,767 | 2,685 |
+| r2 | 4,802 | 3,245 | 2,806 |
+| r3 | 2,154 | 2,815 | 2,806 |
+| r4 | 2,167 | 2,854 | 2,805 |
+| r5 | 2,211 | 2,792 | 2,807 |
+
+Round 2 is disturbed (LMDB doubled; the root gp3 volume was writing back). On
+the other four rounds before and after are within 3 % of each other, around
+2.80 µs against LMDB's ~2.2 µs (0.78×).
+
+**Criterion** (`scripts/bench-ab.sh '^(del|put|commit/batch)/'`, 3 rounds):
+verdict **flat**, 0 regressed, 21 flat, 1 faster (`commit/batch/n1` 0.960).
+
+| rung | LMDB | ZeroDB before | ZeroDB after | vs LMDB before → after | after ÷ before | LMDB drift | verdict |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `commit/batch/n1` | 7.410 ms | 11.175 ms | 10.732 ms | 1.51× → **1.45×** | 0.960 (±0.030) | 1.000 | ✅ faster |
+| `commit/batch/n100` | 6.298 ms | 7.190 ms | 7.140 ms | 1.14× → **1.13×** | 0.991 (±0.030) | 1.004 | flat |
+| `commit/batch/n10k` | 14.039 ms | 14.006 ms | 14.091 ms | 1.00× → **1.00×** | 1.007 (±0.030) | 1.007 | flat |
+| `del/batch/k1000` 🎯 | 32.043 ms | 41.208 ms | 40.994 ms | 1.29× → **1.28×** | 0.990 (±0.030) | 1.010 | flat |
+| `del/bulk/all` 🎯 | 13.923 ms | 19.621 ms | 19.648 ms | 1.41× → **1.41×** | 1.002 (±0.030) | 1.002 | flat |
+| `del/bulk/half` 🎯 | 7.095 ms | 9.885 ms | 9.914 ms | 1.39× → **1.40×** | 1.004 (±0.030) | 1.003 | flat |
+| `del/churn/reinsert` 🎯 | 9.423 ms | 12.302 ms | 12.405 ms | 1.31× → **1.32×** | 1.010 (±0.030) | 1.000 | flat |
+| `del/clear/all` 🎯 | 117.230 µs | 212.231 µs | 209.430 µs | 1.81× → **1.79×** | 0.999 (±0.044) | 1.005 | flat |
+| `del/cursor/drain` 🎯 | 5.247 ms | 12.654 ms | 12.577 ms | 2.41× → **2.40×** | 0.994 (±0.030) | 1.002 | flat |
+| `del/range/half` 🎯 | 5.230 ms | 3.072 ms | 3.072 ms | 0.59× → **0.59×** | 1.002 (±0.030) | 1.007 | flat |
+| `put/api/plain` | 14.807 ms | 14.385 ms | 14.365 ms | 0.97× → **0.97×** | 0.998 (±0.030) | 1.002 | flat |
+| `put/api/reserved` | 14.888 ms | 16.286 ms | 16.179 ms | 1.09× → **1.09×** | 0.993 (±0.030) | 0.998 | flat |
+| `put/gc/drain_big` | 23.242 ms | 26.803 ms | 26.730 ms | 1.15× → **1.15×** | 1.000 (±0.030) | 1.018 | flat |
+| `put/order/append` | 9.344 ms | 11.805 ms | 11.802 ms | 1.26× → **1.26×** | 0.999 (±0.030) | 0.998 | flat |
+| `put/order/rand` | 36.999 ms | 35.708 ms | 35.798 ms | 0.97× → **0.97×** | 0.999 (±0.030) | 0.989 | flat |
+| `put/order/seq` | 14.397 ms | 14.368 ms | 14.345 ms | 1.00× → **1.00×** | 0.998 (±0.030) | 1.003 | flat |
+| `put/over/grow` | 8.852 ms | 9.850 ms | 9.910 ms | 1.11× → **1.12×** | 1.004 (±0.030) | 0.992 | flat |
+| `put/over/same_size` | 2.983 ms | 3.259 ms | 3.236 ms | 1.09× → **1.08×** | 0.991 (±0.045) | 1.009 | flat |
+| `put/val/v256` | 2.688 ms | 2.666 ms | 2.686 ms | 0.99× → **1.00×** | 1.011 (±0.030) | 1.012 | flat |
+| `put/val/v2page` | 6.632 ms | 6.578 ms | 6.701 ms | 0.99× → **1.01×** | 1.015 (±0.030) | 1.003 | flat |
+| `put/val/v4k` | 23.778 ms | 23.298 ms | 23.741 ms | 0.98× → **1.00×** | 1.011 (±0.030) | 1.002 | flat |
+| `put/val/v8` | 1.446 ms | 1.457 ms | 1.450 ms | 1.01× → **1.00×** | 0.995 (±0.030) | 1.006 | flat |
+
+**Reading it.** The copy-on-write copy shrinks by the page's free gap. On the
+Mac's 16 KiB pages with ~1.2 KB values that gap is several KiB per leaf, and the
+spike measured ~11 % per delete. On 4 KiB pages a leaf holds about three such
+values and the gap is a few hundred bytes, so the copy is not where a 4 KiB
+delete spends its time. The change keeps ZeroDB doing LMDB's work on this path
+at every page size and costs nothing at 4 KiB. The rest of the batch-delete gap
+on Linux (`del/batch/k1000` 1.28× LMDB's time, the repro at 0.78×) lies
+elsewhere and has not been profiled on Linux yet.
+
 ## Scorecard (the kept change: count scan)
 
 | | |
@@ -281,8 +336,20 @@ Reading it:
 
 ## What is left
 
-- ADR-0030 (partial copy-on-write copy), awaiting a decision. After it, a ladder
-  rung for random batched deletes on a larger-than-cache tree (`del/bulk/half`
-  is ascending keys on a cache-resident tree).
+- The batch-delete gap at 4 KiB pages (0.78× LMDB in the repro,
+  `del/batch/k1000` 1.28× LMDB's time): a Linux `perf` profile of the delete
+  phase next to LMDB's, to find the next lever.
+- The page size Meilisearch's production kernels use (`getconf PAGESIZE`):
+  4 KiB makes the Graviton numbers the ones to optimise.
 - ADR number 0029 is used twice on unmerged branches (`hardware-crc32c` and
   `free-page-run-search`); one needs renumbering before both merge.
+
+## Scorecard (ADR-0030: copy-on-write copies only the used bytes)
+
+| | |
+|---|---|
+| **Faster** | ~11 % per batch delete at 16 KiB pages (Mac spike, busy host). Flat at 4 KiB on Graviton4: repro within 3 %, criterion `^(del|put|commit/batch)/` flat with 0 regressed and `commit/batch/n1` 0.960. |
+| **Behavior** | Unchanged through every API: a copy's header, pointer array and cells are byte-identical to its source's, so every view reads the same entries. `cargo test --workspace` passes, including `writemap_in_place.rs` (heap vs in-place `WRITE_MAP` results) and `rightmost_finger.rs` (byte-identical files across two runs of one mode). New tests `copy_tests::copies_the_used_bytes_and_leaves_the_gap`, `copy_tests::bad_bounds_copy_the_whole_page`, `insert_copy_into_a_spare_copies_the_used_bytes`. |
+| **Safe** | No new `unsafe`. The two copied ranges come from bounds that pass the same check every view runs (`lower` even, `lower <= upper <= body`); any other source is copied whole. Miri on `zerodb-core` passes; clippy clean on host and `x86_64-unknown-linux-gnu`. |
+| **Durable** | Commit ordering, barriers and the bytes recovery reads are unchanged. Crash smoke: 213 single-process cycles (14 image cuts, 43 SIGKILL) and 57 multi-process cycles verified. |
+| **Secure** | A page's free gap now keeps bytes from an earlier page at its page number, or from a reused frame of the same transaction, instead of its source's gap. These are bytes the file or transaction already held, and gaps already carried stale cell bytes (`remove_cell` does not zero). A freshly allocated heap frame is still filled whole, so no uninitialised memory is written. Accepted in ADR-0030 (Option A). Differential fuzz: `diff_ops` 63,600 runs in 10 min, image-open 5.9 M runs, no finding. |
