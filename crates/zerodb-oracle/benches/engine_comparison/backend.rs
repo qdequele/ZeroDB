@@ -319,6 +319,19 @@ macro_rules! bench_backend {
                 hits
             }
 
+            /// One read txn per lookup: begin, one `get`, drop — the shape of
+            /// one search request, and of rust-storage-bench's YCSB reads.
+            pub fn point_get_txn_each(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
+                let mut hits = 0usize;
+                for k in keys {
+                    let r = env.read_txn().expect("read_txn");
+                    if db.get(&r, k.as_slice()).expect("get").is_some() {
+                        hits += 1;
+                    }
+                }
+                hits
+            }
+
             /// Point lookups that also READ the returned value's first and last
             /// byte through `black_box` — unlike `point_get`, this cannot let an
             /// overflow-value rung (`v4k`, `v2page`) skip the actual page-chase
@@ -724,6 +737,9 @@ macro_rules! bench_backend {
 
                 fn point_get(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
                     point_get(env, db, keys)
+                }
+                fn point_get_txn_each(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
+                    point_get_txn_each(env, db, keys)
                 }
                 fn point_get_touch(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
                     point_get_touch(env, db, keys)

@@ -61,6 +61,7 @@ pub trait Backend {
     /// value through `black_box` — the control for the `get/val/*_touch` rungs,
     /// so overflow-value rungs measure the value chase and copy rather than an
     /// elided read.
+    fn point_get_txn_each(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>]) -> usize;
     fn point_get_touch(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>]) -> usize;
     fn point_get_multi(env: &Self::Env, dbs: &[Self::Db], keys: &[Vec<u8>]) -> usize;
     fn point_get_hot(env: &Self::Env, db: Self::Db, key: &[u8], n: usize) -> usize;

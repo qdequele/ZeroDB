@@ -716,6 +716,14 @@ dirty-page store must be built so it is.
   (ADR-0014 amendment, 2026-09-29); the slice stays bounded by the high-water. Under the
   trusting policy a corrupt page is undefined behaviour, as in LMDB; the
   policy is the caller's `unsafe` contract (SPEC 00, `file_trust`).
+  **Memo reuse across txns (added 2026-10-19, #25).** The memo's entries are
+  keyed by (pgno, page kind), not by stamp, so they never outlive the txn
+  that recorded them: every txn starts with an empty memo. Its first 8 KiB
+  level may be reused memory: a memo being dropped zeroes each level-0 slot
+  it wrote (it logs the slot index of its first 32 level-0 inserts) and
+  parks the zeroed level for the next memo created on the same thread; a
+  memo with more level-0 inserts than it logs frees the level instead. One
+  level is parked per thread. This is not an entry carried across txns.
   **Cross-txn validation cache (added 2026-09-29, ADR-0018):** under the
   validating policy a txn-memo miss on a map-sourced leaf or branch first
   probes an env-wide cache keyed by **(pgno, page kind, header txnid stamp)**.
