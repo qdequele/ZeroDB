@@ -37,4 +37,4 @@ issues.
 | 0026 | [Ranged `msync` for `WRITE_MAP` commits](adr/0026-writemap-ranged-msync.md) | Accepted (Option B, 2026-10-17), implemented (#45) | Durability |
 | 0027 | [The API of Meilisearch's heed fork, behind a feature](adr/0027-heed-fork-unique-txns.md) | Accepted (Option B, 2026-10-18), implemented (#115) | API, consumer compatibility |
 | 0028 | [Delete rebalance moves cells page to page, as LMDB](adr/0028-delete-rebalance-node-move.md) | Accepted (Option A, 2026-10-18), implemented | Performance (deletes), B+tree |
-| 0029 | [Free-page run search across freed-page records](adr/0029-free-page-run-search.md) | Proposed (draft), awaiting approval (#29) | Page reclamation, LMDB parity |
+| 0029 | [Free-page run search across freed-page records](adr/0029-free-page-run-search.md) | Accepted (Option C, 2026-10-19), implemented (#29) | Page reclamation, LMDB parity |

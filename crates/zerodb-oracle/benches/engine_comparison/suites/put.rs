@@ -26,6 +26,12 @@
 //!   first). Every other rung starts with an empty or tiny free list, so this
 //!   is the only one where the cost of drawing reused pages scales with the
 //!   entry's length (the O(1) free-list front draw, SPEC 05 GC-19/20).
+//! * `gc/ovf_across`, `gc/ovf_miss` — 6-page values written into a free list
+//!   split over two freed-page records whose 3-page runs interleave
+//!   (`across`: every fitting run spans both records) or are separated by
+//!   live values (`miss`: no run fits, the file is extended). They time the
+//!   overflow-run search when no single record holds a run (SPEC 05 GC-21):
+//!   the cross-record merge on a hit, and its cost on a miss.
 
 use criterion::{BatchSize, Criterion, Throughput};
 
@@ -188,6 +194,82 @@ fn family_gc(c: &mut Criterion, cfg: &Cfg) {
     let mut g = group(c, "put/gc/drain_big", touch.len());
     pair_shape!(gc_drain_case, &mut g, cfg.page, &keys, mid, &touch, &val);
     g.finish();
+
+    // Two freed-page records that each hold more ids than ZeroDB keeps in
+    // its meta page (`(page - 176) / 8`), so both live in the free-page
+    // database for both engines.
+    let ps = cfg.page as usize;
+    let per_record = (ps - 176) / 8 / OVF_FREED_PAGES + 64;
+    let small = ovf_value(ps, OVF_FREED_PAGES);
+    let big = ovf_value(ps, 2 * OVF_FREED_PAGES);
+    for (name, stride) in [("put/gc/ovf_across", 2usize), ("put/gc/ovf_miss", 4)] {
+        let keys = ascending_keys(per_record * stride);
+        // Record 1 frees keys at offset 0 of each stride, record 2 at offset
+        // `stride / 2`; with stride 4 the keys in between stay live.
+        let frees: [Vec<Vec<u8>>; 2] =
+            [0, stride / 2].map(|off| keys.iter().skip(off).step_by(stride).cloned().collect());
+        let fresh: Vec<Vec<u8>> = (0..N_OVF_TOUCH as u64)
+            .map(|i| (u64::MAX - i).to_be_bytes().to_vec())
+            .collect();
+        let mut g = group(c, name, fresh.len());
+        pair_shape!(
+            gc_ovf_case,
+            &mut g,
+            cfg.page,
+            &keys,
+            &small,
+            &frees,
+            &fresh,
+            &big
+        );
+        g.finish();
+    }
+}
+
+/// Pages per value the `gc/ovf_*` rungs free; their timed puts are twice as
+/// long.
+const OVF_FREED_PAGES: usize = 3;
+/// Overflow values written in the timed txn of the `gc/ovf_*` rungs.
+const N_OVF_TOUCH: usize = 200;
+
+/// A value of exactly `pages` overflow pages at page size `ps` for both
+/// engines: `pages - 1` full pages plus half a page leaves room for either
+/// engine's overflow-page header.
+fn ovf_value(ps: usize, pages: usize) -> Vec<u8> {
+    vec![0xCDu8; (pages - 1) * ps + ps / 2]
+}
+
+/// Untimed: load `keys` with `small` values, delete each set of `frees` in
+/// its own txn (one freed-page record each), then one more commit so both
+/// pass LMDB's stricter reuse gate too. Timed: one txn putting `big` under
+/// each of `fresh` (new keys) plus its commit.
+fn gc_ovf_case<B: Backend>(
+    g: &mut Group<'_>,
+    page: u32,
+    keys: &[Vec<u8>],
+    small: &[u8],
+    frees: &[Vec<Vec<u8>>; 2],
+    fresh: &[Vec<u8>],
+    big: &[u8],
+) {
+    g.bench_function(B::NAME, |b| {
+        b.iter_batched(
+            || {
+                let f = Fixture::<B>::empty(page, Some("bench"), true);
+                B::bulk_put(&f.env, f.db, keys, small);
+                for set in frees {
+                    B::delete_keys(&f.env, f.db, set);
+                }
+                B::bulk_put(&f.env, f.db, &keys[..1], small);
+                f
+            },
+            |f| {
+                B::bulk_put(&f.env, f.db, fresh, big);
+                f
+            },
+            BatchSize::PerIteration,
+        )
+    });
 }
 
 /// Untimed: load `keys`, delete `keys[..mid]` in one txn (one large GC entry),

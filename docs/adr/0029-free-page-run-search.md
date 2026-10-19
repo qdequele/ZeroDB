@@ -1,8 +1,8 @@
 # ADR-0029: Free-page run search across freed-page records
 
-- Status: Proposed (draft, awaiting maintainer review; no engine change yet)
+- Status: Accepted (Option C, maintainer decision 2026-10-19), implemented
 - Related issue: #29 (also tracks the cross-record part of closed #31);
-  divergence D-027 (proposed)
+  divergence D-027 ((b) resolved by Option C; (a) proposed)
 - Date: 2026-10-19
 
 ## Context
@@ -217,7 +217,8 @@ lists.
 
 ## Decision
 
-None yet. The draft recommends trying **Option C first**: it is the smallest change that tests the
+**Option C**, maintainer decision 2026-10-19 ("for #29 yes we have to do
+something"). The draft's reasoning, kept for the record: Option C is the smallest change that tests the
 riskiest assumption (that the cross-record miss is what grows the file),
 touches no on-disk records and no save logic, and lands behind the
 differential test above. Measure `free_run_churn` and `gc_churn_parity`

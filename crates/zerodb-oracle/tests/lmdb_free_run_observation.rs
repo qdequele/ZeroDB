@@ -38,11 +38,16 @@
 //! The `OBS_*` constants pin LMDB's outcomes; a diff means the fork changed or
 //! the pin was wrong, never edit a pin to make ZeroDB pass. Pins observed on
 //! macOS (Darwin 27.0.0, aarch64, 16 KiB pages) and Linux aarch64 (4 KiB
-//! pages), 2026-10-19, identical on both. ZeroDB runs the
+//! pages), 2026-10-19, identical on both; the two `_CUSHIONED` pins on macOS
+//! only. ZeroDB runs the
 //! same scripts and must match each pin, except in the cases of divergence
-//! D-027 (proposed, issue #29), where it is held to its current outcome so
+//! D-027 (a) (proposed, issue #29), where it is held to its current outcome so
 //! that any change to the free-page search shows up here. Both outcomes are
 //! printed side by side with `--nocapture`.
+//!
+//! Since ZeroDB's run search also merges records (SPEC 05 GC-21), the
+//! `_CUSHIONED` cases, where the run of `a` and `b` stays whole until `c`,
+//! match LMDB; before it, ZeroDB placed `c` at the end of the file in both.
 
 use zerodb_oracle::tempdir::TempDir;
 
@@ -62,6 +67,13 @@ const OBS_BIG_RUN_ACROSS_TWO_RECORDS: &[&str] = &["b-a=adjacent", "c=reused", "g
 /// `a` of `BIG` pages and `b` of 3 pages deleted by two transactions, one
 /// spacer, then `c` of `BIG + 3` pages.
 const OBS_BIG_AND_SMALL_ACROSS_TWO_RECORDS: &[&str] = &["b-a=adjacent", "c=reused", "grew=1"];
+/// As `OBS_BIG_RUN_ACROSS_TWO_RECORDS`, with a cushion `x` of 64 pages
+/// freed first (`Script::cushion`).
+const OBS_BIG_RUN_ACROSS_TWO_RECORDS_CUSHIONED: &[&str] = &["b-a=adjacent", "c=reused", "grew=0"];
+/// As `OBS_BIG_AND_SMALL_ACROSS_TWO_RECORDS`, with a cushion `x` of 64 pages
+/// freed first.
+const OBS_BIG_AND_SMALL_ACROSS_TWO_RECORDS_CUSHIONED: &[&str] =
+    &["b-a=adjacent", "c=reused", "grew=0"];
 
 /// Marker prefix of value `name`; 16 bytes, never produced by the filler.
 fn marker(name: u8) -> [u8; 16] {
@@ -112,6 +124,14 @@ struct Script {
     b: fn(usize) -> usize,
     frees: &'static [&'static [&'static [u8]]],
     spacers: usize,
+    /// Pages of a value `x` written before `a` and `b` and deleted just
+    /// before them (0: no `x`). Its freed pages are older and lower than
+    /// `a`'s and `b`'s, so the pages the engines take for their own
+    /// bookkeeping until `c` (tree pages, freed-page records) come from `x`
+    /// rather than from the front of `a`. A two-page value `y`, written
+    /// right after `x` and never deleted, keeps `x`'s pages apart from
+    /// `a`'s.
+    cushion: usize,
 }
 
 const FREED_BY_PREVIOUS_TXN: Script = Script {
@@ -119,30 +139,44 @@ const FREED_BY_PREVIOUS_TXN: Script = Script {
     b: small,
     frees: &[&[b"a", b"b"]],
     spacers: 0,
+    cushion: 0,
 };
 const RUN_WITHIN_ONE_RECORD: Script = Script {
     a: small,
     b: small,
     frees: &[&[b"a", b"b"]],
     spacers: 1,
+    cushion: 0,
 };
 const RUN_ACROSS_TWO_RECORDS: Script = Script {
     a: small,
     b: small,
     frees: &[&[b"a"], &[b"b"]],
     spacers: 1,
+    cushion: 0,
 };
 const BIG_RUN_ACROSS_TWO_RECORDS: Script = Script {
     a: big,
     b: big,
     frees: &[&[b"a"], &[b"b"]],
     spacers: 1,
+    cushion: 0,
 };
 const BIG_AND_SMALL_ACROSS_TWO_RECORDS: Script = Script {
     a: big,
     b: small,
     frees: &[&[b"a"], &[b"b"]],
     spacers: 1,
+    cushion: 0,
+};
+
+const BIG_RUN_ACROSS_TWO_RECORDS_CUSHIONED: Script = Script {
+    cushion: 64,
+    ..BIG_RUN_ACROSS_TWO_RECORDS
+};
+const BIG_AND_SMALL_ACROSS_TWO_RECORDS_CUSHIONED: Script = Script {
+    cushion: 64,
+    ..BIG_AND_SMALL_ACROSS_TWO_RECORDS
 };
 
 macro_rules! cases {
@@ -182,12 +216,29 @@ macro_rules! cases {
                 let (env, db, ps) = open(dir);
                 let (na, nb) = ((s.a)(ps), (s.b)(ps));
                 let data = dir.join("data.mdb");
+                if s.cushion > 0 {
+                    // `y` stays: it keeps `x`'s pages apart from `a`'s,
+                    // so no run of `c`'s length lies in `x` and `a` alone.
+                    commit_puts(
+                        &env,
+                        db,
+                        &[
+                            (b"x", value(b'x', s.cushion, ps)),
+                            (b"y", value(b'y', 2, ps)),
+                        ],
+                    );
+                }
                 commit_puts(
                     &env,
                     db,
                     &[(b"a", value(b'a', na, ps)), (b"b", value(b'b', nb, ps))],
                 );
                 let (a, b) = (first_page(&data, b'a', ps), first_page(&data, b'b', ps));
+                if s.cushion > 0 {
+                    let mut w = env.write_txn().unwrap();
+                    assert!(db.delete(&mut w, b"x").unwrap());
+                    w.commit().unwrap();
+                }
                 for keys in s.frees {
                     let mut w = env.write_txn().unwrap();
                     for k in *keys {
@@ -267,19 +318,40 @@ observe!(
     RUN_ACROSS_TWO_RECORDS,
     OBS_RUN_ACROSS_TWO_RECORDS
 );
-// D-027 (b), proposed: the run spans two records of the free-page database;
-// ZeroDB searches one record at a time and extends the file.
+// D-027 (a), proposed: the run spans two records of the free-page database,
+// and ZeroDB's run search finds such runs (the `_cushioned` case below), but
+// here `a`'s front is gone before `c`. ZeroDB takes the pages for its own
+// bookkeeping (the tree's leaf, the free-page database's leaf and its
+// records) from the lowest free ids, which are `a`'s first pages, and it
+// starts doing so in the transaction right after the one that freed `a`,
+// which LMDB's gate does not allow. Traced at 16 KiB pages: 10 of `a`'s
+// pages are taken over three commits, leaving a free run 7 pages short of
+// `c`, so `c` goes to the end of the file.
 observe!(
     big_run_across_two_records,
     BIG_RUN_ACROSS_TWO_RECORDS,
     OBS_BIG_RUN_ACROSS_TWO_RECORDS,
     &["b-a=adjacent", "c=end", "grew=c+0"]
 );
-// D-027 (b), proposed: one record in the free-page database, the other in the
-// meta page's freed list.
+// D-027 (a), proposed: as above, with one record in the free-page database
+// and the other in the meta page's freed list.
 observe!(
     big_and_small_across_two_records,
     BIG_AND_SMALL_ACROSS_TWO_RECORDS,
     OBS_BIG_AND_SMALL_ACROSS_TWO_RECORDS,
     &["b-a=adjacent", "c=end", "grew=c+0"]
+);
+// Matches: the run spans two records of the free-page database (SPEC 05
+// GC-21's merged search).
+observe!(
+    big_run_across_two_records_cushioned,
+    BIG_RUN_ACROSS_TWO_RECORDS_CUSHIONED,
+    OBS_BIG_RUN_ACROSS_TWO_RECORDS_CUSHIONED
+);
+// Matches: the run spans a record of the free-page database and the meta
+// page's freed list.
+observe!(
+    big_and_small_across_two_records_cushioned,
+    BIG_AND_SMALL_ACROSS_TWO_RECORDS_CUSHIONED,
+    OBS_BIG_AND_SMALL_ACROSS_TWO_RECORDS_CUSHIONED
 );
