@@ -5,7 +5,8 @@
 //!
 //! Each wraps a native [`zerodb::RoRange`], which already yields `&'txn`
 //! borrows over the txn's view (committed map, or a write/nested txn's dirty
-//! frames). `next` just decodes with the codecs.
+//! frames). `next` just decodes with the codecs; `nth` (what `skip` calls)
+//! lets the native range skip leaf by leaf and decodes only the landing entry.
 //!
 //! ## Write iterators (the engine write cursor, mirroring heed)
 //!
@@ -130,6 +131,15 @@ macro_rules! ro_iterator {
                     Err(e) => Some(Err(e.into())),
                 }
             }
+
+            // The native range skips leaf by leaf (SPEC 03 §4); only the
+            // landing entry is decoded.
+            fn nth(&mut self, n: usize) -> Option<Self::Item> {
+                match self.range.nth(n)? {
+                    Ok((k, v)) => Some(decode_pair::<KC, DC>(k, v)),
+                    Err(e) => Some(Err(e.into())),
+                }
+            }
         }
 
         impl<KC, DC, IM> std::fmt::Debug for $name<'_, KC, DC, IM> {
@@ -215,6 +225,15 @@ macro_rules! ro_range_iterator {
 
             fn next(&mut self) -> Option<Self::Item> {
                 match self.range.next()? {
+                    Ok((k, v)) => Some(decode_pair::<KC, DC>(k, v)),
+                    Err(e) => Some(Err(e.into())),
+                }
+            }
+
+            // The native range skips leaf by leaf (SPEC 03 §4); only the
+            // landing entry is decoded.
+            fn nth(&mut self, n: usize) -> Option<Self::Item> {
+                match self.range.nth(n)? {
                     Ok((k, v)) => Some(decode_pair::<KC, DC>(k, v)),
                     Err(e) => Some(Err(e.into())),
                 }

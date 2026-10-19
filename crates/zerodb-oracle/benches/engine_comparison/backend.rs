@@ -347,6 +347,32 @@ macro_rules! bench_backend {
                 n
             }
 
+            /// `iter.skip(skip).take(take)`, touching each yielded key and
+            /// value — the paged-listing shape (`OFFSET … LIMIT …`). `skip`
+            /// reaches the iterator's `nth`.
+            pub fn skip_take(env: &BEnv, db: Db, skip: usize, take: usize) -> usize {
+                let r = env.read_txn().expect("read_txn");
+                let mut n = 0usize;
+                for kv in db.iter(&r).expect("iter").skip(skip).take(take) {
+                    let (k, v) = kv.expect("entry");
+                    black_box((k, v));
+                    n += 1;
+                }
+                n
+            }
+
+            /// [`skip_take`] over the reverse iterator.
+            pub fn rev_skip_take(env: &BEnv, db: Db, skip: usize, take: usize) -> usize {
+                let r = env.read_txn().expect("read_txn");
+                let mut n = 0usize;
+                for kv in db.rev_iter(&r).expect("rev_iter").skip(skip).take(take) {
+                    let (k, v) = kv.expect("entry");
+                    black_box((k, v));
+                    n += 1;
+                }
+                n
+            }
+
             /// Bounded range scan over `[lo, hi)`.
             pub fn range_scan(env: &BEnv, db: Db, lo: &[u8], hi: &[u8]) -> usize {
                 let r = env.read_txn().expect("read_txn");
@@ -666,6 +692,12 @@ macro_rules! bench_backend {
                 }
                 fn rev_scan(env: &BEnv, db: Db) -> usize {
                     rev_scan(env, db)
+                }
+                fn skip_take(env: &BEnv, db: Db, skip: usize, take: usize) -> usize {
+                    skip_take(env, db, skip, take)
+                }
+                fn rev_skip_take(env: &BEnv, db: Db, skip: usize, take: usize) -> usize {
+                    rev_skip_take(env, db, skip, take)
                 }
                 fn range_scan(env: &BEnv, db: Db, lo: &[u8], hi: &[u8]) -> usize {
                     range_scan(env, db, lo, hi)
