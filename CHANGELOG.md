@@ -45,6 +45,18 @@ work to get there shrinks.
 - SPEC 03 §10.1 numbers the rebalance rules (REB-1..REB-5). New golden test
   `rebalance_logical_image` pins the tree shape deletes leave behind.
 
+### Less CPU per commit for the meta page (#8)
+
+- The meta-page CRC32C uses slicing-by-8 tables instead of one lookup per
+  byte, with bit-identical results (about 5x faster on the ~200 bytes it
+  covers).
+- A commit encodes its meta page into a zeroed buffer the environment keeps
+  between commits, instead of allocating and zeroing a fresh page each time.
+  The bytes written to disk are unchanged.
+- One-key no-sync commit on macOS arm64: user CPU 4.17 µs → 3.45 µs per
+  commit (LMDB 1.50 µs). Wall time `commit/batch/n1` 0.95–0.97× of before.
+  Empty write transactions are unchanged.
+
 ### Meilisearch v1.55's heed fork (ADR-0027, #102)
 
 Meilisearch v1.55 builds against its own heed fork, whose API differs from

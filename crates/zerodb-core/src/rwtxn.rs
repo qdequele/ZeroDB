@@ -4491,9 +4491,27 @@ impl<'env> RwTxn<'env> {
             main_db: self.main_db,
             fl_count: annex.len() as u32,
         };
-        let mut buf = vec![0u8; psize as usize];
-        meta.encode_with_annex(&mut buf, annex).map_err(corrupt)?;
-        inner.backing_ref().write_at_page(slot, psize, &buf)?;
+        // The page buffer is the env's reusable one: all zero on entry and
+        // on exit, since only the encoded prefix is written and then cleared
+        // again, so a commit neither allocates nor zeroes a whole page here.
+        // The bytes written are the same full page as before.
+        let mut buf = inner.meta_buf();
+        if buf.len() != psize as usize {
+            *buf = vec![0u8; psize as usize];
+        }
+        let written = meta
+            .encode_with_annex_over_zeroed(&mut buf, annex)
+            .map_err(corrupt)
+            .and_then(|()| {
+                inner
+                    .backing_ref()
+                    .write_at_page(slot, psize, &buf)
+                    .map_err(Error::from)
+            });
+        let dirty = MetaPage::encoded_len(annex.len()).min(buf.len());
+        buf[..dirty].fill(0);
+        drop(buf);
+        written?;
         inner.run_hook(HookPoint::H3);
         // Crash here: recovered snapshot is `N-1` (meta missing/torn → CRC
         // rejects → older slot wins) or `N` (meta intact — safe because C3

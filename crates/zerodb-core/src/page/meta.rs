@@ -228,6 +228,40 @@ impl MetaPage {
     /// [`PageError::BadValueSize`] if `annex` exceeds [`meta_annex_cap`]
     /// (engine bug: the save's fit check owns that bound).
     pub fn encode_with_annex(&self, buf: &mut [u8], annex: &[u64]) -> Result<(), PageError> {
+        let psize = self.check_encode(buf, annex)?;
+        // Zero the whole page first so every reserved byte is 0.
+        buf[..psize].fill(0);
+        self.write_fields(buf, annex);
+        Ok(())
+    }
+
+    /// [`MetaPage::encode_with_annex`] into a buffer whose first `page_size`
+    /// bytes are **already all zero**, writing only the encoded prefix
+    /// `[0, MetaPage::encoded_len(annex.len()))`. The commit path keeps one such
+    /// buffer across commits and re-zeroes just that prefix after each meta
+    /// write, which saves zeroing a whole page (and allocating one) per commit.
+    /// The result is byte-identical to [`MetaPage::encode_with_annex`].
+    ///
+    /// # Errors
+    ///
+    /// As [`MetaPage::encode_with_annex`].
+    pub(crate) fn encode_with_annex_over_zeroed(
+        &self,
+        buf: &mut [u8],
+        annex: &[u64],
+    ) -> Result<(), PageError> {
+        let psize = self.check_encode(buf, annex)?;
+        debug_assert!(
+            buf[..psize].iter().all(|&b| b == 0),
+            "encode_with_annex_over_zeroed needs an all-zero page buffer"
+        );
+        self.write_fields(buf, annex);
+        Ok(())
+    }
+
+    /// The bounds both encoders check before writing anything; returns the
+    /// page size in bytes.
+    fn check_encode(&self, buf: &[u8], annex: &[u64]) -> Result<usize, PageError> {
         validate_page_size(self.page_size)?;
         let psize = self.page_size as usize;
         if buf.len() < psize {
@@ -244,8 +278,20 @@ impl MetaPage {
             annex.len(),
             "MetaPage.fl_count must match the annex slice (single source: the ids)"
         );
-        // Zero the whole page first so every reserved byte is 0.
-        buf[..psize].fill(0);
+        Ok(psize)
+    }
+
+    /// Bytes of a meta page that an encode with `annex_len` annex ids writes:
+    /// the fixed fields, the CRC and the ids. Everything past it is the
+    /// reserved, zero tail (SPEC 02 §3).
+    #[must_use]
+    pub(crate) fn encoded_len(annex_len: usize) -> usize {
+        META_ANNEX_OFF + 8 * annex_len
+    }
+
+    /// Write every field, the annex ids and the CRC into a zeroed `buf` (the
+    /// shared body of the two encoders; bounds already checked).
+    fn write_fields(&self, buf: &mut [u8], annex: &[u64]) {
         // Common header (zeros reserved0 + checksum; variant tail already 0).
         CommonHeader {
             pgno: self.pgno,
@@ -271,7 +317,6 @@ impl MetaPage {
         // CRC over [0, 172) ∪ the annex ids (SPEC 02 §3.3).
         let crc = meta_crc_of(buf, annex.len());
         write_u32(buf, OFF_META_CRC, crc);
-        Ok(())
     }
 
     /// Read the free-list annex ids out of a meta page buffer (SPEC 02 §3,
