@@ -1712,6 +1712,10 @@ mod tests {
         let fd = fd_of(id.1).expect("the lock file's descriptor is open");
         // As when the environment's directory is deleted while it is open.
         std::fs::remove_file(&*path).unwrap();
+        // Keeps the unlinked inode alive to the end of the test, so its
+        // number cannot be handed to a file another test creates meanwhile:
+        // the checks below look the file up by inode number.
+        let pin = File::open(format!("/dev/fd/{fd}")).expect("pin the inode");
 
         let registry = open_files();
         let dropper = std::thread::spawn(move || drop(l));
@@ -1729,6 +1733,10 @@ mod tests {
             "the descriptor was closed while its registry entry still existed"
         );
         assert!(!open_files().contains(&key));
-        assert!(fd_of(id.1).is_none());
+        assert!(
+            std::fs::metadata(format!("/dev/fd/{fd}")).map_or(true, |m| m.ino() != id.1),
+            "the lock file's descriptor is closed"
+        );
+        drop(pin);
     }
 }
