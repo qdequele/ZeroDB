@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write as _};
 use std::path::Path;
 
 use zerodb::{check::check_image, check::check_snapshot, Env, EnvOpenOptions, MdbError, PutFlags};
@@ -156,15 +156,23 @@ pub fn cmd_dump(env_dir: &Path) -> Result<String, BoxErr> {
 ///
 /// The dump is read twice, a line at a time ([`dump_format::DumpReader`]),
 /// so memory stays bounded by one write txn's batch whatever the dump's size:
-/// a first pass checks the whole dump's syntax before the destination is
-/// touched, the second writes it. Every DB's records are sorted and unique in
-/// a valid dump; in a hand-edited one, out-of-order records are still
-/// placed in key order by the B+tree, and of several records with the same
-/// key in a database the first one in the dump is kept.
+/// a first pass checks the whole dump (syntax and key lengths) before the
+/// destination env is created, the second writes it. A regular file is
+/// rewound between the passes. Any other input (a pipe, `/dev/stdin`, a
+/// FIFO) cannot be read twice, so the first pass also copies it to a spool
+/// file in `env_dir`, which the second pass reads and which is removed on
+/// every exit path.
+///
+/// Every DB's records are sorted and unique in a valid dump; in a
+/// hand-edited one, out-of-order records are still placed in key order by
+/// the B+tree, and of several records with the same key in a database the
+/// first one in the dump is kept.
 ///
 /// # Errors
 ///
-/// A refusal, parse errors, or an engine error.
+/// A refusal, parse errors, or an engine error. Only an engine error during
+/// the second pass (for example a named DB whose name is also a main-DB key,
+/// or an I/O error) leaves a partially loaded env behind, as with `mdb_load`.
 pub fn cmd_load(dump_path: &Path, env_dir: &Path, psize: u32, map_size: u64) -> Result<(), BoxErr> {
     load_batched(dump_path, env_dir, psize, map_size, BATCH_BYTES)
 }
@@ -181,16 +189,34 @@ fn load_batched(
     std::fs::create_dir_all(env_dir)?;
     refuse_existing_env(env_dir, "load into")?;
 
-    // Pass 1: reject a malformed dump before creating anything.
-    let mut reader = open_dump(dump_path)?;
-    while reader.next_db()?.is_some() {}
-
     let map_size = usize::try_from(map_size).map_err(|_| "map size does not fit in usize")?;
+
+    // Pass 1: reject a malformed dump before creating anything, and keep a
+    // copy of an input that cannot be rewound.
+    let input = File::open(dump_path)?;
+    let mut source = if input.metadata()?.is_file() {
+        validate_dump(&mut BufReader::with_capacity(DUMP_BUF, &input))?;
+        input
+    } else {
+        let spool = anonymous_spool(env_dir)?;
+        let mut tee = BufReader::with_capacity(
+            DUMP_BUF,
+            Tee {
+                input,
+                copy: BufWriter::with_capacity(DUMP_BUF, &spool),
+            },
+        );
+        validate_dump(&mut tee)?;
+        tee.into_inner().copy.flush()?;
+        spool
+    };
+    source.seek(SeekFrom::Start(0))?;
+
     let env = open_exclusive_destination(env_dir, psize, map_size, "load into")?;
 
     // Pass 2: write each block's records in batches, in dump order (the main
     // DB first, then the named DBs).
-    let mut reader = open_dump(dump_path)?;
+    let mut reader = dump_format::DumpReader::new(BufReader::with_capacity(DUMP_BUF, source))?;
     let mut batch = Batch::default();
     let (mut key, mut val) = (Vec::new(), Vec::new());
     while let Some(name) = reader.next_db()? {
@@ -290,13 +316,75 @@ pub(crate) fn open_exclusive_destination(
 /// never holds a large DB's dirty pages in memory.
 const BATCH_BYTES: usize = 64 << 20;
 
-/// Open `path` for streaming through the dump parser.
-fn open_dump(path: &Path) -> Result<dump_format::DumpReader<BufReader<File>>, BoxErr> {
-    let file = File::open(path)?;
-    Ok(dump_format::DumpReader::new(BufReader::with_capacity(
-        1 << 20,
-        file,
-    ))?)
+/// The read (and spool write) buffer size for the dump.
+const DUMP_BUF: usize = 1 << 20;
+
+/// `load`'s first pass: read the whole dump and check it, so that a dump
+/// the second pass would reject never creates the destination. Besides the
+/// syntax ([`dump_format::DumpReader`]), it checks the one record property
+/// the engine refuses that the text can show: every key, and every named
+/// DB's name (a key of the main DB), is 1 to [`zerodb::MAX_KEY_SIZE`] bytes.
+fn validate_dump<R: BufRead>(input: &mut R) -> Result<(), BoxErr> {
+    let bad_key = |what: String, len: usize| -> BoxErr {
+        format!(
+            "{what}: key length {len} is outside 1..={}",
+            zerodb::MAX_KEY_SIZE
+        )
+        .into()
+    };
+    let mut reader = dump_format::DumpReader::new(input)?;
+    let (mut key, mut val) = (Vec::new(), Vec::new());
+    let mut block = 0usize;
+    while let Some(name) = reader.next_db()? {
+        block += 1;
+        if let Some(n) = &name {
+            if n.is_empty() || n.len() > zerodb::MAX_KEY_SIZE {
+                return Err(bad_key(format!("database name of block {block}"), n.len()));
+            }
+        }
+        let mut record = 0usize;
+        while reader.next_record(&mut key, &mut val)? {
+            record += 1;
+            if key.is_empty() || key.len() > zerodb::MAX_KEY_SIZE {
+                return Err(bad_key(
+                    format!("record {record} of block {block}"),
+                    key.len(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A reader that copies every byte it reads into `copy`: `load`'s first
+/// pass over an input that cannot be rewound keeps it for the second pass.
+struct Tee<'a> {
+    input: File,
+    copy: BufWriter<&'a File>,
+}
+
+impl Read for Tee<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.input.read(buf)?;
+        self.copy.write_all(&buf[..n])?;
+        Ok(n)
+    }
+}
+
+/// A new, empty spool file in `dir`, opened for reading and writing, whose
+/// path is removed at once: the open handle keeps the data reachable, and
+/// nothing is left in `dir` whichever way `load` ends, crashes included.
+/// It lives on the destination's file system, which must hold about the
+/// dump's size anyway.
+fn anonymous_spool(dir: &Path) -> Result<File, BoxErr> {
+    let path = dir.join(format!(".zerodb-tools-load-{}.spool", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    std::fs::remove_file(&path)?;
+    Ok(file)
 }
 
 /// One write txn's records, packed into one buffer: about [`BATCH_BYTES`]

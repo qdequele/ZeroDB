@@ -11,8 +11,10 @@ the release workflow publishes the section matching the tag as the GitHub releas
 `load` used to read the whole dump into memory, parse every record into
 owned buffers and sort each database there, so its peak memory grew with the
 dump. It now reads the dump a line at a time, twice: a first pass rejects a
-malformed dump before the destination is created, the second writes each
-database in dump order in 64 MiB write txns. Peak memory is about one batch
+malformed dump (or an over-long key) before the destination is created, the
+second writes each database in dump order in 64 MiB write txns. A dump
+piped in (`load /dev/stdin <dir>`) is copied during the first pass to an
+unlinked spool file in the destination directory. Peak memory is about one batch
 plus its dirty pages, whatever the dump's size. The dump format and the
 command line are unchanged.
 

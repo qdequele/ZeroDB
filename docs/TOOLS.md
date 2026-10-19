@@ -66,8 +66,11 @@ or any other failure (unknown subcommand or option, unreadable env, …). Unknow
   writes (ADR-0015), as `mdb_load` does, committing every 64 MiB of records;
   the map doubles whenever it fills, so `--map-size` is a starting size. The
   dump is read a line at a time, twice: a first pass rejects a malformed dump
-  before the destination is created, the second writes the databases in dump
-  order. Memory stays at about one 64 MiB batch plus its write txn's dirty
+  (or a key longer than 511 bytes) before the destination is created, the
+  second writes the databases in dump order. A dump read from a pipe
+  (`load /dev/stdin <env-dir>`) is copied during the first pass to an
+  unlinked spool file in `<env-dir>`, so that file system needs room for the
+  dump too. Memory stays at about one 64 MiB batch plus its write txn's dirty
   pages, whatever the dump's size. In a hand-edited dump, records out of
   order still land in key order, and of several records with the same key in
   a database the first is kept. The produced env is checked through the map
