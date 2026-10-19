@@ -6,6 +6,24 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### `check` walks large environments on several threads (#65)
+
+`zerodb-tools check`, the check after `zerodb-tools load`, and
+`check::check_image` / `check::check_snapshot` walked every tree on one
+thread and kept the reached pages in a hash set. The reached pages are now a
+bitmap (one bit per page instead of a hash-set entry), and an environment of
+at least 16 384 pages is walked on up to 16 threads: each record's root
+children and each named database are independent jobs. A parallel walk that
+finds anything is redone on one thread, so the findings and their order
+never depend on the thread count. Pages listed free more than
+once (INV-24) are now reported in ascending page order rather than hash
+order.
+
+- 2.1 GB environment, Apple M-series (8 cores, busy host, indicative):
+  `zerodb-tools check` 0.39-0.47 s -> 0.16-0.20 s with the page cache warm;
+  the walk alone 238 ms -> 205 ms on one thread, 60 ms on eight. LMDB has no
+  equivalent checker.
+
 ### Short read transactions reuse their memory (#25)
 
 A read transaction that reads one key used to allocate, zero and free two
