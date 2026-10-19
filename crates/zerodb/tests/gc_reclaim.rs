@@ -506,3 +506,238 @@ fn gc_crash_matrix_recovers_consistently() {
         assert_clean(dir.path());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Runs spanning freed-page records (SPEC 05 GC-21): a multi-page value whose
+// only fitting run lies across two records of the free-page database.
+// ---------------------------------------------------------------------------
+
+/// Pages of `a` and of `b`: more than the meta page's freed list holds at
+/// 4 KiB pages (`(4096 - 176) / 8 = 490` ids), so each deleting transaction
+/// writes its own record to the free-page database.
+const BIG: usize = 600;
+
+/// A value of `pages` overflow pages: `pages - 1` full pages plus half a page
+/// leaves room for the overflow-page header.
+fn pages_value(fill: u8, pages: usize) -> Vec<u8> {
+    vec![fill; (pages - 1) * PS as usize + PS as usize / 2]
+}
+
+fn commit_put(env: &Env, key: &[u8], val: &[u8]) {
+    let db = env.main_database();
+    let mut wtxn = env.write_txn().unwrap();
+    db.put(&mut wtxn, key, val).unwrap();
+    wtxn.commit().unwrap();
+}
+
+fn commit_delete(env: &Env, key: &[u8]) {
+    let db = env.main_database();
+    let mut wtxn = env.write_txn().unwrap();
+    assert!(db.delete(&mut wtxn, key).unwrap());
+    wtxn.commit().unwrap();
+}
+
+/// Txns 1..=5 of the cross-record scripts: lay out a cushion `x` (64 pages;
+/// the bookkeeping pages of the next commits come from it, so `a`'s run
+/// stays whole), a kept separator `y`, then `a` and `b` side by side, and
+/// free `x`, `a` and `b` in three transactions. `a`'s and `b`'s pages end up
+/// in two records of the free-page database. `before_b` runs between the
+/// deletes of `a` and `b`.
+fn lay_out_and_free_a_then_b(env: &Env, dir: &Path, before_b: impl FnOnce()) {
+    let db = env.main_database();
+    {
+        let mut wtxn = env.write_txn().unwrap();
+        db.put(&mut wtxn, b"x", &pages_value(b'x', 64)).unwrap();
+        db.put(&mut wtxn, b"y", &pages_value(b'y', 2)).unwrap();
+        wtxn.commit().unwrap();
+    }
+    {
+        let mut wtxn = env.write_txn().unwrap();
+        db.put(&mut wtxn, b"a", &pages_value(b'a', BIG)).unwrap();
+        db.put(&mut wtxn, b"b", &pages_value(b'b', BIG)).unwrap();
+        wtxn.commit().unwrap();
+    }
+    commit_delete(env, b"x");
+    assert_clean(dir);
+    commit_delete(env, b"a");
+    assert_clean(dir);
+    before_b();
+    commit_delete(env, b"b");
+    assert_clean(dir);
+}
+
+/// SPEC 05 GC-21: once both records pass the reuse gate, a value as long as
+/// `a` and `b` together is placed in their pages, though neither record alone
+/// holds a long enough run. The partition walk after every commit (no page
+/// both reachable and free, none neither) shows each page left exactly one
+/// record when drawn. LMDB places it there too
+/// (`crates/zerodb-oracle/tests/lmdb_free_run_observation.rs`,
+/// `big_run_across_two_records_cushioned`).
+#[test]
+fn run_across_two_gc_records_is_reused() {
+    let dir = TempDir::new();
+    let env = open(dir.path());
+    let db = env.main_database();
+    lay_out_and_free_a_then_b(&env, dir.path(), || {});
+    commit_put(&env, b"s", b"spacer");
+    let before = file_size(dir.path());
+    let c = pages_value(b'c', 2 * BIG);
+    commit_put(&env, b"c", &c);
+    assert_clean(dir.path());
+    let grew = (file_size(dir.path()) - before) / u64::from(PS);
+    assert!(
+        grew < 8,
+        "c ({} pages) must reuse the run across the two records; the file grew by {grew} pages",
+        2 * BIG
+    );
+    let rtxn = env.read_txn().unwrap();
+    assert_eq!(db.get(&rtxn, b"c").unwrap(), Some(c.as_slice()));
+    assert_eq!(
+        db.get(&rtxn, b"y").unwrap(),
+        Some(pages_value(b'y', 2).as_slice())
+    );
+    drop(rtxn);
+    // Reopen: the remainders the draw left in each record are read back
+    // from disk and stay consistent.
+    drop(env);
+    let env = open(dir.path());
+    commit_put(&env, b"d", &pages_value(b'd', 3));
+    assert_clean(dir.path());
+}
+
+/// The reuse gate holds for every record a run is drawn from: a reader that
+/// still sees `b` keeps `b`'s record out of the search, so `c` cannot take
+/// the run across `a` and `b` and goes to the end of the file; the reader
+/// reads `b` intact afterwards. Once it is gone, the run is reused.
+#[test]
+fn reader_pin_keeps_a_record_out_of_the_cross_record_search() {
+    let dir = TempDir::new();
+    let env = open(dir.path());
+    let db = env.main_database();
+    let mut pinned = None;
+    lay_out_and_free_a_then_b(&env, dir.path(), || {
+        pinned = Some(env.read_txn().unwrap()); // still sees `b`
+    });
+    let rtxn = pinned.expect("reader opened before b's delete");
+    commit_put(&env, b"s", b"spacer");
+    let before = file_size(dir.path());
+    let c = pages_value(b'c', 2 * BIG);
+    commit_put(&env, b"c", &c);
+    assert_clean(dir.path());
+    let grew = (file_size(dir.path()) - before) / u64::from(PS);
+    assert!(
+        grew >= 2 * BIG as u64,
+        "c drew from b's record while a reader still sees b (grew {grew} pages)"
+    );
+    assert_eq!(
+        db.get(&rtxn, b"b").unwrap(),
+        Some(pages_value(b'b', BIG).as_slice()),
+        "the pinned reader observed a reused page of b"
+    );
+    drop(rtxn);
+    commit_delete(&env, b"c");
+    commit_put(&env, b"s2", b"spacer");
+    let before = file_size(dir.path());
+    commit_put(&env, b"d", &pages_value(b'd', 2 * BIG));
+    assert_clean(dir.path());
+    let grew = (file_size(dir.path()) - before) / u64::from(PS);
+    assert!(
+        grew < 8,
+        "with the reader gone the run is reusable; the file grew by {grew} pages"
+    );
+}
+
+const CROSS_CHILD_ENV_VAR: &str = "ZDB_GC_CROSS_CRASH_CHILD_HOOK";
+
+/// Commits the cross-record script runs before the aborted one: five of
+/// `lay_out_and_free_a_then_b` and the spacer.
+const CROSS_TXNS: u64 = 6;
+
+/// Child body for the crash matrix below: the cross-record script, then the
+/// commit that draws `c`'s run from two records, aborted at the target hook.
+/// No-op unless spawned by the parent.
+#[test]
+fn gc_cross_record_crash_child_runner() {
+    let Ok(hook_name) = std::env::var(CROSS_CHILD_ENV_VAR) else {
+        return;
+    };
+    let dir = PathBuf::from(std::env::var(DIR_ENV_VAR).expect("child dir env var"));
+    let env = open(&dir);
+    lay_out_and_free_a_then_b(&env, &dir, || {});
+    commit_put(&env, b"s", b"spacer");
+    assert_eq!(env.txnid(), CROSS_TXNS);
+    env.set_commit_hook(Some(Arc::new(AbortAt(hook_from_name(&hook_name)))));
+    let db = env.main_database();
+    let mut wtxn = env.write_txn().unwrap();
+    db.put(&mut wtxn, b"c", &pages_value(b'c', 2 * BIG))
+        .unwrap();
+    let _ = wtxn.commit(); // aborts at the hook for H0..H4
+    unreachable!("the abort hook must fire");
+}
+
+/// GC-14 for a run drawn from two records: a crash at every commit step —
+/// after the free-page database is updated in memory (H0), after its pages
+/// and the data pages are written but before the meta page (H1, H2), after
+/// the meta write (H3, H4) — recovers either the state before `c`, with
+/// `a`'s and `b`'s pages still listed free, or the state with `c` and both
+/// records shrunk, never a mix: the partition walk is clean, and a `c`
+/// written after recovery to the earlier state still finds the run (nothing
+/// leaked).
+#[test]
+fn gc_cross_record_crash_matrix_recovers_consistently() {
+    let exe = std::env::current_exe().expect("test binary path");
+    let cases: [(&str, &[u64]); 5] = [
+        ("H0", &[CROSS_TXNS]),
+        ("H1", &[CROSS_TXNS]),
+        ("H2", &[CROSS_TXNS]),
+        ("H3", &[CROSS_TXNS, CROSS_TXNS + 1]),
+        ("H4", &[CROSS_TXNS + 1]),
+    ];
+    let c = pages_value(b'c', 2 * BIG);
+    for (hook, expect) in cases {
+        let dir = TempDir::new();
+        let status = Command::new(&exe)
+            .arg("gc_cross_record_crash_child_runner")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(CROSS_CHILD_ENV_VAR, hook)
+            .env(DIR_ENV_VAR, dir.path())
+            .status()
+            .expect("spawn child");
+        assert!(!status.success(), "{hook}: child must die at the hook");
+
+        let env = open(dir.path());
+        let recovered = env.txnid();
+        assert!(
+            expect.contains(&recovered),
+            "{hook}: recovered txn {recovered}, expected one of {expect:?}"
+        );
+        let db = env.main_database();
+        let rtxn = env.read_txn().unwrap();
+        let got = db.get(&rtxn, b"c").unwrap().map(<[u8]>::to_vec);
+        assert_eq!(db.get(&rtxn, b"a").unwrap(), None, "{hook}");
+        assert_eq!(db.get(&rtxn, b"b").unwrap(), None, "{hook}");
+        drop(rtxn);
+        assert_clean(dir.path());
+        if recovered == CROSS_TXNS {
+            assert_eq!(
+                got, None,
+                "{hook}: data from the unrecovered txn is visible"
+            );
+            // Nothing leaked: the run across `a`'s and `b`'s records is
+            // still listed free and serves `c` now.
+            let before = file_size(dir.path());
+            commit_put(&env, b"c", &c);
+            let grew = (file_size(dir.path()) - before) / u64::from(PS);
+            assert!(
+                grew < 8,
+                "{hook}: c after recovery grew the file by {grew} pages"
+            );
+        } else {
+            assert_eq!(got.as_deref(), Some(c.as_slice()), "{hook}");
+            commit_put(&env, b"d", &pages_value(b'd', 3));
+        }
+        drop(env);
+        assert_clean(dir.path());
+    }
+}

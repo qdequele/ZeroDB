@@ -6,6 +6,37 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### Multi-page values reuse free pages freed by different transactions (ADR-0029, #29)
+
+A value larger than a page needs a run of contiguous free pages. ZeroDB
+looked for that run inside one freed-page record at a time (one record per
+freeing transaction), so a run whose pages were freed by two transactions
+was missed and the file grew by the whole value. When no single record holds
+the run, ZeroDB now merges the records the reuse gate admits, with the meta
+page's freed list, and searches the merged list, as LMDB merges the records
+it reads into its free list. The merged list is kept for the transaction;
+the records and how they are saved are unchanged.
+
+- `free_run_churn` (macOS aarch64, 16 KiB pages; 2,000 rewrites of mixed
+  inline and 2–16 page values per commit): file size vs LMDB 1.64× → 1.06×
+  after 200 commits, 2.43× → 1.10× after 400. Small-commit and inline-only
+  controls unchanged (0.98×, 0.80×).
+- `lmdb_free_run_observation.rs` gains two cases where the run spans records
+  and is still whole; ZeroDB now places the value where LMDB does. Divergence
+  D-027 (b) is resolved; (a), reuse one transaction sooner than LMDB, stays
+  proposed.
+- New tests: reuse, reader gate and a crash at every commit step for a run
+  drawn from two records (`crates/zerodb/tests/gc_reclaim.rs`), and a
+  property test (`free_run_cross_record_proptest.rs`). New bench rungs
+  `put/gc/ovf_across` and `put/gc/ovf_miss`.
+- Commit no longer panics with "freelist_save failed to reach a fixed point"
+  when the committing transaction's own freed-page record sits at an
+  overflow page-count boundary: the save could shrink the record by a page,
+  grow it back by listing that page, and repeat once per page of the meta
+  page's freed list. Once the record has shrunk during a save, growing it
+  now takes pages from outside the set it lists (SPEC 05 GC-13 (v)). Found
+  by the property test on Linux CI; the shrunk case is kept as a fixed test.
+
 ### `skip` crosses whole leaves instead of stepping each entry
 
 The read iterators (`iter`, `rev_iter`, `range`, `rev_range`, `prefix_iter`,

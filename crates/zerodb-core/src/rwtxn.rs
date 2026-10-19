@@ -183,16 +183,71 @@ impl Drain {
     /// runs fall back to `Vec::drain`.
     fn take_run(&mut self, start: u64, n: u64) {
         let n = usize::try_from(n).expect("run length fits usize (find_run did)");
+        self.take_span(start, n);
+    }
+
+    /// Consume the `count` live ids that start at id `first` and occupy
+    /// consecutive positions of [`Drain::live`]. [`Drain::take_run`] is the
+    /// case where those ids are also consecutive page numbers; the
+    /// cross-record run search ([`RwTxn::cross_record_run`]) also takes a
+    /// record's share of a run whose other pages come from other records —
+    /// still consecutive positions here, because every id of this record
+    /// that lies between two of them would lie inside the run too.
+    fn take_span(&mut self, first: u64, count: usize) {
         let pos = self
             .live()
-            .binary_search(&start)
+            .binary_search(&first)
             .expect("picked id present in the remaining set");
+        debug_assert!(pos + count <= self.len(), "span past the live ids");
         if pos == 0 {
-            self.head += n;
+            self.head += count;
         } else {
-            self.ids.drain(self.head + pos..self.head + pos + n);
+            self.ids.drain(self.head + pos..self.head + pos + count);
         }
         debug_assert!(self.head <= self.ids.len());
+    }
+}
+
+/// How many freed-page records the cross-record run search
+/// ([`RwTxn::cross_record_run`]) reads per page of the requested run: it
+/// reads at most `n * CROSS_RUN_RECORDS_PER_PAGE` records for a run of `n`
+/// pages. LMDB's page allocator bounds its own search the same way (it gives
+/// up and extends the file after `n * 60` failed searches, one per record it
+/// merges), so a heavily fragmented free list costs a bounded amount of work
+/// per allocation instead of a walk of the whole free-page database.
+const CROSS_RUN_RECORDS_PER_PAGE: u64 = 60;
+
+/// A source of the cross-record run search: a GC-tree record by key, with the
+/// ids the search read when this txn had not drawn from it yet, or the base
+/// meta's annex pool.
+enum CrossSource {
+    Tree { f: u64, fresh: Option<Vec<u64>> },
+    Annex,
+}
+
+/// The cross-record run search's state for one write txn
+/// ([`RwTxn::cross_record_run`]): the free ids of its sources merged into
+/// one ascending list, each tagged with the index of its source.
+struct CrossRunCache {
+    /// `(page id, index into sources)`, ascending by id. May still hold ids
+    /// another draw arm took since it was built (they are in `reclaimed`).
+    merged: Vec<(u64, u32)>,
+    sources: Vec<CrossSource>,
+    /// The record budget it was built with.
+    budget: u64,
+    /// Whether the budget stopped the read before the last gated record.
+    truncated: bool,
+}
+
+/// Pages a GC-tree value listing `count` ids occupies outside its leaf cell:
+/// 0 when the PIL is stored inline, else its overflow run length (SPEC 02
+/// §4.2/§5). GC keys are 8 bytes (SPEC 05 GC-2).
+fn gc_value_pages(count: usize, psize: u32) -> u64 {
+    let dsize = pil_size(count) as u64;
+    if value_is_inline(8, dsize, psize) {
+        0
+    } else {
+        overflow_page_count(dsize, psize)
     }
 }
 
@@ -701,6 +756,11 @@ pub struct RwTxn<'env> {
     /// fires (like `RwCursor::repaired_keeps`). Debug builds only.
     #[cfg(debug_assertions)]
     finger_hits: u64,
+    /// Runs served by the cross-record run search
+    /// ([`RwTxn::cross_record_run`]) this txn — a test signal that the
+    /// search actually fires. Debug builds only.
+    #[cfg(debug_assertions)]
+    cross_runs: u64,
     /// LMDB `MDB_TXN_ERROR` parity: a mid-mutation failure (e.g. `MapFull`
     /// inside a split cascade) leaves the working tree partial, so every later
     /// mutation and `commit` returns `BadTxn`; only abort is valid.
@@ -712,6 +772,23 @@ pub struct RwTxn<'env> {
     /// — and the cache dies with the `RwTxn` ("must recompute in a fresh
     /// write txn"). The debug shadow check re-scans fresh at every draw.
     oldest_cache: Option<u64>,
+    /// The smallest run length the cross-record run search
+    /// ([`RwTxn::cross_record_run`]) has looked for and not found this txn,
+    /// after reading every record the gate admits. During the txn's
+    /// operations the reusable pages only ever shrink (draws remove ids;
+    /// nothing adds any until `freelist_save`), so a later request for a run
+    /// at least as long cannot succeed either and skips the search.
+    cross_miss: Option<u64>,
+    /// The cross-record run search's merged list of free ids, built on its
+    /// first use in this txn ([`RwTxn::cross_record_run`]).
+    cross_cache: Option<CrossRunCache>,
+    /// Set by `freelist_save` around the one put that grows this txn's own
+    /// GC entry after it has shrunk in the same save (SPEC 05 GC-13): the
+    /// in-save allocator then skips the carried annex pool, whose ids are
+    /// part of that entry, so the grow takes pages from outside it (the
+    /// drain pool or the end of the file) and the save reaches its fixed
+    /// point instead of trading pages between the entry and its own run.
+    save_outside: bool,
     /// Live nested read children (SPEC 04 TXN-31, ADR-0007 D3). Checked by
     /// [`RwTxn::guard_ok`] on every mutating entry (TXN-29) and at
     /// commit C0 (TXN-33); bumped/released by
@@ -836,6 +913,8 @@ impl Env {
             read_high: base.last_pg,
             #[cfg(debug_assertions)]
             finger_hits: 0,
+            #[cfg(debug_assertions)]
+            cross_runs: 0,
             psize: inner.page_size(),
             dirty,
             // ADR-0018: the writer probes the env
@@ -852,6 +931,9 @@ impl Env {
             save_touched: std::collections::BTreeSet::new(),
             errored: false,
             oldest_cache: None,
+            cross_miss: None,
+            cross_cache: None,
+            save_outside: false,
             children: ChildCounter::new(),
             // In-place WRITE_MAP keeps no whole-map reference in the struct
             // (see the field docs; ADR-0021 M1) — `whole_map` borrows lazily.
@@ -1308,6 +1390,15 @@ impl<'env> RwTxn<'env> {
                 if let Some(start) = self.annex_draw(n) {
                     return Ok(start);
                 }
+                // GC-21: a run no single source holds may still be free
+                // across several of them — the tree records the gate admits
+                // and the annex pool — as LMDB finds by merging the records
+                // it reads before searching.
+                if n > 1 {
+                    if let Some(start) = self.cross_record_run(n)? {
+                        return Ok(start);
+                    }
+                }
             }
             AllocMode::GcSave => {
                 // GC-12 (ADR-0005): never *read* the GC tree
@@ -1326,9 +1417,12 @@ impl<'env> RwTxn<'env> {
                 // like every annex draw; the step-(c) placement re-reads
                 // `annex.live()` after every put, so a draw here can never
                 // leave a handed-out id in the persisted set — the GC-12
-                // pool argument.
-                if let Some(start) = self.annex_draw(n) {
-                    return Ok(start);
+                // pool argument. Skipped while `freelist_save` grows its own
+                // entry after a shrink (`save_outside`, GC-13).
+                if !self.save_outside {
+                    if let Some(start) = self.annex_draw(n) {
+                        return Ok(start);
+                    }
                 }
             }
         }
@@ -1598,6 +1692,203 @@ impl<'env> RwTxn<'env> {
             debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
         }
         Ok(Some(start))
+    }
+
+    /// Allocate step 2c (SPEC 05 GC-16/GC-21): a run of `n > 1` pages whose
+    /// pages come from more than one freed-page source, tried only after the
+    /// per-record search ([`RwTxn::gc_reclaim`]) and the annex pool
+    /// ([`RwTxn::annex_draw`]) found no run inside any single source.
+    ///
+    /// The sources are the GC-tree records the gate admits (`F ≤
+    /// oldest_reader()`), read oldest first, at most
+    /// `n * CROSS_RUN_RECORDS_PER_PAGE` of them, then the annex pool when
+    /// its own gate (GC-31) admits it. Their live ids are merged into one
+    /// sorted list, as LMDB merges the records it reads into its in-memory
+    /// free list, and the first run of `n` consecutive ids from the low end
+    /// is taken. Each source keeps its own record (GC-20): the run is removed
+    /// from every source it came from — tree records through `drains`, the
+    /// pool through `annex` — so `freelist_save` rewrites each remainder
+    /// under its own key exactly as for a single-record draw. A page is free
+    /// in exactly one source (INV-24), so no page is handed out twice, and
+    /// every source's share is removed, so none leaks.
+    ///
+    /// The merged list is built once per txn and kept ([`CrossRunCache`]),
+    /// as LMDB keeps its in-memory free list for the whole txn. Ids the
+    /// other draw arms take afterwards stay in it until a candidate run
+    /// meets them: every draw records its pages in `reclaimed`, so a
+    /// candidate is checked against it and a taken id is dropped there.
+    ///
+    /// Every page drawn passed the same gate as a single-record draw, so no
+    /// live snapshot and no crash-fallback meta can reach it (GC-18).
+    // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
+    // arms stay separate so their size never moves it (inlining budget).
+    #[inline(never)]
+    fn cross_record_run(&mut self, n: u64) -> Result<Option<u64>> {
+        debug_assert!(n > 1 && self.alloc_mode == AllocMode::Normal);
+        if self.cross_miss.is_some_and(|m| n >= m) {
+            return Ok(None);
+        }
+        let run_len = usize::try_from(n).map_err(|_| Error::Mdb(MdbError::Invalid))?;
+        let budget = n.saturating_mul(CROSS_RUN_RECORDS_PER_PAGE);
+        let mut cache = match self.cross_cache.take() {
+            // A cache that read every gated record, or at least as many as
+            // this request may read, serves it.
+            Some(c) if !c.truncated || c.budget >= budget => c,
+            _ => self.build_cross_cache(budget)?,
+        };
+        // Search from the low end. A candidate whose ids all are still free
+        // is the pick; an id another draw arm took since the cache was built
+        // is dropped, and the search resumes at the first window it could
+        // have hidden.
+        let mut from = 0usize;
+        let hit = loop {
+            let ids = &cache.merged;
+            let Some(at) = (from..ids.len().saturating_sub(run_len - 1))
+                .find(|&i| ids[i + run_len - 1].0 == ids[i].0 + (n - 1))
+            else {
+                break None;
+            };
+            match (at..at + run_len).find(|&j| self.reclaimed.contains(&ids[j].0)) {
+                None => break Some(at),
+                Some(j) => {
+                    cache.merged.remove(j);
+                    from = j.saturating_sub(run_len - 1);
+                }
+            }
+        };
+        let Some(at) = hit else {
+            if !cache.truncated {
+                self.cross_miss = Some(self.cross_miss.map_or(n, |m| m.min(n)));
+            }
+            self.cross_cache = Some(cache);
+            return Ok(None);
+        };
+        let start = cache.merged[at].0;
+        // Each source's share of the run: its first id and its count. A
+        // source's ids inside the run are consecutive positions of its own
+        // list (`Drain::take_span`).
+        let mut shares: Vec<(u32, u64, usize)> = Vec::new();
+        for &(p, i) in &cache.merged[at..at + run_len] {
+            match shares.iter_mut().find(|s| s.0 == i) {
+                Some(s) => s.2 += 1,
+                None => shares.push((i, p, 1)),
+            }
+        }
+        cache.merged.drain(at..at + run_len);
+        debug_assert!(shares.len() >= 2, "a single-source run was missed upstream");
+        for (i, first, count) in shares {
+            match &mut cache.sources[i as usize] {
+                CrossSource::Tree { f, fresh } => {
+                    let f = *f;
+                    // Reader-table shadow check, as in every other draw arm.
+                    #[cfg(debug_assertions)]
+                    self.debug_assert_gate(f);
+                    // A record first drawn here enters `drains` with the ids
+                    // the cache read; if `gc_reclaim` loaded it meanwhile,
+                    // its entry is the live one.
+                    let drain = match fresh.take() {
+                        Some(ids) => self.drains.entry(f).or_insert(Drain::new(ids)),
+                        None => self.drains.get_mut(&f).expect("drain entry present"),
+                    };
+                    drain.take_span(first, count);
+                }
+                CrossSource::Annex => {
+                    #[cfg(debug_assertions)]
+                    self.debug_assert_gate(self.base.txnid);
+                    self.annex.take_span(first, count);
+                }
+            }
+        }
+        self.cross_cache = Some(cache);
+        for p in start..start + n {
+            let first_time = self.reclaimed.insert(p);
+            debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
+        }
+        #[cfg(debug_assertions)]
+        {
+            self.cross_runs += 1;
+        }
+        Ok(Some(start))
+    }
+
+    /// Build the cross-record run search's merged list
+    /// ([`RwTxn::cross_record_run`]): the live ids of the gated GC-tree
+    /// records, oldest first and at most `budget` of them, and of the annex
+    /// pool when GC-31 admits it, each tagged with its source.
+    fn build_cross_cache(&mut self, budget: u64) -> Result<CrossRunCache> {
+        let oldest = self.oldest_reader();
+        let mut sources: Vec<CrossSource> = Vec::new();
+        let mut truncated = false;
+        if self.free_db.root != PGNO_INVALID {
+            let rec = self.free_db;
+            let tree = Tree::new(self.source(), self.psize, rec.root, rec.depth);
+            let mut cursor = tree.cursor();
+            let mut entry = cursor.first().map_err(map_page_err)?;
+            let mut read = 0u64;
+            while let Some((key, val)) = entry {
+                let f = gc_key_decode(key).ok_or(Error::Mdb(MdbError::Invalid))?;
+                if f > oldest {
+                    break; // the gate, as in `gc_reclaim`
+                }
+                if read == budget {
+                    truncated = true;
+                    break;
+                }
+                read += 1;
+                match self.drains.get(&f) {
+                    Some(d) if d.len() == 0 => {}
+                    Some(_) => sources.push(CrossSource::Tree { f, fresh: None }),
+                    None => {
+                        let ids = pil_decode(val).ok_or(Error::Mdb(MdbError::Invalid))?;
+                        // The GC-18 validation rule, as in `gc_reclaim`.
+                        validate_pil_ids(&ids, self.committed_last_pg)?;
+                        if !ids.is_empty() {
+                            sources.push(CrossSource::Tree {
+                                f,
+                                fresh: Some(ids),
+                            });
+                        }
+                    }
+                }
+                entry = cursor.next().map_err(map_page_err)?;
+            }
+        }
+        if self.annex.len() > 0 && self.base.txnid <= oldest {
+            sources.push(CrossSource::Annex);
+        }
+        let mut merged: Vec<(u64, u32)> = Vec::new();
+        // Every single source was already searched in full, so a run needs
+        // two sources at least; with fewer the list stays empty.
+        if sources.len() >= 2 {
+            for (i, s) in sources.iter().enumerate() {
+                let i = u32::try_from(i).map_err(|_| Error::Mdb(MdbError::Invalid))?;
+                let live: &[u64] = match s {
+                    CrossSource::Tree {
+                        fresh: Some(ids), ..
+                    } => ids,
+                    CrossSource::Tree { f, fresh: None } => self.drains[f].live(),
+                    CrossSource::Annex => self.annex.live(),
+                };
+                merged.extend(live.iter().map(|&p| (p, i)));
+            }
+            // The sources' lists are each ascending: the stable sort merges
+            // runs.
+            merged.sort_by_key(|&(p, _)| p);
+            // INV-24: a free page is listed by exactly one source. The
+            // records are on-disk data and never trusted (GC-18): a page
+            // listed twice would be handed out while still listed free, so a
+            // corrupt free list fails the allocation like any other invalid
+            // record.
+            if merged.windows(2).any(|w| w[0].0 == w[1].0) {
+                return Err(Error::Mdb(MdbError::Invalid));
+            }
+        }
+        Ok(CrossRunCache {
+            merged,
+            sources,
+            budget,
+            truncated,
+        })
     }
 
     /// Record `pgno` as freed (GC-6), dropping its dirty frame if it has one.
@@ -4253,8 +4544,11 @@ impl<'env> RwTxn<'env> {
     /// loose page into `freed` (each id folds at most once); all three are
     /// bounded, and the previous iteration's PIL value run is loose and is
     /// re-served to the next iteration's allocation (free-before-allocate
-    /// ordering inside the put). `FREELIST_SAVE_MAX_ITERS` turns a regression
-    /// into a panic.
+    /// ordering inside the put). Annex-pool draws are bounded too, but a
+    /// grow of this txn's own entry served from the pool it lists could
+    /// spend one draw per iteration; the own-entry size guard in step (c)
+    /// rules that cycle out (GC-13 (v)). `FREELIST_SAVE_MAX_ITERS` turns a
+    /// regression into a panic.
     fn freelist_save(&mut self) -> Result<()> {
         debug_assert!(self.alloc_mode == AllocMode::Normal);
         self.alloc_mode = AllocMode::GcSave;
@@ -4279,6 +4573,11 @@ impl<'env> RwTxn<'env> {
         let annex_cap = crate::page::meta_annex_cap(self.psize);
         let mut tree_arm = false;
         let mut annex_mode = false;
+        // GC-13 own-entry size guard (tree arm): the page count of this
+        // txn's entry `BE(txnid)` as last written (0 = inline), and whether
+        // it has shrunk during this save. See step (c).
+        let mut own_pages: Option<u64> = None;
+        let mut own_shrunk = false;
         // Every ops-drained entry needs its GC-20 rewrite at least once.
         let mut pending: std::collections::BTreeSet<u64> = self.drains.keys().copied().collect();
         // Release-active bound on the *inner* rewrite loop (GC-13 guard):
@@ -4356,7 +4655,39 @@ impl<'env> RwTxn<'env> {
                     tree_arm = true; // sticky (GC-32)
                     annex_mode = false;
                     let ids = merge_sorted_unique(&self.freed, self.annex.live());
-                    self.put_pil(self.txnid, &ids)?;
+                    // GC-13 own-entry size guard. The entry lists the carried
+                    // annex pool and every loose page folded in, so a run
+                    // for it taken from those (an annex draw, a loose page)
+                    // leaves the pages it accounts for unchanged — the old
+                    // run is listed in their place. Near an overflow
+                    // page-count boundary that set may admit no exact size:
+                    // the shrunk entry frees a tail page, listing it grows
+                    // the entry back, and the grow draws a fresh run from
+                    // the annex, forever trading annex ids for listed ones
+                    // (LMDB never meets this: its put keeps a larger dirty
+                    // overflow run in place, which the exact run length of
+                    // SPEC 02 §5 forbids). So once the entry has shrunk in
+                    // this save, a grow takes every page from outside that
+                    // set — the drain pool or the end of the file — which
+                    // adds pages to it and so admits the larger size.
+                    let pages = gc_value_pages(ids.len(), self.psize);
+                    let grow_after_shrink = own_shrunk && own_pages.is_some_and(|p| pages > p);
+                    if own_pages.is_some_and(|p| pages < p) {
+                        own_shrunk = true;
+                    }
+                    if grow_after_shrink {
+                        // Loose pages are part of the set too (listed at the
+                        // fixed point): hold them back for this put.
+                        let held = std::mem::take(&mut self.loose);
+                        self.save_outside = true;
+                        let r = self.put_pil(self.txnid, &ids);
+                        self.save_outside = false;
+                        self.loose.extend(held);
+                        r?;
+                    } else {
+                        self.put_pil(self.txnid, &ids)?;
+                    }
+                    own_pages = Some(pages);
                     if self.freed.len() != before || Drain::len(&self.annex) != annex_before {
                         // The put COW-freed committed GC pages (PIL must
                         // grow) or drew from the annex pool (the written
@@ -5408,6 +5739,25 @@ mod tests {
         d.take_run(7, 2);
         assert_eq!(d.live(), &[6, 12]);
         assert_eq!(d.len(), 2);
+    }
+
+    /// A record's share of a run drawn across records (GC-21): its ids inside
+    /// the run interleave with another record's, so they are consecutive
+    /// positions of its own list but not consecutive page numbers.
+    #[test]
+    fn drain_take_span_removes_a_records_share_of_a_cross_record_run() {
+        // Records A and B interleave over the run 11..=15.
+        let mut a = Drain::new(vec![4, 11, 13, 15, 20]);
+        let mut b = Drain::new(vec![12, 14, 30]);
+        a.take_span(11, 3);
+        b.take_span(12, 2);
+        assert_eq!(a.live(), &[4, 20]);
+        assert_eq!(b.live(), &[30]);
+        // From the front: advances the consumed prefix, as a front run does.
+        let mut c = Drain::new(vec![7, 9, 11, 40]);
+        c.take_span(7, 3);
+        assert_eq!(c.live(), &[40]);
+        assert_eq!((c.head, c.ids.len()), (3, 4), "front span must not memmove");
     }
 
     /// Fully drained: the live view is empty however the ids were consumed —
