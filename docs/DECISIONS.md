@@ -36,3 +36,4 @@ issues.
 | 0025 | [Nested write transactions](adr/0025-nested-write-txns.md) | Draft, awaiting approval (#71) | Concurrency |
 | 0026 | [Ranged `msync` for `WRITE_MAP` commits](adr/0026-writemap-ranged-msync.md) | Accepted (Option B, 2026-10-17), implemented (#45) | Durability |
 | 0027 | [The API of Meilisearch's heed fork, behind a feature](adr/0027-heed-fork-unique-txns.md) | Accepted (Option B, 2026-10-18), implemented (#115) | API, consumer compatibility |
+| 0028 | [Free-page run search across freed-page records](adr/0028-free-page-run-search.md) | Proposed (draft), awaiting approval (#29) | Page reclamation, LMDB parity |
