@@ -64,6 +64,55 @@ fn op() -> impl Strategy<Value = Op> {
     )
 }
 
+/// One random case: `commits` write txns, a reader pinned after commit
+/// `pin_at`, and a spacer commit after every `spacer_every`-th one.
+fn run_case(commits: &[Vec<Op>], pin_at: usize, spacer_every: usize) -> Result<(), TestCaseError> {
+    let dir = TempDir::new().unwrap();
+    let env = open(dir.path());
+    let db = env.main_database();
+    let mut model = Contents::new();
+    let mut pinned: Option<(zerodb::RoTxn<'_>, Contents)> = None;
+    for (i, ops) in commits.iter().enumerate() {
+        let mut w = env.write_txn().unwrap();
+        for (n, &(k, put)) in ops.iter().enumerate() {
+            let key = vec![b'k', k];
+            match put {
+                Some(pages) => {
+                    let v = value((i * 31 + n) as u8, pages);
+                    db.put(&mut w, &key, &v).unwrap();
+                    model.insert(key, v);
+                }
+                None => {
+                    let had = db.delete(&mut w, &key).unwrap();
+                    prop_assert_eq!(had, model.remove(&key).is_some());
+                }
+            }
+        }
+        w.commit().unwrap();
+        // Spacer commits let freed records pass the reuse gate.
+        if i % spacer_every == 0 {
+            let mut w = env.write_txn().unwrap();
+            db.put(&mut w, b"spacer", &[i as u8]).unwrap();
+            w.commit().unwrap();
+            model.insert(b"spacer".to_vec(), vec![i as u8]);
+        }
+        let bytes = std::fs::read(dir.path().join(zerodb::DATA_FILE_NAME)).unwrap();
+        let v = check::check_image(&bytes, PS);
+        prop_assert!(v.is_empty(), "commit {}: {:#?}", i, v);
+        let r = env.read_txn().unwrap();
+        prop_assert_eq!(&contents(&env, &r), &model, "commit {}", i);
+        drop(r);
+        if let Some((r, want)) = &pinned {
+            prop_assert_eq!(&contents(&env, r), want, "pinned reader, commit {}", i);
+        }
+        if i == pin_at {
+            let r = env.read_txn().unwrap();
+            pinned = Some((r, model.clone()));
+        }
+    }
+    Ok(())
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         failure_persistence: None,
@@ -77,48 +126,94 @@ proptest! {
         pin_at in 0usize..16,
         spacer_every in 1usize..4,
     ) {
-        let dir = TempDir::new().unwrap();
-        let env = open(dir.path());
-        let db = env.main_database();
-        let mut model = Contents::new();
-        let mut pinned: Option<(zerodb::RoTxn<'_>, Contents)> = None;
-        for (i, ops) in commits.iter().enumerate() {
-            let mut w = env.write_txn().unwrap();
-            for (n, &(k, put)) in ops.iter().enumerate() {
-                let key = vec![b'k', k];
-                match put {
-                    Some(pages) => {
-                        let v = value((i * 31 + n) as u8, pages);
-                        db.put(&mut w, &key, &v).unwrap();
-                        model.insert(key, v);
-                    }
-                    None => {
-                        let had = db.delete(&mut w, &key).unwrap();
-                        prop_assert_eq!(had, model.remove(&key).is_some());
-                    }
-                }
-            }
-            w.commit().unwrap();
-            // Spacer commits let freed records pass the reuse gate.
-            if i % spacer_every == 0 {
-                let mut w = env.write_txn().unwrap();
-                db.put(&mut w, b"spacer", &[i as u8]).unwrap();
-                w.commit().unwrap();
-                model.insert(b"spacer".to_vec(), vec![i as u8]);
-            }
-            let bytes = std::fs::read(dir.path().join(zerodb::DATA_FILE_NAME)).unwrap();
-            let v = check::check_image(&bytes, PS);
-            prop_assert!(v.is_empty(), "commit {}: {:#?}", i, v);
-            let r = env.read_txn().unwrap();
-            prop_assert_eq!(&contents(&env, &r), &model, "commit {}", i);
-            drop(r);
-            if let Some((r, want)) = &pinned {
-                prop_assert_eq!(&contents(&env, r), want, "pinned reader, commit {}", i);
-            }
-            if i == pin_at {
-                let r = env.read_txn().unwrap();
-                pinned = Some((r, model.clone()));
-            }
-        }
+        run_case(&commits, pin_at, spacer_every)?;
     }
+}
+
+/// The case the property test shrank to on Linux CI: commit 4 (whose
+/// allocations drew runs across many records) failed to reach the
+/// `freelist_save` fixed point (GC-13). Kept as a fixed regression case.
+#[test]
+fn freelist_save_converges_after_cross_record_draws_regression() {
+    let commits: Vec<Vec<Op>> = vec![
+        vec![
+            (29, Some(48)),
+            (17, Some(55)),
+            (14, Some(19)),
+            (3, Some(43)),
+            (1, Some(37)),
+            (2, Some(41)),
+            (0, Some(47)),
+            (21, Some(26)),
+        ],
+        vec![
+            (30, None),
+            (0, Some(31)),
+            (29, None),
+            (0, None),
+            (0, None),
+            (11, Some(2)),
+            (0, None),
+            (18, None),
+        ],
+        vec![
+            (3, None),
+            (5, Some(17)),
+            (23, Some(13)),
+            (3, None),
+            (19, Some(18)),
+            (7, Some(52)),
+            (1, Some(8)),
+            (15, Some(47)),
+            (7, None),
+        ],
+        vec![
+            (9, Some(9)),
+            (10, Some(29)),
+            (20, Some(45)),
+            (5, Some(18)),
+            (27, Some(53)),
+            (22, Some(63)),
+            (29, Some(31)),
+            (26, Some(40)),
+            (4, None),
+            (12, Some(0)),
+            (0, Some(0)),
+            (21, None),
+            (16, Some(17)),
+            (0, None),
+            (29, Some(21)),
+            (19, Some(8)),
+            (29, Some(32)),
+            (22, Some(28)),
+            (29, Some(40)),
+            (8, Some(33)),
+            (19, None),
+            (17, None),
+            (24, Some(33)),
+            (8, Some(49)),
+            (17, None),
+            (4, Some(33)),
+            (16, Some(30)),
+            (19, Some(0)),
+            (15, Some(29)),
+            (22, Some(2)),
+            (20, Some(56)),
+            (14, Some(38)),
+        ],
+        vec![
+            (24, Some(0)),
+            (23, None),
+            (6, None),
+            (26, Some(62)),
+            (8, Some(32)),
+            (21, Some(45)),
+            (14, Some(51)),
+            (16, Some(54)),
+            (2, Some(0)),
+            (27, Some(46)),
+            (8, Some(10)),
+        ],
+    ];
+    run_case(&commits, 4, 3).unwrap();
 }

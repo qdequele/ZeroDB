@@ -29,6 +29,13 @@ the records and how they are saved are unchanged.
   drawn from two records (`crates/zerodb/tests/gc_reclaim.rs`), and a
   property test (`free_run_cross_record_proptest.rs`). New bench rungs
   `put/gc/ovf_across` and `put/gc/ovf_miss`.
+- Commit no longer panics with "freelist_save failed to reach a fixed point"
+  when the committing transaction's own freed-page record sits at an
+  overflow page-count boundary: the save could shrink the record by a page,
+  grow it back by listing that page, and repeat once per page of the meta
+  page's freed list. Once the record has shrunk during a save, growing it
+  now takes pages from outside the set it lists (SPEC 05 GC-13 (v)). Found
+  by the property test on Linux CI; the shrunk case is kept as a fixed test.
 
 ### `skip` crosses whole leaves instead of stepping each entry
 

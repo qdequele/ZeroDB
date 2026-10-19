@@ -239,6 +239,18 @@ struct CrossRunCache {
     truncated: bool,
 }
 
+/// Pages a GC-tree value listing `count` ids occupies outside its leaf cell:
+/// 0 when the PIL is stored inline, else its overflow run length (SPEC 02
+/// §4.2/§5). GC keys are 8 bytes (SPEC 05 GC-2).
+fn gc_value_pages(count: usize, psize: u32) -> u64 {
+    let dsize = pil_size(count) as u64;
+    if value_is_inline(8, dsize, psize) {
+        0
+    } else {
+        overflow_page_count(dsize, psize)
+    }
+}
+
 /// Merge two strictly-ascending, mutually-disjoint id slices into one
 /// strictly-ascending vec (GC-3/GC-4; the `freelist_save` step-(c) merge of
 /// this txn's `freed` with the carried annex remainder, SPEC 05 §2a GC-30).
@@ -770,6 +782,13 @@ pub struct RwTxn<'env> {
     /// The cross-record run search's merged list of free ids, built on its
     /// first use in this txn ([`RwTxn::cross_record_run`]).
     cross_cache: Option<CrossRunCache>,
+    /// Set by `freelist_save` around the one put that grows this txn's own
+    /// GC entry after it has shrunk in the same save (SPEC 05 GC-13): the
+    /// in-save allocator then skips the carried annex pool, whose ids are
+    /// part of that entry, so the grow takes pages from outside it (the
+    /// drain pool or the end of the file) and the save reaches its fixed
+    /// point instead of trading pages between the entry and its own run.
+    save_outside: bool,
     /// Live nested read children (SPEC 04 TXN-31, ADR-0007 D3). Checked by
     /// [`RwTxn::guard_ok`] on every mutating entry (TXN-29) and at
     /// commit C0 (TXN-33); bumped/released by
@@ -914,6 +933,7 @@ impl Env {
             oldest_cache: None,
             cross_miss: None,
             cross_cache: None,
+            save_outside: false,
             children: ChildCounter::new(),
             // In-place WRITE_MAP keeps no whole-map reference in the struct
             // (see the field docs; ADR-0021 M1) — `whole_map` borrows lazily.
@@ -1397,9 +1417,12 @@ impl<'env> RwTxn<'env> {
                 // like every annex draw; the step-(c) placement re-reads
                 // `annex.live()` after every put, so a draw here can never
                 // leave a handed-out id in the persisted set — the GC-12
-                // pool argument.
-                if let Some(start) = self.annex_draw(n) {
-                    return Ok(start);
+                // pool argument. Skipped while `freelist_save` grows its own
+                // entry after a shrink (`save_outside`, GC-13).
+                if !self.save_outside {
+                    if let Some(start) = self.annex_draw(n) {
+                        return Ok(start);
+                    }
                 }
             }
         }
@@ -4521,8 +4544,11 @@ impl<'env> RwTxn<'env> {
     /// loose page into `freed` (each id folds at most once); all three are
     /// bounded, and the previous iteration's PIL value run is loose and is
     /// re-served to the next iteration's allocation (free-before-allocate
-    /// ordering inside the put). `FREELIST_SAVE_MAX_ITERS` turns a regression
-    /// into a panic.
+    /// ordering inside the put). Annex-pool draws are bounded too, but a
+    /// grow of this txn's own entry served from the pool it lists could
+    /// spend one draw per iteration; the own-entry size guard in step (c)
+    /// rules that cycle out (GC-13 (v)). `FREELIST_SAVE_MAX_ITERS` turns a
+    /// regression into a panic.
     fn freelist_save(&mut self) -> Result<()> {
         debug_assert!(self.alloc_mode == AllocMode::Normal);
         self.alloc_mode = AllocMode::GcSave;
@@ -4547,6 +4573,11 @@ impl<'env> RwTxn<'env> {
         let annex_cap = crate::page::meta_annex_cap(self.psize);
         let mut tree_arm = false;
         let mut annex_mode = false;
+        // GC-13 own-entry size guard (tree arm): the page count of this
+        // txn's entry `BE(txnid)` as last written (0 = inline), and whether
+        // it has shrunk during this save. See step (c).
+        let mut own_pages: Option<u64> = None;
+        let mut own_shrunk = false;
         // Every ops-drained entry needs its GC-20 rewrite at least once.
         let mut pending: std::collections::BTreeSet<u64> = self.drains.keys().copied().collect();
         // Release-active bound on the *inner* rewrite loop (GC-13 guard):
@@ -4624,7 +4655,39 @@ impl<'env> RwTxn<'env> {
                     tree_arm = true; // sticky (GC-32)
                     annex_mode = false;
                     let ids = merge_sorted_unique(&self.freed, self.annex.live());
-                    self.put_pil(self.txnid, &ids)?;
+                    // GC-13 own-entry size guard. The entry lists the carried
+                    // annex pool and every loose page folded in, so a run
+                    // for it taken from those (an annex draw, a loose page)
+                    // leaves the pages it accounts for unchanged — the old
+                    // run is listed in their place. Near an overflow
+                    // page-count boundary that set may admit no exact size:
+                    // the shrunk entry frees a tail page, listing it grows
+                    // the entry back, and the grow draws a fresh run from
+                    // the annex, forever trading annex ids for listed ones
+                    // (LMDB never meets this: its put keeps a larger dirty
+                    // overflow run in place, which the exact run length of
+                    // SPEC 02 §5 forbids). So once the entry has shrunk in
+                    // this save, a grow takes every page from outside that
+                    // set — the drain pool or the end of the file — which
+                    // adds pages to it and so admits the larger size.
+                    let pages = gc_value_pages(ids.len(), self.psize);
+                    let grow_after_shrink = own_shrunk && own_pages.is_some_and(|p| pages > p);
+                    if own_pages.is_some_and(|p| pages < p) {
+                        own_shrunk = true;
+                    }
+                    if grow_after_shrink {
+                        // Loose pages are part of the set too (listed at the
+                        // fixed point): hold them back for this put.
+                        let held = std::mem::take(&mut self.loose);
+                        self.save_outside = true;
+                        let r = self.put_pil(self.txnid, &ids);
+                        self.save_outside = false;
+                        self.loose.extend(held);
+                        r?;
+                    } else {
+                        self.put_pil(self.txnid, &ids)?;
+                    }
+                    own_pages = Some(pages);
                     if self.freed.len() != before || Drain::len(&self.annex) != annex_before {
                         // The put COW-freed committed GC pages (PIL must
                         // grow) or drew from the annex pool (the written

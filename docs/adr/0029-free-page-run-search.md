@@ -276,6 +276,21 @@ Traced at 16 KiB pages, 10 of `a`'s pages are gone before `c`, leaving a free
 run 7 pages short. Closing that needs D-027 (a) decided, not more search;
 those two cases stay held to ZeroDB's outcome, now attributed to (a).
 
+**A commit-time loop the property test found.** On Linux CI the property
+test shrank to a commit whose `freelist_save` never reached its fixed point
+(GC-13): the transaction's own freed-page record, which in the tree arm also
+lists the carried annex pool, sat at an overflow page-count boundary. The
+put shrank it by a page, listing the freed tail page grew it back, and the
+grow drew a fresh run from the annex, so each cycle moved two annex ids into
+the freed set and the loop needed as many iterations as the pool held ids.
+The cross-record search only made the state reachable (no drain pool was
+loaded in that commit). LMDB keeps a larger dirty overflow run in place when
+a value shrinks; SPEC 02 §5 ties the run length to the value size, so
+ZeroDB instead takes a grow that follows a shrink from outside the record's
+set: the drain pool or the end of the file (SPEC 05 GC-13 (v)). The case
+converges in 4 iterations, and `free_run_churn` reads the same file sizes
+as in the table above.
+
 ## Consequences
 
 - Option B or C: SPEC 05 GC-16, GC-18, GC-21 (and for B GC-11..13, GC-20,
