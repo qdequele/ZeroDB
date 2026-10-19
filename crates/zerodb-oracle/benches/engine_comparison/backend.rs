@@ -145,6 +145,17 @@ macro_rules! bench_backend {
                 w.commit().expect("commit");
             }
 
+            /// Insert every key in ONE write txn, then abort: the put path
+            /// (descent, page and overflow-frame setup, value copy) without
+            /// the commit's file writes.
+            pub fn bulk_put_abort(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
+                let mut w = env.write_txn().expect("write_txn");
+                for k in keys {
+                    db.put(&mut w, k.as_slice(), val).expect("put");
+                }
+                w.abort();
+            }
+
             /// Same, with `MDB_APPEND` — keys MUST be ascending.
             pub fn bulk_put_append(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
                 let mut w = env.write_txn().expect("write_txn");
@@ -667,6 +678,9 @@ macro_rules! bench_backend {
 
                 fn bulk_put(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
                     bulk_put(env, db, keys, val)
+                }
+                fn bulk_put_abort(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
+                    bulk_put_abort(env, db, keys, val)
                 }
                 fn bulk_put_append(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
                     bulk_put_append(env, db, keys, val)

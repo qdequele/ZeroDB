@@ -8,7 +8,9 @@
 //!   implies. `rand / seq` is the split-and-COW cost; `seq / append` is what
 //!   the engine failed to infer from an ascending key order.
 //! * `val/*` — one insert order, four value widths. Isolates the value memcpy,
-//!   and at 2×page crosses into overflow pages.
+//!   and at 2×page crosses into overflow pages. `v2page_abort` runs the same
+//!   overflow puts and aborts, so the put path is measured without the
+//!   commit's file writes.
 //! * `api/{plain,reserved}` — the same bytes written through `put` and through
 //!   `MDB_RESERVE`. milli serializes documents through the reserved path, so a
 //!   gap here is a gap in milli's hottest write call (adapter `ReservedSpace`
@@ -85,6 +87,21 @@ fn family_val(c: &mut Criterion, cfg: &Cfg) {
     let val = vec![0xCDu8; os_page_size() as usize * 2];
     let mut g = group(c, "put/val/v2page", ovf_keys.len());
     pair!(wr_fresh, bulk_put, &mut g, cfg.page, true, &ovf_keys, &val);
+    g.finish();
+
+    // The same overflow puts, aborted instead of committed: isolates the put
+    // path's per-value cost (overflow-frame setup and value copy) from the
+    // commit's file writes, which dominate `v2page` and its noise.
+    let mut g = group(c, "put/val/v2page_abort", ovf_keys.len());
+    pair!(
+        wr_fresh,
+        bulk_put_abort,
+        &mut g,
+        cfg.page,
+        true,
+        &ovf_keys,
+        &val
+    );
     g.finish();
 }
 
