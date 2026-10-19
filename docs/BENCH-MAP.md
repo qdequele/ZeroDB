@@ -94,6 +94,7 @@ and last byte of every returned value through `std::hint::black_box`.
 |---|---|---|
 | `scan/full/fwd` **(base)** | one descent, then pure leaf walking | the cursor leaf memo |
 | `scan/full/rev` | the same walk against the sibling-link direction | reverse-iteration path |
+| `scan/skip_take/fwd` → `rev` | `skip(5000).take(100)`: a discarded scan prefix, then a short window | `Iterator::nth` leaf skipping (SPEC 03 §4) |
 | `scan/range/1pct` **(base)** → `10pct` | a positioned descent plus a per-step bound test | `RoRange` bound handling |
 | `scan/prefix/bucket` | the same through the prefix API | `prefix_iter` / `MDB_SET_RANGE` |
 | `scan/edge/first_last` | leftmost/rightmost descent, no walking | descent-only cost |

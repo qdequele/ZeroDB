@@ -6,6 +6,27 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### `skip` crosses whole leaves instead of stepping each entry
+
+The read iterators (`iter`, `rev_iter`, `range`, `rev_range`, `prefix_iter`,
+`rev_prefix_iter`) override `Iterator::nth`, which `Iterator::skip` calls. A
+skip now moves through a leaf by its entry count and hops to the next leaf,
+without decoding, bound-testing or reading the value of the entries it
+passes; only the landing entry is read. The results are the same as `n` calls
+to `next`, which the new differential test checks against LMDB. LMDB's C
+cursor moves one entry per call, so heed over LMDB cannot skip faster than
+that.
+
+- New cursor operations `Cursor::advance_by` and `Cursor::retreat_by` in
+  `zerodb-core` (SPEC 03 §4).
+- A paged listing such as `iter.skip(5000).take(100)` runs several times
+  faster; the numbers are in the pull request. A plain `count()` is
+  unchanged: std routes it through `try_fold`, which never calls `nth`.
+- Under corruption only: a damaged overflow page behind a skipped entry is no
+  longer noticed, and a page error met while crossing leaves is returned as
+  the item rather than ending the iterator silently.
+- New benchmark rungs `scan/skip_take/fwd` and `scan/skip_take/rev`.
+
 ### Faster deletes: rebalance moves cells page to page (ADR-0028)
 
 When a delete leaves a page under a quarter full, ZeroDB borrows an entry

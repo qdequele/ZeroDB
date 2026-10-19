@@ -1125,7 +1125,13 @@ impl<'txn> RoRange<'txn> {
 
     /// Whether `key` is within the bound that *terminates* iteration in this
     /// direction (the upper bound going forward, the lower bound going reverse).
-    fn in_bounds(&self, key: &[u8]) -> bool {
+    ///
+    /// `SKIP` only separates the copy `nth` uses (`true`) from the one `next`
+    /// uses (`false`). Each copy then has a single caller, which is what lets
+    /// LLVM inline this, key compare included, into `next`; with `nth` as a
+    /// second caller of one shared copy it stopped doing so and every plain
+    /// scan paid a call per entry (scan/full measured 1.4x slower).
+    fn in_bounds<const SKIP: bool>(&self, key: &[u8]) -> bool {
         match self.dir {
             Dir::Fwd => match &self.hi {
                 Bound::Unbounded => true,
@@ -1171,12 +1177,60 @@ impl<'txn> Iterator for RoRange<'txn> {
                 None
             }
             Ok(Some((k, v))) => {
-                if self.in_bounds(k) {
+                if self.in_bounds::<false>(k) {
                     Some(Ok((k, v)))
                 } else {
                     self.done = true;
                     None
                 }
+            }
+        }
+    }
+
+    /// Skip `n` entries leaf by leaf ([`Cursor::advance_by`] /
+    /// [`Cursor::retreat_by`]) instead of stepping, bound-testing and
+    /// resolving each one — what `Iterator::skip` calls. The result equals
+    /// `n` calls to `next` followed by one more: keys are sorted, so the
+    /// landing entry being in bounds means every skipped one was. The one
+    /// difference is under corruption (SPEC 03 §4): a skipped entry's value is
+    /// never read, and a page error met while crossing leaves is yielded
+    /// rather than consumed as a skipped item.
+    fn nth(&mut self, n: usize) -> Option<Self::Item> {
+        if n == 0 {
+            return self.next();
+        }
+        if self.done {
+            return None;
+        }
+        // The first item is the seek (or the handle check's error): it counts
+        // as one skipped entry and leaves the cursor on a yielded entry.
+        if !self.started || self.failed.is_some() {
+            let _ = self.next()?;
+            return self.nth(n - 1);
+        }
+        // The walk moves a copy of the cursor so the bound test can borrow
+        // `self`; the copy is written back below. (Splitting the bound test
+        // out of `self` instead changed how LLVM inlines `next`, costing every
+        // plain scan.)
+        let mut cursor = self.cursor.clone();
+        let past_end = |k: &[u8]| !self.in_bounds::<true>(k);
+        // The cursor sits on the last yielded entry, so the `n`th next one is
+        // `n + 1` steps away.
+        let steps = n.saturating_add(1);
+        let step = match self.dir {
+            Dir::Fwd => cursor.advance_by(steps, past_end),
+            Dir::Rev => cursor.retreat_by(steps, past_end),
+        };
+        self.cursor = cursor;
+        match step {
+            Ok(Some((k, v))) if self.in_bounds::<true>(k) => Some(Ok((k, v))),
+            Ok(_) => {
+                self.done = true;
+                None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(map_page_err(e)))
             }
         }
     }

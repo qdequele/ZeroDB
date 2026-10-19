@@ -1098,6 +1098,29 @@ impl<'a> Cursor<'a> {
         }
     }
 
+    /// [`ascend_next`](Self::ascend_next)'s walk without its final read: land
+    /// on the first slot of the next leaf (`true`) or set `EOF` (`false`), for
+    /// [`advance_by`](Self::advance_by), which crosses leaves without reading
+    /// their entries. Kept separate from `ascend_next` so the plain `next` path
+    /// is left exactly as it was.
+    fn next_leaf(&mut self) -> Result<bool, PageError> {
+        loop {
+            if self.stack.len() <= 1 {
+                self.eof = true;
+                return Ok(false);
+            }
+            self.stack.pop();
+            let (bp, bki) = *self.stack.last().expect("len > 1");
+            let br = self.branch_at(bp)?;
+            if bki + 1 < br.num_keys() {
+                self.stack.last_mut().expect("len > 1").1 = bki + 1;
+                let child = br.child_pgno(bki + 1);
+                self.descend_min(child)?;
+                return Ok(true);
+            }
+        }
+    }
+
     /// Symmetric to [`ascend_next`](Self::ascend_next): move to the last entry of
     /// the previous leaf, or go before-begin (uninitialized) if there is none.
     fn ascend_prev(&mut self) -> PosResult<'a> {
@@ -1115,6 +1138,28 @@ impl<'a> Cursor<'a> {
                 let child = br.child_pgno(bki - 1);
                 self.descend_max(child)?;
                 return self.current();
+            }
+        }
+    }
+
+    /// [`ascend_prev`](Self::ascend_prev)'s walk without its final read: land
+    /// on the last slot of the previous leaf (`true`) or go before-begin
+    /// (`false`), for [`retreat_by`](Self::retreat_by).
+    fn prev_leaf(&mut self) -> Result<bool, PageError> {
+        loop {
+            if self.stack.len() <= 1 {
+                self.initialized = false;
+                self.stack.clear();
+                return Ok(false);
+            }
+            self.stack.pop();
+            let (bp, bki) = *self.stack.last().expect("len > 1");
+            let br = self.branch_at(bp)?;
+            if bki > 0 {
+                self.stack.last_mut().expect("len > 1").1 = bki - 1;
+                let child = br.child_pgno(bki - 1);
+                self.descend_max(child)?;
+                return Ok(true);
             }
         }
     }
@@ -1235,6 +1280,105 @@ impl<'a> Cursor<'a> {
             return self.current();
         }
         self.ascend_prev()
+    }
+
+    /// Skip forward: the position `n` calls to [`next`](Self::next) reach,
+    /// without reading the entries in between (SPEC 03 §4 "advance_by /
+    /// retreat_by"). Within a leaf the slot index moves by `n` directly; a
+    /// leaf the walk leaves is crossed by its entry count, and the next leaf is
+    /// reached by [`next`](Self::next)'s ascend-and-descend. Skipped entries'
+    /// values are never resolved, so their overflow pages are never read.
+    ///
+    /// `past_end` is asked about the last key of each leaf before the walk
+    /// leaves it; `true` stops the walk with `Ok(None)`. A range iterator passes
+    /// its terminating bound, so a skip that overshoots the range stops at the
+    /// leaf holding the bound instead of walking the rest of the tree.
+    ///
+    /// An unpositioned or `EOF` cursor has no leaf to count from and falls
+    /// back to `n` single steps.
+    pub fn advance_by(
+        &mut self,
+        mut n: usize,
+        mut past_end: impl FnMut(&[u8]) -> bool,
+    ) -> PosResult<'a> {
+        if n == 0 {
+            return self.current();
+        }
+        if !self.initialized || self.eof {
+            for _ in 1..n {
+                if self.next()?.is_none() {
+                    return Ok(None);
+                }
+            }
+            return self.next();
+        }
+        loop {
+            let (pgno, ki) = *self
+                .stack
+                .last()
+                .expect("initialized cursor has a leaf frame");
+            let leaf = self.leaf_at(pgno)?;
+            let nkeys = leaf.num_keys();
+            let left = nkeys.saturating_sub(ki + 1);
+            if n <= left {
+                self.stack.last_mut().expect("leaf frame").1 = ki + n;
+                return self.current();
+            }
+            // The next leaf's first entry is `left + 1` steps away.
+            n -= left + 1;
+            if nkeys > 0 && past_end(leaf.key(nkeys - 1)) {
+                return Ok(None);
+            }
+            if !self.next_leaf()? {
+                return Ok(None);
+            }
+            if n == 0 {
+                return self.current();
+            }
+        }
+    }
+
+    /// Skip backward: the position `n` calls to [`prev`](Self::prev) reach,
+    /// mirroring [`advance_by`](Self::advance_by). `past_end` is asked about
+    /// the first key of each leaf before the walk leaves it.
+    pub fn retreat_by(
+        &mut self,
+        mut n: usize,
+        mut past_end: impl FnMut(&[u8]) -> bool,
+    ) -> PosResult<'a> {
+        if n == 0 {
+            return self.current();
+        }
+        if !self.initialized || self.eof {
+            for _ in 1..n {
+                if self.prev()?.is_none() {
+                    return Ok(None);
+                }
+            }
+            return self.prev();
+        }
+        loop {
+            let (pgno, ki) = *self
+                .stack
+                .last()
+                .expect("initialized cursor has a leaf frame");
+            if n <= ki {
+                self.stack.last_mut().expect("leaf frame").1 = ki - n;
+                return self.current();
+            }
+            // The previous leaf's last entry is `ki + 1` steps away.
+            n -= ki + 1;
+            let leaf = self.leaf_at(pgno)?;
+            if leaf.num_keys() > 0 && past_end(leaf.key(0)) {
+                return Ok(None);
+            }
+            if !self.prev_leaf()? {
+                return Ok(None);
+            }
+            if n == 0 {
+                return self.current();
+            }
+        }
     }
 
     /// `set` (`MDB_SET`) — SPEC 03 §4: exact match. Positions on `key` and

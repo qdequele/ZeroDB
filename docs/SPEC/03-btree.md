@@ -347,6 +347,38 @@ Return key+value at the current position without moving. Requires
 `INITIALIZED` and not `EOF`, else `MDB_NOTFOUND`/`EINVAL` (mirrors LMDB;
 underlies `iter_mut`/`prefix_iter_mut` rewrite and the write-cursor ops §7).
 
+### advance_by / retreat_by (skip `n`) — SPEC 00 r43–r46 (`Iterator::nth`, `skip`)
+
+No LMDB counterpart: LMDB's C cursor moves one entry per call, so heed over
+LMDB implements `skip(n)` as `n` calls to `MDB_NEXT`/`MDB_PREV`. ZeroDB's read
+iterators override `Iterator::nth` (which `skip` calls) with a cursor skip that
+lands on the same entry without visiting the ones in between.
+
+- `advance_by(n)` reaches the position `n` calls to **next** reach. While
+  `n <= NUMKEYS(leaf) − 1 − ki[top]`, set `ki[top] += n` and stop. Otherwise
+  subtract the `NUMKEYS(leaf) − ki[top]` steps that reach the next leaf's first
+  entry, perform **next**'s ascend-and-descend to that leaf (`ki[top]=0`), and
+  repeat. Running out of leaves sets `EOF` and yields `None`, as **next** does.
+- `retreat_by(n)` mirrors it with **prev**: `ki[top] -= n` while `n <= ki[top]`,
+  otherwise subtract `ki[top] + 1` and move to the previous leaf's last entry.
+  Running out of leaves goes before-begin.
+- Bounds: before the walk leaves a leaf, the iterator's terminating bound is
+  tested against that leaf's last key (first key in reverse). If it fails, the
+  skip stops with `None`, since every later entry is past the bound too, so an
+  overshooting skip over a range or prefix never walks past the bound's leaf.
+  After landing, the landing key gets the same bound test **next** applies;
+  keys are sorted, so a landing key in bounds means every skipped key was.
+- An unpositioned or `EOF` cursor has no leaf to count from and takes `n`
+  single steps. A range iterator's first item is always its seek.
+
+`nth(n)` therefore yields exactly what `n` calls to `next` followed by one more
+yield, at the cost of one leaf-header read per crossed leaf instead of one key,
+value and bound test per skipped entry. The one difference is under corruption:
+a skipped entry's value is never resolved, so a damaged overflow page behind a
+skipped entry goes unnoticed, and a page error met while crossing leaves (each
+crossed leaf goes through the normal leaf read, validated unless the env trusts
+the file) is yielded as the item rather than consumed as a skipped one.
+
 **EOF/empty summary.** Empty tree: first/last/set_range/get_current → `None`;
 next/prev → `None`; set → `NotFound`. Non-empty at the boundary: `next` past the
 max → `EOF`+`None` (idempotent); `prev` past the min → before-begin (`next`
