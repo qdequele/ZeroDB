@@ -334,6 +334,13 @@ impl Engine for LmdbEngine {
                 steps,
                 drain,
             } => self.iter_mut_del_then_walk(*db, *nth, *steps, *drain),
+            Op::IterMutPutThenWalk {
+                db,
+                nth,
+                steps,
+                val,
+                rewrite,
+            } => self.iter_mut_put_then_walk(*db, *nth, *steps, &val.0, *rewrite),
 
             // ---------------- verification ----------------
             Op::VerifyGet { db, key } => self.verify_get(*db, &key.0),
@@ -997,6 +1004,76 @@ impl LmdbEngine {
                     if drain {
                         // SAFETY: the entry was copied out above; no borrow lives.
                         if let Err(e) = unsafe { it.del_current() } {
+                            return err(e);
+                        }
+                    }
+                }
+                Some(Err(e)) => return err(e),
+                None => break,
+            }
+        }
+        OpResult::Entries(seen)
+    }
+
+    fn iter_mut_put_then_walk(
+        &mut self,
+        db: u8,
+        nth: u8,
+        steps: u8,
+        val: &[u8],
+        rewrite: bool,
+    ) -> OpResult {
+        let db = match self.db_at(db) {
+            Ok(d) => d,
+            Err(r) => return r,
+        };
+        let wtxn = match self.write_txn() {
+            Ok(w) => w,
+            Err(r) => return r,
+        };
+        let mut it = match db.iter_mut(wtxn) {
+            Ok(it) => it,
+            Err(e) => return err(e),
+        };
+        let target = nth as usize;
+        let mut i = 0usize;
+        let mut key_owned: Option<Vec<u8>> = None;
+        loop {
+            match it.next() {
+                Some(Ok((k, _))) => {
+                    if i == target {
+                        key_owned = Some(k.to_vec());
+                        break;
+                    }
+                    i += 1;
+                }
+                Some(Err(e)) => return err(e),
+                None => break,
+            }
+        }
+        let Some(k) = key_owned else {
+            return OpResult::Bool(false);
+        };
+        // SAFETY: the key was copied out and the borrowing `next()` result
+        // dropped; `k` equals the current key, as `put_current` requires.
+        if let Err(e) = unsafe { it.put_current(k.as_slice(), val) } {
+            return err(e);
+        }
+        let limit = if steps == 0 {
+            usize::MAX
+        } else {
+            steps as usize
+        };
+        let mut seen = Vec::new();
+        while seen.len() < limit {
+            match it.next() {
+                Some(Ok((k, v))) => {
+                    let k = k.to_vec();
+                    seen.push((k.clone(), v.to_vec()));
+                    if rewrite {
+                        // SAFETY: the entry was copied out above; no borrow
+                        // lives, and `k` is the current key.
+                        if let Err(e) = unsafe { it.put_current(k.as_slice(), val) } {
                             return err(e);
                         }
                     }
