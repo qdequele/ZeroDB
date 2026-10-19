@@ -228,3 +228,120 @@ fn skip_take_matches_slice() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Corruption: what a skip reads and what it reports (SPEC 03 §4)
+// ---------------------------------------------------------------------------
+
+const PS: usize = 4096;
+/// Page-type flags and reserved header fields (SPEC 02 §1, §2.1).
+const OFF_FLAGS: usize = 16;
+const P_LEAF: u16 = 0x0001;
+const P_OVERFLOW: u16 = 0x0004;
+/// Overflow head: `reserved2` (offset 28, MUST be 0).
+const OFF_OVF_RESERVED2: usize = 28;
+/// Leaf: `leaf2_ksize` (offset 28, MUST be 0).
+const OFF_LEAF2_KSIZE: usize = 28;
+
+fn key(i: usize) -> Vec<u8> {
+    format!("k{i:05}").into_bytes()
+}
+
+/// 1000 keys on 4 KiB pages; key 500 holds `big` (an overflow value when it
+/// exceeds a page), every other key a short value. The env is closed on return.
+fn build_corruptible(dir: &std::path::Path, big: &[u8]) {
+    let mut o = EnvOpenOptions::new().read_txn_without_tls();
+    o.map_size(16 << 20).max_dbs(1).page_size(PS as u32);
+    let env = unsafe { o.open(dir) }.unwrap();
+    let mut w = env.write_txn().unwrap();
+    let db: Database<Bytes, Bytes> = env.create_database(&mut w, None).unwrap();
+    for i in 0..1000 {
+        let v: &[u8] = if i == 500 { big } else { b"small" };
+        db.put(&mut w, &key(i), v).unwrap();
+    }
+    w.commit().unwrap();
+}
+
+fn reopen(dir: &std::path::Path) -> (heed_zerodb::Env<WithoutTls>, Database<Bytes, Bytes>) {
+    let mut o = EnvOpenOptions::new().read_txn_without_tls();
+    o.map_size(16 << 20).max_dbs(1);
+    let env = unsafe { o.open(dir) }.unwrap();
+    let r = env.read_txn().unwrap();
+    let db = env.open_database(&r, None).unwrap().unwrap();
+    drop(r);
+    (env, db)
+}
+
+/// Set a 4-byte field of the first page of type `flag` whose bytes contain
+/// `needle`, and return that page's number.
+fn damage_page(dir: &std::path::Path, flag: u16, needle: &[u8], off: usize) -> usize {
+    let path = dir.join(zerodb::HEED_DATA_FILE_NAME);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let pgno = (2..bytes.len() / PS)
+        .find(|&p| {
+            let page = &bytes[p * PS..(p + 1) * PS];
+            u16::from_le_bytes([page[OFF_FLAGS], page[OFF_FLAGS + 1]]) & flag != 0
+                && page.windows(needle.len()).any(|w| w == needle)
+        })
+        .expect("page to damage");
+    bytes[pgno * PS + off..pgno * PS + off + 4].copy_from_slice(&1u32.to_le_bytes());
+    std::fs::write(&path, bytes).unwrap();
+    pgno
+}
+
+/// A skip never reads a skipped entry's value: a damaged overflow page behind
+/// a skipped entry goes unnoticed, while landing on that entry, or stepping
+/// over it with `next`, reports it.
+#[test]
+fn skip_does_not_read_skipped_overflow_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut big = b"OVERFLOW-MARKER".to_vec();
+    big.resize(3 * PS, 0x7A);
+    build_corruptible(dir.path(), &big);
+    damage_page(
+        dir.path(),
+        P_OVERFLOW,
+        b"OVERFLOW-MARKER",
+        OFF_OVF_RESERVED2,
+    );
+    let (env, db) = reopen(dir.path());
+    let r = env.read_txn().unwrap();
+
+    // The damage is real: stepping onto entry 500 reports it.
+    assert!(db.iter(&r).unwrap().nth(500).unwrap().is_err());
+    let stepped: Vec<_> = db.iter(&r).unwrap().take(501).collect();
+    assert!(stepped[500].is_err(), "next reads every value");
+
+    // Skipping past it does not read it.
+    let (k, v) = db.iter(&r).unwrap().nth(600).unwrap().unwrap();
+    assert_eq!((k, v), (&key(600)[..], &b"small"[..]));
+    let (k, _) = db.rev_iter(&r).unwrap().nth(999 - 400).unwrap().unwrap();
+    assert_eq!(k, &key(400)[..]);
+}
+
+/// A page error met while a skip crosses leaves is the item `nth` returns,
+/// and the iterator ends after it.
+#[test]
+fn skip_reports_a_damaged_leaf_it_crosses() {
+    let dir = tempfile::tempdir().unwrap();
+    build_corruptible(dir.path(), b"small");
+    damage_page(dir.path(), P_LEAF, &key(500), OFF_LEAF2_KSIZE);
+    let (env, db) = reopen(dir.path());
+    let r = env.read_txn().unwrap();
+
+    for rev in [false, true] {
+        let mut it: Box<dyn Iterator<Item = heed_zerodb::Result<(&[u8], &[u8])>>> = if rev {
+            Box::new(db.rev_iter(&r).unwrap())
+        } else {
+            Box::new(db.iter(&r).unwrap())
+        };
+        assert!(
+            it.nth(900).unwrap().is_err(),
+            "rev={rev}: crossing the damaged leaf"
+        );
+        assert!(
+            it.next().is_none(),
+            "rev={rev}: the iterator ends after the error"
+        );
+    }
+}
