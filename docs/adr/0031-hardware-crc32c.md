@@ -202,13 +202,22 @@ If Option B is approved:
   becomes "done for the meta CRC (ADR-0031)".
 - **Durability, format, API, LMDB parity:** unchanged.
 
-### Implementation (2026-10-19)
+### Implementation
 
-`b2f5b6c`. Measured on the Mac (`benches/results/2026-10-19-meta-crc-hardware.md`):
-16 KiB CRC 5.66 → 1.99 µs; one delete per commit on a large tree 16.71 →
-14.64 µs (LMDB 6.62); crud-bench deletes 0.82× → 0.93× LMDB. Criterion was
-inconclusive on that busy host, with no regression seen; a quiet-host and
-Graviton rerun is still to do.
+`e6d69fa` (2026-10-20), on `main`'s slicing-by-8 table (#117). First built on
+the slicing-by-16 variant (pre-rebase commit `b2f5b6c`) and measured there:
+on the Mac, 16 KiB CRC 5.66 → 1.99 µs, single-delete commit 16.71 →
+14.64 µs (LMDB 6.62), crud-bench deletes 0.82× → 0.93× LMDB; on Graviton4
+(`benches/results/2026-10-19-meta-crc-graviton.md`), 16 KiB CRC 5.66 →
+0.75 µs, single-delete commit 0.91× (4 KiB pages) and 0.83× (16 KiB) of the
+slicing-by-16 one.
+
+Rebased build against `main`, Mac, busy host (load 15–22; absolute numbers
+inflated, see `benches/results/2026-10-19-meta-crc-hardware.md`): 16 KiB
+CRC 10.53 → 2.44 µs; single-delete commit 21.96 → 17.19 µs, paired
+0.68–0.80 over 7 runs. A 3-round criterion run at load 14 was invalid (LMDB
+drift up to 16 %); `del/random/n1` read 0.772 (±0.288). Not rerun on
+Graviton.
 
 ## Open questions for human review
 

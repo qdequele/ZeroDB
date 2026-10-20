@@ -6,6 +6,19 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### Hardware CRC32C for the meta checksum on aarch64 (ADR-0031)
+
+On aarch64 CPUs with the `crc` feature (every Graviton and Apple M-series
+core), the meta-page checksum uses the ARMv8 `crc32c` instructions, detected
+at run time. Other CPUs keep the slicing-by-8 table. The checksum value is
+the same, so files are unchanged. A full 16 KiB annex is checksummed in
+0.75 µs on Graviton4 and 2.4 µs on Apple M-series, against 9–10 µs for the
+table. Commits that free many pages gain the most: one delete per
+transaction on a large tree costs about 0.77× as much as on the table path
+(Mac). A new criterion rung, `del/random/n1`, measures this case.
+Details: `benches/results/2026-10-19-meta-crc-hardware.md` and
+`-graviton.md`.
+
 ### Copy-on-write copies only a page's used bytes (ADR-0030)
 
 When a write transaction first modifies a page, ZeroDB copied all of it. It now
