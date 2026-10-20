@@ -1,4 +1,4 @@
-# ADR-0031: Raw environment copy from the data file: clone or in-kernel copy
+# ADR-0032: Raw environment copy from the data file: clone or in-kernel copy
 
 - Status: Proposed
 - Related issue: #64

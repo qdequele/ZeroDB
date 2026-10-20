@@ -1,4 +1,4 @@
-//! Raw-copy routes (`copy.rs`, ADR-0031): each route — streaming from the
+//! Raw-copy routes (`copy.rs`, ADR-0032): each route — streaming from the
 //! map, copying the data file, cloning the data file — produces the pinned
 //! snapshot's image, on a quiet env and under a concurrent writer, with and
 //! without `WRITE_MAP`. The routes are forced here, so the ones a platform

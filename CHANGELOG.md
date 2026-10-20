@@ -6,7 +6,7 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
-### Raw environment copies read the data file: a clone on APFS, `copy_file_range` on Linux (ADR-0031)
+### Raw environment copies read the data file: a clone on APFS, `copy_file_range` on Linux (ADR-0032)
 
 A non-compacting copy (`copy_to_file` with `CompactionOption::Disabled`) wrote
 every page from the memory map. It now takes the pages from the data file while

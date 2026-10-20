@@ -26,7 +26,7 @@
 //! overwritten on the next reuse), so a torn free page is harmless. Compaction
 //! sidesteps the question entirely: it reads only reachable entries.
 //!
-//! ## Raw copies that read the data file instead of the map (ADR-0031)
+//! ## Raw copies that read the data file instead of the map (ADR-0032)
 //!
 //! The same pin makes it safe for a raw copy to take the snapshot's pages
 //! from the **data file** rather than from the map, with any method that
