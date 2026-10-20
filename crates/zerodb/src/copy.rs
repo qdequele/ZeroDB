@@ -25,8 +25,48 @@
 //! never read as live data (the copy's freelist lists them free and they are
 //! overwritten on the next reuse), so a torn free page is harmless. Compaction
 //! sidesteps the question entirely: it reads only reachable entries.
+//!
+//! ## Raw copies that read the data file instead of the map (ADR-0031)
+//!
+//! The same pin makes it safe for a raw copy to take the snapshot's pages
+//! from the **data file** rather than from the map, with any method that
+//! reads the file while the writer keeps committing:
+//!
+//! - **File copy** (Linux, both forms, when the destination is on the data
+//!   file's own XFS, btrfs or bcachefs filesystem): `std::io::copy` of the
+//!   file's first `(last_pg + 1) × page_size` bytes, which std performs with
+//!   `copy_file_range`, which these filesystems turn into a block clone
+//!   (reflink). Elsewhere `copy_file_range` copies bytes through a pipe,
+//!   measured slower than streaming from the map, so the copy streams.
+//! - **Clone** (macOS, a copy to a path without a progress callback):
+//!   `std::fs::copy` of the whole file, which std performs with
+//!   `fclonefileat` (an APFS clone that shares the file's blocks), and with
+//!   a byte copy where cloning is unsupported. The clone is then trimmed to
+//!   the snapshot's last page.
+//!
+//! Either way the copy's two meta pages are then overwritten with the ones
+//! built for `T`, so whatever the file held at those offsets (a newer meta, a
+//! meta being rewritten) is discarded, as is any page past `last_pg`.
+//!
+//! Why this reads `T`'s pages exactly: every page reachable from `T` was
+//! written before `T` was published (with `pwrite`, or through the shared
+//! map under `WRITE_MAP`), and the reader pin forbids rewriting it, in place
+//! or otherwise (SPEC 04 TXN-62, which the `WRITE_MAP` in-place writes obey
+//! too), until this copy's read transaction ends. On Linux and macOS a file's
+//! page cache is the very memory a shared mapping maps, so `read`,
+//! `copy_file_range` and the clone see those bytes whether or not they have
+//! reached the disk; the clone and reflink paths write dirty cached pages
+//! back before sharing blocks. A page that was free at `T` may change during
+//! the copy and arrive torn — harmless, as above. Nothing here needs the copy
+//! to be atomic, to pause the writer or to sync the source.
+//!
+//! The file is opened afresh by the path the env opened it at, and used only
+//! when it is still the same file (device and inode) as the env's own
+//! descriptor; otherwise, and for backings that are not a file, the copy
+//! streams from the map.
 
 use std::fs::File;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 use zerodb_core::builder::{EnvStream, PageSink, StreamBuildError, DEFAULT_FILL_PERMILLE};
@@ -102,7 +142,12 @@ pub trait CopyToFile {
     ///
     /// - `Disabled` (raw): the snapshot's data pages are written straight from
     ///   the map in large chunks, as LMDB's `mdb_env_copyfd` writes from its
-    ///   map; no in-memory image.
+    ///   map; no in-memory image. On Linux, onto the data file's own XFS,
+    ///   btrfs or bcachefs filesystem, they are cloned from the data file in
+    ///   the same chunks with `copy_file_range` instead (see the module
+    ///   docs). This form never clones the whole file, which
+    ///   [`CopyToFile::copy_to_file`] may do on macOS: a clone is one
+    ///   filesystem call with nothing to report between its start and end.
     /// - `Enabled` (compacting): pages land incrementally, bounded memory —
     ///   O(tree depth × page size).
     ///
@@ -146,7 +191,11 @@ pub trait CopyToFile {
     ///
     /// The image is written starting at the file's current position, and the
     /// position is left at the end of the image, as LMDB's sequential writes
-    /// leave it. Pages go straight into `file`: no temp file, no rename, no
+    /// leave it. A raw copy on Linux into a file on the data file's own XFS,
+    /// btrfs or bcachefs filesystem clones the pages from the data file with
+    /// `copy_file_range` (see the module docs); otherwise, and for a
+    /// compacting copy, they are written from the map. Pages go straight into
+    /// `file`: no temp file, no rename, no
     /// progress reporting, so a failure can leave a partial image in `file`
     /// (as with LMDB). Durability is the caller's concern, as for
     /// [`CopyToFile::copy_to_file`].
@@ -159,10 +208,17 @@ pub trait CopyToFile {
 
 impl CopyToFile for Env {
     fn copy_to_file(&self, path: impl AsRef<Path>, option: CompactionOption) -> Result<()> {
-        // Same code path as the progress form, with a callback that does
-        // nothing — so the no-callback signature (heed parity, SPEC 00 row 17)
-        // cannot drift from the instrumented one.
-        self.copy_to_file_with_progress(path, option, &mut |_| {})
+        // The progress form's code path with a callback that does nothing, so
+        // the no-callback signature (heed parity, SPEC 00 row 17) cannot
+        // drift from the instrumented one. The one difference: with no
+        // progress to report, a raw copy may clone the whole file.
+        copy_to_path(
+            self,
+            path.as_ref(),
+            option,
+            &mut |_| {},
+            |src, dest, data_end| path_route(src, dest, data_end, true),
+        )
     }
 
     fn copy_to_file_with_progress(
@@ -171,38 +227,345 @@ impl CopyToFile for Env {
         option: CompactionOption,
         on_progress: &mut dyn FnMut(CopyProgress),
     ) -> Result<()> {
-        let dest = path.as_ref();
-        // The internal read txn pins the snapshot for the whole copy (SPEC 00
-        // row 17: copy opens its own read txn).
-        let txn = self.read_txn()?;
-        let plan = Plan::new(self, &txn, option)?;
-        let (tmp, file) = create_staging_file(dest)?;
-        // Remove the temp on every non-rename exit (error or unwinding callback).
-        let mut guard = TmpGuard {
-            path: &tmp,
-            armed: true,
-        };
-        let mut progress = Progress::start(plan.total, on_progress);
-        plan.write(self, &txn, &file, 0, &mut progress)?;
-        drop(file); // close the temp file before renaming it
-                    // Last callback before `dest` is touched — see the panic contract on
-                    // `copy_to_file_with_progress`.
-        progress.finish();
-        std::fs::rename(&tmp, dest)?;
-        guard.armed = false;
-        Ok(())
+        copy_to_path(
+            self,
+            path.as_ref(),
+            option,
+            on_progress,
+            |src, dest, data_end| path_route(src, dest, data_end, false),
+        )
     }
 
     fn copy_to_open_file(&self, file: &mut File, option: CompactionOption) -> Result<()> {
-        use std::io::{Seek, SeekFrom};
-        let txn = self.read_txn()?;
-        let plan = Plan::new(self, &txn, option)?;
-        let base = file.stream_position()?;
-        let mut silent = |_: CopyProgress| {};
-        let mut progress = Progress::start(plan.total, &mut silent);
-        let len = plan.write(self, &txn, file, base, &mut progress)?;
-        file.seek(SeekFrom::Start(base + len))?;
-        Ok(())
+        copy_into_open_file(self, file, option, open_file_route)
+    }
+}
+
+/// The body of [`CopyToFile::copy_to_file_with_progress`]; `pick` chooses how
+/// a raw copy moves its pages (tests force each route through it).
+fn copy_to_path(
+    env: &Env,
+    dest: &Path,
+    option: CompactionOption,
+    on_progress: &mut dyn FnMut(CopyProgress),
+    pick: impl FnOnce(Option<&DataFile>, &Path, u64) -> RawRoute,
+) -> Result<()> {
+    // The internal read txn pins the snapshot for the whole copy (SPEC 00
+    // row 17: copy opens its own read txn).
+    let txn = env.read_txn()?;
+    let plan = Plan::new(env, &txn, option)?;
+    let src = plan.data_file(env);
+    let route = pick(src.as_ref(), dest, raw_image_len(env, &txn));
+    let mut progress = Progress::start(plan.total, on_progress);
+    if let (RawRoute::Clone, Some(src)) = (route, &src) {
+        if clone_raw(env, &txn, src, dest, &mut progress)? {
+            return Ok(());
+        }
+        // The clone backed off (the path no longer names the env's data
+        // file, or the clone came out short): stream from the map instead.
+        return stream_to_path(env, &txn, plan, None, dest, &mut progress);
+    }
+    let src = src.filter(|_| route == RawRoute::FileCopy);
+    stream_to_path(env, &txn, plan, src.as_ref(), dest, &mut progress)
+}
+
+/// Write the image into a sibling staging file and rename it over `dest`.
+fn stream_to_path(
+    env: &Env,
+    txn: &RoTxn<'_>,
+    plan: Plan,
+    src: Option<&DataFile>,
+    dest: &Path,
+    progress: &mut Progress<'_>,
+) -> Result<()> {
+    let (tmp, file) = create_staging_file(dest)?;
+    // Remove the temp on every non-rename exit (error or unwinding callback).
+    let mut guard = TmpGuard {
+        path: &tmp,
+        armed: true,
+    };
+    plan.write(env, txn, &file, 0, src, progress)?;
+    drop(file); // close the temp file before renaming it
+                // Last callback before `dest` is touched — see the panic contract on
+                // `copy_to_file_with_progress`.
+    progress.finish();
+    std::fs::rename(&tmp, dest)?;
+    guard.armed = false;
+    Ok(())
+}
+
+/// The body of [`CopyToFile::copy_to_open_file`]; `pick` as for
+/// [`copy_to_path`].
+fn copy_into_open_file(
+    env: &Env,
+    file: &mut File,
+    option: CompactionOption,
+    pick: impl FnOnce(Option<&DataFile>, &File) -> RawRoute,
+) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let txn = env.read_txn()?;
+    let plan = Plan::new(env, &txn, option)?;
+    let src = plan.data_file(env);
+    let src = src.filter(|s| pick(Some(s), file) == RawRoute::FileCopy);
+    let base = file.stream_position()?;
+    let mut silent = |_: CopyProgress| {};
+    let mut progress = Progress::start(plan.total, &mut silent);
+    let len = plan.write(env, &txn, file, base, src.as_ref(), &mut progress)?;
+    file.seek(SeekFrom::Start(base + len))?;
+    Ok(())
+}
+
+/// How a raw copy moves the snapshot's pages (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawRoute {
+    /// Positioned writes straight from the map, as LMDB's `mdb_env_copyfd`.
+    Stream,
+    /// `std::io::copy` of the image's bytes from the data file:
+    /// `copy_file_range` on Linux (taken only where it clones blocks), a
+    /// read/write loop elsewhere (tests only).
+    FileCopy,
+    /// `std::fs::copy` of the whole data file into a staging directory, then
+    /// trimmed: `fclonefileat` on macOS.
+    Clone,
+}
+
+/// The route of a raw copy to `dest`. `may_clone` is false when a progress
+/// callback is watching (a clone has no intermediate progress).
+fn path_route(src: Option<&DataFile>, dest: &Path, data_end: u64, may_clone: bool) -> RawRoute {
+    let Some(src) = src else {
+        return RawRoute::Stream;
+    };
+    if cfg!(target_os = "linux") {
+        // The staging file is created in `dest`'s directory.
+        let dir = match dest.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        };
+        let dev = std::fs::metadata(dir).ok().map(|m| m.dev());
+        if src.reflinks_to(dev) {
+            RawRoute::FileCopy
+        } else {
+            RawRoute::Stream
+        }
+    } else if cfg!(target_os = "macos") && may_clone && clone_is_bounded(src.len, data_end) {
+        RawRoute::Clone
+    } else {
+        RawRoute::Stream
+    }
+}
+
+/// The route of a raw copy into the open `file`: only Linux has an in-kernel
+/// copy into an arbitrary descriptor through std (`copy_file_range`).
+fn open_file_route(src: Option<&DataFile>, file: &File) -> RawRoute {
+    let dev = file.metadata().ok().map(|m| m.dev());
+    match src {
+        Some(src) if cfg!(target_os = "linux") && src.reflinks_to(dev) => RawRoute::FileCopy,
+        _ => RawRoute::Stream,
+    }
+}
+
+/// Filesystems on which Linux `copy_file_range` within one filesystem shares
+/// blocks (a reflink) instead of copying bytes. Elsewhere (ext4, tmpfs,
+/// overlayfs, NFS, ...) the kernel copies the bytes through a pipe, which was
+/// measured slower than writing from the map (ext4: about twice the time).
+const REFLINK_FILESYSTEMS: [&str; 3] = ["xfs", "btrfs", "bcachefs"];
+
+/// The type of the filesystem mounted at the deepest mount point containing
+/// `path` (an absolute, canonical path), from `/proc/self/mountinfo`, or
+/// `None` if it cannot be read. The last matching line wins: a later mount
+/// over the same point hides the earlier one.
+fn filesystem_type(path: &Path) -> Option<String> {
+    let info = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mut best: Option<(usize, String)> = None;
+    for line in info.lines() {
+        // `id parent major:minor root mount-point options... - type source ...`
+        let Some((left, right)) = line.split_once(" - ") else {
+            continue;
+        };
+        let (Some(mount_point), Some(fs_type)) = (left.split(' ').nth(4), right.split(' ').next())
+        else {
+            continue;
+        };
+        let mount_point = unescape_mountinfo(mount_point);
+        let depth = Path::new(&mount_point).components().count();
+        if path.starts_with(&mount_point) && best.as_ref().is_none_or(|(d, _)| depth >= *d) {
+            best = Some((depth, fs_type.to_owned()));
+        }
+    }
+    best.map(|(_, fs_type)| fs_type)
+}
+
+/// Undo mountinfo's octal escapes (`\040` for a space, and so on).
+fn unescape_mountinfo(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes.get(i + 1..i + 4).and_then(|d| {
+            let d = std::str::from_utf8(d).ok()?;
+            u8::from_str_radix(d, 8).ok()
+        });
+        match (bytes[i], octal) {
+            (b'\\', Some(b)) => {
+                out.push(b);
+                i += 4;
+            }
+            (b, _) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether cloning a data file of `file_len` bytes for an image of
+/// `data_end` bytes is bounded by the streaming copy's cost.
+///
+/// `std::fs::copy` does not say whether it cloned. Where it cannot (the
+/// destination is on another volume, or the filesystem has no clones) it
+/// byte-copies the **whole** file, which may be far longer than the
+/// snapshot: under `WRITE_MAP` the file is as long as the map. The clone is
+/// therefore attempted only when such a fallback would copy at most a
+/// quarter more bytes than the streaming copy writes.
+fn clone_is_bounded(file_len: u64, data_end: u64) -> bool {
+    file_len <= data_end.saturating_add(data_end / 4)
+}
+
+/// The env's data file, opened afresh for a raw copy that reads the file
+/// instead of the map, at its own file offset (a `dup` of the env's
+/// descriptor would share the env's offset with any concurrent copy).
+struct DataFile {
+    path: PathBuf,
+    file: File,
+    /// The file's length when it was opened.
+    len: u64,
+    /// Device and inode, which identify the file the env maps.
+    id: (u64, u64),
+    /// Whether the file is on a filesystem where `copy_file_range` within
+    /// the filesystem clones blocks (Linux only; see [`REFLINK_FILESYSTEMS`]).
+    reflinks: bool,
+}
+
+impl DataFile {
+    /// Open the file at the env's data path, or `None` if there is none or it
+    /// is no longer the file the env maps (renamed or replaced since the
+    /// open). Any failure means "stream from the map", never an error.
+    ///
+    /// Opening and closing a second descriptor of the data file releases no
+    /// lock: the env holds its POSIX record locks on the lock file only.
+    fn open(env: &Env) -> Option<DataFile> {
+        let path = env.data_path()?.to_path_buf();
+        let file = File::open(&path).ok()?;
+        let ours = env.try_clone_inner_file().ok()?.metadata().ok()?;
+        let theirs = file.metadata().ok()?;
+        let id = (ours.dev(), ours.ino());
+        if !theirs.is_file() || (theirs.dev(), theirs.ino()) != id {
+            return None;
+        }
+        let reflinks = cfg!(target_os = "linux")
+            && filesystem_type(&path).is_some_and(|t| REFLINK_FILESYSTEMS.contains(&t.as_str()));
+        Some(DataFile {
+            path,
+            file,
+            len: theirs.len(),
+            id,
+            reflinks,
+        })
+    }
+
+    /// Whether `copy_file_range` from this file to a file on device `dev`
+    /// clones blocks: both on the same filesystem, and one that reflinks.
+    fn reflinks_to(&self, dev: Option<u64>) -> bool {
+        self.reflinks && dev == Some(self.id.0)
+    }
+
+    /// Whether `path` still names this file.
+    fn path_still_names_it(&self) -> bool {
+        std::fs::metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.id)
+    }
+}
+
+/// The byte length of a raw image of `txn`'s snapshot.
+fn raw_image_len(env: &Env, txn: &RoTxn<'_>) -> u64 {
+    (txn.snapshot().last_pg + 1) * u64::from(env.page_size())
+}
+
+/// Clone the env's data file to `dest` (macOS: `fclonefileat`), then make the
+/// clone the raw image of `txn`'s snapshot: its two meta pages overwritten
+/// with the snapshot's, and its length trimmed to the snapshot's last page.
+///
+/// The clone lands in a fresh owner-only staging directory beside `dest`
+/// (`fclonefileat` refuses an existing destination, and the directory keeps
+/// anything else from being placed at the clone's path), and is renamed over
+/// `dest` once complete, so `dest` is never seen half-written.
+///
+/// Returns `Ok(false)` without touching `dest` when the result could not be
+/// the snapshot's image: the data path named another file by the time it
+/// was cloned, or the clone is shorter than the image. The caller then
+/// streams from the map.
+fn clone_raw(
+    env: &Env,
+    txn: &RoTxn<'_>,
+    src: &DataFile,
+    dest: &Path,
+    progress: &mut Progress<'_>,
+) -> Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    let data_end = raw_image_len(env, txn);
+    let dir = create_staging_dir(dest)?;
+    let staged = dir.join("data");
+    let _guard = StagingDirGuard {
+        dir: &dir,
+        file: &staged,
+    };
+    std::fs::copy(&src.path, &staged)?;
+    if !src.path_still_names_it() {
+        return Ok(false);
+    }
+    let file = std::fs::OpenOptions::new().write(true).open(&staged)?;
+    // The clone carries the source's mode; make it owner-only, as the
+    // streaming copy's staging file is.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    if file.metadata()?.len() < data_end {
+        return Ok(false);
+    }
+    file.set_len(data_end)?;
+    file.write_all_at(&snapshot_metas(env, txn)?, 0)?;
+    drop(file);
+    // Last callback before `dest` is touched, as on the streaming path.
+    progress.finish();
+    std::fs::rename(&staged, dest)?;
+    Ok(true)
+}
+
+/// Create a fresh owner-only (0700) staging directory beside `dest`, named
+/// as [`create_staging_file`] names its file.
+fn create_staging_dir(dest: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut attempt = 0u32;
+    loop {
+        let tmp = staging_name(dest)?;
+        match std::fs::DirBuilder::new().mode(0o700).create(&tmp) {
+            Ok(()) => return Ok(tmp),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+}
+
+/// Removes a clone's staging file (if still there) and directory on drop.
+struct StagingDirGuard<'p> {
+    dir: &'p Path,
+    file: &'p Path,
+}
+
+impl Drop for StagingDirGuard<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.file);
+        let _ = std::fs::remove_dir(self.dir);
     }
 }
 
@@ -252,18 +615,35 @@ impl Plan {
         }
     }
 
-    /// Write the image into `file` at offset `base`; returns its length.
+    /// The env's data file, for a raw copy that may read it (see
+    /// [`DataFile::open`]); `None` for a compacting copy.
+    fn data_file(&self, env: &Env) -> Option<DataFile> {
+        match self.option {
+            CompactionOption::Disabled => DataFile::open(env),
+            CompactionOption::Enabled => None,
+        }
+    }
+
+    /// Write the image into `file` at offset `base`, which must be `file`'s
+    /// position when `src` is given; returns its length. A raw copy copies
+    /// its pages from `src` when given, from the map otherwise.
     fn write(
         self,
         env: &Env,
         txn: &RoTxn<'_>,
         file: &File,
         base: u64,
+        src: Option<&DataFile>,
         progress: &mut Progress<'_>,
     ) -> Result<u64> {
-        match self.option {
-            CompactionOption::Disabled => write_raw(env, txn, file, base, progress),
-            CompactionOption::Enabled => write_compact(env, txn, self.names, file, base, progress),
+        match (self.option, src) {
+            (CompactionOption::Disabled, Some(src)) => {
+                copy_raw_file(env, txn, src, file, base, progress)
+            }
+            (CompactionOption::Disabled, None) => write_raw(env, txn, file, base, progress),
+            (CompactionOption::Enabled, _) => {
+                write_compact(env, txn, self.names, file, base, progress)
+            }
         }
     }
 }
@@ -278,19 +658,10 @@ impl Plan {
 /// (and any pre-placed file at a guessed name). The destination path itself
 /// is the caller's; the final rename replaces it.
 fn create_staging_file(dest: &Path) -> Result<(PathBuf, File)> {
-    use std::hash::{BuildHasher, Hasher};
     use std::os::unix::fs::OpenOptionsExt;
-    let file_name = dest
-        .file_name()
-        .ok_or_else(|| Error::Io(std::io::Error::other("copy destination has no file name")))?;
     let mut attempt = 0u32;
     loop {
-        let nonce = std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish();
-        let mut tmp_name = file_name.to_os_string();
-        tmp_name.push(format!(".copy-tmp-{}-{nonce:016x}", std::process::id()));
-        let tmp = dest.with_file_name(tmp_name);
+        let tmp = staging_name(dest)?;
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -304,6 +675,20 @@ fn create_staging_file(dest: &Path) -> Result<(PathBuf, File)> {
             Err(e) => return Err(Error::Io(e)),
         }
     }
+}
+
+/// A fresh staging name beside `dest`: `<name>.copy-tmp-<pid>-<nonce>`.
+fn staging_name(dest: &Path) -> Result<PathBuf> {
+    use std::hash::{BuildHasher, Hasher};
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| Error::Io(std::io::Error::other("copy destination has no file name")))?;
+    let nonce = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let mut tmp_name = file_name.to_os_string();
+    tmp_name.push(format!(".copy-tmp-{}-{nonce:016x}", std::process::id()));
+    Ok(dest.with_file_name(tmp_name))
 }
 
 /// Drives a [`CopyProgress`] sequence: fixed `total`, monotone `done`, a
@@ -371,16 +756,85 @@ fn write_raw(
     base: u64,
     progress: &mut Progress<'_>,
 ) -> Result<u64> {
-    use std::os::unix::fs::FileExt;
     let psize = env.page_size();
     let ps = psize as usize;
     let snap = txn.snapshot();
-    // Pages 0..=last_pg. Slots 0/1 are synthesized below; the rest are data.
+    // Pages 0..=last_pg. Slots 0/1 are synthesized; the rest are data.
     let n_pages = snap.last_pg + 1;
     let data_end = (snap.last_pg as usize + 1) * ps;
     let map = txn.map_bytes();
     let src = map.get(..data_end).ok_or(Error::Mdb(MdbError::Invalid))?;
 
+    file.write_all_at(&snapshot_metas(env, txn)?, base)?;
+
+    // Data pages in chunks, so progress is observable.
+    let pages_per_chunk = pages_per_chunk(n_pages, psize);
+    let mut pg = FIRST_DATA_PGNO.min(n_pages);
+    while pg < n_pages {
+        let end = (pg + pages_per_chunk).min(n_pages);
+        let (from, to) = (pg as usize * ps, end as usize * ps);
+        file.write_all_at(&src[from..to], base + from as u64)?;
+        pg = end;
+        progress.advance_to(pg);
+    }
+    Ok(data_end as u64)
+}
+
+/// Raw copy from the data file (see the module docs): the image's bytes
+/// `[0, (last_pg + 1) × page_size)` copied from `src` with `std::io::copy`
+/// into `file` at its current position `base`, in the streaming copy's
+/// chunks, then the two meta pages overwritten with the snapshot's. Returns
+/// the image length.
+fn copy_raw_file(
+    env: &Env,
+    txn: &RoTxn<'_>,
+    src: &DataFile,
+    file: &File,
+    base: u64,
+    progress: &mut Progress<'_>,
+) -> Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let psize = env.page_size();
+    let n_pages = txn.snapshot().last_pg + 1;
+    let chunk_pages = pages_per_chunk(n_pages, psize);
+    let mut reader = &src.file;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut writer = file;
+    let mut pg = 0;
+    while pg < n_pages {
+        let end = (pg + chunk_pages).min(n_pages);
+        let want = (end - pg) * u64::from(psize);
+        // `File` to `File`: std copies in the kernel where it can.
+        let got = std::io::copy(&mut reader.take(want), &mut writer)?;
+        if got != want {
+            // The data file is shorter than the snapshot it holds: corrupt.
+            return Err(Error::Mdb(MdbError::Invalid));
+        }
+        pg = end;
+        progress.advance_to(pg);
+    }
+    // The file's own meta pages were copied too; replace them.
+    file.write_all_at(&snapshot_metas(env, txn)?, base)?;
+    Ok(n_pages * u64::from(psize))
+}
+
+/// Pages per chunk of a raw copy. The chunk is sized relative to the env
+/// (~`PROGRESS_STEPS` reports keep the callback rate bounded and the
+/// resolution usable at every scale) and capped so one write stays a bounded
+/// syscall. It is a reporting granularity only and does not affect one byte
+/// of the output.
+fn pages_per_chunk(n_pages: u64, psize: u32) -> u64 {
+    const PROGRESS_STEPS: u64 = 32;
+    const MAX_CHUNK_BYTES: u64 = 64 << 20;
+    (n_pages / PROGRESS_STEPS).clamp(1, MAX_CHUNK_BYTES / u64::from(psize))
+}
+
+/// The raw image's two meta slots, both built for `txn`'s snapshot, so the
+/// copy opens at exactly that snapshot (SPEC 00 row 17).
+fn snapshot_metas(env: &Env, txn: &RoTxn<'_>) -> Result<Vec<u8>> {
+    let psize = env.page_size();
+    let ps = psize as usize;
+    let snap = txn.snapshot();
     // Synthesize both meta slots from the pinned snapshot — the copy is a
     // self-contained env at snapshot T, freelist preserved (SPEC 02 §3).
     // Format v2 (ADR-0022): the snapshot's free-list annex rides along —
@@ -406,25 +860,7 @@ fn write_raw(
     meta.pgno = 1;
     meta.encode_with_annex(&mut metas[ps..2 * ps], &snap.free_annex)
         .map_err(corrupt)?;
-    file.write_all_at(&metas, base)?;
-
-    // Data pages in chunks, so progress is observable. The chunk is sized
-    // relative to the env (~`PROGRESS_STEPS` reports keep the callback rate
-    // bounded and the resolution usable at every scale) and capped so one
-    // write stays a bounded syscall. The chunk size is a reporting
-    // granularity only and does not affect one byte of the output.
-    const PROGRESS_STEPS: u64 = 32;
-    const MAX_CHUNK_BYTES: u64 = 64 << 20;
-    let pages_per_chunk = (n_pages / PROGRESS_STEPS).clamp(1, MAX_CHUNK_BYTES / u64::from(psize));
-    let mut pg = FIRST_DATA_PGNO.min(n_pages);
-    while pg < n_pages {
-        let end = (pg + pages_per_chunk).min(n_pages);
-        let (from, to) = (pg as usize * ps, end as usize * ps);
-        file.write_all_at(&src[from..to], base + from as u64)?;
-        pg = end;
-        progress.advance_to(pg);
-    }
-    Ok(data_end as u64)
+    Ok(metas)
 }
 
 /// The custom-comparator scope boundary (SPEC 03 §2.0): refuse a compacting
@@ -473,7 +909,6 @@ fn write_compact(
     base: u64,
     progress: &mut Progress<'_>,
 ) -> Result<u64> {
-    use std::os::unix::fs::FileExt;
     use std::sync::mpsc;
     std::thread::scope(|scope| {
         // Bounded: one buffer queued, one being written, one being filled.
@@ -661,3 +1096,7 @@ impl Drop for TmpGuard<'_> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "copy_tests.rs"]
+mod tests;

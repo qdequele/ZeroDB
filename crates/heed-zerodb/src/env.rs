@@ -768,7 +768,9 @@ impl<T> Env<T> {
         use zerodb::CopyToFile;
         // Pages go straight into `file` from the current position, as
         // `mdb_env_copyfd2` writes them (the raw mode straight from the map,
-        // the compacting mode through a write buffer). No staging copy: the
+        // or on Linux, onto the data file's own XFS, btrfs or bcachefs
+        // filesystem, cloned from the data file with `copy_file_range`; the
+        // compacting mode through a write buffer). No staging copy: the
         // image is written once, never read back.
         self.inner
             .copy_to_open_file(file, zdb_compaction(option))
