@@ -146,6 +146,7 @@ ascending order leaves on the table.
 | `del/clear/all` | the whole tree dropped in one operation | page-list work, not per-key work (leaves freed from their parents unread) |
 | `del/churn/reinsert` | delete and re-insert alternating: freed pages must be reclaimed and handed straight back out | free-list churn, SPEC 05 |
 | `del/batch/k1000` | 10,000 random deletes in 1,000-key txns from 50k random-order inserts of 1,200-byte values | the copy-on-write copy (ADR-0030) and descent misses: crud-bench `batch_delete_1000` |
+| `del/random/n1` | 50k keys of 1,536-byte values emptied in shuffled order, one delete per txn | per-commit cost with a full meta free-list annex: the meta CRC (ADR-0031); crud-bench `delete` |
 
 A gap concentrated in `churn/reinsert` is a reclamation finding. A gap spread
 evenly across `bulk/*` is a tree finding. `range/half ÷ bulk/half` says how much

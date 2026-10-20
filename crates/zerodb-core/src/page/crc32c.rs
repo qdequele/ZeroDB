@@ -1,16 +1,24 @@
-//! CRC32C (Castagnoli) — in-house software table implementation
-//! (slicing-by-8).
+//! CRC32C (Castagnoli): a hardware path on aarch64 and an in-house software
+//! table (slicing-by-8) everywhere else.
 //!
 //! Polynomial `0x1EDC6F41` (reflected form `0x82F6_3B78`), reflected input and
 //! output, initial value `0xFFFF_FFFF`, final XOR `0xFFFF_FFFF`. This is the
 //! algorithm mandated by [ADR-0002 §D1] and used for the mandatory meta-page CRC
-//! (SPEC 02 §3.3). Any hardware path (the ARMv8-A `crc32c*` instructions
-//! compute exactly this polynomial) must agree bit-for-bit with these tables.
+//! (SPEC 02 §3.3).
+//!
+//! On aarch64 CPUs with the `crc` feature (every Graviton and Apple M-series
+//! core; mandatory from ARMv8.1), the ARMv8 `crc32c*` instructions compute
+//! exactly this polynomial, eight bytes per instruction ([ADR-0031]). The
+//! feature is detected at run time, because the `aarch64-unknown-linux-gnu`
+//! target does not enable it at compile time. The table path serves every
+//! other CPU and miri, and both must agree bit for bit with the byte-wise
+//! reference below.
 //!
 //! In-house rather than a dependency (ADR-0002 §D1: no CRC crate is on the
 //! allowlist).
 //!
 //! [ADR-0002 §D1]: ../../../../docs/adr/0002-on-disk-format.md
+//! [ADR-0031]: ../../../../docs/adr/0031-hardware-crc32c.md
 
 /// Reflected CRC32C generator polynomial: bit-reversal of `0x1EDC6F41`.
 const POLY_REFLECTED: u32 = 0x82F6_3B78;
@@ -66,17 +74,49 @@ fn crc_update_bytewise(mut crc: u32, bytes: &[u8]) -> u32 {
     crc
 }
 
-/// Fold `bytes` into a running (non-finalized) CRC32C state. The single source
-/// of the table step, shared by [`crc32c`] and [`crc32c_concat`] so the two
-/// cannot drift if the tables or algorithm ever change.
-///
-/// Slicing-by-8: each 8-byte block is XORed into the state and folded through
+/// Fold `bytes` into a running (non-finalized) CRC32C state, on the hardware
+/// path when this CPU has it and on the table path otherwise. The single entry
+/// point shared by [`crc32c`] and [`crc32c_concat`], so the two cannot drift.
+#[inline]
+fn crc_update(crc: u32, bytes: &[u8]) -> u32 {
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        // ADR-0031: the one sanctioned `unsafe` in this module.
+        // SAFETY: `crc_update_hw`'s only precondition is the `crc` CPU feature
+        // its `#[target_feature]` names, and this CPU has it (detected on the
+        // line above). Its body does no pointer or memory-unsafe work.
+        #[allow(unsafe_code)]
+        return unsafe { crc_update_hw(crc, bytes) };
+    }
+    crc_update_table(crc, bytes)
+}
+
+/// The hardware path: the ARMv8 CRC32C instructions, eight bytes per
+/// `crc32cx` and the trailing `len % 8` bytes one `crc32cb` each. Callable
+/// only where the `crc` feature is present (see [`crc_update`]).
+#[cfg(all(target_arch = "aarch64", not(miri)))]
+#[target_feature(enable = "crc")]
+fn crc_update_hw(mut crc: u32, bytes: &[u8]) -> u32 {
+    use std::arch::aarch64::{__crc32cb, __crc32cd};
+    let (words, rest) = bytes.as_chunks::<8>();
+    for w in words {
+        // Little-endian, so the word's first byte is the first one folded,
+        // as the reflected CRC consumes the stream.
+        crc = __crc32cd(crc, u64::from_le_bytes(*w));
+    }
+    for &byte in rest {
+        crc = __crc32cb(crc, byte);
+    }
+    crc
+}
+
+/// The table path, slicing-by-8: each 8-byte block is XORed into the state and folded through
 /// eight table lookups that do not depend on each other, then the last
 /// `len % 8` bytes go through the byte-wise step. The result is bit-identical
 /// to the byte-wise algorithm (pinned by the tests below), about five times
 /// faster on the meta CRC that every commit computes.
 #[inline]
-fn crc_update(mut crc: u32, bytes: &[u8]) -> u32 {
+fn crc_update_table(mut crc: u32, bytes: &[u8]) -> u32 {
     let (blocks, tail) = bytes.as_chunks::<8>();
     for b in blocks {
         let lo = u32::from_le_bytes([b[0], b[1], b[2], b[3]]) ^ crc;
@@ -117,7 +157,7 @@ pub fn crc32c_concat(parts: &[&[u8]]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{crc32c, crc32c_concat, crc_update, crc_update_bytewise};
+    use super::{crc32c, crc32c_concat, crc_update, crc_update_bytewise, crc_update_table};
     use proptest::prelude::*;
 
     /// Proptest config that also runs under miri: failure persistence writes a
@@ -132,7 +172,8 @@ mod tests {
     }
 
     /// Every length from 0 to 40 (each block/remainder split) and the meta
-    /// CRC's own lengths: slicing-by-8 equals the byte-wise reference.
+    /// CRC's own lengths: the dispatched path (hardware where this CPU has
+    /// it, else slicing-by-8) equals the byte-wise reference.
     #[test]
     fn sliced_equals_bytewise_every_split() {
         let data: Vec<u8> = (0..400u32)
@@ -153,7 +194,7 @@ mod tests {
 
     proptest! {
         #![proptest_config(prop_config())]
-        /// Any bytes from any starting state: slicing-by-8 equals the
+        /// Any bytes from any starting state: the dispatched path equals the
         /// byte-wise reference, and a split stream equals the joined one.
         #[test]
         fn sliced_equals_bytewise(
@@ -216,5 +257,78 @@ mod tests {
         assert_eq!(a, b, "same input must yield the same checksum");
         // A single-bit change must change the checksum.
         assert_ne!(a, crc32c(b"The quick brown fox jumps over the lazy dov"));
+    }
+
+    /// The table path on its own (the fallback, and what miri and x86-64
+    /// run) equals the byte-wise reference, also on CPUs whose dispatched
+    /// path is the hardware one: every length 0–300 from every block offset,
+    /// from three starting states, and whole 4 and 16 KiB pages.
+    #[test]
+    fn table_path_equals_bytewise() {
+        let data: Vec<u8> = (0..16 * 1024 + 16u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let max_len = if cfg!(miri) { 40 } else { 300 };
+        for start in 0..8 {
+            for len in 0..=max_len {
+                let s = &data[start..start + len];
+                for init in [0xFFFF_FFFF, 0, 0x1234_5678] {
+                    assert_eq!(
+                        crc_update_table(init, s),
+                        crc_update_bytewise(init, s),
+                        "start {start} len {len} init {init:#x}"
+                    );
+                }
+            }
+        }
+        for len in [4096, 16 * 1024] {
+            let s = &data[..len];
+            assert_eq!(
+                crc_update_table(0xFFFF_FFFF, s),
+                crc_update_bytewise(0xFFFF_FFFF, s)
+            );
+        }
+    }
+
+    /// ADR-0031: where this CPU has the `crc` feature, the hardware path and
+    /// the table path agree on every length up to 300 bytes from every offset,
+    /// from three starting states, and on whole pages up to 64 KiB. On other
+    /// CPUs the test checks nothing: the table path is the only path.
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    #[test]
+    fn hardware_path_matches_table_path() {
+        if !std::arch::is_aarch64_feature_detected!("crc") {
+            return;
+        }
+        let data: Vec<u8> = (0..64 * 1024 + 16u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let hw = |crc: u32, s: &[u8]| {
+            // SAFETY: the `crc` feature was detected at the top of this test.
+            #[allow(unsafe_code)]
+            unsafe {
+                super::crc_update_hw(crc, s)
+            }
+        };
+        for start in 0..16 {
+            for len in 0..=300 {
+                let s = &data[start..start + len];
+                for init in [0xFFFF_FFFF, 0, 0x1234_5678] {
+                    assert_eq!(
+                        hw(init, s),
+                        crc_update_table(init, s),
+                        "start {start} len {len} init {init:#x}"
+                    );
+                }
+            }
+        }
+        for len in [4096 - 176, 4096, 16 * 1024, 64 * 1024] {
+            let s = &data[..len];
+            assert_eq!(
+                hw(0xFFFF_FFFF, s),
+                crc_update_table(0xFFFF_FFFF, s),
+                "len {len}"
+            );
+        }
     }
 }

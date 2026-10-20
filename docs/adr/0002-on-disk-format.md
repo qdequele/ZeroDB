@@ -30,7 +30,9 @@ CRC32C, polynomial `0x1EDC6F41` (reflected in/out, init/final `0xFFFFFFFF`).
 Used for the **mandatory meta CRC** (Phase 1) and the **reserved data-page
 checksum** field (Phase 3.9). Phase 1 implementation is a software table; Phase
 3.9 switches to the ARMv8-A `crc32c*` hardware instructions (primary target is
-Graviton — CLAUDE.md), which compute exactly this polynomial.
+Graviton — CLAUDE.md), which compute exactly this polynomial. (Update
+2026-10-19: the meta CRC takes those instructions on aarch64 CPUs that have
+them, with the table as fallback — ADR-0031.)
 
 - *Alternatives:* CRC32 (ISO/zlib, poly `0x04C11DB7`) — no dedicated ARM
   instruction, so slower and pointless when CRC32C has one. xxHash/xxh3 — faster

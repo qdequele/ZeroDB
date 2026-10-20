@@ -18,12 +18,15 @@
 //!   under loom via the [`sync`] shim (`just loom`).
 
 #![deny(missing_docs)]
-// `deny`, not `forbid`: the unsafe policy sanctions two homes in this crate —
+// `deny`, not `forbid`: the unsafe policy sanctions three homes in this crate —
 // the unchecked page-field readers in `page::raw` (allow on its `mod`
-// declaration; docs/PERF-GAP-VS-LMDB.md, byte-copy field reads) and the one
+// declaration; docs/PERF-GAP-VS-LMDB.md, byte-copy field reads), the one
 // call of the WRITE_MAP in-place map-slice broker, `dirty::map_mut` (ADR-0021;
-// allow on that fn, SAFETY contract stated there). The `Backing::map_dirty_page`
-// trait method in `env` carries a declaration-only allow (ADR-0021 B1 requires
+// allow on that fn, SAFETY contract stated there), and the one call of the
+// aarch64 hardware CRC32C function in `page::crc32c` after CPU-feature
+// detection (ADR-0031; allow on that call and on its test's twin). The
+// `Backing::map_dirty_page` trait method in `env` carries a declaration-only
+// allow (ADR-0021 B1 requires
 // the broker to be an `unsafe fn`; its default body is trivially safe).
 // Everything else in this crate is unsafe-free and the lint keeps it that way.
 #![deny(unsafe_code)]
