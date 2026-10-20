@@ -72,6 +72,10 @@ trusted-file mode) so the default stays a faithful drop-in.
   through the safe `SharedRegion` trait;
 - the in-place `WRITE_MAP` path in `zerodb-core::dirty` (ADR-0021), detailed
   below;
+- the CRC32C hardware path in `zerodb-core::page::crc32c` (ADR-0031): the one
+  call of the `#[target_feature(enable = "crc")]` checksum function, guarded
+  by runtime detection of that aarch64 CPU feature, and the same call in that
+  module's test comparing it with the table path;
 - FFI inside `zerodb-oracle`;
 - the minimal API-shape `unsafe` in `heed-zerodb` that heed's pointer model
   requires: `Send` impls, TLS-marker retags, the lifetime-erased write cursor,

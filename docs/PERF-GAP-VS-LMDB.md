@@ -332,7 +332,11 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
 ## Deliberate differences
 
 - **Meta CRC32C** (ADR-0002) — one checksum per commit and meta read; crash
-  recovery depends on it to detect torn writes. LMDB has none.
+  recovery depends on it to detect torn writes. LMDB has none. It covers the
+  meta free-list annex (up to a page of ids). On aarch64 it uses the ARMv8
+  `crc32c` instructions (ADR-0031): about 2 µs at a full 16 KiB page on the
+  Mac, 0.75 µs on Graviton4; elsewhere the slicing-by-8 table, about 9 µs
+  (`benches/results/2026-10-19-meta-crc-hardware.md`).
 - **Page validation by default** — a corrupt page gives a typed error, never
   undefined behaviour. Removing it is opt-in only, through trusted-file mode
   (ADR-0014).

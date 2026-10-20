@@ -18,6 +18,12 @@
 //! * `batch/k1000` deletes random keys 1,000 per txn from a randomly inserted
 //!   tree of ~1.2 KB values (crud-bench's `batch_delete_1000`): nearly every
 //!   delete copies a different leaf, so the copy-on-write copy dominates.
+//! * `random/n1` empties a tree of 1.5 KiB values (crud-bench's document size)
+//!   in shuffled order, one delete per committed txn. Per-commit cost
+//!   dominates, and as the tree shrinks the pages it frees pile up in the
+//!   commit's free list (zerodb: the meta page's free-list annex, ADR-0022),
+//!   so it measures commit work that scales with that list. The large values
+//!   give the tree enough leaves for that list to fill.
 
 use criterion::{BatchSize, Criterion, Throughput};
 
@@ -41,6 +47,7 @@ pub fn run(c: &mut Criterion, cfg: &Cfg) {
     clear(c, cfg, &keys, &val);
     churn(c, cfg, &keys, &val);
     batch(c, cfg);
+    random_n1(c, cfg, &keys);
 }
 
 /// Keys per write txn in `batch/k1000`.
@@ -200,6 +207,32 @@ fn churn(c: &mut Criterion, cfg: &Cfg, keys: &[Vec<u8>], val: &[u8]) {
         &Seed::named(cfg.page, keys, val),
         touched,
         val
+    );
+    g.finish();
+}
+
+/// Value size of the `random/n1` tree: about crud-bench's 1.5 KB documents.
+const RANDOM_N1_VAL: usize = 1536;
+
+/// Empty a tree of [`RANDOM_N1_VAL`]-byte values in shuffled order, one
+/// delete per committed txn.
+fn random_n1(c: &mut Criterion, cfg: &Cfg, keys: &[Vec<u8>]) {
+    fn del_each_op<B: Backend>(env: &B::Env, db: B::Db, keys: &[Vec<u8>], _val: &[u8]) {
+        for k in keys {
+            let n = B::delete_keys(env, db, std::slice::from_ref(k));
+            assert_eq!(n, 1, "every delete must hit an existing key");
+        }
+    }
+    let val = vec![0xABu8; RANDOM_N1_VAL];
+    let order = shuffle(keys.to_vec(), 0xDE1E_7E01);
+    let mut g = group(c, "del/random/n1", order.len());
+    pair_op!(
+        wr_loaded,
+        del_each_op,
+        &mut g,
+        &Seed::named(cfg.page, keys, &val),
+        &order,
+        &val
     );
     g.finish();
 }
