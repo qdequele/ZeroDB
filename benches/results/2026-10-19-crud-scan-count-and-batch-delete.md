@@ -21,7 +21,7 @@
 | row | cause | result |
 |---|---|---|
 | `start(5000) limit(100)` | `skip` stepped every skipped entry | already fixed by #118 (`Iterator::nth` crosses whole leaves): ZeroDB is now 2.2–4.6× LMDB's throughput in every round |
-| full `count()` | per-txn validated-pages memo bookkeeping for every leaf, and a long per-entry step | **fixed here**: repro 20 → 34 ops/s against LMDB's 33 (single thread); Graviton4 `scan/full/*` 2.05× → 1.02× LMDB's time, no rung regressed |
+| full `count()` | per-txn validated-pages memo bookkeeping for every leaf, and a long per-entry step | **fixed here**: repro 20 → 34 ops/s against LMDB's 33 (single thread); Graviton4 trusted `scan/full/rev` 2.03× → 1.06× LMDB's time (`fwd` 1.02× and `big` 1.03× read the same way but were drift-flagged), no rung regressed |
 | `batch_delete_1000` | at 16 KiB the copy-on-write copy moving the whole page; LMDB copies only the used bytes | **ADR-0030 accepted and implemented**: ~11 % per delete at 16 KiB (Mac spike), flat at 4 KiB on Graviton4, no rung regressed; the 4 KiB gap (0.78×) is elsewhere |
 
 ## Full `count()`
@@ -257,9 +257,13 @@ outside the excerpt regressed either; all are faster or flat.
 Reading it:
 
 - Full scans: 2.0–2.25× → **1.02–1.06× LMDB's time** under trust, 1.45× when
-  validating. The step change helps both policies; the memo change only the
+  validating. Under trust only `scan/full/rev` (1.06×) passed the drift gate;
+  LMDB itself moved 8.0 % on `fwd` (1.02×) and 5.7 % on `big` (1.03×), so read
+  those two as "about LMDB's speed", not as exact ratios. Their after ÷ before
+  speedups (0.500 and 0.725, ±0.03–0.04) are well outside that drift. The step change helps both policies; the memo change only the
   trusting one.
-- `scan/full/big` (the crud-bench `count()` shape) 1.40× → 1.03× under trust.
+- `scan/full/big` (the crud-bench `count()` shape) 1.40× → 1.03× under trust
+  (drift-flagged, see above).
   When validating it moves less (1.76× → 1.64×): there, each leaf's first view
   pays the cell walk, which this change does not touch.
 - Range scans move ahead of LMDB (0.70–0.74× trusted, 0.83–0.88× validating).
@@ -328,7 +332,7 @@ elsewhere and has not been profiled on Linux yet.
 
 | | |
 |---|---|
-| **Faster** | Full `count()` over a 500k-entry, 0.9 GB tree: 0.57× → ~1.0× LMDB in the repro (single thread), 0.45× → 1.01× in crud-bench medians on a loaded host. Graviton4 (quiet): both policies **improved, 0 regressed**; full scans 2.05× → 1.02× LMDB under trust (1.45× validating), `scan/full/big` 1.40× → 1.03×, range scans 0.70–0.88× LMDB, `get/access/hot` 0.89–0.90× of before. |
+| **Faster** | Full `count()` over a 500k-entry, 0.9 GB tree: 0.57× → ~1.0× LMDB in the repro (single thread), 0.45× → 1.01× in crud-bench medians on a loaded host. Graviton4 (quiet): both policies **improved, 0 regressed**; full scans ~2.0× → 1.02–1.06× LMDB under trust (only `rev`, 1.06×, passed the drift gate; 1.45× validating), `scan/full/big` 1.40× → 1.03× (drift-flagged), range scans 0.70–0.88× LMDB, `get/access/hot` 0.89–0.90× of before. |
 | **Behavior** | Unchanged. `next`/`prev` return the same entries and errors. The memo is a cache: a trusted leaf not recorded is re-checked the same way on its next view. `cargo test --workspace` passes, including the cursor model tests and the oracle differentials. New unit test `trusting_policy_memoizes_branches_but_not_leaves`. |
 | **Safe** | No new `unsafe`. `resolve_value` / `resolve_overflow` are the same code split in two. Clippy `-D warnings` is clean on the host and on `x86_64-unknown-linux-gnu`, and fmt is clean. `cargo +nightly miri test -p zerodb-core` passes. Differential fuzz `just fuzz-quick`: `diff_ops` 44,530 runs in 10 min, image-open 3.18 M runs, no finding. |
 | **Durable** | No write path touched. `just crash-test-quick` passes: 229 single-process cycles (15 image cuts, 45 SIGKILL) and 57 multi-process cycles verified. |
@@ -346,7 +350,7 @@ elsewhere and has not been profiled on Linux yet.
 
 | | |
 |---|---|
-| **Faster** | ~11 % per batch delete at 16 KiB pages (Mac spike, busy host). Flat at 4 KiB on Graviton4: repro within 3 %, criterion `^(del|put|commit/batch)/` flat with 0 regressed and `commit/batch/n1` 0.960. |
+| **Faster** | ~11 % per batch delete at 16 KiB pages (Mac spike, busy host). Flat at 4 KiB on Graviton4: repro within 3 %, criterion `^(del\|put\|commit/batch)/` flat with 0 regressed and `commit/batch/n1` 0.960. |
 | **Behavior** | Unchanged through every API: a copy's header, pointer array and cells are byte-identical to its source's, so every view reads the same entries. `cargo test --workspace` passes, including `writemap_in_place.rs` (heap vs in-place `WRITE_MAP` results) and `rightmost_finger.rs` (byte-identical files across two runs of one mode). New tests `copy_tests::copies_the_used_bytes_and_leaves_the_gap`, `copy_tests::bad_bounds_copy_the_whole_page`, `insert_copy_into_a_spare_copies_the_used_bytes`. |
 | **Safe** | No new `unsafe`. The two copied ranges come from bounds that pass the same check every view runs (`lower` even, `lower <= upper <= body`); any other source is copied whole. Miri on `zerodb-core` passes; clippy clean on host and `x86_64-unknown-linux-gnu`. |
 | **Durable** | Commit ordering, barriers and the bytes recovery reads are unchanged. Crash smoke: 213 single-process cycles (14 image cuts, 43 SIGKILL) and 57 multi-process cycles verified. |

@@ -98,8 +98,8 @@ on, five rungs regress, and their rows below give both figures.
 | First/last (`scan/edge/first_last`) | 1.66× | E |
 | `len` of a DB (`scan/meta/len`) | 1.00× | E |
 | Range scans, opt-in trusted mode | 1.19–1.21× | E |
-| Full scan, opt-in trusted mode (`scan/full/fwd`, Graviton4) | 1.02× (was 2.05×) | X |
-| Full scan over a 300 MB tree, opt-in trusted mode (`scan/full/big`, Graviton4) | 1.03× (was 1.40×) | X |
+| Full scan, opt-in trusted mode (`scan/full/rev`, Graviton4) | 1.06× (was 2.03×); `scan/full/fwd` 1.02× (was 2.05×), LMDB drift 8 % in that run | X |
+| Full scan over a 300 MB tree, opt-in trusted mode (`scan/full/big`, Graviton4) | 1.03× (was 1.40×), LMDB drift 5.7 % in that run | X |
 
 ### Writes
 

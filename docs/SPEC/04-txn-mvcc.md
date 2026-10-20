@@ -844,8 +844,12 @@ dirty-page store must be built so it is.
   Reuse happens only at `&mut` boundaries within a txn (TXN-43) and across txn
   ends otherwise, so the stability guarantee above is untouched; run frames and
   in-map frames (TXN-45b) are never pooled.*
-- **TXN-42** — COW (SPEC 03 §5) allocates a fresh frame, `memcpy`s the source
-  page into it, and inserts it; it never edits a frame's backing identity.
+- **TXN-42** — COW (SPEC 03 §5) allocates a fresh frame, copies the source
+  page into it, and inserts it. *(Amended 2026-10-19, ADR-0030.)* The copy
+  moves the used bytes only, the header and pointer array
+  `[0, HEADER + lower)` and the cell heap `[HEADER + upper, psize)`; the free
+  gap keeps the frame's or map page's previous bytes. A source whose bounds do
+  not check, and a freshly allocated heap frame, are copied whole. COW it never edits a frame's backing identity.
   Editing an already-dirty page (SPEC 03 §5 rule 2) writes in place within its
   existing frame — allowed under TXN-39 only because such an edit is itself a
   `&mut` op, so no read borrow is outstanding.
