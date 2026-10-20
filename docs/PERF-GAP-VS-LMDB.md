@@ -321,8 +321,9 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
   on-disk format change that needs approval.
 - Consumer-facing APIs beyond LMDB: batched lookups (#53), single-descent
   get-merge-put (#52), group commit (#36), relaxed durability (#35), prefetch
-  hints (#57), map warm-up (#61), reflink copies (#64), parallel `check`
-  (#65).
+  hints (#57), map warm-up (#61), reflink copies (#64). `check` is now
+  parallel (#65; a 2.1 GB env checks in 0.17 s instead of 0.42 s on an
+  8-core Mac, warm cache); LMDB has no checker to compare with.
 
 ## Deliberate differences
 

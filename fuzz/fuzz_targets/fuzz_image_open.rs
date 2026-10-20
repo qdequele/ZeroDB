@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use libfuzzer_sys::fuzz_target;
-use zerodb_core::check::check_image;
+use zerodb_core::check::check_image_with_threads;
 use zerodb_core::env::testutil::VecBacking;
 use zerodb_core::env::{open_with_backing, DurabilityFlags, Env};
 use zerodb_core::page::{crc32c, FORMAT_VERSION, MAGIC, P_META};
@@ -33,8 +33,10 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Open one image and, if it opens, run reads + a mutation attempt over it.
 fn exercise(img: Vec<u8>) {
-    // The checker must terminate quickly on anything (H3).
-    let _ = check_image(&img, PS);
+    // The checker must terminate quickly on anything (H3), and its parallel
+    // walk must report exactly what the serial walk reports.
+    let serial = check_image_with_threads(&img, PS, 1);
+    assert_eq!(check_image_with_threads(&img, PS, 2), serial);
 
     let path = PathBuf::from(format!(
         "/virtual/fuzz-image-open-{}",
