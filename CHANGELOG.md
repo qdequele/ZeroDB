@@ -6,6 +6,38 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### Copy-on-write copies only a page's used bytes (ADR-0030)
+
+When a write transaction first modifies a page, ZeroDB copied all of it. It now
+copies the header with the pointer array and the cell area and skips the free
+gap between them, as LMDB's `mdb_page_copy` does. The gap of a copied page keeps
+whatever its new page held before; nothing reads it, and ZeroDB already left
+stale bytes there when a cell was removed. The on-disk format and recovery are
+unchanged. Files written in heap mode and in in-place `WRITE_MAP` mode can now
+differ in those gap bytes. Batch deletes at 16 KiB pages gain about 11 %; at
+4 KiB pages (Graviton4) the change is flat, with nothing regressed. New
+benchmark rung `del/batch/k1000`.
+
+### Faster full scans over large trees under the trusting policy
+
+A full scan (`iter().count()`, a `for` loop over `iter`) over a tree much larger
+than the CPU caches ran at about half LMDB's speed. Two causes, both fixed:
+
+- Under the trusting file policy (ADR-0014), every leaf a scan visited was
+  recorded in the read transaction's validated-pages memo. A scan sees each leaf
+  once, so the memo grew to megabytes and every probe missed through all its
+  levels. Trusted leaves are no longer recorded; branches still are (ADR-0014
+  amendment 2026-10-19). The header checks on each leaf view are unchanged, and
+  the default validating policy is untouched.
+- A cursor step within a leaf now reads the entry from the leaf view it already
+  holds, as LMDB's `mdb_cursor_next` does, instead of re-deriving the position.
+
+In a crud-bench-shaped repro (500k entries, ~0.9 GB), a full count went from
+0.57× to about 1.0× LMDB. On Graviton4, full scans take 1.45× LMDB's time
+(was 2.25×) under the default policy and about LMDB's time (1.02–1.06×, was
+~2.0×) under the trusting one; range scans and point gets got faster too, and no rung regressed. New
+benchmark rung `scan/full/big`. Numbers:
+`benches/results/2026-10-19-crud-scan-count-and-batch-delete.md`.
 ### A deleted environment no longer blocks opening an unrelated one (#123)
 
 ZeroDB refuses a second open of a lock file this process already has open,

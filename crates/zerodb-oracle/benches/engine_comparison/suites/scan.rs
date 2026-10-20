@@ -13,7 +13,7 @@
 
 use criterion::{Criterion, Throughput};
 
-use crate::data::{ascending_keys, N, N_PROBE, VAL};
+use crate::data::{ascending_keys, shuffled_keys, N, N_BIG, N_PROBE, VAL, VAL_BIG};
 use crate::harness::{ro_repeat, ro_span, ro_whole, Backend, Fixture, Group, Seed};
 use crate::{pair, pair_shape, Cfg};
 
@@ -29,6 +29,7 @@ pub fn run(c: &mut Criterion, cfg: &Cfg) {
     let val = vec![0xABu8; VAL];
 
     full(c, cfg, &keys, &val);
+    full_big(c, cfg);
     skips(c, cfg, &keys, &val);
     ranges(c, cfg, &keys, &val);
     edges(c, cfg, &keys, &val);
@@ -49,6 +50,21 @@ fn full(c: &mut Criterion, cfg: &Cfg, keys: &[Vec<u8>], val: &[u8]) {
         &mut g,
         &Seed::named(cfg.page, keys, val)
     );
+    g.finish();
+}
+
+/// A forward walk over a tree far larger than the CPU caches, built by
+/// random-order inserts of about crud-bench-sized documents: each step's cell
+/// read is a cache miss, so the rung measures how many misses a step keeps in
+/// flight — what crud-bench's `count()` scan exercises — rather than the
+/// cache-resident step cost `scan/full/fwd` measures.
+fn full_big(c: &mut Criterion, cfg: &Cfg) {
+    let keys = shuffled_keys(N_BIG, 0x5CA1_AB1E);
+    let val = vec![0xCDu8; VAL_BIG];
+    let mut g = c.benchmark_group("scan/full/big");
+    g.throughput(Throughput::Elements(N_BIG as u64));
+    crate::heavy(&mut g);
+    pair!(ro_whole, scan, &mut g, &Seed::named(cfg.page, &keys, &val));
     g.finish();
 }
 

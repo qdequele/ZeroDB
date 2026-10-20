@@ -510,12 +510,12 @@ fn leaf_view_over<'a>(
                     // in for the cell walk, as in LMDB; the O(1) header checks
                     // (page type included) still run. Tested only on a memo
                     // miss, keeping the option off the memo-hit path.
-                    // Recorded like a validated
-                    // page, so later views of it take the same zero-check hit
-                    // path (the kind tag was just checked).
-                    let leaf = LeafRef::new_prevalidated(bytes, psize)?;
-                    v.insert(pgno, PageKind::Leaf);
-                    Ok(leaf)
+                    // Not recorded, unlike a trusted branch (ADR-0014
+                    // amendment 2026-10-19): a scan views each leaf once, and
+                    // recording every leaf grew the memo until each probe
+                    // missed through all its levels, as LMDB keeps no such
+                    // table. The header checks cost less than that probe.
+                    LeafRef::new_prevalidated(bytes, psize)
                 } else {
                     validate_leaf_miss(bytes, psize, pgno, v)
                 }
@@ -691,6 +691,7 @@ pub(crate) fn node_view<'a>(
 /// slice stays bounded by the snapshot's high-water (`Source::bytes_from`
 /// clamps there), so a corrupt run can only yield wrong bytes or a typed
 /// error, never a read outside the committed map.
+#[inline(always)]
 fn resolve_value<'a>(
     src: Source<'a>,
     psize: u32,
@@ -701,19 +702,32 @@ fn resolve_value<'a>(
     match leaf.value(i) {
         LeafValue::Inline(v) => Ok(v),
         LeafValue::Overflow { head_pgno, dsize } => {
-            let run = src.bytes_from(psize, head_pgno)?;
-            if valid.is_some_and(ValidatedPages::trusts_file) {
-                let end = crate::page::HEADER_SIZE + dsize as usize;
-                return run
-                    .get(crate::page::HEADER_SIZE..end)
-                    .ok_or(PageError::BufferTooSmall {
-                        got: run.len(),
-                        psize: end,
-                    });
-            }
-            OverflowRef::new(run, psize)?.payload(dsize)
+            resolve_overflow(src, psize, head_pgno, dsize, valid)
         }
     }
+}
+
+/// The overflow arm of [`resolve_value`], kept out of line so the inline
+/// arm stays small where it is inlined into the cursor steps.
+#[inline(never)]
+fn resolve_overflow<'a>(
+    src: Source<'a>,
+    psize: u32,
+    head_pgno: u64,
+    dsize: u32,
+    valid: Option<&ValidatedPages<'_>>,
+) -> Result<&'a [u8], PageError> {
+    let run = src.bytes_from(psize, head_pgno)?;
+    if valid.is_some_and(ValidatedPages::trusts_file) {
+        let end = crate::page::HEADER_SIZE + dsize as usize;
+        return run
+            .get(crate::page::HEADER_SIZE..end)
+            .ok_or(PageError::BufferTooSmall {
+                got: run.len(),
+                psize: end,
+            });
+    }
+    OverflowRef::new(run, psize)?.payload(dsize)
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,8 +1319,13 @@ impl<'a> Cursor<'a> {
             .expect("initialized cursor has a leaf frame");
         let leaf = self.leaf_at(pgno)?;
         if ki + 1 < leaf.num_keys() {
-            self.stack.last_mut().expect("leaf frame").1 = ki + 1;
-            return self.current();
+            // Same leaf: bump the slot and read the entry from the leaf view
+            // already in hand, as LMDB's `mdb_cursor_next` reads the node
+            // right after `mc_ki++`, rather than re-deriving it in `current`.
+            let ki = ki + 1;
+            self.stack.last_mut().expect("leaf frame").1 = ki;
+            let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
+            return Ok(Some((leaf.key(ki), v)));
         }
         self.ascend_next()
     }
@@ -1361,12 +1380,19 @@ impl<'a> Cursor<'a> {
             self.eof = false;
             return self.last();
         }
-        let (_, ki) = *self
+        let (pgno, ki) = *self
             .stack
             .last()
             .expect("initialized cursor has a leaf frame");
         if ki > 0 {
-            self.stack.last_mut().expect("leaf frame").1 = ki - 1;
+            // Same leaf: read the entry directly, as `next` does.
+            let ki = ki - 1;
+            self.stack.last_mut().expect("leaf frame").1 = ki;
+            let leaf = self.leaf_at(pgno)?;
+            if ki < leaf.num_keys() {
+                let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
+                return Ok(Some((leaf.key(ki), v)));
+            }
             return self.current();
         }
         self.ascend_prev()
@@ -1991,6 +2017,31 @@ mod tests {
             ),
             "the page type stays checked when trusted"
         );
+    }
+
+    /// ADR-0014 amendment (2026-10-19): under the trusting policy a branch's
+    /// first view is recorded in the txn memo, so later descents take the
+    /// zero-check view, but a leaf's is not: a scan views each leaf once, and
+    /// recording them grew the memo by a level per four-fold of leaves, making
+    /// every probe miss through all of them. The validating policy still
+    /// records leaves (its memo skips the cell walk).
+    #[test]
+    fn trusting_policy_memoizes_branches_but_not_leaves() {
+        let entries: Vec<_> = (0..2000u16)
+            .map(|i| kv(&i.to_be_bytes(), &[7u8; 40]))
+            .collect();
+        let (img, root, depth) = build(&entries);
+        assert!(depth >= 2, "a branch root over leaves");
+        let trusting = ValidatedPages::for_policy(FileTrust::trusting_for_tests());
+        let br = branch_view(src(&img), PS, root, Some(&trusting)).expect("root branch");
+        let leaf = br.child_pgno(0);
+        leaf_view(src(&img), PS, leaf, Some(&trusting)).expect("leaf");
+        assert!(trusting.contains(root, PageKind::Branch));
+        assert!(!trusting.contains(leaf, PageKind::Leaf));
+
+        let validating = ValidatedPages::new();
+        leaf_view(src(&img), PS, leaf, Some(&validating)).expect("leaf validates");
+        assert!(validating.contains(leaf, PageKind::Leaf));
     }
 
     /// Take this thread's parked memo level, if any.

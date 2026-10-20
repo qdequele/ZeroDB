@@ -15,10 +15,13 @@
 //!   page-list work rather than per-key work.
 //! * `churn/reinsert` alternates delete and re-insert, so freed pages have to be
 //!   reclaimed and handed straight back out. This is the freelist's rung.
+//! * `batch/k1000` deletes random keys 1,000 per txn from a randomly inserted
+//!   tree of ~1.2 KB values (crud-bench's `batch_delete_1000`): nearly every
+//!   delete copies a different leaf, so the copy-on-write copy dominates.
 
 use criterion::{BatchSize, Criterion, Throughput};
 
-use crate::data::{ascending_keys, N, VAL};
+use crate::data::{ascending_keys, shuffle, shuffled_keys, N, VAL, VAL_BIG};
 use crate::harness::{wr_loaded, Backend, Fixture, Group, Seed};
 use crate::{pair, pair_op, pair_shape, Cfg};
 
@@ -37,6 +40,37 @@ pub fn run(c: &mut Criterion, cfg: &Cfg) {
     cursor(c, cfg, &keys, &val);
     clear(c, cfg, &keys, &val);
     churn(c, cfg, &keys, &val);
+    batch(c, cfg);
+}
+
+/// Keys per write txn in `batch/k1000`.
+const BATCH: usize = 1_000;
+/// Keys deleted per timed iteration of `batch/k1000` (ten txns).
+const BATCH_KEYS: usize = 10_000;
+
+/// Random deletes in [`BATCH`]-key txns from [`N`] random-order inserts of
+/// [`VAL_BIG`]-byte values.
+fn batch(c: &mut Criterion, cfg: &Cfg) {
+    let keys = shuffled_keys(N, 0xBA7C_4DE1);
+    let val = vec![0xCDu8; VAL_BIG];
+    let victims = shuffle(keys.clone(), 0x0DE1_E7E5)[..BATCH_KEYS].to_vec();
+    let mut g = group(c, "del/batch/k1000", victims.len());
+    pair_op!(
+        wr_loaded,
+        batch_del_op,
+        &mut g,
+        &Seed::named(cfg.page, &keys, &val),
+        &victims,
+        &val
+    );
+    g.finish();
+}
+
+/// [`del_op`] in [`BATCH`]-key txns.
+fn batch_del_op<B: Backend>(env: &B::Env, db: B::Db, keys: &[Vec<u8>], val: &[u8]) {
+    for chunk in keys.chunks(BATCH) {
+        del_op::<B>(env, db, chunk, val);
+    }
 }
 
 /// `delete_keys` returns a hit count the write shape does not take; adapt it,

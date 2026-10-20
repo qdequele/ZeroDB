@@ -283,3 +283,26 @@ header read differs): `get/val/v4k` 1.29× → 0.91×, `get/val/v2page` 1.27× �
 0.93× LMDB; inline-value and scan rungs flat. Validating default: all 9 rungs
 flat.
 
+
+## Amendment (2026-10-19): trusted leaves are not recorded in the txn memo
+
+Proposed by an agent session, awaiting maintainer review (it changes the
+"Mechanism as built" paragraph above, not the safety contract). Under the
+trusting policy a **leaf**'s memo miss still takes the header-checked view
+(page type, reserved fields, free-space bounds) but no longer records the
+page; branches are recorded as before. The validating policy is unchanged.
+
+Why: a scan views each leaf once. Recording every leaf grew the memo by one
+level per four-fold of leaves (to ~2 MB of tables for a 50k-leaf walk,
+allocated and zeroed per read txn), and every later probe, a miss for each new
+leaf, walked all levels, each a likely cache miss. In a full `count()` over a
+500k-entry, ~0.9 GB tree (crud-bench's shape) that bookkeeping was ~30 % of
+the scan. LMDB keeps no such table: it tests the page type and reads. Branches
+stay recorded: they are few, so the memo stays one small level, and every
+descent revisits them, which is where the 2026-09-28 "record nothing" variant
+lost 4–5 % on hot reads.
+
+What stays checked is unchanged: every trusted leaf view still runs the O(1)
+header checks; it simply runs them on every first view of the leaf in a
+cursor step instead of once per txn. The measurements are in
+`benches/results/2026-10-19-crud-scan-count-and-batch-delete.md`.

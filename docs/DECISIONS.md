@@ -38,3 +38,4 @@ issues.
 | 0027 | [The API of Meilisearch's heed fork, behind a feature](adr/0027-heed-fork-unique-txns.md) | Accepted (Option B, 2026-10-18), implemented (#115) | API, consumer compatibility |
 | 0028 | [Delete rebalance moves cells page to page, as LMDB](adr/0028-delete-rebalance-node-move.md) | Accepted (Option A, 2026-10-18), implemented | Performance (deletes), B+tree |
 | 0029 | [Free-page run search across freed-page records](adr/0029-free-page-run-search.md) | Accepted (Option C, 2026-10-19), implemented (#29) | Page reclamation, LMDB parity |
+| 0030 | [A copy-on-write copies only a page's used bytes, as LMDB](adr/0030-cow-copies-used-bytes.md) | Accepted (Option A, 2026-10-19), implemented | Performance (writes), bytes on disk |

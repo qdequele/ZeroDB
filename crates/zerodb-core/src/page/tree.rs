@@ -46,6 +46,25 @@ pub(crate) fn even(n: usize) -> usize {
     (n + 1) & !1
 }
 
+/// Copy tree page `src` into `dst` for a copy-on-write (ADR-0030), as LMDB's
+/// `mdb_page_copy` does: the header and pointer array
+/// `[0, HEADER_SIZE + lower)` and the cell heap `[HEADER_SIZE + upper, len)`.
+/// The free gap between them is not copied; `dst` keeps the bytes it held
+/// there, which no view, check or recovery path reads. A source whose bounds
+/// do not check is copied whole, so a corrupt header never shapes the copy.
+pub(crate) fn copy_tree_page(dst: &mut [u8], src: &[u8]) {
+    debug_assert_eq!(dst.len(), src.len(), "copy_tree_page copies one page");
+    match u32::try_from(src.len()).map(|psize| read_and_check_bounds(src, psize)) {
+        Ok(Ok((lower, upper))) => {
+            let lo = HEADER_SIZE + lower as usize;
+            let hi = HEADER_SIZE + upper as usize;
+            dst[..lo].copy_from_slice(&src[..lo]);
+            dst[hi..].copy_from_slice(&src[hi..]);
+        }
+        _ => dst.copy_from_slice(src),
+    }
+}
+
 /// The value stored by a leaf node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeafValue<'a> {
@@ -1197,4 +1216,67 @@ fn check_reserved_tail_fields(buf: &[u8]) -> Result<(), PageError> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::{copy_tree_page, LeafMut, LeafRef, LeafValue, HEADER_SIZE, OFF_LOWER, OFF_UPPER};
+    use crate::page::raw::read_u16;
+
+    const PS: u32 = 4096;
+
+    /// A leaf with a free gap: entries inserted, then some removed, so the
+    /// gap is neither empty nor at its initial size.
+    fn sample_leaf() -> Vec<u8> {
+        let mut buf = vec![0u8; PS as usize];
+        let mut leaf = LeafMut::init(&mut buf, PS, 7, 3).unwrap();
+        for i in 0..20u8 {
+            leaf.insert_inline(i as usize, &[b'k', i], 0, &[i; 60])
+                .unwrap();
+        }
+        for i in (0..20).step_by(3).rev() {
+            leaf.remove(i).unwrap();
+        }
+        buf
+    }
+
+    /// ADR-0030: the copy carries the header, pointer array and cell heap
+    /// byte for byte and leaves the destination's free gap untouched, so the
+    /// copy reads back entry for entry as its source.
+    #[test]
+    fn copies_the_used_bytes_and_leaves_the_gap() {
+        let src = sample_leaf();
+        let lo = HEADER_SIZE + read_u16(&src, OFF_LOWER) as usize;
+        let hi = HEADER_SIZE + read_u16(&src, OFF_UPPER) as usize;
+        assert!(hi - lo > 100, "the sample leaf has a real gap");
+        let mut dst = vec![0xEEu8; PS as usize];
+        copy_tree_page(&mut dst, &src);
+        assert_eq!(dst[..lo], src[..lo]);
+        assert_eq!(dst[hi..], src[hi..]);
+        assert!(dst[lo..hi].iter().all(|&b| b == 0xEE), "gap left as it was");
+
+        let a = LeafRef::new(&src, PS).unwrap();
+        let b = LeafRef::new(&dst, PS).expect("the copy validates in full");
+        assert_eq!(a.num_keys(), b.num_keys());
+        for i in 0..a.num_keys() {
+            assert_eq!(a.key(i), b.key(i));
+            assert!(
+                matches!((a.value(i), b.value(i)), (LeafValue::Inline(x), LeafValue::Inline(y)) if x == y)
+            );
+        }
+    }
+
+    /// A source whose bounds do not check (not a tree page, or corrupt) is
+    /// copied whole: its header never decides which bytes move.
+    #[test]
+    fn bad_bounds_copy_the_whole_page() {
+        for (lower, upper) in [(3u16, 100u16), (200, 100), (10, 5000)] {
+            let mut src = sample_leaf();
+            src[OFF_LOWER..OFF_LOWER + 2].copy_from_slice(&lower.to_le_bytes());
+            src[OFF_UPPER..OFF_UPPER + 2].copy_from_slice(&upper.to_le_bytes());
+            let mut dst = vec![0xEEu8; PS as usize];
+            copy_tree_page(&mut dst, &src);
+            assert_eq!(dst, src, "lower {lower}, upper {upper}");
+        }
+    }
 }

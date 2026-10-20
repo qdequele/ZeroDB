@@ -521,11 +521,15 @@ impl<'env> DirtyStore<'env> {
         self.bytes_mut(pgno).expect("frame was just inserted")
     }
 
-    /// Insert a one-page COW copy of `src` for `pgno` and return it mutably (the
-    /// caller restamps the header). Heap mode reuses a pooled spare,
-    /// overwriting it with `src`, before allocating; in-map mode
-    /// (ADR-0021) copies `src` straight into the map page at `pgno` — the one
-    /// copy COW inherently costs, with no heap frame and no commit write-back.
+    /// Insert a one-page COW copy of tree page `src` for `pgno` and return it
+    /// mutably (the caller restamps the header). Heap mode reuses a pooled
+    /// spare before allocating; in-map mode (ADR-0021) copies `src` straight
+    /// into the map page at `pgno` — the one copy COW inherently costs, with
+    /// no heap frame and no commit write-back. Into a spare or a map page only
+    /// the used bytes are copied, as LMDB's `mdb_page_copy` does (ADR-0030,
+    /// [`copy_tree_page`](crate::page::copy_tree_page)): the free gap keeps
+    /// bytes this file or txn already held. A fresh allocation copies the
+    /// whole page, so no uninitialised memory is ever written out.
     /// `src` must be exactly one page and MUST NOT overlap the map page at
     /// `pgno` (it never does: `src` is a committed or spilled page, `pgno` a
     /// fresh allocation of this txn).
@@ -539,13 +543,13 @@ impl<'env> DirtyStore<'env> {
             // overlaps the region (a committed/spilled page vs a fresh
             // TXN-62 allocation — caller contract above).
             let frame = unsafe { map_mut(self.broker, self.psize, pgno, ps) };
-            frame.copy_from_slice(src);
+            crate::page::copy_tree_page(frame, src);
             return frame;
         }
         let frame = match self.spare.pop() {
             Some(mut f) => {
                 debug_assert_eq!(f.len(), ps, "spare frame is one page");
-                f.copy_from_slice(src);
+                crate::page::copy_tree_page(&mut f, src);
                 f
             }
             None => src.into(),
@@ -734,6 +738,36 @@ mod tests {
         let f = s.insert_tree_frame(9);
         assert_eq!(f.as_ptr() as usize, addr, "insert_tree_frame reused it");
         assert!(f.iter().all(|&b| b == 0), "reused tree frame is zeroed");
+    }
+
+    #[test]
+    fn insert_copy_into_a_spare_copies_the_used_bytes() {
+        // ADR-0030: copying a tree page into a reused spare moves the header,
+        // pointer array and cell heap; the gap keeps the spare's old bytes,
+        // and the frame reads back as its source.
+        let mut src = vec![0u8; 4096];
+        let mut leaf = crate::page::LeafMut::init(&mut src, 4096, 3, 1).unwrap();
+        for i in 0..10u8 {
+            leaf.insert_inline(i as usize, &[i, i], 0, &[i; 50])
+                .unwrap();
+        }
+        let mut s = DirtyStore::new(4096);
+        s.insert_copy(7, &[0xAB; 4096]);
+        s.discard(7);
+        s.insert_copy(8, &src);
+        let frame = s.bytes(8).unwrap();
+        let lower = u16::from_le_bytes([src[24], src[25]]) as usize;
+        let upper = u16::from_le_bytes([src[26], src[27]]) as usize;
+        let (lo, hi) = (
+            crate::page::HEADER_SIZE + lower,
+            crate::page::HEADER_SIZE + upper,
+        );
+        assert_eq!(frame[..lo], src[..lo]);
+        assert_eq!(frame[hi..], src[hi..]);
+        assert!(frame[lo..hi].iter().all(|&b| b == 0xAB), "gap not copied");
+        let view = crate::page::LeafRef::new(frame, 4096).expect("the copy validates");
+        assert_eq!(view.num_keys(), 10);
+        assert_eq!(view.key(9), &[9, 9]);
     }
 
     #[test]

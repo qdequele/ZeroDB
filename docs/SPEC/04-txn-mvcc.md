@@ -709,8 +709,9 @@ dirty-page store must be built so it is.
   views it, and re-wrapped without checks on later views through the
   txn-scoped validated-pages memo. An env opened with the trusting
   `FileTrust` policy skips the cell walk for map pages: on a memo miss they
-  take the O(1) header checks dirty frames take, then enter the memo (page type, reserved fields,
-  free-space bounds). The high-water bound above and the free-list id checks
+  take the O(1) header checks dirty frames take (page type, reserved fields,
+  free-space bounds); a branch then enters the memo, a leaf does not (ADR-0014
+  amendment 2026-10-19: a scan views each leaf once). The high-water bound above and the free-list id checks
   (SPEC 05 GC-18) apply under both policies. Under the trusting policy an
   overflow value is sliced from its head page without reading the run's header
   (ADR-0014 amendment, 2026-09-29); the slice stays bounded by the high-water. Under the
@@ -843,8 +844,12 @@ dirty-page store must be built so it is.
   Reuse happens only at `&mut` boundaries within a txn (TXN-43) and across txn
   ends otherwise, so the stability guarantee above is untouched; run frames and
   in-map frames (TXN-45b) are never pooled.*
-- **TXN-42** — COW (SPEC 03 §5) allocates a fresh frame, `memcpy`s the source
-  page into it, and inserts it; it never edits a frame's backing identity.
+- **TXN-42** — COW (SPEC 03 §5) allocates a fresh frame, copies the source
+  page into it, and inserts it. *(Amended 2026-10-19, ADR-0030.)* The copy
+  moves the used bytes only, the header and pointer array
+  `[0, HEADER + lower)` and the cell heap `[HEADER + upper, psize)`; the free
+  gap keeps the frame's or map page's previous bytes. A source whose bounds do
+  not check, and a freshly allocated heap frame, are copied whole. COW it never edits a frame's backing identity.
   Editing an already-dirty page (SPEC 03 §5 rule 2) writes in place within its
   existing frame — allowed under TXN-39 only because such an edit is itself a
   `&mut` op, so no read borrow is outstanding.
