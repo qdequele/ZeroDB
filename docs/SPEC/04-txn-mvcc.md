@@ -1157,7 +1157,12 @@ spilling bullet there.)
   fires, the teardown drops the lock region: the lock file is unmapped, its
   descriptor closed, which releases this process's record locks (its shared
   election lock and its liveness lock), and only then is its entry in the
-  lock-file registry removed. A waiter woken by the event can therefore
+  lock-file registry removed. The close and the removal happen under the
+  registry's lock (amended 2026-10-19, issue #123): if the lock file was
+  unlinked while open (its directory deleted), the close frees its inode,
+  whose number the filesystem may give at once to a new file, and a
+  concurrent open of such a new lock file must not find the old entry and be
+  refused with `EnvAlreadyOpened`. A waiter woken by the event can therefore
   reopen the environment at once. Every reader slot of this process is
   already released by then, because every read txn holds the env alive
   (TXN-52).

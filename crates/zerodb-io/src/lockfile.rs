@@ -159,11 +159,14 @@ enum RegistryKey {
     Missing(PathBuf),
 }
 
-/// This process's claim on one lock file in the registry. Dropping it removes
-/// the entry, so every error path and every [`LockFile`] drop releases it
-/// exactly once.
+/// This process's claim on one lock file in the registry, and the
+/// descriptor it covers once one is open. Dropping it closes the descriptor
+/// and removes the entry, so every error path and every [`LockFile`] drop
+/// releases both exactly once.
 struct Registration {
     key: RegistryKey,
+    /// The descriptor of the claimed file, from [`Registration::adopt`].
+    file: Option<File>,
 }
 
 impl Registration {
@@ -175,7 +178,36 @@ impl Registration {
         if !open_files().insert(key.clone()) {
             return Err(LockOpenError::AlreadyOpen);
         }
-        Ok(Registration { key })
+        Ok(Registration { key, file: None })
+    }
+
+    /// Take ownership of `file`, the descriptor just opened for this claim,
+    /// after re-keying the claim by its identity ([`Registration::rekey`]).
+    /// From then on the descriptor closes only in this claim's drop.
+    ///
+    /// Fails with `AlreadyOpen` if another claim of this process already
+    /// holds that identity. The descriptor then reached a file this process
+    /// already has open (its name was replaced by a link to it after the
+    /// claim), and closing it would drop that handle's record locks, so it
+    /// is leaked instead.
+    fn adopt(&mut self, file: File) -> Result<(), LockOpenError> {
+        if let Err(e) = self.rekey(&file) {
+            std::mem::forget(file);
+            return Err(e);
+        }
+        self.file = Some(file);
+        Ok(())
+    }
+
+    /// The adopted descriptor.
+    ///
+    /// # Panics
+    ///
+    /// If no descriptor was adopted; every caller adopts one first.
+    fn file(&self) -> &File {
+        self.file
+            .as_ref()
+            .expect("the registration adopted its descriptor")
     }
 
     /// Re-key this claim by the identity of `file`, the descriptor just
@@ -209,8 +241,18 @@ impl Registration {
 }
 
 impl Drop for Registration {
+    /// Close the descriptor, then remove the entry, both under the registry
+    /// lock. Closing first keeps the rule that this process never has two
+    /// descriptors of one lock file. Holding the lock across both steps
+    /// matters when the file was unlinked while open (its directory deleted,
+    /// say): the close frees the inode, and the filesystem may give its
+    /// number to the next file it creates, at once. A claim of such a new
+    /// file by another thread must not see the entry this drop is about to
+    /// remove, or it would be refused as already open.
     fn drop(&mut self) {
-        open_files().remove(&self.key);
+        let mut files = open_files();
+        drop(self.file.take());
+        files.remove(&self.key);
     }
 }
 
@@ -282,16 +324,17 @@ enum Election {
 /// [`LockOpenError::AlreadyOpen`] if this process has the lock file open,
 /// and I/O errors other than a missing file.
 pub fn published_max_readers(path: &Path) -> Result<Option<u32>, LockOpenError> {
-    let _registration = Registration::claim(path)?;
-    let file = match File::open(path) {
-        Ok(f) => f,
+    let mut registration = Registration::claim(path)?;
+    match File::open(path) {
+        Ok(f) => registration.adopt(f)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
-    };
-    if read_u64_at(&file, OFF_MAGIC)? != LOCK_MAGIC {
+    }
+    let file = registration.file();
+    if read_u64_at(file, OFF_MAGIC)? != LOCK_MAGIC {
         return Ok(None);
     }
-    match read_u32_at(&file, OFF_MAX_READERS) {
+    match read_u32_at(file, OFF_MAX_READERS) {
         // A new initializer started rebuilding the file between the two reads
         // (every process had closed the environment) and zeroed the header:
         // the value is unknown again (ADR-0023 amendment 20).
@@ -304,18 +347,19 @@ pub fn published_max_readers(path: &Path) -> Result<Option<u32>, LockOpenError> 
 }
 
 /// The mapped lock file. Field order matters for `Drop`: the map is
-/// unmapped before the descriptor closes, closing the descriptor releases
-/// this process's record locks, and only then is the file's entry removed
-/// from the registry (keyed by the file's identity, not its path) — so no
-/// second descriptor of this file can be opened by this process while the
-/// first is still open.
+/// unmapped before the descriptor closes. The registration owns the
+/// descriptor: closing it releases this process's record locks, and only
+/// then is the file's entry removed from the registry (keyed by the file's
+/// identity, not its path), both under the registry lock — so no second
+/// descriptor of this file can be opened by this process while the first is
+/// still open, and no new file that reuses the inode number of an unlinked
+/// one is refused because of a stale entry.
 ///
 /// Sharing one `LockFile` across threads is sound: all shared state is reached
 /// through atomics over the mapping or through `fcntl` on the descriptor.
 pub struct LockFile {
     map: memmap2::MmapRaw,
-    file: File,
-    _registration: Registration,
+    registration: Registration,
     pid: u32,
     initializer: bool,
     slots: u32,
@@ -416,21 +460,18 @@ impl LockFile {
             }
             Err(e) => return Err(e.into()),
         };
-        if let Err(e) = registration.rekey(&file) {
-            // The descriptor reached a file this process already has open
-            // (its name was replaced by a link to it between the `stat` and
-            // the open). Closing it would drop that handle's record locks, so
-            // the descriptor is leaked instead.
-            std::mem::forget(file);
-            return Err(e);
-        }
-        check_not_data_file(&file, created, path, data_path)?;
+        // Fails if the descriptor reached a file this process already has
+        // open (its name was replaced by a link to it between the `stat` and
+        // the open); the descriptor is then leaked rather than closed.
+        registration.adopt(file)?;
+        let file = registration.file();
+        check_not_data_file(file, created, path, data_path)?;
         /// How often a joiner that finds a half-built lock file retries the
         /// election before failing (ADR-0023 amendment 10).
         const ELECTION_RETRIES: u32 = 100;
         let mut attempt = 0;
         let initializer = loop {
-            if record_lock(&file, libc::F_SETLK, WRLCK, ELECTION_BYTE)? {
+            if record_lock(file, libc::F_SETLK, WRLCK, ELECTION_BYTE)? {
                 break true;
             }
             if election == Election::TryExclusive {
@@ -441,13 +482,13 @@ impl LockFile {
             }
             // Blocks until the initializer downgrades in `finish_open`, or
             // exits.
-            record_lock(&file, libc::F_SETLKW, RDLCK, ELECTION_BYTE)?;
+            record_lock(file, libc::F_SETLKW, RDLCK, ELECTION_BYTE)?;
             // Every other process may have exited while this one waited,
             // including an initializer that died before finishing. POSIX
             // converts this process's shared lock in place, and the upgrade
             // succeeds only when no other process holds the byte. A failed
             // F_SETLK leaves the shared lock held.
-            if record_lock(&file, libc::F_SETLK, WRLCK, ELECTION_BYTE)? {
+            if record_lock(file, libc::F_SETLK, WRLCK, ELECTION_BYTE)? {
                 break true;
             }
             // Another process holds the byte too. If the magic is not set,
@@ -462,10 +503,10 @@ impl LockFile {
             // exited, which the protocol tolerates: `T` is the last published
             // value, dead PIDs are reapable, and a stale writer word is taken
             // over (ADR-0023 amendment 10).
-            if read_u64_at(&file, OFF_MAGIC)? == LOCK_MAGIC {
+            if read_u64_at(file, OFF_MAGIC)? == LOCK_MAGIC {
                 break false;
             }
-            record_lock(&file, libc::F_SETLK, UNLCK, ELECTION_BYTE)?;
+            record_lock(file, libc::F_SETLK, UNLCK, ELECTION_BYTE)?;
             attempt += 1;
             if attempt == ELECTION_RETRIES {
                 return Err(LockOpenError::Io(std::io::Error::new(
@@ -485,7 +526,7 @@ impl LockFile {
         // `OBS_JOINER_MORE_MAXREADERS`; ADR-0023 §1 as amended). A count no
         // initializer can write means the file is not a usable lock file.
         if initializer {
-            check_lock_file_shape(&file, path)?;
+            check_lock_file_shape(file, path)?;
         }
         let slots = if initializer {
             // An initializer never shrinks the reader table of a finished
@@ -494,9 +535,9 @@ impl LockFile {
             // count is the larger of the requested one and the recorded one
             // (`OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS`; ADR-0023 §1 as
             // amended). The slots themselves are wiped below as always.
-            previous_run_slots(&file)?.map_or(max_readers, |n| n.max(max_readers))
+            previous_run_slots(file)?.map_or(max_readers, |n| n.max(max_readers))
         } else {
-            let n = read_u32_at(&file, OFF_MAX_READERS)?;
+            let n = read_u32_at(file, OFF_MAX_READERS)?;
             if n == 0 || n > zerodb_core::env::MAX_READERS_LIMIT {
                 return Err(LockOpenError::Mismatch(format!(
                     "the lock file records {n} reader slots"
@@ -506,18 +547,17 @@ impl LockFile {
         };
         let len = OFF_SLOTS + SLOT_STRIDE * slots as usize;
         if initializer {
-            rebuild_in_place(&file, len as u64)?;
+            rebuild_in_place(file, len as u64)?;
         } else if file.metadata()?.len() < len as u64 {
             return Err(LockOpenError::Mismatch(
                 "lock file shorter than its header says".into(),
             ));
         }
-        let map = memmap2::MmapOptions::new().len(len).map_raw(&file)?;
+        let map = memmap2::MmapOptions::new().len(len).map_raw(file)?;
         let pid = std::process::id();
         let lock = LockFile {
             map,
-            file,
-            _registration: registration,
+            registration,
             pid,
             initializer,
             slots,
@@ -548,7 +588,7 @@ impl LockFile {
         }
         // This process's liveness lock (ADR-0023 §3), held for the handle's life.
         if !record_lock(
-            &lock.file,
+            lock.file(),
             libc::F_SETLK,
             WRLCK,
             LIVENESS_BASE + i64::from(pid),
@@ -594,9 +634,14 @@ impl LockFile {
             // with Acquire. A joiner that sees the magic therefore sees a
             // seeded `T` (ADR-0023 amendment 10).
             self.u64_at(OFF_MAGIC).store(LOCK_MAGIC, Ordering::Release);
-            record_lock(&self.file, libc::F_SETLK, RDLCK, ELECTION_BYTE)?;
+            record_lock(self.file(), libc::F_SETLK, RDLCK, ELECTION_BYTE)?;
         }
         Ok(())
+    }
+
+    /// The lock file's descriptor, owned by the registration.
+    fn file(&self) -> &File {
+        self.registration.file()
     }
 
     fn u64_at(&self, off: usize) -> &AtomicU64 {
@@ -676,7 +721,7 @@ impl SharedRegion for LockFile {
             // F_GETLK never reports the caller's own locks.
             return Ok(true);
         }
-        probe_locked(&self.file, LIVENESS_BASE + i64::from(pid))
+        probe_locked(self.file(), LIVENESS_BASE + i64::from(pid))
     }
 
     /// Returns `true` from both takeovers (a dead owner, and a stale word
@@ -761,7 +806,7 @@ impl SharedRegion for LockFile {
     fn lock_writer(&self) -> std::io::Result<bool> {
         // POSIX record locks belong to the process, so any thread may release
         // it, and the kernel drops it if the process dies (ADR-0023 §2).
-        record_lock(&self.file, libc::F_SETLKW, WRLCK, WRITER_BYTE).map(|_| false)
+        record_lock(self.file(), libc::F_SETLKW, WRLCK, WRITER_BYTE).map(|_| false)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -770,7 +815,7 @@ impl SharedRegion for LockFile {
         // did, every other process would stay blocked on the writer lock until
         // this one exits. This runs inside the core's writer-guard `Drop`, so
         // it aborts rather than panicking: exiting releases the lock.
-        if let Err(e) = record_lock(&self.file, libc::F_SETLK, UNLCK, WRITER_BYTE) {
+        if let Err(e) = record_lock(self.file(), libc::F_SETLK, UNLCK, WRITER_BYTE) {
             eprintln!("zerodb: cannot release the cross-process writer lock: {e}");
             std::process::abort();
         }
@@ -1137,7 +1182,7 @@ mod tests {
             .expect("no other opener");
         assert!(l.is_initializer());
         assert_eq!(l.slots().len(), 8);
-        assert_eq!(read_u64_at(&l.file, OFF_MAGIC).unwrap(), LOCK_MAGIC_INIT);
+        assert_eq!(read_u64_at(l.file(), OFF_MAGIC).unwrap(), LOCK_MAGIC_INIT);
         assert!(matches!(
             LockFile::try_open_exclusive(&path, &data, 8),
             Err(LockOpenError::AlreadyOpen)
@@ -1413,7 +1458,7 @@ mod tests {
         let l = LockFile::open(&path, &data, 8).unwrap();
         assert!(l.is_initializer());
         let mut header = vec![0u8; OFF_SLOTS];
-        l.file.read_exact_at(&mut header, 0).unwrap();
+        l.file().read_exact_at(&mut header, 0).unwrap();
         assert_eq!(&header[..8], &LOCK_MAGIC_INIT.to_le_bytes());
         assert_eq!(&header[8..12], &LOCK_FORMAT.to_le_bytes());
         assert_eq!(&header[16..20], &8u32.to_le_bytes());
@@ -1422,9 +1467,9 @@ mod tests {
                 assert_eq!(*b, 0, "header byte {i} survived the rebuild");
             }
         }
-        assert_eq!(l.file.metadata().unwrap().len(), len_before);
+        assert_eq!(l.file().metadata().unwrap().len(), len_before);
         let mut marker = [0u8];
-        l.file.read_exact_at(&mut marker, marker_at).unwrap();
+        l.file().read_exact_at(&mut marker, marker_at).unwrap();
         assert_eq!(marker, [0x5A], "the file was truncated");
         l.bind_page_size(8192).expect("a new page size binds");
         assert_fresh_slots(&l, 8);
@@ -1440,11 +1485,11 @@ mod tests {
         let path = tmp();
         std::fs::write(&path, vec![0u8; exact(64) as usize]).unwrap();
         let l = LockFile::open(&path, &data_of(&path), 4).unwrap();
-        assert_eq!(l.file.metadata().unwrap().len(), exact(4), "cut back");
+        assert_eq!(l.file().metadata().unwrap().len(), exact(4), "cut back");
         assert_fresh(&l, 4);
         drop(l);
         let l = LockFile::open(&path, &data_of(&path), 10).unwrap();
-        assert_eq!(l.file.metadata().unwrap().len(), exact(10), "grown");
+        assert_eq!(l.file().metadata().unwrap().len(), exact(10), "grown");
         assert_fresh(&l, 10);
     }
 
@@ -1629,5 +1674,69 @@ mod tests {
         assert!(!data_of(&path).exists());
         let l = LockFile::open(&path, &data_of(&path), 4).expect("open");
         assert_fresh(&l, 4);
+    }
+
+    /// The descriptor number of an open file with inode number `ino`, found
+    /// through `/dev/fd` (Linux and macOS both provide it; macOS reports its
+    /// own device number there, so only the inode number is compared).
+    fn fd_of(ino: u64) -> Option<String> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::read_dir("/dev/fd").ok()?.find_map(|e| {
+            let name = e.ok()?.file_name().into_string().ok()?;
+            let m = std::fs::metadata(format!("/dev/fd/{name}")).ok()?;
+            (m.ino() == ino).then_some(name)
+        })
+    }
+
+    /// Closing the last descriptor of an unlinked lock file frees its inode,
+    /// and the filesystem may give that inode number to the next file it
+    /// creates (ext4 commonly does). If the registry entry outlived the
+    /// descriptor, even briefly, a new lock file created in that window by
+    /// another thread would be refused as already open (issue #123). The
+    /// descriptor must therefore close while the registry is locked, in the
+    /// same critical section that removes the entry: with the registry held
+    /// by this test, a drop on another thread must not get as far as closing
+    /// the descriptor.
+    #[test]
+    fn an_unlinked_lock_file_closes_and_unregisters_atomically() {
+        use std::os::unix::fs::MetadataExt;
+        let path = tmp();
+        let l = LockFile::open(&path, &data_of(&path), 4).expect("open");
+        l.finish_open().unwrap();
+        let m = std::fs::metadata(&*path).unwrap();
+        let id = (m.dev(), m.ino());
+        let key = RegistryKey::File {
+            dev: id.0,
+            ino: id.1,
+        };
+        let fd = fd_of(id.1).expect("the lock file's descriptor is open");
+        // As when the environment's directory is deleted while it is open.
+        std::fs::remove_file(&*path).unwrap();
+        // Keeps the unlinked inode alive to the end of the test, so its
+        // number cannot be handed to a file another test creates meanwhile:
+        // the checks below look the file up by inode number.
+        let pin = File::open(format!("/dev/fd/{fd}")).expect("pin the inode");
+
+        let registry = open_files();
+        let dropper = std::thread::spawn(move || drop(l));
+        // Give the drop time to run as far as it can without the registry.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let still_open = std::fs::metadata(format!("/dev/fd/{fd}")).is_ok_and(|m| m.ino() == id.1);
+        assert!(
+            registry.contains(&key),
+            "the entry is removed under the lock"
+        );
+        drop(registry);
+        dropper.join().unwrap();
+        assert!(
+            still_open,
+            "the descriptor was closed while its registry entry still existed"
+        );
+        assert!(!open_files().contains(&key));
+        assert!(
+            std::fs::metadata(format!("/dev/fd/{fd}")).map_or(true, |m| m.ino() != id.1),
+            "the lock file's descriptor is closed"
+        );
+        drop(pin);
     }
 }
