@@ -7,10 +7,14 @@
 //! cargo run --release -p zerodb-oracle --example raw_copy_bench -- [MiB] [rounds] [dest-dir]
 //! ```
 //!
-//! `dest-dir` (default: the source's temp dir) is where copies land; pass a
-//! directory on another filesystem to measure a cross-filesystem copy. Run
-//! it built at two revisions for a before/after; LMDB's column is the drift
-//! control between the two runs.
+//! The two source envs live in the system temp dir, so `TMPDIR` picks the
+//! source filesystem (for example `TMPDIR=/mnt/xfs` to measure the XFS
+//! reflink route); the run prints where they are. Copies land in a
+//! subdirectory the benchmark creates under `dest-dir` (default: the ZeroDB
+//! source's temp dir) and removes at the end; pass a directory on another
+//! filesystem to measure a cross-filesystem copy. Run it built at two
+//! revisions for a before/after; LMDB's column is the drift control between
+//! the two runs.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -78,9 +82,19 @@ fn main() {
 
     let ld = TempDir::new().unwrap();
     let zd = TempDir::new().unwrap();
-    let dest = args
+    let dest_root = args
         .next()
         .map_or_else(|| zd.path().to_path_buf(), PathBuf::from);
+    // A directory of its own, so the fixed copy names below never touch a
+    // file the caller keeps in `dest-dir`.
+    let dest = dest_root.join(format!("raw_copy_bench-{}", std::process::id()));
+    std::fs::create_dir(&dest).unwrap();
+    println!(
+        "sources: {} and {}; copies in {}",
+        ld.path().display(),
+        zd.path().display(),
+        dest.display()
+    );
     println!("building ~{mib} MiB envs ({n} x {VAL} B values)");
     let lenv = fill!(heed, ld.path(), n);
     let zenv = fill!(heed_zerodb, zd.path(), n);
@@ -147,4 +161,5 @@ fn main() {
         median(lf),
         median(zf)
     );
+    std::fs::remove_dir_all(&dest).unwrap();
 }

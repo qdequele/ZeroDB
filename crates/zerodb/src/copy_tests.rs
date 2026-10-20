@@ -228,7 +228,17 @@ fn every_route_copies_the_pinned_snapshot_under_a_concurrent_writer() {
                 assert!(!writer.is_finished(), "{tag}: the writer stopped");
                 std::thread::yield_now();
             }
-            let route = PATH_ROUTES[i % PATH_ROUTES.len()];
+            let mut route = PATH_ROUTES[i % PATH_ROUTES.len()];
+            // Under `WRITE_MAP` the data file is as long as the 1 GiB map,
+            // and off APFS the clone route copies all of it as bytes (the
+            // engine never takes that route there). The file-copy route
+            // reads the same file, bounded to the snapshot.
+            if route == RawRoute::Clone
+                && !cfg!(target_os = "macos")
+                && flags.contains(EnvFlags::WRITE_MAP)
+            {
+                route = RawRoute::FileCopy;
+            }
             let out = dir.path().join(format!("copy-{i}.dat"));
             let what = if i % 2 == 0 {
                 copy_via(&env, &out, route);
