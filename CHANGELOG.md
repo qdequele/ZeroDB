@@ -19,6 +19,29 @@ closes and the entry is removed under the registry's lock, so no open can see
 the stale entry. Reproduced on Linux ext4 (two false refusals in 30 s of
 concurrent opens; none in 60 s with the fix).
 
+### `zerodb-tools load` streams its input (#63)
+
+`load` used to read the whole dump into memory, parse every record into
+owned buffers and sort each database there, so its peak memory grew with the
+dump. It now reads the dump a line at a time, twice: a first pass rejects a
+malformed dump (or an over-long key) before the destination is created, the
+second writes each database in dump order in 64 MiB write txns. A dump
+piped in (`load /dev/stdin <dir>`) is copied during the first pass to an
+unlinked spool file in the destination directory. Peak memory is about one batch
+plus its dirty pages, whatever the dump's size. The dump format and the
+command line are unchanged.
+
+- Generated dumps of 0.7 GB and 1.4 GB (macOS aarch64, `/usr/bin/time -l`
+  peak memory footprint): 1,212 MiB → 156 MiB and 2,420 MiB → 157 MiB.
+  LMDB's `mdb_load` (Meilisearch fork) on the same 0.7 GB dump: ~1 MiB,
+  since it commits every 100 records.
+- Writing the main database before the named ones keeps its keys on the
+  append path, so the loaded file of the 0.7 GB dump is 379 MiB instead of
+  619 MiB (half-full pages before), close to LMDB's 367 MiB.
+- In a hand-edited dump, records out of order still land in key order, and
+  of several records with the same key in a database the first is kept, as
+  before; this now also holds across repeated blocks of the same database.
+
 ### Short read transactions reuse their memory (#25)
 
 A read transaction that reads one key used to allocate, zero and free two
