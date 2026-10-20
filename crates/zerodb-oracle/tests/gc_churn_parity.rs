@@ -11,11 +11,12 @@
 //!    `[0.5x, 1.5x]` of LMDB's for the general (overflow-bearing) workload,
 //!    and within `[0.60x, 1.25x]` for the no-overflow variant. The general band is
 //!    asymmetric-generous because of (i) 32-vs-16-byte page/overflow headers,
-//!    (ii) different split-fill policies, and (iii) — dominant — GC-21's
-//!    within-PIL-only run search vs the fork's cross-entry `me_pghead`
-//!    merging, which lets LMDB reuse fragmented space for overflow runs where
-//!    zerodb extends (spec-sanctioned). The no-overflow variant removes (iii),
-//!    hence the tighter band.
+//!    (ii) different split-fill policies, and (iii) how freed pages are
+//!    reused for overflow runs: ZeroDB reuses pages one transaction sooner
+//!    (divergence D-027 (a)) and does not re-save its leftover free pages
+//!    coalesced as the fork does, though since issue #29 it merges freed-page
+//!    records for a run as the fork's `me_pghead` does (SPEC 05 GC-21). The
+//!    no-overflow variant removes (iii), hence the tighter band.
 //!
 //! `Env::real_disk_size` parity is also asserted structurally: zerodb's value
 //! must equal the data file's `fstat` length (SPEC 00 row 18 / GC-22).

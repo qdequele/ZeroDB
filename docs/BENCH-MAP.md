@@ -129,6 +129,7 @@ plain descent cost.
 | `put/api/reserved` | `MDB_RESERVE` — milli's document-serialization path | reserved-space writes in the heed adapter (divergence D-015) |
 | `put/over/same_size` **(base)** | overwriting a cell that still fits | in-place replacement |
 | `put/over/grow` | overwriting a cell that no longer fits | page rearrangement and splits |
+| `put/cursor/rewrite` | the same-size overwrites as `over/same_size`, reached through the **write cursor** (`range_mut` + `put_current`) rather than by key | cursor put; the only rung where post-put cursor position costs anything |
 | `put/gc/drain_big` | overwrites whose COW pages are all drawn from ONE large free-list entry (half of a 300k-key tree deleted first, then aged one commit so both engines' reuse gates admit it) | free-list draw cost per reused page vs entry length (SPEC 05). Every other rung starts with an empty or tiny free list |
 
 `rand ÷ seq` is the split-and-COW cost. `seq ÷ append` is what an undeclared

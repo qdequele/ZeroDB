@@ -358,6 +358,23 @@ pub enum Op {
         /// `while next { del_current }` drain shape.
         drain: bool,
     },
+    /// `iter_mut`, advance to the `nth` entry, `put_current` (same key, new
+    /// value), then **keep walking** and report every entry the cursor yields
+    /// afterwards — the post-put cursor position under the differential
+    /// fuzzer, as [`Op::IterMutDelThenWalk`] does for deletes.
+    IterMutPutThenWalk {
+        /// Target database index.
+        db: u8,
+        /// Position to rewrite.
+        nth: u8,
+        /// Entries to read after the put; 0 means walk to exhaustion.
+        steps: u8,
+        /// Replacement value.
+        val: Value,
+        /// Rewrite every entry the walk visits with `val` too — the
+        /// read-modify-write loop (`while next { put_current }`).
+        rewrite: bool,
+    },
 
     // ---- post-txn verification ----
     /// Open a fresh independent read txn and read a key — models a post-commit

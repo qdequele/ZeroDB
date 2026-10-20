@@ -10,15 +10,18 @@
 //!   and validating an existing one.
 //! * `txn/ro_begin_abort` → `txn/rw_empty_commit` separates the reader-table
 //!   slot protocol from the commit path with zero dirty pages.
+//! * `txn/ro_begin_abort` → `txn/ro_get_one` adds one point read on a named DB
+//!   per read txn: the per-transaction structures a first read sets up (the
+//!   validated-pages memo, the named-DB record table) on top of the slot pin.
 
 use std::hint::black_box;
 
 use criterion::{BatchSize, Criterion, Throughput};
 use zerodb_oracle::tempdir::TempDir;
 
-use crate::data::{ascending_keys, MAP, N, N_PROBE, VAL};
-use crate::harness::{Backend, Fixture, Group};
-use crate::{pair_shape, Cfg};
+use crate::data::{ascending_keys, probes, MAP, N, N_PROBE, VAL};
+use crate::harness::{ro_probe, Backend, Fixture, Group, Seed};
+use crate::{pair, pair_shape, Cfg};
 
 /// Envs opened per timed iteration — a single open is too quick to time.
 const N_OPEN: usize = 20;
@@ -45,6 +48,7 @@ pub fn run(c: &mut Criterion, cfg: &Cfg) {
     open_create(c, cfg);
     reopen(c, cfg);
     ro_txn(c, cfg);
+    ro_get_one(c, cfg);
     rw_empty_commit(c, cfg);
     non_free_stat(c, cfg);
 }
@@ -125,6 +129,24 @@ fn case_ro_txn<B: Backend>(g: &mut Group<'_>, page: u32, keys: &[Vec<u8>], val: 
     g.bench_function(B::NAME, |b| {
         b.iter(|| black_box(B::rotxn_churn(&f.env, N_PROBE)))
     });
+}
+
+/// Seed of `ro_get_one`'s scattered probe keys.
+const SEED_RO_GET_ONE: u64 = 0x5EED_0025;
+
+/// Begin a read txn, read one scattered key of a named DB, drop the txn —
+/// `N_PROBE` times. milli opens a read txn per search request, so whatever a
+/// txn's first read sets up is paid per request; the delta against
+/// `ro_begin_abort` is that setup plus one lookup.
+fn ro_get_one(c: &mut Criterion, cfg: &Cfg) {
+    let keys = ascending_keys(N);
+    let val = vec![0xABu8; VAL];
+    let probes = probes(&keys, N_PROBE, SEED_RO_GET_ONE);
+    let mut g = c.benchmark_group("env/txn/ro_get_one");
+    g.throughput(Throughput::Elements(N_PROBE as u64));
+    let seed = Seed::named(cfg.page, &keys, &val);
+    pair!(ro_probe, point_get_txn_each, &mut g, &seed, &probes);
+    g.finish();
 }
 
 /// Begin + commit an EMPTY write txn, repeatedly, fsync off. Zero dirty pages,

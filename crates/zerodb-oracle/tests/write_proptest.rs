@@ -16,24 +16,59 @@ use zerodb_oracle::{run, DbName, Key, LmdbEngine, Op, PutFlag, Value, ZerodbEngi
 /// One simplified mutation/read step inside a write txn.
 #[derive(Debug, Clone)]
 enum Step {
-    Put { slot: u8, val: Value },
-    PutAppend { slot: u8, val: Value },
-    PutNoOverwrite { slot: u8, val: Value },
-    PutReserved { slot: u8, val: Value },
-    Del { slot: u8 },
+    Put {
+        slot: u8,
+        val: Value,
+    },
+    PutAppend {
+        slot: u8,
+        val: Value,
+    },
+    PutNoOverwrite {
+        slot: u8,
+        val: Value,
+    },
+    PutReserved {
+        slot: u8,
+        val: Value,
+    },
+    Del {
+        slot: u8,
+    },
     Clear,
-    IterMutPut { nth: u8, val: Value },
-    IterMutDel { nth: u8 },
-    Get { slot: u8 },
+    IterMutPut {
+        nth: u8,
+        val: Value,
+    },
+    IterMutDel {
+        nth: u8,
+    },
+    IterMutPutWalk {
+        nth: u8,
+        steps: u8,
+        val: Value,
+        rewrite: bool,
+    },
+    Get {
+        slot: u8,
+    },
     Iter,
     RevIter,
-    Prefix { slot: u8 },
+    Prefix {
+        slot: u8,
+    },
     Len,
     First,
     Last,
-    SeekGe { slot: u8 },
-    SeekGt { slot: u8 },
-    SeekLe { slot: u8 },
+    SeekGe {
+        slot: u8,
+    },
+    SeekGt {
+        slot: u8,
+    },
+    SeekLe {
+        slot: u8,
+    },
 }
 
 fn pool_key(slot: u8) -> Key {
@@ -57,6 +92,9 @@ fn arb_step() -> impl Strategy<Value = Step> {
         1 => Just(Step::Clear),
         2 => (any::<u8>(), arb_value()).prop_map(|(nth, val)| Step::IterMutPut { nth: nth % 40, val }),
         2 => any::<u8>().prop_map(|nth| Step::IterMutDel { nth: nth % 40 }),
+        2 => (any::<u8>(), any::<u8>(), arb_value(), any::<bool>()).prop_map(|(nth, steps, val, rewrite)| {
+            Step::IterMutPutWalk { nth: nth % 40, steps: steps % 8, val, rewrite }
+        }),
         2 => any::<u8>().prop_map(|slot| Step::Get { slot }),
         1 => Just(Step::Iter),
         1 => Just(Step::RevIter),
@@ -139,6 +177,18 @@ fn step_to_op(s: Step) -> Op {
         Step::Clear => Op::ClearDb { db: 0 },
         Step::IterMutPut { nth, val } => Op::IterMutPutCurrent { db: 0, nth, val },
         Step::IterMutDel { nth } => Op::IterMutDelCurrent { db: 0, nth },
+        Step::IterMutPutWalk {
+            nth,
+            steps,
+            val,
+            rewrite,
+        } => Op::IterMutPutThenWalk {
+            db: 0,
+            nth,
+            steps,
+            val,
+            rewrite,
+        },
         Step::Get { slot } => Op::Get {
             db: 0,
             key: pool_key(slot),

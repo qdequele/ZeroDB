@@ -375,3 +375,70 @@ fn aborted_spills_seed_nothing_and_reuse_stays_correct() {
     let want: Vec<(Vec<u8>, Vec<u8>)> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     assert_eq!(got, want);
 }
+
+/// Read txns reuse per-transaction memory on the same thread: the
+/// validated-pages memo's first level and the named-database record table are
+/// cleared when a txn drops and handed to the next one. Each record names its
+/// database's root as of one snapshot, and each memo entry vouches for a page
+/// number only within one snapshot, so a carried-over entry would read a
+/// stale or reused page. Every round rewrites both named databases (moving
+/// their roots and reusing pages), then runs many one-get txns on them,
+/// alternating with a second env whose different `max_dbs` gives a table of
+/// another length, and checks each result against the model.
+#[test]
+fn reused_read_txn_memory_carries_nothing_across_txns() {
+    let dir = TempDir::new();
+    let env = open(dir.path());
+    let other_dir = TempDir::new();
+    let other = {
+        let mut opts = EnvOpenOptions::new();
+        opts.map_size(64 << 20);
+        opts.page_size(PS);
+        opts.max_dbs(9);
+        opts.open(other_dir.path()).expect("open env")
+    };
+    let mut w = env.write_txn().unwrap();
+    let dbs = [
+        env.create_database(&mut w, Some(b"alpha")).unwrap(),
+        env.create_database(&mut w, Some(b"beta")).unwrap(),
+    ];
+    w.commit().unwrap();
+    let mut w = other.write_txn().unwrap();
+    let other_db = other.create_database(&mut w, Some(b"gamma")).unwrap();
+    other_db.put(&mut w, b"fixed", b"other env").unwrap();
+    w.commit().unwrap();
+
+    let mut models: [BTreeMap<Vec<u8>, Vec<u8>>; 2] = Default::default();
+    let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+    for round in 0..80u64 {
+        let mut w = env.write_txn().unwrap();
+        for _ in 0..(10 + rng.below(120)) {
+            let which = rng.below(2) as usize;
+            let k = format!("key{:05}", rng.below(1_200)).into_bytes();
+            if rng.below(3) == 0 {
+                dbs[which].delete(&mut w, &k).unwrap();
+                models[which].remove(&k);
+            } else {
+                let v = value(&mut rng, round);
+                dbs[which].put(&mut w, &k, &v).unwrap();
+                models[which].insert(k, v);
+            }
+        }
+        w.commit().unwrap();
+        for i in 0..40 {
+            let which = rng.below(2) as usize;
+            let k = format!("key{:05}", rng.below(1_200)).into_bytes();
+            let r = env.read_txn().unwrap();
+            assert_eq!(
+                dbs[which].get(&r, &k).unwrap(),
+                models[which].get(&k).map(Vec::as_slice),
+                "round {round}, db {which}, key {k:?}"
+            );
+            drop(r);
+            if i % 8 == 0 {
+                let r = other.read_txn().unwrap();
+                assert_eq!(other_db.get(&r, b"fixed").unwrap(), Some(&b"other env"[..]));
+            }
+        }
+    }
+}

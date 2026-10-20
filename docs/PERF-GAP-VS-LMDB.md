@@ -205,7 +205,7 @@ are bench server ratios, before → after, unless stated.
 
 | Technique | What changed | Before → after | Pointer |
 |---|---|---|---|
-| **`RwCursor` re-seek** | The write cursor tracked its position by key, re-descending and copying each pair three times per step. It now parks and resumes its path, with no allocation per step. **Residual:** `put_current` and cursor `put` still re-seek once per mutation, where LMDB fixes the cursor up in place. | — | #7 |
+| **`RwCursor` re-seek** | The write cursor tracked its position by key, re-descending and copying each pair three times per step. It now parks and resumes its path, with no allocation per step. A `del_current`, and a put of the current key that stays in its leaf, mutate at the parked path and keep it (SPEC 03 §5.4a/§5.4b). **Residual:** puts that split, the left-sibling rebalance, and any op but `next` after a delete still re-seek once. | `put/cursor/rewrite` 5.47× → 2.49× (macOS arm64, 2026-10-19) | #7 |
 | **Splits without materializing the page** | Appends split onto a fresh right page; other splits pack both halves from cells borrowed from the old page. | — | 3c6a064 |
 | **One `pwrite` per dirty page** | Contiguous dirty pages go out in `pwritev` batches, as `mdb_page_flush` does. Its target, EBS gp3, is still unmeasured. | — | 3c6a064 |
 | **Adapter `ReservedSpace`** | `put_reserved` (milli's document path) filled a zeroed heap buffer, then copied it; the caller now writes straight into the page slot, as with `MDB_RESERVE`. The cursor variant still stages (#10, divergence D-015). | `put/api/reserved` 0.96× today [E] | — |
@@ -299,8 +299,9 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
   because ZeroDB issues a second `fdatasync` after the meta write, which LMDB
   does not. Open: prefault / preallocation of the map (#42), the Graviton A/B,
   and whether Meilisearch should set `WRITE_MAP`.
-- **Short read txns** — one read txn + one get is 1.55× [V]; reusing read txns
-  is #25.
+- **Short read txns** — one read txn + one get is 1.55× [V]. The memo level
+  and the named-DB table are now reused across txns on a thread (#25,
+  `env/txn/ro_get_one` −26 % on macOS); a Linux re-measure is pending.
 - **Page fill under random inserts** — the unsorted 10M load makes an 8 %
   larger file than LMDB's [S]. No issue yet.
 - **`zerodb-tools load` memory** — reads the whole dump into memory, then
@@ -314,8 +315,7 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
   first merges several records into its in-memory free list, so the file can
   grow even when a fitting run spans two records. A differential test against
   LMDB comes first. Only matters under GC churn.
-- Write cursor re-seek after `put_current` (#7) and the cursor reserved put
-  (#10): no consumer profile names them.
+- The cursor reserved put (#10): no consumer profile names it.
 - Durable commits on EBS gp3, where per-syscall latency should favour the
   coalesced writes: still owed. On SATA and Graviton4 NVMe durable commits
   are at parity or better.

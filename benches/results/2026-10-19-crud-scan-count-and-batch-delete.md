@@ -341,8 +341,6 @@ elsewhere and has not been profiled on Linux yet.
   phase next to LMDB's, to find the next lever.
 - The page size Meilisearch's production kernels use (`getconf PAGESIZE`):
   4 KiB makes the Graviton numbers the ones to optimise.
-- ADR number 0029 is used twice on unmerged branches (`hardware-crc32c` and
-  `free-page-run-search`); one needs renumbering before both merge.
 
 ## Scorecard (ADR-0030: copy-on-write copies only the used bytes)
 

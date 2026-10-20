@@ -38,6 +38,51 @@ In a crud-bench-shaped repro (500k entries, ~0.9 GB), a full count went from
 one; range scans and point gets got faster too, and no rung regressed. New
 benchmark rung `scan/full/big`. Numbers:
 `benches/results/2026-10-19-crud-scan-count-and-batch-delete.md`.
+### Short read transactions reuse their memory (#25)
+
+A read transaction that reads one key used to allocate, zero and free two
+per-transaction structures: the first 8 KiB level of the validated-pages
+memo and the named-database record table. Both are now cleared when the
+transaction drops and handed to the next one opened on the same thread (one
+of each is kept per thread). The memo clears exactly the slots it wrote; no
+entry is ever carried from one transaction to the next. heed 0.22.1 exposes
+no `mdb_txn_reset` / `mdb_txn_renew`, so the reuse is internal and needs no
+API change.
+
+- New rung `env/txn/ro_get_one` (begin, one named-DB `get`, drop). Memo
+  reuse alone, Apple M-series: 0.57x -> 0.42x LMDB's time (after / before
+  0.735); `env/txn/ro_begin_abort` flat.
+
+### Multi-page values reuse free pages freed by different transactions (ADR-0029, #29)
+
+A value larger than a page needs a run of contiguous free pages. ZeroDB
+looked for that run inside one freed-page record at a time (one record per
+freeing transaction), so a run whose pages were freed by two transactions
+was missed and the file grew by the whole value. When no single record holds
+the run, ZeroDB now merges the records the reuse gate admits, with the meta
+page's freed list, and searches the merged list, as LMDB merges the records
+it reads into its free list. The merged list is kept for the transaction;
+the records and how they are saved are unchanged.
+
+- `free_run_churn` (macOS aarch64, 16 KiB pages; 2,000 rewrites of mixed
+  inline and 2–16 page values per commit): file size vs LMDB 1.64× → 1.06×
+  after 200 commits, 2.43× → 1.10× after 400. Small-commit and inline-only
+  controls unchanged (0.98×, 0.80×).
+- `lmdb_free_run_observation.rs` gains two cases where the run spans records
+  and is still whole; ZeroDB now places the value where LMDB does. Divergence
+  D-027 (b) is resolved; (a), reuse one transaction sooner than LMDB, stays
+  proposed.
+- New tests: reuse, reader gate and a crash at every commit step for a run
+  drawn from two records (`crates/zerodb/tests/gc_reclaim.rs`), and a
+  property test (`free_run_cross_record_proptest.rs`). New bench rungs
+  `put/gc/ovf_across` and `put/gc/ovf_miss`.
+- Commit no longer panics with "freelist_save failed to reach a fixed point"
+  when the committing transaction's own freed-page record sits at an
+  overflow page-count boundary: the save could shrink the record by a page,
+  grow it back by listing that page, and repeat once per page of the meta
+  page's freed list. Once the record has shrunk during a save, growing it
+  now takes pages from outside the set it lists (SPEC 05 GC-13 (v)). Found
+  by the property test on Linux CI; the shrunk case is kept as a fixed test.
 
 ### `skip` crosses whole leaves instead of stepping each entry
 
@@ -77,6 +122,18 @@ work to get there shrinks.
   workload is bound by commit, not by the rebalance.
 - SPEC 03 §10.1 numbers the rebalance rules (REB-1..REB-5). New golden test
   `rebalance_logical_image` pins the tree shape deletes leave behind.
+
+### Less CPU per commit for the meta page (#8)
+
+- The meta-page CRC32C uses slicing-by-8 tables instead of one lookup per
+  byte, with bit-identical results (about 5x faster on the ~200 bytes it
+  covers).
+- A commit encodes its meta page into a zeroed buffer the environment keeps
+  between commits, instead of allocating and zeroing a fresh page each time.
+  The bytes written to disk are unchanged.
+- One-key no-sync commit on macOS arm64: user CPU 4.17 µs → 3.45 µs per
+  commit (LMDB 1.50 µs). Wall time `commit/batch/n1` 0.95–0.97× of before.
+  Empty write transactions are unchanged.
 
 ### Meilisearch v1.55's heed fork (ADR-0027, #102)
 
@@ -264,6 +321,21 @@ retires divergence D-001 (single-process only).
   does not free dead readers' slots (call `clear_stale_readers`).
   `Env::sync` serializes only with this process's commits. Details: SPEC 04
   §12.1.
+
+### Write-cursor puts keep their position (#7)
+
+#### Changed
+
+- **A put through the write cursor of the key it sits on now writes at the
+  cursor's position**, as LMDB's `MDB_CURRENT` put does: no search from the
+  root for the put, and none for the next step, which resumes from the kept
+  path. This covers `RwCursor::put_current` and heed's `put_current` on
+  `iter_mut` / `range_mut` / `prefix_iter_mut` and their reverse forms. A
+  put that splits its leaf, a put with flags, or a put of another key still
+  takes the keyed path and re-seeks once (SPEC 03 §5.4b). The new
+  `put/cursor/rewrite` benchmark (10 000 same-size rewrites through
+  `range_mut` + `put_current`) went from 5.47× to 2.49× LMDB's time on
+  macOS arm64 (ZeroDB 5.33 ms → 2.43 ms).
 
 ### `WRITE_MAP` commits flush the used prefix, as LMDB (#45, ADR-0026)
 

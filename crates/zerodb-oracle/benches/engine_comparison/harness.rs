@@ -44,6 +44,7 @@ pub trait Backend {
 
     // -- write -----------------------------------------------------------
     fn bulk_put(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8]);
+    fn bulk_put_abort(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8]);
     fn bulk_put_append(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8]);
     fn bulk_put_reserved(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8]);
     fn commit_churn(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8], per_txn: usize);
@@ -51,6 +52,7 @@ pub trait Backend {
     fn delete_range(env: &Self::Env, db: Self::Db, lo: &[u8], hi: &[u8]) -> usize;
     fn clear_db(env: &Self::Env, db: Self::Db);
     fn cursor_drain(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8]);
+    fn cursor_rewrite(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8]);
     fn delete_reinsert(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8], rounds: usize);
 
     // -- read ------------------------------------------------------------
@@ -59,6 +61,7 @@ pub trait Backend {
     /// value through `black_box` — the control for the `get/val/*_touch` rungs,
     /// so overflow-value rungs measure the value chase and copy rather than an
     /// elided read.
+    fn point_get_txn_each(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>]) -> usize;
     fn point_get_touch(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>]) -> usize;
     fn point_get_multi(env: &Self::Env, dbs: &[Self::Db], keys: &[Vec<u8>]) -> usize;
     fn point_get_hot(env: &Self::Env, db: Self::Db, key: &[u8], n: usize) -> usize;

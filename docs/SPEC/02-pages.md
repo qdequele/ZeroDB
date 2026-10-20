@@ -305,7 +305,8 @@ to the annex. Validation reads `fl_count` *before* the CRC is checked, so it
 is bounds-checked first (`fl_count ≤ (psize − 176) / 8`, else the slot is
 invalid) to bound the CRC read. Reserved bytes inside the covered range MUST
 be zero so the CRC is deterministic. Implementation of CRC32C is ADR-0002 §D1
-(software table in Phase 1; ARMv8 `crc32c` instructions in Phase 3.9).
+(software slicing-by-8 tables in Phase 1, bit-identical to the byte-wise
+table algorithm; ARMv8 `crc32c` instructions in Phase 3.9).
 
 ### §3.4 — Env-creation protocol (both slots initialised, empty DB)
 

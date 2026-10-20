@@ -27,6 +27,7 @@
 //! and the read API; the write side (create/clear/drop, catalog write-back)
 //! lives in [`crate::rwtxn`].
 
+use std::cell::Cell;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -261,8 +262,13 @@ impl RoTxn<'_> {
             return None;
         }
         let table = self.named_dense.get_or_init(|| {
-            let n = self.env_ref().inner().max_dbs().min(DENSE_DBI_LIMIT);
-            (0..n).map(|_| NamedEntry::default()).collect()
+            let n = self.env_ref().inner().max_dbs().min(DENSE_DBI_LIMIT) as usize;
+            // `try_with` fails only during thread-local teardown. A parked
+            // table of another length (another env's `max_dbs`) is freed.
+            match SPARE_NAMED.try_with(Cell::take).ok().flatten() {
+                Some(spare) if spare.len() == n => spare,
+                _ => (0..n).map(|_| NamedEntry::default()).collect(),
+            }
         });
         table.get(dbi as usize)
     }
@@ -312,6 +318,22 @@ struct NamedEntry {
     checked: MemoCell,
 }
 
+thread_local! {
+    /// One cleared named-database table, left by the last read txn dropped on
+    /// this thread that had one.
+    ///
+    /// A read txn that touches a named database allocates its dbi-indexed
+    /// table (`named_dense`), and frees it at drop; for a txn that reads one
+    /// key that was a large share of its cost. LMDB keeps its per-txn
+    /// `mt_dbs` array with the transaction object, which a caller reuses
+    /// through `mdb_txn_reset` / `mdb_txn_renew`; heed 0.22.1 does not expose
+    /// those, so the reuse happens here. Every entry is reset to its default
+    /// before the table is parked, so a later txn starts with an empty table,
+    /// exactly as with a fresh allocation: records belong to one snapshot and
+    /// are never carried over.
+    static SPARE_NAMED: Cell<Option<Box<[NamedEntry]>>> = const { Cell::new(None) };
+}
+
 /// Dbis below this get [`RoTxn`]'s lock-free record table (see
 /// `named_dense`). Meilisearch opens ~30 named DBs per env and hannoy a
 /// handful, so this covers every known consumer while bounding the
@@ -329,6 +351,15 @@ impl Drop for RoTxn<'_> {
         self.env_ref().inner().release_reader(self.slot);
         // ADR-0024: an end without a commit frees what this txn opened.
         self.end_handles(false);
+        // Park the named-DB table, cleared, for the next txn on this thread.
+        if let Some(mut table) = self.named_dense.take() {
+            for entry in table.iter_mut() {
+                *entry = NamedEntry::default();
+            }
+            // Replaces (and frees) a table parked first. Fails only during
+            // thread-local teardown, which frees `table`.
+            let _ = SPARE_NAMED.try_with(|spare| spare.set(Some(table)));
+        }
     }
 }
 

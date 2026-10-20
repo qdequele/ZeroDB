@@ -162,6 +162,54 @@ impl<'a> Source<'a> {
 const MEMO_LEVELS: usize = 7;
 /// Slots in level 0 (8 KiB) — sized so short txns allocate once and small.
 const MEMO_BASE_SLOTS: usize = 1024;
+/// Level-0 inserts whose slot index the memo logs, so that dropping it can
+/// clear exactly those slots and hand the zeroed level to the next memo built
+/// on the same thread (see [`ValidatedPages`]'s `Drop`). A point read on a
+/// tree of a few million keys records about four pages; 32 covers a short
+/// transaction of several reads. A memo with more level-0 entries frees its
+/// level instead. The log lives in level 0's allocation, after its
+/// [`MEMO_BASE_SLOTS`] table slots, so a memo that never reads costs nothing
+/// extra to build.
+const MEMO_LOG_SLOTS: usize = 32;
+
+/// Table slots of level `li` (its allocation may carry more: level 0's log).
+const fn level_slots(li: usize) -> usize {
+    MEMO_BASE_SLOTS << (2 * li)
+}
+
+thread_local! {
+    /// One all-zero level 0, left by the last memo dropped on this thread.
+    ///
+    /// Opening a read transaction and reading one key used to allocate,
+    /// zero and free this 8 KiB level every time: about a fifth of the
+    /// per-transaction time of `short_txn_census`. LMDB avoids per-request
+    /// setup by letting the caller keep a transaction and re-arm it
+    /// (`mdb_txn_reset` / `mdb_txn_renew`); heed 0.22.1 does not expose that,
+    /// so the reuse happens here instead. The level holds no entry when it is
+    /// parked (dropping the memo zeroes every slot it wrote), so a new
+    /// transaction starts with an empty memo, exactly as with a fresh
+    /// allocation. One level per thread bounds the parked memory to 8 KiB per
+    /// thread that ever dropped a memo.
+    static SPARE_BASE: Cell<Option<Box<[AtomicU64]>>> = const { Cell::new(None) };
+}
+
+/// The zeroed allocation of level `li`: the parked level 0 when one is
+/// there, else a fresh one. Level 0 carries its insert log after the table.
+fn new_level(li: usize) -> Box<[AtomicU64]> {
+    let mut len = level_slots(li);
+    if li == 0 {
+        // `try_with` fails only while the thread's locals are being torn
+        // down; allocate then.
+        if let Some(level) = SPARE_BASE.try_with(Cell::take).ok().flatten() {
+            return level;
+        }
+        len += MEMO_LOG_SLOTS;
+    }
+    (0..len)
+        .map(|_| AtomicU64::new(0))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
 
 /// Which validated shape a memo entry vouches for (kind-tagged memo). The kind is
 /// part of the memo **key**, so a hit can hand out a fully *trusted* typed
@@ -198,7 +246,10 @@ pub struct ValidatedPages<'e> {
     levels: [OnceLock<Box<[AtomicU64]>>; MEMO_LEVELS],
     /// Highest level inserts currently target.
     cur: AtomicUsize,
-    /// Per-level advisory fill counts (½ load-factor gate only).
+    /// Per-level fill counts: the ½ load-factor gate, and at drop the number
+    /// of level-0 slots written (each successful insert counts once). Level
+    /// 0's allocation ends with the slot index of its first
+    /// [`MEMO_LOG_SLOTS`] inserts, in insert order, read only by `Drop`.
     counts: [AtomicUsize; MEMO_LEVELS],
     /// The env's [`FileTrust`] policy, copied in at txn begin (ADR-0014).
     /// When set, a memo miss on a map page takes the header-checked
@@ -312,8 +363,9 @@ impl<'e> ValidatedPages<'e> {
         // the page bytes themselves are immutable and were readable before).
         // A stale `cur` or slot read is only ever a miss → revalidation.
         let top = self.cur.load(Ordering::Acquire).min(MEMO_LEVELS - 1);
-        for level in self.levels.iter().take(top + 1) {
+        for (li, level) in self.levels.iter().enumerate().take(top + 1) {
             let Some(lvl) = level.get() else { continue };
+            let lvl = &lvl[..level_slots(li)];
             let mask = lvl.len() - 1;
             let mut i = (Self::mix(key) as usize) & mask;
             // Bounded probe: the ½ load-factor gate guarantees empty slots,
@@ -336,12 +388,8 @@ impl<'e> ValidatedPages<'e> {
             // index; `get_or_init` does its own synchronization for the
             // allocation itself.
             let li = self.cur.load(Ordering::Acquire).min(MEMO_LEVELS - 1);
-            let lvl = self.levels[li].get_or_init(|| {
-                (0..MEMO_BASE_SLOTS << (2 * li))
-                    .map(|_| AtomicU64::new(0))
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice()
-            });
+            let alloc = self.levels[li].get_or_init(|| new_level(li));
+            let (lvl, log) = alloc.split_at(level_slots(li));
             // ½ load-factor gate: keeps probes short and guarantees empty
             // slots so `contains` terminates on the first `0`.
             if self.counts[li].load(Ordering::Relaxed) * 2 >= lvl.len() {
@@ -365,9 +413,16 @@ impl<'e> ValidatedPages<'e> {
                 // completed publication by a racing thread.
                 match lvl[i].compare_exchange(0, key, Ordering::Release, Ordering::Acquire) {
                     Ok(_) => {
-                        // Advisory only (gates the load factor); `Relaxed`
-                        // suffices — no data is published through it.
-                        self.counts[li].fetch_add(1, Ordering::Relaxed);
+                        // `Relaxed` suffices: no data is published through
+                        // the count or the log. Only `Drop` reads them as
+                        // exact, under `&mut self`, and whatever handed it
+                        // that exclusive access (a thread join, the last
+                        // `Arc` drop) orders every insert before it.
+                        let n = self.counts[li].fetch_add(1, Ordering::Relaxed);
+                        if let Some(entry) = log.get(n) {
+                            // Only level 0 has a log (`log` is empty above it).
+                            entry.store(i as u64, Ordering::Relaxed);
+                        }
                         return;
                     }
                     Err(s) if s == key => return,
@@ -384,6 +439,41 @@ impl<'e> ValidatedPages<'e> {
                 return;
             }
         }
+    }
+}
+
+impl Drop for ValidatedPages<'_> {
+    /// Clear level 0 slot by slot and park it for the next memo on this
+    /// thread, when every slot written is logged; otherwise free it.
+    ///
+    /// Soundness: a memo entry vouches for a page only within one snapshot.
+    /// It is keyed by page number and kind, not by the page's stamp, so an
+    /// entry carried into a later transaction could vouch for a page that
+    /// was freed and rewritten since. The parked level therefore holds no
+    /// entry: `counts[0]` is the exact number of level-0 slots written (one
+    /// count per successful insert), and when it is at most
+    /// [`MEMO_LOG_SLOTS`] every one of those slots is in the level's log.
+    fn drop(&mut self) {
+        let Some(mut base) = self.levels[0].take() else {
+            return;
+        };
+        let written = *self.counts[0].get_mut();
+        if written > MEMO_LOG_SLOTS {
+            return;
+        }
+        let (table, log) = base.split_at_mut(level_slots(0));
+        for logged in &mut log[..written] {
+            let slot = std::mem::take(logged.get_mut());
+            // A logged index is below `level_slots(0)`: it was a table index.
+            *table[usize::try_from(slot).expect("logged slot index")].get_mut() = 0;
+        }
+        debug_assert!(
+            base.iter_mut().all(|slot| *slot.get_mut() == 0),
+            "a parked memo level must hold no entry"
+        );
+        // Replaces (and frees) a level another memo on this thread parked
+        // first. Fails only during thread-local teardown, which frees `base`.
+        let _ = SPARE_BASE.try_with(|spare| spare.set(Some(base)));
     }
 }
 
@@ -1952,6 +2042,89 @@ mod tests {
         let validating = ValidatedPages::new();
         leaf_view(src(&img), PS, leaf, Some(&validating)).expect("leaf validates");
         assert!(validating.contains(leaf, PageKind::Leaf));
+    }
+
+    /// Take this thread's parked memo level, if any.
+    fn take_spare() -> Option<Box<[AtomicU64]>> {
+        SPARE_BASE.with(Cell::take)
+    }
+
+    /// A dropped memo parks its level 0 for the next memo on the thread with
+    /// every entry cleared: a later transaction must not inherit a page this
+    /// one validated (memo entries are keyed by page number, not stamp, so
+    /// the page may have been rewritten since). The next memo reuses the
+    /// parked level and starts empty.
+    #[test]
+    fn dropped_memo_parks_an_empty_level_for_the_next() {
+        drop(take_spare());
+        let first = ValidatedPages::new();
+        for pgno in 1..=8 {
+            first.insert(pgno, PageKind::Leaf);
+            first.insert(pgno + 100, PageKind::Branch);
+        }
+        assert!(first.contains(3, PageKind::Leaf));
+        let level = first.levels[0].get().expect("level 0 allocated").as_ptr();
+        drop(first);
+
+        let second = ValidatedPages::new();
+        for pgno in 1..=8 {
+            assert!(!second.contains(pgno, PageKind::Leaf));
+            assert!(!second.contains(pgno + 100, PageKind::Branch));
+        }
+        second.insert(42, PageKind::Leaf);
+        let reused = second.levels[0].get().expect("level 0 allocated");
+        assert_eq!(reused.as_ptr(), level, "the parked level is reused");
+        assert!(second.contains(42, PageKind::Leaf));
+        assert!(!second.contains(3, PageKind::Leaf), "no entry carried over");
+        assert_eq!(
+            reused[..level_slots(0)]
+                .iter()
+                .filter(|s| s.load(Ordering::Relaxed) != 0)
+                .count(),
+            1,
+            "only the new transaction's entry is in the level"
+        );
+    }
+
+    /// A memo that wrote more level-0 slots than it logs frees its level
+    /// rather than parking a level it cannot clear slot by slot; a memo that
+    /// never allocated parks nothing.
+    #[test]
+    fn memo_past_the_log_frees_its_level() {
+        drop(take_spare());
+        let big = ValidatedPages::new();
+        for pgno in 0..=MEMO_LOG_SLOTS as u64 {
+            big.insert(pgno, PageKind::Leaf);
+        }
+        drop(big);
+        assert!(take_spare().is_none(), "an over-full level is freed");
+
+        drop(ValidatedPages::new());
+        assert!(take_spare().is_none(), "an unused memo parks nothing");
+    }
+
+    /// Inserts racing from several threads are all logged, so the memo's
+    /// drop still parks a level with no entry left in it.
+    #[test]
+    fn racing_inserts_are_all_cleared_at_drop() {
+        drop(take_spare());
+        let memo = ValidatedPages::new();
+        std::thread::scope(|s| {
+            for t in 0..4u64 {
+                let memo = &memo;
+                s.spawn(move || {
+                    for pgno in 0..6 {
+                        // Threads 0/1 and 2/3 insert the same keys: racing
+                        // duplicates must count once.
+                        memo.insert((t / 2) * 1000 + pgno, PageKind::Leaf);
+                    }
+                });
+            }
+        });
+        assert_eq!(memo.counts[0].load(Ordering::Relaxed), 12);
+        drop(memo);
+        let parked = take_spare().expect("a level within the log is parked");
+        assert!(parked.iter().all(|s| s.load(Ordering::Relaxed) == 0));
     }
 
     /// ADR-0018: a leaf fully validated by one txn is taken from the env-wide
