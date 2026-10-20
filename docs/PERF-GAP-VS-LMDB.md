@@ -235,7 +235,7 @@ are bench server ratios, before → after, unless stated.
 | Technique | What changed | Before → after | Pointer |
 |---|---|---|---|
 | **The `non_free_pages_size` item** | Meilisearch calls it before every register write txn. It decoded the whole free list; it now sums per-DB page counts from the catalog, as heed does over LMDB, and is correct under `WRITE_MAP`. | 317 µs → 148 ns (0.41×) | f98374a, c82e5c8 |
-| **Compaction memory (compaction RAM, bounded-memory compaction)** | Compaction, the compacting copy and `zerodb-tools load` held about twice the env size in RAM. The rebuild now streams: peak memory is O(tree depth × page size) plus the write buffers, and the destination appears by atomic rename. `load` still parses its input in memory (#63). | — | ADR-0009 |
+| **Compaction memory (compaction RAM, bounded-memory compaction)** | Compaction, the compacting copy and `zerodb-tools load` held about twice the env size in RAM. The rebuild now streams: peak memory is O(tree depth × page size) plus the write buffers, and the destination appears by atomic rename. `load` also streams its input (#63). | — | ADR-0009 |
 | **Env copies write each byte once** | Copies were staged then copied again, the raw copy built the image in RAM, the compacting copy wrote one page per syscall. Now raw writes straight from the map and compact goes through 1 MiB buffers handed to a writer thread (`mdb_env_copyfd1`/`2`). | `maint/copy/raw` 2.53× → 0.93×, `maint/copy/compact` 3.31× → 0.98× | 2f479d2, 7dc3d1c |
 
 ## Tried and not adopted
@@ -304,9 +304,10 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
   `env/txn/ro_get_one` −26 % on macOS); a Linux re-measure is pending.
 - **Page fill under random inserts** — the unsorted 10M load makes an 8 %
   larger file than LMDB's [S]. No issue yet.
-- **`zerodb-tools load` memory** — reads the whole dump into memory, then
-  sorts and de-duplicates it there (#63). The check after a load now runs over
-  the memory map.
+- **`zerodb-tools load` memory** — streams the dump since #63: peak memory
+  footprint ~156 MiB for a 0.7 GB or a 1.4 GB dump (was 1.2 / 2.4 GB), against
+  ~1 MiB for LMDB's `mdb_load`, which commits every 100 records where `load`
+  commits every 64 MiB (a 4 MiB batch measured 20 MiB but +50 % wall time).
 
 **Not yet measured**
 
@@ -324,8 +325,9 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
   on-disk format change that needs approval.
 - Consumer-facing APIs beyond LMDB: batched lookups (#53), single-descent
   get-merge-put (#52), group commit (#36), relaxed durability (#35), prefetch
-  hints (#57), map warm-up (#61), reflink copies (#64), parallel `check`
-  (#65).
+  hints (#57), map warm-up (#61), reflink copies (#64). `check` is now
+  parallel (#65; a 2.1 GB env checks in 0.17 s instead of 0.42 s on an
+  8-core Mac, warm cache); LMDB has no checker to compare with.
 
 ## Deliberate differences
 

@@ -38,6 +38,60 @@ In a crud-bench-shaped repro (500k entries, ~0.9 GB), a full count went from
 one; range scans and point gets got faster too, and no rung regressed. New
 benchmark rung `scan/full/big`. Numbers:
 `benches/results/2026-10-19-crud-scan-count-and-batch-delete.md`.
+### A deleted environment no longer blocks opening an unrelated one (#123)
+
+ZeroDB refuses a second open of a lock file this process already has open,
+recognizing the file by its inode number. When an environment's directory
+was deleted while the environment was open, closing it freed the lock
+file's inode before its entry left that registry. On filesystems that reuse
+inode numbers at once (ext4, for one), a lock file created by another thread
+in that brief window got the same number and its open failed with
+`EnvAlreadyOpened`, although its directory was brand new. The descriptor now
+closes and the entry is removed under the registry's lock, so no open can see
+the stale entry. Reproduced on Linux ext4 (two false refusals in 30 s of
+concurrent opens; none in 60 s with the fix).
+
+### `zerodb-tools load` streams its input (#63)
+
+`load` used to read the whole dump into memory, parse every record into
+owned buffers and sort each database there, so its peak memory grew with the
+dump. It now reads the dump a line at a time, twice: a first pass rejects a
+malformed dump (or an over-long key) before the destination is created, the
+second writes each database in dump order in 64 MiB write txns. A dump
+piped in (`load /dev/stdin <dir>`) is copied during the first pass to an
+unlinked spool file in the destination directory. Peak memory is about one batch
+plus its dirty pages, whatever the dump's size. The dump format and the
+command line are unchanged.
+
+- Generated dumps of 0.7 GB and 1.4 GB (macOS aarch64, `/usr/bin/time -l`
+  peak memory footprint): 1,212 MiB → 156 MiB and 2,420 MiB → 157 MiB.
+  LMDB's `mdb_load` (Meilisearch fork) on the same 0.7 GB dump: ~1 MiB,
+  since it commits every 100 records.
+- Writing the main database before the named ones keeps its keys on the
+  append path, so the loaded file of the 0.7 GB dump is 379 MiB instead of
+  619 MiB (half-full pages before), close to LMDB's 367 MiB.
+- In a hand-edited dump, records out of order still land in key order, and
+  of several records with the same key in a database the first is kept, as
+  before; this now also holds across repeated blocks of the same database.
+
+### `check` walks large environments on several threads (#65)
+
+`zerodb-tools check`, the check after `zerodb-tools load`, and
+`check::check_image` / `check::check_snapshot` walked every tree on one
+thread and kept the reached pages in a hash set. The reached pages are now a
+bitmap (one bit per page instead of a hash-set entry), and an environment of
+at least 16 384 pages is walked on up to 16 threads: each record's root
+children and each named database are independent jobs. A parallel walk that
+finds anything is redone on one thread, so the findings and their order
+never depend on the thread count. Pages listed free more than
+once (INV-24) are now reported in ascending page order rather than hash
+order.
+
+- 2.1 GB environment, Apple M-series (8 cores, busy host, indicative):
+  `zerodb-tools check` 0.39-0.47 s -> 0.16-0.20 s with the page cache warm;
+  the walk alone 238 ms -> 205 ms on one thread, 60 ms on eight. LMDB has no
+  equivalent checker.
+
 ### Short read transactions reuse their memory (#25)
 
 A read transaction that reads one key used to allocate, zero and free two

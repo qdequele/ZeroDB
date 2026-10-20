@@ -73,3 +73,93 @@ fn stat_runs_on_a_closed_env() {
     assert!(report.contains("database <main>:"));
     assert!(report.contains("free_pages:"));
 }
+
+/// Dump `src`, load the dump into a fresh env, check it, dump it again and
+/// require byte-identical text. Returns the dump.
+fn round_trip(src: &Path, page_size: u32) -> String {
+    let dump1 = zerodb_tools::commands::cmd_dump(src).unwrap();
+    let dump_file = tmp_dir("rt-dumpfile").join("out.dump");
+    std::fs::write(&dump_file, dump1.as_bytes()).unwrap();
+    let dst = tmp_dir("rt-dst");
+    zerodb_tools::commands::cmd_load(&dump_file, &dst, page_size, 1 << 20).unwrap();
+    let (report, clean) = zerodb_tools::commands::cmd_check(&dst).unwrap();
+    assert!(clean, "reloaded env failed check:\n{report}");
+    let dump2 = zerodb_tools::commands::cmd_dump(&dst).unwrap();
+    assert_eq!(dump1, dump2, "round-trip dump differs");
+    dump1
+}
+
+fn open_env(dir: &Path) -> Env {
+    EnvOpenOptions::new()
+        .map_size(256 << 20)
+        .max_dbs(1024)
+        .open(dir)
+        .unwrap()
+}
+
+#[test]
+fn round_trip_empty_env() {
+    let a = tmp_dir("rt-empty");
+    let env = open_env(&a);
+    env.write_txn().unwrap().commit().unwrap();
+    drop(env);
+    let dump = round_trip(&a, 4096);
+    assert_eq!(
+        dump,
+        "VERSION=3\nformat=bytevalue\ntype=btree\nHEADER=END\nDATA=END\n"
+    );
+}
+
+#[test]
+fn round_trip_many_named_dbs() {
+    let a = tmp_dir("rt-many");
+    let env = open_env(&a);
+    let mut wtxn = env.write_txn().unwrap();
+    for d in 0u32..300 {
+        let db = env
+            .create_database(&mut wtxn, Some(format!("db-{d:03}").as_bytes()))
+            .unwrap();
+        for i in 0..(d % 7) {
+            db.put(&mut wtxn, &i.to_be_bytes(), &d.to_le_bytes())
+                .unwrap();
+        }
+    }
+    wtxn.commit().unwrap();
+    drop(env);
+    let dump = round_trip(&a, 4096);
+    assert_eq!(dump.matches("database=").count(), 300);
+}
+
+#[test]
+fn round_trip_large_values_and_special_keys() {
+    let a = tmp_dir("rt-special");
+    let env = open_env(&a);
+    let mut wtxn = env.write_txn().unwrap();
+    let main = env.main_database();
+    // Keys made of bytes that mean something in the text format or in C
+    // strings, and the longest key the engine accepts.
+    let keys: Vec<Vec<u8>> = vec![
+        vec![0],
+        vec![0, 0, 0],
+        vec![b'\n'],
+        b"\r\n".to_vec(),
+        b" DATA=END".to_vec(),
+        vec![0xff; 3],
+        vec![b'k'; 511],
+    ];
+    for (i, k) in keys.iter().enumerate() {
+        main.put(&mut wtxn, k, &[i as u8; 3]).unwrap();
+    }
+    let blobs = env
+        .create_database(&mut wtxn, Some(&[0, b'\n', 0xff]))
+        .unwrap();
+    blobs.put(&mut wtxn, b"empty", b"").unwrap();
+    blobs
+        .put(&mut wtxn, b"one-mib", &vec![0xa5; 1 << 20])
+        .unwrap();
+    blobs.put(&mut wtxn, b"page", &vec![1; 4096]).unwrap();
+    wtxn.commit().unwrap();
+    drop(env);
+    round_trip(&a, 4096);
+    round_trip(&a, 65536);
+}
