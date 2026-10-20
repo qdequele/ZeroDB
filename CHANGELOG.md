@@ -6,6 +6,19 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### A deleted environment no longer blocks opening an unrelated one (#123)
+
+ZeroDB refuses a second open of a lock file this process already has open,
+recognizing the file by its inode number. When an environment's directory
+was deleted while the environment was open, closing it freed the lock
+file's inode before its entry left that registry. On filesystems that reuse
+inode numbers at once (ext4, for one), a lock file created by another thread
+in that brief window got the same number and its open failed with
+`EnvAlreadyOpened`, although its directory was brand new. The descriptor now
+closes and the entry is removed under the registry's lock, so no open can see
+the stale entry. Reproduced on Linux ext4 (two false refusals in 30 s of
+concurrent opens; none in 60 s with the fix).
+
 ### `zerodb-tools load` streams its input (#63)
 
 `load` used to read the whole dump into memory, parse every record into
