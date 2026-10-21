@@ -150,6 +150,13 @@ pub trait Backing: Send + Sync {
     /// data file (SPEC 02 §8).
     fn try_clone_file(&self) -> std::io::Result<std::fs::File>;
 
+    /// The path the data file was opened at, if the backing is a file
+    /// opened by path ([`Env::data_path`]). The default is `None`: test and
+    /// fault-injection backings have no file a raw copy may read directly.
+    fn data_path(&self) -> Option<&Path> {
+        None
+    }
+
     /// Positioned write of `data` starting at page `pgno` (commit step C2/C4,
     /// SPEC 04 §9). `data.len()` is a multiple of `psize` (one page, or a whole
     /// overflow run). Writing past EOF extends the file. Not durable until
@@ -1565,6 +1572,13 @@ impl EnvInner {
         }
     }
 
+    /// The path the data file was opened at (SPEC 00 row 17: a raw copy
+    /// clones the file it names, after checking it is still the same file).
+    #[must_use]
+    pub fn data_path(&self) -> Option<&Path> {
+        self.backing.as_ref().and_then(|b| b.data_path())
+    }
+
     /// `dup()` the data-file fd for raw snapshot streaming (SPEC 00 row 22).
     ///
     /// # Errors
@@ -2028,6 +2042,15 @@ impl Env {
     /// Propagates the `dup` I/O error.
     pub fn try_clone_inner_file(&self) -> Result<std::fs::File, Error> {
         self.inner.try_clone_inner_file()
+    }
+
+    /// The path the data file was opened at, or `None` for a backing that
+    /// is not a file opened by path. The file at that path may since have
+    /// been renamed or replaced: compare it with
+    /// [`Env::try_clone_inner_file`] before relying on it.
+    #[must_use]
+    pub fn data_path(&self) -> Option<&Path> {
+        self.inner.data_path()
     }
 
     /// Number of strong references to the shared inner (this handle included).

@@ -25,7 +25,7 @@ mod mmap;
 pub mod testmap;
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use file::{
@@ -109,6 +109,8 @@ fn grow_regions(
 pub struct MmapBacking {
     regions: MapRegions,
     file: File,
+    /// The path `file` was opened at, for [`Backing::data_path`].
+    path: PathBuf,
     /// `MDB_NORDAHEAD`: every new mapping is advised `MADV_RANDOM`.
     random_access: bool,
 }
@@ -137,6 +139,10 @@ impl Backing for MmapBacking {
 
     fn try_clone_file(&self) -> std::io::Result<File> {
         self.file.try_clone()
+    }
+
+    fn data_path(&self) -> Option<&Path> {
+        Some(&self.path)
     }
 
     fn read_meta_copy(&self, slot: u64, psize: u32, buf: &mut [u8]) -> std::io::Result<()> {
@@ -198,6 +204,8 @@ impl Backing for MmapBacking {
 pub struct WriteMapBacking {
     regions: MapRegions,
     file: File,
+    /// The path `file` was opened at, for [`Backing::data_path`].
+    path: PathBuf,
     /// `MDB_NORDAHEAD`: every new mapping is advised `MADV_RANDOM`.
     random_access: bool,
     /// A lower bound of the data file's length: the last length this process
@@ -263,6 +271,10 @@ impl Backing for WriteMapBacking {
 
     fn try_clone_file(&self) -> std::io::Result<File> {
         self.file.try_clone()
+    }
+
+    fn data_path(&self) -> Option<&Path> {
+        Some(&self.path)
     }
 
     fn read_meta_copy(&self, slot: u64, psize: u32, buf: &mut [u8]) -> std::io::Result<()> {
@@ -552,7 +564,14 @@ pub fn open_or_create_with_advice(
         }
         let map_size = requested_map_size.unwrap_or(default_map_size);
         let file = file::create_env_file(data_path, requested_page_size, map_size)?;
-        let backing = map_backing(file, map_size, write_map, random_access, grow_file)?;
+        let backing = map_backing(
+            file,
+            data_path,
+            map_size,
+            write_map,
+            random_access,
+            grow_file,
+        )?;
         return Ok(Opened {
             backing,
             page_size: requested_page_size,
@@ -612,7 +631,14 @@ pub fn open_or_create_with_advice(
             map_size = map_size.max(min);
         }
     }
-    let backing = map_backing(file, map_size, write_map, random_access, grow_file)?;
+    let backing = map_backing(
+        file,
+        data_path,
+        map_size,
+        write_map,
+        random_access,
+        grow_file,
+    )?;
 
     Ok(Opened {
         backing,
@@ -632,6 +658,7 @@ pub fn open_or_create_with_advice(
 /// both writer locks before writing through the map.
 fn map_backing(
     file: File,
+    path: &Path,
     map_size: u64,
     write_map: bool,
     random_access: bool,
@@ -654,6 +681,7 @@ fn map_backing(
         Ok(Box::new(WriteMapBacking {
             regions,
             file,
+            path: path.to_path_buf(),
             random_access,
             file_len: AtomicU64::new(file_len),
         }))
@@ -666,6 +694,7 @@ fn map_backing(
         Ok(Box::new(MmapBacking {
             regions,
             file,
+            path: path.to_path_buf(),
             random_access,
         }))
     }

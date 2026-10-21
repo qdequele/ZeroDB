@@ -6,6 +6,22 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### Raw environment copies read the data file: a clone on APFS, `copy_file_range` on Linux (ADR-0032)
+
+A non-compacting copy (`copy_to_file` with `CompactionOption::Disabled`) wrote
+every page from the memory map. It now takes the pages from the data file while
+its read transaction pins the snapshot, then writes the snapshot's two meta
+pages over the copy's. On macOS, a copy to a path clones the file (an APFS
+clone shares the file's blocks) and trims it to the snapshot; a copy with a
+progress callback, a copy into an open file, and a `WRITE_MAP` env still stream
+from the map. On Linux, when the copy lands on the data file's own XFS, btrfs
+or bcachefs filesystem, both forms clone the snapshot's bytes with
+`copy_file_range`; on other filesystems (ext4, where the in-kernel copy measured
+slower) they still stream. Writers are not paused, the output is byte-identical
+to before, and nothing is synced. A 3.2 GiB raw copy to a path on APFS went
+from 20 s to 0.19 s (LMDB: 20–23 s).
+New example `crates/zerodb-oracle/examples/raw_copy_bench.rs`.
+
 ### Hardware CRC32C for the meta checksum on aarch64 (ADR-0031)
 
 On aarch64 CPUs with the `crc` feature (every Graviton and Apple M-series
