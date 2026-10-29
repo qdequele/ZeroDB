@@ -84,7 +84,10 @@ trusted-file mode) so the default stays a faithful drop-in.
   amendment 15; its body holds no `unsafe` block) — nothing beyond what the
   mirrored heed surface forces;
 - `zerodb-tools`: the `migrate-lmdb` feature's heed `open`
-  (`src/migrate.rs`), in use and awaiting maintainer review.
+  (`src/migrate.rs`), in use and awaiting maintainer review;
+- `benches/kv-compare` (a standalone crate outside the workspace): the two
+  heed `open` calls, the `FileTrust::trust_contents` call, one `getrusage`
+  and one `sync`, proposed in ADR-0033 and awaiting maintainer review.
 
 The in-place `WRITE_MAP` exception covers only calling `zerodb-io`'s `unsafe`
 map-slice broker to realize a dirty page in the writable map at a freshly

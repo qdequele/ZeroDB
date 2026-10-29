@@ -41,3 +41,4 @@ issues.
 | 0030 | [A copy-on-write copies only a page's used bytes, as LMDB](adr/0030-cow-copies-used-bytes.md) | Accepted (Option A, 2026-10-19), implemented | Performance (writes), bytes on disk |
 | 0031 | [Hardware CRC32C for the meta checksum](adr/0031-hardware-crc32c.md) | Accepted (Option B, 2026-10-19), implemented; amends the `unsafe` policy | Performance (commit), `unsafe` policy |
 | 0032 | [Raw environment copy from the data file: clone or in-kernel copy](adr/0032-raw-copy-block-clone.md) | Proposed (#64) | Env copy, beyond LMDB |
+| 0033 | [A standalone benchmark crate comparing ZeroDB with other key-value stores](adr/0033-kv-compare-bench.md) | Proposed | Benchmarks, dependencies |

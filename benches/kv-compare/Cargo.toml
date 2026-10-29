@@ -1,0 +1,33 @@
+# kv-compare — the public comparison of ZeroDB with other embedded key-value
+# stores (LMDB, RocksDB, fjall, redb, SQLite). See README.md.
+#
+# Standalone on purpose: it has its own `[workspace]` so the other engines'
+# crates never enter the ZeroDB workspace, its lock file or its dependency
+# allowlist (ADR-0033).
+[package]
+name = "kv-compare"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[workspace]
+
+[dependencies]
+# ZeroDB through its heed surface, the way Meilisearch uses it.
+heed-zerodb = { path = "../../crates/heed-zerodb" }
+# LMDB: heed 0.22.1 vendors the Meilisearch LMDB fork (lmdb-master-sys 0.2.6),
+# the engine ZeroDB replaces.
+heed = "=0.22.1"
+fjall = "=3.1.13"
+redb = "=4.4.0"
+rocksdb = { version = "=0.25.0", default-features = false, features = ["lz4", "snappy", "zstd"] }
+rusqlite = { version = "=0.41.0", features = ["bundled"] }
+libc = "0.2"
+
+[profile.release]
+# One codegen unit and fat LTO for every engine alike, so no Rust engine pays
+# for crate boundaries that a single C file (LMDB, SQLite) does not have.
+lto = "fat"
+codegen-units = 1
+debug = 1
