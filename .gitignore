@@ -10,3 +10,5 @@ __pycache__/
 # a local CLAUDE.md can import it with `@AGENTS.md`).
 /CLAUDE.md
 /.claude/
+# kv-compare raw runs; published results are copied into benches/results/.
+/benches/kv-compare/results/
