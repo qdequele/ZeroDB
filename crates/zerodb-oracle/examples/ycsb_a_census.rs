@@ -71,14 +71,16 @@ macro_rules! census {
             // The harness's 10^12-byte map, rounded down to a 64 KiB multiple
             // as the public-suite report describes.
             let map_size = 1_000_000_000_000usize & !0xFFFF;
+            let mut opts = EnvOpenOptions::new();
+            opts.map_size(map_size);
+            {
+                let $o = &mut opts;
+                $extra
+            }
             // SAFETY: a private directory used by this process only; the
             // flags are the harness's no-sync set.
             let env = unsafe {
-                let mut opts = EnvOpenOptions::new();
-                opts.map_size(map_size);
                 opts.flags(EnvFlags::NO_SYNC | EnvFlags::NO_READ_AHEAD);
-                let $o = &mut opts;
-                $extra
                 opts.open(dir)
             }
             .expect("open env");
