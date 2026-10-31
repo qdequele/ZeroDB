@@ -17,7 +17,9 @@
 //! the begin / put / commit split.
 //!
 //! `CENSUS_PAGE_SIZE=<bytes>` sets ZeroDB's page size (LMDB always uses the
-//! OS page size), so a 16 KiB-page host can reproduce a 4 KiB-page file. The
+//! OS page size), so a 16 KiB-page host can reproduce a 4 KiB-page file, and
+//! `CENSUS_TRUST=1` opens ZeroDB with the trusting file policy (ADR-0014),
+//! the no-validation reference. The
 //! data files are read once through the page cache after the load, so the
 //! timed phase measures the engine rather than first-touch disk reads.
 
@@ -201,6 +203,11 @@ census!(zerodb, heed_zerodb, |opts| {
         .and_then(|s| s.parse().ok())
     {
         opts.page_size(ps);
+    }
+    if std::env::var_os("CENSUS_TRUST").is_some_and(|v| v == "1") {
+        // SAFETY: a private directory written only by this process's
+        // ZeroDB — the `trust_contents` contract.
+        opts.file_trust(unsafe { heed_zerodb::FileTrust::trust_contents() });
     }
 });
 
