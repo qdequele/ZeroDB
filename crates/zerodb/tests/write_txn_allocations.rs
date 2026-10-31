@@ -86,6 +86,9 @@ impl TempDir {
         let pid = std::process::id();
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("zerodb-allocs-{pid}-{seq}"));
+        // An interrupted run leaves its directory behind; a later run with
+        // the same pid and sequence must not open that old data.
+        let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create temp dir");
         TempDir { path }
     }
@@ -198,5 +201,27 @@ fn a_large_txn_does_not_disturb_the_next_small_ones() {
         w.commit().expect("commit");
     }
     let r = env.read_txn().expect("read_txn");
+    for i in (0..50_000u64).step_by(2) {
+        let want: &[u8] = if i < 100 { &[2u8; 64] } else { &[1u8; 64] };
+        assert_eq!(
+            db.get(&r, &i.to_be_bytes()).expect("get"),
+            Some(want),
+            "key {i}"
+        );
+    }
+    let three: &[u8] = &[3u8; 64];
+    assert_eq!(
+        db.get(&r, &1_000_000u64.to_be_bytes()).expect("get"),
+        Some(three)
+    );
+    for i in 0..50u64 {
+        let four: &[u8] = &[4u8; 64];
+        assert_eq!(
+            db.get(&r, &(2_000_000 + i).to_be_bytes()).expect("get"),
+            Some(four),
+            "key {}",
+            2_000_000 + i
+        );
+    }
     assert_eq!(db.len(&r).expect("len"), 25_051);
 }

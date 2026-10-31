@@ -5509,6 +5509,13 @@ impl Drop for RwTxn<'_> {
             }
             *slot = None;
         }
+        // Both lists are as long as the highest dbi a txn touched: bounded
+        // like the others. A name past the cap is looked up again
+        // (`named_name`), which changes no result.
+        work.names.truncate(CARRY_VEC_CAP);
+        work.names.shrink_to(CARRY_VEC_CAP);
+        self.open.slots.truncate(CARRY_VEC_CAP);
+        self.open.slots.shrink_to(CARRY_VEC_CAP);
         work.open = std::mem::take(&mut self.open.slots);
         // The snapshot published at C6, else the unchanged base: either is
         // the latest this process knows of.

@@ -25,7 +25,9 @@ transaction none instead of one. On Graviton4 a single-put no-sync commit
 takes 5.17 µs instead of 5.51 (LMDB: 4.25) and 5.74k user cycles instead of
 6.68k; `commit/batch/n1` went from 1.26× to 1.17× LMDB, no rung regressed.
 Details: `benches/results/2026-10-31-writer-carry-graviton.md`. New test
-`crates/zerodb/tests/write_txn_allocations.rs`.
+`crates/zerodb/tests/write_txn_allocations.rs`. In `zerodb-core`,
+`DirtyStore::sorted_pgnos` is replaced by `sorted_pgnos_into`, which fills a
+buffer the caller reuses.
 ### Faster cursor deletes and `clear` (issue #137)
 
 Four changes to the delete path, each taken from LMDB's technique for it; the
