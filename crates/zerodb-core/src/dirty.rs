@@ -125,14 +125,22 @@ pub(crate) const SPARE_CAP: usize = 256;
 /// it, and a scan of it stays a few dozen loads.
 pub(crate) const CARRY_INDEX_CAP: usize = 128;
 
-/// Empty `map`, keeping at most [`CARRY_INDEX_CAP`] entries of capacity for
+/// Whether a carried index of `capacity` entries is past the size a table
+/// for [`CARRY_INDEX_CAP`] entries gets. A table shrunk to that cap reports
+/// more (256 buckets hold 224 entries), so the bound is twice the cap: a
+/// table at its cap is left alone instead of shrunk again on every txn.
+pub(crate) fn index_oversized(capacity: usize) -> bool {
+    capacity > 2 * CARRY_INDEX_CAP
+}
+
+/// Empty `map`, keeping capacity for about [`CARRY_INDEX_CAP`] entries for
 /// the next write txn.
 pub(crate) fn recycle_index<K, V>(map: &mut HashMap<K, V, PgnoBuildHasher>)
 where
     K: std::hash::Hash + Eq,
 {
     map.clear();
-    if map.capacity() > CARRY_INDEX_CAP {
+    if index_oversized(map.capacity()) {
         map.shrink_to(CARRY_INDEX_CAP);
     }
 }

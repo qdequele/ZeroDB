@@ -112,6 +112,10 @@ pub(crate) struct Rare {
     /// Read txns keep theirs beside their record memo instead
     /// ([`HandleTable::check_with`]).
     memo: OnceLock<Box<[MemoCell]>>,
+    /// Whether a check of this transaction wrote a cell of `memo`: only then
+    /// does [`TxnHandles::recycle`] reset it, so a write txn that checked
+    /// no handle (an empty one) skips the walk over every cell.
+    memo_written: std::sync::atomic::AtomicBool,
 }
 
 /// One slot's memo of a valid check: the epoch it held at and the handle
@@ -187,9 +191,11 @@ impl TxnHandles {
     pub(crate) fn recycle(&mut self) -> Option<Box<Rare>> {
         let mut rare = self.rare.take()?;
         rare.opened.get_mut().ok()?.clear();
-        if let Some(memo) = rare.memo.get_mut() {
-            for cell in memo.iter() {
-                cell.reset();
+        if std::mem::take(rare.memo_written.get_mut()) {
+            if let Some(memo) = rare.memo.get_mut() {
+                for cell in memo.iter() {
+                    cell.reset();
+                }
             }
         }
         Some(rare)
@@ -456,13 +462,17 @@ impl HandleTable {
             }
         }
         self.check_locked(txn, parent, slot, generation, |epoch| {
-            let memo = txn.rare().memo.get_or_init(|| {
+            let rare = txn.rare();
+            let memo = rare.memo.get_or_init(|| {
                 (0..self.max_dbs.min(DENSE_SLOT_LIMIT))
                     .map(|_| MemoCell::default())
                     .collect()
             });
             if let Some(m) = memo.get(slot as usize) {
                 m.set(epoch, generation);
+                // Relaxed: read only by `recycle`, through `&mut` after the
+                // transaction ended, which orders it after this store.
+                rare.memo_written.store(true, Ordering::Relaxed);
             }
         })
     }
