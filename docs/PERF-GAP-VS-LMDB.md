@@ -58,6 +58,7 @@ set today. Source keys:
 - **[C]** [`2026-10-15-meilisearch-v1.53.1-graviton-xlarge.md`](../benches/results/2026-10-15-meilisearch-v1.53.1-graviton-xlarge.md) — Meilisearch v1.53.1 and hannoy on Graviton4 `c8g.xlarge` (8 GiB, gp3), lock file on
 - **[D]** [`2026-10-18-delete-rebalance-node-move-mac.md`](../benches/results/2026-10-18-delete-rebalance-node-move-mac.md) — `del/*` rungs and crud-bench before/after ADR-0028, Apple M-series laptop (busy host; indicative)
 - **[G2]** [`2026-10-15-lock-file-in-place-graviton.md`](../benches/results/2026-10-15-lock-file-in-place-graviton.md) — `env/*` and a sample of other rungs on Graviton4 (c8g, EBS gp3, ext4, CGU1) after the lock file is rebuilt in place (ADR-0023 amendment 20)
+- **[Q]** [`2026-10-31-delete-path-cursor.md`](../benches/results/2026-10-31-delete-path-cursor.md) — `^del/` three-column A/B on Graviton4 after the issue #137 delete-path levers, plus macOS profiles and retired-instruction counts
 - **[X]** [`2026-10-19-crud-scan-count-and-batch-delete.md`](../benches/results/2026-10-19-crud-scan-count-and-batch-delete.md) — crud-bench `count()`, `start(5000) limit(100)` and `batch_delete_1000` (repro and crud-bench on an M-series laptop, indicative), plus the `^(scan|get|seek)/` gate on Graviton4 in both policies
 - **[SC]** [`2026-10-31-stamp-cache-graviton.md`](../benches/results/2026-10-31-stamp-cache-graviton.md) — the validated-pages cache sized to the file: `ycsb_a_census` 10M keys and the `^(get/|scan/|seek/|env/)` ladder on Graviton4
 
@@ -120,12 +121,14 @@ on, five rungs regress, and their rows below give both figures.
 
 | What | Ratio | Source |
 |---|---:|---|
-| Per-key deletes (`del/bulk/half`, `del/bulk/all`) | 1.30–1.37× | D |
-| Delete + re-insert churn (`del/churn/reinsert`) | 1.21× | D |
-| Draining through the write cursor (`del/cursor/drain`) | 1.50× | D |
-| `delete_range` (`del/range/half`) | 0.24× | D |
+| Per-key deletes (`del/bulk/half`, `del/bulk/all`) | 1.35–1.36× | Q |
+| Delete + re-insert churn (`del/churn/reinsert`) | 1.28× | Q |
+| 1,000 random deletes per txn (`del/batch/k1000`) | 1.26× | Q |
+| Draining through the write cursor (`del/cursor/drain`) | 1.66× | Q |
+| Draining backward through the write cursor (`del/cursor/rev`) | 1.50× | Q |
+| `delete_range` (`del/range/half`) | 0.52× | Q |
 | One delete per txn, 48 threads (crud-bench, 16 KiB pages) | ~2.1× (~0.48× the throughput) | D |
-| `clear` (`del/clear/all`) | 1.84× | E |
+| `clear` (`del/clear/all`) | 1.43× | Q |
 
 ### Commits
 
@@ -206,7 +209,7 @@ are bench server ratios, before → after, unless stated.
 
 | Technique | What changed | Before → after | Pointer |
 |---|---|---|---|
-| **`RwCursor` re-seek** | The write cursor tracked its position by key, re-descending and copying each pair three times per step. It now parks and resumes its path, with no allocation per step. A `del_current`, and a put of the current key, mutate at the parked path and keep it (SPEC 03 §5.4a/§5.4b); since #138 a put that splits keeps it too, repaired to the half holding the entry as `mdb_page_split` fixes up its cursor. Each step moves the parked path in place (it was copied in and out, 512 bytes each way) and yields the entry from the page it read; a same-size rewrite on a page the txn owns checks the key and writes in one page access with no copy-on-write pass, as LMDB's `MDB_CURRENT` put on a `P_DIRTY` page. **Residual:** the left-sibling rebalance and any op but `next` after a delete still re-seek once; each entry still costs two pgno→frame lookups (step, put) where LMDB holds page pointers. | `put/cursor/rewrite` 5.47× → 2.49× (macOS arm64, 2026-10-19), then 2.50× → 1.37× and `del/cursor/drain` 2.62× → 2.15× (Graviton4, 2026-10-31) [[report](../benches/results/2026-10-31-write-cursor-split-append-graviton.md)] | #7, #138 |
+| **`RwCursor` re-seek** | The write cursor tracked its position by key, re-descending and copying each pair three times per step. It now parks and resumes its path, with no allocation per step. A `del_current`, and a put of the current key, mutate at the parked path and keep it (SPEC 03 §5.4a/§5.4b); since #138 a put that splits keeps it too, repaired to the half holding the entry as `mdb_page_split` fixes up its cursor. Each step moves the parked path in place (it was copied in and out, 512 bytes each way) and yields the entry from the page it read; a same-size rewrite on a page the txn owns checks the key and writes in one page access with no copy-on-write pass, as LMDB's `MDB_CURRENT` put on a `P_DIRTY` page. **Residual:** any op but `next`/`prev` after a delete still re-seeks once; each entry still costs two pgno→frame lookups (step, put) where LMDB holds page pointers. | `put/cursor/rewrite` 5.47× → 2.49× (macOS arm64, 2026-10-19), then 2.50× → 1.37× and `del/cursor/drain` 2.62× → 2.15× (Graviton4, 2026-10-31) [[report](../benches/results/2026-10-31-write-cursor-split-append-graviton.md)] | #7, #138 |
 | **Splits without materializing the page** | Appends split onto a fresh right page; other splits pack both halves from cells borrowed from the old page. | — | 3c6a064 |
 | **One `pwrite` per dirty page** | Contiguous dirty pages go out in `pwritev` batches, as `mdb_page_flush` does. Its target, EBS gp3, is still unmeasured. | — | 3c6a064 |
 | **Adapter `ReservedSpace`** | `put_reserved` (milli's document path) filled a zeroed heap buffer, then copied it; the caller now writes straight into the page slot, as with `MDB_RESERVE`. The cursor variant still stages (#10, divergence D-015). | `put/api/reserved` 0.96× today [E] | — |
@@ -228,6 +231,7 @@ are bench server ratios, before → after, unless stated.
 | Technique | What changed | Before → after | Pointer |
 |---|---|---|---|
 | **Cursor delete keeps its position (the `del_current` re-descent)** | `del_current` re-descended to delete, then again for the next step, so a cursor drain cost 28 % more than deleting by key. It now deletes at the path it holds and settles on the successor (LMDB's `C_DEL`), and keeps the path across leftmost-pairing rebalances (`mdb_cursor_del0`). SPEC 03 §5.4a; pinned by `tests/cursor_delete_position.rs`. | `del/cursor/drain` 3.38× → 2.46× (laptop), then 2.91× → 2.63× | c4ab096, 17fdb24 |
+| **Cursor delete steps in place; left-sibling repair; `clear` free list** | After a delete, `next`/`prev` inside the leaf read the slot from the kept path (LMDB's `mdb_cursor_next`/`prev` after `C_DEL`) instead of rebuilding a cursor, and no key is allocated per delete. A borrow from or merge with the left sibling keeps the path (`mdb_node_move`/`mdb_page_merge` fix-ups). Removing a cell fixes the pointers in one pass (`mdb_node_del`). `clear` frees base-snapshot pages with a list append, reserves per branch (`mdb_midl_need`) and checks duplicates with a bitmap. SPEC 03 §5.4a. | `del/cursor/drain` 2.41× → 1.66×, `del/cursor/rev` 3.06× → 1.50×, `del/clear/all` 1.73× → 1.43×, `del/bulk/half` 1.41× → 1.35× (Graviton4, [Q]) | #137 |
 | **`delete_range` as one leaf walk** | Collected every key, then point-deleted each; now splices covered cells leaf by leaf and rebalances each leaf once (beyond LMDB, which has no range delete). | `del/range/half` 2.63× → 0.92× | 3512269 |
 | **Rebalance moves cells page to page** | A borrow decoded the moved entry into owned key/value buffers, re-encoded it, and rewrote the parent separator as remove + re-insert; a merge did the same per entry. Cells now move verbatim through a per-txn scratch buffer and separators are rewritten in place, as LMDB's node move and key update do. Tree shape unchanged. ADR-0028, SPEC 03 §10.1. | `del/bulk/half` 2.46× → 1.30×, `del/cursor/drain` 2.59× → 1.50×, `del/range/half` 0.67× → 0.24× (laptop, [D]) | ADR-0028 |
 | **`clear` frees leaves unread** | Without overflow pages, leaf page numbers are freed from their parents without loading the leaves (LMDB's `mdb_drop0`). | `del/clear/all` 12.73× → 1.78× | c60a31e |
@@ -271,10 +275,14 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
 
 **Measured**
 
-- **Deletes after ADR-0028** — per-key deletes 1.30–1.37×, cursor drains
-  1.50× [D]. The rebalance now moves cells as LMDB does; what remains is the
-  rest of the delete (descent, COW of the sibling). A cursor delete that
-  rebalances outside the leftmost pairing still re-descends. Workloads with
+- **Deletes after #137** — per-key deletes 1.35×, cursor drains 1.50–1.66×,
+  `clear` 1.43× on Graviton4 [Q]. The memmoves of a delete and its borrow now
+  match LMDB's byte for byte; what remains is bookkeeping around them (page
+  lookups by pgno where LMDB's cursor holds page pointers, O(1) view checks,
+  the descent). About 30 µs of `clear`'s gap is the commit's fixed cost (#8).
+  On macOS's 16 KiB pages the ladder's delete fixture is one level deeper
+  than LMDB's (10-byte branch cells, ADR-0002), so Mac ratios read higher.
+  Workloads with
   one delete per transaction are bound by commit instead: in crud-bench's
   delete phase ~78 % of commit is re-encoding the meta page's free-list annex
   (`MetaPage::encode_with_annex`, ADR-0022), which a delete-heavy run keeps

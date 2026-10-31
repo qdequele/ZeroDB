@@ -938,6 +938,27 @@ impl<'a> Tree<'a> {
         let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
         Ok((k, v))
     }
+
+    /// The entry in slot `ki` of leaf `pgno`, or `None` when `ki` is past the
+    /// leaf's last cell: the write cursor's in-leaf step (LMDB's
+    /// `mdb_cursor_next` reading the node at `mc_ki` in the page it already
+    /// holds), which needs no cursor rebuilt around its parked path.
+    ///
+    /// The caller vouches that `pgno` is a live leaf of this tree state, as
+    /// for [`entry_at`](Self::entry_at); only `ki` may run past the end.
+    ///
+    /// # Errors
+    ///
+    /// A [`PageError`] if the page is not a valid leaf.
+    pub(crate) fn entry_in_leaf(&self, pgno: u64, ki: usize) -> PosResult<'a> {
+        let leaf = leaf_view(self.src, self.psize, pgno, self.valid)?;
+        if ki >= leaf.num_keys() {
+            return Ok(None);
+        }
+        let k = leaf.key(ki);
+        let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
+        Ok(Some((k, v)))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1746,6 +1767,15 @@ impl SavedCursor {
     /// the remap the parked path needs.
     pub(crate) fn frames_mut(&mut self) -> &mut [(u64, usize)] {
         self.stack.frames_mut()
+    }
+
+    /// Move the parked leaf slot to `ki` (the write cursor's in-leaf step,
+    /// [`Tree::entry_in_leaf`]). The caller has checked that `ki` is a live
+    /// slot of the parked leaf.
+    pub(crate) fn set_leaf_slot(&mut self, ki: usize) {
+        if let Some(frame) = self.stack.frames_mut().last_mut() {
+            frame.1 = ki;
+        }
     }
 
     /// Apply the root-shrink repair to the parked path (SPEC 03 §5.4a): the

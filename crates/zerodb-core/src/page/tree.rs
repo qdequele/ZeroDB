@@ -1144,18 +1144,22 @@ fn remove_cell(
     let abs_upper = HEADER_SIZE + upper;
     let abs_cpos = HEADER_SIZE + cpos;
     buf.copy_within(abs_upper..abs_cpos, abs_upper + clen);
-    // 2. Adjust every pointer that referenced a cell below the removed one.
-    for j in 0..num_keys {
-        let p = ptr_at(buf, j) as usize;
-        if p < cpos {
-            write_u16(buf, HEADER_SIZE + j * 2, (p + clen) as u16);
-        }
+    // 2. Remove pointer idx: shift [idx+1..num_keys] down one slot.
+    let ptrs = &mut buf[HEADER_SIZE..HEADER_SIZE + num_keys * 2];
+    ptrs.copy_within((idx + 1) * 2.., idx * 2);
+    // 3. Adjust every remaining pointer that referenced a cell below the
+    // removed one (LMDB's `mdb_node_del` fix-up). One pass over the
+    // pointer array as 2-byte arrays, so it carries no per-slot bounds
+    // check. On a well-formed page the sum stays below the page size (at
+    // most 64 KiB); wrapping (as the u16 store always truncated) keeps a
+    // hostile page from panicking a debug build.
+    let (cpos16, clen16) = (cpos as u16, clen as u16);
+    for slot in ptrs[..(num_keys - 1) * 2].as_chunks_mut::<2>().0 {
+        let p = u16::from_le_bytes(*slot);
+        *slot = p
+            .wrapping_add(if p < cpos16 { clen16 } else { 0 })
+            .to_le_bytes();
     }
-    // 3. Remove pointer idx: shift [idx+1..num_keys] down one slot.
-    let src_start = HEADER_SIZE + (idx + 1) * 2;
-    let src_end = HEADER_SIZE + num_keys * 2;
-    let dst_start = HEADER_SIZE + idx * 2;
-    buf.copy_within(src_start..src_end, dst_start);
     // 4. Update bounds.
     let new_lower = (num_keys - 1) * 2;
     write_u16(buf, OFF_LOWER, new_lower as u16);

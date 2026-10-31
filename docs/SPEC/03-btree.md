@@ -485,27 +485,39 @@ repaired, whenever the mutation could have moved the entry it names. At minimum:
 Discarding is always a correct implementation of "repair"; it costs a re-seek,
 which is exactly the M1.4 mechanism applied selectively.
 
-**Implemented repair table (2026-09-27, leftmost pairing only; c4ab096,
-17fdb24).** This table covers deletes; puts through the write cursor follow
-§5.4b. The engine retains the path across `del_current` and repairs it for the structural
-cases below; everything else discards. The rebalance reports one of *unchanged*
-(no structural change — the path is valid as-is), *kept* (repaired per this
-table), *kept + root pop* (as kept, plus frame 0 must be dropped), or
-*invalidated* (discard and re-seek). The repairs apply **only when the
-rebalanced page is its parent's child 0** — the §10 sibling choice then
-always pairs it with its RIGHT sibling — which is every delete of a
-front-to-back drain (milli's `del_current` loops). The "from left" pairing
-(child ≥ 1) is not repaired in this iteration.
+**Implemented repair table (2026-09-27, c4ab096, 17fdb24; extended to the
+left pairing 2026-10-31, issue #137).** This table covers deletes; puts
+through the write cursor follow §5.4b. The engine retains the path across
+`del_current` and repairs it for the structural cases below; everything else
+discards. The rebalance reports one of *unchanged* (no structural change — the
+path is valid as-is), *kept* (repaired per this table), *kept + root pop* (as
+kept, plus frame 0 must be dropped), or *invalidated* (discard and re-seek).
+The table follows LMDB's cursor fix-ups in `mdb_node_move` (a cursor on the
+page receiving a node from the left moves up one slot) and `mdb_page_merge`
+(a cursor on the merged-away page moves to the left page, its slot past the
+left page's own entries). Before 2026-10-31 only the leftmost pairing (P =
+child 0, paired with its RIGHT sibling: every delete of a front-to-back
+drain) was repaired, and the left pairing invalidated.
 
-| §10 event at a level (page P = parent's child 0) | per-level repair |
+| §10 event at a level (page P on the path) | per-level repair |
 |---|---|
-| borrow from the right sibling (leaf or branch), no ancestor split | keep every frame as-is: P keeps its pgno (it is already dirty), the moved entry is *appended* at/after the vacated `ki` (so the slot still holds the successor when the tail was deleted), and the parent's separator rewrite at child 1 moves no lower-indexed child |
+| borrow from the right sibling (P = child 0; leaf or branch), no ancestor split | keep every frame as-is: P keeps its pgno (it is already dirty), the moved entry is *appended* at/after the vacated `ki` (so the slot still holds the successor when the tail was deleted), and the parent's separator rewrite at child 1 moves no lower-indexed child |
+| borrow from the left sibling (P = child ≥ 1; leaf or branch), no ancestor split | P's frame `ki` += 1: the moved entry (leaf) or child (branch) becomes P's slot 0 and every slot shifts up one; P keeps its pgno and the parent's separator rewrite at P's own index moves no child |
 | merge with the right sibling (right into left = P), right sibling non-empty | keep every frame as-is: P survives with its pgno, the sibling's cells land at/after the vacated `ki`, the parent only loses child 1; the parent level then re-enters this table (merge cascade) |
+| merge with the left sibling (P into the left sibling L), L non-empty | P's frame moves to L, `ki` += L's entry count before the merge; the parent frame's `ki` −= 1 (P's index is gone, L's is one less); the parent level then re-enters this table |
 | root shrink to the remaining branch child (§9) | pop frame 0: the surviving child is the single-child root's child 0, which is exactly the path's frame 1 |
 | any ancestor **split** during a separator rewrite (a longer separator can split the parent, up to a root grow) | invalidate — splits move sibling frames and can add a level; not followed |
-| the "from left" pairing (P is child ≥ 1) | invalidate — not implemented in this iteration |
 | root shrink to empty (last entry deleted) | invalidate — the path names a freed page |
-| right sibling with zero cells (hostile image) | invalidate — the vacated slot could sit past an empty leaf |
+| sibling with zero cells (hostile image) | invalidate — the vacated slot could sit past an empty page |
+
+After a kept delete the cursor sits on the vacated slot (LMDB's `C_DEL`):
+`next` reads the slot as is (it holds the successor, or is one past the last
+cell when the tail was deleted, and then steps to the next leaf); `prev` steps
+back from it to the predecessor (LMDB's `mdb_cursor_prev` after `C_DEL`).
+Every other positioning op re-derives from the deleted key. A step that stays
+inside the parked leaf reads its slot straight from the parked path, as
+`mdb_cursor_next`/`mdb_cursor_prev` move `mc_ki` in the page the cursor
+holds.
 
 **Debug shadow check (mandatory while a path is retained).** In debug builds
 (`debug_assertions`), after every delete that keeps the path — repaired or
