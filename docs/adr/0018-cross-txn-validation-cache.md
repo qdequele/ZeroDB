@@ -231,3 +231,189 @@ env can expose ever share a pair.
 Recorded in the perf ledger and the commit body (bench server, x86-64,
 4 KiB): see `short_txn_census` three-column table and the `get/put/commit`
 ladder A/B.
+
+## Amendment: a table that covers the file — one-word slots, mapped by pgno (2026-10-31)
+
+- Status: **Accepted** — approved by the maintainer, 2026-10-31: Option B,
+  cap 2^23 slots. Implemented and measured on Graviton4 the same day (see
+  Measurements).
+
+### Problem
+
+Answer 2 above fixed the table at 64 Ki slots and deferred scaling "until a
+measurement shows misses from collisions". The 2026-10-29 Graviton4 profile
+(`c8g.xlarge`, `ycsb_a_census` `mix`: the public suite's YCSB A shape, 10M
+16-byte keys, 100-byte values, one txn per op) is that measurement:
+
+| | LMDB | ZeroDB | ZeroDB, trusted file |
+|---|---:|---:|---:|
+| read p50, 10M keys (1.2 GB, ~300k pages of 4 KiB) | 0.95–1.15 µs | 1.39–1.54 µs | ~1.09 µs (public suite) |
+
+`validate_leaf_miss` + `validate_branch_miss` are 5.8 % of the mix's cycles.
+The cause is capacity, not conflict: ~300k pages compete for 64 Ki slots
+(slot = pgno mod 64 Ki), so about 4.6 pages share each slot. Under uniform
+random reads a probe hits only if its page was the last one published to the
+slot, about 64 Ki / 300k ≈ 22 % of the time, and every miss walks the leaf's
+cells. Branch pages share slots with leaves, so even the ~2.5k branches are
+evicted by leaf publishes and miss too. The trusted-file column bounds what
+removing the walk can give: about 0.3–0.4 µs of p50.
+
+### Options
+
+**A — Raise the fixed size, keep the 32-byte seqlock slot.** Simplest diff:
+`SLOTS` from 2^16 to 2^22 or 2^23; the loom model and protocol are unchanged.
+Costs 32 B per page in use (0.78 % of a 4 KiB-page file: 9.4 MiB for this
+1.2 GB file), up to 256 MiB per env at 2^23; the per-env chunk directory grows
+to 8 Ki entries (~190 KiB at open) unless it gains a second level. Each probe
+stays four loads and an `Acquire` fence, and each publish a CAS (an outlined
+`__aarch64_cas8_acq` call on the default aarch64 target, per the same
+profile).
+
+**B — One-word slots mapped by pgno, lazily allocated (recommended).** See
+below. 8 B per page in use (0.2 % of a 4 KiB-page file), one load per probe,
+one store per publish, no seqlock.
+
+**C — Set-associative at the same 2 MiB.** Associativity cures *conflict*
+misses; these are *capacity* misses (more pages than entries), which no
+replacement policy at 64 Ki entries removes. Rejected.
+
+**D — Size the table from `map_size` at open.** `map_size` says nothing about
+the pages in use: the census and the public-suite harness map 10^12 bytes,
+Meilisearch maps several TiB. Sizing from the file at open and re-sizing as
+`last_pg` grows needs a table that is swapped while readers probe it (a lock,
+or `unsafe` reclamation in `zerodb-core`). B gets growth with the file for
+free: slots are allocated where pgnos land, and pgnos only grow with the
+file. Rejected as a separate mechanism.
+
+### Option B in detail
+
+**Index.** Slot = `pgno mod 2^23` — the pgno itself for every page of a file
+up to 2^23 pages (32 GiB at 4 KiB pages, 128 GiB at 16 KiB). Below that size
+two pages never share a slot, so the hit rate is limited only by pages that
+were never validated (or were rewritten) since open. Above it, pgnos wrap and
+collide exactly as today, 2^23 apart. Keeping the identity map keeps the
+property measured in the original decision: a scan over a bulk-loaded tree
+probes adjacent slots, now eight per cache line instead of two.
+
+**Lazy allocation, three levels.** A fixed top array of 32 entries (allocated
+at open, ~0.8 KiB) → 64-entry directory blocks (1.5 KiB, allocated on first
+publish under them, each covering 256 Ki pages) → 4096-slot chunks (32 KiB,
+allocated on first publish in them). All three use `OnceLock`, as the chunks
+do today: no `unsafe`. A probe that finds an unallocated level is a miss. The
+extra directory level is one more dependent load, of a line that stays in L1
+on any hot path.
+
+**Slot word.** One `AtomicU64`:
+
+```
+bit 63 ............ 14 | 13 ..... 2 |   1  | 0
+     stamp (50 bits)   | pgno >> 23 | kind | 1
+```
+
+`pgno >> 23` needs 12 bits because every pgno is below
+`MAX_MAP_SIZE / MIN_PAGE_SIZE` = 2^47 / 2^12 = 2^35. Bit 0 is set in every
+published word, so an all-zero (never written) slot matches nothing. Within
+one slot (fixed `pgno mod 2^23`), the word determines `(pgno, kind, stamp)`
+uniquely, so word equality is exact key-and-stamp equality: no hash, no
+truncation. A triple outside the domain — pgno ≥ 2^35 or stamp ≥ 2^50 — is
+never published and its lookup answers `false` without a probe, which is
+sound (a miss revalidates). 2^50 commits is 35 years at a million commits a
+second; past it the cache would stop learning, never mis-answer.
+
+**Protocol.** Publish: one `Release` store of the word. Lookup: one `Acquire`
+load, compared with the word the probe expects. The seqlock existed only to
+keep two words coherent (the "Coherent entries" requirement under Option A
+above): a lookup must never pair one publish's key with another's stamp. With
+one word, every value a load can return is a value one publish stored whole,
+so the requirement holds by construction. Two racing publishers leave the
+last store; both are true facts. The `Release`/`Acquire` pair keeps the
+existing statement that the validation (or commit) preceding a publish
+happens-before a hit; a hit's page bytes are additionally synchronized by
+the reader's own snapshot pin (TXN-18/19). On aarch64 a probe is one `ldar`
+(was `ldar`, two `ldr`, `dmb ishld`, `ldr`) and a publish one `stlr` (was a
+CAS, an outlined call, and three stores).
+
+**Everything else is unchanged:** the page-version identity, who publishes
+(readers from the miss arm, the committer after C5, never a writer's miss
+arm), who probes, trusted mode skipping it, and the stated limit for bytes
+rewritten underneath the env by something other than a ZeroDB commit.
+
+### Memory (Option B)
+
+8 bytes per page in use, rounded up to 32 KiB chunks, plus 1.5 KiB per
+256 Ki pages of directory:
+
+| env | today | Option B | Option A at 2^23 |
+|---|---:|---:|---:|
+| at open, nothing published | 1.5 KiB | 0.8 KiB | ~190 KiB (or two-level) |
+| a few pages | 33.5 KiB | 34 KiB | ~220 KiB |
+| 1.2 GB file, 4 KiB pages (~300k pages) | 2 MiB | 2.3 MiB | 9.4 MiB |
+| 10 GiB file, 4 KiB pages | 2 MiB | 20 MiB | 80 MiB |
+| ≥ 32 GiB file, 4 KiB pages (cap) | 2 MiB | 64 MiB | 256 MiB |
+
+At 16 KiB pages every row below the second is a quarter of that, except the
+cap row: the slot count is fixed at 2^23 whatever the page size, so it stays at
+64 MiB (reached at 128 GiB files instead of 32 GiB). Chunks stay
+allocated until the env closes; their number follows the file's high-water
+pgno.
+
+### Tests and model
+
+- Loom L7 is rewritten for the one-word protocol with the same shape
+  (two publishers of distinct versions, a reader asserting that no
+  never-published triple hits, exactly one entry at quiescence); it stays
+  in `just loom`.
+- Unit tests: word encoding exact at the domain edges (pgno 2^35 − 1, stamp
+  2^50 − 1, both kinds) and refusal past them; identity below 2^23 (no two
+  pages of a file under the cap evict each other); pgnos 2^23 apart sharing a
+  slot and distinguished by the word; lazy allocation of directory blocks and
+  chunks only where publishes land; the concurrent publish/lookup test.
+- `zerodb/tests/page_version_identity.rs` and the btree cache tests apply
+  unchanged (the identity they pin is the soundness argument).
+- SPEC 04 TXN-38's shape sentence and the `stamps.rs` module docs are
+  updated in the same change.
+
+### Measurement plan
+
+Spike on a Mac, 2026-10-31: inconclusive. Another workload shared the machine
+and every variant (64 Ki seqlock, 4 Mi seqlock, one-word 8 Mi) swung between
+1.9 and 3.7 µs read p50 from round to round, with I/O-sized p99s. No local
+number is quoted. The gate runs on a quiet Graviton4 `c8g.xlarge`, three
+columns (LMDB / ZeroDB before / ZeroDB after):
+
+- `ycsb_a_census` `read` and `mix`, 10M items, two reps, engine order
+  rotated: read p50/p99 and, for `mix`, write p50 (the committer's seeding
+  cost).
+- `scripts/bench-ab.sh '^(get/|scan/|seek/|env/)'`, 3 rounds: the probe on
+  every short read txn, the scan's sequential probe, and `env/open/reopen`
+  for the at-open cost.
+- Memory: allocated cache bytes at the end of the 10M census.
+
+Kept if the census read p50 moves toward the trusted-file figure and no
+ladder rung regresses beyond 3 %.
+
+### Decision (2026-10-31)
+
+1. Option B over A.
+2. Cap 2^23 slots: 64 MiB per env at most, files up to 32 GiB at 4 KiB pages
+   (128 GiB at 16 KiB) collision-free.
+
+### Measurements (2026-10-31)
+
+Graviton4 `c8g.xlarge`, report
+`benches/results/2026-10-31-stamp-cache-graviton.md`. `ycsb_a_census`, 10M
+keys (1.33 GB, ~325k pages of 4 KiB), p50 over two reps:
+
+| | LMDB | before | after | trusted file |
+|---|---:|---:|---:|---:|
+| `read` get | 961–1,075 ns | 1,323–1,363 ns | 1,232–1,236 ns | 1,119–1,127 ns |
+| `mix` get | 1,127–1,133 ns | 1,512–1,571 ns | 1,388–1,390 ns | 1,273–1,279 ns |
+| `mix` update | 7.7–7.9 µs | 13.0–14.1 µs | 12.2–12.7 µs | 12.5–12.8 µs |
+
+Instructions per get fall from 6,037 to 4,155 (LMDB 3,652), cycles from
+3,869 to 3,583 (LMDB 2,804): the cell walk is gone, and what separates
+"after" from the trusted floor (~110 ns) is the probe's own cache and TLB
+miss into a 2.5 MiB table. Memory for this file: 2.50 MiB (was 2.0 MiB).
+The `^(get/|scan/|seek/|env/)` ladder, 3 rounds: improved, 3 faster
+(`scan/full/big` 0.87, `get/db/named` 0.93, `env/txn/ro_get_one` 0.96),
+0 regressed, 34 flat, 1 unreliable; `env/open/reopen` flat.
