@@ -104,7 +104,7 @@ pub struct TxnHandles {
 }
 
 #[derive(Debug, Default)]
-struct Rare {
+pub(crate) struct Rare {
     /// `(slot, inc)` of every slot instance this transaction opened.
     opened: Mutex<Vec<(u32, u64)>>,
     /// Slot → `epoch + 1` of the last check that found the slot's current
@@ -149,6 +149,12 @@ impl MemoCell {
             && self.epoch.load(crate::sync::Ordering::Acquire) == e + 1
     }
 
+    /// Forget the verdict. Only on a memo no other thread can reach
+    /// ([`TxnHandles::recycle`] holds it by `&mut`), so Relaxed suffices.
+    fn reset(&self) {
+        self.epoch.store(0, crate::sync::Ordering::Relaxed);
+    }
+
     /// Record a valid verdict for `generation` at epoch `e`. Called with the
     /// table lock held, so writers never interleave.
     fn set(&self, e: u64, generation: u32) {
@@ -170,6 +176,23 @@ impl TxnHandles {
 
     fn rare(&self) -> &Rare {
         self.rare.get_or_init(Box::default)
+    }
+
+    /// Take this transaction's [`Rare`] allocation, emptied, for the next
+    /// write transaction ([`HandleTable::begin_reusing`]; issue #8). Called
+    /// after [`HandleTable::end`], with `&mut`, so no check can be reading
+    /// the memo. Every memo cell is reset to "none": the next transaction
+    /// checks each slot under the table lock once, exactly as with a fresh
+    /// allocation. `None` if there was none, or its list lock was poisoned.
+    pub(crate) fn recycle(&mut self) -> Option<Box<Rare>> {
+        let mut rare = self.rare.take()?;
+        rare.opened.get_mut().ok()?.clear();
+        if let Some(memo) = rare.memo.get_mut() {
+            for cell in memo.iter() {
+                cell.reset();
+            }
+        }
+        Some(rare)
     }
 
     /// Whether this transaction opened instance `inc` of `slot`.
@@ -203,12 +226,18 @@ impl HandleTable {
 
     /// A transaction's begin: record the epoch.
     pub(crate) fn begin(&self) -> TxnHandles {
+        self.begin_reusing(None)
+    }
+
+    /// [`HandleTable::begin`] for a write transaction, reusing the previous
+    /// one's [`Rare`] allocation ([`TxnHandles::recycle`]) when there is one.
+    pub(crate) fn begin_reusing(&self, rare: Option<Box<Rare>>) -> TxnHandles {
         TxnHandles {
             // Acquire: pairs with `bump`'s Release, so a slot published before
             // this load is seen published by this transaction's checks.
             begin: self.epoch.load(Ordering::Acquire),
             owner: AtomicU64::new(0),
-            rare: OnceLock::new(),
+            rare: rare.map_or_else(OnceLock::new, OnceLock::from),
         }
     }
 
@@ -537,6 +566,34 @@ mod tests {
 
     fn is_bad_dbi(r: Result<()>) -> bool {
         matches!(r, Err(Error::Mdb(MdbError::BadDbi)))
+    }
+
+    #[test]
+    fn a_recycled_memo_starts_empty() {
+        // Issue #8: a write txn reuses the previous one's memo allocation,
+        // but none of its verdicts.
+        let h = HandleTable::new(4);
+        let mut w = h.begin();
+        let (s, g, _) = h.open(&w, b"a", |_| true).unwrap();
+        h.end(&mut w, true);
+        let mut w1 = h.begin();
+        assert!(h.check(&w1, None, s, g).is_ok());
+        let memo = w1.rare.get().and_then(|r| r.memo.get()).expect("memo");
+        assert!(memo[s as usize].holds(h.epoch(), g));
+        let rare = w1.recycle().expect("w1 allocated one");
+        let memo = rare.memo.get().expect("memo kept");
+        assert!(memo.iter().all(|c| !c.holds(h.epoch(), g)));
+        assert!(rare.opened.lock().unwrap().is_empty());
+        let w2 = h.begin_reusing(Some(rare));
+        assert!(h.check(&w2, None, s, g).is_ok());
+
+        // An aborted create leaves no verdict behind for the next txn.
+        let mut w3 = h.begin_reusing(None);
+        let (s3, g3, _) = h.open(&w3, b"b", |_| true).unwrap();
+        assert!(h.check(&w3, None, s3, g3).is_ok());
+        h.end(&mut w3, false);
+        let w4 = h.begin_reusing(w3.recycle());
+        assert!(is_einval(h.check(&w4, None, s3, g3)));
     }
 
     #[test]
