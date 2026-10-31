@@ -6,6 +6,22 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### Write transactions reuse the previous one's containers (#8)
+
+Every write transaction built its working containers empty: the dirty-page
+and spilled-page indexes, the freed, loose and reclaimed page sets, the
+commit's sorted page list, the open-table slots and the descent buffers. A
+small commit spent much of its CPU growing and freeing them. They now ride
+the env's writer slot from one write transaction to the next, as LMDB keeps
+its single write transaction (`me_txn0`) per env. Hash indexes keep at most
+128 entries of capacity and vectors 4,096, so one large transaction does not
+make later small ones walk an oversized table. A write transaction also
+starts from the snapshot the previous one published when nothing has
+committed since, instead of taking the snapshot cell's lock, and drains the
+base meta page's free-list annex in place instead of copying it. Nothing
+observable changes. A single-put commit on a named database makes 5 heap
+allocations instead of 19; an empty write transaction makes none instead of
+one. New test `crates/zerodb/tests/write_txn_allocations.rs`.
 ### Faster cursor deletes and `clear` (issue #137)
 
 Four changes to the delete path, each taken from LMDB's technique for it; the
