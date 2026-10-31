@@ -12,7 +12,8 @@ The env-wide cache of validated page versions had 64 Ki slots, so on a file of
 more than 64 Ki pages most random reads found their leaf's slot taken by
 another page and checked the leaf's cells again. Each page now has its own
 slot, up to 2^23 pages (32 GiB at 4 KiB pages, 128 GiB at 16 KiB), allocated
-as pages are first validated: 8 bytes per page, 64 MiB per environment at most.
+as pages are first committed or validated: 8 bytes per page, 64 MiB per
+environment at most.
 A slot is one atomic word instead of a seqlock over three, so a lookup is one
 load and a publish one store. Files and the public API are unchanged.
 On Graviton4, random gets on a 10M-key file went from 1.32–1.36 µs to

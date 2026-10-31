@@ -351,7 +351,9 @@ rewritten underneath the env by something other than a ZeroDB commit.
 | 10 GiB file, 4 KiB pages | 2 MiB | 20 MiB | 80 MiB |
 | ≥ 32 GiB file, 4 KiB pages (cap) | 2 MiB | 64 MiB | 256 MiB |
 
-At 16 KiB pages every row below the second is a quarter of that. Chunks stay
+At 16 KiB pages every row below the second is a quarter of that, except the
+cap row: the slot count is fixed at 2^23 whatever the page size, so it stays at
+64 MiB (reached at 128 GiB files instead of 32 GiB). Chunks stay
 allocated until the env closes; their number follows the file's high-water
 pgno.
 

@@ -68,6 +68,13 @@ macro_rules! census {
             use $heed::{Database, EnvFlags, EnvOpenOptions};
 
             std::fs::create_dir_all(dir).expect("create dir");
+            // Every run measures a freshly loaded file: reusing a directory
+            // would reload over the previous run's file history.
+            assert!(
+                std::fs::read_dir(dir).expect("read dir").next().is_none(),
+                "data dir {} must be empty",
+                dir.display()
+            );
             // The harness's 10^12-byte map, rounded down to a 64 KiB multiple
             // as the public-suite report describes.
             let map_size = 1_000_000_000_000usize & !0xFFFF;
@@ -102,8 +109,12 @@ macro_rules! census {
                 db.put(&mut w, &i.to_be_bytes(), &val).expect("load put");
             }
             w.commit().expect("load commit");
+            let page_size = {
+                let r = env.read_txn().expect("read_txn");
+                db.stat(&r).expect("stat").page_size
+            };
             println!(
-                "{} load {items} items: {:.1} s",
+                "{} load {items} items: {:.1} s, page size {page_size} B",
                 stringify!($name),
                 t.elapsed().as_secs_f64()
             );
@@ -144,6 +155,7 @@ macro_rules! census {
                         .expect("get")
                         .map(<[u8]>::to_vec);
                     drop(txn);
+                    assert!(v.is_some(), "key {key} missing after the load");
                     black_box(v);
                     reads.push(a.elapsed().as_nanos() as u32);
                 } else if mode == "empty" {
@@ -200,10 +212,11 @@ fn warm_page_cache(dir: &std::path::Path) {
 
 census!(lmdb, heed, |_opts| {});
 census!(zerodb, heed_zerodb, |opts| {
-    if let Some(ps) = std::env::var("CENSUS_PAGE_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
+    if let Some(ps) = std::env::var_os("CENSUS_PAGE_SIZE") {
+        let ps = ps
+            .to_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("CENSUS_PAGE_SIZE must be a page size in bytes, not {ps:?}"));
         opts.page_size(ps);
     }
     if std::env::var_os("CENSUS_TRUST").is_some_and(|v| v == "1") {
@@ -223,6 +236,7 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000_000);
     let secs: u64 = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(60);
+    assert!(items > 0, "items must be at least 1");
     assert!(
         matches!(mode, "mix" | "write" | "read" | "empty"),
         "mode must be mix, write, read or empty"
