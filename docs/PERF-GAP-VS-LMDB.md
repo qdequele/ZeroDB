@@ -293,10 +293,12 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
   cycles per single-put no-sync commit against LMDB's 5.7–6.2k, led by hash
   index growth and malloc/free for containers built empty per write txn, and
   by outlined aarch64 atomics on the writer lock path. Write txns now reuse
-  the previous one's containers, as LMDB's `me_txn0` (#8): 19 → 5 heap
-  allocations per single-put commit, 1 → 0 per empty write txn, and the
+  the previous one's containers in place, as LMDB's `me_txn0` (#8): 19 → 5
+  heap allocations per single-put commit, 1 → 0 per empty write txn, and the
   snapshot cell's lock and the copy of the base meta page's annex leave the
-  begin path. Still open: the writer slot's in-process mutex costs two
+  begin path. Graviton4: 6.68k → 5.74k user cycles per single-put commit
+  (LMDB 2.64k), `commit/batch/n1` 1.26× → 1.17×, empty write txn 191 →
+  182 ns (`benches/results/2026-10-31-writer-carry-graviton.md`). Still open: the writer slot's in-process mutex costs two
   read-modify-write atomics per acquire and release on top of the lock
   file's word (about 8 per empty write txn, LMDB 2; removing it needs an
   owned lock cell, an ADR-level change), the snapshot `Arc` published per
