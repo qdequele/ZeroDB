@@ -19,6 +19,7 @@
 //! there even when the yielded entries happen to agree.
 
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -218,6 +219,19 @@ impl Rng {
     }
 }
 
+/// Where the random walk's cursor is, for the exact-step check.
+#[derive(Debug)]
+enum Edge {
+    /// On the entry `at` (after a step, a seek or a put that kept it there).
+    On,
+    /// Fresh, or `prev` ran past the minimum (before-begin).
+    Unpositioned,
+    /// `next` ran past the maximum.
+    Eof,
+    /// After a seek that found nothing.
+    Unmodeled,
+}
+
 /// Random steps, seeks and cursor puts of random sizes (many of which split)
 /// against a `BTreeMap` model: every yielded entry must be the model's entry
 /// at that position, then the committed image must check clean and match.
@@ -241,8 +255,11 @@ fn random_cursor_puts_match_a_model() {
             {
                 let mut cur = db.rw_cursor(&mut w);
                 let mut at: Option<Vec<u8>> = None;
+                let mut edge = Edge::Unpositioned;
                 for _ in 0..2_000 {
-                    let got = match rng.below(10) {
+                    let op = rng.below(10);
+                    let forward = op <= 3;
+                    let got = match op {
                         0..=3 => cur.move_next().unwrap().map(|(k, _)| k.to_vec()),
                         4..=5 => cur.move_prev().unwrap().map(|(k, _)| k.to_vec()),
                         6 => {
@@ -252,6 +269,14 @@ fn random_cursor_puts_match_a_model() {
                             let got = cur.seek_ge(&probe).unwrap().map(|(k, _)| k.to_vec());
                             let want = model.range(probe..).next().map(|(k, _)| k.clone());
                             assert_eq!(got, want, "seek_ge");
+                            // A seek past the last key leaves a position
+                            // this test does not model: check the next
+                            // step for membership only.
+                            edge = if got.is_some() {
+                                Edge::On
+                            } else {
+                                Edge::Unmodeled
+                            };
                             at = got;
                             continue;
                         }
@@ -272,21 +297,41 @@ fn random_cursor_puts_match_a_model() {
                             continue;
                         }
                     };
-                    // A step from `at` (or from a fresh/edge position) must
-                    // land on the model's neighbour; `None` parks the cursor
-                    // at an edge, from which the next step re-enters.
-                    if let (Some(prev), Some(now)) = (&at, &got) {
-                        assert_ne!(prev, now, "a step must move");
-                        let between = if prev < now {
-                            model.range(prev.clone()..now.clone()).count()
-                        } else {
-                            model.range(now.clone()..prev.clone()).count()
-                        };
-                        assert_eq!(between, 1, "stepped over an entry: {prev:?} -> {now:?}");
-                    }
-                    if let Some(k) = &got {
-                        assert!(model.contains_key(k), "yielded a key the model lacks");
-                    }
+                    // Every step lands exactly on the model's neighbour in
+                    // its direction, edges included (SPEC 03 §4).
+                    let want = match &edge {
+                        Edge::On => {
+                            let k = at.clone().expect("on an entry");
+                            if forward {
+                                model
+                                    .range((Bound::Excluded(k), Bound::Unbounded))
+                                    .next()
+                                    .map(|(k, _)| k.clone())
+                            } else {
+                                model.range(..k).next_back().map(|(k, _)| k.clone())
+                            }
+                        }
+                        // Unpositioned (fresh, or `prev` ran past the
+                        // minimum): `next` is `first`, `prev` is `last`.
+                        Edge::Unpositioned if forward => model.keys().next().cloned(),
+                        Edge::Unpositioned => model.keys().next_back().cloned(),
+                        // `next` ran past the maximum: `next` stays `None`,
+                        // `prev` steps back onto the last entry.
+                        Edge::Eof if forward => None,
+                        Edge::Eof => model.keys().next_back().cloned(),
+                        Edge::Unmodeled => {
+                            if let Some(k) = &got {
+                                assert!(model.contains_key(k), "yielded a key the model lacks");
+                            }
+                            got.clone()
+                        }
+                    };
+                    assert_eq!(got, want, "step from {edge:?} at {at:?}");
+                    edge = match (&got, forward) {
+                        (Some(_), _) => Edge::On,
+                        (None, true) => Edge::Eof,
+                        (None, false) => Edge::Unpositioned,
+                    };
                     at = got;
                 }
             }
