@@ -32,6 +32,20 @@ On Graviton4 (ZeroDB time ÷ LMDB time): `del/cursor/drain` 2.41× → 1.66×,
 put or commit rung slowed. New ladder rung `del/cursor/rev` (the backward
 drain). Details: `benches/results/2026-10-31-delete-path-cursor.md`.
 
+### The validated-pages cache covers the whole file (ADR-0018 amendment)
+
+The env-wide cache of validated page versions had 64 Ki slots, so on a file of
+more than 64 Ki pages most random reads found their leaf's slot taken by
+another page and checked the leaf's cells again. Each page now has its own
+slot, up to 2^23 pages (32 GiB at 4 KiB pages, 128 GiB at 16 KiB), allocated
+as pages are first committed or validated: 8 bytes per page, 64 MiB per
+environment at most.
+A slot is one atomic word instead of a seqlock over three, so a lookup is one
+load and a publish one store. Files and the public API are unchanged.
+On Graviton4, random gets on a 10M-key file went from 1.32–1.36 µs to
+1.23–1.24 µs p50 (LMDB 0.96–1.08 µs) and `scan/full/big` from 27.9 ms to
+24.3 ms; the cache holds 2.5 MiB for that 1.33 GB file.
+
 ### Raw environment copies read the data file: a clone on APFS, `copy_file_range` on Linux (ADR-0032)
 
 A non-compacting copy (`copy_to_file` with `CompactionOption::Disabled`) wrote
