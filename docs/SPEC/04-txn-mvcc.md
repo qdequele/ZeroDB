@@ -772,10 +772,16 @@ dirty-page store must be built so it is.
   pages, and no cache holds its stamps. The original text said the cache
   assumes the file changes only through this process's commits (D-001);
   it now assumes the file changes only through ZeroDB commits.
-  The table is fixed-size (allocated in chunks as publishes land) and
-  direct-mapped by pgno; each slot is a seqlock, so a
-  lookup racing a publish or a collision only misses (loom model
-  `loom_stamp_cache_never_mixes_publishes`). Tests:
+  The table is mapped by pgno: slot = pgno mod 2^23, so the pages of a file
+  below 2^23 pages never share a slot, and pages 2^23 apart in a larger file
+  do (the newer publish wins). Slots are allocated where publishes land, 8
+  bytes per page, 64 MiB per env at most. Each slot is **one atomic word**
+  encoding the stamp, the pgno's bits above the slot index and the kind,
+  exact within its slot; a triple the word cannot encode (pgno ≥ 2^35 or
+  stamp ≥ 2^50) is never published. A lookup loads the word whole, so it
+  can never combine two publishes, and a collision only misses (loom model
+  `loom_stamp_cache_never_mixes_publishes`; amended 2026-10-31, ADR-0018:
+  was a 64 Ki-slot table of seqlock slots). Tests:
   `zerodb/tests/page_version_identity.rs` (the identity over churn with
   overflow values, named DBs, aborts and delayed reuse; short read txns
   against a model), `stamps::tests`,
