@@ -235,7 +235,8 @@ ladder A/B.
 ## Amendment: a table that covers the file — one-word slots, mapped by pgno (2026-10-31)
 
 - Status: **Accepted** — approved by the maintainer, 2026-10-31: Option B,
-  cap 2^23 slots, gated on a Graviton4 `c8g.xlarge` three-column run.
+  cap 2^23 slots. Implemented and measured on Graviton4 the same day (see
+  Measurements).
 
 ### Problem
 
@@ -394,3 +395,23 @@ ladder rung regresses beyond 3 %.
 1. Option B over A.
 2. Cap 2^23 slots: 64 MiB per env at most, files up to 32 GiB at 4 KiB pages
    (128 GiB at 16 KiB) collision-free.
+
+### Measurements (2026-10-31)
+
+Graviton4 `c8g.xlarge`, report
+`benches/results/2026-10-31-stamp-cache-graviton.md`. `ycsb_a_census`, 10M
+keys (1.33 GB, ~325k pages of 4 KiB), p50 over two reps:
+
+| | LMDB | before | after | trusted file |
+|---|---:|---:|---:|---:|
+| `read` get | 961–1,075 ns | 1,323–1,363 ns | 1,232–1,236 ns | 1,119–1,127 ns |
+| `mix` get | 1,127–1,133 ns | 1,512–1,571 ns | 1,388–1,390 ns | 1,273–1,279 ns |
+| `mix` update | 7.7–7.9 µs | 13.0–14.1 µs | 12.2–12.7 µs | 12.5–12.8 µs |
+
+Instructions per get fall from 6,037 to 4,155 (LMDB 3,652), cycles from
+3,869 to 3,583 (LMDB 2,804): the cell walk is gone, and what separates
+"after" from the trusted floor (~110 ns) is the probe's own cache and TLB
+miss into a 2.5 MiB table. Memory for this file: 2.50 MiB (was 2.0 MiB).
+The `^(get/|scan/|seek/|env/)` ladder, 3 rounds: improved, 3 faster
+(`scan/full/big` 0.87, `get/db/named` 0.93, `env/txn/ro_get_one` 0.96),
+0 regressed, 34 flat, 1 unreliable; `env/open/reopen` flat.
