@@ -53,8 +53,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use crate::btree::{
-    branch_view, leaf_view, node_view, Cursor as BCursor, NodeView, SavedCursor, Source, Tree,
-    ValidatedPages,
+    branch_view, leaf_view, node_view, node_view_classified, Cursor as BCursor, NodeView,
+    SavedCursor, Source, Tree, ValidatedPages,
 };
 use crate::dirty::{DirtyStore, PgnoBuildHasher};
 use crate::env::{Env, HookPoint, Snapshot};
@@ -311,6 +311,20 @@ struct Finger {
 /// the deferred-rebalance anchor (set when the leaf kept survivors in front
 /// of the span).
 type LeafSpan = (u64, Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// What a write cursor's put at its parked path ([`RwTxn::put_at_path`]) did
+/// (SPEC 03 §5.4b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathPut {
+    /// The entry under the path does not have the put's key: nothing changed.
+    Elsewhere,
+    /// Rewritten; the path still descends to the entry (repaired across a
+    /// split).
+    Kept,
+    /// Rewritten through a split cascade that grew the root: this frame (the
+    /// new root's) goes on top of the path.
+    Grown((u64, usize)),
+}
 
 /// What a delete's rebalance ([`RwTxn::rebalance`]) did to the root-to-leaf
 /// path it was handed (SPEC 03 §5.4a): the parked write cursor keeps, pops,
@@ -2250,10 +2264,21 @@ impl<'env> RwTxn<'env> {
     /// Read-only descent to the rightmost entry (APPEND's last-key check,
     /// §6.3) into a caller-owned buffer (cleared first): fills the path (leaf
     /// `ki = num_keys - 1`) and returns whether `key` sorts strictly after the
-    /// last key under the tree's ordering. The key is compared in place in
-    /// the leaf, as LMDB's APPEND check does, not copied out. The tree must be
-    /// non-empty.
-    fn rightmost_path_into(&self, tree: TreeId, key: &[u8], path: &mut Path) -> Result<bool> {
+    /// last key under the tree's ordering, or `None` if not. The key is
+    /// compared in place in the leaf, as LMDB's APPEND check does, not copied
+    /// out. The tree must be non-empty.
+    ///
+    /// `Some(owned)` also says whether every page on the path is already a
+    /// frame of this txn, in which case [`touch_path`](Self::touch_path)
+    /// would change nothing: an append load stays on one dirty right spine
+    /// between splits, and LMDB's `mdb_page_touch` skips such pages on their
+    /// `P_DIRTY` flag the same way.
+    fn rightmost_path_into(
+        &self,
+        tree: TreeId,
+        key: &[u8],
+        path: &mut Path,
+    ) -> Result<Option<bool>> {
         path.clear();
         let rec = *self.record(tree);
         // Same hostile-depth guard as `search_path`.
@@ -2262,8 +2287,12 @@ impl<'env> RwTxn<'env> {
         }
         let mut pgno = rec.root;
         let valid = Some(&self.validated);
+        let mut owned = true;
         for _ in 0..=rec.depth {
-            match node_view(self.source(), self.psize, pgno, valid).map_err(corrupt)? {
+            let (view, from_map) =
+                node_view_classified(self.source(), self.psize, pgno, valid).map_err(corrupt)?;
+            owned &= !from_map;
+            match view {
                 NodeView::Leaf(leaf) => {
                     let n = leaf.num_keys();
                     if n == 0 {
@@ -2276,7 +2305,7 @@ impl<'env> RwTxn<'env> {
                     // the keys it should accept.
                     let after = self.tree_comparator(tree).compare(key, leaf.key(n - 1))
                         == Ordering::Greater;
-                    return Ok(after);
+                    return Ok(after.then_some(owned));
                 }
                 NodeView::Branch(br) => {
                     // A zero-child branch is rejected at decode
@@ -2739,9 +2768,9 @@ impl<'env> RwTxn<'env> {
         }
         let mut path = std::mem::take(&mut self.path_buf);
         let res = match self.rightmost_path_into(tree, key, &mut path) {
-            Ok(true) if seq => {
+            Ok(Some(owned)) if seq => {
                 let before = *self.record(tree);
-                let res = self.append_apply(tree, &mut path, key, val);
+                let res = self.append_apply(tree, &mut path, owned, key, val);
                 if res.is_ok() {
                     // A fully-touched right-spine descent that did not split
                     // is exactly the finger invariant (§6.6 F2).
@@ -2749,8 +2778,8 @@ impl<'env> RwTxn<'env> {
                 }
                 res
             }
-            Ok(true) => self.append_apply(tree, &mut path, key, val),
-            Ok(false) => {
+            Ok(Some(owned)) => self.append_apply(tree, &mut path, owned, key, val),
+            Ok(None) => {
                 self.path_buf = path;
                 return Err(Error::Mdb(MdbError::KeyExist));
             }
@@ -2766,22 +2795,34 @@ impl<'env> RwTxn<'env> {
         res
     }
 
+    /// `owned`: every page on `path` is already a frame of this txn
+    /// ([`rightmost_path_into`](Self::rightmost_path_into)), so there is
+    /// nothing to copy on write.
     fn append_apply(
         &mut self,
         tree: TreeId,
         path: &mut [(u64, usize)],
+        owned: bool,
         key: &[u8],
         val: ValSrc<'_>,
     ) -> Result<ReserveLoc> {
-        self.touch_path(tree, path)?;
-        let (lpg, _) = *path.last().expect("non-empty path");
-        let n = {
-            let frame = self.dirty.bytes(lpg).expect("leaf touched");
-            LeafRef::new_prevalidated(frame, self.psize)
-                .map_err(corrupt)?
-                .num_keys()
-        };
-        path.last_mut().expect("non-empty path").1 = n;
+        if !owned {
+            self.touch_path(tree, path)?;
+        }
+        // The rightmost descent left the leaf frame on its last cell, and a
+        // COW copy is byte-identical: the append slot is one past it, as
+        // LMDB's APPEND bumps `mc_ki` after `mdb_cursor_last`, with no second
+        // view of the leaf.
+        let leaf = path.last_mut().expect("non-empty path");
+        leaf.1 += 1;
+        let (lpg, n) = *leaf;
+        debug_assert_eq!(
+            LeafRef::new_prevalidated(self.dirty.bytes(lpg).expect("leaf touched"), self.psize)
+                .map(|l| l.num_keys())
+                .ok(),
+            Some(n),
+            "the rightmost descent named the leaf's last cell"
+        );
         let loc = self.insert_into_leaf(tree, path, n, key, val, true, 0)?;
         sat_add(&mut self.record_mut(tree).entries, 1);
         Ok(loc)
@@ -3112,18 +3153,12 @@ impl<'env> RwTxn<'env> {
             }
             sat_add(&mut self.record_mut(tree).leaf_pages, 1);
             // sep = first key of R (§6.4): the moved old last key, or the new key.
-            let sep = match moved {
-                Some((mkey, _, _)) => mkey,
-                None => key.to_vec(),
+            let (sep, slot) = match moved {
+                Some((mkey, _, _)) => (mkey, 1),
+                None => (key.to_vec(), 0),
             };
-            return if top == 0 {
-                self.insert_into_branch(tree, path, -1, 0, sep, rpg)
-                    .map(|_| ())
-            } else {
-                let at = path[top - 1].1 + 1;
-                self.insert_into_branch(tree, path, top as isize - 1, at, sep, rpg)
-                    .map(|_| ())
-            };
+            // The new cell is on the right page, after the moved cell if any.
+            return self.rise_leaf_split(tree, path, sep, rpg, (rpg, slot));
         }
 
         // General split: pack both frames from cells **borrowed** out of the
@@ -3153,15 +3188,51 @@ impl<'env> RwTxn<'env> {
         self.pack_leaf_range(rpg, &oldleaf, newindx, key, &val, node_flags, s, total)?;
         drop(old);
         sat_add(&mut self.record_mut(tree).leaf_pages, 1);
-        // The split flag only matters to a kept delete path; puts discard it.
+        // Post-insert item `newindx` is the new cell: slot `newindx` of the
+        // left half, or `newindx - s` of the right one.
+        let cell = if newindx < s {
+            (lpg, newindx)
+        } else {
+            (rpg, newindx - s)
+        };
+        self.rise_leaf_split(tree, path, sep, rpg, cell)
+    }
+
+    /// Rise a leaf split's separator into the parent (or grow the root), then
+    /// point the leaf frame of `path` at `cell`, the `(pgno, slot)` the split
+    /// gave the cell just inserted. Every branch frame above follows it
+    /// through any split the insert cascades into (SPEC 03 §5.4b — LMDB fixes
+    /// up the splitting cursor the same way after `mdb_page_split`), so
+    /// `path` stays the root-to-leaf path to that cell; only a root grow
+    /// leaves the new root's frame for the caller to add
+    /// ([`put_at_path`](Self::put_at_path)).
+    fn rise_leaf_split(
+        &mut self,
+        tree: TreeId,
+        path: &mut [(u64, usize)],
+        sep: Vec<u8>,
+        rpg: u64,
+        cell: (u64, usize),
+    ) -> Result<()> {
+        let top = path.len() - 1;
+        let to_right = cell.0 == rpg;
         if top == 0 {
-            self.insert_into_branch(tree, path, -1, 0, sep, rpg)
-                .map(|_| ())
+            self.insert_into_branch_follow(tree, path, -1, 0, sep, rpg, Some(to_right))?;
         } else {
             let at = path[top - 1].1 + 1;
-            self.insert_into_branch(tree, path, top as isize - 1, at, sep, rpg)
-                .map(|_| ())
+            self.insert_into_branch_follow(
+                tree,
+                path,
+                top as isize - 1,
+                at,
+                sep,
+                rpg,
+                Some(to_right),
+            )?;
         }
+        // Written last: a root grow above reads `path[0]` as the old root.
+        path[top] = cell;
+        Ok(())
     }
 
     /// Pack post-insert items `[from, to)` into a fresh frame at `pgno`
@@ -3228,6 +3299,27 @@ impl<'env> RwTxn<'env> {
         key: Vec<u8>,
         child: u64,
     ) -> Result<bool> {
+        self.insert_into_branch_follow(tree, path, level, at, key, child, None)
+    }
+
+    /// [`insert_into_branch`](Self::insert_into_branch), optionally keeping
+    /// `path` on a put's new cell (SPEC 03 §5.4b). `follow` is `None` for
+    /// callers whose path does not survive a split (it is then left as is),
+    /// or `Some(new)` when the cell is under the inserted `child` (`new`) or
+    /// under the frame's own child, whose index the insert does not move
+    /// (`at` is right after it). The frame at `level` is then rewritten to
+    /// the slot, on whichever half, of the child holding the cell.
+    #[allow(clippy::too_many_arguments)] // house pattern (insert_into_leaf): pre-resolved scalars
+    fn insert_into_branch_follow(
+        &mut self,
+        tree: TreeId,
+        path: &mut [(u64, usize)],
+        level: isize,
+        at: usize,
+        key: Vec<u8>,
+        child: u64,
+        follow: Option<bool>,
+    ) -> Result<bool> {
         if level < 0 {
             // Root split (§9): new root branch over (old root, risen key).
             let old_root = path[0].0;
@@ -3248,7 +3340,19 @@ impl<'env> RwTxn<'env> {
         }
         let lvl = level as usize;
         debug_assert!(at >= 1, "branch inserts never target node 0");
-        let (ppg, _) = path[lvl];
+        let (ppg, pki) = path[lvl];
+        // The followed child's index among the post-insert cells.
+        let follow = follow.map(|new| {
+            debug_assert!(
+                new || at > pki,
+                "the insert must not shift the followed child"
+            );
+            if new {
+                at
+            } else {
+                pki
+            }
+        });
         let r = {
             let frame = self.dirty.bytes_mut(ppg).expect("branch is dirty");
             BranchMut::from_valid(frame, self.psize)
@@ -3256,8 +3360,15 @@ impl<'env> RwTxn<'env> {
                 .insert(at, &key, child)
         };
         match r {
-            Ok(()) => Ok(false),
-            Err(PageError::PageFull { .. }) => self.split_branch(tree, path, lvl, at, key, child),
+            Ok(()) => {
+                if let Some(x) = follow {
+                    path[lvl].1 = x;
+                }
+                Ok(false)
+            }
+            Err(PageError::PageFull { .. }) => {
+                self.split_branch(tree, path, lvl, at, key, child, follow)
+            }
             Err(e) => Err(corrupt(e)),
         }
     }
@@ -3278,6 +3389,11 @@ impl<'env> RwTxn<'env> {
     /// leaves them about half full. A branch must keep two children (INV-8),
     /// so the new cell cannot start the right page alone as it does for an
     /// APPEND on a leaf. Non-end inserts keep the median-fit-adjust rule (`choose_split`).
+    ///
+    /// `follow` is the post-insert index of the child a put's path follows
+    /// ([`insert_into_branch_follow`](Self::insert_into_branch_follow)), or
+    /// `None` to leave `path` as is.
+    #[allow(clippy::too_many_arguments)] // house pattern (insert_into_leaf): pre-resolved scalars
     fn split_branch(
         &mut self,
         tree: TreeId,
@@ -3286,6 +3402,7 @@ impl<'env> RwTxn<'env> {
         at: usize,
         key: Vec<u8>,
         child: u64,
+        follow: Option<usize>,
     ) -> Result<bool> {
         let (ppg, _) = path[lvl];
         let mut cells = self.extract_branch_cells(ppg)?;
@@ -3322,11 +3439,19 @@ impl<'env> RwTxn<'env> {
         self.write_branch_frame(ppg, &cells)?;
         self.write_branch_frame(rpg, &right)?;
         sat_add(&mut self.record_mut(tree).branch_pages, 1);
+        // Children `[0, s)` stay left at their index; child `s` (the rising
+        // cell's) is the right page's node 0, and the tail follows it.
+        let followed = follow.map(|x| if x < s { (ppg, x) } else { (rpg, x - s) });
+        let up = followed.map(|(pg, _)| pg == rpg);
         if lvl == 0 {
-            self.insert_into_branch(tree, path, -1, 0, rising, rpg)?;
+            self.insert_into_branch_follow(tree, path, -1, 0, rising, rpg, up)?;
         } else {
             let at2 = path[lvl - 1].1 + 1;
-            self.insert_into_branch(tree, path, lvl as isize - 1, at2, rising, rpg)?;
+            self.insert_into_branch_follow(tree, path, lvl as isize - 1, at2, rising, rpg, up)?;
+        }
+        // Written last: a root grow above reads `path[0]` as the old root.
+        if let Some(frame) = followed {
+            path[lvl] = frame;
         }
         Ok(true)
     }
@@ -3355,7 +3480,7 @@ impl<'env> RwTxn<'env> {
     ///
     /// `path` MUST be the live root-to-leaf path to an existing entry of
     /// `tree`: either fresh from [`search_path`](Self::search_path), or a
-    /// cursor's parked path over an unmutated tree (the `Cursor::resume`
+    /// cursor's parked path over an unmutated tree (the `Cursor::resume_in`
     /// contract). It is rewritten in place as pages are COWed and as the
     /// rebalance repairs it.
     fn delete_at_path(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<PathFate> {
@@ -3377,44 +3502,87 @@ impl<'env> RwTxn<'env> {
     /// Overwrite the value of the existing entry at the end of `path` — the
     /// write cursor's put at its parked position (SPEC 03 §5.4b): the same
     /// §6.1 replace as [`put_tree`](Self::put_tree) on a found key, minus the
-    /// descent. Returns whether `path` still descends to the rewritten entry:
-    /// `true` when the replace stayed inside its leaf (same slot, the pgnos
-    /// remapped in place by `touch_path`), `false` when it split the leaf and
-    /// the path must be discarded.
+    /// descent. `path` is left descending to the rewritten entry: same slot
+    /// when the replace stayed inside its leaf (the pgnos remapped in place
+    /// by `touch_path`), or the slot a leaf split gave it, with every branch
+    /// frame above following any split cascade.
     ///
-    /// `path` MUST be the live root-to-leaf path to an existing entry whose
-    /// key is `key`, as for [`delete_at_path`](Self::delete_at_path). The
-    /// caller handles the sequential-writes and flag variants of a put; this
-    /// is the plain overwrite.
+    /// `path` MUST be the live root-to-leaf path to an existing entry, as for
+    /// [`delete_at_path`](Self::delete_at_path). When that entry's key is not
+    /// `key`, nothing changes ([`PathPut::Elsewhere`]): the caller runs the
+    /// keyed put. The caller handles the sequential-writes and flag variants
+    /// of a put; this is the plain overwrite.
     fn put_at_path(
         &mut self,
         tree: TreeId,
         path: &mut [(u64, usize)],
         key: &[u8],
         val: &[u8],
-    ) -> Result<bool> {
+    ) -> Result<PathPut> {
         self.guard_ok()?;
         // The key is the stored one, so it already passed the key bounds;
         // the value is new (SPEC 03 §6 up-front validation).
         if val.len() as u64 > MAX_DATA_SIZE as u64 {
             return Err(Error::Mdb(MdbError::BadValSize));
         }
-        let before = *self.record(tree);
-        match self.put_apply(tree, path, true, key, ValSrc::Val(val), 0) {
-            Ok(_) => {
-                // A replace adds no entry; the only structural change it can
-                // make is a leaf split (§6.2), which adds a leaf page.
-                let after = *self.record(tree);
-                Ok(after.depth == before.depth
-                    && after.leaf_pages == before.leaf_pages
-                    && after.branch_pages == before.branch_pages)
+        let psize = self.psize;
+        let (lpg, ki) = *path.last().expect("non-empty path");
+        if let Some(frame) = self.dirty.bytes_mut(lpg) {
+            // The leaf is already this txn's (LMDB's `MDB_CURRENT` put on a
+            // `P_DIRTY` page): one frame access confirms the key and, for a
+            // same-size inline value, rewrites it in place (§6.1). A dirty
+            // page's ancestors are this txn's pages too — a page is copied
+            // only below a touched parent (§5.3) — so the path needs no
+            // touch for a write that changes no structure.
+            let at = {
+                let leaf = LeafMut::from_valid(&mut *frame, psize).map_err(corrupt)?;
+                if leaf.key(ki) != key {
+                    return Ok(PathPut::Elsewhere);
+                }
+                match leaf.inline_value_at(ki) {
+                    Ok((off, dsize))
+                        if dsize as usize == val.len()
+                            && value_is_inline(key.len(), val.len() as u64, psize) =>
+                    {
+                        Some(off)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(off) = at {
+                frame[off..off + val.len()].copy_from_slice(val);
+                return Ok(PathPut::Kept);
             }
-            Err(e) => {
-                // Mid-mutation failure: poison (TXN-59), as `put_tree` does.
-                self.errored = true;
-                Err(e)
+        } else {
+            let leaf = match node_view(self.source(), psize, lpg, Some(&self.validated))
+                .map_err(corrupt)?
+            {
+                NodeView::Leaf(l) => l,
+                NodeView::Branch(_) => return Err(Error::Mdb(MdbError::Invalid)),
+            };
+            if leaf.key(ki) != key {
+                return Ok(PathPut::Elsewhere);
             }
         }
+        let depth = self.record(tree).depth;
+        if let Err(e) = self.put_apply(tree, path, true, key, ValSrc::Val(val), 0) {
+            // Mid-mutation failure: poison (TXN-59), as `put_tree` does.
+            self.errored = true;
+            return Err(e);
+        }
+        let rec = *self.record(tree);
+        if rec.depth == depth {
+            return Ok(PathPut::Kept);
+        }
+        // A replace splits at most one page per level, so the root grew by
+        // one level: a branch over the old root's two halves, `path[0]`
+        // being the half that holds the entry.
+        debug_assert_eq!(rec.depth, depth + 1, "one put grows the root once");
+        let frame = self.dirty.bytes(rec.root).expect("new root is dirty");
+        let root = BranchRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
+        let ki = usize::from(root.child_pgno(0) != path[0].0);
+        debug_assert_eq!(root.child_pgno(ki), path[0].0, "path[0] is a root child");
+        Ok(PathPut::Grown((rec.root, ki)))
     }
 
     /// Debug-build check for [`put_at_path`](Self::put_at_path): a path the
@@ -5283,15 +5451,16 @@ enum Step<'k> {
 ///
 /// **Stack persistence:** between mutations the cursor persists its
 /// root-to-leaf path as a parked [`SavedCursor`], so an advance is an O(1)
-/// amortized stack step (LMDB's `mc_pg[]`/`mc_ki[]` walk), not a fresh
-/// O(log n) descent; entries are yielded as **borrows** of the txn's frames
-/// (lending style — the borrow dies at the next call, which is what makes the
-/// in-place mutations safe at compile time). A `del_current`, and a put of the
-/// key under the cursor that stays inside its leaf, mutate at the parked path
-/// and keep it, repaired in place (SPEC 03 §5.4a / §5.4b, LMDB's in-place
-/// cursor fix-up). Any other mutation drops the parked path and records the
-/// key (`CurPos`); the next advance re-seeks once.
-/// The exclusivity argument is what makes `SavedCursor::resume`'s
+/// amortized stack step (LMDB's `mc_pg[]`/`mc_ki[]` walk) on that stack in
+/// place, not a fresh O(log n) descent; entries are yielded as **borrows** of
+/// the txn's frames (lending style — the borrow dies at the next call, which
+/// is what makes the in-place mutations safe at compile time). A
+/// `del_current`, and a put of the key under the cursor, mutate at the parked
+/// path and keep it, repaired in place — across a split for the put (SPEC 03
+/// §5.4a / §5.4b, LMDB's in-place cursor fix-up). Any other mutation drops
+/// the parked path and records the key (`CurPos`); the next advance re-seeks
+/// once.
+/// The exclusivity argument is what makes `Cursor::resume_in`'s
 /// same-tree-state contract hold: no mutation can happen while a parked stack
 /// exists except through this cursor, and each of its mutating methods either
 /// repairs the stack to the post-mutation tree or clears it.
@@ -5319,9 +5488,11 @@ pub struct RwCursor<'t, 'env> {
 }
 
 impl RwCursor<'_, '_> {
-    /// Run one physical step: resume the parked path (or re-derive the
-    /// position from [`CurPos`] with one seek), park the new path, and
-    /// re-materialize the yielded entry as borrows of the txn's frames.
+    /// Run one physical step: move the parked path in place (or re-derive
+    /// the position from [`CurPos`] with one seek into an empty parked path)
+    /// and yield the entry it lands on as borrows of the txn's pages — the
+    /// same page views the step read, as LMDB's `mdb_cursor_next` reads the
+    /// node its stack points at.
     fn drive(&mut self, op: Step<'_>) -> Result<Option<(&[u8], &[u8])>> {
         // A post-delete parked path names the vacated slot, which only `next`
         // knows how to read (it settles there rather than stepping). Every
@@ -5332,68 +5503,62 @@ impl RwCursor<'_, '_> {
             self.saved = None;
         }
         self.on_vacated_slot = false;
-        // Phase 1 — position under a scoped shared borrow of the txn; keep
-        // only plain data (the parked stack and the hit's (pgno, ki)).
-        let hit: Option<(u64, usize)> = {
-            let tree = self.db.checked_tree(&*self.txn)?;
-            let (mut c, resumed) = match self.saved.take() {
-                Some(s) => (BCursor::resume(tree, s), true),
-                None => (tree.cursor(), false),
-            };
-            let r = match op {
-                Step::Next => {
-                    if settle {
-                        c.settle()
-                    } else if resumed {
-                        c.next()
-                    } else {
-                        match &self.pos {
-                            // A fresh cursor's `next` is `first` (SPEC 03 §4),
-                            // which `BCursor::next` already implements.
-                            CurPos::Start => c.next(),
-                            CurPos::At(k) => c.get_greater_than(k),
-                            CurPos::AfterDelete(k) => c.set_range(k),
-                        }
+        let tree = self.db.checked_tree(&*self.txn)?;
+        let resumed = self.saved.is_some();
+        // The step borrows the parked stack, so it moves where it is parked:
+        // no copy of the whole stack in or out (the entry borrows the txn,
+        // not the stack, and outlives the cursor).
+        let saved = self.saved.get_or_insert_with(SavedCursor::empty);
+        let mut c = BCursor::resume_in(tree, saved);
+        let r = match op {
+            Step::Next => {
+                if settle {
+                    c.settle()
+                } else if resumed {
+                    c.next()
+                } else {
+                    match &self.pos {
+                        // A fresh cursor's `next` is `first` (SPEC 03 §4),
+                        // which `BCursor::next` already implements.
+                        CurPos::Start => c.next(),
+                        CurPos::At(k) => c.get_greater_than(k),
+                        CurPos::AfterDelete(k) => c.set_range(k),
                     }
                 }
-                Step::Prev => {
-                    if resumed {
-                        c.prev()
-                    } else {
-                        match &self.pos {
-                            // A fresh cursor's `prev` is `last` (SPEC 03 §4).
-                            CurPos::Start => c.prev(),
-                            CurPos::At(k) => c.get_lower_than(k),
-                            // The deleted key's successor is "current", so
-                            // `prev` is the entry strictly before the deleted
-                            // key (LMDB cursor-delete semantics).
-                            CurPos::AfterDelete(k) => c.get_lower_than(k),
-                        }
+            }
+            Step::Prev => {
+                if resumed {
+                    c.prev()
+                } else {
+                    match &self.pos {
+                        // A fresh cursor's `prev` is `last` (SPEC 03 §4).
+                        CurPos::Start => c.prev(),
+                        CurPos::At(k) => c.get_lower_than(k),
+                        // The deleted key's successor is "current", so
+                        // `prev` is the entry strictly before the deleted
+                        // key (LMDB cursor-delete semantics).
+                        CurPos::AfterDelete(k) => c.get_lower_than(k),
                     }
                 }
-                Step::First => c.first(),
-                Step::Last => c.last(),
-                Step::Ge(k) => c.get_greater_than_or_equal_to(k),
-                Step::Gt(k) => c.get_greater_than(k),
-                Step::Le(k) => c.get_lower_than_or_equal_to(k),
-                Step::Lt(k) => c.get_lower_than(k),
-            };
-            let hit = match r.map_err(map_page_err)? {
-                Some(_) => c.entry_pos(),
-                None => None,
-            };
-            self.saved = Some(c.park());
-            hit
+            }
+            Step::First => c.first(),
+            Step::Last => c.last(),
+            Step::Ge(k) => c.get_greater_than_or_equal_to(k),
+            Step::Gt(k) => c.get_greater_than(k),
+            Step::Le(k) => c.get_lower_than_or_equal_to(k),
+            Step::Lt(k) => c.get_lower_than(k),
         };
-        // Phase 2 — re-materialize the entry from plain data under a fresh
-        // shared borrow (leaf view comes from the txn's validated-pages memo,
-        // so this is a hash hit + O(1) header check, not a re-validation).
-        match hit {
-            None => Ok(None),
-            Some((pgno, ki)) => {
-                let tree = self.db.checked_tree(&*self.txn)?;
-                let (k, v) = tree.entry_at(pgno, ki).map_err(map_page_err)?;
-                Ok(Some((k, v)))
+        let flags = c.park_in();
+        match r {
+            Ok(entry) => {
+                saved.set_flags(flags);
+                Ok(entry)
+            }
+            Err(e) => {
+                // A corrupt page: drop the half-moved path (any later op
+                // re-derives from `pos`, as after a discard).
+                self.saved = None;
+                Err(map_page_err(e))
             }
         }
     }
@@ -5514,9 +5679,9 @@ impl RwCursor<'_, '_> {
     /// Rewrite the value of the current entry, keeping the key (`MDB_CURRENT`,
     /// SPEC 03 §7): same-size rewrites happen in place; a different size
     /// deletes and re-inserts (which may split). Returns `false` if the cursor
-    /// is not positioned on an entry. Writes at the parked path and keeps it
-    /// unless the rewrite splits the leaf (SPEC 03 §5.4b); after a split the
-    /// next advance re-seeks once.
+    /// is not positioned on an entry. Writes at the parked path and keeps it,
+    /// following the entry to its half when the rewrite splits the leaf
+    /// (SPEC 03 §5.4b), so the next advance needs no seek.
     ///
     /// # Errors
     ///
@@ -5540,10 +5705,10 @@ impl RwCursor<'_, '_> {
 
     /// The cursor-position put (SPEC 03 §5.4b): when the cursor has a parked
     /// path on a live entry whose key is byte-equal to `key`, overwrite that
-    /// entry at the path — no descent — and keep the path if the overwrite
-    /// stayed inside its leaf, so the next step resumes without a seek
-    /// either. Returns `false`, having changed nothing, when the fast path
-    /// does not apply; the caller then runs the keyed put.
+    /// entry at the path — no descent — and keep the path, repaired across a
+    /// split, so the next step resumes without a seek either. Returns
+    /// `false`, having changed nothing, when the fast path does not apply;
+    /// the caller then runs the keyed put.
     ///
     /// Sequential-writes trees take the keyed put: their rightmost-leaf
     /// finger bookkeeping lives on that path.
@@ -5551,33 +5716,39 @@ impl RwCursor<'_, '_> {
         if self.on_vacated_slot || self.txn.seq_writes_on(tree) {
             return Ok(false);
         }
-        let Some((pgno, ki)) = self.saved.as_ref().and_then(SavedCursor::entry_pos) else {
+        let Some(saved) = self.saved.as_mut() else {
             return Ok(false);
         };
-        {
-            let t = self.db.checked_tree(&*self.txn)?;
-            let (k, _) = t.entry_at(pgno, ki).map_err(map_page_err)?;
-            if k != key {
-                return Ok(false);
-            }
+        if saved.entry_pos().is_none() {
+            return Ok(false);
         }
         // The path stays parked during the put: an error that rejects the put
         // before any mutation (an oversized value, a poisoned txn) leaves the
         // cursor exactly where it was, as the keyed put's error does.
-        let saved = self.saved.as_mut().expect("checked above");
-        if self.txn.put_at_path(tree, saved.frames_mut(), key, value)? {
-            #[cfg(debug_assertions)]
-            {
-                self.repaired_keeps += 1;
-                self.txn
-                    .shadow_check_put_path(tree, saved.frames_mut(), key);
+        match self.txn.put_at_path(tree, saved.frames_mut(), key, value)? {
+            PathPut::Elsewhere => return Ok(false),
+            PathPut::Kept => {}
+            // A split kept the path on the entry; only a root grow adds a
+            // frame.
+            PathPut::Grown(root) => {
+                if saved.push_root(root).is_err() {
+                    self.saved = None;
+                }
             }
-        } else {
-            self.saved = None;
         }
-        // `pos` is the fallback for a discarded path (a split) and for every
-        // op that re-derives its position by key. A cursor rewriting entry
-        // after entry reuses the buffer instead of allocating per put.
+        #[cfg(debug_assertions)]
+        if let Some(saved) = self.saved.as_mut() {
+            self.repaired_keeps += 1;
+            self.txn
+                .shadow_check_put_path(tree, saved.frames_mut(), key);
+        }
+        // `pos` is read only while no path is parked (the struct docs), and
+        // the path is kept unless it could not take the new root frame. A
+        // kept path leaves `pos` alone: like a step, a put through the cursor
+        // then copies no key.
+        if self.saved.is_some() {
+            return Ok(true);
+        }
         match &mut self.pos {
             CurPos::At(k) | CurPos::AfterDelete(k) => {
                 k.clear();

@@ -24,6 +24,7 @@ use std::ops::Deref;
 use heed_zerodb::types::Bytes;
 use heed_zerodb::{Database, Env, EnvOpenOptions, RoTxn, RwTxn, WithoutTls};
 
+use crate::op::walk_value;
 use crate::result::{OpResult, OracleError, Skip};
 use crate::tempdir::TempDir;
 use crate::{DbName, Engine, EngineMode, Op, PutFlag};
@@ -354,7 +355,8 @@ impl Engine for HeedZerodbEngine {
                 steps,
                 val,
                 rewrite,
-            } => self.iter_mut_put_then_walk(*db, *nth, *steps, &val.0, *rewrite),
+                grow,
+            } => self.iter_mut_put_then_walk(*db, *nth, *steps, &val.0, *rewrite, *grow),
 
             // ---------------- verification ----------------
             Op::VerifyGet { db, key } => self.verify_get(*db, &key.0),
@@ -1038,6 +1040,7 @@ impl HeedZerodbEngine {
         steps: u8,
         val: &[u8],
         rewrite: bool,
+        grow: u16,
     ) -> OpResult {
         let db = match self.db_at(db) {
             Ok(d) => d,
@@ -1072,7 +1075,7 @@ impl HeedZerodbEngine {
         };
         // SAFETY: the key was copied out and the borrowing `next()` result
         // dropped; `k` equals the current key, as `put_current` requires.
-        if let Err(e) = unsafe { it.put_current(k.as_slice(), val) } {
+        if let Err(e) = unsafe { it.put_current(k.as_slice(), &walk_value(val, grow, 0)) } {
             return err(e);
         }
         let limit = if steps == 0 {
@@ -1089,7 +1092,9 @@ impl HeedZerodbEngine {
                     if rewrite {
                         // SAFETY: the entry was copied out above; no borrow
                         // lives, and `k` is the current key.
-                        if let Err(e) = unsafe { it.put_current(k.as_slice(), val) } {
+                        if let Err(e) = unsafe {
+                            it.put_current(k.as_slice(), &walk_value(val, grow, seen.len()))
+                        } {
                             return err(e);
                         }
                     }

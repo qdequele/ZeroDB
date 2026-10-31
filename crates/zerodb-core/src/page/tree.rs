@@ -476,6 +476,21 @@ impl<'a> LeafMut<'a> {
         self.insert_cell(idx, key, 0, dsize, dsize as usize, None)
     }
 
+    /// The key of entry `idx` (bounds-checked reads, unlike the unchecked
+    /// [`LeafRef::key`]): lets a put at a known slot confirm the key on the
+    /// same view it then rewrites.
+    ///
+    /// # Panics
+    ///
+    /// If `idx` is not an entry of this page.
+    #[must_use]
+    pub fn key(&self, idx: usize) -> &[u8] {
+        assert!(idx < self.num_keys(), "leaf entry index out of range");
+        let abs = HEADER_SIZE + ptr_at(self.buf, idx) as usize;
+        let ksize = read_u16(self.buf, abs + 2) as usize;
+        &self.buf[abs + LEAF_NODE_HEADER..abs + LEAF_NODE_HEADER + ksize]
+    }
+
     /// Absolute byte offset of entry `idx`'s inline value area, together with
     /// its `dsize`. Errors if the entry is `F_BIGDATA` (its value lives on an
     /// overflow run, not in this page).

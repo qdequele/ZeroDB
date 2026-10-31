@@ -53,6 +53,7 @@ use zerodb::{
     RwTxn,
 };
 
+use crate::op::walk_value;
 use crate::result::{OpResult, OracleError, Skip};
 use crate::tempdir::TempDir;
 use crate::{DbName, Engine, EngineMode, Op, PutFlag};
@@ -711,6 +712,7 @@ impl ZerodbEngine {
         steps: u8,
         val: &[u8],
         rewrite: bool,
+        grow: u16,
     ) -> OpResult {
         let dbh = match self.db_at(db) {
             Ok(d) => d,
@@ -728,7 +730,7 @@ impl ZerodbEngine {
                 Err(e) => return OpResult::Err(to_oracle(e)),
             }
         }
-        if let Err(e) = cur.put_current(val) {
+        if let Err(e) = cur.put_current(&walk_value(val, grow, 0)) {
             return OpResult::Err(to_oracle(e));
         }
         let limit = if steps == 0 {
@@ -742,7 +744,7 @@ impl ZerodbEngine {
                 Ok(Some((k, v))) => {
                     seen.push((k.to_vec(), v.to_vec()));
                     if rewrite {
-                        if let Err(e) = cur.put_current(val) {
+                        if let Err(e) = cur.put_current(&walk_value(val, grow, seen.len())) {
                             return OpResult::Err(to_oracle(e));
                         }
                     }
@@ -1051,7 +1053,8 @@ impl Engine for ZerodbEngine {
                 steps,
                 val,
                 rewrite,
-            } => self.iter_mut_put_then_walk(*db, *nth, *steps, &val.0, *rewrite),
+                grow,
+            } => self.iter_mut_put_then_walk(*db, *nth, *steps, &val.0, *rewrite, *grow),
 
             Op::VerifyGet { db, key } => self.verify_get(*db, &key.0),
 
