@@ -17,11 +17,11 @@
 //! swap), so `std::sync::Arc` is used everywhere, including in loom models.
 
 #[cfg(loom)]
-pub(crate) use loom::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+pub(crate) use loom::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 #[cfg(loom)]
 pub(crate) use loom::sync::Mutex;
 
 #[cfg(not(loom))]
-pub(crate) use std::sync::atomic::{fence, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+pub(crate) use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 #[cfg(not(loom))]
 pub(crate) use std::sync::Mutex;

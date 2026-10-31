@@ -6,6 +6,16 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### The validated-pages cache covers the whole file (ADR-0018 amendment)
+
+The env-wide cache of validated page versions had 64 Ki slots, so on a file of
+more than 64 Ki pages most random reads found their leaf's slot taken by
+another page and checked the leaf's cells again. Each page now has its own
+slot, up to 2^23 pages (32 GiB at 4 KiB pages, 128 GiB at 16 KiB), allocated
+as pages are first validated: 8 bytes per page, 64 MiB per environment at most.
+A slot is one atomic word instead of a seqlock over three, so a lookup is one
+load and a publish one store. Files and the public API are unchanged.
+
 ### Raw environment copies read the data file: a clone on APFS, `copy_file_range` on Linux (ADR-0032)
 
 A non-compacting copy (`copy_to_file` with `CompactionOption::Disabled`) wrote

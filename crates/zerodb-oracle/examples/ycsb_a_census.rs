@@ -196,7 +196,10 @@ fn warm_page_cache(dir: &std::path::Path) {
 
 census!(lmdb, heed, |_opts| {});
 census!(zerodb, heed_zerodb, |opts| {
-    if let Some(ps) = std::env::var("CENSUS_PAGE_SIZE").ok().and_then(|s| s.parse().ok()) {
+    if let Some(ps) = std::env::var("CENSUS_PAGE_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
         opts.page_size(ps);
     }
 });

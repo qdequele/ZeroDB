@@ -234,8 +234,8 @@ ladder A/B.
 
 ## Amendment: a table that covers the file — one-word slots, mapped by pgno (2026-10-31)
 
-- Status: **Proposed** — awaiting maintainer approval; no implementation
-  before it.
+- Status: **Accepted** — approved by the maintainer, 2026-10-31: Option B,
+  cap 2^23 slots, gated on a Graviton4 `c8g.xlarge` three-column run.
 
 ### Problem
 
@@ -389,9 +389,8 @@ columns (LMDB / ZeroDB before / ZeroDB after):
 Kept if the census read p50 moves toward the trusted-file figure and no
 ladder rung regresses beyond 3 %.
 
-### Open questions
+### Decision (2026-10-31)
 
-1. Option B over A (a new, simpler protocol and a 4× smaller table, against
-   A's untouched loom-checked protocol)?
-2. The cap: 2^23 slots (64 MiB at most, files up to 32 GiB at 4 KiB pages
-   collision-free), or 2^22 (32 MiB, 16 GiB)?
+1. Option B over A.
+2. Cap 2^23 slots: 64 MiB per env at most, files up to 32 GiB at 4 KiB pages
+   (128 GiB at 16 KiB) collision-free.
