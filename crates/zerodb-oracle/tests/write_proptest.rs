@@ -48,6 +48,7 @@ enum Step {
         steps: u8,
         val: Value,
         rewrite: bool,
+        grow: u16,
     },
     Get {
         slot: u8,
@@ -92,8 +93,10 @@ fn arb_step() -> impl Strategy<Value = Step> {
         1 => Just(Step::Clear),
         2 => (any::<u8>(), arb_value()).prop_map(|(nth, val)| Step::IterMutPut { nth: nth % 40, val }),
         2 => any::<u8>().prop_map(|nth| Step::IterMutDel { nth: nth % 40 }),
-        2 => (any::<u8>(), any::<u8>(), arb_value(), any::<bool>()).prop_map(|(nth, steps, val, rewrite)| {
-            Step::IterMutPutWalk { nth: nth % 40, steps: steps % 8, val, rewrite }
+        2 => (any::<u8>(), any::<u8>(), arb_value(), any::<bool>(), any::<u16>()).prop_map(|(nth, steps, val, rewrite, grow)| {
+            // Half the walks grow their values past a leaf (`walk_value`).
+            let grow = if grow.is_multiple_of(2) { 0 } else { grow };
+            Step::IterMutPutWalk { nth: nth % 40, steps: steps % 8, val, rewrite, grow }
         }),
         2 => any::<u8>().prop_map(|slot| Step::Get { slot }),
         1 => Just(Step::Iter),
@@ -182,12 +185,14 @@ fn step_to_op(s: Step) -> Op {
             steps,
             val,
             rewrite,
+            grow,
         } => Op::IterMutPutThenWalk {
             db: 0,
             nth,
             steps,
             val,
             rewrite,
+            grow,
         },
         Step::Get { slot } => Op::Get {
             db: 0,

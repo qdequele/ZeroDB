@@ -46,6 +46,28 @@ On Graviton4, random gets on a 10M-key file went from 1.32–1.36 µs to
 1.23–1.24 µs p50 (LMDB 0.96–1.08 µs) and `scan/full/big` from 27.9 ms to
 24.3 ms; the cache holds 2.5 MiB for that 1.33 GB file.
 
+### Write-cursor puts keep their position across splits; cheaper cursor steps and APPEND puts (#138)
+
+A put through the write cursor (`put_current`, or heed's `put_current` on a
+`RwIter`/`RwRange`) that splits its leaf used to drop the cursor's
+root-to-leaf path, and the next step searched from the root again. The path
+now follows the entry to whichever half holds it, through branch splits and a
+root grow, as LMDB fixes up its cursor after a page split. The write cursor
+also steps on its parked path in place instead of copying it in and out per
+step, yields the entry the step landed on without looking the page up a
+second time, and rewrites a same-size value on a page the transaction already
+owns in one page access, with no copy-on-write pass over the path (LMDB's
+`MDB_CURRENT` put on a dirty page). `APPEND` puts no longer view the
+rightmost leaf twice and skip the copy-on-write pass when the whole right
+spine is already the transaction's. Behaviour and files are unchanged.
+On Graviton4, `put/cursor/rewrite` went from 2.50× to 1.37× LMDB's time,
+`put/order/append` from 1.26× to 1.21× and `del/cursor/drain` from 2.62× to
+2.15×; without commit costs, the cursor rewrite loop went from 4.1× to 2.1×
+LMDB's CPU time per entry. Details:
+`benches/results/2026-10-31-write-cursor-split-append-graviton.md`. New example
+`crates/zerodb-oracle/examples/cursor_put_census.rs`; the differential
+fuzzer's cursor-put walk gains a `grow` mode that splits on most puts.
+
 ### Raw environment copies read the data file: a clone on APFS, `copy_file_range` on Linux (ADR-0032)
 
 A non-compacting copy (`copy_to_file` with `CompactionOption::Disabled`) wrote

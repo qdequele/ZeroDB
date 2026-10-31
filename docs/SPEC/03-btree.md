@@ -552,13 +552,15 @@ searching for the key. LMDB's `MDB_CURRENT` put likewise writes at
 
 | outcome of the replace | effect on the retained path |
 |---|---|
+| same-size inline value on a leaf the txn already owns (dirty) | keep, untouched: the value bytes are overwritten in place. Every ancestor of a dirty page is the txn's own page too (a page is copied only below a touched parent, §5.3), so no level needs a COW — LMDB's `mdb_page_touch` skips such pages on `P_DIRTY` |
 | fits in its leaf (same-size in place, or remove + reinsert at the same slot) | keep: `touch_path` remapped every pgno during COW, and the entry is back at the same `ki` with the same key, so no separator above it changed |
-| leaf split (§6.2; may cascade to branch splits and a root grow) | discard; the cursor re-seeks by key on its next access |
+| leaf split (§6.2; may cascade to branch splits and a root grow) | keep, repaired (2026-10-31): the leaf frame names the half that received the cell — slot `newindx` on the left page or `newindx - s` on the right one, for the general split; slot 0 (APPEND-style) or 1 (end pair) of the right page, for an end split (§6.4). Each branch level the separator rises into then follows the child holding the cell: `ki` itself, or `ki + 1` when the cell went right; when that branch splits at `s` too (§6.5), index `x` becomes `x` on the left page or `x - s` on the right (index `s`, the rising cell's child, is the right page's node 0). A root grow puts the new root's frame on top: child 0 or 1, whichever is the half below. LMDB fixes up the splitting cursor the same way at the end of `mdb_page_split` |
 | error that poisons the txn | no obligation |
 
-A split is detected as a change in the tree's depth, leaf-page or branch-page
-count across the replace. The keyed put is taken instead — and the path dropped,
-as before — for every other cursor put: any put flag (`NO_OVERWRITE`, `APPEND`,
+The cursor checks the key under it while it views the leaf for the replace;
+when it differs the put changes nothing and the keyed put runs instead. The
+keyed put is taken — and the path dropped, as before — for every other cursor
+put: any put flag (`NO_OVERWRITE`, `APPEND`,
 …), a key other than the current one (including one equal only under a custom
 comparator), a cursor sitting on a slot a delete just vacated, and trees with
 the sequential-writes setting (their §6.6 finger bookkeeping lives on the keyed
@@ -566,7 +568,13 @@ path).
 
 **Debug shadow check.** As for deletes: after every put that keeps the path, a
 debug build re-runs a fresh search for the key and asserts it is found at
-exactly the kept path, same `pgno` and `ki` at every level.
+exactly the kept path, same `pgno` and `ki` at every level — splits and root
+grows included.
+
+*(Amended 2026-10-31, issue #138: a split used to discard the path, the next
+access re-seeking by key. The repair follows the split instead; it is
+confined to the put path — a delete's separator rewrite that splits an
+ancestor still invalidates, §5.4a.)*
 
 ---
 
@@ -640,7 +648,12 @@ split(page P at insertion index newindx, new cell):
 `put(..., APPEND)` does **not** do a normal search. It positions at the
 **last** entry (`last()`), compares `key` against the last key:
 
-- `key > last_key` (the tree's ordering, §2.0; memcmp by default): insert at the end. If the rightmost leaf is full,
+- `key > last_key` (the tree's ordering, §2.0; memcmp by default): insert at the end — at
+  slot `nkeys`, one past the last cell the positioning read, with no second view of
+  the leaf (LMDB bumps `mc_ki` after `mdb_cursor_last`). When every page on the
+  rightmost path is already the txn's own (an append load between two splits), the
+  §5.3 COW pass has nothing to copy and is skipped, as LMDB's `mdb_page_touch` skips
+  `P_DIRTY` pages. If the rightmost leaf is full,
   split with the **end-of-page insert-point policy** (§6.4): put the *new* key
   alone on a fresh right page instead of splitting the full page in half — this
   keeps sequentially-loaded pages ~100 % full and avoids repeated half-empty
