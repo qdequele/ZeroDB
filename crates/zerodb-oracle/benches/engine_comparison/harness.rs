@@ -52,6 +52,7 @@ pub trait Backend {
     fn delete_range(env: &Self::Env, db: Self::Db, lo: &[u8], hi: &[u8]) -> usize;
     fn clear_db(env: &Self::Env, db: Self::Db);
     fn cursor_drain(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8]);
+    fn cursor_rev_drain(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8]);
     fn cursor_rewrite(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8]);
     fn delete_reinsert(env: &Self::Env, db: Self::Db, keys: &[Vec<u8>], val: &[u8], rounds: usize);
 

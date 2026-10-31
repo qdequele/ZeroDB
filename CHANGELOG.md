@@ -6,6 +6,32 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### Faster cursor deletes and `clear` (issue #137)
+
+Four changes to the delete path, each taken from LMDB's technique for it; the
+tree shape and the file are unchanged.
+
+- The write cursor steps inside its leaf in place after a delete, as
+  `mdb_cursor_next`/`mdb_cursor_prev` do: it reads the next slot from the path
+  it keeps instead of rebuilding a cursor around it, and no longer allocates a
+  copy of each deleted key.
+- A delete that borrows from or merges with its **left** sibling keeps the
+  cursor's path (LMDB's `mdb_node_move` and `mdb_page_merge` cursor fix-ups)
+  instead of re-descending, and `prev` after a delete steps back from the kept
+  path. Backward drains (`rev_range_mut` + `del_current`) used to re-descend on
+  every step. SPEC 03 §5.4a.
+- Removing a cell fixes the page's cell pointers in one pass, as
+  `mdb_node_del` does.
+- `clear` frees a page of the base snapshot with a list append (it cannot have
+  a dirty frame), reserves its page list per branch (`mdb_midl_need`), and
+  checks the collected pages for duplicates with a bitmap instead of a sort.
+
+On Graviton4 (ZeroDB time ÷ LMDB time): `del/cursor/drain` 2.41× → 1.66×,
+`del/cursor/rev` 3.06× → 1.50×, `del/clear/all` 1.73× → 1.43×, `del/bulk/half`
+1.41× → 1.35×; cursor rewrites (`put/cursor/rewrite`) 2.12× → 1.75×, and no
+put or commit rung slowed. New ladder rung `del/cursor/rev` (the backward
+drain). Details: `benches/results/2026-10-31-delete-path-cursor.md`.
+
 ### Raw environment copies read the data file: a clone on APFS, `copy_file_range` on Linux (ADR-0032)
 
 A non-compacting copy (`copy_to_file` with `CompactionOption::Disabled`) wrote
