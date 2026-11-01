@@ -33,10 +33,11 @@ LMDB ops/s ÷ ZeroDB ops/s, which is the same time ratio.
   operation, usually under a 2 GB memory cap so the data does not fit in RAM.
 - **Consumers end to end** — Meilisearch (`cargo xtask bench` workloads,
   through `scripts/consumer.sh`) and hannoy v0.1.7 (its divan benches), each
-  built once against LMDB and once against ZeroDB. The recorded Meilisearch
-  numbers are on v1.53.1. The gate now defaults to v1.55.0, which builds
-  against Meilisearch's heed fork through the `unique-txns` shim (ADR-0027);
-  no v1.55 benchmark is recorded yet.
+  built once against LMDB and once against ZeroDB. The gate now defaults to
+  v1.55.0, which builds against Meilisearch's heed fork through the
+  `unique-txns` shim (ADR-0027). v1.55.0 numbers are recorded for movies
+  indexing, movies search and hackernews additions [WC]; the other
+  Meilisearch numbers are on v1.53.1.
 
 Raw numbers live in [`benches/results/*.md`](../benches/results/), one report
 per run. Every lever ever tried, kept or reverted, is one line in

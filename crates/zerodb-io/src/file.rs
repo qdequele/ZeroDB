@@ -97,6 +97,12 @@ const MAX_SEGS: usize = 64;
 /// slow. 256 KiB takes most of the small-commit gain for few extra syscalls.
 const MAX_WRITE_BYTES: usize = 256 * 1024;
 
+/// Byte cap for one `pwritev` call at page size `psize`: [`MAX_WRITE_BYTES`],
+/// or one page when a page is larger.
+fn commit_cap(psize: u32) -> usize {
+    MAX_WRITE_BYTES.max(psize as usize)
+}
+
 /// Fill `segs` with the next `pwritev` call's segments over consecutive
 /// `frames`, resuming at `at` (frame index, byte offset within it): at most
 /// `cap` bytes and [`MAX_SEGS`] segments, cutting a frame longer than the
@@ -150,7 +156,7 @@ pub fn write_pages_vectored(
 ) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
 
-    let cap = MAX_WRITE_BYTES.max(psize as usize);
+    let cap = commit_cap(psize);
     let mut off: u64 = page_offset(start_pgno, psize)?;
     let mut at = (0usize, 0usize);
     let mut segs: [&[u8]; MAX_SEGS] = [&[]; MAX_SEGS];
@@ -339,7 +345,16 @@ fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{next_write_run, write_pages_vectored, MAX_SEGS, MAX_WRITE_BYTES};
+    use super::{commit_cap, next_write_run, write_pages_vectored, MAX_SEGS, MAX_WRITE_BYTES};
+
+    /// The commit cap is 256 KiB, LMDB's 64 pages at 4 KiB, unless one page
+    /// is larger; a change to the tuned value has to change this test.
+    #[test]
+    fn commit_cap_is_256_kib_or_one_page() {
+        assert_eq!(commit_cap(4096), 256 * 1024);
+        assert_eq!(commit_cap(65536), 256 * 1024);
+        assert_eq!(commit_cap(1 << 20), 1 << 20);
+    }
     use std::os::unix::fs::FileExt;
 
     /// Every call's segments `next_write_run` hands out, in order.
