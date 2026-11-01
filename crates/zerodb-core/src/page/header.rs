@@ -123,10 +123,9 @@ impl<'a> PageRef<'a> {
     }
 
     /// [`PageRef::new`] minus the `validate_page_size` re-check, for the
-    /// engine's per-page-load hot path (`btree::load_page`): the page size is
+    /// engine's per-page-load hot path (`btree::node_view`): the page size is
     /// validated once at env open and is immutable after, so re-validating it
-    /// on every page load only costs time (docs/PERF-GAP-VS-LMDB.md,
-    /// `validate_page_size` on every page load). All per-buffer checks (length,
+    /// on every page load only costs time. All per-buffer checks (length,
     /// type classification) are kept — this trusts only `psize`, never the
     /// bytes.
     pub(crate) fn new_trusted_psize(buf: &'a [u8], psize: u32) -> Result<PageRef<'a>, PageError> {
@@ -258,7 +257,6 @@ impl<'a> PageRef<'a> {
 
 /// Validate the free-space bounds of a branch/leaf page against the body size,
 /// shared by the tree views. Returns `(lower, upper)` on success.
-// Forced: LLVM inlines this only at -inline-threshold=1000.
 #[inline(always)]
 pub(crate) fn read_and_check_bounds(buf: &[u8], psize: u32) -> Result<(u16, u16), PageError> {
     let body_size = psize as usize - HEADER_SIZE;

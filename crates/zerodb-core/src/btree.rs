@@ -107,7 +107,6 @@ impl<'a> Source<'a> {
     /// every spill resets that writer's memo (TXN-71), so no memo entry
     /// outlives the bytes it vouched for. Dirty frames mutate mid-txn and
     /// must never be trusted from a memo.
-    // Forced: LLVM inlines this only at -inline-threshold=1000.
     #[inline(always)]
     pub(crate) fn bytes_from_classified(
         &self,
@@ -179,12 +178,10 @@ const fn level_slots(li: usize) -> usize {
 }
 
 thread_local! {
-    /// One all-zero level 0, left by the last memo dropped on this thread.
-    ///
-    /// Opening a read transaction and reading one key used to allocate,
-    /// zero and free this 8 KiB level every time: about a fifth of the
-    /// per-transaction time of `short_txn_census`. LMDB avoids per-request
-    /// setup by letting the caller keep a transaction and re-arm it
+    /// One all-zero level 0, left by the last memo dropped on this thread,
+    /// so a short read transaction does not allocate, zero and free 8 KiB.
+    /// LMDB avoids per-request setup by letting the caller keep a
+    /// transaction and re-arm it
     /// (`mdb_txn_reset` / `mdb_txn_renew`); heed 0.22.1 does not expose that,
     /// so the reuse happens here instead. The level holds no entry when it is
     /// parked (dropping the memo zeroes every slot it wrote), so a new
@@ -258,15 +255,11 @@ pub struct ValidatedPages<'e> {
     trust_file: bool,
     /// The env-wide cache of validated page versions (ADR-0018), probed on
     /// a validating memo miss for a map page. Borrowed from the env by a
-    /// plain read txn, so opening one touches no shared refcount (an `Arc`
-    /// cloned per txn cost `env/txn/ro_begin_abort` +17 %, and an owning
-    /// variant for `static_read_txn` still cost +7 % in drop glue). `None`
-    /// for env-owning `static_read_txn`s and under a trusting policy. Write
-    /// txns carry it too (ADR-0018 publish-at-commit): the committer seeds
-    /// the cache, so a writer's probe hits the path the previous commit
-    /// rewrote. Kept inside the memo
-    /// so the tree code passes one pointer: a two-word handle cost 4–7 % on
-    /// memo-hit and scan rungs in the codegen-units=16 build.
+    /// plain read txn, so opening one touches no shared refcount. `None` for
+    /// env-owning `static_read_txn`s and under a trusting policy. Write txns
+    /// carry it too (ADR-0018 publish-at-commit): the committer seeds the
+    /// cache, so a writer's probe hits the path the previous commit
+    /// rewrote. Kept inside the memo so the tree code passes one pointer.
     shared: Option<&'e StampCache>,
     /// Whether a validating miss may publish its result into `shared`
     /// (ADR-0018). True for plain read txns; false for
@@ -354,7 +347,6 @@ impl<'e> ValidatedPages<'e> {
         z ^ (z >> 31)
     }
 
-    // Forced: LLVM inlines this only at -inline-threshold=1000.
     #[inline(always)]
     fn contains(&self, pgno: u64, kind: PageKind) -> bool {
         let key = Self::key_of(pgno, kind);
@@ -491,8 +483,8 @@ pub(crate) fn leaf_view<'a>(
     leaf_view_over(bytes, from_map, psize, pgno, valid)
 }
 
-/// [`leaf_view`] over bytes the caller already resolved (issue #9:
-/// the descent resolves each page's bytes exactly once — see [`node_view`]).
+/// [`leaf_view`] over bytes the caller already resolved (the descent
+/// resolves each page's bytes exactly once — see [`node_view`]).
 fn leaf_view_over<'a>(
     bytes: &'a [u8],
     from_map: bool,
@@ -511,11 +503,9 @@ fn leaf_view_over<'a>(
                     // in for the cell walk, as in LMDB; the O(1) header checks
                     // (page type included) still run. Tested only on a memo
                     // miss, keeping the option off the memo-hit path. Not
-                    // recorded, unlike a trusted branch (ADR-0014): a scan
-                    // views each leaf once, and recording every leaf grew the
-                    // memo until each probe missed through all its levels, as
-                    // LMDB keeps no such table. The header checks cost less
-                    // than that probe.
+                    // recorded, unlike a trusted branch: a scan views each
+                    // leaf once, and recording every leaf would fill the memo
+                    // until each probe missed through all its levels.
                     LeafRef::new_prevalidated(bytes, psize)
                 } else {
                     validate_leaf_miss(bytes, psize, pgno, v)
@@ -647,19 +637,17 @@ fn branch_view_over<'a>(
 }
 
 /// A tree page as its typed view, resolved and dispatched in **one** source
-/// resolution (issue #9).
+/// resolution.
 ///
 /// A type dispatch followed by [`leaf_view`]/[`branch_view`] would resolve
 /// each page's bytes twice, and in a write txn each resolution probes the
-/// dirty store first ([`Source::bytes_from_classified`]), which the
-/// hannoy-build call tree showed as a top descent cost. Any non-tree page
+/// dirty store first ([`Source::bytes_from_classified`]). Any non-tree page
 /// type fails with [`PageError::WrongPageType`].
 pub(crate) enum NodeView<'a> {
     Leaf(LeafRef<'a>),
     Branch(BranchRef<'a>),
 }
 
-// Forced: LLVM inlines this only at -inline-threshold=1000.
 #[inline(always)]
 pub(crate) fn node_view<'a>(
     src: Source<'a>,
@@ -684,7 +672,6 @@ pub(crate) fn node_view<'a>(
 /// or is a frame this write txn already owns (`false`) — the writer's
 /// equivalent of LMDB's `P_DIRTY` test on a page in hand, which tells a
 /// descent that copy-on-write has nothing left to do at that level.
-// Forced, as `node_view`.
 #[inline(always)]
 pub(crate) fn node_view_classified<'a>(
     src: Source<'a>,
@@ -962,7 +949,7 @@ impl<'a> Tree<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// PathStack — inline root-to-leaf frame stack (no heap allocation per cursor, issue #19)
+// PathStack — inline root-to-leaf frame stack (no heap allocation per cursor)
 // ---------------------------------------------------------------------------
 
 /// Maximum root-to-leaf frames a cursor path can hold — LMDB's
@@ -973,8 +960,8 @@ impl<'a> Tree<'a> {
 pub(crate) const CURSOR_STACK: usize = 32;
 
 /// A `Vec`-shaped fixed-capacity `(pgno, ki)` stack. Descents are the
-/// engine's hottest loop, and a heap `Vec` costs one alloc + free per
-/// `Tree::get` (the `grow_one` frame in the hannoy-build profile).
+/// engine's hottest loop, and a heap `Vec` would cost one alloc + free per
+/// `Tree::get`.
 /// Inline storage makes cursor construction allocation-free; `push` reports
 /// overflow as a typed corruption error instead of growing.
 ///
@@ -1144,7 +1131,6 @@ impl<'a, S: BorrowMut<PathStack>> Cursor<'a, S> {
     /// The validated leaf view for `pgno`, reusing the memoized one while the
     /// cursor stays on the same page (see [`Cursor::leaf_cache`]). A miss goes
     /// through the txn's validated-pages memo ([`leaf_view`]).
-    // Forced: LLVM inlines this only at -inline-threshold=1000.
     #[inline(always)]
     fn leaf_at(&self, pgno: u64) -> Result<LeafRef<'a>, PageError> {
         if let Some((cached, leaf)) = self.leaf_cache.get() {
@@ -1751,9 +1737,9 @@ impl SavedCursor {
     }
 
     /// The parked `(leaf pgno, cell index)` if the parked cursor sat on an
-    /// entry — same conditions as [`Cursor::entry_pos`], evaluated on the
-    /// detached state (used by the write cursor's mutations to read the
-    /// current key without resuming).
+    /// entry (initialized and not at EOF), evaluated on the detached state
+    /// (used by the write cursor's mutations to read the current key without
+    /// resuming).
     pub(crate) fn entry_pos(&self) -> Option<(u64, usize)> {
         if !self.initialized || self.eof {
             return None;

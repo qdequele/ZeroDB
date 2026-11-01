@@ -183,7 +183,7 @@ impl TxnHandles {
     }
 
     /// Take this transaction's [`Rare`] allocation, emptied, for the next
-    /// write transaction ([`HandleTable::begin_reusing`]; issue #8). Called
+    /// write transaction ([`HandleTable::begin_reusing`]). Called
     /// after [`HandleTable::end`], with `&mut`, so no check can be reading
     /// the memo. Every memo cell is reset to "none": the next transaction
     /// checks each slot under the table lock once, exactly as with a fresh

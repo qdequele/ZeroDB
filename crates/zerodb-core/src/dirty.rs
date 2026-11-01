@@ -68,10 +68,9 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::env::Backing;
 
-/// Pgno hasher (issue #9): every page load inside a write txn
-/// probes this store first (`Source::Writer`), and the hannoy-build call
-/// tree put the default `RandomState` SipHash among the top descent costs.
-/// Keys are page numbers authored by the engine itself — never
+/// Pgno hasher: every page load inside a write txn probes this store first
+/// (`Source::Writer`), so the default SipHash would sit on the descent's
+/// hot path. Keys are page numbers authored by the engine itself — never
 /// attacker-controlled input — so SipHash's HashDoS resistance buys nothing
 /// here. This uses the splitmix64 finalizer (same full-avalanche 3-multiply
 /// mixer as `btree::ValidatedPages::mix`), which also mixes the low bits
@@ -117,7 +116,7 @@ pub(crate) type PgnoBuildHasher = BuildHasherDefault<PgnoHasher>;
 pub(crate) const SPARE_CAP: usize = 256;
 
 /// Capacity, in entries, that a write txn's pgno-hashed indexes keep when
-/// they are carried to the next write txn ([`DirtyCarry`]; issue #8). A
+/// they are carried to the next write txn ([`DirtyCarry`]). A
 /// hash table is iterated over its whole bucket array, not its entries
 /// (commit C2 lists the dirty pgnos that way), so an index left large by
 /// one big txn would slow every small txn after it. 128 entries is 256
@@ -146,11 +145,10 @@ where
 }
 
 /// A [`DirtyStore`]'s allocations, handed from one write txn to the next on
-/// the env's writer slot (issue #8): the frame index and the spilled index,
-/// empty, and the recycled one-page frames. LMDB allocates its dirty list
-/// and its `me_dpages` frame pool once per environment and reuses them in
-/// every write txn; rebuilding the two indexes from nothing cost every
-/// write txn their allocations and the rehashes that grow them.
+/// the env's writer slot: the frame index and the spilled index, empty, and
+/// the recycled one-page frames. LMDB likewise allocates its dirty list and
+/// its `me_dpages` frame pool once per environment and reuses them in every
+/// write txn.
 #[derive(Default)]
 pub(crate) struct DirtyCarry {
     frames: HashMap<u64, Slot, PgnoBuildHasher>,
@@ -308,10 +306,9 @@ impl<'env> DirtyStore<'env> {
 
     /// An empty store seeded with a pool of recycled one-page frames (the
     /// env's `me_dpages`-style pool handed in at write-txn begin). The `Vec`
-    /// is adopted as is, O(1): every write txn, empty ones
-    /// included, pays for the pool hand-over, so it must not scale with the
-    /// pool size (a per-frame filter here made `env/txn/rw_empty_commit` 6×
-    /// slower). The pool only ever holds frames of this env's page size.
+    /// is adopted as is, O(1): every write txn, empty ones included, pays
+    /// for the pool hand-over, so it must not scale with the pool size. The
+    /// pool only ever holds frames of this env's page size.
     #[must_use]
     pub fn with_spare(psize: u32, spare: Vec<Box<[u8]>>) -> DirtyStore<'env> {
         DirtyStore::from_carry(

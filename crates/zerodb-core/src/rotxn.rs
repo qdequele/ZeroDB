@@ -507,7 +507,7 @@ impl Env {
     /// sequential-writes override (**ADR-0015**; ZeroDB extension). With the
     /// setting on, a write txn remembers the path to the tree's rightmost
     /// leaf and appends there without descending when a key sorts after
-    /// every key already in it: faster ascending and APPEND loads, 3–5 %
+    /// every key already in it: faster ascending and APPEND loads, slightly
     /// slower random-key writes. Results are identical either way. Runtime
     /// state, not persisted; write txns that start after the call use it.
     pub fn set_sequential_writes(&self, db: &Database, on: Option<bool>) {

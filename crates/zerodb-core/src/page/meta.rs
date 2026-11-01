@@ -214,8 +214,9 @@ impl MetaPage {
     /// shape is never trusted on the way *out* of a meta — it is re-checked by
     /// `validate_pil_ids` before any id is handed out (SPEC 05 GC-33). The two
     /// callers and their inputs:
-    /// - `RwTxn::freelist_save` → the commit path: produces a GC-29-shaped list
-    ///   by construction, so what it encodes is well-formed.
+    /// - `RwTxn::freelist_save` → the commit path, through
+    ///   [`MetaPage::encode_with_annex_over_zeroed`]: produces a GC-29-shaped
+    ///   list by construction, so what it encodes is well-formed.
     /// - `copy::write_raw` → raw env copy: forwards the pinned snapshot's annex
     ///   verbatim. That annex passed only the open-time count+CRC bound, **not**
     ///   `validate_pil_ids`, so a hostile-but-CRC-valid source file is copied

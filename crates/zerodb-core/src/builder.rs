@@ -1,5 +1,5 @@
-//! Bottom-up B+tree builder — the read-path test loader and the **prototype of
-//! a possible future `Database::bulk_load`**.
+//! Bottom-up B+tree builders: the streaming [`EnvStream`] behind compacting
+//! copy, and the batch `build_*_image` loaders tests use.
 //!
 //! Given a stream of **pre-sorted, unique** `(key, value)` pairs it packs leaves
 //! at a configurable fill factor, builds branch levels upward, spills big values
@@ -9,10 +9,6 @@
 //! opens and the [`crate::btree`] read path (and the `zerodb-tools check` tool)
 //! treat identically to a write-path tree — which is what lets the write path
 //! be differential-tested against this loader.
-//!
-//! It is written to be **promoted, not discarded**: the packing and
-//! upward-build logic is exactly what a bulk loader needs; only the page sink changes
-//! (an in-memory image here; the txn dirty set + writer there).
 //!
 //! Pure logic over a growable `Vec<u8>` page buffer — no I/O, no `unsafe`, so
 //! `miri` exercises it.
@@ -389,8 +385,7 @@ pub trait PageSink {
 }
 
 /// A [`PageSink`] over a growable in-memory image (pages 0/1 reserved for the
-/// meta slots) — the compatibility sink behind the batch `build_*_image`
-/// wrappers and the differential referee for file-backed streaming.
+/// meta slots), the differential referee for file-backed streaming in tests.
 pub struct VecSink {
     psize: u32,
     buf: Vec<u8>,
@@ -944,9 +939,7 @@ pub fn build_single_db_image(
 /// Build a complete **multi-DB** env-file image: the main/unnamed DB
 /// (`main_user` = its plain user entries) plus every named DB in `named`, each
 /// referenced from the main catalog by an inline `F_SUBDATA` record (SPEC 02
-/// §6). This is the compaction primitive for `Env::copy_to_file(Enabled)` and
-/// the `zerodb-tools load` reload path: every tree is packed bottom-up
-/// and densely, dropping fragmentation and all stale GC state.
+/// §6). Every tree is packed bottom-up and densely, with no free pages.
 ///
 /// Build order: each named DB's tree is packed first (so its root pgno is
 /// known), then the main catalog is packed over `main_user` merged with one

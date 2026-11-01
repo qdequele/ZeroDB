@@ -10,14 +10,13 @@
 //! for that pair therefore stays true with no invalidation from the writer:
 //! a reused page carries a newer stamp and simply misses.
 //!
-//! Shape (ADR-0018, 2026-10-31): one slot per pgno, slot = pgno
-//! modulo [`SLOTS`] (2^23), so every page of a file below 2^23 pages owns its
-//! slot and pages never evict each other; in a larger file, pages [`SLOTS`]
-//! apart share a slot and the newer publish wins. Slots are allocated where
-//! publishes land, in three levels — a top array made at open, directory
-//! blocks of [`MID_CHUNKS`] chunks, and chunks of [`CHUNK_SLOTS`] slots — so
-//! the table grows with the pages the file uses (8 bytes per page) and a
-//! small env pays for one chunk.
+//! Shape (ADR-0018): one slot per pgno, slot = pgno modulo [`SLOTS`] (2^23), so
+//! every page of a file below 2^23 pages owns its slot and pages never evict
+//! each other; in a larger file, pages [`SLOTS`] apart share a slot and the
+//! newer publish wins. Slots are allocated where publishes land, in three
+//! levels — a top array made at open, directory blocks of [`MID_CHUNKS`]
+//! chunks, and chunks of [`CHUNK_SLOTS`] slots — so the table grows with the
+//! pages the file uses (8 bytes per page) and a small env pays for one chunk.
 //!
 //! Each slot is one atomic word holding the stamp, the pgno's bits above the
 //! slot index, and the page kind (see [`StampCache::word`]). Within one slot
@@ -43,7 +42,7 @@ use crate::sync::{AtomicU64, Ordering};
 pub(crate) const SLOTS: usize = 1 << 23;
 
 /// Slots per lazily allocated chunk (32 KiB), so a first publish never
-/// zero-fills more than that (measured on `env/open/reopen`).
+/// zero-fills more than that.
 pub(crate) const CHUNK_SLOTS: usize = 1 << 12;
 
 /// Chunks per lazily allocated directory block (1.5 KiB, covering 256 Ki
@@ -165,9 +164,9 @@ impl StampCache {
     /// `pgno`: the pgno itself, masked, not a hash. Pages the file holds
     /// side by side (a bulk-loaded tree's leaves, a sequential writer's)
     /// then sit in adjacent slots, so a scan probes the table almost
-    /// sequentially. Hashed slots make a full scan touch one random line and
-    /// page of the table per leaf: `scan/full/*` measured +5 % from cache
-    /// and TLB misses. A pgno is one kind at a time, so leaf and branch
+    /// sequentially; hashed slots would make a full scan touch one random
+    /// cache line and page of the table per leaf. A pgno is one kind at a
+    /// time, so leaf and branch
     /// share its slot.
     #[inline]
     fn index(&self, pgno: u64) -> (usize, usize, usize) {

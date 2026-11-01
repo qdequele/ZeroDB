@@ -85,7 +85,6 @@ pub enum LeafValue<'a> {
 
 /// Compute the padded length of the leaf cell at absolute offset `abs`, bounds-
 /// checking every field read against `psize`.
-// Forced: LLVM inlines this only at -inline-threshold=1000.
 #[inline(always)]
 fn leaf_cell_len(buf: &[u8], abs: usize, psize: u32) -> Result<usize, PageError> {
     let body = body_size(psize);
@@ -497,9 +496,8 @@ impl<'a> LeafMut<'a> {
     ///
     /// # Errors
     ///
-    /// [`PageError::WrongPageType`]-free; returns [`PageError::ReservedFlagSet`]
-    /// never — a `F_BIGDATA` entry yields [`PageError::BadValueSize`] carrying
-    /// the logical size, signalling "not inline".
+    /// [`PageError::BadValueSize`], carrying the logical size, when the entry
+    /// is `F_BIGDATA` (its value is not inline).
     pub fn inline_value_at(&self, idx: usize) -> Result<(usize, u32), PageError> {
         debug_assert!(idx < self.num_keys(), "index out of range");
         let abs = HEADER_SIZE + ptr_at(self.buf, idx) as usize;
@@ -889,7 +887,6 @@ impl<'a> BranchRef<'a> {
 
     /// As [`Self::child_index`], under an explicit ordering.
     #[must_use]
-    // Forced: LLVM inlines this only at -inline-threshold=1000.
     #[inline(always)]
     pub fn child_index_with(&self, key: &[u8], cmp: KeyCmp<'_>) -> usize {
         // Node 0 is -inf and always qualifies; scan separators 1..num_keys.

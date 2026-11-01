@@ -407,17 +407,15 @@ struct WriterSlot {
     occupied: bool,
     /// Threads parked in [`WriterLock::acquire`]'s wait. The release notifies
     /// only when this is non-zero: on Linux, std's futex `Condvar` makes every
-    /// `notify_one` a `futex_wake` system call even with nobody waiting, which
-    /// cost one syscall per write txn (`env/txn/rw_empty_commit`).
+    /// `notify_one` a `futex_wake` system call even with nobody waiting.
     waiters: u32,
-    /// What one write txn leaves for the next (issue #8): the dirty-frame
+    /// What one write txn leaves for the next: the dirty-frame
     /// pool (LMDB's `me_dpages`), the emptied containers a write txn fills,
     /// and the snapshot the last one published ([`crate::rwtxn::WriterCarry`]).
     /// Kept under the writer lock's own mutex, as LMDB keeps `me_dpages`
     /// under its writer mutex: the carry moves out with the acquire and back
-    /// with the release, so it costs no lock operation of its own (a
-    /// separate `Mutex` for the frame pool made every write txn, empty ones
-    /// included, ~36 % slower). `None` until the first write txn ends.
+    /// with the release, so it costs no lock operation of its own. `None`
+    /// until the first write txn ends.
     carry: Option<Box<crate::rwtxn::WriterCarry>>,
 }
 
@@ -1010,9 +1008,8 @@ impl EnvInner {
         }
     }
 
-    /// The lock-file arm of [`EnvInner::lock_writer_shared`]. Out of line so
-    /// the write-txn path without a lock file stays as small as it was
-    /// before lock files existed.
+    /// The lock-file arm of [`EnvInner::lock_writer_shared`], kept out of
+    /// line so the write-txn path without a lock file stays small.
     ///
     /// A writer that took the lock over from a dead owner then frees dead
     /// processes' reader slots, as LMDB's writer does when it recovers the
@@ -1935,42 +1932,18 @@ impl Env {
     }
 
     /// Reclaim reader slots abandoned by dead processes —
-    /// `mdb_reader_check`. Returns the number of slots freed.
+    /// `mdb_reader_check`. Returns the number of slots freed, counting
+    /// slots, not processes.
     ///
-    /// LMDB's reader table lives in a shared `lock.mdb` mapped by every
-    /// process that opens the env, so a process that dies without ending its
-    /// read txn leaves a slot pinned forever, stalling GC for everyone else.
-    /// `mdb_reader_check` exists to scan those slots and free the ones whose
-    /// `mr_pid` no longer names a live process.
-    ///
-    /// Without a lock file ZeroDB is **single-process** (see
-    /// docs/DIVERGENCES.md): the reader table is plain process memory, every
-    /// slot is owned by a `RoTxn` in *this* address space, and a `RoTxn`
-    /// releases its slot in `Drop` — including while unwinding from a panic.
-    /// The only way to leak a slot is to `mem::forget` a live `RoTxn`, which is
-    /// exactly as unrecoverable as leaking any other resource and is not what
-    /// `mdb_reader_check` is for. If this process dies, the table dies with it,
-    /// so this path always returns `0`, which is the correct answer, not a
-    /// stub.
-    ///
-    /// With the lock file on (the default; `zerodb::EnvOpenOptions::lock_file`,
-    /// heed's `NO_LOCK` off, ADR-0023), the reader table is shared
-    /// across processes, and a process that dies inside a read txn leaves its
-    /// slot pinned. This method then probes the owner of every occupied slot
-    /// and frees the slots of processes that no longer have the environment
-    /// open (ADR-0023 §3). Like `mdb_reader_check`, it counts **slots**, not
-    /// processes: one dead process that held two slots counts 2.
-    ///
-    /// As in LMDB, the engine reaps on its own in only one other place: a
-    /// writer that takes over the writer lock from a dead owner (Linux)
-    /// frees dead readers' slots too. Beginning a read txn, committing, and
-    /// joining an environment that another process has open never reap
-    /// another process's slots, and a full reader table fails with
-    /// `ReadersFull` without reaping; call this method to recover the slots.
-    /// (The first process to open the environment wipes the whole table, as
-    /// no other process has it open; and a joining process frees the slots
-    /// left under its own PID by a dead predecessor, since no probe can tell
-    /// those from its own, ADR-0023.)
+    /// With a lock file (the default, ADR-0023 §3) the reader table is shared
+    /// across processes, and one that dies inside a read txn leaves its slot
+    /// pinned, holding GC back; this probes the owner of every occupied slot
+    /// and frees those of processes that no longer have the environment
+    /// open. As in LMDB, the only automatic reaping is by a writer that takes
+    /// the writer lock over from a dead owner (Linux); a full reader table
+    /// fails with `ReadersFull` without reaping. Without a lock file the
+    /// table is process memory, every slot is released by its `RoTxn`'s
+    /// `Drop`, and this always returns `0`.
     ///
     /// # Errors
     ///
@@ -2114,20 +2087,11 @@ impl Env {
 }
 
 /// Environment info (SPEC 00 rows 20/60; `mdb_env_info` / `MDB_envinfo`).
-/// Every field is populated, though `map_size` is the only one any consumer
-/// reads.
 ///
-/// ## LMDB `MDB_envinfo` field mapping
-///
-/// | `MDB_envinfo` | here | note |
-/// |---|---|---|
-/// | `me_mapaddr` | *(absent)* | LMDB-structural: the address the map is fixed at under `MDB_FIXEDMAP`. ZeroDB never maps at a fixed address (`MDB_FIXEDMAP` is WON'T, SPEC 01), so the value would always be null and the field is **not exposed** here. The `heed-zerodb` mirror keeps a `map_addr` field for signature parity and reports null. |
-/// | `me_mapsize` | [`EnvInfo::map_size`] | identical meaning. |
-/// | `me_last_pgno` | [`EnvInfo::last_pgno`] | identical *meaning* (id of the last used page), but the **value is format-specific**: it counts ZeroDB pages of ZeroDB's layout, not LMDB's. Never compare it cross-engine. |
-/// | `me_last_txnid` | [`EnvInfo::last_txnid`] | identical meaning and value domain: the id of the last committed txn. Comparable cross-engine. |
-/// | `me_maxreaders` | [`EnvInfo::max_readers`] | identical: the reader-table size (configured, or adopted from the lock file by a joining process). |
-/// | `me_numreaders` | [`EnvInfo::num_readers`] | identical — **including LMDB's surprise**: it is a *high-water mark*, not a live count (see docs/DIVERGENCES.md). In a lock-file environment it counts every process's readers, as LMDB's shared counter does (`OBS_NUMREADERS_OTHER_PROCESS`): it is derived from the shared reader slots, so it restarts from 0 only when a first opener initializes the lock file. |
-/// | *(none)* | [`EnvInfo::live_readers`] | **ZeroDB extension**: the genuinely-live occupied-slot count that `me_numreaders` looks like but is not. |
+/// Each field names its `MDB_envinfo` counterpart. `me_mapaddr` is not
+/// exposed: ZeroDB never maps at a fixed address (`MDB_FIXEDMAP` is not
+/// supported, SPEC 01). `last_pgno` counts pages of ZeroDB's own layout, so
+/// it is not comparable with LMDB's value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvInfo {
     /// The configured/runtime map size, in bytes (`me_mapsize`).
@@ -2193,19 +2157,12 @@ pub struct ReaderEntry {
 }
 
 /// Environment-level statistics (`mdb_env_stat` / `MDB_stat` over the **main**
-/// DB). The per-database form is
-/// [`crate::rotxn::DatabaseStat`] (SPEC 00 row 49).
+/// DB). The per-database form is [`crate::rotxn::DatabaseStat`] (SPEC 00
+/// row 49).
 ///
-/// ## LMDB `MDB_stat` field mapping
-///
-/// | `MDB_stat` | here | note |
-/// |---|---|---|
-/// | `ms_psize` | [`EnvStat::page_size`] | identical meaning; the value is whatever the env was created with (SPEC 02 §0, runtime page-size selection). |
-/// | `ms_depth` | [`EnvStat::depth`] | identical meaning (tree height, 0 = empty). The *value* depends on per-page fan-out and therefore on the on-disk format (ZeroDB's own) — comparable in kind, not exactly, cross-engine. |
-/// | `ms_branch_pages` | [`EnvStat::branch_pages`] | identical meaning; **format-specific value** (own on-disk format). |
-/// | `ms_leaf_pages` | [`EnvStat::leaf_pages`] | identical meaning; **format-specific value** (own on-disk format). |
-/// | `ms_overflow_pages` | [`EnvStat::overflow_pages`] | identical meaning; **format-specific value** (own on-disk format). |
-/// | `ms_entries` | [`EnvStat::entries`] | identical meaning **and value**: for the env-level stat this is the number of entries in the main DB, which under a named-DB env is the number of named-DB catalog records. Comparable cross-engine. |
+/// Each field names its `MDB_stat` counterpart. The page counts and depth
+/// depend on ZeroDB's own on-disk format, so only `entries` (and
+/// `page_size`) compare exactly with LMDB.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvStat {
     /// Database page size in bytes (`ms_psize`).
@@ -2313,9 +2270,6 @@ pub fn check_open_limits(max_readers: u32, max_dbs: u32) -> Result<(), Error> {
 /// - [`Error::EnvAlreadyOpened`] if a live handle for `canonical_path` exists.
 /// - [`Error::Mdb`]`(`[`MdbError::Invalid`]`)` if neither slot validates, or
 ///   under the one-valid + `PREV_SNAPSHOT` combination (SPEC 06 REC-2†).
-// The open parameters are all distinct scalars/flags the caller (zerodb-io / the
-// public crate) has already resolved; bundling them into a params struct would
-// only add indirection for this single internal entry point.
 #[allow(clippy::too_many_arguments)]
 pub fn open_with_backing(
     canonical_path: PathBuf,

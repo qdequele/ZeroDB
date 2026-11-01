@@ -52,7 +52,7 @@
 //!   decrements, so all child activity happens-before the writer mutates or
 //!   commits, even without the join edge.
 //!
-//! `mem::forget(child)` (risk R1): forget *consumes* the child, so no read
+//! `mem::forget(child)`: forget *consumes* the child, so no read
 //! through it can happen afterwards and nothing stays aliased; the counter
 //! simply never reaches 0 again and every later mutating op / `commit`
 //! returns `BadTxn` — a permanently-blocked writer, never UB.
@@ -65,9 +65,8 @@ use crate::sync::{AtomicUsize, Ordering};
 
 /// The live-child counter on a write txn (SPEC 04 TXN-31,
 /// ADR-0007 D3: `AtomicUsize`, **not** `Cell` — a `Cell` would destroy
-/// `RwTxn: Sync` and children really do drop on worker threads at all six
-/// consumer call sites). Factored into its own type so the loom L6 model
-/// checks the exact shipped code.
+/// `RwTxn: Sync`, and children may drop on worker threads). Factored into
+/// its own type so the loom L6 model checks the exact shipped code.
 #[derive(Debug)]
 pub(crate) struct ChildCounter(AtomicUsize);
 
@@ -236,24 +235,13 @@ impl TxnRead for NestedRoTxn<'_> {
 // tests filtered `loom_`). Models are tiny (2 spawned threads + main) so loom
 // explores them exhaustively.
 //
-// Mutation-check record: weakening BOTH counter orderings to `Relaxed`
-// (`release`/`live`) is NOT caught by L6a/L6b — the violating execution is
-// **load-buffering-shaped** (the child's frame load would have to read a
-// *future* store, one that executes later in every loom interleaving because
-// the writer's store is control-dependent on observing the decrements), and
-// loom 0.7 explores store buffering via stale values only, never
-// future-store reads (the explorer limitation recorded in the reader table's
-// mutation-check record, tokio-rs/loom#180 family). The weakening is nevertheless
-// REAL on AArch64: without Release, the child's plain frame load may be
-// satisfied after its younger relaxed RMW decrement becomes globally visible
-// (load→store reordering is architecturally allowed), so the writer could
-// observe quiescence and mutate while the child's read is still in flight.
-// The `Release`/`Acquire` pair is therefore normative (SPEC 04 TXN-31
-// prescribes it verbatim) and guarded by the per-site justification comments
-// + this record, not by loom. What L6a DOES machine-check: the pairing keeps
-// the invariant in every explorable interleaving (a regression that breaks
-// the protocol shape — e.g. decrementing before the read, or checking the
-// wrong counter — fails it); L6b machine-checks the join-edge world.
+// Limit: weakening both counter orderings to `Relaxed` is not caught here.
+// The violating execution is load-buffering-shaped, which loom does not
+// explore (tokio-rs/loom#180), yet it is real on AArch64: the child's frame
+// load could complete after its relaxed decrement becomes visible. The
+// `Release`/`Acquire` pair (SPEC 04 TXN-31) is therefore guarded by the
+// per-site comments, not by loom. L6a checks the protocol shape (e.g.
+// decrementing before the read fails it); L6b checks the join-edge world.
 // ---------------------------------------------------------------------------
 
 #[cfg(all(test, loom))]
