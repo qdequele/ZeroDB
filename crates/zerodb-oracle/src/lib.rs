@@ -30,9 +30,11 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod child;
 pub mod crash;
 pub mod driver;
 mod engine;
+pub mod ffi_lmdb;
 mod heed_engine;
 mod op;
 mod result;

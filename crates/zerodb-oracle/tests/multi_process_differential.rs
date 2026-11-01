@@ -11,18 +11,16 @@
 //! A mismatch between the engines is a ZeroDB bug unless recorded in
 //! `docs/DIVERGENCES.md`; never edit an expectation to make ZeroDB pass.
 
-use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_uint, c_void};
+use std::os::raw::{c_int, c_void};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
 use std::ptr;
 use std::time::{Duration, Instant};
 
 use lmdb_master_sys as ffi;
+use zerodb_oracle::child::{self, ChildGuard};
+use zerodb_oracle::ffi_lmdb::{Lmdb, Txn, MDB_RDONLY};
 use zerodb_oracle::tempdir::TempDir;
 
-const MDB_NOTLS: c_uint = 0x0020_0000;
-const MDB_RDONLY: c_uint = 0x0002_0000;
 const ROLE: &str = "ZERODB_MPDIFF_ROLE";
 const DIR: &str = "ZERODB_MPDIFF_DIR";
 const MAX_READERS: u32 = 8;
@@ -33,302 +31,19 @@ const PSIZE: u64 = 4096;
 /// Past 1 MiB (so a 1 MiB map cannot hold it) and under 2 MiB.
 const GROW_TARGET: u64 = MIB + MIB / 4;
 
-struct Lmdb {
-    env: *mut ffi::MDB_env,
-}
-
-impl Lmdb {
-    fn open(dir: &Path, max_readers: u32) -> Lmdb {
-        Lmdb::open_sized(dir, max_readers, MIB)
-    }
-
-    fn open_sized(dir: &Path, max_readers: u32, mapsize: u64) -> Lmdb {
-        let path = CString::new(dir.to_str().unwrap()).unwrap();
-        let mut env = ptr::null_mut();
-        // SAFETY: plain C API calls on a fresh env handle owned by this
-        // struct; `path` outlives `mdb_env_open`.
-        unsafe {
-            assert_eq!(ffi::mdb_env_create(&mut env), 0);
-            assert_eq!(ffi::mdb_env_set_maxreaders(env, max_readers), 0);
-            assert_eq!(ffi::mdb_env_set_mapsize(env, mapsize as _), 0);
-            assert_eq!(ffi::mdb_env_open(env, path.as_ptr(), MDB_NOTLS, 0o644), 0);
-        }
-        Lmdb { env }
-    }
-
-    /// Open with `mapsize` and extra `flags` (`MDB_NOTLS` is added); the raw
-    /// return code on failure.
-    fn try_open_flags(
-        dir: &Path,
-        max_readers: u32,
-        mapsize: u64,
-        flags: c_uint,
-    ) -> Result<Lmdb, c_int> {
-        let path = CString::new(dir.to_str().unwrap()).unwrap();
-        let mut env = ptr::null_mut();
-        // SAFETY: plain C API calls on a fresh env handle; on failure the
-        // handle is closed as the C API requires, and `path` outlives the
-        // `mdb_env_open` call.
-        unsafe {
-            assert_eq!(ffi::mdb_env_create(&mut env), 0);
-            assert_eq!(ffi::mdb_env_set_maxreaders(env, max_readers), 0);
-            assert_eq!(ffi::mdb_env_set_mapsize(env, mapsize as _), 0);
-            let rc = ffi::mdb_env_open(env, path.as_ptr(), MDB_NOTLS | flags, 0o644);
-            if rc != 0 {
-                ffi::mdb_env_close(env);
-                return Err(rc);
-            }
-        }
-        Ok(Lmdb { env })
-    }
-
-    /// `mdb_env_get_maxreaders`.
-    fn maxreaders(&self) -> u32 {
-        let mut n: c_uint = 0;
-        // SAFETY: plain call on an open env; `n` outlives it.
-        assert_eq!(unsafe { ffi::mdb_env_get_maxreaders(self.env, &mut n) }, 0);
-        n
-    }
-
-    /// Begin a read txn; the raw return code on failure.
-    fn try_read(&self) -> Result<*mut ffi::MDB_txn, c_int> {
-        self.try_begin(MDB_RDONLY)
-    }
-
-    /// Begin a txn with `flags`; the raw return code on failure.
-    fn try_begin(&self, flags: c_uint) -> Result<*mut ffi::MDB_txn, c_int> {
-        let mut txn = ptr::null_mut();
-        // SAFETY: `self.env` is open; `txn` receives a handle we own.
-        let rc = unsafe { ffi::mdb_txn_begin(self.env, ptr::null_mut(), flags, &mut txn) };
-        if rc == 0 {
-            Ok(txn)
-        } else {
-            Err(rc)
-        }
-    }
-
-    /// Begin and abort a txn with `flags`, normalized for comparison.
-    fn begin_outcome(&self, flags: c_uint) -> String {
-        match self.try_begin(flags) {
-            Ok(txn) => {
-                Lmdb::abort(txn);
-                "ok".to_string()
-            }
-            Err(ffi::MDB_MAP_RESIZED) => "MapResized".to_string(),
-            Err(rc) => format!("rc={rc}"),
-        }
-    }
-
-    /// The page size (LMDB uses the OS page size: 16 KiB on macOS aarch64).
-    fn psize(&self) -> u64 {
-        // SAFETY: MDB_stat is plain data; LMDB fills it.
-        let st = unsafe {
-            let mut st: ffi::MDB_stat = std::mem::zeroed();
-            assert_eq!(ffi::mdb_env_stat(self.env, &mut st), 0);
-            st
-        };
-        u64::from(st.ms_psize)
-    }
-
-    /// `(me_mapsize, me_last_pgno)`.
-    fn map_info(&self) -> (u64, u64) {
-        // SAFETY: MDB_envinfo is plain data; LMDB fills it.
-        let i = unsafe {
-            let mut i: ffi::MDB_envinfo = std::mem::zeroed();
-            assert_eq!(ffi::mdb_env_info(self.env, &mut i), 0);
-            i
-        };
-        (i.me_mapsize as u64, i.me_last_pgno as u64)
-    }
-
-    /// `mdb_env_info`'s `me_last_txnid`.
-    fn last_txnid(&self) -> u64 {
-        // SAFETY: MDB_envinfo is plain data; LMDB fills it.
-        let i = unsafe {
-            let mut i: ffi::MDB_envinfo = std::mem::zeroed();
-            assert_eq!(ffi::mdb_env_info(self.env, &mut i), 0);
-            i
-        };
-        i.me_last_txnid as u64
-    }
-
-    /// `mdb_env_stat`'s `ms_entries` (the main DB's entry count).
-    fn entries(&self) -> u64 {
-        // SAFETY: MDB_stat is plain data; LMDB fills it.
-        let st = unsafe {
-            let mut st: ffi::MDB_stat = std::mem::zeroed();
-            assert_eq!(ffi::mdb_env_stat(self.env, &mut st), 0);
-            st
-        };
-        st.ms_entries as u64
-    }
-
-    /// Commit batches of 1000-byte values until the file's last page lies
-    /// past [`GROW_TARGET`].
-    fn grow(&self) {
-        let value = [7u8; 1000];
-        let psize = self.psize();
-        let mut i = 0u32;
-        while (self.map_info().1 + 1) * psize <= GROW_TARGET {
-            // SAFETY: standard begin/dbi_open/put/commit sequence on an open
-            // env; every pointer is live for the duration of its call.
-            unsafe {
-                let txn = self.try_begin(0).unwrap();
-                let mut dbi = 0;
-                assert_eq!(ffi::mdb_dbi_open(txn, ptr::null(), 0, &mut dbi), 0);
-                for j in 0..8 {
-                    let key = format!("g{:08}", i * 8 + j);
-                    let mut k = ffi::MDB_val {
-                        mv_size: key.len(),
-                        mv_data: key.as_ptr() as *mut c_void,
-                    };
-                    let mut v = ffi::MDB_val {
-                        mv_size: value.len(),
-                        mv_data: value.as_ptr() as *mut c_void,
-                    };
-                    assert_eq!(ffi::mdb_put(txn, dbi, &mut k, &mut v, 0), 0);
-                }
-                assert_eq!(ffi::mdb_txn_commit(txn), 0);
-            }
-            i += 1;
-            assert!(i < 100_000, "never grew");
-        }
-    }
-
-    /// `mdb_env_set_mapsize`'s raw return code.
-    fn set_mapsize(&self, size: u64) -> c_int {
-        // SAFETY: `self.env` is open; the call takes a plain size.
-        unsafe { ffi::mdb_env_set_mapsize(self.env, size as _) }
-    }
-
-    fn abort(txn: *mut ffi::MDB_txn) {
-        // SAFETY: `txn` came from `mdb_txn_begin` and is ended exactly once.
-        unsafe { ffi::mdb_txn_abort(txn) }
-    }
-
-    /// Begin a write txn, put one key, commit.
-    fn commit_one(&self) {
-        // SAFETY: standard begin/dbi_open/put/commit sequence on an open
-        // env; every pointer is live for the duration of its call.
-        unsafe {
-            let mut txn = ptr::null_mut();
-            assert_eq!(
-                ffi::mdb_txn_begin(self.env, ptr::null_mut(), 0, &mut txn),
-                0
-            );
-            let mut dbi = 0;
-            assert_eq!(ffi::mdb_dbi_open(txn, ptr::null(), 0, &mut dbi), 0);
-            let mut k = ffi::MDB_val {
-                mv_size: 1,
-                mv_data: b"k".as_ptr() as *mut c_void,
-            };
-            let mut v = ffi::MDB_val {
-                mv_size: 1,
-                mv_data: b"v".as_ptr() as *mut c_void,
-            };
-            assert_eq!(ffi::mdb_put(txn, dbi, &mut k, &mut v, 0), 0);
-            assert_eq!(ffi::mdb_txn_commit(txn), 0);
-        }
-    }
-
-    /// Put `n` 1000-byte values in **one** txn and commit, so the meta's
-    /// `last_pg` moves well past a small env in a single generation (unlike
-    /// [`Lmdb::grow`], which commits many small txns and so would make the
-    /// on-disk "previous" meta the second-to-last of those, not whatever the
-    /// caller committed before calling this).
-    fn commit_many(&self, n: u32) {
-        let value = [7u8; 1000];
-        // SAFETY: standard begin/dbi_open/put/commit sequence on an open
-        // env; every pointer is live for the duration of its call.
-        unsafe {
-            let mut txn = ptr::null_mut();
-            assert_eq!(
-                ffi::mdb_txn_begin(self.env, ptr::null_mut(), 0, &mut txn),
-                0
-            );
-            let mut dbi = 0;
-            assert_eq!(ffi::mdb_dbi_open(txn, ptr::null(), 0, &mut dbi), 0);
-            for i in 0..n {
-                let key = format!("g{i:08}");
-                let mut k = ffi::MDB_val {
-                    mv_size: key.len(),
-                    mv_data: key.as_ptr() as *mut c_void,
-                };
-                let mut v = ffi::MDB_val {
-                    mv_size: value.len(),
-                    mv_data: value.as_ptr() as *mut c_void,
-                };
-                assert_eq!(ffi::mdb_put(txn, dbi, &mut k, &mut v, 0), 0);
-            }
-            assert_eq!(ffi::mdb_txn_commit(txn), 0);
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    /// Whether the main database holds `key`, read in a fresh read txn.
-    fn has_key(&self, key: &[u8]) -> bool {
-        // SAFETY: begin/dbi_open/get/abort on an open env; `key` outlives the
-        // call and the returned data pointer is not used.
-        unsafe {
-            let txn = self.try_read().unwrap();
-            let mut dbi = 0;
-            assert_eq!(ffi::mdb_dbi_open(txn, ptr::null(), 0, &mut dbi), 0);
-            let mut k = ffi::MDB_val {
-                mv_size: key.len(),
-                mv_data: key.as_ptr() as *mut c_void,
-            };
-            let mut v = ffi::MDB_val {
-                mv_size: 0,
-                mv_data: ptr::null_mut(),
-            };
-            let rc = ffi::mdb_get(txn, dbi, &mut k, &mut v);
-            Lmdb::abort(txn);
-            match rc {
-                0 => true,
-                ffi::MDB_NOTFOUND => false,
-                other => panic!("mdb_get failed: {other}"),
-            }
-        }
-    }
-
-    /// PIDs listed by `mdb_reader_list` (one per occupied slot).
-    fn reader_pids(&self) -> Vec<u32> {
-        unsafe extern "C" fn collect(msg: *const c_char, ctx: *mut c_void) -> c_int {
-            // SAFETY: `ctx` is the `&mut Vec<String>` passed below, live for
-            // the call; `msg` is a NUL-terminated string from LMDB.
-            let out = unsafe { &mut *(ctx as *mut Vec<String>) };
-            out.push(
-                unsafe { CStr::from_ptr(msg) }
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-            0
-        }
-        let mut lines: Vec<String> = Vec::new();
-        // SAFETY: the callback only touches `lines`, which outlives the call.
-        unsafe {
-            ffi::mdb_reader_list(self.env, Some(collect), &mut lines as *mut _ as *mut c_void);
-        }
-        lines
-            .iter()
-            .flat_map(|l| l.lines())
-            .filter_map(|l| l.split_whitespace().next()?.parse::<u32>().ok())
-            .collect()
-    }
-
-    /// `mdb_reader_check`'s dead count.
-    fn reader_check(&self) -> i32 {
-        let mut dead: c_int = 0;
-        // SAFETY: `dead` outlives the call.
-        assert_eq!(unsafe { ffi::mdb_reader_check(self.env, &mut dead) }, 0);
-        dead
-    }
-}
-
-impl Drop for Lmdb {
-    fn drop(&mut self) {
-        // SAFETY: every txn of this env has ended; closed exactly once.
-        unsafe { ffi::mdb_env_close(self.env) }
+/// Commit batches of 1000-byte values until the file's last page lies past
+/// [`GROW_TARGET`].
+fn lmdb_grow(env: &Lmdb) {
+    let value = [7u8; 1000];
+    let psize = env.psize();
+    let mut i = 0u32;
+    while (env.map_info().1 + 1) * psize <= GROW_TARGET {
+        let pairs: Vec<(String, &[u8])> = (0..8)
+            .map(|j| (format!("g{:08}", i * 8 + j), &value[..]))
+            .collect();
+        env.commit(&pairs);
+        i += 1;
+        assert!(i < 100_000, "never grew");
     }
 }
 
@@ -430,80 +145,30 @@ fn zdb_commit_many(env: &zerodb::Env, n: u32) {
     w.commit().unwrap();
 }
 
-struct ChildGuard(Child);
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
 fn spawn(role: &str, dir: &Path) -> ChildGuard {
-    ChildGuard(
-        Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "child_entry", "--nocapture", "--test-threads=1"])
-            .env(ROLE, role)
-            .env(DIR, dir)
-            .spawn()
-            .unwrap(),
+    child::spawn_self(
+        module_path!(),
+        &[(ROLE, role.as_ref()), (DIR, dir.as_os_str())],
     )
-}
-
-fn wait_for(path: &Path) {
-    let end = Instant::now() + Duration::from_secs(30);
-    while !path.exists() {
-        assert!(
-            Instant::now() < end,
-            "timed out waiting for {}",
-            path.display()
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
 }
 
 /// Spawn a child in `role`, wait for its `held` marker, SIGKILL it, remove
 /// the marker. Returns its PID.
 fn kill_child(role: &str, dir: &Path) -> u32 {
-    let mut c = spawn(role, dir);
-    wait_for(&dir.join("held"));
-    let pid = c.0.id();
-    c.0.kill().unwrap();
-    c.0.wait().unwrap();
-    std::fs::remove_file(dir.join("held")).unwrap();
-    pid
+    child::kill_when_held(dir, || spawn(role, dir))
 }
 
 /// Run a child role to completion; panics on a failure exit or a 60 s
 /// timeout.
 fn run_child(role: &str, dir: &Path) {
-    let mut c = spawn(role, dir);
-    let end = Instant::now() + Duration::from_secs(60);
-    loop {
-        if let Some(st) = c.0.try_wait().unwrap() {
-            assert!(st.success(), "child {role} failed: {st}");
-            return;
-        }
-        assert!(Instant::now() < end, "timed out waiting for child {role}");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    child::wait_success(&mut spawn(role, dir), role, Duration::from_secs(60));
 }
 
 /// Wait for an already-spawned child to exit successfully (30 s deadline),
 /// for a role that exits on its own once told to (unlike [`run_child`],
 /// which spawns too, and unlike [`kill_child`], which SIGKILLs).
 fn wait_exit(c: &mut ChildGuard, role: &str) {
-    let end = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(st) = c.0.try_wait().unwrap() {
-            assert!(st.success(), "child {role} failed: {st}");
-            return;
-        }
-        assert!(
-            Instant::now() < end,
-            "timed out waiting for child {role} to exit"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    child::wait_success(c, role, Duration::from_secs(30));
 }
 
 /// Child entry point: a no-op unless run by `spawn`. Roles are
@@ -531,27 +196,27 @@ fn child_entry() {
     let signal = || std::fs::write(dir.join("held"), b"").unwrap();
     let park = || std::thread::sleep(Duration::from_secs(600));
     match role.as_str() {
-        "lmdb_grow" => return Lmdb::open_sized(&dir, MAX_READERS, 8 * MIB).grow(),
-        "lmdb_commit_one" => return Lmdb::open_sized(&dir, MAX_READERS, 8 * MIB).commit_one(),
+        "lmdb_grow" => return lmdb_grow(&Lmdb::open(&dir, 8 * MIB, MAX_READERS)),
+        "lmdb_commit_one" => return Lmdb::open(&dir, 8 * MIB, MAX_READERS).commit_one(),
         "zdb_grow" => return zdb_grow(&zdb_open_sized(&dir, Some(8 * MIB))),
         "zdb_commit_one" => return zdb_commit_one(&zdb_open_sized(&dir, Some(8 * MIB))),
         "lmdb_hold_open" => {
-            let _env = Lmdb::open(&dir, MAX_READERS);
+            let _env = Lmdb::open(&dir, MIB, MAX_READERS);
             signal();
-            wait_for(&dir.join("stop"));
+            child::wait_for(&dir.join("stop"));
             return;
         }
         "zdb_hold_open" => {
             let _env = zdb_open(&dir);
             signal();
-            wait_for(&dir.join("stop"));
+            child::wait_for(&dir.join("stop"));
             return;
         }
         "lmdb_join_report" => {
-            let out = match Lmdb::try_open_flags(&dir, MAX_READERS, 16 * MIB, 0) {
+            let out = match Lmdb::try_open(&dir, 16 * MIB, MAX_READERS, 0) {
                 Ok(env) => {
                     let txn = env.try_read().unwrap();
-                    let snap = lmdb_snapshot_of(txn);
+                    let snap = lmdb_snapshot_of(&txn);
                     Lmdb::abort(txn);
                     format!("ok:{snap}")
                 }
@@ -567,7 +232,7 @@ fn child_entry() {
             return write_result(&dir, &out);
         }
         "lmdb_join_info" => {
-            let out = match Lmdb::try_open_flags(&dir, MAX_READERS, 16 * MIB, 0) {
+            let out = match Lmdb::try_open(&dir, 16 * MIB, MAX_READERS, 0) {
                 Ok(env) => {
                     let (id, snap) = lmdb_read_view(&env);
                     format!("ok:{id} {} {snap}", env.last_txnid())
@@ -587,8 +252,7 @@ fn child_entry() {
             return write_result(&dir, &out);
         }
         "lmdb_prev_join_report" => {
-            let out = match Lmdb::try_open_flags(&dir, MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT)
-            {
+            let out = match Lmdb::try_open(&dir, 16 * MIB, MAX_READERS, ffi::MDB_PREVSNAPSHOT) {
                 Ok(env) => format!("ok:{}", lmdb_read_view(&env).1),
                 Err(libc::EAGAIN) => "EAGAIN".to_string(),
                 Err(rc) => lmdb_rc(rc),
@@ -606,10 +270,10 @@ fn child_entry() {
             return write_result(&dir, &out);
         }
         "lmdb_rdonly_prev_join" => {
-            let out = match Lmdb::try_open_flags(
+            let out = match Lmdb::try_open(
                 &dir,
-                MAX_READERS,
                 16 * MIB,
+                MAX_READERS,
                 MDB_RDONLY | ffi::MDB_PREVSNAPSHOT,
             ) {
                 Ok(env) => {
@@ -639,8 +303,7 @@ fn child_entry() {
             return write_result(&dir, &out);
         }
         "lmdb_prev_hold" => {
-            let _env =
-                Lmdb::try_open_flags(&dir, MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT).unwrap();
+            let _env = Lmdb::try_open(&dir, 16 * MIB, MAX_READERS, ffi::MDB_PREVSNAPSHOT).unwrap();
             signal();
             park();
             return;
@@ -656,8 +319,8 @@ fn child_entry() {
     if let Some(map) = role.strip_prefix("lmdb_join_writemap:") {
         let len = || std::fs::metadata(dir.join("data.mdb")).unwrap().len();
         let before = len();
-        let env = Lmdb::try_open_flags(&dir, MAX_READERS, map.parse().unwrap(), ffi::MDB_WRITEMAP)
-            .unwrap();
+        let env =
+            Lmdb::try_open(&dir, map.parse().unwrap(), MAX_READERS, ffi::MDB_WRITEMAP).unwrap();
         let after_open = len();
         env.commit_one();
         let after_write = len();
@@ -689,15 +352,15 @@ fn child_entry() {
     // `stop` appears.
     let released = || {
         std::fs::write(dir.join("released"), b"").unwrap();
-        wait_for(&dir.join("stop"));
+        child::wait_for(&dir.join("stop"));
     };
     if let Some(n) = role.strip_prefix("lmdb_reads_until:") {
-        let env = Lmdb::open(&dir, MAX_READERS);
+        let env = Lmdb::open(&dir, MIB, MAX_READERS);
         let txns: Vec<_> = (0..n.parse::<u32>().unwrap())
             .map(|_| env.try_read().unwrap())
             .collect();
         signal();
-        wait_for(&dir.join("release"));
+        child::wait_for(&dir.join("release"));
         txns.into_iter().for_each(Lmdb::abort);
         return released();
     }
@@ -707,12 +370,12 @@ fn child_entry() {
             .map(|_| env.read_txn().unwrap())
             .collect();
         signal();
-        wait_for(&dir.join("release"));
+        child::wait_for(&dir.join("release"));
         drop(txns);
         return released();
     }
     if let Some(n) = role.strip_prefix("lmdb_hold_readers:") {
-        let env = Lmdb::open(&dir, MAX_READERS);
+        let env = Lmdb::open(&dir, MIB, MAX_READERS);
         let txns: Vec<_> = (0..n.parse::<u32>().unwrap())
             .map(|_| env.try_read().unwrap())
             .collect();
@@ -720,7 +383,7 @@ fn child_entry() {
         park();
         drop(txns);
     } else if role == "lmdb_hold_writer" {
-        let env = Lmdb::open(&dir, MAX_READERS);
+        let env = Lmdb::open(&dir, MIB, MAX_READERS);
         // SAFETY: as `commit_one`; the txn is never ended (the process is
         // killed while holding it).
         unsafe {
@@ -766,7 +429,7 @@ fn child_entry() {
 fn killed_reader_then_clear_stale_readers_matches_lmdb() {
     let lmdb = {
         let dir = TempDir::new().unwrap();
-        let env = Lmdb::open(dir.path(), MAX_READERS);
+        let env = Lmdb::open(dir.path(), MIB, MAX_READERS);
         env.commit_one();
         let pid = kill_child("lmdb_hold_readers:2", dir.path());
         let listed = env.reader_pids().iter().filter(|&&p| p == pid).count();
@@ -804,7 +467,7 @@ fn killed_reader_then_clear_stale_readers_matches_lmdb() {
 fn killed_writer_takeover_matches_lmdb() {
     let run_lmdb = || {
         let dir = TempDir::new().unwrap();
-        let env = Lmdb::open(dir.path(), MAX_READERS);
+        let env = Lmdb::open(dir.path(), MIB, MAX_READERS);
         env.commit_one();
         let rpid = kill_child("lmdb_hold_readers:1", dir.path());
         assert!(
@@ -853,7 +516,7 @@ fn killed_writer_takeover_matches_lmdb() {
 fn begins_on_a_small_map_after_another_process_grew_match_lmdb() {
     let lmdb = {
         let dir = TempDir::new().unwrap();
-        let env = Lmdb::open(dir.path(), MAX_READERS);
+        let env = Lmdb::open(dir.path(), MIB, MAX_READERS);
         env.commit_one();
         run_child("lmdb_grow", dir.path());
         (env.begin_outcome(MDB_RDONLY), env.begin_outcome(0))
@@ -877,7 +540,7 @@ fn begins_on_a_small_map_after_another_process_grew_match_lmdb() {
 fn begins_with_only_a_bigger_meta_size_match_lmdb() {
     let lmdb = {
         let dir = TempDir::new().unwrap();
-        let env = Lmdb::open(dir.path(), MAX_READERS);
+        let env = Lmdb::open(dir.path(), MIB, MAX_READERS);
         env.commit_one();
         run_child("lmdb_commit_one", dir.path());
         assert_eq!(lmdb_meta_mapsize(dir.path(), env.psize()), 8 * MIB, "setup");
@@ -905,7 +568,7 @@ fn begins_with_only_a_bigger_meta_size_match_lmdb() {
 fn smaller_map_commit_keeps_the_meta_size_like_lmdb() {
     let lmdb = {
         let dir = TempDir::new().unwrap();
-        let env = Lmdb::open(dir.path(), MAX_READERS);
+        let env = Lmdb::open(dir.path(), MIB, MAX_READERS);
         env.commit_one();
         run_child("lmdb_commit_one", dir.path());
         env.commit_one();
@@ -947,7 +610,7 @@ fn open_below_last_pg_matches_lmdb() {
     let lmdb = {
         let dir = TempDir::new().unwrap();
         run_child("lmdb_grow", dir.path());
-        let env = Lmdb::open(dir.path(), MAX_READERS);
+        let env = Lmdb::open(dir.path(), MIB, MAX_READERS);
         let (m, last) = env.map_info();
         Lmdb::abort(env.try_read().unwrap());
         classify(m, last, env.psize())
@@ -988,7 +651,7 @@ fn prev_snapshot_rounding_matches_lmdb() {
     let lmdb = {
         let dir = TempDir::new().unwrap();
         let psize = {
-            let env = Lmdb::open_sized(dir.path(), MAX_READERS, 2 * MIB);
+            let env = Lmdb::open(dir.path(), 2 * MIB, MAX_READERS);
             env.commit_one();
             env.psize()
             // Dropped: exactly two meta generations now sit on disk (the
@@ -999,7 +662,7 @@ fn prev_snapshot_rounding_matches_lmdb() {
             // *second-to-last* loop commit, not `commit_one`'s).
         };
         {
-            let env = Lmdb::open_sized(dir.path(), MAX_READERS, 16 * MIB);
+            let env = Lmdb::open(dir.path(), 16 * MIB, MAX_READERS);
             env.commit_many(300);
         }
         let metas = lmdb_meta_generations(dir.path(), psize);
@@ -1019,15 +682,14 @@ fn prev_snapshot_rounding_matches_lmdb() {
             "setup: the requested map is below both minimums"
         );
         let minsize_from =
-            match Lmdb::try_open_flags(dir.path(), MAX_READERS, requested, ffi::MDB_PREVSNAPSHOT) {
+            match Lmdb::try_open(dir.path(), requested, MAX_READERS, ffi::MDB_PREVSNAPSHOT) {
                 Ok(e) => classify(e.map_info().0, prev_minsize, newest_minsize),
                 Err(rc) => format!("rc={rc}"),
             };
-        let zero_from =
-            match Lmdb::try_open_flags(dir.path(), MAX_READERS, 0, ffi::MDB_PREVSNAPSHOT) {
-                Ok(e) => classify(e.map_info().0, prev_mapsize, newest_mapsize),
-                Err(rc) => format!("rc={rc}"),
-            };
+        let zero_from = match Lmdb::try_open(dir.path(), 0, MAX_READERS, ffi::MDB_PREVSNAPSHOT) {
+            Ok(e) => classify(e.map_info().0, prev_mapsize, newest_mapsize),
+            Err(rc) => format!("rc={rc}"),
+        };
         (minsize_from, zero_from)
     };
     eprintln!("lmdb (minsize_from, zero_from) = {lmdb:?}");
@@ -1109,16 +771,16 @@ fn prev_snapshot_joiner_matches_lmdb() {
     let lmdb = {
         let dir = TempDir::new().unwrap();
         let mut c = spawn("lmdb_hold_open", dir.path());
-        wait_for(&dir.path().join("held"));
+        child::wait_for(&dir.path().join("held"));
         let while_held = lmdb_rc(
-            Lmdb::try_open_flags(dir.path(), MAX_READERS, MIB, ffi::MDB_PREVSNAPSHOT)
+            Lmdb::try_open(dir.path(), MIB, MAX_READERS, ffi::MDB_PREVSNAPSHOT)
                 .map(|_| 0)
                 .unwrap_or_else(|rc| rc),
         );
         std::fs::write(dir.path().join("stop"), b"").unwrap();
         wait_exit(&mut c, "lmdb_hold_open");
         let after = lmdb_rc(
-            Lmdb::try_open_flags(dir.path(), MAX_READERS, MIB, ffi::MDB_PREVSNAPSHOT)
+            Lmdb::try_open(dir.path(), MIB, MAX_READERS, ffi::MDB_PREVSNAPSHOT)
                 .map(|_| 0)
                 .unwrap_or_else(|rc| rc),
         );
@@ -1129,7 +791,7 @@ fn prev_snapshot_joiner_matches_lmdb() {
     let zdb = {
         let dir = TempDir::new().unwrap();
         let mut c = spawn("zdb_hold_open", dir.path());
-        wait_for(&dir.path().join("held"));
+        child::wait_for(&dir.path().join("held"));
         let while_held = zdb_open_rc(zdb_prev_snapshot_open(dir.path()));
         std::fs::write(dir.path().join("stop"), b"").unwrap();
         wait_exit(&mut c, "zdb_hold_open");
@@ -1190,7 +852,7 @@ fn zdb_prev_snapshot_open(dir: &Path) -> zerodb::Result<zerodb::Env> {
 fn set_mapsize_zero_after_another_process_grew_matches_lmdb() {
     let lmdb = {
         let dir = TempDir::new().unwrap();
-        let env = Lmdb::open(dir.path(), MAX_READERS);
+        let env = Lmdb::open(dir.path(), MIB, MAX_READERS);
         env.commit_one();
         run_child("lmdb_grow", dir.path());
         let rc = lmdb_rc(env.set_mapsize(0));
@@ -1215,9 +877,9 @@ fn set_mapsize_zero_after_another_process_grew_matches_lmdb() {
 fn set_mapsize_with_a_write_txn_matches_lmdb() {
     let lmdb = {
         let dir = TempDir::new().unwrap();
-        let env = Lmdb::open(dir.path(), MAX_READERS);
+        let env = Lmdb::open(dir.path(), MIB, MAX_READERS);
         env.commit_one();
-        let txn = env.try_begin(0).unwrap();
+        let txn = env.begin(0).unwrap();
         let rc = lmdb_rc(env.set_mapsize(2 * MIB));
         Lmdb::abort(txn);
         rc
@@ -1248,10 +910,10 @@ fn joiner_with_other_max_readers_matches_lmdb() {
     let lmdb: Vec<(String, u32)> = {
         let dir = TempDir::new().unwrap();
         let mut c = spawn("lmdb_hold_open", dir.path());
-        wait_for(&dir.path().join("held"));
+        child::wait_for(&dir.path().join("held"));
         let got = asks
             .iter()
-            .map(|&n| match Lmdb::try_open_flags(dir.path(), n, MIB, 0) {
+            .map(|&n| match Lmdb::try_open(dir.path(), MIB, n, 0) {
                 Ok(env) => ("ok".to_string(), env.maxreaders()),
                 Err(rc) => (lmdb_rc(rc), 0),
             })
@@ -1265,7 +927,7 @@ fn joiner_with_other_max_readers_matches_lmdb() {
     let zdb: Vec<(String, u32)> = {
         let dir = TempDir::new().unwrap();
         let mut c = spawn("zdb_hold_open", dir.path());
-        wait_for(&dir.path().join("held"));
+        child::wait_for(&dir.path().join("held"));
         let got = asks
             .iter()
             .map(|&n| {
@@ -1301,7 +963,7 @@ fn sole_opener_after_a_larger_run_matches_lmdb() {
     let lmdb: Vec<u32> = {
         let dir = TempDir::new().unwrap();
         asks.iter()
-            .map(|&n| Lmdb::open(dir.path(), n).maxreaders())
+            .map(|&n| Lmdb::open(dir.path(), MIB, n).maxreaders())
             .collect()
     };
     eprintln!("lmdb maxreaders per sequential sole open {asks:?} = {lmdb:?}");
@@ -1336,7 +998,7 @@ fn sole_opener_after_a_larger_run_matches_lmdb() {
 fn info_and_stat_see_other_commit_matches_lmdb() {
     let lmdb = {
         let dir = TempDir::new().unwrap();
-        let env = Lmdb::open(dir.path(), MAX_READERS);
+        let env = Lmdb::open(dir.path(), MIB, MAX_READERS);
         // One distinct key so a later, different key from the child is a
         // genuine entry-count increase, not an overwrite.
         env.commit_many(1);
@@ -1380,10 +1042,10 @@ fn reader_counts<E>(
     own: impl Fn(&E) -> (u32, usize),
 ) -> [(u32, usize); 4] {
     let mut c = spawn(role, dir);
-    wait_for(&dir.join("held"));
+    child::wait_for(&dir.join("held"));
     let held = sample(env);
     std::fs::write(dir.join("release"), b"").unwrap();
-    wait_for(&dir.join("released"));
+    child::wait_for(&dir.join("released"));
     let ended = sample(env);
     std::fs::write(dir.join("stop"), b"").unwrap();
     wait_exit(&mut c, role);
@@ -1398,7 +1060,7 @@ fn reader_counts<E>(
 fn reader_count_with_readers_in_another_process_matches_lmdb() {
     let lmdb = {
         let dir = TempDir::new().unwrap();
-        let env = Lmdb::open(dir.path(), MAX_READERS);
+        let env = Lmdb::open(dir.path(), MIB, MAX_READERS);
         env.commit_one();
         let sample = |e: &Lmdb| {
             // SAFETY: MDB_envinfo is plain data; LMDB fills it.
@@ -1502,7 +1164,7 @@ fn write_map_joiner_lengths(holder_write_map: bool, joiner_map: u64) -> [(String
         } else {
             (0, MIB)
         };
-        let env = Lmdb::try_open_flags(dir.path(), MAX_READERS, map, flags).unwrap();
+        let env = Lmdb::try_open(dir.path(), map, MAX_READERS, flags).unwrap();
         env.commit_one();
         run_child(&format!("lmdb_join_writemap:{joiner_map}"), dir.path());
         let (before, open, write) = parse(dir.path());
@@ -1577,29 +1239,6 @@ fn write_map_joiner_with_a_smaller_map_file_length_vs_lmdb() {
     );
 }
 
-/// Whether the main database holds `key` in the read txn `txn`.
-fn lmdb_txn_has_key(txn: *mut ffi::MDB_txn, key: &[u8]) -> bool {
-    // SAFETY: dbi_open/get on a live read txn; `key` outlives the call and
-    // the returned data pointer is not used.
-    unsafe {
-        let mut dbi = 0;
-        assert_eq!(ffi::mdb_dbi_open(txn, ptr::null(), 0, &mut dbi), 0);
-        let mut k = ffi::MDB_val {
-            mv_size: key.len(),
-            mv_data: key.as_ptr() as *mut c_void,
-        };
-        let mut v = ffi::MDB_val {
-            mv_size: 0,
-            mv_data: ptr::null_mut(),
-        };
-        match ffi::mdb_get(txn, dbi, &mut k, &mut v) {
-            0 => true,
-            ffi::MDB_NOTFOUND => false,
-            rc => panic!("mdb_get failed: {rc}"),
-        }
-    }
-}
-
 /// Classify a snapshot of [`join_before_prev_snapshot_commit`]'s env by the
 /// keys `has` finds: "a_commit2" (`after2`), "a_commit" (`after`), "newest"
 /// (`g00000000`, the generation `PREV_SNAPSHOT` rolled back) or "prev".
@@ -1615,8 +1254,8 @@ fn snapshot_by(has: impl Fn(&[u8]) -> bool) -> &'static str {
     }
 }
 
-fn lmdb_snapshot_of(txn: *mut ffi::MDB_txn) -> &'static str {
-    snapshot_by(|k| lmdb_txn_has_key(txn, k))
+fn lmdb_snapshot_of(txn: &Txn) -> &'static str {
+    snapshot_by(|k| Lmdb::txn_has_key(txn, k))
 }
 
 /// The snapshot a fresh read txn of `env` sees.
@@ -1682,42 +1321,23 @@ fn join_before_prev_snapshot_first_commit_vs_lmdb() {
     let lmdb = {
         let dir = TempDir::new().unwrap();
         {
-            let env = Lmdb::open_sized(dir.path(), MAX_READERS, 2 * MIB);
+            let env = Lmdb::open(dir.path(), 2 * MIB, MAX_READERS);
             env.commit_one();
         }
         {
-            let env = Lmdb::open_sized(dir.path(), MAX_READERS, 16 * MIB);
+            let env = Lmdb::open(dir.path(), 16 * MIB, MAX_READERS);
             env.commit_many(300);
         }
         join_before_prev_snapshot_commit(
             dir.path(),
             "lmdb_join_report",
-            || {
-                Lmdb::try_open_flags(dir.path(), MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT)
-                    .unwrap()
-            },
+            || Lmdb::try_open(dir.path(), 16 * MIB, MAX_READERS, ffi::MDB_PREVSNAPSHOT).unwrap(),
             |e, key| {
-                // SAFETY: standard begin/dbi_open/put/commit sequence on an
-                // open env; every pointer is live for its call.
-                unsafe {
-                    let txn = e.try_begin(0).unwrap();
-                    let mut dbi = 0;
-                    assert_eq!(ffi::mdb_dbi_open(txn, ptr::null(), 0, &mut dbi), 0);
-                    let mut k = ffi::MDB_val {
-                        mv_size: key.len(),
-                        mv_data: key.as_ptr() as *mut c_void,
-                    };
-                    let mut v = ffi::MDB_val {
-                        mv_size: 1,
-                        mv_data: b"v".as_ptr() as *mut c_void,
-                    };
-                    assert_eq!(ffi::mdb_put(txn, dbi, &mut k, &mut v, 0), 0);
-                    assert_eq!(ffi::mdb_txn_commit(txn), 0);
-                }
+                e.commit_key(key);
             },
             |e| {
                 let txn = e.try_read().unwrap();
-                let snap = lmdb_snapshot_of(txn);
+                let snap = lmdb_snapshot_of(&txn);
                 Lmdb::abort(txn);
                 snap
             },
@@ -1761,10 +1381,10 @@ fn join_before_prev_snapshot_first_commit_vs_lmdb() {
 /// `k`, 2 MiB map), then txn 2 (300 values, 16 MiB map).
 fn lmdb_two_generations(dir: &Path) {
     {
-        let env = Lmdb::open_sized(dir, MAX_READERS, 2 * MIB);
+        let env = Lmdb::open(dir, 2 * MIB, MAX_READERS);
         env.commit_one();
     }
-    let env = Lmdb::open_sized(dir, MAX_READERS, 16 * MIB);
+    let env = Lmdb::open(dir, 16 * MIB, MAX_READERS);
     env.commit_many(300);
 }
 
@@ -1778,30 +1398,7 @@ fn zdb_two_generations(dir: &Path) {
     zdb_commit_many(&env, 300);
 }
 
-/// Commit `key` in one write txn; the write txn's id.
-fn lmdb_commit_key(e: &Lmdb, key: &[u8]) -> u64 {
-    let txn = e.try_begin(0).unwrap();
-    // SAFETY: standard txn_id/dbi_open/put/commit sequence on a live write
-    // txn; every pointer is live for its call.
-    unsafe {
-        let id = ffi::mdb_txn_id(txn) as u64;
-        let mut dbi = 0;
-        assert_eq!(ffi::mdb_dbi_open(txn, ptr::null(), 0, &mut dbi), 0);
-        let mut k = ffi::MDB_val {
-            mv_size: key.len(),
-            mv_data: key.as_ptr() as *mut c_void,
-        };
-        let mut v = ffi::MDB_val {
-            mv_size: 1,
-            mv_data: b"v".as_ptr() as *mut c_void,
-        };
-        assert_eq!(ffi::mdb_put(txn, dbi, &mut k, &mut v, 0), 0);
-        assert_eq!(ffi::mdb_txn_commit(txn), 0);
-        id
-    }
-}
-
-/// [`lmdb_commit_key`] for ZeroDB.
+/// [`|e: &Lmdb, k: &[u8]| e.commit_key(k)`] for ZeroDB.
 fn zdb_commit_key(e: &zerodb::Env, key: &[u8]) -> u64 {
     let mut w = e.write_txn().unwrap();
     let id = w.txnid();
@@ -1813,9 +1410,8 @@ fn zdb_commit_key(e: &zerodb::Env, key: &[u8]) -> u64 {
 /// A fresh read txn's id and snapshot (see [`snapshot_by`]).
 fn lmdb_read_view(e: &Lmdb) -> (u64, &'static str) {
     let txn = e.try_read().unwrap();
-    // SAFETY: `txn` is a live read txn.
-    let id = unsafe { ffi::mdb_txn_id(txn) } as u64;
-    let snap = lmdb_snapshot_of(txn);
+    let id = txn.id();
+    let snap = lmdb_snapshot_of(&txn);
     Lmdb::abort(txn);
     (id, snap)
 }
@@ -1844,27 +1440,26 @@ fn prev_snapshot_commit_txnids_vs_lmdb() {
     let lmdb: CommitTxnids = {
         let dir = TempDir::new().unwrap();
         lmdb_two_generations(dir.path());
-        let a =
-            Lmdb::try_open_flags(dir.path(), MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT).unwrap();
+        let a = Lmdb::try_open(dir.path(), 16 * MIB, MAX_READERS, ffi::MDB_PREVSNAPSHOT).unwrap();
         let step = |key: &[u8]| {
-            let w = lmdb_commit_key(&a, key);
+            let w = a.commit_key(key);
             let (r, _) = lmdb_read_view(&a);
             (w, r, a.last_txnid())
         };
         let first = step(b"after");
         let second = step(b"after2");
         let txn = a.try_read().unwrap();
-        let keeps_first = lmdb_txn_has_key(txn, b"after");
+        let keeps_first = Lmdb::txn_has_key(&txn, b"after");
         Lmdb::abort(txn);
         drop(a);
         let dir2 = TempDir::new().unwrap();
         lmdb_two_generations(dir2.path());
         {
-            let a = Lmdb::try_open_flags(dir2.path(), MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT)
-                .unwrap();
-            lmdb_commit_key(&a, b"after");
+            let a =
+                Lmdb::try_open(dir2.path(), 16 * MIB, MAX_READERS, ffi::MDB_PREVSNAPSHOT).unwrap();
+            a.commit_key(b"after");
         }
-        let env = Lmdb::try_open_flags(dir2.path(), MAX_READERS, 16 * MIB, 0).unwrap();
+        let env = Lmdb::try_open(dir2.path(), 16 * MIB, MAX_READERS, 0).unwrap();
         ([first, second], keeps_first, lmdb_read_view(&env).1)
     };
     eprintln!("lmdb = {lmdb:?}");
@@ -1914,9 +1509,8 @@ fn prev_snapshot_joiner_after_first_commit_vs_lmdb() {
     let lmdb = {
         let dir = TempDir::new().unwrap();
         lmdb_two_generations(dir.path());
-        let a =
-            Lmdb::try_open_flags(dir.path(), MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT).unwrap();
-        lmdb_commit_key(&a, b"after");
+        let a = Lmdb::try_open(dir.path(), 16 * MIB, MAX_READERS, ffi::MDB_PREVSNAPSHOT).unwrap();
+        a.commit_key(b"after");
         run_child("lmdb_join_info", dir.path());
         std::fs::read_to_string(dir.path().join("result")).unwrap()
     };
@@ -1947,7 +1541,7 @@ fn prev_snapshot_opener_ends<E>(
     let result = dir.join("result");
     let (mut a_child, a_env) = if kill {
         let c = spawn(hold_role, dir);
-        wait_for(&dir.join("held"));
+        child::wait_for(&dir.join("held"));
         (Some(c), None)
     } else {
         (None, Some(open_prev()))
@@ -1977,10 +1571,7 @@ fn prev_snapshot_opener_ends_both(kill: bool) -> ([String; 2], [String; 2]) {
             kill,
             "lmdb_prev_hold",
             "lmdb_join_report",
-            || {
-                Lmdb::try_open_flags(dir.path(), MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT)
-                    .unwrap()
-            },
+            || Lmdb::try_open(dir.path(), 16 * MIB, MAX_READERS, ffi::MDB_PREVSNAPSHOT).unwrap(),
         )
     };
     let zdb = {
@@ -2056,12 +1647,9 @@ fn second_prev_snapshot_opener_vs_lmdb() {
         run(
             dir.path(),
             "lmdb_prev_join_report",
-            || {
-                Lmdb::try_open_flags(dir.path(), MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT)
-                    .unwrap()
-            },
+            || Lmdb::try_open(dir.path(), 16 * MIB, MAX_READERS, ffi::MDB_PREVSNAPSHOT).unwrap(),
             |a| {
-                lmdb_commit_key(a, b"after");
+                a.commit_key(b"after");
             },
         )
     };
@@ -2094,10 +1682,10 @@ fn prev_snapshot_read_only_opener_vs_lmdb() {
         let dir = TempDir::new().unwrap();
         lmdb_two_generations(dir.path());
         prev_snapshot_opener_ends(dir.path(), false, "-", "lmdb_join_report", || {
-            Lmdb::try_open_flags(
+            Lmdb::try_open(
                 dir.path(),
-                MAX_READERS,
                 16 * MIB,
+                MAX_READERS,
                 MDB_RDONLY | ffi::MDB_PREVSNAPSHOT,
             )
             .unwrap()
@@ -2158,18 +1746,13 @@ fn prev_snapshot_empty_commit_keeps_the_election_vs_lmdb() {
         run(
             dir.path(),
             "lmdb_join_report",
-            || {
-                Lmdb::try_open_flags(dir.path(), MAX_READERS, 16 * MIB, ffi::MDB_PREVSNAPSHOT)
-                    .unwrap()
+            || Lmdb::try_open(dir.path(), 16 * MIB, MAX_READERS, ffi::MDB_PREVSNAPSHOT).unwrap(),
+            |a| {
+                let txn = a.begin(0).unwrap();
+                assert_eq!(Lmdb::commit_txn(txn), 0);
             },
             |a| {
-                let txn = a.try_begin(0).unwrap();
-                // SAFETY: `txn` is a live write txn with no changes,
-                // committed once.
-                assert_eq!(unsafe { ffi::mdb_txn_commit(txn) }, 0);
-            },
-            |a| {
-                lmdb_commit_key(a, b"after");
+                a.commit_key(b"after");
             },
         )
     };
@@ -2201,19 +1784,19 @@ fn prev_snapshot_without_a_lock_file_vs_lmdb() {
     let lmdb = {
         let dir = TempDir::new().unwrap();
         lmdb_two_generations(dir.path());
-        let a = Lmdb::try_open_flags(
+        let a = Lmdb::try_open(
             dir.path(),
-            MAX_READERS,
             16 * MIB,
+            MAX_READERS,
             ffi::MDB_NOLOCK | ffi::MDB_PREVSNAPSHOT,
         )
         .unwrap();
-        lmdb_commit_key(&a, b"after");
+        a.commit_key(b"after");
         let first = lmdb_read_view(&a).1;
-        lmdb_commit_key(&a, b"after2");
+        a.commit_key(b"after2");
         let second = lmdb_read_view(&a).1;
         let txn = a.try_read().unwrap();
-        let keeps_first = lmdb_txn_has_key(txn, b"after");
+        let keeps_first = Lmdb::txn_has_key(&txn, b"after");
         Lmdb::abort(txn);
         (first, second, keeps_first)
     };
@@ -2252,11 +1835,11 @@ fn prev_snapshot_read_only_joiner_vs_lmdb() {
     let lmdb = {
         let dir = TempDir::new().unwrap();
         lmdb_two_generations(dir.path());
-        let a = Lmdb::try_open_flags(dir.path(), MAX_READERS, 16 * MIB, 0).unwrap();
+        let a = Lmdb::try_open(dir.path(), 16 * MIB, MAX_READERS, 0).unwrap();
         run_child("lmdb_rdonly_prev_join", dir.path());
         let joiner = std::fs::read_to_string(dir.path().join("result")).unwrap();
         let (id, snap) = lmdb_read_view(&a);
-        let w = lmdb_commit_key(&a, b"after");
+        let w = a.commit_key(b"after");
         [joiner, format!("{id} {snap}"), w.to_string()]
     };
     let zdb = {
