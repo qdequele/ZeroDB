@@ -2,6 +2,8 @@
 //! under the oldest-reader gate, the meta annex pool, the cross-record run
 //! search, and freeing pages.
 
+use std::ops::ControlFlow;
+
 use super::*;
 
 /// Reject a decoded GC PIL whose ids are not strictly ascending or lie
@@ -23,6 +25,18 @@ pub(crate) fn validate_pil_ids(ids: &[u64], last_pg: u64) -> Result<()> {
         prev = Some(id);
     }
     Ok(())
+}
+
+/// Decode a GC record's PIL and validate it (SPEC 05 GC-18): the freelist
+/// is on-disk data and is not trusted. Every id must be a real, committed,
+/// non-meta page, strictly ascending (`find_run` and `binary_search` assume
+/// sorted ids) and in `[FIRST_DATA_PGNO, last_pg]`; a hostile PIL could
+/// otherwise hand out page 0/1 (the meta slots, clobbered at commit C2) or a
+/// page past the file.
+fn decode_gc_ids(val: &[u8], last_pg: u64) -> Result<Vec<u64>> {
+    let ids = pil_decode(val).ok_or(Error::Mdb(MdbError::Invalid))?;
+    validate_pil_ids(&ids, last_pg)?;
+    Ok(ids)
 }
 
 /// Find an `n`-page pick in a sorted-ascending, unique id list (SPEC 05
@@ -522,52 +536,25 @@ impl<'env> RwTxn<'env> {
             fresh: Option<Vec<u64>>,
             start: u64,
         }
-        let pick: Option<Pick> = {
-            let rec = self.free_db;
-            let tree = Tree::new(self.source(), self.psize, rec.root, rec.depth);
-            let mut cursor = tree.cursor();
-            let mut entry = cursor.first().map_err(map_page_err)?;
-            let mut found = None;
-            while let Some((key, val)) = entry {
-                let f = gc_key_decode(key).ok_or(Error::Mdb(MdbError::Invalid))?;
-                if f > oldest {
-                    break; // gate: no older entries remain (ascending scan)
+        let last_pg = self.committed_last_pg;
+        let mut pick: Option<Pick> = None;
+        self.visit_gated_records(oldest, |f, drain, val| {
+            let (fresh, start) = match drain {
+                Some(d) => (None, find_run(d.live(), n)),
+                None => {
+                    let ids = decode_gc_ids(val, last_pg)?;
+                    let start = find_run(&ids, n);
+                    (Some(ids), start)
                 }
-                match self.drains.get(&f) {
-                    Some(remaining) => {
-                        if let Some(start) = find_run(remaining.live(), n) {
-                            found = Some(Pick {
-                                f,
-                                fresh: None,
-                                start,
-                            });
-                            break;
-                        }
-                    }
-                    None => {
-                        let ids = pil_decode(val).ok_or(Error::Mdb(MdbError::Invalid))?;
-                        // SPEC 05 GC-18 (validation rule): the freelist is
-                        // on-disk data and is NOT trusted. Every id must be a
-                        // real, committed, non-meta page — strictly ascending
-                        // (find_run/binary_search assume sorted ids) and in
-                        // [FIRST_DATA_PGNO, base.last_pg]. A hostile PIL
-                        // could otherwise hand out page 0/1 (the meta slots,
-                        // clobbered at commit C2) or a page past the file.
-                        validate_pil_ids(&ids, self.committed_last_pg)?;
-                        if let Some(start) = find_run(&ids, n) {
-                            found = Some(Pick {
-                                f,
-                                fresh: Some(ids),
-                                start,
-                            });
-                            break;
-                        }
-                    }
+            };
+            Ok(match start {
+                Some(start) => {
+                    pick = Some(Pick { f, fresh, start });
+                    ControlFlow::Break(())
                 }
-                entry = cursor.next().map_err(map_page_err)?;
-            }
-            found
-        };
+                None => ControlFlow::Continue(()),
+            })
+        })?;
         let Some(Pick { f, fresh, start }) = pick else {
             return Ok(None);
         };
@@ -582,6 +569,33 @@ impl<'env> RwTxn<'env> {
         remaining.take_run(start, n);
         self.mark_reclaimed(start, n);
         Ok(Some(start))
+    }
+
+    /// Walk the GC tree's records oldest first (BE keys, so a forward
+    /// cursor), stopping at the reuse gate: the first `F > oldest` ends the
+    /// walk, as no older record remains (GC-18). `visit` gets each record's
+    /// `F`, this txn's drain of it if any, and its raw PIL value, and returns
+    /// `Break` to stop early.
+    fn visit_gated_records(
+        &self,
+        oldest: u64,
+        mut visit: impl FnMut(u64, Option<&Drain>, &[u8]) -> Result<ControlFlow<()>>,
+    ) -> Result<()> {
+        if self.free_db.root == PGNO_INVALID {
+            return Ok(());
+        }
+        let rec = self.free_db;
+        let tree = Tree::new(self.source(), self.psize, rec.root, rec.depth);
+        let mut cursor = tree.cursor();
+        let mut entry = cursor.first().map_err(map_page_err)?;
+        while let Some((key, val)) = entry {
+            let f = gc_key_decode(key).ok_or(Error::Mdb(MdbError::Invalid))?;
+            if f > oldest || visit(f, self.drains.get(&f), val)?.is_break() {
+                break;
+            }
+            entry = cursor.next().map_err(map_page_err)?;
+        }
+        Ok(())
     }
 
     /// Allocate step 2c (SPEC 05 GC-16/GC-21): a run of `n > 1` pages whose
@@ -700,40 +714,29 @@ impl<'env> RwTxn<'env> {
         let oldest = self.oldest_reader();
         let mut sources: Vec<CrossSource> = Vec::new();
         let mut truncated = false;
-        if self.free_db.root != PGNO_INVALID {
-            let rec = self.free_db;
-            let tree = Tree::new(self.source(), self.psize, rec.root, rec.depth);
-            let mut cursor = tree.cursor();
-            let mut entry = cursor.first().map_err(map_page_err)?;
-            let mut read = 0u64;
-            while let Some((key, val)) = entry {
-                let f = gc_key_decode(key).ok_or(Error::Mdb(MdbError::Invalid))?;
-                if f > oldest {
-                    break; // the gate, as in `gc_reclaim`
-                }
-                if read == budget {
-                    truncated = true;
-                    break;
-                }
-                read += 1;
-                match self.drains.get(&f) {
-                    Some(d) if d.len() == 0 => {}
-                    Some(_) => sources.push(CrossSource::Tree { f, fresh: None }),
-                    None => {
-                        let ids = pil_decode(val).ok_or(Error::Mdb(MdbError::Invalid))?;
-                        // The GC-18 validation rule, as in `gc_reclaim`.
-                        validate_pil_ids(&ids, self.committed_last_pg)?;
-                        if !ids.is_empty() {
-                            sources.push(CrossSource::Tree {
-                                f,
-                                fresh: Some(ids),
-                            });
-                        }
+        let last_pg = self.committed_last_pg;
+        let mut read = 0u64;
+        self.visit_gated_records(oldest, |f, drain, val| {
+            if read == budget {
+                truncated = true;
+                return Ok(ControlFlow::Break(()));
+            }
+            read += 1;
+            match drain {
+                Some(d) if d.len() == 0 => {}
+                Some(_) => sources.push(CrossSource::Tree { f, fresh: None }),
+                None => {
+                    let ids = decode_gc_ids(val, last_pg)?;
+                    if !ids.is_empty() {
+                        sources.push(CrossSource::Tree {
+                            f,
+                            fresh: Some(ids),
+                        });
                     }
                 }
-                entry = cursor.next().map_err(map_page_err)?;
             }
-        }
+            Ok(ControlFlow::Continue(()))
+        })?;
         if self.annex.len() > 0 && self.base().txnid <= oldest {
             sources.push(CrossSource::Annex);
         }
