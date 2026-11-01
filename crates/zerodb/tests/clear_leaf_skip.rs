@@ -8,35 +8,12 @@
 //! takes the reading walk and frees its runs, and that the freed pages are
 //! actually reusable afterwards.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::{assert_clean, TempDir};
 
-use zerodb::{check, free_page_count, Env, EnvOpenOptions};
+use std::path::Path;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-clearskip-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{free_page_count, Env, EnvOpenOptions};
 
 const PS: u32 = 4096;
 const MAP: usize = 64 << 20;
@@ -47,16 +24,6 @@ fn open(dir: &Path) -> Env {
     opts.page_size(PS);
     opts.max_dbs(4);
     opts.open(dir).expect("open env")
-}
-
-/// Full-image invariant sweep, INV-22 included: after a clear commits, every
-/// page the tree occupied must be in the GC ("free"), no page may be both
-/// reachable and free, and none may be neither — i.e. the freed set is exactly
-/// what the reading walk produced.
-fn assert_clean(dir: &Path) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, PS);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
 }
 
 fn key(i: u32) -> Vec<u8> {
@@ -86,7 +53,7 @@ fn clear_multi_level_no_overflow_frees_every_page() {
         db.put(&mut txn, &key(i), &inline_val(i)).unwrap();
     }
     txn.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     let (tree_pages, free_before) = {
         let rtxn = env.read_txn().unwrap();
@@ -112,7 +79,7 @@ fn clear_multi_level_no_overflow_frees_every_page() {
     // INV-22 is the exact freed-set equivalence: a leaf skipped but leaked
     // would be neither reachable nor free; a double-freed pgno would be
     // listed twice / both.
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     let rtxn = env.read_txn().unwrap();
     let stat = db.stat(&rtxn).unwrap();
     assert_eq!(stat.entries, 0);
@@ -144,7 +111,7 @@ fn clear_with_overflow_frees_the_runs() {
         db.put(&mut txn, &key(i), &big).unwrap();
     }
     txn.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     let (tree_pages, overflow_pages) = {
         let rtxn = env.read_txn().unwrap();
@@ -160,7 +127,7 @@ fn clear_with_overflow_frees_the_runs() {
     db.clear(&mut txn).unwrap();
     txn.commit().unwrap();
 
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     let rtxn = env.read_txn().unwrap();
     assert_eq!(db.stat(&rtxn).unwrap().entries, 0);
     let free_after = free_page_count(&rtxn).unwrap();
@@ -175,7 +142,7 @@ fn clear_with_overflow_frees_the_runs() {
     let mut txn = env.write_txn().unwrap();
     db.put(&mut txn, b"again", &big).unwrap();
     txn.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     let rtxn = env.read_txn().unwrap();
     assert_eq!(db.get(&rtxn, b"again").unwrap(), Some(&big[..]));
 }
@@ -198,7 +165,7 @@ fn clear_then_reuse_round_trips_and_stays_flat() {
             db.put(&mut txn, &key(i), &inline_val(i)).unwrap();
         }
         txn.commit().unwrap();
-        assert_clean(dir.path());
+        assert_clean(dir.path(), PS);
         {
             let rtxn = env.read_txn().unwrap();
             assert!(db.stat(&rtxn).unwrap().depth >= 3);
@@ -213,7 +180,7 @@ fn clear_then_reuse_round_trips_and_stays_flat() {
         let mut txn = env.write_txn().unwrap();
         db.clear(&mut txn).unwrap();
         txn.commit().unwrap();
-        assert_clean(dir.path());
+        assert_clean(dir.path(), PS);
 
         let size = std::fs::metadata(dir.path().join(zerodb::DATA_FILE_NAME))
             .unwrap()
@@ -243,7 +210,7 @@ fn drop_named_db_leaf_skips_and_frees() {
         db.put(&mut txn, &key(i), &inline_val(i)).unwrap();
     }
     txn.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     {
         let rtxn = env.read_txn().unwrap();
         let stat = db.stat(&rtxn).unwrap();
@@ -257,7 +224,7 @@ fn drop_named_db_leaf_skips_and_frees() {
     let mut txn = env.write_txn().unwrap();
     db.drop_db(&mut txn).unwrap();
     txn.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     let rtxn = env.read_txn().unwrap();
     assert!(

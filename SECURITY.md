@@ -26,9 +26,9 @@ same assumption LMDB makes.
 - **Memory safety and freedom from panics for every legal sequence of API
   calls**, verified by differential fuzzing against LMDB, `miri` on the core,
   and `loom` on the reader table.
-- **Single-writer, many-reader MVCC isolation within one process.** Readers
-  never block the writer or each other; a reader always sees one committed
-  snapshot.
+- **Single-writer, many-reader MVCC isolation**, across processes when the
+  lock file is on (the default). Readers never block the writer or each other;
+  a reader always sees one committed snapshot.
 - **Environment/transaction pairing is checked.** Using a database handle with
   a transaction from a different environment panics with heed's message
   instead of touching the wrong file.
@@ -77,4 +77,4 @@ file's shared-memory atomics with its `fcntl` record locks and Linux `futex`
 calls (`zerodb-io::lockfile`, ADR-0023), one `pwritev` FFI call, the
 differential oracle's LMDB FFI, and the few pointer-shaped constructs heed's own
 API forces on the adapter. Every block
-carries a `// SAFETY:` comment; the policy is in `AGENTS.md`.
+carries a `// SAFETY:` comment; the policy is in `CONTRIBUTING.md`.

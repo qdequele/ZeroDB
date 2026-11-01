@@ -1,18 +1,14 @@
 # SPEC 02 — On-disk page formats
 
-> Revised 2026-10-05: `FORMAT_VERSION` 2 (ADR-0022), `META_ANNEX_OFF` constant,
-> `non_free_pages_size` definition (GC-23), DUPSORT hooks marked parked.
-
-Status: **DONE** — 2026-07-15 (milestone 0.4). Source of truth for the encode/
-decode implementation in `zerodb-core::page` (M1.1) and the meta protocol in
-M1.2. **This is our own format** (D-002): it is *not* byte-compatible with LMDB
+The source of truth for the encode/decode implementation in
+`zerodb-core::page` and for the meta protocol. **This is our own format** (D-002): it is *not* byte-compatible with LMDB
 0.9/1.0. Migration between LMDB and ZeroDB is logical (dump/load), never by
 sharing a file. Algorithms that consume these layouts live in
 [SPEC 03](03-btree.md); the format-defining rationale is
 [ADR-0002](../adr/0002-on-disk-format.md).
 
 Reading note: the LMDB fork sources were read to understand *what information a
-page must carry and why* (clean-room, AGENTS.md rule 4). The layouts below are
+page must carry and why* (clean-room, CONTRIBUTING.md rule 4). The layouts below are
 ZeroDB's own design; where a field mirrors an LMDB idea it is called out, but no
 LMDB struct is transliterated.
 
@@ -25,7 +21,7 @@ LMDB struct is transliterated.
   variant. (Consumer *keys* are frequently big-endian — SPEC 00 row 52 — but
   that is codec-level key content, opaque to the engine; it does not change how
   the engine stores its own integer fields.)
-- **No `#[repr(C)]` casting of possibly-unaligned data** (AGENTS.md unsafe
+- **No `#[repr(C)]` casting of possibly-unaligned data** (CONTRIBUTING.md unsafe
   policy). Every field is defined by an explicit byte **offset** and **width**
   and is read/written with `read_unaligned`-style accessors. The layouts below
   are chosen to keep the load-bearing integers **naturally aligned relative to
@@ -65,7 +61,7 @@ LMDB struct is transliterated.
 | Name | Value | Meaning |
 |------|-------|---------|
 | `MAGIC` | bytes `5A 44 42 31` (ASCII `"ZDB1"`) | 4-byte file identifier, stored as a byte array (endianness-free). |
-| `FORMAT_VERSION` | `2` (`u32`) | On-disk format version. Bumped only on an incompatible change (ADR-0002 §D8). Version 2 (ADR-0022, merged as #89) adds the meta free-list annex: `fl_count` at offset 168, `meta_crc` moved to 172 with split coverage, annex ids at 176 (§3/§3.3). A v1 file is refused at open (§3.2 step 2); migration is logical, `dump` then `load`. |
+| `FORMAT_VERSION` | `2` (`u32`) | On-disk format version. Bumped only on an incompatible change (ADR-0002 §D8). Version 2 (ADR-0022) adds the meta free-list annex: `fl_count` at offset 168, `meta_crc` moved to 172 with split coverage, annex ids at 176 (§3/§3.3). A v1 file is refused at open (§3.2 step 2); migration is logical, `dump` then `load`. |
 | `HEADER_SIZE` | `32` | Size of the common page header, bytes. |
 | `PGNO_INVALID` | `0xFFFF_FFFF_FFFF_FFFF` | Sentinel "no page". |
 | `META_A_PGNO` / `META_B_PGNO` | `0` / `1` | The two fixed meta-page slots. |
@@ -275,7 +271,7 @@ Selection among the *CRC-valid* slots:
   committed snapshot — and use its `main_db.root` / `free_db.root`.
 - If exactly one slot is CRC-valid (the other torn by a power-cut mid-write),
   the valid one wins **regardless of txnid** — this is the torn-meta recovery
-  guarantee (M1.2). Because a writer only ever overwrites the *older* slot,
+  guarantee. Because a writer only ever overwrites the *older* slot,
   the surviving slot is always a complete, consistent earlier snapshot.
 - If **both** slots fail validation → `MdbError::Invalid` (unrecoverable;
   M1.11 must never produce this from a single torn write).
@@ -284,7 +280,7 @@ Selection among the *CRC-valid* slots:
   `(txnid[0] < txnid[1]) XOR prev_snapshot`, restricted to CRC-valid slots.
 - **Exactly one valid slot + `PREV_SNAPSHOT`**: this layer reports the single
   valid slot as a typed one-valid outcome regardless of the flag; the **env
-  layer** (M1.2) maps that combination to `MdbError::Invalid` per SPEC 06
+  layer** maps that combination to `MdbError::Invalid` per SPEC 06
   REC-2† (ratified 2026-07-16) — there are not two committed snapshots to
   identify an older from.
 
@@ -555,7 +551,7 @@ off (9*4096)+0  : <remaining 936 payload bytes> <then unused to end of page>
 
 ---
 
-## §6 — The catalog (main DB) and named databases (M1.6)
+## §6 — The catalog (main DB) and named databases
 
 Named databases are entries in the **main DB** (the tree rooted at
 `meta.main_db.root`). A catalog entry is an ordinary leaf node whose **key** is
@@ -633,7 +629,7 @@ name with mismatched flags → `MdbError::Incompatible` (SPEC 01 §S8). All the
   `check` verifies it against a full walk on every committed image.
 - **Name = byte string.** A DB name is a leaf key (1–`MAX_DB_NAME` bytes),
   arbitrary bytes including `0x00`. heed's C-string names are a stricter
-  adapter-boundary rule imposed in M1.13 (DIVERGENCES D-008).
+  adapter-boundary rule imposed in M1.13 (divergence D-008).
 
 ---
 
@@ -748,7 +744,7 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
   `Env::info().map_size` (SPEC 00 row 20). Growth beyond it is *not* automatic
   (auto-geometry is Phase 3.2): callers grow with `Env::resize` (below) or by
   reopening with a larger `map_size` after a `MapFull` (SPEC 00 rows 3, 55).
-  - **Runtime `map_size` selection (M1.2).** At open the effective `map_size` is
+  - **Runtime `map_size` selection.** At open the effective `map_size` is
     the caller's `EnvOpenOptions::map_size` when set, else the persisted
     `meta.map_size`. It is then raised to `(last_pg + 1) · psize` of the newest
     valid meta when smaller, as LMDB does (ADR-0023 amendment 15;
@@ -774,7 +770,7 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     `T` (`EnvInner::current_snapshot`, SPEC 04 TXN-18), not this process's
     own cached snapshot, so another process's commit is visible as soon as it
     publishes — `OBS_INFO_SEES_OTHER_COMMIT`/`OBS_STAT_SEES_OTHER_COMMIT`
-    (both `true`, `crates/zerodb-oracle/tests/lmdb_stage3_observation.rs`).
+    (both `true`, `crates/zerodb-oracle/tests/multi_process/lmdb_stage3_observation.rs`).
     `map_size`, `max_readers`, `num_readers` and `live_readers` already come
     from the backing's published view and the shared reader table (above;
     SPEC 04 §4). `num_readers` is LMDB's shared high-water mark, counting
@@ -824,7 +820,7 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     `map_size ≥ 2·psize` — the kernel rounds the mapping length internally, and
     the reported `map_size`/`MapFull` boundary use the exact configured value.
     Unobservable to consumers, which always clamp before the call (SPEC 00
-    row 3). See `docs/DIVERGENCES.md` D-006 (approved 2026-07-16 via ADR-0004
+    row 3). See `docs/LMDB-COMPATIBILITY.md#behavior-differences` D-006 (approved 2026-07-16 via ADR-0004
     OQ2).
 - **Allocation.** New pages are taken first from the GC DB (SPEC 05; where a
   reader still pins them, from end-of-file), otherwise by bumping `last_pg`.
@@ -869,7 +865,7 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
   at offset 32).
 - Cell (node) contents are only **2-byte** aligned. `child_pgno` (u64) and
   `dsize` (u32) inside cells are read with `read_unaligned`. This is the primary
-  reason `#[repr(C)]` casting is forbidden here (AGENTS.md).
+  reason `#[repr(C)]` casting is forbidden here (CONTRIBUTING.md).
 - Phase 3.6 (hannoy) will add an *opt-in* value-alignment table type; the Phase
   1 B+tree makes **no** value-alignment promise beyond 2-byte cell alignment.
 
@@ -878,9 +874,9 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
 ## §10 — DUPSORT format hooks (reserved — D-004; Phase 2.8 **parked**)
 
 No consumer uses duplicates (SPEC 00 §B.1, D-004). A staged DUPSORT
-implementation (M2.8a) was built, reviewed and **parked on 2026-07-20**
-(the scope rule, AGENTS.md rule 6) — the engine-side work is not merged;
-only the oracle observation pins landed (`zerodb-oracle/tests/dup_pin_semantics.rs`
+implementation was built, reviewed and **parked on 2026-07-20**
+(the scope rule, CONTRIBUTING.md rule 6) — the engine-side work is not merged;
+only the oracle observation pins landed (`zerodb-oracle/tests/lmdb_observations/dup_pin_semantics.rs`
 / `dup_pin_ffi.rs`, SPEC 03 §12.1). The format still reserves, but does not
 implement:
 

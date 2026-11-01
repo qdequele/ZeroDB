@@ -391,6 +391,20 @@ dependencies = [
 [[package]]
 name = "heed"
 version = "0.22.1"
+dependencies = [
+ "byteorder",
+ "heed-traits",
+ "heed-types",
+ "libc",
+ "tempfile",
+ "zerodb",
+ "zerodb-core",
+ "zerodb-io",
+]
+
+[[package]]
+name = "heed"
+version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad82d6598ccf1dac15c8b758a1bd282b755b6776be600429176757190a1b0202"
 dependencies = [
@@ -424,20 +438,6 @@ dependencies = [
  "heed-traits",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "heed-zerodb"
-version = "0.22.1"
-dependencies = [
- "byteorder",
- "heed-traits",
- "heed-types",
- "libc",
- "tempfile",
- "zerodb",
- "zerodb-core",
- "zerodb-io",
 ]
 
 [[package]]
@@ -1489,8 +1489,8 @@ version = "0.2.0"
 dependencies = [
  "arbitrary",
  "criterion",
- "heed",
- "heed-zerodb",
+ "heed 0.22.1",
+ "heed 0.22.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "libc",
  "lmdb-master-sys",
  "proptest",
@@ -1504,8 +1504,8 @@ dependencies = [
 name = "zerodb-tools"
 version = "0.2.0"
 dependencies = [
- "heed",
- "heed-zerodb",
+ "heed 0.22.1",
+ "heed 0.22.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "zerodb",
  "zerodb-core",
  "zerodb-io",

@@ -1,6 +1,6 @@
 # ADR-0004: Write path — single-writer RwTxn, COW dirty store, commit pipeline
 
-- Status: Approved — maintainer, 2026-07-16 (standing directive). OQ1–OQ5
+- Status: Approved — maintainer, 2026-07-16. OQ1–OQ5
   answered; resolutions recorded
   at the end of this document.
 - Milestone: 1.4
@@ -331,7 +331,7 @@ mutate-while-iterating sequences) flip on in `driver::classify` +
 stays differential, so the whole M1.4 surface — writes, write-cursor ops,
 in-txn reads through dirty frames, commit/abort visibility, reopen — is
 covered by `diff_ops` fuzz + a new write-workload proptest (values 0 B–16 MB
-per PLAN; the harness's 64 MiB map and 1/16 large-value bias from M1.3 get a
+per the original plan; the harness's 64 MiB map and 1/16 large-value bias from M1.3 get a
 dedicated large-value differential test so 16 MB runs are exercised without
 starving throughput). After every fuzz/proptest case: run the invariant walk
 (scoped per the fence above) on the committed image. The M1.2 FORK-1 guard
@@ -382,7 +382,7 @@ flip on in this milestone and not later.)
   interface note (`next_pgno` in memory, `last_pg` persisted) is honored as
   GC-15 already fixed.
 - SPEC updates in the same change if implementation clarifies behavior
-  (CLAUDE.md rule 3): expected touch points are SPEC 03 §5.4 (single-cursor
+  (the project rules): expected touch points are SPEC 03 §5.4 (single-cursor
   fix-up scope) and SPEC 04 §6 (if miri forces any frame-lifetime refinement).
 
 ## Open questions — RESOLVED (maintainer, 2026-07-16)
@@ -394,7 +394,7 @@ flip on in this milestone and not later.)
 2. **OQ2 — map full `map_size` at open (D4/B): APPROVED.** Resolve D-006 as
    proposed: round the **mapping length** up to the OS-page multiple
    internally; never change the reported/persisted `map_size` or the GC-17
-   MapFull predicate. D-006 flipped to APPROVED in `docs/DIVERGENCES.md`
+   MapFull predicate. D-006 flipped to APPROVED in `docs/LMDB-COMPATIBILITY.md#behavior-differences`
    citing this ADR.
 3. **OQ3 — macOS fsync (D3 amendment): use std's `sync_data`/`sync_all`
    semantics as-is.** No F_BARRIERFSYNC special-casing: the pipeline calls

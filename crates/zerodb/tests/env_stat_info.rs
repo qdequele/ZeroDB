@@ -1,7 +1,7 @@
 //! `Env::stat()` and `Env::info()` — the **zerodb-defined** half. The
 //! cross-engine half (`last_txnid`, `entries`, `num_readers`, `max_readers` —
 //! the fields whose values are format-independent) lives in
-//! `crates/zerodb-oracle/tests/env_info_differential.rs`.
+//! `crates/zerodb-oracle/tests/differential/env_info_differential.rs`.
 //!
 //! The page counts (`branch_pages` / `leaf_pages` / `overflow_pages`) are
 //! format-specific by construction (ZeroDB has its own on-disk format), so
@@ -14,39 +14,12 @@
 //!   2. `Env::stat()` must equal `main_database().stat(&rtxn)` exactly — the
 //!      env-level and per-DB views of the same tree cannot disagree.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::{assert_clean, TempDir};
 
-use zerodb::{check, Env, EnvOpenOptions};
+use std::path::Path;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("zerodb-envstat-{pid}-{nanos}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{Env, EnvOpenOptions};
 
 const MAP: usize = 16 << 20;
 
@@ -57,12 +30,6 @@ fn open_with(dir: &Path, psize: u32, max_dbs: u32, max_readers: u32) -> Env {
     opts.max_dbs(max_dbs);
     opts.max_readers(max_readers);
     opts.open(dir).expect("open env")
-}
-
-fn assert_clean(dir: &Path, psize: u32) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, psize);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +240,7 @@ fn env_info_max_readers_is_the_configured_table_size() {
 fn env_info_live_readers_tracks_live_read_txns() {
     // `live_readers` is the ZeroDB extension: the count that actually follows
     // the reader population. (`num_readers` is the LMDB-parity high-water mark
-    // — see `env_info_num_readers_is_a_high_water_mark` and docs/DIVERGENCES.md.)
+    // — see `env_info_num_readers_is_a_high_water_mark` and docs/LMDB-COMPATIBILITY.md.)
     let dir = TempDir::new();
     let env = open_with(dir.path(), 4096, 8, 16);
     assert_eq!(env.info().live_readers, 0, "no readers on a fresh env");
@@ -303,7 +270,7 @@ fn env_info_num_readers_is_a_high_water_mark() {
     // LMDB parity: `MDB_envinfo::me_numreaders` is monotone — it is the
     // maximum number of simultaneously live readers ever observed, and ending a
     // read txn does not lower it. The cross-engine proof is in
-    // `zerodb-oracle/tests/env_info_differential.rs`; this pins the native side.
+    // `zerodb-oracle/tests/differential/env_info_differential.rs`; this pins the native side.
     let dir = TempDir::new();
     let env = open_with(dir.path(), 4096, 8, 32);
     assert_eq!(env.info().num_readers, 0);

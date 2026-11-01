@@ -8,41 +8,12 @@
 //! multi-process coordination is covered elsewhere (Task 7+); this file is
 //! the "did wiring it up break the default path" smoke test.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::TempDir;
+
+use std::path::Path;
 
 use zerodb::{EnvOpenOptions, Error, LOCK_FILE_NAME};
-
-// --- tiny self-cleaning temp dir (no tempfile dep on the allowlist) ---
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("zerodb-lockfile-{pid}-{nanos}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 fn opts() -> EnvOpenOptions {
     let mut o = EnvOpenOptions::new();
@@ -323,7 +294,7 @@ fn opts_with(lock_file: bool, map_size: Option<usize>) -> EnvOpenOptions {
 
 /// Opening with a map smaller than the committed data rounds the map up to
 /// exactly `(last_pg + 1) * page_size`, as LMDB does
-/// (`OBS_OPEN_BELOW_LAST_PG = "minsize"`, ADR-0023 amendment 15).
+/// (`OBS_OPEN_BELOW_LAST_PG = "minsize"`, ADR-0023).
 #[test]
 fn open_below_last_pg_rounds_up_to_the_minimum() {
     for lock_file in [false, true] {
@@ -367,7 +338,7 @@ fn open_below_last_pg_rounds_up_to_the_minimum() {
 }
 
 /// A requested map size above `MAX_MAP_SIZE` is refused with
-/// `Io(InvalidInput)` before the data file is created (ADR-0023 amendment 15,
+/// `Io(InvalidInput)` before the data file is created (ADR-0023,
 /// decision 6).
 #[test]
 fn open_rejects_a_map_size_above_the_cap() {
@@ -438,8 +409,8 @@ fn resize_opts(lock_file: bool, write_map: bool, map_size: usize) -> EnvOpenOpti
 }
 
 /// `resize` while this env has a live write txn fails with `EINVAL`, as
-/// `mdb_env_set_mapsize` does (`OBS_SET_MAPSIZE_WITH_WRITE_TXN`, ADR-0023
-/// amendment 15). The map is unchanged and the write txn still commits.
+/// `mdb_env_set_mapsize` does (`OBS_SET_MAPSIZE_WITH_WRITE_TXN`, ADR-0023).
+/// The map is unchanged and the write txn still commits.
 #[test]
 fn resize_with_a_live_write_txn_is_refused() {
     for (lock_file, write_map) in RESIZE_MODES {
@@ -484,7 +455,7 @@ fn resize_with_a_live_read_txn_succeeds_and_the_value_stays_readable() {
 
         let r = env.read_txn().unwrap();
         let value = db.get(&r, b"held").unwrap().expect("held value");
-        let whole = env.inner().backing_bytes();
+        let whole = env.backing_bytes();
         let head = whole[..64].to_vec();
         env.resize(2 * MIB as u64)
             .unwrap_or_else(|e| panic!("lock_file {lock_file}, write_map {write_map}: {e:?}"));
@@ -514,8 +485,7 @@ fn resize_with_a_live_read_txn_succeeds_and_the_value_stays_readable() {
 }
 
 /// `resize` below the committed data rounds up to exactly
-/// `(last_pg + 1) * page_size`, as LMDB does silently (ADR-0023 amendment
-/// 15, step 4).
+/// `(last_pg + 1) * page_size`, as LMDB does silently (ADR-0023).
 #[test]
 fn resize_rounds_up_to_the_last_page() {
     for (lock_file, write_map) in RESIZE_MODES {
@@ -556,7 +526,7 @@ fn resize_rounds_up_to_the_last_page() {
 }
 
 /// A caller-supplied size above `MAX_MAP_SIZE` is `Io(InvalidInput)`; the
-/// map is unchanged (ADR-0023 amendment 15, decision 6).
+/// map is unchanged (ADR-0023).
 #[test]
 fn resize_above_the_cap_is_refused() {
     for (lock_file, write_map) in RESIZE_MODES {
@@ -575,7 +545,7 @@ fn resize_above_the_cap_is_refused() {
     }
 }
 
-// --- Lock-file naming and the file guards (ADR-0023 amendment 16) ---
+// --- Lock-file naming and the file guards (ADR-0023) ---
 
 #[test]
 fn lock_file_name_is_derived_from_the_data_file_name() {

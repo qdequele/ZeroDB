@@ -1,32 +1,19 @@
 # SPEC 03 — B+tree algorithms
 
-Status: **DONE** — 2026-07-15 (milestone 0.4). Algorithmic source of truth for
-the read path (M1.3), the write path (M1.4), and the check tool (M1.12). Formats
+Algorithmic source of truth for
+the read path, the write path, and the check tool. Formats
 are in [SPEC 02](02-pages.md); this document defines the operations over them.
 Pseudocode is illustrative, not code to transliterate; the LMDB fork was read to
-understand the *algorithms* (AGENTS.md rule 4), and the semantics below are
+understand the *algorithms* (CONTRIBUTING.md rule 4), and the semantics below are
 pinned to the oracle (SPEC 00/01), not to LMDB's C.
 
-> **Revised 2026-10-05** — brought up to date with the merged engine: cursor-free
-> point get (`Tree::find_exact`, §2); default-compare integer fast path (§2.0,
-> ef61096); dirty-frame staging, spilling and in-place WRITE_MAP cross-refs in §5
-> (ADR-0017/ADR-0021); §6.1 same-size fast path scoped to inline values;
-> single-descent `put_reserved` (3cee9aa); §8 allocation/free updated for the
-> meta free-list annex (ADR-0022) and the shipped M1.8 reader table; §12 DUPSORT
-> marked parked (milestone 2.8, 2026-07-20).
-
-> **Revised 2026-10-18** — §10.1 numbers the rebalance rules (REB-1..REB-5):
-> borrows and merges move encoded cells verbatim and separators are rewritten
-> in place (ADR-0028).
-
-> **AMENDED 2026-07-20 (milestone 2.4).** The ordering statement below was
-> absolute in Phase 1; it is now parameterized. Read §2.0 first — everything
+> Read §2.0 first — everything
 > after it that says "memcmp" means "the tree's ordering", which is memcmp for
 > every tree except a named database with a registered comparator.
 
 ---
 
-## §2.0 — Key ordering (AMENDED, milestone 2.4)
+## §2.0 — Key ordering
 
 **Phase 1 (superseded).** Ordering was **unsigned lexicographic byte
 comparison** of keys everywhere (`memcmp`; SPEC 00 row 53, SPEC 01 Table 2).
@@ -52,7 +39,7 @@ to byte order.
 **Default-ordering fast path (commit ef61096, kept).** The default comparison
 (`KeyCmp::Default`) compares two *equal-length* 8- or 4-byte keys as single
 big-endian integers instead of calling `memcmp` (milli/hannoy key the hot trees
-on fixed-width big-endian u32/u64 ids; PERF-GAP B13). For equal-length slices,
+on fixed-width big-endian u32/u64 ids; performance item B13). For equal-length slices,
 big-endian integer order **is** memcmp order — the most significant differing
 byte decides both — so the result is exactly `a.cmp(b)` for every input; every
 other length pair falls through to the plain slice comparison. This is a
@@ -110,7 +97,7 @@ at open is the natural fix and there is nowhere to put one: `DBRecord` is
 exactly 48 bytes with every offset assigned (SPEC 02 §3.1), and its only two
 unused *values* — `flags` (offset 42) and `leaf2_ksize` (offset 44) — are
 already reserved for DUPSORT/DUPFIXED in milestone 2.8 (parked 2026-07-20, §12). Widening the record or
-repurposing those fields is an on-disk **format** change, which AGENTS.md rule 5
+repurposing those fields is an on-disk **format** change, which CONTRIBUTING.md rule 5
 puts behind an ADR and human approval. **Deliberately not taken in 2.4**; the
 hazard is documented, filed as D-014, and left for a maintainer decision.
 
@@ -388,7 +375,7 @@ resumes at first).
 
 ## §5 — Copy-on-write (COW) rules
 
-The write path (M1.4) mutates a private, shadow copy of every page it touches.
+The write path mutates a private, shadow copy of every page it touches.
 The rules (SPEC 04 owns dirty-set *storage*; this section owns *when* pages are
 copied and how pgnos propagate):
 
@@ -432,7 +419,7 @@ copied and how pgnos propagate):
 **Where dirty bytes live (ADR-0017, ADR-0021 — storage is SPEC 04's; noted here
 because §5's rules survive it).** By default dirty frames are heap-staged and
 written to the file at commit. Under `WRITE_MAP` the first-touch copy lands
-**in place in the map at the new pgno** (ADR-0021, merged PR #88) — safe
+**in place in the map at the new pgno** (ADR-0021) — safe
 mid-txn because `allocate` only returns pages no live snapshot references
 (SPEC 04 TXN-62) — and commit writes no tree pages back. Independently, a large
 txn may **spill** dirty tree pages to the file mid-txn (ADR-0017, SPEC 04
@@ -443,12 +430,12 @@ identity is the pgno, which spill/unspill never changes; a retained cursor path
 (§5.4a) keys on pgnos and stays valid; the §6.6 finger re-verifies per-frame
 dirtiness at use time, so a spilled frame is an ordinary miss.
 
-miri must exercise get-then-put sequences (M1.4): a `&[u8]` obtained by
+miri must exercise get-then-put sequences: a `&[u8]` obtained by
 `get` before a `put` must not dangle — enforced by SPEC 04's dirty-page
 stability contract; this doc requires only that COW never *moves* an
 already-dirty page's backing storage while a borrow into it is live.
 
-### §5.4a — Position preservation is a contract, not a mechanism (AMENDED 2026-09-10)
+### §5.4a — Position preservation is a contract, not a mechanism 
 
 The M1.4 rule read: *"The M1.4 write cursor tracks its position **by key** and
 re-seeks after each of its own mutations, which is trivially stable across
@@ -537,7 +524,7 @@ which made ZeroDB's cursor-delete loop **4.2×** the fork's — where LMDB's is
 milli, four of them in the current indexer. Measured on the real server, the
 `prefix_iter_mut` + `del_current` loop in
 `post_processing::prefix::delete_prefixes` runs at **3.63×**
-(PERF-GAP **B8a**; `benches/results/2026-09-10-meilisearch-delete-heavy-macos.md`).
+(performance item **B8a**; the 2026-09-10 "meilisearch delete heavy macos" run).
 The contract above is what the fork actually guarantees; the re-seek was never
 part of it.
 
@@ -669,8 +656,7 @@ split(page P at insertion index newindx, new cell):
 
 ### §6.4 — Split-point policy (ADR-0002 §D6; end-of-page rule ADR-0005 D5)
 
-**[AMENDED 2026-07-16 by ADR-0005 D5; RATIFIED — maintainer, 2026-07-16, standing
-directive. The end-of-page insert-point rule below now governs *any* insert
+**[Amended by ADR-0005 D5. The end-of-page insert-point rule below now governs *any* insert
 that lands at `newindx == nkeys` (plain puts included), not just APPEND; the
 median-fit-adjust rule is scoped to non-end inserts. The pre-amendment text is
 preserved for the record at the end of this section.]**
@@ -697,7 +683,7 @@ pointer). A split is **feasible** at `s` iff `used(L) ≤ C` **and** `used(R) �
     reachable: `max_node_size` guarantees two entries fit, SPEC 02 §4.2), the
     APPEND form applies instead.
 
-  Observed through the oracle (`crates/zerodb-oracle/tests/ascending_fill_parity.rs`,
+  Observed through the oracle (`crates/zerodb-oracle/tests/differential/ascending_fill_parity.rs`,
   `*_leaf_model*` tests): an ascending load of `n` entries over leaves of
   `cap` entries builds `ceil(n / cap)` leaves with APPEND and
   `1 + ceil((n − cap) / (cap − 1))` with plain puts, in both engines. Both
@@ -751,8 +737,8 @@ pointer). A split is **feasible** at `s` iff `used(L) ≤ C` **and** `used(R) �
     byte-identical boundary in every case. The gate is the **M1.5 tolerance
     band**: page counts must track the oracle within that band, not exactly.
 
-- **Branch splits — end-of-page rule, two-children form (AMENDED 2026-10-17,
-  issue #11; extends ADR-0005 D5 to branches) — MUST.** When the new cell
+- **Branch splits — end-of-page rule, two-children form (extends ADR-0005 D5 to
+  branches) — MUST.** When the new cell
   lands at the end of a full **branch** (`newindx == nkeys`), force
   `s = nkeys − 1`: the old last cell is the rising separator (§6.5), its child
   becomes node 0 of `R`, and the new cell is node 1 of `R` — exactly **two
@@ -760,7 +746,7 @@ pointer). A split is **feasible** at `s` iff `used(L) ≤ C` **and** `used(R) �
   "new cell alone on `R`" would leave the right branch with a single child,
   violating the branch two-children minimum (INV-8). This is the fork's
   `mdb_page_split` split point for an end insert on a branch (observed via
-  the oracle: `crates/zerodb-oracle/tests/ascending_fill_parity.rs`, whose
+  the oracle: `crates/zerodb-oracle/tests/differential/ascending_fill_parity.rs`, whose
   `*_branch_parity` tests check both engines' branch counts and heights
   against this rule at 4 KiB and 16 KiB pages). Both sides are feasible by
   construction: `L` is a subset of the full page, and `R` holds a key-less
@@ -917,7 +903,7 @@ as before.
 
 ---
 
-## §7 — Write-cursor ops: put_current / del_current (M1.4)
+## §7 — Write-cursor ops: put_current / del_current
 
 These mutate at the cursor's current position during `iter_mut` /
 `prefix_iter_mut` passes (SPEC 00 rows 33/34; SPEC 01 §S3). They are `unsafe` in
@@ -944,7 +930,7 @@ value of the entry at `ki[top]` **keeping the key**:
   irrelevant to the outcome.
 
   > Confirmed via oracle self-test 2026-07-15
-  > (`crates/zerodb-oracle/tests/flag_semantics.rs`:
+  > (`crates/zerodb-oracle/tests/differential/flag_semantics.rs`:
   > `cursor_put_current_append_ignores_position_when_greater` — key `>` last
   > succeeds while the cursor is parked at the *first* entry;
   > `cursor_put_current_append_not_greater_is_keyexist` — key `<` last and key
@@ -1011,7 +997,7 @@ through the heed surface consumers actually use:
 | drain a `prefix_iter_mut` range | visits exactly the prefix's keys; the rest survives |
 
 > Observed against the fork 2026-09-10:
-> `crates/zerodb-oracle/tests/cursor_delete_position.rs` (7 cases) drives
+> `crates/zerodb-oracle/tests/differential/cursor_delete_position.rs` (7 cases) drives
 > `iter_mut` / `prefix_iter_mut` on both engines from one macro body and
 > requires an identical event trace **and** identical surviving content. The
 > drain cases span ~2 000 entries at the OS page size, so they cross leaf
@@ -1218,7 +1204,7 @@ some DB tree walked from a meta root. Applies to the live meta's snapshot.
   check tool therefore asserts only `≥ min_keys` on non-root pages (and the bounds
   of INV-9), **not** `≥ FILL_THRESHOLD`. The root is exempt from `min_keys`. The
   threshold governs *when delete rebalances*, and is verified indirectly by the
-  file-size tolerance band (M1.5), not as a per-page assertion.
+  file-size tolerance band, not as a per-page assertion.
   **Decode-level floor (added 2026-09-09, security review H2):** independent of
   the invariant, the *decoder* rejects a branch page with **zero** children
   (`PageError::EmptyBranch`, SPEC 02 §4.1) — even a root branch — because
@@ -1282,7 +1268,7 @@ remain **unsupported**). Milestone 2.8 (ADR-0011, approved) was **parked
 2026-07-20**: stage 2.8a was implemented and reviewed but never merged or
 pushed — local work only, preserved outside the repository along with the
 resume preconditions. The design below is kept, not deleted; other documents
-(SPEC 02 §10, ADR-0011, DIVERGENCES D-004) reference it. If revived, 2.8 would
+(SPEC 02 §10, ADR-0011, divergence D-004) reference it. If revived, 2.8 would
 add, against the format hooks reserved in SPEC 02 §10:
 
 - **Sub-page** encoding for small duplicate sets: the dup values live in an
@@ -1303,7 +1289,7 @@ parked 2.8.
 
 Observed against the oracle (heed =0.22.1 / lmdb-master-sys 0.2.6, fork
 `mdb.master.nested-rtxns`, macOS aarch64) by
-`crates/zerodb-oracle/tests/dup_pin_semantics.rs` and `dup_pin_ffi.rs` —
+`crates/zerodb-oracle/tests/lmdb_observations/dup_pin_semantics.rs` and `dup_pin_ffi.rs` —
 **before any zerodb dup code exists**. These tables are the normative record
 a revived 2.8 implementation must match; the tests are the executable form and
 remain committed and green (the park kept exactly this pinning work,

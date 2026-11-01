@@ -1,42 +1,15 @@
 //! `copy_to_file_with_progress`: a zerodb-defined extension (`mdb_env_copy2`
 //! reports no progress and heed exposes no callback), so there is no oracle
 //! to diff against. Copy byte-correctness is covered by
-//! `zerodb-oracle/tests/copy_to_file_differential.rs`; these tests pin the
+//! `zerodb-oracle/tests/differential/copy_to_file_differential.rs`; these tests pin the
 //! callback contract and that instrumenting a copy does not change its bytes.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::TempDir;
+
+use std::path::Path;
 
 use zerodb::{CompactionOption, CopyProgress, CopyToFile, Env, EnvOpenOptions};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("zerodb-copyprog-{pid}-{nanos}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 /// An env with enough data to span many pages and several named DBs, so the
 /// progress sequence has real intermediate steps rather than just 0 → total.

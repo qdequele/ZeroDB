@@ -1,48 +1,19 @@
 //! Write-path integration tests over **real files**: the commit
 //! pipeline end-to-end (SPEC 04 §9), read-after-commit through the fixed
-//! full-`map_size` map (ADR-0004 D4), reopen durability, meta slot
+//! full-`map_size` map (ADR-0004), reopen durability, meta slot
 //! alternation (TXN-63), PREV_SNAPSHOT over real commits (TXN-65..67), split
-//! exact-fit boundaries at both page-size extremes (ADR-0004 D7 risk 2), and
+//! exact-fit boundaries at both page-size extremes (ADR-0004 risk 2), and
 //! a multi-MB overflow value.
 //!
 //! Every committed image is validated with `zerodb::check::check_image`
 //! (SPEC 03 §11 + SPEC 05 §9, including INV-10/INV-22 reachable-XOR-free).
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::{assert_clean, TempDir};
 
-use zerodb::{check, Env, EnvFlags, EnvOpenOptions};
+use std::path::Path;
 
-// --- tiny self-cleaning temp dir (no tempfile dep on the allowlist) ---
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("zerodb-write-{pid}-{nanos}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{Env, EnvFlags, EnvOpenOptions};
 
 fn open(dir: &Path, map_size: usize, page_size: u32) -> Env {
     let mut opts = EnvOpenOptions::new();
@@ -51,20 +22,13 @@ fn open(dir: &Path, map_size: usize, page_size: u32) -> Env {
     opts.open(dir).expect("open env")
 }
 
-/// Assert the on-disk image passes the invariant walk (SPEC 03 §11 subset).
-fn assert_clean(dir: &Path, psize: u32) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, psize);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
-}
-
 const PS: u32 = 4096;
 const MAP: usize = 8 << 20;
 
 #[test]
 fn put_commit_read_back_same_env() {
     // Read-after-commit through the same env exercises the fixed map seeing
-    // the commit's pwrites (ADR-0004 D4) — no remap, no reopen.
+    // the commit's pwrites (ADR-0004) — no remap, no reopen.
     let dir = TempDir::new();
     let env = open(dir.path(), MAP, PS);
     let db = env.main_database();
@@ -255,7 +219,7 @@ fn prev_snapshot_env(dir: &Path, lock_file: bool) -> Env {
     opts.open(dir).unwrap()
 }
 
-/// ADR-0023 amendment 19, as LMDB (`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`,
+/// ADR-0023, as LMDB (`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`,
 /// `OBS_PREV_SNAPSHOT_SECOND_COMMIT_KEEPS_FIRST`): with a lock file, the
 /// first commit of a `PREV_SNAPSHOT` env is durable but not published. Read
 /// txns keep the older snapshot; `Env::txnid` and `Env::info` name the
@@ -306,7 +270,7 @@ fn prev_snapshot_first_commit_is_not_published_with_a_lock_file() {
 
 /// Without a lock file a `PREV_SNAPSHOT` env's first commit is published at
 /// once and the second builds on it, as LMDB with `MDB_NOLOCK`
-/// (`OBS_PREV_SNAPSHOT_NOLOCK_COMMITS`; ADR-0023 amendment 19).
+/// (`OBS_PREV_SNAPSHOT_NOLOCK_COMMITS`; ADR-0023).
 #[test]
 fn prev_snapshot_first_commit_is_published_without_a_lock_file() {
     let dir = TempDir::new();

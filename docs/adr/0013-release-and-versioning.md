@@ -1,11 +1,17 @@
 # ADR-0013: Release and versioning policy for the 0.x line
 
-- Status: Proposed (agent-drafted 2026-09-09 for the first release; Q1 and Q2
-  answered by the maintainer the same day — publish the engine crates to
-  crates.io, ship 0.1 with the open Phase 1 items as known gaps; Q3 defaults to
-  plain annotated tags unless a maintainer objects before tagging)
+- Status: Followed for the 0.2.0 release. The maintainer answered Q1 and Q2 on
+  2026-09-09 (publish the engine crates to crates.io; ship with the open items
+  as known gaps); Q3 defaulted to plain annotated tags. The formal approval is
+  not recorded.
 - Milestone: first release (v0.1.0)
 - Date: 2026-09-09 (revised the same day: Option A → Option B after Q1)
+- Amended 2026-11-01 (maintainer decision): the shim crates are gone. The
+  adapter's own package is named `heed`, so `crates/heed-zerodb` is the
+  `[patch]` target directly; workspace crates depend on it as
+  `heed_zerodb = { package = "heed", path = … }`. The adapter stays
+  unpublished and at heed's version. Text below that names
+  `crates/heed-shim` describes the design before this amendment.
 
 ## Context
 
@@ -30,7 +36,7 @@ Forces:
   a fix to the adapter could not be re-released under the `0.22.1` the patch
   needs. crates.io is therefore useful for the **engine** crates (docs.rs,
   `cargo add zerodb`, `cargo install zerodb-tools`), not for the adapter.
-- **The frozen contract is heed's.** PLAN.md ground rule 2: no heed-mirrored
+- **The frozen contract is heed's.** project rule 2: no heed-mirrored
   signature changes in Phases 0–2. ZeroDB-only extensions (`Env::sync(force)`,
   `reader_list`, `live_readers`, `EnvOpenOptions::page_size`,
   `copy_to_file_with_progress`, `Comparator`) are the only API that can move.
@@ -42,7 +48,7 @@ Forces:
   `crates/zerodb-core/src/page/mod.rs`) and a mismatch is refused at open
   (SPEC 02 §3, SPEC 06). D-002 sanctions no LMDB file compatibility; migration
   is logical (`zerodb-tools dump`/`load`, `migrate-from-lmdb`).
-- **Phase 1's exit criteria are not all met** (PLAN §1.14: 24 h fuzz soak,
+- **Phase 1's exit criteria are not all met** (original project plan: 24 h fuzz soak,
   Graviton 4K/64K bench, CI). The first release must say so rather than imply
   production readiness.
 
@@ -98,7 +104,7 @@ Versioning rules while 0.x:
    change to the native `zerodb` API (cargo treats `0.Y.*` as one compatible
    line, so this is what crates.io consumers rely on), any `FORMAT_VERSION`
    bump, any MSRV bump, any new sanctioned divergence. A `FORMAT_VERSION` bump
-   is itself an ADR (CLAUDE.md rule 6) and the CHANGELOG entry's first line
+   is itself an ADR (the project rules) and the CHANGELOG entry's first line
    states it with the dump/load migration path.
 3. **Patch bump (0.Y.Z)**: bug fixes, performance, docs, tooling, with the
    on-disk format and every API unchanged.
@@ -106,8 +112,8 @@ Versioning rules while 0.x:
    moves to 0.23, that is a new adapter line, a new ADR, and at least a minor
    bump.
 5. **What a release promises**: files written by vX.Y.Z open unchanged in every
-   later release with the same `FORMAT_VERSION`; the full CLAUDE.md gate and the
-   consumer gate (docs/CONSUMER-GATE.md) passed on the release commit, with the
+   later release with the same `FORMAT_VERSION`; the full check suite and the
+   consumer gate (docs/maintainers/CONSUMER-GATE.md) passed on the release commit, with the
    Meilisearch and hannoy refs named in the CHANGELOG; known gaps are listed in
    the release notes, never implied away.
 6. **MSRV** is the workspace `rust-version`; it is checked in CI and bumped
@@ -142,7 +148,7 @@ Publishing rules:
 
 - New files: `CHANGELOG.md` (Keep a Changelog shape; the release workflow
   extracts the tagged section), `.github/workflows/release.yml`,
-  `docs/RELEASING.md`, `SECURITY.md`, `CONTRIBUTING.md`, `docs/COMPATIBILITY.md`
+  `docs/maintainers/RELEASING.md`, `SECURITY.md`, `CONTRIBUTING.md`, `docs/LMDB-COMPATIBILITY.md`
   (the heed/LMDB coverage matrix a release is measured against).
 - Engine crates bump `0.0.1 → 0.1.0`; `heed-zerodb`, `heed-shim`, and
   `zerodb-oracle` carry `publish = false`.
@@ -155,7 +161,7 @@ Publishing rules:
   surface; cleaning those up is a 0.2 change, not a patch.
 - `zerodb-tools --version` prints the crate version and `FORMAT_VERSION`, so a
   support request can name both; `cargo install zerodb-tools` works.
-- README, `docs/RELEASING.md` and `docs/TOOLS.md` describe the crates.io path;
+- README, `docs/maintainers/RELEASING.md` and `docs/TOOLS.md` describe the crates.io path;
   the drop-in instructions are unchanged (git patch on the shim at a tag).
 
 ## Open questions for human review

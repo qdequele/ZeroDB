@@ -7,68 +7,11 @@
 //! allocator. Crafted images over a heap backing, as `hostile_input.rs` (the
 //! suite also runs under miri).
 
-use zerodb_core::env::testutil::VecBacking;
-use zerodb_core::env::{open_with_backing, DurabilityFlags, Env};
 use zerodb_core::error::{Error, MdbError};
-use zerodb_core::page::{BranchMut, LeafMut, MetaPage};
+use zerodb_core::page::BranchMut;
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-const PS: u32 = 4096;
-const MAP: u64 = 1 << 20; // 256 pages
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn unique_path(tag: &str) -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    PathBuf::from(format!(
-        "/virtual/hostile-clear-{tag}-{}-{n}",
-        std::process::id()
-    ))
-}
-
-/// As `hostile_input.rs::craft_image`: both meta slots from `edit(meta)`,
-/// then each `(pgno, frame)` copied in.
-fn craft_image(
-    file_pages: usize,
-    edit: impl Fn(&mut MetaPage),
-    pages: &[(u64, Vec<u8>)],
-) -> Vec<u8> {
-    let ps = PS as usize;
-    let mut buf = vec![0u8; file_pages * ps];
-    for slot in [0u64, 1] {
-        let mut m = MetaPage::create(slot, PS, MAP);
-        edit(&mut m);
-        let base = slot as usize * ps;
-        m.encode(&mut buf[base..base + ps]).expect("valid meta");
-    }
-    for (pgno, frame) in pages {
-        let base = *pgno as usize * ps;
-        buf[base..base + frame.len()].copy_from_slice(frame);
-    }
-    buf
-}
-
-fn open_image(buf: Vec<u8>, tag: &str) -> Result<Env, Error> {
-    open_with_backing(
-        unique_path(tag),
-        Box::new(VecBacking::new(buf, MAP)),
-        PS,
-        false,
-        8,
-        8,
-        DurabilityFlags::default(),
-    )
-}
-
-/// A one-entry leaf page frame stamped `(pgno, txnid)`.
-fn leaf_frame(pgno: u64, txnid: u64, key: &[u8], val: &[u8]) -> Vec<u8> {
-    let mut buf = vec![0u8; PS as usize];
-    let mut leaf = LeafMut::init(&mut buf, PS, pgno, txnid).unwrap();
-    leaf.insert_inline(0, key, 0, val).unwrap();
-    buf
-}
+mod common;
+use common::{craft_image, leaf_frame, open_image, PS};
 
 /// A two-child branch frame `{[] -> left, "m" -> right}` stamped `(pgno, 1)`.
 fn branch_frame(pgno: u64, left: u64, right: u64) -> Vec<u8> {

@@ -3,7 +3,7 @@
 //! the environment's database-open mutex, only they open or create
 //! databases, and `UniqueRoTxn::commit` replaces `RoTxn::commit`.
 //!
-//! Run with `cargo test -p heed-zerodb --features unique-txns`. The other test
+//! Run with `cargo test -p heed --features unique-txns`. The other test
 //! files cover heed 0.22.1's API and are compiled without the feature.
 
 #![cfg(feature = "unique-txns")]
@@ -12,8 +12,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use heed_zerodb::types::{Bytes, Str};
-use heed_zerodb::{AsUniqueTxnRef, Database, Env, EnvOpenOptions, Error, WithoutTls};
+use heed::types::{Bytes, Str};
+use heed::{AsUniqueTxnRef, Database, Env, EnvOpenOptions, Error, WithoutTls};
 
 fn open_env(dir: &tempfile::TempDir) -> Env<WithoutTls> {
     let mut opts = EnvOpenOptions::new().read_txn_without_tls();

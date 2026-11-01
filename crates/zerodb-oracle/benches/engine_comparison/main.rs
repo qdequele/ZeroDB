@@ -9,8 +9,8 @@
 //! that at the consumer level. This answers **where** the two engines diverge
 //! and **which mechanism** is responsible, by arranging the rungs as a *ladder*:
 //! adjacent rungs differ by exactly one mechanism, so a ratio that jumps between
-//! two rungs names the cost. `docs/BENCH-MAP.md` maps every rung to the
-//! mechanism it isolates and the `docs/PERF-GAP-VS-LMDB.md` item it implicates.
+//! two rungs names the cost. `docs/PERFORMANCE.md` maps every rung to the
+//! mechanism it isolates and the `docs/PERFORMANCE.md` item it implicates.
 //!
 //! ## Fair by construction
 //! * **Identical operation bodies** — `backend.rs` holds one macro body expanded

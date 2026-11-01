@@ -15,7 +15,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 # ZeroDB through its heed surface, the way Meilisearch uses it.
-heed-zerodb = { path = "../../crates/heed-zerodb" }
+heed_zerodb = { package = "heed", path = "../../crates/heed-zerodb" }
 # LMDB: heed 0.22.1 vendors the Meilisearch LMDB fork (lmdb-master-sys 0.2.6),
 # the engine ZeroDB replaces.
 heed = "=0.22.1"

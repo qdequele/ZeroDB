@@ -1,7 +1,7 @@
 [package]
 name = "zerodb-tools"
 version = "0.2.0"
-description = "Utilities for ZeroDB environments: stat, dump, load, check and migrate-from-lmdb."
+description = "Command-line utilities for ZeroDB environments: stat, dump, load, check and migrate-from-lmdb."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -24,10 +24,10 @@ zerodb = { path = "../zerodb", version = "=0.2.0" }
 zerodb-core = { path = "../zerodb-core", version = "=0.2.0" }
 # `probe_page_size` for `check`'s raw-file fallback, and
 # `lockfile::published_max_readers`, so a tool joins a running env with its
-# lock file's `max_readers` (ADR-0023 amendment 18); no C.
+# lock file's `max_readers` (ADR-0023); no C.
 zerodb-io = { path = "../zerodb-io", version = "=0.2.0" }
 # migrate-from-lmdb only: opens a real LMDB env read-only (the Meilisearch
-# fork). Off by default; see the ADR-0001 amendment (2026-07-17).
+# fork). Off by default (ADR-0001).
 heed = { version = "=0.22.1", optional = true }
 
 [features]
@@ -36,6 +36,6 @@ migrate-lmdb = ["dep:heed"]
 
 [dev-dependencies]
 # The live-env tests hold an environment open in a child process through the
-# heed adapter, as Meilisearch does (ADR-0023 amendment 18). Workspace-internal,
+# heed adapter, as Meilisearch does (ADR-0023). Workspace-internal,
 # not a new external dependency.
-heed-zerodb = { path = "../heed-zerodb" }
+heed_zerodb = { package = "heed", path = "../heed-zerodb" }

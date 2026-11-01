@@ -1,6 +1,6 @@
 # ADR-0008: Crash harness — fault-injection write backend, two-mechanism crash cycles, crash-harness binary
 
-- Status: **Approved** — maintainer, 2026-07-16, standing directive, delegated review
+- Status: **Approved** — maintainer, 2026-07-16
 - Milestone: 1.11 (Recovery, torn writes, and crash consistency)
 - Date: 2026-07-16
 
@@ -21,14 +21,14 @@
    fuzz-long; `crash-test-quick` (200) joins the milestone gate. This
    milestone's local acceptance: quick gate + one large local run capped at
    ≤30 min wall (`--jobs`), reporting the achieved cycle count; if <10k
-   locally, the 10k run becomes a recorded CI obligation in PROGRESS.
+   locally, the 10k run becomes a recorded CI obligation in the engineering log.
 6. **80/20 image/SIGKILL split approved**, with a floor written into the
    full-run acceptance: **≥1k of the counted cycles must be mechanism-B
    SIGKILL recoveries.**
 
 ## Context
 
-**PLAN §1.11 acceptance, restated.** A crash-injection harness with **two
+**Acceptance criteria from the original plan, restated.** A crash-injection harness with **two
 mechanisms** — SIGKILL alone cannot tear a write (the OS page cache survives
 process death; only power loss tears/reorders un-fsynced sectors):
 (1) process kill — workload in a child process, SIGKILL at random points and
@@ -289,7 +289,7 @@ Matches the justfile contract (`--cycles 200` quick / `--cycles 10000` full).
   weighted toward `default`), `--repro <seed:cycle>` (re-run one cycle).
 - **Cycle accounting:** one cycle = one crash-state reopened and verified
   (each materialized image variant and each SIGKILL recovery counts as one).
-  This is the natural reading of PLAN's “crash-recovery cycles” — flagged as
+  This is the natural reading of the original plan “crash-recovery cycles” — flagged as
   open question 1 for sign-off, since the alternative (one cycle = one cut
   point) multiplies the bar by V.
 - Parallelism: worker threads for mechanism A (per-worker reusable buffers,
@@ -301,7 +301,7 @@ Matches the justfile contract (`--cycles 200` quick / `--cycles 10000` full).
   op stream under `target/crash-repro/<seed>-<cycle>/`. First failure stops
   the run (CI semantics); `--keep-going` for triage.
 - justfile: recipes already exist and are honored as written; `crash-test-full`
-  is the nightly-CI target (PLAN Testing strategy), `crash-test-quick` joins
+  is the nightly-CI target (the original test strategy), `crash-test-quick` joins
   the per-milestone gate from M1.11 on.
 
 ## Decision 4 — Durability-flag windows: assert exactly REC-9..12, no more
@@ -327,7 +327,7 @@ harness logs (does not gate on) the observed loss/corruption distribution.
 
 Phase 1 stays on buffered I/O (pwrite + fdatasync / mmap + msync). Actual
 `O_DIRECT` belongs to the Phase 3.5 io_uring backend (its alignment,
-allocator, and queue-depth story). What M1.11 does now — PLAN's “O_DIRECT-
+allocator, and queue-depth story). What M1.11 does now — the original plan “O_DIRECT-
 friendly write sizing” note — is pin and enforce the invariant that makes
 that future backend a drop-in: **every `write_at_page` the engine issues is
 psize-aligned at a psize-multiple offset with a psize-multiple length** (pages
@@ -335,7 +335,7 @@ and whole overflow runs; the meta write is one full page). The `FaultBacking`
 debug-asserts this on every write, so 10k cycles double as a continuous audit
 that no sub-page or misaligned write ever creeps into the commit path. No
 `O_DIRECT` flag, no allocation-alignment work, in Phase 1. (EBS sanity per
-PLAN: alignment is the property EBS/O_DIRECT needs; recorded here so Phase 3.5
+The original plan: alignment is the property EBS/O_DIRECT needs; recorded here so Phase 3.5
 starts from an already-clean write pattern.)
 
 ## Decision 6 — Risk register (3 traps + a guard each)
@@ -447,7 +447,7 @@ model bugs during bring-up (D6's traps firing as designed):
 4. **PRNG:** in-house splitmix64/xoshiro256** in the harness (bit-stable
    forever, ~20 lines of test-only code) vs allowlisted `rand::StdRng`
    (lockfile-stable only). Recommended: in-house; needs your sign-off since
-   CLAUDE.md prefers the allowlist.
+   AGENTS.md prefers the allowlist.
 5. **CI budget:** `crash-test-full` (10k cycles) target wall time and venue —
    nightly on the Graviton runner alongside fuzz-long (recommended), with
    `crash-test-quick` (200) in the per-milestone gate?

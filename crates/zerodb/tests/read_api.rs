@@ -4,39 +4,13 @@
 //! combinations) and a multi-megabyte overflow value, which the oracle `Op`
 //! model does not exercise (its values are bounded, and it has no range op).
 
+mod common;
+use common::TempDir;
+
 use std::ops::Bound;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use zerodb::EnvOpenOptions;
 use zerodb_core::builder::{build_single_db_image, DEFAULT_FILL_PERMILLE};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("zerodb-read-{pid}-{nanos}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 const PS: u32 = 4096;
 const MAP: u64 = 16 << 20;

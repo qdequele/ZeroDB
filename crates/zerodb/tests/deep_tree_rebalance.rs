@@ -1,40 +1,17 @@
 //! Confirms that the wide-key geometry used by
-//! `crates/zerodb-oracle/tests/write_rebalance_differential.rs` actually
+//! `crates/zerodb-oracle/tests/differential/write_rebalance_differential.rs` actually
 //! reaches depth >= 3 (branch-of-branches), and that the delete cascade walks
 //! all the way back down to an empty, depth-0 tree. The oracle's `Op` model
 //! has no depth-introspection op, so depth is asserted here against
 //! `TxnRead::main_record`, on a file-backed env so `check::check_image`
 //! validates every commit.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::{assert_clean, TempDir};
 
-use zerodb::{check, Env, EnvOpenOptions, TxnRead};
+use std::path::Path;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-deep-tree-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{Env, EnvOpenOptions, TxnRead};
 
 const PS: u32 = 4096;
 const MAP: usize = 16 << 20;
@@ -44,12 +21,6 @@ fn open(dir: &Path) -> Env {
     opts.map_size(MAP);
     opts.page_size(PS);
     opts.open(dir).expect("open env")
-}
-
-fn assert_clean(dir: &Path) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, PS);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
 }
 
 /// Mirrors `write_rebalance_differential.rs::wide_key`: a ~500-byte key
@@ -83,7 +54,7 @@ fn wide_key_geometry_reaches_depth_three_then_collapses() {
     assert!(rec.branch_pages >= 2, "expected multiple branch pages");
     assert_eq!(rec.entries, n as u64);
     wtxn.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     // Cascade delete: evens, then odds — must walk back to an empty,
     // depth-0 tree (§9 root collapse) with every merge/borrow along the way
@@ -93,7 +64,7 @@ fn wide_key_geometry_reaches_depth_three_then_collapses() {
         assert!(db.delete(&mut wtxn, &wide_key(i)).unwrap());
     }
     wtxn.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     let mut wtxn = env.write_txn().unwrap();
     for i in (1..n).step_by(2) {
@@ -106,7 +77,7 @@ fn wide_key_geometry_reaches_depth_three_then_collapses() {
     assert_eq!(rec.leaf_pages, 0);
     assert_eq!(rec.branch_pages, 0);
     wtxn.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     let rtxn = env.read_txn().unwrap();
     assert!(db.is_empty(&rtxn).unwrap());

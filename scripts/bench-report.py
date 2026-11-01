@@ -7,7 +7,7 @@ holding `new/benchmark.json` (the id: group + function) and `new/estimates.json`
 (the statistics). This pairs the `lmdb` and `zerodb` functions inside each
 group and prints `ratio = zerodb / lmdb` — above 1.0 means zerodb is slower.
 
-The point of the ladder (see `docs/BENCH-MAP.md`) is that adjacent rungs in a
+The point of the ladder (see `docs/PERFORMANCE.md`) is that adjacent rungs in a
 family differ by exactly one mechanism, so this also prints, per family, how
 much each rung's ratio moved against the family's FIRST rung. A rung whose
 ratio jumps is naming the mechanism that rung added.
@@ -27,7 +27,7 @@ ZERODB = "zerodb"
 
 # The reference rung of each ladder family: the cheapest or most-isolated one,
 # so every other rung's delta reads as "what this rung's extra mechanism added".
-# `docs/BENCH-MAP.md` lists the same base per family and explains each choice —
+# `docs/PERFORMANCE.md` lists the same base per family and explains each choice —
 # that document is the source of truth; this table only encodes the ordering.
 # A family missing here (or whose base was filtered out of the run) falls back
 # to its first rung, and the report says so.
@@ -108,7 +108,7 @@ def family_of(group: str) -> str:
     """`get/db/named` -> `get/db`. The rungs a ladder step compares within.
 
     `*_touch` rungs are their own ladder (`get/val/v8_touch` → `v4k_touch` →
-    `v2page_touch`, docs/BENCH-MAP.md) with `v8_touch` as the control, so
+    `v2page_touch`, docs/PERFORMANCE.md) with `v8_touch` as the control, so
     `get/val/v4k_touch` -> `get/val_touch`: comparing them against `get/val/v8`
     would mix the touch's cost into the value-width delta.
     """

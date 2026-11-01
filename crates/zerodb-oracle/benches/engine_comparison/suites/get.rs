@@ -13,11 +13,11 @@
 //!
 //! Reading it: `db/root` is the floor — a descent with no catalog record to
 //! resolve. `db/named` adds exactly the named-DB resolution (the named-DB
-//! record lookup in docs/PERF-GAP-VS-LMDB.md), so `named / root` is that
+//! record lookup in docs/PERFORMANCE.md), so `named / root` is that
 //! mechanism's price. `access/hot` removes the descent variance and leaves
 //! per-call overhead. `size` moves tree depth and nothing else, so
 //! `n1m / n50k` is the per-level cost (branch levels re-resolved per cursor
-//! step, docs/PERF-GAP-VS-LMDB.md). `key` moves the comparison and the
+//! step, docs/PERFORMANCE.md). `key` moves the comparison and the
 //! cells-per-page density; `val` moves the value memcpy and, at 2×page,
 //! crosses into overflow pages.
 

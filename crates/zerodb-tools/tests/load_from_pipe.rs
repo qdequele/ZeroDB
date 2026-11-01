@@ -2,26 +2,14 @@
 //! `/dev/stdin`): the dump is spooled during the checking pass, loads the same
 //! as from a file, and a malformed piped dump leaves the destination empty.
 
+mod common;
+use common::TempDir;
+
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use zerodb_tools::dump_format::{render, DumpDb};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmp_dir(tag: &str) -> PathBuf {
-    // Relaxed: the counter only makes names unique within this process.
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let p = std::env::temp_dir().join(format!(
-        "zerodb-tools-pipe-{tag}-{}-{n}",
-        std::process::id()
-    ));
-    let _ = std::fs::remove_dir_all(&p);
-    std::fs::create_dir_all(&p).unwrap();
-    p
-}
 
 /// Run `zerodb-tools load /dev/stdin <env_dir>` with `text` written to its
 /// stdin through a pipe.
@@ -65,7 +53,7 @@ fn load_from_a_pipe_matches_the_input() {
             entries: entries(500),
         },
     ]);
-    let env_dir = tmp_dir("ok");
+    let env_dir = TempDir::new("ok");
     let out = load_piped(text.as_bytes(), &env_dir);
     assert!(
         out.status.success(),
@@ -89,7 +77,7 @@ fn malformed_piped_dump_leaves_destination_empty() {
         entries: entries(5_000),
     }]);
     text.push_str("format=bytevalue\nHEADER=END\n 6b\n zz\nDATA=END\n");
-    let env_dir = tmp_dir("bad");
+    let env_dir = TempDir::new("bad");
     let out = load_piped(text.as_bytes(), &env_dir);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
@@ -106,7 +94,7 @@ fn piped_dump_with_an_oversized_key_leaves_destination_empty() {
             (vec![b'k'; 512], b"2".to_vec()),
         ],
     }]);
-    let env_dir = tmp_dir("bigkey");
+    let env_dir = TempDir::new("bigkey");
     let out = load_piped(text.as_bytes(), &env_dir);
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);

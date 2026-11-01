@@ -10,36 +10,13 @@
 //! - short read txns (each one hitting the cache for pages an earlier txn
 //!   validated) return exactly the model's contents while pgnos are reused.
 
+mod common;
+use common::TempDir;
+
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
 use zerodb::{Env, EnvOpenOptions};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-stamp-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 const PS: u32 = 4096;
 
@@ -221,18 +198,18 @@ fn short_read_txns_see_exact_contents_while_pages_are_reused() {
     }
 }
 
-/// No cache entry exists anywhere in the table under `stamp` (ADR-0018
-/// amendment): probes every pgno the file could hold, both kinds.
+/// No cache entry exists anywhere in the table under `stamp` (ADR-0018):
+/// probes every pgno the file could hold, both kinds.
 fn no_entry_with_stamp(env: &Env, dir: &Path, stamp: u64) -> bool {
     let len = std::fs::metadata(dir.join(zerodb::DATA_FILE_NAME))
         .expect("data file")
         .len();
     let pages = len / PS as u64 + 1;
-    (0..pages).all(|p| !env.inner().stamp_cache_has(p, false, stamp))
-        && (0..pages).all(|p| !env.inner().stamp_cache_has(p, true, stamp))
+    (0..pages).all(|p| !env.stamp_cache_has(p, false, stamp))
+        && (0..pages).all(|p| !env.stamp_cache_has(p, true, stamp))
 }
 
-/// ADR-0018 amendment: a successful commit seeds the env-wide
+/// ADR-0018: a successful commit seeds the env-wide
 /// cache with the tree frames it wrote under the committing txnid; an abort
 /// seeds nothing, so the reused txnid (TXN-2) starts clean and the reuse
 /// commit's own seeding is the first entry under that stamp.
@@ -246,10 +223,10 @@ fn commit_seeds_the_cache_and_abort_does_not() {
     let mut w = env.write_txn().unwrap();
     db.put(&mut w, b"a", b"1").unwrap();
     w.commit().unwrap();
-    let snap = env.inner().snapshot();
+    let snap = env.snapshot();
     assert_eq!(snap.txnid, 1);
     assert!(
-        env.inner().stamp_cache_has(snap.main_db.root, false, 1),
+        env.stamp_cache_has(snap.main_db.root, false, 1),
         "the committed root leaf must be seeded under the committing txnid"
     );
 
@@ -273,15 +250,15 @@ fn commit_seeds_the_cache_and_abort_does_not() {
         db.put(&mut w, k.as_bytes(), &[9u8; 64]).unwrap();
     }
     w.commit().unwrap();
-    let snap = env.inner().snapshot();
+    let snap = env.snapshot();
     assert_eq!(snap.txnid, 2, "TXN-2: the aborted id is reused");
     assert!(snap.main_db.depth >= 2, "expected a branch level");
     assert!(
-        env.inner().stamp_cache_has(snap.main_db.root, true, 2),
+        env.stamp_cache_has(snap.main_db.root, true, 2),
         "the committed root branch must be seeded under its kind"
     );
     assert!(
-        !env.inner().stamp_cache_has(snap.main_db.root, false, 2),
+        !env.stamp_cache_has(snap.main_db.root, false, 2),
         "the kind is part of the key"
     );
     let r = env.read_txn().unwrap();
@@ -292,7 +269,7 @@ fn commit_seeds_the_cache_and_abort_does_not() {
     assert_eq!(db.get(&r, b"a").unwrap(), Some(b"1".as_slice()));
 }
 
-/// ADR-0018 amendment safety pin: spilled pages are written to the file
+/// ADR-0018 safety pin: spilled pages are written to the file
 /// mid-txn under the txn's stamp (ADR-0017) and may be rewritten in place, so
 /// they must never seed the cache — not from the writer's own re-validation
 /// (the writer memo never publishes) and not from an aborted txn. After the
@@ -319,7 +296,7 @@ fn aborted_spills_seed_nothing_and_reuse_stays_correct() {
     }
     assert!(w.spill_count() > 0, "the base txn must have spilled");
     w.commit().unwrap();
-    let base_txnid = env.inner().snapshot().txnid;
+    let base_txnid = env.snapshot().txnid;
 
     // Spill heavily, then abort: nothing may be seeded under the aborted id.
     let mut w = env.write_txn().unwrap();

@@ -34,20 +34,8 @@ fn page_offset(pgno: u64, psize: u32) -> std::io::Result<u64> {
 /// # Errors
 ///
 /// Propagates the open I/O error (e.g. `ENOENT`).
-pub fn open_file(path: &Path, read_only: bool) -> std::io::Result<File> {
+pub(crate) fn open_file(path: &Path, read_only: bool) -> std::io::Result<File> {
     OpenOptions::new().read(true).write(!read_only).open(path)
-}
-
-/// Read one page-worth (`psize` bytes) at `pgno`, positioned (no cursor move).
-///
-/// # Errors
-///
-/// Propagates the positioned-read I/O error, or `UnexpectedEof` on a short read.
-pub fn read_page(file: &File, pgno: u64, psize: u32) -> std::io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; psize as usize];
-    let off = page_offset(pgno, psize)?;
-    file.read_exact_at(&mut buf, off)?;
-    Ok(buf)
 }
 
 /// Positioned read of exactly `buf.len()` bytes at page `pgno` (a kernel copy,
@@ -58,7 +46,12 @@ pub fn read_page(file: &File, pgno: u64, psize: u32) -> std::io::Result<Vec<u8>>
 ///
 /// Propagates the positioned-read I/O error, or `UnexpectedEof` on a short
 /// read.
-pub fn read_page_into(file: &File, pgno: u64, psize: u32, buf: &mut [u8]) -> std::io::Result<()> {
+pub(crate) fn read_page_into(
+    file: &File,
+    pgno: u64,
+    psize: u32,
+    buf: &mut [u8],
+) -> std::io::Result<()> {
     let off = page_offset(pgno, psize)?;
     file.read_exact_at(buf, off)
 }
@@ -70,7 +63,7 @@ pub fn read_page_into(file: &File, pgno: u64, psize: u32, buf: &mut [u8]) -> std
 /// # Errors
 ///
 /// Propagates the positioned-write I/O error.
-pub fn write_page(file: &File, pgno: u64, psize: u32, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_page(file: &File, pgno: u64, psize: u32, bytes: &[u8]) -> std::io::Result<()> {
     debug_assert!(bytes.len() <= psize as usize || bytes.len().is_multiple_of(psize as usize));
     let off = page_offset(pgno, psize)?;
     file.write_all_at(bytes, off)
@@ -88,13 +81,11 @@ const MAX_SEGS: usize = 64;
 /// The page cache sizes the folios it allocates for a buffered write by the
 /// write's length on kernels and filesystems with large-folio support (XFS,
 /// and ext4 on recent kernels). A later write of one page into a large folio
-/// costs far more kernel time than a write into a small one: on Graviton4,
-/// kernel 7.0, ext4, after a 10M-key load written in 2 MiB calls, each
-/// single-put commit spent ~25k kernel cycles, ~14k after a load written in
-/// 256 KiB calls, and ~11k with one page per call
-/// (`benches/results/2026-11-01-commit-write-cap-graviton.md`). Smaller calls
-/// cost bulk commits instead: at 16 KiB, writing 4 KiB values was 1.57× as
-/// slow. 256 KiB takes most of the small-commit gain for few extra syscalls.
+/// costs far more kernel time than a write into a small one, so large calls
+/// slow down every small commit that follows a bulk one. Smaller calls slow
+/// bulk commits instead, through the extra syscalls. 256 KiB, LMDB's choice,
+/// keeps most of the small-commit gain for few extra calls (measurements in
+/// docs/PERFORMANCE.md).
 const MAX_WRITE_BYTES: usize = 256 * 1024;
 
 /// Byte cap for one `pwritev` call at page size `psize`: [`MAX_WRITE_BYTES`],
@@ -148,7 +139,7 @@ fn next_write_run<'a>(
 /// # Errors
 ///
 /// Propagates the positioned-write I/O error.
-pub fn write_pages_vectored(
+pub(crate) fn write_pages_vectored(
     file: &File,
     start_pgno: u64,
     psize: u32,
@@ -217,18 +208,18 @@ pub fn write_pages_vectored(
 /// # Errors
 ///
 /// Propagates the positioned-read I/O error.
-pub fn read_head(file: &File, len: usize) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_head(file: &File, len: usize) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; len];
     file.read_exact_at(&mut buf, 0)?;
     Ok(buf)
 }
 
-/// The actual on-disk file length via `fstat` (SPEC 00 row 18).
+/// The actual on-disk file length via `fstat`.
 ///
 /// # Errors
 ///
 /// Propagates the `fstat` I/O error.
-pub fn real_disk_size(file: &File) -> std::io::Result<u64> {
+pub(crate) fn real_disk_size(file: &File) -> std::io::Result<u64> {
     Ok(file.metadata()?.len())
 }
 
@@ -271,7 +262,7 @@ pub fn probe_page_size(file: &File) -> std::io::Result<Option<u32>> {
 ///
 /// Propagates any create/write/fsync I/O error, or (unexpectedly) a meta encode
 /// error wrapped as `InvalidInput`.
-pub fn create_env_file(path: &Path, page_size: u32, map_size: u64) -> std::io::Result<File> {
+pub(crate) fn create_env_file(path: &Path, page_size: u32, map_size: u64) -> std::io::Result<File> {
     // `create_new` (O_CREAT|O_EXCL): never follows a symlink planted at the
     // data-file path, and `mode(0o600)` keeps the store owner-only (LMDB
     // creates its map 0600 too; a default-mode file leaks data via umask).
@@ -323,7 +314,7 @@ pub fn create_env_file(path: &Path, page_size: u32, map_size: u64) -> std::io::R
     // fsync so both slots are durable before the env is usable (SPEC 02 §3.4).
     file.sync_all()?;
     // …and fsync the parent directory so the file's *directory entry* is
-    // durable too (SPEC 02 §3.4 step 4; issue #46): without this, a crash
+    // durable too (SPEC 02 §3.4 step 4): without this, a crash
     // shortly after creation can lose the name while the content was already
     // durable — a reachable-file guarantee, one fsync per env lifetime.
     fsync_parent_dir(path)?;

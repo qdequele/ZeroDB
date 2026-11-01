@@ -169,7 +169,7 @@ pub fn classify(op: &Op, txn: TxnState, dbs_empty: bool, cleared_in_txn: bool) -
         // opens its own read txn, so it needs a db to exist but no active txn —
         // and it must NOT run while a write txn is open (VerifyDuringWrite; see
         // that `Skip`'s doc + the dropped-and-reused dbi entry in
-        // docs/DIVERGENCES.md). Its concurrent-with-writer isolation is a
+        // docs/LMDB-COMPATIBILITY.md). Its concurrent-with-writer isolation is a
         // reader-table concern.
         VerifyGet { .. } => {
             if dbs_empty {

@@ -5,7 +5,7 @@
   but written to disk), so it was decided before it was implemented
   (AGENTS.md rule 5). A spike measured it first (rule 6).
 - Related issue: none yet. Background:
-  [`benches/results/2026-10-19-crud-scan-count-and-batch-delete.md`](../../benches/results/2026-10-19-crud-scan-count-and-batch-delete.md).
+  the 2026-10-19 "crud scan count and batch delete" run.
 - Date: 2026-10-19
 
 ## Context
@@ -123,4 +123,4 @@ Graviton4 `c8g.xlarge`, 4 KiB pages: `^(del|put|commit/batch)/` flat (0
 regressed, `commit/batch/n1` 0.960), the batch-delete repro within 3 %. At
 4 KiB a leaf of ~1.2 KB values has little gap to skip, so the gain is the Mac
 spike's ~11 % at 16 KiB pages only. Details:
-`benches/results/2026-10-19-crud-scan-count-and-batch-delete.md`.
+the 2026-10-19 "crud scan count and batch delete" run.

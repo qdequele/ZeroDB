@@ -1,9 +1,8 @@
 # ADR-0010: Env directory presentation — the data-file name (`zerodb.dat` vs heed's `data.mdb` contract)
 
-- Status: **Approved** — Option A adopted (approved by the maintainer, 2026-07-20,
-  standing directive). **Implemented 2026-07-20**; see
-  §Consequences for the acceptance criteria and the engineering log (PROGRESS.md
-  at the time) for the landing note. D-012 is flipped to APPROVED/resolved.
+- Status: **Approved** — Option A adopted (approved by the maintainer, 2026-07-20). **Implemented 2026-07-20**; see
+  §Consequences for the acceptance criteria and the engineering log
+  for the landing note. D-012 is flipped to APPROVED/resolved.
 - Milestone: filed against the **M1.14 gate remainder** (this was a gate
   blocker: compaction and snapshot-restore were latent-broken behind a green
   suite).
@@ -40,7 +39,7 @@
 **D-002 does not cover this.** D-002 sanctions zerodb's own on-disk **format**;
 it says nothing about the **file name** heed consumers observe in the env
 directory. The name difference is a separate, unsanctioned divergence — filed
-as **D-012** (docs/DIVERGENCES.md) alongside this ADR.
+as **D-012** (docs/LMDB-COMPATIBILITY.md#behavior-differences) alongside this ADR.
 
 ### The latent break (found during the M1.14 index-scheduler gate)
 
@@ -77,7 +76,7 @@ lie (a file implying cross-process locking the engine does not provide).
   shim. The fix must preserve that property or it forfeits the adapter's whole
   point.
 - The M1.13 precedent for exactly this shape of problem is the
-  **adapter-boundary re-imposition** pattern (DIVERGENCES.md, D-006/D-008/
+  **adapter-boundary re-imposition** pattern (LMDB-COMPATIBILITY.md#behavior-differences, D-006/D-008/
   D-010): the core keeps its lenient/native behavior; `heed-zerodb` re-imposes
   the fork's observable contract at the heed boundary.
 - **Migration**: there are **no zerodb envs in production anywhere** (Phase 1
@@ -219,7 +218,7 @@ name it writes.
   are untouched: between any two steps of any write sequence, the invariant
   set is identical to today's because the name never changes after open.
 
-### SPEC updates (same change as the implementation, CLAUDE.md rule 3)
+### SPEC updates (same change as the implementation, the project rules)
 
 - SPEC 02 §8: the layout bullet ("named `zerodb.dat`") becomes "named by the
   opener; native default `zerodb.dat`, `data.mdb` when opened through
@@ -227,7 +226,7 @@ name it writes.
 - SPEC 00 row 7: note that the adapter satisfies the `data.mdb` half of the
   directory-env convention and that `lock.mdb` is intentionally absent
   (D-001, D-012).
-- DIVERGENCES.md D-012: flip wording from "latent break" to "resolved at the
+- LMDB-COMPATIBILITY.md#behavior-differences D-012: flip wording from "latent break" to "resolved at the
   adapter boundary" once implemented.
 
 ### Acceptance criteria the implementing milestone inherits

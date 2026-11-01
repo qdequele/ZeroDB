@@ -1,5 +1,5 @@
 //! A heap-backed stand-in for the writable map (`test-backing` feature;
-//! ADR-0021 M1) so the **in-place `WRITE_MAP` brokered discipline runs under
+//! ADR-0021) so the **in-place `WRITE_MAP` brokered discipline runs under
 //! miri**: the real `MmapWritable` is OS memory miri cannot see, while
 //! [`TestWriteMap`] holds the "map" in an `UnsafeCell<Box<[u8]>>` — plain
 //! heap memory on which Stacked/Tree Borrows check every access.
@@ -10,8 +10,8 @@
 //!   whole-buffer `&[u8]` per call, with the buffer's length as the logical
 //!   map size (as a
 //!   remapped-never `MAP_SHARED` view, this is what the engine's read paths
-//!   hold — the writer re-derives its copy per spill, ADR-0021 B2);
-//! - [`Backing::map_dirty_page`] (the `unsafe fn` broker, ADR-0021 B1) mints
+//!   hold — the writer re-derives its copy per spill, ADR-0021);
+//! - [`Backing::map_dirty_page`] (the `unsafe fn` broker, ADR-0021) mints
 //!   the region `&mut [u8]` from a root-derived raw pointer, exactly as
 //!   `MmapWritable::slice_mut` does;
 //! - [`Backing::write_at_page`] (the C4 meta write, and C2 for any heap
@@ -21,7 +21,7 @@
 //!   written locations through a stale view.
 //!
 //! Any violation of the brokered contract — two live `&mut` into one region,
-//! a stale `&[u8]` read at in-place-written locations (the ADR-0021 B2
+//! a stale `&[u8]` read at in-place-written locations (the ADR-0021
 //! hazard), a frame borrow outliving its `&mut` op — is undefined behavior
 //! on this backing and miri reports it. `zerodb-core`'s
 //! `writemap_in_place_miri` integration test drives the full txn surface
@@ -177,7 +177,7 @@ impl Backing for TestWriteMap {
 
     // clippy cannot see that this is an `unsafe fn` whose documented contract
     // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
-    // too); ADR-0021 B1's substance is the `unsafe fn` itself.
+    // too); ADR-0021's substance is the `unsafe fn` itself.
     #[allow(clippy::mut_from_ref)]
     unsafe fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
         let (off, len) = self.region(pgno, psize, pages)?;

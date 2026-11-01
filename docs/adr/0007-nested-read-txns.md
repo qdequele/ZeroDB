@@ -1,6 +1,6 @@
 # ADR-0007: Nested read transactions over a write txn — implementation strategy
 
-- Status: Approved — maintainer, 2026-07-16, standing directive, delegated review
+- Status: Approved — maintainer, 2026-07-16
 - Milestone: 1.9
 - Date: 2026-07-16
 
@@ -84,7 +84,7 @@ Forces:
   "ops-on-parent-with-live-child ⇒ `MDB_BAD_TXN`" error convention (stock
   LMDB likewise: `MDB_BAD_TXN` = "transaction must abort, has a child, or is
   invalid").
-- **zerodb-core is `#![forbid(unsafe_code)]`** (CLAUDE.md unsafe policy —
+- **zerodb-core is `#![forbid(unsafe_code)]`** (the unsafe policy —
   the reader table is the sanctioned core area; nothing is sanctioned for a
   nested module). heed's raw-pointer trick is therefore not available in-core
   without a policy amendment.
@@ -192,14 +192,14 @@ join, resume):
 #### Option C — heed-style raw pointer child (sanctioned `unsafe` in a new `zerodb-core::nested` module)
 
 Child holds erased pointers to the dirty store + records; `unsafe impl Send`.
-Requires a one-line CLAUDE.md unsafe-policy amendment (the policy currently
+Requires a one-line the unsafe-policy amendment (the policy currently
 sanctions only mmap/page-casting, the reader table, and oracle FFI).
 Rejected: it buys nothing over Option A (A is already zero-copy and `Send`),
 and it converts a compiler-checked guarantee into a human-audited one.
 
 **Decision: Option A**, with Option B recorded as the sanctioned fallback if
 `RwTxn: Sync` ever has to be given up (the static assertions make that moment
-loud, and B is a mechanical refactor away). No CLAUDE.md amendment needed;
+loud, and B is a mechanical refactor away). No AGENTS.md amendment needed;
 `unsafe` count in zerodb-core stays 0.
 
 ### D2 — What the child sees: delegate live vs snapshot roots at open
@@ -227,7 +227,7 @@ child never touches `readers.rs`.
   atomic, and the call sites really do drop children on worker threads:
   milli's `into_par_iter` consumes each child on a worker; hannoy's
   `ThreadLocal` pool drops wherever the `FrozenReader` drops).
-- **Orderings** (explicit per CLAUDE.md rule; assume ARM/weak memory):
+- **Orderings** (explicit per project rule; assume ARM/weak memory):
   - open: `fetch_add(1, Relaxed)` — creation happens on a thread holding
     `&RwTxn`; the child is published to its worker by the spawning
     mechanism's own happens-before edge (thread spawn / channel send), so the
@@ -258,7 +258,7 @@ child never touches `readers.rs`.
   runs. `Drop` (abort path) cannot return an error: a nonzero count at drop
   is only reachable via `mem::forget` of a child (see risk R1 — nothing is
   aliased at that point), so it is `debug_assert!` + proceed.
-- **Loom** (CLAUDE.md rule 4 — new lock-free interaction): add **L6** to the
+- **Loom** (the project rules — new lock-free interaction): add **L6** to the
   M1.8 suite: two loom threads each read a model "dirty" value through a
   child and `fetch_sub(1, Release)`; the writer thread `load(Acquire)`s until
   0 and then mutates the model value; assert no read observes the mutation.

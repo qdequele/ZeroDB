@@ -1,5 +1,5 @@
 //! Multi-process behavior of the lock file's first-opener election
-//! (ADR-0023 §1, amendment 10). The test binary re-runs itself as the other
+//! (ADR-0023 §1). The test binary re-runs itself as the other
 //! processes.
 
 use std::path::{Path, PathBuf};

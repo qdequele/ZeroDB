@@ -1,7 +1,7 @@
 [package]
 name = "zerodb-core"
 version = "0.2.0"
-description = "ZeroDB engine core: copy-on-write B+tree pages, MVCC transactions, free-page GC and a lock-free reader table. No I/O policy."
+description = "The engine core of ZeroDB: page format, copy-on-write B+trees, MVCC transactions and free-page reuse. Internal; use the `zerodb` crate."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -1,5 +1,5 @@
 //! `Database<KC, DC, C, CDUP>`, `DatabaseOpenOptions`, and `DatabaseStat`
-//! (SPEC 00 rows 10–12, 30–51). Typed over the `heed-traits` codecs, byte-level
+//! (30–51). Typed over the `heed-traits` codecs, byte-level
 //! over ZeroDB. Read methods dispatch across the three txn sources
 //! ([`with_read!`]); write methods target `&mut RwTxn`.
 
@@ -17,10 +17,10 @@ use crate::iterator::{
     RwRange, RwRevIter, RwRevPrefix, RwRevRange,
 };
 use crate::reserved_space::ReservedSpace;
-use crate::txn::{RoTxn, RwTxn, WithTls};
+use crate::txn::{RoTxn, RwTxn};
 use crate::{Error, MdbError, Result, Unspecified};
 
-/// Statistics for a database (SPEC 00 rows 49/60; `mdb_stat`).
+/// Statistics for a database (`mdb_stat`).
 #[derive(Debug, Clone, Copy)]
 pub struct DatabaseStat {
     /// Size of a database page.
@@ -48,7 +48,7 @@ impl DatabaseStat {
 }
 
 /// Map heed `PutFlags` → ZeroDB `PutFlags` (SPEC 01 Table 3). Dup flags are
-/// dropped (DUPSORT is unsupported; see docs/DIVERGENCES.md).
+/// dropped (DUPSORT is unsupported; see docs/LMDB-COMPATIBILITY.md).
 pub(crate) fn to_zdb_put_flags(f: PutFlags) -> zerodb::PutFlags {
     let mut z = zerodb::PutFlags::EMPTY;
     if f.contains(PutFlags::APPEND) {
@@ -148,7 +148,7 @@ fn prefix_bounds(prefix: &[u8]) -> OwnedBounds {
 // Database
 // ---------------------------------------------------------------------------
 
-/// A typed database handle (SPEC 00 rows 30–51). `Copy`, like `heed::Database`.
+/// A typed database handle. `Copy`, like `heed::Database`.
 pub struct Database<KC, DC, C = DefaultComparator, CDUP = DefaultComparator> {
     pub(crate) inner: zerodb::Database,
     pub(crate) page_size: u32,
@@ -204,13 +204,11 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         with_read!(txn, |t| zerodb::TxnRead::check_db(t, &self.inner)).map_err(Into::into)
     }
 
-    /// `get(txn, key)` (SPEC 00 row 30): the value for `key`, or `None`.
+    /// `get(txn, key)`: the value for `key`, or `None`.
     ///
     /// # Errors
     ///
     /// `Encoding`/`Decoding` on codec failure; `Mdb(Invalid)` on corruption.
-    // Hint: inlined only at a raised LLVM threshold (see
-    // docs/PERF-GAP-VS-LMDB.md, hot paths above LLVM's inlining threshold).
     #[inline]
     pub fn get<'a, 'txn>(&self, txn: &'txn RoTxn, key: &'a KC::EItem) -> Result<Option<DC::DItem>>
     where
@@ -226,7 +224,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         }
     }
 
-    /// `len(txn)` (SPEC 00 row 39).
+    /// `len(txn)`.
     ///
     /// # Errors
     ///
@@ -235,7 +233,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         Ok(with_read!(self, txn, |t| self.inner.len(t))?)
     }
 
-    /// `is_empty(txn)` (SPEC 00 row 40).
+    /// `is_empty(txn)`.
     ///
     /// # Errors
     ///
@@ -244,7 +242,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         Ok(with_read!(self, txn, |t| self.inner.is_empty(t))?)
     }
 
-    /// `stat(txn)` (SPEC 00 row 49).
+    /// `stat(txn)`.
     ///
     /// # Errors
     ///
@@ -261,7 +259,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         })
     }
 
-    /// `first(txn)` (SPEC 00 row 41).
+    /// `first(txn)`.
     ///
     /// # Errors
     ///
@@ -274,7 +272,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         decode_opt::<KC, DC>(with_read!(self, txn, |t| self.inner.first(t))?)
     }
 
-    /// `last(txn)` (SPEC 00 row 42).
+    /// `last(txn)`.
     ///
     /// # Errors
     ///
@@ -308,8 +306,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
             .get_lower_than(t, &kb))?)
     }
 
-    /// `get_lower_than_or_equal_to(txn, key)` — last entry `<= key`
-    /// (SPEC 00 row 48).
+    /// `get_lower_than_or_equal_to(txn, key)` — last entry `<= key`.
     ///
     /// # Errors
     ///
@@ -330,7 +327,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
             .get_lower_than_or_equal_to(t, &kb))?)
     }
 
-    /// `get_greater_than(txn, key)` — first entry `> key` (SPEC 00 row 47).
+    /// `get_greater_than(txn, key)` — first entry `> key`.
     ///
     /// # Errors
     ///
@@ -375,7 +372,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
 
     // -- read iterators ------------------------------------------------------
 
-    /// `iter(txn)` (SPEC 00 row 43).
+    /// `iter(txn)`.
     ///
     /// # Errors
     ///
@@ -397,7 +394,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
             .rev_iter(t))))
     }
 
-    /// `range(txn, range)` (SPEC 00 row 44).
+    /// `range(txn, range)`.
     ///
     /// # Errors
     ///
@@ -419,7 +416,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
             .range(t, lo, hi))))
     }
 
-    /// `rev_range(txn, range)` (SPEC 00 row 44).
+    /// `rev_range(txn, range)`.
     ///
     /// # Errors
     ///
@@ -441,7 +438,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
             .rev_range(t, lo, hi))))
     }
 
-    /// `prefix_iter(txn, prefix)` (SPEC 00 row 45).
+    /// `prefix_iter(txn, prefix)`.
     ///
     /// # Errors
     ///
@@ -463,7 +460,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
             .prefix_iter(t, &pb))))
     }
 
-    /// `rev_prefix_iter(txn, prefix)` (SPEC 00 row 46).
+    /// `rev_prefix_iter(txn, prefix)`.
     ///
     /// # Errors
     ///
@@ -486,7 +483,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
 
     // -- write iterators -----------------------------------------------------
 
-    /// `iter_mut(txn)` (SPEC 00 row 43).
+    /// `iter_mut(txn)`.
     ///
     /// # Errors
     ///
@@ -566,7 +563,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         )))
     }
 
-    /// `prefix_iter_mut(txn, prefix)` (SPEC 00 row 45).
+    /// `prefix_iter_mut(txn, prefix)`.
     ///
     /// # Errors
     ///
@@ -624,7 +621,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
 
     // -- writes --------------------------------------------------------------
 
-    /// `put(txn, key, data)` (SPEC 00 row 31).
+    /// `put(txn, key, data)`.
     ///
     /// # Errors
     ///
@@ -640,7 +637,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         self.inner.put(txn.zdb_mut(), &kb, &vb).map_err(Into::into)
     }
 
-    /// `put_with_flags(txn, flags, key, data)` (SPEC 00 row 32).
+    /// `put_with_flags(txn, flags, key, data)`.
     ///
     /// # Errors
     ///
@@ -664,12 +661,14 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
             .map_err(Into::into)
     }
 
-    /// `put_reserved(txn, key, size, f)` (SPEC 00 row 35, `MDB_RESERVE`).
+    /// `put_reserved(txn, key, size, f)` (`MDB_RESERVE`).
     ///
     /// # Errors
     ///
-    /// As [`Database::put`]; `Io` if `f` returns an error (the entry is still
-    /// written, as in LMDB).
+    /// As [`Database::put`]; `Io` if `f` returns an error, and
+    /// `Io(UnexpectedEof)` if `f` leaves part of the space unwritten. In both
+    /// cases the entry is still written (unwritten bytes read back as zero),
+    /// as in LMDB.
     pub fn put_reserved<'a, F>(
         &self,
         txn: &mut RwTxn,
@@ -683,34 +682,30 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         self.assert_env(txn);
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
-        // Hand the caller the engine's in-frame slot directly (the
-        // `MDB_RESERVE` shape): no heap buffer, no copy. Two deliberate
-        // semantics, both fork-pinned by the oracle's
-        // `put_reserved_failing_closure_leaves_entry_parity`:
-        //  - the engine reserves the slot BEFORE the closure runs, so a
-        //    closure error leaves the entry in place (LMDB cannot un-put a
-        //    reserve either) while the error propagates as `Io` (the fork's
-        //    variant);
-        //  - the slot may carry stale frame bytes (a COWed page's old cell
-        //    heap), so the unwritten tail is zeroed either way (the adapter's
-        //    zero-tail contract).
-        let mut werr: Option<std::io::Error> = None;
+        // The closure writes straight into the engine's slot, reserved before
+        // it runs, so a closure error cannot un-put the entry (as in LMDB).
+        // The slot may hold stale bytes from the copied page, so the
+        // unwritten tail is zeroed either way. The oracle pins both cases:
+        // `put_reserved_failing_closure_leaves_entry_parity` and
+        // `put_reserved_short_write_parity`.
+        let mut outcome: std::io::Result<()> = Ok(());
         self.inner
             .put_reserved(txn.zdb_mut(), &kb, data_size, |slot| {
                 let mut space = ReservedSpace::new(slot);
-                if let Err(e) = write_func(&mut space) {
-                    werr = Some(e);
-                }
+                outcome = write_func(&mut space).and_then(|()| {
+                    if space.remaining() == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::ErrorKind::UnexpectedEof.into())
+                    }
+                });
                 space.zero_unwritten_tail();
             })
             .map_err(Into::<Error>::into)?;
-        match werr {
-            Some(e) => Err(Error::Io(e)),
-            None => Ok(()),
-        }
+        outcome.map_err(Error::Io)
     }
 
-    /// `delete(txn, key)` (SPEC 00 row 36): whether the key existed.
+    /// `delete(txn, key)`: whether the key existed.
     ///
     /// # Errors
     ///
@@ -725,7 +720,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         self.inner.delete(txn.zdb_mut(), &kb).map_err(Into::into)
     }
 
-    /// `delete_range(txn, range)` (SPEC 00 row 37): number deleted.
+    /// `delete_range(txn, range)`: number deleted.
     ///
     /// # Errors
     ///
@@ -743,7 +738,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         Ok(n as usize)
     }
 
-    /// `clear(txn)` (SPEC 00 row 38): empty the DB, keep the handle.
+    /// `clear(txn)`: empty the DB, keep the handle.
     ///
     /// # Errors
     ///
@@ -771,25 +766,25 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
 
     // -- remap ---------------------------------------------------------------
 
-    /// Change the key/data codecs (SPEC 00 row 51). Pure client-side retype.
+    /// Change the key/data codecs. Pure client-side retype.
     #[must_use]
     pub fn remap_types<KC2, DC2>(&self) -> Database<KC2, DC2, C> {
         Database::new(self.inner, self.page_size, self.env_ident)
     }
 
-    /// Change the key codec (SPEC 00 row 51).
+    /// Change the key codec.
     #[must_use]
     pub fn remap_key_type<KC2>(&self) -> Database<KC2, DC, C> {
         self.remap_types::<KC2, DC>()
     }
 
-    /// Change the data codec (SPEC 00 row 51).
+    /// Change the data codec.
     #[must_use]
     pub fn remap_data_type<DC2>(&self) -> Database<KC, DC2, C> {
         self.remap_types::<KC, DC2>()
     }
 
-    /// Wrap the data in a lazy decoder (SPEC 00 row 50).
+    /// Wrap the data in a lazy decoder.
     #[must_use]
     pub fn lazily_decode_data(&self) -> Database<KC, LazyDecode<DC>, C> {
         self.remap_types::<KC, LazyDecode<DC>>()
@@ -817,7 +812,7 @@ where
 // DatabaseOpenOptions
 // ---------------------------------------------------------------------------
 
-/// The typed database open-options builder (SPEC 00 row 12).
+/// The typed database open-options builder.
 pub struct DatabaseOpenOptions<'e, 'n, T, KC, DC, C = DefaultComparator, CDUP = DefaultComparator> {
     env: &'e Env<T>,
     name: Option<&'n str>,
@@ -887,7 +882,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
 }
 
 /// Convert a heed `&str` name to ZeroDB bytes, re-imposing the fork's C-string
-/// rule (see docs/DIVERGENCES.md). heed builds the dbi name with
+/// rule (see docs/LMDB-COMPATIBILITY.md). heed builds the dbi name with
 /// `CString::new(name).unwrap()`, so an embedded NUL **panics** — that is the
 /// fork's observable behavior (probed against heed =0.22.1's `raw_open_dbi`),
 /// which we reproduce exactly rather than inventing a clean error. No consumer
@@ -904,18 +899,22 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
     fn check_flags(&self) -> Result<()> {
         // No consumer passes any DatabaseFlags; DUPSORT/INTEGER_KEY/etc. are
         // unsupported. Reject a non-empty value cleanly rather than silently
-        // ignoring it (documented in docs/DIVERGENCES.md).
+        // ignoring it (documented in docs/LMDB-COMPATIBILITY.md).
         if !self.flags.is_empty() {
             return Err(Error::Mdb(MdbError::Incompatible));
         }
         Ok(())
     }
 
-    /// Open an existing database (SPEC 00 rows 10/12).
+    /// Open an existing database.
     ///
     /// # Errors
     ///
-    /// `Mdb`(`BadValSize`/`Incompatible`); `Io` on an embedded-NUL name.
+    /// `Mdb`(`BadValSize`/`Incompatible`) on a bad or colliding name.
+    ///
+    /// # Panics
+    ///
+    /// On a name with an embedded NUL byte, as heed does.
     #[cfg(not(feature = "unique-txns"))]
     pub fn open(&self, rtxn: &RoTxn) -> Result<Option<Database<KC, DC, C, CDUP>>>
     where
@@ -931,7 +930,11 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
     ///
     /// # Errors
     ///
-    /// `Mdb`(`BadValSize`/`Incompatible`); `Io` on an embedded-NUL name.
+    /// `Mdb`(`BadValSize`/`Incompatible`) on a bad or colliding name.
+    ///
+    /// # Panics
+    ///
+    /// On a name with an embedded NUL byte, as heed does.
     #[cfg(feature = "unique-txns")]
     pub fn open<U>(&self, rtxn: &U) -> Result<Option<Database<KC, DC, C, CDUP>>>
     where
@@ -959,7 +962,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         Ok(res.map(|db| Database::new(db, page_size, z.ident())))
     }
 
-    /// Create the database if absent (SPEC 00 rows 11/12).
+    /// Create the database if absent.
     ///
     /// # Errors
     ///
@@ -1072,7 +1075,3 @@ fn custom_comparator<C: Comparator + 'static>() -> Option<Box<dyn zerodb::Compar
         Some(Box::new(HeedComparator::<C>(PhantomData)))
     }
 }
-
-// A tiny use so `WithTls` import isn't flagged when default T is inferred.
-#[allow(dead_code)]
-fn _tls_marker(_: PhantomData<WithTls>) {}

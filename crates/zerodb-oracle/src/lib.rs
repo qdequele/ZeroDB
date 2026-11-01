@@ -7,10 +7,8 @@
 //! * The reference engine is [`LmdbEngine`], backed by `heed =0.22.1` — the
 //!   Meilisearch LMDB fork (`mdb.master.nested-rtxns`), the exact C Meilisearch
 //!   runs. See ADR-0001.
-//! * The native [`ZerodbEngine`] is the second [`Engine`] implementor. Any op an
-//!   engine does not implement is gated out symmetrically by the driver
-//!   ([`Engine::implements`]), so a `run::<LmdbEngine, ZerodbEngine>` differential
-//!   run restricts itself to the ops both engines support.
+//! * [`ZerodbEngine`] drives the native ZeroDB API and [`HeedZerodbEngine`]
+//!   drives ZeroDB through the `heed-zerodb` adapter.
 //! * [`run_self_test`] (`LmdbEngine` vs a second, independent `LmdbEngine`) is the
 //!   harness's determinism/order-stability check.
 //!
@@ -30,11 +28,12 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod child;
 pub mod crash;
 pub mod driver;
 mod engine;
-mod heed_zerodb_engine;
-mod lmdb;
+pub mod ffi_lmdb;
+mod heed_engine;
 mod op;
 mod result;
 pub mod tempdir;
@@ -42,8 +41,7 @@ mod zerodb_engine;
 
 pub use driver::{classify, TxnState};
 pub use engine::Engine;
-pub use heed_zerodb_engine::HeedZerodbEngine;
-pub use lmdb::LmdbEngine;
+pub use heed_engine::{HeedZerodbEngine, LmdbEngine};
 pub use op::{walk_value, DbName, Key, Op, PutFlag, Value};
 pub use result::{OpResult, OracleError, Skip};
 pub use zerodb_engine::ZerodbEngine;
@@ -109,18 +107,34 @@ impl EngineMode {
 
 /// Base map size for the differential engines: 64 MiB. Large enough that no
 /// 64-op sequence of `≤ 64 KiB` values (see [`Value`]) can exceed it, so the
-/// reference LMDB env never returns `MdbError::MapFull` — a boundary the
-/// rebuild-on-commit [`ZerodbEngine`] does not model (its shadow is in-memory).
+/// reference LMDB env never returns `MdbError::MapFull`: the exact op at which
+/// a map fills depends on each engine's page allocation, so it is kept out of
+/// the comparison.
 pub const DIFF_MAP_SIZE: usize = 64 << 20;
 
 /// Round a map size up to a 64 KiB multiple — a multiple of every target OS
 /// page size (4 / 16 / 64 KiB), so heed never rejects it for not being an
-/// OS-page multiple (the `map_size` entry in docs/DIVERGENCES.md) and both
+/// OS-page multiple (the `map_size` entry in docs/LMDB-COMPATIBILITY.md) and both
 /// engines agree on the effective size after an [`Op::Reopen`].
 #[must_use]
 pub fn round_map_size(size: usize) -> usize {
     let q = 64 * 1024;
     size.div_ceil(q) * q
+}
+
+/// The OS page size, clamped to ZeroDB's supported `[4096, 65536]`
+/// power-of-two range. LMDB is locked to the OS page size and exposes no
+/// selector, so a comparison that depends on page geometry pins ZeroDB to
+/// this value.
+#[must_use]
+pub fn os_page_size() -> u32 {
+    // SAFETY: `sysconf(_SC_PAGESIZE)` is a pure query with no preconditions
+    // and no side effects.
+    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    match u32::try_from(v) {
+        Ok(p) if (4096..=65536).contains(&p) && p.is_power_of_two() => p,
+        _ => 4096,
+    }
 }
 
 /// A point where two engines produced different results for the same op.
@@ -168,6 +182,19 @@ pub fn run<A: Engine, B: Engine>(ops: &[Op]) -> Result<(), Box<Divergence>> {
     run_in_mode::<A, B>(ops, EngineMode::DEFAULT)
 }
 
+/// Run `ops` against [`LmdbEngine`] and a fresh `E`, panicking with the first
+/// [`Divergence`] if any. The usual assertion of a differential test.
+///
+/// # Panics
+///
+/// On the first op where the two engines disagree.
+#[track_caller]
+pub fn assert_matches_lmdb<E: Engine>(ops: impl AsRef<[Op]>) {
+    if let Err(d) = run::<LmdbEngine, E>(ops.as_ref()) {
+        panic!("{} diverged from LMDB:\n{d}", std::any::type_name::<E>());
+    }
+}
+
 /// Run `ops` against two fresh engines **opened in `mode`**: both
 /// engines get the identical `WRITE_MAP` / durability flag combination, so a
 /// differential run exercises the second write mode at parity. Returns the first
@@ -186,13 +213,6 @@ pub fn run_in_mode<A: Engine, B: Engine>(
     let mut b = B::new_in_mode(mode);
     let size_tripwire = !mode.write_map;
     for (index, op) in ops.iter().enumerate() {
-        // Symmetric implementation gate: if either engine does not yet implement this
-        // op, skip it on both sides so a partially-built engine restricts the
-        // differential to its supported ops without spurious divergences
-        // (see `Engine::implements`). Neither engine's state advances.
-        if !a.implements(op) || !b.implements(op) {
-            continue;
-        }
         let ra = a.apply(op);
         let rb = b.apply(op);
         if ra != rb {
@@ -205,23 +225,20 @@ pub fn run_in_mode<A: Engine, B: Engine>(
                 b: rb,
             }));
         }
-        // GC file-size tripwire (ADR-0005 D5): after every commit, the second
+        // GC file-size tripwire (ADR-0005): after every commit, the second
         // engine's on-disk size must stay within `BASE + 1.5x` of the
-        // reference's — a cheap unbounded-GC-growth detector on every fuzz case
-        // / proptest sequence. `BASE` = 16 pages (16 x 4096 = 64 KiB). With the
-        // SPEC 03 §6.4 end-of-page insert-point rule (matching the fork's
-        // `mdb_page_split`), small DBs at matched page size are byte-identical,
-        // so BASE is only a margin for GC-21 within-PIL-only overflow-
-        // fragmentation transients in fuzz overflow sequences; a real leak grows
-        // without bound and clears the band within a few commits. Measurements:
-        // ADR-0005 D5 addendum.
+        // reference's, a cheap unbounded-GC-growth detector on every fuzz case
+        // and proptest sequence. Small databases at a matched page size are
+        // byte-identical (SPEC 03 §6.4 insert-point rule), so `BASE` is only a
+        // margin for transient overflow-run fragmentation (GC-21); a real leak
+        // grows without bound and clears the band within a few commits.
         if size_tripwire && matches!(op, Op::Commit) {
             if let (Some(sa), Some(sb)) = (a.real_disk_size(), b.real_disk_size()) {
                 const BASE: u64 = 16 * 4096;
                 assert!(
                     sb <= BASE + sa.saturating_mul(3) / 2,
                     "file-size tripwire at op #{index}: {} = {sb} bytes vs {} = {sa} bytes \
-                     (band BASE=288KiB + 1.5x, ADR-0005 D5)",
+                     (band BASE=64KiB + 1.5x, ADR-0005)",
                     b.name(),
                     a.name(),
                 );

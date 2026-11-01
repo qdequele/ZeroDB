@@ -1,6 +1,6 @@
 # ADR-0024: Database handle lifetime (stale handles after abort and remove)
 
-- Status: Approved (Option A), maintainer, 2026-10-17
+- Status: Approved (Option A), maintainer, 2026-10-17; implemented
 - Related issue: #73 (divergence D-013)
 - Date: 2026-10-17
 
@@ -26,7 +26,7 @@ data that should not exist.
 ### What LMDB does, and what ZeroDB does today
 
 Observed through heed 0.22.1 on both engines, 20 cases,
-`crates/zerodb-oracle/tests/lmdb_dbi_handle_observation.rs` (LMDB pinned,
+`crates/zerodb-oracle/tests/lmdb_observations/lmdb_dbi_handle_observation.rs` (LMDB pinned,
 macOS aarch64, 2026-10-17). "a" and "b" are named databases, `k` a key.
 
 | Case | LMDB | ZeroDB today |

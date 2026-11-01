@@ -5,8 +5,7 @@
   ADR-0029 and renumbered on 2026-10-20, when the branch was rebased on
   `main`, where 0029 is the free-page run search.
 - Related: #117 (the slicing-by-8 table, the software path on `main`);
-  reports `benches/results/2026-10-19-meta-crc-slicing.md`,
-  `-hardware.md` and `-graviton.md`; ADR-0002 §D1; ADR-0022.
+  the 2026-10-19 benchmark runs (slicing table, hardware CRC, Graviton4); ADR-0002 §D1; ADR-0022.
 - Date: 2026-10-19
 
 ## Context
@@ -208,12 +207,12 @@ If Option B is approved:
 the slicing-by-16 variant (pre-rebase commit `b2f5b6c`) and measured there:
 on the Mac, 16 KiB CRC 5.66 → 1.99 µs, single-delete commit 16.71 →
 14.64 µs (LMDB 6.62), crud-bench deletes 0.82× → 0.93× LMDB; on Graviton4
-(`benches/results/2026-10-19-meta-crc-graviton.md`), 16 KiB CRC 5.66 →
+(the 2026-10-19 "meta crc graviton" run), 16 KiB CRC 5.66 →
 0.75 µs, single-delete commit 0.91× (4 KiB pages) and 0.83× (16 KiB) of the
 slicing-by-16 one.
 
 Rebased build against `main`, Mac, busy host (load 15–22; absolute numbers
-inflated, see `benches/results/2026-10-19-meta-crc-hardware.md`): 16 KiB
+inflated, see the 2026-10-19 "meta crc hardware" run): 16 KiB
 CRC 10.53 → 2.44 µs; single-delete commit 21.96 → 17.19 µs, paired
 0.68–0.80 over 7 runs. A 3-round criterion run at load 14 was invalid (LMDB
 drift up to 16 %); `del/random/n1` read 0.772 (±0.288). Not rerun on
@@ -225,7 +224,7 @@ Graviton.
    B)?~~ Approved, 2026-10-19.
 2. ~~Include x86-64 now (Option C)?~~ No: aarch64 only, 2026-10-19.
 3. ~~Is a Mac A/B enough to merge, or should it wait for a Graviton run?~~
-   Graviton4 run done, 2026-10-19 (`benches/results/2026-10-19-meta-crc-graviton.md`):
+   Graviton4 run done, 2026-10-19 (the 2026-10-19 "meta crc graviton" run):
    run-time detection takes the hardware path on Linux aarch64, where the
    feature is off at compile time; CRC of 16 KiB 5.66 → 0.75 µs; the hardware
    step alone makes a single-delete commit 0.91× (4 KiB pages) and 0.83×

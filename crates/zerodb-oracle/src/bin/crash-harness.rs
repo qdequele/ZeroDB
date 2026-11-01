@@ -1,4 +1,4 @@
-//! The crash-consistency harness binary (ADR-0008 D3; SPEC 06 §5).
+//! The crash-consistency harness binary (ADR-0008; SPEC 06 §5).
 //!
 //! ```text
 //! crash-harness [--cycles N] [--seed S] [--mechanism image|sigkill|both|mp]
@@ -7,19 +7,19 @@
 //!               [--repro image:SEED|sigkill:SEED|mp:SEED] [--keep-going] [--isolate]
 //! ```
 //!
-//! One **cycle** = one recovered-and-verified crash state (ADR-0008 OQ1).
+//! One **cycle** = one recovered-and-verified crash state (ADR-0008).
 //! `--mechanism both` (default) targets ≈80% image / 20% SIGKILL **by cycle**
 //! (one image cut ≈ `--variants` cycles, one SIGKILL cut = 1, hence a 1:3
 //! image:sigkill cut pattern); a full 10k run must land ≥1k verified SIGKILL
-//! cycles (ADR-0008 OQ6) — checked at the end of full-sized runs.
+//! cycles (ADR-0008) — checked at the end of full-sized runs.
 //!
 //! Exit status: nonzero iff a violation (or an unmet SIGKILL floor on a
 //! ≥10k run) occurred. On a violation the seed, mode, cut, and repro
 //! artifacts (image + fault plan + op stream) land under
 //! `target/crash-repro/`, and `--repro <mech>:<seed>` replays that cycle.
 //!
-//! Hidden child mode (mechanism B): `crash-harness --crash-child <seed>
-//! <dir> <kill>` — see `crash::sigkill`. Multi-process mechanism (`--mechanism
+//! Hidden child mode (mechanism B):
+//! `crash-harness --crash-child <seed> <dir> <kill>` — see `crash::sigkill`. Multi-process mechanism (`--mechanism
 //! mp`, opt-in, never part of `both`): the lock-file writer child
 //! `--crash-child-lock <seed> <dir> <kill>` and the reader child
 //! `--crash-reader <dir> <page_size> <map_size> <seed>` — see `crash::multiproc`.
@@ -55,7 +55,7 @@ struct Args {
     keep_going: bool,
     isolate: bool,
     repro: Option<(Mechanism, u64)>,
-    /// Restrict cycles to one durability mode (ADR-0008 D3 `--modes`): cut
+    /// Restrict cycles to one durability mode (ADR-0008 `--modes`): cut
     /// seeds whose derived spec is another mode are skipped (rejection
     /// sampling keeps seed→spec derivation pure). `None` = all modes.
     modes: Option<Mode>,
@@ -160,7 +160,7 @@ struct Totals {
     adv_walk_clean: u64,
     stale_fallback: u64,
     sigkill_spilled: u64,
-    /// In-map dirty regions journaled by WRITE_MAP image cuts (ADR-0021 B3:
+    /// In-map dirty regions journaled by WRITE_MAP image cuts (ADR-0021:
     /// proof the in-place realization was exercised, not the heap path).
     map_regions: u64,
     by_mode: std::collections::BTreeMap<&'static str, u64>,
@@ -311,11 +311,11 @@ fn main() {
                         }
                     }
                     // ≈80/20 image/SIGKILL split **by counted cycle** (the
-                    // ADR-0008 OQ1 unit): one image cut yields ~`--variants`
+                    // unit ADR-0008 counts in): one image cut yields ~`--variants`
                     // (12) cycles, one SIGKILL cut yields 1, so a 1:3
                     // image:sigkill cut pattern lands 12:3 = 80/20 by cycles
                     // and comfortably clears the ≥1k SIGKILL floor on a 10k
-                    // run (ADR-0008 OQ6). Deterministic in the cut index so a
+                    // run (ADR-0008). Deterministic in the cut index so a
                     // run's mechanism assignment is `--jobs`-independent.
                     let mech = match args.mechanism {
                         Mechanism::Image => Mechanism::Image,
@@ -378,7 +378,7 @@ fn main() {
          adversarial     : {} probes — {} opened, {} designed-Invalid, {} walk-clean (characterization, not gated)\n\
          stale fallbacks : {} (NO_META_SYNC reclaim-clobber window, REC-10 as amended — walk/data waived)\n\
          spilling txns   : {} image, {} sigkill + mp (ADR-0017 spill cycles)\n\
-         in-place regions: {} (ADR-0021 B3 — brokered map regions journaled by WRITE_MAP image cuts)\n\
+         in-place regions: {} (ADR-0021: brokered map regions journaled by WRITE_MAP image cuts)\n\
          wall time       : {:.1}s ({:.1} cycles/s)",
         t.verified,
         t.image_cuts,
@@ -412,11 +412,11 @@ fn main() {
             args.seed
         );
     }
-    // ADR-0008 OQ6: a full-sized run must include ≥1k SIGKILL cycles.
+    // ADR-0008: a full-sized run must include ≥1k SIGKILL cycles.
     if args.cycles >= 10_000 && args.mechanism == Mechanism::Both && t.sigkill_verified < 1_000 {
         failed = true;
         eprintln!(
-            "\nSIGKILL floor unmet: {} < 1000 verified sigkill cycles on a full run (ADR-0008 OQ6)",
+            "\nSIGKILL floor unmet: {} < 1000 verified sigkill cycles on a full run (ADR-0008)",
             t.sigkill_verified
         );
     }
@@ -426,7 +426,7 @@ fn main() {
 }
 
 /// `--isolate`: run one image cut in a child process (contamination triage,
-/// ADR-0008 D6.2). The child is this binary in `--repro image:<seed>` mode;
+/// ADR-0008). The child is this binary in `--repro image:<seed>` mode;
 /// its exit status carries the verdict, its stdout the count.
 fn run_isolated_image_cut(exe: &std::path::Path, seed: u64, opts: &ImageOpts) -> CutReport {
     let out = std::process::Command::new(exe)

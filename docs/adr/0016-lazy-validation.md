@@ -146,8 +146,7 @@ to track `num_keys / log2(num_keys)` per page; (2) restructuring
 +6 %: the descent sits at LLVM's inlining threshold (PERF-GAP B13), and any
 new arm moves it. Only very large trees (pages seen once) gain clearly.
 
-Parked: not adopted in this form. Patch kept at
-`research/next-adr16-lazy-point-lookups.patch` (benches-server). If resumed:
+Parked: not adopted in this form. The patch was not published. If resumed:
 a per-page check budget (promote once the lazy checks spent reach the page's
 `num_keys`), a single-check `LazyLeaf::find`, and a hot path left
 byte-identical (the lazy step entered only on a memo miss, through a path

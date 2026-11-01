@@ -4,7 +4,7 @@
 //! introspection, so there is no through-heed path to drive C LMDB's
 //! `mdb_reader_list`. The quantities that *are* cross-engine comparable —
 //! `max_readers` and the `me_numreaders` high-water mark — are covered by
-//! `zerodb-oracle/tests/env_info_differential.rs`.
+//! `zerodb-oracle/tests/differential/env_info_differential.rs`.
 //!
 //! What is pinned here is ZeroDB's own contract, cross-checked against the
 //! reader-table facts `Env::info()` already exposes (`live_readers`, `num_readers`)
@@ -12,42 +12,15 @@
 //! default options, so they run with a lock file (ADR-0023), within one
 //! process: every reader is alive, so `clear_stale_readers` frees nothing.
 //! Reaping the slots of dead processes, and the PID column, are covered by
-//! `multi_process.rs` and `zerodb-oracle/tests/multi_process_differential.rs`.
+//! `multi_process.rs` and `zerodb-oracle/tests/multi_process/multi_process_differential.rs`.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::TempDir;
+
+use std::path::Path;
 use std::sync::{Arc, Barrier};
 
 use zerodb::{Env, EnvOpenOptions};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("zerodb-rdrlist-{pid}-{nanos}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 fn open(dir: &Path, max_readers: u32) -> Env {
     let mut opts = EnvOpenOptions::new();

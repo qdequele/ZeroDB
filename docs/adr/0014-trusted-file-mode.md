@@ -185,7 +185,7 @@ opt in. It can be done before or after A.
   PERF-GAP section D is amended to "removing validation is not on the table
   **by default**; ADR-0014 adds an opt-in"; DIVERGENCES gains an entry
   describing the option as a ZeroDB extension (LMDB has no validating mode to
-  diverge from; default behaviour is unchanged); CLAUDE.md's unsafe policy
+  diverge from; default behaviour is unchanged); the unsafe policy
   needs no new module but the SAFETY-contract wording changes.
 - **Bench plan (both codegen settings, bench server, then Graviton):**
   three columns, LMDB | ZeroDB validating | ZeroDB trusted, on the read ladder
@@ -305,4 +305,4 @@ lost 4–5 % on hot reads.
 What stays checked is unchanged: every trusted leaf view still runs the O(1)
 header checks; it simply runs them on every first view of the leaf in a
 cursor step instead of once per txn. The measurements are in
-`benches/results/2026-10-19-crud-scan-count-and-batch-delete.md`.
+the 2026-10-19 "crud scan count and batch delete" run.

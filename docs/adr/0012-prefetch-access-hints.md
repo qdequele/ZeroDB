@@ -8,8 +8,8 @@
 
 Milestone 3.7 exposes memory-access hints (madvise-family) so consumers can tell
 the kernel which mmap pages they are about to touch. Unlike 3.4 (parked this same
-day because its stated milli consumer turned out to be legacy — see PLAN §3.4 and
-PROGRESS 2026-07-20), 3.7 has a **verified live consumer** whose hack we can read
+day because its stated milli consumer turned out to be legacy — see the original project plan and
+the engineering log, 2026-07-20, 3.7 has a **verified live consumer** whose hack we can read
 line-by-line.
 
 **The consumer, exactly.** hannoy `Reader::prefetch_graph`
@@ -43,7 +43,7 @@ also what keeps the change small (rule 7): a single value→pages→WillNeed cal
   (the explicit remit of Phase 2/3). A heed-API consumer like hannoy must be able
   to reach it without forking heed and must still compile against upstream heed.
   This is a public-API-shape decision → ADR-gated (rule 6).
-- *reads stay mmap* (PLAN §3.5/§3.7). Hints apply to the read mmap and are valid
+- *reads stay mmap* (original project plan). Hints apply to the read mmap and are valid
   in WRITE_MAP mode too (WillNeed only faults pages in; it never mutates).
 - *no new dependency.* `memmap2` (already on the allowlist) exposes safe
   `Mmap::advise_range(Advice, offset, len)` / `MmapMut::advise_range`. That
@@ -106,7 +106,7 @@ Advise a contiguous **key range** with `WillNeed | Sequential | Random`.
 
 - Pro: fits *scan-shaped* consumers — cursor iteration, `copy_to_file`
   compaction, `zerodb-tools dump` — where `Sequential` readahead is the right
-  hint. This is the `txn.advise(range, …)` half of PLAN §3.7.
+  hint. This is the `txn.advise(range, …)` half of the original project plan
 - Cons: **does not fit hannoy.** hannoy's access is graph-scattered, not a key
   range; `advise(range)` cannot express it. Different consumer, different shape.
 - Verdict: real, but a *separate* consumer with no in-hand caller today. Stage it
@@ -133,7 +133,7 @@ forking heed. (Alternative considered: a cfg-gated inherent method on the adapte
 `RoTxn`; rejected because a trait composes better with hannoy's dual-backend
 build and documents "this is beyond heed" at the call site.)
 
-**Receiver.** `RoTxn`, matching PLAN's `txn.advise` phrasing and hannoy's
+**Receiver.** `RoTxn`, matching the original plan's `txn.advise` phrasing and hannoy's
 call-during-read ergonomics, even though the hint is snapshot-independent (the
 map is env-wide). An `Env`-level twin can be added if a non-txn caller appears.
 
@@ -164,7 +164,7 @@ Tests / invariants:
   — same key/cursor results with and without the call (parity must not move).
 - A unit test that `will_need` on an out-of-map slice is a benign no-op/err (no
   UB, no panic) and that an in-map value advises `len`-covering pages.
-- Bench (required by CLAUDE.md for the perf claim): hannoy cold-cache search
+- Bench (required by AGENTS.md for the perf claim): hannoy cold-cache search
   latency with vs without `will_need`, on linux-aarch64 + EBS gp3 (drop caches
   between runs). No claim ships without the criterion/latency diff pasted in the
   summary.

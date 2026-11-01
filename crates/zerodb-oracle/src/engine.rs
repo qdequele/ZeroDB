@@ -36,20 +36,9 @@ pub trait Engine {
     /// Apply one operation and return its normalized result.
     fn apply(&mut self, op: &Op) -> OpResult;
 
-    /// Whether this engine implements `op` at its current stage of development.
-    ///
-    /// The default is `true` (the LMDB reference implements the whole SPEC 00
-    /// surface). A partially-built engine overrides this to return `false` for
-    /// ops it does not execute. [`crate::run`] gates on **both** engines
-    /// implementing an op, so a differential run is symmetrically restricted to
-    /// the ops both sides support, without spurious divergences.
-    fn implements(&self, _op: &Op) -> bool {
-        true
-    }
-
     /// The engine's actual on-disk data-file size, if it can report one.
     ///
-    /// Feeds the GC file-size tripwire in [`crate::run`] (ADR-0005 D5): after
+    /// Feeds the GC file-size tripwire in [`crate::run`] (ADR-0005): after
     /// every committed op, the native engine's file must stay within a fixed
     /// band of the reference's, catching unbounded GC growth on every fuzz
     /// case. Default `None` (no check).

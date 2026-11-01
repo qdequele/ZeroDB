@@ -2,8 +2,7 @@
 """Append-only ledger of performance attempts: kept, reverted and abandoned.
 
 The ledger exists so that a disproved idea is never re-tried by the next
-session. BENCH-MAP records two blind picks the July 2026 campaign disproved; this
-file is where the next ones go. One JSON object per line in
+session; every lever tried, kept or reverted, goes here. One JSON object per line in
 `benches/results/perf-ledger.jsonl`, committed with the change or with the revert.
 
     scripts/perf-ledger.py show [--rung REGEX] [--last N]

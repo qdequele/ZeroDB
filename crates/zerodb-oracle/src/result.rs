@@ -53,15 +53,10 @@ pub enum Skip {
     /// with a write txn that has dropped-and-reused that dbi number trips an
     /// LMDB dbi-reuse hazard (`EINVAL` from `mdb_get` on the reused slot) that
     /// no consumer exercises — zerodb returns the correct MVCC answer (absent →
-    /// `None`). See the dropped-and-reused dbi entry in docs/DIVERGENCES.md.
+    /// `None`). See the dropped-and-reused dbi entry in docs/LMDB-COMPATIBILITY.md.
     /// Concurrent reader-vs-writer isolation is exercised properly through the
     /// reader table.
     VerifyDuringWrite,
-    /// The op is not yet implemented by one of the engines, so
-    /// [`crate::run`] skips it symmetrically on both sides (see
-    /// [`crate::Engine::implements`]). A differential run restricts itself to the
-    /// ops both engines support.
-    NotImplemented,
     /// The op combination is skipped because it crashes the *reference* engine —
     /// a confirmed bug in the vendored LMDB fork, not an observable behavior an
     /// oracle can assert. See `docs/UPSTREAM-BUGS.md` FORK-1 (SEGV in

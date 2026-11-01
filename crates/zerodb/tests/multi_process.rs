@@ -1,43 +1,15 @@
 //! Two-process tests for lock-file environments (ADR-0023 stage 1). The test
 //! binary re-runs itself as the second process (see `child_entry`).
 
+mod common;
+use common::TempDir;
+
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use zerodb::{Env, EnvOpenOptions, Error, MdbError};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// A self-cleaning temporary directory (no `tempfile` dependency).
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("zerodb-mp-{pid}-{nanos}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 const ROLE: &str = "ZERODB_MP_ROLE";
 const DIR: &str = "ZERODB_MP_DIR";
@@ -146,7 +118,7 @@ fn child_entry() {
         return;
     };
     let dir = PathBuf::from(dir);
-    // The WRITE_MAP roles open their own env (ADR-0023 amendment 15).
+    // The WRITE_MAP roles open their own env (ADR-0023).
     match role.as_str() {
         "wm_resizer" => return wm_resizer(&dir),
         "wm_writer" => return wm_writer(&dir),
@@ -315,7 +287,7 @@ fn commit_in_one_process_is_visible_in_another() {
 /// (ADR-0023 §4), so another process's commit is visible without this
 /// process opening a read txn of its own. Pinned by the LMDB observation
 /// `OBS_INFO_SEES_OTHER_COMMIT`/`OBS_STAT_SEES_OTHER_COMMIT`
-/// (`crates/zerodb-oracle/tests/lmdb_stage3_observation.rs`), both `true`.
+/// (`crates/zerodb-oracle/tests/multi_process/lmdb_stage3_observation.rs`), both `true`.
 #[test]
 fn info_and_stat_see_another_processes_commit() {
     let dir = TempDir::new();
@@ -509,7 +481,7 @@ fn killed_writer_lock_is_taken_over() {
 /// A joiner that asks for another `max_readers` than the running
 /// environment's adopts the lock file's reader count, in both directions, as
 /// LMDB does (`OBS_JOINER_FEWER_MAXREADERS`, `OBS_JOINER_MORE_MAXREADERS`;
-/// ADR-0023 §1 as amended).
+/// ADR-0023 §1).
 #[test]
 fn second_process_with_other_max_readers_adopts_the_lock_files() {
     let dir = TempDir::new();
@@ -730,7 +702,7 @@ fn writer_takeover_reaps_a_dead_readers_slot() {
 }
 
 /// A process whose map is smaller than the data another process committed
-/// gets `MapResized` at both begins (ADR-0023 amendment 15;
+/// gets `MapResized` at both begins (ADR-0023;
 /// `OBS_READ_BEGIN_SMALL_MAP`, `OBS_WRITE_BEGIN_SMALL_MAP`). The failed write
 /// begin releases both writer locks: another process can still write.
 #[test]
@@ -803,7 +775,7 @@ fn smaller_map_process_commit_keeps_the_larger_meta_size() {
 
 /// After another process grew the environment past this process's map,
 /// `resize(0)` adopts the persisted map size and the next read sees the
-/// other process's data (ADR-0023 amendment 15; `OBS_SET_MAPSIZE_ZERO_ADOPTS`).
+/// other process's data (ADR-0023; `OBS_SET_MAPSIZE_ZERO_ADOPTS`).
 #[test]
 fn resize_zero_adopts_the_grown_map_and_reads_succeed() {
     let dir = TempDir::new();
@@ -912,7 +884,7 @@ fn wm_writer(dir: &Path) {
 /// Two `WRITE_MAP` processes, one growing the map and one writing on a
 /// smaller map: the data file never shrinks, and neither process dies (a
 /// shrink under another process's mapping is a `SIGBUS`). The file grows
-/// only under both writer locks (ADR-0023 amendment 15, decision 4).
+/// only under both writer locks (ADR-0023).
 #[test]
 fn write_map_processes_never_shrink_the_file() {
     let dir = TempDir::new();
@@ -989,7 +961,7 @@ fn hold_b_db(dir: &Path) {
 
 /// Two processes hold envs with different data names in one directory at the
 /// same time. Each derives its own lock file (`a.db-lock`, `b.db-lock`,
-/// ADR-0023 amendment 16), so they do not share a reader table or writer
+/// ADR-0023), so they do not share a reader table or writer
 /// lock, and each commits and reads its own data.
 #[test]
 fn two_processes_with_different_data_names_use_different_lock_files() {
@@ -1048,7 +1020,7 @@ fn prev_snapshot_open_fails_while_another_process_has_the_env() {
     assert!(env.opened_exclusively());
 }
 
-/// ADR-0023 amendment 18: `Env::opened_exclusively` is `true` for the
+/// ADR-0023: `Env::opened_exclusively` is `true` for the
 /// process that opens the environment alone and `false` for one that joins
 /// another, and `ExclusiveLock::acquire` succeeds only when no other process
 /// has the environment open, never waiting for one.
@@ -1118,7 +1090,7 @@ fn exclusive_lock_holds_other_openers_in_the_election() {
     );
 }
 
-/// ADR-0023 amendment 17 (`OBS_RDONLY_EXISTING_LOCK = 0`): a `READ_ONLY` open
+/// ADR-0023 (`OBS_RDONLY_EXISTING_LOCK = 0`): a `READ_ONLY` open
 /// while another process holds a write txn joins the existing lock file. It
 /// reads the other process's commit (not its pending write), and its read
 /// txn takes a slot in the shared reader table under this process's PID.
@@ -1270,7 +1242,7 @@ fn read_only_fs(src: &Path) -> Result<ReadOnlyFs, String> {
     Ok(ReadOnlyFs { mount, _keep: keep })
 }
 
-/// ADR-0023 amendment 17 (`OBS_RDONLY_LOCK_READONLY_FS = 0`): on read-only
+/// ADR-0023 (`OBS_RDONLY_LOCK_READONLY_FS = 0`): on read-only
 /// media, where no lock file can be created, a `READ_ONLY` open proceeds
 /// without one and serves read txns. A writable open there still fails with
 /// `EROFS`.

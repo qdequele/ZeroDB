@@ -1,6 +1,7 @@
 # ADR-0033: A standalone benchmark crate comparing ZeroDB with other key-value stores
 
-- Status: Proposed
+- Status: Implemented (`benches/kv-compare`). The maintainer's approval is not
+  recorded.
 - Related issue: —
 - Date: 2026-10-27
 

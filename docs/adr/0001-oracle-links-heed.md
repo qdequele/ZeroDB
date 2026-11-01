@@ -6,7 +6,7 @@
 
 ## Context
 
-Ground rule 1 (CLAUDE.md, PLAN.md §0.3) requires every LMDB behavior question to
+Ground rule 1 (now in CONTRIBUTING.md) requires every LMDB behavior question to
 be answered by a *differential test against the oracle*, never by guessing. The
 oracle is the **Meilisearch LMDB fork** — branch `mdb.master.nested-rtxns`,
 commit `cd767228d31285a73af44f7fb15267e95d1df86f` — as vendored by
@@ -23,7 +23,7 @@ safe API, rather than re-vendoring or hand-binding `lmdb-master-sys`. heed is th
 API surface Phase 1 reproduces, so exercising LMDB through it also matches the
 observable behavior consumers actually see.
 
-CLAUDE.md unsafe/dependency policy: FFI and C linkage are permitted **only inside
+the unsafe/dependency policy: FFI and C linkage are permitted **only inside
 `zerodb-oracle`**. No new dependency may be added elsewhere without an ADR;
 `heed`/`lmdb-master-sys` are C-linking crates and therefore need this decision
 recorded.
@@ -61,7 +61,7 @@ Bind `mdb_*` calls in `zerodb-oracle` without heed.
 Copy the fork's `mdb.c`/`lmdb.h` and build with `cc`.
 
 - Pros: no registry dependency; pin is a git submodule/commit.
-- Cons: transliteration/clean-room hazard (CLAUDE.md rule 4 forbids copying C
+- Cons: transliteration/clean-room hazard (the project rules forbids copying C
   into the engine; vendoring it into a *test* crate is allowed but muddies the
   boundary); we would still hand-bind it (Option B's cons); build-system burden.
   No upside over Option A for a test-only oracle.
@@ -84,12 +84,12 @@ the `fuzz/` crate (outside the workspace) additionally depends on `libfuzzer-sys
 the standard cargo-fuzz runtime the pre-existing justfile presupposes — covered by
 this ADR with the same oracle-only, test-infrastructure-only scope;
 that is a separate, human-approved decision. The oracle routes zerodb through its
-**native** API, never through `heed-zerodb` (PLAN.md §0.3); adapter-level parity
+**native** API, never through `heed-zerodb` (original project plan); adapter-level parity
 is re-verified at the 1.14 gate.
 
 ## Amendment (M1.12, 2026-07-17): `zerodb-tools` may link heed behind `migrate-lmdb`
 
-PLAN.md §1.12 sanctions the `migrate-from-lmdb` tool as "the one place linking C
+The original project plan sanctions the `migrate-from-lmdb` tool as "the one place linking C
 is fine" — it must open a **real** LMDB env read-only and stream it into a fresh
 zerodb env. That requires the same C library this ADR already blesses (heed
 =0.22.1 / lmdb-master-sys 0.2.6, the Meilisearch fork).
@@ -103,7 +103,7 @@ boundary explicit and opt-in, consistent with the oracle-only spirit of the
 original decision: the migrate path is a one-off operational tool, not part of
 the engine.
 
-Ratification: **delegated review under the maintainer's standing directive, 2026-07-17.**
+Ratification: **maintainer, 2026-07-17.**
 
 ## Consequences
 
@@ -123,7 +123,7 @@ Ratification: **delegated review under the maintainer's standing directive, 2026
 ## Open questions for human review
 
 - None blocking. Note for the maintainer: this ADR documents a dependency that
-  PLAN.md §0.3 already mandates ("LMDB implements it via heed 0.22.1 /
+  the original project plan already mandates ("LMDB implements it via heed 0.22.1 /
   lmdb-master-sys 0.2.6"); it is recorded as **Approved** on that basis. If you
   would rather gate it as Draft pending explicit sign-off, say so and I will flip
   the status.

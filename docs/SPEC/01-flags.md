@@ -1,12 +1,7 @@
-# SPEC 01 — LMDB flag & semantics matrix (Phase 0.2 deliverable)
+# SPEC 01 — LMDB flag & semantics matrix
 
-> Revised 2026-10-05: NO_READ_AHEAD landed status, WRITE_MAP in-place note
-> (§S7, ADR-0021), the two parked-2.8a observation pins (§S8, Table 3
-> `MDB_RESERVE`) adopted as spec text.
-
-Status: **DONE** — 2026-07-15. **M1.10 landed addendum** — 2026-07-16 (the
-env write-mode / durability / RDONLY flags implemented; see the *M1.10 landed
-flag matrix* at the end of this file for each flag's landing test).
+The *landed flag matrix* at the end of this file names each implemented flag's
+test.
 
 Source of truth: the **Meilisearch LMDB fork**, branch `mdb.master.nested-rtxns`,
 as vendored by `lmdb-master-sys 0.2.6` inside **heed v0.22.1** (SPEC 00 pinned
@@ -57,7 +52,7 @@ through `EnvOpenOptions::read_txn_with_tls()` / `read_txn_without_tls()`.
 | `MDB_FIXEDMAP` | `0x01` | `EnvFlags::FIXED_MAP` | **WON'T** | — | — | "mmap at a fixed address (**experimental**)" per the header; upstream marks it experimental and it hard-codes a mmap address. No consumer. Rationale: experimental upstream, incompatible with our own-format mmap policy. |
 | `MDB_NOSUBDIR` | `0x4000` | `EnvFlags::NO_SUB_DIR` | **WON'T** | — | — | Store the env as two files `name` / `name-lock` instead of a directory. SPEC 00 row 7: every consumer opens a **directory** env (`data.mdb`/`lock.mdb`), never `NO_SUB_DIR`. zerodb defines its own on-disk layout (D-002); no consumer need. |
 | `MDB_NOSYNC` | `0x10000` | `EnvFlags::NO_SYNC` | **SHOULD** † | 1.10 | `durability_nosync_no_fsync` | Skip both data and meta fsync on commit; durability restored only by `mdb_env_sync`/next non-RDONLY commit. In `mdb_env_sync0` the fsync is elided when `NO_SYNC` set. No consumer passes it, but M1.10 scopes durability-flag parity into Phase 1 (†, §S6). Crash-tested in M1.11. |
-| `MDB_RDONLY` | `0x20000` | `EnvFlags::READ_ONLY` | **SHOULD** | 1.10 | `env_rdonly_rejects_write` | *Env-level* read-only: `mdb_txn_begin` returns `EACCES` for a write txn (`env->me_flags & MDB_RDONLY & ~flags`); `mdb_env_sync0` returns `EACCES`. No consumer opens an RDONLY **env** (they all need `write_txn`). NB: the *txn-level* `MDB_RDONLY` set on every `read_txn()` is a separate, universal MUST covered by SPEC 00 rows 14/16 (M1.3/1.8), not this env bit. |
+| `MDB_RDONLY` | `0x20000` | `EnvFlags::READ_ONLY` | **SHOULD** | 1.10 | `env_rdonly_rejects_write` | *Env-level* read-only: `mdb_txn_begin` returns `EACCES` for a write txn (`env->me_flags & MDB_RDONLY & ~flags`); `mdb_env_sync0` returns `EACCES`. No consumer opens an RDONLY **env** (they all need `write_txn`). NB: the *txn-level* `MDB_RDONLY` set on every `read_txn()` is a separate, universal MUST covered by SPEC 00 rows 14/16, not this env bit. |
 | `MDB_NOMETASYNC` | `0x40000` | `EnvFlags::NO_META_SYNC` | **SHOULD** † | 1.10 | `durability_nometasync` | fsync data pages but skip the meta-page fsync on commit; the meta is flushed on the next sync. `mfd = (flags & (NOSYNC\|NOMETASYNC)) ? me_fd : me_mfd` — routes the meta write to the non-syncing fd. No consumer; M1.10 (†, §S6). Crash-tested in M1.11. |
 | `MDB_WRITEMAP` | `0x80000` | `EnvFlags::WRITE_MAP` | **MUST** | 1.10 | `env_writemap_put_get_parity`, `env_writemap_put_reserved` | SPEC 00 row 8 (Meilisearch `index_map`, gated on experimental writemap). Writes go through a **writable** mmap (`mmap(PROT_WRITE)`), not `malloc`+`pwrite`; dirty bytes live in the map. Interacts with `put_reserved` (returns a pointer into the map) and the SPEC 04 value-borrow contract. Commit flushes with `msync` (`MS_SYNC`, or `MS_ASYNC` under `MAP_ASYNC`) instead of `pwrite`+`fdatasync`, limited to the used prefix `[0, next_pgno)` at C3 and the meta page at C5, as LMDB (ranged since 2026-10-17); a synchronous flush also `fdatasync`s the data fd on every platform (SPEC 06 REC-12). Excludes `NO_MEM_INIT`/readahead paths. Must be spec'd as a second write mode (§S7). |
 | `MDB_MAPASYNC` | `0x100000` | `EnvFlags::MAP_ASYNC` | **SHOULD** † | 1.10 | `durability_mapasync_writemap` | Only meaningful with `WRITE_MAP`: use `MS_ASYNC` instead of `MS_SYNC` for the commit `msync` (`flags = (MAPASYNC && !force) ? MS_ASYNC : MS_SYNC`). A crash can then lose/corrupt the last txns. No consumer; M1.10 (†, §S6). |
@@ -111,7 +106,7 @@ and never appear as a user-visible `PutFlags` bit; `MULTIPLE` is unexposed.
 | `MDB_NOOVERWRITE` | `0x10` | `PutFlags::NO_OVERWRITE` | **SHOULD** ‡ | 1.10 | `flag_no_overwrite_returns_existing` | If the key already exists, **do not overwrite**: LMDB copies the existing value into the caller's `data` (`*data = d2`) and returns `MDB_KEYEXIST` → heed `MdbError::KeyExist`. The returned-existing-value contract is load-bearing (§S2). No consumer passes it, but M1.10 lists it in Phase-1 scope (‡, Mismatches note 2). |
 | `MDB_NODUPDATA` | `0x20` | `PutFlags::NO_DUP_DATA` | **WON'T** (→2.8) | — | — | DUPSORT-only: skip if the key/value pair already exists; on `mdb_cursor_del` removes all dups. No consumer (no DUPSORT DB). D-004. |
 | `MDB_CURRENT` | `0x40` | `Cursor::put_current` (internal) | **MUST** | 1.4 | `cursor_put_current_overwrite`, `cursor_put_current_uninit_einval` | SPEC 00 row 33 (milli/arroy/hannoy/cellulite `put_current`/`put_current_with_options`). Overwrite the value at the current cursor position. Requires the cursor be positioned (`C_INITIALIZED`) else `EINVAL`. The `_with_options` form re-encodes with a different data codec. `unsafe`: no live borrow into the entry may span the call (§S3). |
-| `MDB_RESERVE` | `0x10000` | `Database::put_reserved` (internal) | **MUST** | 1.10 | `put_reserved_writes_into_map`, `put_reserved_overwrite_same_size` | SPEC 00 row 35 (milli word-prefix docids). Allocate space for the value and return a pointer to it (`data->mv_data = METADATA(page)` / `= olddata.mv_data`); the caller fills it in-place, avoiding a temp buffer. ~~Not valid with DUPSORT~~ **observed 2.8a pin: lmdb.h forbids it with DUPSORT but the fork does NOT reject it — the reserved bytes are stored as an ordinary dup value (SPEC 03 §12.1 O5; pinned by `zerodb-oracle/tests/dup_pin_semantics.rs`, adopted as spec text in the 2026-10-05 maintainer-authorized docs pass; the DUPSORT work itself stays parked, D-004)**. Lifetime + `WRITE_MAP` interaction in §S3/§S7. |
+| `MDB_RESERVE` | `0x10000` | `Database::put_reserved` (internal) | **MUST** | 1.10 | `put_reserved_writes_into_map`, `put_reserved_overwrite_same_size` | SPEC 00 row 35 (milli word-prefix docids). Allocate space for the value and return a pointer to it (`data->mv_data = METADATA(page)` / `= olddata.mv_data`); the caller fills it in-place, avoiding a temp buffer. ~~Not valid with DUPSORT~~ **observed 2.8a pin: lmdb.h forbids it with DUPSORT but the fork does NOT reject it — the reserved bytes are stored as an ordinary dup value (SPEC 03 §12.1 O5; pinned by `zerodb-oracle/tests/lmdb_observations/dup_pin_semantics.rs`, adopted as spec text in the 2026-10-05 maintainer-authorized docs pass; the DUPSORT work itself stays parked, D-004)**. Lifetime + `WRITE_MAP` interaction in §S3/§S7. |
 | `MDB_APPEND` | `0x20000` | `PutFlags::APPEND` | **MUST** | 1.10 | `flag_append_out_of_order`, `flag_append_ascending_ok`, `flag_append_equal_key_keyexist` | SPEC 00 rows 32/33 (arroy bulk item append; milli facet bulk via `put_current_with_options`). Fast bulk insert assuming ascending key order: LMDB positions at the **last** key and compares (`md_cmp(key, last)`). If `key > last` → insert at end (no page split). If `key <= last` (**including equal**) → `MDB_KEYEXIST` → heed `KeyExist` → arroy `InvalidItemAppend`. Only the last key is checked, not full order (§S1). |
 | `MDB_APPENDDUP` | `0x40000` | `PutFlags::APPEND_DUP` | **WON'T** (→2.8) | — | — | DUPSORT append of a dup value in sorted order. No consumer (no DUPSORT DB). D-004. |
 | `MDB_MULTIPLE` | `0x80000` | *(unexposed by heed)* | **WON'T** (→2.8) | — | — | DUPFIXED-only bulk-store of many fixed-size dup values in one call; `data[1].mv_size` carries the count. Returns `MDB_INCOMPATIBLE` if the DB is not DUPFIXED. Not exposed by heed; no consumer. D-004. |
@@ -164,7 +159,7 @@ heed user-facing method in the SPEC 00 surface.
 
 ### §S1 — `MDB_APPEND`: last-key compare, not full-order validation
 
-> Confirmed empirically via oracle self-test 2026-07-15 (`tests/flag_semantics.rs`: append tests — out-of-order and equal-to-last both `KeyExist`, empty-db append ok).
+> Confirmed empirically via oracle self-test 2026-07-15 (`tests/differential/flag_semantics.rs`: append tests — out-of-order and equal-to-last both `KeyExist`, empty-db append ok).
 
 `_mdb_cursor_put` with `MDB_APPEND` does **not** perform a normal tree search.
 It calls `mdb_cursor_last`, then `md_cmp(new_key, last_key)`:
@@ -190,7 +185,7 @@ The heed → error path is `MDB_KEYEXIST` → `MdbError::KeyExist` → (arroy)
 
 ### §S2 — `MDB_NOOVERWRITE`: the returned-existing-value contract
 
-> Confirmed empirically via oracle self-test 2026-07-15 (`tests/flag_semantics.rs`: NOOVERWRITE collision returns the existing value).
+> Confirmed empirically via oracle self-test 2026-07-15 (`tests/differential/flag_semantics.rs`: NOOVERWRITE collision returns the existing value).
 
 When the key exists, LMDB does **not** just return an error — it first writes the
 existing value back into the caller's `MDB_val *data` (`*data = d2;`) and *then*
@@ -237,7 +232,7 @@ returns `KeyExist` without exposing the existing bytes is a divergence.
   `BadValSize`.
 
 **Confirmed via oracle self-test 2026-07-15** (`zerodb-oracle`
-`tests/key_bounds.rs`: `max_key_size_is_511_and_map_size_independent`,
+`tests/differential/key_bounds.rs`: `max_key_size_is_511_and_map_size_independent`,
 `key_size_511_boundary_and_empty_key_rejection`), observed directly against the
 fork through heed 0.22.1 on macOS aarch64:
 
@@ -265,13 +260,13 @@ Two caveats on scope:
   `> 511`. For keys in `512..=65535` milli's type-level assumption says "valid"
   while LMDB returns `BadValSize`. Phase 1 zerodb **replicates LMDB exactly: max
   key = 511, empty rejected, `BadValSize` otherwise** — so zerodb does **not**
-  diverge from the oracle here (no `docs/DIVERGENCES.md` entry needed). Whether
+  diverge from the oracle here (no `docs/LMDB-COMPATIBILITY.md#behavior-differences` entry needed). Whether
   to expose a larger key bound as an opt-in is a Phase 3 question, not a Phase 1
   parity gap.
 
 ### §S5 — `MDB_PREVSNAPSHOT` open protocol
 
-> Confirmed empirically via oracle self-test 2026-07-15 (`tests/flag_semantics.rs`: PREV_SNAPSHOT opens older meta; flag auto-clears after first commit).
+> Confirmed empirically via oracle self-test 2026-07-15 (`tests/differential/flag_semantics.rs`: PREV_SNAPSHOT opens older meta; flag auto-clears after first commit).
 
 - Meta selection: `mdb_env_pick_meta` returns
   `metas[(metas[0]->mm_txnid < metas[1]->mm_txnid) ^ (flags & PREVSNAPSHOT)]`.
@@ -322,7 +317,7 @@ Two caveats on scope:
   - A process that joins after the first commit reads the older snapshot,
     and its `Env::info`/`Env::stat` name the newest meta on disk, as LMDB's
     (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`).
-  - Not mirrored, docs/DIVERGENCES.md D-025 (approved): when the opener
+  - Not mirrored, docs/LMDB-COMPATIBILITY.md#behavior-differences D-025 (approved): when the opener
     closes or dies before its first commit, a waiting zerodb process becomes
     the first opener and serves the newest meta, while the fork's waiter
     reads the older meta (or, on macOS after a close, fails with `EINVAL`);
@@ -365,9 +360,8 @@ several other rules:
   per `MAP_ASYNC`) plus, for a synchronous flush, an `fdatasync` of the data fd.
   The commit `msync`s cover only the used prefix and the meta page, as LMDB's
   (SPEC 06 REC-12, ranged since 2026-10-17); `Env::sync` flushes the whole map.
-  *(Revised 2026-10-05: the `fdatasync` was originally scoped to macOS/Windows,
-  where `msync` alone is not a full barrier; `WriteMapBacking::sync` runs it on
-  every platform — a strict superset, SPEC 06 REC-12.)*
+  The `fdatasync` runs on every platform, not only where `msync` alone is not a
+  full barrier (SPEC 06 REC-12).
 - `put_reserved` (§S3) returns a pointer straight into the writable map, so the
   reserved bytes are literally the on-disk bytes; the value-borrow contract
   (SPEC 04) must treat writemap and non-writemap dirty storage uniformly from the
@@ -379,7 +373,7 @@ several other rules:
   to write transactions to disk"; `MAP_ASYNC | WRITE_MAP` is the intended relaxed
   mode. zerodb specs both the heap-buffer writer and the writemap writer as
   two explicit modes (landed M1.10) and proves `put_reserved` parity in each.
-  Since ADR-0021 (PR #88) the `WRITE_MAP` mode is **truly in-place**: a write
+  Since ADR-0021 the `WRITE_MAP` mode is **truly in-place**: a write
   txn's dirty frames are realized in the writable map at allocation/edit time
   rather than in heap frames copied in at commit (SPEC 04 §6.4 TXN-45b;
   `zerodb-io::mmap` brokered slice, `zerodb-core::dirty`).
@@ -387,7 +381,7 @@ several other rules:
   processes hold the env, and also downward: a 2 MiB joiner shrinks an
   8 MiB file under the holder's 8 MiB mapping
   (`OBS_WRITE_MAP_JOINER_LARGER_MAP`, `OBS_WRITE_MAP_JOINER_SMALLER_MAP`,
-  observed on macOS; docs/DIVERGENCES.md D-024). ZeroDB does so only
+  observed on macOS; docs/LMDB-COMPATIBILITY.md#behavior-differences D-024). ZeroDB does so only
   when the process is alone (no lock file, or the lock file's initializer);
   otherwise the file grows only under both writer locks, in `Env::resize` and
   at a write-txn begin, and never shrinks, so no process's mapping loses its
@@ -423,7 +417,7 @@ Order of checks, each with its exact code, for zerodb's M1.6 catalog to match:
    directly in the vendored `mdb.c`. For the main DB (`name == NULL`),
    requested persistent flags are **OR'd into** the main record and persist
    on commit. See SPEC 03 §12.1 O8/O9 and
-   `zerodb-oracle/tests/dup_pin_semantics.rs::pin_flags_persistence_open_mismatch`.
+   `zerodb-oracle/tests/lmdb_observations/dup_pin_semantics.rs::pin_flags_persistence_open_mismatch`.
 
 Since Phase 1 rejects all persistent DB flags (D-004), checks 4/5/8's
 dup/integer branches are dormant, but the `CREATE`/`NOTFOUND`/`EACCES`/`DBS_FULL`/
@@ -505,24 +499,24 @@ from its MUST table):
 
 ## M1.10 landed flag matrix (write flags and modes)
 
-**Landed 2026-07-16** (M1.10). Every write-mode / durability / RDONLY flag
+**Landed 2026-07-16**. Every write-mode / durability / RDONLY flag
 in Phase-1 scope, its landing test, and where it lives. The put-flag rows
 (`APPEND` / `NO_OVERWRITE` / `CURRENT` / `RESERVE`) landed earlier in M1.4/M1.6;
 they are re-listed here for a single flag-matrix view (M1.10 acceptance).
 
 | Flag | Table | Behavior (landed) | Landing test | Kind |
 |------|-------|-------------------|--------------|------|
-| `MDB_WRITEMAP` | 1 | Writes go through a writable mmap (`zerodb-io::WriteMapBacking`); commit `msync` (+ `fdatasync` on a synchronous flush) instead of `pwrite`+`fdatasync`. Realized as a commit-time write strategy — heap dirty frames during the txn, copied into the map at C2 (SPEC 04 §6.4, amended). *(As landed 2026-07-16; since ADR-0021, PR #88, the real map backing realizes dirty frames in the map at allocation instead — SPEC 04 TXN-45b.)* | `env_writemap_put_get_parity`, `env_writemap_put_reserved` (oracle, both engines in WRITE_MAP); `writemap_put_get_reserved_persist`, `writemap_reopened_as_writemap_sees_data` (`crates/zerodb/tests/write_flags.rs`) | differential + e2e |
+| `MDB_WRITEMAP` | 1 | Writes go through a writable mmap (`zerodb-io::WriteMapBacking`); commit `msync` (+ `fdatasync` on a synchronous flush) instead of `pwrite`+`fdatasync`. Realized as a commit-time write strategy — heap dirty frames during the txn, copied into the map at C2 (SPEC 04 §6.4, amended). *(As landed 2026-07-16; since ADR-0021 the real map backing realizes dirty frames in the map at allocation instead — SPEC 04 TXN-45b.)* | `env_writemap_put_get_parity`, `env_writemap_put_reserved` (oracle, both engines in WRITE_MAP); `writemap_put_get_reserved_persist`, `writemap_reopened_as_writemap_sees_data` (`crates/zerodb/tests/write_flags.rs`) | differential + e2e |
 | `MDB_MAPASYNC` | 1 | With WRITE_MAP, C3/C5 use `msync(MS_ASYNC)`. | `durability_mapasync_writemap` (oracle); `map_async_makes_barriers_async` (barrier count); `mapasync_writemap_commit_and_force_sync` (e2e) | differential + control-flow |
 | `MDB_NOSYNC` | 1 | Skip **both** C3 and C5 fsync (SPEC 06 REC-9). Restored by `force_sync`. | `durability_nosync_no_fsync` (oracle); `no_sync_skips_both_barriers` / `no_sync_dominates_no_meta_sync` (barrier count) | differential + control-flow |
 | `MDB_NOMETASYNC` | 1 | fsync data (C3), skip meta fsync (C5); recovery falls back to newest durable meta, corruption-free (REC-10). | `durability_nometasync` (oracle); `no_meta_sync_skips_meta_barrier` (barrier count) | differential + control-flow |
 | `MDB_RDONLY` | 1 | `write_txn` / `force_sync` → `EACCES` (`Io(PermissionDenied)`, matching the fork); reads fully functional; no store creation. | `env_rdonly_rejects_write` (oracle, direct two-engine); `read_only_env_rejects_write_txn_and_force_sync`, `read_only_open_of_missing_store_errors` (e2e) | differential + e2e |
 | `MDB_NOTLS` | 1 | `RoTxn: Send` (default/only mode); reader-table slot tied to the txn object. | `flag_notls_rotxn_is_send` (compile assert + cross-thread move) | compile + e2e |
-| `MDB_PREVSNAPSHOT` | 1 | Open on the older meta; auto-clears on first commit (M1.2 / SPEC 02 §3.2, TXN-65..67). | `env_prevsnapshot_opens_older_meta` (M1.2) | differential |
+| `MDB_PREVSNAPSHOT` | 1 | Open on the older meta; auto-clears on first commit (M1.2 / SPEC 02 §3.2, TXN-65..67). | `env_prevsnapshot_opens_older_meta` | differential |
 | `MDB_APPEND` | 3 | Last-key compare; `key <= last` → `KeyExist` (SPEC 01 §S1). | `flag_append_*` (M1.4 oracle) | differential |
-| `MDB_NOOVERWRITE` | 3 | Return existing value + `KeyExist` (SPEC 01 §S2). | `flag_no_overwrite_returns_existing` (M1.4) | differential |
-| `MDB_CURRENT` | 3 | `put_current` at cursor; `EINVAL` if uninitialized. | `cursor_put_current_*` (M1.4) | differential |
-| `MDB_RESERVE` | 3 | `put_reserved`: caller fills the slot in place; not zeroed (SPEC 01 §S3). Under WRITE_MAP the slot is (logically) into the map. | `put_reserved_*` (M1.4), `env_writemap_put_reserved` (M1.10) | differential |
+| `MDB_NOOVERWRITE` | 3 | Return existing value + `KeyExist` (SPEC 01 §S2). | `flag_no_overwrite_returns_existing` | differential |
+| `MDB_CURRENT` | 3 | `put_current` at cursor; `EINVAL` if uninitialized. | `cursor_put_current_*` | differential |
+| `MDB_RESERVE` | 3 | `put_reserved`: caller fills the slot in place; not zeroed (SPEC 01 §S3). Under WRITE_MAP the slot is (logically) into the map. | `put_reserved_*`, `env_writemap_put_reserved` | differential |
 
 **`Env::force_sync` / `Env::sync(force)`** (`mdb_env_sync` parity, §S6).
 `force_sync()` — the only form heed exposes — is exactly `mdb_env_sync(env, 1)`:
@@ -547,7 +541,7 @@ reproducing all three decisions of the fork's `mdb_env_sync0` in order:
 
 A call that does flush always issues the barrier even with nothing pending,
 matching LMDB. Proved against the M1.11 fault-injection backing in
-`zerodb-oracle/tests/force_sync_durability.rs` (the journal must be empty after
+`zerodb-oracle/tests/differential/force_sync_durability.rs` (the journal must be empty after
 `force_sync`, and the crash-floor image must then read back every committed
 key).
 

@@ -1,26 +1,16 @@
 # SPEC 04 — Transactions & MVCC
 
-Revised 2026-10-05 — docs sweep: snapshot-object field list brought up to the
-shipped shape (`last_pg`, free-list annex — ADR-0022), dirty-frame pool noted
-(commit 10c98a1).
-
-Revised 2026-10-13 — multi-process access (ADR-0023, stages 1–3): the lock
-file is on by default, D-001 is retired, and the rules below that assumed a
-single process are amended in place (§0, §2, TXN-6/7/9, §4, TXN-14/16/17/18/19,
-TXN-38, TXN-45b, TXN-50/51/53, TXN-56, TXN-66). The lock file's own invariants
-are the new §12 (`LCK-1` …).
-
-Status: **DONE** — 2026-07-15 (milestone 0.4). Behavioral source of truth for the
-transaction lifecycle (M1.4), the reader table and concurrency (M1.8), nested
-read transactions (M1.9), and the write-txn value-borrow contract that every
-write-path change (M1.4/1.10) must uphold. Formats are in
+Behavioral source of truth for the
+transaction lifecycle, the reader table and concurrency, nested
+read transactions, and the write-txn value-borrow contract that every
+write-path change must uphold. Formats are in
 [SPEC 02](02-pages.md); tree algorithms in [SPEC 03](03-btree.md); free-page
 reclamation in [SPEC 05](05-gc.md); the crash/durability guarantees that the
 commit pipeline defined here must satisfy are in [SPEC 06](06-recovery.md).
 
 Clean-room note: the LMDB fork (`mdb.master.nested-rtxns`, SPEC 00 pin) was read
 to understand the *algorithms* — reader-slot claiming, `mdb_find_oldest`, the
-nested-read patch (ITS#10395), and the commit sequence (AGENTS.md rule 4). The
+nested-read patch (ITS#10395), and the commit sequence (CONTRIBUTING.md rule 4). The
 protocols below are ZeroDB's own design; where a rule mirrors an LMDB idea it is
 called out, but no C is transliterated. Binding decisions (not relitigated):
 several processes may open one environment through a shared lock file, on by
@@ -28,7 +18,7 @@ default (**ADR-0023**; it retired the founding single-process decision D-001),
 and `NO_LOCK` (`EnvOpenOptions::lock_file(false)`) keeps the single-process
 path with an in-process reader table; nested WRITE txns
 unsupported (**D-003**); nested READ txns over the active write txn are a
-hot-path MUST with see-uncommitted semantics (M1.9); meta CRC + double-buffer
+hot-path MUST with see-uncommitted semantics; meta CRC + double-buffer
 per SPEC 02 §3; commit ordering encoded in one function with crash hooks
 (M1.4).
 
@@ -154,7 +144,7 @@ Normative rules are numbered **TXN-n** so tests and the check tool can cite them
   (heed `MdbError` path; §8 error table). No write mutex is taken.
 - **TXN-9** — Readers never take the write mutex and never block on it; the
   writer never blocks on readers (it computes the oldest reader lock-free, §4).
-  This is the core concurrency guarantee (M1.8): *readers never block, the
+  This is the core concurrency guarantee: *readers never block, the
   writer never blocks readers.* The published-snapshot **cell** is not the
   write mutex: readers may briefly contend on its bounded O(1) pointer
   operations (one swap per commit, one clone per pin) but never on any part
@@ -297,7 +287,7 @@ claim/release a pinned snapshot without blocking the writer.
 
 The reader now owns a `RDR_CLAIMED` slot but has not yet pinned a real snapshot.
 The pin must be correct against a *concurrent committing writer* on a weakly
-ordered machine (ARM; AGENTS.md). The hazard is a classic **store→load
+ordered machine (ARM; CONTRIBUTING.md). The hazard is a classic **store→load
 reordering**:
 
 ```
@@ -342,8 +332,7 @@ only a full fence / `SeqCst` does.
   `t & 1` has already moved on, the loop re-reads `T` and pins again, the slot
   keeping its last pin meanwhile (conservative for the GC gate, TXN-20). The
   tail's adopt-newer step does not apply: the snapshot is the one for `t`.
-- **TXN-18** — **The published-snapshot object.** *(Amended 2026-07-16,
-  ratified — maintainer, standing directive, ADR-0006 Option B: the original
+- **TXN-18** — **The published-snapshot object.** *(Amended by ADR-0006 Option B: the original
   text required an ArcSwap-style lock-free cell "in the reader-table module
   where `unsafe` is sanctioned"; the ratified implementation keeps
   `zerodb-core` `forbid(unsafe_code)` and scopes the no-blocking guarantee to
@@ -600,7 +589,7 @@ page concurrently, the borrow would dangle and the read would race.
     `ensure_open` — which mutates the open-table children read via
     `record_for` — and commit C0.)* This quiescence is a **zerodb** soundness
     rule the fork does not itself impose — **D-005 (APPROVED)** in
-    `docs/DIVERGENCES.md` (not observable to any consumer, which always pause
+    `docs/LMDB-COMPATIBILITY.md#behavior-differences` (not observable to any consumer, which always pause
     the writer; see §10 conflict block).
 - **TXN-30** — Enforcement is primarily **compile-time**: `nested_read_txn(&wtxn)`
   borrows the `RwTxn` **immutably** (`&self`). All mutating `RwTxn` ops take
@@ -637,8 +626,7 @@ page concurrently, the borrow would dangle and the read would race.
   nested readers dropped). Because of TXN-30 this is normally guaranteed by the
   borrow checker; the **commit** path carries the runtime check (C0, TXN-58) as
   defense-in-depth. The **abort/drop** path deliberately carries no runtime
-  check *(amended 2026-07-16, M1.9 — ratified under the maintainer's standing
-  directive; ADR-0007 post-implementation notes)*: a live child at parent-drop
+  check *(ADR-0007 post-implementation notes)*: a live child at parent-drop
   is unrepresentable in safe Rust, and a nonzero count at drop can only mean
   `mem::forget(child)` — which consumed the child, aliases nothing, and is
   harmless; a drop-side assert would false-positive on exactly that case while
@@ -653,7 +641,7 @@ page concurrently, the borrow would dangle and the read would race.
   (SPEC 01 §S7) is permitted: the nested reader reads dirty bytes straight from
   the writable map instead of a heap page (§6.4), same borrow contract. (The fork
   blocks only writemap nested *write* children; read children are fine.)
-- **TXN-36** — Oracle parity target (M1.9): randomized
+- **TXN-36** — Oracle parity target: randomized
   write-then-open-nested-read-then-read sequences, including reads of uncommitted
   state, and replays of the milli/hannoy fan-out, must match the fork observed
   through heed. A nested-**write** attempt is **unrepresentable in the API**
@@ -673,7 +661,7 @@ semantics exactly (TXN-26). No Phase-3.8 seam is opened here beyond leaving the
 
 ## §6 — The write-txn value-borrow contract (Rust soundness)
 
-This is the likeliest soundness bug outside the reader table (M0.4/1.4). A
+This is the likeliest soundness bug outside the reader table. A
 `get` during a write txn may return bytes from a **dirty page in heap memory**
 (default mode) or from the **writable mmap** (WRITE_MAP) — not the read-only
 map. The contract below defines exactly when a borrow is valid and how the
@@ -843,7 +831,7 @@ dirty-page store must be built so it is.
   Adding a new dirty page or run allocates a **new** frame; it never disturbs the
   address of any existing frame. The per-`psize` rule (above) governs tree pages;
   overflow runs are the contiguous-frame exception.
-  *(Realization note — frame pool, commit 10c98a1, PERF-GAP B3/B12; LMDB's
+  *(Realization note — frame pool, commit 10c98a1, performance item B3/B12; LMDB's
   `me_dpages`.) One-page frames are recycled: within a txn a freed/spilled
   frame parks on a bounded spare list, and at txn end up to `SPARE_CAP` (256)
   spares ride back to an env-level pool that seeds the next write txn's store,
@@ -931,7 +919,7 @@ spilling bullet there.)
   at the written locations; caught by miri on the heap-backed test map,
   `zerodb-core/tests/writemap_in_place_miri.rs`). The resolution hot path is
   unchanged
-  (PERF-GAP B13: an extra spilled-page lookup inlined into every descent cost
+  (performance item B13: an extra spilled-page lookup inlined into every descent cost
   read rungs 3–13 %). Nested read children read through the same source; no
   spill runs while one is live (TXN-29 guard precedes the check).
 - **TXN-72 (writing a spilled page again)** — Touching a spilled tree page
@@ -971,12 +959,12 @@ spilling bullet there.)
   REC-12). Rationale and consequences:
   - **Observably identical** to the fork's live-map writes through the heed /
     oracle surface: same `put`/`get`/`put_reserved`/iteration results, same
-    durability. `env_writemap_*` differential tests (M1.10) confirm parity.
+    durability. `env_writemap_*` differential tests confirm parity.
   - **Preserves every invariant unchanged:** the value-borrow contract (§6.3),
     nested-reader reads of dirty pages (§5), and abort-by-drop all operate on the
     heap store exactly as the default mode — so `WRITE_MAP` needs **no map
     `unsafe` in `zerodb-core`** (the writable-mmap `unsafe` is confined to
-    `zerodb-io`, per the AGENTS.md unsafe policy) and the M1.4 miri coverage
+    `zerodb-io`, per the CONTRIBUTING.md unsafe policy) and the M1.4 miri coverage
     (§6.6 / TXN-49) covers writemap's during-txn path for free.
   - The writable map covers the full `map_size` and the file is `set_len` to
     `map_size` at open (matching the fork's `ftruncate`-to-mapsize under
@@ -995,11 +983,11 @@ spilling bullet there.)
     realization below (ADR-0021). TXN-45a remains the realization for every
     backing that does not broker map slices: the default mode, the miri test
     backing, and the fault-injection backend (whose crash journal records
-    fd-path writes only). Neither realization is a `docs/DIVERGENCES.md`
+    fd-path writes only). Neither realization is a `docs/LMDB-COMPATIBILITY.md#behavior-differences`
     entry — both are observably identical to the fork through the heed /
     oracle surface.
 
-- **TXN-45b — in-place realization (ADR-0021, accepted 2026-10-02; spike, then production hardening, merged PR #88).**
+- **TXN-45b — in-place realization (ADR-0021).**
   When the backing brokers mutable map slices (`Backing::dirty_in_map`,
   implemented by the writable-map backing only), the write txn realizes every
   dirty frame **in the writable map at the frame's own page number**: COW
@@ -1056,7 +1044,7 @@ spilling bullet there.)
     out to a heap scratch first — the map region cannot be both source and
     destination. One page copy per general split, as LMDB's split makes under
     `MDB_WRITEMAP`.
-  - **unsafe containment (AGENTS.md policy; hardened 2026-10-02, ADR-0021
+  - **unsafe containment (CONTRIBUTING.md policy; hardened 2026-10-02, ADR-0021
     B1).** The broker is an **`unsafe fn`** end to end
     (`MmapWritable::slice_mut` → `Backing::map_dirty_page`): no safe
     function mints `&mut [u8]` from `&self`. The sole sanctioned caller is
@@ -1114,7 +1102,7 @@ spilling bullet there.)
   dropped). This mirrors SPEC 01 §S3's "after commit/abort the pointer is
   invalid."
 
-### §6.6 — miri obligations (M1.4)
+### §6.6 — miri obligations
 
 - **TXN-49** — `cargo miri test -p zerodb-core` MUST exercise, on the **heap
   dirty-page store** (writemap uses real mmap and is not miri-able — a heap-backed
@@ -1264,7 +1252,7 @@ spilling bullet there.)
 
 ## §9 — Commit pipeline (one function, crash hooks between steps)
 
-The commit ordering is the crash-safety invariant (M1.4). It is encoded in
+The commit ordering is the crash-safety invariant. It is encoded in
 **one** function with **crash-injection hooks** between each numbered step
 (M1.11 kills / tears at each hook). SPEC 06 defines the invariant guaranteed at
 every hook; this section defines the steps and their ordering. Both write modes
@@ -1423,14 +1411,14 @@ every hook; this section defines the steps and their ordering. Both write modes
 | single writer | TXN-6..9 | SPEC 01 Table 1 RDONLY |
 | read snapshot pin | TXN-10..13 | SPEC 05 GC-18 |
 | reader table | TXN-14..25 | M1.8; loom suite L1–L5 (`zerodb-core/src/readers.rs`, `just loom`); stress gate (`zerodb/tests/reader_stress.rs`, `just stress`) |
-| memory ordering | TXN-15/17/19/20 | AGENTS.md (ARM), SPEC 06 |
-| nested read txn | TXN-26..36 | SPEC 00 row 16, SPEC 01 §S9; loom L6 (`zerodb-core/src/nested.rs`); fan-out gate (`zerodb/tests/nested_fanout.rs`); differential (`zerodb-oracle/tests/nested_read_differential.rs`) |
+| memory ordering | TXN-15/17/19/20 | CONTRIBUTING.md (ARM), SPEC 06 |
+| nested read txn | TXN-26..36 | SPEC 00 row 16, SPEC 01 §S9; loom L6 (`zerodb-core/src/nested.rs`); fan-out gate (`zerodb/tests/nested_fanout.rs`); differential (`zerodb-oracle/tests/differential/nested_read_differential.rs`) |
 | value-borrow contract | TXN-37..49 | SPEC 03 §3/§5/§7, SPEC 01 §S3/§S7 |
 | env clone/close/registry | TXN-50..55 | SPEC 00 rows 23–26 |
 | commit pipeline | TXN-61..64 | SPEC 06 REC-1..12 |
 | PREV_SNAPSHOT | TXN-65..67 | SPEC 01 §S5, SPEC 02 §3.2, SPEC 06 REC-5 |
-| database handle lifetime | DBI-1..10 (§13) | ADR-0024; SPEC 02 §6.1; D-026; `zerodb-oracle/tests/lmdb_dbi_handle_observation.rs`; unit tests in `zerodb-core/src/handles.rs` |
-| lock file (multi-process) | LCK-1..11 (§12); TXN-73 (§4.4); TXN-6/7, TXN-17..19, TXN-51/53, TXN-56, TXN-66 as amended | ADR-0023; SPEC 02 §8; SPEC 06 REC-1a; loom models in `zerodb-core/src/readers.rs`; `zerodb/tests/multi_process*.rs`; `zerodb-oracle/tests/multi_process_differential.rs`, `lmdb_reaping_observation.rs`, `lmdb_stage3_observation.rs` |
+| database handle lifetime | DBI-1..10 (§13) | ADR-0024; SPEC 02 §6.1; D-026; `zerodb-oracle/tests/lmdb_observations/lmdb_dbi_handle_observation.rs`; unit tests in `zerodb-core/src/handles.rs` |
+| lock file (multi-process) | LCK-1..11 (§12); TXN-73 (§4.4); TXN-6/7, TXN-17..19, TXN-51/53, TXN-56, TXN-66 as amended | ADR-0023; SPEC 02 §8; SPEC 06 REC-1a; loom models in `zerodb-core/src/readers.rs`; `zerodb/tests/multi_process*.rs`; `zerodb-oracle/tests/multi_process/multi_process_differential.rs`, `lmdb_reaping_observation.rs`, `lmdb_stage3_observation.rs` |
 
 **Rule count: TXN-1 … TXN-67 (67 normative rules; §4.4 adds sub-rule TXN-18a for
 slot release), plus the later TXN-68 … TXN-72 (§6.3a), TXN-73 (§4.4, added
@@ -1443,7 +1431,7 @@ added 2026-10-17).** TXN-40 (nested write unsupported, D-003) is referenced from
   public API**: zerodb exposes **no** nested-write entry point at all — no
   `Env::nested_write_txn`, no `RwTxn::nested` — which is a strictly stronger
   form of the original "clean error" clause (nothing to call, so never a
-  panic and never partial state). The heed-zerodb adapter (M1.13) likewise
+  panic and never partial state). The heed-zerodb adapter likewise
   surfaces no nested-write entry point and no error variant is needed. heed
   itself keeps only `RwTxn::nested` `pub(crate)`: its `Env::nested_write_txn`
   is public (heed 0.22.1 and Meilisearch's fork), so a consumer calling it
@@ -1611,7 +1599,7 @@ and the futex), `zerodb-core::shared` (the safe interface the core sees) and
   A reaper that dies after its CAS leaves a slot carrying its own PID, which
   the next reaper frees. Reaping counts slots, not processes. **Reap
   points**, as observed in the LMDB fork (amendment 12,
-  `crates/zerodb-oracle/tests/lmdb_reaping_observation.rs`): an explicit
+  `crates/zerodb-oracle/tests/multi_process/lmdb_reaping_observation.rs`): an explicit
   `Env::clear_stale_readers` (`mdb_reader_check`); a writer that took the
   writer lock over from a dead owner (Linux; LCK-4), whose reap failure
   fails the write-txn begin and releases both locks; and the initializer,
@@ -1679,7 +1667,7 @@ against LMDB unless it says so.
   unpublished first commit and the joiner's `info`/`stat` follow LMDB
   (TXN-66, TXN-67; ADR-0023 amendment 19; `multi_process_differential.rs::
   join_before_prev_snapshot_first_commit_vs_lmdb` and its neighbors). Two
-  cases differ, docs/DIVERGENCES.md D-025 (approved). If the opener closes
+  cases differ, docs/LMDB-COMPATIBILITY.md#behavior-differences D-025 (approved). If the opener closes
   or dies before its first commit, a waiting ZeroDB process becomes the
   first opener and serves the newest meta; LMDB's waiter joins the lock
   file as the opener left it and reads the older meta, or, on macOS after a
@@ -1696,7 +1684,7 @@ against LMDB unless it says so.
   while another process holds a write txn, also on an `MDB_RDONLY` env
   (`OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER`,
   `OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER_RDONLY`). The wait is deliberate
-  (ADR-0023 decision 3). See `docs/DIVERGENCES.md` (D-023).
+  (ADR-0023 decision 3). See `docs/LMDB-COMPATIBILITY.md#behavior-differences` (D-023).
 
 ## §13 — Database handle lifetime (ADR-0024)
 
@@ -1704,7 +1692,7 @@ A named database's handle is `(slot, generation)` into the env's slot table
 (`zerodb-core/src/handles.rs`; SPEC 02 §6.1). The main database's handle has
 no slot and is valid in every txn. The rules below reproduce what heed over
 the LMDB fork returns, except DBI-9 (divergence D-026). They are pinned by
-`crates/zerodb-oracle/tests/lmdb_dbi_handle_observation.rs`.
+`crates/zerodb-oracle/tests/lmdb_observations/lmdb_dbi_handle_observation.rs`.
 
 - **DBI-1 (slot states)** — A slot is *pending* while the live txns that
   opened it (its openers) have not committed, *published* once one of them

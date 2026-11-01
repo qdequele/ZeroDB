@@ -123,10 +123,9 @@ impl<'a> PageRef<'a> {
     }
 
     /// [`PageRef::new`] minus the `validate_page_size` re-check, for the
-    /// engine's per-page-load hot path (`btree::load_page`): the page size is
+    /// engine's per-page-load hot path (`btree::node_view`): the page size is
     /// validated once at env open and is immutable after, so re-validating it
-    /// on every page load only costs time (docs/PERF-GAP-VS-LMDB.md,
-    /// `validate_page_size` on every page load). All per-buffer checks (length,
+    /// on every page load only costs time. All per-buffer checks (length,
     /// type classification) are kept — this trusts only `psize`, never the
     /// bytes.
     pub(crate) fn new_trusted_psize(buf: &'a [u8], psize: u32) -> Result<PageRef<'a>, PageError> {
@@ -195,12 +194,7 @@ impl<'a> PageRef<'a> {
     /// [`PageError::WrongPageType`] if this is not a leaf page; otherwise any
     /// body-validation error from [`LeafRef::new`].
     pub fn as_leaf(&self) -> Result<LeafRef<'a>, PageError> {
-        if self.page_type != PageType::Leaf {
-            return Err(PageError::WrongPageType {
-                expected: PageType::Leaf,
-                found: self.page_type,
-            });
-        }
+        expect_type(PageType::Leaf, self.page_type)?;
         LeafRef::new(self.buf, self.psize)
     }
 
@@ -211,12 +205,7 @@ impl<'a> PageRef<'a> {
     /// [`PageError::WrongPageType`] if this is not a branch page; otherwise any
     /// body-validation error from [`BranchRef::new`].
     pub fn as_branch(&self) -> Result<BranchRef<'a>, PageError> {
-        if self.page_type != PageType::Branch {
-            return Err(PageError::WrongPageType {
-                expected: PageType::Branch,
-                found: self.page_type,
-            });
-        }
+        expect_type(PageType::Branch, self.page_type)?;
         BranchRef::new(self.buf, self.psize)
     }
 
@@ -227,12 +216,7 @@ impl<'a> PageRef<'a> {
     /// [`PageError::WrongPageType`] if this is not an overflow page; otherwise
     /// any body-validation error from [`OverflowRef::new`].
     pub fn as_overflow(&self) -> Result<OverflowRef<'a>, PageError> {
-        if self.page_type != PageType::Overflow {
-            return Err(PageError::WrongPageType {
-                expected: PageType::Overflow,
-                found: self.page_type,
-            });
-        }
+        expect_type(PageType::Overflow, self.page_type)?;
         OverflowRef::new(self.buf, self.psize)
     }
 
@@ -246,19 +230,24 @@ impl<'a> PageRef<'a> {
     ///
     /// [`PageError::WrongPageType`] if this is not a meta page.
     pub fn as_meta(&self) -> Result<MetaValidity, PageError> {
-        if self.page_type != PageType::Meta {
-            return Err(PageError::WrongPageType {
-                expected: PageType::Meta,
-                found: self.page_type,
-            });
-        }
+        expect_type(PageType::Meta, self.page_type)?;
         MetaPage::validate(self.buf, self.psize)
+    }
+}
+
+/// `Ok` when a page of type `found` is of the `expected` type, else
+/// [`PageError::WrongPageType`].
+#[inline(always)]
+pub(crate) fn expect_type(expected: PageType, found: PageType) -> Result<(), PageError> {
+    if found == expected {
+        Ok(())
+    } else {
+        Err(PageError::WrongPageType { expected, found })
     }
 }
 
 /// Validate the free-space bounds of a branch/leaf page against the body size,
 /// shared by the tree views. Returns `(lower, upper)` on success.
-// Forced: LLVM inlines this only at -inline-threshold=1000.
 #[inline(always)]
 pub(crate) fn read_and_check_bounds(buf: &[u8], psize: u32) -> Result<(u16, u16), PageError> {
     let body_size = psize as usize - HEADER_SIZE;

@@ -11,8 +11,10 @@
 //!     index replay.
 #![cfg(feature = "migrate-lmdb")]
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::TempDir;
+
+use std::path::Path;
 
 use heed::types::Bytes;
 use heed::EnvOpenOptions as LEnvOpenOptions;
@@ -20,21 +22,15 @@ use heed::EnvOpenOptions as LEnvOpenOptions;
 use zerodb::{EnvFlags, EnvOpenOptions as ZEnvOpenOptions};
 use zerodb_tools::dump_format::{render, DumpDb};
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmp_dir(tag: &str) -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let p = std::env::temp_dir().join(format!("zerodb-migrate-{tag}-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&p).unwrap();
-    p
-}
+/// An owned key/value pair.
+type Kv = (Vec<u8>, Vec<u8>);
 
 /// Logical content collected from a heed env, in the same order `cmd_dump`
 /// produces: main user data (subdb pointers excluded), then named DBs by name,
 /// every section sorted by key.
 struct Content {
-    main_user: Vec<zerodb_tools::common::Kv>,
-    named: Vec<zerodb_tools::common::NamedDb>,
+    main_user: Vec<Kv>,
+    named: Vec<(Vec<u8>, Vec<Kv>)>,
 }
 
 fn collect_lmdb(dir: &Path, map_size: usize) -> Content {
@@ -147,7 +143,7 @@ fn build_lmdb(dir: &Path, map_size: usize) {
 #[test]
 fn round_trip_lmdb_migrate_dump_is_byte_identical() {
     let map_size = 128 << 20;
-    let src = tmp_dir("rt-lmdb");
+    let src = TempDir::new("rt-lmdb");
     build_lmdb(&src, map_size);
 
     // LMDB's own logical content, rendered in our dump format.
@@ -155,7 +151,7 @@ fn round_trip_lmdb_migrate_dump_is_byte_identical() {
     let lmdb_dump = render_content(&content);
 
     // Migrate into a fresh zerodb env, then dump it.
-    let dst = tmp_dir("rt-zerodb");
+    let dst = TempDir::new("rt-zerodb");
     let report =
         zerodb_tools::migrate::cmd_migrate(&src, &dst, map_size, 4096).expect("migrate failed");
     assert!(report.contains("verified"), "migrate report:\n{report}");
@@ -174,11 +170,11 @@ fn round_trip_lmdb_migrate_dump_is_byte_identical() {
 #[test]
 fn real_index_proxy_point_queries_match() {
     let map_size = 128 << 20;
-    let src = tmp_dir("proxy-lmdb");
+    let src = TempDir::new("proxy-lmdb");
     build_lmdb(&src, map_size);
     let content = collect_lmdb(&src, map_size);
 
-    let dst = tmp_dir("proxy-zerodb");
+    let dst = TempDir::new("proxy-zerodb");
     zerodb_tools::migrate::cmd_migrate(&src, &dst, map_size, 4096).unwrap();
 
     // Reopen the migrated zerodb env and point-query several keys per DB,
@@ -225,7 +221,7 @@ fn real_index_proxy_point_queries_match() {
 /// `MDB_INVALID` from heed.
 #[test]
 fn migrate_rejects_a_zerodb_data_mdb_source_by_magic() {
-    let src = tmp_dir("zdb-source");
+    let src = TempDir::new("zdb-source");
     // A ZeroDB env named `data.mdb`, i.e. what the adapter produces.
     let env = ZEnvOpenOptions::new()
         .map_size(1 << 20)
@@ -237,7 +233,7 @@ fn migrate_rejects_a_zerodb_data_mdb_source_by_magic() {
     wtxn.commit().unwrap();
     env.prepare_for_closing().wait();
 
-    let dst = tmp_dir("zdb-source-dst");
+    let dst = TempDir::new("zdb-source-dst");
     let err = zerodb_tools::migrate::cmd_migrate(&src, &dst, 1 << 20, 4096)
         .unwrap_err()
         .to_string();
@@ -262,7 +258,7 @@ fn migrate_rejects_a_zerodb_data_mdb_source_by_magic() {
 /// not reject real sources).
 #[test]
 fn migrate_still_accepts_a_real_lmdb_source() {
-    let src = tmp_dir("real-lmdb-source");
+    let src = TempDir::new("real-lmdb-source");
     {
         let mut opts = LEnvOpenOptions::new();
         opts.max_dbs(4);
@@ -274,6 +270,6 @@ fn migrate_still_accepts_a_real_lmdb_source() {
         db.put(&mut wtxn, b"k", b"v").unwrap();
         wtxn.commit().unwrap();
     }
-    let dst = tmp_dir("real-lmdb-dst");
+    let dst = TempDir::new("real-lmdb-dst");
     zerodb_tools::migrate::cmd_migrate(&src, &dst, 1 << 20, 4096).unwrap();
 }

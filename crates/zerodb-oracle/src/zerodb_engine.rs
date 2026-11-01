@@ -17,7 +17,7 @@
 //! `Skip::WriteBlockedByNested` — the shared driver classifies that skip
 //! *before either engine runs*, so the fork's technical allowance of
 //! writes-under-a-child (it does not enforce quiescence; zerodb does — see the
-//! writer-quiescence entry in docs/DIVERGENCES.md) stays unobservable and the
+//! writer-quiescence entry in docs/LMDB-COMPATIBILITY.md) stays unobservable and the
 //! two engines cannot drift. The op model holds
 //! **one** child at a time (like its one-txn limitation); multiple concurrent
 //! children + real thread fan-out are covered by
@@ -26,11 +26,12 @@
 //! Unlike heed's child (a raw `MDB_txn` pointer, no Rust reference into the
 //! parent), `zerodb::NestedRoTxn` holds a **real `&RwTxn`** — so the parent
 //! must sit at a stable heap address while children exist. `Active::Rw`
-//! already boxes the txn (ADR-0007 D5); the nested child borrows the Box's
+//! already boxes the txn (ADR-0007); the nested child borrows the Box's
 //! target and both move together between `Active` variants.
 //!
 //! Every write op runs zerodb's real COW write path, `Commit` runs the real
-//! C0–C6 pipeline (incl. the C1a catalog write-back, SPEC 02 §6), and in debug
+//! commit pipeline (SPEC 04 steps C0–C6, including the catalog write-back at
+//! C1a, SPEC 02 §6), and in debug
 //! builds every successful commit re-reads
 //! `zerodb.dat` and runs the SPEC 03 §11 + named-DB catalog invariant walk
 //! ([`zerodb::check::check_image`]).
@@ -49,8 +50,7 @@
 //! differences are LMDB API-boundary behaviors applied here.
 
 use zerodb::{
-    check, Database, Env, EnvFlags, EnvOpenOptions, Error, MdbError, NestedRoTxn, PutFlags, RoTxn,
-    RwTxn,
+    Database, Env, EnvFlags, EnvOpenOptions, Error, MdbError, NestedRoTxn, PutFlags, RoTxn, RwTxn,
 };
 
 use crate::op::walk_value;
@@ -257,15 +257,11 @@ impl ZerodbEngine {
         {
             let path = self.dir.path().join(zerodb::DATA_FILE_NAME);
             let bytes = std::fs::read(&path).expect("read committed image");
-            let violations = check::check_image(&bytes, PAGE_SIZE);
+            let violations = zerodb::check::check_image(&bytes, PAGE_SIZE);
             assert!(
                 violations.is_empty(),
                 "invariant violations after commit: {violations:#?}"
             );
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            let _ = &check::check_image; // keep the import meaningful
         }
     }
 
@@ -408,7 +404,7 @@ impl ZerodbEngine {
                 // Open the nested child and erase its borrow of the boxed
                 // parent to 'static so both can be stored side by side.
                 //
-                // SAFETY (ADR-0007 D5): the child's one reference is
+                // SAFETY (ADR-0007): the child's one reference is
                 // `&RwTxn`, pointing at the **Box's heap target** — a stable
                 // address that survives moves of the `Box` itself and of
                 // `self.active` between variants. Invariants:
@@ -990,11 +986,6 @@ impl Engine for ZerodbEngine {
 
     fn real_disk_size(&self) -> Option<u64> {
         self.env.as_ref().and_then(|e| e.real_disk_size().ok())
-    }
-
-    fn implements(&self, _op: &Op) -> bool {
-        // Every modeled op is differential.
-        true
     }
 
     fn apply(&mut self, op: &Op) -> OpResult {

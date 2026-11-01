@@ -362,7 +362,7 @@ pub fn run_mp_cycle(seed: u64, opts: &SigkillOpts) -> CutReport {
     }
     exec.finish();
     // Sidecar acks must be a prefix of the replayed commit log (the
-    // ADR-0008 D6.3 drift guard).
+    // ADR-0008 drift guard).
     if side.commits.as_slice() != &exec.commit_log[..side.commits.len().min(exec.commit_log.len())]
         || side.commits.len() > exec.commit_log.len()
     {

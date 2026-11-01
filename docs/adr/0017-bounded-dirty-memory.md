@@ -11,7 +11,7 @@ A ZeroDB write txn keeps every page it touches as a heap frame until commit
 (the dirty store, SPEC 04 §6.3). Memory therefore grows with the txn: the
 rust-storage-bench YCSB load (one txn of 10M × 128-byte puts) peaked at
 **1.7 GB** of anonymous memory, against **~540 MiB** for LMDB on the same load
-(`benches/results/2026-09-29-ycsb-bigger-than-ram.md`). Meilisearch indexes in
+(the 2026-09-29 "ycsb bigger than ram" run). Meilisearch indexes in
 single large write txns (autobatching up to min(max_indexing_memory / 2,
 10 GiB) of payload), so its peak memory during indexing is the indexer's own
 budget **plus** the whole dirty set. Under glibc the freed frames also stay in

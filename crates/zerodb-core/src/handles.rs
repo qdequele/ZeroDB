@@ -19,21 +19,18 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::error::{Error, MdbError, Result};
-
-/// The `EINVAL` (raw OS error 22) LMDB returns for a handle that is not valid
-/// in a transaction; heed surfaces it as `Error::Io`.
-pub(crate) fn einval() -> Error {
-    Error::Io(std::io::Error::from_raw_os_error(22))
-}
+use crate::error::{einval, Error, MdbError, Result};
 
 /// "Never": the publication epoch of an instance that was never published.
 const NEVER: u64 = u64::MAX;
 
-/// Slots below this get the lock-free check. Meilisearch opens about 30 named
-/// databases per environment and hannoy a handful; a slot past it is checked
-/// under the table lock every time.
-pub(crate) const DENSE_SLOT_LIMIT: u32 = 256;
+/// Dbis below this get lock-free per-txn tables: the handle check here and
+/// [`crate::rotxn::RoTxn`]'s record table, whose entries embed this check's
+/// memo, so the two share this one bound. A dbi past it takes the locked
+/// path every time. Meilisearch opens about 30 named databases per
+/// environment, so this covers known consumers while bounding the per-txn
+/// allocation for an env opened with a very large `max_dbs`.
+pub(crate) const DENSE_DBI_LIMIT: u32 = 256;
 
 #[derive(Debug)]
 enum State {
@@ -183,7 +180,7 @@ impl TxnHandles {
     }
 
     /// Take this transaction's [`Rare`] allocation, emptied, for the next
-    /// write transaction ([`HandleTable::begin_reusing`]; issue #8). Called
+    /// write transaction ([`HandleTable::begin_reusing`]). Called
     /// after [`HandleTable::end`], with `&mut`, so no check can be reading
     /// the memo. Every memo cell is reset to "none": the next transaction
     /// checks each slot under the table lock once, exactly as with a fresh
@@ -464,7 +461,7 @@ impl HandleTable {
         self.check_locked(txn, parent, slot, generation, |epoch| {
             let rare = txn.rare();
             let memo = rare.memo.get_or_init(|| {
-                (0..self.max_dbs.min(DENSE_SLOT_LIMIT))
+                (0..self.max_dbs.min(DENSE_DBI_LIMIT))
                     .map(|_| MemoCell::default())
                     .collect()
             });
@@ -529,7 +526,7 @@ impl HandleTable {
                 }
             }
         }
-        if verdict.is_ok() && slot < DENSE_SLOT_LIMIT {
+        if verdict.is_ok() && slot < DENSE_DBI_LIMIT {
             // Memoized under the lock, at the epoch the verdict holds for.
             // Relaxed load: the epoch only changes under the lock, held.
             on_valid(self.epoch.load(Ordering::Relaxed));

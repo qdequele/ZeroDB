@@ -1,0 +1,1880 @@
+//! B+tree read path — search, `get`, and the full cursor state machine
+//! ([SPEC 03](../../../../docs/SPEC/03-btree.md) §2–§4).
+//!
+//! Everything here operates over a [`Source`] — either the immutable mapped
+//! env file (`Source::Map`, the read-txn path) or a write txn's view
+//! (`Source::Writer`: the dirty-page store first, the map for untouched pages
+//! — SPEC 04 TXN-38, ADR-0004). Reads are **zero-copy**: keys and values
+//! are `&'a [u8]` borrowed straight from the backing bytes (SPEC 04 TXN-37/41),
+//! and a `F_BIGDATA` value resolves to one contiguous slice spanning its
+//! overflow run (SPEC 03 §3; a dirty run is one contiguous frame, TXN-41).
+//! This module contains **no** `unsafe` (the crate is `#![deny(unsafe_code)]`,
+//! opened only in `page::raw` for the unchecked field readers)
+//! and no I/O — it is pure logic over borrowed bytes, so `miri` exercises it.
+//!
+//! The cursor is a root-to-leaf path (`stack` of `(pgno, ki)` frames) plus the
+//! `INITIALIZED`/`EOF` flags of SPEC 03 §4. Each public op documents the §4
+//! subsection whose positioning/EOF/empty-DB semantics it implements.
+
+use std::borrow::BorrowMut;
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::OnceLock;
+
+use super::cmp::KeyCmp;
+use super::dirty::{DirtyStore, Resolved};
+use super::page::{
+    BranchRef, FileTrust, LeafRef, LeafValue, OverflowRef, PageError, PageRef, PageType,
+    PGNO_INVALID,
+};
+use super::stamps::{StampCache, StampKind};
+
+mod memo;
+
+pub(crate) use memo::PageKind;
+pub use memo::ValidatedPages;
+
+/// An entry `(key, value)` borrowed from the map for the view's lifetime `'a`.
+pub type Entry<'a> = (&'a [u8], &'a [u8]);
+
+/// Result of a cursor/positioning op: `Ok(Some(entry))`, `Ok(None)` (EOF /
+/// empty / no-such), or a decode error on a structurally-corrupt tree.
+pub type PosResult<'a> = Result<Option<Entry<'a>>, PageError>;
+
+// ---------------------------------------------------------------------------
+// Page source (ADR-0004): where a page's bytes come from
+// ---------------------------------------------------------------------------
+
+/// Where tree pages are read from (SPEC 04 TXN-37/38).
+///
+/// `Map` is a read snapshot over the mapped file; `Writer` is a write txn's
+/// view, which resolves the **dirty-page store first** and falls back to the
+/// map for pages the txn has not touched. A caller cannot tell which backing a
+/// borrow came from; the lifetime rules are identical (SPEC 04 §6.2). This is
+/// also the nested-read-txn seam (a nested reader is the writer's source,
+/// read-only) and the WRITE_MAP seam (WRITE_MAP swaps the backing, TXN-46).
+#[derive(Clone, Copy)]
+pub enum Source<'a> {
+    /// The read-only mapped env file.
+    Map {
+        /// The whole mapped region.
+        bytes: &'a [u8],
+        /// The pinned snapshot's committed high-water (`Snapshot::last_pg`).
+        /// Map reads refuse any pgno beyond it: the mapping covers the full
+        /// `map_size` (ADR-0004), so bytes past the real file end are
+        /// mapped but unbacked — dereferencing them on a corrupt/hostile
+        /// reference would `SIGBUS` instead of erroring (SPEC 06 REC-14).
+        last_pg: u64,
+    },
+    /// A write txn's view: dirty frames first, then the map.
+    Writer {
+        /// The txn's dirty-page store (checked first). Covariance makes any
+        /// `&'a DirtyStore<'env>` (`'env: 'a`) coerce here — the store only
+        /// holds a *shared* backing reference (ADR-0021), never `&mut`.
+        dirty: &'a DirtyStore<'a>,
+        /// The mapped region (fallback for untouched pages).
+        bytes: &'a [u8],
+        /// The base snapshot's committed high-water. Bounds only the **map
+        /// fallback**: pages the writer allocates beyond it live in `dirty`
+        /// and are resolved before this bound is consulted.
+        last_pg: u64,
+    },
+}
+
+impl<'a> Source<'a> {
+    /// Bytes beginning at page `pgno`: at least one page; for an overflow head
+    /// resolved from this source, the returned slice covers the whole run
+    /// (a dirty run is its full contiguous frame; a mapped run extends to the
+    /// end of the map, bounded by the overflow decoder).
+    pub(crate) fn bytes_from(&self, psize: u32, pgno: u64) -> Result<&'a [u8], PageError> {
+        self.bytes_from_classified(psize, pgno).map(|(b, _)| b)
+    }
+
+    /// As [`Source::bytes_from`], additionally reporting whether the bytes
+    /// came from the **map** (`true`) or from a **dirty frame** (`false`).
+    ///
+    /// The distinction gates [`ValidatedPages`]: map bytes are immutable for
+    /// the owning txn's life (a reader's pinned snapshot is GC-protected,
+    /// TXN-20/21; a writer buffers every mutation in the dirty store until
+    /// commit C2 — including WRITE_MAP, TXN-45a — so the map never changes
+    /// under a live txn). The one exception is a writer's **spilled** pages
+    /// (SPEC 04 §6.3a): they are rewritten in the map only at a spill, and
+    /// every spill resets that writer's memo (TXN-71), so no memo entry
+    /// outlives the bytes it vouched for. Dirty frames mutate mid-txn and
+    /// must never be trusted from a memo.
+    #[inline(always)]
+    pub(crate) fn bytes_from_classified(
+        &self,
+        psize: u32,
+        pgno: u64,
+    ) -> Result<(&'a [u8], bool), PageError> {
+        let ps = psize as usize;
+        let map_slice = |bytes: &'a [u8], last_pg: u64| -> Result<&'a [u8], PageError> {
+            // Committed-map reads never dereference past the snapshot's
+            // high-water: pages there may be unbacked by the file even though
+            // the mapping covers them (see the `Source` field docs). A
+            // corrupt/hostile reference fails typed instead of faulting.
+            if pgno > last_pg {
+                return Err(PageError::PageOutOfBounds { pgno, last_pg });
+            }
+            let base = (pgno as usize)
+                .checked_mul(ps)
+                .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })?;
+            let slice = bytes
+                .get(base..)
+                .filter(|s| s.len() >= ps)
+                .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })?;
+            // Clamp the slice at the high-water so a multi-page consumer (an
+            // overflow-run payload) can never read past it either: the pages
+            // beyond `last_pg` are exactly the potentially-unbacked ones.
+            let cap = usize::try_from(last_pg - pgno + 1)
+                .ok()
+                .and_then(|n| n.checked_mul(ps));
+            Ok(match cap {
+                Some(c) if c < slice.len() => &slice[..c],
+                _ => slice,
+            })
+        };
+        match self {
+            Source::Map { bytes, last_pg } => map_slice(bytes, *last_pg).map(|b| (b, true)),
+            Source::Writer {
+                dirty,
+                bytes,
+                last_pg,
+            } => match dirty.resolve(pgno) {
+                Resolved::Clean => map_slice(bytes, *last_pg).map(|b| (b, true)),
+                // An in-map dirty page lives at its own pgno in the map,
+                // which `bytes` views (ADR-0021).
+                Resolved::MapPage => (pgno as usize)
+                    .checked_mul(ps)
+                    .and_then(|base| bytes.get(base..base.checked_add(ps)?))
+                    .map(|b| (b, false))
+                    .ok_or(PageError::BufferTooSmall { got: 0, psize: ps }),
+                Resolved::Frame(frame) => Ok((frame, false)),
+            },
+        }
+    }
+}
+
+/// The validated leaf view of `pgno` from `src`: memo hit on a map-sourced
+/// page skips the O(`num_keys`) cell walk; every other case fully validates
+/// (and records map-sourced pages for the rest of the txn).
+pub(crate) fn leaf_view<'a>(
+    src: Source<'a>,
+    psize: u32,
+    pgno: u64,
+    valid: Option<&ValidatedPages<'_>>,
+) -> Result<LeafRef<'a>, PageError> {
+    let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
+    leaf_view_over(bytes, from_map, psize, pgno, valid)
+}
+
+/// [`leaf_view`] over bytes the caller already resolved (the descent
+/// resolves each page's bytes exactly once — see [`node_view`]).
+fn leaf_view_over<'a>(
+    bytes: &'a [u8],
+    from_map: bool,
+    psize: u32,
+    pgno: u64,
+    valid: Option<&ValidatedPages<'_>>,
+) -> Result<LeafRef<'a>, PageError> {
+    match valid {
+        Some(v) => {
+            if from_map {
+                if v.contains(pgno, PageKind::Leaf) {
+                    // Kind-tagged hit: zero checks.
+                    Ok(LeafRef::new_trusted(bytes))
+                } else if v.trusts_file() {
+                    // ADR-0014: the caller's `trust_contents` contract stands
+                    // in for the cell walk, as in LMDB; the O(1) header checks
+                    // (page type included) still run. Tested only on a memo
+                    // miss, keeping the option off the memo-hit path. Not
+                    // recorded, unlike a trusted branch: a scan views each
+                    // leaf once, and recording every leaf would fill the memo
+                    // until each probe missed through all its levels.
+                    LeafRef::new_prevalidated(bytes, psize)
+                } else {
+                    validate_leaf_miss(bytes, psize, pgno, v)
+                }
+            } else {
+                // Engine-authored dirty frame (trusted by construction): a frame is
+                // either a COW copy of a page fully validated on its first
+                // map access this txn, or the output of this txn's own page
+                // encoders — never raw disk bytes, which always enter through
+                // the `from_map` arm above. Structural O(1) checks (type,
+                // bounds) still run; the per-cell walk over the engine's own
+                // output is skipped — LMDB's model for its dirty pages.
+                LeafRef::new_prevalidated(bytes, psize)
+            }
+        }
+        None => LeafRef::new(bytes, psize),
+    }
+}
+
+/// A validating memo miss on a map leaf: a hit in the env-wide cache of
+/// validated page versions (ADR-0018) — same pgno, kind **and** header stamp,
+/// so the same immutable bytes — takes the zero-check view; otherwise the
+/// full cell walk runs and its success is published there. Either way the
+/// page enters this txn's memo. Out of line so the memo-hit path keeps its
+/// shape (see docs/PERFORMANCE.md, inlining threshold).
+#[inline(never)]
+fn validate_leaf_miss<'a>(
+    bytes: &'a [u8],
+    psize: u32,
+    pgno: u64,
+    v: &ValidatedPages<'_>,
+) -> Result<LeafRef<'a>, PageError> {
+    let leaf = match v.shared {
+        Some(cache) => {
+            let stamp = crate::page::read_page_txnid(bytes);
+            if cache.contains(pgno, StampKind::Leaf, stamp) {
+                LeafRef::new_trusted(bytes)
+            } else {
+                let leaf = LeafRef::new(bytes, psize)?;
+                // Writers never publish (ADR-0018):
+                // their own spilled pages are non-final images, and an
+                // abort would leave the entry behind under a reused txnid.
+                if v.publish_shared {
+                    cache.publish(pgno, StampKind::Leaf, stamp);
+                }
+                leaf
+            }
+        }
+        None => LeafRef::new(bytes, psize)?,
+    };
+    v.insert(pgno, PageKind::Leaf);
+    Ok(leaf)
+}
+
+/// As [`validate_leaf_miss`], for branch pages.
+#[inline(never)]
+fn validate_branch_miss<'a>(
+    bytes: &'a [u8],
+    psize: u32,
+    pgno: u64,
+    v: &ValidatedPages<'_>,
+) -> Result<BranchRef<'a>, PageError> {
+    let br = match v.shared {
+        Some(cache) => {
+            let stamp = crate::page::read_page_txnid(bytes);
+            if cache.contains(pgno, StampKind::Branch, stamp) {
+                BranchRef::new_trusted(bytes)
+            } else {
+                let br = BranchRef::new(bytes, psize)?;
+                // Writers never publish — see `validate_leaf_miss`.
+                if v.publish_shared {
+                    cache.publish(pgno, StampKind::Branch, stamp);
+                }
+                br
+            }
+        }
+        None => BranchRef::new(bytes, psize)?,
+    };
+    v.insert(pgno, PageKind::Branch);
+    Ok(br)
+}
+
+/// As [`leaf_view`], for branch pages.
+pub(crate) fn branch_view<'a>(
+    src: Source<'a>,
+    psize: u32,
+    pgno: u64,
+    valid: Option<&ValidatedPages<'_>>,
+) -> Result<BranchRef<'a>, PageError> {
+    let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
+    branch_view_over(bytes, from_map, psize, pgno, valid)
+}
+
+/// [`branch_view`] over bytes the caller already resolved (see [`node_view`]).
+fn branch_view_over<'a>(
+    bytes: &'a [u8],
+    from_map: bool,
+    psize: u32,
+    pgno: u64,
+    valid: Option<&ValidatedPages<'_>>,
+) -> Result<BranchRef<'a>, PageError> {
+    match valid {
+        Some(v) => {
+            if from_map {
+                if v.contains(pgno, PageKind::Branch) {
+                    // Kind-tagged hit: zero checks.
+                    Ok(BranchRef::new_trusted(bytes))
+                } else if v.trusts_file() {
+                    // ADR-0014 — see [`leaf_view`].
+                    let br = BranchRef::new_prevalidated(bytes, psize)?;
+                    v.insert(pgno, PageKind::Branch);
+                    Ok(br)
+                } else {
+                    validate_branch_miss(bytes, psize, pgno, v)
+                }
+            } else {
+                // Engine-authored dirty frame — see [`leaf_view`].
+                BranchRef::new_prevalidated(bytes, psize)
+            }
+        }
+        None => BranchRef::new(bytes, psize),
+    }
+}
+
+/// A tree page as its typed view, resolved and dispatched in **one** source
+/// resolution.
+///
+/// A type dispatch followed by [`leaf_view`]/[`branch_view`] would resolve
+/// each page's bytes twice, and in a write txn each resolution probes the
+/// dirty store first ([`Source::bytes_from_classified`]). Any non-tree page
+/// type fails with [`PageError::NotATreePage`].
+pub(crate) enum NodeView<'a> {
+    Leaf(LeafRef<'a>),
+    Branch(BranchRef<'a>),
+}
+
+#[inline(always)]
+pub(crate) fn node_view<'a>(
+    src: Source<'a>,
+    psize: u32,
+    pgno: u64,
+    valid: Option<&ValidatedPages<'_>>,
+) -> Result<NodeView<'a>, PageError> {
+    // Kept apart from `node_view_classified` (not a wrapper over it): every
+    // keyed descent runs this body, and its code is left exactly as it was.
+    let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
+    let page = PageRef::new_trusted_psize(bytes, psize)?;
+    match page.page_type() {
+        PageType::Leaf => leaf_view_over(bytes, from_map, psize, pgno, valid).map(NodeView::Leaf),
+        PageType::Branch => {
+            branch_view_over(bytes, from_map, psize, pgno, valid).map(NodeView::Branch)
+        }
+        other => Err(wrong_type(other)),
+    }
+}
+
+/// [`node_view`] plus whether the page came from the committed map (`true`)
+/// or is a frame this write txn already owns (`false`) — the writer's
+/// equivalent of LMDB's `P_DIRTY` test on a page in hand, which tells a
+/// descent that copy-on-write has nothing left to do at that level.
+#[inline(always)]
+pub(crate) fn node_view_classified<'a>(
+    src: Source<'a>,
+    psize: u32,
+    pgno: u64,
+    valid: Option<&ValidatedPages<'_>>,
+) -> Result<(NodeView<'a>, bool), PageError> {
+    let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
+    let page = PageRef::new_trusted_psize(bytes, psize)?;
+    let view = match page.page_type() {
+        PageType::Leaf => leaf_view_over(bytes, from_map, psize, pgno, valid).map(NodeView::Leaf),
+        PageType::Branch => {
+            branch_view_over(bytes, from_map, psize, pgno, valid).map(NodeView::Branch)
+        }
+        other => Err(wrong_type(other)),
+    }?;
+    Ok((view, from_map))
+}
+
+// ---------------------------------------------------------------------------
+// Page loading + value resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve the value of leaf entry `i` to a contiguous `&'a [u8]` (SPEC 03 §3):
+/// inline values borrow the leaf page; `F_BIGDATA` values borrow the overflow
+/// run, sliced from the head page across the whole run.
+///
+/// Under the trusting policy (ADR-0014) an overflow value
+/// is sliced from its head page without reading the run's header, as LMDB's
+/// `mdb_node_read` computes the data address from the page number alone. The
+/// slice stays bounded by the snapshot's high-water (`Source::bytes_from`
+/// clamps there), so a corrupt run can only yield wrong bytes or a typed
+/// error, never a read outside the committed map.
+#[inline(always)]
+fn resolve_value<'a>(
+    src: Source<'a>,
+    psize: u32,
+    leaf: &LeafRef<'a>,
+    i: usize,
+    valid: Option<&ValidatedPages<'_>>,
+) -> Result<&'a [u8], PageError> {
+    match leaf.value(i) {
+        LeafValue::Inline(v) => Ok(v),
+        LeafValue::Overflow { head_pgno, dsize } => {
+            resolve_overflow(src, psize, head_pgno, dsize, valid)
+        }
+    }
+}
+
+/// The overflow arm of [`resolve_value`], kept out of line so the inline
+/// arm stays small where it is inlined into the cursor steps.
+#[inline(never)]
+fn resolve_overflow<'a>(
+    src: Source<'a>,
+    psize: u32,
+    head_pgno: u64,
+    dsize: u32,
+    valid: Option<&ValidatedPages<'_>>,
+) -> Result<&'a [u8], PageError> {
+    let run = src.bytes_from(psize, head_pgno)?;
+    if valid.is_some_and(ValidatedPages::trusts_file) {
+        let end = crate::page::HEADER_SIZE + dsize as usize;
+        return run
+            .get(crate::page::HEADER_SIZE..end)
+            .ok_or(PageError::BufferTooSmall {
+                got: run.len(),
+                psize: end,
+            });
+    }
+    OverflowRef::new(run, psize)?.payload(dsize)
+}
+
+// ---------------------------------------------------------------------------
+// Tree — the immutable handle over one B+tree
+// ---------------------------------------------------------------------------
+
+/// An immutable view of one B+tree, rooted at `root` with height `depth`
+/// (SPEC 03 §1). Cheap to copy; carries no owned state.
+#[derive(Clone, Copy)]
+pub struct Tree<'a> {
+    src: Source<'a>,
+    psize: u32,
+    root: u64,
+    depth: u16,
+    /// The ordering this tree is stored under (SPEC 03 §2.0).
+    /// Carried by the `Tree` rather than looked up per comparison so every
+    /// descent, seek and hit-test in this module uses the same ordering by
+    /// construction — the only way to be sure none of them silently falls back
+    /// to memcmp.
+    cmp: KeyCmp<'a>,
+    /// The owning txn's validated-pages memo, if it provides one
+    /// ([`ValidatedPages`]); `None` (always fully validate) for tests, tools
+    /// and the GC tree.
+    valid: Option<&'a ValidatedPages<'a>>,
+}
+
+impl<'a> Tree<'a> {
+    /// Build a tree view over `src` with the given page size, root page number
+    /// (`PGNO_INVALID` for an empty tree), and height.
+    #[must_use]
+    pub fn new(src: Source<'a>, psize: u32, root: u64, depth: u16) -> Tree<'a> {
+        Tree::with_comparator(src, psize, root, depth, KeyCmp::Default)
+    }
+
+    /// As [`Tree::new`], under an explicit ordering (custom comparators). Every
+    /// engine path that serves a *named* database builds its tree through here;
+    /// [`Tree::new`] (memcmp) remains correct for the main/catalog tree and the
+    /// GC tree, which are memcmp by construction (SPEC 03 §2.0).
+    #[must_use]
+    pub fn with_comparator(
+        src: Source<'a>,
+        psize: u32,
+        root: u64,
+        depth: u16,
+        cmp: KeyCmp<'a>,
+    ) -> Tree<'a> {
+        Tree {
+            src,
+            psize,
+            root,
+            depth,
+            cmp,
+            valid: None,
+        }
+    }
+
+    /// Attach the owning txn's validated-pages memo. Descents
+    /// through this tree then skip re-validating cells of map-sourced pages
+    /// already validated this txn; without it every view fully validates.
+    #[must_use]
+    pub(crate) fn with_validation_memo(
+        mut self,
+        valid: Option<&'a ValidatedPages<'a>>,
+    ) -> Tree<'a> {
+        self.valid = valid;
+        self
+    }
+
+    /// The ordering this tree is stored under.
+    #[must_use]
+    pub fn comparator(&self) -> KeyCmp<'a> {
+        self.cmp
+    }
+
+    /// Whether the tree is empty (`root == PGNO_INVALID`).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.root == PGNO_INVALID
+    }
+
+    /// `get(key)` (SPEC 03 §2 tail): the value for `key` if present, else `None`
+    /// (a missing key is `Ok(None)`, never an error — SPEC 00 rows 14/30). The
+    /// value is resolved zero-copy, spanning an overflow run if `F_BIGDATA`.
+    ///
+    /// # Errors
+    ///
+    /// A [`PageError`] only if the tree is structurally corrupt.
+    pub fn get(&self, key: &[u8]) -> Result<Option<&'a [u8]>, PageError> {
+        match self.find_exact(key)? {
+            Some((leaf, ki)) => Ok(Some(resolve_value(
+                self.src, self.psize, &leaf, ki, self.valid,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Root-to-leaf descent for an exact point lookup: the leaf holding `key`
+    /// and its slot, or `None` if absent. No cursor: a point lookup needs no
+    /// path, so it skips the [`PathStack`] and the leaf cache, and it takes
+    /// exactness from the leaf's binary search instead of comparing the found
+    /// key a second time. LMDB's `mdb_node_search` reports exactness the same
+    /// way, and `mdb_cursor_init` only resets the depth. The level bound and
+    /// its error match [`Cursor::search`]: `depth + 2` iterations, capped at
+    /// the `CURSOR_STACK` frames its path stack can push, so a hostile depth
+    /// over a page cycle fails after the same number of levels.
+    fn find_exact(&self, key: &[u8]) -> Result<Option<(LeafRef<'a>, usize)>, PageError> {
+        if self.root == PGNO_INVALID {
+            return Ok(None);
+        }
+        let mut pgno = self.root;
+        for _ in 0..(self.depth as usize + 2).min(CURSOR_STACK) {
+            match node_view(self.src, self.psize, pgno, self.valid)? {
+                NodeView::Leaf(leaf) => {
+                    return Ok(match leaf.lookup_with(key, self.cmp) {
+                        Ok(ki) => Some((leaf, ki)),
+                        Err(_) => None,
+                    });
+                }
+                NodeView::Branch(br) => {
+                    pgno = br.child_pgno(br.child_index_with(key, self.cmp));
+                }
+            }
+        }
+        Err(depth_exceeded())
+    }
+
+    /// Catalog lookup for the named-DB resolver (SPEC 02 §6): like [`Tree::get`]
+    /// but also returns the leaf **node flags** of the matched entry, so the
+    /// caller can tell an `F_SUBDATA` sub-DB record from a plain user key
+    /// (a name collision → `Incompatible`). `Ok(None)` if the key is absent.
+    ///
+    /// # Errors
+    ///
+    /// A [`PageError`] only if the tree is structurally corrupt.
+    pub fn get_catalog_entry(&self, key: &[u8]) -> Result<Option<(u16, &'a [u8])>, PageError> {
+        match self.find_exact(key)? {
+            Some((leaf, ki)) => {
+                let flags = leaf.node_flags(ki);
+                Ok(Some((
+                    flags,
+                    resolve_value(self.src, self.psize, &leaf, ki, self.valid)?,
+                )))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Open a fresh, unpositioned [`Cursor`] over this tree.
+    #[must_use]
+    pub fn cursor(&self) -> Cursor<'a> {
+        Cursor::new(*self)
+    }
+
+    /// The entry at a known `(leaf pgno, cell index)` position:
+    /// used by the write cursor to re-materialize the borrows of a position it
+    /// computed while holding a *different* borrow of the txn. Goes through the
+    /// txn's validated-pages memo, so no re-validation on the hot path.
+    ///
+    /// The caller vouches that `(pgno, ki)` is a live leaf position in **this**
+    /// tree state (the write cursor only replays positions it just derived,
+    /// with no mutation in between — it holds the `&mut RwTxn` exclusively).
+    ///
+    /// # Errors
+    ///
+    /// A [`PageError`] if the page is not a valid leaf or `ki` is out of range.
+    pub(crate) fn entry_at(&self, pgno: u64, ki: usize) -> Result<(&'a [u8], &'a [u8]), PageError> {
+        let leaf = leaf_view(self.src, self.psize, pgno, self.valid)?;
+        let n = leaf.num_keys();
+        if ki >= n {
+            // Unreachable under the caller contract; surfaced as an
+            // out-of-bounds cell rather than a panic so a logic error degrades
+            // to `Invalid`, not UB-adjacent behavior.
+            debug_assert!(false, "entry_at({pgno}, {ki}) past num_keys={n}");
+            return Err(PageError::CellOutOfBounds {
+                offset: ki,
+                needed: 1,
+                body_size: n,
+            });
+        }
+        let k = leaf.key(ki);
+        let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
+        Ok((k, v))
+    }
+
+    /// The entry in slot `ki` of leaf `pgno`, or `None` when `ki` is past the
+    /// leaf's last cell: the write cursor's in-leaf step (LMDB's
+    /// `mdb_cursor_next` reading the node at `mc_ki` in the page it already
+    /// holds), which needs no cursor rebuilt around its parked path.
+    ///
+    /// The caller vouches that `pgno` is a live leaf of this tree state, as
+    /// for [`entry_at`](Self::entry_at); only `ki` may run past the end.
+    ///
+    /// # Errors
+    ///
+    /// A [`PageError`] if the page is not a valid leaf.
+    pub(crate) fn entry_in_leaf(&self, pgno: u64, ki: usize) -> PosResult<'a> {
+        let leaf = leaf_view(self.src, self.psize, pgno, self.valid)?;
+        if ki >= leaf.num_keys() {
+            return Ok(None);
+        }
+        let k = leaf.key(ki);
+        let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
+        Ok(Some((k, v)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PathStack — inline root-to-leaf frame stack (no heap allocation per cursor)
+// ---------------------------------------------------------------------------
+
+/// Maximum root-to-leaf frames a cursor path can hold — LMDB's
+/// `CURSOR_STACK` bound. With the B+tree's minimum branch fanout of 2,
+/// depth 32 already addresses 2^31 leaf pages (8 TB at the smallest page
+/// size); any deeper descent means a corrupt `depth`/cycle and fails with
+/// the same typed error the per-descent iteration guards produce.
+pub(crate) const CURSOR_STACK: usize = 32;
+
+/// A `Vec`-shaped fixed-capacity `(pgno, ki)` stack. Descents are the
+/// engine's hottest loop, and a heap `Vec` would cost one alloc + free per
+/// `Tree::get`.
+/// Inline storage makes cursor construction allocation-free; `push` reports
+/// overflow as a typed corruption error instead of growing.
+///
+/// Public only as the default path storage of [`Cursor`]; it has no public
+/// methods.
+#[derive(Clone, Debug)]
+pub struct PathStack {
+    /// Frames `0..len`; slots past `len` are dead space.
+    buf: [(u64, usize); CURSOR_STACK],
+    len: usize,
+}
+
+impl PathStack {
+    fn new() -> PathStack {
+        PathStack {
+            buf: [(0, 0); CURSOR_STACK],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, frame: (u64, usize)) -> Result<(), PageError> {
+        match self.buf.get_mut(self.len) {
+            Some(slot) => {
+                *slot = frame;
+                self.len += 1;
+                Ok(())
+            }
+            // Deeper than any legal tree: reject like the descent iteration
+            // guards do (SPEC 03 §11 INV-7), never overflow.
+            None => Err(depth_exceeded()),
+        }
+    }
+
+    fn pop(&mut self) -> Option<(u64, usize)> {
+        if self.len == 0 {
+            None
+        } else {
+            self.len -= 1;
+            Some(self.buf[self.len])
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    /// The live frames as one mutable slice, for the write path's
+    /// `touch_path`/`rebalance` (which take `&mut [(u64, usize)]`). Lets a
+    /// parked cursor's path be deleted at directly, with no descent and no
+    /// `Vec` (SPEC 03 §5.4a).
+    fn frames_mut(&mut self) -> &mut [(u64, usize)] {
+        &mut self.buf[..self.len]
+    }
+
+    fn last(&self) -> Option<&(u64, usize)> {
+        self.buf[..self.len].last()
+    }
+
+    fn last_mut(&mut self) -> Option<&mut (u64, usize)> {
+        self.buf[..self.len].last_mut()
+    }
+
+    /// Drop frame 0 (the root frame), shifting the rest down: the write
+    /// path's root-shrink repair (SPEC 03 §5.4a) — the old root left the tree
+    /// and its only child, frame 1, is the new root frame.
+    fn drop_root(&mut self) {
+        debug_assert!(self.len >= 2, "root pop needs a frame below the root");
+        self.buf.copy_within(1..self.len, 0);
+        self.len -= 1;
+    }
+
+    /// Insert `frame` as the new frame 0, shifting the rest up: the write
+    /// path's root-grow repair (SPEC 03 §5.4b) — a split reached the root,
+    /// and the new root branch sits above the old root level.
+    fn push_root(&mut self, frame: (u64, usize)) -> Result<(), PageError> {
+        if self.len == CURSOR_STACK {
+            return Err(depth_exceeded());
+        }
+        self.buf.copy_within(0..self.len, 1);
+        self.buf[0] = frame;
+        self.len += 1;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cursor — the read positioning state machine (SPEC 03 §4)
+// ---------------------------------------------------------------------------
+
+/// A read cursor: a root-to-leaf path plus the `INITIALIZED`/`EOF` flags of
+/// SPEC 03 §4. All positioning ops return the entry at the new position (or
+/// `None` at an edge), borrowing key/value `&'a [u8]` from the source.
+///
+/// `S` holds the path: owned by default, or borrowed from a write cursor's
+/// parked `SavedCursor` (`Cursor::resume_in`), so a step moves the
+/// cursor where it is parked instead of copying the whole stack in and out.
+#[derive(Clone)]
+pub struct Cursor<'a, S: BorrowMut<PathStack> = PathStack> {
+    src: Source<'a>,
+    psize: u32,
+    root: u64,
+    depth: u16,
+    /// `(pgno, ki)` from root (index 0) to the current leaf (`top`). Empty when
+    /// the cursor is unpositioned.
+    path: S,
+    /// The `INITIALIZED` flag (SPEC 03 §4): the cursor has been positioned.
+    /// Cleared on before-begin (`prev` past the minimum) and on a failed exact
+    /// `set`.
+    initialized: bool,
+    /// The `EOF` flag (SPEC 03 §4): the cursor sits past the maximum entry.
+    eof: bool,
+    /// The tree's ordering, copied from the [`Tree`] this
+    /// cursor was opened on so every seek uses it.
+    cmp: KeyCmp<'a>,
+    /// Memoized current leaf view, keyed by pgno.
+    ///
+    /// [`LeafRef::new`] validates **every cell** on the page (O(`num_keys`)), so
+    /// re-deriving the view on each step makes a full scan O(`num_keys`²) per
+    /// page instead of O(`num_keys`) — the dominant cost in cursor iteration.
+    /// Caching keeps the validation (every page is still fully validated before
+    /// any access) and just stops repeating it while the cursor stays on one
+    /// page.
+    ///
+    /// Soundness: the cursor owns a [`Source<'a>`], whose `&'a [u8]` map and
+    /// `&'a DirtyStore` are *immutable* borrows for `'a`. No mutation can occur
+    /// while this cursor is alive, so a cached view can never go stale.
+    leaf_cache: Cell<Option<(u64, LeafRef<'a>)>>,
+    /// The owning txn's validated-pages memo, copied from the
+    /// [`Tree`] this cursor was opened on.
+    valid: Option<&'a ValidatedPages<'a>>,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(t: Tree<'a>) -> Cursor<'a> {
+        Cursor {
+            src: t.src,
+            psize: t.psize,
+            root: t.root,
+            depth: t.depth,
+            path: PathStack::new(),
+            initialized: false,
+            eof: false,
+            cmp: t.cmp,
+            leaf_cache: Cell::new(None),
+            valid: t.valid,
+        }
+    }
+}
+
+impl<'a, S: BorrowMut<PathStack>> Cursor<'a, S> {
+    #[inline(always)]
+    fn stack(&self) -> &PathStack {
+        self.path.borrow()
+    }
+
+    #[inline(always)]
+    fn stack_mut(&mut self) -> &mut PathStack {
+        self.path.borrow_mut()
+    }
+
+    // -- page helpers ------------------------------------------------------
+
+    /// The validated leaf view for `pgno`, reusing the memoized one while the
+    /// cursor stays on the same page (see [`Cursor::leaf_cache`]). A miss goes
+    /// through the txn's validated-pages memo ([`leaf_view`]).
+    #[inline(always)]
+    fn leaf_at(&self, pgno: u64) -> Result<LeafRef<'a>, PageError> {
+        if let Some((cached, leaf)) = self.leaf_cache.get() {
+            if cached == pgno {
+                return Ok(leaf);
+            }
+        }
+        let leaf = leaf_view(self.src, self.psize, pgno, self.valid)?;
+        self.leaf_cache.set(Some((pgno, leaf)));
+        Ok(leaf)
+    }
+
+    /// The validated branch view for `pgno`, through the txn's memo
+    /// ([`branch_view`]).
+    fn branch_at(&self, pgno: u64) -> Result<BranchRef<'a>, PageError> {
+        branch_view(self.src, self.psize, pgno, self.valid)
+    }
+
+    /// The entry at the current leaf position, or `None` if unpositioned / EOF /
+    /// parked past the end of a leaf. Shared by every positioning op.
+    fn current(&self) -> PosResult<'a> {
+        if !self.initialized || self.eof {
+            return Ok(None);
+        }
+        let (pgno, ki) = match self.stack().last() {
+            Some(f) => *f,
+            None => return Ok(None),
+        };
+        let leaf = self.leaf_at(pgno)?;
+        if ki >= leaf.num_keys() {
+            return Ok(None);
+        }
+        let k = leaf.key(ki);
+        let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
+        Ok(Some((k, v)))
+    }
+
+    // -- descents ----------------------------------------------------------
+
+    /// Descend from `start` taking child 0 at every branch to the leftmost leaf,
+    /// pushing frames with `ki = 0`.
+    fn descend_min(&mut self, start: u64) -> Result<(), PageError> {
+        let mut pgno = start;
+        for _ in 0..=(self.depth as usize + 1) {
+            match node_view(self.src, self.psize, pgno, self.valid)? {
+                NodeView::Leaf(leaf) => {
+                    self.stack_mut().push((pgno, 0))?;
+                    self.leaf_cache.set(Some((pgno, leaf)));
+                    return Ok(());
+                }
+                NodeView::Branch(br) => {
+                    self.stack_mut().push((pgno, 0))?;
+                    pgno = br.child_pgno(0);
+                }
+            }
+        }
+        Err(depth_exceeded())
+    }
+
+    /// Descend from `start` taking the last child at every branch to the
+    /// rightmost leaf, pushing frames with `ki = num_keys − 1`.
+    fn descend_max(&mut self, start: u64) -> Result<(), PageError> {
+        let mut pgno = start;
+        for _ in 0..=(self.depth as usize + 1) {
+            match node_view(self.src, self.psize, pgno, self.valid)? {
+                NodeView::Leaf(leaf) => {
+                    let n = leaf.num_keys();
+                    self.stack_mut().push((pgno, n.saturating_sub(1)))?;
+                    self.leaf_cache.set(Some((pgno, leaf)));
+                    return Ok(());
+                }
+                NodeView::Branch(br) => {
+                    let last = br.num_keys().saturating_sub(1);
+                    self.stack_mut().push((pgno, last))?;
+                    pgno = br.child_pgno(last);
+                }
+            }
+        }
+        Err(depth_exceeded())
+    }
+
+    /// Position at the leaf that would contain `key`, `ki` = lower-bound slot
+    /// (may equal `num_keys`). Leaves the cursor uninitialized on an empty tree
+    /// (SPEC 03 §2).
+    fn search(&mut self, key: &[u8]) -> Result<(), PageError> {
+        self.stack_mut().clear();
+        self.eof = false;
+        if self.root == PGNO_INVALID {
+            self.initialized = false;
+            return Ok(());
+        }
+        let mut pgno = self.root;
+        for _ in 0..=(self.depth as usize + 1) {
+            match node_view(self.src, self.psize, pgno, self.valid)? {
+                NodeView::Leaf(leaf) => {
+                    let ki = match leaf.lookup_with(key, self.cmp) {
+                        Ok(i) | Err(i) => i,
+                    };
+                    self.stack_mut().push((pgno, ki))?;
+                    self.leaf_cache.set(Some((pgno, leaf)));
+                    self.initialized = true;
+                    return Ok(());
+                }
+                NodeView::Branch(br) => {
+                    let i = br.child_index_with(key, self.cmp);
+                    self.stack_mut().push((pgno, i))?;
+                    pgno = br.child_pgno(i);
+                }
+            }
+        }
+        Err(depth_exceeded())
+    }
+
+    // -- ascend helpers (shared by next / prev / set_range) ----------------
+
+    /// From the current leaf, move to the first entry of the next leaf, or set
+    /// `EOF` if there is none. Pops to the first ancestor with a further child,
+    /// then descends leftmost. Does **not** read the leaf's own `ki`, so it is
+    /// also used by `set_range` when parked past a leaf's end.
+    fn ascend_next(&mut self) -> PosResult<'a> {
+        loop {
+            if self.stack().len() <= 1 {
+                self.eof = true;
+                return Ok(None);
+            }
+            self.stack_mut().pop();
+            let (bp, bki) = *self.stack().last().expect("len > 1");
+            let br = self.branch_at(bp)?;
+            if bki + 1 < br.num_keys() {
+                self.stack_mut().last_mut().expect("len > 1").1 = bki + 1;
+                let child = br.child_pgno(bki + 1);
+                self.descend_min(child)?;
+                return self.current();
+            }
+        }
+    }
+
+    /// [`ascend_next`](Self::ascend_next)'s walk without its final read: land
+    /// on the first slot of the next leaf (`true`) or set `EOF` (`false`), for
+    /// [`advance_by`](Self::advance_by), which crosses leaves without reading
+    /// their entries. Kept separate from `ascend_next` so the plain `next` path
+    /// is left exactly as it was.
+    fn next_leaf(&mut self) -> Result<bool, PageError> {
+        loop {
+            if self.stack().len() <= 1 {
+                self.eof = true;
+                return Ok(false);
+            }
+            self.stack_mut().pop();
+            let (bp, bki) = *self.stack().last().expect("len > 1");
+            let br = self.branch_at(bp)?;
+            if bki + 1 < br.num_keys() {
+                self.stack_mut().last_mut().expect("len > 1").1 = bki + 1;
+                let child = br.child_pgno(bki + 1);
+                self.descend_min(child)?;
+                return Ok(true);
+            }
+        }
+    }
+
+    /// Symmetric to [`ascend_next`](Self::ascend_next): move to the last entry of
+    /// the previous leaf, or go before-begin (uninitialized) if there is none.
+    fn ascend_prev(&mut self) -> PosResult<'a> {
+        loop {
+            if self.stack().len() <= 1 {
+                self.initialized = false;
+                self.stack_mut().clear();
+                return Ok(None);
+            }
+            self.stack_mut().pop();
+            let (bp, bki) = *self.stack().last().expect("len > 1");
+            let br = self.branch_at(bp)?;
+            if bki > 0 {
+                self.stack_mut().last_mut().expect("len > 1").1 = bki - 1;
+                let child = br.child_pgno(bki - 1);
+                self.descend_max(child)?;
+                return self.current();
+            }
+        }
+    }
+
+    /// [`ascend_prev`](Self::ascend_prev)'s walk without its final read: land
+    /// on the last slot of the previous leaf (`true`) or go before-begin
+    /// (`false`), for [`retreat_by`](Self::retreat_by).
+    fn prev_leaf(&mut self) -> Result<bool, PageError> {
+        loop {
+            if self.stack().len() <= 1 {
+                self.initialized = false;
+                self.stack_mut().clear();
+                return Ok(false);
+            }
+            self.stack_mut().pop();
+            let (bp, bki) = *self.stack().last().expect("len > 1");
+            let br = self.branch_at(bp)?;
+            if bki > 0 {
+                self.stack_mut().last_mut().expect("len > 1").1 = bki - 1;
+                let child = br.child_pgno(bki - 1);
+                self.descend_max(child)?;
+                return Ok(true);
+            }
+        }
+    }
+
+    // -- public positioning ops (SPEC 03 §4) -------------------------------
+
+    /// `first` (`MDB_FIRST`) — SPEC 03 §4: leftmost entry; empty tree → `None`,
+    /// cursor stays uninitialized. Clears `EOF`.
+    pub fn first(&mut self) -> PosResult<'a> {
+        self.stack_mut().clear();
+        self.eof = false;
+        if self.root == PGNO_INVALID {
+            self.initialized = false;
+            return Ok(None);
+        }
+        self.descend_min(self.root)?;
+        self.initialized = true;
+        self.current()
+    }
+
+    /// `last` (`MDB_LAST`) — SPEC 03 §4: rightmost entry; empty tree → `None`.
+    pub fn last(&mut self) -> PosResult<'a> {
+        self.stack_mut().clear();
+        self.eof = false;
+        if self.root == PGNO_INVALID {
+            self.initialized = false;
+            return Ok(None);
+        }
+        self.descend_max(self.root)?;
+        self.initialized = true;
+        self.current()
+    }
+
+    /// `next` (`MDB_NEXT`) — SPEC 03 §4: from an uninitialized cursor behaves as
+    /// [`first`](Self::first); at `EOF` keeps returning `None`; otherwise
+    /// advances one entry, hopping to the next leaf when the current one is
+    /// exhausted.
+    ///
+    /// Named after `MDB_NEXT` (not [`Iterator::next`]): this is a cursor
+    /// positioning op that returns a `Result`, and the SPEC 03 `next`/`prev`
+    /// pair is the readable naming.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> PosResult<'a> {
+        if !self.initialized {
+            return self.first();
+        }
+        if self.eof {
+            return Ok(None);
+        }
+        let (pgno, ki) = *self
+            .stack()
+            .last()
+            .expect("initialized cursor has a leaf frame");
+        let leaf = self.leaf_at(pgno)?;
+        if ki + 1 < leaf.num_keys() {
+            // Same leaf: bump the slot and read the entry from the leaf view
+            // already in hand, as LMDB's `mdb_cursor_next` reads the node
+            // right after `mc_ki++`, rather than re-deriving it in `current`.
+            let ki = ki + 1;
+            self.stack_mut().last_mut().expect("leaf frame").1 = ki;
+            let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
+            return Ok(Some((leaf.key(ki), v)));
+        }
+        self.ascend_next()
+    }
+
+    /// Yield the entry at the slot the cursor already sits on, **without
+    /// advancing** (SPEC 03 §7 / §5.4a; LMDB's `C_DEL` resume).
+    ///
+    /// The write cursor parks here after `del_current`: the vacated slot now
+    /// holds the deleted entry's successor, so `next` must settle rather than
+    /// step. If the delete vacated the leaf's last slot the successor lives on
+    /// the following leaf, which is where `ascend_next` from the last live slot
+    /// lands.
+    ///
+    /// Only the write cursor's post-delete path calls this; a cursor that has
+    /// not just deleted must use [`next`](Self::next).
+    pub(crate) fn settle(&mut self) -> PosResult<'a> {
+        if !self.initialized {
+            return self.first();
+        }
+        if self.eof {
+            return Ok(None);
+        }
+        let (pgno, ki) = *self
+            .stack()
+            .last()
+            .expect("initialized cursor has a leaf frame");
+        let leaf = self.leaf_at(pgno)?;
+        let nkeys = leaf.num_keys();
+        if ki < nkeys {
+            return self.current();
+        }
+        // The vacated slot was past the last live cell. An empty leaf cannot
+        // reach here: emptying one is a structural change (§10), and the write
+        // cursor discards its path on those rather than parking.
+        debug_assert!(nkeys > 0, "settle on an empty leaf");
+        self.stack_mut().last_mut().expect("leaf frame").1 = nkeys.saturating_sub(1);
+        self.ascend_next()
+    }
+
+    /// `prev` (`MDB_PREV`) — SPEC 03 §4: from an uninitialized cursor behaves as
+    /// [`last`](Self::last); from `EOF` returns the maximum entry (`last`);
+    /// otherwise steps back one entry, hopping to the previous leaf. Stepping
+    /// past the minimum leaves the cursor before-begin (uninitialized), so a
+    /// following `next` yields `first`.
+    pub fn prev(&mut self) -> PosResult<'a> {
+        if !self.initialized {
+            return self.last();
+        }
+        if self.eof {
+            // Past the maximum: the entry before "past the end" is the global
+            // maximum (SPEC 03 §4 EOF/empty summary).
+            self.eof = false;
+            return self.last();
+        }
+        let (pgno, ki) = *self
+            .stack()
+            .last()
+            .expect("initialized cursor has a leaf frame");
+        if ki > 0 {
+            // Same leaf: read the entry directly, as `next` does.
+            let ki = ki - 1;
+            self.stack_mut().last_mut().expect("leaf frame").1 = ki;
+            let leaf = self.leaf_at(pgno)?;
+            if ki < leaf.num_keys() {
+                let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
+                return Ok(Some((leaf.key(ki), v)));
+            }
+            return self.current();
+        }
+        self.ascend_prev()
+    }
+
+    /// Skip forward: the position `n` calls to [`next`](Self::next) reach,
+    /// without reading the entries in between (SPEC 03 §4 "advance_by /
+    /// retreat_by"). Within a leaf the slot index moves by `n` directly; a
+    /// leaf the walk leaves is crossed by its entry count, and the next leaf is
+    /// reached by [`next`](Self::next)'s ascend-and-descend. Skipped entries'
+    /// values are never resolved, so their overflow pages are never read.
+    ///
+    /// `past_end` is asked about the last key of each leaf before the walk
+    /// leaves it; `true` stops the walk with `Ok(None)`. A range iterator passes
+    /// its terminating bound, so a skip that overshoots the range stops at the
+    /// leaf holding the bound instead of walking the rest of the tree.
+    ///
+    /// An unpositioned or `EOF` cursor has no leaf to count from and falls
+    /// back to `n` single steps.
+    pub fn advance_by(
+        &mut self,
+        mut n: usize,
+        mut past_end: impl FnMut(&[u8]) -> bool,
+    ) -> PosResult<'a> {
+        if n == 0 {
+            return self.current();
+        }
+        if !self.initialized || self.eof {
+            for _ in 1..n {
+                if self.next()?.is_none() {
+                    return Ok(None);
+                }
+            }
+            return self.next();
+        }
+        loop {
+            let (pgno, ki) = *self
+                .stack()
+                .last()
+                .expect("initialized cursor has a leaf frame");
+            let leaf = self.leaf_at(pgno)?;
+            let nkeys = leaf.num_keys();
+            let left = nkeys.saturating_sub(ki + 1);
+            if n <= left {
+                self.stack_mut().last_mut().expect("leaf frame").1 = ki + n;
+                return self.current();
+            }
+            // The next leaf's first entry is `left + 1` steps away.
+            n -= left + 1;
+            if nkeys > 0 && past_end(leaf.key(nkeys - 1)) {
+                return Ok(None);
+            }
+            if !self.next_leaf()? {
+                return Ok(None);
+            }
+            if n == 0 {
+                return self.current();
+            }
+        }
+    }
+
+    /// Skip backward: the position `n` calls to [`prev`](Self::prev) reach,
+    /// mirroring [`advance_by`](Self::advance_by). `past_end` is asked about
+    /// the first key of each leaf before the walk leaves it.
+    pub fn retreat_by(
+        &mut self,
+        mut n: usize,
+        mut past_end: impl FnMut(&[u8]) -> bool,
+    ) -> PosResult<'a> {
+        if n == 0 {
+            return self.current();
+        }
+        if !self.initialized || self.eof {
+            for _ in 1..n {
+                if self.prev()?.is_none() {
+                    return Ok(None);
+                }
+            }
+            return self.prev();
+        }
+        loop {
+            let (pgno, ki) = *self
+                .stack()
+                .last()
+                .expect("initialized cursor has a leaf frame");
+            if n <= ki {
+                self.stack_mut().last_mut().expect("leaf frame").1 = ki - n;
+                return self.current();
+            }
+            // The previous leaf's last entry is `ki + 1` steps away.
+            n -= ki + 1;
+            let leaf = self.leaf_at(pgno)?;
+            if leaf.num_keys() > 0 && past_end(leaf.key(0)) {
+                return Ok(None);
+            }
+            if !self.prev_leaf()? {
+                return Ok(None);
+            }
+            if n == 0 {
+                return self.current();
+            }
+        }
+    }
+
+    /// `set` (`MDB_SET`) — SPEC 03 §4: exact match. Positions on `key` and
+    /// returns its entry, or `None` (LMDB `MDB_NOTFOUND`) leaving the cursor
+    /// unpositioned for iteration.
+    pub fn set_exact(&mut self, key: &[u8]) -> PosResult<'a> {
+        self.search(key)?;
+        if !self.initialized {
+            return Ok(None);
+        }
+        let (pgno, ki) = *self
+            .stack()
+            .last()
+            .expect("initialized cursor has a leaf frame");
+        let leaf = self.leaf_at(pgno)?;
+        if ki < leaf.num_keys() && self.cmp.eq(leaf.key(ki), key) {
+            return self.current();
+        }
+        // Not found: leave unpositioned for iteration (SPEC 03 §4 `set`).
+        self.initialized = false;
+        Ok(None)
+    }
+
+    /// `set_range` (`MDB_SET_RANGE`, `≥`) — SPEC 03 §4: the first entry `≥ key`,
+    /// hopping to the following leaf when `key` is past the searched leaf's end;
+    /// empty tree / nothing `≥ key` → `None`.
+    pub fn set_range(&mut self, key: &[u8]) -> PosResult<'a> {
+        self.search(key)?;
+        if !self.initialized {
+            return Ok(None);
+        }
+        let (pgno, ki) = *self
+            .stack()
+            .last()
+            .expect("initialized cursor has a leaf frame");
+        let leaf = self.leaf_at(pgno)?;
+        if ki < leaf.num_keys() {
+            return self.current();
+        }
+        // `key` is past the end of this leaf: advance to the next leaf's first
+        // entry (SPEC 03 §4 `set_range`).
+        self.ascend_next()
+    }
+
+    /// `get_greater_than` (`>`) — SPEC 03 §4: the least entry strictly greater
+    /// than `key`. `set_range` then skip an equal hit.
+    pub fn get_greater_than(&mut self, key: &[u8]) -> PosResult<'a> {
+        match self.set_range(key)? {
+            None => Ok(None),
+            Some((k, _)) if self.cmp.eq(k, key) => self.next(),
+            some => Ok(some),
+        }
+    }
+
+    /// `get_greater_than_or_equal_to` (`≥`) — SPEC 00 SHOULD; identical to
+    /// [`set_range`](Self::set_range).
+    pub fn get_greater_than_or_equal_to(&mut self, key: &[u8]) -> PosResult<'a> {
+        self.set_range(key)
+    }
+
+    /// `get_lower_than_or_equal_to` (`≤`) — SPEC 03 §4: the greatest entry `≤
+    /// key`. `set_range`; if it overshot (or hit end) step back / take `last`.
+    pub fn get_lower_than_or_equal_to(&mut self, key: &[u8]) -> PosResult<'a> {
+        match self.set_range(key)? {
+            None => self.last(),
+            Some((k, _)) if self.cmp.eq(k, key) => self.current(),
+            Some(_) => self.prev(),
+        }
+    }
+
+    /// `get_lower_than` (`<`) — SPEC 00 SHOULD: the greatest entry strictly less
+    /// than `key`. `set_range` then step back once (the first `≥ key`, whether
+    /// `==` or `>`, is stepped over).
+    pub fn get_lower_than(&mut self, key: &[u8]) -> PosResult<'a> {
+        match self.set_range(key)? {
+            None => self.last(),
+            Some(_) => self.prev(),
+        }
+    }
+
+    /// The leaf **node flags** of the entry at the current position (tools and
+    /// copy): lets `dump`/`copy_to_file` tell an `F_SUBDATA` named-DB
+    /// catalog record apart from a plain user-data key during an in-order scan
+    /// (SPEC 02 §6). `None` if unpositioned, at `EOF`, or parked past a leaf's
+    /// last entry — the same positions for which the current entry is
+    /// `None`.
+    ///
+    /// # Errors
+    ///
+    /// A [`PageError`] only if the tree is structurally corrupt.
+    pub fn current_flags(&self) -> Result<Option<u16>, PageError> {
+        if !self.initialized || self.eof {
+            return Ok(None);
+        }
+        let (pgno, ki) = match self.stack().last() {
+            Some(f) => *f,
+            None => return Ok(None),
+        };
+        let leaf = self.leaf_at(pgno)?;
+        if ki >= leaf.num_keys() {
+            return Ok(None);
+        }
+        Ok(Some(leaf.node_flags(ki)))
+    }
+}
+
+// -- park / resume (the write cursor's stack persistence) --
+
+impl<'a, 's> Cursor<'a, &'s mut PathStack> {
+    /// A cursor over `t` that moves the position parked in `saved` **in
+    /// place**: the stack is borrowed, not copied, and the
+    /// `INITIALIZED`/`EOF` flags go back with [`park_in`](Self::park_in).
+    ///
+    /// Caller contract: `saved` must have been parked from a
+    /// cursor over the **same tree state** — same root, same pages, no
+    /// mutation in between (or be empty). The write cursor guarantees this by
+    /// holding the `&mut RwTxn` exclusively and repairing or dropping its
+    /// parked state on every mutation.
+    pub(crate) fn resume_in(t: Tree<'a>, saved: &'s mut SavedCursor) -> Self {
+        Cursor {
+            src: t.src,
+            psize: t.psize,
+            root: t.root,
+            depth: t.depth,
+            path: &mut saved.stack,
+            initialized: saved.initialized,
+            eof: saved.eof,
+            cmp: t.cmp,
+            leaf_cache: Cell::new(None),
+            valid: t.valid,
+        }
+    }
+
+    /// End a [`resume_in`](Self::resume_in): the flags this cursor ends with,
+    /// for [`SavedCursor::set_flags`] once the stack borrow is released.
+    pub(crate) fn park_in(self) -> (bool, bool) {
+        (self.initialized, self.eof)
+    }
+}
+
+/// A [`Cursor`]'s position detached from its borrows (write-cursor persistence): the
+/// root-to-leaf `(pgno, child/cell index)` stack plus the SPEC 03 §4
+/// `INITIALIZED`/`EOF` flags. Only meaningful for the exact tree state it was
+/// parked from (see [`Cursor::resume_in`]).
+#[derive(Debug)]
+pub(crate) struct SavedCursor {
+    stack: PathStack,
+    initialized: bool,
+    eof: bool,
+}
+
+impl SavedCursor {
+    /// An unpositioned parked cursor (a fresh cursor's position), for
+    /// [`Cursor::resume_in`] to position by a seek.
+    pub(crate) fn empty() -> SavedCursor {
+        SavedCursor {
+            stack: PathStack::new(),
+            initialized: false,
+            eof: false,
+        }
+    }
+
+    /// Store the flags a [`Cursor::resume_in`] ended with
+    /// ([`Cursor::park_in`]).
+    pub(crate) fn set_flags(&mut self, (initialized, eof): (bool, bool)) {
+        self.initialized = initialized;
+        self.eof = eof;
+    }
+
+    /// The parked `(leaf pgno, cell index)` if the parked cursor sat on an
+    /// entry (initialized and not at EOF), evaluated on the detached state
+    /// (used by the write cursor's mutations to read the current key without
+    /// resuming).
+    pub(crate) fn entry_pos(&self) -> Option<(u64, usize)> {
+        if !self.initialized || self.eof {
+            return None;
+        }
+        self.stack.last().copied()
+    }
+
+    /// The parked root-to-leaf path as a mutable slice, so the write path can
+    /// delete at it directly — no descent, no allocation (SPEC 03 §5.4a).
+    /// `touch_path` rewrites the pgnos in place as it COWs, which is exactly
+    /// the remap the parked path needs.
+    pub(crate) fn frames_mut(&mut self) -> &mut [(u64, usize)] {
+        self.stack.frames_mut()
+    }
+
+    /// Move the parked leaf slot to `ki` (the write cursor's in-leaf step,
+    /// [`Tree::entry_in_leaf`]). The caller has checked that `ki` is a live
+    /// slot of the parked leaf.
+    pub(crate) fn set_leaf_slot(&mut self, ki: usize) {
+        if let Some(frame) = self.stack.frames_mut().last_mut() {
+            frame.1 = ki;
+        }
+    }
+
+    /// Apply the root-shrink repair to the parked path (SPEC 03 §5.4a): the
+    /// delete's rebalance freed the old root branch, so frame 0 goes and the
+    /// surviving child becomes the root frame.
+    pub(crate) fn drop_root(&mut self) {
+        self.stack.drop_root();
+    }
+
+    /// Apply the root-grow repair to the parked path (SPEC 03 §5.4b): a put
+    /// split its way up to the root, so the new root's frame goes on top.
+    /// Fails only past [`CURSOR_STACK`] levels, which no legal tree reaches;
+    /// the caller then discards the path.
+    pub(crate) fn push_root(&mut self, frame: (u64, usize)) -> Result<(), PageError> {
+        self.stack.push_root(frame)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prefix helper (SPEC 03 §4 prefix iteration)
+// ---------------------------------------------------------------------------
+
+/// The smallest key strictly greater than every key with prefix `p`
+/// (`prefix_successor`, SPEC 03 §4): increment the last non-`0xFF` byte and drop
+/// the trailing `0xFF`s. `None` when `p` is empty or all `0xFF` (no successor —
+/// the prefix range extends to the end of key space).
+#[must_use]
+pub fn prefix_successor(p: &[u8]) -> Option<Vec<u8>> {
+    let mut s = p.to_vec();
+    while let Some(&last) = s.last() {
+        if last == 0xFF {
+            s.pop();
+        } else {
+            let n = s.len();
+            s[n - 1] = last + 1;
+            return Some(s);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Error helpers (structural corruption)
+// ---------------------------------------------------------------------------
+
+fn wrong_type(found: PageType) -> PageError {
+    PageError::NotATreePage { found }
+}
+
+fn depth_exceeded() -> PageError {
+    PageError::TreeTooDeep
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builder::build_single_db_image;
+    use crate::page::{select_meta, MetaChoice, MetaPage, META_A_PGNO, META_B_PGNO};
+
+    const PS: u32 = 4096;
+    const MAP: u64 = 1 << 20;
+
+    /// A map source over a whole built image: the high-water is the image's
+    /// last page (built images are exact-length files).
+    fn src(img: &[u8]) -> Source<'_> {
+        Source::Map {
+            bytes: img,
+            last_pg: (img.len() / PS as usize) as u64 - 1,
+        }
+    }
+
+    #[test]
+    fn path_stack_is_vec_shaped_and_rejects_overflow() {
+        // The inline stack must behave like a Vec and fail typed (never
+        // grow, never panic) past the CURSOR_STACK bound.
+        let mut s = PathStack::new();
+        assert!(s.last().is_none());
+        assert!(s.pop().is_none());
+        for i in 0..CURSOR_STACK as u64 {
+            s.push((i, i as usize)).expect("within capacity");
+        }
+        assert_eq!(s.len(), CURSOR_STACK);
+        assert!(
+            s.push((99, 0)).is_err(),
+            "frame {CURSOR_STACK} must fail typed, not grow"
+        );
+        assert_eq!(s.pop(), Some((CURSOR_STACK as u64 - 1, CURSOR_STACK - 1)));
+        s.last_mut().expect("nonempty").1 = 7;
+        assert_eq!(s.last(), Some(&(CURSOR_STACK as u64 - 2, 7)));
+        s.clear();
+        assert_eq!(s.len(), 0);
+        assert!(s.last().is_none());
+    }
+
+    /// Build an env image from `entries` and return `(image, main_root, depth)`.
+    fn build(entries: &[(Vec<u8>, Vec<u8>)]) -> (Vec<u8>, u64, u16) {
+        let img = build_single_db_image(PS, MAP, 1, entries, 900).expect("build");
+        let s0 = MetaPage::validate(&img[0..PS as usize], PS).unwrap();
+        let s1 = MetaPage::validate(&img[PS as usize..2 * PS as usize], PS).unwrap();
+        let meta = match select_meta(&s0, &s1, false) {
+            MetaChoice::Both { meta, .. } | MetaChoice::OnlyOne { meta, .. } => meta,
+            MetaChoice::None => panic!("built image has no valid meta"),
+        };
+        let _ = (META_A_PGNO, META_B_PGNO);
+        (img, meta.main_db.root, meta.main_db.depth)
+    }
+
+    fn kv(k: &[u8], v: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        (k.to_vec(), v.to_vec())
+    }
+
+    fn collect_fwd(tree: &Tree<'_>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut c = tree.cursor();
+        let mut out = Vec::new();
+        let mut e = c.first().unwrap();
+        while let Some((k, v)) = e {
+            out.push((k.to_vec(), v.to_vec()));
+            e = c.next().unwrap();
+        }
+        out
+    }
+
+    fn collect_rev(tree: &Tree<'_>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut c = tree.cursor();
+        let mut out = Vec::new();
+        let mut e = c.last().unwrap();
+        while let Some((k, v)) = e {
+            out.push((k.to_vec(), v.to_vec()));
+            e = c.prev().unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn empty_tree_reads() {
+        let (img, root, depth) = build(&[]);
+        let t = Tree::new(src(&img), PS, root, depth);
+        assert!(t.is_empty());
+        assert_eq!(t.get(b"x").unwrap(), None);
+        let mut c = t.cursor();
+        assert_eq!(c.first().unwrap(), None);
+        assert_eq!(c.last().unwrap(), None);
+        assert_eq!(c.next().unwrap(), None);
+        assert_eq!(c.prev().unwrap(), None);
+        assert_eq!(c.set_range(b"x").unwrap(), None);
+        assert_eq!(c.get_greater_than(b"x").unwrap(), None);
+        assert_eq!(c.get_lower_than_or_equal_to(b"x").unwrap(), None);
+    }
+
+    #[test]
+    fn single_leaf_get_and_iter() {
+        let entries: Vec<_> = (0u16..20)
+            .map(|i| kv(format!("k{i:03}").as_bytes(), format!("v{i}").as_bytes()))
+            .collect();
+        let (img, root, depth) = build(&entries);
+        let t = Tree::new(src(&img), PS, root, depth);
+        assert_eq!(depth, 1, "20 tiny entries fit one leaf");
+        for (k, v) in &entries {
+            assert_eq!(t.get(k).unwrap(), Some(v.as_slice()));
+        }
+        assert_eq!(t.get(b"missing").unwrap(), None);
+        assert_eq!(collect_fwd(&t), entries);
+        let mut rev = entries.clone();
+        rev.reverse();
+        assert_eq!(collect_rev(&t), rev);
+    }
+
+    #[test]
+    fn multi_level_iter_matches_sorted() {
+        // Enough entries with large-ish values to force several leaves + a
+        // branch level.
+        let entries: Vec<_> = (0u16..2000)
+            .map(|i| {
+                kv(
+                    format!("key{i:05}").as_bytes(),
+                    format!("value-{i}").as_bytes(),
+                )
+            })
+            .collect();
+        let (img, root, depth) = build(&entries);
+        let t = Tree::new(src(&img), PS, root, depth);
+        assert!(
+            depth >= 2,
+            "2000 entries need a branch level, got depth {depth}"
+        );
+        for (k, v) in &entries {
+            assert_eq!(t.get(k).unwrap(), Some(v.as_slice()), "get {k:?}");
+        }
+        assert_eq!(collect_fwd(&t), entries);
+        let mut rev = entries.clone();
+        rev.reverse();
+        assert_eq!(collect_rev(&t), rev);
+    }
+
+    #[test]
+    fn overflow_values_resolve_zero_copy() {
+        let big = vec![0xABu8; 9000]; // > 2 pages
+        let bigger = vec![0x5Cu8; 200_000];
+        let entries = vec![
+            kv(b"a", b"small"),
+            kv(b"b", &big),
+            kv(b"c", &bigger),
+            kv(b"d", b"tiny"),
+        ];
+        let (img, root, depth) = build(&entries);
+        let t = Tree::new(src(&img), PS, root, depth);
+        assert_eq!(t.get(b"b").unwrap(), Some(big.as_slice()));
+        assert_eq!(t.get(b"c").unwrap(), Some(bigger.as_slice()));
+        assert_eq!(collect_fwd(&t), entries);
+    }
+
+    #[test]
+    fn neighbor_seeks() {
+        let entries: Vec<_> = [10u32, 20, 30, 40, 50]
+            .iter()
+            .map(|n| kv(format!("{n:03}").as_bytes(), b"x"))
+            .collect();
+        let (img, root, depth) = build(&entries);
+        let t = Tree::new(src(&img), PS, root, depth);
+        let mut c = t.cursor();
+
+        // set_range (>=)
+        assert_eq!(
+            c.set_range(b"025").unwrap().map(|(k, _)| k.to_vec()),
+            Some(b"030".to_vec())
+        );
+        assert_eq!(
+            c.set_range(b"030").unwrap().map(|(k, _)| k.to_vec()),
+            Some(b"030".to_vec())
+        );
+        assert_eq!(c.set_range(b"055").unwrap(), None);
+        assert_eq!(
+            c.set_range(b"005").unwrap().map(|(k, _)| k.to_vec()),
+            Some(b"010".to_vec())
+        );
+
+        // get_greater_than (>)
+        assert_eq!(
+            c.get_greater_than(b"030").unwrap().map(|(k, _)| k.to_vec()),
+            Some(b"040".to_vec())
+        );
+        assert_eq!(c.get_greater_than(b"050").unwrap(), None);
+        assert_eq!(
+            c.get_greater_than(b"005").unwrap().map(|(k, _)| k.to_vec()),
+            Some(b"010".to_vec())
+        );
+
+        // get_lower_than_or_equal_to (<=)
+        assert_eq!(
+            c.get_lower_than_or_equal_to(b"035")
+                .unwrap()
+                .map(|(k, _)| k.to_vec()),
+            Some(b"030".to_vec())
+        );
+        assert_eq!(
+            c.get_lower_than_or_equal_to(b"030")
+                .unwrap()
+                .map(|(k, _)| k.to_vec()),
+            Some(b"030".to_vec())
+        );
+        assert_eq!(c.get_lower_than_or_equal_to(b"005").unwrap(), None);
+        assert_eq!(
+            c.get_lower_than_or_equal_to(b"999")
+                .unwrap()
+                .map(|(k, _)| k.to_vec()),
+            Some(b"050".to_vec())
+        );
+    }
+
+    #[test]
+    fn next_prev_edges() {
+        let entries: Vec<_> = (0u16..500)
+            .map(|i| kv(format!("k{i:04}").as_bytes(), b"v"))
+            .collect();
+        let (img, root, depth) = build(&entries);
+        let t = Tree::new(src(&img), PS, root, depth);
+        let mut c = t.cursor();
+        // Walk to EOF.
+        c.first().unwrap();
+        while c.next().unwrap().is_some() {}
+        // At EOF: next stays None, prev returns last.
+        assert_eq!(c.next().unwrap(), None);
+        assert_eq!(
+            c.prev().unwrap().map(|(k, _)| k.to_vec()),
+            Some(b"k0499".to_vec())
+        );
+        // Walk to before-begin.
+        c.last().unwrap();
+        while c.prev().unwrap().is_some() {}
+        // Before-begin: next resumes at first.
+        assert_eq!(
+            c.next().unwrap().map(|(k, _)| k.to_vec()),
+            Some(b"k0000".to_vec())
+        );
+    }
+
+    #[test]
+    fn prefix_successor_cases() {
+        assert_eq!(prefix_successor(b"ab"), Some(b"ac".to_vec()));
+        assert_eq!(prefix_successor(b"ab\xff"), Some(b"ac".to_vec()));
+        assert_eq!(prefix_successor(b"\xff\xff"), None);
+        assert_eq!(prefix_successor(b""), None);
+        assert_eq!(prefix_successor(b"a\xff\xff"), Some(b"b".to_vec()));
+    }
+
+    /// ADR-0014: under the trusting policy a map page skips the per-cell
+    /// walk (a corrupt node pointer is not looked at) but keeps the O(1)
+    /// header checks (page type); the validating memo rejects the same page.
+    /// The trusted view is built and dropped without reading any cell.
+    #[test]
+    fn trusting_policy_skips_the_cell_walk_but_checks_the_type() {
+        let entries: Vec<_> = (0..8u8).map(|i| kv(&[b'k', i], b"v")).collect();
+        let (mut img, root, depth) = build(&entries);
+        assert_eq!(depth, 1, "a single leaf root");
+        let off = root as usize * PS as usize + crate::page::HEADER_SIZE;
+        img[off..off + 2].copy_from_slice(&0xFFF0u16.to_le_bytes());
+
+        let validating = ValidatedPages::new();
+        assert!(leaf_view(src(&img), PS, root, Some(&validating)).is_err());
+
+        // The corrupt page is wrapped but no cell accessor runs, so nothing
+        // reads through the bad pointer.
+        let trusting = ValidatedPages::for_policy(FileTrust::trusting_for_tests());
+        let view = leaf_view(src(&img), PS, root, Some(&trusting)).expect("header checks pass");
+        assert_eq!(view.num_keys(), entries.len());
+        assert!(
+            matches!(
+                branch_view(src(&img), PS, root, Some(&trusting)),
+                Err(PageError::WrongPageType { .. })
+            ),
+            "the page type stays checked when trusted"
+        );
+    }
+
+    /// ADR-0014: under the trusting policy a branch's
+    /// first view is recorded in the txn memo, so later descents take the
+    /// zero-check view, but a leaf's is not: a scan views each leaf once, and
+    /// recording them grew the memo by a level per four-fold of leaves, making
+    /// every probe miss through all of them. The validating policy still
+    /// records leaves (its memo skips the cell walk).
+    #[test]
+    fn trusting_policy_memoizes_branches_but_not_leaves() {
+        let entries: Vec<_> = (0..2000u16)
+            .map(|i| kv(&i.to_be_bytes(), &[7u8; 40]))
+            .collect();
+        let (img, root, depth) = build(&entries);
+        assert!(depth >= 2, "a branch root over leaves");
+        let trusting = ValidatedPages::for_policy(FileTrust::trusting_for_tests());
+        let br = branch_view(src(&img), PS, root, Some(&trusting)).expect("root branch");
+        let leaf = br.child_pgno(0);
+        leaf_view(src(&img), PS, leaf, Some(&trusting)).expect("leaf");
+        assert!(trusting.contains(root, PageKind::Branch));
+        assert!(!trusting.contains(leaf, PageKind::Leaf));
+
+        let validating = ValidatedPages::new();
+        leaf_view(src(&img), PS, leaf, Some(&validating)).expect("leaf validates");
+        assert!(validating.contains(leaf, PageKind::Leaf));
+    }
+
+    /// ADR-0018: a leaf fully validated by one txn is taken from the env-wide
+    /// cache by the next txn's first view, keyed by its exact header stamp.
+    /// Shown by corrupting a cell after the first view, keeping the stamp: a
+    /// later txn with the same cache is served from the cache (the stated
+    /// limit: bytes changed under the env with an old stamp are trusted),
+    /// while a different stamp, a txn without the cache, or the other page
+    /// kind misses and fails validation. No cell accessor runs on the corrupt
+    /// view.
+    #[test]
+    fn stamp_cache_serves_the_exact_page_version_across_txns() {
+        let entries: Vec<_> = (0..8u8).map(|i| kv(&[b'k', i], b"v")).collect();
+        let (mut img, root, depth) = build(&entries);
+        assert_eq!(depth, 1, "a single leaf root");
+        let cache = StampCache::new();
+        let reader = || ValidatedPages::for_reader(FileTrust::VALIDATE, Some(&cache));
+        let first = reader();
+        leaf_view(src(&img), PS, root, Some(&first)).expect("clean leaf validates");
+
+        let off = root as usize * PS as usize + crate::page::HEADER_SIZE;
+        img[off..off + 2].copy_from_slice(&0xFFF0u16.to_le_bytes());
+
+        let second = reader();
+        let view = leaf_view(src(&img), PS, root, Some(&second)).expect("served from the cache");
+        assert_eq!(view.num_keys(), entries.len());
+
+        let alone = ValidatedPages::new();
+        assert!(
+            leaf_view(src(&img), PS, root, Some(&alone)).is_err(),
+            "without the cache the corrupt cell is caught"
+        );
+
+        let restamped = reader();
+        let stamp_off = root as usize * PS as usize + 8;
+        let old = u64::from_le_bytes(img[stamp_off..stamp_off + 8].try_into().unwrap());
+        img[stamp_off..stamp_off + 8].copy_from_slice(&(old + 1).to_le_bytes());
+        assert!(
+            leaf_view(src(&img), PS, root, Some(&restamped)).is_err(),
+            "a newer stamp is a new page version: it misses and is validated"
+        );
+    }
+
+    /// ADR-0018: a write txn's memo probes the
+    /// env-wide cache but never publishes into it. Probing is shown by a
+    /// cache hit on a page whose cells were corrupted after the entry was
+    /// published (the hit skips the walk a fresh memo would fail); the
+    /// no-publish half by the cache staying empty after a writer memo fully
+    /// validated the clean page.
+    #[test]
+    fn writer_memo_probes_the_cache_but_never_publishes() {
+        let entries: Vec<_> = (0..8u8).map(|i| kv(&[b'k', i], b"v")).collect();
+        let (mut img, root, depth) = build(&entries);
+        assert_eq!(depth, 1, "a single leaf root");
+        let cache = StampCache::new();
+        let stamp_off = root as usize * PS as usize + 8;
+        let stamp = u64::from_le_bytes(img[stamp_off..stamp_off + 8].try_into().unwrap());
+
+        // No publish: a writer memo's full validation leaves no entry.
+        let writer = ValidatedPages::for_writer(FileTrust::VALIDATE, Some(&cache));
+        leaf_view(src(&img), PS, root, Some(&writer)).expect("clean leaf validates");
+        assert!(
+            !cache.contains(root, StampKind::Leaf, stamp),
+            "a write txn's miss arm must not publish (ADR-0018)"
+        );
+
+        // Probe: with the entry published (as commit seeding does), a fresh
+        // writer memo is served from the cache even over corrupt cells.
+        cache.publish(root, StampKind::Leaf, stamp);
+        let off = root as usize * PS as usize + crate::page::HEADER_SIZE;
+        img[off..off + 2].copy_from_slice(&0xFFF0u16.to_le_bytes());
+        let second = ValidatedPages::for_writer(FileTrust::VALIDATE, Some(&cache));
+        let view = leaf_view(src(&img), PS, root, Some(&second)).expect("served from the cache");
+        assert_eq!(view.num_keys(), entries.len());
+
+        // A newer stamp (a spilled page of the live txn, or a reused pgno)
+        // misses and is validated — here, caught.
+        img[stamp_off..stamp_off + 8].copy_from_slice(&(stamp + 1).to_le_bytes());
+        let third = ValidatedPages::for_writer(FileTrust::VALIDATE, Some(&cache));
+        assert!(
+            leaf_view(src(&img), PS, root, Some(&third)).is_err(),
+            "a stamp above every committed txnid always misses"
+        );
+    }
+}

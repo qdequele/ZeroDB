@@ -18,8 +18,8 @@ meta pages with a **mandatory** CRC (torn-meta detection is Phase 1); a common
 page header carrying the writer txnID stamp (feeds Phase 3.10) and a reserved
 data-page checksum field (Phase 3.9); DUPSORT format hooks reserved but
 unimplemented (D-004, Phase 2.8); observable max key = 511 bytes and empty key
-rejected (SPEC 01 §S4); no `#[repr(C)]` casting of unaligned data (CLAUDE.md).
-LMDB fork sources were read for algorithmic understanding only (CLAUDE.md rule
+rejected (SPEC 01 §S4); no `#[repr(C)]` casting of unaligned data (AGENTS.md).
+LMDB fork sources were read for algorithmic understanding only (AGENTS.md rule
 4); no C was transliterated.
 
 ## Decisions
@@ -30,7 +30,7 @@ CRC32C, polynomial `0x1EDC6F41` (reflected in/out, init/final `0xFFFFFFFF`).
 Used for the **mandatory meta CRC** (Phase 1) and the **reserved data-page
 checksum** field (Phase 3.9). Phase 1 implementation is a software table; Phase
 3.9 switches to the ARMv8-A `crc32c*` hardware instructions (primary target is
-Graviton — CLAUDE.md), which compute exactly this polynomial. (Update
+Graviton — AGENTS.md), which compute exactly this polynomial. (Update
 2026-10-19: the meta CRC takes those instructions on aarch64 CPUs that have
 them, with the table as fallback — ADR-0031.)
 
@@ -38,7 +38,7 @@ them, with the table as fallback — ADR-0031.)
   instruction, so slower and pointless when CRC32C has one. xxHash/xxh3 — faster
   bulk hashing but not a CRC (weaker torn-write/bit-error guarantees for a
   fixed-size 168-byte meta) and no hardware acceleration on ARM. A bare
-  signature/magic (rejected by PLAN: "a signature field alone is not
+  signature/magic (rejected by the original plan: "a signature field alone is not
   sufficient" for torn-meta detection).
 - *Why:* hardware-accelerated on the primary platform, strong for the small
   fixed meta block, reused unchanged for Phase 3.9 data pages.
@@ -103,7 +103,7 @@ Rebalance thresholds: leaf `min_keys=1`, branch `min_keys=2`, fill threshold
 - *Alternatives:* a different fill threshold (e.g. 33 %/50 %) or always-merge-
   toward-a-fixed-side. Rejected for Phase 1: parity with the oracle is the goal;
   changing thresholds changes page counts and would diverge from LMDB's
-  `non_free_pages_size` within the tolerance band (PLAN 1.5). GC/space redesign
+  `non_free_pages_size` within the tolerance band (milestone 1.5). GC/space redesign
   is Phase 3.1.
 - *Why:* Phase 1 is strict behavior parity; these are the oracle's numbers.
 

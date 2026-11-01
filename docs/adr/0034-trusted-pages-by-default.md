@@ -16,7 +16,7 @@ validation as the default (divergence D-019: "opt-in, default validating").
 
 The maintainer decided on 2026-11-01 to promote the trusting policy instead:
 "promote only the trusted mode because it's what LMDB does". It matches the
-project's rule in `AGENTS.md`: default behaviour matches LMDB, and
+project's rule in `CONTRIBUTING.md`: default behaviour matches LMDB, and
 capabilities LMDB lacks ship behind explicit options. Validation is such a
 capability.
 
@@ -26,10 +26,10 @@ Graviton4 `c8g.xlarge`, same binary, validating vs trusting:
 
 | Path | Validating | Trusting | Source |
 |---|---:|---:|---|
-| Full scan (`scan/full/fwd`, `rev`) ÷ LMDB | 1.47× | 1.05–1.09× | `benches/results/2026-10-31-build-profiles-and-scans-graviton.md` |
+| Full scan (`scan/full/fwd`, `rev`) ÷ LMDB | 1.47× | 1.05–1.09× | the 2026-10-31 "build profiles and scans graviton" run |
 | Full scan over a 300 MB tree (`scan/full/big`) ÷ LMDB | 1.60× | 1.03× | same |
 | Prefix bucket (`scan/prefix/bucket`) ÷ LMDB | 1.27× | 1.08× | same |
-| Random get p50, 10M keys (LMDB 0.96–1.08 µs) | 1.23 µs | 1.12 µs | `benches/results/2026-10-31-stamp-cache-graviton.md` |
+| Random get p50, 10M keys (LMDB 0.96–1.08 µs) | 1.23 µs | 1.12 µs | the 2026-10-31 "stamp cache graviton" run |
 | Get in a 50/50 read/update mix p50 (LMDB 1.13 µs) | 1.39 µs | 1.27 µs | same |
 | Values in overflow pages (`get/val/v4k`, `v2page`) ÷ LMDB, bench server | 1.29×, 1.27× | 0.91×, 0.89× | ADR-0014, overflow amendment |
 
@@ -73,7 +73,7 @@ validating by default, because its `open` is safe.
 - **Mechanism:** the adapter stores `Option<FileTrust>`, `None` by default.
   Its `unsafe fn open` resolves `None` to `unsafe { FileTrust::trust_contents() }`,
   justified by the contract of `open` itself. That is one new `unsafe` block in
-  `heed-zerodb`, which the `unsafe` policy in `AGENTS.md` must list.
+  `heed-zerodb`, which the `unsafe` policy in `CONTRIBUTING.md` must list.
 - **Pros:** every consumer of the heed API gets LMDB's read cost with no code
   change; the obligation rides on a contract heed users already accept; the
   native safe API stays sound; tools keep validating files of uncertain
@@ -112,16 +112,16 @@ for the tools that inspect files of unknown origin.
   opt-in extension. With the default, D-019 stops being a behaviour
   difference from LMDB for heed users; the native default is a ZeroDB-only
   API and is recorded as such.
-- **`unsafe` policy (`AGENTS.md`):** add the one `trust_contents()` call in
+- **`unsafe` policy (`CONTRIBUTING.md`):** add the one `trust_contents()` call in
   `heed_zerodb::EnvOpenOptions::open` to the list of sanctioned `unsafe` in
   `heed-zerodb`.
 - **Docs to update in the implementing change:** `heed_zerodb::EnvOpenOptions::open`
   (`# Safety`: the file must have been written by ZeroDB and not modified by
   anything else, or the caller opts into `FileTrust::VALIDATE`) and
-  `file_trust`; `docs/COMPATIBILITY.md`; `docs/DIVERGENCES.md` D-019;
+  `file_trust`; `docs/LMDB-COMPATIBILITY.md`; `docs/LMDB-COMPATIBILITY.md` D-019;
   `docs/SPEC/02-pages.md` and `docs/SPEC/04-txn-mvcc.md` (which policy is the
   default where); ADR-0014's status line ("default since ADR-0034 behind the
-  heed API"); `docs/PERF-GAP-VS-LMDB.md` (the trusted column becomes the
+  heed API"); `docs/PERFORMANCE.md` (the trusted column becomes the
   default one for consumers); README wording that promises a typed error on
   corruption.
 - **Snapshots of uncertain origin:** Meilisearch can import a raw snapshot a

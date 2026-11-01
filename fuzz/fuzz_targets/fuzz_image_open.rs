@@ -15,7 +15,7 @@
 //! Two images per input: the raw bytes (exercises slot validation), and a
 //! "repaired" variant whose meta headers/CRCs are made valid so the fuzzer
 //! explores hostile *geometry* (last_pg, roots, depths, records) behind a
-//! passing checksum — the exact shape of the H1/H4 findings.
+//! passing checksum.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,16 +24,18 @@ use libfuzzer_sys::fuzz_target;
 use zerodb_core::check::check_image_with_threads;
 use zerodb_core::env::testutil::VecBacking;
 use zerodb_core::env::{open_with_backing, DurabilityFlags, Env};
-use zerodb_core::page::{crc32c, FORMAT_VERSION, MAGIC, P_META};
+use zerodb_core::page::{crc32c, FORMAT_VERSION, MAGIC, META_CONTENT_LEN, P_META};
 
 const PS: u32 = 4096;
 const MAX_PAGES: usize = 16;
+/// Meta free-list annex id count (SPEC 02 §3): the last field before the CRC.
+const OFF_FL_COUNT: usize = META_CONTENT_LEN - 4;
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Open one image and, if it opens, run reads + a mutation attempt over it.
 fn exercise(img: Vec<u8>) {
-    // The checker must terminate quickly on anything (H3), and its parallel
+    // The checker must terminate quickly on anything, and its parallel
     // walk must report exactly what the serial walk reports.
     let serial = check_image_with_threads(&img, PS, 1);
     assert_eq!(check_image_with_threads(&img, PS, 2), serial);
@@ -71,8 +73,8 @@ fn exercise(img: Vec<u8>) {
             }
         }
     }
-    // The write path decodes the GC tree (H4) and the main tree (M8); the
-    // heap backing cannot commit, but put/delete exercise every decode.
+    // The write path decodes the free-page tree and the main tree; the heap
+    // backing cannot commit, but put/delete exercise every decode.
     if let Ok(mut txn) = env.write_txn() {
         let _ = db.put(&mut txn, b"fuzz", b"v");
         let _ = db.delete(&mut txn, b"probe");
@@ -90,8 +92,8 @@ fuzz_target!(|data: &[u8]| {
     exercise(img.clone());
 
     // Pass 2: force-valid meta headers + CRCs so hostile geometry survives
-    // selection (magic/version/page_size/txnid-match/CRC are made to pass;
-    // last_pg, map_size, and both DBRecords stay fuzz-controlled).
+    // selection (magic/version/page_size/txnid-match/annex/CRC are made to
+    // pass; last_pg, map_size, and both DBRecords stay fuzz-controlled).
     for slot in 0..2usize {
         let base = slot * ps;
         let s = &mut img[base..base + ps];
@@ -102,8 +104,11 @@ fuzz_target!(|data: &[u8]| {
         s[40..44].copy_from_slice(&PS.to_le_bytes());
         let body_txnid = s[64..72].to_vec();
         s[8..16].copy_from_slice(&body_txnid); // header txnid = body txnid
-        let crc = crc32c(&s[..168]);
-        s[168..172].copy_from_slice(&crc.to_le_bytes());
+        // No annex ids, so the CRC covers exactly [0, META_CONTENT_LEN) and
+        // is stored right after it (format v2).
+        s[OFF_FL_COUNT..META_CONTENT_LEN].copy_from_slice(&0u32.to_le_bytes());
+        let crc = crc32c(&s[..META_CONTENT_LEN]);
+        s[META_CONTENT_LEN..META_CONTENT_LEN + 4].copy_from_slice(&crc.to_le_bytes());
     }
     exercise(img);
 });
