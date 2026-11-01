@@ -17,22 +17,22 @@
 //! First touch copies a committed page into a fresh frame under a **new** pgno
 //! and rewrites the parent chain top-down (§5.1/§5.3). Allocation follows
 //! GC-16: the loose-page list (GC-7/8) for single pages, then a GC-DB draw
-//! ([`RwTxn::gc_reclaim`], gated by the oldest live reader — the
+//! (`RwTxn::gc_reclaim`, gated by the oldest live reader — the
 //! lock-free reader-table scan, SPEC 04 TXN-20/21, cached per txn per
 //! TXN-22), then file extend
 //! (`next_pgno`, GC-15) with the GC-17 `MapFull` bound. Draws are recorded in
 //! the in-memory drain map (GC-20) and applied to the GC tree at commit. At
-//! C1, [`RwTxn::freelist_save`] rewrites drained entries, releases trailing
+//! C1, `RwTxn::freelist_save` rewrites drained entries, releases trailing
 //! loose pages (GC-10), and writes this txn's freed set under
 //! `BE(writer_txnid)` in a fixed-point loop (GC-11..13) during which
 //! `allocate` is restricted to loose pages / extend only (GC-12,
-//! [`AllocMode::GcSave`]). The GC tree is mutated by the **same** split/COW
-//! code as the main tree, selected by [`TreeId`].
+//! `AllocMode::GcSave`). The GC tree is mutated by the **same** split/COW
+//! code as the main tree, selected by `TreeId`.
 //!
 //! ## Commit (SPEC 04 §9, SPEC 06 §2)
 //!
 //! [`RwTxn::commit`] runs the C0–C6 steps in **one function**
-//! ([`RwTxn::commit_pipeline`]) with the always-compiled H0–H4 crash hooks
+//! (`RwTxn::commit_pipeline`) with the always-compiled H0–H4 crash hooks
 //! between steps (ADR-0004). The single load-bearing ordering (REC-7):
 //! dirty pages are written (C2) and fsynced (C3) strictly before the meta is
 //! written (C4) to slot `txnid & 1` (TXN-63) and fsynced (C5); the in-memory

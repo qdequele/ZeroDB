@@ -370,7 +370,7 @@ impl FaultHandle {
         }
     }
 
-    /// ADR-0008.1 mutation self-test switch. See [`FaultState`] docs.
+    /// ADR-0008.1 mutation self-test switch. See the `FaultState` docs.
     pub fn set_broken_data_barriers(&self, broken: bool) {
         self.state
             .lock()

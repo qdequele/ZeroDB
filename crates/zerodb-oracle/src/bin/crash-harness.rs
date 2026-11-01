@@ -18,8 +18,8 @@
 //! artifacts (image + fault plan + op stream) land under
 //! `target/crash-repro/`, and `--repro <mech>:<seed>` replays that cycle.
 //!
-//! Hidden child mode (mechanism B): `crash-harness --crash-child <seed>
-//! <dir> <kill>` — see `crash::sigkill`. Multi-process mechanism (`--mechanism
+//! Hidden child mode (mechanism B):
+//! `crash-harness --crash-child <seed> <dir> <kill>` — see `crash::sigkill`. Multi-process mechanism (`--mechanism
 //! mp`, opt-in, never part of `both`): the lock-file writer child
 //! `--crash-child-lock <seed> <dir> <kill>` and the reader child
 //! `--crash-reader <dir> <page_size> <map_size> <seed>` — see `crash::multiproc`.

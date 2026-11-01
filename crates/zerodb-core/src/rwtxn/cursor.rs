@@ -153,7 +153,7 @@ pub(super) enum Step<'k> {
 /// reduces to this cursor's own position (ADR-0004).
 ///
 /// **Stack persistence:** between mutations the cursor persists its
-/// root-to-leaf path as a parked [`SavedCursor`], so an advance is an O(1)
+/// root-to-leaf path as a parked `SavedCursor`, so an advance is an O(1)
 /// amortized stack step (LMDB's `mc_pg[]`/`mc_ki[]` walk) on that stack in
 /// place, not a fresh O(log n) descent; entries are yielded as **borrows** of
 /// the txn's frames (lending style — the borrow dies at the next call, which
