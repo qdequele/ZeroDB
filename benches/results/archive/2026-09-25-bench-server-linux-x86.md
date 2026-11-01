@@ -3,7 +3,7 @@
 The first run on the dedicated bench server. It covers the full comparison
 ladder (long tier), a before/after A/B of the staged B8a change, and both
 consumer benches, Meilisearch and hannoy. The reading guide is
-[`docs/BENCH-MAP.md`](../../docs/BENCH-MAP.md).
+[`docs/PERFORMANCE.md#benchmark-ladder`](../../../docs/PERFORMANCE.md#benchmark-ladder).
 
 **Ratio = ZeroDB ÷ LMDB; above 1.00 means ZeroDB is slower.**
 

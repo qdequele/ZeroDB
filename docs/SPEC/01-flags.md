@@ -265,7 +265,7 @@ Two caveats on scope:
   `> 511`. For keys in `512..=65535` milli's type-level assumption says "valid"
   while LMDB returns `BadValSize`. Phase 1 zerodb **replicates LMDB exactly: max
   key = 511, empty rejected, `BadValSize` otherwise** — so zerodb does **not**
-  diverge from the oracle here (no `docs/DIVERGENCES.md` entry needed). Whether
+  diverge from the oracle here (no `docs/LMDB-COMPATIBILITY.md#behavior-differences` entry needed). Whether
   to expose a larger key bound as an opt-in is a Phase 3 question, not a Phase 1
   parity gap.
 
@@ -322,7 +322,7 @@ Two caveats on scope:
   - A process that joins after the first commit reads the older snapshot,
     and its `Env::info`/`Env::stat` name the newest meta on disk, as LMDB's
     (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`).
-  - Not mirrored, docs/DIVERGENCES.md D-025 (approved): when the opener
+  - Not mirrored, docs/LMDB-COMPATIBILITY.md#behavior-differences D-025 (approved): when the opener
     closes or dies before its first commit, a waiting zerodb process becomes
     the first opener and serves the newest meta, while the fork's waiter
     reads the older meta (or, on macOS after a close, fails with `EINVAL`);
@@ -387,7 +387,7 @@ several other rules:
   processes hold the env, and also downward: a 2 MiB joiner shrinks an
   8 MiB file under the holder's 8 MiB mapping
   (`OBS_WRITE_MAP_JOINER_LARGER_MAP`, `OBS_WRITE_MAP_JOINER_SMALLER_MAP`,
-  observed on macOS; docs/DIVERGENCES.md D-024). ZeroDB does so only
+  observed on macOS; docs/LMDB-COMPATIBILITY.md#behavior-differences D-024). ZeroDB does so only
   when the process is alone (no lock file, or the lock file's initializer);
   otherwise the file grows only under both writer locks, in `Env::resize` and
   at a write-txn begin, and never shrinks, so no process's mapping loses its

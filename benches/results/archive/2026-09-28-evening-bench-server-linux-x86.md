@@ -1,6 +1,6 @@
 # LMDB fork vs ZeroDB on the bench server, opt-in modes included — 2026-09-28 (evening)
 
-The third full run on the dedicated bench server, after the day's work: single-write env copies (PERF-GAP B24), the opt-in trusted-file policy (ADR-0014) and the opt-in sequential-writes option (ADR-0015). Same machine and settings as [the morning run](2026-09-28-bench-server-linux-x86.md). The reading guide is [`docs/BENCH-MAP.md`](../../docs/BENCH-MAP.md).
+The third full run on the dedicated bench server, after the day's work: single-write env copies (PERF-GAP B24), the opt-in trusted-file policy (ADR-0014) and the opt-in sequential-writes option (ADR-0015). Same machine and settings as [the morning run](2026-09-28-bench-server-linux-x86.md). The reading guide is [`docs/PERFORMANCE.md#benchmark-ladder`](../../../docs/PERFORMANCE.md#benchmark-ladder).
 
 **Ratio = ZeroDB ÷ LMDB; below 1.00 means ZeroDB is faster.**
 

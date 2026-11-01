@@ -60,14 +60,14 @@ Two things to know: the data file is **not** an LMDB file (own format; migrate
 with `zerodb-tools`), and keys are ≤ 511 bytes. The on-disk format is version 2: files from development builds before
 2026-10-05 (version 1) are refused at open and need a `zerodb-tools` dump and
 reload. Full
-list: [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md).
+list: [`docs/LMDB-COMPATIBILITY.md`](docs/LMDB-COMPATIBILITY.md).
 
 ## Performance
 
 **In Meilisearch, ZeroDB is as fast as LMDB.** Indexing takes the same time
 (+1% on the movies dataset, −1% when adding documents to hackernews), search is
 6% faster and vector search (hannoy) 5% faster.
-([hannoy run](benches/results/2026-09-28-evening-bench-server-linux-x86.md);
+([hannoy run](benches/results/archive/2026-09-28-evening-bench-server-linux-x86.md);
 Meilisearch run of 2026-10-05.)
 
 **Against other embedded key-value stores.** No store wins everything.
@@ -178,7 +178,7 @@ memory use, thread counts from 1 to 16, and more charts:
 [`benches/results/2026-10-27-kv-compare/report.md`](benches/results/2026-10-27-kv-compare/report.md).
 How the tests work and how to run them:
 [`benches/kv-compare`](benches/kv-compare/README.md). ZeroDB-vs-LMDB tuning
-results are in [`docs/PERF-GAP-VS-LMDB.md`](docs/PERF-GAP-VS-LMDB.md).
+results are in [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).
 
 ## More
 
@@ -187,7 +187,7 @@ results are in [`docs/PERF-GAP-VS-LMDB.md`](docs/PERF-GAP-VS-LMDB.md).
 | [`docs/SPEC/`](docs/SPEC/) | On-disk format & algorithm spec — the source of truth |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | Architecture decision records |
 | [`docs/TOOLS.md`](docs/TOOLS.md) | `zerodb-tools`: stat / dump / load / check / migrate-from-lmdb |
-| [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md) | Per-item heed coverage and every difference vs LMDB |
+| [`docs/LMDB-COMPATIBILITY.md`](docs/LMDB-COMPATIBILITY.md) | Per-item heed coverage and every difference vs LMDB |
 | [`AGENTS.md`](AGENTS.md) | How it's built and verified: spec-first, differential-tested, full gate per change |
 
 Build and test: `cargo test --workspace`, `just fuzz-quick` (differential fuzz vs

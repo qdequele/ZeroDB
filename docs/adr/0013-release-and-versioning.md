@@ -107,7 +107,7 @@ Versioning rules while 0.x:
    bump.
 5. **What a release promises**: files written by vX.Y.Z open unchanged in every
    later release with the same `FORMAT_VERSION`; the full check suite and the
-   consumer gate (docs/CONSUMER-GATE.md) passed on the release commit, with the
+   consumer gate (docs/maintainers/CONSUMER-GATE.md) passed on the release commit, with the
    Meilisearch and hannoy refs named in the CHANGELOG; known gaps are listed in
    the release notes, never implied away.
 6. **MSRV** is the workspace `rust-version`; it is checked in CI and bumped
@@ -142,7 +142,7 @@ Publishing rules:
 
 - New files: `CHANGELOG.md` (Keep a Changelog shape; the release workflow
   extracts the tagged section), `.github/workflows/release.yml`,
-  `docs/RELEASING.md`, `SECURITY.md`, `CONTRIBUTING.md`, `docs/COMPATIBILITY.md`
+  `docs/maintainers/RELEASING.md`, `SECURITY.md`, `CONTRIBUTING.md`, `docs/LMDB-COMPATIBILITY.md`
   (the heed/LMDB coverage matrix a release is measured against).
 - Engine crates bump `0.0.1 → 0.1.0`; `heed-zerodb`, `heed-shim`, and
   `zerodb-oracle` carry `publish = false`.
@@ -155,7 +155,7 @@ Publishing rules:
   surface; cleaning those up is a 0.2 change, not a patch.
 - `zerodb-tools --version` prints the crate version and `FORMAT_VERSION`, so a
   support request can name both; `cargo install zerodb-tools` works.
-- README, `docs/RELEASING.md` and `docs/TOOLS.md` describe the crates.io path;
+- README, `docs/maintainers/RELEASING.md` and `docs/TOOLS.md` describe the crates.io path;
   the drop-in instructions are unchanged (git patch on the shim at a tag).
 
 ## Open questions for human review

@@ -59,7 +59,7 @@ Hackernews additions, the spans that move (median inclusive time per run):
 - Movies indexing and search are at parity, as on the x86 server.
 - **Hackernews incremental additions take 3% longer on ZeroDB** (1.2 s per run). The x86 server measured this workload at 0.99× on 2026-10-05, on the same span.
 - Inside it, the two merge spans take twice as long on ZeroDB. They read the existing posting lists back from the database while merging the new ones. They run in parallel with other work, so they raise `indexing::write_db::all` by 5 s (1.19×) rather than the whole run, and ZeroDB gets 3.7 s back in commit and post-processing.
-- Three things differ from the 0.99× run: this host has 8 GiB against a larger x86 server; the lock file is now on by default; and the architecture is aarch64. ZeroDB's peak memory on this workload was already slightly above LMDB's (`docs/PERF-GAP-VS-LMDB.md`), and an 8 GiB host leaves little page cache. This run cannot separate these causes.
+- Three things differ from the 0.99× run: this host has 8 GiB against a larger x86 server; the lock file is now on by default; and the architecture is aarch64. ZeroDB's peak memory on this workload was already slightly above LMDB's (`docs/PERFORMANCE.md`), and an 8 GiB host leaves little page cache. This run cannot separate these causes.
 
 ## hannoy benchmarks
 

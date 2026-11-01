@@ -2,7 +2,7 @@
 
 First run of the rung-per-mechanism ladder
 (`crates/zerodb-oracle/benches/engine_comparison/`, `just bench`). Reading
-guide, and what each rung isolates: [`docs/BENCH-MAP.md`](../../docs/BENCH-MAP.md).
+guide, and what each rung isolates: [`docs/PERFORMANCE.md#benchmark-ladder`](../../../docs/PERFORMANCE.md#benchmark-ladder).
 
 **Ratio = ZeroDB ÷ LMDB; above 1.00 means ZeroDB is slower.** `~` marks rungs
 where the two engines are within a standard deviation of each other — not a

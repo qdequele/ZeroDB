@@ -8,7 +8,7 @@ read it before your first change. The ones you will hit first:
 - **The oracle decides LMDB semantics.** Never guess what LMDB does: write a
   differential test in `crates/zerodb-oracle` against the Meilisearch LMDB fork
   and observe. A behaviour difference is a ZeroDB bug unless it is a signed-off
-  entry in [`docs/DIVERGENCES.md`](docs/DIVERGENCES.md).
+  entry in [`docs/LMDB-COMPATIBILITY.md#behavior-differences`](docs/LMDB-COMPATIBILITY.md#behavior-differences).
 - **Never weaken a test to make it pass.** If a test looks wrong, say so in the
   PR and let a maintainer decide.
 - **Spec before code.** [`docs/SPEC/`](docs/SPEC/) is the source of truth; if
@@ -40,7 +40,7 @@ a build of the consumer crates on the workspace `rust-version`, currently 1.98
 ZeroDB itself needs a current stable toolchain because of the bench and fuzz
 tooling). For changes that could affect
 Meilisearch or hannoy, run the consumer gate too
-([`docs/CONSUMER-GATE.md`](docs/CONSUMER-GATE.md)).
+([`docs/maintainers/CONSUMER-GATE.md`](docs/maintainers/CONSUMER-GATE.md)).
 
 Performance claims need a criterion or consumer-bench diff in the PR
 description, with the machine named.
@@ -53,7 +53,7 @@ description, with the machine named.
 | Planned and open work | GitHub issues |
 | Release history | [`CHANGELOG.md`](CHANGELOG.md) |
 | Docs map | [`docs/README.md`](docs/README.md) |
-| Releasing | [`docs/RELEASING.md`](docs/RELEASING.md) |
+| Releasing | [`docs/maintainers/RELEASING.md`](docs/maintainers/RELEASING.md) |
 | Security | [`SECURITY.md`](SECURITY.md) |
 
 ## Reporting a bug

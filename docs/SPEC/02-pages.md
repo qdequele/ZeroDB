@@ -824,7 +824,7 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     `map_size ≥ 2·psize` — the kernel rounds the mapping length internally, and
     the reported `map_size`/`MapFull` boundary use the exact configured value.
     Unobservable to consumers, which always clamp before the call (SPEC 00
-    row 3). See `docs/DIVERGENCES.md` D-006 (approved 2026-07-16 via ADR-0004
+    row 3). See `docs/LMDB-COMPATIBILITY.md#behavior-differences` D-006 (approved 2026-07-16 via ADR-0004
     OQ2).
 - **Allocation.** New pages are taken first from the GC DB (SPEC 05; where a
   reader still pins them, from end-of-file), otherwise by bumping `last_pg`.

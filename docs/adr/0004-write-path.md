@@ -394,7 +394,7 @@ flip on in this milestone and not later.)
 2. **OQ2 — map full `map_size` at open (D4/B): APPROVED.** Resolve D-006 as
    proposed: round the **mapping length** up to the OS-page multiple
    internally; never change the reported/persisted `map_size` or the GC-17
-   MapFull predicate. D-006 flipped to APPROVED in `docs/DIVERGENCES.md`
+   MapFull predicate. D-006 flipped to APPROVED in `docs/LMDB-COMPATIBILITY.md#behavior-differences`
    citing this ADR.
 3. **OQ3 — macOS fsync (D3 amendment): use std's `sync_data`/`sync_all`
    semantics as-is.** No F_BARRIERFSYNC special-casing: the pipeline calls

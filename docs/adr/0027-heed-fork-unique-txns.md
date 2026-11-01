@@ -165,7 +165,7 @@ Option B, mirroring the fork exactly:
   compile-time property, and pinning it needs a compile-fail harness the
   workspace does not have.
 - Docs:
-  - `docs/COMPATIBILITY.md` and `docs/CONSUMER-GATE.md` describe the feature
+  - `docs/LMDB-COMPATIBILITY.md` and `docs/maintainers/CONSUMER-GATE.md` describe the feature
     and the second shim;
   - SPEC 00 row 19 notes the replacement of `non_free_pages_size`;
   - `CHANGELOG.md` records the change.

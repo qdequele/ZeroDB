@@ -1,6 +1,6 @@
 # Meilisearch v1.53.1 on LMDB vs ZeroDB — movies workloads, macOS laptop, 2026-09-09
 
-Produced by `scripts/consumer.sh bench` (see docs/CONSUMER-GATE.md). Indicative
+Produced by `scripts/consumer.sh bench` (see docs/maintainers/CONSUMER-GATE.md). Indicative
 only: the production target is Graviton + EBS gp3.
 
 - Meilisearch: v1.53.1 (577f7af28), heed 0.22.1 → heed-shim (ZeroDB 4b4ff2a + uncommitted consumer-gate scripts); zero source changes; `lmdb-master-sys` absent from the ZeroDB binary's dependency tree.

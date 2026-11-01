@@ -193,7 +193,7 @@ SPEC/DIVERGENCES edits the implementation would make (exact list):
   REC-17 hook list note. REC-10/REC-12 untouched.
 - SPEC 01 §S6: the fd-routing note (`me_mfd` equivalent) gains ZeroDB's
   realization.
-- DIVERGENCES.md: **no entry** — this is parity, not a divergence; the macOS
+- LMDB-COMPATIBILITY.md#behavior-differences: **no entry** — this is parity, not a divergence; the macOS
   stronger-barrier choice is an internal durability strengthening documented
   in SPEC 06 (same category as REC-13's poisoning).
 

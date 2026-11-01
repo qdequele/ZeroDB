@@ -3,7 +3,7 @@
 The five benchmarks from the [*fjall 3* article](https://fjall-rs.github.io/post/fjall-3/)
 on [rust-storage-bench](https://github.com/marvin-j97/rust-storage-bench), with a
 `zerodb` backend added next to the article's engines. This is the complete
-three-repetition run that the [2026-09-30 report](2026-09-30-public-suite-nvme.md)
+three-repetition run that the [2026-09-30 report](archive/2026-09-30-public-suite-nvme.md)
 left as a follow-up.
 
 `heed` is Meilisearch's LMDB fork through heed 0.22.1 (`lmdb-master-sys` 0.2.6).

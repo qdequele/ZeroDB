@@ -2,7 +2,7 @@
 
 All notable changes to ZeroDB. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the release workflow publishes the section matching the tag as the GitHub release notes
-(see `docs/RELEASING.md`). Versioning policy: ADR-0013.
+(see `docs/maintainers/RELEASING.md`). Versioning policy: ADR-0013.
 
 ## [Unreleased]
 
@@ -24,7 +24,7 @@ named database makes 5 heap allocations instead of 19, and an empty write
 transaction none instead of one. On Graviton4 a single-put no-sync commit
 takes 5.17 µs instead of 5.51 (LMDB: 4.25) and 5.74k user cycles instead of
 6.68k; `commit/batch/n1` went from 1.26× to 1.17× LMDB, no rung regressed.
-Details: `benches/results/2026-10-31-writer-carry-graviton.md`. New test
+Details: `benches/results/archive/2026-10-31-writer-carry-graviton.md`. New test
 `crates/zerodb/tests/write_txn_allocations.rs`. In `zerodb-core`,
 `DirtyStore::sorted_pgnos` is replaced by `sorted_pgnos_into`, which fills a
 buffer the caller reuses.
@@ -52,7 +52,7 @@ On Graviton4 (ZeroDB time ÷ LMDB time): `del/cursor/drain` 2.41× → 1.66×,
 `del/cursor/rev` 3.06× → 1.50×, `del/clear/all` 1.73× → 1.43×, `del/bulk/half`
 1.41× → 1.35×; cursor rewrites (`put/cursor/rewrite`) 2.12× → 1.75×, and no
 put or commit rung slowed. New ladder rung `del/cursor/rev` (the backward
-drain). Details: `benches/results/2026-10-31-delete-path-cursor.md`.
+drain). Details: `benches/results/archive/2026-10-31-delete-path-cursor.md`.
 
 ### The validated-pages cache covers the whole file (ADR-0018 amendment)
 
@@ -86,7 +86,7 @@ On Graviton4, `put/cursor/rewrite` went from 2.50× to 1.37× LMDB's time,
 `put/order/append` from 1.26× to 1.21× and `del/cursor/drain` from 2.62× to
 2.15×; without commit costs, the cursor rewrite loop went from 4.1× to 2.1×
 LMDB's CPU time per entry. Details:
-`benches/results/2026-10-31-write-cursor-split-append-graviton.md`. New example
+`benches/results/archive/2026-10-31-write-cursor-split-append-graviton.md`. New example
 `crates/zerodb-oracle/examples/cursor_put_census.rs`; the differential
 fuzzer's cursor-put walk gains a `grow` mode that splits on most puts.
 
@@ -116,7 +116,7 @@ the same, so files are unchanged. A full 16 KiB annex is checksummed in
 table. Commits that free many pages gain the most: one delete per
 transaction on a large tree costs about 0.77× as much as on the table path
 (Mac). A new criterion rung, `del/random/n1`, measures this case.
-Details: `benches/results/2026-10-19-meta-crc-hardware.md` and
+Details: `benches/results/archive/2026-10-19-meta-crc-hardware.md` and
 `-graviton.md`.
 
 ### Copy-on-write copies only a page's used bytes (ADR-0030)
@@ -150,7 +150,7 @@ In a crud-bench-shaped repro (500k entries, ~0.9 GB), a full count went from
 (was 2.25×) under the default policy and about LMDB's time (1.02–1.06×, was
 ~2.0×) under the trusting one; range scans and point gets got faster too, and no rung regressed. New
 benchmark rung `scan/full/big`. Numbers:
-`benches/results/2026-10-19-crud-scan-count-and-batch-delete.md`.
+`benches/results/archive/2026-10-19-crud-scan-count-and-batch-delete.md`.
 ### A deleted environment no longer blocks opening an unrelated one (#123)
 
 ZeroDB refuses a second open of a lock file this process already has open,
@@ -467,7 +467,7 @@ retires divergence D-001 (single-process only).
 #### Performance
 
 - **The lock file has a cost**, measured on Graviton4 (EBS io2, ext4;
-  `benches/results/2026-10-13-multi-process-stage3-graviton.md`) against
+  `benches/results/archive/2026-10-13-multi-process-stage3-graviton.md`) against
   0.2.0: +29.8 ns per write commit, +6.8 ns per read txn begin/abort, +7 ns
   per `Env::stat`. With `NO_LOCK` (`lock_file(false)` natively) every rung
   is flat.
@@ -475,7 +475,7 @@ retires divergence D-001 (single-process only).
   opener of an env now rebuilds the lock file in place instead of truncating
   it to zero, as LMDB does (ADR-0023 amendment 20, issue #94). Truncating
   made ext4 free and reallocate the file's blocks on every open. On Graviton4
-  (EBS gp3, ext4; `benches/results/2026-10-15-lock-file-in-place-graviton.md`),
+  (EBS gp3, ext4; `benches/results/archive/2026-10-15-lock-file-in-place-graviton.md`),
   env reopen went from 1016 µs to 36.4 µs per open (LMDB 37.8 µs), and env
   create got 1.13 ms faster. Before this, the lock-file default had cost
   +155 µs per create and 17 → 347 µs per reopen on the io2 host of the
@@ -544,8 +544,8 @@ Meilisearch runs.
   and hannoy build against it with no source changes.
 
 The full coverage matrix of heed items and LMDB features is
-[`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md); intentional differences from
-LMDB are in [`docs/DIVERGENCES.md`](docs/DIVERGENCES.md).
+[`docs/LMDB-COMPATIBILITY.md`](docs/LMDB-COMPATIBILITY.md); intentional differences from
+LMDB are in [`docs/LMDB-COMPATIBILITY.md#behavior-differences`](docs/LMDB-COMPATIBILITY.md#behavior-differences).
 
 ### Features
 
@@ -579,17 +579,17 @@ LMDB time; below 1 is faster):
 - **Meilisearch v1.53.1**, on this release's code (2026-10-05, x86-64 bench
   server): movies indexing 1.01×, incremental hackernews additions 0.99×, movies
   search 0.94×.
-  [`benches/results/2026-10-05-meta-annex-real-case.md`](benches/results/2026-10-05-meta-annex-real-case.md)
+  [`benches/results/archive/2026-10-05-meta-annex-real-case.md`](benches/results/archive/2026-10-05-meta-annex-real-case.md)
 - **hannoy v0.1.7-nested-rtxns** (2026-09-28): HNSW build 0.84–0.89×, search
   0.95×.
-  [`benches/results/2026-09-28-evening-bench-server-linux-x86.md`](benches/results/2026-09-28-evening-bench-server-linux-x86.md)
+  [`benches/results/archive/2026-09-28-evening-bench-server-linux-x86.md`](benches/results/archive/2026-09-28-evening-bench-server-linux-x86.md)
 - **YCSB** (rust-storage-bench, Graviton4 NVMe): durable YCSB B at 1.08× LMDB's
   throughput; with `WRITE_MAP`, no-sync YCSB at 1.6–1.7× default LMDB's
   throughput, still behind LMDB's own `WRITE_MAP`. The cross-engine results are
-  in [`benches/results/2026-09-30-public-suite-nvme.md`](benches/results/2026-09-30-public-suite-nvme.md).
+  in [`benches/results/archive/2026-09-30-public-suite-nvme.md`](benches/results/archive/2026-09-30-public-suite-nvme.md).
 
 Where ZeroDB stands per area, which LMDB techniques closed each gap, and what
-remains: [`docs/PERF-GAP-VS-LMDB.md`](docs/PERF-GAP-VS-LMDB.md). Every
+remains: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). Every
 performance experiment, kept or reverted, is a line in
 [`benches/results/perf-ledger.jsonl`](benches/results/perf-ledger.jsonl).
 
@@ -623,8 +623,8 @@ performance experiment, kept or reverted, is a line in
 - Not supported: `DUPSORT`/`DUPFIXED` and the other `DatabaseFlags`, nested
   *write* transactions, multi-process access (no lock file), `Env::resize`,
   `Env::set_flags`, `get_or_put*`, `MDB_NOSUBDIR` (refused at open),
-  encryption. Each is a documented entry in `docs/DIVERGENCES.md` or a row in
-  `docs/COMPATIBILITY.md`; none is used by Meilisearch or hannoy.
+  encryption. Each is a documented entry in `docs/LMDB-COMPATIBILITY.md#behavior-differences` or a row in
+  `docs/LMDB-COMPATIBILITY.md`; none is used by Meilisearch or hannoy.
 - Not yet run: the 24-hour fuzz soak and a 64 KiB-page kernel.
 - heed's `WithTls` read transactions compile but are not thread-pinned;
   `clear_stale_readers` returns 0 (correct for a single-process engine).

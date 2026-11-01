@@ -4,7 +4,7 @@
   Correctness-critical B+tree change (AGENTS.md rule 5); the spike's profile
   ran first (rule 6). Open questions answered under "Resolution" below.
 - Related issue: none yet. Background: the delete-rebalance entry in
-  [`docs/PERF-GAP-VS-LMDB.md`](../PERF-GAP-VS-LMDB.md) ("What remains"), and
+  [`docs/PERFORMANCE.md`](../PERFORMANCE.md) ("What remains"), and
   the 2026-09-10 `blocked-adr` entry in `benches/results/perf-ledger.jsonl`.
 - Date: 2026-10-18
 
@@ -16,7 +16,7 @@ Deletes are ZeroDB's largest remaining write gap against LMDB:
 
 | measurement | ZeroDB vs LMDB |
 |---|---|
-| criterion ladder `del/bulk/half`, `del/bulk/all` (50k ascending keys, 256 B values, 4 KiB pages, Linux x86-64; `benches/results/2026-09-28-evening-bench-server-linux-x86.md`) | 1.75× the time |
+| criterion ladder `del/bulk/half`, `del/bulk/all` (50k ascending keys, 256 B values, 4 KiB pages, Linux x86-64; `benches/results/archive/2026-09-28-evening-bench-server-linux-x86.md`) | 1.75× the time |
 | criterion ladder `del/cursor/drain` (same run) | 2.72× the time |
 | criterion ladder `del/churn/reinsert` (same run) | 1.40× the time |
 | crud-bench deletes: 500k random 26-byte keys, ~1.5 KB values, 16 KiB pages, macOS M1, `WRITE_MAP \| MAP_ASYNC \| NO_SYNC` (ZeroDB also in trusted-file mode), median of 3 rounds | **0.55×** the throughput |
@@ -228,7 +228,7 @@ lowest-key separator choice for branch moves (open question 2).
 |---|---|
 | **Logical tree image** | For any operation sequence, every committed tree page has the same pgno, type, ordered entries (key, flags, inline value bytes or overflow head, child pgno) and free-space count as ZeroDB-before. Therefore identical: `stat` (`entries`, `depth`, `leaf_pages`, `branch_pages`, `overflow_pages`, INV-18), pgno allocation order, the freed and loose lists, GC contents, file size. |
 | **Raw page bytes** | Not required identical. A separator rewritten in place keeps its heap position, so the order of cells inside a page's heap can differ from ZeroDB-before. Not observable through the API, by `check`, by dump or by compaction. Heap and `WRITE_MAP` modes run the same primitives, so they keep giving identical results (`writemap_in_place`). |
-| **LMDB-parity behavior** | Everything observable through the heed surface: gets, iteration, `entries`, errors, `delete_range` counts. No oracle expectation changes; `docs/DIVERGENCES.md` gains no entry. |
+| **LMDB-parity behavior** | Everything observable through the heed surface: gets, iteration, `entries`, errors, `delete_range` counts. No oracle expectation changes; `docs/LMDB-COMPATIBILITY.md#behavior-differences` gains no entry. |
 | **Cursor position after delete** | SPEC 03 §7's pinned table (successor after a mid-page or end-of-leaf delete, `None` after the last entry, full and partial drains visit each key once). The §5.4a repair rows still hold: in a borrow from the right the underfull page keeps its pgno and the moved cell is appended at its end; in a merge the right page's cells are appended after the left page's. Every `PathFate` is the same as ZeroDB-before; the debug shadow check stays. |
 | **dump / load** | `zerodb-tools dump` output byte-identical (it is per entry); load is untouched (it does not delete). |
 | **Compaction** | A compacting copy (`copy_to_file`, `zerodb-tools`) rewrites from a tree walk, so its output for the same logical content is byte-identical to ZeroDB-before. |
@@ -339,7 +339,7 @@ Each stage carries its own three-column report.
 ## Implementation (2026-10-18)
 
 Landed in one stage after the spike's profile confirmed the premise
-(`benches/results/2026-10-18-delete-rebalance-node-move-mac.md`): before the
+(`benches/results/archive/2026-10-18-delete-rebalance-node-move-mac.md`): before the
 change, `rebalance` was 68 % of `del/bulk/half`'s delete time and the
 separator remove + re-insert alone 31 %.
 
@@ -392,7 +392,7 @@ below are settled as follows:
    (one extra descent per branch move or merge); ZeroDB reuses the parent
    separator. Not observable through the API and not compared cross-engine
    (`stat_differential` compares no page counts). Keep ZeroDB's choice, or
-   record it in `docs/DIVERGENCES.md` as a known internal difference, or
+   record it in `docs/LMDB-COMPATIBILITY.md#behavior-differences` as a known internal difference, or
    align with LMDB in a later change?
 3. **Two-frame access.** Is the per-txn scratch buffer acceptable, or should
    a disjoint two-frame borrow (new `unsafe` under `WRITE_MAP`) be considered

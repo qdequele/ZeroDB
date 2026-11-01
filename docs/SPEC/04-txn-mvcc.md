@@ -600,7 +600,7 @@ page concurrently, the borrow would dangle and the read would race.
     `ensure_open` — which mutates the open-table children read via
     `record_for` — and commit C0.)* This quiescence is a **zerodb** soundness
     rule the fork does not itself impose — **D-005 (APPROVED)** in
-    `docs/DIVERGENCES.md` (not observable to any consumer, which always pause
+    `docs/LMDB-COMPATIBILITY.md#behavior-differences` (not observable to any consumer, which always pause
     the writer; see §10 conflict block).
 - **TXN-30** — Enforcement is primarily **compile-time**: `nested_read_txn(&wtxn)`
   borrows the `RwTxn` **immutably** (`&self`). All mutating `RwTxn` ops take
@@ -995,7 +995,7 @@ spilling bullet there.)
     realization below (ADR-0021). TXN-45a remains the realization for every
     backing that does not broker map slices: the default mode, the miri test
     backing, and the fault-injection backend (whose crash journal records
-    fd-path writes only). Neither realization is a `docs/DIVERGENCES.md`
+    fd-path writes only). Neither realization is a `docs/LMDB-COMPATIBILITY.md#behavior-differences`
     entry — both are observably identical to the fork through the heed /
     oracle surface.
 
@@ -1669,7 +1669,7 @@ against LMDB unless it says so.
   unpublished first commit and the joiner's `info`/`stat` follow LMDB
   (TXN-66, TXN-67; ADR-0023 amendment 19; `multi_process_differential.rs::
   join_before_prev_snapshot_first_commit_vs_lmdb` and its neighbors). Two
-  cases differ, docs/DIVERGENCES.md D-025 (approved). If the opener closes
+  cases differ, docs/LMDB-COMPATIBILITY.md#behavior-differences D-025 (approved). If the opener closes
   or dies before its first commit, a waiting ZeroDB process becomes the
   first opener and serves the newest meta; LMDB's waiter joins the lock
   file as the opener left it and reads the older meta, or, on macOS after a
@@ -1686,7 +1686,7 @@ against LMDB unless it says so.
   while another process holds a write txn, also on an `MDB_RDONLY` env
   (`OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER`,
   `OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER_RDONLY`). The wait is deliberate
-  (ADR-0023 decision 3). See `docs/DIVERGENCES.md` (D-023).
+  (ADR-0023 decision 3). See `docs/LMDB-COMPATIBILITY.md#behavior-differences` (D-023).
 
 ## §13 — Database handle lifetime (ADR-0024)
 

@@ -39,7 +39,7 @@
 **D-002 does not cover this.** D-002 sanctions zerodb's own on-disk **format**;
 it says nothing about the **file name** heed consumers observe in the env
 directory. The name difference is a separate, unsanctioned divergence — filed
-as **D-012** (docs/DIVERGENCES.md) alongside this ADR.
+as **D-012** (docs/LMDB-COMPATIBILITY.md#behavior-differences) alongside this ADR.
 
 ### The latent break (found during the M1.14 index-scheduler gate)
 
@@ -76,7 +76,7 @@ lie (a file implying cross-process locking the engine does not provide).
   shim. The fix must preserve that property or it forfeits the adapter's whole
   point.
 - The M1.13 precedent for exactly this shape of problem is the
-  **adapter-boundary re-imposition** pattern (DIVERGENCES.md, D-006/D-008/
+  **adapter-boundary re-imposition** pattern (LMDB-COMPATIBILITY.md#behavior-differences, D-006/D-008/
   D-010): the core keeps its lenient/native behavior; `heed-zerodb` re-imposes
   the fork's observable contract at the heed boundary.
 - **Migration**: there are **no zerodb envs in production anywhere** (Phase 1
@@ -226,7 +226,7 @@ name it writes.
 - SPEC 00 row 7: note that the adapter satisfies the `data.mdb` half of the
   directory-env convention and that `lock.mdb` is intentionally absent
   (D-001, D-012).
-- DIVERGENCES.md D-012: flip wording from "latent break" to "resolved at the
+- LMDB-COMPATIBILITY.md#behavior-differences D-012: flip wording from "latent break" to "resolved at the
   adapter boundary" once implemented.
 
 ### Acceptance criteria the implementing milestone inherits

@@ -31,7 +31,7 @@ Per open:
 | create a new env | 105 µs | 4.19 ms | 3.06 ms |
 
 - **Reopen is at parity with LMDB** (0.96×). This was the cost #94 tracked.
-- **Create improved by 1.13 ms per env but is still 29× LMDB.** The lock file is not what is left: with `NO_LOCK`, create was already 9.0× LMDB on 2026-10-13 (`2026-10-13-multi-process-stage3-graviton.md`). The remaining gap is the data file's creation, which `docs/PERF-GAP-VS-LMDB.md` tracks separately.
+- **Create improved by 1.13 ms per env but is still 29× LMDB.** The lock file is not what is left: with `NO_LOCK`, create was already 9.0× LMDB on 2026-10-13 (`2026-10-13-multi-process-stage3-graviton.md`). The remaining gap is the data file's creation, which `docs/PERFORMANCE.md` tracks separately.
 
 ## No other rung moves: a sample, 3 rounds
 

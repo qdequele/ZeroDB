@@ -23,7 +23,7 @@ trusted-file mode) so the default stays a faithful drop-in.
    heed 0.22.1 — what Meilisearch actually runs; stock LMDB lacks nested read
    transactions). To learn what LMDB does, write a differential test in
    `crates/zerodb-oracle` and run it. A behavior difference is a ZeroDB bug
-   unless it is recorded and approved in `docs/DIVERGENCES.md`. Never change an
+   unless it is recorded and approved in `docs/LMDB-COMPATIBILITY.md#behavior-differences`. Never change an
    oracle expectation to make ZeroDB pass.
 2. **Never delete, weaken, `#[ignore]` or loosen a test to make it pass.** If a
    test looks wrong, say so in the PR and let a maintainer decide.
@@ -158,8 +158,8 @@ architectures. macOS clippy skips Linux-only modules, so also lint the
   record of every performance experiment (kept or reverted).
 - `scripts/` — benchmark A/B, profiling and consumer-suite runners.
 - `docs/SPEC/` — format and algorithm spec. `docs/adr/` — design decisions,
-  indexed in `docs/DECISIONS.md`. `docs/DIVERGENCES.md` — approved behavior
-  differences from LMDB. `docs/PERF-GAP-VS-LMDB.md` — performance inventory.
+  indexed in `docs/DECISIONS.md`. `docs/LMDB-COMPATIBILITY.md#behavior-differences` — approved behavior
+  differences from LMDB. `docs/PERFORMANCE.md` — performance inventory.
 
 ## Style
 

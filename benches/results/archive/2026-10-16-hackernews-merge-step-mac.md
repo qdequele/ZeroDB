@@ -40,7 +40,7 @@ No setup reproduces a 2× merge step, even with memory capped at 2 GiB.
 
 ## Reading
 
-The merge step on ZeroDB is not slower than on LMDB in itself: it is faster on the Mac, and within 7% in the synthetic shape on Linux under a 2 GiB cap. What differs on the Graviton host is the host: 8 GiB of memory, a gp3 network volume, and swap used during the session. ZeroDB's peak memory on this workload is a little above LMDB's (`docs/PERF-GAP-VS-LMDB.md`, peak RSS row), which leaves less room for the page cache on 8 GiB and would send more of the merge step's reads to the slow volume. That is the most likely cause; it is not proven.
+The merge step on ZeroDB is not slower than on LMDB in itself: it is faster on the Mac, and within 7% in the synthetic shape on Linux under a 2 GiB cap. What differs on the Graviton host is the host: 8 GiB of memory, a gp3 network volume, and swap used during the session. ZeroDB's peak memory on this workload is a little above LMDB's (`docs/PERFORMANCE.md`, peak RSS row), which leaves less room for the page cache on 8 GiB and would send more of the merge step's reads to the slow volume. That is the most likely cause; it is not proven.
 
 Next step: measure where ZeroDB's extra memory goes in a large write transaction, against LMDB, and confirm with a memory-capped Linux run of the real workload.
 

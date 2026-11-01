@@ -305,4 +305,4 @@ lost 4–5 % on hot reads.
 What stays checked is unchanged: every trusted leaf view still runs the O(1)
 header checks; it simply runs them on every first view of the leaf in a
 cursor step instead of once per txn. The measurements are in
-`benches/results/2026-10-19-crud-scan-count-and-batch-delete.md`.
+`benches/results/archive/2026-10-19-crud-scan-count-and-batch-delete.md`.

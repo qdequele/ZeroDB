@@ -14,7 +14,7 @@
   180s 2/0, fuzz-quick 2.1M clean. Adversarial spec-review found no technical
   blockers; its should-fix/nit items are addressed in the branch.
 - Real-case check (2026-10-05, three columns LMDB / before `8b066a6` / after,
-  `benches/results/2026-10-05-meta-annex-real-case.md`): YCSB on Graviton4 NVMe
+  `benches/results/archive/2026-10-05-meta-annex-real-case.md`): YCSB on Graviton4 NVMe
   durable B **1.078×** before (258k vs 239k ops/s, now 1.08× LMDB), no-sync
   0.98–1.04×; on the x86 bench server no-sync **1.03–1.07×**, durable flat
   (SATA-flush-bound). Write p50 −14% to −25% in every configuration on both
@@ -22,7 +22,7 @@
   incremental additions 0.98× (commit span 0.94×), search 0.97×. Scope of the
   claim: frequent or durable commits; not a Meilisearch bulk-indexing speed-up.
 - Milestone: perf track "non-copy per-commit CPU" lever #1 (cheaper free-list
-  save), PERF-GAP-VS-LMDB §B12; forward-looking toward the later free-space redesign.
+  save), PERFORMANCE.md item B12; forward-looking toward the later free-space redesign.
 - Date: 2026-10-03
 - Numbering note: ADR-0021 (WRITE_MAP in-place) lives on its own open branch;
   this ADR takes 0022 to avoid colliding with it. (ADR-0021 has since merged,

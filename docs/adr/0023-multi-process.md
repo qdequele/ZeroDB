@@ -764,7 +764,7 @@ Terms used below:
         narrow the case to a deliberately colliding data name. Closing it
         would need the data file to be built under a temporary name and
         renamed, which is a new protocol, not proposed here.
-    - SPEC 02 §8 (naming) and `docs/COMPATIBILITY.md` record the rule.
+    - SPEC 02 §8 (naming) and `docs/LMDB-COMPATIBILITY.md` record the rule.
 
 17. **`NO_LOCK` and read-only.** Approved 2026-10-12.
     - The engine's opt-out is `EnvOpenOptions::lock_file(false)`. The default
@@ -812,7 +812,7 @@ Terms used below:
         takes the writer lock.
     - SPEC 01 `MDB_NOLOCK` row (WON'T becomes MUST), SPEC 00 flag rows,
       DIVERGENCES D-016 (it says `NO_LOCK` is an accepted no-op) and
-      `docs/COMPATIBILITY.md` are updated.
+      `docs/LMDB-COMPATIBILITY.md` are updated.
 
 18. **Tools attach as readers.** Approved 2026-10-12.
     - `stat`, `dump` and `check` open the environment `READ_ONLY` through
@@ -1039,7 +1039,7 @@ Terms used below:
       opener left it and reads the older generation. Mirroring that needs a
       joiner to adopt a lock file its initializer never finished, a change
       to the election of every environment, so it is not mirrored here; it
-      is filed as `docs/DIVERGENCES.md` D-025 (approved).
+      is filed as `docs/LMDB-COMPATIBILITY.md#behavior-differences` D-025 (approved).
     - **`READ_ONLY` with `PREV_SNAPSHOT`** never commits, so a sole opener
       holds the election for its whole life and every joiner waits until it
       closes, as observed.
@@ -1090,7 +1090,7 @@ Terms used below:
     *Problem.* With the lock file on, an env open by a process that becomes
     the initializer costs about 330 µs more than with `NO_LOCK` on Linux
     (`env/open/reopen` 17 → 347 µs, 9.6× LMDB;
-    `benches/results/2026-10-13-multi-process-stage3-graviton.md`). Every
+    `benches/results/archive/2026-10-13-multi-process-stage3-graviton.md`). Every
     open of an env that no other process holds is such an open, which
     includes every open in a single-process consumer like Meilisearch. The
     cost is LCK-2's first step:
@@ -1191,7 +1191,7 @@ Terms used below:
       with the lock file on and off, in three columns: LMDB, ZeroDB before,
       ZeroDB after. This needs a quiet Linux aarch64 host.
     - The target is lock-on reopen at or below LMDB's. If a gap remains, it
-      is profiled and reported in `docs/PERF-GAP-VS-LMDB.md`, not hidden.
+      is profiled and reported in `docs/PERFORMANCE.md`, not hidden.
     - No other rung may move.
 
     *Tests.*
@@ -1281,7 +1281,7 @@ updated. New invariants for the lock file get fresh IDs.
   macOS). Stage 1's bench decides whether that is acceptable.
 - Measured at stage 3 on Graviton4 (EBS io2, ext4), lock file on against the
   release before it
-  (`benches/results/2026-10-13-multi-process-stage3-graviton.md`): +29.8 ns
+  (`benches/results/archive/2026-10-13-multi-process-stage3-graviton.md`): +29.8 ns
   per write commit, +6.8 ns per read txn begin/abort, +7 ns per `stat` (it
   reads the shared `T`), +155 µs per env create, and env reopen 17 → 347 µs,
   9.6× LMDB. With `NO_LOCK` every rung is flat.
@@ -1296,7 +1296,7 @@ updated. New invariants for the lock file get fresh IDs.
   *Resolved by amendment 20 (approved and implemented 2026-10-14):* on
   Graviton4, env reopen with the lock file on is 36.4 µs per open against
   LMDB's 37.8 µs (0.96×), and env create is 1.13 ms per env faster
-  (`benches/results/2026-10-15-lock-file-in-place-graviton.md`).
+  (`benches/results/archive/2026-10-15-lock-file-in-place-graviton.md`).
 - The macOS POSIX-lock pitfall (§3) and Linux-only futex give two writer-lock
   implementations to test on CI.
 - A bug here corrupts data rather than crashing — the reason for stage-1-first,

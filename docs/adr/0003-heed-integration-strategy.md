@@ -299,7 +299,7 @@ or custom comparators, which are OUT on the same grounds.
 - SPEC 00: mark rows 23–26, 51–54, 61 as satisfied by `heed-zerodb`.
 - SPEC 04 §7/§8.1: cross-reference the adapter as the realization of the
   registry/close model and error taxonomy.
-- If human approves, flip this ADR to Approved and add a `docs/DIVERGENCES.md`
+- If human approves, flip this ADR to Approved and add a `docs/LMDB-COMPATIBILITY.md#behavior-differences`
   cross-ref for the D-003 `nested.rs` scoping.
 
 ### Acceptance criteria 1.13 inherits from this ADR

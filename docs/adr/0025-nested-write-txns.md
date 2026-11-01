@@ -29,7 +29,7 @@ ZeroDB's adapter has no such method (`crates/heed-zerodb/src/env.rs` has
 TXN-40, D-003 and ADR-0007 (Q2/Q3) all rest on the premise that heed keeps
 nested writes private. That premise holds for `RwTxn::nested` but not for
 `Env::nested_write_txn`, which is public. The issue was corrected on
-2026-10-17; TXN-40, D-003 and `docs/COMPATIBILITY.md` (rows for
+2026-10-17; TXN-40, D-003 and `docs/LMDB-COMPATIBILITY.md` (rows for
 `nested_write_txn`) still carry the old wording.
 
 ### Consumers
@@ -404,7 +404,7 @@ dirty store plus one savepoint. The cost is that it is not LMDB's technique;
 the stated reason (AGENTS.md rule 7) is the measured sensitivity of
 `bytes_from_classified` to any extra probe (B13).
 
-Correct the wording of TXN-40, D-003 and `docs/COMPATIBILITY.md` (they say
+Correct the wording of TXN-40, D-003 and `docs/LMDB-COMPATIBILITY.md` (they say
 heed has no public nested-write entry point) in a separate small change,
 whatever is decided here.
 
