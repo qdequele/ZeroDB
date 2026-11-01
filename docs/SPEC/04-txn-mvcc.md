@@ -831,7 +831,7 @@ dirty-page store must be built so it is.
   Adding a new dirty page or run allocates a **new** frame; it never disturbs the
   address of any existing frame. The per-`psize` rule (above) governs tree pages;
   overflow runs are the contiguous-frame exception.
-  *(Realization note — frame pool, commit 10c98a1, PERF-GAP B3/B12; LMDB's
+  *(Realization note — frame pool, commit 10c98a1, performance item B3/B12; LMDB's
   `me_dpages`.) One-page frames are recycled: within a txn a freed/spilled
   frame parks on a bounded spare list, and at txn end up to `SPARE_CAP` (256)
   spares ride back to an env-level pool that seeds the next write txn's store,
@@ -919,7 +919,7 @@ spilling bullet there.)
   at the written locations; caught by miri on the heap-backed test map,
   `zerodb-core/tests/writemap_in_place_miri.rs`). The resolution hot path is
   unchanged
-  (PERF-GAP B13: an extra spilled-page lookup inlined into every descent cost
+  (performance item B13: an extra spilled-page lookup inlined into every descent cost
   read rungs 3–13 %). Nested read children read through the same source; no
   spill runs while one is live (TXN-29 guard precedes the check).
 - **TXN-72 (writing a spilled page again)** — Touching a spilled tree page

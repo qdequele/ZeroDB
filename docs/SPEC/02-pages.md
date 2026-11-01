@@ -629,7 +629,7 @@ name with mismatched flags → `MdbError::Incompatible` (SPEC 01 §S8). All the
   `check` verifies it against a full walk on every committed image.
 - **Name = byte string.** A DB name is a leaf key (1–`MAX_DB_NAME` bytes),
   arbitrary bytes including `0x00`. heed's C-string names are a stricter
-  adapter-boundary rule imposed in M1.13 (DIVERGENCES D-008).
+  adapter-boundary rule imposed in M1.13 (divergence D-008).
 
 ---
 

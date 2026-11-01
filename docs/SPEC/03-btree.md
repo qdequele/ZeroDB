@@ -39,7 +39,7 @@ to byte order.
 **Default-ordering fast path (commit ef61096, kept).** The default comparison
 (`KeyCmp::Default`) compares two *equal-length* 8- or 4-byte keys as single
 big-endian integers instead of calling `memcmp` (milli/hannoy key the hot trees
-on fixed-width big-endian u32/u64 ids; PERF-GAP B13). For equal-length slices,
+on fixed-width big-endian u32/u64 ids; performance item B13). For equal-length slices,
 big-endian integer order **is** memcmp order — the most significant differing
 byte decides both — so the result is exactly `a.cmp(b)` for every input; every
 other length pair falls through to the plain slice comparison. This is a
@@ -524,7 +524,7 @@ which made ZeroDB's cursor-delete loop **4.2×** the fork's — where LMDB's is
 milli, four of them in the current indexer. Measured on the real server, the
 `prefix_iter_mut` + `del_current` loop in
 `post_processing::prefix::delete_prefixes` runs at **3.63×**
-(PERF-GAP **B8a**; `benches/results/archive/2026-09-10-meilisearch-delete-heavy-macos.md`).
+(performance item **B8a**; `benches/results/archive/2026-09-10-meilisearch-delete-heavy-macos.md`).
 The contract above is what the fork actually guarantees; the re-seek was never
 part of it.
 
@@ -1268,7 +1268,7 @@ remain **unsupported**). Milestone 2.8 (ADR-0011, approved) was **parked
 2026-07-20**: stage 2.8a was implemented and reviewed but never merged or
 pushed — local work only, preserved outside the repository along with the
 resume preconditions. The design below is kept, not deleted; other documents
-(SPEC 02 §10, ADR-0011, DIVERGENCES D-004) reference it. If revived, 2.8 would
+(SPEC 02 §10, ADR-0011, divergence D-004) reference it. If revived, 2.8 would
 add, against the format hooks reserved in SPEC 02 §10:
 
 - **Sub-page** encoding for small duplicate sets: the dup values live in an
