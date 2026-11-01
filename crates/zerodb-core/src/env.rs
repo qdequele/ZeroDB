@@ -30,12 +30,6 @@ use crate::page::{
 use crate::readers::{ReaderTable, SnapshotCell};
 use crate::stamps::StampCache;
 
-/// `EINVAL`, the error `mdb_env_set_mapsize` returns while the env has a
-/// live write txn (`Env::resize`). `zerodb-core` has no `libc`; the value is
-/// 22 on both supported targets (Linux and macOS).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-const EINVAL: i32 = 22;
-
 /// A consistent (mapped bytes, logical map size) pair (ADR-0023),
 /// from one [`Backing::view`] call. No `Debug`: it would print the whole map.
 #[derive(Clone, Copy)]
@@ -596,14 +590,6 @@ pub struct DurabilityFlags {
     /// SPEC 04 §6.4). Recorded here for introspection; the actual writable map
     /// lives in the `zerodb-io` backing.
     pub write_map: bool,
-}
-
-/// The `EACCES` error a write attempt on a read-only env returns (SPEC 01
-/// Table 1, TXN-8). Matches the fork's `mdb_txn_begin` → `EACCES`, which heed
-/// surfaces as `Error::Io(PermissionDenied)` (os error 13) — so ZeroDB returns
-/// the identical `Io(PermissionDenied)` for oracle taxonomy parity.
-fn eacces_error() -> Error {
-    Error::Io(std::io::Error::from_raw_os_error(13))
 }
 
 // ---------------------------------------------------------------------------
@@ -1510,7 +1496,7 @@ impl EnvInner {
     pub fn sync(&self, force: bool) -> Result<(), Error> {
         // (1) RDONLY is rejected before the NO_SYNC test, as in mdb_env_sync0.
         if self.durability.read_only {
-            return Err(eacces_error());
+            return Err(crate::error::eacces());
         }
         if self.is_poisoned() {
             return Err(Error::Io(std::io::Error::other(
@@ -1748,7 +1734,7 @@ impl Env {
         let mut guard = inner
             .write_mutex
             .try_acquire()
-            .ok_or_else(|| Error::Io(std::io::Error::from_raw_os_error(EINVAL)))?;
+            .ok_or_else(crate::error::einval)?;
         // Step 2: the cross-process writer lock (a no-op without a lock
         // file), through the write begin's path, which reaps after a
         // dead-owner takeover. Every error below drops `guard`, releasing

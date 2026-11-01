@@ -105,5 +105,20 @@ pub enum MdbError {
     BadDbi,
 }
 
+/// `EINVAL` as heed surfaces it (`Error::Io`, raw OS error 22): LMDB's answer
+/// for a handle that is not valid in a transaction, and for
+/// `mdb_env_set_mapsize` while a write txn is live. `zerodb-core` has no
+/// `libc`; 22 is `EINVAL` on Linux and macOS, the supported targets.
+pub(crate) fn einval() -> Error {
+    Error::Io(std::io::Error::from_raw_os_error(22))
+}
+
+/// `EACCES` as heed surfaces it (`Error::Io(PermissionDenied)`, raw OS error
+/// 13): the fork's `mdb_txn_begin` answer to a write attempt on a read-only
+/// env (SPEC 01 Table 1, TXN-8).
+pub(crate) fn eacces() -> Error {
+    Error::Io(std::io::Error::from_raw_os_error(13))
+}
+
 /// A convenience result alias for engine operations.
 pub type Result<T> = std::result::Result<T, Error>;

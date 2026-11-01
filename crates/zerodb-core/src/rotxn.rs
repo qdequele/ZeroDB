@@ -36,7 +36,7 @@ use crate::builder::StreamBuildError;
 use crate::cmp::KeyCmp;
 use crate::env::{Env, Snapshot};
 use crate::error::{Error, MdbError, Result};
-use crate::handles::{HandleTable, MemoCell, TxnHandles};
+use crate::handles::{HandleTable, MemoCell, TxnHandles, DENSE_DBI_LIMIT};
 use crate::page::{DBRecord, PageError, F_SUBDATA};
 use std::cmp::Ordering;
 
@@ -333,12 +333,6 @@ thread_local! {
     /// are never carried over.
     static SPARE_NAMED: Cell<Option<Box<[NamedEntry]>>> = const { Cell::new(None) };
 }
-
-/// Dbis below this get [`RoTxn`]'s lock-free record table (see
-/// `named_dense`). Meilisearch opens ~30 named DBs per env and hannoy a
-/// handful, so this covers every known consumer while bounding the
-/// per-txn allocation for envs opened with a very large `max_dbs`.
-const DENSE_DBI_LIMIT: u32 = 256;
 
 impl Drop for RoTxn<'_> {
     fn drop(&mut self) {
