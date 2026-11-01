@@ -1,7 +1,7 @@
 //! The write transaction: single-writer `RwTxn`, COW mutation, and the commit
 //! pipeline (SPEC 04 §2/§6/§8/§9, SPEC 03 §5–§10, ADR-0004).
 //!
-//! ## Shape (ADR-0004 D2)
+//! ## Shape (ADR-0004)
 //!
 //! [`Env::write_txn`] acquires the env's in-process write mutex (TXN-6) and
 //! holds the guard for the txn's whole life. All mutation runs against the
@@ -33,7 +33,7 @@
 //!
 //! [`RwTxn::commit`] runs the C0–C6 steps in **one function**
 //! ([`RwTxn::commit_pipeline`]) with the always-compiled H0–H4 crash hooks
-//! between steps (ADR-0004 D3/OQ5). The single load-bearing ordering (REC-7):
+//! between steps (ADR-0004). The single load-bearing ordering (REC-7):
 //! dirty pages are written (C2) and fsynced (C3) strictly before the meta is
 //! written (C4) to slot `txnid & 1` (TXN-63) and fsynced (C5); the in-memory
 //! snapshot is published last (C6, TXN-18/19 order). A failed fsync poisons
@@ -166,10 +166,9 @@ struct Drain {
 #[derive(Debug, Clone)]
 enum DrainIds {
     Owned(Vec<u64>),
-    /// The base meta's annex (SPEC 05 §2a), pinned in the snapshot. The
-    /// writer used to copy it into a `Vec` at every begin; front draws only
-    /// advance `head`, so the copy is now made by the rare mid-slice
-    /// removal alone ([`Drain::take_span`]).
+    /// The base meta's annex (SPEC 05 §2a), pinned in the snapshot. Front
+    /// draws only advance `head`, so only a mid-slice removal
+    /// ([`Drain::take_span`]) copies it.
     Shared(Arc<[u64]>),
 }
 
@@ -444,7 +443,7 @@ const LEAF_NODE_HEADER: usize = 8;
 /// Branch node header size (SPEC 02 §4.1).
 const BRANCH_NODE_HEADER: usize = 10;
 
-/// Which B+tree a mutation targets (ADR-0005 D1). The GC (free) DB is an
+/// Which B+tree a mutation targets (ADR-0005). The GC (free) DB is an
 /// ordinary tree of `P_LEAF`/`P_BRANCH` pages (SPEC 02 §7), so it is mutated
 /// by exactly the same split/merge/COW code as the main tree — this selector
 /// is the only difference, and it is the seam the named-DB catalog extends.
@@ -469,7 +468,7 @@ struct NamedTree {
     /// The handle generation the name was looked up for, when it came from
     /// a checked handle ([`RwTxn::ensure_open`]); `None` for a database
     /// this txn created or opened by name. A slot keeps one name per
-    /// generation (ADR-0024 rule 1), so the next write txn may reuse a name
+    /// generation (ADR-0024), so the next write txn may reuse a name
     /// carried with its generation ([`WriterCarry`]) instead of looking it up.
     generation: Option<u32>,
     rec: DBRecord,
@@ -549,18 +548,12 @@ fn recycle_vec<T>(v: &mut Vec<T>, cap: usize) {
     }
 }
 
-/// What a write txn leaves for the next write txn of its env (issue #8):
-/// its containers, emptied, with their allocations; the frame pool; the
+/// What a write txn leaves for the next write txn of its env: its
+/// containers, emptied, with their allocations; the frame pool; the
 /// named-database names it looked up; and the snapshot it ended with.
 /// Carried on the writer slot (`crate::env::WriterGuard`), so taking and
-/// returning it costs no lock of its own.
-///
-/// LMDB allocates its write transaction once per environment (`me_txn0`),
-/// with its dirty list, free-page lists and per-database arrays, and reuses
-/// it for every write txn. A ZeroDB write txn built every container empty
-/// and grew it again: a single-put commit made 19 heap allocations, and a
-/// profile of small commits on Graviton put `malloc`/`free` and the hash
-/// table rehashes among the largest user-space costs of the commit.
+/// returning it costs no lock of its own. LMDB likewise allocates its write
+/// transaction once per environment (`me_txn0`) and reuses it.
 ///
 /// Every container comes back empty. Capacity is kept up to a bound
 /// ([`crate::dirty::CARRY_INDEX_CAP`] for hash tables, [`CARRY_VEC_CAP`]
@@ -574,10 +567,10 @@ pub(crate) struct WriterCarry {
     /// The dirty store's indexes and spare frames, between txns; `None`
     /// while a txn's [`DirtyStore`] holds them.
     dirty: Option<DirtyCarry>,
-    /// Every pgno handed out by a GC draw this txn (ADR-0005 D1): feeds the
+    /// Every pgno handed out by a GC draw this txn (ADR-0005): feeds the
     /// generalized TXN-62 assert at C2 and the loose classification in
-    /// [`RwTxn::free_page`]. Pgno-hashed (issue #9): engine-authored keys,
-    /// no HashDoS surface.
+    /// [`RwTxn::free_page`]. Pgno-hashed: engine-authored keys, no HashDoS
+    /// surface.
     reclaimed: HashSet<u64, PgnoBuildHasher>,
     /// Committed pages obsoleted by this txn (GC-6). Written to the GC DB
     /// under `BE(writer_txnid)` at commit step C1 (`freelist_save`).
@@ -599,8 +592,7 @@ pub(crate) struct WriterCarry {
     names: Vec<Option<(u32, Box<[u8]>)>>,
     /// Descent-path buffer reused by every put and delete: taken with
     /// `mem::take` for the op and put back after, so only the first op
-    /// allocates. LMDB's cursor stack is likewise allocated once and reused;
-    /// a fresh `Vec` per op cost an allocation, its growth and a free.
+    /// allocates, as LMDB allocates its cursor stack once.
     path_buf: Path,
     /// Byte buffer the delete rebalance moves cells through (ADR-0028,
     /// SPEC 03 §10 REB-2/REB-4): a cell or a whole page is copied out of
@@ -609,16 +601,11 @@ pub(crate) struct WriterCarry {
     /// once, which under `WRITE_MAP` would take a second live `&mut` into
     /// the map.
     cell_scratch: Vec<u8>,
-    /// Rightmost-leaf fingers, at most one per tree (SPEC 03 §6.6):
-    /// the cached right-spine descent a sequential/APPEND put re-uses
-    /// instead of descending. Writer-private — reads and nested read children
-    /// never consult it (they descend from the records as always). Dropped by
-    /// every structural or ownership change of its pages: any put miss, every
-    /// delete/clear/drop entry, a fast-path split, and `free_page`/`free_run`
-    /// for any page a finger names (see [`RwTxn::finger_forget`]); an errored
-    /// txn cannot reach the fast path at all (`guard_ok` precedes it). A tiny
-    /// `Vec` scanned linearly: a txn touches a handful of trees. Emptied at
-    /// every txn end.
+    /// Rightmost-leaf fingers, at most one per tree (SPEC 03 §6.6): the
+    /// cached right-spine descent a sequential/APPEND put reuses. Writer
+    /// private. Dropped by every structural or ownership change of its pages
+    /// (see [`RwTxn::finger_forget`]) and emptied at every txn end. A small
+    /// `Vec` scanned linearly: a txn touches a handful of trees.
     fingers: Vec<Finger>,
     /// The handle-check memo allocation ([`TxnHandles::recycle`]).
     handles: Option<Box<crate::handles::Rare>>,
@@ -656,7 +643,7 @@ macro_rules! work_mut {
     };
 }
 
-/// Allocation restriction state (SPEC 05 GC-12, ADR-0005 D2).
+/// Allocation restriction state (SPEC 05 GC-12, ADR-0005).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AllocMode {
     /// Normal ops: loose → GC draw → extend (GC-16).
@@ -721,9 +708,9 @@ impl ValSrc<'_> {
 enum ReserveLoc {
     /// Inline in the leaf. `at` carries the settled `(leaf pgno, cell index)`
     /// when the insert path can prove it final — every no-split arm, where
-    /// the receiving leaf and slot are in scope (issue #10: this makes
-    /// the common `put_reserved` single-descent).
-    /// `None` (a split moved cells) falls back to a key search.
+    /// the receiving leaf and slot are in scope — so the common
+    /// `put_reserved` needs no second descent. `None` (a split moved cells)
+    /// falls back to a key search.
     Inline { at: Option<(u64, usize)> },
     /// On the overflow run headed at this pgno.
     Big(u64),
@@ -778,7 +765,7 @@ impl OwnedBranchCell {
 
 /// §6.4 split-point policy: median then fit-adjust, over the post-insert
 /// sequence's `used` sizes (`cell + 2` each). Index `s` belongs to the right
-/// page (deterministic tie-break). Cited, not re-derived (ADR-0004 D5); the
+/// page (deterministic tie-break). Cited, not re-derived (ADR-0004); the
 /// monotonicity/termination argument is SPEC 03 §6.4's.
 fn choose_split(sizes: &[usize], cap: usize) -> usize {
     let n = sizes.len();
@@ -826,10 +813,9 @@ fn read_only_error() -> Error {
     Error::Io(std::io::Error::from_raw_os_error(13))
 }
 
-/// The `WRITE_MAP` arm of a write-txn begin (ADR-0023 amendment 15, decision
-/// 4): grow the data file to this process's logical map size. Out of line so
-/// the default write-txn begin stays small enough for its own callees to be
-/// inlined.
+/// The `WRITE_MAP` arm of a write-txn begin (ADR-0023): grow the data file
+/// to this process's logical map size. Out of line so the default write-txn
+/// begin stays small enough for its own callees to be inlined.
 #[cold]
 #[inline(never)]
 fn grow_file_to_map(inner: &crate::env::EnvInner) -> Result<()> {
@@ -854,16 +840,11 @@ pub struct RwTxn<'env> {
     /// `std::sync::MutexGuard`).
     _guard: crate::env::WriterGuard<'env>,
     /// The mapped region (fallback source for untouched pages, TXN-38), heap
-    /// modes only. Re-derived from the backing at every spill (TXN-71,
-    /// ADR-0021 B2): a spill makes this-txn-written pages resolvable through
-    /// this view, and a view predating those writes must never serve them.
-    ///
-    /// Under in-place `WRITE_MAP` (TXN-45b) this is the **empty slice** and
-    /// every access goes through [`RwTxn::whole_map`]'s lazy borrow instead:
-    /// the writer mutates map bytes mid-txn, and under Stacked Borrows a
-    /// stale whole-map reference *field* is re-asserted (retagged) on every
-    /// move of the txn — `commit(self)` included — which is UB at the
-    /// written locations even if never read (ADR-0021 M1).
+    /// modes only, re-derived at every spill (TXN-71). Under in-place
+    /// `WRITE_MAP` (TXN-45b) it is the **empty slice**: a stale whole-map
+    /// reference field would be retagged on every move of the txn, which is
+    /// UB at the written locations, so [`RwTxn::whole_map`] borrows lazily
+    /// instead (ADR-0021).
     bytes: &'env [u8],
     /// The snapshot this txn grew from (`writer_txnid = base.txnid + 1`).
     /// `Some` until the txn's drop hands it to the [`WriterCarry`]; read it
@@ -880,18 +861,13 @@ pub struct RwTxn<'env> {
     txnid: u64,
     psize: u32,
     dirty: DirtyStore<'env>,
-    /// Map-sourced pages fully validated this txn. Sound for a
-    /// writer because a map page's bytes can change during the txn only at
-    /// pgnos this txn has **dirtied** — never at all in the default mode
-    /// (mutations are buffered until commit C2, TXN-45a), and only at the
-    /// freshly-allocated dirty pgnos under in-place WRITE_MAP (TXN-45b,
-    /// ADR-0021) — and dirty frames are excluded from the memo by
-    /// [`Source::bytes_from_classified`] (the dirty store is probed first,
-    /// so a dirtied pgno's memo entry is never consulted again; spills reset
-    /// the memo wholesale, TXN-71). Probes (never publishes) the
-    /// env-wide stamp cache (ADR-0018).
+    /// Map-sourced pages fully validated this txn. Sound for a writer
+    /// because a map page's bytes change during the txn only at pgnos this
+    /// txn has dirtied (TXN-45a/45b), and the dirty store is probed before
+    /// the memo; spills reset the memo (TXN-71). Probes, never publishes,
+    /// the env-wide stamp cache (ADR-0018).
     validated: ValidatedPages<'env>,
-    /// GC-20 drain bookkeeping (ADR-0005 D1): for every GC entry `F` this txn
+    /// GC-20 drain bookkeeping (ADR-0005): for every GC entry `F` this txn
     /// drew from, the **remaining** (still-free, sorted-ascending) ids —
     /// [`Drain::live`], a consumed-prefix view so the GC-19 front pop is O(1).
     /// Loaded from the tree PIL on first touch; `freelist_save` step (a)
@@ -910,7 +886,7 @@ pub struct RwTxn<'env> {
     /// GC-tree entry `BE(txnid)` exists), `false` = the v1 tree arm ran (or
     /// `freed` is empty) and the annex is empty.
     annex_out: bool,
-    /// GC-12 allocation restriction (ADR-0005 D2).
+    /// GC-12 allocation restriction (ADR-0005).
     alloc_mode: AllocMode,
     /// Entries of `drains` whose `remaining` shrank via an **in-save pool
     /// draw** (GC-12 — see `freelist_save`): each must be
@@ -960,12 +936,11 @@ pub struct RwTxn<'env> {
     /// inside a split cascade) leaves the working tree partial, so every later
     /// mutation and `commit` returns `BadTxn`; only abort is valid.
     errored: bool,
-    /// Per-txn cache of the GC reuse gate (SPEC 04 TXN-22; ADR-0006
-    /// decision 6): computed by the first `gc_reclaim` of this txn, reused
-    /// for its remaining draws. Caching is only ever *more* conservative — a
-    /// reader that releases mid-txn is simply not reclaimed-against this txn
-    /// — and the cache dies with the `RwTxn` ("must recompute in a fresh
-    /// write txn"). The debug shadow check re-scans fresh at every draw.
+    /// Per-txn cache of the GC reuse gate (SPEC 04 TXN-22, ADR-0006):
+    /// computed by this txn's first `gc_reclaim` and reused for its other
+    /// draws. Caching is only ever more conservative (a reader that releases
+    /// mid-txn is just not reclaimed against). The debug shadow check
+    /// re-scans at every draw.
     oldest_cache: Option<u64>,
     /// The smallest run length the cross-record run search
     /// ([`RwTxn::cross_record_run`]) has looked for and not found this txn,
@@ -984,18 +959,14 @@ pub struct RwTxn<'env> {
     /// drain pool or the end of the file) and the save reaches its fixed
     /// point instead of trading pages between the entry and its own run.
     save_outside: bool,
-    /// Live nested read children (SPEC 04 TXN-31, ADR-0007 D3). Checked by
-    /// [`RwTxn::guard_ok`] on every mutating entry (TXN-29) and at
-    /// commit C0 (TXN-33); bumped/released by
-    /// [`crate::nested::NestedRoTxn`].
+    /// Live nested read children (SPEC 04 TXN-31, ADR-0007), checked by
+    /// [`RwTxn::guard_ok`] (TXN-29) and at commit C0 (TXN-33).
     ///
-    /// **`RwTxn: Sync` standing contract (ADR-0007 Q1):** `NestedRoTxn` is
-    /// `Send` purely because `&RwTxn: Send`,
-    /// i.e. because this struct is `Sync`. No field may introduce interior
-    /// mutability usable through `&self` (`Cell`, `RefCell`, …) — use an
-    /// atomic (like this one) or keep it behind `&mut`. The
-    /// `rwtxn_sync_contract_and_child_send` compile-time assertion in
-    /// `crate::nested` turns a violation into a build failure.
+    /// **`RwTxn` must stay `Sync`:** `NestedRoTxn` is `Send` only because
+    /// `&RwTxn: Send`. No field may add interior mutability usable through
+    /// `&self` (`Cell`, `RefCell`, …); use an atomic or keep it behind
+    /// `&mut`. `rwtxn_sync_contract_and_child_send` in `crate::nested` makes
+    /// a violation a build failure.
     children: ChildCounter,
 }
 
@@ -1009,7 +980,7 @@ impl Env {
     /// [`Error::Io`] if the env is poisoned by an earlier fsync failure
     /// (SPEC 06 REC-13). [`MdbError::MapResized`] if the newest snapshot lies
     /// beyond this process's logical map size: another process with a larger
-    /// map committed past it (ADR-0023 amendment 15).
+    /// map committed past it (ADR-0023).
     pub fn write_txn(&self) -> Result<RwTxn<'_>> {
         let inner = self.inner();
         // TXN-8 / SPEC 01 Table 1: a write txn on a read-only env is
@@ -1031,31 +1002,29 @@ impl Env {
         if inner.is_poisoned() {
             return Err(poisoned_error());
         }
-        // ADR-0023 amendment 15, decision 4: under WRITE_MAP the data file
-        // grows to this process's logical map size here, with both writer
-        // locks held (and after any dead-owner takeover reap), so every page
-        // this txn can allocate below the map size is inside the file before
-        // anything is written through the map. A joiner's open never grows
-        // the file. One comparison when the file is already long enough.
+        // Under WRITE_MAP the data file grows to this process's logical map
+        // size here, with both writer locks held (and after any dead-owner
+        // takeover reap), so every page this txn can allocate below the map
+        // size is inside the file before anything is written through the
+        // map (ADR-0023). A joiner's open never grows the file.
         let write_map = inner.durability().write_map;
         if write_map {
             grow_file_to_map(inner)?;
         }
         // The latest published snapshot, which in a lock-file env may be
-        // another process's commit (ADR-0023 §4): never the process-local
-        // cell. Without a lock file this is the cell, as before. The previous
-        // write txn's snapshot, carried on the writer slot, when it is still
-        // the latest.
+        // another process's commit (ADR-0023 §4). The previous write txn's
+        // snapshot, carried on the writer slot, serves when it is still the
+        // latest.
         let cached = guard.carry().snapshot.take();
         let base = inner.writer_base(cached)?;
         // The map view, loaded once for the whole begin: the base check
         // below and the txn's read view (`bytes`) both come from it.
         let backing = inner.backing_ref();
         let view = backing.view();
-        // ADR-0023 amendment 15: the base must lie inside this process's
-        // logical map size, even when it came from the cache; otherwise the
-        // begin fails with `MapResized` (`OBS_WRITE_BEGIN_SMALL_MAP`). Either
-        // error drops `guard`, releasing both writer locks.
+        // The base must lie inside this process's logical map size, even
+        // when it came from the cache; otherwise the begin fails with
+        // `MapResized` (ADR-0023). Either error drops `guard`, releasing both
+        // writer locks.
         inner.check_base_in(view, &base)?;
         // ADR-0021 (SPEC 04 §6.4 TXN-45b): under WRITE_MAP, with a backing
         // that brokers map slices, dirty pages are realized **in the map** at
@@ -1084,10 +1053,9 @@ impl Env {
             validate_pil_ids(&base.free_annex, base.last_pg)?;
             Drain::shared(Arc::clone(&base.free_annex))
         };
-        // The previous write txn's containers (issue #8), and the frames
-        // recycled from earlier write txns (LMDB's `me_dpages`) as the dirty
-        // store's spare list. They came with the writer slot, so this takes
-        // no lock.
+        // The previous write txn's containers, and the frames recycled from
+        // earlier write txns (LMDB's `me_dpages`) as the dirty store's spare
+        // list. They came with the writer slot, so this takes no lock.
         let mut work = guard.take_carry();
         let dirty = DirtyStore::from_carry(
             inner.page_size(),
@@ -1130,7 +1098,7 @@ impl Env {
             save_outside: false,
             children: ChildCounter::new(),
             // In-place WRITE_MAP keeps no whole-map reference in the struct
-            // (see the field docs; ADR-0021 M1) — `whole_map` borrows lazily.
+            // (see the field docs; ADR-0021) — `whole_map` borrows lazily.
             bytes: if in_map { &[] } else { view.bytes },
             base: Some(base),
             published: None,
@@ -1369,7 +1337,7 @@ impl<'env> RwTxn<'env> {
         Ok(NestedRoTxn::open(self))
     }
 
-    /// The live-child counter (ADR-0007 D3) — for `crate::nested` only.
+    /// The live-child counter (ADR-0007) — for `crate::nested` only.
     pub(crate) fn children(&self) -> &ChildCounter {
         &self.children
     }
@@ -1380,7 +1348,7 @@ impl<'env> RwTxn<'env> {
         if self.errored {
             return Err(Error::Mdb(MdbError::BadTxn));
         }
-        // TXN-29 (ADR-0007 Q4): while any nested read child is live,
+        // TXN-29 (ADR-0007): while any nested read child is live,
         // the dirty set is frozen — every mutating entry funnels through here
         // and refuses with BadTxn (LMDB `MDB_BAD_TXN` = "transaction … has a
         // child") in BOTH debug and release. Normally unreachable (the child
@@ -1407,7 +1375,7 @@ impl<'env> RwTxn<'env> {
         }
     }
 
-    /// The working `DBRecord` of `tree` (ADR-0005 D1 selector). A named tree's
+    /// The working `DBRecord` of `tree` (ADR-0005 selector). A named tree's
     /// record must have been loaded by [`RwTxn::ensure_open`] first.
     fn record(&self, tree: TreeId) -> &DBRecord {
         match tree {
@@ -1497,13 +1465,13 @@ impl<'env> RwTxn<'env> {
     /// txn begin would predate those writes: under Stacked/Tree Borrows,
     /// copying such a stale `&[u8]` — let alone reading a spilled page
     /// through it — is undefined behavior at the written locations
-    /// (ADR-0021 M1). The in-map arm
+    /// (ADR-0021). The in-map arm
     /// therefore borrows the view **lazily per access**, exactly as `RoTxn`
     /// does: a fresh borrow at a `&self` boundary postdates every in-place
     /// write, and none can happen while it lives (TXN-39).
     ///
     /// Heap modes keep the cached view (`self.bytes`, re-derived per spill —
-    /// TXN-71, ADR-0021 B2): their mid-txn file writes go through the fd,
+    /// TXN-71, ADR-0021): their mid-txn file writes go through the fd,
     /// and the only Rust-visible map mutation is the commit/spill-time
     /// `memcpy` of the heap-staged WRITE_MAP backing, which the spill-time
     /// re-derivation postdates.
@@ -1527,7 +1495,7 @@ impl<'env> RwTxn<'env> {
         .map_err(corrupt)
     }
 
-    /// `allocate(n)` (SPEC 05 GC-16, ADR-0005 D3): loose fast path, then a GC
+    /// `allocate(n)` (SPEC 05 GC-16, ADR-0005): loose fast path, then a GC
     /// draw (skipped entirely inside `freelist_save` — GC-12), then file
     /// extend with the GC-17 bound.
     ///
@@ -1535,7 +1503,7 @@ impl<'env> RwTxn<'env> {
     /// immediately realized **in the map** — a store to committed bytes, not
     /// a heap frame — so the TXN-62 check that is a `debug_assert` at C2
     /// (`write_frames`) is enforced here as a **typed release-mode guard**
-    /// (ADR-0021 M2): a future allocator bug must surface as an error, never
+    /// (ADR-0021): a future allocator bug must surface as an error, never
     /// silently clobber committed data through the map.
     fn allocate(&mut self, n: u64) -> Result<u64> {
         let p = self.allocate_raw(n)?;
@@ -1553,7 +1521,7 @@ impl<'env> RwTxn<'env> {
         Ok(p)
     }
 
-    /// The ADR-0021 M2 predicate: every page of the run is either beyond the
+    /// The ADR-0021 predicate: every page of the run is either beyond the
     /// committed high-water or recorded as GC-reclaimed under the
     /// oldest-reader gate this txn (`reclaimed` also covers loose re-draws:
     /// a loose page was classified loose by exactly this predicate,
@@ -1568,8 +1536,13 @@ impl<'env> RwTxn<'env> {
             .all(|pg| pg > self.committed_last_pg || work!(self).reclaimed.contains(&pg))
     }
 
-    /// [`RwTxn::allocate`] without the ADR-0021 M2 guard (the guard wraps
+    /// [`RwTxn::allocate`] without the ADR-0021 guard (the guard wraps
     /// every return point in one place).
+    ///
+    /// The hot shape here is the loose pop. The draw arms (`loose_run`,
+    /// `save_pool_draw`, `annex_draw`, `gc_reclaim`, `cross_record_run`) are
+    /// `#[inline(never)]` so their size never pushes this function past
+    /// LLVM's inlining budget.
     fn allocate_raw(&mut self, n: u64) -> Result<u64> {
         debug_assert!(n >= 1);
         if n == 1 {
@@ -1645,8 +1618,6 @@ impl<'env> RwTxn<'env> {
     /// Serve a contiguous `n`-page run from the loose list (GcSave only; see
     /// [`RwTxn::allocate`]). A loose run that abuts `next_pgno` may be
     /// completed by extension. Returns the run's head pgno.
-    // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
-    // arms stay separate so their size never moves it (inlining budget).
     #[inline(never)]
     fn loose_run(&mut self, n: u64) -> Option<u64> {
         debug_assert!(self.alloc_mode == AllocMode::GcSave);
@@ -1696,8 +1667,6 @@ impl<'env> RwTxn<'env> {
     /// entry passed `F ≤ oldest_reader()` when first loaded during ops, and
     /// any reader that pins *after* that pins the published snapshot
     /// `≥ writer_txnid − 1 ≥ F`, from whose trees these pages are absent.
-    // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
-    // arms stay separate so their size never moves it (inlining budget).
     #[inline(never)]
     fn save_pool_draw(&mut self, n: u64) -> Option<u64> {
         debug_assert!(self.alloc_mode == AllocMode::GcSave);
@@ -1735,8 +1704,6 @@ impl<'env> RwTxn<'env> {
     /// ops as step 2b, and inside `freelist_save` as the carried pool
     /// (GC-30 — the step-(c) placement re-reads `annex.live()` after every
     /// tree write, so an in-save draw is always re-accounted).
-    // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
-    // arms stay separate so their size never moves it (inlining budget).
     #[inline(never)]
     fn annex_draw(&mut self, n: u64) -> Option<u64> {
         if self.annex.len() == 0 {
@@ -1762,7 +1729,7 @@ impl<'env> RwTxn<'env> {
     /// live reader snapshot txnid, writer_txnid − 1)`. The reader term is the
     /// lock-free reader-table SeqCst scan
     /// ([`crate::env::EnvInner::oldest_live_reader`]); this is its only
-    /// consumer. Cached per write txn (TXN-22; ADR-0006 decision 6): the
+    /// consumer. Cached per write txn (TXN-22; ADR-0006): the
     /// first draw scans, later draws reuse — always sound because a stale
     /// gate is only ever *smaller* (readers that release mid-txn are not
     /// reclaimed-against; readers that pin mid-txn pin `≥ commit point =
@@ -1820,8 +1787,6 @@ impl<'env> RwTxn<'env> {
     /// (smallest id for `n == 1` — GC-19; first within-PIL contiguous run for
     /// `n > 1` — GC-15/21), record the drain in `self.drains` (the tree entry
     /// itself is rewritten only at C1, GC-20) and return the head pgno.
-    // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
-    // arms stay separate so their size never moves it (inlining budget).
     #[inline(never)]
     fn gc_reclaim(&mut self, n: u64) -> Result<Option<u64>> {
         debug_assert!(
@@ -1930,8 +1895,6 @@ impl<'env> RwTxn<'env> {
     ///
     /// Every page drawn passed the same gate as a single-record draw, so no
     /// live snapshot and no crash-fallback meta can reach it (GC-18).
-    // Kept out of line: `allocate`'s hot shape is the loose pop; the draw
-    // arms stay separate so their size never moves it (inlining budget).
     #[inline(never)]
     fn cross_record_run(&mut self, n: u64) -> Result<Option<u64>> {
         debug_assert!(n > 1 && self.alloc_mode == AllocMode::Normal);
@@ -2155,7 +2118,7 @@ impl<'env> RwTxn<'env> {
         }
         // Not dirty, so the page must be committed: a committed reference
         // never exceeds the base snapshot's high-water (SPEC 06 REC-14). The
-        // map may extend past the real file end (ADR-0004 D4), so an
+        // map may extend past the real file end (ADR-0004), so an
         // unbounded read here could fault on a corrupt reference.
         if pgno > self.committed_last_pg {
             return Err(Error::Mdb(MdbError::Invalid));
@@ -2365,20 +2328,12 @@ impl<'env> RwTxn<'env> {
         // touch already stored it in the fully-backed map), so the file backs
         // every page up to `high`; spilled pages resolve from the map below it.
         self.read_high = high;
-        // TXN-71 / ADR-0021 B2: re-derive the cached whole-map read view. A
-        // spill is the moment pages this txn wrote (via `pwrite` or the
-        // heap-staged WRITE_MAP `memcpy`) become resolvable through the view
-        // (`read_high` above), so a view taken *before* those writes must
-        // never serve them: under Stacked/Tree Borrows a write through the
-        // map's root invalidates an older shared borrow at exactly the
-        // written locations, and the fd-write path mutates the same mapped
-        // bytes outside the borrow system entirely. A fresh borrow taken
-        // here — after every write to the newly spilled pages, at a `&mut`
-        // boundary with no other borrow live (TXN-39) — postdates them all.
-        // (Under in-place WRITE_MAP the writes happen mid-txn, not at spill,
-        // so the cache stays the empty slice and `RwTxn::whole_map`
-        // re-borrows per access instead — ADR-0021 M1: a stale reference
-        // *field* is retagged on every move of the txn.)
+        // TXN-71 (ADR-0021): re-derive the cached whole-map read view. The
+        // pages just spilled become resolvable through it, and a view taken
+        // before those writes must never serve them (under Stacked/Tree
+        // Borrows the write invalidates the older borrow). This fresh borrow,
+        // at a `&mut` boundary (TXN-39), postdates every write. In-place
+        // WRITE_MAP keeps no cached view; see `RwTxn::whole_map`.
         if !self.dirty.in_map_mode() {
             self.bytes = self.env.inner().backing_bytes();
         }
@@ -2440,7 +2395,7 @@ impl<'env> RwTxn<'env> {
     }
 
     /// [`RwTxn::search_path`] into a caller-owned buffer (cleared first), so
-    /// the put and delete paths can reuse [`RwTxn::path_buf`].
+    /// the put and delete paths can reuse the carried `path_buf` ([`WriterCarry`]).
     fn search_path_into(&self, tree: TreeId, key: &[u8], path: &mut Path) -> Result<bool> {
         path.clear();
         let cmp = self.tree_comparator(tree);
@@ -2460,8 +2415,8 @@ impl<'env> RwTxn<'env> {
         let mut pgno = rec.root;
         let valid = Some(&self.validated);
         for _ in 0..=rec.depth {
-            // One source resolution per level (issue #9); a non-tree
-            // page type maps through `corrupt` to `Invalid`.
+            // One source resolution per level; a non-tree page type maps
+            // through `corrupt` to `Invalid`.
             match node_view(self.source(), self.psize, pgno, valid).map_err(corrupt)? {
                 NodeView::Leaf(leaf) => {
                     let (ki, found) = match leaf.lookup_with(key, cmp) {
@@ -3234,7 +3189,7 @@ impl<'env> RwTxn<'env> {
         }
     }
 
-    // -- split machinery (§6.2/§6.4/§6.5, ADR-0004 D5) ------------------------
+    // -- split machinery (§6.2/§6.4/§6.5, ADR-0004) ------------------------
 
     fn extract_branch_cells(&self, pgno: u64) -> Result<Vec<OwnedBranchCell>> {
         let frame = self.dirty.bytes(pgno).expect("page is dirty");
@@ -4764,7 +4719,7 @@ impl<'env> RwTxn<'env> {
 
     /// Leaf-skipping variant of [`collect_tree`](Self::collect_tree) for a
     /// tree whose record says `overflow_pages == 0` (SPEC 02 §6.1, LMDB
-    /// `mdb_drop0`): branch pages are read as before, but the children of the
+    /// `mdb_drop0`): branch pages are read as usual, but the children of the
     /// lowest branch level — and a root-is-leaf root — are collected WITHOUT
     /// loading the leaf pages, so `clear`/`drop` reads only the branches.
     ///
@@ -4914,8 +4869,8 @@ impl<'env> RwTxn<'env> {
                 pil_encode_into(ids, &mut frame[HEADER_SIZE..HEADER_SIZE + len]);
             }
             ReserveLoc::Inline { at } => {
-                // The no-split insert arms prove the settled cell (issue
-                // #10); a split falls back to the key search.
+                // The no-split insert arms prove the settled cell; a split
+                // falls back to the key search.
                 let (lpg, ki) = match at {
                     Some(pos) => {
                         // Same cross-check as `Database::put_reserved`.
@@ -5183,7 +5138,7 @@ impl<'env> RwTxn<'env> {
     ///   poisons the env (SPEC 06 REC-13).
     /// - [`Error::Io`] when this is the first commit of a `PREV_SNAPSHOT`
     ///   env with a lock file and letting other processes in (the lock-file
-    ///   downgrade) fails after the meta write (ADR-0023 amendment 19). The
+    ///   downgrade) fails after the meta write (ADR-0023). The
     ///   commit is then **durable** although `Err` is returned; as for every
     ///   first `PREV_SNAPSHOT` commit, it is not published, the next commit
     ///   reuses its txnid on the older snapshot, and that commit retries the
@@ -5192,11 +5147,11 @@ impl<'env> RwTxn<'env> {
         if self.errored {
             return Err(Error::Mdb(MdbError::BadTxn));
         }
-        // C0 (SPEC 04 TXN-33/58, ADR-0007 D4): all nested read children must
+        // C0 (SPEC 04 TXN-33/58, ADR-0007): all nested read children must
         // be gone before anything commits. Compile-time this is guaranteed —
         // `commit(self)` is by-value, so a live child's `&self` borrow makes
         // the call unrepresentable; the runtime check backstops lifetime
-        // erasure (oracle/FFI) and `mem::forget`-leaked children (risk R1).
+        // erasure (oracle/FFI) and `mem::forget`-leaked children.
         // Checked before `is_unchanged` too: a leaked child must block even a
         // no-op commit, keeping the degradation mode uniform (always BadTxn).
         if self.children.live() != 0 {
@@ -5229,7 +5184,7 @@ impl<'env> RwTxn<'env> {
         env.inner().handles().end(&mut self.handles, committed);
     }
 
-    /// The one commit function (ADR-0004 D3): steps C1–C6 in textual order,
+    /// The one commit function (ADR-0004): steps C1–C6 in textual order,
     /// H0–H4 hooks between steps. Crash-safety invariant per cut point is the
     /// SPEC 06 REC-6 table; the load-bearing ordering (REC-7) is that C3
     /// completes before C4 begins, and C4 targets only the older slot
@@ -5248,7 +5203,7 @@ impl<'env> RwTxn<'env> {
         let async_flush = durability.map_async;
 
         // ----- C0 was checked in `commit()` (TXN-33: `children.live() == 0`,
-        // ADR-0007 D4); the freed-page list is already accumulated
+        // ADR-0007); the freed-page list is already accumulated
         // (GC-6). -----
 
         // ----- C1a: flush dirty named-DB records into the main catalog
@@ -5257,7 +5212,7 @@ impl<'env> RwTxn<'env> {
         // freelist_save must then capture. -----
         self.flush_catalog()?;
 
-        // ----- C1: freelist_save (SPEC 05 §4, GC-11..14; ADR-0005 D2):
+        // ----- C1: freelist_save (SPEC 05 §4, GC-11..14; ADR-0005):
         // drains applied, trailing loose released, this txn's freed set
         // written under BE(writer_txnid) — all into dirty frames only. -----
         self.freelist_save()?;
@@ -5310,9 +5265,8 @@ impl<'env> RwTxn<'env> {
         // slot; the intact `N-1` slot is the crash fallback). -----
         let last_pg = self.next_pgno - 1;
         let slot = self.txnid & 1;
-        // ADR-0023 amendment 15: a commit never lowers the persisted map size
-        // (`OBS_COMMIT_PERSISTS_OWN_MAPSIZE` = false): a process with a
-        // smaller map keeps the larger size another process recorded.
+        // A commit never lowers the persisted map size (ADR-0023): a process
+        // with a smaller map keeps the larger size another process recorded.
         let map_size = self.base().map_size.max(inner.map_size());
         // GC-32 (ADR-0022): in annex mode this txn's freed PIL rides in the
         // meta itself — `freed` is final after C1 and already sorted/deduped
@@ -5338,7 +5292,6 @@ impl<'env> RwTxn<'env> {
         // The page buffer is the env's reusable one: all zero on entry and
         // on exit, since only the encoded prefix is written and then cleared
         // again, so a commit neither allocates nor zeroes a whole page here.
-        // The bytes written are the same full page as before.
         let mut buf = inner.meta_buf();
         if buf.len() != psize as usize {
             *buf = vec![0u8; psize as usize];
@@ -5398,9 +5351,9 @@ impl<'env> RwTxn<'env> {
             },
         });
 
-        // ----- ADR-0023 amendment 19: the first commit of a `PREV_SNAPSHOT`
-        // open that holds the election is durable but not published, as
-        // LMDB's (`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`): C5a and C6 are skipped,
+        // ----- The first commit of a `PREV_SNAPSHOT` open that holds the
+        // election is durable but not published, as LMDB's (ADR-0023): C5a
+        // and C6 are skipped,
         // because the next commit reuses this txnid (TXN-2) and builds on the
         // older snapshot. The election is finished instead, letting waiting
         // processes join. -----
@@ -5456,22 +5409,11 @@ impl<'env> RwTxn<'env> {
 
 impl Drop for RwTxn<'_> {
     fn drop(&mut self) {
-        // Reclaim up to `SPARE_CAP` one-page frames into the writer slot's pool for
-        // the next write txn (LMDB's `me_dpages` reuse). This runs
-        // on every end-of-txn path — commit success, commit failure, and abort
-        // (which is `drop(self)`) — and is safe on all of them:
-        //   * The commit pipeline has fully returned before this drop begins, so
-        //     C2 has finished copying every dirty frame to disk. All write
-        //     backends copy synchronously (pwrite / msync `memcpy`); none retain
-        //     a reference to a frame buffer past the write call, so no frame is
-        //     recycled while a write still reads it.
-        //   * On abort/failure the frames are unwritten garbage; recycled
-        //     contents never matter because every reuse (`insert_copy` /
-        //     `insert_tree_frame`) fully overwrites or zero-fills the frame.
-        // The frames ride back with the txn's other containers in its
-        // `WriterCarry` (issue #8) on the writer guard, which stores it in
-        // the slot under the release lock it takes anyway when this txn's
-        // fields drop right after this method.
+        // Hand the dirty store's frames back for the next write txn (LMDB's
+        // `me_dpages` reuse; `DirtyStore::take_carry` says why this is safe
+        // on every end-of-txn path). They ride with the txn's other
+        // containers in its `WriterCarry`, which the writer guard stores in
+        // the slot when this txn's fields drop right after this method.
         let dirty = self.dirty.take_carry();
         // ADR-0024: an end without a commit (abort, failed commit) frees what
         // this txn opened; after a commit there is nothing left to end.
@@ -5586,8 +5528,8 @@ impl Database {
             }
             ReserveLoc::Inline { at } => {
                 // The insert path proves the settled `(leaf, slot)` on every
-                // no-split arm (issue #10: one descent, not two); a split
-                // returns `None` and we re-locate by key.
+                // no-split arm, so no second descent; a split returns `None`
+                // and we re-locate by key.
                 let (lpg, ki) = match at {
                     Some(pos) => {
                         // Cross-check the proof against a real search in
@@ -5749,7 +5691,7 @@ impl Database {
 }
 
 // ---------------------------------------------------------------------------
-// RwCursor — the mutable cursor (SPEC 03 §7, ADR-0004 D5)
+// RwCursor — the mutable cursor (SPEC 03 §7, ADR-0004)
 // ---------------------------------------------------------------------------
 
 /// The write cursor's **semantic** position, used only when no parked stack
@@ -5782,7 +5724,7 @@ enum Step<'k> {
 /// A write cursor: iteration with `put_current`/`del_current`/`put` at the
 /// current entry (SPEC 03 §7). It holds the `&mut RwTxn` exclusively, so **at
 /// most one cursor exists across any mutation** — cursor fix-up therefore
-/// reduces to this cursor's own position (ADR-0004 D5).
+/// reduces to this cursor's own position (ADR-0004).
 ///
 /// **Stack persistence:** between mutations the cursor persists its
 /// root-to-leaf path as a parked [`SavedCursor`], so an advance is an O(1)
@@ -6421,7 +6363,7 @@ mod tests {
     /// remainder equals what a naive representation (binary_search +
     /// `Vec::drain` on every draw) would encode into the rewritten PIL.
     #[test]
-    fn drain_remainder_matches_old_drain_algorithm() {
+    fn drain_remainder_matches_naive_drain() {
         // Reference: the naive drain-on-every-draw algorithm.
         fn naive_take(ids: &mut Vec<u64>, start: u64, n: u64) {
             let pos = ids.binary_search(&start).unwrap();
