@@ -1,6 +1,6 @@
 # ADR-0024: Database handle lifetime (stale handles after abort and remove)
 
-- Status: Approved (Option A), maintainer, 2026-10-17
+- Status: Approved (Option A), maintainer, 2026-10-17; implemented
 - Related issue: #73 (divergence D-013)
 - Date: 2026-10-17
 

@@ -1,9 +1,9 @@
 # ADR-0013: Release and versioning policy for the 0.x line
 
-- Status: Proposed (agent-drafted 2026-09-09 for the first release; Q1 and Q2
-  answered by the maintainer the same day — publish the engine crates to
-  crates.io, ship 0.1 with the open Phase 1 items as known gaps; Q3 defaults to
-  plain annotated tags unless a maintainer objects before tagging)
+- Status: Followed for the 0.2.0 release. The maintainer answered Q1 and Q2 on
+  2026-09-09 (publish the engine crates to crates.io; ship with the open items
+  as known gaps); Q3 defaulted to plain annotated tags. The formal approval is
+  not recorded.
 - Milestone: first release (v0.1.0)
 - Date: 2026-09-09 (revised the same day: Option A → Option B after Q1)
 

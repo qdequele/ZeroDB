@@ -1,16 +1,60 @@
 # ADR-0023: Multi-process access — lock file, shared reader table, cross-process writer lock
 
-- Status: **Accepted, implemented** (stages 1–3, 2026-10-13). Approved
-  2026-10-09 by the maintainer, open questions resolved to the proposed
-  defaults (see the end of this ADR); stage-3 amendments 15–18 approved
-  2026-10-12, amendment 19 (`PREV_SNAPSHOT`) approved 2026-10-13, amendment
-  20 (in-place lock-file initialization, issue #94) approved 2026-10-14. The lock
-  file is on by default. The decision text below is
-  reconciled with the amendments; where a sentence was superseded, it says
-  so inline. SPEC 04 §12 (`LCK-1` …) states the resulting invariants.
-- Related issue: [#70](https://github.com/qdequele/ZeroDB/issues/70); retires
+- Status: **Accepted, implemented.** The lock file is on by default. Approved
+  by the maintainer on 2026-10-09; amendments 15–20 approved 2026-10-12 to
+  2026-10-14.
+- Related issue: [#70](https://github.com/qdequele/ZeroDB/issues/70). Retires
   divergence D-001 and the lock-file half of D-012.
 - Date: 2026-10-09
+
+## The decision as built
+
+Several processes can open one environment at once, as with LMDB. SPEC 04 §12
+(`LCK-1` …) states the resulting invariants; this summary says what was built,
+and the sections below say why.
+
+- **Lock file.** A `MAP_SHARED` file next to the data file: `lock.mdb` through
+  heed, `zerodb.lock` natively, or `<name>-lock` for any other data-file name
+  (amendment 16). Its layout is ZeroDB's own: a header holding the published
+  txnid `T`, the writer-lock word and the reader count, then 128-byte reader
+  slots. All access is by explicit offset over atomics.
+- **Open.** The first opener, which wins an exclusive `fcntl` lock on byte 0,
+  initializes the lock file in place, without truncating it (amendment 20), and
+  wipes every slot; later processes join with a shared lock. A joiner adopts
+  the recorded reader count, as LMDB does. The open refuses a lock file that is
+  the data file under another name, or a foreign non-empty file.
+- **Writer lock.** Two layers. The in-process mutex comes first, then a
+  cross-process lock: on Linux a futex word holding the owner's PID, with
+  takeover from a dead owner; elsewhere an `fcntl` write lock. A dead writer
+  needs no repair, because a commit becomes visible only through the meta write
+  and the later store to `T`.
+- **Readers.** Each slot holds the pinned txnid and an owner word (PID plus a
+  claim generation). Each process holds an `fcntl` liveness lock, so a reused
+  PID is never mistaken for a live owner. Dead owners' slots are freed by
+  `clear_stale_readers` and by a writer taking over from a dead writer, the
+  points where LMDB reaps (amendment 12).
+- **Snapshots and growth.** Read and write txns take their base from `T`, so
+  they see other processes' commits. A txn begin that finds the data beyond
+  this process's map returns `MapResized`; `resize` adopts the new size and
+  waits for the cross-process writer lock (amendment 15, D-023). A joining
+  `WRITE_MAP` process grows the file at its first write txn, never at open
+  (D-024).
+- **`PREV_SNAPSHOT`** follows LMDB: other processes wait for the opener's first
+  commit, which is durable but not published (amendment 19, D-025).
+- **Opt-outs.** `NO_LOCK` creates no lock file and keeps the single-process
+  path. A read-only open on read-only media runs without one (amendment 17).
+- **Tools** attach to a live environment as readers; `load` and
+  `migrate-from-lmdb` refuse a destination another process has open
+  (amendment 18).
+- **`unsafe`.** The atomics over the mapping, the futex syscall and the `fcntl`
+  locks live in `zerodb-io::lockfile`, behind the safe `SharedRegion` trait
+  (§6).
+- **Cost.** About +30 ns per write commit and +7 ns per read txn begin on
+  Graviton4; `NO_LOCK` is flat, and reopen is at parity with LMDB.
+
+The numbered amendments that changed the original decision are kept, with
+their reasoning, in the [appendix](#appendix-amendment-history); code and
+other documents cite them by number.
 
 ## Context
 
@@ -242,7 +286,86 @@ stays `forbid(unsafe_code)`. AGENTS.md's `unsafe` policy is amended in the same
 change as the implementation. Every block carries a `// SAFETY:` comment; every
 atomic states its `Ordering` and why, assuming a weak memory model.
 
-## Amendments (stage-1 planning, 2026-10-09)
+## Consequences
+
+### Staging (rule 6: the riskiest assumption first)
+
+0. This ADR, approved before any code.
+1. **Riskiest assumption** — lock file, first-opener election, the futex/`flock`
+   writer lock, the shared `T` and the meta re-read with its fast path. It must
+   show (a) cross-process visibility and writer handoff in two-process smoke
+   tests and (b) acceptable single-process cost on the three-column ladder
+   (`txn/begin`, `get/*`, `commit/batch/n1`; LMDB / ZeroDB before / after, in
+   default and `NO_LOCK` mode). Report and stop before stage 2.
+2. Shared reader slots with PID, liveness locks, reaping, loom models.
+3. Parity and docs: `MapResized`, `PREV_SNAPSHOT`, tools, adapter flags, the
+   full oracle suite; SPEC, DIVERGENCES, COMPATIBILITY, CHANGELOG.
+
+### Tests
+
+- **Oracle (multi-process differential):** built on the crash harness's
+  child-process pattern, each scenario on both engines — cross-process commit
+  visibility; a foreign reader holding back page reuse; a SIGKILLed reader, then
+  `clear_stale_readers`' count; a SIGKILLed writer and takeover; `MapResized`;
+  `NO_LOCK`. The "no `lock.mdb`" assertion in
+  `env_lifecycle_differential.rs` flips to "present".
+- **loom:** claim / release / reap against the `oldest()` scan; publish-and-
+  verify against `T`. Per ADR-0006 R1, StoreLoad edges are SeqCst with a
+  written proof, since loom cannot detect weakened SeqCst accesses.
+- **Crash harness:** SIGKILL a writer process mid-commit while a reader process
+  is live, then reopen.
+- **Stress:** two processes, each with readers and a writer, 180 s on x86-64 and
+  aarch64.
+- **miri:** all non-mmap logic.
+- **Changed test:** `crates/zerodb-tools/tests/live_env_refusal.rs` asserts that
+  tools refuse a live environment; this ADR changes that behavior, so the test
+  is rewritten to assert attachment. Called out in the PR (rule 2).
+
+### SPEC and divergences
+
+Rules amended (never renumbered; a rule that no longer holds is retired
+explicitly): SPEC 04 §0, §2, TXN-6, TXN-7, TXN-9, §4, TXN-14..TXN-22 (TXN-18a
+included), TXN-38, TXN-45b, TXN-50, TXN-51, TXN-53, TXN-56; SPEC 00 (lock-file
+row, `clear_stale_readers`, `reader_list`, `NO_LOCK`); SPEC 01 (`MDB_NOLOCK`,
+`PREV_SNAPSHOT` exclusivity); SPEC 02 ("no lock file is ever created"); SPEC 06
+(REC-1a, recovery and readers). D-001 is retired; D-012's lock-file note is
+updated. New invariants for the lock file get fresh IDs.
+
+### Costs and risks
+
+- Default single-process use pays one shared load and one slot store per txn
+  begin, plus one uncontended CAS per write txn on Linux (a `flock` pair on
+  macOS). Stage 1's bench decides whether that is acceptable.
+- Measured at stage 3 on Graviton4 (EBS io2, ext4), lock file on against the
+  release before it
+  (`benches/results/archive/2026-10-13-multi-process-stage3-graviton.md`): +29.8 ns
+  per write commit, +6.8 ns per read txn begin/abort, +7 ns per `stat` (it
+  reads the shared `T`), +155 µs per env create, and env reopen 17 → 347 µs,
+  9.6× LMDB. With `NO_LOCK` every rung is flat.
+- The env-open cost comes from the first opener truncating the lock file and
+  rebuilding it (amendment 10): on ext4 that frees and reallocates the file's
+  blocks on every open. LMDB's first opener reinitializes its lock file in
+  place. Maintainer ruling, 2026-10-14: the cost is accepted for this stage
+  (about 0.3 ms per index open for Meilisearch). A follow-up, amendment 20,
+  will reinitialize the lock file in place, as LMDB does; it changes
+  amendment 10's crash-safety argument (truncate, then magic last), so it
+  needs its own approved amendment first (rule 5). It is tracked in issue #94.
+  *Resolved by amendment 20 (approved and implemented 2026-10-14):* on
+  Graviton4, env reopen with the lock file on is 36.4 µs per open against
+  LMDB's 37.8 µs (0.96×), and env create is 1.13 ms per env faster
+  (`benches/results/archive/2026-10-15-lock-file-in-place-graviton.md`).
+- The macOS POSIX-lock pitfall (§3) and Linux-only futex give two writer-lock
+  implementations to test on CI.
+- A bug here corrupts data rather than crashing — the reason for stage-1-first,
+  loom, crash and stress coverage before the default flips.
+
+## Appendix: amendment history
+
+The amendments below were written while the design was staged and built. The
+summary above and the Decision section reflect them; they are kept because
+code, tests and other documents cite them by number.
+
+### Amendments (stage-1 planning, 2026-10-09)
 
 1. **Shared reader slots move into stage 1.** Without them a writer in one
    process can reuse pages a reader in another process still holds, so
@@ -269,7 +392,7 @@ atomic states its `Ordering` and why, assuming a weak memory model.
    existing suite is untouched; stage 3 flips the default and updates the two
    tests that assert the single-process behavior.
 
-## Amendments (stage-2 planning, 2026-10-11)
+### Amendments (stage-2 planning, 2026-10-11)
 
 7. **Release unpins before it disowns.** The owner's release is now three
    stores: `txnid = CLAIMED`, then `pid = 0`, then `txnid = FREE`. With the
@@ -371,7 +494,7 @@ atomic states its `Ordering` and why, assuming a weak memory model.
     initializer from wiping the slots must keep that count correct or
     replace the derivation.
 
-## Amendments (stage-3 planning, 2026-10-12)
+### Amendments (stage-3 planning, 2026-10-12)
 
 Status: **Approved (2026-10-12, maintainer)**: all twelve decisions at the end of
 amendment 18 are accepted as proposed. The LMDB behavior cited here is pinned by the
@@ -930,7 +1053,7 @@ Terms used below:
     12. **The default flip is gated** on the Linux three-column bench.
         *Alternative:* flip now and measure in the PR.
 
-## Amendment 19 (stage 3 Task 13c, 2026-10-13)
+### Amendment 19 (stage 3 Task 13c, 2026-10-13)
 
 19. **`PREV_SNAPSHOT` holds the election until its first commit, and that
     commit is not published.** Approved 2026-10-13 by the maintainer
@@ -1080,7 +1203,7 @@ Terms used below:
     `PREV_SNAPSHOT` are unaffected. SPEC 01 §S5, SPEC 04 TXN-66, TXN-67,
     LCK-1, LCK-2 and §12.1 follow.
 
-## Amendment 20 (issue #94, 2026-10-14)
+### Amendment 20 (issue #94, 2026-10-14)
 
 20. **The initializer rebuilds the lock file in place instead of truncating
     it.** Status: **Approved (2026-10-14, maintainer)**, after a review of
@@ -1229,80 +1352,7 @@ Terms used below:
     truncated" becomes "before anything is written") follow. Amendment 16's
     guard text and SPEC 02 §8 are reworded the same way.
 
-## Consequences
-
-### Staging (rule 6: the riskiest assumption first)
-
-0. This ADR, approved before any code.
-1. **Riskiest assumption** — lock file, first-opener election, the futex/`flock`
-   writer lock, the shared `T` and the meta re-read with its fast path. It must
-   show (a) cross-process visibility and writer handoff in two-process smoke
-   tests and (b) acceptable single-process cost on the three-column ladder
-   (`txn/begin`, `get/*`, `commit/batch/n1`; LMDB / ZeroDB before / after, in
-   default and `NO_LOCK` mode). Report and stop before stage 2.
-2. Shared reader slots with PID, liveness locks, reaping, loom models.
-3. Parity and docs: `MapResized`, `PREV_SNAPSHOT`, tools, adapter flags, the
-   full oracle suite; SPEC, DIVERGENCES, COMPATIBILITY, CHANGELOG.
-
-### Tests
-
-- **Oracle (multi-process differential):** built on the crash harness's
-  child-process pattern, each scenario on both engines — cross-process commit
-  visibility; a foreign reader holding back page reuse; a SIGKILLed reader, then
-  `clear_stale_readers`' count; a SIGKILLed writer and takeover; `MapResized`;
-  `NO_LOCK`. The "no `lock.mdb`" assertion in
-  `env_lifecycle_differential.rs` flips to "present".
-- **loom:** claim / release / reap against the `oldest()` scan; publish-and-
-  verify against `T`. Per ADR-0006 R1, StoreLoad edges are SeqCst with a
-  written proof, since loom cannot detect weakened SeqCst accesses.
-- **Crash harness:** SIGKILL a writer process mid-commit while a reader process
-  is live, then reopen.
-- **Stress:** two processes, each with readers and a writer, 180 s on x86-64 and
-  aarch64.
-- **miri:** all non-mmap logic.
-- **Changed test:** `crates/zerodb-tools/tests/live_env_refusal.rs` asserts that
-  tools refuse a live environment; this ADR changes that behavior, so the test
-  is rewritten to assert attachment. Called out in the PR (rule 2).
-
-### SPEC and divergences
-
-Rules amended (never renumbered; a rule that no longer holds is retired
-explicitly): SPEC 04 §0, §2, TXN-6, TXN-7, TXN-9, §4, TXN-14..TXN-22 (TXN-18a
-included), TXN-38, TXN-45b, TXN-50, TXN-51, TXN-53, TXN-56; SPEC 00 (lock-file
-row, `clear_stale_readers`, `reader_list`, `NO_LOCK`); SPEC 01 (`MDB_NOLOCK`,
-`PREV_SNAPSHOT` exclusivity); SPEC 02 ("no lock file is ever created"); SPEC 06
-(REC-1a, recovery and readers). D-001 is retired; D-012's lock-file note is
-updated. New invariants for the lock file get fresh IDs.
-
-### Costs and risks
-
-- Default single-process use pays one shared load and one slot store per txn
-  begin, plus one uncontended CAS per write txn on Linux (a `flock` pair on
-  macOS). Stage 1's bench decides whether that is acceptable.
-- Measured at stage 3 on Graviton4 (EBS io2, ext4), lock file on against the
-  release before it
-  (`benches/results/archive/2026-10-13-multi-process-stage3-graviton.md`): +29.8 ns
-  per write commit, +6.8 ns per read txn begin/abort, +7 ns per `stat` (it
-  reads the shared `T`), +155 µs per env create, and env reopen 17 → 347 µs,
-  9.6× LMDB. With `NO_LOCK` every rung is flat.
-- The env-open cost comes from the first opener truncating the lock file and
-  rebuilding it (amendment 10): on ext4 that frees and reallocates the file's
-  blocks on every open. LMDB's first opener reinitializes its lock file in
-  place. Maintainer ruling, 2026-10-14: the cost is accepted for this stage
-  (about 0.3 ms per index open for Meilisearch). A follow-up, amendment 20,
-  will reinitialize the lock file in place, as LMDB does; it changes
-  amendment 10's crash-safety argument (truncate, then magic last), so it
-  needs its own approved amendment first (rule 5). It is tracked in issue #94.
-  *Resolved by amendment 20 (approved and implemented 2026-10-14):* on
-  Graviton4, env reopen with the lock file on is 36.4 µs per open against
-  LMDB's 37.8 µs (0.96×), and env create is 1.13 ms per env faster
-  (`benches/results/archive/2026-10-15-lock-file-in-place-graviton.md`).
-- The macOS POSIX-lock pitfall (§3) and Linux-only futex give two writer-lock
-  implementations to test on CI.
-- A bug here corrupts data rather than crashing — the reason for stage-1-first,
-  loom, crash and stress coverage before the default flips.
-
-## Open questions for human review
+### Open questions, as resolved at approval
 
 Resolved 2026-10-09 (maintainer approval of the proposed defaults):
 

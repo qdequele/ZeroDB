@@ -1,6 +1,7 @@
 # ADR-0032: Raw environment copy from the data file: clone or in-kernel copy
 
-- Status: Proposed
+- Status: Implemented (see the CHANGELOG). The maintainer's approval is not
+  recorded.
 - Related issue: #64
 - Date: 2026-10-20
 

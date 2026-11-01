@@ -1,6 +1,7 @@
 # ADR-0009: `copy_to_file` design and the `zerodb-tools` shape (M1.12)
 
-- Status: Proposed (agent-authored 2026-07-17; awaiting human ratification)
+- Status: Implemented, shipped in 0.2.0. The maintainer's approval is not
+  recorded.
 - Superseded in part (2026-10-13): the tools' live-env guard below relied on
   D-001, which ADR-0023 retired. The tools now attach to a live env as
   readers, and `load`/`migrate-from-lmdb` refuse a destination another
