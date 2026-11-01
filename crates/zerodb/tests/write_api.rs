@@ -1,8 +1,8 @@
 //! Write-path integration tests over **real files**: the commit
 //! pipeline end-to-end (SPEC 04 §9), read-after-commit through the fixed
-//! full-`map_size` map (ADR-0004 D4), reopen durability, meta slot
+//! full-`map_size` map (ADR-0004), reopen durability, meta slot
 //! alternation (TXN-63), PREV_SNAPSHOT over real commits (TXN-65..67), split
-//! exact-fit boundaries at both page-size extremes (ADR-0004 D7 risk 2), and
+//! exact-fit boundaries at both page-size extremes (ADR-0004 risk 2), and
 //! a multi-MB overflow value.
 //!
 //! Every committed image is validated with `zerodb::check::check_image`
@@ -64,7 +64,7 @@ const MAP: usize = 8 << 20;
 #[test]
 fn put_commit_read_back_same_env() {
     // Read-after-commit through the same env exercises the fixed map seeing
-    // the commit's pwrites (ADR-0004 D4) — no remap, no reopen.
+    // the commit's pwrites (ADR-0004) — no remap, no reopen.
     let dir = TempDir::new();
     let env = open(dir.path(), MAP, PS);
     let db = env.main_database();
@@ -255,7 +255,7 @@ fn prev_snapshot_env(dir: &Path, lock_file: bool) -> Env {
     opts.open(dir).unwrap()
 }
 
-/// ADR-0023 amendment 19, as LMDB (`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`,
+/// ADR-0023, as LMDB (`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`,
 /// `OBS_PREV_SNAPSHOT_SECOND_COMMIT_KEEPS_FIRST`): with a lock file, the
 /// first commit of a `PREV_SNAPSHOT` env is durable but not published. Read
 /// txns keep the older snapshot; `Env::txnid` and `Env::info` name the
@@ -306,7 +306,7 @@ fn prev_snapshot_first_commit_is_not_published_with_a_lock_file() {
 
 /// Without a lock file a `PREV_SNAPSHOT` env's first commit is published at
 /// once and the second builds on it, as LMDB with `MDB_NOLOCK`
-/// (`OBS_PREV_SNAPSHOT_NOLOCK_COMMITS`; ADR-0023 amendment 19).
+/// (`OBS_PREV_SNAPSHOT_NOLOCK_COMMITS`; ADR-0023).
 #[test]
 fn prev_snapshot_first_commit_is_published_without_a_lock_file() {
     let dir = TempDir::new();

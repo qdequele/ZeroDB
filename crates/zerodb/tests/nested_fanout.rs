@@ -1,6 +1,6 @@
 //! Nested read transactions, acceptance: replay of the milli/hannoy nested-read
 //! fan-out patterns on a **real file** with **real threads** (SPEC 04 §5,
-//! ADR-0007 D5 item 4).
+//! ADR-0007 item 4).
 //!
 //! The six consumer call sites (SPEC 00 Findings §A — milli ×5, hannoy ×1)
 //! share one shape: open a write txn, stage uncommitted writes, open
@@ -9,7 +9,7 @@
 //! resume writing, commit. `std::thread::scope` stands in for rayon (not a
 //! dependency): the scoped spawn/join edges are the same synchronization the
 //! rayon scope provides, and moving each `NestedRoTxn` into its worker is the
-//! real `Send` assertion (compiler-derived from `RwTxn: Sync`, ADR-0007 D1 —
+//! real `Send` assertion (compiler-derived from `RwTxn: Sync`, ADR-0007 —
 //! no `unsafe impl` anywhere).
 //!
 //! Values embed `(key, generation, checksum-ish payload)` so any read of a
@@ -63,7 +63,7 @@ fn open(dir: &Path, flags: EnvFlags) -> Env {
     opts.open(dir).expect("open env")
 }
 
-/// The fan-out batteries run in both dirty-page realizations (ADR-0021 M3):
+/// The fan-out batteries run in both dirty-page realizations (ADR-0021):
 /// the default heap-staged store, and in-place `WRITE_MAP` (TXN-45b), where
 /// the children read the writer's uncommitted state straight from the
 /// writable map. The writemap twins assert the mode actually engaged.
@@ -139,7 +139,7 @@ fn milli_fanout_two_windows_then_commit() {
     milli_fanout_two_windows(EnvFlags::EMPTY);
 }
 
-/// The same milli fan-out with in-place `WRITE_MAP` (ADR-0021 M3): workers
+/// The same milli fan-out with in-place `WRITE_MAP` (ADR-0021): workers
 /// read dirty leaves and overflow runs directly out of the writable map.
 #[test]
 fn milli_fanout_two_windows_then_commit_writemap_in_place() {
@@ -248,7 +248,7 @@ fn hannoy_channel_pool_fanout() {
     hannoy_channel_pool(EnvFlags::EMPTY);
 }
 
-/// The hannoy pool fan-out with in-place `WRITE_MAP` (ADR-0021 M3): the
+/// The hannoy pool fan-out with in-place `WRITE_MAP` (ADR-0021): the
 /// children drop on worker threads while the dirty state lives in the map.
 #[test]
 fn hannoy_channel_pool_fanout_writemap_in_place() {
@@ -326,13 +326,13 @@ fn hannoy_channel_pool(flags: EnvFlags) {
 
 /// Named DBs through the fan-out: an uncommitted named DB (created this txn,
 /// catalog entry still dirty) is readable from every worker (TXN-26 +
-/// `record_for` delegation, ADR-0007 D2).
+/// `record_for` delegation, ADR-0007).
 #[test]
 fn fanout_reads_uncommitted_named_db() {
     fanout_uncommitted_named_db(EnvFlags::EMPTY);
 }
 
-/// Named-DB fan-out with in-place `WRITE_MAP` (ADR-0021 M3).
+/// Named-DB fan-out with in-place `WRITE_MAP` (ADR-0021).
 #[test]
 fn fanout_reads_uncommitted_named_db_writemap_in_place() {
     fanout_uncommitted_named_db(EnvFlags::WRITE_MAP);

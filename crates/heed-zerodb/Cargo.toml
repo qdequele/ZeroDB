@@ -15,9 +15,9 @@ name = "heed-zerodb"
 # Version tracks the heed line it reproduces (0.22.1) so the `heed-shim` patch
 # target that re-exports it satisfies a consumer's `heed = "0.22.1"`
 # requirement (scripts/consumer.sh). The crate
-# is never published (ADR-0003 OQ1); the version is only for patch resolution.
+# is never published (ADR-0003); the version is only for patch resolution.
 version = "0.22.1"
-# Never published (ADR-0003 OQ1, ADR-0013): consumed only through crates/heed-shim.
+# Never published (ADR-0003, ADR-0013): consumed only through crates/heed-shim.
 publish = false
 description = "heed 0.22.1 API surface re-implemented over the ZeroDB engine (the heed-shim target)."
 edition.workspace = true
@@ -56,7 +56,7 @@ unique-txns = []
 tempfile = "3"
 # For the OS-page-size probe in the page-size parity test (allowlisted dep).
 libc.workspace = true
-# ADR-0021 B4 (adapter borrow audit): the lifetime-erased write cursor
+# ADR-0021 (adapter borrow audit): the lifetime-erased write cursor
 # is exercised under miri over the heap-backed writable-map stand-in —
 # workspace-internal test infrastructure, not new external dependencies.
 zerodb-core = { path = "../zerodb-core" }

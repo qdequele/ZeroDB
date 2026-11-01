@@ -14,15 +14,15 @@
 //! | 256 + i·128 | reader slot `i`: txnid `u64` at +0, owner `u64` at +8 (PID low 32 bits, claim generation high 32 bits) |
 //!
 //! Offsets 136–255 are unused: they keep slot 0 off the writer word's 128-byte
-//! line pair (ADR-0023 amendment 11).
+//! line pair (ADR-0023).
 //!
 //! Before it writes anything, every opener checks that the lock file is
 //! not the data file, and the initializer refuses a non-empty file that does
-//! not look like a lock file (ADR-0023 amendment 16; see [`LockFile::open`]).
+//! not look like a lock file (ADR-0023; see [`LockFile::open`]).
 //! The initializer then rebuilds the file in place, never truncating it to
-//! zero (amendment 20; see `rebuild_in_place`).
+//! zero (see `rebuild_in_place`).
 //!
-//! Record locks (POSIX `fcntl`, per process; ADR-0023 amendment 2): byte 0 is
+//! Record locks (POSIX `fcntl`, per process; ADR-0023): byte 0 is
 //! the first-opener election, byte 1 the macOS writer lock, and byte
 //! `LIVENESS_BASE + pid` each process's liveness lock.
 //!
@@ -40,10 +40,10 @@ use zerodb_core::shared::{ReaderSlot, SharedRegion, READER_SLOT_FREE, READER_SLO
 
 const LOCK_MAGIC: u64 = u64::from_le_bytes(*b"ZDBLOCK1");
 /// The initializing magic: the initializer's first write to the file (with
-/// `pwrite`, ADR-0023 amendment 20), replaced by [`LOCK_MAGIC`] in
+/// `pwrite`, ADR-0023), replaced by [`LOCK_MAGIC`] in
 /// [`LockFile::finish_open`]. A file carrying it was left by an initializer
 /// that died mid-way; the next initializer accepts it, and a joiner treats it
-/// as unfinished (ADR-0023 amendment 16).
+/// as unfinished (ADR-0023).
 const LOCK_MAGIC_INIT: u64 = u64::from_le_bytes(*b"ZDBLOCK0");
 const LOCK_FORMAT: u32 = 2;
 const OFF_MAGIC: usize = 0;
@@ -98,7 +98,7 @@ pub enum LockOpenError {
     Mismatch(String),
     /// The lock file cannot be created or opened for writing because it lies
     /// on a read-only filesystem (`EROFS`). A read-only environment then runs
-    /// without a lock file, as LMDB does (ADR-0023 amendment 17,
+    /// without a lock file, as LMDB does (ADR-0023,
     /// `OBS_RDONLY_LOCK_READONLY_FS`); any other caller treats it as the
     /// `EROFS` I/O error it is.
     ReadOnlyFs,
@@ -258,7 +258,7 @@ impl Drop for Registration {
 
 /// The registry key of the lock file at `path`, computed without opening a
 /// descriptor (opening one and closing it again would drop this process's
-/// record locks on that file, ADR-0023 amendment 2).
+/// record locks on that file, ADR-0023).
 ///
 /// An existing file is keyed by `(st_dev, st_ino)` from a `stat` that follows
 /// symbolic links, so a symbolic link, a hard link or another spelling of a
@@ -337,7 +337,7 @@ pub fn published_max_readers(path: &Path) -> Result<Option<u32>, LockOpenError> 
     match read_u32_at(file, OFF_MAX_READERS) {
         // A new initializer started rebuilding the file between the two reads
         // (every process had closed the environment) and zeroed the header:
-        // the value is unknown again (ADR-0023 amendment 20).
+        // the value is unknown again (ADR-0023).
         Ok(0) => Ok(None),
         Ok(n) => Ok(Some(n)),
         // A file shorter than the header, which no initializer leaves.
@@ -372,8 +372,7 @@ impl LockFile {
     /// [`LockFile::finish_open`]; later openers wait for that, then validate.
     ///
     /// `data_path` is the environment's data file. Two guards keep the
-    /// initializer from overwriting a file that is not a lock file (ADR-0023
-    /// amendment 16):
+    /// initializer from overwriting a file that is not a lock file (ADR-0023):
     ///
     /// - **Same file.** Every opener compares the lock file's identity with
     ///   the data file's (`st_dev`, `st_ino`), so a hard link, or a name that
@@ -419,7 +418,7 @@ impl LockFile {
 
     /// Open the lock file at `path` only if this process wins the
     /// first-opener election at once; never wait for another opener
-    /// (ADR-0023 amendment 18). `Ok(None)` means another process holds the
+    /// (ADR-0023). `Ok(None)` means another process holds the
     /// election byte, that is, has the environment open or is opening it;
     /// the descriptor is closed and nothing in the file is changed.
     ///
@@ -450,7 +449,7 @@ impl LockFile {
     ) -> Result<Option<Arc<LockFile>>, LockOpenError> {
         // Claimed before any descriptor exists: POSIX record locks belong to
         // the process, and closing a second descriptor would drop the first
-        // handle's locks (ADR-0023 amendment 2). On every error below the
+        // handle's locks (ADR-0023). On every error below the
         // registration (or the `LockFile` owning it) drops and releases it.
         let mut registration = Registration::claim(path)?;
         let (file, created) = match open_or_create(path) {
@@ -467,7 +466,7 @@ impl LockFile {
         let file = registration.file();
         check_not_data_file(file, created, path, data_path)?;
         /// How often a joiner that finds a half-built lock file retries the
-        /// election before failing (ADR-0023 amendment 10).
+        /// election before failing (ADR-0023).
         const ELECTION_RETRIES: u32 = 100;
         let mut attempt = 0;
         let initializer = loop {
@@ -502,7 +501,7 @@ impl LockFile {
             // is the same state as joining a table whose processes all
             // exited, which the protocol tolerates: `T` is the last published
             // value, dead PIDs are reapable, and a stale writer word is taken
-            // over (ADR-0023 amendment 10).
+            // over (ADR-0023).
             if read_u64_at(file, OFF_MAGIC)? == LOCK_MAGIC {
                 break false;
             }
@@ -523,7 +522,7 @@ impl LockFile {
         // the shared election lock, so the initializer has finished writing.
         // It adopts that count whatever it asked for, as an LMDB joiner sizes
         // its reader table from the lock file (`OBS_JOINER_FEWER_MAXREADERS`,
-        // `OBS_JOINER_MORE_MAXREADERS`; ADR-0023 §1 as amended). A count no
+        // `OBS_JOINER_MORE_MAXREADERS`; ADR-0023 §1). A count no
         // initializer can write means the file is not a usable lock file.
         if initializer {
             check_lock_file_shape(file, path)?;
@@ -632,7 +631,7 @@ impl LockFile {
             // Release: the header fields stored in `open` and `T`, seeded by
             // the core since, are visible to any joiner that loads the magic
             // with Acquire. A joiner that sees the magic therefore sees a
-            // seeded `T` (ADR-0023 amendment 10).
+            // seeded `T` (ADR-0023).
             self.u64_at(OFF_MAGIC).store(LOCK_MAGIC, Ordering::Release);
             record_lock(self.file(), libc::F_SETLK, RDLCK, ELECTION_BYTE)?;
         }
@@ -886,12 +885,11 @@ fn read_u64_at(file: &File, off: usize) -> std::io::Result<u64> {
     }
 }
 
-/// The initializer's in-place rebuild of the lock file's header (ADR-0023
-/// amendment 20), run after the file guards and before the file is mapped.
-/// The file is never truncated to zero: on ext4 that frees its blocks and the
-/// writes after it allocate them again, which made every initializing open
-/// cost about 330 µs. As LMDB, the file keeps its blocks and is resized only
-/// when its length differs from `len`.
+/// The initializer's in-place rebuild of the lock file's header (ADR-0023),
+/// run after the file guards and before the file is mapped.
+/// The file is never truncated to zero, which on ext4 frees its blocks only for
+/// the next writes to allocate them again. As in LMDB, the file keeps its
+/// blocks and is resized only when its length differs from `len`.
 ///
 /// 1. Mark the file as being initialized: from here on a process crash
 ///    leaves a file carrying a lock magic, which the foreign-file guard
@@ -970,7 +968,7 @@ fn open_or_create(path: &Path) -> std::io::Result<(File, bool)> {
     }
 }
 
-/// The same-file guard (ADR-0023 amendment 16): fail with `InvalidInput` if
+/// The same-file guard (ADR-0023): fail with `InvalidInput` if
 /// `file`, the lock file just opened at `path`, is the data file at
 /// `data_path`. A missing data file cannot be the lock file. On refusal, the
 /// lock file is removed only if this open `created` it and it is still empty;
@@ -1007,7 +1005,7 @@ fn check_not_data_file(
 
 /// Whether `len` is a length an initializer can leave behind: the
 /// initializing magic alone in a file that was empty, or the header plus at
-/// least one reader slot (ADR-0023 amendment 20, step order).
+/// least one reader slot (ADR-0023).
 fn is_initializer_length(len: u64) -> bool {
     let magic_only = (OFF_MAGIC + 8) as u64;
     let header = OFF_SLOTS as u64;
@@ -1015,7 +1013,7 @@ fn is_initializer_length(len: u64) -> bool {
     len == magic_only || (len >= header + slot && (len - header).is_multiple_of(slot))
 }
 
-/// The foreign-file guard (ADR-0023 amendment 16), run by the initializer
+/// The foreign-file guard (ADR-0023), run by the initializer
 /// before it writes to the lock file at `path`: accept an empty file, a file
 /// carrying [`LOCK_MAGIC`] or [`LOCK_MAGIC_INIT`], or one whose header (the
 /// first `OFF_SLOTS` bytes, or the whole file if shorter) is all zero and
@@ -1347,7 +1345,7 @@ mod tests {
         assert!(l.bind_page_size(8192).is_err());
     }
 
-    // --- File guards (ADR-0023 amendment 16) ---
+    // --- File guards (ADR-0023) ---
 
     /// The data-file path next to the lock file `path`.
     fn data_of(path: &Path) -> PathBuf {
@@ -1415,7 +1413,7 @@ mod tests {
         }
     }
 
-    // --- In-place rebuild (ADR-0023 amendment 20) ---
+    // --- In-place rebuild (ADR-0023) ---
 
     /// A finished lock file from an earlier run, with a bound page size, a
     /// published txnid, a stale writer word, garbage in the unused header
@@ -1692,7 +1690,7 @@ mod tests {
     /// and the filesystem may give that inode number to the next file it
     /// creates (ext4 commonly does). If the registry entry outlived the
     /// descriptor, even briefly, a new lock file created in that window by
-    /// another thread would be refused as already open (issue #123). The
+    /// another thread would be refused as already open. The
     /// descriptor must therefore close while the registry is locked, in the
     /// same critical section that removes the entry: with the registry held
     /// by this test, a drop on another thread must not get as far as closing

@@ -9,7 +9,7 @@
 //! - `migrate-from-lmdb <src> <dst>` — stream a real LMDB env into a fresh
 //!   zerodb env (needs the `migrate-lmdb` feature).
 //!
-//! ## Live environments (ADR-0023 amendment 18)
+//! ## Live environments (ADR-0023)
 //!
 //! `stat`, `dump` and `check` open the env `READ_ONLY` through the engine,
 //! with its lock file, and so attach to an env that other processes have

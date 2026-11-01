@@ -221,8 +221,8 @@ fn short_read_txns_see_exact_contents_while_pages_are_reused() {
     }
 }
 
-/// No cache entry exists anywhere in the table under `stamp` (ADR-0018
-/// amendment): probes every pgno the file could hold, both kinds.
+/// No cache entry exists anywhere in the table under `stamp` (ADR-0018):
+/// probes every pgno the file could hold, both kinds.
 fn no_entry_with_stamp(env: &Env, dir: &Path, stamp: u64) -> bool {
     let len = std::fs::metadata(dir.join(zerodb::DATA_FILE_NAME))
         .expect("data file")
@@ -232,7 +232,7 @@ fn no_entry_with_stamp(env: &Env, dir: &Path, stamp: u64) -> bool {
         && (0..pages).all(|p| !env.inner().stamp_cache_has(p, true, stamp))
 }
 
-/// ADR-0018 amendment: a successful commit seeds the env-wide
+/// ADR-0018: a successful commit seeds the env-wide
 /// cache with the tree frames it wrote under the committing txnid; an abort
 /// seeds nothing, so the reused txnid (TXN-2) starts clean and the reuse
 /// commit's own seeding is the first entry under that stamp.
@@ -292,7 +292,7 @@ fn commit_seeds_the_cache_and_abort_does_not() {
     assert_eq!(db.get(&r, b"a").unwrap(), Some(b"1".as_slice()));
 }
 
-/// ADR-0018 amendment safety pin: spilled pages are written to the file
+/// ADR-0018 safety pin: spilled pages are written to the file
 /// mid-txn under the txn's stamp (ADR-0017) and may be rewritten in place, so
 /// they must never seed the cache — not from the writer's own re-validation
 /// (the writer memo never publishes) and not from an aborted txn. After the

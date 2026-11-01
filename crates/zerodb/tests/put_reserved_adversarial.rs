@@ -50,7 +50,7 @@ impl Drop for TempDir {
 const PS: u32 = 4096;
 const MAP: usize = 8 << 20;
 
-/// The battery runs in both dirty-page realizations (ADR-0021 M3): default
+/// The battery runs in both dirty-page realizations (ADR-0021): default
 /// heap frames, and in-place `WRITE_MAP` (TXN-45b), where the reserved
 /// slice the closure fills points straight into the writable map.
 fn open_flags(dir: &Path, flags: EnvFlags) -> Env {
@@ -75,7 +75,7 @@ fn reserve_at_inline_overflow_boundary_both_sides() {
     reserve_at_boundary(EnvFlags::EMPTY);
 }
 
-/// ADR-0021 M3: the boundary reserves with the slice in the writable map.
+/// ADR-0021: the boundary reserves with the slice in the writable map.
 #[test]
 fn reserve_at_inline_overflow_boundary_both_sides_writemap_in_place() {
     reserve_at_boundary(EnvFlags::WRITE_MAP);
@@ -119,7 +119,7 @@ fn reserve_forcing_split_lands_correctly_through_commit_and_reopen() {
     reserve_forcing_split(EnvFlags::EMPTY);
 }
 
-/// ADR-0021 M3: the split-materializing reserve under in-place `WRITE_MAP`
+/// ADR-0021: the split-materializing reserve under in-place `WRITE_MAP`
 /// (the general split's scratch copy of a map frame, then the placeholder
 /// overwrite — all in the map), through commit + reopen.
 #[test]
@@ -196,7 +196,7 @@ fn reserve_partial_fill_unfilled_tail_is_observed_deterministic() {
     reserve_partial_fill(EnvFlags::EMPTY);
 }
 
-/// ADR-0021 M3: same misuse under in-place `WRITE_MAP` — the fresh frame is
+/// ADR-0021: same misuse under in-place `WRITE_MAP` — the fresh frame is
 /// the zero-filled map page (`insert_tree_frame` zero-fills the map region
 /// exactly as it zero-fills a heap frame), so the observed tail matches.
 #[test]

@@ -17,7 +17,7 @@ use crate::naming;
 
 /// `stat <env-dir>`: env-level and per-DB statistics. Attaches to the env
 /// read-only through its lock file, so it also runs while other processes have
-/// the env open (ADR-0023 amendment 18).
+/// the env open (ADR-0023).
 ///
 /// Probes both data-file names (ADR-0010) and prints an engine-identification
 /// line naming the file, the magic and the format version — so an operator
@@ -199,7 +199,7 @@ fn walk_error(e: StreamBuildError) -> BoxErr {
 /// [`zerodb::DATA_FILE_NAME`], with its lock file. It is opened through the
 /// engine and must be opened exclusively ([`Env::opened_exclusively`]): a
 /// destination another process has open is refused, and the `Env` is held
-/// for the whole load (ADR-0023 amendment 18). The records go in through
+/// for the whole load (ADR-0023). The records go in through
 /// ordinary write txns with sequential writes (ADR-0015), as LMDB's
 /// `mdb_load` uses txns. The map grows when it fills.
 ///
@@ -295,7 +295,7 @@ fn load_batched(
 
 /// Open a fresh destination env (native name, lock file on) for `load` or
 /// `migrate-from-lmdb`, and refuse it unless this process opened it alone
-/// and it is still empty (ADR-0023 amendment 18).
+/// and it is still empty (ADR-0023).
 ///
 /// The empty-destination check before the open ([`refuse_existing_env`]) ran
 /// without holding anything, so it is repeated here, now that the `Env` is
@@ -591,7 +591,7 @@ pub fn refuse_existing_env(env_dir: &Path, verb: &str) -> Result<(), BoxErr> {
 ///
 /// It attaches to the env read-only through its lock file, like `stat`, and
 /// walks the snapshot its read txn pins: that snapshot's roots, free tree and
-/// `last_pg`, through the txn's map (ADR-0023 amendment 18). So it runs while
+/// `last_pg`, through the txn's map (ADR-0023). So it runs while
 /// other processes have the env open, and never reads a page the snapshot
 /// lists as free.
 ///

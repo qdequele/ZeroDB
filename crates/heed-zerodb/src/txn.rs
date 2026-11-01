@@ -1,5 +1,5 @@
 //! Transactions — `RoTxn<'e, T>` / `RwTxn<'p>` and the TLS marker types
-//! (SPEC 00 rows 2/13/14/15/16/27/28/29; SPEC 04 §3–§5; ADR-0003 §C6/§C7).
+//! (SPEC 04 §3–§5; ADR-0003).
 //!
 //! ## The one internal representation trick
 //!
@@ -30,17 +30,17 @@ use std::ops::Deref;
 use crate::Result;
 
 // ---------------------------------------------------------------------------
-// TLS markers (SPEC 04 §4; ADR-0003 §C6)
+// TLS markers (SPEC 04 §4; ADR-0003)
 // ---------------------------------------------------------------------------
 
 /// Read transactions opened with Thread Local Storage (TLS) — `!Send`. A
 /// compile-only shim (SPEC 00 second table: `WithTls` is SHOULD);
 /// ZeroDB's read txns are universally NOTLS, so `WithTls` behaves like
-/// `WithoutTls` at runtime (ADR-0003 Q5).
+/// `WithoutTls` at runtime (ADR-0003).
 #[derive(Debug, PartialEq, Eq)]
 pub enum WithTls {}
 
-/// Read transactions opened without TLS — therefore `Send` (SPEC 00 rows 2/29).
+/// Read transactions opened without TLS — therefore `Send`.
 /// Every production open uses this (`read_txn_without_tls`).
 #[derive(Debug, PartialEq, Eq)]
 pub enum WithoutTls {}
@@ -86,7 +86,7 @@ pub(crate) enum InnerTxn<'e> {
 }
 
 /// A read-only transaction — the exact `heed::RoTxn<'e, T>` shape (default
-/// `AnyTls`). Covariant in `'e` (ADR-0007 D6 for the nested case).
+/// `AnyTls`). Covariant in `'e` (ADR-0007 for the nested case).
 #[repr(transparent)]
 pub struct RoTxn<'e, T = AnyTls> {
     pub(crate) inner: InnerTxn<'e>,
@@ -131,7 +131,7 @@ impl<'e, T> RoTxn<'e, T> {
     /// Infallible in ZeroDB; returns [`Result`] for API shape.
     ///
     /// Not available with the `unique-txns` feature: Meilisearch's heed fork
-    /// moves it to [`crate::UniqueRoTxn::commit`] (ADR-0027).
+    /// moves it to `UniqueRoTxn::commit` (ADR-0027).
     #[cfg(not(feature = "unique-txns"))]
     pub fn commit(self) -> Result<()> {
         self.commit_inner()
@@ -245,7 +245,7 @@ impl<'p> RwTxn<'p> {
         }
     }
 
-    /// Commit all operations of the transaction (SPEC 00 row 27).
+    /// Commit all operations of the transaction.
     ///
     /// # Errors
     ///
@@ -254,20 +254,20 @@ impl<'p> RwTxn<'p> {
     ///
     /// The first commit of a `PREV_SNAPSHOT` env with a lock file can return
     /// an I/O error after its meta write, when letting other processes in
-    /// fails (ADR-0023 amendment 19): the commit is then durable although
+    /// fails (ADR-0023): the commit is then durable although
     /// `Err` is returned, and is not published, as every first
     /// `PREV_SNAPSHOT` commit; the next commit retries.
     pub fn commit(self) -> Result<()> {
         self.into_zdb().commit().map_err(Into::into)
     }
 
-    /// Abandon all operations of the transaction (SPEC 00 row 28).
+    /// Abandon all operations of the transaction.
     pub fn abort(self) {
         self.into_zdb().abort();
     }
 
     /// Open a nested read transaction reading this write txn's uncommitted
-    /// state (SPEC 00 row 16, SPEC 04 §5). Equivalent to
+    /// state (SPEC 04 §5). Equivalent to
     /// [`crate::Env::nested_read_txn`] with this txn as the parent.
     ///
     /// # Errors

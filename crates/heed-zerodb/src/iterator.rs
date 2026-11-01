@@ -1,5 +1,5 @@
 //! Iterators — `Ro{Iter,RevIter,Range,RevRange,Prefix,RevPrefix}` and their
-//! `Rw` mutating siblings (SPEC 00 rows 43–46, 50; SPEC 03 §4/§7).
+//! `Rw` mutating siblings (50; SPEC 03 §4/§7).
 //!
 //! ## Read iterators (zero-copy, no `unsafe`)
 //!
@@ -70,7 +70,7 @@ macro_rules! ro_iterator {
                 }
             }
 
-            /// Change the key/data codecs of this iterator (SPEC 00 row 51).
+            /// Change the key/data codecs of this iterator.
             #[must_use]
             pub fn remap_types<KC2, DC2>(self) -> $name<'txn, KC2, DC2, IM> {
                 $name {
@@ -79,19 +79,19 @@ macro_rules! ro_iterator {
                 }
             }
 
-            /// Change the key codec (SPEC 00 row 51).
+            /// Change the key codec.
             #[must_use]
             pub fn remap_key_type<KC2>(self) -> $name<'txn, KC2, DC, IM> {
                 self.remap_types::<KC2, DC>()
             }
 
-            /// Change the data codec (SPEC 00 row 51).
+            /// Change the data codec.
             #[must_use]
             pub fn remap_data_type<DC2>(self) -> $name<'txn, KC, DC2, IM> {
                 self.remap_types::<KC, DC2>()
             }
 
-            /// Wrap the data in a lazy decoder (SPEC 00 row 50).
+            /// Wrap the data in a lazy decoder.
             #[must_use]
             pub fn lazily_decode_data(self) -> $name<'txn, KC, LazyDecode<DC>, IM> {
                 self.remap_types::<KC, LazyDecode<DC>>()
@@ -168,7 +168,7 @@ macro_rules! ro_range_iterator {
                 }
             }
 
-            /// Change the key/data codecs of this iterator (SPEC 00 row 51).
+            /// Change the key/data codecs of this iterator.
             #[must_use]
             pub fn remap_types<KC2, DC2>(self) -> $name<'txn, KC2, DC2, C, IM> {
                 $name {
@@ -177,19 +177,19 @@ macro_rules! ro_range_iterator {
                 }
             }
 
-            /// Change the key codec (SPEC 00 row 51).
+            /// Change the key codec.
             #[must_use]
             pub fn remap_key_type<KC2>(self) -> $name<'txn, KC2, DC, C, IM> {
                 self.remap_types::<KC2, DC>()
             }
 
-            /// Change the data codec (SPEC 00 row 51).
+            /// Change the data codec.
             #[must_use]
             pub fn remap_data_type<DC2>(self) -> $name<'txn, KC, DC2, C, IM> {
                 self.remap_types::<KC, DC2>()
             }
 
-            /// Wrap the data in a lazy decoder (SPEC 00 row 50).
+            /// Wrap the data in a lazy decoder.
             #[must_use]
             pub fn lazily_decode_data(self) -> $name<'txn, KC, LazyDecode<DC>, C, IM> {
                 self.remap_types::<KC, LazyDecode<DC>>()
@@ -248,27 +248,12 @@ macro_rules! ro_range_iterator {
     };
 }
 
-ro_iterator!(
-    RoIter,
-    "A read-only forward full-scan iterator (SPEC 00 row 43)."
-);
+ro_iterator!(RoIter, "A read-only forward full-scan iterator.");
 ro_iterator!(RoRevIter, "A read-only reverse full-scan iterator.");
-ro_range_iterator!(
-    RoRange,
-    "A read-only forward range iterator (SPEC 00 row 44)."
-);
-ro_range_iterator!(
-    RoRevRange,
-    "A read-only reverse range iterator (SPEC 00 row 44)."
-);
-ro_range_iterator!(
-    RoPrefix,
-    "A read-only forward prefix iterator (SPEC 00 row 45)."
-);
-ro_range_iterator!(
-    RoRevPrefix,
-    "A read-only reverse prefix iterator (SPEC 00 row 46)."
-);
+ro_range_iterator!(RoRange, "A read-only forward range iterator.");
+ro_range_iterator!(RoRevRange, "A read-only reverse range iterator.");
+ro_range_iterator!(RoPrefix, "A read-only forward prefix iterator.");
+ro_range_iterator!(RoRevPrefix, "A read-only reverse prefix iterator.");
 
 // ---------------------------------------------------------------------------
 // Write iterators
@@ -415,7 +400,7 @@ macro_rules! rw_iterator {
                 }
             }
 
-            /// Delete the entry the cursor is on (SPEC 00 row 34, SPEC 03 §7).
+            /// Delete the entry the cursor is on (SPEC 03 §7).
             ///
             /// # Safety
             ///
@@ -428,7 +413,7 @@ macro_rules! rw_iterator {
                 self.guts.del_current()
             }
 
-            /// Rewrite the current entry's value (SPEC 00 row 33, `MDB_CURRENT`).
+            /// Rewrite the current entry's value (`MDB_CURRENT`).
             ///
             /// # Safety
             ///
@@ -452,7 +437,7 @@ macro_rules! rw_iterator {
             }
 
             /// Rewrite the current entry with explicit flags and a different data
-            /// codec (SPEC 00 row 33, `put_current_with_options`).
+            /// codec (`put_current_with_options`).
             ///
             /// # Safety
             ///
@@ -476,7 +461,7 @@ macro_rules! rw_iterator {
                 self.guts.put_current_with_flags(flags, &kb, &vb)
             }
 
-            /// Reserve-and-write the current entry (SPEC 00 row 33 sibling).
+            /// Reserve-and-write the current entry.
             ///
             /// # Safety
             ///
@@ -526,7 +511,7 @@ macro_rules! rw_iterator {
                 }
             }
 
-            /// Change the key/data codecs (SPEC 00 row 51).
+            /// Change the key/data codecs.
             #[must_use]
             pub fn remap_types<KC2, DC2>(self) -> $name<'txn, KC2, DC2, IM> {
                 $name {
@@ -535,19 +520,19 @@ macro_rules! rw_iterator {
                 }
             }
 
-            /// Change the key codec (SPEC 00 row 51).
+            /// Change the key codec.
             #[must_use]
             pub fn remap_key_type<KC2>(self) -> $name<'txn, KC2, DC, IM> {
                 self.remap_types::<KC2, DC>()
             }
 
-            /// Change the data codec (SPEC 00 row 51).
+            /// Change the data codec.
             #[must_use]
             pub fn remap_data_type<DC2>(self) -> $name<'txn, KC, DC2, IM> {
                 self.remap_types::<KC, DC2>()
             }
 
-            /// Wrap the data in a lazy decoder (SPEC 00 row 50).
+            /// Wrap the data in a lazy decoder.
             #[must_use]
             pub fn lazily_decode_data(self) -> $name<'txn, KC, LazyDecode<DC>, IM> {
                 self.remap_types::<KC, LazyDecode<DC>>()
@@ -594,7 +579,7 @@ macro_rules! rw_range_iterator {
                 }
             }
 
-            /// Delete the entry the cursor is on (SPEC 00 row 34, SPEC 03 §7).
+            /// Delete the entry the cursor is on (SPEC 03 §7).
             ///
             /// # Safety
             ///
@@ -607,7 +592,7 @@ macro_rules! rw_range_iterator {
                 self.guts.del_current()
             }
 
-            /// Rewrite the current entry's value (SPEC 00 row 33, `MDB_CURRENT`).
+            /// Rewrite the current entry's value (`MDB_CURRENT`).
             ///
             /// # Safety
             ///
@@ -631,7 +616,7 @@ macro_rules! rw_range_iterator {
             }
 
             /// Rewrite the current entry with explicit flags and a different data
-            /// codec (SPEC 00 row 33, `put_current_with_options`).
+            /// codec (`put_current_with_options`).
             ///
             /// # Safety
             ///
@@ -655,7 +640,7 @@ macro_rules! rw_range_iterator {
                 self.guts.put_current_with_flags(flags, &kb, &vb)
             }
 
-            /// Reserve-and-write the current entry (SPEC 00 row 33 sibling).
+            /// Reserve-and-write the current entry.
             ///
             /// # Safety
             ///
@@ -705,7 +690,7 @@ macro_rules! rw_range_iterator {
                 }
             }
 
-            /// Change the key/data codecs (SPEC 00 row 51).
+            /// Change the key/data codecs.
             #[must_use]
             pub fn remap_types<KC2, DC2>(self) -> $name<'txn, KC2, DC2, C, IM> {
                 $name {
@@ -714,19 +699,19 @@ macro_rules! rw_range_iterator {
                 }
             }
 
-            /// Change the key codec (SPEC 00 row 51).
+            /// Change the key codec.
             #[must_use]
             pub fn remap_key_type<KC2>(self) -> $name<'txn, KC2, DC, C, IM> {
                 self.remap_types::<KC2, DC>()
             }
 
-            /// Change the data codec (SPEC 00 row 51).
+            /// Change the data codec.
             #[must_use]
             pub fn remap_data_type<DC2>(self) -> $name<'txn, KC, DC2, C, IM> {
                 self.remap_types::<KC, DC2>()
             }
 
-            /// Wrap the data in a lazy decoder (SPEC 00 row 50).
+            /// Wrap the data in a lazy decoder.
             #[must_use]
             pub fn lazily_decode_data(self) -> $name<'txn, KC, LazyDecode<DC>, C, IM> {
                 self.remap_types::<KC, LazyDecode<DC>>()
@@ -756,22 +741,16 @@ macro_rules! rw_range_iterator {
     };
 }
 
-rw_iterator!(
-    RwIter,
-    "A read-write forward full-scan iterator (SPEC 00 row 43)."
-);
+rw_iterator!(RwIter, "A read-write forward full-scan iterator.");
 rw_iterator!(RwRevIter, "A read-write reverse full-scan iterator.");
 rw_range_iterator!(RwRange, "A read-write forward range iterator.");
 rw_range_iterator!(RwRevRange, "A read-write reverse range iterator.");
-rw_range_iterator!(
-    RwPrefix,
-    "A read-write forward prefix iterator (SPEC 00 row 45)."
-);
+rw_range_iterator!(RwPrefix, "A read-write forward prefix iterator.");
 rw_range_iterator!(RwRevPrefix, "A read-write reverse prefix iterator.");
 
 #[cfg(test)]
 mod erased_cursor_in_place_tests {
-    //! ADR-0021 B4 — the adapter's **lifetime-erased write cursor** under miri,
+    //! ADR-0021 — the adapter's **lifetime-erased write cursor** under miri,
     //! over the in-place `WRITE_MAP` realization (SPEC 04 TXN-45b).
     //!
     //! `RwGuts` is the one place the adapter erases lifetimes: it reborrows

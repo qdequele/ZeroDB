@@ -138,8 +138,8 @@ fn both_names_present_is_a_hard_error() {
 }
 
 /// The probe every tool resolves its data file with (and so its lock file,
-/// ADR-0023 amendment 16) finds both names, and reports ambiguity. This was
-/// the flock guard's test; ADR-0023 amendment 18 retired that guard, and the
+/// ADR-0023) finds both names, and reports ambiguity. This was
+/// the flock guard's test; ADR-0023 retired that guard, and the
 /// tools now resolve the name with `naming::resolve` alone.
 #[test]
 fn name_probe_resolves_both_names() {

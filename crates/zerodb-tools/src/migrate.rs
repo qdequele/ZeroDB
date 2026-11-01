@@ -1,6 +1,6 @@
 //! `migrate-from-lmdb` — stream a real LMDB env into a fresh zerodb env (the
 //! one place outside the oracle where linking C is accepted). Behind the
-//! off-by-default `migrate-lmdb` feature (ADR-0001 amendment).
+//! off-by-default `migrate-lmdb` feature (ADR-0001).
 //!
 //! Opens the source LMDB env **read-only** via heed =0.22.1 (the Meilisearch
 //! fork), enumerates the main DB and every named sub-DB, and writes their
@@ -57,8 +57,7 @@ pub fn cmd_migrate(
         .into());
     }
     // The destination must be fresh under either name, and opened by this
-    // process alone; the `Env` is held for the whole migration (ADR-0023
-    // amendment 18).
+    // process alone; the `Env` is held for the whole migration (ADR-0023).
     std::fs::create_dir_all(dst_dir)?;
     crate::commands::refuse_existing_env(dst_dir, "migrate into")?;
     let dst =

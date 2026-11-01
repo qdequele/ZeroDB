@@ -86,7 +86,7 @@ pub const HEED_DATA_FILE_NAME: &str = "data.mdb";
 /// derive other lock names; see [`derived_lock_file_name`].
 pub const LOCK_FILE_NAME: &str = "zerodb.lock";
 
-/// The lock-file name derived from a data-file name (ADR-0023 amendment 16):
+/// The lock-file name derived from a data-file name (ADR-0023):
 /// [`DATA_FILE_NAME`] (`zerodb.dat`) gives [`LOCK_FILE_NAME`]
 /// (`zerodb.lock`), [`HEED_DATA_FILE_NAME`] (`data.mdb`) gives LMDB's
 /// `lock.mdb`, and any other name `<data_file_name>-lock` (LMDB's
@@ -130,7 +130,7 @@ fn is_single_component(name: &OsStr) -> bool {
 }
 
 /// Default map size when the caller does not set one (1 MiB). LMDB/heed require
-/// a `map_size`; every production consumer sets it (SPEC 00 row 3), so this
+/// a `map_size`; every production consumer sets it, so this
 /// default only matters for tests.
 const DEFAULT_MAP_SIZE: u64 = 1 << 20;
 
@@ -207,7 +207,7 @@ impl std::ops::BitOrAssign for EnvFlags {
     }
 }
 
-/// Builder for opening an [`Env`] (SPEC 00 rows 1–12), shaped like heed's
+/// Builder for opening an [`Env`], shaped like heed's
 /// `EnvOpenOptions`.
 #[derive(Debug, Clone)]
 pub struct EnvOpenOptions {
@@ -235,7 +235,7 @@ impl Default for EnvOpenOptions {
 }
 
 impl EnvOpenOptions {
-    /// A fresh builder with defaults (SPEC 00 row 1).
+    /// A fresh builder with defaults.
     #[must_use]
     pub fn new() -> EnvOpenOptions {
         EnvOpenOptions {
@@ -257,21 +257,21 @@ impl EnvOpenOptions {
         }
     }
 
-    /// Set the map size (SPEC 00 row 3). Stored; the mmap ceiling and
+    /// Set the map size. Stored; the mmap ceiling and
     /// `MdbError::MapFull` boundary use it.
     pub fn map_size(&mut self, size: usize) -> &mut EnvOpenOptions {
         self.map_size = Some(size as u64);
         self
     }
 
-    /// Set the named-DB catalog capacity (SPEC 00 row 4): the number of distinct
+    /// Set the named-DB catalog capacity: the number of distinct
     /// named DBs the env can open.
     pub fn max_dbs(&mut self, n: u32) -> &mut EnvOpenOptions {
         self.max_dbs = n;
         self
     }
 
-    /// Set the reader-table size (SPEC 00 row 5; SPEC 04 TXN-14, default 126
+    /// Set the reader-table size (SPEC 04 TXN-14, default 126
     /// = LMDB `DEFAULT_READERS`). The table is allocated once at open and
     /// never resized; when it is exhausted, `read_txn` fails with
     /// [`MdbError::ReadersFull`] (TXN-16).
@@ -323,7 +323,7 @@ impl EnvOpenOptions {
         self.page_size
     }
 
-    /// Set the env flags (SPEC 00 row 6). All LMDB-parity flags are honored:
+    /// Set the env flags. All LMDB-parity flags are honored:
     /// `PREV_SNAPSHOT`, `READ_ONLY`, `WRITE_MAP`, `NO_SYNC`, `NO_META_SYNC`,
     /// `MAP_ASYNC` (SPEC 01 Table 1).
     pub fn flags(&mut self, flags: EnvFlags) -> &mut EnvOpenOptions {
@@ -397,9 +397,9 @@ impl EnvOpenOptions {
     ///
     /// With it on, a write txn remembers the path to each tree's rightmost
     /// leaf and appends there without descending from the root when a key
-    /// sorts after every key already in that leaf. Measured on x86-64:
-    /// ascending and APPEND loads 14–24 % faster, random-key writes 3–5 %
-    /// slower. Results are identical either way. Override it per database
+    /// sorts after every key already in that leaf. Ascending and APPEND loads
+    /// get faster, random-key writes slightly slower; results are identical
+    /// either way. Override it per database
     /// with [`Env::set_sequential_writes`].
     pub fn sequential_writes(&mut self, on: bool) -> &mut EnvOpenOptions {
         self.sequential_writes = on;
@@ -424,8 +424,7 @@ impl EnvOpenOptions {
     /// Let other processes open this environment at the same time, through a
     /// shared lock file next to the data file (ADR-0023). On by default, as in
     /// LMDB; `false` makes the environment single-process and creates no lock
-    /// file. The heed adapter maps heed's `NO_LOCK` to `false` (ADR-0023
-    /// amendment 17).
+    /// file. The heed adapter maps heed's `NO_LOCK` to `false` (ADR-0023).
     pub fn lock_file(&mut self, on: bool) -> &mut EnvOpenOptions {
         self.lock_file = on;
         self
@@ -479,8 +478,7 @@ impl EnvOpenOptions {
     /// must not be the data file. The lock-file initializer overwrites its
     /// file, so sharing the name would destroy the data; it is rejected before
     /// either file is opened. Other names of the data file (hard links, case
-    /// variants) are caught by the same-file guard in `LockFile::open`
-    /// (amendment 16).
+    /// variants) are caught by the same-file guard in `LockFile::open`.
     fn check_lock_file_name(&self, lock_file_name: &OsStr) -> Result<()> {
         if !is_single_component(lock_file_name) {
             return Err(Error::Io(std::io::Error::new(
@@ -499,9 +497,9 @@ impl EnvOpenOptions {
         Ok(())
     }
 
-    /// Open (or create) the environment at `path` (SPEC 00 row 7).
+    /// Open (or create) the environment at `path`.
     ///
-    /// `path` is a **directory** (the directory-env convention, SPEC 00 row 7);
+    /// `path` is a **directory** (the directory-env convention);
     /// the data lives in `path/`[`EnvOpenOptions::get_data_file_name`]
     /// (default [`DATA_FILE_NAME`], ADR-0010). The directory must already
     /// exist (LMDB parity). If the data file is absent or empty, a fresh empty
@@ -531,7 +529,7 @@ impl EnvOpenOptions {
     ///   link, or a case variant on a case-insensitive filesystem), or if it
     ///   is a non-empty file that is neither a ZeroDB lock file nor the
     ///   all-zero remains of one, such as another environment's data file or
-    ///   a stale LMDB `lock.mdb` (ADR-0023 amendment 16; SPEC 02 §8 gives the
+    ///   a stale LMDB `lock.mdb` (ADR-0023; SPEC 02 §8 gives the
     ///   exact rule). Neither file is modified.
     /// - [`Error::Io`] if the directory does not exist, on any file/mmap I/O
     ///   error, or if a `READ_ONLY` open finds no existing store.
@@ -539,7 +537,7 @@ impl EnvOpenOptions {
     ///   the lock file cannot be created or opened for writing on a read-only
     ///   filesystem and the open is not [`EnvFlags::READ_ONLY`]. A `READ_ONLY`
     ///   open there proceeds without a lock file, as LMDB does
-    ///   ([`Env::has_lock_file`] is then `false`; ADR-0023 amendment 17).
+    ///   ([`Env::has_lock_file`] is then `false`; ADR-0023).
     ///   Any other lock-file error, such as `EACCES` in a directory this
     ///   process cannot write, fails the open, also when `READ_ONLY`.
     /// - [`Error::Mdb`]`(`[`MdbError::Invalid`]`)` if the file is not a valid
@@ -571,7 +569,7 @@ impl EnvOpenOptions {
             )));
         }
         self.check_data_file_name()?;
-        // ADR-0023 amendment 16: the explicit lock-file name, or the one
+        // ADR-0023: the explicit lock-file name, or the one
         // derived from the data-file name.
         let lock_file_name = self.get_lock_file_name();
         if self.lock_file {
@@ -593,7 +591,7 @@ impl EnvOpenOptions {
             let path = canonical_dir.join(&lock_file_name);
             match zerodb_io::lockfile::LockFile::open(&path, &data_path, self.max_readers) {
                 Ok(l) => Some(l),
-                // ADR-0023 amendment 17 (`OBS_RDONLY_LOCK_READONLY_FS = 0`): a
+                // ADR-0023 (`OBS_RDONLY_LOCK_READONLY_FS = 0`): a
                 // read-only env on read-only media runs without a lock file,
                 // as LMDB does. A writable env fails with the `EROFS`.
                 Err(zerodb_io::lockfile::LockOpenError::ReadOnlyFs) if read_only => None,
@@ -646,7 +644,7 @@ impl EnvOpenOptions {
             read_only,
             durability.write_map,
             self.flags.contains(EnvFlags::NO_READ_AHEAD),
-            // ADR-0023 amendment 15, decision 4: only the sole process may
+            // ADR-0023: only the sole process may
             // grow a WRITE_MAP data file at open. A joiner's write txns grow
             // it under both writer locks.
             lock.as_ref()
@@ -675,16 +673,12 @@ impl EnvOpenOptions {
             // the lock file before returning the error.
             lock.map(|l| l as std::sync::Arc<dyn zerodb_core::shared::SharedRegion>),
         )?;
-        // The core open let joiners in once `T` was seeded (ADR-0023 §1),
-        // or, for `PREV_SNAPSHOT`, keeps them out until the first commit
-        // (amendment 19).
         Ok(env)
     }
 }
 
 /// Holds an environment's lock file as an unfinished initializer: every other
-/// opener waits in the first-opener election until this guard drops (ADR-0023
-/// amendment 18).
+/// opener waits in the first-opener election until this guard drops (ADR-0023).
 ///
 /// `zerodb-tools check` takes it before walking the raw data file of an
 /// environment that does not open, so no process opens the environment, and

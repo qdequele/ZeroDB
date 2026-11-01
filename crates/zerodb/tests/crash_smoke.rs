@@ -1,4 +1,4 @@
-//! Commit-pipeline crash smoke test (ADR-0004 D7 risk 3; the full ≥10k-cycle
+//! Commit-pipeline crash smoke test (ADR-0004 risk 3; the full ≥10k-cycle
 //! harness is the zerodb-oracle crash harness). For each hook point H0..H4 (SPEC 04 §9), a
 //! **child process** runs: commit txn 1 normally, then commit txn 2 with a
 //! [`CommitHook`] that aborts the process at the target point. The parent

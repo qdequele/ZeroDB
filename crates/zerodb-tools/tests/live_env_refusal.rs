@@ -1,4 +1,4 @@
-//! The tools against a live environment (ADR-0023 amendment 18): `stat`,
+//! The tools against a live environment (ADR-0023): `stat`,
 //! `dump` and `check` attach to an environment another process has open,
 //! through its lock file; `load` and `check`'s raw-file fallback refuse one.
 //!
@@ -180,10 +180,6 @@ fn entries(dir: &Path) -> BTreeSet<String> {
 /// holds open with a read txn and an uncommitted write txn: they read its
 /// committed data, not the pending write, and create nothing beside the
 /// environment's own two files.
-///
-/// This replaces `tools_refuse_a_locked_env`, which asserted the opposite
-/// (refusal while a `flock` on the data file was held). ADR-0023 amendment
-/// 18 retires that `flock` and makes the tools attach as readers.
 #[test]
 fn tools_attach_to_a_live_env_in_another_process() {
     let dir = tmp_dir("live");

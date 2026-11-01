@@ -163,7 +163,7 @@ fn stress_readers_vs_spilling_writer() {
     readers_vs_churn(Some(128 * PS as usize), 800, EnvFlags::EMPTY);
 }
 
-/// The same stress with an **in-place `WRITE_MAP`** writer (ADR-0021 B4,
+/// The same stress with an **in-place `WRITE_MAP`** writer (ADR-0021,
 /// SPEC 04 TXN-45b): every churn txn stores its dirty pages straight into
 /// the writable map mid-txn — fresh and GC-reclaimed pgnos alike — while 8
 /// readers hold and re-walk older snapshots, and nested-free commits

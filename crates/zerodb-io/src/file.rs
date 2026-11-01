@@ -150,7 +150,7 @@ pub(crate) fn read_head(file: &File, len: usize) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// The actual on-disk file length via `fstat` (SPEC 00 row 18).
+/// The actual on-disk file length via `fstat`.
 ///
 /// # Errors
 ///
@@ -250,7 +250,7 @@ pub(crate) fn create_env_file(path: &Path, page_size: u32, map_size: u64) -> std
     // fsync so both slots are durable before the env is usable (SPEC 02 §3.4).
     file.sync_all()?;
     // …and fsync the parent directory so the file's *directory entry* is
-    // durable too (SPEC 02 §3.4 step 4; issue #46): without this, a crash
+    // durable too (SPEC 02 §3.4 step 4): without this, a crash
     // shortly after creation can lose the name while the content was already
     // durable — a reachable-file guarantee, one fsync per env lifetime.
     fsync_parent_dir(path)?;

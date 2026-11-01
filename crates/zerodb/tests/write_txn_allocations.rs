@@ -1,4 +1,4 @@
-//! Heap allocations per write transaction (issue #8).
+//! Heap allocations per write transaction.
 //!
 //! A write txn reuses the previous one's containers, carried on the env's
 //! writer slot (`zerodb_core::rwtxn::WriterCarry`), as LMDB reuses its one

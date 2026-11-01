@@ -76,8 +76,7 @@ use zerodb_core::page::FIRST_DATA_PGNO;
 use zerodb_core::page::{MetaPage, FORMAT_VERSION, F_SUBDATA, MAGIC};
 use zerodb_core::{for_each_entry_flagged, named_databases, RoTxn};
 
-/// Whether [`CopyToFile::copy_to_file`] compacts (`heed::CompactionOption`,
-/// SPEC 00 row 59). `Enabled` rewrites into a fresh, densely-packed env with no
+/// Whether [`CopyToFile::copy_to_file`] compacts (`heed::CompactionOption`). `Enabled` rewrites into a fresh, densely-packed env with no
 /// free pages (`MDB_CP_COMPACT`); `Disabled` copies the snapshot's pages
 /// verbatim, keeping the freelist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +109,7 @@ pub struct CopyProgress {
     pub total: u64,
 }
 
-/// `Env::copy_to_file` (SPEC 00 row 17). Produces a **single data file** (a
+/// `Env::copy_to_file`. Produces a **single data file** (a
 /// `zerodb.dat`-format image); to open the copy as an env, place it as
 /// `<dir>/zerodb.dat` and open `<dir>`.
 pub trait CopyToFile {
@@ -209,7 +208,7 @@ pub trait CopyToFile {
 impl CopyToFile for Env {
     fn copy_to_file(&self, path: impl AsRef<Path>, option: CompactionOption) -> Result<()> {
         // The progress form's code path with a callback that does nothing, so
-        // the no-callback signature (heed parity, SPEC 00 row 17) cannot
+        // the no-callback signature (heed parity) cannot
         // drift from the instrumented one. The one difference: with no
         // progress to report, a raw copy may clone the whole file.
         copy_to_path(
@@ -285,9 +284,10 @@ fn stream_to_path(
         armed: true,
     };
     plan.write(env, txn, &file, 0, src, progress)?;
-    drop(file); // close the temp file before renaming it
-                // Last callback before `dest` is touched — see the panic contract on
-                // `copy_to_file_with_progress`.
+    // Close the temp file before renaming it.
+    drop(file);
+    // The last callback before `dest` is touched; see the panic contract on
+    // `copy_to_file_with_progress`.
     progress.finish();
     std::fs::rename(&tmp, dest)?;
     guard.armed = false;
@@ -743,7 +743,7 @@ fn corrupt(_e: zerodb_core::page::PageError) -> Error {
 /// Non-compact copy: the snapshot's data pages `[FIRST_DATA_PGNO, last_pg]`
 /// copied verbatim from the map, with two freshly-encoded meta slots pinned to
 /// this snapshot (so the copy opens at exactly snapshot `T`, even if the live
-/// env has committed newer metas since the txn began — SPEC 00 row 17).
+/// env has committed newer metas since the txn began).
 ///
 /// The data pages are written straight from the map in large positioned
 /// writes, as LMDB's `mdb_env_copyfd` writes from its map: no in-memory image
@@ -830,7 +830,7 @@ fn pages_per_chunk(n_pages: u64, psize: u32) -> u64 {
 }
 
 /// The raw image's two meta slots, both built for `txn`'s snapshot, so the
-/// copy opens at exactly that snapshot (SPEC 00 row 17).
+/// copy opens at exactly that snapshot.
 fn snapshot_metas(env: &Env, txn: &RoTxn<'_>) -> Result<Vec<u8>> {
     let psize = env.page_size();
     let ps = psize as usize;

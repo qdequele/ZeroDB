@@ -1,4 +1,4 @@
-//! The loose-page fast path (GC-7/8) and trailing-shrink (GC-10), ADR-0004 D4,
+//! The loose-page fast path (GC-7/8) and trailing-shrink (GC-10), ADR-0004,
 //! pinned through observable file-size + `check_image` assertions.
 
 use std::path::{Path, PathBuf};

@@ -1,4 +1,4 @@
-//! `ReservedSpace` — heed's `MDB_RESERVE` write buffer (SPEC 00 row 35). heed
+//! `ReservedSpace` — heed's `MDB_RESERVE` write buffer. heed
 //! reserves bytes *inside the map*; the adapter does the equivalent:
 //! `Database::put_reserved` hands the caller a `ReservedSpace` wrapping the
 //! engine's **in-frame slot** (the mutable slice into the dirty page or

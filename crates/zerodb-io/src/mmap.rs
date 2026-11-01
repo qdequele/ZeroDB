@@ -1,7 +1,7 @@
 //! Memory maps over an env data file (SPEC 02 §8): the read-only [`Mmap`]
 //! (default backing) and the writable [`MmapWritable`] (`EnvFlags::WRITE_MAP`),
 //! plus [`MapRegions`], the grow-only cell of mappings a backing reads through
-//! (ADR-0023 amendment 15).
+//! (ADR-0023).
 //!
 //! # Aliasing contract
 //!
@@ -237,7 +237,7 @@ impl MmapWritable {
     }
 }
 
-/// One mmap of the data file (ADR-0023 amendment 15).
+/// One mmap of the data file (ADR-0023).
 pub(crate) enum Mapping {
     /// A read-only map (the default backing).
     Read(Mmap),
@@ -274,7 +274,7 @@ struct Owned {
     views: Vec<*mut ViewCell>,
 }
 
-/// Grow-only mappings (ADR-0023 amendment 15). Every mapping and view is
+/// Grow-only mappings (ADR-0023). Every mapping and view is
 /// created with `Box::into_raw`, recorded in `owned`, and freed only in Drop.
 ///
 /// `current` points to the newest view. One `Acquire` load of it gives a

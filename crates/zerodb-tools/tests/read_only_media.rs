@@ -1,4 +1,4 @@
-//! The read tools on read-only media (ADR-0023 amendments 17 and 18): no lock
+//! The read tools on read-only media (ADR-0023 and 18): no lock
 //! file can be created there, so `stat`, `dump` and `check` open the
 //! environment read-only without one, as LMDB's tools do
 //! (`OBS_RDONLY_LOCK_READONLY_FS = 0`).

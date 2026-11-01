@@ -15,11 +15,11 @@ pub type BoxErr = Box<dyn std::error::Error>;
 /// The options a tool opens an existing environment with: `READ_ONLY`, the
 /// data file `data_file_name`, and the lock file on, under the name derived
 /// from the data file ([`zerodb::derived_lock_file_name`]), so the tool joins
-/// the environment as any other process does (ADR-0023 amendment 18).
+/// the environment as any other process does (ADR-0023).
 ///
 /// `max_readers` is the value the environment's lock file records, if any;
 /// otherwise the engine default. A tool that joins a running environment
-/// adopts that environment's count anyway (ADR-0023 §1 as amended); reading
+/// adopts that environment's count anyway (ADR-0023 §1); reading
 /// it first keeps the count when every other process has closed and the
 /// tool's open reinitializes the lock file.
 ///
@@ -61,7 +61,7 @@ fn recorded_max_readers(env_dir: &Path, opts: &EnvOpenOptions) -> Result<Option<
 /// must tell it which file the directory actually holds.
 ///
 /// On read-only media no lock file can be created, and the open proceeds
-/// without one, as LMDB's tools do (ADR-0023 amendment 17).
+/// without one, as LMDB's tools do (ADR-0023).
 ///
 /// # Errors
 ///
@@ -78,8 +78,7 @@ pub fn open_ro(env_dir: &Path, data_file_name: &str) -> Result<Env, zerodb::Erro
 
 /// Begin a read txn on a tool's env. A [`MdbError::MapResized`] (another
 /// process grew the environment past this process's map) is answered as
-/// LMDB's tools do: adopt the newest map size and retry once (ADR-0023
-/// amendment 18).
+/// LMDB's tools do: adopt the newest map size and retry once (ADR-0023).
 ///
 /// # Errors
 ///

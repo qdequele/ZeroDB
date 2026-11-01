@@ -1,7 +1,7 @@
-//! Free-page GC guard tests (ADR-0005 D6) over **real files**: freed-page
+//! Free-page GC guard tests (ADR-0005) over **real files**: freed-page
 //! reclamation (SPEC 05 GC-14..20), the freelist-writes-to-itself commit step
 //! (GC-11..13), the partial-drain remainder rewrite (GC-20), the interim
-//! oldest-reader gate (ADR-0005 OQ1; SPEC 04 TXN-21), the huge-txn PIL spill
+//! oldest-reader gate (ADR-0005; SPEC 04 TXN-21), the huge-txn PIL spill
 //! (GC-5/GC-26),
 //! `non_free_pages_size` (GC-22..24, INV-27), and GC atomicity across crashes
 //! (GC-14, REC-6).
@@ -65,7 +65,7 @@ fn file_size(dir: &Path) -> u64 {
 }
 
 /// Bounded file growth on insert/delete churn (GC acceptance criterion;
-/// ADR-0005 D5 flatness bound): with a constant live set, reclamation must
+/// ADR-0005 flatness bound): with a constant live set, reclamation must
 /// hold the file at a steady state — size at the last cycle within 1.05× of
 /// the size at the halfway cycle. The INV-22 walk after every commit is the
 /// structural half of the guarantee (no leak, no double-hand-out); this is
@@ -104,7 +104,7 @@ fn churn_file_growth_reaches_steady_state() {
     );
 }
 
-/// GC-20 partial-drain remainder rewrite (ADR-0005 D6 risk 3): draining part
+/// GC-20 partial-drain remainder rewrite (ADR-0005 risk 3): draining part
 /// of a GC entry across a commit must keep the remainder listed (INV-22
 /// "never neither"), remove the drained ids (INV-22 "never both" — they are
 /// reachable again), and leave the remainder genuinely reusable (a follow-up
@@ -192,7 +192,7 @@ fn partial_drain_remainder_survives_commits() {
     );
 }
 
-/// GC-11..13 freelist-writes-to-itself (ADR-0005 D6 risk 1) + the GC-26
+/// GC-11..13 freelist-writes-to-itself (ADR-0005 risk 1) + the GC-26
 /// huge-txn spill: one txn frees far more than the `c >= 251` (psize 4096)
 /// spill threshold, so the PIL goes to an overflow run, and `freelist_save`'s
 /// own tree writes free/allocate GC pages mid-save. INV-22 catches any page
@@ -258,7 +258,7 @@ fn freelist_self_write_split_and_spill() {
     );
 }
 
-/// The interim oldest-reader gate (ADR-0005 OQ1, D6 risk 2 —
+/// The interim oldest-reader gate (ADR-0005 —
 /// reuse-while-referenced): a live `RoTxn` pins its snapshot; writers that
 /// churn concurrently must NOT reclaim pages that snapshot still reaches.
 /// The reader's borrows come zero-copy from the mmap, so a gate bug is
@@ -385,7 +385,7 @@ fn non_free_pages_size_identity() {
 }
 
 // ---------------------------------------------------------------------------
-// GC atomicity across crashes (GC-14; ADR-0005 D6, crash-churn variant of the
+// GC atomicity across crashes (GC-14; ADR-0005, crash-churn variant of the
 // commit-pipeline crash smoke — the full crash harness lives in zerodb-oracle).
 // ---------------------------------------------------------------------------
 

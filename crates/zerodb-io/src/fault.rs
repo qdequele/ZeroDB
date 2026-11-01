@@ -1,4 +1,4 @@
-//! Fault-injection write backend (ADR-0008 D1; SPEC 06 REC-19/REC-20).
+//! Fault-injection write backend (ADR-0008; SPEC 06 REC-19/REC-20).
 //!
 //! [`FaultBacking`] wraps a real [`Backing`] and journals every
 //! `write_at_page` issued since the last completed sync barrier. The wrapped
@@ -26,9 +26,9 @@
 //! durable meta `N` without durable `N`-data. If the pipeline ever misordered
 //! C3 after C4, this backend would materialize exactly that corrupt image and
 //! the harness's REC-18 verification would fail — that is the tripwire this
-//! module arms (and the mutation self-test proves it fires, ADR-0008 D6.1).
+//! module arms (and the mutation self-test proves it fires, ADR-0008.1).
 //!
-//! ## In-place `WRITE_MAP` (ADR-0021 B3)
+//! ## In-place `WRITE_MAP` (ADR-0021)
 //!
 //! When the wrapped backing brokers map slices (`Backing::dirty_in_map`),
 //! dirty pages never pass through `write_at_page` — the engine stores them
@@ -55,7 +55,7 @@
 //! states between two seal points are not enumerated; under the
 //! bounded-window modes they can only land on pages no durable meta
 //! references, and under `MAP_ASYNC` the adversarial sub-model is
-//! probe-only, ADR-0008 D4.)
+//! probe-only, ADR-0008.)
 //!
 //! ## Ranged barriers (SPEC 06 REC-12)
 //!
@@ -70,7 +70,7 @@
 //!
 //! The live view stays the wrapped backing's — no new aliasing. The only
 //! `unsafe` is the mandatory `unsafe fn` forward of the brokered map slice
-//! (ADR-0021 B1), which adds no obligation of its own.
+//! (ADR-0021), which adds no obligation of its own.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -81,7 +81,7 @@ use zerodb_core::env::{Backing, MapView};
 pub const SECTOR: usize = 512;
 
 // ---------------------------------------------------------------------------
-// Deterministic PRNG (ADR-0008 D1, OQ4): splitmix64 seeding a
+// Deterministic PRNG (ADR-0008): splitmix64 seeding a
 // xoshiro256** core. In-house so fault plans are bit-stable across platforms,
 // crate versions, and time — a saved (seed, cycle) pair reproduces the exact
 // image forever. ~20 lines, test-infrastructure only (CRC32C precedent).
@@ -99,7 +99,7 @@ pub fn splitmix64(mut x: u64) -> u64 {
 }
 
 /// xoshiro256** — deterministic, dependency-free PRNG for fault plans and
-/// workload generation (ADR-0008 D1/OQ4).
+/// workload generation (ADR-0008).
 #[derive(Debug, Clone)]
 pub struct Rng {
     s: [u64; 4],
@@ -162,7 +162,7 @@ impl Rng {
 #[derive(Debug, Clone)]
 pub struct WriteRecord {
     /// Byte offset in the file (`pgno * psize` — page-aligned by construction
-    /// of the [`Backing`] trait, the ADR-0008 D5 invariant).
+    /// of the [`Backing`] trait, the ADR-0008 invariant).
     pub offset: u64,
     /// The bytes written (length a positive multiple of `psize`, D5).
     pub data: Box<[u8]>,
@@ -183,14 +183,14 @@ pub struct FaultStats {
     /// Asynchronous flushes observed (deliberately **not** barriers, REC-9:
     /// `msync(MS_ASYNC)` gives no completion guarantee).
     pub async_flushes: u64,
-    /// Distinct in-map dirty regions journaled (ADR-0021 B3: brokered map
+    /// Distinct in-map dirty regions journaled (ADR-0021: brokered map
     /// slices, deduplicated per seal window). Nonzero iff the wrapped
     /// backing runs the in-place WRITE_MAP realization.
     pub map_regions: u64,
     /// `write_at_page` calls targeting **data** pages (offset past the two
     /// meta slots). Under in-place WRITE_MAP this must stay 0 — every data
     /// page is realized through the broker, and C2/spill write nothing — so
-    /// the harness uses it as a vacuousness tripwire (ADR-0021 B3): a
+    /// the harness uses it as a vacuousness tripwire (ADR-0021): a
     /// nonzero value under a WRITE_MAP cycle means the in-place realization
     /// silently disengaged.
     pub data_writes: u64,
@@ -207,12 +207,12 @@ struct FaultState {
     durable_len: u64,
     /// Writes since the last barrier, in issue order.
     pending: Vec<WriteRecord>,
-    /// In-map dirty regions brokered since the last seal point (ADR-0021
-    /// B3): byte offset → region length. Deduplicated (every mutable access
+    /// In-map dirty regions brokered since the last seal point (ADR-0021):
+    /// byte offset → region length. Deduplicated (every mutable access
     /// re-brokers its region); content is read from the live map at the next
     /// seal (any `sync`) or capture — see the module docs.
     map_regions: BTreeMap<u64, u64>,
-    /// Mutation self-test mode (ADR-0008 D6.1): barriers fold ONLY meta-page
+    /// Mutation self-test mode (ADR-0008.1): barriers fold ONLY meta-page
     /// writes; data writes stay pending forever. This models a pipeline whose
     /// data fsync is ineffective/misordered — the harness MUST catch the
     /// resulting meta-without-data images. Never set outside the self-test.
@@ -314,7 +314,7 @@ impl FaultState {
                     self.keep_pending(&rec, cur, lo);
                 }
                 if broken && rec.offset >= meta_end {
-                    // ADR-0008 D6.1 self-test: data durability is dropped.
+                    // ADR-0008.1 self-test: data durability is dropped.
                     self.keep_pending(&rec, lo, hi);
                 } else {
                     if self.durable.len() < hi as usize {
@@ -348,7 +348,7 @@ impl FaultState {
 pub struct FaultHandle {
     state: Arc<Mutex<FaultState>>,
     /// The wrapped live backing (shared with the [`FaultBacking`]): capture
-    /// resolves un-sealed in-map regions against it (ADR-0021 B3), and the
+    /// resolves un-sealed in-map regions against it (ADR-0021), and the
     /// `Arc` keeps the map alive for captures after the env dropped.
     live: Arc<dyn Backing>,
 }
@@ -356,8 +356,8 @@ pub struct FaultHandle {
 impl FaultHandle {
     /// Snapshot the `(durable, pending)` pair — the simulated power cut. The
     /// running env is untouched (capture, don't kill: the cut point is frozen
-    /// while the workload continues, ADR-0008 D2). In-map dirty regions
-    /// (ADR-0021 B3) are resolved against the live map into the snapshot;
+    /// while the workload continues, ADR-0008). In-map dirty regions
+    /// (ADR-0021) are resolved against the live map into the snapshot;
     /// the journal itself is not mutated.
     #[must_use]
     pub fn capture(&self) -> CapturedDisk {
@@ -370,7 +370,7 @@ impl FaultHandle {
         }
     }
 
-    /// ADR-0008 D6.1 mutation self-test switch. See [`FaultState`] docs.
+    /// ADR-0008.1 mutation self-test switch. See [`FaultState`] docs.
     pub fn set_broken_data_barriers(&self, broken: bool) {
         self.state
             .lock()
@@ -385,12 +385,12 @@ impl FaultHandle {
     }
 }
 
-/// A [`Backing`] wrapper journaling un-barriered writes (ADR-0008 D1 Option B).
+/// A [`Backing`] wrapper journaling un-barriered writes (ADR-0008).
 ///
 /// Reads (`bytes`) delegate to the wrapped backing — the live process view,
 /// identical to production where the page cache serves un-fsynced writes.
-/// Writes journal, then delegate; brokered in-map dirty regions (ADR-0021
-/// B3) are journaled at broker time and resolved at seal points (module
+/// Writes journal, then delegate; brokered in-map dirty regions (ADR-0021)
+/// are journaled at broker time and resolved at seal points (module
 /// docs). `sync(false)` folds the journal (the REC-20 pending→durable
 /// transition); `sync(true)` (`MAP_ASYNC`) deliberately does **not** — the
 /// most adversarial sound model of `msync(MS_ASYNC)`. The ranged barrier
@@ -456,7 +456,7 @@ impl Backing for FaultBacking {
     }
 
     fn grow_map(&self, map_size: u64) -> std::io::Result<()> {
-        // ADR-0023 amendment 15: forward, so crash cycles run over a backing
+        // ADR-0023: forward, so crash cycles run over a backing
         // that can grow. Growth writes no page content: a grown file reads as
         // zeros past its old end, which the durable image already models (it
         // grows only as writes are folded).
@@ -477,7 +477,7 @@ impl Backing for FaultBacking {
     }
 
     fn read_meta_copy(&self, slot: u64, psize: u32, buf: &mut [u8]) -> std::io::Result<()> {
-        // ADR-0008 D1 Option B: this backing wraps a real one and injects no
+        // ADR-0008: this backing wraps a real one and injects no
         // behavior of its own on the read path — forward verbatim.
         self.inner.read_meta_copy(slot, psize, buf)
     }
@@ -485,14 +485,14 @@ impl Backing for FaultBacking {
     fn write_at_page(&self, pgno: u64, psize: u32, data: &[u8]) -> std::io::Result<()> {
         {
             let mut st = self.state.lock().expect("fault state lock");
-            // ADR-0008 D5 (O_DIRECT-friendly sizing audit): every commit write
+            // ADR-0008 (O_DIRECT-friendly sizing audit): every commit write
             // MUST be a positive whole-page multiple at a page offset. The
             // trait's `pgno` shape makes the offset structural; length is
             // asserted here on every write of every crash cycle.
             debug_assert_eq!(psize, st.psize, "write psize drifted from env psize");
             debug_assert!(
                 !data.is_empty() && data.len().is_multiple_of(psize as usize),
-                "ADR-0008 D5: non-page-multiple commit write ({} bytes)",
+                "ADR-0008: non-page-multiple commit write ({} bytes)",
                 data.len()
             );
             st.stats.writes += 1;
@@ -509,7 +509,7 @@ impl Backing for FaultBacking {
     }
 
     fn dirty_in_map(&self) -> bool {
-        // ADR-0021 B3: forward the in-place realization so WRITE_MAP crash
+        // ADR-0021: forward the in-place realization so WRITE_MAP crash
         // cycles exercise it — the journal tracks brokered regions instead
         // of (never-issued) C2 writes.
         self.inner.dirty_in_map()
@@ -517,7 +517,7 @@ impl Backing for FaultBacking {
 
     // clippy cannot see that this is an `unsafe fn` whose documented contract
     // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
-    // too); ADR-0021 B1's substance is the `unsafe fn` itself.
+    // too); ADR-0021's substance is the `unsafe fn` itself.
     #[allow(clippy::mut_from_ref)]
     unsafe fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
         {
@@ -551,7 +551,7 @@ impl Backing for FaultBacking {
     fn sync(&self, async_flush: bool) -> std::io::Result<()> {
         {
             let mut st = self.state.lock().expect("fault state lock");
-            // ADR-0021 B3: any flush call is a seal point — resolve the
+            // ADR-0021: any flush call is a seal point — resolve the
             // brokered regions' current bytes into pending records (C3 runs
             // before C4, so data records precede the meta's; under MAP_ASYNC
             // this also seals per-commit versions without folding).
@@ -795,7 +795,7 @@ impl CapturedDisk {
     /// can starve the REC-19 CRC-rejection or txnid-selection paths), then
     /// seeded random per-write fates. Deterministic in `seed`.
     ///
-    /// Quotas (asserted by `plan_quotas_present` in tests, ADR-0008 D6.1):
+    /// Quotas (asserted by `plan_quotas_present` in tests, ADR-0008.1):
     /// - `floor` (all dropped) and `ceil` (all applied) — always;
     /// - `lost-extension` (all applied, durable length) — always;
     /// - if a meta write is pending: `meta-subsector-torn` (splits the meta's
@@ -927,7 +927,7 @@ impl CapturedDisk {
         plans
     }
 
-    /// The **ordered-writeback** plan set (ADR-0008 D4, `NO_SYNC`/`MAP_ASYNC`
+    /// The **ordered-writeback** plan set (ADR-0008, `NO_SYNC`/`MAP_ASYNC`
     /// sub-model (i)): pending writes persist only as an issue-order prefix —
     /// modeling a filesystem that preserves write order — with the write in
     /// flight at the cut optionally torn. Under this model REC-11's
@@ -1230,7 +1230,7 @@ mod tests {
 
     #[test]
     fn plans_and_images_are_deterministic() {
-        // OQ4: bit-stable plans — same seed, same capture ⇒ identical images.
+        // Bit-stable plans — same seed, same capture ⇒ identical images.
         let mk = || {
             let (b, h) = setup(2);
             let mut rng = Rng::new(9);
@@ -1275,7 +1275,7 @@ mod tests {
 
     #[test]
     fn broken_barrier_mode_keeps_data_pending() {
-        // ADR-0008 D6.1: the mutation self-test switch — barriers fold metas
+        // ADR-0008.1: the mutation self-test switch — barriers fold metas
         // but silently drop data durability.
         let (b, h) = setup(2);
         h.set_broken_data_barriers(true);
@@ -1319,7 +1319,7 @@ mod tests {
         }
     }
 
-    /// Map growth (ADR-0023 amendment 15) reaches the wrapped backing, so
+    /// Map growth (ADR-0023) reaches the wrapped backing, so
     /// the crash harness runs over a backing that can grow.
     #[test]
     fn map_growth_is_forwarded() {
@@ -1335,7 +1335,7 @@ mod tests {
         );
     }
 
-    /// ADR-0021 B3 — the in-map journal model, over the heap-backed
+    /// ADR-0021 — the in-map journal model, over the heap-backed
     /// `testmap::TestWriteMap` (enabled whenever the `test-backing` feature
     /// is on, as the workspace test build has it).
     #[cfg(feature = "test-backing")]

@@ -144,7 +144,7 @@ fn steady_state_annex_only_gc_tree_stays_empty() {
     steady_state_annex_only_gc_tree_stays_empty_inner(EnvFlags::EMPTY);
 }
 
-/// WRITE_MAP in-place twin (ADR-0021 M3 convention): the same steady-state
+/// WRITE_MAP in-place twin (ADR-0021 convention): the same steady-state
 /// churn, but with dirty pages realized in the writable map. The annex draw
 /// (ids reused from the meta's loose pool, not fresh-extended pages — see the
 /// flat `file_size` assertions below) is orthogonal to WRITE_MAP's dirty-page
@@ -212,7 +212,7 @@ fn reader_gate_blocks_annex_draw_then_carry_reclaims() {
     reader_gate_blocks_annex_draw_then_carry_reclaims_inner(EnvFlags::EMPTY);
 }
 
-/// WRITE_MAP in-place twin (ADR-0021 M3 convention) of the parked-reader
+/// WRITE_MAP in-place twin (ADR-0021 convention) of the parked-reader
 /// case: the GC-31 gate and GC-30 carry are meta free-list bookkeeping,
 /// independent of whether dirty pages are realized in the writable map, so
 /// the same growth-then-settle shape must hold. `assert_mode` tripwires that

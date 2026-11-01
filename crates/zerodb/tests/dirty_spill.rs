@@ -295,7 +295,7 @@ fn abort_after_spilling_leaves_the_last_commit() {
     abort_after_spill(EnvFlags::EMPTY);
 }
 
-/// ADR-0021 M3: abort-after-spill under in-place `WRITE_MAP` (TXN-45b) —
+/// ADR-0021: abort-after-spill under in-place `WRITE_MAP` (TXN-45b) —
 /// the "spilled" pages were stored in the map at allocation time and the
 /// spill was pure bookkeeping, so the abort leaves them as unreferenced
 /// scribbles; the last commit survives intact, also across reopen, and the
