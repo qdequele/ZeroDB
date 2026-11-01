@@ -33,506 +33,17 @@ macro_rules! bench_backend {
             // env / database lifecycle
             // ---------------------------------------------------------------
 
-            /// Open (creating if absent) an env at `dir`.
-            pub fn open(dir: &Path, map_size: usize, no_sync: bool, page: u32) -> BEnv {
-                let mut opts = EnvOpenOptions::new().read_txn_without_tls();
-                opts.map_size(map_size);
-                opts.max_dbs(16);
-                bench_backend!(@setpage opts, page, $setpage);
-                let mut flags = EnvFlags::empty();
-                if no_sync {
-                    flags |= EnvFlags::NO_SYNC;
-                }
-                bench_backend!(@nolock flags, $setpage);
-                // `ZERODB_BENCH_WRITE_MAP=1` opens every env, LMDB's and
-                // zerodb's alike, with `WRITE_MAP`: the writable-map write
-                // path and its `msync` commit barriers (SPEC 06 REC-12).
-                if crate::backend::bench_knob("ZERODB_BENCH_WRITE_MAP") {
-                    flags |= EnvFlags::WRITE_MAP;
-                }
-                // SAFETY: single-process, private temp dir; the flags are
-                // NO_SYNC and WRITE_MAP (durability and write path, not
-                // cross-process behaviors) and, on the zerodb side with
-                // `ZERODB_BENCH_NO_LOCK=1`, NO_LOCK, whose contract (no other
-                // process opens the env) a private temp dir in one process
-                // meets.
-                unsafe {
-                    if flags != EnvFlags::empty() {
-                        opts.flags(flags);
-                    }
-                    opts.open(dir)
-                }
-                .expect("open env")
-            }
-
-            /// Create one database. `None` = the unnamed root DB.
-            pub fn create_db(env: &BEnv, name: Option<&str>) -> Db {
-                let mut w = env.write_txn().expect("write_txn");
-                let db = env
-                    .create_database::<Bytes, Bytes>(&mut w, name)
-                    .expect("create_database");
-                w.commit().expect("commit");
-                db
-            }
-
-            /// Create every named database in one txn, in order.
-            pub fn create_dbs(env: &BEnv, names: &[String]) -> Vec<Db> {
-                let mut w = env.write_txn().expect("write_txn");
-                let dbs = names
-                    .iter()
-                    .map(|n| {
-                        env.create_database::<Bytes, Bytes>(&mut w, Some(n.as_str()))
-                            .expect("create_database")
-                    })
-                    .collect();
-                w.commit().expect("commit");
-                dbs
-            }
-
-            /// Create one env per directory in `dirs`, with one named DB, and
-            /// close it — env setup cost per lifetime.
-            ///
-            /// One directory per env, not one directory reused: reopening the
-            /// same path is a *reopen*, and that is `reopen`'s rung. The
-            /// directories are made in the caller's untimed setup so only the
-            /// engine work is measured.
-            pub fn open_create_close(dirs: &[std::path::PathBuf], map_size: usize, page: u32) {
-                for d in dirs {
-                    let e = open(d, map_size, true, page);
-                    let _ = create_db(&e, Some("bench"));
-                    drop(e);
-                }
-            }
-
-            /// Reopen an already-populated env `n` times (no create) — the cost
-            /// of mapping and validating an existing image.
-            pub fn reopen(dir: &Path, map_size: usize, page: u32, n: usize) {
-                for _ in 0..n {
-                    let e = open(dir, map_size, true, page);
-                    drop(e);
-                }
-            }
-
-            /// `n` read txns begun and dropped — reader-table slot pin/unpin.
-            pub fn rotxn_churn(env: &BEnv, n: usize) -> usize {
-                let mut live = 0usize;
-                for _ in 0..n {
-                    let r = env.read_txn().expect("read_txn");
-                    live += 1;
-                    drop(r);
-                }
-                live
-            }
-
-            /// `n` empty write txns begun and committed — the commit floor.
-            pub fn empty_commit_churn(env: &BEnv, n: usize) {
-                for _ in 0..n {
-                    let w = env.write_txn().expect("write_txn");
-                    w.commit().expect("commit");
-                }
-            }
-
             // ---------------------------------------------------------------
             // write path
             // ---------------------------------------------------------------
-
-            /// Insert every key in ONE write txn, then commit (bulk-write shape).
-            pub fn bulk_put(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
-                let mut w = env.write_txn().expect("write_txn");
-                for k in keys {
-                    db.put(&mut w, k.as_slice(), val).expect("put");
-                }
-                w.commit().expect("commit");
-            }
-
-            /// Insert every key in ONE write txn, then abort: the put path
-            /// (descent, page and overflow-frame setup, value copy) without
-            /// the commit's file writes.
-            pub fn bulk_put_abort(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
-                let mut w = env.write_txn().expect("write_txn");
-                for k in keys {
-                    db.put(&mut w, k.as_slice(), val).expect("put");
-                }
-                w.abort();
-            }
-
-            /// Same, with `MDB_APPEND` — keys MUST be ascending.
-            pub fn bulk_put_append(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
-                let mut w = env.write_txn().expect("write_txn");
-                for k in keys {
-                    db.put_with_flags(&mut w, PutFlags::APPEND, k.as_slice(), val)
-                        .expect("put append");
-                }
-                w.commit().expect("commit");
-            }
-
-            /// Same, through `MDB_RESERVE` (milli's document-serialization path).
-            pub fn bulk_put_reserved(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
-                let mut w = env.write_txn().expect("write_txn");
-                for k in keys {
-                    db.put_reserved(&mut w, k.as_slice(), val.len(), |space| {
-                        space.write_all(val)
-                    })
-                    .expect("put_reserved");
-                }
-                w.commit().expect("commit");
-            }
-
-            /// `per_txn` puts per committed txn — isolates commit / barrier cost
-            /// and, as `per_txn` grows, dirty-page write amplification.
-            pub fn commit_churn(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8], per_txn: usize) {
-                for chunk in keys.chunks(per_txn.max(1)) {
-                    let mut w = env.write_txn().expect("write_txn");
-                    for k in chunk {
-                        db.put(&mut w, k.as_slice(), val).expect("put");
-                    }
-                    w.commit().expect("commit");
-                }
-            }
-
-            /// Delete every listed key in one txn; returns the hit count.
-            pub fn delete_keys(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
-                let mut w = env.write_txn().expect("write_txn");
-                let mut hits = 0usize;
-                for k in keys {
-                    if db.delete(&mut w, k.as_slice()).expect("delete") {
-                        hits += 1;
-                    }
-                }
-                w.commit().expect("commit");
-                hits
-            }
-
-            /// `delete_range` over `[lo, hi)` in one txn.
-            pub fn delete_range(env: &BEnv, db: Db, lo: &[u8], hi: &[u8]) -> usize {
-                let mut w = env.write_txn().expect("write_txn");
-                // `Range<&[u8]>` cannot implement `RangeBounds<[u8]>` (the impl
-                // requires `Sized`); the `Bound` tuple is the unsized-key form,
-                // and it states the half-open interval outright.
-                let span = (Bound::Included(lo), Bound::Excluded(hi));
-                let n = db.delete_range(&mut w, &span).expect("delete_range");
-                w.commit().expect("commit");
-                n
-            }
-
-            /// Drain `[keys.first(), keys.last())` through the WRITE CURSOR —
-            /// `range_mut` + `del_current`, the loop milli writes at each of
-            /// its nine `del_current` call sites. Distinct from
-            /// `delete_range`, which materialises the key set and issues point
-            /// deletes: this is the path the `del_current` re-descent item in
-            /// docs/PERF-GAP-VS-LMDB.md is about, and the only
-            /// rung that exercises post-delete cursor position (SPEC 03 §5.4a).
-            pub fn cursor_drain(env: &BEnv, db: Db, keys: &[Vec<u8>], _val: &[u8]) {
-                let (Some(lo), Some(hi)) = (keys.first(), keys.last()) else {
-                    return;
-                };
-                let mut w = env.write_txn().expect("write_txn");
-                {
-                    let span = (
-                        Bound::Included(lo.as_slice()),
-                        Bound::Excluded(hi.as_slice()),
-                    );
-                    let mut it = db.range_mut(&mut w, &span).expect("range_mut");
-                    while it.next().is_some() {
-                        // SAFETY: the entry borrow from `next` is dropped with
-                        // the condition's temporary, before this call.
-                        unsafe { it.del_current() }.expect("del_current");
-                    }
-                }
-                w.commit().expect("commit");
-            }
-
-            /// The same span as [`cursor_drain`], drained BACKWARD through the
-            /// write cursor (`rev_range_mut` + `del_current`). Every leaf it
-            /// empties is its parent's child >= 1 until the walk reaches the
-            /// span's first leaf, so its rebalances pair with the LEFT
-            /// sibling, and each step after a delete is a `prev` from the
-            /// vacated slot (SPEC 03 §5.4a).
-            pub fn cursor_rev_drain(env: &BEnv, db: Db, keys: &[Vec<u8>], _val: &[u8]) {
-                let (Some(lo), Some(hi)) = (keys.first(), keys.last()) else {
-                    return;
-                };
-                let mut w = env.write_txn().expect("write_txn");
-                {
-                    let span = (
-                        Bound::Included(lo.as_slice()),
-                        Bound::Excluded(hi.as_slice()),
-                    );
-                    let mut it = db.rev_range_mut(&mut w, &span).expect("rev_range_mut");
-                    while it.next().is_some() {
-                        // SAFETY: the entry borrow from `next` is dropped with
-                        // the condition's temporary, before this call.
-                        unsafe { it.del_current() }.expect("del_current");
-                    }
-                }
-                w.commit().expect("commit");
-            }
-
-            /// Rewrite every value in `[keys.first(), keys.last()]` through the
-            /// WRITE CURSOR — `range_mut` + `put_current`, the read-modify-write
-            /// loop milli and hannoy run over stored entries. Distinct from
-            /// `bulk_put` over existing keys, which reaches each entry by key:
-            /// this is the only rung where the cursor's position after a put
-            /// costs anything.
-            pub fn cursor_rewrite(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
-                let (Some(lo), Some(hi)) = (keys.first(), keys.last()) else {
-                    return;
-                };
-                let mut w = env.write_txn().expect("write_txn");
-                {
-                    let span = (
-                        Bound::Included(lo.as_slice()),
-                        Bound::Included(hi.as_slice()),
-                    );
-                    let mut it = db.range_mut(&mut w, &span).expect("range_mut");
-                    let mut key = Vec::new();
-                    while let Some(kv) = it.next() {
-                        let (k, _) = kv.expect("entry");
-                        key.clear();
-                        key.extend_from_slice(k);
-                        // SAFETY: the key was copied out and the entry borrow
-                        // from `next` is dead before this call.
-                        unsafe { it.put_current(&key, val) }.expect("put_current");
-                    }
-                }
-                w.commit().expect("commit");
-            }
-
-            /// Drop every entry (`MDB_DROP` with the handle kept).
-            pub fn clear_db(env: &BEnv, db: Db) {
-                let mut w = env.write_txn().expect("write_txn");
-                db.clear(&mut w).expect("clear");
-                w.commit().expect("commit");
-            }
-
-            /// Delete then re-insert the same keys, one committed txn each way,
-            /// `rounds` times — freelist / GC churn (pages must be reclaimed and
-            /// handed back out).
-            pub fn delete_reinsert(
-                env: &BEnv,
-                db: Db,
-                keys: &[Vec<u8>],
-                val: &[u8],
-                rounds: usize,
-            ) {
-                for _ in 0..rounds {
-                    let mut w = env.write_txn().expect("write_txn");
-                    for k in keys {
-                        db.delete(&mut w, k.as_slice()).expect("delete");
-                    }
-                    w.commit().expect("commit");
-                    let mut w = env.write_txn().expect("write_txn");
-                    for k in keys {
-                        db.put(&mut w, k.as_slice(), val).expect("put");
-                    }
-                    w.commit().expect("commit");
-                }
-            }
 
             // ---------------------------------------------------------------
             // read path
             // ---------------------------------------------------------------
 
-            /// Point lookups; returns the hit count so the reads can't be elided.
-            pub fn point_get(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
-                let r = env.read_txn().expect("read_txn");
-                let mut hits = 0usize;
-                for k in keys {
-                    if db.get(&r, k.as_slice()).expect("get").is_some() {
-                        hits += 1;
-                    }
-                }
-                hits
-            }
-
-            /// One read txn per lookup: begin, one `get`, drop — the shape of
-            /// one search request, and of rust-storage-bench's YCSB reads.
-            pub fn point_get_txn_each(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
-                let mut hits = 0usize;
-                for k in keys {
-                    let r = env.read_txn().expect("read_txn");
-                    if db.get(&r, k.as_slice()).expect("get").is_some() {
-                        hits += 1;
-                    }
-                }
-                hits
-            }
-
-            /// Point lookups that also READ the returned value's first and last
-            /// byte through `black_box` — unlike `point_get`, this cannot let an
-            /// overflow-value rung (`v4k`, `v2page`) skip the actual page-chase
-            /// and memcpy of the value bytes.
-            pub fn point_get_touch(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
-                let r = env.read_txn().expect("read_txn");
-                let mut hits = 0usize;
-                for k in keys {
-                    if let Some(v) = db.get(&r, k.as_slice()).expect("get") {
-                        if !v.is_empty() {
-                            black_box(v[0]);
-                            black_box(v[v.len() - 1]);
-                        }
-                        hits += 1;
-                    }
-                }
-                hits
-            }
-
-            /// Point lookups spread over `dbs` round-robin — the multi-named-DB
-            /// rung (catalog resolution repeated against different records).
-            pub fn point_get_multi(env: &BEnv, dbs: &[Db], keys: &[Vec<u8>]) -> usize {
-                let r = env.read_txn().expect("read_txn");
-                let mut hits = 0usize;
-                for (i, k) in keys.iter().enumerate() {
-                    if dbs[i % dbs.len()]
-                        .get(&r, k.as_slice())
-                        .expect("get")
-                        .is_some()
-                    {
-                        hits += 1;
-                    }
-                }
-                hits
-            }
-
-            /// The same key `n` times in one txn — pure per-call overhead with
-            /// every page already resident and every memo warm.
-            pub fn point_get_hot(env: &BEnv, db: Db, key: &[u8], n: usize) -> usize {
-                let r = env.read_txn().expect("read_txn");
-                let mut bytes = 0usize;
-                for _ in 0..n {
-                    bytes += db.get(&r, key).expect("get").map_or(0, |v| v.len());
-                }
-                bytes
-            }
-
-            /// Full forward cursor scan; returns the entry count.
-            pub fn scan(env: &BEnv, db: Db) -> usize {
-                let r = env.read_txn().expect("read_txn");
-                let mut n = 0usize;
-                for kv in db.iter(&r).expect("iter") {
-                    let _ = kv.expect("entry");
-                    n += 1;
-                }
-                n
-            }
-
-            /// Full reverse cursor scan.
-            pub fn rev_scan(env: &BEnv, db: Db) -> usize {
-                let r = env.read_txn().expect("read_txn");
-                let mut n = 0usize;
-                for kv in db.rev_iter(&r).expect("rev_iter") {
-                    let _ = kv.expect("entry");
-                    n += 1;
-                }
-                n
-            }
-
-            /// `iter.skip(skip).take(take)`, touching each yielded key and
-            /// value — the paged-listing shape (`OFFSET … LIMIT …`). `skip`
-            /// reaches the iterator's `nth`.
-            pub fn skip_take(env: &BEnv, db: Db, skip: usize, take: usize) -> usize {
-                let r = env.read_txn().expect("read_txn");
-                let mut n = 0usize;
-                for kv in db.iter(&r).expect("iter").skip(skip).take(take) {
-                    let (k, v) = kv.expect("entry");
-                    black_box((k, v));
-                    n += 1;
-                }
-                n
-            }
-
-            /// [`skip_take`] over the reverse iterator.
-            pub fn rev_skip_take(env: &BEnv, db: Db, skip: usize, take: usize) -> usize {
-                let r = env.read_txn().expect("read_txn");
-                let mut n = 0usize;
-                for kv in db.rev_iter(&r).expect("rev_iter").skip(skip).take(take) {
-                    let (k, v) = kv.expect("entry");
-                    black_box((k, v));
-                    n += 1;
-                }
-                n
-            }
-
-            /// Bounded range scan over `[lo, hi)`.
-            pub fn range_scan(env: &BEnv, db: Db, lo: &[u8], hi: &[u8]) -> usize {
-                let r = env.read_txn().expect("read_txn");
-                let mut n = 0usize;
-                let span = (Bound::Included(lo), Bound::Excluded(hi));
-                for kv in db.range(&r, &span).expect("range") {
-                    let _ = kv.expect("entry");
-                    n += 1;
-                }
-                n
-            }
-
-            /// Prefix scan.
-            pub fn prefix_scan(env: &BEnv, db: Db, prefix: &[u8]) -> usize {
-                let r = env.read_txn().expect("read_txn");
-                let mut n = 0usize;
-                for kv in db.prefix_iter(&r, prefix).expect("prefix_iter") {
-                    let _ = kv.expect("entry");
-                    n += 1;
-                }
-                n
-            }
-
-            /// `first` + `last`, `n` times — leftmost / rightmost descent only.
-            pub fn first_last(env: &BEnv, db: Db, n: usize) -> usize {
-                let r = env.read_txn().expect("read_txn");
-                let mut bytes = 0usize;
-                for _ in 0..n {
-                    bytes += db.first(&r).expect("first").map_or(0, |(k, _)| k.len());
-                    bytes += db.last(&r).expect("last").map_or(0, |(k, _)| k.len());
-                }
-                bytes
-            }
-
-            /// `len`, `n` times — the DB-record read, no tree walk.
-            pub fn db_len(env: &BEnv, db: Db, n: usize) -> usize {
-                let r = env.read_txn().expect("read_txn");
-                let mut total = 0usize;
-                for _ in 0..n {
-                    total = total.wrapping_add(db.len(&r).expect("len") as usize);
-                }
-                total
-            }
-
-            /// `MDB_SET_RANGE`-shaped seeks: a fresh positioned descent per probe
-            /// with no sequential locality for a leaf memo to exploit.
-            pub fn seek_ge(env: &BEnv, db: Db, probes: &[Vec<u8>]) -> usize {
-                let r = env.read_txn().expect("read_txn");
-                let mut hits = 0usize;
-                for k in probes {
-                    if db
-                        .get_greater_than_or_equal_to(&r, k.as_slice())
-                        .expect("seek")
-                        .is_some()
-                    {
-                        hits += 1;
-                    }
-                }
-                hits
-            }
-
             // ---------------------------------------------------------------
             // composite / maintenance
             // ---------------------------------------------------------------
-
-            /// milli-shaped: one write txn touching every named DB round-robin,
-            /// each put immediately read back (extractor → write_db pattern).
-            pub fn mixed_rw(env: &BEnv, dbs: &[Db], keys: &[Vec<u8>], val: &[u8]) -> usize {
-                let mut hits = 0usize;
-                let mut w = env.write_txn().expect("write_txn");
-                for (i, k) in keys.iter().enumerate() {
-                    let db = dbs[i % dbs.len()];
-                    db.put(&mut w, k.as_slice(), val).expect("put");
-                    if db.get(&w, k.as_slice()).expect("get").is_some() {
-                        hits += 1;
-                    }
-                }
-                w.commit().expect("commit");
-                hits
-            }
 
             /// A single forward scan that checks `stop` every `chunk` entries
             /// instead of only at end-of-scan, so a reader notices the writer is
@@ -568,122 +79,6 @@ macro_rules! bench_backend {
                 }
             }
 
-            /// `readers` threads full-scanning in a loop (polling `stop` every
-            /// 1024 entries) while this thread commits `batches` write txns.
-            /// Returns the ELAPSED TIME OF THE WRITER LOOP ONLY — from the first
-            /// `write_txn` to the last `commit` — so the caller's criterion
-            /// `iter_custom` times exactly the writer's work under concurrent
-            /// reader pressure, not the reader threads' join tail or the
-            /// fixture's drop.
-            pub fn writer_under_readers(
-                env: &BEnv,
-                db: Db,
-                keys: &[Vec<u8>],
-                val: &[u8],
-                readers: usize,
-                batches: usize,
-                per_batch: usize,
-            ) -> Duration {
-                const READER_STOP_POLL_CHUNK: usize = 1024;
-                let stop = AtomicBool::new(false);
-                let ready = AtomicUsize::new(0);
-                let started = AtomicBool::new(false);
-                std::thread::scope(|s| {
-                    for _ in 0..readers {
-                        s.spawn(|| {
-                            let mut first = Some((&ready, &started));
-                            while !stop.load(Ordering::Relaxed) {
-                                scan_chunked_until_stop(
-                                    env,
-                                    db,
-                                    &stop,
-                                    READER_STOP_POLL_CHUNK,
-                                    first.take(),
-                                );
-                            }
-                        });
-                    }
-                    // Time the writer only once every reader holds a read txn.
-                    while ready.load(Ordering::Acquire) < readers {
-                        std::thread::yield_now();
-                    }
-                    let start = Instant::now();
-                    // Release the readers only after t0: each still holds the
-                    // read txn it opened, so all of them are live when timing
-                    // begins.
-                    started.store(true, Ordering::Release);
-                    for b in 0..batches {
-                        let lo = (b * per_batch) % keys.len();
-                        let hi = (lo + per_batch).min(keys.len());
-                        let mut w = env.write_txn().expect("write_txn");
-                        for k in &keys[lo..hi] {
-                            db.put(&mut w, k.as_slice(), val).expect("put");
-                        }
-                        w.commit().expect("commit");
-                    }
-                    let elapsed = start.elapsed();
-                    stop.store(true, Ordering::Relaxed);
-                    elapsed
-                })
-            }
-
-            /// `non_free_pages_size()` — the used-bytes figure milli reads
-            /// before every register write txn and after every batch. Neither
-            /// engine touches the free list: LMDB sums `mdb_stat` per database
-            /// (`mdb_env_stat` + one `mdb_stat` per DB), zerodb sums the same
-            /// page counts from its catalog records (SPEC 05 GC-23). Returned so
-            /// neither engine's call can be elided.
-            pub fn non_free_size(env: &BEnv) -> u64 {
-                env.non_free_pages_size().expect("non_free_pages_size")
-            }
-
-            /// Build an env whose free DB holds MANY small entries — the regime
-            /// a free-list walk in `non_free_size` would pay for. Fill one named DB,
-            /// then delete it in `commits` separate committed txns while a reader
-            /// pinned at the just-filled snapshot blocks reclamation (the
-            /// oldest-reader gate): every commit's freed pages accumulate as
-            /// their own GC entry instead of recycling the previous one, so the
-            /// free list ends fragmented into ~`commits` PILs. Untimed setup for
-            /// the `env/stat/non_free` rung; returns the env with the DB loaded.
-            pub fn build_fragmented_free(
-                dir: &Path,
-                map_size: usize,
-                page: u32,
-                keys: &[Vec<u8>],
-                val: &[u8],
-                commits: usize,
-            ) -> BEnv {
-                let env = open(dir, map_size, true, page);
-                let db = create_db(&env, Some("bench"));
-                bulk_put(&env, db, keys, val);
-                let pin = env.read_txn().expect("read_txn");
-                let commits = commits.max(1);
-                let per = keys.len().div_ceil(commits).max(1);
-                for chunk in keys.chunks(per) {
-                    let mut w = env.write_txn().expect("write_txn");
-                    for k in chunk {
-                        db.delete(&mut w, k.as_slice()).expect("delete");
-                    }
-                    w.commit().expect("commit");
-                }
-                // The pin has done its job: the freed pages are committed and,
-                // with no further writer, stay un-reclaimed. Drop it so the
-                // timed reads open against an empty reader table.
-                drop(pin);
-                env
-            }
-
-            /// `mdb_env_copy2` into `dest`, compacting or raw.
-            pub fn copy_to(env: &BEnv, dest: &Path, compact: bool) {
-                let mut f = File::create(dest).expect("create copy dest");
-                let opt = if compact {
-                    CompactionOption::Enabled
-                } else {
-                    CompactionOption::Disabled
-                };
-                env.copy_to_file(&mut f, opt).expect("copy_to_file");
-            }
-
             /// Zero-sized marker so the generic rung shapes in `harness.rs` can
             /// name this backend as a type parameter.
             pub struct Marker;
@@ -693,67 +88,277 @@ macro_rules! bench_backend {
                 type Env = BEnv;
                 type Db = Db;
 
+                /// Open (creating if absent) an env at `dir`.
                 fn open(dir: &Path, map_size: usize, no_sync: bool, page: u32) -> BEnv {
-                    open(dir, map_size, no_sync, page)
-                }
-                fn create_db(env: &BEnv, name: Option<&str>) -> Db {
-                    create_db(env, name)
-                }
-                fn create_dbs(env: &BEnv, names: &[String]) -> Vec<Db> {
-                    create_dbs(env, names)
-                }
-                fn open_create_close(dirs: &[std::path::PathBuf], map_size: usize, page: u32) {
-                    open_create_close(dirs, map_size, page)
-                }
-                fn reopen(dir: &Path, map_size: usize, page: u32, n: usize) {
-                    reopen(dir, map_size, page, n)
-                }
-                fn rotxn_churn(env: &BEnv, n: usize) -> usize {
-                    rotxn_churn(env, n)
-                }
-                fn empty_commit_churn(env: &BEnv, n: usize) {
-                    empty_commit_churn(env, n)
+                    let mut opts = EnvOpenOptions::new().read_txn_without_tls();
+                    opts.map_size(map_size);
+                    opts.max_dbs(16);
+                    bench_backend!(@setpage opts, page, $setpage);
+                    let mut flags = EnvFlags::empty();
+                    if no_sync {
+                        flags |= EnvFlags::NO_SYNC;
+                    }
+                    bench_backend!(@nolock flags, $setpage);
+                    // `ZERODB_BENCH_WRITE_MAP=1` opens every env, LMDB's and
+                    // zerodb's alike, with `WRITE_MAP`: the writable-map write
+                    // path and its `msync` commit barriers (SPEC 06 REC-12).
+                    if crate::backend::bench_knob("ZERODB_BENCH_WRITE_MAP") {
+                        flags |= EnvFlags::WRITE_MAP;
+                    }
+                    // SAFETY: single-process, private temp dir; the flags are
+                    // NO_SYNC and WRITE_MAP (durability and write path, not
+                    // cross-process behaviors) and, on the zerodb side with
+                    // `ZERODB_BENCH_NO_LOCK=1`, NO_LOCK, whose contract (no other
+                    // process opens the env) a private temp dir in one process
+                    // meets.
+                    unsafe {
+                        if flags != EnvFlags::empty() {
+                            opts.flags(flags);
+                        }
+                        opts.open(dir)
+                    }
+                    .expect("open env")
                 }
 
+                /// Create one database. `None` = the unnamed root DB.
+                fn create_db(env: &BEnv, name: Option<&str>) -> Db {
+                    let mut w = env.write_txn().expect("write_txn");
+                    let db = env
+                        .create_database::<Bytes, Bytes>(&mut w, name)
+                        .expect("create_database");
+                    w.commit().expect("commit");
+                    db
+                }
+
+                /// Create every named database in one txn, in order.
+                fn create_dbs(env: &BEnv, names: &[String]) -> Vec<Db> {
+                    let mut w = env.write_txn().expect("write_txn");
+                    let dbs = names
+                        .iter()
+                        .map(|n| {
+                            env.create_database::<Bytes, Bytes>(&mut w, Some(n.as_str()))
+                                .expect("create_database")
+                        })
+                        .collect();
+                    w.commit().expect("commit");
+                    dbs
+                }
+
+                /// Create one env per directory in `dirs`, with one named DB, and
+                /// close it — env setup cost per lifetime.
+                ///
+                /// One directory per env, not one directory reused: reopening the
+                /// same path is a *reopen*, and that is `reopen`'s rung. The
+                /// directories are made in the caller's untimed setup so only the
+                /// engine work is measured.
+                fn open_create_close(dirs: &[std::path::PathBuf], map_size: usize, page: u32) {
+                    for d in dirs {
+                        let e = Self::open(d, map_size, true, page);
+                        let _ = Self::create_db(&e, Some("bench"));
+                        drop(e);
+                    }
+                }
+
+                /// Reopen an already-populated env `n` times (no create) — the cost
+                /// of mapping and validating an existing image.
+                fn reopen(dir: &Path, map_size: usize, page: u32, n: usize) {
+                    for _ in 0..n {
+                        let e = Self::open(dir, map_size, true, page);
+                        drop(e);
+                    }
+                }
+
+                /// `n` read txns begun and dropped — reader-table slot pin/unpin.
+                fn rotxn_churn(env: &BEnv, n: usize) -> usize {
+                    let mut live = 0usize;
+                    for _ in 0..n {
+                        let r = env.read_txn().expect("read_txn");
+                        live += 1;
+                        drop(r);
+                    }
+                    live
+                }
+
+                /// `n` empty write txns begun and committed — the commit floor.
+                fn empty_commit_churn(env: &BEnv, n: usize) {
+                    for _ in 0..n {
+                        let w = env.write_txn().expect("write_txn");
+                        w.commit().expect("commit");
+                    }
+                }
+
+                /// Insert every key in ONE write txn, then commit (bulk-write shape).
                 fn bulk_put(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
-                    bulk_put(env, db, keys, val)
+                    let mut w = env.write_txn().expect("write_txn");
+                    for k in keys {
+                        db.put(&mut w, k.as_slice(), val).expect("put");
+                    }
+                    w.commit().expect("commit");
                 }
+
+                /// Insert every key in ONE write txn, then abort: the put path
+                /// (descent, page and overflow-frame setup, value copy) without
+                /// the commit's file writes.
                 fn bulk_put_abort(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
-                    bulk_put_abort(env, db, keys, val)
+                    let mut w = env.write_txn().expect("write_txn");
+                    for k in keys {
+                        db.put(&mut w, k.as_slice(), val).expect("put");
+                    }
+                    w.abort();
                 }
+
+                /// Same, with `MDB_APPEND` — keys MUST be ascending.
                 fn bulk_put_append(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
-                    bulk_put_append(env, db, keys, val)
+                    let mut w = env.write_txn().expect("write_txn");
+                    for k in keys {
+                        db.put_with_flags(&mut w, PutFlags::APPEND, k.as_slice(), val)
+                            .expect("put append");
+                    }
+                    w.commit().expect("commit");
                 }
+
+                /// Same, through `MDB_RESERVE` (milli's document-serialization path).
                 fn bulk_put_reserved(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
-                    bulk_put_reserved(env, db, keys, val)
+                    let mut w = env.write_txn().expect("write_txn");
+                    for k in keys {
+                        db.put_reserved(&mut w, k.as_slice(), val.len(), |space| {
+                            space.write_all(val)
+                        })
+                        .expect("put_reserved");
+                    }
+                    w.commit().expect("commit");
                 }
-                fn commit_churn(
-                    env: &BEnv,
-                    db: Db,
-                    keys: &[Vec<u8>],
-                    val: &[u8],
-                    per_txn: usize,
-                ) {
-                    commit_churn(env, db, keys, val, per_txn)
+
+                /// `per_txn` puts per committed txn — isolates commit / barrier cost
+                /// and, as `per_txn` grows, dirty-page write amplification.
+                fn commit_churn(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8], per_txn: usize) {
+                    for chunk in keys.chunks(per_txn.max(1)) {
+                        let mut w = env.write_txn().expect("write_txn");
+                        for k in chunk {
+                            db.put(&mut w, k.as_slice(), val).expect("put");
+                        }
+                        w.commit().expect("commit");
+                    }
                 }
+
+                /// Delete every listed key in one txn; returns the hit count.
                 fn delete_keys(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
-                    delete_keys(env, db, keys)
+                    let mut w = env.write_txn().expect("write_txn");
+                    let mut hits = 0usize;
+                    for k in keys {
+                        if db.delete(&mut w, k.as_slice()).expect("delete") {
+                            hits += 1;
+                        }
+                    }
+                    w.commit().expect("commit");
+                    hits
                 }
+
+                /// `delete_range` over `[lo, hi)` in one txn.
                 fn delete_range(env: &BEnv, db: Db, lo: &[u8], hi: &[u8]) -> usize {
-                    delete_range(env, db, lo, hi)
+                    let mut w = env.write_txn().expect("write_txn");
+                    // `Range<&[u8]>` cannot implement `RangeBounds<[u8]>` (the impl
+                    // requires `Sized`); the `Bound` tuple is the unsized-key form,
+                    // and it states the half-open interval outright.
+                    let span = (Bound::Included(lo), Bound::Excluded(hi));
+                    let n = db.delete_range(&mut w, &span).expect("delete_range");
+                    w.commit().expect("commit");
+                    n
                 }
+
+                /// Drop every entry (`MDB_DROP` with the handle kept).
                 fn clear_db(env: &BEnv, db: Db) {
-                    clear_db(env, db)
+                    let mut w = env.write_txn().expect("write_txn");
+                    db.clear(&mut w).expect("clear");
+                    w.commit().expect("commit");
                 }
-                fn cursor_drain(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
-                    cursor_drain(env, db, keys, val)
+
+                /// Drain `[keys.first(), keys.last())` through the WRITE CURSOR —
+                /// `range_mut` + `del_current`, the loop milli writes at each of
+                /// its nine `del_current` call sites. Distinct from
+                /// `delete_range`, which materialises the key set and issues point
+                /// deletes: this is the path the `del_current` re-descent item in
+                /// docs/PERF-GAP-VS-LMDB.md is about, and the only
+                /// rung that exercises post-delete cursor position (SPEC 03 §5.4a).
+                fn cursor_drain(env: &BEnv, db: Db, keys: &[Vec<u8>], _val: &[u8]) {
+                    let (Some(lo), Some(hi)) = (keys.first(), keys.last()) else {
+                        return;
+                    };
+                    let mut w = env.write_txn().expect("write_txn");
+                    {
+                        let span = (
+                            Bound::Included(lo.as_slice()),
+                            Bound::Excluded(hi.as_slice()),
+                        );
+                        let mut it = db.range_mut(&mut w, &span).expect("range_mut");
+                        while it.next().is_some() {
+                            // SAFETY: the entry borrow from `next` is dropped with
+                            // the condition's temporary, before this call.
+                            unsafe { it.del_current() }.expect("del_current");
+                        }
+                    }
+                    w.commit().expect("commit");
                 }
-                fn cursor_rev_drain(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
-                    cursor_rev_drain(env, db, keys, val)
+
+                /// The same span as [`cursor_drain`], drained BACKWARD through the
+                /// write cursor (`rev_range_mut` + `del_current`). Every leaf it
+                /// empties is its parent's child >= 1 until the walk reaches the
+                /// span's first leaf, so its rebalances pair with the LEFT
+                /// sibling, and each step after a delete is a `prev` from the
+                /// vacated slot (SPEC 03 §5.4a).
+                fn cursor_rev_drain(env: &BEnv, db: Db, keys: &[Vec<u8>], _val: &[u8]) {
+                    let (Some(lo), Some(hi)) = (keys.first(), keys.last()) else {
+                        return;
+                    };
+                    let mut w = env.write_txn().expect("write_txn");
+                    {
+                        let span = (
+                            Bound::Included(lo.as_slice()),
+                            Bound::Excluded(hi.as_slice()),
+                        );
+                        let mut it = db.rev_range_mut(&mut w, &span).expect("rev_range_mut");
+                        while it.next().is_some() {
+                            // SAFETY: the entry borrow from `next` is dropped with
+                            // the condition's temporary, before this call.
+                            unsafe { it.del_current() }.expect("del_current");
+                        }
+                    }
+                    w.commit().expect("commit");
                 }
+
+                /// Rewrite every value in `[keys.first(), keys.last()]` through the
+                /// WRITE CURSOR — `range_mut` + `put_current`, the read-modify-write
+                /// loop milli and hannoy run over stored entries. Distinct from
+                /// `bulk_put` over existing keys, which reaches each entry by key:
+                /// this is the only rung where the cursor's position after a put
+                /// costs anything.
                 fn cursor_rewrite(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
-                    cursor_rewrite(env, db, keys, val)
+                    let (Some(lo), Some(hi)) = (keys.first(), keys.last()) else {
+                        return;
+                    };
+                    let mut w = env.write_txn().expect("write_txn");
+                    {
+                        let span = (
+                            Bound::Included(lo.as_slice()),
+                            Bound::Included(hi.as_slice()),
+                        );
+                        let mut it = db.range_mut(&mut w, &span).expect("range_mut");
+                        let mut key = Vec::new();
+                        while let Some(kv) = it.next() {
+                            let (k, _) = kv.expect("entry");
+                            key.clear();
+                            key.extend_from_slice(k);
+                            // SAFETY: the key was copied out and the entry borrow
+                            // from `next` is dead before this call.
+                            unsafe { it.put_current(&key, val) }.expect("put_current");
+                        }
+                    }
+                    w.commit().expect("commit");
                 }
+
+                /// Delete then re-insert the same keys, one committed txn each way,
+                /// `rounds` times — freelist / GC churn (pages must be reclaimed and
+                /// handed back out).
                 fn delete_reinsert(
                     env: &BEnv,
                     db: Db,
@@ -761,55 +366,224 @@ macro_rules! bench_backend {
                     val: &[u8],
                     rounds: usize,
                 ) {
-                    delete_reinsert(env, db, keys, val, rounds)
+                    for _ in 0..rounds {
+                        let mut w = env.write_txn().expect("write_txn");
+                        for k in keys {
+                            db.delete(&mut w, k.as_slice()).expect("delete");
+                        }
+                        w.commit().expect("commit");
+                        let mut w = env.write_txn().expect("write_txn");
+                        for k in keys {
+                            db.put(&mut w, k.as_slice(), val).expect("put");
+                        }
+                        w.commit().expect("commit");
+                    }
                 }
 
+                /// Point lookups; returns the hit count so the reads can't be elided.
                 fn point_get(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
-                    point_get(env, db, keys)
-                }
-                fn point_get_txn_each(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
-                    point_get_txn_each(env, db, keys)
-                }
-                fn point_get_touch(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
-                    point_get_touch(env, db, keys)
-                }
-                fn point_get_multi(env: &BEnv, dbs: &[Db], keys: &[Vec<u8>]) -> usize {
-                    point_get_multi(env, dbs, keys)
-                }
-                fn point_get_hot(env: &BEnv, db: Db, key: &[u8], n: usize) -> usize {
-                    point_get_hot(env, db, key, n)
-                }
-                fn scan(env: &BEnv, db: Db) -> usize {
-                    scan(env, db)
-                }
-                fn rev_scan(env: &BEnv, db: Db) -> usize {
-                    rev_scan(env, db)
-                }
-                fn skip_take(env: &BEnv, db: Db, skip: usize, take: usize) -> usize {
-                    skip_take(env, db, skip, take)
-                }
-                fn rev_skip_take(env: &BEnv, db: Db, skip: usize, take: usize) -> usize {
-                    rev_skip_take(env, db, skip, take)
-                }
-                fn range_scan(env: &BEnv, db: Db, lo: &[u8], hi: &[u8]) -> usize {
-                    range_scan(env, db, lo, hi)
-                }
-                fn prefix_scan(env: &BEnv, db: Db, prefix: &[u8]) -> usize {
-                    prefix_scan(env, db, prefix)
-                }
-                fn first_last(env: &BEnv, db: Db, n: usize) -> usize {
-                    first_last(env, db, n)
-                }
-                fn db_len(env: &BEnv, db: Db, n: usize) -> usize {
-                    db_len(env, db, n)
-                }
-                fn seek_ge(env: &BEnv, db: Db, probes: &[Vec<u8>]) -> usize {
-                    seek_ge(env, db, probes)
+                    let r = env.read_txn().expect("read_txn");
+                    let mut hits = 0usize;
+                    for k in keys {
+                        if db.get(&r, k.as_slice()).expect("get").is_some() {
+                            hits += 1;
+                        }
+                    }
+                    hits
                 }
 
-                fn mixed_rw(env: &BEnv, dbs: &[Db], keys: &[Vec<u8>], val: &[u8]) -> usize {
-                    mixed_rw(env, dbs, keys, val)
+                /// One read txn per lookup: begin, one `get`, drop — the shape of
+                /// one search request, and of rust-storage-bench's YCSB reads.
+                fn point_get_txn_each(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
+                    let mut hits = 0usize;
+                    for k in keys {
+                        let r = env.read_txn().expect("read_txn");
+                        if db.get(&r, k.as_slice()).expect("get").is_some() {
+                            hits += 1;
+                        }
+                    }
+                    hits
                 }
+
+                /// Point lookups that also READ the returned value's first and last
+                /// byte through `black_box` — unlike `point_get`, this cannot let an
+                /// overflow-value rung (`v4k`, `v2page`) skip the actual page-chase
+                /// and memcpy of the value bytes.
+                fn point_get_touch(env: &BEnv, db: Db, keys: &[Vec<u8>]) -> usize {
+                    let r = env.read_txn().expect("read_txn");
+                    let mut hits = 0usize;
+                    for k in keys {
+                        if let Some(v) = db.get(&r, k.as_slice()).expect("get") {
+                            if !v.is_empty() {
+                                black_box(v[0]);
+                                black_box(v[v.len() - 1]);
+                            }
+                            hits += 1;
+                        }
+                    }
+                    hits
+                }
+
+                /// Point lookups spread over `dbs` round-robin — the multi-named-DB
+                /// rung (catalog resolution repeated against different records).
+                fn point_get_multi(env: &BEnv, dbs: &[Db], keys: &[Vec<u8>]) -> usize {
+                    let r = env.read_txn().expect("read_txn");
+                    let mut hits = 0usize;
+                    for (i, k) in keys.iter().enumerate() {
+                        if dbs[i % dbs.len()]
+                            .get(&r, k.as_slice())
+                            .expect("get")
+                            .is_some()
+                        {
+                            hits += 1;
+                        }
+                    }
+                    hits
+                }
+
+                /// The same key `n` times in one txn — pure per-call overhead with
+                /// every page already resident and every memo warm.
+                fn point_get_hot(env: &BEnv, db: Db, key: &[u8], n: usize) -> usize {
+                    let r = env.read_txn().expect("read_txn");
+                    let mut bytes = 0usize;
+                    for _ in 0..n {
+                        bytes += db.get(&r, key).expect("get").map_or(0, |v| v.len());
+                    }
+                    bytes
+                }
+
+                /// Full forward cursor scan; returns the entry count.
+                fn scan(env: &BEnv, db: Db) -> usize {
+                    let r = env.read_txn().expect("read_txn");
+                    let mut n = 0usize;
+                    for kv in db.iter(&r).expect("iter") {
+                        let _ = kv.expect("entry");
+                        n += 1;
+                    }
+                    n
+                }
+
+                /// Full reverse cursor scan.
+                fn rev_scan(env: &BEnv, db: Db) -> usize {
+                    let r = env.read_txn().expect("read_txn");
+                    let mut n = 0usize;
+                    for kv in db.rev_iter(&r).expect("rev_iter") {
+                        let _ = kv.expect("entry");
+                        n += 1;
+                    }
+                    n
+                }
+
+                /// `iter.skip(skip).take(take)`, touching each yielded key and
+                /// value — the paged-listing shape (`OFFSET … LIMIT …`). `skip`
+                /// reaches the iterator's `nth`.
+                fn skip_take(env: &BEnv, db: Db, skip: usize, take: usize) -> usize {
+                    let r = env.read_txn().expect("read_txn");
+                    let mut n = 0usize;
+                    for kv in db.iter(&r).expect("iter").skip(skip).take(take) {
+                        let (k, v) = kv.expect("entry");
+                        black_box((k, v));
+                        n += 1;
+                    }
+                    n
+                }
+
+                /// [`skip_take`] over the reverse iterator.
+                fn rev_skip_take(env: &BEnv, db: Db, skip: usize, take: usize) -> usize {
+                    let r = env.read_txn().expect("read_txn");
+                    let mut n = 0usize;
+                    for kv in db.rev_iter(&r).expect("rev_iter").skip(skip).take(take) {
+                        let (k, v) = kv.expect("entry");
+                        black_box((k, v));
+                        n += 1;
+                    }
+                    n
+                }
+
+                /// Bounded range scan over `[lo, hi)`.
+                fn range_scan(env: &BEnv, db: Db, lo: &[u8], hi: &[u8]) -> usize {
+                    let r = env.read_txn().expect("read_txn");
+                    let mut n = 0usize;
+                    let span = (Bound::Included(lo), Bound::Excluded(hi));
+                    for kv in db.range(&r, &span).expect("range") {
+                        let _ = kv.expect("entry");
+                        n += 1;
+                    }
+                    n
+                }
+
+                /// Prefix scan.
+                fn prefix_scan(env: &BEnv, db: Db, prefix: &[u8]) -> usize {
+                    let r = env.read_txn().expect("read_txn");
+                    let mut n = 0usize;
+                    for kv in db.prefix_iter(&r, prefix).expect("prefix_iter") {
+                        let _ = kv.expect("entry");
+                        n += 1;
+                    }
+                    n
+                }
+
+                /// `first` + `last`, `n` times — leftmost / rightmost descent only.
+                fn first_last(env: &BEnv, db: Db, n: usize) -> usize {
+                    let r = env.read_txn().expect("read_txn");
+                    let mut bytes = 0usize;
+                    for _ in 0..n {
+                        bytes += db.first(&r).expect("first").map_or(0, |(k, _)| k.len());
+                        bytes += db.last(&r).expect("last").map_or(0, |(k, _)| k.len());
+                    }
+                    bytes
+                }
+
+                /// `len`, `n` times — the DB-record read, no tree walk.
+                fn db_len(env: &BEnv, db: Db, n: usize) -> usize {
+                    let r = env.read_txn().expect("read_txn");
+                    let mut total = 0usize;
+                    for _ in 0..n {
+                        total = total.wrapping_add(db.len(&r).expect("len") as usize);
+                    }
+                    total
+                }
+
+                /// `MDB_SET_RANGE`-shaped seeks: a fresh positioned descent per probe
+                /// with no sequential locality for a leaf memo to exploit.
+                fn seek_ge(env: &BEnv, db: Db, probes: &[Vec<u8>]) -> usize {
+                    let r = env.read_txn().expect("read_txn");
+                    let mut hits = 0usize;
+                    for k in probes {
+                        if db
+                            .get_greater_than_or_equal_to(&r, k.as_slice())
+                            .expect("seek")
+                            .is_some()
+                        {
+                            hits += 1;
+                        }
+                    }
+                    hits
+                }
+
+                /// milli-shaped: one write txn touching every named DB round-robin,
+                /// each put immediately read back (extractor → write_db pattern).
+                fn mixed_rw(env: &BEnv, dbs: &[Db], keys: &[Vec<u8>], val: &[u8]) -> usize {
+                    let mut hits = 0usize;
+                    let mut w = env.write_txn().expect("write_txn");
+                    for (i, k) in keys.iter().enumerate() {
+                        let db = dbs[i % dbs.len()];
+                        db.put(&mut w, k.as_slice(), val).expect("put");
+                        if db.get(&w, k.as_slice()).expect("get").is_some() {
+                            hits += 1;
+                        }
+                    }
+                    w.commit().expect("commit");
+                    hits
+                }
+
+                /// `readers` threads full-scanning in a loop (polling `stop` every
+                /// 1024 entries) while this thread commits `batches` write txns.
+                /// Returns the ELAPSED TIME OF THE WRITER LOOP ONLY — from the first
+                /// `write_txn` to the last `commit` — so the caller's criterion
+                /// `iter_custom` times exactly the writer's work under concurrent
+                /// reader pressure, not the reader threads' join tail or the
+                /// fixture's drop.
                 fn writer_under_readers(
                     env: &BEnv,
                     db: Db,
@@ -819,11 +593,67 @@ macro_rules! bench_backend {
                     batches: usize,
                     per_batch: usize,
                 ) -> Duration {
-                    writer_under_readers(env, db, keys, val, readers, batches, per_batch)
+                    const READER_STOP_POLL_CHUNK: usize = 1024;
+                    let stop = AtomicBool::new(false);
+                    let ready = AtomicUsize::new(0);
+                    let started = AtomicBool::new(false);
+                    std::thread::scope(|s| {
+                        for _ in 0..readers {
+                            s.spawn(|| {
+                                let mut first = Some((&ready, &started));
+                                while !stop.load(Ordering::Relaxed) {
+                                    scan_chunked_until_stop(
+                                        env,
+                                        db,
+                                        &stop,
+                                        READER_STOP_POLL_CHUNK,
+                                        first.take(),
+                                    );
+                                }
+                            });
+                        }
+                        // Time the writer only once every reader holds a read txn.
+                        while ready.load(Ordering::Acquire) < readers {
+                            std::thread::yield_now();
+                        }
+                        let start = Instant::now();
+                        // Release the readers only after t0: each still holds the
+                        // read txn it opened, so all of them are live when timing
+                        // begins.
+                        started.store(true, Ordering::Release);
+                        for b in 0..batches {
+                            let lo = (b * per_batch) % keys.len();
+                            let hi = (lo + per_batch).min(keys.len());
+                            let mut w = env.write_txn().expect("write_txn");
+                            for k in &keys[lo..hi] {
+                                db.put(&mut w, k.as_slice(), val).expect("put");
+                            }
+                            w.commit().expect("commit");
+                        }
+                        let elapsed = start.elapsed();
+                        stop.store(true, Ordering::Relaxed);
+                        elapsed
+                    })
                 }
+
+                /// `non_free_pages_size()` — the used-bytes figure milli reads
+                /// before every register write txn and after every batch. Neither
+                /// engine touches the free list: LMDB sums `mdb_stat` per database
+                /// (`mdb_env_stat` + one `mdb_stat` per DB), zerodb sums the same
+                /// page counts from its catalog records (SPEC 05 GC-23). Returned so
+                /// neither engine's call can be elided.
                 fn non_free_size(env: &BEnv) -> u64 {
-                    non_free_size(env)
+                    env.non_free_pages_size().expect("non_free_pages_size")
                 }
+
+                /// Build an env whose free DB holds MANY small entries — the regime
+                /// a free-list walk in `non_free_size` would pay for. Fill one named DB,
+                /// then delete it in `commits` separate committed txns while a reader
+                /// pinned at the just-filled snapshot blocks reclamation (the
+                /// oldest-reader gate): every commit's freed pages accumulate as
+                /// their own GC entry instead of recycling the previous one, so the
+                /// free list ends fragmented into ~`commits` PILs. Untimed setup for
+                /// the `env/stat/non_free` rung; returns the env with the DB loaded.
                 fn build_fragmented_free(
                     dir: &Path,
                     map_size: usize,
@@ -832,10 +662,35 @@ macro_rules! bench_backend {
                     val: &[u8],
                     commits: usize,
                 ) -> BEnv {
-                    build_fragmented_free(dir, map_size, page, keys, val, commits)
+                    let env = Self::open(dir, map_size, true, page);
+                    let db = Self::create_db(&env, Some("bench"));
+                    Self::bulk_put(&env, db, keys, val);
+                    let pin = env.read_txn().expect("read_txn");
+                    let commits = commits.max(1);
+                    let per = keys.len().div_ceil(commits).max(1);
+                    for chunk in keys.chunks(per) {
+                        let mut w = env.write_txn().expect("write_txn");
+                        for k in chunk {
+                            db.delete(&mut w, k.as_slice()).expect("delete");
+                        }
+                        w.commit().expect("commit");
+                    }
+                    // The pin has done its job: the freed pages are committed and,
+                    // with no further writer, stay un-reclaimed. Drop it so the
+                    // timed reads open against an empty reader table.
+                    drop(pin);
+                    env
                 }
+
+                /// `mdb_env_copy2` into `dest`, compacting or raw.
                 fn copy_to(env: &BEnv, dest: &Path, compact: bool) {
-                    copy_to(env, dest, compact)
+                    let mut f = File::create(dest).expect("create copy dest");
+                    let opt = if compact {
+                        CompactionOption::Enabled
+                    } else {
+                        CompactionOption::Disabled
+                    };
+                    env.copy_to_file(&mut f, opt).expect("copy_to_file");
                 }
             }
         }
