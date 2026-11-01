@@ -330,6 +330,17 @@ impl<'env> RwTxn<'env> {
         Ok(p)
     }
 
+    /// Record the run `start .. start + n`, just drawn from a GC source, in
+    /// `reclaimed` (it feeds the TXN-62 checks and the loose classification
+    /// in [`RwTxn::free_page`]).
+    fn mark_reclaimed(&mut self, start: u64, n: u64) {
+        let reclaimed = &mut work_mut!(self).reclaimed;
+        for p in start..start + n {
+            let first_time = reclaimed.insert(p);
+            debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
+        }
+    }
+
     /// Serve a contiguous `n`-page run from the loose list (GcSave only; see
     /// [`RwTxn::allocate`]). A loose run that abuts `next_pgno` may be
     /// completed by extension. Returns the run's head pgno.
@@ -397,10 +408,7 @@ impl<'env> RwTxn<'env> {
         self.debug_assert_gate(f);
         let remaining = self.drains.get_mut(&f).expect("pool entry present");
         remaining.take_run(start, n);
-        for p in start..start + n {
-            let first_time = work_mut!(self).reclaimed.insert(p);
-            debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
-        }
+        self.mark_reclaimed(start, n);
         self.save_touched.insert(f);
         Some(start)
     }
@@ -431,10 +439,7 @@ impl<'env> RwTxn<'env> {
         #[cfg(debug_assertions)]
         self.debug_assert_gate(f);
         self.annex.take_run(start, n);
-        for p in start..start + n {
-            let first_time = work_mut!(self).reclaimed.insert(p);
-            debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
-        }
+        self.mark_reclaimed(start, n);
         Some(start)
     }
 
@@ -575,10 +580,7 @@ impl<'env> RwTxn<'env> {
             None => self.drains.get_mut(&f).expect("drain entry present"),
         };
         remaining.take_run(start, n);
-        for p in start..start + n {
-            let first_time = work_mut!(self).reclaimed.insert(p);
-            debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
-        }
+        self.mark_reclaimed(start, n);
         Ok(Some(start))
     }
 
@@ -686,10 +688,7 @@ impl<'env> RwTxn<'env> {
             }
         }
         self.cross_cache = Some(cache);
-        for p in start..start + n {
-            let first_time = work_mut!(self).reclaimed.insert(p);
-            debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
-        }
+        self.mark_reclaimed(start, n);
         Ok(Some(start))
     }
 
