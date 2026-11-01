@@ -235,36 +235,14 @@ pub fn open_with_backing_shared(
     // (ADR-0004 D4), so pages inside the map but past the file end are
     // unbacked: dereferencing them faults (SIGBUS) instead of erroring. Reject
     // at open, with checked arithmetic (a hostile `last_pg` near `u64::MAX`
-    // must not wrap the multiply):
-    //  - the file must cover `(last_pg + 1) * page_size` bytes;
-    //  - each root is `PGNO_INVALID` or within `[FIRST_DATA_PGNO, last_pg]`.
-    // Under WRITE_MAP a process alone on the file grew it to `map_size` at
-    // map time, so the length check is trivially true there; a joining
-    // process does not grow the file at open (ADR-0023), so for
-    // it the check is real. The roots check always applies.
-    // Also part of REC-1a: the committed txnid itself. The reader table
-    // encodes slot occupancy in the top-of-u64 sentinel band (SPEC 04 TXN-14)
-    // and the next writer txnid is `meta.txnid + 1`; a txnid at or above the
-    // band is unreachable by real commits (one increment per commit) and
-    // would alias the RDR_FREE/RDR_CLAIMED sentinels or wrap — corrupt file.
-    if meta.txnid > crate::readers::MAX_COMMITTED_TXNID {
+    // must not wrap the multiply): the file must cover the snapshot's pages,
+    // and the txnid and roots must be in range (`check_meta_shape`). Under
+    // WRITE_MAP a process alone on the file grew it to `map_size` at map
+    // time, so the length check is trivially true there; a joining process
+    // does not grow the file at open (ADR-0023), so for it the check is real.
+    check_meta_shape(&meta)?;
+    if bytes_needed(meta.last_pg, page_size)? > backing.real_disk_size().map_err(Error::Io)? {
         return Err(Error::Mdb(MdbError::Invalid));
-    }
-    let real = backing.real_disk_size().map_err(Error::Io)?;
-    let needed = meta
-        .last_pg
-        .checked_add(1)
-        .and_then(|n| n.checked_mul(u64::from(page_size)))
-        .ok_or(Error::Mdb(MdbError::Invalid))?;
-    if needed > real {
-        return Err(Error::Mdb(MdbError::Invalid));
-    }
-    for rec in [&meta.main_db, &meta.free_db] {
-        if rec.root != crate::page::PGNO_INVALID
-            && (rec.root < crate::page::FIRST_DATA_PGNO || rec.root > meta.last_pg)
-        {
-            return Err(Error::Mdb(MdbError::Invalid));
-        }
     }
 
     let selected = Snapshot::from_meta(&meta, annex);
@@ -434,6 +412,25 @@ pub(crate) fn read_snapshot_at(
     if meta.txnid != t {
         return Ok(None);
     }
+    check_meta_shape(&meta)?;
+    let annex = MetaPage::read_annex(&buf, page_size).ok_or(Error::Mdb(MdbError::Invalid))?;
+    Ok(Some(Snapshot::from_meta(&meta, annex)))
+}
+
+/// `(last_pg + 1) * page_size`: the bytes a snapshot ending at page
+/// `last_pg` occupies. [`MdbError::Invalid`] on overflow (a corrupt meta).
+pub(super) fn bytes_needed(last_pg: u64, page_size: u32) -> Result<u64, Error> {
+    last_pg
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(u64::from(page_size)))
+        .ok_or(Error::Mdb(MdbError::Invalid))
+}
+
+/// The REC-1a checks a CRC-valid meta must also pass: its txnid lies below
+/// the reader table's sentinel band (SPEC 04 TXN-14; a real txnid there is
+/// unreachable and would alias `RDR_FREE`/`RDR_CLAIMED`), and each root is
+/// `PGNO_INVALID` or within `[FIRST_DATA_PGNO, last_pg]`.
+fn check_meta_shape(meta: &MetaPage) -> Result<(), Error> {
     if meta.txnid > crate::readers::MAX_COMMITTED_TXNID {
         return Err(Error::Mdb(MdbError::Invalid));
     }
@@ -444,8 +441,7 @@ pub(crate) fn read_snapshot_at(
             return Err(Error::Mdb(MdbError::Invalid));
         }
     }
-    let annex = MetaPage::read_annex(&buf, page_size).ok_or(Error::Mdb(MdbError::Invalid))?;
-    Ok(Some(Snapshot::from_meta(&meta, annex)))
+    Ok(())
 }
 
 /// Bound on re-reads of the published txnid when its meta slot keeps changing
@@ -500,11 +496,7 @@ fn seed_from_published(
 /// file holds. [`MdbError::MapResized`] when the backing cannot grow its map
 /// (a heap test backing); the I/O error of a failed growth.
 fn grow_to_seed(backing: &dyn Backing, page_size: u32, seed: &Snapshot) -> Result<(), Error> {
-    let needed = seed
-        .last_pg
-        .checked_add(1)
-        .and_then(|n| n.checked_mul(u64::from(page_size)))
-        .ok_or(Error::Mdb(MdbError::Invalid))?;
+    let needed = bytes_needed(seed.last_pg, page_size)?;
     if needed > crate::page::geometry::MAX_MAP_SIZE
         || needed > backing.real_disk_size().map_err(Error::Io)?
     {
@@ -551,11 +543,7 @@ fn check_snapshot_in_view(
     page_size: u32,
     snap: &Snapshot,
 ) -> Result<u64, Error> {
-    let needed = snap
-        .last_pg
-        .checked_add(1)
-        .and_then(|n| n.checked_mul(u64::from(page_size)))
-        .ok_or(Error::Mdb(MdbError::Invalid))?;
+    let needed = bytes_needed(snap.last_pg, page_size)?;
     if needed > view.map_size {
         return Err(Error::Mdb(MdbError::MapResized));
     }

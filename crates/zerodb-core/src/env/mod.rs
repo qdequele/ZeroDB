@@ -42,7 +42,7 @@ pub use open::{
     check_open_limits, dirty_limit_pages, open_with_backing, open_with_backing_policy,
     open_with_backing_shared, MAX_READERS_LIMIT,
 };
-use open::{check_snapshot_backed, META_RETRY_LIMIT};
+use open::{bytes_needed, check_snapshot_backed, META_RETRY_LIMIT};
 pub(crate) use writer_lock::WriterGuard;
 use writer_lock::{SignalEvent, WriterLock};
 
@@ -1301,11 +1301,7 @@ impl Env {
         // ADR-0023: the newest meta on disk, as LMDB's
         // `mdb_env_set_mapsize`, including an unpublished first commit.
         let snap = inner.or_newer_unpublished(inner.newest_snapshot_unchecked()?);
-        let min = snap
-            .last_pg
-            .checked_add(1)
-            .and_then(|n| n.checked_mul(u64::from(inner.page_size())))
-            .ok_or(Error::Mdb(MdbError::Invalid))?;
+        let min = bytes_needed(snap.last_pg, inner.page_size())?;
         // OBS_SET_MAPSIZE_ZERO_ADOPTS: 0 adopts the newest meta's size.
         let (size, from_meta) = if new_size == 0 {
             (snap.map_size, true)
