@@ -319,30 +319,27 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
 /// engine's only mode, and `FIXED_MAP` and `NO_MEM_INIT` are accepted
 /// no-ops, so they are dropped here.
 fn zerodb_env_flags(flags: EnvFlags) -> zerodb::EnvFlags {
-    let mut z = zerodb::EnvFlags::EMPTY;
-    if flags.contains(EnvFlags::WRITE_MAP) {
-        z |= zerodb::EnvFlags::WRITE_MAP;
-    }
-    if flags.contains(EnvFlags::PREV_SNAPSHOT) {
-        z |= zerodb::EnvFlags::PREV_SNAPSHOT;
-    }
-    if flags.contains(EnvFlags::READ_ONLY) {
-        z |= zerodb::EnvFlags::READ_ONLY;
-    }
-    if flags.contains(EnvFlags::NO_SYNC) {
-        z |= zerodb::EnvFlags::NO_SYNC;
-    }
-    if flags.contains(EnvFlags::NO_META_SYNC) {
-        z |= zerodb::EnvFlags::NO_META_SYNC;
-    }
-    if flags.contains(EnvFlags::MAP_ASYNC) {
-        z |= zerodb::EnvFlags::MAP_ASYNC;
-    }
-    if flags.contains(EnvFlags::NO_READ_AHEAD) {
-        z |= zerodb::EnvFlags::NO_READ_AHEAD;
-    }
-    z
+    // Both types use LMDB's `MDB_*` values (checked below); heed flags ZeroDB
+    // does not define (`NO_LOCK`, `NO_TLS`, ...) are handled by the caller.
+    zerodb::EnvFlags::from_bits_truncate(flags.bits())
 }
+
+const _: () = {
+    let pairs = [
+        (EnvFlags::WRITE_MAP, zerodb::EnvFlags::WRITE_MAP),
+        (EnvFlags::PREV_SNAPSHOT, zerodb::EnvFlags::PREV_SNAPSHOT),
+        (EnvFlags::READ_ONLY, zerodb::EnvFlags::READ_ONLY),
+        (EnvFlags::NO_SYNC, zerodb::EnvFlags::NO_SYNC),
+        (EnvFlags::NO_META_SYNC, zerodb::EnvFlags::NO_META_SYNC),
+        (EnvFlags::MAP_ASYNC, zerodb::EnvFlags::MAP_ASYNC),
+        (EnvFlags::NO_READ_AHEAD, zerodb::EnvFlags::NO_READ_AHEAD),
+    ];
+    let mut i = 0;
+    while i < pairs.len() {
+        assert!(pairs[i].0.bits() == pairs[i].1.bits());
+        i += 1;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Env
