@@ -354,7 +354,6 @@ impl<'env> DirtyStore<'env> {
         }
     }
 
-
     /// Whether this store realizes dirty frames in the writable map
     /// (ADR-0021). Commit C2 and spilling write nothing for such frames.
     #[must_use]

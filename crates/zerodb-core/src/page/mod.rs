@@ -169,7 +169,6 @@ pub enum PageType {
     Meta,
 }
 
-
 /// Classify a `flags` field into a [`PageType`], enforcing the current rule:
 /// exactly one structural bit set and no reserved bit (including the DUPSORT/DUPFIXED
 /// `P_LEAF2`/`P_SUBP` hooks) set (SPEC 02 §1, §10).
