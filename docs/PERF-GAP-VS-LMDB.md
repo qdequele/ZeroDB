@@ -61,6 +61,9 @@ set today. Source keys:
 - **[Q]** [`2026-10-31-delete-path-cursor.md`](../benches/results/2026-10-31-delete-path-cursor.md) — `^del/` three-column A/B on Graviton4 after the issue #137 delete-path levers, plus macOS profiles and retired-instruction counts
 - **[X]** [`2026-10-19-crud-scan-count-and-batch-delete.md`](../benches/results/2026-10-19-crud-scan-count-and-batch-delete.md) — crud-bench `count()`, `start(5000) limit(100)` and `batch_delete_1000` (repro and crud-bench on an M-series laptop, indicative), plus the `^(scan|get|seek)/` gate on Graviton4 in both policies
 - **[SC]** [`2026-10-31-stamp-cache-graviton.md`](../benches/results/2026-10-31-stamp-cache-graviton.md) — the validated-pages cache sized to the file: `ycsb_a_census` 10M keys and the `^(get/|scan/|seek/|env/)` ladder on Graviton4
+- **[BP]** [`2026-10-31-build-profiles-and-scans-graviton.md`](../benches/results/2026-10-31-build-profiles-and-scans-graviton.md) — the default-tier ladder under four build profiles, and `^(scan|seek)/` validating vs trusted, Graviton4 `c8g.xlarge`, `main` at `0adf868` (before the validated-pages cache was sized to the file)
+- **[W]** [`2026-10-31-writer-carry-graviton.md`](../benches/results/2026-10-31-writer-carry-graviton.md) — write txns reuse the previous one's containers (#8): `commit_census` under `perf stat` and the `^(commit/|env/txn/|put/|del/)` ladder, Graviton4
+- **[WM]** [`2026-10-31-writemap-dirty-bits-graviton.md`](../benches/results/2026-10-31-writemap-dirty-bits-graviton.md) — bulk-write rungs with `WRITE_MAP` before/after the per-page dirty bits, Graviton4
 
 Rungs that [V] re-measured are quoted from [V]; the rest come from [E], which
 predates the cache, so read paths in [E] are slightly pessimistic.
@@ -90,18 +93,21 @@ on, five rungs regress, and their rows below give both figures.
 
 ### Scans and seeks
 
-| What | Ratio | Source |
-|---|---:|---|
-| Seeks (`seek/ge/rand`, `seek/ge/seq`) | 0.95× | V |
-| Seek into gaps (`seek/ge/gap`) | 1.32× | E |
-| Full scan (`scan/full/fwd`) | 1.49× | V |
-| Range scan 1 % (`scan/range/1pct`) | 1.33× | V |
-| Prefix bucket (`scan/prefix/bucket`) | 1.76× | V |
-| First/last (`scan/edge/first_last`) | 1.66× | E |
-| `len` of a DB (`scan/meta/len`) | 1.00× | E |
-| Range scans, opt-in trusted mode | 1.19–1.21× | E |
-| Full scan, opt-in trusted mode (`scan/full/rev`, Graviton4) | 1.06× (was 2.03×); `scan/full/fwd` 1.02× (was 2.05×), LMDB drift 8 % in that run | X |
-| Full scan over a 300 MB tree, opt-in trusted mode (`scan/full/big`, Graviton4) | 1.03× (was 1.40×), LMDB drift 5.7 % in that run | X |
+Graviton4, default (validating) policy and opt-in trusted mode, same binary
+[BP]. Measured before the validated-pages cache was sized to the file, which
+then made `scan/full/big` 13 % faster [SC].
+
+| What | Default | Trusted | Source |
+|---|---:|---:|---|
+| Seeks (`seek/ge/rand`, `seek/ge/seq`) | 0.92×, 0.93× | 0.89×, 0.85× | BP |
+| Seek into gaps (`seek/ge/gap`) | 1.06× | 1.01× | BP |
+| Full scan (`scan/full/fwd`, `scan/full/rev`) | 1.47× | 1.09×, 1.05× | BP |
+| Full scan over a 300 MB tree (`scan/full/big`) | 1.60× | 1.03× | BP |
+| Range scans 1 % / 10 % (`scan/range/1pct`, `10pct`) | 0.85×, 0.82× | 0.70×, 0.69× | BP |
+| Paged listing (`scan/skip_take/*`) | 0.47× | 0.24× | BP |
+| Prefix bucket (`scan/prefix/bucket`) | 1.27× | 1.08× | BP |
+| First/last (`scan/edge/first_last`) | 1.41× | 1.42× | BP |
+| `len` of a DB (`scan/meta/len`) | 1.12× (7.5 vs 6.7 ns; moves ±40 % with code layout) | 1.15× | BP |
 
 ### Writes
 
@@ -112,6 +118,9 @@ on, five rungs regress, and their rows below give both figures.
 | Reserved puts, milli's document path (`put/api/reserved`) | 0.96× | E |
 | Random-order puts (`put/order/rand`) | 0.93× | E |
 | APPEND puts (`put/order/append`) | 1.21× | [report](../benches/results/2026-10-31-write-cursor-split-append-graviton.md) |
+| Rewriting every value through the write cursor (`put/cursor/rewrite`) | 1.37× | [report](../benches/results/2026-10-31-write-cursor-split-append-graviton.md) |
+| Bulk puts with `WRITE_MAP` (`put/order/seq`, `put/api/plain`, `commit/batch/n10k`) | 0.99–1.00× | WM |
+| … other rungs with `WRITE_MAP` (`put/order/rand`, `put/api/reserved`, `put/val/v4k`) | 1.07×, 1.12×, 1.12× | WM |
 | Overwrites that grow a value (`put/over/grow`) | 1.22× | E |
 | Puts drawing pages from a large free-list entry (`put/gc/drain_big`) | 1.14× | E |
 | 4 KiB values (`put/val/v4k`) | 0.99× | E |
@@ -134,9 +143,10 @@ on, five rungs regress, and their rows below give both figures.
 
 | What | Ratio | Source |
 |---|---:|---|
-| One-put no-sync commit (`commit/batch/n1`) | 1.60× | ADR-0022 (CGU1, 5 rounds) |
+| One-put no-sync commit (`commit/batch/n1`) | 1.17× on Graviton4 (an older bench-server run read 1.60×) | W |
+| One-put no-sync commit, per commit (`commit_census`) | 5.17 vs 4.25 µs; 5.74k vs 2.64k user cycles | W |
 | 100 / 10k puts per commit (`commit/batch/n100`, `n10k`) | 1.08×, 0.90× | E |
-| Empty write txn (`env/txn/rw_empty_commit`) | 2.46× (E); Graviton4: 3.42× lock file on (+29.8 ns per txn), 2.80× `NO_LOCK` | E, G |
+| Empty write txn (`env/txn/rw_empty_commit`) | 2.46× (E); Graviton4: 3.52× lock file on [W], 2.80× `NO_LOCK` [G] | E, G, W |
 | Read txn begin/abort (`env/txn/ro_begin_abort`) | 0.56× (E); Graviton4: 0.73× lock file on (+6.8 ns per txn), 0.66× `NO_LOCK` | E, G |
 | Writer with 0–4 concurrent readers (`concurrent/writer/*`) | 1.15–1.18× | E |
 | Durable commits (`commit/sync/*`, SATA fsync-bound) | 0.97–1.03× (noise) | E |
@@ -212,15 +222,18 @@ are bench server ratios, before → after, unless stated.
 | **`RwCursor` re-seek** | The write cursor tracked its position by key, re-descending and copying each pair three times per step. It now parks and resumes its path, with no allocation per step. A `del_current`, and a put of the current key, mutate at the parked path and keep it (SPEC 03 §5.4a/§5.4b); since #138 a put that splits keeps it too, repaired to the half holding the entry as `mdb_page_split` fixes up its cursor. Each step moves the parked path in place (it was copied in and out, 512 bytes each way) and yields the entry from the page it read; a same-size rewrite on a page the txn owns checks the key and writes in one page access with no copy-on-write pass, as LMDB's `MDB_CURRENT` put on a `P_DIRTY` page. **Residual:** any op but `next`/`prev` after a delete still re-seeks once; each entry still costs two pgno→frame lookups (step, put) where LMDB holds page pointers. | `put/cursor/rewrite` 5.47× → 2.49× (macOS arm64, 2026-10-19), then 2.50× → 1.37× and `del/cursor/drain` 2.62× → 2.15× (Graviton4, 2026-10-31) [[report](../benches/results/2026-10-31-write-cursor-split-append-graviton.md)] | #7, #138 |
 | **Splits without materializing the page** | Appends split onto a fresh right page; other splits pack both halves from cells borrowed from the old page. | — | 3c6a064 |
 | **One `pwrite` per dirty page** | Contiguous dirty pages go out in `pwritev` batches, as `mdb_page_flush` does. Its target, EBS gp3, is still unmeasured. | — | 3c6a064 |
-| **Adapter `ReservedSpace`** | `put_reserved` (milli's document path) filled a zeroed heap buffer, then copied it; the caller now writes straight into the page slot, as with `MDB_RESERVE`. The cursor variant still stages (#10, divergence D-015). | `put/api/reserved` 0.96× today [E] | — |
+| **Adapter `ReservedSpace`** | `put_reserved` (milli's document path) filled a zeroed heap buffer, then copied it; the caller now writes straight into the page slot, as with `MDB_RESERVE`. The cursor variant still stages; it is to be built in place, as LMDB does (#10, low priority). | `put/api/reserved` 0.96× today [E] | — |
 | **Writer slot without a syscall** | Releasing a write txn always issued a `futex_wake`; it now wakes only when a writer waits, like LMDB's pthread writer mutex. | `env/txn/rw_empty_commit` 5.93× → 2.19× | 7c02a5c |
 | **dbi-indexed write-txn table** | The write txn's open-DB table was a SipHash map. | `put/val/v8` 1.28× → 1.09× | 4fc1c9e |
 | **Reused descent path, in-place APPEND check** | One path buffer per write txn instead of a `Vec` per op; APPEND compares the last key in the page instead of copying it. | `put/val/v8` 1.08× → 1.00×, `put/order/append` 1.32× → 1.19× | 2142ab2, 2ee1d25 |
 | **APPEND without a second leaf view or a no-op COW pass** | The append slot is one past the last cell the rightmost descent read (LMDB bumps `mc_ki` after `mdb_cursor_last`); when every page on that descent is already the txn's own frame, the copy-on-write pass is skipped, as `mdb_page_touch` skips `P_DIRTY` pages. **Residual (Mac profile):** zeroing each new split page (SPEC 04 TXN-47; LMDB reuses `me_dpages` without zeroing) ~7 %, an O(1) header re-check per page view, and two pgno→frame lookups per level (view, touch) on keyed puts. | `put/order/append` 1.26× → 1.21× (Graviton4, 2026-10-31) | #138 |
 | **Dirty frame pool** | Page buffers are reused within and across write txns, capped at 256 (LMDB's `me_dpages`). The empty-txn cost was accepted by the maintainer. | `put/gc/drain_big` 1.58× → 1.17×, `commit/batch/n1` 2.05× → 1.93×; `rw_empty_commit` 2.19× → 2.41× | 10c98a1 |
+| **Write-txn containers carried across txns** | Each write txn built its dirty-page and freed-page indexes, page lists, descent path and open-table slots empty and freed them at the end. One carry on the env's writer slot now holds them and each txn clears them in place, as LMDB reuses `me_txn0`; capacity caps keep one large txn from slowing the small ones after it. The begin path also reuses the cached snapshot and drains the meta page's freed-page list without copying it. | single-put commit 19 → 5 heap allocations, 6.68k → 5.74k user cycles (LMDB 2.64k); `commit/batch/n1` 1.26× → 1.17× (Graviton4, [W]) | #8, PR #144 |
 | **O(1) free-list front draw** | Each page drawn from a free-list entry memmoved the rest; a consumed-prefix offset makes it O(1), file byte-identical. | `put/gc/drain_big` 2.21× → 1.68× | 37b03c9 |
+| **Free-page runs across records** | A multi-page value searched one freed-page record at a time, so a run split across two records was missed and the file grew. When no single record fits, the allocator now merges the records the reuse gate allows, oldest first and bounded as LMDB bounds its free list, and keeps the merged list for the txn. | file size under multi-page rewrites 2.43× → 1.10× LMDB's (`free_run_churn`, macOS, 400 commits) | ADR-0029, PR #121 |
 | **Spilling** | Past LMDB's dirty limit (131,072 pages; `max_dirty_bytes`), a write txn writes its highest-numbered dirty pages to the file and drops them, as `mdb_page_spill` does. | YCSB C loads instead of being killed; YCSB A 0.58 → 0.76, B 0.31 → 0.69 of LMDB's throughput [S]; ladder flat | ADR-0017 |
 | **In-place `WRITE_MAP`** (opt-in) | Under `WRITE_MAP`, dirty pages live in the writable map at their final offset: no heap copy, no write-back, as `MDB_WRITEMAP`. | spike, macOS arm64, single-put no-sync commits: 29.8–43.5 → 8.6–11.1 µs | ADR-0021, PR #88 |
+| **`WRITE_MAP` dirty-page test from per-page bits** (opt-in mode) | Every level of a descent asks whether its page is already dirty; on a large in-map write txn that hash probe missed the cache (15–17 % of a bulk insert). Two bits per page now answer it once the txn holds 64 frames. LMDB skips the question under `MDB_WRITEMAP`; ZeroDB still needs the answer because map pages are validated and dirty frames are not. | with `WRITE_MAP`: `put/order/seq` 1.12× → 0.99×, `commit/batch/n10k` 1.11× → 1.00×, `put/api/plain` 1.12× → 0.99× (Graviton4, [WM]) | #13, PR #145 |
 | **Meta free-list annex** | A commit's freed-page list goes into its own meta page when it fits, instead of a free-list tree put per commit (beyond LMDB). On-disk format 2. | `commit/batch/n1` 2.04× → 1.60×; durable YCSB B on Graviton4 239k → 258k ops/s; Meilisearch flat [M] | ADR-0022, PR #89 |
 | **Branch splits on ascending inserts** | A full branch page took a middle split even on an end insert, so ascending loads left every branch page half full. It now splits at the end, as LMDB does. SPEC 03. | 4 KiB pages, 20k ascending keys: 949 → 480 branch pages (LMDB 558); writes flat; `get/access/miss` −26 %, `get/access/hot` +5.5 % (laptop) [L] | #111 |
 | **Leaf end-insert split** | A plain put at the end of a full leaf now moves the old last entry to the new page with it, as LMDB does, so ascending loads build LMDB's leaf count. The cell is removed in place from the top of the left page's cell heap, so nothing else moves. | measured rungs flat, `get/access/hot` −4.5 % (laptop) [L] | #113 |
@@ -252,7 +265,7 @@ are bench server ratios, before → after, unless stated.
 | Durable meta write through an `O_DSYNC` descriptor | 2 → 1 `fdatasync` per commit, but no measured gain on the reachable io2 host | ADR-0019, PR #86 |
 | Used-portion COW copy (skip a page's free gap) | `commit/batch/n1` 1.95× → 1.93×, all rungs flat; the frame pool had already removed the cost, and stale bytes would reach the file | 2026-10-02, branch never merged |
 | `#[cold]` arms plus `#[inline]` hints | flat at CGU16, `put/val/v8` +8.8 % at CGU1; LLVM still declined | ledger, 994a05c |
-| Dirty-store arena or sorted map | the dirty-store probe never cleared the profile's noise bar; the frame pool took the useful part | ledger 2026-07-22; issue #5 closed, #4 open |
+| Dirty-store arena or sorted map | the dirty-store probe never cleared the profile's noise bar; the frame pool took the useful part | ledger 2026-07-22; issues #4 and #5 closed |
 | Cached parent branch in scans | 2–4 % on `scan/*`, under the noise bar | ledger, b7fa519 |
 | Fused cell-removal loop (LMDB's loop shape) | slower, 23.8 vs 21.3 ms: `copy_within` beats per-element indexing | ledger 2026-09-10 |
 | Inline path stack on the write path | zero-filling a 520-byte struct per op cost more: `put/val/v8` +8 % | ledger, 9eb19d4 |
@@ -275,64 +288,83 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
 
 **Measured**
 
-- **Deletes after #137** — per-key deletes 1.35×, cursor drains 1.50–1.66×,
-  `clear` 1.43× on Graviton4 [Q]. The memmoves of a delete and its borrow now
-  match LMDB's byte for byte; what remains is bookkeeping around them (page
+- **Single-page writes after a bulk commit** (#135) — a commit writes each
+  run of dirty pages with one `pwritev` of up to 2 MiB, where LMDB writes at
+  most 64 pages per call. On kernels and filesystems that cache files in
+  large folios, those writes leave the file in large folios, and every later
+  commit that rewrites one 4 KiB page inside one pays far more kernel time.
+  On the 10M-key no-sync workload, write p50 is 12.1–12.6 µs against LMDB's
+  7.6–7.9 µs; a 256 KiB cap per call brings it to 8.7–8.8 µs. This is most of
+  the public `a_nosync` gap (0.60× LMDB's throughput). Open: whether capping
+  slows Meilisearch's bulk indexing, then the default.
+- **Per-commit CPU** (#146) — `commit/batch/n1` 1.17×, empty write txn
+  3.52× on Graviton4 [W]; a single-put no-sync commit costs 5.74k user
+  cycles against LMDB's 2.64k. What is left is CPU per commit, not I/O.
+  Write txns already reuse the previous one's containers (#8). Still open:
+  the writer slot's in-process mutex costs two read-modify-write atomics per
+  acquire and release on top of the lock file's word (about 8 per empty
+  write txn, LMDB 2; removing it needs an owned lock cell, an ADR-level
+  change); re-encoding the meta page's free-list annex
+  (`MetaPage::encode_with_annex`, ADR-0022), ~78 % of commit in crud-bench's
+  one-delete-per-txn phase, which keeps the annex full; the free-list tree
+  record that small txns decode and rewrite after a large delete (LMDB
+  keeps its reclaimed list, `me_pghead`, across txns); the snapshot `Arc`
+  published per commit; the `pwritev` iovec list.
+- **Scans** (#147) — by default full scans are 1.47–1.60× and prefix
+  buckets 1.27×; in trusted mode 1.03–1.09× [BP], so the default-mode gap is
+  page validation (16–19 % of a scan, including out-of-line atomics in
+  `ValidatedPages::insert`), and the trusted residual is two calls per entry
+  against LMDB's one. `scan/edge/first_last` is 1.41× in both modes: every
+  call re-resolves the tree from the root. Range scans, paged listings and
+  point seeks (`seek/ge/rand`, `seq`) are faster than LMDB; seeks into gaps
+  (`seek/ge/gap`) trail at 1.06× by default and 1.01× trusted. Cache-line prefetch (#17) and branchless page
+  search (#16) were closed: the latter slowed gets down.
+- **Point gets and the build profile** (#147) — LTO makes point gets 3–10 %
+  faster with LMDB flat, from small `zerodb-core` accessors the heed adapter
+  calls per operation; the candidate `#[inline]` sites are listed in [BP].
+  One codegen unit (Meilisearch's build) gets almost none of it, and makes
+  `put/cursor/rewrite` 19 % and `del/cursor/drain` 9 % slower, cause not
+  found. Otherwise the profile moves both engines alike: ZeroDB ÷ LMDB stays
+  at 1.12–1.13 across all four profiles.
+- **Write cursor and APPEND** (#148) — `put/cursor/rewrite` 1.37×,
+  `put/order/append` 1.21×. Each cursor rewrite still costs two pgno→frame
+  lookups where LMDB's cursor holds page pointers; APPEND zero-fills each
+  new split page (SPEC 04 TXN-47), which LMDB does not. #141 left two small
+  unexplained regressions (`put/gc/ovf_across` +4.2 %, `del/bulk/all`
+  +3.1 %) whose Graviton re-run is owed.
+- **Deletes** — per-key deletes 1.35×, cursor drains 1.50–1.66×, `clear`
+  1.43× on Graviton4 [Q]. The memmoves of a delete and its borrow now match
+  LMDB's byte for byte; what remains is bookkeeping around them (page
   lookups by pgno where LMDB's cursor holds page pointers, O(1) view checks,
-  the descent). About 30 µs of `clear`'s gap is the commit's fixed cost (#8).
-  On macOS's 16 KiB pages the ladder's delete fixture is one level deeper
-  than LMDB's (10-byte branch cells, ADR-0002), so Mac ratios read higher.
-  Workloads with
-  one delete per transaction are bound by commit instead: in crud-bench's
-  delete phase ~78 % of commit is re-encoding the meta page's free-list annex
-  (`MetaPage::encode_with_annex`, ADR-0022), which a delete-heavy run keeps
-  full. No issue yet.
-- **Per-commit CPU** — `commit/batch/n1` 1.60×, empty write txn 2.46×, and
-  YCSB no-sync on Graviton4 1.21–1.38× [M]. What is left is CPU per commit,
-  not I/O. A Graviton4 profile (2026-10-29) put ZeroDB at 9.1–10.7k user
-  cycles per single-put no-sync commit against LMDB's 5.7–6.2k, led by hash
-  index growth and malloc/free for containers built empty per write txn, and
-  by outlined aarch64 atomics on the writer lock path. Write txns now reuse
-  the previous one's containers in place, as LMDB's `me_txn0` (#8): 19 → 5
-  heap allocations per single-put commit, 1 → 0 per empty write txn, and the
-  snapshot cell's lock and the copy of the base meta page's annex leave the
-  begin path. Graviton4: 6.68k → 5.74k user cycles per single-put commit
-  (LMDB 2.64k), `commit/batch/n1` 1.26× → 1.17×, empty write txn 191 →
-  182 ns (`benches/results/2026-10-31-writer-carry-graviton.md`). Still open: the writer slot's in-process mutex costs two
-  read-modify-write atomics per acquire and release on top of the lock
-  file's word (about 8 per empty write txn, LMDB 2; removing it needs an
-  owned lock cell, an ADR-level change), the snapshot `Arc` published per
-  commit, the `pwritev` iovec list, and the free-list tree record that small
-  txns decode and rewrite after a large delete (LMDB keeps its reclaimed
-  list, `me_pghead`, across txns). #4 (per-page allocation and zero-fill) is
-  partly done by the frame pool.
-- **Scans** — 1.3–1.8× by default; range scans 1.2× in trusted mode. A cursor keeps only its leaf;
-  branch levels are re-resolved per cursor step (a memo hit, so cheap; one
-  try to cache the parent read flat). Open idea: cache-line prefetch (#17).
-  Branchless page search (#16) was tried and slowed gets down.
+  the descent; #148). About 30 µs of `clear`'s gap is the commit's fixed cost
+  (#146). On macOS's 16 KiB pages the ladder's delete fixture is one level
+  deeper than LMDB's (10-byte branch cells, ADR-0002), so Mac ratios read
+  higher. Workloads with one delete per transaction are bound by commit
+  instead (#146).
 - **Overflow values** — 1.3× by default, because the overflow header is read
   and checked; with both engines trusting the file it is 0.89–0.91×.
 - **Wider keys** — `get/key/k32`/`k128` 1.26–1.33× [E]. Extending the integer
   compare to all keys of at most 8 bytes (#15) was tried and not adopted.
-- **`WRITE_MAP` follow-ups** (#13) — ZeroDB's in-place `WRITE_MAP` still
-  trails LMDB's by 1.34–1.42× on no-sync YCSB [M]. Durable commits now
-  `msync` the used prefix, as LMDB (#45, ADR-0026), flat on macOS even with a
-  16 GiB map. Durable `WRITE_MAP` commits on macOS are 1.87–1.91× LMDB [L]
-  because ZeroDB issues a second `fdatasync` after the meta write, which LMDB
-  does not. Open: prefault / preallocation of the map (#42), the Graviton A/B,
-  and whether Meilisearch should set `WRITE_MAP`. Since the dirty store
-  answers its dirty-page test from per-page bits, `put/order/seq`
-  (1.12× → 0.99×), `put/api/plain` (1.12× → 0.99×) and `commit/batch/n10k`
-  (1.11× → 1.00×) are at parity with `WRITE_MAP` on Graviton4. Other bulk
-  rungs stay above LMDB with `WRITE_MAP`: `put/order/append` 1.38×,
+- **`WRITE_MAP`** (#13) — bulk puts are at parity since the per-page dirty
+  bits [WM]. Still above LMDB with `WRITE_MAP`: `put/order/append` 1.38×,
   `put/api/reserved` 1.12×, `put/order/rand` 1.07×, and `put/val/v4k` 1.12×,
   where in-map overflow runs are zero-filled before the value is copied in,
-  which LMDB does not do.
+  which LMDB does not do. No-sync YCSB was last measured at 1.34–1.42× LMDB's
+  own `WRITE_MAP` [M], before ranged `msync` and the dirty bits; a re-run is
+  owed. Durable `WRITE_MAP` commits on macOS are 1.87–1.91× LMDB [L] because
+  ZeroDB issues a second `fdatasync` after the meta write, which LMDB does
+  not. Open: prefaulting fresh pages, and whether Meilisearch should set
+  `WRITE_MAP`. Preallocating the file was tried and dropped (#42): LMDB does
+  not preallocate.
 - **Short read txns** — one read txn + one get is 1.55× [V]. The memo level
   and the named-DB table are now reused across txns on a thread (#25,
   `env/txn/ro_get_one` −26 % on macOS); a Linux re-measure is pending.
 - **Page fill under random inserts** — the unsorted 10M load makes an 8 %
   larger file than LMDB's [S]. No issue yet.
+- **Free-page runs** — since ADR-0029 the residual is small: under steady
+  multi-page rewrites ZeroDB's file still grows ~4 % between 200 and 400
+  commits, LMDB's 0.6 %. Coalescing leftovers on disk (ADR-0029 option B)
+  would close it; not planned.
 - **`zerodb-tools load` memory** — streams the dump since #63: peak memory
   footprint ~156 MiB for a 0.7 GB or a 1.4 GB dump (was 1.2 / 2.4 GB), against
   ~1 MiB for LMDB's `mdb_load`, which commits every 100 records where `load`
@@ -340,11 +372,6 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
 
 **Not yet measured**
 
-- Free-page run search (#29): a multi-page value looks for a run of
-  contiguous free pages inside one freed-page record at a time, where LMDB
-  first merges several records into its in-memory free list, so the file can
-  grow even when a fitting run spans two records. A differential test against
-  LMDB comes first. Only matters under GC churn.
 - The cursor reserved put (#10): no consumer profile names it.
 - Durable commits on EBS gp3, where per-syscall latency should favour the
   coalesced writes: still owed. On SATA and Graviton4 NVMe durable commits
@@ -352,11 +379,13 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
 - A 24-byte page header instead of 32 (ADR-0020): a spike ran on an
   unmerged branch, but the measurement that decides it is not recorded; an
   on-disk format change that needs approval.
-- Consumer-facing APIs beyond LMDB: batched lookups (#53), single-descent
-  get-merge-put (#52), group commit (#36), relaxed durability (#35), prefetch
-  hints (#57), map warm-up (#61), reflink copies (#64). `check` is now
-  parallel (#65; a 2.1 GB env checks in 0.17 s instead of 0.42 s on an
-  8-core Mac, warm cache); LMDB has no checker to compare with.
+- Consumer-facing APIs beyond LMDB: group commit (#36), relaxed durability
+  (#35), prefetch hints (#57), map warm-up (#61), automatic map growth (#33),
+  balanced ranges for parallel scans (#55), reader parking (#32). Batched
+  lookups (#53) and single-descent get-merge-put (#52) were closed as not
+  planned. Reflink copies (#64) and a parallel `check` (#65; a 2.1 GB env
+  checks in 0.17 s instead of 0.42 s on an 8-core Mac, warm cache) are done;
+  LMDB has neither.
 
 ## Deliberate differences
 
