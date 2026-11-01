@@ -490,19 +490,6 @@ impl<'env> DirtyStore<'env> {
         unsafe { map_mut(self.broker, self.psize, pgno, len) }
     }
 
-    /// Shared view of the in-map frame of `len` bytes at `pgno`: a plain
-    /// subslice of the backing's shared map bytes, tied to `&self` like any
-    /// heap frame view (TXN-39/41).
-    #[inline]
-    fn map_frame(&self, pgno: u64, len: usize) -> &[u8] {
-        let off = (pgno as usize) * self.psize as usize;
-        let bytes = self
-            .broker
-            .expect("Slot::Map exists only in an in-map store")
-            .bytes();
-        &bytes[off..off + len]
-    }
-
     /// Keep a removed frame as a spare when it is a one-page heap frame and
     /// the pool has room; map frames and runs are dropped.
     fn park_spare(&mut self, slot: Slot) {
@@ -519,7 +506,17 @@ impl<'env> DirtyStore<'env> {
     pub fn bytes(&self, pgno: u64) -> Option<&[u8]> {
         match self.frames.get(&pgno)? {
             Slot::Heap(b) => Some(&**b),
-            Slot::Map { len } => Some(self.map_frame(pgno, *len)),
+            Slot::Map { len } => {
+                // Shared view of the in-map frame: a plain subslice of the
+                // backing's shared map bytes, tied to `&self` like any heap
+                // frame view (TXN-39/41).
+                let off = (pgno as usize) * self.psize as usize;
+                let bytes = self
+                    .broker
+                    .expect("Slot::Map exists only in an in-map store")
+                    .bytes();
+                Some(&bytes[off..off + *len])
+            }
         }
     }
 
@@ -671,8 +668,6 @@ impl<'env> DirtyStore<'env> {
         match f {
             Slot::Heap(b) => Some(b),
             Slot::Map { len } => {
-                // Inline rather than `map_frame`: the spare pool is borrowed
-                // mutably while `src` is alive.
                 let off = (pgno as usize) * self.psize as usize;
                 let bytes = self
                     .broker
