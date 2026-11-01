@@ -4,7 +4,7 @@
 //! introspection, so there is no through-heed path to drive C LMDB's
 //! `mdb_reader_list`. The quantities that *are* cross-engine comparable —
 //! `max_readers` and the `me_numreaders` high-water mark — are covered by
-//! `zerodb-oracle/tests/env_info_differential.rs`.
+//! `zerodb-oracle/tests/differential/env_info_differential.rs`.
 //!
 //! What is pinned here is ZeroDB's own contract, cross-checked against the
 //! reader-table facts `Env::info()` already exposes (`live_readers`, `num_readers`)
@@ -12,7 +12,7 @@
 //! default options, so they run with a lock file (ADR-0023), within one
 //! process: every reader is alive, so `clear_stale_readers` frees nothing.
 //! Reaping the slots of dead processes, and the PID column, are covered by
-//! `multi_process.rs` and `zerodb-oracle/tests/multi_process_differential.rs`.
+//! `multi_process.rs` and `zerodb-oracle/tests/multi_process/multi_process_differential.rs`.
 
 mod common;
 use common::TempDir;

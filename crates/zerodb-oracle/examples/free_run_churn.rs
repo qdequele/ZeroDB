@@ -8,7 +8,7 @@
 //! lengths: the pattern of Meilisearch documents (`obkv`) and compressed id
 //! sets updated across indexing batches. Where a value needs a run that only
 //! exists across two freed-page records, ZeroDB extends the file and LMDB
-//! does not (`tests/lmdb_free_run_observation.rs`); this measures what that
+//! does not (`tests/lmdb_observations/lmdb_free_run_observation.rs`); this measures what that
 //! costs over many commits.
 //!
 //! ```text

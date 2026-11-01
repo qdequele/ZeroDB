@@ -542,7 +542,7 @@ fn lay_out_and_free_a_then_b(env: &Env, dir: &Path, before_b: impl FnOnce()) {
 /// holds a long enough run. The partition walk after every commit (no page
 /// both reachable and free, none neither) shows each page left exactly one
 /// record when drawn. LMDB places it there too
-/// (`crates/zerodb-oracle/tests/lmdb_free_run_observation.rs`,
+/// (`crates/zerodb-oracle/tests/lmdb_observations/lmdb_free_run_observation.rs`,
 /// `big_run_across_two_records_cushioned`).
 #[test]
 fn run_across_two_gc_records_is_reused() {

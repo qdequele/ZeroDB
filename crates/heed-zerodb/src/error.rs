@@ -143,7 +143,7 @@ impl fmt::Display for MdbError {
     // liblmdb/mdb.c), which is what heed's `Display` prints: consumers format
     // these into logs and HTTP error bodies, so the wording is part of the
     // observable surface. Pinned against real heed by
-    // `zerodb-oracle/tests/adapter_surface_parity.rs`.
+    // `zerodb-oracle/tests/differential/adapter_surface_parity.rs`.
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             MdbError::KeyExist => f.write_str("MDB_KEYEXIST: Key/data pair already exists"),

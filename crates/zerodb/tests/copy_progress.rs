@@ -1,7 +1,7 @@
 //! `copy_to_file_with_progress`: a zerodb-defined extension (`mdb_env_copy2`
 //! reports no progress and heed exposes no callback), so there is no oracle
 //! to diff against. Copy byte-correctness is covered by
-//! `zerodb-oracle/tests/copy_to_file_differential.rs`; these tests pin the
+//! `zerodb-oracle/tests/differential/copy_to_file_differential.rs`; these tests pin the
 //! callback contract and that instrumenting a copy does not change its bytes.
 
 mod common;

@@ -11,7 +11,7 @@
 > (a crate literally named `heed`, since cargo `[patch]` matches by name — the
 > `package =` rename is ignored). milli and hannoy compile on the backend with
 > zero `.rs` edits (patch diffs in `docs/patches/`); the oracle re-run *through*
-> the adapter (`HeedZerodbEngine`, `tests/heed_adapter_differential.rs`) shows
+> the adapter (`HeedZerodbEngine`, `tests/differential/heed_adapter_differential.rs`) shows
 > zero divergences; heed's suite passes at the IN scope
 > (`crates/heed-zerodb/tests/heed_suite.rs`). Accept criteria 1–6 met. Answers
 > to OQ1 (never published — shim path/patch only), OQ2 (workspace-level

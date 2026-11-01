@@ -683,7 +683,7 @@ pointer). A split is **feasible** at `s` iff `used(L) ≤ C` **and** `used(R) �
     reachable: `max_node_size` guarantees two entries fit, SPEC 02 §4.2), the
     APPEND form applies instead.
 
-  Observed through the oracle (`crates/zerodb-oracle/tests/ascending_fill_parity.rs`,
+  Observed through the oracle (`crates/zerodb-oracle/tests/differential/ascending_fill_parity.rs`,
   `*_leaf_model*` tests): an ascending load of `n` entries over leaves of
   `cap` entries builds `ceil(n / cap)` leaves with APPEND and
   `1 + ceil((n − cap) / (cap − 1))` with plain puts, in both engines. Both
@@ -746,7 +746,7 @@ pointer). A split is **feasible** at `s` iff `used(L) ≤ C` **and** `used(R) �
   "new cell alone on `R`" would leave the right branch with a single child,
   violating the branch two-children minimum (INV-8). This is the fork's
   `mdb_page_split` split point for an end insert on a branch (observed via
-  the oracle: `crates/zerodb-oracle/tests/ascending_fill_parity.rs`, whose
+  the oracle: `crates/zerodb-oracle/tests/differential/ascending_fill_parity.rs`, whose
   `*_branch_parity` tests check both engines' branch counts and heights
   against this rule at 4 KiB and 16 KiB pages). Both sides are feasible by
   construction: `L` is a subset of the full page, and `R` holds a key-less
@@ -930,7 +930,7 @@ value of the entry at `ki[top]` **keeping the key**:
   irrelevant to the outcome.
 
   > Confirmed via oracle self-test 2026-07-15
-  > (`crates/zerodb-oracle/tests/flag_semantics.rs`:
+  > (`crates/zerodb-oracle/tests/differential/flag_semantics.rs`:
   > `cursor_put_current_append_ignores_position_when_greater` — key `>` last
   > succeeds while the cursor is parked at the *first* entry;
   > `cursor_put_current_append_not_greater_is_keyexist` — key `<` last and key
@@ -997,7 +997,7 @@ through the heed surface consumers actually use:
 | drain a `prefix_iter_mut` range | visits exactly the prefix's keys; the rest survives |
 
 > Observed against the fork 2026-09-10:
-> `crates/zerodb-oracle/tests/cursor_delete_position.rs` (7 cases) drives
+> `crates/zerodb-oracle/tests/differential/cursor_delete_position.rs` (7 cases) drives
 > `iter_mut` / `prefix_iter_mut` on both engines from one macro body and
 > requires an identical event trace **and** identical surviving content. The
 > drain cases span ~2 000 entries at the OS page size, so they cross leaf
@@ -1289,7 +1289,7 @@ parked 2.8.
 
 Observed against the oracle (heed =0.22.1 / lmdb-master-sys 0.2.6, fork
 `mdb.master.nested-rtxns`, macOS aarch64) by
-`crates/zerodb-oracle/tests/dup_pin_semantics.rs` and `dup_pin_ffi.rs` —
+`crates/zerodb-oracle/tests/lmdb_observations/dup_pin_semantics.rs` and `dup_pin_ffi.rs` —
 **before any zerodb dup code exists**. These tables are the normative record
 a revived 2.8 implementation must match; the tests are the executable form and
 remain committed and green (the park kept exactly this pinning work,

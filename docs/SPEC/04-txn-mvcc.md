@@ -1412,13 +1412,13 @@ every hook; this section defines the steps and their ordering. Both write modes
 | read snapshot pin | TXN-10..13 | SPEC 05 GC-18 |
 | reader table | TXN-14..25 | M1.8; loom suite L1–L5 (`zerodb-core/src/readers.rs`, `just loom`); stress gate (`zerodb/tests/reader_stress.rs`, `just stress`) |
 | memory ordering | TXN-15/17/19/20 | CONTRIBUTING.md (ARM), SPEC 06 |
-| nested read txn | TXN-26..36 | SPEC 00 row 16, SPEC 01 §S9; loom L6 (`zerodb-core/src/nested.rs`); fan-out gate (`zerodb/tests/nested_fanout.rs`); differential (`zerodb-oracle/tests/nested_read_differential.rs`) |
+| nested read txn | TXN-26..36 | SPEC 00 row 16, SPEC 01 §S9; loom L6 (`zerodb-core/src/nested.rs`); fan-out gate (`zerodb/tests/nested_fanout.rs`); differential (`zerodb-oracle/tests/differential/nested_read_differential.rs`) |
 | value-borrow contract | TXN-37..49 | SPEC 03 §3/§5/§7, SPEC 01 §S3/§S7 |
 | env clone/close/registry | TXN-50..55 | SPEC 00 rows 23–26 |
 | commit pipeline | TXN-61..64 | SPEC 06 REC-1..12 |
 | PREV_SNAPSHOT | TXN-65..67 | SPEC 01 §S5, SPEC 02 §3.2, SPEC 06 REC-5 |
-| database handle lifetime | DBI-1..10 (§13) | ADR-0024; SPEC 02 §6.1; D-026; `zerodb-oracle/tests/lmdb_dbi_handle_observation.rs`; unit tests in `zerodb-core/src/handles.rs` |
-| lock file (multi-process) | LCK-1..11 (§12); TXN-73 (§4.4); TXN-6/7, TXN-17..19, TXN-51/53, TXN-56, TXN-66 as amended | ADR-0023; SPEC 02 §8; SPEC 06 REC-1a; loom models in `zerodb-core/src/readers.rs`; `zerodb/tests/multi_process*.rs`; `zerodb-oracle/tests/multi_process_differential.rs`, `lmdb_reaping_observation.rs`, `lmdb_stage3_observation.rs` |
+| database handle lifetime | DBI-1..10 (§13) | ADR-0024; SPEC 02 §6.1; D-026; `zerodb-oracle/tests/lmdb_observations/lmdb_dbi_handle_observation.rs`; unit tests in `zerodb-core/src/handles.rs` |
+| lock file (multi-process) | LCK-1..11 (§12); TXN-73 (§4.4); TXN-6/7, TXN-17..19, TXN-51/53, TXN-56, TXN-66 as amended | ADR-0023; SPEC 02 §8; SPEC 06 REC-1a; loom models in `zerodb-core/src/readers.rs`; `zerodb/tests/multi_process*.rs`; `zerodb-oracle/tests/multi_process/multi_process_differential.rs`, `lmdb_reaping_observation.rs`, `lmdb_stage3_observation.rs` |
 
 **Rule count: TXN-1 … TXN-67 (67 normative rules; §4.4 adds sub-rule TXN-18a for
 slot release), plus the later TXN-68 … TXN-72 (§6.3a), TXN-73 (§4.4, added
@@ -1599,7 +1599,7 @@ and the futex), `zerodb-core::shared` (the safe interface the core sees) and
   A reaper that dies after its CAS leaves a slot carrying its own PID, which
   the next reaper frees. Reaping counts slots, not processes. **Reap
   points**, as observed in the LMDB fork (amendment 12,
-  `crates/zerodb-oracle/tests/lmdb_reaping_observation.rs`): an explicit
+  `crates/zerodb-oracle/tests/multi_process/lmdb_reaping_observation.rs`): an explicit
   `Env::clear_stale_readers` (`mdb_reader_check`); a writer that took the
   writer lock over from a dead owner (Linux; LCK-4), whose reap failure
   fails the write-txn begin and releases both locks; and the initializer,
@@ -1692,7 +1692,7 @@ A named database's handle is `(slot, generation)` into the env's slot table
 (`zerodb-core/src/handles.rs`; SPEC 02 §6.1). The main database's handle has
 no slot and is valid in every txn. The rules below reproduce what heed over
 the LMDB fork returns, except DBI-9 (divergence D-026). They are pinned by
-`crates/zerodb-oracle/tests/lmdb_dbi_handle_observation.rs`.
+`crates/zerodb-oracle/tests/lmdb_observations/lmdb_dbi_handle_observation.rs`.
 
 - **DBI-1 (slot states)** — A slot is *pending* while the live txns that
   opened it (its openers) have not committed, *published* once one of them

@@ -443,7 +443,7 @@ code, tests and other documents cite them by number.
     writer word's 128-byte line pair. The version bump makes a stage-1 lock
     file of a still-running process fail validation instead of being misread.
 12. **Reap points, as observed in the oracle.** The table below is observed
-    by `crates/zerodb-oracle/tests/lmdb_reaping_observation.rs`, which
+    by `crates/zerodb-oracle/tests/multi_process/lmdb_reaping_observation.rs`, which
     SIGKILLs a reader process and then checks whether `mdb_reader_list` still
     shows its slot. Results are identical on macOS aarch64 and Linux x86-64
     for every scenario run on both, and stable over repeated runs. ZeroDB reaps at exactly these points:
@@ -498,7 +498,7 @@ code, tests and other documents cite them by number.
 
 Status: **Approved (2026-10-12, maintainer)**: all twelve decisions at the end of
 amendment 18 are accepted as proposed. The LMDB behavior cited here is pinned by the
-`OBS_*` constants of `crates/zerodb-oracle/tests/lmdb_stage3_observation.rs`.
+`OBS_*` constants of `crates/zerodb-oracle/tests/multi_process/lmdb_stage3_observation.rs`.
 Each value was observed on both macOS aarch64 and Linux aarch64. The Linux
 results come from a privileged container (`--privileged`), which allowed the
 read-only bind mount and dropping to `nobody`. Without those privileges the

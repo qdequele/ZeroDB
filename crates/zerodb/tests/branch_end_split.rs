@@ -9,7 +9,7 @@
 //! committed image: after ascending loads, after random inserts and deletes on
 //! top of them, and after many small ascending commits.
 //! Page-count parity with LMDB lives in
-//! `crates/zerodb-oracle/tests/ascending_fill_parity.rs`.
+//! `crates/zerodb-oracle/tests/differential/ascending_fill_parity.rs`.
 
 mod common;
 use common::TempDir;

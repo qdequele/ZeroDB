@@ -287,7 +287,7 @@ fn commit_in_one_process_is_visible_in_another() {
 /// (ADR-0023 §4), so another process's commit is visible without this
 /// process opening a read txn of its own. Pinned by the LMDB observation
 /// `OBS_INFO_SEES_OTHER_COMMIT`/`OBS_STAT_SEES_OTHER_COMMIT`
-/// (`crates/zerodb-oracle/tests/lmdb_stage3_observation.rs`), both `true`.
+/// (`crates/zerodb-oracle/tests/multi_process/lmdb_stage3_observation.rs`), both `true`.
 #[test]
 fn info_and_stat_see_another_processes_commit() {
     let dir = TempDir::new();

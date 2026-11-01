@@ -62,7 +62,7 @@ The reference is the Meilisearch fork (`mdb.c`, `mdb_page_alloc`,
 
 ### What the differential test observed
 
-`crates/zerodb-oracle/tests/lmdb_free_run_observation.rs` (heed 0.22.1 over
+`crates/zerodb-oracle/tests/lmdb_observations/lmdb_free_run_observation.rs` (heed 0.22.1 over
 the fork against heed-zerodb; macOS aarch64 with 16 KiB pages and Linux
 aarch64 with 4 KiB pages, identical outcomes, 2026-10-19; page counts below
 are the 16 KiB run). Two overflow values `a` and `b` are written side by side, freed, and a value `c`

@@ -3,7 +3,7 @@
 //! * [`LmdbEngine`] is the reference: heed =0.22.1 over the Meilisearch LMDB
 //!   fork. See ADR-0001 for why this crate, and only this crate, links LMDB.
 //! * [`HeedZerodbEngine`] drives ZeroDB through the `heed-zerodb` adapter.
-//!   Paired against `LmdbEngine` in `tests/heed_adapter_differential.rs`, it
+//!   Paired against `LmdbEngine` in `tests/differential/heed_adapter_differential.rs`, it
 //!   checks that the adapter boundary adds no observable divergence (ADR-0003).
 //!
 //! Both are expanded from the same source over the two API-identical crate

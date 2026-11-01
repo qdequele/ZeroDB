@@ -160,7 +160,7 @@ impl<'a> Arbitrary<'a> for Value {
 /// Modeling `Unnamed` as milli's named `"main"` keeps the fuzz faithful and
 /// avoids surfacing engine-internal records (the catalog-record divergence in
 /// docs/LMDB-COMPATIBILITY.md). The true unnamed/root DB is covered on its own — with
-/// no catalog mixing — by `tests/unnamed_root_differential.rs`.
+/// no catalog mixing — by `tests/differential/unnamed_root_differential.rs`.
 #[derive(Arbitrary, Debug, Clone, PartialEq, Eq)]
 pub enum DbName {
     /// The primary database, modeled as milli's named `"main"` DB.

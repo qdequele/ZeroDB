@@ -146,7 +146,7 @@ fn sync_and_force_sync_are_both_reachable_and_succeed() {
     // The `sync(force)` extension, both values. On a default (non-NO_SYNC) env both
     // flush, so both simply succeed; the behavioral split is only visible
     // under NO_SYNC and is asserted in
-    // `zerodb-oracle/tests/force_sync_durability.rs` against the fault backing.
+    // `zerodb-oracle/tests/differential/force_sync_durability.rs` against the fault backing.
     env.sync(true).expect("sync(true)");
     env.sync(false).expect("sync(false)");
 

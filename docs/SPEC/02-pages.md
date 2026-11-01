@@ -770,7 +770,7 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     `T` (`EnvInner::current_snapshot`, SPEC 04 TXN-18), not this process's
     own cached snapshot, so another process's commit is visible as soon as it
     publishes — `OBS_INFO_SEES_OTHER_COMMIT`/`OBS_STAT_SEES_OTHER_COMMIT`
-    (both `true`, `crates/zerodb-oracle/tests/lmdb_stage3_observation.rs`).
+    (both `true`, `crates/zerodb-oracle/tests/multi_process/lmdb_stage3_observation.rs`).
     `map_size`, `max_readers`, `num_readers` and `live_readers` already come
     from the backing's published view and the shared reader table (above;
     SPEC 04 §4). `num_readers` is LMDB's shared high-water mark, counting
@@ -876,7 +876,7 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
 No consumer uses duplicates (SPEC 00 §B.1, D-004). A staged DUPSORT
 implementation was built, reviewed and **parked on 2026-07-20**
 (the scope rule, CONTRIBUTING.md rule 6) — the engine-side work is not merged;
-only the oracle observation pins landed (`zerodb-oracle/tests/dup_pin_semantics.rs`
+only the oracle observation pins landed (`zerodb-oracle/tests/lmdb_observations/dup_pin_semantics.rs`
 / `dup_pin_ffi.rs`, SPEC 03 §12.1). The format still reserves, but does not
 implement:
 

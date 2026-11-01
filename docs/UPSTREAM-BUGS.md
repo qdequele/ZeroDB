@@ -37,7 +37,7 @@ combination inside one write txn is plausible.
 
 **Harness guard:** `driver::classify` skips an `APPEND` put in any write txn
 that has run a `ClearDb` (`Skip::KnownForkBug`), on both engines. Pinned by
-`crates/zerodb-oracle/tests/fork_bug_guard.rs`.
+`crates/zerodb-oracle/tests/lmdb_observations/fork_bug_guard.rs`.
 
 **ZeroDB:** returns `KeyExist`, as SPEC 01 §S1 requires
 ([D-007](LMDB-COMPATIBILITY.md#d-007)).

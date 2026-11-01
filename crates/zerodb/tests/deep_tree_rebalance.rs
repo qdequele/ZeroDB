@@ -1,5 +1,5 @@
 //! Confirms that the wide-key geometry used by
-//! `crates/zerodb-oracle/tests/write_rebalance_differential.rs` actually
+//! `crates/zerodb-oracle/tests/differential/write_rebalance_differential.rs` actually
 //! reaches depth >= 3 (branch-of-branches), and that the delete cascade walks
 //! all the way back down to an empty, depth-0 tree. The oracle's `Op` model
 //! has no depth-introspection op, so depth is asserted here against

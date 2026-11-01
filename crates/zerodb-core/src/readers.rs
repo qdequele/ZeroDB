@@ -425,7 +425,7 @@ impl ReaderTable {
     /// live readers ever observed** by the env, and it never decreases. LMDB's
     /// own header documents it as "number of reader slots used", which is
     /// misleading; the differential test in
-    /// `zerodb-oracle/tests/env_info_differential.rs` observed the real
+    /// `zerodb-oracle/tests/differential/env_info_differential.rs` observed the real
     /// behavior. ZeroDB reproduces it exactly (LMDB parity) and offers
     /// the genuinely-live count separately as [`ReaderTable::in_use`].
     ///

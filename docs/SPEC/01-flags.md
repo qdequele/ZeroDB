@@ -106,7 +106,7 @@ and never appear as a user-visible `PutFlags` bit; `MULTIPLE` is unexposed.
 | `MDB_NOOVERWRITE` | `0x10` | `PutFlags::NO_OVERWRITE` | **SHOULD** ‡ | 1.10 | `flag_no_overwrite_returns_existing` | If the key already exists, **do not overwrite**: LMDB copies the existing value into the caller's `data` (`*data = d2`) and returns `MDB_KEYEXIST` → heed `MdbError::KeyExist`. The returned-existing-value contract is load-bearing (§S2). No consumer passes it, but M1.10 lists it in Phase-1 scope (‡, Mismatches note 2). |
 | `MDB_NODUPDATA` | `0x20` | `PutFlags::NO_DUP_DATA` | **WON'T** (→2.8) | — | — | DUPSORT-only: skip if the key/value pair already exists; on `mdb_cursor_del` removes all dups. No consumer (no DUPSORT DB). D-004. |
 | `MDB_CURRENT` | `0x40` | `Cursor::put_current` (internal) | **MUST** | 1.4 | `cursor_put_current_overwrite`, `cursor_put_current_uninit_einval` | SPEC 00 row 33 (milli/arroy/hannoy/cellulite `put_current`/`put_current_with_options`). Overwrite the value at the current cursor position. Requires the cursor be positioned (`C_INITIALIZED`) else `EINVAL`. The `_with_options` form re-encodes with a different data codec. `unsafe`: no live borrow into the entry may span the call (§S3). |
-| `MDB_RESERVE` | `0x10000` | `Database::put_reserved` (internal) | **MUST** | 1.10 | `put_reserved_writes_into_map`, `put_reserved_overwrite_same_size` | SPEC 00 row 35 (milli word-prefix docids). Allocate space for the value and return a pointer to it (`data->mv_data = METADATA(page)` / `= olddata.mv_data`); the caller fills it in-place, avoiding a temp buffer. ~~Not valid with DUPSORT~~ **observed 2.8a pin: lmdb.h forbids it with DUPSORT but the fork does NOT reject it — the reserved bytes are stored as an ordinary dup value (SPEC 03 §12.1 O5; pinned by `zerodb-oracle/tests/dup_pin_semantics.rs`, adopted as spec text in the 2026-10-05 maintainer-authorized docs pass; the DUPSORT work itself stays parked, D-004)**. Lifetime + `WRITE_MAP` interaction in §S3/§S7. |
+| `MDB_RESERVE` | `0x10000` | `Database::put_reserved` (internal) | **MUST** | 1.10 | `put_reserved_writes_into_map`, `put_reserved_overwrite_same_size` | SPEC 00 row 35 (milli word-prefix docids). Allocate space for the value and return a pointer to it (`data->mv_data = METADATA(page)` / `= olddata.mv_data`); the caller fills it in-place, avoiding a temp buffer. ~~Not valid with DUPSORT~~ **observed 2.8a pin: lmdb.h forbids it with DUPSORT but the fork does NOT reject it — the reserved bytes are stored as an ordinary dup value (SPEC 03 §12.1 O5; pinned by `zerodb-oracle/tests/lmdb_observations/dup_pin_semantics.rs`, adopted as spec text in the 2026-10-05 maintainer-authorized docs pass; the DUPSORT work itself stays parked, D-004)**. Lifetime + `WRITE_MAP` interaction in §S3/§S7. |
 | `MDB_APPEND` | `0x20000` | `PutFlags::APPEND` | **MUST** | 1.10 | `flag_append_out_of_order`, `flag_append_ascending_ok`, `flag_append_equal_key_keyexist` | SPEC 00 rows 32/33 (arroy bulk item append; milli facet bulk via `put_current_with_options`). Fast bulk insert assuming ascending key order: LMDB positions at the **last** key and compares (`md_cmp(key, last)`). If `key > last` → insert at end (no page split). If `key <= last` (**including equal**) → `MDB_KEYEXIST` → heed `KeyExist` → arroy `InvalidItemAppend`. Only the last key is checked, not full order (§S1). |
 | `MDB_APPENDDUP` | `0x40000` | `PutFlags::APPEND_DUP` | **WON'T** (→2.8) | — | — | DUPSORT append of a dup value in sorted order. No consumer (no DUPSORT DB). D-004. |
 | `MDB_MULTIPLE` | `0x80000` | *(unexposed by heed)* | **WON'T** (→2.8) | — | — | DUPFIXED-only bulk-store of many fixed-size dup values in one call; `data[1].mv_size` carries the count. Returns `MDB_INCOMPATIBLE` if the DB is not DUPFIXED. Not exposed by heed; no consumer. D-004. |
@@ -159,7 +159,7 @@ heed user-facing method in the SPEC 00 surface.
 
 ### §S1 — `MDB_APPEND`: last-key compare, not full-order validation
 
-> Confirmed empirically via oracle self-test 2026-07-15 (`tests/flag_semantics.rs`: append tests — out-of-order and equal-to-last both `KeyExist`, empty-db append ok).
+> Confirmed empirically via oracle self-test 2026-07-15 (`tests/differential/flag_semantics.rs`: append tests — out-of-order and equal-to-last both `KeyExist`, empty-db append ok).
 
 `_mdb_cursor_put` with `MDB_APPEND` does **not** perform a normal tree search.
 It calls `mdb_cursor_last`, then `md_cmp(new_key, last_key)`:
@@ -185,7 +185,7 @@ The heed → error path is `MDB_KEYEXIST` → `MdbError::KeyExist` → (arroy)
 
 ### §S2 — `MDB_NOOVERWRITE`: the returned-existing-value contract
 
-> Confirmed empirically via oracle self-test 2026-07-15 (`tests/flag_semantics.rs`: NOOVERWRITE collision returns the existing value).
+> Confirmed empirically via oracle self-test 2026-07-15 (`tests/differential/flag_semantics.rs`: NOOVERWRITE collision returns the existing value).
 
 When the key exists, LMDB does **not** just return an error — it first writes the
 existing value back into the caller's `MDB_val *data` (`*data = d2;`) and *then*
@@ -232,7 +232,7 @@ returns `KeyExist` without exposing the existing bytes is a divergence.
   `BadValSize`.
 
 **Confirmed via oracle self-test 2026-07-15** (`zerodb-oracle`
-`tests/key_bounds.rs`: `max_key_size_is_511_and_map_size_independent`,
+`tests/differential/key_bounds.rs`: `max_key_size_is_511_and_map_size_independent`,
 `key_size_511_boundary_and_empty_key_rejection`), observed directly against the
 fork through heed 0.22.1 on macOS aarch64:
 
@@ -266,7 +266,7 @@ Two caveats on scope:
 
 ### §S5 — `MDB_PREVSNAPSHOT` open protocol
 
-> Confirmed empirically via oracle self-test 2026-07-15 (`tests/flag_semantics.rs`: PREV_SNAPSHOT opens older meta; flag auto-clears after first commit).
+> Confirmed empirically via oracle self-test 2026-07-15 (`tests/differential/flag_semantics.rs`: PREV_SNAPSHOT opens older meta; flag auto-clears after first commit).
 
 - Meta selection: `mdb_env_pick_meta` returns
   `metas[(metas[0]->mm_txnid < metas[1]->mm_txnid) ^ (flags & PREVSNAPSHOT)]`.
@@ -417,7 +417,7 @@ Order of checks, each with its exact code, for zerodb's M1.6 catalog to match:
    directly in the vendored `mdb.c`. For the main DB (`name == NULL`),
    requested persistent flags are **OR'd into** the main record and persist
    on commit. See SPEC 03 §12.1 O8/O9 and
-   `zerodb-oracle/tests/dup_pin_semantics.rs::pin_flags_persistence_open_mismatch`.
+   `zerodb-oracle/tests/lmdb_observations/dup_pin_semantics.rs::pin_flags_persistence_open_mismatch`.
 
 Since Phase 1 rejects all persistent DB flags (D-004), checks 4/5/8's
 dup/integer branches are dormant, but the `CREATE`/`NOTFOUND`/`EACCES`/`DBS_FULL`/
@@ -541,7 +541,7 @@ reproducing all three decisions of the fork's `mdb_env_sync0` in order:
 
 A call that does flush always issues the barrier even with nothing pending,
 matching LMDB. Proved against the M1.11 fault-injection backing in
-`zerodb-oracle/tests/force_sync_durability.rs` (the journal must be empty after
+`zerodb-oracle/tests/differential/force_sync_durability.rs` (the journal must be empty after
 `force_sync`, and the crash-floor image must then read back every committed
 key).
 

@@ -1,7 +1,7 @@
 //! `Env::stat()` and `Env::info()` — the **zerodb-defined** half. The
 //! cross-engine half (`last_txnid`, `entries`, `num_readers`, `max_readers` —
 //! the fields whose values are format-independent) lives in
-//! `crates/zerodb-oracle/tests/env_info_differential.rs`.
+//! `crates/zerodb-oracle/tests/differential/env_info_differential.rs`.
 //!
 //! The page counts (`branch_pages` / `leaf_pages` / `overflow_pages`) are
 //! format-specific by construction (ZeroDB has its own on-disk format), so
@@ -270,7 +270,7 @@ fn env_info_num_readers_is_a_high_water_mark() {
     // LMDB parity: `MDB_envinfo::me_numreaders` is monotone — it is the
     // maximum number of simultaneously live readers ever observed, and ending a
     // read txn does not lower it. The cross-engine proof is in
-    // `zerodb-oracle/tests/env_info_differential.rs`; this pins the native side.
+    // `zerodb-oracle/tests/differential/env_info_differential.rs`; this pins the native side.
     let dir = TempDir::new();
     let env = open_with(dir.path(), 4096, 8, 32);
     assert_eq!(env.info().num_readers, 0);

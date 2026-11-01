@@ -822,7 +822,7 @@ fn single_process_path_is_unchanged() {
 }
 
 // Reaping (ADR-0023 §3). The LMDB fork, observed by
-// `zerodb-oracle/tests/lmdb_reaping_observation.rs`, reaps dead readers
+// `zerodb-oracle/tests/multi_process/lmdb_reaping_observation.rs`, reaps dead readers
 // in `mdb_reader_check` and when a writer takes over a dead writer's lock
 // (Linux), and nowhere else: not at read-txn begin, write commit, a
 // joiner's open or a full table. The tests below pin each of those.

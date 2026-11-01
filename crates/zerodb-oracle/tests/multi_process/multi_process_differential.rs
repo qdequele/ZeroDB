@@ -991,7 +991,7 @@ fn sole_opener_after_a_larger_run_matches_lmdb() {
 /// commit without this process opening a read txn of its own:
 /// `(last_txnid advanced, entries advanced)`
 /// (`OBS_INFO_SEES_OTHER_COMMIT`/`OBS_STAT_SEES_OTHER_COMMIT`, both `true` —
-/// `crates/zerodb-oracle/tests/lmdb_stage3_observation.rs`). A differential
+/// `crates/zerodb-oracle/tests/multi_process/lmdb_stage3_observation.rs`). A differential
 /// tuple for
 /// `multi_process.rs::info_and_stat_see_another_processes_commit`.
 #[test]
