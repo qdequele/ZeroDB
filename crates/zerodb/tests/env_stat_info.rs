@@ -14,39 +14,12 @@
 //!   2. `Env::stat()` must equal `main_database().stat(&rtxn)` exactly — the
 //!      env-level and per-DB views of the same tree cannot disagree.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::{assert_clean, TempDir};
 
-use zerodb::{check, Env, EnvOpenOptions};
+use std::path::Path;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("zerodb-envstat-{pid}-{nanos}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{Env, EnvOpenOptions};
 
 const MAP: usize = 16 << 20;
 
@@ -57,12 +30,6 @@ fn open_with(dir: &Path, psize: u32, max_dbs: u32, max_readers: u32) -> Env {
     opts.max_dbs(max_dbs);
     opts.max_readers(max_readers);
     opts.open(dir).expect("open env")
-}
-
-fn assert_clean(dir: &Path, psize: u32) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, psize);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
 }
 
 // ---------------------------------------------------------------------------

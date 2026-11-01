@@ -19,37 +19,15 @@
 //! under the reader shows up as a checksum/shape mismatch, and any snapshot
 //! mutation shows up as a walk-digest mismatch (TXN-11 immutability).
 
-use std::path::{Path, PathBuf};
+mod common;
+use common::TempDir;
+
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use zerodb::{Env, EnvFlags, EnvOpenOptions, Error, MdbError, RoTxn};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-rdrstress-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 const PS: u32 = 4096;
 const MAP: usize = 64 << 20;
@@ -163,7 +141,7 @@ fn stress_readers_vs_spilling_writer() {
     readers_vs_churn(Some(128 * PS as usize), 800, EnvFlags::EMPTY);
 }
 
-/// The same stress with an **in-place `WRITE_MAP`** writer (ADR-0021 B4,
+/// The same stress with an **in-place `WRITE_MAP`** writer (ADR-0021,
 /// SPEC 04 TXN-45b): every churn txn stores its dirty pages straight into
 /// the writable map mid-txn — fresh and GC-reclaimed pgnos alike — while 8
 /// readers hold and re-walk older snapshots, and nested-free commits

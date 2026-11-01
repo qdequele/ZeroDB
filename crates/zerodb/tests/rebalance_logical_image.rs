@@ -23,37 +23,14 @@
 //! `ZERODB_PRINT_GOLDEN=1 cargo test -p zerodb --test rebalance_logical_image -- --nocapture`
 //! and say in the change why the shape moved.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::TempDir;
+
+use std::path::PathBuf;
 
 use zerodb::{check, CompactionOption, CopyToFile, Database, Env, EnvFlags, EnvOpenOptions};
 use zerodb::{RwTxn, TxnRead};
 use zerodb_core::page::{BranchRef, LeafRef, LeafValue, PGNO_INVALID};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-rebal-image-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 /// FNV-1a, 64-bit: a fixed, dependency-free digest, stable across Rust
 /// releases and architectures (unlike `DefaultHasher`).

@@ -15,36 +15,13 @@
 //! - nested read children see the writer's in-map dirty state;
 //! - `put_reserved` fills the in-map frame (inline and overflow-run).
 
+mod common;
+use common::{assert_clean, TempDir};
+
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
-use zerodb::{check, Database, Env, EnvFlags, EnvOpenOptions};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-wmip-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{Database, Env, EnvFlags, EnvOpenOptions};
 
 const PS: u32 = 4096;
 
@@ -55,12 +32,6 @@ fn open(dir: &Path, flags: EnvFlags) -> Env {
         .max_dbs(4)
         .flags(flags);
     opts.open(dir).expect("open env")
-}
-
-fn assert_clean(dir: &Path) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, PS);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
 }
 
 struct Rng(u64);
@@ -176,8 +147,8 @@ fn in_place_matches_default_mode() {
         let seed = 0xADB0_0021 + r;
         round(&wm, wdb, &mut wmodel, seed, r);
         round(&hp, hdb, &mut hmodel, seed, r);
-        assert_clean(wm_dir.path());
-        assert_clean(hp_dir.path());
+        assert_clean(wm_dir.path(), PS);
+        assert_clean(hp_dir.path(), PS);
     }
     let (rw, rh) = (wm.read_txn().unwrap(), hp.read_txn().unwrap());
     assert_eq!(contents(&rw, wdb), contents(&rh, hdb));
@@ -220,7 +191,7 @@ fn abort_leaves_the_last_commit() {
     }
     w.commit().unwrap();
     let before = contents(&env.read_txn().unwrap(), db);
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     // A txn that dirties plenty of pages in place (inline + overflow), then
     // aborts.
@@ -236,7 +207,7 @@ fn abort_leaves_the_last_commit() {
     }
     w.abort();
     assert_eq!(contents(&env.read_txn().unwrap(), db), before);
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     // Reopen: the meta never advanced, the garbage is unreferenced.
     drop(env);
@@ -254,7 +225,7 @@ fn abort_leaves_the_last_commit() {
             .unwrap();
     }
     w.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     assert_eq!(
         contents(&env.read_txn().unwrap(), db).len(),
         before.len() + 4_000
@@ -284,7 +255,7 @@ fn put_reserved_fills_the_map_frame() {
     assert_eq!(db.get(&w, b"inline").unwrap(), Some(inline.as_slice()));
     assert_eq!(db.get(&w, b"big").unwrap(), Some(big.as_slice()));
     w.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     let r = env.read_txn().unwrap();
     assert_eq!(db.get(&r, b"inline").unwrap(), Some(inline.as_slice()));

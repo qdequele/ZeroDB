@@ -13,35 +13,12 @@
 //! where the survivor is on either side. Every commit is validated with the
 //! SPEC 03 §11 walker.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::{assert_clean, TempDir};
 
-use zerodb::{check, Env, EnvOpenOptions, TxnRead};
+use std::path::Path;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-deep-sym-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{Env, EnvOpenOptions, TxnRead};
 
 const PS: u32 = 4096;
 const MAP: usize = 16 << 20;
@@ -51,12 +28,6 @@ fn open(dir: &Path) -> Env {
     opts.map_size(MAP);
     opts.page_size(PS);
     opts.open(dir).expect("open env")
-}
-
-fn assert_clean(dir: &Path) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, PS);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
 }
 
 /// Same wide-key geometry as `deep_tree_rebalance.rs` (~7 entries/page at
@@ -86,7 +57,7 @@ fn descending_delete_drives_borrow_and_merge_from_left() {
     let rec = *TxnRead::main_record(&wtxn);
     assert!(rec.depth >= 3, "geometry must reach depth >= 3");
     wtxn.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     // Strictly descending: every rebalance sees its sibling on the LEFT.
     let mut wtxn = env.write_txn().unwrap();
@@ -99,7 +70,7 @@ fn descending_delete_drives_borrow_and_merge_from_left() {
     assert_eq!(rec.leaf_pages, 0);
     assert_eq!(rec.branch_pages, 0);
     wtxn.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     let rtxn = env.read_txn().unwrap();
     assert!(db.is_empty(&rtxn).unwrap());
@@ -123,7 +94,7 @@ fn interior_band_delete_merges_in_both_directions() {
     }
     assert!(TxnRead::main_record(&wtxn).depth >= 3);
     wtxn.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     // Hollow out the middle half [100, 300), alternating ends of the band so
     // the underful frontier advances from BOTH sides toward the middle.
@@ -139,7 +110,7 @@ fn interior_band_delete_merges_in_both_directions() {
     }
     assert_eq!(TxnRead::main_record(&wtxn).entries, 200);
     wtxn.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     // Both flanks intact and correctly ordered.
     let rtxn = env.read_txn().unwrap();

@@ -18,37 +18,14 @@
 //! cursor put (`RwTxn::shadow_check_put_path`), so a wrong repair fails
 //! there even when the yielded entries happen to agree.
 
+mod common;
+use common::{assert_clean, TempDir};
+
 use std::collections::BTreeMap;
 use std::ops::Bound;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
-use zerodb::{check, Database, Env, EnvFlags, EnvOpenOptions, PutFlags};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-cursor-split-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{Database, Env, EnvFlags, EnvOpenOptions, PutFlags};
 
 const PS: u32 = 4096;
 const MODES: [EnvFlags; 2] = [EnvFlags::EMPTY, EnvFlags::WRITE_MAP];
@@ -57,12 +34,6 @@ fn open(dir: &Path, flags: EnvFlags) -> Env {
     let mut opts = EnvOpenOptions::new();
     opts.map_size(64 << 20).page_size(PS).flags(flags);
     opts.open(dir).expect("open env")
-}
-
-fn assert_clean(dir: &Path) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, PS);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
 }
 
 fn dump(db: &Database, env: &Env) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -197,7 +168,7 @@ fn rewrite_walk_through_branch_splits_and_root_grow() {
             }
             assert_eq!(seen, expected, "walk skipped or repeated entries");
             w.commit().unwrap();
-            assert_clean(dir.path());
+            assert_clean(dir.path(), PS);
             let want: Vec<(Vec<u8>, Vec<u8>)> = model.into_iter().collect();
             assert_eq!(dump(&db, &env), want);
         }
@@ -336,7 +307,7 @@ fn random_cursor_puts_match_a_model() {
                 }
             }
             w.commit().unwrap();
-            assert_clean(dir.path());
+            assert_clean(dir.path(), PS);
             let want: Vec<(Vec<u8>, Vec<u8>)> = model.into_iter().collect();
             assert_eq!(dump(&db, &env), want, "seed {seed}");
         }

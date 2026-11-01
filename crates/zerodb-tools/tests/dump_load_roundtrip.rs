@@ -2,19 +2,12 @@
 //! pure zerodb — no heed): the two dumps are byte-identical and the reloaded env
 //! is invariant-clean.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::TempDir;
+
+use std::path::Path;
 
 use zerodb::{Env, EnvOpenOptions};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmp_dir(tag: &str) -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let p = std::env::temp_dir().join(format!("zerodb-tools-{tag}-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&p).unwrap();
-    p
-}
 
 /// Build an env with main user data + named DBs (one with overflow, one empty).
 fn build(dir: &Path) {
@@ -44,15 +37,16 @@ fn build(dir: &Path) {
 
 #[test]
 fn dump_load_dump_is_byte_identical() {
-    let a = tmp_dir("src");
+    let a = TempDir::new("src");
     build(&a);
 
     let dump1 = zerodb_tools::commands::cmd_dump(&a).unwrap();
 
-    let dump_file = tmp_dir("dumpfile").join("out.dump");
+    let dump_file_dir = TempDir::new("dumpfile");
+    let dump_file = dump_file_dir.join("out.dump");
     std::fs::write(&dump_file, dump1.as_bytes()).unwrap();
 
-    let b = tmp_dir("dst");
+    let b = TempDir::new("dst");
     zerodb_tools::commands::cmd_load(&dump_file, &b, 4096, 64 << 20).unwrap();
 
     // The reloaded env is invariant-clean...
@@ -66,7 +60,7 @@ fn dump_load_dump_is_byte_identical() {
 
 #[test]
 fn stat_runs_on_a_closed_env() {
-    let a = tmp_dir("stat-src");
+    let a = TempDir::new("stat-src");
     build(&a);
     let report = zerodb_tools::commands::cmd_stat(&a).unwrap();
     assert!(report.contains("database posts:"), "stat report:\n{report}");
@@ -78,9 +72,10 @@ fn stat_runs_on_a_closed_env() {
 /// require byte-identical text. Returns the dump.
 fn round_trip(src: &Path, page_size: u32) -> String {
     let dump1 = zerodb_tools::commands::cmd_dump(src).unwrap();
-    let dump_file = tmp_dir("rt-dumpfile").join("out.dump");
+    let dump_file_dir = TempDir::new("rt-dumpfile");
+    let dump_file = dump_file_dir.join("out.dump");
     std::fs::write(&dump_file, dump1.as_bytes()).unwrap();
-    let dst = tmp_dir("rt-dst");
+    let dst = TempDir::new("rt-dst");
     zerodb_tools::commands::cmd_load(&dump_file, &dst, page_size, 1 << 20).unwrap();
     let (report, clean) = zerodb_tools::commands::cmd_check(&dst).unwrap();
     assert!(clean, "reloaded env failed check:\n{report}");
@@ -99,7 +94,7 @@ fn open_env(dir: &Path) -> Env {
 
 #[test]
 fn round_trip_empty_env() {
-    let a = tmp_dir("rt-empty");
+    let a = TempDir::new("rt-empty");
     let env = open_env(&a);
     env.write_txn().unwrap().commit().unwrap();
     drop(env);
@@ -112,7 +107,7 @@ fn round_trip_empty_env() {
 
 #[test]
 fn round_trip_many_named_dbs() {
-    let a = tmp_dir("rt-many");
+    let a = TempDir::new("rt-many");
     let env = open_env(&a);
     let mut wtxn = env.write_txn().unwrap();
     for d in 0u32..300 {
@@ -132,7 +127,7 @@ fn round_trip_many_named_dbs() {
 
 #[test]
 fn round_trip_large_values_and_special_keys() {
-    let a = tmp_dir("rt-special");
+    let a = TempDir::new("rt-special");
     let env = open_env(&a);
     let mut wtxn = env.write_txn().unwrap();
     let main = env.main_database();

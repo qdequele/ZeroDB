@@ -1,7 +1,7 @@
 [package]
 name = "zerodb-io"
 version = "0.2.0"
-description = "ZeroDB I/O layer: memory-mapped reads, pwrite/pwritev commit backends and fsync strategies."
+description = "Internal I/O layer of ZeroDB (memory maps, commit writes, lock file); use the zerodb crate."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -23,6 +23,6 @@ default = []
 # (ADR-0008). Test infrastructure: the oracle enables it; consumer builds never do.
 fault = []
 # Heap-backed writable-map stand-in so the in-place WRITE_MAP brokered
-# discipline runs under miri (ADR-0021 M1). Test infrastructure: the
+# discipline runs under miri (ADR-0021). Test infrastructure: the
 # zerodb-core / heed-zerodb dev-deps enable it; consumer builds never do.
 test-backing = []

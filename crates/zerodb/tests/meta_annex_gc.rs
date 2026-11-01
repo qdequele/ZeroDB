@@ -4,36 +4,13 @@
 //! observable state (file size, `check_image`, `free_page_count`, the meta
 //! bytes) rather than internals.
 
+mod common;
+use common::TempDir;
+
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use zerodb::{check, free_page_count, CompactionOption, CopyToFile, Env, EnvFlags, EnvOpenOptions};
 use zerodb_core::page::{MetaPage, MetaValidity, PGNO_INVALID};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-annex-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 const PS: u32 = 4096;
 const MAP: usize = 32 << 20;
@@ -144,7 +121,7 @@ fn steady_state_annex_only_gc_tree_stays_empty() {
     steady_state_annex_only_gc_tree_stays_empty_inner(EnvFlags::EMPTY);
 }
 
-/// WRITE_MAP in-place twin (ADR-0021 M3 convention): the same steady-state
+/// WRITE_MAP in-place twin (ADR-0021 convention): the same steady-state
 /// churn, but with dirty pages realized in the writable map. The annex draw
 /// (ids reused from the meta's loose pool, not fresh-extended pages — see the
 /// flat `file_size` assertions below) is orthogonal to WRITE_MAP's dirty-page
@@ -212,7 +189,7 @@ fn reader_gate_blocks_annex_draw_then_carry_reclaims() {
     reader_gate_blocks_annex_draw_then_carry_reclaims_inner(EnvFlags::EMPTY);
 }
 
-/// WRITE_MAP in-place twin (ADR-0021 M3 convention) of the parked-reader
+/// WRITE_MAP in-place twin (ADR-0021 convention) of the parked-reader
 /// case: the GC-31 gate and GC-30 carry are meta free-list bookkeeping,
 /// independent of whether dirty pages are realized in the writable map, so
 /// the same growth-then-settle shape must hold. `assert_mode` tripwires that

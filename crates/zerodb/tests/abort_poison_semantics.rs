@@ -8,35 +8,12 @@
 //! - Abort after an overflow-run-heavy mutation leaves the data file
 //!   byte-identical.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::{assert_clean, TempDir};
 
-use zerodb::{check, Env, EnvOpenOptions, Error, MdbError};
+use std::path::Path;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-poison-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{Env, EnvOpenOptions, Error, MdbError};
 
 const PS: u32 = 4096;
 const MAP: usize = 8 << 20;
@@ -46,12 +23,6 @@ fn open(dir: &Path) -> Env {
     opts.map_size(MAP);
     opts.page_size(PS);
     opts.open(dir).expect("open env")
-}
-
-fn assert_clean(dir: &Path) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, PS);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
 }
 
 #[test]
@@ -84,7 +55,7 @@ fn oversized_key_error_does_not_poison_txn() {
     assert_eq!(db.len(&wtxn).unwrap(), 1);
     // And commit succeeds — the ultimate proof the txn was never poisoned.
     wtxn.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     let rtxn = env.read_txn().unwrap();
     assert_eq!(

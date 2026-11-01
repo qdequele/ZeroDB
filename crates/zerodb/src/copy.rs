@@ -76,8 +76,7 @@ use zerodb_core::page::FIRST_DATA_PGNO;
 use zerodb_core::page::{MetaPage, FORMAT_VERSION, F_SUBDATA, MAGIC};
 use zerodb_core::{for_each_entry_flagged, named_databases, RoTxn};
 
-/// Whether [`CopyToFile::copy_to_file`] compacts (`heed::CompactionOption`,
-/// SPEC 00 row 59). `Enabled` rewrites into a fresh, densely-packed env with no
+/// Whether [`CopyToFile::copy_to_file`] compacts (`heed::CompactionOption`). `Enabled` rewrites into a fresh, densely-packed env with no
 /// free pages (`MDB_CP_COMPACT`); `Disabled` copies the snapshot's pages
 /// verbatim, keeping the freelist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +109,7 @@ pub struct CopyProgress {
     pub total: u64,
 }
 
-/// `Env::copy_to_file` (SPEC 00 row 17). Produces a **single data file** (a
+/// `Env::copy_to_file`. Produces a **single data file** (a
 /// `zerodb.dat`-format image); to open the copy as an env, place it as
 /// `<dir>/zerodb.dat` and open `<dir>`.
 pub trait CopyToFile {
@@ -209,7 +208,7 @@ pub trait CopyToFile {
 impl CopyToFile for Env {
     fn copy_to_file(&self, path: impl AsRef<Path>, option: CompactionOption) -> Result<()> {
         // The progress form's code path with a callback that does nothing, so
-        // the no-callback signature (heed parity, SPEC 00 row 17) cannot
+        // the no-callback signature (heed parity) cannot
         // drift from the instrumented one. The one difference: with no
         // progress to report, a raw copy may clone the whole file.
         copy_to_path(
@@ -285,9 +284,10 @@ fn stream_to_path(
         armed: true,
     };
     plan.write(env, txn, &file, 0, src, progress)?;
-    drop(file); // close the temp file before renaming it
-                // Last callback before `dest` is touched — see the panic contract on
-                // `copy_to_file_with_progress`.
+    // Close the temp file before renaming it.
+    drop(file);
+    // The last callback before `dest` is touched; see the panic contract on
+    // `copy_to_file_with_progress`.
     progress.finish();
     std::fs::rename(&tmp, dest)?;
     guard.armed = false;
@@ -543,17 +543,10 @@ fn clone_raw(
 /// as [`create_staging_file`] names its file.
 fn create_staging_dir(dest: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
-    let mut attempt = 0u32;
-    loop {
-        let tmp = staging_name(dest)?;
-        match std::fs::DirBuilder::new().mode(0o700).create(&tmp) {
-            Ok(()) => return Ok(tmp),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
-                attempt += 1;
-            }
-            Err(e) => return Err(Error::Io(e)),
-        }
-    }
+    let (tmp, ()) = create_staging(dest, |tmp| {
+        std::fs::DirBuilder::new().mode(0o700).create(tmp)
+    })?;
+    Ok(tmp)
 }
 
 /// Removes a clone's staging file (if still there) and directory on drop.
@@ -659,16 +652,26 @@ impl Plan {
 /// is the caller's; the final rename replaces it.
 fn create_staging_file(dest: &Path) -> Result<(PathBuf, File)> {
     use std::os::unix::fs::OpenOptionsExt;
-    let mut attempt = 0u32;
-    loop {
-        let tmp = staging_name(dest)?;
-        match std::fs::OpenOptions::new()
+    create_staging(dest, |tmp| {
+        std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&tmp)
-        {
-            Ok(f) => return Ok((tmp, f)),
+            .open(tmp)
+    })
+}
+
+/// Run `create` on fresh [`staging_name`]s until one does not exist yet
+/// (up to 17 tries), returning the name and what `create` made.
+fn create_staging<T>(
+    dest: &Path,
+    create: impl Fn(&Path) -> std::io::Result<T>,
+) -> Result<(PathBuf, T)> {
+    let mut attempt = 0u32;
+    loop {
+        let tmp = staging_name(dest)?;
+        match create(&tmp) {
+            Ok(made) => return Ok((tmp, made)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
                 attempt += 1;
             }
@@ -743,7 +746,7 @@ fn corrupt(_e: zerodb_core::page::PageError) -> Error {
 /// Non-compact copy: the snapshot's data pages `[FIRST_DATA_PGNO, last_pg]`
 /// copied verbatim from the map, with two freshly-encoded meta slots pinned to
 /// this snapshot (so the copy opens at exactly snapshot `T`, even if the live
-/// env has committed newer metas since the txn began — SPEC 00 row 17).
+/// env has committed newer metas since the txn began).
 ///
 /// The data pages are written straight from the map in large positioned
 /// writes, as LMDB's `mdb_env_copyfd` writes from its map: no in-memory image
@@ -768,15 +771,11 @@ fn write_raw(
     file.write_all_at(&snapshot_metas(env, txn)?, base)?;
 
     // Data pages in chunks, so progress is observable.
-    let pages_per_chunk = pages_per_chunk(n_pages, psize);
-    let mut pg = FIRST_DATA_PGNO.min(n_pages);
-    while pg < n_pages {
-        let end = (pg + pages_per_chunk).min(n_pages);
+    for_each_chunk(FIRST_DATA_PGNO, n_pages, psize, progress, |pg, end| {
         let (from, to) = (pg as usize * ps, end as usize * ps);
         file.write_all_at(&src[from..to], base + from as u64)?;
-        pg = end;
-        progress.advance_to(pg);
-    }
+        Ok(())
+    })?;
     Ok(data_end as u64)
 }
 
@@ -796,13 +795,10 @@ fn copy_raw_file(
     use std::io::{Read, Seek, SeekFrom};
     let psize = env.page_size();
     let n_pages = txn.snapshot().last_pg + 1;
-    let chunk_pages = pages_per_chunk(n_pages, psize);
     let mut reader = &src.file;
     reader.seek(SeekFrom::Start(0))?;
     let mut writer = file;
-    let mut pg = 0;
-    while pg < n_pages {
-        let end = (pg + chunk_pages).min(n_pages);
+    for_each_chunk(0, n_pages, psize, progress, |pg, end| {
         let want = (end - pg) * u64::from(psize);
         // `File` to `File`: std copies in the kernel where it can.
         let got = std::io::copy(&mut reader.take(want), &mut writer)?;
@@ -810,9 +806,8 @@ fn copy_raw_file(
             // The data file is shorter than the snapshot it holds: corrupt.
             return Err(Error::Mdb(MdbError::Invalid));
         }
-        pg = end;
-        progress.advance_to(pg);
-    }
+        Ok(())
+    })?;
     // The file's own meta pages were copied too; replace them.
     file.write_all_at(&snapshot_metas(env, txn)?, base)?;
     Ok(n_pages * u64::from(psize))
@@ -829,8 +824,28 @@ fn pages_per_chunk(n_pages: u64, psize: u32) -> u64 {
     (n_pages / PROGRESS_STEPS).clamp(1, MAX_CHUNK_BYTES / u64::from(psize))
 }
 
+/// Call `copy(pg, end)` for each chunk of pages `[pg, end)` from `first` up
+/// to `n_pages`, in order, reporting progress after each one.
+fn for_each_chunk(
+    first: u64,
+    n_pages: u64,
+    psize: u32,
+    progress: &mut Progress<'_>,
+    mut copy: impl FnMut(u64, u64) -> Result<()>,
+) -> Result<()> {
+    let chunk = pages_per_chunk(n_pages, psize);
+    let mut pg = first.min(n_pages);
+    while pg < n_pages {
+        let end = (pg + chunk).min(n_pages);
+        copy(pg, end)?;
+        pg = end;
+        progress.advance_to(pg);
+    }
+    Ok(())
+}
+
 /// The raw image's two meta slots, both built for `txn`'s snapshot, so the
-/// copy opens at exactly that snapshot (SPEC 00 row 17).
+/// copy opens at exactly that snapshot.
 fn snapshot_metas(env: &Env, txn: &RoTxn<'_>) -> Result<Vec<u8>> {
     let psize = env.page_size();
     let ps = psize as usize;
