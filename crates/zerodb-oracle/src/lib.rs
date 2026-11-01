@@ -33,8 +33,7 @@
 pub mod crash;
 pub mod driver;
 mod engine;
-mod heed_zerodb_engine;
-mod lmdb;
+mod heed_engine;
 mod op;
 mod result;
 pub mod tempdir;
@@ -42,8 +41,7 @@ mod zerodb_engine;
 
 pub use driver::{classify, TxnState};
 pub use engine::Engine;
-pub use heed_zerodb_engine::HeedZerodbEngine;
-pub use lmdb::LmdbEngine;
+pub use heed_engine::{HeedZerodbEngine, LmdbEngine};
 pub use op::{walk_value, DbName, Key, Op, PutFlag, Value};
 pub use result::{OpResult, OracleError, Skip};
 pub use zerodb_engine::ZerodbEngine;
