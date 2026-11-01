@@ -2,7 +2,7 @@
 //! batch of image cuts across all durability modes, one deterministic and one
 //! asynchronous SIGKILL cycle, and determinism of a cut's verification. The
 //! volume runs live in `just crash-test-quick` / `crash-test-full`
-//! (ADR-0008 D3); this keeps `cargo test` self-sufficient.
+//! (ADR-0008); this keeps `cargo test` self-sufficient.
 
 use std::path::PathBuf;
 
@@ -96,7 +96,7 @@ fn writemap_image_cuts_run_in_place() {
 
 #[test]
 fn image_cut_reports_are_deterministic() {
-    // Same seed ⇒ same spec, plans, and verdict (ADR-0008 OQ4 end-to-end).
+    // Same seed ⇒ same spec, plans, and verdict (ADR-0008 end-to-end).
     let a = run_image_cut(4242, &opts(1));
     let b = run_image_cut(4242, &opts(1));
     assert_eq!(a.verified, b.verified);

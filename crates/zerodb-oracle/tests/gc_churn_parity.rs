@@ -1,5 +1,5 @@
 //! GC acceptance: file-size parity with the LMDB fork under insert/delete
-//! churn (ADR-0005 D5).
+//! churn (ADR-0005).
 //!
 //! Two identical seeded workloads drive the fork (via heed, at the OS page
 //! size) and zerodb (psize 4096) side by side; `real_disk_size` is recorded after
@@ -191,7 +191,7 @@ fn churn_parity_no_overflow() {
     let zdir = TempDir::new().unwrap();
     let lmdb = run_lmdb(ldir.path(), &cycles);
     let zdb = run_zerodb(zdir.path(), &cycles);
-    // Lower edge 0.60 (ADR-0005 D5 addendum; SPEC 03 §6.4 insert-point split)
+    // Lower edge 0.60 (ADR-0005; SPEC 03 §6.4 insert-point split)
     // is a sanity bound, not the acceptance — bounded growth + the upper edge are.
     // zerodb legitimately packs ascending churn tighter than the fork, and the
     // fork's page size here is the OS page size (16 KiB on macOS ARM) vs

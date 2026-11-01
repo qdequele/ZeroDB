@@ -1,5 +1,5 @@
 //! Parity of leaf-page fill on ascending plain-put workloads (SPEC 03 §6.4
-//! end-of-page insert-point rule, ADR-0005 D5).
+//! end-of-page insert-point rule, ADR-0005).
 //!
 //! milli's dominant write pattern is ascending keys (facet ids, docids, sorted
 //! bulk). A median-fit split leaves ~50 %-full leaves on such loads, ~2× the
@@ -152,7 +152,7 @@ fn assert_leaf_parity(tag: &str, n: u32, wide: bool, vlen: usize, tol: f64) {
         ratio >= 1.0 - tol && ratio <= 1.0 + tol,
         "[{tag}] leaf-page ratio {ratio:.3} outside +/-{tol} band \
          (zerodb {zdb} leaves vs fork {lmdb} at psize {ps}); the §6.4 end-of-page \
-         rule must pack ascending plain puts like the fork (ADR-0005 D5)"
+         rule must pack ascending plain puts like the fork (ADR-0005)"
     );
 }
 

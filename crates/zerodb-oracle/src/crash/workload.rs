@@ -1,4 +1,4 @@
-//! Seeded crash workloads (ADR-0008 D2): the oracle [`Op`] model decoded from
+//! Seeded crash workloads (ADR-0008): the oracle [`Op`] model decoded from
 //! a deterministic PRNG byte stream, with value inflation to reach REC-21's
 //! 0 B–16 MB band, plus the per-cycle durability-mode pick (SPEC 06 §3).
 
@@ -8,7 +8,7 @@ use zerodb_io::fault::{splitmix64, Rng};
 
 use crate::{decode_ops, DbName, Key, Op, Value};
 
-/// Durability mode of one crash cycle (SPEC 06 REC-9..12; ADR-0008 D4).
+/// Durability mode of one crash cycle (SPEC 06 REC-9..12; ADR-0008).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Both barriers run — loses nothing on crash (REC-6).
@@ -20,7 +20,7 @@ pub enum Mode {
     NoMetaSync,
     /// `NO_SYNC`: no barriers; structural consistency only under ordered
     /// writeback (REC-11) — verified under the ordered sub-model, only
-    /// characterized under the adversarial one (ADR-0008 OQ3).
+    /// characterized under the adversarial one (ADR-0008).
     NoSync,
     /// `WRITE_MAP | MAP_ASYNC`: async msync — same window as `NO_SYNC`
     /// (REC-9/REC-11).
@@ -138,7 +138,7 @@ pub fn gen_spec(seed: u64) -> Spec {
     let page_size = if rng.ratio(1, 8) { 8192 } else { 4096 };
     let big = rng.ratio(1, 48);
     // Generous maps: `MapFull` is unmodeled (cycles abandon on it) and the
-    // fault backend's memory tracks *usage*, not the map (ADR-0008 D1).
+    // fault backend's memory tracks *usage*, not the map (ADR-0008).
     let map_size: u64 = if big { 128 << 20 } else { 64 << 20 };
     // Drawn last so every earlier field keeps its value for a given seed.
     let dirty_limit = rng.ratio(1, 3).then(|| 8 + rng.below(120) as u64);

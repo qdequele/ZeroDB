@@ -1,9 +1,9 @@
-//! Mechanism B — child-process SIGKILL crash cycles (REC-17, ADR-0008 D2):
+//! Mechanism B — child-process SIGKILL crash cycles (REC-17, ADR-0008):
 //! the real OS path (real file, real mmap/pwrite or writable map). A child
 //! runs the seeded workload and dies — deterministically (`abort()` at a
 //! seeded `(commit, hook)` via the commit pipeline's [`CommitHook`]) or
 //! asynchronously (parent SIGKILL after a seeded wall-clock delay, which can land *mid*-C2,
-//! a state the hooks cannot produce; ADR-0008 OQ2 keeps this in CI because
+//! a state the hooks cannot produce; ADR-0008 keeps this in CI because
 //! verification tolerates any legal recovery point).
 //!
 //! SIGKILL does not tear writes (the OS page cache survives, REC-17), so
@@ -311,7 +311,7 @@ pub fn run_sigkill_cycle(seed: u64, opts: &SigkillOpts) -> CutReport {
     }
     exec.finish();
     // Sidecar acks must be a prefix of the replayed commit log — the
-    // mechanism-B leg of the ADR-0008 D6.3 drift guard.
+    // mechanism-B leg of the ADR-0008 drift guard.
     if side.commits.as_slice() != &exec.commit_log[..side.commits.len().min(exec.commit_log.len())]
         || side.commits.len() > exec.commit_log.len()
     {

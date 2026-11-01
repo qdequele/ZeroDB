@@ -42,9 +42,9 @@ pub struct Key(pub Vec<u8>);
 ///
 /// The large branch is deliberately bounded at 64 KiB: the differential populates
 /// a real LMDB env of a fixed [`DIFF_MAP_SIZE`](crate::DIFF_MAP_SIZE), so a 64-op
-/// sequence must stay well under the map to avoid `MapFull` (which the
-/// rebuild-on-commit zerodb harness does not model) and to keep per-iteration
-/// temp files small. The overflow *algorithm* is length-independent, so 16-page
+/// sequence must stay well under the map to avoid `MapFull` (see
+/// [`DIFF_MAP_SIZE`](crate::DIFF_MAP_SIZE)) and to keep per-iteration temp
+/// files small. The overflow *algorithm* is length-independent, so 16-page
 /// runs exercise it as thoroughly as 750-page runs; a multi-MB overflow value is
 /// unit-tested separately in the zerodb read path.
 #[derive(Clone, PartialEq, Eq, Hash)]

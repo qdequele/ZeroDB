@@ -1,5 +1,5 @@
 //! Mechanism A — in-process image-based crash cycles (REC-19/REC-20,
-//! ADR-0008 D2): workload on a [`FaultBacking`], simulated power cut at a
+//! ADR-0008): workload on a [`FaultBacking`], simulated power cut at a
 //! commit hook (H0..H4) or an op boundary, N fault-plan images materialized,
 //! each reopened and verified per REC-18.
 
@@ -23,7 +23,7 @@ use super::CutReport;
 use crate::tempdir::TempDir;
 
 /// A [`CommitHook`] that freezes the fault journal at the `commit`-th
-/// pipeline entry, at `point` — capture, don't kill (ADR-0008 D2): the cut
+/// pipeline entry, at `point` — capture, don't kill (ADR-0008): the cut
 /// state is cloned and the workload continues, so the model also records the
 /// in-flight commit's final state.
 ///
@@ -62,11 +62,11 @@ impl CommitHook for CaptureHook {
 pub struct ImageOpts {
     /// Fault-plan images per cut (each = one counted cycle).
     pub variants: usize,
-    /// ADR-0008 D6.1 mutation self-test: break the data barrier accounting.
+    /// ADR-0008 mutation self-test: break the data barrier accounting.
     /// The harness MUST then report a violation — see `crash_mutation.rs`.
     pub broken_barriers: bool,
     /// Registry path for the workload env (reuse per worker arms the
-    /// deregistration tripwire, ADR-0008 D6.2).
+    /// deregistration tripwire, ADR-0008).
     pub env_path: PathBuf,
     /// Registry path for verification reopens (same reuse rationale).
     pub verify_path: PathBuf,
@@ -158,9 +158,9 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
     let mut rng = Rng::new(splitmix64(seed ^ 0x0000_1A9E_0000_1A9E));
     let abandon = |why: String| CutFail::Abandon(why);
 
-    // Real temp file + real mmap backing under the fault wrapper (ADR-0008 D1
+    // Real temp file + real mmap backing under the fault wrapper (ADR-0008
     // Option B): the live view is production-identical; only durability is
-    // simulated. WRITE_MAP modes open the real writable map (ADR-0021 B3):
+    // simulated. WRITE_MAP modes open the real writable map (ADR-0021):
     // the fault wrapper then forwards the brokered dirty-page slices, so the
     // cycle runs the true in-place realization and the journal tracks the
     // brokered regions instead of (never-issued) C2 writes.
@@ -227,7 +227,7 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
     };
 
     // Run the workload, cross-checking every op against the model
-    // (ADR-0008 D6.3: drift fails loudly BEFORE the crash is injected).
+    // (ADR-0008: drift fails loudly BEFORE the crash is injected).
     // `boundary_cap` carries the acked txnid AT the cut (capture-and-continue
     // means workload-end acks are later than the cut's — the durability
     // obligations compare against the cut-time value).
@@ -272,7 +272,7 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
     env.set_commit_hook(None);
     drop(env); // release the registry entry; the fault journal lives on
 
-    // ADR-0021 B3 tripwires: under the WRITE_MAP modes the cycle must have
+    // ADR-0021 tripwires: under the WRITE_MAP modes the cycle must have
     // run the in-place realization — every data page goes through the
     // brokered map slice, never `write_at_page` (C2 and spills write nothing
     // for in-map frames) — so any journaled fd *data* write means the
@@ -283,7 +283,7 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
         return Err(CutFail::Violation {
             detail: format!(
                 "in-place WRITE_MAP cycle issued {} fd data write(s) — the brokered realization \
-                 disengaged (ADR-0021 B3 vacuousness tripwire)",
+                 disengaged (ADR-0021 vacuousness tripwire)",
                 stats.data_writes
             ),
             artifact: None,
@@ -337,7 +337,7 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
         artifact: Some((ceil_img.clone(), "ceil (all pending applied)".to_string())),
     })?;
 
-    // Pipeline-shape assertions per mode (ADR-0008 D4).
+    // Pipeline-shape assertions per mode (ADR-0008).
     if spec.mode.bounded_window() && ceil.saturating_sub(floor) > 1 {
         return Err(CutFail::Violation {
             detail: format!(
@@ -364,7 +364,7 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
         });
     }
 
-    // Materialize + verify (ADR-0008 D4): bounded-window modes run the full
+    // Materialize + verify (ADR-0008): bounded-window modes run the full
     // adversarial fault model WITH full REC-18 checks; NO_SYNC/MAP_ASYNC
     // split into the ordered sub-model (full checks) and the adversarial
     // sub-model (taxonomy-only probes, characterization logged).

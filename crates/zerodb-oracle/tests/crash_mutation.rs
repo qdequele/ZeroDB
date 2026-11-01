@@ -1,4 +1,4 @@
-//! ADR-0008 D6.1 — the harness mutation self-test.
+//! ADR-0008 — the harness mutation self-test.
 //!
 //! A crash harness that cannot catch the bug class it exists for is
 //! untrustworthy. This test breaks the *fault model's barrier accounting*
@@ -50,7 +50,7 @@ fn broken_data_barriers_are_caught_within_budget() {
         }
     }
     let (i, v) = caught.unwrap_or_else(|| {
-        panic!("harness failed to catch a data-fsync-less pipeline within {BUDGET} default-mode cuts — the fault model is too kind (ADR-0008 D6.1)")
+        panic!("harness failed to catch a data-fsync-less pipeline within {BUDGET} default-mode cuts — the fault model is too kind (ADR-0008)")
     });
     // Visible with --nocapture / in CI logs: what the tripwire actually fired.
     eprintln!("mutation self-test caught (cut {i}): {v}");
