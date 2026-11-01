@@ -316,7 +316,8 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
   `ValidatedPages::insert`), and the trusted residual is two calls per entry
   against LMDB's one. `scan/edge/first_last` is 1.41× in both modes: every
   call re-resolves the tree from the root. Range scans, paged listings and
-  seeks are faster than LMDB. Cache-line prefetch (#17) and branchless page
+  point seeks (`seek/ge/rand`, `seq`) are faster than LMDB; seeks into gaps
+  (`seek/ge/gap`) trail at 1.06× by default and 1.01× trusted. Cache-line prefetch (#17) and branchless page
   search (#16) were closed: the latter slowed gets down.
 - **Point gets and the build profile** (#147) — LTO makes point gets 3–10 %
   faster with LMDB flat, from small `zerodb-core` accessors the heed adapter
