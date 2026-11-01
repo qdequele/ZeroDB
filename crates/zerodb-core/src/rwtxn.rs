@@ -795,10 +795,6 @@ fn choose_split(sizes: &[usize], cap: usize) -> usize {
     }
 }
 
-fn corrupt(e: PageError) -> Error {
-    map_page_err(e)
-}
-
 fn poisoned_error() -> Error {
     Error::Io(std::io::Error::other(
         "environment poisoned by a failed durability barrier (SPEC 06 REC-13)",
@@ -927,11 +923,6 @@ pub struct RwTxn<'env> {
     /// fires (like `RwCursor::repaired_keeps`). Debug builds only.
     #[cfg(debug_assertions)]
     finger_hits: u64,
-    /// Runs served by the cross-record run search
-    /// ([`RwTxn::cross_record_run`]) this txn — a test signal that the
-    /// search actually fires. Debug builds only.
-    #[cfg(debug_assertions)]
-    cross_runs: u64,
     /// LMDB `MDB_TXN_ERROR` parity: a mid-mutation failure (e.g. `MapFull`
     /// inside a split cascade) leaves the working tree partial, so every later
     /// mutation and `commit` returns `BadTxn`; only abort is valid.
@@ -1078,8 +1069,6 @@ impl Env {
             read_high: base.last_pg,
             #[cfg(debug_assertions)]
             finger_hits: 0,
-            #[cfg(debug_assertions)]
-            cross_runs: 0,
             psize: inner.page_size(),
             dirty,
             // ADR-0018: the writer probes the env
@@ -1243,7 +1232,7 @@ impl TxnRead for RwTxn<'_> {
     fn free_annex_count(&self) -> u64 {
         // Working-state view (like `free_record`): the base annex pool's
         // live remainder — drawn ids are no longer free.
-        Drain::len(&self.annex) as u64
+        self.annex.len() as u64
     }
     fn page_size(&self) -> u32 {
         self.psize
@@ -1489,10 +1478,10 @@ impl<'env> RwTxn<'env> {
         PageRef::new_trusted_psize(
             self.source()
                 .bytes_from(self.psize, pgno)
-                .map_err(corrupt)?,
+                .map_err(map_page_err)?,
             self.psize,
         )
-        .map_err(corrupt)
+        .map_err(map_page_err)
     }
 
     /// `allocate(n)` (SPEC 05 GC-16, ADR-0005): loose fast path, then a GC
@@ -1977,10 +1966,6 @@ impl<'env> RwTxn<'env> {
             let first_time = work_mut!(self).reclaimed.insert(p);
             debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
         }
-        #[cfg(debug_assertions)]
-        {
-            self.cross_runs += 1;
-        }
         Ok(Some(start))
     }
 
@@ -2416,8 +2401,8 @@ impl<'env> RwTxn<'env> {
         let valid = Some(&self.validated);
         for _ in 0..=rec.depth {
             // One source resolution per level; a non-tree page type maps
-            // through `corrupt` to `Invalid`.
-            match node_view(self.source(), self.psize, pgno, valid).map_err(corrupt)? {
+            // through `map_page_err` to `Invalid`.
+            match node_view(self.source(), self.psize, pgno, valid).map_err(map_page_err)? {
                 NodeView::Leaf(leaf) => {
                     let (ki, found) = match leaf.lookup_with(key, cmp) {
                         Ok(i) => (i, true),
@@ -2464,8 +2449,8 @@ impl<'env> RwTxn<'env> {
         let valid = Some(&self.validated);
         let mut owned = true;
         for _ in 0..=rec.depth {
-            let (view, from_map) =
-                node_view_classified(self.source(), self.psize, pgno, valid).map_err(corrupt)?;
+            let (view, from_map) = node_view_classified(self.source(), self.psize, pgno, valid)
+                .map_err(map_page_err)?;
             owned &= !from_map;
             match view {
                 NodeView::Leaf(leaf) => {
@@ -2514,7 +2499,7 @@ impl<'env> RwTxn<'env> {
                     let (ppg, pki) = path[level - 1];
                     let frame = self.dirty.bytes_mut(ppg).expect("parent already touched");
                     BranchMut::from_valid(frame, self.psize)
-                        .map_err(corrupt)?
+                        .map_err(map_page_err)?
                         .set_child_pgno(pki, np);
                 }
             }
@@ -2680,12 +2665,10 @@ impl<'env> RwTxn<'env> {
     /// cheapest-first so a random put pays two record compares and one leaf
     /// slot check, not the spine walk.
     fn finger_consider(&mut self, tree: TreeId, path: &[(u64, usize)], before: &DBRecord) {
-        if tree == TreeId::Free {
-            // Deliberately unfingered: the GC tree is written almost solely
-            // inside `freelist_save`, whose rewrite/delete interleaving would
-            // invalidate a finger at every step — cost without a consumer.
-            return;
-        }
+        // Only sequential-writes trees reach here, and the GC tree is never
+        // one (`seq_writes_on`): `freelist_save`'s rewrites would invalidate
+        // a finger at every step.
+        debug_assert_ne!(tree, TreeId::Free, "the GC tree is never fingered");
         let rec = *self.record(tree);
         if rec.depth != before.depth
             || rec.leaf_pages != before.leaf_pages
@@ -3029,7 +3012,7 @@ impl<'env> RwTxn<'env> {
         // inline value, `Ok((head, dsize))` for a BIGDATA one.
         let (old_big, new_inline) = {
             let frame = self.dirty.bytes(lpg).expect("leaf touched");
-            let leaf = LeafRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
+            let leaf = LeafRef::new_prevalidated(frame, self.psize).map_err(map_page_err)?;
             let old_big = match leaf.value(ki) {
                 LeafValue::Inline(v) => Err(v.len() as u32),
                 LeafValue::Overflow { head_pgno, dsize } => Ok((head_pgno, dsize)),
@@ -3043,8 +3026,9 @@ impl<'env> RwTxn<'env> {
                 // place (§6.1; the `MDB_RESERVE`/`put_current` fast path).
                 let frame = self.dirty.bytes_mut(lpg).expect("leaf touched");
                 let (off, dsize) = {
-                    let leaf = LeafMut::from_valid(&mut *frame, self.psize).map_err(corrupt)?;
-                    leaf.inline_value_at(ki).map_err(corrupt)?
+                    let leaf =
+                        LeafMut::from_valid(&mut *frame, self.psize).map_err(map_page_err)?;
+                    leaf.inline_value_at(ki).map_err(map_page_err)?
                 };
                 if let ValSrc::Val(v) = val {
                     frame[off..off + dsize as usize].copy_from_slice(v);
@@ -3065,9 +3049,9 @@ impl<'env> RwTxn<'env> {
         {
             let frame = self.dirty.bytes_mut(lpg).expect("leaf touched");
             LeafMut::from_valid(frame, self.psize)
-                .map_err(corrupt)?
+                .map_err(map_page_err)?
                 .remove(ki)
-                .map_err(corrupt)?;
+                .map_err(map_page_err)?;
         }
         // entries unchanged: replace, not insert.
         self.insert_into_leaf(tree, path, ki, key, val, false, node_flags)
@@ -3084,7 +3068,7 @@ impl<'env> RwTxn<'env> {
         let pg = self.allocate(1)?;
         {
             let frame = self.dirty.insert_tree_frame(pg);
-            LeafMut::init(frame, self.psize, pg, self.txnid).map_err(corrupt)?;
+            LeafMut::init(frame, self.psize, pg, self.txnid).map_err(map_page_err)?;
         }
         let rec = self.record_mut(tree);
         rec.root = pg;
@@ -3114,7 +3098,7 @@ impl<'env> RwTxn<'env> {
             let (lpg, _) = *path.last().expect("non-empty path");
             let r = {
                 let frame = self.dirty.bytes_mut(lpg).expect("leaf is dirty");
-                let mut leaf = LeafMut::from_valid(frame, psize).map_err(corrupt)?;
+                let mut leaf = LeafMut::from_valid(frame, psize).map_err(map_page_err)?;
                 match &val {
                     ValSrc::Val(v) => leaf.insert_inline(ki, key, node_flags, v),
                     ValSrc::Reserve(n) => {
@@ -3139,7 +3123,7 @@ impl<'env> RwTxn<'env> {
                     // The cell may have landed on either split half.
                     Ok(ReserveLoc::Inline { at: None })
                 }
-                Err(e) => Err(corrupt(e)),
+                Err(e) => Err(map_page_err(e)),
             }
         } else {
             // Overflow run first (§6.2), then the BIGDATA pointer cell. The
@@ -3157,7 +3141,7 @@ impl<'env> RwTxn<'env> {
             {
                 let run = self.dirty.insert_run_frame(head, n);
                 let written = write_overflow_head(run, psize, head, self.txnid, n as u32, payload)
-                    .map_err(corrupt)?;
+                    .map_err(map_page_err)?;
                 if payload.len() > written {
                     let rest = &payload[written..];
                     run[ps..ps + rest.len()].copy_from_slice(rest);
@@ -3167,7 +3151,7 @@ impl<'env> RwTxn<'env> {
             let (lpg, _) = *path.last().expect("non-empty path");
             let r = {
                 let frame = self.dirty.bytes_mut(lpg).expect("leaf is dirty");
-                let mut leaf = LeafMut::from_valid(frame, psize).map_err(corrupt)?;
+                let mut leaf = LeafMut::from_valid(frame, psize).map_err(map_page_err)?;
                 leaf.insert_bigdata(ki, key, dsize, head)
             };
             match r {
@@ -3184,7 +3168,7 @@ impl<'env> RwTxn<'env> {
                     )?;
                     Ok(ReserveLoc::Big(head))
                 }
-                Err(e) => Err(corrupt(e)),
+                Err(e) => Err(map_page_err(e)),
             }
         }
     }
@@ -3193,7 +3177,7 @@ impl<'env> RwTxn<'env> {
 
     fn extract_branch_cells(&self, pgno: u64) -> Result<Vec<OwnedBranchCell>> {
         let frame = self.dirty.bytes(pgno).expect("page is dirty");
-        let br = BranchRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
+        let br = BranchRef::new_prevalidated(frame, self.psize).map_err(map_page_err)?;
         let mut cells = Vec::with_capacity(br.num_keys());
         for i in 0..br.num_keys() {
             cells.push(OwnedBranchCell {
@@ -3210,10 +3194,10 @@ impl<'env> RwTxn<'env> {
         let psize = self.psize;
         let txnid = self.txnid;
         let frame = self.dirty.bytes_mut(pgno).expect("page is dirty");
-        let mut br = BranchMut::init(frame, psize, pgno, txnid).map_err(corrupt)?;
+        let mut br = BranchMut::init(frame, psize, pgno, txnid).map_err(map_page_err)?;
         for (i, c) in cells.iter().enumerate() {
             let sep: &[u8] = if i == 0 { &[] } else { &c.key };
-            br.insert(i, sep, c.child).map_err(corrupt)?;
+            br.insert(i, sep, c.child).map_err(map_page_err)?;
         }
         Ok(())
     }
@@ -3249,7 +3233,7 @@ impl<'env> RwTxn<'env> {
         let n_old = {
             let frame = self.dirty.bytes(lpg).expect("leaf is dirty");
             LeafRef::new_prevalidated(frame, psize)
-                .map_err(corrupt)?
+                .map_err(map_page_err)?
                 .num_keys()
         };
 
@@ -3259,7 +3243,7 @@ impl<'env> RwTxn<'env> {
         // the new cell goes alone, as for an APPEND.
         let end_pair = !append && newindx == n_old && n_old >= 2 && {
             let frame = self.dirty.bytes(lpg).expect("leaf is dirty");
-            let leaf = LeafRef::new_prevalidated(frame, psize).map_err(corrupt)?;
+            let leaf = LeafRef::new_prevalidated(frame, psize).map_err(map_page_err)?;
             leaf_cell_used(&leaf, n_old - 1) + val.used(key.len()) <= body_size(psize)
         };
         // End split (§6.4) without repacking the left frame. APPEND, or a
@@ -3277,7 +3261,7 @@ impl<'env> RwTxn<'env> {
                 let frame = self.dirty.bytes_mut(lpg).expect("leaf is dirty");
                 let i = n_old - 1;
                 let (mkey, mflags, mval) = {
-                    let leaf = LeafRef::new_prevalidated(&*frame, psize).map_err(corrupt)?;
+                    let leaf = LeafRef::new_prevalidated(&*frame, psize).map_err(map_page_err)?;
                     // Preserve non-BIGDATA node flags (F_SUBDATA) across the
                     // move (SPEC 02 §6); F_BIGDATA is re-derived on write.
                     let flags = leaf.node_flags(i) & !crate::page::F_BIGDATA;
@@ -3291,9 +3275,9 @@ impl<'env> RwTxn<'env> {
                     (leaf.key(i).to_vec(), flags, v)
                 };
                 LeafMut::from_valid(&mut *frame, psize)
-                    .map_err(corrupt)?
+                    .map_err(map_page_err)?
                     .remove(i)
-                    .map_err(corrupt)?;
+                    .map_err(map_page_err)?;
                 Some((mkey, mflags, mval))
             } else {
                 None
@@ -3302,15 +3286,16 @@ impl<'env> RwTxn<'env> {
             {
                 let txnid = self.txnid;
                 let frame = self.dirty.insert_tree_frame(rpg);
-                let mut leaf = LeafMut::init(frame, psize, rpg, txnid).map_err(corrupt)?;
+                let mut leaf = LeafMut::init(frame, psize, rpg, txnid).map_err(map_page_err)?;
                 let slot = match &moved {
                     Some((mkey, mflags, Moved::Inline(v))) => {
-                        leaf.insert_inline(0, mkey, *mflags, v).map_err(corrupt)?;
+                        leaf.insert_inline(0, mkey, *mflags, v)
+                            .map_err(map_page_err)?;
                         1
                     }
                     Some((mkey, _, Moved::Big { head, dsize })) => {
                         leaf.insert_bigdata(0, mkey, *dsize, *head)
-                            .map_err(corrupt)?;
+                            .map_err(map_page_err)?;
                         1
                     }
                     None => 0,
@@ -3324,7 +3309,7 @@ impl<'env> RwTxn<'env> {
                         leaf.insert_bigdata(slot, key, *dsize, *head)
                     }
                 }
-                .map_err(corrupt)?;
+                .map_err(map_page_err)?;
             }
             sat_add(&mut self.record_mut(tree).leaf_pages, 1);
             // sep = first key of R (§6.4): the moved old last key, or the new key.
@@ -3341,7 +3326,7 @@ impl<'env> RwTxn<'env> {
         // `Box` — plus the caller's new cell. No owned per-cell copies.
         let rpg = self.allocate(1)?;
         let old = self.dirty.remove(lpg).expect("leaf is dirty");
-        let oldleaf = LeafRef::new_prevalidated(&old, psize).map_err(corrupt)?;
+        let oldleaf = LeafRef::new_prevalidated(&old, psize).map_err(map_page_err)?;
         let total = n_old + 1;
         let mut sizes = Vec::with_capacity(total);
         for j in 0..total {
@@ -3392,18 +3377,10 @@ impl<'env> RwTxn<'env> {
         let top = path.len() - 1;
         let to_right = cell.0 == rpg;
         if top == 0 {
-            self.insert_into_branch_follow(tree, path, -1, 0, sep, rpg, Some(to_right))?;
+            self.insert_into_branch(tree, path, -1, 0, sep, rpg, Some(to_right))?;
         } else {
             let at = path[top - 1].1 + 1;
-            self.insert_into_branch_follow(
-                tree,
-                path,
-                top as isize - 1,
-                at,
-                sep,
-                rpg,
-                Some(to_right),
-            )?;
+            self.insert_into_branch(tree, path, top as isize - 1, at, sep, rpg, Some(to_right))?;
         }
         // Written last: a root grow above reads `path[0]` as the old root.
         path[top] = cell;
@@ -3430,7 +3407,7 @@ impl<'env> RwTxn<'env> {
         let psize = self.psize;
         let txnid = self.txnid;
         let frame = self.dirty.insert_tree_frame(pgno);
-        let mut leaf = LeafMut::init(frame, psize, pgno, txnid).map_err(corrupt)?;
+        let mut leaf = LeafMut::init(frame, psize, pgno, txnid).map_err(map_page_err)?;
         for (slot, j) in (from..to).enumerate() {
             let r = match j.cmp(&newindx) {
                 Ordering::Equal => match val {
@@ -3455,7 +3432,7 @@ impl<'env> RwTxn<'env> {
                     }
                 }
             };
-            r.map_err(corrupt)?;
+            r.map_err(map_page_err)?;
         }
         Ok(())
     }
@@ -3465,27 +3442,15 @@ impl<'env> RwTxn<'env> {
     /// `level < 0`. Returns whether any page split (or the root grew) on the
     /// way — the signal that a kept cursor path can no longer be proven
     /// correct (SPEC 03 §5.4a).
-    fn insert_into_branch(
-        &mut self,
-        tree: TreeId,
-        path: &mut [(u64, usize)],
-        level: isize,
-        at: usize,
-        key: Vec<u8>,
-        child: u64,
-    ) -> Result<bool> {
-        self.insert_into_branch_follow(tree, path, level, at, key, child, None)
-    }
-
-    /// [`insert_into_branch`](Self::insert_into_branch), optionally keeping
-    /// `path` on a put's new cell (SPEC 03 §5.4b). `follow` is `None` for
+    ///
+    /// Optionally keeps `path` on a put's new cell (SPEC 03 §5.4b). `follow` is `None` for
     /// callers whose path does not survive a split (it is then left as is),
     /// or `Some(new)` when the cell is under the inserted `child` (`new`) or
     /// under the frame's own child, whose index the insert does not move
     /// (`at` is right after it). The frame at `level` is then rewritten to
     /// the slot, on whichever half, of the child holding the cell.
     #[allow(clippy::too_many_arguments)] // house pattern (insert_into_leaf): pre-resolved scalars
-    fn insert_into_branch_follow(
+    fn insert_into_branch(
         &mut self,
         tree: TreeId,
         path: &mut [(u64, usize)],
@@ -3503,9 +3468,9 @@ impl<'env> RwTxn<'env> {
                 let psize = self.psize;
                 let txnid = self.txnid;
                 let frame = self.dirty.insert_tree_frame(np);
-                let mut br = BranchMut::init(frame, psize, np, txnid).map_err(corrupt)?;
-                br.insert(0, &[], old_root).map_err(corrupt)?;
-                br.insert(1, &key, child).map_err(corrupt)?;
+                let mut br = BranchMut::init(frame, psize, np, txnid).map_err(map_page_err)?;
+                br.insert(0, &[], old_root).map_err(map_page_err)?;
+                br.insert(1, &key, child).map_err(map_page_err)?;
             }
             let rec = self.record_mut(tree);
             rec.root = np;
@@ -3531,7 +3496,7 @@ impl<'env> RwTxn<'env> {
         let r = {
             let frame = self.dirty.bytes_mut(ppg).expect("branch is dirty");
             BranchMut::from_valid(frame, self.psize)
-                .map_err(corrupt)?
+                .map_err(map_page_err)?
                 .insert(at, &key, child)
         };
         match r {
@@ -3544,7 +3509,7 @@ impl<'env> RwTxn<'env> {
             Err(PageError::PageFull { .. }) => {
                 self.split_branch(tree, path, lvl, at, key, child, follow)
             }
-            Err(e) => Err(corrupt(e)),
+            Err(e) => Err(map_page_err(e)),
         }
     }
 
@@ -3566,7 +3531,7 @@ impl<'env> RwTxn<'env> {
     /// APPEND on a leaf. Non-end inserts keep the median-fit-adjust rule (`choose_split`).
     ///
     /// `follow` is the post-insert index of the child a put's path follows
-    /// ([`insert_into_branch_follow`](Self::insert_into_branch_follow)), or
+    /// ([`insert_into_branch`](Self::insert_into_branch)), or
     /// `None` to leave `path` as is.
     #[allow(clippy::too_many_arguments)] // house pattern (insert_into_leaf): pre-resolved scalars
     fn split_branch(
@@ -3619,10 +3584,10 @@ impl<'env> RwTxn<'env> {
         let followed = follow.map(|x| if x < s { (ppg, x) } else { (rpg, x - s) });
         let up = followed.map(|(pg, _)| pg == rpg);
         if lvl == 0 {
-            self.insert_into_branch_follow(tree, path, -1, 0, rising, rpg, up)?;
+            self.insert_into_branch(tree, path, -1, 0, rising, rpg, up)?;
         } else {
             let at2 = path[lvl - 1].1 + 1;
-            self.insert_into_branch_follow(tree, path, lvl as isize - 1, at2, rising, rpg, up)?;
+            self.insert_into_branch(tree, path, lvl as isize - 1, at2, rising, rpg, up)?;
         }
         // Written last: a root grow above reads `path[0]` as the old root.
         if let Some(frame) = followed {
@@ -3710,7 +3675,7 @@ impl<'env> RwTxn<'env> {
             // only below a touched parent (§5.3) — so the path needs no
             // touch for a write that changes no structure.
             let at = {
-                let leaf = LeafMut::from_valid(&mut *frame, psize).map_err(corrupt)?;
+                let leaf = LeafMut::from_valid(&mut *frame, psize).map_err(map_page_err)?;
                 if leaf.key(ki) != key {
                     return Ok(PathPut::Elsewhere);
                 }
@@ -3730,7 +3695,7 @@ impl<'env> RwTxn<'env> {
             }
         } else {
             let leaf = match node_view(self.source(), psize, lpg, Some(&self.validated))
-                .map_err(corrupt)?
+                .map_err(map_page_err)?
             {
                 NodeView::Leaf(l) => l,
                 NodeView::Branch(_) => return Err(Error::Mdb(MdbError::Invalid)),
@@ -3754,7 +3719,7 @@ impl<'env> RwTxn<'env> {
         // being the half that holds the entry.
         debug_assert_eq!(rec.depth, depth + 1, "one put grows the root once");
         let frame = self.dirty.bytes(rec.root).expect("new root is dirty");
-        let root = BranchRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
+        let root = BranchRef::new_prevalidated(frame, self.psize).map_err(map_page_err)?;
         let ki = usize::from(root.child_pgno(0) != path[0].0);
         debug_assert_eq!(root.child_pgno(ki), path[0].0, "path[0] is a root child");
         Ok(PathPut::Grown((rec.root, ki)))
@@ -3782,7 +3747,7 @@ impl<'env> RwTxn<'env> {
         let (lpg, ki) = *path.last().expect("non-empty path");
         let big = {
             let frame = self.dirty.bytes(lpg).expect("leaf touched");
-            let leaf = LeafRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
+            let leaf = LeafRef::new_prevalidated(frame, self.psize).map_err(map_page_err)?;
             match leaf.value(ki) {
                 LeafValue::Inline(_) => None,
                 LeafValue::Overflow { head_pgno, dsize } => Some((head_pgno, dsize)),
@@ -3796,9 +3761,9 @@ impl<'env> RwTxn<'env> {
         {
             let frame = self.dirty.bytes_mut(lpg).expect("leaf touched");
             LeafMut::from_valid(frame, self.psize)
-                .map_err(corrupt)?
+                .map_err(map_page_err)?
                 .remove(ki)
-                .map_err(corrupt)?;
+                .map_err(map_page_err)?;
         }
         let top = path.len() - 1;
         self.rebalance(tree, path, top, false)
@@ -3853,7 +3818,7 @@ impl<'env> RwTxn<'env> {
         let (end, bigs, last, anchor) = {
             let cmp = self.tree_comparator(tree);
             let leaf = match node_view(self.source(), self.psize, lpg, Some(&self.validated))
-                .map_err(corrupt)?
+                .map_err(map_page_err)?
             {
                 NodeView::Leaf(l) => l,
                 NodeView::Branch(_) => return Err(Error::Mdb(MdbError::Invalid)),
@@ -3982,9 +3947,9 @@ impl<'env> RwTxn<'env> {
         {
             let frame = self.dirty.bytes_mut(lpg).expect("leaf touched");
             LeafMut::from_valid(frame, self.psize)
-                .map_err(corrupt)?
+                .map_err(map_page_err)?
                 .remove_span(start, end)
-                .map_err(corrupt)?;
+                .map_err(map_page_err)?;
         }
         if !do_rebalance {
             return Ok(());
@@ -4030,15 +3995,15 @@ impl<'env> RwTxn<'env> {
         let frame = self.dirty.bytes(pgno).expect("page is dirty");
         // A dirty frame is engine-authored (trusted, see `btree::leaf_view`):
         // O(1) structural checks only.
-        let page = PageRef::new_trusted_psize(frame, self.psize).map_err(corrupt)?;
+        let page = PageRef::new_trusted_psize(frame, self.psize).map_err(map_page_err)?;
         let body = body_size(self.psize);
         match page.page_type() {
             PageType::Leaf => {
-                let l = LeafRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
+                let l = LeafRef::new_prevalidated(frame, self.psize).map_err(map_page_err)?;
                 Ok((true, l.num_keys(), body - l.free_space()))
             }
             PageType::Branch => {
-                let b = BranchRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
+                let b = BranchRef::new_prevalidated(frame, self.psize).map_err(map_page_err)?;
                 Ok((false, b.num_keys(), body - b.free_space()))
             }
             _ => Err(Error::Mdb(MdbError::Invalid)),
@@ -4082,7 +4047,7 @@ impl<'env> RwTxn<'env> {
                 let child = {
                     let frame = self.dirty.bytes(pgno).expect("root is dirty");
                     BranchRef::new_prevalidated(frame, self.psize)
-                        .map_err(corrupt)?
+                        .map_err(map_page_err)?
                         .child_pgno(0)
                 };
                 self.free_page(pgno);
@@ -4114,7 +4079,7 @@ impl<'env> RwTxn<'env> {
         let parent_nkeys = {
             let frame = self.dirty.bytes(ppg).expect("parent is dirty");
             BranchRef::new_prevalidated(frame, self.psize)
-                .map_err(corrupt)?
+                .map_err(map_page_err)?
                 .num_keys()
         };
         if parent_nkeys < 2 {
@@ -4132,14 +4097,14 @@ impl<'env> RwTxn<'env> {
         let sib_old = {
             let frame = self.dirty.bytes(ppg).expect("parent is dirty");
             BranchRef::new_prevalidated(frame, self.psize)
-                .map_err(corrupt)?
+                .map_err(map_page_err)?
                 .child_pgno(sib_idx)
         };
         let sib = self.touch(sib_old)?;
         if sib != sib_old {
             let frame = self.dirty.bytes_mut(ppg).expect("parent is dirty");
             BranchMut::from_valid(frame, self.psize)
-                .map_err(corrupt)?
+                .map_err(map_page_err)?
                 .set_child_pgno(sib_idx, sib);
         }
         let (s_leaf, s_nkeys, s_used) = self.page_stats(sib)?;
@@ -4222,20 +4187,20 @@ impl<'env> RwTxn<'env> {
             cell.clear();
             let src_idx = {
                 let frame = self.dirty.bytes_mut(sib).expect("sibling touched");
-                let mut l = LeafMut::from_valid(frame, psize).map_err(corrupt)?;
+                let mut l = LeafMut::from_valid(frame, psize).map_err(map_page_err)?;
                 let i = if fromleft { l.num_keys() - 1 } else { 0 };
-                cell.extend_from_slice(l.cell_bytes(i).map_err(corrupt)?);
-                l.remove(i).map_err(corrupt)?;
+                cell.extend_from_slice(l.cell_bytes(i).map_err(map_page_err)?);
+                l.remove(i).map_err(map_page_err)?;
                 i
             };
             debug_assert!(fromleft || src_idx == 0);
             {
                 let frame = self.dirty.bytes_mut(pg).expect("page is dirty");
-                let mut l = LeafMut::from_valid(frame, psize).map_err(corrupt)?;
+                let mut l = LeafMut::from_valid(frame, psize).map_err(map_page_err)?;
                 // From the left the sibling's last entry becomes P's first;
                 // from the right the sibling's first becomes P's last.
                 let at = if fromleft { 0 } else { l.num_keys() };
-                l.insert_cell_bytes(at, &cell).map_err(corrupt)?;
+                l.insert_cell_bytes(at, &cell).map_err(map_page_err)?;
             }
             // The rewritten separator: from the left, P's (the moved key);
             // from the right, the sibling's (its new first key).
@@ -4243,7 +4208,7 @@ impl<'env> RwTxn<'env> {
             cell.clear();
             {
                 let frame = self.dirty.bytes(key_pg).expect("page is dirty");
-                let l = LeafRef::new_prevalidated(frame, psize).map_err(corrupt)?;
+                let l = LeafRef::new_prevalidated(frame, psize).map_err(map_page_err)?;
                 cell.extend_from_slice(l.key(0));
             }
             let split = self.update_parent_key(tree, path, level - 1, sep_idx, &cell);
@@ -4255,21 +4220,21 @@ impl<'env> RwTxn<'env> {
             // parent separator becomes the moved child's key.
             let (k_m, c) = {
                 let frame = self.dirty.bytes(sib).expect("sibling touched");
-                let br = BranchRef::new_prevalidated(frame, psize).map_err(corrupt)?;
+                let br = BranchRef::new_prevalidated(frame, psize).map_err(map_page_err)?;
                 let i = br.num_keys() - 1;
                 (br.key(i).to_vec(), br.child_pgno(i))
             };
             {
                 let frame = self.dirty.bytes_mut(sib).expect("sibling touched");
-                let mut b = BranchMut::from_valid(frame, psize).map_err(corrupt)?;
+                let mut b = BranchMut::from_valid(frame, psize).map_err(map_page_err)?;
                 let i = b.num_keys() - 1;
-                b.remove(i).map_err(corrupt)?;
+                b.remove(i).map_err(map_page_err)?;
             }
             let old_sep = {
                 let (ppg, _) = path[level - 1];
                 let frame = self.dirty.bytes(ppg).expect("parent is dirty");
                 BranchRef::new_prevalidated(frame, psize)
-                    .map_err(corrupt)?
+                    .map_err(map_page_err)?
                     .key(pki)
                     .to_vec()
             };
@@ -4277,16 +4242,16 @@ impl<'env> RwTxn<'env> {
             // Rebuild it as: node 0 = (empty, c), node 1 = (old_sep, c0).
             let c0 = {
                 let frame = self.dirty.bytes(pg).expect("page is dirty");
-                let br = BranchRef::new_prevalidated(frame, psize).map_err(corrupt)?;
+                let br = BranchRef::new_prevalidated(frame, psize).map_err(map_page_err)?;
                 debug_assert_eq!(br.num_keys(), 1, "underful branch has one child");
                 br.child_pgno(0)
             };
             {
                 let frame = self.dirty.bytes_mut(pg).expect("page is dirty");
-                let mut b = BranchMut::from_valid(frame, psize).map_err(corrupt)?;
-                b.remove(0).map_err(corrupt)?;
-                b.insert(0, &[], c).map_err(corrupt)?;
-                b.insert(1, &old_sep, c0).map_err(corrupt)?;
+                let mut b = BranchMut::from_valid(frame, psize).map_err(map_page_err)?;
+                b.remove(0).map_err(map_page_err)?;
+                b.insert(0, &[], c).map_err(map_page_err)?;
+                b.insert(1, &old_sep, c0).map_err(map_page_err)?;
             }
             self.update_parent_key(tree, path, level - 1, pki, &k_m)
         } else {
@@ -4296,35 +4261,35 @@ impl<'env> RwTxn<'env> {
             // the parent.
             let (c, k1, c1) = {
                 let frame = self.dirty.bytes(sib).expect("sibling touched");
-                let br = BranchRef::new_prevalidated(frame, psize).map_err(corrupt)?;
+                let br = BranchRef::new_prevalidated(frame, psize).map_err(map_page_err)?;
                 (br.child_pgno(0), br.key(1).to_vec(), br.child_pgno(1))
             };
             {
                 let frame = self.dirty.bytes_mut(sib).expect("sibling touched");
-                let mut b = BranchMut::from_valid(frame, psize).map_err(corrupt)?;
+                let mut b = BranchMut::from_valid(frame, psize).map_err(map_page_err)?;
                 // Remove at explicit, unshifted indices, HIGHEST FIRST: after
                 // `remove(0)` the real-keyed old node 1 would shift into
                 // index 0, where the node-0 sentinel rule (empty separator,
                 // SPEC 02 §4.1) rejects its key. So: drop old node 1 first (its child
                 // is re-inserted as the new sentinel), then the old node 0
                 // sentinel, then install the new sentinel.
-                b.remove(1).map_err(corrupt)?; // old node 1 (real key; child c1 survives below)
-                b.remove(0).map_err(corrupt)?; // old node 0 (the empty-key sentinel)
-                b.insert(0, &[], c1).map_err(corrupt)?;
+                b.remove(1).map_err(map_page_err)?; // old node 1 (real key; child c1 survives below)
+                b.remove(0).map_err(map_page_err)?; // old node 0 (the empty-key sentinel)
+                b.insert(0, &[], c1).map_err(map_page_err)?;
             }
             let old_sep = {
                 let (ppg, _) = path[level - 1];
                 let frame = self.dirty.bytes(ppg).expect("parent is dirty");
                 BranchRef::new_prevalidated(frame, psize)
-                    .map_err(corrupt)?
+                    .map_err(map_page_err)?
                     .key(pki + 1)
                     .to_vec()
             };
             {
                 let frame = self.dirty.bytes_mut(pg).expect("page is dirty");
-                let mut b = BranchMut::from_valid(frame, psize).map_err(corrupt)?;
+                let mut b = BranchMut::from_valid(frame, psize).map_err(map_page_err)?;
                 let n = b.num_keys();
-                b.insert(n, &old_sep, c).map_err(corrupt)?;
+                b.insert(n, &old_sep, c).map_err(map_page_err)?;
             }
             self.update_parent_key(tree, path, level - 1, pki + 1, &k1)
         }
@@ -4351,9 +4316,9 @@ impl<'env> RwTxn<'env> {
         {
             let frame = self.dirty.bytes_mut(ppg).expect("parent is dirty");
             let fitted = BranchMut::from_valid(frame, self.psize)
-                .map_err(corrupt)?
+                .map_err(map_page_err)?
                 .set_key(child_idx, new_key)
-                .map_err(corrupt)?;
+                .map_err(map_page_err)?;
             if fitted {
                 return Ok(false);
             }
@@ -4361,15 +4326,15 @@ impl<'env> RwTxn<'env> {
         let child = {
             let frame = self.dirty.bytes(ppg).expect("parent is dirty");
             BranchRef::new_prevalidated(frame, self.psize)
-                .map_err(corrupt)?
+                .map_err(map_page_err)?
                 .child_pgno(child_idx)
         };
         {
             let frame = self.dirty.bytes_mut(ppg).expect("parent is dirty");
             BranchMut::from_valid(frame, self.psize)
-                .map_err(corrupt)?
+                .map_err(map_page_err)?
                 .remove(child_idx)
-                .map_err(corrupt)?;
+                .map_err(map_page_err)?;
         }
         self.insert_into_branch(
             tree,
@@ -4378,6 +4343,7 @@ impl<'env> RwTxn<'env> {
             child_idx,
             new_key.to_vec(),
             child,
+            None,
         )
     }
 
@@ -4412,13 +4378,13 @@ impl<'env> RwTxn<'env> {
         let base;
         if is_leaf {
             {
-                let r = LeafRef::new_prevalidated(&src, psize).map_err(corrupt)?;
+                let r = LeafRef::new_prevalidated(&src, psize).map_err(map_page_err)?;
                 let frame = self.dirty.bytes_mut(left).expect("left is dirty");
-                let mut l = LeafMut::from_valid(frame, psize).map_err(corrupt)?;
+                let mut l = LeafMut::from_valid(frame, psize).map_err(map_page_err)?;
                 base = l.num_keys();
                 for j in 0..r.num_keys() {
-                    l.insert_cell_bytes(base + j, r.cell_bytes(j, psize).map_err(corrupt)?)
-                        .map_err(corrupt)?;
+                    l.insert_cell_bytes(base + j, r.cell_bytes(j, psize).map_err(map_page_err)?)
+                        .map_err(map_page_err)?;
                 }
             }
             sat_sub(&mut self.record_mut(tree).leaf_pages, 1);
@@ -4428,19 +4394,20 @@ impl<'env> RwTxn<'env> {
             let sep = {
                 let frame = self.dirty.bytes(ppg).expect("parent is dirty");
                 BranchRef::new_prevalidated(frame, psize)
-                    .map_err(corrupt)?
+                    .map_err(map_page_err)?
                     .key(right_idx)
                     .to_vec()
             };
             {
-                let r = BranchRef::new_prevalidated(&src, psize).map_err(corrupt)?;
+                let r = BranchRef::new_prevalidated(&src, psize).map_err(map_page_err)?;
                 let frame = self.dirty.bytes_mut(left).expect("left is dirty");
-                let mut b = BranchMut::from_valid(frame, psize).map_err(corrupt)?;
+                let mut b = BranchMut::from_valid(frame, psize).map_err(map_page_err)?;
                 base = b.num_keys();
-                b.insert(base, &sep, r.child_pgno(0)).map_err(corrupt)?;
+                b.insert(base, &sep, r.child_pgno(0))
+                    .map_err(map_page_err)?;
                 for j in 1..r.num_keys() {
                     b.insert(base + j, r.key(j), r.child_pgno(j))
-                        .map_err(corrupt)?;
+                        .map_err(map_page_err)?;
                 }
             }
             sat_sub(&mut self.record_mut(tree).branch_pages, 1);
@@ -4449,9 +4416,9 @@ impl<'env> RwTxn<'env> {
         {
             let frame = self.dirty.bytes_mut(ppg).expect("parent is dirty");
             BranchMut::from_valid(frame, self.psize)
-                .map_err(corrupt)?
+                .map_err(map_page_err)?
                 .remove(right_idx)
-                .map_err(corrupt)?;
+                .map_err(map_page_err)?;
         }
         self.free_page(right);
         // Keep the path coherent: the surviving page is the pair's left page.
@@ -4695,7 +4662,7 @@ impl<'env> RwTxn<'env> {
         match page.page_type() {
             PageType::Leaf => {
                 let leaf = leaf_view(self.source(), self.psize, pgno, Some(&self.validated))
-                    .map_err(corrupt)?;
+                    .map_err(map_page_err)?;
                 for i in 0..leaf.num_keys() {
                     if let LeafValue::Overflow { head_pgno, dsize } = leaf.value(i) {
                         runs.push((head_pgno, overflow_page_count(dsize as u64, self.psize)));
@@ -4706,7 +4673,7 @@ impl<'env> RwTxn<'env> {
             }
             PageType::Branch => {
                 let br = branch_view(self.source(), self.psize, pgno, Some(&self.validated))
-                    .map_err(corrupt)?;
+                    .map_err(map_page_err)?;
                 for i in 0..br.num_keys() {
                     self.collect_tree(br.child_pgno(i), level - 1, pages, runs)?;
                 }
@@ -4755,7 +4722,7 @@ impl<'env> RwTxn<'env> {
         match page.page_type() {
             PageType::Branch => {
                 let br = branch_view(self.source(), self.psize, pgno, Some(&self.validated))
-                    .map_err(corrupt)?;
+                    .map_err(map_page_err)?;
                 if level == 2 {
                     // Every child is an unread leaf: room for all of them at
                     // once, and one loop over the child pointers (LMDB's
@@ -4777,7 +4744,7 @@ impl<'env> RwTxn<'env> {
             // it for overflow refs and collect the page itself.
             PageType::Leaf => {
                 let leaf = leaf_view(self.source(), self.psize, pgno, Some(&self.validated))
-                    .map_err(corrupt)?;
+                    .map_err(map_page_err)?;
                 for i in 0..leaf.num_keys() {
                     if let LeafValue::Overflow { head_pgno, dsize } = leaf.value(i) {
                         runs.push((head_pgno, overflow_page_count(dsize as u64, self.psize)));
@@ -4894,8 +4861,9 @@ impl<'env> RwTxn<'env> {
                 };
                 let frame = self.dirty.bytes_mut(lpg).expect("GC leaf is dirty");
                 let (off, dsize) = {
-                    let leaf = LeafMut::from_valid(&mut *frame, self.psize).map_err(corrupt)?;
-                    leaf.inline_value_at(ki).map_err(corrupt)?
+                    let leaf =
+                        LeafMut::from_valid(&mut *frame, self.psize).map_err(map_page_err)?;
+                    leaf.inline_value_at(ki).map_err(map_page_err)?
                 };
                 debug_assert_eq!(dsize as usize, len);
                 pil_encode_into(ids, &mut frame[off..off + len]);
@@ -5040,7 +5008,7 @@ impl<'env> RwTxn<'env> {
                 "page double-freed (GC-4)"
             );
             let before = work_mut!(self).freed.len();
-            let annex_before = Drain::len(&self.annex);
+            let annex_before = self.annex.len();
             let total = before + annex_before;
             if total > 0 {
                 if !tree_arm && total <= annex_cap {
@@ -5087,9 +5055,7 @@ impl<'env> RwTxn<'env> {
                         self.put_pil(self.txnid, &ids)?;
                     }
                     own_pages = Some(pages);
-                    if work_mut!(self).freed.len() != before
-                        || Drain::len(&self.annex) != annex_before
-                    {
+                    if work_mut!(self).freed.len() != before || self.annex.len() != annex_before {
                         // The put COW-freed committed GC pages (PIL must
                         // grow) or drew from the annex pool (the written
                         // PIL lists a handed-out page): rewrite next round.
@@ -5298,7 +5264,7 @@ impl<'env> RwTxn<'env> {
         }
         let written = meta
             .encode_with_annex_over_zeroed(&mut buf, annex)
-            .map_err(corrupt)
+            .map_err(map_page_err)
             .and_then(|()| {
                 inner
                     .backing_ref()
@@ -5555,8 +5521,8 @@ impl Database {
                 };
                 let frame = txn.dirty.bytes_mut(lpg).expect("leaf is dirty");
                 let (off, dsize) = {
-                    let leaf = LeafMut::from_valid(&mut *frame, txn.psize).map_err(corrupt)?;
-                    leaf.inline_value_at(ki).map_err(corrupt)?
+                    let leaf = LeafMut::from_valid(&mut *frame, txn.psize).map_err(map_page_err)?;
+                    leaf.inline_value_at(ki).map_err(map_page_err)?
                 };
                 debug_assert_eq!(dsize as usize, len);
                 f(&mut frame[off..off + len]);
