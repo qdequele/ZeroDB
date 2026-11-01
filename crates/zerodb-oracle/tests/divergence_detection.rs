@@ -18,13 +18,6 @@ use std::marker::PhantomData;
 
 use zerodb_oracle::{run, DbName, Engine, LmdbEngine, Op, OpResult, OracleError, PutFlag};
 
-fn k(bytes: &[u8]) -> zerodb_oracle::Key {
-    zerodb_oracle::Key(bytes.to_vec())
-}
-fn v(bytes: &[u8]) -> zerodb_oracle::Value {
-    zerodb_oracle::Value(bytes.to_vec())
-}
-
 /// A single-shot, targeted result corruption applied at op index `TARGET`.
 ///
 /// Each impl only touches the `OpResult` shape it claims to corrupt; every
@@ -174,20 +167,11 @@ impl<F: Fault> Engine for FaultyEngine<F> {
 #[test]
 fn detects_flipped_byte_in_get_result() {
     let ops = vec![
-        Op::BeginRw, // 0
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        }, // 1
-        Op::Put {
-            db: 0,
-            key: k(b"k"),
-            val: v(b"v"),
-        }, // 2
-        Op::Get {
-            db: 0,
-            key: k(b"k"),
-        }, // 3 <- target
-        Op::Commit,  // 4
+        Op::BeginRw,                    // 0
+        Op::create_db(DbName::Unnamed), // 1
+        Op::put(0, b"k", b"v"),         // 2
+        Op::get(0, b"k"),               // 3 <- target
+        Op::Commit,                     // 4
     ];
     const TARGET: usize = 3;
     let err = run::<LmdbEngine, FaultyEngine<FlipByte<TARGET>>>(&ops)
@@ -196,72 +180,37 @@ fn detects_flipped_byte_in_get_result() {
         err.index, TARGET,
         "divergence must point at the corrupted op"
     );
-    assert_eq!(
-        err.op,
-        Op::Get {
-            db: 0,
-            key: k(b"k")
-        }
-    );
+    assert_eq!(err.op, Op::get(0, b"k"));
 }
 
 /// (b) A `get()` on an existing key is rewritten to report `NotFound`.
 #[test]
 fn detects_false_not_found_for_existing_key() {
     let ops = vec![
-        Op::BeginRw, // 0
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        }, // 1
-        Op::Put {
-            db: 0,
-            key: k(b"k"),
-            val: v(b"v"),
-        }, // 2
-        Op::Get {
-            db: 0,
-            key: k(b"k"),
-        }, // 3 <- target
-        Op::Commit,  // 4
+        Op::BeginRw,                    // 0
+        Op::create_db(DbName::Unnamed), // 1
+        Op::put(0, b"k", b"v"),         // 2
+        Op::get(0, b"k"),               // 3 <- target
+        Op::Commit,                     // 4
     ];
     const TARGET: usize = 3;
     let err = run::<LmdbEngine, FaultyEngine<FalseNotFound<TARGET>>>(&ops)
         .expect_err("misreported NotFound must be detected");
     assert_eq!(err.index, TARGET);
-    assert_eq!(
-        err.op,
-        Op::Get {
-            db: 0,
-            key: k(b"k")
-        }
-    );
+    assert_eq!(err.op, Op::get(0, b"k"));
 }
 
 /// (c) The last entry of a 3-entry forward iteration is silently dropped.
 #[test]
 fn detects_dropped_last_entry_in_iteration() {
     let ops = vec![
-        Op::BeginRw, // 0
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        }, // 1
-        Op::Put {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"1"),
-        }, // 2
-        Op::Put {
-            db: 0,
-            key: k(b"b"),
-            val: v(b"2"),
-        }, // 3
-        Op::Put {
-            db: 0,
-            key: k(b"c"),
-            val: v(b"3"),
-        }, // 4
-        Op::Iter { db: 0 }, // 5 <- target
-        Op::Commit,  // 6
+        Op::BeginRw,                    // 0
+        Op::create_db(DbName::Unnamed), // 1
+        Op::put(0, b"a", b"1"),         // 2
+        Op::put(0, b"b", b"2"),         // 3
+        Op::put(0, b"c", b"3"),         // 4
+        Op::Iter { db: 0 },             // 5 <- target
+        Op::Commit,                     // 6
     ];
     const TARGET: usize = 5;
     let err = run::<LmdbEngine, FaultyEngine<DropLastEntry<TARGET>>>(&ops)
@@ -275,27 +224,13 @@ fn detects_dropped_last_entry_in_iteration() {
 #[test]
 fn detects_swapped_entry_order_in_iteration() {
     let ops = vec![
-        Op::BeginRw, // 0
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        }, // 1
-        Op::Put {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"1"),
-        }, // 2
-        Op::Put {
-            db: 0,
-            key: k(b"b"),
-            val: v(b"2"),
-        }, // 3
-        Op::Put {
-            db: 0,
-            key: k(b"c"),
-            val: v(b"3"),
-        }, // 4
-        Op::Iter { db: 0 }, // 5 <- target
-        Op::Commit,  // 6
+        Op::BeginRw,                    // 0
+        Op::create_db(DbName::Unnamed), // 1
+        Op::put(0, b"a", b"1"),         // 2
+        Op::put(0, b"b", b"2"),         // 3
+        Op::put(0, b"c", b"3"),         // 4
+        Op::Iter { db: 0 },             // 5 <- target
+        Op::Commit,                     // 6
     ];
     const TARGET: usize = 5;
     let err = run::<LmdbEngine, FaultyEngine<SwapEntryOrder<TARGET>>>(&ops)
@@ -310,36 +245,17 @@ fn detects_swapped_entry_order_in_iteration() {
 #[test]
 fn detects_suppressed_key_exist_error() {
     let ops = vec![
-        Op::BeginRw, // 0
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        }, // 1
-        Op::Put {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"1"),
-        }, // 2
-        Op::PutFlagged {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"2"),
-            flag: PutFlag::NoOverwrite,
-        }, // 3 <- target, must be KeyExist on the real engine
-        Op::Commit,  // 4
+        Op::BeginRw,                                          // 0
+        Op::create_db(DbName::Unnamed),                       // 1
+        Op::put(0, b"a", b"1"),                               // 2
+        Op::put_flagged(0, b"a", b"2", PutFlag::NoOverwrite), // 3 <- target, must be KeyExist on the real engine
+        Op::Commit,                                           // 4
     ];
     const TARGET: usize = 3;
     let err = run::<LmdbEngine, FaultyEngine<SuppressKeyExist<TARGET>>>(&ops)
         .expect_err("a suppressed KeyExist error must be detected");
     assert_eq!(err.index, TARGET);
-    assert_eq!(
-        err.op,
-        Op::PutFlagged {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"2"),
-            flag: PutFlag::NoOverwrite,
-        }
-    );
+    assert_eq!(err.op, Op::put_flagged(0, b"a", b"2", PutFlag::NoOverwrite));
     // Sanity: confirm the reference engine really did error KeyExist here (so
     // the fault had something real to suppress), not e.g. Ok on both sides.
     assert_eq!(err.a, OpResult::Err(OracleError::KeyExist));
@@ -350,22 +266,12 @@ fn detects_suppressed_key_exist_error() {
 #[test]
 fn detects_miscounted_len() {
     let ops = vec![
-        Op::BeginRw, // 0
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        }, // 1
-        Op::Put {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"1"),
-        }, // 2
-        Op::Put {
-            db: 0,
-            key: k(b"b"),
-            val: v(b"2"),
-        }, // 3
-        Op::Len { db: 0 }, // 4 <- target
-        Op::Commit,  // 5
+        Op::BeginRw,                    // 0
+        Op::create_db(DbName::Unnamed), // 1
+        Op::put(0, b"a", b"1"),         // 2
+        Op::put(0, b"b", b"2"),         // 3
+        Op::Len { db: 0 },              // 4 <- target
+        Op::Commit,                     // 5
     ];
     const TARGET: usize = 4;
     let err = run::<LmdbEngine, FaultyEngine<MiscountLen<TARGET>>>(&ops)
@@ -386,63 +292,24 @@ fn detects_miscounted_len() {
 fn no_fault_produces_no_divergence() {
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
-        Op::CreateDb {
-            name: DbName::Named(2),
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"b"),
-            val: v(b"2"),
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"1"),
-        },
-        Op::PutReserved {
-            db: 0,
-            key: k(b"c"),
-            val: v(b"reserved"),
-        },
+        Op::create_db(DbName::Unnamed),
+        Op::create_db(DbName::Named(2)),
+        Op::put(0, b"b", b"2"),
+        Op::put(0, b"a", b"1"),
+        Op::put_reserved(0, b"c", b"reserved"),
         Op::BeginNestedRo,
-        Op::Get {
-            db: 0,
-            key: k(b"a"),
-        },
+        Op::get(0, b"a"),
         Op::Iter { db: 0 },
         Op::EndNestedRo,
-        Op::Put {
-            db: 1,
-            key: k(b"x"),
-            val: v(b"y"),
-        },
-        Op::SetRange {
-            db: 0,
-            key: k(b"aa"),
-        },
-        Op::GetGreaterThan {
-            db: 0,
-            key: k(b"a"),
-        },
-        Op::IterMutPutCurrent {
-            db: 0,
-            nth: 0,
-            val: v(b"rewritten"),
-        },
-        Op::Del {
-            db: 0,
-            key: k(b"c"),
-        },
+        Op::put(1, b"x", b"y"),
+        Op::set_range(0, b"aa"),
+        Op::get_greater_than(0, b"a"),
+        Op::iter_mut_put_current(0, 0, b"rewritten"),
+        Op::del(0, b"c"),
         Op::Len { db: 0 },
         Op::ClearDb { db: 1 },
         Op::Commit,
-        Op::VerifyGet {
-            db: 0,
-            key: k(b"a"),
-        },
+        Op::verify_get(0, b"a"),
     ];
     assert!(
         run::<LmdbEngine, FaultyEngine<NoFault>>(&ops).is_ok(),

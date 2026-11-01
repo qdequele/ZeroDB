@@ -166,6 +166,19 @@ pub fn run<A: Engine, B: Engine>(ops: &[Op]) -> Result<(), Box<Divergence>> {
     run_in_mode::<A, B>(ops, EngineMode::DEFAULT)
 }
 
+/// Run `ops` against [`LmdbEngine`] and a fresh `E`, panicking with the first
+/// [`Divergence`] if any. The usual assertion of a differential test.
+///
+/// # Panics
+///
+/// On the first op where the two engines disagree.
+#[track_caller]
+pub fn assert_matches_lmdb<E: Engine>(ops: impl AsRef<[Op]>) {
+    if let Err(d) = run::<LmdbEngine, E>(ops.as_ref()) {
+        panic!("{} diverged from LMDB:\n{d}", std::any::type_name::<E>());
+    }
+}
+
 /// Run `ops` against two fresh engines **opened in `mode`**: both
 /// engines get the identical `WRITE_MAP` / durability flag combination, so a
 /// differential run exercises the second write mode at parity. Returns the first

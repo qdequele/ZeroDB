@@ -123,23 +123,14 @@ fn arb_scenario() -> impl Strategy<Value = Vec<Op>> {
         1..6,
     )
     .prop_map(|blocks| {
-        let mut ops = vec![
-            Op::BeginRw,
-            Op::CreateDb {
-                name: DbName::Unnamed,
-            },
-            Op::Commit,
-        ];
+        let mut ops = vec![Op::BeginRw, Op::create_db(DbName::Unnamed), Op::Commit];
         for (steps, commit, verify_slot) in blocks {
             ops.push(Op::BeginRw);
             for s in steps {
                 ops.push(step_to_op(s));
             }
             ops.push(if commit { Op::Commit } else { Op::Abort });
-            ops.push(Op::VerifyGet {
-                db: 0,
-                key: pool_key(verify_slot),
-            });
+            ops.push(Op::verify_get(0, pool_key(verify_slot)));
             ops.push(Op::BeginRo);
             ops.push(Op::Iter { db: 0 });
             ops.push(Op::Len { db: 0 });
@@ -151,35 +142,16 @@ fn arb_scenario() -> impl Strategy<Value = Vec<Op>> {
 
 fn step_to_op(s: Step) -> Op {
     match s {
-        Step::Put { slot, val } => Op::Put {
-            db: 0,
-            key: pool_key(slot),
-            val,
-        },
-        Step::PutAppend { slot, val } => Op::PutFlagged {
-            db: 0,
-            key: pool_key(slot),
-            val,
-            flag: PutFlag::Append,
-        },
-        Step::PutNoOverwrite { slot, val } => Op::PutFlagged {
-            db: 0,
-            key: pool_key(slot),
-            val,
-            flag: PutFlag::NoOverwrite,
-        },
-        Step::PutReserved { slot, val } => Op::PutReserved {
-            db: 0,
-            key: pool_key(slot),
-            val,
-        },
-        Step::Del { slot } => Op::Del {
-            db: 0,
-            key: pool_key(slot),
-        },
+        Step::Put { slot, val } => Op::put(0, pool_key(slot), val),
+        Step::PutAppend { slot, val } => Op::put_flagged(0, pool_key(slot), val, PutFlag::Append),
+        Step::PutNoOverwrite { slot, val } => {
+            Op::put_flagged(0, pool_key(slot), val, PutFlag::NoOverwrite)
+        }
+        Step::PutReserved { slot, val } => Op::put_reserved(0, pool_key(slot), val),
+        Step::Del { slot } => Op::del(0, pool_key(slot)),
         Step::Clear => Op::ClearDb { db: 0 },
-        Step::IterMutPut { nth, val } => Op::IterMutPutCurrent { db: 0, nth, val },
-        Step::IterMutDel { nth } => Op::IterMutDelCurrent { db: 0, nth },
+        Step::IterMutPut { nth, val } => Op::iter_mut_put_current(0, nth, val),
+        Step::IterMutDel { nth } => Op::iter_mut_del_current(0, nth),
         Step::IterMutPutWalk {
             nth,
             steps,
@@ -194,31 +166,16 @@ fn step_to_op(s: Step) -> Op {
             rewrite,
             grow,
         },
-        Step::Get { slot } => Op::Get {
-            db: 0,
-            key: pool_key(slot),
-        },
+        Step::Get { slot } => Op::get(0, pool_key(slot)),
         Step::Iter => Op::Iter { db: 0 },
         Step::RevIter => Op::RevIter { db: 0 },
-        Step::Prefix { slot } => Op::PrefixIter {
-            db: 0,
-            prefix: Key(format!("pool-key-{}", slot % 3).into_bytes()),
-        },
+        Step::Prefix { slot } => Op::prefix_iter(0, format!("pool-key-{}", slot % 3).into_bytes()),
         Step::Len => Op::Len { db: 0 },
         Step::First => Op::First { db: 0 },
         Step::Last => Op::Last { db: 0 },
-        Step::SeekGe { slot } => Op::SetRange {
-            db: 0,
-            key: pool_key(slot),
-        },
-        Step::SeekGt { slot } => Op::GetGreaterThan {
-            db: 0,
-            key: pool_key(slot),
-        },
-        Step::SeekLe { slot } => Op::GetLowerThanOrEqualTo {
-            db: 0,
-            key: pool_key(slot),
-        },
+        Step::SeekGe { slot } => Op::set_range(0, pool_key(slot)),
+        Step::SeekGt { slot } => Op::get_greater_than(0, pool_key(slot)),
+        Step::SeekLe { slot } => Op::get_lower_than_or_equal_to(0, pool_key(slot)),
     }
 }
 

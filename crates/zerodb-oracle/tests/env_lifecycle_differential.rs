@@ -30,32 +30,19 @@
 use zerodb_oracle::tempdir::TempDir;
 use zerodb_oracle::{decode_ops, run, DbName, LmdbEngine, Op, OracleError, PutFlag, ZerodbEngine};
 
-fn k(bytes: &[u8]) -> zerodb_oracle::Key {
-    zerodb_oracle::Key(bytes.to_vec())
-}
-fn v(bytes: &[u8]) -> zerodb_oracle::Value {
-    zerodb_oracle::Value(bytes.to_vec())
-}
-
 /// create → open → reopen cycles at parity, with data ops interspersed.
 #[test]
 fn differential_create_open_reopen_cycles() {
     let ops = vec![
-        Op::Reopen { map_size_kib: 0 },
+        Op::reopen(0),
         // Data work between reopens.
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"k"),
-            val: v(b"v"),
-        },
+        Op::create_db(DbName::Unnamed),
+        Op::put(0, b"k", b"v"),
         Op::Commit,
         // Reopen again after the data work.
-        Op::Reopen { map_size_kib: 32 },
-        Op::Reopen { map_size_kib: 16 }, // a smaller request: monotonic, still Ok
+        Op::reopen(32),
+        Op::reopen(16), // a smaller request: monotonic, still Ok
     ];
     if let Err(d) = run::<LmdbEngine, ZerodbEngine>(&ops) {
         panic!("env-lifecycle differential diverged:\n{d}");
@@ -81,31 +68,17 @@ fn differential_reopen_with_larger_map_size() {
 fn differential_mixed_sequence_only_env_survives() {
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(1),
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"1"),
-        },
+        Op::create_db(DbName::Named(1)),
+        Op::put(0, b"a", b"1"),
         Op::BeginNestedRo,
         Op::Iter { db: 0 },
         Op::EndNestedRo,
-        Op::Reopen { map_size_kib: 16 },
+        Op::reopen(16),
         Op::First { db: 0 },
         Op::Commit,
-        Op::VerifyGet {
-            db: 0,
-            key: k(b"a"),
-        },
-        Op::PutFlagged {
-            db: 0,
-            key: k(b"b"),
-            val: v(b"2"),
-            flag: PutFlag::Append,
-        },
-        Op::Reopen { map_size_kib: 48 },
+        Op::verify_get(0, b"a"),
+        Op::put_flagged(0, b"b", b"2", PutFlag::Append),
+        Op::reopen(48),
     ];
     assert!(run::<LmdbEngine, ZerodbEngine>(&ops).is_ok());
 }

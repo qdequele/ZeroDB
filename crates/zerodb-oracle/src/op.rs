@@ -62,6 +62,42 @@ impl std::fmt::Debug for Value {
     }
 }
 
+impl<T: AsRef<[u8]> + ?Sized> From<&T> for Key {
+    fn from(bytes: &T) -> Key {
+        Key(bytes.as_ref().to_vec())
+    }
+}
+
+impl From<Vec<u8>> for Key {
+    fn from(bytes: Vec<u8>) -> Key {
+        Key(bytes)
+    }
+}
+
+impl From<String> for Key {
+    fn from(s: String) -> Key {
+        Key(s.into_bytes())
+    }
+}
+
+impl<T: AsRef<[u8]> + ?Sized> From<&T> for Value {
+    fn from(bytes: &T) -> Value {
+        Value(bytes.as_ref().to_vec())
+    }
+}
+
+impl From<Vec<u8>> for Value {
+    fn from(bytes: Vec<u8>) -> Value {
+        Value(bytes)
+    }
+}
+
+impl From<String> for Value {
+    fn from(s: String) -> Value {
+        Value(s.into_bytes())
+    }
+}
+
 fn hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2 + 2);
     s.push_str("0x");
@@ -399,6 +435,103 @@ pub enum Op {
 /// empty). Up to 1899 bytes stays inline at a 4 KiB page for the fuzzer's
 /// short keys, and a handful of such cells fills a leaf, so consecutive puts
 /// both split leaves and shrink entries back.
+/// Shorthand constructors for hand-written op sequences in tests. Keys and
+/// values take anything byte-like (`&str`, `b"..."`, `Vec<u8>`, `String`).
+impl Op {
+    pub fn reopen(map_size_kib: u16) -> Op {
+        Op::Reopen { map_size_kib }
+    }
+    pub fn create_db(name: DbName) -> Op {
+        Op::CreateDb { name }
+    }
+    pub fn get(db: u8, key: impl Into<Key>) -> Op {
+        Op::Get {
+            db,
+            key: key.into(),
+        }
+    }
+    pub fn put(db: u8, key: impl Into<Key>, val: impl Into<Value>) -> Op {
+        Op::Put {
+            db,
+            key: key.into(),
+            val: val.into(),
+        }
+    }
+    pub fn put_flagged(db: u8, key: impl Into<Key>, val: impl Into<Value>, flag: PutFlag) -> Op {
+        Op::PutFlagged {
+            db,
+            key: key.into(),
+            val: val.into(),
+            flag,
+        }
+    }
+    pub fn put_reserved(db: u8, key: impl Into<Key>, val: impl Into<Value>) -> Op {
+        Op::PutReserved {
+            db,
+            key: key.into(),
+            val: val.into(),
+        }
+    }
+    pub fn del(db: u8, key: impl Into<Key>) -> Op {
+        Op::Del {
+            db,
+            key: key.into(),
+        }
+    }
+    pub fn set_exact(db: u8, key: impl Into<Key>) -> Op {
+        Op::SetExact {
+            db,
+            key: key.into(),
+        }
+    }
+    pub fn set_range(db: u8, key: impl Into<Key>) -> Op {
+        Op::SetRange {
+            db,
+            key: key.into(),
+        }
+    }
+    pub fn get_greater_than(db: u8, key: impl Into<Key>) -> Op {
+        Op::GetGreaterThan {
+            db,
+            key: key.into(),
+        }
+    }
+    pub fn get_lower_than_or_equal_to(db: u8, key: impl Into<Key>) -> Op {
+        Op::GetLowerThanOrEqualTo {
+            db,
+            key: key.into(),
+        }
+    }
+    pub fn prefix_iter(db: u8, prefix: impl Into<Key>) -> Op {
+        Op::PrefixIter {
+            db,
+            prefix: prefix.into(),
+        }
+    }
+    pub fn rev_prefix_iter(db: u8, prefix: impl Into<Key>) -> Op {
+        Op::RevPrefixIter {
+            db,
+            prefix: prefix.into(),
+        }
+    }
+    pub fn iter_mut_put_current(db: u8, nth: u8, val: impl Into<Value>) -> Op {
+        Op::IterMutPutCurrent {
+            db,
+            nth,
+            val: val.into(),
+        }
+    }
+    pub fn iter_mut_del_current(db: u8, nth: u8) -> Op {
+        Op::IterMutDelCurrent { db, nth }
+    }
+    pub fn verify_get(db: u8, key: impl Into<Key>) -> Op {
+        Op::VerifyGet {
+            db,
+            key: key.into(),
+        }
+    }
+}
+
 #[must_use]
 pub fn walk_value(val: &[u8], grow: u16, i: usize) -> std::borrow::Cow<'_, [u8]> {
     if grow == 0 {

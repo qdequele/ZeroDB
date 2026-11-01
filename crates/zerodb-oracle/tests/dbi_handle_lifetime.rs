@@ -22,7 +22,7 @@
 //! `Database` is a plain value, not an env-level dbi slot with a validity flag
 //! and sequence number — would serve the request.
 
-use zerodb_oracle::{run, DbName, HeedZerodbEngine, Key, LmdbEngine, Op, Value, ZerodbEngine};
+use zerodb_oracle::{run, DbName, HeedZerodbEngine, LmdbEngine, Op, ZerodbEngine};
 
 /// Assert both engine pairs agree on `ops` — the native pair and the adapter
 /// pair, since the harness bookkeeping is shared by all three engines.
@@ -33,13 +33,6 @@ fn diff_both_pairs(ops: &[Op]) {
     if let Err(d) = run::<LmdbEngine, HeedZerodbEngine>(ops) {
         panic!("adapter divergence:\n{d}");
     }
-}
-
-fn k(s: &str) -> Key {
-    Key(s.as_bytes().to_vec())
-}
-fn v(s: &str) -> Value {
-    Value(s.as_bytes().to_vec())
 }
 
 /// Commit a named DB, open a second DB in a txn that is never committed, drop
@@ -53,26 +46,18 @@ fn cursor_after_abort_of_txn_that_opened_the_handle() {
     let ops = vec![
         // Committed named DB.
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(40),
-        },
+        Op::create_db(DbName::Named(40)),
         Op::Commit,
         // A second DB opened in a txn that never commits.
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
+        Op::create_db(DbName::Unnamed),
         // Drop the committed one from the middle of the harness's list.
         Op::DropDb { db: 0 },
         // Rollback: closes the uncommitted handle; the dropped dbi stays closed.
         Op::Abort,
         // Fresh txn — the write-cursor path that produced EINVAL.
         Op::BeginRw,
-        Op::IterMutPutCurrent {
-            db: 45,
-            nth: 1,
-            val: v("after-abort"),
-        },
+        Op::iter_mut_put_current(45, 1, "after-abort"),
         Op::Commit,
     ];
     diff_both_pairs(&ops);
@@ -85,22 +70,14 @@ fn cursor_after_abort_of_txn_that_opened_the_handle() {
 fn put_after_abort_of_txn_that_opened_the_handle() {
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(255),
-        },
+        Op::create_db(DbName::Named(255)),
         Op::Commit,
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
+        Op::create_db(DbName::Unnamed),
         Op::DropDb { db: 0 },
         Op::Abort,
         Op::BeginRw,
-        Op::Put {
-            db: 226,
-            key: k("an-ordinary-key"),
-            val: v("an-ordinary-value"),
-        },
+        Op::put(226, "an-ordinary-key", "an-ordinary-value"),
         Op::Commit,
     ];
     diff_both_pairs(&ops);
@@ -112,31 +89,17 @@ fn put_after_abort_of_txn_that_opened_the_handle() {
 fn committed_handle_survives_a_later_abort() {
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
-        Op::Put {
-            db: 0,
-            key: k("k"),
-            val: v("v"),
-        },
+        Op::create_db(DbName::Unnamed),
+        Op::put(0, "k", "v"),
         Op::Commit,
         // An unrelated txn that rolls back.
         Op::BeginRw,
-        Op::Put {
-            db: 0,
-            key: k("rolled-back"),
-            val: v("x"),
-        },
+        Op::put(0, "rolled-back", "x"),
         Op::Abort,
         // The committed handle is still good.
         Op::BeginRw,
-        Op::Get { db: 0, key: k("k") },
-        Op::Put {
-            db: 0,
-            key: k("k2"),
-            val: v("v2"),
-        },
+        Op::get(0, "k"),
+        Op::put(0, "k2", "v2"),
         Op::Len { db: 0 },
         Op::Commit,
     ];
@@ -150,12 +113,8 @@ fn committed_handle_survives_a_later_abort() {
 fn dropped_handle_is_not_resurrected_by_abort() {
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(7),
-        },
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
+        Op::create_db(DbName::Named(7)),
+        Op::create_db(DbName::Unnamed),
         Op::Commit,
         Op::BeginRw,
         Op::DropDb { db: 0 },
@@ -176,28 +135,17 @@ fn dropped_handle_is_not_resurrected_by_abort() {
 fn recreate_after_drop_and_abort() {
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(3),
-        },
+        Op::create_db(DbName::Named(3)),
         Op::Commit,
         Op::BeginRw,
         Op::DropDb { db: 0 },
         Op::Abort,
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(3),
-        },
-        Op::Put {
-            db: 0,
-            key: k("fresh"),
-            val: v("entry"),
-        },
+        Op::create_db(DbName::Named(3)),
+        Op::put(0, "fresh", "entry"),
         Op::Commit,
         Op::BeginRo,
-        Op::Get {
-            db: 0,
-            key: k("fresh"),
-        },
+        Op::get(0, "fresh"),
         Op::Commit,
     ];
     diff_both_pairs(&ops);

@@ -11,21 +11,10 @@
 //! small (~7 entries/page at 4 KiB), reaching depth 3 in a few hundred entries
 //! instead of tens of thousands, which keeps the C-LMDB-linked runtime short.
 
-use zerodb_oracle::{run, DbName, Key, LmdbEngine, Op, Value, ZerodbEngine};
-
-fn diff(ops: Vec<Op>) {
-    if let Err(d) = run::<LmdbEngine, ZerodbEngine>(&ops) {
-        panic!("divergence:\n{d}");
-    }
-}
+use zerodb_oracle::{assert_matches_lmdb, DbName, Key, Op, Value, ZerodbEngine};
 
 fn setup() -> Vec<Op> {
-    vec![
-        Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
-    ]
+    vec![Op::BeginRw, Op::create_db(DbName::Unnamed)]
 }
 
 /// A near-max-size key (small branch fanout) with a distinguishing numeric
@@ -48,11 +37,7 @@ fn deep_split_cascade_then_delete_to_empty() {
     // leaves forces a second branch level; 400 entries comfortably clears it.
     let n = 400u32;
     for i in 0..n {
-        ops.push(Op::Put {
-            db: 0,
-            key: wide_key(i),
-            val: small_val(i),
-        });
+        ops.push(Op::put(0, wide_key(i), small_val(i)));
     }
     ops.push(Op::Len { db: 0 });
     ops.push(Op::Commit);
@@ -66,10 +51,7 @@ fn deep_split_cascade_then_delete_to_empty() {
     // empty tree (root collapse, §9).
     ops.push(Op::BeginRw);
     for i in (0..n).step_by(2) {
-        ops.push(Op::Del {
-            db: 0,
-            key: wide_key(i),
-        });
+        ops.push(Op::del(0, wide_key(i)));
     }
     ops.push(Op::Len { db: 0 });
     ops.push(Op::Iter { db: 0 });
@@ -80,10 +62,7 @@ fn deep_split_cascade_then_delete_to_empty() {
 
     ops.push(Op::BeginRw);
     for i in (1..n).step_by(2) {
-        ops.push(Op::Del {
-            db: 0,
-            key: wide_key(i),
-        });
+        ops.push(Op::del(0, wide_key(i)));
     }
     ops.push(Op::Len { db: 0 });
     ops.push(Op::Commit);
@@ -95,13 +74,9 @@ fn deep_split_cascade_then_delete_to_empty() {
     // Rebuild after full collapse: the empty-tree grow path (§9) must still
     // work post-collapse.
     ops.push(Op::BeginRw);
-    ops.push(Op::Put {
-        db: 0,
-        key: wide_key(0),
-        val: small_val(999),
-    });
+    ops.push(Op::put(0, wide_key(0), small_val(999)));
     ops.push(Op::Commit);
-    diff(ops);
+    assert_matches_lmdb::<ZerodbEngine>(ops);
 }
 
 #[test]
@@ -116,29 +91,19 @@ fn interleaved_put_del_crossing_threshold_both_directions() {
         ops.push(Op::BeginRw);
         let base = round * 200;
         for i in 0..120u32 {
-            ops.push(Op::Put {
-                db: 0,
-                key: wide_key(base + i),
-                val: small_val(i),
-            });
+            ops.push(Op::put(0, wide_key(base + i), small_val(i)));
         }
         // Shrink back to a handful of entries: most of this round's inserts
         // (and some of the previous round's survivors) get removed, driving
         // borrow/merge cascades while other subtrees stay populated.
         for i in (0..120u32).step_by(3) {
-            ops.push(Op::Del {
-                db: 0,
-                key: wide_key(base + i),
-            });
+            ops.push(Op::del(0, wide_key(base + i)));
         }
         if round > 0 {
             // Also thin out the previous round's surviving keys.
             let prev_base = (round - 1) * 200;
             for i in (1..120u32).step_by(5) {
-                ops.push(Op::Del {
-                    db: 0,
-                    key: wide_key(prev_base + i),
-                });
+                ops.push(Op::del(0, wide_key(prev_base + i)));
             }
         }
         ops.push(Op::Len { db: 0 });
@@ -149,7 +114,7 @@ fn interleaved_put_del_crossing_threshold_both_directions() {
         ops.push(Op::RevIter { db: 0 });
         ops.push(Op::Commit);
     }
-    diff(ops);
+    assert_matches_lmdb::<ZerodbEngine>(ops);
 }
 
 #[test]
@@ -169,42 +134,24 @@ fn insert_exactly_at_split_index_tie_break() {
         if i == 3 {
             continue;
         }
-        ops2.push(Op::Put {
-            db: 0,
-            key: wide_key(i),
-            val: small_val(i),
-        });
+        ops2.push(Op::put(0, wide_key(i), small_val(i)));
     }
     // Force the leaf to actually be full before the gap-fill by padding with
     // more entries around it (both sides), so the gap-fill triggers a split
     // rather than a plain in-page insert.
     for i in 7..40u32 {
-        ops2.push(Op::Put {
-            db: 0,
-            key: wide_key(i),
-            val: small_val(i),
-        });
+        ops2.push(Op::put(0, wide_key(i), small_val(i)));
     }
     ops.extend(ops2);
     // The tie-break insert: fills the gap at the median of a full leaf.
-    ops.push(Op::Put {
-        db: 0,
-        key: wide_key(3),
-        val: small_val(3),
-    });
+    ops.push(Op::put(0, wide_key(3), small_val(3)));
     ops.push(Op::Len { db: 0 });
     ops.push(Op::Iter { db: 0 });
     ops.push(Op::Commit);
     ops.push(Op::BeginRo);
     ops.push(Op::Iter { db: 0 });
-    ops.push(Op::GetGreaterThan {
-        db: 0,
-        key: wide_key(2),
-    });
-    ops.push(Op::GetLowerThanOrEqualTo {
-        db: 0,
-        key: wide_key(3),
-    });
+    ops.push(Op::get_greater_than(0, wide_key(2)));
+    ops.push(Op::get_lower_than_or_equal_to(0, wide_key(3)));
     ops.push(Op::Commit);
-    diff(ops);
+    assert_matches_lmdb::<ZerodbEngine>(ops);
 }

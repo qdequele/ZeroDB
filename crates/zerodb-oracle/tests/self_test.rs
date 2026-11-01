@@ -4,42 +4,20 @@
 
 use zerodb_oracle::{run_self_test, DbName, Op, PutFlag};
 
-fn k(bytes: &[u8]) -> zerodb_oracle::Key {
-    zerodb_oracle::Key(bytes.to_vec())
-}
-fn v(bytes: &[u8]) -> zerodb_oracle::Value {
-    zerodb_oracle::Value(bytes.to_vec())
-}
-
 /// The harness acceptance test: open, put, get, commit, reopen, get.
 #[test]
 fn trivial_sequence_self_test() {
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"hello"),
-            val: v(b"world"),
-        },
-        Op::Get {
-            db: 0,
-            key: k(b"hello"),
-        },
+        Op::create_db(DbName::Unnamed),
+        Op::put(0, b"hello", b"world"),
+        Op::get(0, b"hello"),
         Op::Commit,
         // A fresh independent read sees the committed value.
-        Op::VerifyGet {
-            db: 0,
-            key: k(b"hello"),
-        },
+        Op::verify_get(0, b"hello"),
         // Reopen the env (drop + reopen larger) and read again.
-        Op::Reopen { map_size_kib: 256 },
-        Op::VerifyGet {
-            db: 0,
-            key: k(b"hello"),
-        },
+        Op::reopen(256),
+        Op::verify_get(0, b"hello"),
     ];
     if let Err(d) = run_self_test(&ops) {
         panic!("self-test diverged:\n{d}");
@@ -51,47 +29,19 @@ fn trivial_sequence_self_test() {
 fn multi_db_iteration_and_seeks() {
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
-        Op::CreateDb {
-            name: DbName::Named(1),
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"b"),
-            val: v(b"2"),
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"1"),
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"c"),
-            val: v(b"3"),
-        },
+        Op::create_db(DbName::Unnamed),
+        Op::create_db(DbName::Named(1)),
+        Op::put(0, b"b", b"2"),
+        Op::put(0, b"a", b"1"),
+        Op::put(0, b"c", b"3"),
         Op::Iter { db: 0 },
         Op::RevIter { db: 0 },
         Op::First { db: 0 },
         Op::Last { db: 0 },
-        Op::SetRange {
-            db: 0,
-            key: k(b"aa"),
-        },
-        Op::GetGreaterThan {
-            db: 0,
-            key: k(b"b"),
-        },
-        Op::GetLowerThanOrEqualTo {
-            db: 0,
-            key: k(b"b"),
-        },
-        Op::PrefixIter {
-            db: 0,
-            prefix: k(b""),
-        },
+        Op::set_range(0, b"aa"),
+        Op::get_greater_than(0, b"b"),
+        Op::get_lower_than_or_equal_to(0, b"b"),
+        Op::prefix_iter(0, b""),
         Op::Len { db: 0 },
         Op::IsEmpty { db: 1 },
         Op::Commit,
@@ -104,51 +54,18 @@ fn multi_db_iteration_and_seeks() {
 fn write_flags_and_cursor_mutation() {
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
+        Op::create_db(DbName::Unnamed),
         // APPEND ascending, then an out-of-order APPEND (must error KeyExist).
-        Op::PutFlagged {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"1"),
-            flag: PutFlag::Append,
-        },
-        Op::PutFlagged {
-            db: 0,
-            key: k(b"b"),
-            val: v(b"2"),
-            flag: PutFlag::Append,
-        },
-        Op::PutFlagged {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"x"),
-            flag: PutFlag::Append,
-        },
+        Op::put_flagged(0, b"a", b"1", PutFlag::Append),
+        Op::put_flagged(0, b"b", b"2", PutFlag::Append),
+        Op::put_flagged(0, b"a", b"x", PutFlag::Append),
         // NO_OVERWRITE on an existing key (must error KeyExist).
-        Op::PutFlagged {
-            db: 0,
-            key: k(b"b"),
-            val: v(b"z"),
-            flag: PutFlag::NoOverwrite,
-        },
-        Op::PutReserved {
-            db: 0,
-            key: k(b"c"),
-            val: v(b"reserved"),
-        },
-        Op::IterMutPutCurrent {
-            db: 0,
-            nth: 1,
-            val: v(b"rewritten"),
-        },
-        Op::IterMutDelCurrent { db: 0, nth: 0 },
+        Op::put_flagged(0, b"b", b"z", PutFlag::NoOverwrite),
+        Op::put_reserved(0, b"c", b"reserved"),
+        Op::iter_mut_put_current(0, 1, b"rewritten"),
+        Op::iter_mut_del_current(0, 0),
         Op::Iter { db: 0 },
-        Op::Del {
-            db: 0,
-            key: k(b"c"),
-        },
+        Op::del(0, b"c"),
         Op::ClearDb { db: 0 },
         Op::Len { db: 0 },
         Op::Commit,
@@ -162,33 +79,17 @@ fn write_flags_and_cursor_mutation() {
 fn nested_read_over_write_txn() {
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"k"),
-            val: v(b"uncommitted"),
-        },
+        Op::create_db(DbName::Unnamed),
+        Op::put(0, b"k", b"uncommitted"),
         // Nested reader sees the write txn's uncommitted put.
         Op::BeginNestedRo,
-        Op::Get {
-            db: 0,
-            key: k(b"k"),
-        },
+        Op::get(0, b"k"),
         Op::Iter { db: 0 },
         Op::EndNestedRo,
         // Back to the write txn.
-        Op::Put {
-            db: 0,
-            key: k(b"k2"),
-            val: v(b"more"),
-        },
+        Op::put(0, b"k2", b"more"),
         Op::Commit,
-        Op::VerifyGet {
-            db: 0,
-            key: k(b"k"),
-        },
+        Op::verify_get(0, b"k"),
     ];
     assert!(run_self_test(&ops).is_ok());
 }
@@ -198,20 +99,13 @@ fn nested_read_over_write_txn() {
 #[test]
 fn empty_engine_skips_agree() {
     let ops = vec![
-        Op::Get {
-            db: 0,
-            key: k(b"x"),
-        },
+        Op::get(0, b"x"),
         Op::Iter { db: 0 },
         Op::Len { db: 3 },
         Op::Commit, // no txn
         Op::EndNestedRo,
         Op::BeginRw,
-        Op::Put {
-            db: 0,
-            key: k(b"x"),
-            val: v(b"y"),
-        }, // no db yet
+        Op::put(0, b"x", b"y"), // no db yet
         Op::Abort,
     ];
     assert!(run_self_test(&ops).is_ok());

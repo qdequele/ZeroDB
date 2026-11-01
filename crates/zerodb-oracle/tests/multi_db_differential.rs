@@ -8,20 +8,7 @@
 //! comparison against the LMDB fork. (Per-DB `stat` parity and name-edge cases
 //! are `stat_differential.rs` / `name_edge_differential.rs`.)
 
-use zerodb_oracle::{run, DbName, Key, LmdbEngine, Op, Value, ZerodbEngine};
-
-fn k(b: &[u8]) -> Key {
-    Key(b.to_vec())
-}
-fn v(b: &[u8]) -> Value {
-    Value(b.to_vec())
-}
-
-fn diff(ops: &[Op]) {
-    if let Err(d) = run::<LmdbEngine, ZerodbEngine>(ops) {
-        panic!("multi-db divergence:\n{d}");
-    }
-}
+use zerodb_oracle::{assert_matches_lmdb, DbName, Op, ZerodbEngine};
 
 /// The five databases the harness addresses: primary ("main") + db0..db3. The
 /// `db` index selects modulo the number of open DBs, so after opening all five
@@ -29,21 +16,11 @@ fn diff(ops: &[Op]) {
 fn create_all() -> Vec<Op> {
     vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
-        Op::CreateDb {
-            name: DbName::Named(0),
-        },
-        Op::CreateDb {
-            name: DbName::Named(1),
-        },
-        Op::CreateDb {
-            name: DbName::Named(2),
-        },
-        Op::CreateDb {
-            name: DbName::Named(3),
-        },
+        Op::create_db(DbName::Unnamed),
+        Op::create_db(DbName::Named(0)),
+        Op::create_db(DbName::Named(1)),
+        Op::create_db(DbName::Named(2)),
+        Op::create_db(DbName::Named(3)),
     ]
 }
 
@@ -55,11 +32,7 @@ fn interleaved_writes_are_isolated_per_db() {
         for db in 0..5u8 {
             let key = format!("k{round:03}");
             let val = format!("db{db}-r{round}");
-            ops.push(Op::Put {
-                db,
-                key: k(key.as_bytes()),
-                val: v(val.as_bytes()),
-            });
+            ops.push(Op::put(db, key.as_bytes(), val.as_bytes()));
         }
     }
     ops.push(Op::Commit);
@@ -70,7 +43,7 @@ fn interleaved_writes_are_isolated_per_db() {
         ops.push(Op::First { db });
         ops.push(Op::Last { db });
     }
-    diff(&ops);
+    assert_matches_lmdb::<ZerodbEngine>(&ops);
 }
 
 #[test]
@@ -78,11 +51,7 @@ fn deletes_and_clears_are_isolated() {
     let mut ops = create_all();
     for db in 0..5u8 {
         for i in 0..30u32 {
-            ops.push(Op::Put {
-                db,
-                key: k(format!("k{i:03}").as_bytes()),
-                val: v(b"x"),
-            });
+            ops.push(Op::put(db, format!("k{i:03}").as_bytes(), b"x"));
         }
     }
     ops.push(Op::Commit);
@@ -90,17 +59,15 @@ fn deletes_and_clears_are_isolated() {
     // Clear db2 entirely; delete a band from db0; leave db1/db3/main alone.
     ops.push(Op::ClearDb { db: 3 }); // creation order: main,db0,db1,db2,db3 -> idx3 = db2
     for i in 5..15u32 {
-        ops.push(Op::Del {
-            db: 1, // db0
-            key: k(format!("k{i:03}").as_bytes()),
-        });
+        // db index 1 is db0
+        ops.push(Op::del(1, format!("k{i:03}").as_bytes()));
     }
     ops.push(Op::Commit);
     for db in 0..5u8 {
         ops.push(Op::Len { db });
         ops.push(Op::Iter { db });
     }
-    diff(&ops);
+    assert_matches_lmdb::<ZerodbEngine>(&ops);
 }
 
 #[test]
@@ -109,69 +76,41 @@ fn create_in_txn_then_abort_removes_the_db() {
     // the name is reusable and stays absent until the create commits.
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(0),
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"1"),
-        },
+        Op::create_db(DbName::Named(0)),
+        Op::put(0, b"a", b"1"),
         Op::Abort,
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(0),
-        },
-        Op::VerifyGet {
-            db: 0,
-            key: k(b"a"),
-        }, // still None: not committed
-        Op::Put {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"2"),
-        },
+        Op::create_db(DbName::Named(0)),
+        Op::verify_get(0, b"a"), // still None: not committed
+        Op::put(0, b"a", b"2"),
         Op::Commit,
-        Op::VerifyGet {
-            db: 0,
-            key: k(b"a"),
-        }, // now Some("2")
+        Op::verify_get(0, b"a"), // now Some("2")
     ];
-    diff(&ops);
+    assert_matches_lmdb::<ZerodbEngine>(&ops);
 }
 
 #[test]
 fn create_then_reopen_persists() {
-    let mut ops = vec![
-        Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(1),
-        },
-    ];
+    let mut ops = vec![Op::BeginRw, Op::create_db(DbName::Named(1))];
     for i in 0..50u32 {
-        ops.push(Op::Put {
-            db: 0,
-            key: k(format!("key{i:04}").as_bytes()),
-            val: v(format!("val{i}").as_bytes()),
-        });
+        ops.push(Op::put(
+            0,
+            format!("key{i:04}").as_bytes(),
+            format!("val{i}").as_bytes(),
+        ));
     }
     ops.push(Op::Commit);
-    ops.push(Op::Reopen { map_size_kib: 0 });
+    ops.push(Op::reopen(0));
     // Reopen clears the handle table on both engines; re-open the DB by name
     // (idempotent create over the committed catalog) so later ops can address
     // it, then read every entry back.
     ops.push(Op::BeginRw);
-    ops.push(Op::CreateDb {
-        name: DbName::Named(1),
-    });
+    ops.push(Op::create_db(DbName::Named(1)));
     ops.push(Op::Commit);
     for i in 0..50u32 {
-        ops.push(Op::VerifyGet {
-            db: 0,
-            key: k(format!("key{i:04}").as_bytes()),
-        });
+        ops.push(Op::verify_get(0, format!("key{i:04}").as_bytes()));
     }
-    diff(&ops);
+    assert_matches_lmdb::<ZerodbEngine>(&ops);
 }
 
 #[test]
@@ -179,11 +118,7 @@ fn drop_removes_the_named_db_and_its_data() {
     let mut ops = create_all();
     for db in 0..5u8 {
         for i in 0..20u32 {
-            ops.push(Op::Put {
-                db,
-                key: k(format!("k{i:02}").as_bytes()),
-                val: v(b"v"),
-            });
+            ops.push(Op::put(db, format!("k{i:02}").as_bytes(), b"v"));
         }
     }
     ops.push(Op::Commit);
@@ -196,64 +131,36 @@ fn drop_removes_the_named_db_and_its_data() {
         ops.push(Op::Len { db });
         ops.push(Op::Iter { db });
     }
-    diff(&ops);
+    assert_matches_lmdb::<ZerodbEngine>(&ops);
 }
 
 #[test]
 fn drop_then_recreate_same_name() {
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(0),
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"old"),
-            val: v(b"1"),
-        },
+        Op::create_db(DbName::Named(0)),
+        Op::put(0, b"old", b"1"),
         Op::Commit,
         Op::BeginRw,
         Op::DropDb { db: 0 },
         Op::Commit,
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(0),
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"new"),
-            val: v(b"2"),
-        },
+        Op::create_db(DbName::Named(0)),
+        Op::put(0, b"new", b"2"),
         Op::Commit,
-        Op::VerifyGet {
-            db: 0,
-            key: k(b"old"),
-        }, // gone
-        Op::VerifyGet {
-            db: 0,
-            key: k(b"new"),
-        }, // present
+        Op::verify_get(0, b"old"), // gone
+        Op::verify_get(0, b"new"), // present
     ];
-    diff(&ops);
+    assert_matches_lmdb::<ZerodbEngine>(&ops);
 }
 
 #[test]
 fn clear_keeps_the_db_but_empties_it() {
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(0),
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"1"),
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"b"),
-            val: v(b"2"),
-        },
+        Op::create_db(DbName::Named(0)),
+        Op::put(0, b"a", b"1"),
+        Op::put(0, b"b", b"2"),
         Op::Commit,
         Op::BeginRw,
         Op::ClearDb { db: 0 },
@@ -261,20 +168,13 @@ fn clear_keeps_the_db_but_empties_it() {
         Op::Len { db: 0 },
         Op::IsEmpty { db: 0 },
         // Re-open by name after clear must still succeed (entry kept).
-        Op::VerifyGet {
-            db: 0,
-            key: k(b"a"),
-        },
+        Op::verify_get(0, b"a"),
         Op::BeginRw,
-        Op::Put {
-            db: 0,
-            key: k(b"c"),
-            val: v(b"3"),
-        },
+        Op::put(0, b"c", b"3"),
         Op::Commit,
         Op::Len { db: 0 },
     ];
-    diff(&ops);
+    assert_matches_lmdb::<ZerodbEngine>(&ops);
 }
 
 #[test]
@@ -284,23 +184,11 @@ fn overflow_values_in_named_dbs() {
     let big = vec![0xABu8; 9000];
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(2),
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"big"),
-            val: Value(big.clone()),
-        },
+        Op::create_db(DbName::Named(2)),
+        Op::put(0, b"big", big.clone()),
         Op::Commit,
-        Op::VerifyGet {
-            db: 0,
-            key: k(b"big"),
-        },
-        Op::Get {
-            db: 0,
-            key: k(b"big"),
-        },
+        Op::verify_get(0, b"big"),
+        Op::get(0, b"big"),
     ];
-    diff(&ops);
+    assert_matches_lmdb::<ZerodbEngine>(&ops);
 }

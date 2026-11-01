@@ -9,7 +9,7 @@
 //! Remove ONLY when the fork fix lands upstream and the repro example no
 //! longer crashes.
 
-use zerodb_oracle::{run_self_test, DbName, Key, LmdbEngine, Op, PutFlag, Value};
+use zerodb_oracle::{run_self_test, DbName, LmdbEngine, Op, PutFlag};
 
 /// The exact minimized crash sequence must complete without a SEGV —
 /// the APPEND puts after the clear classify as `Skip::KnownForkBug`.
@@ -17,27 +17,13 @@ use zerodb_oracle::{run_self_test, DbName, Key, LmdbEngine, Op, PutFlag, Value};
 fn fork1_crash_sequence_is_guarded() {
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(40),
-        },
+        Op::create_db(DbName::Named(40)),
         Op::Commit,
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
+        Op::create_db(DbName::Unnamed),
         Op::ClearDb { db: 165 },
-        Op::PutFlagged {
-            db: 104,
-            key: Key(vec![0xbe, 0x68]),
-            val: Value(vec![]),
-            flag: PutFlag::Append,
-        },
-        Op::PutFlagged {
-            db: 104,
-            key: Key(vec![0u8; 500]),
-            val: Value(vec![0u8; 1_000_000]),
-            flag: PutFlag::Append,
-        },
+        Op::put_flagged(104, vec![0xbe, 0x68], vec![], PutFlag::Append),
+        Op::put_flagged(104, vec![0u8; 500], vec![0u8; 1_000_000], PutFlag::Append),
         Op::Commit,
     ];
     // Would SIGSEGV the whole test process without the guard.
@@ -50,15 +36,8 @@ fn append_without_clear_still_executes() {
     use zerodb_oracle::Engine;
     let mut e = LmdbEngine::new();
     assert!(matches!(e.apply(&Op::BeginRw), zerodb_oracle::OpResult::Ok));
-    e.apply(&Op::CreateDb {
-        name: DbName::Unnamed,
-    });
-    let r = e.apply(&Op::PutFlagged {
-        db: 0,
-        key: Key(vec![1]),
-        val: Value(vec![2]),
-        flag: PutFlag::Append,
-    });
+    e.apply(&Op::create_db(DbName::Unnamed));
+    let r = e.apply(&Op::put_flagged(0, vec![1], vec![2], PutFlag::Append));
     assert!(matches!(r, zerodb_oracle::OpResult::Ok), "got {r:?}");
 }
 
@@ -69,17 +48,10 @@ fn guard_resets_after_commit() {
     use zerodb_oracle::Engine;
     let mut e = LmdbEngine::new();
     e.apply(&Op::BeginRw);
-    e.apply(&Op::CreateDb {
-        name: DbName::Unnamed,
-    });
+    e.apply(&Op::create_db(DbName::Unnamed));
     e.apply(&Op::ClearDb { db: 0 });
     e.apply(&Op::Commit);
     e.apply(&Op::BeginRw);
-    let r = e.apply(&Op::PutFlagged {
-        db: 0,
-        key: Key(vec![1]),
-        val: Value(vec![2]),
-        flag: PutFlag::Append,
-    });
+    let r = e.apply(&Op::put_flagged(0, vec![1], vec![2], PutFlag::Append));
     assert!(matches!(r, zerodb_oracle::OpResult::Ok), "got {r:?}");
 }

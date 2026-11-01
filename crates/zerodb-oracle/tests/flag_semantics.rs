@@ -33,13 +33,6 @@ use heed::{Database, EnvFlags, EnvOpenOptions, PutFlags};
 use zerodb_oracle::tempdir::TempDir;
 use zerodb_oracle::{DbName, Engine, LmdbEngine, Op, OpResult, OracleError, PutFlag};
 
-fn k(bytes: &[u8]) -> zerodb_oracle::Key {
-    zerodb_oracle::Key(bytes.to_vec())
-}
-fn v(bytes: &[u8]) -> zerodb_oracle::Value {
-    zerodb_oracle::Value(bytes.to_vec())
-}
-
 // ---------------------------------------------------------------------
 // §S1 — MDB_APPEND: last-key compare, not full-order validation
 // ---------------------------------------------------------------------
@@ -50,19 +43,9 @@ fn v(bytes: &[u8]) -> zerodb_oracle::Value {
 fn flag_append_into_empty_db_ok() {
     let mut e = LmdbEngine::new();
     assert_eq!(e.apply(&Op::BeginRw), OpResult::Ok);
+    assert_eq!(e.apply(&Op::create_db(DbName::Unnamed)), OpResult::Ok);
     assert_eq!(
-        e.apply(&Op::CreateDb {
-            name: DbName::Unnamed
-        }),
-        OpResult::Ok
-    );
-    assert_eq!(
-        e.apply(&Op::PutFlagged {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"1"),
-            flag: PutFlag::Append,
-        }),
+        e.apply(&Op::put_flagged(0, b"a", b"1", PutFlag::Append)),
         OpResult::Ok,
         "APPEND into an empty db must succeed"
     );
@@ -75,24 +58,14 @@ fn flag_append_into_empty_db_ok() {
 fn flag_append_ascending_ok() {
     let mut e = LmdbEngine::new();
     assert_eq!(e.apply(&Op::BeginRw), OpResult::Ok);
-    assert_eq!(
-        e.apply(&Op::CreateDb {
-            name: DbName::Unnamed
-        }),
-        OpResult::Ok
-    );
+    assert_eq!(e.apply(&Op::create_db(DbName::Unnamed)), OpResult::Ok);
     for (key, val) in [
         (b"a".as_slice(), b"1".as_slice()),
         (b"b", b"2"),
         (b"c", b"3"),
     ] {
         assert_eq!(
-            e.apply(&Op::PutFlagged {
-                db: 0,
-                key: k(key),
-                val: v(val),
-                flag: PutFlag::Append,
-            }),
+            e.apply(&Op::put_flagged(0, key, val, PutFlag::Append)),
             OpResult::Ok,
             "ascending APPEND of {key:?} must succeed"
         );
@@ -107,38 +80,18 @@ fn flag_append_ascending_ok() {
 fn flag_append_out_of_order() {
     let mut e = LmdbEngine::new();
     assert_eq!(e.apply(&Op::BeginRw), OpResult::Ok);
+    assert_eq!(e.apply(&Op::create_db(DbName::Unnamed)), OpResult::Ok);
     assert_eq!(
-        e.apply(&Op::CreateDb {
-            name: DbName::Unnamed
-        }),
+        e.apply(&Op::put_flagged(0, b"a", b"1", PutFlag::Append)),
         OpResult::Ok
     );
     assert_eq!(
-        e.apply(&Op::PutFlagged {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"1"),
-            flag: PutFlag::Append,
-        }),
-        OpResult::Ok
-    );
-    assert_eq!(
-        e.apply(&Op::PutFlagged {
-            db: 0,
-            key: k(b"b"),
-            val: v(b"2"),
-            flag: PutFlag::Append,
-        }),
+        e.apply(&Op::put_flagged(0, b"b", b"2", PutFlag::Append)),
         OpResult::Ok
     );
     // "a" < "b" (the current last key) -> out-of-order APPEND -> KeyExist.
     assert_eq!(
-        e.apply(&Op::PutFlagged {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"x"),
-            flag: PutFlag::Append,
-        }),
+        e.apply(&Op::put_flagged(0, b"a", b"x", PutFlag::Append)),
         OpResult::Err(OracleError::KeyExist),
         "out-of-order APPEND must error KeyExist, not silently insert"
     );
@@ -151,37 +104,19 @@ fn flag_append_out_of_order() {
 fn flag_append_equal_key_keyexist() {
     let mut e = LmdbEngine::new();
     assert_eq!(e.apply(&Op::BeginRw), OpResult::Ok);
+    assert_eq!(e.apply(&Op::create_db(DbName::Unnamed)), OpResult::Ok);
     assert_eq!(
-        e.apply(&Op::CreateDb {
-            name: DbName::Unnamed
-        }),
+        e.apply(&Op::put_flagged(0, b"b", b"2", PutFlag::Append)),
         OpResult::Ok
     );
     assert_eq!(
-        e.apply(&Op::PutFlagged {
-            db: 0,
-            key: k(b"b"),
-            val: v(b"2"),
-            flag: PutFlag::Append,
-        }),
-        OpResult::Ok
-    );
-    assert_eq!(
-        e.apply(&Op::PutFlagged {
-            db: 0,
-            key: k(b"b"),
-            val: v(b"different"),
-            flag: PutFlag::Append,
-        }),
+        e.apply(&Op::put_flagged(0, b"b", b"different", PutFlag::Append)),
         OpResult::Err(OracleError::KeyExist),
         "APPEND with a key equal to the current last key must error KeyExist"
     );
     // Confirm it did NOT overwrite (unlike a plain put would have).
     assert_eq!(
-        e.apply(&Op::Get {
-            db: 0,
-            key: k(b"b")
-        }),
+        e.apply(&Op::get(0, b"b")),
         OpResult::MaybeVal(Some(b"2".to_vec()))
     );
     assert_eq!(e.apply(&Op::Commit), OpResult::Ok);
@@ -194,34 +129,14 @@ fn flag_append_equal_key_keyexist() {
 fn flag_no_overwrite_errors_and_does_not_modify() {
     let mut e = LmdbEngine::new();
     assert_eq!(e.apply(&Op::BeginRw), OpResult::Ok);
+    assert_eq!(e.apply(&Op::create_db(DbName::Unnamed)), OpResult::Ok);
+    assert_eq!(e.apply(&Op::put(0, b"k", b"original")), OpResult::Ok);
     assert_eq!(
-        e.apply(&Op::CreateDb {
-            name: DbName::Unnamed
-        }),
-        OpResult::Ok
-    );
-    assert_eq!(
-        e.apply(&Op::Put {
-            db: 0,
-            key: k(b"k"),
-            val: v(b"original"),
-        }),
-        OpResult::Ok
-    );
-    assert_eq!(
-        e.apply(&Op::PutFlagged {
-            db: 0,
-            key: k(b"k"),
-            val: v(b"clobber"),
-            flag: PutFlag::NoOverwrite,
-        }),
+        e.apply(&Op::put_flagged(0, b"k", b"clobber", PutFlag::NoOverwrite)),
         OpResult::Err(OracleError::KeyExist)
     );
     assert_eq!(
-        e.apply(&Op::Get {
-            db: 0,
-            key: k(b"k")
-        }),
+        e.apply(&Op::get(0, b"k")),
         OpResult::MaybeVal(Some(b"original".to_vec())),
         "NO_OVERWRITE on an existing key must not modify the stored value"
     );

@@ -9,30 +9,11 @@
 
 use proptest::prelude::*;
 use zerodb_oracle::{
-    decode_ops, run, DbName, HeedZerodbEngine, Key, LmdbEngine, Op, PutFlag, Value,
+    assert_matches_lmdb, decode_ops, run, DbName, HeedZerodbEngine, LmdbEngine, Op, PutFlag,
 };
 
-fn diff(ops: &[Op]) {
-    if let Err(d) = run::<LmdbEngine, HeedZerodbEngine>(ops) {
-        panic!("adapter divergence:\n{d}");
-    }
-}
-
-fn k(s: &str) -> Key {
-    Key(s.as_bytes().to_vec())
-}
-fn v(s: &str) -> Value {
-    Value(s.as_bytes().to_vec())
-}
-
 fn open_unnamed() -> Vec<Op> {
-    vec![
-        Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
-        Op::Commit,
-    ]
+    vec![Op::BeginRw, Op::create_db(DbName::Unnamed), Op::Commit]
 }
 
 #[test]
@@ -40,20 +21,13 @@ fn put_get_commit_reopen() {
     let mut ops = open_unnamed();
     ops.push(Op::BeginRw);
     for i in 0..50u32 {
-        ops.push(Op::Put {
-            db: 0,
-            key: k(&format!("key-{i:03}")),
-            val: v(&format!("val-{i}")),
-        });
+        ops.push(Op::put(0, format!("key-{i:03}"), format!("val-{i}")));
     }
     ops.push(Op::Commit);
     // Reads over a fresh read txn.
     ops.push(Op::BeginRo);
     for i in 0..50u32 {
-        ops.push(Op::Get {
-            db: 0,
-            key: k(&format!("key-{i:03}")),
-        });
+        ops.push(Op::get(0, format!("key-{i:03}")));
     }
     ops.push(Op::Len { db: 0 });
     ops.push(Op::First { db: 0 });
@@ -62,11 +36,11 @@ fn put_get_commit_reopen() {
     ops.push(Op::RevIter { db: 0 });
     ops.push(Op::Commit);
     // Reopen durability.
-    ops.push(Op::Reopen { map_size_kib: 0 });
+    ops.push(Op::reopen(0));
     ops.push(Op::BeginRo);
     ops.push(Op::Len { db: 0 });
     ops.push(Op::Commit);
-    diff(&ops);
+    assert_matches_lmdb::<HeedZerodbEngine>(&ops);
 }
 
 #[test]
@@ -75,44 +49,22 @@ fn flags_append_no_overwrite_reserved() {
     ops.push(Op::BeginRw);
     // APPEND in ascending order, then a misfire.
     for i in 0..20u32 {
-        ops.push(Op::PutFlagged {
-            db: 0,
-            key: k(&format!("a-{i:03}")),
-            val: v("x"),
-            flag: PutFlag::Append,
-        });
+        ops.push(Op::put_flagged(
+            0,
+            format!("a-{i:03}"),
+            "x",
+            PutFlag::Append,
+        ));
     }
-    ops.push(Op::PutFlagged {
-        db: 0,
-        key: k("a-000"),
-        val: v("x"),
-        flag: PutFlag::Append,
-    });
+    ops.push(Op::put_flagged(0, "a-000", "x", PutFlag::Append));
     // NO_OVERWRITE on an existing and a fresh key.
-    ops.push(Op::PutFlagged {
-        db: 0,
-        key: k("a-000"),
-        val: v("y"),
-        flag: PutFlag::NoOverwrite,
-    });
-    ops.push(Op::PutFlagged {
-        db: 0,
-        key: k("z-new"),
-        val: v("y"),
-        flag: PutFlag::NoOverwrite,
-    });
+    ops.push(Op::put_flagged(0, "a-000", "y", PutFlag::NoOverwrite));
+    ops.push(Op::put_flagged(0, "z-new", "y", PutFlag::NoOverwrite));
     // RESERVE.
-    ops.push(Op::PutReserved {
-        db: 0,
-        key: k("r-key"),
-        val: v("reserved-value"),
-    });
-    ops.push(Op::Get {
-        db: 0,
-        key: k("r-key"),
-    });
+    ops.push(Op::put_reserved(0, "r-key", "reserved-value"));
+    ops.push(Op::get(0, "r-key"));
     ops.push(Op::Commit);
-    diff(&ops);
+    assert_matches_lmdb::<HeedZerodbEngine>(&ops);
 }
 
 #[test]
@@ -120,28 +72,14 @@ fn delete_clear_and_cursor_mutation() {
     let mut ops = open_unnamed();
     ops.push(Op::BeginRw);
     for i in 0..40u32 {
-        ops.push(Op::Put {
-            db: 0,
-            key: k(&format!("m-{i:03}")),
-            val: v("v"),
-        });
+        ops.push(Op::put(0, format!("m-{i:03}"), "v"));
     }
     // Cursor put/del at positions.
-    ops.push(Op::IterMutPutCurrent {
-        db: 0,
-        nth: 5,
-        val: v("rewritten"),
-    });
-    ops.push(Op::IterMutDelCurrent { db: 0, nth: 10 });
-    ops.push(Op::IterMutDelCurrent { db: 0, nth: 0 });
-    ops.push(Op::Del {
-        db: 0,
-        key: k("m-020"),
-    });
-    ops.push(Op::Get {
-        db: 0,
-        key: k("m-005"),
-    });
+    ops.push(Op::iter_mut_put_current(0, 5, "rewritten"));
+    ops.push(Op::iter_mut_del_current(0, 10));
+    ops.push(Op::iter_mut_del_current(0, 0));
+    ops.push(Op::del(0, "m-020"));
+    ops.push(Op::get(0, "m-005"));
     ops.push(Op::Len { db: 0 });
     ops.push(Op::Iter { db: 0 });
     ops.push(Op::Commit);
@@ -150,7 +88,7 @@ fn delete_clear_and_cursor_mutation() {
     ops.push(Op::ClearDb { db: 0 });
     ops.push(Op::Len { db: 0 });
     ops.push(Op::Commit);
-    diff(&ops);
+    assert_matches_lmdb::<HeedZerodbEngine>(&ops);
 }
 
 #[test]
@@ -159,84 +97,44 @@ fn seeks_prefix_and_range() {
     ops.push(Op::BeginRw);
     for p in ["aa", "ab", "ba", "bb", "bc", "ca"] {
         for i in 0..5u32 {
-            ops.push(Op::Put {
-                db: 0,
-                key: k(&format!("{p}-{i}")),
-                val: v("v"),
-            });
+            ops.push(Op::put(0, format!("{p}-{i}"), "v"));
         }
     }
     ops.push(Op::Commit);
     ops.push(Op::BeginRo);
-    ops.push(Op::PrefixIter {
-        db: 0,
-        prefix: k("b"),
-    });
-    ops.push(Op::RevPrefixIter {
-        db: 0,
-        prefix: k("b"),
-    });
-    ops.push(Op::SetRange {
-        db: 0,
-        key: k("ba-2"),
-    });
-    ops.push(Op::GetGreaterThan {
-        db: 0,
-        key: k("ba-2"),
-    });
-    ops.push(Op::GetLowerThanOrEqualTo {
-        db: 0,
-        key: k("bb-0"),
-    });
+    ops.push(Op::prefix_iter(0, "b"));
+    ops.push(Op::rev_prefix_iter(0, "b"));
+    ops.push(Op::set_range(0, "ba-2"));
+    ops.push(Op::get_greater_than(0, "ba-2"));
+    ops.push(Op::get_lower_than_or_equal_to(0, "bb-0"));
     ops.push(Op::Commit);
-    diff(&ops);
+    assert_matches_lmdb::<HeedZerodbEngine>(&ops);
 }
 
 #[test]
 fn named_databases_and_abort() {
     let mut ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(0),
-        },
-        Op::CreateDb {
-            name: DbName::Named(1),
-        },
+        Op::create_db(DbName::Named(0)),
+        Op::create_db(DbName::Named(1)),
         Op::Commit,
         Op::BeginRw,
     ];
     for i in 0..15u32 {
-        ops.push(Op::Put {
-            db: 0,
-            key: k(&format!("d0-{i}")),
-            val: v("a"),
-        });
-        ops.push(Op::Put {
-            db: 1,
-            key: k(&format!("d1-{i}")),
-            val: v("b"),
-        });
+        ops.push(Op::put(0, format!("d0-{i}"), "a"));
+        ops.push(Op::put(1, format!("d1-{i}"), "b"));
     }
     ops.push(Op::Commit);
     // Create-in-txn then abort: must vanish.
     ops.push(Op::BeginRw);
-    ops.push(Op::CreateDb {
-        name: DbName::Named(2),
-    });
-    ops.push(Op::Put {
-        db: 2,
-        key: k("ephemeral"),
-        val: v("x"),
-    });
+    ops.push(Op::create_db(DbName::Named(2)));
+    ops.push(Op::put(2, "ephemeral", "x"));
     ops.push(Op::Abort);
     ops.push(Op::BeginRo);
-    ops.push(Op::VerifyGet {
-        db: 0,
-        key: k("d0-3"),
-    });
+    ops.push(Op::verify_get(0, "d0-3"));
     ops.push(Op::Len { db: 1 });
     ops.push(Op::Commit);
-    diff(&ops);
+    assert_matches_lmdb::<HeedZerodbEngine>(&ops);
 }
 
 #[test]
@@ -244,56 +142,31 @@ fn nested_read_over_write_txn() {
     let mut ops = open_unnamed();
     ops.push(Op::BeginRw);
     for i in 0..30u32 {
-        ops.push(Op::Put {
-            db: 0,
-            key: k(&format!("n-{i:02}")),
-            val: v(&format!("uncommitted-{i}")),
-        });
+        ops.push(Op::put(0, format!("n-{i:02}"), format!("uncommitted-{i}")));
     }
     // Nested reader sees uncommitted state.
     ops.push(Op::BeginNestedRo);
-    ops.push(Op::Get {
-        db: 0,
-        key: k("n-05"),
-    });
+    ops.push(Op::get(0, "n-05"));
     ops.push(Op::Iter { db: 0 });
     ops.push(Op::Len { db: 0 });
     ops.push(Op::EndNestedRo);
     ops.push(Op::Commit);
-    diff(&ops);
+    assert_matches_lmdb::<HeedZerodbEngine>(&ops);
 }
 
 #[test]
 fn large_overflow_values() {
     let mut ops = open_unnamed();
     ops.push(Op::BeginRw);
-    ops.push(Op::Put {
-        db: 0,
-        key: k("small"),
-        val: Value(vec![1u8; 10]),
-    });
-    ops.push(Op::Put {
-        db: 0,
-        key: k("big"),
-        val: Value(vec![7u8; 40_000]),
-    });
-    ops.push(Op::Put {
-        db: 0,
-        key: k("mid"),
-        val: Value(vec![3u8; 4096]),
-    });
+    ops.push(Op::put(0, "small", vec![1u8; 10]));
+    ops.push(Op::put(0, "big", vec![7u8; 40_000]));
+    ops.push(Op::put(0, "mid", vec![3u8; 4096]));
     ops.push(Op::Commit);
     ops.push(Op::BeginRo);
-    ops.push(Op::Get {
-        db: 0,
-        key: k("big"),
-    });
-    ops.push(Op::Get {
-        db: 0,
-        key: k("mid"),
-    });
+    ops.push(Op::get(0, "big"));
+    ops.push(Op::get(0, "mid"));
     ops.push(Op::Commit);
-    diff(&ops);
+    assert_matches_lmdb::<HeedZerodbEngine>(&ops);
 }
 
 proptest! {

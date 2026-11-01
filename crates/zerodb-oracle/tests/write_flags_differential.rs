@@ -19,83 +19,38 @@
 //! tests. The Meilisearch indexing flag-combo replay is
 //! `milli_indexing_flag_combo_replay`.
 
-use zerodb_oracle::{
-    run, run_in_mode, DbName, EngineMode, Key, LmdbEngine, Op, PutFlag, Value, ZerodbEngine,
-};
-
-fn k(b: &[u8]) -> Key {
-    Key(b.to_vec())
-}
-fn v(b: &[u8]) -> Value {
-    Value(b.to_vec())
-}
+use zerodb_oracle::{run, run_in_mode, DbName, EngineMode, LmdbEngine, Op, PutFlag, ZerodbEngine};
 
 /// A read/write/reserve/iterate storm exercising the whole surface, used by the
 /// `WRITE_MAP` parity tests. `db = 0` is the sole (unnamed→"main") DB.
 fn storm() -> Vec<Op> {
-    let mut ops = vec![
-        Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
-    ];
+    let mut ops = vec![Op::BeginRw, Op::create_db(DbName::Unnamed)];
     // Ascending APPEND (SPEC 01 §S1) — the bulk-insert path writemap must match.
     for i in 0u16..80 {
-        ops.push(Op::PutFlagged {
-            db: 0,
-            key: k(&i.to_be_bytes()),
-            val: v(format!("append-{i}").as_bytes()),
-            flag: PutFlag::Append,
-        });
+        ops.push(Op::put_flagged(
+            0,
+            &i.to_be_bytes(),
+            format!("append-{i}").as_bytes(),
+            PutFlag::Append,
+        ));
     }
     // Plain puts (overwrites + fresh), a reserved value, and a large overflow
     // value — all landing in the writable map under WRITE_MAP.
-    ops.push(Op::Put {
-        db: 0,
-        key: k(b"zzz"),
-        val: v(b"plain"),
-    });
-    ops.push(Op::Put {
-        db: 0,
-        key: k(&5u16.to_be_bytes()),
-        val: v(b"overwrite"),
-    });
-    ops.push(Op::PutReserved {
-        db: 0,
-        key: k(b"reserved"),
-        val: v(b"RESERVEDBYTES"),
-    });
-    ops.push(Op::Put {
-        db: 0,
-        key: k(b"big"),
-        val: v(&vec![0xAB; 20_000]),
-    });
-    ops.push(Op::Del {
-        db: 0,
-        key: k(&3u16.to_be_bytes()),
-    });
+    ops.push(Op::put(0, b"zzz", b"plain"));
+    ops.push(Op::put(0, &5u16.to_be_bytes(), b"overwrite"));
+    ops.push(Op::put_reserved(0, b"reserved", b"RESERVEDBYTES"));
+    ops.push(Op::put(0, b"big", vec![0xAB; 20_000]));
+    ops.push(Op::del(0, &3u16.to_be_bytes()));
     ops.push(Op::Commit);
     // Read back through a fresh read txn.
     ops.push(Op::BeginRo);
     ops.push(Op::Len { db: 0 });
     ops.push(Op::First { db: 0 });
     ops.push(Op::Last { db: 0 });
-    ops.push(Op::Get {
-        db: 0,
-        key: k(&7u16.to_be_bytes()),
-    });
-    ops.push(Op::Get {
-        db: 0,
-        key: k(b"reserved"),
-    });
-    ops.push(Op::Get {
-        db: 0,
-        key: k(b"big"),
-    });
-    ops.push(Op::Get {
-        db: 0,
-        key: k(&3u16.to_be_bytes()),
-    }); // deleted → None
+    ops.push(Op::get(0, &7u16.to_be_bytes()));
+    ops.push(Op::get(0, b"reserved"));
+    ops.push(Op::get(0, b"big"));
+    ops.push(Op::get(0, &3u16.to_be_bytes())); // deleted → None
     ops.push(Op::Iter { db: 0 });
     ops.push(Op::RevIter { db: 0 });
     ops.push(Op::Abort);
@@ -116,42 +71,16 @@ fn env_writemap_put_reserved() {
     // reserve, overwrite same key with a new reserved value, read back.
     let ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        },
-        Op::PutReserved {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"first-reserved"),
-        },
-        Op::PutReserved {
-            db: 0,
-            key: k(b"b"),
-            val: v(&vec![0x7F; 9000]),
-        }, // overflow-sized reserve
-        Op::Get {
-            db: 0,
-            key: k(b"a"),
-        },
-        Op::Put {
-            db: 0,
-            key: k(b"a"),
-            val: v(b"replaced-plain"),
-        },
-        Op::Get {
-            db: 0,
-            key: k(b"a"),
-        },
+        Op::create_db(DbName::Unnamed),
+        Op::put_reserved(0, b"a", b"first-reserved"),
+        Op::put_reserved(0, b"b", vec![0x7F; 9000]), // overflow-sized reserve
+        Op::get(0, b"a"),
+        Op::put(0, b"a", b"replaced-plain"),
+        Op::get(0, b"a"),
         Op::Commit,
         Op::BeginRo,
-        Op::Get {
-            db: 0,
-            key: k(b"a"),
-        },
-        Op::Get {
-            db: 0,
-            key: k(b"b"),
-        },
+        Op::get(0, b"a"),
+        Op::get(0, b"b"),
         Op::Len { db: 0 },
         Op::Abort,
     ];
@@ -334,67 +263,41 @@ fn milli_indexing_flag_combo_replay() {
     // gate, covered separately by the WRITE_MAP tests above).
     let mut ops = vec![
         Op::BeginRw,
-        Op::CreateDb {
-            name: DbName::Named(0),
-        }, // e.g. "word-docids"
-        Op::CreateDb {
-            name: DbName::Named(1),
-        }, // e.g. "documents"
-        Op::CreateDb {
-            name: DbName::Unnamed,
-        }, // milli's named "main"
+        Op::create_db(DbName::Named(0)), // e.g. "word-docids"
+        Op::create_db(DbName::Named(1)), // e.g. "documents"
+        Op::create_db(DbName::Unnamed),  // milli's named "main"
     ];
     // Bulk APPEND word postings in strict ascending order (milli's grenad-sorted
     // output → APPEND loop).
     for i in 0u16..64 {
-        ops.push(Op::PutFlagged {
-            db: 0,
-            key: k(&i.to_be_bytes()),
-            val: v(format!("posting-{i}").as_bytes()),
-            flag: PutFlag::Append,
-        });
+        ops.push(Op::put_flagged(
+            0,
+            &i.to_be_bytes(),
+            format!("posting-{i}").as_bytes(),
+            PutFlag::Append,
+        ));
     }
     // Documents DB: plain puts (out-of-order keys).
     for &d in &[9u16, 2, 40, 3, 17, 8] {
-        ops.push(Op::Put {
-            db: 1,
-            key: k(&d.to_be_bytes()),
-            val: v(b"doc"),
-        });
+        ops.push(Op::put(1, &d.to_be_bytes(), b"doc"));
     }
     // Mid-txn nested reads (the fan-out): open a nested reader, read uncommitted
     // state from both DBs, close it, resume the writer.
     ops.push(Op::BeginNestedRo);
     ops.push(Op::Iter { db: 0 });
     ops.push(Op::Len { db: 0 });
-    ops.push(Op::Get {
-        db: 1,
-        key: k(&40u16.to_be_bytes()),
-    });
+    ops.push(Op::get(1, &40u16.to_be_bytes()));
     ops.push(Op::EndNestedRo);
     // Deletes + a clear (prune a DB), then more writes.
-    ops.push(Op::Del {
-        db: 0,
-        key: k(&10u16.to_be_bytes()),
-    });
-    ops.push(Op::Del {
-        db: 1,
-        key: k(&2u16.to_be_bytes()),
-    });
+    ops.push(Op::del(0, &10u16.to_be_bytes()));
+    ops.push(Op::del(1, &2u16.to_be_bytes()));
     ops.push(Op::ClearDb { db: 2 });
-    ops.push(Op::Put {
-        db: 2,
-        key: k(b"key"),
-        val: v(b"main-val"),
-    });
+    ops.push(Op::put(2, b"key", b"main-val"));
     // Second nested-read fan-out after mutations.
     ops.push(Op::BeginNestedRo);
     ops.push(Op::Iter { db: 0 });
     ops.push(Op::Iter { db: 1 });
-    ops.push(Op::Get {
-        db: 0,
-        key: k(&10u16.to_be_bytes()),
-    }); // deleted → None
+    ops.push(Op::get(0, &10u16.to_be_bytes())); // deleted → None
     ops.push(Op::EndNestedRo);
     ops.push(Op::Commit);
     // Post-commit verification through fresh read txns.
