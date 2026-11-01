@@ -38,11 +38,11 @@ mod writer_lock;
 pub use backing::{Backing, MapView};
 pub use info::{EnvClosingEvent, EnvInfo, EnvStat, ReaderEntry};
 pub(crate) use open::read_snapshot_at;
+use open::{bytes_needed, check_snapshot_backed, META_RETRY_LIMIT};
 pub use open::{
     check_open_limits, dirty_limit_pages, open_with_backing, open_with_backing_policy,
     open_with_backing_shared, MAX_READERS_LIMIT,
 };
-use open::{bytes_needed, check_snapshot_backed, META_RETRY_LIMIT};
 pub(crate) use writer_lock::WriterGuard;
 use writer_lock::{SignalEvent, WriterLock};
 

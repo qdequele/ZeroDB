@@ -17,7 +17,7 @@
 use crate::cmp::KeyCmp;
 
 use super::geometry::body_size;
-use super::header::{read_and_check_bounds, read_flags, CommonHeader};
+use super::header::{expect_type, read_and_check_bounds, read_flags, CommonHeader};
 use super::raw::{
     read_u16, read_u16_unchecked, read_u32, read_u32_unchecked, read_u64_unchecked, write_u16,
     write_u32, write_u64,
@@ -83,6 +83,66 @@ pub enum LeafValue<'a> {
 // Shared cell-length / validation helpers
 // ===========================================================================
 
+/// The padded length of a leaf cell with header fields `flags`, `ksize` and
+/// `dsize`, checking the flags carry no reserved bit and the key size is
+/// 1..=`MAX_KEY_SIZE`.
+#[inline(always)]
+fn leaf_cell_shape(flags: u16, ksize: usize, dsize: u32) -> Result<usize, PageError> {
+    if flags & !LEAF_FLAGS_PHASE1_MASK != 0 {
+        return Err(PageError::ReservedFlagSet { flags });
+    }
+    if ksize == 0 || ksize > MAX_KEY_SIZE {
+        return Err(PageError::BadKeySize { ksize });
+    }
+    let value_area = if flags & F_BIGDATA != 0 {
+        BIGDATA_VALUE_LEN
+    } else {
+        dsize as usize
+    };
+    Ok(even(LEAF_NODE_HEADER + ksize + value_area))
+}
+
+/// A branch separator's size rule: node 0 holds the empty key, every other
+/// node a key of 1..=`MAX_KEY_SIZE` bytes.
+#[inline(always)]
+fn check_branch_ksize(index0: bool, ksize: usize) -> Result<(), PageError> {
+    let ok = if index0 {
+        ksize == 0
+    } else {
+        ksize != 0 && ksize <= MAX_KEY_SIZE
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(PageError::BadKeySize { ksize })
+    }
+}
+
+/// Write an empty tree page of type `flags` (`P_LEAF` or `P_BRANCH`) into
+/// `buf`: the common header, `lower = 0`, `upper = body_size`, and zeroed
+/// reserved tail fields.
+fn init_tree_page(
+    buf: &mut [u8],
+    psize: u32,
+    pgno: u64,
+    txnid: u64,
+    flags: u16,
+) -> Result<(), PageError> {
+    super::geometry::validate_page_size(psize)?;
+    if buf.len() < psize as usize {
+        return Err(PageError::BufferTooSmall {
+            got: buf.len(),
+            psize: psize as usize,
+        });
+    }
+    CommonHeader { pgno, txnid, flags }.write(buf);
+    write_u16(buf, OFF_LOWER, 0);
+    write_u16(buf, OFF_UPPER, body_size(psize) as u16);
+    write_u16(buf, OFF_LEAF2_KSIZE, 0);
+    write_u16(buf, OFF_RESERVED1, 0);
+    Ok(())
+}
+
 /// Compute the padded length of the leaf cell at absolute offset `abs`, bounds-
 /// checking every field read against `psize`.
 #[inline(always)]
@@ -97,22 +157,11 @@ fn leaf_cell_len(buf: &[u8], abs: usize, psize: u32) -> Result<usize, PageError>
             body_size: body,
         });
     }
-    let flags = read_u16(buf, abs);
-    let ksize = read_u16(buf, abs + 2) as usize;
-    let dsize = read_u32(buf, abs + 4);
-    if flags & !LEAF_FLAGS_PHASE1_MASK != 0 {
-        return Err(PageError::ReservedFlagSet { flags });
-    }
-    if ksize == 0 || ksize > MAX_KEY_SIZE {
-        return Err(PageError::BadKeySize { ksize });
-    }
-    let value_area = if flags & F_BIGDATA != 0 {
-        BIGDATA_VALUE_LEN
-    } else {
-        dsize as usize
-    };
-    let unpadded = LEAF_NODE_HEADER + ksize + value_area;
-    let clen = even(unpadded);
+    let clen = leaf_cell_shape(
+        read_u16(buf, abs),
+        read_u16(buf, abs + 2) as usize,
+        read_u32(buf, abs + 4),
+    )?;
     if rel + clen > body {
         return Err(PageError::CellOutOfBounds {
             offset: rel,
@@ -136,13 +185,7 @@ fn branch_cell_len(buf: &[u8], abs: usize, psize: u32, index0: bool) -> Result<u
         });
     }
     let ksize = read_u16(buf, abs + 8) as usize;
-    if index0 {
-        if ksize != 0 {
-            return Err(PageError::BadKeySize { ksize });
-        }
-    } else if ksize == 0 || ksize > MAX_KEY_SIZE {
-        return Err(PageError::BadKeySize { ksize });
-    }
+    check_branch_ksize(index0, ksize)?;
     let clen = even(BRANCH_NODE_HEADER + ksize);
     if rel + clen > body {
         return Err(PageError::CellOutOfBounds {
@@ -203,12 +246,7 @@ impl<'a> LeafRef<'a> {
     /// (`btree::ValidatedPages`; docs/PERF-GAP-VS-LMDB.md, eager page validation).
     pub(crate) fn new_prevalidated(buf: &'a [u8], psize: u32) -> Result<LeafRef<'a>, PageError> {
         let flags = read_flags(buf);
-        if page_type_of(flags)? != PageType::Leaf {
-            return Err(PageError::WrongPageType {
-                expected: PageType::Leaf,
-                found: page_type_of(flags)?,
-            });
-        }
+        expect_type(PageType::Leaf, page_type_of(flags)?)?;
         check_reserved_tail_fields(buf)?;
         let (lower, upper) = read_and_check_bounds(buf, psize)?;
         Ok(LeafRef { buf, lower, upper })
@@ -346,24 +384,7 @@ impl<'a> LeafMut<'a> {
         pgno: u64,
         txnid: u64,
     ) -> Result<LeafMut<'a>, PageError> {
-        super::geometry::validate_page_size(psize)?;
-        if buf.len() < psize as usize {
-            return Err(PageError::BufferTooSmall {
-                got: buf.len(),
-                psize: psize as usize,
-            });
-        }
-        CommonHeader {
-            pgno,
-            txnid,
-            flags: P_LEAF,
-        }
-        .write(buf);
-        let body = body_size(psize) as u16;
-        write_u16(buf, OFF_LOWER, 0);
-        write_u16(buf, OFF_UPPER, body);
-        write_u16(buf, OFF_LEAF2_KSIZE, 0);
-        write_u16(buf, OFF_RESERVED1, 0);
+        init_tree_page(buf, psize, pgno, txnid, P_LEAF)?;
         Ok(LeafMut { buf, psize })
     }
 
@@ -698,24 +719,15 @@ impl<'a> LeafMut<'a> {
                 body_size: clen,
             });
         }
-        let flags = read_u16(cell, 0);
-        let ksize = read_u16(cell, 2) as usize;
-        let dsize = read_u32(cell, 4);
-        if flags & !LEAF_FLAGS_PHASE1_MASK != 0 {
-            return Err(PageError::ReservedFlagSet { flags });
-        }
-        if ksize == 0 || ksize > MAX_KEY_SIZE {
-            return Err(PageError::BadKeySize { ksize });
-        }
-        let area = if flags & F_BIGDATA != 0 {
-            BIGDATA_VALUE_LEN
-        } else {
-            dsize as usize
-        };
-        if even(LEAF_NODE_HEADER + ksize + area) != clen {
+        let needed = leaf_cell_shape(
+            read_u16(cell, 0),
+            read_u16(cell, 2) as usize,
+            read_u32(cell, 4),
+        )?;
+        if needed != clen {
             return Err(PageError::CellOutOfBounds {
                 offset: 0,
-                needed: even(LEAF_NODE_HEADER + ksize + area),
+                needed,
                 body_size: clen,
             });
         }
@@ -792,12 +804,7 @@ impl<'a> BranchRef<'a> {
     /// `btree::ValidatedPages`.
     pub(crate) fn new_prevalidated(buf: &'a [u8], psize: u32) -> Result<BranchRef<'a>, PageError> {
         let flags = read_flags(buf);
-        if page_type_of(flags)? != PageType::Branch {
-            return Err(PageError::WrongPageType {
-                expected: PageType::Branch,
-                found: page_type_of(flags)?,
-            });
-        }
+        expect_type(PageType::Branch, page_type_of(flags)?)?;
         check_reserved_tail_fields(buf)?;
         let (lower, upper) = read_and_check_bounds(buf, psize)?;
         // A well-formed branch always has >= 1 child (SPEC 02 §4.1, SPEC 03
@@ -946,24 +953,7 @@ impl<'a> BranchMut<'a> {
         pgno: u64,
         txnid: u64,
     ) -> Result<BranchMut<'a>, PageError> {
-        super::geometry::validate_page_size(psize)?;
-        if buf.len() < psize as usize {
-            return Err(PageError::BufferTooSmall {
-                got: buf.len(),
-                psize: psize as usize,
-            });
-        }
-        CommonHeader {
-            pgno,
-            txnid,
-            flags: P_BRANCH,
-        }
-        .write(buf);
-        let body = body_size(psize) as u16;
-        write_u16(buf, OFF_LOWER, 0);
-        write_u16(buf, OFF_UPPER, body);
-        write_u16(buf, OFF_LEAF2_KSIZE, 0);
-        write_u16(buf, OFF_RESERVED1, 0);
+        init_tree_page(buf, psize, pgno, txnid, P_BRANCH)?;
         Ok(BranchMut { buf, psize })
     }
 
@@ -994,13 +984,7 @@ impl<'a> BranchMut<'a> {
     /// [`PageError::BadKeySize`] on an invalid key for the position, or
     /// [`PageError::PageFull`] if the cell does not fit.
     pub fn insert(&mut self, idx: usize, key: &[u8], child_pgno: u64) -> Result<(), PageError> {
-        if idx == 0 {
-            if !key.is_empty() {
-                return Err(PageError::BadKeySize { ksize: key.len() });
-            }
-        } else if key.is_empty() || key.len() > MAX_KEY_SIZE {
-            return Err(PageError::BadKeySize { ksize: key.len() });
-        }
+        check_branch_ksize(idx == 0, key.len())?;
         let num_keys = self.num_keys();
         debug_assert!(idx <= num_keys, "insert index out of range");
         let clen = even(BRANCH_NODE_HEADER + key.len());
@@ -1058,13 +1042,7 @@ impl<'a> BranchMut<'a> {
     /// only the empty key), or a cell-shape error if the existing cell does
     /// not decode.
     pub fn set_key(&mut self, idx: usize, key: &[u8]) -> Result<bool, PageError> {
-        if idx == 0 {
-            if !key.is_empty() {
-                return Err(PageError::BadKeySize { ksize: key.len() });
-            }
-        } else if key.is_empty() || key.len() > MAX_KEY_SIZE {
-            return Err(PageError::BadKeySize { ksize: key.len() });
-        }
+        check_branch_ksize(idx == 0, key.len())?;
         let num_keys = self.num_keys();
         assert!(idx < num_keys, "branch entry index out of range");
         let cpos = ptr_at(self.buf, idx) as usize;

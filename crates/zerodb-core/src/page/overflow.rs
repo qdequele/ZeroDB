@@ -49,12 +49,7 @@ impl<'a> OverflowRef<'a> {
             });
         }
         let flags = super::header::read_flags(buf);
-        if page_type_of(flags)? != PageType::Overflow {
-            return Err(PageError::WrongPageType {
-                expected: PageType::Overflow,
-                found: page_type_of(flags)?,
-            });
-        }
+        super::header::expect_type(PageType::Overflow, page_type_of(flags)?)?;
         let ovf_pages = read_u32(buf, OFF_OVF_PAGES);
         if ovf_pages < 1 {
             return Err(PageError::BadOverflowRun(ovf_pages));

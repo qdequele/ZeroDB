@@ -194,12 +194,7 @@ impl<'a> PageRef<'a> {
     /// [`PageError::WrongPageType`] if this is not a leaf page; otherwise any
     /// body-validation error from [`LeafRef::new`].
     pub fn as_leaf(&self) -> Result<LeafRef<'a>, PageError> {
-        if self.page_type != PageType::Leaf {
-            return Err(PageError::WrongPageType {
-                expected: PageType::Leaf,
-                found: self.page_type,
-            });
-        }
+        expect_type(PageType::Leaf, self.page_type)?;
         LeafRef::new(self.buf, self.psize)
     }
 
@@ -210,12 +205,7 @@ impl<'a> PageRef<'a> {
     /// [`PageError::WrongPageType`] if this is not a branch page; otherwise any
     /// body-validation error from [`BranchRef::new`].
     pub fn as_branch(&self) -> Result<BranchRef<'a>, PageError> {
-        if self.page_type != PageType::Branch {
-            return Err(PageError::WrongPageType {
-                expected: PageType::Branch,
-                found: self.page_type,
-            });
-        }
+        expect_type(PageType::Branch, self.page_type)?;
         BranchRef::new(self.buf, self.psize)
     }
 
@@ -226,12 +216,7 @@ impl<'a> PageRef<'a> {
     /// [`PageError::WrongPageType`] if this is not an overflow page; otherwise
     /// any body-validation error from [`OverflowRef::new`].
     pub fn as_overflow(&self) -> Result<OverflowRef<'a>, PageError> {
-        if self.page_type != PageType::Overflow {
-            return Err(PageError::WrongPageType {
-                expected: PageType::Overflow,
-                found: self.page_type,
-            });
-        }
+        expect_type(PageType::Overflow, self.page_type)?;
         OverflowRef::new(self.buf, self.psize)
     }
 
@@ -245,13 +230,19 @@ impl<'a> PageRef<'a> {
     ///
     /// [`PageError::WrongPageType`] if this is not a meta page.
     pub fn as_meta(&self) -> Result<MetaValidity, PageError> {
-        if self.page_type != PageType::Meta {
-            return Err(PageError::WrongPageType {
-                expected: PageType::Meta,
-                found: self.page_type,
-            });
-        }
+        expect_type(PageType::Meta, self.page_type)?;
         MetaPage::validate(self.buf, self.psize)
+    }
+}
+
+/// `Ok` when a page of type `found` is of the `expected` type, else
+/// [`PageError::WrongPageType`].
+#[inline(always)]
+pub(crate) fn expect_type(expected: PageType, found: PageType) -> Result<(), PageError> {
+    if found == expected {
+        Ok(())
+    } else {
+        Err(PageError::WrongPageType { expected, found })
     }
 }
 
