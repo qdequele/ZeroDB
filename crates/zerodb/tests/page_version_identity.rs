@@ -228,8 +228,8 @@ fn no_entry_with_stamp(env: &Env, dir: &Path, stamp: u64) -> bool {
         .expect("data file")
         .len();
     let pages = len / PS as u64 + 1;
-    (0..pages).all(|p| !env.inner().stamp_cache_has(p, false, stamp))
-        && (0..pages).all(|p| !env.inner().stamp_cache_has(p, true, stamp))
+    (0..pages).all(|p| !env.stamp_cache_has(p, false, stamp))
+        && (0..pages).all(|p| !env.stamp_cache_has(p, true, stamp))
 }
 
 /// ADR-0018 amendment: a successful commit seeds the env-wide
@@ -246,10 +246,10 @@ fn commit_seeds_the_cache_and_abort_does_not() {
     let mut w = env.write_txn().unwrap();
     db.put(&mut w, b"a", b"1").unwrap();
     w.commit().unwrap();
-    let snap = env.inner().snapshot();
+    let snap = env.snapshot();
     assert_eq!(snap.txnid, 1);
     assert!(
-        env.inner().stamp_cache_has(snap.main_db.root, false, 1),
+        env.stamp_cache_has(snap.main_db.root, false, 1),
         "the committed root leaf must be seeded under the committing txnid"
     );
 
@@ -273,15 +273,15 @@ fn commit_seeds_the_cache_and_abort_does_not() {
         db.put(&mut w, k.as_bytes(), &[9u8; 64]).unwrap();
     }
     w.commit().unwrap();
-    let snap = env.inner().snapshot();
+    let snap = env.snapshot();
     assert_eq!(snap.txnid, 2, "TXN-2: the aborted id is reused");
     assert!(snap.main_db.depth >= 2, "expected a branch level");
     assert!(
-        env.inner().stamp_cache_has(snap.main_db.root, true, 2),
+        env.stamp_cache_has(snap.main_db.root, true, 2),
         "the committed root branch must be seeded under its kind"
     );
     assert!(
-        !env.inner().stamp_cache_has(snap.main_db.root, false, 2),
+        !env.stamp_cache_has(snap.main_db.root, false, 2),
         "the kind is part of the key"
     );
     let r = env.read_txn().unwrap();
@@ -319,7 +319,7 @@ fn aborted_spills_seed_nothing_and_reuse_stays_correct() {
     }
     assert!(w.spill_count() > 0, "the base txn must have spilled");
     w.commit().unwrap();
-    let base_txnid = env.inner().snapshot().txnid;
+    let base_txnid = env.snapshot().txnid;
 
     // Spill heavily, then abort: nothing may be seeded under the aborted id.
     let mut w = env.write_txn().unwrap();

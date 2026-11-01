@@ -5,7 +5,7 @@
 //! (ADR-0006 §loom).
 //!
 //! Scope: only `crate::readers`, `crate::nested` (the nested-txn child counter,
-//! ADR-0007 D3), `crate::stamps` (the ADR-0018 slot seqlock), `crate::handles`'s
+//! ADR-0007), `crate::stamps` (the ADR-0018 slot seqlock), `crate::handles`'s
 //! `MemoCell` (the ADR-0024 check memo, also a seqlock) and the
 //! `EnvInner` fields they own import from here. The rest
 //! of the crate uses `std::sync` directly — loom tests drive the

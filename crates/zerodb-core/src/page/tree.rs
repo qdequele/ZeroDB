@@ -83,9 +83,49 @@ pub enum LeafValue<'a> {
 // Shared cell-length / validation helpers
 // ===========================================================================
 
+/// A branch separator's size rule: node 0 holds the empty key, every other
+/// node a key of 1..=`MAX_KEY_SIZE` bytes.
+#[inline(always)]
+fn check_branch_ksize(index0: bool, ksize: usize) -> Result<(), PageError> {
+    let ok = if index0 {
+        ksize == 0
+    } else {
+        ksize != 0 && ksize <= MAX_KEY_SIZE
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(PageError::BadKeySize { ksize })
+    }
+}
+
+/// Write an empty tree page of type `flags` (`P_LEAF` or `P_BRANCH`) into
+/// `buf`: the common header, `lower = 0`, `upper = body_size`, and zeroed
+/// reserved tail fields.
+fn init_tree_page(
+    buf: &mut [u8],
+    psize: u32,
+    pgno: u64,
+    txnid: u64,
+    flags: u16,
+) -> Result<(), PageError> {
+    super::geometry::validate_page_size(psize)?;
+    if buf.len() < psize as usize {
+        return Err(PageError::BufferTooSmall {
+            got: buf.len(),
+            psize: psize as usize,
+        });
+    }
+    CommonHeader { pgno, txnid, flags }.write(buf);
+    write_u16(buf, OFF_LOWER, 0);
+    write_u16(buf, OFF_UPPER, body_size(psize) as u16);
+    write_u16(buf, OFF_LEAF2_KSIZE, 0);
+    write_u16(buf, OFF_RESERVED1, 0);
+    Ok(())
+}
+
 /// Compute the padded length of the leaf cell at absolute offset `abs`, bounds-
 /// checking every field read against `psize`.
-// Forced: LLVM inlines this only at -inline-threshold=1000.
 #[inline(always)]
 fn leaf_cell_len(buf: &[u8], abs: usize, psize: u32) -> Result<usize, PageError> {
     let body = body_size(psize);
@@ -347,24 +387,7 @@ impl<'a> LeafMut<'a> {
         pgno: u64,
         txnid: u64,
     ) -> Result<LeafMut<'a>, PageError> {
-        super::geometry::validate_page_size(psize)?;
-        if buf.len() < psize as usize {
-            return Err(PageError::BufferTooSmall {
-                got: buf.len(),
-                psize: psize as usize,
-            });
-        }
-        CommonHeader {
-            pgno,
-            txnid,
-            flags: P_LEAF,
-        }
-        .write(buf);
-        let body = body_size(psize) as u16;
-        write_u16(buf, OFF_LOWER, 0);
-        write_u16(buf, OFF_UPPER, body);
-        write_u16(buf, OFF_LEAF2_KSIZE, 0);
-        write_u16(buf, OFF_RESERVED1, 0);
+        init_tree_page(buf, psize, pgno, txnid, P_LEAF)?;
         Ok(LeafMut { buf, psize })
     }
 
@@ -374,14 +397,14 @@ impl<'a> LeafMut<'a> {
     /// copy of a page fully validated on its first map access this txn, or
     /// the output of this txn's own page encoders), so validation is the same
     /// O(1) structural checks the read-side dirty path uses
-    /// ([`LeafRef::new_prevalidated`]: type, reserved fields, bounds). The
+    /// (`LeafRef::new_prevalidated`: type, reserved fields, bounds). The
     /// **full O(`num_keys`)** [`LeafRef::new`] cell walk here would run on every
     /// put (`insert_into_leaf` wraps the target leaf per call); the milli
     /// write-phase profile measured it as the single hottest zerodb cost.
     ///
     /// # Errors
     ///
-    /// Propagates [`LeafRef::new_prevalidated`] validation.
+    /// Propagates `LeafRef::new_prevalidated` validation.
     pub fn from_valid(buf: &'a mut [u8], psize: u32) -> Result<LeafMut<'a>, PageError> {
         LeafRef::new_prevalidated(buf, psize)?;
         Ok(LeafMut { buf, psize })
@@ -497,9 +520,8 @@ impl<'a> LeafMut<'a> {
     ///
     /// # Errors
     ///
-    /// [`PageError::WrongPageType`]-free; returns [`PageError::ReservedFlagSet`]
-    /// never — a `F_BIGDATA` entry yields [`PageError::BadValueSize`] carrying
-    /// the logical size, signalling "not inline".
+    /// [`PageError::BadValueSize`], carrying the logical size, when the entry
+    /// is `F_BIGDATA` (its value is not inline).
     pub fn inline_value_at(&self, idx: usize) -> Result<(usize, u32), PageError> {
         debug_assert!(idx < self.num_keys(), "index out of range");
         let abs = HEADER_SIZE + ptr_at(self.buf, idx) as usize;
@@ -889,7 +911,6 @@ impl<'a> BranchRef<'a> {
 
     /// As [`Self::child_index`], under an explicit ordering.
     #[must_use]
-    // Forced: LLVM inlines this only at -inline-threshold=1000.
     #[inline(always)]
     pub fn child_index_with(&self, key: &[u8], cmp: KeyCmp<'_>) -> usize {
         // Node 0 is -inf and always qualifies; scan separators 1..num_keys.
@@ -919,12 +940,12 @@ impl<'a> BranchMut<'a> {
     ///
     /// Same contract as [`LeafMut::from_valid`]: callers only hand this
     /// engine-authored dirty frames, so validation is the O(1) structural
-    /// checks ([`BranchRef::new_prevalidated`]), not a per-cell walk on every
+    /// checks (`BranchRef::new_prevalidated`), not a per-cell walk on every
     /// parent-chain touch.
     ///
     /// # Errors
     ///
-    /// Propagates [`BranchRef::new_prevalidated`] validation.
+    /// Propagates `BranchRef::new_prevalidated` validation.
     pub fn from_valid(buf: &'a mut [u8], psize: u32) -> Result<BranchMut<'a>, PageError> {
         BranchRef::new_prevalidated(buf, psize)?;
         Ok(BranchMut { buf, psize })
@@ -949,24 +970,7 @@ impl<'a> BranchMut<'a> {
         pgno: u64,
         txnid: u64,
     ) -> Result<BranchMut<'a>, PageError> {
-        super::geometry::validate_page_size(psize)?;
-        if buf.len() < psize as usize {
-            return Err(PageError::BufferTooSmall {
-                got: buf.len(),
-                psize: psize as usize,
-            });
-        }
-        CommonHeader {
-            pgno,
-            txnid,
-            flags: P_BRANCH,
-        }
-        .write(buf);
-        let body = body_size(psize) as u16;
-        write_u16(buf, OFF_LOWER, 0);
-        write_u16(buf, OFF_UPPER, body);
-        write_u16(buf, OFF_LEAF2_KSIZE, 0);
-        write_u16(buf, OFF_RESERVED1, 0);
+        init_tree_page(buf, psize, pgno, txnid, P_BRANCH)?;
         Ok(BranchMut { buf, psize })
     }
 
@@ -997,13 +1001,7 @@ impl<'a> BranchMut<'a> {
     /// [`PageError::BadKeySize`] on an invalid key for the position, or
     /// [`PageError::PageFull`] if the cell does not fit.
     pub fn insert(&mut self, idx: usize, key: &[u8], child_pgno: u64) -> Result<(), PageError> {
-        if idx == 0 {
-            if !key.is_empty() {
-                return Err(PageError::BadKeySize { ksize: key.len() });
-            }
-        } else if key.is_empty() || key.len() > MAX_KEY_SIZE {
-            return Err(PageError::BadKeySize { ksize: key.len() });
-        }
+        check_branch_ksize(idx == 0, key.len())?;
         let num_keys = self.num_keys();
         debug_assert!(idx <= num_keys, "insert index out of range");
         let clen = even(BRANCH_NODE_HEADER + key.len());
@@ -1061,13 +1059,7 @@ impl<'a> BranchMut<'a> {
     /// only the empty key), or a cell-shape error if the existing cell does
     /// not decode.
     pub fn set_key(&mut self, idx: usize, key: &[u8]) -> Result<bool, PageError> {
-        if idx == 0 {
-            if !key.is_empty() {
-                return Err(PageError::BadKeySize { ksize: key.len() });
-            }
-        } else if key.is_empty() || key.len() > MAX_KEY_SIZE {
-            return Err(PageError::BadKeySize { ksize: key.len() });
-        }
+        check_branch_ksize(idx == 0, key.len())?;
         let num_keys = self.num_keys();
         assert!(idx < num_keys, "branch entry index out of range");
         let cpos = ptr_at(self.buf, idx) as usize;

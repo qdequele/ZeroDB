@@ -484,7 +484,7 @@ fn resize_with_a_live_read_txn_succeeds_and_the_value_stays_readable() {
 
         let r = env.read_txn().unwrap();
         let value = db.get(&r, b"held").unwrap().expect("held value");
-        let whole = env.inner().backing_bytes();
+        let whole = env.backing_bytes();
         let head = whole[..64].to_vec();
         env.resize(2 * MIB as u64)
             .unwrap_or_else(|e| panic!("lock_file {lock_file}, write_map {write_map}: {e:?}"));
