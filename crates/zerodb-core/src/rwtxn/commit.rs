@@ -2,6 +2,27 @@
 
 use super::*;
 
+/// One durability barrier of the commit: a ranged sync of the `(first pgno,
+/// count)` run (SPEC 06 REC-12) when the backing supports it, else a full
+/// sync. A failure poisons the env (REC-13).
+fn barrier(
+    inner: &crate::env::EnvInner,
+    ranged: bool,
+    async_flush: bool,
+    psize: u32,
+    run: (u64, u64),
+) -> Result<()> {
+    let res = if ranged {
+        inner.backing_ref().sync_pages(async_flush, psize, &[run])
+    } else {
+        inner.backing_ref().sync(async_flush)
+    };
+    res.map_err(|e| {
+        inner.poison();
+        e.into()
+    })
+}
+
 impl<'env> RwTxn<'env> {
     /// Commit (SPEC 04 TXN-58/61): run the pipeline; on success the new meta
     /// is durable and published. Consumes the txn; the write mutex is released
@@ -123,17 +144,7 @@ impl<'env> RwTxn<'env> {
         // `NO_SYNC`, in this process or another.
         let ranged = inner.backing_ref().ranged_sync();
         if sync_data {
-            let res = if ranged {
-                inner
-                    .backing_ref()
-                    .sync_pages(async_flush, psize, &[(0, self.next_pgno)])
-            } else {
-                inner.backing_ref().sync(async_flush)
-            };
-            if let Err(e) = res {
-                inner.poison(); // REC-13
-                return Err(e.into());
-            }
+            barrier(inner, ranged, async_flush, psize, (0, self.next_pgno))?;
         }
         inner.run_hook(HookPoint::H2);
         // Crash here: `N`'s data durable but unreferenced → `N-1` (REC-6 H2).
@@ -198,19 +209,9 @@ impl<'env> RwTxn<'env> {
         // (REC-2), which is corruption-free under NO_META_SYNC because C3 still
         // fsynced the data. -----
         if sync_meta {
-            // Ranged (SPEC 06 REC-12): the meta slot C4 wrote; C3 already
-            // made every data page durable.
-            let res = if ranged {
-                inner
-                    .backing_ref()
-                    .sync_pages(async_flush, psize, &[(slot, 1)])
-            } else {
-                inner.backing_ref().sync(async_flush)
-            };
-            if let Err(e) = res {
-                inner.poison(); // REC-13
-                return Err(e.into());
-            }
+            // Ranged: the meta slot C4 wrote; C3 already made every data
+            // page durable.
+            barrier(inner, ranged, async_flush, psize, (slot, 1))?;
         }
         inner.run_hook(HookPoint::H4);
         // Crash here: `N` durable and selected (REC-6 H4).
