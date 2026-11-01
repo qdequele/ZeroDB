@@ -34,6 +34,16 @@ pub(super) fn has_duplicate(pages: &[u64]) -> bool {
     }
 }
 
+/// The level guard of the page-collecting walks: `level` is the on-disk
+/// `rec.depth` counting down, and they recurse one frame per level, so a
+/// zero or a hostile `u16::MAX` must be a typed error, not a stack overflow.
+fn check_walk_level(level: u16) -> Result<()> {
+    if level == 0 || level as usize > crate::btree::CURSOR_STACK {
+        return Err(Error::Mdb(MdbError::Invalid));
+    }
+    Ok(())
+}
+
 /// A named DB's per-txn working state: the loaded/mutated `DBRecord`
 /// plus its catalog name, kept in [`RwTxn::open`]. `dirty` marks that the
 /// record changed and must be written back into the main catalog at commit
@@ -444,29 +454,10 @@ impl<'env> RwTxn<'env> {
         pages: &mut Vec<u64>,
         runs: &mut Vec<(u64, u64)>,
     ) -> Result<()> {
-        if level == 0 {
-            return Err(Error::Mdb(MdbError::Invalid));
-        }
-        // Hostile-depth guard (same as `search_path`): this function recurses
-        // one frame per level and the entry `level` is the on-disk
-        // `rec.depth` — a u16::MAX there must be a typed error, not a stack
-        // overflow.
-        if level as usize > crate::btree::CURSOR_STACK {
-            return Err(Error::Mdb(MdbError::Invalid));
-        }
+        check_walk_level(level)?;
         let page = self.load(pgno)?;
         match page.page_type() {
-            PageType::Leaf => {
-                let leaf = leaf_view(self.source(), self.psize, pgno, Some(&self.validated))
-                    .map_err(map_page_err)?;
-                for i in 0..leaf.num_keys() {
-                    if let LeafValue::Overflow { head_pgno, dsize } = leaf.value(i) {
-                        runs.push((head_pgno, overflow_page_count(dsize as u64, self.psize)));
-                    }
-                }
-                pages.push(pgno);
-                Ok(())
-            }
+            PageType::Leaf => self.collect_loaded_leaf(pgno, pages, runs),
             PageType::Branch => {
                 let br = branch_view(self.source(), self.psize, pgno, Some(&self.validated))
                     .map_err(map_page_err)?;
@@ -503,13 +494,7 @@ impl<'env> RwTxn<'env> {
         pages: &mut Vec<u64>,
         runs: &mut Vec<(u64, u64)>,
     ) -> Result<()> {
-        if level == 0 {
-            return Err(Error::Mdb(MdbError::Invalid));
-        }
-        // Hostile-depth guard, exactly as `collect_tree`.
-        if level as usize > crate::btree::CURSOR_STACK {
-            return Err(Error::Mdb(MdbError::Invalid));
-        }
+        check_walk_level(level)?;
         if level == 1 {
             // A root that is the leaf level (a one-page tree).
             return self.collect_unread_leaf(pgno, pages);
@@ -536,21 +521,28 @@ impl<'env> RwTxn<'env> {
                 Ok(())
             }
             // A leaf above the leaf level (ragged — only a hostile image):
-            // handled exactly as the full walk handles a loaded leaf — scan
-            // it for overflow refs and collect the page itself.
-            PageType::Leaf => {
-                let leaf = leaf_view(self.source(), self.psize, pgno, Some(&self.validated))
-                    .map_err(map_page_err)?;
-                for i in 0..leaf.num_keys() {
-                    if let LeafValue::Overflow { head_pgno, dsize } = leaf.value(i) {
-                        runs.push((head_pgno, overflow_page_count(dsize as u64, self.psize)));
-                    }
-                }
-                pages.push(pgno);
-                Ok(())
-            }
+            // handled exactly as the full walk handles a loaded leaf.
+            PageType::Leaf => self.collect_loaded_leaf(pgno, pages, runs),
             _ => Err(Error::Mdb(MdbError::Invalid)),
         }
+    }
+
+    /// Collect loaded leaf `pgno` and the overflow runs its values head.
+    fn collect_loaded_leaf(
+        &self,
+        pgno: u64,
+        pages: &mut Vec<u64>,
+        runs: &mut Vec<(u64, u64)>,
+    ) -> Result<()> {
+        let leaf = leaf_view(self.source(), self.psize, pgno, Some(&self.validated))
+            .map_err(map_page_err)?;
+        for i in 0..leaf.num_keys() {
+            if let LeafValue::Overflow { head_pgno, dsize } = leaf.value(i) {
+                runs.push((head_pgno, overflow_page_count(dsize as u64, self.psize)));
+            }
+        }
+        pages.push(pgno);
+        Ok(())
     }
 
     /// Collect leaf `pgno` for [`collect_tree_skip_leaves`](Self::collect_tree_skip_leaves)
