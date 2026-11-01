@@ -8,6 +8,9 @@
 mod common;
 use common::TempDir;
 
+#[cfg(target_os = "linux")]
+use std::path::Path;
+
 use zerodb::{EnvFlags, EnvOpenOptions};
 
 /// The `VmFlags` of the mapping of `file` in this process, if found.
