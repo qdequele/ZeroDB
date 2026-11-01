@@ -17,7 +17,7 @@ use crate::iterator::{
     RwRange, RwRevIter, RwRevPrefix, RwRevRange,
 };
 use crate::reserved_space::ReservedSpace;
-use crate::txn::{RoTxn, RwTxn, WithTls};
+use crate::txn::{RoTxn, RwTxn};
 use crate::{Error, MdbError, Result, Unspecified};
 
 /// Statistics for a database (SPEC 00 rows 49/60; `mdb_stat`).
@@ -1070,7 +1070,3 @@ fn custom_comparator<C: Comparator + 'static>() -> Option<Box<dyn zerodb::Compar
         Some(Box::new(HeedComparator::<C>(PhantomData)))
     }
 }
-
-// A tiny use so `WithTls` import isn't flagged when default T is inferred.
-#[allow(dead_code)]
-fn _tls_marker(_: PhantomData<WithTls>) {}

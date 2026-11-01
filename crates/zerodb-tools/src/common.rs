@@ -12,12 +12,6 @@ pub const MAX_TOOL_DBS: u32 = 1 << 16;
 /// A boxed error for the tool layer (no `anyhow` dependency).
 pub type BoxErr = Box<dyn std::error::Error>;
 
-/// An owned key/value pair.
-pub type Kv = (Vec<u8>, Vec<u8>);
-
-/// A named database's name paired with its entries (tools collect DBs this way).
-pub type NamedDb = (Vec<u8>, Vec<Kv>);
-
 /// The options a tool opens an existing environment with: `READ_ONLY`, the
 /// data file `data_file_name`, and the lock file on, under the name derived
 /// from the data file ([`zerodb::derived_lock_file_name`]), so the tool joins

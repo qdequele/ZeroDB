@@ -29,12 +29,15 @@ fn tmp_dir(tag: &str) -> PathBuf {
     p
 }
 
+/// An owned key/value pair.
+type Kv = (Vec<u8>, Vec<u8>);
+
 /// Logical content collected from a heed env, in the same order `cmd_dump`
 /// produces: main user data (subdb pointers excluded), then named DBs by name,
 /// every section sorted by key.
 struct Content {
-    main_user: Vec<zerodb_tools::common::Kv>,
-    named: Vec<zerodb_tools::common::NamedDb>,
+    main_user: Vec<Kv>,
+    named: Vec<(Vec<u8>, Vec<Kv>)>,
 }
 
 fn collect_lmdb(dir: &Path, map_size: usize) -> Content {

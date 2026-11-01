@@ -43,11 +43,9 @@ use std::path::{Component, Path};
 mod copy;
 pub use copy::{CompactionOption, CopyProgress, CopyToFile};
 
-pub use zerodb_core::builder::{
-    build_multi_db_image, EnvStream, NamedDbData, PageSink, StreamBuildError, DEFAULT_FILL_PERMILLE,
-};
+pub use zerodb_core::builder::StreamBuildError;
 pub use zerodb_core::check;
-pub use zerodb_core::cmp::{Comparator, ComparatorError, DefaultComparator, FnComparator, KeyCmp};
+pub use zerodb_core::cmp::{Comparator, ComparatorError, DefaultComparator, FnComparator};
 pub use zerodb_core::env::{
     CommitHook, DurabilityFlags, Env, EnvClosingEvent, EnvInfo, EnvStat, HookPoint, ReaderEntry,
     Snapshot,
@@ -55,7 +53,7 @@ pub use zerodb_core::env::{
 pub use zerodb_core::error::{Error, MdbError, Result};
 pub use zerodb_core::nested::NestedRoTxn;
 pub use zerodb_core::page::geometry::MAX_MAP_SIZE;
-pub use zerodb_core::page::{FileTrust, FIRST_DATA_PGNO, MAX_KEY_SIZE};
+pub use zerodb_core::page::{FileTrust, MAX_KEY_SIZE};
 pub use zerodb_core::rotxn::{
     collect_entries_flagged, for_each_entry_flagged, free_page_count, named_databases, Database,
     DatabaseStat, RoRange, RoTxn, TxnRead,
@@ -408,12 +406,6 @@ impl EnvOpenOptions {
         self
     }
 
-    /// The configured sequential-writes default (ADR-0015).
-    #[must_use]
-    pub fn get_sequential_writes(&self) -> bool {
-        self.sequential_writes
-    }
-
     /// Bound a write txn's dirty memory to about `bytes` (**ADR-0017**;
     /// ZeroDB extension — LMDB's limit is a compile-time constant). Default:
     /// LMDB's limit, 131,072 dirty pages (512 MiB at 4 KiB pages).
@@ -427,13 +419,6 @@ impl EnvOpenOptions {
     pub fn max_dirty_bytes(&mut self, bytes: usize) -> &mut EnvOpenOptions {
         self.max_dirty_bytes = Some(bytes);
         self
-    }
-
-    /// The configured dirty limit in bytes (ADR-0017); `None` = LMDB's
-    /// default.
-    #[must_use]
-    pub fn get_max_dirty_bytes(&self) -> Option<usize> {
-        self.max_dirty_bytes
     }
 
     /// Let other processes open this environment at the same time, through a
@@ -473,18 +458,6 @@ impl EnvOpenOptions {
             Some(name) => name.clone(),
             None => derived_lock_file_name(&self.data_file_name),
         }
-    }
-
-    /// The configured max DBs.
-    #[must_use]
-    pub fn get_max_dbs(&self) -> u32 {
-        self.max_dbs
-    }
-
-    /// The configured max readers.
-    #[must_use]
-    pub fn get_max_readers(&self) -> u32 {
-        self.max_readers
     }
 
     /// ADR-0010: the data-file name must be a single path component, so it
@@ -734,8 +707,8 @@ impl ExclusiveLock {
     /// `opts` would open it: the data file is
     /// [`EnvOpenOptions::get_data_file_name`] and the lock file
     /// [`EnvOpenOptions::get_lock_file_name`] (whether or not
-    /// [`EnvOpenOptions::lock_file`] is on), with
-    /// [`EnvOpenOptions::get_max_readers`] slots.
+    /// [`EnvOpenOptions::lock_file`] is on), with its
+    /// [`EnvOpenOptions::max_readers`] slots.
     ///
     /// Succeeds only if this process wins the first-opener election at once,
     /// that is, no other process has the environment open or is opening it.

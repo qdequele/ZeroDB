@@ -250,9 +250,8 @@ fn lossy(bytes: &[u8]) -> String {
 ///
 /// Call [`DumpReader::next_db`] to reach the next database block, then
 /// [`DumpReader::next_record`] until it returns `false` at the block's
-/// `DATA=END`. It accepts exactly what [`parse`] accepts, since [`parse`] is
-/// built on it: `\r\n` line endings, blank lines between blocks, and
-/// trailing whitespace on a line.
+/// `DATA=END`. It accepts `\r\n` line endings, blank lines between blocks,
+/// and trailing whitespace on a line.
 pub struct DumpReader<R> {
     input: R,
     /// The current line, without its `\n` (and a `\r` before it).
@@ -398,14 +397,10 @@ impl<R: std::io::BufRead> DumpReader<R> {
     }
 }
 
-/// Parse dump text back into database sections. The inverse of [`render`];
-/// tolerant of `\r\n` line endings. It holds every record in memory; `load`
-/// reads a dump with [`DumpReader`] instead.
-///
-/// # Errors
-///
-/// [`DumpError`] on any malformed line, hex field, or truncated block.
-pub fn parse(text: &str) -> Result<Vec<DumpDb>, DumpError> {
+/// Parse dump text back into database sections: the inverse of [`render`],
+/// for tests (`load` reads a dump with [`DumpReader`]).
+#[cfg(test)]
+fn parse(text: &str) -> Result<Vec<DumpDb>, DumpError> {
     let mut reader = DumpReader::new(text.as_bytes())?;
     let mut dbs = Vec::new();
     let (mut key, mut val) = (Vec::new(), Vec::new());
