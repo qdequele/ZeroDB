@@ -323,4 +323,16 @@ pub enum PageError {
         /// The snapshot's committed high-water.
         last_pg: u64,
     },
+
+    /// A tree descent ran deeper than the tree's recorded depth: a cycle or
+    /// a corrupt `depth` (SPEC 03 INV-7). Refused instead of looping.
+    #[error("tree descent deeper than the recorded depth (cycle or corrupt depth)")]
+    TreeTooDeep,
+
+    /// A tree page (leaf or branch) was expected; the page has another type.
+    #[error("expected a leaf or branch page, found {found:?}")]
+    NotATreePage {
+        /// The page type actually found.
+        found: PageType,
+    },
 }

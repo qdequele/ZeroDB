@@ -315,7 +315,7 @@ fn branch_view_over<'a>(
 /// A type dispatch followed by [`leaf_view`]/[`branch_view`] would resolve
 /// each page's bytes twice, and in a write txn each resolution probes the
 /// dirty store first ([`Source::bytes_from_classified`]). Any non-tree page
-/// type fails with [`PageError::WrongPageType`].
+/// type fails with [`PageError::NotATreePage`].
 pub(crate) enum NodeView<'a> {
     Leaf(LeafRef<'a>),
     Branch(BranchRef<'a>),
@@ -1475,20 +1475,11 @@ pub fn prefix_successor(p: &[u8]) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 fn wrong_type(found: PageType) -> PageError {
-    PageError::WrongPageType {
-        expected: PageType::Leaf,
-        found,
-    }
+    PageError::NotATreePage { found }
 }
 
 fn depth_exceeded() -> PageError {
-    // A descent deeper than `depth + 1` means a cycle / bad `depth`: reject
-    // rather than loop forever (SPEC 03 §11 INV-7 height balance).
-    PageError::BadBounds {
-        lower: 0,
-        upper: 0,
-        body_size: 0,
-    }
+    PageError::TreeTooDeep
 }
 
 #[cfg(test)]
