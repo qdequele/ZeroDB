@@ -336,37 +336,35 @@ impl<'env> RwTxn<'env> {
     #[inline(never)]
     pub(super) fn loose_run(&mut self, n: u64) -> Option<u64> {
         debug_assert!(self.alloc_mode == AllocMode::GcSave);
-        if work_mut!(self).loose.is_empty() {
+        let mp = map_pages(self.env.inner().map_size(), self.psize);
+        // Borrows only the `work` field, so `next_pgno` stays usable.
+        let loose = &mut work_mut!(self).loose;
+        if loose.is_empty() {
             return None;
         }
-        work_mut!(self).loose.sort_unstable();
+        loose.sort_unstable();
         debug_assert!(
-            work_mut!(self).loose.windows(2).all(|w| w[0] < w[1]),
+            loose.windows(2).all(|w| w[0] < w[1]),
             "loose list holds a duplicate pgno"
         );
-        let mp = map_pages(self.env.inner().map_size(), self.psize);
         let mut i = 0;
-        while i < work_mut!(self).loose.len() {
+        while i < loose.len() {
             // Extent of the maximal consecutive run starting at index i.
             let mut j = i + 1;
-            while j < work_mut!(self).loose.len()
-                && work_mut!(self).loose[j] == work_mut!(self).loose[j - 1] + 1
-            {
+            while j < loose.len() && loose[j] == loose[j - 1] + 1 {
                 j += 1;
             }
             let len = (j - i) as u64;
             if len >= n {
-                let start = work_mut!(self).loose[i];
-                work_mut!(self).loose.drain(i..i + n as usize);
+                let start = loose[i];
+                loose.drain(i..i + n as usize);
                 return Some(start);
             }
             // Top-of-file completion: the run ends at next_pgno - 1, so
             // extending by (n - len) yields one contiguous run.
-            if work_mut!(self).loose[j - 1] + 1 == self.next_pgno
-                && !is_map_full(self.next_pgno, n - len, mp)
-            {
-                let start = work_mut!(self).loose[i];
-                work_mut!(self).loose.drain(i..j);
+            if loose[j - 1] + 1 == self.next_pgno && !is_map_full(self.next_pgno, n - len, mp) {
+                let start = loose[i];
+                loose.drain(i..j);
                 self.next_pgno += n - len;
                 return Some(start);
             }
