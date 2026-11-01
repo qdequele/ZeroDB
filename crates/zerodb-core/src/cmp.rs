@@ -62,7 +62,6 @@
 //! file changes only at commit) — but the operation is lost. Do not panic.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 /// A total order over raw key bytes — ZeroDB's safe
@@ -284,16 +283,14 @@ impl std::error::Error for ComparatorError {}
 /// `&'a dyn Comparator` borrowed from the environment: the registry owns the
 /// boxed comparator for the env's whole life and never moves or replaces it.
 ///
-/// The `Mutex<HashMap<..>>` beside it is *not* on the read path — it exists
-/// only to make the "same dbi, second registration" check atomic against a
-/// concurrent registration of the same database, and is touched once per
-/// `*_with_comparator` open.
+/// The `Mutex` beside it is *not* on the read path — it only makes the
+/// "same dbi, second registration" check atomic against a concurrent
+/// registration of the same database, once per `*_with_comparator` open.
 pub struct ComparatorRegistry {
     /// dbi → comparator, written at most once per slot. `None`/unset = memcmp.
     slots: Box<[OnceLock<Box<dyn Comparator>>]>,
     /// Serializes registration so the read-modify-write of a slot is atomic.
-    /// Maps dbi → registered name, for the mismatch diagnostic.
-    reg_lock: Mutex<HashMap<u32, String>>,
+    reg_lock: Mutex<()>,
 }
 
 impl ComparatorRegistry {
@@ -306,7 +303,7 @@ impl ComparatorRegistry {
             .into_boxed_slice();
         ComparatorRegistry {
             slots,
-            reg_lock: Mutex::new(HashMap::new()),
+            reg_lock: Mutex::new(()),
         }
     }
 
@@ -333,28 +330,26 @@ impl ComparatorRegistry {
     /// [`ComparatorError::Mismatch`] if a comparator with a *different* name
     /// is already registered for `dbi`.
     pub fn register(&self, dbi: u32, cmp: Box<dyn Comparator>) -> Result<(), ComparatorError> {
-        let requested = cmp.name().to_string();
-        let mut guard = self.reg_lock.lock().expect("comparator registry poisoned");
-        if let Some(registered) = guard.get(&dbi) {
-            if registered == &requested {
-                return Ok(());
-            }
-            return Err(ComparatorError::Mismatch {
-                registered: registered.clone(),
-                requested,
-            });
-        }
+        let _guard = self.reg_lock.lock().expect("comparator registry poisoned");
         let Some(slot) = self.slots.get(dbi as usize) else {
             // Unreachable for an engine-issued dbi (< max_dbs). Treating it as
             // "no custom ordering" rather than panicking keeps a corrupt dbi
             // from taking the process down.
             return Ok(());
         };
+        if let Some(registered) = slot.get() {
+            if registered.name() == cmp.name() {
+                return Ok(());
+            }
+            return Err(ComparatorError::Mismatch {
+                registered: registered.name().to_string(),
+                requested: cmp.name().to_string(),
+            });
+        }
         // The `reg_lock` guard makes this the only writer, so `set` cannot
         // lose; `let _ =` documents that rather than unwrapping on a value
         // that is not `Debug`.
         let _ = slot.set(cmp);
-        guard.insert(dbi, requested);
         Ok(())
     }
 
@@ -365,11 +360,7 @@ impl ComparatorRegistry {
     /// tree in the wrong order.
     #[must_use]
     pub fn any_custom(&self) -> bool {
-        !self
-            .reg_lock
-            .lock()
-            .expect("comparator registry poisoned")
-            .is_empty()
+        self.slots.iter().any(|slot| slot.get().is_some())
     }
 }
 
