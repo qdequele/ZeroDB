@@ -136,7 +136,17 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let engine = args.next().unwrap_or_else(|| "zerodb".into());
     let reps: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(15);
+    if reps == 0 {
+        eprintln!("reps must be at least 1");
+        std::process::exit(2);
+    }
     let only = args.next();
+    if let Some(o) = only.as_deref() {
+        if !shapes().iter().any(|s| s.name == o) {
+            eprintln!("unknown shape {o}; expected one of seq, rand, v4k, n10k");
+            std::process::exit(2);
+        }
+    }
     let write_map = std::env::var("CENSUS_WRITE_MAP").as_deref() != Ok("0");
     for shape in shapes() {
         if only.as_deref().is_some_and(|o| o != shape.name) {

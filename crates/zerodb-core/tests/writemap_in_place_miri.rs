@@ -239,7 +239,8 @@ fn spill_unspill_in_place_under_miri() {
 /// limit spills and unspills pages after the bits are built. Reads through
 /// the bits' direct map path and the brokered `&mut` they hand out stay
 /// inside the discipline; a debug assertion checks every answer against
-/// the hash index.
+/// the hash index, so a missed bit update (an unspill after the bits are
+/// built, which the spill run does) fails on the next lookup of that page.
 #[test]
 fn frame_bits_under_miri() {
     for dirty_limit in [None, Some(160)] {

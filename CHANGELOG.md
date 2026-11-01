@@ -16,8 +16,9 @@ also keeps two bits per page number. A dirty tree page is then found with one
 load and read at its own offset in the map, as LMDB reads a dirty page under
 `MDB_WRITEMAP`. Validation is unchanged. On Graviton4 with `WRITE_MAP`,
 `put/order/seq` went from 1.12× to 0.99× LMDB, `commit/batch/n10k` from 1.11×
-to 1.00× and `put/api/reserved` from 1.30× to 1.12×. 7 ladder rungs got faster
-and none slower, and the same rungs without `WRITE_MAP` are unchanged.
+to 1.00× and `put/api/reserved` from 1.30× to 1.12×. 7 of 11 ladder rungs got
+faster and none slower. A control run of 9 of those rungs without `WRITE_MAP`
+(all but `put/api/*`) is unchanged.
 Details: `benches/results/2026-10-31-writemap-dirty-bits-graviton.md`. New
 example `writemap_bulk_census` (`zerodb-oracle`).
 
