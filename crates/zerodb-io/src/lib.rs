@@ -28,12 +28,9 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use file::{
-    create_env_file, open_file, probe_page_size, read_page, real_disk_size, write_page,
-};
-pub use mmap::{Mmap, MmapWritable};
+pub use file::probe_page_size;
 
-use mmap::{MapRegions, Mapping};
+use mmap::{MapRegions, Mapping, Mmap, MmapWritable};
 use zerodb_core::env::{Backing, MapView};
 use zerodb_core::error::{Error, MdbError};
 use zerodb_core::page::geometry::MAX_MAP_SIZE;
@@ -189,12 +186,12 @@ impl Backing for MmapBacking {
 ///
 /// **Realization note (SPEC 04 §6.4 TXN-45b, ADR-0021):** this backing offers
 /// the brokered dirty-page slice ([`Backing::map_dirty_page`] /
-/// [`MmapWritable::slice_mut`]): the engine core realizes a write txn's dirty
+/// `MmapWritable::slice_mut`): the engine core realizes a write txn's dirty
 /// pages **directly in the map** at their freshly-COW'd page numbers, so
 /// commit C2 has no heap→map copy for them — only `msync` (C3/C5) and the
 /// meta write (C4, still through `write_at_page`) remain. The map `unsafe`
 /// stays in this crate; `zerodb-core` consumes safe slices whose exclusivity
-/// contract is documented on [`MmapWritable::slice_mut`]. The heap-staged
+/// contract is documented on `MmapWritable::slice_mut`. The heap-staged
 /// realization (TXN-45a) remains the behavior of every backing that does not
 /// broker slices (the default mode, the miri test backing, the
 /// fault-injection backend).
@@ -316,7 +313,10 @@ impl Backing for WriteMapBacking {
                 ),
             ));
         }
-        map.write_at(off, data);
+        // SAFETY: `write_at_page` is called only by the single writer (TXN-6)
+        // during commit, for a page no snapshot references (TXN-62) or a meta
+        // slot, which readers never borrow (TXN-18).
+        unsafe { map.write_at(off, data) };
         Ok(())
     }
 
@@ -825,7 +825,7 @@ mod tests {
     #[test]
     fn persisted_map_size_above_the_cap_is_invalid() {
         let path = TempFile::new("cap");
-        drop(super::create_env_file(&path.0, 4096, MAX_MAP_SIZE + 4096).expect("create"));
+        drop(crate::file::create_env_file(&path.0, 4096, MAX_MAP_SIZE + 4096).expect("create"));
         for requested in [None, Some(1 << 20)] {
             match open_or_create(&path.0, 4096, requested, 1 << 20, false, false) {
                 Err(Error::Mdb(MdbError::Invalid)) => {}
