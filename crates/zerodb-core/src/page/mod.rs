@@ -169,18 +169,6 @@ pub enum PageType {
     Meta,
 }
 
-impl PageType {
-    /// This page type's structural flag bit.
-    #[must_use]
-    pub fn flag_bit(self) -> u16 {
-        match self {
-            PageType::Leaf => P_LEAF,
-            PageType::Branch => P_BRANCH,
-            PageType::Overflow => P_OVERFLOW,
-            PageType::Meta => P_META,
-        }
-    }
-}
 
 /// Classify a `flags` field into a [`PageType`], enforcing the current rule:
 /// exactly one structural bit set and no reserved bit (including the DUPSORT/DUPFIXED

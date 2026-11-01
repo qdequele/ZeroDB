@@ -24,7 +24,6 @@ use std::time::Duration;
 
 use crate::cmp::{Comparator, ComparatorError, ComparatorRegistry, KeyCmp};
 use crate::error::{Error, MdbError};
-use crate::page::geometry::{is_map_full, map_pages};
 use crate::page::{
     select_meta, DBRecord, FileTrust, MetaChoice, MetaPage, MetaValidity, META_A_PGNO, META_B_PGNO,
 };
@@ -657,11 +656,7 @@ pub struct EnvInner {
     /// The runtime map size is not stored here: it lives in the backing's
     /// published view with the mapping it fits in (ADR-0023).
     page_size: u32,
-    /// The meta selected **at open** (higher-txnid, or older under
-    /// `PREV_SNAPSHOT`). Read once to seed the published snapshot (TXN-18);
-    /// steady-state reads use [`EnvInner::snapshot`], never this field, because
-    /// commits advance past it.
-    meta: MetaPage,
+
     /// Whether this env was opened with `PREV_SNAPSHOT` (SPEC 01 §S5).
     prev_snapshot: bool,
     /// Close signal, shared with any outstanding [`EnvClosingEvent`].
@@ -778,7 +773,7 @@ impl std::fmt::Debug for EnvInner {
             .field("path", &self.path)
             .field("page_size", &self.page_size)
             .field("map_size", &self.map_size())
-            .field("txnid", &self.meta.txnid)
+            .field("txnid", &self.snapshot().txnid)
             .field("prev_snapshot", &self.prev_snapshot)
             .finish_non_exhaustive()
     }
@@ -905,27 +900,6 @@ impl EnvInner {
         Ok(())
     }
 
-    /// The meta selected at open, possibly unpublished in a joiner: the
-    /// durable meta page this process read once when it opened the
-    /// environment (TXN-18), kept only to seed the published snapshot cell.
-    /// In a lock-file environment (ADR-0023) a process that *joins* an
-    /// environment another process already has open may select an
-    /// older meta than the one the first opener is about to publish, or the
-    /// shared published txnid `T` may already be ahead of it by the time this
-    /// call returns — so this is never current once another writer has run.
-    ///
-    /// **Do not read roots or txnids from this for anything that must be
-    /// correct across processes or across commits** (the main/free-DB roots,
-    /// `txnid`, `last_pg`): use [`EnvInner::snapshot`] for the process-local
-    /// published view, or [`EnvInner::current_snapshot`] for the one that
-    /// also follows another process's commits. This accessor exists only for
-    /// open-time/debugging use (geometry recorded at the moment this process
-    /// opened, e.g. in [`std::fmt::Debug`]); it goes stale after the first
-    /// commit, by this process or any other.
-    #[must_use]
-    pub fn meta(&self) -> &MetaPage {
-        &self.meta
-    }
 
     /// `Arc`-clone the current published snapshot (SPEC 04 TXN-18). The
     /// clone keeps the `(txnid, roots)` alive for the caller's
@@ -1450,11 +1424,6 @@ impl EnvInner {
         self.dirty_limit
     }
 
-    /// The env's sequential-writes default (ADR-0015).
-    #[must_use]
-    pub fn sequential_writes_default(&self) -> bool {
-        self.sequential_writes
-    }
 
     /// Whether the main DB (`None`) or named DB `dbi` uses the sequential-
     /// writes fast path: its override if set, else the env default
@@ -1622,7 +1591,9 @@ impl EnvInner {
     /// (SPEC 02 §8, `MdbError::MapFull`). Exposed so the geometry ceiling is
     /// testable at the env level; the write path checks `is_map_full` itself.
     #[must_use]
-    pub fn would_map_full(&self, next_pgno: u64, n: u64) -> bool {
+    #[cfg(test)]
+    pub(crate) fn would_map_full(&self, next_pgno: u64, n: u64) -> bool {
+        use crate::page::geometry::{is_map_full, map_pages};
         is_map_full(next_pgno, n, map_pages(self.map_size(), self.page_size))
     }
 }
@@ -2059,7 +2030,8 @@ impl Env {
     /// Number of strong references to the shared inner (this handle included).
     /// Diagnostic; the deferred-close contract does not depend on it.
     #[must_use]
-    pub fn handle_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn handle_count(&self) -> usize {
         Arc::strong_count(&self.inner)
     }
 
@@ -2219,7 +2191,7 @@ pub const MAX_READERS_LIMIT: u32 = 1 << 20;
 /// Upper bound accepted for `max_dbs` (SPEC 00 row 4) — same rationale as
 /// [`MAX_READERS_LIMIT`] (the comparator registry allocates `max_dbs` slots
 /// eagerly).
-pub const MAX_DBS_LIMIT: u32 = 1 << 20;
+pub(crate) const MAX_DBS_LIMIT: u32 = 1 << 20;
 
 /// Rejects a `max_readers` or `max_dbs` above its limit with
 /// `Io(InvalidInput)` (see docs/DIVERGENCES.md).
@@ -2295,12 +2267,12 @@ pub fn open_with_backing(
 }
 
 /// LMDB's dirty limit, `MDB_IDL_UM_MAX` = 2^17 pages (SPEC 04 TXN-68).
-pub const DEFAULT_DIRTY_LIMIT: u64 = 1 << 17;
+pub(crate) const DEFAULT_DIRTY_LIMIT: u64 = 1 << 17;
 
 /// The smallest dirty limit `max_dirty_bytes` can set, in pages (SPEC 04
 /// TXN-68): a spill writes at least 64 pages and keeps roots and finger
 /// pages, so a smaller limit would spill on nearly every call.
-pub const MIN_DIRTY_LIMIT: u64 = 128;
+pub(crate) const MIN_DIRTY_LIMIT: u64 = 128;
 
 /// The dirty limit in pages for `max_dirty_bytes` at `page_size` (SPEC 04
 /// TXN-68): `None` = LMDB's [`DEFAULT_DIRTY_LIMIT`], otherwise
@@ -2554,7 +2526,6 @@ pub fn open_with_backing_shared(
         dirty_limit: dirty_limit.unwrap_or(DEFAULT_DIRTY_LIMIT).max(1),
         sequential_writes,
         sequential_overrides: (0..=max_dbs).map(|_| AtomicU8::new(SEQ_FOLLOW)).collect(),
-        meta,
         prev_snapshot,
         closing,
         holds_election: AtomicBool::new(holds_election),

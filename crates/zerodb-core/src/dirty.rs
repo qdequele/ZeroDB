@@ -49,19 +49,19 @@
 //!
 //! **In-map dirty pages (ADR-0021; SPEC 04 §6.4 TXN-45b; `WRITE_MAP`).** When
 //! the backing brokers map slices ([`Backing::dirty_in_map`]), a store built
-//! with [`DirtyStore::with_spare_in_map`] realizes every new frame **in the
-//! writable map** at the frame's own pgno ([`Slot::Map`]) instead of on the
+//! with [`DirtyStore::from_carry`] with a broker realizes every new frame **in
+//! the writable map** at the frame's own pgno ([`Slot::Map`]) instead of on the
 //! heap: the bytes are already at their final file offset, so commit C2 (and
 //! spilling) writes nothing for them. The TXN-41 stability contract holds
 //! unchanged — the map is mapped once for the env's life (ADR-0004 D4), so a
 //! map frame's address never moves — and the borrow discipline is the same:
-//! `bytes` ties a shared view to `&self`, `bytes_mut` a mutable view to
-//! `&mut self`, so the brokered `&mut` slices are transient and never
-//! overlap a live borrow (TXN-39). Writing a frame **at allocation time**
-//! instead of commit C2 is safe for the same reason spilling is (TXN-70):
-//! the pgno came from this txn's allocator, so TXN-62 guarantees no live
-//! snapshot references it. Map frames are never pooled as spares; `remove`
-//! copies a map frame out to a heap `Box` (the split path's scratch copy).
+//! `bytes` ties a shared view to `&self`, `bytes_mut` a mutable view to `&mut
+//! self`, so the brokered `&mut` slices are transient and never overlap a live
+//! borrow (TXN-39). Writing a frame **at allocation time** instead of commit C2
+//! is safe for the same reason spilling is (TXN-70): the pgno came from this
+//! txn's allocator, so TXN-62 guarantees no live snapshot references it. Map
+//! frames are never pooled as spares; `remove` copies a map frame out to a heap
+//! `Box` (the split path's scratch copy).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -190,8 +190,8 @@ impl Slot {
 
 /// A write txn's dirty-page frames, indexed by pgno. See the module docs for
 /// the stability contract. `'env` is the backing's lifetime (only used in
-/// in-map mode, [`DirtyStore::with_spare_in_map`]; heap-mode stores never
-/// touch it).
+/// in-map mode, [`DirtyStore::from_carry`] with a broker; heap-mode stores
+/// never touch it).
 pub struct DirtyStore<'env> {
     psize: u32,
     /// `log2(psize)` (page sizes are powers of two, SPEC 02 §3.2): turns a
@@ -299,8 +299,9 @@ unsafe fn map_mut(broker: Option<&dyn Backing>, psize: u32, pgno: u64, len: usiz
 
 impl<'env> DirtyStore<'env> {
     /// An empty store for pages of size `psize`.
+    #[cfg(test)]
     #[must_use]
-    pub fn new(psize: u32) -> DirtyStore<'env> {
+    pub(crate) fn new(psize: u32) -> DirtyStore<'env> {
         DirtyStore::with_spare(psize, Vec::new())
     }
 
@@ -309,8 +310,9 @@ impl<'env> DirtyStore<'env> {
     /// is adopted as is, O(1): every write txn, empty ones included, pays
     /// for the pool hand-over, so it must not scale with the pool size. The
     /// pool only ever holds frames of this env's page size.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_spare(psize: u32, spare: Vec<Box<[u8]>>) -> DirtyStore<'env> {
+    pub(crate) fn with_spare(psize: u32, spare: Vec<Box<[u8]>>) -> DirtyStore<'env> {
         DirtyStore::from_carry(
             psize,
             DirtyCarry {
@@ -323,7 +325,7 @@ impl<'env> DirtyStore<'env> {
 
     /// An empty store built from the previous write txn's allocations
     /// ([`DirtyCarry`]), realizing new frames in the writable map through
-    /// `broker` when it is `Some` (see [`DirtyStore::with_spare_in_map`]).
+    /// `broker` when it is `Some` (ADR-0021, SPEC 04 §6.4 TXN-45b).
     /// O(1): the indexes and the spare `Vec` move in whole.
     #[must_use]
     pub(crate) fn from_carry(
@@ -352,21 +354,6 @@ impl<'env> DirtyStore<'env> {
         }
     }
 
-    /// [`DirtyStore::with_spare`], realizing new frames **in the writable
-    /// map** through `broker` (ADR-0021, SPEC 04 §6.4 TXN-45b). The caller
-    /// (write-txn begin) selects this only when
-    /// [`Backing::dirty_in_map`] is `true`.
-    #[must_use]
-    pub fn with_spare_in_map(
-        psize: u32,
-        spare: Vec<Box<[u8]>>,
-        broker: &'env dyn Backing,
-    ) -> DirtyStore<'env> {
-        debug_assert!(broker.dirty_in_map());
-        let mut s = DirtyStore::with_spare(psize, spare);
-        s.broker = Some(broker);
-        s
-    }
 
     /// Whether this store realizes dirty frames in the writable map
     /// (ADR-0021). Commit C2 and spilling write nothing for such frames.
@@ -375,16 +362,9 @@ impl<'env> DirtyStore<'env> {
         self.broker.is_some()
     }
 
-    /// Whether `pgno`'s frame lives in the map (always `false` in heap mode).
-    /// Commit C2/spill skip these frames: their bytes are already at their
-    /// final file offset.
-    #[must_use]
-    pub fn in_map(&self, pgno: u64) -> bool {
-        self.broker.is_some() && matches!(self.frames.get(&pgno), Some(Slot::Map { .. }))
-    }
-
-    /// `pgno`'s frame length in bytes and whether it lives in the map
-    /// ([`DirtyStore::in_map`]), in one lookup; `None` without a frame.
+    /// `pgno`'s frame length in bytes and whether it lives in the map, in
+    /// one lookup; `None` without a frame. Commit C2 and spilling skip map
+    /// frames: their bytes are already at their final file offset.
     #[must_use]
     pub fn frame_extent(&self, pgno: u64) -> Option<(usize, bool)> {
         self.frames
@@ -563,9 +543,10 @@ impl<'env> DirtyStore<'env> {
 
     /// Insert (or replace) the frame for `pgno`. The frame length must be a
     /// non-zero multiple of `psize` (1 page for tree frames, `n` for runs).
-    /// Always a heap frame (test/compat path; the engine's run creation goes
-    /// through [`DirtyStore::insert_run_frame`]).
-    pub fn insert(&mut self, pgno: u64, frame: Box<[u8]>) {
+    /// Always a heap frame (the engine's run creation goes through
+    /// [`DirtyStore::insert_run_frame`]).
+    #[cfg(test)]
+    pub(crate) fn insert(&mut self, pgno: u64, frame: Box<[u8]>) {
         debug_assert!(
             !frame.is_empty() && frame.len().is_multiple_of(self.psize as usize),
             "frame length {} must be a positive multiple of psize {}",
@@ -733,7 +714,7 @@ impl<'env> DirtyStore<'env> {
     /// overwrites. Run frames and in-map frames (ADR-0021 — the map's bytes
     /// are not pool material) are left behind to drop with the store.
     #[must_use]
-    pub fn reclaimable_frames(&mut self, cap: usize) -> Vec<Box<[u8]>> {
+    pub(crate) fn reclaimable_frames(&mut self, cap: usize) -> Vec<Box<[u8]>> {
         // The spare `Vec` moves out whole (O(1)); only this txn's dirty frames
         // are walked, so the hand-back costs O(pages dirtied), like LMDB
         // returning its dirty list to `me_dpages`.

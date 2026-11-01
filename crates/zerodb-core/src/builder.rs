@@ -365,12 +365,11 @@ fn finalize_image(
 // compaction RAM)
 // ===========================================================================
 
-/// Where a streaming build lands its pages. `zerodb-core` has
-/// no I/O policy, so the file-backed implementation lives engine-side
-/// (`zerodb::copy`); [`VecSink`] is the in-memory implementation the batch
-/// wrappers and tests use. Pages may be emitted out of pgno order only for
-/// the two meta slots (patched last); data pages are emitted exactly once
-/// each, at the pgno `alloc` returned for them.
+/// Where a streaming build lands its pages. `zerodb-core` has no I/O policy, so
+/// the file-backed implementation lives engine-side (`zerodb::copy`); tests use
+/// an in-memory one. Pages may be emitted out of pgno order only for the two
+/// meta slots (patched last); data pages are emitted exactly once each, at the
+/// pgno `alloc` returned for them.
 pub trait PageSink {
     /// Allocate `n` contiguous page numbers, returning the first.
     fn alloc(&mut self, n: u64) -> u64;
@@ -380,18 +379,20 @@ pub trait PageSink {
     ///
     /// # Errors
     ///
-    /// I/O errors from file-backed sinks; [`VecSink`] never fails.
+    /// I/O errors from file-backed sinks; an in-memory sink never fails.
     fn emit(&mut self, pgno: u64, frame: &[u8]) -> std::io::Result<()>;
 }
 
 /// A [`PageSink`] over a growable in-memory image (pages 0/1 reserved for the
 /// meta slots), the differential referee for file-backed streaming in tests.
-pub struct VecSink {
+#[cfg(test)]
+pub(crate) struct VecSink {
     psize: u32,
     buf: Vec<u8>,
     next: u64,
 }
 
+#[cfg(test)]
 impl VecSink {
     /// A fresh image sink: two zeroed meta slots, data from [`FIRST_DATA_PGNO`].
     #[must_use]
@@ -410,6 +411,7 @@ impl VecSink {
     }
 }
 
+#[cfg(test)]
 impl PageSink for VecSink {
     fn alloc(&mut self, n: u64) -> u64 {
         let p = self.next;

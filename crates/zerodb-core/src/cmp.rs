@@ -216,8 +216,9 @@ impl KeyCmp<'_> {
     }
 
     /// Whether this is the default (memcmp) ordering.
+    #[cfg(test)]
     #[must_use]
-    pub fn is_default(&self) -> bool {
+    pub(crate) fn is_default(&self) -> bool {
         matches!(self, KeyCmp::Default)
     }
 }

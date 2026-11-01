@@ -77,15 +77,6 @@ pub enum Source<'a> {
 }
 
 impl<'a> Source<'a> {
-    /// The committed high-water this source is bounded by (`Snapshot::last_pg`
-    /// for a reader; the base snapshot's for a writer). Pages above it are
-    /// refused by the committed-map resolver (SPEC 04 TXN-38).
-    #[must_use]
-    pub fn last_pg(&self) -> u64 {
-        match self {
-            Source::Map { last_pg, .. } | Source::Writer { last_pg, .. } => *last_pg,
-        }
-    }
 
     /// Bytes beginning at page `pgno`: at least one page; for an overflow head
     /// resolved from this source, the returned slice covers the whole run
@@ -540,7 +531,7 @@ fn validate_leaf_miss<'a>(
 ) -> Result<LeafRef<'a>, PageError> {
     let leaf = match v.shared {
         Some(cache) => {
-            let stamp = page_stamp(bytes);
+            let stamp = crate::page::read_page_txnid(bytes);
             if cache.contains(pgno, StampKind::Leaf, stamp) {
                 LeafRef::new_trusted(bytes)
             } else {
@@ -570,7 +561,7 @@ fn validate_branch_miss<'a>(
 ) -> Result<BranchRef<'a>, PageError> {
     let br = match v.shared {
         Some(cache) => {
-            let stamp = page_stamp(bytes);
+            let stamp = crate::page::read_page_txnid(bytes);
             if cache.contains(pgno, StampKind::Branch, stamp) {
                 BranchRef::new_trusted(bytes)
             } else {
@@ -588,11 +579,6 @@ fn validate_branch_miss<'a>(
     Ok(br)
 }
 
-/// The writer-txnid stamp of a page (header offset 8, SPEC 02 §2). `bytes`
-/// is a resolved map page, at least one page long.
-fn page_stamp(bytes: &[u8]) -> u64 {
-    crate::page::read_page_txnid(bytes)
-}
 
 /// As [`leaf_view`], for branch pages.
 pub(crate) fn branch_view<'a>(
@@ -1641,17 +1627,11 @@ impl<'a, S: BorrowMut<PathStack>> Cursor<'a, S> {
         }
     }
 
-    /// `get_current` (`MDB_GET_CURRENT`) — SPEC 03 §4: the entry at the current
-    /// position without moving. `None` if unpositioned or at `EOF`.
-    pub fn get_current(&self) -> PosResult<'a> {
-        self.current()
-    }
-
     /// The leaf **node flags** of the entry at the current position (tools and
     /// copy): lets `dump`/`copy_to_file` tell an `F_SUBDATA` named-DB
     /// catalog record apart from a plain user-data key during an in-order scan
     /// (SPEC 02 §6). `None` if unpositioned, at `EOF`, or parked past a leaf's
-    /// last entry — the same positions for which [`Cursor::get_current`] yields
+    /// last entry — the same positions for which the current entry is
     /// `None`.
     ///
     /// # Errors
