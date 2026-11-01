@@ -188,47 +188,45 @@ struct Opts {
     map_size: Option<u64>,
 }
 
-/// Split `args` into positional args and recognised `--flag value` options.
-/// Unknown `--flags` are treated as positional (kept simple; hand-rolled, no
-/// `clap`). Returns `(positional, opts)`.
+/// Split `args` into positional args and the `--out`, `--page-size` and
+/// `--map-size` options, each followed by its value. Hand-rolled, no `clap`.
+///
+/// # Errors
+///
+/// An unknown `--flag`, a flag without a value, or a value that does not
+/// parse: each is a usage error, never taken as a path or a default.
 fn parse_opts(args: &[String]) -> Result<(Vec<String>, Opts), common::BoxErr> {
     let mut positional = Vec::new();
     let mut opts = Opts::default();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            // An unknown `--flag` is a usage error, not a path: `check --verbose
-            // dir` must not try to open a directory named `--verbose`.
-            flag if flag.starts_with("--")
-                && !matches!(flag, "--out" | "--page-size" | "--map-size") =>
-            {
-                return Err(format!("unknown option {flag:?}\n{USAGE}").into());
-            }
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        let flag = arg.as_str();
+        if !flag.starts_with("--") {
+            positional.push(arg.clone());
+            continue;
+        }
+        let value = || -> Result<&String, common::BoxErr> {
+            Err(format!("option {flag} needs a value\n{USAGE}").into())
+        };
+        let invalid = |v: &str| -> common::BoxErr {
+            format!("option {flag}: {v:?} is not a valid number\n{USAGE}").into()
+        };
+        match flag {
             "--out" => {
-                if let Some(v) = args.get(i + 1) {
-                    opts.out = Some(PathBuf::from(v));
-                    i += 2;
-                    continue;
-                }
+                let v = args.next().map_or_else(value, Ok)?;
+                opts.out = Some(PathBuf::from(v));
             }
             "--page-size" => {
-                if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
-                    opts.page_size = Some(v);
-                    i += 2;
-                    continue;
-                }
+                let v = args.next().map_or_else(value, Ok)?;
+                opts.page_size = Some(v.parse().map_err(|_| invalid(v))?);
             }
             "--map-size" => {
-                if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
-                    opts.map_size = Some(v);
-                    i += 2;
-                    continue;
-                }
+                let v = args.next().map_or_else(value, Ok)?;
+                opts.map_size = Some(v.parse().map_err(|_| invalid(v))?);
             }
-            _ => {}
+            // `check --verbose dir` must not open a directory named `--verbose`.
+            _ => return Err(format!("unknown option {flag:?}\n{USAGE}").into()),
         }
-        positional.push(args[i].clone());
-        i += 1;
     }
     Ok((positional, opts))
 }
@@ -243,4 +241,42 @@ fn first_positional(positional: &[String], usage: &str) -> Result<PathBuf, commo
         .first()
         .map(PathBuf::from)
         .ok_or_else(|| format!("usage: {usage}").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_opts;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn parses_positionals_and_options() {
+        let (positional, opts) = parse_opts(&args(&[
+            "in",
+            "--page-size",
+            "8192",
+            "out",
+            "--map-size",
+            "1048576",
+        ]))
+        .unwrap();
+        assert_eq!(positional, args(&["in", "out"]));
+        assert_eq!(opts.page_size, Some(8192));
+        assert_eq!(opts.map_size, Some(1 << 20));
+    }
+
+    #[test]
+    fn rejects_bad_or_missing_values_and_unknown_flags() {
+        for bad in [
+            &["dir", "--page-size", "abc"][..],
+            &["dir", "--map-size", "-1"],
+            &["dir", "--page-size"],
+            &["dir", "--out"],
+            &["--verbose", "dir"],
+        ] {
+            assert!(parse_opts(&args(bad)).is_err(), "{bad:?} was accepted");
+        }
+    }
 }
