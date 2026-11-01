@@ -1,12 +1,7 @@
-# SPEC 01 — LMDB flag & semantics matrix (Phase 0.2 deliverable)
+# SPEC 01 — LMDB flag & semantics matrix
 
-> Revised 2026-10-05: NO_READ_AHEAD landed status, WRITE_MAP in-place note
-> (§S7, ADR-0021), the two parked-2.8a observation pins (§S8, Table 3
-> `MDB_RESERVE`) adopted as spec text.
-
-Status: **DONE** — 2026-07-15. **M1.10 landed addendum** — 2026-07-16 (the
-env write-mode / durability / RDONLY flags implemented; see the *M1.10 landed
-flag matrix* at the end of this file for each flag's landing test).
+The *landed flag matrix* at the end of this file names each implemented flag's
+test.
 
 Source of truth: the **Meilisearch LMDB fork**, branch `mdb.master.nested-rtxns`,
 as vendored by `lmdb-master-sys 0.2.6` inside **heed v0.22.1** (SPEC 00 pinned
@@ -57,7 +52,7 @@ through `EnvOpenOptions::read_txn_with_tls()` / `read_txn_without_tls()`.
 | `MDB_FIXEDMAP` | `0x01` | `EnvFlags::FIXED_MAP` | **WON'T** | — | — | "mmap at a fixed address (**experimental**)" per the header; upstream marks it experimental and it hard-codes a mmap address. No consumer. Rationale: experimental upstream, incompatible with our own-format mmap policy. |
 | `MDB_NOSUBDIR` | `0x4000` | `EnvFlags::NO_SUB_DIR` | **WON'T** | — | — | Store the env as two files `name` / `name-lock` instead of a directory. SPEC 00 row 7: every consumer opens a **directory** env (`data.mdb`/`lock.mdb`), never `NO_SUB_DIR`. zerodb defines its own on-disk layout (D-002); no consumer need. |
 | `MDB_NOSYNC` | `0x10000` | `EnvFlags::NO_SYNC` | **SHOULD** † | 1.10 | `durability_nosync_no_fsync` | Skip both data and meta fsync on commit; durability restored only by `mdb_env_sync`/next non-RDONLY commit. In `mdb_env_sync0` the fsync is elided when `NO_SYNC` set. No consumer passes it, but M1.10 scopes durability-flag parity into Phase 1 (†, §S6). Crash-tested in M1.11. |
-| `MDB_RDONLY` | `0x20000` | `EnvFlags::READ_ONLY` | **SHOULD** | 1.10 | `env_rdonly_rejects_write` | *Env-level* read-only: `mdb_txn_begin` returns `EACCES` for a write txn (`env->me_flags & MDB_RDONLY & ~flags`); `mdb_env_sync0` returns `EACCES`. No consumer opens an RDONLY **env** (they all need `write_txn`). NB: the *txn-level* `MDB_RDONLY` set on every `read_txn()` is a separate, universal MUST covered by SPEC 00 rows 14/16 (M1.3/1.8), not this env bit. |
+| `MDB_RDONLY` | `0x20000` | `EnvFlags::READ_ONLY` | **SHOULD** | 1.10 | `env_rdonly_rejects_write` | *Env-level* read-only: `mdb_txn_begin` returns `EACCES` for a write txn (`env->me_flags & MDB_RDONLY & ~flags`); `mdb_env_sync0` returns `EACCES`. No consumer opens an RDONLY **env** (they all need `write_txn`). NB: the *txn-level* `MDB_RDONLY` set on every `read_txn()` is a separate, universal MUST covered by SPEC 00 rows 14/16, not this env bit. |
 | `MDB_NOMETASYNC` | `0x40000` | `EnvFlags::NO_META_SYNC` | **SHOULD** † | 1.10 | `durability_nometasync` | fsync data pages but skip the meta-page fsync on commit; the meta is flushed on the next sync. `mfd = (flags & (NOSYNC\|NOMETASYNC)) ? me_fd : me_mfd` — routes the meta write to the non-syncing fd. No consumer; M1.10 (†, §S6). Crash-tested in M1.11. |
 | `MDB_WRITEMAP` | `0x80000` | `EnvFlags::WRITE_MAP` | **MUST** | 1.10 | `env_writemap_put_get_parity`, `env_writemap_put_reserved` | SPEC 00 row 8 (Meilisearch `index_map`, gated on experimental writemap). Writes go through a **writable** mmap (`mmap(PROT_WRITE)`), not `malloc`+`pwrite`; dirty bytes live in the map. Interacts with `put_reserved` (returns a pointer into the map) and the SPEC 04 value-borrow contract. Commit flushes with `msync` (`MS_SYNC`, or `MS_ASYNC` under `MAP_ASYNC`) instead of `pwrite`+`fdatasync`, limited to the used prefix `[0, next_pgno)` at C3 and the meta page at C5, as LMDB (ranged since 2026-10-17); a synchronous flush also `fdatasync`s the data fd on every platform (SPEC 06 REC-12). Excludes `NO_MEM_INIT`/readahead paths. Must be spec'd as a second write mode (§S7). |
 | `MDB_MAPASYNC` | `0x100000` | `EnvFlags::MAP_ASYNC` | **SHOULD** † | 1.10 | `durability_mapasync_writemap` | Only meaningful with `WRITE_MAP`: use `MS_ASYNC` instead of `MS_SYNC` for the commit `msync` (`flags = (MAPASYNC && !force) ? MS_ASYNC : MS_SYNC`). A crash can then lose/corrupt the last txns. No consumer; M1.10 (†, §S6). |
@@ -365,9 +360,8 @@ several other rules:
   per `MAP_ASYNC`) plus, for a synchronous flush, an `fdatasync` of the data fd.
   The commit `msync`s cover only the used prefix and the meta page, as LMDB's
   (SPEC 06 REC-12, ranged since 2026-10-17); `Env::sync` flushes the whole map.
-  *(Revised 2026-10-05: the `fdatasync` was originally scoped to macOS/Windows,
-  where `msync` alone is not a full barrier; `WriteMapBacking::sync` runs it on
-  every platform — a strict superset, SPEC 06 REC-12.)*
+  The `fdatasync` runs on every platform, not only where `msync` alone is not a
+  full barrier (SPEC 06 REC-12).
 - `put_reserved` (§S3) returns a pointer straight into the writable map, so the
   reserved bytes are literally the on-disk bytes; the value-borrow contract
   (SPEC 04) must treat writemap and non-writemap dirty storage uniformly from the
@@ -379,7 +373,7 @@ several other rules:
   to write transactions to disk"; `MAP_ASYNC | WRITE_MAP` is the intended relaxed
   mode. zerodb specs both the heap-buffer writer and the writemap writer as
   two explicit modes (landed M1.10) and proves `put_reserved` parity in each.
-  Since ADR-0021 (PR #88) the `WRITE_MAP` mode is **truly in-place**: a write
+  Since ADR-0021 the `WRITE_MAP` mode is **truly in-place**: a write
   txn's dirty frames are realized in the writable map at allocation/edit time
   rather than in heap frames copied in at commit (SPEC 04 §6.4 TXN-45b;
   `zerodb-io::mmap` brokered slice, `zerodb-core::dirty`).
@@ -505,24 +499,24 @@ from its MUST table):
 
 ## M1.10 landed flag matrix (write flags and modes)
 
-**Landed 2026-07-16** (M1.10). Every write-mode / durability / RDONLY flag
+**Landed 2026-07-16**. Every write-mode / durability / RDONLY flag
 in Phase-1 scope, its landing test, and where it lives. The put-flag rows
 (`APPEND` / `NO_OVERWRITE` / `CURRENT` / `RESERVE`) landed earlier in M1.4/M1.6;
 they are re-listed here for a single flag-matrix view (M1.10 acceptance).
 
 | Flag | Table | Behavior (landed) | Landing test | Kind |
 |------|-------|-------------------|--------------|------|
-| `MDB_WRITEMAP` | 1 | Writes go through a writable mmap (`zerodb-io::WriteMapBacking`); commit `msync` (+ `fdatasync` on a synchronous flush) instead of `pwrite`+`fdatasync`. Realized as a commit-time write strategy — heap dirty frames during the txn, copied into the map at C2 (SPEC 04 §6.4, amended). *(As landed 2026-07-16; since ADR-0021, PR #88, the real map backing realizes dirty frames in the map at allocation instead — SPEC 04 TXN-45b.)* | `env_writemap_put_get_parity`, `env_writemap_put_reserved` (oracle, both engines in WRITE_MAP); `writemap_put_get_reserved_persist`, `writemap_reopened_as_writemap_sees_data` (`crates/zerodb/tests/write_flags.rs`) | differential + e2e |
+| `MDB_WRITEMAP` | 1 | Writes go through a writable mmap (`zerodb-io::WriteMapBacking`); commit `msync` (+ `fdatasync` on a synchronous flush) instead of `pwrite`+`fdatasync`. Realized as a commit-time write strategy — heap dirty frames during the txn, copied into the map at C2 (SPEC 04 §6.4, amended). *(As landed 2026-07-16; since ADR-0021 the real map backing realizes dirty frames in the map at allocation instead — SPEC 04 TXN-45b.)* | `env_writemap_put_get_parity`, `env_writemap_put_reserved` (oracle, both engines in WRITE_MAP); `writemap_put_get_reserved_persist`, `writemap_reopened_as_writemap_sees_data` (`crates/zerodb/tests/write_flags.rs`) | differential + e2e |
 | `MDB_MAPASYNC` | 1 | With WRITE_MAP, C3/C5 use `msync(MS_ASYNC)`. | `durability_mapasync_writemap` (oracle); `map_async_makes_barriers_async` (barrier count); `mapasync_writemap_commit_and_force_sync` (e2e) | differential + control-flow |
 | `MDB_NOSYNC` | 1 | Skip **both** C3 and C5 fsync (SPEC 06 REC-9). Restored by `force_sync`. | `durability_nosync_no_fsync` (oracle); `no_sync_skips_both_barriers` / `no_sync_dominates_no_meta_sync` (barrier count) | differential + control-flow |
 | `MDB_NOMETASYNC` | 1 | fsync data (C3), skip meta fsync (C5); recovery falls back to newest durable meta, corruption-free (REC-10). | `durability_nometasync` (oracle); `no_meta_sync_skips_meta_barrier` (barrier count) | differential + control-flow |
 | `MDB_RDONLY` | 1 | `write_txn` / `force_sync` → `EACCES` (`Io(PermissionDenied)`, matching the fork); reads fully functional; no store creation. | `env_rdonly_rejects_write` (oracle, direct two-engine); `read_only_env_rejects_write_txn_and_force_sync`, `read_only_open_of_missing_store_errors` (e2e) | differential + e2e |
 | `MDB_NOTLS` | 1 | `RoTxn: Send` (default/only mode); reader-table slot tied to the txn object. | `flag_notls_rotxn_is_send` (compile assert + cross-thread move) | compile + e2e |
-| `MDB_PREVSNAPSHOT` | 1 | Open on the older meta; auto-clears on first commit (M1.2 / SPEC 02 §3.2, TXN-65..67). | `env_prevsnapshot_opens_older_meta` (M1.2) | differential |
+| `MDB_PREVSNAPSHOT` | 1 | Open on the older meta; auto-clears on first commit (M1.2 / SPEC 02 §3.2, TXN-65..67). | `env_prevsnapshot_opens_older_meta` | differential |
 | `MDB_APPEND` | 3 | Last-key compare; `key <= last` → `KeyExist` (SPEC 01 §S1). | `flag_append_*` (M1.4 oracle) | differential |
-| `MDB_NOOVERWRITE` | 3 | Return existing value + `KeyExist` (SPEC 01 §S2). | `flag_no_overwrite_returns_existing` (M1.4) | differential |
-| `MDB_CURRENT` | 3 | `put_current` at cursor; `EINVAL` if uninitialized. | `cursor_put_current_*` (M1.4) | differential |
-| `MDB_RESERVE` | 3 | `put_reserved`: caller fills the slot in place; not zeroed (SPEC 01 §S3). Under WRITE_MAP the slot is (logically) into the map. | `put_reserved_*` (M1.4), `env_writemap_put_reserved` (M1.10) | differential |
+| `MDB_NOOVERWRITE` | 3 | Return existing value + `KeyExist` (SPEC 01 §S2). | `flag_no_overwrite_returns_existing` | differential |
+| `MDB_CURRENT` | 3 | `put_current` at cursor; `EINVAL` if uninitialized. | `cursor_put_current_*` | differential |
+| `MDB_RESERVE` | 3 | `put_reserved`: caller fills the slot in place; not zeroed (SPEC 01 §S3). Under WRITE_MAP the slot is (logically) into the map. | `put_reserved_*`, `env_writemap_put_reserved` | differential |
 
 **`Env::force_sync` / `Env::sync(force)`** (`mdb_env_sync` parity, §S6).
 `force_sync()` — the only form heed exposes — is exactly `mdb_env_sync(env, 1)`:

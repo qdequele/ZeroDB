@@ -1,19 +1,9 @@
 # SPEC 04 — Transactions & MVCC
 
-Revised 2026-10-05 — docs sweep: snapshot-object field list brought up to the
-shipped shape (`last_pg`, free-list annex — ADR-0022), dirty-frame pool noted
-(commit 10c98a1).
-
-Revised 2026-10-13 — multi-process access (ADR-0023, stages 1–3): the lock
-file is on by default, D-001 is retired, and the rules below that assumed a
-single process are amended in place (§0, §2, TXN-6/7/9, §4, TXN-14/16/17/18/19,
-TXN-38, TXN-45b, TXN-50/51/53, TXN-56, TXN-66). The lock file's own invariants
-are the new §12 (`LCK-1` …).
-
-Status: **DONE** — 2026-07-15 (milestone 0.4). Behavioral source of truth for the
-transaction lifecycle (M1.4), the reader table and concurrency (M1.8), nested
-read transactions (M1.9), and the write-txn value-borrow contract that every
-write-path change (M1.4/1.10) must uphold. Formats are in
+Behavioral source of truth for the
+transaction lifecycle, the reader table and concurrency, nested
+read transactions, and the write-txn value-borrow contract that every
+write-path change must uphold. Formats are in
 [SPEC 02](02-pages.md); tree algorithms in [SPEC 03](03-btree.md); free-page
 reclamation in [SPEC 05](05-gc.md); the crash/durability guarantees that the
 commit pipeline defined here must satisfy are in [SPEC 06](06-recovery.md).
@@ -28,7 +18,7 @@ default (**ADR-0023**; it retired the founding single-process decision D-001),
 and `NO_LOCK` (`EnvOpenOptions::lock_file(false)`) keeps the single-process
 path with an in-process reader table; nested WRITE txns
 unsupported (**D-003**); nested READ txns over the active write txn are a
-hot-path MUST with see-uncommitted semantics (M1.9); meta CRC + double-buffer
+hot-path MUST with see-uncommitted semantics; meta CRC + double-buffer
 per SPEC 02 §3; commit ordering encoded in one function with crash hooks
 (M1.4).
 
@@ -154,7 +144,7 @@ Normative rules are numbered **TXN-n** so tests and the check tool can cite them
   (heed `MdbError` path; §8 error table). No write mutex is taken.
 - **TXN-9** — Readers never take the write mutex and never block on it; the
   writer never blocks on readers (it computes the oldest reader lock-free, §4).
-  This is the core concurrency guarantee (M1.8): *readers never block, the
+  This is the core concurrency guarantee: *readers never block, the
   writer never blocks readers.* The published-snapshot **cell** is not the
   write mutex: readers may briefly contend on its bounded O(1) pointer
   operations (one swap per commit, one clone per pin) but never on any part
@@ -342,8 +332,7 @@ only a full fence / `SeqCst` does.
   `t & 1` has already moved on, the loop re-reads `T` and pins again, the slot
   keeping its last pin meanwhile (conservative for the GC gate, TXN-20). The
   tail's adopt-newer step does not apply: the snapshot is the one for `t`.
-- **TXN-18** — **The published-snapshot object.** *(Amended 2026-07-16,
-  ratified — maintainer, ADR-0006 Option B: the original
+- **TXN-18** — **The published-snapshot object.** *(Amended by ADR-0006 Option B: the original
   text required an ArcSwap-style lock-free cell "in the reader-table module
   where `unsafe` is sanctioned"; the ratified implementation keeps
   `zerodb-core` `forbid(unsafe_code)` and scopes the no-blocking guarantee to
@@ -637,8 +626,7 @@ page concurrently, the borrow would dangle and the read would race.
   nested readers dropped). Because of TXN-30 this is normally guaranteed by the
   borrow checker; the **commit** path carries the runtime check (C0, TXN-58) as
   defense-in-depth. The **abort/drop** path deliberately carries no runtime
-  check *(amended 2026-07-16, M1.9 — ratified under the maintainer's standing
-  directive; ADR-0007 post-implementation notes)*: a live child at parent-drop
+  check *(ADR-0007 post-implementation notes)*: a live child at parent-drop
   is unrepresentable in safe Rust, and a nonzero count at drop can only mean
   `mem::forget(child)` — which consumed the child, aliases nothing, and is
   harmless; a drop-side assert would false-positive on exactly that case while
@@ -653,7 +641,7 @@ page concurrently, the borrow would dangle and the read would race.
   (SPEC 01 §S7) is permitted: the nested reader reads dirty bytes straight from
   the writable map instead of a heap page (§6.4), same borrow contract. (The fork
   blocks only writemap nested *write* children; read children are fine.)
-- **TXN-36** — Oracle parity target (M1.9): randomized
+- **TXN-36** — Oracle parity target: randomized
   write-then-open-nested-read-then-read sequences, including reads of uncommitted
   state, and replays of the milli/hannoy fan-out, must match the fork observed
   through heed. A nested-**write** attempt is **unrepresentable in the API**
@@ -673,7 +661,7 @@ semantics exactly (TXN-26). No Phase-3.8 seam is opened here beyond leaving the
 
 ## §6 — The write-txn value-borrow contract (Rust soundness)
 
-This is the likeliest soundness bug outside the reader table (M0.4/1.4). A
+This is the likeliest soundness bug outside the reader table. A
 `get` during a write txn may return bytes from a **dirty page in heap memory**
 (default mode) or from the **writable mmap** (WRITE_MAP) — not the read-only
 map. The contract below defines exactly when a borrow is valid and how the
@@ -971,7 +959,7 @@ spilling bullet there.)
   REC-12). Rationale and consequences:
   - **Observably identical** to the fork's live-map writes through the heed /
     oracle surface: same `put`/`get`/`put_reserved`/iteration results, same
-    durability. `env_writemap_*` differential tests (M1.10) confirm parity.
+    durability. `env_writemap_*` differential tests confirm parity.
   - **Preserves every invariant unchanged:** the value-borrow contract (§6.3),
     nested-reader reads of dirty pages (§5), and abort-by-drop all operate on the
     heap store exactly as the default mode — so `WRITE_MAP` needs **no map
@@ -999,7 +987,7 @@ spilling bullet there.)
     entry — both are observably identical to the fork through the heed /
     oracle surface.
 
-- **TXN-45b — in-place realization (ADR-0021, accepted 2026-10-02; spike, then production hardening, merged PR #88).**
+- **TXN-45b — in-place realization (ADR-0021).**
   When the backing brokers mutable map slices (`Backing::dirty_in_map`,
   implemented by the writable-map backing only), the write txn realizes every
   dirty frame **in the writable map at the frame's own page number**: COW
@@ -1104,7 +1092,7 @@ spilling bullet there.)
   dropped). This mirrors SPEC 01 §S3's "after commit/abort the pointer is
   invalid."
 
-### §6.6 — miri obligations (M1.4)
+### §6.6 — miri obligations
 
 - **TXN-49** — `cargo miri test -p zerodb-core` MUST exercise, on the **heap
   dirty-page store** (writemap uses real mmap and is not miri-able — a heap-backed
@@ -1254,7 +1242,7 @@ spilling bullet there.)
 
 ## §9 — Commit pipeline (one function, crash hooks between steps)
 
-The commit ordering is the crash-safety invariant (M1.4). It is encoded in
+The commit ordering is the crash-safety invariant. It is encoded in
 **one** function with **crash-injection hooks** between each numbered step
 (M1.11 kills / tears at each hook). SPEC 06 defines the invariant guaranteed at
 every hook; this section defines the steps and their ordering. Both write modes
@@ -1433,7 +1421,7 @@ added 2026-10-17).** TXN-40 (nested write unsupported, D-003) is referenced from
   public API**: zerodb exposes **no** nested-write entry point at all — no
   `Env::nested_write_txn`, no `RwTxn::nested` — which is a strictly stronger
   form of the original "clean error" clause (nothing to call, so never a
-  panic and never partial state). The heed-zerodb adapter (M1.13) likewise
+  panic and never partial state). The heed-zerodb adapter likewise
   surfaces no nested-write entry point and no error variant is needed. heed
   itself keeps only `RwTxn::nested` `pub(crate)`: its `Env::nested_write_txn`
   is public (heed 0.22.1 and Meilisearch's fork), so a consumer calling it

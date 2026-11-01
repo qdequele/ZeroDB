@@ -1,30 +1,14 @@
-# SPEC 00 — API surface contract (Phase 0.1 deliverable)
+# SPEC 00 — API surface contract
 
-> Revised 2026-10-05: WRITE_MAP row notes the in-place realization (ADR-0021).
-> The third table was re-verified against `crates/zerodb` and
-> `crates/heed-zerodb` as of this date; no surface change was needed.
+This document is the heed API contract ZeroDB reproduces. It inventories every
+`heed` item used by the five consumers below, read from their call sites, and
+maps each item to the LMDB primitive it wraps and to the milestone that
+implemented it. `heed-zerodb` satisfies every MUST row; the oracle re-runs
+through the adapter and the milli and hannoy test suites check it.
 
-Status: **DONE** — 2026-07-15.
-
-> **M1.13 (2026-07-17):** the `heed-zerodb` adapter now **satisfies the full MUST
-> table over ZeroDB's native API** — the integration rows 23–26 (registry /
-> `EnvClosingEvent` / `Env: Clone`), 51–54 (`remap_*` / codecs /
-> `DefaultComparator` / error taxonomy), and 61 (the `WithoutTls`/`PutFlags`/…
-> type surface + `BytesEncode`/`BytesDecode`/`BoxedError` re-exported verbatim)
-> are realized by `crates/heed-zerodb`, and the read/write/env rows 1–22, 27–49,
-> 55–60 are wired through it (verified by the oracle re-run through the adapter
-> and by the milli+hannoy compile gate, ADR-0003). The read-key taxonomy of
-> rows 30/47/48 (empty key → `BadValSize`) is re-imposed at the adapter boundary
-> (SPEC 03 §2.1). The WithTls rows stay a compile-only shim (Phase 2, OQ5).
-
-This document is the frozen heed API contract that ZeroDB Phase 1 must reproduce.
-It is derived by inventorying every `heed` item used by the five consumers below,
-reading the call sites (not guessing), and mapping each item to the LMDB
-primitive it wraps and to the Phase 1 milestone that must implement it.
-
-Every **MUST** row (a heed item at least one consumer uses) is traceable to a
-Phase 1 milestone (1.1–1.13). Items heed exposes but no consumer uses are in the
-second table, marked SHOULD (Phase 2) or WON'T (with justification).
+Every **MUST** row is a heed item at least one consumer uses. Items heed
+exposes but no consumer uses are in the second table, marked SHOULD or WON'T
+(with justification).
 
 ## Pinned consumer SHAs (the frozen contract)
 
@@ -71,7 +55,7 @@ cellulite is driven by milli's `WithoutTls` env and generic txn refs).
 | 5 | `.max_readers(u32)` | ms (index_map only; `MEILI_EXPERIMENTAL_INDEX_MAX_READERS`, default 1024) | `mdb_env_set_maxreaders` | Sizes the reader table. Only one call site. Bounded at open: values above `MAX_READERS_LIMIT` (2^20) are `Io(InvalidInput)` — the table allocates one cache-padded slot per reader eagerly (SPEC 04 TXN-14; 2026-09-09, security review M6). | 1.8 |
 | 6 | `.flags(EnvFlags)` (unsafe) | milli, ms | `mdb_env_set_flags` bits at open | Only two flag *values* ever passed — rows 8, 9. Call is `unsafe`. | 1.10 |
 | 7 | `unsafe { options.open(path) }` | milli, ms, arroy(t), hannoy(t) | `mdb_env_create` + `mdb_env_open` | Directory env (`data.mdb`/`lock.mdb`); never `NO_SUB_DIR`. **ADR-0010 / D-012:** the adapter satisfies the **`data.mdb` half** of this convention — an env opened through `heed-zerodb` materializes as `<dir>/data.mdb` (via `zerodb::EnvOpenOptions::data_file_name`; the native engine's default stays `zerodb.dat`). Required because consumers hardcode the name outside heed (Meilisearch compaction/snapshot paths). **ADR-0023:** the **`lock.mdb` half** is satisfied too — the lock file is **on by default**, so an adapter env dir holds `data.mdb` and `lock.mdb`, as an LMDB env dir does (native engine: `zerodb.dat` + `zerodb.lock`; any other data-file name `<name>-lock`), and other processes can open the env at the same time. The opt-out is heed's `NO_LOCK` (adapter; reported by `Env::flags()`) or `lock_file(false)` (native engine), which creates no lock file and leaves the env single-process; a `READ_ONLY` open on read-only media also proceeds without one (ADR-0023 amendment 17). Contents are still ZeroDB's own format (D-002) — the `ZDB1` magic makes real LMDB reject the file loudly rather than misread it. `Env::path()` still returns the directory. | 1.2, ADR-0010 |
-| 8 | `EnvFlags::WRITE_MAP` | ms (index_map, gated on experimental writemap) | `MDB_WRITEMAP` | Writes go through the writable mmap instead of `malloc`+`pwrite`. Interacts with the dirty-page value-borrow model (SPEC 04) and `put_reserved` (row 35). Optional but present. Since ADR-0021 (PR #88) ZeroDB realizes it truly in-place — dirty frames live in the writable map from allocation (SPEC 04 TXN-45b, SPEC 01 §S7). | 1.10 |
+| 8 | `EnvFlags::WRITE_MAP` | ms (index_map, gated on experimental writemap) | `MDB_WRITEMAP` | Writes go through the writable mmap instead of `malloc`+`pwrite`. Interacts with the dirty-page value-borrow model (SPEC 04) and `put_reserved` (row 35). Optional but present. Since ADR-0021 ZeroDB realizes it truly in-place — dirty frames live in the writable map from allocation (SPEC 04 TXN-45b, SPEC 01 §S7). | 1.10 |
 | 9 | `EnvFlags::PREV_SNAPSHOT` | milli (`Index::rollback` only) | `MDB_PREVSNAPSHOT` | Opens the env on the **older** of the two meta pages — directly the meta double-buffer (SPEC 04). Used to roll an index back one committed txn. | 1.2, 1.10 |
 | 10 | `Env::open_database::<KC,DC>(txn, Some(name))` | ms (upgrades, meilitool), cellulite | `mdb_dbi_open` (no create) | Opens an existing named DB; `None` for the returned dbi means absent. cellulite opens 4 named DBs per instance (`{prefix}-item/-cell/-update/-metadata`). | 1.6 |
 | 11 | `Env::create_database(&mut wtxn, name)` | milli, arroy, hannoy, cellulite | `mdb_dbi_open` + `MDB_CREATE` | arroy/hannoy always create the **unnamed** DB (`None`); milli creates ~27 named DBs; cellulite creates 4 **named** DBs per instance (name-prefixed, so several cellulite indexes share one env). Create-in-write-txn. No `DatabaseFlags` argument (row 50). | 1.6 |
@@ -144,7 +128,7 @@ cellulite is driven by milli's `WithoutTls` env and generic txn refs).
 | `RoTxn::id()` / `RwTxn::id()` | `mdb_txn_id` | **LANDED M2.7** | Not used by any consumer. **M2.7:** `heed_zerodb::RoTxn::id()` (inherited by `RwTxn` through its `Deref`) returns the pinned snapshot txnid for a read txn, the id-to-be-published for a write txn, and the parent's id for a nested read txn. Agrees by construction with what `Env::reader_list()` reports for that reader's slot (asserted in `heed-zerodb/tests/phase2_extensions.rs`). |
 | `Database::get_or_put*` (4 variants) | `mdb_get`+`mdb_put` | SHOULD — **DEFERRED** (left open by the M2.7 sweep, 2026-07-20) | Not used; pure convenience wrappers over `get` + `put` with no engine behavior of their own, so nothing in the engine blocks them. Deferred because their exact heed semantics — what each returns when the key is present, and how `get_or_put_reserved*` composes `ReservedSpace` with `NO_OVERWRITE` — must be **read out of heed 0.22.1, not guessed** (CONTRIBUTING.md rule 1), and a wrapper that silently differs from heed's is worse than an absent one. Cheap to land in a follow-up once that reading is done. |
 | `Database::rev_iter` / `rev_iter_mut` / `range_mut` / `rev_range_mut` / `rev_prefix_iter_mut` | reverse/mut cursors | **LANDED** (present since M1.13; confirmed by the M2.7 sweep) | Consumers use only `rev_range`, `rev_prefix_iter`, `iter_mut`, `prefix_iter_mut` (rows 43–46). The remaining variants share the same machinery and were implemented alongside them; all five exist on `heed_zerodb::Database`. |
-| `Database::get_lower_than` / `get_greater_than_or_equal_to` | neighbor seeks | **LANDED** (present since M1.3/M1.13; confirmed by the M2.7 sweep) | The other two of the four neighbor-seek variants; only `get_greater_than` and `get_lower_than_or_equal_to` are used (rows 47/48). All four exist in the core cursor and on the adapter, and all four are asserted against a custom comparator in `zerodb/tests/custom_comparator.rs` (M2.4). |
+| `Database::get_lower_than` / `get_greater_than_or_equal_to` | neighbor seeks | **LANDED** (present since M1.3/M1.13; confirmed by the M2.7 sweep) | The other two of the four neighbor-seek variants; only `get_greater_than` and `get_lower_than_or_equal_to` are used (rows 47/48). All four exist in the core cursor and on the adapter, and all four are asserted against a custom comparator in `zerodb/tests/custom_comparator.rs`. |
 | `Database::get_duplicates` | `mdb_cursor_get(MDB_GET_MULTIPLE/NEXT_DUP)` | WON'T (Phase 1) | DUPSORT-only; no consumer uses DUPSORT (see below). |
 | `Database::delete_one_duplicate` | `mdb_cursor_del(0)` on a dup | WON'T (Phase 1) | DUPSORT-only; unused. |
 | `DatabaseFlags::DUP_SORT`, `DUP_FIXED` | `MDB_DUPSORT` / `MDB_DUPFIXED` | WON'T Phase 1 / reclassify M1.7 as SHOULD | **No consumer creates a DUPSORT DB.** All multi-value data is modeled as composite keys + roaring-bitmap values. See Findings §B — this reshapes M1.7. |
@@ -152,9 +136,9 @@ cellulite is driven by milli's `WithoutTls` env and generic txn refs).
 | `DatabaseFlags::REVERSE_KEY` / `REVERSE_DUP` / `DUP_SORT`+integer combos | `MDB_REVERSEKEY` etc. | WON'T | Not used. |
 | `Comparator` / `LexicographicComparator` / `IntegerComparator` / custom `mdb_set_compare` | `mdb_set_compare` / `mdb_set_dupsort` | **LANDED M2.4** (key); `mdb_set_dupsort` → 2.8 | No consumer sets a custom key comparator; all rely on `DefaultComparator` (row 53). **M2.4:** exposed as a **safe Rust trait** (`zerodb::Comparator`, object-safe, `Send + Sync`, plus `FnComparator` for the closure form) rather than LMDB's raw `MDB_cmp_func` pointer, registered per named database at open/create. Settable on **named DBs only** — the main/unnamed DB is the named-DB catalog and the GC tree is BE-txnid-keyed, so both stay memcmp unconditionally (SPEC 03 §2.0). **Defect found and fixed:** the adapter's `DatabaseOpenOptions::key_comparator::<C>()` type parameter was accepted and then *silently ignored* since M1.13 — every database was memcmp regardless. It now reaches the engine (`DefaultComparator` still short-circuits to the inlined memcmp path, so the consumer-facing default is bit-for-bit unchanged). **Hazard:** the comparator is not persisted (D-014). **Scope left open:** compacting copy refuses a custom-comparator env; `check`/`dump`/`load` stay memcmp-defined. The **dupsort** comparator is milestone 2.8, out of scope. Tests: `zerodb/tests/custom_comparator.rs` (13), `heed-zerodb/tests/phase2_extensions.rs`. |
 | `EncryptedEnv` / `EncryptedDatabase` / `EncryptedDatabaseOpenOptions` | LMDB 1.0 page encryption | WON'T Phase 1 | Encryption-at-rest is Phase 3.9. |
-| `env_closing_event(path)` free function | global registry lookup | **LANDED as a documented `None`** (M1.13; confirmed by the M2.7 sweep) | Consumers use `prepare_for_closing()` (row 23), which returns the event directly; the path-lookup form is unused. The function exists and always returns `None`: ZeroDB's env registry is keyed for the `EnvAlreadyOpened` check (TXN-51) and holds no path→closing-event map, and inventing one to serve an API no consumer calls would add a global lifetime-coupled structure for nothing. Unlike `clear_stale_readers` (M2.2), `None` here is a genuine "not provided", not a semantically-correct answer — noted so a future maintainer can tell the two no-ops apart. |
+| `env_closing_event(path)` free function | global registry lookup | **LANDED as a documented `None`** (M1.13; confirmed by the M2.7 sweep) | Consumers use `prepare_for_closing()` (row 23), which returns the event directly; the path-lookup form is unused. The function exists and always returns `None`: ZeroDB's env registry is keyed for the `EnvAlreadyOpened` check (TXN-51) and holds no path→closing-event map, and inventing one to serve an API no consumer calls would add a global lifetime-coupled structure for nothing. Unlike `clear_stale_readers`, `None` here is a genuine "not provided", not a semantically-correct answer — noted so a future maintainer can tell the two no-ops apart. |
 | `lmdb_version()` / `LmdbVersion` | `mdb_version` | WON'T | LMDB-specific version reporting; ZeroDB reports its own identity. |
-| `EnvFlags` other than `WRITE_MAP`/`PREV_SNAPSHOT` (`NO_SYNC`, `NO_META_SYNC`, `MAP_ASYNC`, `NO_SUB_DIR`, `NO_LOCK`, `NO_READAHEAD`, `NO_TLS`, `NO_MEM_INIT`, …) | corresponding `MDB_*` | MUST/SHOULD/WON'T — see SPEC 01 | No consumer passes them. Durability flags map onto the ZeroDB writer in M1.10; `NO_TLS` is the implicit default. `NO_LOCK` is no longer a WON'T flag: it is MUST since ADR-0023 amendment 17 (the adapter maps it to `lock_file(false)`, no lock file is created, and `Env::flags()` reports it); the WON'T flags are `NO_SUB_DIR` (refused at open, D-016) and `FIXED_MAP`. Full classification lives in `docs/SPEC/01-flags.md` (milestone 0.2). |
+| `EnvFlags` other than `WRITE_MAP`/`PREV_SNAPSHOT` (`NO_SYNC`, `NO_META_SYNC`, `MAP_ASYNC`, `NO_SUB_DIR`, `NO_LOCK`, `NO_READAHEAD`, `NO_TLS`, `NO_MEM_INIT`, …) | corresponding `MDB_*` | MUST/SHOULD/WON'T — see SPEC 01 | No consumer passes them. Durability flags map onto the ZeroDB writer in M1.10; `NO_TLS` is the implicit default. `NO_LOCK` is no longer a WON'T flag: it is MUST since ADR-0023 amendment 17 (the adapter maps it to `lock_file(false)`, no lock file is created, and `Env::flags()` reports it); the WON'T flags are `NO_SUB_DIR` (refused at open, D-016) and `FIXED_MAP`. Full classification lives in `docs/SPEC/01-flags.md`. |
 
 
 ## Third table — ZeroDB extensions (APIs heed/LMDB do **not** have)
@@ -182,7 +166,7 @@ is the frozen contract), and code that never calls them behaves exactly as befor
 
 ## Findings that affect the plan
 
-### A. Nested-transaction verdict (milestone 1.9)
+### A. Nested-transaction verdict
 
 **No consumer opens a nested WRITE transaction.** `nested_write_txn` /
 `RwTxn::nested` has zero call sites across meilisearch, milli, arroy and hannoy.
@@ -219,7 +203,7 @@ this pattern and should be designed with these five call sites as its target.
 
 (Listed for the maintainer; this document does **not** edit the roadmap.)
 
-1. **DUPSORT/DUPFIXED (M1.7) is not used by any consumer.** No `DatabaseFlags`
+1. **DUPSORT/DUPFIXED is not used by any consumer.** No `DatabaseFlags`
    of any kind is ever passed; there is no `DUP_SORT`, `DUP_FIXED`,
    `INTEGER_KEY`, `get_duplicates`, `delete_one_duplicate`, or `APPEND_DUP`
    anywhere in milli, arroy, or hannoy. milli models facet/word-docids as
