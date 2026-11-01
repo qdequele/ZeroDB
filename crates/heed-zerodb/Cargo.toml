@@ -19,7 +19,7 @@ name = "heed-zerodb"
 version = "0.22.1"
 # Never published (ADR-0003 OQ1, ADR-0013): consumed only through crates/heed-shim.
 publish = false
-description = "heed 0.22.1 API surface re-implemented over the ZeroDB engine (the heed-shim target)."
+description = "The heed 0.22.1 API over the ZeroDB engine, so heed users can switch from LMDB without code changes."
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
