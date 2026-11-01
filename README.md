@@ -95,40 +95,22 @@ More in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Performance
 
-**In Meilisearch, ZeroDB runs at LMDB's speed.** On AWS Graviton4, indexing
-the movies dataset takes 2 % longer and search is 1 % faster; hannoy builds its
-vector index 3–6 % faster and searches 6–17 % faster
-([Graviton4 run](benches/results/2026-10-15-meilisearch-v1.53.1-graviton-xlarge.md);
-an earlier [x86-64 run](benches/results/archive/2026-10-05-meta-annex-real-case.md)
-has the same picture). The remaining gaps are in micro-operations those
-consumers use little, such as full scans and empty commits; see
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+The goal is LMDB's speed on the workloads Meilisearch and hannoy run, and
+earlier runs put it there. The benchmarks are being re-run on a quiet AWS
+Graviton4 host, and the reports will be published in
+[`benches/results/`](benches/results/README.md). Three suites compare ZeroDB
+with LMDB:
 
-**Against other embedded stores**, no engine wins everything. LMDB and ZeroDB
-answer reads fastest, and their readers stay fast while another thread writes.
-fjall and RocksDB, which are LSM trees, write and load much faster and use less
-disk, but pause writes now and then to reorganize their files.
+- **Operation by operation:** `just bench` runs a criterion ladder where
+  adjacent steps differ by one mechanism, so a gap points at its cause.
+- **Against other embedded stores:** [`benches/kv-compare`](benches/kv-compare/README.md)
+  runs ZeroDB, LMDB, fjall, RocksDB, redb and SQLite on the same YCSB-style
+  workloads, in and out of memory.
+- **In real consumers:** Meilisearch and hannoy built once on LMDB and once on
+  ZeroDB ([docs/maintainers/CONSUMER-GATE.md](docs/maintainers/CONSUMER-GATE.md)).
 
-Thousands of operations per second, 10 M records of 16-byte keys and 100-byte
-values, data in memory, AWS Graviton4 (higher is better, best in **bold**):
-
-| | ZeroDB | LMDB | fjall | RocksDB | redb | SQLite |
-|---|---:|---:|---:|---:|---:|---:|
-| Read one key | 756 | **844** | 240 | 344 | 542 | 290 |
-| Read, 8 threads, while one thread writes | 1,900 | **2,400** | 346 | 408 | 612 | 411 |
-| Write one key, flushed to disk | 5.2 | 3.8 | 15.2 | 11.2 | 3.8 | **16.2** |
-| Write 1,000 keys at a time | 64 | 75 | 280 | **504** | 65 | 27 |
-| Load the data set | 141 | 176 | 409 | **600** | 146 | 19 |
-
-<picture><source media="(prefers-color-scheme: dark)" srcset="benches/results/2026-10-27-kv-compare/charts/mixed-threads-small.dark.svg"><img alt="Reads per second while one thread writes, data in memory, by number of reader threads" src="benches/results/2026-10-27-kv-compare/charts/mixed-threads-small.light.svg"></picture>
-
-Against LMDB, ZeroDB is 10–20 % slower on reads that fit in memory, equal on
-reads larger than memory, faster on writes flushed to disk, and 15–20 % slower
-at loading. With the opt-in that skips page validation (LMDB never validates),
-it reads one key at 870k per second, ahead of LMDB. The data-larger-than-memory
-results, latencies, disk use, a 30-minute stability test and the method are in
-the [full report](benches/results/2026-10-27-kv-compare/report.md); the harness
-is [`benches/kv-compare`](benches/kv-compare/README.md).
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md) explains the method and lists the
+known gaps.
 
 ## Documentation
 

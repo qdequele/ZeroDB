@@ -401,7 +401,7 @@ ladder rung regresses beyond 3 %.
 ### Measurements (2026-10-31)
 
 Graviton4 `c8g.xlarge`, report
-`benches/results/archive/2026-10-31-stamp-cache-graviton.md`. `ycsb_a_census`, 10M
+the 2026-10-31 "stamp cache graviton" run. `ycsb_a_census`, 10M
 keys (1.33 GB, ~325k pages of 4 KiB), p50 over two reps:
 
 | | LMDB | before | after | trusted file |

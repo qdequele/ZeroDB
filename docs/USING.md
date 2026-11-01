@@ -98,7 +98,7 @@ faults, exactly as LMDB does with `MDB_NORDAHEAD`. It matters when the data does
 not fit in memory and reads are random. In one bigger-than-RAM test, an env
 without the flag read about 10 GB from disk in 60 s for a 1.5 GB database,
 because every fault pulled in a readahead window nobody needed
-([report](../benches/results/archive/2026-09-29-ycsb-bigger-than-ram.md)).
+(2026-09-29 benchmark run).
 
 The flag applies to the whole environment. If one environment holds both
 random-access data (such as a vector graph) and data read in sequential scans,
@@ -185,8 +185,8 @@ build tuning belongs to the consumer, not to ZeroDB.
   `RUSTFLAGS`, so a win over LMDB may just be a win any Rust code gets on that
   CPU.
 
-The benchmark reports in [`benches/results/`](../benches/results/) record which
-build setting each run used.
+Each benchmark report in [`benches/results/`](../benches/results/README.md)
+records the build setting its run used.
 
 ## Not available yet
 

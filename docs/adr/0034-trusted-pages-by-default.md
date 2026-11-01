@@ -26,10 +26,10 @@ Graviton4 `c8g.xlarge`, same binary, validating vs trusting:
 
 | Path | Validating | Trusting | Source |
 |---|---:|---:|---|
-| Full scan (`scan/full/fwd`, `rev`) ÷ LMDB | 1.47× | 1.05–1.09× | `benches/results/archive/2026-10-31-build-profiles-and-scans-graviton.md` |
+| Full scan (`scan/full/fwd`, `rev`) ÷ LMDB | 1.47× | 1.05–1.09× | the 2026-10-31 "build profiles and scans graviton" run |
 | Full scan over a 300 MB tree (`scan/full/big`) ÷ LMDB | 1.60× | 1.03× | same |
 | Prefix bucket (`scan/prefix/bucket`) ÷ LMDB | 1.27× | 1.08× | same |
-| Random get p50, 10M keys (LMDB 0.96–1.08 µs) | 1.23 µs | 1.12 µs | `benches/results/archive/2026-10-31-stamp-cache-graviton.md` |
+| Random get p50, 10M keys (LMDB 0.96–1.08 µs) | 1.23 µs | 1.12 µs | the 2026-10-31 "stamp cache graviton" run |
 | Get in a 50/50 read/update mix p50 (LMDB 1.13 µs) | 1.39 µs | 1.27 µs | same |
 | Values in overflow pages (`get/val/v4k`, `v2page`) ÷ LMDB, bench server | 1.29×, 1.27× | 0.91×, 0.89× | ADR-0014, overflow amendment |
 

@@ -14,7 +14,7 @@
   180s 2/0, fuzz-quick 2.1M clean. Adversarial spec-review found no technical
   blockers; its should-fix/nit items are addressed in the branch.
 - Real-case check (2026-10-05, three columns LMDB / before `8b066a6` / after,
-  `benches/results/archive/2026-10-05-meta-annex-real-case.md`): YCSB on Graviton4 NVMe
+  the 2026-10-05 "meta annex real case" run): YCSB on Graviton4 NVMe
   durable B **1.078×** before (258k vs 239k ops/s, now 1.08× LMDB), no-sync
   0.98–1.04×; on the x86 bench server no-sync **1.03–1.07×**, durable flat
   (SATA-flush-bound). Write p50 −14% to −25% in every configuration on both

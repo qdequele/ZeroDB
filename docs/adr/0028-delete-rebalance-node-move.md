@@ -16,7 +16,7 @@ Deletes are ZeroDB's largest remaining write gap against LMDB:
 
 | measurement | ZeroDB vs LMDB |
 |---|---|
-| criterion ladder `del/bulk/half`, `del/bulk/all` (50k ascending keys, 256 B values, 4 KiB pages, Linux x86-64; `benches/results/archive/2026-09-28-evening-bench-server-linux-x86.md`) | 1.75× the time |
+| criterion ladder `del/bulk/half`, `del/bulk/all` (50k ascending keys, 256 B values, 4 KiB pages, Linux x86-64; the 2026-09-28 "evening bench server linux x86" run) | 1.75× the time |
 | criterion ladder `del/cursor/drain` (same run) | 2.72× the time |
 | criterion ladder `del/churn/reinsert` (same run) | 1.40× the time |
 | crud-bench deletes: 500k random 26-byte keys, ~1.5 KB values, 16 KiB pages, macOS M1, `WRITE_MAP \| MAP_ASYNC \| NO_SYNC` (ZeroDB also in trusted-file mode), median of 3 rounds | **0.55×** the throughput |
@@ -339,7 +339,7 @@ Each stage carries its own three-column report.
 ## Implementation (2026-10-18)
 
 Landed in one stage after the spike's profile confirmed the premise
-(`benches/results/archive/2026-10-18-delete-rebalance-node-move-mac.md`): before the
+(the 2026-10-18 "delete rebalance node move mac" run): before the
 change, `rebalance` was 68 % of `del/bulk/half`'s delete time and the
 separator remove + re-insert alone 31 %.
 

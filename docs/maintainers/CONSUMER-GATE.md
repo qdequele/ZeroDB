@@ -119,7 +119,7 @@ Caveats that apply to any number these produce:
 
 - A laptop run is indicative. The representative numbers come from a quiet
   Linux server or the Graviton target (e.g.
-  `benches/results/archive/2026-10-05-meta-annex-real-case.md`, an x86-64 bench
+  the 2026-10-05 "meta annex real case" run, an x86-64 bench
   server); see also `docs/PERFORMANCE.md`.
 - The workloads include HTTP overhead and the indexer's own CPU work; the
   storage engine is one span family among many. Read the per-span table, not

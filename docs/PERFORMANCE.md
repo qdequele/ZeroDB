@@ -42,32 +42,34 @@ time ratio.
   hannoy's own benchmarks, each built once against LMDB and once against
   ZeroDB ([maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md)).
 
-Reports are in [`benches/results/`](../benches/results/) (index in its README).
-Every experiment ever tried, kept or reverted, is one line in
+The benchmarks are being re-run on a quiet Graviton4 host; new reports will go
+in [`benches/results/`](../benches/results/README.md). The figures below are
+the last measured values, from reports that were removed from the tree and are
+still in git history (commit `e0fd466`). Every experiment ever tried, kept or reverted, is one line in
 [`perf-ledger.jsonl`](../benches/results/perf-ledger.jsonl).
 
 ## Where ZeroDB stands
 
 Default options unless stated. "Trusted mode" is the opt-in that skips page
-validation (ADR-0014). Source keys:
+validation (ADR-0014). Source keys name the run each figure comes from:
 
-| Key | Report |
+| Key | Run |
 |---|---|
-| E | [full ladder and consumers, x86-64, CGU16](../benches/results/archive/2026-09-28-evening-bench-server-linux-x86.md) |
-| V | [read rungs after the validated-pages cache, x86-64, CGU1](../benches/results/archive/2026-09-30-validation-cache.md) |
-| M | [YCSB on Graviton4 NVMe, and Meilisearch](../benches/results/archive/2026-10-05-meta-annex-real-case.md) |
-| S | [YCSB under a 2 GB cap after spilling](../benches/results/archive/2026-09-30-bounded-dirty-memory.md) |
-| P | [public YCSB suite, Graviton4 NVMe (indicative)](../benches/results/archive/2026-09-30-public-suite-nvme.md) |
-| G | [full ladder on Graviton4, lock file on and off](../benches/results/archive/2026-10-13-multi-process-stage3-graviton.md) |
-| G2 | [env rungs after the lock file is rebuilt in place, Graviton4](../benches/results/archive/2026-10-15-lock-file-in-place-graviton.md) |
-| C | [Meilisearch v1.53.1 and hannoy on Graviton4](../benches/results/2026-10-15-meilisearch-v1.53.1-graviton-xlarge.md) |
-| D | [delete rungs and crud-bench, laptop (indicative)](../benches/results/archive/2026-10-18-delete-rebalance-node-move-mac.md) |
-| Q | [delete path, three-column A/B on Graviton4](../benches/results/archive/2026-10-31-delete-path-cursor.md) |
-| X | [scans and batch deletes, Graviton4](../benches/results/archive/2026-10-19-crud-scan-count-and-batch-delete.md) |
-| SC | [validated-pages cache sized to the file, Graviton4](../benches/results/archive/2026-10-31-stamp-cache-graviton.md) |
-| BP | [ladder under four build profiles, and scans validating vs trusted, Graviton4](../benches/results/archive/2026-10-31-build-profiles-and-scans-graviton.md) |
-| W | [write txns reuse their containers, Graviton4](../benches/results/archive/2026-10-31-writer-carry-graviton.md) |
-| WM | [bulk writes with `WRITE_MAP`, before and after the per-page dirty bits, Graviton4](../benches/results/archive/2026-10-31-writemap-dirty-bits-graviton.md) |
+| E | full ladder and consumers, x86-64, CGU16, 2026-09-28 |
+| V | read rungs after the validated-pages cache, x86-64, CGU1, 2026-09-30 |
+| M | YCSB on Graviton4 NVMe, and Meilisearch, 2026-10-05 |
+| S | YCSB under a 2 GB cap after spilling, 2026-09-30 |
+| P | public YCSB suite, Graviton4 NVMe (indicative), 2026-09-30 |
+| G | full ladder on Graviton4, lock file on and off, 2026-10-13 |
+| G2 | env rungs after the lock file is rebuilt in place, Graviton4, 2026-10-15 |
+| C | Meilisearch v1.53.1 and hannoy on Graviton4, 2026-10-15 |
+| D | delete rungs and crud-bench, laptop (indicative), 2026-10-18 |
+| Q | delete path, three-column A/B on Graviton4, 2026-10-31 |
+| X | scans and batch deletes, Graviton4, 2026-10-19 |
+| SC | validated-pages cache sized to the file, Graviton4, 2026-10-31 |
+| BP | ladder under four build profiles, and scans validating vs trusted, Graviton4, 2026-10-31 |
+| W | write txns reuse their containers, Graviton4, 2026-10-31 |
+| WM | bulk writes with `WRITE_MAP`, before and after the per-page dirty bits, Graviton4, 2026-10-31 |
 | L | the perf ledger line for the change |
 
 E, V, M, S and P predate the multi-process lock file, which has been on by
@@ -112,8 +114,8 @@ file, which made `scan/full/big` a further 13 % faster (SC).
 | … with the sequential-writes option | 0.66–0.77× | E |
 | Reserved puts, milli's document path (`put/api/reserved`) | 0.96× | E |
 | Random-order puts (`put/order/rand`) | 0.93× | E |
-| `APPEND` puts (`put/order/append`) | 1.21× | [report](../benches/results/archive/2026-10-31-write-cursor-split-append-graviton.md) |
-| Rewriting every value through the write cursor (`put/cursor/rewrite`) | 1.37× | [report](../benches/results/archive/2026-10-31-write-cursor-split-append-graviton.md) |
+| `APPEND` puts (`put/order/append`) | 1.21× | Graviton4, 2026-10-31 |
+| Rewriting every value through the write cursor (`put/cursor/rewrite`) | 1.37× | Graviton4, 2026-10-31 |
 | Bulk puts with `WRITE_MAP` (`put/order/seq`, `put/api/plain`, `commit/batch/n10k`) | 0.99–1.00× | WM |
 | Other rungs with `WRITE_MAP` (`put/order/rand`, `put/api/reserved`, `put/val/v4k`) | 1.07×, 1.12×, 1.12× | WM |
 | Overwrites that grow a value (`put/over/grow`) | 1.22× | E |

@@ -338,7 +338,7 @@ updated. New invariants for the lock file get fresh IDs.
   macOS). Stage 1's bench decides whether that is acceptable.
 - Measured at stage 3 on Graviton4 (EBS io2, ext4), lock file on against the
   release before it
-  (`benches/results/archive/2026-10-13-multi-process-stage3-graviton.md`): +29.8 ns
+  (the 2026-10-13 "multi process stage3 graviton" run): +29.8 ns
   per write commit, +6.8 ns per read txn begin/abort, +7 ns per `stat` (it
   reads the shared `T`), +155 µs per env create, and env reopen 17 → 347 µs,
   9.6× LMDB. With `NO_LOCK` every rung is flat.
@@ -353,7 +353,7 @@ updated. New invariants for the lock file get fresh IDs.
   *Resolved by amendment 20 (approved and implemented 2026-10-14):* on
   Graviton4, env reopen with the lock file on is 36.4 µs per open against
   LMDB's 37.8 µs (0.96×), and env create is 1.13 ms per env faster
-  (`benches/results/archive/2026-10-15-lock-file-in-place-graviton.md`).
+  (the 2026-10-15 "lock file in place graviton" run).
 - The macOS POSIX-lock pitfall (§3) and Linux-only futex give two writer-lock
   implementations to test on CI.
 - A bug here corrupts data rather than crashing — the reason for stage-1-first,
@@ -1213,7 +1213,7 @@ Terms used below:
     *Problem.* With the lock file on, an env open by a process that becomes
     the initializer costs about 330 µs more than with `NO_LOCK` on Linux
     (`env/open/reopen` 17 → 347 µs, 9.6× LMDB;
-    `benches/results/archive/2026-10-13-multi-process-stage3-graviton.md`). Every
+    the 2026-10-13 "multi process stage3 graviton" run). Every
     open of an env that no other process holds is such an open, which
     includes every open in a single-process consumer like Meilisearch. The
     cost is LCK-2's first step:

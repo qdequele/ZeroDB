@@ -524,7 +524,7 @@ which made ZeroDB's cursor-delete loop **4.2×** the fork's — where LMDB's is
 milli, four of them in the current indexer. Measured on the real server, the
 `prefix_iter_mut` + `del_current` loop in
 `post_processing::prefix::delete_prefixes` runs at **3.63×**
-(performance item **B8a**; `benches/results/archive/2026-09-10-meilisearch-delete-heavy-macos.md`).
+(performance item **B8a**; the 2026-09-10 "meilisearch delete heavy macos" run).
 The contract above is what the fork actually guarantees; the re-seek was never
 part of it.
 

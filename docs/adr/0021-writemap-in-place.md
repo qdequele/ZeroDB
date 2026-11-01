@@ -23,7 +23,7 @@ So `WRITE_MAP` today changes only the *commit* mechanism (memcpy into the map +
 memory and does **not** remove the per-page COW `Box` allocation + copy.
 
 The measured consequences (fresh Graviton4 NVMe, 2026-10-01; and
-`benches/results/2026-09-30-*.md`):
+the 2026-09-30 benchmark runs):
 
 - **Memory / page-cache competition.** A write txn's heap dirty set competes
   with the OS page cache under a cap. ADR-0017 spilling bounds it (YCSB B

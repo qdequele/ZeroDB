@@ -228,15 +228,13 @@ LMDB time; below 1 is faster):
 
 - **Meilisearch v1.53.1**, on this release's code (2026-10-05, x86-64 bench
   server): movies indexing 1.01×, incremental hackernews additions 0.99×, movies
-  search 0.94×.
-  [`benches/results/archive/2026-10-05-meta-annex-real-case.md`](benches/results/archive/2026-10-05-meta-annex-real-case.md)
+  search 0.94× (2026-10-05 run).
 - **hannoy v0.1.7-nested-rtxns** (2026-09-28): HNSW build 0.84–0.89×, search
-  0.95×.
-  [`benches/results/archive/2026-09-28-evening-bench-server-linux-x86.md`](benches/results/archive/2026-09-28-evening-bench-server-linux-x86.md)
+  0.95× (2026-09-28 run).
 - **YCSB** (rust-storage-bench, Graviton4 NVMe): durable YCSB B at 1.08× LMDB's
   throughput; with `WRITE_MAP`, no-sync YCSB at 1.6–1.7× default LMDB's
   throughput, still behind LMDB's own `WRITE_MAP`. The cross-engine results are
-  in [`benches/results/archive/2026-09-30-public-suite-nvme.md`](benches/results/archive/2026-09-30-public-suite-nvme.md).
+  from the 2026-09-30 public-suite run.
 
 Where ZeroDB stands per area, which LMDB techniques closed each gap, and what
 remains: [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md). Every
