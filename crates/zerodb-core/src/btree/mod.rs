@@ -328,7 +328,17 @@ pub(crate) fn node_view<'a>(
     pgno: u64,
     valid: Option<&ValidatedPages<'_>>,
 ) -> Result<NodeView<'a>, PageError> {
-    node_view_classified(src, psize, pgno, valid).map(|(view, _)| view)
+    // Kept apart from `node_view_classified` (not a wrapper over it): every
+    // keyed descent runs this body, and its code is left exactly as it was.
+    let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
+    let page = PageRef::new_trusted_psize(bytes, psize)?;
+    match page.page_type() {
+        PageType::Leaf => leaf_view_over(bytes, from_map, psize, pgno, valid).map(NodeView::Leaf),
+        PageType::Branch => {
+            branch_view_over(bytes, from_map, psize, pgno, valid).map(NodeView::Branch)
+        }
+        other => Err(wrong_type(other)),
+    }
 }
 
 /// [`node_view`] plus whether the page came from the committed map (`true`)
@@ -914,18 +924,28 @@ impl<'a, S: BorrowMut<PathStack>> Cursor<'a, S> {
     /// then descends leftmost. Does **not** read the leaf's own `ki`, so it is
     /// also used by `set_range` when parked past a leaf's end.
     fn ascend_next(&mut self) -> PosResult<'a> {
-        if self.next_leaf()? {
-            self.current()
-        } else {
-            Ok(None)
+        loop {
+            if self.stack().len() <= 1 {
+                self.eof = true;
+                return Ok(None);
+            }
+            self.stack_mut().pop();
+            let (bp, bki) = *self.stack().last().expect("len > 1");
+            let br = self.branch_at(bp)?;
+            if bki + 1 < br.num_keys() {
+                self.stack_mut().last_mut().expect("len > 1").1 = bki + 1;
+                let child = br.child_pgno(bki + 1);
+                self.descend_min(child)?;
+                return self.current();
+            }
         }
     }
 
-    /// Land on the first slot of the next leaf (`true`) or set `EOF`
-    /// (`false`), without reading an entry: [`ascend_next`](Self::ascend_next)
-    /// and [`advance_by`](Self::advance_by), which crosses leaves without
-    /// reading their entries.
-    #[inline]
+    /// [`ascend_next`](Self::ascend_next)'s walk without its final read: land
+    /// on the first slot of the next leaf (`true`) or set `EOF` (`false`), for
+    /// [`advance_by`](Self::advance_by), which crosses leaves without reading
+    /// their entries. Kept separate from `ascend_next` so the plain `next` path
+    /// is left exactly as it was.
     fn next_leaf(&mut self) -> Result<bool, PageError> {
         loop {
             if self.stack().len() <= 1 {
@@ -947,17 +967,27 @@ impl<'a, S: BorrowMut<PathStack>> Cursor<'a, S> {
     /// Symmetric to [`ascend_next`](Self::ascend_next): move to the last entry of
     /// the previous leaf, or go before-begin (uninitialized) if there is none.
     fn ascend_prev(&mut self) -> PosResult<'a> {
-        if self.prev_leaf()? {
-            self.current()
-        } else {
-            Ok(None)
+        loop {
+            if self.stack().len() <= 1 {
+                self.initialized = false;
+                self.stack_mut().clear();
+                return Ok(None);
+            }
+            self.stack_mut().pop();
+            let (bp, bki) = *self.stack().last().expect("len > 1");
+            let br = self.branch_at(bp)?;
+            if bki > 0 {
+                self.stack_mut().last_mut().expect("len > 1").1 = bki - 1;
+                let child = br.child_pgno(bki - 1);
+                self.descend_max(child)?;
+                return self.current();
+            }
         }
     }
 
-    /// Land on the last slot of the previous leaf (`true`) or go
-    /// before-begin (`false`), without reading an entry:
-    /// [`ascend_prev`](Self::ascend_prev) and [`retreat_by`](Self::retreat_by).
-    #[inline]
+    /// [`ascend_prev`](Self::ascend_prev)'s walk without its final read: land
+    /// on the last slot of the previous leaf (`true`) or go before-begin
+    /// (`false`), for [`retreat_by`](Self::retreat_by).
     fn prev_leaf(&mut self) -> Result<bool, PageError> {
         loop {
             if self.stack().len() <= 1 {
