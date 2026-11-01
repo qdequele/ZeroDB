@@ -18,6 +18,7 @@ mod key_bounds;
 mod multi_db_differential;
 mod name_edge_differential;
 mod nested_read_differential;
+mod put_reserved_short_write_parity;
 mod random_ops_proptest;
 mod read_differential;
 mod readers_full_differential;
