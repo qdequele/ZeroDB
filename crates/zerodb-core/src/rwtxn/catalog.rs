@@ -318,6 +318,24 @@ impl<'env> RwTxn<'env> {
         }
     }
 
+    /// A clean working record for named DB `dbi`, with its sequential-writes
+    /// setting resolved (ADR-0015).
+    pub(super) fn named_tree(
+        &self,
+        dbi: u32,
+        name: Box<[u8]>,
+        generation: Option<u32>,
+        rec: DBRecord,
+    ) -> NamedTree {
+        NamedTree {
+            name,
+            generation,
+            rec,
+            dirty: false,
+            seq: self.env.inner().sequential_writes_for(Some(dbi)),
+        }
+    }
+
     /// Create-or-open a named DB's catalog entry (SPEC 02 §6, `mdb_dbi_open` +
     /// `MDB_CREATE`): if the name already exists as an `F_SUBDATA` record, load
     /// it (idempotent open); if it exists as a plain user key, `Incompatible`;
@@ -351,14 +369,8 @@ impl<'env> RwTxn<'env> {
         match cat {
             Cat::Collision => Err(Error::Mdb(MdbError::Incompatible)),
             Cat::SubDb(rec) => {
-                let seq = self.env.inner().sequential_writes_for(Some(dbi));
-                self.open.slot(dbi).get_or_insert_with(|| NamedTree {
-                    name: name.into(),
-                    generation: None,
-                    rec,
-                    dirty: false,
-                    seq,
-                });
+                let t = self.named_tree(dbi, name.into(), None, rec);
+                self.open.slot(dbi).get_or_insert(t);
                 Ok(())
             }
             Cat::Missing => {
@@ -376,16 +388,8 @@ impl<'env> RwTxn<'env> {
                     self.errored = true;
                     return res.map(|_| ());
                 }
-                self.open.insert(
-                    dbi,
-                    NamedTree {
-                        name: name.into(),
-                        generation: None,
-                        rec: empty,
-                        dirty: false,
-                        seq: self.env.inner().sequential_writes_for(Some(dbi)),
-                    },
-                );
+                let t = self.named_tree(dbi, name.into(), None, empty);
+                self.open.insert(dbi, t);
                 Ok(())
             }
         }

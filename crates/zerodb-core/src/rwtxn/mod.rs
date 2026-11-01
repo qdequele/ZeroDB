@@ -769,16 +769,8 @@ impl<'env> RwTxn<'env> {
                     .expect("named dbi is assigned before a handle exists"),
             };
             let rec = resolve_named_record(self.source(), self.psize, &self.main_db, &name);
-            self.open.insert(
-                dbi,
-                NamedTree {
-                    name,
-                    generation: Some(db.generation()),
-                    rec,
-                    dirty: false,
-                    seq: self.env.inner().sequential_writes_for(Some(dbi)),
-                },
-            );
+            let t = self.named_tree(dbi, name, Some(db.generation()), rec);
+            self.open.insert(dbi, t);
         }
         Ok(TreeId::Named(dbi))
     }
