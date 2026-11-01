@@ -470,8 +470,8 @@ struct StreamLevel {
 }
 
 /// Push-style bottom-up B+tree bulk loader (bounded-memory compaction): the batch
-/// [`build_tree_into`] logic — same greedy fill targets, same
-/// [`fix_branch_groups`] last-two rebalance, same overflow spill rule — but
+/// `build_tree_into` logic — same greedy fill targets, same
+/// `fix_branch_groups` last-two rebalance, same overflow spill rule — but
 /// driven one entry at a time and emitting every finished page straight to a
 /// [`PageSink`]. Peak memory is one leaf scratch frame + one overflow scratch
 /// frame + at most **two child lists per branch level** (≲ 2 pages' worth of

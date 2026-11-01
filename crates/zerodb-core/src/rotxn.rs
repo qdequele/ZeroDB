@@ -1,4 +1,4 @@
-//! Read transactions and the heed-shaped read API over the [`btree`] cursor
+//! Read transactions and the heed-shaped read API over the [`btree`](crate::btree) cursor
 //! (SPEC 04 §3, SPEC 00 read-op rows).
 //!
 //! A [`RoTxn`] pins the env's **published snapshot** at open: it claims a
@@ -23,7 +23,7 @@
 //! `DBRecord` (root/depth/stats) is **not** stored in the [`RoTxn`] snapshot;
 //! it resolves lazily from the transaction's catalog view — the main tree,
 //! keyed by name, value = 48-byte `F_SUBDATA` record (SPEC 02 §6, SPEC 04
-//! TXN-10 step 3). This module owns that resolution ([`resolve_named_record`])
+//! TXN-10 step 3). This module owns that resolution (`resolve_named_record`)
 //! and the read API; the write side (create/clear/drop, catalog write-back)
 //! lives in [`crate::rwtxn`].
 
@@ -156,7 +156,7 @@ enum EnvHandle<'e> {
 }
 
 /// A read-only transaction: a consistent view of one committed snapshot
-/// (SPEC 04 §3). It holds the [`Env`] (borrowed or owned, [`EnvHandle`]),
+/// (SPEC 04 §3). It holds the [`Env`] (borrowed or owned, `EnvHandle`),
 /// which keeps the mapped file alive so every `&'txn [u8]` it lends stays
 /// valid (TXN-37); an `Arc` to the pinned [`Snapshot`] so its roots survive
 /// later commits (TXN-18); and its reader-table slot, which gates the

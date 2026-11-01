@@ -11,7 +11,7 @@
 //! each via the page-layer predicate ([`crate::page::MetaPage::validate`]), selecting
 //! the live snapshot (normal / `PREV_SNAPSHOT`), mapping the SPEC 06 REC error
 //! taxonomy onto [`Error`], the process registry with `EnvAlreadyOpened`, the
-//! refcounted [`EnvInner`] behind [`Env`] (`Clone`), and deferred close with
+//! refcounted `EnvInner` behind [`Env`] (`Clone`), and deferred close with
 //! [`EnvClosingEvent`] (SPEC 04 TXN-52/53). The inner also owns the
 //! MVCC reader table and the published-snapshot cell (`crate::readers`,
 //! SPEC 04 §3/§4, ADR-0006); the write path lives in `crate::rwtxn`.
@@ -53,7 +53,7 @@ pub struct MapView<'a> {
 /// the write methods keep their erroring defaults, so miri tests exercise
 /// mutation and in-txn reads, never commit I/O).
 ///
-/// Implementors must be `Send + Sync`: an [`EnvInner`] is shared across threads
+/// Implementors must be `Send + Sync`: an `EnvInner` is shared across threads
 /// through an `Arc` and read txns hand out `Send` borrows.
 pub trait Backing: Send + Sync {
     /// The current mapped bytes and logical map size, as one consistent pair
@@ -622,7 +622,7 @@ fn next_env_id() -> u64 {
 /// and the close signal. Torn down (map unmapped, fd closed, registry slot
 /// cleared, close event fired) only when the last [`Env`] / txn reference drops
 /// (TXN-52/53).
-pub struct EnvInner {
+pub(crate) struct EnvInner {
     /// Unique id for the registry-race guard.
     id: u64,
     /// Canonical directory path — the registry key and [`Env::path`] value.
@@ -1393,7 +1393,6 @@ impl EnvInner {
     /// validated-pages cache currently holds exactly the page version
     /// `(pgno, kind, stamp)` — `branch` selects the kind half of the key.
     /// Observes only; never part of the stable API.
-    #[doc(hidden)]
     #[must_use]
     pub fn stamp_cache_has(&self, pgno: u64, branch: bool, stamp: u64) -> bool {
         let kind = if branch {
@@ -1454,13 +1453,7 @@ impl EnvInner {
         self.durability.read_only
     }
 
-    /// Force durability of all prior commits — `mdb_env_sync(env, 1)`
-    /// (SPEC 01 §S6). Equivalent to [`EnvInner::sync`]`(true)`, and the only
-    /// form heed exposes (SPEC 00 second table).
-    ///
-    /// # Errors
-    ///
-    /// See [`EnvInner::sync`].
+    /// [`EnvInner::sync`]`(true)`, the only form heed exposes.
     pub fn force_sync(&self) -> Result<(), Error> {
         self.sync(true)
     }
@@ -1530,10 +1523,6 @@ impl EnvInner {
     }
 
     /// The actual on-disk file length (SPEC 00 row 18).
-    ///
-    /// # Errors
-    ///
-    /// Propagates the `fstat` I/O error.
     pub fn real_disk_size(&self) -> Result<u64, Error> {
         match self.backing.as_ref() {
             Some(b) => Ok(b.real_disk_size()?),
@@ -1562,10 +1551,6 @@ impl EnvInner {
     }
 
     /// `dup()` the data-file fd for raw snapshot streaming (SPEC 00 row 22).
-    ///
-    /// # Errors
-    ///
-    /// Propagates the `dup` I/O error.
     pub fn try_clone_inner_file(&self) -> Result<std::fs::File, Error> {
         match self.backing.as_ref() {
             Some(b) => Ok(b.try_clone_file()?),
@@ -1630,7 +1615,7 @@ impl Drop for EnvInner {
 /// A cheap, cloneable environment handle (SPEC 00 row 25, SPEC 04 TXN-50).
 ///
 /// `Clone` bumps the refcount; it never reopens the file. The underlying
-/// [`EnvInner`] is torn down only when the last clone (and every outstanding
+/// `EnvInner` is torn down only when the last clone (and every outstanding
 /// txn) drops.
 #[derive(Clone)]
 pub struct Env {
@@ -1646,8 +1631,29 @@ impl std::fmt::Debug for Env {
 impl Env {
     /// Access the shared inner state.
     #[must_use]
-    pub fn inner(&self) -> &Arc<EnvInner> {
+    pub(crate) fn inner(&self) -> &Arc<EnvInner> {
         &self.inner
+    }
+
+    /// The process-local published snapshot (test and harness hook).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        self.inner.snapshot()
+    }
+
+    /// The whole mapped data file (test and harness hook).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn backing_bytes(&self) -> &[u8] {
+        self.inner.backing_bytes()
+    }
+
+    /// Whether the validated-page cache holds `pgno` at `stamp` (test hook).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn stamp_cache_has(&self, pgno: u64, branch: bool, stamp: u64) -> bool {
+        self.inner.stamp_cache_has(pgno, branch, stamp)
     }
 
     /// An identity for this environment, equal across every clone of the same
@@ -1782,13 +1788,13 @@ impl Env {
     /// All fields are read from the **live published snapshot** plus the reader
     /// table; no transaction is opened, so this never blocks a writer and never
     /// consumes a reader slot. In a lock-file environment the snapshot follows
-    /// the shared published txnid `T` ([`EnvInner::current_snapshot`]), so
+    /// the shared published txnid `T` (`EnvInner::current_snapshot`), so
     /// `last_pgno`/`last_txnid` reflect another process's commit as soon as it
     /// publishes (`OBS_INFO_SEES_OTHER_COMMIT`, ADR-0023 §4). This call stays
     /// infallible: if the snapshot at `T` cannot be read right now (for
     /// example [`MdbError::MapResized`], when `T` has moved past a commit that
     /// grew the map beyond this process's current mapping), it falls back to
-    /// this process's own cached snapshot ([`EnvInner::snapshot`]) rather than
+    /// this process's own cached snapshot (`EnvInner::snapshot`) rather than
     /// surfacing the error, which can under-report a page/txnid that another
     /// process has already published. That fallback has no dedicated test.
     ///
@@ -1975,13 +1981,13 @@ impl Env {
 
     /// Explicit environment sync with full `mdb_env_sync(env, force)` parity
     /// `force = false` is a ZeroDB extension — heed exposes
-    /// only [`Env::force_sync`]. See [`EnvInner::sync`] for the exact
+    /// only [`Env::force_sync`]. See `EnvInner::sync` for the exact
     /// three-way semantics (`EACCES`, the `force || !NO_SYNC` gate, and the
     /// `MAP_ASYNC` downgrade).
     ///
     /// # Errors
     ///
-    /// See [`EnvInner::sync`].
+    /// See `EnvInner::sync`.
     pub fn sync(&self, force: bool) -> Result<(), Error> {
         self.inner.sync(force)
     }
@@ -2022,7 +2028,7 @@ impl Env {
     }
 
     /// Install (or clear) the commit-pipeline crash hook (ADR-0004 D3). See
-    /// [`EnvInner::set_commit_hook`]; test infrastructure (commit smoke test,
+    /// `EnvInner::set_commit_hook`; test infrastructure (commit smoke test,
     /// crash harness).
     pub fn set_commit_hook(&self, hook: Option<Arc<dyn CommitHook>>) {
         self.inner.set_commit_hook(hook);
@@ -2216,7 +2222,7 @@ pub fn check_open_limits(max_readers: u32, max_dbs: u32) -> Result<(), Error> {
 /// runtime map size is the backing's: [`Backing::view`] (ADR-0023).
 ///
 /// Steps: registry dedup (`EnvAlreadyOpened`) → validate both slots → select →
-/// map REC taxonomy to [`Error`] → build & register [`EnvInner`].
+/// map REC taxonomy to [`Error`] → build & register `EnvInner`.
 ///
 /// `page_size` is the size the caller mapped/validated with; it must be the
 /// authoritative page size for the file (the meta's own `page_size` field is
@@ -2261,7 +2267,7 @@ pub(crate) const DEFAULT_DIRTY_LIMIT: u64 = 1 << 17;
 pub(crate) const MIN_DIRTY_LIMIT: u64 = 128;
 
 /// The dirty limit in pages for `max_dirty_bytes` at `page_size` (SPEC 04
-/// TXN-68): `None` = LMDB's [`DEFAULT_DIRTY_LIMIT`], otherwise
+/// TXN-68): `None` = LMDB's `DEFAULT_DIRTY_LIMIT`, otherwise
 /// `max(bytes / page_size, MIN_DIRTY_LIMIT)`.
 #[must_use]
 pub fn dirty_limit_pages(max_dirty_bytes: Option<usize>, page_size: u32) -> u64 {
@@ -2273,7 +2279,7 @@ pub fn dirty_limit_pages(max_dirty_bytes: Option<usize>, page_size: u32) -> u64 
 
 /// [`open_with_backing`] with an explicit page-validation policy
 /// (ADR-0014), sequential-writes default (ADR-0015) and dirty limit in
-/// pages (ADR-0017; `None` = LMDB's [`DEFAULT_DIRTY_LIMIT`]). The limit is
+/// pages (ADR-0017; `None` = LMDB's `DEFAULT_DIRTY_LIMIT`). The limit is
 /// taken as given (at least 1): the public option applies its floor through
 /// [`dirty_limit_pages`], while the crash harness uses tiny limits here to
 /// spill on nearly every call.
@@ -2324,7 +2330,7 @@ pub fn open_with_backing_policy(
 ///   does, and publishes that txnid as `T`;
 /// - a joining process seeds its snapshot from the meta slot holding the
 ///   published `T`, never from the newest valid meta (ADR-0023);
-/// - pins, the writer's base and [`EnvInner::txnid`] follow `T`, and the
+/// - pins, the writer's base and `EnvInner::txnid` follow `T`, and the
 ///   writer also takes the region's cross-process lock.
 ///
 /// The region is moved in, and the caller keeps no other strong reference to

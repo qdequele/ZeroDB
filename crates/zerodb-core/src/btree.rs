@@ -220,7 +220,7 @@ pub(crate) enum PageKind {
 /// `new_trusted` constructors (the memo key carries the page kind).
 ///
 /// Soundness: entries are only recorded for **map-sourced** bytes
-/// ([`Source::bytes_from_classified`]), which are immutable for the owning
+/// (`Source::bytes_from_classified`), which are immutable for the owning
 /// txn's life; dirty frames never enter the memo.
 ///
 /// Concurrency: milli shares one `RoTxn` across rayon workers, so the probe
@@ -436,7 +436,7 @@ impl Drop for ValidatedPages<'_> {
     /// was freed and rewritten since. The parked level therefore holds no
     /// entry: `counts[0]` is the exact number of level-0 slots written (one
     /// count per successful insert), and when it is at most
-    /// [`MEMO_LOG_SLOTS`] every one of those slots is in the level's log.
+    /// `MEMO_LOG_SLOTS` every one of those slots is in the level's log.
     fn drop(&mut self) {
         let Some(mut base) = self.levels[0].take() else {
             return;
@@ -1046,7 +1046,7 @@ impl PathStack {
 /// `None` at an edge), borrowing key/value `&'a [u8]` from the source.
 ///
 /// `S` holds the path: owned by default, or borrowed from a write cursor's
-/// parked [`SavedCursor`] ([`Cursor::resume_in`]), so a step moves the
+/// parked `SavedCursor` (`Cursor::resume_in`), so a step moves the
 /// cursor where it is parked instead of copying the whole stack in and out.
 #[derive(Clone)]
 pub struct Cursor<'a, S: BorrowMut<PathStack> = PathStack> {

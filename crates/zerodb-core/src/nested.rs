@@ -27,7 +27,7 @@
 //! observably equivalent: mutation is impossible from the moment the **first**
 //! child exists until the **last** child drops — compile-time (every live
 //! child holds a shared `&wtxn` borrow; opening more children needs only `&`,
-//! which coexists) and runtime (the [`ChildCounter`] guard in
+//! which coexists) and runtime (the `ChildCounter` guard in
 //! `RwTxn::guard_ok`, TXN-29). So between any child's open and its drop the
 //! parent's roots, open-table and dirty set are **constant**, and every child
 //! opened in one paused window sees the identical state — there is no window
@@ -38,7 +38,7 @@
 //! The counter exists for the world where the borrow checker was bypassed
 //! (`unsafe`/FFI at an adapter boundary — e.g. the oracle's lifetime-erased
 //! children). Every mutating `RwTxn` entry checks `live() == 0` and returns
-//! [`MdbError::BadTxn`] (LMDB's `MDB_BAD_TXN` is literally "transaction …
+//! [`MdbError::BadTxn`](crate::error::MdbError::BadTxn) (LMDB's `MDB_BAD_TXN` is literally "transaction …
 //! has a child" — ADR-0007 Q4) instead of mutating frozen-but-aliased pages.
 //! Orderings (ARM/weak-memory assumptions, loom-checked as L6):
 //!

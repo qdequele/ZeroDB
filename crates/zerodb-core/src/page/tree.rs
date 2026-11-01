@@ -373,14 +373,14 @@ impl<'a> LeafMut<'a> {
     /// copy of a page fully validated on its first map access this txn, or
     /// the output of this txn's own page encoders), so validation is the same
     /// O(1) structural checks the read-side dirty path uses
-    /// ([`LeafRef::new_prevalidated`]: type, reserved fields, bounds). The
+    /// (`LeafRef::new_prevalidated`: type, reserved fields, bounds). The
     /// **full O(`num_keys`)** [`LeafRef::new`] cell walk here would run on every
     /// put (`insert_into_leaf` wraps the target leaf per call); the milli
     /// write-phase profile measured it as the single hottest zerodb cost.
     ///
     /// # Errors
     ///
-    /// Propagates [`LeafRef::new_prevalidated`] validation.
+    /// Propagates `LeafRef::new_prevalidated` validation.
     pub fn from_valid(buf: &'a mut [u8], psize: u32) -> Result<LeafMut<'a>, PageError> {
         LeafRef::new_prevalidated(buf, psize)?;
         Ok(LeafMut { buf, psize })
@@ -916,12 +916,12 @@ impl<'a> BranchMut<'a> {
     ///
     /// Same contract as [`LeafMut::from_valid`]: callers only hand this
     /// engine-authored dirty frames, so validation is the O(1) structural
-    /// checks ([`BranchRef::new_prevalidated`]), not a per-cell walk on every
+    /// checks (`BranchRef::new_prevalidated`), not a per-cell walk on every
     /// parent-chain touch.
     ///
     /// # Errors
     ///
-    /// Propagates [`BranchRef::new_prevalidated`] validation.
+    /// Propagates `BranchRef::new_prevalidated` validation.
     pub fn from_valid(buf: &'a mut [u8], psize: u32) -> Result<BranchMut<'a>, PageError> {
         BranchRef::new_prevalidated(buf, psize)?;
         Ok(BranchMut { buf, psize })

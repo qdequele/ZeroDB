@@ -230,7 +230,7 @@ pub fn verify_image_full(mut img: Vec<u8>, c: &FullChecks<'_>) -> Result<FullOut
             return Ok(FullOutcome::StaleFallback);
         }
         // Obligation 3: full walk on the recovered bytes.
-        let violations = check_image(env.inner().backing_bytes(), psize);
+        let violations = check_image(env.backing_bytes(), psize);
         if !violations.is_empty() {
             return Err(format!("check_image failed: {violations:?}"));
         }

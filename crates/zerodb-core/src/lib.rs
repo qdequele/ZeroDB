@@ -3,7 +3,7 @@
 //! See `docs/SPEC/` for the design.
 //!
 //! - The [`page`] module — on-disk page formats (SPEC 02).
-//! - The [`env`] module — environment open/close, meta selection,
+//! - The [`env`](mod@env) module — environment open/close, meta selection,
 //!   and the same-process registry (SPEC 02 §3.2, SPEC 06 §1, SPEC 04 §7), plus
 //!   the [`error`] taxonomy. All mmap `unsafe` lives in `zerodb-io` behind
 //!   [`env::Backing`]; this crate's own `unsafe` is confined to the places
@@ -13,9 +13,9 @@
 //!   SPEC 04 §6.3), [`rwtxn`] (single-writer txn, COW, split/rebalance, the
 //!   commit pipeline with its test hook points, SPEC 04 §9), and [`check`]
 //!   (the SPEC 03 §11 invariant walker that `zerodb-tools check` wraps).
-//! - The [`readers`] module — the lock-free MVCC reader table
+//! - The `readers` module — the lock-free MVCC reader table
 //!   and the published-snapshot cell (SPEC 04 §3/§4, ADR-0006), model-checked
-//!   under loom via the [`sync`] shim (`just loom`).
+//!   under loom via the `sync` shim (`just loom`).
 
 #![deny(missing_docs)]
 // `deny`, not `forbid`: the unsafe policy (AGENTS.md) sanctions these places,

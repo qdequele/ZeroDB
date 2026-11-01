@@ -13,8 +13,8 @@
 //!   is the GC-DB txnid key, which is big-endian (SPEC 05); see
 //!   [`geometry::gc_key_encode`].
 //! - **No `#[repr(C)]` casts of unaligned data.** All fields are read/written by
-//!   explicit offset through [`raw`]. The field readers in
-//!   [`raw`] are unchecked `read_unaligned` behind the validated-view contract
+//!   explicit offset through `raw`. The field readers in
+//!   `raw` are unchecked `read_unaligned` behind the validated-view contract
 //!   (`#[allow(unsafe_code)]` on that one module); the rest of this module is
 //!   safe code.
 //! - **Body-relative offsets:** intra-page offsets (`lower`, `upper`, node
