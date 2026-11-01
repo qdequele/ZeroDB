@@ -2,42 +2,13 @@
 //! error — never a SIGBUS, panic, or silent write through an attacker-planted
 //! path — and env files are created owner-only.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::TempDir;
+
+use std::path::Path;
 
 use zerodb::{CompactionOption, CopyToFile, Env, EnvOpenOptions, Error, MdbError, DATA_FILE_NAME};
 use zerodb_core::page::crc32c;
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new(tag: &str) -> TempDir {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
-            "zerodb-hostile-{tag}-{}-{nanos}-{n}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 const PS: u32 = 4096;
 const MAP: u64 = 1 << 20;
@@ -83,7 +54,7 @@ fn patch_metas(dir: &Path, edit: impl Fn(&mut [u8])) {
 
 #[test]
 fn open_rejects_valid_crc_meta_pointing_past_eof() {
-    let dir = TempDir::new("h1-root");
+    let dir = TempDir::new();
     seed_env(dir.path());
     // Point the main root (and the high-water) at page 200: inside the 1 MiB
     // map, far past the real few-KiB file. Accepting it would let the first
@@ -99,7 +70,7 @@ fn open_rejects_valid_crc_meta_pointing_past_eof() {
 
 #[test]
 fn open_rejects_root_beyond_high_water_on_disk() {
-    let dir = TempDir::new("h1-root2");
+    let dir = TempDir::new();
     seed_env(dir.path());
     // Keep last_pg honest, point the root past it.
     patch_metas(dir.path(), |s| {
@@ -118,7 +89,7 @@ fn open_rejects_root_beyond_high_water_on_disk() {
 #[test]
 fn data_file_is_created_owner_only() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = TempDir::new("mode");
+    let dir = TempDir::new();
     seed_env(dir.path());
     let md = std::fs::metadata(dir.path().join(DATA_FILE_NAME)).unwrap();
     assert_eq!(
@@ -135,7 +106,7 @@ fn data_file_is_created_owner_only() {
 #[cfg(unix)]
 #[test]
 fn env_creation_refuses_planted_symlink() {
-    let dir = TempDir::new("symlink");
+    let dir = TempDir::new();
     let victim = dir.path().join("victim");
     std::fs::write(&victim, b"precious").unwrap();
     std::os::unix::fs::symlink(&victim, dir.path().join(DATA_FILE_NAME)).unwrap();
@@ -153,9 +124,9 @@ fn env_creation_refuses_planted_symlink() {
 #[cfg(unix)]
 #[test]
 fn copy_staging_does_not_write_through_planted_symlink() {
-    let dir = TempDir::new("copy-src");
+    let dir = TempDir::new();
     seed_env(dir.path());
-    let out = TempDir::new("copy-out");
+    let out = TempDir::new();
     let dest = out.path().join("copy.zdb");
     // Plant a symlink at the predictable name `<dest>.copy-tmp-<pid>`. The
     // staging path carries a random nonce and is opened with create_new, so
@@ -188,7 +159,7 @@ fn copy_staging_does_not_write_through_planted_symlink() {
 
 #[test]
 fn open_rejects_unbounded_reader_and_db_counts() {
-    let dir = TempDir::new("limits");
+    let dir = TempDir::new();
     let e = EnvOpenOptions::new()
         .map_size(MAP as usize)
         .max_readers(u32::MAX)
@@ -219,7 +190,7 @@ fn rwtxn_is_send_and_droppable_on_another_thread() {
     fn assert_send<T: Send>() {}
     assert_send::<zerodb::RwTxn<'static>>();
 
-    let dir = TempDir::new("send");
+    let dir = TempDir::new();
     let env = open_env(dir.path()).unwrap();
 
     // Abort-by-drop on a foreign thread (unlocking a std Mutex from a thread

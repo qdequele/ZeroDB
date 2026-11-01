@@ -17,40 +17,17 @@
 //!    so a dirty-frame allocation change that starts leaking stale committed
 //!    bytes into unfilled RESERVE regions shows up as a behavior change.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::{assert_clean, TempDir};
 
-use zerodb::{check, Env, EnvFlags, EnvOpenOptions};
+use std::path::Path;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-reserve-adv-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{Env, EnvFlags, EnvOpenOptions};
 
 const PS: u32 = 4096;
 const MAP: usize = 8 << 20;
 
-/// The battery runs in both dirty-page realizations (ADR-0021 M3): default
+/// The battery runs in both dirty-page realizations (ADR-0021): default
 /// heap frames, and in-place `WRITE_MAP` (TXN-45b), where the reserved
 /// slice the closure fills points straight into the writable map.
 fn open_flags(dir: &Path, flags: EnvFlags) -> Env {
@@ -61,12 +38,6 @@ fn open_flags(dir: &Path, flags: EnvFlags) -> Env {
     opts.open(dir).expect("open env")
 }
 
-fn assert_clean(dir: &Path) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, PS);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
-}
-
 /// SPEC 02 §4.2 worked boundary at psize 4096: `max_node_size = 2030`; a
 /// 1-byte key inlines up to `dsize = 2021` (`8+1+2021 = 2030`) and overflows
 /// at `2022`.
@@ -75,7 +46,7 @@ fn reserve_at_inline_overflow_boundary_both_sides() {
     reserve_at_boundary(EnvFlags::EMPTY);
 }
 
-/// ADR-0021 M3: the boundary reserves with the slice in the writable map.
+/// ADR-0021: the boundary reserves with the slice in the writable map.
 #[test]
 fn reserve_at_inline_overflow_boundary_both_sides_writemap_in_place() {
     reserve_at_boundary(EnvFlags::WRITE_MAP);
@@ -107,7 +78,7 @@ fn reserve_at_boundary(flags: EnvFlags) {
         zerodb_core::page::geometry::overflow_page_count(overflow_val.len() as u64, PS)
     );
     wtxn.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     let rtxn = env.read_txn().unwrap();
     assert_eq!(db.get(&rtxn, b"k").unwrap(), Some(inline_val.as_slice()));
@@ -119,7 +90,7 @@ fn reserve_forcing_split_lands_correctly_through_commit_and_reopen() {
     reserve_forcing_split(EnvFlags::EMPTY);
 }
 
-/// ADR-0021 M3: the split-materializing reserve under in-place `WRITE_MAP`
+/// ADR-0021: the split-materializing reserve under in-place `WRITE_MAP`
 /// (the general split's scratch copy of a map frame, then the placeholder
 /// overwrite — all in the map), through commit + reopen.
 #[test]
@@ -161,7 +132,7 @@ fn reserve_forcing_split(flags: EnvFlags) {
         );
         wtxn.commit().unwrap();
     }
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     // Reopen: the split-materialized reserve must have survived the commit
     // pipeline (C0-C6) intact, not just the in-txn dirty-frame view.
     let env = open_flags(dir.path(), flags);
@@ -196,7 +167,7 @@ fn reserve_partial_fill_unfilled_tail_is_observed_deterministic() {
     reserve_partial_fill(EnvFlags::EMPTY);
 }
 
-/// ADR-0021 M3: same misuse under in-place `WRITE_MAP` — the fresh frame is
+/// ADR-0021: same misuse under in-place `WRITE_MAP` — the fresh frame is
 /// the zero-filled map page (`insert_tree_frame` zero-fills the map region
 /// exactly as it zero-fills a heap frame), so the observed tail matches.
 #[test]

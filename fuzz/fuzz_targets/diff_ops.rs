@@ -9,7 +9,7 @@
 //! - unset / any other value (**default**): `LmdbEngine` vs the
 //!   **native** `ZerodbEngine`.
 //! - `ZERODB_FUZZ_PAIR=heed`: `LmdbEngine` vs `HeedZerodbEngine` — the whole op
-//!   model re-run **through the `heed-zerodb` adapter** (ADR-0003 accept #6).
+//!   model re-run **through the `heed-zerodb` adapter** (ADR-0003).
 //!   For manual runs: `ZERODB_FUZZ_PAIR=heed cargo +nightly fuzz run diff_ops`.
 //!
 //! **Env-mode dimension.** The first input byte seeds an [`EngineMode`]

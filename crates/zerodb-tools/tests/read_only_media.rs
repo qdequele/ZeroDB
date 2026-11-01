@@ -1,4 +1,4 @@
-//! The read tools on read-only media (ADR-0023 amendments 17 and 18): no lock
+//! The read tools on read-only media (ADR-0023 and 18): no lock
 //! file can be created there, so `stat`, `dump` and `check` open the
 //! environment read-only without one, as LMDB's tools do
 //! (`OBS_RDONLY_LOCK_READONLY_FS = 0`).
@@ -8,43 +8,14 @@
 //! neither can be made, each test prints `SKIPPED: <reason>` and passes.
 #![cfg(unix)]
 
+mod common;
+use common::TempDir;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use zerodb::{Env, EnvOpenOptions, DATA_FILE_NAME};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// A self-cleaning temporary directory.
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new(tag: &str) -> TempDir {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let p = std::env::temp_dir().join(format!(
-            "zerodb-rofs-{tag}-{}-{nanos}-{n}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        TempDir(p)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// Run `cmd` to completion within 60 s; `false` on a failure exit, a spawn
 /// error or the timeout (the child is then killed).

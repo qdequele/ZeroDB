@@ -1,4 +1,4 @@
-//! Read transactions and the heed-shaped read API over the [`btree`] cursor
+//! Read transactions and the heed-shaped read API over the [`btree`](crate::btree) cursor
 //! (SPEC 04 §3, SPEC 00 read-op rows).
 //!
 //! A [`RoTxn`] pins the env's **published snapshot** at open: it claims a
@@ -13,7 +13,7 @@
 //!
 //! The read API is generic over [`TxnRead`], so the same `Database` methods
 //! serve a `RoTxn` (mapped bytes) **and** a write txn (`RwTxn`: dirty frames
-//! first, map fallback — SPEC 04 TXN-38, ADR-0004 D2). heed's borrow model is
+//! first, map fallback — SPEC 04 TXN-38, ADR-0004). heed's borrow model is
 //! reproduced: reads take `&Txn` and return `&'txn [u8]`; mutations take
 //! `&mut RwTxn`, so no read borrow can span a mutation (TXN-39).
 //!
@@ -23,7 +23,7 @@
 //! `DBRecord` (root/depth/stats) is **not** stored in the [`RoTxn`] snapshot;
 //! it resolves lazily from the transaction's catalog view — the main tree,
 //! keyed by name, value = 48-byte `F_SUBDATA` record (SPEC 02 §6, SPEC 04
-//! TXN-10 step 3). This module owns that resolution ([`resolve_named_record`])
+//! TXN-10 step 3). This module owns that resolution (`resolve_named_record`)
 //! and the read API; the write side (create/clear/drop, catalog write-back)
 //! lives in [`crate::rwtxn`].
 
@@ -36,7 +36,7 @@ use crate::builder::StreamBuildError;
 use crate::cmp::KeyCmp;
 use crate::env::{Env, Snapshot};
 use crate::error::{Error, MdbError, Result};
-use crate::handles::{HandleTable, MemoCell, TxnHandles};
+use crate::handles::{HandleTable, MemoCell, TxnHandles, DENSE_DBI_LIMIT};
 use crate::page::{DBRecord, PageError, F_SUBDATA};
 use std::cmp::Ordering;
 
@@ -49,7 +49,7 @@ pub(crate) fn map_page_err(_e: PageError) -> Error {
 
 /// Anything the read API can read through: a [`RoTxn`] (mapped bytes of a
 /// committed snapshot) or a [`crate::rwtxn::RwTxn`] (the writer's in-progress
-/// view). The three accessors are exactly what [`Tree`] needs (ADR-0004 D2).
+/// view). The three accessors are exactly what [`Tree`] needs (ADR-0004).
 pub trait TxnRead {
     /// Where this txn's pages come from (SPEC 04 TXN-37/38).
     fn source(&self) -> Source<'_>;
@@ -123,6 +123,17 @@ pub enum DbSel {
     Named(u32),
 }
 
+impl DbSel {
+    /// The named database's dbi; `None` for the main database.
+    #[must_use]
+    pub fn dbi(self) -> Option<u32> {
+        match self {
+            DbSel::Main => None,
+            DbSel::Named(dbi) => Some(dbi),
+        }
+    }
+}
+
 /// Resolve a named DB's `DBRecord` from a catalog view (SPEC 02 §6, SPEC 04
 /// TXN-10 step 3): search the main tree for `name`; if the entry is a 48-byte
 /// `F_SUBDATA` sub-DB record, decode it; otherwise (absent, or a plain user-key
@@ -156,7 +167,7 @@ enum EnvHandle<'e> {
 }
 
 /// A read-only transaction: a consistent view of one committed snapshot
-/// (SPEC 04 §3). It holds the [`Env`] (borrowed or owned, [`EnvHandle`]),
+/// (SPEC 04 §3). It holds the [`Env`] (borrowed or owned, `EnvHandle`),
 /// which keeps the mapped file alive so every `&'txn [u8]` it lends stays
 /// valid (TXN-37); an `Arc` to the pinned [`Snapshot`] so its roots survive
 /// later commits (TXN-18); and its reader-table slot, which gates the
@@ -167,7 +178,7 @@ enum EnvHandle<'e> {
 /// `&[u8]` it lends — may move to another thread (rayon/async). Asserted at
 /// compile time by the `send_assertions` test below.
 ///
-/// **Leaked readers (documented stall, ADR-0006 R5):** `mem::forget(ro_txn)`
+/// **Leaked readers (documented stall, ADR-0006):** `mem::forget(ro_txn)`
 /// is safe Rust and cannot be prevented; the slot then pins its txnid
 /// forever, the GC gate stops advancing past it, and the file grows. Same
 /// failure mode as a stale LMDB reader, except that no reap frees it while
@@ -334,12 +345,6 @@ thread_local! {
     static SPARE_NAMED: Cell<Option<Box<[NamedEntry]>>> = const { Cell::new(None) };
 }
 
-/// Dbis below this get [`RoTxn`]'s lock-free record table (see
-/// `named_dense`). Meilisearch opens ~30 named DBs per env and hannoy a
-/// handful, so this covers every known consumer while bounding the
-/// per-txn allocation for envs opened with a very large `max_dbs`.
-const DENSE_DBI_LIMIT: u32 = 256;
-
 impl Drop for RoTxn<'_> {
     fn drop(&mut self) {
         // TXN-18a: release the slot (Release store of RDR_FREE) so the GC
@@ -457,8 +462,7 @@ impl Env {
     /// [`MdbError::ReadersFull`] when every reader-table slot is occupied
     /// (TXN-16; the table holds `max_readers` slots, default 126). In a
     /// lock-file environment, [`MdbError::MapResized`] when another process
-    /// committed beyond this process's logical map size (ADR-0023 amendment
-    /// 15).
+    /// committed beyond this process's logical map size (ADR-0023).
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
         let (snap, slot) = self.inner().pin_reader()?;
         Ok(RoTxn {
@@ -508,26 +512,18 @@ impl Env {
     /// sequential-writes override (**ADR-0015**; ZeroDB extension). With the
     /// setting on, a write txn remembers the path to the tree's rightmost
     /// leaf and appends there without descending when a key sorts after
-    /// every key already in it: faster ascending and APPEND loads, 3–5 %
+    /// every key already in it: faster ascending and APPEND loads, slightly
     /// slower random-key writes. Results are identical either way. Runtime
     /// state, not persisted; write txns that start after the call use it.
     pub fn set_sequential_writes(&self, db: &Database, on: Option<bool>) {
-        let dbi = match db.sel() {
-            DbSel::Main => None,
-            DbSel::Named(dbi) => Some(dbi),
-        };
-        self.inner().set_sequential_writes(dbi, on);
+        self.inner().set_sequential_writes(db.sel().dbi(), on);
     }
 
     /// Whether write txns use the sequential-writes fast path for `db`: its
     /// override if set, else the env default (ADR-0015).
     #[must_use]
     pub fn sequential_writes(&self, db: &Database) -> bool {
-        let dbi = match db.sel() {
-            DbSel::Main => None,
-            DbSel::Named(dbi) => Some(dbi),
-        };
-        self.inner().sequential_writes_for(dbi)
+        self.inner().sequential_writes_for(db.sel().dbi())
     }
 
     /// A handle to the main (unnamed) database (SPEC 00 row 10, `None` name).

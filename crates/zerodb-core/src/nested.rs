@@ -7,27 +7,27 @@
 //! **no reader-table slot** (TXN-25/32 — the writer already gates GC at
 //! `writer_txnid − 1`, and no allocation can occur while children live).
 //!
-//! ## The safety story (ADR-0007 D1, zero `unsafe`)
+//! ## The safety story (ADR-0007, zero `unsafe`)
 //!
 //! The child holds a real `&'p RwTxn` — so the borrow checker itself enforces
 //! writer quiescence (TXN-29/30; see docs/DIVERGENCES.md): while any child is alive, no
 //! `&mut RwTxn` method can be called. The child is [`Send`] **by compiler
 //! derivation**: `&RwTxn: Send ⇔ RwTxn: Sync`, and `RwTxn` is `Sync` as a
-//! **standing asserted contract** (ADR-0007 Q1): it has
+//! **standing asserted contract** (ADR-0007): it has
 //! no interior mutability on any `&self` path — the compile-time assertions in
 //! this module's tests turn any future violation into a build failure, not an
 //! unsoundness. There is no `unsafe impl` anywhere in this design (contrast
 //! heed, whose child holds a raw `MDB_txn` pointer and needs
 //! `unsafe impl Send`).
 //!
-//! ## What the child sees: delegate-live ≡ snapshot-at-open (ADR-0007 D2)
+//! ## What the child sees: delegate-live ≡ snapshot-at-open (ADR-0007)
 //!
 //! The child's [`TxnRead`] simply forwards to the parent's. TXN-26 phrases the
 //! snapshot as "the working roots *at child-open time*", and delegation is
 //! observably equivalent: mutation is impossible from the moment the **first**
 //! child exists until the **last** child drops — compile-time (every live
 //! child holds a shared `&wtxn` borrow; opening more children needs only `&`,
-//! which coexists) and runtime (the [`ChildCounter`] guard in
+//! which coexists) and runtime (the `ChildCounter` guard in
 //! `RwTxn::guard_ok`, TXN-29). So between any child's open and its drop the
 //! parent's roots, open-table and dirty set are **constant**, and every child
 //! opened in one paused window sees the identical state — there is no window
@@ -38,8 +38,8 @@
 //! The counter exists for the world where the borrow checker was bypassed
 //! (`unsafe`/FFI at an adapter boundary — e.g. the oracle's lifetime-erased
 //! children). Every mutating `RwTxn` entry checks `live() == 0` and returns
-//! [`MdbError::BadTxn`] (LMDB's `MDB_BAD_TXN` is literally "transaction …
-//! has a child" — ADR-0007 Q4) instead of mutating frozen-but-aliased pages.
+//! [`MdbError::BadTxn`](crate::error::MdbError::BadTxn) (LMDB's `MDB_BAD_TXN` is literally "transaction …
+//! has a child" — ADR-0007) instead of mutating frozen-but-aliased pages.
 //! Orderings (ARM/weak-memory assumptions, loom-checked as L6):
 //!
 //! - open: `fetch_add(1, Relaxed)` — creation happens on a thread already
@@ -52,7 +52,7 @@
 //!   decrements, so all child activity happens-before the writer mutates or
 //!   commits, even without the join edge.
 //!
-//! `mem::forget(child)` (risk R1): forget *consumes* the child, so no read
+//! `mem::forget(child)`: forget *consumes* the child, so no read
 //! through it can happen afterwards and nothing stays aliased; the counter
 //! simply never reaches 0 again and every later mutating op / `commit`
 //! returns `BadTxn` — a permanently-blocked writer, never UB.
@@ -64,10 +64,9 @@ use crate::rwtxn::RwTxn;
 use crate::sync::{AtomicUsize, Ordering};
 
 /// The live-child counter on a write txn (SPEC 04 TXN-31,
-/// ADR-0007 D3: `AtomicUsize`, **not** `Cell` — a `Cell` would destroy
-/// `RwTxn: Sync` and children really do drop on worker threads at all six
-/// consumer call sites). Factored into its own type so the loom L6 model
-/// checks the exact shipped code.
+/// ADR-0007: `AtomicUsize`, **not** `Cell` — a `Cell` would destroy
+/// `RwTxn: Sync`, and children may drop on worker threads). Factored into
+/// its own type so the loom L6 model checks the exact shipped code.
 #[derive(Debug)]
 pub(crate) struct ChildCounter(AtomicUsize);
 
@@ -188,7 +187,7 @@ impl Drop for NestedRoTxn<'_> {
     }
 }
 
-/// The child reads the parent's view verbatim (delegate-live, ADR-0007 D2;
+/// The child reads the parent's view verbatim (delegate-live, ADR-0007;
 /// equivalence with snapshot-at-open proven in the module docs). This is what
 /// makes the whole read API — gets, cursors, ranges, prefix iters, named DBs
 /// through `record_for`, overflow runs — work on a child unchanged.
@@ -232,28 +231,17 @@ impl TxnRead for NestedRoTxn<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// loom L6 (ADR-0007 D3/Q5). Run via `just loom` (RUSTFLAGS="--cfg loom",
+// loom L6 (ADR-0007). Run via `just loom` (RUSTFLAGS="--cfg loom",
 // tests filtered `loom_`). Models are tiny (2 spawned threads + main) so loom
 // explores them exhaustively.
 //
-// Mutation-check record: weakening BOTH counter orderings to `Relaxed`
-// (`release`/`live`) is NOT caught by L6a/L6b — the violating execution is
-// **load-buffering-shaped** (the child's frame load would have to read a
-// *future* store, one that executes later in every loom interleaving because
-// the writer's store is control-dependent on observing the decrements), and
-// loom 0.7 explores store buffering via stale values only, never
-// future-store reads (the explorer limitation recorded in the reader table's
-// mutation-check record, tokio-rs/loom#180 family). The weakening is nevertheless
-// REAL on AArch64: without Release, the child's plain frame load may be
-// satisfied after its younger relaxed RMW decrement becomes globally visible
-// (load→store reordering is architecturally allowed), so the writer could
-// observe quiescence and mutate while the child's read is still in flight.
-// The `Release`/`Acquire` pair is therefore normative (SPEC 04 TXN-31
-// prescribes it verbatim) and guarded by the per-site justification comments
-// + this record, not by loom. What L6a DOES machine-check: the pairing keeps
-// the invariant in every explorable interleaving (a regression that breaks
-// the protocol shape — e.g. decrementing before the read, or checking the
-// wrong counter — fails it); L6b machine-checks the join-edge world.
+// Limit: weakening both counter orderings to `Relaxed` is not caught here.
+// The violating execution is load-buffering-shaped, which loom does not
+// explore (tokio-rs/loom#180), yet it is real on AArch64: the child's frame
+// load could complete after its relaxed decrement becomes visible. The
+// `Release`/`Acquire` pair (SPEC 04 TXN-31) is therefore guarded by the
+// per-site comments, not by loom. L6a checks the protocol shape (e.g.
+// decrementing before the read fails it); L6b checks the join-edge world.
 // ---------------------------------------------------------------------------
 
 #[cfg(all(test, loom))]
@@ -368,7 +356,7 @@ mod tests {
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
 
-    /// ADR-0007 D6: `NestedRoTxn<'p>` covariance in `'p` is a design
+    /// ADR-0007: `NestedRoTxn<'p>` covariance in `'p` is a design
     /// requirement for the heed adapter (heed returns a plain covariant
     /// `RoTxn<'a>`). This function only compiles while the type stays
     /// covariant — an invariant-making field (`fn(&'p _)`, `Cell<&'p _>`, …)
@@ -378,7 +366,7 @@ mod tests {
         x
     }
 
-    /// The ADR-0007 Q1 standing contract, machine-enforced (risk R2): `RwTxn`
+    /// The ADR-0007 standing contract, machine-enforced (risk R2): `RwTxn`
     /// stays `Sync` (no interior mutability on `&self` paths) and therefore
     /// `NestedRoTxn` — a `&RwTxn` newtype — is `Send` **by compiler
     /// derivation**, with no `unsafe impl`. If a future `RwTxn` field breaks

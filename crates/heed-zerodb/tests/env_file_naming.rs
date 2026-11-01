@@ -291,7 +291,7 @@ fn streamed_inner_file_bytes_reopen_as_env() {
 }
 
 // ---------------------------------------------------------------------------
-// NO_LOCK (ADR-0023 amendment 17)
+// NO_LOCK (ADR-0023)
 // ---------------------------------------------------------------------------
 
 /// heed's `NO_LOCK` maps to the engine's `lock_file(false)` and turns off the
@@ -346,7 +346,7 @@ fn flags_report_no_lock() {
 }
 
 // ---------------------------------------------------------------------------
-// Read-only media (ADR-0023 amendment 17)
+// Read-only media (ADR-0023)
 // ---------------------------------------------------------------------------
 
 /// Run `cmd` to completion within 60 s; `false` on a failure exit, a spawn

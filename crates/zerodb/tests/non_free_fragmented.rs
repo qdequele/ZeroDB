@@ -11,35 +11,12 @@
 //! independent decode-based walk of the same image (`check::check_image`,
 //! INV-22/24/26).
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::{assert_clean, TempDir};
 
-use zerodb::{check, free_page_count, Env, EnvOpenOptions};
+use std::path::Path;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-nff-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{free_page_count, Env, EnvOpenOptions};
 
 const PS: u32 = 4096;
 const MAP: usize = 64 << 20;
@@ -49,12 +26,6 @@ fn open(dir: &Path) -> Env {
     opts.map_size(MAP);
     opts.page_size(PS);
     opts.open(dir).expect("open env")
-}
-
-fn assert_clean(dir: &Path) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, PS);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
 }
 
 #[test]
@@ -92,7 +63,7 @@ fn free_page_count_over_fragmented_gc_tree() {
     // Independent decode-based walk of the committed image: check_image decodes
     // every GC entry's ids and asserts reachable-XOR-free (INV-22/24/26). If the
     // count-prefix walk mis-shaped an entry, this image would not be clean.
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     let rtxn = env.read_txn().unwrap();
     let free = free_page_count(&rtxn).unwrap();

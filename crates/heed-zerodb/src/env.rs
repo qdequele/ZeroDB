@@ -1,6 +1,6 @@
 //! Environment surface — `EnvOpenOptions<T>`, `Env<T>`, `EnvInfo`, `EnvStat`,
 //! `EnvClosingEvent`, `CompactionOption`, `FlagSetMode`, the comparators, and
-//! `env_closing_event` (SPEC 00 rows 1–26; SPEC 04 §7; ADR-0003 §C2/§C3/§C4).
+//! `env_closing_event` (SPEC 04 §7; ADR-0003).
 //!
 //! Everything wraps ZeroDB's native [`zerodb::Env`] (already `Arc`-cloneable,
 //! registry-deduped with `EnvAlreadyOpened`, and deferred-close, TXN-50..53).
@@ -33,7 +33,7 @@ use crate::{Database, DatabaseOpenOptions, Error, Result, Unspecified};
 /// snapshot code (`process_snapshot_creation.rs`, `enterprise_edition/s3.rs`).
 /// An adapter env dir therefore contains **exactly** this one data file — no
 /// `zerodb.dat`. A `lock.mdb` sits next to it, as with LMDB (ADR-0023),
-/// unless the env is opened with heed's `NO_LOCK` (ADR-0023 amendment 17) or
+/// unless the env is opened with heed's `NO_LOCK` (ADR-0023) or
 /// read-only on read-only media.
 ///
 /// The bytes inside are still ZeroDB's own `ZDB1` format: pointing
@@ -62,7 +62,7 @@ fn os_page_size() -> usize {
 
 /// Builder for opening an [`Env`] — the exact `heed::EnvOpenOptions<T>` shape
 /// (default `WithTls`, immediately converted via `read_txn_without_tls` in
-/// every production open; SPEC 00 rows 1/2).
+/// every production open).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnvOpenOptions<T: TlsUsage = WithTls> {
     map_size: Option<usize>,
@@ -87,7 +87,7 @@ impl Default for EnvOpenOptions<WithTls> {
 }
 
 impl EnvOpenOptions<WithTls> {
-    /// A fresh builder (SPEC 00 row 1). Default is `WithTls`.
+    /// A fresh builder. Default is `WithTls`.
     #[must_use]
     pub fn new() -> EnvOpenOptions<WithTls> {
         EnvOpenOptions {
@@ -125,25 +125,25 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         self.retag()
     }
 
-    /// Select NOTLS read txns (`WithoutTls`) — `RoTxn: Send` (SPEC 00 row 2).
+    /// Select NOTLS read txns (`WithoutTls`) — `RoTxn: Send`.
     #[must_use]
     pub fn read_txn_without_tls(self) -> EnvOpenOptions<WithoutTls> {
         self.retag()
     }
 
-    /// Set the map size (SPEC 00 row 3).
+    /// Set the map size.
     pub fn map_size(&mut self, size: usize) -> &mut Self {
         self.map_size = Some(size);
         self
     }
 
-    /// Set the reader-table size (SPEC 00 row 5).
+    /// Set the reader-table size.
     pub fn max_readers(&mut self, readers: u32) -> &mut Self {
         self.max_readers = Some(readers);
         self
     }
 
-    /// Set the named-DB catalog capacity (SPEC 00 row 4).
+    /// Set the named-DB catalog capacity.
     pub fn max_dbs(&mut self, dbs: u32) -> &mut Self {
         self.max_dbs = dbs;
         self
@@ -155,7 +155,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// its page size from the OS and offers no selector. Code that never calls
     /// it gets exactly what the fork would give it: new stores default to the
     /// **OS page size**, clamped to the engine window (LMDB parity —
-    /// `me_psize = me_os_psize`, capped at 64 K; SPEC 00 row 164). This method
+    /// `me_psize = me_os_psize`, capped at 64 K). This method
     /// only ever *overrides* that parity default.
     ///
     /// `size` must be a power of two in
@@ -187,7 +187,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
 
     /// Turn on the sequential-writes fast path for every database by default
     /// (**ADR-0015**). **ZeroDB extension — heed has no such method.**
-    /// Faster ascending and APPEND loads, 3–5 % slower random-key writes,
+    /// Faster ascending and APPEND loads, slightly slower random-key writes,
     /// identical results; override it per database with
     /// [`Env::set_sequential_writes`]. Default: off.
     pub fn sequential_writes(&mut self, on: bool) -> &mut Self {
@@ -205,13 +205,13 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         self
     }
 
-    /// Set the env flags (SPEC 00 row 6). `unsafe` for heed signature parity;
+    /// Set the env flags. `unsafe` for heed signature parity;
     /// the body contains no unsafe operation.
     ///
     /// # Safety
     ///
     /// Mirrors `heed::EnvOpenOptions::flags`. As with LMDB's `MDB_NOLOCK`, an
-    /// env opened with `NO_LOCK` has no lock file (ADR-0023 amendment 17):
+    /// env opened with `NO_LOCK` has no lock file (ADR-0023):
     /// the caller must ensure that no other process opens the environment
     /// while it is open. The other flags carry no such obligation in ZeroDB.
     pub unsafe fn flags(&mut self, flags: EnvFlags) -> &mut Self {
@@ -219,7 +219,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         self
     }
 
-    /// Open (or create) the environment at `path` (a directory; SPEC 00 row 7).
+    /// Open (or create) the environment at `path` (a directory).
     /// `unsafe` for heed signature parity (see [`EnvOpenOptions::flags`]).
     ///
     /// Re-imposes the fork's open-time boundaries the native engine is lenient
@@ -277,8 +277,8 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         // created through the heed surface must get the same geometry the fork
         // would give it (16 K on Apple Silicon / 64 K-page ARM distros, 4 K on
         // x86_64). The native `zerodb::EnvOpenOptions` keeps its own fixed
-        // 4 K default; this parity default lives at the heed boundary only
-        // (SPEC 00 row 164). Creation-only, as for every geometry option: an
+        // 4 K default; this parity default lives at the heed boundary only.
+        // Creation-only, as for every geometry option: an
         // existing store keeps its persisted page size.
         let ps = self.page_size.unwrap_or_else(|| {
             u32::try_from(os_page_size())
@@ -290,7 +290,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         // boundary — an env opened through this adapter materializes as
         // `<dir>/data.mdb`, the name Meilisearch hardcodes in its production
         // compaction and snapshot paths. The `lock.mdb` next to it is the
-        // name the engine derives from `data.mdb` (ADR-0023 amendment 16).
+        // name the engine derives from `data.mdb` (ADR-0023).
         opts.data_file_name(DATA_FILE_NAME);
         opts.flags(zerodb_env_flags(self.flags));
         opts.file_trust(self.file_trust);
@@ -298,7 +298,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         if let Some(b) = self.max_dirty_bytes {
             opts.max_dirty_bytes(b);
         }
-        // ADR-0023 amendment 17: the lock file (`lock.mdb`) is on, as in
+        // ADR-0023: the lock file (`lock.mdb`) is on, as in
         // LMDB; heed's `NO_LOCK` turns it off
         // (`OBS_NOLOCK_CREATES_LOCK_FILE = false`).
         opts.lock_file(!self.flags.contains(EnvFlags::NO_LOCK));
@@ -319,37 +319,34 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
 /// engine's only mode, and `FIXED_MAP` and `NO_MEM_INIT` are accepted
 /// no-ops, so they are dropped here.
 fn zerodb_env_flags(flags: EnvFlags) -> zerodb::EnvFlags {
-    let mut z = zerodb::EnvFlags::EMPTY;
-    if flags.contains(EnvFlags::WRITE_MAP) {
-        z |= zerodb::EnvFlags::WRITE_MAP;
-    }
-    if flags.contains(EnvFlags::PREV_SNAPSHOT) {
-        z |= zerodb::EnvFlags::PREV_SNAPSHOT;
-    }
-    if flags.contains(EnvFlags::READ_ONLY) {
-        z |= zerodb::EnvFlags::READ_ONLY;
-    }
-    if flags.contains(EnvFlags::NO_SYNC) {
-        z |= zerodb::EnvFlags::NO_SYNC;
-    }
-    if flags.contains(EnvFlags::NO_META_SYNC) {
-        z |= zerodb::EnvFlags::NO_META_SYNC;
-    }
-    if flags.contains(EnvFlags::MAP_ASYNC) {
-        z |= zerodb::EnvFlags::MAP_ASYNC;
-    }
-    if flags.contains(EnvFlags::NO_READ_AHEAD) {
-        z |= zerodb::EnvFlags::NO_READ_AHEAD;
-    }
-    z
+    // Both types use LMDB's `MDB_*` values (checked below); heed flags ZeroDB
+    // does not define (`NO_LOCK`, `NO_TLS`, ...) are handled by the caller.
+    zerodb::EnvFlags::from_bits_truncate(flags.bits())
 }
+
+const _: () = {
+    let pairs = [
+        (EnvFlags::WRITE_MAP, zerodb::EnvFlags::WRITE_MAP),
+        (EnvFlags::PREV_SNAPSHOT, zerodb::EnvFlags::PREV_SNAPSHOT),
+        (EnvFlags::READ_ONLY, zerodb::EnvFlags::READ_ONLY),
+        (EnvFlags::NO_SYNC, zerodb::EnvFlags::NO_SYNC),
+        (EnvFlags::NO_META_SYNC, zerodb::EnvFlags::NO_META_SYNC),
+        (EnvFlags::MAP_ASYNC, zerodb::EnvFlags::MAP_ASYNC),
+        (EnvFlags::NO_READ_AHEAD, zerodb::EnvFlags::NO_READ_AHEAD),
+    ];
+    let mut i = 0;
+    while i < pairs.len() {
+        assert!(pairs[i].0.bits() == pairs[i].1.bits());
+        i += 1;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Env
 // ---------------------------------------------------------------------------
 
 /// A cheaply-cloneable environment handle — the exact `heed::Env<T>` shape
-/// (SPEC 00 row 25; `Arc`-backed shared ownership, TXN-50). `T` is a phantom
+/// (`Arc`-backed shared ownership, TXN-50). `T` is a phantom
 /// TLS marker; ZeroDB read txns are universally NOTLS.
 pub struct Env<T = WithTls> {
     inner: zerodb::Env,
@@ -394,7 +391,7 @@ impl<T> Env<T> {
         &self.inner
     }
 
-    /// Actual on-disk data-file size (SPEC 00 row 18).
+    /// Actual on-disk data-file size.
     ///
     /// # Errors
     ///
@@ -403,7 +400,7 @@ impl<T> Env<T> {
         self.inner.real_disk_size().map_err(Into::into)
     }
 
-    /// `dup()` the data-file fd (SPEC 00 row 22).
+    /// `dup()` the data-file fd.
     ///
     /// # Errors
     ///
@@ -414,7 +411,7 @@ impl<T> Env<T> {
 
     /// The env flags as set at open (SPEC 00 second table — SHOULD). Returns the
     /// durability/write-mode bits ZeroDB records, and `NO_LOCK` when the env
-    /// was opened with it (ADR-0023 amendment 17).
+    /// was opened with it (ADR-0023).
     ///
     /// # Errors
     ///
@@ -457,7 +454,7 @@ impl<T> Env<T> {
     }
 
     /// Changes the map size, as heed 0.22.1's `Env::resize`
-    /// (`mdb_env_set_mapsize`; ADR-0023 amendment 15). `0` adopts the size
+    /// (`mdb_env_set_mapsize`; ADR-0023). `0` adopts the size
     /// recorded in the newest committed meta, the answer to a
     /// `MdbError::MapResized` begin; a size below the committed data rounds
     /// up to it.
@@ -487,7 +484,7 @@ impl<T> Env<T> {
         self.inner.resize(new_size as u64).map_err(Error::from)
     }
 
-    /// Environment info (SPEC 00 rows 20/60; `mdb_env_info`). Every field is
+    /// Environment info (`mdb_env_info`). Every field is
     /// populated from the live snapshot and the reader table.
     ///
     /// `map_addr` is always null: it is `MDB_envinfo::me_mapaddr`, meaningful
@@ -527,7 +524,7 @@ impl<T> Env<T> {
         }
     }
 
-    /// `non_free_pages_size()` (SPEC 00 row 19).
+    /// `non_free_pages_size()`.
     ///
     /// # Errors
     ///
@@ -541,7 +538,7 @@ impl<T> Env<T> {
         self.inner.non_free_pages_size().map_err(Into::into)
     }
 
-    /// A typed database open-options builder (SPEC 00 row 12).
+    /// A typed database open-options builder.
     #[must_use]
     pub fn database_options(
         &self,
@@ -549,12 +546,16 @@ impl<T> Env<T> {
         DatabaseOpenOptions::new(self)
     }
 
-    /// Open a typed database that already exists (SPEC 00 rows 10/12).
+    /// Open a typed database that already exists.
     ///
     /// # Errors
     ///
-    /// [`Error::Mdb`] (`BadValSize`/`Incompatible`) on a bad/colliding name;
-    /// `Error::Io` on an embedded NUL in `name` (C-string name boundary).
+    /// [`Error::Mdb`] (`BadValSize`/`Incompatible`) on a bad or colliding
+    /// name.
+    ///
+    /// # Panics
+    ///
+    /// On a name with an embedded NUL byte, as heed does.
     #[cfg(not(feature = "unique-txns"))]
     pub fn open_database<KC, DC>(
         &self,
@@ -572,7 +573,7 @@ impl<T> Env<T> {
         options.open(rtxn)
     }
 
-    /// Create a typed database, if absent (SPEC 00 rows 11/12).
+    /// Create a typed database, if absent.
     ///
     /// # Errors
     ///
@@ -697,7 +698,7 @@ impl<T> Env<T> {
             .transpose()
     }
 
-    /// Begin a write transaction (SPEC 00 row 13).
+    /// Begin a write transaction.
     ///
     /// # Errors
     ///
@@ -707,7 +708,7 @@ impl<T> Env<T> {
         Ok(RwTxn::from_zdb(w))
     }
 
-    /// Begin a read transaction over the live snapshot (SPEC 00 row 14).
+    /// Begin a read transaction over the live snapshot.
     ///
     /// # Errors
     ///
@@ -717,7 +718,7 @@ impl<T> Env<T> {
         Ok(RoTxn::from_inner(crate::txn::InnerTxn::Ro(r)))
     }
 
-    /// Begin a `'static`, env-owning read transaction (SPEC 00 row 15).
+    /// Begin a `'static`, env-owning read transaction.
     ///
     /// # Errors
     ///
@@ -727,7 +728,7 @@ impl<T> Env<T> {
         Ok(RoTxn::from_inner(crate::txn::InnerTxn::Ro(r)))
     }
 
-    /// Open a nested read transaction parented to `parent` (SPEC 00 row 16).
+    /// Open a nested read transaction parented to `parent`.
     ///
     /// # Errors
     ///
@@ -758,7 +759,7 @@ impl<T> Env<T> {
         self.inner.sequential_writes(&db.inner)
     }
 
-    /// Copy this environment to an open file (SPEC 00 row 17, `mdb_env_copy2`).
+    /// Copy this environment to an open file (`mdb_env_copy2`).
     ///
     /// # Errors
     ///
@@ -851,7 +852,7 @@ impl<T> Env<T> {
         self.inner.sync(force).map_err(Into::into)
     }
 
-    /// The canonical directory path (SPEC 00 row 21).
+    /// The canonical directory path.
     #[must_use]
     pub fn path(&self) -> &Path {
         self.inner.path()
@@ -902,7 +903,7 @@ impl<T> Env<T> {
         self.inner.reader_list()
     }
 
-    /// Consume this handle and return the closing event (SPEC 00 row 23).
+    /// Consume this handle and return the closing event.
     #[must_use]
     pub fn prepare_for_closing(self) -> EnvClosingEvent {
         EnvClosingEvent(self.inner.prepare_for_closing())
@@ -932,7 +933,7 @@ impl<T> Env<T> {
     }
 }
 
-/// heed's `CompactionOption` → ZeroDB's (SPEC 00 row 59).
+/// heed's `CompactionOption` → ZeroDB's.
 fn zdb_compaction(option: CompactionOption) -> zerodb::CompactionOption {
     match option {
         CompactionOption::Enabled => zerodb::CompactionOption::Enabled,
@@ -940,7 +941,7 @@ fn zdb_compaction(option: CompactionOption) -> zerodb::CompactionOption {
     }
 }
 
-/// Contains information about the environment (SPEC 00 row 60).
+/// Contains information about the environment.
 #[derive(Debug, Clone, Copy)]
 pub struct EnvInfo {
     /// Address of the map, if fixed (always null in ZeroDB).
@@ -984,7 +985,7 @@ impl EnvStat {
     }
 }
 
-/// A signal fired once the environment is fully closed (SPEC 00 rows 23/24).
+/// A signal fired once the environment is fully closed.
 #[derive(Clone)]
 pub struct EnvClosingEvent(zerodb::EnvClosingEvent);
 
@@ -1015,7 +1016,7 @@ pub fn env_closing_event<P: AsRef<Path>>(_path: P) -> Option<EnvClosingEvent> {
     None
 }
 
-/// Whether to compact while copying (SPEC 00 row 59).
+/// Whether to compact while copying.
 #[derive(Debug, Copy, Clone)]
 pub enum CompactionOption {
     /// Omit free pages and sequentially renumber all pages in output.
@@ -1034,7 +1035,7 @@ pub enum FlagSetMode {
     Disable,
 }
 
-/// LMDB's built-in lexicographic (memcmp) key comparator (SPEC 00 row 53).
+/// LMDB's built-in lexicographic (memcmp) key comparator.
 #[derive(Debug)]
 pub enum DefaultComparator {}
 

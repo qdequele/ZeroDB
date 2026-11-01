@@ -13,8 +13,8 @@
 //!   is the GC-DB txnid key, which is big-endian (SPEC 05); see
 //!   [`geometry::gc_key_encode`].
 //! - **No `#[repr(C)]` casts of unaligned data.** All fields are read/written by
-//!   explicit offset through [`raw`]. The field readers in
-//!   [`raw`] are unchecked `read_unaligned` behind the validated-view contract
+//!   explicit offset through `raw`. The field readers in
+//!   `raw` are unchecked `read_unaligned` behind the validated-view contract
 //!   (`#[allow(unsafe_code)]` on that one module); the rest of this module is
 //!   safe code.
 //! - **Body-relative offsets:** intra-page offsets (`lower`, `upper`, node
@@ -167,19 +167,6 @@ pub enum PageType {
     Overflow,
     /// Meta page ([`P_META`]).
     Meta,
-}
-
-impl PageType {
-    /// This page type's structural flag bit.
-    #[must_use]
-    pub fn flag_bit(self) -> u16 {
-        match self {
-            PageType::Leaf => P_LEAF,
-            PageType::Branch => P_BRANCH,
-            PageType::Overflow => P_OVERFLOW,
-            PageType::Meta => P_META,
-        }
-    }
 }
 
 /// Classify a `flags` field into a [`PageType`], enforcing the current rule:
@@ -335,5 +322,17 @@ pub enum PageError {
         pgno: u64,
         /// The snapshot's committed high-water.
         last_pg: u64,
+    },
+
+    /// A tree descent ran deeper than the tree's recorded depth: a cycle or
+    /// a corrupt `depth` (SPEC 03 INV-7). Refused instead of looping.
+    #[error("tree descent deeper than the recorded depth (cycle or corrupt depth)")]
+    TreeTooDeep,
+
+    /// A tree page (leaf or branch) was expected; the page has another type.
+    #[error("expected a leaf or branch page, found {found:?}")]
+    NotATreePage {
+        /// The page type actually found.
+        found: PageType,
     },
 }

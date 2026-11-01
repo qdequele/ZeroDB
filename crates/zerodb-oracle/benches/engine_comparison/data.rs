@@ -126,17 +126,7 @@ pub fn round_robin_probes(keys: &[Vec<u8>], dbs: usize, count: usize, seed: u64)
         .collect()
 }
 
-/// The OS page size (what LMDB is locked to), clamped to zerodb's supported
-/// `[4096, 65536]` power-of-two range so zerodb can be pinned to the same value.
-pub fn os_page_size() -> u32 {
-    // SAFETY: `sysconf(_SC_PAGESIZE)` is a pure query — no preconditions, no side
-    // effects.
-    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    match u32::try_from(v) {
-        Ok(p) if (4096..=65536).contains(&p) && p.is_power_of_two() => p,
-        _ => 4096,
-    }
-}
+pub use zerodb_oracle::os_page_size;
 
 /// Names for the multi-DB rungs. Stable and ordered so the "last DB" probe hits
 /// the same catalog position on both engines.

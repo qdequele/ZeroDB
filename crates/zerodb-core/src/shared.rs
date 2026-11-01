@@ -30,7 +30,7 @@ pub const READER_SLOT_SIZE: usize = 128;
 /// (which stores PID 0). A word with a non-zero PID therefore never recurs: a
 /// reaper that compare-and-swaps the whole word cannot be fooled by a PID
 /// that was freed and then claimed again under the same PID
-/// (ADR-0023 amendment 14). See [`owner_pid`], [`owner_generation`] and
+/// (ADR-0023). See [`owner_pid`], [`owner_generation`] and
 /// [`owner_word`].
 ///
 /// The padding is atomic bytes too, so the whole slot is interior-mutable:
@@ -120,7 +120,7 @@ pub trait SharedRegion: Send + Sync {
     /// liveness lock, ADR-0023 §3). Immune to PID reuse for other processes.
     /// For this process's own PID it is always `true`, even when the PID was
     /// recorded by a dead predecessor with the same PID; the reader table
-    /// frees those slots at open instead (ADR-0023 amendment 9).
+    /// frees those slots at open instead (ADR-0023).
     ///
     /// # Errors
     ///
@@ -135,7 +135,7 @@ pub trait SharedRegion: Send + Sync {
     /// `false` when it was acquired normally. An implementation that cannot
     /// tell (a POSIX record lock reports no previous owner) returns `false`.
     /// The environment reaps dead readers after a takeover, as LMDB does
-    /// (ADR-0023 amendment 12).
+    /// (ADR-0023).
     ///
     /// # Errors
     ///
@@ -147,7 +147,7 @@ pub trait SharedRegion: Send + Sync {
     /// publishes the finished header and downgrades its exclusive election
     /// lock to a shared one. A no-op for a joiner, which already holds it
     /// shared. The environment calls it once, at the end of its open, or,
-    /// for a `PREV_SNAPSHOT` open, at its first commit (amendment 19).
+    /// for a `PREV_SNAPSHOT` open, at its first commit (ADR-0023).
     ///
     /// # Errors
     ///

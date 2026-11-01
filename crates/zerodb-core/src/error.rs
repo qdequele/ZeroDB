@@ -91,7 +91,7 @@ pub enum MdbError {
 
     /// `MDB_MAP_RESIZED` (LMDB code `-30785`) — a transaction begin found the
     /// newest committed snapshot past this environment's logical map size:
-    /// another process grew the database beyond it (ADR-0023 amendment 15).
+    /// another process grew the database beyond it (ADR-0023).
     /// A larger map size recorded in the meta alone does not raise it.
     /// `Debug` renders as `MapResized`, matching `heed::MdbError::MapResized`.
     #[error("database contents grew beyond environment mapsize")]
@@ -103,6 +103,21 @@ pub enum MdbError {
     /// `heed::MdbError::BadDbi`.
     #[error("the specified DBI handle was closed/changed unexpectedly")]
     BadDbi,
+}
+
+/// `EINVAL` as heed surfaces it (`Error::Io`, raw OS error 22): LMDB's answer
+/// for a handle that is not valid in a transaction, and for
+/// `mdb_env_set_mapsize` while a write txn is live. `zerodb-core` has no
+/// `libc`; 22 is `EINVAL` on Linux and macOS, the supported targets.
+pub(crate) fn einval() -> Error {
+    Error::Io(std::io::Error::from_raw_os_error(22))
+}
+
+/// `EACCES` as heed surfaces it (`Error::Io(PermissionDenied)`, raw OS error
+/// 13): the fork's `mdb_txn_begin` answer to a write attempt on a read-only
+/// env (SPEC 01 Table 1, TXN-8).
+pub(crate) fn eacces() -> Error {
+    Error::Io(std::io::Error::from_raw_os_error(13))
 }
 
 /// A convenience result alias for engine operations.

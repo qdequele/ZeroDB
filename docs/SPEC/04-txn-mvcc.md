@@ -1073,6 +1073,16 @@ spilling bullet there.)
     cannot (the page cache survives it). Under `MAP_ASYNC` each flush seals
     that commit's final region bytes, preserving the per-commit versions
     the ordered-writeback sub-model (SPEC 06 REC-11) compares against.
+  *(Realization note — frame bits, issue #13; LMDB's `mdb_page_get` under
+  `MDB_WRITEMAP`.)* Once an in-place txn holds 64 frames, the dirty store
+  also keeps two bits per pgno that mirror its frame index: no frame, a
+  one-page frame in the map at the pgno itself, or any other frame (an
+  overflow-run head). Every change to the index updates them. The write
+  txn's page source answers "is this page dirty?" from them, and slices a
+  one-page dirty frame from its own whole-map view without probing the
+  index, as LMDB reads a dirty page at `map + pgno * psize`. The dirty / map
+  classification the memo relies on (above) is unchanged. The bits are not
+  carried to the next write txn, and heap modes never build them.
 
 ### §6.5 — put_reserved / ReservedSpace rules
 

@@ -1,5 +1,5 @@
-//! Bottom-up B+tree builder — the read-path test loader and the **prototype of
-//! a possible future `Database::bulk_load`**.
+//! Bottom-up B+tree builders: the streaming [`EnvStream`] behind compacting
+//! copy, and the batch `build_*_image` loaders tests use.
 //!
 //! Given a stream of **pre-sorted, unique** `(key, value)` pairs it packs leaves
 //! at a configurable fill factor, builds branch levels upward, spills big values
@@ -9,10 +9,6 @@
 //! opens and the [`crate::btree`] read path (and the `zerodb-tools check` tool)
 //! treat identically to a write-path tree — which is what lets the write path
 //! be differential-tested against this loader.
-//!
-//! It is written to be **promoted, not discarded**: the packing and
-//! upward-build logic is exactly what a bulk loader needs; only the page sink changes
-//! (an in-memory image here; the txn dirty set + writer there).
 //!
 //! Pure logic over a growable `Vec<u8>` page buffer — no I/O, no `unsafe`, so
 //! `miri` exercises it.
@@ -369,12 +365,11 @@ fn finalize_image(
 // compaction RAM)
 // ===========================================================================
 
-/// Where a streaming build lands its pages. `zerodb-core` has
-/// no I/O policy, so the file-backed implementation lives engine-side
-/// (`zerodb::copy`); [`VecSink`] is the in-memory implementation the batch
-/// wrappers and tests use. Pages may be emitted out of pgno order only for
-/// the two meta slots (patched last); data pages are emitted exactly once
-/// each, at the pgno `alloc` returned for them.
+/// Where a streaming build lands its pages. `zerodb-core` has no I/O policy, so
+/// the file-backed implementation lives engine-side (`zerodb::copy`); tests use
+/// an in-memory one. Pages may be emitted out of pgno order only for the two
+/// meta slots (patched last); data pages are emitted exactly once each, at the
+/// pgno `alloc` returned for them.
 pub trait PageSink {
     /// Allocate `n` contiguous page numbers, returning the first.
     fn alloc(&mut self, n: u64) -> u64;
@@ -384,19 +379,20 @@ pub trait PageSink {
     ///
     /// # Errors
     ///
-    /// I/O errors from file-backed sinks; [`VecSink`] never fails.
+    /// I/O errors from file-backed sinks; an in-memory sink never fails.
     fn emit(&mut self, pgno: u64, frame: &[u8]) -> std::io::Result<()>;
 }
 
 /// A [`PageSink`] over a growable in-memory image (pages 0/1 reserved for the
-/// meta slots) — the compatibility sink behind the batch `build_*_image`
-/// wrappers and the differential referee for file-backed streaming.
-pub struct VecSink {
+/// meta slots), the differential referee for file-backed streaming in tests.
+#[cfg(test)]
+pub(crate) struct VecSink {
     psize: u32,
     buf: Vec<u8>,
     next: u64,
 }
 
+#[cfg(test)]
 impl VecSink {
     /// A fresh image sink: two zeroed meta slots, data from [`FIRST_DATA_PGNO`].
     #[must_use]
@@ -415,6 +411,7 @@ impl VecSink {
     }
 }
 
+#[cfg(test)]
 impl PageSink for VecSink {
     fn alloc(&mut self, n: u64) -> u64 {
         let p = self.next;
@@ -473,8 +470,8 @@ struct StreamLevel {
 }
 
 /// Push-style bottom-up B+tree bulk loader (bounded-memory compaction): the batch
-/// [`build_tree_into`] logic — same greedy fill targets, same
-/// [`fix_branch_groups`] last-two rebalance, same overflow spill rule — but
+/// `build_tree_into` logic — same greedy fill targets, same
+/// `fix_branch_groups` last-two rebalance, same overflow spill rule — but
 /// driven one entry at a time and emitting every finished page straight to a
 /// [`PageSink`]. Peak memory is one leaf scratch frame + one overflow scratch
 /// frame + at most **two child lists per branch level** (≲ 2 pages' worth of
@@ -944,9 +941,7 @@ pub fn build_single_db_image(
 /// Build a complete **multi-DB** env-file image: the main/unnamed DB
 /// (`main_user` = its plain user entries) plus every named DB in `named`, each
 /// referenced from the main catalog by an inline `F_SUBDATA` record (SPEC 02
-/// §6). This is the compaction primitive for `Env::copy_to_file(Enabled)` and
-/// the `zerodb-tools load` reload path: every tree is packed bottom-up
-/// and densely, dropping fragmentation and all stale GC state.
+/// §6). Every tree is packed bottom-up and densely, with no free pages.
 ///
 /// Build order: each named DB's tree is packed first (so its root pgno is
 /// known), then the main catalog is packed over `main_user` merged with one

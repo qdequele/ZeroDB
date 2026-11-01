@@ -49,38 +49,9 @@ MEILI_PORT="${MEILI_PORT:-7700}"
 MARK_BEGIN="# >>> zerodb consumer gate (scripts/consumer.sh) >>>"
 MARK_END="# <<< zerodb consumer gate <<<"
 
-log() { printf '\n\033[1m[consumer] %s\033[0m\n' "$*"; }
-
-ensure_clone() {
-    if [ -d "$CLONE/.git" ]; then
-        # A previous run may have died with the patch block still in place.
-        set_patch off
-        if git -C "$CLONE" rev-parse --verify -q "$MEILISEARCH_REF^{commit}" >/dev/null; then
-            git -C "$CLONE" checkout -q --detach "$MEILISEARCH_REF"
-        else
-            git -C "$CLONE" fetch -q origin "$MEILISEARCH_REF"
-            git -C "$CLONE" checkout -q --detach FETCH_HEAD
-        fi
-        log "reusing clone at $CLONE, now at $MEILISEARCH_REF ($(git -C "$CLONE" rev-parse --short HEAD))"
-        return
-    fi
-    mkdir -p "$(dirname "$CLONE")"
-    if [ -n "${MEILISEARCH_SRC:-}" ]; then
-        log "shared clone from $MEILISEARCH_SRC at $MEILISEARCH_REF"
-        git clone -q --local --shared "$MEILISEARCH_SRC" "$CLONE"
-        git -C "$CLONE" checkout -q "$MEILISEARCH_REF"
-    else
-        log "cloning meilisearch at $MEILISEARCH_REF"
-        git clone -q --depth 1 --branch "$MEILISEARCH_REF" https://github.com/meilisearch/meilisearch "$CLONE"
-    fi
-}
-
-# Patch heed to the shim ($1 = on), prepare a stock build ($1 = stock) or restore
-# the manifest ($1 = off); see scripts/patch-heed.py.
-set_patch() {
-    python3 "$ZERODB/scripts/patch-heed.py" "$CLONE/Cargo.toml" "$1" \
-        "$MARK_BEGIN" "$MARK_END" "$(heed_shim)"
-}
+LOG_TAG=consumer
+# shellcheck source=scripts/lib/consumer-common.sh
+source "$ZERODB/scripts/lib/consumer-common.sh"
 
 # The shim matching the heed API the clone builds against (ADR-0027). Reads
 # the committed lock file: a build with the shim patched in rewrites the one
@@ -94,17 +65,6 @@ heed_shim() {
     else
         echo "$ZERODB/crates/heed-shim"
     fi
-}
-
-assert_no_lmdb() {
-    # The whole point of the drop-in: with the shim patched in, the C LMDB fork
-    # must vanish from the dependency graph of the crate under test.
-    if (cd "$CLONE" && cargo tree -p "$1" -i lmdb-master-sys >/dev/null 2>&1); then
-        echo "FAIL: lmdb-master-sys is still in $1's dependency tree" >&2
-        (cd "$CLONE" && cargo tree -p "$1" -i lmdb-master-sys | head -20) >&2
-        exit 1
-    fi
-    log "$1: lmdb-master-sys absent from the dependency tree (pure ZeroDB)"
 }
 
 do_check() {
@@ -215,7 +175,7 @@ cleanup() {
     exit "$rc"
 }
 
-ensure_clone
+ensure_clone "$MEILISEARCH_REF" "${MEILISEARCH_SRC:-}" https://github.com/meilisearch/meilisearch
 trap cleanup EXIT
 case "$MODE" in
     check)  do_check ;;

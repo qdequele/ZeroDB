@@ -1,7 +1,7 @@
-//! Free-page GC guard tests (ADR-0005 D6) over **real files**: freed-page
+//! Free-page GC guard tests (ADR-0005) over **real files**: freed-page
 //! reclamation (SPEC 05 GC-14..20), the freelist-writes-to-itself commit step
 //! (GC-11..13), the partial-drain remainder rewrite (GC-20), the interim
-//! oldest-reader gate (ADR-0005 OQ1; SPEC 04 TXN-21), the huge-txn PIL spill
+//! oldest-reader gate (ADR-0005; SPEC 04 TXN-21), the huge-txn PIL spill
 //! (GC-5/GC-26),
 //! `non_free_pages_size` (GC-22..24, INV-27), and GC atomicity across crashes
 //! (GC-14, REC-6).
@@ -10,37 +10,14 @@
 //! **including** the INV-22 reachable-XOR-free partition — a leaked page
 //! ("neither") or a double-hand-out ("both") fails loudly.
 
+mod common;
+use common::{assert_clean, TempDir};
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use zerodb::{check, free_page_count, CommitHook, Env, EnvOpenOptions, HookPoint};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-gc-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{free_page_count, CommitHook, Env, EnvOpenOptions, HookPoint};
 
 const PS: u32 = 4096;
 const MAP: usize = 16 << 20;
@@ -52,12 +29,6 @@ fn open(dir: &Path) -> Env {
     opts.open(dir).expect("open env")
 }
 
-fn assert_clean(dir: &Path) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, PS);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
-}
-
 fn file_size(dir: &Path) -> u64 {
     std::fs::metadata(dir.join(zerodb::DATA_FILE_NAME))
         .unwrap()
@@ -65,7 +36,7 @@ fn file_size(dir: &Path) -> u64 {
 }
 
 /// Bounded file growth on insert/delete churn (GC acceptance criterion;
-/// ADR-0005 D5 flatness bound): with a constant live set, reclamation must
+/// ADR-0005 flatness bound): with a constant live set, reclamation must
 /// hold the file at a steady state — size at the last cycle within 1.05× of
 /// the size at the halfway cycle. The INV-22 walk after every commit is the
 /// structural half of the guarantee (no leak, no double-hand-out); this is
@@ -92,7 +63,7 @@ fn churn_file_growth_reaches_steady_state() {
             db.delete(&mut wtxn, &k).unwrap();
         }
         wtxn.commit().unwrap();
-        assert_clean(dir.path());
+        assert_clean(dir.path(), PS);
         sizes.push(file_size(dir.path()));
     }
     let half = sizes[CYCLES / 2] as f64;
@@ -104,7 +75,7 @@ fn churn_file_growth_reaches_steady_state() {
     );
 }
 
-/// GC-20 partial-drain remainder rewrite (ADR-0005 D6 risk 3): draining part
+/// GC-20 partial-drain remainder rewrite (ADR-0005 risk 3): draining part
 /// of a GC entry across a commit must keep the remainder listed (INV-22
 /// "never neither"), remove the drained ids (INV-22 "never both" — they are
 /// reachable again), and leave the remainder genuinely reusable (a follow-up
@@ -131,7 +102,7 @@ fn partial_drain_remainder_survives_commits() {
         }
         wtxn.commit().unwrap();
     }
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     let free_after_del = {
         let rtxn = env.read_txn().unwrap();
         free_page_count(&rtxn).unwrap()
@@ -152,7 +123,7 @@ fn partial_drain_remainder_survives_commits() {
         }
         wtxn.commit().unwrap();
     }
-    assert_clean(dir.path()); // INV-22/24: remainder listed once, drained ids not
+    assert_clean(dir.path(), PS); // INV-22/24: remainder listed once, drained ids not
     let free_after_partial = {
         let rtxn = env.read_txn().unwrap();
         free_page_count(&rtxn).unwrap()
@@ -184,7 +155,7 @@ fn partial_drain_remainder_survives_commits() {
         }
         wtxn.commit().unwrap();
     }
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     assert_eq!(
         file_size(dir.path()),
         size_after_del,
@@ -192,7 +163,7 @@ fn partial_drain_remainder_survives_commits() {
     );
 }
 
-/// GC-11..13 freelist-writes-to-itself (ADR-0005 D6 risk 1) + the GC-26
+/// GC-11..13 freelist-writes-to-itself (ADR-0005 risk 1) + the GC-26
 /// huge-txn spill: one txn frees far more than the `c >= 251` (psize 4096)
 /// spill threshold, so the PIL goes to an overflow run, and `freelist_save`'s
 /// own tree writes free/allocate GC pages mid-save. INV-22 catches any page
@@ -212,7 +183,7 @@ fn freelist_self_write_split_and_spill() {
         }
         wtxn.commit().unwrap();
     }
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     // One txn freeing the whole tree: clear().
     let t0 = std::time::Instant::now();
     {
@@ -221,7 +192,7 @@ fn freelist_self_write_split_and_spill() {
         wtxn.commit().unwrap();
     }
     let commit_time = t0.elapsed();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     let rtxn = env.read_txn().unwrap();
     let free = free_page_count(&rtxn).unwrap();
     drop(rtxn);
@@ -245,7 +216,7 @@ fn freelist_self_write_split_and_spill() {
         }
         wtxn.commit().unwrap();
     }
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     // Slack note: a commit's own GC pages are committed-freed and age one txn
     // before reuse (TXN-62), so a single post-clear commit may exceed the pool
     // by the GC-tree size (~2 pages) — bounded, not a leak (INV-22 above).
@@ -258,7 +229,7 @@ fn freelist_self_write_split_and_spill() {
     );
 }
 
-/// The interim oldest-reader gate (ADR-0005 OQ1, D6 risk 2 —
+/// The interim oldest-reader gate (ADR-0005 —
 /// reuse-while-referenced): a live `RoTxn` pins its snapshot; writers that
 /// churn concurrently must NOT reclaim pages that snapshot still reaches.
 /// The reader's borrows come zero-copy from the mmap, so a gate bug is
@@ -302,7 +273,7 @@ fn reader_gate_blocks_reuse_until_release() {
         }
         wtxn.commit().unwrap();
     }
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     // The pinned snapshot must read back byte-correct originals.
     assert_eq!(rtxn.txnid(), pinned);
     for i in (0..400u32).step_by(7) {
@@ -328,7 +299,7 @@ fn reader_gate_blocks_reuse_until_release() {
         }
         wtxn.commit().unwrap();
     }
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     // Same 2-page slack as above: the commit's own GC storage ages one txn.
     assert!(
         file_size(dir.path()) <= size_pinned + 2 * u64::from(PS),
@@ -385,7 +356,7 @@ fn non_free_pages_size_identity() {
 }
 
 // ---------------------------------------------------------------------------
-// GC atomicity across crashes (GC-14; ADR-0005 D6, crash-churn variant of the
+// GC atomicity across crashes (GC-14; ADR-0005, crash-churn variant of the
 // commit-pipeline crash smoke — the full crash harness lives in zerodb-oracle).
 // ---------------------------------------------------------------------------
 
@@ -503,7 +474,7 @@ fn gc_crash_matrix_recovers_consistently() {
         );
         drop(rtxn);
         drop(env);
-        assert_clean(dir.path());
+        assert_clean(dir.path(), PS);
     }
 }
 
@@ -558,12 +529,12 @@ fn lay_out_and_free_a_then_b(env: &Env, dir: &Path, before_b: impl FnOnce()) {
         wtxn.commit().unwrap();
     }
     commit_delete(env, b"x");
-    assert_clean(dir);
+    assert_clean(dir, PS);
     commit_delete(env, b"a");
-    assert_clean(dir);
+    assert_clean(dir, PS);
     before_b();
     commit_delete(env, b"b");
-    assert_clean(dir);
+    assert_clean(dir, PS);
 }
 
 /// SPEC 05 GC-21: once both records pass the reuse gate, a value as long as
@@ -583,7 +554,7 @@ fn run_across_two_gc_records_is_reused() {
     let before = file_size(dir.path());
     let c = pages_value(b'c', 2 * BIG);
     commit_put(&env, b"c", &c);
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     let grew = (file_size(dir.path()) - before) / u64::from(PS);
     assert!(
         grew < 8,
@@ -602,7 +573,7 @@ fn run_across_two_gc_records_is_reused() {
     drop(env);
     let env = open(dir.path());
     commit_put(&env, b"d", &pages_value(b'd', 3));
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 }
 
 /// The reuse gate holds for every record a run is drawn from: a reader that
@@ -623,7 +594,7 @@ fn reader_pin_keeps_a_record_out_of_the_cross_record_search() {
     let before = file_size(dir.path());
     let c = pages_value(b'c', 2 * BIG);
     commit_put(&env, b"c", &c);
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     let grew = (file_size(dir.path()) - before) / u64::from(PS);
     assert!(
         grew >= 2 * BIG as u64,
@@ -639,7 +610,7 @@ fn reader_pin_keeps_a_record_out_of_the_cross_record_search() {
     commit_put(&env, b"s2", b"spacer");
     let before = file_size(dir.path());
     commit_put(&env, b"d", &pages_value(b'd', 2 * BIG));
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     let grew = (file_size(dir.path()) - before) / u64::from(PS);
     assert!(
         grew < 8,
@@ -718,7 +689,7 @@ fn gc_cross_record_crash_matrix_recovers_consistently() {
         assert_eq!(db.get(&rtxn, b"a").unwrap(), None, "{hook}");
         assert_eq!(db.get(&rtxn, b"b").unwrap(), None, "{hook}");
         drop(rtxn);
-        assert_clean(dir.path());
+        assert_clean(dir.path(), PS);
         if recovered == CROSS_TXNS {
             assert_eq!(
                 got, None,
@@ -738,6 +709,6 @@ fn gc_cross_record_crash_matrix_recovers_consistently() {
             commit_put(&env, b"d", &pages_value(b'd', 3));
         }
         drop(env);
-        assert_clean(dir.path());
+        assert_clean(dir.path(), PS);
     }
 }

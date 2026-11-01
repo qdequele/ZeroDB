@@ -1,4 +1,11 @@
-//! Ingredient isolation for the fork SEGV. VARIANT env var picks the case.
+//! Isolates the ingredients of the LMDB fork crash recorded as FORK-1 in
+//! `docs/UPSTREAM-BUGS.md`: an `APPEND` put that should fail with `KeyExist`
+//! after a `clear` of another database in the same write txn.
+//!
+//! `VARIANT=<case> cargo run -p zerodb-oracle --example fork_segv_repro`, where
+//! `<case>` drops or changes one ingredient: `no_second_db`, `with_clear`,
+//! `clear_small_val`, `clear_no_tiny`, `no_tiny`, `small_val`, `ordered_key`
+//! (any other value runs the base case: second db opened, no clear).
 use heed::types::Bytes;
 use heed::{EnvOpenOptions, PutFlags};
 
@@ -9,6 +16,7 @@ fn main() {
     let mut opts = EnvOpenOptions::new().read_txn_without_tls();
     opts.map_size(1 << 20);
     opts.max_dbs(16);
+    // SAFETY: a fresh private directory, opened once by this process.
     let env = unsafe { opts.open(&dir) }.unwrap();
     let mut w = env.write_txn().unwrap();
     let db0: heed::Database<Bytes, Bytes> = env.create_database(&mut w, Some("db40")).unwrap();
@@ -26,13 +34,12 @@ fn main() {
     }
     let (klen, vlen): (usize, usize) = match variant.as_str() {
         "small_val" | "clear_small_val" => (500, 4096),
-        "ordered_key" => (500, 1_000_000), // key > last? zeros < 0xbe68, so use 0xff prefix
         _ => (500, 1_000_000),
     };
+    // The base key (all zeros) sorts before the tiny `0xbe68` key, so the
+    // APPEND must fail with `KeyExist`; `ordered_key` makes it sort after.
     let key = if variant == "ordered_key" {
-        let mut k = vec![0xffu8; klen];
-        k[0] = 0xff;
-        k
+        vec![0xffu8; klen]
     } else {
         vec![0u8; klen]
     };

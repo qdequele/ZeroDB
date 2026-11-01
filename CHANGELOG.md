@@ -38,6 +38,7 @@ the release workflow publishes the section matching the tag as the GitHub releas
 - `zerodb-core`: `Cursor::advance_by` and `Cursor::retreat_by`.
 - New error variant `MdbError::BadDbi`.
 - A runnable example, `cargo run -p zerodb --example basic`.
+- `zerodb::EnvFlags::from_bits_truncate`.
 
 ### Changed
 
@@ -90,12 +91,22 @@ the release workflow publishes the section matching the tag as the GitHub releas
   copy on APFS went from 20 s to 0.19 s. The output is unchanged.
 - `zerodb-core`: `DirtyStore::sorted_pgnos` is replaced by
   `sorted_pgnos_into`, which fills a caller's buffer.
+- `zerodb-tools dump` streams each database to its output instead of
+  holding the whole environment in memory, and `migrate-from-lmdb` commits
+  about every 64 MiB and grows the map when it fills, as `load` does.
+- `zerodb-tools` rejects an option with a missing or unparseable value (such
+  as `--page-size abc`) instead of treating it as a path.
 
 ### Performance
 
 Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
+- `WRITE_MAP` bulk writes find dirty pages with two bits per page instead of
+  a hash probe, and read them at their own offset in the map, as LMDB does
+  under `MDB_WRITEMAP` (#13). With `WRITE_MAP`: `put/order/seq` 1.12× →
+  0.99×, `commit/batch/n10k` 1.11× → 1.00×, `put/api/reserved` 1.30× → 1.12×;
+  nothing changes without `WRITE_MAP`.
 - Write transactions reuse the previous one's containers, as LMDB's
   `me_txn0` (#8): 5 heap allocations per single-put commit instead of 19.
   `commit/batch/n1` 1.26× → 1.17×.
@@ -121,6 +132,9 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 
 ### Fixed
 
+- heed adapter: `Database::put_reserved` returns `Io(UnexpectedEof)` when the
+  closure writes fewer bytes than it reserved, as heed does. It returned `Ok`
+  with a zeroed tail.
 - A commit no longer panics with "freelist_save failed to reach a fixed
   point" when the committing transaction's freed-page record sits at an
   overflow page-count boundary.
@@ -132,6 +146,13 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 
 ### Removed
 
+- Re-exports from `zerodb` that were internals: `build_multi_db_image`,
+  `EnvStream`, `NamedDbData`, `PageSink`, `DEFAULT_FILL_PERMILLE`, `KeyCmp`
+  and `FIRST_DATA_PGNO`; and the `EnvOpenOptions` getters
+  `get_sequential_writes`, `get_max_dirty_bytes`, `get_max_dbs` and
+  `get_max_readers`.
+- `zerodb-io` exports only `probe_page_size` among its file helpers; `Mmap`,
+  `MmapWritable` and the page read and write helpers are now private.
 - The `crossbeam-utils` dependency.
 - The heed adapter's unreleased `lock_file(bool)` setter: `NO_LOCK` is the
   opt-out.

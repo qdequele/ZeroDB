@@ -1,5 +1,5 @@
 //! The error taxonomy, 1:1 with `heed::Error` / `heed::MdbError` (SPEC 00
-//! rows 54–58, SPEC 04 §8.1; ADR-0003 §C5). The adapter maps ZeroDB's native
+//! rows 54–58, SPEC 04 §8.1; ADR-0003). The adapter maps ZeroDB's native
 //! [`zerodb::Error`] / [`zerodb::MdbError`] onto these so consumers that match
 //! `heed::Error::{Io, Mdb, Encoding, Decoding, EnvAlreadyOpened}` and the
 //! `MdbError` variants (`MapFull`, `Invalid`, `BadValSize`, `KeyExist`, …) see
@@ -11,7 +11,7 @@ use std::{error, fmt, io, result};
 pub use heed_traits::BoxedError;
 
 /// An error that encapsulates all possible errors in this crate — the exact
-/// shape of `heed::Error` (SPEC 00 row 54).
+/// shape of `heed::Error`.
 #[derive(Debug)]
 pub enum Error {
     /// I/O error: can come from the standard library or be a rewrapped

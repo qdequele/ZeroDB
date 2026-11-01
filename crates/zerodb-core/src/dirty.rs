@@ -1,4 +1,4 @@
-//! The write transaction's dirty-page store (SPEC 04 §6.3, ADR-0004 D1).
+//! The write transaction's dirty-page store (SPEC 04 §6.3, ADR-0004).
 //!
 //! A [`DirtyStore`] holds a write txn's private, not-yet-committed page copies
 //! as **individually stable frames** indexed by pgno:
@@ -21,7 +21,7 @@
 //! is met by construction; the store never drops a frame under a `&self`
 //! borrow). This module does no I/O; its heap paths are pure safe Rust, and
 //! its one `unsafe` is the sanctioned call of the in-place WRITE_MAP map-slice
-//! broker ([`map_mut`]; AGENTS.md unsafe policy, ADR-0021). `miri` exercises
+//! broker (`map_mut`; AGENTS.md unsafe policy, ADR-0021). `miri` exercises
 //! both realizations (TXN-49; `tests/writemap_in_place_miri.rs` over the
 //! heap-backed test map).
 //!
@@ -35,8 +35,8 @@
 //! avoiding a slow-path `malloc`+`free` of a full page (above glibc's tcache
 //! bin) per touched or new page. Run frames (multi-page) are never pooled;
 //! they are just dropped. The env hands a store its initial spares at
-//! write-txn begin and reclaims them at end (see [`DirtyStore::with_spare`] /
-//! [`DirtyStore::reclaimable_frames`]).
+//! write-txn begin and reclaims them at end (see `DirtyStore::with_spare` /
+//! `DirtyStore::reclaimable_frames`).
 //!
 //! **Spilling (SPEC 04 §6.3a, ADR-0017; LMDB `mdb_page_spill`).** The store
 //! counts the pages its frames hold ([`DirtyStore::pages`]). Past the env's
@@ -49,29 +49,28 @@
 //!
 //! **In-map dirty pages (ADR-0021; SPEC 04 §6.4 TXN-45b; `WRITE_MAP`).** When
 //! the backing brokers map slices ([`Backing::dirty_in_map`]), a store built
-//! with [`DirtyStore::with_spare_in_map`] realizes every new frame **in the
-//! writable map** at the frame's own pgno ([`Slot::Map`]) instead of on the
+//! with `DirtyStore::from_carry` with a broker realizes every new frame **in
+//! the writable map** at the frame's own pgno (`Slot::Map`) instead of on the
 //! heap: the bytes are already at their final file offset, so commit C2 (and
 //! spilling) writes nothing for them. The TXN-41 stability contract holds
-//! unchanged — the map is mapped once for the env's life (ADR-0004 D4), so a
+//! unchanged — the map is mapped once for the env's life (ADR-0004), so a
 //! map frame's address never moves — and the borrow discipline is the same:
-//! `bytes` ties a shared view to `&self`, `bytes_mut` a mutable view to
-//! `&mut self`, so the brokered `&mut` slices are transient and never
-//! overlap a live borrow (TXN-39). Writing a frame **at allocation time**
-//! instead of commit C2 is safe for the same reason spilling is (TXN-70):
-//! the pgno came from this txn's allocator, so TXN-62 guarantees no live
-//! snapshot references it. Map frames are never pooled as spares; `remove`
-//! copies a map frame out to a heap `Box` (the split path's scratch copy).
+//! `bytes` ties a shared view to `&self`, `bytes_mut` a mutable view to `&mut
+//! self`, so the brokered `&mut` slices are transient and never overlap a live
+//! borrow (TXN-39). Writing a frame **at allocation time** instead of commit C2
+//! is safe for the same reason spilling is (TXN-70): the pgno came from this
+//! txn's allocator, so TXN-62 guarantees no live snapshot references it. Map
+//! frames are never pooled as spares; `remove` copies a map frame out to a heap
+//! `Box` (the split path's scratch copy).
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::env::Backing;
 
-/// Pgno hasher (issue #9): every page load inside a write txn
-/// probes this store first (`Source::Writer`), and the hannoy-build call
-/// tree put the default `RandomState` SipHash among the top descent costs.
-/// Keys are page numbers authored by the engine itself — never
+/// Pgno hasher: every page load inside a write txn probes this store first
+/// (`Source::Writer`), so the default SipHash would sit on the descent's
+/// hot path. Keys are page numbers authored by the engine itself — never
 /// attacker-controlled input — so SipHash's HashDoS resistance buys nothing
 /// here. This uses the splitmix64 finalizer (same full-avalanche 3-multiply
 /// mixer as `btree::ValidatedPages::mix`), which also mixes the low bits
@@ -116,8 +115,84 @@ pub(crate) type PgnoBuildHasher = BuildHasherDefault<PgnoHasher>;
 /// small, bursty write txns that dominate, cheap to hold onto.
 pub(crate) const SPARE_CAP: usize = 256;
 
+/// Frames an in-map store holds before it builds its [`FrameBits`]: below
+/// this the hash index is a few cache lines and stays hot, and a small
+/// write txn pays nothing for the bits.
+const FRAME_BITS_MIN: usize = 64;
+
+/// Pages per [`FrameBits`] chunk: two bits each, so one chunk is 4 KiB.
+const BITS_CHUNK_SHIFT: u32 = 14;
+const BITS_CHUNK_WORDS: usize = 1 << (BITS_CHUNK_SHIFT - 5);
+
+/// What [`FrameBits`] records for a pgno.
+const BITS_NONE: u64 = 0;
+/// A one-page frame in the map at the pgno itself (tree page).
+const BITS_MAP_PAGE: u64 = 1;
+/// Any other frame (an overflow-run head, or a heap frame): look it up.
+const BITS_OTHER: u64 = 2;
+
+/// Two bits per pgno mirroring the frame index of an in-map store
+/// (ADR-0021): whether `pgno` has a frame and whether it is a one-page map
+/// frame. Under `WRITE_MAP` a one-page frame's bytes sit at the pgno's own
+/// map offset, so this answers every descent step's "is this page dirty?"
+/// with one load from a table a 10k-page txn keeps in 2.5 KiB, instead of a
+/// hash probe into the index. LMDB's `mdb_page_get` skips its dirty-list
+/// search under `MDB_WRITEMAP` for the same reason; ZeroDB still needs the
+/// answer, because map pages are validated and memoized and dirty frames are
+/// not. Chunks are allocated on first use; pgnos are bounded by the map.
+#[derive(Default)]
+struct FrameBits {
+    chunks: Vec<Option<Box<[u64]>>>,
+}
+
+impl FrameBits {
+    #[inline(always)]
+    fn get(&self, pgno: u64) -> u64 {
+        let c = (pgno >> BITS_CHUNK_SHIFT) as usize;
+        match self.chunks.get(c) {
+            Some(Some(chunk)) => {
+                let i = (pgno as usize >> 5) & (BITS_CHUNK_WORDS - 1);
+                (chunk[i] >> ((pgno & 31) * 2)) & 3
+            }
+            _ => BITS_NONE,
+        }
+    }
+
+    fn set(&mut self, pgno: u64, state: u64) {
+        let c = (pgno >> BITS_CHUNK_SHIFT) as usize;
+        if c >= self.chunks.len() {
+            if state == BITS_NONE {
+                return;
+            }
+            self.chunks.resize_with(c + 1, || None);
+        }
+        let chunk = match &mut self.chunks[c] {
+            Some(chunk) => chunk,
+            slot @ None => {
+                if state == BITS_NONE {
+                    return;
+                }
+                slot.insert(vec![0u64; BITS_CHUNK_WORDS].into_boxed_slice())
+            }
+        };
+        let i = (pgno as usize >> 5) & (BITS_CHUNK_WORDS - 1);
+        let sh = (pgno & 31) * 2;
+        chunk[i] = (chunk[i] & !(3 << sh)) | (state << sh);
+    }
+}
+
+/// [`DirtyStore::resolve`]'s answer.
+pub(crate) enum Resolved<'a> {
+    /// No frame: the page is read from the map as committed.
+    Clean,
+    /// A one-page frame in the map at the pgno's own offset.
+    MapPage,
+    /// Any other frame, with its bytes.
+    Frame(&'a [u8]),
+}
+
 /// Capacity, in entries, that a write txn's pgno-hashed indexes keep when
-/// they are carried to the next write txn ([`DirtyCarry`]; issue #8). A
+/// they are carried to the next write txn ([`DirtyCarry`]). A
 /// hash table is iterated over its whole bucket array, not its entries
 /// (commit C2 lists the dirty pgnos that way), so an index left large by
 /// one big txn would slow every small txn after it. 128 entries is 256
@@ -146,11 +221,10 @@ where
 }
 
 /// A [`DirtyStore`]'s allocations, handed from one write txn to the next on
-/// the env's writer slot (issue #8): the frame index and the spilled index,
-/// empty, and the recycled one-page frames. LMDB allocates its dirty list
-/// and its `me_dpages` frame pool once per environment and reuses them in
-/// every write txn; rebuilding the two indexes from nothing cost every
-/// write txn their allocations and the rehashes that grow them.
+/// the env's writer slot: the frame index and the spilled index, empty, and
+/// the recycled one-page frames. LMDB likewise allocates its dirty list and
+/// its `me_dpages` frame pool once per environment and reuses them in every
+/// write txn.
 #[derive(Default)]
 pub(crate) struct DirtyCarry {
     frames: HashMap<u64, Slot, PgnoBuildHasher>,
@@ -188,12 +262,20 @@ impl Slot {
             Slot::Map { len } => *len,
         }
     }
+
+    /// This slot's [`FrameBits`] state in a store of page size `psize`.
+    fn bits_state(&self, psize: usize) -> u64 {
+        match self {
+            Slot::Map { len } if *len == psize => BITS_MAP_PAGE,
+            _ => BITS_OTHER,
+        }
+    }
 }
 
 /// A write txn's dirty-page frames, indexed by pgno. See the module docs for
 /// the stability contract. `'env` is the backing's lifetime (only used in
-/// in-map mode, [`DirtyStore::with_spare_in_map`]; heap-mode stores never
-/// touch it).
+/// in-map mode, `DirtyStore::from_carry` with a broker; heap-mode stores
+/// never touch it).
 pub struct DirtyStore<'env> {
     psize: u32,
     /// `log2(psize)` (page sizes are powers of two, SPEC 02 §3.2): turns a
@@ -218,6 +300,10 @@ pub struct DirtyStore<'env> {
     /// Spilled pgnos (SPEC 04 TXN-69..72) → page count (1 for a tree page,
     /// `n` for an overflow-run head). Disjoint from `frames`.
     spilled: HashMap<u64, u64, PgnoBuildHasher>,
+    /// The frame index's [`FrameBits`] mirror, in-map stores only, built
+    /// once the store holds [`FRAME_BITS_MIN`] frames. Every change to
+    /// `frames` updates it.
+    bits: Option<Box<FrameBits>>,
 }
 
 impl std::fmt::Debug for DirtyStore<'_> {
@@ -242,7 +328,7 @@ impl std::fmt::Debug for DirtyStore<'_> {
 /// the same broker with the same geometry.
 ///
 /// This is the **sole sanctioned call site** of the `unsafe` map-slice broker
-/// (AGENTS.md unsafe policy; ADR-0021 B1): the broker is
+/// (AGENTS.md unsafe policy; ADR-0021): the broker is
 /// an `unsafe fn` because it mints `&mut [u8]` from `&self`, and this module
 /// discharges its contract. `map_mut` is itself an `unsafe fn` for the same
 /// reason — no safe function anywhere may mint `&mut` from a shared borrow.
@@ -277,7 +363,7 @@ unsafe fn map_mut(broker: Option<&dyn Backing>, psize: u32, pgno: u64, len: usiz
     //    the committed high-water or GC-reclaimed under the oldest-reader
     //    gate — which the txn additionally re-checks with a typed
     //    release-mode guard before any in-map frame is tracked
-    //    (`RwTxn::allocate`, ADR-0021 M2). Readers, nested readers and the
+    //    (`RwTxn::allocate`, ADR-0021). Readers, nested readers and the
     //    committed trees therefore never dereference the region.
     //  * Exactly one live `&mut` per map region, tied to `&mut DirtyStore`,
     //    never stored: every caller of this function is a `&mut self` method
@@ -285,7 +371,7 @@ unsafe fn map_mut(broker: Option<&dyn Backing>, psize: u32, pgno: u64, len: usiz
     //    never retains it (only `Slot::Map { len }` bookkeeping), and no
     //    caller invokes it twice without the previous borrow dying first.
     //  * The whole-map `&[u8]` read view is re-derived after each spill
-    //    (`RwTxn::spill`, ADR-0021 B2) and — in in-map mode — re-borrowed
+    //    (`RwTxn::spill`, ADR-0021) and — in in-map mode — re-borrowed
     //    lazily on every access (`RwTxn::whole_map`: under Stacked Borrows
     //    even *copying* a stale view after an in-place write is UB at the
     //    written locations), so no stale shared
@@ -301,19 +387,20 @@ unsafe fn map_mut(broker: Option<&dyn Backing>, psize: u32, pgno: u64, len: usiz
 
 impl<'env> DirtyStore<'env> {
     /// An empty store for pages of size `psize`.
+    #[cfg(test)]
     #[must_use]
-    pub fn new(psize: u32) -> DirtyStore<'env> {
+    pub(crate) fn new(psize: u32) -> DirtyStore<'env> {
         DirtyStore::with_spare(psize, Vec::new())
     }
 
     /// An empty store seeded with a pool of recycled one-page frames (the
     /// env's `me_dpages`-style pool handed in at write-txn begin). The `Vec`
-    /// is adopted as is, O(1): every write txn, empty ones
-    /// included, pays for the pool hand-over, so it must not scale with the
-    /// pool size (a per-frame filter here made `env/txn/rw_empty_commit` 6×
-    /// slower). The pool only ever holds frames of this env's page size.
+    /// is adopted as is, O(1): every write txn, empty ones included, pays
+    /// for the pool hand-over, so it must not scale with the pool size. The
+    /// pool only ever holds frames of this env's page size.
+    #[cfg(test)]
     #[must_use]
-    pub fn with_spare(psize: u32, spare: Vec<Box<[u8]>>) -> DirtyStore<'env> {
+    pub(crate) fn with_spare(psize: u32, spare: Vec<Box<[u8]>>) -> DirtyStore<'env> {
         DirtyStore::from_carry(
             psize,
             DirtyCarry {
@@ -326,7 +413,7 @@ impl<'env> DirtyStore<'env> {
 
     /// An empty store built from the previous write txn's allocations
     /// ([`DirtyCarry`]), realizing new frames in the writable map through
-    /// `broker` when it is `Some` (see [`DirtyStore::with_spare_in_map`]).
+    /// `broker` when it is `Some` (ADR-0021, SPEC 04 §6.4 TXN-45b).
     /// O(1): the indexes and the spare `Vec` move in whole.
     #[must_use]
     pub(crate) fn from_carry(
@@ -352,23 +439,8 @@ impl<'env> DirtyStore<'env> {
             spare,
             pages: 0,
             spilled,
+            bits: None,
         }
-    }
-
-    /// [`DirtyStore::with_spare`], realizing new frames **in the writable
-    /// map** through `broker` (ADR-0021, SPEC 04 §6.4 TXN-45b). The caller
-    /// (write-txn begin) selects this only when
-    /// [`Backing::dirty_in_map`] is `true`.
-    #[must_use]
-    pub fn with_spare_in_map(
-        psize: u32,
-        spare: Vec<Box<[u8]>>,
-        broker: &'env dyn Backing,
-    ) -> DirtyStore<'env> {
-        debug_assert!(broker.dirty_in_map());
-        let mut s = DirtyStore::with_spare(psize, spare);
-        s.broker = Some(broker);
-        s
     }
 
     /// Whether this store realizes dirty frames in the writable map
@@ -378,16 +450,9 @@ impl<'env> DirtyStore<'env> {
         self.broker.is_some()
     }
 
-    /// Whether `pgno`'s frame lives in the map (always `false` in heap mode).
-    /// Commit C2/spill skip these frames: their bytes are already at their
-    /// final file offset.
-    #[must_use]
-    pub fn in_map(&self, pgno: u64) -> bool {
-        self.broker.is_some() && matches!(self.frames.get(&pgno), Some(Slot::Map { .. }))
-    }
-
-    /// `pgno`'s frame length in bytes and whether it lives in the map
-    /// ([`DirtyStore::in_map`]), in one lookup; `None` without a frame.
+    /// `pgno`'s frame length in bytes and whether it lives in the map, in
+    /// one lookup; `None` without a frame. Commit C2 and spilling skip map
+    /// frames: their bytes are already at their final file offset.
     #[must_use]
     pub fn frame_extent(&self, pgno: u64) -> Option<(usize, bool)> {
         self.frames
@@ -398,7 +463,10 @@ impl<'env> DirtyStore<'env> {
     /// Whether `pgno` has a dirty frame (tree page, or overflow-run **head**).
     #[must_use]
     pub fn contains(&self, pgno: u64) -> bool {
-        self.frames.contains_key(&pgno)
+        match self.bits_state(pgno) {
+            Some(state) => state != BITS_NONE,
+            None => self.frames.contains_key(&pgno),
+        }
     }
 
     /// Number of dirty frames (runs count once).
@@ -423,6 +491,30 @@ impl<'env> DirtyStore<'env> {
     #[inline]
     fn pages_of(&self, len: usize) -> u64 {
         (len >> self.psize_shift) as u64
+    }
+
+    /// Mirror a change of `pgno`'s frame into the [`FrameBits`], if built.
+    #[inline]
+    fn note(&mut self, pgno: u64, state: u64) {
+        if let Some(bits) = &mut self.bits {
+            bits.set(pgno, state);
+        }
+    }
+
+    /// `pgno`'s [`FrameBits`] state, or `None` while the bits are not built
+    /// (the caller then asks the hash index). Checked against the index in
+    /// debug builds.
+    #[inline(always)]
+    fn bits_state(&self, pgno: u64) -> Option<u64> {
+        let state = self.bits.as_ref()?.get(pgno);
+        debug_assert_eq!(
+            state,
+            self.frames
+                .get(&pgno)
+                .map_or(BITS_NONE, |f| f.bits_state(self.psize as usize)),
+            "frame bits out of step with the index at pgno {pgno}"
+        );
+        Some(state)
     }
 
     /// Whether any page of this txn is spilled (SPEC 04 §6.3a). The cheap
@@ -466,14 +558,11 @@ impl<'env> DirtyStore<'env> {
     /// [`DirtyStore::discard`].
     pub fn spill(&mut self, pgno: u64) {
         if let Some(frame) = self.frames.remove(&pgno) {
+            self.note(pgno, BITS_NONE);
             let n = self.pages_of(frame.len());
             self.pages -= n;
             self.spilled.insert(pgno, n);
-            if let Slot::Heap(frame) = frame {
-                if frame.len() == self.psize as usize && self.spare.len() < SPARE_CAP {
-                    self.spare.push(frame);
-                }
-            }
+            self.park_spare(frame);
         }
     }
 
@@ -512,16 +601,59 @@ impl<'env> DirtyStore<'env> {
         if let Some(old) = self.frames.insert(pgno, Slot::Map { len }) {
             self.pages -= self.pages_of(old.len());
         }
+        self.note(pgno, BITS_MAP_PAGE);
         // SAFETY: `&mut self` op re-tying the borrow via this signature; the
         // region is this store's re-tracked `Slot::Map` frame (a TXN-62 pgno
         // this txn wrote in place before spilling); no other view is live.
         unsafe { map_mut(self.broker, self.psize, pgno, len) }
     }
 
+    /// Where a read of `pgno` finds its bytes, for the write txn's page
+    /// source (`btree::Source::Writer`). [`Resolved::MapPage`] is a one-page
+    /// in-map frame: the caller slices it from its own view of the map, which
+    /// under in-map mode is the same mapping this store's frames live in, and
+    /// saves the backing call [`DirtyStore::bytes`] makes.
+    #[inline(always)]
+    pub(crate) fn resolve(&self, pgno: u64) -> Resolved<'_> {
+        match self.bits_state(pgno) {
+            Some(BITS_NONE) => Resolved::Clean,
+            Some(BITS_MAP_PAGE) => Resolved::MapPage,
+            _ => match self.bytes(pgno) {
+                Some(frame) => Resolved::Frame(frame),
+                None => Resolved::Clean,
+            },
+        }
+    }
+
+    /// Keep a removed frame as a spare when it is a one-page heap frame and
+    /// the pool has room; map frames and runs are dropped.
+    fn park_spare(&mut self, slot: Slot) {
+        if let Slot::Heap(frame) = slot {
+            if frame.len() == self.psize as usize && self.spare.len() < SPARE_CAP {
+                self.spare.push(frame);
+            }
+        }
+    }
+
     /// The frame bytes for `pgno`: exactly `psize` for a tree page, the whole
     /// contiguous `n * psize` run for an overflow head.
     #[must_use]
+    #[inline]
     pub fn bytes(&self, pgno: u64) -> Option<&[u8]> {
+        match self.bits_state(pgno) {
+            Some(BITS_NONE) => return None,
+            Some(BITS_MAP_PAGE) => {
+                // A one-page map frame, found without the index.
+                let ps = self.psize as usize;
+                let off = (pgno as usize) * ps;
+                let bytes = self
+                    .broker
+                    .expect("frame bits exist only in an in-map store")
+                    .bytes();
+                return Some(&bytes[off..off + ps]);
+            }
+            _ => {}
+        }
         match self.frames.get(&pgno)? {
             Slot::Heap(b) => Some(&**b),
             Slot::Map { len } => {
@@ -542,6 +674,15 @@ impl<'env> DirtyStore<'env> {
     #[must_use]
     #[allow(unsafe_code)] // sanctioned brokered-slice call (ADR-0021; see `map_mut`)
     pub fn bytes_mut(&mut self, pgno: u64) -> Option<&mut [u8]> {
+        match self.bits_state(pgno) {
+            Some(BITS_NONE) => return None,
+            // SAFETY: as the `Slot::Map` arm below: a tracked one-page map
+            // frame (the bits mirror the index), re-tied to `&mut self`.
+            Some(BITS_MAP_PAGE) => {
+                return Some(unsafe { map_mut(self.broker, self.psize, pgno, self.psize as usize) })
+            }
+            _ => {}
+        }
         match self.frames.get_mut(&pgno)? {
             Slot::Heap(b) => Some(&mut **b),
             // SAFETY: `&mut self` op; the brokered view is re-tied to
@@ -559,16 +700,30 @@ impl<'env> DirtyStore<'env> {
             "frame for a spilled pgno"
         );
         self.pages += self.pages_of(slot.len());
+        let state = slot.bits_state(self.psize as usize);
         if let Some(old) = self.frames.insert(pgno, slot) {
             self.pages -= self.pages_of(old.len());
+        }
+        match &mut self.bits {
+            Some(bits) => bits.set(pgno, state),
+            None if self.broker.is_some() && self.frames.len() >= FRAME_BITS_MIN => {
+                let ps = self.psize as usize;
+                let mut bits = Box::<FrameBits>::default();
+                for (&p, f) in &self.frames {
+                    bits.set(p, f.bits_state(ps));
+                }
+                self.bits = Some(bits);
+            }
+            None => {}
         }
     }
 
     /// Insert (or replace) the frame for `pgno`. The frame length must be a
     /// non-zero multiple of `psize` (1 page for tree frames, `n` for runs).
-    /// Always a heap frame (test/compat path; the engine's run creation goes
-    /// through [`DirtyStore::insert_run_frame`]).
-    pub fn insert(&mut self, pgno: u64, frame: Box<[u8]>) {
+    /// Always a heap frame (the engine's run creation goes through
+    /// [`DirtyStore::insert_run_frame`]).
+    #[cfg(test)]
+    pub(crate) fn insert(&mut self, pgno: u64, frame: Box<[u8]>) {
         debug_assert!(
             !frame.is_empty() && frame.len().is_multiple_of(self.psize as usize),
             "frame length {} must be a positive multiple of psize {}",
@@ -614,7 +769,7 @@ impl<'env> DirtyStore<'env> {
     /// into the map page at `pgno` — the one copy COW inherently costs, with
     /// no heap frame and no commit write-back. Into a spare or a map page only
     /// the used bytes are copied, as LMDB's `mdb_page_copy` does (ADR-0030,
-    /// [`copy_tree_page`](crate::page::copy_tree_page)): the free gap keeps
+    /// `page::copy_tree_page`): the free gap keeps
     /// bytes this file or txn already held. A fresh allocation copies the
     /// whole page, so no uninitialised memory is ever written out.
     /// `src` must be exactly one page and MUST NOT overlap the map page at
@@ -681,6 +836,7 @@ impl<'env> DirtyStore<'env> {
             "remove of a spilled pgno"
         );
         let f = self.frames.remove(&pgno)?;
+        self.note(pgno, BITS_NONE);
         self.pages -= self.pages_of(f.len());
         match f {
             Slot::Heap(b) => Some(b),
@@ -708,7 +864,7 @@ impl<'env> DirtyStore<'env> {
 
     /// Discard the frame for `pgno` (freed within the txn). A one-page heap
     /// frame is parked on the `spare` pool for reuse if there is room; a run
-    /// frame (multi-page), an overflow past [`SPARE_CAP`], or an in-map frame
+    /// frame (multi-page), an overflow past `SPARE_CAP`, or an in-map frame
     /// (whose bytes are not ours to pool) is dropped. Like
     /// [`DirtyStore::remove`], only called from `&mut` ops (TXN-43): the frame
     /// leaves `frames` at a `&mut` boundary, so no borrow can alias it.
@@ -717,12 +873,9 @@ impl<'env> DirtyStore<'env> {
     /// the page returns to the txn as loose, like any page it allocated.
     pub fn discard(&mut self, pgno: u64) {
         if let Some(frame) = self.frames.remove(&pgno) {
+            self.note(pgno, BITS_NONE);
             self.pages -= self.pages_of(frame.len());
-            if let Slot::Heap(frame) = frame {
-                if frame.len() == self.psize as usize && self.spare.len() < SPARE_CAP {
-                    self.spare.push(frame);
-                }
-            }
+            self.park_spare(frame);
         } else if !self.spilled.is_empty() {
             self.spilled.remove(&pgno);
         }
@@ -736,7 +889,7 @@ impl<'env> DirtyStore<'env> {
     /// overwrites. Run frames and in-map frames (ADR-0021 — the map's bytes
     /// are not pool material) are left behind to drop with the store.
     #[must_use]
-    pub fn reclaimable_frames(&mut self, cap: usize) -> Vec<Box<[u8]>> {
+    pub(crate) fn reclaimable_frames(&mut self, cap: usize) -> Vec<Box<[u8]>> {
         // The spare `Vec` moves out whole (O(1)); only this txn's dirty frames
         // are walked, so the hand-back costs O(pages dirtied), like LMDB
         // returning its dirty list to `me_dpages`.
@@ -745,6 +898,7 @@ impl<'env> DirtyStore<'env> {
         out.truncate(cap);
         if out.len() < cap && !self.frames.is_empty() {
             self.pages = 0;
+            self.bits = None;
             for (_, f) in self.frames.drain() {
                 if out.len() >= cap {
                     break;
@@ -771,6 +925,8 @@ impl<'env> DirtyStore<'env> {
         let mut spilled = std::mem::take(&mut self.spilled);
         recycle_index(&mut spilled);
         self.pages = 0;
+        // Not carried: the next txn builds its own bits once it is large.
+        self.bits = None;
         DirtyCarry {
             frames,
             spilled,
@@ -779,7 +935,7 @@ impl<'env> DirtyStore<'env> {
     }
 
     /// Dirty pgnos in ascending order — the commit write-out order (C2 writes
-    /// sequentially by pgno; ADR-0004 D1) — into `out`, which is cleared
+    /// sequentially by pgno; ADR-0004) — into `out`, which is cleared
     /// first (the commit reuses one buffer across write txns).
     pub fn sorted_pgnos_into(&self, out: &mut Vec<u64>) {
         out.clear();

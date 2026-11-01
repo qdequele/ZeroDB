@@ -1,4 +1,4 @@
-//! ADR-0021 M1 — the in-place `WRITE_MAP` brokered discipline under
+//! ADR-0021 — the in-place `WRITE_MAP` brokered discipline under
 //! **miri** (SPEC 04 §6.4 TXN-45b; `cargo +nightly miri test -p zerodb-core`).
 //!
 //! The real writable map is OS memory miri cannot see, so this battery runs
@@ -7,12 +7,12 @@
 //! whose brokered `&mut` regions and whole-map `&[u8]` views are plain heap
 //! memory Stacked/Tree Borrows fully check. What this proves on every run:
 //!
-//! - the brokered `&mut` (ADR-0021 B1) is exclusive in practice: no two live
+//! - the brokered `&mut` (ADR-0021) is exclusive in practice: no two live
 //!   mutable views of one region, every view transient and re-tied to
 //!   `&mut` on the dirty store (TXN-39/41/42);
 //! - the writer's whole-map `&[u8]` is re-derived at every spill (ADR-0021
 //!   B2), so no stale shared borrow is ever read at locations an in-place
-//!   write touched (TXN-71) — the Tree-Borrows hazard ADR-0021 B2 names;
+//!   write touched (TXN-71) — the Tree-Borrows hazard ADR-0021 names;
 //! - readers holding snapshots across in-place commits, nested read children
 //!   of the writer, `put_reserved` closures, the general split's scratch
 //!   copy and abort-by-drop all stay inside the discipline.
@@ -182,7 +182,7 @@ fn in_place_discipline_under_miri() {
 }
 
 /// Spill/unspill as pure bookkeeping (TXN-68..72 degenerate under TXN-45b)
-/// plus the ADR-0021 B2 re-derivation: with a tiny dirty limit nearly every
+/// plus the ADR-0021 re-derivation: with a tiny dirty limit nearly every
 /// mutating call spills, spilled pages are resolved through the (re-derived)
 /// whole-map view, and touches of spilled pages unspill in place.
 #[test]
@@ -209,7 +209,7 @@ fn spill_unspill_in_place_under_miri() {
         model.insert(k.clone(), v);
         if i % 9 == 8 {
             // Read back through the source: spilled pages resolve from the
-            // re-derived map view (TXN-71 / ADR-0021 B2).
+            // re-derived map view (TXN-71 / ADR-0021).
             assert_eq!(
                 db.get(&w, &k).expect("get"),
                 model.get(&k).map(Vec::as_slice)
@@ -231,4 +231,56 @@ fn spill_unspill_in_place_under_miri() {
         want,
         "committed state"
     );
+}
+
+/// The dirty store's per-pgno frame bits (built once an in-map txn holds 64
+/// frames) under miri: one write txn dirties well over 64 pages, frees some
+/// (deletes merge leaves) and writes overflow runs; a second run with a dirty
+/// limit spills and unspills pages after the bits are built. Reads through
+/// the bits' direct map path and the brokered `&mut` they hand out stay
+/// inside the discipline; a debug assertion checks every answer against
+/// the hash index, so a missed bit update (an unspill after the bits are
+/// built, which the spill run does) fails on the next lookup of that page.
+#[test]
+fn frame_bits_under_miri() {
+    for dirty_limit in [None, Some(160)] {
+        let env = wm_env(dirty_limit);
+        let db = env.main_database();
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let mut rng = Rng(0xADB0_0021_0000_0003);
+
+        let mut w = env.write_txn().expect("write txn");
+        assert!(w.dirty_in_map_mode(), "in-place WRITE_MAP must be active");
+        for i in 0..200u64 {
+            let k = format!("bits-{:04}", rng.below(400)).into_bytes();
+            let v = if i % 40 == 39 {
+                vec![b'R'; 9_000] // an overflow run: the bits' "other" state
+            } else {
+                vec![(i % 251) as u8; 1_400] // two entries per 4 KiB leaf
+            };
+            db.put(&mut w, &k, &v).expect("put");
+            model.insert(k, v);
+        }
+        for i in 0..60u64 {
+            let k = format!("bits-{:04}", i * 5).into_bytes();
+            let deleted = db.delete(&mut w, &k).expect("delete");
+            assert_eq!(deleted, model.remove(&k).is_some());
+        }
+        for i in 0..30u64 {
+            let k = format!("bits-{:04}", i * 7).into_bytes();
+            db.put(&mut w, &k, b"rewritten").expect("rewrite");
+            model.insert(k, b"rewritten".to_vec());
+        }
+        let want: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(contents(&w, db), want, "writer view");
+        if dirty_limit.is_some() {
+            assert!(w.spill_count() > 0, "the dirty limit must have spilled");
+        }
+        w.commit().expect("commit");
+        assert_eq!(
+            contents(&env.read_txn().expect("reader"), db),
+            want,
+            "committed state"
+        );
+    }
 }

@@ -909,6 +909,7 @@ dependencies = [
  "arbitrary",
  "heed",
  "heed-zerodb",
+ "libc",
  "lmdb-master-sys",
  "thiserror",
  "zerodb",

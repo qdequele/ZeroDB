@@ -1,20 +1,15 @@
-//! `heed-zerodb` — a 1:1 re-implementation of `heed 0.22.1`'s public surface
-//! over ZeroDB's native API (ADR-0003 Option C/D).
+//! The public API of [heed](https://github.com/meilisearch/heed) 0.22.1,
+//! implemented over ZeroDB instead of LMDB, so a heed consumer switches
+//! engines without changing code.
 //!
-//! The crate presents the exact concrete type paths the five consumers name
-//! (SPEC 00 §C): `Env<WithoutTls>`, `RoTxn<'a, WithoutTls>`,
-//! `RoTxn<'static, WithoutTls>`, `RwTxn<'p>`, `Database<KC, DC>`, the
-//! `EnvFlags`/`PutFlags`/`DatabaseFlags` types, `CompactionOption`,
-//! `EnvClosingEvent`, `MdbError`, `Error`, `ReservedSpace`, `LazyDecode`,
-//! `DecodeIgnore`, and `BytesEncode`/`BytesDecode`/`BoxedError`. It **re-exports
-//! `heed-traits` and `heed-types` verbatim**, so codec and trait *identity*
-//! (coherence) is preserved: milli's `impl heed::BytesEncode for FooCodec` is an
-//! impl of the very same trait the LMDB `heed` uses.
+//! It mirrors heed's type paths (`Env<WithoutTls>`, `RoTxn`, `RwTxn`,
+//! `Database<KC, DC>`, the flag types, `Error`, `ReservedSpace`, ...) and
+//! re-exports `heed-traits` and `heed-types` unchanged, so codec traits stay
+//! the very traits LMDB's heed uses.
 //!
-//! Consumers switch backends via `[patch.crates-io] heed = { path =
-//! ".../crates/heed-shim" }` — a crate literally named `heed` that re-exports
-//! this one (a `package =` rename inside `[patch]` is silently ignored by cargo;
-//! see `crates/heed-shim/Cargo.toml` and `docs/CONSUMER-GATE.md`).
+//! Consumers do not depend on this crate directly. They point
+//! `[patch.crates-io] heed` at `crates/heed-shim`, a crate named `heed` that
+//! re-exports this one (cargo ignores a `package =` rename inside `[patch]`).
 //!
 //! ## Meilisearch's heed fork (`unique-txns` feature, ADR-0027)
 //!
@@ -29,19 +24,13 @@
 //! The feature changes signatures, so it is not additive: a build uses one
 //! API or the other. Consumers reach it through `crates/heed-shim-unique-txns`.
 //!
-//! ## Adapter `unsafe` (see per-site `SAFETY:` comments)
+//! ## `unsafe`
 //!
-//! The adapter reproduces heed's inherently pointer-based model, so it needs the
-//! same small `unsafe` heed itself carries: `unsafe impl Send for
-//! RoTxn<WithoutTls>` (SPEC 04 TXN-13; every inner ZeroDB txn is itself `Send`,
-//! the writer lock being thread-agnostic — `txn.rs`), the `repr(transparent)`
-//! TLS-marker deref retags (`txn.rs`), the lifetime-erased write cursor
-//! (`iterator.rs`, guarded by heed's documented "no live borrow across a
-//! mutating call" contract), the `ReservedSpace` uninit view and its
-//! `assume_written` (`reserved_space.rs`, heed's own signatures), and one
-//! `sysconf` query for the OS-page-multiple `map_size` check (`env.rs`). Each
-//! is documented at its site; this is the minimal adapter-shape `unsafe`,
-//! wrapping no UB under the stated contracts.
+//! Only what heed's own signatures force: `Send` for read txns opened without
+//! TLS (TXN-13), the TLS-marker retags (`txn.rs`), the lifetime-erased write
+//! cursor (`iterator.rs`), the `ReservedSpace` uninitialized view
+//! (`reserved_space.rs`), and one `sysconf` for the OS page size (`env.rs`).
+//! Each site states its safety contract.
 
 #![allow(clippy::result_large_err)]
 
@@ -78,7 +67,7 @@ pub use self::txn::{AnyTls, RoTxn, RwTxn, TlsUsage, WithTls, WithoutTls};
 #[cfg(feature = "unique-txns")]
 pub use self::unique::{AsUniqueTxnRef, UniqueRoTxn, UniqueRwTxn};
 
-/// An unspecified codec placeholder (SPEC 00 rows 12/51): used when opening a
+/// An unspecified codec placeholder: used when opening a
 /// database whose types are remapped per call. Does not implement the codec
 /// traits.
 pub enum Unspecified {}

@@ -98,7 +98,7 @@ enum Slots {
 /// `< RDR_CLAIMED`: ids start at 1 and grow by one per commit). One word per
 /// slot means every observation of a slot is atomic — a state+txnid two-field
 /// design would admit torn observations and need its own inter-field ordering
-/// protocol (ADR-0006 D1). Each [`crate::shared::ReaderSlot`] is 64-byte
+/// protocol (ADR-0006). Each [`crate::shared::ReaderSlot`] is 64-byte
 /// aligned and 128 bytes long, which keeps a pinning reader's store and the
 /// writer's scan off each other's cache lines (TXN-14). A table opened with
 /// [`ReaderTable::new_shared`] has the same slot layout, but the slots live in
@@ -172,17 +172,16 @@ impl ReaderTable {
     /// `compare_exchange(RDR_FREE → RDR_CLAIMED)` grants exclusive ownership.
     /// `None` after a full scan means the table is exhausted — the caller maps
     /// it to `MdbError::ReadersFull` (TXN-16). No reaping happens at claim,
-    /// so the error is immediate; LMDB does none there either (ADR-0023
-    /// amendment 12).
+    /// so the error is immediate; LMDB does none there either (ADR-0023).
     ///
     /// There is no ABA hazard in this CAS: the compare value `RDR_FREE` means
     /// "free *now*", and ownership is conferred by the successful exchange
     /// itself — no thread acts on a stale expectation derived from an earlier
-    /// read (ADR-0006 D1). No scan hint and no high-water-mark shortcut
-    /// (ADR-0006 D2): a stale bound could hide an already-pinned reader from
+    /// read (ADR-0006). No scan hint and no high-water-mark shortcut
+    /// (ADR-0006): a stale bound could hide an already-pinned reader from
     /// the writer's scan, which is exactly the missed-pin bug.
     ///
-    /// **ADR-0006 D2 still holds** despite the `high_water` counter maintained
+    /// **ADR-0006 still holds** despite the `high_water` counter maintained
     /// below: that counter is written here but read *only* by
     /// [`ReaderTable::num_readers`] (introspection). Neither this scan
     /// nor the writer's [`ReaderTable::oldest`] scan consults it — both still
@@ -227,7 +226,7 @@ impl ReaderTable {
                     // with Acquire before judging the slot; this store must
                     // be visible no later than the pin that follows it. The
                     // generation increment makes the word unique to this
-                    // claim (ADR-0023 amendment 14).
+                    // claim (ADR-0023).
                     rs.owner().store(
                         owner_word(owner_generation(w).wrapping_add(1), pid),
                         Ordering::Release,
@@ -284,8 +283,7 @@ impl ReaderTable {
     }
 
     /// Release `slot`. `owned` says whether the slot carries an owner PID (a
-    /// shared table), in which case the release is three stores (ADR-0023
-    /// amendment 7):
+    /// shared table), in which case the release is three stores (ADR-0023):
     ///
     /// 1. `txnid = CLAIMED` (`Release`): unpins. It orders the owner's page
     ///    reads before the GC gate can stop counting this slot (the TXN-18a
@@ -510,7 +508,7 @@ impl ReaderTable {
     }
 
     /// Free every slot whose owner process is dead (ADR-0023 §3 and
-    /// amendments 8 and 14); returns how many slots were freed. `reaper` is
+    /// ADR-0023); returns how many slots were freed. `reaper` is
     /// this process's PID: its own slots are never probed (a probe cannot see
     /// this process's own lock, and its stale own-PID slots were freed at
     /// open). `is_alive` is called at most once per distinct PID per call.
@@ -599,7 +597,7 @@ impl ReaderTable {
                 debug_assert_ne!(
                     rs.txnid().load(Ordering::Relaxed),
                     RDR_FREE,
-                    "a slot with an owner PID is never FREE (ADR-0023 amendment 7)"
+                    "a slot with an owner PID is never FREE (ADR-0023)"
                 );
                 self.release_as(i as u32, true);
                 freed += 1;
@@ -608,10 +606,10 @@ impl ReaderTable {
         Ok(freed)
     }
 
-    /// Free every slot that carries this process's PID `me` (ADR-0023
-    /// amendment 9). Called once at open, before this process's first claim,
-    /// so any such slot was left by a dead process that had the same PID.
-    /// Returns how many slots were freed.
+    /// Free every slot that carries this process's PID `me` (ADR-0023). Called
+    /// once at open, before this process's first claim, so any such slot was
+    /// left by a dead process that had the same PID. Returns how many slots
+    /// were freed.
     ///
     /// `CAS w -> (generation of w, PID 0)` (`AcqRel`, as in
     /// [`ReaderTable::reap_dead`]) is what excludes another process's reaper.
@@ -791,7 +789,7 @@ impl SnapshotCell {
     /// The invariant the tail preserves is `slot value ≤ cloned snapshot
     /// txnid`: pinning *older* than what is read is conservative (GC merely
     /// holds back more), while the reverse would let GC reclaim pages the
-    /// cloned roots still reference — the unsafe direction (ADR-0006 R3).
+    /// cloned roots still reference — the unsafe direction (ADR-0006).
     ///
     /// Why the clone can never see roots *older* than the verified `t`: the
     /// writer's swap is sequenced-before its `commit_point.store(t)`
@@ -1007,8 +1005,8 @@ mod tests {
 
     #[test]
     fn release_leaves_a_free_unowned_slot() {
-        // The owner's release order is CLAIMED, pid 0, FREE (ADR-0023
-        // amendment 7); the end state is a free, unowned slot.
+        // The owner's release order is CLAIMED, pid 0, FREE (ADR-0023); the end
+        // state is a free, unowned slot.
         let (region, t) = shared_table(1, 7);
         let s = t.claim().unwrap();
         t.store_pin(s, 5);
@@ -1308,7 +1306,7 @@ mod tests {
 //     fence-oriented; tokio-rs/loom#180 class). A test that fails on correct
 //     code cannot be committed.
 // The SeqCst sites are therefore guarded by SPEC 04 TXN-17/20 (normative),
-// the per-site justification comments, this record, and ADR-0006 R1: any
+// the per-site justification comments, this record, and ADR-0006: any
 // future migration to the Option-D/E lock-free cell MUST bring its own
 // StoreLoad verification (an SC-fence reformulation loom can check,
 // a different checker, or hardware litmus runs) as a precondition — the
@@ -1430,7 +1428,7 @@ mod loom_tests {
     /// `slot value ≤ cloned snapshot txnid` (pinning older than what it reads
     /// is conservative; the reverse is the unsafe direction) and with roots
     /// no older than its verified commit point. A TXN-19 publish-order
-    /// inversion (counter before object) fails this test (ADR-0006 R3).
+    /// inversion (counter before object) fails this test (ADR-0006).
     #[test]
     fn loom_l4_publish_vs_pin_retry() {
         loom::model(|| {
@@ -1446,7 +1444,7 @@ mod loom_tests {
             assert!(
                 raw <= s.txnid,
                 "slot pinned {raw} but cloned roots are {} — GC could reclaim pages \
-                 those roots reference (slot ≤ snap invariant, ADR-0006 R3)",
+                 those roots reference (slot ≤ snap invariant, ADR-0006)",
                 s.txnid
             );
             table.release(slot);
@@ -1501,7 +1499,7 @@ mod loom_tests {
 
     /// L6 — two reapers race on one dead slot: it is freed exactly once
     /// (the counts sum to 1), and afterwards the slot is FREE, unowned and
-    /// claimable (ADR-0023 §3, amendment 8).
+    /// claimable (ADR-0023 §3).
     #[test]
     fn loom_l6_two_reapers_one_dead_slot() {
         loom::model(|| {
@@ -1586,7 +1584,7 @@ mod loom_tests {
     /// modeled `Relaxed`; it is a `pwrite`), then stores T = N `SeqCst`, then
     /// (as the next writer) computes the GC gate with seed N. The reader runs
     /// `pin_against`, resolving t by reading meta slot `t & 1` and accepting
-    /// only a txnid equal to t (ADR-0023 §4, amendment 4). In every
+    /// only a txnid equal to t (ADR-0023 §4). In every
     /// interleaving the reader resolves a snapshot whose txnid equals its
     /// pin.
     ///
@@ -1667,7 +1665,7 @@ mod loom_tests {
         });
     }
 
-    /// L11 — PID reuse (ADR-0023 amendment 14): a reaper holding a stale
+    /// L11 — PID reuse (ADR-0023): a reaper holding a stale
     /// "dead" verdict on PID 2 races a new process that also has PID 2,
     /// which frees its predecessor's slot and re-claims it. The claim
     /// generation makes the reaper's CAS fail: the new process's pin

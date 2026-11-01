@@ -1,5 +1,5 @@
 //! Iterators — `Ro{Iter,RevIter,Range,RevRange,Prefix,RevPrefix}` and their
-//! `Rw` mutating siblings (SPEC 00 rows 43–46, 50; SPEC 03 §4/§7).
+//! `Rw` mutating siblings (50; SPEC 03 §4/§7).
 //!
 //! ## Read iterators (zero-copy, no `unsafe`)
 //!
@@ -54,52 +54,55 @@ where
 // Read iterators
 // ---------------------------------------------------------------------------
 
+/// Defines a read-only iterator type. Range and prefix iterators pass `C`,
+/// heed's comparator type parameter (`heed::RoRange<'t, KC, DC, C, IM>`);
+/// full-scan iterators have none.
 macro_rules! ro_iterator {
-    ($name:ident, $doc:literal) => {
+    ($name:ident, $doc:literal $(, $C:ident)?) => {
         #[doc = $doc]
-        pub struct $name<'txn, KC, DC, IM = MoveThroughDuplicateValues> {
+        pub struct $name<'txn, KC, DC, $($C = DefaultComparator,)? IM = MoveThroughDuplicateValues> {
             pub(crate) range: zerodb::RoRange<'txn>,
-            pub(crate) _marker: PhantomData<(KC, DC, IM)>,
+            pub(crate) _marker: PhantomData<(KC, DC, $($C,)? IM)>,
         }
 
-        impl<'txn, KC, DC, IM> $name<'txn, KC, DC, IM> {
-            pub(crate) fn new(range: zerodb::RoRange<'txn>) -> $name<'txn, KC, DC, IM> {
+        impl<'txn, KC, DC, $($C,)? IM> $name<'txn, KC, DC, $($C,)? IM> {
+            pub(crate) fn new(range: zerodb::RoRange<'txn>) -> $name<'txn, KC, DC, $($C,)? IM> {
                 $name {
                     range,
                     _marker: PhantomData,
                 }
             }
 
-            /// Change the key/data codecs of this iterator (SPEC 00 row 51).
+            /// Change the key/data codecs of this iterator.
             #[must_use]
-            pub fn remap_types<KC2, DC2>(self) -> $name<'txn, KC2, DC2, IM> {
+            pub fn remap_types<KC2, DC2>(self) -> $name<'txn, KC2, DC2, $($C,)? IM> {
                 $name {
                     range: self.range,
                     _marker: PhantomData,
                 }
             }
 
-            /// Change the key codec (SPEC 00 row 51).
+            /// Change the key codec.
             #[must_use]
-            pub fn remap_key_type<KC2>(self) -> $name<'txn, KC2, DC, IM> {
+            pub fn remap_key_type<KC2>(self) -> $name<'txn, KC2, DC, $($C,)? IM> {
                 self.remap_types::<KC2, DC>()
             }
 
-            /// Change the data codec (SPEC 00 row 51).
+            /// Change the data codec.
             #[must_use]
-            pub fn remap_data_type<DC2>(self) -> $name<'txn, KC, DC2, IM> {
+            pub fn remap_data_type<DC2>(self) -> $name<'txn, KC, DC2, $($C,)? IM> {
                 self.remap_types::<KC, DC2>()
             }
 
-            /// Wrap the data in a lazy decoder (SPEC 00 row 50).
+            /// Wrap the data in a lazy decoder.
             #[must_use]
-            pub fn lazily_decode_data(self) -> $name<'txn, KC, LazyDecode<DC>, IM> {
+            pub fn lazily_decode_data(self) -> $name<'txn, KC, LazyDecode<DC>, $($C,)? IM> {
                 self.remap_types::<KC, LazyDecode<DC>>()
             }
 
             /// Iteration method shim (DUPSORT is unsupported — a no-op retag).
             #[must_use]
-            pub fn move_between_keys(self) -> $name<'txn, KC, DC, MoveBetweenKeys> {
+            pub fn move_between_keys(self) -> $name<'txn, KC, DC, $($C,)? MoveBetweenKeys> {
                 $name {
                     range: self.range,
                     _marker: PhantomData,
@@ -110,7 +113,7 @@ macro_rules! ro_iterator {
             #[must_use]
             pub fn move_through_duplicate_values(
                 self,
-            ) -> $name<'txn, KC, DC, MoveThroughDuplicateValues> {
+            ) -> $name<'txn, KC, DC, $($C,)? MoveThroughDuplicateValues> {
                 $name {
                     range: self.range,
                     _marker: PhantomData,
@@ -118,7 +121,7 @@ macro_rules! ro_iterator {
             }
         }
 
-        impl<'txn, KC, DC, IM> Iterator for $name<'txn, KC, DC, IM>
+        impl<'txn, KC, DC, $($C,)? IM> Iterator for $name<'txn, KC, DC, $($C,)? IM>
         where
             KC: BytesDecode<'txn>,
             DC: BytesDecode<'txn>,
@@ -142,7 +145,7 @@ macro_rules! ro_iterator {
             }
         }
 
-        impl<KC, DC, IM> std::fmt::Debug for $name<'_, KC, DC, IM> {
+        impl<KC, DC, $($C,)? IM> std::fmt::Debug for $name<'_, KC, DC, $($C,)? IM> {
             fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.debug_struct(stringify!($name)).finish()
             }
@@ -150,125 +153,12 @@ macro_rules! ro_iterator {
     };
 }
 
-/// Same as [`ro_iterator!`] plus heed's comparator type parameter `C`, which
-/// range and prefix iterators carry (`heed::RoRange<'t, KC, DC, C, IM>`).
-macro_rules! ro_range_iterator {
-    ($name:ident, $doc:literal) => {
-        #[doc = $doc]
-        pub struct $name<'txn, KC, DC, C = DefaultComparator, IM = MoveThroughDuplicateValues> {
-            pub(crate) range: zerodb::RoRange<'txn>,
-            pub(crate) _marker: PhantomData<(KC, DC, C, IM)>,
-        }
-
-        impl<'txn, KC, DC, C, IM> $name<'txn, KC, DC, C, IM> {
-            pub(crate) fn new(range: zerodb::RoRange<'txn>) -> $name<'txn, KC, DC, C, IM> {
-                $name {
-                    range,
-                    _marker: PhantomData,
-                }
-            }
-
-            /// Change the key/data codecs of this iterator (SPEC 00 row 51).
-            #[must_use]
-            pub fn remap_types<KC2, DC2>(self) -> $name<'txn, KC2, DC2, C, IM> {
-                $name {
-                    range: self.range,
-                    _marker: PhantomData,
-                }
-            }
-
-            /// Change the key codec (SPEC 00 row 51).
-            #[must_use]
-            pub fn remap_key_type<KC2>(self) -> $name<'txn, KC2, DC, C, IM> {
-                self.remap_types::<KC2, DC>()
-            }
-
-            /// Change the data codec (SPEC 00 row 51).
-            #[must_use]
-            pub fn remap_data_type<DC2>(self) -> $name<'txn, KC, DC2, C, IM> {
-                self.remap_types::<KC, DC2>()
-            }
-
-            /// Wrap the data in a lazy decoder (SPEC 00 row 50).
-            #[must_use]
-            pub fn lazily_decode_data(self) -> $name<'txn, KC, LazyDecode<DC>, C, IM> {
-                self.remap_types::<KC, LazyDecode<DC>>()
-            }
-
-            /// Iteration method shim (DUPSORT is unsupported — a no-op retag).
-            #[must_use]
-            pub fn move_between_keys(self) -> $name<'txn, KC, DC, C, MoveBetweenKeys> {
-                $name {
-                    range: self.range,
-                    _marker: PhantomData,
-                }
-            }
-
-            /// Iteration method shim (DUPSORT is unsupported — a no-op retag).
-            #[must_use]
-            pub fn move_through_duplicate_values(
-                self,
-            ) -> $name<'txn, KC, DC, C, MoveThroughDuplicateValues> {
-                $name {
-                    range: self.range,
-                    _marker: PhantomData,
-                }
-            }
-        }
-
-        impl<'txn, KC, DC, C, IM> Iterator for $name<'txn, KC, DC, C, IM>
-        where
-            KC: BytesDecode<'txn>,
-            DC: BytesDecode<'txn>,
-        {
-            type Item = Result<(KC::DItem, DC::DItem)>;
-
-            fn next(&mut self) -> Option<Self::Item> {
-                match self.range.next()? {
-                    Ok((k, v)) => Some(decode_pair::<KC, DC>(k, v)),
-                    Err(e) => Some(Err(e.into())),
-                }
-            }
-
-            // The native range skips leaf by leaf (SPEC 03 §4); only the
-            // landing entry is decoded.
-            fn nth(&mut self, n: usize) -> Option<Self::Item> {
-                match self.range.nth(n)? {
-                    Ok((k, v)) => Some(decode_pair::<KC, DC>(k, v)),
-                    Err(e) => Some(Err(e.into())),
-                }
-            }
-        }
-
-        impl<KC, DC, C, IM> std::fmt::Debug for $name<'_, KC, DC, C, IM> {
-            fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.debug_struct(stringify!($name)).finish()
-            }
-        }
-    };
-}
-
-ro_iterator!(
-    RoIter,
-    "A read-only forward full-scan iterator (SPEC 00 row 43)."
-);
+ro_iterator!(RoIter, "A read-only forward full-scan iterator.");
 ro_iterator!(RoRevIter, "A read-only reverse full-scan iterator.");
-ro_range_iterator!(
-    RoRange,
-    "A read-only forward range iterator (SPEC 00 row 44)."
-);
-ro_range_iterator!(
-    RoRevRange,
-    "A read-only reverse range iterator (SPEC 00 row 44)."
-);
-ro_range_iterator!(
-    RoPrefix,
-    "A read-only forward prefix iterator (SPEC 00 row 45)."
-);
-ro_range_iterator!(
-    RoRevPrefix,
-    "A read-only reverse prefix iterator (SPEC 00 row 46)."
-);
+ro_iterator!(RoRange, "A read-only forward range iterator.", C);
+ro_iterator!(RoRevRange, "A read-only reverse range iterator.", C);
+ro_iterator!(RoPrefix, "A read-only forward prefix iterator.", C);
+ro_iterator!(RoRevPrefix, "A read-only reverse prefix iterator.", C);
 
 // ---------------------------------------------------------------------------
 // Write iterators
@@ -399,23 +289,24 @@ impl<'txn> RwGuts<'txn> {
     }
 }
 
+/// Defines a read-write iterator type; `C` as for `ro_iterator!`.
 macro_rules! rw_iterator {
-    ($name:ident, $doc:literal) => {
+    ($name:ident, $doc:literal $(, $C:ident)?) => {
         #[doc = $doc]
-        pub struct $name<'txn, KC, DC, IM = MoveThroughDuplicateValues> {
+        pub struct $name<'txn, KC, DC, $($C = DefaultComparator,)? IM = MoveThroughDuplicateValues> {
             pub(crate) guts: RwGuts<'txn>,
-            pub(crate) _marker: PhantomData<(KC, DC, IM)>,
+            pub(crate) _marker: PhantomData<(KC, DC, $($C,)? IM)>,
         }
 
-        impl<'txn, KC, DC, IM> $name<'txn, KC, DC, IM> {
-            pub(crate) fn new(guts: RwGuts<'txn>) -> $name<'txn, KC, DC, IM> {
+        impl<'txn, KC, DC, $($C,)? IM> $name<'txn, KC, DC, $($C,)? IM> {
+            pub(crate) fn new(guts: RwGuts<'txn>) -> $name<'txn, KC, DC, $($C,)? IM> {
                 $name {
                     guts,
                     _marker: PhantomData,
                 }
             }
 
-            /// Delete the entry the cursor is on (SPEC 00 row 34, SPEC 03 §7).
+            /// Delete the entry the cursor is on (SPEC 03 §7).
             ///
             /// # Safety
             ///
@@ -428,7 +319,7 @@ macro_rules! rw_iterator {
                 self.guts.del_current()
             }
 
-            /// Rewrite the current entry's value (SPEC 00 row 33, `MDB_CURRENT`).
+            /// Rewrite the current entry's value (`MDB_CURRENT`).
             ///
             /// # Safety
             ///
@@ -452,7 +343,7 @@ macro_rules! rw_iterator {
             }
 
             /// Rewrite the current entry with explicit flags and a different data
-            /// codec (SPEC 00 row 33, `put_current_with_options`).
+            /// codec (`put_current_with_options`).
             ///
             /// # Safety
             ///
@@ -476,7 +367,7 @@ macro_rules! rw_iterator {
                 self.guts.put_current_with_flags(flags, &kb, &vb)
             }
 
-            /// Reserve-and-write the current entry (SPEC 00 row 33 sibling).
+            /// Reserve-and-write the current entry.
             ///
             /// # Safety
             ///
@@ -508,7 +399,7 @@ macro_rules! rw_iterator {
 
             /// Iteration method shim (no DUPSORT — no-op retag).
             #[must_use]
-            pub fn move_between_keys(self) -> $name<'txn, KC, DC, MoveBetweenKeys> {
+            pub fn move_between_keys(self) -> $name<'txn, KC, DC, $($C,)? MoveBetweenKeys> {
                 $name {
                     guts: self.guts,
                     _marker: PhantomData,
@@ -519,42 +410,42 @@ macro_rules! rw_iterator {
             #[must_use]
             pub fn move_through_duplicate_values(
                 self,
-            ) -> $name<'txn, KC, DC, MoveThroughDuplicateValues> {
+            ) -> $name<'txn, KC, DC, $($C,)? MoveThroughDuplicateValues> {
                 $name {
                     guts: self.guts,
                     _marker: PhantomData,
                 }
             }
 
-            /// Change the key/data codecs (SPEC 00 row 51).
+            /// Change the key/data codecs.
             #[must_use]
-            pub fn remap_types<KC2, DC2>(self) -> $name<'txn, KC2, DC2, IM> {
+            pub fn remap_types<KC2, DC2>(self) -> $name<'txn, KC2, DC2, $($C,)? IM> {
                 $name {
                     guts: self.guts,
                     _marker: PhantomData,
                 }
             }
 
-            /// Change the key codec (SPEC 00 row 51).
+            /// Change the key codec.
             #[must_use]
-            pub fn remap_key_type<KC2>(self) -> $name<'txn, KC2, DC, IM> {
+            pub fn remap_key_type<KC2>(self) -> $name<'txn, KC2, DC, $($C,)? IM> {
                 self.remap_types::<KC2, DC>()
             }
 
-            /// Change the data codec (SPEC 00 row 51).
+            /// Change the data codec.
             #[must_use]
-            pub fn remap_data_type<DC2>(self) -> $name<'txn, KC, DC2, IM> {
+            pub fn remap_data_type<DC2>(self) -> $name<'txn, KC, DC2, $($C,)? IM> {
                 self.remap_types::<KC, DC2>()
             }
 
-            /// Wrap the data in a lazy decoder (SPEC 00 row 50).
+            /// Wrap the data in a lazy decoder.
             #[must_use]
-            pub fn lazily_decode_data(self) -> $name<'txn, KC, LazyDecode<DC>, IM> {
+            pub fn lazily_decode_data(self) -> $name<'txn, KC, LazyDecode<DC>, $($C,)? IM> {
                 self.remap_types::<KC, LazyDecode<DC>>()
             }
         }
 
-        impl<'txn, KC, DC, IM> Iterator for $name<'txn, KC, DC, IM>
+        impl<'txn, KC, DC, $($C,)? IM> Iterator for $name<'txn, KC, DC, $($C,)? IM>
         where
             KC: BytesDecode<'txn>,
             DC: BytesDecode<'txn>,
@@ -569,7 +460,7 @@ macro_rules! rw_iterator {
             }
         }
 
-        impl<KC, DC, IM> std::fmt::Debug for $name<'_, KC, DC, IM> {
+        impl<KC, DC, $($C,)? IM> std::fmt::Debug for $name<'_, KC, DC, $($C,)? IM> {
             fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.debug_struct(stringify!($name)).finish()
             }
@@ -577,201 +468,16 @@ macro_rules! rw_iterator {
     };
 }
 
-/// Same as [`rw_iterator!`] plus heed's comparator type parameter `C`.
-macro_rules! rw_range_iterator {
-    ($name:ident, $doc:literal) => {
-        #[doc = $doc]
-        pub struct $name<'txn, KC, DC, C = DefaultComparator, IM = MoveThroughDuplicateValues> {
-            pub(crate) guts: RwGuts<'txn>,
-            pub(crate) _marker: PhantomData<(KC, DC, C, IM)>,
-        }
-
-        impl<'txn, KC, DC, C, IM> $name<'txn, KC, DC, C, IM> {
-            pub(crate) fn new(guts: RwGuts<'txn>) -> $name<'txn, KC, DC, C, IM> {
-                $name {
-                    guts,
-                    _marker: PhantomData,
-                }
-            }
-
-            /// Delete the entry the cursor is on (SPEC 00 row 34, SPEC 03 §7).
-            ///
-            /// # Safety
-            ///
-            /// No `&` borrow of the current entry may be live across this call.
-            ///
-            /// # Errors
-            ///
-            /// As `Database::delete`.
-            pub unsafe fn del_current(&mut self) -> Result<bool> {
-                self.guts.del_current()
-            }
-
-            /// Rewrite the current entry's value (SPEC 00 row 33, `MDB_CURRENT`).
-            ///
-            /// # Safety
-            ///
-            /// See [`Self::del_current`].
-            ///
-            /// # Errors
-            ///
-            /// As `Database::put`.
-            pub unsafe fn put_current<'a>(
-                &mut self,
-                key: &'a KC::EItem,
-                data: &'a DC::EItem,
-            ) -> Result<bool>
-            where
-                KC: heed_traits::BytesEncode<'a>,
-                DC: heed_traits::BytesEncode<'a>,
-            {
-                let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
-                let vb = DC::bytes_encode(data).map_err(Error::Encoding)?;
-                self.guts.put_current(&kb, &vb)
-            }
-
-            /// Rewrite the current entry with explicit flags and a different data
-            /// codec (SPEC 00 row 33, `put_current_with_options`).
-            ///
-            /// # Safety
-            ///
-            /// See [`Self::del_current`].
-            ///
-            /// # Errors
-            ///
-            /// As `Database::put_with_flags`.
-            pub unsafe fn put_current_with_options<'a, NDC>(
-                &mut self,
-                flags: PutFlags,
-                key: &'a KC::EItem,
-                data: &'a NDC::EItem,
-            ) -> Result<()>
-            where
-                KC: heed_traits::BytesEncode<'a>,
-                NDC: heed_traits::BytesEncode<'a>,
-            {
-                let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
-                let vb = NDC::bytes_encode(data).map_err(Error::Encoding)?;
-                self.guts.put_current_with_flags(flags, &kb, &vb)
-            }
-
-            /// Reserve-and-write the current entry (SPEC 00 row 33 sibling).
-            ///
-            /// # Safety
-            ///
-            /// See [`Self::del_current`].
-            ///
-            /// # Errors
-            ///
-            /// As `Database::put_reserved`.
-            pub unsafe fn put_current_reserved_with_flags<'a, F>(
-                &mut self,
-                flags: PutFlags,
-                key: &'a KC::EItem,
-                data_size: usize,
-                write_func: F,
-            ) -> Result<bool>
-            where
-                KC: heed_traits::BytesEncode<'a>,
-                F: FnOnce(&mut crate::ReservedSpace) -> std::io::Result<()>,
-            {
-                let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
-                let mut buf = vec![0u8; data_size];
-                {
-                    let mut space = crate::ReservedSpace::new(&mut buf);
-                    write_func(&mut space).map_err(|e| Error::Encoding(Box::new(e)))?;
-                }
-                self.guts.put_current_with_flags(flags, &kb, &buf)?;
-                Ok(true)
-            }
-
-            /// Iteration method shim (no DUPSORT — no-op retag).
-            #[must_use]
-            pub fn move_between_keys(self) -> $name<'txn, KC, DC, C, MoveBetweenKeys> {
-                $name {
-                    guts: self.guts,
-                    _marker: PhantomData,
-                }
-            }
-
-            /// Iteration method shim (no DUPSORT — no-op retag).
-            #[must_use]
-            pub fn move_through_duplicate_values(
-                self,
-            ) -> $name<'txn, KC, DC, C, MoveThroughDuplicateValues> {
-                $name {
-                    guts: self.guts,
-                    _marker: PhantomData,
-                }
-            }
-
-            /// Change the key/data codecs (SPEC 00 row 51).
-            #[must_use]
-            pub fn remap_types<KC2, DC2>(self) -> $name<'txn, KC2, DC2, C, IM> {
-                $name {
-                    guts: self.guts,
-                    _marker: PhantomData,
-                }
-            }
-
-            /// Change the key codec (SPEC 00 row 51).
-            #[must_use]
-            pub fn remap_key_type<KC2>(self) -> $name<'txn, KC2, DC, C, IM> {
-                self.remap_types::<KC2, DC>()
-            }
-
-            /// Change the data codec (SPEC 00 row 51).
-            #[must_use]
-            pub fn remap_data_type<DC2>(self) -> $name<'txn, KC, DC2, C, IM> {
-                self.remap_types::<KC, DC2>()
-            }
-
-            /// Wrap the data in a lazy decoder (SPEC 00 row 50).
-            #[must_use]
-            pub fn lazily_decode_data(self) -> $name<'txn, KC, LazyDecode<DC>, C, IM> {
-                self.remap_types::<KC, LazyDecode<DC>>()
-            }
-        }
-
-        impl<'txn, KC, DC, C, IM> Iterator for $name<'txn, KC, DC, C, IM>
-        where
-            KC: BytesDecode<'txn>,
-            DC: BytesDecode<'txn>,
-        {
-            type Item = Result<(KC::DItem, DC::DItem)>;
-
-            fn next(&mut self) -> Option<Self::Item> {
-                match self.guts.step()? {
-                    Ok((k, v)) => Some(decode_pair::<KC, DC>(k, v)),
-                    Err(e) => Some(Err(e)),
-                }
-            }
-        }
-
-        impl<KC, DC, C, IM> std::fmt::Debug for $name<'_, KC, DC, C, IM> {
-            fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.debug_struct(stringify!($name)).finish()
-            }
-        }
-    };
-}
-
-rw_iterator!(
-    RwIter,
-    "A read-write forward full-scan iterator (SPEC 00 row 43)."
-);
+rw_iterator!(RwIter, "A read-write forward full-scan iterator.");
 rw_iterator!(RwRevIter, "A read-write reverse full-scan iterator.");
-rw_range_iterator!(RwRange, "A read-write forward range iterator.");
-rw_range_iterator!(RwRevRange, "A read-write reverse range iterator.");
-rw_range_iterator!(
-    RwPrefix,
-    "A read-write forward prefix iterator (SPEC 00 row 45)."
-);
-rw_range_iterator!(RwRevPrefix, "A read-write reverse prefix iterator.");
+rw_iterator!(RwRange, "A read-write forward range iterator.", C);
+rw_iterator!(RwRevRange, "A read-write reverse range iterator.", C);
+rw_iterator!(RwPrefix, "A read-write forward prefix iterator.", C);
+rw_iterator!(RwRevPrefix, "A read-write reverse prefix iterator.", C);
 
 #[cfg(test)]
 mod erased_cursor_in_place_tests {
-    //! ADR-0021 B4 — the adapter's **lifetime-erased write cursor** under miri,
+    //! ADR-0021 — the adapter's **lifetime-erased write cursor** under miri,
     //! over the in-place `WRITE_MAP` realization (SPEC 04 TXN-45b).
     //!
     //! `RwGuts` is the one place the adapter erases lifetimes: it reborrows

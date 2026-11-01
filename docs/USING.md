@@ -192,8 +192,6 @@ build setting each run used.
 
 | Feature | Use case | Tracking |
 |---|---|---|
-| Fused read-modify-write (`update(key, closure)`) | Merging a change into a stored value, such as a posting-list bitmap, in one tree descent instead of two | [#52](https://github.com/qdequele/ZeroDB/issues/52) |
-| Batched lookups | Many independent `get`s per step, such as a graph walk's neighbor reads | [#53](https://github.com/qdequele/ZeroDB/issues/53) |
 | Bounded relaxed durability | A crash loses at most a configured window of commits, never consistency. It would replace the `NO_SYNC` plus checkpoint pattern | [#35](https://github.com/qdequele/ZeroDB/issues/35) |
 
 ## See also
