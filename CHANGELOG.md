@@ -108,6 +108,14 @@ the release workflow publishes the section matching the tag as the GitHub releas
 Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
+- Commit writes carry at most 256 KiB per `pwritev` call, LMDB's 64 pages
+  at 4 KiB (#135). Larger calls left the file in 2 MiB page-cache folios on
+  kernels that use large folios (XFS, recent ext4), and every later commit
+  rewriting one page inside one paid far more kernel time. After a 10M-key
+  load, a single-put no-sync commit's p50 went from 12.1–12.6 µs to 8.7–8.8 µs
+  (LMDB 7.6–7.9 µs); Meilisearch v1.55.0's hackernews additions 1.00× → 0.92×,
+  movies indexing and search flat. Bulk commits of fresh large values pay for
+  the extra calls: `put/val/v4k` 0.99× → 1.10×.
 - `WRITE_MAP` bulk writes find dirty pages with two bits per page instead of
   a hash probe, and read them at their own offset in the map, as LMDB does
   under `MDB_WRITEMAP` (#13). With `WRITE_MAP`: `put/order/seq` 1.12× →

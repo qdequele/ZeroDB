@@ -69,14 +69,72 @@ pub(crate) fn write_page(file: &File, pgno: u64, psize: u32, bytes: &[u8]) -> st
     file.write_all_at(bytes, off)
 }
 
-/// Vectored positioned write of consecutive page-multiple `frames` laid out
-/// back-to-back from `start_pgno * psize` (commit C2 batching):
-/// one `pwritev` per chunk of up to [`MAX_IOV`] frames instead of one syscall
-/// per dirty page.
+/// Segments per `pwritev` call, far below `IOV_MAX` (1024 on Linux and
+/// macOS). Commit frames are whole pages, so [`MAX_WRITE_BYTES`] binds first
+/// (64 pages of 4 KiB); this bound only matters for smaller buffers, and it
+/// lets the segments live in stack arrays.
+const MAX_SEGS: usize = 64;
+
+/// Bytes per `pwritev` call, unless one page is larger (then one page): 64
+/// pages of 4 KiB, LMDB's `MDB_COMMIT_PAGES`.
 ///
-/// A short write (rare on regular files) falls back to per-frame
-/// [`write_page`] for the whole chunk — positioned rewrites of the same bytes
-/// at the same offsets are idempotent, so restarting the chunk is correct.
+/// The page cache sizes the folios it allocates for a buffered write by the
+/// write's length on kernels and filesystems with large-folio support (XFS,
+/// and ext4 on recent kernels). A later write of one page into a large folio
+/// costs far more kernel time than a write into a small one, so large calls
+/// slow down every small commit that follows a bulk one. Smaller calls slow
+/// bulk commits instead, through the extra syscalls. 256 KiB, LMDB's choice,
+/// keeps most of the small-commit gain for few extra calls (measurements in
+/// docs/PERFORMANCE.md).
+const MAX_WRITE_BYTES: usize = 256 * 1024;
+
+/// Byte cap for one `pwritev` call at page size `psize`: [`MAX_WRITE_BYTES`],
+/// or one page when a page is larger.
+fn commit_cap(psize: u32) -> usize {
+    MAX_WRITE_BYTES.max(psize as usize)
+}
+
+/// Fill `segs` with the next `pwritev` call's segments over consecutive
+/// `frames`, resuming at `at` (frame index, byte offset within it): at most
+/// `cap` bytes and [`MAX_SEGS`] segments, cutting a frame longer than the
+/// remaining room (an overflow run) across calls. Returns the segment count,
+/// 0 once every byte has been handed out; concatenated, the calls' segments
+/// are exactly the frames' bytes in order.
+fn next_write_run<'a>(
+    frames: &[&'a [u8]],
+    at: &mut (usize, usize),
+    cap: usize,
+    segs: &mut [&'a [u8]; MAX_SEGS],
+) -> usize {
+    debug_assert!(cap > 0);
+    let (mut n, mut room) = (0usize, cap);
+    while room > 0 && n < MAX_SEGS {
+        let Some(frame) = frames.get(at.0) else { break };
+        let rest = &frame[at.1..];
+        let take = rest.len().min(room);
+        if take > 0 {
+            segs[n] = &rest[..take];
+            n += 1;
+            room -= take;
+        }
+        if take == rest.len() {
+            *at = (at.0 + 1, 0);
+        } else {
+            at.1 += take;
+        }
+    }
+    n
+}
+
+/// Vectored positioned write of consecutive page-multiple `frames` laid out
+/// back-to-back from `start_pgno * psize` (commit C2 batching): one
+/// `pwritev` per [`MAX_WRITE_BYTES`] (or per page, if a page is larger)
+/// instead of one syscall per dirty page.
+///
+/// A short write (rare on regular files) falls back to positioned
+/// `write_all_at` of each segment of that call — positioned rewrites of the
+/// same bytes at the same offsets are idempotent, so restarting the call's
+/// range is correct.
 ///
 /// # Errors
 ///
@@ -88,35 +146,42 @@ pub(crate) fn write_pages_vectored(
     frames: &[&[u8]],
 ) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
-    /// Conservative iovec cap ≤ `IOV_MAX` on every supported platform
-    /// (Linux 1024, macOS 1024; LMDB's `MDB_COMMIT_PAGES` plays the same
-    /// role).
-    const MAX_IOV: usize = 512;
 
+    let cap = commit_cap(psize);
     let mut off: u64 = page_offset(start_pgno, psize)?;
-    let mut i = 0usize;
-    while i < frames.len() {
-        let chunk = &frames[i..(i + MAX_IOV).min(frames.len())];
-        let total: usize = chunk.iter().map(|f| f.len()).sum();
-        let iovs: Vec<libc::iovec> = chunk
-            .iter()
-            .map(|f| libc::iovec {
-                iov_base: f.as_ptr() as *mut libc::c_void,
-                iov_len: f.len(),
-            })
-            .collect();
+    let mut at = (0usize, 0usize);
+    let mut segs: [&[u8]; MAX_SEGS] = [&[]; MAX_SEGS];
+    let mut iovs = [libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
+    }; MAX_SEGS];
+    loop {
+        let count = next_write_run(frames, &mut at, cap, &mut segs);
+        if count == 0 {
+            break;
+        }
+        let run = &segs[..count];
+        let mut total = 0usize;
+        for (iov, s) in iovs.iter_mut().zip(run) {
+            *iov = libc::iovec {
+                iov_base: s.as_ptr() as *mut libc::c_void,
+                iov_len: s.len(),
+            };
+            total += s.len();
+        }
         let offset = libc::off_t::try_from(off).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset overflow")
         })?;
-        // SAFETY: each iovec points at a live `&[u8]` borrow held for the
-        // whole call (`chunk` outlives it); `pwritev` only READS the buffers
-        // (`iov_base` is `*mut` purely for C signature symmetry); the fd is a
-        // valid, open regular file owned by `file`.
+        // SAFETY: the first `count` iovecs point at live `&[u8]` borrows
+        // (`segs`, borrowing `frames`) held for the whole call; `pwritev`
+        // only READS the buffers (`iov_base` is `*mut` purely for C
+        // signature symmetry); the fd is a valid, open regular file owned by
+        // `file`.
         let n = unsafe {
             libc::pwritev(
                 file.as_raw_fd(),
                 iovs.as_ptr(),
-                iovs.len() as libc::c_int,
+                count as libc::c_int,
                 offset,
             )
         };
@@ -124,16 +189,15 @@ pub(crate) fn write_pages_vectored(
             return Err(std::io::Error::last_os_error());
         }
         if n as usize != total {
-            // Short write: restart this chunk with idempotent per-frame
-            // positioned writes.
-            let mut pg = off / psize as u64;
-            for f in chunk {
-                write_page(file, pg, psize, f)?;
-                pg += (f.len() / psize as usize) as u64;
+            // Short write: restart this call's range with idempotent
+            // positioned writes of each segment.
+            let mut seg_off = off;
+            for s in run {
+                file.write_all_at(s, seg_off)?;
+                seg_off += s.len() as u64;
             }
         }
         off += total as u64;
-        i += chunk.len();
     }
     Ok(())
 }
@@ -268,4 +332,135 @@ fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
         _ => Path::new("."),
     };
     File::open(parent)?.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{commit_cap, next_write_run, write_pages_vectored, MAX_SEGS, MAX_WRITE_BYTES};
+
+    /// The commit cap is 256 KiB, LMDB's 64 pages at 4 KiB, unless one page
+    /// is larger; a change to the tuned value has to change this test.
+    #[test]
+    fn commit_cap_is_256_kib_or_one_page() {
+        assert_eq!(commit_cap(4096), 256 * 1024);
+        assert_eq!(commit_cap(65536), 256 * 1024);
+        assert_eq!(commit_cap(1 << 20), 1 << 20);
+    }
+    use std::os::unix::fs::FileExt;
+
+    /// Every call's segments `next_write_run` hands out, in order.
+    fn runs<'a>(frames: &[&'a [u8]], cap: usize) -> Vec<Vec<&'a [u8]>> {
+        let (mut at, mut out) = ((0, 0), Vec::new());
+        let mut segs: [&[u8]; MAX_SEGS] = [&[]; MAX_SEGS];
+        loop {
+            let n = next_write_run(frames, &mut at, cap, &mut segs);
+            if n == 0 {
+                break;
+            }
+            out.push(segs[..n].to_vec());
+        }
+        assert_eq!(
+            next_write_run(frames, &mut at, cap, &mut segs),
+            0,
+            "a finished split stays finished"
+        );
+        out
+    }
+
+    /// Distinct bytes per page, so a misplaced or reordered page shows.
+    fn page(ps: usize, tag: usize) -> Vec<u8> {
+        (0..ps).map(|i| (i * 31 + tag * 7) as u8).collect()
+    }
+
+    /// Runs hold at most `cap` bytes and `MAX_SEGS` segments, cut overflow-run
+    /// frames across calls, and concatenate back to the frames' bytes.
+    #[test]
+    fn write_runs_respect_the_byte_and_iovec_caps() {
+        const PS: usize = 4096;
+        let pages: Vec<Vec<u8>> = (0..30).map(|t| page(PS, t)).collect();
+        let overflow: Vec<u8> = pages[2..12].concat(); // a 10-page overflow run
+        let mut frames: Vec<&[u8]> = vec![&pages[0], &pages[1], &overflow];
+        frames.extend(pages[12..30].iter().map(Vec::as_slice));
+        let want: Vec<u8> = frames.concat();
+
+        for cap in [PS, 4 * PS, MAX_WRITE_BYTES, 1 << 30] {
+            let got = runs(&frames, cap);
+            for r in &got {
+                let len: usize = r.iter().map(|s| s.len()).sum();
+                assert!(
+                    len <= cap && r.len() <= MAX_SEGS,
+                    "cap {cap}: run of {len} bytes"
+                );
+                assert!(r.iter().all(|s| !s.is_empty()), "no empty segment");
+            }
+            let full = got
+                .iter()
+                .filter(|r| r.len() == MAX_SEGS || r.iter().map(|s| s.len()).sum::<usize>() == cap);
+            assert!(
+                full.count() >= got.len() - 1,
+                "cap {cap}: only the last call stops short of a limit"
+            );
+            let flat: Vec<u8> = got
+                .iter()
+                .flatten()
+                .flat_map(|s| s.iter().copied())
+                .collect();
+            assert_eq!(flat, want, "cap {cap}: bytes reordered or lost");
+        }
+        assert_eq!(
+            runs(&frames, 1 << 30).len(),
+            frames.len().div_ceil(MAX_SEGS),
+            "a large byte cap leaves the segment cap"
+        );
+        assert_eq!(
+            runs(&frames, MAX_WRITE_BYTES).len(),
+            (30 * PS).div_ceil(MAX_WRITE_BYTES),
+            "the commit cap writes MAX_WRITE_BYTES per call"
+        );
+        assert_eq!(
+            runs(&frames, PS).len(),
+            30,
+            "a one-page cap writes page by page"
+        );
+
+        // More segments than MAX_SEGS under a large byte cap: split by count.
+        let tiny = [0u8; 8];
+        let many: Vec<&[u8]> = vec![&tiny[..]; MAX_SEGS + 3];
+        let got = runs(&many, 1 << 30);
+        assert_eq!(
+            got.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![MAX_SEGS, 3]
+        );
+        assert!(runs(&[], PS).is_empty(), "nothing to write, no call");
+    }
+
+    /// The vectored write lands every byte at its page offset, at a page
+    /// size below the byte cap (the overflow run spans three calls) and at
+    /// 64 KiB.
+    #[test]
+    fn write_pages_vectored_round_trips() {
+        for ps in [4096usize, 65536] {
+            let path = std::env::temp_dir()
+                .join(format!("zerodb-io-vectored-{ps}-{}", std::process::id()));
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&path)
+                .unwrap();
+            let pages: Vec<Vec<u8>> = (0..150).map(|t| page(ps, t)).collect();
+            let overflow: Vec<u8> = pages[1..147].concat(); // spans several calls
+            let frames: Vec<&[u8]> = vec![&pages[0], &overflow, &pages[147], &pages[148]];
+            write_pages_vectored(&file, 3, ps as u32, &frames).unwrap();
+
+            let want: Vec<u8> = frames.concat();
+            let mut got = vec![0u8; want.len()];
+            file.read_exact_at(&mut got, 3 * ps as u64).unwrap();
+            assert_eq!(got, want, "page size {ps}");
+            assert_eq!(file.metadata().unwrap().len(), (3 * ps + want.len()) as u64);
+            drop(file);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }

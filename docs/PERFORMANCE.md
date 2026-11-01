@@ -70,6 +70,7 @@ validation (ADR-0014). Source keys name the run each figure comes from:
 | BP | ladder under four build profiles, and scans validating vs trusted, Graviton4, 2026-10-31 |
 | W | write txns reuse their containers, Graviton4, 2026-10-31 |
 | WM | bulk writes with `WRITE_MAP`, before and after the per-page dirty bits, Graviton4, 2026-10-31 |
+| WC | commit writes capped at 256 KiB per call: 10M-key single-put commits, the ladder, and Meilisearch v1.55.0, Graviton4, 2026-11-01 |
 | L | the perf ledger line for the change |
 
 E, V, M, S and P predate the multi-process lock file, which has been on by
@@ -173,7 +174,7 @@ file, which made `scan/full/big` a further 13 % faster (SC).
 |---|---:|---|
 | Meilisearch indexing, movies | 0.99× (E), 1.01× (M), 1.02× (C) | E, M, C |
 | Meilisearch indexing, hackernews 1M docs | 0.99× | E |
-| Meilisearch hackernews incremental additions | 0.99× (M); 1.03× on an 8 GiB Graviton4 host (C), most likely host memory; 0.89× on a 16 GiB laptop | M, C |
+| Meilisearch hackernews incremental additions | 0.99× (M); 1.03× on an 8 GiB Graviton4 host (C), most likely host memory; 0.89× on a 16 GiB laptop. Meilisearch v1.55.0 on the 8 GiB Graviton4 host: 1.00× before the 256 KiB commit-write cap, 0.92× after (WC) | M, C, WC |
 | Meilisearch search, movies | 0.95× (E), 0.94× (M), 0.99× (C) | E, M, C |
 | Meilisearch search, hackernews | 1.01× | E |
 | hannoy build, 512 / 768 / 1536 dims | 0.84× / 0.84× / 0.89× (E); 0.94× / 0.95× / 0.97× (C) | E, C |
@@ -206,7 +207,7 @@ LMDB". Ratios are before → after.
 | Technique | Change | Before → after |
 |---|---|---|
 | <a id="b1"></a>Write cursor keeps its path | The write cursor parks and resumes its path instead of re-seeking by key; a delete, a same-key put and a split keep the path, as LMDB fixes up its cursors. | Graviton4: `put/cursor/rewrite` 2.50× → 1.37×, `del/cursor/drain` 2.62× → 2.15× |
-| <a id="b4"></a>Batched writes | Contiguous dirty pages go out in `pwritev` batches, as `mdb_page_flush`. | — |
+| <a id="b4"></a>Batched writes | Contiguous dirty pages go out in `pwritev` batches of at most 256 KiB, LMDB's 64 pages (`MDB_COMMIT_PAGES`), as `mdb_page_flush`. Batches used to reach 2 MiB, which left the file in large page-cache folios on kernels that use them, so every later one-page rewrite paid far more kernel time (#135). Cost: bulk fresh large values, `put/val/v4k` 0.99× → 1.10×. | 10M-key single-put no-sync commit p50 12.1–12.6 → 8.7–8.8 µs (LMDB 7.6–7.9); Meilisearch hackernews additions 1.00× → 0.92× (WC) |
 | <a id="b6"></a>Reserved puts write in place | `put_reserved` hands the caller the page slot directly, as `MDB_RESERVE`. The cursor form still stages its value; it is to be built in place, as LMDB does (#10). | `put/api/reserved` 0.96× |
 | <a id="b11"></a>Writer slot without a syscall | Releasing a write txn wakes a waiter only if one waits. | `rw_empty_commit` 5.93× → 2.19× |
 | Reused descent path; in-place `APPEND` check | One path buffer per write txn; `APPEND` compares the last key in place. | `put/order/append` 1.32× → 1.19× |
@@ -260,14 +261,13 @@ LMDB". Ratios are before → after.
 
 Issues are tracked on [GitHub](https://github.com/qdequele/ZeroDB/issues).
 
-- **Single-page writes after a bulk commit** (#135). A commit writes each run
-  of dirty pages with one `pwritev` of up to 2 MiB, where LMDB writes at most
-  64 pages per call. On kernels and filesystems that cache files in large
-  folios, every later commit that rewrites one 4 KiB page inside such a run
-  pays far more kernel time. On the 10M-key no-sync workload, write p50 is
-  12.1–12.6 µs against LMDB's 7.6–7.9 µs; a 256 KiB cap per call brings it to
-  8.7–8.8 µs. This is most of the public no-sync YCSB A gap. Open: whether a
-  cap slows Meilisearch's bulk indexing, then the default.
+- **Single-page writes after a bulk commit** (#135). Commit writes are now
+  capped at 256 KiB per `pwritev` call, as LMDB's 64 pages: on the 10M-key
+  no-sync workload, write p50 went from 12.1–12.6 µs to 8.7–8.8 µs, against
+  LMDB's 7.6–7.9 µs (WC). A 16 KiB cap reached 7.5 µs but made bulk
+  large-value writes 1.6× slower. Still to measure: the public no-sync YCSB A
+  suite and the hannoy benches with the cap, the ladder on current `main`, and
+  XFS.
 - **Per-commit CPU** (#146). `commit/batch/n1` is 1.17× and an empty write
   txn 3.52× on Graviton4 (W); a single-put no-sync commit costs 5.74k user
   cycles against LMDB's 2.64k. The remaining cost is CPU, not I/O: the writer
