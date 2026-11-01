@@ -11,6 +11,9 @@
 //! * `bulk/half` leaves it populated: rebalance without collapse.
 //! * `range/half` removes the same span through one `delete_range` cursor walk,
 //!   so `range/half ÷ bulk/half` is per-key descent vs a single positioned walk.
+//! * `cursor/drain` removes the same span through the write cursor
+//!   (`del_current`), front to back; `cursor/rev` drains it back to front, so
+//!   its rebalances pair with the left sibling and it steps with `prev`.
 //! * `clear/all` drops the whole tree in one operation, which should be
 //!   page-list work rather than per-key work.
 //! * `churn/reinsert` alternates delete and re-insert, so freed pages have to be
@@ -185,6 +188,20 @@ fn cursor(c: &mut Criterion, cfg: &Cfg, keys: &[Vec<u8>], val: &[u8]) {
     pair!(
         wr_loaded,
         cursor_drain,
+        &mut g,
+        &Seed::named(cfg.page, keys, val),
+        half,
+        val
+    );
+    g.finish();
+    // The same span drained backward: `drain` starts at the tree's first key,
+    // so every rebalance it does pairs a parent's child 0 with its right
+    // sibling; this one pairs with the left sibling and steps with `prev`
+    // after each delete — the cursor repairs `drain` never reaches.
+    let mut g = group(c, "del/cursor/rev", half.len());
+    pair!(
+        wr_loaded,
+        cursor_rev_drain,
         &mut g,
         &Seed::named(cfg.page, keys, val),
         half,

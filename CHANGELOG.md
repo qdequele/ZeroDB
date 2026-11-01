@@ -6,6 +6,90 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### Write transactions reuse the previous one's containers (#8)
+
+Every write transaction built its working containers empty: the dirty-page
+and spilled-page indexes, the freed, loose and reclaimed page sets, the
+commit's sorted page list, the open-table slots and the descent buffers. A
+small commit spent much of its CPU growing and freeing them. They now live in
+a box that rides the env's writer slot from one write transaction to the
+next, used in place, as LMDB keeps its single write transaction (`me_txn0`)
+per env. Hash indexes keep capacity for about 128 entries and vectors 4,096,
+so one large transaction does not make later small ones walk an oversized
+table. A write transaction also starts from the snapshot the previous one
+published when nothing has committed since, instead of taking the snapshot
+cell's lock, and drains the base meta page's free-list annex in place
+instead of copying it. Nothing observable changes. A single-put commit on a
+named database makes 5 heap allocations instead of 19, and an empty write
+transaction none instead of one. On Graviton4 a single-put no-sync commit
+takes 5.17 µs instead of 5.51 (LMDB: 4.25) and 5.74k user cycles instead of
+6.68k; `commit/batch/n1` went from 1.26× to 1.17× LMDB, no rung regressed.
+Details: `benches/results/2026-10-31-writer-carry-graviton.md`. New test
+`crates/zerodb/tests/write_txn_allocations.rs`. In `zerodb-core`,
+`DirtyStore::sorted_pgnos` is replaced by `sorted_pgnos_into`, which fills a
+buffer the caller reuses.
+### Faster cursor deletes and `clear` (issue #137)
+
+Four changes to the delete path, each taken from LMDB's technique for it; the
+tree shape and the file are unchanged.
+
+- The write cursor steps inside its leaf in place after a delete, as
+  `mdb_cursor_next`/`mdb_cursor_prev` do: it reads the next slot from the path
+  it keeps instead of rebuilding a cursor around it, and no longer allocates a
+  copy of each deleted key.
+- A delete that borrows from or merges with its **left** sibling keeps the
+  cursor's path (LMDB's `mdb_node_move` and `mdb_page_merge` cursor fix-ups)
+  instead of re-descending, and `prev` after a delete steps back from the kept
+  path. Backward drains (`rev_range_mut` + `del_current`) used to re-descend on
+  every step. SPEC 03 §5.4a.
+- Removing a cell fixes the page's cell pointers in one pass, as
+  `mdb_node_del` does.
+- `clear` frees a page of the base snapshot with a list append (it cannot have
+  a dirty frame), reserves its page list per branch (`mdb_midl_need`), and
+  checks the collected pages for duplicates with a bitmap instead of a sort.
+
+On Graviton4 (ZeroDB time ÷ LMDB time): `del/cursor/drain` 2.41× → 1.66×,
+`del/cursor/rev` 3.06× → 1.50×, `del/clear/all` 1.73× → 1.43×, `del/bulk/half`
+1.41× → 1.35×; cursor rewrites (`put/cursor/rewrite`) 2.12× → 1.75×, and no
+put or commit rung slowed. New ladder rung `del/cursor/rev` (the backward
+drain). Details: `benches/results/2026-10-31-delete-path-cursor.md`.
+
+### The validated-pages cache covers the whole file (ADR-0018 amendment)
+
+The env-wide cache of validated page versions had 64 Ki slots, so on a file of
+more than 64 Ki pages most random reads found their leaf's slot taken by
+another page and checked the leaf's cells again. Each page now has its own
+slot, up to 2^23 pages (32 GiB at 4 KiB pages, 128 GiB at 16 KiB), allocated
+as pages are first committed or validated: 8 bytes per page, 64 MiB per
+environment at most.
+A slot is one atomic word instead of a seqlock over three, so a lookup is one
+load and a publish one store. Files and the public API are unchanged.
+On Graviton4, random gets on a 10M-key file went from 1.32–1.36 µs to
+1.23–1.24 µs p50 (LMDB 0.96–1.08 µs) and `scan/full/big` from 27.9 ms to
+24.3 ms; the cache holds 2.5 MiB for that 1.33 GB file.
+
+### Write-cursor puts keep their position across splits; cheaper cursor steps and APPEND puts (#138)
+
+A put through the write cursor (`put_current`, or heed's `put_current` on a
+`RwIter`/`RwRange`) that splits its leaf used to drop the cursor's
+root-to-leaf path, and the next step searched from the root again. The path
+now follows the entry to whichever half holds it, through branch splits and a
+root grow, as LMDB fixes up its cursor after a page split. The write cursor
+also steps on its parked path in place instead of copying it in and out per
+step, yields the entry the step landed on without looking the page up a
+second time, and rewrites a same-size value on a page the transaction already
+owns in one page access, with no copy-on-write pass over the path (LMDB's
+`MDB_CURRENT` put on a dirty page). `APPEND` puts no longer view the
+rightmost leaf twice and skip the copy-on-write pass when the whole right
+spine is already the transaction's. Behaviour and files are unchanged.
+On Graviton4, `put/cursor/rewrite` went from 2.50× to 1.37× LMDB's time,
+`put/order/append` from 1.26× to 1.21× and `del/cursor/drain` from 2.62× to
+2.15×; without commit costs, the cursor rewrite loop went from 4.1× to 2.1×
+LMDB's CPU time per entry. Details:
+`benches/results/2026-10-31-write-cursor-split-append-graviton.md`. New example
+`crates/zerodb-oracle/examples/cursor_put_census.rs`; the differential
+fuzzer's cursor-put walk gains a `grow` mode that splits on most puts.
+
 ### Raw environment copies read the data file: a clone on APFS, `copy_file_range` on Linux (ADR-0032)
 
 A non-compacting copy (`copy_to_file` with `CompactionOption::Disabled`) wrote

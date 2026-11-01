@@ -16,6 +16,7 @@
 //! `INITIALIZED`/`EOF` flags of SPEC 03 §4. Each public op documents the §4
 //! subsection whose positioning/EOF/empty-DB semantics it implements.
 
+use std::borrow::BorrowMut;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -673,6 +674,8 @@ pub(crate) fn node_view<'a>(
     pgno: u64,
     valid: Option<&ValidatedPages<'_>>,
 ) -> Result<NodeView<'a>, PageError> {
+    // Kept apart from `node_view_classified` (not a wrapper over it): every
+    // keyed descent runs this body, and its code is left exactly as it was.
     let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
     let page = PageRef::new_trusted_psize(bytes, psize)?;
     match page.page_type() {
@@ -682,6 +685,30 @@ pub(crate) fn node_view<'a>(
         }
         other => Err(wrong_type(other)),
     }
+}
+
+/// [`node_view`] plus whether the page came from the committed map (`true`)
+/// or is a frame this write txn already owns (`false`) — the writer's
+/// equivalent of LMDB's `P_DIRTY` test on a page in hand, which tells a
+/// descent that copy-on-write has nothing left to do at that level.
+// Forced, as `node_view`.
+#[inline(always)]
+pub(crate) fn node_view_classified<'a>(
+    src: Source<'a>,
+    psize: u32,
+    pgno: u64,
+    valid: Option<&ValidatedPages<'_>>,
+) -> Result<(NodeView<'a>, bool), PageError> {
+    let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
+    let page = PageRef::new_trusted_psize(bytes, psize)?;
+    let view = match page.page_type() {
+        PageType::Leaf => leaf_view_over(bytes, from_map, psize, pgno, valid).map(NodeView::Leaf),
+        PageType::Branch => {
+            branch_view_over(bytes, from_map, psize, pgno, valid).map(NodeView::Branch)
+        }
+        other => Err(wrong_type(other)),
+    }?;
+    Ok((view, from_map))
 }
 
 // ---------------------------------------------------------------------------
@@ -918,6 +945,27 @@ impl<'a> Tree<'a> {
         let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
         Ok((k, v))
     }
+
+    /// The entry in slot `ki` of leaf `pgno`, or `None` when `ki` is past the
+    /// leaf's last cell: the write cursor's in-leaf step (LMDB's
+    /// `mdb_cursor_next` reading the node at `mc_ki` in the page it already
+    /// holds), which needs no cursor rebuilt around its parked path.
+    ///
+    /// The caller vouches that `pgno` is a live leaf of this tree state, as
+    /// for [`entry_at`](Self::entry_at); only `ki` may run past the end.
+    ///
+    /// # Errors
+    ///
+    /// A [`PageError`] if the page is not a valid leaf.
+    pub(crate) fn entry_in_leaf(&self, pgno: u64, ki: usize) -> PosResult<'a> {
+        let leaf = leaf_view(self.src, self.psize, pgno, self.valid)?;
+        if ki >= leaf.num_keys() {
+            return Ok(None);
+        }
+        let k = leaf.key(ki);
+        let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
+        Ok(Some((k, v)))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -936,8 +984,11 @@ pub(crate) const CURSOR_STACK: usize = 32;
 /// `Tree::get` (the `grow_one` frame in the hannoy-build profile).
 /// Inline storage makes cursor construction allocation-free; `push` reports
 /// overflow as a typed corruption error instead of growing.
+///
+/// Public only as the default path storage of [`Cursor`]; it has no public
+/// methods.
 #[derive(Clone, Debug)]
-pub(crate) struct PathStack {
+pub struct PathStack {
     /// Frames `0..len`; slots past `len` are dead space.
     buf: [(u64, usize); CURSOR_STACK],
     len: usize,
@@ -1005,6 +1056,19 @@ impl PathStack {
         self.buf.copy_within(1..self.len, 0);
         self.len -= 1;
     }
+
+    /// Insert `frame` as the new frame 0, shifting the rest up: the write
+    /// path's root-grow repair (SPEC 03 §5.4b) — a split reached the root,
+    /// and the new root branch sits above the old root level.
+    fn push_root(&mut self, frame: (u64, usize)) -> Result<(), PageError> {
+        if self.len == CURSOR_STACK {
+            return Err(depth_exceeded());
+        }
+        self.buf.copy_within(0..self.len, 1);
+        self.buf[0] = frame;
+        self.len += 1;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1014,15 +1078,19 @@ impl PathStack {
 /// A read cursor: a root-to-leaf path plus the `INITIALIZED`/`EOF` flags of
 /// SPEC 03 §4. All positioning ops return the entry at the new position (or
 /// `None` at an edge), borrowing key/value `&'a [u8]` from the source.
+///
+/// `S` holds the path: owned by default, or borrowed from a write cursor's
+/// parked [`SavedCursor`] ([`Cursor::resume_in`]), so a step moves the
+/// cursor where it is parked instead of copying the whole stack in and out.
 #[derive(Clone)]
-pub struct Cursor<'a> {
+pub struct Cursor<'a, S: BorrowMut<PathStack> = PathStack> {
     src: Source<'a>,
     psize: u32,
     root: u64,
     depth: u16,
     /// `(pgno, ki)` from root (index 0) to the current leaf (`top`). Empty when
     /// the cursor is unpositioned.
-    stack: PathStack,
+    path: S,
     /// The `INITIALIZED` flag (SPEC 03 §4): the cursor has been positioned.
     /// Cleared on before-begin (`prev` past the minimum) and on a failed exact
     /// `set`.
@@ -1057,13 +1125,25 @@ impl<'a> Cursor<'a> {
             psize: t.psize,
             root: t.root,
             depth: t.depth,
-            stack: PathStack::new(),
+            path: PathStack::new(),
             initialized: false,
             eof: false,
             cmp: t.cmp,
             leaf_cache: Cell::new(None),
             valid: t.valid,
         }
+    }
+}
+
+impl<'a, S: BorrowMut<PathStack>> Cursor<'a, S> {
+    #[inline(always)]
+    fn stack(&self) -> &PathStack {
+        self.path.borrow()
+    }
+
+    #[inline(always)]
+    fn stack_mut(&mut self) -> &mut PathStack {
+        self.path.borrow_mut()
     }
 
     // -- page helpers ------------------------------------------------------
@@ -1096,7 +1176,7 @@ impl<'a> Cursor<'a> {
         if !self.initialized || self.eof {
             return Ok(None);
         }
-        let (pgno, ki) = match self.stack.last() {
+        let (pgno, ki) = match self.stack().last() {
             Some(f) => *f,
             None => return Ok(None),
         };
@@ -1118,12 +1198,12 @@ impl<'a> Cursor<'a> {
         for _ in 0..=(self.depth as usize + 1) {
             match node_view(self.src, self.psize, pgno, self.valid)? {
                 NodeView::Leaf(leaf) => {
-                    self.stack.push((pgno, 0))?;
+                    self.stack_mut().push((pgno, 0))?;
                     self.leaf_cache.set(Some((pgno, leaf)));
                     return Ok(());
                 }
                 NodeView::Branch(br) => {
-                    self.stack.push((pgno, 0))?;
+                    self.stack_mut().push((pgno, 0))?;
                     pgno = br.child_pgno(0);
                 }
             }
@@ -1139,13 +1219,13 @@ impl<'a> Cursor<'a> {
             match node_view(self.src, self.psize, pgno, self.valid)? {
                 NodeView::Leaf(leaf) => {
                     let n = leaf.num_keys();
-                    self.stack.push((pgno, n.saturating_sub(1)))?;
+                    self.stack_mut().push((pgno, n.saturating_sub(1)))?;
                     self.leaf_cache.set(Some((pgno, leaf)));
                     return Ok(());
                 }
                 NodeView::Branch(br) => {
                     let last = br.num_keys().saturating_sub(1);
-                    self.stack.push((pgno, last))?;
+                    self.stack_mut().push((pgno, last))?;
                     pgno = br.child_pgno(last);
                 }
             }
@@ -1157,7 +1237,7 @@ impl<'a> Cursor<'a> {
     /// (may equal `num_keys`). Leaves the cursor uninitialized on an empty tree
     /// (SPEC 03 §2).
     fn search(&mut self, key: &[u8]) -> Result<(), PageError> {
-        self.stack.clear();
+        self.stack_mut().clear();
         self.eof = false;
         if self.root == PGNO_INVALID {
             self.initialized = false;
@@ -1170,14 +1250,14 @@ impl<'a> Cursor<'a> {
                     let ki = match leaf.lookup_with(key, self.cmp) {
                         Ok(i) | Err(i) => i,
                     };
-                    self.stack.push((pgno, ki))?;
+                    self.stack_mut().push((pgno, ki))?;
                     self.leaf_cache.set(Some((pgno, leaf)));
                     self.initialized = true;
                     return Ok(());
                 }
                 NodeView::Branch(br) => {
                     let i = br.child_index_with(key, self.cmp);
-                    self.stack.push((pgno, i))?;
+                    self.stack_mut().push((pgno, i))?;
                     pgno = br.child_pgno(i);
                 }
             }
@@ -1193,15 +1273,15 @@ impl<'a> Cursor<'a> {
     /// also used by `set_range` when parked past a leaf's end.
     fn ascend_next(&mut self) -> PosResult<'a> {
         loop {
-            if self.stack.len() <= 1 {
+            if self.stack().len() <= 1 {
                 self.eof = true;
                 return Ok(None);
             }
-            self.stack.pop();
-            let (bp, bki) = *self.stack.last().expect("len > 1");
+            self.stack_mut().pop();
+            let (bp, bki) = *self.stack().last().expect("len > 1");
             let br = self.branch_at(bp)?;
             if bki + 1 < br.num_keys() {
-                self.stack.last_mut().expect("len > 1").1 = bki + 1;
+                self.stack_mut().last_mut().expect("len > 1").1 = bki + 1;
                 let child = br.child_pgno(bki + 1);
                 self.descend_min(child)?;
                 return self.current();
@@ -1216,15 +1296,15 @@ impl<'a> Cursor<'a> {
     /// is left exactly as it was.
     fn next_leaf(&mut self) -> Result<bool, PageError> {
         loop {
-            if self.stack.len() <= 1 {
+            if self.stack().len() <= 1 {
                 self.eof = true;
                 return Ok(false);
             }
-            self.stack.pop();
-            let (bp, bki) = *self.stack.last().expect("len > 1");
+            self.stack_mut().pop();
+            let (bp, bki) = *self.stack().last().expect("len > 1");
             let br = self.branch_at(bp)?;
             if bki + 1 < br.num_keys() {
-                self.stack.last_mut().expect("len > 1").1 = bki + 1;
+                self.stack_mut().last_mut().expect("len > 1").1 = bki + 1;
                 let child = br.child_pgno(bki + 1);
                 self.descend_min(child)?;
                 return Ok(true);
@@ -1236,16 +1316,16 @@ impl<'a> Cursor<'a> {
     /// the previous leaf, or go before-begin (uninitialized) if there is none.
     fn ascend_prev(&mut self) -> PosResult<'a> {
         loop {
-            if self.stack.len() <= 1 {
+            if self.stack().len() <= 1 {
                 self.initialized = false;
-                self.stack.clear();
+                self.stack_mut().clear();
                 return Ok(None);
             }
-            self.stack.pop();
-            let (bp, bki) = *self.stack.last().expect("len > 1");
+            self.stack_mut().pop();
+            let (bp, bki) = *self.stack().last().expect("len > 1");
             let br = self.branch_at(bp)?;
             if bki > 0 {
-                self.stack.last_mut().expect("len > 1").1 = bki - 1;
+                self.stack_mut().last_mut().expect("len > 1").1 = bki - 1;
                 let child = br.child_pgno(bki - 1);
                 self.descend_max(child)?;
                 return self.current();
@@ -1258,16 +1338,16 @@ impl<'a> Cursor<'a> {
     /// (`false`), for [`retreat_by`](Self::retreat_by).
     fn prev_leaf(&mut self) -> Result<bool, PageError> {
         loop {
-            if self.stack.len() <= 1 {
+            if self.stack().len() <= 1 {
                 self.initialized = false;
-                self.stack.clear();
+                self.stack_mut().clear();
                 return Ok(false);
             }
-            self.stack.pop();
-            let (bp, bki) = *self.stack.last().expect("len > 1");
+            self.stack_mut().pop();
+            let (bp, bki) = *self.stack().last().expect("len > 1");
             let br = self.branch_at(bp)?;
             if bki > 0 {
-                self.stack.last_mut().expect("len > 1").1 = bki - 1;
+                self.stack_mut().last_mut().expect("len > 1").1 = bki - 1;
                 let child = br.child_pgno(bki - 1);
                 self.descend_max(child)?;
                 return Ok(true);
@@ -1280,7 +1360,7 @@ impl<'a> Cursor<'a> {
     /// `first` (`MDB_FIRST`) — SPEC 03 §4: leftmost entry; empty tree → `None`,
     /// cursor stays uninitialized. Clears `EOF`.
     pub fn first(&mut self) -> PosResult<'a> {
-        self.stack.clear();
+        self.stack_mut().clear();
         self.eof = false;
         if self.root == PGNO_INVALID {
             self.initialized = false;
@@ -1293,7 +1373,7 @@ impl<'a> Cursor<'a> {
 
     /// `last` (`MDB_LAST`) — SPEC 03 §4: rightmost entry; empty tree → `None`.
     pub fn last(&mut self) -> PosResult<'a> {
-        self.stack.clear();
+        self.stack_mut().clear();
         self.eof = false;
         if self.root == PGNO_INVALID {
             self.initialized = false;
@@ -1321,7 +1401,7 @@ impl<'a> Cursor<'a> {
             return Ok(None);
         }
         let (pgno, ki) = *self
-            .stack
+            .stack()
             .last()
             .expect("initialized cursor has a leaf frame");
         let leaf = self.leaf_at(pgno)?;
@@ -1330,7 +1410,7 @@ impl<'a> Cursor<'a> {
             // already in hand, as LMDB's `mdb_cursor_next` reads the node
             // right after `mc_ki++`, rather than re-deriving it in `current`.
             let ki = ki + 1;
-            self.stack.last_mut().expect("leaf frame").1 = ki;
+            self.stack_mut().last_mut().expect("leaf frame").1 = ki;
             let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
             return Ok(Some((leaf.key(ki), v)));
         }
@@ -1356,7 +1436,7 @@ impl<'a> Cursor<'a> {
             return Ok(None);
         }
         let (pgno, ki) = *self
-            .stack
+            .stack()
             .last()
             .expect("initialized cursor has a leaf frame");
         let leaf = self.leaf_at(pgno)?;
@@ -1368,7 +1448,7 @@ impl<'a> Cursor<'a> {
         // reach here: emptying one is a structural change (§10), and the write
         // cursor discards its path on those rather than parking.
         debug_assert!(nkeys > 0, "settle on an empty leaf");
-        self.stack.last_mut().expect("leaf frame").1 = nkeys.saturating_sub(1);
+        self.stack_mut().last_mut().expect("leaf frame").1 = nkeys.saturating_sub(1);
         self.ascend_next()
     }
 
@@ -1388,13 +1468,13 @@ impl<'a> Cursor<'a> {
             return self.last();
         }
         let (pgno, ki) = *self
-            .stack
+            .stack()
             .last()
             .expect("initialized cursor has a leaf frame");
         if ki > 0 {
             // Same leaf: read the entry directly, as `next` does.
             let ki = ki - 1;
-            self.stack.last_mut().expect("leaf frame").1 = ki;
+            self.stack_mut().last_mut().expect("leaf frame").1 = ki;
             let leaf = self.leaf_at(pgno)?;
             if ki < leaf.num_keys() {
                 let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
@@ -1437,14 +1517,14 @@ impl<'a> Cursor<'a> {
         }
         loop {
             let (pgno, ki) = *self
-                .stack
+                .stack()
                 .last()
                 .expect("initialized cursor has a leaf frame");
             let leaf = self.leaf_at(pgno)?;
             let nkeys = leaf.num_keys();
             let left = nkeys.saturating_sub(ki + 1);
             if n <= left {
-                self.stack.last_mut().expect("leaf frame").1 = ki + n;
+                self.stack_mut().last_mut().expect("leaf frame").1 = ki + n;
                 return self.current();
             }
             // The next leaf's first entry is `left + 1` steps away.
@@ -1482,11 +1562,11 @@ impl<'a> Cursor<'a> {
         }
         loop {
             let (pgno, ki) = *self
-                .stack
+                .stack()
                 .last()
                 .expect("initialized cursor has a leaf frame");
             if n <= ki {
-                self.stack.last_mut().expect("leaf frame").1 = ki - n;
+                self.stack_mut().last_mut().expect("leaf frame").1 = ki - n;
                 return self.current();
             }
             // The previous leaf's last entry is `ki + 1` steps away.
@@ -1513,7 +1593,7 @@ impl<'a> Cursor<'a> {
             return Ok(None);
         }
         let (pgno, ki) = *self
-            .stack
+            .stack()
             .last()
             .expect("initialized cursor has a leaf frame");
         let leaf = self.leaf_at(pgno)?;
@@ -1534,7 +1614,7 @@ impl<'a> Cursor<'a> {
             return Ok(None);
         }
         let (pgno, ki) = *self
-            .stack
+            .stack()
             .last()
             .expect("initialized cursor has a leaf frame");
         let leaf = self.leaf_at(pgno)?;
@@ -1602,7 +1682,7 @@ impl<'a> Cursor<'a> {
         if !self.initialized || self.eof {
             return Ok(None);
         }
-        let (pgno, ki) = match self.stack.last() {
+        let (pgno, ki) = match self.stack().last() {
             Some(f) => *f,
             None => return Ok(None),
         };
@@ -1612,35 +1692,27 @@ impl<'a> Cursor<'a> {
         }
         Ok(Some(leaf.node_flags(ki)))
     }
+}
 
-    // -- park / resume (the write cursor's stack persistence) --
+// -- park / resume (the write cursor's stack persistence) --
 
-    /// Detach this cursor's position as plain data (no borrows), so a write
-    /// cursor can persist it across `&mut RwTxn` calls and [`resume`]
-    /// (Self::resume) later without a re-descent. The inline [`PathStack`]
-    /// moves by value, so a park/resume round-trip never allocates.
-    pub(crate) fn park(self) -> SavedCursor {
-        SavedCursor {
-            stack: self.stack,
-            initialized: self.initialized,
-            eof: self.eof,
-        }
-    }
-
-    /// Rebuild a cursor over `t` from a parked position.
+impl<'a, 's> Cursor<'a, &'s mut PathStack> {
+    /// A cursor over `t` that moves the position parked in `saved` **in
+    /// place**: the stack is borrowed, not copied, and the
+    /// `INITIALIZED`/`EOF` flags go back with [`park_in`](Self::park_in).
     ///
     /// Caller contract: `saved` must have been parked from a
     /// cursor over the **same tree state** — same root, same pages, no
-    /// mutation in between. The write cursor guarantees this by holding the
-    /// `&mut RwTxn` exclusively and dropping its parked state on every
-    /// mutation.
-    pub(crate) fn resume(t: Tree<'a>, saved: SavedCursor) -> Cursor<'a> {
+    /// mutation in between (or be empty). The write cursor guarantees this by
+    /// holding the `&mut RwTxn` exclusively and repairing or dropping its
+    /// parked state on every mutation.
+    pub(crate) fn resume_in(t: Tree<'a>, saved: &'s mut SavedCursor) -> Self {
         Cursor {
             src: t.src,
             psize: t.psize,
             root: t.root,
             depth: t.depth,
-            stack: saved.stack,
+            path: &mut saved.stack,
             initialized: saved.initialized,
             eof: saved.eof,
             cmp: t.cmp,
@@ -1649,23 +1721,17 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    /// The `(leaf pgno, cell index)` under the cursor, for callers that just
-    /// received `Some(..)` from a positioning op and need the position as
-    /// plain data (the write cursor's two-phase yield). `None` when unpositioned/EOF
-    /// (mirrors [`get_current`](Self::get_current)'s `None` conditions except
-    /// the past-leaf-end park, which positioning ops never yield `Some` from).
-    pub(crate) fn entry_pos(&self) -> Option<(u64, usize)> {
-        if !self.initialized || self.eof {
-            return None;
-        }
-        self.stack.last().copied()
+    /// End a [`resume_in`](Self::resume_in): the flags this cursor ends with,
+    /// for [`SavedCursor::set_flags`] once the stack borrow is released.
+    pub(crate) fn park_in(self) -> (bool, bool) {
+        (self.initialized, self.eof)
     }
 }
 
 /// A [`Cursor`]'s position detached from its borrows (write-cursor persistence): the
 /// root-to-leaf `(pgno, child/cell index)` stack plus the SPEC 03 §4
 /// `INITIALIZED`/`EOF` flags. Only meaningful for the exact tree state it was
-/// parked from (see [`Cursor::resume`]).
+/// parked from (see [`Cursor::resume_in`]).
 #[derive(Debug)]
 pub(crate) struct SavedCursor {
     stack: PathStack,
@@ -1674,6 +1740,23 @@ pub(crate) struct SavedCursor {
 }
 
 impl SavedCursor {
+    /// An unpositioned parked cursor (a fresh cursor's position), for
+    /// [`Cursor::resume_in`] to position by a seek.
+    pub(crate) fn empty() -> SavedCursor {
+        SavedCursor {
+            stack: PathStack::new(),
+            initialized: false,
+            eof: false,
+        }
+    }
+
+    /// Store the flags a [`Cursor::resume_in`] ended with
+    /// ([`Cursor::park_in`]).
+    pub(crate) fn set_flags(&mut self, (initialized, eof): (bool, bool)) {
+        self.initialized = initialized;
+        self.eof = eof;
+    }
+
     /// The parked `(leaf pgno, cell index)` if the parked cursor sat on an
     /// entry — same conditions as [`Cursor::entry_pos`], evaluated on the
     /// detached state (used by the write cursor's mutations to read the
@@ -1693,11 +1776,28 @@ impl SavedCursor {
         self.stack.frames_mut()
     }
 
+    /// Move the parked leaf slot to `ki` (the write cursor's in-leaf step,
+    /// [`Tree::entry_in_leaf`]). The caller has checked that `ki` is a live
+    /// slot of the parked leaf.
+    pub(crate) fn set_leaf_slot(&mut self, ki: usize) {
+        if let Some(frame) = self.stack.frames_mut().last_mut() {
+            frame.1 = ki;
+        }
+    }
+
     /// Apply the root-shrink repair to the parked path (SPEC 03 §5.4a): the
     /// delete's rebalance freed the old root branch, so frame 0 goes and the
     /// surviving child becomes the root frame.
     pub(crate) fn drop_root(&mut self) {
         self.stack.drop_root();
+    }
+
+    /// Apply the root-grow repair to the parked path (SPEC 03 §5.4b): a put
+    /// split its way up to the root, so the new root's frame goes on top.
+    /// Fails only past [`CURSOR_STACK`] levels, which no legal tree reaches;
+    /// the caller then discards the path.
+    pub(crate) fn push_root(&mut self, frame: (u64, usize)) -> Result<(), PageError> {
+        self.stack.push_root(frame)
     }
 }
 

@@ -374,6 +374,12 @@ pub enum Op {
         /// Rewrite every entry the walk visits with `val` too — the
         /// read-modify-write loop (`while next { put_current }`).
         rewrite: bool,
+        /// When non-zero, every put of this op writes a value sized by
+        /// [`walk_value`] instead of `val` itself: sizes that swing above
+        /// and below what a leaf holds, so the cursor's puts split leaves,
+        /// cascade into branches and grow the root, and the walk compares
+        /// the cursor position after each split (SPEC 03 §5.4b).
+        grow: u16,
     },
 
     // ---- post-txn verification ----
@@ -385,4 +391,26 @@ pub enum Op {
         /// Key to look up.
         key: Key,
     },
+}
+
+/// The value the `i`-th put of an [`Op::IterMutPutThenWalk`] writes (its
+/// first put is `i = 0`): `val` itself when `grow` is 0, else
+/// `(grow + 211·i) mod 1900` bytes cycling through `val` (zeros if `val` is
+/// empty). Up to 1899 bytes stays inline at a 4 KiB page for the fuzzer's
+/// short keys, and a handful of such cells fills a leaf, so consecutive puts
+/// both split leaves and shrink entries back.
+#[must_use]
+pub fn walk_value(val: &[u8], grow: u16, i: usize) -> std::borrow::Cow<'_, [u8]> {
+    if grow == 0 {
+        return std::borrow::Cow::Borrowed(val);
+    }
+    let len = (grow as usize + 211 * i) % 1900;
+    let fill = |j: usize| {
+        if val.is_empty() {
+            0
+        } else {
+            val[j % val.len()]
+        }
+    };
+    std::borrow::Cow::Owned((0..len).map(fill).collect())
 }

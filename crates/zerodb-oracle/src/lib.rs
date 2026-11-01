@@ -44,7 +44,7 @@ pub use driver::{classify, TxnState};
 pub use engine::Engine;
 pub use heed_zerodb_engine::HeedZerodbEngine;
 pub use lmdb::LmdbEngine;
-pub use op::{DbName, Key, Op, PutFlag, Value};
+pub use op::{walk_value, DbName, Key, Op, PutFlag, Value};
 pub use result::{OpResult, OracleError, Skip};
 pub use zerodb_engine::ZerodbEngine;
 

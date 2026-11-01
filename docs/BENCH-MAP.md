@@ -143,6 +143,7 @@ ascending order leaves on the table.
 | `del/bulk/all` | per-key deletion down to empty: every leaf eventually merges | delete and rebalance, merge path |
 | `del/range/half` | the same span through **one** `delete_range` call | range delete (a leaf-granular splice, not a per-key delete) |
 | `del/cursor/drain` | the same span drained through the **write cursor** (`range_mut` + `del_current`) rather than by key | cursor delete; the only rung where post-delete cursor position costs anything |
+| `del/cursor/rev` | the same span drained **backward** through the write cursor (`rev_range_mut` + `del_current`) | cursor delete whose rebalances pair with the left sibling, stepping with `prev` after each delete (SPEC 03 §5.4a) |
 | `del/clear/all` | the whole tree dropped in one operation | page-list work, not per-key work (leaves freed from their parents unread) |
 | `del/churn/reinsert` | delete and re-insert alternating: freed pages must be reclaimed and handed straight back out | free-list churn, SPEC 05 |
 | `del/batch/k1000` | 10,000 random deletes in 1,000-key txns from 50k random-order inserts of 1,200-byte values | the copy-on-write copy (ADR-0030) and descent misses: crud-bench `batch_delete_1000` |

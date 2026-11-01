@@ -410,33 +410,24 @@ struct WriterSlot {
     /// `notify_one` a `futex_wake` system call even with nobody waiting, which
     /// cost one syscall per write txn (`env/txn/rw_empty_commit`).
     waiters: u32,
-    /// Reusable one-page dirty-frame buffers carried across write txns
-    /// (LMDB's `me_dpages`). Kept under the writer lock's own
-    /// mutex, as LMDB keeps `me_dpages` under its writer mutex: the frames
-    /// move out with the acquire and back with the release, so the pool costs
-    /// no lock operation of its own (a separate `Mutex` made every write txn,
-    /// empty ones included, ~36 % slower).
-    frames: FramePool,
-}
-
-/// The recycled frames in [`WriterSlot`]. A newtype only so `Debug` prints a
-/// count instead of every frame's bytes.
-#[derive(Default)]
-struct FramePool(Vec<Box<[u8]>>);
-
-impl std::fmt::Debug for FramePool {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FramePool({} frames)", self.0.len())
-    }
+    /// What one write txn leaves for the next (issue #8): the dirty-frame
+    /// pool (LMDB's `me_dpages`), the emptied containers a write txn fills,
+    /// and the snapshot the last one published ([`crate::rwtxn::WriterCarry`]).
+    /// Kept under the writer lock's own mutex, as LMDB keeps `me_dpages`
+    /// under its writer mutex: the carry moves out with the acquire and back
+    /// with the release, so it costs no lock operation of its own (a
+    /// separate `Mutex` for the frame pool made every write txn, empty ones
+    /// included, ~36 % slower). `None` until the first write txn ends.
+    carry: Option<Box<crate::rwtxn::WriterCarry>>,
 }
 
 /// Ownership of the writer slot; releases it on drop, from any thread.
 /// Held by `RwTxn` for its whole life (TXN-6).
 pub(crate) struct WriterGuard<'env> {
     lock: &'env WriterLock,
-    /// The recycled frames: taken from the slot at acquire, handed to the
-    /// txn's dirty store, given back at txn end, stored at release.
-    frames: Vec<Box<[u8]>>,
+    /// The carry: taken from the slot at acquire, handed to the write txn,
+    /// given back at txn end, stored at release.
+    carry: Option<Box<crate::rwtxn::WriterCarry>>,
     /// The cross-process writer lock, when this guard also holds it
     /// (ADR-0023 §2; set by [`EnvInner::lock_writer_shared`]). Released
     /// before the in-process slot on drop.
@@ -444,17 +435,20 @@ pub(crate) struct WriterGuard<'env> {
 }
 
 impl WriterGuard<'_> {
-    /// The recycled-frame pool taken with the writer slot, for the new write
-    /// txn's dirty store. O(1): the `Vec` moves whole.
-    pub(crate) fn take_frames(&mut self) -> Vec<Box<[u8]>> {
-        std::mem::take(&mut self.frames)
+    /// The carry taken with the writer slot, allocated on the first write
+    /// txn of the env.
+    pub(crate) fn carry(&mut self) -> &mut crate::rwtxn::WriterCarry {
+        self.carry.get_or_insert_with(Box::default)
     }
 
-    /// Frames to store back into the slot when this guard releases it, capped
-    /// at [`crate::dirty::SPARE_CAP`].
-    pub(crate) fn give_back_frames(&mut self, mut frames: Vec<Box<[u8]>>) {
-        frames.truncate(crate::dirty::SPARE_CAP);
-        self.frames = frames;
+    /// Move the carry out, for the new write txn. O(1): the `Box` moves.
+    pub(crate) fn take_carry(&mut self) -> Box<crate::rwtxn::WriterCarry> {
+        self.carry.take().unwrap_or_default()
+    }
+
+    /// The carry to store back into the slot when this guard releases it.
+    pub(crate) fn give_back_carry(&mut self, carry: Box<crate::rwtxn::WriterCarry>) {
+        self.carry = Some(carry);
     }
 }
 
@@ -478,10 +472,10 @@ impl WriterLock {
             return None;
         }
         g.occupied = true;
-        let frames = std::mem::take(&mut g.frames.0);
+        let carry = g.carry.take();
         Some(WriterGuard {
             lock: self,
-            frames,
+            carry,
             shared: None,
         })
     }
@@ -509,10 +503,10 @@ impl WriterLock {
             g.waiters -= 1;
         }
         g.occupied = true;
-        let frames = std::mem::take(&mut g.frames.0);
+        let carry = g.carry.take();
         WriterGuard {
             lock: self,
-            frames,
+            carry,
             shared: None,
         }
     }
@@ -532,7 +526,7 @@ impl Drop for WriterGuard<'_> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         g.occupied = false;
-        g.frames.0 = std::mem::take(&mut self.frames);
+        g.carry = self.carry.take();
         // One waiter at most can make progress (single writer), so
         // `notify_one` suffices; drop the flag lock before notify is not
         // required for correctness (the waiter re-checks under the lock).
@@ -1201,23 +1195,59 @@ impl EnvInner {
     /// file.
     #[inline]
     pub(crate) fn current_snapshot(&self) -> Result<Arc<Snapshot>, Error> {
+        self.writer_base(None)
+    }
+
+    /// [`EnvInner::current_snapshot`] for a writer holding the writer lock,
+    /// given the snapshot the previous write txn of this process ended with
+    /// (its published one, or its unchanged base; [`crate::rwtxn::WriterCarry`]).
+    /// When that is still the latest it is returned as is: no lock of the
+    /// snapshot cell and no reference-count change, which a write txn
+    /// otherwise pays at every begin and end.
+    ///
+    /// Published txnids only grow — a commit publishes a txnid once, and a
+    /// commit that fails or finishes a held election publishes nothing — so
+    /// a cached snapshot whose txnid is the latest published one is the
+    /// latest snapshot.
+    ///
+    /// # Errors
+    ///
+    /// As [`EnvInner::current_snapshot`].
+    #[inline]
+    pub(crate) fn writer_base(
+        &self,
+        cached: Option<Arc<Snapshot>>,
+    ) -> Result<Arc<Snapshot>, Error> {
         match &self.shared {
-            None => Ok(self.snapshot()),
-            Some(region) => self.current_snapshot_shared(region.as_ref()),
+            None => match cached {
+                // The commit point is stored by the publishing writer, whose
+                // writer-lock release happens-before this writer's acquire,
+                // so this load sees the latest publish.
+                Some(s) if s.txnid == self.snap_cell.commit_point() => Ok(s),
+                _ => Ok(self.snapshot()),
+            },
+            Some(region) => self.current_snapshot_shared(region.as_ref(), cached),
         }
     }
 
-    /// The lock-file arm of [`EnvInner::current_snapshot`]: the snapshot at
-    /// the shared `T`. Out of line so the default write-txn path stays small.
+    /// The lock-file arm of [`EnvInner::writer_base`]: the snapshot at the
+    /// shared `T`, `cached` when that is it. Out of line so the default
+    /// write-txn path stays small.
     #[inline(never)]
     fn current_snapshot_shared(
         &self,
         region: &dyn crate::shared::SharedRegion,
+        cached: Option<Arc<Snapshot>>,
     ) -> Result<Arc<Snapshot>, Error> {
         for _ in 0..META_RETRY_LIMIT {
             // SeqCst: pairs with the committing writer's SeqCst store of T
             // (the same total order as TXN-17/19).
             let t = region.published_txnid().load(Ordering::SeqCst);
+            if let Some(s) = cached.as_ref() {
+                if s.txnid == t {
+                    return Ok(cached.expect("matched above"));
+                }
+            }
             if let Some(s) = self.snapshot_at(t)? {
                 return Ok(s);
             }

@@ -772,10 +772,16 @@ dirty-page store must be built so it is.
   pages, and no cache holds its stamps. The original text said the cache
   assumes the file changes only through this process's commits (D-001);
   it now assumes the file changes only through ZeroDB commits.
-  The table is fixed-size (allocated in chunks as publishes land) and
-  direct-mapped by pgno; each slot is a seqlock, so a
-  lookup racing a publish or a collision only misses (loom model
-  `loom_stamp_cache_never_mixes_publishes`). Tests:
+  The table is mapped by pgno: slot = pgno mod 2^23, so the pages of a file
+  below 2^23 pages never share a slot, and pages 2^23 apart in a larger file
+  do (the newer publish wins). Slots are allocated where publishes land, 8
+  bytes per page, 64 MiB per env at most. Each slot is **one atomic word**
+  encoding the stamp, the pgno's bits above the slot index and the kind,
+  exact within its slot; a triple the word cannot encode (pgno ≥ 2^35 or
+  stamp ≥ 2^50) is never published. A lookup loads the word whole, so it
+  can never combine two publishes, and a collision only misses (loom model
+  `loom_stamp_cache_never_mixes_publishes`; amended 2026-10-31, ADR-0018:
+  was a 64 Ki-slot table of seqlock slots). Tests:
   `zerodb/tests/page_version_identity.rs` (the identity over churn with
   overflow values, named DBs, aborts and delayed reuse; short read txns
   against a model), `stamps::tests`,
@@ -840,7 +846,8 @@ dirty-page store must be built so it is.
   *(Realization note — frame pool, commit 10c98a1, PERF-GAP B3/B12; LMDB's
   `me_dpages`.) One-page frames are recycled: within a txn a freed/spilled
   frame parks on a bounded spare list, and at txn end up to `SPARE_CAP` (256)
-  spares ride back to an env-level pool that seeds the next write txn's store.
+  spares ride back to an env-level pool that seeds the next write txn's store,
+  with the store's emptied pgno index (the writer carry, TXN-56).
   Reuse happens only at `&mut` boundaries within a txn (TXN-43) and across txn
   ends otherwise, so the stability guarantee above is untouched; run frames and
   in-map frames (TXN-45b) are never pooled.*
@@ -1202,6 +1209,18 @@ spilling bullet there.)
   TXN-38). `writer_txnid` is the base's txnid + 1. Every failure releases both
   writer locks. Without a lock file the base is the process-local cell, as
   before.
+  *(Realization note — writer carry, issue #8; LMDB's `me_txn0`.)* A write
+  txn ends by handing its containers, emptied, to the next write txn of the
+  process on the in-process writer slot: the dirty-frame index and pool
+  (TXN-41), the freed, loose and reclaimed page sets, the descent and
+  catalog buffers, and the snapshot it published at C6 (or its unchanged
+  base when it published nothing). The next begin uses that snapshot as its
+  base when its txnid is the latest published one (`commit_point` without a
+  lock file, `T` with one); published txnids only grow, so it is the same
+  snapshot the cell or the meta at `T` would give. Capacities are bounded
+  (`CARRY_INDEX_CAP`, `CARRY_VEC_CAP`), so one large txn leaves no large
+  allocation behind. Nothing observable changes: every container starts the
+  txn empty, and the handle-check memo starts with no verdict (ADR-0024).
 - **TXN-57** — **mutate**: `put`/`del`/cursor writes run SPEC 03 §5–§10 against
   the dirty set (COW top-down, TXN-42), record freed pages (SPEC 05), and update
   working `DBRecord` stats. Reads interleave under §6. Nested readers may be

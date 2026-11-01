@@ -485,27 +485,39 @@ repaired, whenever the mutation could have moved the entry it names. At minimum:
 Discarding is always a correct implementation of "repair"; it costs a re-seek,
 which is exactly the M1.4 mechanism applied selectively.
 
-**Implemented repair table (2026-09-27, leftmost pairing only; c4ab096,
-17fdb24).** This table covers deletes; puts through the write cursor follow
-§5.4b. The engine retains the path across `del_current` and repairs it for the structural
-cases below; everything else discards. The rebalance reports one of *unchanged*
-(no structural change — the path is valid as-is), *kept* (repaired per this
-table), *kept + root pop* (as kept, plus frame 0 must be dropped), or
-*invalidated* (discard and re-seek). The repairs apply **only when the
-rebalanced page is its parent's child 0** — the §10 sibling choice then
-always pairs it with its RIGHT sibling — which is every delete of a
-front-to-back drain (milli's `del_current` loops). The "from left" pairing
-(child ≥ 1) is not repaired in this iteration.
+**Implemented repair table (2026-09-27, c4ab096, 17fdb24; extended to the
+left pairing 2026-10-31, issue #137).** This table covers deletes; puts
+through the write cursor follow §5.4b. The engine retains the path across
+`del_current` and repairs it for the structural cases below; everything else
+discards. The rebalance reports one of *unchanged* (no structural change — the
+path is valid as-is), *kept* (repaired per this table), *kept + root pop* (as
+kept, plus frame 0 must be dropped), or *invalidated* (discard and re-seek).
+The table follows LMDB's cursor fix-ups in `mdb_node_move` (a cursor on the
+page receiving a node from the left moves up one slot) and `mdb_page_merge`
+(a cursor on the merged-away page moves to the left page, its slot past the
+left page's own entries). Before 2026-10-31 only the leftmost pairing (P =
+child 0, paired with its RIGHT sibling: every delete of a front-to-back
+drain) was repaired, and the left pairing invalidated.
 
-| §10 event at a level (page P = parent's child 0) | per-level repair |
+| §10 event at a level (page P on the path) | per-level repair |
 |---|---|
-| borrow from the right sibling (leaf or branch), no ancestor split | keep every frame as-is: P keeps its pgno (it is already dirty), the moved entry is *appended* at/after the vacated `ki` (so the slot still holds the successor when the tail was deleted), and the parent's separator rewrite at child 1 moves no lower-indexed child |
+| borrow from the right sibling (P = child 0; leaf or branch), no ancestor split | keep every frame as-is: P keeps its pgno (it is already dirty), the moved entry is *appended* at/after the vacated `ki` (so the slot still holds the successor when the tail was deleted), and the parent's separator rewrite at child 1 moves no lower-indexed child |
+| borrow from the left sibling (P = child ≥ 1; leaf or branch), no ancestor split | P's frame `ki` += 1: the moved entry (leaf) or child (branch) becomes P's slot 0 and every slot shifts up one; P keeps its pgno and the parent's separator rewrite at P's own index moves no child |
 | merge with the right sibling (right into left = P), right sibling non-empty | keep every frame as-is: P survives with its pgno, the sibling's cells land at/after the vacated `ki`, the parent only loses child 1; the parent level then re-enters this table (merge cascade) |
+| merge with the left sibling (P into the left sibling L), L non-empty | P's frame moves to L, `ki` += L's entry count before the merge; the parent frame's `ki` −= 1 (P's index is gone, L's is one less); the parent level then re-enters this table |
 | root shrink to the remaining branch child (§9) | pop frame 0: the surviving child is the single-child root's child 0, which is exactly the path's frame 1 |
 | any ancestor **split** during a separator rewrite (a longer separator can split the parent, up to a root grow) | invalidate — splits move sibling frames and can add a level; not followed |
-| the "from left" pairing (P is child ≥ 1) | invalidate — not implemented in this iteration |
 | root shrink to empty (last entry deleted) | invalidate — the path names a freed page |
-| right sibling with zero cells (hostile image) | invalidate — the vacated slot could sit past an empty leaf |
+| sibling with zero cells (hostile image) | invalidate — the vacated slot could sit past an empty page |
+
+After a kept delete the cursor sits on the vacated slot (LMDB's `C_DEL`):
+`next` reads the slot as is (it holds the successor, or is one past the last
+cell when the tail was deleted, and then steps to the next leaf); `prev` steps
+back from it to the predecessor (LMDB's `mdb_cursor_prev` after `C_DEL`).
+Every other positioning op re-derives from the deleted key. A step that stays
+inside the parked leaf reads its slot straight from the parked path, as
+`mdb_cursor_next`/`mdb_cursor_prev` move `mc_ki` in the page the cursor
+holds.
 
 **Debug shadow check (mandatory while a path is retained).** In debug builds
 (`debug_assertions`), after every delete that keeps the path — repaired or
@@ -540,13 +552,15 @@ searching for the key. LMDB's `MDB_CURRENT` put likewise writes at
 
 | outcome of the replace | effect on the retained path |
 |---|---|
+| same-size inline value on a leaf the txn already owns (dirty) | keep, untouched: the value bytes are overwritten in place. Every ancestor of a dirty page is the txn's own page too (a page is copied only below a touched parent, §5.3), so no level needs a COW — LMDB's `mdb_page_touch` skips such pages on `P_DIRTY` |
 | fits in its leaf (same-size in place, or remove + reinsert at the same slot) | keep: `touch_path` remapped every pgno during COW, and the entry is back at the same `ki` with the same key, so no separator above it changed |
-| leaf split (§6.2; may cascade to branch splits and a root grow) | discard; the cursor re-seeks by key on its next access |
+| leaf split (§6.2; may cascade to branch splits and a root grow) | keep, repaired (2026-10-31): the leaf frame names the half that received the cell — slot `newindx` on the left page or `newindx - s` on the right one, for the general split; slot 0 (APPEND-style) or 1 (end pair) of the right page, for an end split (§6.4). Each branch level the separator rises into then follows the child holding the cell: `ki` itself, or `ki + 1` when the cell went right; when that branch splits at `s` too (§6.5), index `x` becomes `x` on the left page or `x - s` on the right (index `s`, the rising cell's child, is the right page's node 0). A root grow puts the new root's frame on top: child 0 or 1, whichever is the half below. LMDB fixes up the splitting cursor the same way at the end of `mdb_page_split` |
 | error that poisons the txn | no obligation |
 
-A split is detected as a change in the tree's depth, leaf-page or branch-page
-count across the replace. The keyed put is taken instead — and the path dropped,
-as before — for every other cursor put: any put flag (`NO_OVERWRITE`, `APPEND`,
+The cursor checks the key under it while it views the leaf for the replace;
+when it differs the put changes nothing and the keyed put runs instead. The
+keyed put is taken — and the path dropped, as before — for every other cursor
+put: any put flag (`NO_OVERWRITE`, `APPEND`,
 …), a key other than the current one (including one equal only under a custom
 comparator), a cursor sitting on a slot a delete just vacated, and trees with
 the sequential-writes setting (their §6.6 finger bookkeeping lives on the keyed
@@ -554,7 +568,13 @@ path).
 
 **Debug shadow check.** As for deletes: after every put that keeps the path, a
 debug build re-runs a fresh search for the key and asserts it is found at
-exactly the kept path, same `pgno` and `ki` at every level.
+exactly the kept path, same `pgno` and `ki` at every level — splits and root
+grows included.
+
+*(Amended 2026-10-31, issue #138: a split used to discard the path, the next
+access re-seeking by key. The repair follows the split instead; it is
+confined to the put path — a delete's separator rewrite that splits an
+ancestor still invalidates, §5.4a.)*
 
 ---
 
@@ -628,7 +648,12 @@ split(page P at insertion index newindx, new cell):
 `put(..., APPEND)` does **not** do a normal search. It positions at the
 **last** entry (`last()`), compares `key` against the last key:
 
-- `key > last_key` (the tree's ordering, §2.0; memcmp by default): insert at the end. If the rightmost leaf is full,
+- `key > last_key` (the tree's ordering, §2.0; memcmp by default): insert at the end — at
+  slot `nkeys`, one past the last cell the positioning read, with no second view of
+  the leaf (LMDB bumps `mc_ki` after `mdb_cursor_last`). When every page on the
+  rightmost path is already the txn's own (an append load between two splits), the
+  §5.3 COW pass has nothing to copy and is skipped, as LMDB's `mdb_page_touch` skips
+  `P_DIRTY` pages. If the rightmost leaf is full,
   split with the **end-of-page insert-point policy** (§6.4): put the *new* key
   alone on a fresh right page instead of splitting the full page in half — this
   keeps sequentially-loaded pages ~100 % full and avoids repeated half-empty

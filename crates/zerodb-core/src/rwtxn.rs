@@ -53,10 +53,10 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use crate::btree::{
-    branch_view, leaf_view, node_view, Cursor as BCursor, NodeView, SavedCursor, Source, Tree,
-    ValidatedPages,
+    branch_view, leaf_view, node_view, node_view_classified, Cursor as BCursor, NodeView,
+    SavedCursor, Source, Tree, ValidatedPages,
 };
-use crate::dirty::{DirtyStore, PgnoBuildHasher};
+use crate::dirty::{DirtyCarry, DirtyStore, PgnoBuildHasher};
 use crate::env::{Env, HookPoint, Snapshot};
 use crate::error::{Error, MdbError, Result};
 use crate::handles::{HandleTable, TxnHandles};
@@ -156,24 +156,56 @@ fn find_run(ids: &[u64], n: u64) -> Option<u64> {
 #[derive(Debug, Clone)]
 struct Drain {
     /// Decoded PIL ids, ascending. `..head` consumed, `head..` live.
-    ids: Vec<u64>,
+    ids: DrainIds,
     /// Length of the consumed front prefix. Invariant: `head <= ids.len()`.
     head: usize,
 }
 
+/// A [`Drain`]'s ids: its own, or the base snapshot's annex ids shared
+/// without a copy until a mid-slice removal needs one.
+#[derive(Debug, Clone)]
+enum DrainIds {
+    Owned(Vec<u64>),
+    /// The base meta's annex (SPEC 05 §2a), pinned in the snapshot. The
+    /// writer used to copy it into a `Vec` at every begin; front draws only
+    /// advance `head`, so the copy is now made by the rare mid-slice
+    /// removal alone ([`Drain::take_span`]).
+    Shared(Arc<[u64]>),
+}
+
+impl DrainIds {
+    fn as_slice(&self) -> &[u64] {
+        match self {
+            DrainIds::Owned(v) => v,
+            DrainIds::Shared(a) => a,
+        }
+    }
+}
+
 impl Drain {
     fn new(ids: Vec<u64>) -> Self {
-        Drain { ids, head: 0 }
+        Drain {
+            ids: DrainIds::Owned(ids),
+            head: 0,
+        }
+    }
+
+    /// A drain over shared, already validated ids (the base annex).
+    fn shared(ids: Arc<[u64]>) -> Self {
+        Drain {
+            ids: DrainIds::Shared(ids),
+            head: 0,
+        }
     }
 
     /// The remaining (still-free) ids, sorted ascending.
     fn live(&self) -> &[u64] {
-        &self.ids[self.head..]
+        &self.ids.as_slice()[self.head..]
     }
 
     /// Number of remaining ids.
     fn len(&self) -> usize {
-        self.ids.len() - self.head
+        self.ids.as_slice().len() - self.head
     }
 
     /// Consume the run `start .. start + n`. The caller (a `find_run` hit on
@@ -202,9 +234,15 @@ impl Drain {
         if pos == 0 {
             self.head += count;
         } else {
-            self.ids.drain(self.head + pos..self.head + pos + count);
+            if let DrainIds::Shared(a) = &self.ids {
+                self.ids = DrainIds::Owned(a.to_vec());
+            }
+            let DrainIds::Owned(ids) = &mut self.ids else {
+                unreachable!("made owned above")
+            };
+            ids.drain(self.head + pos..self.head + pos + count);
         }
-        debug_assert!(self.head <= self.ids.len());
+        debug_assert!(self.head <= self.ids.as_slice().len());
     }
 }
 
@@ -251,6 +289,37 @@ fn gc_value_pages(count: usize, psize: u32) -> u64 {
     }
 }
 
+/// Whether some pgno appears twice in `pages` — `clear`'s refusal of a
+/// hostile image that aliases one page under several branch pointers (the
+/// leaf-skipping walk never loads the leaves it frees). LMDB's `mdb_drop0`
+/// has no such check; this keeps it linear in the page count. A well-formed
+/// tree's pages spread over a span of pgnos rarely more than a small multiple
+/// of their count, so a bitmap over that span (no larger than `pages` itself
+/// when the span is at most 64 times the count) replaces the sort, which
+/// still covers a sparse tree in a large file.
+fn has_duplicate(pages: &[u64]) -> bool {
+    let (Some(&min), Some(&max)) = (pages.iter().min(), pages.iter().max()) else {
+        return false;
+    };
+    let words = (max - min) / 64 + 1;
+    if words <= pages.len() as u64 {
+        let mut seen = vec![0u64; words as usize];
+        for &p in pages {
+            let bit = p - min;
+            let (word, mask) = ((bit / 64) as usize, 1u64 << (bit % 64));
+            if seen[word] & mask != 0 {
+                return true;
+            }
+            seen[word] |= mask;
+        }
+        false
+    } else {
+        let mut sorted = pages.to_vec();
+        sorted.sort_unstable();
+        sorted.windows(2).any(|w| w[0] == w[1])
+    }
+}
+
 /// Merge two strictly-ascending, mutually-disjoint id slices into one
 /// strictly-ascending vec (GC-3/GC-4; the `freelist_save` step-(c) merge of
 /// this txn's `freed` with the carried annex remainder, SPEC 05 §2a GC-30).
@@ -258,6 +327,15 @@ fn gc_value_pages(count: usize, psize: u32) -> u64 {
 /// snapshot, a `freed` id was live in it — and is asserted in debug builds.
 fn merge_sorted_unique(a: &[u64], b: &[u64]) -> Vec<u64> {
     let mut out = Vec::with_capacity(a.len() + b.len());
+    merge_sorted_unique_into(a, b, &mut out);
+    out
+}
+
+/// [`merge_sorted_unique`] into `out`, which is cleared first: the commit
+/// keeps one merge buffer across write txns ([`WriterCarry`]).
+fn merge_sorted_unique_into(a: &[u64], b: &[u64], out: &mut Vec<u64>) {
+    out.clear();
+    out.reserve(a.len() + b.len());
     let (mut i, mut j) = (0, 0);
     while i < a.len() && j < b.len() {
         if a[i] < b[j] {
@@ -272,13 +350,15 @@ fn merge_sorted_unique(a: &[u64], b: &[u64]) -> Vec<u64> {
     out.extend_from_slice(&a[i..]);
     out.extend_from_slice(&b[j..]);
     debug_assert!(out.windows(2).all(|w| w[0] < w[1]), "merge not ascending");
-    out
 }
 
 /// A root-to-leaf descent path: `(pgno, ki)` per level (SPEC 03 §1 cursor
 /// shape). `ki` is the chosen child index on branches and the entry/insertion
 /// slot on the leaf.
 type Path = Vec<(u64, usize)>;
+
+/// Longest run of frames [`RwTxn::write_run`] lists on the stack.
+const RUN_ON_STACK: usize = 16;
 
 /// One mutating call's worst-case page touches, as LMDB's `need` estimate in
 /// `mdb_page_spill` (SPEC 04 TXN-68): the spill trigger's headroom and the
@@ -312,6 +392,20 @@ struct Finger {
 /// of the span).
 type LeafSpan = (u64, Option<Vec<u8>>, Option<Vec<u8>>);
 
+/// What a write cursor's put at its parked path ([`RwTxn::put_at_path`]) did
+/// (SPEC 03 §5.4b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathPut {
+    /// The entry under the path does not have the put's key: nothing changed.
+    Elsewhere,
+    /// Rewritten; the path still descends to the entry (repaired across a
+    /// split).
+    Kept,
+    /// Rewritten through a split cascade that grew the root: this frame (the
+    /// new root's) goes on top of the path.
+    Grown((u64, usize)),
+}
+
 /// What a delete's rebalance ([`RwTxn::rebalance`]) did to the root-to-leaf
 /// path it was handed (SPEC 03 §5.4a): the parked write cursor keeps, pops,
 /// or discards its path based on this.
@@ -321,8 +415,7 @@ enum PathFate {
     Unchanged,
     /// A borrow or merge changed the tree's shape, but every `(pgno, ki)`
     /// frame still names the descent to the vacated slot — the path was
-    /// repaired in place (the leftmost / right-sibling repair table,
-    /// SPEC 03 §5.4a).
+    /// repaired in place (the borrow/merge repair table, SPEC 03 §5.4a).
     Kept,
     /// As [`Kept`](PathFate::Kept), plus a root shrink dropped the tree's top
     /// level: frame 0 must be popped before the path is used.
@@ -373,6 +466,12 @@ enum TreeId {
 /// (SPEC 02 §6, before `freelist_save` — the LMDB sub-DB flush order).
 struct NamedTree {
     name: Box<[u8]>,
+    /// The handle generation the name was looked up for, when it came from
+    /// a checked handle ([`RwTxn::ensure_open`]); `None` for a database
+    /// this txn created or opened by name. A slot keeps one name per
+    /// generation (ADR-0024 rule 1), so the next write txn may reuse a name
+    /// carried with its generation ([`WriterCarry`]) instead of looking it up.
+    generation: Option<u32>,
     rec: DBRecord,
     dirty: bool,
     /// This DB's sequential-writes setting (ADR-0015), resolved when the txn
@@ -435,6 +534,126 @@ impl OpenTable {
     fn values_mut(&mut self) -> impl Iterator<Item = &mut NamedTree> {
         self.slots.iter_mut().flatten()
     }
+}
+
+/// Most entries a carried `Vec` keeps of its capacity ([`WriterCarry`]): a
+/// `Vec` is walked over its length only, so its capacity costs memory, not
+/// time; this bounds what one large txn leaves allocated.
+const CARRY_VEC_CAP: usize = 4096;
+
+/// Empty `v`, keeping at most `cap` entries of capacity.
+fn recycle_vec<T>(v: &mut Vec<T>, cap: usize) {
+    v.clear();
+    if v.capacity() > cap {
+        v.shrink_to(cap);
+    }
+}
+
+/// What a write txn leaves for the next write txn of its env (issue #8):
+/// its containers, emptied, with their allocations; the frame pool; the
+/// named-database names it looked up; and the snapshot it ended with.
+/// Carried on the writer slot (`crate::env::WriterGuard`), so taking and
+/// returning it costs no lock of its own.
+///
+/// LMDB allocates its write transaction once per environment (`me_txn0`),
+/// with its dirty list, free-page lists and per-database arrays, and reuses
+/// it for every write txn. A ZeroDB write txn built every container empty
+/// and grew it again: a single-put commit made 19 heap allocations, and a
+/// profile of small commits on Graviton put `malloc`/`free` and the hash
+/// table rehashes among the largest user-space costs of the commit.
+///
+/// Every container comes back empty. Capacity is kept up to a bound
+/// ([`crate::dirty::CARRY_INDEX_CAP`] for hash tables, [`CARRY_VEC_CAP`]
+/// for lists), so a large txn does not leave a large allocation behind.
+///
+/// A write txn uses these containers in place, through its `work` box
+/// (`work!` / `work_mut!`), so beginning and ending a txn moves one pointer
+/// rather than every container.
+#[derive(Default)]
+pub(crate) struct WriterCarry {
+    /// The dirty store's indexes and spare frames, between txns; `None`
+    /// while a txn's [`DirtyStore`] holds them.
+    dirty: Option<DirtyCarry>,
+    /// Every pgno handed out by a GC draw this txn (ADR-0005 D1): feeds the
+    /// generalized TXN-62 assert at C2 and the loose classification in
+    /// [`RwTxn::free_page`]. Pgno-hashed (issue #9): engine-authored keys,
+    /// no HashDoS surface.
+    reclaimed: HashSet<u64, PgnoBuildHasher>,
+    /// Committed pages obsoleted by this txn (GC-6). Written to the GC DB
+    /// under `BE(writer_txnid)` at commit step C1 (`freelist_save`).
+    freed: Vec<u64>,
+    /// Pages allocated *and* freed by this txn (GC-7): the reuse fast path
+    /// (GC-8) and the trailing-shrink set (GC-10). A GC-reclaimed page freed
+    /// again this txn also lands here (it is this-txn-private after the gate).
+    loose: Vec<u64>,
+    /// Merge buffer for the commit's annex settle (`freelist_save`).
+    merged: Vec<u64>,
+    /// The commit's sorted dirty-pgno list (step C2).
+    pgnos: Vec<u64>,
+    /// The order `flush_catalog` writes the dirty named records in.
+    catalog: Vec<u32>,
+    /// The open table's slots between txns, every entry `None`.
+    open: Vec<Option<NamedTree>>,
+    /// Named-database names carried from earlier write txns, by dbi, with
+    /// the handle generation they belong to (`NamedTree::generation`).
+    names: Vec<Option<(u32, Box<[u8]>)>>,
+    /// Descent-path buffer reused by every put and delete: taken with
+    /// `mem::take` for the op and put back after, so only the first op
+    /// allocates. LMDB's cursor stack is likewise allocated once and reused;
+    /// a fresh `Vec` per op cost an allocation, its growth and a free.
+    path_buf: Path,
+    /// Byte buffer the delete rebalance moves cells through (ADR-0028,
+    /// SPEC 03 §10 REB-2/REB-4): a cell or a whole page is copied out of
+    /// one dirty frame, then written into another. Kept across ops, so only
+    /// the first rebalance allocates; it avoids holding two dirty frames at
+    /// once, which under `WRITE_MAP` would take a second live `&mut` into
+    /// the map.
+    cell_scratch: Vec<u8>,
+    /// Rightmost-leaf fingers, at most one per tree (SPEC 03 §6.6):
+    /// the cached right-spine descent a sequential/APPEND put re-uses
+    /// instead of descending. Writer-private — reads and nested read children
+    /// never consult it (they descend from the records as always). Dropped by
+    /// every structural or ownership change of its pages: any put miss, every
+    /// delete/clear/drop entry, a fast-path split, and `free_page`/`free_run`
+    /// for any page a finger names (see [`RwTxn::finger_forget`]); an errored
+    /// txn cannot reach the fast path at all (`guard_ok` precedes it). A tiny
+    /// `Vec` scanned linearly: a txn touches a handful of trees. Emptied at
+    /// every txn end.
+    fingers: Vec<Finger>,
+    /// The handle-check memo allocation ([`TxnHandles::recycle`]).
+    handles: Option<Box<crate::handles::Rare>>,
+    /// The snapshot the last write txn published, or its base when it
+    /// published nothing: the next write txn's base when it is still the
+    /// latest ([`crate::env::EnvInner::writer_base`]).
+    snapshot: Option<Arc<Snapshot>>,
+}
+
+impl std::fmt::Debug for WriterCarry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriterCarry")
+            .field("dirty", &self.dirty)
+            .field("snapshot", &self.snapshot.as_ref().map(|s| s.txnid))
+            .finish_non_exhaustive()
+    }
+}
+
+/// A write txn's [`WriterCarry`], shared, through its `work` field alone (so
+/// the txn's other fields stay borrowable beside it).
+macro_rules! work {
+    ($txn:expr) => {
+        $txn.work
+            .as_deref()
+            .expect("a write txn holds its work buffers until it drops")
+    };
+}
+
+/// [`work!`], mutable.
+macro_rules! work_mut {
+    ($txn:expr) => {
+        $txn.work
+            .as_deref_mut()
+            .expect("a write txn holds its work buffers until it drops")
+    };
 }
 
 /// Allocation restriction state (SPEC 05 GC-12, ADR-0005 D2).
@@ -647,7 +866,17 @@ pub struct RwTxn<'env> {
     /// written locations even if never read (ADR-0021 M1).
     bytes: &'env [u8],
     /// The snapshot this txn grew from (`writer_txnid = base.txnid + 1`).
-    base: Arc<Snapshot>,
+    /// `Some` until the txn's drop hands it to the [`WriterCarry`]; read it
+    /// through [`RwTxn::base`].
+    base: Option<Arc<Snapshot>>,
+    /// The snapshot this txn published at commit step C6, for the
+    /// [`WriterCarry`]; `None` until then.
+    published: Option<Arc<Snapshot>>,
+    /// This txn's working lists and buffers ([`WriterCarry`]), used in
+    /// place: they came from the writer slot with their allocations and go
+    /// back to it, emptied, when the txn drops. `Some` until then; read
+    /// them through `work!` / `work_mut!`.
+    work: Option<Box<WriterCarry>>,
     txnid: u64,
     psize: u32,
     dirty: DirtyStore<'env>,
@@ -662,13 +891,6 @@ pub struct RwTxn<'env> {
     /// the memo wholesale, TXN-71). Probes (never publishes) the
     /// env-wide stamp cache (ADR-0018).
     validated: ValidatedPages<'env>,
-    /// Committed pages obsoleted by this txn (GC-6). Written to the GC DB
-    /// under `BE(writer_txnid)` at commit step C1 (`freelist_save`).
-    freed: Vec<u64>,
-    /// Pages allocated *and* freed by this txn (GC-7): the reuse fast path
-    /// (GC-8) and the trailing-shrink set (GC-10). A GC-reclaimed page freed
-    /// again this txn also lands here (it is this-txn-private after the gate).
-    loose: Vec<u64>,
     /// GC-20 drain bookkeeping (ADR-0005 D1): for every GC entry `F` this txn
     /// drew from, the **remaining** (still-free, sorted-ascending) ids —
     /// [`Drain::live`], a consumed-prefix view so the GC-19 front pop is O(1).
@@ -676,11 +898,6 @@ pub struct RwTxn<'env> {
     /// rewrites the remainder (or deletes the entry when empty). `BTreeMap` so
     /// iteration is ascending-`F`, matching the GC-18 scan.
     drains: BTreeMap<u64, Drain>,
-    /// Every pgno handed out by a GC draw this txn (ADR-0005 D1): feeds the
-    /// generalized TXN-62 assert at C2 and the loose classification in
-    /// [`RwTxn::free_page`]. Pgno-hashed (issue #9): engine-authored keys,
-    /// no HashDoS surface.
-    reclaimed: HashSet<u64, PgnoBuildHasher>,
     /// The base meta's free-list annex pool (SPEC 05 §2a, ADR-0022): the
     /// pages freed by txn `base.txnid`, parsed (and `validate_pil_ids`-
     /// checked, GC-33) at begin when `base.free_annex > 0`. Drawn by
@@ -717,28 +934,6 @@ pub struct RwTxn<'env> {
     open: OpenTable,
     /// This txn's state in the env's slot table (ADR-0024).
     handles: TxnHandles,
-    /// Descent-path buffer reused by every put and delete of this txn: taken
-    /// with `mem::take` for the op and put back after, so only the first op
-    /// allocates. LMDB's cursor stack is likewise allocated once and reused;
-    /// a fresh `Vec` per op cost an allocation, its growth and a free.
-    path_buf: Path,
-    /// Byte buffer the delete rebalance moves cells through (ADR-0028,
-    /// SPEC 03 §10 REB-2/REB-4): a cell or a whole page is copied out of
-    /// one dirty frame, then written into another. Kept across ops, so only
-    /// the first rebalance of the txn allocates; it avoids holding two dirty
-    /// frames at once, which under `WRITE_MAP` would take a second live
-    /// `&mut` into the map.
-    cell_scratch: Vec<u8>,
-    /// Rightmost-leaf fingers, at most one per tree (SPEC 03 §6.6):
-    /// the cached right-spine descent a sequential/APPEND put re-uses
-    /// instead of descending. Writer-private — reads and nested read children
-    /// never consult it (they descend from the records as always). Dropped by
-    /// every structural or ownership change of its pages: any put miss, every
-    /// delete/clear/drop entry, a fast-path split, and `free_page`/`free_run`
-    /// for any page a finger names (see [`RwTxn::finger_forget`]); an errored
-    /// txn cannot reach the fast path at all (`guard_ok` precedes it). A tiny
-    /// `Vec` scanned linearly: a txn touches a handful of trees.
-    fingers: Vec<Finger>,
     /// The main DB's sequential-writes setting (ADR-0015), resolved at txn
     /// begin; named DBs carry theirs in [`NamedTree::seq`].
     seq_main: bool,
@@ -848,8 +1043,11 @@ impl Env {
         }
         // The latest published snapshot, which in a lock-file env may be
         // another process's commit (ADR-0023 §4): never the process-local
-        // cell. Without a lock file this is the cell, as before.
-        let base = inner.current_snapshot()?;
+        // cell. Without a lock file this is the cell, as before. The previous
+        // write txn's snapshot, carried on the writer slot, when it is still
+        // the latest.
+        let cached = guard.carry().snapshot.take();
+        let base = inner.writer_base(cached)?;
         // The map view, loaded once for the whole begin: the base check
         // below and the txn's read view (`bytes`) both come from it.
         let backing = inner.backing_ref();
@@ -866,15 +1064,6 @@ impl Env {
         // the default mode, the miri test backing, the fault-injection
         // backend (whose crash journal only sees fd-path writes).
         let in_map = write_map && backing.dirty_in_map();
-        // Seed the dirty store's spare list with the frames recycled from
-        // earlier write txns (LMDB's `me_dpages`); they came
-        // with the writer slot, so this takes no lock.
-        let spare = guard.take_frames();
-        let dirty = if in_map {
-            DirtyStore::with_spare_in_map(inner.page_size(), spare, backing)
-        } else {
-            DirtyStore::with_spare(inner.page_size(), spare)
-        };
         // TXN-14 runtime half of the open-time bound (SPEC 06 REC-1a): the
         // next txnid must stay 2^32 below the reader-table sentinel band, so
         // an accepted file cannot commit its way into RDR_CLAIMED/RDR_FREE.
@@ -892,21 +1081,29 @@ impl Env {
         let annex = if base.free_annex.is_empty() {
             Drain::new(Vec::new())
         } else {
-            let ids = base.free_annex.to_vec();
-            validate_pil_ids(&ids, base.last_pg)?;
-            Drain::new(ids)
+            validate_pil_ids(&base.free_annex, base.last_pg)?;
+            Drain::shared(Arc::clone(&base.free_annex))
         };
+        // The previous write txn's containers (issue #8), and the frames
+        // recycled from earlier write txns (LMDB's `me_dpages`) as the dirty
+        // store's spare list. They came with the writer slot, so this takes
+        // no lock.
+        let mut work = guard.take_carry();
+        let dirty = DirtyStore::from_carry(
+            inner.page_size(),
+            work.dirty.take().unwrap_or_default(),
+            in_map.then_some(backing),
+        );
         Ok(RwTxn {
             txnid: base.txnid + 1, // TXN-2 (+ the reuse note in the module docs)
             next_pgno: base.last_pg + 1,
             committed_last_pg: base.last_pg,
             main_db: base.main_db,
             free_db: base.free_db,
-            open: OpenTable::default(),
-            handles: inner.handles().begin(),
-            path_buf: Path::new(),
-            cell_scratch: Vec::new(),
-            fingers: Vec::new(),
+            open: OpenTable {
+                slots: std::mem::take(&mut work.open),
+            },
+            handles: inner.handles().begin_reusing(work.handles.take()),
             seq_main: inner.sequential_writes_for(None),
             dirty_limit: inner.dirty_limit(),
             spills: 0,
@@ -921,10 +1118,7 @@ impl Env {
             // cache (the previous commit seeded it with the very pages this
             // txn's first descent walks) but never publishes from a miss.
             validated: ValidatedPages::for_writer(inner.file_trust(), Some(inner.stamp_cache())),
-            freed: Vec::new(),
-            loose: Vec::new(),
             drains: BTreeMap::new(),
-            reclaimed: HashSet::default(),
             annex,
             annex_out: false,
             alloc_mode: AllocMode::Normal,
@@ -938,7 +1132,9 @@ impl Env {
             // In-place WRITE_MAP keeps no whole-map reference in the struct
             // (see the field docs; ADR-0021 M1) — `whole_map` borrows lazily.
             bytes: if in_map { &[] } else { view.bytes },
-            base,
+            base: Some(base),
+            published: None,
+            work: Some(work),
             _guard: guard,
             env: self,
         })
@@ -1264,16 +1460,27 @@ impl<'env> RwTxn<'env> {
         // database checks its handle first.
         self.check_db(db)?;
         if !self.open.contains(dbi) {
-            let name = self
-                .env
-                .inner()
-                .named_name(dbi)
-                .expect("named dbi is assigned before a handle exists");
+            // The name the previous write txn carried for this slot and
+            // generation, if any (`NamedTree::generation`): the same name
+            // the table would return, without its lock or an allocation.
+            let name = match work_mut!(self)
+                .names
+                .get_mut(dbi as usize)
+                .and_then(Option::take)
+            {
+                Some((g, name)) if g == db.generation() => name,
+                _ => self
+                    .env
+                    .inner()
+                    .named_name(dbi)
+                    .expect("named dbi is assigned before a handle exists"),
+            };
             let rec = resolve_named_record(self.source(), self.psize, &self.main_db, &name);
             self.open.insert(
                 dbi,
                 NamedTree {
                     name,
+                    generation: Some(db.generation()),
                     rec,
                     dirty: false,
                     seq: self.env.inner().sequential_writes_for(Some(dbi)),
@@ -1358,7 +1565,7 @@ impl<'env> RwTxn<'env> {
             return true;
         }
         (p..p.saturating_add(n))
-            .all(|pg| pg > self.committed_last_pg || self.reclaimed.contains(&pg))
+            .all(|pg| pg > self.committed_last_pg || work!(self).reclaimed.contains(&pg))
     }
 
     /// [`RwTxn::allocate`] without the ADR-0021 M2 guard (the guard wraps
@@ -1366,7 +1573,7 @@ impl<'env> RwTxn<'env> {
     fn allocate_raw(&mut self, n: u64) -> Result<u64> {
         debug_assert!(n >= 1);
         if n == 1 {
-            if let Some(p) = self.loose.pop() {
+            if let Some(p) = work_mut!(self).loose.pop() {
                 return Ok(p);
             }
         } else if self.alloc_mode == AllocMode::GcSave {
@@ -1443,34 +1650,37 @@ impl<'env> RwTxn<'env> {
     #[inline(never)]
     fn loose_run(&mut self, n: u64) -> Option<u64> {
         debug_assert!(self.alloc_mode == AllocMode::GcSave);
-        if self.loose.is_empty() {
+        if work_mut!(self).loose.is_empty() {
             return None;
         }
-        self.loose.sort_unstable();
+        work_mut!(self).loose.sort_unstable();
         debug_assert!(
-            self.loose.windows(2).all(|w| w[0] < w[1]),
+            work_mut!(self).loose.windows(2).all(|w| w[0] < w[1]),
             "loose list holds a duplicate pgno"
         );
         let mp = map_pages(self.env.inner().map_size(), self.psize);
         let mut i = 0;
-        while i < self.loose.len() {
+        while i < work_mut!(self).loose.len() {
             // Extent of the maximal consecutive run starting at index i.
             let mut j = i + 1;
-            while j < self.loose.len() && self.loose[j] == self.loose[j - 1] + 1 {
+            while j < work_mut!(self).loose.len()
+                && work_mut!(self).loose[j] == work_mut!(self).loose[j - 1] + 1
+            {
                 j += 1;
             }
             let len = (j - i) as u64;
             if len >= n {
-                let start = self.loose[i];
-                self.loose.drain(i..i + n as usize);
+                let start = work_mut!(self).loose[i];
+                work_mut!(self).loose.drain(i..i + n as usize);
                 return Some(start);
             }
             // Top-of-file completion: the run ends at next_pgno - 1, so
             // extending by (n - len) yields one contiguous run.
-            if self.loose[j - 1] + 1 == self.next_pgno && !is_map_full(self.next_pgno, n - len, mp)
+            if work_mut!(self).loose[j - 1] + 1 == self.next_pgno
+                && !is_map_full(self.next_pgno, n - len, mp)
             {
-                let start = self.loose[i];
-                self.loose.drain(i..j);
+                let start = work_mut!(self).loose[i];
+                work_mut!(self).loose.drain(i..j);
                 self.next_pgno += n - len;
                 return Some(start);
             }
@@ -1506,7 +1716,7 @@ impl<'env> RwTxn<'env> {
         let remaining = self.drains.get_mut(&f).expect("pool entry present");
         remaining.take_run(start, n);
         for p in start..start + n {
-            let first_time = self.reclaimed.insert(p);
+            let first_time = work_mut!(self).reclaimed.insert(p);
             debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
         }
         self.save_touched.insert(f);
@@ -1532,7 +1742,7 @@ impl<'env> RwTxn<'env> {
         if self.annex.len() == 0 {
             return None;
         }
-        let f = self.base.txnid;
+        let f = self.base().txnid;
         if f > self.oldest_reader() {
             return None; // GC-31 gate: a reader is pinned below the base.
         }
@@ -1542,7 +1752,7 @@ impl<'env> RwTxn<'env> {
         self.debug_assert_gate(f);
         self.annex.take_run(start, n);
         for p in start..start + n {
-            let first_time = self.reclaimed.insert(p);
+            let first_time = work_mut!(self).reclaimed.insert(p);
             debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
         }
         Some(start)
@@ -1688,7 +1898,7 @@ impl<'env> RwTxn<'env> {
         };
         remaining.take_run(start, n);
         for p in start..start + n {
-            let first_time = self.reclaimed.insert(p);
+            let first_time = work_mut!(self).reclaimed.insert(p);
             debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
         }
         Ok(Some(start))
@@ -1748,7 +1958,7 @@ impl<'env> RwTxn<'env> {
             else {
                 break None;
             };
-            match (at..at + run_len).find(|&j| self.reclaimed.contains(&ids[j].0)) {
+            match (at..at + run_len).find(|&j| work_mut!(self).reclaimed.contains(&ids[j].0)) {
                 None => break Some(at),
                 Some(j) => {
                     cache.merged.remove(j);
@@ -1794,14 +2004,14 @@ impl<'env> RwTxn<'env> {
                 }
                 CrossSource::Annex => {
                     #[cfg(debug_assertions)]
-                    self.debug_assert_gate(self.base.txnid);
+                    self.debug_assert_gate(self.base().txnid);
                     self.annex.take_span(first, count);
                 }
             }
         }
         self.cross_cache = Some(cache);
         for p in start..start + n {
-            let first_time = self.reclaimed.insert(p);
+            let first_time = work_mut!(self).reclaimed.insert(p);
             debug_assert!(first_time, "page {p} reclaimed twice (INV-24)");
         }
         #[cfg(debug_assertions)]
@@ -1853,7 +2063,7 @@ impl<'env> RwTxn<'env> {
                 entry = cursor.next().map_err(map_page_err)?;
             }
         }
-        if self.annex.len() > 0 && self.base.txnid <= oldest {
+        if self.annex.len() > 0 && self.base().txnid <= oldest {
             sources.push(CrossSource::Annex);
         }
         let mut merged: Vec<(u64, u32)> = Vec::new();
@@ -1901,11 +2111,19 @@ impl<'env> RwTxn<'env> {
         // SPEC 03 §6.6 F3 ownership hook: a freed page may be re-served to
         // another tree while staying dirty — no finger may keep naming it.
         self.finger_forget(pgno, 1);
-        self.dirty.discard(pgno);
-        if pgno > self.committed_last_pg || self.reclaimed.contains(&pgno) {
-            self.loose.push(pgno);
+        if pgno > self.committed_last_pg || work!(self).reclaimed.contains(&pgno) {
+            self.dirty.discard(pgno);
+            work_mut!(self).loose.push(pgno);
         } else {
-            self.freed.push(pgno);
+            // A page of the base snapshot. Every dirty or spilled page was
+            // allocated by this txn, so it passes the test above (the TXN-62
+            // invariant `write_frames` asserts): this one has no frame to
+            // drop, and freeing it is a list append, as in LMDB.
+            debug_assert!(
+                !self.dirty.contains(pgno) && self.dirty.spilled_pages(pgno).is_none(),
+                "committed page {pgno} has a dirty or spilled frame"
+            );
+            work_mut!(self).freed.push(pgno);
         }
     }
 
@@ -1916,10 +2134,10 @@ impl<'env> RwTxn<'env> {
         // Run frames are multi-page; `discard` drops them rather than pooling.
         self.dirty.discard(head);
         for p in head..head + n {
-            if p > self.committed_last_pg || self.reclaimed.contains(&p) {
-                self.loose.push(p);
+            if p > self.committed_last_pg || work_mut!(self).reclaimed.contains(&p) {
+                work_mut!(self).loose.push(p);
             } else {
-                self.freed.push(p);
+                work_mut!(self).freed.push(p);
             }
         }
     }
@@ -2022,11 +2240,10 @@ impl<'env> RwTxn<'env> {
     /// and by spilling (SPEC 04 TXN-69). Not yet durable.
     fn write_frames(&self, pgnos: &[u64]) -> Result<()> {
         let psize = self.psize;
-        let backing = self.env.inner().backing_ref();
-        let mut run_start: u64 = 0;
+        // The run being built: `pgnos[first..i]`, contiguous on the file.
+        let mut first = 0;
         let mut next_expected: u64 = 0;
-        let mut run: Vec<&[u8]> = Vec::new();
-        for &pgno in pgnos {
+        for (i, &pgno) in pgnos.iter().enumerate() {
             // TXN-62: only pages the live meta `N-1` does not reference may be
             // written: beyond the committed high-water (extend / loose), or
             // GC-reclaimed under the oldest-reader gate (freed by
@@ -2035,34 +2252,51 @@ impl<'env> RwTxn<'env> {
             // in-map frames too: their bytes were stored at allocation time
             // (TXN-45b), under exactly this invariant.
             debug_assert!(
-                pgno > self.committed_last_pg || self.reclaimed.contains(&pgno),
+                pgno > self.committed_last_pg || work!(self).reclaimed.contains(&pgno),
                 "TXN-62 violation: writing page {pgno} referenced by the live snapshot"
             );
             // An in-map frame (ADR-0021) already sits at its final file
             // offset — there is nothing to write (a self-`memcpy` through
             // `write_at_page` would even self-overlap). It still breaks any
             // pending vectored run.
-            if self.dirty.in_map(pgno) {
-                if !run.is_empty() {
-                    backing.write_pages_at(run_start, psize, &run)?;
-                    run.clear();
-                }
+            let (len, in_map) = self.dirty.frame_extent(pgno).expect("pgno has a frame");
+            if in_map {
+                self.write_run(&pgnos[first..i])?;
+                first = i + 1;
                 continue;
             }
-            let data = self.dirty.bytes(pgno).expect("pgno has a frame");
-            if !run.is_empty() && pgno != next_expected {
-                backing.write_pages_at(run_start, psize, &run)?;
-                run.clear();
+            if first < i && pgno != next_expected {
+                self.write_run(&pgnos[first..i])?;
+                first = i;
             }
-            if run.is_empty() {
-                run_start = pgno;
+            if first == i {
                 next_expected = pgno;
             }
-            run.push(data);
-            next_expected += (data.len() / psize as usize) as u64;
+            next_expected += (len / psize as usize) as u64;
         }
-        if !run.is_empty() {
-            backing.write_pages_at(run_start, psize, &run)?;
+        self.write_run(&pgnos[first..])
+    }
+
+    /// Write the heap frames at `run`, which are contiguous on the file, in
+    /// one vectored write ([`RwTxn::write_frames`]); nothing for an empty
+    /// run. The frame list is built on the stack for a run of up to
+    /// [`RUN_ON_STACK`] frames, which covers small commits, so they allocate
+    /// nothing here; a longer run collects it into a `Vec`.
+    fn write_run(&self, run: &[u64]) -> Result<()> {
+        let Some(&start) = run.first() else {
+            return Ok(());
+        };
+        let backing = self.env.inner().backing_ref();
+        let frame = |pgno: &u64| self.dirty.bytes(*pgno).expect("pgno has a frame");
+        if run.len() <= RUN_ON_STACK {
+            let mut frames: [&[u8]; RUN_ON_STACK] = [&[]; RUN_ON_STACK];
+            for (slot, pgno) in frames.iter_mut().zip(run) {
+                *slot = frame(pgno);
+            }
+            backing.write_pages_at(start, self.psize, &frames[..run.len()])?;
+        } else {
+            let frames: Vec<&[u8]> = run.iter().map(frame).collect();
+            backing.write_pages_at(start, self.psize, &frames)?;
         }
         Ok(())
     }
@@ -2091,7 +2325,7 @@ impl<'env> RwTxn<'env> {
         let want = SPILL_NEED.max(self.dirty_limit / 8);
         let mut keep: Vec<u64> = vec![self.main_db.root, self.free_db.root];
         keep.extend(self.open.values().map(|t| t.rec.root));
-        for f in &self.fingers {
+        for f in &work_mut!(self).fingers {
             keep.extend(f.path.iter().map(|&(p, _)| p));
         }
         let mut cands: Vec<(u64, u64)> = self
@@ -2250,10 +2484,21 @@ impl<'env> RwTxn<'env> {
     /// Read-only descent to the rightmost entry (APPEND's last-key check,
     /// §6.3) into a caller-owned buffer (cleared first): fills the path (leaf
     /// `ki = num_keys - 1`) and returns whether `key` sorts strictly after the
-    /// last key under the tree's ordering. The key is compared in place in
-    /// the leaf, as LMDB's APPEND check does, not copied out. The tree must be
-    /// non-empty.
-    fn rightmost_path_into(&self, tree: TreeId, key: &[u8], path: &mut Path) -> Result<bool> {
+    /// last key under the tree's ordering, or `None` if not. The key is
+    /// compared in place in the leaf, as LMDB's APPEND check does, not copied
+    /// out. The tree must be non-empty.
+    ///
+    /// `Some(owned)` also says whether every page on the path is already a
+    /// frame of this txn, in which case [`touch_path`](Self::touch_path)
+    /// would change nothing: an append load stays on one dirty right spine
+    /// between splits, and LMDB's `mdb_page_touch` skips such pages on their
+    /// `P_DIRTY` flag the same way.
+    fn rightmost_path_into(
+        &self,
+        tree: TreeId,
+        key: &[u8],
+        path: &mut Path,
+    ) -> Result<Option<bool>> {
         path.clear();
         let rec = *self.record(tree);
         // Same hostile-depth guard as `search_path`.
@@ -2262,8 +2507,12 @@ impl<'env> RwTxn<'env> {
         }
         let mut pgno = rec.root;
         let valid = Some(&self.validated);
+        let mut owned = true;
         for _ in 0..=rec.depth {
-            match node_view(self.source(), self.psize, pgno, valid).map_err(corrupt)? {
+            let (view, from_map) =
+                node_view_classified(self.source(), self.psize, pgno, valid).map_err(corrupt)?;
+            owned &= !from_map;
+            match view {
                 NodeView::Leaf(leaf) => {
                     let n = leaf.num_keys();
                     if n == 0 {
@@ -2276,7 +2525,7 @@ impl<'env> RwTxn<'env> {
                     // the keys it should accept.
                     let after = self.tree_comparator(tree).compare(key, leaf.key(n - 1))
                         == Ordering::Greater;
-                    return Ok(after);
+                    return Ok(after.then_some(owned));
                 }
                 NodeView::Branch(br) => {
                     // A zero-child branch is rejected at decode
@@ -2322,7 +2571,7 @@ impl<'env> RwTxn<'env> {
 
     /// Index of `tree`'s finger in the table, if one is live.
     fn finger_pos(&self, tree: TreeId) -> Option<usize> {
-        self.fingers.iter().position(|f| f.tree == tree)
+        work!(self).fingers.iter().position(|f| f.tree == tree)
     }
 
     /// Drop `tree`'s finger (SPEC 03 §6.6 F3). Called at the head of every
@@ -2334,14 +2583,14 @@ impl<'env> RwTxn<'env> {
     fn finger_invalidate(&mut self, tree: TreeId) {
         // The table is empty for every tree with the setting off (ADR-0015):
         // one load and a branch, the body out of line.
-        if !self.fingers.is_empty() {
+        if !work_mut!(self).fingers.is_empty() {
             self.finger_invalidate_slow(tree);
         }
     }
 
     #[inline(never)]
     fn finger_invalidate_slow(&mut self, tree: TreeId) {
-        self.fingers.retain(|f| f.tree != tree);
+        work_mut!(self).fingers.retain(|f| f.tree != tree);
     }
 
     /// Ownership-change hook (SPEC 03 §6.6 F3, the load-bearing one): a page
@@ -2357,14 +2606,14 @@ impl<'env> RwTxn<'env> {
     fn finger_forget(&mut self, head: u64, n: u64) {
         // Empty for every tree with the setting off (ADR-0015); see
         // `finger_invalidate`.
-        if !self.fingers.is_empty() {
+        if !work_mut!(self).fingers.is_empty() {
             self.finger_forget_slow(head, n);
         }
     }
 
     #[inline(never)]
     fn finger_forget_slow(&mut self, head: u64, n: u64) {
-        self.fingers.retain(|f| {
+        work_mut!(self).fingers.retain(|f| {
             f.path
                 .iter()
                 .all(|&(pg, _)| !(head..head + n).contains(&pg))
@@ -2436,7 +2685,7 @@ impl<'env> RwTxn<'env> {
             // random put pays one leaf view and one compare. This read proves
             // nothing on its own (the frame may since belong to another
             // tree); the spine walk below is what makes a hit correct.
-            let (lpg, _) = *self.fingers[i].path.last()?;
+            let (lpg, _) = *work_mut!(self).fingers[i].path.last()?;
             let frame = self.dirty.bytes(lpg)?;
             let leaf = LeafRef::new_prevalidated(frame, self.psize).ok()?;
             let n = leaf.num_keys();
@@ -2446,19 +2695,19 @@ impl<'env> RwTxn<'env> {
                 return None;
             }
             let rec = *self.record(tree);
-            let (spine_lpg, spine_n) = self.finger_spine(&rec, &self.fingers[i].path)?;
+            let (spine_lpg, spine_n) = self.finger_spine(&rec, &work!(self).fingers[i].path)?;
             debug_assert_eq!((spine_lpg, spine_n), (lpg, n));
             Some(n)
         })();
         match hit {
             Some(n) => {
                 path.clear();
-                path.extend_from_slice(&self.fingers[i].path);
+                path.extend_from_slice(&work_mut!(self).fingers[i].path);
                 path.last_mut().expect("finger path is non-empty").1 = n;
                 true
             }
             None => {
-                self.fingers.swap_remove(i);
+                work_mut!(self).fingers.swap_remove(i);
                 false
             }
         }
@@ -2500,7 +2749,7 @@ impl<'env> RwTxn<'env> {
             self.finger_pos(tree).is_none(),
             "establishing over a live finger (op entry must have dropped it)"
         );
-        self.fingers.push(Finger {
+        work_mut!(self).fingers.push(Finger {
             tree,
             path: path.to_vec(),
         });
@@ -2550,9 +2799,9 @@ impl<'env> RwTxn<'env> {
         val: ValSrc<'_>,
         node_flags: u16,
     ) -> Option<Result<ReserveLoc>> {
-        let mut path = std::mem::take(&mut self.path_buf);
+        let mut path = std::mem::take(&mut work_mut!(self).path_buf);
         if !self.finger_hit(tree, key, &mut path) {
-            self.path_buf = path;
+            work_mut!(self).path_buf = path;
             return None;
         }
         #[cfg(debug_assertions)]
@@ -2597,7 +2846,7 @@ impl<'env> RwTxn<'env> {
                 self.errored = true;
             }
         }
-        self.path_buf = path;
+        work_mut!(self).path_buf = path;
         Some(res)
     }
 
@@ -2645,21 +2894,21 @@ impl<'env> RwTxn<'env> {
         if flags.contains(PutFlags::APPEND) {
             return self.append_tree(tree, key, val, false);
         }
-        let mut path = std::mem::take(&mut self.path_buf);
+        let mut path = std::mem::take(&mut work_mut!(self).path_buf);
         let found = match self.search_path_into(tree, key, &mut path) {
             Ok(found) => found,
             Err(e) => {
-                self.path_buf = path;
+                work_mut!(self).path_buf = path;
                 return Err(e);
             }
         };
         if found && flags.contains(PutFlags::NO_OVERWRITE) {
             // §S2: no mutation, nothing dirtied.
-            self.path_buf = path;
+            work_mut!(self).path_buf = path;
             return Err(Error::Mdb(MdbError::KeyExist));
         }
         let res = self.put_apply(tree, &mut path, found, key, val, node_flags);
-        self.path_buf = path;
+        work_mut!(self).path_buf = path;
         if res.is_err() {
             // Mid-mutation failure (MapFull in a split cascade, corrupt page):
             // the working tree may be partial — poison the txn (TXN-59 clean
@@ -2691,16 +2940,16 @@ impl<'env> RwTxn<'env> {
         if flags.contains(PutFlags::APPEND) {
             return self.append_tree(tree, key, val, true);
         }
-        let mut path = std::mem::take(&mut self.path_buf);
+        let mut path = std::mem::take(&mut work_mut!(self).path_buf);
         let found = match self.search_path_into(tree, key, &mut path) {
             Ok(found) => found,
             Err(e) => {
-                self.path_buf = path;
+                work_mut!(self).path_buf = path;
                 return Err(e);
             }
         };
         if found && flags.contains(PutFlags::NO_OVERWRITE) {
-            self.path_buf = path;
+            work_mut!(self).path_buf = path;
             return Err(Error::Mdb(MdbError::KeyExist));
         }
         let before = *self.record(tree);
@@ -2710,7 +2959,7 @@ impl<'env> RwTxn<'env> {
             // establish the finger from this descent (§6.6 F2).
             self.finger_consider(tree, &path, &before);
         }
-        self.path_buf = path;
+        work_mut!(self).path_buf = path;
         if res.is_err() {
             self.errored = true;
         }
@@ -2737,11 +2986,11 @@ impl<'env> RwTxn<'env> {
             }
             return res;
         }
-        let mut path = std::mem::take(&mut self.path_buf);
+        let mut path = std::mem::take(&mut work_mut!(self).path_buf);
         let res = match self.rightmost_path_into(tree, key, &mut path) {
-            Ok(true) if seq => {
+            Ok(Some(owned)) if seq => {
                 let before = *self.record(tree);
-                let res = self.append_apply(tree, &mut path, key, val);
+                let res = self.append_apply(tree, &mut path, owned, key, val);
                 if res.is_ok() {
                     // A fully-touched right-spine descent that did not split
                     // is exactly the finger invariant (§6.6 F2).
@@ -2749,39 +2998,51 @@ impl<'env> RwTxn<'env> {
                 }
                 res
             }
-            Ok(true) => self.append_apply(tree, &mut path, key, val),
-            Ok(false) => {
-                self.path_buf = path;
+            Ok(Some(owned)) => self.append_apply(tree, &mut path, owned, key, val),
+            Ok(None) => {
+                work_mut!(self).path_buf = path;
                 return Err(Error::Mdb(MdbError::KeyExist));
             }
             Err(e) => {
-                self.path_buf = path;
+                work_mut!(self).path_buf = path;
                 return Err(e);
             }
         };
-        self.path_buf = path;
+        work_mut!(self).path_buf = path;
         if res.is_err() {
             self.errored = true;
         }
         res
     }
 
+    /// `owned`: every page on `path` is already a frame of this txn
+    /// ([`rightmost_path_into`](Self::rightmost_path_into)), so there is
+    /// nothing to copy on write.
     fn append_apply(
         &mut self,
         tree: TreeId,
         path: &mut [(u64, usize)],
+        owned: bool,
         key: &[u8],
         val: ValSrc<'_>,
     ) -> Result<ReserveLoc> {
-        self.touch_path(tree, path)?;
-        let (lpg, _) = *path.last().expect("non-empty path");
-        let n = {
-            let frame = self.dirty.bytes(lpg).expect("leaf touched");
-            LeafRef::new_prevalidated(frame, self.psize)
-                .map_err(corrupt)?
-                .num_keys()
-        };
-        path.last_mut().expect("non-empty path").1 = n;
+        if !owned {
+            self.touch_path(tree, path)?;
+        }
+        // The rightmost descent left the leaf frame on its last cell, and a
+        // COW copy is byte-identical: the append slot is one past it, as
+        // LMDB's APPEND bumps `mc_ki` after `mdb_cursor_last`, with no second
+        // view of the leaf.
+        let leaf = path.last_mut().expect("non-empty path");
+        leaf.1 += 1;
+        let (lpg, n) = *leaf;
+        debug_assert_eq!(
+            LeafRef::new_prevalidated(self.dirty.bytes(lpg).expect("leaf touched"), self.psize)
+                .map(|l| l.num_keys())
+                .ok(),
+            Some(n),
+            "the rightmost descent named the leaf's last cell"
+        );
         let loc = self.insert_into_leaf(tree, path, n, key, val, true, 0)?;
         sat_add(&mut self.record_mut(tree).entries, 1);
         Ok(loc)
@@ -3112,18 +3373,12 @@ impl<'env> RwTxn<'env> {
             }
             sat_add(&mut self.record_mut(tree).leaf_pages, 1);
             // sep = first key of R (§6.4): the moved old last key, or the new key.
-            let sep = match moved {
-                Some((mkey, _, _)) => mkey,
-                None => key.to_vec(),
+            let (sep, slot) = match moved {
+                Some((mkey, _, _)) => (mkey, 1),
+                None => (key.to_vec(), 0),
             };
-            return if top == 0 {
-                self.insert_into_branch(tree, path, -1, 0, sep, rpg)
-                    .map(|_| ())
-            } else {
-                let at = path[top - 1].1 + 1;
-                self.insert_into_branch(tree, path, top as isize - 1, at, sep, rpg)
-                    .map(|_| ())
-            };
+            // The new cell is on the right page, after the moved cell if any.
+            return self.rise_leaf_split(tree, path, sep, rpg, (rpg, slot));
         }
 
         // General split: pack both frames from cells **borrowed** out of the
@@ -3153,15 +3408,51 @@ impl<'env> RwTxn<'env> {
         self.pack_leaf_range(rpg, &oldleaf, newindx, key, &val, node_flags, s, total)?;
         drop(old);
         sat_add(&mut self.record_mut(tree).leaf_pages, 1);
-        // The split flag only matters to a kept delete path; puts discard it.
+        // Post-insert item `newindx` is the new cell: slot `newindx` of the
+        // left half, or `newindx - s` of the right one.
+        let cell = if newindx < s {
+            (lpg, newindx)
+        } else {
+            (rpg, newindx - s)
+        };
+        self.rise_leaf_split(tree, path, sep, rpg, cell)
+    }
+
+    /// Rise a leaf split's separator into the parent (or grow the root), then
+    /// point the leaf frame of `path` at `cell`, the `(pgno, slot)` the split
+    /// gave the cell just inserted. Every branch frame above follows it
+    /// through any split the insert cascades into (SPEC 03 §5.4b — LMDB fixes
+    /// up the splitting cursor the same way after `mdb_page_split`), so
+    /// `path` stays the root-to-leaf path to that cell; only a root grow
+    /// leaves the new root's frame for the caller to add
+    /// ([`put_at_path`](Self::put_at_path)).
+    fn rise_leaf_split(
+        &mut self,
+        tree: TreeId,
+        path: &mut [(u64, usize)],
+        sep: Vec<u8>,
+        rpg: u64,
+        cell: (u64, usize),
+    ) -> Result<()> {
+        let top = path.len() - 1;
+        let to_right = cell.0 == rpg;
         if top == 0 {
-            self.insert_into_branch(tree, path, -1, 0, sep, rpg)
-                .map(|_| ())
+            self.insert_into_branch_follow(tree, path, -1, 0, sep, rpg, Some(to_right))?;
         } else {
             let at = path[top - 1].1 + 1;
-            self.insert_into_branch(tree, path, top as isize - 1, at, sep, rpg)
-                .map(|_| ())
+            self.insert_into_branch_follow(
+                tree,
+                path,
+                top as isize - 1,
+                at,
+                sep,
+                rpg,
+                Some(to_right),
+            )?;
         }
+        // Written last: a root grow above reads `path[0]` as the old root.
+        path[top] = cell;
+        Ok(())
     }
 
     /// Pack post-insert items `[from, to)` into a fresh frame at `pgno`
@@ -3228,6 +3519,27 @@ impl<'env> RwTxn<'env> {
         key: Vec<u8>,
         child: u64,
     ) -> Result<bool> {
+        self.insert_into_branch_follow(tree, path, level, at, key, child, None)
+    }
+
+    /// [`insert_into_branch`](Self::insert_into_branch), optionally keeping
+    /// `path` on a put's new cell (SPEC 03 §5.4b). `follow` is `None` for
+    /// callers whose path does not survive a split (it is then left as is),
+    /// or `Some(new)` when the cell is under the inserted `child` (`new`) or
+    /// under the frame's own child, whose index the insert does not move
+    /// (`at` is right after it). The frame at `level` is then rewritten to
+    /// the slot, on whichever half, of the child holding the cell.
+    #[allow(clippy::too_many_arguments)] // house pattern (insert_into_leaf): pre-resolved scalars
+    fn insert_into_branch_follow(
+        &mut self,
+        tree: TreeId,
+        path: &mut [(u64, usize)],
+        level: isize,
+        at: usize,
+        key: Vec<u8>,
+        child: u64,
+        follow: Option<bool>,
+    ) -> Result<bool> {
         if level < 0 {
             // Root split (§9): new root branch over (old root, risen key).
             let old_root = path[0].0;
@@ -3248,7 +3560,19 @@ impl<'env> RwTxn<'env> {
         }
         let lvl = level as usize;
         debug_assert!(at >= 1, "branch inserts never target node 0");
-        let (ppg, _) = path[lvl];
+        let (ppg, pki) = path[lvl];
+        // The followed child's index among the post-insert cells.
+        let follow = follow.map(|new| {
+            debug_assert!(
+                new || at > pki,
+                "the insert must not shift the followed child"
+            );
+            if new {
+                at
+            } else {
+                pki
+            }
+        });
         let r = {
             let frame = self.dirty.bytes_mut(ppg).expect("branch is dirty");
             BranchMut::from_valid(frame, self.psize)
@@ -3256,8 +3580,15 @@ impl<'env> RwTxn<'env> {
                 .insert(at, &key, child)
         };
         match r {
-            Ok(()) => Ok(false),
-            Err(PageError::PageFull { .. }) => self.split_branch(tree, path, lvl, at, key, child),
+            Ok(()) => {
+                if let Some(x) = follow {
+                    path[lvl].1 = x;
+                }
+                Ok(false)
+            }
+            Err(PageError::PageFull { .. }) => {
+                self.split_branch(tree, path, lvl, at, key, child, follow)
+            }
             Err(e) => Err(corrupt(e)),
         }
     }
@@ -3278,6 +3609,11 @@ impl<'env> RwTxn<'env> {
     /// leaves them about half full. A branch must keep two children (INV-8),
     /// so the new cell cannot start the right page alone as it does for an
     /// APPEND on a leaf. Non-end inserts keep the median-fit-adjust rule (`choose_split`).
+    ///
+    /// `follow` is the post-insert index of the child a put's path follows
+    /// ([`insert_into_branch_follow`](Self::insert_into_branch_follow)), or
+    /// `None` to leave `path` as is.
+    #[allow(clippy::too_many_arguments)] // house pattern (insert_into_leaf): pre-resolved scalars
     fn split_branch(
         &mut self,
         tree: TreeId,
@@ -3286,6 +3622,7 @@ impl<'env> RwTxn<'env> {
         at: usize,
         key: Vec<u8>,
         child: u64,
+        follow: Option<usize>,
     ) -> Result<bool> {
         let (ppg, _) = path[lvl];
         let mut cells = self.extract_branch_cells(ppg)?;
@@ -3322,11 +3659,19 @@ impl<'env> RwTxn<'env> {
         self.write_branch_frame(ppg, &cells)?;
         self.write_branch_frame(rpg, &right)?;
         sat_add(&mut self.record_mut(tree).branch_pages, 1);
+        // Children `[0, s)` stay left at their index; child `s` (the rising
+        // cell's) is the right page's node 0, and the tail follows it.
+        let followed = follow.map(|x| if x < s { (ppg, x) } else { (rpg, x - s) });
+        let up = followed.map(|(pg, _)| pg == rpg);
         if lvl == 0 {
-            self.insert_into_branch(tree, path, -1, 0, rising, rpg)?;
+            self.insert_into_branch_follow(tree, path, -1, 0, rising, rpg, up)?;
         } else {
             let at2 = path[lvl - 1].1 + 1;
-            self.insert_into_branch(tree, path, lvl as isize - 1, at2, rising, rpg)?;
+            self.insert_into_branch_follow(tree, path, lvl as isize - 1, at2, rising, rpg, up)?;
+        }
+        // Written last: a root grow above reads `path[0]` as the old root.
+        if let Some(frame) = followed {
+            path[lvl] = frame;
         }
         Ok(true)
     }
@@ -3338,13 +3683,13 @@ impl<'env> RwTxn<'env> {
         // Read-side key leniency (§2.1): an oversized key simply finds
         // nothing (`Ok(false)`); the empty-key `BadValSize` is an API-boundary
         // concern (oracle adapter / heed adapter).
-        let mut path = std::mem::take(&mut self.path_buf);
+        let mut path = std::mem::take(&mut work_mut!(self).path_buf);
         let res = match self.search_path_into(tree, key, &mut path) {
             // The path is transient here, so its fate is irrelevant.
             Ok(true) => self.delete_at_path(tree, &mut path).map(|_| true),
             other => other,
         };
-        self.path_buf = path;
+        work_mut!(self).path_buf = path;
         res
     }
 
@@ -3355,7 +3700,7 @@ impl<'env> RwTxn<'env> {
     ///
     /// `path` MUST be the live root-to-leaf path to an existing entry of
     /// `tree`: either fresh from [`search_path`](Self::search_path), or a
-    /// cursor's parked path over an unmutated tree (the `Cursor::resume`
+    /// cursor's parked path over an unmutated tree (the `Cursor::resume_in`
     /// contract). It is rewritten in place as pages are COWed and as the
     /// rebalance repairs it.
     fn delete_at_path(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<PathFate> {
@@ -3377,44 +3722,87 @@ impl<'env> RwTxn<'env> {
     /// Overwrite the value of the existing entry at the end of `path` — the
     /// write cursor's put at its parked position (SPEC 03 §5.4b): the same
     /// §6.1 replace as [`put_tree`](Self::put_tree) on a found key, minus the
-    /// descent. Returns whether `path` still descends to the rewritten entry:
-    /// `true` when the replace stayed inside its leaf (same slot, the pgnos
-    /// remapped in place by `touch_path`), `false` when it split the leaf and
-    /// the path must be discarded.
+    /// descent. `path` is left descending to the rewritten entry: same slot
+    /// when the replace stayed inside its leaf (the pgnos remapped in place
+    /// by `touch_path`), or the slot a leaf split gave it, with every branch
+    /// frame above following any split cascade.
     ///
-    /// `path` MUST be the live root-to-leaf path to an existing entry whose
-    /// key is `key`, as for [`delete_at_path`](Self::delete_at_path). The
-    /// caller handles the sequential-writes and flag variants of a put; this
-    /// is the plain overwrite.
+    /// `path` MUST be the live root-to-leaf path to an existing entry, as for
+    /// [`delete_at_path`](Self::delete_at_path). When that entry's key is not
+    /// `key`, nothing changes ([`PathPut::Elsewhere`]): the caller runs the
+    /// keyed put. The caller handles the sequential-writes and flag variants
+    /// of a put; this is the plain overwrite.
     fn put_at_path(
         &mut self,
         tree: TreeId,
         path: &mut [(u64, usize)],
         key: &[u8],
         val: &[u8],
-    ) -> Result<bool> {
+    ) -> Result<PathPut> {
         self.guard_ok()?;
         // The key is the stored one, so it already passed the key bounds;
         // the value is new (SPEC 03 §6 up-front validation).
         if val.len() as u64 > MAX_DATA_SIZE as u64 {
             return Err(Error::Mdb(MdbError::BadValSize));
         }
-        let before = *self.record(tree);
-        match self.put_apply(tree, path, true, key, ValSrc::Val(val), 0) {
-            Ok(_) => {
-                // A replace adds no entry; the only structural change it can
-                // make is a leaf split (§6.2), which adds a leaf page.
-                let after = *self.record(tree);
-                Ok(after.depth == before.depth
-                    && after.leaf_pages == before.leaf_pages
-                    && after.branch_pages == before.branch_pages)
+        let psize = self.psize;
+        let (lpg, ki) = *path.last().expect("non-empty path");
+        if let Some(frame) = self.dirty.bytes_mut(lpg) {
+            // The leaf is already this txn's (LMDB's `MDB_CURRENT` put on a
+            // `P_DIRTY` page): one frame access confirms the key and, for a
+            // same-size inline value, rewrites it in place (§6.1). A dirty
+            // page's ancestors are this txn's pages too — a page is copied
+            // only below a touched parent (§5.3) — so the path needs no
+            // touch for a write that changes no structure.
+            let at = {
+                let leaf = LeafMut::from_valid(&mut *frame, psize).map_err(corrupt)?;
+                if leaf.key(ki) != key {
+                    return Ok(PathPut::Elsewhere);
+                }
+                match leaf.inline_value_at(ki) {
+                    Ok((off, dsize))
+                        if dsize as usize == val.len()
+                            && value_is_inline(key.len(), val.len() as u64, psize) =>
+                    {
+                        Some(off)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(off) = at {
+                frame[off..off + val.len()].copy_from_slice(val);
+                return Ok(PathPut::Kept);
             }
-            Err(e) => {
-                // Mid-mutation failure: poison (TXN-59), as `put_tree` does.
-                self.errored = true;
-                Err(e)
+        } else {
+            let leaf = match node_view(self.source(), psize, lpg, Some(&self.validated))
+                .map_err(corrupt)?
+            {
+                NodeView::Leaf(l) => l,
+                NodeView::Branch(_) => return Err(Error::Mdb(MdbError::Invalid)),
+            };
+            if leaf.key(ki) != key {
+                return Ok(PathPut::Elsewhere);
             }
         }
+        let depth = self.record(tree).depth;
+        if let Err(e) = self.put_apply(tree, path, true, key, ValSrc::Val(val), 0) {
+            // Mid-mutation failure: poison (TXN-59), as `put_tree` does.
+            self.errored = true;
+            return Err(e);
+        }
+        let rec = *self.record(tree);
+        if rec.depth == depth {
+            return Ok(PathPut::Kept);
+        }
+        // A replace splits at most one page per level, so the root grew by
+        // one level: a branch over the old root's two halves, `path[0]`
+        // being the half that holds the entry.
+        debug_assert_eq!(rec.depth, depth + 1, "one put grows the root once");
+        let frame = self.dirty.bytes(rec.root).expect("new root is dirty");
+        let root = BranchRef::new_prevalidated(frame, self.psize).map_err(corrupt)?;
+        let ki = usize::from(root.child_pgno(0) != path[0].0);
+        debug_assert_eq!(root.child_pgno(ki), path[0].0, "path[0] is a root child");
+        Ok(PathPut::Grown((rec.root, ki)))
     }
 
     /// Debug-build check for [`put_at_path`](Self::put_at_path): a path the
@@ -3481,9 +3869,9 @@ impl<'env> RwTxn<'env> {
         // The splice and its rebalance can restructure the right spine
         // (SPEC 03 §6.6 F3).
         self.finger_invalidate(tree);
-        let mut path = std::mem::take(&mut self.path_buf);
+        let mut path = std::mem::take(&mut work_mut!(self).path_buf);
         let res = self.delete_range_leaf_inner(tree, first, upper, &mut path);
-        self.path_buf = path;
+        work_mut!(self).path_buf = path;
         res
     }
 
@@ -3588,7 +3976,7 @@ impl<'env> RwTxn<'env> {
         self.guard_ok()?;
         // The deferred rebalance can borrow/merge (SPEC 03 §6.6 F3).
         self.finger_invalidate(tree);
-        let mut path = std::mem::take(&mut self.path_buf);
+        let mut path = std::mem::take(&mut work_mut!(self).path_buf);
         let res = (|| {
             let found = self.search_path_into(tree, anchor, &mut path)?;
             debug_assert!(found, "deferred-rebalance anchor is a survivor");
@@ -3601,7 +3989,7 @@ impl<'env> RwTxn<'env> {
             let top = path.len() - 1;
             self.rebalance(tree, &mut path, top, true).map(|_| ())
         })();
-        self.path_buf = path;
+        work_mut!(self).path_buf = path;
         if res.is_err() {
             // Same poisoning as the splice: the walk's structure is applied.
             self.errored = true;
@@ -3711,10 +4099,10 @@ impl<'env> RwTxn<'env> {
     /// bit-for-bit (the churn-flatness pins depend on it).
     /// Returns the [`PathFate`] of `path` (SPEC 03 §5.4a): `Unchanged` when
     /// the delete only removed a cell from its leaf; `Kept`/`KeptShrunk` when
-    /// the shape changed through the leftmost pairing (child 0 + its RIGHT
-    /// sibling) and every frame was repaired in place; `Invalidated` for the
-    /// left pairing, for any ancestor split during a separator rewrite, and
-    /// for anything else this table does not prove.
+    /// a borrow or merge with either sibling changed the shape and every
+    /// frame was repaired in place; `Invalidated` for any ancestor split
+    /// during a separator rewrite, an emptied tree, an empty sibling, and
+    /// anything else this table does not prove.
     fn rebalance(
         &mut self,
         tree: TreeId,
@@ -3819,28 +4207,34 @@ impl<'env> RwTxn<'env> {
         };
         if can_borrow {
             let split = self.borrow_entry(tree, path, level, sib, fromleft, is_leaf)?;
-            // Right-sibling borrow (SPEC 03 §5.4a repair table): P keeps its
-            // pgno, the moved entry is appended after the vacated slot, and
-            // the parent's child 0 does not move — every frame is already
-            // correct. A separator split rewrites ancestors this table does
-            // not follow (and a root grow adds a frame), so it invalidates;
-            // so does the left pairing, whose rules this step does not
-            // implement.
-            Ok(if fromleft || split {
+            // Borrow repair (SPEC 03 §5.4a repair table). P keeps its pgno
+            // and the parent's frame still names P. From the right, the moved
+            // entry is appended after P's slot, so the frame is already
+            // correct. From the left, the moved entry becomes P's node 0 and
+            // every slot shifts up one (LMDB's `mdb_node_move` bumps `mc_ki`
+            // of cursors on the destination page). A separator split
+            // rewrites ancestors this table does not follow (and a root grow
+            // adds a frame), so it invalidates.
+            if fromleft {
+                path[level].1 += 1;
+            }
+            Ok(if split {
                 PathFate::Invalidated
             } else {
                 PathFate::Kept
             })
         } else {
             self.merge_pages(tree, path, level, sib, fromleft, is_leaf)?;
-            // Right-sibling merge (right into left = P): P keeps its pgno and
-            // the appended cells land at or after the vacated slot, so the
-            // slot still names the successor; the parent loses child 1 only.
-            // A left-pairing merge moves the path onto the sibling
-            // (`merge_pages` repairs it for the recursion, not for the
-            // cursor), and an empty right sibling (hostile image) would leave
-            // the vacated slot past a possibly-empty leaf — both invalidate.
-            let here = if fromleft || s_nkeys == 0 {
+            // Merge repair: right into left, and `merge_pages` leaves the
+            // frame on the surviving left page. With the right sibling, P
+            // survives and the appended cells land at or after P's slot, so
+            // the slot still names the successor; the parent loses child 1
+            // only. With the left sibling, P's cells were appended after the
+            // sibling's and `merge_pages` shifted the slot by the sibling's
+            // count (LMDB's `mdb_page_merge` cursor fix-up). An empty
+            // sibling (hostile image) could leave the slot past an empty
+            // page, so it invalidates.
+            let here = if s_nkeys == 0 {
                 PathFate::Invalidated
             } else {
                 PathFate::Kept
@@ -3869,7 +4263,7 @@ impl<'env> RwTxn<'env> {
             // REB-2: the boundary cell moves verbatim (flags, key, inline
             // value or overflow head) through the txn's scratch buffer — no
             // decode, no owned key/value copies.
-            let mut cell = std::mem::take(&mut self.cell_scratch);
+            let mut cell = std::mem::take(&mut work_mut!(self).cell_scratch);
             cell.clear();
             let src_idx = {
                 let frame = self.dirty.bytes_mut(sib).expect("sibling touched");
@@ -3898,7 +4292,7 @@ impl<'env> RwTxn<'env> {
                 cell.extend_from_slice(l.key(0));
             }
             let split = self.update_parent_key(tree, path, level - 1, sep_idx, &cell);
-            self.cell_scratch = cell;
+            work_mut!(self).cell_scratch = cell;
             split
         } else if fromleft {
             // Branch borrow from the left sibling: its last child becomes P's
@@ -4055,15 +4449,18 @@ impl<'env> RwTxn<'env> {
         // REB-4: the right page's cells are appended to the left page in
         // order, read from a scratch copy of the right page (so only one
         // dirty frame is borrowed at a time) — no owned per-cell copies.
-        let mut src = std::mem::take(&mut self.cell_scratch);
+        let mut src = std::mem::take(&mut work_mut!(self).cell_scratch);
         src.clear();
         src.extend_from_slice(self.dirty.bytes(right).expect("right is dirty"));
+        // The left page's entry count before the append: where the right
+        // page's slot 0 lands.
+        let base;
         if is_leaf {
             {
                 let r = LeafRef::new_prevalidated(&src, psize).map_err(corrupt)?;
                 let frame = self.dirty.bytes_mut(left).expect("left is dirty");
                 let mut l = LeafMut::from_valid(frame, psize).map_err(corrupt)?;
-                let base = l.num_keys();
+                base = l.num_keys();
                 for j in 0..r.num_keys() {
                     l.insert_cell_bytes(base + j, r.cell_bytes(j, psize).map_err(corrupt)?)
                         .map_err(corrupt)?;
@@ -4084,7 +4481,7 @@ impl<'env> RwTxn<'env> {
                 let r = BranchRef::new_prevalidated(&src, psize).map_err(corrupt)?;
                 let frame = self.dirty.bytes_mut(left).expect("left is dirty");
                 let mut b = BranchMut::from_valid(frame, psize).map_err(corrupt)?;
-                let base = b.num_keys();
+                base = b.num_keys();
                 b.insert(base, &sep, r.child_pgno(0)).map_err(corrupt)?;
                 for j in 1..r.num_keys() {
                     b.insert(base + j, r.key(j), r.child_pgno(j))
@@ -4093,7 +4490,7 @@ impl<'env> RwTxn<'env> {
             }
             sat_sub(&mut self.record_mut(tree).branch_pages, 1);
         }
-        self.cell_scratch = src;
+        work_mut!(self).cell_scratch = src;
         {
             let frame = self.dirty.bytes_mut(ppg).expect("parent is dirty");
             BranchMut::from_valid(frame, self.psize)
@@ -4102,11 +4499,14 @@ impl<'env> RwTxn<'env> {
                 .map_err(corrupt)?;
         }
         self.free_page(right);
-        // Keep the path coherent for the parent-level recursion: the surviving
-        // page is the pair's left page.
+        // Keep the path coherent: the surviving page is the pair's left page.
+        // The parent-level recursion reads the parent frame; a cursor keeping
+        // the path reads this one, whose slot moves past the left page's own
+        // entries when P was the right page.
         path[level].0 = left;
         if fromleft {
             path[level - 1].1 = pki - 1;
+            path[level].1 += base;
         }
         Ok(())
     }
@@ -4140,10 +4540,7 @@ impl<'env> RwTxn<'env> {
                     // free it twice (the full walk double-frees such a page
                     // too, but only after loading it). Refuse the whole clear
                     // instead — nothing has been freed yet.
-                    let mut sorted = pages.clone();
-                    sorted.sort_unstable();
-                    sorted.dedup();
-                    if sorted.len() != pages.len() {
+                    if has_duplicate(&pages) {
                         r = Err(Error::Mdb(MdbError::Invalid));
                     }
                 }
@@ -4158,6 +4555,8 @@ impl<'env> RwTxn<'env> {
             for (head, n) in runs {
                 self.free_run(head, n);
             }
+            // A tree this txn has not touched frees every page into `freed`.
+            work_mut!(self).freed.reserve(pages.len());
             for p in pages {
                 self.free_page(p);
             }
@@ -4241,6 +4640,7 @@ impl<'env> RwTxn<'env> {
                 let seq = self.env.inner().sequential_writes_for(Some(dbi));
                 self.open.slot(dbi).get_or_insert_with(|| NamedTree {
                     name: name.into(),
+                    generation: None,
                     rec,
                     dirty: false,
                     seq,
@@ -4266,6 +4666,7 @@ impl<'env> RwTxn<'env> {
                     dbi,
                     NamedTree {
                         name: name.into(),
+                        generation: None,
                         rec: empty,
                         dirty: false,
                         seq: self.env.inner().sequential_writes_for(Some(dbi)),
@@ -4283,23 +4684,35 @@ impl<'env> RwTxn<'env> {
     /// `F_SUBDATA` entry, but it COWs main-tree leaves and may free pages, all
     /// of which must be captured by the subsequent `freelist_save`.
     fn flush_catalog(&mut self) -> Result<()> {
-        let mut dirty: Vec<(Box<[u8]>, DBRecord)> = self
-            .open
-            .values()
-            .filter(|t| t.dirty)
-            .map(|t| (t.name.clone(), t.rec))
-            .collect();
-        dirty.sort_by(|a, b| a.0.cmp(&b.0));
-        for (name, rec) in dirty {
-            let bytes = rec.to_bytes();
-            self.put_tree_flagged(
+        let mut order = std::mem::take(&mut work_mut!(self).catalog);
+        order.clear();
+        order.extend(
+            (0..self.open.slots.len() as u32)
+                .filter(|&dbi| self.open.get(dbi).is_some_and(|t| t.dirty)),
+        );
+        let open = &self.open;
+        // Names are unique, so the unstable sort is deterministic.
+        order.sort_unstable_by(|&a, &b| {
+            let name = |dbi| &open.get(dbi).expect("listed above").name;
+            name(a).cmp(name(b))
+        });
+        for &dbi in &order {
+            // The name moves out for the put (which reads no named-DB name)
+            // and back after it, so the write borrows it without a copy.
+            let t = self.open.get_mut(dbi).expect("listed above");
+            let name = std::mem::take(&mut t.name);
+            let bytes = t.rec.to_bytes();
+            let r = self.put_tree_flagged(
                 TreeId::Main,
                 &name,
                 PutFlags::EMPTY,
                 ValSrc::Val(&bytes),
                 F_SUBDATA,
-            )?;
+            );
+            self.open.get_mut(dbi).expect("listed above").name = name;
+            r?;
         }
+        work_mut!(self).catalog = order;
         for t in self.open.values_mut() {
             t.dirty = false;
         }
@@ -4380,25 +4793,26 @@ impl<'env> RwTxn<'env> {
             return Err(Error::Mdb(MdbError::Invalid));
         }
         if level == 1 {
-            // The leaf level: bound-check (see above), collect unread.
-            // Committed leaves (the common case) answer on the range test;
-            // the spilled-set lookup runs only for this-txn pages.
-            if (FIRST_DATA_PGNO..=self.committed_last_pg).contains(&pgno)
-                || self.dirty.contains(pgno)
-                || self.dirty.spilled_pages(pgno).is_some()
-            {
-                pages.push(pgno);
-                return Ok(());
-            }
-            return Err(Error::Mdb(MdbError::Invalid));
+            // A root that is the leaf level (a one-page tree).
+            return self.collect_unread_leaf(pgno, pages);
         }
         let page = self.load(pgno)?;
         match page.page_type() {
             PageType::Branch => {
                 let br = branch_view(self.source(), self.psize, pgno, Some(&self.validated))
                     .map_err(corrupt)?;
-                for i in 0..br.num_keys() {
-                    self.collect_tree_skip_leaves(br.child_pgno(i), level - 1, pages, runs)?;
+                if level == 2 {
+                    // Every child is an unread leaf: room for all of them at
+                    // once, and one loop over the child pointers (LMDB's
+                    // `mdb_drop0` with `mdb_midl_need` per branch).
+                    pages.reserve(br.num_keys() + 1);
+                    for i in 0..br.num_keys() {
+                        self.collect_unread_leaf(br.child_pgno(i), pages)?;
+                    }
+                } else {
+                    for i in 0..br.num_keys() {
+                        self.collect_tree_skip_leaves(br.child_pgno(i), level - 1, pages, runs)?;
+                    }
                 }
                 pages.push(pgno);
                 Ok(())
@@ -4421,7 +4835,31 @@ impl<'env> RwTxn<'env> {
         }
     }
 
+    /// Collect leaf `pgno` for [`collect_tree_skip_leaves`](Self::collect_tree_skip_leaves)
+    /// without loading it, after the bound check that stands in for the load
+    /// (see there). Committed leaves (the common case) answer on the range
+    /// test; the dirty and spilled lookups run only for this-txn pages.
+    #[inline]
+    fn collect_unread_leaf(&self, pgno: u64, pages: &mut Vec<u64>) -> Result<()> {
+        if (FIRST_DATA_PGNO..=self.committed_last_pg).contains(&pgno)
+            || self.dirty.contains(pgno)
+            || self.dirty.spilled_pages(pgno).is_some()
+        {
+            pages.push(pgno);
+            return Ok(());
+        }
+        Err(Error::Mdb(MdbError::Invalid))
+    }
+
     // -- commit pipeline (SPEC 04 §9 TXN-61..64, SPEC 06 §2 REC-6/7) -----------
+
+    /// The snapshot this txn grew from.
+    #[inline]
+    fn base(&self) -> &Snapshot {
+        self.base
+            .as_deref()
+            .expect("the base is held until the txn drops")
+    }
 
     /// Whether this txn changed nothing observable (no dirty pages, no frees,
     /// no allocation, identical records): commit is then a pure mutex release,
@@ -4429,13 +4867,13 @@ impl<'env> RwTxn<'env> {
     fn is_unchanged(&self) -> bool {
         self.dirty.is_empty()
             && !self.dirty.has_spills()
-            && self.freed.is_empty()
-            && self.loose.is_empty()
+            && work!(self).freed.is_empty()
+            && work!(self).loose.is_empty()
             && self.drains.is_empty()
-            && self.reclaimed.is_empty()
-            && self.next_pgno == self.base.last_pg + 1
-            && self.main_db == self.base.main_db
-            && self.free_db == self.base.free_db
+            && work!(self).reclaimed.is_empty()
+            && self.next_pgno == self.base().last_pg + 1
+            && self.main_db == self.base().main_db
+            && self.free_db == self.base().free_db
             // A dirty named-DB working record still needs its catalog write-back
             // (defensive: any named mutation also dirties a page, so this is
             // implied — but keep the commit honest, SPEC 02 §6).
@@ -4449,15 +4887,16 @@ impl<'env> RwTxn<'env> {
     /// then leaves unreferenced bytes past the new high-water, which TXN-70
     /// allows (the file may keep a grown, unreferenced tail).
     fn release_trailing_loose(&mut self) {
-        if self.loose.is_empty() {
+        if work_mut!(self).loose.is_empty() {
             return;
         }
-        let mut set: std::collections::BTreeSet<u64> = self.loose.iter().copied().collect();
+        let mut set: std::collections::BTreeSet<u64> =
+            work_mut!(self).loose.iter().copied().collect();
         while self.next_pgno > self.committed_last_pg + 1 && set.remove(&(self.next_pgno - 1)) {
             debug_assert!(!self.dirty.contains(self.next_pgno - 1));
             self.next_pgno -= 1;
         }
-        self.loose = set.into_iter().collect();
+        work_mut!(self).loose = set.into_iter().collect();
     }
 
     /// Write a PIL under `BE(f)` into the GC tree via the RESERVE path
@@ -4595,7 +5034,8 @@ impl<'env> RwTxn<'env> {
         // *generated by the loop below* (a replaced PIL overflow run) are
         // re-served to later in-save allocations or folded in at the end.
         self.release_trailing_loose();
-        self.freed.extend(std::mem::take(&mut self.loose));
+        let work = work_mut!(self);
+        work.freed.extend(std::mem::take(&mut work.loose));
         let mut iters = 0usize;
         loop {
             iters += 1;
@@ -4636,11 +5076,15 @@ impl<'env> RwTxn<'env> {
             }
             // (c) this txn's own entry: the meta annex when it fits (GC-32),
             // else the GC tree under BE(writer_txnid) as in format v1.
-            self.freed.sort_unstable();
-            let pre_dedup = self.freed.len();
-            self.freed.dedup();
-            debug_assert_eq!(self.freed.len(), pre_dedup, "page double-freed (GC-4)");
-            let before = self.freed.len();
+            work_mut!(self).freed.sort_unstable();
+            let pre_dedup = work_mut!(self).freed.len();
+            work_mut!(self).freed.dedup();
+            debug_assert_eq!(
+                work_mut!(self).freed.len(),
+                pre_dedup,
+                "page double-freed (GC-4)"
+            );
+            let before = work_mut!(self).freed.len();
             let annex_before = Drain::len(&self.annex);
             let total = before + annex_before;
             if total > 0 {
@@ -4654,7 +5098,7 @@ impl<'env> RwTxn<'env> {
                 } else {
                     tree_arm = true; // sticky (GC-32)
                     annex_mode = false;
-                    let ids = merge_sorted_unique(&self.freed, self.annex.live());
+                    let ids = merge_sorted_unique(&work_mut!(self).freed, self.annex.live());
                     // GC-13 own-entry size guard. The entry lists the carried
                     // annex pool and every loose page folded in, so a run
                     // for it taken from those (an annex draw, a loose page)
@@ -4678,17 +5122,19 @@ impl<'env> RwTxn<'env> {
                     if grow_after_shrink {
                         // Loose pages are part of the set too (listed at the
                         // fixed point): hold them back for this put.
-                        let held = std::mem::take(&mut self.loose);
+                        let held = std::mem::take(&mut work_mut!(self).loose);
                         self.save_outside = true;
                         let r = self.put_pil(self.txnid, &ids);
                         self.save_outside = false;
-                        self.loose.extend(held);
+                        work_mut!(self).loose.extend(held);
                         r?;
                     } else {
                         self.put_pil(self.txnid, &ids)?;
                     }
                     own_pages = Some(pages);
-                    if self.freed.len() != before || Drain::len(&self.annex) != annex_before {
+                    if work_mut!(self).freed.len() != before
+                        || Drain::len(&self.annex) != annex_before
+                    {
                         // The put COW-freed committed GC pages (PIL must
                         // grow) or drew from the annex pool (the written
                         // PIL lists a handed-out page): rewrite next round.
@@ -4705,17 +5151,20 @@ impl<'env> RwTxn<'env> {
                 continue;
             }
             self.release_trailing_loose();
-            if self.loose.is_empty() {
+            if work_mut!(self).loose.is_empty() {
                 break; // true fixed point
             }
-            self.freed.extend(std::mem::take(&mut self.loose));
+            let work = work_mut!(self);
+            work.freed.extend(std::mem::take(&mut work.loose));
         }
         // GC-30/GC-32 settle: in the annex arm the persisted annex is the
         // merged set, materialized into `freed` for C4/C6; in the tree arm
         // the pool's ids were written into the tree entry `BE(txnid)`. The
         // pool is spent either way (no allocation runs after C1).
         if annex_mode {
-            self.freed = merge_sorted_unique(&self.freed, self.annex.live());
+            let work = work_mut!(self);
+            merge_sorted_unique_into(&work.freed, self.annex.live(), &mut work.merged);
+            std::mem::swap(&mut work.freed, &mut work.merged);
         }
         self.annex = Drain::new(Vec::new());
         self.annex_out = annex_mode;
@@ -4824,7 +5273,8 @@ impl<'env> RwTxn<'env> {
         // nothing for them — C2 reduces to the heap frames (none, in pure
         // in-map txns) and the C3 `msync` barrier makes the in-place stores
         // durable exactly as it made the commit-time `memcpy`s durable.
-        let pgnos = self.dirty.sorted_pgnos();
+        let mut pgnos = std::mem::take(&mut work_mut!(self).pgnos);
+        self.dirty.sorted_pgnos_into(&mut pgnos);
         self.write_frames(&pgnos)?;
         inner.run_hook(HookPoint::H1);
         // Crash here: meta slots untouched → `N-1` selected; the written (or
@@ -4863,11 +5313,15 @@ impl<'env> RwTxn<'env> {
         // ADR-0023 amendment 15: a commit never lowers the persisted map size
         // (`OBS_COMMIT_PERSISTS_OWN_MAPSIZE` = false): a process with a
         // smaller map keeps the larger size another process recorded.
-        let map_size = self.base.map_size.max(inner.map_size());
+        let map_size = self.base().map_size.max(inner.map_size());
         // GC-32 (ADR-0022): in annex mode this txn's freed PIL rides in the
         // meta itself — `freed` is final after C1 and already sorted/deduped
         // (GC-3/4); `freelist_save` guaranteed it fits the cap.
-        let annex: &[u64] = if self.annex_out { &self.freed } else { &[] };
+        let annex: &[u64] = if self.annex_out {
+            &work_mut!(self).freed
+        } else {
+            &[]
+        };
         let meta = MetaPage {
             pgno: slot,
             txnid: self.txnid,
@@ -4938,7 +5392,7 @@ impl<'env> RwTxn<'env> {
             main_db: self.main_db,
             free_db: self.free_db,
             free_annex: if self.annex_out {
-                Arc::from(&self.freed[..])
+                Arc::from(&work_mut!(self).freed[..])
             } else {
                 Arc::from(&[][..])
             },
@@ -4987,9 +5441,13 @@ impl<'env> RwTxn<'env> {
             }
         }
 
+        work_mut!(self).pgnos = pgnos;
+
         // ----- C6: publish the snapshot (TXN-18/19 order: swap the object,
         // then store the commit point SeqCst) — only after C5, so no reader
-        // can pin `N` before it is durable (TXN-64). -----
+        // can pin `N` before it is durable (TXN-64). The next write txn of
+        // this process starts from it (`WriterCarry`). -----
+        self.published = Some(Arc::clone(&snapshot));
         inner.publish_snapshot(snapshot);
         Ok(())
         // Drop of `self` releases the write mutex — the tail of C6.
@@ -5010,14 +5468,59 @@ impl Drop for RwTxn<'_> {
         //   * On abort/failure the frames are unwritten garbage; recycled
         //     contents never matter because every reuse (`insert_copy` /
         //     `insert_tree_frame`) fully overwrites or zero-fills the frame.
-        // The frames ride back on the writer guard, which stores them in the
-        // slot under the release lock it takes anyway when this txn's fields
-        // drop right after this method.
-        let frames = self.dirty.reclaimable_frames(crate::dirty::SPARE_CAP);
-        self._guard.give_back_frames(frames);
+        // The frames ride back with the txn's other containers in its
+        // `WriterCarry` (issue #8) on the writer guard, which stores it in
+        // the slot under the release lock it takes anyway when this txn's
+        // fields drop right after this method.
+        let dirty = self.dirty.take_carry();
         // ADR-0024: an end without a commit (abort, failed commit) frees what
         // this txn opened; after a commit there is nothing left to end.
         self.end_handles(false);
+        let Some(mut work) = self.work.take() else {
+            return;
+        };
+        work.dirty = Some(dirty);
+        work.handles = self.handles.recycle();
+        work.reclaimed.clear();
+        if crate::dirty::index_oversized(work.reclaimed.capacity()) {
+            work.reclaimed.shrink_to(crate::dirty::CARRY_INDEX_CAP);
+        }
+        recycle_vec(&mut work.freed, CARRY_VEC_CAP);
+        recycle_vec(&mut work.loose, CARRY_VEC_CAP);
+        recycle_vec(&mut work.merged, CARRY_VEC_CAP);
+        recycle_vec(&mut work.pgnos, CARRY_VEC_CAP);
+        recycle_vec(&mut work.catalog, CARRY_VEC_CAP);
+        recycle_vec(&mut work.path_buf, CARRY_VEC_CAP);
+        // Byte buffer: up to the largest page (64 KiB), its usual content.
+        recycle_vec(&mut work.cell_scratch, 64 * 1024);
+        recycle_vec(&mut work.fingers, CARRY_VEC_CAP);
+        // Names looked up through a checked handle stay with their
+        // generation for the next txn; the slots stay, empty. Checked
+        // through a reference: `Option::take` would copy every slot's whole
+        // `NamedTree` out, empty or not.
+        let names = &mut work.names;
+        for (dbi, slot) in self.open.slots.iter_mut().enumerate() {
+            let Some(t) = slot else { continue };
+            if let Some(g) = t.generation {
+                if names.len() <= dbi {
+                    names.resize_with(dbi + 1, || None);
+                }
+                names[dbi] = Some((g, std::mem::take(&mut t.name)));
+            }
+            *slot = None;
+        }
+        // Both lists are as long as the highest dbi a txn touched: bounded
+        // like the others. A name past the cap is looked up again
+        // (`named_name`), which changes no result.
+        work.names.truncate(CARRY_VEC_CAP);
+        work.names.shrink_to(CARRY_VEC_CAP);
+        self.open.slots.truncate(CARRY_VEC_CAP);
+        self.open.slots.shrink_to(CARRY_VEC_CAP);
+        work.open = std::mem::take(&mut self.open.slots);
+        // The snapshot published at C6, else the unchanged base: either is
+        // the latest this process knows of.
+        work.snapshot = self.published.take().or_else(|| self.base.take());
+        self._guard.give_back_carry(work);
     }
 }
 
@@ -5283,15 +5786,16 @@ enum Step<'k> {
 ///
 /// **Stack persistence:** between mutations the cursor persists its
 /// root-to-leaf path as a parked [`SavedCursor`], so an advance is an O(1)
-/// amortized stack step (LMDB's `mc_pg[]`/`mc_ki[]` walk), not a fresh
-/// O(log n) descent; entries are yielded as **borrows** of the txn's frames
-/// (lending style — the borrow dies at the next call, which is what makes the
-/// in-place mutations safe at compile time). A `del_current`, and a put of the
-/// key under the cursor that stays inside its leaf, mutate at the parked path
-/// and keep it, repaired in place (SPEC 03 §5.4a / §5.4b, LMDB's in-place
-/// cursor fix-up). Any other mutation drops the parked path and records the
-/// key (`CurPos`); the next advance re-seeks once.
-/// The exclusivity argument is what makes `SavedCursor::resume`'s
+/// amortized stack step (LMDB's `mc_pg[]`/`mc_ki[]` walk) on that stack in
+/// place, not a fresh O(log n) descent; entries are yielded as **borrows** of
+/// the txn's frames (lending style — the borrow dies at the next call, which
+/// is what makes the in-place mutations safe at compile time). A
+/// `del_current`, and a put of the key under the cursor, mutate at the parked
+/// path and keep it, repaired in place — across a split for the put (SPEC 03
+/// §5.4a / §5.4b, LMDB's in-place cursor fix-up). Any other mutation drops
+/// the parked path and records the key (`CurPos`); the next advance re-seeks
+/// once.
+/// The exclusivity argument is what makes `Cursor::resume_in`'s
 /// same-tree-state contract hold: no mutation can happen while a parked stack
 /// exists except through this cursor, and each of its mutating methods either
 /// repairs the stack to the post-mutation tree or clears it.
@@ -5308,8 +5812,9 @@ pub struct RwCursor<'t, 'env> {
     ///
     /// While set, the cursor is **not** on a live entry: `current_key` reports
     /// `None`, so a second `del_current` or a `put_current` is a no-op.
-    /// Only `next` may use the path (it
-    /// settles instead of stepping); every other op re-derives from `pos`.
+    /// Only `next` (which settles instead of stepping) and `prev` (which
+    /// steps back to the predecessor) may use the path; every other op
+    /// re-derives from `pos`.
     on_vacated_slot: bool,
     /// Deletes whose *structural* rebalance kept a repaired path instead of
     /// discarding it (SPEC 03 §5.4a repair table) — a test signal that the
@@ -5319,81 +5824,101 @@ pub struct RwCursor<'t, 'env> {
 }
 
 impl RwCursor<'_, '_> {
-    /// Run one physical step: resume the parked path (or re-derive the
-    /// position from [`CurPos`] with one seek), park the new path, and
-    /// re-materialize the yielded entry as borrows of the txn's frames.
+    /// Run one physical step: move the parked path in place (or re-derive
+    /// the position from [`CurPos`] with one seek into an empty parked path)
+    /// and yield the entry it lands on as borrows of the txn's pages — the
+    /// same page views the step read, as LMDB's `mdb_cursor_next` reads the
+    /// node its stack points at.
     fn drive(&mut self, op: Step<'_>) -> Result<Option<(&[u8], &[u8])>> {
-        // A post-delete parked path names the vacated slot, which only `next`
-        // knows how to read (it settles there rather than stepping). Every
-        // other op re-derives from `pos` (SPEC 03 §5.4a: discarding is
-        // always a correct repair).
+        // In-leaf step (LMDB's `mdb_cursor_next`/`mdb_cursor_prev`, which
+        // move `mc_ki` in the page the cursor holds; right after a `C_DEL`
+        // delete `next` returns the node at `mc_ki` as is): read the slot
+        // straight from the parked path. Leaving the leaf takes the general
+        // path below.
+        if let Some((pgno, ki)) = self.saved.as_ref().and_then(SavedCursor::entry_pos) {
+            let slot = match op {
+                Step::Next if self.on_vacated_slot => Some(ki),
+                Step::Next => Some(ki + 1),
+                Step::Prev => ki.checked_sub(1),
+                _ => None,
+            };
+            if let Some(slot) = slot {
+                let tree = self.db.checked_tree(&*self.txn)?;
+                if let Some(kv) = tree.entry_in_leaf(pgno, slot).map_err(map_page_err)? {
+                    if let Some(s) = self.saved.as_mut() {
+                        s.set_leaf_slot(slot);
+                    }
+                    self.on_vacated_slot = false;
+                    return Ok(Some(kv));
+                }
+            }
+        }
+        // A post-delete parked path names the vacated slot, which now holds
+        // the deleted entry's successor: `next` settles there rather than
+        // stepping, and `prev` steps back from it to the predecessor (LMDB's
+        // `mdb_cursor_prev` after `C_DEL`). Every other op re-derives from
+        // `pos` (SPEC 03 §5.4a: discarding is always a correct repair).
         let settle = self.on_vacated_slot && matches!(op, Step::Next);
-        if self.on_vacated_slot && !settle {
+        if self.on_vacated_slot && !matches!(op, Step::Next | Step::Prev) {
             self.saved = None;
         }
         self.on_vacated_slot = false;
-        // Phase 1 — position under a scoped shared borrow of the txn; keep
-        // only plain data (the parked stack and the hit's (pgno, ki)).
-        let hit: Option<(u64, usize)> = {
-            let tree = self.db.checked_tree(&*self.txn)?;
-            let (mut c, resumed) = match self.saved.take() {
-                Some(s) => (BCursor::resume(tree, s), true),
-                None => (tree.cursor(), false),
-            };
-            let r = match op {
-                Step::Next => {
-                    if settle {
-                        c.settle()
-                    } else if resumed {
-                        c.next()
-                    } else {
-                        match &self.pos {
-                            // A fresh cursor's `next` is `first` (SPEC 03 §4),
-                            // which `BCursor::next` already implements.
-                            CurPos::Start => c.next(),
-                            CurPos::At(k) => c.get_greater_than(k),
-                            CurPos::AfterDelete(k) => c.set_range(k),
-                        }
+        let tree = self.db.checked_tree(&*self.txn)?;
+        let resumed = self.saved.is_some();
+        // The step borrows the parked stack, so it moves where it is parked:
+        // no copy of the whole stack in or out (the entry borrows the txn,
+        // not the stack, and outlives the cursor).
+        let saved = self.saved.get_or_insert_with(SavedCursor::empty);
+        let mut c = BCursor::resume_in(tree, saved);
+        let r = match op {
+            Step::Next => {
+                if settle {
+                    c.settle()
+                } else if resumed {
+                    c.next()
+                } else {
+                    match &self.pos {
+                        // A fresh cursor's `next` is `first` (SPEC 03 §4),
+                        // which `BCursor::next` already implements.
+                        CurPos::Start => c.next(),
+                        CurPos::At(k) => c.get_greater_than(k),
+                        CurPos::AfterDelete(k) => c.set_range(k),
                     }
                 }
-                Step::Prev => {
-                    if resumed {
-                        c.prev()
-                    } else {
-                        match &self.pos {
-                            // A fresh cursor's `prev` is `last` (SPEC 03 §4).
-                            CurPos::Start => c.prev(),
-                            CurPos::At(k) => c.get_lower_than(k),
-                            // The deleted key's successor is "current", so
-                            // `prev` is the entry strictly before the deleted
-                            // key (LMDB cursor-delete semantics).
-                            CurPos::AfterDelete(k) => c.get_lower_than(k),
-                        }
+            }
+            Step::Prev => {
+                if resumed {
+                    c.prev()
+                } else {
+                    match &self.pos {
+                        // A fresh cursor's `prev` is `last` (SPEC 03 §4).
+                        CurPos::Start => c.prev(),
+                        CurPos::At(k) => c.get_lower_than(k),
+                        // The deleted key's successor is "current", so
+                        // `prev` is the entry strictly before the deleted
+                        // key (LMDB cursor-delete semantics).
+                        CurPos::AfterDelete(k) => c.get_lower_than(k),
                     }
                 }
-                Step::First => c.first(),
-                Step::Last => c.last(),
-                Step::Ge(k) => c.get_greater_than_or_equal_to(k),
-                Step::Gt(k) => c.get_greater_than(k),
-                Step::Le(k) => c.get_lower_than_or_equal_to(k),
-                Step::Lt(k) => c.get_lower_than(k),
-            };
-            let hit = match r.map_err(map_page_err)? {
-                Some(_) => c.entry_pos(),
-                None => None,
-            };
-            self.saved = Some(c.park());
-            hit
+            }
+            Step::First => c.first(),
+            Step::Last => c.last(),
+            Step::Ge(k) => c.get_greater_than_or_equal_to(k),
+            Step::Gt(k) => c.get_greater_than(k),
+            Step::Le(k) => c.get_lower_than_or_equal_to(k),
+            Step::Lt(k) => c.get_lower_than(k),
         };
-        // Phase 2 — re-materialize the entry from plain data under a fresh
-        // shared borrow (leaf view comes from the txn's validated-pages memo,
-        // so this is a hash hit + O(1) header check, not a re-validation).
-        match hit {
-            None => Ok(None),
-            Some((pgno, ki)) => {
-                let tree = self.db.checked_tree(&*self.txn)?;
-                let (k, v) = tree.entry_at(pgno, ki).map_err(map_page_err)?;
-                Ok(Some((k, v)))
+        let flags = c.park_in();
+        match r {
+            Ok(entry) => {
+                saved.set_flags(flags);
+                Ok(entry)
+            }
+            Err(e) => {
+                // A corrupt page: drop the half-moved path (any later op
+                // re-derives from `pos`, as after a discard).
+                self.saved = None;
+                Err(map_page_err(e))
             }
         }
     }
@@ -5514,9 +6039,9 @@ impl RwCursor<'_, '_> {
     /// Rewrite the value of the current entry, keeping the key (`MDB_CURRENT`,
     /// SPEC 03 §7): same-size rewrites happen in place; a different size
     /// deletes and re-inserts (which may split). Returns `false` if the cursor
-    /// is not positioned on an entry. Writes at the parked path and keeps it
-    /// unless the rewrite splits the leaf (SPEC 03 §5.4b); after a split the
-    /// next advance re-seeks once.
+    /// is not positioned on an entry. Writes at the parked path and keeps it,
+    /// following the entry to its half when the rewrite splits the leaf
+    /// (SPEC 03 §5.4b), so the next advance needs no seek.
     ///
     /// # Errors
     ///
@@ -5540,10 +6065,10 @@ impl RwCursor<'_, '_> {
 
     /// The cursor-position put (SPEC 03 §5.4b): when the cursor has a parked
     /// path on a live entry whose key is byte-equal to `key`, overwrite that
-    /// entry at the path — no descent — and keep the path if the overwrite
-    /// stayed inside its leaf, so the next step resumes without a seek
-    /// either. Returns `false`, having changed nothing, when the fast path
-    /// does not apply; the caller then runs the keyed put.
+    /// entry at the path — no descent — and keep the path, repaired across a
+    /// split, so the next step resumes without a seek either. Returns
+    /// `false`, having changed nothing, when the fast path does not apply;
+    /// the caller then runs the keyed put.
     ///
     /// Sequential-writes trees take the keyed put: their rightmost-leaf
     /// finger bookkeeping lives on that path.
@@ -5551,33 +6076,39 @@ impl RwCursor<'_, '_> {
         if self.on_vacated_slot || self.txn.seq_writes_on(tree) {
             return Ok(false);
         }
-        let Some((pgno, ki)) = self.saved.as_ref().and_then(SavedCursor::entry_pos) else {
+        let Some(saved) = self.saved.as_mut() else {
             return Ok(false);
         };
-        {
-            let t = self.db.checked_tree(&*self.txn)?;
-            let (k, _) = t.entry_at(pgno, ki).map_err(map_page_err)?;
-            if k != key {
-                return Ok(false);
-            }
+        if saved.entry_pos().is_none() {
+            return Ok(false);
         }
         // The path stays parked during the put: an error that rejects the put
         // before any mutation (an oversized value, a poisoned txn) leaves the
         // cursor exactly where it was, as the keyed put's error does.
-        let saved = self.saved.as_mut().expect("checked above");
-        if self.txn.put_at_path(tree, saved.frames_mut(), key, value)? {
-            #[cfg(debug_assertions)]
-            {
-                self.repaired_keeps += 1;
-                self.txn
-                    .shadow_check_put_path(tree, saved.frames_mut(), key);
+        match self.txn.put_at_path(tree, saved.frames_mut(), key, value)? {
+            PathPut::Elsewhere => return Ok(false),
+            PathPut::Kept => {}
+            // A split kept the path on the entry; only a root grow adds a
+            // frame.
+            PathPut::Grown(root) => {
+                if saved.push_root(root).is_err() {
+                    self.saved = None;
+                }
             }
-        } else {
-            self.saved = None;
         }
-        // `pos` is the fallback for a discarded path (a split) and for every
-        // op that re-derives its position by key. A cursor rewriting entry
-        // after entry reuses the buffer instead of allocating per put.
+        #[cfg(debug_assertions)]
+        if let Some(saved) = self.saved.as_mut() {
+            self.repaired_keeps += 1;
+            self.txn
+                .shadow_check_put_path(tree, saved.frames_mut(), key);
+        }
+        // `pos` is read only while no path is parked (the struct docs), and
+        // the path is kept unless it could not take the new root frame. A
+        // kept path leaves `pos` alone: like a step, a put through the cursor
+        // then copies no key.
+        if self.saved.is_some() {
+            return Ok(true);
+        }
         match &mut self.pos {
             CurPos::At(k) | CurPos::AfterDelete(k) => {
                 k.clear();
@@ -5623,13 +6154,49 @@ impl RwCursor<'_, '_> {
     ///
     /// As [`Database::delete`].
     pub fn del_current(&mut self) -> Result<bool> {
-        let Some(key) = self.current_key()? else {
+        // The deleted key is kept for `pos`: it is what `prev`, and any op
+        // after a discarded path, re-derives from. It is copied into the
+        // buffer the previous `pos` key owned, so a drain allocates once,
+        // not once per entry.
+        // Same "on an entry" rule as `current_key`.
+        if self.on_vacated_slot {
             return Ok(false);
+        }
+        let key = match self.saved.as_ref() {
+            Some(s) => {
+                let Some((pgno, ki)) = s.entry_pos() else {
+                    return Ok(false);
+                };
+                let tree = self.db.checked_tree(&*self.txn)?;
+                let (k, _) = tree.entry_at(pgno, ki).map_err(map_page_err)?;
+                // The parked path is authoritative, so `pos` holds nothing
+                // the cursor needs until it is set below.
+                let mut buf = match std::mem::replace(&mut self.pos, CurPos::Start) {
+                    CurPos::At(b) | CurPos::AfterDelete(b) => b,
+                    CurPos::Start => Vec::new(),
+                };
+                buf.clear();
+                buf.extend_from_slice(k);
+                buf
+            }
+            None => match std::mem::replace(&mut self.pos, CurPos::Start) {
+                CurPos::At(k) => k,
+                other => {
+                    self.pos = other;
+                    return Ok(false);
+                }
+            },
         };
-        let tree = self.txn.ensure_open(&self.db)?;
-        // `pos` is set on every path: it is what `prev`, and any op after a
-        // discarded path, re-derives from.
-        let Some(mut saved) = self.saved.take() else {
+        let tree = match self.txn.ensure_open(&self.db) {
+            Ok(tree) => tree,
+            Err(e) => {
+                // Nothing was deleted: the cursor stays on the entry.
+                self.pos = CurPos::At(key);
+                return Err(e);
+            }
+        };
+        // `pos` is set on every path below.
+        let Some(saved) = self.saved.as_mut() else {
             // No parked path (fresh cursor, or the position came from `pos`
             // after an earlier mutation): descend for the key.
             let existed = self.txn.delete_tree(tree, &key)?;
@@ -5637,32 +6204,42 @@ impl RwCursor<'_, '_> {
             return Ok(existed);
         };
         // The parked path IS the live root-to-leaf path to this entry, so the
-        // delete needs no descent of its own (SPEC 03 §5.4a).
+        // delete needs no descent of its own (SPEC 03 §5.4a), and runs on the
+        // parked frames in place (LMDB deletes at `mc_pg`/`mc_ki`).
         debug_assert!(
             saved.entry_pos().is_some(),
-            "current_key returned Some, so the parked cursor is on an entry"
+            "the key was read at the parked entry, so the cursor is on one"
         );
         // The parked leaf slot needs no adjustment: it already names the cell
         // being removed, and removing it shifts the successor down into it.
-        let fate = self.txn.delete_at_path(tree, saved.frames_mut())?;
+        let fate = match self.txn.delete_at_path(tree, saved.frames_mut()) {
+            Ok(fate) => fate,
+            Err(e) => {
+                // The txn is poisoned (TXN-59); nothing may resume this path.
+                self.saved = None;
+                self.pos = CurPos::AfterDelete(key);
+                return Err(e);
+            }
+        };
         match fate {
             PathFate::Invalidated => {
                 // The rebalance moved entries in a way the repair table does
-                // not follow (left pairing, an ancestor split, an emptied
-                // tree): the parked path may name the wrong page or depth.
-                // Discard it — the next op re-seeks from `pos`, which is
-                // always a correct repair (§5.4a).
+                // not follow (an ancestor split, an emptied tree): the parked
+                // path may name the wrong page or depth. Discard it — the
+                // next op re-seeks from `pos`, which is always a correct
+                // repair (§5.4a).
                 self.saved = None;
             }
             fate => {
                 // The path still descends to the vacated slot: either nothing
                 // structural happened (`Unchanged` — only a cell left this
-                // leaf), or the leftmost-pairing repair held every frame
-                // steady (`Kept`), possibly minus a popped root frame
-                // (`KeptShrunk`). `ki` names the successor (the cells above it
-                // shifted down, and a borrow/merge appended the right
-                // sibling's cells at or after it), or is one past the last
-                // live cell if the tail was deleted — both of which
+                // leaf), or the borrow/merge repair moved every frame onto
+                // the vacated slot (`Kept`), possibly minus a popped root
+                // frame (`KeptShrunk`). `ki` names the successor (the cells
+                // above it shifted down; a right-sibling borrow/merge appended
+                // cells at or after it; a left-sibling one put cells before
+                // it and moved `ki` past them), or is one past the last live
+                // cell if the tail was deleted — both of which
                 // `Cursor::settle` reads, and from which a plain `prev` still
                 // yields the predecessor.
                 if fate == PathFate::KeptShrunk {
@@ -5676,7 +6253,6 @@ impl RwCursor<'_, '_> {
                     self.txn
                         .shadow_check_kept_path(tree, saved.frames_mut(), &key);
                 }
-                self.saved = Some(saved);
                 self.on_vacated_slot = true;
             }
         }
@@ -5693,6 +6269,47 @@ mod tests {
 
     const PS: u32 = 4096;
     const MAP: u64 = 1 << 20;
+
+    #[test]
+    fn has_duplicate_matches_a_sort_on_both_arms() {
+        assert!(!has_duplicate(&[]));
+        assert!(!has_duplicate(&[7]));
+        // Dense span: the bitmap arm (words across a 64-bit boundary).
+        assert!(!has_duplicate(&[130, 3, 64, 65, 2]));
+        assert!(has_duplicate(&[130, 3, 64, 65, 130]));
+        assert!(has_duplicate(&[5, 5]));
+        // Sparse span: the sort arm.
+        assert!(!has_duplicate(&[2, 1 << 40, 9]));
+        assert!(has_duplicate(&[1 << 40, 2, 1 << 40]));
+        assert!(!has_duplicate(&[0, u64::MAX]));
+        assert!(has_duplicate(&[u64::MAX, 0, u64::MAX]));
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            failure_persistence: None,
+            cases: if cfg!(miri) { 16 } else { 256 },
+            ..Default::default()
+        })]
+
+        /// `has_duplicate` agrees with sort-and-dedup on dense and sparse
+        /// pgno sets.
+        #[test]
+        fn has_duplicate_matches_model(
+            pages in proptest::collection::vec(0u64..2_000, 0..200),
+            sparse in proptest::prelude::any::<bool>(),
+        ) {
+            let pages: Vec<u64> = if sparse {
+                pages.iter().map(|p| p << 30).collect()
+            } else {
+                pages
+            };
+            let mut sorted = pages.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            proptest::prop_assert_eq!(has_duplicate(&pages), sorted.len() != pages.len());
+        }
+    }
 
     #[test]
     fn find_run_picks_deterministically() {
@@ -5716,11 +6333,15 @@ mod tests {
         let mut d = Drain::new(vec![5, 9, 10, 11]);
         d.take_run(5, 1);
         assert_eq!(d.live(), &[9, 10, 11]);
-        assert_eq!((d.head, d.ids.len()), (1, 4), "front pop must not memmove");
+        assert_eq!(
+            (d.head, d.ids.as_slice().len()),
+            (1, 4),
+            "front pop must not memmove"
+        );
         // A front *run* draw also advances head, by n.
         d.take_run(9, 2);
         assert_eq!(d.live(), &[11]);
-        assert_eq!((d.head, d.ids.len()), (3, 4));
+        assert_eq!((d.head, d.ids.as_slice().len()), (3, 4));
         assert_eq!(d.len(), 1);
     }
 
@@ -5757,7 +6378,27 @@ mod tests {
         let mut c = Drain::new(vec![7, 9, 11, 40]);
         c.take_span(7, 3);
         assert_eq!(c.live(), &[40]);
-        assert_eq!((c.head, c.ids.len()), (3, 4), "front span must not memmove");
+        assert_eq!(
+            (c.head, c.ids.as_slice().len()),
+            (3, 4),
+            "front span must not memmove"
+        );
+    }
+
+    /// The base annex is drained without a copy until a mid-slice removal
+    /// needs one; the shared ids themselves never change.
+    #[test]
+    fn drain_shared_copies_only_on_a_mid_slice_removal() {
+        let base: Arc<[u64]> = Arc::from(&[2u64, 3, 6, 7, 8, 12][..]);
+        let mut d = Drain::shared(Arc::clone(&base));
+        d.take_run(2, 2);
+        assert!(matches!(d.ids, DrainIds::Shared(_)), "front draw shares");
+        assert_eq!(d.live(), &[6, 7, 8, 12]);
+        d.take_run(7, 2);
+        assert!(matches!(d.ids, DrainIds::Owned(_)), "mid-slice draw copies");
+        assert_eq!(d.live(), &[6, 12]);
+        assert_eq!(d.len(), 2);
+        assert_eq!(&*base, &[2, 3, 6, 7, 8, 12]);
     }
 
     /// Fully drained: the live view is empty however the ids were consumed —
@@ -6508,10 +7149,10 @@ mod tests {
         }
     }
 
-    /// A backward drain (`prev/del_current`) deletes at `pki != 0`, the
-    /// pairing this step does NOT repair: every structural delete falls back
-    /// to the discard + re-seek path. It must still visit every key exactly
-    /// once, in reverse order.
+    /// A backward drain (`prev/del_current`) deletes at `pki != 0`, so its
+    /// rebalances pair with the LEFT sibling and `prev` resumes from the
+    /// repaired path. It must still visit every key exactly once, in reverse
+    /// order.
     #[test]
     fn cursor_reverse_drain_matches_model() {
         let env = mem_env(PS, 8 << 20);
@@ -6618,6 +7259,69 @@ mod tests {
             "kept-path repair never fired: {} structural keeps",
             cur.repaired_keeps
         );
+    }
+
+    /// A drain that starts mid-tree deletes from leaves that are not their
+    /// parent's child 0, so each rebalance borrows from or merges with the
+    /// LEFT sibling (SPEC 03 §10). The cursor must keep its repaired path
+    /// across those (the debug shadow check re-derives every kept one), and
+    /// must still yield exactly the span, in order. A backward drain over the
+    /// same span then runs the same repairs under `prev`.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn cursor_mid_drain_keeps_left_pairing_paths() {
+        for backward in [false, true] {
+            let env = mem_env(PS, 8 << 20);
+            let db = env.main_database();
+            let mut txn = env.write_txn().unwrap();
+            let n = miri_scaled(150, 80);
+            let mut model = std::collections::BTreeMap::new();
+            for i in 0..n {
+                let (k, v) = wide_kv(i);
+                db.put(&mut txn, &k, &v).unwrap();
+                model.insert(k, v);
+            }
+            assert!(txn.main_record().depth >= 3);
+            let (lo, hi) = (wide_kv(n / 4).0, wide_kv(3 * n / 4).0);
+            let mut seen = Vec::new();
+            let keeps = {
+                let mut cur = db.rw_cursor(&mut txn);
+                let mut kv = if backward {
+                    cur.seek_lt(&hi).unwrap()
+                } else {
+                    cur.seek_ge(&lo).unwrap()
+                };
+                while let Some((k, _v)) = kv {
+                    if k < lo.as_slice() || k >= hi.as_slice() {
+                        break;
+                    }
+                    seen.push(k.to_vec());
+                    assert!(cur.del_current().unwrap());
+                    kv = if backward {
+                        cur.move_prev().unwrap()
+                    } else {
+                        cur.move_next().unwrap()
+                    };
+                }
+                cur.repaired_keeps
+            };
+            let mut expected: Vec<Vec<u8>> = model
+                .range(lo.clone()..hi.clone())
+                .map(|(k, _)| k.clone())
+                .collect();
+            if backward {
+                expected.reverse();
+            }
+            assert_eq!(seen, expected, "backward = {backward}");
+            model.retain(|k, _| k < &lo || k >= &hi);
+            assert_eq!(dump(&txn), model.into_iter().collect::<Vec<_>>());
+            // ~6 wide entries per 4 K leaf: a 75-entry span rebalances dozens
+            // of times, nearly all of them with the left sibling.
+            assert!(
+                keeps >= 10,
+                "left-pairing repair never fired: {keeps} keeps"
+            );
+        }
     }
 
     proptest::proptest! {
@@ -7411,7 +8115,10 @@ mod tests {
             mm.remove(&k);
             assert!(i > 0, "never merged a rightmost leaf");
         }
-        assert!(!txn.loose.is_empty(), "merged leaf pgno must be loose");
+        assert!(
+            !work!(txn).loose.is_empty(),
+            "merged leaf pgno must be loose"
+        );
         // The named DB's growth pops the loose list first (GC-8): the freed
         // main-tree page is re-served as a page of the named tree.
         for j in 0..n {
