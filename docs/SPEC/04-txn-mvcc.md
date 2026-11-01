@@ -20,7 +20,7 @@ commit pipeline defined here must satisfy are in [SPEC 06](06-recovery.md).
 
 Clean-room note: the LMDB fork (`mdb.master.nested-rtxns`, SPEC 00 pin) was read
 to understand the *algorithms* — reader-slot claiming, `mdb_find_oldest`, the
-nested-read patch (ITS#10395), and the commit sequence (AGENTS.md rule 4). The
+nested-read patch (ITS#10395), and the commit sequence (CONTRIBUTING.md rule 4). The
 protocols below are ZeroDB's own design; where a rule mirrors an LMDB idea it is
 called out, but no C is transliterated. Binding decisions (not relitigated):
 several processes may open one environment through a shared lock file, on by
@@ -297,7 +297,7 @@ claim/release a pinned snapshot without blocking the writer.
 
 The reader now owns a `RDR_CLAIMED` slot but has not yet pinned a real snapshot.
 The pin must be correct against a *concurrent committing writer* on a weakly
-ordered machine (ARM; AGENTS.md). The hazard is a classic **store→load
+ordered machine (ARM; CONTRIBUTING.md). The hazard is a classic **store→load
 reordering**:
 
 ```
@@ -976,7 +976,7 @@ spilling bullet there.)
     nested-reader reads of dirty pages (§5), and abort-by-drop all operate on the
     heap store exactly as the default mode — so `WRITE_MAP` needs **no map
     `unsafe` in `zerodb-core`** (the writable-mmap `unsafe` is confined to
-    `zerodb-io`, per the AGENTS.md unsafe policy) and the M1.4 miri coverage
+    `zerodb-io`, per the CONTRIBUTING.md unsafe policy) and the M1.4 miri coverage
     (§6.6 / TXN-49) covers writemap's during-txn path for free.
   - The writable map covers the full `map_size` and the file is `set_len` to
     `map_size` at open (matching the fork's `ftruncate`-to-mapsize under
@@ -1056,7 +1056,7 @@ spilling bullet there.)
     out to a heap scratch first — the map region cannot be both source and
     destination. One page copy per general split, as LMDB's split makes under
     `MDB_WRITEMAP`.
-  - **unsafe containment (AGENTS.md policy; hardened 2026-10-02, ADR-0021
+  - **unsafe containment (CONTRIBUTING.md policy; hardened 2026-10-02, ADR-0021
     B1).** The broker is an **`unsafe fn`** end to end
     (`MmapWritable::slice_mut` → `Backing::map_dirty_page`): no safe
     function mints `&mut [u8]` from `&self`. The sole sanctioned caller is
@@ -1413,7 +1413,7 @@ every hook; this section defines the steps and their ordering. Both write modes
 | single writer | TXN-6..9 | SPEC 01 Table 1 RDONLY |
 | read snapshot pin | TXN-10..13 | SPEC 05 GC-18 |
 | reader table | TXN-14..25 | M1.8; loom suite L1–L5 (`zerodb-core/src/readers.rs`, `just loom`); stress gate (`zerodb/tests/reader_stress.rs`, `just stress`) |
-| memory ordering | TXN-15/17/19/20 | AGENTS.md (ARM), SPEC 06 |
+| memory ordering | TXN-15/17/19/20 | CONTRIBUTING.md (ARM), SPEC 06 |
 | nested read txn | TXN-26..36 | SPEC 00 row 16, SPEC 01 §S9; loom L6 (`zerodb-core/src/nested.rs`); fan-out gate (`zerodb/tests/nested_fanout.rs`); differential (`zerodb-oracle/tests/nested_read_differential.rs`) |
 | value-borrow contract | TXN-37..49 | SPEC 03 §3/§5/§7, SPEC 01 §S3/§S7 |
 | env clone/close/registry | TXN-50..55 | SPEC 00 rows 23–26 |

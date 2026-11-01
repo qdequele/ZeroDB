@@ -33,7 +33,7 @@ This ADR chooses *how* ZeroDB is wired behind that surface; the choice constrain
 lifetimes, error types, and `Env` semantics for all of Phase 1 and is
 implemented by milestone 1.13.
 
-### What the decision must enable the original project plan / §1.14)
+### What the decision must enable (milestones 1.13 and 1.14)
 
 - **1.13** builds the adapter over the *full SPEC 00 surface*, maps the error
   taxonomy 1:1, replicates the env registry + `EnvClosingEvent`, and patches

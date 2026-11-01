@@ -42,7 +42,7 @@ Forces:
   `crates/zerodb-core/src/page/mod.rs`) and a mismatch is refused at open
   (SPEC 02 §3, SPEC 06). D-002 sanctions no LMDB file compatibility; migration
   is logical (`zerodb-tools dump`/`load`, `migrate-from-lmdb`).
-- **Phase 1's exit criteria are not all met** the original project plan: 24 h fuzz soak,
+- **Phase 1's exit criteria are not all met** (original project plan: 24 h fuzz soak,
   Graviton 4K/64K bench, CI). The first release must say so rather than imply
   production readiness.
 

@@ -28,7 +28,7 @@
 
 ## Context
 
-**the original project plan acceptance, restated.** A crash-injection harness with **two
+**Acceptance criteria from the original plan, restated.** A crash-injection harness with **two
 mechanisms** — SIGKILL alone cannot tear a write (the OS page cache survives
 process death; only power loss tears/reorders un-fsynced sectors):
 (1) process kill — workload in a child process, SIGKILL at random points and

@@ -12,7 +12,7 @@ sharing a file. Algorithms that consume these layouts live in
 [ADR-0002](../adr/0002-on-disk-format.md).
 
 Reading note: the LMDB fork sources were read to understand *what information a
-page must carry and why* (clean-room, AGENTS.md rule 4). The layouts below are
+page must carry and why* (clean-room, CONTRIBUTING.md rule 4). The layouts below are
 ZeroDB's own design; where a field mirrors an LMDB idea it is called out, but no
 LMDB struct is transliterated.
 
@@ -25,7 +25,7 @@ LMDB struct is transliterated.
   variant. (Consumer *keys* are frequently big-endian — SPEC 00 row 52 — but
   that is codec-level key content, opaque to the engine; it does not change how
   the engine stores its own integer fields.)
-- **No `#[repr(C)]` casting of possibly-unaligned data** (AGENTS.md unsafe
+- **No `#[repr(C)]` casting of possibly-unaligned data** (CONTRIBUTING.md unsafe
   policy). Every field is defined by an explicit byte **offset** and **width**
   and is read/written with `read_unaligned`-style accessors. The layouts below
   are chosen to keep the load-bearing integers **naturally aligned relative to
@@ -869,7 +869,7 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
   at offset 32).
 - Cell (node) contents are only **2-byte** aligned. `child_pgno` (u64) and
   `dsize` (u32) inside cells are read with `read_unaligned`. This is the primary
-  reason `#[repr(C)]` casting is forbidden here (AGENTS.md).
+  reason `#[repr(C)]` casting is forbidden here (CONTRIBUTING.md).
 - Phase 3.6 (hannoy) will add an *opt-in* value-alignment table type; the Phase
   1 B+tree makes **no** value-alignment promise beyond 2-byte cell alignment.
 
@@ -879,7 +879,7 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
 
 No consumer uses duplicates (SPEC 00 §B.1, D-004). A staged DUPSORT
 implementation (M2.8a) was built, reviewed and **parked on 2026-07-20**
-(the scope rule, AGENTS.md rule 6) — the engine-side work is not merged;
+(the scope rule, CONTRIBUTING.md rule 6) — the engine-side work is not merged;
 only the oracle observation pins landed (`zerodb-oracle/tests/dup_pin_semantics.rs`
 / `dup_pin_ffi.rs`, SPEC 03 §12.1). The format still reserves, but does not
 implement:

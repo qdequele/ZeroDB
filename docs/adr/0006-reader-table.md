@@ -87,7 +87,7 @@ Constraints from standing law: `zerodb-core` is `#![forbid(unsafe_code)]`
 reader table but M1.1 chose stricter, and every milestone since has preserved
 it). Dependency allowlist: memmap2, libc, thiserror, **crossbeam-utils**,
 rand, proptest, arbitrary, criterion — `loom` and `arc-swap` are **not** on
-it; the original project plan and the original project plan nonetheless *require* loom for the reader
+it; the original project plan nonetheless *require* loom for the reader
 table, so this ADR must sanction it (precedent: ADR-0001's `libfuzzer-sys`
 treatment — test-infrastructure-only scope, human-approved). All atomics need
 explicit `Ordering` + per-site justification, ARM weak-memory assumed.

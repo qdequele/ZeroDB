@@ -4,7 +4,7 @@ Status: **DONE** — 2026-07-15 (milestone 0.4). Algorithmic source of truth for
 the read path (M1.3), the write path (M1.4), and the check tool (M1.12). Formats
 are in [SPEC 02](02-pages.md); this document defines the operations over them.
 Pseudocode is illustrative, not code to transliterate; the LMDB fork was read to
-understand the *algorithms* (AGENTS.md rule 4), and the semantics below are
+understand the *algorithms* (CONTRIBUTING.md rule 4), and the semantics below are
 pinned to the oracle (SPEC 00/01), not to LMDB's C.
 
 > **Revised 2026-10-05** — brought up to date with the merged engine: cursor-free
@@ -110,7 +110,7 @@ at open is the natural fix and there is nowhere to put one: `DBRecord` is
 exactly 48 bytes with every offset assigned (SPEC 02 §3.1), and its only two
 unused *values* — `flags` (offset 42) and `leaf2_ksize` (offset 44) — are
 already reserved for DUPSORT/DUPFIXED in milestone 2.8 (parked 2026-07-20, §12). Widening the record or
-repurposing those fields is an on-disk **format** change, which AGENTS.md rule 5
+repurposing those fields is an on-disk **format** change, which CONTRIBUTING.md rule 5
 puts behind an ADR and human approval. **Deliberately not taken in 2.4**; the
 hazard is documented, filed as D-014, and left for a maintainer decision.
 

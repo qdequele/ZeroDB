@@ -6,7 +6,7 @@
 
 ## Context
 
-Ground rule 1 (AGENTS.md, the original project plan requires every LMDB behavior question to
+Ground rule 1 (now in CONTRIBUTING.md) requires every LMDB behavior question to
 be answered by a *differential test against the oracle*, never by guessing. The
 oracle is the **Meilisearch LMDB fork** — branch `mdb.master.nested-rtxns`,
 commit `cd767228d31285a73af44f7fb15267e95d1df86f` — as vendored by
@@ -84,12 +84,12 @@ the `fuzz/` crate (outside the workspace) additionally depends on `libfuzzer-sys
 the standard cargo-fuzz runtime the pre-existing justfile presupposes — covered by
 this ADR with the same oracle-only, test-infrastructure-only scope;
 that is a separate, human-approved decision. The oracle routes zerodb through its
-**native** API, never through `heed-zerodb` the original project plan; adapter-level parity
+**native** API, never through `heed-zerodb` (original project plan); adapter-level parity
 is re-verified at the 1.14 gate.
 
 ## Amendment (M1.12, 2026-07-17): `zerodb-tools` may link heed behind `migrate-lmdb`
 
-the original project plan sanctions the `migrate-from-lmdb` tool as "the one place linking C
+The original project plan sanctions the `migrate-from-lmdb` tool as "the one place linking C
 is fine" — it must open a **real** LMDB env read-only and stream it into a fresh
 zerodb env. That requires the same C library this ADR already blesses (heed
 =0.22.1 / lmdb-master-sys 0.2.6, the Meilisearch fork).

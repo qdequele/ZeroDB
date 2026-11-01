@@ -20,7 +20,7 @@ relies on is [SPEC 05](05-gc.md) §4. Durability-flag semantics come from
 
 Clean-room note: the fork's `mdb_env_open`/`mdb_env_pick_meta` (meta selection)
 and `mdb_env_write_meta`/`mdb_env_sync0` (sync routing) were read to understand
-the *algorithm* (AGENTS.md rule 4); the guarantees below are ZeroDB's own,
+the *algorithm* (CONTRIBUTING.md rule 4); the guarantees below are ZeroDB's own,
 strengthened by the **mandatory** meta CRC (torn-meta detection is Phase 1, not
 Phase 3 — M0.4). Normative rules are numbered **REC-n**.
 
@@ -469,7 +469,7 @@ obligations (REC-18).
   not sufficient; the ≥10k-cycle bar is the milestone gate.
 
 **M1.11 amendments (ADR-0008, Approved 2026-07-16 — implementation of this
-section; behavior clarifications per AGENTS.md rule 3):**
+section; behavior clarifications per CONTRIBUTING.md rule 3):**
 
 - **Cycle accounting (REC-21).** One *cycle* = one recovered-and-verified
   crash state: each materialized fault-plan image variant (mechanism 2) and

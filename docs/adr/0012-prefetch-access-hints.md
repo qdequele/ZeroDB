@@ -9,7 +9,7 @@
 Milestone 3.7 exposes memory-access hints (madvise-family) so consumers can tell
 the kernel which mmap pages they are about to touch. Unlike 3.4 (parked this same
 day because its stated milli consumer turned out to be legacy — see the original project plan and
-the engineering log, 2026-07-20), 3.7 has a **verified live consumer** whose hack we can read
+the engineering log, 2026-07-20, 3.7 has a **verified live consumer** whose hack we can read
 line-by-line.
 
 **The consumer, exactly.** hannoy `Reader::prefetch_graph`
@@ -43,7 +43,7 @@ also what keeps the change small (rule 7): a single value→pages→WillNeed cal
   (the explicit remit of Phase 2/3). A heed-API consumer like hannoy must be able
   to reach it without forking heed and must still compile against upstream heed.
   This is a public-API-shape decision → ADR-gated (rule 6).
-- *reads stay mmap* the original project plan/§3.7). Hints apply to the read mmap and are valid
+- *reads stay mmap* (original project plan). Hints apply to the read mmap and are valid
   in WRITE_MAP mode too (WillNeed only faults pages in; it never mutates).
 - *no new dependency.* `memmap2` (already on the allowlist) exposes safe
   `Mmap::advise_range(Advice, offset, len)` / `MmapMut::advise_range`. That
