@@ -250,6 +250,16 @@ pub(crate) enum Mapping {
 }
 
 impl Mapping {
+    /// Advise the kernel that reads are random (see [`Mmap::advise_random`]).
+    pub(crate) fn advise_random(&self) -> std::io::Result<()> {
+        match self {
+            Mapping::Read(m) => m.advise_random(),
+            Mapping::Write(m) => m.advise_random(),
+            #[cfg(test)]
+            Mapping::Heap(_) => Ok(()),
+        }
+    }
+
     /// The whole mapped region.
     pub(crate) fn bytes(&self) -> &[u8] {
         match self {

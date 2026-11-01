@@ -76,13 +76,14 @@ fn grow_regions(
     let wanted = map_size.max(current.saturating_mul(2));
     let mapping = match map_len(wanted).and_then(&map) {
         Ok(m) => m,
-        Err(e) if wanted > map_size && e.raw_os_error() == Some(libc::ENOMEM) => {
-            map(map_len(map_size)?)?
-        }
-        Err(e) if wanted > map_size && e.kind() == std::io::ErrorKind::InvalidInput => {
-            // `wanted` does not fit a `usize`, or `mmap` refused the length
-            // with `EINVAL` (which the standard library reports as
-            // `InvalidInput`); `map_size` may still fit.
+        // Out of address space (`ENOMEM`), or `wanted` does not fit a
+        // `usize`, or `mmap` refused the length with `EINVAL` (which the
+        // standard library reports as `InvalidInput`): `map_size` may fit.
+        Err(e)
+            if wanted > map_size
+                && (e.raw_os_error() == Some(libc::ENOMEM)
+                    || e.kind() == std::io::ErrorKind::InvalidInput) =>
+        {
             map(map_len(map_size)?)?
         }
         Err(e) => return Err(e),
@@ -91,19 +92,46 @@ fn grow_regions(
     Ok(())
 }
 
-/// A [`Backing`] over a memory-mapped env data file.
-///
-/// It reads through grow-only `MapRegions` holding read-only maps, and
-/// commits with `pwrite` and `fdatasync`. Field order is load-bearing for
-/// `Drop`: `regions` is declared before `file`, so every mapping is unmapped
-/// before the descriptor is closed (TXN-53).
-pub struct MmapBacking {
-    regions: MapRegions,
+/// The data file a backing maps, with what both backings do with it alike.
+struct DataFile {
     file: File,
     /// The path `file` was opened at, for [`Backing::data_path`].
     path: PathBuf,
     /// `MDB_NORDAHEAD`: every new mapping is advised `MADV_RANDOM`.
     random_access: bool,
+}
+
+impl DataFile {
+    /// Map the first `len` bytes of the file, writable or read-only.
+    fn map(&self, len: usize, writable: bool) -> std::io::Result<Mapping> {
+        let mapping = if writable {
+            Mapping::Write(MmapWritable::map(&self.file, len)?)
+        } else {
+            Mapping::Read(Mmap::map(&self.file, len)?)
+        };
+        if self.random_access {
+            mapping.advise_random()?;
+        }
+        Ok(mapping)
+    }
+
+    fn read_meta_copy(&self, slot: u64, psize: u32, buf: &mut [u8]) -> std::io::Result<()> {
+        // A kernel copy rather than a map slice (ADR-0023 §4): another process
+        // may be rewriting this slot, and borrowing bytes under a concurrent
+        // write would be a data race. A torn copy fails its CRC.
+        file::read_page_into(&self.file, slot, psize, &mut buf[..psize as usize])
+    }
+}
+
+/// A [`Backing`] over a memory-mapped env data file.
+///
+/// It reads through grow-only `MapRegions` holding read-only maps, and
+/// commits with `pwrite` and `fdatasync`. Field order is load-bearing for
+/// `Drop`: `regions` is declared before `data`, so every mapping is unmapped
+/// before the file is closed (TXN-53).
+pub struct MmapBacking {
+    regions: MapRegions,
+    data: DataFile,
 }
 
 impl Backing for MmapBacking {
@@ -115,32 +143,23 @@ impl Backing for MmapBacking {
         // A read-only map past the file's end is safe: pages there fault only
         // when touched, and readers touch only pages a checked snapshot
         // references, which lie inside the file (SPEC 06 REC-1a).
-        grow_regions(&self.regions, map_size, |len| {
-            let m = Mmap::map(&self.file, len)?;
-            if self.random_access {
-                m.advise_random()?;
-            }
-            Ok(Mapping::Read(m))
-        })
+        grow_regions(&self.regions, map_size, |len| self.data.map(len, false))
     }
 
     fn real_disk_size(&self) -> std::io::Result<u64> {
-        file::real_disk_size(&self.file)
+        file::real_disk_size(&self.data.file)
     }
 
     fn try_clone_file(&self) -> std::io::Result<File> {
-        self.file.try_clone()
+        self.data.file.try_clone()
     }
 
     fn data_path(&self) -> Option<&Path> {
-        Some(&self.path)
+        Some(&self.data.path)
     }
 
     fn read_meta_copy(&self, slot: u64, psize: u32, buf: &mut [u8]) -> std::io::Result<()> {
-        // A kernel copy rather than a map slice (ADR-0023 §4): another process
-        // may be rewriting this slot, and borrowing bytes under a concurrent
-        // write would be a data race. A torn copy fails its CRC.
-        file::read_page_into(&self.file, slot, psize, &mut buf[..psize as usize])
+        self.data.read_meta_copy(slot, psize, buf)
     }
 
     fn write_at_page(&self, pgno: u64, psize: u32, data: &[u8]) -> std::io::Result<()> {
@@ -149,19 +168,19 @@ impl Backing for MmapBacking {
         // already covers the whole map size, sees the new bytes. Readers never
         // see a change: the target is a page no snapshot references (TXN-62)
         // or a meta slot, which is never lent out (see `mmap.rs`).
-        file::write_page(&self.file, pgno, psize, data)
+        file::write_page(&self.data.file, pgno, psize, data)
     }
 
     fn write_pages_at(&self, start_pgno: u64, psize: u32, frames: &[&[u8]]) -> std::io::Result<()> {
         // One `pwritev` per chunk instead of one `pwrite` per page; the same
         // argument as `write_at_page` keeps readers safe.
-        file::write_pages_vectored(&self.file, start_pgno, psize, frames)
+        file::write_pages_vectored(&self.data.file, start_pgno, psize, frames)
     }
 
     fn sync_data(&self) -> std::io::Result<()> {
         // `fdatasync` on Linux, which also flushes the file size needed to
         // read the data back (REC-14); the full-flush path on macOS.
-        self.file.sync_data()
+        self.data.file.sync_data()
     }
 }
 
@@ -176,14 +195,10 @@ impl Backing for MmapBacking {
 /// dirty pages on the heap (TXN-45a).
 ///
 /// Its `MapRegions` hold only writable maps. Field order is load-bearing for
-/// `Drop` (`regions` before `file`).
+/// `Drop` (`regions` before `data`).
 pub struct WriteMapBacking {
     regions: MapRegions,
-    file: File,
-    /// The path `file` was opened at, for [`Backing::data_path`].
-    path: PathBuf,
-    /// `MDB_NORDAHEAD`: every new mapping is advised `MADV_RANDOM`.
-    random_access: bool,
+    data: DataFile,
     /// A lower bound of the data file's length: the last length this process
     /// measured or set. The file never shrinks, so
     /// [`Backing::ensure_file_len`] is one comparison when the file is
@@ -211,13 +226,7 @@ impl Backing for WriteMapBacking {
         // The file first, so every page below the new logical size is backed
         // before the size is published. Only grows.
         self.ensure_file_len(map_size)?;
-        grow_regions(&self.regions, map_size, |len| {
-            let m = MmapWritable::map(&self.file, len)?;
-            if self.random_access {
-                m.advise_random()?;
-            }
-            Ok(Mapping::Write(m))
-        })
+        grow_regions(&self.regions, map_size, |len| self.data.map(len, true))
     }
 
     fn ensure_file_len(&self, len: u64) -> std::io::Result<()> {
@@ -232,9 +241,9 @@ impl Backing for WriteMapBacking {
         // Re-read the length: another process may have grown the file under
         // the writer lock since this one last looked. Grow only if it is
         // shorter, so the file never shrinks under another mapping.
-        let real = file::real_disk_size(&self.file)?;
+        let real = file::real_disk_size(&self.data.file)?;
         if real < len {
-            self.file.set_len(len)?;
+            self.data.file.set_len(len)?;
         }
         // Relaxed: as for the load above.
         self.file_len.fetch_max(real.max(len), Ordering::Relaxed);
@@ -242,22 +251,19 @@ impl Backing for WriteMapBacking {
     }
 
     fn real_disk_size(&self) -> std::io::Result<u64> {
-        file::real_disk_size(&self.file)
+        file::real_disk_size(&self.data.file)
     }
 
     fn try_clone_file(&self) -> std::io::Result<File> {
-        self.file.try_clone()
+        self.data.file.try_clone()
     }
 
     fn data_path(&self) -> Option<&Path> {
-        Some(&self.path)
+        Some(&self.data.path)
     }
 
     fn read_meta_copy(&self, slot: u64, psize: u32, buf: &mut [u8]) -> std::io::Result<()> {
-        // A kernel copy rather than a map slice (ADR-0023 §4): another process
-        // may be rewriting this slot, and borrowing bytes under a concurrent
-        // write would be a data race. A torn copy fails its CRC.
-        file::read_page_into(&self.file, slot, psize, &mut buf[..psize as usize])
+        self.data.read_meta_copy(slot, psize, buf)
     }
 
     fn write_at_page(&self, pgno: u64, psize: u32, data: &[u8]) -> std::io::Result<()> {
@@ -333,7 +339,7 @@ impl Backing for WriteMapBacking {
         // (relaxed durability, REC-9).
         self.map().flush(async_flush)?;
         if !async_flush {
-            self.file.sync_data()?;
+            self.data.file.sync_data()?;
         }
         Ok(())
     }
@@ -359,7 +365,7 @@ impl Backing for WriteMapBacking {
             map.flush_range(off, len, async_flush)?;
         }
         if !async_flush {
-            self.file.sync_data()?;
+            self.data.file.sync_data()?;
         }
         Ok(())
     }
@@ -570,11 +576,7 @@ pub fn open_or_create_with_advice(
     let head = file::read_head(&file, file_len.min(2 * page_size as usize))?;
     // `PREV_SNAPSHOT` takes its geometry from the older meta generation, as
     // LMDB does; a normal open takes the newest (see the doc comment above).
-    let geometry = if prev_snapshot {
-        prev_meta_geometry(&head, page_size)
-    } else {
-        newest_meta_geometry(&head, page_size)
-    };
+    let geometry = meta_geometry(&head, page_size, prev_snapshot);
     if let Some((persisted, _)) = geometry {
         // A persisted size above the cap is corrupt.
         if persisted > MAX_MAP_SIZE {
@@ -631,82 +633,49 @@ fn map_backing(
 ) -> Result<Box<dyn Backing>, Error> {
     let mut file_len = file::real_disk_size(&file)?;
     let want = map_len(file_len.max(map_size)).map_err(Error::Io)?;
-    if write_map {
-        // Grow the file to cover the whole map so writes anywhere in
-        // `[0, map_size)` land in backed (sparse) blocks, not past EOF.
-        if grow_file && file_len < map_size {
-            file.set_len(map_size)?;
-            file_len = map_size;
-        }
-        let mmap = MmapWritable::map(&file, want)?;
-        if random_access {
-            mmap.advise_random()?;
-        }
-        let regions = MapRegions::new(Mapping::Write(mmap), map_size);
-        Ok(Box::new(WriteMapBacking {
-            regions,
-            file,
-            path: path.to_path_buf(),
-            random_access,
-            file_len: AtomicU64::new(file_len),
-        }))
-    } else {
-        let mmap = Mmap::map(&file, want)?;
-        if random_access {
-            mmap.advise_random()?;
-        }
-        let regions = MapRegions::new(Mapping::Read(mmap), map_size);
-        Ok(Box::new(MmapBacking {
-            regions,
-            file,
-            path: path.to_path_buf(),
-            random_access,
-        }))
+    // Under `WRITE_MAP`, grow the file to cover the whole map so writes
+    // anywhere in `[0, map_size)` land in backed (sparse) blocks, not past EOF.
+    if write_map && grow_file && file_len < map_size {
+        file.set_len(map_size)?;
+        file_len = map_size;
     }
+    let data = DataFile {
+        file,
+        path: path.to_path_buf(),
+        random_access,
+    };
+    let regions = MapRegions::new(data.map(want, write_map)?, map_size);
+    Ok(if write_map {
+        Box::new(WriteMapBacking {
+            regions,
+            data,
+            file_len: AtomicU64::new(file_len),
+        })
+    } else {
+        Box::new(MmapBacking { regions, data })
+    })
 }
 
 /// The persisted `(map_size, last_pg)` of the newest valid meta slot (the
-/// higher-txnid one), or `None` if neither decodes. This is the meta LMDB
-/// reads its open-time map size and minimum from.
-fn newest_meta_geometry(bytes: &[u8], page_size: u32) -> Option<(u64, u64)> {
+/// higher txnid; slot 0 on a tie), or, with `prev`, of the older one (the
+/// generation `PREV_SNAPSHOT` serves; the LMDB fork reads its open-time map
+/// size and minimum from it too, as the oracle observes). With one valid slot,
+/// that one either way; `None` if neither decodes.
+fn meta_geometry(bytes: &[u8], page_size: u32, prev: bool) -> Option<(u64, u64)> {
     let ps = page_size as usize;
-    let mut best: Option<(u64, u64, u64)> = None; // (txnid, map_size, last_pg)
-    for slot in [0usize, 1] {
-        let base = slot * ps;
-        let end = base.checked_add(ps)?;
-        if end > bytes.len() {
-            continue;
+    let valid = [0usize, 1].into_iter().filter_map(|slot| {
+        let page = bytes.get(slot * ps..(slot + 1).checked_mul(ps)?)?;
+        match MetaPage::validate(page, page_size) {
+            Ok(MetaValidity::Valid(m)) => Some((m.txnid, m.map_size, m.last_pg)),
+            _ => None,
         }
-        if let Ok(MetaValidity::Valid(m)) = MetaPage::validate(&bytes[base..end], page_size) {
-            match best {
-                Some((t, _, _)) if t >= m.txnid => {}
-                _ => best = Some((m.txnid, m.map_size, m.last_pg)),
-            }
-        }
-    }
-    best.map(|(_, ms, lp)| (ms, lp))
-}
-
-/// The persisted `(map_size, last_pg)` of the **older** valid meta slot (the
-/// lower-txnid one, when both decode), or of whichever single slot decodes
-/// otherwise. This is the generation `PREV_SNAPSHOT` serves, and so the meta
-/// the LMDB fork reads its `PREVSNAPSHOT` open-time map size and minimum
-/// from (observed in the oracle).
-fn prev_meta_geometry(bytes: &[u8], page_size: u32) -> Option<(u64, u64)> {
-    let ps = page_size as usize;
-    let mut valid: Vec<(u64, u64, u64)> = Vec::new(); // (txnid, map_size, last_pg)
-    for slot in [0usize, 1] {
-        let base = slot * ps;
-        let end = base.checked_add(ps)?;
-        if end > bytes.len() {
-            continue;
-        }
-        if let Ok(MetaValidity::Valid(m)) = MetaPage::validate(&bytes[base..end], page_size) {
-            valid.push((m.txnid, m.map_size, m.last_pg));
-        }
-    }
-    valid.sort_by_key(|m| m.0);
-    valid.first().map(|&(_, ms, lp)| (ms, lp))
+    });
+    let pick = if prev {
+        valid.min_by_key(|m| m.0)
+    } else {
+        valid.reduce(|a, b| if b.0 > a.0 { b } else { a })
+    };
+    pick.map(|(_, map_size, last_pg)| (map_size, last_pg))
 }
 
 #[cfg(test)]

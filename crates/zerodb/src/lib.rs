@@ -189,8 +189,22 @@ impl EnvFlags {
 
     /// The raw bit value (matches the LMDB constants).
     #[must_use]
-    pub fn bits(self) -> u32 {
+    pub const fn bits(self) -> u32 {
         self.0
+    }
+
+    /// The flags of `bits` that ZeroDB defines; other bits are dropped. The
+    /// values are LMDB's `MDB_*` constants.
+    #[must_use]
+    pub const fn from_bits_truncate(bits: u32) -> EnvFlags {
+        const ALL: u32 = EnvFlags::NO_SYNC.0
+            | EnvFlags::READ_ONLY.0
+            | EnvFlags::NO_META_SYNC.0
+            | EnvFlags::WRITE_MAP.0
+            | EnvFlags::MAP_ASYNC.0
+            | EnvFlags::NO_READ_AHEAD.0
+            | EnvFlags::PREV_SNAPSHOT.0;
+        EnvFlags(bits & ALL)
     }
 }
 
@@ -595,19 +609,7 @@ impl EnvOpenOptions {
                 // read-only env on read-only media runs without a lock file,
                 // as LMDB does. A writable env fails with the `EROFS`.
                 Err(zerodb_io::lockfile::LockOpenError::ReadOnlyFs) if read_only => None,
-                Err(zerodb_io::lockfile::LockOpenError::ReadOnlyFs) => {
-                    return Err(Error::Io(std::io::Error::from_raw_os_error(libc::EROFS)))
-                }
-                Err(zerodb_io::lockfile::LockOpenError::AlreadyOpen) => {
-                    return Err(Error::EnvAlreadyOpened)
-                }
-                Err(zerodb_io::lockfile::LockOpenError::Mismatch(m)) => {
-                    return Err(Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        m,
-                    )))
-                }
-                Err(zerodb_io::lockfile::LockOpenError::Io(e)) => return Err(Error::Io(e)),
+                Err(e) => return Err(lock_error(e)),
             }
         } else {
             None
@@ -737,14 +739,22 @@ impl ExclusiveLock {
                 std::io::ErrorKind::WouldBlock,
                 "environment in use",
             ))),
-            Err(zerodb_io::lockfile::LockOpenError::AlreadyOpen) => Err(Error::EnvAlreadyOpened),
-            Err(zerodb_io::lockfile::LockOpenError::ReadOnlyFs) => {
-                Err(Error::Io(std::io::Error::from_raw_os_error(libc::EROFS)))
-            }
-            Err(zerodb_io::lockfile::LockOpenError::Mismatch(m)) => Err(Error::Io(
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, m),
-            )),
-            Err(zerodb_io::lockfile::LockOpenError::Io(e)) => Err(Error::Io(e)),
+            Err(e) => Err(lock_error(e)),
         }
+    }
+}
+
+/// The open error for a lock file that could not be opened: `EROFS` on
+/// read-only media, [`Error::EnvAlreadyOpened`] if this process already has
+/// it open, `InvalidInput` when a guard refuses the file.
+fn lock_error(e: zerodb_io::lockfile::LockOpenError) -> Error {
+    use zerodb_io::lockfile::LockOpenError;
+    match e {
+        LockOpenError::ReadOnlyFs => Error::Io(std::io::Error::from_raw_os_error(libc::EROFS)),
+        LockOpenError::AlreadyOpen => Error::EnvAlreadyOpened,
+        LockOpenError::Mismatch(m) => {
+            Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, m))
+        }
+        LockOpenError::Io(e) => Error::Io(e),
     }
 }
