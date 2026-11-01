@@ -289,11 +289,23 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
   full. No issue yet.
 - **Per-commit CPU** — `commit/batch/n1` 1.60×, empty write txn 2.46×, and
   YCSB no-sync on Graviton4 1.21–1.38× [M]. What is left is CPU per commit,
-  not I/O. Most write-txn containers already start empty and do not allocate,
-  so the next step is a profile of the empty and one-put commits on Graviton.
-  Likely suspects: the copy of the freed-page list carried in the meta page,
-  meta encoding and txn setup. Tracked in #8 and #4 (per-page allocation and
-  zero-fill, partly done by the frame pool).
+  not I/O. A Graviton4 profile (2026-10-29) put ZeroDB at 9.1–10.7k user
+  cycles per single-put no-sync commit against LMDB's 5.7–6.2k, led by hash
+  index growth and malloc/free for containers built empty per write txn, and
+  by outlined aarch64 atomics on the writer lock path. Write txns now reuse
+  the previous one's containers in place, as LMDB's `me_txn0` (#8): 19 → 5
+  heap allocations per single-put commit, 1 → 0 per empty write txn, and the
+  snapshot cell's lock and the copy of the base meta page's annex leave the
+  begin path. Graviton4: 6.68k → 5.74k user cycles per single-put commit
+  (LMDB 2.64k), `commit/batch/n1` 1.26× → 1.17×, empty write txn 191 →
+  182 ns (`benches/results/2026-10-31-writer-carry-graviton.md`). Still open: the writer slot's in-process mutex costs two
+  read-modify-write atomics per acquire and release on top of the lock
+  file's word (about 8 per empty write txn, LMDB 2; removing it needs an
+  owned lock cell, an ADR-level change), the snapshot `Arc` published per
+  commit, the `pwritev` iovec list, and the free-list tree record that small
+  txns decode and rewrite after a large delete (LMDB keeps its reclaimed
+  list, `me_pghead`, across txns). #4 (per-page allocation and zero-fill) is
+  partly done by the frame pool.
 - **Scans** — 1.3–1.8× by default; range scans 1.2× in trusted mode. A cursor keeps only its leaf;
   branch levels are re-resolved per cursor step (a memo hit, so cheap; one
   try to cache the parent read flat). Open idea: cache-line prefetch (#17).

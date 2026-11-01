@@ -6,6 +6,28 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### Write transactions reuse the previous one's containers (#8)
+
+Every write transaction built its working containers empty: the dirty-page
+and spilled-page indexes, the freed, loose and reclaimed page sets, the
+commit's sorted page list, the open-table slots and the descent buffers. A
+small commit spent much of its CPU growing and freeing them. They now live in
+a box that rides the env's writer slot from one write transaction to the
+next, used in place, as LMDB keeps its single write transaction (`me_txn0`)
+per env. Hash indexes keep capacity for about 128 entries and vectors 4,096,
+so one large transaction does not make later small ones walk an oversized
+table. A write transaction also starts from the snapshot the previous one
+published when nothing has committed since, instead of taking the snapshot
+cell's lock, and drains the base meta page's free-list annex in place
+instead of copying it. Nothing observable changes. A single-put commit on a
+named database makes 5 heap allocations instead of 19, and an empty write
+transaction none instead of one. On Graviton4 a single-put no-sync commit
+takes 5.17 µs instead of 5.51 (LMDB: 4.25) and 5.74k user cycles instead of
+6.68k; `commit/batch/n1` went from 1.26× to 1.17× LMDB, no rung regressed.
+Details: `benches/results/2026-10-31-writer-carry-graviton.md`. New test
+`crates/zerodb/tests/write_txn_allocations.rs`. In `zerodb-core`,
+`DirtyStore::sorted_pgnos` is replaced by `sorted_pgnos_into`, which fills a
+buffer the caller reuses.
 ### Faster cursor deletes and `clear` (issue #137)
 
 Four changes to the delete path, each taken from LMDB's technique for it; the

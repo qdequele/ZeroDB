@@ -116,6 +116,57 @@ pub(crate) type PgnoBuildHasher = BuildHasherDefault<PgnoHasher>;
 /// small, bursty write txns that dominate, cheap to hold onto.
 pub(crate) const SPARE_CAP: usize = 256;
 
+/// Capacity, in entries, that a write txn's pgno-hashed indexes keep when
+/// they are carried to the next write txn ([`DirtyCarry`]; issue #8). A
+/// hash table is iterated over its whole bucket array, not its entries
+/// (commit C2 lists the dirty pgnos that way), so an index left large by
+/// one big txn would slow every small txn after it. 128 entries is 256
+/// buckets: a single-put commit dirties a handful of pages and never grows
+/// it, and a scan of it stays a few dozen loads.
+pub(crate) const CARRY_INDEX_CAP: usize = 128;
+
+/// Whether a carried index of `capacity` entries is past the size a table
+/// for [`CARRY_INDEX_CAP`] entries gets. A table shrunk to that cap reports
+/// more (256 buckets hold 224 entries), so the bound is twice the cap: a
+/// table at its cap is left alone instead of shrunk again on every txn.
+pub(crate) fn index_oversized(capacity: usize) -> bool {
+    capacity > 2 * CARRY_INDEX_CAP
+}
+
+/// Empty `map`, keeping capacity for about [`CARRY_INDEX_CAP`] entries for
+/// the next write txn.
+pub(crate) fn recycle_index<K, V>(map: &mut HashMap<K, V, PgnoBuildHasher>)
+where
+    K: std::hash::Hash + Eq,
+{
+    map.clear();
+    if index_oversized(map.capacity()) {
+        map.shrink_to(CARRY_INDEX_CAP);
+    }
+}
+
+/// A [`DirtyStore`]'s allocations, handed from one write txn to the next on
+/// the env's writer slot (issue #8): the frame index and the spilled index,
+/// empty, and the recycled one-page frames. LMDB allocates its dirty list
+/// and its `me_dpages` frame pool once per environment and reuses them in
+/// every write txn; rebuilding the two indexes from nothing cost every
+/// write txn their allocations and the rehashes that grow them.
+#[derive(Default)]
+pub(crate) struct DirtyCarry {
+    frames: HashMap<u64, Slot, PgnoBuildHasher>,
+    spilled: HashMap<u64, u64, PgnoBuildHasher>,
+    spare: Vec<Box<[u8]>>,
+}
+
+impl std::fmt::Debug for DirtyCarry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DirtyCarry")
+            .field("index_capacity", &self.frames.capacity())
+            .field("spare", &self.spare.len())
+            .finish()
+    }
+}
+
 /// One dirty frame: where its bytes live.
 #[derive(Debug)]
 enum Slot {
@@ -262,18 +313,45 @@ impl<'env> DirtyStore<'env> {
     /// pool size (a per-frame filter here made `env/txn/rw_empty_commit` 6×
     /// slower). The pool only ever holds frames of this env's page size.
     #[must_use]
-    pub fn with_spare(psize: u32, mut spare: Vec<Box<[u8]>>) -> DirtyStore<'env> {
+    pub fn with_spare(psize: u32, spare: Vec<Box<[u8]>>) -> DirtyStore<'env> {
+        DirtyStore::from_carry(
+            psize,
+            DirtyCarry {
+                spare,
+                ..DirtyCarry::default()
+            },
+            None,
+        )
+    }
+
+    /// An empty store built from the previous write txn's allocations
+    /// ([`DirtyCarry`]), realizing new frames in the writable map through
+    /// `broker` when it is `Some` (see [`DirtyStore::with_spare_in_map`]).
+    /// O(1): the indexes and the spare `Vec` move in whole.
+    #[must_use]
+    pub(crate) fn from_carry(
+        psize: u32,
+        carry: DirtyCarry,
+        broker: Option<&'env dyn Backing>,
+    ) -> DirtyStore<'env> {
+        let DirtyCarry {
+            frames,
+            spilled,
+            mut spare,
+        } = carry;
+        debug_assert!(frames.is_empty() && spilled.is_empty());
         debug_assert!(spare.iter().all(|f| f.len() == psize as usize));
+        debug_assert!(broker.is_none_or(|b| b.dirty_in_map()));
         spare.truncate(SPARE_CAP);
         debug_assert!(psize.is_power_of_two());
         DirtyStore {
             psize,
             psize_shift: psize.trailing_zeros(),
-            frames: HashMap::default(),
-            broker: None,
+            frames,
+            broker,
             spare,
             pages: 0,
-            spilled: HashMap::default(),
+            spilled,
         }
     }
 
@@ -306,6 +384,15 @@ impl<'env> DirtyStore<'env> {
     #[must_use]
     pub fn in_map(&self, pgno: u64) -> bool {
         self.broker.is_some() && matches!(self.frames.get(&pgno), Some(Slot::Map { .. }))
+    }
+
+    /// `pgno`'s frame length in bytes and whether it lives in the map
+    /// ([`DirtyStore::in_map`]), in one lookup; `None` without a frame.
+    #[must_use]
+    pub fn frame_extent(&self, pgno: u64) -> Option<(usize, bool)> {
+        self.frames
+            .get(&pgno)
+            .map(|f| (f.len(), matches!(f, Slot::Map { .. })))
     }
 
     /// Whether `pgno` has a dirty frame (tree page, or overflow-run **head**).
@@ -672,13 +759,32 @@ impl<'env> DirtyStore<'env> {
         out
     }
 
+    /// Empty this store into a [`DirtyCarry`] for the next write txn: up to
+    /// [`SPARE_CAP`] one-page frames ([`DirtyStore::reclaimable_frames`]) and
+    /// the two indexes, cleared and capped at [`CARRY_INDEX_CAP`]. Same
+    /// preconditions as `reclaimable_frames`: the commit pipeline has
+    /// finished writing, or the txn aborted.
+    pub(crate) fn take_carry(&mut self) -> DirtyCarry {
+        let spare = self.reclaimable_frames(SPARE_CAP);
+        let mut frames = std::mem::take(&mut self.frames);
+        recycle_index(&mut frames);
+        let mut spilled = std::mem::take(&mut self.spilled);
+        recycle_index(&mut spilled);
+        self.pages = 0;
+        DirtyCarry {
+            frames,
+            spilled,
+            spare,
+        }
+    }
+
     /// Dirty pgnos in ascending order — the commit write-out order (C2 writes
-    /// sequentially by pgno; ADR-0004 D1).
-    #[must_use]
-    pub fn sorted_pgnos(&self) -> Vec<u64> {
-        let mut v: Vec<u64> = self.frames.keys().copied().collect();
-        v.sort_unstable();
-        v
+    /// sequentially by pgno; ADR-0004 D1) — into `out`, which is cleared
+    /// first (the commit reuses one buffer across write txns).
+    pub fn sorted_pgnos_into(&self, out: &mut Vec<u64>) {
+        out.clear();
+        out.extend(self.frames.keys().copied());
+        out.sort_unstable();
     }
 }
 
@@ -717,7 +823,9 @@ mod tests {
         for pgno in [9u64, 2, 40, 3] {
             s.insert(pgno, vec![0u8; 4096].into_boxed_slice());
         }
-        assert_eq!(s.sorted_pgnos(), vec![2, 3, 9, 40]);
+        let mut v = vec![77];
+        s.sorted_pgnos_into(&mut v);
+        assert_eq!(v, vec![2, 3, 9, 40]);
     }
 
     #[test]
@@ -816,5 +924,45 @@ mod tests {
         let mut s2 = DirtyStore::with_spare(4096, back);
         let back2 = s2.reclaimable_frames(SPARE_CAP);
         assert_eq!(back2.as_ptr() as usize, pool_ptr);
+    }
+
+    #[test]
+    fn carry_keeps_index_capacity_and_frames() {
+        // Issue #8: the indexes come back empty with their capacity, and the
+        // one-page frames come back as spares.
+        let mut s = DirtyStore::new(4096);
+        for pgno in 0..20 {
+            s.insert_tree_frame(pgno);
+        }
+        s.spill(3);
+        let cap = s.frames.capacity();
+        let carry = s.take_carry();
+        assert!(carry.frames.is_empty() && carry.spilled.is_empty());
+        assert_eq!(carry.frames.capacity(), cap);
+        assert!(carry.spilled.capacity() > 0);
+        assert_eq!(
+            carry.spare.len(),
+            20,
+            "every one-page frame, spilled or not"
+        );
+        let mut s2 = DirtyStore::from_carry(4096, carry, None);
+        assert_eq!(s2.pages(), 0);
+        assert!(s2.is_empty() && s2.spilled_pages(3).is_none());
+        s2.insert_tree_frame(40);
+        assert_eq!(s2.spare.len(), 19, "a recycled frame serves the next page");
+    }
+
+    #[test]
+    fn carry_caps_a_large_index() {
+        // An index grown by a large txn is not kept at that size.
+        let mut s = DirtyStore::new(512);
+        for pgno in 0..(4 * CARRY_INDEX_CAP as u64) {
+            s.insert_tree_frame(pgno);
+        }
+        assert!(s.frames.capacity() > CARRY_INDEX_CAP);
+        let carry = s.take_carry();
+        assert!(carry.frames.capacity() >= CARRY_INDEX_CAP);
+        assert!(carry.frames.capacity() < 2 * CARRY_INDEX_CAP);
+        assert_eq!(carry.spare.len(), SPARE_CAP);
     }
 }
