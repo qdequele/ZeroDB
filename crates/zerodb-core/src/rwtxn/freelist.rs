@@ -1,7 +1,28 @@
 //! Commit step C1: writing the free-page database (SPEC 05 GC-10..13,
 //! GC-20, GC-30..32).
 
+use std::collections::BTreeSet;
+
 use super::*;
+
+/// [`RwTxn::freelist_save`]'s state across fixed-point iterations.
+struct SaveLoop {
+    /// GC entries awaiting their GC-20 rewrite.
+    pending: BTreeSet<u64>,
+    /// Rewrites done so far, and their release-active bound (GC-13 guard):
+    /// each rewrite consumes one pending entry, and an entry only re-enters
+    /// `pending` through an in-save pool draw, which strictly shrinks the
+    /// finite pool, so the total is bounded by (initial entries) + (total
+    /// pool ids) + slack. A regression confined to the rewrite loop panics
+    /// loudly instead of hanging.
+    inner_iters: usize,
+    inner_budget: usize,
+    /// GC-13 own-entry size guard (tree arm): the page count of this txn's
+    /// entry `BE(txnid)` as last written (0 = inline), and whether it has
+    /// shrunk during this save. See [`RwTxn::put_own_entry`].
+    own_pages: Option<u64>,
+    own_shrunk: bool,
+}
 
 /// Merge two strictly-ascending, mutually-disjoint id slices into one
 /// strictly-ascending vec (GC-3/GC-4; the `freelist_save` step-(c) merge of
@@ -135,22 +156,15 @@ impl<'env> RwTxn<'env> {
         let annex_cap = crate::page::meta_annex_cap(self.psize);
         let mut tree_arm = false;
         let mut annex_mode = false;
-        // GC-13 own-entry size guard (tree arm): the page count of this
-        // txn's entry `BE(txnid)` as last written (0 = inline), and whether
-        // it has shrunk during this save. See step (c).
-        let mut own_pages: Option<u64> = None;
-        let mut own_shrunk = false;
         // Every ops-drained entry needs its GC-20 rewrite at least once.
-        let mut pending: std::collections::BTreeSet<u64> = self.drains.keys().copied().collect();
-        // Release-active bound on the *inner* rewrite loop (GC-13 guard):
-        // each inner iteration consumes one pending entry,
-        // and an entry only re-enters `pending` via an in-save pool draw,
-        // which strictly shrinks the finite pool — so total inner iterations
-        // across the whole save are bounded by (initial entries) + (total
-        // pool ids) + slack. A regression confined to the inner loop panics
-        // loudly instead of hanging.
-        let inner_budget = pending.len() + self.drains.values().map(Drain::len).sum::<usize>() + 16;
-        let mut inner_iters = 0usize;
+        let pending: BTreeSet<u64> = self.drains.keys().copied().collect();
+        let mut st = SaveLoop {
+            inner_budget: pending.len() + self.drains.values().map(Drain::len).sum::<usize>() + 16,
+            pending,
+            inner_iters: 0,
+            own_pages: None,
+            own_shrunk: false,
+        };
         // (b) GC-10 trailing shrink of ops-era loose pages, then GC-9: the
         // survivors join the freed set up front (LMDB parity — the fork's
         // freelist_save merges loose pages into the list first). Loose pages
@@ -166,37 +180,8 @@ impl<'env> RwTxn<'env> {
                 iters <= FREELIST_SAVE_MAX_ITERS,
                 "freelist_save failed to reach a fixed point (GC-13)"
             );
-            // (a) apply_drains (GC-11a/GC-20): rewrite the remainder of every
-            // pending entry; delete fully-drained ones. Never delete a
-            // partially-drained entry (leaks the remainder), never leave a
-            // drained id behind (double-hand-out). A put/delete here may draw
-            // from the pool (re-dirtying entries — merged from `save_touched`)
-            // or free committed GC pages (growing `freed`).
-            loop {
-                pending.extend(std::mem::take(&mut self.save_touched));
-                let Some(&f) = pending.iter().next() else {
-                    break;
-                };
-                pending.remove(&f);
-                inner_iters += 1;
-                assert!(
-                    inner_iters <= inner_budget,
-                    "freelist_save drain-rewrite loop exceeded its budget (GC-13)"
-                );
-                // GC-20 rewrite payload: exactly the live remainder — the
-                // consumed prefix never reaches the tree.
-                let remaining: Vec<u64> = self
-                    .drains
-                    .get(&f)
-                    .map_or(Vec::new(), |d| d.live().to_vec());
-                if remaining.is_empty() {
-                    self.drains.remove(&f);
-                    let existed = self.delete_tree(TreeId::Free, &gc_key_encode(f))?;
-                    debug_assert!(existed, "drained GC entry {f} missing from the tree");
-                } else {
-                    self.put_pil(f, &remaining)?;
-                }
-            }
+            // (a) apply_drains (GC-11a/GC-20).
+            self.rewrite_pending_drains(&mut st)?;
             // (c) this txn's own entry: the meta annex when it fits (GC-32),
             // else the GC tree under BE(writer_txnid) as in format v1.
             work_mut!(self).freed.sort_unstable();
@@ -222,39 +207,7 @@ impl<'env> RwTxn<'env> {
                     tree_arm = true; // sticky (GC-32)
                     annex_mode = false;
                     let ids = merge_sorted_unique(&work_mut!(self).freed, self.annex.live());
-                    // GC-13 own-entry size guard. The entry lists the carried
-                    // annex pool and every loose page folded in, so a run
-                    // for it taken from those (an annex draw, a loose page)
-                    // leaves the pages it accounts for unchanged — the old
-                    // run is listed in their place. Near an overflow
-                    // page-count boundary that set may admit no exact size:
-                    // the shrunk entry frees a tail page, listing it grows
-                    // the entry back, and the grow draws a fresh run from
-                    // the annex, forever trading annex ids for listed ones
-                    // (LMDB never meets this: its put keeps a larger dirty
-                    // overflow run in place, which the exact run length of
-                    // SPEC 02 §5 forbids). So once the entry has shrunk in
-                    // this save, a grow takes every page from outside that
-                    // set — the drain pool or the end of the file — which
-                    // adds pages to it and so admits the larger size.
-                    let pages = gc_value_pages(ids.len(), self.psize);
-                    let grow_after_shrink = own_shrunk && own_pages.is_some_and(|p| pages > p);
-                    if own_pages.is_some_and(|p| pages < p) {
-                        own_shrunk = true;
-                    }
-                    if grow_after_shrink {
-                        // Loose pages are part of the set too (listed at the
-                        // fixed point): hold them back for this put.
-                        let held = std::mem::take(&mut work_mut!(self).loose);
-                        self.save_outside = true;
-                        let r = self.put_pil(self.txnid, &ids);
-                        self.save_outside = false;
-                        work_mut!(self).loose.extend(held);
-                        r?;
-                    } else {
-                        self.put_pil(self.txnid, &ids)?;
-                    }
-                    own_pages = Some(pages);
+                    self.put_own_entry(&ids, &mut st)?;
                     if work_mut!(self).freed.len() != before || self.annex.len() != annex_before {
                         // The put COW-freed committed GC pages (PIL must
                         // grow) or drew from the annex pool (the written
@@ -267,8 +220,8 @@ impl<'env> RwTxn<'env> {
             // pool draw during the writes above means some tree entry still
             // lists a handed-out page), and no loose page survives unlisted
             // (GC-9/GC-10).
-            pending.extend(std::mem::take(&mut self.save_touched));
-            if !pending.is_empty() {
+            st.pending.extend(std::mem::take(&mut self.save_touched));
+            if !st.pending.is_empty() {
                 continue;
             }
             self.release_trailing_loose();
@@ -289,6 +242,77 @@ impl<'env> RwTxn<'env> {
         }
         self.annex = Drain::new(Vec::new());
         self.annex_out = annex_mode;
+        Ok(())
+    }
+
+    /// Step (a) of [`RwTxn::freelist_save`], apply_drains (GC-11a/GC-20):
+    /// rewrite the remainder of every pending entry and delete fully-drained
+    /// ones. Never delete a partially-drained entry (leaks the remainder),
+    /// never leave a drained id behind (double hand-out). A put or delete
+    /// here may draw from the pool (re-dirtying entries, merged from
+    /// `save_touched`) or free committed GC pages (growing `freed`).
+    fn rewrite_pending_drains(&mut self, st: &mut SaveLoop) -> Result<()> {
+        loop {
+            st.pending.extend(std::mem::take(&mut self.save_touched));
+            let Some(&f) = st.pending.iter().next() else {
+                break;
+            };
+            st.pending.remove(&f);
+            st.inner_iters += 1;
+            assert!(
+                st.inner_iters <= st.inner_budget,
+                "freelist_save drain-rewrite loop exceeded its budget (GC-13)"
+            );
+            // GC-20 rewrite payload: exactly the live remainder — the
+            // consumed prefix never reaches the tree.
+            let remaining: Vec<u64> = self
+                .drains
+                .get(&f)
+                .map_or(Vec::new(), |d| d.live().to_vec());
+            if remaining.is_empty() {
+                self.drains.remove(&f);
+                let existed = self.delete_tree(TreeId::Free, &gc_key_encode(f))?;
+                debug_assert!(existed, "drained GC entry {f} missing from the tree");
+            } else {
+                self.put_pil(f, &remaining)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Step (c), tree arm, of [`RwTxn::freelist_save`]: write this txn's
+    /// own entry `BE(txnid)` listing `ids`.
+    fn put_own_entry(&mut self, ids: &[u64], st: &mut SaveLoop) -> Result<()> {
+        // GC-13 own-entry size guard. The entry lists the carried annex pool
+        // and every loose page folded in, so a run for it taken from those
+        // (an annex draw, a loose page) leaves the pages it accounts for
+        // unchanged: the old run is listed in their place. Near an overflow
+        // page-count boundary that set may admit no exact size: the shrunk
+        // entry frees a tail page, listing it grows the entry back, and the
+        // grow draws a fresh run from the annex, forever trading annex ids
+        // for listed ones (LMDB never meets this: its put keeps a larger
+        // dirty overflow run in place, which the exact run length of SPEC 02
+        // §5 forbids). So once the entry has shrunk in this save, a grow
+        // takes every page from outside that set (the drain pool or the end
+        // of the file), which adds pages to it and so admits the larger size.
+        let pages = gc_value_pages(ids.len(), self.psize);
+        let grow_after_shrink = st.own_shrunk && st.own_pages.is_some_and(|p| pages > p);
+        if st.own_pages.is_some_and(|p| pages < p) {
+            st.own_shrunk = true;
+        }
+        if grow_after_shrink {
+            // Loose pages are part of the set too (listed at the fixed
+            // point): hold them back for this put.
+            let held = std::mem::take(&mut work_mut!(self).loose);
+            self.save_outside = true;
+            let r = self.put_pil(self.txnid, ids);
+            self.save_outside = false;
+            work_mut!(self).loose.extend(held);
+            r?;
+        } else {
+            self.put_pil(self.txnid, ids)?;
+        }
+        st.own_pages = Some(pages);
         Ok(())
     }
 }
