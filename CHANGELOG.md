@@ -6,6 +6,22 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### Commit writes capped at 256 KiB per call (issue #135)
+
+A commit wrote each run of contiguous dirty pages with one `pwritev` of up to
+512 pages, 2 MiB at 4 KiB pages. On kernels and filesystems that cache files
+in large folios (XFS, and ext4 on recent kernels), a bulk commit then left the
+file cached in 2 MiB folios, and every later commit that rewrote one page
+inside one paid far more kernel time. A call now carries at most 256 KiB,
+LMDB's 64 pages at 4 KiB (one page when a page is larger), and its iovecs live
+on the stack. On Graviton4 (kernel 7.0, ext4), after a 10M-key load, a
+single-put no-sync commit's p50 went from 12.1–12.6 µs to 8.7–8.8 µs (LMDB
+7.6–7.9 µs). Meilisearch v1.55.0's hackernews additions went from 1.00× to
+0.92× LMDB's time; movies indexing and search are flat. Bulk commits of fresh
+large values pay for the extra calls: `put/val/v4k` 0.99× → 1.10× LMDB.
+Crash safety is unchanged. Details:
+`benches/results/2026-11-01-commit-write-cap-graviton.md`.
+
 ### `WRITE_MAP` bulk writes at LMDB speed (issue #13)
 
 Under `WRITE_MAP`, every step of a write transaction's tree descent asked the
