@@ -203,8 +203,8 @@ pub fn open_with_backing_shared(
     // a usable env → Invalid.
     let bytes = backing.bytes();
     let ps = page_size as usize;
-    let slot0 = read_slot(bytes, META_A_PGNO, ps, page_size)?;
-    let slot1 = read_slot(bytes, META_B_PGNO, ps, page_size)?;
+    let slot0 = read_slot(bytes, META_A_PGNO, page_size)?;
+    let slot1 = read_slot(bytes, META_B_PGNO, page_size)?;
 
     // Select the live snapshot (SPEC 02 §3.2 / SPEC 06 REC-2..5).
     let (meta, chosen_slot) = match select_meta(&slot0, &slot1, prev_snapshot) {
@@ -369,15 +369,10 @@ pub fn open_with_backing_shared(
 }
 
 /// Validate one meta slot at `pgno` from the mapped bytes.
-fn read_slot(
-    bytes: &[u8],
-    pgno: u64,
-    page_size_usize: usize,
-    page_size: u32,
-) -> Result<MetaValidity, Error> {
-    let base = pgno as usize * page_size_usize;
+fn read_slot(bytes: &[u8], pgno: u64, page_size: u32) -> Result<MetaValidity, Error> {
+    let base = pgno as usize * page_size as usize;
     let end = base
-        .checked_add(page_size_usize)
+        .checked_add(page_size as usize)
         .ok_or(Error::Mdb(MdbError::Invalid))?;
     if end > bytes.len() {
         // The mapped region does not even cover both meta slots → not an env.

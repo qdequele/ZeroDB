@@ -7,7 +7,6 @@
 //! are tested against real files in `crates/zerodb`.
 
 use super::{next_env_id, open_with_backing_policy, Backing, Env, MapView};
-use crate::error::Error;
 use crate::page::FileTrust;
 use crate::page::MetaPage;
 use std::path::PathBuf;
@@ -100,7 +99,6 @@ fn mem_env_with(page_size: u32, map_size: u64, sequential_writes: bool) -> Env {
         None,
     ) {
         Ok(env) => env,
-        Err(Error::Io(e)) => panic!("mem_env open failed: {e}"),
         Err(e) => panic!("mem_env open failed: {e}"),
     }
 }
