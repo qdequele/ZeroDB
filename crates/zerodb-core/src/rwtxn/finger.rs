@@ -125,8 +125,7 @@ impl<'env> RwTxn<'env> {
     }
 
     /// The finger fast path's hit test (SPEC 03 §6.6 F1). A hit needs a live
-    /// finger for `tree`, a spine that still verifies ([`finger_spine`]
-    /// (Self::finger_spine)), and `key` sorting **strictly greater** than the
+    /// finger for `tree`, a spine that still verifies ([`RwTxn::finger_spine`]), and `key` sorting **strictly greater** than the
     /// leaf's last key under the tree's comparator — which is APPEND's §6.3
     /// validation and, for a plain put, proof the key is absent (so
     /// `NO_OVERWRITE` cannot fail either): one condition serves every flag
