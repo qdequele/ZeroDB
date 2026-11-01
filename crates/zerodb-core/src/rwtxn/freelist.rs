@@ -68,45 +68,7 @@ impl<'env> RwTxn<'env> {
         let key = gc_key_encode(f);
         let len = pil_size(ids.len());
         let loc = self.put_tree(TreeId::Free, &key, PutFlags::EMPTY, ValSrc::Reserve(len))?;
-        match loc {
-            ReserveLoc::Big(head) => {
-                let frame = self.dirty.bytes_mut(head).expect("run frame present");
-                pil_encode_into(ids, &mut frame[HEADER_SIZE..HEADER_SIZE + len]);
-            }
-            ReserveLoc::Inline { at } => {
-                // The no-split insert arms prove the settled cell; a split
-                // falls back to the key search.
-                let (lpg, ki) = match at {
-                    Some(pos) => {
-                        // Same cross-check as `Database::put_reserved`.
-                        #[cfg(debug_assertions)]
-                        {
-                            let (path, found) = self.search_path(TreeId::Free, &key)?;
-                            debug_assert!(found, "reserved GC key must be present");
-                            debug_assert_eq!(
-                                *path.last().expect("non-empty path"),
-                                pos,
-                                "GC ReserveLoc::Inline{{at}} disagrees with search"
-                            );
-                        }
-                        pos
-                    }
-                    None => {
-                        let (path, found) = self.search_path(TreeId::Free, &key)?;
-                        debug_assert!(found, "reserved GC key must be present");
-                        *path.last().expect("non-empty path")
-                    }
-                };
-                let frame = self.dirty.bytes_mut(lpg).expect("GC leaf is dirty");
-                let (off, dsize) = {
-                    let leaf =
-                        LeafMut::from_valid(&mut *frame, self.psize).map_err(map_page_err)?;
-                    leaf.inline_value_at(ki).map_err(map_page_err)?
-                };
-                debug_assert_eq!(dsize as usize, len);
-                pil_encode_into(ids, &mut frame[off..off + len]);
-            }
-        }
+        pil_encode_into(ids, self.reserved_slot(TreeId::Free, &key, len, loc)?);
         Ok(())
     }
 

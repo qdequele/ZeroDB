@@ -53,47 +53,7 @@ impl Database {
     ) -> Result<()> {
         let tree = txn.ensure_open(self)?;
         let loc = txn.put_tree(tree, key, PutFlags::EMPTY, ValSrc::Reserve(len))?;
-        match loc {
-            ReserveLoc::Big(head) => {
-                let frame = txn.dirty.bytes_mut(head).expect("run frame present");
-                f(&mut frame[HEADER_SIZE..HEADER_SIZE + len]);
-            }
-            ReserveLoc::Inline { at } => {
-                // The insert path proves the settled `(leaf, slot)` on every
-                // no-split arm, so no second descent; a split returns `None`
-                // and we re-locate by key.
-                let (lpg, ki) = match at {
-                    Some(pos) => {
-                        // Cross-check the proof against a real search in
-                        // debug/fuzz builds — a stale position here would
-                        // corrupt user data silently.
-                        #[cfg(debug_assertions)]
-                        {
-                            let (path, found) = txn.search_path(tree, key)?;
-                            debug_assert!(found, "reserved key must be present");
-                            debug_assert_eq!(
-                                *path.last().expect("non-empty path"),
-                                pos,
-                                "ReserveLoc::Inline{{at}} disagrees with search"
-                            );
-                        }
-                        pos
-                    }
-                    None => {
-                        let (path, found) = txn.search_path(tree, key)?;
-                        debug_assert!(found, "reserved key must be present");
-                        *path.last().expect("non-empty path")
-                    }
-                };
-                let frame = txn.dirty.bytes_mut(lpg).expect("leaf is dirty");
-                let (off, dsize) = {
-                    let leaf = LeafMut::from_valid(&mut *frame, txn.psize).map_err(map_page_err)?;
-                    leaf.inline_value_at(ki).map_err(map_page_err)?
-                };
-                debug_assert_eq!(dsize as usize, len);
-                f(&mut frame[off..off + len]);
-            }
-        }
+        f(txn.reserved_slot(tree, key, len, loc)?);
         Ok(())
     }
 

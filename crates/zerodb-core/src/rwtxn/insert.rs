@@ -146,6 +146,54 @@ pub(super) fn choose_split(sizes: &[usize], cap: usize) -> usize {
 }
 
 impl<'env> RwTxn<'env> {
+    /// The bytes of the value a `ValSrc::Reserve(len)` put of `key` just
+    /// placed at `loc`, for the caller to fill.
+    pub(super) fn reserved_slot(
+        &mut self,
+        tree: TreeId,
+        key: &[u8],
+        len: usize,
+        loc: ReserveLoc,
+    ) -> Result<&mut [u8]> {
+        let (lpg, ki) = match loc {
+            ReserveLoc::Big(head) => {
+                let frame = self.dirty.bytes_mut(head).expect("run frame present");
+                return Ok(&mut frame[HEADER_SIZE..HEADER_SIZE + len]);
+            }
+            // The insert path proves the settled `(leaf, slot)` on every
+            // no-split arm, so no second descent.
+            ReserveLoc::Inline { at: Some(pos) } => {
+                // Cross-check the proof against a real search in debug and
+                // fuzz builds: a stale position would corrupt data silently.
+                #[cfg(debug_assertions)]
+                {
+                    let (path, found) = self.search_path(tree, key)?;
+                    debug_assert!(found, "reserved key must be present");
+                    debug_assert_eq!(
+                        *path.last().expect("non-empty path"),
+                        pos,
+                        "ReserveLoc::Inline{{at}} disagrees with search"
+                    );
+                }
+                pos
+            }
+            // A split moved cells: re-locate by key.
+            ReserveLoc::Inline { at: None } => {
+                let (path, found) = self.search_path(tree, key)?;
+                debug_assert!(found, "reserved key must be present");
+                *path.last().expect("non-empty path")
+            }
+        };
+        let psize = self.psize;
+        let frame = self.dirty.bytes_mut(lpg).expect("leaf is dirty");
+        let (off, dsize) = {
+            let leaf = LeafMut::from_valid(&mut *frame, psize).map_err(map_page_err)?;
+            leaf.inline_value_at(ki).map_err(map_page_err)?
+        };
+        debug_assert_eq!(dsize as usize, len);
+        Ok(&mut frame[off..off + len])
+    }
+
     pub(super) fn put_tree(
         &mut self,
         tree: TreeId,
