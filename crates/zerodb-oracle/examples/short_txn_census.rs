@@ -77,8 +77,7 @@ macro_rules! census {
         }
     };
     (@setpage $opts:ident, set) => {
-        // SAFETY: sysconf is always safe to call.
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
+        let page = zerodb_oracle::os_page_size();
         $opts.page_size(page);
     };
     (@setpage $opts:ident, noset) => {};

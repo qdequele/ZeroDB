@@ -1,9 +1,10 @@
 # ZeroDB CI — the AGENTS.md check battery, automated.
 #
 # Per push / PR: fmt, clippy, tests (x86-64 and aarch64), an MSRV check, miri
-# on the core, loom on the reader table, the 10-minute differential fuzz (plus
-# 2 minutes each of page-decode and image-open fuzzing) and the crash smoke.
+# on the core, loom on the reader table, the fuzz gate and the crash smoke.
 # Nightly: the long fuzz, the full crash run and the reader stress.
+# The loom, fuzz, crash and stress jobs run the justfile recipes of the same
+# name, so `just <recipe>` locally runs exactly what CI runs.
 # The oracle crate links the real LMDB fork (lmdb-master-sys), so every job
 # needs a C toolchain — the GitHub Ubuntu images ship gcc.
 #
@@ -115,10 +116,11 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: RUSTFLAGS="--cfg loom" CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo test -p zerodb-core --lib --release loom_
+      - run: cargo install just --version 1.58.0 --locked
+      - run: just loom
 
   fuzz-quick:
-    name: differential fuzz, 10 min (${{ matrix.os }})
+    name: fuzz gate (${{ matrix.os }})
     if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
@@ -139,9 +141,8 @@ jobs:
             .
             fuzz
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
-      - run: cargo +nightly fuzz run diff_ops -- -max_total_time=600
-      - run: cargo +nightly fuzz run fuzz_page_decode -- -max_total_time=120
-      - run: cargo +nightly fuzz run fuzz_image_open -- -max_total_time=120
+      - run: cargo install just --version 1.58.0 --locked
+      - run: just fuzz-quick
       - name: keep any crash artifact
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -163,7 +164,8 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-      - run: cargo run -p zerodb-oracle --bin crash-harness -- --cycles 200
+      - run: cargo install just --version 1.58.0 --locked
+      - run: just crash-test-quick
 
   nightly:
     name: nightly — long fuzz, full crash run, stress (${{ matrix.os }})
@@ -187,11 +189,13 @@ jobs:
             .
             fuzz
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
-      - run: ZERODB_STRESS_SECS=180 cargo test -p zerodb --test reader_stress -- --nocapture stress_
-      - run: cargo run -p zerodb-oracle --bin crash-harness -- --cycles 10000
-      # 4 h here; `just fuzz-long` is 6 h and the 24 h soak the consumer
-      # integration gate asks for needs a self-hosted runner.
-      - run: cargo +nightly fuzz run diff_ops -- -max_total_time=14400
+      - run: cargo install just --version 1.58.0 --locked
+      - run: just stress
+      - run: just crash-test-full
+      # 3.5 h native + 26 min through the heed adapter, to fit the 6 h job
+      # cap; the 24 h soak the consumer integration gate asks for needs a
+      # self-hosted runner.
+      - run: just fuzz-long 12600
       - name: keep any crash artifact
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

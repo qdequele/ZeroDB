@@ -1,4 +1,4 @@
-//! Per-cycle recovery verification (SPEC 06 REC-18; ADR-0008 D2/D4).
+//! Per-cycle recovery verification (SPEC 06 REC-18; ADR-0008).
 //!
 //! Full verification (obligations REC-18.1–.5):
 //! 1. open succeeds (a single-torn image MUST open, REC-3);
@@ -158,7 +158,7 @@ pub struct FullChecks<'a> {
     pub map_size: u64,
     /// Registry path for the verification env. Reused sequentially per
     /// worker: a failed deregistration on the previous drop surfaces as
-    /// `EnvAlreadyOpened` here (the ADR-0008 D6.2 residue tripwire).
+    /// `EnvAlreadyOpened` here (the ADR-0008 residue tripwire).
     pub verify_path: &'a Path,
     /// **`NO_META_SYNC` reclaim-clobber window** (REC-10): set by the caller
     /// only when the plan persisted at least one in-flight **data** write of a cut that
@@ -244,7 +244,7 @@ pub fn verify_image_full(mut img: Vec<u8>, c: &FullChecks<'_>) -> Result<FullOut
     }
 }
 
-/// Adversarial-probe outcome (characterization only, ADR-0008 D4).
+/// Adversarial-probe outcome (characterization only, ADR-0008).
 #[derive(Debug, Clone, Copy)]
 pub struct AdvOutcome {
     /// Recovered txnid when the image opened.
@@ -257,7 +257,7 @@ pub struct AdvOutcome {
 
 /// Probe an adversarial (`NO_SYNC`/`MAP_ASYNC` reorder) image: no panic, and
 /// only the designed taxonomy (`Ok` or `Invalid`). Nothing else is asserted —
-/// REC-11 makes no stronger promise under reordering (ADR-0008 OQ3).
+/// REC-11 makes no stronger promise under reordering (ADR-0008).
 ///
 /// # Errors
 ///

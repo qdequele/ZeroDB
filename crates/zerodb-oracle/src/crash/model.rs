@@ -1,8 +1,8 @@
-//! The crash harness's data-model oracle (ADR-0008 D2): a pure shadow model
+//! The crash harness's data-model oracle (ADR-0008): a pure shadow model
 //! replaying the seeded op stream, executed either **against** a live env
 //! (mechanisms A and B-child — every op's outcome is cross-checked against
 //! the model's prediction, so model↔engine drift fails loudly *before* any
-//! crash is injected, ADR-0008 D6.3) or **standalone** (mechanism B parent
+//! crash is injected, ADR-0008) or **standalone** (mechanism B parent
 //! replay, reconstructing the expected committed state for any recovered
 //! txnid).
 //!
@@ -11,7 +11,7 @@
 //! the FORK-1 `KnownForkBug` guard protects the vendored C fork, which is not
 //! in this loop (crash cycles are zerodb-only).
 //!
-//! Executed surface (ADR-0008 D2 / REC-21): `BeginRw`, `Commit`, `Abort`,
+//! Executed surface (ADR-0008 / REC-21): `BeginRw`, `Commit`, `Abort`,
 //! `CreateDb`, `ClearDb`, `DropDb`, `Put`, `PutFlagged`, `PutReserved`,
 //! `Del`, plus `Get`/`Len` as continuous in-txn cross-checks. Read-only
 //! positioning/iteration ops are skipped (the differential fuzz owns read

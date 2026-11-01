@@ -99,15 +99,9 @@ macro_rules! census {
     (@setpage $opts:ident, set) => {
         // Pin zerodb to the OS page size, as LMDB derives it (the ladder's
         // single asymmetry; see the engine_comparison backend).
-        $opts.page_size(os_page_size());
+        $opts.page_size(zerodb_oracle::os_page_size());
     };
     (@setpage $opts:ident, noset) => {};
-}
-
-fn os_page_size() -> u32 {
-    // SAFETY: sysconf with a valid name has no preconditions.
-    let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    u32::try_from(ps).unwrap_or(4096)
 }
 
 census!(run_lmdb, heed, noset);

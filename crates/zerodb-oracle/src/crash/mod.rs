@@ -17,7 +17,7 @@
 //!   process stays live; the parent joins through the lock file, verifies,
 //!   and commits over the dead writer.
 //!
-//! One **cycle** = one recovered-and-verified crash state (ADR-0008 OQ1):
+//! One **cycle** = one recovered-and-verified crash state (ADR-0008):
 //! each materialized image variant and each SIGKILL recovery counts as one
 //! toward the ≥10k acceptance bar.
 //!
@@ -39,7 +39,7 @@ pub use workload::{gen_spec, Mode, Spec};
 /// The outcome of one cut (mechanism A) or one child crash (mechanism B).
 #[derive(Debug, Default)]
 pub struct CutReport {
-    /// Recovered-and-verified crash states (the ADR-0008 OQ1 cycle unit).
+    /// Recovered-and-verified crash states (the ADR-0008 cycle unit).
     pub verified: u64,
     /// The cycle could not run to a verifiable cut (env pressure such as
     /// `MapFull`, spawn failure, …) — counted and reported, never silently
@@ -49,7 +49,7 @@ pub struct CutReport {
     pub violation: Option<String>,
     /// Durability mode of the cycle (for reporting).
     pub mode: Option<Mode>,
-    /// Adversarial-model characterization (ADR-0008 D4: logged, not gated):
+    /// Adversarial-model characterization (ADR-0008: logged, not gated):
     /// probes attempted / opened OK / designed-`Invalid` / walk-clean count.
     pub adv_probes: u64,
     /// Adversarial probes that opened successfully.
@@ -67,7 +67,7 @@ pub struct CutReport {
     /// counted process-wide in `model::SPILLED_TXNS` instead.
     pub spilled_txns: u64,
     /// Distinct in-map dirty regions the cycle's fault journal recorded
-    /// (ADR-0021 B3) — nonzero only for image cuts of the WRITE_MAP modes,
+    /// (ADR-0021) — nonzero only for image cuts of the WRITE_MAP modes,
     /// where the workload runs the true in-place realization. A green run
     /// with zero here and nonzero writemap cycles would mean the in-place
     /// crash coverage went vacuous.

@@ -57,11 +57,6 @@ pub enum Skip {
     /// Concurrent reader-vs-writer isolation is exercised properly through the
     /// reader table.
     VerifyDuringWrite,
-    /// The op is not yet implemented by one of the engines, so
-    /// [`crate::run`] skips it symmetrically on both sides (see
-    /// [`crate::Engine::implements`]). A differential run restricts itself to the
-    /// ops both engines support.
-    NotImplemented,
     /// The op combination is skipped because it crashes the *reference* engine —
     /// a confirmed bug in the vendored LMDB fork, not an observable behavior an
     /// oracle can assert. See `docs/UPSTREAM-BUGS.md` FORK-1 (SEGV in
