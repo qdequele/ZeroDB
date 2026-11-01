@@ -6,6 +6,21 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ## [Unreleased]
 
+### `WRITE_MAP` bulk writes at LMDB speed (issue #13)
+
+Under `WRITE_MAP`, every step of a write transaction's tree descent asked the
+dirty-page hash index whether the page was dirty. On a large write
+transaction those probes missed the cache, which cost 15–17 % of the cycles of
+a bulk insert. Once a transaction holds 64 dirty pages, the dirty store now
+also keeps two bits per page number. A dirty tree page is then found with one
+load and read at its own offset in the map, as LMDB reads a dirty page under
+`MDB_WRITEMAP`. Validation is unchanged. On Graviton4 with `WRITE_MAP`,
+`put/order/seq` went from 1.12× to 0.99× LMDB, `commit/batch/n10k` from 1.11×
+to 1.00× and `put/api/reserved` from 1.30× to 1.12×. 7 ladder rungs got faster
+and none slower, and the same rungs without `WRITE_MAP` are unchanged.
+Details: `benches/results/2026-10-31-writemap-dirty-bits-graviton.md`. New
+example `writemap_bulk_census` (`zerodb-oracle`).
+
 ### Write transactions reuse the previous one's containers (#8)
 
 Every write transaction built its working containers empty: the dirty-page

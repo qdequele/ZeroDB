@@ -320,7 +320,11 @@ Measured gaps first, then ideas without a measurement yet. Issues are on
   16 GiB map. Durable `WRITE_MAP` commits on macOS are 1.87–1.91× LMDB [L]
   because ZeroDB issues a second `fdatasync` after the meta write, which LMDB
   does not. Open: prefault / preallocation of the map (#42), the Graviton A/B,
-  and whether Meilisearch should set `WRITE_MAP`.
+  and whether Meilisearch should set `WRITE_MAP`. Bulk rungs with `WRITE_MAP`
+  are at parity on Graviton4 since the dirty store answers its dirty-page test
+  from per-page bits (`put/order/seq` 1.12× → 0.99×, `commit/batch/n10k`
+  1.11× → 1.00×). `put/val/v4k` stays at 1.12×: in-map overflow runs are
+  zero-filled before the value is copied in, which LMDB does not do.
 - **Short read txns** — one read txn + one get is 1.55× [V]. The memo level
   and the named-DB table are now reused across txns on a thread (#25,
   `env/txn/ro_get_one` −26 % on macOS); a Linux re-measure is pending.
