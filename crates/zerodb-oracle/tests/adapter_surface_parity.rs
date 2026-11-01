@@ -4,34 +4,7 @@
 //! put flags are treated on a plain database.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// A throwaway directory (no `tempfile` dependency in this crate).
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-surface-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb_oracle::tempdir::TempDir;
 
 /// Every `MdbError` variant heed 0.22.1 exposes (non-`master3`), paired.
 macro_rules! variants {
@@ -103,7 +76,7 @@ fn error_display_wrapping_matches_heed() {
 #[test]
 fn database_used_with_another_envs_txn_panics_like_heed() {
     // --- real heed / LMDB
-    let (a, b) = (TempDir::new(), TempDir::new());
+    let (a, b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let env_a = unsafe {
         heed::EnvOpenOptions::new()
             .read_txn_without_tls()
@@ -129,7 +102,7 @@ fn database_used_with_another_envs_txn_panics_like_heed() {
         .expect("heed must panic on an env/txn mismatch");
 
     // --- adapter
-    let (a, b) = (TempDir::new(), TempDir::new());
+    let (a, b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let env_a = unsafe {
         heed_zerodb::EnvOpenOptions::new()
             .read_txn_without_tls()
@@ -166,7 +139,7 @@ fn database_used_with_another_envs_txn_panics_like_heed() {
 #[test]
 fn dup_only_put_flags_on_plain_db_match_the_fork() {
     fn outcome_lmdb(flags: heed::PutFlags) -> String {
-        let d = TempDir::new();
+        let d = TempDir::new().unwrap();
         let env = unsafe {
             heed::EnvOpenOptions::new()
                 .read_txn_without_tls()
@@ -184,7 +157,7 @@ fn dup_only_put_flags_on_plain_db_match_the_fork() {
         format!("{:?}", after.map_err(|e| e.to_string()))
     }
     fn outcome_zdb(flags: heed_zerodb::PutFlags) -> String {
-        let d = TempDir::new();
+        let d = TempDir::new().unwrap();
         let env = unsafe {
             heed_zerodb::EnvOpenOptions::new()
                 .read_txn_without_tls()

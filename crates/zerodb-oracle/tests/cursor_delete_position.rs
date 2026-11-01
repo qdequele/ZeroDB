@@ -28,27 +28,13 @@ fn keys() -> Vec<Vec<u8>> {
     (0..N as u64).map(|i| i.to_be_bytes().to_vec()).collect()
 }
 
-/// The OS page size, clamped to zerodb's supported range. LMDB is locked to it
-/// and exposes no selector, so zerodb is pinned to the same value: a geometry
-/// mismatch would change which deletes trigger a merge and make the traces
-/// incomparable for reasons that have nothing to do with cursor position.
-fn os_page_size() -> u32 {
-    // SAFETY: `sysconf(_SC_PAGESIZE)` is a pure query with no preconditions and
-    // no side effects.
-    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    match u32::try_from(v) {
-        Ok(p) if (4096..=65536).contains(&p) && p.is_power_of_two() => p,
-        _ => 4096,
-    }
-}
-
 /// Generate one probe module per engine from a single body, so neither engine
 /// can be given a different sequence of calls.
 macro_rules! probes {
     ($m:ident, $heed:ident, $setpage:tt) => {
         mod $m {
             #[allow(unused_imports)] // only the `set` arm needs the page size
-            use super::{os_page_size, N, VAL};
+            use super::{N, VAL};
             use std::path::Path;
             use $heed::types::Bytes;
             use $heed::{Database, Env, EnvOpenOptions, WithoutTls};
@@ -223,7 +209,7 @@ macro_rules! probes {
             }
         }
     };
-    (@setpage $o:ident, set) => { $o.page_size(os_page_size()); };
+    (@setpage $o:ident, set) => { $o.page_size(zerodb_oracle::os_page_size()); };
     (@setpage $o:ident, noset) => {};
 }
 

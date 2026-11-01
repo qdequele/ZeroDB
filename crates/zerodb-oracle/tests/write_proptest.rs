@@ -1,7 +1,7 @@
 //! Randomized **write-workload** differential (write-path acceptance:
 //! randomized single-threaded put/del/commit/abort workloads).
 //!
-//! Unlike `read_proptest` (raw `decode_ops` bytes, whose op density is
+//! Unlike `random_ops_proptest` (raw `decode_ops` bytes, whose op density is
 //! whatever `Arbitrary` yields), this generator is **write-biased and
 //! collision-heavy**: keys come from a 24-slot pool so puts overwrite, deletes
 //! hit, APPEND misfires, and `iter_mut` positions land on real entries; ops

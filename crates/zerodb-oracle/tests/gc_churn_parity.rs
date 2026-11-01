@@ -21,36 +21,11 @@
 //! `Env::real_disk_size` parity is also asserted structurally: zerodb's value
 //! must equal the data file's `fstat` length (SPEC 00 row 18 / GC-22).
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
 use heed::types::Bytes;
 use heed::{EnvOpenOptions as HeedOpts, WithoutTls};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new(tag: &str) -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-churn-{tag}-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb_oracle::tempdir::TempDir;
 
 const PS: u32 = 4096;
 const MAP: usize = 64 << 20;
@@ -201,8 +176,8 @@ fn assert_curves(tag: &str, lmdb: &[u64], zdb: &[u64], lo: f64, hi: f64) {
 #[test]
 fn churn_parity_general() {
     let cycles = make_cycles(0x5EED_0001, true);
-    let ldir = TempDir::new("l-gen");
-    let zdir = TempDir::new("z-gen");
+    let ldir = TempDir::new().unwrap();
+    let zdir = TempDir::new().unwrap();
     let lmdb = run_lmdb(ldir.path(), &cycles);
     let zdb = run_zerodb(zdir.path(), &cycles);
     assert_curves("general", &lmdb, &zdb, 0.5, 1.5);
@@ -212,8 +187,8 @@ fn churn_parity_general() {
 #[test]
 fn churn_parity_no_overflow() {
     let cycles = make_cycles(0x5EED_0002, false);
-    let ldir = TempDir::new("l-inl");
-    let zdir = TempDir::new("z-inl");
+    let ldir = TempDir::new().unwrap();
+    let zdir = TempDir::new().unwrap();
     let lmdb = run_lmdb(ldir.path(), &cycles);
     let zdb = run_zerodb(zdir.path(), &cycles);
     // Lower edge 0.60 (ADR-0005 D5 addendum; SPEC 03 §6.4 insert-point split)

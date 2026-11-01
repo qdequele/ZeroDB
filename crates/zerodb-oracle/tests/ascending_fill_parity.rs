@@ -26,36 +26,11 @@
 //! to match** (zerodb's page size is runtime-chosen), keeping the
 //! comparison valid on every platform instead of hard-coding 4 KiB.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
 use heed::types::Bytes;
 use heed::{EnvOpenOptions as HeedOpts, WithoutTls};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new(tag: &str) -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-ascfill-{tag}-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb_oracle::tempdir::TempDir;
 
 const MAP: usize = 256 << 20;
 
@@ -161,8 +136,8 @@ fn zerodb_shape_with(dir: &Path, ps: u32, pairs: &[(Vec<u8>, Vec<u8>)], append: 
 /// `cargo test -- --nocapture`.
 fn assert_leaf_parity(tag: &str, n: u32, wide: bool, vlen: usize, tol: f64) {
     let pairs = make_pairs(n, wide, vlen);
-    let ldir = TempDir::new(&format!("l-{tag}"));
-    let zdir = TempDir::new(&format!("z-{tag}"));
+    let ldir = TempDir::new().unwrap();
+    let zdir = TempDir::new().unwrap();
     let (lmdb, ps) = lmdb_stat(ldir.path(), &pairs);
     let lmdb = lmdb.leaf_pages;
     let zdb = zerodb_shape(zdir.path(), ps, &pairs).leaf_pages;
@@ -272,8 +247,8 @@ fn ascending_branch_model(leaves: u64, cap: u64) -> (u64, u32) {
 fn assert_branch_parity(tag: &str, n: u32, klen: usize, vlen: usize, need_depth3: bool) {
     let pairs = make_pairs_klen(n, klen, vlen);
     let ksize = pairs[0].0.len();
-    let ldir = TempDir::new(&format!("lb-{tag}"));
-    let zdir = TempDir::new(&format!("zb-{tag}"));
+    let ldir = TempDir::new().unwrap();
+    let zdir = TempDir::new().unwrap();
     let (lmdb, ps) = lmdb_stat(ldir.path(), &pairs);
     let zdb = zerodb_shape(zdir.path(), ps, &pairs);
     let (lcap, zcap) = (
@@ -384,8 +359,8 @@ fn ascending_leaf_model(n: u64, cap: u64, append: bool) -> u64 {
 fn assert_leaf_model(tag: &str, n: u32, klen: usize, vlen: usize, append: bool) {
     let pairs = make_pairs_klen(n, klen, vlen);
     let ksize = pairs[0].0.len();
-    let ldir = TempDir::new(&format!("lm-{tag}"));
-    let zdir = TempDir::new(&format!("zm-{tag}"));
+    let ldir = TempDir::new().unwrap();
+    let zdir = TempDir::new().unwrap();
     let (lmdb, ps) = lmdb_stat_with(ldir.path(), &pairs, append);
     let zdb = zerodb_shape_with(zdir.path(), ps, &pairs, append);
     let (lcap, zcap) = (

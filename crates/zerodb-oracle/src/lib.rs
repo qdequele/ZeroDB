@@ -123,6 +123,21 @@ pub fn round_map_size(size: usize) -> usize {
     size.div_ceil(q) * q
 }
 
+/// The OS page size, clamped to ZeroDB's supported `[4096, 65536]`
+/// power-of-two range. LMDB is locked to the OS page size and exposes no
+/// selector, so a comparison that depends on page geometry pins ZeroDB to
+/// this value.
+#[must_use]
+pub fn os_page_size() -> u32 {
+    // SAFETY: `sysconf(_SC_PAGESIZE)` is a pure query with no preconditions
+    // and no side effects.
+    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    match u32::try_from(v) {
+        Ok(p) if (4096..=65536).contains(&p) && p.is_power_of_two() => p,
+        _ => 4096,
+    }
+}
+
 /// A point where two engines produced different results for the same op.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Divergence {

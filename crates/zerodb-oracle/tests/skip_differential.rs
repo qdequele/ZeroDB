@@ -8,34 +8,8 @@
 //! not depend on page size.
 
 use std::ops::Bound;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// A throwaway directory (no `tempfile` dependency in this crate).
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-skip-diff-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use std::path::Path;
+use zerodb_oracle::tempdir::TempDir;
 
 /// xorshift64* — deterministic, no `rand`.
 struct Rng(u64);
@@ -199,7 +173,7 @@ fn run(seed: u64) {
             (0..len).map(|i| i as u8).collect()
         })
         .collect();
-    let (dl, dz) = (TempDir::new(), TempDir::new());
+    let (dl, dz) = (TempDir::new().unwrap(), TempDir::new().unwrap());
     let (le, ldb) = lmdb::build(dl.path(), &keys, &vals);
     let (ze, zdb_) = zdb::build(dz.path(), &keys, &vals);
 

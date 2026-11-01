@@ -25,19 +25,6 @@ fn keys() -> Vec<Vec<u8>> {
     (0..N as u64).map(|i| i.to_be_bytes().to_vec()).collect()
 }
 
-/// The OS page size, clamped to zerodb's supported range (see
-/// `cursor_delete_position.rs`: LMDB is locked to it, so zerodb is pinned to
-/// the same geometry and the same rewrites split the same leaves).
-fn os_page_size() -> u32 {
-    // SAFETY: `sysconf(_SC_PAGESIZE)` is a pure query with no preconditions and
-    // no side effects.
-    let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    match u32::try_from(v) {
-        Ok(p) if (4096..=65536).contains(&p) && p.is_power_of_two() => p,
-        _ => 4096,
-    }
-}
-
 /// The replacement width for the `i`-th rewrite under each shape.
 fn width(shape: u8, i: usize) -> usize {
     match shape {
@@ -56,7 +43,7 @@ macro_rules! probes {
     ($m:ident, $heed:ident, $setpage:tt) => {
         mod $m {
             #[allow(unused_imports)] // only the `set` arm needs the page size
-            use super::{os_page_size, width, N, VAL};
+            use super::{width, N, VAL};
             use std::ops::Bound;
             use std::path::Path;
             use $heed::types::Bytes;
@@ -242,7 +229,7 @@ macro_rules! probes {
             }
         }
     };
-    (@setpage $o:ident, set) => { $o.page_size(os_page_size()); };
+    (@setpage $o:ident, set) => { $o.page_size(zerodb_oracle::os_page_size()); };
     (@setpage $o:ident, noset) => {};
 }
 

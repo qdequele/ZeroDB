@@ -21,6 +21,9 @@ heed = "=0.22.1"
 lmdb-master-sys = "=0.2.6"
 thiserror.workspace = true
 arbitrary.workspace = true
+# OS page size query (sysconf, `os_page_size`) so zerodb can be pinned to
+# LMDB's page size for a fair comparison. Allowlisted (AGENTS.md).
+libc.workspace = true
 # The native engine under test. Workspace-internal, no C linkage.
 zerodb = { path = "../zerodb" }
 zerodb-core = { path = "../zerodb-core" }
@@ -47,6 +50,3 @@ harness = false
 [dev-dependencies]
 proptest.workspace = true
 criterion.workspace = true
-# OS page size query (sysconf) so zerodb can be pinned to LMDB's page size for a
-# fair comparison. Allowlisted (AGENTS.md); bench-only.
-libc.workspace = true
