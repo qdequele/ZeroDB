@@ -668,8 +668,10 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// # Errors
     ///
-    /// As [`Database::put`]; `Io` if `f` returns an error (the entry is still
-    /// written, as in LMDB).
+    /// As [`Database::put`]; `Io` if `f` returns an error, and
+    /// `Io(UnexpectedEof)` if `f` leaves part of the space unwritten. In both
+    /// cases the entry is still written (unwritten bytes read back as zero),
+    /// as in LMDB.
     pub fn put_reserved<'a, F>(
         &self,
         txn: &mut RwTxn,
@@ -683,31 +685,27 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         self.assert_env(txn);
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
-        // Hand the caller the engine's in-frame slot directly (the
-        // `MDB_RESERVE` shape): no heap buffer, no copy. Two deliberate
-        // semantics, both fork-pinned by the oracle's
-        // `put_reserved_failing_closure_leaves_entry_parity`:
-        //  - the engine reserves the slot BEFORE the closure runs, so a
-        //    closure error leaves the entry in place (LMDB cannot un-put a
-        //    reserve either) while the error propagates as `Io` (the fork's
-        //    variant);
-        //  - the slot may carry stale frame bytes (a COWed page's old cell
-        //    heap), so the unwritten tail is zeroed either way (the adapter's
-        //    zero-tail contract).
-        let mut werr: Option<std::io::Error> = None;
+        // The closure writes straight into the engine's slot, reserved before
+        // it runs, so a closure error cannot un-put the entry (as in LMDB).
+        // The slot may hold stale bytes from the copied page, so the
+        // unwritten tail is zeroed either way. The oracle pins both cases:
+        // `put_reserved_failing_closure_leaves_entry_parity` and
+        // `put_reserved_short_write_parity`.
+        let mut outcome: std::io::Result<()> = Ok(());
         self.inner
             .put_reserved(txn.zdb_mut(), &kb, data_size, |slot| {
                 let mut space = ReservedSpace::new(slot);
-                if let Err(e) = write_func(&mut space) {
-                    werr = Some(e);
-                }
+                outcome = write_func(&mut space).and_then(|()| {
+                    if space.remaining() == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::ErrorKind::UnexpectedEof.into())
+                    }
+                });
                 space.zero_unwritten_tail();
             })
             .map_err(Into::<Error>::into)?;
-        match werr {
-            Some(e) => Err(Error::Io(e)),
-            None => Ok(()),
-        }
+        outcome.map_err(Error::Io)
     }
 
     /// `delete(txn, key)` (SPEC 00 row 36): whether the key existed.
