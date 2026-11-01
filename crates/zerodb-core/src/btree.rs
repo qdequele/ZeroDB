@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use super::cmp::KeyCmp;
-use super::dirty::DirtyStore;
+use super::dirty::{DirtyStore, Resolved};
 use super::page::{
     BranchRef, FileTrust, LeafRef, LeafValue, OverflowRef, PageError, PageRef, PageType,
     PGNO_INVALID,
@@ -146,9 +146,16 @@ impl<'a> Source<'a> {
                 dirty,
                 bytes,
                 last_pg,
-            } => match dirty.bytes(pgno) {
-                Some(frame) => Ok((frame, false)),
-                None => map_slice(bytes, *last_pg).map(|b| (b, true)),
+            } => match dirty.resolve(pgno) {
+                Resolved::Clean => map_slice(bytes, *last_pg).map(|b| (b, true)),
+                // An in-map dirty page lives at its own pgno in the map,
+                // which `bytes` views (ADR-0021).
+                Resolved::MapPage => (pgno as usize)
+                    .checked_mul(ps)
+                    .and_then(|base| bytes.get(base..base.checked_add(ps)?))
+                    .map(|b| (b, false))
+                    .ok_or(PageError::BufferTooSmall { got: 0, psize: ps }),
+                Resolved::Frame(frame) => Ok((frame, false)),
             },
         }
     }
