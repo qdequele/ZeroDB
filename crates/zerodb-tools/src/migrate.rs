@@ -3,9 +3,10 @@
 //! off-by-default `migrate-lmdb` feature (ADR-0001 amendment).
 //!
 //! Opens the source LMDB env **read-only** via heed =0.22.1 (the Meilisearch
-//! fork), enumerates the main DB and every named sub-DB, and re-writes them into
-//! a fresh zerodb env through the normal write path in **batched** write txns.
-//! Verifies the per-DB entry counts after the copy.
+//! fork), enumerates the main DB and every named sub-DB, and writes their
+//! records into a fresh zerodb env as they are read, in write txns of about
+//! 64 MiB each that grow the map when it fills (as `load` does). Verifies the
+//! per-DB entry counts after the copy.
 //!
 //! ### Enumerating LMDB sub-databases (generic, no a-priori name list)
 //!
@@ -25,10 +26,8 @@ use heed::{EnvFlags, EnvOpenOptions};
 
 use zerodb::collect_entries_flagged;
 
+use crate::commands::{DbWriter, BATCH_BYTES};
 use crate::common::{BoxErr, MAX_TOOL_DBS};
-
-/// Commit every `BATCH` puts so a single write txn never holds the whole DB.
-const BATCH: usize = 10_000;
 
 /// Open the source LMDB env read-only and stream it into a fresh zerodb env at
 /// `dst_dir`. Returns a human-readable summary.
@@ -82,23 +81,6 @@ pub fn cmd_migrate(
         .open_database(&rtxn, None)?
         .ok_or("source has no main database")?;
 
-    // Partition the main DB into user data and sub-DB names.
-    let mut main_user: Vec<crate::common::Kv> = Vec::new();
-    let mut subdb_names: Vec<String> = Vec::new();
-    for item in main.iter(&rtxn)? {
-        let (k, v) = item?;
-        let as_subdb = std::str::from_utf8(k).ok().and_then(|name| {
-            match src.open_database::<Bytes, Bytes>(&rtxn, Some(name)) {
-                Ok(Some(_)) => Some(name.to_string()),
-                _ => None,
-            }
-        });
-        match as_subdb {
-            Some(name) => subdb_names.push(name),
-            None => main_user.push((k.to_vec(), v.to_vec())),
-        }
-    }
-
     let mut report = String::new();
     writeln!(
         report,
@@ -107,8 +89,18 @@ pub fn cmd_migrate(
         dst_dir.display()
     )?;
 
-    // Main DB user data.
-    let main_written = write_db_batched(&dst, None, &main_user)?;
+    // The main DB's user records, written as they are read. Its other keys
+    // name the sub-DBs, copied next.
+    let mut db = DbWriter::new(&dst, None, BATCH_BYTES);
+    let mut subdb_names: Vec<String> = Vec::new();
+    for item in main.iter(&rtxn)? {
+        let (k, v) = item?;
+        match subdb_name(&src, &rtxn, k) {
+            Some(name) => subdb_names.push(name),
+            None => db.push(k, v)?,
+        }
+    }
+    let main_written = db.finish()?;
     writeln!(report, "  <main>: {main_written} entries")?;
 
     // Each named sub-DB.
@@ -117,51 +109,31 @@ pub fn cmd_migrate(
         let sub: heed::Database<Bytes, Bytes> = src
             .open_database(&rtxn, Some(name))?
             .ok_or("sub-DB vanished")?;
-        let entries: Vec<crate::common::Kv> = sub
-            .iter(&rtxn)?
-            .map(|r| r.map(|(k, v)| (k.to_vec(), v.to_vec())))
-            .collect::<Result<_, _>>()?;
-        let n = write_db_batched(&dst, Some(name.as_bytes()), &entries)?;
+        let mut db = DbWriter::new(&dst, Some(name.as_bytes()), BATCH_BYTES);
+        for item in sub.iter(&rtxn)? {
+            let (k, v) = item?;
+            db.push(k, v)?;
+        }
+        let n = db.finish()?;
         writeln!(report, "  {name}: {n} entries")?;
         subdb_counts.push((name.clone(), n));
     }
 
     // --- Verify per-DB counts ---
-    verify_counts(&dst, main_user.len() as u64, &subdb_counts)?;
+    verify_counts(&dst, main_written, &subdb_counts)?;
     writeln!(report, "  verified: all per-DB entry counts match")?;
     Ok(report)
 }
 
-/// Write `entries` into `name` (or the main DB) via the zerodb write path,
-/// committing every [`BATCH`]. Creates a named DB even when empty so its catalog
-/// entry exists.
-fn write_db_batched(
-    dst: &zerodb::Env,
-    name: Option<&[u8]>,
-    entries: &[crate::common::Kv],
-) -> Result<u64, BoxErr> {
-    // Ensure a named DB exists (empty or not).
-    if let Some(n) = name {
-        let mut wtxn = dst.write_txn()?;
-        dst.create_database(&mut wtxn, Some(n))?;
-        wtxn.commit()?;
+/// `Some(name)` if the main-DB key `key` names a sub-database of `src`: it
+/// is UTF-8 and opens as a database (a plain user key fails with
+/// `MDB_INCOMPATIBLE`).
+fn subdb_name(src: &heed::Env, rtxn: &heed::RoTxn, key: &[u8]) -> Option<String> {
+    let name = std::str::from_utf8(key).ok()?;
+    match src.open_database::<Bytes, Bytes>(rtxn, Some(name)) {
+        Ok(Some(_)) => Some(name.to_string()),
+        _ => None,
     }
-    let mut written = 0u64;
-    for chunk in entries.chunks(BATCH) {
-        let mut wtxn = dst.write_txn()?;
-        let db = match name {
-            None => dst.main_database(),
-            Some(n) => dst
-                .open_database(&wtxn, Some(n))?
-                .ok_or("just-created DB missing")?,
-        };
-        for (k, v) in chunk {
-            db.put(&mut wtxn, k, v)?;
-            written += 1;
-        }
-        wtxn.commit()?;
-    }
-    Ok(written)
 }
 
 /// Verify the migrated env's per-DB entry counts against the source counts.

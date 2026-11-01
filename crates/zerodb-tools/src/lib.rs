@@ -49,6 +49,8 @@ pub mod naming;
 #[cfg(feature = "migrate-lmdb")]
 pub mod migrate;
 
+use std::fs::File;
+use std::io::BufWriter;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -89,10 +91,9 @@ fn dispatch(args: &[String]) -> Result<ExitCode, common::BoxErr> {
         "dump" => {
             let (positional, opts) = parse_opts(rest)?;
             let dir = first_positional(&positional, "dump <env-dir> [--out FILE]")?;
-            let text = commands::cmd_dump(&dir)?;
             match opts.out {
-                Some(out) => std::fs::write(out, text.as_bytes())?,
-                None => print!("{text}"),
+                Some(out) => commands::write_dump(&dir, BufWriter::new(File::create(out)?))?,
+                None => commands::write_dump(&dir, std::io::stdout().lock())?,
             }
             Ok(ExitCode::SUCCESS)
         }

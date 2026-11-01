@@ -5,9 +5,13 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write as _};
 use std::path::Path;
 
-use zerodb::{check::check_image, check::check_snapshot, Env, EnvOpenOptions, MdbError, PutFlags};
+use zerodb::{
+    check::check_image, check::check_snapshot, for_each_entry_flagged, named_databases, Env,
+    EnvOpenOptions, MdbError, PutFlags, StreamBuildError,
+};
+use zerodb_core::page::F_SUBDATA;
 
-use crate::common::{collect_dump, open_ro, read_txn, BoxErr};
+use crate::common::{open_ro, read_txn, BoxErr};
 use crate::dump_format;
 use crate::naming;
 
@@ -127,20 +131,65 @@ fn printable_name(name: &[u8]) -> String {
     }
 }
 
-/// `dump <env-dir>`: logical dump text (mdb_dump-shaped) of every DB, from one
-/// read snapshot. Attaches to the env read-only through its lock file, like
-/// `stat`. Probes both data-file names (ADR-0010).
+/// `dump <env-dir>`: write the logical dump (mdb_dump-shaped) of every DB,
+/// from one read snapshot, to `out`. Records are written as they are read,
+/// so memory stays bounded however large the env is. Attaches to the env
+/// read-only through its lock file, like `stat`. Probes both data-file names
+/// (ADR-0010).
 ///
 /// # Errors
 ///
 /// [`naming::NameError`] if the env is missing or ambiguous, the open's error,
-/// or any read error.
-pub fn cmd_dump(env_dir: &Path) -> Result<String, BoxErr> {
+/// a read error, or a write error on `out` (which may then hold a partial
+/// dump).
+pub fn write_dump(env_dir: &Path, out: impl std::io::Write) -> Result<(), BoxErr> {
     let data = naming::resolve(env_dir)?;
     let env = open_ro(env_dir, data.name)?;
     let txn = read_txn(&env)?;
-    let dbs = collect_dump(&env, &txn)?;
-    Ok(dump_format::render(&dbs))
+    let mut w = dump_format::DumpWriter::new(out)?;
+
+    // The main DB's `F_SUBDATA` records are the named DBs' catalog entries,
+    // dumped as their own blocks below.
+    w.begin_db(None)?;
+    for_each_entry_flagged(&env.main_database(), &txn, |k, flags, v| {
+        if flags & F_SUBDATA == 0 {
+            w.record(k, v)?;
+        }
+        Ok(())
+    })
+    .map_err(walk_error)?;
+    w.end_db()?;
+
+    for name in named_databases(&txn)? {
+        let db = env
+            .open_database(&txn, Some(&name))?
+            .ok_or("named DB vanished between enumeration and open")?;
+        w.begin_db(Some(&name))?;
+        for_each_entry_flagged(&db, &txn, |k, _, v| Ok(w.record(k, v)?)).map_err(walk_error)?;
+        w.end_db()?;
+    }
+    w.finish()?;
+    Ok(())
+}
+
+/// [`write_dump`] into a `String`: the whole dump in memory, for small envs
+/// and tests.
+///
+/// # Errors
+///
+/// As [`write_dump`].
+pub fn cmd_dump(env_dir: &Path) -> Result<String, BoxErr> {
+    let mut out = Vec::new();
+    write_dump(env_dir, &mut out)?;
+    Ok(String::from_utf8(out)?)
+}
+
+/// A tree walk's error as a tool error.
+fn walk_error(e: StreamBuildError) -> BoxErr {
+    match e {
+        StreamBuildError::Io(e) => e.into(),
+        StreamBuildError::Page(e) => format!("corrupt tree: {e}").into(),
+    }
 }
 
 /// `load <dump-file> <env-dir>`: build a fresh env from a logical dump.
@@ -217,26 +266,14 @@ fn load_batched(
     // Pass 2: write each block's records in batches, in dump order (the main
     // DB first, then the named DBs).
     let mut reader = dump_format::DumpReader::new(BufReader::with_capacity(DUMP_BUF, source))?;
-    let mut batch = Batch::default();
     let (mut key, mut val) = (Vec::new(), Vec::new());
     while let Some(name) = reader.next_db()? {
-        batch.clear();
-        let mut written = false;
+        let mut db = DbWriter::new(&env, name.as_deref(), batch_bytes);
         while reader.next_record(&mut key, &mut val)? {
-            batch.push(&key, &val);
-            if batch.data.len() >= batch_bytes {
-                write_batch_growing(&env, name.as_deref(), &batch)?;
-                batch.clear();
-                written = true;
-            }
+            db.push(&key, &val)?;
         }
-        // The last partial batch; an empty one still creates an empty named
-        // DB's catalog record.
-        if !batch.is_empty() || !written {
-            write_batch_growing(&env, name.as_deref(), &batch)?;
-        }
+        db.finish()?;
     }
-    drop(batch);
 
     // Verify the produced env is structurally clean before returning. Unlike
     // the old `check_image` over the file, this does not re-verify the meta
@@ -314,7 +351,7 @@ pub(crate) fn open_exclusive_destination(
 
 /// Commit a write txn after this many bytes of keys and values, so one txn
 /// never holds a large DB's dirty pages in memory.
-const BATCH_BYTES: usize = 64 << 20;
+pub(crate) const BATCH_BYTES: usize = 64 << 20;
 
 /// The read (and spool write) buffer size for the dump.
 const DUMP_BUF: usize = 1 << 20;
@@ -387,9 +424,68 @@ fn anonymous_spool(dir: &Path) -> Result<File, BoxErr> {
     Ok(file)
 }
 
-/// One write txn's records, packed into one buffer: about [`BATCH_BYTES`]
-/// of keys and values, kept until the txn commits so a full map can be grown
-/// and the batch retried.
+/// Writes one database's records into a fresh env in write txns of about
+/// `batch_bytes` of keys and values each (`load` and `migrate-from-lmdb`).
+pub(crate) struct DbWriter<'e> {
+    env: &'e Env,
+    name: Option<Vec<u8>>,
+    batch_bytes: usize,
+    batch: Batch,
+    committed: bool,
+    records: u64,
+}
+
+impl<'e> DbWriter<'e> {
+    /// A writer into the named DB `name`, or the main DB.
+    pub(crate) fn new(env: &'e Env, name: Option<&[u8]>, batch_bytes: usize) -> Self {
+        DbWriter {
+            env,
+            name: name.map(<[u8]>::to_vec),
+            batch_bytes,
+            batch: Batch::default(),
+            committed: false,
+            records: 0,
+        }
+    }
+
+    /// Add one record, committing the batch once it is full.
+    ///
+    /// # Errors
+    ///
+    /// As [`write_batch_growing`].
+    pub(crate) fn push(&mut self, key: &[u8], val: &[u8]) -> Result<(), BoxErr> {
+        self.batch.push(key, val);
+        self.records += 1;
+        if self.batch.data.len() >= self.batch_bytes {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
+    /// Commit the last partial batch and return how many records were
+    /// pushed. A named DB with no records is still created, so its catalog
+    /// record exists.
+    ///
+    /// # Errors
+    ///
+    /// As [`write_batch_growing`].
+    pub(crate) fn finish(mut self) -> Result<u64, BoxErr> {
+        if !self.batch.is_empty() || !self.committed {
+            self.commit()?;
+        }
+        Ok(self.records)
+    }
+
+    fn commit(&mut self) -> Result<(), BoxErr> {
+        write_batch_growing(self.env, self.name.as_deref(), &self.batch)?;
+        self.batch.clear();
+        self.committed = true;
+        Ok(())
+    }
+}
+
+/// One write txn's records, packed into one buffer, kept until the txn
+/// commits so a full map can be grown and the batch retried.
 #[derive(Default)]
 struct Batch {
     /// Every record's key then value, back to back.

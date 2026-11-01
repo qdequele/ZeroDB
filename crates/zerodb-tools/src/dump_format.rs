@@ -39,7 +39,7 @@
 //! in ascending name order. Within a block, records are in ascending key order.
 //! `<SP>` is a single ASCII space; an empty value renders as just `<SP>\n`.
 
-use std::fmt::Write as _;
+use std::io::Write;
 
 /// One database section of a dump: `name = None` for the main/unnamed DB.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,13 +53,15 @@ pub struct DumpDb {
 /// The dump-format version line value.
 pub const DUMP_VERSION: u32 = 3;
 
-/// Lowercase-hex encode `bytes` (two digits per byte), the `bytevalue` encoding.
-fn to_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        write!(s, "{b:02x}").expect("write to String is infallible");
+/// Append the lowercase-hex encoding of `bytes` (two digits per byte, the
+/// `bytevalue` encoding) to `out`.
+fn push_hex(out: &mut Vec<u8>, bytes: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    out.reserve(bytes.len() * 2);
+    for &b in bytes {
+        out.push(DIGITS[usize::from(b >> 4)]);
+        out.push(DIGITS[usize::from(b & 0xf)]);
     }
-    s
 }
 
 /// Decode a lowercase/uppercase-hex field, appending the bytes to `out`.
@@ -85,28 +87,103 @@ fn hex_digit(c: u8) -> Result<u8, DumpError> {
     }
 }
 
+/// Writes dump text as it goes, so dumping a database never holds more than
+/// one record in memory.
+///
+/// Call [`DumpWriter::begin_db`], then [`DumpWriter::record`] for each record
+/// in ascending key order, then [`DumpWriter::end_db`], once per database:
+/// the main database first, then the named ones in ascending name order.
+pub struct DumpWriter<W: Write> {
+    out: W,
+    /// The line being encoded, reused across lines.
+    line: Vec<u8>,
+}
+
+impl<W: Write> DumpWriter<W> {
+    /// Start a dump: writes the `VERSION=` line.
+    ///
+    /// # Errors
+    ///
+    /// The write error.
+    pub fn new(mut out: W) -> std::io::Result<Self> {
+        writeln!(out, "VERSION={DUMP_VERSION}")?;
+        Ok(DumpWriter {
+            out,
+            line: Vec::new(),
+        })
+    }
+
+    /// Start a database block; `name` is `None` for the main database.
+    ///
+    /// # Errors
+    ///
+    /// The write error.
+    pub fn begin_db(&mut self, name: Option<&[u8]>) -> std::io::Result<()> {
+        self.out.write_all(b"format=bytevalue\n")?;
+        if let Some(name) = name {
+            self.hex_line(b"database=", name)?;
+        }
+        self.out.write_all(b"type=btree\nHEADER=END\n")
+    }
+
+    /// Write one record of the current block.
+    ///
+    /// # Errors
+    ///
+    /// The write error.
+    pub fn record(&mut self, key: &[u8], val: &[u8]) -> std::io::Result<()> {
+        self.hex_line(b" ", key)?;
+        self.hex_line(b" ", val)
+    }
+
+    /// End the current database block.
+    ///
+    /// # Errors
+    ///
+    /// The write error.
+    pub fn end_db(&mut self) -> std::io::Result<()> {
+        self.out.write_all(b"DATA=END\n")
+    }
+
+    /// Flush and return the output.
+    ///
+    /// # Errors
+    ///
+    /// The flush error.
+    pub fn finish(mut self) -> std::io::Result<W> {
+        self.out.flush()?;
+        Ok(self.out)
+    }
+
+    /// Write `prefix`, the hex encoding of `bytes`, and a newline.
+    fn hex_line(&mut self, prefix: &[u8], bytes: &[u8]) -> std::io::Result<()> {
+        self.line.clear();
+        self.line.extend_from_slice(prefix);
+        push_hex(&mut self.line, bytes);
+        self.line.push(b'\n');
+        self.out.write_all(&self.line)
+    }
+}
+
 /// Render a set of databases (main first, named DBs in ascending name order) to
 /// the dump text. Deterministic: the same logical content always yields the same
 /// bytes. Callers must pass the main DB as `name = None` first (if present) and
 /// named DBs sorted by name.
 #[must_use]
 pub fn render(dbs: &[DumpDb]) -> String {
-    let mut out = String::new();
-    writeln!(out, "VERSION={DUMP_VERSION}").expect("infallible");
-    for db in dbs {
-        writeln!(out, "format=bytevalue").expect("infallible");
-        if let Some(name) = &db.name {
-            writeln!(out, "database={}", to_hex(name)).expect("infallible");
+    let write = || -> std::io::Result<Vec<u8>> {
+        let mut w = DumpWriter::new(Vec::new())?;
+        for db in dbs {
+            w.begin_db(db.name.as_deref())?;
+            for (k, v) in &db.entries {
+                w.record(k, v)?;
+            }
+            w.end_db()?;
         }
-        writeln!(out, "type=btree").expect("infallible");
-        writeln!(out, "HEADER=END").expect("infallible");
-        for (k, v) in &db.entries {
-            writeln!(out, " {}", to_hex(k)).expect("infallible");
-            writeln!(out, " {}", to_hex(v)).expect("infallible");
-        }
-        writeln!(out, "DATA=END").expect("infallible");
-    }
-    out
+        w.finish()
+    };
+    let bytes = write().expect("writing to a Vec cannot fail");
+    String::from_utf8(bytes).expect("the dump text is ASCII")
 }
 
 /// A dump parse/validation error.
