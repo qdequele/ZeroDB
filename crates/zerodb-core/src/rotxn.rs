@@ -457,8 +457,7 @@ impl Env {
     /// [`MdbError::ReadersFull`] when every reader-table slot is occupied
     /// (TXN-16; the table holds `max_readers` slots, default 126). In a
     /// lock-file environment, [`MdbError::MapResized`] when another process
-    /// committed beyond this process's logical map size (ADR-0023 amendment
-    /// 15).
+    /// committed beyond this process's logical map size (ADR-0023).
     pub fn read_txn(&self) -> Result<RoTxn<'_>> {
         let (snap, slot) = self.inner().pin_reader()?;
         Ok(RoTxn {

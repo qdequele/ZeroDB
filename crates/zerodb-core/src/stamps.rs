@@ -10,7 +10,7 @@
 //! for that pair therefore stays true with no invalidation from the writer:
 //! a reused page carries a newer stamp and simply misses.
 //!
-//! Shape (ADR-0018 amendment, 2026-10-31): one slot per pgno, slot = pgno
+//! Shape (ADR-0018, 2026-10-31): one slot per pgno, slot = pgno
 //! modulo [`SLOTS`] (2^23), so every page of a file below 2^23 pages owns its
 //! slot and pages never evict each other; in a larger file, pages [`SLOTS`]
 //! apart share a slot and the newer publish wins. Slots are allocated where
@@ -39,7 +39,7 @@ use std::sync::OnceLock;
 use crate::sync::{AtomicU64, Ordering};
 
 /// Slots before pgnos wrap: 8 Mi × 8 bytes = 64 MiB per env at most, and no
-/// collisions for files up to 32 GiB at 4 KiB pages (ADR-0018 amendment).
+/// collisions for files up to 32 GiB at 4 KiB pages (ADR-0018).
 pub(crate) const SLOTS: usize = 1 << 23;
 
 /// Slots per lazily allocated chunk (32 KiB), so a first publish never

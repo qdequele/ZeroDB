@@ -26,11 +26,11 @@ pub fn body_size(psize: u32) -> usize {
     psize as usize - HEADER_SIZE
 }
 
-/// The largest logical map size an environment accepts, at open and at
-/// resize: 2^47 bytes (128 TiB), the x86-64 user address space (ADR-0023
-/// amendment 15, decision 6). A persisted meta naming more is corrupt
-/// (`Invalid`); a caller asking for more gets `Io(InvalidInput)`. The cap keeps
-/// a corrupt meta from driving a huge `set_len` or `mmap`.
+/// The largest logical map size an environment accepts, at open and at resize:
+/// 2^47 bytes (128 TiB), the x86-64 user address space (ADR-0023). A persisted
+/// meta naming more is corrupt (`Invalid`); a caller asking for more gets
+/// `Io(InvalidInput)`. The cap keeps a corrupt meta from driving a huge
+/// `set_len` or `mmap`.
 pub const MAX_MAP_SIZE: u64 = 1 << 47;
 
 /// Number of pages the map can hold: `map_size / psize` (SPEC 02 §8). Valid page

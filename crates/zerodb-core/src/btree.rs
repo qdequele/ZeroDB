@@ -510,12 +510,12 @@ fn leaf_view_over<'a>(
                     // ADR-0014: the caller's `trust_contents` contract stands
                     // in for the cell walk, as in LMDB; the O(1) header checks
                     // (page type included) still run. Tested only on a memo
-                    // miss, keeping the option off the memo-hit path.
-                    // Not recorded, unlike a trusted branch (ADR-0014
-                    // amendment 2026-10-19): a scan views each leaf once, and
-                    // recording every leaf grew the memo until each probe
-                    // missed through all its levels, as LMDB keeps no such
-                    // table. The header checks cost less than that probe.
+                    // miss, keeping the option off the memo-hit path. Not
+                    // recorded, unlike a trusted branch (ADR-0014): a scan
+                    // views each leaf once, and recording every leaf grew the
+                    // memo until each probe missed through all its levels, as
+                    // LMDB keeps no such table. The header checks cost less
+                    // than that probe.
                     LeafRef::new_prevalidated(bytes, psize)
                 } else {
                     validate_leaf_miss(bytes, psize, pgno, v)
@@ -2119,7 +2119,7 @@ mod tests {
         );
     }
 
-    /// ADR-0014 amendment (2026-10-19): under the trusting policy a branch's
+    /// ADR-0014: under the trusting policy a branch's
     /// first view is recorded in the txn memo, so later descents take the
     /// zero-check view, but a leaf's is not: a scan views each leaf once, and
     /// recording them grew the memo by a level per four-fold of leaves, making
@@ -2288,7 +2288,7 @@ mod tests {
         leaf_view(src(&img), PS, root, Some(&writer)).expect("clean leaf validates");
         assert!(
             !cache.contains(root, StampKind::Leaf, stamp),
-            "a write txn's miss arm must not publish (ADR-0018 amendment)"
+            "a write txn's miss arm must not publish (ADR-0018)"
         );
 
         // Probe: with the entry published (as commit seeding does), a fresh

@@ -12,7 +12,7 @@
 //!
 //! [`check_snapshot`] runs the same walk over one committed snapshot of a
 //! live environment, read through a read txn's map, without the meta slots
-//! (ADR-0023 amendment 18).
+//! (ADR-0023).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -777,9 +777,9 @@ fn check_image_inner(bytes: &[u8], psize: u32, threads: Option<usize>) -> Vec<St
     )
 }
 
-/// Check one committed snapshot of a live environment (ADR-0023 amendment
-/// 18): its roots, its free tree, its free-list annex and its `last_pg`, read
-/// through `map`, the mapped data file a read txn pinning `snap` borrows
+/// Check one committed snapshot of a live environment (ADR-0023): its roots,
+/// its free tree, its free-list annex and its `last_pg`, read through `map`,
+/// the mapped data file a read txn pinning `snap` borrows
 /// ([`crate::rotxn::RoTxn::map_bytes`]). Returns the violations (empty =
 /// clean), as [`check_image`].
 ///

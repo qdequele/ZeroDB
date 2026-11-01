@@ -37,7 +37,7 @@ use crate::stamps::StampCache;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const EINVAL: i32 = 22;
 
-/// A consistent (mapped bytes, logical map size) pair (ADR-0023 amendment 15),
+/// A consistent (mapped bytes, logical map size) pair (ADR-0023),
 /// from one [`Backing::view`] call. No `Debug`: it would print the whole map.
 #[derive(Clone, Copy)]
 pub struct MapView<'a> {
@@ -64,7 +64,7 @@ pub struct MapView<'a> {
 /// through an `Arc` and read txns hand out `Send` borrows.
 pub trait Backing: Send + Sync {
     /// The current mapped bytes and logical map size, as one consistent pair
-    /// (ADR-0023 amendment 15). A mapped backing's bytes are at least as long
+    /// (ADR-0023). A mapped backing's bytes are at least as long
     /// as the logical size; a heap test backing models a file and may be
     /// shorter. A backing whose map can grow publishes a new pair without
     /// ever invalidating bytes it lent earlier; a heap backing returns its
@@ -88,7 +88,7 @@ pub trait Backing: Send + Sync {
     /// lock and, with a lock file, the cross-process one (`Env::resize`), or
     /// runs at open before the backing is shared and only for a size inside
     /// the file (a joiner's seed), so publications are serialized and the
-    /// file grows only under both writer locks (ADR-0023 amendment 15).
+    /// file grows only under both writer locks (ADR-0023).
     ///
     /// The default refuses: the backing cannot grow its map.
     ///
@@ -108,7 +108,7 @@ pub trait Backing: Send + Sync {
     /// at a `WRITE_MAP` write-txn begin, with both writer locks held, so a
     /// joiner whose mapping extends past the file end has every page below
     /// its logical map size backed before it writes through the map
-    /// (ADR-0023 amendment 15, decision 4).
+    /// (ADR-0023).
     ///
     /// The default does nothing: a backing that writes with `pwrite` extends
     /// the file as it writes.
@@ -325,7 +325,7 @@ pub struct Snapshot {
     pub txnid: u64,
     /// File high-water as of this commit (`next_pgno - 1`, SPEC 05 GC-15).
     pub last_pg: u64,
-    /// The map size this snapshot's meta records (ADR-0023 amendment 15). A
+    /// The map size this snapshot's meta records (ADR-0023). A
     /// commit persists `max(base.map_size, the committing process's logical
     /// map size)`, so it never lowers the recorded size.
     pub map_size: u64,
@@ -461,7 +461,7 @@ impl WriterLock {
     }
 
     /// Claim the writer slot if it is free; `None` while a write txn of
-    /// this env is live. Never waits (`Env::resize`, ADR-0023 amendment 15).
+    /// this env is live. Never waits (`Env::resize`, ADR-0023).
     fn try_acquire(&self) -> Option<WriterGuard<'_>> {
         // Poison recovery as in `acquire`.
         let mut g = self
@@ -657,7 +657,7 @@ pub struct EnvInner {
     backing: Option<Box<dyn Backing>>,
     /// The DB page size (from the live meta; authoritative — SPEC 02 §3.2).
     /// The runtime map size is not stored here: it lives in the backing's
-    /// published view with the mapping it fits in (ADR-0023 amendment 15).
+    /// published view with the mapping it fits in (ADR-0023).
     page_size: u32,
     /// The meta selected **at open** (higher-txnid, or older under
     /// `PREV_SNAPSHOT`). Read once to seed the published snapshot (TXN-18);
@@ -738,12 +738,12 @@ pub struct EnvInner {
     /// `None` keeps the single-process path unchanged.
     shared: Option<Arc<dyn crate::shared::SharedRegion>>,
     /// Whether this process still holds the first-opener election past its
-    /// open (ADR-0023 amendment 19): set at open for a `PREV_SNAPSHOT` open
+    /// open (ADR-0023): set at open for a `PREV_SNAPSHOT` open
     /// that initialized the lock file, cleared by its first commit, which
     /// finishes the election instead of publishing. Read and written only
     /// at open and by the write-lock holder.
     holds_election: AtomicBool,
-    /// A durable commit newer than the published snapshot (amendment 19):
+    /// A durable commit newer than the published snapshot (ADR-0023):
     /// the commit that finished a held election (never published, its
     /// txnid reused by the next commit), or, in a joiner, the newest meta
     /// on disk when it was newer than `T` at open. Reported by
@@ -756,8 +756,8 @@ pub struct EnvInner {
     has_unpublished: AtomicBool,
 }
 
-/// A durable commit newer than the published snapshot (ADR-0023
-/// amendment 19), kept in [`EnvInner`] for `info`, `stat` and `resize`.
+/// A durable commit newer than the published snapshot (ADR-0023), kept in
+/// [`EnvInner`] for `info`, `stat` and `resize`.
 struct Unpublished {
     snap: Arc<Snapshot>,
     /// This process's own unpublished first `PREV_SNAPSHOT` commit, which
@@ -794,7 +794,7 @@ impl EnvInner {
     }
 
     /// The runtime map size (SPEC 00 row 20, `Env::info().map_size`): the
-    /// logical size of the backing's current view (ADR-0023 amendment 15).
+    /// logical size of the backing's current view (ADR-0023).
     #[must_use]
     pub fn map_size(&self) -> u64 {
         self.backing_ref().view().map_size
@@ -806,7 +806,7 @@ impl EnvInner {
     /// lock-file environment it is the shared published txnid `T`, so it
     /// includes other processes' commits (ADR-0023 §4).
     ///
-    /// One exception (ADR-0023 amendment 19, SPEC 04 TXN-67): in a
+    /// One exception (ADR-0023, SPEC 04 TXN-67): in a
     /// `PREV_SNAPSHOT` opener with a lock file, between its first and second
     /// commit, it is the first commit's txnid. That commit is durable but not
     /// published, so no read txn can pin it: read txns still begin at `T`. In
@@ -819,14 +819,14 @@ impl EnvInner {
             Some(region) => region.published_txnid().load(Ordering::SeqCst),
             None => self.snap_cell.commit_point(),
         };
-        // ADR-0023 amendment 19: a `PREV_SNAPSHOT` opener's own unpublished
+        // ADR-0023: a `PREV_SNAPSHOT` opener's own unpublished
         // first commit, while it is newer than `T`. A joiner's newer meta on
         // disk is left out: `txnid` stays the published txnid there.
         self.newer_unpublished(t, true).map_or(t, |u| u.txnid)
     }
 
     /// Whether this process still holds the first-opener election past its
-    /// open (ADR-0023 amendment 19).
+    /// open (ADR-0023).
     pub(crate) fn holds_election(&self) -> bool {
         // Relaxed: set before the env is shared, and afterwards read and
         // written only by the holder of the writer locks, whose
@@ -835,7 +835,7 @@ impl EnvInner {
     }
 
     /// The unpublished first commit of a `PREV_SNAPSHOT` opener
-    /// (ADR-0023 amendment 19), if its txnid is above `txnid`.
+    /// (ADR-0023), if its txnid is above `txnid`.
     /// With `own_only`, only this process's own unpublished commit counts,
     /// not a newer meta a joiner found on disk at open.
     fn newer_unpublished(&self, txnid: u64, own_only: bool) -> Option<Arc<Snapshot>> {
@@ -866,7 +866,7 @@ impl EnvInner {
     }
 
     /// `snap`, or the unpublished first commit of a `PREV_SNAPSHOT` opener
-    /// when that one is newer (ADR-0023 amendment 19): the newest meta on
+    /// when that one is newer (ADR-0023): the newest meta on
     /// disk, which LMDB's `mdb_env_info`, `mdb_env_stat` and
     /// `mdb_env_set_mapsize` read.
     fn or_newer_unpublished(&self, snap: Arc<Snapshot>) -> Arc<Snapshot> {
@@ -874,7 +874,7 @@ impl EnvInner {
     }
 
     /// Finish a commit while this process holds the election
-    /// (ADR-0023 amendment 19). The commit is durable; it is not published,
+    /// (ADR-0023). The commit is durable; it is not published,
     /// as LMDB's first `MDB_PREVSNAPSHOT` commit leaves the shared txnid on
     /// the older meta (`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`): `T` and the
     /// published-snapshot cell keep the older snapshot, so the next writer
@@ -1016,7 +1016,7 @@ impl EnvInner {
     ///
     /// A writer that took the lock over from a dead owner then frees dead
     /// processes' reader slots, as LMDB's writer does when it recovers the
-    /// lock from a dead owner on Linux (ADR-0023 amendment 12).
+    /// lock from a dead owner on Linux (ADR-0023).
     ///
     /// # Errors
     ///
@@ -1041,7 +1041,7 @@ impl EnvInner {
 
     /// Free the reader slots of dead processes (`mdb_reader_check`,
     /// ADR-0023 §3). Returns the number of slots freed (the fork's
-    /// `mdb_reader_check` also counts slots, ADR-0023 amendment 12); always 0
+    /// `mdb_reader_check` also counts slots, ADR-0023); always 0
     /// without a lock file, where every slot belongs to this process.
     ///
     /// # Errors
@@ -1260,7 +1260,7 @@ impl EnvInner {
     /// environment the snapshot committed as `T`, decoded from a `pread`
     /// copy of its meta slot (no map access); otherwise the process-local
     /// cell. For `Env::resize`, which holds both writer locks, so `T` cannot
-    /// move while it runs (ADR-0023 amendment 15, step 3).
+    /// move while it runs (ADR-0023).
     ///
     /// # Errors
     ///
@@ -1720,7 +1720,7 @@ impl Env {
 
     /// Whether this process opened the environment alone: it won the lock
     /// file's first-opener election, so no other process had the environment
-    /// open at that moment (ADR-0023 amendment 18). Always `true` without a
+    /// open at that moment (ADR-0023). Always `true` without a
     /// lock file, where the environment is single-process.
     ///
     /// The answer describes the open only: another process can join later.
@@ -1735,7 +1735,7 @@ impl Env {
     }
 
     /// Whether this environment runs with a lock file shared with other
-    /// processes (ADR-0023 amendment 17). `false` when it was opened without
+    /// processes (ADR-0023). `false` when it was opened without
     /// one, and for a read-only environment on read-only media, where no
     /// lock file can be created and the open proceeds without one, as LMDB
     /// does.
@@ -1745,7 +1745,7 @@ impl Env {
     }
 
     /// Change the map size, as `mdb_env_set_mapsize` on an open env
-    /// (ADR-0023 amendment 15).
+    /// (ADR-0023).
     ///
     /// - `0` adopts the map size recorded in the newest committed meta
     ///   (`OBS_SET_MAPSIZE_ZERO_ADOPTS`), the answer to a
@@ -1786,7 +1786,7 @@ impl Env {
         // dead-owner takeover. Every error below drops `guard`, releasing
         // both locks.
         inner.lock_writer_shared(&mut guard)?;
-        // ADR-0023 amendment 19: the newest meta on disk, as LMDB's
+        // ADR-0023: the newest meta on disk, as LMDB's
         // `mdb_env_set_mapsize`, including an unpublished first commit.
         let snap = inner.or_newer_unpublished(inner.newest_snapshot_unchecked()?);
         let min = snap
@@ -1839,7 +1839,7 @@ impl Env {
     /// process has already published. That fallback has no dedicated test.
     ///
     /// It can also report a commit that no read txn sees yet, as LMDB's
-    /// `mdb_env_info` reports the newest meta on disk (ADR-0023 amendment 19,
+    /// `mdb_env_info` reports the newest meta on disk (ADR-0023,
     /// SPEC 04 TXN-67): a `PREV_SNAPSHOT` opener's unpublished first commit,
     /// and, in a process that joined, a meta newer than `T` that it found on
     /// disk at open (such an opener's first commit, or another process's
@@ -1854,7 +1854,7 @@ impl Env {
             .inner
             .current_snapshot()
             .unwrap_or_else(|_| self.inner.snapshot());
-        // ADR-0023 amendment 19: an unpublished first `PREV_SNAPSHOT` commit
+        // ADR-0023: an unpublished first `PREV_SNAPSHOT` commit
         // is the newest meta on disk, which LMDB's `mdb_env_info` reports.
         let snap = self.inner.or_newer_unpublished(snap);
         EnvInfo {
@@ -1882,14 +1882,14 @@ impl Env {
     /// Like [`Env::info`], it reports an unpublished `PREV_SNAPSHOT` first
     /// commit, or a joiner's newer meta found on disk at open, until `T`
     /// reaches it, so its counts can describe a commit no read txn sees yet
-    /// (ADR-0023 amendment 19, SPEC 04 TXN-67).
+    /// (ADR-0023, SPEC 04 TXN-67).
     #[must_use]
     pub fn stat(&self) -> EnvStat {
         let snap = self
             .inner
             .current_snapshot()
             .unwrap_or_else(|_| self.inner.snapshot());
-        // As in `info` (ADR-0023 amendment 19).
+        // As in `info` (ADR-0023).
         let snap = self.inner.or_newer_unpublished(snap);
         let rec = snap.main_db;
         EnvStat {
@@ -1970,7 +1970,7 @@ impl Env {
     /// (The first process to open the environment wipes the whole table, as
     /// no other process has it open; and a joining process frees the slots
     /// left under its own PID by a dead predecessor, since no probe can tell
-    /// those from its own, ADR-0023 amendment 9.)
+    /// those from its own, ADR-0023.)
     ///
     /// # Errors
     ///
@@ -1998,10 +1998,10 @@ impl Env {
     /// shared published txnid `T`, which includes other processes' commits.
     ///
     /// In a `PREV_SNAPSHOT` opener with a lock file, between its first and
-    /// second commit, it is the first commit's txnid, which is durable but
-    /// not published: read txns still pin the older snapshot (ADR-0023
-    /// amendment 19, SPEC 04 TXN-67). In a process that joined, it stays at
-    /// `T` even while [`Env::info`] and [`Env::stat`] report a newer meta.
+    /// second commit, it is the first commit's txnid, which is durable but not
+    /// published: read txns still pin the older snapshot (ADR-0023, SPEC 04
+    /// TXN-67). In a process that joined, it stays at `T` even while
+    /// [`Env::info`] and [`Env::stat`] report a newer meta.
     #[must_use]
     pub fn txnid(&self) -> u64 {
         self.inner.txnid()
@@ -2186,7 +2186,7 @@ pub struct ReaderEntry {
     /// underflowing if a reader pinned a commit that landed after that sample.
     pub age: Option<u64>,
     /// The PID of the process that owns the slot, in an environment opened
-    /// with a lock file (ADR-0023 amendment 13). `None` without a lock file
+    /// with a lock file (ADR-0023). `None` without a lock file
     /// (every reader is in this process) and for a slot being claimed or
     /// released. LMDB's `mdb_reader_list` prints the same column.
     pub pid: Option<u32>,
@@ -2298,8 +2298,7 @@ pub fn check_open_limits(max_readers: u32, max_dbs: u32) -> Result<(), Error> {
 /// §1). This is the I/O-free core of open: the caller (`zerodb-io` / the public
 /// `zerodb` crate) has already opened, created-if-new, and mapped the file, and
 /// determined `page_size` (from the meta, or the creation option). The
-/// runtime map size is the backing's: [`Backing::view`] (ADR-0023 amendment
-/// 15).
+/// runtime map size is the backing's: [`Backing::view`] (ADR-0023).
 ///
 /// Steps: registry dedup (`EnvAlreadyOpened`) → validate both slots → select →
 /// map REC taxonomy to [`Error`] → build & register [`EnvInner`].
@@ -2412,7 +2411,7 @@ pub fn open_with_backing_policy(
 ///   seeds its snapshot from the selected meta, as a single-process open
 ///   does, and publishes that txnid as `T`;
 /// - a joining process seeds its snapshot from the meta slot holding the
-///   published `T`, never from the newest valid meta (ADR-0023 amendment 5);
+///   published `T`, never from the newest valid meta (ADR-0023);
 /// - pins, the writer's base and [`EnvInner::txnid`] follow `T`, and the
 ///   writer also takes the region's cross-process lock.
 ///
@@ -2493,7 +2492,7 @@ pub fn open_with_backing_shared(
     //  - each root is `PGNO_INVALID` or within `[FIRST_DATA_PGNO, last_pg]`.
     // Under WRITE_MAP a process alone on the file grew it to `map_size` at
     // map time, so the length check is trivially true there; a joining
-    // process does not grow the file at open (ADR-0023 amendment 15), so for
+    // process does not grow the file at open (ADR-0023), so for
     // it the check is real. The roots check always applies.
     // Also part of REC-1a: the committed txnid itself. The reader table
     // encodes slot occupancy in the top-of-u64 sentinel band (SPEC 04 TXN-14)
@@ -2525,10 +2524,10 @@ pub fn open_with_backing_shared(
         // A joining process seeds from the published txnid, never from the
         // newest valid meta: that meta may belong to a commit still in flight
         // or one that failed, whose txnid the next writer reuses (TXN-2;
-        // ADR-0023 amendment 5).
+        // ADR-0023).
         Some(region) if !region.is_initializer() => {
             let seed = seed_from_published(backing.as_ref(), page_size, region.as_ref())?;
-            // ADR-0023 amendment 19: a newer meta on disk than `T` (the
+            // ADR-0023: a newer meta on disk than `T` (the
             // unpublished first commit of a `PREV_SNAPSHOT` opener, or a
             // commit between its meta write and its `T` store) is what
             // LMDB's `mdb_env_info`/`mdb_env_stat` report
@@ -2552,13 +2551,13 @@ pub fn open_with_backing_shared(
         // The reader table is sized once at open and never resized (TXN-14).
         _ => ReaderTable::new(max_readers),
     };
-    // A joining process frees the slots that carry its own PID (ADR-0023
-    // amendment 9): a dead process that had the same PID left them, and no
-    // liveness probe can tell them apart from this process's own slots. None
-    // of them is live: this runs before this process's first claim, and the
-    // lock-file layer refuses a second open of the same lock file within one
-    // process, so no other environment handle here shares these slots. An
-    // initializer has already wiped every slot.
+    // A joining process frees the slots that carry its own PID (ADR-0023): a
+    // dead process that had the same PID left them, and no liveness probe can
+    // tell them apart from this process's own slots. None of them is live: this
+    // runs before this process's first claim, and the lock-file layer refuses a
+    // second open of the same lock file within one process, so no other
+    // environment handle here shares these slots. An initializer has already
+    // wiped every slot.
     #[cfg(not(loom))]
     if let Some(region) = &shared {
         if !region.is_initializer() {
@@ -2570,7 +2569,7 @@ pub fn open_with_backing_shared(
     // check + insert so two concurrent opens of one path cannot both succeed.
     let id = next_env_id();
     let closing = Arc::new(SignalEvent::new());
-    // ADR-0023 amendment 19: a `PREV_SNAPSHOT` initializer keeps the
+    // ADR-0023: a `PREV_SNAPSHOT` initializer keeps the
     // election until its first commit, as LMDB does.
     let holds_election = prev_snapshot && shared.as_ref().is_some_and(|r| r.is_initializer());
     // `shared` moves into the `EnvInner` rather than being cloned: from here
@@ -2634,7 +2633,7 @@ pub fn open_with_backing_shared(
 
     // ADR-0023 §1: let joiners in only after `T` is seeded and the env is
     // registered. A `PREV_SNAPSHOT` initializer keeps the election until its
-    // first commit instead (amendment 19; `RwTxn::commit`).
+    // first commit instead (ADR-0023; `RwTxn::commit`).
     if let Some(region) = &inner.shared {
         if !inner.holds_election() {
             region.finish_open().map_err(Error::Io)?;
@@ -2711,7 +2710,7 @@ pub(crate) fn read_snapshot_at(
 const META_RETRY_LIMIT: u32 = if cfg!(miri) { 64 } else { 10_000 };
 
 /// The seed snapshot of a process joining a lock-file environment: the one
-/// committed as the published txnid `T` (ADR-0023 amendment 5).
+/// committed as the published txnid `T` (ADR-0023).
 fn seed_from_published(
     backing: &dyn Backing,
     page_size: u32,
@@ -2738,7 +2737,7 @@ fn seed_from_published(
 
 /// Grow a joiner's map to its seed's `(last_pg + 1) * page_size`, as LMDB's
 /// open rounds a small map up to its data and never fails with
-/// `MDB_MAP_RESIZED` (ADR-0023 amendment 15). The seed is never used
+/// `MDB_MAP_RESIZED` (ADR-0023). The seed is never used
 /// unchecked: the cached read fast path does no check of its own, so the
 /// caller re-checks it against the grown view.
 ///
@@ -2774,7 +2773,7 @@ fn grow_to_seed(backing: &dyn Backing, page_size: u32, seed: &Snapshot) -> Resul
 }
 
 /// Check that a snapshot decoded after open lies inside this process's map
-/// and inside the file as it is now (ADR-0023 amendment 15; SPEC 06 REC-1a,
+/// and inside the file as it is now (ADR-0023; SPEC 06 REC-1a,
 /// the open-time geometry check). Checked arithmetic: a hostile `last_pg`
 /// must not wrap the multiply.
 ///
@@ -2822,7 +2821,7 @@ fn check_snapshot_in_view(
 
 impl EnvInner {
     /// The write-begin check of the writer's base against `view`, the map
-    /// view the begin loaded (ADR-0023 amendment 15), also for a base that
+    /// view the begin loaded (ADR-0023), also for a base that
     /// came from the cache: a write txn never starts with a base outside its
     /// logical map size, which would otherwise make every allocation
     /// `MapFull`. The file-length half is not repeated: a cached snapshot
@@ -3276,7 +3275,7 @@ mod shared_env_tests {
         Ok(id)
     }
 
-    /// ADR-0023 amendment 19 (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`):
+    /// ADR-0023 (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`):
     /// a joiner that finds a meta newer than `T` on disk reads at `T` but
     /// reports the newer meta in `info`, until a publish reaches it.
     #[test]
@@ -3324,7 +3323,7 @@ mod shared_env_tests {
         assert_eq!(region.finish_opens.load(O::Relaxed), 1);
     }
 
-    /// ADR-0023 amendment 19: a `PREV_SNAPSHOT` initializer keeps the
+    /// ADR-0023: a `PREV_SNAPSHOT` initializer keeps the
     /// election past its open; an unchanged commit keeps it; the first real
     /// commit finishes it and is not published, so readers keep the older
     /// snapshot and the next write txn reuses its txnid on that base.
@@ -3551,7 +3550,7 @@ mod shared_env_tests {
     #[test]
     fn refresh_rejects_a_snapshot_past_this_process_map() {
         // The file reaches page 200, but this process mapped only 4 pages: a
-        // process with a larger map_size grew it. ADR-0023 amendment 15 maps
+        // process with a larger map_size grew it. ADR-0023 maps
         // this case to `MapResized`, as LMDB does (`OBS_READ_BEGIN_SMALL_MAP`,
         // `OBS_WRITE_BEGIN_SMALL_MAP`); before the observation it was
         // `Invalid`.
@@ -3583,7 +3582,7 @@ mod shared_env_tests {
     #[test]
     fn snapshot_past_the_mapped_bytes_inside_the_map_size_is_invalid() {
         // A logical map size the mapping does not cover is a bug or
-        // corruption, never `MapResized` (ADR-0023 amendment 15).
+        // corruption, never `MapResized` (ADR-0023).
         let b = Box::new(SizedBacking {
             bytes: grown_image(4),
             map_size: 256 * u64::from(PS),
@@ -3623,7 +3622,7 @@ mod shared_env_tests {
     type GrowLog = Arc<Mutex<Vec<(u64, bool)>>>;
 
     /// A heap backing whose logical map size grows through `grow_map`, as
-    /// the mmap backings' do (ADR-0023 amendment 15). It records every grow
+    /// the mmap backings' do (ADR-0023). It records every grow
     /// and whether the cross-process writer lock was held at the time.
     struct GrowBacking {
         bytes: Vec<u8>,
@@ -3975,7 +3974,7 @@ mod shared_env_tests {
         );
     }
 
-    // Reaping (ADR-0023 §3, amendment 12). The LMDB fork, observed by
+    // Reaping (ADR-0023 §3). The LMDB fork, observed by
     // `zerodb-oracle/tests/lmdb_reaping_observation.rs`, reaps dead readers
     // in `mdb_reader_check` and when a writer takes over a dead writer's lock
     // (Linux), and nowhere else: not at read-txn begin, write commit, a
@@ -4011,7 +4010,7 @@ mod shared_env_tests {
 
     #[test]
     fn clear_stale_readers_counts_slots_not_processes() {
-        // `mdb_reader_check` counts slots (amendment 12).
+        // `mdb_reader_check` counts slots (ADR-0023).
         let region = Arc::new(HeapRegion::new(4, 1, true));
         let env = open(backing(4, 5), region.clone());
         pin_as(&env, 2, 4);
