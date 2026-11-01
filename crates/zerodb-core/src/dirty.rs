@@ -1,4 +1,4 @@
-//! The write transaction's dirty-page store (SPEC 04 §6.3, ADR-0004 D1).
+//! The write transaction's dirty-page store (SPEC 04 §6.3, ADR-0004).
 //!
 //! A [`DirtyStore`] holds a write txn's private, not-yet-committed page copies
 //! as **individually stable frames** indexed by pgno:
@@ -53,7 +53,7 @@
 //! the writable map** at the frame's own pgno (`Slot::Map`) instead of on the
 //! heap: the bytes are already at their final file offset, so commit C2 (and
 //! spilling) writes nothing for them. The TXN-41 stability contract holds
-//! unchanged — the map is mapped once for the env's life (ADR-0004 D4), so a
+//! unchanged — the map is mapped once for the env's life (ADR-0004), so a
 //! map frame's address never moves — and the borrow discipline is the same:
 //! `bytes` ties a shared view to `&self`, `bytes_mut` a mutable view to `&mut
 //! self`, so the brokered `&mut` slices are transient and never overlap a live
@@ -240,7 +240,7 @@ impl std::fmt::Debug for DirtyStore<'_> {
 /// the same broker with the same geometry.
 ///
 /// This is the **sole sanctioned call site** of the `unsafe` map-slice broker
-/// (AGENTS.md unsafe policy; ADR-0021 B1): the broker is
+/// (AGENTS.md unsafe policy; ADR-0021): the broker is
 /// an `unsafe fn` because it mints `&mut [u8]` from `&self`, and this module
 /// discharges its contract. `map_mut` is itself an `unsafe fn` for the same
 /// reason — no safe function anywhere may mint `&mut` from a shared borrow.
@@ -275,7 +275,7 @@ unsafe fn map_mut(broker: Option<&dyn Backing>, psize: u32, pgno: u64, len: usiz
     //    the committed high-water or GC-reclaimed under the oldest-reader
     //    gate — which the txn additionally re-checks with a typed
     //    release-mode guard before any in-map frame is tracked
-    //    (`RwTxn::allocate`, ADR-0021 M2). Readers, nested readers and the
+    //    (`RwTxn::allocate`, ADR-0021). Readers, nested readers and the
     //    committed trees therefore never dereference the region.
     //  * Exactly one live `&mut` per map region, tied to `&mut DirtyStore`,
     //    never stored: every caller of this function is a `&mut self` method
@@ -283,7 +283,7 @@ unsafe fn map_mut(broker: Option<&dyn Backing>, psize: u32, pgno: u64, len: usiz
     //    never retains it (only `Slot::Map { len }` bookkeeping), and no
     //    caller invokes it twice without the previous borrow dying first.
     //  * The whole-map `&[u8]` read view is re-derived after each spill
-    //    (`RwTxn::spill`, ADR-0021 B2) and — in in-map mode — re-borrowed
+    //    (`RwTxn::spill`, ADR-0021) and — in in-map mode — re-borrowed
     //    lazily on every access (`RwTxn::whole_map`: under Stacked Borrows
     //    even *copying* a stale view after an in-place write is UB at the
     //    written locations), so no stale shared
@@ -756,7 +756,7 @@ impl<'env> DirtyStore<'env> {
     }
 
     /// Dirty pgnos in ascending order — the commit write-out order (C2 writes
-    /// sequentially by pgno; ADR-0004 D1) — into `out`, which is cleared
+    /// sequentially by pgno; ADR-0004) — into `out`, which is cleared
     /// first (the commit reuses one buffer across write txns).
     pub fn sorted_pgnos_into(&self, out: &mut Vec<u64>) {
         out.clear();

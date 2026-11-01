@@ -159,7 +159,7 @@ pub trait Backing: Send + Sync {
     ///
     /// # Safety
     ///
-    /// **The brokered contract (ADR-0021 B1).**
+    /// **The brokered contract (ADR-0021).**
     /// This mints `&mut [u8]` from `&self`; the signature cannot express the
     /// exclusivity it needs, so the obligation is the caller's. The sole
     /// sanctioned caller is the write txn's `DirtyStore` (AGENTS.md unsafe
@@ -173,15 +173,15 @@ pub trait Backing: Send + Sync {
     ///   `&mut` on the dirty store and never stored (TXN-39/41/42);
     /// - no outstanding `&[u8]` view of the map is later read at locations
     ///   this slice wrote — the writer re-derives its whole-map read view
-    ///   after every spill (TXN-71, ADR-0021 B2).
-    // `unsafe fn` *declaration* only (ADR-0021 B1: no safe fn may mint `&mut`
+    ///   after every spill (TXN-71, ADR-0021).
+    // `unsafe fn` *declaration* only (ADR-0021: no safe fn may mint `&mut`
     // from `&self`); the default body is trivially safe and the one unsafe
     // *call* lives in `crate::dirty::map_mut`, the home the AGENTS.md policy
     // sanctions for the WRITE_MAP in-place brokered map-slice write.
     #[allow(unsafe_code)]
     // clippy cannot see that this is an `unsafe fn` whose documented contract
     // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
-    // too); ADR-0021 B1's substance is the `unsafe fn` itself.
+    // too); ADR-0021's substance is the `unsafe fn` itself.
     #[allow(clippy::mut_from_ref)]
     unsafe fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
         let _ = (pgno, psize, pages);
@@ -212,7 +212,7 @@ pub trait Backing: Send + Sync {
     }
 
     /// Durability barrier for previously-written pages (commit steps C3/C5;
-    /// `File::sync_data` — ADR-0004 D3 as amended by OQ3: std semantics as-is,
+    /// `File::sync_data` — ADR-0004: std semantics as-is,
     /// `fdatasync` on Linux).
     ///
     /// # Errors

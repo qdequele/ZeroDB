@@ -50,7 +50,7 @@ use writer_lock::{SignalEvent, WriterLock};
 pub mod testutil;
 
 // ---------------------------------------------------------------------------
-// Published snapshot + commit hooks (SPEC 04 TXN-18/19, §9; ADR-0004 D3)
+// Published snapshot + commit hooks (SPEC 04 TXN-18/19, §9; ADR-0004)
 // ---------------------------------------------------------------------------
 
 /// An immutable committed snapshot: the roots and geometry of one committed
@@ -113,7 +113,7 @@ pub enum HookPoint {
     H4,
 }
 
-/// A commit-pipeline observer (ADR-0004 D3/OQ5: **always compiled**, default
+/// A commit-pipeline observer (ADR-0004: **always compiled**, default
 /// absent, so the crash-tested pipeline is byte-for-byte the shipped one).
 /// The crash-consistency harnesses install hooks that kill/tear at a chosen
 /// [`HookPoint`]; the commit smoke test aborts the process at each point in turn.
@@ -220,7 +220,7 @@ pub(crate) struct EnvInner {
     /// (TXN-17/19/20). Published in the TXN-19 order (swap the object, then
     /// store the commit point).
     snap_cell: SnapshotCell,
-    /// Commit-pipeline crash hooks (ADR-0004 D3; default `None` = no-op).
+    /// Commit-pipeline crash hooks (ADR-0004; default `None` = no-op).
     commit_hook: Mutex<Option<Arc<dyn CommitHook>>>,
     /// REC-13 fsync-gate: set (Release) when a commit fsync fails; checked
     /// (Acquire) at every write-txn begin and commit. A poisoned env still
@@ -584,7 +584,7 @@ impl EnvInner {
         self.poisoned.store(true, Ordering::Release);
     }
 
-    /// Install (or clear) the commit-pipeline crash hook (ADR-0004 D3). Test
+    /// Install (or clear) the commit-pipeline crash hook (ADR-0004). Test
     /// infrastructure for the commit smoke test and the crash harness; the
     /// default (`None`) makes every hook site a no-op.
     pub fn set_commit_hook(&self, hook: Option<Arc<dyn CommitHook>>) {
@@ -1575,7 +1575,7 @@ impl Env {
         Arc::strong_count(&self.inner)
     }
 
-    /// Install (or clear) the commit-pipeline crash hook (ADR-0004 D3). See
+    /// Install (or clear) the commit-pipeline crash hook (ADR-0004). See
     /// `EnvInner::set_commit_hook`; test infrastructure (commit smoke test,
     /// crash harness).
     pub fn set_commit_hook(&self, hook: Option<Arc<dyn CommitHook>>) {

@@ -1,4 +1,4 @@
-//! ADR-0021 M1 — the in-place `WRITE_MAP` brokered discipline under
+//! ADR-0021 — the in-place `WRITE_MAP` brokered discipline under
 //! **miri** (SPEC 04 §6.4 TXN-45b; `cargo +nightly miri test -p zerodb-core`).
 //!
 //! The real writable map is OS memory miri cannot see, so this battery runs
@@ -7,12 +7,12 @@
 //! whose brokered `&mut` regions and whole-map `&[u8]` views are plain heap
 //! memory Stacked/Tree Borrows fully check. What this proves on every run:
 //!
-//! - the brokered `&mut` (ADR-0021 B1) is exclusive in practice: no two live
+//! - the brokered `&mut` (ADR-0021) is exclusive in practice: no two live
 //!   mutable views of one region, every view transient and re-tied to
 //!   `&mut` on the dirty store (TXN-39/41/42);
 //! - the writer's whole-map `&[u8]` is re-derived at every spill (ADR-0021
 //!   B2), so no stale shared borrow is ever read at locations an in-place
-//!   write touched (TXN-71) — the Tree-Borrows hazard ADR-0021 B2 names;
+//!   write touched (TXN-71) — the Tree-Borrows hazard ADR-0021 names;
 //! - readers holding snapshots across in-place commits, nested read children
 //!   of the writer, `put_reserved` closures, the general split's scratch
 //!   copy and abort-by-drop all stay inside the discipline.
@@ -182,7 +182,7 @@ fn in_place_discipline_under_miri() {
 }
 
 /// Spill/unspill as pure bookkeeping (TXN-68..72 degenerate under TXN-45b)
-/// plus the ADR-0021 B2 re-derivation: with a tiny dirty limit nearly every
+/// plus the ADR-0021 re-derivation: with a tiny dirty limit nearly every
 /// mutating call spills, spilled pages are resolved through the (re-derived)
 /// whole-map view, and touches of spilled pages unspill in place.
 #[test]
@@ -209,7 +209,7 @@ fn spill_unspill_in_place_under_miri() {
         model.insert(k.clone(), v);
         if i % 9 == 8 {
             // Read back through the source: spilled pages resolve from the
-            // re-derived map view (TXN-71 / ADR-0021 B2).
+            // re-derived map view (TXN-71 / ADR-0021).
             assert_eq!(
                 db.get(&w, &k).expect("get"),
                 model.get(&k).map(Vec::as_slice)

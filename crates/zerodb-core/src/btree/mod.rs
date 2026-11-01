@@ -4,7 +4,7 @@
 //! Everything here operates over a [`Source`] — either the immutable mapped
 //! env file (`Source::Map`, the read-txn path) or a write txn's view
 //! (`Source::Writer`: the dirty-page store first, the map for untouched pages
-//! — SPEC 04 TXN-38, ADR-0004 D2). Reads are **zero-copy**: keys and values
+//! — SPEC 04 TXN-38, ADR-0004). Reads are **zero-copy**: keys and values
 //! are `&'a [u8]` borrowed straight from the backing bytes (SPEC 04 TXN-37/41),
 //! and a `F_BIGDATA` value resolves to one contiguous slice spanning its
 //! overflow run (SPEC 03 §3; a dirty run is one contiguous frame, TXN-41).
@@ -42,7 +42,7 @@ pub type Entry<'a> = (&'a [u8], &'a [u8]);
 pub type PosResult<'a> = Result<Option<Entry<'a>>, PageError>;
 
 // ---------------------------------------------------------------------------
-// Page source (ADR-0004 D2): where a page's bytes come from
+// Page source (ADR-0004): where a page's bytes come from
 // ---------------------------------------------------------------------------
 
 /// Where tree pages are read from (SPEC 04 TXN-37/38).
@@ -61,7 +61,7 @@ pub enum Source<'a> {
         bytes: &'a [u8],
         /// The pinned snapshot's committed high-water (`Snapshot::last_pg`).
         /// Map reads refuse any pgno beyond it: the mapping covers the full
-        /// `map_size` (ADR-0004 D4), so bytes past the real file end are
+        /// `map_size` (ADR-0004), so bytes past the real file end are
         /// mapped but unbacked — dereferencing them on a corrupt/hostile
         /// reference would `SIGBUS` instead of erroring (SPEC 06 REC-14).
         last_pg: u64,

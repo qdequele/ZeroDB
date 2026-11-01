@@ -7,20 +7,20 @@
 //! **no reader-table slot** (TXN-25/32 — the writer already gates GC at
 //! `writer_txnid − 1`, and no allocation can occur while children live).
 //!
-//! ## The safety story (ADR-0007 D1, zero `unsafe`)
+//! ## The safety story (ADR-0007, zero `unsafe`)
 //!
 //! The child holds a real `&'p RwTxn` — so the borrow checker itself enforces
 //! writer quiescence (TXN-29/30; see docs/DIVERGENCES.md): while any child is alive, no
 //! `&mut RwTxn` method can be called. The child is [`Send`] **by compiler
 //! derivation**: `&RwTxn: Send ⇔ RwTxn: Sync`, and `RwTxn` is `Sync` as a
-//! **standing asserted contract** (ADR-0007 Q1): it has
+//! **standing asserted contract** (ADR-0007): it has
 //! no interior mutability on any `&self` path — the compile-time assertions in
 //! this module's tests turn any future violation into a build failure, not an
 //! unsoundness. There is no `unsafe impl` anywhere in this design (contrast
 //! heed, whose child holds a raw `MDB_txn` pointer and needs
 //! `unsafe impl Send`).
 //!
-//! ## What the child sees: delegate-live ≡ snapshot-at-open (ADR-0007 D2)
+//! ## What the child sees: delegate-live ≡ snapshot-at-open (ADR-0007)
 //!
 //! The child's [`TxnRead`] simply forwards to the parent's. TXN-26 phrases the
 //! snapshot as "the working roots *at child-open time*", and delegation is
@@ -39,7 +39,7 @@
 //! (`unsafe`/FFI at an adapter boundary — e.g. the oracle's lifetime-erased
 //! children). Every mutating `RwTxn` entry checks `live() == 0` and returns
 //! [`MdbError::BadTxn`](crate::error::MdbError::BadTxn) (LMDB's `MDB_BAD_TXN` is literally "transaction …
-//! has a child" — ADR-0007 Q4) instead of mutating frozen-but-aliased pages.
+//! has a child" — ADR-0007) instead of mutating frozen-but-aliased pages.
 //! Orderings (ARM/weak-memory assumptions, loom-checked as L6):
 //!
 //! - open: `fetch_add(1, Relaxed)` — creation happens on a thread already
@@ -64,7 +64,7 @@ use crate::rwtxn::RwTxn;
 use crate::sync::{AtomicUsize, Ordering};
 
 /// The live-child counter on a write txn (SPEC 04 TXN-31,
-/// ADR-0007 D3: `AtomicUsize`, **not** `Cell` — a `Cell` would destroy
+/// ADR-0007: `AtomicUsize`, **not** `Cell` — a `Cell` would destroy
 /// `RwTxn: Sync`, and children may drop on worker threads). Factored into
 /// its own type so the loom L6 model checks the exact shipped code.
 #[derive(Debug)]
@@ -187,7 +187,7 @@ impl Drop for NestedRoTxn<'_> {
     }
 }
 
-/// The child reads the parent's view verbatim (delegate-live, ADR-0007 D2;
+/// The child reads the parent's view verbatim (delegate-live, ADR-0007;
 /// equivalence with snapshot-at-open proven in the module docs). This is what
 /// makes the whole read API — gets, cursors, ranges, prefix iters, named DBs
 /// through `record_for`, overflow runs — work on a child unchanged.
@@ -231,7 +231,7 @@ impl TxnRead for NestedRoTxn<'_> {
 }
 
 // ---------------------------------------------------------------------------
-// loom L6 (ADR-0007 D3/Q5). Run via `just loom` (RUSTFLAGS="--cfg loom",
+// loom L6 (ADR-0007). Run via `just loom` (RUSTFLAGS="--cfg loom",
 // tests filtered `loom_`). Models are tiny (2 spawned threads + main) so loom
 // explores them exhaustively.
 //
@@ -356,7 +356,7 @@ mod tests {
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
 
-    /// ADR-0007 D6: `NestedRoTxn<'p>` covariance in `'p` is a design
+    /// ADR-0007: `NestedRoTxn<'p>` covariance in `'p` is a design
     /// requirement for the heed adapter (heed returns a plain covariant
     /// `RoTxn<'a>`). This function only compiles while the type stays
     /// covariant — an invariant-making field (`fn(&'p _)`, `Cell<&'p _>`, …)
@@ -366,7 +366,7 @@ mod tests {
         x
     }
 
-    /// The ADR-0007 Q1 standing contract, machine-enforced (risk R2): `RwTxn`
+    /// The ADR-0007 standing contract, machine-enforced (risk R2): `RwTxn`
     /// stays `Sync` (no interior mutability on `&self` paths) and therefore
     /// `NestedRoTxn` — a `&RwTxn` newtype — is `Send` **by compiler
     /// derivation**, with no `unsafe impl`. If a future `RwTxn` field breaks

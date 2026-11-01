@@ -13,7 +13,7 @@
 //!
 //! The read API is generic over [`TxnRead`], so the same `Database` methods
 //! serve a `RoTxn` (mapped bytes) **and** a write txn (`RwTxn`: dirty frames
-//! first, map fallback — SPEC 04 TXN-38, ADR-0004 D2). heed's borrow model is
+//! first, map fallback — SPEC 04 TXN-38, ADR-0004). heed's borrow model is
 //! reproduced: reads take `&Txn` and return `&'txn [u8]`; mutations take
 //! `&mut RwTxn`, so no read borrow can span a mutation (TXN-39).
 //!
@@ -49,7 +49,7 @@ pub(crate) fn map_page_err(_e: PageError) -> Error {
 
 /// Anything the read API can read through: a [`RoTxn`] (mapped bytes of a
 /// committed snapshot) or a [`crate::rwtxn::RwTxn`] (the writer's in-progress
-/// view). The three accessors are exactly what [`Tree`] needs (ADR-0004 D2).
+/// view). The three accessors are exactly what [`Tree`] needs (ADR-0004).
 pub trait TxnRead {
     /// Where this txn's pages come from (SPEC 04 TXN-37/38).
     fn source(&self) -> Source<'_>;
@@ -167,7 +167,7 @@ enum EnvHandle<'e> {
 /// `&[u8]` it lends — may move to another thread (rayon/async). Asserted at
 /// compile time by the `send_assertions` test below.
 ///
-/// **Leaked readers (documented stall, ADR-0006 R5):** `mem::forget(ro_txn)`
+/// **Leaked readers (documented stall, ADR-0006):** `mem::forget(ro_txn)`
 /// is safe Rust and cannot be prevented; the slot then pins its txnid
 /// forever, the GC gate stops advancing past it, and the file grows. Same
 /// failure mode as a stale LMDB reader, except that no reap frees it while

@@ -98,7 +98,7 @@ enum Slots {
 /// `< RDR_CLAIMED`: ids start at 1 and grow by one per commit). One word per
 /// slot means every observation of a slot is atomic — a state+txnid two-field
 /// design would admit torn observations and need its own inter-field ordering
-/// protocol (ADR-0006 D1). Each [`crate::shared::ReaderSlot`] is 64-byte
+/// protocol (ADR-0006). Each [`crate::shared::ReaderSlot`] is 64-byte
 /// aligned and 128 bytes long, which keeps a pinning reader's store and the
 /// writer's scan off each other's cache lines (TXN-14). A table opened with
 /// [`ReaderTable::new_shared`] has the same slot layout, but the slots live in
@@ -177,11 +177,11 @@ impl ReaderTable {
     /// There is no ABA hazard in this CAS: the compare value `RDR_FREE` means
     /// "free *now*", and ownership is conferred by the successful exchange
     /// itself — no thread acts on a stale expectation derived from an earlier
-    /// read (ADR-0006 D1). No scan hint and no high-water-mark shortcut
-    /// (ADR-0006 D2): a stale bound could hide an already-pinned reader from
+    /// read (ADR-0006). No scan hint and no high-water-mark shortcut
+    /// (ADR-0006): a stale bound could hide an already-pinned reader from
     /// the writer's scan, which is exactly the missed-pin bug.
     ///
-    /// **ADR-0006 D2 still holds** despite the `high_water` counter maintained
+    /// **ADR-0006 still holds** despite the `high_water` counter maintained
     /// below: that counter is written here but read *only* by
     /// [`ReaderTable::num_readers`] (introspection). Neither this scan
     /// nor the writer's [`ReaderTable::oldest`] scan consults it — both still
@@ -789,7 +789,7 @@ impl SnapshotCell {
     /// The invariant the tail preserves is `slot value ≤ cloned snapshot
     /// txnid`: pinning *older* than what is read is conservative (GC merely
     /// holds back more), while the reverse would let GC reclaim pages the
-    /// cloned roots still reference — the unsafe direction (ADR-0006 R3).
+    /// cloned roots still reference — the unsafe direction (ADR-0006).
     ///
     /// Why the clone can never see roots *older* than the verified `t`: the
     /// writer's swap is sequenced-before its `commit_point.store(t)`
@@ -1306,7 +1306,7 @@ mod tests {
 //     fence-oriented; tokio-rs/loom#180 class). A test that fails on correct
 //     code cannot be committed.
 // The SeqCst sites are therefore guarded by SPEC 04 TXN-17/20 (normative),
-// the per-site justification comments, this record, and ADR-0006 R1: any
+// the per-site justification comments, this record, and ADR-0006: any
 // future migration to the Option-D/E lock-free cell MUST bring its own
 // StoreLoad verification (an SC-fence reformulation loom can check,
 // a different checker, or hardware litmus runs) as a precondition — the
@@ -1428,7 +1428,7 @@ mod loom_tests {
     /// `slot value ≤ cloned snapshot txnid` (pinning older than what it reads
     /// is conservative; the reverse is the unsafe direction) and with roots
     /// no older than its verified commit point. A TXN-19 publish-order
-    /// inversion (counter before object) fails this test (ADR-0006 R3).
+    /// inversion (counter before object) fails this test (ADR-0006).
     #[test]
     fn loom_l4_publish_vs_pin_retry() {
         loom::model(|| {
@@ -1444,7 +1444,7 @@ mod loom_tests {
             assert!(
                 raw <= s.txnid,
                 "slot pinned {raw} but cloned roots are {} — GC could reclaim pages \
-                 those roots reference (slot ≤ snap invariant, ADR-0006 R3)",
+                 those roots reference (slot ≤ snap invariant, ADR-0006)",
                 s.txnid
             );
             table.release(slot);

@@ -232,7 +232,7 @@ pub fn open_with_backing_shared(
     // SPEC 06 REC-1a / SPEC 02 §3.2 step 6 (geometry validation): a slot can
     // carry a valid CRC and still name geometry the real file cannot back — a
     // truncated or hostile file. The mapping covers the full `map_size`
-    // (ADR-0004 D4), so pages inside the map but past the file end are
+    // (ADR-0004), so pages inside the map but past the file end are
     // unbacked: dereferencing them faults (SIGBUS) instead of erroring. Reject
     // at open, with checked arithmetic (a hostile `last_pg` near `u64::MAX`
     // must not wrap the multiply): the file must cover the snapshot's pages,

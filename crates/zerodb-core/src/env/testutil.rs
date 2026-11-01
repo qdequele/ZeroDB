@@ -53,7 +53,7 @@ impl Backing for VecBacking {
 
 /// A fresh in-memory env: both meta slots valid at txnid 0 (SPEC 02 §3.4),
 /// the backing vector sized to `map_size` (as a real map would be,
-/// ADR-0004 D4), registered under a unique virtual path.
+/// ADR-0004), registered under a unique virtual path.
 ///
 /// # Panics
 ///
