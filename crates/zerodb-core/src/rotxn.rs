@@ -123,6 +123,17 @@ pub enum DbSel {
     Named(u32),
 }
 
+impl DbSel {
+    /// The named database's dbi; `None` for the main database.
+    #[must_use]
+    pub fn dbi(self) -> Option<u32> {
+        match self {
+            DbSel::Main => None,
+            DbSel::Named(dbi) => Some(dbi),
+        }
+    }
+}
+
 /// Resolve a named DB's `DBRecord` from a catalog view (SPEC 02 §6, SPEC 04
 /// TXN-10 step 3): search the main tree for `name`; if the entry is a 48-byte
 /// `F_SUBDATA` sub-DB record, decode it; otherwise (absent, or a plain user-key
@@ -505,22 +516,14 @@ impl Env {
     /// slower random-key writes. Results are identical either way. Runtime
     /// state, not persisted; write txns that start after the call use it.
     pub fn set_sequential_writes(&self, db: &Database, on: Option<bool>) {
-        let dbi = match db.sel() {
-            DbSel::Main => None,
-            DbSel::Named(dbi) => Some(dbi),
-        };
-        self.inner().set_sequential_writes(dbi, on);
+        self.inner().set_sequential_writes(db.sel().dbi(), on);
     }
 
     /// Whether write txns use the sequential-writes fast path for `db`: its
     /// override if set, else the env default (ADR-0015).
     #[must_use]
     pub fn sequential_writes(&self, db: &Database) -> bool {
-        let dbi = match db.sel() {
-            DbSel::Main => None,
-            DbSel::Named(dbi) => Some(dbi),
-        };
-        self.inner().sequential_writes_for(dbi)
+        self.inner().sequential_writes_for(db.sel().dbi())
     }
 
     /// A handle to the main (unnamed) database (SPEC 00 row 10, `None` name).
