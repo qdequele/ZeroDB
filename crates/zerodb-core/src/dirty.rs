@@ -116,6 +116,82 @@ pub(crate) type PgnoBuildHasher = BuildHasherDefault<PgnoHasher>;
 /// small, bursty write txns that dominate, cheap to hold onto.
 pub(crate) const SPARE_CAP: usize = 256;
 
+/// Frames an in-map store holds before it builds its [`FrameBits`]: below
+/// this the hash index is a few cache lines and stays hot, and a small
+/// write txn pays nothing for the bits.
+const FRAME_BITS_MIN: usize = 64;
+
+/// Pages per [`FrameBits`] chunk: two bits each, so one chunk is 4 KiB.
+const BITS_CHUNK_SHIFT: u32 = 14;
+const BITS_CHUNK_WORDS: usize = 1 << (BITS_CHUNK_SHIFT - 5);
+
+/// What [`FrameBits`] records for a pgno.
+const BITS_NONE: u64 = 0;
+/// A one-page frame in the map at the pgno itself (tree page).
+const BITS_MAP_PAGE: u64 = 1;
+/// Any other frame (an overflow-run head, or a heap frame): look it up.
+const BITS_OTHER: u64 = 2;
+
+/// Two bits per pgno mirroring the frame index of an in-map store
+/// (ADR-0021): whether `pgno` has a frame and whether it is a one-page map
+/// frame. Under `WRITE_MAP` a one-page frame's bytes sit at the pgno's own
+/// map offset, so this answers every descent step's "is this page dirty?"
+/// with one load from a table a 10k-page txn keeps in 2.5 KiB, instead of a
+/// hash probe into the index. LMDB's `mdb_page_get` skips its dirty-list
+/// search under `MDB_WRITEMAP` for the same reason; ZeroDB still needs the
+/// answer, because map pages are validated and memoized and dirty frames are
+/// not. Chunks are allocated on first use; pgnos are bounded by the map.
+#[derive(Default)]
+struct FrameBits {
+    chunks: Vec<Option<Box<[u64]>>>,
+}
+
+impl FrameBits {
+    #[inline(always)]
+    fn get(&self, pgno: u64) -> u64 {
+        let c = (pgno >> BITS_CHUNK_SHIFT) as usize;
+        match self.chunks.get(c) {
+            Some(Some(chunk)) => {
+                let i = (pgno as usize >> 5) & (BITS_CHUNK_WORDS - 1);
+                (chunk[i] >> ((pgno & 31) * 2)) & 3
+            }
+            _ => BITS_NONE,
+        }
+    }
+
+    fn set(&mut self, pgno: u64, state: u64) {
+        let c = (pgno >> BITS_CHUNK_SHIFT) as usize;
+        if c >= self.chunks.len() {
+            if state == BITS_NONE {
+                return;
+            }
+            self.chunks.resize_with(c + 1, || None);
+        }
+        let chunk = match &mut self.chunks[c] {
+            Some(chunk) => chunk,
+            slot @ None => {
+                if state == BITS_NONE {
+                    return;
+                }
+                slot.insert(vec![0u64; BITS_CHUNK_WORDS].into_boxed_slice())
+            }
+        };
+        let i = (pgno as usize >> 5) & (BITS_CHUNK_WORDS - 1);
+        let sh = (pgno & 31) * 2;
+        chunk[i] = (chunk[i] & !(3 << sh)) | (state << sh);
+    }
+}
+
+/// [`DirtyStore::resolve`]'s answer.
+pub(crate) enum Resolved<'a> {
+    /// No frame: the page is read from the map as committed.
+    Clean,
+    /// A one-page frame in the map at the pgno's own offset.
+    MapPage,
+    /// Any other frame, with its bytes.
+    Frame(&'a [u8]),
+}
+
 /// Capacity, in entries, that a write txn's pgno-hashed indexes keep when
 /// they are carried to the next write txn ([`DirtyCarry`]; issue #8). A
 /// hash table is iterated over its whole bucket array, not its entries
@@ -188,6 +264,14 @@ impl Slot {
             Slot::Map { len } => *len,
         }
     }
+
+    /// This slot's [`FrameBits`] state in a store of page size `psize`.
+    fn bits_state(&self, psize: usize) -> u64 {
+        match self {
+            Slot::Map { len } if *len == psize => BITS_MAP_PAGE,
+            _ => BITS_OTHER,
+        }
+    }
 }
 
 /// A write txn's dirty-page frames, indexed by pgno. See the module docs for
@@ -218,6 +302,10 @@ pub struct DirtyStore<'env> {
     /// Spilled pgnos (SPEC 04 TXN-69..72) → page count (1 for a tree page,
     /// `n` for an overflow-run head). Disjoint from `frames`.
     spilled: HashMap<u64, u64, PgnoBuildHasher>,
+    /// The frame index's [`FrameBits`] mirror, in-map stores only, built
+    /// once the store holds [`FRAME_BITS_MIN`] frames. Every change to
+    /// `frames` updates it.
+    bits: Option<Box<FrameBits>>,
 }
 
 impl std::fmt::Debug for DirtyStore<'_> {
@@ -352,6 +440,7 @@ impl<'env> DirtyStore<'env> {
             spare,
             pages: 0,
             spilled,
+            bits: None,
         }
     }
 
@@ -383,7 +472,11 @@ impl<'env> DirtyStore<'env> {
     /// final file offset.
     #[must_use]
     pub fn in_map(&self, pgno: u64) -> bool {
-        self.broker.is_some() && matches!(self.frames.get(&pgno), Some(Slot::Map { .. }))
+        match self.bits_state(pgno) {
+            Some(BITS_NONE) => false,
+            Some(BITS_MAP_PAGE) => true,
+            _ => self.broker.is_some() && matches!(self.frames.get(&pgno), Some(Slot::Map { .. })),
+        }
     }
 
     /// `pgno`'s frame length in bytes and whether it lives in the map
@@ -398,7 +491,10 @@ impl<'env> DirtyStore<'env> {
     /// Whether `pgno` has a dirty frame (tree page, or overflow-run **head**).
     #[must_use]
     pub fn contains(&self, pgno: u64) -> bool {
-        self.frames.contains_key(&pgno)
+        match self.bits_state(pgno) {
+            Some(state) => state != BITS_NONE,
+            None => self.frames.contains_key(&pgno),
+        }
     }
 
     /// Number of dirty frames (runs count once).
@@ -423,6 +519,30 @@ impl<'env> DirtyStore<'env> {
     #[inline]
     fn pages_of(&self, len: usize) -> u64 {
         (len >> self.psize_shift) as u64
+    }
+
+    /// Mirror a change of `pgno`'s frame into the [`FrameBits`], if built.
+    #[inline]
+    fn note(&mut self, pgno: u64, state: u64) {
+        if let Some(bits) = &mut self.bits {
+            bits.set(pgno, state);
+        }
+    }
+
+    /// `pgno`'s [`FrameBits`] state, or `None` while the bits are not built
+    /// (the caller then asks the hash index). Checked against the index in
+    /// debug builds.
+    #[inline(always)]
+    fn bits_state(&self, pgno: u64) -> Option<u64> {
+        let state = self.bits.as_ref()?.get(pgno);
+        debug_assert_eq!(
+            state,
+            self.frames
+                .get(&pgno)
+                .map_or(BITS_NONE, |f| f.bits_state(self.psize as usize)),
+            "frame bits out of step with the index at pgno {pgno}"
+        );
+        Some(state)
     }
 
     /// Whether any page of this txn is spilled (SPEC 04 §6.3a). The cheap
@@ -466,6 +586,7 @@ impl<'env> DirtyStore<'env> {
     /// [`DirtyStore::discard`].
     pub fn spill(&mut self, pgno: u64) {
         if let Some(frame) = self.frames.remove(&pgno) {
+            self.note(pgno, BITS_NONE);
             let n = self.pages_of(frame.len());
             self.pages -= n;
             self.spilled.insert(pgno, n);
@@ -512,16 +633,49 @@ impl<'env> DirtyStore<'env> {
         if let Some(old) = self.frames.insert(pgno, Slot::Map { len }) {
             self.pages -= self.pages_of(old.len());
         }
+        self.note(pgno, BITS_MAP_PAGE);
         // SAFETY: `&mut self` op re-tying the borrow via this signature; the
         // region is this store's re-tracked `Slot::Map` frame (a TXN-62 pgno
         // this txn wrote in place before spilling); no other view is live.
         unsafe { map_mut(self.broker, self.psize, pgno, len) }
     }
 
+    /// Where a read of `pgno` finds its bytes, for the write txn's page
+    /// source (`btree::Source::Writer`). [`Resolved::MapPage`] is a one-page
+    /// in-map frame: the caller slices it from its own view of the map, which
+    /// under in-map mode is the same mapping this store's frames live in, and
+    /// saves the backing call [`DirtyStore::bytes`] makes.
+    #[inline(always)]
+    pub(crate) fn resolve(&self, pgno: u64) -> Resolved<'_> {
+        match self.bits_state(pgno) {
+            Some(BITS_NONE) => Resolved::Clean,
+            Some(BITS_MAP_PAGE) => Resolved::MapPage,
+            _ => match self.bytes(pgno) {
+                Some(frame) => Resolved::Frame(frame),
+                None => Resolved::Clean,
+            },
+        }
+    }
+
     /// The frame bytes for `pgno`: exactly `psize` for a tree page, the whole
     /// contiguous `n * psize` run for an overflow head.
     #[must_use]
+    #[inline]
     pub fn bytes(&self, pgno: u64) -> Option<&[u8]> {
+        match self.bits_state(pgno) {
+            Some(BITS_NONE) => return None,
+            Some(BITS_MAP_PAGE) => {
+                // A one-page map frame, found without the index.
+                let ps = self.psize as usize;
+                let off = (pgno as usize) * ps;
+                let bytes = self
+                    .broker
+                    .expect("frame bits exist only in an in-map store")
+                    .bytes();
+                return Some(&bytes[off..off + ps]);
+            }
+            _ => {}
+        }
         match self.frames.get(&pgno)? {
             Slot::Heap(b) => Some(&**b),
             Slot::Map { len } => {
@@ -542,6 +696,15 @@ impl<'env> DirtyStore<'env> {
     #[must_use]
     #[allow(unsafe_code)] // sanctioned brokered-slice call (ADR-0021; see `map_mut`)
     pub fn bytes_mut(&mut self, pgno: u64) -> Option<&mut [u8]> {
+        match self.bits_state(pgno) {
+            Some(BITS_NONE) => return None,
+            // SAFETY: as the `Slot::Map` arm below: a tracked one-page map
+            // frame (the bits mirror the index), re-tied to `&mut self`.
+            Some(BITS_MAP_PAGE) => {
+                return Some(unsafe { map_mut(self.broker, self.psize, pgno, self.psize as usize) })
+            }
+            _ => {}
+        }
         match self.frames.get_mut(&pgno)? {
             Slot::Heap(b) => Some(&mut **b),
             // SAFETY: `&mut self` op; the brokered view is re-tied to
@@ -559,8 +722,21 @@ impl<'env> DirtyStore<'env> {
             "frame for a spilled pgno"
         );
         self.pages += self.pages_of(slot.len());
+        let state = slot.bits_state(self.psize as usize);
         if let Some(old) = self.frames.insert(pgno, slot) {
             self.pages -= self.pages_of(old.len());
+        }
+        match &mut self.bits {
+            Some(bits) => bits.set(pgno, state),
+            None if self.broker.is_some() && self.frames.len() >= FRAME_BITS_MIN => {
+                let ps = self.psize as usize;
+                let mut bits = Box::<FrameBits>::default();
+                for (&p, f) in &self.frames {
+                    bits.set(p, f.bits_state(ps));
+                }
+                self.bits = Some(bits);
+            }
+            None => {}
         }
     }
 
@@ -681,6 +857,7 @@ impl<'env> DirtyStore<'env> {
             "remove of a spilled pgno"
         );
         let f = self.frames.remove(&pgno)?;
+        self.note(pgno, BITS_NONE);
         self.pages -= self.pages_of(f.len());
         match f {
             Slot::Heap(b) => Some(b),
@@ -717,6 +894,7 @@ impl<'env> DirtyStore<'env> {
     /// the page returns to the txn as loose, like any page it allocated.
     pub fn discard(&mut self, pgno: u64) {
         if let Some(frame) = self.frames.remove(&pgno) {
+            self.note(pgno, BITS_NONE);
             self.pages -= self.pages_of(frame.len());
             if let Slot::Heap(frame) = frame {
                 if frame.len() == self.psize as usize && self.spare.len() < SPARE_CAP {
@@ -745,6 +923,7 @@ impl<'env> DirtyStore<'env> {
         out.truncate(cap);
         if out.len() < cap && !self.frames.is_empty() {
             self.pages = 0;
+            self.bits = None;
             for (_, f) in self.frames.drain() {
                 if out.len() >= cap {
                     break;
@@ -771,6 +950,8 @@ impl<'env> DirtyStore<'env> {
         let mut spilled = std::mem::take(&mut self.spilled);
         recycle_index(&mut spilled);
         self.pages = 0;
+        // Not carried: the next txn builds its own bits once it is large.
+        self.bits = None;
         DirtyCarry {
             frames,
             spilled,

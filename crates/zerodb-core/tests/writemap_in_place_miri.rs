@@ -232,3 +232,55 @@ fn spill_unspill_in_place_under_miri() {
         "committed state"
     );
 }
+
+/// The dirty store's per-pgno frame bits (built once an in-map txn holds 64
+/// frames) under miri: one write txn dirties well over 64 pages, frees some
+/// (deletes merge leaves) and writes overflow runs; a second run with a dirty
+/// limit spills and unspills pages after the bits are built. Reads through
+/// the bits' direct map path and the brokered `&mut` they hand out stay
+/// inside the discipline; a debug assertion checks every answer against
+/// the hash index, so a missed bit update (an unspill after the bits are
+/// built, which the spill run does) fails on the next lookup of that page.
+#[test]
+fn frame_bits_under_miri() {
+    for dirty_limit in [None, Some(160)] {
+        let env = wm_env(dirty_limit);
+        let db = env.main_database();
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let mut rng = Rng(0xADB0_0021_0000_0003);
+
+        let mut w = env.write_txn().expect("write txn");
+        assert!(w.dirty_in_map_mode(), "in-place WRITE_MAP must be active");
+        for i in 0..200u64 {
+            let k = format!("bits-{:04}", rng.below(400)).into_bytes();
+            let v = if i % 40 == 39 {
+                vec![b'R'; 9_000] // an overflow run: the bits' "other" state
+            } else {
+                vec![(i % 251) as u8; 1_400] // two entries per 4 KiB leaf
+            };
+            db.put(&mut w, &k, &v).expect("put");
+            model.insert(k, v);
+        }
+        for i in 0..60u64 {
+            let k = format!("bits-{:04}", i * 5).into_bytes();
+            let deleted = db.delete(&mut w, &k).expect("delete");
+            assert_eq!(deleted, model.remove(&k).is_some());
+        }
+        for i in 0..30u64 {
+            let k = format!("bits-{:04}", i * 7).into_bytes();
+            db.put(&mut w, &k, b"rewritten").expect("rewrite");
+            model.insert(k, b"rewritten".to_vec());
+        }
+        let want: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(contents(&w, db), want, "writer view");
+        if dirty_limit.is_some() {
+            assert!(w.spill_count() > 0, "the dirty limit must have spilled");
+        }
+        w.commit().expect("commit");
+        assert_eq!(
+            contents(&env.read_txn().expect("reader"), db),
+            want,
+            "committed state"
+        );
+    }
+}
