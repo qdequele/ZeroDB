@@ -5,7 +5,7 @@ tags with a GitHub release, prebuilt `zerodb-tools` binaries, and a crates.io
 publish of the four engine crates (`zerodb-core`, `zerodb-io`, `zerodb`,
 `zerodb-tools`). The heed adapter is **not** published — cargo needs a crate
 *named* `heed` for the patch, so heed consumers depend on the repo through
-`[patch.crates-io]` on `crates/heed-shim` at a tag.
+`[patch.crates-io]` on `crates/heed-zerodb` (package `heed`) at a tag.
 
 ## One-time setup
 
@@ -53,8 +53,9 @@ publish of the four engine crates (`zerodb-core`, `zerodb-io`, `zerodb`,
 
 4. **Versions.** Bump `version` in every engine crate (`zerodb-core`,
    `zerodb-io`, `zerodb`, `zerodb-tools`, `zerodb-oracle`) to the same value.
-   `heed-zerodb` and `heed-shim` stay at the heed line they mirror (0.22.1) —
-   that number is what makes the `[patch]` resolve, it is not ZeroDB's version.
+   The heed adapter (`crates/heed-zerodb`) stays at the heed line it mirrors
+   (0.22.1): that number is what makes the `[patch]` resolve, it is not
+   ZeroDB's version.
    The release workflow refuses a tag that does not equal `crates/zerodb`'s
    version.
 

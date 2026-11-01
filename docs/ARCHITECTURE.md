@@ -13,9 +13,8 @@ test harness that checks every behavior against LMDB itself.
 ## Crates
 
 ```
-                    heed-shim, heed-shim-unique-txns   (crates named `heed`, patch targets)
-                                 │
-                            heed-zerodb                (the heed 0.22.1 API)
+                            heed-zerodb                (package `heed`: the heed 0.22.1
+                                 │                      API, the [patch] target)
                                  │
     zerodb-tools ──────────▶   zerodb                  (native API; joins engine and I/O)
                               ╱       ╲

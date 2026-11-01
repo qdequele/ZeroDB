@@ -1,8 +1,9 @@
 # LMDB and heed compatibility
 
 This page lists every public item of heed 0.22.1, and every LMDB feature a heed
-user can reach, with its status in `heed-zerodb`. That crate is what a consumer
-sees as `heed::` through the `crates/heed-shim` patch target. The page also
+user can reach, with its status in ZeroDB's heed adapter (`crates/heed-zerodb`,
+a package named `heed`). It is what a consumer sees as `heed::` once patched
+in. The page also
 records every observable behavior difference from LMDB (the `D-0xx` entries).
 Update it in the same change as any adapter surface change.
 
@@ -109,9 +110,9 @@ Statuses:
 
 From v1.55, Meilisearch builds against its own heed fork,
 `meilisearch/heed@mutexify-open-dbi`. The fork opens and creates databases
-behind one mutex per environment. The `unique-txns` feature of `heed-zerodb`
-switches to that fork's API, and `crates/heed-shim-unique-txns` is the patch
-target with the feature on (ADR-0027). The feature changes signatures, so a
+behind one mutex per environment. The adapter's `unique-txns` feature switches
+to that fork's API (ADR-0027); a consumer on the fork turns it on from one of
+its own `heed` dependencies, since a `[patch]` cannot enable features. The feature changes signatures, so a
 build has one API or the other, never both.
 
 | Item | Status | Notes |

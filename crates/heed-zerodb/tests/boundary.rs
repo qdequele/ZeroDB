@@ -9,8 +9,8 @@
 // fork's (ADR-0027), covered by `unique_txns.rs`.
 #![cfg(not(feature = "unique-txns"))]
 
-use heed_zerodb::types::Bytes;
-use heed_zerodb::{Database, EnvOpenOptions, Error, WithoutTls};
+use heed::types::Bytes;
+use heed::{Database, EnvOpenOptions, Error, WithoutTls};
 
 fn opts() -> EnvOpenOptions<WithoutTls> {
     EnvOpenOptions::new().read_txn_without_tls()
@@ -103,7 +103,7 @@ fn no_sub_dir_is_refused_at_open() {
     let dir = tempfile::tempdir().unwrap();
     let mut o = opts();
     o.map_size(os_page() * 16);
-    unsafe { o.flags(heed_zerodb::EnvFlags::NO_SUB_DIR) };
+    unsafe { o.flags(heed::EnvFlags::NO_SUB_DIR) };
     match unsafe { o.open(dir.path().join("env")) } {
         Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::Unsupported),
         other => panic!("expected Io(Unsupported), got {other:?}"),

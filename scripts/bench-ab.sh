@@ -99,7 +99,7 @@ if cmp -s "$EXE_BASE" "$EXE_CAND"; then
         log "warning: the two binaries are byte-identical — the engine did not change"
     else
         echo "engine source differs from $BASE but the binaries are identical: stale build." >&2
-        echo "fix: cargo clean --release -p zerodb-core -p zerodb-io -p zerodb -p heed-zerodb -p zerodb-oracle" >&2
+        echo "fix: cargo clean --release -p zerodb-core -p zerodb-io -p zerodb -p heed -p zerodb-oracle" >&2
         exit 1
     fi
 fi

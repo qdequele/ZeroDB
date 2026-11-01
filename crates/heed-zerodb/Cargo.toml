@@ -1,23 +1,18 @@
-# heed-zerodb — a 1:1 re-implementation of heed 0.22.1's public surface over
-# ZeroDB's native API (ADR-0003 Option C/D).
+# ZeroDB's heed adapter: heed 0.22.1's public API over the ZeroDB engine
+# (ADR-0003).
 #
-# The crate's *package* name stays `heed-zerodb` inside this workspace so it does
-# not collide with the real `heed = "=0.22.1"` the oracle links (ADR-0001): the
-# oracle depends on BOTH — real heed (LMDB) and this crate (`heed_zerodb`) — in
-# one binary for in-process A/B diffing. Consumers (milli/hannoy) switch backends
-# with `[patch.crates-io] heed = { path = ".../crates/heed-shim" }` — a crate
-# literally named `heed` that re-exports this one (docs/maintainers/CONSUMER-GATE.md). A
-# `package = "heed-zerodb"` rename inside `[patch]` does NOT work: cargo requires
-# the replacement to share the patched crate's name and ignores the rename
-# (verified; see crates/heed-shim/Cargo.toml).
+# The package is named `heed`, at heed's version, so a consumer swaps LMDB for
+# ZeroDB with one `[patch.crates-io] heed = { git = "…ZeroDB" }` line: cargo's
+# `[patch]` matches the replacement by package name and ignores a `package =`
+# rename. Inside this workspace the oracle and zerodb-tools depend on it as
+# `heed_zerodb = { package = "heed", path = … }`, next to the real crates.io
+# `heed` the oracle compares it with; in cargo commands, select it with
+# `-p heed` (the workspace member wins over the registry crate).
 [package]
-name = "heed-zerodb"
-# Version tracks the heed line it reproduces (0.22.1) so the `heed-shim` patch
-# target that re-exports it satisfies a consumer's `heed = "0.22.1"`
-# requirement (scripts/consumer.sh). The crate
-# is never published (ADR-0003); the version is only for patch resolution.
+name = "heed"
 version = "0.22.1"
-# Never published (ADR-0003, ADR-0013): consumed only through crates/heed-shim.
+# Never published: the `heed` name on crates.io belongs to heed itself
+# (ADR-0013). Consumers reach it through `[patch]`.
 publish = false
 description = "The heed 0.22.1 API over the ZeroDB engine, so heed users can switch from LMDB without code changes."
 edition.workspace = true
@@ -45,11 +40,37 @@ byteorder = "1.5"
 libc = { workspace = true }
 
 [features]
-# Mirror the API of Meilisearch's heed fork (`meilisearch/heed@mutexify-open-dbi`,
+# heed 0.22.1's feature names, so a consumer's `heed = { features = [...] }`
+# still resolves once patched. They do nothing: the serde codecs are always
+# compiled in, and the LMDB build knobs do not apply to ZeroDB.
+default = ["serde", "serde-bincode", "serde-json"]
+serde = []
+serde-bincode = []
+serde-json = []
+serde-rmp = []
+preserve_order = []
+arbitrary_precision = []
+raw_value = []
+unbounded_depth = []
+posix-sem = []
+longer-keys = []
+use-valgrind = []
+mdb_idl_logn_8 = []
+mdb_idl_logn_9 = []
+mdb_idl_logn_10 = []
+mdb_idl_logn_11 = []
+mdb_idl_logn_12 = []
+mdb_idl_logn_13 = []
+mdb_idl_logn_14 = []
+mdb_idl_logn_15 = []
+mdb_idl_logn_16 = []
+# The API of Meilisearch's heed fork (`meilisearch/heed@mutexify-open-dbi`,
 # Meilisearch v1.55 and later) instead of heed 0.22.1's (ADR-0027). Not
-# additive: it changes `open_database`/`create_database` signatures and
-# removes `RoTxn::commit` and `Env::non_free_pages_size`, as the fork does.
-# Enabled by `crates/heed-shim-unique-txns`, never by the workspace.
+# additive: it changes `open_database`/`create_database` signatures and removes
+# `RoTxn::commit` and `Env::non_free_pages_size`, as the fork does. A `[patch]`
+# cannot turn it on: a consumer on the fork enables it from one of its own
+# dependencies on `heed` (docs/USING.md). Never on in this workspace's default
+# build.
 unique-txns = []
 
 [dev-dependencies]

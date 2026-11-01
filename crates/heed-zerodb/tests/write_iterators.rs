@@ -10,10 +10,10 @@
 
 use std::ops::Bound;
 
-use heed_zerodb::types::{Bytes, Str};
-use heed_zerodb::{Database, EnvOpenOptions, Error, MdbError};
+use heed::types::{Bytes, Str};
+use heed::{Database, EnvOpenOptions, Error, MdbError};
 
-fn env_opts() -> EnvOpenOptions<heed_zerodb::WithoutTls> {
+fn env_opts() -> EnvOpenOptions<heed::WithoutTls> {
     EnvOpenOptions::new().read_txn_without_tls()
 }
 
@@ -21,7 +21,7 @@ fn env_opts() -> EnvOpenOptions<heed_zerodb::WithoutTls> {
 /// tests give the wrong answer.
 enum ReverseComparator {}
 
-impl heed_zerodb::Comparator for ReverseComparator {
+impl heed::Comparator for ReverseComparator {
     fn compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
         b.cmp(a)
     }
@@ -29,7 +29,7 @@ impl heed_zerodb::Comparator for ReverseComparator {
 
 fn keys<'txn, I>(it: I) -> Vec<String>
 where
-    I: Iterator<Item = heed_zerodb::Result<(&'txn str, &'txn [u8])>>,
+    I: Iterator<Item = heed::Result<(&'txn str, &'txn [u8])>>,
 {
     it.map(|e| e.unwrap().0.to_string()).collect()
 }
@@ -172,7 +172,7 @@ fn copy_to_file_leaves_no_staging_files_behind() {
 
     let dst = tempfile::tempdir().unwrap();
     let mut out = std::fs::File::create(dst.path().join("data.mdb")).unwrap();
-    env.copy_to_file(&mut out, heed_zerodb::CompactionOption::Enabled)
+    env.copy_to_file(&mut out, heed::CompactionOption::Enabled)
         .unwrap();
     drop(out);
 

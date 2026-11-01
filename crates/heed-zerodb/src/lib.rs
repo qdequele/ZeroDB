@@ -7,9 +7,11 @@
 //! re-exports `heed-traits` and `heed-types` unchanged, so codec traits stay
 //! the very traits LMDB's heed uses.
 //!
-//! Consumers do not depend on this crate directly. They point
-//! `[patch.crates-io] heed` at `crates/heed-shim`, a crate named `heed` that
-//! re-exports this one (cargo ignores a `package =` rename inside `[patch]`).
+//! The package is named `heed`, at heed's version, so a consumer switches with
+//! one `[patch.crates-io] heed = { git = "…ZeroDB" }` line: cargo's `[patch]`
+//! matches by package name. Inside this repository it is the
+//! `crates/heed-zerodb` directory, and other crates depend on it as
+//! `heed_zerodb`.
 //!
 //! ## Meilisearch's heed fork (`unique-txns` feature, ADR-0027)
 //!
@@ -22,7 +24,9 @@
 //! `UniqueRoTxn::commit`; `Env::non_free_pages_size` gives way to
 //! `EnvStat::non_free_page_size` and `DatabaseStat::non_free_page_size`.
 //! The feature changes signatures, so it is not additive: a build uses one
-//! API or the other. Consumers reach it through `crates/heed-shim-unique-txns`.
+//! API or the other. A `[patch]` cannot enable a feature, so a consumer on the
+//! fork adds `"unique-txns"` to the features of one of its own `heed`
+//! dependencies (milli's, in Meilisearch).
 //!
 //! ## `unsafe`
 //!

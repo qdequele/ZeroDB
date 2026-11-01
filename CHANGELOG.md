@@ -21,9 +21,8 @@ the release workflow publishes the section matching the tag as the GitHub releas
 - **`MdbError::MapResized`**, returned at transaction begin when another
   process has committed past this process's map. Call `resize(0)` and begin
   again.
-- **Meilisearch v1.55's heed fork** (ADR-0027): the `unique-txns` feature of
-  `heed-zerodb`, with the `crates/heed-shim-unique-txns` patch target, gives
-  the fork's API (`UniqueRwTxn`, `UniqueRoTxn`, `AsUniqueTxnRef`,
+- **Meilisearch v1.55's heed fork** (ADR-0027): the heed adapter's
+  `unique-txns` feature gives the fork's API (`UniqueRwTxn`, `UniqueRoTxn`, `AsUniqueTxnRef`,
   `Env::unique_write_txn` and friends, `non_free_page_size`). Without the
   feature nothing changes. Meilisearch v1.55.0's milli and index-scheduler
   suites pass on it (447 tests).
@@ -42,6 +41,13 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ### Changed
 
+- **The heed adapter is the `[patch]` target itself.** `crates/heed-zerodb`'s
+  package is now named `heed` (version 0.22.1), and the `crates/heed-shim` and
+  `crates/heed-shim-unique-txns` re-export crates are removed. The one-line
+  `[patch.crates-io] heed = { git = "…ZeroDB" }` gives heed 0.22.1's API. A
+  consumer on Meilisearch's heed fork adds `"unique-txns"` to the features of
+  one of its own `heed` dependencies, since a `[patch]` cannot enable features
+  (docs/USING.md). In cargo commands, select the adapter with `-p heed`.
 - **Database handles follow LMDB's lifetime** (ADR-0024). A handle opened in
   a transaction that ends without committing, or whose database was removed,
   is refused with `EINVAL`, or `MDB_BAD_DBI` for a read transaction that began

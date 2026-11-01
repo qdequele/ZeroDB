@@ -38,4 +38,4 @@ migrate-lmdb = ["dep:heed"]
 # The live-env tests hold an environment open in a child process through the
 # heed adapter, as Meilisearch does (ADR-0023). Workspace-internal,
 # not a new external dependency.
-heed-zerodb = { path = "../heed-zerodb" }
+heed_zerodb = { package = "heed", path = "../heed-zerodb" }

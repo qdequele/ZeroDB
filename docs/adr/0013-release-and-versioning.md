@@ -6,6 +6,12 @@
   not recorded.
 - Milestone: first release (v0.1.0)
 - Date: 2026-09-09 (revised the same day: Option A → Option B after Q1)
+- Amended 2026-11-01 (maintainer decision): the shim crates are gone. The
+  adapter's own package is named `heed`, so `crates/heed-zerodb` is the
+  `[patch]` target directly; workspace crates depend on it as
+  `heed_zerodb = { package = "heed", path = … }`. The adapter stays
+  unpublished and at heed's version. Text below that names
+  `crates/heed-shim` describes the design before this amendment.
 
 ## Context
 

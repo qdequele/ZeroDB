@@ -8,8 +8,8 @@
 
 use std::ops::Bound;
 
-use heed_zerodb::types::Bytes;
-use heed_zerodb::{Database, EnvOpenOptions, RoTxn, WithoutTls};
+use heed::types::Bytes;
+use heed::{Database, EnvOpenOptions, RoTxn, WithoutTls};
 
 /// xorshift64* — deterministic, no new dependency.
 struct Rng(u64);
@@ -33,7 +33,7 @@ impl Rng {
 
 type Item = Option<(Vec<u8>, Vec<u8>)>;
 
-fn own(r: Option<heed_zerodb::Result<(&[u8], &[u8])>>) -> Item {
+fn own(r: Option<heed::Result<(&[u8], &[u8])>>) -> Item {
     r.map(|r| {
         let (k, v) = r.unwrap();
         (k.to_vec(), v.to_vec())
@@ -77,7 +77,7 @@ fn check_one(
     let prefix = rng.bytes(3, 6);
     macro_rules! mk {
         () => {{
-            let it: Box<dyn Iterator<Item = heed_zerodb::Result<(&[u8], &[u8])>>> = match kind {
+            let it: Box<dyn Iterator<Item = heed::Result<(&[u8], &[u8])>>> = match kind {
                 0 => Box::new(db.iter(txn).unwrap()),
                 1 => Box::new(db.rev_iter(txn).unwrap()),
                 2 => Box::new(db.range(txn, &(as_ref(&lo), as_ref(&hi))).unwrap()),
@@ -262,7 +262,7 @@ fn build_corruptible(dir: &std::path::Path, big: &[u8]) {
     w.commit().unwrap();
 }
 
-fn reopen(dir: &std::path::Path) -> (heed_zerodb::Env<WithoutTls>, Database<Bytes, Bytes>) {
+fn reopen(dir: &std::path::Path) -> (heed::Env<WithoutTls>, Database<Bytes, Bytes>) {
     let mut o = EnvOpenOptions::new().read_txn_without_tls();
     o.map_size(16 << 20).max_dbs(1);
     let env = unsafe { o.open(dir) }.unwrap();
@@ -319,7 +319,7 @@ fn skip_does_not_read_skipped_overflow_values() {
     assert_eq!(k, &key(400)[..]);
 }
 
-type BoxedIter<'t> = Box<dyn Iterator<Item = heed_zerodb::Result<(&'t [u8], &'t [u8])>> + 't>;
+type BoxedIter<'t> = Box<dyn Iterator<Item = heed::Result<(&'t [u8], &'t [u8])>> + 't>;
 
 /// A page error met while a skip crosses leaves is the item `nth` returns,
 /// and the iterator ends after it.

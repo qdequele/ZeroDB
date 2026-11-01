@@ -1,6 +1,6 @@
 //! heed's own test suite, ported to the adapter at the IN scope defined by
 //! ADR-0003 ("heed's own test suite — scoped IN / OUT"). Each test is labeled
-//! with its heed origin; only imports were adapted (`heed::` → `heed_zerodb::`).
+//! with its heed origin; only imports were adapted (`heed::` → `heed::`).
 //!
 //! ## IN (ported below)
 //! - examples: `all-types`, `clear-database`, `cursor-append`, `multi-env`,
@@ -36,9 +36,9 @@
 
 use std::error::Error;
 
-use heed_zerodb::byteorder::BE;
-use heed_zerodb::types::*;
-use heed_zerodb::{BoxedError, Database, EnvFlags, EnvOpenOptions, MdbError, PutFlags, WithoutTls};
+use heed::byteorder::BE;
+use heed::types::*;
+use heed::{BoxedError, Database, EnvFlags, EnvOpenOptions, MdbError, PutFlags, WithoutTls};
 
 fn opts() -> EnvOpenOptions<WithoutTls> {
     EnvOpenOptions::new().read_txn_without_tls()
@@ -282,7 +282,7 @@ fn nested_rtxns_fanout() -> Result<(), Box<dyn Error>> {
 
     let rtxns = (0..64)
         .map(|_| env.nested_read_txn(&wtxn))
-        .collect::<heed_zerodb::Result<Vec<_>>>()?;
+        .collect::<heed::Result<Vec<_>>>()?;
 
     std::thread::scope(|s| {
         for (i, rtxn) in rtxns.into_iter().enumerate() {
@@ -335,7 +335,7 @@ fn reopen_env_is_env_already_opened() -> Result<(), Box<dyn Error>> {
     o.map_size(10 * 1024 * 1024);
     let _env = unsafe { o.open(dir.path())? };
     let result = unsafe { o.open(dir.path()) };
-    assert!(matches!(result, Err(heed_zerodb::Error::EnvAlreadyOpened)));
+    assert!(matches!(result, Err(heed::Error::EnvAlreadyOpened)));
     Ok(())
 }
 
@@ -380,7 +380,7 @@ fn open_already_existing_database() -> Result<(), Box<dyn Error>> {
 #[test]
 fn ro_txns_are_send() {
     fn is_send<T: Send>() {}
-    is_send::<heed_zerodb::RoTxn<WithoutTls>>();
+    is_send::<heed::RoTxn<WithoutTls>>();
 }
 
 /// heed inline `mdb/lmdb_error.rs` (partial IN): the variant identities and
@@ -406,13 +406,13 @@ fn error_taxonomy_variants_and_constructibility() {
     // Encoding / Decoding are publicly constructible from a BoxedError.
     let be: BoxedError = Box::<dyn std::error::Error + Send + Sync>::from("boom");
     assert!(matches!(
-        heed_zerodb::Error::Encoding(be),
-        heed_zerodb::Error::Encoding(_)
+        heed::Error::Encoding(be),
+        heed::Error::Encoding(_)
     ));
     let bd: BoxedError = Box::from("boom");
     assert!(matches!(
-        heed_zerodb::Error::Decoding(bd),
-        heed_zerodb::Error::Decoding(_)
+        heed::Error::Decoding(bd),
+        heed::Error::Decoding(_)
     ));
 }
 

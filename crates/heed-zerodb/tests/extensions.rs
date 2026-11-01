@@ -15,10 +15,10 @@
 // fork's (ADR-0027), covered by `unique_txns.rs`.
 #![cfg(not(feature = "unique-txns"))]
 
-use heed_zerodb::types::{Bytes, Str};
-use heed_zerodb::{Database, EnvOpenOptions};
+use heed::types::{Bytes, Str};
+use heed::{Database, EnvOpenOptions};
 
-fn env_opts() -> EnvOpenOptions<heed_zerodb::WithoutTls> {
+fn env_opts() -> EnvOpenOptions<heed::WithoutTls> {
     EnvOpenOptions::new().read_txn_without_tls()
 }
 
@@ -172,7 +172,7 @@ fn sync_on_a_readonly_env_is_eacces() {
     }
     let mut opts = env_opts();
     opts.map_size(1024 * 1024).max_dbs(4);
-    unsafe { opts.flags(heed_zerodb::EnvFlags::READ_ONLY) };
+    unsafe { opts.flags(heed::EnvFlags::READ_ONLY) };
     let env = unsafe { opts.open(dir.path()).unwrap() };
 
     for err in [
@@ -181,7 +181,7 @@ fn sync_on_a_readonly_env_is_eacces() {
         env.sync(false).unwrap_err(),
     ] {
         match err {
-            heed_zerodb::Error::Io(e) => assert_eq!(
+            heed::Error::Io(e) => assert_eq!(
                 e.raw_os_error(),
                 Some(EACCES),
                 "read-only sync must be EACCES, got {e:?}"
@@ -249,7 +249,7 @@ fn an_invalid_page_size_is_rejected_at_open() {
     let mut opts = env_opts();
     opts.map_size(1024 * 1024).page_size(3000);
     match unsafe { opts.open(dir.path()) } {
-        Err(heed_zerodb::Error::Io(e)) => {
+        Err(heed::Error::Io(e)) => {
             assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
         }
         other => panic!("expected Io(InvalidInput), got {other:?}"),
@@ -334,7 +334,7 @@ fn clear_stale_readers_through_the_adapter_is_zero_and_harmless() {
 
 #[test]
 fn copy_to_path_with_progress_through_the_adapter() {
-    use heed_zerodb::CompactionOption;
+    use heed::CompactionOption;
 
     let dir = tempfile::tempdir().unwrap();
     let mut opts = env_opts();
@@ -376,7 +376,7 @@ fn copy_to_path_with_progress_through_the_adapter() {
 /// Descending byte order, in heed's type-level `Comparator` shape.
 enum ReverseComparator {}
 
-impl heed_zerodb::Comparator for ReverseComparator {
+impl heed::Comparator for ReverseComparator {
     fn compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
         b.cmp(a)
     }
@@ -461,7 +461,7 @@ fn default_comparator_databases_are_unaffected_by_the_2_4_plumbing() {
 
     // And compaction — which refuses a custom-comparator env — still works.
     let out = dir.path().join("c.mdb");
-    env.copy_to_path(&out, heed_zerodb::CompactionOption::Enabled)
+    env.copy_to_path(&out, heed::CompactionOption::Enabled)
         .expect("no custom comparator registered, so compaction is available");
     assert!(out.exists());
 }

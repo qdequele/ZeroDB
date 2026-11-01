@@ -3,6 +3,13 @@
 - Status: Accepted (Option B, maintainer, 2026-10-18), implemented (#115). Both open questions resolved below.
 - Related issue: #102
 - Date: 2026-10-18
+- Amended 2026-11-01 (maintainer decision): the shim crates are gone. The
+  adapter's own package is named `heed`, so `crates/heed-zerodb` is the
+  `[patch]` target directly; workspace crates depend on it as
+  `heed_zerodb = { package = "heed", path = … }`. A `[patch]` cannot enable a feature, so a consumer on the fork turns
+  `unique-txns` on from one of its own `heed` dependencies (milli's, in
+  Meilisearch; `scripts/consumer.sh` does it). Text below that names
+  `crates/heed-shim` describes the design before this amendment.
 
 ## Context
 

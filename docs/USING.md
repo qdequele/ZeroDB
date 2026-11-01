@@ -48,9 +48,22 @@ A runnable version is in
 heed = { git = "https://github.com/qdequele/ZeroDB", tag = "v0.2.0" }
 ```
 
-The patch target is `crates/heed-shim`, a crate named `heed` that re-exports
-`heed-zerodb`. For Meilisearch v1.55 and later, which use Meilisearch's heed fork
-with unique transactions, patch to `crates/heed-shim-unique-txns` instead.
+The patch target is `crates/heed-zerodb`, ZeroDB's heed adapter, whose package
+is named `heed`. It gives heed 0.22.1's API.
+
+Meilisearch v1.55 and later build against Meilisearch's heed fork, whose API
+differs (unique transactions, ADR-0027). The adapter has it behind the
+`unique-txns` feature. A `[patch]` cannot turn on a feature, so also add it to
+one of your own `heed` dependencies, milli's in Meilisearch:
+
+```toml
+heed = { version = "0.22.1", default-features = false, features = ["unique-txns", "serde-json", "serde-bincode"] }
+```
+
+Meilisearch patches heed to its fork under `[patch.crates-io]`; replace that
+line with the ZeroDB one, and add a `[patch."https://github.com/meilisearch/heed"]`
+table with the same line for crates that take heed from the fork's git
+repository. `scripts/consumer.sh` does all of this on a Meilisearch checkout.
 
 Two things change underneath:
 

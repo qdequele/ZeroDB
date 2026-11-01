@@ -491,7 +491,7 @@ mod erased_cursor_in_place_tests {
     //! the erased `&mut`, the stretched borrows, interleaved mutations
     //! through the cursor (which rewrite map bytes in place), and commit.
     //!
-    //! Run under miri: `cargo +nightly miri test -p heed-zerodb erased_cursor`.
+    //! Run under miri: `cargo +nightly miri test -p heed erased_cursor`.
 
     use std::ops::Bound;
     use std::path::PathBuf;

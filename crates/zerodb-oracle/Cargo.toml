@@ -30,7 +30,7 @@ zerodb-core = { path = "../zerodb-core" }
 # The heed adapter, driven as a third engine (`HeedZerodbEngine`) so the
 # oracle re-runs the whole op model THROUGH the adapter (ADR-0003 accept #6).
 # Depends on zerodb (no C) + heed-traits/heed-types (no C) — ADR-0001 compliant.
-heed-zerodb = { path = "../heed-zerodb" }
+heed_zerodb = { package = "heed", path = "../heed-zerodb" }
 # The fault-injection write backend + deterministic PRNG for the crash
 # harness (ADR-0008). Workspace-internal.
 zerodb-io = { path = "../zerodb-io", features = ["fault", "test-backing"] }

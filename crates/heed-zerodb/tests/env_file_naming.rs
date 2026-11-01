@@ -15,8 +15,8 @@
 
 use std::fs;
 
-use heed_zerodb::types::Bytes;
-use heed_zerodb::{CompactionOption, Database, EnvOpenOptions, WithoutTls};
+use heed::types::Bytes;
+use heed::{CompactionOption, Database, EnvOpenOptions, WithoutTls};
 
 const MAP_SIZE: usize = 4 * 1024 * 1024;
 
@@ -28,7 +28,7 @@ fn opts() -> EnvOpenOptions<WithoutTls> {
 
 /// Populate an env with `n` entries in the main DB and a named DB, so a
 /// round-trip has both catalog records and user data to preserve.
-fn populate(env: &heed_zerodb::Env<WithoutTls>, n: u32) {
+fn populate(env: &heed::Env<WithoutTls>, n: u32) {
     let mut wtxn = env.write_txn().unwrap();
     let main: Database<Bytes, Bytes> = env.create_database(&mut wtxn, None).unwrap();
     let named: Database<Bytes, Bytes> = env.create_database(&mut wtxn, Some("docs")).unwrap();
@@ -55,7 +55,7 @@ type DbContents = (Option<String>, Vec<(Vec<u8>, Vec<u8>)>);
 /// value is a `DBRecord` holding the sub-tree's **root page number**, which a
 /// compacting copy legitimately renumbers. Comparing them would assert physical
 /// page layout, not the logical equality a snapshot must preserve.
-fn contents(env: &heed_zerodb::Env<WithoutTls>) -> Vec<DbContents> {
+fn contents(env: &heed::Env<WithoutTls>) -> Vec<DbContents> {
     let rtxn = env.read_txn().unwrap();
     let mut out = Vec::new();
     let main: Database<Bytes, Bytes> = env.open_database(&rtxn, None).unwrap().unwrap();
@@ -117,7 +117,7 @@ fn adapter_env_dir_contains_exactly_data_mdb_and_lock_mdb() {
         dir_listing(dir.path()),
         vec!["data.mdb".to_string(), "lock.mdb".to_string()]
     );
-    assert_eq!(heed_zerodb::DATA_FILE_NAME, "data.mdb");
+    assert_eq!(heed::DATA_FILE_NAME, "data.mdb");
     // `Env::path()` returns the *directory*, not the data file — heed
     // parity. (Compared canonicalized: the engine
     // canonicalizes for its registry key, and macOS temp dirs are symlinked.)
@@ -304,7 +304,7 @@ fn no_lock_creates_no_lock_file() {
     let mut o = opts();
     // SAFETY: heed signature parity only; setting flags performs no unsafe
     // operation in the adapter.
-    unsafe { o.flags(heed_zerodb::EnvFlags::NO_LOCK) };
+    unsafe { o.flags(heed::EnvFlags::NO_LOCK) };
     let env = unsafe { o.open(dir.path()).unwrap() };
     populate(&env, 8);
     assert_eq!(dir_listing(dir.path()), vec!["data.mdb".to_string()]);
@@ -325,7 +325,7 @@ fn no_lock_creates_no_lock_file() {
 /// `mdb_env_get_flags` does.
 #[test]
 fn flags_report_no_lock() {
-    use heed_zerodb::EnvFlags;
+    use heed::EnvFlags;
     let dir = tempfile::tempdir().unwrap();
     let mut o = opts();
     // SAFETY: as in `no_lock_creates_no_lock_file`.
@@ -447,7 +447,7 @@ fn read_only_fs(src: &std::path::Path) -> Result<ReadOnlyFs, String> {
 /// `multi_process::read_only_env_on_read_only_media_opens_without_a_lock_file`.
 #[test]
 fn read_only_media_env_has_no_lock_file_and_does_not_report_no_lock() {
-    use heed_zerodb::EnvFlags;
+    use heed::EnvFlags;
     let src = tempfile::tempdir().unwrap();
     {
         let mut o = opts();

@@ -3,7 +3,9 @@
 #
 # The sourcing script sets ZERODB (this repository), CLONE (the consumer
 # checkout), MARK_BEGIN / MARK_END (the patch block markers) and LOG_TAG, and
-# defines `heed_shim`, which prints the shim crate to patch in.
+# defines `heed_feature_manifest`, which prints the member manifest that turns
+# on the adapter's `unique-txns` feature for Meilisearch's heed fork, or
+# nothing.
 
 log() { printf '\n\033[1m[%s] %s\033[0m\n' "$LOG_TAG" "$*"; }
 
@@ -34,14 +36,14 @@ ensure_clone() {
     fi
 }
 
-# Patch heed to the shim ($1 = on), prepare a stock build ($1 = stock) or restore
-# the manifest ($1 = off); see scripts/patch-heed.py.
+# Patch heed to ZeroDB's adapter ($1 = on), prepare a stock build ($1 = stock)
+# or restore the manifests ($1 = off); see scripts/patch-heed.py.
 set_patch() {
     python3 "$ZERODB/scripts/patch-heed.py" "$CLONE/Cargo.toml" "$1" \
-        "$MARK_BEGIN" "$MARK_END" "$(heed_shim)"
+        "$MARK_BEGIN" "$MARK_END" "$ZERODB/crates/heed-zerodb" "$(heed_feature_manifest)"
 }
 
-# assert_no_lmdb PACKAGE: the whole point of the drop-in. With the shim
+# assert_no_lmdb PACKAGE: the whole point of the drop-in. With the adapter
 # patched in, the C LMDB fork must vanish from the dependency graph of PACKAGE
 # (or of the whole clone when PACKAGE is empty).
 assert_no_lmdb() {

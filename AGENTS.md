@@ -41,11 +41,10 @@ ship behind explicit options.
 - `crates/zerodb-io`: mmap reads, `pwrite`/`pwritev` commit writes, fsync, the
   lock file, and the fault-injection backend used by the crash tests.
 - `crates/zerodb`: the public engine API (heed-shaped).
-- `crates/heed-zerodb`: the heed 0.22.1 API over the engine.
-- `crates/heed-shim`, `crates/heed-shim-unique-txns`: crates literally named
-  `heed` that re-export `heed-zerodb`; the `[patch.crates-io]` targets. They
-  are excluded from the workspace so they never collide with the oracle's real
-  `heed`.
+- `crates/heed-zerodb`: the heed 0.22.1 API over the engine. Its package is
+  named `heed`, so it is the `[patch.crates-io]` target itself; select it with
+  `-p heed`, and depend on it as `heed_zerodb = { package = "heed", path = … }`
+  (the oracle also links the real crates.io `heed`).
 - `crates/zerodb-tools`: `stat`, `dump`, `load`, `check`, `migrate-from-lmdb`.
   The optional `migrate-lmdb` feature links C LMDB through heed.
 - `crates/zerodb-oracle`: the differential harness against C LMDB, the crash

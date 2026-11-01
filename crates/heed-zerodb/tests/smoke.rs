@@ -6,10 +6,10 @@
 // fork's (ADR-0027), covered by `unique_txns.rs`.
 #![cfg(not(feature = "unique-txns"))]
 
-use heed_zerodb::types::{Bytes, Str, U32};
-use heed_zerodb::{byteorder::BigEndian, Database, EnvOpenOptions};
+use heed::types::{Bytes, Str, U32};
+use heed::{byteorder::BigEndian, Database, EnvOpenOptions};
 
-fn env_opts() -> EnvOpenOptions<heed_zerodb::WithoutTls> {
+fn env_opts() -> EnvOpenOptions<heed::WithoutTls> {
     EnvOpenOptions::new().read_txn_without_tls()
 }
 

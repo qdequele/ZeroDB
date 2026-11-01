@@ -3,6 +3,11 @@
 - Status: Approved — maintainer, 2026-07-16 (Phase 0 ratification queue, per recommendations)
 - Milestone: 0.5 (this ADR); implemented in 1.13, gated in 1.14
 - Date: 2026-07-15
+- Amended 2026-11-01 (maintainer decision): the shim crates are gone. The
+  adapter's own package is named `heed`, so `crates/heed-zerodb` is the
+  `[patch]` target directly; workspace crates depend on it as
+  `heed_zerodb = { package = "heed", path = … }`. Text below that names
+  `crates/heed-shim` describes the design before this amendment.
 
 > **Implemented (M1.13, 2026-07-17).** `crates/heed-zerodb` reproduces the full
 > SPEC 00 MUST surface over ZeroDB's native API and re-exports

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # hannoy (HNSW vector index) on ZeroDB — the second consumer.
 #
-#   scripts/hannoy.sh suites   # hannoy's own test suite on the ZeroDB shim (+ no-LMDB check)
+#   scripts/hannoy.sh suites   # hannoy's own test suite on ZeroDB (+ no-LMDB check)
 #   scripts/hannoy.sh bench    # `cargo bench --bench benchmark` (divan: build_hnsw /
 #                              #   search_hnsw at 512/768/1536 dims) on LMDB then ZeroDB,
 #                              #   medians compared
@@ -15,8 +15,8 @@
 #   ROUNDS        bench rounds, order flipped on even rounds (default: 1)
 #   BENCH_ARGS    extra args after `--` for divan (e.g. "build_hnsw" to filter)
 #
-# Same mechanism as scripts/consumer.sh: `[patch.crates-io] heed = { path = …/heed-shim }`
-# between marker lines, removed again for the stock build.
+# Same mechanism as scripts/consumer.sh: `[patch.crates-io] heed = { path =
+# …/crates/heed-zerodb }` between marker lines, removed again for the stock build.
 set -euo pipefail
 
 ZERODB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -33,11 +33,12 @@ LOG_TAG=hannoy
 # shellcheck source=scripts/lib/consumer-common.sh
 source "$ZERODB/scripts/lib/consumer-common.sh"
 
-heed_shim() { echo "$ZERODB/crates/heed-shim"; }
+# hannoy builds against stock heed 0.22.1: no feature to turn on.
+heed_feature_manifest() { :; }
 
 do_suites() {
     set_patch on
-    log "cargo test on the ZeroDB shim"
+    log "cargo test on ZeroDB"
     (cd "$CLONE" && cargo test)
     assert_no_lmdb ""
 }

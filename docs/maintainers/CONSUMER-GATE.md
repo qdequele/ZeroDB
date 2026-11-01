@@ -18,29 +18,29 @@ Meilisearch `Cargo.toml` (between marker comments, removed again afterwards):
 
 ```toml
 [patch.crates-io]
-heed = { path = "<zerodb>/crates/heed-shim" }
+heed = { path = "<zerodb>/crates/heed-zerodb" }
 ```
+
+`crates/heed-zerodb` is ZeroDB's heed adapter, the 1:1 re-implementation of
+heed's surface over the ZeroDB engine (ADR-0003). Its package is named `heed`
+at version 0.22.1: cargo's `[patch]` matches by package name and silently
+ignores a `package =` rename.
 
 Since v1.55 Meilisearch has its own `[patch.crates-io]` section, which points
 `heed` at a git branch of Meilisearch's heed fork. The script then puts the
-shim line inside that section and comments out Meilisearch's `heed` line, so
+ZeroDB line inside that section and comments out Meilisearch's `heed` line, so
 the LMDB build is the one Meilisearch ships and the ZeroDB build replaces it.
 Some of its dependencies (cellulite) take heed from that git repository
 directly, which `[patch.crates-io]` does not reach, so every git source of heed
 in Meilisearch's `Cargo.lock` gets a `[patch."<url>"]` table pointing at the
-shim as well (`scripts/patch-heed.py`).
+adapter as well (`scripts/patch-heed.py`).
 
 The fork changes heed's API (unique transactions, which alone open and create
-databases). Its counterpart is `crates/heed-shim-unique-txns`, the same shim
-with `heed-zerodb`'s `unique-txns` feature on (ADR-0027). The script picks it
-when Meilisearch's committed `Cargo.lock` resolves heed from the
-`mutexify-open-dbi` branch, and `crates/heed-shim` otherwise; `HEED_SHIM=<path>`
-overrides the choice.
-
-`heed-shim` is a crate literally named `heed` at version 0.22.1 that re-exports
-`heed-zerodb`, the 1:1 re-implementation of heed's surface over the ZeroDB
-engine (ADR-0003). That is the only patch form cargo honours — a `package =`
-rename inside `[patch]` is silently ignored. milli, arroy, hannoy, cellulite and
+databases). The adapter has it behind its `unique-txns` feature (ADR-0027). A
+`[patch]` cannot enable a feature, so when Meilisearch's committed `Cargo.lock`
+resolves heed from the `mutexify-open-dbi` branch, the script also adds
+`"unique-txns"` to the features of milli's `heed` dependency; every build of
+milli, index-scheduler and meilisearch then gets the fork's API. milli, arroy, hannoy, cellulite and
 index-scheduler all see the same `heed` type names and compile unchanged.
 
 After patching, the script asserts that `lmdb-master-sys` (the C LMDB fork) has
