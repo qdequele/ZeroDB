@@ -227,7 +227,7 @@ fn page_size_is_selectable_through_the_adapter() {
 
 #[test]
 fn omitting_page_size_defaults_to_the_os_page_size() {
-    // LMDB parity (SPEC 00 row 164): the fork derives `me_psize` from
+    // LMDB parity: the fork derives `me_psize` from
     // `sysconf(_SC_PAGE_SIZE)` (capped 64 K) at store creation, so an
     // adapter-created store must adopt the same geometry — 16 K on Apple
     // Silicon, 4 K on x86_64 Linux — not the native engine's fixed 4 K

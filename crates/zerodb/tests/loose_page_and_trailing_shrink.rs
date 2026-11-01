@@ -1,35 +1,12 @@
 //! The loose-page fast path (GC-7/8) and trailing-shrink (GC-10), ADR-0004,
 //! pinned through observable file-size + `check_image` assertions.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::{assert_clean, TempDir};
 
-use zerodb::{check, Env, EnvOpenOptions};
+use std::path::Path;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-loose-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{Env, EnvOpenOptions};
 
 const PS: u32 = 4096;
 const MAP: usize = 8 << 20;
@@ -39,12 +16,6 @@ fn open(dir: &Path) -> Env {
     opts.map_size(MAP);
     opts.page_size(PS);
     opts.open(dir).expect("open env")
-}
-
-fn assert_clean(dir: &Path) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, PS);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
 }
 
 /// Same-txn alloc-then-free: an overflow run allocated and deleted **within
@@ -90,7 +61,7 @@ fn same_txn_alloc_then_free_overflow_reused_leaves_only_the_leaf_cow() {
         db.put(&mut wtxn, b"small", b"y").unwrap();
         wtxn.commit().unwrap();
     }
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     let size_after = std::fs::metadata(dir.path().join(zerodb::DATA_FILE_NAME))
         .unwrap()
         .len();
@@ -148,7 +119,7 @@ fn trailing_loose_pages_shrink_next_pgno() {
         assert!(db.delete(&mut wtxn, b"trailing").unwrap());
         wtxn.commit().unwrap();
     }
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     let size_after = std::fs::metadata(dir.path().join(zerodb::DATA_FILE_NAME))
         .unwrap()
         .len();
@@ -167,7 +138,7 @@ fn trailing_loose_pages_shrink_next_pgno() {
     db.put(&mut wtxn, b"post-shrink", &vec![0x33u8; 3 * PS as usize])
         .unwrap();
     wtxn.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     let rtxn = env.read_txn().unwrap();
     assert_eq!(
         db.get(&rtxn, b"post-shrink").unwrap(),

@@ -7,39 +7,12 @@
 //!
 //! Every committed image is validated with `zerodb::check::check_image`.
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::{assert_clean, TempDir};
 
-use zerodb::{check, Env, EnvOpenOptions, Error, MdbError};
+use std::path::Path;
 
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("zerodb-named-{pid}-{nanos}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{Env, EnvOpenOptions, Error, MdbError};
 
 const PS: u32 = 4096;
 const MAP: usize = 16 << 20;
@@ -50,12 +23,6 @@ fn open(dir: &Path, max_dbs: u32) -> Env {
     opts.page_size(PS);
     opts.max_dbs(max_dbs);
     opts.open(dir).expect("open env")
-}
-
-fn assert_clean(dir: &Path) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, PS);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
 }
 
 #[test]
@@ -72,7 +39,7 @@ fn create_named_dbs_persist_and_are_isolated() {
         }
         w.commit().unwrap();
     }
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     // Reopen and read back through the committed catalog.
     let env2 = {
         drop(env);
@@ -114,7 +81,7 @@ fn many_named_dbs_split_the_catalog_leaf_preserving_f_subdata() {
         }
         w.commit().unwrap();
     }
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     // The catalog (main DB) must have grown past a single leaf.
     let r = env.read_txn().unwrap();
     let main_stat = env.main_database().stat(&r).unwrap();
@@ -152,7 +119,7 @@ fn stat_matches_full_walk() {
     assert_eq!(s.entries, 1000);
     assert!(s.depth >= 2, "expected a branch level, depth {}", s.depth);
     w.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 }
 
 #[test]
@@ -176,7 +143,7 @@ fn clear_keeps_entry_drop_removes_it() {
         a.clear(&mut w).unwrap();
         w.commit().unwrap();
     }
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     {
         let r = env.read_txn().unwrap();
         let a = env.open_database(&r, Some(b"a")).unwrap().unwrap();
@@ -192,7 +159,7 @@ fn clear_keeps_entry_drop_removes_it() {
         b.drop_db(&mut w).unwrap();
         w.commit().unwrap();
     }
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     let r = env.read_txn().unwrap();
     assert!(env.open_database(&r, Some(b"b")).unwrap().is_none());
     assert_eq!(env.main_database().len(&r).unwrap(), 1);
@@ -220,7 +187,7 @@ fn create_in_txn_then_abort_discards_it() {
         d.put(&mut w, b"k", b"v2").unwrap();
         w.commit().unwrap();
     }
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     let r = env.read_txn().unwrap();
     let d = env.open_database(&r, Some(b"ephemeral")).unwrap().unwrap();
     assert_eq!(d.get(&r, b"k").unwrap(), Some(b"v2".as_slice()));
@@ -241,7 +208,7 @@ fn dbs_full_when_catalog_capacity_exhausted() {
     let e = env.create_database(&mut w, Some(b"four")).unwrap_err();
     assert!(matches!(e, Error::Mdb(MdbError::DbsFull)), "got {e:?}");
     w.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 }
 
 #[test]

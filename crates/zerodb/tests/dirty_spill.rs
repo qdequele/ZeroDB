@@ -12,37 +12,14 @@
 //! - an abort after spilling leaves exactly the last commit;
 //! - a txn that stays under the limit never spills.
 
+mod common;
+use common::{assert_clean, TempDir};
+
 use std::collections::BTreeMap;
 use std::ops::Bound;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 
-use zerodb::{check, Database, Env, EnvFlags, EnvOpenOptions, RwTxn};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-spill-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{Database, Env, EnvFlags, EnvOpenOptions, RwTxn};
 
 const PS: u32 = 4096;
 /// The smallest limit the option allows (SPEC 04 TXN-68): 128 pages.
@@ -58,12 +35,6 @@ fn open(dir: &Path, limit: Option<usize>, flags: EnvFlags) -> Env {
         opts.max_dirty_bytes(b);
     }
     opts.open(dir).expect("open env")
-}
-
-fn assert_clean(dir: &Path) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, PS);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
 }
 
 struct Rng(u64);
@@ -221,8 +192,8 @@ fn differential(flags: EnvFlags) {
         spilled = spilled.max(big_txn(&tiny, &tdbs, &mut tmodel, &mut Rng(seed), round));
         let unspilled = big_txn(&plain, &pdbs, &mut pmodel, &mut Rng(seed), round);
         assert_eq!(unspilled, 0, "the default limit is never reached here");
-        assert_clean(tiny_dir.path());
-        assert_clean(plain_dir.path());
+        assert_clean(tiny_dir.path(), PS);
+        assert_clean(plain_dir.path(), PS);
     }
     assert!(spilled > 0, "the tiny limit must actually spill");
     let (rt, rp) = (tiny.read_txn().unwrap(), plain.read_txn().unwrap());
@@ -280,7 +251,7 @@ fn dirty_memory_stays_near_the_limit() {
     }
     assert!(w.spilled_pgnos() > 0);
     w.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     let r = env.read_txn().unwrap();
     let want: Vec<_> = model.into_iter().collect();
     assert_eq!(contents(&r, db), want);
@@ -337,7 +308,7 @@ fn abort_after_spill(flags: EnvFlags) {
     );
     w.abort();
     assert_eq!(contents(&env.read_txn().unwrap(), db), before);
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     drop(env);
 
     let env = open(dir.path(), Some(TINY), flags);
@@ -353,7 +324,7 @@ fn abort_after_spill(flags: EnvFlags) {
             .unwrap();
     }
     w.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
     assert_eq!(
         contents(&env.read_txn().unwrap(), db).len(),
         before.len() + 5_000
@@ -408,7 +379,7 @@ fn clear_and_drop_of_spilled_trees() {
     doomed.drop_db(&mut w).unwrap();
     assert_eq!(inline.len(&w).unwrap(), 0);
     w.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     let r = env.read_txn().unwrap();
     assert_eq!(inline.len(&r).unwrap(), 0);
@@ -440,7 +411,7 @@ fn reserve_and_create_in_a_spilled_txn() {
         base.put(&mut w, k, b"rewritten").unwrap();
     }
     w.commit().unwrap();
-    assert_clean(dir.path());
+    assert_clean(dir.path(), PS);
 
     let r = env.read_txn().unwrap();
     for (i, len) in [(0u32, 200usize), (1, 9_000), (2, 70_000), (3, 5)].iter() {

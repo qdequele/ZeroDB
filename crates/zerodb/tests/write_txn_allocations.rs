@@ -11,10 +11,11 @@
 //! published snapshot and its free-list annex (two allocations), and the
 //! vectored-write iovec lists of the file backend.
 
+mod common;
+use common::TempDir;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use zerodb::{EnvFlags, EnvOpenOptions};
 
@@ -71,36 +72,6 @@ fn allocations(f: impl FnOnce()) -> u64 {
     f();
     COUNTING.with(|on| on.set(false));
     COUNT.with(Cell::get)
-}
-
-// --- tiny self-cleaning temp dir (no tempfile dep on the allowlist) ---
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-allocs-{pid}-{seq}"));
-        // An interrupted run leaves its directory behind; a later run with
-        // the same pid and sequence must not open that old data.
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
 }
 
 #[test]

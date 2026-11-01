@@ -5,30 +5,16 @@
 //! The test binary re-runs itself as the other process (see `child_entry`).
 #![cfg(unix)]
 
+mod common;
+use common::TempDir;
+
 use std::collections::BTreeSet;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use zerodb::{Env, EnvOpenOptions, DATA_FILE_NAME, HEED_DATA_FILE_NAME};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn tmp_dir(tag: &str) -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let p = std::env::temp_dir().join(format!(
-        "zerodb-lock-{tag}-{}-{nanos}-{n}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&p).unwrap();
-    p
-}
 
 /// The child's role.
 const ROLE: &str = "ZERODB_TOOLS_LIVE_ROLE";
@@ -182,8 +168,8 @@ fn entries(dir: &Path) -> BTreeSet<String> {
 /// environment's own two files.
 #[test]
 fn tools_attach_to_a_live_env_in_another_process() {
-    let dir = tmp_dir("live");
-    let ctl = tmp_dir("live-ctl");
+    let dir = TempDir::new("live");
+    let ctl = TempDir::new("live-ctl");
     let child = spawn_child("hold_adapter", &dir, &ctl);
     wait_for(&ctl.join("ready"), Duration::from_secs(30));
 
@@ -239,7 +225,7 @@ fn tools_attach_to_a_live_env_in_another_process() {
 /// the tool at the wrong directory can see what it looked for.
 #[test]
 fn tools_refuse_a_missing_env() {
-    let dir = tmp_dir("missing");
+    let dir = TempDir::new("missing");
     let err = zerodb_tools::commands::cmd_stat(&dir).unwrap_err();
     let msg = err.to_string();
     assert!(msg.contains("no zerodb env"), "err: {err}");
@@ -251,12 +237,13 @@ fn tools_refuse_a_missing_env() {
 /// that environment as it was.
 #[test]
 fn load_refuses_a_destination_another_process_has_open() {
-    let dir = tmp_dir("load-live");
-    let ctl = tmp_dir("load-live-ctl");
+    let dir = TempDir::new("load-live");
+    let ctl = TempDir::new("load-live-ctl");
     let child = spawn_child("hold_native", &dir, &ctl);
     wait_for(&ctl.join("ready"), Duration::from_secs(30));
 
-    let dump = tmp_dir("load-live-src").join("dump.txt");
+    let dump_dir = TempDir::new("load-live-src");
+    let dump = dump_dir.join("dump.txt");
     std::fs::write(
         &dump,
         format!(
@@ -303,8 +290,8 @@ fn corrupt_both_metas(data: &Path) {
 /// rather than walking a file that process may be writing.
 #[test]
 fn check_raw_fallback_refuses_while_the_env_is_live() {
-    let dir = tmp_dir("check-live");
-    let ctl = tmp_dir("check-live-ctl");
+    let dir = TempDir::new("check-live");
+    let ctl = TempDir::new("check-live-ctl");
     let child = spawn_child("hold_adapter", &dir, &ctl);
     wait_for(&ctl.join("ready"), Duration::from_secs(30));
 
@@ -320,7 +307,7 @@ fn check_raw_fallback_refuses_while_the_env_is_live() {
 /// file and reports the violations.
 #[test]
 fn check_raw_fallback_reports_a_closed_corrupt_env() {
-    let dir = tmp_dir("check-closed");
+    let dir = TempDir::new("check-closed");
     {
         let env: Env = EnvOpenOptions::new().map_size(1 << 20).open(&dir).unwrap();
         let mut w = env.write_txn().unwrap();

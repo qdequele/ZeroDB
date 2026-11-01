@@ -4,36 +4,13 @@
 //! observable state (file size, `check_image`, `free_page_count`, the meta
 //! bytes) rather than internals.
 
+mod common;
+use common::TempDir;
+
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use zerodb::{check, free_page_count, CompactionOption, CopyToFile, Env, EnvFlags, EnvOpenOptions};
 use zerodb_core::page::{MetaPage, MetaValidity, PGNO_INVALID};
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("zerodb-annex-{pid}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
 
 const PS: u32 = 4096;
 const MAP: usize = 32 << 20;

@@ -8,54 +8,18 @@
 //! Every committed image is validated with `zerodb::check::check_image`
 //! (SPEC 03 §11 + SPEC 05 §9, including INV-10/INV-22 reachable-XOR-free).
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+mod common;
+use common::{assert_clean, TempDir};
 
-use zerodb::{check, Env, EnvFlags, EnvOpenOptions};
+use std::path::Path;
 
-// --- tiny self-cleaning temp dir (no tempfile dep on the allowlist) ---
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> TempDir {
-        let pid = std::process::id();
-        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!("zerodb-write-{pid}-{nanos}-{seq}"));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        TempDir { path }
-    }
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.path);
-    }
-}
+use zerodb::{Env, EnvFlags, EnvOpenOptions};
 
 fn open(dir: &Path, map_size: usize, page_size: u32) -> Env {
     let mut opts = EnvOpenOptions::new();
     opts.map_size(map_size);
     opts.page_size(page_size);
     opts.open(dir).expect("open env")
-}
-
-/// Assert the on-disk image passes the invariant walk (SPEC 03 §11 subset).
-fn assert_clean(dir: &Path, psize: u32) {
-    let bytes = std::fs::read(dir.join(zerodb::DATA_FILE_NAME)).expect("read data file");
-    let v = check::check_image(&bytes, psize);
-    assert!(v.is_empty(), "invariant violations: {v:#?}");
 }
 
 const PS: u32 = 4096;
