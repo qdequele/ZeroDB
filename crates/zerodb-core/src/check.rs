@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::page::geometry::{gc_key_decode, overflow_page_count};
+use crate::page::geometry::{gc_key_decode, overflow_page_count, pil_decode};
 use crate::page::{
     select_meta, DBRecord, LeafValue, MetaPage, OverflowRef, PageRef, PageType, DBRECORD_LEN,
     FIRST_DATA_PGNO, F_SUBDATA, MAX_DB_NAME, MAX_KEY_SIZE, MIN_KEYS_BRANCH, MIN_KEYS_LEAF,
@@ -105,6 +105,18 @@ enum Deferred {
     Subtree(SubtreeJob),
 }
 
+/// Which kind of tree a walk is in: it decides how leaf entries are read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TreeKind {
+    /// The main DB: its `F_SUBDATA` entries are named-DB records, followed
+    /// as trees of their own (SPEC 02 §6).
+    Catalog,
+    /// The free/GC DB: its entries are free-page lists (SPEC 05).
+    Gc,
+    /// A named database's own tree.
+    Named,
+}
+
 /// A child subtree of a record's root branch, with the separator bounds the
 /// root gives it (INV-6).
 struct SubtreeJob {
@@ -115,8 +127,7 @@ struct SubtreeJob {
     level: u16,
     low: Option<Vec<u8>>,
     high: Option<Vec<u8>>,
-    gc_tree: bool,
-    catalog: bool,
+    kind: TreeKind,
 }
 
 struct Checker<'s, 'a> {
@@ -220,21 +231,19 @@ impl<'s, 'a> Checker<'s, 'a> {
     }
 
     /// Walk one tree (INV-5..9, 11–13, 16–20), accumulating stats.
-    /// `low`/`high` are the separator bounds inherited from the parent
+    /// `(low, high)` are the separator bounds inherited from the parent
     /// (INV-6): every key in this subtree must be in `[low, high)`.
-    #[allow(clippy::too_many_arguments)]
     fn walk(
         &mut self,
         pgno: u64,
         level: u16,
         is_root: bool,
-        low: Option<&[u8]>,
-        high: Option<&[u8]>,
+        (low, high): (Option<&[u8]>, Option<&[u8]>),
         stats: &mut WalkStats,
-        gc_tree: bool,
-        catalog: bool,
+        kind: TreeKind,
     ) {
-        let Some(page) = self.visit(pgno, if gc_tree { "GC" } else { "tree" }) else {
+        let what = if kind == TreeKind::Gc { "GC" } else { "tree" };
+        let Some(page) = self.visit(pgno, what) else {
             return;
         };
         match page.page_type() {
@@ -291,7 +300,7 @@ impl<'s, 'a> Checker<'s, 'a> {
                             // Catalog entry (SPEC 02 §6): an `F_SUBDATA` value is
                             // a 48-byte sub-DB record on the main tree only.
                             if is_subdata {
-                                if !catalog {
+                                if kind != TreeKind::Catalog {
                                     self.fail(
                                         "INV-21",
                                         format!(
@@ -326,7 +335,7 @@ impl<'s, 'a> Checker<'s, 'a> {
                             self.check_overflow(pgno, head_pgno, dsize, stats);
                         }
                     }
-                    if gc_tree {
+                    if kind == TreeKind::Gc {
                         self.check_gc_entry(pgno, k, leaf.value(i));
                     }
                 }
@@ -338,7 +347,7 @@ impl<'s, 'a> Checker<'s, 'a> {
                     let label = format!("subdb {:?}", String::from_utf8_lossy(&name));
                     match &mut self.deferred {
                         Some(d) => d.push(Deferred::Record { label, rec }),
-                        None => self.check_record(&label, &rec, false),
+                        None => self.check_record(&label, &rec, TreeKind::Named),
                     }
                 }
             }
@@ -353,7 +362,7 @@ impl<'s, 'a> Checker<'s, 'a> {
                     return;
                 }
                 let n = br.num_keys();
-                if (!is_root && n < MIN_KEYS_BRANCH) || (is_root && n < 2) {
+                if n < MIN_KEYS_BRANCH {
                     self.fail("INV-8", format!("branch {pgno} holds {n} < 2 children"));
                 }
                 // Owned copies of separators so recursion doesn't hold a
@@ -383,22 +392,12 @@ impl<'s, 'a> Checker<'s, 'a> {
                                 level: level - 1,
                                 low: lo.map(<[u8]>::to_vec),
                                 high: hi.map(<[u8]>::to_vec),
-                                gc_tree,
-                                catalog,
+                                kind,
                             }));
                             continue;
                         }
                     }
-                    self.walk(
-                        children[i],
-                        level - 1,
-                        false,
-                        lo,
-                        hi,
-                        stats,
-                        gc_tree,
-                        catalog,
-                    );
+                    self.walk(children[i], level - 1, false, (lo, hi), stats, kind);
                 }
             }
             other => {
@@ -432,13 +431,8 @@ impl<'s, 'a> Checker<'s, 'a> {
                 self.fail("INV-11", format!("overflow page {p} shared/re-referenced"));
             }
         }
-        let ps = self.psize as usize;
         // `head <= last_pg <= bytes.len()/ps` here, but keep it checked.
-        let Some(base) = (head as usize).checked_mul(ps) else {
-            self.fail("INV-11", format!("overflow head {head} beyond the file"));
-            return;
-        };
-        let Some(run) = self.bytes.get(base..) else {
+        let Some(run) = self.run_at(head) else {
             self.fail("INV-11", format!("overflow head {head} beyond the file"));
             return;
         };
@@ -495,16 +489,8 @@ impl<'s, 'a> Checker<'s, 'a> {
         let pil: Vec<u8> = match val {
             LeafValue::Inline(v) => v.to_vec(),
             LeafValue::Overflow { head_pgno, dsize } => {
-                let ps = self.psize as usize;
-                // Checked: `head_pgno` is raw on-disk data; the multiply must
-                // not wrap into a bogus in-bounds offset.
-                let Some(base) = (head_pgno as usize).checked_mul(ps) else {
-                    self.fail("INV-26", format!("GC entry {txnid}: unreadable PIL"));
-                    return;
-                };
                 match self
-                    .bytes
-                    .get(base..)
+                    .run_at(head_pgno)
                     .and_then(|run| OverflowRef::new(run, self.psize).ok())
                     .and_then(|o| o.payload(dsize).ok())
                 {
@@ -516,35 +502,35 @@ impl<'s, 'a> Checker<'s, 'a> {
                 }
             }
         };
-        if pil.len() < 8 || !pil.len().is_multiple_of(8) {
+        let Some(ids) = pil_decode(&pil) else {
             self.fail(
                 "INV-26",
-                format!("GC entry {txnid}: PIL length {}", pil.len()),
+                format!(
+                    "GC entry {txnid}: PIL of {} bytes: bad length or count prefix",
+                    pil.len()
+                ),
             );
             return;
-        }
-        let count = u64::from_le_bytes(pil[0..8].try_into().expect("8 bytes"));
-        if count as usize != pil.len() / 8 - 1 {
-            self.fail("INV-26", format!("GC entry {txnid}: count prefix mismatch"));
-            return;
-        }
-        let mut prev: Option<u64> = None;
-        for chunk in pil[8..].as_chunks::<8>().0 {
-            let id = u64::from_le_bytes(*chunk);
-            if id < FIRST_DATA_PGNO || id > self.last_pg {
-                self.fail(
+        };
+        for fault in check_free_ids(&ids, self.last_pg, &mut self.free) {
+            match fault {
+                FreeIdFault::OutOfRange(id) => self.fail(
                     "INV-25",
                     format!("GC entry {txnid}: free id {id} out of range"),
-                );
-            }
-            if let Some(p) = prev {
-                if p >= id {
+                ),
+                FreeIdFault::NotAscending => {
                     self.fail("INV-26", format!("GC entry {txnid}: ids not ascending"));
                 }
             }
-            prev = Some(id);
-            *self.free.entry(id).or_insert(0) += 1;
         }
+    }
+
+    /// The bytes from page `pgno` to the end of the file; `None` past it.
+    /// Checked: `pgno` is raw on-disk data, and the multiply must not wrap
+    /// into a bogus in-bounds offset.
+    fn run_at(&self, pgno: u64) -> Option<&'a [u8]> {
+        let base = (pgno as usize).checked_mul(self.psize as usize)?;
+        self.bytes.get(base..)
     }
 
     /// INV-22 (the GC side of INV-10) + INV-24: after both tree walks, every
@@ -599,21 +585,10 @@ impl<'s, 'a> Checker<'s, 'a> {
         }
     }
 
-    /// Validate a `DBRecord` (`name` labels it in violation messages) and walk
-    /// its tree. `gc_tree` marks the free/GC DB; `catalog` marks the main DB
-    /// (so its `F_SUBDATA` leaf entries are followed as named-DB records,
-    /// SPEC 02 §6). A named DB's own tree is neither (`catalog = false`).
-    fn check_record(&mut self, name: &str, rec: &DBRecord, gc_tree: bool) {
-        self.check_record_inner(name, rec, gc_tree, false);
-    }
-
-    /// The main catalog DB: `catalog = true` so `F_SUBDATA` entries are walked.
-    fn check_catalog_record(&mut self, name: &str, rec: &DBRecord) {
-        self.check_record_inner(name, rec, false, true);
-    }
-
-    fn check_record_inner(&mut self, name: &str, rec: &DBRecord, gc_tree: bool, catalog: bool) {
-        if let Some(stats) = self.walk_record(name, rec, gc_tree, catalog) {
+    /// Validate a `DBRecord` (`name` labels it in violation messages), walk
+    /// its tree as a `kind` tree and check its stats.
+    fn check_record(&mut self, name: &str, rec: &DBRecord, kind: TreeKind) {
+        if let Some(stats) = self.walk_record(name, rec, kind) {
             self.check_stats(name, rec, stats);
         }
     }
@@ -621,13 +596,7 @@ impl<'s, 'a> Checker<'s, 'a> {
     /// Check a record's own fields and walk its tree (deferring the root's
     /// children in a parallel walk). Returns the stats it counted, or `None`
     /// when the record is malformed and its tree was not walked.
-    fn walk_record(
-        &mut self,
-        name: &str,
-        rec: &DBRecord,
-        gc_tree: bool,
-        catalog: bool,
-    ) -> Option<WalkStats> {
+    fn walk_record(&mut self, name: &str, rec: &DBRecord, kind: TreeKind) -> Option<WalkStats> {
         // INV-19 root shape.
         if rec.depth == 0 && rec.root != PGNO_INVALID {
             self.fail("INV-19", format!("{name}: depth 0 but root {}", rec.root));
@@ -664,9 +633,7 @@ impl<'s, 'a> Checker<'s, 'a> {
                 (1, Some(PageType::Leaf)) | (2.., Some(PageType::Branch)) => {}
                 (d, t) => self.fail("INV-19", format!("{name}: depth {d} but root is {t:?}")),
             }
-            self.walk(
-                rec.root, rec.depth, true, None, None, &mut stats, gc_tree, catalog,
-            );
+            self.walk(rec.root, rec.depth, true, (None, None), &mut stats, kind);
         }
         Some(stats)
     }
@@ -845,6 +812,34 @@ fn default_threads(last_pg: u64) -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_THREADS))
 }
 
+/// A fault in a list of free-page ids ([`check_free_ids`]).
+enum FreeIdFault {
+    /// An id outside `[FIRST_DATA_PGNO, last_pg]`.
+    OutOfRange(u64),
+    /// An id not above the one before it.
+    NotAscending,
+}
+
+/// The shape every list of free-page ids must have, a GC entry's (GC-4) and
+/// the meta annex's (GC-29): each id in `[FIRST_DATA_PGNO, last_pg]` and
+/// strictly ascending. Counts each id into `free` (for the INV-22/24
+/// partition) and returns every fault, in list order.
+fn check_free_ids(ids: &[u64], last_pg: u64, free: &mut HashMap<u64, u64>) -> Vec<FreeIdFault> {
+    let mut faults = Vec::new();
+    let mut prev: Option<u64> = None;
+    for &id in ids {
+        if id < FIRST_DATA_PGNO || id > last_pg {
+            faults.push(FreeIdFault::OutOfRange(id));
+        }
+        if prev.is_some_and(|p| p >= id) {
+            faults.push(FreeIdFault::NotAscending);
+        }
+        prev = Some(id);
+        *free.entry(id).or_insert(0) += 1;
+    }
+    faults
+}
+
 /// Walk the state `roots` describes over `bytes`, which covers at least
 /// pages `0..=roots.last_pg`, appending to `violations`.
 ///
@@ -868,18 +863,11 @@ fn check_state(
     // INV-28) and count its ids into the free set for the INV-22/24
     // partition.
     let mut free: HashMap<u64, u64> = HashMap::new();
-    let mut prev: Option<u64> = None;
-    for &id in roots.annex {
-        if id < FIRST_DATA_PGNO || id > roots.last_pg {
-            violations.push(format!("INV-28: annex free id {id} out of range"));
-        }
-        if let Some(p) = prev {
-            if p >= id {
-                violations.push("INV-28: annex ids not strictly ascending".into());
-            }
-        }
-        prev = Some(id);
-        *free.entry(id).or_insert(0) += 1;
+    for fault in check_free_ids(roots.annex, roots.last_pg, &mut free) {
+        violations.push(match fault {
+            FreeIdFault::OutOfRange(id) => format!("INV-28: annex free id {id} out of range"),
+            FreeIdFault::NotAscending => "INV-28: annex ids not strictly ascending".into(),
+        });
     }
     let shared = || Shared {
         bytes,
@@ -899,8 +887,8 @@ fn check_state(
     let mut checker = Checker::new(&shared, false);
     checker.free = free;
     checker.violations = violations;
-    checker.check_catalog_record("main_db", roots.main_db);
-    checker.check_record("free_db", roots.free_db, true);
+    checker.check_record("main_db", roots.main_db, TreeKind::Catalog);
+    checker.check_record("free_db", roots.free_db, TreeKind::Gc);
     // INV-10 / INV-22 + INV-24 (reachable XOR free, unconditional).
     checker.check_reachable_xor_free();
     checker.violations
@@ -919,11 +907,7 @@ struct RecordSlot {
 enum Job {
     /// Check record `idx`'s fields and its root page; defer the root's
     /// children.
-    Record {
-        idx: usize,
-        gc_tree: bool,
-        catalog: bool,
-    },
+    Record { idx: usize, kind: TreeKind },
     /// Walk a whole subtree.
     Subtree(SubtreeJob),
 }
@@ -964,13 +948,11 @@ fn walk_parallel(
     let mut jobs = vec![
         Job::Record {
             idx: 0,
-            gc_tree: false,
-            catalog: true,
+            kind: TreeKind::Catalog,
         },
         Job::Record {
             idx: 1,
-            gc_tree: true,
-            catalog: false,
+            kind: TreeKind::Gc,
         },
     ];
     let mut violations = Vec::new();
@@ -992,8 +974,7 @@ fn walk_parallel(
                     Deferred::Record { label, rec } => {
                         jobs.push(Job::Record {
                             idx: records.len(),
-                            gc_tree: false,
-                            catalog: false,
+                            kind: TreeKind::Named,
                         });
                         records.push(slot(&label, &rec));
                     }
@@ -1023,14 +1004,10 @@ fn run_round(
     let run = |job: &Job| {
         let mut c = Checker::new(shared, true);
         let stats = match job {
-            Job::Record {
-                idx,
-                gc_tree,
-                catalog,
-            } => {
+            Job::Record { idx, kind } => {
                 c.rec_idx = *idx;
                 let r = &records[*idx];
-                c.walk_record(&r.label, &r.rec, *gc_tree, *catalog)
+                c.walk_record(&r.label, &r.rec, *kind)
             }
             Job::Subtree(j) => {
                 c.rec_idx = j.rec_idx;
@@ -1039,11 +1016,9 @@ fn run_round(
                     j.pgno,
                     j.level,
                     false,
-                    j.low.as_deref(),
-                    j.high.as_deref(),
+                    (j.low.as_deref(), j.high.as_deref()),
                     &mut stats,
-                    j.gc_tree,
-                    j.catalog,
+                    j.kind,
                 );
                 Some(stats)
             }
