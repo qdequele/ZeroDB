@@ -563,7 +563,7 @@ crash-window warning, placed with §1's PREV_SNAPSHOT topic).**
 >    has no meta CRC, so its torn-slot behavior is unpinnable); **ratified 2026-07-16 — Phase 1 ships the documented warning only, no extra interlock; guard redesign deferred (Phase 3 candidate). Original note: human ratification
 >    pending** on whether to instead serve the lone valid older slot.
 > 4. **`NO_META_SYNC` reclaim-clobber window (REC-10 amendment, M1.11) —
->    RATIFIED 2026-07-17 (maintainer, standing directive): scoped claim adopted; steady-gated reclaim = Phase 3 candidate.** The ADR-0008 crash harness materialized a
+>    RATIFIED 2026-07-17 (maintainer): scoped claim adopted; steady-gated reclaim = Phase 3 candidate.** The ADR-0008 crash harness materialized a
 >    legal power-loss image (repro seed 15797139550980166469) where the
 >    fallback snapshot is structurally corrupted by a younger txn's legally
 >    reclaimed pages — REC-10's original blanket "never corruption" overclaims.

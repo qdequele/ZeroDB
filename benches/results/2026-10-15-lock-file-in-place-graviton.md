@@ -2,7 +2,7 @@
 
 - **Date:** 2026-10-15.
 - **Change:** when no other process has an environment open, the opening process rebuilds the lock file in place instead of truncating it to zero (ADR-0023 amendment 20, issue #94).
-- **Branch:** `qdequele/adr-0023-amendment-20`, commits `877cffe` (implementation) and `5e4e3bf` (review fixes, tests and docs only).
+- **Branch:** a feature branch, commits `877cffe` (implementation) and `5e4e3bf` (review fixes, tests and docs only).
 - **Before:** `main` at `f035790`, which has the lock file on by default.
 
 ## Host and method

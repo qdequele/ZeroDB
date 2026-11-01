@@ -1,9 +1,8 @@
 # ADR index
 
 ADRs are historical records. Older ones cite milestone numbers of the original
-roadmap (such as 1.4 or 3.1, grouped into Phases 0–3) and files since removed
-from the tree (`CLAUDE.md`, now [`AGENTS.md`](../AGENTS.md); `PLAN.md`;
-`PROGRESS.md`); git history keeps them. Planned work is tracked in GitHub
+roadmap (such as 1.4 or 3.1, grouped into Phases 0–3) and the original project
+plan and engineering log, which are no longer in the tree. Planned work is tracked in GitHub
 issues.
 
 | # | Title | Status | Area |

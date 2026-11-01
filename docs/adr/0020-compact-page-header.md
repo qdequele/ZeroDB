@@ -1,7 +1,7 @@
 # ADR-0020: Shrink the 32-byte common page header
 
 - Status: Spike approved (maintainer, 2026-10-01: test a spike first); the format change itself is not approved — it waits for the spike's numbers
-- Implementation note (2026-10-05): the spike ran 2026-10-01 on the local, unpushed branch `qdequele/zerodb-header24-spike` (ca34d35, no PR); its "Spike results" section exists only in that branch's copy of this ADR. The real-milli-dump measurement the abandon gate names has not been recorded.
+- Implementation note (2026-10-05): the spike ran 2026-10-01 on a local branch that was never published; its results were not recorded here. The real-milli-dump measurement the abandon gate names has not been recorded.
 - Milestone: Phase 3 (performance / on-disk format); **STOP zone — on-disk
   format change, human approval required before any implementation**
 - Date: 2026-10-01
@@ -176,7 +176,7 @@ falls — a single point, either on a cliff or not, knowable exactly per model.
   B, broken under C-drop-txnid; INV-4 broken under C-drop-pgno. ADR-0002 §D3/§D8
   and this ADR must be cross-linked.
 
-## Spike plan (CLAUDE.md rule 7 — smallest risky-assumption test first)
+## Spike plan (the project rules — smallest risky-assumption test first)
 
 The riskiest assumption is **"the file-size win survives on a real workload and
 the read/write hot paths don't regress from the re-pinned offsets."** The
@@ -213,7 +213,7 @@ rewrite) as a second, separately-reviewed change.
 3. If approved, treat Phase 3.9 data-page CRC as a future format-bump feature
    (it never shipped free) and plan to source DUPFIXED `leaf2_ksize` from the
    DBRecord, not the header.
-4. **Do not bundle** this with any other format change (CLAUDE.md rule 7's
+4. **Do not bundle** this with any other format change (the project rules's
    explicit warning). Shrinking the header is already a full format-version bump
    touching the meta layout and all corpora; a second orthogonal change riding
    along is how a stage becomes 4,000 lines.

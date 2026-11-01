@@ -19,7 +19,7 @@ policy and with `FileTrust::trust_contents()` (ADR-0014).
 | Runs | 3 repetitions × 5 benchmarks × 7 engines = 105 runs, all exit 0, no OOM kill; 04:52–18:28 UTC |
 | Tree | ZeroDB `2013c13`; rust-storage-bench `v1` branch `96b8846` plus a local commit `573a083` (adds the `zerodb` backend, bumps heed 0.20.5 → 0.22.1) |
 | Build | release profile as upstream (no LTO, 16 codegen units), `mimalloc_v3` allocator, rustc 1.99.1 |
-| Runner | `benches-server/public-suite.sh 3 300 5000000`; tables from `benches-server/suite_summary.py` |
+| Runner | an external runner (3 rounds, 300 s, 5M keys; not in this repo) |
 
 Numbers are medians over the three repetitions. Throughput counts the run
 phase only (first sampled read to the last sample). Latencies are the harness's

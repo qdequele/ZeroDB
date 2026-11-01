@@ -15,7 +15,7 @@ consumer benches, Meilisearch and hannoy. The reading guide is
 | Toolchain | rustc 1.98.1, `--release` (criterion bench profile) |
 | Tree | `a8faeb7` + the staged working tree (the ladder harness and B8a) |
 | Consumers | Meilisearch v1.53.1, hannoy v0.1.7-nested-rtxns |
-| Scripts | `_side_projects/benches-server/run.sh` (`ab ladder consumer hannoy`) |
+| Scripts | an external runner script (`ab ladder consumer hannoy` steps; not in this repo) |
 
 ## What this run says
 

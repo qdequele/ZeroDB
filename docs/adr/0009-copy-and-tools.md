@@ -10,11 +10,11 @@
 
 ## Context
 
-PLAN §1.12 requires a compacting/raw environment copy (`Env::copy_to_file`
+the original project plan requires a compacting/raw environment copy (`Env::copy_to_file`
 parity, SPEC 00 rows 17/59 — Meilisearch snapshots use it in both
 `CompactionOption` modes) and a `zerodb-tools` suite (`stat`, `dump`, `load`,
 `check`, `migrate-from-lmdb`). Two design questions needed recording as they
-touch a **public API shape** (CLAUDE.md rule 6): how the copy is realized, and
+touch a **public API shape** (the project rules): how the copy is realized, and
 how the tools guard against a live env with no cross-process protocol (D-001).
 
 ## Decision — `copy_to_file`
@@ -64,9 +64,9 @@ tool invocation (or any process that flocks the file), **not** the engine itself
 
 `std` has no stable file-locking API and `fs2`/`fs4` are not on the allowlist,
 so the guard is one `libc::flock` FFI call (SAFETY-commented) in
-`zerodb-tools::lock`. **This expands the CLAUDE.md unsafe policy** (which lists
+`zerodb-tools::lock`. **This expands the unsafe policy** (which lists
 only `zerodb-core::{page,readers}`, `zerodb-io`, and `zerodb-oracle`) to
-`zerodb-tools` — flagged for a human to record in CLAUDE.md. `zerodb-core`
+`zerodb-tools` — flagged for a human to record in AGENTS.md. `zerodb-core`
 remains `#![forbid(unsafe_code)]`.
 
 ## Decision — dump format
@@ -89,6 +89,6 @@ off-by-default `migrate-lmdb` feature (ADR-0001 M1.12 amendment).
   map_bytes}`; `Cursor::current_flags`.
 - `zerodb-tools` becomes a lib + bin; gains `libc` (flock) and, behind
   `migrate-lmdb`, `heed`.
-- Human review items: the ADR-0001 amendment ratification line; the CLAUDE.md
+- Human review items: the ADR-0001 amendment ratification line; the AGENTS.md
   unsafe-policy expansion for `zerodb-tools` flock; the copy's concurrent-writer
   argument.

@@ -49,7 +49,7 @@ this run also checks that the default path did not regress.
 | Build | criterion bench profile, `CARGO_PROFILE_BENCH_CODEGEN_UNITS=1` (how Meilisearch builds), as for ADR-0022 |
 | LMDB | heed 0.22.1 (the Meilisearch LMDB fork), measured in every run as the drift control |
 | ZeroDB before | `7002d6e` (main, the branch's merge base) |
-| ZeroDB after | `ca27d00` (`qdequele/adr-0023-multi-process`, tasks 1–7) |
+| ZeroDB after | `ca27d00` (a feature branch, tasks 1–7) |
 | Rungs | `env/txn/*`, `get/*`, `commit/batch/n1`, `commit/batch/n100`, `commit/sync/*` |
 | Rounds | 5 interleaved rounds; each round rotates the starting side |
 
@@ -336,7 +336,7 @@ After the fix (`2b53e88`), on the same server: fmt and clippy clean,
 ## Reproduce
 
 ```bash
-# on the bench server, tree synced at ca27d00, tune.sh on
+# on the bench server, tree synced at ca27d00, CPU tuned (turbo off, performance governor)
 export CARGO_PROFILE_BENCH_CODEGEN_UNITS=1
 F='^(env/txn/|get/|commit/batch/n1/|commit/batch/n100/|commit/sync/)'
 # "before" = main (7002d6e) with its own harness, in its own target dir;

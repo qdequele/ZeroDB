@@ -45,7 +45,7 @@ Meilisearch does not set `NO_READ_AHEAD` and keeps one read txn per request, so 
 
 ## Diagnosis: why ZeroDB reads more from disk at the same cap
 
-YCSB B re-run with the scope's cgroup `memory.stat` sampled every 5 s and `fincore` on the data file at the end (`ycsb-mem.sh` on the bench server):
+YCSB B re-run with the scope's cgroup `memory.stat` sampled every 5 s and `fincore` on the data file at the end (an external sampling script, not in this repo):
 
 | YCSB B, 2 GB cap | LMDB | ZeroDB | ZeroDB + `malloc_trim(0)` after the load |
 |---|---:|---:|---:|

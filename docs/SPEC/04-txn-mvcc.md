@@ -343,7 +343,7 @@ only a full fence / `SeqCst` does.
   keeping its last pin meanwhile (conservative for the GC gate, TXN-20). The
   tail's adopt-newer step does not apply: the snapshot is the one for `t`.
 - **TXN-18** — **The published-snapshot object.** *(Amended 2026-07-16,
-  ratified — maintainer, standing directive, ADR-0006 Option B: the original
+  ratified — maintainer, ADR-0006 Option B: the original
   text required an ArcSwap-style lock-free cell "in the reader-table module
   where `unsafe` is sanctioned"; the ratified implementation keeps
   `zerodb-core` `forbid(unsafe_code)` and scopes the no-blocking guarantee to

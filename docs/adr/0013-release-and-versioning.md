@@ -30,7 +30,7 @@ Forces:
   a fix to the adapter could not be re-released under the `0.22.1` the patch
   needs. crates.io is therefore useful for the **engine** crates (docs.rs,
   `cargo add zerodb`, `cargo install zerodb-tools`), not for the adapter.
-- **The frozen contract is heed's.** PLAN.md ground rule 2: no heed-mirrored
+- **The frozen contract is heed's.** project rule 2: no heed-mirrored
   signature changes in Phases 0–2. ZeroDB-only extensions (`Env::sync(force)`,
   `reader_list`, `live_readers`, `EnvOpenOptions::page_size`,
   `copy_to_file_with_progress`, `Comparator`) are the only API that can move.
@@ -42,7 +42,7 @@ Forces:
   `crates/zerodb-core/src/page/mod.rs`) and a mismatch is refused at open
   (SPEC 02 §3, SPEC 06). D-002 sanctions no LMDB file compatibility; migration
   is logical (`zerodb-tools dump`/`load`, `migrate-from-lmdb`).
-- **Phase 1's exit criteria are not all met** (PLAN §1.14: 24 h fuzz soak,
+- **Phase 1's exit criteria are not all met** the original project plan: 24 h fuzz soak,
   Graviton 4K/64K bench, CI). The first release must say so rather than imply
   production readiness.
 
@@ -98,7 +98,7 @@ Versioning rules while 0.x:
    change to the native `zerodb` API (cargo treats `0.Y.*` as one compatible
    line, so this is what crates.io consumers rely on), any `FORMAT_VERSION`
    bump, any MSRV bump, any new sanctioned divergence. A `FORMAT_VERSION` bump
-   is itself an ADR (CLAUDE.md rule 6) and the CHANGELOG entry's first line
+   is itself an ADR (the project rules) and the CHANGELOG entry's first line
    states it with the dump/load migration path.
 3. **Patch bump (0.Y.Z)**: bug fixes, performance, docs, tooling, with the
    on-disk format and every API unchanged.
@@ -106,7 +106,7 @@ Versioning rules while 0.x:
    moves to 0.23, that is a new adapter line, a new ADR, and at least a minor
    bump.
 5. **What a release promises**: files written by vX.Y.Z open unchanged in every
-   later release with the same `FORMAT_VERSION`; the full CLAUDE.md gate and the
+   later release with the same `FORMAT_VERSION`; the full check suite and the
    consumer gate (docs/CONSUMER-GATE.md) passed on the release commit, with the
    Meilisearch and hannoy refs named in the CHANGELOG; known gaps are listed in
    the release notes, never implied away.

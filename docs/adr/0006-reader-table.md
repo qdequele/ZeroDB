@@ -1,10 +1,8 @@
 # ADR-0006: MVCC reader table — implementation strategy (slot table, publish cell, oldest-reader, loom/stress plan)
 
-- Status: Approved — 2026-07-16, via **delegated review under the maintainer's
-  standing directive of 2026-07-16** (not a direct per-document sign-off; the
-  standing directive delegates ratification of M1.8 decisions to that review, and the spec-review verdict of the same day — "committable
-  conditionally, protocol passes site-by-site on ARM" — is incorporated with
-  its conditions applied below)
+- Status: Approved — maintainer, 2026-07-16. The spec review of the same day
+  ("committable conditionally, protocol passes site-by-site on ARM") is
+  incorporated with its conditions applied below.
 - Milestone: 1.8 (MVCC reader table and concurrency)
 - Date: 2026-07-16
 
@@ -42,7 +40,7 @@ not redesign any of that.** It decides the implementation strategy: concrete
 types, the one genuinely open structural question (what replaces the M1.4
 `Mutex<Arc<Snapshot>>` publish cell, given `zerodb-core` is
 `#![forbid(unsafe_code)]` and no ArcSwap-like crate is allowlisted), the
-loom/stress test plan PLAN §1.8's acceptance requires, and the migration off
+loom/stress test plan the original project plan's acceptance requires, and the migration off
 the M1.5 interim registry.
 
 Current state (what gets replaced):
@@ -85,11 +83,11 @@ Prior art (clean-room, algorithm-level):
   behind the same single-word pin; see D1's amendment.)*
 
 Constraints from standing law: `zerodb-core` is `#![forbid(unsafe_code)]`
-(M1.1 posture; zero unsafe blocks to date — CLAUDE.md *permits* unsafe in the
+(M1.1 posture; zero unsafe blocks to date — AGENTS.md *permits* unsafe in the
 reader table but M1.1 chose stricter, and every milestone since has preserved
 it). Dependency allowlist: memmap2, libc, thiserror, **crossbeam-utils**,
 rand, proptest, arbitrary, criterion — `loom` and `arc-swap` are **not** on
-it; PLAN §1.8 and PLAN §Testing nonetheless *require* loom for the reader
+it; the original project plan and the original project plan nonetheless *require* loom for the reader
 table, so this ADR must sanction it (precedent: ADR-0001's `libfuzzer-sys`
 treatment — test-infrastructure-only scope, human-approved). All atomics need
 explicit `Ordering` + per-site justification, ARM weak-memory assumed.
@@ -264,7 +262,7 @@ TXN-19 object-before-counter order is what makes this a one-way check.
   pointer ops) rather than wait-freedom. Flagged for ratification with this
   ADR.
 - Quantification obligation: no performance claim without a criterion diff
-  (CLAUDE.md). The milestone adds a `read_txn_open` bench (zerodb vs heed/
+  (AGENTS.md). The milestone adds a `read_txn_open` bench (zerodb vs heed/
   the fork through the oracle's dependency) so the "at or below the bar"
   argument is measured, not asserted. Non-blocking for acceptance; if the
   bench shows the cell dominating open cost, the escape hatch is Option D
@@ -371,7 +369,7 @@ living in the reader-table module where `unsafe` is sanctioned)"
 parenthetical — no unsafe is used; the module note becomes false. TXN-9's
 own text ("readers never take the write mutex and never block on it") is
 already accurate — the cell mutex is not the write mutex — but gets a
-cross-reference to the amended TXN-18. Per CLAUDE.md rule 3 the amendment
+cross-reference to the amended TXN-18. Per the project rules the amendment
 lands in the same change as the implementation, after human approval here.
 
 ### Dependency sanction: `loom` (test infrastructure only)
@@ -467,7 +465,7 @@ zerodb-core` (not `cfg(loom)`), keeping the miri gate green end-to-end.
   it; Option D is the pre-designed fallback with no protocol change);
   per-txn oldest caching holds reclamation back within very long write txns
   (bounded by the txn, same as LMDB's per-txn oldest; the known-weakness
-  note in PLAN §1.5 already covers huge txns → Phase 3.1).
+  note in the original project plan already covers huge txns → Phase 3.1).
 - SPEC updates in the implementation change (after approval): TXN-18
   amendment (text above); TXN-21 interim-registry paragraph retired; TXN-22
   annotated with the per-txn cache choice; SPEC 04 §11 loom row pointed at

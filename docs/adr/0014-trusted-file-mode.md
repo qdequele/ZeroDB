@@ -185,7 +185,7 @@ opt in. It can be done before or after A.
   PERF-GAP section D is amended to "removing validation is not on the table
   **by default**; ADR-0014 adds an opt-in"; DIVERGENCES gains an entry
   describing the option as a ZeroDB extension (LMDB has no validating mode to
-  diverge from; default behaviour is unchanged); CLAUDE.md's unsafe policy
+  diverge from; default behaviour is unchanged); the unsafe policy
   needs no new module but the SAFETY-contract wording changes.
 - **Bench plan (both codegen settings, bench server, then Graviton):**
   three columns, LMDB | ZeroDB validating | ZeroDB trusted, on the read ladder

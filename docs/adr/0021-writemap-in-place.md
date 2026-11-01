@@ -108,7 +108,7 @@ after commit. Keeps all three contracts trivially and no new `unsafe`.
 Propose **Option A, opt-in behind `WRITE_MAP`**, default unchanged — *pending a
 spike + human approval* (rule 6: write-path + concurrency + unsafe).
 
-### Measured motivation (Graviton4 NVMe, 2026-10-01 — `benches-server/research/validation-results.md`)
+### Measured motivation (Graviton4 NVMe, 2026-10-01)
 
 A fair WRITE_MAP comparison (rust-storage-bench YCSB, 10M×128 B, 2 GB cap,
 no-sync, WRITE_MAP set on **both** engines) settles whether this lever is worth
@@ -175,7 +175,7 @@ the headline referee (owed).
   (`clippy::mut_from_ref` suppressed). Safe code could call twice and alias →
   UB mintable from safe code. Fix: make them `unsafe fn` — which moves the
   `unsafe` call into `zerodb-core::dirty`, a home the unsafe policy does NOT
-  currently sanction, so **CLAUDE.md must be amended (human decision)** — OR
+  currently sanction, so **AGENTS.md must be amended (human decision)** — OR
   redesign the broker to hand out an exclusivity token tied to `&mut`.
 - **B2 (SAFETY-argument gap, BLOCKER):** the writer's own later read of a
   *spilled* in-place page goes through the stale whole-map `&[u8]` taken at txn

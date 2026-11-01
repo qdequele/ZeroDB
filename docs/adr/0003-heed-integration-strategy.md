@@ -19,7 +19,7 @@
 > flows through arroy/hannoy/cellulite — confirmed by the milli check), OQ5
 > (compile-only WithTls shim) are realized as described.
 
-> **ADR-only milestone.** Per CLAUDE.md rule 6, milestone 0.5 is ADR-only:
+> **ADR-only milestone.** Per the project rules, milestone 0.5 is ADR-only:
 > **nothing is implemented until a human approves this document.** No code,
 > no crate scaffolding, no `[patch]` entries. This file + its `docs/DECISIONS.md`
 > index row are the entire deliverable for M0.5.
@@ -33,7 +33,7 @@ This ADR chooses *how* ZeroDB is wired behind that surface; the choice constrain
 lifetimes, error types, and `Env` semantics for all of Phase 1 and is
 implemented by milestone 1.13.
 
-### What the decision must enable (PLAN §1.13 / §1.14)
+### What the decision must enable the original project plan / §1.14)
 
 - **1.13** builds the adapter over the *full SPEC 00 surface*, maps the error
   taxonomy 1:1, replicates the env registry + `EnvClosingEvent`, and patches
@@ -57,7 +57,7 @@ Walked one-by-one in the option analysis below:
   `EnvFlags`, `PutFlags`, `DatabaseFlags`, `CompactionOption`, `EnvClosingEvent`,
   `MdbError`, `heed::Error`, `ReservedSpace`, `LazyDecode`, `DecodeIgnore`,
   `BytesEncode`/`BytesDecode`/`BoxedError`. heed is **not** generic over a
-  backend today, and PLAN rule 2 forbids signature changes to existing heed APIs
+  backend today, and project rule 2 forbids signature changes to existing heed APIs
   in Phases 0–2.
 - **C2 — `Env: Clone`, shared ownership** (`Arc`-style; SPEC 04 TXN-50).
 - **C3 — same-process registry + `EnvAlreadyOpened`** (SPEC 04 TXN-51).
@@ -128,7 +128,7 @@ ZeroDB both implement; ZeroDB ships as an external crate implementing it.
 Constraint walk: **C1 ✘ (at risk)** — a genuine backend trait pushes a type
 parameter onto the public types (`Env<B, …>`). Unless it is a *defaulted*
 generic that still resolves `heed::Env<WithoutTls>`, this breaks the
-concrete-type contract and PLAN rule 2 (no signature changes in Phases 0–2). A
+concrete-type contract and project rule 2 (no signature changes in Phases 0–2). A
 defaulted generic is possible but perturbs inference and every turbofish across
 five consumer repos — a real risk against a frozen contract. **C2–C8** are
 achievable *if* C1 is finessed, but they inherit the same "only if the generic
@@ -147,7 +147,7 @@ A new crate whose public surface is a 1:1 clone of heed 0.22.1's type
 names/signatures/paths, ZeroDB underneath. **heed itself is untouched (no
 fork).** Consumers switch via `[patch.crates-io] heed = { path = ".../heed-zerodb" }`
 where the crate's `[package] name = "heed"` — a drop-in named `heed`, activated
-at the workspace level (this *is* PLAN 1.13's "behind a cargo feature").
+at the workspace level (this *is* milestone 1.13 "behind a cargo feature").
 
 Key structural lever: **re-export `heed-traits` and `heed-types` verbatim**
 (`heed_zerodb::types = heed_types`, `heed_zerodb::{BytesEncode, BytesDecode,
@@ -174,7 +174,7 @@ Constraint walk:
   per SPEC 04 §6.
 
 - Pros: **full source control** — no fork of heed, no upstream dependency, no
-  rebase treadmill. The surface is **frozen** by PLAN rule 2 and SPEC 00, so
+  rebase treadmill. The surface is **frozen** by project rule 2 and SPEC 00, so
   drift is bounded — new upstream heed methods are added only if a pinned
   consumer uses one (none, by definition of the freeze). **Best 1.14
   differential story**: heed (LMDB) and heed-zerodb (ZeroDB) are two *sibling
@@ -220,7 +220,7 @@ on heed maintainer timelines** (Option B), and it produces the best 1.14
 differential story: two sibling crates with an identical surface let the same
 Meilisearch/hannoy build run on either backend via `[patch.crates-io]`, and let
 the oracle link the real `heed` (LMDB) and `heed-zerodb` (ZeroDB) in one binary
-for in-process A/B diffing. The surface is frozen by PLAN rule 2 and SPEC 00, so
+for in-process A/B diffing. The surface is frozen by project rule 2 and SPEC 00, so
 the perennial worry — behavioral drift between backends — is contained by the
 oracle and the 1.14 gate, not by the wiring, and Option C makes that A/B
 verification *cheaper* than either alternative.

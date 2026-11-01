@@ -168,7 +168,7 @@ Points that matter here:
   iterators borrow `&RwTxn`. A child that borrows `&mut parent` therefore
   makes every parent cursor and every parent nested reader unusable for its
   life: LMDB's cursor shadowing has no equivalent to build.
-- **Database handles.** With ADR-0024 (branch `qdequele/stale-dbi-handles`,
+- **Database handles.** With ADR-0024 (
   approved), handles are `(slot, generation)` and each txn carries a
   `TxnHandles` record of what it opened (`crates/zerodb-core/src/handles.rs`:
   `HandleTable::begin`, `open`, `end(committed)`, `check`). `check` already

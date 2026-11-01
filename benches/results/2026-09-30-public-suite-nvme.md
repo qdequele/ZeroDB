@@ -96,5 +96,5 @@ exit; RSS is the run's peak.
 - **Trusted-file mode** (ADR-0014) mainly helps read tails: `blob4k` read p99
   82.5 µs → 1.67 µs (it skips per-page validation on the read path).
 
-Reproduce with `benches-server/public-suite.sh` and summarize with
-`benches-server/suite_summary.py`.
+Produced with an external runner script and summarizer
+(not in this repo).

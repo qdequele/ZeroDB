@@ -1,7 +1,7 @@
 # ADR-0022: Meta free-list annex — the per-commit freed PIL rides in the meta page
 
 - Status: **Accepted (2026-10-05, maintainer)** — format change (`FORMAT_VERSION`
-  1→2) directly ratified per CLAUDE.md rule 6, together with the crash-harness
+  1→2) directly ratified per the project rules, together with the crash-harness
   seed re-pin (198). Implemented first as a spike on approval relayed
   2026-10-02/03; re-gated on main after ADR-0021 (in-place WRITE_MAP) merged,
   with WRITE_MAP in-place twins of the annex battery.
@@ -22,7 +22,7 @@
   incremental additions 0.98× (commit span 0.94×), search 0.97×. Scope of the
   claim: frequent or durable commits; not a Meilisearch bulk-indexing speed-up.
 - Milestone: perf track "non-copy per-commit CPU" lever #1 (cheaper free-list
-  save), PERF-GAP-VS-LMDB §B12; forward-looking toward PLAN 3.1.
+  save), PERF-GAP-VS-LMDB §B12; forward-looking toward the later free-space redesign.
 - Date: 2026-10-03
 - Numbering note: ADR-0021 (WRITE_MAP in-place) lives on its own open branch;
   this ADR takes 0022 to avoid colliding with it. (ADR-0021 has since merged,
@@ -71,7 +71,7 @@ is a deliberate, documented **non-LMDB lever** (observable heed-level
 semantics unchanged; allocation-order determinism preserved), in the same
 spirit as the ratified rightmost-leaf finger (ADR-0015 note in rwtxn.rs):
 LMDB's own technique for this path cannot go below LMDB's own cost, and the
-B12 target is to *beat* that bucket, with PLAN 3.1 already pointing at a
+B12 target is to *beat* that bucket, with the later free-space redesign already pointing at a
 freelist redesign.
 
 ## Options
@@ -159,7 +159,7 @@ Not applicable: the cost is CPU in tree ops, not flush count (B12 is NO_SYNC).
 
 ## Decision
 
-Option B, as a **spike** (CLAUDE.md rule 7: format change ⇒ smallest change
+Option B, as a **spike** (the project rules: format change ⇒ smallest change
 that tests the riskiest assumption — here, that the annex removes the
 measured CPU while recovery, INV-22 and bounded growth stay provable).
 Always-on with the FORMAT_VERSION bump (an opt-in annex would double the
@@ -208,9 +208,9 @@ API-visible behavior, which is unchanged).
 
 ## Open questions for human review
 
-1. ~~Ratify the format change itself (CLAUDE.md rule 6).~~ **Resolved
+1. ~~Ratify the format change itself (the project rules).~~ **Resolved
    2026-10-05:** ratified directly by the maintainer.
 2. ~~Cap policy: full `(psize − 176)/8` (chosen) vs a smaller policy cap.~~
    **Resolved 2026-10-05:** the full cap is accepted with the ADR.
-3. Whether PLAN 3.1 should absorb this as its first stage (the annex is the
+3. Whether the later free-space redesign should absorb this as its first stage (the annex is the
    hot tier of any future freelist redesign) or whether 3.1 supersedes it.

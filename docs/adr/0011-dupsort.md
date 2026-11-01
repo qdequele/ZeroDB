@@ -1,7 +1,7 @@
 # ADR-0011: DUPSORT / DUPFIXED — encoding, second ordering, cursor model, staging
 
-- Status: Approved — maintainer, 2026-07-20 (standing directive, delegated review). All five open questions resolved below.
-- Implementation note (2026-10-05): milestone 2.8 parked 2026-07-20; stage A was never merged or pushed (local work only) (PLAN §2.8, PROGRESS.md). DUPSORT/DUPFIXED remain unsupported (D-004).
+- Status: Approved — maintainer, 2026-07-20. All five open questions resolved below.
+- Implementation note (2026-10-05): milestone 2.8 parked 2026-07-20; stage A was never merged or pushed (local work only) the original project plan. DUPSORT/DUPFIXED remain unsupported (D-004).
 - Milestone: 2.8 (descoped from 1.7 on 2026-07-15, D-004)
 - Date: 2026-07-20
 
@@ -22,11 +22,11 @@ Milestone 2.8 cashes in the format hooks deliberately reserved in Phase 1:
   cursor ops) — all WON'T-with-2.8-revival rows.
 
 No pinned consumer uses any of this (D-004, verified across milli, meilisearch,
-arroy, hannoy, cellulite). PLAN.md calls DUPSORT "the highest-defect-density
+arroy, hannoy, cellulite). the original project plan calls DUPSORT "the highest-defect-density
 area of LMDB" and budgets a dedicated ≥ 2 h differential fuzz target. The
 consequence for this ADR: there is **no consumer pressure to deviate**, so
 every observable behavior is LMDB-fork parity, pinned by oracle observation
-(CLAUDE.md rule 1 — never guess LMDB semantics), and every internal choice is
+(the project rules — never guess LMDB semantics), and every internal choice is
 free so long as the observables match.
 
 Prior art consulted (clean-room: behavior and structure, no transliteration):
@@ -344,7 +344,7 @@ defensive rejection stays for non-dup DBs.
    same way, and noted in DIVERGENCES — the APPEND-family × same-txn-clear
    region that produced FORK-1 overlaps APPENDDUP and gets the guard
    proactively extended before the long fuzz runs.
-4. **Gates.** The PLAN-mandated dedicated dup fuzz target runs **≥ 2 h clean**
+4. **Gates.** The planned dedicated dup fuzz target runs **≥ 2 h clean**
    as a 2.8d exit gate (plus the 10-min `just fuzz-quick` slice from 2.8a on).
    `fuzz_page_decode` learns arbitrary `P_SUBP`/`P_LEAF2` bytes must never
    panic the decoder. The sub-page codec (pure slice logic) is under
@@ -424,7 +424,7 @@ guess; a weakened INV-21 without its replacement invariant active in `check`.
   no public heed-mirrored signature changes — heed's existing dup surface
   activates, MULTIPLE stays native-only.
 - Cost honestly stated: this is the largest remaining parity surface, four
-  gated stages, each ending with the full CLAUDE.md command gate.
+  gated stages, each ending with the full check suite.
 
 ## Open questions for human review
 
@@ -449,13 +449,13 @@ guess; a weakened INV-21 without its replacement invariant active in `check`.
    GET_BOTH_RANGE return quirks, DUPFIXED size-mismatch, MULTIPLE partial
    success, dup-op-on-non-dup-DB errors, main-DB-DUPSORT interaction with
    §S8) will be executed and written into SPEC before any engine code —
-   confirm this ordering is the required reading of CLAUDE.md rule 1 for
+   confirm this ordering is the required reading of the project rules for
    this milestone.
 
 
 ---
 
-## Open-question resolutions (2026-07-20, under the maintainer's standing directive)
+## Open-question resolutions (2026-07-20)
 
 **Q1 — comparator fingerprint split: APPROVED.** Split `DBRecord` offset 44 into
 `leaf2_ksize: u16` + `cmp_fingerprint: u16`; refuse-on-mismatch at open. This
@@ -480,13 +480,13 @@ partial write) and on 2.8a writing no on-disk state that 2.8b must migrate,
 which the staging fence already requires.
 
 **Q5 — the pre-implementation oracle pin list as the required first act:
-CONFIRMED, emphatically.** In the area PLAN.md calls LMDB's
+CONFIRMED, emphatically.** In the area the original project plan calls LMDB's
 highest-defect-density, behavior is observed before it is implemented. No engine
 code lands until the pin list is green against the fork.
 
 ---
 
-## Pin-list adjudication (2026-07-20, under the maintainer's standing directive)
+## Pin-list adjudication (2026-07-20)
 
 The Q5 pin list fired its stop clause. Rulings:
 

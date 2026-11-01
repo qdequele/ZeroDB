@@ -1,7 +1,7 @@
 # Meilisearch v1.53.1 and hannoy on ZeroDB, Graviton4 c8g.xlarge
 
 - **Date:** 2026-10-15.
-- **ZeroDB:** `main` at `bee8865` (lock file on by default, lock file rebuilt in place) plus the consumer-script fixes on `qdequele/consumer-gate-patch-section` (`256cbc0`). The engine and the heed shim are those of `main`.
+- **ZeroDB:** `main` at `bee8865` (lock file on by default, lock file rebuilt in place) plus the consumer-script fixes on a feature branch (`256cbc0`). The engine and the heed shim are those of `main`.
 - **Consumers:** Meilisearch v1.53.1, built with stable Rust 1.99 because its toolchain pin (1.91.1) is below ZeroDB's MSRV. hannoy v0.2.0 for the test suite, v0.1.7-nested-rtxns for the benchmarks, because v0.2.0's bench target does not compile (it resolves `rand` 0.10, where `fill` moved to another trait).
 - **Why not Meilisearch v1.55.0:** it builds against Meilisearch's heed fork, whose API ZeroDB does not provide yet (issue #102).
 
@@ -78,7 +78,7 @@ ZeroDB is ahead on every hannoy bench, as on the x86 server (build 0.84–0.89×
 
 ## Script fixes this run needed
 
-All in `scripts/` on `qdequele/consumer-gate-patch-section`:
+All in `scripts/` on a feature branch:
 
 - The heed patch goes inside a consumer's existing `[patch.crates-io]` section, and every git source of heed is patched too (both needed for Meilisearch v1.55.0, which still fails on the API gap above).
 - A consumer without a `[workspace]` table (hannoy v0.2.0) gets an empty one for both builds, so cargo does not take it for a member of the ZeroDB workspace.

@@ -1,6 +1,6 @@
 # ADR-0023 stage 3 on Graviton4: Linux aarch64 gate, consumer suites and full ladder
 
-Date: 2026-10-13 (runs 19:18–23:46 UTC). Branch `qdequele/adr-0023-stage3` at
+Date: 2026-10-13 (runs 19:18–23:46 UTC). Branch a feature branch at
 `1deebf3`, with the lock file on by default and `NO_LOCK` as the opt-out.
 Before = `main` `7002d6e` (v0.2.0).
 

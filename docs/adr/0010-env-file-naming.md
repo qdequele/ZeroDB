@@ -1,9 +1,8 @@
 # ADR-0010: Env directory presentation — the data-file name (`zerodb.dat` vs heed's `data.mdb` contract)
 
-- Status: **Approved** — Option A adopted (approved by the maintainer, 2026-07-20,
-  standing directive). **Implemented 2026-07-20**; see
-  §Consequences for the acceptance criteria and the engineering log (PROGRESS.md
-  at the time) for the landing note. D-012 is flipped to APPROVED/resolved.
+- Status: **Approved** — Option A adopted (approved by the maintainer, 2026-07-20). **Implemented 2026-07-20**; see
+  §Consequences for the acceptance criteria and the engineering log
+  for the landing note. D-012 is flipped to APPROVED/resolved.
 - Milestone: filed against the **M1.14 gate remainder** (this was a gate
   blocker: compaction and snapshot-restore were latent-broken behind a green
   suite).
@@ -219,7 +218,7 @@ name it writes.
   are untouched: between any two steps of any write sequence, the invariant
   set is identical to today's because the name never changes after open.
 
-### SPEC updates (same change as the implementation, CLAUDE.md rule 3)
+### SPEC updates (same change as the implementation, the project rules)
 
 - SPEC 02 §8: the layout bullet ("named `zerodb.dat`") becomes "named by the
   opener; native default `zerodb.dat`, `data.mdb` when opened through
