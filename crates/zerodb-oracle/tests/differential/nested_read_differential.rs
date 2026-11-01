@@ -9,7 +9,7 @@
 //! `Skip::WriteBlockedByNested` by the shared driver **before either engine
 //! runs** — the fork technically allows a write under a live child, zerodb
 //! forbids it, and the symmetric skip keeps that divergence unobservable
-//! (writer quiescence, docs/DIVERGENCES.md). Multi-child + real-thread fan-out
+//! (writer quiescence, docs/LMDB-COMPATIBILITY.md). Multi-child + real-thread fan-out
 //! parity is covered by `crates/zerodb/tests/nested_fanout.rs`.
 
 use zerodb_oracle::{assert_matches_lmdb, DbName, Op, PutFlag, ZerodbEngine};

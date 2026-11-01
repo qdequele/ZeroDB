@@ -8,7 +8,7 @@
 //! whether a process can join an `MDB_PREVSNAPSHOT` env before its first
 //! commit, with the txn ids and snapshots around that env's first two
 //! commits and what a waiting process gets when the opener ends first.
-//! AGENTS.md rule 1: observed, not guessed. Drives the vendored fork through
+//! CONTRIBUTING.md rule 1: observed, not guessed. Drives the vendored fork through
 //! `lmdb-master-sys`; the test binary re-runs itself as the second process.
 //!
 //! The `OBS_*` constants pin what the fork does; a diff means the fork changed

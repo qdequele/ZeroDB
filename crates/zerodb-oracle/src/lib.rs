@@ -114,7 +114,7 @@ pub const DIFF_MAP_SIZE: usize = 64 << 20;
 
 /// Round a map size up to a 64 KiB multiple — a multiple of every target OS
 /// page size (4 / 16 / 64 KiB), so heed never rejects it for not being an
-/// OS-page multiple (the `map_size` entry in docs/DIVERGENCES.md) and both
+/// OS-page multiple (the `map_size` entry in docs/LMDB-COMPATIBILITY.md) and both
 /// engines agree on the effective size after an [`Op::Reopen`].
 #[must_use]
 pub fn round_map_size(size: usize) -> usize {

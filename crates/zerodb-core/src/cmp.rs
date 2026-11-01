@@ -1,4 +1,4 @@
-//! Custom key comparators (SPEC 03 §2.0; see docs/DIVERGENCES.md, DatabaseFlags).
+//! Custom key comparators (SPEC 03 §2.0; see docs/LMDB-COMPATIBILITY.md, DatabaseFlags).
 //!
 //! LMDB exposes `mdb_set_compare(txn, dbi, MDB_cmp_func*)` — a raw C function
 //! pointer installed per-dbi, per-open. heed hides it completely: its
@@ -44,7 +44,7 @@
 //!   Widening the record or repurposing those fields is an on-disk **format**
 //!   decision that requires an ADR — deliberately not taken here. The hazard
 //!   is therefore **documented, not mitigated**, and is filed in
-//!   docs/DIVERGENCES.md (comparator persistence).
+//!   docs/LMDB-COMPATIBILITY.md (comparator persistence).
 //!
 //! ## Requirements on an implementation
 //!
@@ -172,7 +172,7 @@ pub enum KeyCmp<'a> {
 /// as big-endian integers is *identical* to memcmp order (the most significant
 /// differing byte decides both), so this returns exactly `a.cmp(b)` — but as one
 /// integer load and compare each rather than a `memcmp` call (the aarch64 hot
-/// path showed `bl _memcmp` on every probe; see docs/PERF-GAP-VS-LMDB.md,
+/// path showed `bl _memcmp` on every probe; see docs/PERFORMANCE.md,
 /// default key compare). Every other length pair, including 8-vs-4, falls
 /// through to the slice comparison, which never reads past either slice's
 /// length.

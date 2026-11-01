@@ -189,7 +189,7 @@ macro_rules! heed_engine {
                     // Monotonic: never shrink below the current size, so a reopen can never
                     // fail by cutting below the live data (models "reopen larger on MapFull").
                     // Rounded to a 64 KiB multiple so heed accepts it and both engines agree
-                    // on the effective size (the `map_size` entry in docs/DIVERGENCES.md).
+                    // on the effective size (the `map_size` entry in docs/LMDB-COMPATIBILITY.md).
                     crate::round_map_size(want.max(self.map_size))
                 }
             }

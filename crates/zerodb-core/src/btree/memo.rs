@@ -71,7 +71,7 @@ pub(crate) enum PageKind {
 }
 
 /// Txn-scoped memo of pages whose **cells** have already passed full
-/// validation this txn (docs/PERF-GAP-VS-LMDB.md, eager page validation).
+/// validation this txn (docs/PERFORMANCE.md, eager page validation).
 ///
 /// `LeafRef::new`/`BranchRef::new` validate every cell — O(`num_keys`) per
 /// view construction — which multiplied every descent (get, seek, put

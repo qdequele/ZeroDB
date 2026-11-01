@@ -2,7 +2,7 @@
 //! behaviors ZeroDB is lenient about, so the consumer test suites see exact
 //! parity — `map_size` must be an OS-page multiple, `max_readers(0)` is
 //! refused, and DB names are C strings. Each divergence note in
-//! docs/DIVERGENCES.md authorizes the adapter to re-impose the check at the
+//! docs/LMDB-COMPATIBILITY.md authorizes the adapter to re-impose the check at the
 //! heed boundary.
 
 // heed 0.22.1's API; the `unique-txns` feature replaces it with the heed

@@ -171,7 +171,7 @@ impl Env {
     /// returns wrong answers and, once written to, is permanently corrupt.
     /// LMDB has the identical hazard; ZeroDB cannot do better without an
     /// on-disk format change (`DBRecord` is full — see [`crate::cmp`] and
-    /// docs/DIVERGENCES.md). Treat the comparator as part of your schema.
+    /// docs/LMDB-COMPATIBILITY.md). Treat the comparator as part of your schema.
     ///
     /// # Errors
     ///
@@ -198,7 +198,7 @@ impl Env {
     ///
     /// `Io(InvalidInput)` is the error kind ZeroDB already uses for open-time
     /// argument rejection (cf. the `map_size` and `max_readers(0)` entries in
-    /// docs/DIVERGENCES.md, and the `page_size` selector);
+    /// docs/LMDB-COMPATIBILITY.md, and the `page_size` selector);
     /// LMDB has no error to mirror here because `mdb_set_compare` simply returns
     /// `EINVAL` for a bad dbi and otherwise cannot fail.
     pub(crate) fn register_comparator_on(

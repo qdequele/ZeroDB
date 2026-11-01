@@ -21,7 +21,7 @@
 //! is met by construction; the store never drops a frame under a `&self`
 //! borrow). This module does no I/O; its heap paths are pure safe Rust, and
 //! its one `unsafe` is the sanctioned call of the in-place WRITE_MAP map-slice
-//! broker (`map_mut`; AGENTS.md unsafe policy, ADR-0021). `miri` exercises
+//! broker (`map_mut`; CONTRIBUTING.md unsafe policy, ADR-0021). `miri` exercises
 //! both realizations (TXN-49; `tests/writemap_in_place_miri.rs` over the
 //! heap-backed test map).
 //!
@@ -328,7 +328,7 @@ impl std::fmt::Debug for DirtyStore<'_> {
 /// the same broker with the same geometry.
 ///
 /// This is the **sole sanctioned call site** of the `unsafe` map-slice broker
-/// (AGENTS.md unsafe policy; ADR-0021): the broker is
+/// (CONTRIBUTING.md unsafe policy; ADR-0021): the broker is
 /// an `unsafe fn` because it mints `&mut [u8]` from `&self`, and this module
 /// discharges its contract. `map_mut` is itself an `unsafe fn` for the same
 /// reason — no safe function anywhere may mint `&mut` from a shared borrow.
@@ -354,7 +354,7 @@ unsafe fn map_mut(broker: Option<&dyn Backing>, psize: u32, pgno: u64, len: usiz
     let b = broker.expect("Slot::Map exists only in an in-map store");
     let pages = (len / psize as usize) as u64;
     // SAFETY (the brokered contract, `Backing::map_dirty_page` /
-    // `MmapWritable::slice_mut`; AGENTS.md invariants for this sanction):
+    // `MmapWritable::slice_mut`; CONTRIBUTING.md invariants for this sanction):
     //  * Single writer (TXN-6): a `DirtyStore` exists only inside the one
     //    live `RwTxn`, which holds the env's writer lock for its whole life;
     //    no other thread can reach a broker of this env while it does.

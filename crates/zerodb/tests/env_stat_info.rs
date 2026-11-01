@@ -240,7 +240,7 @@ fn env_info_max_readers_is_the_configured_table_size() {
 fn env_info_live_readers_tracks_live_read_txns() {
     // `live_readers` is the ZeroDB extension: the count that actually follows
     // the reader population. (`num_readers` is the LMDB-parity high-water mark
-    // — see `env_info_num_readers_is_a_high_water_mark` and docs/DIVERGENCES.md.)
+    // — see `env_info_num_readers_is_a_high_water_mark` and docs/LMDB-COMPATIBILITY.md.)
     let dir = TempDir::new();
     let env = open_with(dir.path(), 4096, 8, 16);
     assert_eq!(env.info().live_readers, 0, "no readers on a fresh env");

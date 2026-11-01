@@ -3,7 +3,7 @@
 //! SPEC 03 §7 states the contract ("a following `next` yields the entry that
 //! followed the deleted one"); §5 rule 4 mandates the mechanism (the write
 //! cursor re-seeks by key after each of its own mutations).
-//! docs/PERF-GAP-VS-LMDB.md (the `del_current` re-descent) proposes replacing
+//! docs/PERFORMANCE.md (the `del_current` re-descent) proposes replacing
 //! that re-seek with a retained path (LMDB's `C_DEL`) — a change of mechanism,
 //! not of contract.
 //!

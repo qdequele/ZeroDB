@@ -183,7 +183,7 @@ proptest! {
     }
 }
 
-/// Reserved-put pin (adapter `ReservedSpace`, docs/PERF-GAP-VS-LMDB.md): the
+/// Reserved-put pin (adapter `ReservedSpace`, docs/PERFORMANCE.md): the
 /// fork's `put_reserved` semantics when the caller's closure FAILS. LMDB
 /// reserves the slot inside the page via `MDB_RESERVE` *before* the closure
 /// runs, so a closure error cannot un-put the entry. Pinned side by side:

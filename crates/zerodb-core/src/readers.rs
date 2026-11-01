@@ -443,7 +443,7 @@ impl ReaderTable {
     /// process's own claims still count through the local counter. SPEC 04
     /// TXN-73 states the rule and the invariants it depends on.
     ///
-    /// Logged in `docs/DIVERGENCES.md` (`me_numreaders` semantics; a PROPOSED
+    /// Logged in `docs/LMDB-COMPATIBILITY.md` (`me_numreaders` semantics; a PROPOSED
     /// candidate for later redefinition, not approved).
     ///
     /// Relaxed load: introspection only, orders nothing (see [`ReaderTable::claim`]).
@@ -858,7 +858,7 @@ mod tests {
     fn zero_capacity_table_is_always_full() {
         // max_readers = 0 is degenerate but must not panic: every read txn
         // fails ReadersFull. The fork instead rejects the open with EINVAL —
-        // filed in docs/DIVERGENCES.md (`max_readers(0)` at open); no consumer
+        // filed in docs/LMDB-COMPATIBILITY.md (`max_readers(0)` at open); no consumer
         // passes 0.
         let t = ReaderTable::new(0);
         assert_eq!(t.claim(), None);

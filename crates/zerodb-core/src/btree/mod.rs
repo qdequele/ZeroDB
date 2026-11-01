@@ -216,7 +216,7 @@ fn leaf_view_over<'a>(
 /// so the same immutable bytes — takes the zero-check view; otherwise the
 /// full cell walk runs and its success is published there. Either way the
 /// page enters this txn's memo. Out of line so the memo-hit path keeps its
-/// shape (see docs/PERF-GAP-VS-LMDB.md, inlining threshold).
+/// shape (see docs/PERFORMANCE.md, inlining threshold).
 #[inline(never)]
 fn validate_leaf_miss<'a>(
     bytes: &'a [u8],

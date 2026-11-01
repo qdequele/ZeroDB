@@ -26,7 +26,7 @@
 //! the first-opener election, byte 1 the macOS writer lock, and byte
 //! `LIVENESS_BASE + pid` each process's liveness lock.
 //!
-//! The `unsafe` here is the sanctioned shared-memory category of the AGENTS.md
+//! The `unsafe` here is the sanctioned shared-memory category of the CONTRIBUTING.md
 //! policy: atomic views over the mapping, `fcntl`, and the Linux `futex`.
 
 use std::collections::HashSet;

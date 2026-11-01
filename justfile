@@ -1,6 +1,6 @@
 # Task runner — install: cargo install just
 
-# fmt, clippy and the test suite: the first three checks of AGENTS.md.
+# fmt, clippy and the test suite: the first three checks of CONTRIBUTING.md.
 check:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
@@ -68,8 +68,8 @@ crash-test-full:
 # --- Engine comparison: zerodb vs the LMDB fork (heed), both in one binary ---
 #
 # The bench is a LADDER: adjacent rungs differ by exactly one mechanism, so a
-# ratio that jumps between two rungs names the cost. docs/BENCH-MAP.md maps
-# every rung to the mechanism it isolates and the PERF-GAP-VS-LMDB item it
+# ratio that jumps between two rungs names the cost. docs/PERFORMANCE.md maps
+# every rung to the mechanism it isolates and the docs/PERFORMANCE.md item it
 # implicates. macOS numbers are indicative; Graviton + EBS gp3 is the referee.
 #
 #   just bench            the whole ladder

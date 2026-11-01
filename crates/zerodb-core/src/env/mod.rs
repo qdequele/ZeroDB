@@ -245,7 +245,7 @@ pub(crate) struct EnvInner {
     /// are never represented here and are always memcmp.
     ///
     /// **Not persisted** — see `crate::cmp` for the reopen hazard
-    /// (docs/DIVERGENCES.md, comparator persistence).
+    /// (docs/LMDB-COMPATIBILITY.md, comparator persistence).
     comparators: ComparatorRegistry,
     /// Catalog capacity (`max_dbs`), immutable after open. Duplicated out of
     /// the `named` registry so read txns can size their dbi-indexed record
@@ -811,7 +811,7 @@ impl EnvInner {
     /// count, which never decreases when a read txn ends, over every
     /// process's readers in a lock-file environment. See
     /// [`crate::readers::ReaderTable::num_readers`] for the fork evidence and
-    /// docs/DIVERGENCES.md (`me_numreaders` semantics).
+    /// docs/LMDB-COMPATIBILITY.md (`me_numreaders` semantics).
     #[must_use]
     pub fn num_readers(&self) -> u32 {
         self.reader_table.num_readers()
@@ -1272,7 +1272,7 @@ impl Env {
     /// cross-process writer lock, waiting like a write begin, so no commit
     /// lands while it rounds up. LMDB takes no lock here: its
     /// `mdb_env_set_mapsize` returns while another process holds a write txn
-    /// (`OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER`; docs/DIVERGENCES.md D-023).
+    /// (`OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER`; docs/LMDB-COMPATIBILITY.md D-023).
     /// Under `WRITE_MAP` it grows the data file to the new size, never
     /// shrinking it.
     ///

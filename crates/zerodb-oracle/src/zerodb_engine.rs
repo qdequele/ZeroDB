@@ -17,7 +17,7 @@
 //! `Skip::WriteBlockedByNested` — the shared driver classifies that skip
 //! *before either engine runs*, so the fork's technical allowance of
 //! writes-under-a-child (it does not enforce quiescence; zerodb does — see the
-//! writer-quiescence entry in docs/DIVERGENCES.md) stays unobservable and the
+//! writer-quiescence entry in docs/LMDB-COMPATIBILITY.md) stays unobservable and the
 //! two engines cannot drift. The op model holds
 //! **one** child at a time (like its one-txn limitation); multiple concurrent
 //! children + real thread fan-out are covered by

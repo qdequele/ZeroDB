@@ -906,7 +906,7 @@ fn refuse_custom_comparator(env: &Env) -> Result<()> {
 /// Compacting copy: read every live entry of every DB under the snapshot and
 /// rebuild a fresh, densely-packed image (the `MDB_CP_COMPACT` shape),
 /// streamed into `file` at `base` (peak memory O(tree depth × psize) plus the
-/// write buffer; see docs/PERF-GAP-VS-LMDB.md, compaction RAM). Returns the
+/// write buffer; see docs/PERFORMANCE.md, compaction RAM). Returns the
 /// image length.
 ///
 /// The walk and the writes overlap, as in LMDB's compacting copy

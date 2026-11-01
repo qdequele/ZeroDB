@@ -6,7 +6,7 @@
 //! registry-deduped with `EnvAlreadyOpened`, and deferred-close, TXN-50..53).
 //! The adapter re-imposes three cheap fork boundary behaviors ZeroDB is lenient
 //! about (`map_size` must be an OS-page multiple, `max_readers(0)` is refused,
-//! a NUL in a DB name panics; see docs/DIVERGENCES.md) so the consumer test
+//! a NUL in a DB name panics; see docs/LMDB-COMPATIBILITY.md) so the consumer test
 //! suites see exact parity — each is checked here, at the heed boundary, and
 //! covered by a test. It also imposes heed's **data-file name**
 //! ([`DATA_FILE_NAME`], ADR-0010).
@@ -224,7 +224,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     ///
     /// Re-imposes the fork's open-time boundaries the native engine is lenient
     /// about: `max_readers(0)` → `Io(InvalidInput)`, and `map_size` not an
-    /// OS-page multiple → `Io(InvalidInput)` (see docs/DIVERGENCES.md).
+    /// OS-page multiple → `Io(InvalidInput)` (see docs/LMDB-COMPATIBILITY.md).
     ///
     /// # Safety
     ///
@@ -872,7 +872,7 @@ impl<T> Env<T> {
     /// **ZeroDB extension — no heed/LMDB counterpart.** `EnvInfo`'s
     /// `number_of_readers` mirrors `MDB_envinfo::me_numreaders`, which is a
     /// *high-water mark* that never decreases (LMDB parity; see
-    /// docs/DIVERGENCES.md); this is the live count it is usually mistaken
+    /// docs/LMDB-COMPATIBILITY.md); this is the live count it is usually mistaken
     /// for. Exposed as a method rather than an `EnvInfo` field so the mirrored
     /// struct keeps heed's exact shape.
     #[must_use]

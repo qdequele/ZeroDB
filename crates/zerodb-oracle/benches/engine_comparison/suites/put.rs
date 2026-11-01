@@ -14,7 +14,7 @@
 //! * `api/{plain,reserved}` — the same bytes written through `put` and through
 //!   `MDB_RESERVE`. milli serializes documents through the reserved path, so a
 //!   gap here is a gap in milli's hottest write call (adapter `ReservedSpace`
-//!   in docs/PERF-GAP-VS-LMDB.md, issue #10).
+//!   in docs/PERFORMANCE.md, issue #10).
 //! * `over/{same_size,grow}` — overwriting into a populated tree. Same-size can
 //!   be replaced where it sits; growing may force the page to split. The delta
 //!   is that split.

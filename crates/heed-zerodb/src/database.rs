@@ -48,7 +48,7 @@ impl DatabaseStat {
 }
 
 /// Map heed `PutFlags` → ZeroDB `PutFlags` (SPEC 01 Table 3). Dup flags are
-/// dropped (DUPSORT is unsupported; see docs/DIVERGENCES.md).
+/// dropped (DUPSORT is unsupported; see docs/LMDB-COMPATIBILITY.md).
 pub(crate) fn to_zdb_put_flags(f: PutFlags) -> zerodb::PutFlags {
     let mut z = zerodb::PutFlags::EMPTY;
     if f.contains(PutFlags::APPEND) {
@@ -882,7 +882,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
 }
 
 /// Convert a heed `&str` name to ZeroDB bytes, re-imposing the fork's C-string
-/// rule (see docs/DIVERGENCES.md). heed builds the dbi name with
+/// rule (see docs/LMDB-COMPATIBILITY.md). heed builds the dbi name with
 /// `CString::new(name).unwrap()`, so an embedded NUL **panics** — that is the
 /// fork's observable behavior (probed against heed =0.22.1's `raw_open_dbi`),
 /// which we reproduce exactly rather than inventing a clean error. No consumer
@@ -899,7 +899,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
     fn check_flags(&self) -> Result<()> {
         // No consumer passes any DatabaseFlags; DUPSORT/INTEGER_KEY/etc. are
         // unsupported. Reject a non-empty value cleanly rather than silently
-        // ignoring it (documented in docs/DIVERGENCES.md).
+        // ignoring it (documented in docs/LMDB-COMPATIBILITY.md).
         if !self.flags.is_empty() {
             return Err(Error::Mdb(MdbError::Incompatible));
         }

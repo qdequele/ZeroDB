@@ -880,7 +880,7 @@ fn pin_dupfixed_size_discipline() {
     // enforce DUPFIXED item-size uniformity on put — mismatched sizes are
     // silently ACCEPTED and the stored items become garbage (silent
     // corruption; neither a clean error nor an "un-fixing" of the page).
-    // Whether to replicate this is undecided (DIVERGENCES candidate:
+    // Whether to replicate this is undecided (divergence candidate:
     // BadValSize instead) and must be settled before any DUPFIXED code.
     t.assert_pinned(
         r#"

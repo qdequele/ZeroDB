@@ -10,7 +10,7 @@
 //! ## The safety story (ADR-0007, zero `unsafe`)
 //!
 //! The child holds a real `&'p RwTxn` — so the borrow checker itself enforces
-//! writer quiescence (TXN-29/30; see docs/DIVERGENCES.md): while any child is alive, no
+//! writer quiescence (TXN-29/30; see docs/LMDB-COMPATIBILITY.md): while any child is alive, no
 //! `&mut RwTxn` method can be called. The child is [`Send`] **by compiler
 //! derivation**: `&RwTxn: Send ⇔ RwTxn: Sync`, and `RwTxn` is `Sync` as a
 //! **standing asserted contract** (ADR-0007): it has

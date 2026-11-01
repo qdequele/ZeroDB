@@ -133,7 +133,7 @@ flags! {
 flags! {
     /// LMDB database flags (DUPSORT and the other database
     /// flags are unsupported, so any non-empty value errors at create — no
-    /// consumer passes one; see docs/DIVERGENCES.md). Bit values match `MDB_*`.
+    /// consumer passes one; see docs/LMDB-COMPATIBILITY.md). Bit values match `MDB_*`.
     pub struct DatabaseFlags: u32 {
         /// Use reverse string keys.
         const REVERSE_KEY = 0x02;

@@ -18,7 +18,7 @@
 //!   under loom via the `sync` shim (`just loom`).
 
 #![deny(missing_docs)]
-// `deny`, not `forbid`: the unsafe policy (AGENTS.md) sanctions these places,
+// `deny`, not `forbid`: the unsafe policy (CONTRIBUTING.md) sanctions these places,
 // each allowed item by item with its SAFETY contract inline:
 // - page casting: the unchecked field readers in `page::raw` (allow on the
 //   `mod`), the unchecked cell reads of validated views in `page::tree`, and

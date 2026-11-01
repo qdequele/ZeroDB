@@ -12,7 +12,7 @@
 //! records that every consumer clamps `map_size` to the page size before the
 //! call (`clamp_to_page_size`). zerodb is more lenient — it stores `map_size`
 //! and maps the file length, so it accepts un-clamped values (logged in
-//! `docs/DIVERGENCES.md`, the `map_size` validation entry). To keep these
+//! `docs/LMDB-COMPATIBILITY.md`, the `map_size` validation entry). To keep these
 //! differential tests on the *shared* semantic rather than heed's
 //! input-validation quirk, every
 //! `Reopen` here uses `map_size_kib` that is a multiple of 16, so the resulting
@@ -89,7 +89,7 @@ fn differential_mixed_sequence_only_env_survives() {
 /// `Reopen` map sizes are normalized to multiples of 16 KiB-of-`map_size_kib`
 /// (→ 64 KiB `map_size` steps) so every request is a multiple of the OS page
 /// size on 4 KiB/16 KiB/64 KiB kernels; see the module doc (heed rejects
-/// non-page-multiple map sizes; zerodb is more lenient — see docs/DIVERGENCES.md).
+/// non-page-multiple map sizes; zerodb is more lenient — see docs/LMDB-COMPATIBILITY.md).
 #[test]
 fn differential_random_sequences_do_not_diverge() {
     // A handful of deterministic seeds (no proptest harness needed; keeps this
@@ -182,7 +182,7 @@ fn garbage_store_error_kind_parity() {
 }
 
 /// ADR-0010 extension of the case above. Since the `heed-zerodb` adapter names
-/// its data file `data.mdb` (see docs/DIVERGENCES.md), the garbage-file case
+/// its data file `data.mdb` (see docs/LMDB-COMPATIBILITY.md), the garbage-file case
 /// becomes a *true* same-name differential: both engines are handed a garbage
 /// file at the **identical path**, differing only in which engine reads it.
 /// Both must still report `Invalid`.

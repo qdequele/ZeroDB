@@ -522,7 +522,7 @@ impl EnvOpenOptions {
     /// Unlike heed, this is a safe function: cross-process access is always
     /// coordinated through the lock file, which is on by default (ADR-0023).
     /// With [`EnvOpenOptions::lock_file`] off, ZeroDB is single-process (see
-    /// docs/DIVERGENCES.md).
+    /// docs/LMDB-COMPATIBILITY.md).
     ///
     /// # Errors
     ///

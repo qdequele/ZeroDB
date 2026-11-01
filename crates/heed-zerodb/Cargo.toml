@@ -6,7 +6,7 @@
 # oracle depends on BOTH — real heed (LMDB) and this crate (`heed_zerodb`) — in
 # one binary for in-process A/B diffing. Consumers (milli/hannoy) switch backends
 # with `[patch.crates-io] heed = { path = ".../crates/heed-shim" }` — a crate
-# literally named `heed` that re-exports this one (docs/CONSUMER-GATE.md). A
+# literally named `heed` that re-exports this one (docs/maintainers/CONSUMER-GATE.md). A
 # `package = "heed-zerodb"` rename inside `[patch]` does NOT work: cargo requires
 # the replacement to share the patched crate's name and ignores the rename
 # (verified; see crates/heed-shim/Cargo.toml).
@@ -40,7 +40,7 @@ heed-types = { version = "=0.21.0", default-features = false, features = [
 # `heed::byteorder::BigEndian`. Part of the sanctioned heed-surface re-export
 # (heed-types already pulls it transitively), not a new engine dependency.
 byteorder = "1.5"
-# Allow-listed (AGENTS.md). One `sysconf` call re-imposes the fork's
+# Allow-listed (CONTRIBUTING.md). One `sysconf` call re-imposes the fork's
 # `map_size` OS-page-multiple check at the heed boundary (heed uses `page_size`).
 libc = { workspace = true }
 

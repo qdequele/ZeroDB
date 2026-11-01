@@ -9,7 +9,7 @@
 //! The test binary re-runs itself as the child process (SIGKILLed for the
 //! dead-process cases).
 //! A mismatch between the engines is a ZeroDB bug unless recorded in
-//! `docs/DIVERGENCES.md`; never edit an expectation to make ZeroDB pass.
+//! `docs/LMDB-COMPATIBILITY.md`; never edit an expectation to make ZeroDB pass.
 
 use std::os::raw::{c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -1199,7 +1199,7 @@ fn write_map_joiner_lengths(holder_write_map: bool, joiner_map: u64) -> [(String
 /// than the 1 MiB holder's file: LMDB's open truncates the file up to its
 /// map size (`OBS_WRITE_MAP_JOINER_LARGER_MAP = "joiner_map"`); ZeroDB's
 /// open leaves the file as it is and its first write txn grows it to the
-/// same length (docs/DIVERGENCES.md D-024; ADR-0023 amendment 15, decision
+/// same length (docs/LMDB-COMPATIBILITY.md D-024; ADR-0023 amendment 15, decision
 /// 4). After the joiner's first commit both files have the joiner's map
 /// size.
 #[test]
@@ -1590,7 +1590,7 @@ fn prev_snapshot_opener_ends_both(kill: bool) -> ([String; 2], [String; 2]) {
 /// Both engines hold the waiter while the opener is open. After the close,
 /// LMDB's waiter fails with `EINVAL` on macOS and joins the rolled-back
 /// generation on Linux; ZeroDB's waiter becomes the first opener and serves
-/// the newest generation. The second field is docs/DIVERGENCES.md D-025
+/// the newest generation. The second field is docs/LMDB-COMPATIBILITY.md D-025
 /// (approved), pinned here.
 #[test]
 fn prev_snapshot_opener_closes_before_commit_vs_lmdb() {
@@ -1829,7 +1829,7 @@ fn prev_snapshot_without_a_lock_file_vs_lmdb() {
 /// "<id> <snapshot>", holder's write txn id]`. LMDB admits the read-only
 /// joiner and its open rolls every process back to the older meta; ZeroDB
 /// refuses it with `EAGAIN` and the holder is untouched. Not mirrored:
-/// docs/DIVERGENCES.md D-025 (approved), pinned here.
+/// docs/LMDB-COMPATIBILITY.md D-025 (approved), pinned here.
 #[test]
 fn prev_snapshot_read_only_joiner_vs_lmdb() {
     let lmdb = {

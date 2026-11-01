@@ -1,4 +1,4 @@
-# ZeroDB CI — the AGENTS.md check battery, automated.
+# ZeroDB CI — the CONTRIBUTING.md check battery, automated.
 #
 # Per push / PR: fmt, clippy, tests (x86-64 and aarch64), an MSRV check, miri
 # on the core, loom on the reader table, the fuzz gate and the crash smoke.

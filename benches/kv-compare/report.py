@@ -52,7 +52,7 @@ SETS = {"small": "Fits in memory", "large": "Larger than memory"}
 
 # What each store is, from each project's documentation and source
 # (fjall's 64 KiB key limit: its `Keyspace::insert` docs; ZeroDB processes:
-# docs/COMPATIBILITY.md, ADR-0023).
+# docs/LMDB-COMPATIBILITY.md, ADR-0023).
 FEATURES = [
     ("Design", ["B+ tree, memory-mapped", "B+ tree, memory-mapped", "LSM tree", "LSM tree",
                 "Copy-on-write B-tree", "B-tree"]),

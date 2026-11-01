@@ -53,7 +53,7 @@ pub enum Skip {
     /// with a write txn that has dropped-and-reused that dbi number trips an
     /// LMDB dbi-reuse hazard (`EINVAL` from `mdb_get` on the reused slot) that
     /// no consumer exercises — zerodb returns the correct MVCC answer (absent →
-    /// `None`). See the dropped-and-reused dbi entry in docs/DIVERGENCES.md.
+    /// `None`). See the dropped-and-reused dbi entry in docs/LMDB-COMPATIBILITY.md.
     /// Concurrent reader-vs-writer isolation is exercised properly through the
     /// reader table.
     VerifyDuringWrite,

@@ -9,11 +9,11 @@
 //! | field | compared? | why |
 //! |---|---|---|
 //! | `me_mapaddr` | no | `MDB_FIXEDMAP` only; ZeroDB has no fixed map (always null). |
-//! | `me_mapsize` | no | Both echo the configured value; LMDB rounds to the OS page size, ZeroDB does not (the OS-page-multiple check is re-imposed at the adapter, not here; see docs/DIVERGENCES.md). |
+//! | `me_mapsize` | no | Both echo the configured value; LMDB rounds to the OS page size, ZeroDB does not (the OS-page-multiple check is re-imposed at the adapter, not here; see docs/LMDB-COMPATIBILITY.md). |
 //! | `me_last_pgno` | **no** | Same meaning, format-specific value (own on-disk format). Compared as *monotonic growth* only. |
 //! | `me_last_txnid` | **yes, exactly** | Commit counter; same domain on both engines. |
 //! | `me_maxreaders` | **yes, exactly** | Echoes the configured reader-table size. |
-//! | `me_numreaders` | **yes, exactly** | High-water reader-slot count — LMDB never decrements it (see the `me_numreaders` entry in docs/DIVERGENCES.md). |
+//! | `me_numreaders` | **yes, exactly** | High-water reader-slot count — LMDB never decrements it (see the `me_numreaders` entry in docs/LMDB-COMPATIBILITY.md). |
 //! | `ms_psize` | no | ZeroDB selects it (page-size selection at env creation); LMDB derives it from the OS. |
 //! | `ms_depth` | bounded | Same meaning; value depends on fan-out (own on-disk format). |
 //! | `ms_*_pages` | no | Format-specific by construction (own on-disk format). |
@@ -225,7 +225,7 @@ fn info_num_readers_matches_for_equivalent_reader_populations() {
     // it is a high-water mark (`mti_numreaders` is only incremented, when
     // `mdb_txn_renew0` claims a new slot; ending a txn just clears `mr_pid`).
     // ZeroDB reproduces it rather than "fixing" it; see the `me_numreaders`
-    // entry in docs/DIVERGENCES.md.
+    // entry in docs/LMDB-COMPATIBILITY.md.
     for remaining in (0..CAP).rev() {
         lheld.pop();
         zheld.pop();

@@ -197,7 +197,7 @@ pub struct RoTxn<'env> {
     ///
     /// Without it every read op on a named DB would redo the registry lock +
     /// name clone + a full catalog descent (`resolve_named_record`) — roughly
-    /// doubling the tree work per `get` (docs/PERF-GAP-VS-LMDB.md, named-DB
+    /// doubling the tree work per `get` (docs/PERFORMANCE.md, named-DB
     /// record re-resolved on every read).
     ///
     /// Soundness: this txn pins an immutable [`Snapshot`] (its catalog cannot
@@ -597,7 +597,7 @@ impl Env {
     /// particular that the comparator is **not stored in the file**, so this
     /// call is where you take responsibility for passing the same ordering the
     /// database was built under. Passing a different one is undetectable and
-    /// silently returns wrong results (see docs/DIVERGENCES.md, comparator
+    /// silently returns wrong results (see docs/LMDB-COMPATIBILITY.md, comparator
     /// persistence).
     ///
     /// The comparator is registered even though the database already exists:

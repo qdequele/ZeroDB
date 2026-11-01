@@ -145,7 +145,7 @@ pub const F_BIGDATA: u16 = 0x0001;
 /// Active (named databases); its DUPSORT interaction is deferred with DUPSORT itself.
 pub const F_SUBDATA: u16 = 0x0002;
 /// **Reserved for DUPSORT** — value is a DUPSORT sub-page/sub-tree
-/// (unsupported, see docs/DIVERGENCES.md).
+/// (unsupported, see docs/LMDB-COMPATIBILITY.md).
 pub const F_DUPDATA: u16 = 0x0004;
 
 /// Mask of leaf-node flags that are valid to *see set* today. `F_DUPDATA`

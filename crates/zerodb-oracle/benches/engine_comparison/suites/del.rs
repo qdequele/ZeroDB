@@ -4,7 +4,7 @@
 //! LMDB pushes freed pages onto the FREE_DBI list keyed by txnid; zerodb keeps
 //! its own GC (SPEC 05). A gap that shows up in `churn/reinsert` and nowhere
 //! else points at reclamation, not at the tree (free-list bookkeeping in
-//! docs/PERF-GAP-VS-LMDB.md, issue #29).
+//! docs/PERFORMANCE.md, issue #29).
 //!
 //! Ladder:
 //! * `bulk/all` empties the tree key by key — every leaf eventually merges.
@@ -179,7 +179,7 @@ fn clear(c: &mut Criterion, cfg: &Cfg, keys: &[Vec<u8>], val: &[u8]) {
 /// The same half-tree span drained through the WRITE CURSOR. `bulk/half`
 /// and `range/half` both reach the tree by key; this one reaches it by
 /// cursor, so it is the only rung where post-delete cursor position costs
-/// anything (the `del_current` re-descent in docs/PERF-GAP-VS-LMDB.md,
+/// anything (the `del_current` re-descent in docs/PERFORMANCE.md,
 /// SPEC 03 §5.4a). Read it against `range/half`: same span, same result,
 /// different mechanism.
 fn cursor(c: &mut Criterion, cfg: &Cfg, keys: &[Vec<u8>], val: &[u8]) {

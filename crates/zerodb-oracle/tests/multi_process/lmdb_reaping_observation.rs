@@ -1,5 +1,5 @@
 //! Where the Meilisearch LMDB fork reclaims the reader slots of dead
-//! processes (ADR-0023 §3 "When", amendment 12). AGENTS.md rule 1: observed,
+//! processes (ADR-0023 §3 "When", amendment 12). CONTRIBUTING.md rule 1: observed,
 //! not guessed. Drives the vendored fork directly through `lmdb-master-sys`
 //! (heed exposes no `mdb_reader_list`); the test binary re-runs itself as the
 //! reader/writer process that gets SIGKILLed.

@@ -241,7 +241,7 @@ impl<'a> LeafRef<'a> {
     /// validated, so this may only be used when **these same bytes** already
     /// passed [`LeafRef::new`] earlier — i.e. behind the txn-scoped
     /// validated-pages memo over an immutable source
-    /// (`btree::ValidatedPages`; docs/PERF-GAP-VS-LMDB.md, eager page validation).
+    /// (`btree::ValidatedPages`; docs/PERFORMANCE.md, eager page validation).
     pub(crate) fn new_prevalidated(buf: &'a [u8], psize: u32) -> Result<LeafRef<'a>, PageError> {
         let flags = read_flags(buf);
         if page_type_of(flags)? != PageType::Leaf {

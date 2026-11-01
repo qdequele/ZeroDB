@@ -361,7 +361,7 @@ fn finalize_image(
 }
 
 // ===========================================================================
-// Streaming builder — bounded-memory compaction (docs/PERF-GAP-VS-LMDB.md,
+// Streaming builder — bounded-memory compaction (docs/PERFORMANCE.md,
 // compaction RAM)
 // ===========================================================================
 

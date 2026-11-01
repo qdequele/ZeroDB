@@ -16,7 +16,7 @@ pub const MAX_READERS_LIMIT: u32 = 1 << 20;
 pub(crate) const MAX_DBS_LIMIT: u32 = 1 << 20;
 
 /// Rejects a `max_readers` or `max_dbs` above its limit with
-/// `Io(InvalidInput)` (see docs/DIVERGENCES.md).
+/// `Io(InvalidInput)` (see docs/LMDB-COMPATIBILITY.md).
 ///
 /// Both values size eager allocations: `max_readers` reader slots (in this
 /// process, or in the lock file of a lock-file environment, ADR-0023) and

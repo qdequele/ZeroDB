@@ -159,7 +159,7 @@ impl<'a> Arbitrary<'a> for Value {
 /// unnamed DB and never create named DBs, so their root has no catalog entries.
 /// Modeling `Unnamed` as milli's named `"main"` keeps the fuzz faithful and
 /// avoids surfacing engine-internal records (the catalog-record divergence in
-/// docs/DIVERGENCES.md). The true unnamed/root DB is covered on its own — with
+/// docs/LMDB-COMPATIBILITY.md). The true unnamed/root DB is covered on its own — with
 /// no catalog mixing — by `tests/unnamed_root_differential.rs`.
 #[derive(Arbitrary, Debug, Clone, PartialEq, Eq)]
 pub enum DbName {
@@ -379,7 +379,7 @@ pub enum Op {
     /// [`Op::IterMutDelCurrent`] stops at the delete, so it compares the
     /// surviving *content* but never the surviving *position* — the exact
     /// semantics SPEC 03 §7 pins (mechanism: the retained-position cursor
-    /// delete, docs/PERF-GAP-VS-LMDB.md `del_current` re-descent).
+    /// delete, docs/PERFORMANCE.md `del_current` re-descent).
     /// This op puts the post-delete cursor position under the differential
     /// fuzzer: both engines must agree on every entry yielded afterwards,
     /// including across the leaf merges a long drain provokes.

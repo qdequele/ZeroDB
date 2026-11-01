@@ -162,7 +162,7 @@ pub trait Backing: Send + Sync {
     /// **The brokered contract (ADR-0021).**
     /// This mints `&mut [u8]` from `&self`; the signature cannot express the
     /// exclusivity it needs, so the obligation is the caller's. The sole
-    /// sanctioned caller is the write txn's `DirtyStore` (AGENTS.md unsafe
+    /// sanctioned caller is the write txn's `DirtyStore` (CONTRIBUTING.md unsafe
     /// policy; see `zerodb_io::MmapWritable::slice_mut` for the full
     /// statement). The caller must guarantee:
     ///
@@ -176,7 +176,7 @@ pub trait Backing: Send + Sync {
     ///   after every spill (TXN-71, ADR-0021).
     // `unsafe fn` *declaration* only (ADR-0021: no safe fn may mint `&mut`
     // from `&self`); the default body is trivially safe and the one unsafe
-    // *call* lives in `crate::dirty::map_mut`, the home the AGENTS.md policy
+    // *call* lives in `crate::dirty::map_mut`, the home the CONTRIBUTING.md policy
     // sanctions for the WRITE_MAP in-place brokered map-slice write.
     #[allow(unsafe_code)]
     // clippy cannot see that this is an `unsafe fn` whose documented contract
