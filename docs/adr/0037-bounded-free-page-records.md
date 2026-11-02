@@ -382,8 +382,14 @@ after the first draw.
    re-split after the first draw)?~~ Closed with Option C (2026-11-02).
 2. Refuse version-2 files at open (as format 2 did), or carry the lazy
    in-place upgrade described under Option C?
-3. Chunk size: the most that fits inline (`K` above), or smaller so a leaf
+3. ~~Chunk size: the most that fits inline (`K` above), or smaller so a leaf
    holds several chunks; and whether to cut at a gap between ids so most
-   runs stay inside one chunk.
-4. Should the run search's `n * 60` record bound count chunks or distinct
-   freeing transactions, now that one transaction can own many records?
+   runs stay inside one chunk.~~ Closed (maintainer, 2026-11-02): `K` is the
+   most that fits inline; the list is cut every `K` ids, never at a gap; a
+   record that grows past `K` during the save is cut again into balanced
+   pieces (in two at its middle id when it holds at most `2K`).
+4. ~~Should the run search's `n * 60` record bound count chunks or distinct
+   freeing transactions, now that one transaction can own many records?~~
+   Closed (maintainer, 2026-11-02): it counts records (chunks), as before.
+   Revisit gap cuts or per-transaction counting only if a measurement shows
+   extra file growth from them.
