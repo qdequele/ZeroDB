@@ -149,6 +149,19 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 - heed adapter: `Database::put_reserved` returns `Io(UnexpectedEof)` when the
   closure writes fewer bytes than it reserved, as heed does. It returned `Ok`
   with a zeroed tail.
+- heed adapter: the write cursor's `put_current_reserved_with_flags` now
+  reserves the value inside the page and runs the closure on it, as heed does
+  (`mdb_cursor_put` with `MDB_RESERVE`), instead of filling a heap buffer and
+  copying it in. A put rejected by its flags or size checks no longer runs the
+  closure; a short write returns `Io(UnexpectedEof)` and a failing closure its
+  `Io` error, both with the reserved entry in place; a same-size overwrite
+  hands the closure the old value's bytes; and a rejected `NO_OVERWRITE` or
+  `APPEND` leaves the cursor where LMDB does. The native API gains
+  `RwCursor::put_reserved`.
+- The write cursor's `put_current_with_options` (natively `RwCursor::put`)
+  leaves the cursor where LMDB does when it returns `KeyExist`: on the existing
+  key under `NO_OVERWRITE`, on the last entry under `APPEND`. It left the
+  cursor where it was, so the next `next()` yielded a different entry.
 - A commit no longer panics with "freelist_save failed to reach a fixed
   point" when the committing transaction's freed-page record sits at an
   overflow page-count boundary.

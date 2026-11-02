@@ -532,7 +532,8 @@ part of it.
 
 A write-cursor put whose key is byte-equal to the key of the entry under the
 cursor — `put_current`, and the plain (no-flag) general cursor put that heed's
-`put_current` maps to — is an overwrite **at the cursor's position**: the
+`put_current` maps to, reserved (§7 `RESERVE` form) or not — is an overwrite
+**at the cursor's position**: the
 engine applies the §6.1 replace at the parked root-to-leaf path, without
 searching for the key. LMDB's `MDB_CURRENT` put likewise writes at
 `mc_pg[top]`/`mc_ki[top]` with no search.
@@ -552,6 +553,10 @@ put: any put flag (`NO_OVERWRITE`, `APPEND`,
 comparator), a cursor sitting on a slot a delete just vacated, and trees with
 the sequential-writes setting (their §6.6 finger bookkeeping lives on the keyed
 path).
+
+A reserved put then hands out the slot at the kept path's leaf frame: the
+inline value there, or the overflow run its cell names. When the path could not
+be kept it locates the key by search.
 
 **Debug shadow check.** As for deletes: after every put that keeps the path, a
 debug build re-runs a fresh search for the key and asserts it is found at
@@ -937,10 +942,40 @@ value of the entry at `ki[top]` **keeping the key**:
   > `==` last both `KeyExist` while the cursor is parked at the *last* entry, and
   > the stored value is left unmodified. Verified against the fork through heed
   > 0.22.1, matching SPEC 01 §S1.)
-- `RESERVE` form: returns a pointer to the reserved bytes inside the dirty leaf
-  (or overflow head) for the caller to fill; those bytes MUST be written before
-  any op that could move/split/free the page (SPEC 04 borrow contract, SPEC 01
-  §S3). ZeroDB must not zero the reserved region (parity with writemap peek).
+- **Position after a rejected flagged put.** A `put_current_with_options` that
+  returns `KeyExist` still moves the cursor, as LMDB's `mdb_cursor_put` does:
+  under `NO_OVERWRITE` onto the existing key it found (so `next` yields that
+  key's successor, wherever the cursor was parked); under `APPEND` onto the last
+  entry, which the key was compared with (so `next` yields `None`, and `prev`
+  through `rev_iter_mut` the entry before the last). Nothing is written.
+
+  > Pinned by `crates/zerodb-oracle/tests/differential/cursor_put_position.rs`
+  > (`rejected_no_overwrite_*`, `rejected_append_*`; fork through heed 0.22.1
+  > against `heed-zerodb`, forward and backward).
+- `RESERVE` form (`RwCursor::put_reserved`, heed's
+  `put_current_reserved_with_flags`): places the value first, then hands the
+  caller the reserved bytes inside the dirty leaf (or the overflow run's head)
+  to fill in place; those bytes MUST be written before any op that could
+  move/split/free the page (SPEC 04 TXN-47, SPEC 01 §S3). ZeroDB must not zero
+  the reserved region (parity with writemap peek). Observed against the fork,
+  with and without `WRITE_MAP`, and matched:
+  - A same-size overwrite of an inline value hands back the old value's bytes
+    (LMDB's `olddata.mv_data`); any other size gets unspecified bytes.
+  - The caller's closure runs only after a successful placement: a put
+    rejected by the up-front checks (`BadValSize`) or by its flags
+    (`KeyExist`) never runs it.
+  - After the placement the cursor sits on the reserved entry, whatever the
+    closure then does (a short write or a closure error leaves the entry in
+    place, with the reserved length).
+  - A put rejected with `KeyExist` moves the cursor as LMDB's
+    `mdb_cursor_put` does: under `NO_OVERWRITE` onto the existing key; under
+    `APPEND` onto the last entry, which the key was compared with.
+
+  A plain (no-flag) reserve of the key under the cursor is placed at the
+  parked path (§5.4b); every other reserve takes the keyed put.
+
+  > Pinned by `crates/zerodb-oracle/tests/differential/cursor_put_reserved_parity.rs`
+  > (fork through heed 0.22.1 against `heed-zerodb`).
 
 ### del_current (`MDB_cursor_del`) — SPEC 00 r34
 
