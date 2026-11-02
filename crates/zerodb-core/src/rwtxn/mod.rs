@@ -190,6 +190,16 @@ pub(crate) struct WriterCarry {
     fingers: Vec<Finger>,
     /// The handle-check memo allocation ([`TxnHandles::recycle`]).
     handles: Option<Box<crate::handles::Rare>>,
+    /// The page buffer a commit encodes its meta into (commit step C4):
+    /// empty until the first commit, then one page, reused. Bytes
+    /// `..meta_dirty` may hold an earlier encode; every byte past them is
+    /// zero. Carried under the writer lock like everything here, so a commit
+    /// neither locks, allocates nor zeroes a whole page for it.
+    meta_buf: Vec<u8>,
+    /// See `meta_buf`. Non-zero between an encode and the clear that
+    /// follows the meta write, so a commit that unwound in between leaves
+    /// the next one a prefix to clear.
+    meta_dirty: usize,
     /// The snapshot the last write txn published, or its base when it
     /// published nothing: the next write txn's base when it is still the
     /// latest ([`crate::env::EnvInner::writer_base`]).

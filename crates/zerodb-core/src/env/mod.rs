@@ -206,13 +206,6 @@ pub(crate) struct EnvInner {
     /// thread-agnostic flag+condvar lock (see [`WriterLock`]) so the guard —
     /// and with it `RwTxn` — is `Send`.
     write_mutex: WriterLock,
-    /// The page buffer a commit encodes its meta into (commit step C4),
-    /// reused across commits. Every byte is zero while it sits here; empty
-    /// until the first commit. Only the writer touches it, so its lock is
-    /// never contended; it is taken only by commits that write a meta, which
-    /// keeps it off the begin path and out of the `RwTxn` (an empty write
-    /// txn pays nothing for it).
-    meta_buf: Mutex<Vec<u8>>,
     /// The published-snapshot cell (SPEC 04 TXN-18; ADR-0006 Option B): the
     /// immutable `Arc<Snapshot>` behind a
     /// bounded-O(1)-critical-section mutex, plus the mirroring SeqCst
@@ -470,21 +463,6 @@ impl EnvInner {
             // advances T.
             region.published_txnid().store(txnid, Ordering::SeqCst);
         }
-    }
-
-    /// The commit's reusable meta-page buffer (commit step C4), locked for
-    /// the meta write. The buffer is all zero on entry, or empty before the
-    /// first commit; the commit sizes it to the page, encodes into it, writes
-    /// it, and clears the prefix it encoded before the guard drops.
-    pub(crate) fn meta_buf(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
-        // Poison recovery: a writer that panicked mid-encode may have left
-        // bytes behind, so a recovered buffer is discarded (the commit
-        // reallocates a zeroed one).
-        self.meta_buf.lock().unwrap_or_else(|p| {
-            let mut g = p.into_inner();
-            g.clear();
-            g
-        })
     }
 
     /// Acquire the single-writer lock (SPEC 04 TXN-6/7): blocks until the

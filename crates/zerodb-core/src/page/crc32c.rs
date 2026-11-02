@@ -94,20 +94,133 @@ fn crc_update(crc: u32, bytes: &[u8]) -> u32 {
 /// The hardware path: the ARMv8 CRC32C instructions, eight bytes per
 /// `crc32cx` and the trailing `len % 8` bytes one `crc32cb` each. Callable
 /// only where the `crc` feature is present (see [`crc_update`]).
+///
+/// Each `crc32cx` depends on the previous one's result, so one stream runs
+/// at the instruction's latency, not its throughput. Inputs of at least
+/// [`HW_CHUNK_WORDS`] words are therefore cut into chunks of three equal
+/// blocks, checksummed side by side as three independent streams and joined
+/// with [`crc_shift`]: the standard interleaving of hardware CRC
+/// implementations (ADR-0031 Option D). The result is bit-identical to one
+/// stream.
 #[cfg(all(target_arch = "aarch64", not(miri)))]
 #[target_feature(enable = "crc")]
 fn crc_update_hw(mut crc: u32, bytes: &[u8]) -> u32 {
     use std::arch::aarch64::{__crc32cb, __crc32cd};
     let (words, rest) = bytes.as_chunks::<8>();
-    for w in words {
-        // Little-endian, so the word's first byte is the first one folded,
-        // as the reflected CRC consumes the stream.
+    let (chunks, tail) = words.as_chunks::<HW_CHUNK_WORDS>();
+    for chunk in chunks {
+        let (a, bc) = chunk.split_at(HW_BLOCK_WORDS);
+        let (b, c) = bc.split_at(HW_BLOCK_WORDS);
+        let (mut x, mut y, mut z) = (crc, 0u32, 0u32);
+        for ((wa, wb), wc) in a.iter().zip(b).zip(c) {
+            x = __crc32cd(x, u64::from_le_bytes(*wa));
+            y = __crc32cd(y, u64::from_le_bytes(*wb));
+            z = __crc32cd(z, u64::from_le_bytes(*wc));
+        }
+        // The CRC register is linear: the state after `a ‖ b ‖ c` is `x`
+        // carried over the bytes of `b` and `c`, plus `y` carried over `c`,
+        // plus `z`.
+        crc = crc_shift(x, &SHIFT_2_BLOCKS) ^ crc_shift(y, &SHIFT_1_BLOCK) ^ z;
+    }
+    // Little-endian, so the word's first byte is the first one folded,
+    // as the reflected CRC consumes the stream.
+    for w in tail {
         crc = __crc32cd(crc, u64::from_le_bytes(*w));
     }
     for &byte in rest {
         crc = __crc32cb(crc, byte);
     }
     crc
+}
+
+/// Words (8 bytes) per stream in one interleaved chunk of the hardware path:
+/// short enough that a meta page's annex fills several chunks, long enough
+/// that the two shifts per chunk stay a small part of it.
+#[cfg(any(test, all(target_arch = "aarch64", not(miri))))]
+const HW_BLOCK_WORDS: usize = 32;
+
+/// Words per interleaved chunk: three blocks.
+#[cfg(any(test, all(target_arch = "aarch64", not(miri))))]
+const HW_CHUNK_WORDS: usize = 3 * HW_BLOCK_WORDS;
+
+/// A CRC register shift by a fixed number of bytes, as a table: entry
+/// `[i][b]` is what byte `i` of the register, holding `b`, contributes to the
+/// shifted register. Shifting is linear, so a register's shift is the XOR of
+/// its four bytes' entries.
+#[cfg(any(test, all(target_arch = "aarch64", not(miri))))]
+type ShiftTable = [[u32; 256]; 4];
+
+/// [`crc_shift`] tables that carry a CRC register over one block and over
+/// two blocks of bytes (2 × 4 KiB, built at compile time).
+#[cfg(any(test, all(target_arch = "aarch64", not(miri))))]
+static SHIFT_1_BLOCK: ShiftTable = shift_table(8 * HW_BLOCK_WORDS);
+#[cfg(any(test, all(target_arch = "aarch64", not(miri))))]
+static SHIFT_2_BLOCKS: ShiftTable = shift_table(16 * HW_BLOCK_WORDS);
+
+/// `a · b mod P` over GF(2), both in the reflected representation the CRC
+/// register uses (bit 31 is the coefficient of `x^0`).
+#[cfg(any(test, all(target_arch = "aarch64", not(miri))))]
+const fn mul_mod_p(a: u32, mut b: u32) -> u32 {
+    let mut product = 0u32;
+    let mut bit = 1u32 << 31;
+    while bit != 0 {
+        if a & bit != 0 {
+            product ^= b;
+        }
+        bit >>= 1;
+        // b · x, reduced.
+        b = if b & 1 != 0 {
+            (b >> 1) ^ POLY_REFLECTED
+        } else {
+            b >> 1
+        };
+    }
+    product
+}
+
+/// `x^(8n) mod P`, reflected: multiplying a CRC register by it carries the
+/// register over `n` zero bytes. Square-and-multiply.
+#[cfg(any(test, all(target_arch = "aarch64", not(miri))))]
+const fn x_pow_8n(n: usize) -> u32 {
+    let mut result = 1u32 << 31; // x^0
+    let mut base = 1u32 << (31 - 8); // x^8: one byte
+    let mut n = n;
+    while n != 0 {
+        if n & 1 != 0 {
+            result = mul_mod_p(result, base);
+        }
+        base = mul_mod_p(base, base);
+        n >>= 1;
+    }
+    result
+}
+
+/// The [`ShiftTable`] that carries a CRC register over `n` bytes.
+#[cfg(any(test, all(target_arch = "aarch64", not(miri))))]
+const fn shift_table(n: usize) -> ShiftTable {
+    let k = x_pow_8n(n);
+    let mut table = [[0u32; 256]; 4];
+    let mut i = 0;
+    while i < 4 {
+        let mut b = 0;
+        while b < 256 {
+            table[i][b] = mul_mod_p(k, (b as u32) << (8 * i));
+            b += 1;
+        }
+        i += 1;
+    }
+    table
+}
+
+/// The CRC register `crc` carried over the bytes `table` stands for: what
+/// folding that many zero bytes would leave, without folding them.
+#[cfg(any(test, all(target_arch = "aarch64", not(miri))))]
+#[inline]
+fn crc_shift(crc: u32, table: &ShiftTable) -> u32 {
+    table[0][(crc & 0xFF) as usize]
+        ^ table[1][((crc >> 8) & 0xFF) as usize]
+        ^ table[2][((crc >> 16) & 0xFF) as usize]
+        ^ table[3][(crc >> 24) as usize]
 }
 
 /// The table path, slicing-by-8: each 8-byte block is XORed into the state and folded through
@@ -157,7 +270,11 @@ pub fn crc32c_concat(parts: &[&[u8]]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{crc32c, crc32c_concat, crc_update, crc_update_bytewise, crc_update_table};
+    use super::{
+        crc32c, crc32c_concat, crc_shift, crc_update, crc_update_bytewise, crc_update_table,
+        mul_mod_p, shift_table, x_pow_8n, HW_BLOCK_WORDS, HW_CHUNK_WORDS, SHIFT_1_BLOCK,
+        SHIFT_2_BLOCKS,
+    };
     use proptest::prelude::*;
 
     /// Proptest config that also runs under miri: failure persistence writes a
@@ -329,6 +446,84 @@ mod tests {
                 crc_update_table(0xFFFF_FFFF, s),
                 "len {len}"
             );
+        }
+    }
+
+    /// Multiplying a register by `x^(8n)` equals folding `n` zero bytes, for
+    /// every `n` up to 300 and the block sizes the hardware path shifts by;
+    /// so do the shift tables, at those block sizes and a few others.
+    #[test]
+    fn crc_shift_equals_folding_zero_bytes() {
+        let block = 8 * HW_BLOCK_WORDS;
+        let zeros = vec![0u8; 2 * block];
+        let ns = (0..=if cfg!(miri) { 20 } else { 300 }).chain([block, 2 * block]);
+        let inits = [0xFFFF_FFFF, 1, 0x8000_0000, 0x1234_5678];
+        for n in ns {
+            for init in inits {
+                assert_eq!(
+                    mul_mod_p(x_pow_8n(n), init),
+                    crc_update_table(init, &zeros[..n]),
+                    "n {n} init {init:#x}"
+                );
+            }
+        }
+        for init in inits {
+            let one = crc_update_table(init, &zeros[..block]);
+            assert_eq!(crc_shift(init, &SHIFT_1_BLOCK), one, "one block");
+            let two = crc_update_table(init, &zeros);
+            assert_eq!(crc_shift(init, &SHIFT_2_BLOCKS), two, "two blocks");
+            for n in [0, 1, 7, 8, 172] {
+                let want = crc_update_table(init, &zeros[..n]);
+                assert_eq!(crc_shift(init, &shift_table(n)), want, "n {n}");
+            }
+        }
+    }
+
+    /// Where this CPU has the `crc` feature, the interleaved hardware path
+    /// equals the table path on every length around one and two interleaved
+    /// chunks, from several offsets and starting states.
+    #[cfg(all(target_arch = "aarch64", not(miri)))]
+    #[test]
+    fn hardware_interleaved_chunks_match_table_path() {
+        if !std::arch::is_aarch64_feature_detected!("crc") {
+            return;
+        }
+        let data: Vec<u8> = (0..3 * 8 * HW_CHUNK_WORDS as u32 + 64)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let hw = |crc: u32, s: &[u8]| {
+            // SAFETY: the `crc` feature was detected at the top of this test.
+            #[allow(unsafe_code)]
+            unsafe {
+                super::crc_update_hw(crc, s)
+            }
+        };
+        let chunk = 8 * HW_CHUNK_WORDS;
+        let lens = (chunk - 20..=chunk + 20).chain(2 * chunk - 20..=2 * chunk + 20);
+        for len in lens {
+            for start in [0usize, 1, 5, 8] {
+                let s = &data[start..start + len];
+                for init in [0xFFFF_FFFF, 0, 0x1234_5678] {
+                    assert_eq!(
+                        hw(init, s),
+                        crc_update_table(init, s),
+                        "start {start} len {len} init {init:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    proptest! {
+        #![proptest_config(prop_config())]
+        /// Any bytes up to five interleaved chunks long, from any starting
+        /// state: the dispatched path equals the table path.
+        #[test]
+        fn dispatched_equals_table_long(
+            data in proptest::collection::vec(any::<u8>(), 0..=5 * 8 * HW_CHUNK_WORDS),
+            init in any::<u32>(),
+        ) {
+            prop_assert_eq!(crc_update(init, &data), crc_update_table(init, &data));
         }
     }
 }
