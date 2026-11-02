@@ -207,21 +207,37 @@ fn every_route_copies_the_pinned_snapshot_under_a_concurrent_writer() {
         for s in 0..WINDOW {
             step(&env, s);
         }
+        // While a copy pins its snapshot, every commit takes fresh pages, so
+        // the writer may run at most `AHEAD` steps past the point where the
+        // current copy starts: tens of MiB of the 1 GiB map at most, however
+        // slow the copy is, and still enough commits to land during every
+        // copy.
+        const AHEAD: u64 = 256;
         let stop = Arc::new(AtomicBool::new(false));
         let next = Arc::new(AtomicU64::new(WINDOW));
+        let allowed = Arc::new(AtomicU64::new(WINDOW + AHEAD));
         let writer = {
-            let (env, stop, next) = (env.clone(), Arc::clone(&stop), Arc::clone(&next));
+            let (env, stop, next, allowed) = (
+                env.clone(),
+                Arc::clone(&stop),
+                Arc::clone(&next),
+                Arc::clone(&allowed),
+            );
             std::thread::spawn(move || {
-                // Relaxed: the stop flag orders nothing, and `next` is only
-                // written by this thread. Release: commit `s` happens-before
-                // a copy that reads `next == s + 1` with Acquire.
+                // Relaxed: the stop flag and `allowed` order nothing, and
+                // `next` is only written by this thread. Release: commit `s`
+                // happens-before a copy that reads `next == s + 1` with
+                // Acquire.
                 while !stop.load(Ordering::Relaxed) {
                     let s = next.load(Ordering::Relaxed);
+                    if s >= allowed.load(Ordering::Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_micros(100));
+                        continue;
+                    }
                     step(&env, s);
                     next.store(s + 1, Ordering::Release);
-                    // While a copy pins its snapshot, every commit takes
-                    // fresh pages; an unthrottled `NO_SYNC` writer would
-                    // fill the map during one copy.
+                    // Spreads the allowed steps across the copy instead of
+                    // committing them all before it pins its snapshot.
                     std::thread::sleep(std::time::Duration::from_micros(100));
                 }
             })
@@ -229,6 +245,9 @@ fn every_route_copies_the_pinned_snapshot_under_a_concurrent_writer() {
         let mut grew_past_a_copy = false;
         let mut last_gen = 0;
         for i in 0..60 {
+            // Relaxed: see the writer. `next` only grows, so this always
+            // lets the writer pass the previous copy's snapshot below.
+            allowed.store(next.load(Ordering::Relaxed) + AHEAD, Ordering::Relaxed);
             // Start each copy only once the writer has committed a step past
             // the previous copy's snapshot, so every copy pins a new one.
             // Acquire: pairs with the writer's Release.
