@@ -51,6 +51,12 @@ pub fn cmd_stat(env_dir: &Path) -> Result<String, BoxErr> {
         "  free_pages:           {}",
         zerodb::free_page_count(&txn)?
     )?;
+    let free = zerodb::free_record_stats(&txn)?;
+    writeln!(
+        out,
+        "  free_records:         {} from {} freeing txns, longest {} ids",
+        free.records, free.freeing_txns, free.longest
+    )?;
     writeln!(out, "  last_pgno:            {}", snap.last_pg)?;
     writeln!(out, "  txnid:                {}", snap.txnid)?;
 

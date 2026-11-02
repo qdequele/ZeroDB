@@ -1,6 +1,6 @@
 //! File geometry helpers — page-size validation, map sizing, the `MapFull`
 //! boundary, the inline-vs-overflow threshold, overflow run math, and the GC-DB
-//! big-endian txnid key codec (SPEC 02 §4.2, §5, §7, §8).
+//! big-endian key codec (SPEC 02 §4.2, §5, §7, §8).
 
 use super::{PageError, HEADER_SIZE, MAX_PAGE_SIZE, MIN_PAGE_SIZE};
 
@@ -104,21 +104,61 @@ pub fn overflow_capacity(n: u64, psize: u32) -> u64 {
     n * psize as u64 - HEADER_SIZE as u64
 }
 
-/// Encode a GC-DB key: an 8-byte txnid stored **big-endian** (SPEC 02 §7,
-/// SPEC 05 GC-2). This is the sole engine-internal key that is not
-/// little-endian; big-endian makes memcmp order equal numeric-ascending order,
-/// which the reclamation scan relies on.
-#[must_use]
-pub fn gc_key_encode(txnid: u64) -> [u8; 8] {
-    txnid.to_be_bytes()
+/// A GC-DB key (SPEC 02 §7, SPEC 05 GC-1/GC-2): the transaction that freed
+/// the pages, then the low end of the page-id range the record covers within
+/// that transaction's list (0 for its first record). The derived order is
+/// `(txnid, seq)`, the order of the encoded keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GcKey {
+    /// The write transaction that freed the pages in the record.
+    pub txnid: u64,
+    /// The low end of the record's page-id range: every id it lists is
+    /// `>= seq` and below the `seq` of the next record of the same `txnid`.
+    pub seq: u64,
 }
 
-/// Decode a GC-DB key (big-endian; SPEC 02 §7). Returns `None` if the key is not
-/// exactly 8 bytes.
+impl std::fmt::Display for GcKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({}, {})", self.txnid, self.seq)
+    }
+}
+
+/// Length of an encoded GC-DB key: two big-endian `u64`s (SPEC 02 §7).
+pub const GC_KEY_SIZE: usize = 16;
+
+/// Encode a GC-DB key: `BE(txnid) ‖ BE(seq)`, 16 bytes (SPEC 02 §7, SPEC 05
+/// GC-2). These are the sole engine-internal integers that are not
+/// little-endian; big-endian makes memcmp order equal `(txnid, seq)` order,
+/// which the reclamation scan relies on.
 #[must_use]
-pub fn gc_key_decode(key: &[u8]) -> Option<u64> {
-    let arr: [u8; 8] = key.try_into().ok()?;
-    Some(u64::from_be_bytes(arr))
+pub fn gc_key_encode(key: GcKey) -> [u8; GC_KEY_SIZE] {
+    let mut out = [0u8; GC_KEY_SIZE];
+    out[..8].copy_from_slice(&key.txnid.to_be_bytes());
+    out[8..].copy_from_slice(&key.seq.to_be_bytes());
+    out
+}
+
+/// Decode a GC-DB key (SPEC 02 §7). Returns `None` if the key is not exactly
+/// [`GC_KEY_SIZE`] bytes.
+#[must_use]
+pub fn gc_key_decode(key: &[u8]) -> Option<GcKey> {
+    let arr: &[u8; GC_KEY_SIZE] = key.try_into().ok()?;
+    let (t, s) = arr.split_at(8);
+    Some(GcKey {
+        txnid: u64::from_be_bytes(t.try_into().ok()?),
+        seq: u64::from_be_bytes(s.try_into().ok()?),
+    })
+}
+
+/// The most page ids one GC record holds (SPEC 05 GC-5, ADR-0037): the
+/// longest PIL whose leaf cell `8 + 16 + 8 + 8K` stays inline
+/// (`<= max_node_size`). 249 at 4 KiB pages, 1,017 at 16 KiB, 4,089 at
+/// 64 KiB. A GC record never spills to an overflow run.
+///
+/// Callers must pass a validated `psize`.
+#[must_use]
+pub fn gc_chunk_cap(psize: u32) -> usize {
+    (max_node_size(psize) - 8 - GC_KEY_SIZE - 8) / 8
 }
 
 /// Encoded byte length of a page-id list holding `count` ids (SPEC 02 §7,
@@ -260,13 +300,31 @@ mod tests {
 
     #[test]
     fn gc_key_codec_roundtrip_and_order() {
+        let k = |txnid, seq| GcKey { txnid, seq };
         for txnid in [0u64, 1, 255, 256, 0x0102_0304_0506_0708, u64::MAX] {
-            assert_eq!(gc_key_decode(&gc_key_encode(txnid)), Some(txnid));
+            for seq in [0u64, 2, 0x0A0B_0C0D, u64::MAX] {
+                assert_eq!(
+                    gc_key_decode(&gc_key_encode(k(txnid, seq))),
+                    Some(k(txnid, seq))
+                );
+            }
         }
-        // Big-endian: memcmp order == numeric order.
-        assert!(gc_key_encode(1) < gc_key_encode(2));
-        assert!(gc_key_encode(255) < gc_key_encode(256));
-        assert!(gc_key_encode(0x00FF) < gc_key_encode(0x0100));
+        // Big-endian: memcmp order == (txnid, seq) order.
+        assert!(gc_key_encode(k(1, u64::MAX)) < gc_key_encode(k(2, 0)));
+        assert!(gc_key_encode(k(255, 0)) < gc_key_encode(k(256, 0)));
+        assert!(gc_key_encode(k(7, 255)) < gc_key_encode(k(7, 256)));
+        assert_eq!(gc_key_encode(k(1, 2))[..8], 1u64.to_be_bytes());
         assert_eq!(gc_key_decode(&[0, 0, 0]), None);
+        assert_eq!(gc_key_decode(&[0; 8]), None, "a format-2 key is refused");
+        assert_eq!(gc_key_decode(&[0; 17]), None);
+    }
+
+    #[test]
+    fn gc_chunk_cap_is_the_largest_inline_pil() {
+        for (psize, k) in [(4096u32, 249usize), (16384, 1017), (65536, 4089)] {
+            assert_eq!(gc_chunk_cap(psize), k);
+            assert!(value_is_inline(GC_KEY_SIZE, pil_size(k) as u64, psize));
+            assert!(!value_is_inline(GC_KEY_SIZE, pil_size(k + 1) as u64, psize));
+        }
     }
 }

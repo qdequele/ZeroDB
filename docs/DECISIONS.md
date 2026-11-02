@@ -43,3 +43,7 @@ tracked in GitHub issues. To propose a decision, copy
 | 0032 | [Raw environment copy from the data file: clone or in-kernel copy](adr/0032-raw-copy-block-clone.md) | Implemented; approval not recorded | Env copy, beyond LMDB |
 | 0033 | [A standalone benchmark crate comparing ZeroDB with other key-value stores](adr/0033-kv-compare-bench.md) | Implemented; approval not recorded | Benchmarks, dependencies |
 | 0034 | [Trust page contents by default, as LMDB does](adr/0034-trusted-pages-by-default.md) | Accepted | Page validation, LMDB parity, `unsafe` policy |
+| 0035 | [One atomic word for the in-process writer lock](adr/0035-writer-lock-cell.md) | Proposed | Concurrency, performance (commit), `unsafe` policy |
+| 0037 | [Bounded free-page records](adr/0037-bounded-free-page-records.md) | Accepted (Option C), implemented | On-disk format, page reclamation |
+| 0038 | [Bounded relaxed durability: steady and weak metas, a durable watermark](adr/0038-bounded-relaxed-durability.md) | Proposed | Durability, page reclamation, on-disk format |
+| 0039 | [Group commit: start the next write transaction during the previous commit's sync](adr/0039-group-commit.md) | Proposed (recommends not building it now) | Durability, concurrency, beyond LMDB |

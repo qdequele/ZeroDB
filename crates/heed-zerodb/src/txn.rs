@@ -113,6 +113,7 @@ impl<'e, T> RoTxn<'e, T> {
 
     /// The owning environment's identity (`zerodb::Env::ident`), used for
     /// heed's environment/transaction pairing assertions.
+    #[inline]
     pub(crate) fn env_ident(&self) -> usize {
         match &self.inner {
             InnerTxn::Ro(t) => t.env_ident(),

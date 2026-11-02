@@ -118,6 +118,11 @@ pub struct Spec {
     /// LMDB's default (no spill at this workload's size). The SIGKILL child
     /// opens through the public option, which raises it to that floor.
     pub dirty_limit: Option<u64>,
+    /// A large-clear cycle (~1/4): round 0 first fills a database with a few
+    /// thousand pages, clears it in one txn, then runs small commits, so cuts
+    /// land in a save that writes a freed list of many bounded records and in
+    /// the commits that drain them record by record (SPEC 05 GC-5, GC-20).
+    pub gc_clear: bool,
 }
 
 /// Ops decoded per workload round (mechanism B loops rounds so an async kill
@@ -142,6 +147,7 @@ pub fn gen_spec(seed: u64) -> Spec {
     let map_size: u64 = if big { 128 << 20 } else { 64 << 20 };
     // Drawn last so every earlier field keeps its value for a given seed.
     let dirty_limit = rng.ratio(1, 3).then(|| 8 + rng.below(120) as u64);
+    let gc_clear = rng.ratio(1, 4);
     Spec {
         seed,
         mode,
@@ -149,6 +155,7 @@ pub fn gen_spec(seed: u64) -> Spec {
         map_size,
         big,
         dirty_limit,
+        gc_clear,
     }
 }
 
@@ -192,8 +199,56 @@ impl Spec {
             bulk.append(&mut ops);
             ops = bulk;
         }
+        if self.gc_clear && round == 0 {
+            // Its own stream, so the round's other ops stay those of the seed.
+            let mut clear = clear_phase(&mut Rng::new(splitmix64(self.seed ^ 0x0C1E_A400_0000)));
+            clear.append(&mut ops);
+            ops = clear;
+        }
         ops
     }
+}
+
+/// A large-clear cycle's lead-in: one committed txn of 1,000 puts of one to
+/// three overflow pages each (a few thousand pages), one committed txn that
+/// clears the database, then 24 committed txns of one or two small puts. The
+/// clear frees far more ids than one free-page record holds, so its save
+/// writes many records, and each small commit after it draws from the oldest
+/// of them.
+fn clear_phase(rng: &mut Rng) -> Vec<Op> {
+    let mut ops = vec![
+        Op::BeginRw,
+        Op::CreateDb {
+            name: DbName::Unnamed,
+        },
+    ];
+    for i in 0..1_000u32 {
+        let mut v = vec![0u8; 3_000 + rng.below(9_000)];
+        rng.fill(&mut v);
+        ops.push(Op::Put {
+            db: 0,
+            key: Key(format!("clear-{i:05}").into_bytes()),
+            val: Value(v),
+        });
+    }
+    ops.push(Op::Commit);
+    ops.push(Op::BeginRw);
+    ops.push(Op::ClearDb { db: 0 });
+    ops.push(Op::Commit);
+    for i in 0..24u32 {
+        ops.push(Op::BeginRw);
+        for j in 0..=rng.below(2) {
+            let mut v = vec![0u8; 16 + rng.below(200)];
+            rng.fill(&mut v);
+            ops.push(Op::Put {
+                db: 0,
+                key: Key(format!("after-{i:02}-{j}").into_bytes()),
+                val: Value(v),
+            });
+        }
+        ops.push(Op::Commit);
+    }
+    ops
 }
 
 /// A spill cycle's bulk phase (ADR-0017): one committed txn of 1,200 puts,

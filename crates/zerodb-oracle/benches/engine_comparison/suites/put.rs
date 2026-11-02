@@ -21,6 +21,11 @@
 //! * `cursor/rewrite` — the same-size overwrites of `over/same_size`, reached
 //!   through the write cursor (`range_mut` + `put_current`) instead of by key:
 //!   the only rung where the cursor's position after a put costs anything.
+//! * `cursor/rewrite_reserved`, `cursor/rewrite_reserved_ovf` — the same
+//!   cursor rewrite through the cursor's `MDB_RESERVE` form
+//!   (`put_current_reserved_with_flags`), with a `VAL`-byte value and with a
+//!   two-page overflow value: the value is written into the reserved space,
+//!   so read them against `cursor/rewrite` for the cost of the reservation.
 //! * `gc/drain_big` — overwrites whose copy-on-write pages all come from ONE
 //!   large free-list entry (a contiguous half of a 300k-key tree was deleted
 //!   first). Every other rung starts with an empty or tiny free list, so this
@@ -173,6 +178,31 @@ fn family_over(c: &mut Criterion, cfg: &Cfg) {
         &Seed::named(cfg.page, &keys, &seed_val),
         hits,
         &rewrite_val
+    );
+    g.finish();
+
+    // The same rewrite through the cursor's reserved put.
+    let mut g = group(c, "put/cursor/rewrite_reserved", hits.len());
+    pair!(
+        wr_loaded,
+        cursor_rewrite_reserved,
+        &mut g,
+        &Seed::named(cfg.page, &keys, &seed_val),
+        hits,
+        &rewrite_val
+    );
+    g.finish();
+
+    // And with a value two pages long, stored in an overflow run.
+    let ovf_val = vec![0xCDu8; 2 * cfg.page as usize];
+    let mut g = group(c, "put/cursor/rewrite_reserved_ovf", hits.len());
+    pair!(
+        wr_loaded,
+        cursor_rewrite_reserved,
+        &mut g,
+        &Seed::named(cfg.page, &keys, &seed_val),
+        hits,
+        &ovf_val
     );
     g.finish();
 }

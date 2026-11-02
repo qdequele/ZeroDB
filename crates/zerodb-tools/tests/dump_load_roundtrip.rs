@@ -69,6 +69,50 @@ fn stat_runs_on_a_closed_env() {
     assert!(report.contains("database posts:"), "stat report:\n{report}");
     assert!(report.contains("database <main>:"));
     assert!(report.contains("free_pages:"));
+    assert!(report.contains("free_records:"));
+}
+
+/// After a clear of more pages than one free-page record holds, `stat`
+/// reports the freed list as several bounded records of one freeing txn
+/// (SPEC 05 GC-5: at most 249 ids each at 4 KiB pages).
+#[test]
+fn stat_reports_bounded_free_records_after_a_large_clear() {
+    let a = TempDir::new("stat-clear");
+    {
+        let env: Env = EnvOpenOptions::new()
+            .map_size(64 << 20)
+            .page_size(4096)
+            .open(&a)
+            .unwrap();
+        let main = env.main_database();
+        let mut wtxn = env.write_txn().unwrap();
+        for i in 0u32..1500 {
+            main.put(&mut wtxn, format!("k{i:05}").as_bytes(), &[7u8; 3000])
+                .unwrap();
+        }
+        wtxn.commit().unwrap();
+        let mut wtxn = env.write_txn().unwrap();
+        main.clear(&mut wtxn).unwrap();
+        wtxn.commit().unwrap();
+    }
+    let report = zerodb_tools::commands::cmd_stat(&a).unwrap();
+    let line = report
+        .lines()
+        .find(|l| l.trim_start().starts_with("free_records:"))
+        .expect("stat prints free_records");
+    let nums: Vec<u64> = line
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|w| w.parse().ok())
+        .collect();
+    let (records, txns, longest) = (nums[0], nums[1], nums[2]);
+    assert!(
+        records >= 7,
+        "1,500 freed pages in {records} records: {line}"
+    );
+    assert_eq!(txns, 1, "{line}");
+    assert!(longest <= 249, "{line}");
+    let (check, clean) = zerodb_tools::commands::cmd_check(&a).unwrap();
+    assert!(clean, "{check}");
 }
 
 /// Dump `src`, load the dump into a fresh env, check it, dump it again and

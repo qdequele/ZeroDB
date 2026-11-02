@@ -24,8 +24,9 @@ zerodb-tools --help
 ## Commands
 
 **`stat <env-dir>`** prints environment and per-database statistics: page
-size, map size, disk size, used and free pages, and for each database its
-depth, page counts by kind and entry count.
+size, map size, disk size, used and free pages, the free-page records (how
+many, from how many freeing transactions, and the longest one's page count),
+and for each database its depth, page counts by kind and entry count.
 
 **`dump <env-dir> [--out FILE]`** writes a logical dump of every database in
 `mdb_dump`'s text format (`VERSION=3`, one block per database, hex

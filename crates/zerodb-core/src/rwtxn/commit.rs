@@ -75,11 +75,13 @@ impl<'env> RwTxn<'env> {
     /// End this txn in the slot table (ADR-0024): publish what it opened on a
     /// commit, free it otherwise. A txn that opened nothing returns at once.
     pub(super) fn end_handles(&mut self, committed: bool) {
-        if self.handles.is_idle() {
+        let Some(work) = self.work.as_deref_mut() else {
+            return;
+        };
+        if work.handles.is_idle() {
             return;
         }
-        let env = self.env;
-        env.inner().handles().end(&mut self.handles, committed);
+        self.env.inner().handles().end(&mut work.handles, committed);
     }
 
     /// The one commit function (ADR-0004): steps C1–C6 in textual order,
@@ -159,11 +161,8 @@ impl<'env> RwTxn<'env> {
         // GC-32 (ADR-0022): in annex mode this txn's freed PIL rides in the
         // meta itself — `freed` is final after C1 and already sorted/deduped
         // (GC-3/4); `freelist_save` guaranteed it fits the cap.
-        let annex: &[u64] = if self.annex_out {
-            &work_mut!(self).freed
-        } else {
-            &[]
-        };
+        let work = work_mut!(self);
+        let annex: &[u64] = if self.annex_out { &work.freed } else { &[] };
         let meta = MetaPage {
             pgno: slot,
             txnid: self.txnid,
@@ -177,25 +176,27 @@ impl<'env> RwTxn<'env> {
             main_db: self.main_db,
             fl_count: annex.len() as u32,
         };
-        // The page buffer is the env's reusable one: all zero on entry and
-        // on exit, since only the encoded prefix is written and then cleared
-        // again, so a commit neither allocates nor zeroes a whole page here.
-        let mut buf = inner.meta_buf();
+        // The page buffer is the carried one (`WriterCarry::meta_buf`): only
+        // the encoded prefix is written, and cleared again after the write,
+        // so a commit neither allocates nor zeroes a whole page here.
+        let buf = &mut work.meta_buf;
         if buf.len() != psize as usize {
             *buf = vec![0u8; psize as usize];
+            work.meta_dirty = 0;
         }
+        buf[..work.meta_dirty].fill(0);
+        work.meta_dirty = MetaPage::encoded_len(annex.len()).min(buf.len());
         let written = meta
-            .encode_with_annex_over_zeroed(&mut buf, annex)
+            .encode_with_annex_over_zeroed(buf, annex)
             .map_err(map_page_err)
             .and_then(|()| {
                 inner
                     .backing_ref()
-                    .write_at_page(slot, psize, &buf)
+                    .write_at_page(slot, psize, buf)
                     .map_err(Error::from)
             });
-        let dirty = MetaPage::encoded_len(annex.len()).min(buf.len());
-        buf[..dirty].fill(0);
-        drop(buf);
+        buf[..work.meta_dirty].fill(0);
+        work.meta_dirty = 0;
         written?;
         inner.run_hook(HookPoint::H3);
         // Crash here: recovered snapshot is `N-1` (meta missing/torn → CRC
@@ -278,7 +279,7 @@ impl<'env> RwTxn<'env> {
         // then store the commit point SeqCst) — only after C5, so no reader
         // can pin `N` before it is durable (TXN-64). The next write txn of
         // this process starts from it (`WriterCarry`). -----
-        self.published = Some(Arc::clone(&snapshot));
+        work_mut!(self).snapshot = Some(Arc::clone(&snapshot));
         inner.publish_snapshot(snapshot);
         Ok(())
         // Drop of `self` releases the write mutex — the tail of C6.

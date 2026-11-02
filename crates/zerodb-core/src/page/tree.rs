@@ -312,6 +312,7 @@ impl<'a> LeafRef<'a> {
 
     /// The key bytes of entry `i`. Panics if `i >= num_keys`.
     #[must_use]
+    #[inline]
     #[allow(unsafe_code)]
     pub fn key(&self, i: usize) -> &'a [u8] {
         assert!(i < self.num_keys(), "leaf entry index out of range");
@@ -889,6 +890,7 @@ impl<'a> BranchRef<'a> {
     /// The separator key of entry `i` (empty slice for index 0). Panics if
     /// `i >= num_keys`.
     #[must_use]
+    #[inline]
     #[allow(unsafe_code)]
     pub fn key(&self, i: usize) -> &'a [u8] {
         assert!(i < self.num_keys(), "branch entry index out of range");

@@ -35,11 +35,13 @@ this section defines the **recovery decision** and its error taxonomy.
   REC-1 does **not** restate the list; it references SPEC 02 §3.2 as the
   single owner. A slot failing any
   check is **invalid** (torn or foreign) and is discarded from selection.
-  **Format-version note (ADR-0022):** `FORMAT_VERSION` is **2** since the meta
-  free-list annex landed; a version-1 store fails the
+  **Format-version note (ADR-0022, ADR-0037):** `FORMAT_VERSION` is **3**
+  since GC records became bounded with 16-byte keys (2 since the meta
+  free-list annex landed); a store of an earlier version fails the
   `format_version` check on both slots and opens as `MdbError::Invalid`
-  (REC-3). There is no in-place migration — sanctioned pre-release (ADR-0022
-  consequences; `migrate-from-lmdb` output is v2 implicitly).
+  (REC-3). There is no in-place migration — sanctioned pre-release (ADR-0022,
+  ADR-0037 consequences; `migrate-from-lmdb` output is the current version
+  implicitly).
 - **REC-1a** — **Geometry validation of the selected slot** (added 2026-09-09,
   security review H1; predicate owned by SPEC 02 §3.2 step 6). A CRC-valid slot
   can still name geometry the real file cannot back — a truncated or hostile
