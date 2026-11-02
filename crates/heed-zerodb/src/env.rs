@@ -77,6 +77,8 @@ pub struct EnvOpenOptions<T: TlsUsage = WithTls> {
     sequential_writes: bool,
     /// ADR-0017 ZeroDB extension — no heed counterpart.
     max_dirty_bytes: Option<usize>,
+    /// ADR-0036 ZeroDB extension — no heed counterpart.
+    initial_map_size: Option<usize>,
     _tls: std::marker::PhantomData<T>,
 }
 
@@ -99,6 +101,7 @@ impl EnvOpenOptions<WithTls> {
             file_trust: zerodb::FileTrust::VALIDATE,
             sequential_writes: false,
             max_dirty_bytes: None,
+            initial_map_size: None,
             _tls: std::marker::PhantomData,
         }
     }
@@ -115,6 +118,7 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
             file_trust: self.file_trust,
             sequential_writes: self.sequential_writes,
             max_dirty_bytes: self.max_dirty_bytes,
+            initial_map_size: self.initial_map_size,
             _tls: std::marker::PhantomData,
         }
     }
@@ -202,6 +206,16 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// LMDB does; results and committed files never depend on it.
     pub fn max_dirty_bytes(&mut self, bytes: usize) -> &mut Self {
         self.max_dirty_bytes = Some(bytes);
+        self
+    }
+
+    /// Grow the map on demand (**ADR-0036**). **ZeroDB extension — heed has
+    /// no such method.** Maps, and under `WRITE_MAP` preallocates, only
+    /// `size` bytes at open; a write txn grows both up to `map_size`, the
+    /// ceiling, instead of failing with `MdbError::MapFull`, which fires only
+    /// past the ceiling. `info().map_size` reports the ceiling.
+    pub fn initial_map_size(&mut self, size: usize) -> &mut Self {
+        self.initial_map_size = Some(size);
         self
     }
 
@@ -297,6 +311,9 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         opts.sequential_writes(self.sequential_writes);
         if let Some(b) = self.max_dirty_bytes {
             opts.max_dirty_bytes(b);
+        }
+        if let Some(n) = self.initial_map_size {
+            opts.initial_map_size(n);
         }
         // ADR-0023: the lock file (`lock.mdb`) is on, as in
         // LMDB; heed's `NO_LOCK` turns it off

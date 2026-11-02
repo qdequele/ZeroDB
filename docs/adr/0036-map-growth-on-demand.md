@@ -1,7 +1,8 @@
 # ADR-0036: Grow the memory map on demand, behind an option
 
 - Status: Accepted (Option A-min, without shrinking; approved by the
-  maintainer on 2026-11-02); not implemented
+  maintainer on 2026-11-02); spike done (results below), staged
+  implementation not started
 - Related: issue #33; ADR-0004 (mapping strategy), ADR-0017 (spilling),
   ADR-0021 (in-place `WRITE_MAP`), ADR-0023 (multi-process access,
   amendment 15: `resize` and grow-only mappings), ADR-0026 (ranged `msync`);
@@ -313,6 +314,103 @@ implementation starts with a spike on the riskiest assumption: in-place
 `WRITE_MAP` pages stored through an older mapping, flushed by a ranged
 `msync` through a newer one, read back after a crash, on macOS and Linux,
 together with the heap-mode view re-derivation after a growth.
+
+## Spike results (2026-11-02)
+
+### The riskiest assumption holds on both systems
+
+`crates/zerodb-io/src/mmap.rs`, test
+`a_flush_through_a_newer_mapping_writes_back_older_stores`: two writable
+mappings of one file, the older one shorter, as after a growth. A store
+through the older mapping is followed by one of three flushes, and the test
+checks that the process's disk-write counter moved by at least one OS page
+(`/proc/self/io` on Linux, `proc_pid_rusage` on macOS) and, on macOS, that
+`mincore` reports the page dirty after the store and clean after the flush.
+
+| Flush after a store through the older mapping | macOS (Apple silicon, APFS) | Linux (aarch64 VM, overlay on its disk) |
+|---|---|---|
+| `msync` of the range through the older mapping (control) | written back | written back |
+| `msync` of the range through the newer mapping | written back | written back |
+| `fdatasync` of the descriptor alone | written back | written back |
+
+A synchronous `WRITE_MAP` commit does both of the last two (a ranged `msync`
+through the newest mapping, then `fdatasync`), so a page stored in place
+before a growth is made durable by the commit after it. What the test shows
+is writeback to the device, not survival of a power cut, which needs real
+hardware; the crash harness below covers the engine's ordering. The probe
+adds test-only `unsafe` calls in `zerodb-io` (`sysconf`, `mincore`,
+`proc_pid_rusage`), which the `unsafe` policy must list if the test is kept.
+
+### The engine change is small
+
+The prototype touches no mapping code, no lock file, no reader table and
+no on-disk format:
+
+- `EnvOpenOptions::initial_map_size` on the native and heed builders. Open
+  maps the initial size (or what the data needs) and records `map_size` as
+  the ceiling on the environment.
+- `RwTxn::allocate`, where it returned `MapFull`, now calls a cold
+  `grow_map_for`: past the ceiling it is still `MapFull`; otherwise it grows
+  the logical size to at least twice its value, capped at the ceiling,
+  through the backing's existing `grow_map` (the file first under
+  `WRITE_MAP`, then a new mapping), and in heap modes re-derives the writer's
+  cached view, as after a spill. A failed `mmap` or `set_len` returns the
+  I/O error (question 4's recommendation).
+- `Env::info` reports the ceiling; `Env::resize` with a non-zero size sets
+  the ceiling under the option.
+
+### What the spike changes in the design
+
+1. **The mapping keeps covering the logical size.** The Decision describes
+   a logical size equal to the ceiling with a shorter mapping. The spike
+   instead grows the logical size itself and keeps the ceiling beside it, so
+   the existing invariant "the published mapping covers the logical size"
+   still holds and nothing that reads the view changed. Consequence: a commit
+   persists the size grown so far, not the ceiling (the existing rule,
+   `max(base meta map_size, own map_size)`), so a plain process that adopts
+   it with `resize(0)` maps what the data needs. Recommended: keep this.
+2. **The free-list save must not see the growth.** Its top-of-file
+   completion (`loose_run`) checked the logical size; with growth on it chose
+   a different run than a fixed map would. It now checks the ceiling and the
+   caller grows the map to cover the extension. Found by the differential
+   test below.
+3. **Growth at allocation in every mode is correct.** Deferring it to the
+   first spill read or to commit without `WRITE_MAP` remains an optimisation;
+   the spike did not need it.
+4. **Begin-time extension was not built.** Another process still gets
+   `MapResized` and recovers with `resize(0)`, as the two-process tests show;
+   with point 1 that is LMDB's behaviour unchanged. Whether to add it is
+   left to the staged implementation.
+
+### Tests run
+
+- `crates/zerodb/tests/map_growth.rs`, 8 tests, on macOS:
+  - a seeded workload of three 8,000-op transactions, with the smallest
+    dirty limit so pages spill past the old mapping mid-txn, gives the same
+    contents and the same high-water page as a fixed map of the ceiling's
+    size, in heap, in-place `WRITE_MAP` and durable `WRITE_MAP` modes, before
+    and after reopen with and without the option; a value borrowed before
+    any growth is intact after all of them; under `WRITE_MAP` the file stays
+    far below the ceiling, while the fixed map's file is the full ceiling;
+  - `MapFull` comes at the same put, with the same high-water page, as with
+    a fixed map of the ceiling, with and without `WRITE_MAP`;
+  - two processes: a plain reader keeps its borrow while the other process
+    grows the map, then gets `MapResized` and follows with `resize(0)`; a
+    second `WRITE_MAP` process with the option joins after the first grew
+    the file, adopts the size and grows the map and the file again.
+- Crash harness, with growth on a third of cycles (the cycle spec draws it
+  last, so other seeds keep their earlier fields): 3,086 image-cut states,
+  927 states from mixed image and SIGKILL cycles, and 157 multi-process
+  cycles, all verified, none abandoned. A new summary line counts image cuts
+  whose map grew before the cut: 35 cuts (about 420 crash states) in the
+  image run.
+- `cargo test --workspace` on macOS, and `cargo clippy -D warnings` on
+  macOS and for `x86_64-unknown-linux-gnu`. Not run: miri, loom, fuzzing,
+  the stress test and the consumer gate.
+
+Not measured: performance. The steady-state path is unchanged (the extra
+code runs only where `MapFull` was returned), but the three-column gate in
+Consequences still applies to the staged implementation.
 
 ## Consequences
 

@@ -118,7 +118,15 @@ pub struct Spec {
     /// LMDB's default (no spill at this workload's size). The SIGKILL child
     /// opens through the public option, which raises it to that floor.
     pub dirty_limit: Option<u64>,
+    /// Map growth (ADR-0036) on ~1/3 of cycles: the map and, under
+    /// `WRITE_MAP`, the file start at [`GROWTH_INITIAL`] and grow inside
+    /// write txns up to `map_size`, so cuts land before, during and after
+    /// growths.
+    pub growth: bool,
 }
+
+/// The initial map size of a growth cycle (ADR-0036).
+pub const GROWTH_INITIAL: u64 = 64 << 10;
 
 /// Ops decoded per workload round (mechanism B loops rounds so an async kill
 /// lands mid-run; mechanism A uses round 0).
@@ -142,6 +150,8 @@ pub fn gen_spec(seed: u64) -> Spec {
     let map_size: u64 = if big { 128 << 20 } else { 64 << 20 };
     // Drawn last so every earlier field keeps its value for a given seed.
     let dirty_limit = rng.ratio(1, 3).then(|| 8 + rng.below(120) as u64);
+    // Drawn after `dirty_limit` for the same reason.
+    let growth = rng.ratio(1, 3);
     Spec {
         seed,
         mode,
@@ -149,6 +159,7 @@ pub fn gen_spec(seed: u64) -> Spec {
         map_size,
         big,
         dirty_limit,
+        growth,
     }
 }
 

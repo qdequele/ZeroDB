@@ -235,6 +235,8 @@ pub struct EnvOpenOptions {
     sequential_writes: bool,
     /// Dirty limit in bytes (ADR-0017); `None` = LMDB's default.
     max_dirty_bytes: Option<usize>,
+    /// Map-growth initial size (ADR-0036); `None` = LMDB's fixed size.
+    initial_map_size: Option<u64>,
     /// Whether to coordinate through a cross-process lock file (ADR-0023).
     lock_file: bool,
     /// The lock file's explicit name, when `lock_file` is set; `None` derives
@@ -264,6 +266,7 @@ impl EnvOpenOptions {
             file_trust: FileTrust::VALIDATE,
             sequential_writes: false,
             max_dirty_bytes: None,
+            initial_map_size: None,
             // ADR-0023: the lock file is on by default, as in LMDB;
             // `lock_file(false)` (heed's `NO_LOCK`) opts out.
             lock_file: true,
@@ -432,6 +435,17 @@ impl EnvOpenOptions {
     /// for extra writes in very large txns.
     pub fn max_dirty_bytes(&mut self, bytes: usize) -> &mut EnvOpenOptions {
         self.max_dirty_bytes = Some(bytes);
+        self
+    }
+
+    /// Grow the map on demand (ADR-0036; LMDB has no such option): map, and
+    /// under `WRITE_MAP` preallocate, only `size` bytes at open (or what the
+    /// data already needs), and let a write txn grow both up to
+    /// [`EnvOpenOptions::map_size`], the ceiling, instead of failing with
+    /// [`MdbError::MapFull`]. `MapFull` fires only past the ceiling, which
+    /// [`Env::info`] reports as `map_size`. Off by default.
+    pub fn initial_map_size(&mut self, size: usize) -> &mut EnvOpenOptions {
+        self.initial_map_size = Some(size as u64);
         self
     }
 
@@ -641,7 +655,9 @@ impl EnvOpenOptions {
         let opened = zerodb_io::open_or_create_with_advice(
             &data_path,
             self.page_size,
-            self.map_size,
+            // ADR-0036: with map growth, map only the initial size; the
+            // ceiling is set on the environment below.
+            self.initial_map_size.or(self.map_size),
             DEFAULT_MAP_SIZE,
             read_only,
             durability.write_map,
@@ -675,6 +691,9 @@ impl EnvOpenOptions {
             // the lock file before returning the error.
             lock.map(|l| l as std::sync::Arc<dyn zerodb_core::shared::SharedRegion>),
         )?;
+        if self.initial_map_size.is_some() {
+            env.enable_map_growth(self.map_size.unwrap_or(DEFAULT_MAP_SIZE));
+        }
         Ok(env)
     }
 }

@@ -330,6 +330,8 @@ pub fn open_with_backing_shared(
         closing,
         holds_election: AtomicBool::new(holds_election),
         has_unpublished: AtomicBool::new(newer_on_disk.is_some()),
+        // ADR-0036: growth is off until `Env::enable_map_growth`.
+        map_ceiling: AtomicU64::new(0),
         unpublished: Mutex::new(newer_on_disk),
         shared,
     });

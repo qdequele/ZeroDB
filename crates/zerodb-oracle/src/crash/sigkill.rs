@@ -129,6 +129,9 @@ pub fn child_run(seed: u64, dir: &Path, kill: &str, lock_file: bool) -> ! {
     if let Some(pages) = spec.dirty_limit {
         opts.max_dirty_bytes(pages as usize * spec.page_size as usize);
     }
+    if spec.growth {
+        opts.initial_map_size(super::workload::GROWTH_INITIAL as usize);
+    }
     let env = match opts.open(dir) {
         Ok(e) => e,
         Err(e) => {

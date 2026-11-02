@@ -454,3 +454,157 @@ mod tests {
         assert_eq!((m.bytes().len(), size), (512, 300));
     }
 }
+
+/// Two writable mappings of one file (ADR-0036): a store made through the
+/// older, shorter mapping must be written back by a flush through the newer
+/// one, since commit flushes only through the newest view. Writeback is
+/// observed through the process's disk-write counter (`/proc/self/io` on
+/// Linux, `proc_pid_rusage` on macOS) and, on macOS, through `mincore`'s
+/// modified bits.
+#[cfg(all(test, not(miri), any(target_os = "linux", target_os = "macos")))]
+mod cross_mapping_flush_tests {
+    use super::MmapWritable;
+    use std::fs::{File, OpenOptions};
+
+    struct TempFile(std::path::PathBuf);
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn os_page() -> usize {
+        // SAFETY: `sysconf` reads a process constant; no memory is touched.
+        let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(n).expect("positive page size")
+    }
+
+    /// Bytes this process has caused to be written to storage.
+    #[cfg(target_os = "linux")]
+    fn disk_bytes_written() -> Option<u64> {
+        let io = std::fs::read_to_string("/proc/self/io").ok()?;
+        io.lines()
+            .find_map(|l| l.strip_prefix("write_bytes: "))?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Bytes this process has caused to be written to storage.
+    #[cfg(target_os = "macos")]
+    fn disk_bytes_written() -> Option<u64> {
+        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
+        // SAFETY: `info` is a writable `rusage_info_v2`, the struct the
+        // `RUSAGE_INFO_V2` flavor fills; the kernel writes nothing else.
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V2,
+                info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+            )
+        };
+        // SAFETY: on success the kernel initialized the whole struct.
+        (rc == 0).then(|| unsafe { info.assume_init() }.ri_diskio_byteswritten)
+    }
+
+    /// Whether the OS page at `off` of `map` is dirty (macOS `mincore`).
+    #[cfg(target_os = "macos")]
+    fn dirty(map: &MmapWritable, off: usize) -> bool {
+        let mut vec: libc::c_char = 0;
+        // SAFETY: `off` is OS-page aligned and inside the mapping, so the
+        // one-page range is mapped; `vec` holds the one status byte.
+        let rc =
+            unsafe { libc::mincore(map.bytes().as_ptr().add(off).cast_mut().cast(), 1, &mut vec) };
+        assert_eq!(rc, 0, "mincore: {}", std::io::Error::last_os_error());
+        i32::from(vec) & (libc::MINCORE_MODIFIED | libc::MINCORE_MODIFIED_OTHER) != 0
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dirty(_: &MmapWritable, _: usize) -> bool {
+        // Linux `mincore` reports residency only.
+        false
+    }
+
+    fn store(map: &MmapWritable, off: usize, len: usize, fill: u8) {
+        // SAFETY: single-threaded test, no borrow of the map is live, and
+        // the range is inside both the mapping and the file.
+        unsafe { map.write_at(off, &vec![fill; len]) };
+    }
+
+    /// How a store through `old` is made durable in each case below.
+    fn written_back(file: &File, old: &MmapWritable, new: &MmapWritable, how: &str) -> u64 {
+        let os = os_page();
+        let off = os; // page 1: inside both mappings
+        let fill = how.len() as u8;
+        store(old, off, os, fill);
+        if cfg!(target_os = "macos") {
+            assert!(
+                dirty(old, off) || dirty(new, off),
+                "{how}: the store left the page clean"
+            );
+        }
+        let before = disk_bytes_written().expect("disk-write counter");
+        match how {
+            "msync-old" => old.flush_range(off, os, false).expect("msync"),
+            "msync-new" => new.flush_range(off, os, false).expect("msync"),
+            "fdatasync" => file.sync_data().expect("fdatasync"),
+            _ => unreachable!(),
+        }
+        let after = disk_bytes_written().expect("disk-write counter");
+        assert!(
+            !dirty(old, off) && !dirty(new, off),
+            "{how}: page still dirty"
+        );
+        assert_eq!(
+            new.bytes()[off],
+            fill,
+            "{how}: the newer mapping sees the store"
+        );
+        after - before
+    }
+
+    #[test]
+    fn a_flush_through_a_newer_mapping_writes_back_older_stores() {
+        let os = os_page();
+        let path = TempFile(std::env::current_dir().expect("cwd").join(format!(
+            "zerodb-cross-map-{}-{}.dat",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path.0)
+            .expect("create");
+        file.set_len(8 * os as u64).expect("set_len");
+        // The older mapping covers 2 OS pages, the newer one the whole file,
+        // as after a growth.
+        let old = MmapWritable::map(&file, 2 * os).expect("map old");
+        let new = MmapWritable::map(&file, 8 * os).expect("map new");
+        if disk_bytes_written().is_none() {
+            eprintln!("no disk-write counter on this system; skipped");
+            return;
+        }
+        // Control: the flush through the mapping that stored.
+        let control = written_back(&file, &old, &new, "msync-old");
+        eprintln!("msync through the storing mapping: {control} bytes written");
+        if control == 0 {
+            eprintln!("the counter did not move for the control; skipped");
+            return;
+        }
+        let through_new = written_back(&file, &old, &new, "msync-new");
+        eprintln!("msync through the newer mapping: {through_new} bytes written");
+        assert!(
+            through_new >= os as u64,
+            "msync through the newer mapping wrote nothing"
+        );
+        let fsync = written_back(&file, &old, &new, "fdatasync");
+        eprintln!("fdatasync alone: {fsync} bytes written");
+        assert!(fsync >= os as u64, "fdatasync wrote nothing");
+    }
+}

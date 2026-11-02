@@ -379,6 +379,7 @@ fn main() {
          stale fallbacks : {} (NO_META_SYNC reclaim-clobber window, REC-10 as amended — walk/data waived)\n\
          spilling txns   : {} image, {} sigkill + mp (ADR-0017 spill cycles)\n\
          in-place regions: {} (ADR-0021: brokered map regions journaled by WRITE_MAP image cuts)\n\
+         grown maps      : {} image cuts (ADR-0036: growth cycles whose map grew before the cut)\n\
          wall time       : {:.1}s ({:.1} cycles/s)",
         t.verified,
         t.image_cuts,
@@ -396,6 +397,7 @@ fn main() {
         zerodb_oracle::crash::model::SPILLED_TXNS.load(Ordering::Relaxed),
         t.sigkill_spilled,
         t.map_regions,
+        zerodb_oracle::crash::image::GROWN_CYCLES.load(Ordering::Relaxed),
         secs,
         t.verified as f64 / secs.max(0.001),
     );
