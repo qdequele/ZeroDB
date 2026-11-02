@@ -158,6 +158,10 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
   hands the closure the old value's bytes; and a rejected `NO_OVERWRITE` or
   `APPEND` leaves the cursor where LMDB does. The native API gains
   `RwCursor::put_reserved`.
+- The write cursor's `put_current_with_options` (natively `RwCursor::put`)
+  leaves the cursor where LMDB does when it returns `KeyExist`: on the existing
+  key under `NO_OVERWRITE`, on the last entry under `APPEND`. It left the
+  cursor where it was, so the next `next()` yielded a different entry.
 - A commit no longer panics with "freelist_save failed to reach a fixed
   point" when the committing transaction's freed-page record sits at an
   overflow page-count boundary.

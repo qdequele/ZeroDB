@@ -942,6 +942,16 @@ value of the entry at `ki[top]` **keeping the key**:
   > `==` last both `KeyExist` while the cursor is parked at the *last* entry, and
   > the stored value is left unmodified. Verified against the fork through heed
   > 0.22.1, matching SPEC 01 §S1.)
+- **Position after a rejected flagged put.** A `put_current_with_options` that
+  returns `KeyExist` still moves the cursor, as LMDB's `mdb_cursor_put` does:
+  under `NO_OVERWRITE` onto the existing key it found (so `next` yields that
+  key's successor, wherever the cursor was parked); under `APPEND` onto the last
+  entry, which the key was compared with (so `next` yields `None`, and `prev`
+  through `rev_iter_mut` the entry before the last). Nothing is written.
+
+  > Pinned by `crates/zerodb-oracle/tests/differential/cursor_put_position.rs`
+  > (`rejected_no_overwrite_*`, `rejected_append_*`; fork through heed 0.22.1
+  > against `heed-zerodb`, forward and backward).
 - `RESERVE` form (`RwCursor::put_reserved`, heed's
   `put_current_reserved_with_flags`): places the value first, then hands the
   caller the reserved bytes inside the dirty leaf (or the overflow run's head)

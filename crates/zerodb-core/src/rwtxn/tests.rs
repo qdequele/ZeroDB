@@ -1948,6 +1948,42 @@ fn cursor_reserve_rejections_never_call_the_closure() {
     }
 }
 
+/// A cursor put rejected with `KeyExist` changes nothing and leaves the
+/// cursor where LMDB leaves it, as the reserved form does.
+#[test]
+fn cursor_put_key_exist_moves_the_cursor_as_lmdb() {
+    let env = mem_env(PS, MAP);
+    let db = env.main_database();
+    let mut txn = env.write_txn().unwrap();
+    for i in 0..50u32 {
+        let (k, v) = kv(i);
+        db.put(&mut txn, &k, &v).unwrap();
+    }
+    let before = dump(&txn);
+    let (k10, _) = kv(10);
+    let cases: [(PutFlags, Vec<u8>, Option<Vec<u8>>); 4] = [
+        // NO_OVERWRITE leaves the cursor on the existing key, ahead or behind.
+        (PutFlags::NO_OVERWRITE, kv(20).0, Some(kv(21).0)),
+        (PutFlags::NO_OVERWRITE, kv(3).0, Some(kv(4).0)),
+        // APPEND compared with the last entry and stays on it.
+        (PutFlags::APPEND, k10.clone(), None),
+        (PutFlags::APPEND, kv(49).0, None),
+    ];
+    for (flags, key, next) in cases {
+        let mut c = db.rw_cursor(&mut txn);
+        c.seek_ge(&k10).unwrap();
+        let r = c.put(flags, &key, b"v");
+        assert!(
+            matches!(r, Err(Error::Mdb(MdbError::KeyExist))),
+            "{flags:?}: {r:?}"
+        );
+        let got = c.move_next().unwrap().map(|(k, _)| k.to_vec());
+        assert_eq!(got, next, "{flags:?}: cursor position");
+        drop(c);
+        assert_eq!(dump(&txn), before, "{flags:?}: content changed");
+    }
+}
+
 /// Cursor reserves on a sequential-writes tree take its keyed path: an
 /// appended key past the end and a plain overwrite both land in place.
 #[test]

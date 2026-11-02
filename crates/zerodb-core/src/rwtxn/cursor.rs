@@ -537,7 +537,9 @@ impl RwCursor<'_, '_> {
     /// General put through the cursor — exactly [`Database::put_with_flags`]
     /// (same flag semantics, SPEC 01 §S1/§S2), leaving the cursor positioned
     /// on `key` (the heed `RwIter::put_current(key, ..)` primitive, which may
-    /// write a key other than the one under the cursor).
+    /// write a key other than the one under the cursor). A put rejected with
+    /// [`MdbError::KeyExist`] leaves the cursor where LMDB does: on the
+    /// existing key under `NO_OVERWRITE`, on the last entry under `APPEND`.
     ///
     /// # Errors
     ///
@@ -550,9 +552,14 @@ impl RwCursor<'_, '_> {
         if flags == PutFlags::EMPTY && self.put_at_parked(tree, key, ValSrc::Val(value))? {
             return Ok(());
         }
-        self.txn
-            .put_tree(tree, key, flags, ValSrc::Val(value))
-            .map(|_| ())?;
+        match self.txn.put_tree(tree, key, flags, ValSrc::Val(value)) {
+            Ok(_) => {}
+            Err(e @ Error::Mdb(MdbError::KeyExist)) => {
+                self.park_on_existing(flags, key)?;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        }
         self.saved = None;
         self.on_vacated_slot = false;
         self.pos = CurPos::At(key.to_vec());
