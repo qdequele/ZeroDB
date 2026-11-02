@@ -1,6 +1,6 @@
 # ADR-0040: Refuse unknown persisted flag bits at open
 
-- Status: Proposed
+- Status: Accepted (Option B, maintainer decision 2026-11-02), not implemented
 - Related issue: #72 (the duplicate-key spike that found the gap)
 - Date: 2026-11-02
 
@@ -222,15 +222,16 @@ Against today's engine; "LMDB" says where LMDB stands on the same line.
 
 ## Decision
 
-Recommended: **Option B**, implemented before the next release, with
-`Incompatible` for both checks. It is the smallest change that lets duplicate
-keys, a comparator fingerprint or any env-wide flag land without a format
-bump, and it fixes the commit that erases `env_flags` before anything sets
-it. Option C is cheap and only possible now, but no planned feature needs an
-optional or read-compatible bit; open question 2 asks whether to fix the
-classes anyway.
+**Option B**: maintainer decision 2026-11-02, as recommended: implemented
+before the next release, with `Incompatible` for both checks and
+`leaf2_ksize` refused as one field. Every `env_flags` bit is required; there
+are no compatibility classes. The draft's reasoning, kept for the record:
 
-Awaiting the maintainer's decision. No code changes until it is approved.
+It is the smallest change that lets duplicate keys, a comparator fingerprint
+or any env-wide flag land without a format bump, and it fixes the commit
+that erases `env_flags` before anything sets it. Option C is cheap and only
+possible now, but no planned feature needs an optional or read-compatible
+bit.
 
 ## Consequences
 
@@ -264,13 +265,17 @@ Awaiting the maintainer's decision. No code changes until it is approved.
 
 ## Open questions for human review
 
-1. The env-level error: `Incompatible` (recommended) or a new
+1. ~~The env-level error: `Incompatible` (recommended) or a new
    `VersionMismatch`, LMDB's code for a file of another data version, which
-   would then also replace `Invalid` for a format-version mismatch?
-2. Fix compatibility classes for `env_flags` now (Option C), while it is
-   still possible, or keep every bit required (Option B)?
-3. `leaf2_ksize`: refuse any nonzero value as one field (recommended), or
+   would then also replace `Invalid` for a format-version mismatch?~~
+   Closed (maintainer, 2026-11-02, with Option B as recommended):
+   `Incompatible`.
+2. ~~Fix compatibility classes for `env_flags` now (Option C), while it is
+   still possible, or keep every bit required (Option B)?~~ Closed
+   (maintainer, 2026-11-02): Option B, every bit required.
+3. ~~`leaf2_ksize`: refuse any nonzero value as one field (recommended), or
    treat it now as two 16-bit halves (a fixed item size at offset 44 and a
    fingerprint at 46, as the spike laid out) so each half can be claimed
    separately? Both refuse every file today's engine would misread; the
-   choice only shapes how a later feature claims the bytes.
+   choice only shapes how a later feature claims the bytes.~~ Closed
+   (maintainer, 2026-11-02, with Option B as recommended): one field.

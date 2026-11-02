@@ -49,4 +49,4 @@ tracked in GitHub issues. To propose a decision, copy
 | 0037 | [Bounded free-page records](adr/0037-bounded-free-page-records.md) | Accepted (Option C), implemented | On-disk format, page reclamation |
 | 0038 | [Bounded relaxed durability: steady and weak metas, a durable watermark](adr/0038-bounded-relaxed-durability.md) | Proposed | Durability, page reclamation, on-disk format |
 | 0039 | [Group commit: start the next write transaction during the previous commit's sync](adr/0039-group-commit.md) | Proposed (recommends not building it now) | Durability, concurrency, beyond LMDB |
-| 0040 | [Refuse unknown persisted flag bits at open](adr/0040-refuse-unknown-flag-bits.md) | Proposed | On-disk format, open protocol, beyond LMDB |
+| 0040 | [Refuse unknown persisted flag bits at open](adr/0040-refuse-unknown-flag-bits.md) | Accepted (Option B), not implemented | On-disk format, open protocol, beyond LMDB |
