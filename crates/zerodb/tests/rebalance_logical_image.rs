@@ -409,17 +409,19 @@ fn churn_reinsert(flags: EnvFlags) -> u64 {
     r.finish()
 }
 
-/// Recorded on the engine before the ADR-0028 change (main at f98cd08), at a
-/// 64 MiB map (see the module docs to regenerate).
+/// Recorded at a 64 MiB map with on-disk format version 3 (see the module
+/// docs to regenerate). The digests cover the compacting copy's meta pages,
+/// so a format version bump changes all of them; with the version held, only
+/// a change to the tree shape or the allocation order moves one.
 const GOLDEN: &[(&str, Workload, u64)] = &[
-    ("ascending_drain", ascending_drain, 0x0bbfd378eedf36aa),
-    ("descending_drain", descending_drain, 0x6738322c1de4c585),
-    ("cursor_drain", cursor_drain, 0x641245be963b8e41),
-    ("crud_random", crud_random, 0xb6f370b6839111ab),
-    ("variable_keys", variable_keys, 0x615ffce7ec930f9f),
-    ("wide_keys_deep", wide_keys_deep, 0xf631cac21fb2d132),
-    ("overflow_mix", overflow_mix, 0x1d2d5cccd96c3ca4),
-    ("churn_reinsert", churn_reinsert, 0xdb7fa7ecf7640449),
+    ("ascending_drain", ascending_drain, 0x621823967f50c902),
+    ("descending_drain", descending_drain, 0x4465170729ddc079),
+    ("cursor_drain", cursor_drain, 0x83771ae993cb4821),
+    ("crud_random", crud_random, 0x08a5c4586548f15b),
+    ("variable_keys", variable_keys, 0xae6fbbe03ddd2b8f),
+    ("wide_keys_deep", wide_keys_deep, 0xf152bb280197b662),
+    ("overflow_mix", overflow_mix, 0xb8a25a6f8bb003d2),
+    ("churn_reinsert", churn_reinsert, 0x400deabdb7daf13d),
 ];
 
 #[test]

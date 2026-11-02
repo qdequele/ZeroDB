@@ -3,12 +3,19 @@
 //!
 //! Feeds arbitrary bytes to the SPEC 02 page decoder under a page-size sweep
 //! (4096 / 8192 / 65536), forcing every page-type interpretation, and walks
-//! every accessor on any view that constructs. The decoder must return typed
-//! errors only — it must never panic — for untrusted input.
+//! every accessor on any view that constructs. Every leaf entry is also
+//! decoded as a GC record (16-byte key, page-id list; SPEC 05 GC-1..5). The
+//! decoder must return typed errors only — it must never panic — for
+//! untrusted input.
 
 use libfuzzer_sys::fuzz_target;
+use zerodb_core::page::geometry::{
+    gc_chunk_cap, gc_key_decode, gc_key_encode, pil_count, pil_decode, pil_encode_into, pil_size,
+    GC_KEY_SIZE,
+};
 use zerodb_core::page::{
-    BranchRef, LeafRef, MetaPage, OverflowRef, PageRef, P_BRANCH, P_LEAF, P_META, P_OVERFLOW,
+    BranchRef, LeafRef, LeafValue, MetaPage, OverflowRef, PageRef, P_BRANCH, P_LEAF, P_META,
+    P_OVERFLOW,
 };
 
 const PSIZES: [u32; 3] = [4096, 8192, 65536];
@@ -22,7 +29,7 @@ fn walk_page(p: &PageRef<'_>) {
     let _ = p.page_type();
     let _ = p.page_size();
     if let Ok(leaf) = p.as_leaf() {
-        walk_leaf(&leaf);
+        walk_leaf(&leaf, p.page_size());
     }
     if let Ok(branch) = p.as_branch() {
         walk_branch(&branch);
@@ -38,14 +45,37 @@ fn walk_page(p: &PageRef<'_>) {
     let _ = p.as_meta();
 }
 
-fn walk_leaf(leaf: &LeafRef<'_>) {
+fn walk_leaf(leaf: &LeafRef<'_>, psize: u32) {
     for i in 0..leaf.num_keys() {
-        let _ = leaf.key(i);
-        let _ = leaf.value(i);
+        let key = leaf.key(i);
+        let value = leaf.value(i);
         let _ = leaf.node_flags(i);
+        if let LeafValue::Inline(val) = value {
+            walk_gc_record(key, val, psize);
+        }
     }
     let _ = leaf.lookup(b"probe");
     let _ = leaf.free_space();
+}
+
+/// Decode a leaf entry as a GC record (SPEC 05 GC-1..5): the key decodes
+/// exactly when it is 16 bytes and then re-encodes to itself, the two PIL
+/// decoders agree, and a list the writer would store (at most
+/// `gc_chunk_cap` ids) re-encodes to the same bytes.
+fn walk_gc_record(key: &[u8], val: &[u8], psize: u32) {
+    match gc_key_decode(key) {
+        Some(k) => assert_eq!(&gc_key_encode(k)[..], key),
+        None => assert_ne!(key.len(), GC_KEY_SIZE),
+    }
+    let ids = pil_decode(val);
+    assert_eq!(pil_count(val), ids.as_ref().map(|v| v.len() as u64));
+    if let Some(ids) = ids {
+        if ids.len() <= gc_chunk_cap(psize) {
+            let mut buf = vec![0u8; pil_size(ids.len())];
+            pil_encode_into(&ids, &mut buf);
+            assert_eq!(buf, val);
+        }
+    }
 }
 
 fn walk_branch(branch: &BranchRef<'_>) {
@@ -83,7 +113,7 @@ fuzz_target!(|data: &[u8]| {
                 walk_page(&p);
             }
             // Also drive the type-specific constructors directly.
-            let _ = LeafRef::new(&buf, psize).map(|l| walk_leaf(&l));
+            let _ = LeafRef::new(&buf, psize).map(|l| walk_leaf(&l, psize));
             let _ = BranchRef::new(&buf, psize).map(|b| walk_branch(&b));
             let _ = OverflowRef::new(&buf, psize).map(|o| o.payload(1234));
             let _ = MetaPage::validate(&buf, psize);

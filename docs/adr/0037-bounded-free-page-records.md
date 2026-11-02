@@ -1,6 +1,6 @@
 # ADR-0037: Bounded free-page records
 
-- Status: Accepted (Option C, maintainer decision 2026-11-02); not implemented
+- Status: Accepted (Option C, maintainer decision 2026-11-02); implemented
 - Related issue: #30 (also #146, cost 3; #32)
 - Date: 2026-11-02
 

@@ -214,6 +214,7 @@ LMDB". Ratios are before → after.
 | <a id="b18"></a>Dirty frame pool | Page buffers are reused within and across write txns, as LMDB's `me_dpages`. | `put/gc/drain_big` 1.58× → 1.17× |
 | <a id="b7"></a>O(1) free-list draw; meta free-list annex | Drawing a page from a free-list entry is O(1). A commit's freed-page list rides in its meta page when it fits, instead of a free-list tree put per commit (beyond LMDB, ADR-0022). | `put/gc/drain_big` 2.21× → 1.68×; `commit/batch/n1` 2.04× → 1.60× |
 | <a id="b12"></a>Writer state reused across txns | Write txns reuse the previous one's containers, as LMDB's `me_txn0`: 19 → 5 heap allocations per single-put commit. Capacity caps keep one large txn from slowing the small ones after it. | Graviton4 `commit/batch/n1` 1.26× → 1.17×; 6.68k → 5.74k user cycles per single-put commit (W) |
+| Bounded free-page records (ADR-0037, format 3) | A transaction's freed-page list is stored as records of at most `K` ids (1,017 at 16 KiB pages), so a commit that draws from an old list reads and rewrites only the records it draws from. Before, the list was one record on an overflow run, rewritten whole by every commit that drew from it. Beyond LMDB, which re-splits its leftovers after its first draw. | small commit after a 192,000-page delete 22.8× → 1.12× LMDB (laptop, [report](../benches/results/2026-11-02-bounded-free-page-records-macos.md)) |
 | Free-page runs across records (ADR-0029) | A multi-page value searched one freed-page record at a time, so a run split across two records was missed and the file grew. The allocator now merges the records the reuse gate allows, as LMDB merges its free list. | file size under multi-page rewrites 2.43× → 1.10× LMDB's (laptop, 400 commits) |
 | <a id="c2"></a>Spilling (ADR-0017) | Past the dirty limit, a write txn writes its highest dirty pages to the file and drops them, as `mdb_page_spill`. | YCSB C loads instead of being killed |
 | <a id="b5"></a>In-place `WRITE_MAP` (ADR-0021, opt-in) | Dirty pages live in the writable map at their final offset, as `MDB_WRITEMAP`. | single-put no-sync commits 29.8–43.5 → 8.6–11.1 µs (laptop) |
@@ -274,9 +275,10 @@ Issues are tracked on [GitHub](https://github.com/qdequele/ZeroDB/issues).
   slot's in-process mutex (about 8 atomic read-modify-writes per empty write
   txn against LMDB's 2; removing it needs an ADR), re-encoding the meta page's
   free-list annex (about 78 % of commit when every txn deletes one key), the
-  free-list record that small txns rewrite after a large delete (LMDB keeps
-  its reclaimed list across txns), the snapshot published per commit, and the
-  `pwritev` iovec list.
+  free-list record that small txns rewrite after a large delete (now one
+  bounded record, ADR-0037, but still decoded and rewritten per txn where
+  LMDB keeps its reclaimed list across txns), the snapshot published per
+  commit, and the `pwritev` iovec list.
 - **Scans** (#147). By default full scans are 1.47–1.60× and prefix buckets
   1.27×; in trusted mode 1.03–1.09× (BP). So the default-mode gap is page
   validation (16–19 % of a scan), and the trusted residual is two calls per

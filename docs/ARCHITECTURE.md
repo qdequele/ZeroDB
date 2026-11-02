@@ -70,7 +70,10 @@ explicit offsets, never by casting structs over the map.
 Every database is a B+tree ([SPEC 03](SPEC/03-btree.md)). The **main tree**
 holds the unnamed database's entries and the catalog: one record per named
 database, giving its root and statistics. The **free-page tree** maps the id
-of a transaction to the pages it freed.
+of a transaction and a range of page ids to the pages that transaction freed
+in that range: a long list is cut into records small enough to stay inside a
+leaf, so a later commit reads and rewrites only the records it draws from
+(ADR-0037).
 
 Trees are **copy-on-write**. A write transaction never modifies a page that a
 committed snapshot can see. Instead it copies the page to a fresh page number,

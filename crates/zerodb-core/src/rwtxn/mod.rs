@@ -62,8 +62,8 @@ use crate::error::{Error, MdbError, Result};
 use crate::handles::{HandleTable, TxnHandles};
 use crate::nested::{ChildCounter, NestedRoTxn};
 use crate::page::geometry::{
-    body_size, gc_key_decode, gc_key_encode, is_map_full, map_pages, overflow_page_count,
-    pil_decode, pil_encode_into, pil_size, value_is_inline,
+    body_size, gc_chunk_cap, gc_key_decode, gc_key_encode, is_map_full, map_pages,
+    overflow_page_count, pil_decode, pil_encode_into, pil_size, value_is_inline, GcKey,
 };
 use crate::page::{
     write_overflow_head, BranchMut, BranchRef, DBRecord, LeafMut, LeafRef, LeafValue, MetaPage,
@@ -325,13 +325,13 @@ pub struct RwTxn<'env> {
     /// the memo; spills reset the memo (TXN-71). Probes, never publishes,
     /// the env-wide stamp cache (ADR-0018).
     validated: ValidatedPages<'env>,
-    /// GC-20 drain bookkeeping (ADR-0005): for every GC entry `F` this txn
-    /// drew from, the **remaining** (still-free, sorted-ascending) ids —
+    /// GC-20 drain bookkeeping (ADR-0005): for every GC record `(F, seq)`
+    /// this txn drew from, the **remaining** (still-free, sorted-ascending) ids —
     /// [`Drain::live`], a consumed-prefix view so the GC-19 front pop is O(1).
     /// Loaded from the tree PIL on first touch; `freelist_save` step (a)
-    /// rewrites the remainder (or deletes the entry when empty). `BTreeMap` so
-    /// iteration is ascending-`F`, matching the GC-18 scan.
-    drains: BTreeMap<u64, Drain>,
+    /// rewrites the remainder (or deletes the record when empty). `BTreeMap`
+    /// so iteration is in key order, matching the GC-18 scan.
+    drains: BTreeMap<GcKey, Drain>,
     /// The base meta's free-list annex pool (SPEC 05 §2a, ADR-0022): the
     /// pages freed by txn `base.txnid`, parsed (and `validate_pil_ids`-
     /// checked, GC-33) at begin when `base.free_annex > 0`. Drawn by
@@ -350,7 +350,7 @@ pub struct RwTxn<'env> {
     /// draw** (GC-12 — see `freelist_save`): each must be
     /// re-rewritten before the C1 fixed point is declared, so no rewritten
     /// entry ever lists a handed-out page.
-    save_touched: std::collections::BTreeSet<u64>,
+    save_touched: std::collections::BTreeSet<GcKey>,
     /// Next never-allocated pgno (GC-15); persisted as `last_pg = next_pgno-1`.
     next_pgno: u64,
     /// `base.last_pg` — the committed high-water, used to classify freed pages
@@ -402,16 +402,23 @@ pub struct RwTxn<'env> {
     /// nothing adds any until `freelist_save`), so a later request for a run
     /// at least as long cannot succeed either and skips the search.
     cross_miss: Option<u64>,
+    /// The smallest run length [`RwTxn::gc_reclaim`] has looked for in
+    /// every gated record, one record at a time, and not found this txn.
+    /// For the same reason as `cross_miss`, a later request at least as long
+    /// cannot be served by one record either and skips that walk. A freeing
+    /// txn's list is many bounded records (SPEC 05 GC-5), so the walk it
+    /// saves crosses many leaves.
+    record_miss: Option<u64>,
+    /// Where [`RwTxn::gc_reclaim`]'s walk may start for a run of at least
+    /// `n` pages: run length → the key of the record the last such walk drew
+    /// from. Every gated record before that key had no run that long, and
+    /// during the txn's operations records only lose ids, so none gains one;
+    /// the walk seeks there instead of reading those records again. The pick
+    /// is the one a walk from the first record makes (GC-19, GC-21).
+    record_from: BTreeMap<u64, GcKey>,
     /// The cross-record run search's merged list of free ids, built on its
     /// first use in this txn ([`RwTxn::cross_record_run`]).
     cross_cache: Option<CrossRunCache>,
-    /// Set by `freelist_save` around the one put that grows this txn's own
-    /// GC entry after it has shrunk in the same save (SPEC 05 GC-13): the
-    /// in-save allocator then skips the carried annex pool, whose ids are
-    /// part of that entry, so the grow takes pages from outside it (the
-    /// drain pool or the end of the file) and the save reaches its fixed
-    /// point instead of trading pages between the entry and its own run.
-    save_outside: bool,
     /// Live nested read children (SPEC 04 TXN-31, ADR-0007), checked by
     /// [`RwTxn::guard_ok`] (TXN-29) and at commit C0 (TXN-33).
     ///
@@ -545,8 +552,9 @@ impl Env {
             errored: false,
             oldest_cache: None,
             cross_miss: None,
+            record_miss: None,
+            record_from: BTreeMap::new(),
             cross_cache: None,
-            save_outside: false,
             children: ChildCounter::new(),
             // In-place WRITE_MAP keeps no whole-map reference in the struct
             // (see the field docs; ADR-0021) — `whole_map` borrows lazily.

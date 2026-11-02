@@ -35,10 +35,15 @@ pub(crate) fn validate_pil_ids(ids: &[u64], last_pg: u64) -> Result<()> {
 /// non-meta page, strictly ascending (`find_run` and `binary_search` assume
 /// sorted ids) and in `[FIRST_DATA_PGNO, last_pg]`; a hostile PIL could
 /// otherwise hand out page 0/1 (the meta slots, clobbered at commit C2) or a
-/// page past the file.
-fn decode_gc_ids(val: &[u8], last_pg: u64) -> Result<Vec<u64>> {
+/// page past the file. The record must also list something and nothing
+/// below its own key's `seq` (INV-29), so its GC-20 rewrite stays a
+/// well-formed record.
+fn decode_gc_ids(key: GcKey, val: &[u8], last_pg: u64) -> Result<Vec<u64>> {
     let ids = pil_decode(val).ok_or(Error::Mdb(MdbError::Invalid))?;
     validate_pil_ids(&ids, last_pg)?;
+    if ids.first().is_none_or(|&first| first < key.seq) {
+        return Err(Error::Mdb(MdbError::Invalid));
+    }
     Ok(ids)
 }
 
@@ -184,7 +189,7 @@ pub(super) const CROSS_RUN_RECORDS_PER_PAGE: u64 = 60;
 /// ids the search read when this txn had not drawn from it yet, or the base
 /// meta's annex pool.
 pub(super) enum CrossSource {
-    Tree { f: u64, fresh: Option<Vec<u64>> },
+    Tree { key: GcKey, fresh: Option<Vec<u64>> },
     Annex,
 }
 
@@ -202,26 +207,16 @@ pub(super) struct CrossRunCache {
     pub(super) truncated: bool,
 }
 
-/// Pages a GC-tree value listing `count` ids occupies outside its leaf cell:
-/// 0 when the PIL is stored inline, else its overflow run length (SPEC 02
-/// §4.2/§5). GC keys are 8 bytes (SPEC 05 GC-2).
-pub(super) fn gc_value_pages(count: usize, psize: u32) -> u64 {
-    let dsize = pil_size(count) as u64;
-    if value_is_inline(8, dsize, psize) {
-        0
-    } else {
-        overflow_page_count(dsize, psize)
-    }
-}
-
 /// Allocation restriction state (SPEC 05 GC-12, ADR-0005).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AllocMode {
     /// Normal ops: loose → GC draw → extend (GC-16).
     Normal,
-    /// Inside `freelist_save` (commit step C1): **all GC draws barred**; loose
-    /// pages (including contiguous loose runs — see the GC-12 note) or extend
-    /// only. Set once at `freelist_save` entry and never cleared: the commit
+    /// Inside `freelist_save` (commit step C1): the GC tree is never read;
+    /// loose pages, the already-loaded drain pool, the carried annex pool or
+    /// extend only (GC-12). Every request is a single page: GC records are
+    /// always inline (GC-5), so the save never allocates an overflow run.
+    /// Set once at `freelist_save` entry and never cleared: the commit
     /// consumes the txn.
     GcSave,
 }
@@ -271,22 +266,18 @@ impl<'env> RwTxn<'env> {
     /// [`RwTxn::allocate`] without the ADR-0021 guard (the guard wraps
     /// every return point in one place).
     ///
-    /// The hot shape here is the loose pop. The draw arms (`loose_run`,
-    /// `save_pool_draw`, `annex_draw`, `gc_reclaim`, `cross_record_run`) are
+    /// The hot shape here is the loose pop. The draw arms (`save_pool_draw`, `annex_draw`, `gc_reclaim`, `cross_record_run`) are
     /// `#[inline(never)]` so their size never pushes this function past
     /// LLVM's inlining budget.
     pub(super) fn allocate_raw(&mut self, n: u64) -> Result<u64> {
         debug_assert!(n >= 1);
+        debug_assert!(
+            n == 1 || self.alloc_mode == AllocMode::Normal,
+            "freelist_save asked for a run of {n} pages (GC-5: GC records are inline)"
+        );
         if n == 1 {
             if let Some(p) = work_mut!(self).loose.pop() {
                 return Ok(p);
-            }
-        } else if self.alloc_mode == AllocMode::GcSave {
-            // Loose-run draw, `freelist_save` only (SPEC 05 GC-12 note): the
-            // previous loop iteration's PIL value run is loose and must be
-            // re-allocatable or the fixed point is unreachable.
-            if let Some(start) = self.loose_run(n) {
-                return Ok(start);
             }
         }
         match self.alloc_mode {
@@ -329,12 +320,9 @@ impl<'env> RwTxn<'env> {
                 // like every annex draw; the step-(c) placement re-reads
                 // `annex.live()` after every put, so a draw here can never
                 // leave a handed-out id in the persisted set — the GC-12
-                // pool argument. Skipped while `freelist_save` grows its own
-                // entry after a shrink (`save_outside`, GC-13).
-                if !self.save_outside {
-                    if let Some(start) = self.annex_draw(n) {
-                        return Ok(start);
-                    }
+                // pool argument.
+                if let Some(start) = self.annex_draw(n) {
+                    return Ok(start);
                 }
             }
         }
@@ -358,75 +346,32 @@ impl<'env> RwTxn<'env> {
         }
     }
 
-    /// Serve a contiguous `n`-page run from the loose list (GcSave only; see
-    /// [`RwTxn::allocate`]). A loose run that abuts `next_pgno` may be
-    /// completed by extension. Returns the run's head pgno.
-    #[inline(never)]
-    pub(super) fn loose_run(&mut self, n: u64) -> Option<u64> {
-        debug_assert!(self.alloc_mode == AllocMode::GcSave);
-        let mp = map_pages(self.env.inner().map_size(), self.psize);
-        // Borrows only the `work` field, so `next_pgno` stays usable.
-        let loose = &mut work_mut!(self).loose;
-        if loose.is_empty() {
-            return None;
-        }
-        loose.sort_unstable();
-        debug_assert!(
-            loose.windows(2).all(|w| w[0] < w[1]),
-            "loose list holds a duplicate pgno"
-        );
-        let mut i = 0;
-        while i < loose.len() {
-            // Extent of the maximal consecutive run starting at index i.
-            let mut j = i + 1;
-            while j < loose.len() && loose[j] == loose[j - 1] + 1 {
-                j += 1;
-            }
-            let len = (j - i) as u64;
-            if len >= n {
-                let start = loose[i];
-                loose.drain(i..i + n as usize);
-                return Some(start);
-            }
-            // Top-of-file completion: the run ends at next_pgno - 1, so
-            // extending by (n - len) yields one contiguous run.
-            if loose[j - 1] + 1 == self.next_pgno && !is_map_full(self.next_pgno, n - len, mp) {
-                let start = loose[i];
-                loose.drain(i..j);
-                self.next_pgno += n - len;
-                return Some(start);
-            }
-            i = j;
-        }
-        None
-    }
-
     /// In-save draw from the **already-loaded drain pool** (GC-12;
     /// see [`RwTxn::allocate`]). Deterministic like GC-19: smallest
-    /// reclaimable `F` first (`drains` is a `BTreeMap`), smallest id / first
-    /// contiguous run within it. Gate compliance is inherited: every pool
+    /// reclaimable record first (`drains` is a `BTreeMap` in key order),
+    /// smallest id / first contiguous run within it. Gate compliance is inherited: every pool
     /// entry passed `F ≤ oldest_reader()` when first loaded during ops, and
     /// any reader that pins *after* that pins the published snapshot
     /// `≥ writer_txnid − 1 ≥ F`, from whose trees these pages are absent.
     #[inline(never)]
     pub(super) fn save_pool_draw(&mut self, n: u64) -> Option<u64> {
         debug_assert!(self.alloc_mode == AllocMode::GcSave);
-        let mut hit: Option<(u64, u64)> = None;
-        for (f, remaining) in &self.drains {
+        let mut hit: Option<(GcKey, u64)> = None;
+        for (key, remaining) in &self.drains {
             if let Some(start) = find_run(remaining.live(), n) {
-                hit = Some((*f, start));
+                hit = Some((*key, start));
                 break;
             }
         }
-        let (f, start) = hit?;
+        let (key, start) = hit?;
         // Reader-table shadow check: gate compliance is inherited (doc above), but a
         // fresh table re-scan re-proves it at the hand-out moment.
         #[cfg(debug_assertions)]
-        self.debug_assert_gate(f);
-        let remaining = self.drains.get_mut(&f).expect("pool entry present");
+        self.debug_assert_gate(key.txnid);
+        let remaining = self.drains.get_mut(&key).expect("pool entry present");
         remaining.take_run(start, n);
         self.mark_reclaimed(start, n);
-        self.save_touched.insert(f);
+        self.save_touched.insert(key);
         Some(start)
     }
 
@@ -516,58 +461,66 @@ impl<'env> RwTxn<'env> {
         }
     }
 
-    /// GC-16 step 2 (`gc_reclaim`, SPEC 05 GC-18..20): walk GC entries in
-    /// ascending freeing-txnid order (BE keys ⇒ forward cursor); for the first
-    /// entry `F ≤ oldest_reader()` whose remaining ids satisfy the request
-    /// (smallest id for `n == 1` — GC-19; first within-PIL contiguous run for
-    /// `n > 1` — GC-15/21), record the drain in `self.drains` (the tree entry
-    /// itself is rewritten only at C1, GC-20) and return the head pgno.
+    /// GC-16 step 2 (`gc_reclaim`, SPEC 05 GC-18..20): walk GC records in
+    /// `(freeing txnid, seq)` order (BE keys ⇒ forward cursor); for the first
+    /// record with `F ≤ oldest_reader()` whose remaining ids satisfy the
+    /// request (smallest id for `n == 1` — GC-19; first within-PIL contiguous
+    /// run for `n > 1` — GC-15/21), record the drain in `self.drains` (the
+    /// tree record itself is rewritten only at C1, GC-20) and return the head
+    /// pgno.
     #[inline(never)]
     pub(super) fn gc_reclaim(&mut self, n: u64) -> Result<Option<u64>> {
         debug_assert!(
             self.alloc_mode == AllocMode::Normal,
             "GC draw inside freelist_save (GC-12)"
         );
-        if self.free_db.root == PGNO_INVALID {
+        if self.free_db.root == PGNO_INVALID || self.record_miss.is_some_and(|m| n >= m) {
             return Ok(None);
         }
         let oldest = self.oldest_reader();
         // Scan pass (shared borrows only); the drain mutation happens after
         // the cursor borrow ends.
         struct Pick {
-            f: u64,
+            key: GcKey,
             fresh: Option<Vec<u64>>,
             start: u64,
         }
         let last_pg = self.committed_last_pg;
+        let from = self.record_from.range(..=n).map(|(_, k)| *k).max();
         let mut pick: Option<Pick> = None;
-        self.visit_gated_records(oldest, |f, drain, val| {
+        self.visit_gated_records(oldest, from, |key, drain, val| {
             let (fresh, start) = match drain {
                 Some(d) => (None, find_run(d.live(), n)),
                 None => {
-                    let ids = decode_gc_ids(val, last_pg)?;
+                    let ids = decode_gc_ids(key, val, last_pg)?;
                     let start = find_run(&ids, n);
                     (Some(ids), start)
                 }
             };
             Ok(match start {
                 Some(start) => {
-                    pick = Some(Pick { f, fresh, start });
+                    pick = Some(Pick { key, fresh, start });
                     ControlFlow::Break(())
                 }
                 None => ControlFlow::Continue(()),
             })
         })?;
-        let Some(Pick { f, fresh, start }) = pick else {
+        let Some(Pick { key, fresh, start }) = pick else {
+            // Every gated record was read: during the txn's operations its
+            // records only lose ids, so no longer request can succeed here.
+            self.record_miss = Some(self.record_miss.map_or(n, |m| m.min(n)));
             return Ok(None);
         };
         // Reader-table shadow check: re-scan the live reader table at the hand-out
         // moment (fresh, not the per-txn cache) — see `debug_assert_gate`.
         #[cfg(debug_assertions)]
-        self.debug_assert_gate(f);
+        self.debug_assert_gate(key.txnid);
+        if from.is_none_or(|f| key > f) {
+            self.record_from.insert(n, key);
+        }
         let remaining = match fresh {
-            Some(ids) => self.drains.entry(f).or_insert(Drain::new(ids)),
-            None => self.drains.get_mut(&f).expect("drain entry present"),
+            Some(ids) => self.drains.entry(key).or_insert(Drain::new(ids)),
+            None => self.drains.get_mut(&key).expect("drain entry present"),
         };
         remaining.take_run(start, n);
         self.mark_reclaimed(start, n);
@@ -575,14 +528,20 @@ impl<'env> RwTxn<'env> {
     }
 
     /// Walk the GC tree's records oldest first (BE keys, so a forward
-    /// cursor), stopping at the reuse gate: the first `F > oldest` ends the
-    /// walk, as no older record remains (GC-18). `visit` gets each record's
-    /// `F`, this txn's drain of it if any, and its raw PIL value, and returns
-    /// `Break` to stop early.
+    /// cursor), from the record keyed `from` or the next one (the first
+    /// record when `None`), stopping at the reuse gate: the first
+    /// `F > oldest` ends the walk, as no older record remains (GC-18).
+    /// `visit` gets each record's key, this txn's drain of it if any, and its
+    /// raw PIL value, and returns `Break` to stop early.
+    ///
+    /// The value must be inline (GC-5): a record on an overflow run is a
+    /// corrupt free list, so the decode of its PIL is bounded by
+    /// [`gc_chunk_cap`] ids.
     fn visit_gated_records(
         &self,
         oldest: u64,
-        mut visit: impl FnMut(u64, Option<&Drain>, &[u8]) -> Result<ControlFlow<()>>,
+        from: Option<GcKey>,
+        mut visit: impl FnMut(GcKey, Option<&Drain>, &[u8]) -> Result<ControlFlow<()>>,
     ) -> Result<()> {
         if self.free_db.root == PGNO_INVALID {
             return Ok(());
@@ -590,10 +549,21 @@ impl<'env> RwTxn<'env> {
         let rec = self.free_db;
         let tree = Tree::new(self.source(), self.psize, rec.root, rec.depth);
         let mut cursor = tree.cursor();
-        let mut entry = cursor.first().map_err(map_page_err)?;
+        let mut entry = match from {
+            Some(key) => cursor.set_range(&gc_key_encode(key)),
+            None => cursor.first(),
+        }
+        .map_err(map_page_err)?;
+        let max_val = pil_size(gc_chunk_cap(self.psize));
         while let Some((key, val)) = entry {
-            let f = gc_key_decode(key).ok_or(Error::Mdb(MdbError::Invalid))?;
-            if f > oldest || visit(f, self.drains.get(&f), val)?.is_break() {
+            let key = gc_key_decode(key).ok_or(Error::Mdb(MdbError::Invalid))?;
+            if key.txnid > oldest {
+                break;
+            }
+            if val.len() > max_val {
+                return Err(Error::Mdb(MdbError::Invalid));
+            }
+            if visit(key, self.drains.get(&key), val)?.is_break() {
                 break;
             }
             entry = cursor.next().map_err(map_page_err)?;
@@ -683,17 +653,17 @@ impl<'env> RwTxn<'env> {
         debug_assert!(shares.len() >= 2, "a single-source run was missed upstream");
         for (i, first, count) in shares {
             match &mut cache.sources[i as usize] {
-                CrossSource::Tree { f, fresh } => {
-                    let f = *f;
+                CrossSource::Tree { key, fresh } => {
+                    let key = *key;
                     // Reader-table shadow check, as in every other draw arm.
                     #[cfg(debug_assertions)]
-                    self.debug_assert_gate(f);
+                    self.debug_assert_gate(key.txnid);
                     // A record first drawn here enters `drains` with the ids
                     // the cache read; if `gc_reclaim` loaded it meanwhile,
                     // its entry is the live one.
                     let drain = match fresh.take() {
-                        Some(ids) => self.drains.entry(f).or_insert(Drain::new(ids)),
-                        None => self.drains.get_mut(&f).expect("drain entry present"),
+                        Some(ids) => self.drains.entry(key).or_insert(Drain::new(ids)),
+                        None => self.drains.get_mut(&key).expect("drain entry present"),
                     };
                     drain.take_span(first, count);
                 }
@@ -719,7 +689,7 @@ impl<'env> RwTxn<'env> {
         let mut truncated = false;
         let last_pg = self.committed_last_pg;
         let mut read = 0u64;
-        self.visit_gated_records(oldest, |f, drain, val| {
+        self.visit_gated_records(oldest, None, |key, drain, val| {
             if read == budget {
                 truncated = true;
                 return Ok(ControlFlow::Break(()));
@@ -727,12 +697,12 @@ impl<'env> RwTxn<'env> {
             read += 1;
             match drain {
                 Some(d) if d.len() == 0 => {}
-                Some(_) => sources.push(CrossSource::Tree { f, fresh: None }),
+                Some(_) => sources.push(CrossSource::Tree { key, fresh: None }),
                 None => {
-                    let ids = decode_gc_ids(val, last_pg)?;
+                    let ids = decode_gc_ids(key, val, last_pg)?;
                     if !ids.is_empty() {
                         sources.push(CrossSource::Tree {
-                            f,
+                            key,
                             fresh: Some(ids),
                         });
                     }
@@ -753,7 +723,7 @@ impl<'env> RwTxn<'env> {
                     CrossSource::Tree {
                         fresh: Some(ids), ..
                     } => ids,
-                    CrossSource::Tree { f, fresh: None } => self.drains[f].live(),
+                    CrossSource::Tree { key, fresh: None } => self.drains[key].live(),
                     CrossSource::Annex => self.annex.live(),
                 };
                 merged.extend(live.iter().map(|&p| (p, i)));

@@ -25,7 +25,7 @@ fn expected_meta_content() -> [u8; 172] {
     e[16] = 0x08; // flags = P_META (0x0008)
                   // off 18..32 reserved 0
     e[32..36].copy_from_slice(b"ZDB1"); // magic 5A 44 42 31
-    e[36] = 0x02; // format_version = 2 (ADR-0022)
+    e[36] = 0x03; // format_version = 3 (ADR-0037)
     e[40] = 0x00;
     e[41] = 0x10; // page_size = 4096 (0x0000_1000)
                   // off 44 env_flags = 0

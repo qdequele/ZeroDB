@@ -13,7 +13,9 @@ use zerodb_core::check::check_image;
 use zerodb_core::env::testutil::VecBacking;
 use zerodb_core::env::{open_with_backing, DurabilityFlags};
 use zerodb_core::error::{Error, MdbError};
-use zerodb_core::page::{BranchMut, BranchRef, LeafMut, MetaPage, PageError, PGNO_INVALID};
+use zerodb_core::page::{
+    geometry, BranchMut, BranchRef, LeafMut, MetaPage, PageError, PGNO_INVALID,
+};
 
 mod common;
 use common::{craft_image, leaf_frame, open_image, unique_path, MAP, PS};
@@ -221,8 +223,14 @@ fn zero_child_branch_as_root_reads_typed_error() {
 // A hostile GC freelist must not hand out pages
 // ---------------------------------------------------------------------------
 
-/// An image whose GC DB holds one entry `{txnid 1 -> pil}`.
-fn gc_image(pil_ids: &[u64]) -> Vec<u8> {
+/// The 16-byte GC key `(txnid, seq)` (SPEC 02 §7).
+fn gc_key(txnid: u64, seq: u64) -> Vec<u8> {
+    geometry::gc_key_encode(geometry::GcKey { txnid, seq }).to_vec()
+}
+
+/// An image of `file_pages` pages whose GC DB holds one record `key -> pil`
+/// on page 2, committed by txn 2.
+fn gc_record_image(file_pages: usize, key: &[u8], pil_ids: &[u64]) -> Vec<u8> {
     let mut pil = Vec::with_capacity(8 + 8 * pil_ids.len());
     pil.extend_from_slice(&(pil_ids.len() as u64).to_le_bytes());
     for id in pil_ids {
@@ -230,12 +238,12 @@ fn gc_image(pil_ids: &[u64]) -> Vec<u8> {
     }
     let mut buf = vec![0u8; PS as usize];
     let mut leaf = LeafMut::init(&mut buf, PS, 2, 1).unwrap();
-    leaf.insert_inline(0, &1u64.to_be_bytes(), 0, &pil).unwrap();
+    leaf.insert_inline(0, key, 0, &pil).unwrap();
     craft_image(
-        3,
+        file_pages,
         |m| {
             m.txnid = 2;
-            m.last_pg = 2;
+            m.last_pg = file_pages as u64 - 1;
             m.free_db.root = 2;
             m.free_db.depth = 1;
             m.free_db.leaf_pages = 1;
@@ -243,6 +251,18 @@ fn gc_image(pil_ids: &[u64]) -> Vec<u8> {
         },
         &[(2, buf)],
     )
+}
+
+/// An image whose GC DB holds one record `{(txnid 1, seq 0) -> pil}`.
+fn gc_image(pil_ids: &[u64]) -> Vec<u8> {
+    gc_record_image(3, &gc_key(1, 0), pil_ids)
+}
+
+/// A put in a write txn of `img`: it allocates, so it reads the GC record.
+fn put_after_reading_the_gc_record(img: Vec<u8>, tag: &str) -> Result<(), Error> {
+    let env = open_image(img, tag).unwrap();
+    let mut txn = env.write_txn().unwrap();
+    env.main_database().put(&mut txn, b"k", b"v")
 }
 
 #[test]
@@ -281,7 +301,7 @@ fn gc_freelist_unsorted_is_invalid() {
     pil.extend_from_slice(&3u64.to_le_bytes());
     let mut leaf_buf = vec![0u8; ps];
     let mut leaf = LeafMut::init(&mut leaf_buf, PS, 2, 1).unwrap();
-    leaf.insert_inline(0, &1u64.to_be_bytes(), 0, &pil).unwrap();
+    leaf.insert_inline(0, &gc_key(1, 0), 0, &pil).unwrap();
     let img = craft_image(
         6,
         |m| {
@@ -298,6 +318,40 @@ fn gc_freelist_unsorted_is_invalid() {
     let mut txn = env.write_txn().unwrap();
     let db = env.main_database();
     let e = db.put(&mut txn, b"k", b"v").unwrap_err();
+    assert!(matches!(e, Error::Mdb(MdbError::Invalid)), "got {e:?}");
+}
+
+#[test]
+fn gc_record_with_a_format_2_key_is_invalid() {
+    // An 8-byte key (format 2) in a format-3 file: the record's freeing txn
+    // cannot be read, so nothing in it can pass the reuse gate.
+    let img = gc_record_image(6, &1u64.to_be_bytes(), &[3]);
+    let e = put_after_reading_the_gc_record(img, "gc-v2-key").unwrap_err();
+    assert!(matches!(e, Error::Mdb(MdbError::Invalid)), "got {e:?}");
+}
+
+#[test]
+fn gc_record_listing_an_id_below_its_key_is_invalid() {
+    // INV-29: a record keyed (F, 4) lists only ids >= 4. Its GC-20 rewrite
+    // would write that id under the same key, so the read refuses it.
+    let ok = gc_record_image(6, &gc_key(1, 3), &[3]);
+    put_after_reading_the_gc_record(ok, "gc-seq-ok").expect("id at its key's seq");
+    let img = gc_record_image(6, &gc_key(1, 4), &[3]);
+    let e = put_after_reading_the_gc_record(img, "gc-seq-below").unwrap_err();
+    assert!(matches!(e, Error::Mdb(MdbError::Invalid)), "got {e:?}");
+}
+
+#[test]
+fn gc_record_longer_than_the_cap_is_invalid() {
+    // GC-5: a record holds at most `gc_chunk_cap` ids (249 at 4 KiB), so a
+    // hostile record cannot make the writer decode an unbounded list.
+    let cap = geometry::gc_chunk_cap(PS) as u64;
+    let ids: Vec<u64> = (3..3 + cap).collect();
+    let ok = gc_record_image(3 + cap as usize, &gc_key(1, 0), &ids);
+    put_after_reading_the_gc_record(ok, "gc-cap-ok").expect("a record of the cap");
+    let ids: Vec<u64> = (3..4 + cap).collect();
+    let img = gc_record_image(4 + cap as usize, &gc_key(1, 0), &ids);
+    let e = put_after_reading_the_gc_record(img, "gc-cap-over").unwrap_err();
     assert!(matches!(e, Error::Mdb(MdbError::Invalid)), "got {e:?}");
 }
 

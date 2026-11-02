@@ -1,14 +1,14 @@
 //! Commit step C1: writing the free-page database (SPEC 05 GC-10..13,
 //! GC-20, GC-30..32).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 
 /// [`RwTxn::freelist_save`]'s state across fixed-point iterations.
 struct SaveLoop {
-    /// GC entries awaiting their GC-20 rewrite.
-    pending: BTreeSet<u64>,
+    /// GC records awaiting their GC-20 rewrite.
+    pending: BTreeSet<GcKey>,
     /// Rewrites done so far, and their release-active bound (GC-13 guard):
     /// each rewrite consumes one pending entry, and an entry only re-enters
     /// `pending` through an in-save pool draw, which strictly shrinks the
@@ -17,11 +17,10 @@ struct SaveLoop {
     /// loudly instead of hanging.
     inner_iters: usize,
     inner_budget: usize,
-    /// GC-13 own-entry size guard (tree arm): the page count of this txn's
-    /// entry `BE(txnid)` as last written (0 = inline), and whether it has
-    /// shrunk during this save. See [`RwTxn::put_own_entry`].
-    own_pages: Option<u64>,
-    own_shrunk: bool,
+    /// This txn's own records as last written in the tree arm (GC-11 step
+    /// (c)): `seq` → ids. The keys fix the ranges for the rest of the save
+    /// (see [`RwTxn::put_own_records`]); the first key is always 0.
+    own: BTreeMap<u64, Vec<u64>>,
 }
 
 /// Merge two strictly-ascending, mutually-disjoint id slices into one
@@ -80,13 +79,19 @@ impl<'env> RwTxn<'env> {
         work_mut!(self).loose = set.into_iter().collect();
     }
 
-    /// Write a PIL under `BE(f)` into the GC tree via the RESERVE path
-    /// (GC-11 step (c) / GC-20 rewrite): the engine places the cell (possibly
-    /// splitting GC leaves / spilling to an overflow run, GC-5), then the ids
-    /// are encoded straight into the dirty frame — no double buffering of a
-    /// potentially multi-MB PIL.
-    pub(super) fn put_pil(&mut self, f: u64, ids: &[u64]) -> Result<()> {
-        let key = gc_key_encode(f);
+    /// Write a PIL under `key` into the GC tree via the RESERVE path (GC-11
+    /// step (c) / GC-20 rewrite): the engine places the cell (possibly
+    /// splitting GC leaves), then the ids are encoded straight into the dirty
+    /// frame. A record holds at most [`gc_chunk_cap`] ids, so the cell is
+    /// always inline (GC-5).
+    pub(super) fn put_pil(&mut self, key: GcKey, ids: &[u64]) -> Result<()> {
+        debug_assert!(
+            !ids.is_empty() && ids.len() <= gc_chunk_cap(self.psize),
+            "GC record of {} ids (GC-5)",
+            ids.len()
+        );
+        debug_assert!(ids[0] >= key.seq, "GC record below its key (INV-29)");
+        let key = gc_key_encode(key);
         let len = pil_size(ids.len());
         let loc = self.put_tree(TreeId::Free, &key, PutFlags::EMPTY, ValSrc::Reserve(len))?;
         pil_encode_into(ids, self.reserved_slot(TreeId::Free, &key, len, loc)?);
@@ -97,8 +102,9 @@ impl<'env> RwTxn<'env> {
     /// trailing loose pages (GC-10), merge the surviving loose
     /// pages into the freed set (GC-9, mirroring the fork's
     /// `mdb_freelist_save` loose merge), then loop to a fixed point: rewrite
-    /// every drained entry's remainder / delete the empties (GC-20), and
-    /// write the freed set under `BE(writer_txnid)`.
+    /// every drained record's remainder / delete the empties (GC-20), and
+    /// write the freed set to the meta annex or as records keyed
+    /// `(writer_txnid, seq)` (GC-32).
     ///
     /// **Crash safety:** everything here mutates dirty frames and the working
     /// `free_db` record only; nothing reaches disk before C2, so a crash at
@@ -110,8 +116,9 @@ impl<'env> RwTxn<'env> {
     ///
     /// **Allocation restriction (GC-12):** `alloc_mode = GcSave`
     /// for the whole procedure — `allocate` never **reads** the GC tree; it
-    /// draws loose pages (including contiguous loose runs), pages from the
-    /// **already-loaded drain pool** ([`RwTxn::save_pool_draw`]), or extends.
+    /// draws loose pages, pages from the **already-loaded drain pool**
+    /// ([`RwTxn::save_pool_draw`]), the carried annex pool, or extends. Every
+    /// request is for one page: GC records are always inline (GC-5).
     /// Pool draws are what keep file growth bounded: the in-save COW of a
     /// committed GC page cannot reuse its own predecessor (the `N−1` meta
     /// still references it, TXN-62), so a total draw ban would extend the
@@ -122,15 +129,14 @@ impl<'env> RwTxn<'env> {
     /// never lists a handed-out page.
     ///
     /// **Termination (GC-13):** each iteration that does not exit strictly
-    /// shrinks the finite drain pool (a draw), grows `freed` by
-    /// COW-obsoleting a **committed** GC page (finitely many), or folds a
-    /// loose page into `freed` (each id folds at most once); all three are
-    /// bounded, and the previous iteration's PIL value run is loose and is
-    /// re-served to the next iteration's allocation (free-before-allocate
-    /// ordering inside the put). Annex-pool draws are bounded too, but a
-    /// grow of this txn's own entry served from the pool it lists could
-    /// spend one draw per iteration; the own-entry size guard in step (c)
-    /// rules that cycle out (GC-13 (v)). `FREELIST_SAVE_MAX_ITERS` turns a
+    /// shrinks a finite pool (a drain-pool or annex-pool draw), grows `freed`
+    /// by COW-obsoleting a **committed** GC page (finitely many), or folds a
+    /// loose page into `freed`. Loose pages come only from pages this txn
+    /// allocated and then freed in a leaf merge, and a GC leaf merges only
+    /// after a record is deleted, which needs a record emptied by pool draws:
+    /// so loose folds are bounded by the pool draws too. Nothing else frees
+    /// a page: a put into a dirty leaf rewrites it in place or splits it
+    /// (one fresh page, nothing freed). `FREELIST_SAVE_MAX_ITERS` turns a
     /// regression into a panic.
     pub(super) fn freelist_save(&mut self) -> Result<()> {
         debug_assert!(self.alloc_mode == AllocMode::Normal);
@@ -157,19 +163,19 @@ impl<'env> RwTxn<'env> {
         let mut tree_arm = false;
         let mut annex_mode = false;
         // Every ops-drained entry needs its GC-20 rewrite at least once.
-        let pending: BTreeSet<u64> = self.drains.keys().copied().collect();
+        let pending: BTreeSet<GcKey> = self.drains.keys().copied().collect();
         let mut st = SaveLoop {
             inner_budget: pending.len() + self.drains.values().map(Drain::len).sum::<usize>() + 16,
             pending,
             inner_iters: 0,
-            own_pages: None,
-            own_shrunk: false,
+            own: BTreeMap::new(),
         };
         // (b) GC-10 trailing shrink of ops-era loose pages, then GC-9: the
         // survivors join the freed set up front (LMDB parity — the fork's
         // freelist_save merges loose pages into the list first). Loose pages
-        // *generated by the loop below* (a replaced PIL overflow run) are
-        // re-served to later in-save allocations or folded in at the end.
+        // *generated by the loop below* (a GC leaf merged away after a record
+        // delete) are re-served to later in-save allocations or folded in at
+        // the end.
         self.release_trailing_loose();
         let work = work_mut!(self);
         work.freed.extend(std::mem::take(&mut work.loose));
@@ -182,8 +188,8 @@ impl<'env> RwTxn<'env> {
             );
             // (a) apply_drains (GC-11a/GC-20).
             self.rewrite_pending_drains(&mut st)?;
-            // (c) this txn's own entry: the meta annex when it fits (GC-32),
-            // else the GC tree under BE(writer_txnid) as in format v1.
+            // (c) this txn's own list: the meta annex when it fits (GC-32),
+            // else the GC tree as records keyed (writer_txnid, seq).
             work_mut!(self).freed.sort_unstable();
             let pre_dedup = work_mut!(self).freed.len();
             work_mut!(self).freed.dedup();
@@ -207,7 +213,7 @@ impl<'env> RwTxn<'env> {
                     tree_arm = true; // sticky (GC-32)
                     annex_mode = false;
                     let ids = merge_sorted_unique(&work_mut!(self).freed, self.annex.live());
-                    self.put_own_entry(&ids, &mut st)?;
+                    self.put_own_records(&ids, &mut st)?;
                     if work_mut!(self).freed.len() != before || self.annex.len() != annex_before {
                         // The put COW-freed committed GC pages (PIL must
                         // grow) or drew from the annex pool (the written
@@ -233,7 +239,7 @@ impl<'env> RwTxn<'env> {
         }
         // GC-30/GC-32 settle: in the annex arm the persisted annex is the
         // merged set, materialized into `freed` for C4/C6; in the tree arm
-        // the pool's ids were written into the tree entry `BE(txnid)`. The
+        // the pool's ids were written into the records `(txnid, seq)`. The
         // pool is spent either way (no allocation runs after C1).
         if annex_mode {
             let work = work_mut!(self);
@@ -246,18 +252,20 @@ impl<'env> RwTxn<'env> {
     }
 
     /// Step (a) of [`RwTxn::freelist_save`], apply_drains (GC-11a/GC-20):
-    /// rewrite the remainder of every pending entry and delete fully-drained
-    /// ones. Never delete a partially-drained entry (leaks the remainder),
-    /// never leave a drained id behind (double hand-out). A put or delete
-    /// here may draw from the pool (re-dirtying entries, merged from
-    /// `save_touched`) or free committed GC pages (growing `freed`).
+    /// rewrite the remainder of every pending record under its own key and
+    /// delete fully-drained ones. Never delete a partially-drained record
+    /// (leaks the remainder), never leave a drained id behind (double
+    /// hand-out). A remainder only lost ids, so it still fits its record's
+    /// range and cap (INV-29). A put or delete here may draw from the pool
+    /// (re-dirtying records, merged from `save_touched`) or free committed GC
+    /// pages (growing `freed`).
     fn rewrite_pending_drains(&mut self, st: &mut SaveLoop) -> Result<()> {
         loop {
             st.pending.extend(std::mem::take(&mut self.save_touched));
-            let Some(&f) = st.pending.iter().next() else {
+            let Some(&key) = st.pending.iter().next() else {
                 break;
             };
-            st.pending.remove(&f);
+            st.pending.remove(&key);
             st.inner_iters += 1;
             assert!(
                 st.inner_iters <= st.inner_budget,
@@ -267,52 +275,200 @@ impl<'env> RwTxn<'env> {
             // consumed prefix never reaches the tree.
             let remaining: Vec<u64> = self
                 .drains
-                .get(&f)
+                .get(&key)
                 .map_or(Vec::new(), |d| d.live().to_vec());
             if remaining.is_empty() {
-                self.drains.remove(&f);
-                let existed = self.delete_tree(TreeId::Free, &gc_key_encode(f))?;
-                debug_assert!(existed, "drained GC entry {f} missing from the tree");
+                self.drains.remove(&key);
+                let existed = self.delete_tree(TreeId::Free, &gc_key_encode(key))?;
+                debug_assert!(existed, "drained GC record {key:?} missing from the tree");
             } else {
-                self.put_pil(f, &remaining)?;
+                self.put_pil(key, &remaining)?;
             }
         }
         Ok(())
     }
 
     /// Step (c), tree arm, of [`RwTxn::freelist_save`]: write this txn's
-    /// own entry `BE(txnid)` listing `ids`.
-    fn put_own_entry(&mut self, ids: &[u64], st: &mut SaveLoop) -> Result<()> {
-        // GC-13 own-entry size guard. The entry lists the carried annex pool
-        // and every loose page folded in, so a run for it taken from those
-        // (an annex draw, a loose page) leaves the pages it accounts for
-        // unchanged: the old run is listed in their place. Near an overflow
-        // page-count boundary that set may admit no exact size: the shrunk
-        // entry frees a tail page, listing it grows the entry back, and the
-        // grow draws a fresh run from the annex, forever trading annex ids
-        // for listed ones (LMDB never meets this: its put keeps a larger
-        // dirty overflow run in place, which the exact run length of SPEC 02
-        // §5 forbids). So once the entry has shrunk in this save, a grow
-        // takes every page from outside that set (the drain pool or the end
-        // of the file), which adds pages to it and so admits the larger size.
-        let pages = gc_value_pages(ids.len(), self.psize);
-        let grow_after_shrink = st.own_shrunk && st.own_pages.is_some_and(|p| pages > p);
-        if st.own_pages.is_some_and(|p| pages < p) {
-            st.own_shrunk = true;
-        }
-        if grow_after_shrink {
-            // Loose pages are part of the set too (listed at the fixed
-            // point): hold them back for this put.
-            let held = std::mem::take(&mut work_mut!(self).loose);
-            self.save_outside = true;
-            let r = self.put_pil(self.txnid, ids);
-            self.save_outside = false;
-            work_mut!(self).loose.extend(held);
-            r?;
+    /// own list `ids` as records keyed `(txnid, seq)`, each at most
+    /// [`gc_chunk_cap`] ids (GC-5, INV-29).
+    ///
+    /// The first call cuts `ids` into consecutive slices of the cap, keyed 0
+    /// for the first and by its lowest id for each later one, so the records
+    /// partition the page-id line into ranges `[seq, next seq)`. Later
+    /// iterations of the same save keep those ranges: `ids` is split along
+    /// them, and only records whose ids changed are rewritten. A range whose
+    /// slice grew past the cap is cut again into balanced pieces, each new
+    /// piece keyed by its lowest id (inside the range, so the ranges stay a
+    /// partition); one that emptied is deleted. When the record keyed 0 is
+    /// gone, the lowest remaining one is re-keyed 0 (a delete and a put of
+    /// the same ids), so every id that joins the list later has a range.
+    fn put_own_records(&mut self, ids: &[u64], st: &mut SaveLoop) -> Result<()> {
+        let cap = gc_chunk_cap(self.psize);
+        let mut want: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        if st.own.is_empty() {
+            for (i, piece) in ids.chunks(cap).enumerate() {
+                want.insert(if i == 0 { 0 } else { piece[0] }, piece.to_vec());
+            }
         } else {
-            self.put_pil(self.txnid, ids)?;
+            let seqs: Vec<u64> = st.own.keys().copied().collect();
+            debug_assert_eq!(seqs[0], 0, "own records start at seq 0");
+            let mut from = 0;
+            for (i, _) in seqs.iter().enumerate() {
+                let to = match seqs.get(i + 1) {
+                    Some(&next) => from + ids[from..].partition_point(|&p| p < next),
+                    None => ids.len(),
+                };
+                let slice = &ids[from..to];
+                from = to;
+                if slice.is_empty() {
+                    continue;
+                }
+                let pieces = slice.len().div_ceil(cap);
+                let base = slice.len() / pieces;
+                let extra = slice.len() % pieces;
+                let mut at = 0;
+                for j in 0..pieces {
+                    let len = base + usize::from(j < extra);
+                    let piece = &slice[at..at + len];
+                    let seq = if j == 0 { seqs[i] } else { piece[0] };
+                    want.insert(seq, piece.to_vec());
+                    at += len;
+                }
+            }
+            if !want.contains_key(&0) {
+                if let Some((_, low)) = want.pop_first() {
+                    want.insert(0, low);
+                }
+            }
         }
-        st.own_pages = Some(pages);
+        let txnid = self.txnid;
+        let gone: Vec<u64> = st
+            .own
+            .keys()
+            .filter(|seq| !want.contains_key(seq))
+            .copied()
+            .collect();
+        for seq in gone {
+            st.own.remove(&seq);
+            let existed = self.delete_tree(TreeId::Free, &gc_key_encode(GcKey { txnid, seq }))?;
+            debug_assert!(existed, "own GC record {seq} missing from the tree");
+        }
+        for (seq, piece) in want {
+            if st.own.get(&seq) != Some(&piece) {
+                self.put_pil(GcKey { txnid, seq }, &piece)?;
+                st.own.insert(seq, piece);
+            }
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::env::testutil::mem_env;
+
+    const PS: u32 = 4096;
+
+    /// The free tree's records, as `put_own_records` left them.
+    fn records(txn: &RwTxn<'_>) -> BTreeMap<GcKey, Vec<u64>> {
+        let rec = txn.free_db;
+        let mut out = BTreeMap::new();
+        if rec.root == PGNO_INVALID {
+            return out;
+        }
+        let tree = Tree::new(txn.source(), txn.psize, rec.root, rec.depth);
+        let mut c = tree.cursor();
+        let mut e = c.first().unwrap();
+        while let Some((k, v)) = e {
+            out.insert(gc_key_decode(k).unwrap(), pil_decode(v).unwrap());
+            e = c.next().unwrap();
+        }
+        out
+    }
+
+    /// Writes `ids` and checks the tree holds exactly `st.own`, within the
+    /// cap and the ranges (INV-29), and lists exactly `ids`.
+    fn put_and_check(txn: &mut RwTxn<'_>, st: &mut SaveLoop, ids: &[u64]) -> Vec<u64> {
+        txn.put_own_records(ids, st).unwrap();
+        let recs = records(txn);
+        let own: BTreeMap<GcKey, Vec<u64>> = st
+            .own
+            .iter()
+            .map(|(&seq, v)| {
+                (
+                    GcKey {
+                        txnid: txn.txnid,
+                        seq,
+                    },
+                    v.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(recs, own, "tree and bookkeeping disagree");
+        let seqs: Vec<u64> = st.own.keys().copied().collect();
+        assert_eq!(seqs.first(), Some(&0), "the first record is keyed 0");
+        for (i, (seq, v)) in st.own.iter().enumerate() {
+            assert!(!v.is_empty() && v.len() <= gc_chunk_cap(PS));
+            assert!(v[0] >= *seq);
+            if let Some(next) = seqs.get(i + 1) {
+                assert!(*v.last().unwrap() < *next, "record {seq} past {next}");
+            }
+        }
+        let all: Vec<u64> = st.own.values().flatten().copied().collect();
+        assert_eq!(all, ids);
+        seqs
+    }
+
+    /// GC-11 step (c): the first write cuts the list into records of `K`;
+    /// later writes keep the ranges, split a range that grew past `K` at an
+    /// id inside it, delete a range that emptied, and re-key the lowest
+    /// record 0 when record 0 is gone, so an id below every key still has a
+    /// range.
+    #[test]
+    fn own_records_keep_their_ranges_across_iterations() {
+        let env = mem_env(PS, 1 << 22);
+        let mut txn = env.write_txn().unwrap();
+        let cap = gc_chunk_cap(PS) as u64;
+        let mut st = SaveLoop {
+            pending: BTreeSet::new(),
+            inner_iters: 0,
+            inner_budget: 0,
+            own: BTreeMap::new(),
+        };
+        // 2.5 records' worth of even ids from 100.
+        let mut ids: Vec<u64> = (0..cap * 5 / 2).map(|i| 100 + 2 * i).collect();
+        let seqs = put_and_check(&mut txn, &mut st, &ids);
+        assert_eq!(seqs, vec![0, 100 + 2 * cap, 100 + 4 * cap]);
+
+        // Odd ids join the first range: it holds 2K - 1 ids, cut in two.
+        let first_end = 100 + 2 * cap;
+        ids.extend((0..cap - 1).map(|i| 101 + 2 * i));
+        ids.sort_unstable();
+        assert!(ids.iter().filter(|&&p| p < first_end).count() > cap as usize);
+        let seqs = put_and_check(&mut txn, &mut st, &ids);
+        assert_eq!(seqs.len(), 4, "the grown range split: {seqs:?}");
+        assert!(seqs[1] > 0 && seqs[1] < first_end);
+
+        // Every id below the third key goes: records 0 and its split piece
+        // are deleted, and the lowest survivor is re-keyed 0.
+        let third = seqs[2];
+        ids.retain(|&p| p >= third);
+        let seqs = put_and_check(&mut txn, &mut st, &ids);
+        assert_eq!(seqs.len(), 2);
+
+        // An id below everything lands in record 0, which was full (K ids):
+        // it splits again.
+        ids.insert(0, 3);
+        let seqs = put_and_check(&mut txn, &mut st, &ids);
+        assert_eq!(st.own[&0][0], 3);
+        assert_eq!(seqs.len(), 3);
+
+        // Emptying the last record deletes it.
+        let last = *st.own.keys().last().unwrap();
+        ids.retain(|&p| p < last);
+        let after = put_and_check(&mut txn, &mut st, &ids);
+        assert_eq!(after, seqs[..2]);
+        txn.abort();
     }
 }
