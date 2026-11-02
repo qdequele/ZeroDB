@@ -6,6 +6,7 @@ mod ascending_fill_parity;
 mod copy_to_file_differential;
 mod cursor_delete_position;
 mod cursor_put_position;
+mod cursor_put_reserved_parity;
 mod dbi_handle_lifetime;
 mod env_info_differential;
 mod env_lifecycle_differential;

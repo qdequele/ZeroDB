@@ -1106,6 +1106,11 @@ spilling bullet there.)
   - The engine MUST NOT zero the reserved region (SPEC 01 §S3: parity with
     writemap peek; the caller sees uninitialized-but-owned space). This differs
     from a normal `put`, which copies the caller's value.
+  - The write cursor's form, `RwCursor::put_reserved(flags, key, len, f)`
+    (heed's `put_current_reserved_with_flags`, `mdb_cursor_put` with
+    `MDB_RESERVE`), follows the same rules and takes `put_with_flags`'
+    flags. The slot is placed before `f` runs, so a put rejected by its
+    checks or flags never calls `f` (SPEC 03 §7).
 - **TXN-48** — After the write txn commits or aborts, any `ReservedSpace`-derived
   pointer is invalid (the frame/map page may be reused or the txn's frames
   dropped). This mirrors SPEC 01 §S3's "after commit/abort the pointer is

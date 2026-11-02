@@ -287,6 +287,29 @@ impl<'txn> RwGuts<'txn> {
             .put(crate::database::to_zdb_put_flags(flags), key, data)?;
         Ok(())
     }
+
+    /// heed's `put_current_reserved_with_flags`: the engine places the value
+    /// first, then the closure fills it in place (`MDB_RESERVE`).
+    fn put_current_reserved_with_flags<F>(
+        &mut self,
+        flags: PutFlags,
+        key: &[u8],
+        data_size: usize,
+        write_func: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(&mut crate::ReservedSpace) -> std::io::Result<()>,
+    {
+        let mut outcome: std::io::Result<()> = Ok(());
+        self.cursor.put_reserved(
+            crate::database::to_zdb_put_flags(flags),
+            key,
+            data_size,
+            |slot| outcome = crate::reserved_space::fill_slot(slot, write_func),
+        )?;
+        outcome.map_err(Error::Io)?;
+        Ok(true)
+    }
 }
 
 /// Defines a read-write iterator type; `C` as for `ro_iterator!`.
@@ -367,7 +390,10 @@ macro_rules! rw_iterator {
                 self.guts.put_current_with_flags(flags, &kb, &vb)
             }
 
-            /// Reserve-and-write the current entry.
+            /// Reserve `data_size` bytes for `key`'s value through the cursor
+            /// and let `write_func` fill them in place (`MDB_RESERVE`). The
+            /// closure runs only once the space is reserved; a same-size
+            /// overwrite hands it the old value's bytes.
             ///
             /// # Safety
             ///
@@ -375,7 +401,8 @@ macro_rules! rw_iterator {
             ///
             /// # Errors
             ///
-            /// As `Database::put_reserved`.
+            /// As `Database::put_reserved`, plus `Mdb(KeyExist)` for
+            /// `APPEND`/`NO_OVERWRITE`, in which case the closure never runs.
             pub unsafe fn put_current_reserved_with_flags<'a, F>(
                 &mut self,
                 flags: PutFlags,
@@ -388,13 +415,8 @@ macro_rules! rw_iterator {
                 F: FnOnce(&mut crate::ReservedSpace) -> std::io::Result<()>,
             {
                 let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
-                let mut buf = vec![0u8; data_size];
-                {
-                    let mut space = crate::ReservedSpace::new(&mut buf);
-                    write_func(&mut space).map_err(|e| Error::Encoding(Box::new(e)))?;
-                }
-                self.guts.put_current_with_flags(flags, &kb, &buf)?;
-                Ok(true)
+                self.guts
+                    .put_current_reserved_with_flags(flags, &kb, data_size, write_func)
             }
 
             /// Iteration method shim (no DUPSORT — no-op retag).

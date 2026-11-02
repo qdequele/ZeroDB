@@ -29,13 +29,15 @@ impl<'env> RwTxn<'env> {
     /// [`delete_at_path`](Self::delete_at_path). When that entry's key is not
     /// `key`, nothing changes ([`PathPut::Elsewhere`]): the caller runs the
     /// keyed put. The caller handles the sequential-writes and flag variants
-    /// of a put; this is the plain overwrite.
+    /// of a put; this is the plain overwrite. A `ValSrc::Reserve` value is
+    /// placed but not written (TXN-47): a same-size inline overwrite leaves
+    /// the old value's bytes in its slot.
     pub(super) fn put_at_path(
         &mut self,
         tree: TreeId,
         path: &mut [(u64, usize)],
         key: &[u8],
-        val: &[u8],
+        val: ValSrc<'_>,
     ) -> Result<PathPut> {
         self.guard_ok()?;
         // The key is the stored one, so it already passed the key bounds;
@@ -68,7 +70,9 @@ impl<'env> RwTxn<'env> {
                 }
             };
             if let Some(off) = at {
-                frame[off..off + val.len()].copy_from_slice(val);
+                if let ValSrc::Val(v) = val {
+                    frame[off..off + v.len()].copy_from_slice(v);
+                }
                 return Ok(PathPut::Kept);
             }
         } else {
@@ -83,7 +87,7 @@ impl<'env> RwTxn<'env> {
             }
         }
         let depth = self.record(tree).depth;
-        if let Err(e) = self.put_apply(tree, path, true, key, ValSrc::Val(val), 0) {
+        if let Err(e) = self.put_apply(tree, path, true, key, val, 0) {
             // Mid-mutation failure: poison (TXN-59), as `put_tree` does.
             self.errored = true;
             return Err(e);
@@ -117,6 +121,42 @@ impl<'env> RwTxn<'env> {
             kept,
             "kept cursor path diverges from a fresh descent after a put"
         );
+    }
+
+    /// The bytes of the value a `ValSrc::Reserve(len)` put at the write
+    /// cursor's parked path just placed at leaf slot `at` (or, when the path
+    /// could not be kept, wherever `key` now lives), for the caller to fill:
+    /// the inline value in the leaf, or the overflow run its cell names.
+    pub(super) fn parked_slot(
+        &mut self,
+        tree: TreeId,
+        key: &[u8],
+        len: usize,
+        at: Option<(u64, usize)>,
+    ) -> Result<&mut [u8]> {
+        let (lpg, ki) = match at {
+            Some(at) => at,
+            None => {
+                let (path, found) = self.search_path(tree, key)?;
+                debug_assert!(found, "reserved key must be present");
+                *path.last().expect("non-empty path")
+            }
+        };
+        let head = {
+            let frame = self.dirty.bytes(lpg).expect("leaf is dirty");
+            let leaf = LeafRef::new_prevalidated(frame, self.psize).map_err(map_page_err)?;
+            match leaf.value(ki) {
+                LeafValue::Inline(_) => None,
+                LeafValue::Overflow { head_pgno, .. } => Some(head_pgno),
+            }
+        };
+        let loc = match head {
+            Some(head) => ReserveLoc::Big(head),
+            None => ReserveLoc::Inline {
+                at: Some((lpg, ki)),
+            },
+        };
+        self.reserved_slot(tree, key, len, loc)
     }
 }
 
@@ -419,7 +459,7 @@ impl RwCursor<'_, '_> {
             return Ok(false);
         };
         let tree = self.txn.ensure_open(&self.db)?;
-        if self.put_at_parked(tree, &key, value)? {
+        if self.put_at_parked(tree, &key, ValSrc::Val(value))? {
             return Ok(true);
         }
         self.txn
@@ -440,7 +480,12 @@ impl RwCursor<'_, '_> {
     ///
     /// Sequential-writes trees take the keyed put: their rightmost-leaf
     /// finger bookkeeping lives on that path.
-    pub(super) fn put_at_parked(&mut self, tree: TreeId, key: &[u8], value: &[u8]) -> Result<bool> {
+    pub(super) fn put_at_parked(
+        &mut self,
+        tree: TreeId,
+        key: &[u8],
+        val: ValSrc<'_>,
+    ) -> Result<bool> {
         if self.on_vacated_slot || self.txn.seq_writes_on(tree) {
             return Ok(false);
         }
@@ -453,7 +498,7 @@ impl RwCursor<'_, '_> {
         // The path stays parked during the put: an error that rejects the put
         // before any mutation (an oversized value, a poisoned txn) leaves the
         // cursor exactly where it was, as the keyed put's error does.
-        match self.txn.put_at_path(tree, saved.frames_mut(), key, value)? {
+        match self.txn.put_at_path(tree, saved.frames_mut(), key, val)? {
             PathPut::Elsewhere => return Ok(false),
             PathPut::Kept => {}
             // A split kept the path on the entry; only a root grow adds a
@@ -502,7 +547,7 @@ impl RwCursor<'_, '_> {
         // A plain put of the key under the cursor is an overwrite at the
         // cursor's position (heed's `put_current`); every flag keeps the keyed
         // path, which owns their semantics.
-        if flags == PutFlags::EMPTY && self.put_at_parked(tree, key, value)? {
+        if flags == PutFlags::EMPTY && self.put_at_parked(tree, key, ValSrc::Val(value))? {
             return Ok(());
         }
         self.txn
@@ -511,6 +556,68 @@ impl RwCursor<'_, '_> {
         self.saved = None;
         self.on_vacated_slot = false;
         self.pos = CurPos::At(key.to_vec());
+        Ok(())
+    }
+
+    /// Reserved put through the cursor (`mdb_cursor_put` with
+    /// `MDB_RESERVE`, SPEC 04 TXN-47): as [`RwCursor::put`], except that the
+    /// engine places a `len`-byte value and hands `f` the mutable slice inside
+    /// the dirty leaf, or the overflow run, to fill in place. A same-size
+    /// overwrite of an inline value hands back the old value's bytes; any
+    /// other slot holds unspecified bytes until `f` writes them. The slice
+    /// lives only for the call to `f`.
+    ///
+    /// `f` runs only once the value is placed: a rejected put (bad key or
+    /// size, `NO_OVERWRITE` on an existing key, `APPEND` out of order)
+    /// returns its error without calling it. A put rejected with
+    /// [`MdbError::KeyExist`] leaves the cursor where LMDB does: on the
+    /// existing key under `NO_OVERWRITE`, on the last entry under `APPEND`.
+    ///
+    /// # Errors
+    ///
+    /// As [`RwCursor::put`].
+    pub fn put_reserved(
+        &mut self,
+        flags: PutFlags,
+        key: &[u8],
+        len: usize,
+        f: impl FnOnce(&mut [u8]),
+    ) -> Result<()> {
+        let tree = self.txn.ensure_open(&self.db)?;
+        // A plain reserve of the key under the cursor is placed at the parked
+        // path, as `put` does.
+        if flags == PutFlags::EMPTY && self.put_at_parked(tree, key, ValSrc::Reserve(len))? {
+            let at = self.saved.as_ref().and_then(SavedCursor::entry_pos);
+            f(self.txn.parked_slot(tree, key, len, at)?);
+            return Ok(());
+        }
+        let loc = match self.txn.put_tree(tree, key, flags, ValSrc::Reserve(len)) {
+            Ok(loc) => loc,
+            Err(e @ Error::Mdb(MdbError::KeyExist)) => {
+                self.park_on_existing(flags, key)?;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+        self.saved = None;
+        self.on_vacated_slot = false;
+        self.pos = CurPos::At(key.to_vec());
+        f(self.txn.reserved_slot(tree, key, len, loc)?);
+        Ok(())
+    }
+
+    /// Position the cursor where LMDB's `mdb_cursor_put` leaves it after
+    /// rejecting a put with `KeyExist`: `APPEND` compared the key with the
+    /// last entry, which the cursor now sits on; `NO_OVERWRITE` found the
+    /// key.
+    fn park_on_existing(&mut self, flags: PutFlags, key: &[u8]) -> Result<()> {
+        if flags.contains(PutFlags::APPEND) {
+            self.drive(Step::Last)?;
+        } else {
+            self.saved = None;
+            self.on_vacated_slot = false;
+            self.pos = CurPos::At(key.to_vec());
+        }
         Ok(())
     }
 

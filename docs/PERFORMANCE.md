@@ -208,7 +208,7 @@ LMDB". Ratios are before → after.
 |---|---|---|
 | <a id="b1"></a>Write cursor keeps its path | The write cursor parks and resumes its path instead of re-seeking by key; a delete, a same-key put and a split keep the path, as LMDB fixes up its cursors. | Graviton4: `put/cursor/rewrite` 2.50× → 1.37×, `del/cursor/drain` 2.62× → 2.15× |
 | <a id="b4"></a>Batched writes | Contiguous dirty pages go out in `pwritev` batches of at most 256 KiB, LMDB's 64 pages (`MDB_COMMIT_PAGES`), as `mdb_page_flush`. Batches used to reach 2 MiB, which left the file in large page-cache folios on kernels that use them, so every later one-page rewrite paid far more kernel time (#135). Cost: bulk fresh large values, `put/val/v4k` 0.99× → 1.10×. | 10M-key single-put no-sync commit p50 12.1–12.6 → 8.7–8.8 µs (LMDB 7.6–7.9); Meilisearch hackernews additions 1.00× → 0.92× (WC) |
-| <a id="b6"></a>Reserved puts write in place | `put_reserved` hands the caller the page slot directly, as `MDB_RESERVE`. The cursor form still stages its value; it is to be built in place, as LMDB does (#10). | `put/api/reserved` 0.96× |
+| <a id="b6"></a>Reserved puts write in place | `put_reserved` and the cursor form `put_current_reserved_with_flags` hand the caller the page slot directly, as `MDB_RESERVE`. | `put/api/reserved` 0.96× |
 | <a id="b11"></a>Writer slot without a syscall | Releasing a write txn wakes a waiter only if one waits. | `rw_empty_commit` 5.93× → 2.19× |
 | Reused descent path; in-place `APPEND` check | One path buffer per write txn; `APPEND` compares the last key in place. | `put/order/append` 1.32× → 1.19× |
 | <a id="b18"></a>Dirty frame pool | Page buffers are reused within and across write txns, as LMDB's `me_dpages`. | `put/gc/drain_big` 1.58× → 1.17× |
