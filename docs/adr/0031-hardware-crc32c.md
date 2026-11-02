@@ -1,9 +1,10 @@
 # ADR-0031: Hardware CRC32C for the meta checksum
 
 - Status: **Accepted (Option B, aarch64 only, maintainer, 2026-10-19),
-  implemented.** It amends the `unsafe` policy in `AGENTS.md`. Drafted as
-  ADR-0029 and renumbered on 2026-10-20, when the branch was rebased on
-  `main`, where 0029 is the free-page run search.
+  implemented; Option D added to the hardware path on 2026-11-02 (see the
+  amendment), awaiting maintainer review.** It amends the `unsafe` policy
+  in `AGENTS.md`. Drafted as ADR-0029 and renumbered on 2026-10-20, when
+  the branch was rebased on `main`, where 0029 is the free-page run search.
 - Related: #117 (the slicing-by-8 table, the software path on `main`);
   the 2026-10-19 benchmark runs (slicing table, hardware CRC, Graviton4); ADR-0002 §D1; ADR-0022.
 - Date: 2026-10-19
@@ -217,6 +218,27 @@ CRC 10.53 → 2.44 µs; single-delete commit 21.96 → 17.19 µs, paired
 0.68–0.80 over 7 runs. A 3-round criterion run at load 14 was invalid (LMDB
 drift up to 16 %); `del/random/n1` read 0.772 (±0.288). Not rerun on
 Graviton.
+
+### Amendment (2026-11-02): Option D's three streams, with table shifts
+
+Issue #146 profiled a delete-per-transaction run on Linux aarch64: the meta
+encode and its CRC were about 7 % of a commit, and the single `crc32cx`
+chain is latency-bound. The hardware path now runs Option D: inputs of at
+least 768 bytes are cut into chunks of three 256-byte blocks, checksummed as
+three independent streams and joined by shifting the first two partial CRCs
+forward by two blocks and one block. The shift is a multiplication by
+`x^(8n)` modulo the polynomial, done as four lookups in a 4 KiB table built
+at compile time for each of the two block lengths (safe code, no `pmull`, so
+the `unsafe` call site and the detected feature are unchanged). Shorter
+inputs, such as the 172-byte fixed part, take the single stream as before.
+The bytes and checksums are unchanged: tests compare the path with the table
+path on every length around one and two chunks and on random inputs up to
+five chunks, and check each shift table against folding zero bytes.
+
+Standalone timing on an M1 Pro (minimum over 300 batches, host heavily
+loaded): 490 ids (a full annex at 4 KiB pages) 464 → 175 ns, 2,026 ids
+(16 KiB pages) 1,982 → 741 ns, 8,170 ids (64 KiB pages) 8,068 → 3,030 ns,
+and no change under 96 words. Not yet measured on Graviton.
 
 ## Open questions for human review
 
