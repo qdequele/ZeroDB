@@ -137,12 +137,25 @@ newest steady meta. The promise after **any crash**, process or power loss:
      is made steady instead, so even a single oversized commit is never
      weak);
    - no weak commit older than `max_period` while the environment is open
-     in a live process (see the stages: until the background flusher ships,
-     this bound holds at commit time only).
-4. **A process crash loses nothing.** When the machine did not reboot, the
-   OS page cache holds every write, and recovery keeps the weak head (see
-   recovery below). Only power loss or an OS crash can cost the window.
-   Process crashes (OOM kills, panics, deploys) are the common case.
+     in a live process and no write transaction holds the writer lock (see
+     the stages: until the background flusher ships, this bound holds at
+     commit time only). The flusher needs the writer lock (§9), so a weak
+     commit followed by a long write transaction stays in the window until
+     that transaction commits: the time bound stretches by the length of
+     that transaction. The commit-count and byte bounds are unaffected.
+     Open question 9 asks whether to remove this exception.
+4. **A process crash loses at most the window, and usually nothing.** When
+   the machine did not reboot, the OS page cache holds every completed
+   write, and recovery keeps the weak head (see recovery below). The one
+   exception is a page size larger than the OS page: a kill can then cut
+   short a weak commit's meta write, which overwrites the previous weak
+   head in place (Option A). Recovery finds neither valid and lands on the
+   steady meta, losing the weak commits since it, including acknowledged
+   ones; the loss still stays within the bounds of point 3. With the
+   default page size (one OS page) a meta write cannot be torn by a kill,
+   and a process crash loses nothing. Power loss or an OS crash can cost
+   the window. Process crashes (OOM kills, panics, deploys) are the common
+   case.
 
 The window is a *loss* bound, not a *latency* bound: a commit in the
 window is visible to every reader at once, as with `NO_SYNC`.
@@ -599,3 +612,18 @@ injected so `max_period` is deterministic.
 8. **API surface in the heed adapter**: `wait_durable` takes a txnid, and
    heed's `RwTxn::commit` returns none. Add `commit_with_txnid` under the
    fork feature (ADR-0027), or offer only `wait_durable_head()`?
+9. **`max_period` during a long write transaction** (point 3). Accept that
+   the time bound stretches while a write transaction holds the writer
+   lock, or design a flush that does not need the lock: the flusher would
+   flush the data pages of the committed weak head and write a steady
+   copy of its meta into the steady slot, ordered against the running
+   writer's meta write. Recommended: accept it for stages 1 to 3. A long
+   indexing transaction ends in a commit that applies the bounds, and the
+   loss stays within `max_commits` and `max_bytes`.
+10. **Torn weak metas with large pages** (point 4). Accept the loss of the
+    weak commits since the steady meta when a kill tears a multi-OS-page
+    meta write, or keep the previous weak head as a fallback (Option B's
+    third slot, or writing each weak meta to the slot that does not hold
+    the head when the steady meta is older)? Recommended: accept it. It
+    needs a page size above the OS page, a kill inside one `pwrite`, and
+    stays within the bounds.
