@@ -67,6 +67,7 @@ impl CommonHeader {
     ///
     /// The caller must guarantee `buf.len() >= HEADER_SIZE`.
     #[must_use]
+    #[inline]
     pub fn read(buf: &[u8]) -> CommonHeader {
         CommonHeader {
             pgno: read_u64(buf, OFF_PGNO),

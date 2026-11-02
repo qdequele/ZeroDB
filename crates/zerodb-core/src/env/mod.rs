@@ -833,6 +833,7 @@ impl EnvInner {
     /// engine-internal `DBRecord` bytes. A named DB is whatever was registered
     /// for its dbi, defaulting to memcmp.
     #[must_use]
+    #[inline]
     pub fn comparator_for(&self, sel: crate::rotxn::DbSel) -> KeyCmp<'_> {
         match sel {
             crate::rotxn::DbSel::Main => KeyCmp::Default,
@@ -1088,6 +1089,7 @@ impl EnvInner {
     /// txn's life, so the returned slice is valid `'env`. Returns an empty slice
     /// only after close has released the map (never observed by a live txn).
     #[must_use]
+    #[inline]
     pub fn backing_bytes(&self) -> &[u8] {
         match self.backing.as_ref() {
             Some(b) => b.bytes(),
@@ -1183,6 +1185,7 @@ impl std::fmt::Debug for Env {
 impl Env {
     /// Access the shared inner state.
     #[must_use]
+    #[inline]
     pub(crate) fn inner(&self) -> &Arc<EnvInner> {
         &self.inner
     }
@@ -1214,6 +1217,7 @@ impl Env {
     /// and a transaction belong to the same environment, as heed does with its
     /// `MDB_env` pointer.
     #[must_use]
+    #[inline]
     pub fn ident(&self) -> usize {
         Arc::as_ptr(self.inner()) as *const () as usize
     }
