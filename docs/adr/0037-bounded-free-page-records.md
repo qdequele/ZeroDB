@@ -1,6 +1,6 @@
 # ADR-0037: Bounded free-page records
 
-- Status: Proposed
+- Status: Accepted (Option C, maintainer decision 2026-11-02); not implemented
 - Related issue: #30 (also #146, cost 3; #32)
 - Date: 2026-11-02
 
@@ -343,7 +343,9 @@ Against today's engine; "LMDB" says where LMDB stands on the same line.
 
 ## Decision
 
-Proposed: **Option C**, the composite key.
+**Option C**, the composite key: maintainer decision 2026-11-02, which
+approves the format change (`FORMAT_VERSION` 3). The draft's reasoning,
+kept for the record:
 
 It bounds the records where they are created, so neither the freeing
 transaction, nor the first draw, nor any later commit pays for the whole
@@ -354,7 +356,7 @@ removes overflow values from the free-page database, which deletes a
 subtle part of `freelist_save` (the GC-13 (v) guard) rather than adding one.
 The format bump is cheap now (no users) and expensive later.
 
-If a format bump is not wanted now, Option B is the fallback: LMDB's own
+Option B was the fallback had a format bump not been wanted: LMDB's own
 technique, no format change, and it already removes the per-commit cost
 after the first draw.
 
@@ -376,8 +378,8 @@ after the first draw.
 
 ## Open questions for human review
 
-1. Option C (format 3, bounded at write) or Option B (format 2, LMDB's
-   re-split after the first draw)?
+1. ~~Option C (format 3, bounded at write) or Option B (format 2, LMDB's
+   re-split after the first draw)?~~ Closed with Option C (2026-11-02).
 2. Refuse version-2 files at open (as format 2 did), or carry the lazy
    in-place upgrade described under Option C?
 3. Chunk size: the most that fits inline (`K` above), or smaller so a leaf
