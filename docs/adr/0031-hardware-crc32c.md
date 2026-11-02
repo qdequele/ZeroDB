@@ -238,7 +238,9 @@ five chunks, and check each shift table against folding zero bytes.
 Standalone timing on an M1 Pro (minimum over 300 batches, host heavily
 loaded): 490 ids (a full annex at 4 KiB pages) 464 → 175 ns, 2,026 ids
 (16 KiB pages) 1,982 → 741 ns, 8,170 ids (64 KiB pages) 8,068 → 3,030 ns,
-and no change under 96 words. Not yet measured on Graviton.
+and no change under 96 words. Graviton4, 4 KiB pages (at most 490 ids):
+a single-delete commit takes about 120 user-space cycles less (−0.5 %), the
+ladder reads flat (`benches/results/2026-11-02-commit-cpu-graviton.md`).
 
 ## Open questions for human review
 
