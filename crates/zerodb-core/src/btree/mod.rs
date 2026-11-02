@@ -643,58 +643,72 @@ impl<'a> Tree<'a> {
     pub fn cursor(&self) -> Cursor<'a> {
         Cursor::new(*self)
     }
+}
 
-    /// The entry at a known `(leaf pgno, cell index)` position:
-    /// used by the write cursor to re-materialize the borrows of a position it
-    /// computed while holding a *different* borrow of the txn. Goes through the
-    /// txn's validated-pages memo, so no re-validation on the hot path.
-    ///
-    /// The caller vouches that `(pgno, ki)` is a live leaf position in **this**
-    /// tree state (the write cursor only replays positions it just derived,
-    /// with no mutation in between — it holds the `&mut RwTxn` exclusively).
-    ///
-    /// # Errors
-    ///
-    /// A [`PageError`] if the page is not a valid leaf or `ki` is out of range.
-    pub(crate) fn entry_at(&self, pgno: u64, ki: usize) -> Result<(&'a [u8], &'a [u8]), PageError> {
-        let leaf = leaf_view(self.src, self.psize, pgno, self.valid)?;
-        let n = leaf.num_keys();
-        if ki >= n {
-            // Unreachable under the caller contract; surfaced as an
-            // out-of-bounds cell rather than a panic so a logic error degrades
-            // to `Invalid`, not UB-adjacent behavior.
-            debug_assert!(false, "entry_at({pgno}, {ki}) past num_keys={n}");
-            return Err(PageError::CellOutOfBounds {
-                offset: ki,
-                needed: 1,
-                body_size: n,
-            });
-        }
-        let k = leaf.key(ki);
-        let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
-        Ok((k, v))
+/// The entry at a known `(leaf pgno, cell index)` position:
+/// used by the write cursor to re-materialize the borrows of a position it
+/// computed while holding a *different* borrow of the txn. Goes through the
+/// txn's validated-pages memo, so no re-validation on the hot path. It reads
+/// one leaf, so it needs no [`Tree`] around it.
+///
+/// The caller vouches that `(pgno, ki)` is a live leaf position in the
+/// current tree state (the write cursor only replays positions it just
+/// derived, with no mutation in between — it holds the `&mut RwTxn`
+/// exclusively).
+///
+/// # Errors
+///
+/// A [`PageError`] if the page is not a valid leaf or `ki` is out of range.
+pub(crate) fn leaf_entry_at<'a>(
+    src: Source<'a>,
+    psize: u32,
+    pgno: u64,
+    ki: usize,
+    valid: Option<&ValidatedPages<'_>>,
+) -> Result<Entry<'a>, PageError> {
+    let leaf = leaf_view(src, psize, pgno, valid)?;
+    let n = leaf.num_keys();
+    if ki >= n {
+        // Unreachable under the caller contract; surfaced as an
+        // out-of-bounds cell rather than a panic so a logic error degrades
+        // to `Invalid`, not UB-adjacent behavior.
+        debug_assert!(false, "leaf_entry_at({pgno}, {ki}) past num_keys={n}");
+        return Err(PageError::CellOutOfBounds {
+            offset: ki,
+            needed: 1,
+            body_size: n,
+        });
     }
+    let k = leaf.key(ki);
+    let v = resolve_value(src, psize, &leaf, ki, valid)?;
+    Ok((k, v))
+}
 
-    /// The entry in slot `ki` of leaf `pgno`, or `None` when `ki` is past the
-    /// leaf's last cell: the write cursor's in-leaf step (LMDB's
-    /// `mdb_cursor_next` reading the node at `mc_ki` in the page it already
-    /// holds), which needs no cursor rebuilt around its parked path.
-    ///
-    /// The caller vouches that `pgno` is a live leaf of this tree state, as
-    /// for [`entry_at`](Self::entry_at); only `ki` may run past the end.
-    ///
-    /// # Errors
-    ///
-    /// A [`PageError`] if the page is not a valid leaf.
-    pub(crate) fn entry_in_leaf(&self, pgno: u64, ki: usize) -> PosResult<'a> {
-        let leaf = leaf_view(self.src, self.psize, pgno, self.valid)?;
-        if ki >= leaf.num_keys() {
-            return Ok(None);
-        }
-        let k = leaf.key(ki);
-        let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
-        Ok(Some((k, v)))
+/// The entry in slot `ki` of leaf `pgno`, or `None` when `ki` is past the
+/// leaf's last cell: the write cursor's in-leaf step (LMDB's
+/// `mdb_cursor_next` reading the node at `mc_ki` in the page it already
+/// holds), which needs no cursor rebuilt around its parked path.
+///
+/// The caller vouches that `pgno` is a live leaf of the current tree state,
+/// as for [`leaf_entry_at`]; only `ki` may run past the end.
+///
+/// # Errors
+///
+/// A [`PageError`] if the page is not a valid leaf.
+pub(crate) fn leaf_entry_in<'a>(
+    src: Source<'a>,
+    psize: u32,
+    pgno: u64,
+    ki: usize,
+    valid: Option<&ValidatedPages<'_>>,
+) -> PosResult<'a> {
+    let leaf = leaf_view(src, psize, pgno, valid)?;
+    if ki >= leaf.num_keys() {
+        return Ok(None);
     }
+    let k = leaf.key(ki);
+    let v = resolve_value(src, psize, &leaf, ki, valid)?;
+    Ok(Some((k, v)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1509,7 +1523,7 @@ impl SavedCursor {
     }
 
     /// Move the parked leaf slot to `ki` (the write cursor's in-leaf step,
-    /// [`Tree::entry_in_leaf`]). The caller has checked that `ki` is a live
+    /// [`leaf_entry_in`]). The caller has checked that `ki` is a live
     /// slot of the parked leaf.
     pub(crate) fn set_leaf_slot(&mut self, ki: usize) {
         if let Some(frame) = self.stack.frames_mut().last_mut() {
