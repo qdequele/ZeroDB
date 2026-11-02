@@ -4,6 +4,15 @@ Date: 2026-11-02. Design under test: [ADR-0011](adr/0011-dupsort.md).
 Code: the `dupsort-spike` cargo feature, off by default and enabled by no
 consumer build.
 
+## Decision
+
+**No-go, accepted by the maintainer on 2026-11-02.** Duplicate keys stay
+unsupported (a `DUP_SORT` open is refused with `Incompatible`, as before). The
+spike branch is kept, unmerged, as the starting point if a consumer appears. A
+reading of milli's databases found no Meilisearch use that would pay for it:
+most of the index maps a key to a roaring bitmap, which search intersects
+whole, and duplicates would replace that with per-document items.
+
 ## Recommendation
 
 **No-go on an implementation now.** Freeze the on-disk layout decisions on paper
@@ -86,8 +95,10 @@ Found by building the spike, beyond the three paths:
   both need the duplicate rule.
 - **Invariant IDs collide.** ADR-0011 numbers its duplicate invariants
   INV-22..27, but SPEC 05 uses INV-22..28 for the free list, and both appear in
-  `check` output. Duplicate invariants must start at **INV-29**; the spike uses
-  INV-29 for sub-page well-formedness.
+  `check` output. Format 3's free-list records (ADR-0037) have since taken
+  INV-29 as well, so duplicate invariants must start at the next free ID
+  (**INV-30** today), and the SPEC should reserve a block for them. The spike
+  uses INV-30 for sub-page well-formedness.
 - **Every physical-walk caller needs a decision.** The cell walk is used by the
   compacting copy, `dump`, `migrate-from-lmdb` (which also creates databases
   without flags) and the tests that compare content through it. The stream
@@ -113,6 +124,11 @@ are record-relative (offsets 42..48): in the meta they sit at 162..168, inside
 the CRC range `[0, 172)`, and in a named database they sit in the catalog
 value. The annex changes nothing the design uses, and the spike reads and
 writes DUPSORT records under version 2 with no format change.
+
+**Format version 3 (16-byte free-list keys, ADR-0037)**, merged after the
+spike, changes only the free-list tree's keys and values. The record, leaf
+cell and meta layouts the design uses are unchanged, so the check above
+still holds.
 
 **ADR-0020 (24-byte page header).**
 
@@ -152,7 +168,8 @@ The issue's recorded list, still valid:
 
      The parent record's page counters do not include sub-tree pages
      (SPEC 03 §12.1 O2).
-3. **Renumber the duplicate invariants** from INV-29.
+3. **Renumber the duplicate invariants** from the next free ID (INV-30 today), and
+   reserve a block for them in the SPEC.
 4. **Fix the oracle's iteration blind spot.** The harness stops at the first
    error in both engines, so "errored, then continued differently" compares as
    equal.

@@ -654,27 +654,27 @@ impl<'s, 'a> Checker<'s, 'a> {
     fn check_dup_cell(&mut self, pgno: u64, i: usize, v: LeafValue<'_>, stats: &mut WalkStats) {
         let LeafValue::Inline(v) = v else {
             self.fail(
-                "INV-29",
+                "INV-30",
                 format!("leaf {pgno} entry {i}: duplicate set on overflow"),
             );
             return;
         };
         match crate::page::subpage::SubPage::parse(v) {
             Err(e) => self.fail(
-                "INV-29",
+                "INV-30",
                 format!("leaf {pgno} entry {i}: bad sub-page: {e}"),
             ),
             Ok(sp) => {
                 if sp.len() < 2 {
                     self.fail(
-                        "INV-29",
+                        "INV-30",
                         format!("leaf {pgno} entry {i}: one-value sub-page"),
                     );
                 }
                 stats.entries += sp.len() as u64 - 1;
                 if (1..sp.len()).any(|j| sp.get(j - 1) >= sp.get(j)) {
                     self.fail(
-                        "INV-29",
+                        "INV-30",
                         format!("leaf {pgno} entry {i}: duplicates not ascending"),
                     );
                 }

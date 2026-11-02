@@ -2,7 +2,7 @@
 
 - Status: Approved — maintainer, 2026-07-20. All five open questions resolved below.
 - Implementation note (2026-10-05): milestone 2.8 parked 2026-07-20; stage A was never merged or pushed (local work only). DUPSORT/DUPFIXED remain unsupported (D-004).
-- Spike (2026-11-02): [docs/DUPSORT-SPIKE.md](../DUPSORT-SPIKE.md). The sub-page design fits format version 2 and the ADR-0020 header unchanged; the duplicate invariants must be numbered from INV-29 (INV-22..28 belong to the free list, SPEC 05). Recommendation: settle the open layout details now, do not implement until a consumer needs it.
+- Spike (2026-11-02): [docs/DUPSORT-SPIKE.md](../DUPSORT-SPIKE.md). The sub-page design fits format versions 2 and 3 and the ADR-0020 header unchanged; the duplicate invariants must take the next free IDs (INV-30 today: INV-22..29 belong to the free list, SPEC 05). **Decision (maintainer, 2026-11-02): no-go** — do not implement until a consumer needs it; the spike branch stays unmerged.
 - Milestone: 2.8 (descoped from 1.7 on 2026-07-15, D-004)
 - Date: 2026-07-20
 
