@@ -547,7 +547,7 @@ injected so `max_period` is deterministic.
 |---|---|---|
 | **Faster** | Unchanged by construction: `min(…, S)` with `S = N−1`, same writes. To be confirmed flat with `just bench-ab`. | Small commits drop from two barriers to `2/k`; per-commit CPU unchanged (#146 is separate). |
 | **Reliable** | The selection rule gains one branch that default files never take. The `meta_flags` check makes recovery stricter. | Closes REC-10's corruption window for this mode, proven by the harness and four mutation tests. More states to test: weak, steady, trusted and untrusted. |
-| **Durable** | Unchanged: every commit steady, nothing lost. | Bounded, configurable loss after power loss; none after a process crash; acknowledged-durable commits never lost. Strictly better than `NO_SYNC` and `NO_META_SYNC`. |
+| **Durable** | Unchanged: every commit steady, nothing lost. | Bounded, configurable loss after power loss; none after a process crash at the default page size (with pages above the OS page, a kill that tears a weak meta write loses the weak commits since the steady meta, within the bounds); acknowledged-durable commits never lost. Strictly better than `NO_SYNC` and `NO_META_SYNC`. |
 | **Secure** | No change. | The boot tag is a new on-disk input. A hostile file can only claim a weak meta is trusted, which is no worse than today's acceptance of any CRC-valid meta; geometry checks (REC-1a) still apply. Reading the macOS sysctl needs one `libc::sysctlbyname` call, an `unsafe` policy amendment in `zerodb-io`. The Linux path reads a file. |
 
 ## Consequences
@@ -591,7 +591,7 @@ injected so `max_period` is deterministic.
    did; there are no users yet), or keep version 2 and accept that older
    binaries are unsafe on files this mode wrote? Recommended: version 3.
 2. **Same-boot trust** (recovery rule 2). Keep it, so process crashes lose
-   nothing, or always roll back to the steady meta as libmdbx's
+   nothing (except the torn-meta case of point 4), or always roll back to the steady meta as libmdbx's
    documentation describes? Recommended: keep it. Process kills are the
    common failure, and a lost acknowledged task after an OOM kill is what
    users would notice.
