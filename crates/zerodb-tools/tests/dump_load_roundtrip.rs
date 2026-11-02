@@ -79,11 +79,14 @@ fn stat_runs_on_a_closed_env() {
 fn stat_reports_bounded_free_records_after_a_large_clear() {
     let a = TempDir::new("stat-clear");
     {
-        let env: Env = EnvOpenOptions::new()
-            .map_size(64 << 20)
-            .page_size(4096)
-            .open(&a)
-            .unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env: Env = unsafe {
+            EnvOpenOptions::new()
+                .map_size(64 << 20)
+                .page_size(4096)
+                .open(&a)
+        }
+        .unwrap();
         let main = env.main_database();
         let mut wtxn = env.write_txn().unwrap();
         for i in 0u32..1500 {
