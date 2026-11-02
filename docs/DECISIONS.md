@@ -49,3 +49,4 @@ tracked in GitHub issues. To propose a decision, copy
 | 0037 | [Bounded free-page records](adr/0037-bounded-free-page-records.md) | Accepted (Option C), implemented | On-disk format, page reclamation |
 | 0038 | [Bounded relaxed durability: steady and weak metas, a durable watermark](adr/0038-bounded-relaxed-durability.md) | Proposed | Durability, page reclamation, on-disk format |
 | 0039 | [Group commit: start the next write transaction during the previous commit's sync](adr/0039-group-commit.md) | Proposed (recommends not building it now) | Durability, concurrency, beyond LMDB |
+| 0041 | [A new tree page is not zero-filled when its memory is reused, as LMDB](adr/0041-fresh-page-zero-fill.md) | Proposed | Performance (writes), bytes on disk |
