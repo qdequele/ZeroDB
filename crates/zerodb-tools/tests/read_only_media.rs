@@ -100,11 +100,14 @@ fn read_only_fs(src: &Path) -> Result<ReadOnlyFs, String> {
 /// A closed native environment holding `live`, with no lock file
 /// (`lock_file(false)`; the default would create one).
 fn closed_env(dir: &Path) {
-    let env: Env = EnvOpenOptions::new()
-        .map_size(1 << 20)
-        .lock_file(false)
-        .open(dir)
-        .unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env: Env = unsafe {
+        EnvOpenOptions::new()
+            .map_size(1 << 20)
+            .lock_file(false)
+            .open(dir)
+    }
+    .unwrap();
     let mut w = env.write_txn().unwrap();
     env.main_database().put(&mut w, b"live", b"1").unwrap();
     w.commit().unwrap();

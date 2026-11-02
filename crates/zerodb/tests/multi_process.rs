@@ -28,7 +28,8 @@ fn open_sized(dir: &Path, map_size: usize) -> Env {
         .page_size(4096)
         .max_readers(16)
         .lock_file(true);
-    o.open(dir).expect("open lock-file env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { o.open(dir) }.expect("open lock-file env")
 }
 
 /// A spawned child process that is killed and reaped when dropped, so a
@@ -516,9 +517,8 @@ fn child_entry_other_readers() {
         .page_size(4096)
         .max_readers(asked)
         .lock_file(true);
-    let env = o
-        .open(Path::new(&dir))
-        .expect("a joiner with another max_readers");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(Path::new(&dir)) }.expect("a joiner with another max_readers");
     assert_eq!(env.info().max_readers, 16, "adopted the lock file's count");
     let mut w = env.write_txn().unwrap();
     env.main_database()
@@ -769,7 +769,8 @@ fn smaller_map_process_commit_keeps_the_larger_meta_size() {
     // Reopen without a map size: the environment adopts the persisted one.
     let mut o = EnvOpenOptions::new();
     o.page_size(4096).max_readers(16).lock_file(true);
-    let env = o.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(dir.path()) }.unwrap();
     assert_eq!(env.info().map_size, 8 * MIB as u64);
 }
 
@@ -811,7 +812,8 @@ fn open_write_map(dir: &Path, map_size: usize) -> Env {
         .max_readers(16)
         .flags(zerodb::EnvFlags::WRITE_MAP)
         .lock_file(true);
-    o.open(dir).expect("open WRITE_MAP lock-file env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { o.open(dir) }.expect("open WRITE_MAP lock-file env")
 }
 
 /// Grows the map 24 times, by 1 MiB each, committing one 64 KiB value after
@@ -937,7 +939,8 @@ fn open_named(dir: &Path, data_name: &str) -> Env {
         .max_readers(16)
         .data_file_name(data_name)
         .lock_file(true);
-    o.open(dir).expect("open named lock-file env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { o.open(dir) }.expect("open named lock-file env")
 }
 
 /// Commit `who` under the key `who` and read it back.
@@ -1003,7 +1006,8 @@ fn prev_snapshot_open_fails_while_another_process_has_the_env() {
 
     let mut o = lock_opts();
     o.flags(zerodb::EnvFlags::PREV_SNAPSHOT);
-    match o.open(dir.path()) {
+    // SAFETY: only ZeroDB writes this environment's files.
+    match unsafe { o.open(dir.path()) } {
         Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EAGAIN), "{e}"),
         other => panic!("expected Io(EAGAIN), got {other:?}"),
     }
@@ -1014,9 +1018,8 @@ fn prev_snapshot_open_fails_while_another_process_has_the_env() {
     mark(dir.path(), "child-stop");
     wait_success(&mut c, Duration::from_secs(30));
 
-    let env = o
-        .open(dir.path())
-        .expect("sole opener: PREV_SNAPSHOT succeeds");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(dir.path()) }.expect("sole opener: PREV_SNAPSHOT succeeds");
     assert!(env.opened_exclusively());
 }
 
@@ -1032,7 +1035,8 @@ fn opened_exclusively_and_exclusive_lock_see_another_process() {
         assert!(env.opened_exclusively(), "the sole opener");
     }
     {
-        let env = EnvOpenOptions::new().open(dir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { EnvOpenOptions::new().open(dir.path()) }.unwrap();
         assert!(env.opened_exclusively(), "no lock file");
     }
 
@@ -1056,7 +1060,11 @@ fn opened_exclusively_and_exclusive_lock_see_another_process() {
 
     let guard = zerodb::ExclusiveLock::acquire(dir.path(), &lock_opts()).expect("alone");
     assert!(
-        matches!(lock_opts().open(dir.path()), Err(Error::EnvAlreadyOpened)),
+        // SAFETY: only ZeroDB writes this environment's files.
+        matches!(
+            unsafe { lock_opts().open(dir.path()) },
+            Err(Error::EnvAlreadyOpened)
+        ),
         "the guard is this process's descriptor of the lock file"
     );
     drop(guard);
@@ -1102,7 +1110,8 @@ fn read_only_env_joins_the_existing_lock_file() {
 
     let mut o = lock_opts();
     o.flags(zerodb::EnvFlags::READ_ONLY);
-    let env = o.open(dir.path()).expect("read-only joiner");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(dir.path()) }.expect("read-only joiner");
     assert!(env.has_lock_file());
     assert!(!env.opened_exclusively(), "joined the child's lock file");
     let r = env.read_txn().unwrap();
@@ -1138,15 +1147,14 @@ fn read_only_open_in_an_unwritable_dir_fails_and_creates_nothing() {
     // The environment is created without a lock file (`lock_file(false)`;
     // the default would create one).
     drop(
-        EnvOpenOptions::new()
-            .lock_file(false)
-            .open(dir.path())
-            .unwrap(),
+        // SAFETY: only ZeroDB writes this environment's files.
+        unsafe { EnvOpenOptions::new().lock_file(false).open(dir.path()) }.unwrap(),
     );
     std::fs::set_permissions(dir.path(), PermissionsExt::from_mode(0o555)).unwrap();
     let mut o = lock_opts();
     o.flags(zerodb::EnvFlags::READ_ONLY);
-    let r = o.open(dir.path());
+    // SAFETY: only ZeroDB writes this environment's files.
+    let r = unsafe { o.open(dir.path()) };
     let created = dir.path().join("zerodb.lock").exists();
     std::fs::set_permissions(dir.path(), PermissionsExt::from_mode(0o755)).unwrap();
     match r {
@@ -1252,10 +1260,8 @@ fn read_only_env_on_read_only_media_opens_without_a_lock_file() {
     {
         // Created without a lock file (`lock_file(false)`; the default would
         // create one), so the read-only copy has none.
-        let env = EnvOpenOptions::new()
-            .lock_file(false)
-            .open(src.path())
-            .unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { EnvOpenOptions::new().lock_file(false).open(src.path()) }.unwrap();
         let mut w = env.write_txn().unwrap();
         env.main_database().put(&mut w, b"k", b"v").unwrap();
         w.commit().unwrap();
@@ -1270,13 +1276,15 @@ fn read_only_env_on_read_only_media_opens_without_a_lock_file() {
     {
         let mut o = lock_opts();
         o.flags(zerodb::EnvFlags::READ_ONLY);
-        let env = o.open(&fs.mount).expect("READ_ONLY on read-only media");
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { o.open(&fs.mount) }.expect("READ_ONLY on read-only media");
         assert!(!env.has_lock_file());
         let r = env.read_txn().unwrap();
         assert_eq!(env.main_database().get(&r, b"k").unwrap(), Some(&b"v"[..]));
     }
     assert!(!fs.mount.join("zerodb.lock").exists());
-    match lock_opts().open(&fs.mount) {
+    // SAFETY: only ZeroDB writes this environment's files.
+    match unsafe { lock_opts().open(&fs.mount) } {
         Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(libc::EROFS), "{e}"),
         other => panic!("expected Io(EROFS) for a writable open, got {other:?}"),
     }

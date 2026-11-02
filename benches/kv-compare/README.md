@@ -57,8 +57,9 @@ Other choices: LMDB and ZeroDB open with `NO_READ_AHEAD` (LMDB's advice for
 random reads on data larger than memory). RocksDB gets a bloom filter and
 background threads for every core, as its tuning guide recommends (fjall has a
 bloom filter by default). SQLite uses WAL mode and a `WITHOUT ROWID` table.
-`zerodb-trusted` is ZeroDB with page validation off
-(`FileTrust::trust_contents`), the way LMDB reads pages.
+`zerodb` reads pages the way LMDB does, without validating them (ZeroDB's
+default, ADR-0034); `zerodb-validating` is ZeroDB with page validation on
+(`FileTrust::VALIDATE`).
 
 ## Running it
 

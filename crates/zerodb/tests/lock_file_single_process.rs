@@ -24,7 +24,8 @@ fn opts() -> EnvOpenOptions {
 #[test]
 fn lock_file_env_reads_and_writes_like_the_default() {
     let dir = TempDir::new();
-    let env = opts().open(dir.path()).expect("open");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { opts().open(dir.path()) }.expect("open");
     assert!(dir.path().join(LOCK_FILE_NAME).exists());
     let db = env.main_database();
     let mut w = env.write_txn().unwrap();
@@ -41,7 +42,8 @@ fn default_env_creates_the_lock_file() {
     let mut o = EnvOpenOptions::new();
     o.map_size(16 << 20);
     assert!(o.get_lock_file());
-    let env = o.open(dir.path()).expect("open");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(dir.path()) }.expect("open");
     assert!(dir.path().join(LOCK_FILE_NAME).exists());
     assert!(env.has_lock_file());
 }
@@ -52,7 +54,8 @@ fn lock_file_false_creates_no_lock_file() {
     let dir = TempDir::new();
     let mut o = EnvOpenOptions::new();
     o.map_size(16 << 20).lock_file(false);
-    let env = o.open(dir.path()).expect("open");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(dir.path()) }.expect("open");
     assert!(!dir.path().join(LOCK_FILE_NAME).exists());
     assert!(!env.has_lock_file());
     let mut w = env.write_txn().unwrap();
@@ -118,7 +121,8 @@ fn thousand_sequential_envs_leak_no_descriptors() {
         std::fs::create_dir(&dir).unwrap();
         let mut o = EnvOpenOptions::new();
         o.map_size(1 << 20);
-        let env = o.open(&dir).expect("open");
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { o.open(&dir) }.expect("open");
         assert!(env.has_lock_file());
         drop(env);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -133,9 +137,11 @@ fn thousand_sequential_envs_leak_no_descriptors() {
 #[test]
 fn double_open_in_process_keeps_first_env_working() {
     let dir = TempDir::new();
-    let env = opts().open(dir.path()).expect("open");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { opts().open(dir.path()) }.expect("open");
     assert!(matches!(
-        opts().open(dir.path()),
+        // SAFETY: only ZeroDB writes this environment's files.
+        unsafe { opts().open(dir.path()) },
         Err(Error::EnvAlreadyOpened)
     ));
     let db = env.main_database();
@@ -148,12 +154,14 @@ fn double_open_in_process_keeps_first_env_working() {
 fn reopen_after_close_reinitializes() {
     let dir = TempDir::new();
     {
-        let env = opts().open(dir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { opts().open(dir.path()) }.unwrap();
         let mut w = env.write_txn().unwrap();
         env.main_database().put(&mut w, b"x", b"1").unwrap();
         w.commit().unwrap();
     }
-    let env = opts().open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { opts().open(dir.path()) }.unwrap();
     let r = env.read_txn().unwrap();
     assert_eq!(env.main_database().get(&r, b"x").unwrap(), Some(&b"1"[..]));
 }
@@ -167,9 +175,9 @@ fn reopen_after_close_reinitializes() {
 fn reopen_after_closing_event_wait_succeeds() {
     let dir = TempDir::new();
     for i in 0..200 {
-        let env = opts()
-            .open(dir.path())
-            .unwrap_or_else(|e| panic!("open {i} failed: {e:?}"));
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env =
+            unsafe { opts().open(dir.path()) }.unwrap_or_else(|e| panic!("open {i} failed: {e:?}"));
         let clone = env.clone();
         let (go, wait_go) = std::sync::mpsc::channel::<()>();
         let t = std::thread::spawn(move || {
@@ -184,11 +192,13 @@ fn reopen_after_closing_event_wait_succeeds() {
         closing.wait();
         // Reopen before joining, so nothing but the close event orders the
         // reopen after the other thread's teardown.
-        let reopened = opts().open(dir.path());
+        // SAFETY: only ZeroDB writes this environment's files.
+        let reopened = unsafe { opts().open(dir.path()) };
         t.join().expect("thread");
         reopened.unwrap_or_else(|e| panic!("reopen {i} after wait failed: {e:?}"));
     }
-    let env = opts().open(dir.path()).expect("final reopen");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { opts().open(dir.path()) }.expect("final reopen");
     drop(env);
 }
 
@@ -201,8 +211,13 @@ fn failed_open_after_lock_file_releases_it() {
     std::fs::create_dir(dir.path().join("taken")).expect("mkdir");
     let mut bad = opts();
     bad.data_file_name("taken");
-    assert!(bad.open(dir.path()).is_err(), "a directory is no data file");
-    let env = opts().open(dir.path()).expect("open after a failed open");
+    // SAFETY: only ZeroDB writes this environment's files.
+    assert!(
+        unsafe { bad.open(dir.path()) }.is_err(),
+        "a directory is no data file"
+    );
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { opts().open(dir.path()) }.expect("open after a failed open");
     let mut w = env.write_txn().unwrap();
     env.main_database().put(&mut w, b"k", b"v").unwrap();
     w.commit().unwrap();
@@ -217,9 +232,17 @@ fn failed_engine_open_releases_lock_file() {
     std::fs::write(&data, vec![0xA5u8; 4096 * 4]).expect("write garbage");
     let mut bad = opts();
     bad.data_file_name("garbage.mdb");
-    assert!(bad.open(dir.path()).is_err(), "garbage is no env");
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    assert!(
+        unsafe { bad.file_trust(zerodb::FileTrust::VALIDATE).open(dir.path()) }.is_err(),
+        "garbage is no env"
+    );
     std::fs::remove_file(&data).expect("rm garbage");
-    let env = bad.open(dir.path()).expect("open after a failed open");
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let env = unsafe { bad.file_trust(zerodb::FileTrust::VALIDATE).open(dir.path()) }
+        .expect("open after a failed open");
     let r = env.read_txn().unwrap();
     assert_eq!(env.main_database().get(&r, b"k").unwrap(), None);
 }
@@ -233,20 +256,23 @@ fn lock_file_name_equal_to_data_file_name_is_rejected() {
     {
         let mut o = EnvOpenOptions::new();
         o.map_size(16 << 20).page_size(4096);
-        let env = o.open(dir.path()).expect("open");
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { o.open(dir.path()) }.expect("open");
         let mut w = env.write_txn().unwrap();
         env.main_database().put(&mut w, b"keep", b"me").unwrap();
         w.commit().unwrap();
     }
     let mut bad = opts();
     bad.lock_file_name(zerodb::DATA_FILE_NAME);
-    match bad.open(dir.path()) {
+    // SAFETY: only ZeroDB writes this environment's files.
+    match unsafe { bad.open(dir.path()) } {
         Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
         other => panic!("expected Io(InvalidInput), got {other:?}"),
     }
     let mut o = EnvOpenOptions::new();
     o.map_size(16 << 20).page_size(4096);
-    let env = o.open(dir.path()).expect("plain reopen");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(dir.path()) }.expect("plain reopen");
     let r = env.read_txn().unwrap();
     assert_eq!(
         env.main_database().get(&r, b"keep").unwrap(),
@@ -264,11 +290,8 @@ fn out_of_range_limits_are_rejected_before_the_lock_file_exists() {
     let limit: u32 = 1 << 20;
     for (readers, dbs) in [(limit + 1, 8), (126, limit + 1)] {
         let dir = TempDir::new();
-        let e = opts()
-            .max_readers(readers)
-            .max_dbs(dbs)
-            .open(dir.path())
-            .unwrap_err();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let e = unsafe { opts().max_readers(readers).max_dbs(dbs).open(dir.path()) }.unwrap_err();
         match e {
             Error::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput),
             other => panic!("expected Io(InvalidInput), got {other:?}"),
@@ -300,9 +323,8 @@ fn open_below_last_pg_rounds_up_to_the_minimum() {
     for lock_file in [false, true] {
         let dir = TempDir::new();
         {
-            let env = opts_with(lock_file, Some(8 * MIB))
-                .open(dir.path())
-                .unwrap();
+            // SAFETY: only ZeroDB writes this environment's files.
+            let env = unsafe { opts_with(lock_file, Some(8 * MIB)).open(dir.path()) }.unwrap();
             let db = env.main_database();
             let value = vec![3u8; 4000];
             let mut w = env.write_txn().unwrap();
@@ -316,7 +338,8 @@ fn open_below_last_pg_rounds_up_to_the_minimum() {
                 "setup: the data is past 1 MiB"
             );
         }
-        let env = opts_with(lock_file, Some(MIB)).open(dir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { opts_with(lock_file, Some(MIB)).open(dir.path()) }.unwrap();
         let info = env.info();
         assert_eq!(
             info.map_size,
@@ -345,7 +368,8 @@ fn open_rejects_a_map_size_above_the_cap() {
     for lock_file in [false, true] {
         let dir = TempDir::new();
         let size = usize::try_from(zerodb::MAX_MAP_SIZE + 4096).unwrap();
-        match opts_with(lock_file, Some(size)).open(dir.path()) {
+        // SAFETY: only ZeroDB writes this environment's files.
+        match unsafe { opts_with(lock_file, Some(size)).open(dir.path()) } {
             Err(Error::Io(e)) => assert_eq!(
                 e.kind(),
                 std::io::ErrorKind::InvalidInput,
@@ -371,21 +395,22 @@ fn smaller_map_commit_keeps_the_larger_meta_size_in_one_process() {
     for lock_file in [false, true] {
         let dir = TempDir::new();
         {
-            let env = opts_with(lock_file, Some(8 * MIB))
-                .open(dir.path())
-                .unwrap();
+            // SAFETY: only ZeroDB writes this environment's files.
+            let env = unsafe { opts_with(lock_file, Some(8 * MIB)).open(dir.path()) }.unwrap();
             let mut w = env.write_txn().unwrap();
             env.main_database().put(&mut w, b"a", b"1").unwrap();
             w.commit().unwrap();
         }
         {
-            let env = opts_with(lock_file, Some(MIB)).open(dir.path()).unwrap();
+            // SAFETY: only ZeroDB writes this environment's files.
+            let env = unsafe { opts_with(lock_file, Some(MIB)).open(dir.path()) }.unwrap();
             assert_eq!(env.info().map_size, MIB as u64, "the data fits 1 MiB");
             let mut w = env.write_txn().unwrap();
             env.main_database().put(&mut w, b"b", b"2").unwrap();
             w.commit().unwrap();
         }
-        let env = opts_with(lock_file, None).open(dir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { opts_with(lock_file, None).open(dir.path()) }.unwrap();
         assert_eq!(
             env.info().map_size,
             8 * MIB as u64,
@@ -415,9 +440,8 @@ fn resize_opts(lock_file: bool, write_map: bool, map_size: usize) -> EnvOpenOpti
 fn resize_with_a_live_write_txn_is_refused() {
     for (lock_file, write_map) in RESIZE_MODES {
         let dir = TempDir::new();
-        let env = resize_opts(lock_file, write_map, MIB)
-            .open(dir.path())
-            .unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { resize_opts(lock_file, write_map, MIB).open(dir.path()) }.unwrap();
         let mut w = env.write_txn().unwrap();
         env.main_database().put(&mut w, b"k", b"v").unwrap();
         match env.resize(2 * MIB as u64) {
@@ -445,9 +469,8 @@ fn resize_with_a_live_write_txn_is_refused() {
 fn resize_with_a_live_read_txn_succeeds_and_the_value_stays_readable() {
     for (lock_file, write_map) in RESIZE_MODES {
         let dir = TempDir::new();
-        let env = resize_opts(lock_file, write_map, MIB)
-            .open(dir.path())
-            .unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { resize_opts(lock_file, write_map, MIB).open(dir.path()) }.unwrap();
         let db = env.main_database();
         let mut w = env.write_txn().unwrap();
         db.put(&mut w, b"held", &[9u8; 3000]).unwrap();
@@ -490,9 +513,8 @@ fn resize_with_a_live_read_txn_succeeds_and_the_value_stays_readable() {
 fn resize_rounds_up_to_the_last_page() {
     for (lock_file, write_map) in RESIZE_MODES {
         let dir = TempDir::new();
-        let env = resize_opts(lock_file, write_map, 4 * MIB)
-            .open(dir.path())
-            .unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { resize_opts(lock_file, write_map, 4 * MIB).open(dir.path()) }.unwrap();
         let db = env.main_database();
         let mut w = env.write_txn().unwrap();
         for i in 0..400u32 {
@@ -531,9 +553,8 @@ fn resize_rounds_up_to_the_last_page() {
 fn resize_above_the_cap_is_refused() {
     for (lock_file, write_map) in RESIZE_MODES {
         let dir = TempDir::new();
-        let env = resize_opts(lock_file, write_map, MIB)
-            .open(dir.path())
-            .unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { resize_opts(lock_file, write_map, MIB).open(dir.path()) }.unwrap();
         match env.resize(zerodb::MAX_MAP_SIZE + 4096) {
             Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
             other => panic!(
@@ -584,15 +605,11 @@ fn get_lock_file_name_reports_the_derived_name_until_overridden() {
 #[test]
 fn two_native_envs_with_different_data_names_get_different_lock_files() {
     let dir = TempDir::new();
-    let a = opts()
-        .data_file_name("a.db")
-        .open(dir.path())
-        .expect("open a");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let a = unsafe { opts().data_file_name("a.db").open(dir.path()) }.expect("open a");
     drop(a);
-    let b = opts()
-        .data_file_name("b.db")
-        .open(dir.path())
-        .expect("open b");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let b = unsafe { opts().data_file_name("b.db").open(dir.path()) }.expect("open b");
     drop(b);
     assert!(dir.path().join("a.db-lock").exists());
     assert!(dir.path().join("b.db-lock").exists());
@@ -608,11 +625,10 @@ fn two_native_envs_with_different_data_names_get_different_lock_files() {
 #[test]
 fn second_data_name_in_an_open_directory_is_refused_cleanly() {
     let dir = TempDir::new();
-    let first = opts().open(dir.path()).expect("open zerodb.dat");
-    let e = opts()
-        .data_file_name("data.mdb")
-        .open(dir.path())
-        .unwrap_err();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let first = unsafe { opts().open(dir.path()) }.expect("open zerodb.dat");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let e = unsafe { opts().data_file_name("data.mdb").open(dir.path()) }.unwrap_err();
     assert!(
         matches!(e, Error::EnvAlreadyOpened),
         "expected EnvAlreadyOpened, got {e:?}"
@@ -622,9 +638,8 @@ fn second_data_name_in_an_open_directory_is_refused_cleanly() {
     first.main_database().put(&mut w, b"k", b"v").unwrap();
     w.commit().unwrap();
     drop(first);
-    let second = opts()
-        .data_file_name("data.mdb")
-        .open(dir.path())
+    // SAFETY: only ZeroDB writes this environment's files.
+    let second = unsafe { opts().data_file_name("data.mdb").open(dir.path()) }
         .expect("the refused open released its lock file");
     drop(second);
 }
@@ -633,7 +648,8 @@ fn second_data_name_in_an_open_directory_is_refused_cleanly() {
 fn lock_file_that_is_the_data_file_is_refused_without_truncating() {
     let dir = TempDir::new();
     {
-        let env = opts().data_file_name("data.mdb").open(dir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { opts().data_file_name("data.mdb").open(dir.path()) }.unwrap();
         let mut w = env.write_txn().unwrap();
         env.main_database().put(&mut w, b"k", b"v").unwrap();
         w.commit().unwrap();
@@ -642,11 +658,14 @@ fn lock_file_that_is_the_data_file_is_refused_without_truncating() {
         .unwrap()
         .len();
     std::fs::hard_link(dir.path().join("data.mdb"), dir.path().join("alias")).unwrap();
-    let e = opts()
-        .data_file_name("data.mdb")
-        .lock_file_name("alias")
-        .open(dir.path())
-        .unwrap_err();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let e = unsafe {
+        opts()
+            .data_file_name("data.mdb")
+            .lock_file_name("alias")
+            .open(dir.path())
+    }
+    .unwrap_err();
     match e {
         Error::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput),
         other => panic!("expected Io(InvalidInput), got {other:?}"),
@@ -669,17 +688,16 @@ fn lock_file_that_is_the_data_file_is_refused_without_truncating() {
 fn lock_file_named_like_another_envs_data_file_is_refused() {
     let dir = TempDir::new();
     {
-        let env = opts()
-            .data_file_name("x.db-lock")
-            .open(dir.path())
-            .expect("env 1");
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { opts().data_file_name("x.db-lock").open(dir.path()) }.expect("env 1");
         let mut w = env.write_txn().unwrap();
         env.main_database().put(&mut w, b"keep", b"me").unwrap();
         w.commit().unwrap();
     }
     let data = dir.path().join("x.db-lock");
     let before = std::fs::read(&data).unwrap();
-    match opts().data_file_name("x.db").open(dir.path()) {
+    // SAFETY: only ZeroDB writes this environment's files.
+    match unsafe { opts().data_file_name("x.db").open(dir.path()) } {
         Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
         other => panic!("expected Io(InvalidInput), got {:?}", other.err()),
     }
@@ -688,10 +706,9 @@ fn lock_file_named_like_another_envs_data_file_is_refused() {
         before,
         "env 1's data changed"
     );
-    let env = opts()
-        .data_file_name("x.db-lock")
-        .open(dir.path())
-        .expect("env 1 reopens");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env =
+        unsafe { opts().data_file_name("x.db-lock").open(dir.path()) }.expect("env 1 reopens");
     let r = env.read_txn().unwrap();
     assert_eq!(
         env.main_database().get(&r, b"keep").unwrap(),
@@ -718,14 +735,16 @@ fn lock_name_differing_only_by_case_is_refused_on_a_case_insensitive_fs() {
         return;
     }
     {
-        let env = opts().open(dir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { opts().open(dir.path()) }.unwrap();
         let mut w = env.write_txn().unwrap();
         env.main_database().put(&mut w, b"keep", b"me").unwrap();
         w.commit().unwrap();
     }
     let data = dir.path().join(zerodb::DATA_FILE_NAME);
     let before = std::fs::read(&data).unwrap();
-    match opts().lock_file_name("ZERODB.DAT").open(dir.path()) {
+    // SAFETY: only ZeroDB writes this environment's files.
+    match unsafe { opts().lock_file_name("ZERODB.DAT").open(dir.path()) } {
         Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
         other => panic!("expected Io(InvalidInput), got {:?}", other.err()),
     }
@@ -741,7 +760,8 @@ fn lock_name_differing_only_by_case_creates_nothing_on_a_case_insensitive_fs() {
         eprintln!("SKIPPED: case-sensitive filesystem");
         return;
     }
-    match opts().lock_file_name("ZERODB.DAT").open(dir.path()) {
+    // SAFETY: only ZeroDB writes this environment's files.
+    match unsafe { opts().lock_file_name("ZERODB.DAT").open(dir.path()) } {
         Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput),
         other => panic!("expected Io(InvalidInput), got {:?}", other.err()),
     }

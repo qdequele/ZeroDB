@@ -47,11 +47,14 @@ impl Drop for TempDir {
 const PATH_ROUTES: [RawRoute; 3] = [RawRoute::Stream, RawRoute::FileCopy, RawRoute::Clone];
 
 fn open_env(dir: &Path, flags: EnvFlags, map_size: usize) -> Env {
-    EnvOpenOptions::new()
-        .map_size(map_size)
-        .flags(flags)
-        .open(dir)
-        .unwrap()
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe {
+        EnvOpenOptions::new()
+            .map_size(map_size)
+            .flags(flags)
+            .open(dir)
+    }
+    .unwrap()
 }
 
 /// The value written for key `i`: some fit in a leaf, some span overflow
@@ -96,10 +99,15 @@ fn verify_image(image: &Path, psize: u32, tag: &str) -> u64 {
     );
     let dir = TempDir::new("open");
     std::fs::write(dir.path().join(DATA_FILE_NAME), &bytes).unwrap();
-    let env = EnvOpenOptions::new()
-        .flags(EnvFlags::READ_ONLY)
-        .open(dir.path())
-        .unwrap();
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .flags(EnvFlags::READ_ONLY)
+            .file_trust(crate::FileTrust::VALIDATE)
+            .open(dir.path())
+    }
+    .unwrap();
     let r = env.read_txn().unwrap();
     let db = env.main_database();
     let gen = u64::from_be_bytes(db.get(&r, b"gen").unwrap().unwrap().try_into().unwrap());

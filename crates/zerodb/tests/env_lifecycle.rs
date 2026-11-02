@@ -43,7 +43,8 @@ fn create_then_reopen_roundtrip() {
     {
         let mut o = EnvOpenOptions::new();
         o.map_size(MAP as usize);
-        let env = o.open(dir.path()).expect("create env");
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { o.open(dir.path()) }.expect("create env");
         assert_eq!(env.page_size(), PS);
         assert_eq!(env.info().map_size, MAP);
         assert_eq!(env.txnid(), 0, "fresh env is at txnid 0");
@@ -54,7 +55,8 @@ fn create_then_reopen_roundtrip() {
         env.prepare_for_closing().wait();
     }
     // Reopen the now-existing env: page size / map size persist.
-    let env = EnvOpenOptions::new().open(dir.path()).expect("reopen env");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { EnvOpenOptions::new().open(dir.path()) }.expect("reopen env");
     assert_eq!(env.page_size(), PS);
     assert_eq!(env.info().map_size, MAP);
 }
@@ -67,14 +69,16 @@ fn reopen_with_larger_map_size() {
     {
         let mut o = EnvOpenOptions::new();
         o.map_size(MAP as usize);
-        let env = o.open(dir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { o.open(dir.path()) }.unwrap();
         assert_eq!(env.info().map_size, MAP);
         env.prepare_for_closing().wait();
     }
     let bigger = (MAP * 4) as usize;
     let mut o = EnvOpenOptions::new();
     o.map_size(bigger);
-    let env = o.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(dir.path()) }.unwrap();
     assert_eq!(env.info().map_size, bigger as u64);
 }
 
@@ -83,12 +87,15 @@ fn reopen_with_larger_map_size() {
 #[test]
 fn second_open_is_env_already_opened() {
     let dir = TempDir::new();
-    let env = EnvOpenOptions::new().open(dir.path()).unwrap();
-    let e = EnvOpenOptions::new().open(dir.path()).unwrap_err();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { EnvOpenOptions::new().open(dir.path()) }.unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let e = unsafe { EnvOpenOptions::new().open(dir.path()) }.unwrap_err();
     assert!(matches!(e, Error::EnvAlreadyOpened));
     // Dropping the first frees the path.
     drop(env);
-    let _again = EnvOpenOptions::new().open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let _again = unsafe { EnvOpenOptions::new().open(dir.path()) }.unwrap();
 }
 
 /// SPEC 02 §3.2 / SPEC 06 REC-2: normal open picks the higher txnid; a
@@ -98,13 +105,22 @@ fn prev_snapshot_selects_older_meta() {
     let dir = TempDir::new();
     craft_env(dir.path(), 5, 9);
     {
-        let env = EnvOpenOptions::new().open(dir.path()).unwrap();
+        // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+        // error; nothing else modifies the file while it is mapped.
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .file_trust(zerodb::FileTrust::VALIDATE)
+                .open(dir.path())
+        }
+        .unwrap();
         assert_eq!(env.txnid(), 9, "normal open selects the higher txnid");
         env.prepare_for_closing().wait();
     }
     let mut o = EnvOpenOptions::new();
     o.flags(EnvFlags::PREV_SNAPSHOT);
-    let env = o.open(dir.path()).unwrap();
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let env = unsafe { o.file_trust(zerodb::FileTrust::VALIDATE).open(dir.path()) }.unwrap();
     assert_eq!(env.txnid(), 5, "PREV_SNAPSHOT selects the older txnid");
     assert!(env.is_prev_snapshot());
 }
@@ -121,7 +137,14 @@ fn corrupted_higher_slot_falls_back_to_older() {
     bytes[PS as usize + 100] ^= 0xFF;
     std::fs::write(&data, &bytes).unwrap();
 
-    let env = EnvOpenOptions::new().open(dir.path()).unwrap();
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .file_trust(zerodb::FileTrust::VALIDATE)
+            .open(dir.path())
+    }
+    .unwrap();
     assert_eq!(env.txnid(), 4, "must recover the older intact snapshot");
 }
 
@@ -136,7 +159,14 @@ fn both_slots_corrupted_is_invalid() {
     bytes[PS as usize + 100] ^= 0xFF; // slot 1 CRC region
     std::fs::write(&data, &bytes).unwrap();
 
-    let e = EnvOpenOptions::new().open(dir.path()).unwrap_err();
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let e = unsafe {
+        EnvOpenOptions::new()
+            .file_trust(zerodb::FileTrust::VALIDATE)
+            .open(dir.path())
+    }
+    .unwrap_err();
     assert!(matches!(e, Error::Mdb(MdbError::Invalid)));
 }
 
@@ -152,7 +182,9 @@ fn one_valid_slot_with_prev_snapshot_is_invalid() {
 
     let mut o = EnvOpenOptions::new();
     o.flags(EnvFlags::PREV_SNAPSHOT);
-    let e = o.open(dir.path()).unwrap_err();
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let e = unsafe { o.file_trust(zerodb::FileTrust::VALIDATE).open(dir.path()) }.unwrap_err();
     assert!(matches!(e, Error::Mdb(MdbError::Invalid)));
 }
 
@@ -165,7 +197,14 @@ fn garbage_file_is_invalid() {
         vec![0xFFu8; PS as usize],
     )
     .unwrap();
-    let e = EnvOpenOptions::new().open(dir.path()).unwrap_err();
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let e = unsafe {
+        EnvOpenOptions::new()
+            .file_trust(zerodb::FileTrust::VALIDATE)
+            .open(dir.path())
+    }
+    .unwrap_err();
     assert!(matches!(e, Error::Mdb(MdbError::Invalid)));
 }
 
@@ -181,10 +220,15 @@ fn garbage_file_shorter_than_both_meta_slots_is_invalid_not_sigbus() {
         // Garbage shorter than 2*psize, probe field unreadable as a page size.
         let dir = TempDir::new();
         std::fs::write(dir.path().join(zerodb::DATA_FILE_NAME), vec![0xFFu8; 4096]).unwrap();
-        let e = EnvOpenOptions::new()
-            .page_size(psize)
-            .open(dir.path())
-            .unwrap_err();
+        // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+        // error; nothing else modifies the file while it is mapped.
+        let e = unsafe {
+            EnvOpenOptions::new()
+                .page_size(psize)
+                .file_trust(zerodb::FileTrust::VALIDATE)
+                .open(dir.path())
+        }
+        .unwrap_err();
         assert!(matches!(e, Error::Mdb(MdbError::Invalid)), "psize={psize}");
     }
 
@@ -197,7 +241,14 @@ fn garbage_file_shorter_than_both_meta_slots_is_invalid_not_sigbus() {
         &bytes[..PS as usize],
     )
     .unwrap();
-    let e = EnvOpenOptions::new().open(dir.path()).unwrap_err();
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let e = unsafe {
+        EnvOpenOptions::new()
+            .file_trust(zerodb::FileTrust::VALIDATE)
+            .open(dir.path())
+    }
+    .unwrap_err();
     assert!(matches!(e, Error::Mdb(MdbError::Invalid)), "truncated env");
 }
 
@@ -205,7 +256,8 @@ fn garbage_file_shorter_than_both_meta_slots_is_invalid_not_sigbus() {
 #[test]
 fn try_clone_inner_file_dups_fd() {
     let dir = TempDir::new();
-    let env = EnvOpenOptions::new().open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { EnvOpenOptions::new().open(dir.path()) }.unwrap();
     let f = env.try_clone_inner_file().expect("dup fd");
     assert_eq!(f.metadata().unwrap().len(), 2 * PS as u64);
 }
@@ -215,7 +267,8 @@ fn try_clone_inner_file_dups_fd() {
 fn missing_directory_is_io_error() {
     let missing = std::env::temp_dir().join("zerodb-does-not-exist-xyz-12345");
     let _ = std::fs::remove_dir_all(&missing);
-    let e = EnvOpenOptions::new().open(&missing).unwrap_err();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let e = unsafe { EnvOpenOptions::new().open(&missing) }.unwrap_err();
     assert!(matches!(e, Error::Io(_)));
 }
 
@@ -228,7 +281,9 @@ fn persisted_page_size_wins_over_option() {
     craft_env(dir.path(), 1, 1);
     let mut o = EnvOpenOptions::new();
     o.page_size(8192);
-    let env = o.open(dir.path()).unwrap();
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let env = unsafe { o.file_trust(zerodb::FileTrust::VALIDATE).open(dir.path()) }.unwrap();
     assert_eq!(env.page_size(), PS, "persisted page size wins");
 }
 
@@ -236,7 +291,8 @@ fn persisted_page_size_wins_over_option() {
 #[test]
 fn closing_event_waits_for_last_handle() {
     let dir = TempDir::new();
-    let env = EnvOpenOptions::new().open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { EnvOpenOptions::new().open(dir.path()) }.unwrap();
     let clone = env.clone();
     let ev = env.prepare_for_closing();
     assert!(

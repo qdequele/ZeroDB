@@ -29,7 +29,8 @@ fn open_with(dir: &Path, psize: u32, max_dbs: u32, max_readers: u32) -> Env {
     opts.page_size(psize);
     opts.max_dbs(max_dbs);
     opts.max_readers(max_readers);
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 // ---------------------------------------------------------------------------

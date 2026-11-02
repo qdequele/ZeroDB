@@ -16,9 +16,9 @@ The comparison point is the LMDB build Meilisearch ships (`lmdb-master-sys
 - **The gaps are in micro-operations those consumers use little:** full scans,
   cursor drains, tiny and empty commits, and write-heavy no-sync YCSB. In each
   case the remaining cost is CPU per operation, not I/O.
-- **Some costs are deliberate:** page validation, the meta-page checksum, and
-  syncs at env creation. Each buys a safety property LMDB lacks, and the
-  validation can be turned off with an opt-in.
+- **Some costs are deliberate:** the meta-page checksum and syncs at env
+  creation. Each buys a safety property LMDB lacks. Page validation is opt-in
+  since ADR-0034; pages are trusted by default, as in LMDB.
 
 ## How it is measured
 
@@ -50,8 +50,10 @@ still in git history (commit `e0fd466`). Every experiment ever tried, kept or re
 
 ## Where ZeroDB stands
 
-Default options unless stated. "Trusted mode" is the opt-in that skips page
-validation (ADR-0014). Source keys name the run each figure comes from:
+Default options unless stated. "Trusted mode" skips page validation
+(ADR-0014). It has been the default since ADR-0034; every run below predates
+that change, so "default" in these tables means the validating policy, now the
+opt-in `FileTrust::VALIDATE`. Source keys name the run each figure comes from:
 
 | Key | Run |
 |---|---|
@@ -91,7 +93,7 @@ rung is flat, and with it on five rungs regress; their rows give both figures.
 
 ### Scans and seeks
 
-Graviton4, with the default validating policy and with trusted mode, from the
+Graviton4, with the validating policy (then the default) and with trusted mode, from the
 same binary (BP). This run predates the validated-pages cache sized to the
 file, which made `scan/full/big` a further 13 % faster (SC).
 
@@ -193,7 +195,7 @@ LMDB". Ratios are before → after.
 | <a id="a1"></a>Named-database records resolved once | Each read took a lock and descended the catalog. A read txn now resolves each database once into a table indexed by handle, as LMDB's `txn->mt_dbs[dbi]` does. | `scan/meta/len` 2.46× → 1.01× |
 | <a id="a2"></a>Page validation once per page | ZeroDB checks every cell of a page before trusting it, so a corrupt file is a typed error. The check now runs once per page per txn, recorded in a lock-free memo, and pages the engine wrote itself are trusted. | milli indexing 2.68× → 1.12× (laptop) |
 | Env-wide validated-pages cache (ADR-0018) | Read txns share one cache keyed by page number, kind and the txn id stamped in the page, so short txns stop re-validating hot pages. Since 2026-10-31 it has one slot per page of the file. | read txn plus get 1,984 → 1,008 ns; random gets 1.16× → 0.94× (V); 10M-key random get p50 1.32 → 1.23 µs (SC) |
-| Trusted-file mode (ADR-0014, opt-in) | Skips the per-cell walk and the overflow header check, as LMDB does. | trusted `get/val/v4k` 1.29× → 0.91× |
+| Trusted-file mode (ADR-0014; the default since ADR-0034) | Skips the per-cell walk and the overflow header check, as LMDB does. | trusted `get/val/v4k` 1.29× → 0.91× |
 | Field reads at fixed offsets | Page fields are read with `read_unaligned` at explicit offsets behind one bounds proof per view. | — |
 | No allocation per get | Cursors keep their path in a fixed 32-frame inline stack, as LMDB's `CURSOR_STACK`. | — |
 | <a id="b13"></a>Hot paths above LLVM's inlining threshold | Raising LLVM's threshold sped hot paths up 8–38 %. The nine helpers it then inlined are now `#[inline(always)]`. | CGU1: `get/access/hot` 1.37× → 1.11×; 37 rungs faster, none slower |
@@ -277,9 +279,9 @@ Issues are tracked on [GitHub](https://github.com/qdequele/ZeroDB/issues).
   free-list record that small txns rewrite after a large delete (LMDB keeps
   its reclaimed list across txns), the snapshot published per commit, and the
   `pwritev` iovec list.
-- **Scans** (#147). By default full scans are 1.47–1.60× and prefix buckets
-  1.27×; in trusted mode 1.03–1.09× (BP). So the default-mode gap is page
-  validation (16–19 % of a scan), and the trusted residual is two calls per
+- **Scans** (#147). Validating, full scans are 1.47–1.60× and prefix buckets
+  1.27×; in trusted mode, now the default (ADR-0034), 1.03–1.09× (BP). So the
+  validating gap is page validation (16–19 % of a scan), and the trusted residual is two calls per
   entry against LMDB's one. `scan/edge/first_last` is 1.41× in both modes,
   because every call resolves the tree from the root again. Range scans, paged
   listings and point seeks are faster than LMDB.
@@ -323,8 +325,9 @@ Issues are tracked on [GitHub](https://github.com/qdequele/ZeroDB/issues).
   which crash recovery uses to detect torn writes. LMDB has none. On aarch64 it
   uses the ARMv8 `crc32c` instructions (ADR-0031): about 0.75 µs for a full
   16 KiB page on Graviton4.
-- **Page validation by default.** A corrupt page is a typed error, never
-  undefined behavior. Trusted-file mode turns it off.
+- **Page validation, opt-in.** With `FileTrust::VALIDATE` a corrupt page is a
+  typed error, never undefined behavior. The default trusts pages, as LMDB
+  does (ADR-0034), so the "Trusted" columns above are the default.
 - **Env creation syncs.** Creating an env syncs the file and its parent
   directory, so a crash cannot lose the name of a durable file. It is paid once
   per env, and is why `env/open/create` is about 9×.

@@ -34,7 +34,8 @@ fn open_at(dir: &Path, psize: u32) -> Env {
     o.map_size(MAP);
     o.max_dbs(16);
     o.page_size(psize);
-    o.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { o.open(dir) }.expect("open env")
 }
 
 fn assert_clean(dir: &Path, psize: u32) {
@@ -69,7 +70,8 @@ fn invalid_page_sizes_are_rejected_as_io_invalid_input() {
         let mut o = EnvOpenOptions::new();
         o.map_size(MAP);
         o.page_size(psize);
-        match o.open(dir.path()) {
+        // SAFETY: only ZeroDB writes this environment's files.
+        match unsafe { o.open(dir.path()) } {
             Err(Error::Io(e)) => {
                 assert_eq!(
                     e.kind(),
@@ -107,7 +109,8 @@ fn the_default_is_used_when_unset_and_the_getter_reports_it() {
     let mut o = EnvOpenOptions::new();
     o.map_size(MAP);
     let dir = TempDir::new();
-    let env = o.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(dir.path()) }.unwrap();
     assert_eq!(env.page_size(), zerodb::DEFAULT_PAGE_SIZE);
 
     let mut o = EnvOpenOptions::new();

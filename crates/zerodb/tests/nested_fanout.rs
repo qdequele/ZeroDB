@@ -37,7 +37,8 @@ fn open(dir: &Path, flags: EnvFlags) -> Env {
     opts.page_size(PS);
     opts.max_dbs(4);
     opts.flags(flags);
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 /// The fan-out batteries run in both dirty-page realizations (ADR-0021):

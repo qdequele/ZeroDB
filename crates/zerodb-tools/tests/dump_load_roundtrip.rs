@@ -11,11 +11,14 @@ use zerodb::{Env, EnvOpenOptions};
 
 /// Build an env with main user data + named DBs (one with overflow, one empty).
 fn build(dir: &Path) {
-    let env: Env = EnvOpenOptions::new()
-        .map_size(64 << 20)
-        .max_dbs(64)
-        .open(dir)
-        .unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env: Env = unsafe {
+        EnvOpenOptions::new()
+            .map_size(64 << 20)
+            .max_dbs(64)
+            .open(dir)
+    }
+    .unwrap();
     let mut wtxn = env.write_txn().unwrap();
     let main = env.main_database();
     for i in 0u32..1200 {
@@ -85,11 +88,14 @@ fn round_trip(src: &Path, page_size: u32) -> String {
 }
 
 fn open_env(dir: &Path) -> Env {
-    EnvOpenOptions::new()
-        .map_size(256 << 20)
-        .max_dbs(1024)
-        .open(dir)
-        .unwrap()
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe {
+        EnvOpenOptions::new()
+            .map_size(256 << 20)
+            .max_dbs(1024)
+            .open(dir)
+    }
+    .unwrap()
 }
 
 #[test]

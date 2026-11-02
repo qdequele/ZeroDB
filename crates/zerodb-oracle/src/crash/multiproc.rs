@@ -158,7 +158,9 @@ pub fn reader_run(dir: &Path, page_size: u32, map_size: usize, seed: u64) -> ! {
         .max_dbs(16)
         .lock_file(true);
     let states = replay_states(seed);
-    let env = match opts.open(dir) {
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let env = match unsafe { opts.file_trust(zerodb::FileTrust::VALIDATE).open(dir) } {
         Ok(e) => e,
         Err(e) => fail(format!("open: {e}")),
     };
@@ -382,7 +384,9 @@ pub fn run_mp_cycle(seed: u64, opts: &SigkillOpts) -> CutReport {
         .page_size(spec.page_size)
         .max_dbs(16)
         .lock_file(true);
-    let env = match jopts.open(dir) {
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let env = match unsafe { jopts.file_trust(zerodb::FileTrust::VALIDATE).open(dir) } {
         Ok(e) => e,
         Err(e) => {
             report.violation = violation(format!("joining open failed: {e}"));
@@ -515,7 +519,9 @@ pub fn run_mp_cycle(seed: u64, opts: &SigkillOpts) -> CutReport {
     }
     let mut ropts = EnvOpenOptions::new();
     ropts.max_dbs(16).lock_file(false);
-    let env = match ropts.open(dir) {
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let env = match unsafe { ropts.file_trust(zerodb::FileTrust::VALIDATE).open(dir) } {
         Ok(e) => e,
         Err(e) => {
             report.violation = violation(format!("reopen without a lock file failed: {e}"));

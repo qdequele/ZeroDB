@@ -23,10 +23,14 @@ zerodb = "0.2"
 ```rust
 use zerodb::EnvOpenOptions;
 
-let env = EnvOpenOptions::new()
-    .map_size(1 << 30) // largest size the data file may grow to
-    .max_dbs(8)
-    .open("my-env")?;  // a directory; it must exist
+// SAFETY: only ZeroDB writes this environment's files (see `open`'s
+// contract, the same as heed's and LMDB's).
+let env = unsafe {
+    EnvOpenOptions::new()
+        .map_size(1 << 30) // largest size the data file may grow to
+        .max_dbs(8)
+        .open("my-env")?   // a directory; it must exist
+};
 
 let mut wtxn = env.write_txn()?;
 let db = env.create_database(&mut wtxn, Some(&b"users"[..]))?;
@@ -130,15 +134,21 @@ faster than default LMDB, while still trailing LMDB's own `WRITE_MAP`.
 corrupt the database file directly. This is the same trade LMDB's
 `MDB_WRITEMAP` makes.
 
-### Trusted-file mode
+### Page validation
 
-`EnvOpenOptions::file_trust(FileTrust::trust_contents())` skips ZeroDB's
-read-path page validation and trusts the mapped bytes, as LMDB does (ADR-0014).
-Bounds checks stay, so reads never leave the map.
+By default ZeroDB trusts the pages it reads from the data file, as LMDB does
+(ADR-0034): `open` is `unsafe`, and its contract is that the file was written
+by ZeroDB and nothing else modifies it. Page-number bounds checks stay, so
+reads never leave the map, and the meta pages are always checked at open.
 
-**Cost:** the constructor is `unsafe`. With it, a corrupt or hostile data file
-causes undefined behavior instead of a typed error. Use it only where the
-file's integrity is guaranteed some other way.
+`EnvOpenOptions::file_trust(FileTrust::VALIDATE)` checks every page the first
+time a transaction reads it, so a corrupt or hostile data file yields a typed
+error instead of undefined behavior (ADR-0014). Use it for files of uncertain
+origin, such as an imported snapshot, or run `zerodb-tools check` on them
+first. `zerodb-tools` always validates.
+
+**Cost:** full scans take 1.4–1.55× as long as with trusted pages, and
+random point gets about 10 % longer (Graviton4, 2026-10-31).
 
 ### Sequential writes
 

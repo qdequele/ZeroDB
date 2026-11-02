@@ -56,7 +56,8 @@ fn stats_for(n: u32) -> ((u64, u32), (u64, u32)) {
         o.map_size(MAP);
         o.max_dbs(8);
         o.page_size(4096);
-        o.open(zdir.path()).unwrap()
+        // SAFETY: only ZeroDB writes this environment's files.
+        unsafe { o.open(zdir.path()) }.unwrap()
     };
     let z_stat = {
         let mut w = zenv.write_txn().unwrap();
@@ -103,7 +104,8 @@ fn stat_entries_match_len() {
     o.map_size(MAP);
     o.max_dbs(8);
     o.page_size(4096);
-    let env = o.open(zdir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(zdir.path()) }.unwrap();
     let mut w = env.write_txn().unwrap();
     let db = env.create_database(&mut w, Some(b"d")).unwrap();
     for i in 0..123u32 {

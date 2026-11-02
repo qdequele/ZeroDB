@@ -41,6 +41,14 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ### Changed
 
+- **Pages are trusted by default, as in LMDB** (ADR-0034). An environment
+  no longer validates every page it reads unless opened with
+  `file_trust(FileTrust::VALIDATE)`; a corrupt file is then undefined
+  behaviour, as with LMDB. Breaking for the native API:
+  `zerodb::EnvOpenOptions::open` is now `unsafe`, with heed's contract (only
+  ZeroDB writes the file), and `get_file_trust` returns `Option<FileTrust>`,
+  `None` for the default. `zerodb-tools` always validates. Divergence D-019
+  now records validation as the opt-in.
 - **The heed adapter is the `[patch]` target itself.** `crates/heed-zerodb`'s
   package is now named `heed` (version 0.22.1), and the `crates/heed-shim` and
   `crates/heed-shim-unique-txns` re-export crates are removed. The one-line

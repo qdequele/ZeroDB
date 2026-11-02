@@ -29,7 +29,10 @@ pub type BoxErr = Box<dyn std::error::Error>;
 /// or this process already has it open.
 pub fn tool_open_options(env_dir: &Path, data_file_name: &str) -> Result<EnvOpenOptions, BoxErr> {
     let mut opts = EnvOpenOptions::new();
+    // ADR-0034: a tool inspects files of uncertain origin, so it validates
+    // every page instead of trusting the file as the engine default does.
     opts.max_dbs(MAX_TOOL_DBS)
+        .file_trust(zerodb::FileTrust::VALIDATE)
         .flags(EnvFlags::READ_ONLY)
         .data_file_name(data_file_name)
         .lock_file(true);
@@ -71,9 +74,14 @@ pub fn open_ro(env_dir: &Path, data_file_name: &str) -> Result<Env, zerodb::Erro
         Ok(e) => *e,
         Err(e) => zerodb::Error::Io(std::io::Error::other(e.to_string())),
     };
-    tool_open_options(env_dir, data_file_name)
-        .map_err(to_zerodb)?
-        .open(env_dir)
+    // SAFETY: the options validate every page (`FileTrust::VALIDATE`), so a
+    // damaged file yields an error; nothing else modifies the file while it is
+    // mapped, since the lock file coordinates every process that opens it.
+    unsafe {
+        tool_open_options(env_dir, data_file_name)
+            .map_err(to_zerodb)?
+            .open(env_dir)
+    }
 }
 
 /// Begin a read txn on a tool's env. A [`MdbError::MapResized`] (another

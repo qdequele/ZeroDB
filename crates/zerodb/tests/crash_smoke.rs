@@ -34,7 +34,8 @@ fn open(dir: &Path) -> Env {
     let mut opts = EnvOpenOptions::new();
     opts.map_size(MAP);
     opts.page_size(PS);
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 /// A commit hook that aborts the process at the target point.

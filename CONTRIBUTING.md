@@ -48,7 +48,7 @@ the code first, read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 Default behavior matches LMDB. Capabilities LMDB lacks, or that heed hides,
 ship behind explicit options (such as `max_dirty_bytes`, `sequential_writes`
-or trusted-file mode), so the default stays a faithful drop-in.
+or page validation), so the default stays a faithful drop-in.
 
 ## `unsafe` policy
 
@@ -82,8 +82,15 @@ or trusted-file mode), so the default stays a faithful drop-in.
 - `zerodb-tools`: the `migrate-lmdb` feature's heed `open`
   (`src/migrate.rs`), in use and awaiting maintainer review;
 - `benches/kv-compare` (a standalone crate outside the workspace): the two
-  heed `open` calls, the `FileTrust::trust_contents` call, one `getrusage`
-  and one `sync`, proposed in ADR-0033 and awaiting maintainer review.
+  heed `open` calls, one `getrusage` and one `sync`, proposed in ADR-0033
+  and awaiting maintainer review;
+- calls of the native `zerodb::EnvOpenOptions::open`, an `unsafe fn` with
+  heed's contract (ADR-0034), wherever an environment is opened: the heed
+  adapter, `zerodb-tools`, tests, benches, examples and the oracle. Each
+  call's `// SAFETY:` comment says why the file is ZeroDB's own, or that the
+  call opts into `FileTrust::VALIDATE`. Tests that open a file they damaged
+  or crafted by hand, and the tools, which inspect files of uncertain
+  origin, always opt into `FileTrust::VALIDATE`.
 
 The in-place `WRITE_MAP` exception covers only calling `zerodb-io`'s `unsafe`
 map-slice broker to realize a dirty page in the writable map at a freshly
