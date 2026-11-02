@@ -43,3 +43,4 @@ tracked in GitHub issues. To propose a decision, copy
 | 0032 | [Raw environment copy from the data file: clone or in-kernel copy](adr/0032-raw-copy-block-clone.md) | Implemented; approval not recorded | Env copy, beyond LMDB |
 | 0033 | [A standalone benchmark crate comparing ZeroDB with other key-value stores](adr/0033-kv-compare-bench.md) | Implemented; approval not recorded | Benchmarks, dependencies |
 | 0034 | [Trust page contents by default behind the heed API, as LMDB does](adr/0034-trusted-pages-by-default.md) | Proposed | Page validation, LMDB parity, `unsafe` policy |
+| 0038 | [Bounded relaxed durability: steady and weak metas, a durable watermark](adr/0038-bounded-relaxed-durability.md) | Proposed | Durability, page reclamation, on-disk format |
