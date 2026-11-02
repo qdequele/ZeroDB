@@ -163,6 +163,9 @@ struct Totals {
     /// In-map dirty regions journaled by WRITE_MAP image cuts (ADR-0021:
     /// proof the in-place realization was exercised, not the heap path).
     map_regions: u64,
+    /// Verified cycles of large-clear cuts (`Spec::gc_clear`): proof the
+    /// bounded free-page record paths (SPEC 05 GC-5) were cut through.
+    gc_clear_verified: u64,
     by_mode: std::collections::BTreeMap<&'static str, u64>,
     violations: Vec<String>,
 }
@@ -358,6 +361,9 @@ fn main() {
                     let mut t = totals.lock().expect("totals lock");
                     let had_violation = report.violation.is_some();
                     t.absorb(&report, mech);
+                    if gen_spec(seed).gc_clear {
+                        t.gc_clear_verified += report.verified;
+                    }
                     drop(t);
                     if had_violation && !args.keep_going {
                         stop.store(true, Ordering::Relaxed);
@@ -379,6 +385,7 @@ fn main() {
          stale fallbacks : {} (NO_META_SYNC reclaim-clobber window, REC-10 as amended — walk/data waived)\n\
          spilling txns   : {} image, {} sigkill + mp (ADR-0017 spill cycles)\n\
          in-place regions: {} (ADR-0021: brokered map regions journaled by WRITE_MAP image cuts)\n\
+         large clears    : {} cycles (ADR-0037: a clear of thousands of pages, then small commits)\n\
          grown maps      : {} image cuts (ADR-0036: growth cycles whose map grew before the cut)\n\
          wall time       : {:.1}s ({:.1} cycles/s)",
         t.verified,
@@ -397,6 +404,7 @@ fn main() {
         zerodb_oracle::crash::model::SPILLED_TXNS.load(Ordering::Relaxed),
         t.sigkill_spilled,
         t.map_regions,
+        t.gc_clear_verified,
         zerodb_oracle::crash::image::GROWN_CYCLES.load(Ordering::Relaxed),
         secs,
         t.verified as f64 / secs.max(0.001),

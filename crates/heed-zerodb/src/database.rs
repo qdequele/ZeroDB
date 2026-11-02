@@ -16,7 +16,7 @@ use crate::iterator::{
     Dir, RoIter, RoPrefix, RoRange, RoRevIter, RoRevPrefix, RoRevRange, RwGuts, RwIter, RwPrefix,
     RwRange, RwRevIter, RwRevPrefix, RwRevRange,
 };
-use crate::reserved_space::ReservedSpace;
+use crate::reserved_space::{fill_slot, ReservedSpace};
 use crate::txn::{RoTxn, RwTxn};
 use crate::{Error, MdbError, Result, Unspecified};
 
@@ -691,15 +691,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         let mut outcome: std::io::Result<()> = Ok(());
         self.inner
             .put_reserved(txn.zdb_mut(), &kb, data_size, |slot| {
-                let mut space = ReservedSpace::new(slot);
-                outcome = write_func(&mut space).and_then(|()| {
-                    if space.remaining() == 0 {
-                        Ok(())
-                    } else {
-                        Err(std::io::ErrorKind::UnexpectedEof.into())
-                    }
-                });
-                space.zero_unwritten_tail();
+                outcome = fill_slot(slot, write_func);
             })
             .map_err(Into::<Error>::into)?;
         outcome.map_err(Error::Io)

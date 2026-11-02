@@ -1804,3 +1804,233 @@ proptest::proptest! {
         proptest::prop_assert_eq!(db.len(&txn).unwrap(), model.len() as u64);
     }
 }
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig {
+        failure_persistence: None,
+        cases: if cfg!(miri) { 16 } else { 1024 },
+        ..Default::default()
+    })]
+
+    /// `validate_pil_ids` accepts exactly the lists whose ids are strictly
+    /// ascending and each in `[FIRST_DATA_PGNO, last_pg]` (SPEC 05 GC-3).
+    #[test]
+    fn validate_pil_ids_accepts_exactly_ascending_in_range(
+        ids in proptest::collection::vec(0u64..64, 0..12),
+        last_pg in 0u64..64,
+    ) {
+        let want = ids.iter().all(|&id| (FIRST_DATA_PGNO..=last_pg).contains(&id))
+            && ids.windows(2).all(|w| w[0] < w[1]);
+        proptest::prop_assert_eq!(validate_pil_ids(&ids, last_pg).is_ok(), want);
+    }
+}
+/// TXN-49 item 2 through the write cursor: reserve the entries a walk visits
+/// in place, with sizes that rewrite in place, split the leaf, and move the
+/// value to and from an overflow run; then mutate further. Every reserved
+/// value must have landed intact and the walk must visit each entry once.
+#[test]
+fn txn49_cursor_reserve_then_split() {
+    let env = mem_env(PS, 4 << 20);
+    let db = env.main_database();
+    let mut txn = env.write_txn().unwrap();
+    for i in 0..200u32 {
+        let (k, v) = kv(i);
+        db.put(&mut txn, &k, &v).unwrap();
+    }
+    let len = |i: usize| [kv(i as u32).1.len(), 3, 700, 3000, 50][i % 5];
+    let mut want = Vec::new();
+    {
+        let mut c = db.rw_cursor(&mut txn);
+        let mut i = 0usize;
+        while let Some((k, _)) = c.move_next().unwrap() {
+            let k = k.to_vec();
+            let byte = (i % 251) as u8;
+            c.put_reserved(PutFlags::EMPTY, &k, len(i), |slot| slot.fill(byte))
+                .unwrap();
+            want.push((k, vec![byte; len(i)]));
+            i += 1;
+        }
+    }
+    assert_eq!(want.len(), 200, "the walk visits each entry once");
+    assert_eq!(dump(&txn), want);
+    assert!(
+        txn.main_record().overflow_pages > 0,
+        "expected overflow runs"
+    );
+    for i in 0..60u32 {
+        db.put(&mut txn, format!("key{i:05}-n").as_bytes(), &[0x11; 300])
+            .unwrap();
+    }
+    for (k, v) in &want {
+        assert_eq!(db.get(&txn, k).unwrap(), Some(v.as_slice()));
+    }
+}
+
+/// A same-size reserve of an inline value through the cursor hands back the
+/// old value's bytes, as LMDB's `MDB_RESERVE` does.
+#[test]
+fn cursor_reserve_same_size_starts_from_the_old_value() {
+    let env = mem_env(PS, MAP);
+    let db = env.main_database();
+    let mut txn = env.write_txn().unwrap();
+    db.put(&mut txn, b"k", b"old-value").unwrap();
+    let mut c = db.rw_cursor(&mut txn);
+    c.seek_first().unwrap();
+    let mut seen = Vec::new();
+    c.put_reserved(PutFlags::EMPTY, b"k", 9, |slot| {
+        seen = slot.to_vec();
+        slot.copy_from_slice(b"new-value");
+    })
+    .unwrap();
+    assert_eq!(seen, b"old-value");
+    drop(c);
+    assert_eq!(db.get(&txn, b"k").unwrap(), Some(b"new-value".as_slice()));
+}
+
+/// A rejected cursor reserve never calls the closure, changes nothing, and
+/// leaves the cursor where LMDB leaves it.
+#[test]
+fn cursor_reserve_rejections_never_call_the_closure() {
+    let env = mem_env(PS, MAP);
+    let db = env.main_database();
+    let mut txn = env.write_txn().unwrap();
+    for i in 0..50u32 {
+        let (k, v) = kv(i);
+        db.put(&mut txn, &k, &v).unwrap();
+    }
+    let before = dump(&txn);
+    let (k10, _) = kv(10);
+    let (k20, _) = kv(20);
+    /// Flags, key, reserved length, the expected error, and the key the
+    /// cursor's next step yields afterwards.
+    type Case<'a> = (PutFlags, &'a [u8], usize, MdbError, Option<Vec<u8>>);
+    let cases: [Case<'_>; 4] = [
+        // NO_OVERWRITE leaves the cursor on the existing key.
+        (
+            PutFlags::NO_OVERWRITE,
+            &k20,
+            8,
+            MdbError::KeyExist,
+            Some(kv(21).0),
+        ),
+        // APPEND compared with the last entry and stays on it.
+        (PutFlags::APPEND, &k10, 8, MdbError::KeyExist, None),
+        // Size checks reject before any positioning.
+        (
+            PutFlags::EMPTY,
+            b"",
+            8,
+            MdbError::BadValSize,
+            Some(kv(11).0),
+        ),
+        (
+            PutFlags::EMPTY,
+            &k10,
+            MAX_DATA_SIZE as usize + 1,
+            MdbError::BadValSize,
+            Some(kv(11).0),
+        ),
+    ];
+    for (flags, key, len, err, next) in cases {
+        let mut c = db.rw_cursor(&mut txn);
+        c.seek_ge(&k10).unwrap();
+        let mut called = false;
+        let r = c.put_reserved(flags, key, len, |_| called = true);
+        assert!(
+            matches!(r, Err(Error::Mdb(e)) if e == err),
+            "{flags:?}: {r:?}"
+        );
+        assert!(!called, "{flags:?}: the closure ran");
+        let got = c.move_next().unwrap().map(|(k, _)| k.to_vec());
+        assert_eq!(got, next, "{flags:?}: cursor position");
+        drop(c);
+        assert_eq!(dump(&txn), before, "{flags:?}: content changed");
+    }
+}
+
+/// A cursor put rejected with `KeyExist` changes nothing and leaves the
+/// cursor where LMDB leaves it, as the reserved form does.
+#[test]
+fn cursor_put_key_exist_moves_the_cursor_as_lmdb() {
+    let env = mem_env(PS, MAP);
+    let db = env.main_database();
+    let mut txn = env.write_txn().unwrap();
+    for i in 0..50u32 {
+        let (k, v) = kv(i);
+        db.put(&mut txn, &k, &v).unwrap();
+    }
+    let before = dump(&txn);
+    let (k10, _) = kv(10);
+    let cases: [(PutFlags, Vec<u8>, Option<Vec<u8>>); 4] = [
+        // NO_OVERWRITE leaves the cursor on the existing key, ahead or behind.
+        (PutFlags::NO_OVERWRITE, kv(20).0, Some(kv(21).0)),
+        (PutFlags::NO_OVERWRITE, kv(3).0, Some(kv(4).0)),
+        // APPEND compared with the last entry and stays on it.
+        (PutFlags::APPEND, k10.clone(), None),
+        (PutFlags::APPEND, kv(49).0, None),
+    ];
+    for (flags, key, next) in cases {
+        let mut c = db.rw_cursor(&mut txn);
+        c.seek_ge(&k10).unwrap();
+        let r = c.put(flags, &key, b"v");
+        assert!(
+            matches!(r, Err(Error::Mdb(MdbError::KeyExist))),
+            "{flags:?}: {r:?}"
+        );
+        let got = c.move_next().unwrap().map(|(k, _)| k.to_vec());
+        assert_eq!(got, next, "{flags:?}: cursor position");
+        drop(c);
+        assert_eq!(dump(&txn), before, "{flags:?}: content changed");
+    }
+}
+
+/// Cursor reserves on a sequential-writes tree take its keyed path: an
+/// appended key past the end and a plain overwrite both land in place.
+#[test]
+fn cursor_reserve_on_a_sequential_writes_tree() {
+    let env = mem_env_sequential(PS, 4 << 20);
+    let db = env.main_database();
+    let mut txn = env.write_txn().unwrap();
+    let mut want = Vec::new();
+    {
+        let mut c = db.rw_cursor(&mut txn);
+        for i in 0..300u32 {
+            let k = kv(i).0;
+            let flags = if i % 2 == 0 {
+                PutFlags::APPEND
+            } else {
+                PutFlags::EMPTY
+            };
+            let len = if i % 7 == 0 { 2500 } else { 40 };
+            c.put_reserved(flags, &k, len, |slot| slot.fill(i as u8))
+                .unwrap();
+            want.push((k, vec![i as u8; len]));
+        }
+        c.seek_first().unwrap();
+        let k = want[0].0.clone();
+        c.put_reserved(PutFlags::EMPTY, &k, 2500, |slot| slot.fill(0xEE))
+            .unwrap();
+        want[0].1 = vec![0xEE; 2500];
+    }
+    assert_eq!(dump(&txn), want);
+}
+
+/// A write txn is moved by value from begin to commit (and heed embeds it
+/// in its own transaction types), so its size is a per-txn copy cost. Its
+/// lifetime-free per-txn state lives in the boxed [`WriterCarry`], and the
+/// validated-pages memo keeps its upper levels behind one box; this bound
+/// catches a field that grows the handle back.
+#[test]
+fn rwtxn_stays_small_to_move() {
+    use std::mem::size_of;
+    assert!(
+        size_of::<ValidatedPages<'static>>() <= 80,
+        "ValidatedPages is {} bytes",
+        size_of::<ValidatedPages<'static>>()
+    );
+    assert!(
+        size_of::<RwTxn<'static>>() <= 448,
+        "RwTxn is {} bytes",
+        size_of::<RwTxn<'static>>()
+    );
+}

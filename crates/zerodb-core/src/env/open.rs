@@ -313,7 +313,6 @@ pub fn open_with_backing_shared(
         // (ADR-0023 §4, `EnvInner::snapshot_at`).
         snap_cell: SnapshotCell::new(Arc::new(seed)),
         write_mutex: WriterLock::new(),
-        meta_buf: Mutex::new(Vec::new()),
         commit_hook: Mutex::new(None),
         poisoned: AtomicBool::new(false),
         reader_table,

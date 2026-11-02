@@ -87,7 +87,7 @@ pub struct HandleTable {
 /// One transaction's state in the slot table. Engine-internal; public only
 /// because [`crate::rotxn::TxnRead`] names it.
 #[doc(hidden)]
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TxnHandles {
     /// The epoch when the transaction began.
     begin: u64,
@@ -242,6 +242,15 @@ impl HandleTable {
             owner: AtomicU64::new(0),
             rare: rare.map_or_else(OnceLock::new, OnceLock::from),
         }
+    }
+
+    /// [`HandleTable::begin_reusing`] in place: restart `txn`, a write
+    /// transaction's state carried from the previous one (which ended it),
+    /// for a new transaction, keeping its [`Rare`] allocation emptied
+    /// ([`TxnHandles::recycle`]).
+    pub(crate) fn restart(&self, txn: &mut TxnHandles) {
+        let rare = txn.recycle();
+        *txn = self.begin_reusing(rare);
     }
 
     /// Advance the epoch. Called with the table lock held (`_t` proves it),

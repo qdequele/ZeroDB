@@ -289,21 +289,28 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// The GC-DB txnid key codec (SPEC 02 §7) is big-endian byte-for-byte,
-    /// not merely "ordered like" big-endian.
+    /// The GC-DB key codec (SPEC 02 §7) is `BE(txnid) ‖ BE(seq)`
+    /// byte-for-byte, not merely "ordered like" big-endian.
     #[test]
-    fn gc_key_encode_is_byte_exact_big_endian(txnid in any::<u64>()) {
-        prop_assert_eq!(geometry::gc_key_encode(txnid), txnid.to_be_bytes());
+    fn gc_key_encode_is_byte_exact_big_endian(txnid in any::<u64>(), seq in any::<u64>()) {
+        let enc = geometry::gc_key_encode(geometry::GcKey { txnid, seq });
+        prop_assert_eq!(&enc[..8], &txnid.to_be_bytes());
+        prop_assert_eq!(&enc[8..], &seq.to_be_bytes());
+        prop_assert_eq!(geometry::gc_key_decode(&enc), Some(geometry::GcKey { txnid, seq }));
     }
 
-    /// memcmp order over the encoded bytes equals numeric order over the
-    /// txnid, in both directions — the property SPEC 05's
-    /// reclamation scan depends on.
+    /// memcmp order over the encoded bytes equals `(txnid, seq)` order, in
+    /// both directions — the property SPEC 05's reclamation scan depends on.
     #[test]
-    fn gc_key_order_matches_numeric_order(a in any::<u64>(), b in any::<u64>()) {
-        let ea = geometry::gc_key_encode(a);
-        let eb = geometry::gc_key_encode(b);
+    fn gc_key_order_matches_numeric_order(
+        a in (any::<u64>(), any::<u64>()),
+        b in (any::<u64>(), any::<u64>()),
+    ) {
+        let key = |(txnid, seq)| geometry::GcKey { txnid, seq };
+        let ea = geometry::gc_key_encode(key(a));
+        let eb = geometry::gc_key_encode(key(b));
         prop_assert_eq!(a < b, ea < eb);
         prop_assert_eq!(a == b, ea == eb);
+        prop_assert_eq!(key(a) < key(b), ea < eb);
     }
 }

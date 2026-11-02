@@ -61,7 +61,7 @@ LMDB struct is transliterated.
 | Name | Value | Meaning |
 |------|-------|---------|
 | `MAGIC` | bytes `5A 44 42 31` (ASCII `"ZDB1"`) | 4-byte file identifier, stored as a byte array (endianness-free). |
-| `FORMAT_VERSION` | `2` (`u32`) | On-disk format version. Bumped only on an incompatible change (ADR-0002 §D8). Version 2 (ADR-0022) adds the meta free-list annex: `fl_count` at offset 168, `meta_crc` moved to 172 with split coverage, annex ids at 176 (§3/§3.3). A v1 file is refused at open (§3.2 step 2); migration is logical, `dump` then `load`. |
+| `FORMAT_VERSION` | `3` (`u32`) | On-disk format version. Bumped only on an incompatible change (ADR-0002 §D8). Version 2 (ADR-0022) adds the meta free-list annex: `fl_count` at offset 168, `meta_crc` moved to 172 with split coverage, annex ids at 176 (§3/§3.3). Version 3 (ADR-0037) makes the GC key 16 bytes, `BE(txnid) ‖ BE(seq)`, and bounds every GC value so it is always inline (§7). A file of an earlier version is refused at open (§3.2 step 2); migration is logical, `dump` with the old build then `load` with the new one. |
 | `HEADER_SIZE` | `32` | Size of the common page header, bytes. |
 | `PGNO_INVALID` | `0xFFFF_FFFF_FFFF_FFFF` | Sentinel "no page". |
 | `META_A_PGNO` / `META_B_PGNO` | `0` / `1` | The two fixed meta-page slots. |
@@ -343,7 +343,7 @@ off 18  : 00 00                     reserved0
 off 20  : 00 00 00 00               checksum (data-page CRC; unused, 0)
 off 24  : 00 00 00 00 00 00 00 00   reserved (meta variant tail)
 off 32  : 5A 44 42 31               magic "ZDB1"
-off 36  : 02 00 00 00               format_version = 2
+off 36  : 03 00 00 00               format_version = 3
 off 40  : 00 10 00 00               page_size = 4096 (0x1000)
 off 44  : 00 00 00 00               env_flags = 0
 off 48  : 00 00 10 00 00 00 00 00   map_size = 1 MiB (0x100000)
@@ -640,17 +640,21 @@ ordinary `P_LEAF`/`P_BRANCH` pages — there is **no** distinct freelist page
 type. What is special is the *content* of its entries (the encoding SPEC 05
 owns; the *page* format is exactly §2/§4):
 
-- **Key**: an 8-byte `u64` txnid stored **big-endian** (SPEC 05 GC-2, resolving
-  ADR-0002 OQ1), the id of the write txn that freed the pages. Big-endian is the
-  **one** engine-internal key that is not little-endian: the GC tree is ordered by
-  memcmp, and SPEC 05's reclamation scan needs numeric-ascending txnid order, for
-  which memcmp order must equal numeric order. SPEC 02 fixes only that a GC entry
-  is `(8-byte txnid key → page-id-list value)`; SPEC 05 §1 owns the byte order and
-  chose big-endian.
+- **Key** (format v3, ADR-0037): 16 bytes, two `u64`s stored **big-endian**:
+  `BE(txnid) ‖ BE(seq)`. `txnid` is the id of the write txn that freed the pages
+  (SPEC 05 GC-1); `seq` is the low end of the page-id range this entry covers
+  within that txn's list, 0 for its first entry (SPEC 05 GC-1/GC-5). Big-endian
+  is the **one** engine-internal integer encoding that is not little-endian: the
+  GC tree is ordered by memcmp, and SPEC 05's reclamation scan needs
+  `(txnid, seq)`-ascending order, for which memcmp order must equal numeric
+  order. A key of any other length is a corrupt entry. SPEC 05 §1 owns the byte
+  order and chose big-endian (GC-2, resolving ADR-0002 OQ1).
 - **Value**: a page-id list (PIL) — a `u64` count `c` followed by `c` `u64`
-  page numbers. When the PIL exceeds `max_node_size` it is stored on an
-  overflow run exactly like any large value (§5); there is no bespoke spill
-  format. The in-tree ordering of the ids within the list is SPEC 05's choice.
+  page numbers, with `1 ≤ c ≤ K` where `K = (max_node_size − 32) / 8` (249 at
+  4 KiB pages, 1,017 at 16 KiB, 4,089 at 64 KiB): the longest list whose leaf
+  cell `8 + 16 + 8 + 8c` stays inline (§4.2). A GC value is **never** stored on
+  an overflow run; a longer list is several entries (SPEC 05 GC-5). The
+  ordering of the ids within the list is SPEC 05's choice.
 
 Since format v2 (ADR-0022) the **newest** freeing-txn's PIL normally rides in
 the live meta's free-list annex (§3, SPEC 05 §2a) instead of this tree; the

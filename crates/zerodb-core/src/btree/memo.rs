@@ -91,14 +91,19 @@ pub(crate) enum PageKind {
 /// degradation (stale level counter, saturated last level, racing duplicate
 /// insert) is at worst a miss, which revalidates.
 pub struct ValidatedPages<'e> {
-    levels: [OnceLock<Box<[AtomicU64]>>; MEMO_LEVELS],
+    /// Level 0, kept inline: the only level a short txn touches.
+    base: OnceLock<Box<[AtomicU64]>>,
+    /// Levels 1 and up with their fill counts, allocated when level 0
+    /// fills. Kept behind one box so the memo, and every txn embedding it,
+    /// stays small to move.
+    upper: OnceLock<Box<UpperLevels>>,
     /// Highest level inserts currently target.
     cur: AtomicUsize,
-    /// Per-level fill counts: the ½ load-factor gate, and at drop the number
+    /// Level 0's fill count: the ½ load-factor gate, and at drop the number
     /// of level-0 slots written (each successful insert counts once). Level
     /// 0's allocation ends with the slot index of its first
     /// [`MEMO_LOG_SLOTS`] inserts, in insert order, read only by `Drop`.
-    counts: [AtomicUsize; MEMO_LEVELS],
+    base_count: AtomicUsize,
     /// The env's [`FileTrust`] policy, copied in at txn begin (ADR-0014).
     /// When set, a memo miss on a map page takes the header-checked
     /// `new_prevalidated` view, as dirty frames do, and records the page.
@@ -119,6 +124,15 @@ pub struct ValidatedPages<'e> {
     /// an aborted writer's publishes would outlive the abort into its reused
     /// txnid (TXN-2). Read only in the out-of-line miss arms.
     pub(super) publish_shared: bool,
+}
+
+/// Levels 1 to `MEMO_LEVELS - 1` of a [`ValidatedPages`] memo: index `i`
+/// here is level `i + 1`.
+#[derive(Default)]
+struct UpperLevels {
+    levels: [OnceLock<Box<[AtomicU64]>>; MEMO_LEVELS - 1],
+    /// Per-level fill counts (the ½ load-factor gate).
+    counts: [AtomicUsize; MEMO_LEVELS - 1],
 }
 
 impl ValidatedPages<'static> {
@@ -162,9 +176,10 @@ impl<'e> ValidatedPages<'e> {
         publish_shared: bool,
     ) -> ValidatedPages<'e> {
         ValidatedPages {
-            levels: std::array::from_fn(|_| OnceLock::new()),
+            base: OnceLock::new(),
+            upper: OnceLock::new(),
             cur: AtomicUsize::new(0),
-            counts: std::array::from_fn(|_| AtomicUsize::new(0)),
+            base_count: AtomicUsize::new(0),
             trust_file: policy.is_trusted(),
             shared: if policy.is_trusted() { None } else { shared },
             publish_shared,
@@ -197,6 +212,33 @@ impl<'e> ValidatedPages<'e> {
         z ^ (z >> 31)
     }
 
+    /// Level `li`'s allocation cell and fill count, allocating the upper
+    /// levels when `li` needs them.
+    fn level_or_init(&self, li: usize) -> (&OnceLock<Box<[AtomicU64]>>, &AtomicUsize) {
+        if li == 0 {
+            return (&self.base, &self.base_count);
+        }
+        let upper = self.upper.get_or_init(Box::default);
+        (&upper.levels[li - 1], &upper.counts[li - 1])
+    }
+
+    /// Whether the level table `lvl` holds `key`.
+    #[inline(always)]
+    fn probe(lvl: &[AtomicU64], key: u64) -> bool {
+        let mask = lvl.len() - 1;
+        let mut i = (Self::mix(key) as usize) & mask;
+        // Bounded probe: the ½ load-factor gate guarantees empty slots,
+        // so the first `0` ends this level; the bound is belt-and-braces.
+        for _ in 0..lvl.len() {
+            match lvl[i].load(Ordering::Acquire) {
+                0 => return false,
+                s if s == key => return true,
+                _ => i = (i + 1) & mask,
+            }
+        }
+        false
+    }
+
     #[inline(always)]
     pub(super) fn contains(&self, pgno: u64, kind: PageKind) -> bool {
         let key = Self::key_of(pgno, kind);
@@ -206,19 +248,28 @@ impl<'e> ValidatedPages<'e> {
         // the page bytes themselves are immutable and were readable before).
         // A stale `cur` or slot read is only ever a miss → revalidation.
         let top = self.cur.load(Ordering::Acquire).min(MEMO_LEVELS - 1);
-        for (li, level) in self.levels.iter().enumerate().take(top + 1) {
+        if let Some(lvl) = self.base.get() {
+            if Self::probe(&lvl[..level_slots(0)], key) {
+                return true;
+            }
+        }
+        if top == 0 {
+            return false;
+        }
+        self.contains_upper(key, top)
+    }
+
+    /// [`Self::contains`] over levels 1 to `top`, out of line: only a txn
+    /// that validated more pages than level 0 holds reaches it.
+    #[inline(never)]
+    fn contains_upper(&self, key: u64, top: usize) -> bool {
+        let Some(upper) = self.upper.get() else {
+            return false;
+        };
+        for (i, level) in upper.levels.iter().enumerate().take(top) {
             let Some(lvl) = level.get() else { continue };
-            let lvl = &lvl[..level_slots(li)];
-            let mask = lvl.len() - 1;
-            let mut i = (Self::mix(key) as usize) & mask;
-            // Bounded probe: the ½ load-factor gate guarantees empty slots,
-            // so the first `0` ends this level; the bound is belt-and-braces.
-            for _ in 0..lvl.len() {
-                match lvl[i].load(Ordering::Acquire) {
-                    0 => break,
-                    s if s == key => return true,
-                    _ => i = (i + 1) & mask,
-                }
+            if Self::probe(&lvl[..level_slots(i + 1)], key) {
+                return true;
             }
         }
         false
@@ -231,11 +282,12 @@ impl<'e> ValidatedPages<'e> {
             // index; `get_or_init` does its own synchronization for the
             // allocation itself.
             let li = self.cur.load(Ordering::Acquire).min(MEMO_LEVELS - 1);
-            let alloc = self.levels[li].get_or_init(|| new_level(li));
+            let (cell, count) = self.level_or_init(li);
+            let alloc = cell.get_or_init(|| new_level(li));
             let (lvl, log) = alloc.split_at(level_slots(li));
             // ½ load-factor gate: keeps probes short and guarantees empty
             // slots so `contains` terminates on the first `0`.
-            if self.counts[li].load(Ordering::Relaxed) * 2 >= lvl.len() {
+            if count.load(Ordering::Relaxed) * 2 >= lvl.len() {
                 if li + 1 < MEMO_LEVELS {
                     // Ordering: `AcqRel` — the winning bump publishes the new
                     // level index; losers reload and retry.
@@ -261,7 +313,7 @@ impl<'e> ValidatedPages<'e> {
                         // exact, under `&mut self`, and whatever handed it
                         // that exclusive access (a thread join, the last
                         // `Arc` drop) orders every insert before it.
-                        let n = self.counts[li].fetch_add(1, Ordering::Relaxed);
+                        let n = count.fetch_add(1, Ordering::Relaxed);
                         if let Some(entry) = log.get(n) {
                             // Only level 0 has a log (`log` is empty above it).
                             entry.store(i as u64, Ordering::Relaxed);
@@ -285,6 +337,46 @@ impl<'e> ValidatedPages<'e> {
     }
 }
 
+/// One database's root page as the transaction's memo vouches for it: a copy
+/// of that page's memo entry, kept next to the database's record in the read
+/// transaction, so a keyed descent (a point lookup or a seek) from the root
+/// skips the page-type check and the memo probe there. LMDB resolves a read transaction's root with one pointer
+/// computation (`mdb_page_get`); this is the closest checked equivalent.
+///
+/// Soundness: [`Tree`]'s root view records a slot only for a map-sourced page
+/// that [`ValidatedPages::contains`] already holds, under the same key, so a
+/// slot hit hands out exactly the view a memo hit would. The slot stores the
+/// memo key, page number included, so it only ever answers for the page it
+/// was recorded for; a lookup of any other root misses and takes the normal
+/// path. Like the memo, a slot dies with its transaction.
+#[derive(Default)]
+pub struct RootSlot(AtomicU64);
+
+impl RootSlot {
+    /// The kind recorded for root `pgno`, if this slot holds it.
+    #[inline(always)]
+    pub(super) fn kind(&self, pgno: u64) -> Option<PageKind> {
+        // Ordering: `Acquire` pairs with the `Release` in `record`, as the
+        // memo's probe pairs with its insert.
+        let s = self.0.load(Ordering::Acquire);
+        if s == ValidatedPages::key_of(pgno, PageKind::Branch) {
+            Some(PageKind::Branch)
+        } else if s == ValidatedPages::key_of(pgno, PageKind::Leaf) {
+            Some(PageKind::Leaf)
+        } else {
+            None
+        }
+    }
+
+    /// Record root `pgno` as `kind`. The caller has seen the memo hold that
+    /// key. Racing records of one database store the same word.
+    pub(super) fn record(&self, pgno: u64, kind: PageKind) {
+        // Ordering: `Release` publishes the memo hit observed before it.
+        self.0
+            .store(ValidatedPages::key_of(pgno, kind), Ordering::Release);
+    }
+}
+
 impl Drop for ValidatedPages<'_> {
     /// Clear level 0 slot by slot and park it for the next memo on this
     /// thread, when every slot written is logged; otherwise free it.
@@ -293,14 +385,14 @@ impl Drop for ValidatedPages<'_> {
     /// It is keyed by page number and kind, not by the page's stamp, so an
     /// entry carried into a later transaction could vouch for a page that
     /// was freed and rewritten since. The parked level therefore holds no
-    /// entry: `counts[0]` is the exact number of level-0 slots written (one
+    /// entry: `base_count` is the exact number of level-0 slots written (one
     /// count per successful insert), and when it is at most
     /// `MEMO_LOG_SLOTS` every one of those slots is in the level's log.
     fn drop(&mut self) {
-        let Some(mut base) = self.levels[0].take() else {
+        let Some(mut base) = self.base.take() else {
             return;
         };
-        let written = *self.counts[0].get_mut();
+        let written = *self.base_count.get_mut();
         if written > MEMO_LOG_SLOTS {
             return;
         }
@@ -343,7 +435,7 @@ mod tests {
             first.insert(pgno + 100, PageKind::Branch);
         }
         assert!(first.contains(3, PageKind::Leaf));
-        let level = first.levels[0].get().expect("level 0 allocated").as_ptr();
+        let level = first.base.get().expect("level 0 allocated").as_ptr();
         drop(first);
 
         let second = ValidatedPages::new();
@@ -352,7 +444,7 @@ mod tests {
             assert!(!second.contains(pgno + 100, PageKind::Branch));
         }
         second.insert(42, PageKind::Leaf);
-        let reused = second.levels[0].get().expect("level 0 allocated");
+        let reused = second.base.get().expect("level 0 allocated");
         assert_eq!(reused.as_ptr(), level, "the parked level is reused");
         assert!(second.contains(42, PageKind::Leaf));
         assert!(!second.contains(3, PageKind::Leaf), "no entry carried over");
@@ -401,7 +493,7 @@ mod tests {
                 });
             }
         });
-        assert_eq!(memo.counts[0].load(Ordering::Relaxed), 12);
+        assert_eq!(memo.base_count.load(Ordering::Relaxed), 12);
         drop(memo);
         let parked = take_spare().expect("a level within the log is parked");
         assert!(parked.iter().all(|s| s.load(Ordering::Relaxed) == 0));

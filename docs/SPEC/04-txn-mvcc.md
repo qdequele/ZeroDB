@@ -713,6 +713,15 @@ dirty-page store must be built so it is.
   parks the zeroed level for the next memo created on the same thread; a
   memo with more level-0 inserts than it logs frees the level instead. One
   level is parked per thread. This is not an entry carried across txns.
+  **Root slot (added 2026-11-02, #147).** A read txn also keeps, per
+  database (the main database, and each named database in its dbi-indexed
+  record table), one copy of the memo entry of that database's root page:
+  the root's page number and kind. A keyed descent (point lookup or seek)
+  that finds the root's page number there takes the memo-hit view without the page-type
+  check or the memo probe. The copy is made only for a map-sourced root the
+  memo already holds under the same key, so it vouches for nothing the memo
+  does not, and under the trusting policy a leaf root is never copied. Like
+  the memo, it dies with the txn. Write txns and nested read txns keep none.
   **Cross-txn validation cache (added 2026-09-29, ADR-0018):** under the
   validating policy a txn-memo miss on a map-sourced leaf or branch first
   probes an env-wide cache keyed by **(pgno, page kind, header txnid stamp)**.
@@ -1097,6 +1106,11 @@ spilling bullet there.)
   - The engine MUST NOT zero the reserved region (SPEC 01 §S3: parity with
     writemap peek; the caller sees uninitialized-but-owned space). This differs
     from a normal `put`, which copies the caller's value.
+  - The write cursor's form, `RwCursor::put_reserved(flags, key, len, f)`
+    (heed's `put_current_reserved_with_flags`, `mdb_cursor_put` with
+    `MDB_RESERVE`), follows the same rules and takes `put_with_flags`'
+    flags. The slot is placed before `f` runs, so a put rejected by its
+    checks or flags never calls `f` (SPEC 03 §7).
 - **TXN-48** — After the write txn commits or aborts, any `ReservedSpace`-derived
   pointer is invalid (the frame/map page may be reused or the txn's frames
   dropped). This mirrors SPEC 01 §S3's "after commit/abort the pointer is
@@ -1265,7 +1279,7 @@ every hook; this section defines the steps and their ordering. Both write modes
   |---|------|-----------|----------------------------------|
   | C0 | Assert `child_count == 0`; compute freed-page list. | — | last committed meta `N−1` (unchanged). |
   | C1a | **catalog write-back** (M1.6, SPEC 02 §6.1): write each dirty named-DB working record back into the main tree as its `F_SUBDATA` catalog entry. Before `freelist_save` (matches LMDB's sub-DB flush order) so the pages this COWs/frees are captured by C1. | — | `N−1` (all changes still in the dirty set). |
-  | C1 | **freelist_save** (SPEC 05 §4): apply drain rewrites to the GC DB (dirtying GC pages into the dirty set, loop-until-stable, SPEC 05 GC-11) and place this txn's freed set — into the meta free-list annex when it fits (format v2, SPEC 05 §2a GC-32: stashed for C4, no tree write), else into the GC DB under `BE(N)`. | H0 | `N−1` (all changes still in dirty set, nothing written). |
+  | C1 | **freelist_save** (SPEC 05 §4): apply drain rewrites to the GC DB (dirtying GC pages into the dirty set, loop-until-stable, SPEC 05 GC-11) and place this txn's freed set — into the meta free-list annex when it fits (format v2, SPEC 05 §2a GC-32: stashed for C4, no tree write), else into the GC DB as records keyed `(N, seq)` (format v3, SPEC 05 GC-5). | H0 | `N−1` (all changes still in dirty set, nothing written). |
   | C2 | **write dirty pages** to their pgnos (`pwrite` each dirty frame; memcpy-into-map under heap-staged WRITE_MAP, TXN-45a; a no-op per in-map frame under in-place WRITE_MAP, TXN-45b — those bytes were stored at allocation/edit time, under the same TXN-62 invariant). Not yet durable. | **H1** | `N−1` live; new pages sit in free/beyond-HWM slots the `N−1` tree does not reference (TXN-62). Partial/torn data pages are unreferenced garbage. |
   | C3 | **fsync(data)** — flush all data pages (skipped under `NO_SYNC`/`MAP_ASYNC`, SPEC 06 REC-6). | **H2** | `N−1` live; txn `N`'s data fully durable but unreferenced (no meta points at it). |
   | C4 | **write meta** to slot `N&1` (the *older* slot), with `txnid = writer_txnid`, the C1-stashed free-list annex (format v2, SPEC 02 §3) and a fresh CRC covering both (SPEC 02 §3.3). Not yet durable. | **H3** | Either `N−1` (meta `N` not yet reached disk, or reached but torn → CRC rejects it → older slot wins) or `N` (meta reached disk intact). Never a torn meta accepted. |

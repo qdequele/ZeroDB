@@ -1,6 +1,7 @@
 //! `ReservedSpace` — heed's `MDB_RESERVE` write buffer. heed
 //! reserves bytes *inside the map*; the adapter does the equivalent:
-//! `Database::put_reserved` hands the caller a `ReservedSpace` wrapping the
+//! `Database::put_reserved` and the write cursor's
+//! `put_current_reserved_with_flags` hand the caller a `ReservedSpace` wrapping the
 //! engine's **in-frame slot** (the mutable slice into the dirty page or
 //! overflow-run frame, SPEC 04 TXN-47) — no intermediate heap buffer, no copy.
 //! The slot may carry stale frame bytes (a COWed page's old cell heap), so the
@@ -90,6 +91,26 @@ impl<'a> ReservedSpace<'a> {
         self.written = len;
         self.write_head = len;
     }
+}
+
+/// Run a heed reserved-put closure on the engine's slot, as heed does on the
+/// space `MDB_RESERVE` returned: the closure's own error, else
+/// `UnexpectedEof` if it left part of the space unwritten. The unwritten tail
+/// is zeroed either way, since the slot may hold stale page bytes.
+pub(crate) fn fill_slot<F>(slot: &mut [u8], write_func: F) -> io::Result<()>
+where
+    F: FnOnce(&mut ReservedSpace) -> io::Result<()>,
+{
+    let mut space = ReservedSpace::new(slot);
+    let outcome = write_func(&mut space).and_then(|()| {
+        if space.remaining() == 0 {
+            Ok(())
+        } else {
+            Err(io::ErrorKind::UnexpectedEof.into())
+        }
+    });
+    space.zero_unwritten_tail();
+    outcome
 }
 
 impl io::Write for ReservedSpace<'_> {

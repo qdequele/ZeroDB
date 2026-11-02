@@ -9,6 +9,10 @@
 //! mechanism cannot change what the cursor yields. Do not weaken them to let an
 //! optimization pass.
 //!
+//! A flagged `put_current_with_options` that LMDB rejects with `KeyExist` still
+//! moves the cursor: onto the existing key under `NO_OVERWRITE`, onto the last
+//! entry under `APPEND`. Those positions are pinned here too.
+//!
 //! Each case records an event trace through the **heed surface consumers use**
 //! (`iter_mut` / `rev_iter_mut` / `range_mut`, the shapes milli and hannoy
 //! rewrite entries through) and asserts the two engines produce the same trace
@@ -37,17 +41,24 @@ fn width(shape: u8, i: usize) -> usize {
     }
 }
 
+/// The flags a `put_current_with_options` passes.
+#[derive(Clone, Copy, Debug)]
+pub enum Flag {
+    NoOverwrite,
+    Append,
+}
+
 /// Generate one probe module per engine from a single body, so neither engine
 /// can be given a different sequence of calls.
 macro_rules! probes {
     ($m:ident, $heed:ident, $setpage:tt) => {
         mod $m {
             #[allow(unused_imports)] // only the `set` arm needs the page size
-            use super::{width, N, VAL};
+            use super::{width, Flag, N, VAL};
             use std::ops::Bound;
             use std::path::Path;
             use $heed::types::Bytes;
-            use $heed::{Database, Env, EnvOpenOptions, WithoutTls};
+            use $heed::{Database, Env, EnvOpenOptions, PutFlags, WithoutTls};
 
             type Db = Database<Bytes, Bytes>;
 
@@ -124,6 +135,58 @@ macro_rules! probes {
                         Some(Err(e)) => panic!("next: {e}"),
                         None => trace.push("next -> None".into()),
                     }
+                }
+                w.commit().expect("commit");
+                let c = content(&env, db);
+                drop(env);
+                (trace, c)
+            }
+
+            /// Advance `nth` entries forward (`iter_mut`) or backward
+            /// (`rev_iter_mut`), `put_current_with_options` `flag` with the
+            /// key `target`, then report the result and what the next
+            /// `next()` yields.
+            pub fn flagged_put_then_next(
+                dir: &Path,
+                keys: &[Vec<u8>],
+                nth: usize,
+                backward: bool,
+                target: u64,
+                flag: Flag,
+            ) -> (Vec<String>, Vec<(u64, usize, u8)>) {
+                let (env, db) = open(dir);
+                fill(&env, db, keys);
+                let mut trace = Vec::new();
+                let mut w = env.write_txn().expect("write_txn");
+                {
+                    let mut fwd;
+                    let mut rev;
+                    let it: &mut dyn RwWalk = if backward {
+                        rev = db.rev_iter_mut(&mut w).expect("rev_iter_mut");
+                        &mut rev
+                    } else {
+                        fwd = db.iter_mut(&mut w).expect("iter_mut");
+                        &mut fwd
+                    };
+                    let mut cur = Vec::new();
+                    for _ in 0..=nth {
+                        cur = it.step().expect("tree holds nth");
+                    }
+                    trace.push(format!("at {}", key_of(&cur)));
+                    let flags = match flag {
+                        Flag::NoOverwrite => PutFlags::NO_OVERWRITE,
+                        Flag::Append => PutFlags::APPEND,
+                    };
+                    let r = it.put_flagged(flags, &target.to_be_bytes(), &[0x11u8; 64]);
+                    trace.push(match r {
+                        Ok(()) => "put -> Ok".into(),
+                        Err($heed::Error::Mdb(e)) => format!("put -> Err(Mdb({e:?}))"),
+                        Err(e) => format!("put -> Err(other: {e})"),
+                    });
+                    trace.push(match it.step() {
+                        Some(k) => format!("next -> {}", key_of(&k)),
+                        None => "next -> None".into(),
+                    });
                 }
                 w.commit().expect("commit");
                 let c = content(&env, db);
@@ -208,6 +271,7 @@ macro_rules! probes {
             trait RwWalk {
                 fn step(&mut self) -> Option<Vec<u8>>;
                 fn rewrite(&mut self, k: &[u8], v: &[u8]);
+                fn put_flagged(&mut self, flags: PutFlags, k: &[u8], v: &[u8]) -> $heed::Result<()>;
             }
             impl RwWalk for $heed::RwIter<'_, Bytes, Bytes> {
                 fn step(&mut self) -> Option<Vec<u8>> {
@@ -217,6 +281,10 @@ macro_rules! probes {
                     // SAFETY: `step` copied the key out; no borrow is live.
                     unsafe { self.put_current(k, v) }.expect("put_current");
                 }
+                fn put_flagged(&mut self, flags: PutFlags, k: &[u8], v: &[u8]) -> $heed::Result<()> {
+                    // SAFETY: the caller copied every key out; no borrow is live.
+                    unsafe { self.put_current_with_options::<Bytes>(flags, k, v) }
+                }
             }
             impl RwWalk for $heed::RwRevIter<'_, Bytes, Bytes> {
                 fn step(&mut self) -> Option<Vec<u8>> {
@@ -225,6 +293,10 @@ macro_rules! probes {
                 fn rewrite(&mut self, k: &[u8], v: &[u8]) {
                     // SAFETY: `step` copied the key out; no borrow is live.
                     unsafe { self.put_current(k, v) }.expect("put_current");
+                }
+                fn put_flagged(&mut self, flags: PutFlags, k: &[u8], v: &[u8]) -> $heed::Result<()> {
+                    // SAFETY: the caller copied every key out; no borrow is live.
+                    unsafe { self.put_current_with_options::<Bytes>(flags, k, v) }
                 }
             }
         }
@@ -321,4 +393,86 @@ fn rewriting_a_range_stops_at_its_end() {
         );
         assert_eq!(t[0], "visited 1000 entries");
     }
+}
+
+#[test]
+fn rejected_no_overwrite_leaves_the_cursor_on_the_existing_key() {
+    // A key ahead of the cursor, the key under it, and a key behind it.
+    for (target, after) in [(15u64, "next -> 16"), (10, "next -> 11"), (5, "next -> 6")] {
+        let t = agree!(
+            flagged_put_then_next,
+            format!("NO_OVERWRITE {target}"),
+            10usize,
+            false,
+            target,
+            Flag::NoOverwrite
+        );
+        assert_eq!(
+            t,
+            vec!["at 10", "put -> Err(Mdb(KeyExist))", after],
+            "observed fork behaviour changed"
+        );
+    }
+}
+
+#[test]
+fn rejected_no_overwrite_backward_leaves_the_cursor_on_the_existing_key() {
+    let at = N - 11;
+    let t = agree!(
+        flagged_put_then_next,
+        "NO_OVERWRITE backward",
+        10usize,
+        true,
+        (at - 5) as u64,
+        Flag::NoOverwrite
+    );
+    assert_eq!(
+        t,
+        vec![
+            format!("at {at}"),
+            "put -> Err(Mdb(KeyExist))".into(),
+            format!("next -> {}", at - 6),
+        ]
+    );
+}
+
+#[test]
+fn rejected_append_leaves_the_cursor_on_the_last_entry() {
+    // A key ahead of the cursor, the key under it, and the last key.
+    for target in [15u64, 10, (N - 1) as u64] {
+        let t = agree!(
+            flagged_put_then_next,
+            format!("APPEND {target}"),
+            10usize,
+            false,
+            target,
+            Flag::Append
+        );
+        assert_eq!(
+            t,
+            vec!["at 10", "put -> Err(Mdb(KeyExist))", "next -> None"],
+            "observed fork behaviour changed"
+        );
+    }
+}
+
+#[test]
+fn rejected_append_backward_leaves_the_cursor_on_the_last_entry() {
+    let at = N - 11;
+    let t = agree!(
+        flagged_put_then_next,
+        "APPEND backward",
+        10usize,
+        true,
+        5u64,
+        Flag::Append
+    );
+    assert_eq!(
+        t,
+        vec![
+            format!("at {at}"),
+            "put -> Err(Mdb(KeyExist))".into(),
+            format!("next -> {}", N - 2),
+        ]
+    );
 }

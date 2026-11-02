@@ -10,7 +10,7 @@
 //! # Conventions (SPEC 02 §0)
 //!
 //! - **Little-endian only** for every engine integer field. The one exception
-//!   is the GC-DB txnid key, which is big-endian (SPEC 05); see
+//!   is the GC-DB key, which is big-endian (SPEC 05); see
 //!   [`geometry::gc_key_encode`].
 //! - **No `#[repr(C)]` casts of unaligned data.** All fields are read/written by
 //!   explicit offset through `raw`. The field readers in
@@ -61,7 +61,9 @@ pub const MAGIC: [u8; 4] = *b"ZDB1";
 /// On-disk format version. Bumped only on an incompatible change (ADR-0002
 /// §D8). Version 2 (ADR-0022): the meta free-list annex — `fl_count` at
 /// offset 168, `meta_crc` moved to 172 with split coverage, annex ids at 176.
-pub const FORMAT_VERSION: u32 = 2;
+/// Version 3 (ADR-0037): 16-byte GC keys `BE(txnid) ‖ BE(seq)`, every GC
+/// record inline and at most [`geometry::gc_chunk_cap`] ids long.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// Size of the common page header, in bytes.
 pub const HEADER_SIZE: usize = 32;

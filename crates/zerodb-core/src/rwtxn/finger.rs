@@ -242,7 +242,7 @@ impl<'env> RwTxn<'env> {
         match tree {
             TreeId::Main => self.seq_main,
             TreeId::Free => false,
-            TreeId::Named(dbi) => self.open.get(dbi).is_some_and(|t| t.seq),
+            TreeId::Named(dbi) => work!(self).open.get(dbi).is_some_and(|t| t.seq),
         }
     }
 

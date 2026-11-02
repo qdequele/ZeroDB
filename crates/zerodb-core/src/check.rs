@@ -1,4 +1,4 @@
-//! Tree invariant checker (SPEC 03 §11 INV-1..21 + SPEC 05 §9 INV-22..26).
+//! Tree invariant checker (SPEC 03 §11 INV-1..21 + SPEC 05 §9 INV-22..29).
 //! The `zerodb-tools check` command wraps this walk.
 //!
 //! [`check_image`] validates a whole env-file image against the live meta's
@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crate::page::geometry::{gc_key_decode, overflow_page_count, pil_decode};
+use crate::page::geometry::{gc_chunk_cap, gc_key_decode, overflow_page_count, pil_decode, GcKey};
 use crate::page::{
     select_meta, DBRecord, LeafValue, MetaPage, OverflowRef, PageRef, PageType, DBRECORD_LEN,
     FIRST_DATA_PGNO, F_SUBDATA, MAX_DB_NAME, MAX_KEY_SIZE, MIN_KEYS_BRANCH, MIN_KEYS_LEAF,
@@ -90,7 +90,7 @@ struct Shared<'a> {
     meta_txnid: u64,
     last_pg: u64,
     /// The selected meta's annex id count (INV-28/GC-29: `> 0` forbids a GC
-    /// tree entry keyed `BE(meta_txnid)`).
+    /// tree record of `meta_txnid`).
     annex_count: usize,
     /// Pages reached by the tree walks (INV-16, INV-11, INV-22).
     visited: PageSet,
@@ -143,6 +143,9 @@ struct Checker<'s, 'a> {
     /// unseeded pgno hasher: its keys are *on-disk* page ids, so a hostile
     /// file could otherwise choose ids that all collide (HashDoS).
     free: HashMap<u64, u64>,
+    /// The shape of every GC record walked, for the INV-29 range check once
+    /// the whole GC tree has been read.
+    gc_records: Vec<GcRecordShape>,
     violations: Vec<String>,
     /// `None` for the serial walk, which walks everything in place, in the
     /// order the report lists findings. `Some` for one job of a parallel
@@ -163,6 +166,7 @@ impl<'s, 'a> Checker<'s, 'a> {
             last_pg: shared.last_pg,
             annex_count: shared.annex_count,
             free: HashMap::new(),
+            gc_records: Vec::new(),
             violations: Vec::new(),
             deferred: deferred.then(Vec::new),
             rec_idx: 0,
@@ -465,30 +469,39 @@ impl<'s, 'a> Checker<'s, 'a> {
         stats.overflow_pages += expect;
     }
 
-    /// GC-entry well-formedness (INV-23/25/26): 8-byte big-endian txnid key
-    /// `<=` the live meta txnid; PIL = count prefix + strictly-ascending ids in
-    /// `[2, last_pg]`. Every id is also collected into `self.free` for the
-    /// INV-22/INV-24 partition check.
+    /// GC-record well-formedness (INV-23/25/26/29): a 16-byte big-endian
+    /// `(txnid, seq)` key whose txnid is `<=` the live meta txnid; an inline
+    /// PIL (GC-5) = count prefix + at most [`gc_chunk_cap`] strictly
+    /// ascending ids in `[2, last_pg]`. Every id is also collected into
+    /// `self.free` for the INV-22/INV-24 partition check, and the record's
+    /// shape into `self.gc_records` for the INV-29 range check.
     fn check_gc_entry(&mut self, leaf: u64, key: &[u8], val: LeafValue<'_>) {
-        let Some(txnid) = gc_key_decode(key) else {
-            self.fail("INV-23", format!("GC leaf {leaf}: key is not 8 bytes"));
+        let Some(key) = gc_key_decode(key) else {
+            self.fail(
+                "INV-23",
+                format!("GC leaf {leaf}: key of {} bytes, not 16", key.len()),
+            );
             return;
         };
-        if txnid > self.meta_txnid {
-            self.fail("INV-23", format!("GC entry keyed by future txn {txnid}"));
+        if key.txnid > self.meta_txnid {
+            self.fail("INV-23", format!("GC record {key} keyed by a future txn"));
         }
         // INV-28/GC-29 (format v2): a meta with a non-empty annex holds the
-        // newest freeing-txn's PIL itself — a tree entry under the same
-        // txnid would be the forbidden split placement (GC-32).
-        if txnid == self.meta_txnid && self.annex_count > 0 {
+        // newest freeing-txn's PIL itself — a tree record of the same txnid
+        // would be the forbidden split placement (GC-32).
+        if key.txnid == self.meta_txnid && self.annex_count > 0 {
             self.fail(
                 "INV-28",
-                format!("GC entry {txnid} coexists with a non-empty meta annex (GC-29/GC-32)"),
+                format!("GC record {key} coexists with a non-empty meta annex (GC-29/GC-32)"),
             );
         }
         let pil: Vec<u8> = match val {
             LeafValue::Inline(v) => v.to_vec(),
             LeafValue::Overflow { head_pgno, dsize } => {
+                self.fail(
+                    "INV-29",
+                    format!("GC record {key}: value on an overflow run at {head_pgno} (GC-5)"),
+                );
                 match self
                     .run_at(head_pgno)
                     .and_then(|run| OverflowRef::new(run, self.psize).ok())
@@ -496,7 +509,7 @@ impl<'s, 'a> Checker<'s, 'a> {
                 {
                     Some(p) => p.to_vec(),
                     None => {
-                        self.fail("INV-26", format!("GC entry {txnid}: unreadable PIL"));
+                        self.fail("INV-26", format!("GC record {key}: unreadable PIL"));
                         return;
                     }
                 }
@@ -506,7 +519,7 @@ impl<'s, 'a> Checker<'s, 'a> {
             self.fail(
                 "INV-26",
                 format!(
-                    "GC entry {txnid}: PIL of {} bytes: bad length or count prefix",
+                    "GC record {key}: PIL of {} bytes: bad length or count prefix",
                     pil.len()
                 ),
             );
@@ -516,10 +529,54 @@ impl<'s, 'a> Checker<'s, 'a> {
             match fault {
                 FreeIdFault::OutOfRange(id) => self.fail(
                     "INV-25",
-                    format!("GC entry {txnid}: free id {id} out of range"),
+                    format!("GC record {key}: free id {id} out of range"),
                 ),
                 FreeIdFault::NotAscending => {
-                    self.fail("INV-26", format!("GC entry {txnid}: ids not ascending"));
+                    self.fail("INV-26", format!("GC record {key}: ids not ascending"));
+                }
+            }
+        }
+        self.gc_records.push(GcRecordShape {
+            key,
+            count: ids.len(),
+            span: ids.first().zip(ids.last()).map(|(a, b)| (*a, *b)),
+        });
+    }
+
+    /// INV-29 (ADR-0037): every GC record holds at least one and at most
+    /// [`gc_chunk_cap`] ids, and the records of one freeing txn cover
+    /// disjoint ranges: a record keyed `(F, s)` lists only ids in `[s, s′)`,
+    /// `s′` the key of the next record of `F`. Run once the whole GC tree has
+    /// been read (`gc_records` in any order).
+    fn check_gc_ranges(&mut self) {
+        let cap = gc_chunk_cap(self.psize);
+        let mut recs = std::mem::take(&mut self.gc_records);
+        recs.sort_unstable_by_key(|r| r.key);
+        for (i, r) in recs.iter().enumerate() {
+            if r.count == 0 || r.count > cap {
+                self.fail(
+                    "INV-29",
+                    format!("GC record {}: {} ids, not 1..={cap}", r.key, r.count),
+                );
+            }
+            let Some((first, last)) = r.span else {
+                continue;
+            };
+            if first < r.key.seq {
+                self.fail(
+                    "INV-29",
+                    format!("GC record {}: id {first} below its key", r.key),
+                );
+            }
+            if let Some(next) = recs.get(i + 1).filter(|n| n.key.txnid == r.key.txnid) {
+                if last >= next.key.seq {
+                    self.fail(
+                        "INV-29",
+                        format!(
+                            "GC record {}: id {last} at or past the next record {}",
+                            r.key, next.key
+                        ),
+                    );
                 }
             }
         }
@@ -812,6 +869,14 @@ fn default_threads(last_pg: u64) -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get().min(MAX_THREADS))
 }
 
+/// What INV-29 needs of one GC record ([`Checker::check_gc_ranges`]).
+struct GcRecordShape {
+    key: GcKey,
+    count: usize,
+    /// Its lowest and highest id, when it lists any.
+    span: Option<(u64, u64)>,
+}
+
 /// A fault in a list of free-page ids ([`check_free_ids`]).
 enum FreeIdFault {
     /// An id outside `[FIRST_DATA_PGNO, last_pg]`.
@@ -889,6 +954,7 @@ fn check_state(
     checker.violations = violations;
     checker.check_record("main_db", roots.main_db, TreeKind::Catalog);
     checker.check_record("free_db", roots.free_db, TreeKind::Gc);
+    checker.check_gc_ranges();
     // INV-10 / INV-22 + INV-24 (reachable XOR free, unconditional).
     checker.check_reachable_xor_free();
     checker.violations
@@ -916,6 +982,7 @@ enum Job {
 struct JobOut {
     violations: Vec<String>,
     free: HashMap<u64, u64>,
+    gc_records: Vec<GcRecordShape>,
     deferred: Vec<Deferred>,
     rec_idx: usize,
     /// The job's share of its record's stats; `None` for a malformed
@@ -956,6 +1023,7 @@ fn walk_parallel(
         },
     ];
     let mut violations = Vec::new();
+    let mut gc_records = Vec::new();
     while !jobs.is_empty() {
         let outs = run_round(shared, &records, &jobs, threads);
         jobs.clear();
@@ -964,6 +1032,7 @@ fn walk_parallel(
             for (id, n) in out.free {
                 *free.entry(id).or_insert(0) += n;
             }
+            gc_records.extend(out.gc_records);
             if let Some(stats) = out.stats {
                 let r = &mut records[out.rec_idx];
                 r.stats += stats;
@@ -985,10 +1054,12 @@ fn walk_parallel(
     }
     let mut checker = Checker::new(shared, false);
     checker.free = free;
+    checker.gc_records = gc_records;
     checker.violations = violations;
     for r in records.iter().filter(|r| r.walked) {
         checker.check_stats(&r.label, &r.rec, r.stats);
     }
+    checker.check_gc_ranges();
     checker.check_reachable_xor_free();
     checker.violations
 }
@@ -1026,6 +1097,7 @@ fn run_round(
         JobOut {
             violations: c.violations,
             free: c.free,
+            gc_records: c.gc_records,
             deferred: c.deferred.unwrap_or_default(),
             rec_idx: c.rec_idx,
             stats,

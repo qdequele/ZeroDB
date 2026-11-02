@@ -356,6 +356,40 @@ macro_rules! bench_backend {
                     w.commit().expect("commit");
                 }
 
+                /// `cursor_rewrite` through the cursor's `MDB_RESERVE` form,
+                /// `put_current_reserved_with_flags`: the value is written into
+                /// the space the put reserved.
+                fn cursor_rewrite_reserved(env: &BEnv, db: Db, keys: &[Vec<u8>], val: &[u8]) {
+                    let (Some(lo), Some(hi)) = (keys.first(), keys.last()) else {
+                        return;
+                    };
+                    let mut w = env.write_txn().expect("write_txn");
+                    {
+                        let span = (
+                            Bound::Included(lo.as_slice()),
+                            Bound::Included(hi.as_slice()),
+                        );
+                        let mut it = db.range_mut(&mut w, &span).expect("range_mut");
+                        let mut key = Vec::new();
+                        while let Some(kv) = it.next() {
+                            let (k, _) = kv.expect("entry");
+                            key.clear();
+                            key.extend_from_slice(k);
+                            // SAFETY: as in `cursor_rewrite`.
+                            unsafe {
+                                it.put_current_reserved_with_flags(
+                                    PutFlags::empty(),
+                                    &key,
+                                    val.len(),
+                                    |space| space.write_all(val),
+                                )
+                            }
+                            .expect("put_current_reserved_with_flags");
+                        }
+                    }
+                    w.commit().expect("commit");
+                }
+
                 /// Delete then re-insert the same keys, one committed txn each way,
                 /// `rounds` times — freelist / GC churn (pages must be reclaimed and
                 /// handed back out).
