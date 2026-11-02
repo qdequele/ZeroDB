@@ -11,20 +11,23 @@ use super::*;
 /// freelist is on-disk data: a corrupt or hostile entry must yield
 /// `MdbError::Invalid`, never hand out the meta slots (page 0/1), a live
 /// page, or a page beyond the committed file.
+///
+/// Strictly ascending ids are all in range when the first and the last are,
+/// so the range is checked at the two ends and the order in one pass. The
+/// pass has no early exit (a valid list is the common case), which lets it
+/// compile to vector compares.
 pub(crate) fn validate_pil_ids(ids: &[u64], last_pg: u64) -> Result<()> {
-    let mut prev: Option<u64> = None;
-    for &id in ids {
-        if id < FIRST_DATA_PGNO || id > last_pg {
-            return Err(Error::Mdb(MdbError::Invalid));
-        }
-        if let Some(p) = prev {
-            if p >= id {
-                return Err(Error::Mdb(MdbError::Invalid));
-            }
-        }
-        prev = Some(id);
+    let in_range = match (ids.first(), ids.last()) {
+        (Some(&lo), Some(&hi)) => lo >= FIRST_DATA_PGNO && hi <= last_pg,
+        _ => true,
+    };
+    let rest = ids.get(1..).unwrap_or_default();
+    let ascending = ids.iter().zip(rest).fold(true, |ok, (a, b)| ok & (a < b));
+    if in_range && ascending {
+        Ok(())
+    } else {
+        Err(Error::Mdb(MdbError::Invalid))
     }
-    Ok(())
 }
 
 /// Decode a GC record's PIL and validate it (SPEC 05 GC-18): the freelist

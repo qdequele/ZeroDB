@@ -1804,3 +1804,23 @@ proptest::proptest! {
         proptest::prop_assert_eq!(db.len(&txn).unwrap(), model.len() as u64);
     }
 }
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig {
+        failure_persistence: None,
+        cases: if cfg!(miri) { 16 } else { 1024 },
+        ..Default::default()
+    })]
+
+    /// `validate_pil_ids` accepts exactly the lists whose ids are strictly
+    /// ascending and each in `[FIRST_DATA_PGNO, last_pg]` (SPEC 05 GC-3).
+    #[test]
+    fn validate_pil_ids_accepts_exactly_ascending_in_range(
+        ids in proptest::collection::vec(0u64..64, 0..12),
+        last_pg in 0u64..64,
+    ) {
+        let want = ids.iter().all(|&id| (FIRST_DATA_PGNO..=last_pg).contains(&id))
+            && ids.windows(2).all(|w| w[0] < w[1]);
+        proptest::prop_assert_eq!(validate_pil_ids(&ids, last_pg).is_ok(), want);
+    }
+}
