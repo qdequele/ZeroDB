@@ -140,6 +140,12 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 - Write transactions reuse the previous one's containers, as LMDB's
   `me_txn0` (#8): 5 heap allocations per single-put commit instead of 19.
   `commit/batch/n1` 1.26× → 1.17×.
+- The write transaction handle is 424 bytes instead of 888, and a read
+  transaction 208 instead of 384 (#146): state most transactions never touch
+  lives in the env's reused write-txn carry, and the validated-pages memo's
+  upper levels behind one lazily allocated box, so beginning and committing a
+  transaction copies less. An empty write txn takes 3.0 % fewer cycles
+  (laptop).
 - Cursor deletes step in place and keep their path across left-sibling
   rebalances (#137): `del/cursor/drain` 2.41× → 1.66×, `del/cursor/rev`
   3.06× → 1.50×, `del/clear/all` 1.73× → 1.43×.

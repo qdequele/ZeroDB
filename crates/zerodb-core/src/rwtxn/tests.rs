@@ -2014,3 +2014,23 @@ fn cursor_reserve_on_a_sequential_writes_tree() {
     }
     assert_eq!(dump(&txn), want);
 }
+
+/// A write txn is moved by value from begin to commit (and heed embeds it
+/// in its own transaction types), so its size is a per-txn copy cost. Its
+/// lifetime-free per-txn state lives in the boxed [`WriterCarry`], and the
+/// validated-pages memo keeps its upper levels behind one box; this bound
+/// catches a field that grows the handle back.
+#[test]
+fn rwtxn_stays_small_to_move() {
+    use std::mem::size_of;
+    assert!(
+        size_of::<ValidatedPages<'static>>() <= 80,
+        "ValidatedPages is {} bytes",
+        size_of::<ValidatedPages<'static>>()
+    );
+    assert!(
+        size_of::<RwTxn<'static>>() <= 448,
+        "RwTxn is {} bytes",
+        size_of::<RwTxn<'static>>()
+    );
+}

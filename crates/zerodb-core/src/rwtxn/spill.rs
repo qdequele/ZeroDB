@@ -148,7 +148,7 @@ impl<'env> RwTxn<'env> {
     pub(super) fn spill(&mut self) -> Result<()> {
         let want = SPILL_NEED.max(self.dirty_limit / 8);
         let mut keep: Vec<u64> = vec![self.main_db.root, self.free_db.root];
-        keep.extend(self.open.values().map(|t| t.rec.root));
+        keep.extend(work!(self).open.values().map(|t| t.rec.root));
         for f in &work_mut!(self).fingers {
             keep.extend(f.path.iter().map(|&(p, _)| p));
         }
@@ -208,7 +208,7 @@ impl<'env> RwTxn<'env> {
             self.env.inner().file_trust(),
             Some(self.env.inner().stamp_cache()),
         );
-        self.spills += 1;
+        work_mut!(self).spills += 1;
         Ok(())
     }
 
@@ -217,7 +217,7 @@ impl<'env> RwTxn<'env> {
     #[doc(hidden)]
     #[must_use]
     pub fn spill_count(&self) -> u64 {
-        self.spills
+        work!(self).spills
     }
 
     /// Pages currently held in dirty frames (SPEC 04 TXN-68): what the dirty

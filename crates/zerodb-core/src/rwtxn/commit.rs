@@ -75,11 +75,13 @@ impl<'env> RwTxn<'env> {
     /// End this txn in the slot table (ADR-0024): publish what it opened on a
     /// commit, free it otherwise. A txn that opened nothing returns at once.
     pub(super) fn end_handles(&mut self, committed: bool) {
-        if self.handles.is_idle() {
+        let Some(work) = self.work.as_deref_mut() else {
+            return;
+        };
+        if work.handles.is_idle() {
             return;
         }
-        let env = self.env;
-        env.inner().handles().end(&mut self.handles, committed);
+        self.env.inner().handles().end(&mut work.handles, committed);
     }
 
     /// The one commit function (ADR-0004): steps C1–C6 in textual order,
@@ -277,7 +279,7 @@ impl<'env> RwTxn<'env> {
         // then store the commit point SeqCst) — only after C5, so no reader
         // can pin `N` before it is durable (TXN-64). The next write txn of
         // this process starts from it (`WriterCarry`). -----
-        self.published = Some(Arc::clone(&snapshot));
+        work_mut!(self).snapshot = Some(Arc::clone(&snapshot));
         inner.publish_snapshot(snapshot);
         Ok(())
         // Drop of `self` releases the write mutex — the tail of C6.

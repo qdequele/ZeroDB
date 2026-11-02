@@ -45,8 +45,8 @@ fn check_walk_level(level: u16) -> Result<()> {
 }
 
 /// A named DB's per-txn working state: the loaded/mutated `DBRecord`
-/// plus its catalog name, kept in [`RwTxn::open`]. `dirty` marks that the
-/// record changed and must be written back into the main catalog at commit
+/// plus its catalog name, kept in [`WriterCarry::open`]. `dirty` marks that
+/// the record changed and must be written back into the main catalog at commit
 /// (SPEC 02 §6, before `freelist_save` — the LMDB sub-DB flush order).
 pub(super) struct NamedTree {
     pub(super) name: Box<[u8]>,
@@ -143,13 +143,13 @@ impl Env {
         if name.is_empty() || name.len() > MAX_DB_NAME {
             return Err(Error::Mdb(MdbError::BadValSize));
         }
-        let db = self.open_slot(&wtxn.handles, name)?;
+        let db = self.open_slot(&work!(wtxn).handles, name)?;
         let DbSel::Named(dbi) = db.sel() else {
             unreachable!("a named open makes a named handle")
         };
         if let Err(e) = wtxn.create_named(dbi, name) {
             // No database came to exist under this handle (ADR-0024).
-            self.inner().handles().abandon(&wtxn.handles, dbi);
+            self.inner().handles().abandon(&work!(wtxn).handles, dbi);
             return Err(e);
         }
         Ok(db)
@@ -305,7 +305,7 @@ impl<'env> RwTxn<'env> {
             DbSel::Named(dbi) => {
                 let tree = self.ensure_open(db)?;
                 self.clear_tree(tree)?;
-                let name = self
+                let name = work!(self)
                     .open
                     .get(dbi)
                     .expect("named record loaded")
@@ -316,13 +316,13 @@ impl<'env> RwTxn<'env> {
                 debug_assert!(existed, "dropped named DB had no catalog entry");
                 // The DB no longer exists this txn: drop its working record so
                 // `flush_catalog` does not re-create it.
-                self.open.remove(dbi);
+                work_mut!(self).open.remove(dbi);
                 // ADR-0024: the handle is closed at once, for every txn; an
                 // abort of this one does not reopen it (LMDB `mdb_drop`).
                 self.env
                     .inner()
                     .handles()
-                    .remove(&self.handles, dbi, db.generation());
+                    .remove(&work!(self).handles, dbi, db.generation());
                 Ok(())
             }
         }
@@ -380,7 +380,7 @@ impl<'env> RwTxn<'env> {
             Cat::Collision => Err(Error::Mdb(MdbError::Incompatible)),
             Cat::SubDb(rec) => {
                 let t = self.named_tree(dbi, name.into(), None, rec);
-                self.open.slot(dbi).get_or_insert(t);
+                work_mut!(self).open.slot(dbi).get_or_insert(t);
                 Ok(())
             }
             Cat::Missing => {
@@ -399,7 +399,7 @@ impl<'env> RwTxn<'env> {
                     return res.map(|_| ());
                 }
                 let t = self.named_tree(dbi, name.into(), None, empty);
-                self.open.insert(dbi, t);
+                work_mut!(self).open.insert(dbi, t);
                 Ok(())
             }
         }
@@ -415,10 +415,10 @@ impl<'env> RwTxn<'env> {
         let mut order = std::mem::take(&mut work_mut!(self).catalog);
         order.clear();
         order.extend(
-            (0..self.open.slots.len() as u32)
-                .filter(|&dbi| self.open.get(dbi).is_some_and(|t| t.dirty)),
+            (0..work!(self).open.slots.len() as u32)
+                .filter(|&dbi| work!(self).open.get(dbi).is_some_and(|t| t.dirty)),
         );
-        let open = &self.open;
+        let open = &work!(self).open;
         // Names are unique, so the unstable sort is deterministic.
         order.sort_unstable_by(|&a, &b| {
             let name = |dbi| &open.get(dbi).expect("listed above").name;
@@ -427,7 +427,7 @@ impl<'env> RwTxn<'env> {
         for &dbi in &order {
             // The name moves out for the put (which reads no named-DB name)
             // and back after it, so the write borrows it without a copy.
-            let t = self.open.get_mut(dbi).expect("listed above");
+            let t = work_mut!(self).open.get_mut(dbi).expect("listed above");
             let name = std::mem::take(&mut t.name);
             let bytes = t.rec.to_bytes();
             let r = self.put_tree_flagged(
@@ -437,11 +437,15 @@ impl<'env> RwTxn<'env> {
                 ValSrc::Val(&bytes),
                 F_SUBDATA,
             );
-            self.open.get_mut(dbi).expect("listed above").name = name;
+            work_mut!(self)
+                .open
+                .get_mut(dbi)
+                .expect("listed above")
+                .name = name;
             r?;
         }
         work_mut!(self).catalog = order;
-        for t in self.open.values_mut() {
+        for t in work_mut!(self).open.values_mut() {
             t.dirty = false;
         }
         Ok(())

@@ -141,7 +141,7 @@ impl<'env> RwTxn<'env> {
     pub(super) fn freelist_save(&mut self) -> Result<()> {
         debug_assert!(self.alloc_mode == AllocMode::Normal);
         self.alloc_mode = AllocMode::GcSave;
-        debug_assert!(self.save_touched.is_empty());
+        debug_assert!(work!(self).save_touched.is_empty());
         // GC-30 carry (SPEC 05 §2a, ADR-0022): the base annex's unconsumed
         // remainder must land in this txn's own entry (annex or tree) — meta
         // `base` is overwritten by txn `base + 2`, so dropping it leaks.
@@ -163,9 +163,11 @@ impl<'env> RwTxn<'env> {
         let mut tree_arm = false;
         let mut annex_mode = false;
         // Every ops-drained entry needs its GC-20 rewrite at least once.
-        let pending: BTreeSet<GcKey> = self.drains.keys().copied().collect();
+        let pending: BTreeSet<GcKey> = work!(self).drains.keys().copied().collect();
         let mut st = SaveLoop {
-            inner_budget: pending.len() + self.drains.values().map(Drain::len).sum::<usize>() + 16,
+            inner_budget: pending.len()
+                + work!(self).drains.values().map(Drain::len).sum::<usize>()
+                + 16,
             pending,
             inner_iters: 0,
             own: BTreeMap::new(),
@@ -199,7 +201,7 @@ impl<'env> RwTxn<'env> {
                 "page double-freed (GC-4)"
             );
             let before = work_mut!(self).freed.len();
-            let annex_before = self.annex.len();
+            let annex_before = work!(self).annex.len();
             let total = before + annex_before;
             if total > 0 {
                 if !tree_arm && total <= annex_cap {
@@ -212,9 +214,11 @@ impl<'env> RwTxn<'env> {
                 } else {
                     tree_arm = true; // sticky (GC-32)
                     annex_mode = false;
-                    let ids = merge_sorted_unique(&work_mut!(self).freed, self.annex.live());
+                    let work = work!(self);
+                    let ids = merge_sorted_unique(&work.freed, work.annex.live());
                     self.put_own_records(&ids, &mut st)?;
-                    if work_mut!(self).freed.len() != before || self.annex.len() != annex_before {
+                    let work = work!(self);
+                    if work.freed.len() != before || work.annex.len() != annex_before {
                         // The put COW-freed committed GC pages (PIL must
                         // grow) or drew from the annex pool (the written
                         // PIL lists a handed-out page): rewrite next round.
@@ -226,7 +230,8 @@ impl<'env> RwTxn<'env> {
             // pool draw during the writes above means some tree entry still
             // lists a handed-out page), and no loose page survives unlisted
             // (GC-9/GC-10).
-            st.pending.extend(std::mem::take(&mut self.save_touched));
+            st.pending
+                .extend(std::mem::take(&mut work_mut!(self).save_touched));
             if !st.pending.is_empty() {
                 continue;
             }
@@ -243,10 +248,10 @@ impl<'env> RwTxn<'env> {
         // pool is spent either way (no allocation runs after C1).
         if annex_mode {
             let work = work_mut!(self);
-            merge_sorted_unique_into(&work.freed, self.annex.live(), &mut work.merged);
+            merge_sorted_unique_into(&work.freed, work.annex.live(), &mut work.merged);
             std::mem::swap(&mut work.freed, &mut work.merged);
         }
-        self.annex = Drain::new(Vec::new());
+        work_mut!(self).annex = Drain::new(Vec::new());
         self.annex_out = annex_mode;
         Ok(())
     }
@@ -261,7 +266,8 @@ impl<'env> RwTxn<'env> {
     /// pages (growing `freed`).
     fn rewrite_pending_drains(&mut self, st: &mut SaveLoop) -> Result<()> {
         loop {
-            st.pending.extend(std::mem::take(&mut self.save_touched));
+            st.pending
+                .extend(std::mem::take(&mut work_mut!(self).save_touched));
             let Some(&key) = st.pending.iter().next() else {
                 break;
             };
@@ -273,12 +279,12 @@ impl<'env> RwTxn<'env> {
             );
             // GC-20 rewrite payload: exactly the live remainder — the
             // consumed prefix never reaches the tree.
-            let remaining: Vec<u64> = self
+            let remaining: Vec<u64> = work!(self)
                 .drains
                 .get(&key)
                 .map_or(Vec::new(), |d| d.live().to_vec());
             if remaining.is_empty() {
-                self.drains.remove(&key);
+                work_mut!(self).drains.remove(&key);
                 let existed = self.delete_tree(TreeId::Free, &gc_key_encode(key))?;
                 debug_assert!(existed, "drained GC record {key:?} missing from the tree");
             } else {

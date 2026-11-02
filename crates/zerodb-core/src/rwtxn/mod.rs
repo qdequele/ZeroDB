@@ -49,7 +49,7 @@
 //! overwrite the *live* snapshot's slot.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use crate::btree::{
@@ -111,8 +111,8 @@ enum TreeId {
     /// The free (GC) database, `BE(txnid) → PIL` (SPEC 05 §1).
     Free,
     /// A named database, addressed by its env-level dbi index. Its
-    /// working record lives in [`RwTxn::open`], loaded from the catalog on
-    /// first touch and written back at commit (SPEC 04 TXN-10).
+    /// working record lives in [`WriterCarry::open`], loaded from the
+    /// catalog on first touch and written back at commit (SPEC 04 TXN-10).
     Named(u32),
 }
 
@@ -142,7 +142,11 @@ fn recycle_vec<T>(v: &mut Vec<T>, cap: usize) {
 ///
 /// A write txn uses these containers in place, through its `work` box
 /// (`work!` / `work_mut!`), so beginning and ending a txn moves one pointer
-/// rather than every container.
+/// rather than every container. The txn's other lifetime-free state that
+/// most txns never touch (GC drain bookkeeping, named-database records,
+/// handle state, search caches) lives here too, reset at every txn end, so
+/// the [`RwTxn`] value itself stays small to move: LMDB's `MDB_txn` handle
+/// is a pointer to that preallocated `me_txn0`.
 #[derive(Default)]
 pub(crate) struct WriterCarry {
     /// The dirty store's indexes and spare frames, between txns; `None`
@@ -166,8 +170,13 @@ pub(crate) struct WriterCarry {
     pgnos: Vec<u64>,
     /// The order `flush_catalog` writes the dirty named records in.
     catalog: Vec<u32>,
-    /// The open table's slots between txns, every entry `None`.
-    open: Vec<Option<NamedTree>>,
+    /// Per-txn named-DB working records (the dbi table's txn half),
+    /// indexed by dbi. Loaded lazily from the catalog on first touch;
+    /// `dirty` entries are written back to the main tree at commit before
+    /// `freelist_save` ([`RwTxn::flush_catalog`]). Dropped-this-txn entries are
+    /// removed here (their catalog entry is deleted eagerly at drop time).
+    /// Between txns its slots stay, every entry `None`.
+    open: OpenTable,
     /// Named-database names carried from earlier write txns, by dbi, with
     /// the handle generation they belong to (`NamedTree::generation`).
     names: Vec<Option<(u32, Box<[u8]>)>>,
@@ -188,8 +197,6 @@ pub(crate) struct WriterCarry {
     /// (see [`RwTxn::finger_forget`]) and emptied at every txn end. A small
     /// `Vec` scanned linearly: a txn touches a handful of trees.
     fingers: Vec<Finger>,
-    /// The handle-check memo allocation ([`TxnHandles::recycle`]).
-    handles: Option<Box<crate::handles::Rare>>,
     /// The page buffer a commit encodes its meta into (commit step C4):
     /// empty until the first commit, then one page, reused. Bytes
     /// `..meta_dirty` may hold an earlier encode; every byte past them is
@@ -200,9 +207,65 @@ pub(crate) struct WriterCarry {
     /// follows the meta write, so a commit that unwound in between leaves
     /// the next one a prefix to clear.
     meta_dirty: usize,
+    /// The txn's state in the env's slot table (ADR-0024), restarted at
+    /// every begin, which keeps its handle-check memo allocation
+    /// ([`crate::handles::HandleTable::restart`]).
+    handles: TxnHandles,
+    /// GC-20 drain bookkeeping (ADR-0005): for every GC record `(F, seq)`
+    /// this txn drew from, the **remaining** (still-free, sorted-ascending) ids —
+    /// [`Drain::live`], a consumed-prefix view so the GC-19 front pop is O(1).
+    /// Loaded from the tree PIL on first touch; `freelist_save` step (a)
+    /// rewrites the remainder (or deletes the record when empty). `BTreeMap`
+    /// so iteration is in key order, matching the GC-18 scan.
+    drains: BTreeMap<GcKey, Drain>,
+    /// The base meta's free-list annex pool (SPEC 05 §2a, ADR-0022): the
+    /// pages freed by txn `base.txnid`, parsed (and `validate_pil_ids`-
+    /// checked, GC-33) at begin when `base.free_annex > 0`. Drawn by
+    /// [`RwTxn::annex_draw`] (allocate step 2b, gated per GC-31); whatever
+    /// remains is folded into `freed` at the top of `freelist_save` (the
+    /// GC-30 carry) — by then the pool is empty, so GcSave never sees it.
+    annex: Drain,
+    /// Entries of `drains` whose `remaining` shrank via an **in-save pool
+    /// draw** (GC-12 — see `freelist_save`): each must be
+    /// re-rewritten before the C1 fixed point is declared, so no rewritten
+    /// entry ever lists a handed-out page.
+    save_touched: BTreeSet<GcKey>,
+    /// Per-txn cache of the GC reuse gate (SPEC 04 TXN-22, ADR-0006):
+    /// computed by this txn's first `gc_reclaim` and reused for its other
+    /// draws. Caching is only ever more conservative (a reader that releases
+    /// mid-txn is just not reclaimed against). The debug shadow check
+    /// re-scans at every draw.
+    oldest_cache: Option<u64>,
+    /// The smallest run length the cross-record run search
+    /// ([`RwTxn::cross_record_run`]) has looked for and not found this txn,
+    /// after reading every record the gate admits. During the txn's
+    /// operations the reusable pages only ever shrink (draws remove ids;
+    /// nothing adds any until `freelist_save`), so a later request for a run
+    /// at least as long cannot succeed either and skips the search.
+    cross_miss: Option<u64>,
+    /// The smallest run length [`RwTxn::gc_reclaim`] has looked for in
+    /// every gated record, one record at a time, and not found this txn.
+    /// For the same reason as `cross_miss`, a later request at least as long
+    /// cannot be served by one record either and skips that walk. A freeing
+    /// txn's list is many bounded records (SPEC 05 GC-5), so the walk it
+    /// saves crosses many leaves.
+    record_miss: Option<u64>,
+    /// Where [`RwTxn::gc_reclaim`]'s walk may start for a run of at least
+    /// `n` pages: run length → the key of the record the last such walk drew
+    /// from. Every gated record before that key had no run that long, and
+    /// during the txn's operations records only lose ids, so none gains one;
+    /// the walk seeks there instead of reading those records again. The pick
+    /// is the one a walk from the first record makes (GC-19, GC-21).
+    record_from: BTreeMap<u64, GcKey>,
+    /// The cross-record run search's merged list of free ids, built on its
+    /// first use in this txn ([`RwTxn::cross_record_run`]).
+    cross_cache: Option<CrossRunCache>,
+    /// Spills this txn has done (diagnostics; SPEC 04 TXN-69).
+    spills: u64,
     /// The snapshot the last write txn published, or its base when it
     /// published nothing: the next write txn's base when it is still the
-    /// latest ([`crate::env::EnvInner::writer_base`]).
+    /// latest ([`crate::env::EnvInner::writer_base`]). `None` during a txn
+    /// until its commit step C6 stores the snapshot it published.
     snapshot: Option<Arc<Snapshot>>,
 }
 
@@ -308,9 +371,6 @@ pub struct RwTxn<'env> {
     /// `Some` until the txn's drop hands it to the [`WriterCarry`]; read it
     /// through [`RwTxn::base`].
     base: Option<Arc<Snapshot>>,
-    /// The snapshot this txn published at commit step C6, for the
-    /// [`WriterCarry`]; `None` until then.
-    published: Option<Arc<Snapshot>>,
     /// This txn's working lists and buffers ([`WriterCarry`]), used in
     /// place: they came from the writer slot with their allocations and go
     /// back to it, emptied, when the txn drops. `Some` until then; read
@@ -325,20 +385,6 @@ pub struct RwTxn<'env> {
     /// the memo; spills reset the memo (TXN-71). Probes, never publishes,
     /// the env-wide stamp cache (ADR-0018).
     validated: ValidatedPages<'env>,
-    /// GC-20 drain bookkeeping (ADR-0005): for every GC record `(F, seq)`
-    /// this txn drew from, the **remaining** (still-free, sorted-ascending) ids —
-    /// [`Drain::live`], a consumed-prefix view so the GC-19 front pop is O(1).
-    /// Loaded from the tree PIL on first touch; `freelist_save` step (a)
-    /// rewrites the remainder (or deletes the record when empty). `BTreeMap`
-    /// so iteration is in key order, matching the GC-18 scan.
-    drains: BTreeMap<GcKey, Drain>,
-    /// The base meta's free-list annex pool (SPEC 05 §2a, ADR-0022): the
-    /// pages freed by txn `base.txnid`, parsed (and `validate_pil_ids`-
-    /// checked, GC-33) at begin when `base.free_annex > 0`. Drawn by
-    /// [`RwTxn::annex_draw`] (allocate step 2b, gated per GC-31); whatever
-    /// remains is folded into `freed` at the top of `freelist_save` (the
-    /// GC-30 carry) — by then the pool is empty, so GcSave never sees it.
-    annex: Drain,
     /// `freelist_save`'s GC-32 placement decision: `true` = this txn's own
     /// entry rides in the meta annex (C4 encodes `freed` as `fl_ids`; no
     /// GC-tree entry `BE(txnid)` exists), `false` = the v1 tree arm ran (or
@@ -346,11 +392,6 @@ pub struct RwTxn<'env> {
     annex_out: bool,
     /// GC-12 allocation restriction (ADR-0005).
     alloc_mode: AllocMode,
-    /// Entries of `drains` whose `remaining` shrank via an **in-save pool
-    /// draw** (GC-12 — see `freelist_save`): each must be
-    /// re-rewritten before the C1 fixed point is declared, so no rewritten
-    /// entry ever lists a handed-out page.
-    save_touched: std::collections::BTreeSet<GcKey>,
     /// Next never-allocated pgno (GC-15); persisted as `last_pg = next_pgno-1`.
     next_pgno: u64,
     /// `base.last_pg` — the committed high-water, used to classify freed pages
@@ -360,22 +401,12 @@ pub struct RwTxn<'env> {
     /// Working roots/stats (TXN-56); written to the meta at commit.
     main_db: DBRecord,
     free_db: DBRecord,
-    /// Per-txn named-DB working records (the dbi table's txn half),
-    /// indexed by dbi. Loaded lazily from the catalog on first touch;
-    /// `dirty` entries are written back to the main tree at commit before
-    /// `freelist_save` ([`RwTxn::flush_catalog`]). Dropped-this-txn entries are
-    /// removed here (their catalog entry is deleted eagerly at drop time).
-    open: OpenTable,
-    /// This txn's state in the env's slot table (ADR-0024).
-    handles: TxnHandles,
     /// The main DB's sequential-writes setting (ADR-0015), resolved at txn
     /// begin; named DBs carry theirs in [`NamedTree::seq`].
     seq_main: bool,
     /// The env's dirty limit in pages (SPEC 04 TXN-68, ADR-0017): past it,
     /// the next mutating call spills pages to the file.
     dirty_limit: u64,
-    /// Spills this txn has done (diagnostics; SPEC 04 TXN-69).
-    spills: u64,
     /// The bound on this txn's map reads (SPEC 04 TXN-38/71): the committed
     /// high-water, raised past the highest page each spill writes. The spill
     /// wrote that page, so the file backs every page up to here (holes read
@@ -389,36 +420,6 @@ pub struct RwTxn<'env> {
     /// inside a split cascade) leaves the working tree partial, so every later
     /// mutation and `commit` returns `BadTxn`; only abort is valid.
     errored: bool,
-    /// Per-txn cache of the GC reuse gate (SPEC 04 TXN-22, ADR-0006):
-    /// computed by this txn's first `gc_reclaim` and reused for its other
-    /// draws. Caching is only ever more conservative (a reader that releases
-    /// mid-txn is just not reclaimed against). The debug shadow check
-    /// re-scans at every draw.
-    oldest_cache: Option<u64>,
-    /// The smallest run length the cross-record run search
-    /// ([`RwTxn::cross_record_run`]) has looked for and not found this txn,
-    /// after reading every record the gate admits. During the txn's
-    /// operations the reusable pages only ever shrink (draws remove ids;
-    /// nothing adds any until `freelist_save`), so a later request for a run
-    /// at least as long cannot succeed either and skips the search.
-    cross_miss: Option<u64>,
-    /// The smallest run length [`RwTxn::gc_reclaim`] has looked for in
-    /// every gated record, one record at a time, and not found this txn.
-    /// For the same reason as `cross_miss`, a later request at least as long
-    /// cannot be served by one record either and skips that walk. A freeing
-    /// txn's list is many bounded records (SPEC 05 GC-5), so the walk it
-    /// saves crosses many leaves.
-    record_miss: Option<u64>,
-    /// Where [`RwTxn::gc_reclaim`]'s walk may start for a run of at least
-    /// `n` pages: run length → the key of the record the last such walk drew
-    /// from. Every gated record before that key had no run that long, and
-    /// during the txn's operations records only lose ids, so none gains one;
-    /// the walk seeks there instead of reading those records again. The pick
-    /// is the one a walk from the first record makes (GC-19, GC-21).
-    record_from: BTreeMap<u64, GcKey>,
-    /// The cross-record run search's merged list of free ids, built on its
-    /// first use in this txn ([`RwTxn::cross_record_run`]).
-    cross_cache: Option<CrossRunCache>,
     /// Live nested read children (SPEC 04 TXN-31, ADR-0007), checked by
     /// [`RwTxn::guard_ok`] (TXN-29) and at commit C0 (TXN-33).
     ///
@@ -522,19 +523,16 @@ impl Env {
             work.dirty.take().unwrap_or_default(),
             in_map.then_some(backing),
         );
+        work.annex = annex;
+        inner.handles().restart(&mut work.handles);
         Ok(RwTxn {
             txnid: base.txnid + 1, // TXN-2 (+ the reuse note in the module docs)
             next_pgno: base.last_pg + 1,
             committed_last_pg: base.last_pg,
             main_db: base.main_db,
             free_db: base.free_db,
-            open: OpenTable {
-                slots: std::mem::take(&mut work.open),
-            },
-            handles: inner.handles().begin_reusing(work.handles.take()),
             seq_main: inner.sequential_writes_for(None),
             dirty_limit: inner.dirty_limit(),
-            spills: 0,
             read_high: base.last_pg,
             #[cfg(debug_assertions)]
             finger_hits: 0,
@@ -544,23 +542,14 @@ impl Env {
             // cache (the previous commit seeded it with the very pages this
             // txn's first descent walks) but never publishes from a miss.
             validated: ValidatedPages::for_writer(inner.file_trust(), Some(inner.stamp_cache())),
-            drains: BTreeMap::new(),
-            annex,
             annex_out: false,
             alloc_mode: AllocMode::Normal,
-            save_touched: std::collections::BTreeSet::new(),
             errored: false,
-            oldest_cache: None,
-            cross_miss: None,
-            record_miss: None,
-            record_from: BTreeMap::new(),
-            cross_cache: None,
             children: ChildCounter::new(),
             // In-place WRITE_MAP keeps no whole-map reference in the struct
             // (see the field docs; ADR-0021) — `whole_map` borrows lazily.
             bytes: if in_map { &[] } else { view.bytes },
             base: Some(base),
-            published: None,
             work: Some(work),
             _guard: guard,
             env: self,
@@ -588,13 +577,13 @@ impl TxnRead for RwTxn<'_> {
     fn free_annex_count(&self) -> u64 {
         // Working-state view (like `free_record`): the base annex pool's
         // live remainder — drawn ids are no longer free.
-        self.annex.len() as u64
+        work!(self).annex.len() as u64
     }
     fn page_size(&self) -> u32 {
         self.psize
     }
     fn handle_state(&self) -> (&HandleTable, &TxnHandles, Option<&TxnHandles>) {
-        (self.env.inner().handles(), &self.handles, None)
+        (self.env.inner().handles(), &work!(self).handles, None)
     }
     fn record_for(&self, db: &Database) -> DBRecord {
         match db.sel() {
@@ -604,7 +593,7 @@ impl TxnRead for RwTxn<'_> {
                 // txn (uncommitted state, TXN-38); otherwise resolve from the
                 // working catalog (which itself reflects uncommitted catalog
                 // inserts through the dirty-frame source).
-                if let Some(t) = self.open.get(dbi) {
+                if let Some(t) = work!(self).open.get(dbi) {
                     return t.rec;
                 }
                 match self.env.inner().named_name(dbi) {
@@ -725,7 +714,7 @@ impl<'env> RwTxn<'env> {
             TreeId::Main => &self.main_db,
             TreeId::Free => &self.free_db,
             TreeId::Named(dbi) => {
-                &self
+                &work!(self)
                     .open
                     .get(dbi)
                     .expect("named record loaded before use")
@@ -741,7 +730,7 @@ impl<'env> RwTxn<'env> {
             TreeId::Main => &mut self.main_db,
             TreeId::Free => &mut self.free_db,
             TreeId::Named(dbi) => {
-                let e = self
+                let e = work_mut!(self)
                     .open
                     .get_mut(dbi)
                     .expect("named record loaded before use");
@@ -751,9 +740,9 @@ impl<'env> RwTxn<'env> {
         }
     }
 
-    /// Ensure the named DB `dbi`'s working record is loaded into [`RwTxn::open`]
-    /// (from the catalog view, or empty if the entry does not yet exist), and
-    /// return its tree selector. Idempotent. The main DB needs no loading.
+    /// Ensure the named DB `dbi`'s working record is loaded into
+    /// [`WriterCarry::open`] (from the catalog view, or empty if the entry
+    /// does not yet exist), and return its tree selector. Idempotent. The main DB needs no loading.
     fn ensure_open(&mut self, db: &Database) -> Result<TreeId> {
         // TXN-29 airtightness: `ensure_open` mutates the open table, which
         // live children read through `record_for` — so the child guard fires
@@ -770,7 +759,7 @@ impl<'env> RwTxn<'env> {
         // ADR-0024: every write and every write-cursor step on a named
         // database checks its handle first.
         self.check_db(db)?;
-        if !self.open.contains(dbi) {
+        if !work!(self).open.contains(dbi) {
             // The name the previous write txn carried for this slot and
             // generation, if any (`NamedTree::generation`): the same name
             // the table would return, without its lock or an allocation.
@@ -788,7 +777,7 @@ impl<'env> RwTxn<'env> {
             };
             let rec = resolve_named_record(self.source(), self.psize, &self.main_db, &name);
             let t = self.named_tree(dbi, name, Some(db.generation()), rec);
-            self.open.insert(dbi, t);
+            work_mut!(self).open.insert(dbi, t);
         }
         Ok(TreeId::Named(dbi))
     }
@@ -1031,7 +1020,7 @@ impl<'env> RwTxn<'env> {
             && !self.dirty.has_spills()
             && work!(self).freed.is_empty()
             && work!(self).loose.is_empty()
-            && self.drains.is_empty()
+            && work!(self).drains.is_empty()
             && work!(self).reclaimed.is_empty()
             && self.next_pgno == self.base().last_pg + 1
             && self.main_db == self.base().main_db
@@ -1039,7 +1028,7 @@ impl<'env> RwTxn<'env> {
             // A dirty named-DB working record still needs its catalog write-back
             // (defensive: any named mutation also dirties a page, so this is
             // implied — but keep the commit honest, SPEC 02 §6).
-            && !self.open.values().any(|t| t.dirty)
+            && !work!(self).open.values().any(|t| t.dirty)
     }
 }
 
@@ -1058,7 +1047,6 @@ impl Drop for RwTxn<'_> {
             return;
         };
         work.dirty = Some(dirty);
-        work.handles = self.handles.recycle();
         work.reclaimed.clear();
         if crate::dirty::index_oversized(work.reclaimed.capacity()) {
             work.reclaimed.shrink_to(crate::dirty::CARRY_INDEX_CAP);
@@ -1077,7 +1065,7 @@ impl Drop for RwTxn<'_> {
         // through a reference: `Option::take` would copy every slot's whole
         // `NamedTree` out, empty or not.
         let names = &mut work.names;
-        for (dbi, slot) in self.open.slots.iter_mut().enumerate() {
+        for (dbi, slot) in work.open.slots.iter_mut().enumerate() {
             let Some(t) = slot else { continue };
             if let Some(g) = t.generation {
                 if names.len() <= dbi {
@@ -1092,12 +1080,24 @@ impl Drop for RwTxn<'_> {
         // (`named_name`), which changes no result.
         work.names.truncate(CARRY_VEC_CAP);
         work.names.shrink_to(CARRY_VEC_CAP);
-        self.open.slots.truncate(CARRY_VEC_CAP);
-        self.open.slots.shrink_to(CARRY_VEC_CAP);
-        work.open = std::mem::take(&mut self.open.slots);
+        work.open.slots.truncate(CARRY_VEC_CAP);
+        work.open.slots.shrink_to(CARRY_VEC_CAP);
+        // This txn's GC bookkeeping and search caches: the next txn starts
+        // with none. The annex pool releases the base snapshot's ids.
+        work.drains.clear();
+        work.save_touched.clear();
+        work.annex = Drain::default();
+        work.oldest_cache = None;
+        work.cross_miss = None;
+        work.record_miss = None;
+        work.record_from.clear();
+        work.cross_cache = None;
+        work.spills = 0;
         // The snapshot published at C6, else the unchanged base: either is
         // the latest this process knows of.
-        work.snapshot = self.published.take().or_else(|| self.base.take());
+        if work.snapshot.is_none() {
+            work.snapshot = self.base.take();
+        }
         self._guard.give_back_carry(work);
     }
 }
