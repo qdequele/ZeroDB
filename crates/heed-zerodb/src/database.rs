@@ -900,7 +900,11 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         // No consumer passes any DatabaseFlags; DUPSORT/INTEGER_KEY/etc. are
         // unsupported. Reject a non-empty value cleanly rather than silently
         // ignoring it (documented in docs/LMDB-COMPATIBILITY.md).
-        if !self.flags.is_empty() {
+        #[cfg(feature = "dupsort-spike")]
+        let unsupported = self.flags - DatabaseFlags::DUP_SORT;
+        #[cfg(not(feature = "dupsort-spike"))]
+        let unsupported = self.flags;
+        if !unsupported.is_empty() {
             return Err(Error::Mdb(MdbError::Incompatible));
         }
         Ok(())
@@ -973,6 +977,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         KC: 'static,
         DC: 'static,
         C: Comparator + 'static,
+        CDUP: Comparator + 'static,
     {
         self.create_in(wtxn)
     }
@@ -990,6 +995,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         KC: 'static,
         DC: 'static,
         C: Comparator + 'static,
+        CDUP: Comparator + 'static,
     {
         self.create_in(wtxn)
     }
@@ -997,20 +1003,43 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
     fn create_in(&self, wtxn: &mut RwTxn) -> Result<Database<KC, DC, C, CDUP>>
     where
         C: Comparator + 'static,
+        CDUP: Comparator + 'static,
     {
         self.check_flags()?;
         self.assert_env_txn(wtxn);
         let name = name_bytes(self.name);
         let page_size = self.env.zdb().page_size();
         let db = match custom_comparator::<C>() {
-            None => self.env.zdb().create_database(wtxn.zdb_mut(), name)?,
+            None => self.create_plain_or_dup(wtxn, name)?,
             Some(cmp) => {
                 self.env
                     .zdb()
                     .create_database_with_comparator(wtxn.zdb_mut(), name, cmp)?
             }
         };
+        #[cfg(feature = "dupsort-spike")]
+        if let Some(cmp) = custom_comparator::<CDUP>() {
+            self.env.zdb().set_dup_comparator(db, cmp)?;
+        }
         Ok(Database::new(db, page_size, self.env.zdb().ident()))
+    }
+
+    /// Create the database, with the persistent DUPSORT flag when requested
+    /// (DUPSORT spike).
+    fn create_plain_or_dup(
+        &self,
+        wtxn: &mut RwTxn,
+        name: Option<&[u8]>,
+    ) -> Result<zerodb::Database> {
+        #[cfg(feature = "dupsort-spike")]
+        if self.flags.contains(DatabaseFlags::DUP_SORT) {
+            return Ok(self.env.zdb().create_database_with_flags(
+                wtxn.zdb_mut(),
+                name,
+                zerodb::DB_DUPSORT,
+            )?);
+        }
+        Ok(self.env.zdb().create_database(wtxn.zdb_mut(), name)?)
     }
 
     /// heed's `assert_eq_env_txn!` on `open`/`create`.

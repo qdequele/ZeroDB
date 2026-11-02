@@ -147,7 +147,7 @@ impl Env {
         let DbSel::Named(dbi) = db.sel() else {
             unreachable!("a named open makes a named handle")
         };
-        if let Err(e) = wtxn.create_named(dbi, name) {
+        if let Err(e) = wtxn.create_named(dbi, name, 0) {
             // No database came to exist under this handle (ADR-0024).
             self.inner().handles().abandon(&wtxn.handles, dbi);
             return Err(e);
@@ -285,9 +285,13 @@ impl<'env> RwTxn<'env> {
                 self.free_page(p);
             }
         }
-        // Reset to empty (persistent flags are always 0 today). `record_mut`
-        // marks a named record dirty for the commit write-back.
-        *self.record_mut(tree) = DBRecord::empty();
+        // Reset to empty, keeping the persistent flags. `record_mut` marks a
+        // named record dirty for the commit write-back.
+        let flags = rec.flags;
+        *self.record_mut(tree) = DBRecord {
+            flags,
+            ..DBRecord::empty()
+        };
         Ok(())
     }
 
@@ -351,8 +355,11 @@ impl<'env> RwTxn<'env> {
     /// it (idempotent open); if it exists as a plain user key, `Incompatible`;
     /// otherwise insert an empty `F_SUBDATA` record eagerly (LMDB `MDB_CREATE`
     /// creates the entry inside the write txn), so `open_database` sees it and
-    /// abort discards it with the dirty set.
-    pub(super) fn create_named(&mut self, dbi: u32, name: &[u8]) -> Result<()> {
+    /// abort discards it with the dirty set. `db_flags` are the persistent
+    /// flags of a new record; an existing record keeps its own, as LMDB's
+    /// `mdb_dbi_open` ignores the caller's flags for an existing database
+    /// (SPEC 03 §12.1 O8).
+    pub(super) fn create_named(&mut self, dbi: u32, name: &[u8], db_flags: u16) -> Result<()> {
         self.guard_ok()?;
         // TXN-68: creating a DB inserts a catalog record (a main-tree put).
         self.maybe_spill()?;
@@ -384,7 +391,10 @@ impl<'env> RwTxn<'env> {
                 Ok(())
             }
             Cat::Missing => {
-                let empty = DBRecord::empty();
+                let empty = DBRecord {
+                    flags: db_flags,
+                    ..DBRecord::empty()
+                };
                 let bytes = empty.to_bytes();
                 debug_assert_eq!(bytes.len(), DBRECORD_LEN);
                 let res = self.put_tree_flagged(

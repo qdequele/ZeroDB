@@ -44,6 +44,10 @@ libc = { workspace = true }
 # still resolves once patched. They do nothing: the serde codecs are always
 # compiled in, and the LMDB build knobs do not apply to ZeroDB.
 default = ["serde", "serde-bincode", "serde-json"]
+# Duplicate-key (DUPSORT) spike: off by default, never enabled
+# by a consumer build. Stores sets that fit one leaf cell; see
+# docs/DUPSORT-SPIKE.md.
+dupsort-spike = ["zerodb/dupsort-spike"]
 serde = []
 serde-bincode = []
 serde-json = []

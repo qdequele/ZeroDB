@@ -11,6 +11,10 @@ impl Database {
     /// [`MdbError::MapFull`], [`MdbError::BadTxn`] on a poisoned txn.
     pub fn put(&self, txn: &mut RwTxn<'_>, key: &[u8], value: &[u8]) -> Result<()> {
         let tree = txn.ensure_open(self)?;
+        #[cfg(feature = "dupsort-spike")]
+        if txn.is_dupsort(tree) {
+            return txn.put_dup(self, tree, key, value, PutFlags::EMPTY);
+        }
         txn.put_tree(tree, key, PutFlags::EMPTY, ValSrc::Val(value))
             .map(|_| ())
     }
@@ -30,6 +34,10 @@ impl Database {
         value: &[u8],
     ) -> Result<()> {
         let tree = txn.ensure_open(self)?;
+        #[cfg(feature = "dupsort-spike")]
+        if txn.is_dupsort(tree) {
+            return txn.put_dup(self, tree, key, value, flags);
+        }
         txn.put_tree(tree, key, flags, ValSrc::Val(value))
             .map(|_| ())
     }
@@ -65,6 +73,10 @@ impl Database {
     /// COW/rebalance ran out of map (which also poisons the txn).
     pub fn delete(&self, txn: &mut RwTxn<'_>, key: &[u8]) -> Result<bool> {
         let tree = txn.ensure_open(self)?;
+        #[cfg(feature = "dupsort-spike")]
+        if txn.is_dupsort(tree) {
+            return txn.delete_dup_key(self, tree, key);
+        }
         txn.delete_tree(tree, key)
     }
 

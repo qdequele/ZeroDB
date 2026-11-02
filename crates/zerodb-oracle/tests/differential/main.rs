@@ -7,6 +7,7 @@ mod copy_to_file_differential;
 mod cursor_delete_position;
 mod cursor_put_position;
 mod dbi_handle_lifetime;
+mod dup_spike_paths;
 mod env_info_differential;
 mod env_lifecycle_differential;
 mod flag_semantics;

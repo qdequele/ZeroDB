@@ -33,6 +33,8 @@ mod overflow;
 // validated/trusted view accessors.
 #[allow(unsafe_code)]
 mod raw;
+#[cfg(feature = "dupsort-spike")]
+pub mod subpage;
 mod tree;
 // ADR-0014: declares the one `unsafe fn` that opts an env out of cell
 // validation; it contains no unsafe operation.
@@ -150,7 +152,18 @@ pub const F_DUPDATA: u16 = 0x0004;
 
 /// Mask of leaf-node flags that are valid to *see set* today. `F_DUPDATA`
 /// and all higher bits are rejected by the leaf decoder (SPEC 02 §10).
+#[cfg(not(feature = "dupsort-spike"))]
 pub const LEAF_FLAGS_PHASE1_MASK: u16 = F_BIGDATA | F_SUBDATA;
+/// Mask of leaf-node flags the leaf decoder accepts. The DUPSORT spike admits
+/// `F_DUPDATA` (an embedded sub-page, [`subpage`]); whether the database may
+/// hold one is the DBRecord's [`DB_DUPSORT`] flag, checked by `check`.
+#[cfg(feature = "dupsort-spike")]
+pub const LEAF_FLAGS_PHASE1_MASK: u16 = F_BIGDATA | F_SUBDATA | F_DUPDATA;
+
+/// Persistent DBRecord flag (SPEC 02 §3.1 offset 42): the database holds
+/// several sorted values per key. Same bit as LMDB's `MDB_DUPSORT`.
+#[cfg(feature = "dupsort-spike")]
+pub const DB_DUPSORT: u16 = 0x04;
 
 // ---------------------------------------------------------------------------
 // Page-type classification

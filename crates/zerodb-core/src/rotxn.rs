@@ -746,6 +746,47 @@ pub fn for_each_entry_flagged<T: TxnRead>(
     Ok(())
 }
 
+/// Walk every logical `(key, value)` pair of `db` in order (DUPSORT spike):
+/// a key with duplicates yields one call per value, in duplicate order, as
+/// LMDB's `MDB_NEXT` does (SPEC 03 §12.1 O12). Use this, not
+/// [`for_each_entry_flagged`], wherever the caller means *data*: that walk
+/// yields physical leaf cells, so a duplicate set arrives as one cell holding
+/// a whole sub-page.
+///
+/// # Errors
+///
+/// As [`for_each_entry_flagged`], plus a malformed sub-page.
+#[cfg(feature = "dupsort-spike")]
+pub fn for_each_pair<T: TxnRead>(
+    db: &Database,
+    txn: &T,
+    mut f: impl FnMut(&[u8], &[u8]) -> std::result::Result<(), StreamBuildError>,
+) -> std::result::Result<(), StreamBuildError> {
+    for_each_entry_flagged(db, txn, |k, flags, v| {
+        if flags & crate::page::F_DUPDATA == 0 {
+            return f(k, v);
+        }
+        let sp = crate::page::subpage::SubPage::parse(v).map_err(StreamBuildError::Page)?;
+        (0..sp.len()).try_for_each(|j| f(k, sp.get(j)))
+    })
+}
+
+/// Every logical pair of `db`, owned ([`for_each_pair`]; tests and tools).
+///
+/// # Errors
+///
+/// [`MdbError::Invalid`] on a structurally corrupt tree.
+#[cfg(feature = "dupsort-spike")]
+pub fn collect_pairs<T: TxnRead>(db: &Database, txn: &T) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut out = Vec::new();
+    for_each_pair(db, txn, |k, v| {
+        out.push((k.to_vec(), v.to_vec()));
+        Ok(())
+    })
+    .map_err(|_| Error::Mdb(MdbError::Invalid))?;
+    Ok(out)
+}
+
 /// The names of every named database, in key (name) order (tools and copy):
 /// the `F_SUBDATA` catalog entries on the main tree (SPEC 02 §6). An env with
 /// no named DBs yields an empty list. Works over any readable txn: a committed
@@ -893,7 +934,30 @@ impl Database {
     ///
     /// [`MdbError::Invalid`] only on a structurally-corrupt tree.
     pub fn get<'txn, T: TxnRead>(&self, txn: &'txn T, key: &[u8]) -> Result<Option<&'txn [u8]>> {
+        #[cfg(feature = "dupsort-spike")]
+        if txn.record_for(self).flags & crate::page::DB_DUPSORT != 0 {
+            // A key's first duplicate (SPEC 03 §12.1 O12).
+            let cell = self.checked_tree(txn)?.get_catalog_entry(key);
+            return match cell.map_err(map_page_err)? {
+                Some((f, v)) if f & crate::page::F_DUPDATA != 0 => {
+                    let sp = crate::page::subpage::SubPage::parse(v).map_err(map_page_err)?;
+                    Ok(Some(sp.get(0)))
+                }
+                other => Ok(other.map(|(_, v)| v)),
+            };
+        }
         self.checked_tree(txn)?.get(key).map_err(map_page_err)
+    }
+
+    /// The database's persistent flags (`mdb_dbi_flags`, DUPSORT spike).
+    ///
+    /// # Errors
+    ///
+    /// As [`TxnRead::check_db`].
+    #[cfg(feature = "dupsort-spike")]
+    pub fn db_flags<T: TxnRead>(&self, txn: &T) -> Result<u16> {
+        txn.check_db(self)?;
+        Ok(txn.record_for(self).flags)
     }
 
     /// `len(txn)` — entry count (SPEC 00 row 39), read from the snapshot's

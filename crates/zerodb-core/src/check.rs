@@ -295,6 +295,10 @@ impl<'s, 'a> Checker<'s, 'a> {
                     }
                     prev = Some(k);
                     let is_subdata = leaf.node_flags(i) & F_SUBDATA != 0;
+                    #[cfg(feature = "dupsort-spike")]
+                    if leaf.node_flags(i) & crate::page::F_DUPDATA != 0 {
+                        self.check_dup_cell(pgno, i, leaf.value(i), stats);
+                    }
                     match leaf.value(i) {
                         LeafValue::Inline(v) => {
                             // Catalog entry (SPEC 02 §6): an `F_SUBDATA` value is
@@ -606,8 +610,13 @@ impl<'s, 'a> Checker<'s, 'a> {
             self.fail("INV-19", format!("{name}: depth {} but no root", rec.depth));
             return None;
         }
-        // INV-21 (record-level reserved fields).
-        if rec.flags != 0 || rec.leaf2_ksize != 0 {
+        // INV-21 (record-level reserved fields). The DUPSORT spike licenses
+        // the DUPSORT flag.
+        #[cfg(feature = "dupsort-spike")]
+        let flags = rec.flags & !crate::page::DB_DUPSORT;
+        #[cfg(not(feature = "dupsort-spike"))]
+        let flags = rec.flags;
+        if flags != 0 || rec.leaf2_ksize != 0 {
             self.fail("INV-21", format!("{name}: reserved DBRecord fields set"));
         }
         // Hostile-depth guard: `walk` recurses one frame per level, and
@@ -636,6 +645,41 @@ impl<'s, 'a> Checker<'s, 'a> {
             self.walk(rec.root, rec.depth, true, (None, None), &mut stats, kind);
         }
         Some(stats)
+    }
+
+    /// A duplicate set's embedded sub-page (DUPSORT spike): well-formed, at
+    /// least two values, ascending in memcmp order (the same file-level
+    /// caveat as INV-5 for a custom ordering). Each value is one entry.
+    #[cfg(feature = "dupsort-spike")]
+    fn check_dup_cell(&mut self, pgno: u64, i: usize, v: LeafValue<'_>, stats: &mut WalkStats) {
+        let LeafValue::Inline(v) = v else {
+            self.fail(
+                "INV-29",
+                format!("leaf {pgno} entry {i}: duplicate set on overflow"),
+            );
+            return;
+        };
+        match crate::page::subpage::SubPage::parse(v) {
+            Err(e) => self.fail(
+                "INV-29",
+                format!("leaf {pgno} entry {i}: bad sub-page: {e}"),
+            ),
+            Ok(sp) => {
+                if sp.len() < 2 {
+                    self.fail(
+                        "INV-29",
+                        format!("leaf {pgno} entry {i}: one-value sub-page"),
+                    );
+                }
+                stats.entries += sp.len() as u64 - 1;
+                if (1..sp.len()).any(|j| sp.get(j - 1) >= sp.get(j)) {
+                    self.fail(
+                        "INV-29",
+                        format!("leaf {pgno} entry {i}: duplicates not ascending"),
+                    );
+                }
+            }
+        }
     }
 
     /// INV-18: the stats a record's walk counted match the record.

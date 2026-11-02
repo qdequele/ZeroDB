@@ -230,6 +230,8 @@ mod catalog;
 mod commit;
 mod cursor;
 mod delete;
+#[cfg(feature = "dupsort-spike")]
+mod dup;
 mod finger;
 mod freelist;
 mod insert;

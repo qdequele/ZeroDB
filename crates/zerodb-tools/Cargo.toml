@@ -33,6 +33,10 @@ heed = { version = "=0.22.1", optional = true }
 [features]
 # Enables the `migrate-from-lmdb` subcommand (links C LMDB via heed).
 migrate-lmdb = ["dep:heed"]
+# Duplicate-key (DUPSORT) spike: off by default, never enabled
+# by a consumer build. Stores sets that fit one leaf cell; see
+# docs/DUPSORT-SPIKE.md.
+dupsort-spike = ["zerodb/dupsort-spike", "zerodb-core/dupsort-spike"]
 
 [dev-dependencies]
 # The live-env tests hold an environment open in a child process through the

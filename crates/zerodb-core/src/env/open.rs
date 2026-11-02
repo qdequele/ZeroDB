@@ -320,6 +320,8 @@ pub fn open_with_backing_shared(
         handles: crate::handles::HandleTable::new(max_dbs),
         durability,
         comparators: ComparatorRegistry::new(max_dbs),
+        #[cfg(feature = "dupsort-spike")]
+        dup_comparators: ComparatorRegistry::new(max_dbs),
         max_dbs,
         file_trust,
         stamp_cache: StampCache::new(),

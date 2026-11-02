@@ -247,6 +247,10 @@ pub(crate) struct EnvInner {
     /// **Not persisted** — see `crate::cmp` for the reopen hazard
     /// (docs/LMDB-COMPATIBILITY.md, comparator persistence).
     comparators: ComparatorRegistry,
+    /// Per-named-database duplicate comparators (DUPSORT spike): the order of
+    /// the values within one key. Same registration rules as `comparators`.
+    #[cfg(feature = "dupsort-spike")]
+    dup_comparators: ComparatorRegistry,
     /// Catalog capacity (`max_dbs`), immutable after open. Duplicated out of
     /// the `named` registry so read txns can size their dbi-indexed record
     /// table without taking the registry lock.
@@ -848,6 +852,26 @@ impl EnvInner {
         cmp: Box<dyn Comparator>,
     ) -> Result<(), ComparatorError> {
         self.comparators.register(dbi, cmp)
+    }
+
+    /// The duplicate ordering in force for `sel` (DUPSORT spike): memcmp
+    /// unless a duplicate comparator was registered for that database.
+    #[cfg(feature = "dupsort-spike")]
+    pub fn dup_comparator_for(&self, sel: crate::rotxn::DbSel) -> KeyCmp<'_> {
+        match sel {
+            crate::rotxn::DbSel::Main => KeyCmp::Default,
+            crate::rotxn::DbSel::Named(dbi) => self.dup_comparators.get(dbi),
+        }
+    }
+
+    /// Register a duplicate comparator for named database `dbi`.
+    #[cfg(feature = "dupsort-spike")]
+    pub(crate) fn register_dup_comparator(
+        &self,
+        dbi: u32,
+        cmp: Box<dyn Comparator>,
+    ) -> Result<(), ComparatorError> {
+        self.dup_comparators.register(dbi, cmp)
     }
 
     /// Whether any custom comparator is registered on this env.

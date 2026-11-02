@@ -18,3 +18,9 @@ zerodb-io = { path = "../zerodb-io", version = "=0.2.0" }
 # read-only media (ADR-0023 stage 3, `Env::open`);
 # allowlisted (CONTRIBUTING.md).
 libc.workspace = true
+
+[features]
+# Duplicate-key (DUPSORT) spike: off by default, never enabled
+# by a consumer build. Stores sets that fit one leaf cell; see
+# docs/DUPSORT-SPIKE.md.
+dupsort-spike = ["zerodb-core/dupsort-spike"]

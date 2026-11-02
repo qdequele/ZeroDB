@@ -35,6 +35,12 @@ heed_zerodb = { package = "heed", path = "../heed-zerodb" }
 # harness (ADR-0008). Workspace-internal.
 zerodb-io = { path = "../zerodb-io", features = ["fault", "test-backing"] }
 
+[features]
+# Duplicate-key (DUPSORT) spike: off by default, never enabled
+# by a consumer build. Stores sets that fit one leaf cell; see
+# docs/DUPSORT-SPIKE.md.
+dupsort-spike = ["zerodb/dupsort-spike", "zerodb-core/dupsort-spike", "heed_zerodb/dupsort-spike"]
+
 [[bin]]
 name = "crash-harness"
 path = "src/bin/crash-harness.rs"

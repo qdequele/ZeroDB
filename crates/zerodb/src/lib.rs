@@ -59,6 +59,11 @@ pub use zerodb_core::rotxn::{
     DatabaseStat, RoRange, RoTxn, TxnRead,
 };
 pub use zerodb_core::rwtxn::{PutFlags, RwCursor, RwTxn};
+#[cfg(feature = "dupsort-spike")]
+pub use zerodb_core::{
+    page::DB_DUPSORT,
+    rotxn::{collect_pairs, for_each_pair},
+};
 
 /// The **native default** name of the single data file inside an env directory
 /// (ZeroDB's own file format, SPEC 02 §8).
