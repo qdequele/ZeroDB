@@ -286,7 +286,8 @@ unbounded size, so this does not remove the re-run. Rejected.
 **Accepted (2026-11-02): Option A-min, without shrinking**, as written below.
 
 - `EnvOpenOptions::initial_map_size(bytes)` (native and heed adapter) opts in.
-  `map_size` stays the ceiling, persisted and reported as today. Without the
+  `map_size` stays the ceiling and is reported as today; the meta records
+  the size grown so far (amended by the spike, point 1). Without the
   option nothing changes: same code path, same `MapFull`, `MapResized`,
   `resize` and file-length behavior as LMDB.
 - With it, the mapping (and under `WRITE_MAP` the file) starts at
@@ -368,7 +369,9 @@ no on-disk format:
    still holds and nothing that reads the view changed. Consequence: a commit
    persists the size grown so far, not the ceiling (the existing rule,
    `max(base meta map_size, own map_size)`), so a plain process that adopts
-   it with `resize(0)` maps what the data needs. Recommended: keep this.
+   it with `resize(0)` maps what the data needs. Approved by the maintainer
+   on 2026-11-02: this replaces the Decision's "persisted as today" and the
+   Option A remark that the meta keeps recording the ceiling.
 2. **The free-list save must not see the growth.** Its top-of-file
    completion (`loose_run`) checked the logical size; with growth on it chose
    a different run than a fixed map would. It now checks the ceiling and the
