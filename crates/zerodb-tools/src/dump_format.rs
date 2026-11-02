@@ -119,11 +119,26 @@ impl<W: Write> DumpWriter<W> {
     ///
     /// The write error.
     pub fn begin_db(&mut self, name: Option<&[u8]>) -> std::io::Result<()> {
+        self.begin_db_flagged(name, false)
+    }
+
+    /// [`DumpWriter::begin_db`] for a database that may be DUPSORT: `mdb_dump`
+    /// then prints `duplicates=1` and the flag line `dupsort=1` after
+    /// `type=btree`.
+    ///
+    /// # Errors
+    ///
+    /// The write error.
+    pub fn begin_db_flagged(&mut self, name: Option<&[u8]>, dupsort: bool) -> std::io::Result<()> {
         self.out.write_all(b"format=bytevalue\n")?;
         if let Some(name) = name {
             self.hex_line(b"database=", name)?;
         }
-        self.out.write_all(b"type=btree\nHEADER=END\n")
+        self.out.write_all(b"type=btree\n")?;
+        if dupsort {
+            self.out.write_all(b"duplicates=1\ndupsort=1\n")?;
+        }
+        self.out.write_all(b"HEADER=END\n")
     }
 
     /// Write one record of the current block.
@@ -258,6 +273,8 @@ pub struct DumpReader<R> {
     line: Vec<u8>,
     /// A block's header was read and its `DATA=END` was not.
     in_block: bool,
+    /// The current block's header declares a DUPSORT database.
+    dupsort: bool,
 }
 
 impl<R: std::io::BufRead> DumpReader<R> {
@@ -272,6 +289,7 @@ impl<R: std::io::BufRead> DumpReader<R> {
             input,
             line: Vec::new(),
             in_block: false,
+            dupsort: false,
         };
         if !reader.read_line()? {
             return Err(DumpError::BadVersion("empty input".into()));
@@ -336,6 +354,7 @@ impl<R: std::io::BufRead> DumpReader<R> {
         }
         // Header lines until HEADER=END.
         let mut name = None;
+        self.dupsort = false;
         loop {
             if !self.read_line()? {
                 return Err(DumpError::Truncated);
@@ -350,12 +369,21 @@ impl<R: std::io::BufRead> DumpReader<R> {
                 name = Some(n);
             } else if l == b"type=btree" {
                 // ignored (only btree is produced)
+            } else if l == b"duplicates=1" || l == b"dupsort=1" {
+                self.dupsort = true;
             } else {
                 return Err(DumpError::Unexpected(lossy(l)));
             }
         }
         self.in_block = true;
         Ok(Some(name))
+    }
+
+    /// Whether the current block's header declares a DUPSORT database
+    /// (`duplicates=1` or `dupsort=1`).
+    #[must_use]
+    pub fn dupsort(&self) -> bool {
+        self.dupsort
     }
 
     /// Read the current block's next record into `key` and `val`, replacing

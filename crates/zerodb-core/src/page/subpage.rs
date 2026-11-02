@@ -201,7 +201,7 @@ mod tests {
     /// moves with the header; the sub-page layout itself does not.
     #[test]
     fn capacity_under_both_header_widths() {
-        let max_node = |psize: usize, header: usize| ((psize - header) / 2 & !1) - 2;
+        let max_node = |psize: usize, header: usize| (((psize - header) / 2) & !1) - 2;
         // `key` 16 bytes, 8-byte duplicates (a docid-like payload).
         let key = 16;
         let item = 2 + cell_len(&[0u8; 8]);

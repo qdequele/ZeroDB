@@ -925,6 +925,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         KC: 'static,
         DC: 'static,
         C: Comparator + 'static,
+        CDUP: Comparator + 'static,
     {
         self.open_in(rtxn)
     }
@@ -945,6 +946,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         KC: 'static,
         DC: 'static,
         C: Comparator + 'static,
+        CDUP: Comparator + 'static,
         U: crate::AsUniqueTxnRef<'e>,
     {
         self.open_in(&rtxn.as_unique_txn_ref())
@@ -953,6 +955,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
     fn open_in(&self, rtxn: &RoTxn) -> Result<Option<Database<KC, DC, C, CDUP>>>
     where
         C: Comparator + 'static,
+        CDUP: Comparator + 'static,
     {
         self.check_flags()?;
         self.assert_env_txn(rtxn);
@@ -963,6 +966,13 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
             None => with_read!(rtxn, |t| z.open_database(t, name))?,
             Some(cmp) => with_read!(rtxn, |t| z.open_database_with_comparator(t, name, cmp))?,
         };
+        // Every open must pass the duplicate ordering too, as with
+        // `mdb_set_dupsort` after each `mdb_dbi_open`: the ordering is not
+        // stored in the file.
+        #[cfg(feature = "dupsort-spike")]
+        if let (Some(db), Some(cmp)) = (res, custom_comparator::<CDUP>()) {
+            z.set_dup_comparator(db, cmp)?;
+        }
         Ok(res.map(|db| Database::new(db, page_size, z.ident())))
     }
 

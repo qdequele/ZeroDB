@@ -19,6 +19,7 @@
 | [DECISIONS.md](DECISIONS.md) | Index of the architecture decision records in [adr/](adr/) |
 | [PERFORMANCE.md#benchmark-ladder](PERFORMANCE.md#benchmark-ladder) | The LMDB-versus-ZeroDB benchmark ladder and how to judge a change |
 | [UPSTREAM-BUGS.md](UPSTREAM-BUGS.md) | Bugs the differential fuzzer found in the LMDB reference itself |
+| [DUPSORT-SPIKE.md](DUPSORT-SPIKE.md) | The duplicate-key (DUPSORT) spike: what it reaches, the format check, and the go/no-go recommendation |
 
 The SPEC has seven volumes: `00` the heed API contract, `01` LMDB flags and
 semantics, `02` the page and file format, `03` B+trees and cursors, `04`

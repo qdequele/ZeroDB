@@ -602,7 +602,9 @@ name with mismatched flags → `MdbError::Incompatible` (SPEC 01 §S8). All the
   put/del and complicate the interleaving for no benefit.)
 - **clear vs drop.** `clear` (`mdb_drop(_, 0)`) frees the tree's pages and
   resets the record to empty but keeps the catalog entry (rewritten empty at
-  commit). `drop` (`mdb_drop(_, 1)`) additionally deletes the catalog entry
+  commit). The reset keeps the record's persistent `flags` (offset 42), as
+  LMDB's `mdb_drop` resets only the root and the counters; today they are
+  always 0. `drop` (`mdb_drop(_, 1)`) additionally deletes the catalog entry
   (decrementing `main_db.entries`); for the **main** DB there is no entry to
   remove, so `drop` degrades to `clear` (LMDB: the main dbi is a core DB).
 - **clear/drop leaf-skipping walk (LMDB `mdb_drop0` parity).** The page

@@ -164,8 +164,18 @@ pub fn write_dump(env_dir: &Path, out: impl std::io::Write) -> Result<(), BoxErr
         let db = env
             .open_database(&txn, Some(&name))?
             .ok_or("named DB vanished between enumeration and open")?;
-        w.begin_db(Some(&name))?;
-        for_each_entry_flagged(&db, &txn, |k, _, v| Ok(w.record(k, v)?)).map_err(walk_error)?;
+        #[cfg(feature = "dupsort-spike")]
+        {
+            // One record per (key, value) pair, as `mdb_dump` writes them.
+            let dupsort = db.db_flags(&txn)? & zerodb::DB_DUPSORT != 0;
+            w.begin_db_flagged(Some(&name), dupsort)?;
+            zerodb::for_each_pair(&db, &txn, |k, v| Ok(w.record(k, v)?)).map_err(walk_error)?;
+        }
+        #[cfg(not(feature = "dupsort-spike"))]
+        {
+            w.begin_db(Some(&name))?;
+            for_each_entry_flagged(&db, &txn, |k, _, v| Ok(w.record(k, v)?)).map_err(walk_error)?;
+        }
         w.end_db()?;
     }
     w.finish()?;
@@ -269,6 +279,7 @@ fn load_batched(
     let (mut key, mut val) = (Vec::new(), Vec::new());
     while let Some(name) = reader.next_db()? {
         let mut db = DbWriter::new(&env, name.as_deref(), batch_bytes);
+        db.dupsort = reader.dupsort();
         while reader.next_record(&mut key, &mut val)? {
             db.push(&key, &val)?;
         }
@@ -433,6 +444,8 @@ pub(crate) struct DbWriter<'e> {
     batch: Batch,
     committed: bool,
     records: u64,
+    /// Create the database DUPSORT and add every record as a pair.
+    pub(crate) dupsort: bool,
 }
 
 impl<'e> DbWriter<'e> {
@@ -445,6 +458,7 @@ impl<'e> DbWriter<'e> {
             batch: Batch::default(),
             committed: false,
             records: 0,
+            dupsort: false,
         }
     }
 
@@ -477,7 +491,7 @@ impl<'e> DbWriter<'e> {
     }
 
     fn commit(&mut self) -> Result<(), BoxErr> {
-        write_batch_growing(self.env, self.name.as_deref(), &self.batch)?;
+        write_batch_growing(self.env, self.name.as_deref(), self.dupsort, &self.batch)?;
         self.batch.clear();
         self.committed = true;
         Ok(())
@@ -530,9 +544,14 @@ impl Batch {
 /// # Errors
 ///
 /// An engine error other than a full map.
-fn write_batch_growing(env: &Env, name: Option<&[u8]>, batch: &Batch) -> Result<(), BoxErr> {
+fn write_batch_growing(
+    env: &Env,
+    name: Option<&[u8]>,
+    dupsort: bool,
+    batch: &Batch,
+) -> Result<(), BoxErr> {
     loop {
-        match write_batch(env, name, batch) {
+        match write_batch(env, name, dupsort, batch) {
             Ok(()) => return Ok(()),
             Err(zerodb::Error::Mdb(MdbError::MapFull)) => {
                 let grown = env
@@ -550,8 +569,26 @@ fn write_batch_growing(env: &Env, name: Option<&[u8]>, batch: &Batch) -> Result<
 /// whose key the DB already holds is skipped (`NO_OVERWRITE`), so the first
 /// record of a duplicated key wins. A valid dump has no duplicates, and its
 /// ascending keys take the sequential-writes path whatever the flag.
-fn write_batch(env: &Env, name: Option<&[u8]>, batch: &Batch) -> Result<(), zerodb::Error> {
+///
+/// A DUPSORT database (`dupsort`) is created with that flag and every record
+/// is added as a pair; a repeated pair is a no-op, as in LMDB.
+fn write_batch(
+    env: &Env,
+    name: Option<&[u8]>,
+    dupsort: bool,
+    batch: &Batch,
+) -> Result<(), zerodb::Error> {
     let mut wtxn = env.write_txn()?;
+    #[cfg(feature = "dupsort-spike")]
+    if dupsort {
+        let db = env.create_database_with_flags(&mut wtxn, name, zerodb::DB_DUPSORT)?;
+        for (k, v) in batch.records() {
+            db.put(&mut wtxn, k, v)?;
+        }
+        return wtxn.commit();
+    }
+    #[cfg(not(feature = "dupsort-spike"))]
+    let _ = dupsort;
     let db = match name {
         None => env.main_database(),
         Some(n) => env.create_database(&mut wtxn, Some(n))?,

@@ -604,6 +604,12 @@ impl<'s, S: PageSink> TreeStream<'s, S> {
         self.leaf_used += need;
         self.leaf_count += 1;
         self.entries += 1;
+        // A duplicate set's cell holds several entries (DUPSORT spike).
+        #[cfg(feature = "dupsort-spike")]
+        if flags & crate::page::F_DUPDATA != 0 {
+            let sp = crate::page::subpage::SubPage::parse(val)?;
+            self.entries += sp.len() as u64 - 1;
+        }
         Ok(())
     }
 
@@ -840,13 +846,31 @@ impl<S: PageSink> EnvStream<S> {
         name: &[u8],
         feed: impl FnOnce(&mut TreeStream<'_, S>) -> Result<(), StreamBuildError>,
     ) -> Result<(), StreamBuildError> {
+        self.named_db_flagged(name, 0, feed)
+    }
+
+    /// [`EnvStream::named_db`] for a database whose record carries the
+    /// persistent flags `db_flags` (SPEC 02 §3.1 offset 42).
+    ///
+    /// # Errors
+    ///
+    /// As [`TreeStream::push`].
+    pub fn named_db_flagged(
+        &mut self,
+        name: &[u8],
+        db_flags: u16,
+        feed: impl FnOnce(&mut TreeStream<'_, S>) -> Result<(), StreamBuildError>,
+    ) -> Result<(), StreamBuildError> {
         debug_assert!(
             self.catalog.last().is_none_or(|(n, _)| n.as_slice() < name),
             "named DBs must be added in ascending name order"
         );
         let mut ts = TreeStream::new(&mut self.sink, self.psize, self.txnid, self.fill)?;
         feed(&mut ts)?;
-        let rec = ts.finish()?;
+        let rec = DBRecord {
+            flags: db_flags,
+            ..ts.finish()?
+        };
         self.catalog.push((name.to_vec(), rec));
         Ok(())
     }

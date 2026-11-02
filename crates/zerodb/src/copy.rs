@@ -979,8 +979,15 @@ fn build_compact(
             .open_database(txn, Some(&name))?
             .ok_or(Error::Mdb(MdbError::Invalid))?;
         let st = dbh.stat(txn)?;
-        es.named_db(&name, |ts| {
-            for_each_entry_flagged(&dbh, txn, |k, _flags, v| ts.push(k, 0, v))
+        // Cells are copied as stored, node flags included: a duplicate set
+        // is one `F_DUPDATA` cell, and the record keeps its persistent
+        // flags.
+        #[cfg(feature = "dupsort-spike")]
+        let (db_flags, cell_flags) = (dbh.db_flags(txn)?, zerodb_core::page::F_DUPDATA);
+        #[cfg(not(feature = "dupsort-spike"))]
+        let (db_flags, cell_flags) = (0, 0);
+        es.named_db_flagged(&name, db_flags, |ts| {
+            for_each_entry_flagged(&dbh, txn, |k, flags, v| ts.push(k, flags & cell_flags, v))
         })
         .map_err(stream_err)?;
         read += st.branch_pages + st.leaf_pages + st.overflow_pages;
