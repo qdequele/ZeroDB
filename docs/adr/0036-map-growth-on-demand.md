@@ -1,6 +1,7 @@
 # ADR-0036: Grow the memory map on demand, behind an option
 
-- Status: Proposed (awaiting maintainer approval; no code changed)
+- Status: Accepted (Option A-min, without shrinking; approved by the
+  maintainer on 2026-11-02); not implemented
 - Related: issue #33; ADR-0004 (mapping strategy), ADR-0017 (spilling),
   ADR-0021 (in-place `WRITE_MAP`), ADR-0023 (multi-process access,
   amendment 15: `resize` and grow-only mappings), ADR-0026 (ranged `msync`);
@@ -281,7 +282,7 @@ unbounded size, so this does not remove the re-run. Rejected.
 
 ## Decision
 
-**Proposed: Option A-min, without shrinking.**
+**Accepted (2026-11-02): Option A-min, without shrinking**, as written below.
 
 - `EnvOpenOptions::initial_map_size(bytes)` (native and heed adapter) opts in.
   `map_size` stays the ceiling, persisted and reported as today. Without the
@@ -338,6 +339,11 @@ together with the heap-mode view re-derivation after a growth.
 - **Tests:** as listed under Option A.
 
 ## Open questions for the maintainer
+
+The maintainer approved the Decision section as written on 2026-11-02, which
+settles questions 1, 2, 3 and 5: build it now, the one-method A-min API,
+extension at txn begin under the option, and no shrinking. Question 4 stays
+open until the implementation.
 
 1. **Worth doing now?** Meilisearch already reserves 2 TiB per index, so on
    ordinary 64-bit hosts it rarely sees `MapFull`; the win is on
