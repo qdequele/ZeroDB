@@ -312,6 +312,7 @@ impl ComparatorRegistry {
     /// An out-of-range dbi (impossible for a handle the engine produced) and
     /// an unregistered one both mean memcmp.
     #[must_use]
+    #[inline]
     pub fn get(&self, dbi: u32) -> KeyCmp<'_> {
         match self.slots.get(dbi as usize).and_then(OnceLock::get) {
             Some(c) => KeyCmp::Custom(&**c),

@@ -461,6 +461,7 @@ impl<'a> Tree<'a> {
     /// [`Tree::new`] (memcmp) remains correct for the main/catalog tree and the
     /// GC tree, which are memcmp by construction (SPEC 03 §2.0).
     #[must_use]
+    #[inline]
     pub fn with_comparator(
         src: Source<'a>,
         psize: u32,
@@ -482,6 +483,7 @@ impl<'a> Tree<'a> {
     /// through this tree then skip re-validating cells of map-sourced pages
     /// already validated this txn; without it every view fully validates.
     #[must_use]
+    #[inline]
     pub(crate) fn with_validation_memo(
         mut self,
         valid: Option<&'a ValidatedPages<'a>>,

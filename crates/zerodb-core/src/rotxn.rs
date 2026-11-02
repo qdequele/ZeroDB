@@ -246,11 +246,13 @@ impl RoTxn<'_> {
     /// immutable while the txn's reader slot is held (TXN-20/21), so the copy
     /// is torn-free for reachable pages.
     #[must_use]
+    #[inline]
     pub fn map_bytes(&self) -> &[u8] {
         self.env_ref().inner().backing_bytes()
     }
 
     /// The env this txn reads (borrowed or owned).
+    #[inline]
     fn env_ref(&self) -> &Env {
         match &self.env {
             EnvHandle::Borrowed(e) => e,
@@ -261,6 +263,7 @@ impl RoTxn<'_> {
     /// The identity of the environment this transaction belongs to
     /// ([`Env::ident`]).
     #[must_use]
+    #[inline]
     pub fn env_ident(&self) -> usize {
         self.env_ref().ident()
     }
@@ -369,6 +372,7 @@ impl Drop for RoTxn<'_> {
 }
 
 impl TxnRead for RoTxn<'_> {
+    #[inline]
     fn source(&self) -> Source<'_> {
         // Borrowed lazily from the env on each access (rather than cached at
         // open) so the same struct supports the env-owning 'static shape
@@ -383,6 +387,7 @@ impl TxnRead for RoTxn<'_> {
             last_pg: self.snap.last_pg,
         }
     }
+    #[inline]
     fn main_record(&self) -> &DBRecord {
         &self.snap.main_db
     }
@@ -392,6 +397,7 @@ impl TxnRead for RoTxn<'_> {
     fn free_annex_count(&self) -> u64 {
         self.snap.free_annex.len() as u64
     }
+    #[inline]
     fn page_size(&self) -> u32 {
         self.psize
     }
@@ -442,9 +448,11 @@ impl TxnRead for RoTxn<'_> {
             None => table.check(&self.handles, None, slot, db.generation),
         }
     }
+    #[inline]
     fn comparator_for(&self, sel: DbSel) -> KeyCmp<'_> {
         self.env_ref().inner().comparator_for(sel)
     }
+    #[inline]
     fn validated_pages(&self) -> Option<&ValidatedPages<'_>> {
         Some(&self.validated)
     }
