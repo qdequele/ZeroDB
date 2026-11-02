@@ -1266,8 +1266,8 @@ some DB tree walked from a meta root. Applies to the live meta's snapshot.
   (no sharing), and none is independently in any tree or free set.
 - **INV-12** — Key size: every stored key has length `1..=511`; no empty keys.
 - **INV-13** — Value size: every `dsize ≤ MAX_DATA_SIZE` (`0xFFFF_FFFF`).
-- **INV-14** — GC well-formedness: GC entries are `(8-byte txnid key →
-  page-id-list value)`; every listed page number is in `[2, last_pg]`; no page
+- **INV-14** — GC well-formedness: GC entries are `(16-byte (txnid, seq) key →
+  page-id-list value)` (format v3, SPEC 05 GC-1/GC-5); every listed page number is in `[2, last_pg]`; no page
   appears in two GC entries (subsumed by INV-10 but checked directly).
 - **INV-15** — Catalog consistency: each named-DB catalog entry (main DB,
   `F_SUBDATA`) holds a 48-byte DBRecord with a valid `root` (`PGNO_INVALID` or a

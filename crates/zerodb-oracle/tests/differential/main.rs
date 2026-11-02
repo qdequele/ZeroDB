@@ -13,6 +13,7 @@ mod env_lifecycle_differential;
 mod flag_semantics;
 mod force_sync_durability;
 mod free_run_cross_record_proptest;
+mod freelist_chunk_boundary_proptest;
 mod gc_churn_parity;
 mod heed_adapter_differential;
 mod key_bounds;

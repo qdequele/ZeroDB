@@ -41,6 +41,15 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ### Changed
 
+- **On-disk `format_version` 3: bounded free-page records** (ADR-0037). A
+  transaction that frees many pages stores its list as several records of at
+  most 249 ids (4 KiB pages; 1,017 at 16 KiB), keyed by its transaction id and
+  the low end of each record's page range, instead of one record on a long
+  overflow run. A later commit that draws pages from that list reads and
+  rewrites only the records it draws from, not the whole list. Format-2
+  files are refused at open: migrate with `zerodb-tools dump` built from the
+  previous release, then `load`. `zerodb-tools stat` reports the free-page
+  records, and `check` verifies their bound and ranges (INV-29).
 - **The heed adapter is the `[patch]` target itself.** `crates/heed-zerodb`'s
   package is now named `heed` (version 0.22.1), and the `crates/heed-shim` and
   `crates/heed-shim-unique-txns` re-export crates are removed. The one-line
@@ -107,6 +116,13 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+
+- Small commits after a large delete no longer pay for the size of the delete
+  (ADR-0037, format 3). On a macOS laptop with 16 KiB pages, the median
+  single-put no-sync commit after a 192,000-page delete went from 513 µs
+  (22.8×) to 25 µs (1.12×), and after a 6,000-page delete from 32.5 µs
+  (1.90×) to 21.8 µs (1.27×). A durable commit after a 96,000-page delete costs
+  the same as with no delete.
 
 - Commit writes carry at most 256 KiB per `pwritev` call, LMDB's 64 pages
   at 4 KiB (#135). Larger calls left the file in 2 MiB page-cache folios on

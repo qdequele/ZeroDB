@@ -723,6 +723,50 @@ pub fn free_page_count<T: TxnRead>(txn: &T) -> Result<u64> {
     Ok(total)
 }
 
+/// The shape of a snapshot's free-page tree (SPEC 05 §1): how many records
+/// it holds, how many distinct freeing txns they belong to, and the longest
+/// record's id count (at most [`crate::page::geometry::gc_chunk_cap`] in a
+/// well-formed file, GC-5). For `zerodb-tools stat`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FreeRecordStats {
+    /// Records in the free-page tree.
+    pub records: u64,
+    /// Distinct freeing txns among them.
+    pub freeing_txns: u64,
+    /// The largest record's id count.
+    pub longest: u64,
+}
+
+/// Walk the txn's free-page tree and summarize its records (see
+/// [`FreeRecordStats`]). Reads each record's key and `count` prefix only, as
+/// [`free_page_count`] does; the meta annex is not a record and is not
+/// counted.
+///
+/// # Errors
+///
+/// [`MdbError::Invalid`] on a corrupt GC tree, a key that is not 16 bytes,
+/// or a malformed PIL.
+pub fn free_record_stats<T: TxnRead>(txn: &T) -> Result<FreeRecordStats> {
+    let rec = txn.free_record();
+    let tree = Tree::new(txn.source(), txn.page_size(), rec.root, rec.depth);
+    let mut cursor = tree.cursor();
+    let mut stats = FreeRecordStats::default();
+    let mut last_txnid = None;
+    let mut entry = cursor.first().map_err(map_page_err)?;
+    while let Some((key, val)) = entry {
+        let key = crate::page::geometry::gc_key_decode(key).ok_or(Error::Mdb(MdbError::Invalid))?;
+        let count = crate::page::geometry::pil_count(val).ok_or(Error::Mdb(MdbError::Invalid))?;
+        stats.records += 1;
+        if last_txnid != Some(key.txnid) {
+            stats.freeing_txns += 1;
+            last_txnid = Some(key.txnid);
+        }
+        stats.longest = stats.longest.max(count);
+        entry = cursor.next().map_err(map_page_err)?;
+    }
+    Ok(stats)
+}
+
 /// One owned, flagged entry: `(key, leaf-node flags, value)` (tools and copy).
 pub type FlaggedEntry = (Vec<u8>, u16, Vec<u8>);
 
