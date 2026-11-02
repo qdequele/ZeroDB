@@ -31,7 +31,7 @@ use std::cell::Cell;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::btree::{prefix_successor, Cursor, Source, Tree, ValidatedPages};
+use crate::btree::{prefix_successor, Cursor, RootSlot, Source, Tree, ValidatedPages};
 use crate::builder::StreamBuildError;
 use crate::cmp::KeyCmp;
 use crate::env::{Env, Snapshot};
@@ -101,6 +101,14 @@ pub trait TxnRead {
     /// validate.
     fn validated_pages(&self) -> Option<&ValidatedPages<'_>> {
         None
+    }
+    /// [`TxnRead::record_for`], together with the txn's [`RootSlot`] for
+    /// that database if it keeps one: the root page's memo entry, kept where
+    /// the txn finds the database, so both come from one lookup. Default: no
+    /// slot, so every descent resolves its root page. Engine-internal.
+    #[doc(hidden)]
+    fn record_and_root(&self, db: &Database) -> (DBRecord, Option<&RootSlot>) {
+        (self.record_for(db), None)
     }
     /// The meta free-list annex id count this txn observes (SPEC 05 §2a,
     /// ADR-0022; feeds [`free_page_count`]). A reader reports its snapshot's
@@ -222,6 +230,9 @@ pub struct RoTxn<'env> {
     /// [`ValidatedPages`]). Sound here because every page this snapshot can
     /// reach is immutable while its reader slot is held (TXN-20/21).
     validated: ValidatedPages<'env>,
+    /// The main database's [`RootSlot`]; a named database's lives in its
+    /// `named_dense` entry.
+    main_root: RootSlot,
 }
 
 impl RoTxn<'_> {
@@ -309,6 +320,23 @@ impl RoTxn<'_> {
         Ok(())
     }
 
+    /// Named DB `dbi`'s record through its dense memo `entry`. The resolution
+    /// is constant for this txn's life (see the `named_dense` field docs).
+    fn dense_record(&self, entry: &NamedEntry, dbi: u32, generation: u32) -> DBRecord {
+        match entry.rec.get() {
+            Some(&(g, rec)) if g == generation => return rec,
+            // Another generation of the slot: rare (a remove and a reuse
+            // during this txn), resolve uncached.
+            Some(_) => return self.resolve_named(dbi),
+            None => {}
+        }
+        let rec = self.resolve_named(dbi);
+        // A racing thread may have filled the slot first; it resolved the
+        // same constant record, so either wins.
+        let _ = entry.rec.set((generation, rec));
+        rec
+    }
+
     /// Resolve `dbi`'s record against this txn's pinned catalog (uncached).
     fn resolve_named(&self, dbi: u32) -> DBRecord {
         match self.env_ref().inner().named_name(dbi) {
@@ -330,6 +358,7 @@ type GenRecord = (u32, DBRecord);
 struct NamedEntry {
     rec: OnceLock<GenRecord>,
     checked: MemoCell,
+    root: RootSlot,
 }
 
 thread_local! {
@@ -402,26 +431,13 @@ impl TxnRead for RoTxn<'_> {
         self.psize
     }
     fn record_for(&self, db: &Database) -> DBRecord {
-        let generation = db.generation;
         match db.sel {
             DbSel::Main => self.snap.main_db,
             DbSel::Named(dbi) => {
-                // The resolution is constant for this txn's life (see the
-                // `named_dense` field docs).
                 if let Some(entry) = self.dense_entry(dbi) {
-                    match entry.rec.get() {
-                        Some(&(g, rec)) if g == generation => return rec,
-                        // Another generation of the slot: rare (a remove and
-                        // a reuse during this txn), resolve uncached.
-                        Some(_) => return self.resolve_named(dbi),
-                        None => {}
-                    }
-                    let rec = self.resolve_named(dbi);
-                    // A racing thread may have filled the slot first; it
-                    // resolved the same constant record, so either wins.
-                    let _ = entry.rec.set((generation, rec));
-                    return rec;
+                    return self.dense_record(entry, dbi, db.generation);
                 }
+                let generation = db.generation;
                 let mut memo = self.named_memo.lock().expect("named memo poisoned");
                 if let Some(&(_, _, rec)) =
                     memo.iter().find(|&&(d, g, _)| d == dbi && g == generation)
@@ -456,6 +472,18 @@ impl TxnRead for RoTxn<'_> {
     fn validated_pages(&self) -> Option<&ValidatedPages<'_>> {
         Some(&self.validated)
     }
+    fn record_and_root(&self, db: &Database) -> (DBRecord, Option<&RootSlot>) {
+        match db.sel {
+            DbSel::Main => (self.snap.main_db, Some(&self.main_root)),
+            DbSel::Named(dbi) => match self.dense_entry(dbi) {
+                Some(entry) => (
+                    self.dense_record(entry, dbi, db.generation),
+                    Some(&entry.root),
+                ),
+                None => (self.record_for(db), None),
+            },
+        }
+    }
 }
 
 impl Env {
@@ -486,6 +514,7 @@ impl Env {
                 self.inner().file_trust(),
                 Some(self.inner().stamp_cache()),
             ),
+            main_root: RootSlot::default(),
         })
     }
 
@@ -513,6 +542,7 @@ impl Env {
             named_dense: OnceLock::new(),
             named_memo: Mutex::new(Vec::new()),
             validated,
+            main_root: RootSlot::default(),
         })
     }
 
@@ -862,7 +892,7 @@ impl Database {
     /// This database's tree in `txn`, unchecked: for callers that checked the
     /// handle already.
     pub(crate) fn tree<'txn, T: TxnRead + ?Sized>(&self, txn: &'txn T) -> Tree<'txn> {
-        let rec = txn.record_for(self);
+        let (rec, root_slot) = txn.record_and_root(self);
         // The tree carries its database's ordering, so every descent,
         // seek, range bound and hit-test below uses it (SPEC 03 §2.0).
         Tree::with_comparator(
@@ -873,6 +903,7 @@ impl Database {
             txn.comparator_for(self.sel),
         )
         .with_validation_memo(txn.validated_pages())
+        .with_root_slot(root_slot)
     }
 
     /// `stat(txn)` (SPEC 00 row 49): depth, page counts, and entry count of

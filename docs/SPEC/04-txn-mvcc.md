@@ -713,6 +713,15 @@ dirty-page store must be built so it is.
   parks the zeroed level for the next memo created on the same thread; a
   memo with more level-0 inserts than it logs frees the level instead. One
   level is parked per thread. This is not an entry carried across txns.
+  **Root slot (added 2026-11-02, #147).** A read txn also keeps, per
+  database (the main database, and each named database in its dbi-indexed
+  record table), one copy of the memo entry of that database's root page:
+  the root's page number and kind. A keyed descent (point lookup or seek)
+  that finds the root's page number there takes the memo-hit view without the page-type
+  check or the memo probe. The copy is made only for a map-sourced root the
+  memo already holds under the same key, so it vouches for nothing the memo
+  does not, and under the trusting policy a leaf root is never copied. Like
+  the memo, it dies with the txn. Write txns and nested read txns keep none.
   **Cross-txn validation cache (added 2026-09-29, ADR-0018):** under the
   validating policy a txn-memo miss on a map-sourced leaf or branch first
   probes an env-wide cache keyed by **(pgno, page kind, header txnid stamp)**.

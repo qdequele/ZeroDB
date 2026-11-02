@@ -32,7 +32,7 @@ use super::stamps::{StampCache, StampKind};
 mod memo;
 
 pub(crate) use memo::PageKind;
-pub use memo::ValidatedPages;
+pub use memo::{RootSlot, ValidatedPages};
 
 /// An entry `(key, value)` borrowed from the map for the view's lifetime `'a`.
 pub type Entry<'a> = (&'a [u8], &'a [u8]);
@@ -371,6 +371,55 @@ pub(crate) fn node_view_classified<'a>(
     Ok((view, from_map))
 }
 
+/// [`node_view`] for the root page of a descent, through the transaction's
+/// [`RootSlot`] for this database when it has one: a slot hit takes the
+/// memo's zero-check view without the page-type check or the memo probe; a
+/// miss takes [`node_view`] and records the slot once the memo holds the
+/// page (see [`RootSlot`] for why that is sound).
+#[inline(always)]
+fn root_view<'a>(
+    src: Source<'a>,
+    psize: u32,
+    pgno: u64,
+    valid: Option<&ValidatedPages<'_>>,
+    slot: Option<&RootSlot>,
+) -> Result<NodeView<'a>, PageError> {
+    let Some(slot) = slot else {
+        return node_view(src, psize, pgno, valid);
+    };
+    match slot.kind(pgno) {
+        Some(kind) => {
+            let (bytes, _) = src.bytes_from_classified(psize, pgno)?;
+            Ok(match kind {
+                PageKind::Leaf => NodeView::Leaf(LeafRef::new_trusted(bytes)),
+                PageKind::Branch => NodeView::Branch(BranchRef::new_trusted(bytes)),
+            })
+        }
+        None => record_root(src, psize, pgno, valid, slot),
+    }
+}
+
+/// The miss arm of [`root_view`], out of line: it runs once per database per
+/// transaction.
+#[inline(never)]
+fn record_root<'a>(
+    src: Source<'a>,
+    psize: u32,
+    pgno: u64,
+    valid: Option<&ValidatedPages<'_>>,
+    slot: &RootSlot,
+) -> Result<NodeView<'a>, PageError> {
+    let (view, from_map) = node_view_classified(src, psize, pgno, valid)?;
+    let kind = match view {
+        NodeView::Leaf(_) => PageKind::Leaf,
+        NodeView::Branch(_) => PageKind::Branch,
+    };
+    if from_map && valid.is_some_and(|v| v.contains(pgno, kind)) {
+        slot.record(pgno, kind);
+    }
+    Ok(view)
+}
+
 // ---------------------------------------------------------------------------
 // Page loading + value resolution
 // ---------------------------------------------------------------------------
@@ -446,6 +495,8 @@ pub struct Tree<'a> {
     /// ([`ValidatedPages`]); `None` (always fully validate) for tests, tools
     /// and the GC tree.
     valid: Option<&'a ValidatedPages<'a>>,
+    /// The owning read txn's [`RootSlot`] for this database, if it keeps one.
+    root_slot: Option<&'a RootSlot>,
 }
 
 impl<'a> Tree<'a> {
@@ -476,6 +527,7 @@ impl<'a> Tree<'a> {
             depth,
             cmp,
             valid: None,
+            root_slot: None,
         }
     }
 
@@ -489,6 +541,16 @@ impl<'a> Tree<'a> {
         valid: Option<&'a ValidatedPages<'a>>,
     ) -> Tree<'a> {
         self.valid = valid;
+        self
+    }
+
+    /// Attach the owning read txn's [`RootSlot`] for this database. Only
+    /// meaningful together with [`Tree::with_validation_memo`]: the slot is
+    /// recorded from the memo.
+    #[must_use]
+    #[inline]
+    pub(crate) fn with_root_slot(mut self, slot: Option<&'a RootSlot>) -> Tree<'a> {
+        self.root_slot = slot;
         self
     }
 
@@ -534,8 +596,13 @@ impl<'a> Tree<'a> {
             return Ok(None);
         }
         let mut pgno = self.root;
-        for _ in 0..(self.depth as usize + 2).min(CURSOR_STACK) {
-            match node_view(self.src, self.psize, pgno, self.valid)? {
+        for level in 0..(self.depth as usize + 2).min(CURSOR_STACK) {
+            let view = if level == 0 {
+                root_view(self.src, self.psize, pgno, self.valid, self.root_slot)?
+            } else {
+                node_view(self.src, self.psize, pgno, self.valid)?
+            };
+            match view {
                 NodeView::Leaf(leaf) => {
                     return Ok(match leaf.lookup_with(key, self.cmp) {
                         Ok(ki) => Some((leaf, ki)),
@@ -778,6 +845,9 @@ pub struct Cursor<'a, S: BorrowMut<PathStack> = PathStack> {
     /// The owning txn's validated-pages memo, copied from the
     /// [`Tree`] this cursor was opened on.
     valid: Option<&'a ValidatedPages<'a>>,
+    /// The owning read txn's [`RootSlot`] for this database, copied from the
+    /// [`Tree`] this cursor was opened on.
+    root_slot: Option<&'a RootSlot>,
 }
 
 impl<'a> Cursor<'a> {
@@ -793,6 +863,7 @@ impl<'a> Cursor<'a> {
             cmp: t.cmp,
             leaf_cache: Cell::new(None),
             valid: t.valid,
+            root_slot: t.root_slot,
         }
     }
 }
@@ -905,8 +976,13 @@ impl<'a, S: BorrowMut<PathStack>> Cursor<'a, S> {
             return Ok(());
         }
         let mut pgno = self.root;
-        for _ in 0..=(self.depth as usize + 1) {
-            match node_view(self.src, self.psize, pgno, self.valid)? {
+        for level in 0..=(self.depth as usize + 1) {
+            let view = if level == 0 {
+                root_view(self.src, self.psize, pgno, self.valid, self.root_slot)?
+            } else {
+                node_view(self.src, self.psize, pgno, self.valid)?
+            };
+            match view {
                 NodeView::Leaf(leaf) => {
                     let ki = match leaf.lookup_with(key, self.cmp) {
                         Ok(i) | Err(i) => i,
@@ -1373,6 +1449,7 @@ impl<'a, 's> Cursor<'a, &'s mut PathStack> {
             cmp: t.cmp,
             leaf_cache: Cell::new(None),
             valid: t.valid,
+            root_slot: t.root_slot,
         }
     }
 
@@ -1795,6 +1872,73 @@ mod tests {
         let validating = ValidatedPages::new();
         leaf_view(src(&img), PS, leaf, Some(&validating)).expect("leaf validates");
         assert!(validating.contains(leaf, PageKind::Leaf));
+    }
+
+    /// The root slot copies the memo: a keyed descent records it only once the memo
+    /// holds the root, a later descent through it reads the same entries, and
+    /// it answers for no other page number.
+    #[test]
+    fn root_slot_copies_the_memo_entry_of_the_root() {
+        let entries: Vec<_> = (0..2000u16)
+            .map(|i| kv(&i.to_be_bytes(), &[7u8; 40]))
+            .collect();
+        let (img, root, depth) = build(&entries);
+        assert!(depth >= 2, "a branch root over leaves");
+        let memo = ValidatedPages::new();
+        let slot = RootSlot::default();
+        let tree = Tree::new(src(&img), PS, root, depth)
+            .with_validation_memo(Some(&memo))
+            .with_root_slot(Some(&slot));
+        assert!(slot.kind(root).is_none());
+        let (k0, v0) = &entries[0];
+        assert_eq!(tree.get(k0).unwrap(), Some(v0.as_slice()));
+        assert!(memo.contains(root, PageKind::Branch));
+        assert!(matches!(slot.kind(root), Some(PageKind::Branch)));
+        assert!(slot.kind(root + 1).is_none(), "keyed by page number");
+
+        // Every read through the slot matches a tree without one.
+        let plain = Tree::new(src(&img), PS, root, depth);
+        assert_eq!(
+            tree.cursor().first().unwrap(),
+            plain.cursor().first().unwrap()
+        );
+        assert_eq!(
+            tree.cursor().last().unwrap(),
+            plain.cursor().last().unwrap()
+        );
+        for (k, v) in entries.iter().step_by(97) {
+            assert_eq!(tree.get(k).unwrap(), Some(v.as_slice()));
+            assert_eq!(
+                tree.cursor().set_range(k).unwrap(),
+                plain.cursor().set_range(k).unwrap()
+            );
+        }
+        assert_eq!(tree.get(b"absent-key").unwrap(), None);
+        assert_eq!(collect_fwd(&tree), entries);
+    }
+
+    /// Under the trusting policy a leaf never enters the memo, so a leaf root
+    /// never enters the root slot either; under the validating one it does.
+    #[test]
+    fn root_slot_follows_the_trusting_memo() {
+        let leaf_entries: Vec<_> = (0..8u8).map(|i| kv(&[b'k', i], b"v")).collect();
+        let (img, root, depth) = build(&leaf_entries);
+        assert_eq!(depth, 1, "a single leaf root");
+        let trusting = ValidatedPages::for_policy(FileTrust::trusting_for_tests());
+        let slot = RootSlot::default();
+        let tree = Tree::new(src(&img), PS, root, depth)
+            .with_validation_memo(Some(&trusting))
+            .with_root_slot(Some(&slot));
+        assert_eq!(tree.get(&[b'k', 3]).unwrap(), Some(&b"v"[..]));
+        assert!(slot.kind(root).is_none(), "a trusted leaf is not memoized");
+
+        let validating = ValidatedPages::new();
+        let slot = RootSlot::default();
+        let tree = Tree::new(src(&img), PS, root, depth)
+            .with_validation_memo(Some(&validating))
+            .with_root_slot(Some(&slot));
+        assert_eq!(tree.get(&[b'k', 3]).unwrap(), Some(&b"v"[..]));
+        assert!(matches!(slot.kind(root), Some(PageKind::Leaf)));
     }
 
     /// ADR-0018: a leaf fully validated by one txn is taken from the env-wide

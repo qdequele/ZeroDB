@@ -285,6 +285,46 @@ impl<'e> ValidatedPages<'e> {
     }
 }
 
+/// One database's root page as the transaction's memo vouches for it: a copy
+/// of that page's memo entry, kept next to the database's record in the read
+/// transaction, so a keyed descent (a point lookup or a seek) from the root
+/// skips the page-type check and the memo probe there. LMDB resolves a read transaction's root with one pointer
+/// computation (`mdb_page_get`); this is the closest checked equivalent.
+///
+/// Soundness: [`Tree`]'s root view records a slot only for a map-sourced page
+/// that [`ValidatedPages::contains`] already holds, under the same key, so a
+/// slot hit hands out exactly the view a memo hit would. The slot stores the
+/// memo key, page number included, so it only ever answers for the page it
+/// was recorded for; a lookup of any other root misses and takes the normal
+/// path. Like the memo, a slot dies with its transaction.
+#[derive(Default)]
+pub struct RootSlot(AtomicU64);
+
+impl RootSlot {
+    /// The kind recorded for root `pgno`, if this slot holds it.
+    #[inline(always)]
+    pub(super) fn kind(&self, pgno: u64) -> Option<PageKind> {
+        // Ordering: `Acquire` pairs with the `Release` in `record`, as the
+        // memo's probe pairs with its insert.
+        let s = self.0.load(Ordering::Acquire);
+        if s == ValidatedPages::key_of(pgno, PageKind::Branch) {
+            Some(PageKind::Branch)
+        } else if s == ValidatedPages::key_of(pgno, PageKind::Leaf) {
+            Some(PageKind::Leaf)
+        } else {
+            None
+        }
+    }
+
+    /// Record root `pgno` as `kind`. The caller has seen the memo hold that
+    /// key. Racing records of one database store the same word.
+    pub(super) fn record(&self, pgno: u64, kind: PageKind) {
+        // Ordering: `Release` publishes the memo hit observed before it.
+        self.0
+            .store(ValidatedPages::key_of(pgno, kind), Ordering::Release);
+    }
+}
+
 impl Drop for ValidatedPages<'_> {
     /// Clear level 0 slot by slot and park it for the next memo on this
     /// thread, when every slot written is logged; otherwise free it.
