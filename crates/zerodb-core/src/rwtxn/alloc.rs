@@ -112,6 +112,13 @@ impl DrainIds {
     }
 }
 
+impl Default for Drain {
+    /// An empty drain, with no allocation.
+    fn default() -> Self {
+        Drain::new(Vec::new())
+    }
+}
+
 impl Drain {
     pub(super) fn new(ids: Vec<u64>) -> Self {
         Drain {
@@ -357,7 +364,7 @@ impl<'env> RwTxn<'env> {
     pub(super) fn save_pool_draw(&mut self, n: u64) -> Option<u64> {
         debug_assert!(self.alloc_mode == AllocMode::GcSave);
         let mut hit: Option<(GcKey, u64)> = None;
-        for (key, remaining) in &self.drains {
+        for (key, remaining) in &work!(self).drains {
             if let Some(start) = find_run(remaining.live(), n) {
                 hit = Some((*key, start));
                 break;
@@ -368,10 +375,13 @@ impl<'env> RwTxn<'env> {
         // fresh table re-scan re-proves it at the hand-out moment.
         #[cfg(debug_assertions)]
         self.debug_assert_gate(key.txnid);
-        let remaining = self.drains.get_mut(&key).expect("pool entry present");
+        let remaining = work_mut!(self)
+            .drains
+            .get_mut(&key)
+            .expect("pool entry present");
         remaining.take_run(start, n);
         self.mark_reclaimed(start, n);
-        self.save_touched.insert(key);
+        work_mut!(self).save_touched.insert(key);
         Some(start)
     }
 
@@ -389,18 +399,18 @@ impl<'env> RwTxn<'env> {
     /// tree write, so an in-save draw is always re-accounted).
     #[inline(never)]
     pub(super) fn annex_draw(&mut self, n: u64) -> Option<u64> {
-        if self.annex.len() == 0 {
+        if work!(self).annex.len() == 0 {
             return None;
         }
         let f = self.base().txnid;
         if f > self.oldest_reader() {
             return None; // GC-31 gate: a reader is pinned below the base.
         }
-        let start = find_run(self.annex.live(), n)?;
+        let start = find_run(work!(self).annex.live(), n)?;
         // Reader-table shadow check, as in every other draw arm.
         #[cfg(debug_assertions)]
         self.debug_assert_gate(f);
-        self.annex.take_run(start, n);
+        work_mut!(self).annex.take_run(start, n);
         self.mark_reclaimed(start, n);
         Some(start)
     }
@@ -415,7 +425,7 @@ impl<'env> RwTxn<'env> {
     /// reclaimed-against; readers that pin mid-txn pin `≥ commit point =
     /// txnid − 1 ≥` the cache, so the cache never overshoots a new pin).
     pub(super) fn oldest_reader(&mut self) -> u64 {
-        if let Some(o) = self.oldest_cache {
+        if let Some(o) = work!(self).oldest_cache {
             return o;
         }
         let cap = self.txnid - 1;
@@ -423,7 +433,7 @@ impl<'env> RwTxn<'env> {
             Some(r) => r.min(cap),
             None => cap,
         };
-        self.oldest_cache = Some(o);
+        work_mut!(self).oldest_cache = Some(o);
         o
     }
 
@@ -465,7 +475,7 @@ impl<'env> RwTxn<'env> {
     /// `(freeing txnid, seq)` order (BE keys ⇒ forward cursor); for the first
     /// record with `F ≤ oldest_reader()` whose remaining ids satisfy the
     /// request (smallest id for `n == 1` — GC-19; first within-PIL contiguous
-    /// run for `n > 1` — GC-15/21), record the drain in `self.drains` (the
+    /// run for `n > 1` — GC-15/21), record the drain in the txn's `drains` (the
     /// tree record itself is rewritten only at C1, GC-20) and return the head
     /// pgno.
     #[inline(never)]
@@ -474,7 +484,7 @@ impl<'env> RwTxn<'env> {
             self.alloc_mode == AllocMode::Normal,
             "GC draw inside freelist_save (GC-12)"
         );
-        if self.free_db.root == PGNO_INVALID || self.record_miss.is_some_and(|m| n >= m) {
+        if self.free_db.root == PGNO_INVALID || work!(self).record_miss.is_some_and(|m| n >= m) {
             return Ok(None);
         }
         let oldest = self.oldest_reader();
@@ -486,7 +496,7 @@ impl<'env> RwTxn<'env> {
             start: u64,
         }
         let last_pg = self.committed_last_pg;
-        let from = self.record_from.range(..=n).map(|(_, k)| *k).max();
+        let from = work!(self).record_from.range(..=n).map(|(_, k)| *k).max();
         let mut pick: Option<Pick> = None;
         self.visit_gated_records(oldest, from, |key, drain, val| {
             let (fresh, start) = match drain {
@@ -508,7 +518,8 @@ impl<'env> RwTxn<'env> {
         let Some(Pick { key, fresh, start }) = pick else {
             // Every gated record was read: during the txn's operations its
             // records only lose ids, so no longer request can succeed here.
-            self.record_miss = Some(self.record_miss.map_or(n, |m| m.min(n)));
+            let work = work_mut!(self);
+            work.record_miss = Some(work.record_miss.map_or(n, |m| m.min(n)));
             return Ok(None);
         };
         // Reader-table shadow check: re-scan the live reader table at the hand-out
@@ -516,11 +527,14 @@ impl<'env> RwTxn<'env> {
         #[cfg(debug_assertions)]
         self.debug_assert_gate(key.txnid);
         if from.is_none_or(|f| key > f) {
-            self.record_from.insert(n, key);
+            work_mut!(self).record_from.insert(n, key);
         }
         let remaining = match fresh {
-            Some(ids) => self.drains.entry(key).or_insert(Drain::new(ids)),
-            None => self.drains.get_mut(&key).expect("drain entry present"),
+            Some(ids) => work_mut!(self).drains.entry(key).or_insert(Drain::new(ids)),
+            None => work_mut!(self)
+                .drains
+                .get_mut(&key)
+                .expect("drain entry present"),
         };
         remaining.take_run(start, n);
         self.mark_reclaimed(start, n);
@@ -563,7 +577,7 @@ impl<'env> RwTxn<'env> {
             if val.len() > max_val {
                 return Err(Error::Mdb(MdbError::Invalid));
             }
-            if visit(key, self.drains.get(&key), val)?.is_break() {
+            if visit(key, work!(self).drains.get(&key), val)?.is_break() {
                 break;
             }
             entry = cursor.next().map_err(map_page_err)?;
@@ -600,12 +614,12 @@ impl<'env> RwTxn<'env> {
     #[inline(never)]
     pub(super) fn cross_record_run(&mut self, n: u64) -> Result<Option<u64>> {
         debug_assert!(n > 1 && self.alloc_mode == AllocMode::Normal);
-        if self.cross_miss.is_some_and(|m| n >= m) {
+        if work!(self).cross_miss.is_some_and(|m| n >= m) {
             return Ok(None);
         }
         let run_len = usize::try_from(n).map_err(|_| Error::Mdb(MdbError::Invalid))?;
         let budget = n.saturating_mul(CROSS_RUN_RECORDS_PER_PAGE);
-        let mut cache = match self.cross_cache.take() {
+        let mut cache = match work_mut!(self).cross_cache.take() {
             // A cache that read every gated record, or at least as many as
             // this request may read, serves it.
             Some(c) if !c.truncated || c.budget >= budget => c,
@@ -633,9 +647,10 @@ impl<'env> RwTxn<'env> {
         };
         let Some(at) = hit else {
             if !cache.truncated {
-                self.cross_miss = Some(self.cross_miss.map_or(n, |m| m.min(n)));
+                let work = work_mut!(self);
+                work.cross_miss = Some(work.cross_miss.map_or(n, |m| m.min(n)));
             }
-            self.cross_cache = Some(cache);
+            work_mut!(self).cross_cache = Some(cache);
             return Ok(None);
         };
         let start = cache.merged[at].0;
@@ -662,19 +677,22 @@ impl<'env> RwTxn<'env> {
                     // the cache read; if `gc_reclaim` loaded it meanwhile,
                     // its entry is the live one.
                     let drain = match fresh.take() {
-                        Some(ids) => self.drains.entry(key).or_insert(Drain::new(ids)),
-                        None => self.drains.get_mut(&key).expect("drain entry present"),
+                        Some(ids) => work_mut!(self).drains.entry(key).or_insert(Drain::new(ids)),
+                        None => work_mut!(self)
+                            .drains
+                            .get_mut(&key)
+                            .expect("drain entry present"),
                     };
                     drain.take_span(first, count);
                 }
                 CrossSource::Annex => {
                     #[cfg(debug_assertions)]
                     self.debug_assert_gate(self.base().txnid);
-                    self.annex.take_span(first, count);
+                    work_mut!(self).annex.take_span(first, count);
                 }
             }
         }
-        self.cross_cache = Some(cache);
+        work_mut!(self).cross_cache = Some(cache);
         self.mark_reclaimed(start, n);
         Ok(Some(start))
     }
@@ -710,7 +728,7 @@ impl<'env> RwTxn<'env> {
             }
             Ok(ControlFlow::Continue(()))
         })?;
-        if self.annex.len() > 0 && self.base().txnid <= oldest {
+        if work!(self).annex.len() > 0 && self.base().txnid <= oldest {
             sources.push(CrossSource::Annex);
         }
         let mut merged: Vec<(u64, u32)> = Vec::new();
@@ -723,8 +741,8 @@ impl<'env> RwTxn<'env> {
                     CrossSource::Tree {
                         fresh: Some(ids), ..
                     } => ids,
-                    CrossSource::Tree { key, fresh: None } => self.drains[key].live(),
-                    CrossSource::Annex => self.annex.live(),
+                    CrossSource::Tree { key, fresh: None } => work!(self).drains[key].live(),
+                    CrossSource::Annex => work!(self).annex.live(),
                 };
                 merged.extend(live.iter().map(|&p| (p, i)));
             }
