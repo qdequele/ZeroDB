@@ -352,17 +352,33 @@ fn child_entry() {
             let r = env.read_txn().unwrap();
             assert_eq!(db.len(&r).unwrap(), 1 + 1_300);
         }
+        // A process with map growth, opened before the other grew the map:
+        // its borrow survives, and its read and write begins follow the
+        // growth without `MapResized` (ADR-0036).
+        "growing_reader" => {
+            let env = open_shared(&dir, true, CEILING, EnvFlags::EMPTY);
+            let db = env.main_database();
+            let r = env.read_txn().unwrap();
+            let pinned = db.get(&r, b"pinned").unwrap().unwrap();
+            let first = env.backing_bytes().len();
+            mark(&dir, "reader-ready");
+            wait_for(&dir.join("grown"));
+            assert_eq!(pinned, b"before growth");
+            drop(r);
+            let r = env.read_txn().expect("a read begin follows the growth");
+            assert_eq!(db.len(&r).unwrap(), 1 + 1_300);
+            drop(r);
+            assert!(env.backing_bytes().len() > first, "this process's map grew");
+            let mut w = env.write_txn().expect("a write begin follows the growth");
+            db.put(&mut w, b"from-the-reader", b"v").unwrap();
+            w.commit().unwrap();
+        }
         // A growing `WRITE_MAP` process joining after the other grew the
-        // file: it adopts the grown size, then grows the map and the file
-        // further inside its own write txn.
+        // file: it adopts the grown size at open, then grows the map and the
+        // file further inside its own write txn.
         "growing_writer" => {
             let env = open_shared(&dir, true, CEILING, EnvFlags::WRITE_MAP);
             let before = env.real_disk_size().unwrap();
-            match env.write_txn() {
-                Ok(w) => drop(w),
-                Err(zerodb::Error::Mdb(MdbError::MapResized)) => env.resize(0).unwrap(),
-                Err(e) => panic!("write begin: {e:?}"),
-            }
             write_4mib(&env, "b");
             assert!(
                 env.real_disk_size().unwrap() > before,
@@ -393,23 +409,83 @@ fn another_process_keeps_its_borrows_and_follows_the_growth() {
 }
 
 #[test]
+fn a_process_with_growth_follows_another_without_map_resized() {
+    for flags in [EnvFlags::EMPTY, EnvFlags::WRITE_MAP] {
+        let dir = TempDir::new();
+        let env = open_shared(dir.path(), true, CEILING, flags);
+        let mut w = env.write_txn().unwrap();
+        env.main_database()
+            .put(&mut w, b"pinned", b"before growth")
+            .unwrap();
+        w.commit().unwrap();
+        let mut reader = child("growing_reader", dir.path());
+        wait_for(&dir.path().join("reader-ready"));
+        write_4mib(&env, "a");
+        mark(dir.path(), "grown");
+        wait_success(&mut reader);
+        let r = env.read_txn().unwrap();
+        assert_eq!(env.main_database().len(&r).unwrap(), 2 + 1_300);
+        drop(r);
+        assert_clean(dir.path(), PS);
+    }
+}
+
+#[test]
 fn a_write_map_process_grows_after_another_did() {
     let dir = TempDir::new();
     let env = open_shared(dir.path(), true, CEILING, EnvFlags::WRITE_MAP);
     write_4mib(&env, "a");
     let mut writer = child("growing_writer", dir.path());
     wait_success(&mut writer);
-    // This process sees the other's commit past its own map, adopts it, and
-    // reads both.
-    let r = match env.read_txn() {
-        Ok(r) => r,
-        Err(zerodb::Error::Mdb(MdbError::MapResized)) => {
-            env.resize(0).unwrap();
-            env.read_txn().unwrap()
-        }
-        Err(e) => panic!("read begin: {e:?}"),
-    };
+    // This process follows the other's commit past its own map and reads
+    // both (ADR-0036).
+    let r = env.read_txn().expect("a read begin follows the growth");
     assert_eq!(env.main_database().len(&r).unwrap(), 2 * 1_300);
     drop(r);
     assert_clean(dir.path(), PS);
+}
+
+/// `resize` under map growth (SPEC 02 §8): a non-zero size sets the ceiling
+/// without mapping it, and `MapFull` then comes at the new ceiling; `0`
+/// adopts the meta's size and never lowers the ceiling below it.
+#[test]
+fn resize_sets_the_ceiling_under_map_growth() {
+    let dir = TempDir::new();
+    let mut opts = EnvOpenOptions::new();
+    opts.map_size(1 << 20)
+        .initial_map_size(INITIAL)
+        .page_size(PS)
+        .flags(EnvFlags::NO_SYNC);
+    let env = opts.open(dir.path()).unwrap();
+    let db = env.main_database();
+    let fill = |env: &Env, prefix: &str| -> u32 {
+        let mut n = 0;
+        loop {
+            let mut w = env.write_txn().unwrap();
+            match db.put(&mut w, format!("{prefix}{n:06}").as_bytes(), &[1u8; 1024]) {
+                Ok(()) => w.commit().unwrap(),
+                Err(zerodb::Error::Mdb(MdbError::MapFull)) => return n,
+                Err(e) => panic!("put: {e:?}"),
+            }
+            n += 1;
+        }
+    };
+    let first = fill(&env, "a");
+    env.resize(4 << 20).unwrap();
+    assert_eq!(env.info().map_size, 4 << 20, "the new ceiling");
+    assert!(
+        env.backing_bytes().len() < 4 << 20,
+        "the ceiling is not mapped"
+    );
+    let second = fill(&env, "b");
+    assert!(
+        second > 2 * first,
+        "the larger ceiling holds more: {first} then {second}"
+    );
+    env.resize(0).unwrap();
+    assert_eq!(
+        env.info().map_size,
+        4 << 20,
+        "resize(0) keeps a higher ceiling"
+    );
 }

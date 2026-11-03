@@ -682,7 +682,14 @@ impl EnvInner {
         let Some(snap) = read_snapshot_at(backing, self.page_size, t)? else {
             return Ok(None);
         };
-        check_snapshot_backed(backing, self.page_size, &snap)?;
+        match check_snapshot_backed(backing, self.page_size, &snap) {
+            // ADR-0036: with map growth on, follow another process's growth
+            // instead of returning `MapResized`.
+            Err(Error::Mdb(MdbError::MapResized)) if self.follow_growth(&snap)? => {
+                check_snapshot_backed(backing, self.page_size, &snap)?;
+            }
+            other => other?,
+        }
         let snap = Arc::new(snap);
         self.snap_cell.install_if_newer(Arc::clone(&snap));
         Ok(Some(snap))
@@ -1322,15 +1329,20 @@ impl Env {
                 ))
             });
         }
-        // ADR-0036: with map growth on, a non-zero size sets the ceiling;
-        // the logical size keeps what has been grown, within the new ceiling.
+        // ADR-0036: with map growth on, a non-zero size sets the ceiling and
+        // the logical size keeps what has been grown, within it; `0` adopts
+        // the meta's size as the logical size and raises the ceiling to it.
+        // Relaxed: see the field; the writer locks are held.
         let size = match inner.map_ceiling() {
             Some(_) if new_size != 0 => {
-                // Relaxed: see the field; the writer locks are held.
                 inner.map_ceiling.store(size, Ordering::Relaxed);
                 inner.map_size().min(size).max(min)
             }
-            _ => size,
+            Some(_) => {
+                inner.map_ceiling.fetch_max(size, Ordering::Relaxed);
+                size
+            }
+            None => size,
         };
         inner.backing_ref().grow_map(size).map_err(Error::Io)?;
         // The guard's drop releases both writer locks.

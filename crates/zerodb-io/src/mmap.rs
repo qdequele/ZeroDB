@@ -14,7 +14,10 @@
 //! 2. **Nothing faults past EOF.** Readers dereference only pages a committed
 //!    snapshot references, all inside the file (SPEC 06 REC-14). Under
 //!    `WRITE_MAP`, the writer grows the file to the logical map size before it
-//!    stores through the map (SPEC 04 §6.4). No process truncates the file.
+//!    stores through the map (SPEC 04 §6.4), at its begin and before each
+//!    growth inside the txn (ADR-0036). A reader that follows another
+//!    process's growth raises the logical size only to a committed snapshot's
+//!    size, which lies inside the file. No process truncates the file.
 //! 3. **One writer, writing only unshared pages.** One write txn at a time
 //!    across processes (TXN-6, ADR-0023 §2). It writes only pages no live
 //!    snapshot references (TXN-62: fresh pages, or pages freed before the
@@ -24,7 +27,12 @@
 //! 4. **No live borrow is rewritten.** A spilling write txn rewrites one of its
 //!    own pages only at the start of a later `&mut` call, when no borrow into
 //!    it is live (TXN-39), and re-derives its whole-map view after each spill
-//!    (TXN-71).
+//!    (TXN-71) and after each growth of the map inside the txn (ADR-0036).
+//!
+//! These invariants are about file pages, not about one mapping: an older
+//! mapping and a newer one show the same page-cache pages, so a store made
+//! through either is visible through both, and a flush through the newest
+//! mapping writes back stores made through an older one (tested below).
 //!
 //! So no `&[u8]` that safe code reads is mutated while it is borrowed.
 
@@ -304,7 +312,7 @@ pub(crate) struct MapRegions {
 // before Drop.
 unsafe impl Send for MapRegions {}
 // SAFETY: as for `Send`. Shared access only loads `current` (atomically) and
-// reads immutable, never-freed views and mappings; `publish` mutates `owned`
+// reads immutable, never-freed views and mappings; `update` mutates `owned`
 // under the mutex.
 unsafe impl Sync for MapRegions {}
 
@@ -334,10 +342,10 @@ impl MapRegions {
 
     /// One Acquire load: a consistent (bytes, map_size).
     pub(crate) fn view(&self) -> (&Mapping, u64) {
-        // Acquire: pairs with the Release in `publish`; the view and its
+        // Acquire: pairs with the Release in `publish_locked`; the view and its
         // mapping were fully built before the store.
         let v = self.current.load(Ordering::Acquire);
-        // SAFETY: `v` came from `Box::into_raw` in `publish`/`new` and is
+        // SAFETY: `v` came from `Box::into_raw` in `publish_locked`/`new` and is
         // recorded in `owned`; views and mappings are freed only in Drop
         // (`&mut self`), so both outlive `&self`. No `&mut` to them ever
         // exists after publication.
@@ -346,10 +354,46 @@ impl MapRegions {
         (unsafe { &*v.mapping }, v.map_size)
     }
 
-    /// Publish `map_size`, adding `new_mapping` if given. Callers hold the
-    /// writer lock, so publications are serialized.
+    /// Publish `map_size`, adding `new_mapping` if given, unconditionally
+    /// (the tests' direct path; the engine publishes through
+    /// [`MapRegions::update`]).
+    #[cfg(test)]
     pub(crate) fn publish(&self, new_mapping: Option<Mapping>, map_size: u64) {
         let mut owned = self.owned.lock().expect("map regions poisoned");
+        self.publish_locked(&mut owned, new_mapping, map_size);
+    }
+
+    /// Decide and publish a new view under the regions mutex (ADR-0036):
+    /// `plan` gets the current mapping's length and logical size, read under
+    /// the mutex, and returns the view to publish (a new mapping or `None`
+    /// to keep the current one, and the logical size), or `None` to publish
+    /// nothing. Holding the mutex across the decision, the `mmap` and the
+    /// publication serializes every caller, so a caller that does not hold
+    /// the writer lock (a reader following another process's growth) can
+    /// never publish over a newer view it did not see.
+    ///
+    /// # Errors
+    ///
+    /// The error `plan` returns; nothing is published then.
+    pub(crate) fn update(
+        &self,
+        plan: impl FnOnce(u64, u64) -> std::io::Result<Option<(Option<Mapping>, u64)>>,
+    ) -> std::io::Result<()> {
+        let mut owned = self.owned.lock().expect("map regions poisoned");
+        // Relaxed: under the mutex, which orders this load after the
+        // previous publish's store.
+        let cur = self.current.load(Ordering::Relaxed);
+        // SAFETY: as in `view`: `cur` is a published, never-freed view, and
+        // so is the mapping it points to.
+        let (len, size) = unsafe { ((*(*cur).mapping).bytes().len() as u64, (*cur).map_size) };
+        if let Some((mapping, map_size)) = plan(len, size)? {
+            self.publish_locked(&mut owned, mapping, map_size);
+        }
+        Ok(())
+    }
+
+    /// Publish a view with the regions mutex held.
+    fn publish_locked(&self, owned: &mut Owned, new_mapping: Option<Mapping>, map_size: u64) {
         let mapping = match new_mapping {
             Some(m) => {
                 let p = Box::into_raw(Box::new(m));

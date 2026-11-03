@@ -44,7 +44,7 @@ tracked in GitHub issues. To propose a decision, copy
 | 0033 | [A standalone benchmark crate comparing ZeroDB with other key-value stores](adr/0033-kv-compare-bench.md) | Implemented; approval not recorded | Benchmarks, dependencies |
 | 0034 | [Trust page contents by default behind the heed API, as LMDB does](adr/0034-trusted-pages-by-default.md) | Proposed | Page validation, LMDB parity, `unsafe` policy |
 | 0035 | [One atomic word for the in-process writer lock](adr/0035-writer-lock-cell.md) | Proposed | Concurrency, performance (commit), `unsafe` policy |
-| 0036 | [Grow the memory map on demand, behind an option](adr/0036-map-growth-on-demand.md) | Accepted (Option A-min); spike done, not implemented | Memory map, concurrency, beyond LMDB |
+| 0036 | [Grow the memory map on demand, behind an option](adr/0036-map-growth-on-demand.md) | Accepted (Option A-min), implemented | Memory map, concurrency, beyond LMDB |
 | 0037 | [Bounded free-page records](adr/0037-bounded-free-page-records.md) | Proposed | On-disk format, page reclamation |
 | 0037 | [Bounded free-page records](adr/0037-bounded-free-page-records.md) | Accepted (Option C), not implemented | On-disk format, page reclamation |
 | 0037 | [Bounded free-page records](adr/0037-bounded-free-page-records.md) | Accepted (Option C), implemented | On-disk format, page reclamation |

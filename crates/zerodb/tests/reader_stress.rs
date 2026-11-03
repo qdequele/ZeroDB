@@ -35,12 +35,18 @@ const KEYSPACE: u64 = 1500;
 const READERS: usize = 8;
 
 fn open(dir: &Path, max_readers: u32) -> Env {
-    open_with(dir, max_readers, None, EnvFlags::EMPTY)
+    open_with(dir, max_readers, None, EnvFlags::EMPTY, None)
 }
 
 /// [`open`] with a dirty limit (ADR-0017) and env flags (ADR-0021: the
 /// `WRITE_MAP` in-place writer variant).
-fn open_with(dir: &Path, max_readers: u32, max_dirty_bytes: Option<usize>, flags: EnvFlags) -> Env {
+fn open_with(
+    dir: &Path,
+    max_readers: u32,
+    max_dirty_bytes: Option<usize>,
+    flags: EnvFlags,
+    initial_map_size: Option<usize>,
+) -> Env {
     let mut opts = EnvOpenOptions::new();
     opts.map_size(MAP);
     opts.page_size(PS);
@@ -48,6 +54,9 @@ fn open_with(dir: &Path, max_readers: u32, max_dirty_bytes: Option<usize>, flags
     opts.flags(flags);
     if let Some(b) = max_dirty_bytes {
         opts.max_dirty_bytes(b);
+    }
+    if let Some(n) = initial_map_size {
+        opts.initial_map_size(n);
     }
     opts.open(dir).expect("open env")
 }
@@ -129,7 +138,7 @@ fn stress_duration() -> Duration {
 /// (`static_read_txn`) shapes and hold snapshots across commits.
 #[test]
 fn stress_readers_vs_gc_churn_writer() {
-    readers_vs_churn(None, 120, EnvFlags::EMPTY);
+    readers_vs_churn(None, 120, EnvFlags::EMPTY, None);
 }
 
 /// The same stress with a writer that **spills** (ADR-0017, SPEC 04 §6.3a):
@@ -138,7 +147,7 @@ fn stress_readers_vs_gc_churn_writer() {
 /// snapshots — TXN-62/70 under concurrency. `just stress` runs it too.
 #[test]
 fn stress_readers_vs_spilling_writer() {
-    readers_vs_churn(Some(128 * PS as usize), 800, EnvFlags::EMPTY);
+    readers_vs_churn(Some(128 * PS as usize), 800, EnvFlags::EMPTY, None);
 }
 
 /// The same stress with an **in-place `WRITE_MAP`** writer (ADR-0021,
@@ -152,12 +161,32 @@ fn stress_readers_vs_spilling_writer() {
 /// `just stress` runs it for the full 180 s.
 #[test]
 fn stress_readers_vs_writemap_in_place_writer() {
-    readers_vs_churn(Some(128 * PS as usize), 800, EnvFlags::WRITE_MAP);
+    readers_vs_churn(Some(128 * PS as usize), 800, EnvFlags::WRITE_MAP, None);
 }
 
-fn readers_vs_churn(max_dirty_bytes: Option<usize>, ops_per_txn: usize, flags: EnvFlags) {
+/// The in-place `WRITE_MAP` stress with map growth on (ADR-0036, SPEC 04
+/// TXN-74): the map and the file start at 64 KiB, so the seed and the first
+/// churn txns grow both inside write txns, through several new mappings,
+/// while readers that began on older mappings keep reading. `just stress`
+/// runs it too.
+#[test]
+fn stress_readers_vs_growing_writer() {
+    readers_vs_churn(
+        Some(128 * PS as usize),
+        800,
+        EnvFlags::WRITE_MAP,
+        Some(64 << 10),
+    );
+}
+
+fn readers_vs_churn(
+    max_dirty_bytes: Option<usize>,
+    ops_per_txn: usize,
+    flags: EnvFlags,
+    initial_map_size: Option<usize>,
+) {
     let dir = TempDir::new();
-    let env = open_with(dir.path(), 64, max_dirty_bytes, flags);
+    let env = open_with(dir.path(), 64, max_dirty_bytes, flags, initial_map_size);
     let db = env.main_database();
 
     // Seed a full keyspace so readers always see a populated tree.

@@ -551,6 +551,35 @@ fn check_snapshot_in_view(
 }
 
 impl EnvInner {
+    /// Follow another process's map growth (ADR-0036): when map growth is on
+    /// and `snap` lies past this process's logical map size but within its
+    /// ceiling, raise the logical size to cover it, mapping more if needed,
+    /// and return `true`; the caller checks the snapshot again. `false` when
+    /// growth is off, the snapshot lies past the ceiling, or the backing
+    /// cannot grow, so the caller keeps returning `MapResized`, as LMDB does.
+    ///
+    /// Holds no writer lock: the backing raises the size only, under its
+    /// regions mutex, and never touches the data file, which the committed
+    /// snapshot already lies inside (the caller's file check still runs).
+    ///
+    /// # Errors
+    ///
+    /// The `mmap` error of the growth.
+    pub(crate) fn follow_growth(&self, snap: &Snapshot) -> Result<bool, Error> {
+        let Some(ceiling) = self.map_ceiling() else {
+            return Ok(false);
+        };
+        let needed = bytes_needed(snap.last_pg, self.page_size)?;
+        if needed > ceiling {
+            return Ok(false);
+        }
+        match self.backing_ref().extend_map(needed) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Ok(false),
+            Err(e) => Err(Error::Io(e)),
+        }
+    }
+
     /// The write-begin check of the writer's base against `view`, the map
     /// view the begin loaded (ADR-0023), also for a base that
     /// came from the cache: a write txn never starts with a base outside its

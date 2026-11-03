@@ -1,8 +1,8 @@
 # ADR-0036: Grow the memory map on demand, behind an option
 
 - Status: Accepted (Option A-min, without shrinking; approved by the
-  maintainer on 2026-11-02); spike done (results below), staged
-  implementation not started
+  maintainer on 2026-11-02); implemented 2026-11-02 (see Implementation),
+  measurement on a quiet Linux host owed
 - Related: issue #33; ADR-0004 (mapping strategy), ADR-0017 (spilling),
   ADR-0021 (in-place `WRITE_MAP`), ADR-0023 (multi-process access,
   amendment 15: `resize` and grow-only mappings), ADR-0026 (ranged `msync`);
@@ -376,14 +376,15 @@ no on-disk format:
    completion (`loose_run`) checked the logical size; with growth on it chose
    a different run than a fixed map would. It now checks the ceiling and the
    caller grows the map to cover the extension. Found by the differential
-   test below.
+   test below. *(Moot since on-disk format 3, ADR-0037: the free-list save
+   asks only for single pages, and `loose_run` is gone.)*
 3. **Growth at allocation in every mode is correct.** Deferring it to the
    first spill read or to commit without `WRITE_MAP` remains an optimisation;
    the spike did not need it.
 4. **Begin-time extension was not built.** Another process still gets
    `MapResized` and recovers with `resize(0)`, as the two-process tests show;
-   with point 1 that is LMDB's behaviour unchanged. Whether to add it is
-   left to the staged implementation.
+   with point 1 that is LMDB's behaviour unchanged. *(Built in the
+   implementation, as the Decision says.)*
 
 ### Tests run
 
@@ -415,6 +416,76 @@ Not measured: performance. The steady-state path is unchanged (the extra
 code runs only where `MapFull` was returned), but the three-column gate in
 Consequences still applies to the staged implementation.
 
+## Implementation (2026-11-02)
+
+Built on the spike, after merging main (on-disk format 3):
+
+- **Begin-time following.** A read or write begin of an environment with
+  the option whose snapshot lies past its logical size but within its
+  ceiling raises the logical size instead of returning `MapResized`
+  (`EnvInner::follow_growth`, from the decoded-snapshot check and the
+  write-begin base check). The raise goes through a new
+  `Backing::extend_map`, not `grow_map`: it holds no writer lock, so it
+  must never `set_len` the file (an `ftruncate` racing the writer's could
+  shorten the file), and it needs none, since a committed snapshot lies
+  inside the file. A `WRITE_MAP` write begin still grows the file to the
+  logical size under both writer locks before anything is stored.
+- **Monotonic publication.** Every decision to publish a view, and its
+  `mmap`, now runs under the regions mutex (`MapRegions::update`), and a
+  raise never lowers the logical size, so a reader's raise is serialized
+  with a writer's growth and never publishes over a newer view. Tested
+  under miri with a raising thread, a growing thread and a watcher.
+- **`resize` under the option:** a non-zero size sets the ceiling (the
+  logical size keeps what has been grown, within it); `0` adopts the meta's
+  size and raises the ceiling to it if it is lower.
+- **Growth failure (question 4):** the I/O error of the `mmap` or file
+  growth, as recommended, with the txn left as after a `MapFull`
+  (abortable, the environment not poisoned). Awaiting confirmation.
+- **Not built, by choice:** deferring growth to the first spill read or to
+  commit without `WRITE_MAP`. With the spike's design (point 1) the mapping
+  must cover the logical size at all times, and a growth costs one lazy
+  `mmap` call, so deferring would break an invariant to save nothing
+  measurable. This replaces the Decision's sentence about deferral.
+- **Docs:** SPEC 02 §8 (map growth bullet, `resize`, mapping strategy,
+  `MapFull`), SPEC 04 TXN-74 (new rule) and the begin checks, SPEC 05 GC-17,
+  the `mmap.rs` aliasing contract (stated per file page across mappings),
+  `docs/LMDB-COMPATIBILITY.md` (option row, D-028), `docs/USING.md`. D-024
+  needs no change: a `WRITE_MAP` joiner grows the file to its logical size,
+  which is its map size.
+
+### Checks run for the implementation
+
+- `cargo test --workspace` (191 test binaries) on macOS; the growth tests
+  (`map_growth.rs`, 10 tests; the `zerodb-io` mapping and flush tests; the
+  growth-failure test; the heed adapter test; the growth stress for 60 s)
+  also on Linux (aarch64 VM).
+- New tests: a process with the option follows another's growth without
+  `MapResized`, in read and write begins, with and without `WRITE_MAP`;
+  `resize` sets the ceiling and `resize(0)` keeps a higher one; a failed
+  growth returns the I/O error and leaves the env usable; raises never lower
+  the logical size, alone and concurrently with growths (miri); the heed
+  adapter's option survives the TLS retag and `MapFull` comes at the
+  ceiling; a reader/writer stress variant whose in-place `WRITE_MAP` writer
+  starts from a 64 KiB map.
+- Crash harness: 3,094 image-cut states (38 cuts after a growth), 934 mixed
+  image and SIGKILL states, 157 multi-process cycles; all verified, none
+  abandoned.
+- `just stress` at 180 s (the four reader/writer variants, including the
+  growth one, and the two-process stress), miri on `zerodb-core` and on the
+  `MapRegions` tests, `just fuzz-quick` (the four targets for their full
+  time, no crash), clippy `-D warnings` on macOS, for
+  `x86_64-unknown-linux-gnu` and with heed's `unique-txns` feature. Loom was
+  not run: the reader table is unchanged.
+
+### Performance
+
+Option off, `scripts/bench-ab.sh '^(put|commit/batch|env/txn)/'`, three
+interleaved rounds on the development Mac (Apple silicon, shared with other
+builds), before = main at `ec84097`: 22 rungs flat, 0 regressed, 2
+unreliable (LMDB drift above 3 %). The full table is in
+`benches/results/2026-11-03-map-growth-macos.md`. The steady state with the
+option on is in the same report.
+
 ## Consequences
 
 - **SPEC.** 02 §8: separate the ceiling from the mapped length; describe
@@ -443,8 +514,8 @@ Consequences still applies to the staged implementation.
 
 The maintainer approved the Decision section as written on 2026-11-02, which
 settles questions 1, 2, 3 and 5: build it now, the one-method A-min API,
-extension at txn begin under the option, and no shrinking. Question 4 stays
-open until the implementation.
+extension at txn begin under the option, and no shrinking. Question 4 is
+implemented as recommended (the I/O error) and awaits confirmation.
 
 1. **Worth doing now?** Meilisearch already reserves 2 TiB per index, so on
    ordinary 64-bit hosts it rarely sees `MapFull`; the win is on

@@ -58,38 +58,47 @@ fn map_len(n: u64) -> std::io::Result<usize> {
 /// exactly `map_size`, and a second failure is returned. Otherwise the current
 /// mapping is kept and only the logical size changes: nothing is unmapped.
 ///
-/// Callers serialize publications: they hold the writer locks (`resize`), or
-/// run at open before the backing is shared (a joiner's seed).
+/// The decision, the `mmap` and the publication run under the regions mutex
+/// ([`MapRegions::update`]), so every caller is serialized against every
+/// other: those that hold the writer locks (`resize`, a write txn's growth),
+/// one that runs at open before the backing is shared (a joiner's seed), and
+/// readers raising the size with `raise_only` (ADR-0036).
+///
+/// With `raise_only`, a size at or below the current logical size publishes
+/// nothing, so a reader never lowers the size a writer published.
 fn grow_regions(
     regions: &MapRegions,
     map_size: u64,
+    raise_only: bool,
     map: impl Fn(usize) -> std::io::Result<Mapping>,
 ) -> std::io::Result<()> {
-    let current = regions.view().0.bytes().len() as u64;
-    if map_size <= current {
-        regions.publish(None, map_size);
-        return Ok(());
-    }
-    // Geometric growth bounds the address space all mappings keep: each is
-    // at least twice the previous, so together they stay below twice the
-    // newest.
-    let wanted = map_size.max(current.saturating_mul(2));
-    let mapping = match map_len(wanted).and_then(&map) {
-        Ok(m) => m,
-        // Out of address space (`ENOMEM`), or `wanted` does not fit a
-        // `usize`, or `mmap` refused the length with `EINVAL` (which the
-        // standard library reports as `InvalidInput`): `map_size` may fit.
-        Err(e)
-            if wanted > map_size
-                && (e.raw_os_error() == Some(libc::ENOMEM)
-                    || e.kind() == std::io::ErrorKind::InvalidInput) =>
-        {
-            map(map_len(map_size)?)?
+    regions.update(|current, logical| {
+        if raise_only && map_size <= logical {
+            return Ok(None);
         }
-        Err(e) => return Err(e),
-    };
-    regions.publish(Some(mapping), map_size);
-    Ok(())
+        if map_size <= current {
+            return Ok(Some((None, map_size)));
+        }
+        // Geometric growth bounds the address space all mappings keep: each
+        // is at least twice the previous, so together they stay below twice
+        // the newest.
+        let wanted = map_size.max(current.saturating_mul(2));
+        let mapping = match map_len(wanted).and_then(&map) {
+            Ok(m) => m,
+            // Out of address space (`ENOMEM`), or `wanted` does not fit a
+            // `usize`, or `mmap` refused the length with `EINVAL` (which the
+            // standard library reports as `InvalidInput`): `map_size` may fit.
+            Err(e)
+                if wanted > map_size
+                    && (e.raw_os_error() == Some(libc::ENOMEM)
+                        || e.kind() == std::io::ErrorKind::InvalidInput) =>
+            {
+                map(map_len(map_size)?)?
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(Some((Some(mapping), map_size)))
+    })
 }
 
 /// The data file a backing maps, with what both backings do with it alike.
@@ -143,7 +152,17 @@ impl Backing for MmapBacking {
         // A read-only map past the file's end is safe: pages there fault only
         // when touched, and readers touch only pages a checked snapshot
         // references, which lie inside the file (SPEC 06 REC-1a).
-        grow_regions(&self.regions, map_size, |len| self.data.map(len, false))
+        grow_regions(&self.regions, map_size, false, |len| {
+            self.data.map(len, false)
+        })
+    }
+
+    fn extend_map(&self, map_size: u64) -> std::io::Result<()> {
+        // As `grow_map`, raising only: the caller's snapshot lies inside the
+        // file, so the read-only map needs nothing else.
+        grow_regions(&self.regions, map_size, true, |len| {
+            self.data.map(len, false)
+        })
     }
 
     fn real_disk_size(&self) -> std::io::Result<u64> {
@@ -226,7 +245,20 @@ impl Backing for WriteMapBacking {
         // The file first, so every page below the new logical size is backed
         // before the size is published. Only grows.
         self.ensure_file_len(map_size)?;
-        grow_regions(&self.regions, map_size, |len| self.data.map(len, true))
+        grow_regions(&self.regions, map_size, false, |len| {
+            self.data.map(len, true)
+        })
+    }
+
+    fn extend_map(&self, map_size: u64) -> std::io::Result<()> {
+        // Raising only, and never the file: the caller holds no writer lock,
+        // and a `set_len` racing a writer's could shorten the file. The
+        // caller's snapshot lies inside the file already, and the next
+        // write-txn begin grows the file to the new logical size under both
+        // writer locks (`ensure_file_len`) before anything is stored.
+        grow_regions(&self.regions, map_size, true, |len| {
+            self.data.map(len, true)
+        })
     }
 
     fn ensure_file_len(&self, len: u64) -> std::io::Result<()> {
@@ -784,14 +816,14 @@ mod tests {
         };
 
         // Inside the mapping: no new mapping, smaller or larger.
-        grow_regions(&regions, 40, |_| panic!("no mapping expected")).unwrap();
+        grow_regions(&regions, 40, false, |_| panic!("no mapping expected")).unwrap();
         assert_eq!(lens(&regions), (100, 40));
-        grow_regions(&regions, 100, |_| panic!("no mapping expected")).unwrap();
+        grow_regions(&regions, 100, false, |_| panic!("no mapping expected")).unwrap();
         assert_eq!(lens(&regions), (100, 100));
 
         // Past it: 2x the current mapping.
         let asked = RefCell::new(Vec::new());
-        grow_regions(&regions, 150, |len| {
+        grow_regions(&regions, 150, false, |len| {
             asked.borrow_mut().push(len);
             heap(len)
         })
@@ -800,7 +832,7 @@ mod tests {
         assert_eq!(asked.take(), vec![200]);
 
         // ENOMEM on the doubled length: retry at exactly the size.
-        grow_regions(&regions, 300, |len| {
+        grow_regions(&regions, 300, false, |len| {
             asked.borrow_mut().push(len);
             if len == 400 {
                 Err(std::io::Error::from_raw_os_error(libc::ENOMEM))
@@ -813,12 +845,90 @@ mod tests {
         assert_eq!(asked.take(), vec![400, 300]);
 
         // A second failure is returned and nothing is published.
-        let err = grow_regions(&regions, 1000, |_| {
+        let err = grow_regions(&regions, 1000, false, |_| {
             Err(std::io::Error::from_raw_os_error(libc::ENOMEM))
         })
         .unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOMEM));
         assert_eq!(lens(&regions), (300, 300));
+    }
+
+    /// ADR-0036: a raise (a reader following another process's growth)
+    /// never lowers the logical size, and raises it with the same mapping
+    /// rule as a growth; a plain growth still sets the size exactly.
+    #[test]
+    fn grow_regions_raise_only_never_lowers() {
+        use super::grow_regions;
+        use crate::mmap::{MapRegions, Mapping};
+
+        let heap = |len: usize| Ok(Mapping::Heap(vec![0u8; len].into_boxed_slice()));
+        let regions = MapRegions::new(Mapping::Heap(vec![0u8; 100].into_boxed_slice()), 80);
+        let lens = |r: &MapRegions| {
+            let (m, size) = r.view();
+            (m.bytes().len(), size)
+        };
+        grow_regions(&regions, 50, true, |_| panic!("no mapping expected")).unwrap();
+        assert_eq!(lens(&regions), (100, 80), "a lower raise publishes nothing");
+        grow_regions(&regions, 90, true, |_| panic!("no mapping expected")).unwrap();
+        assert_eq!(lens(&regions), (100, 90));
+        grow_regions(&regions, 150, true, heap).unwrap();
+        assert_eq!(
+            lens(&regions),
+            (200, 150),
+            "past the mapping: 2x, as a growth"
+        );
+        grow_regions(&regions, 120, false, |_| panic!("no mapping expected")).unwrap();
+        assert_eq!(lens(&regions), (200, 120), "a growth sets the size exactly");
+    }
+
+    /// ADR-0036: a raising thread and a growing thread publish concurrently;
+    /// every view a third thread loads is consistent, and the raise never
+    /// publishes below a size the growing thread already published. Runs
+    /// under miri, whose data-race detector checks the mutex and the
+    /// Release/Acquire pairing.
+    #[test]
+    fn concurrent_raise_and_growth_stay_monotonic() {
+        use super::grow_regions;
+        use crate::mmap::{MapRegions, Mapping};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let heap = |len: usize| Ok(Mapping::Heap(vec![0u8; len].into_boxed_slice()));
+        let rounds: u64 = if cfg!(miri) { 8 } else { 200 };
+        let regions = Arc::new(MapRegions::new(heap(64).unwrap(), 64));
+        let done = Arc::new(AtomicBool::new(false));
+        let watcher = {
+            let (regions, done) = (Arc::clone(&regions), Arc::clone(&done));
+            std::thread::spawn(move || {
+                let mut last = 0;
+                // Acquire: pairs with the Release store of `done`.
+                while !done.load(Ordering::Acquire) {
+                    let (m, size) = regions.view();
+                    assert!(
+                        m.bytes().len() as u64 >= size,
+                        "mapping shorter than its size"
+                    );
+                    assert!(size >= last, "the size went down: {last} -> {size}");
+                    last = size;
+                }
+            })
+        };
+        let raiser = {
+            let regions = Arc::clone(&regions);
+            std::thread::spawn(move || {
+                for i in 1..=rounds {
+                    grow_regions(&regions, 64 + i * 8, true, heap).unwrap();
+                }
+            })
+        };
+        for i in 1..=rounds {
+            grow_regions(&regions, 64 + i * 16, false, heap).unwrap();
+        }
+        raiser.join().expect("raiser");
+        // Release: orders the publications before the watcher's Acquire.
+        done.store(true, Ordering::Release);
+        watcher.join().expect("watcher");
+        assert_eq!(regions.view().1, 64 + rounds * 16);
     }
 
     /// A requested `map_size` above the cap is refused before the data file

@@ -463,6 +463,11 @@ impl Backing for FaultBacking {
         self.inner.grow_map(map_size)
     }
 
+    fn extend_map(&self, map_size: u64) -> std::io::Result<()> {
+        // As `grow_map`: a forward; no page content is written.
+        self.inner.extend_map(map_size)
+    }
+
     fn ensure_file_len(&self, len: u64) -> std::io::Result<()> {
         // As `grow_map`: a forward; no page content is written.
         self.inner.ensure_file_len(len)
