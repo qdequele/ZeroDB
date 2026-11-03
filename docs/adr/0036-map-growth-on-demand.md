@@ -482,9 +482,21 @@ Built on the spike, after merging main (on-disk format 3):
 Option off, `scripts/bench-ab.sh '^(put|commit/batch|env/txn)/'`, three
 interleaved rounds on the development Mac (Apple silicon, shared with other
 builds), before = main at `ec84097`: 22 rungs flat, 0 regressed, 2
-unreliable (LMDB drift above 3 %). The full table is in
-`benches/results/2026-11-03-map-growth-macos.md`. The steady state with the
-option on is in the same report.
+unreliable (LMDB drift above 3 %).
+
+Option on, the same binary with `ZERODB_BENCH_INITIAL_MAP=65536` against
+the option off, `'^(put|commit/batch)/'`: every iteration builds a fresh
+environment from a 64 KiB map, so it pays every growth (about nine) inside
+the timed region, the worst case. With heap staging, flat (16 flat, 5
+unreliable). Under `WRITE_MAP`, three rungs slower: `put/gc/ovf_across`
+1.67× (about 0.7 ms per iteration), `put/val/v4k` 1.21× (about 4 ms),
+`put/api/plain` 1.04×. A `WRITE_MAP` growth is a file extension, a new
+writable mapping, and page faults again on pages already touched through the
+old mapping. Once the map has reached its working size nothing differs.
+
+Tables: `benches/results/2026-11-03-map-growth-macos.md`; both runs are in
+the performance ledger. The quiet-host gate (Linux, and a load that grows to
+several GiB against LMDB opened at the final size) is still owed.
 
 ## Consequences
 
@@ -516,6 +528,7 @@ The maintainer approved the Decision section as written on 2026-11-02, which
 settles questions 1, 2, 3 and 5: build it now, the one-method A-min API,
 extension at txn begin under the option, and no shrinking. Question 4 is
 implemented as recommended (the I/O error) and awaits confirmation.
+Question 6 comes from the implementation's measurements.
 
 1. **Worth doing now?** Meilisearch already reserves 2 TiB per index, so on
    ordinary 64-bit hosts it rarely sees `MapFull`; the win is on
@@ -535,3 +548,10 @@ implemented as recommended (the I/O error) and awaits confirmation.
    LMDB caller would expect?
 5. **Shrinking:** confirm it stays out of scope, with compaction as the way
    to give space back.
+6. **A minimum growth step?** Growth doubles the logical size, so a map
+   started at 64 KiB grows about nine times before it reaches tens of MiB,
+   and under `WRITE_MAP` each growth costs a file extension, a new mapping
+   and page faults again (measured above). A floor on the step (libmdbx's
+   `growth_step`; for example 1/64 of the ceiling, or a fixed 16 MiB) would
+   cut early growths to one or two at no address-space cost worth counting.
+   Add it, or leave the initial size to the caller?
