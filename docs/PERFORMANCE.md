@@ -97,7 +97,7 @@ Graviton4, with the validating policy (then the default) and with trusted mode, 
 same binary (BP). This run predates the validated-pages cache sized to the
 file, which made `scan/full/big` a further 13 % faster (SC).
 
-| What | Default | Trusted | Source |
+| What | Validating | Trusted | Source |
 |---|---:|---:|---|
 | Seeks (`seek/ge/rand`, `seek/ge/seq`) | 0.92×, 0.93× | 0.89×, 0.85× | BP |
 | Seeks into gaps (`seek/ge/gap`) | 1.06× | 1.01× | BP |
@@ -300,8 +300,9 @@ Issues are tracked on [GitHub](https://github.com/qdequele/ZeroDB/issues).
   byte moves now match LMDB's exactly; what remains is bookkeeping around
   them, such as looking up pages by number where LMDB's cursor holds page
   pointers. Workloads with one delete per txn are bound by commit (#146).
-- **Overflow values and wide keys.** 1.3× by default, because the overflow
-  header is read and checked; 0.89–0.91× when both engines trust the file.
+- **Overflow values and wide keys.** 1.3× when validating, because the
+  overflow header is read and checked; 0.89–0.91× when both engines trust the
+  file, which is ZeroDB's default (ADR-0034).
 - **`WRITE_MAP`** (#13). Bulk puts are at parity since the per-page dirty bits
   (WM). Still above LMDB with `WRITE_MAP`: `put/order/append` 1.38×,
   `put/api/reserved` and `put/val/v4k` 1.12× (in-map overflow runs are
