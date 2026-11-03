@@ -25,7 +25,8 @@ fn open(dir: &Path, write_map: bool) -> Env {
     if write_map {
         opts.flags(EnvFlags::WRITE_MAP);
     }
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 /// A main DB with user entries, two named DBs (one with overflow values) and

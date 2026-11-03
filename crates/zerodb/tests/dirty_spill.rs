@@ -34,7 +34,8 @@ fn open(dir: &Path, limit: Option<usize>, flags: EnvFlags) -> Env {
     if let Some(b) = limit {
         opts.max_dirty_bytes(b);
     }
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 struct Rng(u64);

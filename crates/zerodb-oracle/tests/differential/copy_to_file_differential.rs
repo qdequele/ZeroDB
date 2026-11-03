@@ -141,11 +141,14 @@ fn collect_heed_file(copy_file: &Path, map_size: usize) -> Content {
 // ---- zerodb side --------------------------------------------------------
 
 fn build_zerodb(dir: &Path, map_size: u64) {
-    let env = ZEnvOpenOptions::new()
-        .map_size(map_size as usize)
-        .max_dbs(64)
-        .open(dir)
-        .unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe {
+        ZEnvOpenOptions::new()
+            .map_size(map_size as usize)
+            .max_dbs(64)
+            .open(dir)
+    }
+    .unwrap();
     let mut wtxn = env.write_txn().unwrap();
     let main = env.main_database();
     let mut dbs = std::collections::HashMap::new();
@@ -165,11 +168,14 @@ fn build_zerodb(dir: &Path, map_size: u64) {
 fn collect_zerodb_file(copy_file: &Path, tag: &str) -> Content {
     let dir = tmp(tag);
     std::fs::copy(copy_file, dir.join(DATA_FILE_NAME)).unwrap();
-    let env = ZEnvOpenOptions::new()
-        .max_dbs(64)
-        .flags(ZEnvFlags::READ_ONLY)
-        .open(&dir)
-        .unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe {
+        ZEnvOpenOptions::new()
+            .max_dbs(64)
+            .flags(ZEnvFlags::READ_ONLY)
+            .open(&dir)
+    }
+    .unwrap();
     let rtxn = env.read_txn().unwrap();
     let mut content: Content = Vec::new();
     let main = env.main_database();
@@ -224,11 +230,14 @@ fn run_case(zerodb_opt: ZCompaction, heed_opt: heed::CompactionOption, tag: &str
     build_zerodb(&zsrc, map_size as u64);
     let zcopy = tmp(&format!("{tag}-zcopy")).join("copy.dat");
     {
-        let env = ZEnvOpenOptions::new()
-            .map_size(map_size)
-            .max_dbs(64)
-            .open(&zsrc)
-            .unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe {
+            ZEnvOpenOptions::new()
+                .map_size(map_size)
+                .max_dbs(64)
+                .open(&zsrc)
+        }
+        .unwrap();
         env.copy_to_file(&zcopy, zerodb_opt).unwrap();
     }
     let zerodb_content = collect_zerodb_file(&zcopy, &format!("{tag}-zread"));

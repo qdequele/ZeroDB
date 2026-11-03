@@ -48,11 +48,14 @@ fn logical(env: &Env, txn: &RoTxn<'_>) -> Logical {
 /// Build a source env with main user data, three named DBs (one with big
 /// overflow values, one empty), across several commits.
 fn build_source(dir: &Path) -> Env {
-    let env = EnvOpenOptions::new()
-        .map_size(64 << 20)
-        .max_dbs(64)
-        .open(dir)
-        .unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .map_size(64 << 20)
+            .max_dbs(64)
+            .open(dir)
+    }
+    .unwrap();
 
     let mut wtxn = env.write_txn().unwrap();
     let main = env.main_database();
@@ -87,11 +90,14 @@ fn build_source(dir: &Path) -> Env {
 fn open_copy(copy_file: &Path, tag: &str) -> (PathBuf, Env) {
     let dir = tmp_dir(tag);
     std::fs::copy(copy_file, dir.join(DATA_FILE_NAME)).unwrap();
-    let env = EnvOpenOptions::new()
-        .max_dbs(64)
-        .flags(EnvFlags::READ_ONLY)
-        .open(&dir)
-        .unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .max_dbs(64)
+            .flags(EnvFlags::READ_ONLY)
+            .open(&dir)
+    }
+    .unwrap();
     (dir, env)
 }
 

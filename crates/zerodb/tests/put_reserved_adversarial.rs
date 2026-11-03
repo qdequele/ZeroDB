@@ -35,7 +35,8 @@ fn open_flags(dir: &Path, flags: EnvFlags) -> Env {
     opts.map_size(MAP);
     opts.page_size(PS);
     opts.flags(flags);
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 /// SPEC 02 §4.2 worked boundary at psize 4096: `max_node_size = 2030`; a

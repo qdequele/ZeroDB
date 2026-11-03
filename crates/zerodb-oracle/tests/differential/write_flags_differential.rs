@@ -176,7 +176,8 @@ fn env_rdonly_rejects_write() {
             o.map_size(1 << 20);
             o.max_dbs(4);
             o.page_size(4096);
-            let env = o.open(dir.path()).unwrap();
+            // SAFETY: only ZeroDB writes this environment's files.
+            let env = unsafe { o.open(dir.path()) }.unwrap();
             let mut w = env.write_txn().unwrap();
             let db = env.create_database(&mut w, None).unwrap();
             db.put(&mut w, b"k", b"v").unwrap();
@@ -187,7 +188,8 @@ fn env_rdonly_rejects_write() {
         o.max_dbs(4);
         o.page_size(4096);
         o.flags(EnvFlags::READ_ONLY);
-        let env = o.open(dir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { o.open(dir.path()) }.unwrap();
         {
             let r = env.read_txn().unwrap();
             let db = env.open_database(&r, None).unwrap().unwrap();
@@ -229,7 +231,8 @@ fn flag_notls_rotxn_is_send() {
     o.map_size(1 << 20);
     o.max_dbs(4);
     o.page_size(4096);
-    let env = o.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(dir.path()) }.unwrap();
     {
         let mut w = env.write_txn().unwrap();
         let db = env.create_database(&mut w, None).unwrap();

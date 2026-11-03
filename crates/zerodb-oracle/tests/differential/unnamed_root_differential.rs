@@ -57,7 +57,8 @@ fn dumps(pairs: &[(Vec<u8>, Vec<u8>)], dels: &[Vec<u8>]) -> (Dump, u64) {
         let mut o = ZOpts::new();
         o.map_size(MAP);
         o.page_size(4096);
-        let env = o.open(zdir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { o.open(zdir.path()) }.unwrap();
         let mut w = env.write_txn().unwrap();
         let db = env.main_database();
         for (k, v) in pairs {

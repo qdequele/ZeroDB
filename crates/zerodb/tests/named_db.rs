@@ -22,7 +22,8 @@ fn open(dir: &Path, max_dbs: u32) -> Env {
     opts.map_size(MAP);
     opts.page_size(PS);
     opts.max_dbs(max_dbs);
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 #[test]

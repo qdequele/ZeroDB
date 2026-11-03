@@ -14,7 +14,14 @@ const PS: u32 = 4096;
 const MAP: u64 = 1 << 20;
 
 fn open_env(dir: &Path) -> zerodb::Result<Env> {
-    EnvOpenOptions::new().map_size(MAP as usize).open(dir)
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    unsafe {
+        EnvOpenOptions::new()
+            .map_size(MAP as usize)
+            .file_trust(zerodb::FileTrust::VALIDATE)
+            .open(dir)
+    }
 }
 
 /// Create a small env with one committed entry, then close it.
@@ -160,20 +167,30 @@ fn copy_staging_does_not_write_through_planted_symlink() {
 #[test]
 fn open_rejects_unbounded_reader_and_db_counts() {
     let dir = TempDir::new();
-    let e = EnvOpenOptions::new()
-        .map_size(MAP as usize)
-        .max_readers(u32::MAX)
-        .open(dir.path())
-        .unwrap_err();
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let e = unsafe {
+        EnvOpenOptions::new()
+            .map_size(MAP as usize)
+            .max_readers(u32::MAX)
+            .file_trust(zerodb::FileTrust::VALIDATE)
+            .open(dir.path())
+    }
+    .unwrap_err();
     match e {
         Error::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput),
         other => panic!("expected Io(InvalidInput), got {other:?}"),
     }
-    let e = EnvOpenOptions::new()
-        .map_size(MAP as usize)
-        .max_dbs(u32::MAX)
-        .open(dir.path())
-        .unwrap_err();
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let e = unsafe {
+        EnvOpenOptions::new()
+            .map_size(MAP as usize)
+            .max_dbs(u32::MAX)
+            .file_trust(zerodb::FileTrust::VALIDATE)
+            .open(dir.path())
+    }
+    .unwrap_err();
     match e {
         Error::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::InvalidInput),
         other => panic!("expected Io(InvalidInput), got {other:?}"),

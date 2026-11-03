@@ -91,7 +91,8 @@ impl Run {
         let dir = TempDir::new();
         let mut opts = EnvOpenOptions::new();
         opts.map_size(64 << 20).page_size(psize).flags(flags);
-        let env = opts.open(dir.path()).expect("open env");
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { opts.open(dir.path()) }.expect("open env");
         let db = env.main_database();
         let path = dir.path().to_path_buf();
         Run {

@@ -1,7 +1,8 @@
-//! ADR-0014 — the opt-in trusted-file page-validation policy.
+//! ADR-0014 and ADR-0034 — the page-validation policies: trusting (the
+//! default, as LMDB) and validating (opt-in).
 //!
 //! On a valid file the trusting policy must be observably identical to the
-//! validating default: every read, write, cursor, range and nested-read result
+//! validating one: every read, write, cursor, range and nested-read result
 //! the same. These tests drive a validating env and a trusting env through the
 //! same seeded random workload and compare them after every commit, then
 //! reopen each file under the other policy. The last test pins that
@@ -36,7 +37,8 @@ fn open(dir: &Path, policy: FileTrust) -> Env {
     opts.page_size(PS);
     opts.max_dbs(4);
     opts.file_trust(policy);
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 /// xorshift64*: deterministic, dependency-free workload generator.
@@ -210,13 +212,26 @@ fn run_workload(seed: u64, a: &Env, b: &Env) {
     }
 }
 
+/// ADR-0034: with no policy chosen, the builder holds no policy and the open
+/// trusts page contents, as LMDB does.
 #[test]
-fn default_policy_validates() {
+fn default_policy_trusts() {
     let dir = TempDir::new();
     let mut opts = EnvOpenOptions::new();
-    assert_eq!(opts.get_file_trust(), FileTrust::VALIDATE);
+    assert_eq!(opts.get_file_trust(), None);
     opts.map_size(MAP);
-    let env = opts.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { opts.open(dir.path()) }.unwrap();
+    assert!(env.file_trust().is_trusted());
+}
+
+#[test]
+fn validating_policy_is_reported() {
+    let dir = TempDir::new();
+    let mut opts = EnvOpenOptions::new();
+    opts.file_trust(FileTrust::VALIDATE);
+    assert_eq!(opts.get_file_trust(), Some(FileTrust::VALIDATE));
+    let env = open(dir.path(), FileTrust::VALIDATE);
     assert!(!env.file_trust().is_trusted());
 }
 

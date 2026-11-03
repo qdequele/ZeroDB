@@ -60,7 +60,8 @@ fn zdb_open_sized(dir: &Path, map_size: Option<u64>) -> zerodb::Env {
     if let Some(m) = map_size {
         o.map_size(usize::try_from(m).unwrap());
     }
-    o.open(dir).expect("open lock-file env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { o.open(dir) }.expect("open lock-file env")
 }
 
 /// Normalize a ZeroDB begin result for comparison with [`Lmdb::begin_outcome`].
@@ -702,7 +703,8 @@ fn prev_snapshot_rounding_matches_lmdb() {
                 .max_readers(MAX_READERS)
                 .lock_file(true)
                 .map_size(usize::try_from(2 * MIB).unwrap());
-            let env = o.open(dir.path()).expect("open lock-file env");
+            // SAFETY: only ZeroDB writes this environment's files.
+            let env = unsafe { o.open(dir.path()) }.expect("open lock-file env");
             zdb_commit_one(&env);
             let info = env.info();
             // Dropped before the second generation, for the same reason as
@@ -715,7 +717,8 @@ fn prev_snapshot_rounding_matches_lmdb() {
                 .max_readers(MAX_READERS)
                 .lock_file(true)
                 .map_size(usize::try_from(16 * MIB).unwrap());
-            let env = o.open(dir.path()).expect("open lock-file env");
+            // SAFETY: only ZeroDB writes this environment's files.
+            let env = unsafe { o.open(dir.path()) }.expect("open lock-file env");
             zdb_commit_many(&env, 300);
             env.info()
         };
@@ -741,7 +744,8 @@ fn prev_snapshot_rounding_matches_lmdb() {
             .lock_file(true)
             .flags(zerodb::EnvFlags::PREV_SNAPSHOT)
             .map_size(usize::try_from(requested).unwrap());
-        let minsize_from = match po.open(dir.path()) {
+        // SAFETY: only ZeroDB writes this environment's files.
+        let minsize_from = match unsafe { po.open(dir.path()) } {
             Ok(e) => classify(e.info().map_size, prev_minsize, newest_minsize),
             Err(e) => format!("{e:?}"),
         };
@@ -751,7 +755,8 @@ fn prev_snapshot_rounding_matches_lmdb() {
             .max_readers(MAX_READERS)
             .lock_file(true)
             .flags(zerodb::EnvFlags::PREV_SNAPSHOT);
-        let zero_from = match zo.open(dir.path()) {
+        // SAFETY: only ZeroDB writes this environment's files.
+        let zero_from = match unsafe { zo.open(dir.path()) } {
             Ok(e) => classify(e.info().map_size, prev_info.map_size, newest_info.map_size),
             Err(e) => format!("{e:?}"),
         };
@@ -842,7 +847,8 @@ fn zdb_prev_snapshot_open(dir: &Path) -> zerodb::Result<zerodb::Env> {
         .lock_file(true)
         .flags(zerodb::EnvFlags::PREV_SNAPSHOT)
         .map_size(usize::try_from(MIB).unwrap());
-    o.open(dir)
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { o.open(dir) }
 }
 
 /// After an 8 MiB process committed past this process's 1 MiB map,
@@ -936,7 +942,8 @@ fn joiner_with_other_max_readers_matches_lmdb() {
                     .max_readers(n)
                     .lock_file(true)
                     .map_size(usize::try_from(MIB).unwrap());
-                match o.open(dir.path()) {
+                // SAFETY: only ZeroDB writes this environment's files.
+                match unsafe { o.open(dir.path()) } {
                     Ok(env) => ("ok".to_string(), env.info().max_readers),
                     Err(e) => (zdb_open_rc(Err(e)), 0),
                 }
@@ -977,7 +984,8 @@ fn sole_opener_after_a_larger_run_matches_lmdb() {
                     .max_readers(n)
                     .lock_file(true)
                     .map_size(usize::try_from(MIB).unwrap());
-                let env = o.open(dir.path()).expect("sole open");
+                // SAFETY: only ZeroDB writes this environment's files.
+                let env = unsafe { o.open(dir.path()) }.expect("sole open");
                 assert!(env.opened_exclusively());
                 env.info().max_readers
             })
@@ -1111,7 +1119,8 @@ fn zdb_try_open(
     if let Some(m) = map_size {
         o.map_size(usize::try_from(m).unwrap());
     }
-    o.open(dir)
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { o.open(dir) }
 }
 
 /// Write `out` to `dir/result` atomically (a reader never sees it partial).
@@ -1809,7 +1818,8 @@ fn prev_snapshot_without_a_lock_file_vs_lmdb() {
             .lock_file(false)
             .flags(zerodb::EnvFlags::PREV_SNAPSHOT)
             .map_size(usize::try_from(16 * MIB).unwrap());
-        let a = o.open(dir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let a = unsafe { o.open(dir.path()) }.unwrap();
         zdb_commit_key(&a, b"after");
         let first = zdb_read_view(&a).1;
         zdb_commit_key(&a, b"after2");

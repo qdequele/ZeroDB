@@ -350,7 +350,8 @@ fn force_sync_on_a_readonly_env_is_eacces_on_both_engines() {
         o.map_size(MAP as usize);
         o.max_dbs(4);
         o.page_size(PS);
-        let env = o.open(zdir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { o.open(zdir.path()) }.unwrap();
         let mut w = env.write_txn().unwrap();
         let db = env.create_database(&mut w, Some(b"d")).unwrap();
         db.put(&mut w, b"k", b"v").unwrap();
@@ -362,7 +363,8 @@ fn force_sync_on_a_readonly_env_is_eacces_on_both_engines() {
         o.max_dbs(4);
         o.page_size(PS);
         o.flags(zerodb::EnvFlags::READ_ONLY);
-        let env = o.open(zdir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { o.open(zdir.path()) }.unwrap();
         env.force_sync().unwrap_err()
     };
 
@@ -392,14 +394,16 @@ fn force_sync_on_a_readonly_env_is_eacces_on_both_engines() {
         o.map_size(MAP as usize);
         o.max_dbs(4);
         o.page_size(PS);
-        o.open(zdir2.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        unsafe { o.open(zdir2.path()) }.unwrap();
     }
     let mut o = zerodb::EnvOpenOptions::new();
     o.map_size(MAP as usize);
     o.max_dbs(4);
     o.page_size(PS);
     o.flags(zerodb::EnvFlags::READ_ONLY);
-    let env = o.open(zdir2.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(zdir2.path()) }.unwrap();
     match env.sync(false).unwrap_err() {
         zerodb::Error::Io(e) => assert_eq!(e.raw_os_error(), Some(EACCES)),
         other => panic!("sync(false) on RDONLY: {other:?}"),

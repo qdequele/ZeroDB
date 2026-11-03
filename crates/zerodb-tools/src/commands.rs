@@ -319,13 +319,18 @@ pub(crate) fn open_exclusive_destination(
     map_size: usize,
     verb: &str,
 ) -> Result<Env, BoxErr> {
-    let env = EnvOpenOptions::new()
-        .map_size(map_size)
-        .max_dbs(crate::common::MAX_TOOL_DBS)
-        .page_size(psize)
-        .sequential_writes(true)
-        .lock_file(true)
-        .open(env_dir)?;
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .map_size(map_size)
+            .max_dbs(crate::common::MAX_TOOL_DBS)
+            .page_size(psize)
+            .sequential_writes(true)
+            .lock_file(true)
+            .file_trust(zerodb::FileTrust::VALIDATE)
+            .open(env_dir)
+    }?;
     if !env.opened_exclusively() {
         return Err(format!(
             "refusing to {verb} {}: another process has the env open",

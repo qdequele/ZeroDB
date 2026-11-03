@@ -18,11 +18,14 @@ use zerodb::{Env, EnvOpenOptions, DATA_FILE_NAME, HEED_DATA_FILE_NAME};
 /// Build an env under an explicit data-file name and close it (tools are
 /// offline; the engine registry also keys per canonical dir).
 fn build_env(dir: &Path, name: &str, marker: &[u8]) {
-    let env: Env = EnvOpenOptions::new()
-        .map_size(1 << 20)
-        .data_file_name(name)
-        .open(dir)
-        .unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env: Env = unsafe {
+        EnvOpenOptions::new()
+            .map_size(1 << 20)
+            .data_file_name(name)
+            .open(dir)
+    }
+    .unwrap();
     let mut wtxn = env.write_txn().unwrap();
     env.main_database().put(&mut wtxn, b"k", marker).unwrap();
     wtxn.commit().unwrap();

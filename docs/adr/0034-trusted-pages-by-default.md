@@ -1,6 +1,6 @@
-# ADR-0034: Trust page contents by default behind the heed API, as LMDB does
+# ADR-0034: Trust page contents by default, as LMDB does
 
-- Status: Proposed (awaiting maintainer approval; no code changed yet)
+- Status: **Accepted (Option B, maintainer, 2026-11-02)**
 - Related: ADR-0014 (the trusted-file policy this makes the default),
   divergence D-019, issue #147
 - Date: 2026-11-01
@@ -100,57 +100,75 @@ Status quo. Rejected by the maintainer's decision above.
 
 ## Decision
 
-**Proposed: Option A.** The heed API is the surface ZeroDB is a drop-in
-for, and its `open` already carries an `unsafe` contract that covers the
-file. The native API stays safe and validating, which is the right default
-for the tools that inspect files of unknown origin.
+**Option B.** Both `EnvOpenOptions` default to trusting, and
+`zerodb::EnvOpenOptions::open` becomes `unsafe fn`, carrying the same
+contract as heed's `open`. The maintainer chose one default across the
+project, matching LMDB's model on every API, over keeping the native `open`
+safe.
+
+The drafted recommendation was Option A; it is superseded by this decision.
+
+### How the default is held
+
+`zerodb-core`'s open functions are safe and take a `FileTrust`, so a
+trusting value obtained without `unsafe` would let safe code open a file
+without validation. The builders therefore never store the trusting value
+as their default: they store `Option<FileTrust>`, `None` meaning "the
+default", and `unsafe fn open` resolves `None` to
+`FileTrust::trust_contents()` under its own contract.
+`zerodb::EnvOpenOptions::get_file_trust` returns that `Option`.
+`FileTrust::trust_contents` stays `unsafe`.
+
+### Answers to the review questions
+
+1. Option B.
+2. Both `open`s state the file-integrity obligation in full in their
+   `# Safety` section: heed's wording covers a file modified while mapped,
+   not one that was already corrupt or hostile when opened.
+3. The validated-pages cache stays, built only under the validating policy.
 
 ## Consequences
 
-- **Divergence D-019** changes from "opt-in, default validating" to: behind
-  the heed API, pages are trusted by default, as in LMDB; validation is an
-  opt-in extension. With the default, D-019 stops being a behaviour
-  difference from LMDB for heed users; the native default is a ZeroDB-only
-  API and is recorded as such.
-- **`unsafe` policy (`CONTRIBUTING.md`):** add the one `trust_contents()` call in
-  `heed_zerodb::EnvOpenOptions::open` to the list of sanctioned `unsafe` in
-  `heed-zerodb`.
-- **Docs to update in the implementing change:** `heed_zerodb::EnvOpenOptions::open`
-  (`# Safety`: the file must have been written by ZeroDB and not modified by
-  anything else, or the caller opts into `FileTrust::VALIDATE`) and
-  `file_trust`; `docs/LMDB-COMPATIBILITY.md`; `docs/LMDB-COMPATIBILITY.md` D-019;
-  `docs/SPEC/02-pages.md` and `docs/SPEC/04-txn-mvcc.md` (which policy is the
-  default where); ADR-0014's status line ("default since ADR-0034 behind the
-  heed API"); `docs/PERFORMANCE.md` (the trusted column becomes the
-  default one for consumers); README wording that promises a typed error on
-  corruption.
+- **Divergence D-019** changes from "opt-in, default validating" to: pages
+  are trusted by default, as in LMDB; validation is an opt-in extension.
+  D-019 stops being a behaviour difference from LMDB.
+- **Native API break:** `zerodb::EnvOpenOptions::open` is `unsafe fn`, and
+  `get_file_trust` returns `Option<FileTrust>`. ZeroDB has no external users
+  of the native API yet.
+- **`unsafe` policy (`CONTRIBUTING.md`):** calling the native `open` is
+  sanctioned wherever an environment is opened (the heed adapter, tools,
+  tests, benches, examples, the oracle), each call with a `// SAFETY:`
+  comment naming why the file is ZeroDB's own or that the call validates.
+  The adapter's `open` resolves the default inside its own `unsafe fn`.
+- **`zerodb-tools`** opts into `FileTrust::VALIDATE` for every environment
+  it opens: it inspects files of uncertain origin. `check` validates fully
+  regardless.
+- **Docs to update in the implementing change:** both `open`s (`# Safety`:
+  the file must have been written by ZeroDB and not modified by anything
+  else, or the caller opts into `FileTrust::VALIDATE`) and both
+  `file_trust` setters; `docs/LMDB-COMPATIBILITY.md` and its D-019;
+  `docs/SPEC/02-pages.md` and `docs/SPEC/04-txn-mvcc.md` (which policy is
+  the default); ADR-0014's status line; `docs/PERFORMANCE.md` (the trusted
+  column becomes the default one); README wording that promises a typed
+  error on corruption.
 - **Snapshots of uncertain origin:** Meilisearch can import a raw snapshot a
   user supplied. With LMDB that file is trusted today, so this matches
   current exposure; the `open` docs point to `zerodb-tools check`, or to
   opening such a file with `FileTrust::VALIDATE`.
 - **Tests:**
-  - tests that open corrupt or hostile files through `heed-zerodb` set
-    `FileTrust::VALIDATE` explicitly; hostile-image fuzzing
-    (`fuzz/fuzz_targets/fuzz_image_open.rs`) and `fuzz_page_decode` stay on
-    the validating policy;
-  - the oracle differentials, `diff_ops` fuzzing, crash harness and heed
-    suite run on valid files and must pass unchanged under the new default;
-  - a test that the adapter's default is trusting and that `file_trust(VALIDATE)`
-    restores typed errors on a corrupted page.
+  - tests that open corrupt or hostile files set `FileTrust::VALIDATE`
+    explicitly; hostile-image fuzzing (`fuzz/fuzz_targets/fuzz_image_open.rs`)
+    and `fuzz_page_decode` open through `zerodb-core` with the validating
+    policy and are unchanged;
+  - the crash harness opens with `FileTrust::VALIDATE`: its files are valid
+    only if the engine is, and a torn file must be a reported failure rather
+    than undefined behaviour;
+  - the oracle differentials, `diff_ops` fuzzing and the heed suite run on
+    valid files and must pass unchanged under the new default;
+  - tests that both builders default to trusting and that
+    `file_trust(VALIDATE)` restores typed errors on a corrupted page.
 - **Measurement gate (three columns: LMDB, ZeroDB before, ZeroDB after):**
   the read ladder `^(get|seek|scan)/`, `commit/batch/n1`, and the
   Meilisearch and hannoy consumer suites (`scripts/consumer.sh`) on Graviton4.
   Keep the change if no consumer workload regresses; the micro-ladder is
   expected to match today's trusting column.
-
-## Open questions for human review
-
-1. **Option A or B?** A keeps the native API safe and validating; B gives one
-   default at the cost of an `unsafe` native `open`.
-2. **Is heed's `open` contract enough**, or should the adapter's `# Safety`
-   section state the file-integrity obligation in full (recommended: state
-   it in full, since heed's wording covers a file modified while mapped, not
-   a file that was already corrupt or hostile when opened)?
-3. **Validated-pages cache:** keep it allocated only under the validating
-   policy (recommended; verify it is not built when trusting), or remove it
-   once no consumer validates?

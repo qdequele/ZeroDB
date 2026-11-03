@@ -28,7 +28,7 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 BIN=${BIN:-$HERE/target/release/kv-compare}
 DATA=${DATA:-/data/kvc}
-ENGINES=(${ENGINES:-lmdb zerodb fjall rocksdb redb sqlite zerodb-trusted})
+ENGINES=(${ENGINES:-lmdb zerodb fjall rocksdb redb sqlite zerodb-validating})
 MEM_CAP=${MEM_CAP:-8G}
 CACHE_MIB=${CACHE_MIB:-2048}
 SMALL=${SMALL:-10000000}

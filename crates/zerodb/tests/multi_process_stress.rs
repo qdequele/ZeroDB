@@ -39,7 +39,8 @@ fn open(dir: &Path) -> Env {
         .page_size(4096)
         .max_readers(64)
         .lock_file(true);
-    o.open(dir).expect("open lock-file env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { o.open(dir) }.expect("open lock-file env")
 }
 
 /// A spawned child process that is killed and reaped when dropped, so a

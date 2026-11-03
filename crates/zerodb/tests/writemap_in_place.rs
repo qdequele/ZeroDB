@@ -31,7 +31,8 @@ fn open(dir: &Path, flags: EnvFlags) -> Env {
         .page_size(PS)
         .max_dbs(4)
         .flags(flags);
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 struct Rng(u64);

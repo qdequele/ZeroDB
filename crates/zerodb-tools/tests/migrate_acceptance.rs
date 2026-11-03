@@ -179,11 +179,14 @@ fn real_index_proxy_point_queries_match() {
 
     // Reopen the migrated zerodb env and point-query several keys per DB,
     // comparing the exact value bytes to the LMDB source.
-    let env = ZEnvOpenOptions::new()
-        .max_dbs(64)
-        .flags(EnvFlags::READ_ONLY)
-        .open(&dst)
-        .unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe {
+        ZEnvOpenOptions::new()
+            .max_dbs(64)
+            .flags(EnvFlags::READ_ONLY)
+            .open(&dst)
+    }
+    .unwrap();
     let rtxn = env.read_txn().unwrap();
 
     // main
@@ -223,11 +226,14 @@ fn real_index_proxy_point_queries_match() {
 fn migrate_rejects_a_zerodb_data_mdb_source_by_magic() {
     let src = TempDir::new("zdb-source");
     // A ZeroDB env named `data.mdb`, i.e. what the adapter produces.
-    let env = ZEnvOpenOptions::new()
-        .map_size(1 << 20)
-        .data_file_name(zerodb::HEED_DATA_FILE_NAME)
-        .open(&src)
-        .unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe {
+        ZEnvOpenOptions::new()
+            .map_size(1 << 20)
+            .data_file_name(zerodb::HEED_DATA_FILE_NAME)
+            .open(&src)
+    }
+    .unwrap();
     let mut wtxn = env.write_txn().unwrap();
     env.main_database().put(&mut wtxn, b"k", b"v").unwrap();
     wtxn.commit().unwrap();

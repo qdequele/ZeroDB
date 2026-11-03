@@ -21,7 +21,9 @@ heed = { git = "https://github.com/qdequele/ZeroDB", tag = "v0.2.0" }
 ```rust
 use zerodb::EnvOpenOptions;
 
-let env = EnvOpenOptions::new().map_size(10 * 1024 * 1024).max_dbs(4).open("books.db")?;
+// SAFETY: only ZeroDB writes this environment's files (the contract of
+// `open`, as in heed and LMDB).
+let env = unsafe { EnvOpenOptions::new().map_size(10 * 1024 * 1024).max_dbs(4).open("books.db")? };
 
 let mut wtxn = env.write_txn()?;
 let db = env.create_database(&mut wtxn, Some(&b"books"[..]))?;
@@ -48,9 +50,10 @@ A runnable version is in [`crates/zerodb/examples/basic.rs`](crates/zerodb/examp
   with loom.
 - **A heed drop-in.** Meilisearch and hannoy run on it unmodified, at LMDB's
   speed.
-- **Safer by default.** Every page read from the file is validated, so a
-  corrupt file returns an error instead of undefined behavior, and each meta
-  page carries a checksum.
+- **Validation when you need it.** Pages are trusted by default, as LMDB
+  trusts them. With `FileTrust::VALIDATE`, every page read from the file is
+  validated, so a corrupt file returns an error instead of undefined behavior.
+  Each meta page carries a checksum either way.
 - **A few things LMDB lacks:** nested read transactions inside a write
   transaction, a reader list, compaction with bounded memory and an atomic
   destination, and opt-in fast paths for sequential writes.

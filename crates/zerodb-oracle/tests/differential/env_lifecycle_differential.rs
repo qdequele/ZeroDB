@@ -167,7 +167,13 @@ fn garbage_store_error_kind_parity() {
     let zerodb_kind = {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join(zerodb::DATA_FILE_NAME), vec![0xFFu8; 8192]).unwrap();
-        match zerodb::EnvOpenOptions::new().open(dir.path()) {
+        // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+        // error; nothing else modifies the file while it is mapped.
+        match unsafe {
+            zerodb::EnvOpenOptions::new()
+                .file_trust(zerodb::FileTrust::VALIDATE)
+                .open(dir.path())
+        } {
             Ok(_) => panic!("zerodb unexpectedly opened a garbage store"),
             Err(e) => normalize_zerodb(e),
         }

@@ -69,7 +69,8 @@ fn readers_full_boundary_matches_lmdb() {
         let mut opts = zerodb::EnvOpenOptions::new();
         opts.map_size(MAP);
         opts.max_readers(MAX_READERS);
-        opts.open(z_dir.path()).expect("open zerodb env")
+        // SAFETY: only ZeroDB writes this environment's files.
+        unsafe { opts.open(z_dir.path()) }.expect("open zerodb env")
     };
     {
         let mut wtxn = zenv.write_txn().expect("zerodb wtxn");
@@ -136,7 +137,8 @@ fn held_readers_unaffected_by_exhaustion() {
         let mut opts = zerodb::EnvOpenOptions::new();
         opts.map_size(MAP);
         opts.max_readers(2);
-        opts.open(z_dir.path()).expect("open zerodb env")
+        // SAFETY: only ZeroDB writes this environment's files.
+        unsafe { opts.open(z_dir.path()) }.expect("open zerodb env")
     };
     let zdb = zenv.main_database();
     {

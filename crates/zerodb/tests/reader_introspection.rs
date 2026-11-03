@@ -27,7 +27,8 @@ fn open(dir: &Path, max_readers: u32) -> Env {
     opts.map_size(8 << 20);
     opts.max_dbs(4);
     opts.max_readers(max_readers);
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 /// Commit one no-op-ish write so the env's txnid advances by exactly 1.
