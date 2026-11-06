@@ -180,7 +180,8 @@ impl ZerodbEngine {
         opts.max_dbs(MAX_DBS);
         opts.page_size(PAGE_SIZE);
         opts.flags(env_flags(mode));
-        opts.open(dir)
+        // SAFETY: only ZeroDB writes this environment's files.
+        unsafe { opts.open(dir) }
     }
 
     fn env(&self) -> &Env {

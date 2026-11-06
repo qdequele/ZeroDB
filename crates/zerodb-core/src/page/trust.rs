@@ -1,24 +1,28 @@
-//! The env's page-validation policy (ADR-0014).
+//! The env's page-validation policy (ADR-0014, ADR-0034).
 //!
 //! Every page view in this module rests on one contract: the cells an
 //! accessor reads without bounds checks were proven in-bounds when the view
-//! was built (the unchecked-read view contract). By default ZeroDB proves it itself, by
-//! walking every cell of a map page the first time a txn sees it. An env
-//! opened with [`FileTrust::trust_contents`] instead takes the proof from the
-//! caller, as LMDB does for every page: only the O(1) header checks (page
-//! type, reserved fields, free-space bounds) still run.
+//! was built (the unchecked-read view contract). Under
+//! [`FileTrust::VALIDATE`] ZeroDB proves it itself, by walking every cell of a
+//! map page the first time a txn sees it. An env opened with
+//! [`FileTrust::trust_contents`] instead takes the proof from the caller, as
+//! LMDB does for every page: only the O(1) header checks (page type, reserved
+//! fields, free-space bounds) still run. The `unsafe` `open`s of the `zerodb`
+//! and heed APIs trust by default, under their own contract (ADR-0034).
 
-/// Whether an env validates the cells of the pages it reads from the file
-/// (the default) or trusts them (ADR-0014).
+/// Whether an env validates the cells of the pages it reads from the file or
+/// trusts them (ADR-0014).
 ///
 /// The trusting value can only be made through the `unsafe`
-/// [`FileTrust::trust_contents`], so no safe code can switch validation off.
+/// [`FileTrust::trust_contents`], so no safe code can switch validation off;
+/// [`FileTrust::default`] is the validating value.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FileTrust(bool);
 
 impl FileTrust {
-    /// Validate every map page's cells on first sight in each txn (the
-    /// default; a corrupt or hostile file yields a typed error).
+    /// Validate every map page's cells on first sight in each txn, so that a
+    /// corrupt or hostile file yields a typed error. An opt-in: environments
+    /// trust page contents by default, as LMDB does (ADR-0034).
     pub const VALIDATE: FileTrust = FileTrust(false);
 
     /// Trust the cells of the pages read from the data file.

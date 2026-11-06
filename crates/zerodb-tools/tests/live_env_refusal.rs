@@ -138,11 +138,14 @@ fn hold_adapter(dir: &Path, ctl: &Path) {
 /// Open a native environment (`zerodb.dat`, `zerodb.lock`), commit `live`,
 /// and hold the environment open.
 fn hold_native(dir: &Path, ctl: &Path) {
-    let env = EnvOpenOptions::new()
-        .map_size(16 << 20)
-        .lock_file(true)
-        .open(dir)
-        .expect("open native env");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .map_size(16 << 20)
+            .lock_file(true)
+            .open(dir)
+    }
+    .expect("open native env");
     let mut w = env.write_txn().unwrap();
     env.main_database().put(&mut w, b"live", b"1").unwrap();
     w.commit().unwrap();
@@ -259,7 +262,8 @@ fn load_refuses_a_destination_another_process_has_open() {
     assert!(err.contains("refusing"), "message: {err}");
     stop(child, &ctl);
 
-    let env: Env = EnvOpenOptions::new().open(&dir).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env: Env = unsafe { EnvOpenOptions::new().open(&dir) }.unwrap();
     let r = env.read_txn().unwrap();
     let main = env.main_database();
     assert_eq!(main.get(&r, b"live").unwrap(), Some(&b"1"[..]));
@@ -309,7 +313,8 @@ fn check_raw_fallback_refuses_while_the_env_is_live() {
 fn check_raw_fallback_reports_a_closed_corrupt_env() {
     let dir = TempDir::new("check-closed");
     {
-        let env: Env = EnvOpenOptions::new().map_size(1 << 20).open(&dir).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env: Env = unsafe { EnvOpenOptions::new().map_size(1 << 20).open(&dir) }.unwrap();
         let mut w = env.write_txn().unwrap();
         env.main_database().put(&mut w, b"k", b"v").unwrap();
         w.commit().unwrap();

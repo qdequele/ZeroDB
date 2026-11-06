@@ -39,7 +39,8 @@ fn open(dir: &Path) -> Env {
     opts.map_size(32 << 20);
     opts.max_dbs(16);
     opts.max_readers(32);
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 /// Descending byte order — the sharpest possible test ordering, because every

@@ -37,7 +37,8 @@ fn open(dir: &std::path::Path) -> Env {
     let mut o = EnvOpenOptions::new();
     o.map_size(256 << 20);
     o.page_size(PS);
-    o.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { o.open(dir) }.expect("open env")
 }
 
 /// A database's contents, key to value.

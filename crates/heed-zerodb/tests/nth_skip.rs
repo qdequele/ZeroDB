@@ -262,9 +262,13 @@ fn build_corruptible(dir: &std::path::Path, big: &[u8]) {
     w.commit().unwrap();
 }
 
+/// Reopen a file `damage_page` may have damaged: validating, so the damage
+/// is a typed error rather than undefined behaviour (ADR-0034).
 fn reopen(dir: &std::path::Path) -> (heed::Env<WithoutTls>, Database<Bytes, Bytes>) {
     let mut o = EnvOpenOptions::new().read_txn_without_tls();
-    o.map_size(16 << 20).max_dbs(1);
+    o.map_size(16 << 20)
+        .max_dbs(1)
+        .file_trust(heed::FileTrust::VALIDATE);
     let env = unsafe { o.open(dir) }.unwrap();
     let r = env.read_txn().unwrap();
     let db = env.open_database(&r, None).unwrap().unwrap();

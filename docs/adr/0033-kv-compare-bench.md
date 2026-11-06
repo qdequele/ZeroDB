@@ -71,10 +71,11 @@ are set equal (`benches/kv-compare/README.md`).
 - The comparison is reproducible from this repository: `run.sh` on a Linux
   host, `report.py` for tables and charts.
 - `unsafe` in the crate: the two `heed` opens (the same contract as
-  `zerodb-oracle`), the `FileTrust::trust_contents` call for the
-  trusted-file engine, one `getrusage` call, and one `sync` call before reading
-  the device write counter. This ADR extends the
-  `unsafe` policy to cover them.
+  `zerodb-oracle`), one `getrusage` call, and one `sync` call before reading
+  the device write counter. This ADR extends the `unsafe` policy to cover
+  them. Since ADR-0034 ZeroDB trusts page contents by default, so the
+  `zerodb` engine reads pages as LMDB does and the extra ZeroDB engine is
+  `zerodb-validating`, which opts into `FileTrust::VALIDATE`.
 - A RocksDB build on macOS needs `libclang` for its bindings
   (`LIBCLANG_PATH`); the crate README says how.
 - `cargo fmt` and `cargo clippy` at the workspace root do not reach the crate;

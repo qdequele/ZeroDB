@@ -9,6 +9,9 @@
 //!   earlier point always has the same bytes;
 //! - short read txns (each one hitting the cache for pages an earlier txn
 //!   validated) return exactly the model's contents while pgnos are reused.
+//!
+//! Only the validating policy builds that cache, so every env here opts into
+//! `FileTrust::VALIDATE`.
 
 mod common;
 use common::TempDir;
@@ -16,7 +19,7 @@ use common::TempDir;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
-use zerodb::{Env, EnvOpenOptions};
+use zerodb::{Env, EnvOpenOptions, FileTrust};
 
 const PS: u32 = 4096;
 
@@ -25,7 +28,11 @@ fn open(dir: &Path) -> Env {
     opts.map_size(64 << 20);
     opts.page_size(PS);
     opts.max_dbs(4);
-    opts.open(dir).expect("open env")
+    // The cache under test exists only under the validating policy.
+    opts.file_trust(FileTrust::VALIDATE);
+    // SAFETY: opened with `FileTrust::VALIDATE`; only ZeroDB writes this
+    // environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 /// SPEC 02 §2 common header: pgno at 0, txnid stamp at 8, flags at 16.
@@ -284,7 +291,10 @@ fn aborted_spills_seed_nothing_and_reuse_stays_correct() {
     opts.page_size(PS);
     // Floor of the knob: 128 dirty pages, so a few-hundred-page txn spills.
     opts.max_dirty_bytes(1);
-    let env = opts.open(dir.path()).expect("open env");
+    opts.file_trust(FileTrust::VALIDATE);
+    // SAFETY: opened with `FileTrust::VALIDATE`; only ZeroDB writes this
+    // environment's files.
+    let env = unsafe { opts.open(dir.path()) }.expect("open env");
     let db = env.main_database();
 
     // A committed base so the aborted txn below COWs (and spills) real pages.
@@ -372,7 +382,10 @@ fn reused_read_txn_memory_carries_nothing_across_txns() {
         opts.map_size(64 << 20);
         opts.page_size(PS);
         opts.max_dbs(9);
-        opts.open(other_dir.path()).expect("open env")
+        opts.file_trust(FileTrust::VALIDATE);
+        // SAFETY: opened with `FileTrust::VALIDATE`; only ZeroDB writes this
+        // environment's files.
+        unsafe { opts.open(other_dir.path()) }.expect("open env")
     };
     let mut w = env.write_txn().unwrap();
     let dbs = [

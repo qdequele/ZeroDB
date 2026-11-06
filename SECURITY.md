@@ -35,14 +35,17 @@ same assumption LMDB makes.
 
 **What it does not promise**
 
-- **Safety against a hostile or corrupt database file.** The meta CRC detects
-  accidental tearing, not tampering; it is unkeyed. A first-release hardening
-  pass made the open path and the read path refuse out-of-range page
-  references, zero-child branch pages, and hostile free-page lists with typed
-  errors, and added a fuzz target that feeds arbitrary bytes to `open`. That
-  work is a best effort, not a guarantee: a crafted file can still be able to
-  cause a panic or an out-of-memory in `zerodb-tools`. Run
-  `zerodb-tools check` on files you trust or in a sandbox.
+- **Safety against a hostile or corrupt database file.** By default ZeroDB
+  trusts the pages it reads, as LMDB does: `open` is `unsafe`, and a corrupt
+  file is undefined behavior (ADR-0034). The meta CRC detects accidental
+  tearing, not tampering; it is unkeyed. With `FileTrust::VALIDATE`, which
+  `zerodb-tools` always uses, the open path and the read path refuse
+  out-of-range page references, malformed cells, zero-child branch pages,
+  and hostile free-page lists with typed errors, and a fuzz target feeds
+  arbitrary bytes to `open`. That hardening is a best effort, not a
+  guarantee: a crafted file can still be able to cause a panic or an
+  out-of-memory in `zerodb-tools`. Run `zerodb-tools check` on files you
+  trust or in a sandbox.
 - **Cross-process access by untrusted processes.** Several processes may
   open one environment through its lock file (on by default, ADR-0023), but
   every one of them must be a cooperating ZeroDB process: any process that

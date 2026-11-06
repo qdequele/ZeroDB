@@ -34,7 +34,8 @@ fn open(dir: &Path, growth: bool, flags: EnvFlags) -> Env {
     if growth {
         opts.initial_map_size(INITIAL);
     }
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 struct Rng(u64);
@@ -202,7 +203,8 @@ fn map_full_at_the_ceiling(flags: EnvFlags) {
         if growth {
             opts.initial_map_size(INITIAL);
         }
-        let env = opts.open(dir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { opts.open(dir.path()) }.unwrap();
         let db = env.main_database();
         let mut committed = 0u32;
         loop {
@@ -306,7 +308,8 @@ fn open_shared(dir: &Path, growth: bool, map: usize, flags: EnvFlags) -> Env {
     if growth {
         opts.initial_map_size(INITIAL);
     }
-    opts.open(dir).expect("open lock-file env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open lock-file env")
 }
 
 /// About 4 MiB of 3 KiB values under keys `prefix00000..`, in one txn.
@@ -456,7 +459,8 @@ fn resize_sets_the_ceiling_under_map_growth() {
         .initial_map_size(INITIAL)
         .page_size(PS)
         .flags(EnvFlags::NO_SYNC);
-    let env = opts.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { opts.open(dir.path()) }.unwrap();
     let db = env.main_database();
     let fill = |env: &Env, prefix: &str| -> u32 {
         let mut n = 0;

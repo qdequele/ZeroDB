@@ -58,7 +58,8 @@ fn open_with(
     if let Some(n) = initial_map_size {
         opts.initial_map_size(n);
     }
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 /// Deterministic value for `(key, gen)`: `[key BE 8 | gen BE 8 | payload]`,

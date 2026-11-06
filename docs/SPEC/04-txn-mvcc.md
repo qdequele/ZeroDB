@@ -692,7 +692,11 @@ dirty-page store must be built so it is.
   must fail typed, not SIGBUS (SPEC 06 REC-14). Dirty frames are exempt — a
   writer legitimately allocates pages beyond its base snapshot's `last_pg`,
   and those resolve from the dirty store before the bound is consulted.
-  **Page-validation policy (added 2026-09-28, ADR-0014):** by default a
+  **Page-validation policy (added 2026-09-28, ADR-0014; default changed
+  2026-11-02, ADR-0034):** environments opened through the `zerodb` and heed
+  `open`s trust page contents by default, as LMDB does; the validating policy
+  (`FileTrust::VALIDATE`) is opt-in, and the default of `zerodb-core`'s own
+  open functions. Under the validating policy a
   map-sourced tree page is fully validated (every cell) the first time a txn
   views it, and re-wrapped without checks on later views through the
   txn-scoped validated-pages memo. An env opened with the trusting
@@ -704,7 +708,9 @@ dirty-page store must be built so it is.
   overflow value is sliced from its head page without reading the run's header
   (ADR-0014 amendment, 2026-09-29); the slice stays bounded by the high-water. Under the
   trusting policy a corrupt page is undefined behaviour, as in LMDB; the
-  policy is the caller's `unsafe` contract (SPEC 00, `file_trust`).
+  policy is the caller's `unsafe` contract (SPEC 00, `file_trust`): the
+  contract of the `unsafe fn open` when no policy is chosen, or of
+  `FileTrust::trust_contents`.
   **Memo reuse across txns (added 2026-10-19, #25).** The memo's entries are
   keyed by (pgno, page kind), not by stamp, so they never outlive the txn
   that recorded them: every txn starts with an empty memo. Its first 8 KiB

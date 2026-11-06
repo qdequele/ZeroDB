@@ -71,8 +71,9 @@ pub struct EnvOpenOptions<T: TlsUsage = WithTls> {
     /// Page-size ZeroDB extension — no heed counterpart. `None` = engine default.
     page_size: Option<u32>,
     flags: EnvFlags,
-    /// ADR-0014 ZeroDB extension — no heed counterpart.
-    file_trust: zerodb::FileTrust,
+    /// ADR-0014 ZeroDB extension — no heed counterpart. `None` = the
+    /// default, trusting, resolved by `open` (ADR-0034).
+    file_trust: Option<zerodb::FileTrust>,
     /// ADR-0015 ZeroDB extension — no heed counterpart.
     sequential_writes: bool,
     /// ADR-0017 ZeroDB extension — no heed counterpart.
@@ -98,7 +99,7 @@ impl EnvOpenOptions<WithTls> {
             max_dbs: 0,
             page_size: None,
             flags: EnvFlags::empty(),
-            file_trust: zerodb::FileTrust::VALIDATE,
+            file_trust: None,
             sequential_writes: false,
             max_dirty_bytes: None,
             initial_map_size: None,
@@ -174,18 +175,16 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         self
     }
 
-    /// Choose the page-validation policy (**ADR-0014**).
+    /// Choose the page-validation policy (**ADR-0014**, **ADR-0034**).
     ///
-    /// **ZeroDB extension — heed has no such method**: LMDB never validates
-    /// page contents, while ZeroDB validates them by default so that a
+    /// **ZeroDB extension — heed has no such method.** By default, page
+    /// contents are trusted, as LMDB trusts them, under the contract of
+    /// [`EnvOpenOptions::open`]. [`FileTrust::VALIDATE`](zerodb::FileTrust::VALIDATE)
+    /// checks every page the first time a transaction reads it, so that a
     /// corrupt or hostile file yields an error instead of undefined
-    /// behaviour. Passing the value of the `unsafe`
-    /// [`FileTrust::trust_contents`](zerodb::FileTrust::trust_contents)
-    /// switches that off for this env, reading pages the way LMDB does; its
-    /// `# Safety` section is the contract. Code that never calls this method
-    /// keeps the validating default.
+    /// behaviour. Use it for files of uncertain origin.
     pub fn file_trust(&mut self, policy: zerodb::FileTrust) -> &mut Self {
-        self.file_trust = policy;
+        self.file_trust = Some(policy);
         self
     }
 
@@ -234,7 +233,6 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     }
 
     /// Open (or create) the environment at `path` (a directory).
-    /// `unsafe` for heed signature parity (see [`EnvOpenOptions::flags`]).
     ///
     /// Re-imposes the fork's open-time boundaries the native engine is lenient
     /// about: `max_readers(0)` → `Io(InvalidInput)`, and `map_size` not an
@@ -242,7 +240,18 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     ///
     /// # Safety
     ///
-    /// Mirrors `heed::EnvOpenOptions::open`; safe in practice for ZeroDB.
+    /// Mirrors `heed::EnvOpenOptions::open`. The caller guarantees that:
+    ///
+    /// - nothing but ZeroDB modifies the data file while it is mapped, in
+    ///   this process or another;
+    /// - unless [`EnvOpenOptions::file_trust`] is set to
+    ///   [`FileTrust::VALIDATE`](zerodb::FileTrust::VALIDATE), the data file,
+    ///   if it exists, was written by ZeroDB and has not been modified by
+    ///   anything else since. By default page contents are trusted, as in
+    ///   LMDB (ADR-0034), and a corrupt or hostile file is undefined
+    ///   behaviour. Run `zerodb check` (which always validates) on a file of
+    ///   uncertain origin, such as an imported snapshot, or open it with
+    ///   `FileTrust::VALIDATE`.
     ///
     /// # Errors
     ///
@@ -307,7 +316,9 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         // name the engine derives from `data.mdb` (ADR-0023).
         opts.data_file_name(DATA_FILE_NAME);
         opts.flags(zerodb_env_flags(self.flags));
-        opts.file_trust(self.file_trust);
+        if let Some(policy) = self.file_trust {
+            opts.file_trust(policy);
+        }
         opts.sequential_writes(self.sequential_writes);
         if let Some(b) = self.max_dirty_bytes {
             opts.max_dirty_bytes(b);
@@ -319,7 +330,9 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         // LMDB; heed's `NO_LOCK` turns it off
         // (`OBS_NOLOCK_CREATES_LOCK_FILE = false`).
         opts.lock_file(!self.flags.contains(EnvFlags::NO_LOCK));
-        let env = opts.open(path).map_err(Error::from)?;
+        // SAFETY: the caller upholds this function's contract, which is the
+        // engine `open`'s.
+        let env = unsafe { opts.open(path) }.map_err(Error::from)?;
         Ok(Env {
             inner: env,
             no_lock: self.flags.contains(EnvFlags::NO_LOCK),
@@ -1107,5 +1120,38 @@ impl Comparator for IntegerComparator {
             }
             a.len().cmp(&b.len())
         }
+    }
+}
+
+#[cfg(test)]
+mod file_trust_tests {
+    use super::{EnvOpenOptions, WithoutTls};
+
+    fn opts() -> EnvOpenOptions<WithoutTls> {
+        let mut opts = EnvOpenOptions::new().read_txn_without_tls();
+        opts.map_size(1 << 20);
+        opts
+    }
+
+    /// ADR-0034: an env opened through the adapter trusts page contents by
+    /// default, as LMDB does.
+    #[test]
+    fn default_policy_trusts() {
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { opts().open(dir.path()) }.unwrap();
+        assert!(env.zdb().file_trust().is_trusted());
+    }
+
+    /// `file_trust(VALIDATE)` reaches the engine.
+    #[test]
+    fn validate_reaches_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = opts();
+        opts.file_trust(zerodb::FileTrust::VALIDATE);
+        // SAFETY: opened with `FileTrust::VALIDATE`; only ZeroDB writes this
+        // environment's files.
+        let env = unsafe { opts.open(dir.path()) }.unwrap();
+        assert!(!env.zdb().file_trust().is_trusted());
     }
 }

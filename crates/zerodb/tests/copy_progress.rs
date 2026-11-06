@@ -18,7 +18,8 @@ fn populated(dir: &Path) -> Env {
     opts.map_size(64 << 20);
     opts.max_dbs(8);
     opts.max_readers(16);
-    let env = opts.open(dir).expect("open env");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { opts.open(dir) }.expect("open env");
 
     let mut w = env.write_txn().unwrap();
     env.main_database().put(&mut w, b"main-key", b"v").unwrap();
@@ -138,7 +139,8 @@ fn an_empty_env_still_gets_a_well_formed_progress_sequence() {
     let dir = TempDir::new();
     let mut opts = EnvOpenOptions::new();
     opts.map_size(1 << 20);
-    let env = opts.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { opts.open(dir.path()) }.unwrap();
 
     for (option, name) in [
         (CompactionOption::Disabled, "raw.dat"),
@@ -246,7 +248,8 @@ fn a_progress_tracked_copy_reopens_with_the_same_contents() {
         let mut opts = EnvOpenOptions::new();
         opts.map_size(64 << 20);
         opts.max_dbs(8);
-        let copy = opts.open(dst.path()).expect("the copy opens as an env");
+        // SAFETY: only ZeroDB writes this environment's files.
+        let copy = unsafe { opts.open(dst.path()) }.expect("the copy opens as an env");
 
         let r = copy.read_txn().unwrap();
         assert_eq!(

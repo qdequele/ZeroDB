@@ -33,7 +33,8 @@ const MODES: [EnvFlags; 2] = [EnvFlags::EMPTY, EnvFlags::WRITE_MAP];
 fn open(dir: &Path, flags: EnvFlags) -> Env {
     let mut opts = EnvOpenOptions::new();
     opts.map_size(64 << 20).page_size(PS).flags(flags);
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 fn dump(db: &Database, env: &Env) -> Vec<(Vec<u8>, Vec<u8>)> {

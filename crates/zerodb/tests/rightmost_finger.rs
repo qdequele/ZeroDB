@@ -32,7 +32,8 @@ fn open_with(dir: &Path, sequential_writes: bool) -> Env {
     opts.page_size(PS);
     opts.max_dbs(4);
     opts.sequential_writes(sequential_writes);
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 fn key(i: u32) -> Vec<u8> {

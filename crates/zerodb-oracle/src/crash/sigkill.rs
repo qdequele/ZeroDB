@@ -132,7 +132,9 @@ pub fn child_run(seed: u64, dir: &Path, kill: &str, lock_file: bool) -> ! {
     if spec.growth {
         opts.initial_map_size(super::workload::GROWTH_INITIAL as usize);
     }
-    let env = match opts.open(dir) {
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let env = match unsafe { opts.file_trust(zerodb::FileTrust::VALIDATE).open(dir) } {
         Ok(e) => e,
         Err(e) => {
             mark(format!("ABANDON open: {e}"));
@@ -333,7 +335,13 @@ pub fn run_sigkill_cycle(seed: u64, opts: &SigkillOpts) -> CutReport {
     // the pre-transactional window (SPEC 02 §3.4), not a recovery failure.
     let mut ropts = EnvOpenOptions::new();
     ropts.max_dbs(16);
-    let env = match ropts.open(tmp.path()) {
+    // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
+    // error; nothing else modifies the file while it is mapped.
+    let env = match unsafe {
+        ropts
+            .file_trust(zerodb::FileTrust::VALIDATE)
+            .open(tmp.path())
+    } {
         Ok(e) => e,
         Err(e) => {
             if side.commits.is_empty() && !side.done {

@@ -42,11 +42,14 @@ fn no_read_ahead_env_works_and_advises_random() {
             if nordahead {
                 flags |= EnvFlags::NO_READ_AHEAD;
             }
-            let env = EnvOpenOptions::new()
-                .map_size(64 << 20)
-                .flags(flags)
-                .open(dir.path())
-                .expect("open");
+            // SAFETY: only ZeroDB writes this environment's files.
+            let env = unsafe {
+                EnvOpenOptions::new()
+                    .map_size(64 << 20)
+                    .flags(flags)
+                    .open(dir.path())
+            }
+            .expect("open");
             let db = env.main_database();
             let mut w = env.write_txn().unwrap();
             for i in 0u32..2000 {

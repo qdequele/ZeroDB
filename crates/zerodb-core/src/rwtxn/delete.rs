@@ -96,25 +96,28 @@ impl<'env> RwTxn<'env> {
     ) -> Result<PathFate> {
         self.touch_path(tree, path)?;
         let (lpg, ki) = *path.last().expect("non-empty path");
+        // One frame access reads the cell's value shape and removes the
+        // cell; an overflow run it pointed at is freed after (§8), which
+        // reads nothing from the leaf.
         let big = {
-            let frame = self.dirty.bytes(lpg).expect("leaf touched");
-            let leaf = LeafRef::new_prevalidated(frame, self.psize).map_err(map_page_err)?;
-            match leaf.value(ki) {
+            let frame = self.dirty.bytes_mut(lpg).expect("leaf touched");
+            let big = match LeafRef::new_prevalidated(&*frame, self.psize)
+                .map_err(map_page_err)?
+                .value(ki)
+            {
                 LeafValue::Inline(_) => None,
                 LeafValue::Overflow { head_pgno, dsize } => Some((head_pgno, dsize)),
-            }
+            };
+            LeafMut::from_valid(frame, self.psize)
+                .map_err(map_page_err)?
+                .remove(ki)
+                .map_err(map_page_err)?;
+            big
         };
         if let Some((head, dsize)) = big {
             let n = overflow_page_count(dsize as u64, self.psize);
             self.free_run(head, n);
             sat_sub(&mut self.record_mut(tree).overflow_pages, n);
-        }
-        {
-            let frame = self.dirty.bytes_mut(lpg).expect("leaf touched");
-            LeafMut::from_valid(frame, self.psize)
-                .map_err(map_page_err)?
-                .remove(ki)
-                .map_err(map_page_err)?;
         }
         let top = path.len() - 1;
         self.rebalance(tree, path, top, false)
