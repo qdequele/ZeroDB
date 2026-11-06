@@ -20,7 +20,8 @@ fn open(dir: &Path, flags: EnvFlags) -> Env {
     opts.map_size(MAP);
     opts.page_size(PS);
     opts.flags(flags);
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 /// Non-vacuousness tripwire for the WRITE_MAP twins (ADR-0021/ADR-0022

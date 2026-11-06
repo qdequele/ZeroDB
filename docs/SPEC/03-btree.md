@@ -399,7 +399,11 @@ copied and how pgnos propagate):
    path: copying a leaf forces copying its parent to rewrite the child pgno,
    which forces copying its parent, up to the root. The new root pgno is
    recorded in the txn's working `DBRecord.root` and written to the meta at
-   commit (SPEC 02 §3).
+   commit (SPEC 02 §3). A consequence the write path uses: while the txn has
+   spilled nothing (SPEC 04 TXN-69), a path whose last page is already dirty
+   is dirty at every level, so the whole path is left as is after that one
+   test (LMDB's `mdb_cursor_touch` finds such a path with nothing to copy, one
+   `P_DIRTY` test per level).
 4. **Cursor fix-up.** After a page is copied/split/merged, every live cursor in
    the same txn positioned on the affected page(s) must still point at the
    logically-same entry. *(Clarified 2026-07-16, M1.4 / ADR-0004 D5; mechanism

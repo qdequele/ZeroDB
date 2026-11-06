@@ -19,7 +19,8 @@ fn open(dir: &Path, map_size: usize, page_size: u32) -> Env {
     let mut opts = EnvOpenOptions::new();
     opts.map_size(map_size);
     opts.page_size(page_size);
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 const PS: u32 = 4096;
@@ -172,7 +173,8 @@ fn meta_slots_alternate_and_prev_snapshot_rolls_back() {
         let mut opts = EnvOpenOptions::new();
         opts.map_size(MAP);
         opts.flags(EnvFlags::PREV_SNAPSHOT);
-        let env = opts.open(dir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { opts.open(dir.path()) }.unwrap();
         assert_eq!(env.txnid(), 1);
         let db = env.main_database();
         {
@@ -216,7 +218,8 @@ fn prev_snapshot_env(dir: &Path, lock_file: bool) -> Env {
     let mut opts = EnvOpenOptions::new();
     opts.map_size(MAP).page_size(PS).lock_file(lock_file);
     opts.flags(EnvFlags::PREV_SNAPSHOT);
-    opts.open(dir).unwrap()
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.unwrap()
 }
 
 /// ADR-0023, as LMDB (`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`,

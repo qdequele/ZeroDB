@@ -82,12 +82,16 @@ the transaction already copied are changed in place. Splits, merges and
 borrows follow LMDB's rules, including splitting at the end of the page for
 ascending inserts, so trees built from the same inserts have LMDB's shape.
 
-Readers trust nothing they read from the map. Each page is validated (bounds,
-cell offsets, key and value sizes) before its contents are used, so a corrupt
-file produces a typed error, never undefined behavior. A per-transaction memo
-and an environment-wide cache keyed by (page number, writer txn id) make each
-page cost one validation for as long as it is unchanged. The opt-in
-trusted-file mode skips the per-cell checks, as LMDB does.
+By default readers trust the cells of the pages they read from the map, as
+LMDB does (ADR-0034); `open` is `unsafe`, and its contract is that only ZeroDB
+writes the file. Page numbers are still checked against the snapshot, so
+reads never leave the map, and each page's type and header bounds are
+checked. The opt-in validating policy (`FileTrust::VALIDATE`, ADR-0014)
+validates each page (bounds, cell offsets, key and value sizes) before its
+contents are used, so a corrupt file produces a typed error, never undefined
+behavior. A per-transaction memo and an environment-wide cache keyed by (page
+number, writer txn id) make each page cost one validation for as long as it is
+unchanged.
 
 ## Transactions
 

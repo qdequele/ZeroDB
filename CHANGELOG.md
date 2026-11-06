@@ -41,6 +41,14 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ### Changed
 
+- **Pages are trusted by default, as in LMDB** (ADR-0034). An environment
+  no longer validates every page it reads unless opened with
+  `file_trust(FileTrust::VALIDATE)`; a corrupt file is then undefined
+  behaviour, as with LMDB. Breaking for the native API:
+  `zerodb::EnvOpenOptions::open` is now `unsafe`, with heed's contract (only
+  ZeroDB writes the file), and `get_file_trust` returns `Option<FileTrust>`,
+  `None` for the default. `zerodb-tools` always validates. Divergence D-019
+  now records validation as the opt-in.
 - **On-disk `format_version` 3: bounded free-page records** (ADR-0037). A
   transaction that frees many pages stores its list as several records of at
   most 249 ids (4 KiB pages; 1,017 at 16 KiB), keyed by its transaction id and

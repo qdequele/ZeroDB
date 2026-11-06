@@ -49,7 +49,7 @@ pub trait Reader {
 pub const ENGINES: &[&str] = &[
     "lmdb",
     "zerodb",
-    "zerodb-trusted",
+    "zerodb-validating",
     "fjall",
     "rocksdb",
     "redb",
@@ -62,7 +62,7 @@ pub fn open(name: &str, dir: &Path, cfg: &Config) -> Box<dyn Engine> {
     match name {
         "lmdb" => Box::new(lmdb::Heed::open(dir, cfg, false)),
         "zerodb" => Box::new(zerodb::Heed::open(dir, cfg, false)),
-        "zerodb-trusted" => Box::new(zerodb::Heed::open(dir, cfg, true)),
+        "zerodb-validating" => Box::new(zerodb::Heed::open(dir, cfg, true)),
         "fjall" => Box::new(Fjall::open(dir, cfg)),
         "rocksdb" => Box::new(Rocks::open(dir, cfg)),
         "redb" => Box::new(Redb::open(dir, cfg)),
@@ -94,10 +94,10 @@ macro_rules! heed_engine {
 
             impl Heed {
                 #[allow(unused_variables, unused_mut)]
-                pub fn open(dir: &Path, cfg: &Config, trusted: bool) -> Heed {
+                pub fn open(dir: &Path, cfg: &Config, validating: bool) -> Heed {
                     let mut opts = EnvOpenOptions::new().read_txn_without_tls();
                     opts.map_size(cfg.map_bytes);
-                    heed_engine!(@trust opts, trusted, $trust);
+                    heed_engine!(@trust opts, validating, $trust);
                     // NO_READ_AHEAD: LMDB's advice for random reads on data
                     // larger than memory; set for both engines.
                     let mut flags = EnvFlags::NO_READ_AHEAD;
@@ -105,8 +105,11 @@ macro_rules! heed_engine {
                         flags |= EnvFlags::NO_SYNC;
                     }
                     // SAFETY: one process opens this private benchmark
-                    // directory; NO_SYNC and NO_READ_AHEAD change durability
-                    // and I/O hints, not how processes share the file.
+                    // directory, and the file was created by this benchmark
+                    // with the engine under test, which trusts its pages by
+                    // default (ADR-0034); NO_SYNC and NO_READ_AHEAD change
+                    // durability and I/O hints, not how processes share the
+                    // file.
                     let env = unsafe {
                         opts.flags(flags);
                         opts.open(dir)
@@ -157,14 +160,12 @@ macro_rules! heed_engine {
             }
         }
     };
-    (@trust $opts:ident, $trusted:ident, no) => {
-        assert!(!$trusted, "trusted-file mode is a ZeroDB option");
+    (@trust $opts:ident, $validating:ident, no) => {
+        assert!(!$validating, "page validation is a ZeroDB option");
     };
-    (@trust $opts:ident, $trusted:ident, yes) => {
-        if $trusted {
-            // SAFETY: the file was created by this benchmark with ZeroDB and
-            // nothing else writes to it (the `trust_contents` contract).
-            $opts.file_trust(unsafe { heed_zerodb::FileTrust::trust_contents() });
+    (@trust $opts:ident, $validating:ident, yes) => {
+        if $validating {
+            $opts.file_trust(heed_zerodb::FileTrust::VALIDATE);
         }
     };
 }

@@ -27,7 +27,8 @@ fn churned_image() -> Vec<u8> {
     opts.map_size(256 << 20);
     opts.page_size(PS);
     opts.max_dbs(8);
-    let env = opts.open(dir.path()).expect("open env");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { opts.open(dir.path()) }.expect("open env");
     let mut dbs = vec![env.main_database()];
     {
         let mut w = env.write_txn().unwrap();

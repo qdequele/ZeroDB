@@ -9,10 +9,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir = std::env::temp_dir().join("zerodb-example-basic");
     std::fs::create_dir_all(&dir)?;
 
-    let env = EnvOpenOptions::new()
-        .map_size(10 * 1024 * 1024) // the largest size the data file may grow to
-        .max_dbs(4)
-        .open(&dir)?;
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .map_size(10 * 1024 * 1024) // the largest size the data file may grow to
+            .max_dbs(4)
+            .open(&dir)
+    }?;
 
     // Writes go through one write transaction at a time, and become visible
     // to new readers when it commits.

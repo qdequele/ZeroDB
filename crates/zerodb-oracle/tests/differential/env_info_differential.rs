@@ -58,7 +58,8 @@ fn txnid_series_zerodb(n: usize) -> (u64, Vec<u64>) {
     let mut o = ZOpts::new();
     o.map_size(MAP);
     o.max_dbs(8);
-    let env = o.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(dir.path()) }.unwrap();
     let fresh = env.info().last_txnid;
     let mut series = Vec::new();
     for i in 0..n {
@@ -112,7 +113,8 @@ fn info_last_txnid_does_not_advance_on_abort() {
         let mut o = ZOpts::new();
         o.map_size(MAP);
         o.max_dbs(8);
-        let env = o.open(zdir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { o.open(zdir.path()) }.unwrap();
         let mut w = env.write_txn().unwrap();
         let db = env.create_database(&mut w, Some(b"d")).unwrap();
         db.put(&mut w, b"k", b"v").unwrap();
@@ -157,7 +159,8 @@ fn info_max_readers_matches_the_configured_value() {
             let mut o = ZOpts::new();
             o.map_size(MAP);
             o.max_readers(configured);
-            let env = o.open(zdir.path()).unwrap();
+            // SAFETY: only ZeroDB writes this environment's files.
+            let env = unsafe { o.open(zdir.path()) }.unwrap();
             (env.info().max_readers, env.info().max_readers)
         };
         assert_eq!(
@@ -193,7 +196,8 @@ fn info_num_readers_matches_for_equivalent_reader_populations() {
     o.map_size(MAP);
     o.max_dbs(8);
     o.max_readers(CAP);
-    let zenv = o.open(zdir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let zenv = unsafe { o.open(zdir.path()) }.unwrap();
     {
         let mut w = zenv.write_txn().unwrap();
         let db = zenv.create_database(&mut w, Some(b"d")).unwrap();
@@ -267,7 +271,8 @@ fn num_readers_high_water_survives_a_full_drain_and_reuse() {
     let mut o = ZOpts::new();
     o.map_size(MAP);
     o.max_readers(32);
-    let zenv = o.open(zdir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let zenv = unsafe { o.open(zdir.path()) }.unwrap();
 
     {
         let _l: Vec<_> = (0..4).map(|_| lenv.read_txn().unwrap()).collect();
@@ -318,7 +323,8 @@ fn env_stat_for(n: u32) -> ((u64, u32), (u64, u32)) {
         let mut o = ZOpts::new();
         o.map_size(MAP);
         o.max_dbs(512);
-        let env = o.open(zdir.path()).unwrap();
+        // SAFETY: only ZeroDB writes this environment's files.
+        let env = unsafe { o.open(zdir.path()) }.unwrap();
         {
             let mut w = env.write_txn().unwrap();
             for i in 0..n {

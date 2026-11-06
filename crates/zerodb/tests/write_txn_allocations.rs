@@ -79,7 +79,8 @@ fn steady_state_write_txns_reuse_their_containers() {
     let dir = TempDir::new();
     let mut opts = EnvOpenOptions::new();
     opts.map_size(1 << 26).max_dbs(16).flags(EnvFlags::NO_SYNC);
-    let env = opts.open(dir.path()).expect("open env");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { opts.open(dir.path()) }.expect("open env");
     let mut w = env.write_txn().expect("write_txn");
     let db = env.create_database(&mut w, Some(b"t")).expect("create");
     w.commit().expect("commit");
@@ -132,7 +133,8 @@ fn a_large_txn_does_not_disturb_the_next_small_ones() {
     let dir = TempDir::new();
     let mut opts = EnvOpenOptions::new();
     opts.map_size(1 << 28).max_dbs(4).flags(EnvFlags::NO_SYNC);
-    let env = opts.open(dir.path()).expect("open env");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { opts.open(dir.path()) }.expect("open env");
     let mut w = env.write_txn().expect("write_txn");
     let db = env.create_database(&mut w, Some(b"t")).expect("create");
     for i in 0..50_000u64 {

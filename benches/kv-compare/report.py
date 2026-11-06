@@ -19,7 +19,7 @@ from collections import defaultdict
 
 # Fixed engine order and colours: a colour always means the same engine.
 # Validated as a set (adjacent CVD and normal-vision separation, both modes).
-ENGINES = ["zerodb", "lmdb", "fjall", "rocksdb", "redb", "sqlite", "zerodb-trusted"]
+ENGINES = ["zerodb", "lmdb", "fjall", "rocksdb", "redb", "sqlite", "zerodb-validating"]
 NAMES = {
     "zerodb": "ZeroDB",
     "lmdb": "LMDB",
@@ -27,7 +27,7 @@ NAMES = {
     "rocksdb": "RocksDB",
     "redb": "redb",
     "sqlite": "SQLite",
-    "zerodb-trusted": "ZeroDB, trusted file",
+    "zerodb-validating": "ZeroDB, validating pages",
 }
 THEMES = {
     "light": {

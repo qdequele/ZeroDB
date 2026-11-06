@@ -53,8 +53,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use crate::btree::{
-    branch_view, leaf_view, node_view, node_view_classified, Cursor as BCursor, NodeView,
-    SavedCursor, Source, Tree, ValidatedPages,
+    branch_view, leaf_entry_at, leaf_entry_in, leaf_view, node_view, node_view_classified,
+    Cursor as BCursor, NodeView, SavedCursor, Source, Tree, ValidatedPages,
 };
 use crate::dirty::{DirtyCarry, DirtyStore, PgnoBuildHasher};
 use crate::env::{Env, HookPoint, Snapshot};
@@ -985,6 +985,20 @@ impl<'env> RwTxn<'env> {
     /// updates the working `DBRecord.root`. `ki` values stay valid — the copy
     /// is byte-identical apart from its header identity.
     fn touch_path(&mut self, tree: TreeId, path: &mut [(u64, usize)]) -> Result<()> {
+        // A path that ends on a frame of this txn is all frames of this txn
+        // while nothing is spilled: a page is copied only below a touched
+        // parent (§5.3), and only a spill turns a page of this txn back into
+        // a file page (TXN-69). One test then stands for one per level, as
+        // LMDB's `mdb_cursor_touch` finds a `P_DIRTY` path with nothing to do.
+        if let Some(&(last, _)) = path.last() {
+            if !self.dirty.has_spills() && self.dirty.contains(last) {
+                debug_assert!(
+                    path.iter().all(|&(pgno, _)| self.dirty.contains(pgno)),
+                    "a page above a frame of this txn is not one"
+                );
+                return Ok(());
+            }
+        }
         for level in 0..path.len() {
             let (pgno, _) = path[level];
             let np = self.touch(pgno)?;

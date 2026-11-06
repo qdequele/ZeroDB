@@ -22,7 +22,8 @@ fn open_with(dir: &TempDir, entries: &[(Vec<u8>, Vec<u8>)]) -> zerodb::Env {
     let mut o = EnvOpenOptions::new();
     o.map_size(MAP as usize);
     o.page_size(PS);
-    o.open(dir.path()).unwrap()
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { o.open(dir.path()) }.unwrap()
 }
 
 fn kv(k: &[u8], v: &[u8]) -> (Vec<u8>, Vec<u8>) {

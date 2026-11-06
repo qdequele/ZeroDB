@@ -106,7 +106,8 @@ fn zerodb_shape_with(dir: &Path, ps: u32, pairs: &[(Vec<u8>, Vec<u8>)], append: 
     let mut opts = zerodb::EnvOpenOptions::new();
     opts.map_size(MAP);
     opts.page_size(ps);
-    let env = opts.open(dir).expect("open zerodb env");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { opts.open(dir) }.expect("open zerodb env");
     let db = env.main_database();
     let mut wtxn = env.write_txn().expect("wtxn");
     for (k, v) in pairs {

@@ -119,7 +119,8 @@ fn run_zerodb(dir: &Path, cycles: &[Cycle]) -> Vec<u64> {
     let mut opts = zerodb::EnvOpenOptions::new();
     opts.map_size(MAP);
     opts.page_size(PS);
-    let env = opts.open(dir).expect("open zerodb env");
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { opts.open(dir) }.expect("open zerodb env");
     let db = env.main_database();
     let mut sizes = Vec::with_capacity(cycles.len());
     for (c, cycle) in cycles.iter().enumerate() {

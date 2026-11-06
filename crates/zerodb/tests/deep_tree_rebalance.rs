@@ -20,7 +20,8 @@ fn open(dir: &Path) -> Env {
     let mut opts = EnvOpenOptions::new();
     opts.map_size(MAP);
     opts.page_size(PS);
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 /// Mirrors `write_rebalance_differential.rs::wide_key`: a ~500-byte key

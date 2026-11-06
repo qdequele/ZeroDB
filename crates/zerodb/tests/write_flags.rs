@@ -23,7 +23,8 @@ fn open(dir: &std::path::Path, flags: EnvFlags) -> zerodb::Result<Env> {
     o.max_dbs(8);
     o.page_size(4096);
     o.flags(flags);
-    o.open(dir)
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { o.open(dir) }
 }
 
 #[test]

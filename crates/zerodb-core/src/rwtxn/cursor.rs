@@ -17,6 +17,22 @@ pub(super) enum PathPut {
 }
 
 impl<'env> RwTxn<'env> {
+    /// The entry in slot `ki` of the write cursor's parked leaf `pgno`, or
+    /// `None` past its last cell ([`leaf_entry_in`]). The caller has checked
+    /// the database handle (SPEC 04 DBI-8); the read needs the leaf alone,
+    /// not the database's record or ordering.
+    pub(super) fn parked_entry_in(&self, pgno: u64, ki: usize) -> Result<Option<(&[u8], &[u8])>> {
+        leaf_entry_in(self.source(), self.psize, pgno, ki, Some(&self.validated))
+            .map_err(map_page_err)
+    }
+
+    /// The entry at the write cursor's parked position ([`leaf_entry_at`]),
+    /// under the same contract as [`parked_entry_in`](Self::parked_entry_in).
+    pub(super) fn parked_entry_at(&self, pgno: u64, ki: usize) -> Result<(&[u8], &[u8])> {
+        leaf_entry_at(self.source(), self.psize, pgno, ki, Some(&self.validated))
+            .map_err(map_page_err)
+    }
+
     /// Overwrite the value of the existing entry at the end of `path` — the
     /// write cursor's put at its parked position (SPEC 03 §5.4b): the same
     /// §6.1 replace as [`put_tree`](Self::put_tree) on a found key, minus the
@@ -251,8 +267,8 @@ impl RwCursor<'_, '_> {
                 _ => None,
             };
             if let Some(slot) = slot {
-                let tree = self.db.checked_tree(&*self.txn)?;
-                if let Some(kv) = tree.entry_in_leaf(pgno, slot).map_err(map_page_err)? {
+                self.txn.check_db(&self.db)?;
+                if let Some(kv) = self.txn.parked_entry_in(pgno, slot)? {
                     if let Some(s) = self.saved.as_mut() {
                         s.set_leaf_slot(slot);
                     }
@@ -342,8 +358,8 @@ impl RwCursor<'_, '_> {
         match &self.saved {
             Some(s) => match s.entry_pos() {
                 Some((pgno, ki)) => {
-                    let tree = self.db.checked_tree(&*self.txn)?;
-                    let (k, _) = tree.entry_at(pgno, ki).map_err(map_page_err)?;
+                    self.txn.check_db(&self.db)?;
+                    let (k, _) = self.txn.parked_entry_at(pgno, ki)?;
                     Ok(Some(k.to_vec()))
                 }
                 None => Ok(None),
@@ -649,8 +665,8 @@ impl RwCursor<'_, '_> {
                 let Some((pgno, ki)) = s.entry_pos() else {
                     return Ok(false);
                 };
-                let tree = self.db.checked_tree(&*self.txn)?;
-                let (k, _) = tree.entry_at(pgno, ki).map_err(map_page_err)?;
+                self.txn.check_db(&self.db)?;
+                let (k, _) = self.txn.parked_entry_at(pgno, ki)?;
                 // The parked path is authoritative, so `pos` holds nothing
                 // the cursor needs until it is set below.
                 let mut buf = match std::mem::replace(&mut self.pos, CurPos::Start) {

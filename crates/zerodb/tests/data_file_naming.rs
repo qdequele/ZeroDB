@@ -45,7 +45,8 @@ fn native_default_is_zerodb_dat() {
     let mut o = EnvOpenOptions::new();
     o.map_size(MAP_SIZE);
     assert_eq!(o.get_data_file_name(), DATA_FILE_NAME);
-    let env = o.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(dir.path()) }.unwrap();
     put(&env, b"k", b"v");
 
     assert_eq!(
@@ -64,7 +65,8 @@ fn configured_name_is_used_and_reopens() {
     let dir = TempDir::new();
     let mut o = EnvOpenOptions::new();
     o.map_size(MAP_SIZE).data_file_name(HEED_DATA_FILE_NAME);
-    let env = o.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(dir.path()) }.unwrap();
     put(&env, b"k", b"v");
     assert_eq!(
         dir_listing(dir.path()),
@@ -72,7 +74,8 @@ fn configured_name_is_used_and_reopens() {
     );
     env.prepare_for_closing().wait();
 
-    let reopened = o.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let reopened = unsafe { o.open(dir.path()) }.unwrap();
     assert_eq!(get(&reopened, b"k").as_deref(), Some(&b"v"[..]));
 }
 
@@ -86,7 +89,8 @@ fn name_mismatch_creates_a_fresh_env_and_does_not_adopt() {
 
     let mut native = EnvOpenOptions::new();
     native.map_size(MAP_SIZE);
-    let env = native.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { native.open(dir.path()) }.unwrap();
     put(&env, b"native", b"data");
     assert_eq!(get(&env, b"native").as_deref(), Some(&b"data"[..]));
     env.prepare_for_closing().wait();
@@ -95,7 +99,8 @@ fn name_mismatch_creates_a_fresh_env_and_does_not_adopt() {
     heed_named
         .map_size(MAP_SIZE)
         .data_file_name(HEED_DATA_FILE_NAME);
-    let fresh = heed_named.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let fresh = unsafe { heed_named.open(dir.path()) }.unwrap();
     // Fresh and empty: the `zerodb.dat` next door was not adopted.
     assert_eq!(get(&fresh, b"native"), None);
     // Both data files now exist side by side — two separate databases, each
@@ -120,18 +125,21 @@ fn two_names_are_two_independent_envs() {
 
     let mut a = EnvOpenOptions::new();
     a.map_size(MAP_SIZE);
-    let env_a = a.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env_a = unsafe { a.open(dir.path()) }.unwrap();
     put(&env_a, b"who", b"native");
     env_a.prepare_for_closing().wait();
 
     let mut b = EnvOpenOptions::new();
     b.map_size(MAP_SIZE).data_file_name(HEED_DATA_FILE_NAME);
-    let env_b = b.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env_b = unsafe { b.open(dir.path()) }.unwrap();
     put(&env_b, b"who", b"adapter");
     assert_eq!(get(&env_b, b"who").as_deref(), Some(&b"adapter"[..]));
     env_b.prepare_for_closing().wait();
 
-    let env_a = a.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env_a = unsafe { a.open(dir.path()) }.unwrap();
     assert_eq!(get(&env_a, b"who").as_deref(), Some(&b"native"[..]));
 }
 
@@ -144,7 +152,8 @@ fn invalid_names_are_invalid_input() {
     for bad in ["", "sub/data.mdb", "/abs/data.mdb", ".", "..", "a/"] {
         let mut o = EnvOpenOptions::new();
         o.map_size(MAP_SIZE).data_file_name(bad);
-        match o.open(dir.path()) {
+        // SAFETY: only ZeroDB writes this environment's files.
+        match unsafe { o.open(dir.path()) } {
             Err(Error::Io(e)) => assert_eq!(
                 e.kind(),
                 std::io::ErrorKind::InvalidInput,
@@ -164,7 +173,8 @@ fn arbitrary_single_component_name_works() {
     let dir = TempDir::new();
     let mut o = EnvOpenOptions::new();
     o.map_size(MAP_SIZE).data_file_name("tasks.store");
-    let env = o.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(dir.path()) }.unwrap();
     put(&env, b"k", b"v");
     assert_eq!(
         dir_listing(dir.path()),

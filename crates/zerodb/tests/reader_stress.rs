@@ -49,7 +49,8 @@ fn open_with(dir: &Path, max_readers: u32, max_dirty_bytes: Option<usize>, flags
     if let Some(b) = max_dirty_bytes {
         opts.max_dirty_bytes(b);
     }
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 /// Deterministic value for `(key, gen)`: `[key BE 8 | gen BE 8 | payload]`,

@@ -18,10 +18,13 @@
 //!
 //! # fn main() -> zerodb::Result<()> {
 //! // An environment is a directory holding one data file.
-//! let env = EnvOpenOptions::new()
-//!     .map_size(10 * 1024 * 1024) // 10 MiB map ceiling
-//!     .max_dbs(4)
-//!     .open("books.db")?;
+//! // SAFETY: only ZeroDB writes this environment's files.
+//! let env = unsafe {
+//!     EnvOpenOptions::new()
+//!         .map_size(10 * 1024 * 1024) // 10 MiB map ceiling
+//!         .max_dbs(4)
+//!         .open("books.db")?
+//! };
 //!
 //! // All writes go through a single write transaction.
 //! let mut wtxn = env.write_txn()?;
@@ -231,7 +234,10 @@ pub struct EnvOpenOptions {
     page_size: u32,
     flags: EnvFlags,
     data_file_name: OsString,
-    file_trust: FileTrust,
+    /// The page-validation policy (ADR-0014); `None` = the default, which
+    /// [`EnvOpenOptions::open`] resolves to trusting (ADR-0034). The trusting
+    /// value is never stored here by default, so safe code cannot copy it out.
+    file_trust: Option<FileTrust>,
     sequential_writes: bool,
     /// Dirty limit in bytes (ADR-0017); `None` = LMDB's default.
     max_dirty_bytes: Option<usize>,
@@ -261,7 +267,7 @@ impl EnvOpenOptions {
             page_size: DEFAULT_PAGE_SIZE,
             flags: EnvFlags::EMPTY,
             data_file_name: OsString::from(DATA_FILE_NAME),
-            file_trust: FileTrust::VALIDATE,
+            file_trust: None,
             sequential_writes: false,
             max_dirty_bytes: None,
             // ADR-0023: the lock file is on by default, as in LMDB;
@@ -386,22 +392,24 @@ impl EnvOpenOptions {
         &self.data_file_name
     }
 
-    /// Choose the page-validation policy (**ADR-0014**; ZeroDB extension,
-    /// LMDB has no validating mode). Default: [`FileTrust::VALIDATE`], under
-    /// which a corrupt or hostile file yields a typed error.
+    /// Choose the page-validation policy (**ADR-0014**, **ADR-0034**).
     ///
-    /// Passing the value of the `unsafe` [`FileTrust::trust_contents`] makes
-    /// the env read page cells without validating them, as LMDB does; its
-    /// `# Safety` section is the contract. The setter itself is safe because
-    /// only that `unsafe` constructor can produce the trusting value.
+    /// By default the env reads page cells without validating them, as LMDB
+    /// does, under the contract of [`EnvOpenOptions::open`].
+    /// [`FileTrust::VALIDATE`] (a ZeroDB extension, LMDB has no validating
+    /// mode) checks every page the first time a transaction reads it, so that
+    /// a corrupt or hostile file yields a typed error instead of undefined
+    /// behaviour. Use it for files of uncertain origin.
     pub fn file_trust(&mut self, policy: FileTrust) -> &mut EnvOpenOptions {
-        self.file_trust = policy;
+        self.file_trust = Some(policy);
         self
     }
 
-    /// The configured page-validation policy (ADR-0014).
+    /// The page-validation policy set with [`EnvOpenOptions::file_trust`], or
+    /// `None` for the default, under which [`EnvOpenOptions::open`] trusts
+    /// page contents (ADR-0034).
     #[must_use]
-    pub fn get_file_trust(&self) -> FileTrust {
+    pub fn get_file_trust(&self) -> Option<FileTrust> {
         self.file_trust
     }
 
@@ -519,10 +527,23 @@ impl EnvOpenOptions {
     /// exist (LMDB parity). If the data file is absent or empty, a fresh empty
     /// env is created there (SPEC 02 §3.4).
     ///
-    /// Unlike heed, this is a safe function: cross-process access is always
-    /// coordinated through the lock file, which is on by default (ADR-0023).
-    /// With [`EnvOpenOptions::lock_file`] off, ZeroDB is single-process (see
-    /// docs/LMDB-COMPATIBILITY.md).
+    /// Cross-process access is coordinated through the lock file, which is on
+    /// by default (ADR-0023). With [`EnvOpenOptions::lock_file`] off, ZeroDB
+    /// is single-process (see docs/LMDB-COMPATIBILITY.md).
+    ///
+    /// # Safety
+    ///
+    /// As with heed's and LMDB's `open`, the caller guarantees that:
+    ///
+    /// - nothing but ZeroDB modifies the data file while it is mapped, in
+    ///   this process or another;
+    /// - unless [`EnvOpenOptions::file_trust`] is set to
+    ///   [`FileTrust::VALIDATE`], the data file, if it exists, was written by
+    ///   ZeroDB and has not been modified by anything else since. By default
+    ///   page contents are trusted, as in LMDB (ADR-0034), and a corrupt or
+    ///   hostile file is undefined behaviour. Run `zerodb check` (which always
+    ///   validates) on a file of uncertain origin, such as an imported
+    ///   snapshot, or open it with [`FileTrust::VALIDATE`].
     ///
     /// # Errors
     ///
@@ -566,7 +587,7 @@ impl EnvOpenOptions {
     ///   has the environment open: `PREV_SNAPSHOT` requires winning the
     ///   lock file's first-opener election, matching LMDB as observed
     ///   (ADR-0023 §5, `OBS_PREV_SNAPSHOT_JOINER`).
-    pub fn open(&self, path: impl AsRef<Path>) -> Result<Env> {
+    pub unsafe fn open(&self, path: impl AsRef<Path>) -> Result<Env> {
         let dir = path.as_ref();
         // Validate the page-size selector here rather than in the setter
         // so the builder stays chainable.
@@ -666,7 +687,11 @@ impl EnvOpenOptions {
             self.max_dbs,
             self.max_readers,
             durability,
-            self.file_trust,
+            // ADR-0034: the default trusts page contents, as LMDB does.
+            // SAFETY: the caller upholds this function's contract, which
+            // carries `trust_contents`'s when no policy was chosen.
+            self.file_trust
+                .unwrap_or_else(|| unsafe { FileTrust::trust_contents() }),
             self.sequential_writes,
             self.max_dirty_bytes
                 .map(|b| zerodb_core::env::dirty_limit_pages(Some(b), opened.page_size)),

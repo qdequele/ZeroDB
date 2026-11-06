@@ -51,7 +51,8 @@ fn zerodb_create(name: &[u8]) -> Outcome {
     o.map_size(MAP);
     o.max_dbs(8);
     o.page_size(4096);
-    let env = o.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(dir.path()) }.unwrap();
     let mut w = env.write_txn().unwrap();
     let r = env.create_database(&mut w, Some(name));
     match r {
@@ -91,7 +92,8 @@ fn embedded_nul_name_is_a_valid_byte_string_in_zerodb() {
     o.map_size(MAP);
     o.max_dbs(8);
     o.page_size(4096);
-    let env = o.open(dir.path()).unwrap();
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { o.open(dir.path()) }.unwrap();
 
     let mut w = env.write_txn().unwrap();
     let a = env.create_database(&mut w, Some(b"ab\0cd")).unwrap();

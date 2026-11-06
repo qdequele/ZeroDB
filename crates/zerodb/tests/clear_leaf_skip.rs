@@ -23,7 +23,8 @@ fn open(dir: &Path) -> Env {
     opts.map_size(MAP);
     opts.page_size(PS);
     opts.max_dbs(4);
-    opts.open(dir).expect("open env")
+    // SAFETY: only ZeroDB writes this environment's files.
+    unsafe { opts.open(dir) }.expect("open env")
 }
 
 fn key(i: u32) -> Vec<u8> {
