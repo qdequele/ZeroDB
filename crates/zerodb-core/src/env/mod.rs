@@ -280,6 +280,13 @@ pub(crate) struct EnvInner {
     /// Whether [`EnvInner::unpublished`] may hold a value: lets the common
     /// case skip its mutex.
     has_unpublished: AtomicBool,
+    /// The map-growth ceiling in bytes (ADR-0036), `0` when growth is off
+    /// (LMDB's fixed size, the default). With growth on, the logical map
+    /// size is the size grown so far and `MapFull` fires only past this
+    /// ceiling. Written by the write-lock holder; Relaxed, since it is read
+    /// only by write txns and `info`, which take no decision another thread
+    /// must order against.
+    map_ceiling: AtomicU64,
 }
 
 /// A durable commit newer than the published snapshot (ADR-0023), kept in
@@ -324,6 +331,16 @@ impl EnvInner {
     #[must_use]
     pub fn map_size(&self) -> u64 {
         self.backing_ref().view().map_size
+    }
+
+    /// The map-growth ceiling (ADR-0036), `None` when growth is off.
+    #[must_use]
+    pub(crate) fn map_ceiling(&self) -> Option<u64> {
+        // Relaxed: see the field.
+        match self.map_ceiling.load(Ordering::Relaxed) {
+            0 => None,
+            c => Some(c),
+        }
     }
 
     /// The txnid of the current live snapshot (the commit point; advances on
@@ -665,7 +682,14 @@ impl EnvInner {
         let Some(snap) = read_snapshot_at(backing, self.page_size, t)? else {
             return Ok(None);
         };
-        check_snapshot_backed(backing, self.page_size, &snap)?;
+        match check_snapshot_backed(backing, self.page_size, &snap) {
+            // ADR-0036: with map growth on, follow another process's growth
+            // instead of returning `MapResized`.
+            Err(Error::Mdb(MdbError::MapResized)) if self.follow_growth(&snap)? => {
+                check_snapshot_backed(backing, self.page_size, &snap)?;
+            }
+            other => other?,
+        }
         let snap = Arc::new(snap);
         self.snap_cell.install_if_newer(Arc::clone(&snap));
         Ok(Some(snap))
@@ -1305,10 +1329,41 @@ impl Env {
                 ))
             });
         }
+        // ADR-0036: with map growth on, a non-zero size sets the ceiling and
+        // the logical size keeps what has been grown, within it; `0` adopts
+        // the meta's size as the logical size and raises the ceiling to it.
+        // Relaxed: see the field; the writer locks are held.
+        let size = match inner.map_ceiling() {
+            Some(_) if new_size != 0 => {
+                inner.map_ceiling.store(size, Ordering::Relaxed);
+                inner.map_size().min(size).max(min)
+            }
+            Some(_) => {
+                inner.map_ceiling.fetch_max(size, Ordering::Relaxed);
+                size
+            }
+            None => size,
+        };
         inner.backing_ref().grow_map(size).map_err(Error::Io)?;
         // The guard's drop releases both writer locks.
         drop(guard);
         Ok(())
+    }
+
+    /// Turn on map growth (ADR-0036): from now on a write txn that needs a
+    /// page past the logical map size grows the map, and the data file under
+    /// `WRITE_MAP`, instead of failing with [`MdbError::MapFull`]; `MapFull`
+    /// fires only past `ceiling`, which [`Env::info`] reports as `map_size`.
+    /// A ceiling below the current map size is raised to it.
+    ///
+    /// Spike API: the open option (`EnvOpenOptions::initial_map_size`) calls
+    /// it before the environment is returned, so no txn is live.
+    #[doc(hidden)]
+    pub fn enable_map_growth(&self, ceiling: u64) {
+        let inner = self.inner();
+        let ceiling = ceiling.max(inner.map_size());
+        // Relaxed: see the field; no txn exists yet.
+        inner.map_ceiling.store(ceiling, Ordering::Relaxed);
     }
 
     /// Environment info (SPEC 00 rows 20/60; `mdb_env_info`). The struct is
@@ -1348,7 +1403,12 @@ impl Env {
         // is the newest meta on disk, which LMDB's `mdb_env_info` reports.
         let snap = self.inner.or_newer_unpublished(snap);
         EnvInfo {
-            map_size: self.inner.map_size(),
+            // ADR-0036: with map growth on, the ceiling is the size limit
+            // callers compare usage against, as LMDB's `map_size`.
+            map_size: self
+                .inner
+                .map_ceiling()
+                .unwrap_or_else(|| self.inner.map_size()),
             last_pgno: snap.last_pg,
             last_txnid: snap.txnid,
             max_readers: self.inner.max_readers(),

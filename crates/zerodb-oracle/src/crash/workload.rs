@@ -123,7 +123,15 @@ pub struct Spec {
     /// land in a save that writes a freed list of many bounded records and in
     /// the commits that drain them record by record (SPEC 05 GC-5, GC-20).
     pub gc_clear: bool,
+    /// Map growth (ADR-0036) on ~1/3 of cycles: the map and, under
+    /// `WRITE_MAP`, the file start at [`GROWTH_INITIAL`] and grow inside
+    /// write txns up to `map_size`, so cuts land before, during and after
+    /// growths.
+    pub growth: bool,
 }
+
+/// The initial map size of a growth cycle (ADR-0036).
+pub const GROWTH_INITIAL: u64 = 64 << 10;
 
 /// Ops decoded per workload round (mechanism B loops rounds so an async kill
 /// lands mid-run; mechanism A uses round 0).
@@ -148,6 +156,8 @@ pub fn gen_spec(seed: u64) -> Spec {
     // Drawn last so every earlier field keeps its value for a given seed.
     let dirty_limit = rng.ratio(1, 3).then(|| 8 + rng.below(120) as u64);
     let gc_clear = rng.ratio(1, 4);
+    // Drawn after `gc_clear` for the same reason.
+    let growth = rng.ratio(1, 3);
     Spec {
         seed,
         mode,
@@ -156,6 +166,7 @@ pub fn gen_spec(seed: u64) -> Spec {
         big,
         dirty_limit,
         gc_clear,
+        growth,
     }
 }
 

@@ -152,6 +152,10 @@ fn dump_repro(
     msg
 }
 
+/// Image cuts of growth cycles (ADR-0036) whose map grew past its initial
+/// size before the cut, process-wide.
+pub static GROWN_CYCLES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[allow(clippy::too_many_lines)] // linear cycle script: setup → run → cut → verify
 fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), CutFail> {
     let spec = gen_spec(seed);
@@ -170,7 +174,12 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
     let opened = zerodb_io::open_or_create(
         &data_path,
         spec.page_size,
-        Some(spec.map_size),
+        // ADR-0036: a growth cycle maps only the initial size.
+        Some(if spec.growth {
+            super::workload::GROWTH_INITIAL
+        } else {
+            spec.map_size
+        }),
         spec.map_size,
         false,
         write_map,
@@ -194,6 +203,9 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
         spec.dirty_limit,
     )
     .map_err(|e| abandon(format!("env open: {e}")))?;
+    if spec.growth {
+        env.enable_map_growth(spec.map_size);
+    }
 
     // Cut point: 80% at a commit hook (REC-17's H0..H4 grid drives the REC-6
     // rows), 20% at an op boundary (between-commit windows — interesting
@@ -270,6 +282,12 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
         (std::mem::take(&mut exec.states), exec.acked())
     };
     env.set_commit_hook(None);
+    // ADR-0036: count growth cycles whose map really grew before the cut,
+    // so a green run proves the growth path was crossed.
+    if spec.growth && env.backing_bytes().len() as u64 > super::workload::GROWTH_INITIAL {
+        // Ordering: `Relaxed` — a statistics counter, read after the jobs join.
+        GROWN_CYCLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     drop(env); // release the registry entry; the fault journal lives on
 
     // ADR-0021 tripwires: under the WRITE_MAP modes the cycle must have

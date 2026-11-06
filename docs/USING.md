@@ -170,6 +170,19 @@ going, as LMDB does. `EnvOpenOptions::max_dirty_bytes(bytes)` sets the limit in
 bytes (ADR-0017). Lower it to bound the memory of very large transactions;
 results and files never depend on it.
 
+### Map growth
+
+By default `map_size` is fixed, as in LMDB: the whole size is mapped at open
+(and, under `WRITE_MAP`, the data file is set to it), and a write that needs
+more fails with `MdbError::MapFull`. `EnvOpenOptions::initial_map_size(bytes)`
+maps only `bytes` at open and lets write transactions grow the map, and the
+file under `WRITE_MAP`, up to `map_size` (ADR-0036). `map_size` becomes a
+ceiling: `MapFull` comes only there, at the same point as with a fixed map of
+that size, and `info().map_size` reports it. The address space mapped then
+follows the data (at most about twice it), so a generous ceiling costs
+nothing up front. The file is never shrunk; give space back with a compacting
+copy.
+
 ## Multiple processes
 
 The lock file is on by default, so several processes can open one environment
@@ -184,7 +197,8 @@ them (ADR-0023).
   slots.
 - If another process grows the map, a txn begin returns
   `MdbError::MapResized`. Call `resize(0)` to adopt the new size, then begin
-  again.
+  again. With `initial_map_size`, the begin follows the growth itself, up to
+  this process's `map_size`.
 - Do not use an `Env` in a child after `fork()`, and do not share an
   environment across PID namespaces.
 

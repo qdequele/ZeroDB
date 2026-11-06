@@ -69,6 +69,27 @@ pub trait Backing: Send + Sync {
         ))
     }
 
+    /// Raise the logical map size to at least `map_size`, never lowering it,
+    /// with the mapping strategy of [`Backing::grow_map`] but without
+    /// touching the data file (ADR-0036). Called by a txn begin of an
+    /// environment with map growth on, holding no writer lock, when another
+    /// process committed past this map: the snapshot already lies inside the
+    /// file, and growing the file belongs to the writer locks' holder.
+    ///
+    /// The default refuses: the backing cannot grow its map.
+    ///
+    /// # Errors
+    ///
+    /// `Unsupported` by default; a backing that grows reports its `mmap`
+    /// error.
+    fn extend_map(&self, map_size: u64) -> std::io::Result<()> {
+        let _ = map_size;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "backing cannot grow its map",
+        ))
+    }
+
     /// Grow the data file to at least `len` bytes; never shrink it. Called
     /// at a `WRITE_MAP` write-txn begin, with both writer locks held, so a
     /// joiner whose mapping extends past the file end has every page below

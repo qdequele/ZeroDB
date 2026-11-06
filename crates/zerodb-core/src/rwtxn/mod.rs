@@ -481,12 +481,20 @@ impl Env {
         // The map view, loaded once for the whole begin: the base check
         // below and the txn's read view (`bytes`) both come from it.
         let backing = inner.backing_ref();
-        let view = backing.view();
+        let mut view = backing.view();
         // The base must lie inside this process's logical map size, even
         // when it came from the cache; otherwise the begin fails with
         // `MapResized` (ADR-0023). Either error drops `guard`, releasing both
         // writer locks.
-        inner.check_base_in(view, &base)?;
+        if let Err(e) = inner.check_base_in(view, &base) {
+            // ADR-0036: with map growth on, follow another process's growth
+            // instead of returning `MapResized`, then load the grown view.
+            if !(matches!(e, Error::Mdb(MdbError::MapResized)) && inner.follow_growth(&base)?) {
+                return Err(e);
+            }
+            view = backing.view();
+            inner.check_base_in(view, &base)?;
+        }
         // ADR-0021 (SPEC 04 §6.4 TXN-45b): under WRITE_MAP, with a backing
         // that brokers map slices, dirty pages are realized **in the map** at
         // their freshly-COW'd pgnos — no heap staging, no commit write-back.

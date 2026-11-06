@@ -512,3 +512,42 @@ fn txn_id_is_exposed_on_both_txn_kinds() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].txnid, Some(rtxn.id() as u64));
 }
+
+// ---------------------------------------------------------------------------
+// initial_map_size (ADR-0036)
+// ---------------------------------------------------------------------------
+
+/// `initial_map_size` reaches the engine through the adapter and survives the
+/// TLS retag: the map starts small, a write txn grows it past the initial
+/// size instead of failing with `MapFull`, `info().map_size` reports the
+/// `map_size` ceiling, and `MapFull` still comes at the ceiling.
+#[test]
+fn initial_map_size_grows_the_map_up_to_map_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut opts = EnvOpenOptions::new();
+    opts.initial_map_size(64 * 1024);
+    let mut opts = opts.read_txn_without_tls();
+    opts.map_size(4 * 1024 * 1024);
+    let env = unsafe { opts.open(dir.path()).unwrap() };
+    assert_eq!(env.info().map_size, 4 * 1024 * 1024);
+
+    let mut wtxn = env.write_txn().unwrap();
+    let db: Database<Str, Bytes> = env.create_database(&mut wtxn, None).unwrap();
+    for k in 0..400u32 {
+        db.put(&mut wtxn, &format!("k{k:06}"), &[7u8; 1000])
+            .unwrap();
+    }
+    wtxn.commit().unwrap();
+    assert!(
+        env.real_disk_size().unwrap() > 64 * 1024,
+        "the data passed the initial size"
+    );
+
+    let mut wtxn = env.write_txn().unwrap();
+    let full =
+        (0..10_000u32).find_map(|k| db.put(&mut wtxn, &format!("x{k:06}"), &[7u8; 1000]).err());
+    assert!(
+        matches!(full, Some(heed::Error::Mdb(heed::MdbError::MapFull))),
+        "MapFull at the ceiling, got {full:?}"
+    );
+}

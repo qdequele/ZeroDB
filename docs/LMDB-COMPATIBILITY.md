@@ -62,6 +62,7 @@ Statuses:
 | `file_trust(FileTrust)` | Extension | Opt-in: `FileTrust::VALIDATE` checks every page read from the file, so a corrupt file is a typed error. The default trusts pages, as LMDB does ([D-019](#d-019)) |
 | `sequential_writes(bool)` | Extension | Opt-in rightmost-leaf fast path for ascending or `APPEND` loads, off by default; results and files are identical ([D-020](#d-020)) |
 | `max_dirty_bytes(usize)` | Extension | Bounds a write txn's dirty memory before it spills pages to the file; defaults to LMDB's 131,072 pages ([D-021](#d-021)) |
+| `initial_map_size(usize)` | Extension | Opt-in map growth: map (and under `WRITE_MAP` preallocate) only this much at open, and grow inside write txns up to `map_size` instead of failing with `MapFull`; off by default ([D-028](#d-028)) |
 | `serde` derive under the `serde` feature | Unsupported | |
 
 ### `EnvFlags`
@@ -220,6 +221,7 @@ difference. Details live in the linked ADR or SPEC section.
 | <a id="d-025"></a>D-025 | Two `PREV_SNAPSHOT` cases | (a) If the opener ends before its first commit, a waiting process reads the older meta (or fails with `EINVAL` on macOS after a clean close). (b) A read-only `PREV_SNAPSHOT` open is not refused while another process holds the env, and rolls every process back to the older meta. | (a) A waiting process re-initializes the lock file and serves the newest meta. (b) A read-only `PREV_SNAPSHOT` joiner fails with `EAGAIN` and the running env is untouched, because matching LMDB would let a writer reuse pages that newer readers still read. | Approved |
 | <a id="d-026"></a>D-026 | Database handles in two stale cases | (a) A handle whose slot was freed by an abort and reused for another name reads that other database. (b) When two read txns first-open the same name, later txns get `MDB_BAD_DBI` through either handle. | (a) `EINVAL`: a handle carries its slot's generation. (b) The slot is shared by its openers and both handles stay valid (SPEC 04 DBI-9). | Approved (a), Proposed (b) |
 | <a id="d-027"></a>D-027 | Which freed pages a write txn reuses | (a) Pages freed by txn `N − 1` are never reused by txn `N`, even with no reader open. (b) Freed records are merged before searching for a run of contiguous pages. | (a) Pages freed by txn `N − 1` are reused when no reader pins an older snapshot (SPEC 05 GC-18), so files are never larger for this reason. (b) Same since ADR-0029: the gated records are merged and searched (SPEC 05 GC-16, GC-21). | Proposed (a), Resolved (b) |
+| <a id="d-028"></a>D-028 | Map size | Fixed at open or by `mdb_env_set_mapsize`; an allocation past it fails with `MDB_MAP_FULL`, and a txn begin past this process's map returns `MDB_MAP_RESIZED`. | Same by default. With the opt-in `initial_map_size`, `map_size` is a ceiling: the map and, under `WRITE_MAP`, the data file start at the initial size and a write txn grows them up to the ceiling, where `MapFull` still comes at the same point. A begin follows another process's growth instead of returning `MapResized`, and `info().map_size` reports the ceiling. No shrinking (ADR-0036; SPEC 04 TXN-74). | Approved |
 
 ### Checks the adapter re-imposes
 

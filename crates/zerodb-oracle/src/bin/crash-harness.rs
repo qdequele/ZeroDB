@@ -386,6 +386,7 @@ fn main() {
          spilling txns   : {} image, {} sigkill + mp (ADR-0017 spill cycles)\n\
          in-place regions: {} (ADR-0021: brokered map regions journaled by WRITE_MAP image cuts)\n\
          large clears    : {} cycles (ADR-0037: a clear of thousands of pages, then small commits)\n\
+         grown maps      : {} image cuts (ADR-0036: growth cycles whose map grew before the cut)\n\
          wall time       : {:.1}s ({:.1} cycles/s)",
         t.verified,
         t.image_cuts,
@@ -404,6 +405,7 @@ fn main() {
         t.sigkill_spilled,
         t.map_regions,
         t.gc_clear_verified,
+        zerodb_oracle::crash::image::GROWN_CYCLES.load(Ordering::Relaxed),
         secs,
         t.verified as f64 / secs.max(0.001),
     );

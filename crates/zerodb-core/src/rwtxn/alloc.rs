@@ -335,11 +335,46 @@ impl<'env> RwTxn<'env> {
         }
         let mp = map_pages(self.env.inner().map_size(), self.psize);
         if is_map_full(self.next_pgno, n, mp) {
-            return Err(Error::Mdb(MdbError::MapFull));
+            self.grow_map_for(self.next_pgno.saturating_add(n))?;
         }
         let p = self.next_pgno;
         self.next_pgno += n;
         Ok(p)
+    }
+
+    /// Grow the map so it holds `end_pgno` pages (ADR-0036), or fail with
+    /// [`MdbError::MapFull`] when growth is off or `end_pgno` pages pass the
+    /// ceiling. The new logical size is at least twice the current one,
+    /// capped at the ceiling, so a txn that keeps allocating grows the map a
+    /// logarithmic number of times. Grows the data file first under
+    /// `WRITE_MAP`, then publishes the new view through the backing, exactly
+    /// as [`Env::resize`](crate::env::Env::resize) does: this txn already
+    /// holds both writer locks that `resize` takes.
+    ///
+    /// Nothing staged or spilled moves: dirty pages are addressed by page
+    /// number, and older mappings stay mapped. In heap modes the cached
+    /// whole-map view is re-derived, as after a spill (TXN-71), so a page
+    /// later spilled past the old mapping resolves through the new one.
+    #[cold]
+    #[inline(never)]
+    fn grow_map_for(&mut self, end_pgno: u64) -> Result<()> {
+        let inner = self.env.inner();
+        let Some(ceiling) = inner.map_ceiling() else {
+            return Err(Error::Mdb(MdbError::MapFull));
+        };
+        let ps = u64::from(self.psize);
+        let need = end_pgno
+            .checked_mul(ps)
+            .ok_or(Error::Mdb(MdbError::MapFull))?;
+        if need > ceiling {
+            return Err(Error::Mdb(MdbError::MapFull));
+        }
+        let size = need.max(inner.map_size().saturating_mul(2)).min(ceiling);
+        inner.backing_ref().grow_map(size).map_err(Error::Io)?;
+        if !self.dirty.in_map_mode() {
+            self.bytes = inner.backing_bytes();
+        }
+        Ok(())
     }
 
     /// Record the run `start .. start + n`, just drawn from a GC source, in

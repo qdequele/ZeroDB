@@ -129,6 +129,9 @@ pub fn child_run(seed: u64, dir: &Path, kill: &str, lock_file: bool) -> ! {
     if let Some(pages) = spec.dirty_limit {
         opts.max_dirty_bytes(pages as usize * spec.page_size as usize);
     }
+    if spec.growth {
+        opts.initial_map_size(super::workload::GROWTH_INITIAL as usize);
+    }
     // SAFETY: opened with `FileTrust::VALIDATE`, so a damaged file yields an
     // error; nothing else modifies the file while it is mapped.
     let env = match unsafe { opts.file_trust(zerodb::FileTrust::VALIDATE).open(dir) } {

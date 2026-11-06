@@ -744,6 +744,12 @@ macro_rules! bench_backend {
         if crate::backend::bench_knob("ZERODB_BENCH_SEQUENTIAL_WRITES") {
             $opts.sequential_writes(true);
         }
+        // ADR-0036 bench axis: `ZERODB_BENCH_INITIAL_MAP=<bytes>` opens every
+        // zerodb env with map growth from that initial size, under the
+        // rung's map size as the ceiling.
+        if let Some(n) = crate::backend::bench_bytes("ZERODB_BENCH_INITIAL_MAP") {
+            $opts.initial_map_size(n);
+        }
     };
     (@setpage $opts:ident, $page:ident, noset) => {
         // LMDB derives its page size from the OS; nothing to set.
@@ -769,6 +775,11 @@ macro_rules! bench_backend {
 pub fn trust_file_requested() -> bool {
     static REQ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *REQ.get_or_init(|| bench_knob("ZERODB_BENCH_TRUST_FILE"))
+}
+
+/// The bench env variable `name` as a byte count, if set.
+pub fn bench_bytes(name: &str) -> Option<usize> {
+    std::env::var(name).ok()?.parse().ok()
 }
 
 /// Whether the bench env variable `name` is set to `1`.

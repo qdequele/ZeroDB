@@ -14,7 +14,10 @@
 //! 2. **Nothing faults past EOF.** Readers dereference only pages a committed
 //!    snapshot references, all inside the file (SPEC 06 REC-14). Under
 //!    `WRITE_MAP`, the writer grows the file to the logical map size before it
-//!    stores through the map (SPEC 04 §6.4). No process truncates the file.
+//!    stores through the map (SPEC 04 §6.4), at its begin and before each
+//!    growth inside the txn (ADR-0036). A reader that follows another
+//!    process's growth raises the logical size only to a committed snapshot's
+//!    size, which lies inside the file. No process truncates the file.
 //! 3. **One writer, writing only unshared pages.** One write txn at a time
 //!    across processes (TXN-6, ADR-0023 §2). It writes only pages no live
 //!    snapshot references (TXN-62: fresh pages, or pages freed before the
@@ -24,7 +27,12 @@
 //! 4. **No live borrow is rewritten.** A spilling write txn rewrites one of its
 //!    own pages only at the start of a later `&mut` call, when no borrow into
 //!    it is live (TXN-39), and re-derives its whole-map view after each spill
-//!    (TXN-71).
+//!    (TXN-71) and after each growth of the map inside the txn (ADR-0036).
+//!
+//! These invariants are about file pages, not about one mapping: an older
+//! mapping and a newer one show the same page-cache pages, so a store made
+//! through either is visible through both, and a flush through the newest
+//! mapping writes back stores made through an older one (tested below).
 //!
 //! So no `&[u8]` that safe code reads is mutated while it is borrowed.
 
@@ -304,7 +312,7 @@ pub(crate) struct MapRegions {
 // before Drop.
 unsafe impl Send for MapRegions {}
 // SAFETY: as for `Send`. Shared access only loads `current` (atomically) and
-// reads immutable, never-freed views and mappings; `publish` mutates `owned`
+// reads immutable, never-freed views and mappings; `update` mutates `owned`
 // under the mutex.
 unsafe impl Sync for MapRegions {}
 
@@ -334,10 +342,10 @@ impl MapRegions {
 
     /// One Acquire load: a consistent (bytes, map_size).
     pub(crate) fn view(&self) -> (&Mapping, u64) {
-        // Acquire: pairs with the Release in `publish`; the view and its
+        // Acquire: pairs with the Release in `publish_locked`; the view and its
         // mapping were fully built before the store.
         let v = self.current.load(Ordering::Acquire);
-        // SAFETY: `v` came from `Box::into_raw` in `publish`/`new` and is
+        // SAFETY: `v` came from `Box::into_raw` in `publish_locked`/`new` and is
         // recorded in `owned`; views and mappings are freed only in Drop
         // (`&mut self`), so both outlive `&self`. No `&mut` to them ever
         // exists after publication.
@@ -346,10 +354,46 @@ impl MapRegions {
         (unsafe { &*v.mapping }, v.map_size)
     }
 
-    /// Publish `map_size`, adding `new_mapping` if given. Callers hold the
-    /// writer lock, so publications are serialized.
+    /// Publish `map_size`, adding `new_mapping` if given, unconditionally
+    /// (the tests' direct path; the engine publishes through
+    /// [`MapRegions::update`]).
+    #[cfg(test)]
     pub(crate) fn publish(&self, new_mapping: Option<Mapping>, map_size: u64) {
         let mut owned = self.owned.lock().expect("map regions poisoned");
+        self.publish_locked(&mut owned, new_mapping, map_size);
+    }
+
+    /// Decide and publish a new view under the regions mutex (ADR-0036):
+    /// `plan` gets the current mapping's length and logical size, read under
+    /// the mutex, and returns the view to publish (a new mapping or `None`
+    /// to keep the current one, and the logical size), or `None` to publish
+    /// nothing. Holding the mutex across the decision, the `mmap` and the
+    /// publication serializes every caller, so a caller that does not hold
+    /// the writer lock (a reader following another process's growth) can
+    /// never publish over a newer view it did not see.
+    ///
+    /// # Errors
+    ///
+    /// The error `plan` returns; nothing is published then.
+    pub(crate) fn update(
+        &self,
+        plan: impl FnOnce(u64, u64) -> std::io::Result<Option<(Option<Mapping>, u64)>>,
+    ) -> std::io::Result<()> {
+        let mut owned = self.owned.lock().expect("map regions poisoned");
+        // Relaxed: under the mutex, which orders this load after the
+        // previous publish's store.
+        let cur = self.current.load(Ordering::Relaxed);
+        // SAFETY: as in `view`: `cur` is a published, never-freed view, and
+        // so is the mapping it points to.
+        let (len, size) = unsafe { ((*(*cur).mapping).bytes().len() as u64, (*cur).map_size) };
+        if let Some((mapping, map_size)) = plan(len, size)? {
+            self.publish_locked(&mut owned, mapping, map_size);
+        }
+        Ok(())
+    }
+
+    /// Publish a view with the regions mutex held.
+    fn publish_locked(&self, owned: &mut Owned, new_mapping: Option<Mapping>, map_size: u64) {
         let mapping = match new_mapping {
             Some(m) => {
                 let p = Box::into_raw(Box::new(m));
@@ -452,5 +496,159 @@ mod tests {
         }
         let (m, size) = regions.view();
         assert_eq!((m.bytes().len(), size), (512, 300));
+    }
+}
+
+/// Two writable mappings of one file (ADR-0036): a store made through the
+/// older, shorter mapping must be written back by a flush through the newer
+/// one, since commit flushes only through the newest view. Writeback is
+/// observed through the process's disk-write counter (`/proc/self/io` on
+/// Linux, `proc_pid_rusage` on macOS) and, on macOS, through `mincore`'s
+/// modified bits.
+#[cfg(all(test, not(miri), any(target_os = "linux", target_os = "macos")))]
+mod cross_mapping_flush_tests {
+    use super::MmapWritable;
+    use std::fs::{File, OpenOptions};
+
+    struct TempFile(std::path::PathBuf);
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn os_page() -> usize {
+        // SAFETY: `sysconf` reads a process constant; no memory is touched.
+        let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(n).expect("positive page size")
+    }
+
+    /// Bytes this process has caused to be written to storage.
+    #[cfg(target_os = "linux")]
+    fn disk_bytes_written() -> Option<u64> {
+        let io = std::fs::read_to_string("/proc/self/io").ok()?;
+        io.lines()
+            .find_map(|l| l.strip_prefix("write_bytes: "))?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// Bytes this process has caused to be written to storage.
+    #[cfg(target_os = "macos")]
+    fn disk_bytes_written() -> Option<u64> {
+        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::zeroed();
+        // SAFETY: `info` is a writable `rusage_info_v2`, the struct the
+        // `RUSAGE_INFO_V2` flavor fills; the kernel writes nothing else.
+        let rc = unsafe {
+            libc::proc_pid_rusage(
+                libc::getpid(),
+                libc::RUSAGE_INFO_V2,
+                info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+            )
+        };
+        // SAFETY: on success the kernel initialized the whole struct.
+        (rc == 0).then(|| unsafe { info.assume_init() }.ri_diskio_byteswritten)
+    }
+
+    /// Whether the OS page at `off` of `map` is dirty (macOS `mincore`).
+    #[cfg(target_os = "macos")]
+    fn dirty(map: &MmapWritable, off: usize) -> bool {
+        let mut vec: libc::c_char = 0;
+        // SAFETY: `off` is OS-page aligned and inside the mapping, so the
+        // one-page range is mapped; `vec` holds the one status byte.
+        let rc =
+            unsafe { libc::mincore(map.bytes().as_ptr().add(off).cast_mut().cast(), 1, &mut vec) };
+        assert_eq!(rc, 0, "mincore: {}", std::io::Error::last_os_error());
+        i32::from(vec) & (libc::MINCORE_MODIFIED | libc::MINCORE_MODIFIED_OTHER) != 0
+    }
+
+    #[cfg(target_os = "linux")]
+    fn dirty(_: &MmapWritable, _: usize) -> bool {
+        // Linux `mincore` reports residency only.
+        false
+    }
+
+    fn store(map: &MmapWritable, off: usize, len: usize, fill: u8) {
+        // SAFETY: single-threaded test, no borrow of the map is live, and
+        // the range is inside both the mapping and the file.
+        unsafe { map.write_at(off, &vec![fill; len]) };
+    }
+
+    /// How a store through `old` is made durable in each case below.
+    fn written_back(file: &File, old: &MmapWritable, new: &MmapWritable, how: &str) -> u64 {
+        let os = os_page();
+        let off = os; // page 1: inside both mappings
+        let fill = how.len() as u8;
+        store(old, off, os, fill);
+        if cfg!(target_os = "macos") {
+            assert!(
+                dirty(old, off) || dirty(new, off),
+                "{how}: the store left the page clean"
+            );
+        }
+        let before = disk_bytes_written().expect("disk-write counter");
+        match how {
+            "msync-old" => old.flush_range(off, os, false).expect("msync"),
+            "msync-new" => new.flush_range(off, os, false).expect("msync"),
+            "fdatasync" => file.sync_data().expect("fdatasync"),
+            _ => unreachable!(),
+        }
+        let after = disk_bytes_written().expect("disk-write counter");
+        assert!(
+            !dirty(old, off) && !dirty(new, off),
+            "{how}: page still dirty"
+        );
+        assert_eq!(
+            new.bytes()[off],
+            fill,
+            "{how}: the newer mapping sees the store"
+        );
+        after - before
+    }
+
+    #[test]
+    fn a_flush_through_a_newer_mapping_writes_back_older_stores() {
+        let os = os_page();
+        let path = TempFile(std::env::current_dir().expect("cwd").join(format!(
+            "zerodb-cross-map-{}-{}.dat",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        )));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path.0)
+            .expect("create");
+        file.set_len(8 * os as u64).expect("set_len");
+        // The older mapping covers 2 OS pages, the newer one the whole file,
+        // as after a growth.
+        let old = MmapWritable::map(&file, 2 * os).expect("map old");
+        let new = MmapWritable::map(&file, 8 * os).expect("map new");
+        if disk_bytes_written().is_none() {
+            eprintln!("no disk-write counter on this system; skipped");
+            return;
+        }
+        // Control: the flush through the mapping that stored.
+        let control = written_back(&file, &old, &new, "msync-old");
+        eprintln!("msync through the storing mapping: {control} bytes written");
+        if control == 0 {
+            eprintln!("the counter did not move for the control; skipped");
+            return;
+        }
+        let through_new = written_back(&file, &old, &new, "msync-new");
+        eprintln!("msync through the newer mapping: {through_new} bytes written");
+        assert!(
+            through_new >= os as u64,
+            "msync through the newer mapping wrote nothing"
+        );
+        let fsync = written_back(&file, &old, &new, "fdatasync");
+        eprintln!("fdatasync alone: {fsync} bytes written");
+        assert!(fsync >= os as u64, "fdatasync wrote nothing");
     }
 }

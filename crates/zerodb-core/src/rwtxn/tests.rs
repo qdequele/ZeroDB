@@ -536,6 +536,39 @@ fn map_full_poisons_txn() {
     assert!(matches!(e, Error::Mdb(MdbError::BadTxn)));
 }
 
+/// ADR-0036: with map growth on, a growth the backing cannot make fails the
+/// write with the backing's I/O error, not `MapFull`, and leaves the txn
+/// abortable and the env usable, exactly as a `MapFull` does. The heap test
+/// backing cannot grow its map, which stands in for a failed `mmap`.
+#[test]
+fn failed_map_growth_returns_the_io_error() {
+    let env = mem_env(PS, 16 * PS as u64);
+    env.enable_map_growth(1 << 20);
+    assert_eq!(env.info().map_size, 1 << 20, "info reports the ceiling");
+    let db = env.main_database();
+    let mut txn = env.write_txn().unwrap();
+    let mut failed = None;
+    for i in 0..64u32 {
+        let k = format!("k{i:02}").into_bytes();
+        if let Err(e) = db.put(&mut txn, &k, &vec![0u8; 3000]) {
+            failed = Some(e);
+            break;
+        }
+    }
+    match failed {
+        Some(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::Unsupported),
+        other => panic!("expected the growth's I/O error, got {other:?}"),
+    }
+    let e = db.put(&mut txn, b"more", b"v").unwrap_err();
+    assert!(matches!(e, Error::Mdb(MdbError::BadTxn)));
+    txn.abort();
+    // The env is not poisoned: a new write txn starts from the empty
+    // committed snapshot and can write.
+    let mut txn = env.write_txn().unwrap();
+    assert_eq!(db.get(&txn, b"k00").unwrap(), None);
+    db.put(&mut txn, b"after", b"v").unwrap();
+}
+
 #[test]
 fn abort_discards_everything() {
     let env = mem_env(PS, MAP);
