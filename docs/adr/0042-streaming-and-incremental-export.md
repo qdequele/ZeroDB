@@ -273,11 +273,22 @@ new 100 before the caller's first check. The check then sees txnid 100,
 accepts the stale export point, and the delta is wrong. So the contract does
 not rely on detection. It prevents both cases instead:
 
-- **An export point must name a durable snapshot.** With default durability,
-  every committed snapshot is durable. Under `NO_SYNC` or `NO_META_SYNC`, the
-  caller calls `force_sync` after the export and before recording the export
-  point anywhere it will be used as a base. Recovery then never selects a
-  meta below a recorded export point.
+- **Recovery must never land below a recorded export point.** Making the
+  exported snapshot durable is not enough. Under relaxed durability
+  (`NO_SYNC`, `NO_META_SYNC`, or `WRITE_MAP` with `MAP_ASYNC`), the commits
+  after the export write both meta slots in turn with no barrier between
+  them. A power loss can tear one meta write and lose the other, and recovery
+  then selects a meta below the export point (the crash model of ADR-0038
+  allows torn and reordered writes). So one of these must hold:
+  - every commit, by every process, runs with default durability for as long
+    as the environment has recorded export points. Each commit is then
+    durable before the next one overwrites the other meta slot, so recovery
+    never selects a meta older than the newest commit before the crash;
+  - or, under relaxed durability, the caller discards every export point
+    after any unclean shutdown (a crash of the process, the kernel or the
+    machine), detected for example with a marker it writes only after
+    closing the environment cleanly, and the next export is a full raw
+    export.
 - **An environment with recorded export points is never opened with
   `PREV_SNAPSHOT`.** If it is, the caller discards every export point and
   the next export is a full raw export.
