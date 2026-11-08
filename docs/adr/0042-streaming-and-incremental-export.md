@@ -93,7 +93,7 @@ pub trait ImageSink {
 }
 
 fn copy_to_sink(&self, sink: &mut dyn ImageSink, option: CompactionOption)
-    -> Result<ExportPoint>;
+    -> Result<Option<ExportPoint>>;
 ```
 
 The crate provides two adapters: `WriteSink<W: Write>`, which accepts only
@@ -104,8 +104,9 @@ compacting copy to S3 implements the sink itself. It uploads parts 2..n as
 pages arrive and part 1 last: part 1 is the metas plus the first pages up to
 the 5 MiB minimum part size, held in memory until `metas` arrives.
 
-`ExportPoint` (Part 2) is returned so a raw export can serve as the base of a
-later incremental export.
+A raw copy returns `Some(ExportPoint)` (Part 2), so it can serve as the base
+of a later incremental export. A compacting copy returns `None`: it renumbers
+pages, so it can never be a base.
 
 Pros: both modes stream with no local file, and the order contract is
 explicit and testable. Today's two copy forms become special cases, so the
@@ -179,8 +180,14 @@ produced into any `Write` and applied from any `Read`:
 | End | `pgno = u64::MAX`, `count = 0`, then the CRC32C of every byte before the end record |
 
 The **base meta digest** is the CRC32C of the base image's live meta page
-(the image the delta applies to). It guards against applying a delta to the
-wrong image: another index, or an image at a different txnid.
+(the image the delta applies to). It catches the common mistakes, such as a
+delta applied to another index or to an image at a different txnid. It does
+not prove identity: two images with identical metas can hold different live
+pages (see the history hazard below), and the digest cannot tell them apart.
+The caller must therefore match each delta to the exact image it was
+exported against, for example by recording the base image's object key and
+version next to the delta. The digest is a guard against mistakes, not a
+substitute for that bookkeeping.
 
 **API sketch** (in `zerodb`, beside `CopyToFile`):
 
@@ -196,21 +203,53 @@ fn export_delta(&self, since: &ExportPoint, out: &mut dyn Write) -> Result<Expor
 
 /// Apply a delta to a raw image in place. Checks the header against the
 /// image's live meta before writing anything.
-pub fn apply_delta(image: &File, delta: &mut dyn Read, durable: bool) -> Result<ExportPoint>;
+///
+/// # Safety
+///
+/// For the whole call, no environment may have `image` open, and none may
+/// open it: neither an environment opened before the call (its readers map
+/// the pages this overwrites) nor one opened during it.
+pub unsafe fn apply_delta(image: &File, delta: &mut dyn Read, durable: bool)
+    -> Result<ExportPoint>;
 ```
 
-`apply_delta` overwrites pages that are reachable in the base, so a partly
-applied image is neither `N` nor `T`. It therefore runs in this order:
+**Exclusive access.** `apply_delta` overwrites pages that are reachable in
+the base. A reader of an environment already open on the image would see
+those pages change under its snapshot, through its map. Zeroing the metas
+does not stop it, because a reader never re-reads the metas once it has
+pinned a snapshot. So exclusive access for the whole call is a precondition,
+and `apply_delta` is an `unsafe fn` with that contract, like
+`EnvOpenOptions::open` (ADR-0034). An image the consumer has just downloaded
+is open nowhere, so the contract is easy to meet in the intended use. Open
+question 3 asks whether the engine should enforce it through the lock file
+instead.
 
-1. Verify the header against the base.
-2. Zero both meta slots, so an interrupted apply leaves a file that open
-   refuses (SPEC 02 §3.2), never one that opens at `N` over overwritten
-   pages.
-3. Write the runs, checking each run's CRC.
-4. Set the file length.
-5. With `durable`, `fdatasync`.
-6. Write the target metas.
-7. With `durable`, `fdatasync` again.
+**Order of writes.** A partly applied image is neither `N` nor `T`, so the
+apply runs in this order:
+
+1. Verify the header (its CRC, the page size, and the base meta digest)
+   against the base.
+2. Zero both meta slots and `fdatasync`, always, whatever `durable` says.
+   Writeback does not keep write order, so without this sync a run written
+   in step 3 could reach the disk while an old meta survives, and a crash
+   would leave a file that opens at `N` over overwritten pages. After the
+   sync, an interrupted apply leaves a file that open refuses (SPEC 02 §3.2).
+3. Write the runs. For each run, check its CRC, and check that its page
+   numbers are at least 2, at most the target `last_pg`, and above the
+   previous run's.
+4. Require the end record and check the stream CRC. A corrupted page number
+   can send a run to the wrong place without failing the run's own CRC; the
+   stream CRC catches it. If the end record is missing or the CRC fails,
+   return an error here: the metas stay zeroed and the file stays
+   unopenable.
+5. Set the file length to `(target last_pg + 1) × page_size`.
+6. With `durable`, `fdatasync`.
+7. Write the target metas.
+8. With `durable`, `fdatasync` again.
+
+Without `durable`, steps 6 and 8 are skipped. The result is then safe
+against the process dying, but not against a power loss after the call
+returns, the same guarantee an unsynced copy gives.
 
 A caller that needs to keep the base clones it first (cheap on APFS, XFS or
 btrfs, as in ADR-0032). Deltas chain: a delta from `T` applies to the image
@@ -226,13 +265,26 @@ different snapshots in two cases:
 
 After either case, later commits reuse the ids and the delta is silently
 wrong. The meta digest does not catch this: the live environment no longer
-has `N`'s meta to compare with. Without a format change the engine cannot
-detect this across reopens, so the contract puts it on the caller: **an
-export point above the txnid an environment opens at is invalid, and the
-next export must be a full raw export.** The caller can check this at every
-open (`RoTxn::id()` of a first read transaction against its newest export
-point). A lineage id persisted in the meta would let the engine enforce it.
-That is a format change, left as an open question.
+has `N`'s meta to compare with.
+
+Comparing txnids after the fact does not catch it either. If an environment
+recovers to txnid 99 after exporting at 100, another process can commit a
+new 100 before the caller's first check. The check then sees txnid 100,
+accepts the stale export point, and the delta is wrong. So the contract does
+not rely on detection. It prevents both cases instead:
+
+- **An export point must name a durable snapshot.** With default durability,
+  every committed snapshot is durable. Under `NO_SYNC` or `NO_META_SYNC`, the
+  caller calls `force_sync` after the export and before recording the export
+  point anywhere it will be used as a base. Recovery then never selects a
+  meta below a recorded export point.
+- **An environment with recorded export points is never opened with
+  `PREV_SNAPSHOT`.** If it is, the caller discards every export point and
+  the next export is a full raw export.
+
+A caller that cannot guarantee both makes every export a full raw export.
+Without a format change the engine cannot enforce these rules. Open
+question 2 covers what enforcing them would take.
 
 Pros: uses only the existing format and invariants. The stamp was reserved
 for this. The cost is proportional to the change. The apply side is simple
@@ -303,7 +355,11 @@ shipping.
   usable on an applied image.
 - `docs/LMDB-COMPATIBILITY.md`: both are extensions and change no heed
   behavior.
-- No new dependency and no `unsafe`.
+- No new dependency and no new `unsafe` block. `apply_delta` is declared
+  `unsafe fn` for its exclusive-access contract; its body needs no `unsafe`.
+  Calls of it, in `zerodb-tools` and tests, need an `unsafe` policy entry
+  like the one for `EnvOpenOptions::open` (ADR-0034), each with a
+  `// SAFETY:` comment saying why no environment has the image open.
 - An image downloaded from object storage is opened through the `unsafe`
   `EnvOpenOptions::open` (ADR-0034). Whether such an image counts as the
   caller's own file or should be opened with `FileTrust::VALIDATE` is the
@@ -314,11 +370,24 @@ shipping.
 1. Is a delta format worth versioning and keeping before the spike reports
    the delta-to-full ratio on real Meilisearch workloads, or should Part 2
    wait for that number?
-2. Should the history contract be enforced by the engine: a lineage id in a
-   reserved meta field, set at creation and replaced by any open that rolls
-   back (`PREV_SNAPSHOT`, or recovery below the newest exported txnid)? That
-   is a format change and needs its own ADR.
-3. `apply_delta` zeroes the base's metas first, so a failed apply loses the
+2. Should the engine enforce the history contract? A lineage id in the meta
+   alone is not enough: if both metas carry the same id, a crash that
+   recovers below an export point keeps the id, and a check comparing ids
+   accepts the divergent history. Enforcement would need two parts:
+   - a durable export watermark, the highest exported txnid, made durable
+     before an export point is handed out;
+   - a lineage id that any open rotates when it selects a meta below that
+     watermark, or opens with `PREV_SNAPSHOT`.
+
+   An export point would then carry the lineage id, and `export_delta`
+   would refuse a point whose id differs. That is a format change and needs
+   its own ADR. Until then, the caller rules under "the history hazard"
+   apply.
+3. `apply_delta` requires exclusive access as an `unsafe` contract. Should
+   it enforce it instead, by taking the image's lock file (ADR-0023) and
+   refusing while any process has it open? That works only for an image
+   inside an environment directory, not for a bare file. Relatedly,
+   `apply_delta` zeroes the base's metas first, so a failed apply loses the
    base. Is that acceptable, or should it always write into a clone and
    rename?
 4. Should `ImageSink` live in `zerodb` only, or also be exposed through the
