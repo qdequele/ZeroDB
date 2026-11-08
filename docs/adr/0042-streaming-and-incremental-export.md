@@ -280,10 +280,13 @@ not rely on detection. It prevents both cases instead:
   them. A power loss can tear one meta write and lose the other, and recovery
   then selects a meta below the export point (the crash model of ADR-0038
   allows torn and reordered writes). So one of these must hold:
-  - every commit, by every process, runs with default durability for as long
-    as the environment has recorded export points. Each commit is then
-    durable before the next one overwrites the other meta slot, so recovery
-    never selects a meta older than the newest commit before the crash;
+  - the exported snapshot is itself durable before the export point is
+    recorded (it was committed with default durability, or the caller ran
+    `force_sync` after the export), and every later commit, by every
+    process, runs with default durability for as long as the point is kept.
+    Each commit is then durable before the next one overwrites the other
+    meta slot, so recovery never selects a meta older than the exported
+    snapshot;
   - or, under relaxed durability, the caller discards every export point
     after any unclean shutdown (a crash of the process, the kernel or the
     machine), detected for example with a marker it writes only after
