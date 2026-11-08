@@ -73,6 +73,13 @@ fn walk_gc_record(key: &[u8], val: &[u8], psize: u32) {
     let ids = pil_decode(val);
     assert_eq!(pil_count(val), ids.as_ref().map(|v| v.len() as u64));
     if let Some(ids) = ids {
+        // Every decoded list, in any order, is the count prefix followed by
+        // the ids, all little-endian (GC-3).
+        let mut layout = (ids.len() as u64).to_le_bytes().to_vec();
+        for id in &ids {
+            layout.extend_from_slice(&id.to_le_bytes());
+        }
+        assert_eq!(layout, val);
         let ascending = ids.windows(2).all(|w| w[0] < w[1]);
         if ascending && ids.len() <= gc_chunk_cap(psize) {
             let mut buf = vec![0u8; pil_size(ids.len())];
