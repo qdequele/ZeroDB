@@ -60,8 +60,11 @@ fn walk_leaf(leaf: &LeafRef<'_>, psize: u32) {
 
 /// Decode a leaf entry as a GC record (SPEC 05 GC-1..5): the key decodes
 /// exactly when it is 16 bytes and then re-encodes to itself, the two PIL
-/// decoders agree, and a list the writer would store (at most
-/// `gc_chunk_cap` ids) re-encodes to the same bytes.
+/// decoders agree, and a list the writer would store re-encodes to the same
+/// bytes. The writer stores at most `gc_chunk_cap` ids, strictly ascending
+/// (GC-4), which is also `pil_encode_into`'s precondition; `pil_decode`
+/// checks only the shape, so an unordered list decodes but is not a list the
+/// writer would store.
 fn walk_gc_record(key: &[u8], val: &[u8], psize: u32) {
     match gc_key_decode(key) {
         Some(k) => assert_eq!(&gc_key_encode(k)[..], key),
@@ -70,7 +73,15 @@ fn walk_gc_record(key: &[u8], val: &[u8], psize: u32) {
     let ids = pil_decode(val);
     assert_eq!(pil_count(val), ids.as_ref().map(|v| v.len() as u64));
     if let Some(ids) = ids {
-        if ids.len() <= gc_chunk_cap(psize) {
+        // Every decoded list, in any order, is the count prefix followed by
+        // the ids, all little-endian (GC-3).
+        let mut layout = (ids.len() as u64).to_le_bytes().to_vec();
+        for id in &ids {
+            layout.extend_from_slice(&id.to_le_bytes());
+        }
+        assert_eq!(layout, val);
+        let ascending = ids.windows(2).all(|w| w[0] < w[1]);
+        if ascending && ids.len() <= gc_chunk_cap(psize) {
             let mut buf = vec![0u8; pil_size(ids.len())];
             pil_encode_into(&ids, &mut buf);
             assert_eq!(buf, val);
