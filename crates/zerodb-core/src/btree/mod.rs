@@ -617,6 +617,61 @@ impl<'a> Tree<'a> {
         Err(depth_exceeded())
     }
 
+    /// The minimum entry (`MDB_FIRST` with no cursor kept), or `None` for an
+    /// empty tree. Same result as [`Cursor::first`] on a fresh cursor.
+    ///
+    /// # Errors
+    ///
+    /// A [`PageError`] only if the tree is structurally corrupt.
+    pub fn first_entry(&self) -> PosResult<'a> {
+        self.edge_entry(false)
+    }
+
+    /// The maximum entry (`MDB_LAST` with no cursor kept), or `None` for an
+    /// empty tree. Same result as [`Cursor::last`] on a fresh cursor.
+    ///
+    /// # Errors
+    ///
+    /// A [`PageError`] only if the tree is structurally corrupt.
+    pub fn last_entry(&self) -> PosResult<'a> {
+        self.edge_entry(true)
+    }
+
+    /// Root-to-leaf descent along the leftmost (`max == false`) or rightmost
+    /// edge, returning that leaf's first or last entry. No cursor: the caller
+    /// keeps no position, so there is no path to record, as in
+    /// [`Tree::find_exact`], whose level bound and error this shares.
+    #[inline(always)]
+    fn edge_entry(&self, max: bool) -> PosResult<'a> {
+        if self.root == PGNO_INVALID {
+            return Ok(None);
+        }
+        let mut pgno = self.root;
+        for _ in 0..(self.depth as usize + 2).min(CURSOR_STACK) {
+            match node_view(self.src, self.psize, pgno, self.valid)? {
+                NodeView::Leaf(leaf) => {
+                    let n = leaf.num_keys();
+                    if n == 0 {
+                        return Ok(None);
+                    }
+                    let ki = if max { n - 1 } else { 0 };
+                    let k = leaf.key(ki);
+                    let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
+                    return Ok(Some((k, v)));
+                }
+                NodeView::Branch(br) => {
+                    let ci = if max {
+                        br.num_keys().saturating_sub(1)
+                    } else {
+                        0
+                    };
+                    pgno = br.child_pgno(ci);
+                }
+            }
+        }
+        Err(depth_exceeded())
+    }
+
     /// Catalog lookup for the named-DB resolver (SPEC 02 §6): like [`Tree::get`]
     /// but also returns the leaf **node flags** of the matched entry, so the
     /// caller can tell an `F_SUBDATA` sub-DB record from a plain user key
@@ -1644,6 +1699,9 @@ mod tests {
         let mut c = tree.cursor();
         let mut out = Vec::new();
         let mut e = c.first().unwrap();
+        // The cursor-free edge read agrees with the cursor on every tree
+        // these tests walk.
+        assert_eq!(tree.first_entry().unwrap(), e);
         while let Some((k, v)) = e {
             out.push((k.to_vec(), v.to_vec()));
             e = c.next().unwrap();
@@ -1655,6 +1713,7 @@ mod tests {
         let mut c = tree.cursor();
         let mut out = Vec::new();
         let mut e = c.last().unwrap();
+        assert_eq!(tree.last_entry().unwrap(), e);
         while let Some((k, v)) = e {
             out.push((k.to_vec(), v.to_vec()));
             e = c.prev().unwrap();
@@ -1669,6 +1728,8 @@ mod tests {
         assert!(t.is_empty());
         assert_eq!(t.get(b"x").unwrap(), None);
         let mut c = t.cursor();
+        assert_eq!(t.first_entry().unwrap(), None);
+        assert_eq!(t.last_entry().unwrap(), None);
         assert_eq!(c.first().unwrap(), None);
         assert_eq!(c.last().unwrap(), None);
         assert_eq!(c.next().unwrap(), None);
