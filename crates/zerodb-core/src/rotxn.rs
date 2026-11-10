@@ -1009,10 +1009,7 @@ impl Database {
         &self,
         txn: &'txn T,
     ) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
-        self.checked_tree(txn)?
-            .cursor()
-            .first()
-            .map_err(map_page_err)
+        self.checked_tree(txn)?.first_entry().map_err(map_page_err)
     }
 
     /// `last(txn)` — the maximum entry (SPEC 00 row 42).
@@ -1021,10 +1018,7 @@ impl Database {
     ///
     /// [`MdbError::Invalid`] on a corrupt tree.
     pub fn last<'txn, T: TxnRead>(&self, txn: &'txn T) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
-        self.checked_tree(txn)?
-            .cursor()
-            .last()
-            .map_err(map_page_err)
+        self.checked_tree(txn)?.last_entry().map_err(map_page_err)
     }
 
     /// `get_greater_than_or_equal_to(txn, key)` — first entry `≥ key`

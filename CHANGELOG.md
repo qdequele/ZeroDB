@@ -166,6 +166,9 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 - Full scans read entries from the leaf in hand, and trusted mode no longer
   records leaves: `scan/full/fwd` 2.25× → 1.45×, and about 1.0× in trusted
   mode.
+- `first` and `last` descend without building a cursor, as point gets do
+  (#147): 61.9 → 41.7 ns per call against LMDB's 54.5 (1.14× → 0.77×,
+  laptop).
 - `skip` crosses whole leaves without decoding the entries it passes.
 - Short read transactions reuse their memory on the same thread (#25).
 - The meta checksum uses the ARMv8 `crc32c` instructions on aarch64
