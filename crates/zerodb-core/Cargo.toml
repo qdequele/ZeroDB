@@ -22,7 +22,7 @@ loom = "0.7"
 
 [dev-dependencies]
 proptest.workspace = true
-# The heap-backed writable-map stand-in (ADR-0021 M1): lets the in-place
+# The heap-backed writable-map stand-in (ADR-0021): lets the in-place
 # WRITE_MAP brokered discipline run under miri (`tests/writemap_in_place_miri.rs`).
 # A dev-dependency cycle (zerodb-io depends on this crate) is fine for cargo
 # and is stripped on publish (path-only).

@@ -35,6 +35,7 @@
 
 use std::sync::OnceLock;
 
+use crate::btree::PageKind;
 use crate::sync::{AtomicU64, Ordering};
 
 /// Slots before pgnos wrap: 8 Mi × 8 bytes = 64 MiB per env at most, and no
@@ -56,15 +57,6 @@ const PGNO_BITS: u32 = 35;
 const _: () = assert!(
     1u64 << PGNO_BITS == crate::page::geometry::MAX_MAP_SIZE / crate::page::MIN_PAGE_SIZE as u64
 );
-
-/// Which validated shape an entry vouches for; part of the key, as in the
-/// txn memo, so a page validated as a leaf never hits as a
-/// branch.
-#[derive(Clone, Copy)]
-pub(crate) enum StampKind {
-    Leaf,
-    Branch,
-}
 
 /// A run of slots. A slot of `0` is empty: every published word has bit 0
 /// set.
@@ -128,7 +120,7 @@ impl StampCache {
 
     /// Heap bytes the table holds now: the top array, the directory blocks
     /// and the chunks allocated so far.
-    pub(crate) fn allocated_bytes(&self) -> usize {
+    fn allocated_bytes(&self) -> usize {
         let mids = self.top.iter().filter(|m| m.get().is_some()).count();
         self.top.len() * std::mem::size_of::<OnceLock<Mid>>()
             + mids * self.mid_chunks * std::mem::size_of::<OnceLock<Chunk>>()
@@ -148,14 +140,14 @@ impl StampCache {
     /// gives back the pgno, the kind and the stamp exactly. At 2^23 slots
     /// the stamp has 50 bits: 35 years of commits at a million a second.
     #[inline]
-    fn word(&self, pgno: u64, kind: StampKind, stamp: u64) -> Option<u64> {
+    fn word(&self, pgno: u64, kind: PageKind, stamp: u64) -> Option<u64> {
         let shift = 2 + PGNO_BITS - self.bits;
         if pgno >> PGNO_BITS != 0 || stamp >> (64 - shift) != 0 {
             return None;
         }
         let kind = match kind {
-            StampKind::Leaf => 0,
-            StampKind::Branch => 1 << 1,
+            PageKind::Leaf => 0,
+            PageKind::Branch => 1 << 1,
         };
         Some((stamp << shift) | ((pgno >> self.bits) << 2) | kind | 1)
     }
@@ -181,7 +173,7 @@ impl StampCache {
 
     /// `true` iff a publish of exactly `(pgno, kind, stamp)` is the slot's
     /// current content. A collision or an unallocated slot answers `false`.
-    pub(crate) fn contains(&self, pgno: u64, kind: StampKind, stamp: u64) -> bool {
+    pub(crate) fn contains(&self, pgno: u64, kind: PageKind, stamp: u64) -> bool {
         let Some(want) = self.word(pgno, kind, stamp) else {
             return false;
         };
@@ -201,7 +193,7 @@ impl StampCache {
     /// validation. Call only after the validation succeeded. Racing
     /// publishers to one slot leave the last store; every store is a true
     /// fact, so either outcome is sound.
-    pub(crate) fn publish(&self, pgno: u64, kind: StampKind, stamp: u64) {
+    pub(crate) fn publish(&self, pgno: u64, kind: PageKind, stamp: u64) {
         let Some(word) = self.word(pgno, kind, stamp) else {
             return;
         };
@@ -233,15 +225,15 @@ mod tests {
     #[test]
     fn exact_version_hits_other_versions_miss() {
         let c = StampCache::new();
-        assert!(!c.contains(7, StampKind::Leaf, 3), "empty cache misses");
-        c.publish(7, StampKind::Leaf, 3);
-        assert!(c.contains(7, StampKind::Leaf, 3));
-        assert!(!c.contains(7, StampKind::Leaf, 4), "newer stamp misses");
-        assert!(!c.contains(7, StampKind::Branch, 3), "other kind misses");
-        assert!(!c.contains(8, StampKind::Leaf, 3), "other pgno misses");
-        c.publish(7, StampKind::Leaf, 4);
-        assert!(c.contains(7, StampKind::Leaf, 4));
-        assert!(!c.contains(7, StampKind::Leaf, 3), "overwritten version");
+        assert!(!c.contains(7, PageKind::Leaf, 3), "empty cache misses");
+        c.publish(7, PageKind::Leaf, 3);
+        assert!(c.contains(7, PageKind::Leaf, 3));
+        assert!(!c.contains(7, PageKind::Leaf, 4), "newer stamp misses");
+        assert!(!c.contains(7, PageKind::Branch, 3), "other kind misses");
+        assert!(!c.contains(8, PageKind::Leaf, 3), "other pgno misses");
+        c.publish(7, PageKind::Leaf, 4);
+        assert!(c.contains(7, PageKind::Leaf, 4));
+        assert!(!c.contains(7, PageKind::Leaf, 3), "overwritten version");
     }
 
     #[test]
@@ -249,16 +241,16 @@ mod tests {
         let c = StampCache::new();
         assert_eq!(c.top.len(), SLOTS / CHUNK_SLOTS / MID_CHUNKS);
         assert_eq!(c.chunks_allocated(), 0);
-        c.publish(42, StampKind::Branch, 5);
+        c.publish(42, PageKind::Branch, 5);
         assert_eq!((mids_allocated(&c), c.chunks_allocated()), (1, 1));
-        assert!(c.contains(42, StampKind::Branch, 5));
+        assert!(c.contains(42, PageKind::Branch, 5));
         for pgno in 0..10_000 {
-            c.publish(pgno, StampKind::Leaf, 1);
+            c.publish(pgno, PageKind::Leaf, 1);
         }
         for pgno in 0..10_000 {
             // Slot = pgno: 10k consecutive pgnos never collide.
-            assert!(c.contains(pgno, StampKind::Leaf, 1), "pgno {pgno}");
-            assert!(!c.contains(pgno, StampKind::Leaf, 2));
+            assert!(c.contains(pgno, PageKind::Leaf, 1), "pgno {pgno}");
+            assert!(!c.contains(pgno, PageKind::Leaf, 2));
         }
         assert_eq!(
             c.chunks_allocated(),
@@ -267,8 +259,8 @@ mod tests {
         );
         // The next directory block starts at chunk `MID_CHUNKS`.
         let far = (MID_CHUNKS * CHUNK_SLOTS) as u64;
-        assert!(!c.contains(far, StampKind::Leaf, 1), "unallocated misses");
-        c.publish(far, StampKind::Leaf, 1);
+        assert!(!c.contains(far, PageKind::Leaf, 1), "unallocated misses");
+        c.publish(far, PageKind::Leaf, 1);
         assert_eq!((mids_allocated(&c), c.chunks_allocated()), (2, 4));
         assert_eq!(
             c.allocated_bytes(),
@@ -287,10 +279,10 @@ mod tests {
             .chain([1, 4095, 4096, SLOTS as u64 - 1])
             .collect();
         for &p in &pgnos {
-            c.publish(p, StampKind::Leaf, p + 1);
+            c.publish(p, PageKind::Leaf, p + 1);
         }
         for &p in &pgnos {
-            assert!(c.contains(p, StampKind::Leaf, p + 1), "pgno {p}");
+            assert!(c.contains(p, PageKind::Leaf, p + 1), "pgno {p}");
         }
         assert_eq!(mids_allocated(&c), SLOTS / CHUNK_SLOTS / MID_CHUNKS);
     }
@@ -299,15 +291,15 @@ mod tests {
     fn pgnos_one_table_apart_share_a_slot() {
         let c = StampCache::new();
         let far = 7 + SLOTS as u64;
-        c.publish(7, StampKind::Leaf, 3);
-        c.publish(far, StampKind::Leaf, 3);
+        c.publish(7, PageKind::Leaf, 3);
+        c.publish(far, PageKind::Leaf, 3);
         assert!(
-            !c.contains(7, StampKind::Leaf, 3),
+            !c.contains(7, PageKind::Leaf, 3),
             "evicted by the collision"
         );
-        assert!(c.contains(far, StampKind::Leaf, 3));
+        assert!(c.contains(far, PageKind::Leaf, 3));
         assert!(
-            !c.contains(7, StampKind::Leaf, 3),
+            !c.contains(7, PageKind::Leaf, 3),
             "the pgno bits in the word, not just the slot, must match"
         );
     }
@@ -317,7 +309,7 @@ mod tests {
         let c = StampCache::new();
         let max_pgno = (1u64 << PGNO_BITS) - 1;
         let max_stamp = (1u64 << 50) - 1;
-        for kind in [StampKind::Leaf, StampKind::Branch] {
+        for kind in [PageKind::Leaf, PageKind::Branch] {
             c.publish(max_pgno, kind, max_stamp);
             assert!(c.contains(max_pgno, kind, max_stamp));
             assert!(!c.contains(max_pgno, kind, max_stamp - 1));
@@ -325,28 +317,28 @@ mod tests {
             assert!(!c.contains(max_pgno - SLOTS as u64, kind, max_stamp));
             assert!(!c.contains(max_pgno ^ (1 << (PGNO_BITS - 1)), kind, max_stamp));
         }
-        assert!(!c.contains(max_pgno, StampKind::Leaf, max_stamp));
-        assert!(c.contains(max_pgno, StampKind::Branch, max_stamp));
+        assert!(!c.contains(max_pgno, PageKind::Leaf, max_stamp));
+        assert!(c.contains(max_pgno, PageKind::Branch, max_stamp));
         let before = c.allocated_bytes();
         // Outside the domain: never published (nothing is allocated), never
         // a hit, and no truncated alias of an in-domain entry.
-        c.publish(0, StampKind::Leaf, 1u64 << 50);
-        c.publish(1u64 << PGNO_BITS, StampKind::Leaf, 1);
+        c.publish(0, PageKind::Leaf, 1u64 << 50);
+        c.publish(1u64 << PGNO_BITS, PageKind::Leaf, 1);
         assert_eq!(c.allocated_bytes(), before, "nothing was published");
-        assert!(!c.contains(0, StampKind::Leaf, 1u64 << 50));
-        assert!(!c.contains(1u64 << PGNO_BITS, StampKind::Leaf, 1));
-        c.publish(0, StampKind::Leaf, 0);
-        assert!(c.contains(0, StampKind::Leaf, 0), "stamp 0 is a valid word");
-        assert!(!c.contains(0, StampKind::Leaf, 1u64 << 50));
+        assert!(!c.contains(0, PageKind::Leaf, 1u64 << 50));
+        assert!(!c.contains(1u64 << PGNO_BITS, PageKind::Leaf, 1));
+        c.publish(0, PageKind::Leaf, 0);
+        assert!(c.contains(0, PageKind::Leaf, 0), "stamp 0 is a valid word");
+        assert!(!c.contains(0, PageKind::Leaf, 1u64 << 50));
     }
 
     #[test]
     fn colliding_pages_evict_each_other() {
         let c = StampCache::with_slots(1);
-        c.publish(1, StampKind::Leaf, 10);
-        c.publish(2, StampKind::Branch, 11);
-        assert!(!c.contains(1, StampKind::Leaf, 10));
-        assert!(c.contains(2, StampKind::Branch, 11));
+        c.publish(1, PageKind::Leaf, 10);
+        c.publish(2, PageKind::Branch, 11);
+        assert!(!c.contains(1, PageKind::Leaf, 10));
+        assert!(c.contains(2, PageKind::Branch, 11));
     }
 
     #[test]
@@ -359,7 +351,7 @@ mod tests {
             let c = c.clone();
             hs.push(std::thread::spawn(move || {
                 for i in 0..20_000u64 {
-                    c.publish(t, StampKind::Leaf, t * 1_000_000 + i);
+                    c.publish(t, PageKind::Leaf, t * 1_000_000 + i);
                 }
             }));
         }
@@ -369,8 +361,8 @@ mod tests {
                 for i in 0..20_000u64 {
                     // A mixed pair would be (0, 1_000_000 + i) or
                     // (1, i): never published.
-                    assert!(!c.contains(0, StampKind::Leaf, 1_000_000 + i));
-                    assert!(!c.contains(1, StampKind::Leaf, i));
+                    assert!(!c.contains(0, PageKind::Leaf, 1_000_000 + i));
+                    assert!(!c.contains(1, PageKind::Leaf, i));
                 }
             }));
         }
@@ -380,8 +372,8 @@ mod tests {
     }
 }
 
-// loom L7 (ADR-0018): a lookup never pairs one publish's key with another's
-// stamp. Run via `just loom`.
+// Loom model (ADR-0018): a lookup never pairs one publish's key with
+// another's stamp. Run with `just loom`.
 #[cfg(all(test, loom))]
 mod loom_tests {
     use super::*;
@@ -394,26 +386,26 @@ mod loom_tests {
             let c = Arc::new(StampCache::with_slots(1));
             // Allocate (the single chunk) before spawning so the model covers
             // the slot protocol, not `OnceLock`.
-            c.publish(9, StampKind::Leaf, 9);
+            c.publish(9, PageKind::Leaf, 9);
             let a = {
                 let c = c.clone();
-                thread::spawn(move || c.publish(1, StampKind::Leaf, 100))
+                thread::spawn(move || c.publish(1, PageKind::Leaf, 100))
             };
             let b = {
                 let c = c.clone();
-                thread::spawn(move || c.publish(2, StampKind::Leaf, 200))
+                thread::spawn(move || c.publish(2, PageKind::Leaf, 200))
             };
             // Mixed pairs were never published and must never hit; each
             // probe covers one direction of a mix between the publishers.
-            assert!(!c.contains(1, StampKind::Leaf, 200));
-            assert!(!c.contains(2, StampKind::Leaf, 100));
+            assert!(!c.contains(1, PageKind::Leaf, 200));
+            assert!(!c.contains(2, PageKind::Leaf, 100));
             a.join().unwrap();
             b.join().unwrap();
             // Quiescent: whichever publish owns the slot is intact.
             let hits = [
-                c.contains(9, StampKind::Leaf, 9),
-                c.contains(1, StampKind::Leaf, 100),
-                c.contains(2, StampKind::Leaf, 200),
+                c.contains(9, PageKind::Leaf, 9),
+                c.contains(1, PageKind::Leaf, 100),
+                c.contains(2, PageKind::Leaf, 200),
             ];
             assert_eq!(hits.iter().filter(|h| **h).count(), 1);
         });

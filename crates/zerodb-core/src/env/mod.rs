@@ -206,12 +206,11 @@ pub(crate) struct EnvInner {
     /// thread-agnostic flag+condvar lock (see [`WriterLock`]) so the guard —
     /// and with it `RwTxn` — is `Send`.
     write_mutex: WriterLock,
-    /// The published-snapshot cell (SPEC 04 TXN-18; ADR-0006 Option B): the
-    /// immutable `Arc<Snapshot>` behind a
-    /// bounded-O(1)-critical-section mutex, plus the mirroring SeqCst
-    /// `commit_point` atomic that carries the whole lock-free pin protocol
-    /// (TXN-17/19/20). Published in the TXN-19 order (swap the object, then
-    /// store the commit point).
+    /// The published-snapshot cell (SPEC 04 TXN-18; ADR-0006): the immutable
+    /// `Arc<Snapshot>` behind a mutex held only for a pointer swap or clone,
+    /// plus the SeqCst `commit_point` atomic that carries the lock-free pin
+    /// protocol (TXN-17/19/20). Published in the TXN-19 order (swap the
+    /// object, then store the commit point).
     snap_cell: SnapshotCell,
     /// Commit-pipeline crash hooks (ADR-0004; default `None` = no-op).
     commit_hook: Mutex<Option<Arc<dyn CommitHook>>>,
@@ -221,7 +220,7 @@ pub(crate) struct EnvInner {
     poisoned: AtomicBool,
     /// The MVCC reader table (SPEC 04 §4; ADR-0006): `max_readers` 128-byte
     /// slots, in this process's memory or, in a lock-file environment, in
-    /// the shared lock file (ADR-0023 §3). Readers claim/pin/release
+    /// the shared lock file (ADR-0023). Readers claim/pin/release
     /// slots lock-free; the writer's GC gate scans it (`oldest_live_reader`,
     /// TXN-21).
     reader_table: ReaderTable,
@@ -240,9 +239,8 @@ pub(crate) struct EnvInner {
     /// **Not persisted** — see `crate::cmp` for the reopen hazard
     /// (docs/LMDB-COMPATIBILITY.md, comparator persistence).
     comparators: ComparatorRegistry,
-    /// Catalog capacity (`max_dbs`), immutable after open. Duplicated out of
-    /// the `named` registry so read txns can size their dbi-indexed record
-    /// table without taking the registry lock.
+    /// Catalog capacity (`max_dbs`), immutable after open. Read txns size
+    /// their dbi-indexed record table from it without taking a lock.
     max_dbs: u32,
     /// Page-validation policy (ADR-0014), fixed at open. Every txn copies it
     /// into its validated-pages memo at begin.
@@ -315,14 +313,14 @@ impl std::fmt::Debug for EnvInner {
 impl EnvInner {
     /// The DB page size recorded in the live meta.
     #[must_use]
-    pub fn page_size(&self) -> u32 {
+    pub(crate) fn page_size(&self) -> u32 {
         self.page_size
     }
 
     /// The runtime map size (SPEC 00 row 20, `Env::info().map_size`): the
     /// logical size of the backing's current view (ADR-0023).
     #[must_use]
-    pub fn map_size(&self) -> u64 {
+    pub(crate) fn map_size(&self) -> u64 {
         self.backing_ref().view().map_size
     }
 
@@ -330,7 +328,7 @@ impl EnvInner {
     /// every commit, SPEC 04 TXN-19). SeqCst load inside the cell — see
     /// `crate::readers` for the TXN-17/19/20 StoreLoad pairing argument. In a
     /// lock-file environment it is the shared published txnid `T`, so it
-    /// includes other processes' commits (ADR-0023 §4).
+    /// includes other processes' commits (ADR-0023).
     ///
     /// One exception (ADR-0023, SPEC 04 TXN-67): in a
     /// `PREV_SNAPSHOT` opener with a lock file, between its first and second
@@ -339,7 +337,7 @@ impl EnvInner {
     /// a process that joined, it stays `T` even when [`Env::info`] reports a
     /// newer meta found on disk at open.
     #[must_use]
-    pub fn txnid(&self) -> u64 {
+    pub(crate) fn txnid(&self) -> u64 {
         let t = match &self.shared {
             // SeqCst: the same total order as the T stores (TXN-17/19).
             Some(region) => region.published_txnid().load(Ordering::SeqCst),
@@ -402,7 +400,7 @@ impl EnvInner {
     /// Finish a commit while this process holds the election
     /// (ADR-0023). The commit is durable; it is not published,
     /// as LMDB's first `MDB_PREVSNAPSHOT` commit leaves the shared txnid on
-    /// the older meta (`OBS_PREV_SNAPSHOT_COMMIT_TXNIDS`): `T` and the
+    /// the older meta: `T` and the
     /// published-snapshot cell keep the older snapshot, so the next writer
     /// begins from it and reuses this txnid (TXN-2). Then the election is
     /// finished, letting the processes that wait in it join.
@@ -436,9 +434,9 @@ impl EnvInner {
     /// `Arc`-clone the current published snapshot (SPEC 04 TXN-18). The
     /// clone keeps the `(txnid, roots)` alive for the caller's
     /// life regardless of later commits. Critical section: one refcount bump
-    /// (ADR-0006 Option B).
+    /// (ADR-0006).
     #[must_use]
-    pub fn snapshot(&self) -> Arc<Snapshot> {
+    pub(crate) fn snapshot(&self) -> Arc<Snapshot> {
         self.snap_cell.clone_snapshot()
     }
 
@@ -450,12 +448,12 @@ impl EnvInner {
     ///
     /// In a lock-file environment the shared published txnid `T` is stored
     /// last, which is the moment other processes begin to see the commit
-    /// (ADR-0023 §4).
+    /// (ADR-0023).
     pub(crate) fn publish_snapshot(&self, snap: Arc<Snapshot>) {
         let txnid = snap.txnid;
         self.snap_cell.publish(snap);
         if let Some(region) = &self.shared {
-            // ADR-0023 §4: T is stored after the meta write (and its fsync in
+            // ADR-0023: T is stored after the meta write (and its fsync in
             // the durable modes, C4/C5), and after the cache swap (TXN-19
             // object-before-counter). SeqCst pairs with every reader's
             // publish-and-verify and with the writer's SeqCst slot scan,
@@ -475,7 +473,7 @@ impl EnvInner {
     }
 
     /// Take the cross-process writer lock on top of the in-process one
-    /// (ADR-0023 §2); a no-op without a lock file. The guard releases it on
+    /// (ADR-0023); a no-op without a lock file. The guard releases it on
     /// drop, before the in-process slot. A writer that took the lock over
     /// from a dead owner then frees dead processes' reader slots (see
     /// [`EnvInner::lock_writer_region`]).
@@ -528,9 +526,9 @@ impl EnvInner {
     }
 
     /// Free the reader slots of dead processes (`mdb_reader_check`,
-    /// ADR-0023 §3). Returns the number of slots freed (the fork's
-    /// `mdb_reader_check` also counts slots, ADR-0023); always 0
-    /// without a lock file, where every slot belongs to this process.
+    /// ADR-0023). Returns the number of slots freed, as `mdb_reader_check`
+    /// does; always 0 without a lock file, where every slot belongs to this
+    /// process.
     ///
     /// # Errors
     ///
@@ -550,7 +548,7 @@ impl EnvInner {
 
     /// Whether a failed commit fsync poisoned the env (SPEC 06 REC-13).
     #[must_use]
-    pub fn is_poisoned(&self) -> bool {
+    pub(crate) fn is_poisoned(&self) -> bool {
         // Acquire: pairs with the Release in `poison` so a writer that
         // observes the flag also observes everything before the failure.
         self.poisoned.load(Ordering::Acquire)
@@ -565,7 +563,7 @@ impl EnvInner {
     /// Install (or clear) the commit-pipeline crash hook (ADR-0004). Test
     /// infrastructure for the commit smoke test and the crash harness; the
     /// default (`None`) makes every hook site a no-op.
-    pub fn set_commit_hook(&self, hook: Option<Arc<dyn CommitHook>>) {
+    pub(crate) fn set_commit_hook(&self, hook: Option<Arc<dyn CommitHook>>) {
         *self.commit_hook.lock().expect("hook cell poisoned") = hook;
     }
 
@@ -596,7 +594,7 @@ impl EnvInner {
     ///
     /// In a lock-file environment the commit point is the shared published
     /// txnid `T` and the snapshot comes from [`EnvInner::snapshot_at`]
-    /// (ADR-0023 §4).
+    /// (ADR-0023).
     ///
     /// # Errors
     ///
@@ -672,7 +670,7 @@ impl EnvInner {
     }
 
     /// The latest published snapshot. In a lock-file environment it follows
-    /// the shared `T`, so it includes other processes' commits (ADR-0023 §4);
+    /// the shared `T`, so it includes other processes' commits (ADR-0023);
     /// otherwise it is [`EnvInner::snapshot`]. The writer's base.
     ///
     /// # Errors
@@ -779,19 +777,19 @@ impl EnvInner {
     /// The reader table's fixed slot count (`MDB_envinfo::me_maxreaders`):
     /// `max_readers` as configured at open, or, in a lock-file environment,
     /// the count recorded in the lock file, which a joining process adopts
-    /// (ADR-0023 §1 as amended).
+    /// (ADR-0023).
     #[must_use]
-    pub fn max_readers(&self) -> u32 {
+    pub(crate) fn max_readers(&self) -> u32 {
         self.reader_table.capacity()
     }
 
     /// `MDB_envinfo::me_numreaders` parity: the **high-water** reader-slot
     /// count, which never decreases when a read txn ends, over every
     /// process's readers in a lock-file environment. See
-    /// [`crate::readers::ReaderTable::num_readers`] for the fork evidence and
+    /// [`crate::readers::ReaderTable::num_readers`] and
     /// docs/LMDB-COMPATIBILITY.md (`me_numreaders` semantics).
     #[must_use]
-    pub fn num_readers(&self) -> u32 {
+    pub(crate) fn num_readers(&self) -> u32 {
         self.reader_table.num_readers()
     }
 
@@ -799,7 +797,7 @@ impl EnvInner {
     /// number [`EnvInner::num_readers`] misleadingly looks like.
     /// A concurrently-sampled diagnostic count, not a synchronization point.
     #[must_use]
-    pub fn live_readers(&self) -> u32 {
+    pub(crate) fn live_readers(&self) -> u32 {
         self.reader_table.in_use()
     }
 
@@ -812,7 +810,7 @@ impl EnvInner {
     /// for its dbi, defaulting to memcmp.
     #[must_use]
     #[inline]
-    pub fn comparator_for(&self, sel: crate::rotxn::DbSel) -> KeyCmp<'_> {
+    pub(crate) fn comparator_for(&self, sel: crate::rotxn::DbSel) -> KeyCmp<'_> {
         match sel {
             crate::rotxn::DbSel::Main => KeyCmp::Default,
             crate::rotxn::DbSel::Named(dbi) => self.comparators.get(dbi),
@@ -832,14 +830,14 @@ impl EnvInner {
     /// Whether any custom comparator is registered on this env.
     /// Gates the memcmp-only compacting-copy path (SPEC 03 §2.0).
     #[must_use]
-    pub fn has_custom_comparator(&self) -> bool {
+    pub(crate) fn has_custom_comparator(&self) -> bool {
         self.comparators.any_custom()
     }
 
     /// Per-slot reader introspection — `mdb_reader_list`. See
     /// [`Env::reader_list`] for the full contract; this is the raw form.
     #[must_use]
-    pub fn reader_list(&self) -> Vec<ReaderEntry> {
+    pub(crate) fn reader_list(&self) -> Vec<ReaderEntry> {
         // Sample the commit point *once* so every age in the returned vector
         // is relative to the same reference point. Sampling per entry would
         // make the ages mutually inconsistent for no benefit.
@@ -865,7 +863,7 @@ impl EnvInner {
     /// SeqCst full-table scan of SPEC 04 TXN-20 (two-case proof quoted at the
     /// scan site, `crate::readers::ReaderTable::oldest`). The GC gate folds it
     /// with `writer_txnid − 1` (TXN-20/21) and caches it per write txn
-    /// (TXN-22; ADR-0006 decision 6).
+    /// (TXN-22; ADR-0006).
     #[must_use]
     pub(crate) fn oldest_live_reader(&self) -> Option<u64> {
         self.reader_table.oldest()
@@ -899,19 +897,19 @@ impl EnvInner {
 
     /// Whether this env was opened on the previous (older) snapshot.
     #[must_use]
-    pub fn is_prev_snapshot(&self) -> bool {
+    pub(crate) fn is_prev_snapshot(&self) -> bool {
         self.prev_snapshot
     }
 
     /// The env-level durability / write-mode flags (SPEC 01 §S6/§S7).
     #[must_use]
-    pub fn durability(&self) -> DurabilityFlags {
+    pub(crate) fn durability(&self) -> DurabilityFlags {
         self.durability
     }
 
     /// The page-validation policy this env was opened with (ADR-0014).
     #[must_use]
-    pub fn file_trust(&self) -> FileTrust {
+    pub(crate) fn file_trust(&self) -> FileTrust {
         self.file_trust
     }
 
@@ -921,23 +919,23 @@ impl EnvInner {
     }
 
     /// Test/diagnostics hook (ADR-0018; like
-    /// [`crate::rwtxn::RwTxn::spills`]): whether the env-wide
+    /// [`crate::rwtxn::RwTxn::spill_count`]): whether the env-wide
     /// validated-pages cache currently holds exactly the page version
     /// `(pgno, kind, stamp)` — `branch` selects the kind half of the key.
     /// Observes only; never part of the stable API.
     #[must_use]
-    pub fn stamp_cache_has(&self, pgno: u64, branch: bool, stamp: u64) -> bool {
+    pub(crate) fn stamp_cache_has(&self, pgno: u64, branch: bool, stamp: u64) -> bool {
         let kind = if branch {
-            crate::stamps::StampKind::Branch
+            crate::btree::PageKind::Branch
         } else {
-            crate::stamps::StampKind::Leaf
+            crate::btree::PageKind::Leaf
         };
         self.stamp_cache.contains(pgno, kind, stamp)
     }
 
     /// A write txn's dirty limit in pages (SPEC 04 TXN-68, ADR-0017).
     #[must_use]
-    pub fn dirty_limit(&self) -> u64 {
+    pub(crate) fn dirty_limit(&self) -> u64 {
         self.dirty_limit
     }
 
@@ -945,7 +943,7 @@ impl EnvInner {
     /// writes fast path: its override if set, else the env default
     /// (ADR-0015).
     #[must_use]
-    pub fn sequential_writes_for(&self, dbi: Option<u32>) -> bool {
+    pub(crate) fn sequential_writes_for(&self, dbi: Option<u32>) -> bool {
         let slot = dbi.map_or(0, |d| d as usize + 1);
         // Ordering: `Relaxed` — the value is a performance hint that selects
         // between two paths with identical results, it publishes no other
@@ -965,7 +963,7 @@ impl EnvInner {
     /// (`dbi = None`) or named DB `dbi` (ADR-0015). Write txns that start
     /// after the call use it; an out-of-range dbi (impossible for a handle
     /// the engine produced) is ignored.
-    pub fn set_sequential_writes(&self, dbi: Option<u32>, on: Option<bool>) {
+    pub(crate) fn set_sequential_writes(&self, dbi: Option<u32>, on: Option<bool>) {
         let slot = dbi.map_or(0, |d| d as usize + 1);
         let v = match on {
             None => SEQ_FOLLOW,
@@ -980,18 +978,13 @@ impl EnvInner {
 
     /// Whether the env is read-only (`MDB_RDONLY`, SPEC 01 Table 1).
     #[must_use]
-    pub fn is_read_only(&self) -> bool {
+    pub(crate) fn is_read_only(&self) -> bool {
         self.durability.read_only
-    }
-
-    /// [`EnvInner::sync`]`(true)`, the only form heed exposes.
-    pub fn force_sync(&self) -> Result<(), Error> {
-        self.sync(true)
     }
 
     /// Explicit environment sync — full `mdb_env_sync(env, force)` parity
     /// (SPEC 01 §S6). heed exposes only the `force = true` form
-    /// ([`EnvInner::force_sync`]); `force = false` is a ZeroDB extension.
+    /// ([`Env::force_sync`]); `force = false` is a ZeroDB extension.
     ///
     /// The fork's `mdb_env_sync0` decides three things, reproduced exactly:
     ///
@@ -1017,7 +1010,7 @@ impl EnvInner {
     /// - [`Error::Io`] if the env is already poisoned (SPEC 06 REC-13).
     /// - [`Error::Io`] on an `msync`/`fsync` failure — which also **poisons**
     ///   the env (REC-13), exactly like a failed commit barrier.
-    pub fn sync(&self, force: bool) -> Result<(), Error> {
+    pub(crate) fn sync(&self, force: bool) -> Result<(), Error> {
         // (1) RDONLY is rejected before the NO_SYNC test, as in mdb_env_sync0.
         if self.durability.read_only {
             return Err(crate::error::eacces());
@@ -1049,12 +1042,12 @@ impl EnvInner {
 
     /// The canonical directory path (SPEC 00 row 21).
     #[must_use]
-    pub fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 
     /// The actual on-disk file length (SPEC 00 row 18).
-    pub fn real_disk_size(&self) -> Result<u64, Error> {
+    pub(crate) fn real_disk_size(&self) -> Result<u64, Error> {
         match self.backing.as_ref() {
             Some(b) => Ok(b.real_disk_size()?),
             None => Err(Error::Mdb(MdbError::Invalid)),
@@ -1068,7 +1061,7 @@ impl EnvInner {
     /// only after close has released the map (never observed by a live txn).
     #[must_use]
     #[inline]
-    pub fn backing_bytes(&self) -> &[u8] {
+    pub(crate) fn backing_bytes(&self) -> &[u8] {
         match self.backing.as_ref() {
             Some(b) => b.bytes(),
             None => &[],
@@ -1078,12 +1071,12 @@ impl EnvInner {
     /// The path the data file was opened at (SPEC 00 row 17: a raw copy
     /// clones the file it names, after checking it is still the same file).
     #[must_use]
-    pub fn data_path(&self) -> Option<&Path> {
+    pub(crate) fn data_path(&self) -> Option<&Path> {
         self.backing.as_ref().and_then(|b| b.data_path())
     }
 
     /// `dup()` the data-file fd for raw snapshot streaming (SPEC 00 row 22).
-    pub fn try_clone_inner_file(&self) -> Result<std::fs::File, Error> {
+    pub(crate) fn try_clone_inner_file(&self) -> Result<std::fs::File, Error> {
         match self.backing.as_ref() {
             Some(b) => Ok(b.try_clone_file()?),
             None => Err(Error::Mdb(MdbError::Invalid)),
@@ -1242,8 +1235,7 @@ impl Env {
     /// (ADR-0023).
     ///
     /// - `0` adopts the map size recorded in the newest committed meta
-    ///   (`OBS_SET_MAPSIZE_ZERO_ADOPTS`), the answer to a
-    ///   [`MdbError::MapResized`] begin.
+    ///   as LMDB does, the answer to a [`MdbError::MapResized`] begin.
     /// - A size below the newest snapshot's data rounds up to exactly
     ///   `(last_pg + 1) * page_size`, silently, as LMDB does.
     /// - A smaller size than the current mapping lowers only the logical
@@ -1254,14 +1246,14 @@ impl Env {
     /// cross-process writer lock, waiting like a write begin, so no commit
     /// lands while it rounds up. LMDB takes no lock here: its
     /// `mdb_env_set_mapsize` returns while another process holds a write txn
-    /// (`OBS_SET_MAPSIZE_OTHER_PROCESS_WRITER`; docs/LMDB-COMPATIBILITY.md D-023).
+    /// (LMDB-COMPATIBILITY D-023).
     /// Under `WRITE_MAP` it grows the data file to the new size, never
     /// shrinking it.
     ///
     /// # Errors
     ///
     /// - [`Error::Io`] with raw OS error `EINVAL` (22) while a write txn of
-    ///   this env is live (`OBS_SET_MAPSIZE_WITH_WRITE_TXN`).
+    ///   this env is live, as in LMDB.
     /// - [`Error::Io`] (`InvalidInput`) for a requested size above
     ///   [`MAX_MAP_SIZE`](crate::page::geometry::MAX_MAP_SIZE);
     ///   [`MdbError::Invalid`] when `0` adopts a meta size above it (a corrupt
@@ -1270,13 +1262,13 @@ impl Env {
     ///   file growth.
     pub fn resize(&self, new_size: u64) -> Result<(), Error> {
         let inner = self.inner();
-        // OBS_SET_MAPSIZE_WITH_WRITE_TXN: EINVAL while a write txn is live.
+        // `EINVAL` while a write txn is live, as in LMDB.
         let mut guard = inner
             .write_mutex
             .try_acquire()
             .ok_or_else(crate::error::einval)?;
-        // Step 2: the cross-process writer lock (a no-op without a lock
-        // file), through the write begin's path, which reaps after a
+        // The cross-process writer lock (a no-op without a lock file),
+        // through the write begin's path, which reaps after a
         // dead-owner takeover. Every error below drops `guard`, releasing
         // both locks.
         inner.lock_writer_shared(&mut guard)?;
@@ -1284,7 +1276,7 @@ impl Env {
         // `mdb_env_set_mapsize`, including an unpublished first commit.
         let snap = inner.or_newer_unpublished(inner.newest_snapshot_unchecked()?);
         let min = bytes_needed(snap.last_pg, inner.page_size())?;
-        // OBS_SET_MAPSIZE_ZERO_ADOPTS: 0 adopts the newest meta's size.
+        // 0 adopts the newest meta's size, as in LMDB.
         let (size, from_meta) = if new_size == 0 {
             (snap.map_size, true)
         } else {
@@ -1320,13 +1312,13 @@ impl Env {
     /// consumes a reader slot. In a lock-file environment the snapshot follows
     /// the shared published txnid `T` (`EnvInner::current_snapshot`), so
     /// `last_pgno`/`last_txnid` reflect another process's commit as soon as it
-    /// publishes (`OBS_INFO_SEES_OTHER_COMMIT`, ADR-0023 §4). This call stays
+    /// publishes, as in LMDB (ADR-0023). This call stays
     /// infallible: if the snapshot at `T` cannot be read right now (for
     /// example [`MdbError::MapResized`], when `T` has moved past a commit that
     /// grew the map beyond this process's current mapping), it falls back to
     /// this process's own cached snapshot (`EnvInner::snapshot`) rather than
     /// surfacing the error, which can under-report a page/txnid that another
-    /// process has already published. That fallback has no dedicated test.
+    /// process has already published.
     ///
     /// It can also report a commit that no read txn sees yet, as LMDB's
     /// `mdb_env_info` reports the newest meta on disk (ADR-0023,
@@ -1366,7 +1358,7 @@ impl Env {
     /// are ZeroDB-format values (own on-disk format) and must not be compared to LMDB's.
     /// In a lock-file environment this follows the shared published txnid `T`
     /// the same way [`Env::info`] does, so another process's commit is visible
-    /// as soon as it publishes (`OBS_STAT_SEES_OTHER_COMMIT`), with the same
+    /// as soon as it publishes, with the same
     /// fall back to the cached snapshot if the read at `T` fails.
     ///
     /// Like [`Env::info`], it reports an unpublished `PREV_SNAPSHOT` first
@@ -1410,10 +1402,7 @@ impl Env {
     /// The reader table is lock-free (SPEC 04 §4): slots are read one at a
     /// time, so **entries can already be stale by the time this returns**, and
     /// the vector may correspond to no single instant — a read txn can end (or
-    /// begin) between two slot loads. This is inherent to lock-free
-    /// introspection, not an implementation shortcut: the only way to get a
-    /// linearizable answer would be to stop the world, which would make the
-    /// diagnostic itself a correctness hazard. Treat the result as a
+    /// begin) between two slot loads. Treat the result as a
     /// monitoring sample. Nothing in the engine consults it; the GC gate uses
     /// a different scan (TXN-20) whose staleness is provably one-directional.
     ///
@@ -1428,7 +1417,7 @@ impl Env {
     /// `mdb_reader_check`. Returns the number of slots freed, counting
     /// slots, not processes.
     ///
-    /// With a lock file (the default, ADR-0023 §3) the reader table is shared
+    /// With a lock file (the default, ADR-0023) the reader table is shared
     /// across processes, and one that dies inside a read txn leaves its slot
     /// pinned, holding GC back; this probes the owner of every occupied slot
     /// and frees those of processes that no longer have the environment
@@ -1446,9 +1435,8 @@ impl Env {
         self.inner.clear_stale_readers()
     }
 
-    /// Whether any custom key comparator is registered on this environment
-    /// Gates the memcmp-only compacting-copy path
-    /// (SPEC 03 §2.0).
+    /// Whether any custom key comparator is registered on this environment.
+    /// Gates the memcmp-only compacting-copy path (SPEC 03 §2.0).
     #[must_use]
     pub fn has_custom_comparator(&self) -> bool {
         self.inner.has_custom_comparator()
@@ -1506,10 +1494,10 @@ impl Env {
     /// [`Error::Io`] (`EACCES`) on a read-only env; [`Error::Io`] on an
     /// `msync`/`fsync` failure (which poisons the env, REC-13).
     pub fn force_sync(&self) -> Result<(), Error> {
-        self.inner.force_sync()
+        self.inner.sync(true)
     }
 
-    /// Explicit environment sync with full `mdb_env_sync(env, force)` parity
+    /// Explicit environment sync with full `mdb_env_sync(env, force)` parity.
     /// `force = false` is a ZeroDB extension — heed exposes
     /// only [`Env::force_sync`]. See `EnvInner::sync` for the exact
     /// three-way semantics (`EACCES`, the `force || !NO_SYNC` gate, and the
@@ -1557,9 +1545,9 @@ impl Env {
         Arc::strong_count(&self.inner)
     }
 
-    /// Install (or clear) the commit-pipeline crash hook (ADR-0004). See
-    /// `EnvInner::set_commit_hook`; test infrastructure (commit smoke test,
-    /// crash harness).
+    /// Install (or clear) the commit-pipeline crash hook (ADR-0004). Test
+    /// hook for the commit smoke test and the crash harness.
+    #[doc(hidden)]
     pub fn set_commit_hook(&self, hook: Option<Arc<dyn CommitHook>>) {
         self.inner.set_commit_hook(hook);
     }

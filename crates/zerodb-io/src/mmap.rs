@@ -16,7 +16,7 @@
 //!    `WRITE_MAP`, the writer grows the file to the logical map size before it
 //!    stores through the map (SPEC 04 §6.4). No process truncates the file.
 //! 3. **One writer, writing only unshared pages.** One write txn at a time
-//!    across processes (TXN-6, ADR-0023 §2). It writes only pages no live
+//!    across processes (TXN-6, ADR-0023). It writes only pages no live
 //!    snapshot references (TXN-62: fresh pages, or pages freed before the
 //!    oldest reader) and the two meta slots, which are never lent out as
 //!    borrows (readers use the published snapshot object, TXN-18; a meta is

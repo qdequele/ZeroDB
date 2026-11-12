@@ -6,12 +6,11 @@
 //! onto `heed::Error`; the public `zerodb` crate re-exports them
 //! verbatim.
 //!
-//! SPEC note: several distinct open-time failures (bad magic, wrong
-//! `format_version`, bad `page_size`, torn/CRC-failed meta, both-slots-invalid)
-//! all collapse to [`MdbError::Invalid`] — this is the mapping SPEC 02 §3.2 /
-//! SPEC 06 REC-1..5 mandate (heed's `MdbError::Invalid` → `InvalidStoreFile`,
-//! SPEC 00 row 56). There is no separate `VersionMismatch`/`PageSizeMismatch`
-//! variant: the spec folds them into `Invalid`.
+//! Several distinct open-time failures (bad magic, wrong `format_version`,
+//! bad `page_size`, a torn or CRC-failed meta, both meta slots invalid) all
+//! map to [`MdbError::Invalid`], as SPEC 02 §3.2 and SPEC 06 REC-1..5 require
+//! (SPEC 00 row 56). There is no separate `VersionMismatch` or
+//! `PageSizeMismatch` variant.
 
 /// The top-level engine error, mirroring `heed::Error`'s shape.
 #[derive(Debug, thiserror::Error)]
@@ -46,22 +45,23 @@ pub enum MdbError {
     MapFull,
 
     /// `MDB_BAD_VALSIZE` — a key/value violates the size bounds (SPEC 00
-    /// row 57). Not produced by env open; reserved for the write/read paths.
+    /// row 57). Returned by reads and writes.
     #[error("key or value size is out of bounds")]
     BadValSize,
 
     /// `MDB_KEYEXIST` — key already present (`APPEND`/`NO_OVERWRITE`). SPEC 00
-    /// row 58. Not produced by env open; reserved for the write path.
+    /// row 58. Returned by writes.
     #[error("key already exists")]
     KeyExist,
 
-    /// `MDB_NOTFOUND` — key not found. Reserved for the read/write paths.
+    /// `MDB_NOTFOUND` — key not found. No operation in this crate returns it;
+    /// the heed adapter maps it to `heed::MdbError::NotFound`.
     #[error("key not found")]
     NotFound,
 
     /// `MDB_DBS_FULL` — the named-DB catalog is full (`create_database` beyond
     /// `max_dbs`; SPEC 00 row 4, SPEC 01 §S8). Its `Debug` renders as `DbsFull`,
-    /// matching `heed::MdbError::DbsFull` so the oracle's error taxonomy agrees.
+    /// matching `heed::MdbError::DbsFull`.
     #[error("environment maxdbs reached")]
     DbsFull,
 
@@ -78,7 +78,7 @@ pub enum MdbError {
     /// by `EnvOpenOptions::max_readers`, default 126). Raised immediately,
     /// without first reaping slots left by dead processes, as in the LMDB
     /// fork (ADR-0023). `Debug` renders as `ReadersFull`, matching
-    /// `heed::MdbError::ReadersFull` for oracle taxonomy parity.
+    /// `heed::MdbError::ReadersFull`.
     #[error("environment maxreaders limit reached")]
     ReadersFull,
 
@@ -114,8 +114,8 @@ pub(crate) fn einval() -> Error {
 }
 
 /// `EACCES` as heed surfaces it (`Error::Io(PermissionDenied)`, raw OS error
-/// 13): the fork's `mdb_txn_begin` answer to a write attempt on a read-only
-/// env (SPEC 01 Table 1, TXN-8).
+/// 13): what the LMDB fork's `mdb_txn_begin` returns for a write attempt on
+/// a read-only env (SPEC 01 Table 1, TXN-8).
 pub(crate) fn eacces() -> Error {
     Error::Io(std::io::Error::from_raw_os_error(13))
 }

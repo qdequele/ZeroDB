@@ -5,7 +5,7 @@
 //!
 //! [`Env::write_txn`] acquires the env's in-process write mutex (TXN-6) and
 //! holds the guard for the txn's whole life. All mutation runs against the
-//! txn-private [`DirtyStore`] (TXN-41 stable frames); reads on the txn resolve
+//! txn-private `DirtyStore` (TXN-41 stable frames); reads on the txn resolve
 //! dirty frames first, then the read-only map (TXN-38), through the same
 //! [`Database`] read API as a `RoTxn` (via [`TxnRead`]). heed's borrow model is
 //! the compile-time enforcement of the value-borrow contract: reads take
@@ -329,7 +329,7 @@ fn poisoned_error() -> Error {
 /// The `EACCES` a write txn on a read-only env returns (SPEC 01 Table 1, TXN-8).
 /// The fork's `mdb_txn_begin` returns `EACCES`, which heed surfaces as
 /// `Error::Io(PermissionDenied)` (os error 13); ZeroDB returns the identical
-/// value so the oracle taxonomy agrees.
+/// value, so callers see the same error from both engines.
 fn read_only_error() -> Error {
     Error::Io(std::io::Error::from_raw_os_error(13))
 }
@@ -387,7 +387,7 @@ pub struct RwTxn<'env> {
     validated: ValidatedPages<'env>,
     /// `freelist_save`'s GC-32 placement decision: `true` = this txn's own
     /// entry rides in the meta annex (C4 encodes `freed` as `fl_ids`; no
-    /// GC-tree entry `BE(txnid)` exists), `false` = the v1 tree arm ran (or
+    /// GC-tree entry `BE(txnid)` exists), `false` = the GC-tree arm ran (or
     /// `freed` is empty) and the annex is empty.
     annex_out: bool,
     /// GC-12 allocation restriction (ADR-0005).
@@ -456,7 +456,7 @@ impl Env {
         }
         let mut guard = inner.lock_writer();
         // In a lock-file environment, also the cross-process writer lock
-        // (ADR-0023 §2); a no-op otherwise.
+        // (ADR-0023); a no-op otherwise.
         inner.lock_writer_shared(&mut guard)?;
         // Recheck under the lock: a concurrent commit may have failed while we
         // blocked on the mutex.
@@ -473,7 +473,7 @@ impl Env {
             grow_file_to_map(inner)?;
         }
         // The latest published snapshot, which in a lock-file env may be
-        // another process's commit (ADR-0023 §4). The previous write txn's
+        // another process's commit (ADR-0023). The previous write txn's
         // snapshot, carried on the writer slot, serves when it is still the
         // latest.
         let cached = guard.carry().snapshot.take();
@@ -538,9 +538,9 @@ impl Env {
             finger_hits: 0,
             psize: inner.page_size(),
             dirty,
-            // ADR-0018: the writer probes the env
-            // cache (the previous commit seeded it with the very pages this
-            // txn's first descent walks) but never publishes from a miss.
+            // ADR-0018: the writer probes the env cache (the previous
+            // commit seeded it with the very pages this txn's first descent
+            // walks) but never publishes from a miss.
             validated: ValidatedPages::for_writer(inner.file_trust(), Some(inner.stamp_cache())),
             annex_out: false,
             alloc_mode: AllocMode::Normal,
@@ -685,9 +685,9 @@ impl<'env> RwTxn<'env> {
         // and refuses with BadTxn (LMDB `MDB_BAD_TXN` = "transaction … has a
         // child") in BOTH debug and release. Normally unreachable (the child
         // holds a shared `&RwTxn` borrow, so no `&mut` op can even be
-        // called); it backstops `unsafe`/FFI lifetime erasure (e.g. the
-        // oracle). The `Acquire` inside `live()` pairs with each child-drop's
-        // `Release` (see `crate::nested`).
+        // called); it backstops `unsafe`/FFI lifetime erasure. The `Acquire`
+        // inside `live()` pairs with each child-drop's `Release` (see
+        // `crate::nested`).
         if self.children.live() != 0 {
             return Err(Error::Mdb(MdbError::BadTxn));
         }
@@ -742,7 +742,8 @@ impl<'env> RwTxn<'env> {
 
     /// Ensure the named DB `dbi`'s working record is loaded into
     /// [`WriterCarry::open`] (from the catalog view, or empty if the entry
-    /// does not yet exist), and return its tree selector. Idempotent. The main DB needs no loading.
+    /// does not yet exist), and return its tree selector. Idempotent. The
+    /// main DB needs no loading.
     fn ensure_open(&mut self, db: &Database) -> Result<TreeId> {
         // TXN-29 airtightness: `ensure_open` mutates the open table, which
         // live children read through `record_for` — so the child guard fires
@@ -789,10 +790,10 @@ impl<'env> RwTxn<'env> {
     /// txn begin would predate those writes: under Stacked/Tree Borrows,
     /// copying such a stale `&[u8]` — let alone reading a spilled page
     /// through it — is undefined behavior at the written locations
-    /// (ADR-0021). The in-map arm
-    /// therefore borrows the view **lazily per access**, exactly as `RoTxn`
-    /// does: a fresh borrow at a `&self` boundary postdates every in-place
-    /// write, and none can happen while it lives (TXN-39).
+    /// (ADR-0021). The in-map arm therefore borrows the view **lazily per
+    /// access**, exactly as `RoTxn` does: a fresh borrow at a `&self`
+    /// boundary postdates every in-place write, and none can happen while
+    /// it lives (TXN-39).
     ///
     /// Heap modes keep the cached view (`self.bytes`, re-derived per spill —
     /// TXN-71, ADR-0021): their mid-txn file writes go through the fd,

@@ -47,7 +47,7 @@ impl<'env> RwTxn<'env> {
         self.guard_ok()?;
         // Read-side key leniency (§2.1): an oversized key simply finds
         // nothing (`Ok(false)`); the empty-key `BadValSize` is an API-boundary
-        // concern (oracle adapter / heed adapter).
+        // concern (the heed adapter).
         let mut path = std::mem::take(&mut work_mut!(self).path_buf);
         let res = match self.search_path_into(tree, key, &mut path) {
             // The path is transient here, so its fate is irrelevant.
@@ -124,8 +124,9 @@ impl<'env> RwTxn<'env> {
     }
 
     /// One leaf step of `Database::delete_range` (SPEC 00 row 37; SPEC 03,
-    /// delete_range note): descend to `first` — a key the caller just read from this
-    /// tree's range, so it exists and is covered by both bounds — splice the
+    /// delete_range note): descend to `first` — a key the caller just read
+    /// from this tree's range, so it exists and is covered by both bounds —
+    /// splice the
     /// whole covered span of its leaf out in one compaction, and rebalance
     /// that leaf once. Returns the number of entries deleted and, when the
     /// span ran to the leaf's end (covered keys may remain in later leaves),
@@ -375,7 +376,7 @@ impl<'env> RwTxn<'env> {
     /// `delete_range`'s walk mode (SPEC 03 §10 empty-page rule): an emptied
     /// leaf takes the merge arm outright instead of borrowing; every other
     /// delete path passes `false` and keeps the default neighbor policy
-    /// bit-for-bit (the churn-flatness pins depend on it).
+    /// exactly.
     /// Returns the [`PathFate`] of `path` (SPEC 03 §5.4a): `Unchanged` when
     /// the delete only removed a cell from its leaf; `Kept`/`KeptShrunk` when
     /// a borrow or merge with either sibling changed the shape and every

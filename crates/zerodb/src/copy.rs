@@ -37,7 +37,7 @@
 //!   file's first `(last_pg + 1) × page_size` bytes, which std performs with
 //!   `copy_file_range`, which these filesystems turn into a block clone
 //!   (reflink). Elsewhere `copy_file_range` copies bytes through a pipe,
-//!   measured slower than streaming from the map, so the copy streams.
+//!   which is slower than streaming from the map, so the copy streams.
 //! - **Clone** (macOS, a copy to a path without a progress callback):
 //!   `std::fs::copy` of the whole file, which std performs with
 //!   `fclonefileat` (an APFS clone that shares the file's blocks), and with
@@ -76,9 +76,10 @@ use zerodb_core::page::FIRST_DATA_PGNO;
 use zerodb_core::page::{MetaPage, FORMAT_VERSION, F_SUBDATA, MAGIC};
 use zerodb_core::{for_each_entry_flagged, named_databases, RoTxn};
 
-/// Whether [`CopyToFile::copy_to_file`] compacts (`heed::CompactionOption`). `Enabled` rewrites into a fresh, densely-packed env with no
-/// free pages (`MDB_CP_COMPACT`); `Disabled` copies the snapshot's pages
-/// verbatim, keeping the freelist.
+/// Whether [`CopyToFile::copy_to_file`] compacts (`heed::CompactionOption`).
+/// `Enabled` rewrites into a fresh, densely-packed env with no free pages
+/// (`MDB_CP_COMPACT`); `Disabled` copies the snapshot's pages verbatim,
+/// keeping the freelist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionOption {
     /// Rewrite into a fresh compact env (bottom-up packed, no free pages).
@@ -366,8 +367,8 @@ fn open_file_route(src: Option<&DataFile>, file: &File) -> RawRoute {
 
 /// Filesystems on which Linux `copy_file_range` within one filesystem shares
 /// blocks (a reflink) instead of copying bytes. Elsewhere (ext4, tmpfs,
-/// overlayfs, NFS, ...) the kernel copies the bytes through a pipe, which was
-/// measured slower than writing from the map (ext4: about twice the time).
+/// overlayfs, NFS, ...) the kernel copies the bytes through a pipe, which is
+/// slower than writing from the map (ADR-0032).
 const REFLINK_FILESYSTEMS: [&str; 3] = ["xfs", "btrfs", "bcachefs"];
 
 /// The type of the filesystem mounted at the deepest mount point containing
@@ -888,8 +889,8 @@ fn snapshot_metas(env: &Env, txn: &RoTxn<'_>) -> Result<Vec<u8>> {
 /// would produce a tree whose physical order is the comparator's but whose
 /// builder-side reasoning assumed memcmp — and the resulting file records no
 /// comparator identity, so nothing downstream (`zerodb-tools check`,
-/// `dump`/`load`) could tell. Refusing loudly is the only honest option while
-/// the builder, the dump format and the tools are memcmp-only.
+/// `dump`/`load`) could tell. The copy is therefore refused while the
+/// builder, the dump format and the tools are memcmp-only.
 ///
 /// `CompactionOption::Disabled` (the raw page copy) is unaffected: it is a
 /// byte-level copy that preserves whatever order is on disk.

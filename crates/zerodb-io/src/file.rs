@@ -39,7 +39,7 @@ pub(crate) fn open_file(path: &Path, read_only: bool) -> std::io::Result<File> {
 }
 
 /// Positioned read of exactly `buf.len()` bytes at page `pgno` (a kernel copy,
-/// not a borrowed map slice — ADR-0023 §4): used to decode a meta slot that
+/// not a borrowed map slice — ADR-0023): used to decode a meta slot that
 /// another process may be rewriting concurrently.
 ///
 /// # Errors
@@ -126,12 +126,26 @@ fn next_write_run<'a>(
     n
 }
 
+/// Run `op` again for as long as it fails with
+/// [`std::io::ErrorKind::Interrupted`] (`EINTR`: a signal arrived before the
+/// call did anything), as std's `write_all_at` does. Any other outcome is
+/// returned.
+fn retry_interrupted<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    loop {
+        match op() {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            other => return other,
+        }
+    }
+}
+
 /// Vectored positioned write of consecutive page-multiple `frames` laid out
 /// back-to-back from `start_pgno * psize` (commit C2 batching): one
 /// `pwritev` per [`MAX_WRITE_BYTES`] (or per page, if a page is larger)
 /// instead of one syscall per dirty page.
 ///
-/// A short write (rare on regular files) falls back to positioned
+/// A call interrupted by a signal before it wrote anything (`EINTR`) is
+/// issued again. A short write (rare on regular files) falls back to positioned
 /// `write_all_at` of each segment of that call — positioned rewrites of the
 /// same bytes at the same offsets are idempotent, so restarting the call's
 /// range is correct.
@@ -172,23 +186,25 @@ pub(crate) fn write_pages_vectored(
         let offset = libc::off_t::try_from(off).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset overflow")
         })?;
-        // SAFETY: the first `count` iovecs point at live `&[u8]` borrows
-        // (`segs`, borrowing `frames`) held for the whole call; `pwritev`
-        // only READS the buffers (`iov_base` is `*mut` purely for C
-        // signature symmetry); the fd is a valid, open regular file owned by
-        // `file`.
-        let n = unsafe {
-            libc::pwritev(
-                file.as_raw_fd(),
-                iovs.as_ptr(),
-                count as libc::c_int,
-                offset,
-            )
-        };
-        if n < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        if n as usize != total {
+        let written = retry_interrupted(|| {
+            // SAFETY: the first `count` iovecs point at live `&[u8]` borrows
+            // (`segs`, borrowing `frames`) held for the whole call; `pwritev`
+            // only READS the buffers (`iov_base` is `*mut` purely for C
+            // signature symmetry); the fd is a valid, open regular file owned
+            // by `file`.
+            let n = unsafe {
+                libc::pwritev(
+                    file.as_raw_fd(),
+                    iovs.as_ptr(),
+                    count as libc::c_int,
+                    offset,
+                )
+            };
+            // A negative return is the only failure, and the only value
+            // `try_from` rejects.
+            usize::try_from(n).map_err(|_| std::io::Error::last_os_error())
+        })?;
+        if written != total {
             // Short write: restart this call's range with idempotent
             // positioned writes of each segment.
             let mut seg_off = off;
@@ -336,7 +352,51 @@ fn fsync_parent_dir(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{commit_cap, next_write_run, write_pages_vectored, MAX_SEGS, MAX_WRITE_BYTES};
+    use super::{
+        commit_cap, next_write_run, retry_interrupted, write_pages_vectored, MAX_SEGS,
+        MAX_WRITE_BYTES,
+    };
+
+    /// A call that fails with `Interrupted` is issued again until it
+    /// returns something else; every other result, error or not, is
+    /// returned from the first call that produces it.
+    #[test]
+    fn interrupted_calls_are_retried() {
+        use std::io::{Error, ErrorKind};
+
+        let mut calls = 0;
+        let n = retry_interrupted(|| {
+            calls += 1;
+            if calls < 4 {
+                Err(Error::from(ErrorKind::Interrupted))
+            } else {
+                Ok(calls)
+            }
+        })
+        .unwrap();
+        assert_eq!((n, calls), (4, 4));
+
+        // `EINTR` from the OS is the `Interrupted` kind.
+        let mut calls = 0;
+        let e = retry_interrupted(|| -> std::io::Result<()> {
+            calls += 1;
+            if calls == 1 {
+                Err(Error::from_raw_os_error(libc::EINTR))
+            } else {
+                Err(Error::from(ErrorKind::StorageFull))
+            }
+        })
+        .unwrap_err();
+        assert_eq!((e.kind(), calls), (ErrorKind::StorageFull, 2));
+
+        let mut calls = 0;
+        retry_interrupted(|| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+    }
 
     /// The commit cap is 256 KiB, LMDB's 64 pages at 4 KiB, unless one page
     /// is larger; a change to the tuned value has to change this test.

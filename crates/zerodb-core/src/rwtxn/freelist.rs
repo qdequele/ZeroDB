@@ -9,12 +9,13 @@ use super::*;
 struct SaveLoop {
     /// GC records awaiting their GC-20 rewrite.
     pending: BTreeSet<GcKey>,
-    /// Rewrites done so far, and their release-active bound (GC-13 guard):
+    /// Rewrites done so far, and their bound, which release builds enforce
+    /// too (GC-13 guard):
     /// each rewrite consumes one pending entry, and an entry only re-enters
     /// `pending` through an in-save pool draw, which strictly shrinks the
     /// finite pool, so the total is bounded by (initial entries) + (total
-    /// pool ids) + slack. A regression confined to the rewrite loop panics
-    /// loudly instead of hanging.
+    /// pool ids) + slack. A bug in the rewrite loop then panics instead of
+    /// hanging.
     inner_iters: usize,
     inner_budget: usize,
     /// This txn's own records as last written in the tree arm (GC-11 step
@@ -55,8 +56,8 @@ pub(super) fn merge_sorted_unique_into(a: &[u64], b: &[u64], out: &mut Vec<u64>)
     debug_assert!(out.windows(2).all(|w| w[0] < w[1]), "merge not ascending");
 }
 
-/// GC-13 regression guard: `freelist_save`'s loop provably terminates; a bug
-/// that breaks the fixed point should be a loud panic, not a hang.
+/// GC-13 guard: `freelist_save`'s loop provably terminates; a bug that
+/// breaks the fixed point should panic, not hang.
 pub(super) const FREELIST_SAVE_MAX_ITERS: usize = 64;
 
 impl<'env> RwTxn<'env> {
@@ -114,19 +115,17 @@ impl<'env> RwTxn<'env> {
     /// the old `free_db` root whose entry `F` lists that page as free and
     /// whose trees do not reference it (`F ≤ oldest_reader() ≤ N−1`, TXN-62).
     ///
-    /// **Allocation restriction (GC-12):** `alloc_mode = GcSave`
-    /// for the whole procedure — `allocate` never **reads** the GC tree; it
-    /// draws loose pages, pages from the **already-loaded drain pool**
+    /// **Allocation restriction (GC-12):** `alloc_mode = GcSave` for the
+    /// whole procedure — `allocate` never **reads** the GC tree; it draws
+    /// loose pages, pages from the **already-loaded drain pool**
     /// ([`RwTxn::save_pool_draw`]), the carried annex pool, or extends. Every
     /// request is for one page: GC records are always inline (GC-5).
-    /// Pool draws are what keep file growth bounded: the in-save COW of a
-    /// committed GC page cannot reuse its own predecessor (the `N−1` meta
-    /// still references it, TXN-62), so a total draw ban would extend the
-    /// file on every commit, unboundedly under churn. The anti-leak property
-    /// a ban would give is provided by the fixed point instead: an entry
-    /// touched by a pool draw goes back on the `pending` rewrite set, and the
-    /// loop only exits when no rewrite is pending — so the final tree state
-    /// never lists a handed-out page.
+    /// Pool draws keep file growth bounded: the in-save COW of a committed
+    /// GC page cannot reuse its own predecessor (the `N−1` meta still
+    /// references it, TXN-62), so without them every commit would extend
+    /// the file. An entry touched by a pool draw goes back on the `pending`
+    /// rewrite set, and the loop only exits when no rewrite is pending, so
+    /// the final tree state never lists a handed-out page.
     ///
     /// **Termination (GC-13):** each iteration that does not exit strictly
     /// shrinks a finite pool (a drain-pool or annex-pool draw), grows `freed`
@@ -137,7 +136,7 @@ impl<'env> RwTxn<'env> {
     /// so loose folds are bounded by the pool draws too. Nothing else frees
     /// a page: a put into a dirty leaf rewrites it in place or splits it
     /// (one fresh page, nothing freed). `FREELIST_SAVE_MAX_ITERS` turns a
-    /// regression into a panic.
+    /// violation into a panic.
     pub(super) fn freelist_save(&mut self) -> Result<()> {
         debug_assert!(self.alloc_mode == AllocMode::Normal);
         self.alloc_mode = AllocMode::GcSave;
@@ -145,16 +144,14 @@ impl<'env> RwTxn<'env> {
         // GC-30 carry (SPEC 05 §2a, ADR-0022): the base annex's unconsumed
         // remainder must land in this txn's own entry (annex or tree) — meta
         // `base` is overwritten by txn `base + 2`, so dropping it leaks.
-        // The remainder stays a live **in-save pool** (the GC-12 rule,
-        // exactly like the drain pool): its ids passed the gate with
-        // `F = base.txnid`, so the save's own allocations may consume them —
-        // without this, every save's GC-tree ops extend the file while the
-        // carried surplus sits unreachable in `freed`, an unbounded ratchet
-        // (`churn_parity_general` pins this). The
-        // step-(c) placement merges `freed ∪ annex.live()` and re-loops if
-        // the put itself drew from the pool, so no persisted set ever lists
-        // a handed-out page. The pool is folded into `freed` only after the
-        // fixed point (annex arm) or spent into the tree entry (tree arm).
+        // The remainder stays a live **in-save pool**, like the drain pool
+        // (GC-12): its ids passed the gate with `F = base.txnid`, so the
+        // save's own allocations may consume them instead of extending the
+        // file. The step-(c) placement merges `freed ∪ annex.live()` and
+        // loops again if the put itself drew from the pool, so no persisted
+        // set ever lists a handed-out page. The pool is folded into `freed`
+        // only after the fixed point (annex arm) or spent into the tree
+        // entry (tree arm).
         //
         // GC-32 placement: this txn's own entry goes to the meta annex when
         // the final merged set fits; once the tree arm runs it is sticky for
@@ -162,7 +159,8 @@ impl<'env> RwTxn<'env> {
         let annex_cap = crate::page::meta_annex_cap(self.psize);
         let mut tree_arm = false;
         let mut annex_mode = false;
-        // Every ops-drained entry needs its GC-20 rewrite at least once.
+        // Every entry the txn's operations drew from needs its GC-20
+        // rewrite at least once.
         let pending: BTreeSet<GcKey> = work!(self).drains.keys().copied().collect();
         let mut st = SaveLoop {
             inner_budget: pending.len()
@@ -172,9 +170,9 @@ impl<'env> RwTxn<'env> {
             inner_iters: 0,
             own: BTreeMap::new(),
         };
-        // (b) GC-10 trailing shrink of ops-era loose pages, then GC-9: the
-        // survivors join the freed set up front (LMDB parity — the fork's
-        // freelist_save merges loose pages into the list first). Loose pages
+        // (b) GC-10 trailing shrink of the loose pages the txn's operations
+        // left, then GC-9: the survivors join the freed set up front (as
+        // LMDB's `mdb_freelist_save` merges loose pages first). Loose pages
         // *generated by the loop below* (a GC leaf merged away after a record
         // delete) are re-served to later in-save allocations or folded in at
         // the end.

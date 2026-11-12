@@ -1,5 +1,5 @@
 //! `Database<KC, DC, C, CDUP>`, `DatabaseOpenOptions`, and `DatabaseStat`
-//! (30–51). Typed over the `heed-traits` codecs, byte-level
+//! (SPEC 00 rows 30–51). Typed over the `heed-traits` codecs, byte-level
 //! over ZeroDB. Read methods dispatch across the three txn sources
 //! ([`with_read!`]); write methods target `&mut RwTxn`.
 
@@ -285,7 +285,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         decode_opt::<KC, DC>(with_read!(self, txn, |t| self.inner.last(t))?)
     }
 
-    /// `get_lower_than(txn, key)` — last entry `< key` (SPEC 00 second table).
+    /// `get_lower_than(txn, key)` — last entry `< key` (SPEC 00).
     ///
     /// # Errors
     ///
@@ -349,7 +349,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     }
 
     /// `get_greater_than_or_equal_to(txn, key)` — first entry `>= key`
-    /// (SPEC 00 second table; the `set_range` primitive).
+    /// (SPEC 00; the `set_range` primitive).
     ///
     /// # Errors
     ///
@@ -376,13 +376,14 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// # Errors
     ///
-    /// Infallible construction; returns [`Result`] for heed shape.
+    /// `Io` (`EINVAL`) or `Mdb(BadDbi)` if this handle is not valid in `txn`
+    /// (ADR-0024).
     pub fn iter<'txn>(&self, txn: &'txn RoTxn) -> Result<RoIter<'txn, KC, DC>> {
         self.check_handle(txn)?;
         Ok(RoIter::new(with_read!(self, txn, |t| self.inner.iter(t))))
     }
 
-    /// `rev_iter(txn)` (SPEC 00 second table).
+    /// `rev_iter(txn)` (SPEC 00).
     ///
     /// # Errors
     ///
@@ -487,7 +488,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     ///
     /// # Errors
     ///
-    /// Infallible construction; returns [`Result`] for heed shape.
+    /// As [`Database::iter`].
     pub fn iter_mut<'txn>(&self, txn: &'txn mut RwTxn) -> Result<RwIter<'txn, KC, DC>> {
         self.assert_env(txn);
         self.check_handle(txn)?;
@@ -500,7 +501,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         )))
     }
 
-    /// `rev_iter_mut(txn)` (SPEC 00 second table).
+    /// `rev_iter_mut(txn)` (SPEC 00).
     ///
     /// # Errors
     ///
@@ -517,7 +518,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         )))
     }
 
-    /// `range_mut(txn, range)` (SPEC 00 second table).
+    /// `range_mut(txn, range)` (SPEC 00).
     ///
     /// # Errors
     ///
@@ -537,7 +538,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         Ok(RwRange::new(RwGuts::new(txn, self.inner, Dir::Fwd, lo, hi)))
     }
 
-    /// `rev_range_mut(txn, range)` (SPEC 00 second table).
+    /// `rev_range_mut(txn, range)` (SPEC 00).
     ///
     /// # Errors
     ///
@@ -592,7 +593,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         )))
     }
 
-    /// `rev_prefix_iter_mut(txn, prefix)` (SPEC 00 second table).
+    /// `rev_prefix_iter_mut(txn, prefix)` (SPEC 00).
     ///
     /// # Errors
     ///
@@ -685,9 +686,8 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         // The closure writes straight into the engine's slot, reserved before
         // it runs, so a closure error cannot un-put the entry (as in LMDB).
         // The slot may hold stale bytes from the copied page, so the
-        // unwritten tail is zeroed either way. The oracle pins both cases:
-        // `put_reserved_failing_closure_leaves_entry_parity` and
-        // `put_reserved_short_write_parity`.
+        // unwritten tail is zeroed either way. The oracle's differential
+        // tests cover both cases.
         let mut outcome: std::io::Result<()> = Ok(());
         self.inner
             .put_reserved(txn.zdb_mut(), &kb, data_size, |slot| {
@@ -741,8 +741,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     }
 
     /// `remove(txn)` (`mdb_drop(_, 1)`): empty the DB **and** drop the handle
-    /// (SPEC 00 second table; used by `delete_one_duplicate`-free consumers via
-    /// the drop path). `unsafe` for heed signature parity.
+    /// (SPEC 00). `unsafe` for heed signature parity.
     ///
     /// # Safety
     ///
@@ -836,8 +835,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         }
     }
 
-    /// Change the key comparator (SPEC 00 second table — SHOULD; no consumer
-    /// sets one).
+    /// Change the key comparator (SPEC 00).
     #[must_use]
     pub fn key_comparator<NC>(self) -> DatabaseOpenOptions<'e, 'n, T, KC, DC, NC, CDUP> {
         DatabaseOpenOptions {
@@ -848,7 +846,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         }
     }
 
-    /// Change the dup-sort comparator (SPEC 00 second table — SHOULD).
+    /// Change the dup-sort comparator (SPEC 00).
     #[must_use]
     pub fn dup_sort_comparator<NCDUP>(self) -> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, NCDUP> {
         DatabaseOpenOptions {
@@ -865,7 +863,7 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         self
     }
 
-    /// Set the database flags (SPEC 00 second table; database flags are
+    /// Set the database flags (SPEC 00; database flags are
     /// unsupported, so a non-empty value is rejected at create).
     pub fn flags(&mut self, flags: DatabaseFlags) -> &mut Self {
         self.flags = flags;
@@ -875,10 +873,8 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
 
 /// Convert a heed `&str` name to ZeroDB bytes, re-imposing the fork's C-string
 /// rule (see docs/LMDB-COMPATIBILITY.md). heed builds the dbi name with
-/// `CString::new(name).unwrap()`, so an embedded NUL **panics** — that is the
-/// fork's observable behavior (probed against heed =0.22.1's `raw_open_dbi`),
-/// which we reproduce exactly rather than inventing a clean error. No consumer
-/// ever passes a NUL name, so this never fires in practice.
+/// `CString::new(name).unwrap()`, so an embedded NUL **panics** in heed
+/// 0.22.1, and it panics here too.
 fn name_bytes(name: Option<&str>) -> Option<&[u8]> {
     if let Some(n) = name {
         // Reproduce heed's `CString::new(n).unwrap()` panic on an embedded NUL.

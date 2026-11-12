@@ -34,14 +34,12 @@ use crate::Result;
 // ---------------------------------------------------------------------------
 
 /// Read transactions opened with Thread Local Storage (TLS) — `!Send`. A
-/// compile-only shim (SPEC 00 second table: `WithTls` is SHOULD);
-/// ZeroDB's read txns are universally NOTLS, so `WithTls` behaves like
-/// `WithoutTls` at runtime (ADR-0003).
+/// compile-time marker only: ZeroDB's read txns never use TLS, so `WithTls`
+/// behaves like `WithoutTls` at runtime (ADR-0003).
 #[derive(Debug, PartialEq, Eq)]
 pub enum WithTls {}
 
 /// Read transactions opened without TLS — therefore `Send`.
-/// Every production open uses this (`read_txn_without_tls`).
 #[derive(Debug, PartialEq, Eq)]
 pub enum WithoutTls {}
 
@@ -97,10 +95,16 @@ pub struct RoTxn<'e, T = AnyTls> {
 // `InnerTxn` is `Send` by ZeroDB's own guarantees — `zerodb::RoTxn`,
 // `zerodb::NestedRoTxn`, and `zerodb::RwTxn`, whose writer lock is a
 // thread-agnostic occupied flag (`WriterLock`, SPEC 04 TXN-6) rather than a std
-// `MutexGuard`, so dropping or committing it on another thread is sound. This
-// impl therefore adds no capability the auto trait would not derive; it exists
-// because the `T` marker parameter is not `Send`-bounded and heed spells the
-// impl out the same way. No thread-affinity argument is relied on.
+// `MutexGuard`, so dropping or committing it on another thread is sound. The
+// other field, `PhantomData<&T>`, holds no data. No thread-affinity argument
+// is relied on.
+//
+// The impl is load-bearing in the restrictive direction. Every field is
+// `Send` for every `T` (the markers are empty enums), so without an explicit
+// impl the auto trait would make `RoTxn<WithTls>` and `RoTxn<AnyTls>` `Send`
+// too. An explicit impl for one instantiation suppresses the auto impl for
+// the whole type, which is what keeps those two `!Send`, as in heed, where
+// `RoTxn` holds raw pointers and only this impl makes `WithoutTls` sendable.
 unsafe impl Send for RoTxn<'_, WithoutTls> {}
 
 impl<'e, T> RoTxn<'e, T> {
@@ -129,7 +133,7 @@ impl<'e, T> RoTxn<'e, T> {
     ///
     /// # Errors
     ///
-    /// Infallible in ZeroDB; returns [`Result`] for API shape.
+    /// None in ZeroDB: the [`Result`] is there to match heed's signature.
     ///
     /// Not available with the `unique-txns` feature: Meilisearch's heed fork
     /// moves it to `UniqueRoTxn::commit` (ADR-0027).
@@ -152,7 +156,7 @@ impl<'e, T> RoTxn<'e, T> {
         }
     }
 
-    /// This transaction's id (SPEC 00 second table — SHOULD; `mdb_txn_id`).
+    /// This transaction's id (SPEC 00; `mdb_txn_id`).
     ///
     /// For a read txn this is the **pinned snapshot's** txnid — the commit
     /// this reader sees, which is also what `Env::reader_list` reports for its
@@ -210,8 +214,8 @@ impl<'a> Deref for RoTxn<'a, WithoutTls> {
 /// via the `unsafe impl Send for RoTxn<WithoutTls>` above (its only field), and
 /// that is genuinely sound: `zerodb::RwTxn` holds a thread-agnostic writer lock
 /// (`WriterLock`, SPEC 04 TXN-6), so the transaction may be dropped, aborted or
-/// committed on any thread — pinned by `zerodb/tests/hostile_file.rs`. `Sync`
-/// too, so `&RwTxn` — hence a nested reader — is `Send` (SPEC 04 §5).
+/// committed on any thread. `Sync` too, so `&RwTxn` — hence a nested reader —
+/// is `Send` (SPEC 04 §5).
 pub struct RwTxn<'p> {
     pub(crate) txn: RoTxn<'p, WithoutTls>,
 }

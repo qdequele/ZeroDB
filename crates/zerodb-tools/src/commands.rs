@@ -91,10 +91,9 @@ pub fn cmd_stat(env_dir: &Path) -> Result<String, BoxErr> {
     Ok(out)
 }
 
-/// The engine-identification line for `stat` (ADR-0010 §Options D2 —
-/// "in spirit": the magic in the file is the authoritative discriminator, so
-/// the tool reports it rather than shipping a marker file). Shows the data-file
-/// name actually found, the four magic bytes, and the format version.
+/// The engine-identification line for `stat`: the data-file name actually
+/// found, the four magic bytes, and the format version. The magic in the file,
+/// not its name, tells the engines apart (ADR-0010).
 fn engine_line(data: &naming::EnvDataFile) -> Result<String, BoxErr> {
     let probed = naming::probe_magic(&data.path)?;
     Ok(match probed {
@@ -281,11 +280,11 @@ fn load_batched(
         db.finish()?;
     }
 
-    // Verify the produced env is structurally clean before returning. Unlike
-    // the old `check_image` over the file, this does not re-verify the meta
-    // slots or the file length: the engine wrote and validated those itself
-    // (each commit writes a checksummed meta; this read txn's open accepted
-    // it), and the walk covers every page the committed snapshot references.
+    // Verify the produced env is structurally clean before returning. The
+    // walk covers every page the committed snapshot references. It does not
+    // re-verify the meta slots or the file length: the engine wrote and
+    // validated those itself (each commit writes a checksummed meta, and this
+    // read txn's open accepted it).
     let txn = read_txn(&env)?;
     let violations = check_snapshot(txn.map_bytes(), env.page_size(), txn.snapshot());
     if !violations.is_empty() {
@@ -677,6 +676,11 @@ fn check_raw_exclusively(
 
 /// Walk the raw data file at `data` ([`check_image`]). Tolerant of a corrupt
 /// file.
+///
+/// The file is walked through a read-only memory map of exactly its length,
+/// not a copy on the heap, so the walk's memory does not grow with the file.
+/// The caller holds the env's lock file exclusively, which keeps another
+/// process from shrinking the file under the map.
 fn check_raw_file(env_dir: &Path, data: &Path) -> Result<(String, bool), BoxErr> {
     let file = File::open(data)?;
     let psize = match zerodb_io::probe_page_size(&file)? {
@@ -691,9 +695,35 @@ fn check_raw_file(env_dir: &Path, data: &Path) -> Result<(String, bool), BoxErr>
             ));
         }
     };
-    drop(file);
-    let bytes = std::fs::read(data)?;
-    let violations = check_image(&bytes, psize);
+    let file_len = file.metadata()?.len();
+    let violations = if file_len < 2 * u64::from(psize) {
+        // Too short to hold both meta slots, which the map below requires;
+        // at most two pages, so read it.
+        let mut head = Vec::new();
+        file.take(2 * u64::from(psize)).read_to_end(&mut head)?;
+        check_image(&head, psize)
+    } else {
+        drop(file);
+        // A read-only open maps the file and never creates, grows or writes
+        // it. Asking for a map of the file's length keeps the mapping to the
+        // file itself, whatever map size its metas name.
+        match zerodb_io::open_or_create(data, psize, Some(file_len), file_len, true, false) {
+            Ok(opened) => {
+                let map = opened.backing.view().bytes;
+                // Only the bytes the file holds now: a map page past the
+                // file's end cannot be read.
+                let len = usize::try_from(opened.backing.real_disk_size()?)
+                    .map_or(map.len(), |n| n.min(map.len()));
+                check_image(&map[..len], psize)
+            }
+            // A meta that decodes but names a map size above the supported
+            // maximum: the file is refused before it is mapped.
+            Err(zerodb::Error::Mdb(MdbError::Invalid)) => {
+                vec!["INV-1: a meta slot names a map size above the supported maximum".into()]
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
     let mut out = String::new();
     writeln!(
         out,

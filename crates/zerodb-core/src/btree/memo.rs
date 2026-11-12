@@ -4,13 +4,13 @@
 
 use super::*;
 
-/// Geometric growth levels of the memo (level `i` holds
-/// `MEMO_BASE_SLOTS << (2 * i)` slots): 7 levels ≈ 5.6 M slots ≈ 2.8 M
-/// memoized pages at the ½ load-factor gate — a ~45 GB env of 16 K pages
-/// touched by ONE txn before the memo saturates and degrades to plain
-/// revalidation (correct, just slower).
+/// Geometric growth levels of the memo: level `i` holds
+/// `MEMO_BASE_SLOTS << (2 * i)` slots. Seven levels hold about 5.6 million
+/// slots, so 2.8 million pages at the half-full limit of each level. A txn
+/// that validates more pages than that stops recording them and revalidates
+/// them on each visit.
 const MEMO_LEVELS: usize = 7;
-/// Slots in level 0 (8 KiB) — sized so short txns allocate once and small.
+/// Slots in level 0 (8 KiB), so that a short txn makes one small allocation.
 const MEMO_BASE_SLOTS: usize = 1024;
 /// Level-0 inserts whose slot index the memo logs, so that dropping it can
 /// clear exactly those slots and hand the zeroed level to the next memo built
@@ -30,14 +30,12 @@ const fn level_slots(li: usize) -> usize {
 thread_local! {
     /// One all-zero level 0, left by the last memo dropped on this thread,
     /// so a short read transaction does not allocate, zero and free 8 KiB.
-    /// LMDB avoids per-request setup by letting the caller keep a
-    /// transaction and re-arm it
-    /// (`mdb_txn_reset` / `mdb_txn_renew`); heed 0.22.1 does not expose that,
-    /// so the reuse happens here instead. The level holds no entry when it is
-    /// parked (dropping the memo zeroes every slot it wrote), so a new
-    /// transaction starts with an empty memo, exactly as with a fresh
-    /// allocation. One level per thread bounds the parked memory to 8 KiB per
-    /// thread that ever dropped a memo.
+    /// LMDB avoids per-transaction setup by letting the caller keep a
+    /// transaction and renew it (`mdb_txn_reset` / `mdb_txn_renew`); heed
+    /// 0.22.1 does not expose that, so the reuse happens here. The level
+    /// holds no entry when it is parked (dropping the memo zeroes every slot
+    /// it wrote), so a new transaction starts with an empty memo. At most one
+    /// level, 8 KiB, is parked per thread.
     static SPARE_BASE: Cell<Option<Box<[AtomicU64]>>> = const { Cell::new(None) };
 }
 
@@ -59,37 +57,34 @@ fn new_level(li: usize) -> Box<[AtomicU64]> {
         .into_boxed_slice()
 }
 
-/// Which validated shape a memo entry vouches for (kind-tagged memo). The kind is
-/// part of the memo **key**, so a hit can hand out a fully *trusted* typed
-/// view (`new_trusted`, zero checks) while a pgno validated as one kind can
-/// never be trusted as the other — the mismatched lookup simply misses and
-/// revalidates, failing loudly on the type check.
+/// The page type a memo entry was validated as. The kind is part of the memo
+/// key, so a hit can hand out a typed view with no check (`new_trusted`),
+/// and a pgno validated as one kind is never trusted as the other: that
+/// lookup misses, and the revalidation fails on the type check.
 #[derive(Clone, Copy)]
 pub(crate) enum PageKind {
     Leaf,
     Branch,
 }
 
-/// Txn-scoped memo of pages whose **cells** have already passed full
-/// validation this txn (docs/PERFORMANCE.md, eager page validation).
+/// The pages whose cells this txn has already validated.
 ///
-/// `LeafRef::new`/`BranchRef::new` validate every cell — O(`num_keys`) per
-/// view construction — which multiplied every descent (get, seek, put
-/// search). A page recorded here is re-wrapped via the zero-check
-/// `new_trusted` constructors (the memo key carries the page kind).
+/// `LeafRef::new` and `BranchRef::new` validate every cell, O(`num_keys`)
+/// per view, and a descent builds one view per level. A page recorded here
+/// is wrapped again through the `new_trusted` constructors, which check
+/// nothing.
 ///
-/// Soundness: entries are only recorded for **map-sourced** bytes
-/// (`Source::bytes_from_classified`), which are immutable for the owning
-/// txn's life; dirty frames never enter the memo.
+/// Soundness: entries are recorded only for bytes read from the map
+/// (`Source::bytes_from_classified`), which do not change during the owning
+/// txn's life. Dirty frames never enter the memo.
 ///
-/// Concurrency: milli shares one `RoTxn` across rayon workers, so the probe
-/// must not lock (a `Mutex<HashSet>` probe was the second-hottest zerodb
-/// frame in the milli indexing profile). Insert-only open addressing over
-/// `AtomicU64` slots (`0` = empty, else `key`), in geometrically growing levels published
-/// through `OnceLock` — levels are never moved or rehashed, `contains` probes
-/// every initialized level, and nothing here can affect correctness: any
-/// degradation (stale level counter, saturated last level, racing duplicate
-/// insert) is at worst a miss, which revalidates.
+/// Concurrency: one read txn may be shared by many threads, so the probe
+/// takes no lock. The table is insert-only open addressing over `AtomicU64`
+/// slots (`0` is empty, anything else a key), in geometrically growing
+/// levels published through `OnceLock`. Levels are never moved or rehashed,
+/// and `contains` probes every initialized level. A stale level counter, a
+/// full last level or a racing duplicate insert can only cause a miss,
+/// which revalidates the page.
 pub struct ValidatedPages<'e> {
     /// Level 0, kept inline: the only level a short txn touches.
     base: OnceLock<Box<[AtomicU64]>>,
@@ -204,8 +199,8 @@ impl<'e> ValidatedPages<'e> {
         (pgno | tag) + 1
     }
 
-    /// splitmix64 finalizer — cheap, well-mixed slot index (SipHash was
-    /// measurable in the milli profile).
+    /// The splitmix64 finalizer: a well-mixed slot index at a much lower cost
+    /// than the standard library's SipHash.
     fn mix(mut z: u64) -> u64 {
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -227,8 +222,8 @@ impl<'e> ValidatedPages<'e> {
     fn probe(lvl: &[AtomicU64], key: u64) -> bool {
         let mask = lvl.len() - 1;
         let mut i = (Self::mix(key) as usize) & mask;
-        // Bounded probe: the ½ load-factor gate guarantees empty slots,
-        // so the first `0` ends this level; the bound is belt-and-braces.
+        // The half-full limit guarantees empty slots, so the first `0` ends
+        // this level. The loop bound is a second guarantee of termination.
         for _ in 0..lvl.len() {
             match lvl[i].load(Ordering::Acquire) {
                 0 => return false,
@@ -285,8 +280,8 @@ impl<'e> ValidatedPages<'e> {
             let (cell, count) = self.level_or_init(li);
             let alloc = cell.get_or_init(|| new_level(li));
             let (lvl, log) = alloc.split_at(level_slots(li));
-            // ½ load-factor gate: keeps probes short and guarantees empty
-            // slots so `contains` terminates on the first `0`.
+            // The half-full limit keeps probes short and guarantees empty
+            // slots, so `contains` terminates on the first `0`.
             if count.load(Ordering::Relaxed) * 2 >= lvl.len() {
                 if li + 1 < MEMO_LEVELS {
                     // Ordering: `AcqRel` — the winning bump publishes the new
@@ -296,7 +291,7 @@ impl<'e> ValidatedPages<'e> {
                             .compare_exchange(li, li + 1, Ordering::AcqRel, Ordering::Acquire);
                     continue;
                 }
-                return; // saturated: degrade to revalidation, stay correct
+                return; // every level is full: this page is revalidated on each visit
             }
             let mask = lvl.len() - 1;
             let mut i = (Self::mix(key) as usize) & mask;
@@ -340,11 +335,11 @@ impl<'e> ValidatedPages<'e> {
 /// One database's root page as the transaction's memo vouches for it: a copy
 /// of that page's memo entry, kept next to the database's record in the read
 /// transaction, so a keyed descent (a point lookup or a seek) from the root
-/// skips the page-type check and the memo probe there. LMDB resolves a read transaction's root with one pointer
-/// computation (`mdb_page_get`); this is the closest checked equivalent.
+/// skips the page-type check and the memo probe there. LMDB resolves a read
+/// transaction's root with one pointer computation (`mdb_page_get`).
 ///
 /// Soundness: [`Tree`]'s root view records a slot only for a map-sourced page
-/// that [`ValidatedPages::contains`] already holds, under the same key, so a
+/// that `ValidatedPages::contains` already holds, under the same key, so a
 /// slot hit hands out exactly the view a memo hit would. The slot stores the
 /// memo key, page number included, so it only ever answers for the page it
 /// was recorded for; a lookup of any other root misses and takes the normal
@@ -499,23 +494,22 @@ mod tests {
         assert!(parked.iter().all(|s| s.load(Ordering::Relaxed) == 0));
     }
 
-    /// The lock-free memo under concurrent insert/contains.
-    /// 4 threads × 2,000 keys with heavy overlap (every key inserted by two
-    /// threads, both kinds) force level growth (level 0 holds 512 at the ½
-    /// gate), CAS races on duplicate keys, and probes racing publications.
-    /// Afterwards every inserted key must be a hit under its own kind and a
-    /// miss under the other (bit-63 tag). Runs natively and under miri
-    /// (miri's weak-memory machinery checks the Acquire/Release pairs); loom
-    /// is deliberately not wired: the memo's contract is advisory (any race
-    /// outcome is at worst a miss → revalidation), unlike the reader table's.
+    /// The memo under concurrent `insert` and `contains`. Four threads insert
+    /// 2,000 keys each, every key by two threads, half of them as leaves and
+    /// half as branches. This
+    /// forces level growth (level 0 holds 512 entries at its half-full limit),
+    /// CAS races on duplicate keys, and probes racing inserts. Afterwards
+    /// every inserted key must be a hit under its own kind and a miss under
+    /// the other. The test also runs under miri, whose weak-memory emulation
+    /// exercises the `Acquire`/`Release` pairs. There is no loom model: any
+    /// race outcome here is at worst a miss, which revalidates.
     #[test]
     fn validated_pages_concurrent_insert_contains() {
         let vp = ValidatedPages::new();
         let n_threads = 4usize;
-        // Full size natively (forces two level-growths); small under miri —
-        // its weak-memory simulation is ~1000× slower and the orderings it
-        // checks are the same at any size. Level growth still triggers with
-        // 640 distinct keys > level 0's 512-insert gate.
+        // Full size natively, which grows the memo twice. Smaller under
+        // miri, which is far slower and checks the same orderings at any
+        // size; 640 distinct keys still exceed level 0's 512-entry limit.
         #[cfg(not(miri))]
         let per_thread = 2_000u64;
         #[cfg(miri)]
@@ -525,7 +519,7 @@ mod tests {
                 let vp = &vp;
                 s.spawn(move || {
                     for i in 0..per_thread {
-                        // Overlap: thread t and thread (t+1)%4 share keys.
+                        // Threads `t` and `t + 2` insert the same keys.
                         let pgno = (t as u64 % 2) * 10_000 + i;
                         let kind = if i % 2 == 0 {
                             PageKind::Leaf

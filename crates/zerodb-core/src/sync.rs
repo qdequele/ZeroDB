@@ -5,12 +5,11 @@
 //! (ADR-0006 §loom).
 //!
 //! Scope: only `crate::readers`, `crate::nested` (the nested-txn child counter,
-//! ADR-0007), `crate::stamps` (the ADR-0018 slot seqlock), `crate::handles`'s
-//! `MemoCell` (the ADR-0024 check memo, also a seqlock) and the
-//! `EnvInner` fields they own import from here. The rest
-//! of the crate uses `std::sync` directly — loom tests drive the
-//! table/cell/commit-point and child-counter protocols in isolation, not a
-//! whole env.
+//! ADR-0007), `crate::stamps` (the ADR-0018 stamp cache), `crate::handles`'s
+//! `MemoCell` (the ADR-0024 check memo, a seqlock) and the `EnvInner` fields
+//! they own import from here. The rest of the crate uses `std::sync`
+//! directly: the loom tests drive these protocols in isolation, not a whole
+//! env.
 //!
 //! `Arc` is deliberately **not** shimmed: the protocol under test never relies
 //! on `Arc`'s internal refcount ordering (the cell mutex serializes clone vs

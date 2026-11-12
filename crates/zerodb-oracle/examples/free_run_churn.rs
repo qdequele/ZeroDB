@@ -1,4 +1,4 @@
-//! File growth under multi-page value churn, LMDB vs ZeroDB (issue #29).
+//! File growth under multi-page value churn, LMDB vs ZeroDB.
 //!
 //! Drives the same seeded workload through the Meilisearch LMDB fork (heed)
 //! and through ZeroDB (heed-zerodb), both at the OS page size, and prints the

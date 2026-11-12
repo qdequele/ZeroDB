@@ -58,9 +58,9 @@ impl<'env> RwTxn<'env> {
     }
 
     /// Write the frames at `pgnos` (ascending) with the commit's page writer:
-    /// consecutive frames go out as one vectored write — a frame
-    /// at `pgno` covering `n` pages (an overflow run) makes the run
-    /// contiguous iff the next frame starts at `pgno + n`. Used by commit C2
+    /// consecutive frames go out as one vectored write — a frame at `pgno`
+    /// covering `n` pages (an overflow run) makes the run contiguous iff
+    /// the next frame starts at `pgno + n`. Used by commit C2
     /// and by spilling (SPEC 04 TXN-69). Not yet durable.
     pub(super) fn write_frames(&self, pgnos: &[u64]) -> Result<()> {
         let psize = self.psize;
@@ -236,8 +236,8 @@ impl<'env> RwTxn<'env> {
     }
 
     /// Whether this txn realizes dirty frames **in the writable map**
-    /// (ADR-0021, SPEC 04 §6.4 TXN-45b). Test and diagnostics hook: the
-    /// WRITE_MAP-parameterized batteries assert the mode is actually active.
+    /// (ADR-0021, SPEC 04 §6.4 TXN-45b). Test and diagnostics hook: tests
+    /// parameterized over `WRITE_MAP` assert the mode is actually active.
     #[doc(hidden)]
     #[must_use]
     pub fn dirty_in_map_mode(&self) -> bool {

@@ -9,7 +9,7 @@
 //!   [`env::Backing`]; this crate's own `unsafe` is confined to the places
 //!   listed in the lint note below.
 //! - The [`btree`] read path and the [`rotxn`] read API.
-//! - The write path — [`dirty`] (the stable-frame dirty store,
+//! - The write path — `dirty` (the stable-frame dirty store,
 //!   SPEC 04 §6.3), [`rwtxn`] (single-writer txn, COW, split/rebalance, the
 //!   commit pipeline with its test hook points, SPEC 04 §9), and [`check`]
 //!   (the SPEC 03 §11 invariant walker that `zerodb-tools check` wraps).
@@ -35,7 +35,7 @@ pub mod btree;
 pub mod builder;
 pub mod check;
 pub mod cmp;
-pub mod dirty;
+pub(crate) mod dirty;
 pub mod env;
 pub mod error;
 pub(crate) mod handles;

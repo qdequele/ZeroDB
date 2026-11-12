@@ -731,13 +731,18 @@ macro_rules! bench_backend {
     };
     (@setpage $opts:ident, $page:ident, set) => {
         $opts.page_size($page);
-        // ADR-0014 bench axis: `ZERODB_BENCH_TRUST_FILE=1` opens every zerodb
-        // env with the trusting page-validation policy, to measure it against
-        // the validating default. Off unless set.
+        // `ZERODB_BENCH_TRUST_FILE=1` opens every zerodb env with the trusting
+        // page policy explicitly. Trusting is the default (ADR-0034), so the
+        // knob only matters when benching a revision whose default validates.
         if crate::backend::trust_file_requested() {
             // SAFETY: the bench envs are fresh temp directories written only
             // by zerodb in this process — the `trust_contents` contract.
             $opts.file_trust(unsafe { heed_zerodb::FileTrust::trust_contents() });
+        }
+        // `ZERODB_BENCH_VALIDATE=1` opens every zerodb env with the
+        // validating page policy, to measure it against the trusting default.
+        if crate::backend::bench_knob("ZERODB_BENCH_VALIDATE") {
+            $opts.file_trust(heed_zerodb::FileTrust::VALIDATE);
         }
         // ADR-0015 bench axis: `ZERODB_BENCH_SEQUENTIAL_WRITES=1` turns the
         // sequential-writes fast path on for every zerodb env.

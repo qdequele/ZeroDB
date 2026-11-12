@@ -89,49 +89,24 @@ const WRLCK: libc::c_short = libc::F_WRLCK as libc::c_short;
 const UNLCK: libc::c_short = libc::F_UNLCK as libc::c_short;
 
 /// Why [`LockFile::open`] failed.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LockOpenError {
     /// This process already has the lock file open. A second descriptor would
     /// drop the first one's record locks when closed.
+    #[error("the lock file is already open in this process")]
     AlreadyOpen,
     /// The lock file was initialized with incompatible parameters.
+    #[error("lock file mismatch: {0}")]
     Mismatch(String),
     /// The lock file cannot be created or opened for writing because it lies
     /// on a read-only filesystem (`EROFS`). A read-only environment then runs
-    /// without a lock file, as LMDB does (ADR-0023,
-    /// `OBS_RDONLY_LOCK_READONLY_FS`); any other caller treats it as the
-    /// `EROFS` I/O error it is.
+    /// without a lock file, as LMDB does (ADR-0023); any other caller treats
+    /// it as the `EROFS` I/O error it is.
+    #[error("the lock file is on a read-only filesystem")]
     ReadOnlyFs,
     /// An I/O error.
-    Io(std::io::Error),
-}
-
-impl From<std::io::Error> for LockOpenError {
-    fn from(e: std::io::Error) -> Self {
-        LockOpenError::Io(e)
-    }
-}
-
-impl std::fmt::Display for LockOpenError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LockOpenError::AlreadyOpen => {
-                f.write_str("the lock file is already open in this process")
-            }
-            LockOpenError::Mismatch(m) => write!(f, "lock file mismatch: {m}"),
-            LockOpenError::ReadOnlyFs => f.write_str("the lock file is on a read-only filesystem"),
-            LockOpenError::Io(e) => write!(f, "lock file I/O error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for LockOpenError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            LockOpenError::Io(e) => Some(e),
-            _ => None,
-        }
-    }
+    #[error("lock file I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// The lock files this process has open, by [`RegistryKey`]. A poisoned
@@ -348,12 +323,9 @@ pub fn published_max_readers(path: &Path) -> Result<Option<u32>, LockOpenError> 
 
 /// The mapped lock file. Field order matters for `Drop`: the map is
 /// unmapped before the descriptor closes. The registration owns the
-/// descriptor: closing it releases this process's record locks, and only
-/// then is the file's entry removed from the registry (keyed by the file's
-/// identity, not its path), both under the registry lock — so no second
-/// descriptor of this file can be opened by this process while the first is
-/// still open, and no new file that reuses the inode number of an unlinked
-/// one is refused because of a stale entry.
+/// descriptor and, on drop, closes it before removing the file's registry
+/// entry, so this process never has two descriptors of one lock file (see
+/// `Registration`'s `Drop`).
 ///
 /// Sharing one `LockFile` across threads is sound: all shared state is reached
 /// through atomics over the mapping or through `fcntl` on the descriptor.
@@ -367,7 +339,7 @@ pub struct LockFile {
 
 impl LockFile {
     /// Open or create the lock file at `path` and join the environment
-    /// (ADR-0023 §1). The first opener (no other process alive) initializes
+    /// (ADR-0023). The first opener (no other process alive) initializes
     /// the file and holds the election byte exclusively until
     /// [`LockFile::finish_open`]; later openers wait for that, then validate.
     ///
@@ -520,10 +492,10 @@ impl LockFile {
         };
         // A joiner reads `max_readers` with `pread` before mapping. It holds
         // the shared election lock, so the initializer has finished writing.
-        // It adopts that count whatever it asked for, as an LMDB joiner sizes
-        // its reader table from the lock file (`OBS_JOINER_FEWER_MAXREADERS`,
-        // `OBS_JOINER_MORE_MAXREADERS`; ADR-0023 §1). A count no
-        // initializer can write means the file is not a usable lock file.
+        // It adopts that count whatever it asked for, smaller or larger, as
+        // an LMDB joiner sizes its reader table from the lock file
+        // (ADR-0023). A count no initializer can write means the file is not
+        // a usable lock file.
         if initializer {
             check_lock_file_shape(file, path)?;
         }
@@ -532,8 +504,7 @@ impl LockFile {
             // lock file left by an earlier run: as LMDB, which sizes its
             // table from the lock file's length and never shortens it, the
             // count is the larger of the requested one and the recorded one
-            // (`OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS`; ADR-0023 §1 as
-            // amended). The slots themselves are wiped below as always.
+            // (ADR-0023). The slots themselves are wiped below as always.
             previous_run_slots(file)?.map_or(max_readers, |n| n.max(max_readers))
         } else {
             let n = read_u32_at(file, OFF_MAX_READERS)?;
@@ -585,7 +556,7 @@ impl LockFile {
                 ));
             }
         }
-        // This process's liveness lock (ADR-0023 §3), held for the handle's life.
+        // This process's liveness lock (ADR-0023), held for the handle's life.
         if !record_lock(
             lock.file(),
             libc::F_SETLK,
@@ -769,7 +740,7 @@ impl SharedRegion for LockFile {
             }
             let timed_out = futex_wait(w, cur | WAITERS, OWNER_PROBE);
             if timed_out && !self.is_alive(owner)? {
-                // The owner died holding the lock (ADR-0023 §2): take it over.
+                // The owner died holding the lock (ADR-0023): take it over.
                 // Relaxed load: the CAS below re-validates the value. Acquire
                 // on the CAS as above. The waiters bit is kept so this
                 // owner's release wakes the others.
@@ -804,7 +775,7 @@ impl SharedRegion for LockFile {
     #[cfg(not(target_os = "linux"))]
     fn lock_writer(&self) -> std::io::Result<bool> {
         // POSIX record locks belong to the process, so any thread may release
-        // it, and the kernel drops it if the process dies (ADR-0023 §2).
+        // it, and the kernel drops it if the process dies (ADR-0023).
         record_lock(self.file(), libc::F_SETLKW, WRLCK, WRITER_BYTE).map(|_| false)
     }
 
@@ -968,11 +939,10 @@ fn open_or_create(path: &Path) -> std::io::Result<(File, bool)> {
     }
 }
 
-/// The same-file guard (ADR-0023): fail with `InvalidInput` if
+/// The same-file guard of [`LockFile::open`]: fail with `InvalidInput` if
 /// `file`, the lock file just opened at `path`, is the data file at
-/// `data_path`. A missing data file cannot be the lock file. On refusal, the
-/// lock file is removed only if this open `created` it and it is still empty;
-/// otherwise the name designates the data file, which must not be removed.
+/// `data_path`. On refusal, the lock file is removed only if this open
+/// `created` it and it is still empty.
 fn check_not_data_file(
     file: &File,
     created: bool,
@@ -1013,12 +983,11 @@ fn is_initializer_length(len: u64) -> bool {
     len == magic_only || (len >= header + slot && (len - header).is_multiple_of(slot))
 }
 
-/// The foreign-file guard (ADR-0023), run by the initializer
-/// before it writes to the lock file at `path`: accept an empty file, a file
-/// carrying [`LOCK_MAGIC`] or [`LOCK_MAGIC_INIT`], or one whose header (the
-/// first `OFF_SLOTS` bytes, or the whole file if shorter) is all zero and
-/// whose length an initializer can leave ([`is_initializer_length`]); refuse
-/// anything else with `InvalidInput`, leaving it untouched.
+/// The foreign-file guard of [`LockFile::open`], run by the initializer
+/// before it writes to the lock file at `path`: refuse with `InvalidInput`,
+/// leaving the file untouched, anything that is neither empty, nor carrying
+/// a lock magic, nor an all-zero header with a length an initializer can
+/// leave ([`is_initializer_length`]).
 fn check_lock_file_shape(file: &File, path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     let len = file.metadata()?.len();
@@ -1100,6 +1069,36 @@ fn futex_wake_all(word: &AtomicU32) {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn open_error_messages_and_sources() {
+        use std::error::Error as _;
+        let io = || std::io::Error::other("boom");
+        for (err, text, has_source) in [
+            (
+                LockOpenError::AlreadyOpen,
+                "the lock file is already open in this process",
+                false,
+            ),
+            (
+                LockOpenError::Mismatch("page size".to_owned()),
+                "lock file mismatch: page size",
+                false,
+            ),
+            (
+                LockOpenError::ReadOnlyFs,
+                "the lock file is on a read-only filesystem",
+                false,
+            ),
+            (LockOpenError::from(io()), "lock file I/O error: boom", true),
+        ] {
+            assert_eq!(err.to_string(), text);
+            assert_eq!(
+                err.source().map(ToString::to_string),
+                has_source.then(|| "boom".to_owned())
+            );
+        }
+    }
 
     /// The path of a lock file in a fresh directory, which is removed with
     /// everything in it when this is dropped.
@@ -1191,9 +1190,8 @@ mod tests {
     }
 
     /// An initializer never shrinks the reader table of a finished lock file
-    /// from an earlier run, as LMDB
-    /// (`OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS`), grows it when asked
-    /// for more, and ignores the count of an unfinished file.
+    /// from an earlier run, as LMDB does, grows it when asked for more, and
+    /// ignores the count of an unfinished file.
     #[test]
     fn initializer_keeps_a_larger_finished_table() {
         let path = tmp();

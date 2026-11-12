@@ -23,8 +23,8 @@ pub(crate) const MAX_DBS_LIMIT: u32 = 1 << 20;
 /// `max_dbs` comparator `OnceLock`s. An unbounded value, e.g.
 /// `max_readers(u32::MAX)`, would be an allocation-failure abort or a
 /// 512 GiB lock file, not an error. The bounds (SPEC 00 rows 4/5, SPEC 04
-/// TXN-14) are far above any real deployment (Meilisearch's ceiling is 1024
-/// readers / ~30 dbs). The engine calls this before it creates any file, and
+/// TXN-14) are far above any real deployment. The engine calls this before
+/// it creates any file, and
 /// the core open functions call it again for callers that build a
 /// backing themselves.
 pub fn check_open_limits(max_readers: u32, max_dbs: u32) -> Result<(), Error> {
@@ -256,9 +256,8 @@ pub fn open_with_backing_shared(
             // ADR-0023: a newer meta on disk than `T` (the
             // unpublished first commit of a `PREV_SNAPSHOT` opener, or a
             // commit between its meta write and its `T` store) is what
-            // LMDB's `mdb_env_info`/`mdb_env_stat` report
-            // (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`). Kept
-            // for those calls only; reads still use `T`.
+            // LMDB's `mdb_env_info`/`mdb_env_stat` report. Kept for those
+            // calls only; reads still use `T`.
             let newer = (selected.txnid > seed.txnid).then(|| Unpublished {
                 snap: Arc::new(selected),
                 own_commit: false,
@@ -270,8 +269,7 @@ pub fn open_with_backing_shared(
     let reader_table = match &shared {
         // In shared mode the slot count comes from the region, fixed by the
         // first opener: a joining process adopts it whatever its own
-        // `max_readers` asks for, as an LMDB joiner does (ADR-0023 §1 as
-        // amended).
+        // `max_readers` asks for, as an LMDB joiner does (ADR-0023).
         #[cfg(not(loom))]
         Some(region) => ReaderTable::new_shared(Arc::clone(region)),
         // The reader table is sized once at open and never resized (TXN-14).
@@ -310,7 +308,7 @@ pub fn open_with_backing_shared(
         // Seed the published-snapshot cell from the durable meta — the one
         // and only time a meta *page* is read for roots (SPEC 04 TXN-18). A
         // lock-file environment re-reads metas when another process commits
-        // (ADR-0023 §4, `EnvInner::snapshot_at`).
+        // (ADR-0023, `EnvInner::snapshot_at`).
         snap_cell: SnapshotCell::new(Arc::new(seed)),
         write_mutex: WriterLock::new(),
         commit_hook: Mutex::new(None),
@@ -355,9 +353,9 @@ pub fn open_with_backing_shared(
         reg.insert(canonical_path, (id, Arc::downgrade(&inner)));
     }
 
-    // ADR-0023 §1: let joiners in only after `T` is seeded and the env is
-    // registered. A `PREV_SNAPSHOT` initializer keeps the election until its
-    // first commit instead (ADR-0023; `RwTxn::commit`).
+    // Let joiners in only after `T` is seeded and the env is registered. A
+    // `PREV_SNAPSHOT` initializer keeps the election until its first commit
+    // instead (ADR-0023; `RwTxn::commit`).
     if let Some(region) = &inner.shared {
         if !inner.holds_election() {
             region.finish_open().map_err(Error::Io)?;
@@ -384,7 +382,7 @@ fn read_slot(bytes: &[u8], pgno: u64, page_size: u32) -> Result<MetaValidity, Er
 }
 
 /// The snapshot committed as txnid `t`, decoded from a copy of meta slot
-/// `t & 1` (ADR-0023 §4). `Ok(None)` means the slot no longer holds `t`: it
+/// `t & 1` (ADR-0023). `Ok(None)` means the slot no longer holds `t`: it
 /// was overwritten by `t + 2`, or the copy was torn by a concurrent rewrite.
 /// The caller re-reads the published txnid and retries. Geometry is checked
 /// as at open (SPEC 06 REC-1a), against the file as it is now.
@@ -439,7 +437,7 @@ fn check_meta_shape(meta: &MetaPage) -> Result<(), Error> {
 }
 
 /// Bound on re-reads of the published txnid when its meta slot keeps changing
-/// underneath (ADR-0023 §4). Each retry means a commit landed or a slot was
+/// underneath (ADR-0023). Each retry means a commit landed or a slot was
 /// mid-rewrite; a slot that never decodes is a corrupt file, reported as
 /// [`MdbError::Invalid`] once the bound is reached instead of spinning.
 // Lower under miri only to keep its runtime bounded; the bounded-retry →
@@ -511,8 +509,8 @@ fn grow_to_seed(backing: &dyn Backing, page_size: u32, seed: &Snapshot) -> Resul
 /// must not wrap the multiply.
 ///
 /// - Past the logical map size: [`MdbError::MapResized`]. Another process
-///   with a larger map committed beyond this one's (`OBS_READ_BEGIN_SMALL_MAP`,
-///   `OBS_WRITE_BEGIN_SMALL_MAP`). A larger map size in the meta alone passes.
+///   with a larger map committed beyond this one's; LMDB fails read and
+///   write begins the same way. A larger map size in the meta alone passes.
 /// - Past the mapped bytes but inside the logical size: [`MdbError::Invalid`];
 ///   a mapping always covers its logical size, so this is a bug or corruption.
 /// - Past the file's real length: [`MdbError::Invalid`] (REC-1a).

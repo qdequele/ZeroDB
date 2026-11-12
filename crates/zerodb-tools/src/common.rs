@@ -19,9 +19,9 @@ pub type BoxErr = Box<dyn std::error::Error>;
 ///
 /// `max_readers` is the value the environment's lock file records, if any;
 /// otherwise the engine default. A tool that joins a running environment
-/// adopts that environment's count anyway (ADR-0023 §1); reading
-/// it first keeps the count when every other process has closed and the
-/// tool's open reinitializes the lock file.
+/// adopts that environment's count anyway (ADR-0023); reading it first keeps
+/// the count when every other process has closed and the tool's open
+/// reinitializes the lock file.
 ///
 /// # Errors
 ///

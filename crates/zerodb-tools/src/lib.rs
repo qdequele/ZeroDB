@@ -84,13 +84,13 @@ fn dispatch(args: &[String]) -> Result<ExitCode, common::BoxErr> {
 
     match cmd.as_str() {
         "stat" => {
-            let dir = require_positional(rest, "stat <env-dir>")?;
+            let [dir] = positionals(parse_opts(rest)?.0, "stat <env-dir>")?;
             print!("{}", commands::cmd_stat(&dir)?);
             Ok(ExitCode::SUCCESS)
         }
         "dump" => {
             let (positional, opts) = parse_opts(rest)?;
-            let dir = first_positional(&positional, "dump <env-dir> [--out FILE]")?;
+            let [dir] = positionals(positional, "dump <env-dir> [--out FILE]")?;
             match opts.out {
                 Some(out) => commands::write_dump(&dir, BufWriter::new(File::create(out)?))?,
                 None => commands::write_dump(&dir, std::io::stdout().lock())?,
@@ -99,13 +99,10 @@ fn dispatch(args: &[String]) -> Result<ExitCode, common::BoxErr> {
         }
         "load" => {
             let (positional, opts) = parse_opts(rest)?;
-            if positional.len() < 2 {
-                return Err(
-                    "usage: load <dump-file> <env-dir> [--page-size N] [--map-size BYTES]".into(),
-                );
-            }
-            let dump = PathBuf::from(&positional[0]);
-            let dir = PathBuf::from(&positional[1]);
+            let [dump, dir] = positionals(
+                positional,
+                "load <dump-file> <env-dir> [--page-size N] [--map-size BYTES]",
+            )?;
             let psize = opts.page_size.unwrap_or(DEFAULT_PAGE_SIZE);
             let map_size = opts.map_size.unwrap_or(DEFAULT_MAP_SIZE);
             commands::cmd_load(&dump, &dir, psize, map_size)?;
@@ -113,7 +110,7 @@ fn dispatch(args: &[String]) -> Result<ExitCode, common::BoxErr> {
             Ok(ExitCode::SUCCESS)
         }
         "check" => {
-            let dir = require_positional(rest, "check <env-dir>")?;
+            let [dir] = positionals(parse_opts(rest)?.0, "check <env-dir>")?;
             let (report, clean) = commands::cmd_check(&dir)?;
             print!("{report}");
             Ok(if clean {
@@ -142,14 +139,10 @@ fn dispatch(args: &[String]) -> Result<ExitCode, common::BoxErr> {
 #[cfg(feature = "migrate-lmdb")]
 fn run_migrate(rest: &[String]) -> Result<ExitCode, common::BoxErr> {
     let (positional, opts) = parse_opts(rest)?;
-    if positional.len() < 2 {
-        return Err(
-            "usage: migrate-from-lmdb <src-lmdb-dir> <dst-env-dir> [--page-size N] [--map-size BYTES]"
-                .into(),
-        );
-    }
-    let src = PathBuf::from(&positional[0]);
-    let dst = PathBuf::from(&positional[1]);
+    let [src, dst] = positionals(
+        positional,
+        "migrate-from-lmdb <src-lmdb-dir> <dst-env-dir> [--page-size N] [--map-size BYTES]",
+    )?;
     let psize = opts.page_size.unwrap_or(DEFAULT_PAGE_SIZE);
     let map_size = opts.map_size.unwrap_or(DEFAULT_MAP_SIZE) as usize;
     let report = migrate::cmd_migrate(&src, &dst, map_size, psize)?;
@@ -189,7 +182,7 @@ struct Opts {
 }
 
 /// Split `args` into positional args and the `--out`, `--page-size` and
-/// `--map-size` options, each followed by its value. Hand-rolled, no `clap`.
+/// `--map-size` options, each followed by its value.
 ///
 /// # Errors
 ///
@@ -231,21 +224,29 @@ fn parse_opts(args: &[String]) -> Result<(Vec<String>, Opts), common::BoxErr> {
     Ok((positional, opts))
 }
 
-fn require_positional(rest: &[String], usage: &str) -> Result<PathBuf, common::BoxErr> {
-    let (positional, _) = parse_opts(rest)?;
-    first_positional(&positional, usage)
-}
-
-fn first_positional(positional: &[String], usage: &str) -> Result<PathBuf, common::BoxErr> {
-    positional
-        .first()
-        .map(PathBuf::from)
-        .ok_or_else(|| format!("usage: {usage}").into())
+/// The subcommand's exactly `N` positional arguments, as paths.
+///
+/// # Errors
+///
+/// Too few arguments, or an extra one: a mistyped command line must not run
+/// on a prefix of what was typed.
+fn positionals<const N: usize>(
+    positional: Vec<String>,
+    usage: &str,
+) -> Result<[PathBuf; N], common::BoxErr> {
+    if let Some(extra) = positional.get(N) {
+        return Err(format!("unexpected argument {extra:?}\nusage: {usage}").into());
+    }
+    let paths: Vec<PathBuf> = positional.into_iter().map(PathBuf::from).collect();
+    paths
+        .try_into()
+        .map_err(|_| format!("usage: {usage}").into())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_opts;
+    use super::{dispatch, parse_opts, positionals};
+    use std::path::PathBuf;
 
     fn args(a: &[&str]) -> Vec<String> {
         a.iter().map(|s| (*s).to_string()).collect()
@@ -277,6 +278,47 @@ mod tests {
             &["--verbose", "dir"],
         ] {
             assert!(parse_opts(&args(bad)).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn positionals_takes_exactly_the_expected_count() {
+        let [a, b] = positionals(args(&["in", "out"]), "cmd <a> <b>").unwrap();
+        assert_eq!((a, b), (PathBuf::from("in"), PathBuf::from("out")));
+
+        let missing = positionals::<2>(args(&["in"]), "cmd <a> <b>").unwrap_err();
+        assert_eq!(missing.to_string(), "usage: cmd <a> <b>");
+
+        let extra = positionals::<1>(args(&["in", "stray"]), "cmd <a>").unwrap_err();
+        assert_eq!(
+            extra.to_string(),
+            "unexpected argument \"stray\"\nusage: cmd <a>"
+        );
+    }
+
+    /// An extra argument is refused before the subcommand touches any path:
+    /// none of these paths exist, and the error names the stray argument
+    /// instead of a missing file.
+    #[test]
+    fn subcommands_reject_extra_positional_arguments() {
+        for bad in [
+            &["stat", "/nonexistent/env", "stray"][..],
+            &["check", "/nonexistent/env", "stray"],
+            &["dump", "/nonexistent/env", "stray"],
+            &[
+                "dump",
+                "/nonexistent/env",
+                "--out",
+                "/nonexistent/o",
+                "stray",
+            ],
+            &["load", "/nonexistent/dump", "/nonexistent/env", "stray"],
+        ] {
+            let err = dispatch(&args(bad)).unwrap_err().to_string();
+            assert!(
+                err.starts_with("unexpected argument \"stray\""),
+                "{bad:?}: {err}"
+            );
         }
     }
 }
