@@ -223,9 +223,15 @@ pub(super) enum AllocMode {
     /// loose pages, the already-loaded drain pool, the carried annex pool or
     /// extend only (GC-12). Every request is a single page: GC records are
     /// always inline (GC-5), so the save never allocates an overflow run.
-    /// Set once at `freelist_save` entry and never cleared: the commit
-    /// consumes the txn.
+    /// Set at `freelist_save` entry; the commit consumes the txn.
     GcSave,
+    /// Inside `freelist_save` once its drawing rounds are spent (GC-13a):
+    /// loose pages or extend. Neither pool is drawn from, so no record
+    /// already written can come to list a handed-out page. The one
+    /// exception is a full map: a save the pools can serve must not fail
+    /// with `MapFull`, so the pools are drawn from when the file cannot be
+    /// extended.
+    GcSaveExtend,
 }
 
 impl<'env> RwTxn<'env> {
@@ -312,22 +318,16 @@ impl<'env> RwTxn<'env> {
                 }
             }
             AllocMode::GcSave => {
-                // GC-12 (ADR-0005): never *read* the GC tree in-save, but
-                // draw from the already-loaded drain pool, which keeps file
-                // growth bounded (`freelist_save` gives the argument). Each
-                // entry touched here is rewritten again before the fixed
-                // point (`save_touched`), so no rewritten entry lists a
-                // handed-out page.
-                if let Some(start) = self.save_pool_draw(n) {
+                if let Some(start) = self.save_draw(n) {
                     return Ok(start);
                 }
-                // The carried annex pool (SPEC 05 §2a GC-30): gate-checked
-                // like every annex draw; the step-(c) placement re-reads
-                // `annex.live()` after every put, so a draw here can never
-                // leave a handed-out id in the persisted set — the GC-12
-                // pool argument.
-                if let Some(start) = self.annex_draw(n) {
-                    return Ok(start);
+            }
+            AllocMode::GcSaveExtend => {
+                let mp = map_pages(self.env.inner().map_size(), self.psize);
+                if is_map_full(self.next_pgno, n, mp) {
+                    if let Some(start) = self.save_draw(n) {
+                        return Ok(start);
+                    }
                 }
             }
         }
@@ -351,6 +351,19 @@ impl<'env> RwTxn<'env> {
         }
     }
 
+    /// The in-save draws (GC-12, ADR-0005): the GC tree is never *read*
+    /// in-save, but the already-loaded drain pool is drawn from, which keeps
+    /// file growth bounded (`freelist_save` gives the argument). Each entry
+    /// touched is rewritten again before the fixed point (`save_touched`),
+    /// so no rewritten entry lists a handed-out page. Then the carried annex
+    /// pool (SPEC 05 §2a GC-30), gate-checked like every annex draw: the
+    /// step-(c) placement re-reads `annex.live()` after every put, so a draw
+    /// can never leave a handed-out id in the persisted set.
+    #[inline(never)]
+    fn save_draw(&mut self, n: u64) -> Option<u64> {
+        self.save_pool_draw(n).or_else(|| self.annex_draw(n))
+    }
+
     /// In-save draw from the **already-loaded drain pool** (GC-12;
     /// see [`RwTxn::allocate`]). Deterministic like GC-19: smallest
     /// reclaimable record first (`drains` is a `BTreeMap` in key order),
@@ -361,7 +374,7 @@ impl<'env> RwTxn<'env> {
     /// pages are absent.
     #[inline(never)]
     pub(super) fn save_pool_draw(&mut self, n: u64) -> Option<u64> {
-        debug_assert!(self.alloc_mode == AllocMode::GcSave);
+        debug_assert!(self.alloc_mode != AllocMode::Normal);
         let mut hit: Option<(GcKey, u64)> = None;
         for (key, remaining) in &work!(self).drains {
             if let Some(start) = find_run(remaining.live(), n) {

@@ -25,8 +25,9 @@
 //! C1, `RwTxn::freelist_save` rewrites drained entries, releases trailing
 //! loose pages (GC-10), and writes this txn's freed set under
 //! `BE(writer_txnid)` in a fixed-point loop (GC-11..13) during which
-//! `allocate` is restricted to loose pages / extend only (GC-12,
-//! `AllocMode::GcSave`). The GC tree is mutated by the **same** split/COW
+//! `allocate` never reads the GC tree: it takes loose pages, draws from the
+//! pools already loaded, or extends (GC-12, GC-13a; `AllocMode::GcSave`,
+//! then `AllocMode::GcSaveExtend`). The GC tree is mutated by the **same** split/COW
 //! code as the main tree, selected by `TreeId`.
 //!
 //! ## Commit (SPEC 04 §9, SPEC 06 §2)
@@ -221,9 +222,9 @@ pub(crate) struct WriterCarry {
     /// The base meta's free-list annex pool (SPEC 05 §2a, ADR-0022): the
     /// pages freed by txn `base.txnid`, parsed (and `validate_pil_ids`-
     /// checked, GC-33) at begin when `base.free_annex > 0`. Drawn by
-    /// [`RwTxn::annex_draw`] (allocate step 2b, gated per GC-31); whatever
-    /// remains is folded into `freed` at the top of `freelist_save` (the
-    /// GC-30 carry) — by then the pool is empty, so GcSave never sees it.
+    /// [`RwTxn::annex_draw`] (allocate step 2b, gated per GC-31), during
+    /// ops and inside `freelist_save`; whatever remains at the save's fixed
+    /// point is carried into this txn's own entry (GC-30).
     annex: Drain,
     /// Entries of `drains` whose `remaining` shrank via an **in-save pool
     /// draw** (GC-12 — see `freelist_save`): each must be

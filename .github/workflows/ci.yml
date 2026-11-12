@@ -1,7 +1,8 @@
 # ZeroDB CI — the CONTRIBUTING.md check battery, automated.
 #
 # Per push / PR: fmt, clippy, tests (x86-64 and aarch64), an MSRV check, miri
-# on the core, loom on the reader table, the fuzz gate and the crash smoke.
+# on the core, loom on the reader table, the free-list save without pool
+# draws, the fuzz gate and the crash smoke.
 # Nightly: the long fuzz, the full crash run and the reader stress.
 # The loom, fuzz, crash and stress jobs run the justfile recipes of the same
 # name, so `just <recipe>` locally runs exactly what CI runs.
@@ -114,6 +115,22 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo install just --version 1.58.0 --locked
       - run: just loom
+
+  save-no-draw:
+    name: free-list save without pool draws
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10-01)
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo install just --version 1.58.0 --locked
+      - run: just save-no-draw
 
   fuzz-quick:
     name: fuzz gate (${{ matrix.os }})
