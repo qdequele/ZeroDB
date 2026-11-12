@@ -29,5 +29,9 @@ proptest.workspace = true
 zerodb-io = { path = "../zerodb-io", features = ["test-backing"] }
 
 [lints.rust]
-# `cfg(loom)` is set externally by the `just loom` recipe (ADR-0006).
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+# `cfg(loom)` is set externally by the `just loom` recipe (ADR-0006), and
+# `cfg(zerodb_save_draw_rounds)` by the `just save-no-draw` recipe (ADR-0044).
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(loom)",
+    'cfg(zerodb_save_draw_rounds, values("0", "1"))',
+] }

@@ -41,6 +41,7 @@ Approved or accepted, and in `main`.
 | 0031 | [Hardware CRC32C for the meta checksum](adr/0031-hardware-crc32c.md) | Accepted (Option B), implemented; amends the `unsafe` policy | Performance (commit), `unsafe` policy |
 | 0034 | [Trust page contents by default, as LMDB does](adr/0034-trusted-pages-by-default.md) | Accepted | Page validation, LMDB parity, `unsafe` policy |
 | 0037 | [Bounded free-page records](adr/0037-bounded-free-page-records.md) | Accepted (Option C), implemented | On-disk format, page reclamation |
+| 0044 | [The round limit of the free-list save has no derivation](adr/0044-freelist-save-round-bound.md) | Accepted (Option C), implemented | Page reclamation, commit |
 
 ## Shipped, approval not recorded
 

@@ -19,6 +19,22 @@ miri:
 loom:
     RUSTFLAGS="--cfg loom" CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo test -p zerodb-core --lib --release loom_
 
+# The free-list save with its pool draws cut off from the first round, then
+# after one round (ADR-0044, SPEC 05 GC-13a), over the engine's tests and the
+# crash smoke. The two skipped tests assert a file size and page numbers that
+# hold only when the save reuses pool pages.
+save-no-draw:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export CARGO_TARGET_DIR=target-save-no-draw
+    for rounds in 0 1; do
+        export RUSTFLAGS="--cfg zerodb_save_draw_rounds=\"$rounds\""
+        cargo test -p zerodb-core -p zerodb -- \
+            --skip over_cap_freed_set_spills_whole_to_gc_tree \
+            --skip delete_rebalance_logical_images_match_golden
+        cargo run -p zerodb-oracle --bin crash-harness -- --cycles 200
+    done
+
 # Unoptimized on purpose: debug assertions keep the writer-side GC shadow gate
 # armed. A ~5 s variant runs in the normal `cargo test` suite; this one runs
 # nightly in CI and before a consumer integration gate (ADR-0006).

@@ -223,9 +223,12 @@ pub(super) enum AllocMode {
     /// loose pages, the already-loaded drain pool, the carried annex pool or
     /// extend only (GC-12). Every request is a single page: GC records are
     /// always inline (GC-5), so the save never allocates an overflow run.
-    /// Set once at `freelist_save` entry and never cleared: the commit
-    /// consumes the txn.
+    /// Set at `freelist_save` entry; the commit consumes the txn.
     GcSave,
+    /// Inside `freelist_save` once its drawing rounds are spent (GC-13a):
+    /// loose pages or extend only. Neither pool is drawn from, so no record
+    /// already written can come to list a handed-out page.
+    GcSaveExtend,
 }
 
 impl<'env> RwTxn<'env> {
@@ -330,6 +333,7 @@ impl<'env> RwTxn<'env> {
                     return Ok(start);
                 }
             }
+            AllocMode::GcSaveExtend => {}
         }
         let mp = map_pages(self.env.inner().map_size(), self.psize);
         if is_map_full(self.next_pgno, n, mp) {

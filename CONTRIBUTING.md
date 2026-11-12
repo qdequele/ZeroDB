@@ -131,6 +131,7 @@ cargo +nightly miri test -p zerodb-core   # non-mmap logic must pass miri
 just fuzz-quick                           # differential fuzz against LMDB
 just crash-test-quick                     # crash-consistency smoke
 just loom                                 # reader-table model check, when touching readers or nested txns
+just save-no-draw                         # free-list save without pool draws, when touching the allocator or the save
 just stress                               # 180 s reader/writer stress, before an integration gate
 ```
 

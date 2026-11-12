@@ -183,6 +183,13 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 
 ### Fixed
 
+- **A commit no longer fails when the free-list save converges slowly**
+  (ADR-0044). The save loop was limited to 64 rounds, a number its
+  termination proof did not give; past it the commit panicked, and a retry
+  of the same batch was likely to panic again. After 8 rounds the save now
+  stops reusing free pages and extends the file by a few pages, which ends
+  it. The remaining guard is computed from the proof (SPEC 05 GC-13,
+  GC-13a). No test, crash or stress run has needed more than 3 rounds.
 - `LeafRef::new` and `BranchRef::new` reject a buffer shorter than the page
   size, and `LeafMut::lookup` bounds-checks its reads. Both could read out of
   bounds from safe code when called directly; the engine always passed whole
