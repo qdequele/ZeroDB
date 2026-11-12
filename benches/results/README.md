@@ -6,6 +6,9 @@ faster. [docs/PERFORMANCE.md](../../docs/PERFORMANCE.md) explains the method
 and summarizes the results. The current reference run is
 [2026-11-12-ladder-meilisearch-graviton-gp3.md](2026-11-12-ladder-meilisearch-graviton-gp3.md):
 the whole ladder and Meilisearch on Graviton4 with EBS gp3.
+[2026-11-12-cold-cache-reads-graviton-gp3.md](2026-11-12-cold-cache-reads-graviton-gp3.md)
+covers what the ladder does not: reads with nothing cached, on a data set
+larger than memory.
 
 Earlier reports from the development history were removed from the tree; they
 are still in git history (for example at commit `e0fd466`).
