@@ -116,7 +116,7 @@ impl DataFile {
     }
 
     fn read_meta_copy(&self, slot: u64, psize: u32, buf: &mut [u8]) -> std::io::Result<()> {
-        // A kernel copy rather than a map slice (ADR-0023 §4): another process
+        // A kernel copy rather than a map slice (ADR-0023): another process
         // may be rewriting this slot, and borrowing bytes under a concurrent
         // write would be a data race. A torn copy fails its CRC.
         file::read_page_into(&self.file, slot, psize, &mut buf[..psize as usize])
@@ -562,12 +562,11 @@ pub fn open_or_create_with_advice(
     }
     // SPEC 02 §3.2: an env holds both meta slots in its first `2 * page_size`
     // bytes; any shorter file cannot be a store and is rejected **before the
-    // map exists**. Load-bearing, not just tidy: the core reads slot 1 at
-    // `[psize, 2*psize)` through the map, and OS pages wholly past EOF fault
-    // (SIGBUS) instead of erroring — reachable with a garbage or truncated
-    // file whenever `file_len` is at least one OS page short of `2 * psize`.
-    // LMDB never faults here because it preads the header before mapping; the
-    // parity outcome for both engines is a clean `MDB_INVALID`.
+    // map exists**. The core reads slot 1 at `[psize, 2*psize)` through the
+    // map, and OS pages wholly past EOF fault (SIGBUS) instead of erroring,
+    // which a garbage or truncated file reaches whenever `file_len` is at
+    // least one OS page short of `2 * psize`. LMDB preads the header before
+    // mapping; both engines answer `MDB_INVALID`.
     if file_len < 2 * page_size as usize {
         return Err(Error::Mdb(MdbError::Invalid));
     }

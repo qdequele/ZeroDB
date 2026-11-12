@@ -38,6 +38,10 @@ the release workflow publishes the section matching the tag as the GitHub releas
 - New error variant `MdbError::BadDbi`.
 - A runnable example, `cargo run -p zerodb --example basic`.
 - `zerodb::EnvFlags::from_bits_truncate`.
+- `zerodb_core::check::check_image_with_key_order` and
+  `check_snapshot_with_key_order`: a caller that holds a database's custom
+  comparator can have key order checked under it, or skipped. `check_image`,
+  `check_snapshot` and `zerodb-tools check` are unchanged.
 
 ### Changed
 
@@ -179,6 +183,15 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 
 ### Fixed
 
+- `LeafRef::new` and `BranchRef::new` reject a buffer shorter than the page
+  size, and `LeafMut::lookup` bounds-checks its reads. Both could read out of
+  bounds from safe code when called directly; the engine always passed whole
+  pages.
+- `zerodb-tools check` no longer reads the whole data file into memory when
+  the environment cannot be opened; it walks a read-only map.
+- A `pwritev` interrupted by a signal is retried, not reported as an error.
+- `remove_span` leaves the page unmodified when it returns an error.
+- `zerodb-tools` rejects unexpected extra arguments.
 - heed adapter: `Database::put_reserved` returns `Io(UnexpectedEof)` when the
   closure writes fewer bytes than it reserved, as heed does. It returned `Ok`
   with a zeroed tail.
@@ -237,10 +250,12 @@ feature that links C LMDB).
 ### What ZeroDB is
 
 A pure-Rust, transactional, memory-mapped key-value engine with LMDB's
-architecture: a single writer, lock-free MVCC readers, copy-on-write B+trees,
+architecture: a single writer, MVCC readers that never wait on a write
+transaction (beginning one takes a short mutex to pin the snapshot),
+copy-on-write B+trees,
 double-buffered CRC32C meta pages and reader-gated free-page reuse. It ships
 behind a 1:1 re-implementation of the API of heed 0.22.1 (the Rust LMDB wrapper
-Meilisearch uses), and every behavior is checked against the LMDB fork
+Meilisearch uses), and its behavior is checked against the LMDB fork
 Meilisearch runs.
 
 - **Use the engine directly:** `zerodb = "0.2"` from crates.io (with
@@ -308,7 +323,8 @@ performance experiment, kept or reverted, is a line in
   differential fuzz on x86-64 and aarch64, `miri` on the core, `loom` on the
   reader table and a crash-injection smoke; nightly runs add a 4-hour fuzz,
   10,000 crash cycles and a reader/writer stress test.
-- **Consumers**: Meilisearch v1.53.1 and hannoy run unmodified on this release
+- **Consumers**: Meilisearch v1.53.1 and hannoy run on this release with no
+  source changes
   (the benchmarks above). Their own test suites (milli 271 lib + 92 integration
   tests, index-scheduler 80 tests, hannoy) last passed on ZeroDB on 2026-09-09,
   before spilling, in-place `WRITE_MAP` and `format_version` 2; they were not

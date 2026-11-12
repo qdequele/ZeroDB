@@ -26,7 +26,7 @@
 //! durable meta `N` without durable `N`-data. If the pipeline ever misordered
 //! C3 after C4, this backend would materialize exactly that corrupt image and
 //! the harness's REC-18 verification would fail — that is the tripwire this
-//! module arms (and the mutation self-test proves it fires, ADR-0008.1).
+//! module arms (and the mutation self-test proves it fires, ADR-0008).
 //!
 //! ## In-place `WRITE_MAP` (ADR-0021)
 //!
@@ -84,7 +84,7 @@ pub const SECTOR: usize = 512;
 // Deterministic PRNG (ADR-0008): splitmix64 seeding a
 // xoshiro256** core. In-house so fault plans are bit-stable across platforms,
 // crate versions, and time — a saved (seed, cycle) pair reproduces the exact
-// image forever. ~20 lines, test-infrastructure only (CRC32C precedent).
+// image forever. Test infrastructure only.
 // ---------------------------------------------------------------------------
 
 /// splitmix64: the standard 64-bit seed expander (public domain, Steele et
@@ -164,7 +164,7 @@ pub struct WriteRecord {
     /// Byte offset in the file (`pgno * psize` — page-aligned by construction
     /// of the [`Backing`] trait, the ADR-0008 invariant).
     pub offset: u64,
-    /// The bytes written (length a positive multiple of `psize`, D5).
+    /// The bytes written (length a positive multiple of `psize`).
     pub data: Box<[u8]>,
 }
 
@@ -212,7 +212,7 @@ struct FaultState {
     /// re-brokers its region); content is read from the live map at the next
     /// seal (any `sync`) or capture — see the module docs.
     map_regions: BTreeMap<u64, u64>,
-    /// Mutation self-test mode (ADR-0008.1): barriers fold ONLY meta-page
+    /// Mutation self-test mode (ADR-0008): barriers fold ONLY meta-page
     /// writes; data writes stay pending forever. This models a pipeline whose
     /// data fsync is ineffective/misordered — the harness MUST catch the
     /// resulting meta-without-data images. Never set outside the self-test.
@@ -314,7 +314,7 @@ impl FaultState {
                     self.keep_pending(&rec, cur, lo);
                 }
                 if broken && rec.offset >= meta_end {
-                    // ADR-0008.1 self-test: data durability is dropped.
+                    // ADR-0008 self-test: data durability is dropped.
                     self.keep_pending(&rec, lo, hi);
                 } else {
                     if self.durable.len() < hi as usize {
@@ -370,7 +370,7 @@ impl FaultHandle {
         }
     }
 
-    /// ADR-0008.1 mutation self-test switch. See the `FaultState` docs.
+    /// ADR-0008 mutation self-test switch. See the `FaultState` docs.
     pub fn set_broken_data_barriers(&self, broken: bool) {
         self.state
             .lock()
@@ -425,7 +425,7 @@ impl FaultBacking {
     ///
     /// # Errors
     ///
-    /// Infallible today; `Result` for signature parity with [`FaultBacking::wrap`].
+    /// None: the `Result` matches [`FaultBacking::wrap`]'s signature.
     pub fn wrap_with_initial(
         inner: Box<dyn Backing>,
         psize: u32,
@@ -485,8 +485,8 @@ impl Backing for FaultBacking {
     fn write_at_page(&self, pgno: u64, psize: u32, data: &[u8]) -> std::io::Result<()> {
         {
             let mut st = self.state.lock().expect("fault state lock");
-            // ADR-0008 (O_DIRECT-friendly sizing audit): every commit write
-            // MUST be a positive whole-page multiple at a page offset. The
+            // ADR-0008: every commit write must be a positive whole-page
+            // multiple at a page offset (so it stays `O_DIRECT`-compatible). The
             // trait's `pgno` shape makes the offset structural; length is
             // asserted here on every write of every crash cycle.
             debug_assert_eq!(psize, st.psize, "write psize drifted from env psize");
@@ -515,9 +515,8 @@ impl Backing for FaultBacking {
         self.inner.dirty_in_map()
     }
 
-    // clippy cannot see that this is an `unsafe fn` whose documented contract
-    // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
-    // too); ADR-0021's substance is the `unsafe fn` itself.
+    // The lint fires on `unsafe fn`s too; the trait's contract covers the
+    // aliasing it warns about.
     #[allow(clippy::mut_from_ref)]
     unsafe fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
         {
@@ -795,7 +794,7 @@ impl CapturedDisk {
     /// can starve the REC-19 CRC-rejection or txnid-selection paths), then
     /// seeded random per-write fates. Deterministic in `seed`.
     ///
-    /// Quotas (asserted by `plan_quotas_present` in tests, ADR-0008.1):
+    /// Quotas (ADR-0008):
     /// - `floor` (all dropped) and `ceil` (all applied) — always;
     /// - `lost-extension` (all applied, durable length) — always;
     /// - if a meta write is pending: `meta-subsector-torn` (splits the meta's
@@ -1275,7 +1274,7 @@ mod tests {
 
     #[test]
     fn broken_barrier_mode_keeps_data_pending() {
-        // ADR-0008.1: the mutation self-test switch — barriers fold metas
+        // ADR-0008: the mutation self-test switch — barriers fold metas
         // but silently drop data durability.
         let (b, h) = setup(2);
         h.set_broken_data_barriers(true);

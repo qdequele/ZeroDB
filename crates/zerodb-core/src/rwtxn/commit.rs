@@ -49,7 +49,8 @@ impl<'env> RwTxn<'env> {
         // be gone before anything commits. Compile-time this is guaranteed —
         // `commit(self)` is by-value, so a live child's `&self` borrow makes
         // the call unrepresentable; the runtime check backstops lifetime
-        // erasure (oracle/FFI) and `mem::forget`-leaked children.
+        // erasure through `unsafe` code or FFI, and `mem::forget`-leaked
+        // children.
         // Checked before `is_unchanged` too: a leaked child must block even a
         // no-op commit, keeping the degradation mode uniform (always BadTxn).
         if self.children.live() != 0 {
@@ -127,7 +128,7 @@ impl<'env> RwTxn<'env> {
         // map-resident at their final offsets, so `write_frames` writes
         // nothing for them — C2 reduces to the heap frames (none, in pure
         // in-map txns) and the C3 `msync` barrier makes the in-place stores
-        // durable exactly as it made the commit-time `memcpy`s durable.
+        // durable.
         let mut pgnos = std::mem::take(&mut work_mut!(self).pgnos);
         self.dirty.sorted_pgnos_into(&mut pgnos);
         self.write_frames(&pgnos)?;
@@ -136,8 +137,8 @@ impl<'env> RwTxn<'env> {
         // torn) pages are unreferenced garbage (REC-6 H1).
 
         // ----- C3: fsync(data) — MUST complete before C4 (REC-7). Skipped
-        // under NO_SYNC/MAP_ASYNC-none (SPEC 06 REC-9): the pages are written
-        // (C2) but not made durable this commit. -----
+        // under NO_SYNC (SPEC 06 REC-9): the pages are written (C2) but not
+        // made durable this commit. -----
         // Under WRITE_MAP the barrier is a ranged `msync` (SPEC 06 REC-12) of
         // the used prefix `[0, next_pgno)`, as LMDB's: every page any snapshot
         // up to this one can reference, which includes both meta slots (the
@@ -232,17 +233,16 @@ impl<'env> RwTxn<'env> {
 
         // ----- The first commit of a `PREV_SNAPSHOT` open that holds the
         // election is durable but not published, as LMDB's (ADR-0023): C5a
-        // and C6 are skipped,
-        // because the next commit reuses this txnid (TXN-2) and builds on the
-        // older snapshot. The election is finished instead, letting waiting
-        // processes join. -----
+        // and C6 are skipped, because the next commit reuses this txnid
+        // (TXN-2) and builds on the older snapshot. The election is finished
+        // instead, letting waiting processes join. -----
         if inner.holds_election() {
             return inner.finish_held_election(snapshot);
         }
 
         // ----- C5a: seed the env-wide validated-pages cache (ADR-0018;
-        // SPEC 04 TXN-38). Every frame C2 wrote is
-        // engine-authored, stamped with this txnid, and now final: C5 is
+        // SPEC 04 TXN-38). Every frame C2 wrote is engine-authored,
+        // stamped with this txnid, and now final: C5 is
         // done, the commit can no longer fail, and txnid `N` is consumed
         // forever — so `(pgno, N)` names exactly these bytes for the env's
         // life. Sits after C5 so a failed commit (whose txnid the next
@@ -262,8 +262,8 @@ impl<'env> RwTxn<'env> {
                     "every committed frame carries the committing txnid (ADR-0018)"
                 );
                 let kind = match crate::page::page_type_of(crate::page::read_flags(bytes)) {
-                    Ok(PageType::Leaf) => crate::stamps::StampKind::Leaf,
-                    Ok(PageType::Branch) => crate::stamps::StampKind::Branch,
+                    Ok(PageType::Leaf) => crate::btree::PageKind::Leaf,
+                    Ok(PageType::Branch) => crate::btree::PageKind::Branch,
                     // Overflow runs are not cacheable; meta pages are never
                     // dirty frames. `Err` is unreachable for engine-authored
                     // frames but must not fail an already-durable commit.

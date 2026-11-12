@@ -115,8 +115,8 @@ impl OwnedBranchCell {
 
 /// §6.4 split-point policy: median then fit-adjust, over the post-insert
 /// sequence's `used` sizes (`cell + 2` each). Index `s` belongs to the right
-/// page (deterministic tie-break). Cited, not re-derived (ADR-0004); the
-/// monotonicity/termination argument is SPEC 03 §6.4's.
+/// page (deterministic tie-break). The monotonicity/termination argument
+/// is in SPEC 03 §6.4.
 pub(super) fn choose_split(sizes: &[usize], cap: usize) -> usize {
     let n = sizes.len();
     debug_assert!(n >= 2, "splitting fewer than two cells");
@@ -622,7 +622,7 @@ impl<'env> RwTxn<'env> {
     /// Both keep ascending loads' leaves nearly full (milli's dominant
     /// pattern). All non-end inserts keep the median-fit-adjust rule
     /// (`choose_split`).
-    #[allow(clippy::too_many_arguments)] // house pattern (insert_into_leaf): pre-resolved scalars
+    #[allow(clippy::too_many_arguments)] // pre-resolved scalars, as `insert_into_leaf`
     pub(super) fn split_leaf(
         &mut self,
         tree: TreeId,
@@ -794,10 +794,11 @@ impl<'env> RwTxn<'env> {
     }
 
     /// Pack post-insert items `[from, to)` into a fresh frame at `pgno`
-    /// (no owned-cell materialization): item `j` is the caller's new cell when `j == newindx`,
-    /// else old cell `j`/`j-1` borrowed from `old`. The frame is
-    /// zero-initialized by `insert_tree_frame`, so `ZeroReserve` regions are
-    /// zero-filled without a scratch buffer (TXN-47).
+    /// (no owned-cell materialization): item `j` is the caller's new cell
+    /// when `j == newindx`, else old cell `j`/`j-1` borrowed from `old`.
+    /// The frame is zero-initialized by `insert_tree_frame`, so
+    /// `ZeroReserve` regions are zero-filled without a scratch buffer
+    /// (TXN-47).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn pack_leaf_range(
         &mut self,
@@ -849,13 +850,14 @@ impl<'env> RwTxn<'env> {
     /// way — the signal that a kept cursor path can no longer be proven
     /// correct (SPEC 03 §5.4a).
     ///
-    /// Optionally keeps `path` on a put's new cell (SPEC 03 §5.4b). `follow` is `None` for
-    /// callers whose path does not survive a split (it is then left as is),
+    /// Optionally keeps `path` on a put's new cell (SPEC 03 §5.4b).
+    /// `follow` is `None` for callers whose path does not survive a split
+    /// (it is then left as is),
     /// or `Some(new)` when the cell is under the inserted `child` (`new`) or
     /// under the frame's own child, whose index the insert does not move
     /// (`at` is right after it). The frame at `level` is then rewritten to
     /// the slot, on whichever half, of the child holding the cell.
-    #[allow(clippy::too_many_arguments)] // house pattern (insert_into_leaf): pre-resolved scalars
+    #[allow(clippy::too_many_arguments)] // pre-resolved scalars, as `insert_into_leaf`
     pub(super) fn insert_into_branch(
         &mut self,
         tree: TreeId,
@@ -934,12 +936,13 @@ impl<'env> RwTxn<'env> {
     /// it keeps branches packed on ascending workloads where the median rule
     /// leaves them about half full. A branch must keep two children (INV-8),
     /// so the new cell cannot start the right page alone as it does for an
-    /// APPEND on a leaf. Non-end inserts keep the median-fit-adjust rule (`choose_split`).
+    /// APPEND on a leaf. Non-end inserts keep the median-fit-adjust rule
+    /// (`choose_split`).
     ///
     /// `follow` is the post-insert index of the child a put's path follows
     /// ([`insert_into_branch`](Self::insert_into_branch)), or
     /// `None` to leave `path` as is.
-    #[allow(clippy::too_many_arguments)] // house pattern (insert_into_leaf): pre-resolved scalars
+    #[allow(clippy::too_many_arguments)] // pre-resolved scalars, as `insert_into_leaf`
     pub(super) fn split_branch(
         &mut self,
         tree: TreeId,

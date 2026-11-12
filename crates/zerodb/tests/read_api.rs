@@ -1,6 +1,6 @@
 //! Zerodb-only read-API tests. These drive the public
 //! `zerodb::{Env, RoTxn, Database}` read surface directly over a file produced
-//! by the bulk-load builder — covering `range`/`rev_range` (all `Bound`
+//! by the streaming bulk-load builder — covering `range`/`rev_range` (all `Bound`
 //! combinations) and a multi-megabyte overflow value, which the oracle `Op`
 //! model does not exercise (its values are bounded, and it has no range op).
 
@@ -10,14 +10,57 @@ use common::TempDir;
 use std::ops::Bound;
 
 use zerodb::EnvOpenOptions;
-use zerodb_core::builder::{build_single_db_image, DEFAULT_FILL_PERMILLE};
+use zerodb_core::builder::{EnvStream, PageSink, DEFAULT_FILL_PERMILLE};
 
 const PS: u32 = 4096;
 const MAP: u64 = 16 << 20;
 
+/// A [`PageSink`] over an in-memory image: pages 0 and 1 are the meta slots,
+/// data pages follow.
+struct ImageSink {
+    buf: Vec<u8>,
+    next: u64,
+}
+
+impl PageSink for ImageSink {
+    fn alloc(&mut self, n: u64) -> u64 {
+        let first = self.next;
+        self.next += n;
+        self.buf.resize(self.next as usize * PS as usize, 0);
+        first
+    }
+    fn next_pgno(&self) -> u64 {
+        self.next
+    }
+    fn emit(&mut self, pgno: u64, frame: &[u8]) -> std::io::Result<()> {
+        let base = pgno as usize * PS as usize;
+        self.buf[base..base + PS as usize].copy_from_slice(&frame[..PS as usize]);
+        Ok(())
+    }
+}
+
+/// Build a single-DB env image (txnid 1) holding `entries`, which must be
+/// strictly ascending by key.
+fn build_image(entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let sink = ImageSink {
+        buf: vec![0u8; 2 * PS as usize],
+        next: zerodb_core::page::FIRST_DATA_PGNO,
+    };
+    let stream = EnvStream::new(sink, PS, 1, DEFAULT_FILL_PERMILLE).unwrap();
+    let sink = stream
+        .finish_main(MAP, |main| {
+            for (k, v) in entries {
+                main.push(k, v)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    sink.buf
+}
+
 /// Materialize `entries` into `dir/zerodb.dat` and open it.
 fn open_with(dir: &TempDir, entries: &[(Vec<u8>, Vec<u8>)]) -> zerodb::Env {
-    let image = build_single_db_image(PS, MAP, 1, entries, DEFAULT_FILL_PERMILLE).unwrap();
+    let image = build_image(entries);
     std::fs::write(dir.path().join(zerodb::DATA_FILE_NAME), &image).unwrap();
     let mut o = EnvOpenOptions::new();
     o.map_size(MAP as usize);

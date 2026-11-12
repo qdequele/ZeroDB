@@ -28,12 +28,10 @@ use crate::{Database, DatabaseOpenOptions, Error, Result, Unspecified};
 /// (**ADR-0010**).
 ///
 /// Matches LMDB's directory-env contract, because that name is not private to
-/// LMDB: Meilisearch joins `"data.mdb"` onto an env path in production
-/// compaction (`process_batch.rs`, `routes/tasks/compact.rs`, `meilitool`) and
-/// snapshot code (`process_snapshot_creation.rs`, `enterprise_edition/s3.rs`).
-/// An adapter env dir therefore contains **exactly** this one data file — no
-/// `zerodb.dat`. A `lock.mdb` sits next to it, as with LMDB (ADR-0023),
-/// unless the env is opened with heed's `NO_LOCK` (ADR-0023) or
+/// LMDB: Meilisearch joins `"data.mdb"` onto an env path in its compaction
+/// and snapshot code. An adapter env dir therefore contains **exactly** this
+/// one data file — no `zerodb.dat`. A `lock.mdb` sits next to it, as with
+/// LMDB (ADR-0023), unless the env is opened with heed's `NO_LOCK` or
 /// read-only on read-only media.
 ///
 /// The bytes inside are still ZeroDB's own `ZDB1` format: pointing
@@ -43,11 +41,9 @@ pub const DATA_FILE_NAME: &str = zerodb::HEED_DATA_FILE_NAME;
 
 /// The OS page size (`sysconf(_SC_PAGESIZE)`), for the `map_size` boundary check.
 fn os_page_size() -> usize {
-    // SAFETY (adapter boundary, `map_size` check): `sysconf` with a valid name is a pure
-    // query with no memory effects; the return is the page size (>0) or -1 on
-    // failure, which we clamp to a safe default. This is the sole FFI call in
-    // the adapter and mirrors heed's `page_size` crate dependency, used only to
-    // reproduce the fork's `map_size` OS-page-multiple rejection.
+    // SAFETY: `sysconf` with a valid name is a pure query with no memory
+    // effects; the return is the page size (>0) or -1 on failure, which is
+    // clamped to a safe default. This is the adapter's only FFI call.
     let v = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if v > 0 {
         v as usize
@@ -60,9 +56,12 @@ fn os_page_size() -> usize {
 // EnvOpenOptions
 // ---------------------------------------------------------------------------
 
-/// Builder for opening an [`Env`] — the exact `heed::EnvOpenOptions<T>` shape
-/// (default `WithTls`, immediately converted via `read_txn_without_tls` in
-/// every production open).
+/// Builder for opening an [`Env`], with the shape of
+/// `heed::EnvOpenOptions<T>` (default `WithTls`).
+///
+/// The methods heed has behave as heed's. The others are ZeroDB extensions
+/// that forward to the engine's builder, [`zerodb::EnvOpenOptions`], which
+/// documents them in full.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EnvOpenOptions<T: TlsUsage = WithTls> {
     map_size: Option<usize>,
@@ -152,20 +151,17 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
 
     /// Select the DB page size.
     ///
-    /// **ZeroDB extension — heed has no such method**, because LMDB 0.9 derives
-    /// its page size from the OS and offers no selector. Code that never calls
-    /// it gets exactly what the fork would give it: new stores default to the
-    /// **OS page size**, clamped to the engine window (LMDB parity —
-    /// `me_psize = me_os_psize`, capped at 64 K). This method
-    /// only ever *overrides* that parity default.
+    /// **ZeroDB extension — heed has no such method**, because LMDB derives
+    /// its page size from the OS. Without this call a new store gets what
+    /// LMDB would give it: the **OS page size**, clamped to the engine's
+    /// range. (The engine's own builder defaults to 4 KiB instead.)
     ///
     /// `size` must be a power of two in
     /// `[`[`zerodb::MIN_PAGE_SIZE`]`, `[`zerodb::MAX_PAGE_SIZE`]`]`; an invalid
     /// value is reported by [`EnvOpenOptions::open`] as `Io(InvalidInput)`.
-    /// The value applies only when **creating** a store — an existing env keeps
-    /// its persisted page size (SPEC 02 §3.2). Read the effective value back
-    /// from `Env::stat().page_size`. Note this is the **database** page size,
-    /// independent of the OS page size (which gates `map_size` at open).
+    /// The value applies only when **creating** a store: an existing env keeps
+    /// its persisted page size, which `Env::stat().page_size` reports. See
+    /// [`zerodb::EnvOpenOptions::page_size`].
     pub fn page_size(&mut self, size: u32) -> &mut Self {
         self.page_size = Some(size);
         self
@@ -245,8 +241,8 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
     /// (`Invalid`) on a bad store, [`Error::EnvAlreadyOpened`] (TXN-51).
     pub unsafe fn open<P: AsRef<Path>>(&self, path: P) -> Result<Env<T>> {
         // `MDB_NOSUBDIR` (env = two files `path` and `path-lock`) is not
-        // supported — every ZeroDB env is a directory. Refuse loudly rather than
-        // silently creating a directory where the caller expects a file.
+        // supported: every ZeroDB env is a directory. Refuse it rather than
+        // create a directory where the caller expects a file.
         if self.flags.contains(EnvFlags::NO_SUB_DIR) {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -280,25 +276,19 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         if let Some(r) = self.max_readers {
             opts.max_readers(r);
         }
-        // Page-size extension. Absent = the **OS page size**, clamped to the engine
-        // window — LMDB parity: the fork derives `me_psize` from
-        // `sysconf(_SC_PAGE_SIZE)` at creation (capped at 64 K), so a store
-        // created through the heed surface must get the same geometry the fork
-        // would give it (16 K on Apple Silicon / 64 K-page ARM distros, 4 K on
-        // x86_64). The native `zerodb::EnvOpenOptions` keeps its own fixed
-        // 4 K default; this parity default lives at the heed boundary only.
-        // Creation-only, as for every geometry option: an
-        // existing store keeps its persisted page size.
+        // Without an explicit page size, a new store gets the OS page size,
+        // clamped to the engine's range, as LMDB derives its page size from
+        // `sysconf(_SC_PAGE_SIZE)`. The native `zerodb::EnvOpenOptions` keeps
+        // its fixed 4 KiB default; this default applies at the heed boundary
+        // only. An existing store keeps its persisted page size.
         let ps = self.page_size.unwrap_or_else(|| {
             u32::try_from(os_page_size())
                 .unwrap_or(zerodb::MAX_PAGE_SIZE)
                 .clamp(zerodb::MIN_PAGE_SIZE, zerodb::MAX_PAGE_SIZE)
         });
         opts.page_size(ps);
-        // ADR-0010: re-impose heed's on-disk contract at the heed
-        // boundary — an env opened through this adapter materializes as
-        // `<dir>/data.mdb`, the name Meilisearch hardcodes in its production
-        // compaction and snapshot paths. The `lock.mdb` next to it is the
+        // ADR-0010: an env opened through this adapter is `<dir>/data.mdb`,
+        // the name heed consumers hardcode. The `lock.mdb` next to it is the
         // name the engine derives from `data.mdb` (ADR-0023).
         opts.data_file_name(DATA_FILE_NAME);
         opts.flags(zerodb_env_flags(self.flags));
@@ -309,9 +299,8 @@ impl<T: TlsUsage> EnvOpenOptions<T> {
         if let Some(b) = self.max_dirty_bytes {
             opts.max_dirty_bytes(b);
         }
-        // ADR-0023: the lock file (`lock.mdb`) is on, as in
-        // LMDB; heed's `NO_LOCK` turns it off
-        // (`OBS_NOLOCK_CREATES_LOCK_FILE = false`).
+        // ADR-0023: the lock file (`lock.mdb`) is on, as in LMDB; heed's
+        // `NO_LOCK` turns it off, and LMDB creates no lock file then either.
         opts.lock_file(!self.flags.contains(EnvFlags::NO_LOCK));
         // SAFETY: the caller upholds this function's contract, which is the
         // engine `open`'s.
@@ -366,7 +355,7 @@ pub struct Env<T = WithTls> {
     /// Opened with heed's `NO_LOCK`, which [`Env::flags`] reports as
     /// `mdb_env_get_flags` does. Not the same as "no lock file": a read-only
     /// env on read-only media has none either, and LMDB does not report
-    /// `NO_LOCK` for it (`OBS_RDONLY_READONLY_FS_REPORTS_NOLOCK = false`).
+    /// `NO_LOCK` for it.
     no_lock: bool,
     /// The database-open mutex of Meilisearch's heed fork (ADR-0027), shared
     /// by every clone. A second open of the same env in this process fails
@@ -422,13 +411,13 @@ impl<T> Env<T> {
         self.inner.try_clone_inner_file().map_err(Into::into)
     }
 
-    /// The env flags as set at open (SPEC 00 second table — SHOULD). Returns the
+    /// The env flags as set at open (SPEC 00). Returns the
     /// durability/write-mode bits ZeroDB records, and `NO_LOCK` when the env
     /// was opened with it (ADR-0023).
     ///
     /// # Errors
     ///
-    /// Infallible; returns [`Result`] for heed shape.
+    /// None: the [`Result`] is there to match heed's signature.
     pub fn flags(&self) -> Result<Option<EnvFlags>> {
         Ok(Some(self.get_flags_bits()))
     }
@@ -457,11 +446,11 @@ impl<T> Env<T> {
         f
     }
 
-    /// The raw env flag bits (SPEC 00 second table — SHOULD).
+    /// The raw env flag bits (SPEC 00).
     ///
     /// # Errors
     ///
-    /// Infallible; returns [`Result`] for heed shape.
+    /// None, as for [`Env::flags`].
     pub fn get_flags(&self) -> Result<u32> {
         Ok(self.get_flags_bits().bits())
     }
@@ -518,7 +507,7 @@ impl<T> Env<T> {
         }
     }
 
-    /// Env-level statistics (SPEC 00 second table): the main DB's `MDB_stat`.
+    /// Env-level statistics (SPEC 00): the main DB's `MDB_stat`.
     /// Delegates to [`zerodb::Env::stat`], which reads the published snapshot
     /// directly — no read txn is opened, so it consumes no reader slot and
     /// still returns real numbers when the reader table is full.
@@ -781,11 +770,7 @@ impl<T> Env<T> {
         use std::io::Seek;
         use zerodb::CopyToFile;
         // Pages go straight into `file` from the current position, as
-        // `mdb_env_copyfd2` writes them (the raw mode straight from the map,
-        // or on Linux, onto the data file's own XFS, btrfs or bcachefs
-        // filesystem, cloned from the data file with `copy_file_range`; the
-        // compacting mode through a write buffer). No staging copy: the
-        // image is written once, never read back.
+        // `mdb_env_copyfd2` writes them: no staging copy.
         self.inner
             .copy_to_open_file(file, zdb_compaction(option))
             .map_err(Error::from)?;
@@ -837,7 +822,7 @@ impl<T> Env<T> {
             .map_err(Into::into)
     }
 
-    /// Force durability of all prior commits (SPEC 00 second table). Exactly
+    /// Force durability of all prior commits (SPEC 00). Exactly
     /// `mdb_env_sync(env, 1)`; the only form heed exposes. Equivalent to
     /// [`Env::sync`]`(true)`.
     ///
@@ -871,7 +856,7 @@ impl<T> Env<T> {
         self.inner.path()
     }
 
-    /// The configured reader-table size (SPEC 00 second table;
+    /// The configured reader-table size (SPEC 00;
     /// `mdb_env_get_maxreaders`). Reads the real table capacity rather than
     /// returning the LMDB default constant.
     #[must_use]
@@ -893,7 +878,7 @@ impl<T> Env<T> {
         self.inner.info().live_readers
     }
 
-    /// The maximum key size (SPEC 00 second table — SHOULD;
+    /// The maximum key size (SPEC 00;
     /// `mdb_env_get_maxkeysize`, SPEC 03 §2.1).
     ///
     /// Reports the engine's real [`zerodb::MAX_KEY_SIZE`] rather than a
@@ -922,17 +907,15 @@ impl<T> Env<T> {
         EnvClosingEvent(self.inner.prepare_for_closing())
     }
 
-    /// Clear stale readers (SPEC 00 second table — SHOULD; `mdb_reader_check`).
+    /// Clear stale readers (SPEC 00; `mdb_reader_check`).
     /// Returns the number of reader slots freed.
     ///
-    /// With a lock file (ADR-0023), the reader table is shared
-    /// across processes: this frees the slots of processes that died inside
-    /// a read txn and returns how many slots it freed (slots, not processes,
-    /// as LMDB counts). Without one (heed's `NO_LOCK`, or a read-only env on
-    /// read-only media) the reader table is process memory, every slot is
-    /// owned by a `RoTxn` that releases it in `Drop`, and a dead process
-    /// takes the whole table with it, so this returns `0` — the correct
-    /// answer, not a stub.
+    /// With a lock file (ADR-0023), the reader table is shared across
+    /// processes: this frees the slots of processes that died inside a read
+    /// txn (it counts slots, not processes, as LMDB does). Without one
+    /// (heed's `NO_LOCK`, or a read-only env on read-only media) the reader
+    /// table is process memory and dies with the process, so this returns
+    /// `0`.
     ///
     /// See [`zerodb::Env::clear_stale_readers`] for the full contract,
     /// including where the engine reaps on its own, and
@@ -971,7 +954,7 @@ pub struct EnvInfo {
     pub number_of_readers: u32,
 }
 
-/// Statistics for an environment (SPEC 00 second table — SHOULD).
+/// Statistics for an environment (SPEC 00).
 #[derive(Debug, Clone, Copy)]
 pub struct EnvStat {
     /// Size of a database page.
@@ -1021,7 +1004,7 @@ impl std::fmt::Debug for EnvClosingEvent {
     }
 }
 
-/// Path-based closing-event lookup (SPEC 00 second table — SHOULD; unused by
+/// Path-based closing-event lookup (SPEC 00; unused by
 /// consumers, who use [`Env::prepare_for_closing`]). ZeroDB exposes no
 /// path→event registry lookup, so this always returns `None`.
 #[must_use]
@@ -1081,7 +1064,7 @@ impl LexicographicComparator for DefaultComparator {
     }
 }
 
-/// Native-byte-order integer key comparator (SPEC 00 second table — SHOULD;
+/// Native-byte-order integer key comparator (SPEC 00;
 /// no consumer sets it — all keys are big-endian byte codecs).
 #[derive(Debug)]
 pub enum IntegerComparator {}

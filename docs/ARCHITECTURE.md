@@ -6,9 +6,34 @@ its rule IDs (such as `TXN-61` or `GC-18`) are cited throughout the code. This
 page links to it rather than repeating it.
 
 ZeroDB follows LMDB's design: one memory-mapped file, copy-on-write B+trees,
-a single writer, lock-free readers, and two meta pages that make each commit
-atomic. Its own additions are page validation, a meta-page checksum, and a
-test harness that checks every behavior against LMDB itself.
+a single writer, readers that never wait on a write transaction, and two meta
+pages that make each commit atomic. Its own additions are a meta-page
+checksum, page validation as an opt-in (by default pages are trusted, as in
+LMDB), and a test harness that compares its behavior with LMDB's.
+
+## ZeroDB and LMDB
+
+"LMDB" here is the build Meilisearch ships: Meilisearch's LMDB fork, vendored
+in `lmdb-master-sys 0.2.6` under heed 0.22.1.
+
+| | LMDB | ZeroDB | Why, and where it is specified |
+|---|---|---|---|
+| File format | LMDB's format. | Its own format (magic `ZDB1`, format version 3). Neither engine opens the other's files; migration is a logical dump and load. | Compatibility is at heed's API, not at the file. [SPEC 02](SPEC/02-pages.md), ADR-0002, [D-002](LMDB-COMPATIBILITY.md#d-002) |
+| Page header | 16 bytes. | 32 bytes: LMDB's fields plus the id of the transaction that last wrote the page, and reserved fields. Each page holds slightly fewer entries, so files are somewhat larger. | The transaction id keys the validated-pages cache (ADR-0018). Shrinking the header is an open question (ADR-0020). [SPEC 02 §2](SPEC/02-pages.md) |
+| Checksums | None. | A CRC32C on each meta page, checked at open. **Data pages are not checksummed.** The page header reserves a 4-byte checksum field that is always written as zero and never read. | The meta checksum lets recovery reject a torn meta write. It detects accidents, not tampering. [SPEC 02 §2–§3](SPEC/02-pages.md), [SPEC 06](SPEC/06-recovery.md), ADR-0002 |
+| Page validation | None: a corrupt page is undefined behavior. | The same by default: page contents are trusted, and `open` is `unsafe`. Page numbers are still bounds-checked, so a read never leaves the map. `FileTrust::VALIDATE` is an opt-in that checks every page before use and returns a typed error. | Matching LMDB by default (ADR-0034); validation for files of uncertain origin (ADR-0014). [D-019](LMDB-COMPATIBILITY.md#d-019) |
+| Page size | The OS page size. | A power of two from 4 KiB to 64 KiB, chosen at creation and independent of the OS page size. The heed adapter defaults to the OS page size (capped at 64 KiB), the native API to 4 KiB. | ARM distributions often use 64 KiB OS pages; the database page size is a separate setting. [SPEC 02 §0](SPEC/02-pages.md) |
+| Where freed-page lists are stored | One record per transaction in the free-page tree. | In the committing meta page when the list fits (the meta annex), otherwise in the free-page tree, cut into records small enough to stay inside a leaf. | Fewer tree writes per small commit (ADR-0022); a commit rewrites only the records it draws from (ADR-0037). [SPEC 05](SPEC/05-gc.md), [D-022](LMDB-COMPATIBILITY.md#d-022) |
+| When a freed page is reused | When no reader can still see it, and never by the transaction right after the one that freed it. | When no reader can still see it. The pages freed by the previous transaction are reusable at once if no reader pins an older snapshot. | Files are never larger for this reason. Recorded as a behavior difference that still awaits approval. [SPEC 05](SPEC/05-gc.md), [D-027](LMDB-COMPATIBILITY.md#d-027) |
+| Reader table and lock file | A lock file holding the reader table. Its locks are a robust pthread mutex in shared memory on Linux and SysV semaphores on macOS. | A lock file in ZeroDB's own format, holding the reader table and the writer lock. A reader slot is claimed with atomic operations. The writer lock is a futex word on Linux and an `fcntl` record lock elsewhere. Dead processes are detected through per-process `fcntl` locks. LMDB and ZeroDB processes must never share a directory. | A pthread mutex must be unlocked by the thread that locked it, which a write transaction that can move between threads cannot promise. ADR-0023, [SPEC 04 §12](SPEC/04-txn-mvcc.md) |
+| Reader begin | Does not wait on the writer. Without thread-local reader slots (`MDB_NOTLS`, the mode Meilisearch uses), each begin takes the reader mutex to claim a slot. | Does not wait on a write transaction. It takes one short mutex to clone the current snapshot; the writer takes the same mutex once per commit, for one pointer swap. | ADR-0006, [SPEC 04 §4](SPEC/04-txn-mvcc.md) |
+| Writer model | One writer at a time, across processes. | The same: an in-process lock, then the cross-process lock. Nested write transactions are not supported. | [SPEC 04 §2](SPEC/04-txn-mvcc.md), [D-003](LMDB-COMPATIBILITY.md#d-003) |
+| Durable commit | One `fdatasync` for the data; the meta page is written through a second descriptor opened with `O_DSYNC`. | Two `fdatasync` calls: one after the data, one after the meta page. | Doing as LMDB does was accepted and implemented in a pull request, but it showed no gain on the host measured and was not merged. ADR-0019, [SPEC 06](SPEC/06-recovery.md) |
+| Nested read transactions | A feature of Meilisearch's fork; stock LMDB has none. The writer may keep writing while they are open. | Supported. The write transaction cannot write while one is open; the borrow checker and a runtime check enforce it. | Required for Rust soundness. ADR-0007, [D-005](LMDB-COMPATIBILITY.md#d-005) |
+| Features not supported | | `DUP_SORT` and the other database flags, nested write transactions, `NO_SUB_DIR`, changing flags at runtime, encryption. | The full list is in [LMDB-COMPATIBILITY.md](LMDB-COMPATIBILITY.md). |
+
+Every other observable difference has an entry in
+[LMDB-COMPATIBILITY.md](LMDB-COMPATIBILITY.md#behavior-differences).
 
 ## Crates
 
@@ -102,11 +127,14 @@ The concurrency model is LMDB's ([SPEC 04](SPEC/04-txn-mvcc.md)):
   store, in memory, or in place in the map under `WRITE_MAP`. If the store
   grows past a limit, some of its pages are written to the file early
   (spilling), as LMDB does, so a huge transaction does not run out of memory.
-- **Any number of readers, never blocked.** A read transaction pins the latest
-  committed transaction id in a slot of the **reader table**, then reads that
-  snapshot through the map. Claiming and releasing a slot are lock-free atomic
-  operations. With a lock file, the reader table lives in shared memory, so
-  readers in other processes are visible.
+- **Any number of readers, which never wait on a write transaction.** A read
+  transaction pins the latest committed transaction id in a slot of the
+  **reader table**, then reads that snapshot through the map. Claiming and
+  releasing a slot are atomic operations with no lock. Beginning a read
+  transaction also takes one short mutex, to clone the pointer to the current
+  snapshot; the writer takes that mutex once per commit, to swap the pointer,
+  and never holds it across I/O. With a lock file, the reader table lives in
+  shared memory, so readers in other processes are visible.
 - **Snapshot isolation.** A reader sees exactly the commit it pinned, however
   many commits land after it. Values are borrowed straight from the map with
   no copy, and stay valid for the reader's lifetime.
@@ -170,8 +198,8 @@ heed 0.22.1 in `crates/zerodb-oracle` and nowhere else.
 
 - **The differential oracle.** A test is a sequence of `Op`s (begin, put,
   get, iterate, delete, commit, nested read, …). The driver runs the same
-  sequence against two engines and compares every result: return values,
-  error codes, iteration order, and reads after each transaction. The engines
+  sequence against two engines and compares every result exactly: return
+  values, error codes, iteration order, and reads after each transaction. The engines
   are LMDB, native ZeroDB, and ZeroDB through `heed-zerodb`. Observation tests
   (`lmdb_*_observation.rs`) record what LMDB does in a corner case first; the
   ZeroDB test then has to match it, or the difference has to be listed in
@@ -188,6 +216,9 @@ heed 0.22.1 in `crates/zerodb-oracle` and nowhere else.
   model-checked with loom, and the I/O-free core runs under miri.
 - **The checker.** `zerodb-tools check` walks every tree and the free-page
   accounting and reports violations by rule ID.
+
+What these checks do not cover is listed in
+[PROVENANCE.md](PROVENANCE.md#what-has-not-been-verified).
 
 ## Where to start reading
 

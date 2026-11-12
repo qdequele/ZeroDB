@@ -34,9 +34,9 @@
 //! individually boxed and only move to/from `spare` inside `&mut` ops — while
 //! avoiding a slow-path `malloc`+`free` of a full page (above glibc's tcache
 //! bin) per touched or new page. Run frames (multi-page) are never pooled;
-//! they are just dropped. The env hands a store its initial spares at
-//! write-txn begin and reclaims them at end (see `DirtyStore::with_spare` /
-//! `DirtyStore::reclaimable_frames`).
+//! they are just dropped. A store receives its initial spares from the
+//! previous write txn at write-txn begin and hands them on at end (see
+//! `DirtyStore::from_carry` / `DirtyStore::take_carry`).
 //!
 //! **Spilling (SPEC 04 §6.3a, ADR-0017; LMDB `mdb_page_spill`).** The store
 //! counts the pages its frames hold ([`DirtyStore::pages`]). Past the env's
@@ -276,6 +276,9 @@ impl Slot {
 /// the stability contract. `'env` is the backing's lifetime (only used in
 /// in-map mode, `DirtyStore::from_carry` with a broker; heap-mode stores
 /// never touch it).
+///
+/// The type is `pub` because the public `btree::Source::Writer` variant names
+/// it; this module is crate-private, so no other crate can.
 pub struct DirtyStore<'env> {
     psize: u32,
     /// `log2(psize)` (page sizes are powers of two, SPEC 02 §3.2): turns a
@@ -393,11 +396,10 @@ impl<'env> DirtyStore<'env> {
         DirtyStore::with_spare(psize, Vec::new())
     }
 
-    /// An empty store seeded with a pool of recycled one-page frames (the
-    /// env's `me_dpages`-style pool handed in at write-txn begin). The `Vec`
-    /// is adopted as is, O(1): every write txn, empty ones included, pays
-    /// for the pool hand-over, so it must not scale with the pool size. The
-    /// pool only ever holds frames of this env's page size.
+    /// An empty heap-mode store seeded with a pool of recycled one-page
+    /// frames: the test shorthand for [`DirtyStore::from_carry`] with only
+    /// the spare list set. The `Vec` is adopted as is, O(1). The pool must
+    /// hold only frames of size `psize`.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_spare(psize: u32, spare: Vec<Box<[u8]>>) -> DirtyStore<'env> {
@@ -446,7 +448,7 @@ impl<'env> DirtyStore<'env> {
     /// Whether this store realizes dirty frames in the writable map
     /// (ADR-0021). Commit C2 and spilling write nothing for such frames.
     #[must_use]
-    pub fn in_map_mode(&self) -> bool {
+    pub(crate) fn in_map_mode(&self) -> bool {
         self.broker.is_some()
     }
 
@@ -454,7 +456,7 @@ impl<'env> DirtyStore<'env> {
     /// one lookup; `None` without a frame. Commit C2 and spilling skip map
     /// frames: their bytes are already at their final file offset.
     #[must_use]
-    pub fn frame_extent(&self, pgno: u64) -> Option<(usize, bool)> {
+    pub(crate) fn frame_extent(&self, pgno: u64) -> Option<(usize, bool)> {
         self.frames
             .get(&pgno)
             .map(|f| (f.len(), matches!(f, Slot::Map { .. })))
@@ -462,28 +464,22 @@ impl<'env> DirtyStore<'env> {
 
     /// Whether `pgno` has a dirty frame (tree page, or overflow-run **head**).
     #[must_use]
-    pub fn contains(&self, pgno: u64) -> bool {
+    pub(crate) fn contains(&self, pgno: u64) -> bool {
         match self.bits_state(pgno) {
             Some(state) => state != BITS_NONE,
             None => self.frames.contains_key(&pgno),
         }
     }
 
-    /// Number of dirty frames (runs count once).
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.frames.len()
-    }
-
     /// Whether the store holds no frames.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
 
     /// Pages held in frames (a run counts its `n` pages; SPEC 04 TXN-68).
     #[must_use]
-    pub fn pages(&self) -> u64 {
+    pub(crate) fn pages(&self) -> u64 {
         self.pages
     }
 
@@ -521,14 +517,14 @@ impl<'env> DirtyStore<'env> {
     /// gate in front of every spilled-page lookup.
     #[must_use]
     #[inline]
-    pub fn has_spills(&self) -> bool {
+    pub(crate) fn has_spills(&self) -> bool {
         !self.spilled.is_empty()
     }
 
     /// The page count of spilled `pgno` (1 for a tree page, `n` for a run
     /// head), or `None` if it is not spilled.
     #[must_use]
-    pub fn spilled_pages(&self, pgno: u64) -> Option<u64> {
+    pub(crate) fn spilled_pages(&self, pgno: u64) -> Option<u64> {
         if self.spilled.is_empty() {
             return None;
         }
@@ -537,12 +533,12 @@ impl<'env> DirtyStore<'env> {
 
     /// Number of spilled pgnos (runs count once).
     #[must_use]
-    pub fn spilled_len(&self) -> usize {
+    pub(crate) fn spilled_len(&self) -> usize {
         self.spilled.len()
     }
 
     /// Every frame as `(pgno, pages)` — the spill candidate set.
-    pub fn frame_extents(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+    pub(crate) fn frame_extents(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
         let ps = self.psize as usize;
         self.frames
             .iter()
@@ -556,7 +552,7 @@ impl<'env> DirtyStore<'env> {
     /// is nothing to write (the bytes already sit at the frame's file
     /// offset), so spilling is pure bookkeeping. A `&mut` op, like
     /// [`DirtyStore::discard`].
-    pub fn spill(&mut self, pgno: u64) {
+    pub(crate) fn spill(&mut self, pgno: u64) {
         if let Some(frame) = self.frames.remove(&pgno) {
             self.note(pgno, BITS_NONE);
             let n = self.pages_of(frame.len());
@@ -572,7 +568,7 @@ impl<'env> DirtyStore<'env> {
     /// be exactly one page. Heap mode only — an in-map store uses
     /// [`DirtyStore::unspill_in_place`] (the bytes are already in the map;
     /// copying `src` over itself would self-overlap).
-    pub fn unspill_copy(&mut self, pgno: u64, src: &[u8]) -> &mut [u8] {
+    pub(crate) fn unspill_copy(&mut self, pgno: u64, src: &[u8]) -> &mut [u8] {
         debug_assert!(self.broker.is_none(), "in-map stores unspill in place");
         debug_assert_eq!(
             self.spilled.get(&pgno),
@@ -588,7 +584,7 @@ impl<'env> DirtyStore<'env> {
     /// `pgno` (they were written there in place), so unspilling is pure
     /// re-tracking — no copy. Returns the frame mutably.
     #[allow(unsafe_code)] // sanctioned brokered-slice call (ADR-0021; see `map_mut`)
-    pub fn unspill_in_place(&mut self, pgno: u64) -> &mut [u8] {
+    pub(crate) fn unspill_in_place(&mut self, pgno: u64) -> &mut [u8] {
         debug_assert!(self.broker.is_some(), "in-place unspill needs the broker");
         debug_assert_eq!(
             self.spilled.get(&pgno),
@@ -639,7 +635,7 @@ impl<'env> DirtyStore<'env> {
     /// contiguous `n * psize` run for an overflow head.
     #[must_use]
     #[inline]
-    pub fn bytes(&self, pgno: u64) -> Option<&[u8]> {
+    pub(crate) fn bytes(&self, pgno: u64) -> Option<&[u8]> {
         match self.bits_state(pgno) {
             Some(BITS_NONE) => return None,
             Some(BITS_MAP_PAGE) => {
@@ -673,7 +669,7 @@ impl<'env> DirtyStore<'env> {
     /// Mutable frame bytes for `pgno` (a `&mut self` op; TXN-42 in-place edit).
     #[must_use]
     #[allow(unsafe_code)] // sanctioned brokered-slice call (ADR-0021; see `map_mut`)
-    pub fn bytes_mut(&mut self, pgno: u64) -> Option<&mut [u8]> {
+    pub(crate) fn bytes_mut(&mut self, pgno: u64) -> Option<&mut [u8]> {
         match self.bits_state(pgno) {
             Some(BITS_NONE) => return None,
             // SAFETY: as the `Slot::Map` arm below: a tracked one-page map
@@ -739,7 +735,7 @@ impl<'env> DirtyStore<'env> {
     /// (ADR-0021) zero-fills the map page at `pgno` — callers rely on the
     /// frame being all-zero (e.g. `ZeroReserve` regions, TXN-47).
     #[allow(unsafe_code)] // sanctioned brokered-slice call (ADR-0021; see `map_mut`)
-    pub fn insert_tree_frame(&mut self, pgno: u64) -> &mut [u8] {
+    pub(crate) fn insert_tree_frame(&mut self, pgno: u64) -> &mut [u8] {
         let ps = self.psize as usize;
         if self.broker.is_some() {
             self.track(pgno, Slot::Map { len: ps });
@@ -776,7 +772,7 @@ impl<'env> DirtyStore<'env> {
     /// `pgno` (it never does: `src` is a committed or spilled page, `pgno` a
     /// fresh allocation of this txn).
     #[allow(unsafe_code)] // sanctioned brokered-slice call (ADR-0021; see `map_mut`)
-    pub fn insert_copy(&mut self, pgno: u64, src: &[u8]) -> &mut [u8] {
+    pub(crate) fn insert_copy(&mut self, pgno: u64, src: &[u8]) -> &mut [u8] {
         let ps = self.psize as usize;
         debug_assert_eq!(src.len(), ps, "insert_copy is one-page only");
         if self.broker.is_some() {
@@ -806,7 +802,7 @@ impl<'env> DirtyStore<'env> {
     /// rule); in-map mode (ADR-0021) the run is realized in the map at its
     /// final offset — contiguity is the map's own layout.
     #[allow(unsafe_code)] // sanctioned brokered-slice call (ADR-0021; see `map_mut`)
-    pub fn insert_run_frame(&mut self, pgno: u64, pages: u64) -> &mut [u8] {
+    pub(crate) fn insert_run_frame(&mut self, pgno: u64, pages: u64) -> &mut [u8] {
         let len = (pages as usize) * self.psize as usize;
         debug_assert!(pages > 0, "a run has at least one page");
         if self.broker.is_some() {
@@ -828,7 +824,7 @@ impl<'env> DirtyStore<'env> {
     /// box (ADR-0021): the split path reads the old frame while re-packing
     /// the same pgno, which for a map frame would self-overlap — the copy is
     /// the same scratch copy LMDB's split makes under `MDB_WRITEMAP`.
-    pub fn remove(&mut self, pgno: u64) -> Option<Box<[u8]>> {
+    pub(crate) fn remove(&mut self, pgno: u64) -> Option<Box<[u8]>> {
         // A spilled pgno has no frame; freeing one goes through `discard`,
         // which clears the mark (SPEC 04 TXN-72).
         debug_assert!(
@@ -871,7 +867,7 @@ impl<'env> DirtyStore<'env> {
     ///
     /// Freeing a **spilled** pgno clears its spilled mark (SPEC 04 TXN-72):
     /// the page returns to the txn as loose, like any page it allocated.
-    pub fn discard(&mut self, pgno: u64) {
+    pub(crate) fn discard(&mut self, pgno: u64) {
         if let Some(frame) = self.frames.remove(&pgno) {
             self.note(pgno, BITS_NONE);
             self.pages -= self.pages_of(frame.len());
@@ -889,7 +885,7 @@ impl<'env> DirtyStore<'env> {
     /// overwrites. Run frames and in-map frames (ADR-0021 — the map's bytes
     /// are not pool material) are left behind to drop with the store.
     #[must_use]
-    pub(crate) fn reclaimable_frames(&mut self, cap: usize) -> Vec<Box<[u8]>> {
+    fn reclaimable_frames(&mut self, cap: usize) -> Vec<Box<[u8]>> {
         // The spare `Vec` moves out whole (O(1)); only this txn's dirty frames
         // are walked, so the hand-back costs O(pages dirtied), like LMDB
         // returning its dirty list to `me_dpages`.
@@ -937,7 +933,7 @@ impl<'env> DirtyStore<'env> {
     /// Dirty pgnos in ascending order — the commit write-out order (C2 writes
     /// sequentially by pgno; ADR-0004) — into `out`, which is cleared
     /// first (the commit reuses one buffer across write txns).
-    pub fn sorted_pgnos_into(&self, out: &mut Vec<u64>) {
+    pub(crate) fn sorted_pgnos_into(&self, out: &mut Vec<u64>) {
         out.clear();
         out.extend(self.frames.keys().copied());
         out.sort_unstable();
@@ -1084,8 +1080,8 @@ mod tests {
 
     #[test]
     fn carry_keeps_index_capacity_and_frames() {
-        // Issue #8: the indexes come back empty with their capacity, and the
-        // one-page frames come back as spares.
+        // The indexes come back empty with their capacity, and the one-page
+        // frames come back as spares.
         let mut s = DirtyStore::new(4096);
         for pgno in 0..20 {
             s.insert_tree_frame(pgno);

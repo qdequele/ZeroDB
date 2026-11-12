@@ -1,16 +1,14 @@
 //! B+tree read path — search, `get`, and the full cursor state machine
 //! ([SPEC 03](../../../../docs/SPEC/03-btree.md) §2–§4).
 //!
-//! Everything here operates over a [`Source`] — either the immutable mapped
-//! env file (`Source::Map`, the read-txn path) or a write txn's view
-//! (`Source::Writer`: the dirty-page store first, the map for untouched pages
-//! — SPEC 04 TXN-38, ADR-0004). Reads are **zero-copy**: keys and values
-//! are `&'a [u8]` borrowed straight from the backing bytes (SPEC 04 TXN-37/41),
-//! and a `F_BIGDATA` value resolves to one contiguous slice spanning its
-//! overflow run (SPEC 03 §3; a dirty run is one contiguous frame, TXN-41).
-//! This module contains **no** `unsafe` (the crate is `#![deny(unsafe_code)]`,
-//! opened only in `page::raw` for the unchecked field readers)
-//! and no I/O — it is pure logic over borrowed bytes, so `miri` exercises it.
+//! Everything here operates over a [`Source`]: either the read-only mapped
+//! env file (`Source::Map`, for read txns) or a write txn's view
+//! (`Source::Writer`: the dirty-page store first, the map for untouched
+//! pages; SPEC 04 TXN-38, ADR-0004). Reads copy nothing: keys and values are
+//! `&'a [u8]` borrowed from the backing bytes (SPEC 04 TXN-37/41), and a
+//! `F_BIGDATA` value resolves to one contiguous slice spanning its overflow
+//! run (SPEC 03 §3; a dirty run is one contiguous frame, TXN-41). This
+//! module contains no `unsafe` and no I/O, so miri can run all of it.
 //!
 //! The cursor is a root-to-leaf path (`stack` of `(pgno, ki)` frames) plus the
 //! `INITIALIZED`/`EOF` flags of SPEC 03 §4. Each public op documents the §4
@@ -27,7 +25,7 @@ use super::page::{
     BranchRef, FileTrust, LeafRef, LeafValue, OverflowRef, PageError, PageRef, PageType,
     PGNO_INVALID,
 };
-use super::stamps::{StampCache, StampKind};
+use super::stamps::StampCache;
 
 mod memo;
 
@@ -50,9 +48,9 @@ pub type PosResult<'a> = Result<Option<Entry<'a>>, PageError>;
 /// `Map` is a read snapshot over the mapped file; `Writer` is a write txn's
 /// view, which resolves the **dirty-page store first** and falls back to the
 /// map for pages the txn has not touched. A caller cannot tell which backing a
-/// borrow came from; the lifetime rules are identical (SPEC 04 §6.2). This is
-/// also the nested-read-txn seam (a nested reader is the writer's source,
-/// read-only) and the WRITE_MAP seam (WRITE_MAP swaps the backing, TXN-46).
+/// borrow came from; the lifetime rules are identical (SPEC 04 §6.2). A
+/// nested read txn reads through its parent writer's source, and WRITE_MAP
+/// changes only the backing behind it (TXN-46).
 #[derive(Clone, Copy)]
 pub enum Source<'a> {
     /// The read-only mapped env file.
@@ -61,21 +59,21 @@ pub enum Source<'a> {
         bytes: &'a [u8],
         /// The pinned snapshot's committed high-water (`Snapshot::last_pg`).
         /// Map reads refuse any pgno beyond it: the mapping covers the full
-        /// `map_size` (ADR-0004), so bytes past the real file end are
-        /// mapped but unbacked — dereferencing them on a corrupt/hostile
-        /// reference would `SIGBUS` instead of erroring (SPEC 06 REC-14).
+        /// `map_size` (ADR-0004), so bytes past the end of the file are
+        /// mapped but not backed, and following a corrupt reference there
+        /// would raise `SIGBUS` (SPEC 06 REC-14).
         last_pg: u64,
     },
     /// A write txn's view: dirty frames first, then the map.
     Writer {
-        /// The txn's dirty-page store (checked first). Covariance makes any
-        /// `&'a DirtyStore<'env>` (`'env: 'a`) coerce here — the store only
-        /// holds a *shared* backing reference (ADR-0021), never `&mut`.
+        /// The txn's dirty-page store (checked first). Any
+        /// `&'a DirtyStore<'env>` with `'env: 'a` coerces here by covariance:
+        /// the store holds only a shared reference to the backing (ADR-0021).
         dirty: &'a DirtyStore<'a>,
         /// The mapped region (fallback for untouched pages).
         bytes: &'a [u8],
-        /// The base snapshot's committed high-water. Bounds only the **map
-        /// fallback**: pages the writer allocates beyond it live in `dirty`
+        /// The base snapshot's committed high-water. It bounds only reads
+        /// from the map: pages the writer allocates beyond it live in `dirty`
         /// and are resolved before this bound is consulted.
         last_pg: u64,
     },
@@ -93,15 +91,15 @@ impl<'a> Source<'a> {
     /// As [`Source::bytes_from`], additionally reporting whether the bytes
     /// came from the **map** (`true`) or from a **dirty frame** (`false`).
     ///
-    /// The distinction gates [`ValidatedPages`]: map bytes are immutable for
-    /// the owning txn's life (a reader's pinned snapshot is GC-protected,
-    /// TXN-20/21; a writer buffers every mutation in the dirty store until
-    /// commit C2 — including WRITE_MAP, TXN-45a — so the map never changes
-    /// under a live txn). The one exception is a writer's **spilled** pages
-    /// (SPEC 04 §6.3a): they are rewritten in the map only at a spill, and
-    /// every spill resets that writer's memo (TXN-71), so no memo entry
-    /// outlives the bytes it vouched for. Dirty frames mutate mid-txn and
-    /// must never be trusted from a memo.
+    /// [`ValidatedPages`] records only map bytes, because they do not change
+    /// during the owning txn's life: a reader's pinned snapshot is protected
+    /// from GC (TXN-20/21), and a writer keeps every mutation in the dirty
+    /// store until commit step C2, WRITE_MAP included (TXN-45a). The one
+    /// exception is a writer's spilled pages (SPEC 04 §6.3a): they are
+    /// rewritten in the map only at a spill, and every spill resets that
+    /// writer's memo (TXN-71), so no memo entry outlives the bytes it was
+    /// recorded for. Dirty frames change during the txn and are never
+    /// recorded.
     #[inline(always)]
     pub(crate) fn bytes_from_classified(
         &self,
@@ -110,10 +108,10 @@ impl<'a> Source<'a> {
     ) -> Result<(&'a [u8], bool), PageError> {
         let ps = psize as usize;
         let map_slice = |bytes: &'a [u8], last_pg: u64| -> Result<&'a [u8], PageError> {
-            // Committed-map reads never dereference past the snapshot's
-            // high-water: pages there may be unbacked by the file even though
-            // the mapping covers them (see the `Source` field docs). A
-            // corrupt/hostile reference fails typed instead of faulting.
+            // Map reads never go past the snapshot's high-water: the file may
+            // not back the pages there even though the mapping covers them
+            // (see the `Source` field docs). A corrupt reference gets a typed
+            // error, not a fault.
             if pgno > last_pg {
                 return Err(PageError::PageOutOfBounds { pgno, last_pg });
             }
@@ -124,9 +122,8 @@ impl<'a> Source<'a> {
                 .get(base..)
                 .filter(|s| s.len() >= ps)
                 .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })?;
-            // Clamp the slice at the high-water so a multi-page consumer (an
-            // overflow-run payload) can never read past it either: the pages
-            // beyond `last_pg` are exactly the potentially-unbacked ones.
+            // Clamp the slice at the high-water, so that reading a multi-page
+            // overflow value cannot go past it either.
             let cap = usize::try_from(last_pg - pgno + 1)
                 .ok()
                 .and_then(|n| n.checked_mul(ps));
@@ -156,9 +153,9 @@ impl<'a> Source<'a> {
     }
 }
 
-/// The validated leaf view of `pgno` from `src`: memo hit on a map-sourced
-/// page skips the O(`num_keys`) cell walk; every other case fully validates
-/// (and records map-sourced pages for the rest of the txn).
+/// The leaf view of `pgno` from `src`. A memo hit on a map page skips the
+/// O(`num_keys`) cell walk. A miss under the validating policy walks the
+/// cells and records the page for the rest of the txn.
 pub(crate) fn leaf_view<'a>(
     src: Source<'a>,
     psize: u32,
@@ -169,8 +166,7 @@ pub(crate) fn leaf_view<'a>(
     leaf_view_over(bytes, from_map, psize, pgno, valid)
 }
 
-/// [`leaf_view`] over bytes the caller already resolved (the descent
-/// resolves each page's bytes exactly once — see [`node_view`]).
+/// [`leaf_view`] over bytes the caller already resolved (see [`node_view`]).
 fn leaf_view_over<'a>(
     bytes: &'a [u8],
     from_map: bool,
@@ -182,28 +178,27 @@ fn leaf_view_over<'a>(
         Some(v) => {
             if from_map {
                 if v.contains(pgno, PageKind::Leaf) {
-                    // Kind-tagged hit: zero checks.
+                    // The memo holds this page as a leaf: no check is needed.
                     Ok(LeafRef::new_trusted(bytes))
                 } else if v.trusts_file() {
-                    // ADR-0014: the caller's `trust_contents` contract stands
-                    // in for the cell walk, as in LMDB; the O(1) header checks
-                    // (page type included) still run. Tested only on a memo
-                    // miss, keeping the option off the memo-hit path. Not
-                    // recorded, unlike a trusted branch: a scan views each
-                    // leaf once, and recording every leaf would fill the memo
-                    // until each probe missed through all its levels.
+                    // ADR-0014: the caller's `trust_contents` contract replaces
+                    // the cell walk, as in LMDB; the O(1) header checks (page
+                    // type included) still run. The policy is tested only on a
+                    // memo miss, so a memo hit does not pay for it. The leaf is
+                    // not recorded, unlike a trusted branch: a scan views each
+                    // leaf once, and recording every leaf would grow the memo
+                    // and lengthen every later probe.
                     LeafRef::new_prevalidated(bytes, psize)
                 } else {
                     validate_leaf_miss(bytes, psize, pgno, v)
                 }
             } else {
-                // Engine-authored dirty frame (trusted by construction): a frame is
-                // either a COW copy of a page fully validated on its first
-                // map access this txn, or the output of this txn's own page
-                // encoders — never raw disk bytes, which always enter through
-                // the `from_map` arm above. Structural O(1) checks (type,
-                // bounds) still run; the per-cell walk over the engine's own
-                // output is skipped — LMDB's model for its dirty pages.
+                // A dirty frame, which this txn wrote: a copy-on-write copy
+                // of a page, or the output of this txn's own page encoders.
+                // Bytes read from disk always take the `from_map` arm above.
+                // The O(1) structural checks (type, bounds) still run; the
+                // per-cell walk does not, as LMDB does not re-check its own
+                // dirty pages.
                 LeafRef::new_prevalidated(bytes, psize)
             }
         }
@@ -211,12 +206,13 @@ fn leaf_view_over<'a>(
     }
 }
 
-/// A validating memo miss on a map leaf: a hit in the env-wide cache of
-/// validated page versions (ADR-0018) — same pgno, kind **and** header stamp,
-/// so the same immutable bytes — takes the zero-check view; otherwise the
-/// full cell walk runs and its success is published there. Either way the
-/// page enters this txn's memo. Out of line so the memo-hit path keeps its
-/// shape (see docs/PERFORMANCE.md, inlining threshold).
+/// A memo miss on a map leaf under the validating policy. A hit in the
+/// env-wide cache of validated page versions (ADR-0018) means the same pgno,
+/// kind and header stamp, so the same bytes, and takes the unchecked view.
+/// Otherwise the full cell walk runs and its success is published to that
+/// cache. Either way the page enters this txn's memo. Out of line, to keep
+/// the inlined memo-hit path small (see docs/PERFORMANCE.md, inlining
+/// threshold).
 #[inline(never)]
 fn validate_leaf_miss<'a>(
     bytes: &'a [u8],
@@ -227,15 +223,15 @@ fn validate_leaf_miss<'a>(
     let leaf = match v.shared {
         Some(cache) => {
             let stamp = crate::page::read_page_txnid(bytes);
-            if cache.contains(pgno, StampKind::Leaf, stamp) {
+            if cache.contains(pgno, PageKind::Leaf, stamp) {
                 LeafRef::new_trusted(bytes)
             } else {
                 let leaf = LeafRef::new(bytes, psize)?;
-                // Writers never publish (ADR-0018):
-                // their own spilled pages are non-final images, and an
+                // Writers never publish (ADR-0018): a spilled page of their
+                // own may still be rewritten under the same stamp, and an
                 // abort would leave the entry behind under a reused txnid.
                 if v.publish_shared {
-                    cache.publish(pgno, StampKind::Leaf, stamp);
+                    cache.publish(pgno, PageKind::Leaf, stamp);
                 }
                 leaf
             }
@@ -257,13 +253,13 @@ fn validate_branch_miss<'a>(
     let br = match v.shared {
         Some(cache) => {
             let stamp = crate::page::read_page_txnid(bytes);
-            if cache.contains(pgno, StampKind::Branch, stamp) {
+            if cache.contains(pgno, PageKind::Branch, stamp) {
                 BranchRef::new_trusted(bytes)
             } else {
                 let br = BranchRef::new(bytes, psize)?;
-                // Writers never publish — see `validate_leaf_miss`.
+                // Writers never publish: see `validate_leaf_miss`.
                 if v.publish_shared {
-                    cache.publish(pgno, StampKind::Branch, stamp);
+                    cache.publish(pgno, PageKind::Branch, stamp);
                 }
                 br
             }
@@ -297,10 +293,10 @@ fn branch_view_over<'a>(
         Some(v) => {
             if from_map {
                 if v.contains(pgno, PageKind::Branch) {
-                    // Kind-tagged hit: zero checks.
+                    // The memo holds this page as a branch: no check is needed.
                     Ok(BranchRef::new_trusted(bytes))
                 } else if v.trusts_file() {
-                    // ADR-0014 — see [`leaf_view`].
+                    // ADR-0014: see `leaf_view_over`.
                     let br = BranchRef::new_prevalidated(bytes, psize)?;
                     v.insert(pgno, PageKind::Branch);
                     Ok(br)
@@ -308,7 +304,7 @@ fn branch_view_over<'a>(
                     validate_branch_miss(bytes, psize, pgno, v)
                 }
             } else {
-                // Engine-authored dirty frame — see [`leaf_view`].
+                // A dirty frame: see `leaf_view_over`.
                 BranchRef::new_prevalidated(bytes, psize)
             }
         }
@@ -316,13 +312,12 @@ fn branch_view_over<'a>(
     }
 }
 
-/// A tree page as its typed view, resolved and dispatched in **one** source
-/// resolution.
+/// A tree page as its typed view, from one resolution of its bytes.
 ///
-/// A type dispatch followed by [`leaf_view`]/[`branch_view`] would resolve
-/// each page's bytes twice, and in a write txn each resolution probes the
-/// dirty store first ([`Source::bytes_from_classified`]). Any non-tree page
-/// type fails with [`PageError::NotATreePage`].
+/// Testing the page type and then calling [`leaf_view`] or [`branch_view`]
+/// would resolve each page's bytes twice, and in a write txn each resolution
+/// probes the dirty store first ([`Source::bytes_from_classified`]). Any
+/// non-tree page type fails with [`PageError::NotATreePage`].
 pub(crate) enum NodeView<'a> {
     Leaf(LeafRef<'a>),
     Branch(BranchRef<'a>),
@@ -335,8 +330,8 @@ pub(crate) fn node_view<'a>(
     pgno: u64,
     valid: Option<&ValidatedPages<'_>>,
 ) -> Result<NodeView<'a>, PageError> {
-    // Kept apart from `node_view_classified` (not a wrapper over it): every
-    // keyed descent runs this body, and its code is left exactly as it was.
+    // Not a wrapper over `node_view_classified`: every keyed descent runs
+    // this body, and it does not need the extra result that function returns.
     let (bytes, from_map) = src.bytes_from_classified(psize, pgno)?;
     let page = PageRef::new_trusted_psize(bytes, psize)?;
     match page.page_type() {
@@ -349,9 +344,9 @@ pub(crate) fn node_view<'a>(
 }
 
 /// [`node_view`] plus whether the page came from the committed map (`true`)
-/// or is a frame this write txn already owns (`false`) — the writer's
-/// equivalent of LMDB's `P_DIRTY` test on a page in hand, which tells a
-/// descent that copy-on-write has nothing left to do at that level.
+/// or is a frame this write txn already owns (`false`). This is the
+/// counterpart of LMDB's `P_DIRTY` test: it tells a descent that
+/// copy-on-write has nothing left to do at that level.
 #[inline(always)]
 pub(crate) fn node_view_classified<'a>(
     src: Source<'a>,
@@ -373,7 +368,7 @@ pub(crate) fn node_view_classified<'a>(
 
 /// [`node_view`] for the root page of a descent, through the transaction's
 /// [`RootSlot`] for this database when it has one: a slot hit takes the
-/// memo's zero-check view without the page-type check or the memo probe; a
+/// memo's unchecked view without the page-type check or the memo probe; a
 /// miss takes [`node_view`] and records the slot once the memo holds the
 /// page (see [`RootSlot`] for why that is sound).
 #[inline(always)]
@@ -485,11 +480,9 @@ pub struct Tree<'a> {
     psize: u32,
     root: u64,
     depth: u16,
-    /// The ordering this tree is stored under (SPEC 03 §2.0).
-    /// Carried by the `Tree` rather than looked up per comparison so every
-    /// descent, seek and hit-test in this module uses the same ordering by
-    /// construction — the only way to be sure none of them silently falls back
-    /// to memcmp.
+    /// The ordering this tree is stored under (SPEC 03 §2.0). The `Tree`
+    /// carries it so that every descent, seek and equality test in this
+    /// module uses the same ordering, and none falls back to memcmp.
     cmp: KeyCmp<'a>,
     /// The owning txn's validated-pages memo, if it provides one
     /// ([`ValidatedPages`]); `None` (always fully validate) for tests, tools
@@ -507,10 +500,10 @@ impl<'a> Tree<'a> {
         Tree::with_comparator(src, psize, root, depth, KeyCmp::Default)
     }
 
-    /// As [`Tree::new`], under an explicit ordering (custom comparators). Every
-    /// engine path that serves a *named* database builds its tree through here;
-    /// [`Tree::new`] (memcmp) remains correct for the main/catalog tree and the
-    /// GC tree, which are memcmp by construction (SPEC 03 §2.0).
+    /// As [`Tree::new`], under an explicit ordering (custom comparators). The
+    /// engine builds the tree of every named database through here.
+    /// [`Tree::new`] (memcmp) is correct for the main tree and the GC tree,
+    /// which are always memcmp-ordered (SPEC 03 §2.0).
     #[must_use]
     #[inline]
     pub fn with_comparator(
@@ -567,8 +560,8 @@ impl<'a> Tree<'a> {
     }
 
     /// `get(key)` (SPEC 03 §2 tail): the value for `key` if present, else `None`
-    /// (a missing key is `Ok(None)`, never an error — SPEC 00 rows 14/30). The
-    /// value is resolved zero-copy, spanning an overflow run if `F_BIGDATA`.
+    /// (a missing key is `Ok(None)`, never an error; SPEC 00 rows 14/30). The
+    /// value is borrowed, spanning an overflow run if `F_BIGDATA`.
     ///
     /// # Errors
     ///
@@ -701,15 +694,14 @@ impl<'a> Tree<'a> {
 }
 
 /// The entry at a known `(leaf pgno, cell index)` position:
-/// used by the write cursor to re-materialize the borrows of a position it
-/// computed while holding a *different* borrow of the txn. Goes through the
-/// txn's validated-pages memo, so no re-validation on the hot path. It reads
-/// one leaf, so it needs no [`Tree`] around it.
+/// used by the write cursor to borrow again the entry at a position it
+/// computed while holding a different borrow of the txn. It goes through
+/// the txn's validated-pages memo, and it reads one leaf, so it needs no
+/// [`Tree`].
 ///
-/// The caller vouches that `(pgno, ki)` is a live leaf position in the
-/// current tree state (the write cursor only replays positions it just
-/// derived, with no mutation in between — it holds the `&mut RwTxn`
-/// exclusively).
+/// The caller guarantees that `(pgno, ki)` is a live leaf position in the
+/// current tree state. The write cursor passes only positions it just
+/// derived, with no mutation in between: it holds the `&mut RwTxn`.
 ///
 /// # Errors
 ///
@@ -724,9 +716,8 @@ pub(crate) fn leaf_entry_at<'a>(
     let leaf = leaf_view(src, psize, pgno, valid)?;
     let n = leaf.num_keys();
     if ki >= n {
-        // Unreachable under the caller contract; surfaced as an
-        // out-of-bounds cell rather than a panic so a logic error degrades
-        // to `Invalid`, not UB-adjacent behavior.
+        // Unreachable under the caller contract. A caller bug gets a typed
+        // out-of-bounds error here, not an unchecked read.
         debug_assert!(false, "leaf_entry_at({pgno}, {ki}) past num_keys={n}");
         return Err(PageError::CellOutOfBounds {
             offset: ki,
@@ -744,7 +735,7 @@ pub(crate) fn leaf_entry_at<'a>(
 /// `mdb_cursor_next` reading the node at `mc_ki` in the page it already
 /// holds), which needs no cursor rebuilt around its parked path.
 ///
-/// The caller vouches that `pgno` is a live leaf of the current tree state,
+/// The caller guarantees that `pgno` is a live leaf of the current tree state,
 /// as for [`leaf_entry_at`]; only `ki` may run past the end.
 ///
 /// # Errors
@@ -767,7 +758,7 @@ pub(crate) fn leaf_entry_in<'a>(
 }
 
 // ---------------------------------------------------------------------------
-// PathStack — inline root-to-leaf frame stack (no heap allocation per cursor)
+// PathStack: the inline root-to-leaf frame stack
 // ---------------------------------------------------------------------------
 
 /// Maximum root-to-leaf frames a cursor path can hold — LMDB's
@@ -777,10 +768,8 @@ pub(crate) fn leaf_entry_in<'a>(
 /// the same typed error the per-descent iteration guards produce.
 pub(crate) const CURSOR_STACK: usize = 32;
 
-/// A `Vec`-shaped fixed-capacity `(pgno, ki)` stack. Descents are the
-/// engine's hottest loop, and a heap `Vec` would cost one alloc + free per
-/// `Tree::get`.
-/// Inline storage makes cursor construction allocation-free; `push` reports
+/// A fixed-capacity `(pgno, ki)` stack with a `Vec`-like interface. Inline
+/// storage means that creating a cursor allocates nothing; `push` reports
 /// overflow as a typed corruption error instead of growing.
 ///
 /// Public only as the default path storage of [`Cursor`]; it has no public
@@ -807,8 +796,8 @@ impl PathStack {
                 self.len += 1;
                 Ok(())
             }
-            // Deeper than any legal tree: reject like the descent iteration
-            // guards do (SPEC 03 §11 INV-7), never overflow.
+            // Deeper than any legal tree: the same error as the descents'
+            // level bound (SPEC 03 §11 INV-7).
             None => Err(depth_exceeded()),
         }
     }
@@ -831,9 +820,9 @@ impl PathStack {
     }
 
     /// The live frames as one mutable slice, for the write path's
-    /// `touch_path`/`rebalance` (which take `&mut [(u64, usize)]`). Lets a
-    /// parked cursor's path be deleted at directly, with no descent and no
-    /// `Vec` (SPEC 03 §5.4a).
+    /// `touch_path`/`rebalance` (which take `&mut [(u64, usize)]`), so that
+    /// a delete at a parked cursor's position needs no descent and no
+    /// allocation (SPEC 03 §5.4a).
     fn frames_mut(&mut self) -> &mut [(u64, usize)] {
         &mut self.buf[..self.len]
     }
@@ -900,16 +889,14 @@ pub struct Cursor<'a, S: BorrowMut<PathStack> = PathStack> {
     cmp: KeyCmp<'a>,
     /// Memoized current leaf view, keyed by pgno.
     ///
-    /// [`LeafRef::new`] validates **every cell** on the page (O(`num_keys`)), so
-    /// re-deriving the view on each step makes a full scan O(`num_keys`²) per
-    /// page instead of O(`num_keys`) — the dominant cost in cursor iteration.
-    /// Caching keeps the validation (every page is still fully validated before
-    /// any access) and just stops repeating it while the cursor stays on one
-    /// page.
+    /// [`LeafRef::new`] validates every cell on the page (O(`num_keys`)), so
+    /// building the view again on each step would make a scan O(`num_keys`²)
+    /// per page. The cached view is built the same way, once per page the
+    /// cursor visits.
     ///
     /// Soundness: the cursor owns a [`Source<'a>`], whose `&'a [u8]` map and
-    /// `&'a DirtyStore` are *immutable* borrows for `'a`. No mutation can occur
-    /// while this cursor is alive, so a cached view can never go stale.
+    /// `&'a DirtyStore` are shared borrows for `'a`. Nothing can mutate them
+    /// while this cursor is alive, so a cached view cannot go stale.
     leaf_cache: Cell<Option<(u64, LeafRef<'a>)>>,
     /// The owning txn's validated-pages memo, copied from the
     /// [`Tree`] this cursor was opened on.
@@ -1098,8 +1085,7 @@ impl<'a, S: BorrowMut<PathStack>> Cursor<'a, S> {
     /// [`ascend_next`](Self::ascend_next)'s walk without its final read: land
     /// on the first slot of the next leaf (`true`) or set `EOF` (`false`), for
     /// [`advance_by`](Self::advance_by), which crosses leaves without reading
-    /// their entries. Kept separate from `ascend_next` so the plain `next` path
-    /// is left exactly as it was.
+    /// their entries.
     fn next_leaf(&mut self) -> Result<bool, PageError> {
         loop {
             if self.stack().len() <= 1 {
@@ -1195,9 +1181,8 @@ impl<'a, S: BorrowMut<PathStack>> Cursor<'a, S> {
     /// advances one entry, hopping to the next leaf when the current one is
     /// exhausted.
     ///
-    /// Named after `MDB_NEXT` (not [`Iterator::next`]): this is a cursor
-    /// positioning op that returns a `Result`, and the SPEC 03 `next`/`prev`
-    /// pair is the readable naming.
+    /// Named after `MDB_NEXT`, not [`Iterator::next`]: this is a cursor
+    /// positioning operation that returns a `Result`.
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> PosResult<'a> {
         if !self.initialized {
@@ -1214,7 +1199,7 @@ impl<'a, S: BorrowMut<PathStack>> Cursor<'a, S> {
         if ki + 1 < leaf.num_keys() {
             // Same leaf: bump the slot and read the entry from the leaf view
             // already in hand, as LMDB's `mdb_cursor_next` reads the node
-            // right after `mc_ki++`, rather than re-deriving it in `current`.
+            // right after `mc_ki++`.
             let ki = ki + 1;
             self.stack_mut().last_mut().expect("leaf frame").1 = ki;
             let v = resolve_value(self.src, self.psize, &leaf, ki, self.valid)?;
@@ -1442,12 +1427,6 @@ impl<'a, S: BorrowMut<PathStack>> Cursor<'a, S> {
         }
     }
 
-    /// `get_greater_than_or_equal_to` (`≥`) — SPEC 00 SHOULD; identical to
-    /// [`set_range`](Self::set_range).
-    pub fn get_greater_than_or_equal_to(&mut self, key: &[u8]) -> PosResult<'a> {
-        self.set_range(key)
-    }
-
     /// `get_lower_than_or_equal_to` (`≤`) — SPEC 03 §4: the greatest entry `≤
     /// key`. `set_range`; if it overshot (or hit end) step back / take `last`.
     pub fn get_lower_than_or_equal_to(&mut self, key: &[u8]) -> PosResult<'a> {
@@ -1497,15 +1476,14 @@ impl<'a, S: BorrowMut<PathStack>> Cursor<'a, S> {
 // -- park / resume (the write cursor's stack persistence) --
 
 impl<'a, 's> Cursor<'a, &'s mut PathStack> {
-    /// A cursor over `t` that moves the position parked in `saved` **in
-    /// place**: the stack is borrowed, not copied, and the
+    /// A cursor over `t` that moves the position parked in `saved` in
+    /// place: the stack is borrowed, not copied, and the
     /// `INITIALIZED`/`EOF` flags go back with [`park_in`](Self::park_in).
     ///
-    /// Caller contract: `saved` must have been parked from a
-    /// cursor over the **same tree state** — same root, same pages, no
-    /// mutation in between (or be empty). The write cursor guarantees this by
-    /// holding the `&mut RwTxn` exclusively and repairing or dropping its
-    /// parked state on every mutation.
+    /// Caller contract: `saved` is empty, or was parked from a cursor over
+    /// the same tree state (same root, same pages, no mutation in between).
+    /// The write cursor guarantees this by holding the `&mut RwTxn` and
+    /// repairing or dropping its parked state on every mutation.
     pub(crate) fn resume_in(t: Tree<'a>, saved: &'s mut SavedCursor) -> Self {
         Cursor {
             src: t.src,
@@ -1570,9 +1548,9 @@ impl SavedCursor {
     }
 
     /// The parked root-to-leaf path as a mutable slice, so the write path can
-    /// delete at it directly — no descent, no allocation (SPEC 03 §5.4a).
-    /// `touch_path` rewrites the pgnos in place as it COWs, which is exactly
-    /// the remap the parked path needs.
+    /// delete at it with no descent and no allocation (SPEC 03 §5.4a).
+    /// `touch_path` rewrites the pgnos in place as it copies pages, which
+    /// keeps the parked path pointing at the live pages.
     pub(crate) fn frames_mut(&mut self) -> &mut [(u64, usize)] {
         self.stack.frames_mut()
     }
@@ -1641,7 +1619,7 @@ fn depth_exceeded() -> PageError {
 mod tests {
     use super::*;
     use crate::builder::build_single_db_image;
-    use crate::page::{select_meta, MetaChoice, MetaPage, META_A_PGNO, META_B_PGNO};
+    use crate::page::{select_meta, MetaChoice, MetaPage};
 
     const PS: u32 = 4096;
     const MAP: u64 = 1 << 20;
@@ -1657,8 +1635,8 @@ mod tests {
 
     #[test]
     fn path_stack_is_vec_shaped_and_rejects_overflow() {
-        // The inline stack must behave like a Vec and fail typed (never
-        // grow, never panic) past the CURSOR_STACK bound.
+        // The inline stack must behave like a `Vec` up to `CURSOR_STACK`
+        // frames and return a typed error past it.
         let mut s = PathStack::new();
         assert!(s.last().is_none());
         assert!(s.pop().is_none());
@@ -1687,7 +1665,6 @@ mod tests {
             MetaChoice::Both { meta, .. } | MetaChoice::OnlyOne { meta, .. } => meta,
             MetaChoice::None => panic!("built image has no valid meta"),
         };
-        let _ = (META_A_PGNO, META_B_PGNO);
         (img, meta.main_db.root, meta.main_db.depth)
     }
 
@@ -1924,12 +1901,11 @@ mod tests {
         );
     }
 
-    /// ADR-0014: under the trusting policy a branch's
-    /// first view is recorded in the txn memo, so later descents take the
-    /// zero-check view, but a leaf's is not: a scan views each leaf once, and
-    /// recording them grew the memo by a level per four-fold of leaves, making
-    /// every probe miss through all of them. The validating policy still
-    /// records leaves (its memo skips the cell walk).
+    /// ADR-0014: under the trusting policy a branch's first view is recorded
+    /// in the txn memo, so later descents take the unchecked view, but a
+    /// leaf's is not: a scan views each leaf once, and recording every leaf
+    /// would grow the memo and lengthen every probe. The validating policy
+    /// records leaves, since a memo hit there saves the cell walk.
     #[test]
     fn trusting_policy_memoizes_branches_but_not_leaves() {
         let entries: Vec<_> = (0..2000u16)
@@ -1949,9 +1925,9 @@ mod tests {
         assert!(validating.contains(leaf, PageKind::Leaf));
     }
 
-    /// The root slot copies the memo: a keyed descent records it only once the memo
-    /// holds the root, a later descent through it reads the same entries, and
-    /// it answers for no other page number.
+    /// The root slot copies the memo: a keyed descent records it only once
+    /// the memo holds the root, a later descent through it reads the same
+    /// entries, and it answers for no other page number.
     #[test]
     fn root_slot_copies_the_memo_entry_of_the_root() {
         let entries: Vec<_> = (0..2000u16)
@@ -2057,8 +2033,8 @@ mod tests {
         );
     }
 
-    /// ADR-0018: a write txn's memo probes the
-    /// env-wide cache but never publishes into it. Probing is shown by a
+    /// ADR-0018: a write txn's memo probes the env-wide cache but never
+    /// publishes into it. Probing is shown by a
     /// cache hit on a page whose cells were corrupted after the entry was
     /// published (the hit skips the walk a fresh memo would fail); the
     /// no-publish half by the cache staying empty after a writer memo fully
@@ -2076,13 +2052,13 @@ mod tests {
         let writer = ValidatedPages::for_writer(FileTrust::VALIDATE, Some(&cache));
         leaf_view(src(&img), PS, root, Some(&writer)).expect("clean leaf validates");
         assert!(
-            !cache.contains(root, StampKind::Leaf, stamp),
+            !cache.contains(root, PageKind::Leaf, stamp),
             "a write txn's miss arm must not publish (ADR-0018)"
         );
 
         // Probe: with the entry published (as commit seeding does), a fresh
         // writer memo is served from the cache even over corrupt cells.
-        cache.publish(root, StampKind::Leaf, stamp);
+        cache.publish(root, PageKind::Leaf, stamp);
         let off = root as usize * PS as usize + crate::page::HEADER_SIZE;
         img[off..off + 2].copy_from_slice(&0xFFF0u16.to_le_bytes());
         let second = ValidatedPages::for_writer(FileTrust::VALIDATE, Some(&cache));

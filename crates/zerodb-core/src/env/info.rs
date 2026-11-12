@@ -22,8 +22,7 @@ pub struct EnvInfo {
     pub max_readers: u32,
     /// `me_numreaders`: the **high-water** reader-slot count — the maximum
     /// number of simultaneously live readers ever observed. It does **not**
-    /// decrease when a read txn ends; that is LMDB's actual behavior, verified
-    /// against the fork and reproduced here. In a lock-file environment it
+    /// decrease when a read txn ends, as in LMDB. In a lock-file environment it
     /// covers every process's readers, as LMDB's does. For the live count,
     /// use [`EnvInfo::live_readers`].
     pub num_readers: u32,

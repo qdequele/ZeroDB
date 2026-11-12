@@ -199,7 +199,7 @@ and it converts a compiler-checked guarantee into a human-audited one.
 
 **Decision: Option A**, with Option B recorded as the sanctioned fallback if
 `RwTxn: Sync` ever has to be given up (the static assertions make that moment
-loud, and B is a mechanical refactor away). No AGENTS.md amendment needed;
+loud, and B is a mechanical refactor away). No CONTRIBUTING.md amendment needed;
 `unsafe` count in zerodb-core stays 0.
 
 ### D2 — What the child sees: delegate live vs snapshot roots at open

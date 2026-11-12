@@ -286,7 +286,7 @@ flat.
 
 ## Amendment (2026-10-19): trusted leaves are not recorded in the txn memo
 
-Proposed by an agent session, awaiting maintainer review (it changes the
+Proposed, awaiting maintainer review (it changes the
 "Mechanism as built" paragraph above, not the safety contract). Under the
 trusting policy a **leaf**'s memo miss still takes the header-checked view
 (page type, reserved fields, free-space bounds) but no longer records the

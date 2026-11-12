@@ -105,8 +105,9 @@ from `&self`. The exception also covers the `Backing::map_dirty_page`
 `#[allow(clippy::mut_from_ref)]` on the broker, each with its exclusivity
 contract inline.
 
-`zerodb-core::readers` (the reader table) is lock-free with plain atomics and
-contains no `unsafe`.
+`zerodb-core::readers` contains no `unsafe`. The reader table's slot protocol
+uses plain atomics and no lock; the published-snapshot cell in the same module
+is a mutex held for one pointer clone or swap.
 
 Every `unsafe` block carries a `// SAFETY:` comment stating the invariants it
 relies on. No `#[repr(C)]` casts of possibly unaligned data — use explicit

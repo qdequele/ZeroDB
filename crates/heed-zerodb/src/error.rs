@@ -4,7 +4,7 @@
 //! `heed::Error::{Io, Mdb, Encoding, Decoding, EnvAlreadyOpened}` and the
 //! `MdbError` variants (`MapFull`, `Invalid`, `BadValSize`, `KeyExist`, …) see
 //! identical shapes. `Encoding`/`Decoding` are publicly constructible from a
-//! [`BoxedError`] (consumers construct them — C5).
+//! [`BoxedError`], since consumers construct them.
 
 use std::{error, fmt, io, result};
 
@@ -79,10 +79,8 @@ pub type Result<T> = result::Result<T, Error>;
 
 /// An LMDB error kind — the exact variant set of `heed::MdbError`
 /// (`mdb.master` branch; the `master3`-only encryption/checksum variants are
-/// out of scope, SPEC 00 WON'T). ZeroDB emits its own codes, so the
-/// raw-`c_int`→string mapping heed does over LMDB return codes is dropped
-/// (ADR-0003 heed-suite scoping: `lmdb_error.rs` is *partially IN* — keep the
-/// variant identities, drop the raw-rc assertions).
+/// out of scope, SPEC 00). ZeroDB emits its own codes, so heed's conversion
+/// from raw LMDB return codes is not provided (ADR-0003).
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum MdbError {
     /// A key/data pair already exists (also `APPEND`/`NO_OVERWRITE` misuse).

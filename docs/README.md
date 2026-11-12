@@ -13,7 +13,8 @@
 
 | Document | What it covers |
 |---|---|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | How the engine works and how it is verified; start here |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | How the engine works, how it differs from LMDB, and how it is verified; start here |
+| [PROVENANCE.md](PROVENANCE.md) | How the project was built, what has been verified and what has not |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | The project rules, the `unsafe` policy and the checks to run |
 | [SPEC/](SPEC/) | The reference for formats and algorithms, with the rule IDs (`TXN-61`, `GC-18` …) the code cites |
 | [DECISIONS.md](DECISIONS.md) | Index of the architecture decision records in [adr/](adr/) |

@@ -113,11 +113,10 @@ pub fn derived_lock_file_name(data_file_name: &OsStr) -> OsString {
 /// Whether `name` is a single, non-empty path component — i.e. it names a file
 /// directly inside the env directory and cannot escape it (ADR-0010).
 ///
-/// Rejects a name containing *any* path separator, per the ADR, rather than
-/// only one that survives normalization: `"a/"` normalizes to the single
-/// component `a`, but accepting it would mean the file on disk is not the name
-/// the caller passed. An integration knob whose value silently differs from
-/// what lands on disk is a trap, so the check is on the raw bytes.
+/// Rejects a name containing *any* path separator, rather than only one that
+/// survives normalization: `"a/"` normalizes to the single component `a`, but
+/// accepting it would mean the file on disk is not the name the caller
+/// passed. The check is therefore on the raw bytes.
 fn is_single_component(name: &OsStr) -> bool {
     if name.is_empty() {
         return false;
@@ -147,13 +146,8 @@ pub const MIN_PAGE_SIZE: u32 = 4096;
 /// The largest selectable DB page size (SPEC 02 §0).
 pub const MAX_PAGE_SIZE: u32 = 65536;
 
-/// Environment open flags (SPEC 01 Table 1), as a hand-rolled bitset.
-///
-/// LMDB-parity flags (all MUST/SHOULD per SPEC 01 Table 1):
-/// [`EnvFlags::PREV_SNAPSHOT`] (milli's `Index::rollback`), [`EnvFlags::READ_ONLY`]
-/// (write-txn → `EACCES`), [`EnvFlags::WRITE_MAP`] (writable-mmap write
-/// path), and the durability flags [`EnvFlags::NO_SYNC`] /
-/// [`EnvFlags::NO_META_SYNC`] / [`EnvFlags::MAP_ASYNC`] (SPEC 01 §S6).
+/// Environment open flags (SPEC 01 Table 1), as a bitset whose values are
+/// LMDB's `MDB_*` constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EnvFlags(u32);
 
@@ -299,8 +293,8 @@ impl EnvOpenOptions {
     /// With [`EnvOpenOptions::lock_file`] on, the process that opens the
     /// environment first sizes the shared table, never below the size a
     /// finished lock file from an earlier run records; a process that joins
-    /// it adopts that size whatever it asks for, as LMDB does (ADR-0023 §1 as
-    /// amended). [`Env::info`] reports the size in use.
+    /// it adopts that size whatever it asks for, as LMDB does (ADR-0023).
+    /// [`Env::info`] reports the size in use.
     pub fn max_readers(&mut self, n: u32) -> &mut EnvOpenOptions {
         self.max_readers = n;
         self
@@ -308,29 +302,19 @@ impl EnvOpenOptions {
 
     /// Select the DB page size (SPEC 02 §0).
     ///
-    /// This is a **ZeroDB extension**: LMDB 0.9 derives the page size from the
-    /// OS and offers no selector, so there is no heed API to mirror and no
-    /// cross-engine differential to run. The page size is a runtime value
-    /// persisted in the meta page (SPEC 02 §0/§3.2).
-    ///
-    /// Semantics:
+    /// This is a **ZeroDB extension**: LMDB derives the page size from the OS
+    /// and offers no selector. The page size is persisted in the meta page
+    /// (SPEC 02 §0/§3.2).
     ///
     /// - **Creation-only.** The value is used only when [`EnvOpenOptions::open`]
-    ///   *creates* a new store. Opening an **existing** env ignores it entirely
-    ///   and adopts the persisted page size from the meta page (SPEC 02 §3.2) —
-    ///   opening a 64 K store with `page_size(4096)` succeeds and yields a 64 K
-    ///   env. Read the effective value back with [`Env::page_size`] (or
-    ///   [`EnvStat::page_size`]); it is never silently wrong, just not what was
-    ///   requested. There is deliberately no "wrong expectation" error: the
-    ///   persisted geometry is authoritative, exactly as for `map_size`.
+    ///   *creates* a new store. Opening an **existing** env ignores it and
+    ///   adopts the persisted page size: opening a 64 K store with
+    ///   `page_size(4096)` succeeds and yields a 64 K env. Read the effective
+    ///   value back with [`Env::page_size`] (or [`EnvStat::page_size`]).
     /// - **Independent of the OS page size.** ARM distros commonly run 64 K OS
     ///   pages; the DB page size is chosen here and does not track them.
     /// - **Validated at `open`**, not here, so the builder stays chainable —
     ///   see [`EnvOpenOptions::open`] for the error.
-    ///
-    /// # Panics
-    ///
-    /// Never. An invalid `size` is reported by [`EnvOpenOptions::open`].
     pub fn page_size(&mut self, size: u32) -> &mut EnvOpenOptions {
         self.page_size = size;
         self
@@ -354,27 +338,21 @@ impl EnvOpenOptions {
     /// Choose the name of the data file inside the env directory
     /// (**ADR-0010**). Default: [`DATA_FILE_NAME`] (`zerodb.dat`).
     ///
-    /// This is an **integration knob**, not a format knob: the name lives
-    /// outside the on-disk format (`format_version` is unaffected) and is
-    /// resolved once, at [`EnvOpenOptions::open`], before any write — so no
-    /// SPEC 06 crash-safety invariant depends on it.
+    /// The name is not part of the on-disk format: it is resolved once, at
+    /// [`EnvOpenOptions::open`], before any write.
     ///
     /// It exists because heed/LMDB's directory-env contract names the map
-    /// `data.mdb`, and that name leaks into consumer code: Meilisearch
-    /// hardcodes it in production compaction and snapshot paths. The
-    /// `heed-zerodb` adapter therefore sets [`HEED_DATA_FILE_NAME`]
-    /// unconditionally, re-imposing the heed contract at the heed boundary
-    /// (the same pattern as the adapter's `map_size`, `max_readers(0)` and
-    /// NUL-in-DB-name checks) while the native engine keeps its honest
-    /// `ZDB1`-format name.
+    /// `data.mdb`, and heed consumers hardcode that name: Meilisearch does in
+    /// its compaction and snapshot paths. The `heed-zerodb` adapter therefore
+    /// always sets [`HEED_DATA_FILE_NAME`], while the native engine keeps its
+    /// own name.
     ///
     /// **There is no fallback probing.** `open` uses exactly the configured
     /// name: pointing this at `data.mdb` in a directory that holds only
     /// `zerodb.dat` creates a *fresh, empty* env at `data.mdb`, it does not
-    /// adopt the other file. Determinism matters more than convenience here —
-    /// the adapter must always read the same name it writes. (`zerodb-tools`,
-    /// which only reads, does probe both names; both present is a hard error
-    /// there.)
+    /// adopt the other file, so the adapter always reads the name it writes.
+    /// (`zerodb-tools`, which only reads, does probe both names; both present
+    /// is a hard error there.)
     ///
     /// # Errors
     ///
@@ -549,10 +527,7 @@ impl EnvOpenOptions {
     ///
     /// - [`Error::Io`] (`InvalidInput`) if [`EnvOpenOptions::page_size`] is not
     ///   a power of two in `[`[`MIN_PAGE_SIZE`]`, `[`MAX_PAGE_SIZE`]`]`.
-    ///   `Io(InvalidInput)` is the taxonomy ZeroDB uses for open-time
-    ///   argument rejection (cf. the `max_readers(0)` and non-page-multiple
-    ///   `map_size` checks at the heed boundary); LMDB has no error for this
-    ///   because it has no such option.
+    ///   LMDB has no error for this because it has no such option.
     /// - [`Error::Io`] (`InvalidInput`) if
     ///   [`EnvOpenOptions::data_file_name`] is empty or is not a single path
     ///   component (ADR-0010); likewise for
@@ -585,8 +560,7 @@ impl EnvOpenOptions {
     /// - [`Error::Io`] (`EAGAIN`) with [`EnvFlags::PREV_SNAPSHOT`] and
     ///   [`EnvOpenOptions::lock_file`] both on, if another process already
     ///   has the environment open: `PREV_SNAPSHOT` requires winning the
-    ///   lock file's first-opener election, matching LMDB as observed
-    ///   (ADR-0023 §5, `OBS_PREV_SNAPSHOT_JOINER`).
+    ///   lock file's first-opener election, as LMDB does (ADR-0023).
     pub unsafe fn open(&self, path: impl AsRef<Path>) -> Result<Env> {
         let dir = path.as_ref();
         // Validate the page-size selector here rather than in the setter
@@ -604,8 +578,6 @@ impl EnvOpenOptions {
             )));
         }
         self.check_data_file_name()?;
-        // ADR-0023: the explicit lock-file name, or the one
-        // derived from the data-file name.
         let lock_file_name = self.get_lock_file_name();
         if self.lock_file {
             self.check_lock_file_name(&lock_file_name)?;
@@ -618,7 +590,7 @@ impl EnvOpenOptions {
         let canonical_dir = dir.canonicalize().map_err(Error::Io)?;
         let data_path = canonical_dir.join(&self.data_file_name);
 
-        // ADR-0023 §1: the lock file is opened (the election) *before* the
+        // ADR-0023: the lock file is opened (the election) *before* the
         // data file, so a joining process waits for the initializer rather
         // than racing it to create the data file.
         let read_only = self.flags.contains(EnvFlags::READ_ONLY);
@@ -626,9 +598,9 @@ impl EnvOpenOptions {
             let path = canonical_dir.join(&lock_file_name);
             match zerodb_io::lockfile::LockFile::open(&path, &data_path, self.max_readers) {
                 Ok(l) => Some(l),
-                // ADR-0023 (`OBS_RDONLY_LOCK_READONLY_FS = 0`): a
-                // read-only env on read-only media runs without a lock file,
-                // as LMDB does. A writable env fails with the `EROFS`.
+                // ADR-0023: a read-only env on read-only media runs without
+                // a lock file, as LMDB does. A writable env fails with the
+                // `EROFS`.
                 Err(zerodb_io::lockfile::LockOpenError::ReadOnlyFs) if read_only => None,
                 Err(e) => return Err(lock_error(e)),
             }
@@ -637,10 +609,10 @@ impl EnvOpenOptions {
         };
 
         let prev_snapshot = self.flags.contains(EnvFlags::PREV_SNAPSHOT);
-        // ADR-0023 §5: `PREV_SNAPSHOT` requires winning the first-opener
-        // election (no other process alive), matching LMDB as observed
-        // (`OBS_PREV_SNAPSHOT_JOINER = EAGAIN`). A joiner's lock file is
-        // released before the error returns; the data file is never opened.
+        // ADR-0023: `PREV_SNAPSHOT` requires winning the first-opener
+        // election (no other process alive); LMDB refuses a joiner with
+        // `EAGAIN` too. A joiner's lock file is released before the error
+        // returns; the data file is never opened.
         if prev_snapshot {
             if let Some(l) = &lock {
                 if !zerodb_core::shared::SharedRegion::is_initializer(l.as_ref()) {
@@ -667,9 +639,8 @@ impl EnvOpenOptions {
             read_only,
             durability.write_map,
             self.flags.contains(EnvFlags::NO_READ_AHEAD),
-            // ADR-0023: only the sole process may
-            // grow a WRITE_MAP data file at open. A joiner's write txns grow
-            // it under both writer locks.
+            // ADR-0023: only the sole process may grow a WRITE_MAP data file
+            // at open. A joiner's write txns grow it under both writer locks.
             lock.as_ref()
                 .is_none_or(|l| zerodb_core::shared::SharedRegion::is_initializer(l.as_ref())),
             prev_snapshot,

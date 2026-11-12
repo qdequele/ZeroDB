@@ -1,6 +1,6 @@
 //! `EnvFlags` / `DatabaseFlags` / `PutFlags` — the exact type paths and LMDB bit
-//! values heed exposes. Hand-rolled (no `bitflags` dependency)
-//! but API-compatible with the `bitflags 2` surface consumers use: `empty()`,
+//! values heed exposes. Defined here, without the `bitflags` crate, with the
+//! part of the `bitflags 2` API that consumers use: `empty()`,
 //! `all()`, `bits()`, `from_bits_truncate`, `contains`, `intersects`,
 //! `insert`, `remove`, `is_empty`, and the bit operators. Bit values match
 //! `MDB_*` so a consumer reading `.bits()` sees the same integer as heed.

@@ -67,7 +67,7 @@ impl<'e, T> UniqueRoTxn<'e, T> {
     ///
     /// # Errors
     ///
-    /// Infallible in ZeroDB; returns [`Result`] for API shape.
+    /// None in ZeroDB: the [`Result`] is there to match the fork's signature.
     pub fn commit(self) -> Result<()> {
         self.txn.commit_inner()
     }

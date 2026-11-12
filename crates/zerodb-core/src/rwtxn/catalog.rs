@@ -65,7 +65,8 @@ pub(super) struct NamedTree {
 
 /// The per-txn named-DB table, indexed directly by dbi. LMDB keeps the same
 /// state in `txn->mt_dbs[dbi]`, an array read by index on every cursor init;
-/// a hashed map cost a SipHash per probe and a named put probes several times.
+/// a hashed map would pay a hash per probe, and a named put probes several
+/// times.
 /// dbi indices are small (slots below `max_dbs`, lowest free first), so the
 /// table grows to the highest dbi this txn touched, never past it. An entry
 /// exists only for a handle valid in this txn, and such a slot cannot change
@@ -549,7 +550,8 @@ impl<'env> RwTxn<'env> {
         Ok(())
     }
 
-    /// Collect leaf `pgno` for [`collect_tree_skip_leaves`](Self::collect_tree_skip_leaves)
+    /// Collect leaf `pgno` for
+    /// [`collect_tree_skip_leaves`](Self::collect_tree_skip_leaves)
     /// without loading it, after the bound check that stands in for the load
     /// (see there). Committed leaves (the common case) answer on the range
     /// test; the dirty and spilled lookups run only for this-txn pages.

@@ -282,7 +282,7 @@ The maintainer approved (2026-10-09) a new sanctioned `unsafe` category in
 `zerodb-io`: **shared-memory synchronization primitives** — the atomic views
 over the mapped lock file, the Linux `futex` syscalls and the `fcntl`/`flock`
 calls. They are exposed to `zerodb-core` through a safe API, so `zerodb-core`
-stays `forbid(unsafe_code)`. AGENTS.md's `unsafe` policy is amended in the same
+stays `forbid(unsafe_code)`. CONTRIBUTING.md's `unsafe` policy is amended in the same
 change as the implementation. Every block carries a `// SAFETY:` comment; every
 atomic states its `Ordering` and why, assuming a weak memory model.
 
@@ -751,7 +751,7 @@ Terms used below:
       mutated only under the mutex.
 
     `zerodb-core` gets no new `unsafe`, and `Env::resize` is safe. The
-    AGENTS.md bullet "mmap access and page casting (`zerodb-core::page`,
+    CONTRIBUTING.md bullet "mmap access and page casting (`zerodb-core::page`,
     `zerodb-io`)" gains: "including the grow-only mapping cell
     (`zerodb-io::mmap::MapRegions`): an `AtomicPtr` to views and mappings
     freed only on drop, with its `Send`/`Sync` impls (ADR-0023 amendment
@@ -998,7 +998,7 @@ Terms used below:
       - Another process can still join after the check, as with `mdb_load`.
         A joining reader sees each commit through `T` and is harmless to a
         fresh load. A joining writer interleaves its own txns, as with LMDB.
-      - The AGENTS.md `libc::flock` exception and `zerodb_tools::lock` are
+      - The CONTRIBUTING.md `libc::flock` exception and `zerodb_tools::lock` are
         retired.
     - `crates/zerodb-tools/tests/live_env_refusal.rs` changes behavior.
       `tools_refuse_a_locked_env` is rewritten to hold a live env with an
@@ -1006,7 +1006,7 @@ Terms used below:
       read its committed data. The PR calls this out under rule 2.
       `tools_refuse_a_missing_env` stays.
     - The "tools run offline" text in the `zerodb-tools` crate docs and usage
-      string, `docs/TOOLS.md`, and AGENTS.md change with it.
+      string, `docs/TOOLS.md`, and CONTRIBUTING.md change with it.
 
     **Decisions** (approved 2026-10-12 by the maintainer, all as proposed):
 

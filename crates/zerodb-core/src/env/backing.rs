@@ -38,8 +38,8 @@ pub trait Backing: Send + Sync {
 
     /// The whole mapped region as bytes: [`Backing::view`]'s bytes. Slot 0 is
     /// `[0, page_size)`, slot 1 is `[page_size, 2*page_size)`; data pages
-    /// follow. The region may extend past the current file length (ADR-0004
-    /// D4: the map covers the full `map_size`); callers only dereference pages
+    /// follow. The region may extend past the current file length (ADR-0004:
+    /// the map covers the full `map_size`); callers only dereference pages
     /// a committed snapshot references, which are always within the file
     /// (SPEC 06 REC-14).
     fn bytes(&self) -> &[u8] {
@@ -91,7 +91,7 @@ pub trait Backing: Send + Sync {
     fn real_disk_size(&self) -> std::io::Result<u64>;
 
     /// Copy meta slot `slot` (0 or 1) into `buf` (`psize` bytes). Readers of
-    /// a lock-file environment (ADR-0023 §4) decode metas from this copy,
+    /// a lock-file environment (ADR-0023) decode metas from this copy,
     /// never from a borrowed map slice: another process may be rewriting the
     /// slot, and a torn copy is caught by its CRC. The default copies from
     /// [`Backing::bytes`] (heap test backings); file backings use `pread`.
@@ -179,9 +179,8 @@ pub trait Backing: Send + Sync {
     // *call* lives in `crate::dirty::map_mut`, the home the CONTRIBUTING.md policy
     // sanctions for the WRITE_MAP in-place brokered map-slice write.
     #[allow(unsafe_code)]
-    // clippy cannot see that this is an `unsafe fn` whose documented contract
-    // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
-    // too); ADR-0021's substance is the `unsafe fn` itself.
+    // `mut_from_ref` also fires on an `unsafe fn`; the documented contract
+    // above covers the aliasing the lint warns about.
     #[allow(clippy::mut_from_ref)]
     unsafe fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
         let _ = (pgno, psize, pages);

@@ -17,8 +17,9 @@ use super::*;
 /// bulk pattern) always target the rightmost leaf, so remembering its descent
 /// skips the per-put root-to-leaf search. LMDB has no equivalent technique to
 /// mirror here — `mdb_put` initializes a fresh cursor per call and even
-/// `MDB_APPEND` re-descends via `mdb_cursor_last` — so this is a deliberate,
-/// documented non-LMDB lever (the observable put semantics are unchanged).
+/// `MDB_APPEND` re-descends via `mdb_cursor_last` — so this is a deliberate
+/// departure from LMDB's technique (the observable put semantics are
+/// unchanged).
 pub(super) struct Finger {
     pub(super) tree: TreeId,
     pub(super) path: Path,
@@ -125,8 +126,10 @@ impl<'env> RwTxn<'env> {
     }
 
     /// The finger fast path's hit test (SPEC 03 §6.6 F1). A hit needs a live
-    /// finger for `tree`, a spine that still verifies ([`RwTxn::finger_spine`]), and `key` sorting **strictly greater** than the
-    /// leaf's last key under the tree's comparator — which is APPEND's §6.3
+    /// finger for `tree`, a spine that still verifies
+    /// ([`RwTxn::finger_spine`]), and `key` sorting **strictly greater**
+    /// than the leaf's last key under the tree's comparator — which is
+    /// APPEND's §6.3
     /// validation and, for a plain put, proof the key is absent (so
     /// `NO_OVERWRITE` cannot fail either): one condition serves every flag
     /// combination. On a hit `path` is loaded with the finger's frames, the

@@ -8,9 +8,9 @@
 //!
 //! - [`Backing::view`] (and so [`Backing::bytes`]) mints a fresh
 //!   whole-buffer `&[u8]` per call, with the buffer's length as the logical
-//!   map size (as a
-//!   remapped-never `MAP_SHARED` view, this is what the engine's read paths
-//!   hold — the writer re-derives its copy per spill, ADR-0021);
+//!   map size. Like a `MAP_SHARED` view that is never remapped, this is what
+//!   the engine's read paths hold; the writer re-derives its copy per spill
+//!   (ADR-0021);
 //! - [`Backing::map_dirty_page`] (the `unsafe fn` broker, ADR-0021) mints
 //!   the region `&mut [u8]` from a root-derived raw pointer, exactly as
 //!   `MmapWritable::slice_mut` does;
@@ -175,9 +175,8 @@ impl Backing for TestWriteMap {
         true
     }
 
-    // clippy cannot see that this is an `unsafe fn` whose documented contract
-    // covers exactly what `mut_from_ref` fears (the lint fires on unsafe fns
-    // too); ADR-0021's substance is the `unsafe fn` itself.
+    // The lint fires on `unsafe fn`s too; the trait's contract covers the
+    // aliasing it warns about.
     #[allow(clippy::mut_from_ref)]
     unsafe fn map_dirty_page(&self, pgno: u64, psize: u32, pages: u64) -> Option<&mut [u8]> {
         let (off, len) = self.region(pgno, psize, pages)?;

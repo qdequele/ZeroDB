@@ -45,7 +45,7 @@ pub(crate) struct WriterGuard<'env> {
     /// given back at txn end, stored at release.
     carry: Option<Box<crate::rwtxn::WriterCarry>>,
     /// The cross-process writer lock, when this guard also holds it
-    /// (ADR-0023 §2; set by [`EnvInner::lock_writer_shared`]). Released
+    /// (ADR-0023; set by [`EnvInner::lock_writer_shared`]). Released
     /// before the in-process slot on drop.
     pub(super) shared: Option<&'env dyn crate::shared::SharedRegion>,
 }
@@ -144,8 +144,8 @@ impl Drop for WriterGuard<'_> {
         g.occupied = false;
         g.carry = self.carry.take();
         // One waiter at most can make progress (single writer), so
-        // `notify_one` suffices; drop the flag lock before notify is not
-        // required for correctness (the waiter re-checks under the lock).
+        // `notify_one` suffices. Notifying while the flag lock is still held
+        // is correct: the waiter re-checks under the lock.
         // Skipped when nobody is parked, which is the common, uncontended case.
         if g.waiters > 0 {
             self.lock.cv.notify_one();

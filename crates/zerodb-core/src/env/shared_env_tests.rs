@@ -122,7 +122,7 @@ fn put_commit(env: &Env, key: &[u8]) -> Result<u64, Error> {
     Ok(id)
 }
 
-/// ADR-0023 (`OBS_PREV_SNAPSHOT_JOINER_INFO_AFTER_FIRST_COMMIT`):
+/// ADR-0023, as LMDB:
 /// a joiner that finds a meta newer than `T` on disk reads at `T` but
 /// reports the newer meta in `info`, until a publish reaches it.
 #[test]
@@ -398,9 +398,7 @@ fn refresh_rejects_a_snapshot_past_the_file_end() {
 fn refresh_rejects_a_snapshot_past_this_process_map() {
     // The file reaches page 200, but this process mapped only 4 pages: a
     // process with a larger map_size grew it. ADR-0023 maps
-    // this case to `MapResized`, as LMDB does (`OBS_READ_BEGIN_SMALL_MAP`,
-    // `OBS_WRITE_BEGIN_SMALL_MAP`); before the observation it was
-    // `Invalid`.
+    // this case to `MapResized`, as LMDB does for read and write begins.
     let b = Box::new(SizedBacking {
         bytes: grown_image(4),
         map_size: 4 * u64::from(PS),
@@ -560,7 +558,7 @@ fn resize_zero_adopts_t_under_the_cross_process_lock() {
     // Open at T = 4 (4-page map), then another process publishes 7
     // (last_pg 200, meta map size 1 MiB): reads fail with MapResized
     // until `resize(0)` adopts the meta's size, which it does holding
-    // the cross-process writer lock (decision 3).
+    // the cross-process writer lock.
     let region = Arc::new(HeapRegion::new(4, 2, false));
     region.published_txnid().store(4, O::SeqCst);
     let (b, grows) = grow_backing(4, 256, Some(Arc::clone(&region)));
@@ -821,11 +819,11 @@ fn single_process_path_is_unchanged() {
     );
 }
 
-// Reaping (ADR-0023 §3). The LMDB fork, observed by
+// Reaping (ADR-0023). The LMDB fork, observed by
 // `zerodb-oracle/tests/multi_process/lmdb_reaping_observation.rs`, reaps dead readers
 // in `mdb_reader_check` and when a writer takes over a dead writer's lock
 // (Linux), and nowhere else: not at read-txn begin, write commit, a
-// joiner's open or a full table. The tests below pin each of those.
+// joiner's open or a full table. The tests below check each of those.
 
 /// Claim and pin a slot on behalf of process `pid`, as that process would
 /// have before it died.

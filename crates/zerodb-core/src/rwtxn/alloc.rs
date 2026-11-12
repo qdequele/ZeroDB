@@ -236,9 +236,9 @@ impl<'env> RwTxn<'env> {
     /// Under in-place `WRITE_MAP` (ADR-0021) every pgno this returns is
     /// immediately realized **in the map** — a store to committed bytes, not
     /// a heap frame — so the TXN-62 check that is a `debug_assert` at C2
-    /// (`write_frames`) is enforced here as a **typed release-mode guard**
-    /// (ADR-0021): a future allocator bug must surface as an error, never
-    /// silently clobber committed data through the map.
+    /// (`write_frames`) is enforced here as a **typed release-mode guard**:
+    /// an allocator bug must surface as an error, never silently clobber
+    /// committed data through the map.
     pub(super) fn allocate(&mut self, n: u64) -> Result<u64> {
         let p = self.allocate_raw(n)?;
         if self.dirty.in_map_mode() && !self.in_map_target_ok(p, n) {
@@ -246,7 +246,7 @@ impl<'env> RwTxn<'env> {
             // be trusted (LMDB `MDB_TXN_ERROR` degradation, TXN-30).
             self.errored = true;
             return Err(Error::Io(std::io::Error::other(format!(
-                "TXN-62 violation refused (ADR-0021 M2): allocator returned page {p} (run of {n}) \
+                "TXN-62 violation refused (ADR-0021): allocator returned page {p} (run of {n}) \
                  at or below the committed high-water {} without a reclaim record — writing it \
                  in place would clobber the live snapshot",
                 self.committed_last_pg
@@ -273,8 +273,9 @@ impl<'env> RwTxn<'env> {
     /// [`RwTxn::allocate`] without the ADR-0021 guard (the guard wraps
     /// every return point in one place).
     ///
-    /// The hot shape here is the loose pop. The draw arms (`save_pool_draw`, `annex_draw`, `gc_reclaim`, `cross_record_run`) are
-    /// `#[inline(never)]` so their size never pushes this function past
+    /// The common case here is the loose pop. The draw arms
+    /// (`save_pool_draw`, `annex_draw`, `gc_reclaim`, `cross_record_run`)
+    /// are `#[inline(never)]` so their size never pushes this function past
     /// LLVM's inlining budget.
     pub(super) fn allocate_raw(&mut self, n: u64) -> Result<u64> {
         debug_assert!(n >= 1);
@@ -311,15 +312,12 @@ impl<'env> RwTxn<'env> {
                 }
             }
             AllocMode::GcSave => {
-                // GC-12 (ADR-0005): never *read* the GC tree
-                // in-save, but draws from the already-loaded drain pool are
-                // permitted — required for bounded file growth, since the
-                // in-save COW of a committed GC page can never reuse its own
-                // predecessor (TXN-62: the N−1 meta still references it) and
-                // would otherwise extend the file on every commit. Each entry
-                // touched here is re-rewritten before the fixed point
-                // (`save_touched`), so no rewritten entry lists a handed-out
-                // page (the anti-leak property GC-12 exists for).
+                // GC-12 (ADR-0005): never *read* the GC tree in-save, but
+                // draw from the already-loaded drain pool, which keeps file
+                // growth bounded (`freelist_save` gives the argument). Each
+                // entry touched here is rewritten again before the fixed
+                // point (`save_touched`), so no rewritten entry lists a
+                // handed-out page.
                 if let Some(start) = self.save_pool_draw(n) {
                     return Ok(start);
                 }
@@ -356,10 +354,11 @@ impl<'env> RwTxn<'env> {
     /// In-save draw from the **already-loaded drain pool** (GC-12;
     /// see [`RwTxn::allocate`]). Deterministic like GC-19: smallest
     /// reclaimable record first (`drains` is a `BTreeMap` in key order),
-    /// smallest id / first contiguous run within it. Gate compliance is inherited: every pool
-    /// entry passed `F ≤ oldest_reader()` when first loaded during ops, and
-    /// any reader that pins *after* that pins the published snapshot
-    /// `≥ writer_txnid − 1 ≥ F`, from whose trees these pages are absent.
+    /// smallest id / first contiguous run within it. Gate compliance is
+    /// inherited: every pool entry passed `F ≤ oldest_reader()` when first
+    /// loaded during ops, and any reader that pins *after* that pins the
+    /// published snapshot `≥ writer_txnid − 1 ≥ F`, from whose trees these
+    /// pages are absent.
     #[inline(never)]
     pub(super) fn save_pool_draw(&mut self, n: u64) -> Option<u64> {
         debug_assert!(self.alloc_mode == AllocMode::GcSave);
@@ -371,8 +370,9 @@ impl<'env> RwTxn<'env> {
             }
         }
         let (key, start) = hit?;
-        // Reader-table shadow check: gate compliance is inherited (doc above), but a
-        // fresh table re-scan re-proves it at the hand-out moment.
+        // Reader-table shadow check: gate compliance is inherited (doc
+        // above), but a fresh table re-scan re-proves it at the hand-out
+        // moment.
         #[cfg(debug_assertions)]
         self.debug_assert_gate(key.txnid);
         let remaining = work_mut!(self)
@@ -419,11 +419,11 @@ impl<'env> RwTxn<'env> {
     /// live reader snapshot txnid, writer_txnid − 1)`. The reader term is the
     /// lock-free reader-table SeqCst scan
     /// ([`crate::env::EnvInner::oldest_live_reader`]); this is its only
-    /// consumer. Cached per write txn (TXN-22; ADR-0006): the
-    /// first draw scans, later draws reuse — always sound because a stale
-    /// gate is only ever *smaller* (readers that release mid-txn are not
-    /// reclaimed-against; readers that pin mid-txn pin `≥ commit point =
-    /// txnid − 1 ≥` the cache, so the cache never overshoots a new pin).
+    /// consumer. Cached per write txn (TXN-22; ADR-0006): the first draw
+    /// scans, later draws reuse — always sound because a stale gate is only
+    /// ever *smaller* (readers that release mid-txn are not reclaimed
+    /// against; readers that pin mid-txn pin `≥ commit point = txnid − 1 ≥`
+    /// the cache, so the cache never overshoots a new pin).
     pub(super) fn oldest_reader(&mut self) -> u64 {
         if let Some(o) = work!(self).oldest_cache {
             return o;
@@ -446,14 +446,12 @@ impl<'env> RwTxn<'env> {
     /// reach any page being drawn". Catches a gate bug at the reclaim site,
     /// not via downstream corruption. Debug builds only.
     ///
-    /// Caveat: this re-scan is itself just a set of SeqCst loads subject to
-    /// the same memory-model visibility rules as the real gate — it is a
-    /// debug *aid*, not an independent oracle. A pin it fails to observe is
-    /// exactly a pin the TXN-20 proof already covers (mid-pin ⇒ `≥ N − 1`),
-    /// and a stale read of a just-released slot only makes the assert
-    /// stricter (conservative), so it can produce no false confidence and no
-    /// false alarm — but it also cannot detect ordering bugs the gate itself
-    /// would miss on the same hardware.
+    /// Caveat: this re-scan is itself a set of SeqCst loads subject to the
+    /// same memory-model visibility rules as the real gate, so it is a
+    /// debug aid, not an independent proof. It raises no false alarm (a pin
+    /// it fails to observe is one the TXN-20 argument already covers, and a
+    /// stale read of a just-released slot only makes the assert stricter),
+    /// but it cannot detect an ordering bug the gate itself would miss.
     #[cfg(debug_assertions)]
     pub(super) fn debug_assert_gate(&self, f: u64) {
         // `F ≤ writer_txnid − 1`, spelled `<` for clippy (same predicate).

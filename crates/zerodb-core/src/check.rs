@@ -13,10 +13,20 @@
 //! [`check_snapshot`] runs the same walk over one committed snapshot of a
 //! live environment, read through a read txn's map, without the meta slots
 //! (ADR-0023).
+//!
+//! Key order (INV-5, INV-6) is evaluated in byte order, which is the order
+//! of the main database, the free tree and every named database without a
+//! custom comparator. A file does not record a named database's comparator
+//! ([`crate::cmp`]), so a caller that knows it says so through
+//! [`check_image_with_key_order`] / [`check_snapshot_with_key_order`];
+//! otherwise a database written under a custom comparator reports INV-5 and
+//! INV-6 violations.
 
+use std::cmp::Ordering as KeyOrdering;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use crate::cmp::Comparator;
 use crate::page::geometry::{gc_chunk_cap, gc_key_decode, overflow_page_count, pil_decode, GcKey};
 use crate::page::{
     select_meta, DBRecord, LeafValue, MetaPage, OverflowRef, PageRef, PageType, DBRECORD_LEN,
@@ -82,6 +92,43 @@ impl PageSet {
     }
 }
 
+/// The ordering `check` evaluates a named database's keys under (INV-5,
+/// INV-6). The main database and the free tree are always byte-ordered.
+#[derive(Clone, Copy)]
+pub enum KeyOrder<'a> {
+    /// Unsigned lexicographic byte order: the order of every database that
+    /// has no custom comparator.
+    Bytewise,
+    /// The comparator the database was written under. INV-5 and INV-6 are
+    /// evaluated with it, at full strength.
+    Custom(&'a dyn Comparator),
+    /// The database was written under a comparator the caller cannot supply.
+    /// Its key-order checks are skipped, except that two adjacent keys of a
+    /// page with identical bytes are still an INV-5 violation, since they are
+    /// equal under every ordering. Every other invariant is checked as usual.
+    Unknown,
+}
+
+impl KeyOrder<'_> {
+    /// How `a` orders against `b`, or `None` when the ordering is unknown.
+    fn compare(&self, a: &[u8], b: &[u8]) -> Option<KeyOrdering> {
+        match self {
+            KeyOrder::Bytewise => Some(a.cmp(b)),
+            KeyOrder::Custom(c) => Some(c.compare(a, b)),
+            KeyOrder::Unknown => None,
+        }
+    }
+
+    /// Whether `a` is known not to sort strictly before `b`.
+    fn not_before(&self, a: &[u8], b: &[u8]) -> bool {
+        self.compare(a, b).is_some_and(|o| o != KeyOrdering::Less)
+    }
+}
+
+/// Maps a named database's name to the ordering its keys were written under
+/// ([`check_image_with_key_order`]).
+pub type NamedKeyOrder<'a> = dyn Fn(&[u8]) -> KeyOrder<'a> + Sync + 'a;
+
 /// What every walk over one image shares: the image and the snapshot it
 /// checks, and the set of pages reached so far.
 struct Shared<'a> {
@@ -94,32 +141,51 @@ struct Shared<'a> {
     annex_count: usize,
     /// Pages reached by the tree walks (INV-16, INV-11, INV-22).
     visited: PageSet,
+    /// The key order of each named database; `None` means byte order for
+    /// all of them.
+    order_of: Option<&'a NamedKeyOrder<'a>>,
 }
 
 /// Work a parallel walk hands back to the coordinator instead of doing it
 /// in place (see [`check_state`]).
-enum Deferred {
+enum Deferred<'a> {
     /// A named database's record found in the main catalog.
-    Record { label: String, rec: DBRecord },
+    Record {
+        label: String,
+        rec: DBRecord,
+        order: KeyOrder<'a>,
+    },
     /// One child subtree of a record's root branch page.
-    Subtree(SubtreeJob),
+    Subtree(SubtreeJob<'a>),
 }
 
-/// Which kind of tree a walk is in: it decides how leaf entries are read.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TreeKind {
+/// Which kind of tree a walk is in: it decides how leaf entries are read and
+/// which ordering the keys follow.
+#[derive(Clone, Copy)]
+enum TreeKind<'a> {
     /// The main DB: its `F_SUBDATA` entries are named-DB records, followed
     /// as trees of their own (SPEC 02 §6).
     Catalog,
     /// The free/GC DB: its entries are free-page lists (SPEC 05).
     Gc,
-    /// A named database's own tree.
-    Named,
+    /// A named database's own tree, with the ordering of its keys.
+    Named(KeyOrder<'a>),
+}
+
+impl<'a> TreeKind<'a> {
+    /// The ordering this tree's keys follow: only a named database's can
+    /// differ from byte order.
+    fn order(self) -> KeyOrder<'a> {
+        match self {
+            TreeKind::Catalog | TreeKind::Gc => KeyOrder::Bytewise,
+            TreeKind::Named(order) => order,
+        }
+    }
 }
 
 /// A child subtree of a record's root branch, with the separator bounds the
 /// root gives it (INV-6).
-struct SubtreeJob {
+struct SubtreeJob<'a> {
     /// Index of the record this subtree belongs to, in the coordinator's
     /// record table.
     rec_idx: usize,
@@ -127,7 +193,7 @@ struct SubtreeJob {
     level: u16,
     low: Option<Vec<u8>>,
     high: Option<Vec<u8>>,
-    kind: TreeKind,
+    kind: TreeKind<'a>,
 }
 
 struct Checker<'s, 'a> {
@@ -137,11 +203,11 @@ struct Checker<'s, 'a> {
     meta_txnid: u64,
     last_pg: u64,
     annex_count: usize,
-    /// Free page ids collected from every GC PIL **and the selected meta's
-    /// free-list annex** → occurrence count (INV-22/INV-24/INV-28; SPEC 05
-    /// §9/§2a). **Randomly seeded** (std `RandomState`), unlike the engine's
-    /// unseeded pgno hasher: its keys are *on-disk* page ids, so a hostile
-    /// file could otherwise choose ids that all collide (HashDoS).
+    /// Free page ids collected from every GC PIL and from the selected
+    /// meta's free-list annex, with their occurrence counts
+    /// (INV-22/INV-24/INV-28; SPEC 05 §9/§2a). The map is randomly seeded
+    /// (std `RandomState`): its keys are page ids read from the file, so
+    /// under a fixed hash a hostile file could choose ids that all collide.
     free: HashMap<u64, u64>,
     /// The shape of every GC record walked, for the INV-29 range check once
     /// the whole GC tree has been read.
@@ -151,7 +217,7 @@ struct Checker<'s, 'a> {
     /// order the report lists findings. `Some` for one job of a parallel
     /// walk: a record's root branch defers its children, and a catalog leaf
     /// defers its named databases, to this list.
-    deferred: Option<Vec<Deferred>>,
+    deferred: Option<Vec<Deferred<'a>>>,
     /// The record being walked, for the subtrees it defers.
     rec_idx: usize,
 }
@@ -244,9 +310,14 @@ impl<'s, 'a> Checker<'s, 'a> {
         is_root: bool,
         (low, high): (Option<&[u8]>, Option<&[u8]>),
         stats: &mut WalkStats,
-        kind: TreeKind,
+        kind: TreeKind<'a>,
     ) {
-        let what = if kind == TreeKind::Gc { "GC" } else { "tree" };
+        let what = if matches!(kind, TreeKind::Gc) {
+            "GC"
+        } else {
+            "tree"
+        };
+        let order = kind.order();
         let Some(page) = self.visit(pgno, what) else {
             return;
         };
@@ -283,17 +354,23 @@ impl<'s, 'a> Checker<'s, 'a> {
                         );
                     }
                     if let Some(p) = prev {
-                        if p >= k {
+                        // Under an unknown ordering only identical bytes are
+                        // known to be out of order: no ordering separates them.
+                        let out_of_order = match order.compare(p, k) {
+                            Some(o) => o != KeyOrdering::Less,
+                            None => p == k,
+                        };
+                        if out_of_order {
                             self.fail("INV-5", format!("leaf {pgno} keys not ascending at {i}"));
                         }
                     }
                     if let Some(lo) = low {
-                        if k < lo {
+                        if order.compare(k, lo) == Some(KeyOrdering::Less) {
                             self.fail("INV-6", format!("leaf {pgno} key below separator bound"));
                         }
                     }
                     if let Some(hi) = high {
-                        if k >= hi {
+                        if order.not_before(k, hi) {
                             self.fail("INV-6", format!("leaf {pgno} key at/above separator bound"));
                         }
                     }
@@ -304,7 +381,7 @@ impl<'s, 'a> Checker<'s, 'a> {
                             // Catalog entry (SPEC 02 §6): an `F_SUBDATA` value is
                             // a 48-byte sub-DB record on the main tree only.
                             if is_subdata {
-                                if kind != TreeKind::Catalog {
+                                if !matches!(kind, TreeKind::Catalog) {
                                     self.fail(
                                         "INV-21",
                                         format!(
@@ -339,19 +416,23 @@ impl<'s, 'a> Checker<'s, 'a> {
                             self.check_overflow(pgno, head_pgno, dsize, stats);
                         }
                     }
-                    if kind == TreeKind::Gc {
+                    if matches!(kind, TreeKind::Gc) {
                         self.check_gc_entry(pgno, k, leaf.value(i));
                     }
                 }
                 // Walk each named-DB sub-tree: its pages join `visited`
                 // (reachable-XOR-free) and its stats are validated against its
-                // own record (INV-18). `leaf` borrows the immutable image (not `&mut self`),
-                // so these `&mut self` calls are sound while it is in scope.
+                // own record (INV-18). `leaf` borrows the image, not `self`, so
+                // these `&mut self` calls are allowed while it is in scope.
                 for (name, rec) in subdbs {
                     let label = format!("subdb {:?}", String::from_utf8_lossy(&name));
+                    let order = self
+                        .shared
+                        .order_of
+                        .map_or(KeyOrder::Bytewise, |order_of| order_of(&name));
                     match &mut self.deferred {
-                        Some(d) => d.push(Deferred::Record { label, rec }),
-                        None => self.check_record(&label, &rec, TreeKind::Named),
+                        Some(d) => d.push(Deferred::Record { label, rec, order }),
+                        None => self.check_record(&label, &rec, TreeKind::Named(order)),
                     }
                 }
             }
@@ -382,7 +463,7 @@ impl<'s, 'a> Checker<'s, 'a> {
                     let lo: Option<&[u8]> = if i == 0 { low } else { Some(&seps[i]) };
                     let hi: Option<&[u8]> = if i + 1 < n { Some(&seps[i + 1]) } else { high };
                     if let (Some(l), Some(h)) = (lo, hi) {
-                        if l >= h {
+                        if order.not_before(l, h) {
                             self.fail("INV-6", format!("branch {pgno} separators not ascending"));
                         }
                     }
@@ -644,7 +725,7 @@ impl<'s, 'a> Checker<'s, 'a> {
 
     /// Validate a `DBRecord` (`name` labels it in violation messages), walk
     /// its tree as a `kind` tree and check its stats.
-    fn check_record(&mut self, name: &str, rec: &DBRecord, kind: TreeKind) {
+    fn check_record(&mut self, name: &str, rec: &DBRecord, kind: TreeKind<'a>) {
         if let Some(stats) = self.walk_record(name, rec, kind) {
             self.check_stats(name, rec, stats);
         }
@@ -653,7 +734,7 @@ impl<'s, 'a> Checker<'s, 'a> {
     /// Check a record's own fields and walk its tree (deferring the root's
     /// children in a parallel walk). Returns the stats it counted, or `None`
     /// when the record is malformed and its tree was not walked.
-    fn walk_record(&mut self, name: &str, rec: &DBRecord, kind: TreeKind) -> Option<WalkStats> {
+    fn walk_record(&mut self, name: &str, rec: &DBRecord, kind: TreeKind<'a>) -> Option<WalkStats> {
         // INV-19 root shape.
         if rec.depth == 0 && rec.root != PGNO_INVALID {
             self.fail("INV-19", format!("{name}: depth 0 but root {}", rec.root));
@@ -667,11 +748,10 @@ impl<'s, 'a> Checker<'s, 'a> {
         if rec.flags != 0 || rec.leaf2_ksize != 0 {
             self.fail("INV-21", format!("{name}: reserved DBRecord fields set"));
         }
-        // Hostile-depth guard: `walk` recurses one frame per level, and
-        // `rec.depth` is raw on-disk data (u16 → up to 65 535 frames → stack
-        // overflow). Anything deeper than the read path's CURSOR_STACK bound
-        // (32 — minimum fanout 2 already addresses 2^31 leaves there) is
-        // corruption; report it and do not walk.
+        // `walk` recurses one frame per level, and `rec.depth` comes from
+        // the file: a hostile depth of up to 65,535 would overflow the stack.
+        // A depth beyond the read path's `CURSOR_STACK` bound is corruption;
+        // report it and do not walk.
         if rec.depth as usize > crate::btree::CURSOR_STACK {
             self.fail(
                 "INV-7",
@@ -721,7 +801,26 @@ impl<'s, 'a> Checker<'s, 'a> {
 /// single-threaded walk's (see [`check_image_with_threads`]).
 #[must_use]
 pub fn check_image(bytes: &[u8], psize: u32) -> Vec<String> {
-    check_image_inner(bytes, psize, None)
+    check_image_inner(bytes, psize, None, None)
+}
+
+/// [`check_image`] for a file whose named databases are not all byte-ordered:
+/// `order_of` is called with each named database's name and returns the
+/// ordering its keys were written under. Return [`KeyOrder::Custom`] with the
+/// comparator the database is opened with, or [`KeyOrder::Unknown`] when that
+/// comparator is not available, so that a healthy database is not reported
+/// for INV-5 or INV-6. The main database and the free tree are byte-ordered
+/// whatever `order_of` says.
+///
+/// A comparator supplied here must be the one the database was written
+/// under: any other one makes a healthy tree report violations.
+#[must_use]
+pub fn check_image_with_key_order<'a>(
+    bytes: &'a [u8],
+    psize: u32,
+    order_of: &'a NamedKeyOrder<'a>,
+) -> Vec<String> {
+    check_image_inner(bytes, psize, None, Some(order_of))
 }
 
 /// [`check_image`] on exactly `threads` threads (1 = the serial walk),
@@ -731,10 +830,15 @@ pub fn check_image(bytes: &[u8], psize: u32) -> Vec<String> {
 #[doc(hidden)]
 #[must_use]
 pub fn check_image_with_threads(bytes: &[u8], psize: u32, threads: usize) -> Vec<String> {
-    check_image_inner(bytes, psize, Some(threads))
+    check_image_inner(bytes, psize, Some(threads), None)
 }
 
-fn check_image_inner(bytes: &[u8], psize: u32, threads: Option<usize>) -> Vec<String> {
+fn check_image_inner<'a>(
+    bytes: &'a [u8],
+    psize: u32,
+    threads: Option<usize>,
+    order_of: Option<&'a NamedKeyOrder<'a>>,
+) -> Vec<String> {
     let ps = psize as usize;
     let mut violations = Vec::new();
     if bytes.len() < 2 * ps {
@@ -761,12 +865,11 @@ fn check_image_inner(bytes: &[u8], psize: u32, threads: Option<usize>) -> Vec<St
             bytes.len()
         ));
     }
-    // INV-17: the file covers the high-water. Checked arithmetic — a hostile
-    // `last_pg` near `u64::MAX` must not wrap the multiply — and an **early
-    // return**: every later phase (the walks, and especially the
-    // reachable-XOR-free sweep over `FIRST_DATA_PGNO..=last_pg`) is bounded
-    // by `last_pg`, so a high-water the image cannot back would otherwise
-    // loop ~2^64 times allocating a violation `String` per page.
+    // INV-17: the file covers the high-water. The arithmetic is checked, so
+    // that a hostile `last_pg` near `u64::MAX` cannot wrap the multiply. A
+    // failure returns at once: every later phase is bounded by `last_pg`,
+    // and the reachable-XOR-free sweep over `FIRST_DATA_PGNO..=last_pg`
+    // would otherwise report one violation per page the image lacks.
     let needed = meta
         .last_pg
         .checked_add(1)
@@ -798,6 +901,7 @@ fn check_image_inner(bytes: &[u8], psize: u32, threads: Option<usize>) -> Vec<St
         },
         violations,
         threads.unwrap_or_else(|| default_threads(meta.last_pg)),
+        order_of,
     )
 }
 
@@ -814,6 +918,27 @@ fn check_image_inner(bytes: &[u8], psize: u32, threads: Option<usize>) -> Vec<St
 /// invariants are asserted against `(last_pg + 1) * psize` instead.
 #[must_use]
 pub fn check_snapshot(map: &[u8], psize: u32, snap: &crate::env::Snapshot) -> Vec<String> {
+    check_snapshot_inner(map, psize, snap, None)
+}
+
+/// [`check_snapshot`] with the key order of each named database given by
+/// `order_of`, as [`check_image_with_key_order`].
+#[must_use]
+pub fn check_snapshot_with_key_order<'a>(
+    map: &'a [u8],
+    psize: u32,
+    snap: &crate::env::Snapshot,
+    order_of: &'a NamedKeyOrder<'a>,
+) -> Vec<String> {
+    check_snapshot_inner(map, psize, snap, Some(order_of))
+}
+
+fn check_snapshot_inner<'a>(
+    map: &'a [u8],
+    psize: u32,
+    snap: &crate::env::Snapshot,
+    order_of: Option<&'a NamedKeyOrder<'a>>,
+) -> Vec<String> {
     let needed = snap
         .last_pg
         .checked_add(1)
@@ -841,6 +966,7 @@ pub fn check_snapshot(map: &[u8], psize: u32, snap: &crate::env::Snapshot) -> Ve
         },
         Vec::new(),
         default_threads(snap.last_pg),
+        order_of,
     )
 }
 
@@ -854,8 +980,7 @@ struct SnapshotRoots<'a> {
 }
 
 /// Images smaller than this many pages (64 MiB at 4 KiB pages) are walked on
-/// the calling thread: their walk takes milliseconds, less than starting
-/// threads would save.
+/// the calling thread: the walk is too short for extra threads to pay off.
 const PARALLEL_MIN_PAGES: u64 = 16_384;
 
 /// The most threads one check uses.
@@ -917,12 +1042,13 @@ fn check_free_ids(ids: &[u64], last_pg: u64, free: &mut HashMap<u64, u64>) -> Ve
 /// pages, and the only check that depends on visiting order, "page reached
 /// twice" (INV-16, INV-11), fires in both whenever some page is reachable
 /// twice, since the reached-pages set is shared by all threads.
-fn check_state(
-    bytes: &[u8],
+fn check_state<'a>(
+    bytes: &'a [u8],
     psize: u32,
     roots: &SnapshotRoots<'_>,
     mut violations: Vec<String>,
     threads: usize,
+    order_of: Option<&'a NamedKeyOrder<'a>>,
 ) -> Vec<String> {
     // Validate the annex's GC-29 shape (the INV-25/26 analogues, labelled
     // INV-28) and count its ids into the free set for the INV-22/24
@@ -941,6 +1067,7 @@ fn check_state(
         last_pg: roots.last_pg,
         annex_count: roots.annex.len(),
         visited: PageSet::new(roots.last_pg),
+        order_of,
     };
     if threads > 1 && violations.is_empty() {
         let found = walk_parallel(&shared(), roots, free.clone(), threads);
@@ -970,20 +1097,20 @@ struct RecordSlot {
 }
 
 /// One unit of a parallel walk.
-enum Job {
+enum Job<'a> {
     /// Check record `idx`'s fields and its root page; defer the root's
     /// children.
-    Record { idx: usize, kind: TreeKind },
+    Record { idx: usize, kind: TreeKind<'a> },
     /// Walk a whole subtree.
-    Subtree(SubtreeJob),
+    Subtree(SubtreeJob<'a>),
 }
 
 /// What one job found.
-struct JobOut {
+struct JobOut<'a> {
     violations: Vec<String>,
     free: HashMap<u64, u64>,
     gc_records: Vec<GcRecordShape>,
-    deferred: Vec<Deferred>,
+    deferred: Vec<Deferred<'a>>,
     rec_idx: usize,
     /// The job's share of its record's stats; `None` for a malformed
     /// record, whose tree is not walked.
@@ -996,8 +1123,8 @@ struct JobOut {
 /// record's stats are the sum of its jobs' and are compared (INV-18) once
 /// every round is done; then the reachable-XOR-free partition is checked
 /// over the shared reached-pages set.
-fn walk_parallel(
-    shared: &Shared<'_>,
+fn walk_parallel<'a>(
+    shared: &Shared<'a>,
     roots: &SnapshotRoots<'_>,
     mut free: HashMap<u64, u64>,
     threads: usize,
@@ -1040,10 +1167,10 @@ fn walk_parallel(
             }
             for d in out.deferred {
                 match d {
-                    Deferred::Record { label, rec } => {
+                    Deferred::Record { label, rec, order } => {
                         jobs.push(Job::Record {
                             idx: records.len(),
-                            kind: TreeKind::Named,
+                            kind: TreeKind::Named(order),
                         });
                         records.push(slot(&label, &rec));
                     }
@@ -1066,13 +1193,13 @@ fn walk_parallel(
 
 /// Run one round's `jobs` on up to `threads` threads; the results come back
 /// in job order.
-fn run_round(
-    shared: &Shared<'_>,
+fn run_round<'a>(
+    shared: &Shared<'a>,
     records: &[RecordSlot],
-    jobs: &[Job],
+    jobs: &[Job<'a>],
     threads: usize,
-) -> Vec<JobOut> {
-    let run = |job: &Job| {
+) -> Vec<JobOut<'a>> {
+    let run = |job: &Job<'a>| -> JobOut<'a> {
         let mut c = Checker::new(shared, true);
         let stats = match job {
             Job::Record { idx, kind } => {
@@ -1300,6 +1427,7 @@ mod tests {
             last_pg: meta.last_pg,
             annex_count: annex.len(),
             visited: PageSet::new(meta.last_pg),
+            order_of: None,
         };
         let roots = SnapshotRoots {
             txnid: meta.txnid,
@@ -1328,6 +1456,63 @@ mod tests {
                 Some((pgno, (0..br.num_keys()).map(|i| br.child_pgno(i)).collect()))
             })
             .collect()
+    }
+
+    /// The key order given for a named database decides its INV-5/INV-6
+    /// verdict, on the serial walk and on the parallel one alike: the
+    /// databases of a byte-ordered image are clean under byte order, under
+    /// the default comparator and under an unknown order, and one checked
+    /// under the opposite order reports exactly those two invariants.
+    #[test]
+    fn named_key_order_reaches_every_walk() {
+        use crate::cmp::{DefaultComparator, FnComparator};
+
+        let img = multi_db_image(TEST_ENTRIES);
+        let reverse = FnComparator::new("test.reverse.v1", |a: &[u8], b: &[u8]| b.cmp(a));
+        let clean = |name: &[u8]| match name {
+            b"db-a" => KeyOrder::Custom(&DefaultComparator),
+            b"db-b" => KeyOrder::Unknown,
+            _ => KeyOrder::Bytewise,
+        };
+        let wrong = |name: &[u8]| match name {
+            b"db-a" => KeyOrder::Custom(&reverse),
+            _ => KeyOrder::Bytewise,
+        };
+        for threads in [1, 4] {
+            assert_eq!(
+                check_image_inner(&img, PS, Some(threads), Some(&clean)),
+                Vec::<String>::new(),
+                "threads = {threads}"
+            );
+        }
+        let serial = check_image_inner(&img, PS, Some(1), Some(&wrong));
+        assert!(!serial.is_empty(), "db-a is not in reverse order");
+        assert!(
+            serial
+                .iter()
+                .all(|v| v.starts_with("INV-5") || v.starts_with("INV-6")),
+            "{serial:#?}"
+        );
+        assert_eq!(check_image_inner(&img, PS, Some(4), Some(&wrong)), serial);
+        // The main database is byte-ordered whatever the caller says.
+        let all_reverse = |_: &[u8]| KeyOrder::Custom(&reverse);
+        let v = check_image_with_key_order(&img, PS, &all_reverse);
+        assert!(!v.is_empty());
+        let only_main = build_single_db_image(
+            PS,
+            8 << 20,
+            3,
+            &[
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+            ],
+            900,
+        )
+        .unwrap();
+        assert_eq!(
+            check_image_with_key_order(&only_main, PS, &all_reverse),
+            Vec::<String>::new()
+        );
     }
 
     #[test]

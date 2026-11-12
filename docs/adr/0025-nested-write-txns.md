@@ -285,7 +285,7 @@ depth plus a journal of pre-images.
   design does not need the refusal: under in-place WRITE_MAP the pre-image is
   copied out of the map, and an abort writes it back at the same page number,
   which is a page this write txn allocated (TXN-62). That write back would be
-  a new use of the `dirty::map_mut` broker and would need the AGENTS.md
+  a new use of the `dirty::map_mut` broker and would need the CONTRIBUTING.md
   `WRITE_MAP` exception widened. Not proposed now.
 
 Pros:
@@ -359,7 +359,7 @@ only `'p` is not expressible in safe Rust (invariance). Two ways out:
 1. **Erase the env lifetime once at construction**, as `RwGuts` does for the
    write iterator: the child holds a raw pointer to the parent's engine txn,
    valid for `'p` because the child borrows the parent mutably for `'p`. This
-   adds a second lifetime-erasure site to `heed-zerodb` and needs an AGENTS.md
+   adds a second lifetime-erasure site to `heed-zerodb` and needs an CONTRIBUTING.md
    unsafe-policy amendment and a miri test like `erased_cursor_in_place_tests`.
 2. **Dispatch through a trait object** implemented by the parent adapter
    type, so the child calls the engine through `&'p mut dyn ...`. This is safe
@@ -401,7 +401,7 @@ Draft, awaiting the maintainer. Recommendation:
 Why B over A: it leaves the read path untouched for every write txn, which is
 the path Meilisearch spends its time in, and it confines the change to the
 dirty store plus one savepoint. The cost is that it is not LMDB's technique;
-the stated reason (AGENTS.md rule 7) is the measured sensitivity of
+the stated reason (CONTRIBUTING.md rule 7) is the measured sensitivity of
 `bytes_from_classified` to any extra probe (B13).
 
 Correct the wording of TXN-40, D-003 and `docs/LMDB-COMPATIBILITY.md` (they say
@@ -460,7 +460,7 @@ If the spike succeeds and the option is approved:
   `heed-zerodb` adapter-pair test, `fuzz/` gains nested commit and abort
   operations, and the crash harness gains a case with a child that spilled and
   aborted before the outermost commit (it must recover to `N-1`).
-- If the adapter erases a lifetime, AGENTS.md's unsafe list gains that site
+- If the adapter erases a lifetime, CONTRIBUTING.md's unsafe list gains that site
   and a miri test covers it.
 - Rule 7 numbers (LMDB, ZeroDB before, ZeroDB after) for the standard write
   benchmarks, to show non-nested txns did not slow down.

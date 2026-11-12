@@ -2,7 +2,28 @@
 
 This page covers how ZeroDB compares with LMDB, which techniques closed each gap,
 what was tried and dropped, and what is still open. It also explains how the
-benchmarks work. Every number links to the report that measured it.
+benchmarks work. Each figure names the run it comes from.
+
+> **How to read this page, and the status of the numbers**
+>
+> - **Every table below predates the current default.** Since ADR-0034
+>   (merged 2026-11-03) pages are trusted by default, as in LMDB. In the
+>   tables, "default" means the validating policy, which is now the opt-in
+>   `FileTrust::VALIDATE`, and "trusted" is what a default build does today.
+> - **Most of the source reports are not in the tree.** They were removed and
+>   are still in git history (commit `e0fd466`). Only the three reports dated
+>   2026-11-02 are in [`benches/results/`](../benches/results/README.md).
+> - **The figures come from different machines and dates** (2026-09-28 to
+>   2026-11-02). Compare a figure only with figures that carry the same
+>   source key.
+> - **What the data says.** Meilisearch and hannoy run within a few percent
+>   of LMDB, in either direction. Hot and random point reads, seeks and range
+>   scans are faster (0.69–0.95×). Full scans (1.03–1.09× trusted, 1.47–1.60×
+>   validating), per-key deletes (1.35–1.36×), one-put commits without sync
+>   (1.17×) and empty write transactions (2.46–3.52×) are slower.
+> - **The current numbers are in the next section.** The tables after it
+>   are the history of how each gap was found and closed; they will be
+>   rebuilt from new runs.
 
 The comparison point is the LMDB build Meilisearch ships (`lmdb-master-sys
 0.2.6`, under heed 0.22.1).
@@ -42,11 +63,42 @@ time ratio.
   hannoy's own benchmarks, each built once against LMDB and once against
   ZeroDB ([maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md)).
 
-The benchmarks are being re-run on a quiet Graviton4 host; new reports will go
-in [`benches/results/`](../benches/results/README.md). The figures below are
-the last measured values, from reports that were removed from the tree and are
-still in git history (commit `e0fd466`). Every experiment ever tried, kept or reverted, is one line in
+New reports go in [`benches/results/`](../benches/results/README.md). The
+figures under [Where ZeroDB stands](#where-zerodb-stands) come from earlier
+reports that were removed from the tree and are still in git history (commit
+`e0fd466`). Every experiment ever tried, kept or reverted, is one line in
 [`perf-ledger.jsonl`](../benches/results/perf-ledger.jsonl).
+
+## Current numbers
+
+Current `main` (`d70dbe9`) on the target hardware: AWS `c8g.xlarge`
+(Graviton4), one EBS gp3 volume at its baseline, 4 KiB pages, one codegen
+unit. The full table, the method and its limits are in the
+[report](../benches/results/2026-11-12-ladder-meilisearch-graviton-gp3.md).
+
+| Area | ZeroDB default | ZeroDB validating |
+|---|---:|---:|
+| Durable commits (`commit/sync/*`) | 0.98–1.00× | 0.98–0.99× |
+| No-sync commits of 10k, 100 and 1 put | 0.93×, 1.01×, 1.15× | 0.94×, 1.01×, 1.18× |
+| Point reads (`get/*`) | 0.62–0.95× | 0.66–1.02×; overflow values 1.31–1.33× |
+| Seeks (`seek/*`) | 0.80–0.97× | 0.89–1.03× |
+| Full scans (`scan/full/*`) | 1.01–1.03× | 1.43–1.57× |
+| Range scans (`scan/range/*`) | 0.77–0.78× | 0.91–0.93× |
+| Sequential and random puts | 0.93–0.94× | 0.93–0.96× |
+| Write-cursor rewrite (`put/cursor/rewrite`) | 1.26× | 1.30× |
+| Per-key deletes (`del/bulk/*`) | 1.27–1.28× | 1.29× |
+| Deletes through the write cursor | 1.40–1.55× | 1.40–1.57× |
+| `delete_range` | 0.54× | 0.55× |
+| Empty write transaction | 3.49× | 3.34× |
+| Create an environment | 27.8× | 27.7× |
+| Meilisearch v1.55.0, movies: indexing, search | 0.98×, 1.00× | not run |
+
+The two ladder passes ran one after the other. On 13 rungs, most of them
+`get/*`, LMDB itself moved by more than 3 % between the passes, so the
+difference between the two columns is indicative there.
+
+Not re-measured on this setup: hannoy, the Meilisearch hackernews workloads,
+YCSB, and `WRITE_MAP`.
 
 ## Where ZeroDB stands
 
@@ -193,7 +245,7 @@ LMDB". Ratios are before → after.
 | Technique | Change | Before → after |
 |---|---|---|
 | <a id="a1"></a>Named-database records resolved once | Each read took a lock and descended the catalog. A read txn now resolves each database once into a table indexed by handle, as LMDB's `txn->mt_dbs[dbi]` does. | `scan/meta/len` 2.46× → 1.01× |
-| <a id="a2"></a>Page validation once per page | ZeroDB checks every cell of a page before trusting it, so a corrupt file is a typed error. The check now runs once per page per txn, recorded in a lock-free memo, and pages the engine wrote itself are trusted. | milli indexing 2.68× → 1.12× (laptop) |
+| <a id="a2"></a>Page validation once per page | The validating policy (`FileTrust::VALIDATE`: the default when this was measured, opt-in since ADR-0034) checks every cell of a page before using it, so a corrupt file is a typed error. The check runs once per page per txn, recorded in a lock-free memo, and pages the engine wrote itself are trusted. | milli indexing 2.68× → 1.12× (laptop) |
 | Env-wide validated-pages cache (ADR-0018) | Read txns share one cache keyed by page number, kind and the txn id stamped in the page, so short txns stop re-validating hot pages. Since 2026-10-31 it has one slot per page of the file. | read txn plus get 1,984 → 1,008 ns; random gets 1.16× → 0.94× (V); 10M-key random get p50 1.32 → 1.23 µs (SC) |
 | Trusted-file mode (ADR-0014; the default since ADR-0034) | Skips the per-cell walk and the overflow header check, as LMDB does. | trusted `get/val/v4k` 1.29× → 0.91× |
 | Field reads at fixed offsets | Page fields are read with `read_unaligned` at explicit offsets behind one bounds proof per view. | — |
@@ -317,7 +369,7 @@ Issues are tracked on [GitHub](https://github.com/qdequele/ZeroDB/issues).
 - **Free-page runs.** Under steady multi-page rewrites the file still grows
   about 4 % between 200 and 400 commits, against LMDB's 0.6 %. Coalescing
   leftover runs on disk would close it; not planned.
-- **Not measured yet:** durable commits on EBS gp3; a 24-byte page header
+- **Not measured yet:** a 24-byte page header
   instead of 32 (ADR-0020, a format change).
 
 ## Deliberate differences
@@ -333,7 +385,8 @@ Issues are tracked on [GitHub](https://github.com/qdequele/ZeroDB/issues).
   does (ADR-0034), so the "Trusted" columns above are the default.
 - **Env creation syncs.** Creating an env syncs the file and its parent
   directory, so a crash cannot lose the name of a durable file. It is paid once
-  per env, and is why `env/open/create` is about 9×.
+  per env, and is why `env/open/create` is about 9× on local NVMe and about
+  28× on EBS gp3, where a sync costs more.
 - **Lock file on by default (ADR-0023).** Multi-process access costs about
   +30 ns per write commit, +7 ns per read txn begin and +7 ns per `stat` on
   Graviton4. `NO_LOCK` is flat. Reopen is at parity with LMDB (36.4 vs 37.8 µs),

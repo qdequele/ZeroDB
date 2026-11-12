@@ -22,10 +22,12 @@ path = "src/main.rs"
 [dependencies]
 zerodb = { path = "../zerodb", version = "=0.2.0" }
 zerodb-core = { path = "../zerodb-core", version = "=0.2.0" }
-# `probe_page_size` for `check`'s raw-file fallback, and
-# `lockfile::published_max_readers`, so a tool joins a running env with its
-# lock file's `max_readers` (ADR-0023); no C.
+# `probe_page_size` and `open_or_create` for `check`'s raw-file fallback,
+# which maps the data file read-only, and `lockfile::published_max_readers`,
+# so a tool joins a running env with its lock file's `max_readers`
+# (ADR-0023); no C.
 zerodb-io = { path = "../zerodb-io", version = "=0.2.0" }
+thiserror.workspace = true
 # migrate-from-lmdb only: opens a real LMDB env read-only (the Meilisearch
 # fork). Off by default (ADR-0001).
 heed = { version = "=0.22.1", optional = true }

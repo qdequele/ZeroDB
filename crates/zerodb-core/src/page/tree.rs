@@ -195,6 +195,21 @@ fn branch_cell_len(buf: &[u8], abs: usize, psize: u32, index0: bool) -> Result<u
     Ok(clen)
 }
 
+/// Check that `psize` is a legal page size and that `buf` holds a whole page
+/// of it. The validating view constructors bound every cell against `psize`
+/// and their accessors then read without bounds checks, so the buffer must
+/// cover the page those bounds describe.
+fn check_page_buffer(buf: &[u8], psize: u32) -> Result<(), PageError> {
+    super::geometry::validate_page_size(psize)?;
+    if buf.len() < psize as usize {
+        return Err(PageError::BufferTooSmall {
+            got: buf.len(),
+            psize: psize as usize,
+        });
+    }
+    Ok(())
+}
+
 /// Read the body-relative pointer at array index `i`.
 #[inline]
 fn ptr_at(buf: &[u8], i: usize) -> u16 {
@@ -216,13 +231,16 @@ pub struct LeafRef<'a> {
 impl<'a> LeafRef<'a> {
     /// Validate and wrap `buf` as a leaf page of size `psize`.
     ///
-    /// Validates the type flag, reserved fields, free-space bounds, and that
-    /// every node pointer references an in-bounds, well-formed cell.
+    /// Validates the page size, that `buf` holds a whole page, the type flag,
+    /// reserved fields, free-space bounds, and that every node pointer
+    /// references an in-bounds, well-formed cell.
     ///
     /// # Errors
     ///
-    /// Any [`PageError`] arising from the checks above.
+    /// [`PageError::InvalidPageSize`], [`PageError::BufferTooSmall`], or any
+    /// other [`PageError`] arising from the checks above.
     pub fn new(buf: &'a [u8], psize: u32) -> Result<LeafRef<'a>, PageError> {
+        check_page_buffer(buf, psize)?;
         let view = Self::new_prevalidated(buf, psize)?;
         // Validate every cell.
         for i in 0..view.num_keys() {
@@ -233,15 +251,13 @@ impl<'a> LeafRef<'a> {
         Ok(view)
     }
 
-    /// [`LeafRef::new`] minus the per-cell loop: type flag, reserved fields
-    /// and free-space bounds are still checked (O(1)); the O(`num_keys`) cell
-    /// walk is skipped.
+    /// [`LeafRef::new`] without the per-cell loop: the type flag, reserved
+    /// fields and free-space bounds are still checked (O(1)).
     ///
-    /// The accessors do unchecked slicing and rely on the cells having been
-    /// validated, so this may only be used when **these same bytes** already
-    /// passed [`LeafRef::new`] earlier — i.e. behind the txn-scoped
-    /// validated-pages memo over an immutable source
-    /// (`btree::ValidatedPages`; docs/PERFORMANCE.md, eager page validation).
+    /// The accessors read cells without bounds checks, so this may only wrap
+    /// bytes whose cells are already known to be in bounds: bytes that passed
+    /// [`LeafRef::new`] earlier (recorded in `btree::ValidatedPages`), a
+    /// dirty frame the engine wrote, or a page of a trusted file (ADR-0014).
     pub(crate) fn new_prevalidated(buf: &'a [u8], psize: u32) -> Result<LeafRef<'a>, PageError> {
         let flags = read_flags(buf);
         if page_type_of(flags)? != PageType::Leaf {
@@ -255,12 +271,11 @@ impl<'a> LeafRef<'a> {
         Ok(LeafRef { buf, lower, upper })
     }
 
-    /// [`new_prevalidated`](Self::new_prevalidated) minus every check — two
-    /// raw header reads. Only for a **kind-tagged memo hit**:
-    /// these same bytes passed [`LeafRef::new`] earlier this txn *and* the
-    /// memo key records that they validated as a **leaf**
-    /// (`btree::ValidatedPages` tags the page kind), so not even the type
-    /// flag needs a re-read. The debug assert keeps the claim honest.
+    /// [`new_prevalidated`](Self::new_prevalidated) without any check: two
+    /// header reads. Only for a hit in `btree::ValidatedPages`, which records
+    /// that these bytes passed [`LeafRef::new`] and that they validated as a
+    /// leaf, so the type flag needs no second read either. A debug assertion
+    /// checks the page type.
     pub(crate) fn new_trusted(buf: &'a [u8]) -> LeafRef<'a> {
         debug_assert!(matches!(
             page_type_of(CommonHeader::read(buf).flags),
@@ -394,14 +409,12 @@ impl<'a> LeafMut<'a> {
 
     /// Wrap an already-validated leaf page for mutation.
     ///
-    /// Callers only ever hand this **engine-authored dirty frames** (a COW
-    /// copy of a page fully validated on its first map access this txn, or
-    /// the output of this txn's own page encoders), so validation is the same
-    /// O(1) structural checks the read-side dirty path uses
-    /// (`LeafRef::new_prevalidated`: type, reserved fields, bounds). The
-    /// **full O(`num_keys`)** [`LeafRef::new`] cell walk here would run on every
-    /// put (`insert_into_leaf` wraps the target leaf per call); the milli
-    /// write-phase profile measured it as the single hottest zerodb cost.
+    /// The engine passes only dirty frames it wrote itself: a copy-on-write
+    /// copy of a page, or the output of this txn's own page encoders. The
+    /// checks are therefore the O(1) structural ones of
+    /// `LeafRef::new_prevalidated` (type, reserved fields, bounds). The full
+    /// O(`num_keys`) cell walk of [`LeafRef::new`] would otherwise run on
+    /// every put, which wraps its target leaf once per call.
     ///
     /// # Errors
     ///
@@ -431,13 +444,18 @@ impl<'a> LeafMut<'a> {
     }
 
     /// Binary-search for `key` (see [`LeafRef::lookup`]).
+    ///
+    /// Every read is bounds-checked, unlike [`LeafRef::lookup`]:
+    /// [`LeafMut::from_valid`] does not walk the cells. On a page with a cell
+    /// that does not decode the result is meaningless, but nothing outside
+    /// the buffer is read.
     pub fn lookup(&self, key: &[u8]) -> Result<usize, usize> {
-        leaf_lookup(self.buf, self.num_keys(), key, KeyCmp::Default)
+        leaf_lookup_checked(self.buf, self.num_keys(), key, KeyCmp::Default)
     }
 
     /// As [`Self::lookup`], under an explicit ordering.
     pub fn lookup_with(&self, key: &[u8], cmp: KeyCmp<'_>) -> Result<usize, usize> {
-        leaf_lookup(self.buf, self.num_keys(), key, cmp)
+        leaf_lookup_checked(self.buf, self.num_keys(), key, cmp)
     }
 
     /// Insert an inline value at sorted index `idx`.
@@ -480,10 +498,10 @@ impl<'a> LeafMut<'a> {
     /// Insert an inline cell whose value bytes are **reserved** rather than
     /// copied (`MDB_RESERVE`, SPEC 01 §S3 / SPEC 04 TXN-47): the cell header,
     /// key, and pad byte are written, but the `dsize`-byte value area keeps
-    /// whatever bytes the frame held (uninitialized-but-owned — the engine
-    /// must not zero it). Returns the **absolute** byte offset of the value
-    /// area within the page buffer; the caller re-borrows the frame to fill
-    /// it before the txn's next operation (TXN-47).
+    /// whatever bytes the frame held; the engine does not zero it. Returns
+    /// the absolute byte offset of the value area within the page buffer; the
+    /// caller re-borrows the frame to fill it before the txn's next operation
+    /// (TXN-47).
     ///
     /// # Errors
     ///
@@ -610,9 +628,8 @@ impl<'a> LeafMut<'a> {
     ///
     /// [`PageError::CellOutOfBounds`] (or another cell-shape error) if the
     /// cell at `idx` does not decode. [`LeafMut::from_valid`] runs only the
-    /// O(1) structural checks, so a caller that wraps a
-    /// page whose cells were never fully validated (the constructor is `pub`)
-    /// must get a typed error here, never a panic.
+    /// O(1) structural checks and is `pub`, so a caller can wrap a page whose
+    /// cells were never validated; it gets a typed error here, not a panic.
     pub fn remove(&mut self, idx: usize) -> Result<(), PageError> {
         let num_keys = self.num_keys();
         debug_assert!(idx < num_keys, "remove index out of range");
@@ -629,16 +646,18 @@ impl<'a> LeafMut<'a> {
     /// their relative heap order and the heap ends fully compacted), but each
     /// surviving cell moves at most once instead of once per removed cell.
     ///
-    /// A degenerate span (`start >= end`, or `end` past the key count) is a
-    /// debug assertion and a release no-op — nothing is half-removed.
+    /// An invalid span (`start >= end`, or `end` past the key count) fails a
+    /// debug assertion and does nothing in a release build.
     ///
     /// # Errors
     ///
     /// As [`remove`](LeafMut::remove), for any cell of the page that does not
-    /// decode; the page is unmodified in that case. A hostile-but-decodable
-    /// page (individually in-bounds cells that overlap) yields a typed error
-    /// or garbage content, exactly as repeated `remove` would — never a panic
-    /// or an out-of-bounds access.
+    /// decode, and [`PageError::CellOutOfBounds`] when the surviving cells
+    /// add up to more than the page body (cells that overlap); the page is
+    /// unmodified in both cases. A hostile page whose cells each lie in
+    /// bounds but overlap, and still fit the body, yields meaningless
+    /// content, as repeated `remove` would, with no panic and no
+    /// out-of-bounds access.
     pub fn remove_span(&mut self, start: usize, end: usize) -> Result<(), PageError> {
         let num_keys = self.num_keys();
         debug_assert!(start < end && end <= num_keys, "span out of range");
@@ -650,10 +669,24 @@ impl<'a> LeafMut<'a> {
         // a cell-shape error must surface with the page unmodified, and the
         // pointer slots are rewritten in place below.
         let mut cells: Vec<(usize, usize, usize)> = Vec::with_capacity(num_keys);
+        let mut survivors_len = 0usize;
         for i in 0..num_keys {
             let cpos = ptr_at(self.buf, i) as usize;
             let clen = leaf_cell_len(self.buf, HEADER_SIZE + cpos, self.psize)?;
+            if i < start || i >= end {
+                survivors_len += clen;
+            }
             cells.push((cpos, clen, i));
+        }
+        // On a hostile page whose cells overlap, the survivors can add up to
+        // more than the body. Refuse before the first move, so the error
+        // leaves the page as it was.
+        if survivors_len > body {
+            return Err(PageError::CellOutOfBounds {
+                offset: self.upper() as usize,
+                needed: survivors_len,
+                body_size: body,
+            });
         }
         // The heap tiles `[upper, body)`, so sweeping the survivors in
         // descending `cpos` order re-tiles them from `body` downward with
@@ -666,15 +699,9 @@ impl<'a> LeafMut<'a> {
             if idx >= start && idx < end {
                 continue; // removed: its bytes are dead
             }
-            // Checked: on a hostile page whose cells overlap, the survivor
-            // total can exceed the body.
-            write_pos = write_pos
-                .checked_sub(clen)
-                .ok_or(PageError::CellOutOfBounds {
-                    offset: cpos,
-                    needed: clen,
-                    body_size: body,
-                })?;
+            // Cannot underflow: the survivors' total was checked against
+            // the body above.
+            write_pos -= clen;
             if write_pos != cpos {
                 self.buf.copy_within(
                     HEADER_SIZE + cpos..HEADER_SIZE + cpos + clen,
@@ -802,6 +829,7 @@ impl<'a> BranchRef<'a> {
     /// As [`LeafRef::new`], but for branch cells (index 0 may have an empty
     /// separator key).
     pub fn new(buf: &'a [u8], psize: u32) -> Result<BranchRef<'a>, PageError> {
+        check_page_buffer(buf, psize)?;
         let view = Self::new_prevalidated(buf, psize)?;
         for i in 0..view.num_keys() {
             let rel = ptr_at(buf, i) as usize;
@@ -811,10 +839,8 @@ impl<'a> BranchRef<'a> {
         Ok(view)
     }
 
-    /// [`BranchRef::new`] minus the per-cell loop — same contract as
-    /// [`LeafRef::new_prevalidated`]: only for bytes that already passed the
-    /// full constructor earlier in the same txn, behind
-    /// `btree::ValidatedPages`.
+    /// [`BranchRef::new`] without the per-cell loop, under the same contract
+    /// as [`LeafRef::new_prevalidated`].
     pub(crate) fn new_prevalidated(buf: &'a [u8], psize: u32) -> Result<BranchRef<'a>, PageError> {
         let flags = read_flags(buf);
         if page_type_of(flags)? != PageType::Branch {
@@ -825,22 +851,21 @@ impl<'a> BranchRef<'a> {
         }
         check_reserved_tail_fields(buf)?;
         let (lower, upper) = read_and_check_bounds(buf, psize)?;
-        // A well-formed branch always has >= 1 child (SPEC 02 §4.1, SPEC 03
-        // INV-8): rejecting `num_keys == 0` here keeps `child_pgno(0)` /
-        // `child_index` total for every constructed view (the descent loops
-        // dereference child 0 unconditionally). Engine-authored frames are
-        // never re-wrapped while transiently empty (fresh branches are built
-        // through `BranchMut::init` + `insert`), so this is a pure
-        // corruption check — O(1), safe on the prevalidated path.
+        // A well-formed branch has at least one child (SPEC 02 §4.1, SPEC 03
+        // INV-8). Rejecting `num_keys == 0` here makes `child_pgno(0)` and
+        // `child_index` valid on every constructed view; a descent reads
+        // child 0 unconditionally. The engine never wraps one of its own
+        // branches while it is empty (a new branch is filled through
+        // `BranchMut::init` and `insert`), so this rejects only corruption.
         if lower < 2 {
             return Err(PageError::EmptyBranch);
         }
         Ok(BranchRef { buf, lower, upper })
     }
 
-    /// [`new_prevalidated`](Self::new_prevalidated) minus every check — same
-    /// contract as [`LeafRef::new_trusted`], for a memo hit kind-tagged
-    /// **branch**.
+    /// [`new_prevalidated`](Self::new_prevalidated) without any check, under
+    /// the same contract as [`LeafRef::new_trusted`], for a page recorded as
+    /// a validated branch.
     pub(crate) fn new_trusted(buf: &'a [u8]) -> BranchRef<'a> {
         debug_assert!(matches!(
             page_type_of(CommonHeader::read(buf).flags),
@@ -940,10 +965,9 @@ pub struct BranchMut<'a> {
 impl<'a> BranchMut<'a> {
     /// Wrap an already-validated branch page for mutation.
     ///
-    /// Same contract as [`LeafMut::from_valid`]: callers only hand this
-    /// engine-authored dirty frames, so validation is the O(1) structural
-    /// checks (`BranchRef::new_prevalidated`), not a per-cell walk on every
-    /// parent-chain touch.
+    /// Same contract as [`LeafMut::from_valid`]: the engine passes only dirty
+    /// frames it wrote itself, so the checks are the O(1) structural ones of
+    /// `BranchRef::new_prevalidated`, not a per-cell walk.
     ///
     /// # Errors
     ///
@@ -1032,9 +1056,8 @@ impl<'a> BranchMut<'a> {
     ///
     /// # Errors
     ///
-    /// A cell-shape error if the cell at `idx` does not decode — same
-    /// rationale as [`LeafMut::remove`]: `from_valid` runs O(1) checks only,
-    /// so an unvalidated cell surfaces here as a typed error, not a panic.
+    /// A cell-shape error if the cell at `idx` does not decode, for the same
+    /// reason as in [`LeafMut::remove`].
     pub fn remove(&mut self, idx: usize) -> Result<(), PageError> {
         let num_keys = self.num_keys();
         debug_assert!(idx < num_keys, "remove index out of range");
@@ -1145,8 +1168,8 @@ fn remove_cell(
     // removed one (LMDB's `mdb_node_del` fix-up). One pass over the
     // pointer array as 2-byte arrays, so it carries no per-slot bounds
     // check. On a well-formed page the sum stays below the page size (at
-    // most 64 KiB); wrapping (as the u16 store always truncated) keeps a
-    // hostile page from panicking a debug build.
+    // most 64 KiB). The addition wraps so that a hostile page cannot panic
+    // a debug build.
     let (cpos16, clen16) = (cpos as u16, clen as u16);
     for slot in ptrs[..(num_keys - 1) * 2].as_chunks_mut::<2>().0 {
         let p = u16::from_le_bytes(*slot);
@@ -1189,6 +1212,38 @@ pub(crate) fn leaf_lookup(
             buf.get_unchecked(abs + LEAF_NODE_HEADER..abs + LEAF_NODE_HEADER + ksize)
         };
         match cmp.compare(mid_key, key) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => return Ok(mid),
+        }
+    }
+    Err(lo)
+}
+
+/// [`leaf_lookup`] with every read bounds-checked, for a buffer whose cells
+/// were not validated (a [`LeafMut`]). A pointer slot or cell that does not
+/// lie inside `buf` compares as the empty key, so the search still ends and
+/// reads nothing out of bounds; its result is then meaningless.
+fn leaf_lookup_checked(
+    buf: &[u8],
+    num_keys: usize,
+    key: &[u8],
+    cmp: KeyCmp<'_>,
+) -> Result<usize, usize> {
+    let u16_at = |off: usize| -> Option<usize> {
+        let bytes = buf.get(off..off.checked_add(2)?)?;
+        Some(u16::from_le_bytes([bytes[0], bytes[1]]) as usize)
+    };
+    let key_at = |i: usize| -> Option<&[u8]> {
+        let abs = HEADER_SIZE + u16_at(HEADER_SIZE + i * 2)?;
+        let start = abs + LEAF_NODE_HEADER;
+        buf.get(start..start + u16_at(abs + 2)?)
+    };
+    let mut lo = 0usize;
+    let mut hi = num_keys;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match cmp.compare(key_at(mid).unwrap_or(&[]), key) {
             std::cmp::Ordering::Less => lo = mid + 1,
             std::cmp::Ordering::Greater => hi = mid,
             std::cmp::Ordering::Equal => return Ok(mid),

@@ -1,5 +1,5 @@
 //! Iterators — `Ro{Iter,RevIter,Range,RevRange,Prefix,RevPrefix}` and their
-//! `Rw` mutating siblings (50; SPEC 03 §4/§7).
+//! `Rw` mutating siblings (SPEC 03 §4/§7).
 //!
 //! ## Read iterators (zero-copy, no `unsafe`)
 //!

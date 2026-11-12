@@ -120,7 +120,7 @@ fn txn49_frame_stability_across_index_growth() {
 
 /// Write-cursor referee: the stack-carrying write cursor against a
 /// `BTreeMap` model. Deterministic pseudo-random walks (forward and
-/// reverse, each opened by a random seek — the consumer envelope: no
+/// reverse, each opened by a random seek — as consumers walk: no
 /// mid-walk direction reversal) with mutations interleaved at yielded
 /// entries: `put_current` (resized values, so in-place *and*
 /// delete+reinsert *and* splits happen mid-walk), `del_current`, and
@@ -666,7 +666,7 @@ fn drain_all(db: &Database, txn: &mut RwTxn<'_>) -> Vec<Vec<u8>> {
 }
 
 /// Tree sizes are miri-scaled like proptest case counts: the shadow check
-/// re-descends per delete, which the interpreter pays ~1000x for.
+/// re-descends per delete, which is very slow under miri.
 fn miri_scaled(native: u32, miri: u32) -> u32 {
     if cfg!(miri) {
         miri
@@ -790,7 +790,7 @@ fn cursor_drain_interleaved_with_gets() {
     assert_eq!(db.len(&txn).unwrap(), 0);
 }
 
-/// The lever must actually fire: a front-to-back drain over a deep tree
+/// The path repair must actually run: a front-to-back drain over a deep tree
 /// performs structural deletes whose path is KEPT (repaired), not
 /// re-derived. Counted in debug builds only, where the shadow check also
 /// re-validates every kept path.
@@ -895,7 +895,7 @@ proptest::proptest! {
     /// model and the visited sequence was every key exactly once, in
     /// order. Small keys keep the tree shallow *and* mixed-`pki` (both
     /// repair and fallback paths fire); the wide-entry unit tests above
-    /// pin the deep-tree shapes. Sizes are miri-scaled like the case
+    /// cover the deep-tree shapes. Sizes are miri-scaled like the case
     /// count.
     #[test]
     fn cursor_partial_drain_matches_model(
@@ -1273,7 +1273,7 @@ fn delete_range_poisoned_txn_refuses() {
 /// Child-1 separator of the root branch. On a freshly split, delete-free
 /// tree it **equals** the second leaf's first key (SPEC 03 §11 INV-6:
 /// equality holds for freshly built/split branches), which makes it an
-/// exact leaf boundary for the shape pins below.
+/// exact leaf boundary for the shape tests below.
 fn root_separator_1(txn: &RwTxn<'_>) -> Vec<u8> {
     let rec = txn.main_db;
     let frame = txn
@@ -1292,7 +1292,7 @@ fn root_separator_1(txn: &RwTxn<'_>) -> Vec<u8> {
 /// two-leaf tree must therefore collapse it to one full leaf in that same
 /// call; the borrow arm would instead pull one (uncovered) entry across
 /// and leave both leaves standing. Point deletes keep the default
-/// neighbor policy (the gc_reclaim churn-flatness pin depends on it).
+/// neighbor policy.
 #[test]
 fn delete_range_merges_emptied_leaf_instead_of_borrowing() {
     let env = mem_env(PS, MAP);
@@ -1365,7 +1365,7 @@ proptest::proptest! {
     /// bound pairs anchored on existing keys: the leaf-granular
     /// `delete_range` must match the `BTreeMap` model on count,
     /// survivors, and stats. Small keys keep leaves wide; the wide-entry
-    /// unit tests above pin the many-leaf shapes. Sizes are miri-scaled
+    /// unit tests above cover the many-leaf shapes. Sizes are miri-scaled
     /// like the case count.
     #[test]
     fn delete_range_matches_model(
@@ -1379,8 +1379,8 @@ proptest::proptest! {
                 ),
                 // Overflow values (>= 2030 always overflows at 4 K for
                 // keys < 24 bytes): a (len, fill) pair, not a per-element
-                // vec — element-random 2.5 KB values would make this the
-                // miri long pole for no extra coverage.
+                // vec — element-random 2.5 KB values would dominate the
+                // miri run time for no extra coverage.
                 1 => proptest::prelude::Strategy::prop_map(
                     (
                         2030..if cfg!(miri) { 2060usize } else { 3300 },
@@ -1446,7 +1446,7 @@ fn finger_fires_on_append_and_seq_loads() {
         "load must build a branch level"
     );
     // Every put except the re-establishing descent after each split (and
-    // the very first) is a hit; >= n/2 is the loose, honest bound.
+    // the very first) is a hit; >= n/2 is a loose lower bound.
     assert!(
         txn.finger_hits >= u64::from(n) / 2,
         "APPEND load took the fast path only {} times of {n}",
@@ -1498,7 +1498,7 @@ fn finger_follows_the_sequential_writes_setting() {
     off.set_sequential_writes(&main, None);
     assert_eq!(load(&off, &main, n), 0, "None must restore the default");
 
-    // Named DBs, created inside the measured txn (a mem env cannot
+    // Named DBs, created inside the txn under test (a mem env cannot
     // commit); an aborted create keeps its dbi, so the override set
     // between txns applies when the next txn creates it again.
     let on = mem_env_sequential(PS, 8 << 20);
@@ -2019,7 +2019,7 @@ fn cursor_reserve_on_a_sequential_writes_tree() {
 /// in its own transaction types), so its size is a per-txn copy cost. Its
 /// lifetime-free per-txn state lives in the boxed [`WriterCarry`], and the
 /// validated-pages memo keeps its upper levels behind one box; this bound
-/// catches a field that grows the handle back.
+/// catches a field that grows the handle.
 #[test]
 fn rwtxn_stays_small_to_move() {
     use std::mem::size_of;
