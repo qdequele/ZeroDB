@@ -6,3 +6,4 @@ mod dup_pin_semantics;
 mod fork_bug_guard;
 mod lmdb_dbi_handle_observation;
 mod lmdb_free_run_observation;
+mod lmdb_unknown_flag_bits_observation;
