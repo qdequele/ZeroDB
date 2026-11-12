@@ -135,8 +135,9 @@ impl<'env> RwTxn<'env> {
     /// the old `free_db` root whose entry `F` lists that page as free and
     /// whose trees do not reference it (`F ≤ oldest_reader() ≤ N−1`, TXN-62).
     ///
-    /// **Allocation restriction (GC-12):** `alloc_mode = GcSave` for the
-    /// whole procedure — `allocate` never **reads** the GC tree; it draws
+    /// **Allocation restriction (GC-12):** `alloc_mode` is `GcSave`, then
+    /// `GcSaveExtend`, never `Normal` — `allocate` never **reads** the GC
+    /// tree; it draws
     /// loose pages, pages from the **already-loaded drain pool**
     /// ([`RwTxn::save_pool_draw`]), the carried annex pool, or extends. Every
     /// request is for one page: GC records are always inline (GC-5).
@@ -147,7 +148,8 @@ impl<'env> RwTxn<'env> {
     /// rewrite set, and the loop only exits when no rewrite is pending, so
     /// the final tree state never lists a handed-out page. After
     /// [`FREELIST_SAVE_DRAW_ROUNDS`] rounds `alloc_mode` becomes
-    /// `GcSaveExtend` and the pools are no longer drawn from (GC-13a).
+    /// `GcSaveExtend` and the pools are no longer drawn from, unless the
+    /// map is full (GC-13a).
     ///
     /// **Termination (GC-13):** each iteration that does not exit strictly
     /// shrinks a finite pool (a drain-pool or annex-pool draw), grows `freed`

@@ -133,7 +133,9 @@ budget is derived in GC-13.
   the `assert!` uses the budget `3·(P + D + A) + G + 64`, never
   below the old limit.
 - `alloc.rs`: a third allocation mode, `GcSaveExtend`, in which the save
-  takes loose pages or extends.
+  takes loose pages or extends. When the map is full it draws from the
+  pools as before, so that a save the pools can serve does not fail with
+  `MapFull`; that case ends by GC-13 and the budget alone.
 - Tests: `just save-no-draw`, also a CI job, builds with the threshold at 0
   and at 1 (`--cfg zerodb_save_draw_rounds`) and runs the tests of
   `zerodb-core` and `zerodb` and 200 crash cycles. The tests check contents
@@ -142,7 +144,8 @@ budget is derived in GC-13.
   they assert a file size and page numbers that hold only when the save
   reuses pool pages: `over_cap_freed_set_spills_whole_to_gc_tree` and
   `delete_rebalance_logical_images_match_golden`. At the default threshold
-  no test reaches the degraded mode.
+  no test reaches the degraded mode. `save_at_map_limit.rs` covers the full
+  map: it fails in that run if the save does not fall back to the pools.
 - SPEC 05: GC-12, GC-13 (the budget) and the new GC-13a.
 - No format change. Files written by either version are read by the other.
 - The differential oracle is unaffected: page reclamation is not observable
