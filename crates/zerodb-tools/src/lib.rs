@@ -62,7 +62,6 @@ const DEFAULT_MAP_SIZE: u64 = 256 << 20;
 /// Parse `argv` (excluding the program name) and run the selected subcommand.
 /// Returns the process exit code: `0` success, `1` = `check` found violations,
 /// `2` = usage/other error.
-#[must_use]
 pub fn run(args: &[String]) -> ExitCode {
     match dispatch(args) {
         Ok(code) => code,
