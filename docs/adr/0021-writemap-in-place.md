@@ -1,6 +1,6 @@
 # ADR-0021: True in-place WRITE_MAP — dirty pages live in the map, no heap staging, no commit write-back
 
-- Status: **Accepted (2026-10-02, maintainer) — spike first**. Opt-in behind `WRITE_MAP`; default (heap-staged) path unchanged. Implementation via `critical-implementer`, full gate (loom for commit/meta ordering, crash, stress) + the adapter borrow audit; never merged without a green gate + spec-review. (Was: Draft, gated on the spike numbers below and human approval — rule 6: write-path + concurrency + unsafe.)
+- Status: **Accepted (2026-10-02, maintainer) — spike first**. Opt-in behind `WRITE_MAP`; default (heap-staged) path unchanged. Implementation under the full gate (loom for commit/meta ordering, crash, stress) + the adapter borrow audit; never merged without a green gate and a spec review. (Was: Draft, gated on the spike numbers below and human approval — rule 6: write-path + concurrency + unsafe.)
 - Implementation note (2026-10-05): spike plus the production hardening pass below merged as PR #88 (8b066a6, 2026-10-05; the PR title still read "DRAFT, do not merge"). In-place is now what `WRITE_MAP` does. Ranged msync (issue #45) is ADR-0026. Still open: the open questions at the end.
 - Milestone: Phase 3 (performance), PERF-GAP B5 / issue #13; supersedes ADR-0017 (spilling) **for WRITE_MAP envs only**
 - Date: 2026-10-01
@@ -150,9 +150,8 @@ publish-validated-pages-at-commit. Those need no ADR and no unsafe.)
 
 ## Spike result & adversarial review (2026-10-02)
 
-A spike was implemented behind `WRITE_MAP` (commit d7f7d52, branch
-`worktree-agent-a053adc0a6f95dd7a`, **not merged**) and reviewed by
-`spec-reviewer`.
+A spike was implemented behind `WRITE_MAP` (commit d7f7d52, on a branch that was **not merged**) and reviewed
+against the SPEC.
 
 **Design verdict: sound.** The reviewer traced abort ("don't advance the meta";
 aborted in-place pages are unreferenced, reclaimed later), nested read txns
@@ -175,7 +174,7 @@ the headline referee (owed).
   (`clippy::mut_from_ref` suppressed). Safe code could call twice and alias →
   UB mintable from safe code. Fix: make them `unsafe fn` — which moves the
   `unsafe` call into `zerodb-core::dirty`, a home the unsafe policy does NOT
-  currently sanction, so **AGENTS.md must be amended (human decision)** — OR
+  currently sanction, so **CONTRIBUTING.md must be amended (human decision)** — OR
   redesign the broker to hand out an exclusivity token tied to `&mut`.
 - **B2 (SAFETY-argument gap, BLOCKER):** the writer's own later read of a
   *spilled* in-place page goes through the stale whole-map `&[u8]` taken at txn
@@ -201,11 +200,11 @@ the headline referee (owed).
 - **m1:** amend TXN-71's "map bytes change only on a later spill" (false in-place)
   and the §6.1/C5a "every frame C2 wrote" wording.
 
-Next step per the ADR: the production pass under `critical-implementer`, gated
+Next step per the ADR: the production pass, gated
 on the above, **after** the human calls B1 (unsafe-policy amendment vs typed
 token). The spike branch stays unmerged as the reference.
 
-## Production hardening pass (2026-10-02, critical-implementer; B1 called as unsafe-policy amendment)
+## Production hardening pass (2026-10-02; B1 called as unsafe-policy amendment)
 
 - **B1** — `MmapWritable::slice_mut` and `Backing::map_dirty_page` are
   `unsafe fn`; the one sanctioned `unsafe` call lives in

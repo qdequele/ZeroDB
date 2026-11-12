@@ -25,7 +25,7 @@ That setup has three problems:
 
 Measuring the other engines needs their crates — `rocksdb`, `fjall`, `redb`,
 `rusqlite` — plus `heed` for LMDB. None is on the dependency allowlist
-(AGENTS.md), and `rocksdb` and `rusqlite` build large C/C++ libraries.
+(CONTRIBUTING.md), and `rocksdb` and `rusqlite` build large C/C++ libraries.
 
 ## Options
 

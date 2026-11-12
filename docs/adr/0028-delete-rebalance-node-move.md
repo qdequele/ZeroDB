@@ -1,7 +1,7 @@
 # ADR-0028: Delete rebalance moves cells page to page, as LMDB
 
 - Status: **Accepted (Option A, maintainer, 2026-10-18), implemented**.
-  Correctness-critical B+tree change (AGENTS.md rule 5); the spike's profile
+  Correctness-critical B+tree change (CONTRIBUTING.md rule 5); the spike's profile
   ran first (rule 6). Open questions answered under "Resolution" below.
 - Related issue: none yet. Background: the delete-rebalance entry in
   [`docs/PERFORMANCE.md`](../PERFORMANCE.md) ("What remains"), and
@@ -153,7 +153,7 @@ move:
    no allocation, no new `unsafe`, no `DirtyStore` API change, and identical
    in heap and `WRITE_MAP` modes. (A disjoint two-frame `&mut` borrow from the
    dirty store would skip that copy but needs new `unsafe` under `WRITE_MAP`
-   and an amendment to the AGENTS.md exception, which allows one live `&mut`
+   and an amendment to the CONTRIBUTING.md exception, which allows one live `&mut`
    per map region; not proposed. Revisit only if a profile shows the scratch
    copy.)
 3. **In-place separator rewrite.** A branch-page primitive replaces the key of
@@ -283,7 +283,7 @@ Must stay green unmodified: `write_rebalance_differential`,
 `delete_range_leafwise`, `gc_churn_parity`, `stat_differential`, `gc_reclaim`,
 `writemap_in_place`, `dump_load_roundtrip`, `copy_to_file_differential`,
 `hostile_input`, `heed_adapter_differential`, `write_proptest`; and the
-AGENTS.md checks: fmt, clippy (also for `x86_64-unknown-linux-gnu`), test,
+CONTRIBUTING.md checks: fmt, clippy (also for `x86_64-unknown-linux-gnu`), test,
 miri on `zerodb-core`, `just fuzz-quick`, `just crash-test-quick`, and
 `just stress` before the integration gate. `just loom` is not affected (no
 reader-table or nested-txn change).

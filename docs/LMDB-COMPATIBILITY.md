@@ -182,6 +182,9 @@ Everything they call is **Same** or a supported LMDB feature. This was checked
 on Meilisearch v1.53.1, Meilisearch v1.55.0 (through the `unique-txns` shim)
 and hannoy v0.1.7-nested-rtxns, by running their test suites on the shim with
 no source changes ([maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md)).
+Meilisearch v1.55.0 needs manifest changes ([USING.md](USING.md#as-a-heed-replacement)).
+The suites are run by hand, not in CI: the last recorded passes are 2026-10-18
+for Meilisearch v1.55.0 and 2026-09-09 for Meilisearch v1.53.1 and hannoy.
 None of the differences below is reached by either consumer.
 
 ## Behavior differences
@@ -214,7 +217,7 @@ difference. Details live in the linked ADR or SPEC section.
 | <a id="d-019"></a>D-019 | Page validation | Never validated; a corrupt page is undefined behavior. | Trusts page cells by default, as LMDB does (ADR-0034), but keeps page-number bounds checks, so reads never leave the map. The opt-in `FileTrust::VALIDATE` checks every page, so corruption is a typed error (ADR-0014). The native `zerodb::EnvOpenOptions::open` is `unsafe`, like heed's. | Approved |
 | <a id="d-020"></a>D-020 | Sequential-writes fast path | Every put descends from the root. | Opt-in, with a per-database override: a key that sorts last is appended at a remembered rightmost leaf. Results and files are identical (ADR-0015). | Approved |
 | <a id="d-021"></a>D-021 | Dirty-page limit | A compile-time constant (131,072 pages). | Same default, plus the opt-in `max_dirty_bytes`. Results and files never depend on it (ADR-0017). | Approved |
-| <a id="d-022"></a>D-022 | Freed-page list placement | Every commit's freed list goes into the free-page B-tree. | Each commit's freed list rides in its meta page; the tree is used only for overflow and lists carried for readers. Format version 2; results are identical (ADR-0022). | Approved |
+| <a id="d-022"></a>D-022 | Freed-page list placement | Every commit's freed list goes into the free-page B-tree. | Each commit's freed list rides in its meta page; the tree is used only for overflow and lists carried for readers. Introduced in format version 2 (the current version is 3, ADR-0037); results are identical (ADR-0022). | Approved |
 | <a id="d-023"></a>D-023 | `resize` while another process writes | `mdb_env_set_mapsize` takes no lock and returns at once, also on a read-only env. | In a lock-file env it waits for the cross-process writer lock, as a write begin does, so every cached snapshot stays inside the new size. This includes a `READ_ONLY` env. A live write txn of the same env still gets `EINVAL` (ADR-0023). | Approved |
 | <a id="d-024"></a>D-024 | Data-file length of a `WRITE_MAP` process that joins a running env | The joiner truncates the file to its own map size at open, up or down; shrinking leaves the holder's mapping past the end of the file. | The joiner never resizes the file at open; it grows the file to its map size at its first write-txn begin, under both writer locks. The file only ever grows. Contents and results are identical (ADR-0023). | Approved |
 | <a id="d-025"></a>D-025 | Two `PREV_SNAPSHOT` cases | (a) If the opener ends before its first commit, a waiting process reads the older meta (or fails with `EINVAL` on macOS after a clean close). (b) A read-only `PREV_SNAPSHOT` open is not refused while another process holds the env, and rolls every process back to the older meta. | (a) A waiting process re-initializes the lock file and serves the newest meta. (b) A read-only `PREV_SNAPSHOT` joiner fails with `EAGAIN` and the running env is untouched, because matching LMDB would let a writer reuse pages that newer readers still read. | Approved |

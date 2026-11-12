@@ -5,13 +5,27 @@ There are two ways to use ZeroDB:
 - **The native API, crate `zerodb`.** It is heed-shaped and works on byte
   slices. Use it for new code.
 - **The heed drop-in.** A consumer that already uses `heed` 0.22 switches
-  engines with one `[patch]` line and no code changes. Meilisearch and hannoy
-  run this way.
+  engines with one `[patch]` line and no source changes. Meilisearch and
+  hannoy run this way; Meilisearch 1.55 and later needs two more manifest
+  edits, described [below](#as-a-heed-replacement).
 
 The defaults match LMDB. Every option below that trades safety for speed is
 opt-in on purpose, and each section states what it costs next to what it gains.
 
 ## Getting started
+
+<!-- BEGIN main-vs-release note: delete this block at the next release. -->
+> **This page describes `main`, which is ahead of the 0.2.0 release.** The
+> `0.2` crates and the `v0.2.0` tag used in the install lines below differ
+> from it: in 0.2.0 `open` is a safe `fn`, pages are validated by default, an
+> environment belongs to one process (there is no lock file and no
+> `Env::resize`, so [Multiple processes](#multiple-processes) does not
+> apply), the on-disk format version is 2 where `main` writes 3, and
+> the `unique-txns` feature does not exist. To build against `main`, replace
+> `"0.2"` with `{ git = "https://github.com/qdequele/ZeroDB", rev = "<commit>" }`
+> and `tag = "v0.2.0"` with `rev = "<commit>"`, where `<commit>` is a commit
+> of `main`. The [README](../README.md) has the same list as a table.
+<!-- END main-vs-release note -->
 
 ### Native API
 
@@ -222,6 +236,6 @@ records the build setting its run used.
 - [LMDB-COMPATIBILITY.md](LMDB-COMPATIBILITY.md): every heed item and LMDB
   feature, with its status.
 - [TOOLS.md](TOOLS.md): `zerodb-tools` (`stat`, `check`, `dump`, `load`,
-  `copy`, `migrate-from-lmdb`).
+  `migrate-from-lmdb`).
 - [PERFORMANCE.md](PERFORMANCE.md): how ZeroDB compares with LMDB, and why.
 - [ARCHITECTURE.md](ARCHITECTURE.md): how the engine works.

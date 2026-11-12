@@ -3,7 +3,7 @@
 - Status: **Accepted (Option B, aarch64 only, maintainer, 2026-10-19),
   implemented; Option D added to the hardware path on 2026-11-02 (see the
   amendment), awaiting maintainer review.** It amends the `unsafe` policy
-  in `AGENTS.md`. Drafted as ADR-0029 and renumbered on 2026-10-20, when
+  in `CONTRIBUTING.md`. Drafted as ADR-0029 and renumbered on 2026-10-20, when
   the branch was rebased on `main`, where 0029 is the free-page run search.
 - Related: #117 (the slicing-by-8 table, the software path on `main`);
   the 2026-10-19 benchmark runs (slicing table, hardware CRC, Graviton4); ADR-0002 §D1; ADR-0022.
@@ -61,7 +61,7 @@ feature, as on macOS) is what makes it run there.
 
 `zerodb-core` is `#![deny(unsafe_code)]`, with narrow `#[allow(unsafe_code)]`
 on each sanctioned site (`lib.rs` lists them). The `unsafe` policy in
-`AGENTS.md` lists `zerodb-core::page` for mmap access and page casting only.
+`CONTRIBUTING.md` lists `zerodb-core::page` for mmap access and page casting only.
 CPU intrinsics are not on the list, hence this ADR.
 
 ### Spike (Apple M-series, macOS, scratch code, not merged)
@@ -130,7 +130,7 @@ fn crc_update(crc: u32, bytes: &[u8]) -> u32 {
   Its only obligation is "the CPU has `crc`", discharged by the line above it.
   There is no pointer, aliasing or memory-ordering reasoning. Loads go through
   `as_chunks::<8>()` and `u64::from_le_bytes`, so there are no unaligned
-  casts (AGENTS.md's `read_unaligned` rule does not even come into play).
+  casts (CONTRIBUTING.md's `read_unaligned` rule does not even come into play).
 - **Fallback:** the slicing-by-8 table stays. It serves aarch64 CPUs without
   the feature, every other architecture, and miri (which cannot execute the
   intrinsic, so `not(miri)` routes it to the table).
@@ -152,7 +152,7 @@ fn crc_update(crc: u32, bytes: &[u8]) -> u32 {
 
 Same structure behind `is_x86_feature_detected!("sse4.2")`. Gives development
 machines and x86 CI the same speed. Costs a second `unsafe` site and a second
-intrinsic family. x86-64 is a development platform here (AGENTS.md "Target
+intrinsic family. x86-64 is a development platform here (CONTRIBUTING.md "Target
 platforms"), and this spike could not measure it (no x86 host at hand). It
 can be added later under the same rule if wanted.
 
@@ -182,7 +182,7 @@ oracle. C and D can follow under the same rule if numbers ask for them.
 
 If Option B is approved:
 
-- **`AGENTS.md`, `unsafe` policy:** add an entry, for example: "the CRC32C
+- **`CONTRIBUTING.md`, `unsafe` policy:** add an entry, for example: "the CRC32C
   hardware path in `zerodb-core::page::crc32c` (ADR-0031): one call of the
   `#[target_feature(enable = "crc")]` checksum function, guarded by runtime
   detection of that CPU feature". Update the sanctioned-sites comment in

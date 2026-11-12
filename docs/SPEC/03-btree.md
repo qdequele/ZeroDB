@@ -79,7 +79,12 @@ oldest-reader gate depends on that.
   bounds) are evaluated in byte order and a custom-comparator
   database legitimately reports violations of exactly those two. Every other
   invariant — page typing, reachability, depth uniformity, counter accuracy,
-  GC structure — is ordering-independent and must still pass.
+  GC structure — is ordering-independent and must still pass. A caller that
+  holds the comparators can pass each named database's key order to
+  `check_image_with_key_order` / `check_snapshot_with_key_order`: INV-5 and
+  INV-6 are then evaluated under that order, or skipped for a database whose
+  order the caller declares unknown. The main database and the free-page tree
+  are always byte-ordered.
 - **The comparator is not persisted.** See §2.0.1.
 
 ### §2.0.1 — Non-persistence hazard (D-014)

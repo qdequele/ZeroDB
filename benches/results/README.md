@@ -1,10 +1,11 @@
 # Benchmark results
 
-The benchmark reports are being re-run on a quiet AWS Graviton4 host and will
-be published here, one Markdown file per run: the machine, the build, the
-commands and the raw numbers. Ratios are **ZeroDB time ÷ LMDB time**, so below
-1.00 means ZeroDB is faster. [docs/PERFORMANCE.md](../../docs/PERFORMANCE.md)
-explains the method and summarizes the results.
+One Markdown file per run: the machine, the build, the commands and the raw
+numbers. Ratios are **ZeroDB time ÷ LMDB time**, so below 1.00 means ZeroDB is
+faster. [docs/PERFORMANCE.md](../../docs/PERFORMANCE.md) explains the method
+and summarizes the results. The current reference run is
+[2026-11-12-ladder-meilisearch-graviton-gp3.md](2026-11-12-ladder-meilisearch-graviton-gp3.md):
+the whole ladder and Meilisearch on Graviton4 with EBS gp3.
 
 Earlier reports from the development history were removed from the tree; they
 are still in git history (for example at commit `e0fd466`).
