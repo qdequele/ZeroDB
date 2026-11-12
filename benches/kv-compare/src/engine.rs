@@ -23,6 +23,12 @@ pub struct Config {
     pub connections: usize,
     /// Map size for the memory-mapped engines (LMDB, ZeroDB).
     pub map_bytes: usize,
+    /// Database page size in bytes, for ZeroDB only: LMDB always uses the OS
+    /// page size. `None` keeps the engine's default.
+    pub page_size: Option<u32>,
+    /// Leave the kernel's read-ahead on for the memory-mapped engines (LMDB,
+    /// ZeroDB). Off, they open with `NO_READ_AHEAD`.
+    pub read_ahead: bool,
 }
 
 /// A store under test. Shared by all worker threads of a phase.
@@ -35,10 +41,19 @@ pub trait Engine: Send + Sync {
     fn sync(&self);
 }
 
+/// Read every byte of a value an engine returned as a borrowed slice, and
+/// return its length. A memory-mapped engine hands out a pointer into the
+/// file; until the bytes are read, a value stored outside the leaf page has
+/// cost no disk read, while an engine that copies the value has paid for it.
+fn touch(value: &[u8]) -> usize {
+    std::hint::black_box(value.iter().fold(0u8, |acc, b| acc ^ b));
+    value.len()
+}
+
 /// Reads made from one thread. Each call is its own read transaction or
 /// snapshot, the way a server answers independent requests.
 pub trait Reader {
-    /// Value length for `key`, if present.
+    /// Read the value of `key` in full; returns its length, if present.
     fn get(&mut self, key: &[u8]) -> Option<usize>;
     /// Read up to `n` entries in key order starting at `start`; returns the
     /// total value bytes read.
@@ -98,9 +113,15 @@ macro_rules! heed_engine {
                     let mut opts = EnvOpenOptions::new().read_txn_without_tls();
                     opts.map_size(cfg.map_bytes);
                     heed_engine!(@trust opts, validating, $trust);
+                    heed_engine!(@page opts, cfg, $trust);
                     // NO_READ_AHEAD: LMDB's advice for random reads on data
-                    // larger than memory; set for both engines.
-                    let mut flags = EnvFlags::NO_READ_AHEAD;
+                    // larger than memory; set for both engines unless the
+                    // run asks for read-ahead.
+                    let mut flags = if cfg.read_ahead {
+                        EnvFlags::empty()
+                    } else {
+                        EnvFlags::NO_READ_AHEAD
+                    };
                     if !cfg.durable {
                         flags |= EnvFlags::NO_SYNC;
                     }
@@ -148,14 +169,14 @@ macro_rules! heed_engine {
             impl Reader for HeedReader<'_> {
                 fn get(&mut self, key: &[u8]) -> Option<usize> {
                     let r = self.env.read_txn().expect("read_txn");
-                    self.db.get(&r, key).expect("get").map(<[u8]>::len)
+                    self.db.get(&r, key).expect("get").map(super::touch)
                 }
 
                 fn range(&mut self, start: &[u8], n: usize) -> usize {
                     let r = self.env.read_txn().expect("read_txn");
                     let bounds = (Bound::Included(start), Bound::Unbounded);
                     let it = self.db.range(&r, &bounds).expect("range");
-                    it.take(n).map(|e| e.expect("entry").1.len()).sum()
+                    it.take(n).map(|e| super::touch(e.expect("entry").1)).sum()
                 }
             }
         }
@@ -166,6 +187,14 @@ macro_rules! heed_engine {
     (@trust $opts:ident, $validating:ident, yes) => {
         if $validating {
             $opts.file_trust(heed_zerodb::FileTrust::VALIDATE);
+        }
+    };
+    (@page $opts:ident, $cfg:ident, no) => {
+        assert!($cfg.page_size.is_none(), "the page size is a ZeroDB option");
+    };
+    (@page $opts:ident, $cfg:ident, yes) => {
+        if let Some(size) = $cfg.page_size {
+            $opts.page_size(size);
         }
     };
 }
