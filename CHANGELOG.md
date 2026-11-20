@@ -15,6 +15,15 @@ the release workflow publishes the section matching the tag as the GitHub releas
   every acknowledged commit of a durable mode is present and no later commit
   is partly visible. Linux and root only; a CI job runs it nightly and on pull
   requests that touch it.
+- **Hardening runners**: `just soak` runs the fuzz targets,
+  the crash harness and the stress tests side by side for 24 hours and
+  collects sequence counts and findings; `just page-size-matrix` runs the
+  suite, the crash harness at DB pages of 4, 16 and 64 KiB, the stress tests
+  and the fuzz gate on the host's kernel, for a 64 KiB-page aarch64 machine.
+  `docs/maintainers/HARDENING-RUNS.md` says which machines to use. The crash
+  harness takes `ZERODB_CRASH_PAGE_SIZE` to pin every cycle's page size, and
+  `crates/zerodb/tests/os_page_size.rs` exercises the OS-page-rounding paths
+  at each DB page size. Neither long run has been recorded yet.
 - **Multi-process access** (ADR-0023). Several processes can open one
   environment and read or write it, as with LMDB. A lock file is created next
   to the data file by default: `lock.mdb` through heed, `zerodb.lock`
@@ -49,6 +58,12 @@ the release workflow publishes the section matching the tag as the GitHub releas
 - `zerodb-core`: `Cursor::advance_by` and `Cursor::retreat_by`.
 - New error variant `MdbError::BadDbi`.
 - A runnable example, `cargo run -p zerodb --example basic`.
+- **`zerodb-tools upgrade <old-env-dir> <new-env-dir>`** copies a format 2
+  environment (0.2.0) into a fresh current-format one, keeping its data-file
+  name and page size, and checks entry counts and invariants. `dump` also reads
+  format 2 files, producing the dump the 0.2.0 tools did.
+- `zerodb_core::page::MetaPage::validate_version`: SPEC 02 §3.2's meta-slot
+  check against a given format version, for tools that read an older file.
 - `zerodb::EnvFlags::from_bits_truncate`.
 - `zerodb_core::check::check_image_with_key_order` and
   `check_snapshot_with_key_order`: a caller that holds a database's custom
@@ -71,8 +86,8 @@ the release workflow publishes the section matching the tag as the GitHub releas
   the low end of each record's page range, instead of one record on a long
   overflow run. A later commit that draws pages from that list reads and
   rewrites only the records it draws from, not the whole list. Format-2
-  files are refused at open: migrate with `zerodb-tools dump` built from the
-  previous release, then `load`. `zerodb-tools stat` reports the free-page
+  files are refused at open: migrate with `zerodb-tools upgrade <old-env>
+  <new-env>` from this release, one command and one tool version. `zerodb-tools stat` reports the free-page
   records, and `check` verifies their bound and ranges (INV-29).
 - **The heed adapter is the `[patch]` target itself.** `crates/heed-zerodb`'s
   package is now named `heed` (version 0.22.1), and the `crates/heed-shim` and

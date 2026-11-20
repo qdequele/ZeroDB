@@ -20,7 +20,7 @@ build Meilisearch ships and compare the results.
 > | `EnvOpenOptions::open` (native API) | a safe `fn` | an `unsafe fn`, with heed's contract |
 > | Pages read from the file | validated by default; trusting them is opt-in | trusted by default, as in LMDB; `FileTrust::VALIDATE` is opt-in |
 > | Processes per environment | one (no lock file) | several (lock file on by default) |
-> | On-disk format version | 2 | 3; a version 2 file is refused at open, so dump it with the 0.2.0 `zerodb-tools` and `load` it |
+> | On-disk format version | 2 | 3; a version 2 file is refused at open: `zerodb-tools upgrade <old> <new>` converts it |
 > | `unique-txns` feature (Meilisearch 1.55) | absent | present |
 > | `Env::resize` | absent | present |
 >

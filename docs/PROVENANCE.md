@@ -109,14 +109,26 @@ plainly as the strengths.
   Read-only environments and multi-process behavior are covered by
   hand-written scenarios only, not by generated sequences. Concurrent readers
   and writers are stress-tested on ZeroDB alone, not compared with LMDB.
-- **4 KiB-page kernels only, on Linux.** CI runs on GitHub's x86-64 and
-  aarch64 Linux runners, which use 4 KiB OS pages. ZeroDB has not been run on
-  a 64 KiB-page kernel. macOS on Apple silicon (16 KiB pages) runs the tests
-  and the crash smoke in CI, but not the fuzz, miri, loom or nightly runs.
+- **No 64 KiB-page kernel.** CI runs on GitHub's x86-64 and aarch64 Linux
+  runners, which use 4 KiB OS pages. ZeroDB has not been run on a 64 KiB-page
+  kernel. macOS on Apple silicon (16 KiB pages) runs the tests and the crash
+  smoke in CI, but not the fuzz, miri, loom or nightly runs.
+  The one fuller run on a larger OS page is a page-size matrix on a 16 KiB-page
+  macOS host (Apple silicon) on 2026-11-20, recorded in
+  [hardening-runs/](hardening-runs/2026-11-20-macos-arm64-16k-page-size-matrix.md):
+  the test suite, 6,793 crash cycles across DB pages of 4, 16 and 64 KiB,
+  the stress tests and three of the four fuzz jobs passed; the fourth stopped
+  at libFuzzer's memory limit from sanitizer growth, not an engine fault (the
+  record explains). DB pages of 4 KiB there are smaller
+  than the OS page, the case a 64 KiB kernel reaches with 4 and 16 KiB DB
+  pages, but on Darwin's virtual memory system, not Linux's.
+  [maintainers/HARDENING-RUNS.md](maintainers/HARDENING-RUNS.md) has the
+  runner (`just page-size-matrix`) and the machine to use.
 - **No Windows support.** The crates do not build on Windows (a
   `compile_error!`); ADR-0046 is a draft. LMDB's behavior on Windows has not
   been observed by the oracle.
 - **No 24-hour fuzz soak.** The longest scheduled fuzz run is the nightly one.
+  The runner exists (`just soak`, same page); no 24-hour run is recorded.
 - **Consumers newer than the pins.** Meilisearch v1.56 and later, and
   hannoy v0.3.0, depend on heed 0.23, which the adapter does not provide; on
   them the `[patch]` is ignored and the build keeps C LMDB. The consumer
