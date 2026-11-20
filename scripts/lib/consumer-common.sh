@@ -27,7 +27,8 @@ report_versions() {
     log "versions under test"
     note "- ZeroDB \`$zerodb_rev\`$dirty"
     note "- $1 \`$2\` (\`$(git -C "$CLONE" rev-parse HEAD)\`)"
-    note "- \`$(rustc --version)\`"
+    # From inside the clone, so a consumer's rust-toolchain.toml is honoured.
+    note "- \`$(cd "$CLONE" && rustc --version)\`"
 }
 
 # run_tests ARGS...: `cargo test ARGS` in the clone, with the output kept in

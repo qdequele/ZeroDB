@@ -106,14 +106,17 @@ A runnable version is in [`crates/zerodb/examples/basic.rs`](crates/zerodb/examp
 
 ZeroDB matches LMDB for the heed surface Meilisearch and hannoy use. Both
 build on it with no source changes. Meilisearch v1.53.1 needs one `[patch]`
-line; Meilisearch v1.55 and later also needs the `unique-txns` feature and a
-second `[patch]` table ([docs/USING.md](docs/USING.md#as-a-heed-replacement)).
-hannoy is tested at its `v0.1.7-nested-rtxns` tag.
+line; Meilisearch v1.55 also needs the `unique-txns` feature and a second
+`[patch]` table ([docs/USING.md](docs/USING.md#as-a-heed-replacement)).
+Meilisearch v1.56 and later depend on heed 0.23, which ZeroDB does not
+provide yet. hannoy is tested at v0.2.0, the release Meilisearch v1.55 uses.
 
-The consumer test suites are run by hand, not in CI. The last recorded passes
-are Meilisearch v1.55.0's milli and index-scheduler suites on 2026-10-18, and
-Meilisearch v1.53.1's and hannoy's suites on 2026-09-09. They were not re-run
-for the 0.2.0 release, and no later run is recorded.
+CI runs the consumer suites nightly
+([CONSUMER-GATE.md](docs/maintainers/CONSUMER-GATE.md)). The last recorded
+run, on 2026-11-20 on `main` at `c7e1abf` (macOS, aarch64), passed:
+Meilisearch v1.55.1's milli and index-scheduler suites (448 passed, 0
+failed, 4 ignored) and hannoy v0.2.0's suite (59 passed, 0 failed, 1
+ignored), with no C LMDB in either build.
 
 ZeroDB is not yet production-hardened: the 24-hour fuzz soak and a run on a
 64 KiB-page kernel are still open. [Provenance](#provenance) lists what has

@@ -178,13 +178,16 @@ orders are available through `key_comparator` instead.
 
 ## What Meilisearch and hannoy use
 
-Everything they call is **Same** or a supported LMDB feature. This was checked
-on Meilisearch v1.53.1, Meilisearch v1.55.0 (through the `unique-txns` shim)
-and hannoy v0.1.7-nested-rtxns, by running their test suites on the shim with
-no source changes ([maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md)).
-Meilisearch v1.55.0 needs manifest changes ([USING.md](USING.md#as-a-heed-replacement)).
-The suites are run by hand, not in CI: the last recorded passes are 2026-10-18
-for Meilisearch v1.55.0 and 2026-09-09 for Meilisearch v1.53.1 and hannoy.
+Everything they call is **Same** or a supported LMDB feature. This is checked
+by running their test suites on the shim with no source changes, nightly in CI
+([maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md)), on Meilisearch
+v1.55.1 (through the `unique-txns` shim, with manifest changes:
+[USING.md](USING.md#as-a-heed-replacement)) and hannoy v0.2.0. Earlier passes
+cover Meilisearch v1.53.1 and hannoy v0.1.7-nested-rtxns (2026-09-09). The
+last recorded run, 2026-11-20 on `main` at `c7e1abf`: Meilisearch v1.55.1's
+milli and index-scheduler suites, 448 passed, 0 failed, 4 ignored; hannoy
+v0.2.0, 59 passed, 0 failed, 1 ignored. Meilisearch v1.56 and later, and
+hannoy v0.3.0, use heed 0.23, which the adapter does not provide.
 None of the differences below is reached by either consumer.
 
 ## Behavior differences
