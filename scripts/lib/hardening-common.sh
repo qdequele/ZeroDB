@@ -11,6 +11,17 @@ cpu_count() { getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu; }
 
 os_page_size() { getconf PAGESIZE; }
 
+# fs_type DIR: the filesystem DIR is on (GNU stat on Linux, mount on macOS).
+fs_type() {
+    if [ "$(uname)" = Linux ]; then
+        stat -f -c %T "$1"
+        return
+    fi
+    local mnt
+    mnt="$(df -P "$1" | awk 'NR == 2 {print $6}')"
+    mount | awk -v m="$mnt" '$3 == m {gsub(/[(,]/, "", $4); print $4}'
+}
+
 # write_host_info FILE: the machine, kernel, page size, toolchains and commit,
 # as the Markdown list a PROVENANCE.md entry quotes.
 write_host_info() {
@@ -28,7 +39,7 @@ write_host_info() {
         elif command -v sysctl >/dev/null; then
             echo "- CPU: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
         fi
-        echo "- Filesystem of the run directory: $(df -PT "$OUT" 2>/dev/null | awk 'NR==2 {print $2}' || echo unknown)"
+        echo "- Filesystem of the run directory: $(fs_type "$OUT")"
         echo "- Stable toolchain: \`$(rustc -V)\`"
         echo "- Nightly toolchain: \`$(rustc +nightly -V 2>/dev/null || echo 'not installed')\`"
         echo "- ZeroDB commit: \`$(git -C "$ZERODB" rev-parse HEAD)\`$dirty"

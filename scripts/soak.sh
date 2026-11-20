@@ -128,7 +128,10 @@ crash_loop() {
     mkdir -p "$dir"
     cd "$dir"
     while [ "$(remaining)" -gt 60 ]; do
-        local ps="${sizes[$((round % 3))]}" seed=$((SEED + round))
+        # The harness derives cycle seeds as splitmix64(base ^ cut * 0x9E3779B9),
+        # which stays below 2^48 for any round size used here; giving each
+        # round its own high bits keeps the rounds' cycle seeds disjoint.
+        local ps="${sizes[$((round % 3))]}" seed=$((SEED ^ (round << 48)))
         {
             echo "=== round $round, seed $seed, page size ${ps:-from seed}, $(now)"
             env ${ps:+ZERODB_CRASH_PAGE_SIZE=$ps} "$CRASH_BIN" --cycles "$CRASH_ROUND_CYCLES" --seed "$seed" \
@@ -183,7 +186,7 @@ VERDICT=pass
     echo "# ZeroDB soak, $START to $END"
     echo
     echo "Requested length: ${HOURS} h (the clock starts after the build; the last crash and"
-    echo "stress rounds may run past it). Command: \`HOURS=$HOURS scripts/soak.sh\`."
+    echo "stress rounds may run past it). Command: \`HOURS=$HOURS CRASH_ROUND_CYCLES=$CRASH_ROUND_CYCLES scripts/soak.sh\`."
     echo
     cat "$OUT/host.md"
     echo
