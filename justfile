@@ -76,6 +76,13 @@ fuzz-long SECS='21600':
 fuzz-decode ARTIFACT:
     cargo run -q -p zerodb-oracle --example decode_artifact -- '{{ARTIFACT}}'
 
+# Example: just fuzz-decode-scenario fuzz/artifacts/diff_scenarios/crash-…
+#
+# Print the scenario a diff_scenarios fuzz artifact decodes to, and its
+# minimized divergence.
+fuzz-decode-scenario ARTIFACT:
+    cargo run -q -p zerodb-oracle --example scenario_explore -- '{{ARTIFACT}}'
+
 # Crash-consistency smoke, run by CI on every PR.
 crash-test-quick:
     cargo run -p zerodb-oracle --bin crash-harness -- --cycles 200

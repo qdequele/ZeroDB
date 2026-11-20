@@ -1,10 +1,30 @@
-//! Run random scenarios and print each distinct divergence once.
+//! Run random scenarios and print each distinct divergence once, with
+//! `MINIMIZE=1` also minimized.
 //!
 //! `cargo run --release -p zerodb-oracle --example scenario_explore -- [cases] [seed]`
+//!
+//! Given a file instead (a `diff_scenarios` fuzz artifact), print the
+//! scenario it decodes to and, if it diverges, the minimized divergence:
+//! `cargo run -p zerodb-oracle --example scenario_explore -- <artifact>`.
 
 use zerodb_oracle::scenario::{decode_scenario, minimize, run_scenario, Scenario};
 
 fn main() {
+    if let Some(path) = std::env::args()
+        .nth(1)
+        .filter(|a| std::path::Path::new(a).is_file())
+    {
+        let s = decode_scenario(&std::fs::read(&path).unwrap()).expect("decodes to a scenario");
+        println!("{s:#?}");
+        match run_scenario(&s) {
+            Ok(()) => println!("no divergence"),
+            Err(_) => {
+                let m = minimize(&s);
+                println!("{}\nminimized: {m:?}", run_scenario(&m).unwrap_err());
+            }
+        }
+        return;
+    }
     let mut args = std::env::args().skip(1);
     let cases: u64 = args.next().map_or(2000, |a| a.parse().unwrap());
     let mut x: u64 = args

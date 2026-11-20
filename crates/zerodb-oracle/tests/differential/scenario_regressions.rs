@@ -52,10 +52,9 @@ fn get_greater_than_with_custom_comparators() {
         for i in [0u32, 5, 17, 39, 40, 300] {
             ops.push(OrderedOp::Read(ReadOp::Gt(shape.index_key(i))));
         }
-        ops.push(OrderedOp::Read(ReadOp::Gt(k(
-            &[0x41, 0x41, 0x01][..usize::from(!matches!(cmp, CmpKind::Integer { .. })) * 3]
-        ))));
-        ops.retain(|op| !matches!(op, OrderedOp::Read(ReadOp::Gt(SKey(b))) if b.is_empty()));
+        if !matches!(cmp, CmpKind::Integer { .. }) {
+            ops.push(OrderedOp::Read(ReadOp::Gt(k(&[0x41, 0x41, 0x01]))));
+        }
         same(Scenario::Ordered(OrderedCase { cmp, ops }));
     }
 }
