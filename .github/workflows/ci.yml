@@ -337,8 +337,9 @@ jobs:
       - run: cargo install just --version 1.58.0 --locked
       - run: just stress
       - run: just crash-test-full
-      # 3.5 h native + 26 min through the heed adapter, to fit the 6 h job
-      # cap; the 24 h soak the consumer integration gate asks for needs a
+      # 3.5 h native, 26 min through the heed adapter, 26 min of the
+      # generated scenarios and 2000 multi-process sequences, to fit the 6 h
+      # job cap; the 24 h soak the consumer integration gate asks for needs a
       # self-hosted runner.
       - run: just fuzz-long 12600
       - name: keep any crash artifact

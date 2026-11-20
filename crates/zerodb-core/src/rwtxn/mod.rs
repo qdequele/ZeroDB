@@ -421,6 +421,11 @@ pub struct RwTxn<'env> {
     /// inside a split cascade) leaves the working tree partial, so every later
     /// mutation and `commit` returns `BadTxn`; only abort is valid.
     errored: bool,
+    /// Whether this txn cleared the main database. LMDB's `mdb_drop` marks
+    /// the txn dirty even when the database was already empty, so such a
+    /// commit writes a new meta and takes a new txnid; this keeps the
+    /// unchanged-commit short-circuit from skipping it (TXN-74).
+    cleared_main: bool,
     /// Live nested read children (SPEC 04 TXN-31, ADR-0007), checked by
     /// [`RwTxn::guard_ok`] (TXN-29) and at commit C0 (TXN-33).
     ///
@@ -546,6 +551,7 @@ impl Env {
             annex_out: false,
             alloc_mode: AllocMode::Normal,
             errored: false,
+            cleared_main: false,
             children: ChildCounter::new(),
             // In-place WRITE_MAP keeps no whole-map reference in the struct
             // (see the field docs; ADR-0021) — `whole_map` borrows lazily.
@@ -1040,6 +1046,7 @@ impl<'env> RwTxn<'env> {
             && work!(self).reclaimed.is_empty()
             && self.next_pgno == self.base().last_pg + 1
             && self.main_db == self.base().main_db
+            && !self.cleared_main
             && self.free_db == self.base().free_db
             // A dirty named-DB working record still needs its catalog write-back
             // (defensive: any named mutation also dirties a page, so this is
