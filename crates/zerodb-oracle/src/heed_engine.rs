@@ -96,10 +96,6 @@ macro_rules! heed_engine {
                 /// Set when the env was irrecoverably lost (double reopen failure); every
                 /// subsequent op returns a comparable error instead of panicking.
                 poisoned: Option<String>,
-                /// Whether the current write txn has executed a `ClearDb` — the FORK-1
-                /// guard fact (see `driver::classify` and `docs/UPSTREAM-BUGS.md`). Set in
-                /// `clear_db`, reset at every txn boundary.
-                cleared_in_txn: bool,
                 /// The env open mode: `WRITE_MAP` / durability flags. Preserved
                 /// across `reopen` so a reopened env keeps the same write mode.
                 mode: EngineMode,
@@ -273,7 +269,6 @@ macro_rules! heed_engine {
                         env: Some(Box::new(env)),
                         map_size: BASE_MAP_SIZE,
                         poisoned: None,
-                        cleared_in_txn: false,
                         mode,
                         dir,
                     }
@@ -297,12 +292,9 @@ macro_rules! heed_engine {
                     // (see `driver.rs`). If it says skip, do so without touching the backend; the
                     // per-method `db_at`/`write_txn`/`read_source` helpers below only resolve
                     // handles from here on (their skip arms are unreachable after this gate).
-                    if let Some(skip) = crate::driver::classify(
-                        op,
-                        self.txn_state(),
-                        self.dbs.is_empty(),
-                        self.cleared_in_txn,
-                    ) {
+                    if let Some(skip) =
+                        crate::driver::classify(op, self.txn_state(), self.dbs.is_empty())
+                    {
                         return OpResult::Skipped(skip);
                     }
                     match op {
@@ -386,13 +378,7 @@ macro_rules! heed_engine {
                 fn reopen(&mut self, kib: u16) -> OpResult {
                     // Close all transactions and forget handles before dropping the env
                     // (heed's same-process registry forbids two open handles to one path).
-                    // Reopen drops the active txn, so it is a txn boundary: reset the FORK-1
-                    // guard fact too, exactly as `commit`/`abort`/`begin_rw` do (and as
-                    // `ZerodbEngine::reopen` does). Without this the two engines' tracked
-                    // `cleared_in_txn` drift after a reopen-while-cleared, making the shared
-                    // `classify` FORK-1 guard fire asymmetrically.
                     self.active = Active::None;
-                    self.cleared_in_txn = false;
                     self.dbs.clear();
                     drop(self.env.take());
 
@@ -422,8 +408,6 @@ macro_rules! heed_engine {
                 }
 
                 fn begin_rw(&mut self) -> OpResult {
-                    // Txn boundary: reset the FORK-1 guard fact.
-                    self.cleared_in_txn = false;
                     if !matches!(self.active, Active::None) {
                         return OpResult::Skipped(Skip::TxnAlreadyOpen);
                     }
@@ -475,8 +459,6 @@ macro_rules! heed_engine {
                 }
 
                 fn commit(&mut self) -> OpResult {
-                    // Txn boundary: reset the FORK-1 guard fact.
-                    self.cleared_in_txn = false;
                     match std::mem::replace(&mut self.active, Active::None) {
                         Active::Rw(w) => match (*w).commit() {
                             Ok(()) => {
@@ -512,8 +494,6 @@ macro_rules! heed_engine {
                 }
 
                 fn abort(&mut self) -> OpResult {
-                    // Txn boundary: reset the FORK-1 guard fact.
-                    self.cleared_in_txn = false;
                     match std::mem::replace(&mut self.active, Active::None) {
                         Active::None => OpResult::Skipped(Skip::NoTxn),
                         Active::Rw(w) => {
@@ -625,8 +605,6 @@ macro_rules! heed_engine {
                 }
 
                 fn clear_db(&mut self, db: u8) -> OpResult {
-                    // FORK-1 guard fact: this write txn has cleared a db (see driver::classify).
-                    self.cleared_in_txn = true;
                     let db = match self.db_at(db) {
                         Ok(d) => d,
                         Err(r) => return r,
