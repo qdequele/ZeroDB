@@ -97,8 +97,10 @@ The module contract in `zerodb-io/src/mmap.rs` states the argument this
 relies on: "no `&[u8]` that safe code reads is mutated while it is
 borrowed". It reasons about the bytes read, while Rust's rules apply to every
 byte a reference covers. Fixing it changes how pages are viewed (slices bounded to the pages
-a snapshot references, and a map view that is not a `&[u8]`), which needs an
-amendment to ADR-0021 and a benchmark of the read path. It is not fixed here.
+a snapshot references, and a map view that is not a `&[u8]`). That fix is
+proposed in [ADR-0021 amendment 1](../adr/0021-writemap-in-place.md)
+(draft, awaiting approval), together with the alternatives and the read-path
+benchmark it needs. It is not implemented.
 
 **Questions for the reviewer:** is the "bytes actually read" argument
 acceptable in practice, and which fix is preferable? The same question arises

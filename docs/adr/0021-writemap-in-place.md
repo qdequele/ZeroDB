@@ -2,6 +2,7 @@
 
 - Status: **Accepted (2026-10-02, maintainer) — spike first**. Opt-in behind `WRITE_MAP`; default (heap-staged) path unchanged. Implementation under the full gate (loom for commit/meta ordering, crash, stress) + the adapter borrow audit; never merged without a green gate and a spec review. (Was: Draft, gated on the spike numbers below and human approval — rule 6: write-path + concurrency + unsafe.)
 - Implementation note (2026-10-05): spike plus the production hardening pass below merged as PR #88 (8b066a6, 2026-10-05; the PR title still read "DRAFT, do not merge"). In-place is now what `WRITE_MAP` does. Ranged msync (issue #45) is ADR-0026. Still open: the open questions at the end.
+- Amendment 1 (2026-11-20): **draft, awaiting approval**: bound reader views of the map to the pages they reference (unsafe audit finding F1). See the end of this ADR.
 - Milestone: Phase 3 (performance), PERF-GAP B5 / issue #13; supersedes ADR-0017 (spilling) **for WRITE_MAP envs only**
 - Date: 2026-10-01
 
@@ -327,3 +328,230 @@ fork's own WRITEMAP trade, accepted with the opt-in flag (Open question 3).
    helps the default path every consumer runs.)
 3. `WRITE_MAP` makes a stray write corrupt the DB through the map (no typed
    error). That is LMDB's own trade; acceptable as an explicit opt-in?
+
+## Amendment 1 (draft, 2026-11-20): reader views bounded to the pages they reference
+
+- Status: **Draft, awaiting maintainer approval.** Nothing below is
+  implemented. It changes the read path's view of the map and a concurrency
+  argument, so it needs approval and a read-path benchmark before any code.
+- Related: issue #178 (unsafe verification), finding F1 in
+  [`docs/maintainers/UNSAFE-AUDIT.md`](../maintainers/UNSAFE-AUDIT.md).
+
+### Context
+
+The production pass above made the *writer* hold no cached whole-map view
+under in-place `WRITE_MAP` (B2/M1), and checked that discipline under miri
+with a single thread. It did not cover a **reader in another thread of the
+same process** while the writer stores in place. Miri, run over
+`TestWriteMap` with a `WithoutTls` read transaction on a second thread,
+reports undefined behavior under both aliasing models:
+
+- Stacked Borrows: a store through the broker's `&mut` (`dirty::map_mut`)
+  pops a protected `SharedReadOnly` tag held by the reader
+  (`btree::resolve_overflow`'s `src` argument).
+- Tree Borrows: a data race between the reader's retag of a slice
+  (`Source::bytes_from_classified`, the high-water clamp `&slice[..c]`) and
+  the writer's non-atomic store (`page::tree::copy_tree_page`).
+
+The cause is the width of the reader's references, not the bytes it reads:
+
+1. `Source::Map { bytes }` and `Source::Writer { bytes }` carry the **whole
+   map** as one `&'a [u8]`, built from `Backing::view()` on every
+   `TxnRead::source` call and copied into every `Tree` and page lookup.
+2. `bytes_from_classified` returns, for a map page, a slice from that page
+   **to the snapshot's high-water** (`last_pg`), so that an overflow run is
+   one slice. Every leaf and branch view starts from such a slice.
+3. `RoTxn::map_bytes` lends the whole map. Its callers are
+   `check::check_snapshot` (the `zerodb-tools` `check` and `stat` commands,
+   and a test) and the raw `Env::copy` path (`zerodb/src/copy.rs`,
+   `write_raw`), which passes `&map[from..to]` over
+   `[FIRST_DATA_PGNO, last_pg]` to `write_all_at`, free pages included.
+
+TXN-62 makes the bytes a reader *dereferences* disjoint from the bytes the
+writer stores: the writer writes only pages no live snapshot references. But
+a live `&[u8]` asserts that **none** of the bytes it covers change while it
+lives, and a `&[u8]` function argument is emitted with LLVM's
+`noalias readonly dereferenceable(len)` over its whole length. The free pages
+the writer reuses lie below `last_pg`, inside every reference listed above.
+So the module contract in `zerodb-io/src/mmap.rs` ("no `&[u8]` that safe
+code reads is mutated while it is borrowed") holds for the bytes read and
+fails for the bytes referenced, which is what Rust's rules are about.
+
+The same shape exists without `WRITE_MAP`: the in-process writer's commit
+`pwrite`s free pages that readers' whole-map slices cover (F2), and another
+process may write the file. Those writes are made by the kernel or by
+another address space, outside the Rust abstract machine, and no tool here
+checks them; they are not reported UB today. But they rest on the same
+"bytes read" argument, and `TestWriteMap` cannot model the heap-frame mode
+for the same reason (F2), so the heed miri tests run only the in-place mode.
+
+LMDB is C: it holds a `char *` to the map, and C's data-race rule concerns
+only locations both sides access, so LMDB has no equivalent of this
+question. heed hands out `&'txn [u8]` *values* from that map; each value
+covers bytes of a page the snapshot references, so values are already
+correctly bounded. The problem is confined to ZeroDB's internal views.
+
+### Options
+
+#### Option A: bounded page slices from a raw map handle (recommended)
+
+Replace every whole-map `&[u8]` in the read path with a handle that holds a
+base pointer and a length and hands out slices covering **exactly** the
+pages being read.
+
+- A new `Copy` type in `zerodb-core::page` (working name `MapPages<'a>`: a
+  `NonNull<u8>`, a `usize` length, and `PhantomData<&'a [u8]>`), with a
+  safe `pages(pgno, n, psize) -> Option<&'a [u8]>` that bounds-checks
+  `[pgno × psize, (pgno + n) × psize)` and builds the slice with
+  `slice::from_raw_parts`. Its soundness rests on the engine invariants the
+  mmap contract already states (TXN-62, SPEC 06 REC-14): callers ask only
+  for pages a snapshot they pin references, or for the writer's own frames.
+  It is `Send + Sync` by `unsafe impl`, like `MapRegions`.
+- It is built only through an `unsafe fn` constructor (contract: the region
+  stays mapped and valid for `'a`), called by the backings in `zerodb-io`
+  from the mapping's raw pointer (`memmap2::Mmap::as_ptr` or `MmapRaw`), and
+  by `TestWriteMap` from its `UnsafeCell` root. No backing ever creates a
+  whole-map `&[u8]` on a path that can run concurrently with a writer; even a
+  transient one is a Tree Borrows retag over the whole map.
+- `MapView { bytes }` becomes `MapView { pages: MapPages<'_> }`;
+  `Source::{Map, Writer}` carry `MapPages` instead of `bytes`. The two
+  structures keep the same size (pointer + length).
+- `bytes_from_classified` returns **one page** for a tree page. Overflow
+  runs take their length from the leaf node's `dsize` (`n = ⌈(HEADER_SIZE +
+  dsize) / psize⌉`), already known at every call of `resolve_overflow`, and
+  check `head + n − 1 ≤ last_pg`. The untrusted path still cross-checks the
+  run header's page count in `OverflowRef::new`.
+- The writer's cached heap-mode view (`RwTxn::bytes`) and lazy in-place view
+  (`RwTxn::whole_map`) become a `MapPages` too. TXN-71's re-derivation at
+  every spill is then unnecessary in every mode, because no reference spans
+  a page before it is rewritten.
+- `RoTxn::map_bytes` is removed or replaced by an accessor bounded to the
+  pinned snapshot. `check_snapshot` reads pages one at a time through the
+  same handle. The raw copy cannot use a bounded slice: it deliberately
+  reads free pages, which an in-place writer may be storing to, a real race
+  on the bytes read. Under `WRITE_MAP` it switches to the existing
+  fd-to-fd path (`copy_raw_file`), so the bytes are read by the kernel, as
+  in LMDB's `mdb_env_copyfd`, which passes map pointers to `write`. Without
+  `WRITE_MAP` it can keep writing from the map.
+
+Pros:
+
+- Closes F1 for in-process readers, and makes the mmap contract true at the
+  level Rust checks: no reference covers a byte that changes while it lives,
+  in any mode.
+- Makes F2 go away: `TestWriteMap` can imitate `pwrite` with a pointer store
+  into a free page no reference covers, so the heed miri tests run both
+  modes, and a multi-threaded reader/writer miri test can run in the core.
+- Narrows every page view to one page, which also tightens the bounds that
+  a corrupt reference can reach.
+- No public API or on-disk change; heed's `&'txn [u8]` values are unchanged.
+
+Cons and costs:
+
+- New `unsafe` in `zerodb-core::page`: one `from_raw_parts` in the hot read
+  path and one `unsafe impl Send/Sync`. "mmap access and page casting" in
+  `zerodb-core::page` is already sanctioned, but CONTRIBUTING should name the
+  type explicitly, as it names `MapRegions`.
+- A wide but mechanical change: every `Source` construction, every
+  `Backing` implementation (real, fault-injection, test), `check.rs`,
+  and any page view that today relies on a slice longer than one
+  page (to be audited during the implementation; none is known).
+- Hot-path risk: the map-page lookup changes shape (one bounds check, no
+  high-water clamp) and overflow resolution computes `n` from `dsize`. This
+  is expected to be neutral, but it must be measured.
+- Residual: a corrupt file opened with `FileTrust::VALIDATE` can still steer
+  a reader to a free page below `last_pg`. Under in-process `WRITE_MAP` that
+  read races a store on the bytes actually read. The validation memo rejects
+  the result or returns garbage, but it is UB in Rust's terms. LMDB, which
+  does not validate pages, has the same exposure, and today's code has it
+  too. See the open questions.
+
+#### Option B: read the map through atomic or volatile accesses
+
+View the map as `&[AtomicU8]`, or read it with `read_volatile`, so concurrent
+stores are not UB. This breaks zero-copy: heed returns `&'txn [u8]` values,
+so every value would have to be copied out. It contradicts TXN-37/41 and
+LMDB's read cost. Rejected.
+
+#### Option C: document the "bytes read" argument and accept it
+
+Amend the mmap contract and TXN-45b to state that whole-map references may
+span pages a concurrent in-place writer stores to, as long as the bytes
+dereferenced are disjoint. Keep the reproducer skipped under miri.
+
+- Pro: no code change, no performance risk. In practice, LLVM uses
+  `noalias readonly` to reorder or remove accesses the reader makes, and the
+  reader makes none to the stored bytes; no miscompilation is known.
+- Con: it is undefined behavior under both models Rust is considering, so it
+  is a bet on the optimizer, not a proof. Miri cannot run any
+  multi-threaded `WRITE_MAP` test, which is the configuration most likely to
+  hide a real TXN-62 slip. An outside reviewer (issue #178, item 4) will
+  report it again.
+
+#### Option D: no in-place stores while an in-process reader is live
+
+Under `WRITE_MAP`, heap-stage dirty pages whenever the reader table shows a
+live reader in this process. This removes the overlap but also ADR-0021's
+gain for the workload it targets, concurrent search during indexing. LMDB
+has no such mode. Rejected.
+
+### Decision (proposed)
+
+**Option A**, applied to every mode, since `Source` is one type and the
+default mode's kernel writes rest on the same argument. Implementation is
+blocked until:
+
+1. the maintainer approves this amendment;
+2. a three-column read-path comparison (LMDB, ZeroDB before, ZeroDB after)
+   from `just bench-ab` on the read rungs (`get`, cursor and range scans,
+   overflow values) and the `WRITE_MAP` write rungs shows no regression
+   beyond run-to-run noise. A regression stops the work and is reported, as
+   for any performance change.
+
+### Consequences
+
+- SPEC 04 §6.1: TXN-37 and TXN-38 state that a read borrows only the bytes
+  of the pages (or the value) it resolves; the high-water bound paragraph
+  replaces "clamps multi-page slices at that bound" with "an overflow run's
+  length comes from the node's `dsize` and must end at or below `last_pg`".
+  The error kind a corrupt run reports must stay the same, or the change is
+  recorded where the SPEC requires it.
+- SPEC 04 TXN-71 (writer view re-derivation) and TXN-45b: the
+  whole-map-view paragraphs are replaced by "no view in any mode spans a page
+  before it is rewritten".
+- SPEC 03 §3: "a mapped run extends to the end of the map, bounded by the
+  overflow decoder" becomes "a mapped run is exactly `n` pages".
+- `zerodb-io/src/mmap.rs` module contract: rule 4 and the closing sentence
+  state the bounded-view rule. `Backing::view` and `Backing::bytes` change
+  signature. `check.rs` reads through `MapPages` like the rest of the
+  engine.
+- CONTRIBUTING's `unsafe` policy names `zerodb-core::page::MapPages` (its
+  `from_raw_parts`, its `unsafe fn` constructor called from `zerodb-io`, and
+  its `Send`/`Sync` impls).
+- Tests:
+  - un-skip `without_tls_read_txn_reads_on_another_thread_during_commits`
+    under miri;
+  - run the heed miri tests in both modes (`MODES` no longer depends on
+    `cfg!(miri)`);
+  - add a reader-thread-versus-in-place-writer test to
+    `zerodb-core/tests/writemap_in_place_miri.rs`, run under both aliasing
+    models;
+  - add a native test of a raw `Env::copy` under `WRITE_MAP` while a writer
+    commits, checking that the copy opens and matches its snapshot.
+- `docs/maintainers/UNSAFE-AUDIT.md`: F1 and F2 marked fixed, the inventory
+  updated with the new `unsafe` sites.
+
+### Open questions for the maintainer
+
+1. Option A, or Option C? A is the only one that lets miri check concurrent
+   `WRITE_MAP` use; C costs nothing and relies on the optimizer.
+2. Apply A to every mode (proposed), or only to `WRITE_MAP` environments?
+   Restricting it would keep two `Source` shapes and leave F2 open.
+3. The `FileTrust::VALIDATE` residual: accept it as LMDB's exposure (a
+   corrupt file can make a reader race the writer's store to a free page),
+   or require that `WRITE_MAP` environments with concurrent in-process
+   readers are opened only on trusted files? The latter is a documentation
+   rule, not a check.
+4. The raw copy under `WRITE_MAP`: switch to the fd-to-fd path (proposed),
+   or always use it? The map path is faster without `WRITE_MAP`, where no
+   in-process store can race it.
