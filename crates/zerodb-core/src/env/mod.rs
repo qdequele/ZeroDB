@@ -546,7 +546,8 @@ impl EnvInner {
         Ok(0)
     }
 
-    /// Whether a failed commit fsync poisoned the env (SPEC 06 REC-13).
+    /// Whether a failed commit barrier or meta write poisoned the env (SPEC
+    /// 06 REC-13).
     #[must_use]
     pub(crate) fn is_poisoned(&self) -> bool {
         // Acquire: pairs with the Release in `poison` so a writer that
@@ -554,7 +555,8 @@ impl EnvInner {
         self.poisoned.load(Ordering::Acquire)
     }
 
-    /// Poison the env after a failed durability barrier (SPEC 06 REC-13).
+    /// Poison the env after a failed durability barrier or meta write (SPEC
+    /// 06 REC-13).
     pub(crate) fn poison(&self) {
         // Release: see `is_poisoned`.
         self.poisoned.store(true, Ordering::Release);
@@ -1017,7 +1019,7 @@ impl EnvInner {
         }
         if self.is_poisoned() {
             return Err(Error::Io(std::io::Error::other(
-                "environment poisoned by a failed durability barrier (SPEC 06 REC-13)",
+                "environment poisoned by a failed durability barrier or meta write (SPEC 06 REC-13)",
             )));
         }
         // (2) `force || !NO_SYNC` — otherwise no flush is issued at all.

@@ -208,6 +208,10 @@ pub(crate) struct WriterCarry {
     /// follows the meta write, so a commit that unwound in between leaves
     /// the next one a prefix to clear.
     meta_dirty: usize,
+    /// The bytes the meta slot held before this commit's C4, kept so a
+    /// failed meta write or meta barrier can put them back (SPEC 06 REC-13,
+    /// ADR-0047). Empty until the first commit, then one page, reused.
+    meta_prev: Vec<u8>,
     /// The txn's state in the env's slot table (ADR-0024), restarted at
     /// every begin, which keeps its handle-check memo allocation
     /// ([`crate::handles::HandleTable::restart`]).
@@ -323,7 +327,7 @@ use insert::*;
 
 fn poisoned_error() -> Error {
     Error::Io(std::io::Error::other(
-        "environment poisoned by a failed durability barrier (SPEC 06 REC-13)",
+        "environment poisoned by a failed durability barrier or meta write (SPEC 06 REC-13)",
     ))
 }
 

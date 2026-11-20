@@ -42,6 +42,7 @@ Approved or accepted, and in `main`.
 | 0034 | [Trust page contents by default, as LMDB does](adr/0034-trusted-pages-by-default.md) | Accepted | Page validation, LMDB parity, `unsafe` policy |
 | 0037 | [Bounded free-page records](adr/0037-bounded-free-page-records.md) | Accepted (Option C), implemented | On-disk format, page reclamation |
 | 0044 | [The round limit of the free-list save has no derivation](adr/0044-freelist-save-round-bound.md) | Accepted (Option C), implemented | Page reclamation, commit |
+| 0047 | [What the environment does after a failed meta write or commit barrier](adr/0047-failed-meta-write-policy.md) | Accepted (Option A), implemented (#176) | Durability |
 
 ## Shipped, approval not recorded
 
@@ -80,7 +81,6 @@ Awaiting a decision. Nothing here is implemented in `main`.
 | 0043 | [Adopt `bitflags` for the flag types and `tempfile` for test directories](adr/0043-bitflags-and-tempfile.md) | Proposed | Dependencies, heed API |
 | 0045 | [On-disk format stability: when `format_version` may change, and what a user is promised](adr/0045-format-stability-policy.md) | Draft, awaiting approval (#182); the policy is not in force. The format 2 reader and `zerodb-tools upgrade` it relies on are tooling, in `main` | On-disk format, release, tools |
 | 0046 | [Windows support](adr/0046-windows-support.md) | Draft, awaiting approval (#183) | Platforms, concurrency, durability, dependencies, `unsafe` policy |
-| 0047 | [What the environment does after a failed meta write or commit barrier](adr/0047-failed-meta-write-policy.md) | Draft, awaiting approval (#176) | Durability |
 | 0048 | [heed 0.23 support in the heed adapter](adr/0048-heed-0-23-adapter.md) | Proposed (spike only) | heed integration, consumers |
 
 ## Measured and not adopted

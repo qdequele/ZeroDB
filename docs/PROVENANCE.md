@@ -118,9 +118,11 @@ plainly as the strengths.
   file on a full device, which kills the process as it does LMDB's. Only a
   failed page write in a commit is compared with LMDB on a real failure (an
   `EFBIG` from a file-size limit); LMDB's handling of the other failures was
-  read in its source. The tests found that a failed meta write leaves the
-  environment writable, which can corrupt the file
-  ([ADR-0047](adr/0047-failed-meta-write-policy.md), awaiting a decision).
+  read in its source. The tests found that a failed meta write left the
+  environment writable, which could corrupt the file; a failed meta write or
+  meta barrier now restores the meta slot and poisons the environment
+  ([ADR-0047](adr/0047-failed-meta-write-policy.md)). The restore is tested
+  in one process only.
 - **No power-loss test on a real device.** Crash tests use a model of what a
   disk may keep, and process kills, which leave the page cache intact. No
   test has cut power to a machine.
