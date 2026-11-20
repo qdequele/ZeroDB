@@ -20,8 +20,8 @@ build Meilisearch ships and compare the results.
 > | `EnvOpenOptions::open` (native API) | a safe `fn` | an `unsafe fn`, with heed's contract |
 > | Pages read from the file | validated by default; trusting them is opt-in | trusted by default, as in LMDB; `FileTrust::VALIDATE` is opt-in |
 > | Processes per environment | one (no lock file) | several (lock file on by default) |
-> | On-disk format version | 2 | 3; a version 2 file is refused at open, so dump it with the 0.2.0 `zerodb-tools` and `load` it |
-> | `unique-txns` feature (Meilisearch 1.55 and later) | absent | present |
+> | On-disk format version | 2 | 3; a version 2 file is refused at open: `zerodb-tools upgrade <old> <new>` converts it |
+> | `unique-txns` feature (Meilisearch 1.55) | absent | present |
 > | `Env::resize` | absent | present |
 >
 > To build against `main`, pin a commit of it
@@ -86,8 +86,9 @@ A runnable version is in [`crates/zerodb/examples/basic.rs`](crates/zerodb/examp
   model-checked with loom. What these tests do not cover is listed under
   [Provenance](#provenance).
 - **A heed drop-in.** Meilisearch and hannoy build and pass their test suites
-  on it with no source changes. Meilisearch 1.55 and later needs manifest
-  changes, described in [docs/USING.md](docs/USING.md#as-a-heed-replacement).
+  on it with no source changes. Meilisearch 1.55 needs manifest changes,
+  described in [docs/USING.md](docs/USING.md#as-a-heed-replacement);
+  Meilisearch 1.56 and later use heed 0.23, which ZeroDB does not provide yet.
   Speed is in [Performance](#performance).
 - **Validation when you need it.** Pages are trusted by default, as LMDB
   trusts them. With `FileTrust::VALIDATE`, every page read from the file is
@@ -105,18 +106,36 @@ A runnable version is in [`crates/zerodb/examples/basic.rs`](crates/zerodb/examp
 
 ZeroDB matches LMDB for the heed surface Meilisearch and hannoy use. Both
 build on it with no source changes. Meilisearch v1.53.1 needs one `[patch]`
-line; Meilisearch v1.55 and later also needs the `unique-txns` feature and a
-second `[patch]` table ([docs/USING.md](docs/USING.md#as-a-heed-replacement)).
-hannoy is tested at its `v0.1.7-nested-rtxns` tag.
+line; Meilisearch v1.55 also needs the `unique-txns` feature and a second
+`[patch]` table ([docs/USING.md](docs/USING.md#as-a-heed-replacement)).
+Meilisearch v1.56 and later depend on heed 0.23, which ZeroDB does not
+provide yet. hannoy is tested at v0.2.0, the release Meilisearch v1.55 uses.
 
-The consumer test suites are run by hand, not in CI. The last recorded passes
-are Meilisearch v1.55.0's milli and index-scheduler suites on 2026-10-18, and
-Meilisearch v1.53.1's and hannoy's suites on 2026-09-09. They were not re-run
-for the 0.2.0 release, and no later run is recorded.
+CI runs the consumer suites nightly
+([CONSUMER-GATE.md](docs/maintainers/CONSUMER-GATE.md)). The last recorded
+run, on 2026-11-20 on `main` at `c7e1abf` (macOS, aarch64), passed:
+Meilisearch v1.55.1's milli and index-scheduler suites (448 passed, 0
+failed, 4 ignored) and hannoy v0.2.0's suite (59 passed, 0 failed, 1
+ignored), with no C LMDB in either build.
 
 ZeroDB is not yet production-hardened: the 24-hour fuzz soak and a run on a
 64 KiB-page kernel are still open. [Provenance](#provenance) lists what has
 and has not been verified.
+
+**Platforms:**
+
+| Tier | Targets | What runs |
+|---|---|---|
+| Tested, supported | Linux x86-64; Linux aarch64 with 4 KiB pages | Every PR: the full CI (fmt, clippy, tests, differential fuzz; miri, loom and the crash smoke on x86-64). Nightly: long fuzz, full crash run, stress |
+| Tested, supported | macOS aarch64 (Apple silicon, 16 KiB pages) | Every PR: clippy, the test suite and the crash smoke. No fuzz, miri, loom or nightly runs |
+| Builds, best effort | Linux aarch64 with 64 KiB pages (such as RHEL for ARM); macOS x86-64; Linux on other 64-bit architectures | Same code paths as a tested target, but no CI runs them |
+| Unsupported | Windows | Fails to build with a `compile_error!`. A design is proposed in [ADR-0046](docs/adr/0046-windows-support.md), awaiting approval |
+| Unsupported | Other Unix systems (FreeBSD and others); 32-bit targets | Never built or tested |
+
+Meilisearch also ships on Windows, so ZeroDB cannot replace LMDB in a
+Meilisearch release until Windows is supported. The differences between
+Linux and macOS are listed in
+[docs/USING.md](docs/USING.md#platform-support).
 
 **Not supported:**
 

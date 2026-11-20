@@ -29,6 +29,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "diff_scenarios"
+path = "fuzz_targets/diff_scenarios.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_page_decode"
 path = "fuzz_targets/fuzz_page_decode.rs"
 test = false

@@ -83,7 +83,7 @@ Statuses:
 
 | Method | Status | Notes |
 |---|---|---|
-| `real_disk_size`, `try_clone_inner_file`, `info`, `stat`, `non_free_pages_size`, `database_options`, `open_database`, `create_database`, `write_txn`, `read_txn`, `static_read_txn`, `copy_to_file`, `copy_to_path`, `force_sync`, `path`, `max_readers`, `max_key_size`, `prepare_for_closing`, `Clone`, `Debug` | Same | `info().map_addr` is always null, and page counts are ZeroDB's. `info().number_of_readers` is LMDB's high-water mark and, with a lock file, counts other processes' readers too ([D-011](#d-011)) |
+| `real_disk_size`, `try_clone_inner_file`, `info`, `stat`, `non_free_pages_size`, `database_options`, `open_database`, `create_database`, `write_txn`, `read_txn`, `static_read_txn`, `copy_to_file`, `copy_to_path`, `force_sync`, `path`, `max_readers`, `max_key_size`, `prepare_for_closing`, `Clone`, `Debug` | Same | `info().map_addr` is always null, and page counts are ZeroDB's. `info().number_of_readers` is LMDB's high-water mark and, with a lock file, counts other processes' readers too ([D-011](#d-011)); with `NO_LOCK` it is 0, as LMDB has no reader table then. `info().last_txn_id` can lag in a process whose map is smaller than another process's commit ([D-029](#d-029)) |
 | `nested_read_txn(&RwTxn)` | Same | Available for every `T` (heed: `WithoutTls` only). The writer cannot mutate while children are live: the borrow checker enforces it ([D-005](#d-005)) |
 | `flags()`, `get_flags()` | Emulated | Rebuilt from the open options: only `WRITE_MAP`, `READ_ONLY`, `NO_SYNC`, `NO_META_SYNC`, `MAP_ASYNC` and `NO_LOCK` are ever reported. `NO_LOCK` is reported only for an env opened with it, as in LMDB |
 | `clear_stale_readers()` | Same | Frees the reader slots of dead processes and returns how many, as `mdb_reader_check` counts. Returns `Ok(0)` with `NO_LOCK` |
@@ -127,7 +127,7 @@ build has one API or the other, never both.
 
 | Item | Status | Notes |
 |---|---|---|
-| `get`, `get_lower_than`, `get_lower_than_or_equal_to`, `get_greater_than`, `get_greater_than_or_equal_to`, `first`, `last`, `len`, `is_empty`, `stat`, `iter`, `rev_iter`, `iter_mut`, `rev_iter_mut`, `range`, `rev_range`, `range_mut`, `rev_range_mut`, `prefix_iter`, `rev_prefix_iter`, `prefix_iter_mut`, `rev_prefix_iter_mut`, `put`, `put_with_flags`, `delete`, `delete_range`, `clear`, `unsafe remove`, `remap_*`, `lazily_decode_data`, `Copy`, `Debug` | Same | An empty key gives `BadValSize` on reads, as in LMDB. `delete_range` never returns `Decoding` |
+| `get`, `get_lower_than`, `get_lower_than_or_equal_to`, `get_greater_than`, `get_greater_than_or_equal_to`, `first`, `last`, `len`, `is_empty`, `stat`, `iter`, `rev_iter`, `iter_mut`, `rev_iter_mut`, `range`, `rev_range`, `range_mut`, `rev_range_mut`, `prefix_iter`, `rev_prefix_iter`, `prefix_iter_mut`, `rev_prefix_iter_mut`, `put`, `put_with_flags`, `delete`, `delete_range`, `clear`, `unsafe remove`, `remap_*`, `lazily_decode_data`, `Copy`, `Debug` | Same | An empty key gives `BadValSize` on reads, as in LMDB. A range whose seek bound (the start of a forward range, the end of a reverse one) is an empty key yields `BadValSize` first, then iterates from that end of the database, as heed's cursor does; `delete_range` with an empty start bound returns `Io(InvalidInput)` (`EINVAL`) and deletes nothing, as does `del_current` on a write iterator before its first seek. With a custom key comparator, `get_greater_than` returns heed's result: the first entry at or after the key in the database's order, kept only if its bytes compare greater than the key with memcmp, else the entry after it. `delete_range` never returns `Decoding` |
 | `put_reserved` | Same | A closure that writes less than it reserved returns `Io(UnexpectedEof)`, and a failing closure returns its `Io` error with the reserved entry in place, as in heed. Bytes the closure did not write are zero, where LMDB leaves page garbage ([D-015](#d-015)) |
 | `put_with_flags(APPEND \| NO_OVERWRITE)`, `put_with_flags(NO_DUP_DATA \| APPEND_DUP)` on a plain database | Same | The fork accepts the dup flags on a non-`DUP_SORT` database |
 | `get_duplicates`, `delete_one_duplicate` | Unsupported | No `DUP_SORT` ([D-004](#d-004)) |
@@ -178,13 +178,16 @@ orders are available through `key_comparator` instead.
 
 ## What Meilisearch and hannoy use
 
-Everything they call is **Same** or a supported LMDB feature. This was checked
-on Meilisearch v1.53.1, Meilisearch v1.55.0 (through the `unique-txns` shim)
-and hannoy v0.1.7-nested-rtxns, by running their test suites on the shim with
-no source changes ([maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md)).
-Meilisearch v1.55.0 needs manifest changes ([USING.md](USING.md#as-a-heed-replacement)).
-The suites are run by hand, not in CI: the last recorded passes are 2026-10-18
-for Meilisearch v1.55.0 and 2026-09-09 for Meilisearch v1.53.1 and hannoy.
+Everything they call is **Same** or a supported LMDB feature. This is checked
+by running their test suites on the shim with no source changes, nightly in CI
+([maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md)), on Meilisearch
+v1.55.1 (through the `unique-txns` shim, with manifest changes:
+[USING.md](USING.md#as-a-heed-replacement)) and hannoy v0.2.0. Earlier passes
+cover Meilisearch v1.53.1 and hannoy v0.1.7-nested-rtxns (2026-09-09). The
+last recorded run, 2026-11-20 on `main` at `c7e1abf`: Meilisearch v1.55.1's
+milli and index-scheduler suites, 448 passed, 0 failed, 4 ignored; hannoy
+v0.2.0, 59 passed, 0 failed, 1 ignored. Meilisearch v1.56 and later, and
+hannoy v0.3.0, use heed 0.23, which the adapter does not provide.
 None of the differences below is reached by either consumer.
 
 ## Behavior differences
@@ -223,6 +226,8 @@ difference. Details live in the linked ADR or SPEC section.
 | <a id="d-025"></a>D-025 | Two `PREV_SNAPSHOT` cases | (a) If the opener ends before its first commit, a waiting process reads the older meta (or fails with `EINVAL` on macOS after a clean close). (b) A read-only `PREV_SNAPSHOT` open is not refused while another process holds the env, and rolls every process back to the older meta. | (a) A waiting process re-initializes the lock file and serves the newest meta. (b) A read-only `PREV_SNAPSHOT` joiner fails with `EAGAIN` and the running env is untouched, because matching LMDB would let a writer reuse pages that newer readers still read. | Approved |
 | <a id="d-026"></a>D-026 | Database handles in two stale cases | (a) A handle whose slot was freed by an abort and reused for another name reads that other database. (b) When two read txns first-open the same name, later txns get `MDB_BAD_DBI` through either handle. | (a) `EINVAL`: a handle carries its slot's generation. (b) The slot is shared by its openers and both handles stay valid (SPEC 04 DBI-9). | Approved (a), Proposed (b) |
 | <a id="d-027"></a>D-027 | Which freed pages a write txn reuses | (a) Pages freed by txn `N − 1` are never reused by txn `N`, even with no reader open. (b) Freed records are merged before searching for a run of contiguous pages. | (a) Pages freed by txn `N − 1` are reused when no reader pins an older snapshot (SPEC 05 GC-18), so files are never larger for this reason. (b) Same since ADR-0029: the gated records are merged and searched (SPEC 05 GC-16, GC-21). | Proposed (a), Resolved (b) |
+| <a id="d-028"></a>D-028 | Dead readers at a writer takeover, on macOS | The next writer after a writer process died frees the reader slots of dead processes, on macOS as on Linux (its SysV semaphore reports the dead owner). | On Linux, the same. On macOS the cross-process writer lock is an `fcntl` record lock, which does not report a previous owner, so those slots stay until `clear_stale_readers` or the next first opener (SPEC 04 §12.1). Matching LMDB needs an ADR-0023 amendment to the macOS writer lock. | Proposed |
+| <a id="d-029"></a>D-029 | `Env::info().last_txn_id` beyond this process's map | `mdb_env_info` reports the newest meta, also when its pages lie beyond this process's map. | Reports this process's own last snapshot until a `resize` lets the process map the newest one, because `info` stays infallible and the newest snapshot cannot be read through the current map (SPEC 02 §8, ADR-0023). Found by the generated multi-process sequences. Open question: report the newest txnid from the meta without reading its pages? | Proposed |
 
 ### Checks the adapter re-imposes
 

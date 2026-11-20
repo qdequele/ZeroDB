@@ -503,7 +503,9 @@ impl<T> Env<T> {
             last_page_number: i.last_pgno as usize,
             last_txn_id: i.last_txnid as usize,
             maximum_number_of_readers: i.max_readers,
-            number_of_readers: i.num_readers,
+            // `MDB_NOLOCK` leaves LMDB without a reader table, and
+            // `mdb_env_info` then reports no readers at all.
+            number_of_readers: if self.no_lock { 0 } else { i.num_readers },
         }
     }
 

@@ -6,6 +6,8 @@
 //! - `dump  <env-dir> [--out FILE]` — logical dump (mdb_dump-shaped, hex).
 //! - `load  <dump-file> <env-dir>` — rebuild a fresh env from a dump.
 //! - `check <env-dir>` — run the invariant walker; exit 1 on any violation.
+//! - `upgrade <old-env-dir> <new-env-dir>` — copy an env in the previous
+//!   on-disk format into a fresh env in the current one ([`legacy`]).
 //! - `migrate-from-lmdb <src> <dst>` — stream a real LMDB env into a fresh
 //!   zerodb env (needs the `migrate-lmdb` feature).
 //!
@@ -44,6 +46,7 @@
 pub mod commands;
 pub mod common;
 pub mod dump_format;
+pub mod legacy;
 pub mod naming;
 
 #[cfg(feature = "migrate-lmdb")]
@@ -118,6 +121,19 @@ fn dispatch(args: &[String]) -> Result<ExitCode, common::BoxErr> {
                 ExitCode::from(1)
             })
         }
+        "upgrade" => {
+            let (positional, opts) = parse_opts(rest)?;
+            let [src, dst] = positionals(
+                positional,
+                "upgrade <old-env-dir> <new-env-dir> [--page-size N] [--map-size BYTES]",
+            )?;
+            let map_size = opts.map_size.unwrap_or(DEFAULT_MAP_SIZE);
+            print!(
+                "{}",
+                legacy::cmd_upgrade(&src, &dst, opts.page_size, map_size)?
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         "migrate-from-lmdb" => run_migrate(rest),
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
@@ -163,6 +179,8 @@ Subcommands:
   load  <dump-file> <env-dir>           rebuild a fresh env from a dump
         [--page-size N] [--map-size BYTES]
   check <env-dir>                       invariant check (exit 1 on violations)
+  upgrade <old-env-dir> <new-env-dir>   copy an env in on-disk format 2 into a
+        [--page-size N] [--map-size BYTES]   fresh env in the current format
   migrate-from-lmdb <src> <dst>         stream an LMDB env into a fresh env
         [--page-size N] [--map-size BYTES]   (requires --features migrate-lmdb)
   -V, --version                         print the zerodb-tools version
@@ -170,7 +188,9 @@ Subcommands:
 
 stat, dump and check attach read-only to an env other processes have open,
 through its lock file, and read one consistent snapshot. load and
-migrate-from-lmdb refuse a destination that is non-empty or open elsewhere.";
+migrate-from-lmdb refuse a destination that is non-empty or open elsewhere.
+dump and upgrade also read an env in on-disk format 2 (the 0.2.0 release),
+which no process may have open while they run.";
 
 /// Parsed optional flags shared by several subcommands.
 #[derive(Default)]
@@ -312,6 +332,7 @@ mod tests {
                 "stray",
             ],
             &["load", "/nonexistent/dump", "/nonexistent/env", "stray"],
+            &["upgrade", "/nonexistent/old", "/nonexistent/new", "stray"],
         ] {
             let err = dispatch(&args(bad)).unwrap_err().to_string();
             assert!(
