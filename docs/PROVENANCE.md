@@ -95,9 +95,21 @@ plainly as the strengths.
   futex and `fcntl` code) and `heed-zerodb` (the lifetime-erased cursor and
   `Send` impls) do not run under miri, and they hold most of the `unsafe`
   code that touches the operating system.
-- **No I/O-error injection.** The fault-injecting backend models crashes, not
-  failing system calls. No test injects `EIO` or `ENOSPC` into a write or a
-  sync.
+- **I/O-error injection covers the data file's write, sync and growth calls
+  and the copy's destination writes, not the lock file.** The
+  fault-injecting backend can fail the `n`th write, sync or file-growth call
+  with `EIO`, `ENOSPC` or a short write, and the tests fail every such call of
+  a commit, of a spill, of the `WRITE_MAP` ranged `msync` and of a copy or
+  compaction ([SPEC 06 REC-23](SPEC/06-recovery.md)). Not covered: the lock
+  file (its creation, `fcntl` locks, `futex`), `mmap` itself, the file-copy
+  and clone routes of a raw copy (which move bytes through `std::io::copy`
+  and `std::fs::copy`), and `SIGBUS` from a `WRITE_MAP` store into a sparse
+  file on a full device, which kills the process as it does LMDB's. Only a
+  failed page write in a commit is compared with LMDB on a real failure (an
+  `EFBIG` from a file-size limit); LMDB's handling of the other failures was
+  read in its source. The tests found that a failed meta write leaves the
+  environment writable, which can corrupt the file
+  ([ADR-0047](adr/0047-failed-meta-write-policy.md), awaiting a decision).
 - **No power-loss test on a real device.** Crash tests use a model of what a
   disk may keep, and process kills, which leave the page cache intact. No
   test has cut power to a machine.

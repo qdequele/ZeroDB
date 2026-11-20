@@ -1212,7 +1212,11 @@ some DB tree walked from a meta root. Applies to the live meta's snapshot.
   header `txnid` == body `txnid`; on a torn slot the older intact slot is used
   (SPEC 02 §3.3).
 - **INV-3** — Page-size uniformity: every page is exactly `psize` bytes; the file
-  length is a whole multiple of `psize`.
+  length is a whole multiple of `psize`, except for a partial page past the
+  high-water `(last_pg + 1) × psize`. A positioned write that extended the file
+  and failed part-way (a short write on a full device, SPEC 06 REC-23) leaves
+  such a tail; no snapshot references it, and a later write of that page
+  completes it.
 - **INV-4** — Self pgno (**written pages only**): every page that is *reachable*
   through a DB tree (a leaf/branch/overflow-head of the main, named, or GC trees)
   has a header `pgno` equal to its file index (`file_offset / psize`). A page that
