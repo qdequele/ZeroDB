@@ -3,6 +3,11 @@
 - Status: Accepted (Option A-min, without shrinking; approved by the
   maintainer on 2026-11-02); implemented 2026-11-02 (see Implementation),
   measurement on a quiet Linux host owed
+- Note (2026-11-20): since ADR-0021 amendment 1 the write txn holds the map
+  as a page view, not a whole-map slice. Where this ADR says the writer's
+  whole-map view is re-derived after a growth in heap modes, the txn now
+  takes the backing's new page view after a growth in every mode. The rule
+  is SPEC 04 TXN-75 and the behavior difference D-031.
 - Related: issue #33; ADR-0004 (mapping strategy), ADR-0017 (spilling),
   ADR-0021 (in-place `WRITE_MAP`), ADR-0023 (multi-process access,
   amendment 15: `resize` and grow-only mappings), ADR-0026 (ranged `msync`);

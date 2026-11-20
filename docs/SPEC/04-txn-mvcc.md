@@ -968,10 +968,9 @@ spilling bullet there.)
   grown first, then a mapping of at least twice the current one is added;
   older mappings stay mapped, so every borrow survives). The txn already
   holds both writer locks that `resize` takes. Nothing staged or spilled
-  moves: frames are addressed by pgno. In heap modes the writer's cached
-  whole-map view is re-derived after a growth, as after a spill (TXN-71), so
-  a page later spilled past the old mapping resolves through the new one;
-  the in-place realization caches no view. A growth whose `mmap` or file
+  moves: frames are addressed by pgno. The write txn takes the backing's new
+  page view after a growth, in every mode, so a page later spilled or stored
+  past the old mapping resolves through the new one. A growth whose `mmap` or file
   growth fails returns that I/O error, and the txn is left as after a
   `MapFull` (TXN-30): abortable, the environment not poisoned. A growth
   changes no allocation decision, so contents and the high-water page equal
