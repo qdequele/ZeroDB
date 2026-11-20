@@ -103,7 +103,7 @@ plainly as the strengths.
   `EFBIG` from a file-size limit); LMDB's handling of the other failures was
   read in its source. The tests found that a failed meta write leaves the
   environment writable, which can corrupt the file
-  ([ADR-0046](adr/0046-failed-meta-write-policy.md), awaiting a decision).
+  ([ADR-0047](adr/0047-failed-meta-write-policy.md), awaiting a decision).
 - **No power-loss test on a real device.** Crash tests use a model of what a
   disk may keep, and process kills, which leave the page cache intact. No
   test has cut power to a machine.

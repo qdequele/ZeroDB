@@ -1,4 +1,4 @@
-# ADR-0046: What the environment does after a failed meta write or commit barrier
+# ADR-0047: What the environment does after a failed meta write or commit barrier
 
 - Status: Draft, awaiting approval. Nothing here is implemented.
 - Related issue: #176 (I/O-error injection)

@@ -251,7 +251,7 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 - A failed meta write (commit step C4) does not poison the environment. If
   the write was short but carried the whole meta, and a later write
   transaction is interrupted between its page writes and its meta write, the
-  file can be left corrupt (SPEC 06 conflict 5; the fix awaits ADR-0046).
+  file can be left corrupt (SPEC 06 conflict 5; the fix awaits ADR-0047).
 
 - Using an `Env` in a child after `fork()`, and sharing an environment across
   PID namespaces, are unsupported. `Env::sync` only serializes with this

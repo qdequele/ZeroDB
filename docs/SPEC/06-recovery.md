@@ -563,7 +563,7 @@ section; behavior clarifications per CONTRIBUTING.md rule 3):**
 | durability flags | REC-9..12 | SPEC 01 §S6/§S7, SPEC 04 §9 |
 | WRITE_MAP msync | REC-12 | SPEC 01 §S7 |
 | fsync-gate / poison | REC-13 | SPEC 04 §8.1/TXN-60 |
-| failed write, growth or copy | REC-23 | SPEC 04 TXN-59/62/69, SPEC 03 INV-3, ADR-0046 |
+| failed write, growth or copy | REC-23 | SPEC 04 TXN-59/62/69, SPEC 03 INV-3, ADR-0047 |
 | file growth safety | REC-14..16 | SPEC 05 GC-16/GC-28 |
 | PREV_SNAPSHOT recovery + crash window | REC-5, REC-22 | SPEC 04 TXN-65..67 (self-resolving, §10) |
 | crash-test protocol | REC-17..21 | M1.11, `zerodb-io` fault backend |
@@ -609,6 +609,6 @@ crash-window warning, placed with §1's PREV_SNAPSHOT topic; REC-23, placed with
 >    loss (reproduced in-process). A failed C5 leaves the same kind of meta in
 >    the file; the failing process is poisoned, but by the same reasoning a
 >    writer in another process of a lock-file env (REC-13 poisons per
->    process) can reach the same state (not tested). ADR-0046 (draft) proposes
+>    process) can reach the same state (not tested). ADR-0047 (draft) proposes
 >    LMDB's scrub and poisoning on every failed meta write; until it is
 >    decided, this is a known defect.

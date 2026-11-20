@@ -18,7 +18,7 @@
 //!
 //! Failures of `fsync` and of the meta write cannot be produced this way
 //! (the meta slots lie inside the file); for those, LMDB's handling was read
-//! in the fork's source and is compared in ADR-0046.
+//! in the fork's source and is compared in ADR-0047.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
