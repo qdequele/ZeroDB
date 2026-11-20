@@ -61,7 +61,7 @@ LMDB struct is transliterated.
 | Name | Value | Meaning |
 |------|-------|---------|
 | `MAGIC` | bytes `5A 44 42 31` (ASCII `"ZDB1"`) | 4-byte file identifier, stored as a byte array (endianness-free). |
-| `FORMAT_VERSION` | `3` (`u32`) | On-disk format version. Bumped only on an incompatible change (ADR-0002 §D8). Version 2 (ADR-0022) adds the meta free-list annex: `fl_count` at offset 168, `meta_crc` moved to 172 with split coverage, annex ids at 176 (§3/§3.3). Version 3 (ADR-0037) makes the GC key 16 bytes, `BE(txnid) ‖ BE(seq)`, and bounds every GC value so it is always inline (§7). A file of an earlier version is refused at open (§3.2 step 2); migration is logical, `dump` with the old build then `load` with the new one. |
+| `FORMAT_VERSION` | `3` (`u32`) | On-disk format version. Bumped only on an incompatible change (ADR-0002 §D8). Version 2 (ADR-0022) adds the meta free-list annex: `fl_count` at offset 168, `meta_crc` moved to 172 with split coverage, annex ids at 176 (§3/§3.3). Version 3 (ADR-0037) makes the GC key 16 bytes, `BE(txnid) ‖ BE(seq)`, and bounds every GC value so it is always inline (§7). A file of an earlier version is refused at open (§3.2 step 2) and never converted in place; migration is logical. `zerodb-tools upgrade` reads a version 2 file and writes a fresh version 3 environment, and `zerodb-tools dump` reads version 2 too (ADR-0045 draft): they run §3.2's slot predicate with version 2 (`MetaPage::validate_version`), since the meta layout is the same in versions 2 and 3, and read only the main and named databases, whose pages did not change. Version 1 was never released and is not read. |
 | `HEADER_SIZE` | `32` | Size of the common page header, bytes. |
 | `PGNO_INVALID` | `0xFFFF_FFFF_FFFF_FFFF` | Sentinel "no page". |
 | `META_A_PGNO` / `META_B_PGNO` | `0` / `1` | The two fixed meta-page slots. |
@@ -227,7 +227,9 @@ At env open the engine reads both slots and validates each independently:
 1. `magic == MAGIC`, else the file is not a ZeroDB env → `MdbError::Invalid`
    (SPEC 00 row 56).
 2. `format_version == FORMAT_VERSION`, else `MdbError::Invalid` (version
-   mismatch; ADR-0002 §D8).
+   mismatch; ADR-0002 §D8). The engine always checks against
+   `FORMAT_VERSION`; only `zerodb-tools` runs this predicate with an older
+   version, to read a file it upgrades (§0, `FORMAT_VERSION` row).
 3. `page_size` is a power of two in `[4096, 65536]`, else `MdbError::Invalid`.
 4. Header `txnid` (offset 8) equals body `txnid` (offset 64), else the slot is
    inconsistent and is **discarded** (INV-2). This guards a torn write that
