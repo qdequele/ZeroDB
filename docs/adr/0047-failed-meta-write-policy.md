@@ -1,6 +1,8 @@
 # ADR-0047: What the environment does after a failed meta write or commit barrier
 
-- Status: Draft, awaiting approval. Nothing here is implemented.
+- Status: Accepted (Option A), 2026-11-20. Implemented with #176.
+  Open questions 2 and 3 keep REC-13's answers: read transactions keep
+  working on a poisoned env, and a failed `Env::force_sync` keeps poisoning.
 - Related issue: #176 (I/O-error injection)
 - Date: 2026-11-20
 
@@ -127,7 +129,21 @@ approved, and it closes the reproduced in-process corruption with a change
 confined to the commit pipeline's failure path. Option C can follow if
 multi-process deployments make case 2 matter.
 
-## Consequences (if Option A is approved)
+## Decision
+
+Option A. The maintainer approved it on 2026-11-20, with REC-13's existing
+answers to open questions 2 and 3.
+
+The writer copies the target slot with `Backing::read_meta_copy` (one
+`pread` of one page per commit, into a buffer carried with the writer) rather
+than keeping the older meta from an earlier commit: in a lock-file
+environment another process may have written that slot since. The restore
+writes the copy back, then attempts the meta barrier again when the commit
+would have synced its meta (`sync_meta`), ignores both results, and poisons.
+The added `pread` was not benchmarked; it is a page-cache read next to the
+commit's two barriers.
+
+## Consequences
 
 - `commit_pipeline` (C4, C5): keep the slot's previous bytes; on failure,
   restore them, then `poison()`. `Backing` needs no new method
@@ -141,7 +157,8 @@ multi-process deployments make case 2 matter.
   (the scrub succeeds in the fault backend). New regression test: a short
   meta write, then a second transaction whose C3 fails, then the file must
   check clean and open at the last acknowledged commit (the reproduction
-  above; it fails on `main` today).
+  above): `failed_meta_write_then_interrupted_writer_keeps_the_file_consistent`,
+  in default mode and in-place `WRITE_MAP`.
 - The fault backend models the scrub as one more write: a pending write that
   a crash may keep or lose, so crash images may still recover `N`
   (consistent) or `N−1`.

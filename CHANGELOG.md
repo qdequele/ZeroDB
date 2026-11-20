@@ -215,6 +215,13 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 
 ### Fixed
 
+- A failed meta write (commit step C4) or meta barrier (C5) now writes the
+  meta slot's previous bytes back and poisons the environment, as LMDB marks
+  its environment fatal (SPEC 06 REC-13, ADR-0047). Before, a failed meta
+  write left the environment writable, and a short write that carried the
+  whole meta, followed by a write transaction interrupted between its page
+  writes and its meta write, could leave the file corrupt. Read transactions
+  keep working on the poisoned environment; LMDB refuses them.
 - `zerodb-tools check` on a file it walks raw no longer reports INV-3 for a
   partial page past the high-water. A write that extended the file and failed
   part-way (a short write on a full device) leaves one; no snapshot reads it.
@@ -274,11 +281,6 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
   opt-out.
 
 ### Known limits
-
-- A failed meta write (commit step C4) does not poison the environment. If
-  the write was short but carried the whole meta, and a later write
-  transaction is interrupted between its page writes and its meta write, the
-  file can be left corrupt (SPEC 06 conflict 5; the fix awaits ADR-0047).
 
 - Using an `Env` in a child after `fork()`, and sharing an environment across
   PID namespaces, are unsupported. `Env::sync` only serializes with this

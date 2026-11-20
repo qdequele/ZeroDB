@@ -1266,7 +1266,7 @@ spilling bullet there.)
 | allocation exceeds map_size | `MdbError::MapFull` | SPEC 02 §8, SPEC 05 GC-17 |
 | txn begin: snapshot beyond this env's map_size (another process grew the data) | `MdbError::MapResized` | SPEC 02 §8, ADR-0023 amendment 15 |
 | nested write txn attempt | unsupported (D-003) | TXN-40 |
-| fsync failed (poisoned) | `Error::Io` / poisoned | SPEC 06 REC-13 |
+| fsync failed, or meta write (C4) failed (poisoned) | `Error::Io` / poisoned; a failed C4 or C5 restores the meta slot | SPEC 06 REC-13, ADR-0047 |
 
 ---
 
@@ -1288,7 +1288,7 @@ every hook; this section defines the steps and their ordering. Both write modes
   | C1 | **freelist_save** (SPEC 05 §4): apply drain rewrites to the GC DB (dirtying GC pages into the dirty set, loop-until-stable, SPEC 05 GC-11) and place this txn's freed set — into the meta free-list annex when it fits (format v2, SPEC 05 §2a GC-32: stashed for C4, no tree write), else into the GC DB as records keyed `(N, seq)` (format v3, SPEC 05 GC-5). | H0 | `N−1` (all changes still in dirty set, nothing written). |
   | C2 | **write dirty pages** to their pgnos (`pwrite` each dirty frame; memcpy-into-map under heap-staged WRITE_MAP, TXN-45a; a no-op per in-map frame under in-place WRITE_MAP, TXN-45b — those bytes were stored at allocation/edit time, under the same TXN-62 invariant). Not yet durable. | **H1** | `N−1` live; new pages sit in free/beyond-HWM slots the `N−1` tree does not reference (TXN-62). Partial/torn data pages are unreferenced garbage. |
   | C3 | **fsync(data)** — flush all data pages (skipped under `NO_SYNC`/`MAP_ASYNC`, SPEC 06 REC-6). | **H2** | `N−1` live; txn `N`'s data fully durable but unreferenced (no meta points at it). |
-  | C4 | **write meta** to slot `N&1` (the *older* slot), with `txnid = writer_txnid`, the C1-stashed free-list annex (format v2, SPEC 02 §3) and a fresh CRC covering both (SPEC 02 §3.3). Not yet durable. | **H3** | Either `N−1` (meta `N` not yet reached disk, or reached but torn → CRC rejects it → older slot wins) or `N` (meta reached disk intact). Never a torn meta accepted. |
+  | C4 | **write meta** to slot `N&1` (the *older* slot), with `txnid = writer_txnid`, the C1-stashed free-list annex (format v2, SPEC 02 §3) and a fresh CRC covering both (SPEC 02 §3.3). Not yet durable. The slot's previous bytes are copied first; if C4 or C5 fails they are written back and the env is poisoned (SPEC 06 REC-13). | **H3** | Either `N−1` (meta `N` not yet reached disk, or reached but torn → CRC rejects it → older slot wins) or `N` (meta reached disk intact). Never a torn meta accepted. |
   | C5 | **fsync(meta)** — flush the meta page (skipped under `NO_META_SYNC`/`NO_SYNC`: the meta is written but not fsynced this commit, SPEC 06 REC-6/REC-7/REC-9). | **H4** | txn `N` durable and live. |
   | C6 | Publish the new snapshot (TXN-18/TXN-19): swap the `Arc<Snapshot>`, then `commit_point.store(writer_txnid, SeqCst)`; update `last_committed_txnid`; release the write mutex. | — | commit complete; new readers see `N`. |
 
