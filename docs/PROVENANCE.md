@@ -108,7 +108,7 @@ plainly as the strengths.
   a 64 KiB-page kernel. macOS on Apple silicon (16 KiB pages) runs the tests
   and the crash smoke in CI, but not the fuzz, miri, loom or nightly runs.
 - **No Windows support.** The crates do not build on Windows (a
-  `compile_error!`); ADR-0045 is a draft. LMDB's behavior on Windows has not
+  `compile_error!`); ADR-0046 is a draft. LMDB's behavior on Windows has not
   been observed by the oracle.
 - **No 24-hour fuzz soak.** The longest scheduled fuzz run is the nightly one.
 - **The consumer suites are not in CI.** They are run by hand

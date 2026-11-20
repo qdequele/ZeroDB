@@ -1,4 +1,4 @@
-# ADR-0045: Windows support
+# ADR-0046: Windows support
 
 - Status: Draft, awaiting approval (no Windows code is written; the crates
   stop at a `compile_error!` on any non-Unix target until this is approved

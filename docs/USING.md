@@ -209,7 +209,7 @@ them (ADR-0023).
 | Tested, supported | Linux x86-64; Linux aarch64 with 4 KiB pages | Every PR: the full CI (fmt, clippy, tests, differential fuzz; miri, loom and the crash smoke on x86-64). Nightly: long fuzz, full crash run, stress |
 | Tested, supported | macOS aarch64 (Apple silicon, 16 KiB pages) | Every PR: clippy, the test suite and the crash smoke. No fuzz, miri, loom or nightly runs |
 | Builds, best effort | Linux aarch64 with 64 KiB pages (such as RHEL for ARM); macOS x86-64; Linux on other 64-bit architectures | Same code paths as a tested target, but no CI runs them |
-| Unsupported | Windows | Fails to build with a `compile_error!`. A design is proposed in [ADR-0045](adr/0045-windows-support.md), awaiting approval |
+| Unsupported | Windows | Fails to build with a `compile_error!`. A design is proposed in [ADR-0046](adr/0046-windows-support.md), awaiting approval |
 | Unsupported | Other Unix systems (FreeBSD and others); 32-bit targets | Never built or tested |
 
 The primary target is Linux aarch64 (AWS Graviton). The database page size is

@@ -118,7 +118,7 @@ comment justifying it; assume a weak memory model (ARM), never "works on x86".
 
 linux-aarch64 (AWS Graviton 3 and 4) is the primary target; linux-x86_64 and
 macOS aarch64 are also tested in CI. Windows is not supported: the crates
-stop at a `compile_error!` there (ADR-0045 proposes the design). The tiers
+stop at a `compile_error!` there (ADR-0046 proposes the design). The tiers
 are in [docs/USING.md](docs/USING.md#platform-support), with the list of what
 differs on macOS and the tests that cover each difference: keep that list
 current when a change adds platform-specific code. The database page size is

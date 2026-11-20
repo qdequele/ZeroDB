@@ -246,7 +246,7 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
   `clear_stale_readers` (SPEC 04 §12.1).
 - **Platforms:** Linux (x86-64, aarch64) and macOS (aarch64) are tested in
   CI. Windows is not supported: the crates stop at a `compile_error!` there,
-  instead of dozens of unresolved Unix imports. ADR-0045 proposes the Windows
+  instead of dozens of unresolved Unix imports. ADR-0046 proposes the Windows
   design (draft). The tiers are in `docs/USING.md#platform-support`.
 
 ## [0.2.0] - 2026-10-05

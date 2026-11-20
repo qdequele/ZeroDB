@@ -36,12 +36,12 @@
 // here: every other ZeroDB crate depends on this one, so cargo builds it
 // first and stops at this one error instead of reporting dozens of
 // unresolved Unix imports from `zerodb-io`. Windows support is proposed in
-// docs/adr/0045-windows-support.md and not implemented.
+// docs/adr/0046-windows-support.md and not implemented.
 #[cfg(not(unix))]
 compile_error!(
     "ZeroDB does not support this target yet: it runs on Unix (Linux and \
      macOS) only. Windows support is proposed in ZeroDB's \
-     docs/adr/0045-windows-support.md and not implemented; see the platform \
+     docs/adr/0046-windows-support.md and not implemented; see the platform \
      support table in ZeroDB's README."
 );
 

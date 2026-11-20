@@ -90,7 +90,7 @@ jobs:
       - run: cargo install just --version 1.58.0 --locked
       - run: just crash-test-quick
 
-  # Windows is unsupported (ADR-0045, a draft). A build there must stop at
+  # Windows is unsupported (ADR-0046, a draft). A build there must stop at
   # the one `compile_error!` in zerodb-core, not at the Unix-only code
   # behind it. `cargo check` needs only the target's standard library.
   windows-guard:
