@@ -60,8 +60,13 @@ pub fn cmd_migrate(
     // process alone; the `Env` is held for the whole migration (ADR-0023).
     std::fs::create_dir_all(dst_dir)?;
     crate::commands::refuse_existing_env(dst_dir, "migrate into")?;
-    let dst =
-        crate::commands::open_exclusive_destination(dst_dir, page_size, map_size, "migrate into")?;
+    let dst = crate::commands::open_exclusive_destination(
+        dst_dir,
+        zerodb::DATA_FILE_NAME,
+        page_size,
+        map_size,
+        "migrate into",
+    )?;
 
     // --- Source: open LMDB read-only via heed ---
     let mut opts = EnvOpenOptions::new();
