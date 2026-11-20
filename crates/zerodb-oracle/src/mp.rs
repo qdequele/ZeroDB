@@ -573,6 +573,27 @@ mod worker {
                     }
                 }
 
+                /// A map set below the data is raised to exactly the pages in
+                /// use, so the next commit of another process crosses it or
+                /// not depending on page reuse. A raised map is therefore
+                /// grown to the big one at once, on both engines alike.
+                /// Returns the map size now asked for and the transcript text.
+                fn unraise(env: &Env<WithoutTls>, asked: usize) -> (usize, String) {
+                    let s = map_str(env.info().map_size, asked);
+                    if s != "raised" {
+                        return (asked, s);
+                    }
+                    // SAFETY: called only while this process holds no
+                    // transaction of `env`.
+                    match unsafe { env.resize(crate::mp::BIG_MAP) } {
+                        Ok(()) => (
+                            crate::mp::BIG_MAP,
+                            format!("raised, then {}", map_str(env.info().map_size, 0)),
+                        ),
+                        Err(err) => (asked, format!("raised, then {}", e(err))),
+                    }
+                }
+
                 fn main_db(env: &Env<WithoutTls>) -> $heed::Result<Option<Database<Bytes, Bytes>>> {
                     let r = env.read_txn()?;
                     let db = env.open_database::<Bytes, Bytes>(&r, None)?;
@@ -716,8 +737,9 @@ mod worker {
                                     // command).
                                     match unsafe { env.resize(size) } {
                                         Ok(()) => {
-                                            asked = size;
-                                            format!("Ok(map {})", map_str(env.info().map_size, size))
+                                            let (a, s) = unraise(env, size);
+                                            asked = a;
+                                            format!("Ok(map {s})")
                                         }
                                         Err(err) => e(err),
                                     }
@@ -800,16 +822,18 @@ mod worker {
                                     out.flush().unwrap();
                                 }
                                 Ok(env) => {
+                                    let mut asked = map.bytes();
                                     let r = match main_db(&env) {
-                                        Ok(_) => format!(
-                                            "Ok(map {})",
-                                            map_str(env.info().map_size, map.bytes())
-                                        ),
+                                        Ok(_) => {
+                                            let (a, s) = unraise(&env, asked);
+                                            asked = a;
+                                            format!("Ok(map {s})")
+                                        }
                                         Err(err) => format!("opened, {}", e(err)),
                                     };
                                     writeln!(out, "{r}").unwrap();
                                     out.flush().unwrap();
-                                    next = session(&env, dir, map.bytes(), &mut lines, &mut out);
+                                    next = session(&env, dir, asked, &mut lines, &mut out);
                                     env.prepare_for_closing().wait();
                                     if matches!(next, Some(Cmd::Close)) {
                                         next = None;

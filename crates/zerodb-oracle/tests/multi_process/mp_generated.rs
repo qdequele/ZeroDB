@@ -40,3 +40,58 @@ proptest! {
         }
     }
 }
+
+/// A worker reopened with a map smaller than the data: both engines raise it
+/// to the pages in use, a size that another process's next commit crosses or
+/// not depending on page reuse. The worker grows a raised map to the big one.
+#[test]
+fn raised_map_after_reopen() {
+    use zerodb_oracle::mp::{Cmd, MapChoice, MpCase, MpOp};
+    let case = MpCase {
+        workers: vec![MapChoice::Big, MapChoice::Big],
+        ops: vec![
+            MpOp::Run(0, Cmd::BeginRead(0)),
+            MpOp::Run(0, Cmd::Bulk { id: 1 }),
+            MpOp::Run(
+                0,
+                Cmd::Open {
+                    map: MapChoice::Small,
+                    read_only: false,
+                },
+            ),
+            MpOp::Run(
+                0,
+                Cmd::Write {
+                    start: 21,
+                    n: 1,
+                    vlen: 19,
+                    tag: 0,
+                },
+            ),
+            MpOp::Run(0, Cmd::BeginRead(0)),
+            MpOp::Run(0, Cmd::Delete { start: 126, n: 32 }),
+            MpOp::Run(
+                1,
+                Cmd::Write {
+                    start: 94,
+                    n: 5,
+                    vlen: 185,
+                    tag: 180,
+                },
+            ),
+            MpOp::Run(
+                0,
+                Cmd::Write {
+                    start: 0,
+                    n: 1,
+                    vlen: 0,
+                    tag: 0,
+                },
+            ),
+            MpOp::Run(0, Cmd::Info),
+        ],
+    };
+    if let Err(d) = run_mp(&case, exe()) {
+        panic!("{d}\n{case}");
+    }
+}
