@@ -525,6 +525,7 @@ impl FaultHandle {
             durable: st.durable.clone(),
             durable_len: st.durable_len,
             pending: st.pending_with_regions(self.live.pages().whole()),
+            map_len: self.live.pages().len() as u64,
         }
     }
 
@@ -902,6 +903,8 @@ pub struct CapturedDisk {
     pub durable_len: u64,
     /// Un-barriered writes in issue order.
     pub pending: Vec<WriteRecord>,
+    /// Length of the live mapping at the cut, in bytes.
+    pub map_len: u64,
 }
 
 impl CapturedDisk {

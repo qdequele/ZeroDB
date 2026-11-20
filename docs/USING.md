@@ -195,10 +195,18 @@ more fails with `MdbError::MapFull`. `EnvOpenOptions::initial_map_size(bytes)`
 maps only `bytes` at open and lets write transactions grow the map, and the
 file under `WRITE_MAP`, up to `map_size` (ADR-0036). `map_size` becomes a
 ceiling: `MapFull` comes only there, at the same point as with a fixed map of
-that size, and `info().map_size` reports it. The address space mapped then
-follows the data (at most about twice it), so a generous ceiling costs
-nothing up front. The file is never shrunk; give space back with a compacting
-copy.
+that size, and `info().map_size` reports it. Opening fails with
+`InvalidInput` when `bytes` is above `map_size`. The address space mapped then
+follows the data, so a generous ceiling costs nothing up front: each new
+mapping is at most twice the previous one, earlier mappings stay mapped until
+the environment closes, and together they stay below about four times the
+data. `map_size` caps the logical size, not the length of a mapping, so the
+last mapping can be longer than it. An existing data file longer than `bytes`
+is mapped whole at open, whatever the data needs; a file once opened with
+`WRITE_MAP` and a fixed map is that long. Under `WRITE_MAP`, the first
+process to open the environment sets the file's length at open; a process
+that joins later grows the file when it begins a write transaction. The file
+is never shrunk; give space back with a compacting copy.
 
 ## Multiple processes
 

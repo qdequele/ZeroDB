@@ -768,12 +768,18 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     reports. The **logical map size** starts at `n` (raised to what the data
     needs, as any open size is): it is what the open maps and, under
     `WRITE_MAP`, the length the data file is set to, and a write txn grows it
-    up to the ceiling where an allocation would pass it (SPEC 04 TXN-75). The
-    meta records the logical size, so a process without the option that
-    adopts it with `resize(0)` maps only what the data needs. `resize` with a
-    non-zero size sets the ceiling and keeps the logical size within it;
-    `resize(0)` adopts the meta's size as the logical size, as without the
-    option, and raises the ceiling to it if it is lower. A begin of an environment with the option follows another
+    up to the ceiling where an allocation would pass it (SPEC 04 TXN-75). An
+    initial size above the ceiling, or a ceiling above `MAX_MAP_SIZE`, is
+    refused at open with `Io(InvalidInput)`, before the data file is created.
+    A commit records `max(base meta map_size, logical size)` in the meta, so
+    a process without the option that adopts it with `resize(0)` maps only
+    what the data needs, unless an earlier commit recorded a larger map: that
+    size is kept. `resize` with a
+    non-zero size sets the ceiling and keeps the logical size within it
+    (lowering it when the new ceiling is below it, but never below what the
+    data needs); `resize(0)` adopts the meta's size as the logical size, as
+    without the option, and raises the ceiling to it if it is lower. A
+    `resize` that fails leaves the ceiling as it was. A begin of an environment with the option follows another
     process's growth instead of returning `MapResized` (TXN-75). The file
     is never shrunk.
   - **Runtime `map_size` selection.** At open the effective `map_size` is

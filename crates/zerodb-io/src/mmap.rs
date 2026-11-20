@@ -620,25 +620,31 @@ mod cross_mapping_flush_tests {
 
     /// Store a page through `old`, flush it as `how` says, and return the
     /// bytes the flush wrote to storage.
+    ///
+    /// The kernel may write the page back on its own between the store and
+    /// the flush; the flush then has nothing to write. One sample that wrote
+    /// nothing therefore proves nothing, so the sample is taken again, and 0
+    /// is returned only when eight in a row wrote nothing.
     #[cfg(target_os = "macos")]
     fn written_back(file: &File, old: &MmapWritable, new: &MmapWritable, how: &str) -> u64 {
         let os = os_page();
         let off = os; // page 1: inside both mappings
-        let fill = how.len() as u8;
-        store(old, off, &vec![fill; os]);
-        assert!(
-            dirty(old, off) || dirty(new, off),
-            "{how}: the store left the page clean"
-        );
-        let before = disk_bytes_written().expect("disk-write counter");
-        flush(file, old, new, off, how);
-        let after = disk_bytes_written().expect("disk-write counter");
-        assert!(
-            !dirty(old, off) && !dirty(new, off),
-            "{how}: page still dirty"
-        );
-        assert_visible(new, off, fill, how);
-        after - before
+        for attempt in 0..8u8 {
+            let fill = (how.len() as u8).wrapping_add(attempt);
+            store(old, off, &vec![fill; os]);
+            let before = disk_bytes_written().expect("disk-write counter");
+            flush(file, old, new, off, how);
+            let after = disk_bytes_written().expect("disk-write counter");
+            assert!(
+                !dirty(old, off) && !dirty(new, off),
+                "{how}: page still dirty"
+            );
+            assert_visible(new, off, fill, how);
+            if after - before >= os as u64 {
+                return after - before;
+            }
+        }
+        0
     }
 
     /// Store a page through `old`, flush it as `how` says, and return the

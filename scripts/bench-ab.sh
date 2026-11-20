@@ -33,7 +33,8 @@
 #               (default 0.03)
 #   OUT         output dir (default target/bench-ab/runs/<timestamp>)
 #   ZERODB_BENCH_TIER is passed through (long = include the 1M rung + concurrent).
-#   CAND_ENV    space-separated VAR=value pairs set for the "after" runs only, to
+#   CAND_ENV    space-separated VAR=value pairs set for the "after" runs only
+#               (and removed from the environment of the "before" runs), to
 #               A/B a runtime option of one engine build against its default
 #               (e.g. CAND_ENV=ZERODB_BENCH_TRUST_FILE=1 with a clean tree: the
 #               two binaries are then identical and only the option differs).
@@ -131,8 +132,17 @@ EOF
 run_side() { # side exe round
     log "round $3/$ROUNDS: $1"
     local extra=()
-    if [ "$1" = after ] && [ -n "${CAND_ENV:-}" ]; then
+    if [ -n "${CAND_ENV:-}" ]; then
         read -r -a extra <<<"$CAND_ENV"
+        if [ "$1" != after ]; then
+            # The control runs without the candidate's options, also when
+            # the caller's environment already exports one of them.
+            local pair unset=()
+            for pair in "${extra[@]}"; do
+                unset+=(-u "${pair%%=*}")
+            done
+            extra=("${unset[@]}")
+        fi
     fi
     env ${extra[@]+"${extra[@]}"} CRITERION_HOME="$OUT/round-$3/$1" "$2" --bench --noplot ${FILTER:+"$FILTER"} \
         >"$OUT/round-$3/$1.log" 2>&1 ||

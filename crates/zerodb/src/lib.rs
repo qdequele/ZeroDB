@@ -430,6 +430,9 @@ impl EnvOpenOptions {
     /// [`EnvOpenOptions::map_size`], the ceiling, instead of failing with
     /// [`MdbError::MapFull`]. `MapFull` fires only past the ceiling, which
     /// [`Env::info`] reports as `map_size`. Off by default.
+    ///
+    /// Opening fails with `Io(InvalidInput)` when `size` is above
+    /// [`EnvOpenOptions::map_size`] (1 MiB when it is not set).
     pub fn initial_map_size(&mut self, size: usize) -> &mut EnvOpenOptions {
         self.initial_map_size = Some(size as u64);
         self
@@ -644,6 +647,30 @@ impl EnvOpenOptions {
             map_async: self.flags.contains(EnvFlags::MAP_ASYNC),
             write_map: self.flags.contains(EnvFlags::WRITE_MAP) && !read_only,
         };
+
+        // ADR-0036: with map growth, `map_size` is the ceiling and is never
+        // passed to the open below, so it is checked here, before the data
+        // file is created.
+        if let Some(initial) = self.initial_map_size {
+            let ceiling = self.map_size.unwrap_or(DEFAULT_MAP_SIZE);
+            let refused = if ceiling > MAX_MAP_SIZE {
+                Some(format!(
+                    "map_size ({ceiling}) exceeds the supported maximum {MAX_MAP_SIZE}"
+                ))
+            } else if initial > ceiling {
+                Some(format!(
+                    "initial_map_size ({initial}) exceeds map_size ({ceiling})"
+                ))
+            } else {
+                None
+            };
+            if let Some(msg) = refused {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    msg,
+                )));
+            }
+        }
 
         let opened = zerodb_io::open_or_create_with_advice(
             &data_path,

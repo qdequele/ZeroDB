@@ -1329,19 +1329,17 @@ impl Env {
         // ADR-0036: with map growth on, a non-zero size sets the ceiling and
         // the logical size keeps what has been grown, within it; `0` adopts
         // the meta's size as the logical size and raises the ceiling to it.
-        // Relaxed: see the field; the writer locks are held.
-        let size = match inner.map_ceiling() {
-            Some(_) if new_size != 0 => {
-                inner.map_ceiling.store(size, Ordering::Relaxed);
-                inner.map_size().min(size).max(min)
-            }
-            Some(_) => {
-                inner.map_ceiling.fetch_max(size, Ordering::Relaxed);
-                size
-            }
-            None => size,
+        let (size, ceiling) = match inner.map_ceiling() {
+            Some(_) if new_size != 0 => (inner.map_size().min(size).max(min), Some(size)),
+            Some(old) => (size, Some(old.max(size))),
+            None => (size, None),
         };
         inner.backing_ref().grow_map(size).map_err(Error::Io)?;
+        // Stored only now: a resize that failed leaves the ceiling as it was.
+        if let Some(ceiling) = ceiling {
+            // Relaxed: see the field; the writer locks are held.
+            inner.map_ceiling.store(ceiling, Ordering::Relaxed);
+        }
         // The guard's drop releases both writer locks.
         drop(guard);
         Ok(())

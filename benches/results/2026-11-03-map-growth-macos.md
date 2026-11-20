@@ -108,7 +108,10 @@ As 2 with `ZERODB_BENCH_WRITE_MAP=1` for both engines. Verdict
   `MapResized`.
 - With the option on, these rungs are the worst case: each iteration builds a
   fresh environment, so it pays every growth from 64 KiB to the rung's data
-  size, about nine of them, inside the timed region. In heap mode a growth is
+  size, about nine of them, inside the timed region. The exception is the
+  rungs that load their data in the untimed setup (`put/cursor/rewrite` and
+  its reserved variants): the load grows the map before the timer starts, and
+  this run does not show whether their timed rewrite grows it again. In heap mode a growth is
   one lazy `mmap` and the cost disappears in the noise. Under `WRITE_MAP`
   a growth is a file extension (`ftruncate`), a new writable mapping, and
   page faults again on pages the txn already touched through the old mapping.

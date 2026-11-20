@@ -78,4 +78,7 @@ pub struct CutReport {
     /// with zero here and nonzero writemap cycles would mean the in-place
     /// crash coverage went vacuous.
     pub map_regions: u64,
+    /// The cycle ran with map growth (ADR-0036) and its map had grown past
+    /// the initial size when the cut was taken. Image cuts only.
+    pub grown_map: bool,
 }

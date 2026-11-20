@@ -960,13 +960,16 @@ spilling bullet there.)
   Off by default (LMDB's fixed size). An environment opened with
   `initial_map_size` keeps two sizes: the **ceiling** (`map_size`, reported by
   `Env::info`) and the **logical map size**, which starts at the initial size
-  (or what the data needs) and only grows. Where an allocation would end past
+  (or what the data needs) and which a write txn only grows (`Env::resize`
+  with a non-zero size below it lowers it, SPEC 02 §8). Where an allocation would end past
   the logical size (SPEC 05 GC-17), the write txn grows it instead of failing:
   past the ceiling it is still `MapFull`; otherwise the new logical size is
   `min(ceiling, max(needed, 2 × logical))`, published through the backing
-  exactly as `Env::resize` publishes (under `WRITE_MAP` the data file is
-  grown first, then a mapping of at least twice the current one is added;
-  older mappings stay mapped, so every borrow survives). The txn already
+  exactly as `Env::resize` publishes: under `WRITE_MAP` the data file is
+  grown first; the current mapping is kept when it already covers the new
+  size, and otherwise a mapping of `max(new size, 2 × current mapping)` bytes
+  is added, or of exactly the new size when the larger one cannot be mapped.
+  Older mappings stay mapped, so every borrow survives. The txn already
   holds both writer locks that `resize` takes. Nothing staged or spilled
   moves: frames are addressed by pgno. The write txn takes the backing's new
   page view after a growth, in every mode, so a page later spilled or stored

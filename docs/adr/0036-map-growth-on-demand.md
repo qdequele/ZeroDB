@@ -298,6 +298,9 @@ unbounded size, so this does not remove the re-run. Rejected.
 - With it, the mapping (and under `WRITE_MAP` the file) starts at
   `max(initial size, file length)` and grows inside the write transaction,
   geometrically through the existing grow-only mappings, up to `map_size`.
+  `map_size` caps the logical size, not a mapping's length or the address
+  space in use: a growth may add a mapping of twice the current one, which
+  can pass the ceiling, and earlier mappings stay mapped.
   `MapFull` is returned only at the ceiling. Without `WRITE_MAP` the growth
   is deferred to the first read of a spilled page past the mapping, or to
   commit.

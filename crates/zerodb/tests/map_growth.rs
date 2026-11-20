@@ -389,7 +389,110 @@ fn child_entry() {
             );
             assert_eq!(env.info().map_size, CEILING as u64);
         }
+        // A process with map growth whose ceiling (1 MiB) is below what the
+        // other process commits: its begins cannot follow, so both return
+        // `MapResized`, the write begin first, before any read.
+        "capped_follower" => {
+            let env = open_shared(&dir, true, 1 << 20, EnvFlags::EMPTY);
+            mark(&dir, "reader-ready");
+            wait_for(&dir.join("grown"));
+            match env.write_txn() {
+                Err(zerodb::Error::Mdb(MdbError::MapResized)) => {}
+                other => panic!(
+                    "write begin: expected MapResized, got {:?}",
+                    other.map(|_| ())
+                ),
+            }
+            match env.read_txn() {
+                Err(zerodb::Error::Mdb(MdbError::MapResized)) => {}
+                other => panic!(
+                    "read begin: expected MapResized, got {:?}",
+                    other.map(|_| ())
+                ),
+            }
+            assert_eq!(env.info().map_size, 1 << 20, "the ceiling is unchanged");
+        }
+        // A process with map growth, opened before the other grew the map,
+        // whose first begin after the growth is a write begin: it follows
+        // the growth with no read or `resize` before it.
+        role @ ("write_first" | "write_first_write_map") => {
+            let flags = if role == "write_first" {
+                EnvFlags::EMPTY
+            } else {
+                EnvFlags::WRITE_MAP
+            };
+            let env = open_shared(&dir, true, CEILING, flags);
+            let db = env.main_database();
+            let first = env.backing_bytes().len();
+            mark(&dir, "reader-ready");
+            wait_for(&dir.join("grown"));
+            let mut w = env.write_txn().expect("a write begin follows the growth");
+            assert!(env.backing_bytes().len() > first, "this process's map grew");
+            assert_eq!(db.len(&w).unwrap(), 1_300);
+            db.put(&mut w, b"from-the-follower", b"v").unwrap();
+            w.commit().unwrap();
+        }
         other => panic!("unknown role {other}"),
+    }
+}
+
+#[test]
+fn a_snapshot_past_the_ceiling_is_map_resized_for_both_begins() {
+    let dir = TempDir::new();
+    let env = open_shared(dir.path(), true, CEILING, EnvFlags::EMPTY);
+    let mut follower = child("capped_follower", dir.path());
+    wait_for(&dir.path().join("reader-ready"));
+    write_4mib(&env, "a");
+    mark(dir.path(), "grown");
+    wait_success(&mut follower);
+}
+
+#[test]
+fn a_write_begin_follows_another_process_growth_first() {
+    for (role, flags) in [
+        ("write_first", EnvFlags::EMPTY),
+        ("write_first_write_map", EnvFlags::WRITE_MAP),
+    ] {
+        let dir = TempDir::new();
+        let env = open_shared(dir.path(), true, CEILING, flags);
+        let mut follower = child(role, dir.path());
+        wait_for(&dir.path().join("reader-ready"));
+        write_4mib(&env, "a");
+        mark(dir.path(), "grown");
+        wait_success(&mut follower);
+        let r = env.read_txn().unwrap();
+        assert_eq!(env.main_database().len(&r).unwrap(), 1 + 1_300);
+        drop(r);
+        assert_clean(dir.path(), PS);
+    }
+}
+
+/// A reader pinned before a growth keeps its borrow and its snapshot while
+/// the map it began on is replaced by a longer one, in its own process.
+#[test]
+fn a_pinned_reader_keeps_reading_across_a_growth() {
+    for flags in [EnvFlags::EMPTY, EnvFlags::WRITE_MAP] {
+        let dir = TempDir::new();
+        let env = open(dir.path(), true, flags);
+        let db = env.main_database();
+        let mut w = env.write_txn().unwrap();
+        db.put(&mut w, b"pinned", b"before growth").unwrap();
+        w.commit().unwrap();
+
+        let r = env.read_txn().unwrap();
+        let pinned = db.get(&r, b"pinned").unwrap().unwrap();
+        let first = env.backing_bytes().len();
+        write_4mib(&env, "a");
+        assert!(
+            env.backing_bytes().len() > first,
+            "the map grew under the reader"
+        );
+        assert_eq!(pinned, b"before growth", "the borrow survives the growth");
+        assert_eq!(db.len(&r).unwrap(), 1, "the snapshot is unchanged");
+        assert_eq!(contents(&r, db).len(), 1);
+        drop(r);
+        let r = env.read_txn().unwrap();
+        assert_eq!(db.len(&r).unwrap(), 1 + 1_300);
     }
 }
 
@@ -492,4 +595,44 @@ fn resize_sets_the_ceiling_under_map_growth() {
         4 << 20,
         "resize(0) keeps a higher ceiling"
     );
+}
+
+/// With growth on, `map_size` is the ceiling: an initial size above it, or a
+/// ceiling above the supported maximum, is refused before any data file is
+/// created.
+#[test]
+fn growth_options_are_checked_before_the_file_is_created() {
+    let refused = |initial: usize, ceiling: Option<usize>| {
+        let dir = TempDir::new();
+        let mut opts = EnvOpenOptions::new();
+        opts.initial_map_size(initial).page_size(PS);
+        if let Some(c) = ceiling {
+            opts.map_size(c);
+        }
+        // SAFETY: only ZeroDB writes this environment's files.
+        match unsafe { opts.open(dir.path()) } {
+            Err(zerodb::Error::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+            }
+            other => panic!("expected Io(InvalidInput), got {:?}", other.map(|_| ())),
+        }
+        assert!(
+            !dir.path().join("zerodb.dat").exists(),
+            "no data file after a refused open"
+        );
+    };
+    refused(4 << 20, Some(1 << 20));
+    // The default ceiling is 1 MiB.
+    refused(4 << 20, None);
+    refused(INITIAL, Some(zerodb::MAX_MAP_SIZE as usize + PS as usize));
+
+    // An initial size equal to the ceiling is accepted.
+    let dir = TempDir::new();
+    let mut opts = EnvOpenOptions::new();
+    opts.map_size(1 << 20)
+        .initial_map_size(1 << 20)
+        .page_size(PS);
+    // SAFETY: only ZeroDB writes this environment's files.
+    let env = unsafe { opts.open(dir.path()) }.expect("initial == ceiling");
+    assert_eq!(env.info().map_size, 1 << 20);
 }
