@@ -109,8 +109,13 @@ plainly as the strengths.
   Read-only environments and multi-process behavior are covered by
   hand-written scenarios only, not by generated sequences. Concurrent readers
   and writers are stress-tested on ZeroDB alone, not compared with LMDB.
-- **4 KiB-page kernels only.** CI runs on GitHub's x86-64 and aarch64 runners,
-  which use 4 KiB OS pages. ZeroDB has not been run on a 64 KiB-page kernel.
+- **4 KiB-page kernels only, on Linux.** CI runs on GitHub's x86-64 and
+  aarch64 Linux runners, which use 4 KiB OS pages. ZeroDB has not been run on
+  a 64 KiB-page kernel. macOS on Apple silicon (16 KiB pages) runs the tests
+  and the crash smoke in CI, but not the fuzz, miri, loom or nightly runs.
+- **No Windows support.** The crates do not build on Windows (a
+  `compile_error!`); ADR-0046 is a draft. LMDB's behavior on Windows has not
+  been observed by the oracle.
 - **No 24-hour fuzz soak.** The longest scheduled fuzz run is the nightly one.
 - **Consumers newer than the pins.** Meilisearch v1.56 and later, and
   hannoy v0.3.0, depend on heed 0.23, which the adapter does not provide; on
