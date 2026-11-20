@@ -10,9 +10,10 @@
 #                                #   run the same `cargo xtask bench` workloads on both
 #
 # Environment:
-#   MEILISEARCH_REF    git ref to test (default: v1.55.0, which builds against
-#                      Meilisearch's heed fork; v1.53.1 is the last release on
-#                      stock heed 0.22.1)
+#   MEILISEARCH_REF    git ref to test (default: v1.55.1, the latest release on
+#                      heed 0.22.1, through Meilisearch's heed fork; v1.53.1 is
+#                      the last release on stock heed 0.22.1; v1.56.0 and later
+#                      use heed 0.23, which the adapter does not provide)
 #   MEILISEARCH_SRC    a local Meilisearch checkout to `git clone --shared` from
 #                      (saves the network clone; the checkout itself is never touched)
 #   MEILISEARCH_CLONE  reuse this clone instead of creating one under WORKDIR
@@ -39,7 +40,7 @@ set -euo pipefail
 
 ZERODB="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODE="${1:-check}"
-MEILISEARCH_REF="${MEILISEARCH_REF:-v1.55.0}"
+MEILISEARCH_REF="${MEILISEARCH_REF:-v1.55.1}"
 WORKDIR="${WORKDIR:-$ZERODB/target/consumer}"
 CLONE="${MEILISEARCH_CLONE:-$WORKDIR/meilisearch}"
 WORKLOADS="${WORKLOADS:-workloads/movies.json workloads/search/movies.json}"
@@ -75,10 +76,11 @@ do_check() {
 do_suites() {
     do_check
     log "milli + index-scheduler test suites on ZeroDB"
-    (cd "$CLONE" && cargo test -p milli -p index-scheduler)
+    run_tests -p milli -p index-scheduler
     if [ "${FULL:-0}" = 1 ]; then
         log "meilisearch --lib + meilisearch-auth on ZeroDB"
-        (cd "$CLONE" && cargo test -p meilisearch-auth && cargo test -p meilisearch --lib)
+        run_tests -p meilisearch-auth
+        run_tests -p meilisearch --lib
     fi
 }
 
@@ -172,6 +174,7 @@ cleanup() {
 }
 
 ensure_clone "$MEILISEARCH_REF" "${MEILISEARCH_SRC:-}" https://github.com/meilisearch/meilisearch
+report_versions Meilisearch "$MEILISEARCH_REF"
 trap cleanup EXIT
 case "$MODE" in
     check)  do_check ;;

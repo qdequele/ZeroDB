@@ -178,13 +178,16 @@ orders are available through `key_comparator` instead.
 
 ## What Meilisearch and hannoy use
 
-Everything they call is **Same** or a supported LMDB feature. This was checked
-on Meilisearch v1.53.1, Meilisearch v1.55.0 (through the `unique-txns` shim)
-and hannoy v0.1.7-nested-rtxns, by running their test suites on the shim with
-no source changes ([maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md)).
-Meilisearch v1.55.0 needs manifest changes ([USING.md](USING.md#as-a-heed-replacement)).
-The suites are run by hand, not in CI: the last recorded passes are 2026-10-18
-for Meilisearch v1.55.0 and 2026-09-09 for Meilisearch v1.53.1 and hannoy.
+Everything they call is **Same** or a supported LMDB feature. This is checked
+by running their test suites on the shim with no source changes, nightly in CI
+([maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md)), on Meilisearch
+v1.55.1 (through the `unique-txns` shim, with manifest changes:
+[USING.md](USING.md#as-a-heed-replacement)) and hannoy v0.2.0. Earlier passes
+cover Meilisearch v1.53.1 and hannoy v0.1.7-nested-rtxns (2026-09-09). The
+last recorded run, 2026-11-20 on `main` at `c7e1abf`: Meilisearch v1.55.1's
+milli and index-scheduler suites, 448 passed, 0 failed, 4 ignored; hannoy
+v0.2.0, 59 passed, 0 failed, 1 ignored. Meilisearch v1.56 and later, and
+hannoy v0.3.0, use heed 0.23, which the adapter does not provide.
 None of the differences below is reached by either consumer.
 
 ## Behavior differences
@@ -223,6 +226,7 @@ difference. Details live in the linked ADR or SPEC section.
 | <a id="d-025"></a>D-025 | Two `PREV_SNAPSHOT` cases | (a) If the opener ends before its first commit, a waiting process reads the older meta (or fails with `EINVAL` on macOS after a clean close). (b) A read-only `PREV_SNAPSHOT` open is not refused while another process holds the env, and rolls every process back to the older meta. | (a) A waiting process re-initializes the lock file and serves the newest meta. (b) A read-only `PREV_SNAPSHOT` joiner fails with `EAGAIN` and the running env is untouched, because matching LMDB would let a writer reuse pages that newer readers still read. | Approved |
 | <a id="d-026"></a>D-026 | Database handles in two stale cases | (a) A handle whose slot was freed by an abort and reused for another name reads that other database. (b) When two read txns first-open the same name, later txns get `MDB_BAD_DBI` through either handle. | (a) `EINVAL`: a handle carries its slot's generation. (b) The slot is shared by its openers and both handles stay valid (SPEC 04 DBI-9). | Approved (a), Proposed (b) |
 | <a id="d-027"></a>D-027 | Which freed pages a write txn reuses | (a) Pages freed by txn `N − 1` are never reused by txn `N`, even with no reader open. (b) Freed records are merged before searching for a run of contiguous pages. | (a) Pages freed by txn `N − 1` are reused when no reader pins an older snapshot (SPEC 05 GC-18), so files are never larger for this reason. (b) Same since ADR-0029: the gated records are merged and searched (SPEC 05 GC-16, GC-21). | Proposed (a), Resolved (b) |
+| <a id="d-028"></a>D-028 | Dead readers at a writer takeover, on macOS | The next writer after a writer process died frees the reader slots of dead processes, on macOS as on Linux (its SysV semaphore reports the dead owner). | On Linux, the same. On macOS the cross-process writer lock is an `fcntl` record lock, which does not report a previous owner, so those slots stay until `clear_stale_readers` or the next first opener (SPEC 04 §12.1). Matching LMDB needs an ADR-0023 amendment to the macOS writer lock. | Proposed |
 
 ### Checks the adapter re-imposes
 

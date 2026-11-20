@@ -32,8 +32,20 @@ publish of the four engine crates (`zerodb-core`, `zerodb-io`, `zerodb`,
    just stress
    ```
 
-2. **Consumer gate** (docs/maintainers/CONSUMER-GATE.md) against the Meilisearch and
-   hannoy refs named in the CHANGELOG entry:
+2. **Consumer gate, green on the release commit. Required: no tag without it.**
+   Run the CI workflow by hand on the release commit (Actions → CI → Run
+   workflow, or `gh workflow run ci.yml --ref <branch>`) and wait for both
+   `consumer gate (meilisearch)` and `consumer gate (hannoy)` to pass. They run
+   Meilisearch's milli and index-scheduler suites and hannoy's suite on ZeroDB
+   at the refs pinned in `.github/workflows/ci.yml`
+   ([CONSUMER-GATE.md](CONSUMER-GATE.md)). A failure, including a build break
+   on a newer consumer release, blocks the release until it is fixed or the
+   pin is moved back with a reason in the CHANGELOG. Record in the CHANGELOG
+   entry the run's link, the date, the consumer refs and commits, and the test
+   counts from the job summary.
+
+   The same scripts run locally; use them to reproduce a CI failure and for
+   the benchmarks, which CI does not run:
 
    ```sh
    MEILISEARCH_SRC=… just consumer-suites
@@ -68,9 +80,12 @@ publish of the four engine crates (`zerodb-core`, `zerodb-io`, `zerodb`,
 
 6. **On-disk format.** If `FORMAT_VERSION` (`crates/zerodb-core/src/page/mod.rs`)
    changed since the last release, the entry must say so in its first line and
-   give the migration path (`zerodb-tools dump` on the old binary, `load` on the
-   new one). A format bump is an ADR (`CONTRIBUTING.md` rule 5) and a minor-version bump
-   at least while 0.x.
+   give the migration path: `zerodb-tools upgrade <old-env> <new-env>` from
+   the new release, which must read the previous release's format (check it
+   against a fixture written by that release, as
+   `crates/zerodb-tools/tests/upgrade_format_v2.rs` does for 0.2.0). A format
+   bump is an ADR (`CONTRIBUTING.md` rule 5) and a minor-version bump at least
+   while 0.x. ADR-0045 (draft) proposes the policy for when a bump may happen.
 
 7. **Publish dry run** on the release commit (CI does the manifest-only
    variant on every PR; this one also builds each packaged crate):
@@ -84,6 +99,38 @@ publish of the four engine crates (`zerodb-core`, `zerodb-io`, `zerodb`,
    internal dependencies are exact pins (`version = "=X.Y.Z"`), so the version
    bump in step 4 must also update those pins in `zerodb-io`, `zerodb` and
    `zerodb-tools`.
+
+## Hardening runs
+
+*Proposed; not yet a release requirement.* The two runs of
+[HARDENING-RUNS.md](HARDENING-RUNS.md) need hardware GitHub's hosted runners
+do not offer, so they cannot be part of the tag workflow. The proposal:
+
+- **Before a minor release (`0.Y.0`) and before a release that changes
+  `zerodb-io`, the commit path or the on-disk format:** a page-size matrix
+  (`just page-size-matrix`) on a 64 KiB-page aarch64 kernel, and a 24-hour
+  soak (`just soak`) on x86-64 and on aarch64, all on the release commit or
+  on a commit whose diff to it touches neither `crates/` nor `fuzz/`.
+- **Before a patch release** that touches none of those: the most recent
+  recorded runs stand; name them in the CHANGELOG entry.
+- Each run's `summary.md` is committed under `docs/hardening-runs/` and cited
+  from the CHANGELOG entry, as benchmark tables are. A run with a finding
+  blocks the release until the finding is fixed or recorded as a known gap in
+  the entry.
+
+This becomes step 8 of "Before tagging" once the maintainer accepts it and
+the first runs are recorded.
+
+**A self-hosted runner instead.** The matrix could run unattended on a
+self-hosted aarch64 runner with a 64 KiB kernel, labelled for example
+`[self-hosted, linux, arm64, pagesize-64k]`, as a `workflow_dispatch` and
+release-tag job that calls `just page-size-matrix`; the soak, at 24 h, would
+need the runner's job timeout raised past GitHub's default. Before adding
+one: the repository is public, so the runner must never run pull-request
+workflows (a fork's PR would execute arbitrary code on it); it should be an
+ephemeral, single-job machine; and the job must not receive the
+`CARGO_REGISTRY_TOKEN` secret. None of this is set up, and the CI workflow
+keeps its note that such a runner has to be added by hand.
 
 ## Tagging
 
@@ -139,7 +186,8 @@ be replaced, only yanked (`cargo yank`); the fix is a patch release.
   with a dump/load path.
 - **Platforms**: linux-aarch64, linux-x86_64, macOS aarch64; DB page size is
   independent of the OS page size, but a 64K-page kernel has not been exercised
-  in CI yet (see the release notes' known gaps).
+  yet (see the release notes' known gaps, and
+  [HARDENING-RUNS.md](HARDENING-RUNS.md) for the run that would close it).
 - **MSRV**: the workspace `rust-version` is what a **consumer** needs to build
   the library crates and `zerodb-tools` (checked in CI without
   dev-dependencies). Developing ZeroDB itself — running the oracle, benches and
