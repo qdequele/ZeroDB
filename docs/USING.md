@@ -187,6 +187,27 @@ going, as LMDB does. `EnvOpenOptions::max_dirty_bytes(bytes)` sets the limit in
 bytes (ADR-0017). Lower it to bound the memory of very large transactions;
 results and files never depend on it.
 
+### Map growth
+
+By default `map_size` is fixed, as in LMDB: the whole size is mapped at open
+(and, under `WRITE_MAP`, the data file is set to it), and a write that needs
+more fails with `MdbError::MapFull`. `EnvOpenOptions::initial_map_size(bytes)`
+maps only `bytes` at open and lets write transactions grow the map, and the
+file under `WRITE_MAP`, up to `map_size` (ADR-0036). `map_size` becomes a
+ceiling: `MapFull` comes only there, at the same point as with a fixed map of
+that size, and `info().map_size` reports it. Opening fails with
+`InvalidInput` when `bytes` is above `map_size`. The address space mapped then
+follows the data, so a generous ceiling costs nothing up front: each new
+mapping is at most twice the previous one, earlier mappings stay mapped until
+the environment closes, and together they stay below about four times the
+data. `map_size` caps the logical size, not the length of a mapping, so the
+last mapping can be longer than it. An existing data file longer than `bytes`
+is mapped whole at open, whatever the data needs; a file once opened with
+`WRITE_MAP` and a fixed map is that long. Under `WRITE_MAP`, the first
+process to open the environment sets the file's length at open; a process
+that joins later grows the file when it begins a write transaction. The file
+is never shrunk; give space back with a compacting copy.
+
 ## Multiple processes
 
 The lock file is on by default, so several processes can open one environment
@@ -201,7 +222,8 @@ them (ADR-0023).
   slots.
 - If another process grows the map, a txn begin returns
   `MdbError::MapResized`. Call `resize(0)` to adopt the new size, then begin
-  again.
+  again. With `initial_map_size`, the begin follows the growth itself, up to
+  this process's `map_size`.
 - Do not use an `Env` in a child after `fork()`, and do not share an
   environment across PID namespaces.
 

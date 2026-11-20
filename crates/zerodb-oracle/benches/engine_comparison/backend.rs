@@ -749,6 +749,15 @@ macro_rules! bench_backend {
         if crate::backend::bench_knob("ZERODB_BENCH_SEQUENTIAL_WRITES") {
             $opts.sequential_writes(true);
         }
+        // ADR-0036 bench axis: `ZERODB_BENCH_INITIAL_MAP=<bytes>` opens every
+        // zerodb env with map growth from that initial size, under the
+        // rung's map size as the ceiling.
+        if let Some(n) = crate::backend::bench_bytes("ZERODB_BENCH_INITIAL_MAP") {
+            // In scope for a base build without the option; unused otherwise.
+            #[allow(unused_imports)]
+            use crate::backend::InitialMapSizeShim as _;
+            $opts.initial_map_size(n);
+        }
     };
     (@setpage $opts:ident, $page:ident, noset) => {
         // LMDB derives its page size from the OS; nothing to set.
@@ -774,6 +783,38 @@ macro_rules! bench_backend {
 pub fn trust_file_requested() -> bool {
     static REQ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *REQ.get_or_init(|| bench_knob("ZERODB_BENCH_TRUST_FILE"))
+}
+
+/// The bench env variable `name` as a byte count, if set.
+///
+/// # Panics
+///
+/// If the variable is set to anything but a decimal byte count: a run whose
+/// option was silently dropped would be reported as a run with the option.
+pub fn bench_bytes(name: &str) -> Option<usize> {
+    let value = std::env::var(name).ok()?;
+    match value.parse() {
+        Ok(n) => Some(n),
+        Err(_) => panic!("{name}={value:?} is not a byte count (decimal digits only)"),
+    }
+}
+
+/// `initial_map_size` for a ZeroDB build that has no such option.
+///
+/// `scripts/bench-ab.sh` builds this harness over a base worktree too, and a
+/// base from before ADR-0036 has no `EnvOpenOptions::initial_map_size`. Where
+/// the inherent method exists it is the one called; this one only lets the
+/// harness compile where it does not.
+#[allow(dead_code)]
+pub trait InitialMapSizeShim {
+    /// Refuses: this build cannot grow its map.
+    fn initial_map_size(&mut self, size: usize) -> &mut Self;
+}
+
+impl<T: heed_zerodb::TlsUsage> InitialMapSizeShim for heed_zerodb::EnvOpenOptions<T> {
+    fn initial_map_size(&mut self, _size: usize) -> &mut Self {
+        panic!("ZERODB_BENCH_INITIAL_MAP is set, but this ZeroDB build has no map growth")
+    }
 }
 
 /// Whether the bench env variable `name` is set to `1`.

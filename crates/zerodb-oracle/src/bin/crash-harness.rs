@@ -170,6 +170,8 @@ struct Totals {
     /// Verified cycles of large-clear cuts (`Spec::gc_clear`): proof the
     /// bounded free-page record paths (SPEC 05 GC-5) were cut through.
     gc_clear_verified: u64,
+    /// Image cuts of growth cycles whose map had grown at the cut (ADR-0036).
+    grown_maps: u64,
     by_mode: std::collections::BTreeMap<&'static str, u64>,
     violations: Vec<String>,
 }
@@ -198,6 +200,7 @@ impl Totals {
         self.stale_fallback += r.stale_fallback;
         self.sigkill_spilled += r.spilled_txns;
         self.map_regions += r.map_regions;
+        self.grown_maps += u64::from(r.grown_map);
         if let Some(m) = r.mode {
             *self.by_mode.entry(m.name()).or_default() += r.verified;
         }
@@ -274,8 +277,8 @@ fn main() {
             }
             None => {
                 println!(
-                    "repro clean: {} cycles verified (abandoned: {})",
-                    report.verified, report.abandoned
+                    "repro clean: {} cycles verified (abandoned: {}, grown map: {})",
+                    report.verified, report.abandoned, report.grown_map
                 );
                 return;
             }
@@ -393,6 +396,7 @@ fn main() {
          spilling txns   : {} image, {} sigkill + mp (ADR-0017 spill cycles)\n\
          in-place regions: {} (ADR-0021: brokered map regions journaled by WRITE_MAP image cuts)\n\
          large clears    : {} cycles (ADR-0037: a clear of thousands of pages, then small commits)\n\
+         grown maps      : {} image cuts (ADR-0036: growth cycles whose map grew before the cut)\n\
          wall time       : {:.1}s ({:.1} cycles/s)",
         t.verified,
         t.image_cuts,
@@ -411,6 +415,7 @@ fn main() {
         t.sigkill_spilled,
         t.map_regions,
         t.gc_clear_verified,
+        t.grown_maps,
         secs,
         t.verified as f64 / secs.max(0.001),
     );
@@ -459,13 +464,14 @@ fn run_isolated_image_cut(exe: &std::path::Path, seed: u64, opts: &ImageOpts) ->
         }
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            // "repro clean: N cycles verified (abandoned: B)"
+            // "repro clean: N cycles verified (abandoned: B, grown map: G)"
             if out.status.success() {
                 report.verified = stdout
                     .split_whitespace()
                     .find_map(|w| w.parse::<u64>().ok())
                     .unwrap_or(0);
                 report.abandoned = stdout.contains("abandoned: true");
+                report.grown_map = stdout.contains("grown map: true");
             } else {
                 report.violation = Some(format!(
                     "[image/isolated] seed={seed}: {}",

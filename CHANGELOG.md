@@ -8,6 +8,16 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ### Added
 
+- **Map growth on demand** (ADR-0036, opt-in; LMDB has no such option).
+  `EnvOpenOptions::initial_map_size(bytes)`, native and through the heed
+  adapter, maps only `bytes` at open and, under `WRITE_MAP`, sets the data
+  file to that length; write transactions grow both up to `map_size`, which
+  becomes a ceiling. `MapFull` comes only at the ceiling, at the same point as
+  with a fixed map of that size, and `info().map_size` reports the ceiling. A
+  begin follows another process's growth instead of returning `MapResized`,
+  unless the snapshot lies past this process's ceiling. An initial size above
+  `map_size` is refused at open with `InvalidInput`. Off by default: without
+  the option the map is fixed, as in LMDB (SPEC 04 TXN-75, D-031).
 - **Power-loss harness below the file system** (`power-loss` binary,
   `scripts/power-loss/`, docs/maintainers/POWER-LOSS.md). The workload runs on
   ext4 and XFS over a `dm-log-writes` device; each flush point of the log is

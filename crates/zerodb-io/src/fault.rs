@@ -525,6 +525,7 @@ impl FaultHandle {
             durable: st.durable.clone(),
             durable_len: st.durable_len,
             pending: st.pending_with_regions(self.live.pages().whole()),
+            map_len: self.live.pages().len() as u64,
         }
     }
 
@@ -657,6 +658,11 @@ impl Backing for FaultBacking {
         // grows only as writes are folded).
         self.trip_grow()?;
         self.inner.grow_map(map_size)
+    }
+
+    fn extend_map(&self, map_size: u64) -> std::io::Result<()> {
+        // As `grow_map`: a forward; no page content is written.
+        self.inner.extend_map(map_size)
     }
 
     fn ensure_file_len(&self, len: u64) -> std::io::Result<()> {
@@ -897,6 +903,8 @@ pub struct CapturedDisk {
     pub durable_len: u64,
     /// Un-barriered writes in issue order.
     pub pending: Vec<WriteRecord>,
+    /// Length of the live mapping at the cut, in bytes.
+    pub map_len: u64,
 }
 
 impl CapturedDisk {

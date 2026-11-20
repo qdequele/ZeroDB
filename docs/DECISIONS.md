@@ -40,6 +40,7 @@ Approved or accepted, and in `main`.
 | 0030 | [A copy-on-write copies only a page's used bytes, as LMDB](adr/0030-cow-copies-used-bytes.md) | Accepted (Option A), implemented | Performance (writes), bytes on disk |
 | 0031 | [Hardware CRC32C for the meta checksum](adr/0031-hardware-crc32c.md) | Accepted (Option B), implemented; amends the `unsafe` policy | Performance (commit), `unsafe` policy |
 | 0034 | [Trust page contents by default, as LMDB does](adr/0034-trusted-pages-by-default.md) | Accepted | Page validation, LMDB parity, `unsafe` policy |
+| 0036 | [Grow the memory map on demand, behind an option](adr/0036-map-growth-on-demand.md) | Accepted (Option A-min), implemented | Memory map, concurrency, beyond LMDB |
 | 0037 | [Bounded free-page records](adr/0037-bounded-free-page-records.md) | Accepted (Option C), implemented | On-disk format, page reclamation |
 | 0044 | [The round limit of the free-list save has no derivation](adr/0044-freelist-save-round-bound.md) | Accepted (Option C), implemented | Page reclamation, commit |
 | 0047 | [What the environment does after a failed meta write or commit barrier](adr/0047-failed-meta-write-policy.md) | Accepted (Option A), implemented (#176) | Durability |
@@ -91,12 +92,3 @@ Tried, measured, and left out.
 | # | Title | Status | Area |
 |---|-------|--------|------|
 | 0016 | [Lazy (read-time) cell validation](adr/0016-lazy-validation.md) | Measured, not adopted (parked) | Performance (reads) |
-
-## Reserved numbers
-
-One number is missing above because its ADR was written on a branch that is
-not merged into `main`. The number is not reused.
-
-| # | Title | Status on its branch | Branch |
-|---|-------|--------|------|
-| 0036 | Grow the memory map on demand, behind an option | Accepted and implemented on the branch; not merged | `qdequele/issue-33-map-growth-adr-4640ce` |

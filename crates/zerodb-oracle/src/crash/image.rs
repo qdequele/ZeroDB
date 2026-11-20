@@ -170,7 +170,12 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
     let opened = zerodb_io::open_or_create(
         &data_path,
         spec.page_size,
-        Some(spec.map_size),
+        // ADR-0036: a growth cycle maps only the initial size.
+        Some(if spec.growth {
+            super::workload::GROWTH_INITIAL
+        } else {
+            spec.map_size
+        }),
         spec.map_size,
         false,
         write_map,
@@ -194,6 +199,9 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
         spec.dirty_limit,
     )
     .map_err(|e| abandon(format!("env open: {e}")))?;
+    if spec.growth {
+        env.enable_map_growth(spec.map_size);
+    }
 
     // Cut point: 80% at a commit hook (REC-17's H0..H4 grid drives the REC-6
     // rows), 20% at an op boundary (between-commit windows — interesting
@@ -322,6 +330,12 @@ fn run_inner(seed: u64, opts: &ImageOpts, report: &mut CutReport) -> Result<(), 
             None => (handle.capture(), acked_end),
         },
     };
+
+    // ADR-0036: a growth cycle counts as grown when the map had grown by the
+    // cut, so a green run proves cuts were taken across the growth path. The
+    // workload goes on after a capture, so the map's final length says
+    // nothing about the cut.
+    report.grown_map = spec.growth && cut.map_len > super::workload::GROWTH_INITIAL;
 
     // Legal recovery window: floor = durable-only selection, ceil =
     // all-applied selection (self-adapting encoding of the REC-6 rows).

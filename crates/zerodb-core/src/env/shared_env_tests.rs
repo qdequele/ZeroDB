@@ -475,6 +475,8 @@ struct GrowBacking {
     real: u64,
     region: Option<Arc<HeapRegion>>,
     grows: GrowLog,
+    /// The size from which `grow_map` fails with `ENOMEM`; 0 for never.
+    refuse_from: u64,
 }
 
 impl Backing for GrowBacking {
@@ -491,6 +493,9 @@ impl Backing for GrowBacking {
             .lock()
             .expect("test grows poisoned")
             .push((map_size, held));
+        if self.refuse_from != 0 && map_size >= self.refuse_from {
+            return Err(std::io::Error::from_raw_os_error(12));
+        }
         // Relaxed: as in `view`.
         self.map_size.store(map_size, O::Relaxed);
         Ok(())
@@ -517,6 +522,7 @@ fn grow_backing(
         real: real_pages * u64::from(PS),
         region,
         grows: Arc::clone(&grows),
+        refuse_from: 0,
     });
     (b, grows)
 }
@@ -619,6 +625,7 @@ fn resize_above_the_cap_is_refused_by_source() {
         real: 256 * u64::from(PS),
         region: Some(Arc::clone(&region)),
         grows: Arc::clone(&grows),
+        refuse_from: 0,
     });
     let env = open(b, region);
     assert!(matches!(env.resize(0), Err(Error::Mdb(MdbError::Invalid))));
@@ -993,4 +1000,34 @@ fn a_failed_probe_fails_clear_stale_readers_and_a_takeover_write_txn() {
     // Would block forever if the failed begin had kept the lock.
     let txn = env.write_txn().expect("the writer lock is free again");
     drop(txn);
+}
+
+/// ADR-0036: a `resize` whose mapping fails leaves the ceiling as it was,
+/// for a non-zero size and for `0`.
+#[test]
+fn a_failed_resize_keeps_the_growth_ceiling() {
+    let ps = u64::from(PS);
+    let region = Arc::new(HeapRegion::new(4, 2, true));
+    let grows = Arc::new(Mutex::new(Vec::new()));
+    // The newest meta names a 512-page map, which this backing refuses.
+    let mut bytes = grown_image(256);
+    let mut meta = meta_with(7, 200);
+    meta.map_size = 512 * ps;
+    meta.encode_with_annex(&mut bytes[PS as usize..2 * PS as usize], &[])
+        .unwrap();
+    let b = Box::new(GrowBacking {
+        bytes,
+        map_size: AtomicU64::new(256 * ps),
+        real: 256 * ps,
+        region: Some(Arc::clone(&region)),
+        grows: Arc::clone(&grows),
+        refuse_from: 300 * ps,
+    });
+    let env = open(b, region);
+    env.enable_map_growth(256 * ps);
+    assert_eq!(env.info().map_size, 256 * ps);
+
+    assert!(matches!(env.resize(0), Err(Error::Io(_))));
+    assert_eq!(env.info().map_size, 256 * ps, "after a failed resize(0)");
+    assert!(!grows.lock().unwrap().is_empty(), "the mapping was tried");
 }

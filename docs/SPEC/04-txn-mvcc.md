@@ -810,7 +810,8 @@ dirty-page store must be built so it is.
   (`OBS_READ_BEGIN_SMALL_MAP`, `OBS_WRITE_BEGIN_SMALL_MAP`); a larger
   `map_size` in the meta alone is not an error
   (`OBS_BIGGER_META_MAPSIZE_ALONE_RESIZES = false`). The caller answers with
-  `Env::resize(0)` and begins again. So a committed-map resolution never
+  `Env::resize(0)` and begins again. With map growth on, a snapshot within
+  the ceiling raises the logical size instead (TXN-75). So a committed-map resolution never
   needs a page outside this process's mapping. The check is SPEC 06 REC-1a's;
   a write begin applies it to its base even when the base came from the
   cache. The read fast path (the cached snapshot is current) needs no check:
@@ -955,6 +956,46 @@ spilling bullet there.)
   allocated. Commit C2 writes the remaining frames only: spilled pages are
   already on the file with their final bytes. A txn whose only remaining change
   is spilled pages is not "unchanged" (the commit proceeds).
+- **TXN-75 (map growth inside a write txn, added 2026-11-02, ADR-0036)** —
+  Off by default (LMDB's fixed size). An environment opened with
+  `initial_map_size` keeps two sizes: the **ceiling** (`map_size`, reported by
+  `Env::info`) and the **logical map size**, which starts at the initial size
+  (or what the data needs) and which a write txn only grows (`Env::resize`
+  with a non-zero size below it lowers it, SPEC 02 §8). Where an allocation would end past
+  the logical size (SPEC 05 GC-17), the write txn grows it instead of failing:
+  past the ceiling it is still `MapFull`; otherwise the new logical size is
+  `min(ceiling, max(needed, 2 × logical))`, published through the backing
+  exactly as `Env::resize` publishes: under `WRITE_MAP` the data file is
+  grown first; the current mapping is kept when it already covers the new
+  size, and otherwise a mapping of `max(new size, 2 × current mapping)` bytes
+  is added, or of exactly the new size when the larger one cannot be mapped.
+  Older mappings stay mapped, so every borrow survives. The txn already
+  holds both writer locks that `resize` takes. Nothing staged or spilled
+  moves: frames are addressed by pgno. The write txn takes the backing's new
+  page view after a growth, in every mode, so a page later spilled or stored
+  past the old mapping resolves through the new one. A growth whose `mmap` or file
+  growth fails returns that I/O error, and the txn is left as after a
+  `MapFull` (TXN-30): abortable, the environment not poisoned. A growth
+  changes no allocation decision, so contents and the high-water page equal
+  those of a fixed map of the ceiling's size. A commit persists the logical
+  size as the meta's `map_size` (`max(base meta map_size, logical size)`,
+  SPEC 02 §8). **Following another process's growth:** a read or write
+  begin of such an environment whose snapshot lies past its logical size but
+  within its ceiling raises its logical size to the snapshot's
+  `(last_pg + 1) · page_size` instead of returning `MdbError::MapResized`
+  (past the ceiling it still returns `MapResized`). The raise holds no writer
+  lock and never touches the data file (the committed snapshot lies inside
+  it, REC-1a, which is still checked); it runs under the backing's regions
+  mutex and never lowers the logical size, so it cannot publish over a newer
+  view. A `WRITE_MAP` write begin still grows the file to the logical size
+  under both writer locks before anything is stored. Tests:
+  `zerodb/tests/map_growth.rs` (growth against a fixed map of the ceiling in
+  heap, in-place and durable `WRITE_MAP` modes, `MapFull` at the ceiling, two
+  processes), `rwtxn::tests::failed_map_growth_returns_the_io_error`,
+  `zerodb-io` `grow_regions_raise_only_never_lowers` and
+  `concurrent_raise_and_growth_stay_monotonic` (miri), the flush test
+  `a_flush_through_a_newer_mapping_writes_back_older_stores`, and the crash
+  harness's growth cycles.
 
 ### §6.4 — WRITE_MAP variant of the contract
 
@@ -1230,7 +1271,8 @@ spilling bullet there.)
   `WRITE_MAP`, growing the data file to this process's logical map size
   (§6.4); reading the base at `T`; and checking the base against the map view
   the txn will read through (`MdbError::MapResized` past the logical size,
-  TXN-38). `writer_txnid` is the base's txnid + 1. Every failure releases both
+  TXN-38, or, with map growth on and within the ceiling, a raise of the
+  logical size and a reload of the view, TXN-75). `writer_txnid` is the base's txnid + 1. Every failure releases both
   writer locks. Without a lock file the base is the process-local cell, as
   before.
   *(Realization note — writer carry, issue #8; LMDB's `me_txn0`.)* A write
@@ -1452,13 +1494,14 @@ every hook; this section defines the steps and their ordering. Both write modes
 | value-borrow contract | TXN-37..49 | SPEC 03 §3/§5/§7, SPEC 01 §S3/§S7 |
 | env clone/close/registry | TXN-50..55 | SPEC 00 rows 23–26 |
 | commit pipeline | TXN-61..64 | SPEC 06 REC-1..12 |
+| map growth (opt-in) | TXN-75 (§6.3a) | ADR-0036; SPEC 02 §8; SPEC 05 GC-17; `zerodb/tests/map_growth.rs` |
 | PREV_SNAPSHOT | TXN-65..67 | SPEC 01 §S5, SPEC 02 §3.2, SPEC 06 REC-5 |
 | database handle lifetime | DBI-1..10 (§13) | ADR-0024; SPEC 02 §6.1; D-026; `zerodb-oracle/tests/lmdb_observations/lmdb_dbi_handle_observation.rs`; unit tests in `zerodb-core/src/handles.rs` |
 | lock file (multi-process) | LCK-1..11 (§12); TXN-73 (§4.4); TXN-6/7, TXN-17..19, TXN-51/53, TXN-56, TXN-66 as amended | ADR-0023; SPEC 02 §8; SPEC 06 REC-1a; loom models in `zerodb-core/src/readers.rs`; `zerodb/tests/multi_process*.rs`; `zerodb-oracle/tests/multi_process/multi_process_differential.rs`, `lmdb_reaping_observation.rs`, `lmdb_stage3_observation.rs` |
 
 **Rule count: TXN-1 … TXN-67 (67 normative rules; §4.4 adds sub-rule TXN-18a for
 slot release), plus the later TXN-68 … TXN-72 (§6.3a), TXN-73 (§4.4, added
-2026-10-13), TXN-74 (§8, added 2026-11-20), LCK-1 … LCK-11 (§12, added 2026-10-13) and DBI-1 … DBI-10 (§13,
+2026-10-13), TXN-74 (§8, added 2026-11-20), TXN-75 (§6.3a, added 2026-11-02), LCK-1 … LCK-11 (§12, added 2026-10-13) and DBI-1 … DBI-10 (§13,
 added 2026-10-17).** TXN-40 (nested write unsupported, D-003) is referenced from
 §5/§8 and defined here:
 

@@ -759,9 +759,29 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     discriminator, and `zerodb-tools stat` reports it.
 - **map_size.** `meta.map_size` is the size of the mmap region and the ceiling
   on the data file. It is set at env creation and read back via
-  `Env::info().map_size` (SPEC 00 row 20). Growth beyond it is *not* automatic
-  (auto-geometry is Phase 3.2): callers grow with `Env::resize` (below) or by
+  `Env::info().map_size` (SPEC 00 row 20). By default growth beyond it is
+  *not* automatic, as in LMDB: callers grow with `Env::resize` (below) or by
   reopening with a larger `map_size` after a `MapFull` (SPEC 00 rows 3, 55).
+  - **Map growth on demand (added 2026-11-02, ADR-0036; opt-in).** With
+    `EnvOpenOptions::initial_map_size(n)`, `map_size` is the **ceiling**: the
+    size `MapFull` is measured against and the one `Env::info().map_size`
+    reports. The **logical map size** starts at `n` (raised to what the data
+    needs, as any open size is): it is what the open maps and, under
+    `WRITE_MAP`, the length the data file is set to, and a write txn grows it
+    up to the ceiling where an allocation would pass it (SPEC 04 TXN-75). An
+    initial size above the ceiling, or a ceiling above `MAX_MAP_SIZE`, is
+    refused at open with `Io(InvalidInput)`, before the data file is created.
+    A commit records `max(base meta map_size, logical size)` in the meta, so
+    a process without the option that adopts it with `resize(0)` maps only
+    what the data needs, unless an earlier commit recorded a larger map: that
+    size is kept. `resize` with a
+    non-zero size sets the ceiling and keeps the logical size within it
+    (lowering it when the new ceiling is below it, but never below what the
+    data needs); `resize(0)` adopts the meta's size as the logical size, as
+    without the option, and raises the ceiling to it if it is lower. A
+    `resize` that fails leaves the ceiling as it was. A begin of an environment with the option follows another
+    process's growth instead of returning `MapResized` (TXN-75). The file
+    is never shrunk.
   - **Runtime `map_size` selection.** At open the effective `map_size` is
     the caller's `EnvOpenOptions::map_size` when set, else the persisted
     `meta.map_size`. It is then raised to `(last_pg + 1) · psize` of the newest
@@ -818,12 +838,15 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     `MAX_MAP_SIZE` a requested size is `Io(InvalidInput)` and an adopted one
     `MdbError::Invalid`. The new size is published through the backing's
     grow-only mappings (below); a smaller size lowers only the logical size.
+    With map growth on, a non-zero size sets the ceiling instead (above).
   - **Mapping strategy (amended M1.4, ADR-0004 D4/OQ2 — approved; amended by
     ADR-0023 amendment 15).** The read mmap covers `max(map_size, file length)`
     from open. A mapping is **never remapped in place**: when `resize` needs
     more than the current mapping, a new mapping of `max(new size, 2 × current
     length)` bytes is added (retried at exactly the new size on `ENOMEM`) and
-    published with the new logical size; every earlier mapping stays mapped
+    published with the new logical size, the decision and the publication
+    made under the backing's regions mutex (so a reader raising the size,
+    ADR-0036, is serialized with every growth); every earlier mapping stays mapped
     until the env closes, so no borrow is ever invalidated, and the retained
     address space stays below twice the largest mapping. Within a mapping,
     file growth happens *underneath* the `MAP_SHARED` mapping via the commit's
@@ -850,6 +873,8 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
   would make the new high-water `next_pgno + n`. If the GC DB cannot satisfy the
   request from already-allocated free pages **and**
   `next_pgno + n > map_pages` (the run would **end past** the map), the write fails
+  (with map growth on, `map_size` here is the ceiling, and a run past the
+  logical size but within the ceiling grows the map instead, SPEC 04 TXN-75)
   with `MdbError::MapFull` (SPEC 00 row 55 → heed `MdbError::MapFull` →
   `MaxDatabaseSizeReached`). The txn aborts cleanly with no partial state.
   Equivalently: the last page of the run, `next_pgno + n − 1`, must be
