@@ -96,7 +96,7 @@ fn empty_seek_bound(bound: &mut Bound<Vec<u8>>) -> Option<Error> {
 }
 
 /// `EINVAL`, the same value on every supported platform.
-const EINVAL: i32 = 22;
+pub(crate) const EINVAL: i32 = 22;
 
 /// Dispatch a read closure over the three txn sources (SPEC 04 §3–§5). Each arm
 /// monomorphizes over the concrete `zerodb` txn type (all `TxnRead`).

@@ -168,6 +168,34 @@ macro_rules! scenario_engine {
                     }
                     WriteOp::Del(k) => res(db.delete(wtxn, &k.0)),
                     WriteOp::DeleteRange(lo, hi) => res(db.delete_range(wtxn, &(rb(lo), rb(hi)))),
+                    WriteOp::CursorDeleteRange { lo, hi, rev } => {
+                        let range = (rb(lo), rb(hi));
+                        let mut n = 0usize;
+                        let walk = if *rev {
+                            db.rev_range_mut(wtxn, &range).and_then(|mut it| {
+                                while it.next().is_some() {
+                                    // SAFETY: no key or value borrowed from
+                                    // the iterator is held across the delete.
+                                    unsafe { it.del_current()? };
+                                    n += 1;
+                                }
+                                Ok(())
+                            })
+                        } else {
+                            db.range_mut(wtxn, &range).and_then(|mut it| {
+                                while it.next().is_some() {
+                                    // SAFETY: as above.
+                                    unsafe { it.del_current()? };
+                                    n += 1;
+                                }
+                                Ok(())
+                            })
+                        };
+                        match walk {
+                            Ok(()) => format!("Ok({n})"),
+                            Err(err) => format!("after {n}: {}", e(err)),
+                        }
+                    }
                     WriteOp::Fill { start, n, vlen } => {
                         for i in 0..u32::from(*n) {
                             let idx = u32::from(*start) + i;

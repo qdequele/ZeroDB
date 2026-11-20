@@ -220,6 +220,19 @@ pub enum WriteOp {
     Del(SKey),
     /// `delete_range`.
     DeleteRange(Bound<SKey>, Bound<SKey>),
+    /// heed's `delete_range` loop written out over `range_mut` (forward) or
+    /// `rev_range_mut` (reverse): `del_current` after every item the
+    /// iterator yields, the error items included. On LMDB this is what
+    /// `delete_range` runs; on ZeroDB it drives the adapter's write cursor
+    /// instead of the engine's native range delete.
+    CursorDeleteRange {
+        /// Lower bound.
+        lo: Bound<SKey>,
+        /// Upper bound.
+        hi: Bound<SKey>,
+        /// Walk with `rev_range_mut`.
+        rev: bool,
+    },
     /// Put `n` deterministic entries, from index `start`, so trees reach
     /// several levels and ranges span leaves.
     Fill {
@@ -253,7 +266,12 @@ impl WriteOp {
             4 => WriteOp::PutNoOverwrite(shape.key(u)?, value(u)?),
             5 => WriteOp::Append(shape.key(u)?, value(u)?),
             6 | 7 => WriteOp::Del(shape.key(u)?),
-            8..=10 => WriteOp::DeleteRange(shape.bound(u)?, shape.bound(u)?),
+            8 | 9 => WriteOp::DeleteRange(shape.bound(u)?, shape.bound(u)?),
+            10 => WriteOp::CursorDeleteRange {
+                lo: shape.bound(u)?,
+                hi: shape.bound(u)?,
+                rev: u.arbitrary()?,
+            },
             11 | 12 => WriteOp::Fill {
                 start: u.int_in_range(0u16..=400)?,
                 n: u.arbitrary()?,

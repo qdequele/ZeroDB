@@ -189,6 +189,8 @@ depending on the entry point — pinned by `zerodb-oracle` differential tests
 | `set_range` / `get_greater_than` / `get_lower_than_or_equal_to` | `BadValSize` (an explicit `MDB_SET_RANGE` with a zero-size key is rejected) | `None`/last per the seek — no error |
 | `prefix_iter` / `prefix_iter_mut` (forward) | `BadValSize` (realized as `set_range(prefix)`; the adapter applies it to both the read and the write-cursor variant — 2026-09-09) | empty scan — no error |
 | `rev_prefix_iter` (reverse) | **works** — full reverse iteration (its successor is unbounded, so it seeks via `last`, not `set_range`) | empty scan — no error |
+| `range` / `range_mut` (forward) with an empty **start** bound; `rev_range` / `rev_range_mut` with an empty **end** bound | `BadValSize` as the **first item** (heed seeks that bound with `MDB_SET_RANGE`); the failed seek leaves the cursor unpositioned, so the next items iterate from the first (forward) or last (reverse) entry, still bounded by the other bound. An empty key as the *other* bound is only compared, never an error (generated scenarios, `scenario_regressions.rs`, 2026-11-20) | `None`/last per the seek — no error |
+| `delete_range` with an empty start bound | **`Io(InvalidInput)`** (`EINVAL`), nothing deleted: heed's delete loop calls `del_current` on the failed seek's unpositioned cursor, which LMDB refuses; the adapter's write iterators refuse `del_current` before their first seek the same way | as `range_mut` |
 
 The unifying rule: **write ops** (`put*`) validate `maxkey` before searching, so
 both an empty and an oversized key are `BadValSize`; **read/search ops** reject

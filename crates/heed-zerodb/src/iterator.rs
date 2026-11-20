@@ -195,6 +195,10 @@ pub(crate) struct RwGuts<'txn> {
     lower: Bound<Vec<u8>>,
     upper: Bound<Vec<u8>>,
     started: bool,
+    /// Whether the cursor has done its first seek. Before that it is not on
+    /// an entry, and LMDB refuses `mdb_cursor_del` on such a cursor with
+    /// `EINVAL`, where the native cursor reports `Ok(false)`.
+    seeked: bool,
     /// An error to yield before the first entry: heed's failed seek on an
     /// empty bound key (`Database::range_mut`).
     pending: Option<Error>,
@@ -223,6 +227,7 @@ impl<'txn> RwGuts<'txn> {
             lower,
             upper,
             started: false,
+            seeked: false,
             pending: None,
         }
     }
@@ -243,6 +248,7 @@ impl<'txn> RwGuts<'txn> {
         }
         let first = !self.started;
         self.started = true;
+        self.seeked = true;
         let res = match (self.dir, first) {
             (Dir::Fwd, true) => match &self.lower {
                 Bound::Unbounded => self.cursor.seek_first(),
@@ -305,6 +311,11 @@ impl<'txn> RwGuts<'txn> {
     }
 
     fn del_current(&mut self) -> Result<bool> {
+        if !self.seeked {
+            return Err(Error::Io(std::io::Error::from_raw_os_error(
+                crate::database::EINVAL,
+            )));
+        }
         Ok(self.cursor.del_current()?)
     }
 

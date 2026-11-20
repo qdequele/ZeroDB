@@ -325,3 +325,38 @@ fn env_info_is_stable_across_a_reopen() {
     assert_eq!(i.live_readers, 0);
     assert_eq!(env.stat().page_size, 8192);
 }
+
+// ---------------------------------------------------------------------------
+// TXN-74: which commits take a txnid
+// ---------------------------------------------------------------------------
+
+/// A commit that changes nothing takes no txnid; a `clear` of the main
+/// database takes one even when the database was already empty, as LMDB's
+/// `mdb_drop` marks the txn dirty (SPEC 04 TXN-74).
+#[test]
+fn clear_of_empty_main_db_commits() {
+    let dir = TempDir::new();
+    let env = open_with(dir.path(), 4096, 4, 8);
+    let db = env.main_database();
+    let base = env.info().last_txnid;
+
+    let w = env.write_txn().unwrap();
+    w.commit().unwrap();
+    assert_eq!(
+        env.info().last_txnid,
+        base,
+        "an empty commit takes no txnid"
+    );
+
+    let mut w = env.write_txn().unwrap();
+    assert!(!db.delete(&mut w, b"absent").unwrap());
+    w.commit().unwrap();
+    assert_eq!(env.info().last_txnid, base, "a no-op delete takes no txnid");
+
+    let mut w = env.write_txn().unwrap();
+    db.clear(&mut w).unwrap();
+    w.commit().unwrap();
+    assert_eq!(env.info().last_txnid, base + 1, "clear takes a txnid");
+    drop(env);
+    assert_clean(dir.path(), 4096);
+}

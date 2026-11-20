@@ -728,7 +728,7 @@ mod worker {
                                 // While the data file is larger than this
                                 // process's map, ZeroDB reports the txnid
                                 // of its own last snapshot where LMDB
-                                // reports the newest (D-028).
+                                // reports the newest (D-029).
                                 let file = std::fs::metadata(dir.join("data.mdb"))
                                     .map_or(0, |m| m.len());
                                 let txn = if file > i.map_size as u64 {

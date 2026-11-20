@@ -62,7 +62,8 @@ fn get_greater_than_with_custom_comparators() {
 
 /// An empty key as the bound heed seeks to (the start of a forward range,
 /// the end of a reverse one) fails with `BadValSize`; as the other bound it
-/// is only compared. `delete_range` then fails with `EINVAL` from its
+/// is only compared. `delete_range`, and heed's loop written out over
+/// `range_mut` or `rev_range_mut`, then fail with `EINVAL` from the
 /// `del_current` on the unpositioned cursor.
 #[test]
 fn empty_range_bounds() {
@@ -80,6 +81,16 @@ fn empty_range_bounds() {
         OrderedOp::Read(ReadOp::RevRange(Bound::Included(e()), Bound::Unbounded)),
         OrderedOp::Write(WriteOp::DeleteRange(Bound::Included(e()), Bound::Unbounded)),
         OrderedOp::Write(WriteOp::DeleteRange(Bound::Unbounded, Bound::Excluded(e()))),
+        OrderedOp::Write(WriteOp::CursorDeleteRange {
+            lo: Bound::Included(e()),
+            hi: Bound::Unbounded,
+            rev: false,
+        }),
+        OrderedOp::Write(WriteOp::CursorDeleteRange {
+            lo: Bound::Unbounded,
+            hi: Bound::Excluded(e()),
+            rev: true,
+        }),
         OrderedOp::Read(ReadOp::Iter),
         OrderedOp::Commit,
         OrderedOp::Write(WriteOp::DeleteRange(Bound::Excluded(e()), Bound::Unbounded)),
