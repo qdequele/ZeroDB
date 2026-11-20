@@ -8,10 +8,75 @@
 //! same source that ships (`just loom`, ADR-0006). Nothing here sleeps or
 //! makes a system call.
 
-use crate::sync::{AtomicU32, Ordering};
+#[cfg(test)]
+use crate::sync::AtomicU32;
+use crate::sync::Ordering;
 
 /// Writer-word bit set while a process sleeps on the word's futex.
 pub const WAITERS: u32 = 1 << 31;
+
+/// The atomic operations the protocol uses. `zerodb-io` passes the mapped
+/// lock-file word, a `std::sync::atomic::AtomicU32`; the loom models pass
+/// loom's `AtomicU32`. Under `--cfg loom` both types exist in one build, so
+/// the protocol is generic over them instead of naming either.
+pub trait Word {
+    /// As `AtomicU32::load`.
+    fn load(&self, order: Ordering) -> u32;
+    /// As `AtomicU32::compare_exchange`.
+    ///
+    /// # Errors
+    ///
+    /// The current value, when it is not `current`.
+    fn compare_exchange(
+        &self,
+        current: u32,
+        new: u32,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<u32, u32>;
+    /// As `AtomicU32::swap`.
+    fn swap(&self, val: u32, order: Ordering) -> u32;
+}
+
+impl Word for std::sync::atomic::AtomicU32 {
+    #[inline]
+    fn load(&self, order: Ordering) -> u32 {
+        self.load(order)
+    }
+    #[inline]
+    fn compare_exchange(
+        &self,
+        current: u32,
+        new: u32,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<u32, u32> {
+        self.compare_exchange(current, new, success, failure)
+    }
+    #[inline]
+    fn swap(&self, val: u32, order: Ordering) -> u32 {
+        self.swap(val, order)
+    }
+}
+
+#[cfg(loom)]
+impl Word for loom::sync::atomic::AtomicU32 {
+    fn load(&self, order: Ordering) -> u32 {
+        self.load(order)
+    }
+    fn compare_exchange(
+        &self,
+        current: u32,
+        new: u32,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<u32, u32> {
+        self.compare_exchange(current, new, success, failure)
+    }
+    fn swap(&self, val: u32, order: Ordering) -> u32 {
+        self.swap(val, order)
+    }
+}
 
 /// Take the writer lock held in `word` for process `pid` (LCK-4).
 ///
@@ -31,7 +96,7 @@ pub const WAITERS: u32 = 1 << 31;
 ///
 /// The error of `is_alive`.
 pub fn lock(
-    word: &AtomicU32,
+    word: &impl Word,
     pid: u32,
     mut wait: impl FnMut(u32) -> bool,
     mut is_alive: impl FnMut(u32) -> std::io::Result<bool>,
@@ -102,7 +167,7 @@ pub fn lock(
 /// may be sleeping on the word, in which case the caller wakes every waiter.
 /// Callable from any thread.
 #[must_use]
-pub fn unlock(word: &AtomicU32) -> bool {
+pub fn unlock(word: &impl Word) -> bool {
     // Release: publishes this writer's T store and meta write to the next
     // owner's Acquire.
     word.swap(0, Ordering::Release) & WAITERS != 0
