@@ -62,8 +62,14 @@ plainly as the strengths.
 - **Stress.** Two reader and writer stress tests, one in a single process
   and one across processes, run nightly for three minutes each.
 - **Consumers.** Meilisearch's milli and index-scheduler test suites and
-  hannoy's test suite have passed on ZeroDB, with no source changes. These
-  runs are manual; see the last item of the next section.
+  hannoy's test suite pass on ZeroDB, with no source changes, and run in CI
+  nightly ([maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md)).
+  Last recorded run: 2026-11-20, `main` at
+  `c7e1abf6b30ee964052f75e47ca6b63386a7f192`, macOS aarch64, rustc 1.98.1
+  for Meilisearch and 1.100.0 for hannoy. Meilisearch v1.55.1
+  (`cargo test -p milli -p index-scheduler`): 448 passed, 0 failed, 4
+  ignored. hannoy v0.2.0: 59 passed, 0 failed, 1 ignored. In both builds
+  `lmdb-master-sys` was absent from the dependency tree.
 
 ## What has not been verified
 
@@ -123,11 +129,12 @@ plainly as the strengths.
   been observed by the oracle.
 - **No 24-hour fuzz soak.** The longest scheduled fuzz run is the nightly one.
   The runner exists (`just soak`, same page); no 24-hour run is recorded.
-- **The consumer suites are not in CI.** They are run by hand
-  ([maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md)). The last
-  recorded passes are Meilisearch v1.55.0's milli and index-scheduler suites
-  on 2026-10-18, and Meilisearch v1.53.1's and hannoy's suites on 2026-09-09.
-  No run is recorded on the current `main`.
+- **Consumers newer than the pins.** Meilisearch v1.56 and later, and
+  hannoy v0.3.0, depend on heed 0.23, which the adapter does not provide; on
+  them the `[patch]` is ignored and the build keeps C LMDB. The consumer
+  suites run on Linux x86-64 in CI only; the last recorded run with a result
+  is the macOS one above. Meilisearch's other crates (`meilisearch`,
+  `meilisearch-auth`) run only with `FULL=1`, by hand.
 - **Performance figures are being re-measured.** See the status box at the top
   of [PERFORMANCE.md](PERFORMANCE.md).
 

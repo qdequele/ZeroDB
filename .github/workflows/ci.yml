@@ -5,8 +5,10 @@
 # draws, the fuzz gate and the crash smoke; on macOS (Apple silicon), clippy,
 # the tests and the crash smoke; and a check that a Windows build stops at
 # the platform guard.
-# Nightly: the long fuzz, the full crash run, the reader stress and the
-# power-loss run on ext4 and XFS (also on pull requests that touch it).
+# Nightly: the long fuzz, the full crash run, the reader stress, the
+# power-loss run on ext4 and XFS (also on pull requests that touch it), and
+# the consumer gate (Meilisearch's milli and index-scheduler suites and
+# hannoy's suite on ZeroDB, through scripts/consumer.sh and scripts/hannoy.sh).
 # The loom, fuzz, crash and stress jobs run the justfile recipes of the same
 # name, so `just <recipe>` locally runs exactly what CI runs.
 # The oracle crate links the real LMDB fork (lmdb-master-sys), so every job
@@ -26,6 +28,15 @@ on:
   schedule:
     - cron: "0 2 * * *" # nightly, 02:00 UTC
   workflow_dispatch:
+    inputs:
+      meilisearch_ref:
+        description: "Meilisearch ref for the consumer gate (empty: the pinned release)"
+        required: false
+        default: ""
+      hannoy_ref:
+        description: "hannoy ref for the consumer gate (empty: the pinned tag)"
+        required: false
+        default: ""
 
 # Least privilege: nothing here needs to write to the repository.
 permissions:
@@ -336,4 +347,61 @@ jobs:
         with:
           name: nightly-fuzz-artifacts-${{ matrix.os }}
           path: fuzz/artifacts
+          if-no-files-found: ignore
+
+  # The consumer gate of docs/maintainers/CONSUMER-GATE.md, run by the same
+  # scripts as the manual gate. Each script clones the consumer at the pinned
+  # ref, patches heed to crates/heed-zerodb (plus the `unique-txns` feature and
+  # the git-source `[patch]` table for Meilisearch's heed fork), checks that C
+  # LMDB has left the dependency tree, and runs the suites. It prints the
+  # ZeroDB commit and the consumer ref and commit first, and the summed test
+  # counts last; both also go to the job summary. A build break fails the job:
+  # that is how a new consumer release that the adapter does not cover shows.
+  consumers:
+    name: consumer gate (${{ matrix.consumer }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        consumer: [meilisearch, hannoy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      # Pinned consumer versions. Meilisearch v1.55.1 is the latest release on
+      # heed 0.22.1 (through its heed fork, hence `unique-txns`); v1.56.0 and
+      # later depend on heed 0.23. hannoy v0.2.0 is the release Meilisearch
+      # v1.55 depends on. Move a pin here and in the scripts' defaults
+      # together.
+      MEILISEARCH_REF: ${{ inputs.meilisearch_ref || 'v1.55.1' }}
+      HANNOY_REF: ${{ inputs.hannoy_ref || 'v0.2.0' }}
+      # Debug info would not fit the runner's disk for milli's test binaries;
+      # it changes nothing the tests observe.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: free disk space for the consumer build
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      # Meilisearch pins its own toolchain (rust-toolchain.toml), which rustup
+      # installs on first use inside the clone; scripts/hannoy.sh builds with
+      # stable.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10-01)
+        with:
+          toolchain: stable
+      - name: Meilisearch milli + index-scheduler suites on ZeroDB
+        if: matrix.consumer == 'meilisearch'
+        run: scripts/consumer.sh suites
+      - name: hannoy suite on ZeroDB
+        if: matrix.consumer == 'hannoy'
+        run: scripts/hannoy.sh suites
+      - name: keep the test logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: consumer-logs-${{ matrix.consumer }}
+          path: target/consumer/logs
           if-no-files-found: ignore

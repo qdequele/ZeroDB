@@ -69,7 +69,7 @@ heed = { git = "https://github.com/qdequele/ZeroDB", tag = "v0.2.0" }
 The patch target is `crates/heed-zerodb`, ZeroDB's heed adapter, whose package
 is named `heed`. It gives heed 0.22.1's API.
 
-Meilisearch v1.55 and later build against Meilisearch's heed fork, whose API
+Meilisearch v1.55 builds against Meilisearch's heed fork, whose API
 differs (unique transactions, ADR-0027). The adapter has it behind the
 `unique-txns` feature. A `[patch]` cannot turn on a feature, so also add it to
 one of your own `heed` dependencies, milli's in Meilisearch:
@@ -82,6 +82,9 @@ Meilisearch patches heed to its fork under `[patch.crates-io]`; replace that
 line with the ZeroDB one, and add a `[patch."https://github.com/meilisearch/heed"]`
 table with the same line for crates that take heed from the fork's git
 repository. `scripts/consumer.sh` does all of this on a Meilisearch checkout.
+
+Meilisearch v1.56 and later depend on heed 0.23, which the adapter does not
+provide: a `[patch]` on it is ignored and the build keeps C LMDB.
 
 Two things change underneath:
 

@@ -42,6 +42,11 @@ the release workflow publishes the section matching the tag as the GitHub releas
   `Env::unique_write_txn` and friends, `non_free_page_size`). Without the
   feature nothing changes. Meilisearch v1.55.0's milli and index-scheduler
   suites pass on it (447 tests).
+- **Consumer gate in CI.** A nightly, manually dispatchable job runs
+  Meilisearch v1.55.1's milli and index-scheduler suites and hannoy v0.2.0's
+  suite on ZeroDB through `scripts/consumer.sh` and `scripts/hannoy.sh`, and a
+  green run is required before a release. Run on 2026-11-20 at `c7e1abf`:
+  448 and 59 tests passed, none failed.
 - Read transactions and nested read transactions gain `commit`: as in LMDB,
   committing one keeps the databases it opened.
 - `ReaderEntry::pid`: `Env::reader_list()` reports each slot's owner process.
