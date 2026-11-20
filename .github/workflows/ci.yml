@@ -2,13 +2,16 @@
 #
 # Per push / PR: fmt, clippy, tests (x86-64 and aarch64), an MSRV check, miri
 # on the core, loom on the reader table, the free-list save without pool
-# draws, the fuzz gate and the crash smoke.
+# draws, the fuzz gate and the crash smoke; on macOS (Apple silicon), clippy,
+# the tests and the crash smoke; and a check that a Windows build stops at
+# the platform guard.
 # Nightly: the long fuzz, the full crash run, the reader stress and the
 # power-loss run on ext4 and XFS (also on pull requests that touch it).
 # The loom, fuzz, crash and stress jobs run the justfile recipes of the same
 # name, so `just <recipe>` locally runs exactly what CI runs.
 # The oracle crate links the real LMDB fork (lmdb-master-sys), so every job
-# needs a C toolchain — the GitHub Ubuntu images ship gcc.
+# needs a C toolchain — the GitHub Ubuntu images ship gcc, the macOS images
+# clang.
 #
 # Still missing from the testing strategy: a 64K-page kernel. GitHub's
 # hosted aarch64 runners use 4K pages; a self-hosted Graviton box with a 64K
@@ -61,6 +64,59 @@ jobs:
       # The four engine crates must stay publishable (ADR-0013 rule 10): manifest
       # metadata, versioned internal deps, readme paths. No upload, no build.
       - run: cargo publish --workspace --dry-run --no-verify
+
+  # macOS differs from Linux in the durability barrier (F_FULLFSYNC), the
+  # cross-process writer lock (a record lock, no futex) and the OS page size
+  # (16 KiB on Apple silicon); docs/USING.md#platform-support lists each
+  # difference and its tests. `apple_silicon.rs` fails if this runner stops
+  # having 16 KiB pages.
+  macos:
+    name: clippy + test + crash smoke (macOS aarch64)
+    if: github.event_name != 'schedule'
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10-01)
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo clippy -p heed --all-targets --features unique-txns -- -D warnings
+      - run: cargo test -p heed --features unique-txns
+      - run: cargo install just --version 1.58.0 --locked
+      - run: just crash-test-quick
+
+  # Windows is unsupported (ADR-0046, a draft). A build there must stop at
+  # the one `compile_error!` in zerodb-core, not at the Unix-only code
+  # behind it. `cargo check` needs only the target's standard library.
+  windows-guard:
+    name: Windows build stops at the platform guard
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10-01)
+        with:
+          toolchain: stable
+          targets: x86_64-pc-windows-msvc
+      - name: check the heed adapter for Windows
+        run: |
+          if out=$(cargo check -p heed -p zerodb-tools --target x86_64-pc-windows-msvc 2>&1); then
+            echo "$out"; echo "::error::the Windows build succeeded; update the platform guard and the support table"; exit 1
+          fi
+          echo "$out"
+          echo "$out" | grep -q "ZeroDB does not support this target yet"
+          if echo "$out" | grep -q '^error\['; then
+            echo "::error::errors besides the platform guard"; exit 1
+          fi
 
   msrv:
     name: MSRV (workspace rust-version)
