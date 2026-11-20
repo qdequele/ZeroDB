@@ -8,6 +8,11 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ### Added
 
+- **I/O-error injection** in the fault-injecting backend (`IoFault`): a test
+  can fail the `n`th write, sync or file-growth call with `EIO`, `ENOSPC` or a
+  short write. Tests fail every such call of a commit, of a spill, of the
+  `WRITE_MAP` ranged `msync`, of file growth and of `copy_to_file` and
+  compaction; SPEC 06 REC-23 states the behavior they pin.
 - **Multi-process access** (ADR-0023). Several processes can open one
   environment and read or write it, as with LMDB. A lock file is created next
   to the data file by default: `lock.mdb` through heed, `zerodb.lock`
@@ -183,6 +188,10 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 
 ### Fixed
 
+- `zerodb-tools check` on a file it walks raw no longer reports INV-3 for a
+  partial page past the high-water. A write that extended the file and failed
+  part-way (a short write on a full device) leaves one; no snapshot reads it.
+
 - **A commit no longer fails when the free-list save converges slowly**
   (ADR-0044). The save loop was limited to 64 rounds, a number its
   termination proof did not give; past it the commit panicked, and a retry
@@ -238,6 +247,11 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
   opt-out.
 
 ### Known limits
+
+- A failed meta write (commit step C4) does not poison the environment. If
+  the write was short but carried the whole meta, and a later write
+  transaction is interrupted between its page writes and its meta write, the
+  file can be left corrupt (SPEC 06 conflict 5; the fix awaits ADR-0046).
 
 - Using an `Env` in a child after `fork()`, and sharing an environment across
   PID namespaces, are unsupported. `Env::sync` only serializes with this
