@@ -858,8 +858,15 @@ fn check_image_inner<'a>(
             return vec!["INV-2: no valid meta slot (both torn/foreign)".into()]
         }
     };
-    // INV-3: whole-page file.
-    if !bytes.len().is_multiple_of(ps) {
+    // INV-3: whole pages up to the high-water. A partial page past it is an
+    // unreferenced tail: a write that extended the file and failed part-way
+    // (a short write on a full device) leaves one, and no snapshot reads it.
+    let whole_pages_end = (meta.last_pg)
+        .checked_add(1)
+        .and_then(|n| n.checked_mul(ps as u64));
+    let partial_tail_past_high_water =
+        whole_pages_end.is_some_and(|end| (bytes.len() / ps * ps) as u64 >= end);
+    if !bytes.len().is_multiple_of(ps) && !partial_tail_past_high_water {
         violations.push(format!(
             "INV-3: file length {} not a multiple of psize {psize}",
             bytes.len()
@@ -1280,6 +1287,28 @@ mod tests {
             .collect();
         let img = build_single_db_image(PS, 8 << 20, 3, &entries, 900).unwrap();
         assert_eq!(check_image(&img, PS), Vec::<String>::new());
+    }
+
+    /// INV-3: a partial page past the high-water is an unreferenced tail (a
+    /// short write that extended the file leaves one) and passes; a partial
+    /// page at or below it, which cuts a page the snapshot may read, does not.
+    #[test]
+    fn partial_tail_page_past_the_high_water_is_clean() {
+        let entries: Vec<_> = (0u32..3000)
+            .map(|i| (format!("key{i:06}").into_bytes(), b"v".to_vec()))
+            .collect();
+        let img = build_single_db_image(PS, 8 << 20, 3, &entries, 900).unwrap();
+        let ps = PS as usize;
+        let mut tail = img.clone();
+        tail.extend_from_slice(&[0xAB; 16]);
+        assert_eq!(check_image(&tail, PS), Vec::<String>::new());
+        let mut cut = img.clone();
+        cut.truncate(img.len() - ps + 16);
+        let v = check_image(&cut, PS);
+        assert!(
+            v.iter().any(|s| s.starts_with("INV-3")),
+            "expected INV-3, got {v:?}"
+        );
     }
 
     /// The snapshot walk reads the same state as the image walk, from a map
