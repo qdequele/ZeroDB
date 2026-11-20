@@ -7,9 +7,7 @@
 //! txnid).
 //!
 //! Validity gating goes through [`crate::driver::classify`] — the same single
-//! authority the differential harness uses — with `cleared_in_txn = false`:
-//! the FORK-1 `KnownForkBug` guard protects the vendored C fork, which is not
-//! in this loop (crash cycles are zerodb-only).
+//! authority the differential harness uses.
 //!
 //! Executed surface (ADR-0008 / REC-21): `BeginRw`, `Commit`, `Abort`,
 //! `CreateDb`, `ClearDb`, `DropDb`, `Put`, `PutFlagged`, `PutReserved`,
@@ -191,8 +189,7 @@ impl<'e> Exec<'e> {
         } else {
             TxnState::None
         };
-        // `cleared_in_txn = false`: see module docs (FORK-1 is fork-only).
-        if classify(op, txn_state, self.active_world().is_empty(), false).is_some() {
+        if classify(op, txn_state, self.active_world().is_empty()).is_some() {
             return Ok(StepOutcome::Skipped);
         }
         // Key-size filter (module docs): crash coverage is orthogonal to the

@@ -1,6 +1,6 @@
-//! Isolates the ingredients of the LMDB fork crash recorded as FORK-1 in
-//! `docs/UPSTREAM-BUGS.md`: an `APPEND` put that should fail with `KeyExist`
-//! after a `clear` of another database in the same write txn.
+//! Isolates the ingredients of the LMDB crash recorded as FORK-1 in
+//! `docs/UPSTREAM-BUGS.md`: a second put into an empty named database after a
+//! `clear` of the root (unnamed) database in the same write txn.
 //!
 //! `VARIANT=<case> cargo run -p zerodb-oracle --example fork_segv_repro`, where
 //! `<case>` drops or changes one ingredient: `no_second_db`, `with_clear`,

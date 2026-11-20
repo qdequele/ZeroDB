@@ -164,9 +164,6 @@ pub struct ZerodbEngine {
     /// `Some` between operations.
     env: Option<Box<Env>>,
     map_size: usize,
-    /// FORK-1 guard fact (see `driver::classify`): set by `ClearDb`, reset at
-    /// every txn boundary.
-    cleared_in_txn: bool,
     /// The env open mode: `WRITE_MAP` / durability flags. Preserved
     /// across `reopen` so a reopened env keeps the same write mode.
     mode: EngineMode,
@@ -269,10 +266,8 @@ impl ZerodbEngine {
     // -- environment ---------------------------------------------------------
 
     fn reopen(&mut self, kib: u16) -> OpResult {
-        // Reopen drops the active txn (a txn boundary: reset the FORK-1 fact)
-        // and all db handles; committed data persists in the real file.
+        // Reopen drops the active txn and all db handles; committed data persists in the real file.
         self.active = Active::None;
-        self.cleared_in_txn = false;
         self.dbs.clear();
         self.env = None;
 
@@ -295,7 +290,6 @@ impl ZerodbEngine {
     // -- transactions ---------------------------------------------------------
 
     fn begin_rw(&mut self) -> OpResult {
-        self.cleared_in_txn = false;
         // SAFETY: extend the txn borrow to 'static. Invariants (mirrors
         // LmdbEngine::begin_rw):
         //  * the `Env` lives in a `Box` (stable address) owned by `self`, and
@@ -334,7 +328,6 @@ impl ZerodbEngine {
     }
 
     fn commit(&mut self) -> OpResult {
-        self.cleared_in_txn = false;
         match std::mem::replace(&mut self.active, Active::None) {
             Active::Rw(w) => match w.commit() {
                 Ok(()) => {
@@ -376,7 +369,6 @@ impl ZerodbEngine {
     }
 
     fn abort(&mut self) -> OpResult {
-        self.cleared_in_txn = false;
         match std::mem::replace(&mut self.active, Active::None) {
             Active::None => OpResult::Skipped(Skip::NoTxn),
             Active::Rw(w) => {
@@ -497,7 +489,6 @@ impl ZerodbEngine {
     }
 
     fn clear_db(&mut self, db: u8) -> OpResult {
-        self.cleared_in_txn = true; // FORK-1 guard fact
         let dbh = match self.db_at(db) {
             Ok(d) => d,
             Err(r) => return r,
@@ -975,7 +966,6 @@ impl Engine for ZerodbEngine {
             dbs: Vec::new(),
             env: Some(Box::new(env)),
             map_size: BASE_MAP_SIZE,
-            cleared_in_txn: false,
             mode,
             dir,
         }
@@ -991,12 +981,7 @@ impl Engine for ZerodbEngine {
 
     fn apply(&mut self, op: &Op) -> OpResult {
         // The shared driver is the single authority on op-validity / Skip.
-        if let Some(skip) = crate::driver::classify(
-            op,
-            self.txn_state(),
-            self.dbs.is_empty(),
-            self.cleared_in_txn,
-        ) {
+        if let Some(skip) = crate::driver::classify(op, self.txn_state(), self.dbs.is_empty()) {
             return OpResult::Skipped(skip);
         }
         match op {
