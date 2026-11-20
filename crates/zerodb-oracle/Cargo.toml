@@ -37,6 +37,11 @@ zerodb-io = { path = "../zerodb-io", features = ["fault", "test-backing"] }
 name = "crash-harness"
 path = "src/bin/crash-harness.rs"
 
+# A worker process of the generated multi-process sequences (`mp` module).
+[[bin]]
+name = "mp-worker"
+path = "src/bin/mp-worker.rs"
+
 # Dual-backend timing bench: zerodb (via heed-zerodb) vs the LMDB fork (heed),
 # both already linked here for the differential harness. Indicative on macOS;
 # representative on Graviton + EBS (see the bench file's module docs).

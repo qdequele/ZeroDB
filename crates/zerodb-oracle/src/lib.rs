@@ -34,6 +34,7 @@ pub mod driver;
 mod engine;
 pub mod ffi_lmdb;
 mod heed_engine;
+pub mod mp;
 mod op;
 mod result;
 pub mod scenario;

@@ -621,7 +621,7 @@ impl std::error::Error for ScenarioDivergence {}
 /// One transcript entry: what the step did and its normalized result.
 pub(crate) type Entry = (String, String);
 
-fn compare(a: &[Entry], b: &[Entry]) -> Result<(), Box<ScenarioDivergence>> {
+pub(crate) fn compare(a: &[Entry], b: &[Entry]) -> Result<(), Box<ScenarioDivergence>> {
     for (step, (ea, eb)) in a.iter().zip(b.iter()).enumerate() {
         if ea != eb {
             return Err(Box::new(ScenarioDivergence {
