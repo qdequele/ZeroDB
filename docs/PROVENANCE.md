@@ -37,14 +37,25 @@ plainly as the strengths.
 - **Differential tests against LMDB.** `crates/zerodb-oracle` runs one
   sequence of operations on LMDB, on native ZeroDB and on ZeroDB through the
   heed adapter, and compares each operation's result for equality: return
-  values, error codes and iteration order. Hand-written differential tests
-  cover cases the sequences cannot express, such as read-only opens,
-  multi-process scenarios and environment copies.
+  values, error codes and iteration order. Generated scenarios
+  (`zerodb_oracle::scenario`) compare, through heed on both engines,
+  `delete_range` (a cursor walk deleting each entry on LMDB) and custom key
+  comparators (reverse, native-endian integer, length then bytes), several
+  read transactions held at different snapshots while a writer mutates and
+  commits, and close and reopen sequences with `READ_ONLY`, `PREV_SNAPSHOT`,
+  `NO_LOCK` and `WRITE_MAP`, map sizes and `resize`. Generated
+  multi-process sequences (`zerodb_oracle::mp`) run two or three worker
+  processes on one environment, with reader slots, `ReadersFull`, growth
+  past another process's map, `MapResized`, `resize`, workers killed with
+  `SIGKILL` while holding readers, stale-reader cleanup and respawns.
+  Hand-written differential tests cover what the generators do not, such as
+  environment copies.
 - **Differential fuzzing in CI.** Every pull request runs the fuzzer for
   10 minutes on native ZeroDB and 2 minutes through the heed adapter, on
   x86-64 and aarch64, plus 2 minutes each of two targets that feed arbitrary
-  bytes to the page decoder and to `open`. A nightly job runs it for about
-  four hours on each architecture.
+  bytes to the page decoder and to `open`, 3 minutes of the generated
+  scenarios and 200 generated multi-process sequences. A nightly job runs
+  it for about four and a half hours on each architecture.
 - **Crash testing.** A fault-injecting write backend builds the file images a
   crash could leave between two sync barriers: each pending write kept,
   dropped or torn, in any order. A second mechanism kills real processes with
@@ -115,14 +126,32 @@ plainly as the strengths.
 - **No power-loss test on a real device.** Crash tests use a model of what a
   disk may keep, and process kills, which leave the page cache intact. No
   test has cut power to a machine.
-- **The differential tests do not cover everything.** The generated operation
-  sequences use one transaction at a time, plus one nested read transaction.
-  Not compared with LMDB at all: `delete_range` and custom key comparators,
-  which have ZeroDB-only tests. Not compared: the point at which a full map
-  returns `MapFull`, which depends on each engine's page allocation.
-  Read-only environments and multi-process behavior are covered by
-  hand-written scenarios only, not by generated sequences. Concurrent readers
-  and writers are stress-tested on ZeroDB alone, not compared with LMDB.
+- **The differential tests do not cover everything.**
+  - The point at which a full map returns `MapFull` is not compared, because
+    it depends on each engine's page allocation. A weaker property is
+    compared instead: every failure is a clean `MapFull`, the failed
+    transaction cannot commit, the committed state is intact and still
+    readable, the environment grows with `resize` and then accepts the
+    failed writes, and both engines end with the same contents. For the
+    same reason a map set below the data is not compared by size: LMDB
+    raises it to the pages in use, a count that depends on allocation. The
+    reopen and multi-process generators stop comparing a case at its first
+    `MapFull`.
+  - Concurrency is compared through generated interleavings that run one
+    step at a time, in one process or across processes, not through threads
+    running in parallel. Parallel readers and writers are stress-tested on
+    ZeroDB alone, not compared with LMDB.
+  - The multi-process generator does not use `WRITE_MAP` (a joining LMDB
+    process can truncate the data file under another process's mapping,
+    [D-024](LMDB-COMPATIBILITY.md#d-024)), `PREV_SNAPSHOT` (the approved
+    differences of [D-025](LMDB-COMPATIBILITY.md#d-025)) or `NO_LOCK`, and
+    no worker holds a write transaction between steps, so no process ever
+    waits for another's writer lock.
+  - Custom comparators and `delete_range` are compared through the heed
+    adapter only; the native API is not driven against LMDB for them.
+  - `Env::info().last_txn_id` is not compared in a process whose map is
+    smaller than the data another process committed
+    ([D-029](LMDB-COMPATIBILITY.md#d-029)).
 - **No 64 KiB-page kernel.** CI runs on GitHub's x86-64 and aarch64 Linux
   runners, which use 4 KiB OS pages. ZeroDB has not been run on a 64 KiB-page
   kernel. macOS on Apple silicon (16 KiB pages) runs the tests and the crash

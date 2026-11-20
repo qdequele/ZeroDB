@@ -26,6 +26,8 @@ mod put_reserved_short_write_parity;
 mod random_ops_proptest;
 mod read_differential;
 mod readers_full_differential;
+mod scenario_proptest;
+mod scenario_regressions;
 mod skip_differential;
 mod stat_differential;
 mod unnamed_root_differential;

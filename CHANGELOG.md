@@ -74,6 +74,14 @@ the release workflow publishes the section matching the tag as the GitHub releas
   `check_snapshot_with_key_order`: a caller that holds a database's custom
   comparator can have key order checked under it, or skipped. `check_image`,
   `check_snapshot` and `zerodb-tools check` are unchanged.
+- **More of the heed surface compared with LMDB by generated tests.** The
+  oracle's `scenario` module generates sequences with `delete_range`, custom
+  key comparators, several read transactions at different snapshots while a
+  writer commits, reopens with `READ_ONLY`, `PREV_SNAPSHOT`, `NO_LOCK` and
+  `WRITE_MAP`, and the `MapFull` property (the `diff_scenarios` fuzz
+  target). Its `mp` module generates multi-process sequences: reader slots,
+  growth past another process's map, `resize`, `MapResized`, killed readers
+  and stale-reader cleanup. Both run in the PR fuzz gate.
 
 ### Changed
 
@@ -215,6 +223,23 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 
 ### Fixed
 
+- **`clear` of the main database now commits a new transaction** even when
+  the database was already empty, as LMDB's `mdb_drop` does: the commit takes
+  a new txnid and writes a meta (SPEC 04 TXN-74).
+- **heed adapter: `get_greater_than` on a database with a custom key
+  comparator** returns heed's result. heed seeks in the database's order but
+  then compares the found key with memcmp, so with a custom comparator it can
+  skip an entry; the adapter returned the least entry strictly greater.
+- **heed adapter: an empty key as a range's seek bound** (the start of
+  `range` and `range_mut`, the end of `rev_range` and `rev_range_mut`) now
+  yields `BadValSize` before the entries, and `delete_range` with an empty
+  start bound returns `Io(InvalidInput)` without deleting anything, as heed
+  does on LMDB. The adapter treated the empty key as the smallest key.
+  `del_current` on a write iterator that has not yet sought (before its
+  first item, or right after that error) returns `Io(InvalidInput)`
+  (`EINVAL`) as LMDB does, instead of `Ok(false)`.
+- **heed adapter: `Env::info().number_of_readers` is 0 with `NO_LOCK`**, as
+  in LMDB, which has no reader table then.
 - A failed meta write (commit step C4) or meta barrier (C5) now writes the
   meta slot's previous bytes back and poisons the environment, as LMDB marks
   its environment fatal (SPEC 06 REC-13, ADR-0047). Before, a failed meta

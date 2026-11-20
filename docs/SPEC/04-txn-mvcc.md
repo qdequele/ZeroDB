@@ -1246,6 +1246,16 @@ spilling bullet there.)
 - **TXN-58** — **commit** (`RwTxn::commit`): assert `child_count == 0` (TXN-33),
   then run the commit pipeline (§9), which hands off to SPEC 06 for durability.
   On success the new meta is live (TXN-3/TXN-19) and the write mutex is released.
+- **TXN-74 (unchanged commit)** — A commit whose txn changed nothing (no
+  dirty or spilled page, no freed, loose or reclaimed page, no catalog
+  write-back, the same `main_db`, `free_db` and `next_pgno` as its base)
+  returns `Ok` without running the pipeline: it writes no meta, publishes
+  nothing and consumes no txnid, as LMDB skips a commit whose txn is not
+  `MDB_TXN_DIRTY`. A `clear` of the main database counts as a change even
+  when the database was already empty, because LMDB's `mdb_drop` marks the
+  txn dirty unconditionally: that commit runs the pipeline and takes a new
+  txnid. (A `clear` of a named database already counts, through its catalog
+  write-back.) Observed by the oracle's `noop_clear_commit_advances_txn_id`.
 - **TXN-59** — **abort** (`RwTxn::abort`, also used as a pure write-lock release,
   SPEC 00 row 28): drop the dirty set and freed-page list, discard the working
   `DBRecord`s, make **no** disk change (the live meta is untouched), release the
@@ -1442,7 +1452,7 @@ every hook; this section defines the steps and their ordering. Both write modes
 
 **Rule count: TXN-1 … TXN-67 (67 normative rules; §4.4 adds sub-rule TXN-18a for
 slot release), plus the later TXN-68 … TXN-72 (§6.3a), TXN-73 (§4.4, added
-2026-10-13), LCK-1 … LCK-11 (§12, added 2026-10-13) and DBI-1 … DBI-10 (§13,
+2026-10-13), TXN-74 (§8, added 2026-11-20), LCK-1 … LCK-11 (§12, added 2026-10-13) and DBI-1 … DBI-10 (§13,
 added 2026-10-17).** TXN-40 (nested write unsupported, D-003) is referenced from
 §5/§8 and defined here:
 
