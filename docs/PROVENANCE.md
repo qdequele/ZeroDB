@@ -103,9 +103,17 @@ plainly as the strengths.
   Read-only environments and multi-process behavior are covered by
   hand-written scenarios only, not by generated sequences. Concurrent readers
   and writers are stress-tested on ZeroDB alone, not compared with LMDB.
-- **4 KiB-page kernels only.** CI runs on GitHub's x86-64 and aarch64 runners,
+- **No 64 KiB-page kernel.** CI runs on GitHub's x86-64 and aarch64 runners,
   which use 4 KiB OS pages. ZeroDB has not been run on a 64 KiB-page kernel.
+  The one run on a larger OS page is a page-size matrix on a 16 KiB-page
+  macOS host (Apple silicon), recorded in
+  [hardening-runs/](hardening-runs/): DB pages of 4 KiB there are smaller
+  than the OS page, the case a 64 KiB kernel reaches with 4 and 16 KiB DB
+  pages, but on Darwin's virtual memory system, not Linux's.
+  [maintainers/HARDENING-RUNS.md](maintainers/HARDENING-RUNS.md) has the
+  runner (`just page-size-matrix`) and the machine to use.
 - **No 24-hour fuzz soak.** The longest scheduled fuzz run is the nightly one.
+  The runner exists (`just soak`, same page); no 24-hour run is recorded.
 - **The consumer suites are not in CI.** They are run by hand
   ([maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md)). The last
   recorded passes are Meilisearch v1.55.0's milli and index-scheduler suites

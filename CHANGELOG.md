@@ -8,6 +8,15 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ### Added
 
+- **Hardening runners**: `just soak` runs the fuzz targets,
+  the crash harness and the stress tests side by side for 24 hours and
+  collects sequence counts and findings; `just page-size-matrix` runs the
+  suite, the crash harness at DB pages of 4, 16 and 64 KiB, the stress tests
+  and the fuzz gate on the host's kernel, for a 64 KiB-page aarch64 machine.
+  `docs/maintainers/HARDENING-RUNS.md` says which machines to use. The crash
+  harness takes `ZERODB_CRASH_PAGE_SIZE` to pin every cycle's page size, and
+  `crates/zerodb/tests/os_page_size.rs` exercises the OS-page-rounding paths
+  at each DB page size. Neither long run has been recorded yet.
 - **Multi-process access** (ADR-0023). Several processes can open one
   environment and read or write it, as with LMDB. A lock file is created next
   to the data file by default: `lock.mdb` through heed, `zerodb.lock`

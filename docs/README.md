@@ -31,6 +31,7 @@ transactions and MVCC, `05` free-page reuse, and `06` durability and recovery.
 |---|---|
 | [maintainers/RELEASING.md](maintainers/RELEASING.md) | How a version is cut |
 | [maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md) | Running Meilisearch's and hannoy's test suites and benchmarks on ZeroDB |
+| [maintainers/HARDENING-RUNS.md](maintainers/HARDENING-RUNS.md) | The 24-hour fuzz soak and the run on a 64 KiB-page kernel: machines, commands, recording |
 
 Benchmark reports are in [`benches/results/`](../benches/results/README.md),
 and release history in [CHANGELOG.md](../CHANGELOG.md).
