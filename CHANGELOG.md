@@ -8,6 +8,27 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ### Added
 
+- **Power-loss harness below the file system** (`power-loss` binary,
+  `scripts/power-loss/`, docs/maintainers/POWER-LOSS.md). The workload runs on
+  ext4 and XFS over a `dm-log-writes` device; each flush point of the log is
+  rebuilt, mounted and checked: the env opens, `zerodb-tools check` passes,
+  every acknowledged commit of a durable mode is present and no later commit
+  is partly visible. Linux and root only; a CI job runs it nightly and on pull
+  requests that touch it.
+- **Hardening runners**: `just soak` runs the fuzz targets,
+  the crash harness and the stress tests side by side for 24 hours and
+  collects sequence counts and findings; `just page-size-matrix` runs the
+  suite, the crash harness at DB pages of 4, 16 and 64 KiB, the stress tests
+  and the fuzz gate on the host's kernel, for a 64 KiB-page aarch64 machine.
+  `docs/maintainers/HARDENING-RUNS.md` says which machines to use. The crash
+  harness takes `ZERODB_CRASH_PAGE_SIZE` to pin every cycle's page size, and
+  `crates/zerodb/tests/os_page_size.rs` exercises the OS-page-rounding paths
+  at each DB page size. Neither long run has been recorded yet.
+- **I/O-error injection** in the fault-injecting backend (`IoFault`): a test
+  can fail the `n`th write, sync or file-growth call with `EIO`, `ENOSPC` or a
+  short write. Tests fail every such call of a commit, of a spill, of the
+  `WRITE_MAP` ranged `msync`, of file growth and of `copy_to_file` and
+  compaction; SPEC 06 REC-23 states the behavior they pin.
 - **Multi-process access** (ADR-0023). Several processes can open one
   environment and read or write it, as with LMDB. A lock file is created next
   to the data file by default: `lock.mdb` through heed, `zerodb.lock`
@@ -26,6 +47,11 @@ the release workflow publishes the section matching the tag as the GitHub releas
   `Env::unique_write_txn` and friends, `non_free_page_size`). Without the
   feature nothing changes. Meilisearch v1.55.0's milli and index-scheduler
   suites pass on it (447 tests).
+- **Consumer gate in CI.** A nightly, manually dispatchable job runs
+  Meilisearch v1.55.1's milli and index-scheduler suites and hannoy v0.2.0's
+  suite on ZeroDB through `scripts/consumer.sh` and `scripts/hannoy.sh`, and a
+  green run is required before a release. Run on 2026-11-20 at `c7e1abf`:
+  448 and 59 tests passed, none failed.
 - Read transactions and nested read transactions gain `commit`: as in LMDB,
   committing one keeps the databases it opened.
 - `ReaderEntry::pid`: `Env::reader_list()` reports each slot's owner process.
@@ -37,6 +63,12 @@ the release workflow publishes the section matching the tag as the GitHub releas
 - `zerodb-core`: `Cursor::advance_by` and `Cursor::retreat_by`.
 - New error variant `MdbError::BadDbi`.
 - A runnable example, `cargo run -p zerodb --example basic`.
+- **`zerodb-tools upgrade <old-env-dir> <new-env-dir>`** copies a format 2
+  environment (0.2.0) into a fresh current-format one, keeping its data-file
+  name and page size, and checks entry counts and invariants. `dump` also reads
+  format 2 files, producing the dump the 0.2.0 tools did.
+- `zerodb_core::page::MetaPage::validate_version`: SPEC 02 §3.2's meta-slot
+  check against a given format version, for tools that read an older file.
 - `zerodb::EnvFlags::from_bits_truncate`.
 - `zerodb_core::check::check_image_with_key_order` and
   `check_snapshot_with_key_order`: a caller that holds a database's custom
@@ -49,6 +81,14 @@ the release workflow publishes the section matching the tag as the GitHub releas
   job runs the tests under ThreadSanitizer and AddressSanitizer
   (`just sanitize`). A brief for an outside review is in
   `docs/maintainers/UNSAFE-AUDIT.md`.
+- **More of the heed surface compared with LMDB by generated tests.** The
+  oracle's `scenario` module generates sequences with `delete_range`, custom
+  key comparators, several read transactions at different snapshots while a
+  writer commits, reopens with `READ_ONLY`, `PREV_SNAPSHOT`, `NO_LOCK` and
+  `WRITE_MAP`, and the `MapFull` property (the `diff_scenarios` fuzz
+  target). Its `mp` module generates multi-process sequences: reader slots,
+  growth past another process's map, `resize`, `MapResized`, killed readers
+  and stale-reader cleanup. Both run in the PR fuzz gate.
 
 ### Changed
 
@@ -73,8 +113,8 @@ the release workflow publishes the section matching the tag as the GitHub releas
   the low end of each record's page range, instead of one record on a long
   overflow run. A later commit that draws pages from that list reads and
   rewrites only the records it draws from, not the whole list. Format-2
-  files are refused at open: migrate with `zerodb-tools dump` built from the
-  previous release, then `load`. `zerodb-tools stat` reports the free-page
+  files are refused at open: migrate with `zerodb-tools upgrade <old-env>
+  <new-env>` from this release, one command and one tool version. `zerodb-tools stat` reports the free-page
   records, and `check` verifies their bound and ranges (INV-29).
 - **The heed adapter is the `[patch]` target itself.** `crates/heed-zerodb`'s
   package is now named `heed` (version 0.22.1), and the `crates/heed-shim` and
@@ -197,6 +237,27 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 
 ### Fixed
 
+- **`clear` of the main database now commits a new transaction** even when
+  the database was already empty, as LMDB's `mdb_drop` does: the commit takes
+  a new txnid and writes a meta (SPEC 04 TXN-74).
+- **heed adapter: `get_greater_than` on a database with a custom key
+  comparator** returns heed's result. heed seeks in the database's order but
+  then compares the found key with memcmp, so with a custom comparator it can
+  skip an entry; the adapter returned the least entry strictly greater.
+- **heed adapter: an empty key as a range's seek bound** (the start of
+  `range` and `range_mut`, the end of `rev_range` and `rev_range_mut`) now
+  yields `BadValSize` before the entries, and `delete_range` with an empty
+  start bound returns `Io(InvalidInput)` without deleting anything, as heed
+  does on LMDB. The adapter treated the empty key as the smallest key.
+  `del_current` on a write iterator that has not yet sought (before its
+  first item, or right after that error) returns `Io(InvalidInput)`
+  (`EINVAL`) as LMDB does, instead of `Ok(false)`.
+- **heed adapter: `Env::info().number_of_readers` is 0 with `NO_LOCK`**, as
+  in LMDB, which has no reader table then.
+- `zerodb-tools check` on a file it walks raw no longer reports INV-3 for a
+  partial page past the high-water. A write that extended the file and failed
+  part-way (a short write on a full device) leaves one; no snapshot reads it.
+
 - **A commit no longer fails when the free-list save converges slowly**
   (ADR-0044). The save loop was limited to 64 rounds, a number its
   termination proof did not give; past it the commit panicked, and a retry
@@ -265,11 +326,20 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 
 ### Known limits
 
+- A failed meta write (commit step C4) does not poison the environment. If
+  the write was short but carried the whole meta, and a later write
+  transaction is interrupted between its page writes and its meta write, the
+  file can be left corrupt (SPEC 06 conflict 5; the fix awaits ADR-0047).
+
 - Using an `Env` in a child after `fork()`, and sharing an environment across
   PID namespaces, are unsupported. `Env::sync` only serializes with this
   process's commits. On macOS, a writer that takes over from a dead writer
-  does not free dead readers' slots; call `clear_stale_readers` (SPEC 04
-  §12.1).
+  does not free dead readers' slots, where LMDB does (D-028, proposed); call
+  `clear_stale_readers` (SPEC 04 §12.1).
+- **Platforms:** Linux (x86-64, aarch64) and macOS (aarch64) are tested in
+  CI. Windows is not supported: the crates stop at a `compile_error!` there,
+  instead of dozens of unresolved Unix imports. ADR-0046 proposes the Windows
+  design (draft). The tiers are in `docs/USING.md#platform-support`.
 
 ## [0.2.0] - 2026-10-05
 

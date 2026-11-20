@@ -73,7 +73,10 @@ stress:
     ZERODB_STRESS_SECS=180 cargo test -p zerodb --test multi_process_stress -- --nocapture stress_
 
 # cargo-fuzz needs nightly. 10 min LMDB vs ZeroDB, then 2 min each of page
-# decoding, hostile-image open, and LMDB vs ZeroDB through the heed adapter.
+# decoding, hostile-image open, and LMDB vs ZeroDB through the heed adapter,
+# 3 min of the generated scenarios (comparators and `delete_range`, live
+# readers at several snapshots, reopen and read-only sequences, `MapFull`),
+# then 200 generated multi-process sequences.
 #
 # Fuzz gate for every change (CI runs it on every PR).
 fuzz-quick:
@@ -81,20 +84,32 @@ fuzz-quick:
     cargo +nightly fuzz run fuzz_page_decode -- -max_total_time=120
     cargo +nightly fuzz run fuzz_image_open -- -max_total_time=120
     ZERODB_FUZZ_PAIR=heed cargo +nightly fuzz run diff_ops -- -max_total_time=120
+    cargo +nightly fuzz run diff_scenarios -- -max_total_time=180 -max_len=1200 -len_control=0
+    ZERODB_MP_CASES=200 cargo test --release -p zerodb-oracle --test multi_process mp_generated
 
 # Nightly CI runs `just fuzz-long 12600` to fit GitHub's 6 h job cap; the 24 h
 # soak a consumer integration gate asks for needs a self-hosted box.
 #
-# Long differential fuzz: SECS native, then SECS/8 through the heed adapter.
+# Long differential fuzz: SECS native, then SECS/8 through the heed adapter,
+# SECS/8 of the generated scenarios and 2000 multi-process sequences.
 fuzz-long SECS='21600':
     cargo +nightly fuzz run diff_ops -- -max_total_time={{SECS}}
     ZERODB_FUZZ_PAIR=heed cargo +nightly fuzz run diff_ops -- -max_total_time=$(({{SECS}} / 8))
+    cargo +nightly fuzz run diff_scenarios -- -max_total_time=$(({{SECS}} / 8)) -max_len=1200 -len_control=0
+    ZERODB_MP_CASES=2000 cargo test --release -p zerodb-oracle --test multi_process mp_generated
 
 # Example: just fuzz-decode fuzz/artifacts/diff_ops/crash-…
 #
 # Print the engine mode and op sequence a diff_ops fuzz artifact decodes to.
 fuzz-decode ARTIFACT:
     cargo run -q -p zerodb-oracle --example decode_artifact -- '{{ARTIFACT}}'
+
+# Example: just fuzz-decode-scenario fuzz/artifacts/diff_scenarios/crash-…
+#
+# Print the scenario a diff_scenarios fuzz artifact decodes to, and its
+# minimized divergence.
+fuzz-decode-scenario ARTIFACT:
+    cargo run -q -p zerodb-oracle --example scenario_explore -- '{{ARTIFACT}}'
 
 # Crash-consistency smoke, run by CI on every PR.
 crash-test-quick:
@@ -108,6 +123,26 @@ crash-test-mp CYCLES='500':
 # The full crash run, nightly in CI.
 crash-test-full:
     cargo run -p zerodb-oracle --bin crash-harness -- --cycles 10000
+
+# Power loss below the file system: dm-log-writes on ext4 and XFS. Linux and
+# root only; settings through the environment (docs/maintainers/POWER-LOSS.md).
+power-loss:
+    sudo -E scripts/power-loss/run.sh
+
+# Needs a dedicated machine; docs/maintainers/HARDENING-RUNS.md says which and
+# how to record the result. HOURS, OUT and the worker counts are documented in
+# the header of scripts/soak.sh.
+#
+# Hardening soak: fuzz targets, crash harness and stress side by side for HOURS.
+soak HOURS='24':
+    HOURS={{HOURS}} scripts/soak.sh
+
+# Meant for a 64 KiB-page (or 16 KiB-page) kernel; see
+# docs/maintainers/HARDENING-RUNS.md. Options are in scripts/page-size-matrix.sh.
+#
+# Test suite, crash harness at 4/16/64 KiB DB pages, stress and fuzz, on this kernel.
+page-size-matrix:
+    scripts/page-size-matrix.sh
 
 # --- Engine comparison: zerodb vs the LMDB fork (heed), both in one binary ---
 #

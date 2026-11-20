@@ -1,0 +1,66 @@
+//! Builds the format-version-2 fixture used by zerodb-tools' upgrade tests.
+//! Run from a checkout of the v0.2.0 tag:
+//!   cargo run -p zerodb --example gen_v2_fixture -- <empty-dir>
+use zerodb::EnvOpenOptions;
+
+fn val(i: u32, len: usize) -> Vec<u8> {
+    (0..len).map(|j| (i as usize * 31 + j * 7) as u8).collect()
+}
+
+fn main() {
+    let dir = std::env::args().nth(1).expect("usage: gen_v2_fixture <empty-dir>");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut opts = EnvOpenOptions::new();
+    opts.map_size(16 << 20).page_size(4096).max_dbs(8);
+    let env = opts.open(&dir).unwrap();
+
+    // Txn 1: main DB records (inline and overflow), three named DBs.
+    let mut t = env.write_txn().unwrap();
+    let main = env.main_database();
+    for i in 0..300u32 {
+        main.put(&mut t, format!("main-{i:05}").as_bytes(), &val(i, 24)).unwrap();
+    }
+    for i in 0..3u32 {
+        main.put(&mut t, format!("main-big-{i}").as_bytes(), &val(i, 10_000 + i as usize)).unwrap();
+    }
+    let alpha = env.create_database(&mut t, Some(b"alpha")).unwrap();
+    for i in 0..1200u32 {
+        alpha.put(&mut t, &i.to_be_bytes(), &val(i, 40)).unwrap();
+    }
+    env.create_database(&mut t, Some(b"empty")).unwrap();
+    let gamma = env.create_database(&mut t, Some(b"gamma\x00bin")).unwrap();
+    for i in 0..12u32 {
+        gamma.put(&mut t, &[0u8, 0xff, i as u8], &val(i, 6000)).unwrap();
+    }
+    t.commit().unwrap();
+
+    // Txns 2 and 3: rewrites. A read transaction pins txn 1's pages, so every
+    // commit's freed pages stay free and the free (GC) DB keeps format-2
+    // records (only the newest list rides in the meta annex).
+    let pin = env.read_txn().unwrap();
+    for round in 0..2u32 {
+        let mut t = env.write_txn().unwrap();
+        for i in (round..1200).step_by(7) {
+            alpha.put(&mut t, &i.to_be_bytes(), &val(i + round, 40)).unwrap();
+        }
+        t.commit().unwrap();
+    }
+    // Small commits until the pending free pages outgrow the meta annex
+    // (490 ids at 4 KiB) and spill into free-DB records.
+    for round in 0..130u32 {
+        let mut t = env.write_txn().unwrap();
+        let i = (round * 37) % 1200;
+        alpha.put(&mut t, &i.to_be_bytes(), &val(i + 7, 40)).unwrap();
+        t.commit().unwrap();
+    }
+    // Last txn: one large delete, a long free-page list in one GC record.
+    let mut t = env.write_txn().unwrap();
+    for i in 150..1050u32 {
+        alpha.delete(&mut t, &i.to_be_bytes()).unwrap();
+    }
+    for i in 3..9u32 {
+        gamma.delete(&mut t, &[0u8, 0xff, i as u8]).unwrap();
+    }
+    t.commit().unwrap();
+    drop(pin);
+}

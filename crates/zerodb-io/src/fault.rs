@@ -68,6 +68,15 @@
 //! also `fdatasync`s the file): it checks that the ranges alone cover
 //! everything the new meta references.
 //!
+//! ## Failing system calls
+//!
+//! Besides crashes, the wrapper can make one call fail as a real system call
+//! does ([`FaultHandle::inject`], [`IoFault`]): the `n`th write, sync or
+//! file-growth call returns `EIO` or `ENOSPC`, or a write stores only a
+//! prefix and then fails (a short write). A failed sync moves the whole
+//! journal to a limbo no later barrier folds, the model of a Linux `fsync`
+//! error that may have dropped the dirty pages (SPEC 06 REC-13, REC-23).
+//!
 //! The live view stays the wrapped backing's — no new aliasing. The only
 //! `unsafe` is the mandatory `unsafe fn` forward of the brokered map slice
 //! (ADR-0021), which adds no obligation of its own.
@@ -194,6 +203,113 @@ pub struct FaultStats {
     /// nonzero value under a WRITE_MAP cycle means the in-place realization
     /// silently disengaged.
     pub data_writes: u64,
+    /// Sync calls of any kind (`sync`, `sync_data`, `sync_pages`,
+    /// synchronous or not), failed ones included: the [`IoOp::Sync`] count.
+    pub syncs: u64,
+    /// File-growth calls (`grow_map`, `ensure_file_len`), failed ones
+    /// included: the [`IoOp::Grow`] count.
+    pub grows: u64,
+    /// Calls an [`IoFault`] made fail.
+    pub injected: u64,
+}
+
+// ---------------------------------------------------------------------------
+// System-call failure injection
+// ---------------------------------------------------------------------------
+
+/// A class of backing call an [`IoFault`] can make fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoOp {
+    /// One `write_at_page` call. A vectored `write_pages_at` reaches this
+    /// wrapper as one `write_at_page` per frame (the trait's default), so
+    /// each frame counts as one call.
+    Write,
+    /// One durability call: `sync`, `sync_data` or `sync_pages`, synchronous
+    /// or `MS_ASYNC`.
+    Sync,
+    /// One file-growth call: `grow_map` or `ensure_file_len`.
+    Grow,
+}
+
+/// How an injected call fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoFailure {
+    /// `EIO`: the call reports an I/O error and writes nothing.
+    Eio,
+    /// `ENOSPC`: the call reports a full device and writes nothing.
+    Enospc,
+    /// For [`IoOp::Write`] only: the first `keep` bytes of the write reach
+    /// the file (clamped below the write's length), then the call fails
+    /// with `ENOSPC`. This is what a positioned write loop reports when one
+    /// `pwrite` returns short and the next one finds the device full.
+    ShortWrite {
+        /// Bytes of the write that reach the file before the error.
+        keep: usize,
+    },
+}
+
+impl IoFailure {
+    /// The error the failed call returns.
+    #[must_use]
+    pub fn error(self) -> std::io::Error {
+        match self {
+            IoFailure::Eio => std::io::Error::from_raw_os_error(libc::EIO),
+            IoFailure::Enospc | IoFailure::ShortWrite { .. } => {
+                std::io::Error::from_raw_os_error(libc::ENOSPC)
+            }
+        }
+    }
+}
+
+/// An injected system-call failure: the `nth` call of class `op` (counted
+/// from 1, from the moment [`FaultHandle::inject`] armed it) fails with
+/// `failure`. With `sticky`, every later call of that class fails too (a
+/// device that stays full or broken); without, only the `nth` one does.
+///
+/// What a failed call leaves behind, in the live view and in the crash
+/// journal:
+///
+/// - a failed **write** writes nothing, except the `keep`-byte prefix of a
+///   [`IoFailure::ShortWrite`], which reaches the live file and enters the
+///   journal as a pending write;
+/// - a failed **sync** flushes nothing it can vouch for: every pending write
+///   (and every brokered in-map region) moves to a *limbo* that no later
+///   barrier folds. On Linux a failed `fsync` may drop the dirty pages and
+///   clear the error, so a later `fsync` that succeeds proves nothing about
+///   them; in a crash image each limbo write is present, torn or absent,
+///   forever. The wrapped backing's sync is not called;
+/// - a failed **growth** leaves the file and the map as they were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoFault {
+    /// The class of call that fails.
+    pub op: IoOp,
+    /// Which call of that class fails first, counted from 1.
+    pub nth: u64,
+    /// How it fails.
+    pub failure: IoFailure,
+    /// Whether every later call of that class fails too.
+    pub sticky: bool,
+}
+
+impl IoFault {
+    /// The `nth` call of class `op` fails once with `failure`.
+    #[must_use]
+    pub fn once(op: IoOp, nth: u64, failure: IoFailure) -> IoFault {
+        IoFault {
+            op,
+            nth,
+            failure,
+            sticky: false,
+        }
+    }
+}
+
+/// An armed [`IoFault`] and its countdown.
+#[derive(Debug)]
+struct Armed {
+    fault: IoFault,
+    /// Calls of `fault.op` seen since arming.
+    seen: u64,
 }
 
 #[derive(Debug)]
@@ -217,10 +333,51 @@ struct FaultState {
     /// data fsync is ineffective/misordered — the harness MUST catch the
     /// resulting meta-without-data images. Never set outside the self-test.
     broken_data_barriers: bool,
+    /// Writes whose durability a failed sync left unknown for good (see
+    /// [`IoFault`]): never folded by a later barrier, always materialized as
+    /// pending. In issue order, and all issued before anything in `pending`.
+    limbo: Vec<WriteRecord>,
+    /// The injected failure waiting for its call, if any.
+    armed: Option<Armed>,
     stats: FaultStats,
 }
 
 impl FaultState {
+    /// Count one call of class `op` and return the failure to inject into
+    /// it, if the armed [`IoFault`] targets this call.
+    fn trip(&mut self, op: IoOp) -> Option<IoFailure> {
+        match op {
+            // `writes` is counted by the caller, which also counts the
+            // calls that succeed.
+            IoOp::Write => {}
+            IoOp::Sync => self.stats.syncs += 1,
+            IoOp::Grow => self.stats.grows += 1,
+        }
+        let armed = self.armed.as_mut()?;
+        if armed.fault.op != op {
+            return None;
+        }
+        armed.seen += 1;
+        let hit = if armed.fault.sticky {
+            armed.seen >= armed.fault.nth
+        } else {
+            armed.seen == armed.fault.nth
+        };
+        if !hit {
+            return None;
+        }
+        self.stats.injected += 1;
+        Some(armed.fault.failure)
+    }
+
+    /// A failed sync: seal the brokered regions (their bytes sit in the page
+    /// cache like any written page) and move everything pending to the limbo.
+    fn fail_sync(&mut self, live: &[u8]) {
+        self.seal_map_regions(live);
+        let pending = std::mem::take(&mut self.pending);
+        self.limbo.extend(pending);
+    }
+
     /// Resolve the brokered map regions against the live map `live` and
     /// append them to `pending` (ascending offset — regions never overlap
     /// `write_at_page` records: data pages are brokered, the meta slots and
@@ -244,7 +401,8 @@ impl FaultState {
     /// `pending` plus the still-unsealed map regions resolved against `live`
     /// — the capture view (leaves the journal untouched).
     fn pending_with_regions(&self, live: &[u8]) -> Vec<WriteRecord> {
-        let mut out = self.pending.clone();
+        let mut out = self.limbo.clone();
+        out.extend(self.pending.iter().cloned());
         for (&off, &len) in &self.map_regions {
             let (start, end) = (off as usize, (off + len) as usize);
             debug_assert!(end <= live.len(), "brokered region outside the map");
@@ -378,6 +536,29 @@ impl FaultHandle {
             .broken_data_barriers = broken;
     }
 
+    /// Arm `fault`, replacing any fault armed before. Its call count starts
+    /// now.
+    ///
+    /// # Panics
+    ///
+    /// If `fault.nth` is 0, or a [`IoFailure::ShortWrite`] targets a class
+    /// other than [`IoOp::Write`].
+    pub fn inject(&self, fault: IoFault) {
+        assert!(fault.nth >= 1, "IoFault::nth counts from 1");
+        assert!(
+            fault.op == IoOp::Write || !matches!(fault.failure, IoFailure::ShortWrite { .. }),
+            "a short write applies to IoOp::Write only"
+        );
+        self.state.lock().expect("fault state lock").armed = Some(Armed { fault, seen: 0 });
+    }
+
+    /// Disarm the injected fault, if any: every later call goes through
+    /// (a device that was full has room again). Writes already in the limbo
+    /// stay there.
+    pub fn clear_injection(&self) {
+        self.state.lock().expect("fault state lock").armed = None;
+    }
+
     /// Journal counters.
     #[must_use]
     pub fn stats(&self) -> FaultStats {
@@ -441,6 +622,8 @@ impl FaultBacking {
             pending: Vec::new(),
             map_regions: BTreeMap::new(),
             broken_data_barriers: false,
+            limbo: Vec::new(),
+            armed: None,
             stats: FaultStats::default(),
         }));
         let handle = FaultHandle {
@@ -448,6 +631,17 @@ impl FaultBacking {
             live: Arc::clone(&inner),
         };
         Ok((FaultBacking { inner, state }, handle))
+    }
+}
+
+impl FaultBacking {
+    /// Count one growth call; fail it if an armed fault targets it.
+    fn trip_grow(&self) -> std::io::Result<()> {
+        let mut st = self.state.lock().expect("fault state lock");
+        match st.trip(IoOp::Grow) {
+            Some(failure) => Err(failure.error()),
+            None => Ok(()),
+        }
     }
 }
 
@@ -461,11 +655,13 @@ impl Backing for FaultBacking {
         // that can grow. Growth writes no page content: a grown file reads as
         // zeros past its old end, which the durable image already models (it
         // grows only as writes are folded).
+        self.trip_grow()?;
         self.inner.grow_map(map_size)
     }
 
     fn ensure_file_len(&self, len: u64) -> std::io::Result<()> {
         // As `grow_map`: a forward; no page content is written.
+        self.trip_grow()?;
         self.inner.ensure_file_len(len)
     }
 
@@ -500,6 +696,27 @@ impl Backing for FaultBacking {
             let offset = pgno * u64::from(psize);
             if offset >= 2 * u64::from(st.psize) {
                 st.stats.data_writes += 1;
+            }
+            match st.trip(IoOp::Write) {
+                None => {}
+                Some(failure @ (IoFailure::Eio | IoFailure::Enospc)) => {
+                    return Err(failure.error());
+                }
+                Some(failure @ IoFailure::ShortWrite { keep }) => {
+                    // The prefix reaches the page cache like any write
+                    // (pending: a crash may keep or lose it), then the
+                    // call fails.
+                    let keep = keep.min(data.len().saturating_sub(1));
+                    if keep > 0 {
+                        st.pending.push(WriteRecord {
+                            offset,
+                            data: data[..keep].into(),
+                        });
+                        drop(st);
+                        self.inner.write_at_page(pgno, psize, &data[..keep])?;
+                    }
+                    return Err(failure.error());
+                }
             }
             st.pending.push(WriteRecord {
                 offset,
@@ -551,6 +768,10 @@ impl Backing for FaultBacking {
     fn sync(&self, async_flush: bool) -> std::io::Result<()> {
         {
             let mut st = self.state.lock().expect("fault state lock");
+            if let Some(failure) = st.trip(IoOp::Sync) {
+                st.fail_sync(self.inner.pages().whole());
+                return Err(failure.error());
+            }
             // ADR-0021: any flush call is a seal point — resolve the
             // brokered regions' current bytes into pending records (C3 runs
             // before C4, so data records precede the meta's; under MAP_ASYNC
@@ -582,6 +803,12 @@ impl Backing for FaultBacking {
         {
             let mut st = self.state.lock().expect("fault state lock");
             debug_assert_eq!(psize, st.psize, "sync psize drifted from env psize");
+            if let Some(failure) = st.trip(IoOp::Sync) {
+                // A failed ranged `msync` vouches for nothing either: the
+                // whole journal goes to the limbo, not only the ranges.
+                st.fail_sync(self.inner.pages().whole());
+                return Err(failure.error());
+            }
             // A seal point like `sync`: the brokered regions' current bytes
             // become pending records first, so the ranged fold sees them.
             st.seal_map_regions(self.inner.pages().whole());
@@ -1333,6 +1560,134 @@ mod tests {
             log.lock().unwrap().as_slice(),
             &[("grow_map", 1 << 20), ("ensure_file_len", 2 << 20)]
         );
+    }
+
+    fn errno(e: &std::io::Error) -> Option<i32> {
+        e.raw_os_error()
+    }
+
+    /// An injected write failure writes nothing and journals nothing; only
+    /// the targeted call fails, and the count starts at `inject`.
+    #[test]
+    fn injected_write_fails_the_nth_call_only() {
+        let (b, h) = setup(2);
+        b.write_at_page(2, PS, &page(1)).unwrap();
+        h.inject(IoFault::once(IoOp::Write, 2, IoFailure::Eio));
+        b.write_at_page(3, PS, &page(2)).unwrap();
+        let e = b.write_at_page(4, PS, &page(3)).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::EIO));
+        b.write_at_page(5, PS, &page(4)).unwrap();
+        let cap = h.capture();
+        let offs: Vec<u64> = cap
+            .pending
+            .iter()
+            .map(|r| r.offset / u64::from(PS))
+            .collect();
+        assert_eq!(offs, [2, 3, 5], "the failed write left no record");
+        assert_eq!(h.stats().injected, 1);
+        assert_eq!(h.stats().writes, 4);
+    }
+
+    /// A sticky fault fails every later call of its class, until cleared.
+    #[test]
+    fn sticky_fault_persists_until_cleared() {
+        let (b, h) = setup(2);
+        h.inject(IoFault {
+            op: IoOp::Write,
+            nth: 1,
+            failure: IoFailure::Enospc,
+            sticky: true,
+        });
+        for pg in 2..5 {
+            let e = b.write_at_page(pg, PS, &page(1)).unwrap_err();
+            assert_eq!(errno(&e), Some(libc::ENOSPC));
+        }
+        // Other classes are untouched.
+        b.sync(false).unwrap();
+        h.clear_injection();
+        b.write_at_page(2, PS, &page(1)).unwrap();
+        assert_eq!(h.stats().injected, 3);
+    }
+
+    /// A short write journals its prefix as a pending write, then fails.
+    #[test]
+    fn short_write_journals_its_prefix() {
+        let (b, h) = setup(2);
+        h.inject(IoFault::once(
+            IoOp::Write,
+            1,
+            IoFailure::ShortWrite { keep: 100 },
+        ));
+        let e = b.write_at_page(3, PS, &page(9)).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::ENOSPC));
+        let cap = h.capture();
+        assert_eq!(cap.pending.len(), 1);
+        assert_eq!(cap.pending[0].offset, 3 * u64::from(PS));
+        assert_eq!(cap.pending[0].data.len(), 100);
+        // `keep` is clamped below the write's length: a short write is short.
+        h.inject(IoFault::once(
+            IoOp::Write,
+            1,
+            IoFailure::ShortWrite { keep: usize::MAX },
+        ));
+        b.write_at_page(4, PS, &page(9)).unwrap_err();
+        assert_eq!(h.capture().pending[1].data.len(), PS as usize - 1);
+    }
+
+    /// A failed sync moves the journal to the limbo: no later barrier folds
+    /// those writes, and every crash image may still lose them.
+    #[test]
+    fn failed_sync_moves_pending_to_limbo_for_good() {
+        let (b, h) = setup(2);
+        b.write_at_page(2, PS, &page(0xAA)).unwrap();
+        h.inject(IoFault::once(IoOp::Sync, 1, IoFailure::Eio));
+        let e = b.sync(false).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::EIO));
+        // A later barrier succeeds and folds only what was written after it.
+        b.write_at_page(3, PS, &page(0xBB)).unwrap();
+        b.sync(false).unwrap();
+        let cap = h.capture();
+        assert_eq!(cap.pending.len(), 1, "the limbo write stays pending");
+        assert_eq!(cap.pending[0].offset, 2 * u64::from(PS));
+        assert_eq!(cap.durable[3 * PS as usize], 0xBB);
+        assert_eq!(cap.floor_image()[2 * PS as usize], 0, "page 2 may be lost");
+        // The ranged barrier fails the same way.
+        b.write_at_page(4, PS, &page(0xCC)).unwrap();
+        h.inject(IoFault::once(IoOp::Sync, 1, IoFailure::Enospc));
+        b.sync_pages(false, PS, &[(0, 8)]).unwrap_err();
+        b.sync_pages(false, PS, &[(0, 8)]).unwrap();
+        assert_eq!(h.capture().pending.len(), 2, "both limbo writes pending");
+        assert_eq!(h.stats().syncs, 4);
+    }
+
+    /// A failed growth is not forwarded.
+    #[test]
+    fn failed_growth_is_not_forwarded() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let (b, h) =
+            FaultBacking::wrap_with_initial(Box::new(GrowLog(Arc::clone(&log))), PS, Vec::new(), 0)
+                .unwrap();
+        h.inject(IoFault::once(IoOp::Grow, 2, IoFailure::Enospc));
+        b.grow_map(1 << 20).unwrap();
+        let e = b.ensure_file_len(2 << 20).unwrap_err();
+        assert_eq!(errno(&e), Some(libc::ENOSPC));
+        b.ensure_file_len(2 << 20).unwrap();
+        assert_eq!(
+            log.lock().unwrap().as_slice(),
+            &[("grow_map", 1 << 20), ("ensure_file_len", 2 << 20)]
+        );
+        assert_eq!(h.stats().grows, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "short write applies to IoOp::Write only")]
+    fn short_sync_is_refused() {
+        let (_b, h) = setup(2);
+        h.inject(IoFault::once(
+            IoOp::Sync,
+            1,
+            IoFailure::ShortWrite { keep: 1 },
+        ));
     }
 
     /// ADR-0021 — the in-map journal model, over the heap-backed

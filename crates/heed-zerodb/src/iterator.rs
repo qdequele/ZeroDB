@@ -62,6 +62,9 @@ macro_rules! ro_iterator {
         #[doc = $doc]
         pub struct $name<'txn, KC, DC, $($C = DefaultComparator,)? IM = MoveThroughDuplicateValues> {
             pub(crate) range: zerodb::RoRange<'txn>,
+            /// An error to yield before the first entry: heed's failed seek
+            /// on an empty bound key (`Database::range`).
+            pub(crate) pending: Option<Error>,
             pub(crate) _marker: PhantomData<(KC, DC, $($C,)? IM)>,
         }
 
@@ -69,6 +72,7 @@ macro_rules! ro_iterator {
             pub(crate) fn new(range: zerodb::RoRange<'txn>) -> $name<'txn, KC, DC, $($C,)? IM> {
                 $name {
                     range,
+                    pending: None,
                     _marker: PhantomData,
                 }
             }
@@ -78,6 +82,7 @@ macro_rules! ro_iterator {
             pub fn remap_types<KC2, DC2>(self) -> $name<'txn, KC2, DC2, $($C,)? IM> {
                 $name {
                     range: self.range,
+                    pending: self.pending,
                     _marker: PhantomData,
                 }
             }
@@ -105,6 +110,7 @@ macro_rules! ro_iterator {
             pub fn move_between_keys(self) -> $name<'txn, KC, DC, $($C,)? MoveBetweenKeys> {
                 $name {
                     range: self.range,
+                    pending: self.pending,
                     _marker: PhantomData,
                 }
             }
@@ -116,6 +122,7 @@ macro_rules! ro_iterator {
             ) -> $name<'txn, KC, DC, $($C,)? MoveThroughDuplicateValues> {
                 $name {
                     range: self.range,
+                    pending: self.pending,
                     _marker: PhantomData,
                 }
             }
@@ -129,6 +136,9 @@ macro_rules! ro_iterator {
             type Item = Result<(KC::DItem, DC::DItem)>;
 
             fn next(&mut self) -> Option<Self::Item> {
+                if let Some(e) = self.pending.take() {
+                    return Some(Err(e));
+                }
                 match self.range.next()? {
                     Ok((k, v)) => Some(decode_pair::<KC, DC>(k, v)),
                     Err(e) => Some(Err(e.into())),
@@ -138,6 +148,11 @@ macro_rules! ro_iterator {
             // The native range skips leaf by leaf (SPEC 03 §4); only the
             // landing entry is decoded.
             fn nth(&mut self, n: usize) -> Option<Self::Item> {
+                let n = match self.pending.take() {
+                    Some(e) if n == 0 => return Some(Err(e)),
+                    Some(_) => n - 1,
+                    None => n,
+                };
                 match self.range.nth(n)? {
                     Ok((k, v)) => Some(decode_pair::<KC, DC>(k, v)),
                     Err(e) => Some(Err(e.into())),
@@ -180,6 +195,13 @@ pub(crate) struct RwGuts<'txn> {
     lower: Bound<Vec<u8>>,
     upper: Bound<Vec<u8>>,
     started: bool,
+    /// Whether the cursor has done its first seek. Before that it is not on
+    /// an entry, and LMDB refuses `mdb_cursor_del` on such a cursor with
+    /// `EINVAL`, where the native cursor reports `Ok(false)`.
+    seeked: bool,
+    /// An error to yield before the first entry: heed's failed seek on an
+    /// empty bound key (`Database::range_mut`).
+    pending: Option<Error>,
 }
 
 impl<'txn> RwGuts<'txn> {
@@ -205,13 +227,28 @@ impl<'txn> RwGuts<'txn> {
             lower,
             upper,
             started: false,
+            seeked: false,
+            pending: None,
         }
+    }
+
+    /// Yield `err` before the first entry.
+    pub(crate) fn with_pending(mut self, err: Option<Error>) -> Self {
+        self.pending = err;
+        self
     }
 
     /// Advance and yield the next in-range `(key, value)` as `&'txn` borrows.
     fn step(&mut self) -> Option<Result<(&'txn [u8], &'txn [u8])>> {
+        // The failed seek leaves the cursor unpositioned, so the next step
+        // seeks again, from the (now unbounded) start, as LMDB's `MDB_NEXT`
+        // and `MDB_PREV` do on an unpositioned cursor.
+        if let Some(e) = self.pending.take() {
+            return Some(Err(e));
+        }
         let first = !self.started;
         self.started = true;
+        self.seeked = true;
         let res = match (self.dir, first) {
             (Dir::Fwd, true) => match &self.lower {
                 Bound::Unbounded => self.cursor.seek_first(),
@@ -274,6 +311,11 @@ impl<'txn> RwGuts<'txn> {
     }
 
     fn del_current(&mut self) -> Result<bool> {
+        if !self.seeked {
+            return Err(Error::Io(std::io::Error::from_raw_os_error(
+                crate::database::EINVAL,
+            )));
+        }
         Ok(self.cursor.del_current()?)
     }
 
