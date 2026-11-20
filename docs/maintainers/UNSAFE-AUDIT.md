@@ -227,7 +227,7 @@ maintainer review per CONTRIBUTING.md.
 ## Running the tools
 
 ```sh
-just miri                    # nightly; about 10 minutes
+just miri                    # nightly; the core dominates (about 50 minutes on an M-series Mac)
 just loom
 just sanitize thread         # nightly, Linux or macOS
 just sanitize address
