@@ -81,6 +81,7 @@ Awaiting a decision. Nothing here is implemented in `main`.
 | 0045 | [On-disk format stability: when `format_version` may change, and what a user is promised](adr/0045-format-stability-policy.md) | Draft, awaiting approval (#182); the policy is not in force. The format 2 reader and `zerodb-tools upgrade` it relies on are tooling, in `main` | On-disk format, release, tools |
 | 0046 | [Windows support](adr/0046-windows-support.md) | Draft, awaiting approval (#183) | Platforms, concurrency, durability, dependencies, `unsafe` policy |
 | 0047 | [What the environment does after a failed meta write or commit barrier](adr/0047-failed-meta-write-policy.md) | Draft, awaiting approval (#176) | Durability |
+| 0048 | [heed 0.23 support in the heed adapter](adr/0048-heed-0-23-adapter.md) | Proposed (spike only) | heed integration, consumers |
 
 ## Measured and not adopted
 
