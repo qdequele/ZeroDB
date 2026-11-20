@@ -36,6 +36,7 @@ pub mod ffi_lmdb;
 mod heed_engine;
 mod op;
 mod result;
+pub mod scenario;
 pub mod tempdir;
 mod zerodb_engine;
 

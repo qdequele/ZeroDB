@@ -287,7 +287,12 @@ impl<'env> RwTxn<'env> {
             }
         }
         // Reset to empty (persistent flags are always 0 today). `record_mut`
-        // marks a named record dirty for the commit write-back.
+        // marks a named record dirty for the commit write-back; the main
+        // database has no record to dirty, so the clear itself is recorded
+        // (TXN-74).
+        if tree == TreeId::Main {
+            self.cleared_main = true;
+        }
         *self.record_mut(tree) = DBRecord::empty();
         Ok(())
     }

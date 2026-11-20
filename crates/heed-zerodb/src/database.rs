@@ -76,6 +76,28 @@ fn check_read_key(kb: &[u8]) -> Result<()> {
     }
 }
 
+/// heed seeks the first entry of a range with `MDB_SET_RANGE` on its starting
+/// bound: the lower bound for a forward range, the upper bound in reverse.
+/// LMDB refuses an empty key there, so heed's iterator yields
+/// `BadValSize` as its first item; the failed seek leaves the cursor
+/// unpositioned, so the following items start again from that end of the
+/// database, as LMDB's `MDB_NEXT` / `MDB_PREV` do on an unpositioned cursor.
+/// The other bound is only compared in Rust, where an empty key is not an
+/// error. Returns the error to yield first and turns the bound into
+/// `Unbounded` for what follows.
+fn empty_seek_bound(bound: &mut Bound<Vec<u8>>) -> Option<Error> {
+    match bound {
+        Bound::Included(k) | Bound::Excluded(k) if k.is_empty() => {
+            *bound = Bound::Unbounded;
+            Some(Error::Mdb(MdbError::BadValSize))
+        }
+        _ => None,
+    }
+}
+
+/// `EINVAL`, the same value on every supported platform.
+const EINVAL: i32 = 22;
+
 /// Dispatch a read closure over the three txn sources (SPEC 04 §3–§5). Each arm
 /// monomorphizes over the concrete `zerodb` txn type (all `TxnRead`).
 macro_rules! with_read {
@@ -157,6 +179,10 @@ pub struct Database<KC, DC, C = DefaultComparator, CDUP = DefaultComparator> {
     /// heed's `assert_eq_env_db_txn!` does. Without it a handle used with the
     /// wrong env's txn would silently walk the wrong file's pages.
     pub(crate) env_ident: usize,
+    /// Whether the handle was opened with a custom key comparator, the one
+    /// case where heed's `get_greater_than` differs from "the least entry
+    /// strictly greater" (see [`Database::get_greater_than`]).
+    custom_cmp: bool,
     marker: PhantomData<(KC, DC, C, CDUP)>,
 }
 
@@ -178,11 +204,13 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         inner: zerodb::Database,
         page_size: u32,
         env_ident: usize,
+        custom_cmp: bool,
     ) -> Database<KC, DC, C, CDUP> {
         Database {
             inner,
             page_size,
             env_ident,
+            custom_cmp,
             marker: PhantomData,
         }
     }
@@ -343,9 +371,23 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         let kb = KC::bytes_encode(key).map_err(Error::Encoding)?;
         check_read_key(&kb)?;
-        decode_opt::<KC, DC>(with_read!(self, txn, |t| self
-            .inner
-            .get_greater_than(t, &kb))?)
+        if !self.custom_cmp {
+            return decode_opt::<KC, DC>(with_read!(self, txn, |t| self
+                .inner
+                .get_greater_than(t, &kb))?);
+        }
+        // heed seeks the first entry `>= key` in the database's order, then
+        // keeps it only if its bytes compare greater than `key` with memcmp,
+        // and otherwise steps to the next entry. Under memcmp that is "the
+        // least entry strictly greater"; under a custom comparator it can
+        // skip an entry, and heed's result is reproduced here.
+        decode_opt::<KC, DC>(with_read!(self, txn, |t| {
+            match self.inner.get_greater_than_or_equal_to(t, &kb)? {
+                Some((k, v)) if k > &kb[..] => Some((k, v)),
+                Some((k, _)) => self.inner.get_greater_than(t, k)?,
+                None => None,
+            }
+        }))
     }
 
     /// `get_greater_than_or_equal_to(txn, key)` — first entry `>= key`
@@ -409,12 +451,13 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         KC: BytesEncode<'a>,
         R: RangeBounds<KC::EItem>,
     {
-        let (lo, hi) = encode_bounds::<KC, R>(range)?;
+        let (mut lo, hi) = encode_bounds::<KC, R>(range)?;
+        let pending = empty_seek_bound(&mut lo);
         let (lo, hi) = (as_bound(&lo), as_bound(&hi));
         self.check_handle(txn)?;
-        Ok(RoRange::new(with_read!(self, txn, |t| self
-            .inner
-            .range(t, lo, hi))))
+        let mut it = RoRange::new(with_read!(self, txn, |t| self.inner.range(t, lo, hi)));
+        it.pending = pending;
+        Ok(it)
     }
 
     /// `rev_range(txn, range)`.
@@ -431,12 +474,13 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
         KC: BytesEncode<'a>,
         R: RangeBounds<KC::EItem>,
     {
-        let (lo, hi) = encode_bounds::<KC, R>(range)?;
+        let (lo, mut hi) = encode_bounds::<KC, R>(range)?;
+        let pending = empty_seek_bound(&mut hi);
         let (lo, hi) = (as_bound(&lo), as_bound(&hi));
         self.check_handle(txn)?;
-        Ok(RoRevRange::new(with_read!(self, txn, |t| self
-            .inner
-            .rev_range(t, lo, hi))))
+        let mut it = RoRevRange::new(with_read!(self, txn, |t| self.inner.rev_range(t, lo, hi)));
+        it.pending = pending;
+        Ok(it)
     }
 
     /// `prefix_iter(txn, prefix)`.
@@ -534,8 +578,11 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         self.assert_env(txn);
         self.check_handle(txn)?;
-        let (lo, hi) = encode_bounds::<KC, R>(range)?;
-        Ok(RwRange::new(RwGuts::new(txn, self.inner, Dir::Fwd, lo, hi)))
+        let (mut lo, hi) = encode_bounds::<KC, R>(range)?;
+        let pending = empty_seek_bound(&mut lo);
+        Ok(RwRange::new(
+            RwGuts::new(txn, self.inner, Dir::Fwd, lo, hi).with_pending(pending),
+        ))
     }
 
     /// `rev_range_mut(txn, range)` (SPEC 00).
@@ -554,14 +601,11 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         self.assert_env(txn);
         self.check_handle(txn)?;
-        let (lo, hi) = encode_bounds::<KC, R>(range)?;
-        Ok(RwRevRange::new(RwGuts::new(
-            txn,
-            self.inner,
-            Dir::Rev,
-            lo,
-            hi,
-        )))
+        let (lo, mut hi) = encode_bounds::<KC, R>(range)?;
+        let pending = empty_seek_bound(&mut hi);
+        Ok(RwRevRange::new(
+            RwGuts::new(txn, self.inner, Dir::Rev, lo, hi).with_pending(pending),
+        ))
     }
 
     /// `prefix_iter_mut(txn, prefix)`.
@@ -724,6 +768,13 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     {
         self.assert_env(txn);
         let (lo, hi) = encode_bounds::<KC, R>(range)?;
+        // heed deletes with a `range_mut` walk and calls `del_current` on
+        // every item, the error included: with an empty starting bound the
+        // seek fails (see `empty_seek_bound`) and the delete on the
+        // unpositioned cursor returns `EINVAL`, before anything is deleted.
+        if matches!(&lo, Bound::Included(k) | Bound::Excluded(k) if k.is_empty()) {
+            return Err(Error::Io(std::io::Error::from_raw_os_error(EINVAL)));
+        }
         let n = self
             .inner
             .delete_range(txn.zdb_mut(), as_bound(&lo), as_bound(&hi))?;
@@ -760,7 +811,7 @@ impl<KC, DC, C, CDUP> Database<KC, DC, C, CDUP> {
     /// Change the key/data codecs. Pure client-side retype.
     #[must_use]
     pub fn remap_types<KC2, DC2>(&self) -> Database<KC2, DC2, C> {
-        Database::new(self.inner, self.page_size, self.env_ident)
+        Database::new(self.inner, self.page_size, self.env_ident, self.custom_cmp)
     }
 
     /// Change the key codec.
@@ -943,11 +994,13 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         let name = name_bytes(self.name);
         let page_size = self.env.zdb().page_size();
         let z = self.env.zdb();
-        let res = match custom_comparator::<C>() {
+        let custom = custom_comparator::<C>();
+        let custom_cmp = custom.is_some();
+        let res = match custom {
             None => with_read!(rtxn, |t| z.open_database(t, name))?,
             Some(cmp) => with_read!(rtxn, |t| z.open_database_with_comparator(t, name, cmp))?,
         };
-        Ok(res.map(|db| Database::new(db, page_size, z.ident())))
+        Ok(res.map(|db| Database::new(db, page_size, z.ident(), custom_cmp)))
     }
 
     /// Create the database if absent.
@@ -990,7 +1043,9 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
         self.assert_env_txn(wtxn);
         let name = name_bytes(self.name);
         let page_size = self.env.zdb().page_size();
-        let db = match custom_comparator::<C>() {
+        let custom = custom_comparator::<C>();
+        let custom_cmp = custom.is_some();
+        let db = match custom {
             None => self.env.zdb().create_database(wtxn.zdb_mut(), name)?,
             Some(cmp) => {
                 self.env
@@ -998,7 +1053,12 @@ impl<'e, 'n, T, KC, DC, C, CDUP> DatabaseOpenOptions<'e, 'n, T, KC, DC, C, CDUP>
                     .create_database_with_comparator(wtxn.zdb_mut(), name, cmp)?
             }
         };
-        Ok(Database::new(db, page_size, self.env.zdb().ident()))
+        Ok(Database::new(
+            db,
+            page_size,
+            self.env.zdb().ident(),
+            custom_cmp,
+        ))
     }
 
     /// heed's `assert_eq_env_txn!` on `open`/`create`.
