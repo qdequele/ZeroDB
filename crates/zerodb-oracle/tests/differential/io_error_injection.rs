@@ -91,6 +91,37 @@ impl Rig {
         self.env.as_ref().expect("env is open")
     }
 
+    /// Close the env and reopen its file under a new fault-injecting
+    /// backing, as a new process would.
+    fn reopen_faulty(&mut self, durability: DurabilityFlags) {
+        drop(self.env.take());
+        let opened = zerodb_io::open_or_create(
+            &self.data_path,
+            PS,
+            Some(MAP),
+            MAP,
+            false,
+            durability.write_map,
+        )
+        .expect("reopen: open_or_create");
+        let (fault, handle) = FaultBacking::wrap(opened.backing, PS).expect("fault wrap");
+        let env = open_with_backing_policy(
+            self.env_path.clone(),
+            Box::new(fault),
+            PS,
+            false,
+            16,
+            126,
+            durability,
+            zerodb::FileTrust::VALIDATE,
+            false,
+            None,
+        )
+        .expect("reopen: env open");
+        self.env = Some(env);
+        self.handle = handle;
+    }
+
     /// The data file as a reopen right now would read it: the page cache,
     /// failed and unsynced writes included.
     fn file_bytes(&self) -> Vec<u8> {
@@ -365,23 +396,13 @@ fn run_commit_case(durability: DurabilityFlags, fault: IoFault, step: Step) {
 
     // (4) The file as a reopen sees it now, and every crash image.
     let on_reopen = image_contents(&rig.file_bytes(), &format!("{what}, file"));
-    let reopen_state = match step {
-        Step::DataWrite | Step::DataSync => &before,
-        // REC-23: a failed meta write keeps the previous commit, unless a
-        // short write let the whole encoded meta through: its CRC then
-        // validates and a reopen reads the commit that reported failure.
-        // The encoded meta (header and free-list annex) is well under half
-        // a page here; a 16-byte prefix cuts it and fails the CRC.
-        Step::MetaWrite => match fault.failure {
-            IoFailure::ShortWrite { keep } if keep >= PS as usize / 2 => &after,
-            _ => &before,
-        },
-        // REC-23: the meta reached the page cache before C5 failed, so a
-        // reopen without a power loss reads the failed commit.
-        Step::MetaSync => &after,
-    };
+    // REC-13: a failed meta write or meta barrier puts the slot's previous
+    // bytes back, so a reopen without a power loss reads the previous
+    // commit, even when a short write let the whole encoded meta through
+    // (the encoded meta is well under half a page here) or C5 failed after
+    // the meta reached the page cache.
     assert_eq!(
-        &on_reopen, reopen_state,
+        on_reopen, before,
         "{what}: what a reopen reads right after the failure"
     );
     let allowed: Vec<&Model> = match step {
@@ -397,7 +418,7 @@ fn run_commit_case(durability: DurabilityFlags, fault: IoFault, step: Step) {
 
     // (3) What the environment does next.
     match step {
-        Step::DataWrite | Step::MetaWrite => {
+        Step::DataWrite => {
             // Not poisoned: the same transaction can be redone and commits.
             let mut w = rig
                 .env()
@@ -408,7 +429,7 @@ fn run_commit_case(durability: DurabilityFlags, fault: IoFault, step: Step) {
             assert_eq!(contents(rig.env()), after, "{what}: redone commit");
             assert_crash_images(&rig.handle, &[&after], &format!("{what}, redone"));
         }
-        Step::DataSync | Step::MetaSync => {
+        Step::DataSync | Step::MetaWrite | Step::MetaSync => {
             assert_poisoned(rig.env(), &what);
             assert_eq!(contents(rig.env()), before, "{what}: poisoned env reads");
         }
@@ -416,8 +437,8 @@ fn run_commit_case(durability: DurabilityFlags, fault: IoFault, step: Step) {
 
     // A reopen without faults reads a clean file and accepts writes again.
     let expect_after_reopen = match step {
-        Step::DataWrite | Step::MetaWrite => after.clone(),
-        Step::DataSync | Step::MetaSync => reopen_state.clone(),
+        Step::DataWrite => after.clone(),
+        Step::DataSync | Step::MetaWrite | Step::MetaSync => before.clone(),
     };
     let env = rig.reopen_clean(durability);
     assert_eq!(contents(&env), expect_after_reopen, "{what}: after reopen");
@@ -467,6 +488,53 @@ fn commit_pipeline_failures_write_map_ranged_msync() {
     assert_eq!(writes, 1, "in-place WRITE_MAP writes only the meta");
     assert_eq!(syncs, 2, "two ranged msyncs");
     commit_pipeline_cases(write_map_mode());
+}
+
+/// A short meta write that lets the whole encoded meta through, then, in a
+/// new process, a different transaction that stops after its page writes
+/// (its C3 fails). The restore of SPEC 06 REC-13 keeps the failed commit's
+/// meta out of the slot, so the second writer, which reuses its txnid on the
+/// previous snapshot, cannot leave the file pointing at pages it overwrote.
+/// The writing process itself is poisoned and takes no second writer.
+#[test]
+fn failed_meta_write_then_interrupted_writer_keeps_the_file_consistent() {
+    for mode in [default_mode(), write_map_mode()] {
+        let what = format!("{mode:?}");
+        let mut rig = Rig::open(mode, None);
+        let before = seed(rig.env());
+        let (meta_write, _) = commit_calls(mode);
+        let mut w = rig.env().write_txn().unwrap();
+        target_ops(rig.env(), &mut w, TARGET_N).unwrap();
+        rig.handle.inject(IoFault::once(
+            IoOp::Write,
+            meta_write,
+            IoFailure::ShortWrite {
+                keep: PS as usize / 2,
+            },
+        ));
+        assert_errno(&w.commit().unwrap_err(), ENOSPC, &what);
+        rig.handle.clear_injection();
+        assert_poisoned(rig.env(), &what);
+
+        rig.reopen_faulty(mode);
+        assert_eq!(contents(rig.env()), before, "{what}: reopen");
+        let mut w = rig.env().write_txn().unwrap();
+        let db = rig.env().create_database(&mut w, Some(b"d")).unwrap();
+        for i in 0..2000u32 {
+            db.put(&mut w, format!("other{i:06}").as_bytes(), &[0x5A; 120])
+                .unwrap();
+        }
+        rig.handle
+            .inject(IoFault::once(IoOp::Sync, 1, IoFailure::Eio));
+        assert_errno(&w.commit().unwrap_err(), EIO, &what);
+        rig.handle.clear_injection();
+
+        let on_reopen = image_contents(&rig.file_bytes(), &format!("{what}, file"));
+        assert_eq!(on_reopen, before, "{what}: the file after both failures");
+        assert_crash_images(&rig.handle, &[&before], &what);
+        let env = rig.reopen_clean(mode);
+        assert_eq!(contents(&env), before, "{what}: clean reopen");
+    }
 }
 
 /// A sticky failure (a device that stays full) fails every retry the same

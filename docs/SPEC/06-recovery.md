@@ -372,6 +372,27 @@ recovered) **except** where explicitly noted as FS-order-dependent.
   snapshot, and the next writer reuses the failed commit's txnid (SPEC 04
   TXN-2). Only the process whose barrier failed refuses writes until it
   reopens.
+  **A failed meta write, and the meta slot after a failed C4 or C5
+  (ADR-0047).** A failed C4 meta write (a short one included) poisons the env
+  too. Before C4 the writer copies the bytes the target slot holds (an older
+  commit's meta); when C4 or C5 fails, it writes them back to the slot (into
+  the map under `WRITE_MAP`), attempts the same meta barrier again when the
+  commit would have synced its meta, ignores the result of both, and
+  poisons. The failed commit's meta then no longer sits in the page cache: a
+  reopen without a power loss, and a writer of another process, find the
+  older meta and select the last published commit, as the failed commit
+  reported. Without the restore, a short C4 write that carried the whole
+  encoded meta, or a complete C4 whose C5 failed, left a valid meta for a
+  commit that reported failure; the next writer reused its txnid on the
+  older snapshot and could overwrite the pages it references. A power loss
+  may still keep the failed commit's meta (the restore may not reach the
+  disk): that commit's data was made durable at C3, so the file is
+  consistent either way. If the restore write itself fails, the failed
+  commit's meta can stay in the page cache, visible to other processes of
+  a lock-file env (the poison is per process); a poison shared by every
+  process would need its own ADR. LMDB does the same restore and marks the
+  env fatal (`MDB_PANIC`, read transactions included); ZeroDB keeps read
+  transactions working, as for every poison.
 - **REC-23** — **A failed write, growth or copy (no barrier failed).** Every
   failing system call reaches the caller as `Error::Io` carrying the OS error
   (heed's `Error::Io`); nothing panics. What the environment does next:
@@ -380,7 +401,7 @@ recovered) **except** where explicitly noted as FS-order-dependent.
   |---|---|---|
   | C2 page write (`pwrite`/`pwritev`, a short write included) | `commit` returns the error; the txn ends as an abort (TXN-59) | keeps working; the same txn can be redone; the failed commit's txnid is reused (TXN-2) |
   | spill page write (SPEC 04 TXN-69) | the mutating call returns the error; the txn is errored, `commit` returns `BadTxn` | keeps working |
-  | C4 meta write | `commit` returns the error; the txn ends as an abort | keeps working (see conflict 5 below) |
+  | C4 meta write | `commit` returns the error; the txn ends as an abort | poisoned, with the meta slot restored (REC-13) |
   | file growth (`ftruncate` up under `WRITE_MAP` at write-txn begin, or a `resize` growing the map) | `write_txn` or `resize` returns the error; the size in force is unchanged | keeps working |
   | a copy's destination write (`copy_to_file`, `copy_to_open_file`, both compaction modes) | the copy returns the error | the env is untouched; a copy to a path removes its staging file and never creates the destination; a copy into an open file leaves what it wrote there, as LMDB's `mdb_env_copyfd` |
 
@@ -388,18 +409,17 @@ recovered) **except** where explicitly noted as FS-order-dependent.
   A C2 or spill write that failed changes no page the last commit references
   (TXN-62), so a reopen and every crash image recover that commit. A short
   write that extended the file can leave a partial page past the high-water
-  (allowed by INV-3). A failed C4 normally leaves the slot as it was; a short
-  C4 write that let the whole encoded meta through (its CRC then validates)
-  leaves the failed commit readable by a reopen, as a failed C5 does (REC-13
-  leaves the written meta in place). Under in-place `WRITE_MAP` the data pages
+  (allowed by INV-3). After a failed C4 a reopen reads the last commit, a
+  short write included: the slot is restored (REC-13). Under in-place `WRITE_MAP` the data pages
   are stored in the map, so the only commit write is the meta and the barriers
   are the ranged `msync`s of REC-12, which poison on failure as REC-13 says.
   A device that stays full fails every redo the same way, without poisoning;
   the commit succeeds once space returns. The LMDB fork behaves the same for a
   failed C2 write (observed: `io_error_lmdb_differential`).
-  The behavior after a failed C3/C5 is REC-13's. Tests: `zerodb-oracle`
+  The behavior after a failed C3/C4/C5 is REC-13's. Tests: `zerodb-oracle`
   `io_error_injection` (every write and sync of a commit, spills, `WRITE_MAP`,
-  growth, explicit sync) and `zerodb` `copy::tests::failed_*`, over the
+  growth, explicit sync, a failed meta write followed by an interrupted
+  writer) and `zerodb` `copy::tests::failed_*`, over the
   fault backend's injected `EIO`, `ENOSPC` and short writes (ADR-0008).
 - **REC-14** — **File growth crash safety.** Growing the file (SPEC 05 GC-16
   extend; durability ordering GC-28) writes new data pages into the extended
@@ -562,7 +582,7 @@ section; behavior clarifications per CONTRIBUTING.md rule 3):**
 | crash-stage invariants | REC-6/REC-7 | SPEC 04 §9 TXN-61/62 |
 | durability flags | REC-9..12 | SPEC 01 §S6/§S7, SPEC 04 §9 |
 | WRITE_MAP msync | REC-12 | SPEC 01 §S7 |
-| fsync-gate / poison | REC-13 | SPEC 04 §8.1/TXN-60 |
+| fsync-gate / poison | REC-13 | SPEC 04 §8.1/TXN-60, ADR-0047 |
 | failed write, growth or copy | REC-23 | SPEC 04 TXN-59/62/69, SPEC 03 INV-3, ADR-0047 |
 | file growth safety | REC-14..16 | SPEC 05 GC-16/GC-28 |
 | PREV_SNAPSHOT recovery + crash window | REC-5, REC-22 | SPEC 04 TXN-65..67 (self-resolving, §10) |
@@ -597,7 +617,10 @@ crash-window warning, placed with §1's PREV_SNAPSHOT topic; REC-23, placed with
 >    mandate an engine fix now (mdbx-grade: steady-gated reclaim needs a
 >    survivable steady meta — effectively a third slot — i.e. an ADR-scale
 >    format/GC change).
-> 5. **A failed meta write leaves the env writable (REC-23), and a failed
+> 5. **Resolved by ADR-0047 (accepted, Option A): a failed C4 or C5 now
+>    restores the meta slot and poisons the env (REC-13).** The record of the
+>    defect it fixed follows.
+>    **A failed meta write leaves the env writable (REC-23), and a failed
 >    C4 or C5 can leave the failed commit's meta readable (REC-13, REC-23).**
 >    LMDB rewrites the slot's previous meta through the plain descriptor and
 >    marks the env fatal (`MDB_PANIC` for every later transaction) when its
@@ -609,6 +632,7 @@ crash-window warning, placed with §1's PREV_SNAPSHOT topic; REC-23, placed with
 >    loss (reproduced in-process). A failed C5 leaves the same kind of meta in
 >    the file; the failing process is poisoned, but by the same reasoning a
 >    writer in another process of a lock-file env (REC-13 poisons per
->    process) can reach the same state (not tested). ADR-0047 (draft) proposes
->    LMDB's scrub and poisoning on every failed meta write; until it is
->    decided, this is a known defect.
+>    process) can reach the same state (not tested). ADR-0047 adopts
+>    LMDB's scrub and poisoning on every failed meta write. What is left: if
+>    the restore write itself fails, other processes of a lock-file env can
+>    still see the failed commit's meta (ADR-0047 Option C, not adopted).

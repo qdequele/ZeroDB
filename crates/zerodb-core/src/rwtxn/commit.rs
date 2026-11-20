@@ -23,6 +23,37 @@ fn barrier(
     })
 }
 
+/// After a failed meta write (C4) or meta barrier (C5): put the bytes the
+/// slot held before C4 back, then poison the env (SPEC 06 REC-13, ADR-0047).
+///
+/// The failed write may have left the new meta in the page cache (a short
+/// write that carried the whole encoded meta, or a complete write whose
+/// barrier failed). Left there, a reopen would read a commit that reported
+/// failure, and the next writer of this or another process would reuse its
+/// txnid on the older snapshot and could overwrite the pages it references.
+/// The restore is a best effort: its own errors are ignored, since the env
+/// is poisoned either way, and the barrier after it is attempted only when
+/// the commit would have synced its meta.
+fn restore_meta_slot(
+    inner: &crate::env::EnvInner,
+    ranged: bool,
+    async_flush: bool,
+    sync_meta: bool,
+    psize: u32,
+    slot: u64,
+    prev: &[u8],
+) {
+    let backing = inner.backing_ref();
+    if backing.write_at_page(slot, psize, prev).is_ok() && sync_meta {
+        let _ = if ranged {
+            backing.sync_pages(async_flush, psize, &[(slot, 1)])
+        } else {
+            backing.sync(async_flush)
+        };
+    }
+    inner.poison();
+}
+
 impl<'env> RwTxn<'env> {
     /// Commit (SPEC 04 TXN-58/61): run the pipeline; on success the new meta
     /// is durable and published. Consumes the txn; the write mutex is released
@@ -32,8 +63,8 @@ impl<'env> RwTxn<'env> {
     ///
     /// - [`MdbError::BadTxn`] if a mid-mutation failure poisoned the txn (the
     ///   commit is an implicit abort).
-    /// - [`Error::Io`] on a write/fsync failure — a failed **fsync** also
-    ///   poisons the env (SPEC 06 REC-13).
+    /// - [`Error::Io`] on a write/fsync failure — a failed **fsync** or
+    ///   **meta write** also poisons the env (SPEC 06 REC-13).
     /// - [`Error::Io`] when this is the first commit of a `PREV_SNAPSHOT`
     ///   env with a lock file and letting other processes in (the lock-file
     ///   downgrade) fails after the meta write (ADR-0023). The
@@ -177,6 +208,17 @@ impl<'env> RwTxn<'env> {
             main_db: self.main_db,
             fl_count: annex.len() as u32,
         };
+        // The slot's current bytes (an older commit's meta), kept for
+        // `restore_meta_slot`. A failed read fails the commit before C4,
+        // with the slot untouched.
+        let prev = &mut work.meta_prev;
+        if prev.len() != psize as usize {
+            *prev = vec![0u8; psize as usize];
+        }
+        inner
+            .backing_ref()
+            .read_meta_copy(slot, psize, prev)
+            .map_err(Error::Io)?;
         // The page buffer is the carried one (`WriterCarry::meta_buf`): only
         // the encoded prefix is written, and cleared again after the write,
         // so a commit neither allocates nor zeroes a whole page here.
@@ -194,7 +236,20 @@ impl<'env> RwTxn<'env> {
                 inner
                     .backing_ref()
                     .write_at_page(slot, psize, buf)
-                    .map_err(Error::from)
+                    .map_err(|e| {
+                        // A failed or short meta write may have changed the
+                        // slot (REC-13, ADR-0047).
+                        restore_meta_slot(
+                            inner,
+                            ranged,
+                            async_flush,
+                            sync_meta,
+                            psize,
+                            slot,
+                            &work.meta_prev,
+                        );
+                        Error::from(e)
+                    })
             });
         buf[..work.meta_dirty].fill(0);
         work.meta_dirty = 0;
@@ -212,8 +267,20 @@ impl<'env> RwTxn<'env> {
         // fsynced the data. -----
         if sync_meta {
             // Ranged: the meta slot C4 wrote; C3 already made every data
-            // page durable.
-            barrier(inner, ranged, async_flush, psize, (slot, 1))?;
+            // page durable. On failure the new meta is in the page cache:
+            // take it back out (REC-13, ADR-0047).
+            if let Err(e) = barrier(inner, ranged, async_flush, psize, (slot, 1)) {
+                restore_meta_slot(
+                    inner,
+                    ranged,
+                    async_flush,
+                    sync_meta,
+                    psize,
+                    slot,
+                    &work_mut!(self).meta_prev,
+                );
+                return Err(e);
+            }
         }
         inner.run_hook(HookPoint::H4);
         // Crash here: `N` durable and selected (REC-6 H4).
