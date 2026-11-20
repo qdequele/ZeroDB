@@ -711,6 +711,7 @@ mod tests {
     /// The ranged barrier runs on a real writable map, and a range past the
     /// map is an error, not a panic or a silent no-op.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn writemap_sync_pages_flushes_ranges_and_rejects_out_of_map() {
         const PS: u32 = 4096;
         const MAP: u64 = 1 << 20;
@@ -753,6 +754,7 @@ mod tests {
     /// A persisted meta `map_size` above `MAX_MAP_SIZE` is corrupt: the open
     /// fails with `Invalid` before mapping it, whatever size is requested.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn persisted_map_size_above_the_cap_is_invalid() {
         let path = TempFile::new("cap");
         drop(crate::file::create_env_file(&path.0, 4096, MAX_MAP_SIZE + 4096).expect("create"));
@@ -823,6 +825,7 @@ mod tests {
     /// A requested `map_size` above the cap is refused before the data file
     /// is created.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn requested_map_size_above_the_cap_creates_nothing() {
         let path = TempFile::new("cap-req");
         match open_or_create(&path.0, 4096, Some(MAX_MAP_SIZE + 1), 1 << 20, false, false) {

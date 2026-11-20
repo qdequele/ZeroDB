@@ -1477,8 +1477,9 @@ design follows LMDB's lock file in technique (a first-opener election, PID
 liveness by record locks, a shared reader table), not in byte layout: the
 file is ZeroDB's own format, never LMDB's. Normative rules are numbered
 **LCK-n**. Implementation: `zerodb-io::lockfile` (the file, its record locks
-and the futex), `zerodb-core::shared` (the safe interface the core sees) and
-`zerodb-core::readers` (the slot protocol).
+and the futex), `zerodb-core::shared` (the safe interface the core sees),
+`zerodb-core::readers` (the slot protocol) and `zerodb-core::writer_word` (the
+Linux writer word of LCK-4, model-checked with loom).
 
 - **LCK-1 — First-opener election (ADR-0023 §1, amendments 2 and 10).** Every
   opener takes POSIX `fcntl` record locks, which belong to the process. On

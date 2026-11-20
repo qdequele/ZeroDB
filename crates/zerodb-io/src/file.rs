@@ -498,6 +498,7 @@ mod tests {
     /// size below the byte cap (the overflow run spans three calls) and at
     /// 64 KiB.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn write_pages_vectored_round_trips() {
         for ps in [4096usize, 65536] {
             let path = std::env::temp_dir()
