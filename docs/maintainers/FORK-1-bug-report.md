@@ -173,7 +173,8 @@ all three versions: the `DB_STALE` block of `mdb_page_search`, the
 ## Notes for ZeroDB (not part of the report)
 
 - ZeroDB returns the expected results for this sequence (D-007).
-- The repro and the analysis show the crash is wider than the oracle guard
-  assumes: any second put into a named database after a same-transaction
-  clear of the main database crashes, not only an `APPEND`. The guard in
-  `driver::classify` skips only `APPEND` puts after a `ClearDb`.
+- The oracle has no guard for this crash: its `DbName::Unnamed` is a named
+  `"main"` database, so no fuzzed op stream empties the root database. See
+  `docs/UPSTREAM-BUGS.md`.
+- The crash also follows `mdb_drop(MAIN_DBI, 1)`, and puts in a later write
+  txn after the clear is committed (checked on the fork in C, 2026-11-20).

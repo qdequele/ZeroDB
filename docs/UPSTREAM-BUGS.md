@@ -4,8 +4,9 @@ ZeroDB's differential fuzzer runs every operation against the Meilisearch LMDB
 fork (`mdb.master.nested-rtxns`, commit `cd767228`, vendored in
 `lmdb-master-sys 0.2.6` / heed 0.22.1). Occasionally the reference itself
 crashes. Such crashes are not ZeroDB divergences. Each one gets a repro in
-this repo and a guard in the harness so fuzzing can continue; the guard is
-removed once the fork is fixed.
+this repo and, when the fuzzer's op stream can reach it, a guard in the
+harness so fuzzing can continue; the guard is removed once the fork is
+fixed.
 
 ## FORK-1: `SIGSEGV` in `_mdb_cursor_put` (put into a named database after a same-txn clear of the main database)
 
@@ -30,7 +31,11 @@ release (checked 2026-11-20), so the bug is not specific to the fork.
    `MDB_APPEND` put that should succeed, and a put with no flags.
 
 Value sizes are irrelevant. Removing the `clear` or the first put avoids the
-crash. Under ASan: `SEGV on unknown address 0x00000000000a` at
+crash. Dropping the main database (`mdb_drop(MAIN_DBI, 1)`) instead of
+clearing it crashes the same way, and so does committing txn B after the
+clear and making the two puts in a later write txn: `X`'s record is gone
+until the environment is reopened. If `X` already holds keys, nothing
+crashes, but every put and lookup in `X` returns `MDB_NOTFOUND`. Under ASan: `SEGV on unknown address 0x00000000000a` at
 `_mdb_cursor_put` (`mdb.c:8107`).
 
 **Cause:** the first put allocates `X`'s root without refreshing its stale
@@ -50,10 +55,15 @@ named databases' records, while named databases are in use. SPEC 02 §6
 records that milli stores no keys of its own in the main database; whether
 any consumer clears it has not been checked.
 
-**Harness guard:** `driver::classify` skips an `APPEND` put in any write txn
-that has run a `ClearDb` (`Skip::KnownForkBug`), on both engines. The
-guard covers `APPEND` only; the crash also follows a plain put. Pinned by
-`crates/zerodb-oracle/tests/lmdb_observations/fork_bug_guard.rs`.
+**Harness:** no guard. The oracle never opens the root database: its
+`DbName::Unnamed` is milli's named `"main"` database, so no fuzzed op stream
+can empty the root, and the sequence the fuzzer found (a clear of `"main"`,
+then `APPEND` puts into another named database) runs normally on LMDB. The
+fuzzer found the crash before `Unnamed` was remapped to `"main"`.
+`crates/zerodb-oracle/tests/lmdb_observations/fork1_sequences.rs` runs the
+fuzz-shaped sequences on both engines with nothing skipped; a skip guarded
+by `driver::classify` would be needed again only if the fuzzed op stream
+gained the root database.
 
 **ZeroDB:** returns `KeyExist`, as SPEC 01 §S1 requires
 ([D-007](LMDB-COMPATIBILITY.md#d-007)).
