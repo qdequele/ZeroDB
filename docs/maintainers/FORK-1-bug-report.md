@@ -1,10 +1,9 @@
 # Draft bug report: FORK-1
 
 This is a ready-to-file report for [FORK-1](../UPSTREAM-BUGS.md#fork-1-sigsegv-in-_mdb_cursor_put-put-into-a-named-database-after-a-same-txn-clear-of-the-main-database).
-It has **not been filed**. Whoever files it: run the stock-LMDB check below
-first and fill in its result, then file on `meilisearch/lmdb` and, if stock
-LMDB crashes too, on the OpenLDAP ITS (LMDB's upstream tracker). Link each
-report from `docs/UPSTREAM-BUGS.md`.
+It has **not been filed**. Stock LMDB crashes too (see "Stock LMDB" below),
+so it belongs on the OpenLDAP ITS (LMDB's upstream tracker) as well as on
+`meilisearch/lmdb`. Link each report from `docs/UPSTREAM-BUGS.md`.
 
 Everything between the two rules is the report.
 
@@ -14,8 +13,9 @@ Everything between the two rules is the report.
 puts into an open named database in the same write transaction
 
 **Version:** `mdb.master.nested-rtxns` at `cd767228` (the version vendored by
-`lmdb-master-sys 0.2.6` / heed 0.22.1, reporting `LMDB 0.9.70`). macOS
-aarch64 and Linux.
+`lmdb-master-sys 0.2.6` / heed 0.22.1, reporting `LMDB 0.9.70`). Also
+stock OpenLDAP LMDB: `mdb.master` at `74dd6c3` and the `LMDB_0.9.36`
+release. macOS aarch64 and Linux.
 
 **Summary.** In one write transaction: empty the main database with
 `mdb_drop(txn, MAIN_DBI, 0)`, then put twice into a named database that was
@@ -156,14 +156,17 @@ does when the main database has entries but not this one; or clear
 `DB_STALE` on the `MDB_NO_ROOT` path, which would only hide the deleted
 record until commit.
 
-**Stock LMDB.** The three pieces of code involved are textually identical in
-OpenLDAP's `mdb.master` (`74dd6c3`, 2026-10-20) and in the `LMDB_0.9.36`
-release: the `DB_STALE` block of `mdb_page_search`, the `MDB_APPEND` and
-positioning code at the top of `_mdb_cursor_put`, and `mdb_drop`. The fork's
-changes (nested read transactions) do not touch them. So stock LMDB is very
-likely affected. **Not yet run against stock LMDB:** build the program above
-against `libraries/liblmdb` of `mdb.master` and of `LMDB_0.9.36` and record
-the result here before filing.
+**Stock LMDB.** Stock LMDB crashes the same way. The program above, built
+against `libraries/liblmdb` of OpenLDAP's `mdb.master` (`74dd6c3`) and of
+the `LMDB_0.9.36` release (`24aec4d`), gives the results in the table above
+for all eight argument sets on both versions (macOS 27.2, aarch64, Apple
+clang, `-O0`, three runs each, identical). Under AddressSanitizer the fault
+is at the same statement, `nsize = IS_LEAF2(mc->mc_pg[mc->mc_top]) ? ...`
+after `new_sub:`, at address `0xa`: `mdb.c:8122` on `mdb.master` and
+`mdb.c:7103` on `LMDB_0.9.36`. The code involved is textually identical in
+all three versions: the `DB_STALE` block of `mdb_page_search`, the
+`MDB_APPEND` and positioning code at the top of `_mdb_cursor_put`, and
+`mdb_drop`.
 
 ---
 

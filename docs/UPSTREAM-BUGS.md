@@ -10,13 +10,13 @@ removed once the fork is fixed.
 ## FORK-1: `SIGSEGV` in `_mdb_cursor_put` (put into a named database after a same-txn clear of the main database)
 
 **Status:** open, not yet reported upstream (no matching issue on
-`meilisearch/lmdb`). Found 2026-07-16 by the `diff_ops` fuzz target; still
+`meilisearch/lmdb` or the OpenLDAP ITS). Found 2026-07-16 by the `diff_ops` fuzz target; still
 reproduces on 2026-11-20. A ready-to-file report, with a standalone C
 reproduction and the cause, is in
 [maintainers/FORK-1-bug-report.md](maintainers/FORK-1-bug-report.md).
-Stock LMDB is probably affected: the code involved is identical in
-OpenLDAP's `mdb.master` and in `LMDB_0.9.36`, but it has not been run there
-yet.
+Stock LMDB is affected too: the same C reproduction crashes at the same
+statement on OpenLDAP's `mdb.master` (`74dd6c3`) and on the `LMDB_0.9.36`
+release (checked 2026-11-20), so the bug is not specific to the fork.
 
 **Recipe** (all four steps are required):
 
