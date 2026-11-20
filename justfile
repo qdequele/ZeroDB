@@ -81,6 +81,11 @@ crash-test-mp CYCLES='500':
 crash-test-full:
     cargo run -p zerodb-oracle --bin crash-harness -- --cycles 10000
 
+# Power loss below the file system: dm-log-writes on ext4 and XFS. Linux and
+# root only; settings through the environment (docs/maintainers/POWER-LOSS.md).
+power-loss:
+    sudo -E scripts/power-loss/run.sh
+
 # Needs a dedicated machine; docs/maintainers/HARDENING-RUNS.md says which and
 # how to record the result. HOURS, OUT and the worker counts are documented in
 # the header of scripts/soak.sh.

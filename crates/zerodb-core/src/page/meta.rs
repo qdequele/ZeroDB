@@ -348,6 +348,25 @@ impl MetaPage {
     /// meta's *own* `page_size` field is checked as rule 3 and surfaced via
     /// [`MetaValidity::BadPageSize`], not as an error.)
     pub fn validate(buf: &[u8], psize: u32) -> Result<MetaValidity, PageError> {
+        Self::validate_version(buf, psize, FORMAT_VERSION)
+    }
+
+    /// [`MetaPage::validate`] with rule 2 checking `format_version` against
+    /// `version` instead of [`FORMAT_VERSION`].
+    ///
+    /// The meta layout is the same in every format version from 2 on (SPEC 02
+    /// §0), so this decodes a version 2 meta. The engine never calls it with
+    /// another version: it opens only [`FORMAT_VERSION`] files. It exists for
+    /// `zerodb-tools`, which reads an older file's databases to upgrade it.
+    ///
+    /// # Errors
+    ///
+    /// As [`MetaPage::validate`].
+    pub fn validate_version(
+        buf: &[u8],
+        psize: u32,
+        version: u32,
+    ) -> Result<MetaValidity, PageError> {
         validate_page_size(psize)?;
         if buf.len() < psize as usize {
             return Err(PageError::BufferTooSmall {
@@ -363,7 +382,7 @@ impl MetaPage {
         }
         // Rule 2: format version.
         let format_version = read_u32(buf, OFF_FORMAT_VERSION);
-        if format_version != FORMAT_VERSION {
+        if format_version != version {
             return Ok(MetaValidity::BadVersion(format_version));
         }
         // Rule 3: page_size power of two in range.

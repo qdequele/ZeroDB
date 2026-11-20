@@ -68,9 +68,12 @@ publish of the four engine crates (`zerodb-core`, `zerodb-io`, `zerodb`,
 
 6. **On-disk format.** If `FORMAT_VERSION` (`crates/zerodb-core/src/page/mod.rs`)
    changed since the last release, the entry must say so in its first line and
-   give the migration path (`zerodb-tools dump` on the old binary, `load` on the
-   new one). A format bump is an ADR (`CONTRIBUTING.md` rule 5) and a minor-version bump
-   at least while 0.x.
+   give the migration path: `zerodb-tools upgrade <old-env> <new-env>` from
+   the new release, which must read the previous release's format (check it
+   against a fixture written by that release, as
+   `crates/zerodb-tools/tests/upgrade_format_v2.rs` does for 0.2.0). A format
+   bump is an ADR (`CONTRIBUTING.md` rule 5) and a minor-version bump at least
+   while 0.x. ADR-0045 (draft) proposes the policy for when a bump may happen.
 
 7. **Publish dry run** on the release commit (CI does the manifest-only
    variant on every PR; this one also builds each packaged crate):

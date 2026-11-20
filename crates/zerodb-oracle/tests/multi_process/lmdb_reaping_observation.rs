@@ -30,7 +30,9 @@ const OBS_WRITE_COMMIT_REAPS: bool = false;
 const OBS_JOINER_OPEN_REAPS: bool = false;
 const OBS_FULL_TABLE_REAPS: bool = false;
 const OBS_CHECK_COUNTS_SLOTS: bool = true;
-#[cfg(target_os = "linux")]
+/// Observed on Linux (robust writer mutex, `EOWNERDEAD`) and on macOS (SysV
+/// semaphore whose `locked` flag, still set when the next owner acquires it,
+/// reports the dead owner). Both reap.
 const OBS_WRITER_TAKEOVER_REAPS: bool = true;
 
 fn spawn(role: &str, dir: &Path) -> ChildGuard {
@@ -154,9 +156,8 @@ fn observe_reader_check_count() {
     assert_eq!(counted, OBS_CHECK_COUNTS_SLOTS);
 }
 
-/// Linux only: the writer takeover is not observed on macOS; the takeover
-/// scenario runs only on Linux.
-#[cfg(target_os = "linux")]
+/// The next writer after a writer process died holding the write lock. Runs
+/// on Linux and macOS, where the fork uses different lock primitives.
 #[test]
 fn observe_writer_takeover() {
     let dir = TempDir::new().unwrap();

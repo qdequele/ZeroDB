@@ -52,6 +52,33 @@ walks the snapshot its read transaction pins. If the environment does not open
 only while it holds the lock file exclusively, so no process can open the
 environment during the walk.
 
+**`upgrade <old-env-dir> <new-env-dir> [--page-size N] [--map-size BYTES]`**
+copies an environment in on-disk format 2, the format of the 0.2.0 release,
+into a fresh environment in the current format. The current engine refuses a
+format 2 file at open, and this is the one command that moves it forward:
+
+```sh
+zerodb-tools upgrade /srv/app/env /srv/app/env.new
+```
+
+The new environment keeps the old one's data-file name (`data.mdb` stays
+`data.mdb`, so heed opens it as before) and its page size unless
+`--page-size` names another. `upgrade` refuses a destination that already
+holds data or that another process has open, checks every database's entry
+count against the source, and runs `check` on the result. It never writes the
+old environment: once it succeeds, replace the old directory with the new one.
+
+Close every process that has the old environment open first. A format 2
+environment has no lock file, so `upgrade` cannot see another process, but it
+detects a commit made while it was reading and fails rather than copy a mixed
+state. If it fails after creating the destination, delete the destination
+and run it again. `dump` also reads format 2 files, so a dump of an
+environment made before or after the upgrade is the same.
+
+Format 1 files were never released and are not read; a file of a version
+newer than the tools' is refused. `zerodb-tools --version` prints the format
+the tools write.
+
 **`migrate-from-lmdb <src-lmdb-dir> <dst-env-dir> [--page-size N] [--map-size BYTES]`**
 opens an LMDB environment read-only and copies every database into a fresh
 ZeroDB environment, checking each database's entry count. A dump of the result

@@ -20,7 +20,7 @@ build Meilisearch ships and compare the results.
 > | `EnvOpenOptions::open` (native API) | a safe `fn` | an `unsafe fn`, with heed's contract |
 > | Pages read from the file | validated by default; trusting them is opt-in | trusted by default, as in LMDB; `FileTrust::VALIDATE` is opt-in |
 > | Processes per environment | one (no lock file) | several (lock file on by default) |
-> | On-disk format version | 2 | 3; a version 2 file is refused at open, so dump it with the 0.2.0 `zerodb-tools` and `load` it |
+> | On-disk format version | 2 | 3; a version 2 file is refused at open: `zerodb-tools upgrade <old> <new>` converts it |
 > | `unique-txns` feature (Meilisearch 1.55 and later) | absent | present |
 > | `Env::resize` | absent | present |
 >
@@ -117,6 +117,21 @@ for the 0.2.0 release, and no later run is recorded.
 ZeroDB is not yet production-hardened: the 24-hour fuzz soak and a run on a
 64 KiB-page kernel are still open. [Provenance](#provenance) lists what has
 and has not been verified.
+
+**Platforms:**
+
+| Tier | Targets | What runs |
+|---|---|---|
+| Tested, supported | Linux x86-64; Linux aarch64 with 4 KiB pages | Every PR: the full CI (fmt, clippy, tests, differential fuzz; miri, loom and the crash smoke on x86-64). Nightly: long fuzz, full crash run, stress |
+| Tested, supported | macOS aarch64 (Apple silicon, 16 KiB pages) | Every PR: clippy, the test suite and the crash smoke. No fuzz, miri, loom or nightly runs |
+| Builds, best effort | Linux aarch64 with 64 KiB pages (such as RHEL for ARM); macOS x86-64; Linux on other 64-bit architectures | Same code paths as a tested target, but no CI runs them |
+| Unsupported | Windows | Fails to build with a `compile_error!`. A design is proposed in [ADR-0046](docs/adr/0046-windows-support.md), awaiting approval |
+| Unsupported | Other Unix systems (FreeBSD and others); 32-bit targets | Never built or tested |
+
+Meilisearch also ships on Windows, so ZeroDB cannot replace LMDB in a
+Meilisearch release until Windows is supported. The differences between
+Linux and macOS are listed in
+[docs/USING.md](docs/USING.md#platform-support).
 
 **Not supported:**
 
