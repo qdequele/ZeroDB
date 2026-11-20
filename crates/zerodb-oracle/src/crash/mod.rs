@@ -16,6 +16,11 @@
 //!   child opens a lock-file env and is killed mid-commit while a reader
 //!   process stays live; the parent joins through the lock file, verifies,
 //!   and commits over the dead writer.
+//! - [`powerloss`] — power loss below the file system (Linux): the workload
+//!   runs on a file system over a `dm-log-writes` device, and the states the
+//!   device holds at each flush are rebuilt, mounted and verified. Run by the
+//!   `power-loss` binary and `scripts/power-loss/run.sh`, not by
+//!   `crash-harness`.
 //!
 //! One **cycle** = one recovered-and-verified crash state (ADR-0008):
 //! each materialized image variant and each SIGKILL recovery counts as one
@@ -26,6 +31,7 @@
 pub mod image;
 pub mod model;
 pub mod multiproc;
+pub mod powerloss;
 pub mod sigkill;
 pub mod verify;
 pub mod workload;

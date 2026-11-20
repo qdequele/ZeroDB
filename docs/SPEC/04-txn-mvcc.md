@@ -1687,8 +1687,14 @@ against LMDB unless it says so.
   record lock that reports no previous owner (LCK-4), so a writer that
   follows a dead writer does not free dead readers' slots; only
   `clear_stale_readers` and the next initializer do. LMDB's writer takeover
-  was observed on Linux only (amendment 12); its macOS behavior is
-  unobserved.
+  reaps on macOS as on Linux: its SysV semaphore keeps a `locked` flag that
+  the next owner finds still set and reports as a dead owner
+  (`lmdb_reaping_observation.rs::observe_writer_takeover`, which runs on
+  both). This is a behavior difference on macOS, recorded as D-028 (Proposed):
+  `multi_process_differential.rs::killed_writer_takeover_matches_lmdb` fails
+  there (ZeroDB still lists the dead reader, LMDB does not) and therefore
+  runs on Linux only. Matching LMDB needs a change to the macOS writer lock
+  and so an ADR-0023 amendment.
 - **`Env::sync` takes only the in-process writer lock.** A sync in one
   process serializes with this process's commits, not with a commit in
   another process. Whether LMDB's `mdb_env_sync` takes its writer mutex is

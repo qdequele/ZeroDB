@@ -124,7 +124,7 @@ fn write_db_stat(out: &mut String, s: &zerodb::DatabaseStat) -> Result<(), BoxEr
 }
 
 /// Render a DB name for the stat report: printable ASCII verbatim, else hex.
-fn printable_name(name: &[u8]) -> String {
+pub(crate) fn printable_name(name: &[u8]) -> String {
     if name.iter().all(|&b| b.is_ascii_graphic() || b == b' ') {
         String::from_utf8_lossy(name).into_owned()
     } else {
@@ -142,12 +142,19 @@ fn printable_name(name: &[u8]) -> String {
 /// read-only through its lock file, like `stat`. Probes both data-file names
 /// (ADR-0010).
 ///
+/// An env in the previous on-disk format, which the engine refuses to open,
+/// is read by [`crate::legacy`] instead; its dump is the one the release
+/// that wrote it produces.
+///
 /// # Errors
 ///
 /// [`naming::NameError`] if the env is missing or ambiguous, the open's error,
 /// a read error, or a write error on `out` (which may then hold a partial
 /// dump).
 pub fn write_dump(env_dir: &Path, out: impl std::io::Write) -> Result<(), BoxErr> {
+    if let Some(legacy) = crate::legacy::legacy_data_file(env_dir)? {
+        return crate::legacy::write_dump(&legacy.path, out);
+    }
     let data = naming::resolve(env_dir)?;
     let env = open_ro(env_dir, data.name)?;
     let txn = read_txn(&env)?;
@@ -266,7 +273,13 @@ fn load_batched(
     };
     source.seek(SeekFrom::Start(0))?;
 
-    let env = open_exclusive_destination(env_dir, psize, map_size, "load into")?;
+    let env = open_exclusive_destination(
+        env_dir,
+        zerodb::DATA_FILE_NAME,
+        psize,
+        map_size,
+        "load into",
+    )?;
 
     // Pass 2: write each block's records in batches, in dump order (the main
     // DB first, then the named DBs).
@@ -280,16 +293,24 @@ fn load_batched(
         db.finish()?;
     }
 
-    // Verify the produced env is structurally clean before returning. The
-    // walk covers every page the committed snapshot references. It does not
-    // re-verify the meta slots or the file length: the engine wrote and
-    // validated those itself (each commit writes a checksummed meta, and this
-    // read txn's open accepted it).
-    let txn = read_txn(&env)?;
+    verify_written_env(&env, "loaded")
+}
+
+/// Check the env a tool just wrote, before the tool returns. The walk covers
+/// every page the committed snapshot references. It does not re-verify the
+/// meta slots or the file length: the engine wrote and validated those itself
+/// (each commit writes a checksummed meta, and this read txn's open accepted
+/// it).
+///
+/// # Errors
+///
+/// Any invariant violation, named with `what`, or the read txn's error.
+pub(crate) fn verify_written_env(env: &Env, what: &str) -> Result<(), BoxErr> {
+    let txn = read_txn(env)?;
     let violations = check_snapshot(txn.map_bytes(), env.page_size(), txn.snapshot());
     if !violations.is_empty() {
         return Err(format!(
-            "loaded env failed the invariant check ({} violations): {:?}",
+            "{what} env failed the invariant check ({} violations): {:?}",
             violations.len(),
             violations
         )
@@ -298,8 +319,8 @@ fn load_batched(
     Ok(())
 }
 
-/// Open a fresh destination env (native name, lock file on) for `load` or
-/// `migrate-from-lmdb`, and refuse it unless this process opened it alone
+/// Open a fresh destination env, with the data file `data_file_name` and the
+/// lock file on, for `load`, `upgrade` or `migrate-from-lmdb`, and refuse it unless this process opened it alone
 /// and it is still empty (ADR-0023).
 ///
 /// The empty-destination check before the open ([`refuse_existing_env`]) ran
@@ -314,6 +335,7 @@ fn load_batched(
 /// A refusal naming `verb`, or the open's error.
 pub(crate) fn open_exclusive_destination(
     env_dir: &Path,
+    data_file_name: &str,
     psize: u32,
     map_size: usize,
     verb: &str,
@@ -326,6 +348,7 @@ pub(crate) fn open_exclusive_destination(
             .max_dbs(crate::common::MAX_TOOL_DBS)
             .page_size(psize)
             .sequential_writes(true)
+            .data_file_name(data_file_name)
             .lock_file(true)
             .file_trust(zerodb::FileTrust::VALIDATE)
             .open(env_dir)
@@ -341,14 +364,13 @@ pub(crate) fn open_exclusive_destination(
     if txn.snapshot().main_db.entries != 0 {
         return Err(format!(
             "refusing to {verb} a non-empty env: {} already holds data",
-            env_dir.join(zerodb::DATA_FILE_NAME).display()
+            env_dir.join(data_file_name).display()
         )
         .into());
     }
     drop(txn);
     for candidate in naming::existing_data_files(env_dir) {
-        if candidate.name != zerodb::DATA_FILE_NAME && std::fs::metadata(&candidate.path)?.len() > 0
-        {
+        if candidate.name != data_file_name && std::fs::metadata(&candidate.path)?.len() > 0 {
             return Err(format!(
                 "refusing to {verb} a non-empty env: {} already exists",
                 candidate.path.display()

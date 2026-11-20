@@ -78,6 +78,9 @@ Awaiting a decision. Nothing here is implemented in `main`.
 | 0041 | [A new tree page is not zero-filled when its memory is reused, as LMDB](adr/0041-fresh-page-zero-fill.md) | Proposed | Performance (writes), bytes on disk |
 | 0042 | [Streaming and incremental environment export](adr/0042-streaming-and-incremental-export.md) | Draft, awaiting approval | Env copy, beyond LMDB |
 | 0043 | [Adopt `bitflags` for the flag types and `tempfile` for test directories](adr/0043-bitflags-and-tempfile.md) | Proposed | Dependencies, heed API |
+| 0045 | [On-disk format stability: when `format_version` may change, and what a user is promised](adr/0045-format-stability-policy.md) | Draft, awaiting approval (#182); the policy is not in force. The format 2 reader and `zerodb-tools upgrade` it relies on are tooling, in `main` | On-disk format, release, tools |
+| 0046 | [Windows support](adr/0046-windows-support.md) | Draft, awaiting approval (#183) | Platforms, concurrency, durability, dependencies, `unsafe` policy |
+| 0047 | [What the environment does after a failed meta write or commit barrier](adr/0047-failed-meta-write-policy.md) | Draft, awaiting approval (#176) | Durability |
 
 ## Measured and not adopted
 

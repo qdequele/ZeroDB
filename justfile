@@ -96,6 +96,26 @@ crash-test-mp CYCLES='500':
 crash-test-full:
     cargo run -p zerodb-oracle --bin crash-harness -- --cycles 10000
 
+# Power loss below the file system: dm-log-writes on ext4 and XFS. Linux and
+# root only; settings through the environment (docs/maintainers/POWER-LOSS.md).
+power-loss:
+    sudo -E scripts/power-loss/run.sh
+
+# Needs a dedicated machine; docs/maintainers/HARDENING-RUNS.md says which and
+# how to record the result. HOURS, OUT and the worker counts are documented in
+# the header of scripts/soak.sh.
+#
+# Hardening soak: fuzz targets, crash harness and stress side by side for HOURS.
+soak HOURS='24':
+    HOURS={{HOURS}} scripts/soak.sh
+
+# Meant for a 64 KiB-page (or 16 KiB-page) kernel; see
+# docs/maintainers/HARDENING-RUNS.md. Options are in scripts/page-size-matrix.sh.
+#
+# Test suite, crash harness at 4/16/64 KiB DB pages, stress and fuzz, on this kernel.
+page-size-matrix:
+    scripts/page-size-matrix.sh
+
 # --- Engine comparison: zerodb vs the LMDB fork (heed), both in one binary ---
 #
 # The bench is a LADDER: adjacent rungs differ by exactly one mechanism, so a
