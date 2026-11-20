@@ -8,6 +8,13 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ### Added
 
+- **Power-loss harness below the file system** (`power-loss` binary,
+  `scripts/power-loss/`, docs/maintainers/POWER-LOSS.md). The workload runs on
+  ext4 and XFS over a `dm-log-writes` device; each flush point of the log is
+  rebuilt, mounted and checked: the env opens, `zerodb-tools check` passes,
+  every acknowledged commit of a durable mode is present and no later commit
+  is partly visible. Linux and root only; a CI job runs it nightly and on pull
+  requests that touch it.
 - **Multi-process access** (ADR-0023). Several processes can open one
   environment and read or write it, as with LMDB. A lock file is created next
   to the data file by default: `lock.mdb` through heed, `zerodb.lock`
@@ -248,8 +255,12 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 - Using an `Env` in a child after `fork()`, and sharing an environment across
   PID namespaces, are unsupported. `Env::sync` only serializes with this
   process's commits. On macOS, a writer that takes over from a dead writer
-  does not free dead readers' slots; call `clear_stale_readers` (SPEC 04
-  §12.1).
+  does not free dead readers' slots, where LMDB does (D-028, proposed); call
+  `clear_stale_readers` (SPEC 04 §12.1).
+- **Platforms:** Linux (x86-64, aarch64) and macOS (aarch64) are tested in
+  CI. Windows is not supported: the crates stop at a `compile_error!` there,
+  instead of dozens of unresolved Unix imports. ADR-0046 proposes the Windows
+  design (draft). The tiers are in `docs/USING.md#platform-support`.
 
 ## [0.2.0] - 2026-10-05
 
