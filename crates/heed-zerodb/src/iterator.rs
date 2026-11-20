@@ -333,7 +333,11 @@ macro_rules! rw_iterator {
             ///
             /// # Safety
             ///
-            /// No `&` borrow of the current entry may be live across this call.
+            /// No key or value this iterator yielded, for the current entry or
+            /// any earlier one, may be live across this call, as in heed: a
+            /// value read from the database is valid only until the next
+            /// update. The update may rewrite the page those bytes are on in
+            /// place, including the pages of entries already passed.
             ///
             /// # Errors
             ///
