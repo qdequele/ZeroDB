@@ -138,7 +138,8 @@ just stress                               # 180 s reader/writer stress, before a
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and the differential
 fuzz on x86-64 and aarch64 for every PR, and miri, loom and the crash smoke on
 x86-64; nightly it runs the long fuzz, the full crash run and the stress test
-on both architectures. It also builds the consumer crates on the workspace
+on both architectures, and the Meilisearch and hannoy test suites on ZeroDB
+([maintainers/CONSUMER-GATE.md](docs/maintainers/CONSUMER-GATE.md)). It also builds the consumer crates on the workspace
 `rust-version` (the MSRV is for consumers; developing ZeroDB itself needs a
 current stable toolchain for the bench and fuzz tooling). macOS clippy skips
 Linux-only modules, so also lint the `x86_64-unknown-linux-gnu` target when a

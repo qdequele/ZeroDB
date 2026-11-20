@@ -21,7 +21,7 @@ build Meilisearch ships and compare the results.
 > | Pages read from the file | validated by default; trusting them is opt-in | trusted by default, as in LMDB; `FileTrust::VALIDATE` is opt-in |
 > | Processes per environment | one (no lock file) | several (lock file on by default) |
 > | On-disk format version | 2 | 3; a version 2 file is refused at open, so dump it with the 0.2.0 `zerodb-tools` and `load` it |
-> | `unique-txns` feature (Meilisearch 1.55 and later) | absent | present |
+> | `unique-txns` feature (Meilisearch 1.55) | absent | present |
 > | `Env::resize` | absent | present |
 >
 > To build against `main`, pin a commit of it
@@ -86,8 +86,9 @@ A runnable version is in [`crates/zerodb/examples/basic.rs`](crates/zerodb/examp
   model-checked with loom. What these tests do not cover is listed under
   [Provenance](#provenance).
 - **A heed drop-in.** Meilisearch and hannoy build and pass their test suites
-  on it with no source changes. Meilisearch 1.55 and later needs manifest
-  changes, described in [docs/USING.md](docs/USING.md#as-a-heed-replacement).
+  on it with no source changes. Meilisearch 1.55 needs manifest changes,
+  described in [docs/USING.md](docs/USING.md#as-a-heed-replacement);
+  Meilisearch 1.56 and later use heed 0.23, which ZeroDB does not provide yet.
   Speed is in [Performance](#performance).
 - **Validation when you need it.** Pages are trusted by default, as LMDB
   trusts them. With `FileTrust::VALIDATE`, every page read from the file is

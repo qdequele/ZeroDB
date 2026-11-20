@@ -32,8 +32,20 @@ publish of the four engine crates (`zerodb-core`, `zerodb-io`, `zerodb`,
    just stress
    ```
 
-2. **Consumer gate** (docs/maintainers/CONSUMER-GATE.md) against the Meilisearch and
-   hannoy refs named in the CHANGELOG entry:
+2. **Consumer gate, green on the release commit. Required: no tag without it.**
+   Run the CI workflow by hand on the release commit (Actions → CI → Run
+   workflow, or `gh workflow run ci.yml --ref <branch>`) and wait for both
+   `consumer gate (meilisearch)` and `consumer gate (hannoy)` to pass. They run
+   Meilisearch's milli and index-scheduler suites and hannoy's suite on ZeroDB
+   at the refs pinned in `.github/workflows/ci.yml`
+   ([CONSUMER-GATE.md](CONSUMER-GATE.md)). A failure, including a build break
+   on a newer consumer release, blocks the release until it is fixed or the
+   pin is moved back with a reason in the CHANGELOG. Record in the CHANGELOG
+   entry the run's link, the date, the consumer refs and commits, and the test
+   counts from the job summary.
+
+   The same scripts run locally; use them to reproduce a CI failure and for
+   the benchmarks, which CI does not run:
 
    ```sh
    MEILISEARCH_SRC=… just consumer-suites
