@@ -39,7 +39,7 @@ heed_feature_manifest() { :; }
 do_suites() {
     set_patch on
     log "cargo test on ZeroDB"
-    (cd "$CLONE" && cargo test)
+    run_tests
     assert_no_lmdb ""
 }
 
@@ -74,6 +74,7 @@ cleanup() {
 }
 
 ensure_clone "$HANNOY_REF" "${HANNOY_SRC:-}" https://github.com/nnethercott/hannoy
+report_versions hannoy "$HANNOY_REF"
 trap cleanup EXIT
 case "$MODE" in
     suites) do_suites ;;
