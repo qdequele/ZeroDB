@@ -50,6 +50,8 @@ mod error;
 mod flags;
 pub mod iteration_method;
 mod iterator;
+#[cfg(all(test, not(feature = "unique-txns")))]
+mod miri_tests;
 mod reserved_space;
 mod txn;
 #[cfg(feature = "unique-txns")]

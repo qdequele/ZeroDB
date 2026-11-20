@@ -18,7 +18,7 @@ use super::verify::{
     compare_env_world, image_txnid, probe_image_adversarial, verify_image_full, FullChecks,
     FullOutcome,
 };
-use super::workload::gen_spec;
+use super::workload::{gen_spec, repro_command};
 use super::CutReport;
 use crate::tempdir::TempDir;
 
@@ -143,8 +143,8 @@ fn dump_repro(
             let _ = std::fs::write(dir.join("ops.txt"), format!("{:#?}", spec.ops_for_round(0)));
             let _ = std::fs::write(
                 dir.join("info.txt"),
-                format!("seed={seed}\nmode={}\npage_size={}\nmap_size={}\nviolation={detail}\nrepro: crash-harness --repro image:{seed}\n",
-                    spec.mode.name(), spec.page_size, spec.map_size),
+                format!("seed={seed}\nmode={}\npage_size={}\nmap_size={}\nviolation={detail}\nrepro: {}\n",
+                    spec.mode.name(), spec.page_size, spec.map_size, repro_command("image", seed)),
             );
             msg.push_str(&format!(" [repro artifacts: {}]", dir.display()));
         }

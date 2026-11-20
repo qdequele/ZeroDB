@@ -42,6 +42,18 @@ LMDB struct is transliterated.
   `open` with `Io(InvalidInput)`. Selection applies **only when creating** a
   store — reopening adopts the persisted `psize` from the meta page (§3.2) and
   silently ignores the request, exactly as for `map_size`.
+- **What does depend on the OS page size.** Nothing in the format does. The
+  I/O layer does, in four places, none of which may assume the OS page equals
+  `psize` or is 4 KiB: a map may extend past the end of the file, and only
+  OS pages wholly past the end fault, so a store is read through the map only
+  within the file (§3.2 rejects a file shorter than `2 * psize` before
+  mapping it); the ranged `msync` of SPEC 06 REC-12 starts on an OS-page
+  boundary at or below the first page it flushes; `MADV_RANDOM` applies to
+  whole OS pages; and the heed adapter, as LMDB, requires `map_size` to be a
+  multiple of the OS page size and, unless `page_size` is set, gives a new
+  store the OS page size as its `psize`. `crates/zerodb/tests/os_page_size.rs`
+  runs these paths at `psize` 4, 16 and 64 KiB on whatever kernel runs the
+  suite.
 - **Page number** (`pgno`) is a `u64` index into the file: byte offset of a
   page = `pgno * psize`. `PGNO_INVALID = u64::MAX` (`0xFFFF_FFFF_FFFF_FFFF`)
   denotes "no page" (empty tree / end of chain).
@@ -61,7 +73,7 @@ LMDB struct is transliterated.
 | Name | Value | Meaning |
 |------|-------|---------|
 | `MAGIC` | bytes `5A 44 42 31` (ASCII `"ZDB1"`) | 4-byte file identifier, stored as a byte array (endianness-free). |
-| `FORMAT_VERSION` | `3` (`u32`) | On-disk format version. Bumped only on an incompatible change (ADR-0002 §D8). Version 2 (ADR-0022) adds the meta free-list annex: `fl_count` at offset 168, `meta_crc` moved to 172 with split coverage, annex ids at 176 (§3/§3.3). Version 3 (ADR-0037) makes the GC key 16 bytes, `BE(txnid) ‖ BE(seq)`, and bounds every GC value so it is always inline (§7). A file of an earlier version is refused at open (§3.2 step 2); migration is logical, `dump` with the old build then `load` with the new one. |
+| `FORMAT_VERSION` | `3` (`u32`) | On-disk format version. Bumped only on an incompatible change (ADR-0002 §D8). Version 2 (ADR-0022) adds the meta free-list annex: `fl_count` at offset 168, `meta_crc` moved to 172 with split coverage, annex ids at 176 (§3/§3.3). Version 3 (ADR-0037) makes the GC key 16 bytes, `BE(txnid) ‖ BE(seq)`, and bounds every GC value so it is always inline (§7). A file of an earlier version is refused at open (§3.2 step 2) and never converted in place; migration is logical. `zerodb-tools upgrade` reads a version 2 file and writes a fresh version 3 environment, and `zerodb-tools dump` reads version 2 too (ADR-0045 draft): they run §3.2's slot predicate with version 2 (`MetaPage::validate_version`), since the meta layout is the same in versions 2 and 3, and read only the main and named databases, whose pages did not change. Version 1 was never released and is not read. |
 | `HEADER_SIZE` | `32` | Size of the common page header, bytes. |
 | `PGNO_INVALID` | `0xFFFF_FFFF_FFFF_FFFF` | Sentinel "no page". |
 | `META_A_PGNO` / `META_B_PGNO` | `0` / `1` | The two fixed meta-page slots. |
@@ -227,7 +239,9 @@ At env open the engine reads both slots and validates each independently:
 1. `magic == MAGIC`, else the file is not a ZeroDB env → `MdbError::Invalid`
    (SPEC 00 row 56).
 2. `format_version == FORMAT_VERSION`, else `MdbError::Invalid` (version
-   mismatch; ADR-0002 §D8).
+   mismatch; ADR-0002 §D8). The engine always checks against
+   `FORMAT_VERSION`; only `zerodb-tools` runs this predicate with an older
+   version, to read a file it upgrades (§0, `FORMAT_VERSION` row).
 3. `page_size` is a power of two in `[4096, 65536]`, else `MdbError::Invalid`.
 4. Header `txnid` (offset 8) equals body `txnid` (offset 64), else the slot is
    inconsistent and is **discarded** (INV-2). This guards a torn write that
@@ -754,13 +768,13 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
     reports. The **logical map size** starts at `n` (raised to what the data
     needs, as any open size is): it is what the open maps and, under
     `WRITE_MAP`, the length the data file is set to, and a write txn grows it
-    up to the ceiling where an allocation would pass it (SPEC 04 TXN-74). The
+    up to the ceiling where an allocation would pass it (SPEC 04 TXN-75). The
     meta records the logical size, so a process without the option that
     adopts it with `resize(0)` maps only what the data needs. `resize` with a
     non-zero size sets the ceiling and keeps the logical size within it;
     `resize(0)` adopts the meta's size as the logical size, as without the
     option, and raises the ceiling to it if it is lower. A begin of an environment with the option follows another
-    process's growth instead of returning `MapResized` (TXN-74). The file
+    process's growth instead of returning `MapResized` (TXN-75). The file
     is never shrunk.
   - **Runtime `map_size` selection.** At open the effective `map_size` is
     the caller's `EnvOpenOptions::map_size` when set, else the persisted
@@ -854,7 +868,7 @@ reachability-xor-freeness invariant (INV-10, INV-14, INV-28).
   request from already-allocated free pages **and**
   `next_pgno + n > map_pages` (the run would **end past** the map), the write fails
   (with map growth on, `map_size` here is the ceiling, and a run past the
-  logical size but within the ceiling grows the map instead, SPEC 04 TXN-74)
+  logical size but within the ceiling grows the map instead, SPEC 04 TXN-75)
   with `MdbError::MapFull` (SPEC 00 row 55 → heed `MdbError::MapFull` →
   `MaxDatabaseSizeReached`). The txn aborts cleanly with no partial state.
   Equivalently: the last page of the run, `next_pgno + n − 1`, must be

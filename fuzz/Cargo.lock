@@ -899,6 +899,7 @@ version = "0.2.0"
 dependencies = [
  "libc",
  "memmap2",
+ "thiserror",
  "zerodb-core",
 ]
 

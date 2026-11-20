@@ -223,9 +223,15 @@ pub(super) enum AllocMode {
     /// loose pages, the already-loaded drain pool, the carried annex pool or
     /// extend only (GC-12). Every request is a single page: GC records are
     /// always inline (GC-5), so the save never allocates an overflow run.
-    /// Set once at `freelist_save` entry and never cleared: the commit
-    /// consumes the txn.
+    /// Set at `freelist_save` entry; the commit consumes the txn.
     GcSave,
+    /// Inside `freelist_save` once its drawing rounds are spent (GC-13a):
+    /// loose pages or extend. Neither pool is drawn from, so no record
+    /// already written can come to list a handed-out page. The one
+    /// exception is a full map: a save the pools can serve must not fail
+    /// with `MapFull`, so the pools are drawn from when the file cannot be
+    /// extended.
+    GcSaveExtend,
 }
 
 impl<'env> RwTxn<'env> {
@@ -236,9 +242,9 @@ impl<'env> RwTxn<'env> {
     /// Under in-place `WRITE_MAP` (ADR-0021) every pgno this returns is
     /// immediately realized **in the map** — a store to committed bytes, not
     /// a heap frame — so the TXN-62 check that is a `debug_assert` at C2
-    /// (`write_frames`) is enforced here as a **typed release-mode guard**
-    /// (ADR-0021): a future allocator bug must surface as an error, never
-    /// silently clobber committed data through the map.
+    /// (`write_frames`) is enforced here as a **typed release-mode guard**:
+    /// an allocator bug must surface as an error, never silently clobber
+    /// committed data through the map.
     pub(super) fn allocate(&mut self, n: u64) -> Result<u64> {
         let p = self.allocate_raw(n)?;
         if self.dirty.in_map_mode() && !self.in_map_target_ok(p, n) {
@@ -246,7 +252,7 @@ impl<'env> RwTxn<'env> {
             // be trusted (LMDB `MDB_TXN_ERROR` degradation, TXN-30).
             self.errored = true;
             return Err(Error::Io(std::io::Error::other(format!(
-                "TXN-62 violation refused (ADR-0021 M2): allocator returned page {p} (run of {n}) \
+                "TXN-62 violation refused (ADR-0021): allocator returned page {p} (run of {n}) \
                  at or below the committed high-water {} without a reclaim record — writing it \
                  in place would clobber the live snapshot",
                 self.committed_last_pg
@@ -273,8 +279,9 @@ impl<'env> RwTxn<'env> {
     /// [`RwTxn::allocate`] without the ADR-0021 guard (the guard wraps
     /// every return point in one place).
     ///
-    /// The hot shape here is the loose pop. The draw arms (`save_pool_draw`, `annex_draw`, `gc_reclaim`, `cross_record_run`) are
-    /// `#[inline(never)]` so their size never pushes this function past
+    /// The common case here is the loose pop. The draw arms
+    /// (`save_pool_draw`, `annex_draw`, `gc_reclaim`, `cross_record_run`)
+    /// are `#[inline(never)]` so their size never pushes this function past
     /// LLVM's inlining budget.
     pub(super) fn allocate_raw(&mut self, n: u64) -> Result<u64> {
         debug_assert!(n >= 1);
@@ -311,25 +318,16 @@ impl<'env> RwTxn<'env> {
                 }
             }
             AllocMode::GcSave => {
-                // GC-12 (ADR-0005): never *read* the GC tree
-                // in-save, but draws from the already-loaded drain pool are
-                // permitted — required for bounded file growth, since the
-                // in-save COW of a committed GC page can never reuse its own
-                // predecessor (TXN-62: the N−1 meta still references it) and
-                // would otherwise extend the file on every commit. Each entry
-                // touched here is re-rewritten before the fixed point
-                // (`save_touched`), so no rewritten entry lists a handed-out
-                // page (the anti-leak property GC-12 exists for).
-                if let Some(start) = self.save_pool_draw(n) {
+                if let Some(start) = self.save_draw(n) {
                     return Ok(start);
                 }
-                // The carried annex pool (SPEC 05 §2a GC-30): gate-checked
-                // like every annex draw; the step-(c) placement re-reads
-                // `annex.live()` after every put, so a draw here can never
-                // leave a handed-out id in the persisted set — the GC-12
-                // pool argument.
-                if let Some(start) = self.annex_draw(n) {
-                    return Ok(start);
+            }
+            AllocMode::GcSaveExtend => {
+                let mp = map_pages(self.env.inner().map_size(), self.psize);
+                if is_map_full(self.next_pgno, n, mp) {
+                    if let Some(start) = self.save_draw(n) {
+                        return Ok(start);
+                    }
                 }
             }
         }
@@ -352,9 +350,9 @@ impl<'env> RwTxn<'env> {
     /// holds both writer locks that `resize` takes.
     ///
     /// Nothing staged or spilled moves: dirty pages are addressed by page
-    /// number, and older mappings stay mapped. In heap modes the cached
-    /// whole-map view is re-derived, as after a spill (TXN-71), so a page
-    /// later spilled past the old mapping resolves through the new one.
+    /// number, and older mappings stay mapped. The txn takes the backing's
+    /// new view, so a page later spilled or stored past the old mapping
+    /// resolves through the new one.
     #[cold]
     #[inline(never)]
     fn grow_map_for(&mut self, end_pgno: u64) -> Result<()> {
@@ -371,9 +369,7 @@ impl<'env> RwTxn<'env> {
         }
         let size = need.max(inner.map_size().saturating_mul(2)).min(ceiling);
         inner.backing_ref().grow_map(size).map_err(Error::Io)?;
-        if !self.dirty.in_map_mode() {
-            self.bytes = inner.backing_bytes();
-        }
+        self.map = inner.backing_pages();
         Ok(())
     }
 
@@ -388,16 +384,30 @@ impl<'env> RwTxn<'env> {
         }
     }
 
+    /// The in-save draws (GC-12, ADR-0005): the GC tree is never *read*
+    /// in-save, but the already-loaded drain pool is drawn from, which keeps
+    /// file growth bounded (`freelist_save` gives the argument). Each entry
+    /// touched is rewritten again before the fixed point (`save_touched`),
+    /// so no rewritten entry lists a handed-out page. Then the carried annex
+    /// pool (SPEC 05 §2a GC-30), gate-checked like every annex draw: the
+    /// step-(c) placement re-reads `annex.live()` after every put, so a draw
+    /// can never leave a handed-out id in the persisted set.
+    #[inline(never)]
+    fn save_draw(&mut self, n: u64) -> Option<u64> {
+        self.save_pool_draw(n).or_else(|| self.annex_draw(n))
+    }
+
     /// In-save draw from the **already-loaded drain pool** (GC-12;
     /// see [`RwTxn::allocate`]). Deterministic like GC-19: smallest
     /// reclaimable record first (`drains` is a `BTreeMap` in key order),
-    /// smallest id / first contiguous run within it. Gate compliance is inherited: every pool
-    /// entry passed `F ≤ oldest_reader()` when first loaded during ops, and
-    /// any reader that pins *after* that pins the published snapshot
-    /// `≥ writer_txnid − 1 ≥ F`, from whose trees these pages are absent.
+    /// smallest id / first contiguous run within it. Gate compliance is
+    /// inherited: every pool entry passed `F ≤ oldest_reader()` when first
+    /// loaded during ops, and any reader that pins *after* that pins the
+    /// published snapshot `≥ writer_txnid − 1 ≥ F`, from whose trees these
+    /// pages are absent.
     #[inline(never)]
     pub(super) fn save_pool_draw(&mut self, n: u64) -> Option<u64> {
-        debug_assert!(self.alloc_mode == AllocMode::GcSave);
+        debug_assert!(self.alloc_mode != AllocMode::Normal);
         let mut hit: Option<(GcKey, u64)> = None;
         for (key, remaining) in &work!(self).drains {
             if let Some(start) = find_run(remaining.live(), n) {
@@ -406,8 +416,9 @@ impl<'env> RwTxn<'env> {
             }
         }
         let (key, start) = hit?;
-        // Reader-table shadow check: gate compliance is inherited (doc above), but a
-        // fresh table re-scan re-proves it at the hand-out moment.
+        // Reader-table shadow check: gate compliance is inherited (doc
+        // above), but a fresh table re-scan re-proves it at the hand-out
+        // moment.
         #[cfg(debug_assertions)]
         self.debug_assert_gate(key.txnid);
         let remaining = work_mut!(self)
@@ -454,11 +465,11 @@ impl<'env> RwTxn<'env> {
     /// live reader snapshot txnid, writer_txnid − 1)`. The reader term is the
     /// lock-free reader-table SeqCst scan
     /// ([`crate::env::EnvInner::oldest_live_reader`]); this is its only
-    /// consumer. Cached per write txn (TXN-22; ADR-0006): the
-    /// first draw scans, later draws reuse — always sound because a stale
-    /// gate is only ever *smaller* (readers that release mid-txn are not
-    /// reclaimed-against; readers that pin mid-txn pin `≥ commit point =
-    /// txnid − 1 ≥` the cache, so the cache never overshoots a new pin).
+    /// consumer. Cached per write txn (TXN-22; ADR-0006): the first draw
+    /// scans, later draws reuse — always sound because a stale gate is only
+    /// ever *smaller* (readers that release mid-txn are not reclaimed
+    /// against; readers that pin mid-txn pin `≥ commit point = txnid − 1 ≥`
+    /// the cache, so the cache never overshoots a new pin).
     pub(super) fn oldest_reader(&mut self) -> u64 {
         if let Some(o) = work!(self).oldest_cache {
             return o;
@@ -481,14 +492,12 @@ impl<'env> RwTxn<'env> {
     /// reach any page being drawn". Catches a gate bug at the reclaim site,
     /// not via downstream corruption. Debug builds only.
     ///
-    /// Caveat: this re-scan is itself just a set of SeqCst loads subject to
-    /// the same memory-model visibility rules as the real gate — it is a
-    /// debug *aid*, not an independent oracle. A pin it fails to observe is
-    /// exactly a pin the TXN-20 proof already covers (mid-pin ⇒ `≥ N − 1`),
-    /// and a stale read of a just-released slot only makes the assert
-    /// stricter (conservative), so it can produce no false confidence and no
-    /// false alarm — but it also cannot detect ordering bugs the gate itself
-    /// would miss on the same hardware.
+    /// Caveat: this re-scan is itself a set of SeqCst loads subject to the
+    /// same memory-model visibility rules as the real gate, so it is a
+    /// debug aid, not an independent proof. It raises no false alarm (a pin
+    /// it fails to observe is one the TXN-20 argument already covers, and a
+    /// stale read of a just-released slot only makes the assert stricter),
+    /// but it cannot detect an ordering bug the gate itself would miss.
     #[cfg(debug_assertions)]
     pub(super) fn debug_assert_gate(&self, f: u64) {
         // `F ≤ writer_txnid − 1`, spelled `<` for clippy (same predicate).

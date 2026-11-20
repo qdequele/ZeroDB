@@ -91,10 +91,9 @@ pub fn cmd_stat(env_dir: &Path) -> Result<String, BoxErr> {
     Ok(out)
 }
 
-/// The engine-identification line for `stat` (ADR-0010 §Options D2 —
-/// "in spirit": the magic in the file is the authoritative discriminator, so
-/// the tool reports it rather than shipping a marker file). Shows the data-file
-/// name actually found, the four magic bytes, and the format version.
+/// The engine-identification line for `stat`: the data-file name actually
+/// found, the four magic bytes, and the format version. The magic in the file,
+/// not its name, tells the engines apart (ADR-0010).
 fn engine_line(data: &naming::EnvDataFile) -> Result<String, BoxErr> {
     let probed = naming::probe_magic(&data.path)?;
     Ok(match probed {
@@ -125,7 +124,7 @@ fn write_db_stat(out: &mut String, s: &zerodb::DatabaseStat) -> Result<(), BoxEr
 }
 
 /// Render a DB name for the stat report: printable ASCII verbatim, else hex.
-fn printable_name(name: &[u8]) -> String {
+pub(crate) fn printable_name(name: &[u8]) -> String {
     if name.iter().all(|&b| b.is_ascii_graphic() || b == b' ') {
         String::from_utf8_lossy(name).into_owned()
     } else {
@@ -143,12 +142,19 @@ fn printable_name(name: &[u8]) -> String {
 /// read-only through its lock file, like `stat`. Probes both data-file names
 /// (ADR-0010).
 ///
+/// An env in the previous on-disk format, which the engine refuses to open,
+/// is read by [`crate::legacy`] instead; its dump is the one the release
+/// that wrote it produces.
+///
 /// # Errors
 ///
 /// [`naming::NameError`] if the env is missing or ambiguous, the open's error,
 /// a read error, or a write error on `out` (which may then hold a partial
 /// dump).
 pub fn write_dump(env_dir: &Path, out: impl std::io::Write) -> Result<(), BoxErr> {
+    if let Some(legacy) = crate::legacy::legacy_data_file(env_dir)? {
+        return crate::legacy::write_dump(&legacy.path, out);
+    }
     let data = naming::resolve(env_dir)?;
     let env = open_ro(env_dir, data.name)?;
     let txn = read_txn(&env)?;
@@ -267,7 +273,13 @@ fn load_batched(
     };
     source.seek(SeekFrom::Start(0))?;
 
-    let env = open_exclusive_destination(env_dir, psize, map_size, "load into")?;
+    let env = open_exclusive_destination(
+        env_dir,
+        zerodb::DATA_FILE_NAME,
+        psize,
+        map_size,
+        "load into",
+    )?;
 
     // Pass 2: write each block's records in batches, in dump order (the main
     // DB first, then the named DBs).
@@ -281,16 +293,24 @@ fn load_batched(
         db.finish()?;
     }
 
-    // Verify the produced env is structurally clean before returning. Unlike
-    // the old `check_image` over the file, this does not re-verify the meta
-    // slots or the file length: the engine wrote and validated those itself
-    // (each commit writes a checksummed meta; this read txn's open accepted
-    // it), and the walk covers every page the committed snapshot references.
-    let txn = read_txn(&env)?;
-    let violations = check_snapshot(txn.map_bytes(), env.page_size(), txn.snapshot());
+    verify_written_env(&env, "loaded")
+}
+
+/// Check the env a tool just wrote, before the tool returns. The walk covers
+/// every page the committed snapshot references. It does not re-verify the
+/// meta slots or the file length: the engine wrote and validated those itself
+/// (each commit writes a checksummed meta, and this read txn's open accepted
+/// it).
+///
+/// # Errors
+///
+/// Any invariant violation, named with `what`, or the read txn's error.
+pub(crate) fn verify_written_env(env: &Env, what: &str) -> Result<(), BoxErr> {
+    let txn = read_txn(env)?;
+    let violations = check_snapshot(txn.map_pages(), env.page_size(), txn.snapshot());
     if !violations.is_empty() {
         return Err(format!(
-            "loaded env failed the invariant check ({} violations): {:?}",
+            "{what} env failed the invariant check ({} violations): {:?}",
             violations.len(),
             violations
         )
@@ -299,8 +319,8 @@ fn load_batched(
     Ok(())
 }
 
-/// Open a fresh destination env (native name, lock file on) for `load` or
-/// `migrate-from-lmdb`, and refuse it unless this process opened it alone
+/// Open a fresh destination env, with the data file `data_file_name` and the
+/// lock file on, for `load`, `upgrade` or `migrate-from-lmdb`, and refuse it unless this process opened it alone
 /// and it is still empty (ADR-0023).
 ///
 /// The empty-destination check before the open ([`refuse_existing_env`]) ran
@@ -315,6 +335,7 @@ fn load_batched(
 /// A refusal naming `verb`, or the open's error.
 pub(crate) fn open_exclusive_destination(
     env_dir: &Path,
+    data_file_name: &str,
     psize: u32,
     map_size: usize,
     verb: &str,
@@ -327,6 +348,7 @@ pub(crate) fn open_exclusive_destination(
             .max_dbs(crate::common::MAX_TOOL_DBS)
             .page_size(psize)
             .sequential_writes(true)
+            .data_file_name(data_file_name)
             .lock_file(true)
             .file_trust(zerodb::FileTrust::VALIDATE)
             .open(env_dir)
@@ -342,14 +364,13 @@ pub(crate) fn open_exclusive_destination(
     if txn.snapshot().main_db.entries != 0 {
         return Err(format!(
             "refusing to {verb} a non-empty env: {} already holds data",
-            env_dir.join(zerodb::DATA_FILE_NAME).display()
+            env_dir.join(data_file_name).display()
         )
         .into());
     }
     drop(txn);
     for candidate in naming::existing_data_files(env_dir) {
-        if candidate.name != zerodb::DATA_FILE_NAME && std::fs::metadata(&candidate.path)?.len() > 0
-        {
+        if candidate.name != data_file_name && std::fs::metadata(&candidate.path)?.len() > 0 {
             return Err(format!(
                 "refusing to {verb} a non-empty env: {} already exists",
                 candidate.path.display()
@@ -631,7 +652,7 @@ pub fn cmd_check(env_dir: &Path) -> Result<(String, bool), BoxErr> {
     };
     let txn = read_txn(&env)?;
     let psize = env.page_size();
-    let violations = check_snapshot(txn.map_bytes(), psize, txn.snapshot());
+    let violations = check_snapshot(txn.map_pages(), psize, txn.snapshot());
     let mut out = String::new();
     writeln!(
         out,
@@ -677,6 +698,11 @@ fn check_raw_exclusively(
 
 /// Walk the raw data file at `data` ([`check_image`]). Tolerant of a corrupt
 /// file.
+///
+/// The file is walked through a read-only memory map of exactly its length,
+/// not a copy on the heap, so the walk's memory does not grow with the file.
+/// The caller holds the env's lock file exclusively, which keeps another
+/// process from shrinking the file under the map.
 fn check_raw_file(env_dir: &Path, data: &Path) -> Result<(String, bool), BoxErr> {
     let file = File::open(data)?;
     let psize = match zerodb_io::probe_page_size(&file)? {
@@ -691,9 +717,37 @@ fn check_raw_file(env_dir: &Path, data: &Path) -> Result<(String, bool), BoxErr>
             ));
         }
     };
-    drop(file);
-    let bytes = std::fs::read(data)?;
-    let violations = check_image(&bytes, psize);
+    let file_len = file.metadata()?.len();
+    let violations = if file_len < 2 * u64::from(psize) {
+        // Too short to hold both meta slots, which the map below requires;
+        // at most two pages, so read it.
+        let mut head = Vec::new();
+        file.take(2 * u64::from(psize)).read_to_end(&mut head)?;
+        check_image(&head, psize)
+    } else {
+        drop(file);
+        // A read-only open maps the file and never creates, grows or writes
+        // it. Asking for a map of the file's length keeps the mapping to the
+        // file itself, whatever map size its metas name.
+        match zerodb_io::open_or_create(data, psize, Some(file_len), file_len, true, false) {
+            Ok(opened) => {
+                // The tool's own process runs no write txn on this file, so
+                // a whole-file borrow is sound here (`MapPages::whole`).
+                let map = opened.backing.pages().whole();
+                // Only the bytes the file holds now: a map page past the
+                // file's end cannot be read.
+                let len = usize::try_from(opened.backing.real_disk_size()?)
+                    .map_or(map.len(), |n| n.min(map.len()));
+                check_image(&map[..len], psize)
+            }
+            // A meta that decodes but names a map size above the supported
+            // maximum: the file is refused before it is mapped.
+            Err(zerodb::Error::Mdb(MdbError::Invalid)) => {
+                vec!["INV-1: a meta slot names a map size above the supported maximum".into()]
+            }
+            Err(e) => return Err(e.into()),
+        }
+    };
     let mut out = String::new();
     writeln!(
         out,

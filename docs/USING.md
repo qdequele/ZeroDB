@@ -5,13 +5,27 @@ There are two ways to use ZeroDB:
 - **The native API, crate `zerodb`.** It is heed-shaped and works on byte
   slices. Use it for new code.
 - **The heed drop-in.** A consumer that already uses `heed` 0.22 switches
-  engines with one `[patch]` line and no code changes. Meilisearch and hannoy
-  run this way.
+  engines with one `[patch]` line and no source changes. Meilisearch and
+  hannoy run this way; Meilisearch 1.55 and later needs two more manifest
+  edits, described [below](#as-a-heed-replacement).
 
 The defaults match LMDB. Every option below that trades safety for speed is
 opt-in on purpose, and each section states what it costs next to what it gains.
 
 ## Getting started
+
+<!-- BEGIN main-vs-release note: delete this block at the next release. -->
+> **This page describes `main`, which is ahead of the 0.2.0 release.** The
+> `0.2` crates and the `v0.2.0` tag used in the install lines below differ
+> from it: in 0.2.0 `open` is a safe `fn`, pages are validated by default, an
+> environment belongs to one process (there is no lock file and no
+> `Env::resize`, so [Multiple processes](#multiple-processes) does not
+> apply), the on-disk format version is 2 where `main` writes 3, and
+> the `unique-txns` feature does not exist. To build against `main`, replace
+> `"0.2"` with `{ git = "https://github.com/qdequele/ZeroDB", rev = "<commit>" }`
+> and `tag = "v0.2.0"` with `rev = "<commit>"`, where `<commit>` is a commit
+> of `main`. The [README](../README.md) has the same list as a table.
+<!-- END main-vs-release note -->
 
 ### Native API
 
@@ -55,7 +69,7 @@ heed = { git = "https://github.com/qdequele/ZeroDB", tag = "v0.2.0" }
 The patch target is `crates/heed-zerodb`, ZeroDB's heed adapter, whose package
 is named `heed`. It gives heed 0.22.1's API.
 
-Meilisearch v1.55 and later build against Meilisearch's heed fork, whose API
+Meilisearch v1.55 builds against Meilisearch's heed fork, whose API
 differs (unique transactions, ADR-0027). The adapter has it behind the
 `unique-txns` feature. A `[patch]` cannot turn on a feature, so also add it to
 one of your own `heed` dependencies, milli's in Meilisearch:
@@ -68,6 +82,9 @@ Meilisearch patches heed to its fork under `[patch.crates-io]`; replace that
 line with the ZeroDB one, and add a `[patch."https://github.com/meilisearch/heed"]`
 table with the same line for crates that take heed from the fork's git
 repository. `scripts/consumer.sh` does all of this on a Meilisearch checkout.
+
+Meilisearch v1.56 and later depend on heed 0.23, which the adapter does not
+provide: a `[patch]` on it is ignored and the build keeps C LMDB.
 
 Two things change underneath:
 
@@ -202,6 +219,37 @@ them (ADR-0023).
 - Do not use an `Env` in a child after `fork()`, and do not share an
   environment across PID namespaces.
 
+## Platform support
+
+| Tier | Targets | What runs |
+|---|---|---|
+| Tested, supported | Linux x86-64; Linux aarch64 with 4 KiB pages | Every PR: the full CI (fmt, clippy, tests, differential fuzz; miri, loom and the crash smoke on x86-64). Nightly: long fuzz, full crash run, stress |
+| Tested, supported | macOS aarch64 (Apple silicon, 16 KiB pages) | Every PR: clippy, the test suite and the crash smoke. No fuzz, miri, loom or nightly runs |
+| Builds, best effort | Linux aarch64 with 64 KiB pages (such as RHEL for ARM); macOS x86-64; Linux on other 64-bit architectures | Same code paths as a tested target, but no CI runs them |
+| Unsupported | Windows | Fails to build with a `compile_error!`. A design is proposed in [ADR-0046](adr/0046-windows-support.md), awaiting approval |
+| Unsupported | Other Unix systems (FreeBSD and others); 32-bit targets | Never built or tested |
+
+The primary target is Linux aarch64 (AWS Graviton). The database page size is
+independent of the OS page size, so a store created on one platform opens on
+another.
+
+### What differs on macOS
+
+| Difference | ZeroDB on macOS | Covered by |
+|---|---|---|
+| Durability barrier | `File::sync_data`, which Rust implements with `fcntl(F_FULLFSYNC)` on Apple systems; macOS has no `fdatasync`. LMDB also uses `F_FULLFSYNC` there. Under `WRITE_MAP`, a synchronous `msync` is followed by the same call, since `msync` alone is not a durability barrier on macOS (SPEC 06 REC-12) | Every committing test runs the call. No test can observe which system call std issues without tracing privileges, and the crash harness models barriers in its fault backing rather than on a device |
+| Cross-process writer lock | An `fcntl` record lock on byte 1 of the lock file instead of a futex word (SPEC 04 LCK-4); the kernel releases it if the owner dies | `zerodb/tests/multi_process.rs`: `writers_in_two_processes_exclude_each_other`, `killed_writer_lock_is_taken_over`, `writer_lock_released_on_another_thread_admits_another_process`; the `mp` crash mechanism (`just crash-test-quick`) |
+| Dead readers at a writer takeover | Not freed: a record lock does not report its previous owner, so a takeover looks like an ordinary acquisition. LMDB on macOS does free them, as on Linux ([D-028](LMDB-COMPATIBILITY.md#d-028), awaiting a decision). Run `Env::clear_stale_readers` to free them (see below) | `lmdb_reaping_observation.rs::observe_writer_takeover` pins LMDB's behavior on both systems; `multi_process_differential.rs::killed_writer_takeover_matches_lmdb` runs on Linux only, because ZeroDB differs on macOS |
+| 16 KiB OS pages (Apple silicon) | A database page can be smaller than an OS page. The heed adapter creates stores at the OS page size, 16 KiB, as LMDB does; the map length and ranged `msync` round to 16 KiB | `heed-zerodb/tests/apple_silicon.rs` (4 KiB and 8 KiB stores with and without `WRITE_MAP`, the 16 KiB default, and a check that the runner has 16 KiB pages); `heed-zerodb/tests/extensions.rs::omitting_page_size_defaults_to_the_os_page_size`; `heed-zerodb/tests/boundary.rs` |
+| Read-ahead hint | `NO_READ_AHEAD` applies `madvise(MADV_RANDOM)` on both systems | `zerodb/tests/no_read_ahead.rs` runs on both; only Linux exposes the advice (`/proc/self/smaps`), so only there does it check that the hint took effect |
+| Raw environment copy | `copy_to_file` clones the data file with `fclonefileat` where Linux uses `copy_file_range` (ADR-0032) | `zerodb/src/copy_tests.rs`, which checks each system's path |
+
+On macOS, a writer that follows a writer process that died does not free the
+reader slots of other dead processes, where LMDB does. Those slots hold back
+page reuse, and the file grows, until `Env::clear_stale_readers` runs or
+every process has closed the environment and the next one opens it. A long-running multi-process
+deployment on macOS should call `clear_stale_readers` after a crash.
+
 ## Build settings
 
 Cargo applies `[profile]` settings only from the final binary's workspace, so
@@ -236,6 +284,6 @@ records the build setting its run used.
 - [LMDB-COMPATIBILITY.md](LMDB-COMPATIBILITY.md): every heed item and LMDB
   feature, with its status.
 - [TOOLS.md](TOOLS.md): `zerodb-tools` (`stat`, `check`, `dump`, `load`,
-  `copy`, `migrate-from-lmdb`).
+  `migrate-from-lmdb`).
 - [PERFORMANCE.md](PERFORMANCE.md): how ZeroDB compares with LMDB, and why.
 - [ARCHITECTURE.md](ARCHITECTURE.md): how the engine works.

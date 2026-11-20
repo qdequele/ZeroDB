@@ -79,7 +79,12 @@ oldest-reader gate depends on that.
   bounds) are evaluated in byte order and a custom-comparator
   database legitimately reports violations of exactly those two. Every other
   invariant — page typing, reachability, depth uniformity, counter accuracy,
-  GC structure — is ordering-independent and must still pass.
+  GC structure — is ordering-independent and must still pass. A caller that
+  holds the comparators can pass each named database's key order to
+  `check_image_with_key_order` / `check_snapshot_with_key_order`: INV-5 and
+  INV-6 are then evaluated under that order, or skipped for a database whose
+  order the caller declares unknown. The main database and the free-page tree
+  are always byte-ordered.
 - **The comparator is not persisted.** See §2.0.1.
 
 ### §2.0.1 — Non-persistence hazard (D-014)
@@ -184,6 +189,8 @@ depending on the entry point — pinned by `zerodb-oracle` differential tests
 | `set_range` / `get_greater_than` / `get_lower_than_or_equal_to` | `BadValSize` (an explicit `MDB_SET_RANGE` with a zero-size key is rejected) | `None`/last per the seek — no error |
 | `prefix_iter` / `prefix_iter_mut` (forward) | `BadValSize` (realized as `set_range(prefix)`; the adapter applies it to both the read and the write-cursor variant — 2026-09-09) | empty scan — no error |
 | `rev_prefix_iter` (reverse) | **works** — full reverse iteration (its successor is unbounded, so it seeks via `last`, not `set_range`) | empty scan — no error |
+| `range` / `range_mut` (forward) with an empty **start** bound; `rev_range` / `rev_range_mut` with an empty **end** bound | `BadValSize` as the **first item** (heed seeks that bound with `MDB_SET_RANGE`); the failed seek leaves the cursor unpositioned, so the next items iterate from the first (forward) or last (reverse) entry, still bounded by the other bound. An empty key as the *other* bound is only compared, never an error (generated scenarios, `scenario_regressions.rs`, 2026-11-20) | `None`/last per the seek — no error |
+| `delete_range` with an empty start bound | **`Io(InvalidInput)`** (`EINVAL`), nothing deleted: heed's delete loop calls `del_current` on the failed seek's unpositioned cursor, which LMDB refuses; the adapter's write iterators refuse `del_current` before their first seek the same way | as `range_mut` |
 
 The unifying rule: **write ops** (`put*`) validate `maxkey` before searching, so
 both an empty and an oversized key are `BadValSize`; **read/search ops** reject
@@ -201,7 +208,9 @@ than a zero-size set-range and therefore succeeds.
   SPEC 04's value-borrow contract. This doc assumes those hold.
 - `F_BIGDATA` value: read `dsize` bytes starting at `head*psize + HEADER_SIZE`
   where `head` = the 8-byte pgno in the leaf cell (SPEC 02 §5). Still zero-copy:
-  the overflow run is contiguous in the map.
+  the overflow run is contiguous in the map. A run read from the map is
+  borrowed as exactly the `⌈(HEADER_SIZE + dsize) / psize⌉` pages the value
+  needs, never further (SPEC 04 TXN-37/38, ADR-0021 amendment 1).
 - `Database::len` reads `DBRecord.entries`; `is_empty` = `entries == 0`
   (SPEC 00 rows 39/40).
 
@@ -1207,7 +1216,11 @@ some DB tree walked from a meta root. Applies to the live meta's snapshot.
   header `txnid` == body `txnid`; on a torn slot the older intact slot is used
   (SPEC 02 §3.3).
 - **INV-3** — Page-size uniformity: every page is exactly `psize` bytes; the file
-  length is a whole multiple of `psize`.
+  length is a whole multiple of `psize`, except for a partial page past the
+  high-water `(last_pg + 1) × psize`. A positioned write that extended the file
+  and failed part-way (a short write on a full device, SPEC 06 REC-23) leaves
+  such a tail; no snapshot references it, and a later write of that page
+  completes it.
 - **INV-4** — Self pgno (**written pages only**): every page that is *reachable*
   through a DB tree (a leaf/branch/overflow-head of the main, named, or GC trees)
   has a header `pgno` equal to its file index (`file_offset / psize`). A page that

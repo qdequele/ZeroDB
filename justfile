@@ -6,18 +6,62 @@ check:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
 
-# The core's non-mmap logic under miri (nightly).
+# Under miri (nightly): the core; the I/O layer's unit tests (the lock-file
+# views over an anonymous map, the grow-only map cell over heap mappings, the
+# fault-injection backend), skipping the tests that open real files; and the
+# heed adapter's unit tests over the heap-backed writable map. The integration
+# tests of zerodb-io and heed open real files and are left to `sanitize`.
 miri:
-    cargo miri test -p zerodb-core
+    cargo +nightly miri test -p zerodb-core
+    cargo +nightly miri test -p zerodb-io --all-features --lib
+    cargo +nightly miri test -p heed --lib
+
+# Example: just sanitize thread
+#
+# The I/O layer's, the engine's and the heed adapter's tests under a sanitizer
+# (`thread` or `address`; nightly, Linux or macOS). Short stress runs keep it
+# within an hour.
+sanitize SANITIZER:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="$(rustc +nightly -vV | sed -n 's/^host: //p')"
+    export RUSTFLAGS="-Zsanitizer={{SANITIZER}}"
+    export RUSTDOCFLAGS="$RUSTFLAGS"
+    export CARGO_TARGET_DIR="target-sanitize-{{SANITIZER}}"
+    export ZERODB_STRESS_SECS=20
+    # Halt on the first report, so a race fails the job.
+    export TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1"
+    export ASAN_OPTIONS="detect_leaks=1 detect_stack_use_after_return=1"
+    cargo +nightly test -Zbuild-std --target "$target" -p zerodb-io --all-features
+    cargo +nightly test -Zbuild-std --target "$target" -p zerodb
+    cargo +nightly test -Zbuild-std --target "$target" -p heed
 
 # Only the loom_* tests run; the rest of the lib is compiled but filtered under
 # --cfg loom (loom primitives panic outside a model). --release per ADR-0006,
 # with debug assertions forced on: the pin path's slot ≤ snap debug_assert is
 # one of the suite's publish-inversion detectors.
 #
-# Loom model check of the reader table (ADR-0006).
+# Loom model check of the reader table, nested read txns, the stamp cache,
+# the handle memo, and the in-process and cross-process writer locks
+# (ADR-0006).
 loom:
     RUSTFLAGS="--cfg loom" CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo test -p zerodb-core --lib --release loom_
+
+# The free-list save with its pool draws cut off from the first round, then
+# after one round (ADR-0044, SPEC 05 GC-13a), over the engine's tests and the
+# crash smoke. The two skipped tests assert a file size and page numbers that
+# hold only when the save reuses pool pages.
+save-no-draw:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export CARGO_TARGET_DIR=target-save-no-draw
+    for rounds in 0 1; do
+        export RUSTFLAGS="--cfg zerodb_save_draw_rounds=\"$rounds\""
+        cargo test -p zerodb-core -p zerodb -- \
+            --skip over_cap_freed_set_spills_whole_to_gc_tree \
+            --skip delete_rebalance_logical_images_match_golden
+        cargo run -p zerodb-oracle --bin crash-harness -- --cycles 200
+    done
 
 # Unoptimized on purpose: debug assertions keep the writer-side GC shadow gate
 # armed. A ~5 s variant runs in the normal `cargo test` suite; this one runs
@@ -29,7 +73,10 @@ stress:
     ZERODB_STRESS_SECS=180 cargo test -p zerodb --test multi_process_stress -- --nocapture stress_
 
 # cargo-fuzz needs nightly. 10 min LMDB vs ZeroDB, then 2 min each of page
-# decoding, hostile-image open, and LMDB vs ZeroDB through the heed adapter.
+# decoding, hostile-image open, and LMDB vs ZeroDB through the heed adapter,
+# 3 min of the generated scenarios (comparators and `delete_range`, live
+# readers at several snapshots, reopen and read-only sequences, `MapFull`),
+# then 200 generated multi-process sequences.
 #
 # Fuzz gate for every change (CI runs it on every PR).
 fuzz-quick:
@@ -37,20 +84,32 @@ fuzz-quick:
     cargo +nightly fuzz run fuzz_page_decode -- -max_total_time=120
     cargo +nightly fuzz run fuzz_image_open -- -max_total_time=120
     ZERODB_FUZZ_PAIR=heed cargo +nightly fuzz run diff_ops -- -max_total_time=120
+    cargo +nightly fuzz run diff_scenarios -- -max_total_time=180 -max_len=1200 -len_control=0
+    ZERODB_MP_CASES=200 cargo test --release -p zerodb-oracle --test multi_process mp_generated
 
 # Nightly CI runs `just fuzz-long 12600` to fit GitHub's 6 h job cap; the 24 h
 # soak a consumer integration gate asks for needs a self-hosted box.
 #
-# Long differential fuzz: SECS native, then SECS/8 through the heed adapter.
+# Long differential fuzz: SECS native, then SECS/8 through the heed adapter,
+# SECS/8 of the generated scenarios and 2000 multi-process sequences.
 fuzz-long SECS='21600':
     cargo +nightly fuzz run diff_ops -- -max_total_time={{SECS}}
     ZERODB_FUZZ_PAIR=heed cargo +nightly fuzz run diff_ops -- -max_total_time=$(({{SECS}} / 8))
+    cargo +nightly fuzz run diff_scenarios -- -max_total_time=$(({{SECS}} / 8)) -max_len=1200 -len_control=0
+    ZERODB_MP_CASES=2000 cargo test --release -p zerodb-oracle --test multi_process mp_generated
 
 # Example: just fuzz-decode fuzz/artifacts/diff_ops/crash-…
 #
 # Print the engine mode and op sequence a diff_ops fuzz artifact decodes to.
 fuzz-decode ARTIFACT:
     cargo run -q -p zerodb-oracle --example decode_artifact -- '{{ARTIFACT}}'
+
+# Example: just fuzz-decode-scenario fuzz/artifacts/diff_scenarios/crash-…
+#
+# Print the scenario a diff_scenarios fuzz artifact decodes to, and its
+# minimized divergence.
+fuzz-decode-scenario ARTIFACT:
+    cargo run -q -p zerodb-oracle --example scenario_explore -- '{{ARTIFACT}}'
 
 # Crash-consistency smoke, run by CI on every PR.
 crash-test-quick:
@@ -64,6 +123,26 @@ crash-test-mp CYCLES='500':
 # The full crash run, nightly in CI.
 crash-test-full:
     cargo run -p zerodb-oracle --bin crash-harness -- --cycles 10000
+
+# Power loss below the file system: dm-log-writes on ext4 and XFS. Linux and
+# root only; settings through the environment (docs/maintainers/POWER-LOSS.md).
+power-loss:
+    sudo -E scripts/power-loss/run.sh
+
+# Needs a dedicated machine; docs/maintainers/HARDENING-RUNS.md says which and
+# how to record the result. HOURS, OUT and the worker counts are documented in
+# the header of scripts/soak.sh.
+#
+# Hardening soak: fuzz targets, crash harness and stress side by side for HOURS.
+soak HOURS='24':
+    HOURS={{HOURS}} scripts/soak.sh
+
+# Meant for a 64 KiB-page (or 16 KiB-page) kernel; see
+# docs/maintainers/HARDENING-RUNS.md. Options are in scripts/page-size-matrix.sh.
+#
+# Test suite, crash harness at 4/16/64 KiB DB pages, stress and fuzz, on this kernel.
+page-size-matrix:
+    scripts/page-size-matrix.sh
 
 # --- Engine comparison: zerodb vs the LMDB fork (heed), both in one binary ---
 #

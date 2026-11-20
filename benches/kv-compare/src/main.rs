@@ -46,6 +46,10 @@ struct Args {
     prefetch: bool,
     cache_mib: u64,
     map_gib: u64,
+    /// ZeroDB page size in KiB; 0 keeps the engine's default.
+    page_kib: u64,
+    /// Leave read-ahead on for LMDB and ZeroDB.
+    read_ahead: bool,
     label: String,
     out: Option<PathBuf>,
 }
@@ -55,7 +59,7 @@ fn usage() -> ! {
         "usage: kv-compare <load|get|range|write|mixed|grow> --engine <{}> --dir <path>\n\
          \x20 [--records N] [--value-size B] [--threads T] [--seconds S] [--batch K]\n\
          \x20 [--range-len L] [--durable] [--warmup S] [--prefetch] [--cache-mib M] [--map-gib G]\n\
-         \x20 [--label X] [--out FILE]",
+         \x20 [--page-kib K] [--read-ahead] [--label X] [--out FILE]",
         engine::ENGINES.join("|")
     );
     std::process::exit(2)
@@ -79,13 +83,16 @@ fn parse() -> Args {
         prefetch: false,
         cache_mib: 2048,
         map_gib: 1024,
+        page_kib: 0,
+        read_ahead: false,
         label: String::new(),
         out: None,
     };
     while let Some(flag) = it.next() {
-        if flag == "--durable" || flag == "--prefetch" {
+        if flag == "--durable" || flag == "--prefetch" || flag == "--read-ahead" {
             a.durable |= flag == "--durable";
             a.prefetch |= flag == "--prefetch";
+            a.read_ahead |= flag == "--read-ahead";
             continue;
         }
         let v = it.next().unwrap_or_else(|| usage());
@@ -106,6 +113,7 @@ fn parse() -> Args {
             "--range-len" => a.range_len = num() as usize,
             "--cache-mib" => a.cache_mib = num(),
             "--map-gib" => a.map_gib = num(),
+            "--page-kib" => a.page_kib = num(),
             "--label" => a.label = v.clone(),
             "--out" => a.out = Some(PathBuf::from(&v)),
             _ => usage(),
@@ -260,10 +268,13 @@ fn main() {
         cache_bytes: a.cache_mib << 20,
         connections: readers + usize::from(writes),
         map_bytes: (a.map_gib << 30) as usize,
+        page_size: (a.page_kib > 0).then_some((a.page_kib << 10) as u32),
+        read_ahead: a.read_ahead,
     };
     let values = Values::new(a.value_size);
     let written_before = stats::written_bytes();
     let device_before = stats::device_written_bytes();
+    let reads_before = stats::device_reads();
     if a.prefetch {
         stats::prefetch(&a.dir);
     }
@@ -343,6 +354,10 @@ fn main() {
         _ => usage(),
     };
 
+    // What the phase made the disk read, taken before the engine closes.
+    let device_reads = reads_before
+        .zip(stats::device_reads())
+        .map(|(b, a)| (a.0 - b.0, a.1 - b.1));
     let disk = stats::disk_bytes(&a.dir);
     // Closing the engine finishes its pending writes; count them too.
     drop(eng);
@@ -355,7 +370,7 @@ fn main() {
         unsafe { libc::sync() };
         delta(Some(before), stats::device_written_bytes())
     });
-    let line = report(&a, &out, disk, written, device);
+    let line = report(&a, &out, disk, written, device, device_reads);
     println!("{line}");
     if let Some(path) = &a.out {
         use std::io::Write as _;
@@ -368,7 +383,14 @@ fn main() {
     }
 }
 
-fn report(a: &Args, o: &Outcome, disk: u64, written: Option<u64>, device: Option<u64>) -> String {
+fn report(
+    a: &Args,
+    o: &Outcome,
+    disk: u64,
+    written: Option<u64>,
+    device: Option<u64>,
+    device_reads: Option<(u64, u64)>,
+) -> String {
     let us = |ns: u64| ns as f64 / 1000.0;
     let mut s = String::new();
     let opt = |v: Option<u64>| v.map_or("null".to_string(), |v| v.to_string());
@@ -405,11 +427,16 @@ fn report(a: &Args, o: &Outcome, disk: u64, written: Option<u64>, device: Option
     .unwrap();
     write!(
         s,
-        "\"disk_bytes\":{},\"written_bytes\":{},\"device_written_bytes\":{},\"peak_rss_bytes\":{},\
-         \"read_timeline\":[{}],\"write_timeline\":[{}]}}",
+        "\"disk_bytes\":{},\"written_bytes\":{},\"device_written_bytes\":{},\
+         \"device_read_ios\":{},\"device_read_bytes\":{},\"page_kib\":{},\"read_ahead\":{},\
+         \"peak_rss_bytes\":{},\"read_timeline\":[{}],\"write_timeline\":[{}]}}",
         disk,
         opt(written),
         opt(device),
+        opt(device_reads.map(|r| r.0)),
+        opt(device_reads.map(|r| r.1)),
+        a.page_kib,
+        a.read_ahead,
         stats::peak_rss(),
         list(&o.read_timeline),
         list(&o.write_timeline)

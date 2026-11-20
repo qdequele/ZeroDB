@@ -166,7 +166,7 @@ fn stress_readers_vs_writemap_in_place_writer() {
 }
 
 /// The in-place `WRITE_MAP` stress with map growth on (ADR-0036, SPEC 04
-/// TXN-74): the map and the file start at 64 KiB, so the seed and the first
+/// TXN-75): the map and the file start at 64 KiB, so the seed and the first
 /// churn txns grow both inside write txns, through several new mappings,
 /// while readers that began on older mappings keep reading. `just stress`
 /// runs it too.

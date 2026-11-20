@@ -187,48 +187,26 @@ pub fn render(dbs: &[DumpDb]) -> String {
 }
 
 /// A dump parse/validation error.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DumpError {
     /// The `VERSION=` line is missing, malformed, or an unsupported version.
+    #[error("bad or missing VERSION line: {0}")]
     BadVersion(String),
     /// A hex field could not be decoded.
+    #[error("bad hex field: {0}")]
     BadHex(String),
     /// A record line (leading space) had no matching value line.
+    #[error("record key without a value line")]
     DanglingKey,
     /// A structural line was unexpected at this point.
+    #[error("unexpected line: {0:?}")]
     Unexpected(String),
     /// The dump ended inside a block (no `DATA=END`).
+    #[error("dump truncated (no DATA=END)")]
     Truncated,
     /// Reading the dump failed.
-    Io(std::io::Error),
-}
-
-impl From<std::io::Error> for DumpError {
-    fn from(e: std::io::Error) -> Self {
-        DumpError::Io(e)
-    }
-}
-
-impl std::fmt::Display for DumpError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DumpError::BadVersion(s) => write!(f, "bad or missing VERSION line: {s}"),
-            DumpError::BadHex(s) => write!(f, "bad hex field: {s}"),
-            DumpError::DanglingKey => write!(f, "record key without a value line"),
-            DumpError::Unexpected(s) => write!(f, "unexpected line: {s:?}"),
-            DumpError::Truncated => write!(f, "dump truncated (no DATA=END)"),
-            DumpError::Io(e) => write!(f, "reading the dump: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for DumpError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            DumpError::Io(e) => Some(e),
-            _ => None,
-        }
-    }
+    #[error("reading the dump: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// Strip trailing ASCII whitespace (`\r`, spaces, tabs) from a line.
@@ -419,6 +397,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn error_messages_and_sources() {
+        use std::error::Error as _;
+        for (err, text, has_source) in [
+            (
+                DumpError::BadVersion("x".to_owned()),
+                "bad or missing VERSION line: x",
+                false,
+            ),
+            (
+                DumpError::BadHex("byte 0x7a".to_owned()),
+                "bad hex field: byte 0x7a",
+                false,
+            ),
+            (
+                DumpError::DanglingKey,
+                "record key without a value line",
+                false,
+            ),
+            (
+                DumpError::Unexpected("a\"b".to_owned()),
+                "unexpected line: \"a\\\"b\"",
+                false,
+            ),
+            (DumpError::Truncated, "dump truncated (no DATA=END)", false),
+            (
+                DumpError::from(std::io::Error::other("boom")),
+                "reading the dump: boom",
+                true,
+            ),
+        ] {
+            assert_eq!(err.to_string(), text);
+            assert_eq!(
+                err.source().map(ToString::to_string),
+                has_source.then(|| "boom".to_owned())
+            );
+        }
+    }
+
+    #[test]
     fn round_trip_render_parse() {
         let dbs = vec![
             DumpDb {
@@ -505,8 +522,8 @@ mod tests {
         assert_eq!(r.next_db().unwrap(), None);
     }
 
-    /// The parser `load` used before it streamed: the whole text through
-    /// `str::lines`. Kept as the reference [`parse`] must agree with.
+    /// A reference parser that reads the whole text through `str::lines`.
+    /// [`parse`] must agree with it.
     fn legacy_parse(text: &str) -> Result<Vec<DumpDb>, DumpError> {
         fn from_hex(s: &str) -> Result<Vec<u8>, DumpError> {
             let s = s.trim_end_matches(['\r']);
@@ -585,7 +602,7 @@ mod tests {
     }
 
     /// The streaming parser accepts and rejects exactly what the in-memory
-    /// parser did, with the same result and the same error kind, over
+    /// reference parser does, with the same result and the same error kind, over
     /// valid dumps and many single and double mutations of them (byte
     /// replaced, inserted or deleted, drawn from the characters the grammar
     /// cares about).

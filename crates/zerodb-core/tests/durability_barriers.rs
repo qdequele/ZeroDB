@@ -16,7 +16,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use zerodb_core::env::{open_with_backing, Backing, DurabilityFlags, MapView};
+use zerodb_core::env::{open_with_backing, Backing, DurabilityFlags, MapPages, MapView};
 use zerodb_core::page::MetaPage;
 
 const PS: u32 = 4096;
@@ -48,7 +48,7 @@ struct CountingBacking {
 impl Backing for CountingBacking {
     fn view(&self) -> MapView<'_> {
         MapView {
-            bytes: &self.data,
+            pages: MapPages::from_slice(&self.data),
             map_size: self.data.len() as u64,
         }
     }

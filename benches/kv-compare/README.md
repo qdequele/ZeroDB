@@ -89,6 +89,33 @@ counts and rates, p50/p99/p99.9 latencies, disk size, bytes written (by the
 process, and to the device named by `KVC_DEVICE`), peak memory, and a
 per-second timeline.
 
+## Cold-cache reads
+
+`cold.sh` measures the first reads of a process that has nothing cached, on a
+data set several times larger than its memory limit: the case of a search
+server after a restart, on storage where each read from disk is a network
+round trip (EBS). It runs LMDB and ZeroDB only, and adds two settings the
+main suite keeps fixed:
+
+- **ZeroDB's page size** (`--page-kib`). LMDB always uses the OS page size;
+  ZeroDB chooses its own at creation.
+- **Kernel read-ahead** (`--read-ahead`). Without the flag both engines open
+  with `NO_READ_AHEAD`, as in the main suite.
+
+Two data sets: 100-byte values, and 3,000-byte values, which a 4 KiB page
+stores in an overflow page and a 16 KiB page stores inline. Each measurement
+drops the page cache, starts a new process under the memory limit and runs
+with no warm-up. A read returns only after every byte of the value has been
+read, so a value in an overflow page costs its disk read. Besides latency, each result records how many read requests
+and bytes the block device served (`device_read_ios`, `device_read_bytes`),
+so the cost of one lookup is visible in disk requests.
+
+```bash
+cargo build --release
+DATA=/data/kvc nohup ./cold.sh > cold.log 2>&1 &
+python3 cold-report.py results/cold-<run>/results.jsonl
+```
+
 Building on macOS needs `libclang` for RocksDB's bindings:
 
 ```bash

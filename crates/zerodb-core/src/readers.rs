@@ -2,11 +2,10 @@
 //! TXN-14..22; ADR-0006).
 //!
 //! This module is the only place a reader and the writer communicate. It
-//! contains **no** `unsafe` (ADR-0006 Option B): the load-bearing lock-free
-//! protocol is carried entirely by the slot atomics and the `commit_point`
-//! atomic; the snapshot cell's mutex only manages the `Arc<Snapshot>`'s
-//! lifetime, with critical sections that are all bounded O(1) pointer
-//! operations (TXN-18).
+//! contains no `unsafe` (ADR-0006): the lock-free protocol is carried
+//! entirely by the slot atomics and the `commit_point` atomic; the snapshot
+//! cell's mutex only manages the `Arc<Snapshot>`'s lifetime, with critical
+//! sections that are all bounded O(1) pointer operations (TXN-18).
 //!
 //! Concurrency primitives come from [`crate::sync`], so the identical source
 //! runs natively (and under miri) and is model-checked under
@@ -19,8 +18,8 @@
 //! reader state. Without a lock file the table is in-process state, so a
 //! crashed process leaves no readers behind. With a lock file (ADR-0023) the
 //! table lives in the shared lock-file mapping and outlives a crashed process;
-//! that process's slots are then reaped by liveness (ADR-0023 §3,
-//! `ReaderTable::reap_dead`), or wiped by the next first opener.
+//! that process's slots are then reaped by liveness
+//! (`ReaderTable::reap_dead`), or wiped by the next first opener.
 
 use std::sync::Arc;
 
@@ -32,7 +31,7 @@ use crate::shared::{owner_generation, owner_pid, owner_word};
 /// The local slot type under loom: [`crate::shared::ReaderSlot`]'s fields and
 /// accessors over loom's atomics, which loom must see to model the protocol.
 /// The shipped build uses `ReaderSlot` itself, whose `std` atomics have the
-/// fixed lock-file layout (ADR-0023 §3).
+/// fixed lock-file layout (ADR-0023).
 #[cfg(loom)]
 struct Slot {
     txnid: AtomicU64,
@@ -60,19 +59,15 @@ use crate::sync::{AtomicU64, Mutex, Ordering};
 pub(crate) const RDR_FREE: u64 = u64::MAX;
 /// The largest committed txnid an env may carry (open-time bound, SPEC 06
 /// REC-1a): the slot word encodes occupancy via the sentinel band at the top
-/// of `u64`, so a *pinned* txnid must stay strictly below [`RDR_CLAIMED`] —
-/// and the next writer txnid is `meta.txnid + 1`, which must not wrap or
-/// enter the band either. A committed txnid above this is unreachable by any
-/// real workload (ids grow by one per commit) and therefore marks a corrupt
-/// or hostile meta; `open_with_backing` rejects it with `MdbError::Invalid`
-/// instead of letting `store_pin`'s TXN-14 assumption break.
+/// of `u64`, so a pinned txnid must stay strictly below [`RDR_CLAIMED`], and
+/// the next writer txnid, `meta.txnid + 1`, must not wrap or enter the band
+/// either. No real workload reaches such a txnid (ids grow by one per
+/// commit), so a larger one marks a corrupt or hostile meta;
+/// `open_with_backing` rejects it with `MdbError::Invalid`.
 ///
 /// The bound leaves a margin of 2^32 ids below the band, and `RwTxn::new`
-/// re-enforces it at runtime (a writer refuses to start once
-/// `base.txnid >= MAX_COMMITTED_TXNID`): an accepted file can therefore
-/// never *commit its way* into the band, however many transactions follow.
-/// (A margin of only a few ids would let a boundary-value hostile meta reach
-/// `RDR_CLAIMED` two commits after a successful open.)
+/// refuses to start a writer once `base.txnid >= MAX_COMMITTED_TXNID`, so an
+/// accepted file can never commit its way into the band.
 pub(crate) const MAX_COMMITTED_TXNID: u64 = RDR_CLAIMED - (1 << 32);
 
 /// Slot sentinel: reserved by a reader that has not yet published a real
@@ -102,10 +97,10 @@ enum Slots {
 /// aligned and 128 bytes long, which keeps a pinning reader's store and the
 /// writer's scan off each other's cache lines (TXN-14). A table opened with
 /// [`ReaderTable::new_shared`] has the same slot layout, but the slots live in
-/// a region shared with other processes (ADR-0023 §3) instead of on this heap.
+/// a region shared with other processes (ADR-0023) instead of on this heap.
 pub(crate) struct ReaderTable {
     slots: Slots,
-    /// This process's PID when the slots are shared (ADR-0023 §3): a claim
+    /// This process's PID when the slots are shared (ADR-0023): a claim
     /// records it in the slot's owner field and a release clears it. `None`
     /// for a local table, whose owner field is never written.
     owner_pid: Option<u32>,
@@ -130,7 +125,7 @@ impl ReaderTable {
         }
     }
 
-    /// A table whose slots live in a cross-process region (ADR-0023 §3). The
+    /// A table whose slots live in a cross-process region (ADR-0023). The
     /// claim, pin and release protocol is the same; claims also record the
     /// owner PID, which is how a dead process's slots are reaped.
     #[cfg(not(loom))]
@@ -181,11 +176,10 @@ impl ReaderTable {
     /// (ADR-0006): a stale bound could hide an already-pinned reader from
     /// the writer's scan, which is exactly the missed-pin bug.
     ///
-    /// **ADR-0006 still holds** despite the `high_water` counter maintained
-    /// below: that counter is written here but read *only* by
-    /// [`ReaderTable::num_readers`] (introspection). Neither this scan
-    /// nor the writer's [`ReaderTable::oldest`] scan consults it — both still
-    /// walk every slot, unconditionally.
+    /// The `high_water` counter maintained below is not such a shortcut: it
+    /// is read only by [`ReaderTable::num_readers`] (introspection). This
+    /// scan and the writer's [`ReaderTable::oldest`] scan both walk every
+    /// slot.
     pub(crate) fn claim(&self) -> Option<u32> {
         self.claim_as(self.owner_pid)
     }
@@ -222,7 +216,7 @@ impl ReaderTable {
                     // FREE only this claimer writes the word: a reaper's CAS
                     // needs a non-zero PID, and the word's PID is 0.
                     let w = rs.owner().load(Ordering::Relaxed);
-                    // Release: a later reaper (ADR-0023 §3) loads the word
+                    // Release: a later reaper (ADR-0023) loads the word
                     // with Acquire before judging the slot; this store must
                     // be visible no later than the pin that follows it. The
                     // generation increment makes the word unique to this
@@ -291,7 +285,7 @@ impl ReaderTable {
     ///    PID, which a reaper frees.
     /// 2. owner word with PID 0 and the generation kept (`Release`):
     ///    disowns. A death after this store leaves `CLAIMED` with no PID, the
-    ///    known leak (ADR-0023 §3), which pins nothing. The word is loaded
+    ///    known leak (ADR-0023), which pins nothing. The word is loaded
     ///    `Relaxed` first: its only writer while the owner lives is the owner.
     /// 3. `txnid = FREE` (`Release`): hands the slot over. The next claimer's
     ///    `Acquire` CAS on FREE also sees PID 0 before it stores its own word
@@ -299,8 +293,7 @@ impl ReaderTable {
     ///    then succeed only before step 2, and a reaper acts only on a dead
     ///    owner, which cannot be mid-release.
     ///
-    /// A local table (`owned == false`) does step 3 alone, as before
-    /// (TXN-18a).
+    /// A local table (`owned == false`) does step 3 alone (TXN-18a).
     pub(crate) fn release_as(&self, slot: u32, owned: bool) {
         let rs = &self.slots()[slot as usize];
         if owned {
@@ -335,7 +328,7 @@ impl ReaderTable {
     ///    writer reclaims.
     ///
     /// The whole table is scanned, always — max_readers SeqCst loads, at most
-    /// once per write txn (TXN-22 caching, ADR-0006 decision 6).
+    /// once per write txn (TXN-22 caching, ADR-0006).
     pub(crate) fn oldest(&self) -> Option<u64> {
         let mut oldest: Option<u64> = None;
         for rs in self.slots() {
@@ -355,11 +348,9 @@ impl ReaderTable {
     /// publish `commit_point`'s current value into the owned `slot`, re-read,
     /// and retry until the two agree; returns the verified pin `t`.
     ///
-    /// This is the **protocol core**, factored out of [`SnapshotCell::pin`]
-    /// so a mutex-free model (the ADR-0006 Option-D/E fallback world) can
-    /// drive the *same* code the shipped pin runs — see the mutation-check
-    /// record below for why no such loom test is committable with loom 0.7.
-    /// All accesses SeqCst; see [`ReaderTable::store_pin`]
+    /// This is the protocol core, separate from [`SnapshotCell::pin`] so the
+    /// in-process pin and the lock-file pin ([`ReaderTable::pin_against`])
+    /// run the same code. All accesses SeqCst; see [`ReaderTable::store_pin`]
     /// for the StoreLoad pairing argument. Liveness: the loop only retries
     /// while a commit is actively racing, and each commit strictly advances
     /// `commit_point`, so it terminates.
@@ -384,7 +375,7 @@ impl ReaderTable {
     /// slot keeps the last verified pin either way, which is conservative
     /// for the GC gate (TXN-20); the caller releases it on failure.
     ///
-    /// The lock-file reader (`EnvInner::pin_shared`, ADR-0023 §4) and the
+    /// The lock-file reader (`EnvInner::pin_shared`, ADR-0023) and the
     /// loom model of that protocol both run this function.
     // Under loom the library build (without the loom models) does not call it.
     #[cfg_attr(all(loom, not(test)), allow(dead_code))]
@@ -416,23 +407,17 @@ impl ReaderTable {
 
     /// `MDB_envinfo::me_numreaders` parity.
     ///
-    /// **This is a high-water mark, not a live count** — the surprising part,
-    /// verified against the fork's `mdb.c` (`mdb_txn_renew0`). LMDB allocates a
-    /// reader slot by first-fit scan and only ever *increments*
-    /// `mti_numreaders`, when the scan lands past the current high-water.
-    /// Ending a read txn clears the slot's `mr_pid` but leaves the counter
-    /// alone, so `me_numreaders` is the **maximum number of simultaneously
-    /// live readers ever observed** by the env, and it never decreases. LMDB's
-    /// own header documents it as "number of reader slots used", which is
-    /// misleading; the differential test in
-    /// `zerodb-oracle/tests/differential/env_info_differential.rs` observed the real
-    /// behavior. ZeroDB reproduces it exactly (LMDB parity) and offers
-    /// the genuinely-live count separately as [`ReaderTable::in_use`].
+    /// **This is a high-water mark, not a live count.** LMDB allocates a
+    /// reader slot by first-fit scan (`mdb_txn_renew0`) and only ever
+    /// increments `mti_numreaders`, when the scan lands past the current
+    /// high-water. Ending a read txn leaves the counter alone, so
+    /// `me_numreaders` is the maximum number of simultaneously live readers
+    /// the env has seen, and it never decreases. ZeroDB reproduces this and
+    /// offers the live count separately as [`ReaderTable::in_use`].
     ///
     /// LMDB keeps the counter in the lock file, so with several processes it
     /// counts every process's readers, and it restarts from 0 only when a
-    /// first opener initializes the lock file
-    /// (`OBS_NUMREADERS_OTHER_PROCESS`). A shared table derives the same
+    /// first opener initializes the lock file. A shared table derives the same
     /// value from the slots instead, without a counter in the lock file:
     /// claims are first-fit, so the slots ever claimed since the lock file
     /// was initialized are a prefix of the table, and the value is one past
@@ -443,8 +428,7 @@ impl ReaderTable {
     /// process's own claims still count through the local counter. SPEC 04
     /// TXN-73 states the rule and the invariants it depends on.
     ///
-    /// Logged in `docs/LMDB-COMPATIBILITY.md` (`me_numreaders` semantics; a PROPOSED
-    /// candidate for later redefinition, not approved).
+    /// See LMDB-COMPATIBILITY D-011.
     ///
     /// Relaxed load: introspection only, orders nothing (see [`ReaderTable::claim`]).
     pub(crate) fn num_readers(&self) -> u32 {
@@ -498,8 +482,7 @@ impl ReaderTable {
     /// value is a sample of a concurrently-mutating table and is only
     /// meaningful as a snapshot count. `RDR_CLAIMED` counts as occupied — the
     /// slot is owned. `SeqCst` for consistency with every other read of a slot
-    /// word (TXN-17/19/20); the cost is irrelevant on a diagnostic path and
-    /// using a weaker ordering here would need its own justification.
+    /// word (TXN-17/19/20); the cost does not matter on a diagnostic path.
     pub(crate) fn in_use(&self) -> u32 {
         self.slots()
             .iter()
@@ -507,8 +490,8 @@ impl ReaderTable {
             .count() as u32
     }
 
-    /// Free every slot whose owner process is dead (ADR-0023 §3 and
-    /// ADR-0023); returns how many slots were freed. `reaper` is
+    /// Free every slot whose owner process is dead (ADR-0023); returns how
+    /// many slots were freed. `reaper` is
     /// this process's PID: its own slots are never probed (a probe cannot see
     /// this process's own lock, and its stale own-PID slots were freed at
     /// open). `is_alive` is called at most once per distinct PID per call.
@@ -538,8 +521,7 @@ impl ReaderTable {
     /// satisfy a load after the probe and break B), keeping those with a
     /// non-zero PID other than `reaper` (PID 0 means free, being claimed or
     /// being released: presumed live); (2) probe each distinct PID found;
-    /// (3) for each
-    /// snapshot entry judged dead, `CAS word -> (generation + 1, reaper)`
+    /// (3) for each snapshot entry judged dead, `CAS word -> (generation + 1, reaper)`
     /// (`AcqRel` on success: it is the single linearization point that two
     /// reapers, or a reaper and a re-claim, contend on, and the `Acquire`
     /// half makes the dead owner's last stores visible before this reaper
@@ -619,7 +601,7 @@ impl ReaderTable {
     /// (invariant A of [`ReaderTable::reap_dead`]), so that CAS keeps
     /// failing. Then `txnid = FREE` (`Release`).
     /// Dying between the two stores leaves a pinned slot with PID 0 until
-    /// the next first-opener wipe: a one-store window, documented in the ADR.
+    /// the next first-opener wipe: a one-store window (ADR-0023).
     // loom builds compile no lock-file environment, so only the loom models
     // call this there.
     #[cfg_attr(all(loom, not(test)), allow(dead_code))]
@@ -653,19 +635,15 @@ impl ReaderTable {
     /// `RDR_CLAIMED` — owned by a reader that is mid-pin and has not yet
     /// published a snapshot txnid (SPEC 04 §4.3).
     ///
-    /// **The result is inherently stale.** Slots are read one at a time with
-    /// no global lock (there is none to take — SPEC 04 §4 is a lock-free
-    /// protocol), so this is not a linearizable snapshot of the whole table:
-    /// a reader can be born or die between two loads, and the returned vector
-    /// may correspond to no single instant. That is the honest and only
-    /// possible semantics for lock-free introspection, and it is why nothing
-    /// in the engine consults this — the GC gate uses
-    /// [`ReaderTable::oldest`], which is correct *because* a stale read there
-    /// can only under-estimate (TXN-20).
+    /// **The result may be stale.** Slots are read one at a time with no
+    /// global lock (SPEC 04 §4 is a lock-free protocol), so a reader can
+    /// start or end between two loads and the returned vector may correspond
+    /// to no single instant. Nothing in the engine consults this; the GC
+    /// gate uses [`ReaderTable::oldest`], where a stale read can only
+    /// under-estimate (TXN-20).
     ///
     /// `SeqCst` per slot, matching every other slot read (TXN-17/19/20); the
-    /// ordering buys nothing here beyond consistency of style, and the cost is
-    /// irrelevant on a diagnostic path.
+    /// cost does not matter on a diagnostic path.
     ///
     /// The third element is the owner PID, `None` for a local table or a slot
     /// whose PID word is 0 (being claimed or released). `Acquire`, as in
@@ -694,13 +672,13 @@ impl ReaderTable {
     }
 }
 
-/// The published-snapshot cell (SPEC 04 TXN-18; ADR-0006 Option B): a
+/// The published-snapshot cell (SPEC 04 TXN-18; ADR-0006): a
 /// `Mutex<Arc<Snapshot>>` whose critical sections are all bounded O(1) pointer
 /// operations (the writer's single swap per commit at C6; a reader's clone at
-/// pin), never held across I/O, allocation, or tree work — so no reader ever
-/// blocks on the write *transaction* (TXN-9), and the LMDB-NOTLS read-open
-/// parity bar (one mutex per open) is met. The mirroring `commit_point` atomic carries the entire
-/// lock-free pin protocol.
+/// pin), never held across I/O, allocation, or tree work, so no reader ever
+/// blocks on the write transaction (TXN-9). Opening a read txn takes one
+/// mutex, as LMDB's does under `MDB_NOTLS`. The mirroring `commit_point`
+/// atomic carries the entire lock-free pin protocol.
 pub(crate) struct SnapshotCell {
     /// The immutable `(txnid, roots)` object readers `Arc`-clone (TXN-18).
     cell: Mutex<Arc<Snapshot>>,
@@ -739,8 +717,8 @@ impl SnapshotCell {
     /// order: (1) swap the `Arc<Snapshot>` into the cell, then (2) store the
     /// commit point `SeqCst`. Object-before-counter guarantees a reader that
     /// observes the new counter can always clone the matching (or newer)
-    /// roots — inverting these two steps is the R3 publish-order trap
-    /// (ADR-0006), caught by loom L4.
+    /// roots. With the two steps inverted, a reader could pin a txnid newer
+    /// than the roots it clones (ADR-0006); loom L4 checks the order.
     ///
     /// Called only under the write mutex (C6), so publishes are serialized
     /// and `commit_point` is strictly monotone.
@@ -761,7 +739,7 @@ impl SnapshotCell {
         drop(old);
     }
 
-    /// Replace the cached snapshot with `snap` if it is newer (ADR-0023 §4:
+    /// Replace the cached snapshot with `snap` if it is newer (ADR-0023:
     /// a snapshot decoded after another process committed). Only snapshots
     /// validated against the published txnid are ever passed here. Does not
     /// touch `commit_point`, which lock-file environments do not pin against.
@@ -857,9 +835,8 @@ mod tests {
     #[test]
     fn zero_capacity_table_is_always_full() {
         // max_readers = 0 is degenerate but must not panic: every read txn
-        // fails ReadersFull. The fork instead rejects the open with EINVAL —
-        // filed in docs/LMDB-COMPATIBILITY.md (`max_readers(0)` at open); no consumer
-        // passes 0.
+        // fails ReadersFull. LMDB instead rejects the open with EINVAL
+        // (LMDB-COMPATIBILITY D-010).
         let t = ReaderTable::new(0);
         assert_eq!(t.claim(), None);
         assert_eq!(t.oldest(), None);
@@ -982,7 +959,7 @@ mod tests {
 
     #[test]
     fn shared_num_readers_counts_other_processes_and_never_drops() {
-        // `OBS_NUMREADERS_OTHER_PROCESS`: LMDB's `me_numreaders` is the
+        // LMDB's `me_numreaders` is the
         // shared high-water mark, so a process holding no reader sees another
         // process's readers, and the count stays after they end.
         let (region, other) = shared_table(8, 2);
@@ -1058,7 +1035,7 @@ mod tests {
 
     #[test]
     fn reap_skips_claimed_slots_without_a_pid() {
-        // The known leak (ADR-0023 §3): a claim CAS without its PID store.
+        // The known leak (ADR-0023): a claim CAS without its PID store.
         let (_region, t) = shared_table(2, 1);
         let s = t.claim_as(None).unwrap();
         assert_eq!(t.reap_dead(1, |_| Ok(false)).unwrap(), 0);
@@ -1185,17 +1162,18 @@ mod tests {
 
     #[test]
     fn reaper_chain_cannot_double_adopt_a_slot() {
-        // Dead P (2) pinned slot 0. Reaper R3 snapshots (g,2); meanwhile
-        // R1 adopts and dies, and a new process with reused PID 2 adopts
-        // dead R1's slot. R3's stale CAS must fail.
+        // A dead process with PID 2 pinned slot 0. The outer reaper (PID 3)
+        // loads its owner word; meanwhile a second reaper (PID 4) adopts the
+        // slot and dies, and a new process that reuses PID 2 adopts that dead
+        // reaper's slot. The outer reaper's stale CAS must fail.
         let (region, t) = shared_table(1, 1);
         let s = t.claim_as(Some(2)).unwrap();
         t.store_pin(s, 5);
         let n = t
             .reap_dead(3, |pid| {
                 assert_eq!(pid, 2);
-                // R1 (PID 4) adopts the slot, then dies mid-reap: model its
-                // adoption and nothing else.
+                // The second reaper (PID 4) adopts the slot, then dies
+                // mid-reap: model its adoption and nothing else.
                 let slot0 = &crate::shared::SharedRegion::slots(&*region)[0];
                 let w = slot0.owner().load(Ordering::SeqCst);
                 let adopted = owner_word(owner_generation(w).wrapping_add(1), 4);
@@ -1203,12 +1181,12 @@ mod tests {
                     .owner()
                     .compare_exchange(w, adopted, Ordering::SeqCst, Ordering::SeqCst)
                     .unwrap();
-                // The new process with PID 2 reaps dead R1's slot.
+                // The new process with PID 2 reaps the dead reaper's slot.
                 assert_eq!(t.reap_dead(2, |p| Ok(p != 4)).unwrap(), 1);
                 // ...and re-claims it.
                 let again = t.claim_as(Some(2)).unwrap();
                 t.store_pin(again, 6);
-                Ok(false) // R3's verdict on the old process 2
+                Ok(false) // the outer reaper's verdict on the old process 2
             })
             .unwrap();
         assert_eq!(n, 0, "a stale reaper adopted a slot through a reaper chain");
@@ -1278,39 +1256,22 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// The loom suite (the reader table's model-checking gate; ADR-0006 and
-// ADR-0023, L1–L11). Runs only
-// under `just loom` (`RUSTFLAGS="--cfg loom" cargo test -p zerodb-core --lib
+// The loom suite (ADR-0006 and ADR-0023, L1–L11). Runs only under
+// `just loom` (`RUSTFLAGS="--cfg loom" cargo test -p zerodb-core --lib
 // loom_`). Models are deliberately tiny (≤ 2 spawned threads + main) so loom
 // explores them exhaustively.
 //
-// Mutation-check record (ADR-0006):
+// What the suite checks: the claim, pin, release and reap protocol, and the
+// TXN-19 publish order (swap the object, then store the counter).
 //
-// (a) Inverting the TXN-19 publish order (counter before object) fails
-//     L2 + L4 + L5 — the genuinely load-bearing order under Option B is
-//     machine-checked.
-// (b) Weakening the pin store to `Release` or the scan load to `Relaxed`
-//     does NOT fail this suite, for two stacked reasons:
-//     (i) in the faithful with-mutex models the weakenings are genuinely
-//     safe — the cell mutex creates happens-before chains (an old reader's
-//     pin-completing clone-unlock HB every later publish/begin lock HB the
-//     scan) that keep old pins visible, while a mid-pin reader lands
-//     `≥ N − 1` and is safe to miss (TXN-20 case 2); (ii) loom 0.7 CANNOT
-//     detect SC-access weakenings at all — a mutex-free "L2b" model (pin via
-//     `publish_and_verify` against a bare commit-point atomic, the ADR-0006
-//     Option-D/E fallback world) is not committable because loom reports
-//     the Dekker violation even for the correct all-SeqCst code, and a
-//     minimal all-SeqCst store-buffer litmus run under loom 0.7 confirms it
-//     explores the both-miss outcome C++20 (P0668) and AArch64 RCsc forbid:
-//     loom implements the pre-repair SC-access semantics (its SC support is
-//     fence-oriented; tokio-rs/loom#180 class). A test that fails on correct
-//     code cannot be committed.
-// The SeqCst sites are therefore guarded by SPEC 04 TXN-17/20 (normative),
-// the per-site justification comments, this record, and ADR-0006: any
-// future migration to the Option-D/E lock-free cell MUST bring its own
-// StoreLoad verification (an SC-fence reformulation loom can check,
-// a different checker, or hardware litmus runs) as a precondition — the
-// mutex HB chains that make the weakenings survivable today vanish there.
+// Its limit: it does not detect a `SeqCst` access weakened to a weaker
+// ordering. Loom 0.7 explores, for all-`SeqCst` store-then-load pairs on two
+// threads, the outcome where both loads miss the other thread's store, which
+// C++20 and AArch64 forbid. A model without the cell mutex therefore fails
+// on correct code, and in the models with the mutex its happens-before edges
+// hide the weakening. The `SeqCst` sites rest on SPEC 04 TXN-17/20 and the
+// comments at each site. Replacing the mutex-backed cell with a lock-free
+// one needs its own verification of those store-then-load pairs.
 // ---------------------------------------------------------------------------
 
 #[cfg(all(test, loom))]
@@ -1400,10 +1361,11 @@ mod loom_tests {
     /// reclamation back) but never anything else; after the join the slot is
     /// observably free and reclaimable (TXN-18a / TXN-20 closing argument).
     ///
-    /// Note: this is a **one-sided** (never-unsafe) property. The
-    /// test cannot distinguish "the scan read a stale pre-release value" from
-    /// "the scan simply ran before the release" — both yield `Some(5)` — so
-    /// it pins conservatism and post-join visibility, not scan precision.
+    /// This is a one-sided (never-unsafe) property. The test cannot
+    /// distinguish "the scan read a stale pre-release value" from "the scan
+    /// ran before the release" (both yield `Some(5)`), so it checks that the
+    /// scan is conservative and that the release is visible after the join,
+    /// not that the scan is precise.
     #[test]
     fn loom_l3_release_vs_oldest_scan() {
         loom::model(|| {
@@ -1499,7 +1461,7 @@ mod loom_tests {
 
     /// L6 — two reapers race on one dead slot: it is freed exactly once
     /// (the counts sum to 1), and afterwards the slot is FREE, unowned and
-    /// claimable (ADR-0023 §3).
+    /// claimable (ADR-0023).
     #[test]
     fn loom_l6_two_reapers_one_dead_slot() {
         loom::model(|| {
@@ -1556,7 +1518,7 @@ mod loom_tests {
     /// L8 — claim / pin / release by a live process races a reap scan that
     /// sees no dead owners, against the writer's `oldest()` scan: the
     /// reaper's loads do not disturb the live reader's claim, pin or release,
-    /// nor the scan, which reports only the live pin or nothing (ADR-0023 §3,
+    /// nor the scan, which reports only the live pin or nothing (ADR-0023,
     /// TXN-20). That a reaper never frees a live slot is carried by L7 and
     /// L11.
     #[test]
@@ -1584,7 +1546,7 @@ mod loom_tests {
     /// modeled `Relaxed`; it is a `pwrite`), then stores T = N `SeqCst`, then
     /// (as the next writer) computes the GC gate with seed N. The reader runs
     /// `pin_against`, resolving t by reading meta slot `t & 1` and accepting
-    /// only a txnid equal to t (ADR-0023 §4). In every
+    /// only a txnid equal to t (ADR-0023). In every
     /// interleaving the reader resolves a snapshot whose txnid equals its
     /// pin.
     ///
@@ -1592,11 +1554,10 @@ mod loom_tests {
     /// writer's GC gate (TXN-20), is the store-buffering (Dekker) pattern:
     /// the reader stores its pin then re-reads T, the writer stores T then
     /// scans the pins, all `SeqCst`. Loom 0.7 reports a both-miss outcome
-    /// for it even though C++20 and AArch64 forbid it (see the mutation-check
-    /// record above, tokio-rs/loom#180), so that assertion cannot be made
-    /// here: with it, this model fails on the correct code, and it passes
-    /// only once `SeqCst` fences are added on both sides. It is guarded by
-    /// TXN-17/20 and the per-site comments instead.
+    /// for it even though C++20 and AArch64 forbid it (see the note above
+    /// this module), so that assertion cannot be made here: with it, this
+    /// model fails on the correct code. It rests on TXN-17/20 and the
+    /// comments at each site instead.
     #[test]
     fn loom_l9_pin_against_shared_t() {
         use std::sync::atomic::{AtomicBool as StdBool, Ordering as SO};

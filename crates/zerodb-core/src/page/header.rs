@@ -37,9 +37,9 @@ pub(crate) const OFF_VARIANT: usize = 24;
 
 /// The three universal fields of the common page header.
 ///
-/// `reserved0` and `checksum` (the planned data-page checksum) are always zero
-/// today and are not represented here; the variant tail (offsets 24–31) is
-/// interpreted by the type-specific views.
+/// `reserved0` and `checksum` (reserved for a data-page checksum) are always
+/// zero in the current format and are not represented here; the variant tail
+/// (offsets 24–31) is interpreted by the type-specific views.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommonHeader {
     /// This page's own number.
@@ -51,10 +51,10 @@ pub struct CommonHeader {
 }
 
 /// The `flags` field alone (header offset 16), for the page-view constructors
-/// that only classify the page: decoding the whole [`CommonHeader`] would also
-/// read `pgno` and `txnid`, two bounds-checked loads LLVM cannot drop even
-/// though nothing uses them (an out-of-line `read_u64` in the hannoy search
-/// profile). LMDB reads just the field it tests (`IS_LEAF(mp)`).
+/// that only classify the page. Decoding the whole [`CommonHeader`] would also
+/// read `pgno` and `txnid`, two bounds-checked loads the compiler does not
+/// remove even though nothing uses them. LMDB likewise reads just the field
+/// it tests (`IS_LEAF(mp)`).
 ///
 /// The caller must guarantee `buf.len() >= HEADER_SIZE`.
 #[inline]
@@ -123,12 +123,10 @@ impl<'a> PageRef<'a> {
         Self::new_trusted_psize(buf, psize)
     }
 
-    /// [`PageRef::new`] minus the `validate_page_size` re-check, for the
-    /// engine's per-page-load hot path (`btree::node_view`): the page size is
-    /// validated once at env open and is immutable after, so re-validating it
-    /// on every page load only costs time. All per-buffer checks (length,
-    /// type classification) are kept — this trusts only `psize`, never the
-    /// bytes.
+    /// [`PageRef::new`] without the `validate_page_size` check, for loading a
+    /// page during a descent: the page size is validated once at env open and
+    /// never changes. The per-buffer checks (length, type classification) are
+    /// kept, so this trusts only `psize`, never the bytes.
     pub(crate) fn new_trusted_psize(buf: &'a [u8], psize: u32) -> Result<PageRef<'a>, PageError> {
         if buf.len() < psize as usize {
             return Err(PageError::BufferTooSmall {
@@ -163,8 +161,8 @@ impl<'a> PageRef<'a> {
         read_u16(self.buf, OFF_FLAGS)
     }
 
-    /// The planned data-page checksum field (header offset 20). Always zero
-    /// today; exposed for completeness and future use.
+    /// The data-page checksum field (header offset 20). Reserved: always zero
+    /// in the current format.
     #[must_use]
     pub fn checksum(&self) -> u32 {
         read_u32(self.buf, OFF_CHECKSUM)

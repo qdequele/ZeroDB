@@ -83,7 +83,7 @@ Prior art (clean-room, algorithm-level):
   behind the same single-word pin; see D1's amendment.)*
 
 Constraints from standing law: `zerodb-core` is `#![forbid(unsafe_code)]`
-(M1.1 posture; zero unsafe blocks to date — AGENTS.md *permits* unsafe in the
+(M1.1 posture; zero unsafe blocks to date — CONTRIBUTING.md *permits* unsafe in the
 reader table but M1.1 chose stricter, and every milestone since has preserved
 it). Dependency allowlist: memmap2, libc, thiserror, **crossbeam-utils**,
 rand, proptest, arbitrary, criterion — `loom` and `arc-swap` are **not** on
@@ -262,7 +262,7 @@ TXN-19 object-before-counter order is what makes this a one-way check.
   pointer ops) rather than wait-freedom. Flagged for ratification with this
   ADR.
 - Quantification obligation: no performance claim without a criterion diff
-  (AGENTS.md). The milestone adds a `read_txn_open` bench (zerodb vs heed/
+  (CONTRIBUTING.md). The milestone adds a `read_txn_open` bench (zerodb vs heed/
   the fork through the oracle's dependency) so the "at or below the bar"
   argument is measured, not asserted. Non-blocking for acceptance; if the
   bench shows the cell dominating open cost, the escape hatch is Option D

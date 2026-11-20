@@ -447,9 +447,9 @@ Built on the spike, after merging main (on-disk format 3):
   `mmap` call, so deferring would break an invariant to save nothing
   measurable. This replaces the Decision's sentence about deferral.
 - **Docs:** SPEC 02 §8 (map growth bullet, `resize`, mapping strategy,
-  `MapFull`), SPEC 04 TXN-74 (new rule) and the begin checks, SPEC 05 GC-17,
+  `MapFull`), SPEC 04 TXN-75 (new rule) and the begin checks, SPEC 05 GC-17,
   the `mmap.rs` aliasing contract (stated per file page across mappings),
-  `docs/LMDB-COMPATIBILITY.md` (option row, D-028), `docs/USING.md`. D-024
+  `docs/LMDB-COMPATIBILITY.md` (option row, D-031), `docs/USING.md`. D-024
   needs no change: a `WRITE_MAP` joiner grows the file to its logical size,
   which is its map size.
 

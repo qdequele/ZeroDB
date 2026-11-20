@@ -1,4 +1,4 @@
-//! Bulk-write census under `WRITE_MAP` (issue #13): the shapes of the ladder
+//! Bulk-write census under `WRITE_MAP`: the shapes of the ladder
 //! rungs `put/order/seq`, `put/order/rand`, `put/val/v4k` and
 //! `commit/batch/n10k`, each timed over many fresh envs, reporting the
 //! minimum and the median ns per put. The minimum is the number to compare

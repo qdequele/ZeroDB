@@ -586,8 +586,8 @@ mod tests {
 
     #[test]
     fn a_recycled_memo_starts_empty() {
-        // Issue #8: a write txn reuses the previous one's memo allocation,
-        // but none of its verdicts.
+        // A write txn reuses the previous one's memo allocation, but none of
+        // its verdicts.
         let h = HandleTable::new(4);
         let mut w = h.begin();
         let (s, g, _) = h.open(&w, b"a", |_| true).unwrap();
@@ -760,9 +760,7 @@ mod tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// loom: the MemoCell seqlock (run via `just loom`, tests filtered `loom_`).
-// ---------------------------------------------------------------------------
+// Loom model of the `MemoCell` seqlock. Run with `just loom`.
 
 #[cfg(all(test, loom))]
 mod loom_tests {

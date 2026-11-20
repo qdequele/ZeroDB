@@ -7,6 +7,9 @@
 //!               [--repro image:SEED|sigkill:SEED|mp:SEED] [--keep-going] [--isolate]
 //! ```
 //!
+//! `ZERODB_CRASH_PAGE_SIZE=<bytes>` pins every cycle's page size (a power of
+//! two in 4096..=65536); unset, a cycle draws 4 KiB or 8 KiB from its seed.
+//!
 //! One **cycle** = one recovered-and-verified crash state (ADR-0008).
 //! `--mechanism both` (default) targets ≈80% image / 20% SIGKILL **by cycle**
 //! (one image cut ≈ `--variants` cycles, one SIGKILL cut = 1, hence a 1:3
@@ -34,6 +37,7 @@ use zerodb_oracle::crash::{
     image::{run_image_cut, ImageOpts},
     multiproc::{reader_run, run_mp_cycle},
     sigkill::{child_run, run_sigkill_cycle, SigkillOpts},
+    workload::{page_size_override, PAGE_SIZE_ENV},
     CutReport, Mode,
 };
 
@@ -234,6 +238,9 @@ fn main() {
     }
 
     let args = parse_args();
+    if let Some(ps) = page_size_override() {
+        eprintln!("{PAGE_SIZE_ENV}={ps}: every cycle uses {ps}-byte pages");
+    }
     let exe = std::env::current_exe().expect("own executable path");
     let repro_dir = PathBuf::from("target/crash-repro");
 
