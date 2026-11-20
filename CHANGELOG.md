@@ -74,6 +74,13 @@ the release workflow publishes the section matching the tag as the GitHub releas
   `check_snapshot_with_key_order`: a caller that holds a database's custom
   comparator can have key order checked under it, or skipped. `check_image`,
   `check_snapshot` and `zerodb-tools check` are unchanged.
+- Verification of the `unsafe` code: miri now also runs `zerodb-io`'s
+  file-free unit tests and `heed-zerodb`'s unit tests (`just miri`); loom
+  models the in-process writer lock and the Linux cross-process writer word,
+  whose protocol moved unchanged into `zerodb_core::writer_word`; a nightly CI
+  job runs the tests under ThreadSanitizer and AddressSanitizer
+  (`just sanitize`). A brief for an outside review is in
+  `docs/maintainers/UNSAFE-AUDIT.md`.
 - **More of the heed surface compared with LMDB by generated tests.** The
   oracle's `scenario` module generates sequences with `delete_range`, custom
   key comparators, several read transactions at different snapshots while a
@@ -85,6 +92,13 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ### Changed
 
+- `zerodb-core` lends the map as `zerodb_core::page::MapPages`, a view that
+  hands out page-bounded slices, instead of a whole-map `&[u8]` (ADR-0021
+  amendment 1). Breaking for `zerodb-core` callers: `RoTxn::map_bytes` is now
+  `RoTxn::map_pages`, `check::check_snapshot` and
+  `check_snapshot_with_key_order` take a `MapPages`, `MapView::bytes` is now
+  `MapView::pages` and `Backing::bytes` is now `Backing::pages`. The heed
+  adapter and the `zerodb` API are unchanged.
 - **Pages are trusted by default, as in LMDB** (ADR-0034). An environment
   no longer validates every page it reads unless opened with
   `file_trust(FileTrust::VALIDATE)`; a corrupt file is then undefined
@@ -291,6 +305,18 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
   numbers at once (#123).
 - Under corruption, a page error met while `skip` crosses leaves is returned
   as an item instead of ending the iterator silently.
+
+- A read transaction in one thread no longer holds a borrow of the whole
+  map while the writer of the same process stores into free pages of it
+  (in place under `WRITE_MAP`, by `pwrite` otherwise). The bytes read were
+  never written, but the borrow covered bytes that changed, which Rust's
+  aliasing rules forbid; miri reported it. Every borrow now covers only the
+  page, overflow run or value read, and the raw `Env::copy` writes the map to
+  the file with `pwrite` from the map's address (ADR-0021 amendment 1).
+- The safety contract of the heed adapter's write-iterator `unsafe fn`s
+  (`del_current`, `put_current` and the other cursor writes) now matches
+  heed's: no key or value the iterator yielded may be held across the call,
+  not only the current entry's.
 
 ### Removed
 

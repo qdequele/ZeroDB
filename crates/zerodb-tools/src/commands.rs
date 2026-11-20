@@ -307,7 +307,7 @@ fn load_batched(
 /// Any invariant violation, named with `what`, or the read txn's error.
 pub(crate) fn verify_written_env(env: &Env, what: &str) -> Result<(), BoxErr> {
     let txn = read_txn(env)?;
-    let violations = check_snapshot(txn.map_bytes(), env.page_size(), txn.snapshot());
+    let violations = check_snapshot(txn.map_pages(), env.page_size(), txn.snapshot());
     if !violations.is_empty() {
         return Err(format!(
             "{what} env failed the invariant check ({} violations): {:?}",
@@ -652,7 +652,7 @@ pub fn cmd_check(env_dir: &Path) -> Result<(String, bool), BoxErr> {
     };
     let txn = read_txn(&env)?;
     let psize = env.page_size();
-    let violations = check_snapshot(txn.map_bytes(), psize, txn.snapshot());
+    let violations = check_snapshot(txn.map_pages(), psize, txn.snapshot());
     let mut out = String::new();
     writeln!(
         out,
@@ -731,7 +731,9 @@ fn check_raw_file(env_dir: &Path, data: &Path) -> Result<(String, bool), BoxErr>
         // file itself, whatever map size its metas name.
         match zerodb_io::open_or_create(data, psize, Some(file_len), file_len, true, false) {
             Ok(opened) => {
-                let map = opened.backing.view().bytes;
+                // The tool's own process runs no write txn on this file, so
+                // a whole-file borrow is sound here (`MapPages::whole`).
+                let map = opened.backing.pages().whole();
                 // Only the bytes the file holds now: a map page past the
                 // file's end cannot be read.
                 let len = usize::try_from(opened.backing.real_disk_size()?)

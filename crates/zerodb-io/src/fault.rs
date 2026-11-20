@@ -524,7 +524,7 @@ impl FaultHandle {
             psize: st.psize,
             durable: st.durable.clone(),
             durable_len: st.durable_len,
-            pending: st.pending_with_regions(self.live.bytes()),
+            pending: st.pending_with_regions(self.live.pages().whole()),
         }
     }
 
@@ -597,7 +597,8 @@ impl FaultBacking {
         psize: u32,
     ) -> std::io::Result<(FaultBacking, FaultHandle)> {
         let len = inner.real_disk_size()? as usize;
-        let durable = inner.bytes()[..len.min(inner.bytes().len())].to_vec();
+        let whole = inner.pages().whole();
+        let durable = whole[..len.min(whole.len())].to_vec();
         let durable_len = durable.len() as u64;
         Self::wrap_with_initial(inner, psize, durable, durable_len)
     }
@@ -768,14 +769,14 @@ impl Backing for FaultBacking {
         {
             let mut st = self.state.lock().expect("fault state lock");
             if let Some(failure) = st.trip(IoOp::Sync) {
-                st.fail_sync(self.inner.bytes());
+                st.fail_sync(self.inner.pages().whole());
                 return Err(failure.error());
             }
             // ADR-0021: any flush call is a seal point — resolve the
             // brokered regions' current bytes into pending records (C3 runs
             // before C4, so data records precede the meta's; under MAP_ASYNC
             // this also seals per-commit versions without folding).
-            st.seal_map_regions(self.inner.bytes());
+            st.seal_map_regions(self.inner.pages().whole());
             if async_flush {
                 // REC-9/REC-11: MS_ASYNC completes with no durability
                 // guarantee — pending stays pending (not a barrier).
@@ -805,12 +806,12 @@ impl Backing for FaultBacking {
             if let Some(failure) = st.trip(IoOp::Sync) {
                 // A failed ranged `msync` vouches for nothing either: the
                 // whole journal goes to the limbo, not only the ranges.
-                st.fail_sync(self.inner.bytes());
+                st.fail_sync(self.inner.pages().whole());
                 return Err(failure.error());
             }
             // A seal point like `sync`: the brokered regions' current bytes
             // become pending records first, so the ranged fold sees them.
-            st.seal_map_regions(self.inner.bytes());
+            st.seal_map_regions(self.inner.pages().whole());
             if async_flush {
                 st.stats.async_flushes += 1;
             } else {
@@ -1217,7 +1218,7 @@ mod tests {
     impl Backing for NullInner {
         fn view(&self) -> MapView<'_> {
             MapView {
-                bytes: &[],
+                pages: zerodb_core::env::MapPages::empty(),
                 map_size: 0,
             }
         }
@@ -1525,7 +1526,7 @@ mod tests {
     impl Backing for GrowLog {
         fn view(&self) -> MapView<'_> {
             MapView {
-                bytes: &[],
+                pages: zerodb_core::env::MapPages::empty(),
                 map_size: 0,
             }
         }

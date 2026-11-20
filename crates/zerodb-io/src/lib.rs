@@ -23,7 +23,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub use file::probe_page_size;
+pub use file::{probe_page_size, write_map_range};
 
 use mmap::{MapRegions, Mapping, Mmap, MmapWritable};
 use zerodb_core::env::{Backing, MapView};
@@ -35,7 +35,7 @@ use zerodb_core::page::{MetaPage, MetaValidity};
 fn map_view(regions: &MapRegions) -> MapView<'_> {
     let (mapping, map_size) = regions.view();
     MapView {
-        bytes: mapping.bytes(),
+        pages: mapping.pages(),
         map_size,
     }
 }
@@ -65,7 +65,7 @@ fn grow_regions(
     map_size: u64,
     map: impl Fn(usize) -> std::io::Result<Mapping>,
 ) -> std::io::Result<()> {
-    let current = regions.view().0.bytes().len() as u64;
+    let current = regions.view().0.len() as u64;
     if map_size <= current {
         regions.publish(None, map_size);
         return Ok(());
@@ -322,8 +322,8 @@ impl Backing for WriteMapBacking {
             return None;
         }
         // SAFETY: the caller of this `unsafe fn` upholds `slice_mut`'s
-        // contract (single writer, an unshared page, one live `&mut`, views
-        // re-derived after each spill), forwarded unchanged.
+        // contract (single writer, an unshared page, one live `&mut`, no
+        // borrow covering the region), forwarded unchanged.
         Some(unsafe { map.slice_mut(off, len) })
     }
 
@@ -711,6 +711,7 @@ mod tests {
     /// The ranged barrier runs on a real writable map, and a range past the
     /// map is an error, not a panic or a silent no-op.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn writemap_sync_pages_flushes_ranges_and_rejects_out_of_map() {
         const PS: u32 = 4096;
         const MAP: u64 = 1 << 20;
@@ -722,7 +723,7 @@ mod tests {
         b.sync_pages(false, PS, &[(0, 2), (5, 1)]).unwrap();
         b.sync_pages(true, PS, &[(5, 1)]).unwrap();
         assert_eq!(
-            &b.bytes()[5 * PS as usize..6 * PS as usize],
+            b.pages().get(5 * PS as usize, PS as usize).unwrap(),
             &[0xA5; PS as usize][..]
         );
         let past = MAP / u64::from(PS);
@@ -753,6 +754,7 @@ mod tests {
     /// A persisted meta `map_size` above `MAX_MAP_SIZE` is corrupt: the open
     /// fails with `Invalid` before mapping it, whatever size is requested.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn persisted_map_size_above_the_cap_is_invalid() {
         let path = TempFile::new("cap");
         drop(crate::file::create_env_file(&path.0, 4096, MAX_MAP_SIZE + 4096).expect("create"));
@@ -779,7 +781,7 @@ mod tests {
         let regions = MapRegions::new(Mapping::Heap(vec![0u8; 100].into_boxed_slice()), 80);
         let lens = |r: &MapRegions| {
             let (m, size) = r.view();
-            (m.bytes().len(), size)
+            (m.len(), size)
         };
 
         // Inside the mapping: no new mapping, smaller or larger.
@@ -823,6 +825,7 @@ mod tests {
     /// A requested `map_size` above the cap is refused before the data file
     /// is created.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn requested_map_size_above_the_cap_creates_nothing() {
         let path = TempFile::new("cap-req");
         match open_or_create(&path.0, 4096, Some(MAX_MAP_SIZE + 1), 1 << 20, false, false) {

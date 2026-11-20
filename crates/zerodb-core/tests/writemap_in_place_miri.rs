@@ -4,15 +4,16 @@
 //! The real writable map is OS memory miri cannot see, so this battery runs
 //! the full write-txn surface over `zerodb_io::testmap::TestWriteMap` — an
 //! `UnsafeCell<Box<[u8]>>`-backed `Backing` with `dirty_in_map() = true`
-//! whose brokered `&mut` regions and whole-map `&[u8]` views are plain heap
-//! memory Stacked/Tree Borrows fully check. What this proves on every run:
+//! whose brokered `&mut` regions and page-bounded `&[u8]` views are plain
+//! heap memory Stacked/Tree Borrows fully check. What this proves on every run:
 //!
 //! - the brokered `&mut` (ADR-0021) is exclusive in practice: no two live
 //!   mutable views of one region, every view transient and re-tied to
 //!   `&mut` on the dirty store (TXN-39/41/42);
-//! - the writer's whole-map `&[u8]` is re-derived at every spill (ADR-0021
-//!   B2), so no stale shared borrow is ever read at locations an in-place
-//!   write touched (TXN-71) — the Tree-Borrows hazard ADR-0021 names;
+//! - no borrow of the map, the writer's or a reader's, covers bytes an
+//!   in-place store touches: every borrow covers exactly the page or run it
+//!   reads (ADR-0021 amendment 1), including a reader in another thread
+//!   while the writer stores into free pages below its high-water;
 //! - readers holding snapshots across in-place commits, nested read children
 //!   of the writer, `put_reserved` closures, the general split's scratch
 //!   copy and abort-by-drop all stay inside the discipline.
@@ -22,7 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use zerodb_core::env::{open_with_backing_policy, DurabilityFlags, Env};
 use zerodb_core::page::FileTrust;
@@ -283,4 +284,65 @@ fn frame_bits_under_miri() {
             "committed state"
         );
     }
+}
+
+/// A reader in another thread while the writer stores in place into free
+/// pages below the reader's high-water (ADR-0021 amendment 1). The seed
+/// commits leave free pages that the writer may reuse once the reader pins
+/// its snapshot; every in-place store into them happens while the reader
+/// thread walks the tree. Under the old whole-map views miri reported this
+/// as UB under both aliasing models.
+#[test]
+fn reader_thread_during_in_place_commits_under_miri() {
+    let env = wm_env(None);
+    let db = env.main_database();
+    // Seed: write, then overwrite every value, so the first commit's pages
+    // are freed and become reusable after a third commit.
+    for round in 0..3u8 {
+        let mut w = env.write_txn().expect("seed txn");
+        for i in 0..40u32 {
+            let len = if i % 8 == 0 { 5_000 } else { 120 };
+            db.put(
+                &mut w,
+                format!("k{i:03}").as_bytes(),
+                &vec![b'a' + round; len],
+            )
+            .expect("seed put");
+        }
+        w.commit().expect("seed commit");
+    }
+    let r = env.read_txn().expect("pinned reader");
+    let pinned = contents(&r, db);
+    let done = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let (env, done, pinned) = (&env, &done, &pinned);
+        let reader = s.spawn(move || {
+            let mut walks = 0u32;
+            // At least two walks, and keep walking until the writer is done.
+            while walks < 2 || !done.load(Ordering::Acquire) {
+                let r = env.read_txn().expect("thread reader");
+                let now = contents(&r, db);
+                assert_eq!(now.len(), 40, "every key present in every snapshot");
+                walks += 1;
+            }
+            walks
+        });
+        for round in 0..3u8 {
+            let mut w = env.write_txn().expect("write txn");
+            assert!(w.dirty_in_map_mode(), "in-place WRITE_MAP must be active");
+            for i in (0..40u32).step_by(3) {
+                let len = if i % 6 == 0 { 6_000 } else { 200 };
+                db.put(
+                    &mut w,
+                    format!("k{i:03}").as_bytes(),
+                    &vec![b'x' + round; len],
+                )
+                .expect("put");
+            }
+            w.commit().expect("commit");
+        }
+        done.store(true, Ordering::Release);
+        assert!(reader.join().expect("reader thread") >= 2);
+        assert_eq!(&contents(&r, db), pinned, "pinned snapshot intact");
+    });
 }

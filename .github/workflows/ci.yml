@@ -1,16 +1,18 @@
 # ZeroDB CI — the CONTRIBUTING.md check battery, automated.
 #
 # Per push / PR: fmt, clippy, tests (x86-64 and aarch64), an MSRV check, miri
-# on the core, loom on the reader table, the free-list save without pool
-# draws, the fuzz gate and the crash smoke; on macOS (Apple silicon), clippy,
-# the tests and the crash smoke; and a check that a Windows build stops at
-# the platform guard.
+# on the core, the I/O layer and the heed adapter, loom on the reader table
+# and the writer locks, the free-list save without pool draws, the fuzz gate
+# and the crash smoke; on macOS (Apple silicon), clippy, the tests and the
+# crash smoke; and a check that a Windows build stops at the platform guard.
 # Nightly: the long fuzz, the full crash run, the reader stress, the
-# power-loss run on ext4 and XFS (also on pull requests that touch it), and
-# the consumer gate (Meilisearch's milli and index-scheduler suites and
-# hannoy's suite on ZeroDB, through scripts/consumer.sh and scripts/hannoy.sh).
-# The loom, fuzz, crash and stress jobs run the justfile recipes of the same
-# name, so `just <recipe>` locally runs exactly what CI runs.
+# engine's tests under ThreadSanitizer and AddressSanitizer, the power-loss
+# run on ext4 and XFS (also on pull requests that touch it), and the consumer
+# gate (Meilisearch's milli and index-scheduler suites and hannoy's suite on
+# ZeroDB, through scripts/consumer.sh and scripts/hannoy.sh).
+# The miri, loom, fuzz, crash, stress and sanitizer jobs run the justfile
+# recipes of the same name, so `just <recipe>` locally runs exactly what CI
+# runs.
 # The oracle crate links the real LMDB fork (lmdb-master-sys), so every job
 # needs a C toolchain — the GitHub Ubuntu images ship gcc, the macOS images
 # clang.
@@ -152,7 +154,7 @@ jobs:
       - run: cargo check -p heed --features unique-txns
 
   miri:
-    name: miri (zerodb-core)
+    name: miri (zerodb-core, zerodb-io, heed)
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -165,11 +167,12 @@ jobs:
           toolchain: nightly
           components: miri
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - run: cargo install just --version 1.58.0 --locked
       - run: cargo miri setup
-      - run: cargo miri test -p zerodb-core
+      - run: just miri
 
   loom:
-    name: loom (reader table)
+    name: loom (reader table, writer locks)
     if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -349,6 +352,35 @@ jobs:
           name: nightly-fuzz-artifacts-${{ matrix.os }}
           path: fuzz/artifacts
           if-no-files-found: ignore
+
+  # The tests miri cannot run (real files, mmap, fcntl, the futex, other
+  # processes) under the sanitizers, each in its own job so neither eats the
+  # long nightly job's time. `-Zbuild-std` instruments the standard library
+  # too, which ThreadSanitizer needs to see std's own synchronization. The
+  # oracle is left out: it links C LMDB, which is not instrumented.
+  sanitizers:
+    name: nightly — ${{ matrix.sanitizer }} sanitizer (${{ matrix.os }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        sanitizer: [thread, address]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10-01)
+        with:
+          toolchain: nightly
+          components: rust-src
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: sanitizer-${{ matrix.sanitizer }}
+      - run: cargo install just --version 1.58.0 --locked
+      - run: just sanitize ${{ matrix.sanitizer }}
 
   # The consumer gate of docs/maintainers/CONSUMER-GATE.md, run by the same
   # scripts as the manual gate. Each script clones the consumer at the pinned

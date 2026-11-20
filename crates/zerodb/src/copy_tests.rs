@@ -479,17 +479,46 @@ struct FailingDest<'f> {
     seen: Arc<AtomicU64>,
 }
 
+impl FailingDest<'_> {
+    /// Whether this write is the one that fails. Relaxed: a call counter;
+    /// the compacting copy's writes all come from its one writer thread, in
+    /// order.
+    fn fails_now(&self) -> bool {
+        self.seen.fetch_add(1, Ordering::Relaxed) + 1 == self.nth
+    }
+
+    /// The bytes a short write keeps out of `len`: fewer than all of them.
+    fn kept(&self, len: usize) -> Option<usize> {
+        match self.failure {
+            DestFailure::Short(keep) => Some(keep.min(len.saturating_sub(1))),
+            _ => None,
+        }
+    }
+}
+
 impl ImageDest for FailingDest<'_> {
     fn write_all_at(&self, buf: &[u8], off: u64) -> std::io::Result<()> {
-        // Relaxed: a call counter; the compacting copy's writes all come from
-        // its one writer thread, in order.
-        let n = self.seen.fetch_add(1, Ordering::Relaxed) + 1;
-        if n != self.nth {
+        if !self.fails_now() {
             return FileExt::write_all_at(self.file, buf, off);
         }
-        if let DestFailure::Short(keep) = self.failure {
-            let keep = keep.min(buf.len().saturating_sub(1));
+        if let Some(keep) = self.kept(buf.len()) {
             FileExt::write_all_at(self.file, &buf[..keep], off)?;
+        }
+        Err(std::io::Error::from_raw_os_error(self.failure.errno()))
+    }
+
+    fn write_map_range(
+        &self,
+        map: zerodb_core::page::MapPages<'_>,
+        src: usize,
+        len: usize,
+        off: u64,
+    ) -> std::io::Result<()> {
+        if !self.fails_now() {
+            return zerodb_io::write_map_range(self.file, map, src, len, off);
+        }
+        if let Some(keep) = self.kept(len) {
+            zerodb_io::write_map_range(self.file, map, src, keep, off)?;
         }
         Err(std::io::Error::from_raw_os_error(self.failure.errno()))
     }

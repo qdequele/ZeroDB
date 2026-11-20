@@ -16,6 +16,9 @@
 //! - The `readers` module — the lock-free MVCC reader table
 //!   and the published-snapshot cell (SPEC 04 §3/§4, ADR-0006), model-checked
 //!   under loom via the `sync` shim (`just loom`).
+//! - The [`writer_word`] module — the Linux cross-process writer lock's word
+//!   protocol (SPEC 04 LCK-4), also model-checked under loom. `zerodb-io`
+//!   supplies the mapped word, the futex and the liveness probe.
 
 #![deny(missing_docs)]
 // `deny`, not `forbid`: the unsafe policy (CONTRIBUTING.md) sanctions these places,
@@ -61,6 +64,7 @@ pub mod rwtxn;
 pub mod shared;
 pub(crate) mod stamps;
 pub(crate) mod sync;
+pub mod writer_word;
 
 pub use env::{CommitHook, HookPoint, Snapshot};
 pub use nested::NestedRoTxn;

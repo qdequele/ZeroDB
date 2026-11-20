@@ -37,7 +37,7 @@ use crate::cmp::KeyCmp;
 use crate::env::{Env, Snapshot};
 use crate::error::{Error, MdbError, Result};
 use crate::handles::{HandleTable, MemoCell, TxnHandles, DENSE_DBI_LIMIT};
-use crate::page::{DBRecord, PageError, F_SUBDATA};
+use crate::page::{DBRecord, MapPages, PageError, F_SUBDATA};
 use std::cmp::Ordering;
 
 /// Map a structural tree-decode error to the public taxonomy. A corrupt page
@@ -250,15 +250,15 @@ impl RoTxn<'_> {
         &self.snap
     }
 
-    /// The whole mapped env file as bytes, borrowed for the txn's life
-    /// (SPEC 04 TXN-37). The non-compact `copy_to_file` copies the pinned
-    /// snapshot's pages directly from here; pages this snapshot references are
-    /// immutable while the txn's reader slot is held (TXN-20/21), so the copy
-    /// is torn-free for reachable pages.
+    /// The mapped env file, valid for the txn's life (SPEC 04 TXN-37). It
+    /// lends page-bounded slices (ADR-0021 amendment 1): callers take only
+    /// pages this snapshot references, which are immutable while the txn's
+    /// reader slot is held (TXN-20/21). The free pages below `last_pg` may be
+    /// rewritten by a writer of this process while the txn lives.
     #[must_use]
     #[inline]
-    pub fn map_bytes(&self) -> &[u8] {
-        self.env_ref().inner().backing_bytes()
+    pub fn map_pages(&self) -> MapPages<'_> {
+        self.env_ref().inner().backing_pages()
     }
 
     /// The env this txn reads (borrowed or owned).
@@ -409,7 +409,7 @@ impl TxnRead for RoTxn<'_> {
         // life either way (TXN-37: the env cannot close while this txn holds
         // it, borrowed or owned).
         Source::Map {
-            bytes: self.env_ref().inner().backing_bytes(),
+            map: self.env_ref().inner().backing_pages(),
             // The pinned snapshot's committed high-water bounds every map
             // read (SPEC 06 REC-14: no committed reference exceeds it, so any
             // pgno above it is corruption, refused typed).

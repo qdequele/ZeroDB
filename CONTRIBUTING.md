@@ -55,7 +55,11 @@ or page validation), so the default stays a faithful drop-in.
 `unsafe` is allowed only in:
 
 - mmap access and page casting (`zerodb-core::page`, `zerodb-io`),
-  including the grow-only mapping cell (`zerodb-io::mmap::MapRegions`): an
+  including the page-bounded map view `zerodb-core::page::MapPages` (its
+  `slice::from_raw_parts` calls, its `unsafe fn` constructor, called from
+  `zerodb-io` and the test map, and its `Send`/`Sync` impls; ADR-0021
+  amendment 1), the `pwrite` that writes a range of the map to a file
+  (`zerodb-io::write_map_range`), the grow-only mapping cell (`zerodb-io::mmap::MapRegions`): an
   `AtomicPtr` to views and mappings freed only on drop — the view and mapping
   dereferences, the `Box::from_raw` calls in its `Drop` — with its
   `Send`/`Sync` impls (ADR-0023 amendment 15);
@@ -97,15 +101,16 @@ map-slice broker to realize a dirty page in the writable map at a freshly
 copied-on-write page number. Its `// SAFETY:` comments must state: a single
 writer (TXN-6); the target page is referenced by no live snapshot (TXN-62);
 exactly one live `&mut` per map region, tied to `&mut DirtyStore` and never
-stored; and no stale whole-map borrow aliases an in-place write (in-place
-transactions keep no cached whole-map view; heap modes re-derive theirs after
-each spill). The broker is an `unsafe fn`, never a safe function minting `&mut`
+stored; and no borrow of the map covers the region (every borrow covers only
+the page or run it reads, ADR-0021 amendment 1). The broker is an `unsafe fn`, never a safe function minting `&mut`
 from `&self`. The exception also covers the `Backing::map_dirty_page`
 `unsafe fn` declaration in `zerodb-core::env` and the
 `#[allow(clippy::mut_from_ref)]` on the broker, each with its exclusivity
 contract inline.
 
-`zerodb-core::readers` contains no `unsafe`. The reader table's slot protocol
+`zerodb-core::readers` and `zerodb-core::writer_word` (the Linux writer
+lock's word protocol, whose futex calls stay in `zerodb-io::lockfile`)
+contain no `unsafe`. The reader table's slot protocol
 uses plain atomics and no lock; the published-snapshot cell in the same module
 is a mutex held for one pointer clone or swap.
 
@@ -132,10 +137,10 @@ Apple silicon uses 16 KiB.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo +nightly miri test -p zerodb-core   # non-mmap logic must pass miri
+just miri                                 # the core, zerodb-io and heed under miri (nightly)
 just fuzz-quick                           # differential fuzz against LMDB
 just crash-test-quick                     # crash-consistency smoke
-just loom                                 # reader-table model check, when touching readers or nested txns
+just loom                                 # loom models, when touching readers, nested txns or the writer locks
 just save-no-draw                         # free-list save without pool draws, when touching the allocator or the save
 just stress                               # 180 s reader/writer stress, before an integration gate
 ```
@@ -143,7 +148,8 @@ just stress                               # 180 s reader/writer stress, before a
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and the differential
 fuzz on x86-64 and aarch64 for every PR, miri, loom and the crash smoke on
 x86-64, and clippy, tests and the crash smoke on macOS aarch64; nightly it runs
-the long fuzz, the full crash run and the stress test on both architectures,
+the long fuzz, the full crash run, the stress test and the tests under
+ThreadSanitizer and AddressSanitizer (`just sanitize`) on both architectures,
 and the Meilisearch and hannoy test suites on ZeroDB
 ([maintainers/CONSUMER-GATE.md](docs/maintainers/CONSUMER-GATE.md)). It also builds the consumer crates on the workspace
 `rust-version` (the MSRV is for consumers; developing ZeroDB itself needs a

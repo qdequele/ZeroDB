@@ -31,6 +31,7 @@ transactions and MVCC, `05` free-page reuse, and `06` durability and recovery.
 |---|---|
 | [maintainers/RELEASING.md](maintainers/RELEASING.md) | How a version is cut |
 | [maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md) | Running Meilisearch's and hannoy's test suites and benchmarks on ZeroDB |
+| [maintainers/UNSAFE-AUDIT.md](maintainers/UNSAFE-AUDIT.md) | Brief for an outside review of the `unsafe` code: every site, its invariant, tool coverage and findings |
 | [maintainers/POWER-LOSS.md](maintainers/POWER-LOSS.md) | The power-loss harness: dm-log-writes on ext4 and XFS, how to run it |
 | [maintainers/HARDENING-RUNS.md](maintainers/HARDENING-RUNS.md) | The 24-hour fuzz soak and the run on a 64 KiB-page kernel: machines, commands, recording |
 | [maintainers/FORK-1-bug-report.md](maintainers/FORK-1-bug-report.md) | Draft upstream report for the LMDB fork crash FORK-1, not yet filed |

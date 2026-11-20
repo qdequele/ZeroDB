@@ -29,9 +29,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::cmp::Comparator;
 use crate::page::geometry::{gc_chunk_cap, gc_key_decode, overflow_page_count, pil_decode, GcKey};
 use crate::page::{
-    select_meta, DBRecord, LeafValue, MetaPage, OverflowRef, PageRef, PageType, DBRECORD_LEN,
-    FIRST_DATA_PGNO, F_SUBDATA, MAX_DB_NAME, MAX_KEY_SIZE, MIN_KEYS_BRANCH, MIN_KEYS_LEAF,
-    PGNO_INVALID,
+    select_meta, DBRecord, LeafValue, MapPages, MetaPage, OverflowRef, PageRef, PageType,
+    DBRECORD_LEN, FIRST_DATA_PGNO, F_SUBDATA, MAX_DB_NAME, MAX_KEY_SIZE, MIN_KEYS_BRANCH,
+    MIN_KEYS_LEAF, PGNO_INVALID,
 };
 
 /// Accumulated walk statistics, compared against a `DBRecord` (INV-18).
@@ -132,7 +132,10 @@ pub type NamedKeyOrder<'a> = dyn Fn(&[u8]) -> KeyOrder<'a> + Sync + 'a;
 /// What every walk over one image shares: the image and the snapshot it
 /// checks, and the set of pages reached so far.
 struct Shared<'a> {
-    bytes: &'a [u8],
+    /// The image, read one page or overflow run at a time: a live
+    /// environment's writer may be storing into its free pages
+    /// (ADR-0021 amendment 1).
+    bytes: MapPages<'a>,
     psize: u32,
     meta_txnid: u64,
     last_pg: u64,
@@ -198,7 +201,7 @@ struct SubtreeJob<'a> {
 
 struct Checker<'s, 'a> {
     shared: &'s Shared<'a>,
-    bytes: &'a [u8],
+    bytes: MapPages<'a>,
     psize: u32,
     meta_txnid: u64,
     last_pg: u64,
@@ -246,10 +249,7 @@ impl<'s, 'a> Checker<'s, 'a> {
     fn page(&self, pgno: u64) -> Option<PageRef<'a>> {
         let ps = self.psize as usize;
         let base = (pgno as usize).checked_mul(ps)?;
-        let slice = self.bytes.get(base..)?;
-        if slice.len() < ps {
-            return None;
-        }
+        let slice = self.bytes.get(base, ps)?;
         PageRef::new(slice, self.psize).ok()
     }
 
@@ -517,7 +517,7 @@ impl<'s, 'a> Checker<'s, 'a> {
             }
         }
         // `head <= last_pg <= bytes.len()/ps` here, but keep it checked.
-        let Some(run) = self.run_at(head) else {
+        let Some(run) = self.run_at(head, dsize) else {
             self.fail("INV-11", format!("overflow head {head} beyond the file"));
             return;
         };
@@ -584,7 +584,7 @@ impl<'s, 'a> Checker<'s, 'a> {
                     format!("GC record {key}: value on an overflow run at {head_pgno} (GC-5)"),
                 );
                 match self
-                    .run_at(head_pgno)
+                    .run_at(head_pgno, dsize)
                     .and_then(|run| OverflowRef::new(run, self.psize).ok())
                     .and_then(|o| o.payload(dsize).ok())
                 {
@@ -663,12 +663,22 @@ impl<'s, 'a> Checker<'s, 'a> {
         }
     }
 
-    /// The bytes from page `pgno` to the end of the file; `None` past it.
-    /// Checked: `pgno` is raw on-disk data, and the multiply must not wrap
-    /// into a bogus in-bounds offset.
-    fn run_at(&self, pgno: u64) -> Option<&'a [u8]> {
-        let base = (pgno as usize).checked_mul(self.psize as usize)?;
-        self.bytes.get(base..)
+    /// The pages of the overflow run at `pgno` that a `dsize`-byte value
+    /// needs, cut at the end of the file; `None` past it. Checked: `pgno` is
+    /// raw on-disk data, and the multiply must not wrap into a bogus
+    /// in-bounds offset.
+    fn run_at(&self, pgno: u64, dsize: u32) -> Option<&'a [u8]> {
+        let ps = self.psize as usize;
+        let base = pgno
+            .checked_mul(ps as u64)
+            .and_then(|b| usize::try_from(b).ok())?;
+        let need = overflow_page_count(u64::from(dsize), self.psize);
+        let avail = (self.bytes.len().checked_sub(base)? / ps) as u64;
+        let n = usize::try_from(need.min(avail)).ok()?;
+        if n == 0 {
+            return None;
+        }
+        self.bytes.get(base, n * ps)
     }
 
     /// INV-22 (the GC side of INV-10) + INV-24: after both tree walks, every
@@ -897,7 +907,7 @@ fn check_image_inner<'a>(
     let annex = MetaPage::read_annex(&bytes[chosen * ps..(chosen + 1) * ps], psize)
         .expect("annex count was bounds-checked by MetaPage::validate");
     check_state(
-        bytes,
+        MapPages::from_slice(bytes),
         psize,
         &SnapshotRoots {
             txnid: meta.txnid,
@@ -915,7 +925,7 @@ fn check_image_inner<'a>(
 /// Check one committed snapshot of a live environment (ADR-0023): its roots,
 /// its free tree, its free-list annex and its `last_pg`, read through `map`,
 /// the mapped data file a read txn pinning `snap` borrows
-/// ([`crate::rotxn::RoTxn::map_bytes`]). Returns the violations (empty =
+/// ([`crate::rotxn::RoTxn::map_pages`]), one page or overflow run at a time. Returns the violations (empty =
 /// clean), as [`check_image`].
 ///
 /// Unlike [`check_image`] it never reads the meta slots, which another
@@ -924,7 +934,7 @@ fn check_image_inner<'a>(
 /// the walk runs. `map` may be longer than the file; the file-length
 /// invariants are asserted against `(last_pg + 1) * psize` instead.
 #[must_use]
-pub fn check_snapshot(map: &[u8], psize: u32, snap: &crate::env::Snapshot) -> Vec<String> {
+pub fn check_snapshot(map: MapPages<'_>, psize: u32, snap: &crate::env::Snapshot) -> Vec<String> {
     check_snapshot_inner(map, psize, snap, None)
 }
 
@@ -932,7 +942,7 @@ pub fn check_snapshot(map: &[u8], psize: u32, snap: &crate::env::Snapshot) -> Ve
 /// `order_of`, as [`check_image_with_key_order`].
 #[must_use]
 pub fn check_snapshot_with_key_order<'a>(
-    map: &'a [u8],
+    map: MapPages<'a>,
     psize: u32,
     snap: &crate::env::Snapshot,
     order_of: &'a NamedKeyOrder<'a>,
@@ -941,7 +951,7 @@ pub fn check_snapshot_with_key_order<'a>(
 }
 
 fn check_snapshot_inner<'a>(
-    map: &'a [u8],
+    map: MapPages<'a>,
     psize: u32,
     snap: &crate::env::Snapshot,
     order_of: Option<&'a NamedKeyOrder<'a>>,
@@ -951,9 +961,9 @@ fn check_snapshot_inner<'a>(
         .checked_add(1)
         .and_then(|n| n.checked_mul(u64::from(psize)))
         .and_then(|n| usize::try_from(n).ok());
-    let bytes = match needed {
-        Some(n) if n <= map.len() => &map[..n],
-        _ => {
+    let bytes = match needed.and_then(|n| map.prefix(n)) {
+        Some(prefix) => prefix,
+        None => {
             return vec![format!(
                 "INV-17: map length {} < (last_pg {} + 1) * psize",
                 map.len(),
@@ -1050,7 +1060,7 @@ fn check_free_ids(ids: &[u64], last_pg: u64, free: &mut HashMap<u64, u64>) -> Ve
 /// twice" (INV-16, INV-11), fires in both whenever some page is reachable
 /// twice, since the reached-pages set is shared by all threads.
 fn check_state<'a>(
-    bytes: &'a [u8],
+    bytes: MapPages<'a>,
     psize: u32,
     roots: &SnapshotRoots<'_>,
     mut violations: Vec<String>,
@@ -1337,11 +1347,14 @@ mod tests {
         let mut map = img.clone();
         map.resize(img.len() + 4 * ps, 0);
         map[..2 * ps].fill(0);
-        assert_eq!(check_snapshot(&map, PS, &snap), Vec::<String>::new());
+        assert_eq!(
+            check_snapshot(MapPages::from_slice(&map), PS, &snap),
+            Vec::<String>::new()
+        );
 
         // A map that does not reach last_pg.
         let short = &img[..img.len() - ps];
-        let v = check_snapshot(short, PS, &snap);
+        let v = check_snapshot(MapPages::from_slice(short), PS, &snap);
         assert!(
             v.iter().any(|s| s.starts_with("INV-17")),
             "expected INV-17, got {v:?}"
@@ -1350,7 +1363,7 @@ mod tests {
         // A reachable page corrupted in the map is reported.
         let mut bad = img.clone();
         bad[2 * ps + 8..2 * ps + 16].copy_from_slice(&999u64.to_le_bytes());
-        assert!(!check_snapshot(&bad, PS, &snap).is_empty());
+        assert!(!check_snapshot(MapPages::from_slice(&bad), PS, &snap).is_empty());
     }
 
     #[test]
@@ -1450,7 +1463,7 @@ mod tests {
     /// state of `img` clean, given the meta of the uncorrupted image.
     fn parallel_alone_is_clean(img: &[u8], meta: &MetaPage, annex: &[u64]) -> bool {
         let shared = Shared {
-            bytes: img,
+            bytes: MapPages::from_slice(img),
             psize: PS,
             meta_txnid: meta.txnid,
             last_pg: meta.last_pg,

@@ -393,6 +393,18 @@ impl<T> Env<T> {
         &self.inner
     }
 
+    /// Wrap a native env opened by a test, for tests that need an engine
+    /// built on a backing `EnvOpenOptions::open` cannot select, such as the
+    /// heap-backed writable map miri runs over.
+    #[cfg(all(test, not(feature = "unique-txns")))]
+    pub(crate) fn from_zdb_for_tests(inner: zerodb::Env) -> Env<T> {
+        Env {
+            inner,
+            no_lock: false,
+            _tls: std::marker::PhantomData,
+        }
+    }
+
     /// Actual on-disk data-file size.
     ///
     /// # Errors
@@ -1104,6 +1116,7 @@ mod file_trust_tests {
     /// ADR-0034: an env opened through the adapter trusts page contents by
     /// default, as LMDB does.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn default_policy_trusts() {
         let dir = tempfile::tempdir().unwrap();
         // SAFETY: only ZeroDB writes this environment's files.
@@ -1113,6 +1126,7 @@ mod file_trust_tests {
 
     /// `file_trust(VALIDATE)` reaches the engine.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn validate_reaches_the_engine() {
         let dir = tempfile::tempdir().unwrap();
         let mut opts = opts();

@@ -72,7 +72,7 @@ use std::path::{Path, PathBuf};
 use zerodb_core::builder::{EnvStream, PageSink, StreamBuildError, DEFAULT_FILL_PERMILLE};
 use zerodb_core::env::Env;
 use zerodb_core::error::{Error, MdbError, Result};
-use zerodb_core::page::FIRST_DATA_PGNO;
+use zerodb_core::page::{MapPages, FIRST_DATA_PGNO};
 use zerodb_core::page::{MetaPage, FORMAT_VERSION, F_SUBDATA, MAGIC};
 use zerodb_core::{for_each_entry_flagged, named_databases, RoTxn};
 
@@ -249,11 +249,32 @@ impl CopyToFile for Env {
 trait ImageDest: Sync {
     /// Write all of `buf` at byte offset `off`.
     fn write_all_at(&self, buf: &[u8], off: u64) -> std::io::Result<()>;
+
+    /// Write the `len` bytes of `map` at byte offset `src` at byte offset
+    /// `off`, without lending them as a `&[u8]` (the raw copy's data pages,
+    /// free pages included; [`zerodb_io::write_map_range`]).
+    fn write_map_range(
+        &self,
+        map: MapPages<'_>,
+        src: usize,
+        len: usize,
+        off: u64,
+    ) -> std::io::Result<()>;
 }
 
 impl ImageDest for &File {
     fn write_all_at(&self, buf: &[u8], off: u64) -> std::io::Result<()> {
         FileExt::write_all_at(*self, buf, off)
+    }
+
+    fn write_map_range(
+        &self,
+        map: MapPages<'_>,
+        src: usize,
+        len: usize,
+        off: u64,
+    ) -> std::io::Result<()> {
+        zerodb_io::write_map_range(self, map, src, len, off)
     }
 }
 
@@ -825,15 +846,20 @@ fn write_raw(
     // Pages 0..=last_pg. Slots 0/1 are synthesized; the rest are data.
     let n_pages = snap.last_pg + 1;
     let data_end = (snap.last_pg as usize + 1) * ps;
-    let map = txn.map_bytes();
-    let src = map.get(..data_end).ok_or(Error::Mdb(MdbError::Invalid))?;
+    // Free pages below `last_pg` may be written by this process's writer
+    // during the copy, so they are never lent as a `&[u8]`: the kernel reads
+    // them from the map (ADR-0021 amendment 1).
+    let map = txn
+        .map_pages()
+        .prefix(data_end)
+        .ok_or(Error::Mdb(MdbError::Invalid))?;
 
     file.write_all_at(&snapshot_metas(env, txn)?, base)?;
 
     // Data pages in chunks, so progress is observable.
     for_each_chunk(FIRST_DATA_PGNO, n_pages, psize, progress, |pg, end| {
         let (from, to) = (pg as usize * ps, end as usize * ps);
-        file.write_all_at(&src[from..to], base + from as u64)?;
+        file.write_map_range(map, from, to - from, base + from as u64)?;
         Ok(())
     })?;
     Ok(data_end as u64)

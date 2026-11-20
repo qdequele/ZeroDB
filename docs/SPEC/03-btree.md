@@ -208,7 +208,9 @@ than a zero-size set-range and therefore succeeds.
   SPEC 04's value-borrow contract. This doc assumes those hold.
 - `F_BIGDATA` value: read `dsize` bytes starting at `head*psize + HEADER_SIZE`
   where `head` = the 8-byte pgno in the leaf cell (SPEC 02 §5). Still zero-copy:
-  the overflow run is contiguous in the map.
+  the overflow run is contiguous in the map. A run read from the map is
+  borrowed as exactly the `⌈(HEADER_SIZE + dsize) / psize⌉` pages the value
+  needs, never further (SPEC 04 TXN-37/38, ADR-0021 amendment 1).
 - `Database::len` reads `DBRecord.entries`; `is_empty` = `entries == 0`
   (SPEC 00 rows 39/40).
 

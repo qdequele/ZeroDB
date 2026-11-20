@@ -6,16 +6,44 @@ check:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
 
-# The core's non-mmap logic under miri (nightly).
+# Under miri (nightly): the core; the I/O layer's unit tests (the lock-file
+# views over an anonymous map, the grow-only map cell over heap mappings, the
+# fault-injection backend), skipping the tests that open real files; and the
+# heed adapter's unit tests over the heap-backed writable map. The integration
+# tests of zerodb-io and heed open real files and are left to `sanitize`.
 miri:
-    cargo miri test -p zerodb-core
+    cargo +nightly miri test -p zerodb-core
+    cargo +nightly miri test -p zerodb-io --all-features --lib
+    cargo +nightly miri test -p heed --lib
+
+# Example: just sanitize thread
+#
+# The I/O layer's, the engine's and the heed adapter's tests under a sanitizer
+# (`thread` or `address`; nightly, Linux or macOS). Short stress runs keep it
+# within an hour.
+sanitize SANITIZER:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="$(rustc +nightly -vV | sed -n 's/^host: //p')"
+    export RUSTFLAGS="-Zsanitizer={{SANITIZER}}"
+    export RUSTDOCFLAGS="$RUSTFLAGS"
+    export CARGO_TARGET_DIR="target-sanitize-{{SANITIZER}}"
+    export ZERODB_STRESS_SECS=20
+    # Halt on the first report, so a race fails the job.
+    export TSAN_OPTIONS="halt_on_error=1 second_deadlock_stack=1"
+    export ASAN_OPTIONS="detect_leaks=1 detect_stack_use_after_return=1"
+    cargo +nightly test -Zbuild-std --target "$target" -p zerodb-io --all-features
+    cargo +nightly test -Zbuild-std --target "$target" -p zerodb
+    cargo +nightly test -Zbuild-std --target "$target" -p heed
 
 # Only the loom_* tests run; the rest of the lib is compiled but filtered under
 # --cfg loom (loom primitives panic outside a model). --release per ADR-0006,
 # with debug assertions forced on: the pin path's slot ≤ snap debug_assert is
 # one of the suite's publish-inversion detectors.
 #
-# Loom model check of the reader table (ADR-0006).
+# Loom model check of the reader table, nested read txns, the stamp cache,
+# the handle memo, and the in-process and cross-process writer locks
+# (ADR-0006).
 loom:
     RUSTFLAGS="--cfg loom" CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true cargo test -p zerodb-core --lib --release loom_
 

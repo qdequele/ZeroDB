@@ -63,13 +63,26 @@ plainly as the strengths.
   process is live. After each crash the reopened environment must hold exactly
   one committed prefix of the workload and pass the invariant checker. Pull
   requests run 250 cycles; the nightly job runs 10,000.
-- **Model checking.** The reader table, nested read transactions and two
+- **Model checking.** The reader table, nested read transactions, two
   other concurrent structures of `zerodb-core` (its `handles` and `stamps`
-  modules) are model-checked with loom. The loom
-  build compiles the same source that ships, with the synchronization types
-  swapped for loom's.
-- **Miri.** The tests of `zerodb-core`, the crate with the page format, the
-  trees and the transactions, run under miri on every pull request.
+  modules), the in-process writer lock and the Linux cross-process writer
+  lock's word protocol, takeover from a dead owner included, are
+  model-checked with loom. The loom build compiles the same source that
+  ships, with the synchronization types swapped for loom's. The futex and
+  `fcntl` calls themselves, and the macOS writer lock, are not modelled.
+- **Miri.** On every pull request, miri runs the tests of `zerodb-core` (the
+  page format, the trees and the transactions), the unit tests of
+  `zerodb-io` that need no real file (the lock file's atomic views over an
+  anonymous map, the grow-only map cell, the fault-injection backend), and
+  the unit tests of `heed-zerodb` over a heap-backed map (the lifetime-erased
+  write cursor, the `Send` read transaction, the TLS-marker retags and the
+  reserved-space view). Both include a reader thread running while the
+  writer stores into free pages, in both write modes: miri found that the
+  read path's whole-map borrows were undefined behavior there, and the fix
+  (ADR-0021 amendment 1) bounds every borrow to the pages read.
+- **Sanitizers.** A nightly job runs the tests of `zerodb-io`, `zerodb` and
+  `heed-zerodb`, including the multi-process ones, under ThreadSanitizer and
+  AddressSanitizer on x86-64 and aarch64.
 - **Stress.** Two reader and writer stress tests, one in a single process
   and one across processes, run nightly for three minutes each.
 - **Consumers.** Meilisearch's milli and index-scheduler test suites and
@@ -88,24 +101,28 @@ plainly as the strengths.
   has reviewed it. Every `unsafe` block has a `// SAFETY:` comment, and the
   places where `unsafe` is allowed are listed in
   [CONTRIBUTING.md](../CONTRIBUTING.md#unsafe-policy), but both were written
-  by the same process as the code. Counts in each crate's `src/` directory,
-  unit tests included, comments excluded:
+  by the same process as the code. A brief for an outside reviewer, with
+  every site, its stated invariant and the tool coverage, is in
+  [maintainers/UNSAFE-AUDIT.md](maintainers/UNSAFE-AUDIT.md). Counts in each
+  crate's `src/` directory, unit tests included, comments excluded:
 
   | Crate | `unsafe` blocks | `unsafe fn` | `unsafe impl` |
   |---|---:|---:|---:|
-  | `zerodb-core` | 21 | 6 | 0 |
-  | `zerodb-io` | 26 | 5 | 3 |
+  | `zerodb-core` | 24 | 7 | 2 |
+  | `zerodb-io` | 27 | 5 | 3 |
   | `zerodb` | 3 | 1 | 0 |
-  | `heed-zerodb` | 9 | 9 | 1 |
+  | `heed-zerodb` | 12 | 9 | 1 |
   | `zerodb-tools` | 3 | 0 | 0 |
   | `zerodb-oracle` (test harness, FFI to LMDB) | 39 | 1 | 0 |
 
   Integration tests, benches and examples add about 400 `unsafe` blocks.
   Every call of `open` is one, because `open` is an `unsafe fn`.
-- **Miri covers `zerodb-core` only.** `zerodb-io` (mmap, the lock file, the
-  futex and `fcntl` code) and `heed-zerodb` (the lifetime-erased cursor and
-  `Send` impls) do not run under miri, and they hold most of the `unsafe`
-  code that touches the operating system.
+- **Miri does not see real mappings.** The real file maps, `pwritev`, the
+  lock file's `open`, `fcntl` and the futex run only natively and under the
+  sanitizers, which check one process at a time and know nothing of the
+  synchronization between processes. The heap-backed map miri runs over
+  models the writer's stores, in place and through `pwrite`, but not writes
+  by another process.
 - **I/O-error injection covers the data file's write, sync and growth calls
   and the copy's destination writes, not the lock file.** The
   fault-injecting backend can fail the `n`th write, sync or file-growth call
