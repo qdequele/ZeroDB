@@ -236,7 +236,7 @@ struct SizedBacking {
 impl Backing for SizedBacking {
     fn view(&self) -> MapView<'_> {
         MapView {
-            bytes: &self.bytes,
+            pages: MapPages::from_slice(&self.bytes),
             map_size: self.map_size,
         }
     }
@@ -480,7 +480,7 @@ struct GrowBacking {
 impl Backing for GrowBacking {
     fn view(&self) -> MapView<'_> {
         MapView {
-            bytes: &self.bytes,
+            pages: MapPages::from_slice(&self.bytes),
             // Relaxed: the tests grow and read on one thread.
             map_size: self.map_size.load(O::Relaxed),
         }

@@ -4,8 +4,12 @@
 //! positioned reads/writes use the unix `pwrite`/`pread` family via
 //! [`std::os::unix::fs::FileExt`] (no cursor movement, no `libc`). `fstat` for
 //! [`real_disk_size`] uses `File::metadata`, and fd duplication uses
-//! `File::try_clone`. The one `unsafe` here is the `pwritev` FFI call behind
-//! the vectored commit write, SAFETY-commented at the site.
+//! `File::try_clone`. The `unsafe` here is two FFI calls, SAFETY-commented
+//! at their sites: the `pwritev` behind the vectored commit write, and the
+//! `pwrite` that writes a range of the map to a file without borrowing it
+//! ([`write_map_range`]).
+
+use zerodb_core::env::MapPages;
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
@@ -214,6 +218,71 @@ pub(crate) fn write_pages_vectored(
             }
         }
         off += total as u64;
+    }
+    Ok(())
+}
+
+/// Write the `len` bytes of `map` at byte offset `src` into `file` at
+/// `dst`, with `pwrite` reading straight from the mapping, as LMDB's
+/// `mdb_env_copyfd` writes from its map.
+///
+/// The raw environment copy uses this for the snapshot's pages
+/// `[FIRST_DATA_PGNO, last_pg]`, free pages included. A writer of this
+/// process may be storing into those free pages while the copy runs (their
+/// torn bytes are harmless: the copy's free list lists them free). Lending
+/// them as a `&[u8]` would assert they do not change (ADR-0021 amendment 1);
+/// handing the kernel the mapping's address does not.
+///
+/// # Errors
+///
+/// `InvalidInput` if the range is not inside `map`; otherwise the `pwrite`
+/// error. A short write is resumed.
+pub fn write_map_range(
+    file: &File,
+    map: MapPages<'_>,
+    src: usize,
+    len: usize,
+    dst: u64,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if src.checked_add(len).is_none_or(|end| end > map.len()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "map range at {src} (+{len}) outside the map ({} bytes)",
+                map.len()
+            ),
+        ));
+    }
+    let mut done = 0usize;
+    while done < len {
+        let offset = dst
+            .checked_add(done as u64)
+            .and_then(|o| libc::off_t::try_from(o).ok())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset overflow")
+            })?;
+        let want = (len - done).min(MAX_WRITE_BYTES);
+        let n = retry_interrupted(|| {
+            // SAFETY: `[src + done, src + done + want)` is inside `map`
+            // (checked above), whose region stays mapped and readable while
+            // `map` is borrowed; `pwrite` only reads it, from the kernel, and
+            // no Rust reference to it is created. The fd is a valid, open file
+            // owned by `file`.
+            let n = unsafe {
+                libc::pwrite(
+                    file.as_raw_fd(),
+                    map.as_ptr().add(src + done).cast::<libc::c_void>(),
+                    want,
+                    offset,
+                )
+            };
+            usize::try_from(n).map_err(|_| std::io::Error::last_os_error())
+        })?;
+        if n == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        }
+        done += n;
     }
     Ok(())
 }

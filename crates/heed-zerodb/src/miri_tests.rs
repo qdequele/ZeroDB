@@ -4,14 +4,12 @@
 //! heap-backed writable map (`zerodb_io::testmap::TestWriteMap`, ADR-0021),
 //! where miri checks every access, and wrap it in a heed [`Env`].
 //!
-//! Natively each test runs twice: with dirty pages written in place in the
-//! map (`WRITE_MAP`) and with dirty pages in heap frames (the default). Under
-//! miri only the in-place mode runs. `TestWriteMap` models the in-place
-//! path, where every write to the map goes through a Rust pointer. In heap
-//! mode the commit writes pages with `pwrite`, which this backing can only
-//! imitate with a pointer write while the writer still holds a view of the
-//! whole map; on a real map that write is made by the kernel, outside the
-//! Rust memory model. See `docs/maintainers/UNSAFE-AUDIT.md`.
+//! Each test runs twice: with dirty pages written in place in the map
+//! (`WRITE_MAP`) and with dirty pages in heap frames (the default). In heap
+//! mode `TestWriteMap` imitates the commit's `pwrite` with a pointer store
+//! into pages no borrow covers, since every view of the map is bounded to
+//! the pages it reads (ADR-0021 amendment 1). See
+//! `docs/maintainers/UNSAFE-AUDIT.md`.
 //!
 //! What they reach, by `unsafe` site:
 //!
@@ -42,7 +40,7 @@ const PS: u32 = 4096;
 const MAP: usize = 2 << 20;
 
 /// The `write_map` modes a test runs in; see the module docs.
-const MODES: &[bool] = if cfg!(miri) { &[true] } else { &[true, false] };
+const MODES: &[bool] = &[true, false];
 
 /// A heed env over a fresh heap-backed map; `write_map` selects in-place
 /// dirty pages.
@@ -153,19 +151,12 @@ fn without_tls_read_txn_reads_on_another_thread() {
 /// As above, but the writer commits while the other thread reads. The
 /// reader must see its own snapshot throughout.
 ///
-/// Skipped under miri: in `WRITE_MAP` mode the writer writes free pages in
-/// place while the reader holds slices of the map that span those pages
-/// (from the page it reads up to its snapshot's last page, and the whole map
-/// in its page source). The bytes the reader reads are never written
-/// (TXN-62), but a live `&[u8]` over bytes written through another pointer
-/// breaks Rust's aliasing rules, and miri reports it under both Stacked and
-/// Tree Borrows. Recorded in `docs/maintainers/UNSAFE-AUDIT.md`; run it with
-/// `cargo +nightly miri test -p heed --lib -- --ignored during_commits`.
+/// The writer stores into free pages below the reader's high-water, in place
+/// under `WRITE_MAP` and through the imitated `pwrite` otherwise. The
+/// reader's borrows cover only the pages it reads (ADR-0021 amendment 1);
+/// before that, miri reported this test as UB under both aliasing models
+/// (`docs/maintainers/UNSAFE-AUDIT.md`, F1).
 #[test]
-#[cfg_attr(
-    miri,
-    ignore = "reader map slices span pages written in place (UNSAFE-AUDIT.md)"
-)]
 fn without_tls_read_txn_reads_on_another_thread_during_commits() {
     for &write_map in MODES {
         let env = heap_env::<WithoutTls>(write_map);

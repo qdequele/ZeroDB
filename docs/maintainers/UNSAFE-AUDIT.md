@@ -33,18 +33,19 @@ The rules the `SAFETY` comments cite (TXN-6, TXN-62, LCK-4 and so on) are in
 
 | Tool | What it runs | Where |
 |---|---|---|
-| miri (Stacked Borrows, data-race detector) | `zerodb-core`'s tests, including the `WRITE_MAP` in-place path over a heap-backed map (`zerodb_io::testmap::TestWriteMap`) | every PR, `just miri` |
+| miri (Stacked Borrows, data-race detector) | `zerodb-core`'s tests, including the `WRITE_MAP` in-place path over a heap-backed map (`zerodb_io::testmap::TestWriteMap`), with a reader thread running while the writer stores in place | every PR, `just miri` |
 | miri | `zerodb-io`'s unit tests: the lock-file atomic views over an anonymous map, the grow-only map cell over heap mappings, the fault-injection backend. 25 tests that open real files are skipped under miri | every PR, `just miri` |
-| miri | `heed-zerodb`'s unit tests over `TestWriteMap`: the TLS-marker retags, the `Send` read transaction, `ReservedSpace`, the lifetime-erased write cursor and the write iterator's `unsafe fn`s | every PR, `just miri` |
+| miri | `heed-zerodb`'s unit tests over `TestWriteMap`, in both the in-place and heap-frame modes: the TLS-marker retags, the `Send` read transaction (including reads during commits), `ReservedSpace`, the lifetime-erased write cursor and the write iterator's `unsafe fn`s | every PR, `just miri` |
 | loom | the reader table, nested read transactions, the stamp cache, the handle memo, the in-process writer lock and the Linux cross-process writer word | every PR, `just loom` |
 | ThreadSanitizer, AddressSanitizer | the tests of `zerodb-io` (with real files, `fcntl`, the futex and child processes), `zerodb` and `heed-zerodb`, on x86-64 and aarch64 Linux | nightly, `just sanitize thread` / `just sanitize address` |
 
 What the tools cannot reach:
 
 - **Real mappings under miri.** Miri cannot see an OS mapping of a file, so
-  the real `Mmap`, `MmapWritable`, `pwritev` and the lock file's `open` run
-  only natively and under the sanitizers. `TestWriteMap` stands in for the
-  writable map, but it models only the in-place path (see finding F2).
+  the real `Mmap`, `MmapWritable`, `pwritev`, `pwrite` and the lock file's
+  `open` run only natively and under the sanitizers. `TestWriteMap` stands
+  in for the map, in both write modes; it imitates `pwrite` with a pointer
+  store.
 - **Other processes.** ThreadSanitizer checks the threads of one process. It
   does not see synchronization through the futex or the shared mapping
   between processes, so it says nothing about the cross-process protocol.
@@ -56,67 +57,52 @@ What the tools cannot reach:
 
 ## Findings so far
 
-### F1. Reader slices of the map span pages the writer rewrites in place (open)
+### F1. Reader slices of the map spanned pages the writer rewrites in place (fixed)
 
 Under `WRITE_MAP`, the writer writes free pages in place through `&mut [u8]`
 regions (`dirty::map_mut`). A reader in another thread of the same process
-holds `&[u8]` slices that cover those pages, although it never reads them:
+held `&[u8]` slices that covered those pages, although it never read them:
 
-- `btree::Source` carries the whole map as one `&[u8]`, copied into every
+- `btree::Source` carried the whole map as one `&[u8]`, copied into every
   page lookup;
-- `Source::bytes_from_classified` returns a slice from the page it was asked
-  for up to the reader's snapshot high-water, not one page.
+- `Source::bytes_from_classified` returned a slice from the page it was asked
+  for up to the reader's snapshot high-water, not one page;
+- `RoTxn::map_bytes` lent the whole map, and the raw `Env::copy` passed
+  `&map[..]` over free pages to `write_all_at`.
 
 TXN-62 keeps the bytes a reader actually reads disjoint from the bytes the
 writer writes. But a live `&[u8]` asserts that none of the bytes it covers
-change, and Rust function arguments of type `&[u8]` carry LLVM's
-`noalias readonly dereferenceable` over the whole slice. Miri reports it
-under both aliasing models:
+change, and miri reported it under both aliasing models (a protected
+`SharedReadOnly` popped under Stacked Borrows, a data race on a retag under
+Tree Borrows).
 
-- Stacked Borrows: a write through the broker's `&mut` pops a protected
-  `SharedReadOnly` of the reader (`btree/mod.rs`, `resolve_overflow`'s
-  `src` argument);
-- Tree Borrows: a data race between the reader's retag of the slice
-  (`btree/mod.rs`, the high-water clamp in `bytes_from_classified`) and the
-  writer's non-atomic write (`page::tree::copy_tree_page`).
+[ADR-0021 amendment 1](../adr/0021-writemap-in-place.md) fixed it, in every
+mode. The engine holds the map as `zerodb_core::page::MapPages`, a pointer
+and a length built from the mapping's raw pointer (`memmap2::MmapRaw`), and
+every borrow covers exactly the page, overflow run or value it reads. The
+raw copy hands the kernel the map's address (`zerodb_io::write_map_range`,
+a `pwrite`) instead of a borrow. The reproducer,
+`heed-zerodb/src/miri_tests.rs`
+`without_tls_read_txn_reads_on_another_thread_during_commits`, now runs under
+miri, in both modes, and `zerodb-core/tests/writemap_in_place_miri.rs`
+`reader_thread_during_in_place_commits_under_miri` checks the same in the
+core.
 
-Reproduce:
+Residual, recorded in the amendment: a corrupt file opened with
+`FileTrust::VALIDATE` can still steer a reader to a free page below the
+high-water, whose bytes an in-process `WRITE_MAP` writer may be storing to.
+That is a race on bytes actually read; LMDB, which does not validate pages,
+has the same exposure. Writes by the kernel (`pwrite`) and by other
+processes remain outside the Rust memory model; with bounded borrows no
+reference covers the bytes they change either.
 
-```sh
-cargo +nightly miri test -p heed --lib -- --ignored during_commits
-MIRIFLAGS=-Zmiri-tree-borrows cargo +nightly miri test -p heed --lib -- --ignored during_commits
-```
+### F2. `TestWriteMap` could not model the heap-frame mode (fixed with F1)
 
-The test (`heed-zerodb/src/miri_tests.rs`,
-`without_tls_read_txn_reads_on_another_thread_during_commits`) passes
-natively and is skipped under miri until this is resolved. The core's own
-miri battery (`zerodb-core/tests/writemap_in_place_miri.rs`) is
-single-threaded, so it never had a reader and a writer running at once.
-
-The module contract in `zerodb-io/src/mmap.rs` states the argument this
-relies on: "no `&[u8]` that safe code reads is mutated while it is
-borrowed". It reasons about the bytes read, while Rust's rules apply to every
-byte a reference covers. Fixing it changes how pages are viewed (slices bounded to the pages
-a snapshot references, and a map view that is not a `&[u8]`). That fix is
-proposed in [ADR-0021 amendment 1](../adr/0021-writemap-in-place.md)
-(draft, awaiting approval), together with the alternatives and the read-path
-benchmark it needs. It is not implemented.
-
-**Questions for the reviewer:** is the "bytes actually read" argument
-acceptable in practice, and which fix is preferable? The same question arises
-without `WRITE_MAP`, where pages are written with `pwrite` and another process
-may write the file: those writes are made by the kernel, outside the Rust
-memory model, and no tool here can check them.
-
-### F2. `TestWriteMap` cannot model the heap-frame mode (open, test limit)
-
-Without `WRITE_MAP`, the writer keeps a cached whole-map view and commits
+Without `WRITE_MAP`, the writer kept a cached whole-map view and committed
 with `pwrite`. `TestWriteMap` imitates that `pwrite` with a pointer write
-into the same buffer the view covers, which miri reports (both models) as a
-write under a protected shared borrow in `RwTxn::commit`. On the real backing
-the write is made by the kernel. So the heed miri tests run only the in-place
-mode under miri; natively they run both. This is F1's question for the
-default mode.
+into the same buffer, which miri reported as a write under a protected
+shared borrow while the view existed. With page-bounded borrows (F1) no view
+covers the written pages, so the heed miri tests run both modes.
 
 ### F3. The write iterator's `unsafe fn` contract was narrower than heed's (fixed)
 
@@ -131,15 +117,17 @@ state heed's contract.
 
 In order of risk:
 
-1. **The map aliasing model** (F1): `zerodb-io/src/mmap.rs` (module contract,
-   `Mmap::new`, `MmapWritable::new`), `btree::Source`, and every place a
-   reader or the writer holds a whole-map `&[u8]` (`Backing::view`,
-   `RwTxn::whole_map`).
+1. **The map aliasing model** (F1, fixed): `zerodb-io/src/mmap.rs` (module
+   contract, rule 5, `Mmap::pages`, `MmapWritable::pages`),
+   `zerodb-core/src/page/map.rs` (`MapPages`), `btree::Source` and
+   `map_pages`, and the remaining whole-map borrows (`MapPages::whole`: the
+   fault backend's seal and capture, the tools, test hooks). Check that no whole-map borrow runs in a thread while a
+   writer of the same process stores.
 2. **The `WRITE_MAP` broker**: `zerodb-core/src/dirty.rs` `map_mut` and its
    five callers (six call sites), `Backing::map_dirty_page`, `MmapWritable::slice_mut` and
    `write_at`, `zerodb-io/src/lib.rs` `write_at_page` / `map_dirty_page`.
    Check that TXN-62 is enforced at allocation (`RwTxn::allocate`'s release
-   guard) and that no stale view of the writer outlives a spill.
+   guard) and that no borrow of the map covers a brokered region.
 3. **Trusted pages** (ADR-0034): `page/raw.rs` unchecked reads,
    `page/tree.rs` view accessors and `page/trust.rs`. Check that a
    `FileTrust::VALIDATE` environment never reaches an unchecked read before
@@ -163,11 +151,14 @@ function names do not. "Coverage" names the tools that execute the site. The
 oracle crate's FFI to LMDB (39 blocks) and the `open` calls in integration
 tests, benches and examples are out of scope.
 
-### zerodb-core (21 blocks, 6 `unsafe fn`)
+### zerodb-core (24 blocks, 7 `unsafe fn`, 2 `unsafe impl`)
 
 | Site | Kind | Stated invariant | Coverage |
 |---|---|---|---|
-| `dirty.rs` `map_mut` | `unsafe fn` + block | The brokered contract: single writer (TXN-6); target page referenced by no snapshot (TXN-62); one live `&mut` per region, tied to `&mut DirtyStore`, never stored; no stale whole-map view read at written bytes | miri (in place, single thread); F1 |
+| `dirty.rs` `map_mut` | `unsafe fn` + block | The brokered contract: single writer (TXN-6); target page referenced by no snapshot (TXN-62); one live `&mut` per region, tied to `&mut DirtyStore`, never stored; no borrow of the map covers the region | miri (in place, with a reader thread) |
+| `page/map.rs` `MapPages::from_raw_parts` | `unsafe fn` + block | The pointer is valid for reads of `len` bytes for `'a`; stores keep to the map contract | miri (through `TestWriteMap`) |
+| `page/map.rs` `MapPages::get`, `whole` | block ×2 | The range is inside the region; `get`'s callers ask only for pages a pinned snapshot references or the writer's own frames; `whole` only where no store can run concurrently | miri |
+| `page/map.rs` `MapPages` `Send`, `Sync` | `unsafe impl` ×2 | Lends only `&'a [u8]`, as the `&'a [u8]` it replaces | miri (reader thread) |
 | `dirty.rs` `map_mut` callers (`unspill_in_place`, `bytes_mut` ×2, `insert_tree_frame`, `insert_copy`, `insert_run_frame`) | block ×6 | `&mut self` re-ties the borrow; the region is a tracked `Slot::Map`; `insert_copy`'s source never aliases the target | miri |
 | `env/backing.rs` `Backing::map_dirty_page` | `unsafe fn` (declaration, default `None`) | Same brokered contract, stated for implementers | n/a |
 | `page/raw.rs` `read_u16/u32/u64_unchecked` | `unsafe fn` ×3 + block ×3 | Caller guarantees `off + N <= buf.len()`; `read_unaligned` | miri |
@@ -175,12 +166,11 @@ tests, benches and examples are out of scope.
 | `page/trust.rs` `FileTrust::trust_contents` | `unsafe fn` | The caller guarantees only ZeroDB wrote the file | contract only |
 | `page/crc32c.rs` `crc_update` and two tests | block ×3 | The `crc` CPU feature was detected at run time | native tests (aarch64); not miri |
 
-### zerodb-io (26 blocks, 5 `unsafe fn`, 3 `unsafe impl`)
+### zerodb-io (27 blocks, 5 `unsafe fn`, 3 `unsafe impl`)
 
 | Site | Kind | Stated invariant | Coverage |
 |---|---|---|---|
-| `mmap.rs` `Mmap::new` | block | Module contract 1–4: the file outlives the map; nothing faults past EOF; one writer writing only unshared pages; no live borrow is rewritten | sanitizers; F1 |
-| `mmap.rs` `MmapWritable::new` | block | As above; stores go only through `write_at` and `slice_mut` | sanitizers |
+| `mmap.rs` `Mmap::pages`, `MmapWritable::pages` | block ×2 | Module contract 1–5: the file outlives the map; nothing faults past EOF; one writer writing only unshared pages; no live borrow is rewritten; borrows cover only the pages read. The mappings are `MmapRaw`, created without `unsafe` | sanitizers; mirrored by `TestWriteMap` under miri |
 | `mmap.rs` `MmapWritable::write_at` | `unsafe fn` + block | Single writer; no live view read at the target; pointer from the map root | sanitizers; mirrored by `TestWriteMap` under miri |
 | `mmap.rs` `MmapWritable::slice_mut` | `unsafe fn` + block | Exclusivity of the region is the caller's (the broker contract) | sanitizers; mirrored under miri |
 | `mmap.rs` `MapRegions` `Send`, `Sync` | `unsafe impl` ×2 | Raw pointers own `Send + Sync` boxes; `owned` mutated under its mutex; nothing freed before `Drop` | miri, TSan |
@@ -188,13 +178,14 @@ tests, benches and examples are out of scope.
 | `lib.rs` `WriteMapBacking::write_at_page` | block | Single writer, a page no snapshot references or a meta slot | sanitizers |
 | `lib.rs` `WriteMapBacking::map_dirty_page` | `unsafe fn` + block | Forwards the broker contract to `slice_mut`; bounds checked | sanitizers |
 | `file.rs` `write_pages_vectored` (`pwritev`) | block | iovecs point at borrows live for the call; the kernel only reads them | sanitizers (ASan checks iovec reads) |
+| `file.rs` `write_map_range` (`pwrite`) | block | The range is inside the mapping, which stays mapped while borrowed; the kernel only reads it; no reference is created | sanitizers; copy tests |
 | `lockfile.rs` `LockMap::u64_at`, `u32_at` | block ×2 | Map page-aligned, offset aligned and in bounds (constant offsets, `debug_assert`); every access to those bytes in every process is atomic | miri (anonymous map), sanitizers |
 | `lockfile.rs` `LockMap::slots` | block | Alignment, length, validity (every field atomic), lifetime, aliasing: listed in the comment | miri, sanitizers |
 | `lockfile.rs` `record_lock`, `probe_locked` (`fcntl`) | block ×2 | Open descriptor; `flock` on the stack | sanitizers |
 | `lockfile.rs` `one_byte_flock` (`mem::zeroed`) | block | `flock` is plain integers | sanitizers |
 | `lockfile.rs` `futex_wait`, `futex_wake_all` (Linux) | block ×2 | The word is a live, 4-aligned `u32` in the shared mapping; the kernel only reads the arguments | sanitizers (Linux); the word protocol is loom-checked in `zerodb_core::writer_word` |
 | `fault.rs` `FaultBacking::map_dirty_page` and two tests | `unsafe fn` + block ×3 | Pure forward of the broker contract | miri |
-| `testmap.rs` `TestWriteMap` `Sync`, `whole`, `write_at_page`, `map_dirty_page` | `unsafe impl` + `unsafe fn` + block ×3 | The test stand-in for the writable map; the same contract as the real one | miri (it is the instrument) |
+| `testmap.rs` `TestWriteMap` `Sync`, `root_pages`, `write_at_page`, `map_dirty_page` | `unsafe impl` + `unsafe fn` + block ×3 | The test stand-in for the writable map; the same contract as the real one | miri (it is the instrument) |
 
 ### zerodb (3 blocks, 1 `unsafe fn`)
 

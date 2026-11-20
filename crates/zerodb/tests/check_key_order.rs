@@ -164,11 +164,11 @@ fn snapshot_walk_takes_the_key_orders() {
 
     let r = env.read_txn().unwrap();
     let rev = reverse();
-    let v = check::check_snapshot(r.map_bytes(), PS, r.snapshot());
+    let v = check::check_snapshot(r.map_pages(), PS, r.snapshot());
     assert!(!v.is_empty() && only_key_order(&v), "{v:#?}");
     let order_of = |_: &[u8]| KeyOrder::Custom(&rev as &dyn Comparator);
     assert_eq!(
-        check::check_snapshot_with_key_order(r.map_bytes(), PS, r.snapshot(), &order_of),
+        check::check_snapshot_with_key_order(r.map_pages(), PS, r.snapshot(), &order_of),
         Vec::<String>::new()
     );
 }

@@ -55,7 +55,11 @@ or page validation), so the default stays a faithful drop-in.
 `unsafe` is allowed only in:
 
 - mmap access and page casting (`zerodb-core::page`, `zerodb-io`),
-  including the grow-only mapping cell (`zerodb-io::mmap::MapRegions`): an
+  including the page-bounded map view `zerodb-core::page::MapPages` (its
+  `slice::from_raw_parts` calls, its `unsafe fn` constructor, called from
+  `zerodb-io` and the test map, and its `Send`/`Sync` impls; ADR-0021
+  amendment 1), the `pwrite` that writes a range of the map to a file
+  (`zerodb-io::write_map_range`), the grow-only mapping cell (`zerodb-io::mmap::MapRegions`): an
   `AtomicPtr` to views and mappings freed only on drop — the view and mapping
   dereferences, the `Box::from_raw` calls in its `Drop` — with its
   `Send`/`Sync` impls (ADR-0023 amendment 15);
@@ -97,9 +101,8 @@ map-slice broker to realize a dirty page in the writable map at a freshly
 copied-on-write page number. Its `// SAFETY:` comments must state: a single
 writer (TXN-6); the target page is referenced by no live snapshot (TXN-62);
 exactly one live `&mut` per map region, tied to `&mut DirtyStore` and never
-stored; and no stale whole-map borrow aliases an in-place write (in-place
-transactions keep no cached whole-map view; heap modes re-derive theirs after
-each spill). The broker is an `unsafe fn`, never a safe function minting `&mut`
+stored; and no borrow of the map covers the region (every borrow covers only
+the page or run it reads, ADR-0021 amendment 1). The broker is an `unsafe fn`, never a safe function minting `&mut`
 from `&self`. The exception also covers the `Backing::map_dirty_page`
 `unsafe fn` declaration in `zerodb-core::env` and the
 `#[allow(clippy::mut_from_ref)]` on the broker, each with its exclusivity

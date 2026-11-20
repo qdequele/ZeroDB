@@ -1,15 +1,17 @@
 //! The [`Backing`] trait: how the I/O-free engine reaches the mapped file.
 
 use super::*;
+pub use crate::page::MapPages;
 
 /// A consistent (mapped bytes, logical map size) pair (ADR-0023),
 /// from one [`Backing::view`] call. No `Debug`: it would print the whole map.
 #[derive(Clone, Copy)]
 pub struct MapView<'a> {
-    /// The mapped bytes. A mapping is at least `map_size` long, and longer
+    /// The mapped region. A mapping is at least `map_size` long, and longer
     /// when the file is (the mapping covers the whole file); a heap test
-    /// backing may be shorter.
-    pub bytes: &'a [u8],
+    /// backing may be shorter. It lends page-bounded slices (ADR-0021
+    /// amendment 1): a backing never builds a whole-map `&[u8]` for it.
+    pub pages: MapPages<'a>,
     /// The logical map size: `MapFull` beyond it, and `MapResized` at a txn
     /// begin whose snapshot lies beyond it.
     pub map_size: u64,
@@ -36,14 +38,14 @@ pub trait Backing: Send + Sync {
     /// fixed pair.
     fn view(&self) -> MapView<'_>;
 
-    /// The whole mapped region as bytes: [`Backing::view`]'s bytes. Slot 0 is
+    /// The mapped region: [`Backing::view`]'s pages. Slot 0 is
     /// `[0, page_size)`, slot 1 is `[page_size, 2*page_size)`; data pages
     /// follow. The region may extend past the current file length (ADR-0004:
     /// the map covers the full `map_size`); callers only dereference pages
     /// a committed snapshot references, which are always within the file
     /// (SPEC 06 REC-14).
-    fn bytes(&self) -> &[u8] {
-        self.view().bytes
+    fn pages(&self) -> MapPages<'_> {
+        self.view().pages
     }
 
     /// Set the logical map size to `map_size`, adding a mapping of
@@ -94,7 +96,7 @@ pub trait Backing: Send + Sync {
     /// a lock-file environment (ADR-0023) decode metas from this copy,
     /// never from a borrowed map slice: another process may be rewriting the
     /// slot, and a torn copy is caught by its CRC. The default copies from
-    /// [`Backing::bytes`] (heap test backings); file backings use `pread`.
+    /// [`Backing::pages`] (heap test backings); file backings use `pread`.
     ///
     /// # Errors
     ///
@@ -103,8 +105,8 @@ pub trait Backing: Send + Sync {
         let ps = psize as usize;
         let start = slot as usize * ps;
         let src = self
-            .bytes()
-            .get(start..start + ps)
+            .pages()
+            .get(start, ps)
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
         buf[..ps].copy_from_slice(src);
         Ok(())
@@ -171,9 +173,9 @@ pub trait Backing: Send + Sync {
     /// - there is a single writer (TXN-6);
     /// - at most one `&mut` into the region is live at a time, tied to
     ///   `&mut` on the dirty store and never stored (TXN-39/41/42);
-    /// - no outstanding `&[u8]` view of the map is later read at locations
-    ///   this slice wrote — the writer re-derives its whole-map read view
-    ///   after every spill (TXN-71, ADR-0021).
+    /// - no `&[u8]` borrowed from [`Backing::pages`] covers the region while
+    ///   the slice lives: every such borrow covers only the page or run read
+    ///   (ADR-0021 amendment 1).
     // `unsafe fn` *declaration* only (ADR-0021: no safe fn may mint `&mut`
     // from `&self`); the default body is trivially safe and the one unsafe
     // *call* lives in `crate::dirty::map_mut`, the home the CONTRIBUTING.md policy

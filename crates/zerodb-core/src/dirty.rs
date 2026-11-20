@@ -373,15 +373,13 @@ unsafe fn map_mut(broker: Option<&dyn Backing>, psize: u32, pgno: u64, len: usiz
     //    of the store whose signature re-ties the returned borrow, the store
     //    never retains it (only `Slot::Map { len }` bookkeeping), and no
     //    caller invokes it twice without the previous borrow dying first.
-    //  * The whole-map `&[u8]` read view is re-derived after each spill
-    //    (`RwTxn::spill`, ADR-0021) and — in in-map mode — re-borrowed
-    //    lazily on every access (`RwTxn::whole_map`: under Stacked Borrows
-    //    even *copying* a stale view after an in-place write is UB at the
-    //    written locations), so no stale shared
-    //    borrow is ever created over, or read at, locations an in-place
-    //    write touched; shared views of dirty frames (`DirtyStore::bytes`)
-    //    likewise re-derive from `broker.bytes()` on every call and are
-    //    tied to `&self` (TXN-39/41).
+    //  * No shared borrow of the map covers the region: the engine holds
+    //    the map as a page-bounded `MapPages` handle and every borrow it
+    //    takes, the writer's or a reader's in any thread, covers only the
+    //    page or run it reads (ADR-0021 amendment 1), and a TXN-62 page is
+    //    read by no one; shared views of this txn's own frames
+    //    (`DirtyStore::bytes`) are taken per call, tied to `&self`
+    //    (TXN-39/41), and so are dead whenever this `&mut self` op runs.
     unsafe {
         b.map_dirty_page(pgno, psize, pages)
             .expect("in-map frame region was brokered at insert and the map never shrinks")
@@ -642,26 +640,25 @@ impl<'env> DirtyStore<'env> {
                 // A one-page map frame, found without the index.
                 let ps = self.psize as usize;
                 let off = (pgno as usize) * ps;
-                let bytes = self
+                return self
                     .broker
                     .expect("frame bits exist only in an in-map store")
-                    .bytes();
-                return Some(&bytes[off..off + ps]);
+                    .pages()
+                    .get(off, ps);
             }
             _ => {}
         }
         match self.frames.get(&pgno)? {
             Slot::Heap(b) => Some(&**b),
             Slot::Map { len } => {
-                // Shared view of the in-map frame: a plain subslice of the
-                // backing's shared map bytes, tied to `&self` like any heap
-                // frame view (TXN-39/41).
+                // Shared view of the in-map frame: exactly its bytes, from
+                // the backing's page-bounded map view, tied to `&self` like
+                // any heap frame view (TXN-39/41).
                 let off = (pgno as usize) * self.psize as usize;
-                let bytes = self
-                    .broker
+                self.broker
                     .expect("Slot::Map exists only in an in-map store")
-                    .bytes();
-                Some(&bytes[off..off + *len])
+                    .pages()
+                    .get(off, *len)
             }
         }
     }
@@ -838,11 +835,12 @@ impl<'env> DirtyStore<'env> {
             Slot::Heap(b) => Some(b),
             Slot::Map { len } => {
                 let off = (pgno as usize) * self.psize as usize;
-                let bytes = self
+                let src = self
                     .broker
                     .expect("Slot::Map exists only in an in-map store")
-                    .bytes();
-                let src = &bytes[off..off + len];
+                    .pages()
+                    .get(off, len)
+                    .expect("an in-map frame lies inside the map");
                 let mut b = match self.spare.pop() {
                     Some(f) if f.len() == len => f,
                     Some(f) => {

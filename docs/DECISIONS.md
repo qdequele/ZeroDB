@@ -29,7 +29,7 @@ Approved or accepted, and in `main`.
 | 0015 | [Opt-in sequential-writes fast path](adr/0015-sequential-writes-option.md) | Accepted | Performance (writes) |
 | 0017 | [Bounded dirty-page memory in large write transactions (spilling)](adr/0017-bounded-dirty-memory.md) | Accepted | Memory |
 | 0018 | [Env-wide validated-pages cache across transactions](adr/0018-cross-txn-validation-cache.md) | Accepted | Performance (reads) |
-| 0021 | [True in-place WRITE_MAP](adr/0021-writemap-in-place.md) | Accepted, implemented; amendment 1 draft, awaiting approval | Performance (writes), `unsafe` policy |
+| 0021 | [True in-place WRITE_MAP](adr/0021-writemap-in-place.md) | Accepted, implemented; amendment 1 approved (Option A), benchmark pending | Performance (writes), `unsafe` policy |
 | 0022 | [Meta free-list annex (format v2)](adr/0022-meta-freelist-annex.md) | Accepted, implemented | On-disk format, page reclamation |
 | 0023 | [Multi-process access: lock file, shared reader table, cross-process writer lock](adr/0023-multi-process.md) | Accepted, implemented | Concurrency |
 | 0024 | [Database handle lifetime: stale handles after abort and remove](adr/0024-database-handle-lifetime.md) | Accepted (Option A), implemented | API, LMDB parity |

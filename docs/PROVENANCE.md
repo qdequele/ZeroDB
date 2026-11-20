@@ -65,7 +65,10 @@ plainly as the strengths.
   anonymous map, the grow-only map cell, the fault-injection backend), and
   the unit tests of `heed-zerodb` over a heap-backed map (the lifetime-erased
   write cursor, the `Send` read transaction, the TLS-marker retags and the
-  reserved-space view).
+  reserved-space view). Both include a reader thread running while the
+  writer stores into free pages, in both write modes: miri found that the
+  read path's whole-map borrows were undefined behavior there, and the fix
+  (ADR-0021 amendment 1) bounds every borrow to the pages read.
 - **Sanitizers.** A nightly job runs the tests of `zerodb-io`, `zerodb` and
   `heed-zerodb`, including the multi-process ones, under ThreadSanitizer and
   AddressSanitizer on x86-64 and aarch64.
@@ -88,8 +91,8 @@ plainly as the strengths.
 
   | Crate | `unsafe` blocks | `unsafe fn` | `unsafe impl` |
   |---|---:|---:|---:|
-  | `zerodb-core` | 21 | 6 | 0 |
-  | `zerodb-io` | 26 | 5 | 3 |
+  | `zerodb-core` | 24 | 7 | 2 |
+  | `zerodb-io` | 27 | 5 | 3 |
   | `zerodb` | 3 | 1 | 0 |
   | `heed-zerodb` | 12 | 9 | 1 |
   | `zerodb-tools` | 3 | 0 | 0 |
@@ -101,14 +104,8 @@ plainly as the strengths.
   lock file's `open`, `fcntl` and the futex run only natively and under the
   sanitizers, which check one process at a time and know nothing of the
   synchronization between processes. The heap-backed map miri runs over
-  models only the `WRITE_MAP` in-place path.
-- **An open miri finding.** Under `WRITE_MAP`, a reader thread holds slices
-  of the map that span pages the writer rewrites in place in another thread.
-  The bytes the reader reads are never written, but Rust's aliasing rules
-  cover every byte a reference spans, and miri reports undefined behavior
-  under both Stacked and Tree Borrows. Fixing it changes how pages are
-  viewed and needs a design decision; see
-  [maintainers/UNSAFE-AUDIT.md](maintainers/UNSAFE-AUDIT.md#f1-reader-slices-of-the-map-span-pages-the-writer-rewrites-in-place-open).
+  models the writer's stores, in place and through `pwrite`, but not writes
+  by another process.
 - **No I/O-error injection.** The fault-injecting backend models crashes, not
   failing system calls. No test injects `EIO` or `ENOSPC` into a write or a
   sync.

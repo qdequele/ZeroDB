@@ -6,11 +6,11 @@
 //!
 //! It implements exactly the [`Backing`] surface the in-place path uses:
 //!
-//! - [`Backing::view`] (and so [`Backing::bytes`]) mints a fresh
-//!   whole-buffer `&[u8]` per call, with the buffer's length as the logical
-//!   map size. Like a `MAP_SHARED` view that is never remapped, this is what
-//!   the engine's read paths hold; the writer re-derives its copy per spill
-//!   (ADR-0021);
+//! - [`Backing::view`] (and so [`Backing::pages`]) lends a [`MapPages`]
+//!   built from the cell's root pointer, with the buffer's length as the
+//!   logical map size, exactly as the real mappings do (ADR-0021
+//!   amendment 1): every borrow the engine takes covers only the pages it
+//!   reads;
 //! - [`Backing::map_dirty_page`] (the `unsafe fn` broker, ADR-0021) mints
 //!   the region `&mut [u8]` from a root-derived raw pointer, exactly as
 //!   `MmapWritable::slice_mut` does;
@@ -21,9 +21,9 @@
 //!   written locations through a stale view.
 //!
 //! Any violation of the brokered contract — two live `&mut` into one region,
-//! a stale `&[u8]` read at in-place-written locations (the ADR-0021
-//! hazard), a frame borrow outliving its `&mut` op — is undefined behavior
-//! on this backing and miri reports it. `zerodb-core`'s
+//! a `&[u8]` (in any thread) covering bytes the writer stores to, a frame
+//! borrow outliving its `&mut` op — is undefined behavior on this backing
+//! and miri reports it. `zerodb-core`'s
 //! `writemap_in_place_miri` integration test drives the full txn surface
 //! (COW touch, splits, overflow runs, `put_reserved`, spill/unspill, nested
 //! reads, abort, readers across commits) over this backing under
@@ -35,7 +35,7 @@
 
 use std::cell::UnsafeCell;
 
-use zerodb_core::env::{Backing, MapView};
+use zerodb_core::env::{Backing, MapPages, MapView};
 use zerodb_core::page::MetaPage;
 
 /// The in-memory writable "map". See the module docs.
@@ -94,22 +94,21 @@ impl TestWriteMap {
     }
 
     fn len(&self) -> usize {
-        self.whole().len()
+        self.pages().len()
     }
 
-    /// The whole buffer as a fresh shared view.
+    /// The buffer as a page-bounded view from the cell's root pointer.
     #[allow(unsafe_code)]
-    fn whole(&self) -> &[u8] {
-        // SAFETY: a fresh whole-buffer shared view per call, derived from the
-        // cell's root (no `&mut` is created on the way — `addr_of!` projects
-        // the place raw). Sound under the map contract (see `Sync` above):
-        // the single writer mutates only TXN-62 regions and re-derives its
-        // own read view after each spill, so no caller reads this view at
-        // locations a later in-place write touched. miri enforces exactly
-        // that: a stale read at written locations is reported.
+    fn root_pages(&self) -> MapPages<'_> {
+        // SAFETY: the pointer and length come from the cell's root without
+        // creating any reference on the way (`addr_of!` projects the place
+        // raw; `<*const [u8]>::len` reads the length from the pointer). The
+        // buffer lives as long as `self`. Stores keep to the map contract
+        // (see `Sync` above), which miri checks here.
         unsafe {
             let b = self.bytes.get();
-            &*std::ptr::addr_of!(**b)
+            let whole: *const [u8] = std::ptr::addr_of!(**b);
+            MapPages::from_raw_parts(whole.cast::<u8>(), whole.len())
         }
     }
 
@@ -129,10 +128,10 @@ impl TestWriteMap {
 #[allow(unsafe_code)]
 impl Backing for TestWriteMap {
     fn view(&self) -> MapView<'_> {
-        let bytes = self.whole();
+        let pages = self.root_pages();
         MapView {
-            bytes,
-            map_size: bytes.len() as u64,
+            pages,
+            map_size: pages.len() as u64,
         }
     }
 

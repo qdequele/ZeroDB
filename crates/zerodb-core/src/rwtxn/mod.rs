@@ -67,8 +67,8 @@ use crate::page::geometry::{
     overflow_page_count, pil_decode, pil_encode_into, pil_size, value_is_inline, GcKey,
 };
 use crate::page::{
-    write_overflow_head, BranchMut, BranchRef, DBRecord, LeafMut, LeafRef, LeafValue, MetaPage,
-    PageError, PageRef, PageType, DBRECORD_LEN, FILL_THRESHOLD_PERMILLE, FIRST_DATA_PGNO,
+    write_overflow_head, BranchMut, BranchRef, DBRecord, LeafMut, LeafRef, LeafValue, MapPages,
+    MetaPage, PageError, PageRef, PageType, DBRECORD_LEN, FILL_THRESHOLD_PERMILLE, FIRST_DATA_PGNO,
     FORMAT_VERSION, F_SUBDATA, HEADER_SIZE, MAGIC, MAX_DATA_SIZE, MAX_DB_NAME, MAX_KEY_SIZE,
     MIN_KEYS_BRANCH, MIN_KEYS_LEAF, PGNO_INVALID,
 };
@@ -361,13 +361,11 @@ pub struct RwTxn<'env> {
     /// thread-agnostic [`crate::env`] writer-lock guard, not a
     /// `std::sync::MutexGuard`).
     _guard: crate::env::WriterGuard<'env>,
-    /// The mapped region (fallback source for untouched pages, TXN-38), heap
-    /// modes only, re-derived at every spill (TXN-71). Under in-place
-    /// `WRITE_MAP` (TXN-45b) it is the **empty slice**: a stale whole-map
-    /// reference field would be retagged on every move of the txn, which is
-    /// UB at the written locations, so [`RwTxn::whole_map`] borrows lazily
-    /// instead (ADR-0021).
-    bytes: &'env [u8],
+    /// The mapped region (fallback source for untouched pages, TXN-38). A
+    /// [`MapPages`] holds a pointer, not a reference, so keeping it across
+    /// the txn's in-place stores (TXN-45b), spills (TXN-71) and moves
+    /// asserts nothing about bytes it does not lend (ADR-0021 amendment 1).
+    map: MapPages<'env>,
     /// The snapshot this txn grew from (`writer_txnid = base.txnid + 1`).
     /// `Some` until the txn's drop hands it to the [`WriterCarry`]; read it
     /// through [`RwTxn::base`].
@@ -547,9 +545,7 @@ impl Env {
             alloc_mode: AllocMode::Normal,
             errored: false,
             children: ChildCounter::new(),
-            // In-place WRITE_MAP keeps no whole-map reference in the struct
-            // (see the field docs; ADR-0021) — `whole_map` borrows lazily.
-            bytes: if in_map { &[] } else { view.bytes },
+            map: view.pages,
             base: Some(base),
             work: Some(work),
             _guard: guard,
@@ -562,7 +558,7 @@ impl TxnRead for RwTxn<'_> {
     fn source(&self) -> Source<'_> {
         Source::Writer {
             dirty: &self.dirty,
-            bytes: self.whole_map(),
+            map: self.map,
             // Bounds the map fallback only: pages this txn allocated beyond
             // the base snapshot live in `dirty` and resolve before the bound,
             // or were spilled below `read_high` (SPEC 04 TXN-71).
@@ -784,32 +780,6 @@ impl<'env> RwTxn<'env> {
         Ok(TreeId::Named(dbi))
     }
 
-    /// The whole-map read view this txn's resolutions go through (TXN-38).
-    ///
-    /// Under in-place `WRITE_MAP` (ADR-0021, TXN-45b) the writer mutates map
-    /// bytes **mid-txn** (through the brokered slices), so a view cached at
-    /// txn begin would predate those writes: under Stacked/Tree Borrows,
-    /// copying such a stale `&[u8]` — let alone reading a spilled page
-    /// through it — is undefined behavior at the written locations
-    /// (ADR-0021). The in-map arm therefore borrows the view **lazily per
-    /// access**, exactly as `RoTxn` does: a fresh borrow at a `&self`
-    /// boundary postdates every in-place write, and none can happen while
-    /// it lives (TXN-39).
-    ///
-    /// Heap modes keep the cached view (`self.bytes`, re-derived per spill —
-    /// TXN-71, ADR-0021): their mid-txn file writes go through the fd,
-    /// and the only Rust-visible map mutation is the commit/spill-time
-    /// `memcpy` of the heap-staged WRITE_MAP backing, which the spill-time
-    /// re-derivation postdates.
-    #[inline]
-    fn whole_map(&self) -> &'env [u8] {
-        if self.dirty.in_map_mode() {
-            self.env.inner().backing_bytes()
-        } else {
-            self.bytes
-        }
-    }
-
     fn load(&self, pgno: u64) -> Result<PageRef<'_>> {
         // Trusted-psize load: psize is env-validated at open.
         PageRef::new_trusted_psize(
@@ -843,14 +813,13 @@ impl<'env> RwTxn<'env> {
         let base = (pgno as usize)
             .checked_mul(ps)
             .ok_or(Error::Mdb(MdbError::Invalid))?;
-        // Take the `&'env [u8]` map view out of `self` (lifetime 'env, so the
-        // source borrow does not alias the `&mut self.dirty` op below —
-        // letting `insert_copy` copy straight into a pooled frame). Under
-        // in-place WRITE_MAP this is a fresh per-access borrow postdating
-        // every brokered write (see `RwTxn::whole_map`).
-        let map: &[u8] = self.whole_map();
-        let src = map
-            .get(base..base + ps)
+        // The committed page alone, borrowed for 'env from the map handle
+        // (so the borrow does not alias the `&mut self.dirty` op below —
+        // letting `insert_copy` copy straight into a pooled frame, or, in
+        // place, into the map at `np`, a page this slice does not cover).
+        let src = self
+            .map
+            .get(base, ps)
             .ok_or(Error::Mdb(MdbError::Invalid))?;
         let np = self.allocate(1)?;
         // Copy the committed page into a fresh (or recycled) frame — under

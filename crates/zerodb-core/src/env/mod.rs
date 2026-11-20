@@ -35,7 +35,7 @@ mod info;
 mod open;
 mod writer_lock;
 
-pub use backing::{Backing, MapView};
+pub use backing::{Backing, MapPages, MapView};
 pub use info::{EnvClosingEvent, EnvInfo, EnvStat, ReaderEntry};
 pub(crate) use open::read_snapshot_at;
 use open::{bytes_needed, check_snapshot_backed, META_RETRY_LIMIT};
@@ -187,7 +187,7 @@ pub(crate) struct EnvInner {
     /// No `Mutex` is needed: the only mutation is the release in [`EnvInner`]'s
     /// `Drop`, which receives `&mut self` and runs only when the last `Arc`
     /// reference is gone (so no reader can be touching it concurrently). Shared
-    /// `&self` readers ([`EnvInner::backing_bytes`], `real_disk_size`, …) take
+    /// `&self` readers ([`EnvInner::backing_pages`], `real_disk_size`, …) take
     /// only immutable references, which is why a `RoTxn` can borrow the mapped
     /// `&[u8]` for its whole life (SPEC 04 TXN-37) with no `unsafe` in this
     /// crate. `Backing: Send + Sync` keeps `EnvInner: Sync`.
@@ -1054,17 +1054,18 @@ impl EnvInner {
         }
     }
 
-    /// The whole mapped env file as bytes, borrowed for as long as this
-    /// `EnvInner` is borrowed (SPEC 04 TXN-37). A `RoTxn` holds `&'env Env`,
-    /// which keeps the owning `Arc<EnvInner>` (and hence this map) alive for the
-    /// txn's life, so the returned slice is valid `'env`. Returns an empty slice
-    /// only after close has released the map (never observed by a live txn).
+    /// The mapped env file, borrowed for as long as this `EnvInner` is
+    /// borrowed (SPEC 04 TXN-37). A `RoTxn` holds `&'env Env`, which keeps
+    /// the owning `Arc<EnvInner>` (and hence this map) alive for the txn's
+    /// life, so the view is valid `'env`. It lends page-bounded slices only
+    /// (ADR-0021 amendment 1). Empty only after close has released the map
+    /// (never observed by a live txn).
     #[must_use]
     #[inline]
-    pub(crate) fn backing_bytes(&self) -> &[u8] {
+    pub(crate) fn backing_pages(&self) -> MapPages<'_> {
         match self.backing.as_ref() {
-            Some(b) => b.bytes(),
-            None => &[],
+            Some(b) => b.pages(),
+            None => MapPages::empty(),
         }
     }
 
@@ -1168,11 +1169,13 @@ impl Env {
         self.inner.snapshot()
     }
 
-    /// The whole mapped data file (test and harness hook).
+    /// The whole mapped data file (test and harness hook). A whole-map
+    /// borrow: only for assertions made while no write transaction of this
+    /// process runs ([`MapPages::whole`]).
     #[doc(hidden)]
     #[must_use]
     pub fn backing_bytes(&self) -> &[u8] {
-        self.inner.backing_bytes()
+        self.inner.backing_pages().whole()
     }
 
     /// Whether the validated-page cache holds `pgno` at `stamp` (test hook).

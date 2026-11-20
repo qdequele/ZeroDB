@@ -7,8 +7,10 @@
 //! pages; SPEC 04 TXN-38, ADR-0004). Reads copy nothing: keys and values are
 //! `&'a [u8]` borrowed from the backing bytes (SPEC 04 TXN-37/41), and a
 //! `F_BIGDATA` value resolves to one contiguous slice spanning its overflow
-//! run (SPEC 03 §3; a dirty run is one contiguous frame, TXN-41). This
-//! module contains no `unsafe` and no I/O, so miri can run all of it.
+//! run (SPEC 03 §3; a dirty run is one contiguous frame, TXN-41). Every
+//! borrow covers exactly the page or run read, never the whole map
+//! (ADR-0021 amendment 1). This module contains no `unsafe` and no I/O, so
+//! miri can run all of it.
 //!
 //! The cursor is a root-to-leaf path (`stack` of `(pgno, ki)` frames) plus the
 //! `INITIALIZED`/`EOF` flags of SPEC 03 §4. Each public op documents the §4
@@ -22,7 +24,7 @@ use std::sync::OnceLock;
 use super::cmp::KeyCmp;
 use super::dirty::{DirtyStore, Resolved};
 use super::page::{
-    BranchRef, FileTrust, LeafRef, LeafValue, OverflowRef, PageError, PageRef, PageType,
+    BranchRef, FileTrust, LeafRef, LeafValue, MapPages, OverflowRef, PageError, PageRef, PageType,
     PGNO_INVALID,
 };
 use super::stamps::StampCache;
@@ -51,12 +53,18 @@ pub type PosResult<'a> = Result<Option<Entry<'a>>, PageError>;
 /// borrow came from; the lifetime rules are identical (SPEC 04 §6.2). A
 /// nested read txn reads through its parent writer's source, and WRITE_MAP
 /// changes only the backing behind it (TXN-46).
+///
+/// Both variants hold the map as a [`MapPages`] handle, never as a whole-map
+/// `&[u8]`: every borrow they lend covers exactly the page or overflow run
+/// being read (ADR-0021 amendment 1). The writer of this process may be
+/// storing into free pages below the high-water while a reader holds a
+/// source; no slice lent here covers them (TXN-62).
 #[derive(Clone, Copy)]
 pub enum Source<'a> {
     /// The read-only mapped env file.
     Map {
-        /// The whole mapped region.
-        bytes: &'a [u8],
+        /// The mapped region.
+        map: MapPages<'a>,
         /// The pinned snapshot's committed high-water (`Snapshot::last_pg`).
         /// Map reads refuse any pgno beyond it: the mapping covers the full
         /// `map_size` (ADR-0004), so bytes past the end of the file are
@@ -71,7 +79,7 @@ pub enum Source<'a> {
         /// the store holds only a shared reference to the backing (ADR-0021).
         dirty: &'a DirtyStore<'a>,
         /// The mapped region (fallback for untouched pages).
-        bytes: &'a [u8],
+        map: MapPages<'a>,
         /// The base snapshot's committed high-water. It bounds only reads
         /// from the map: pages the writer allocates beyond it live in `dirty`
         /// and are resolved before this bound is consulted.
@@ -80,10 +88,10 @@ pub enum Source<'a> {
 }
 
 impl<'a> Source<'a> {
-    /// Bytes beginning at page `pgno`: at least one page; for an overflow head
-    /// resolved from this source, the returned slice covers the whole run
-    /// (a dirty run is its full contiguous frame; a mapped run extends to the
-    /// end of the map, bounded by the overflow decoder).
+    /// The bytes of page `pgno`: exactly one page for a map page, the whole
+    /// frame for a dirty frame (a dirty overflow run is one contiguous
+    /// frame, TXN-41). Overflow runs read from the map go through
+    /// [`Source::overflow_run`].
     pub(crate) fn bytes_from(&self, psize: u32, pgno: u64) -> Result<&'a [u8], PageError> {
         self.bytes_from_classified(psize, pgno).map(|(b, _)| b)
     }
@@ -106,51 +114,90 @@ impl<'a> Source<'a> {
         psize: u32,
         pgno: u64,
     ) -> Result<(&'a [u8], bool), PageError> {
-        let ps = psize as usize;
-        let map_slice = |bytes: &'a [u8], last_pg: u64| -> Result<&'a [u8], PageError> {
-            // Map reads never go past the snapshot's high-water: the file may
-            // not back the pages there even though the mapping covers them
-            // (see the `Source` field docs). A corrupt reference gets a typed
-            // error, not a fault.
-            if pgno > last_pg {
-                return Err(PageError::PageOutOfBounds { pgno, last_pg });
-            }
-            let base = (pgno as usize)
-                .checked_mul(ps)
-                .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })?;
-            let slice = bytes
-                .get(base..)
-                .filter(|s| s.len() >= ps)
-                .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })?;
-            // Clamp the slice at the high-water, so that reading a multi-page
-            // overflow value cannot go past it either.
-            let cap = usize::try_from(last_pg - pgno + 1)
-                .ok()
-                .and_then(|n| n.checked_mul(ps));
-            Ok(match cap {
-                Some(c) if c < slice.len() => &slice[..c],
-                _ => slice,
-            })
-        };
         match self {
-            Source::Map { bytes, last_pg } => map_slice(bytes, *last_pg).map(|b| (b, true)),
+            Source::Map { map, last_pg } => {
+                map_pages(*map, psize, pgno, 1, *last_pg).map(|b| (b, true))
+            }
             Source::Writer {
                 dirty,
-                bytes,
+                map,
                 last_pg,
             } => match dirty.resolve(pgno) {
-                Resolved::Clean => map_slice(bytes, *last_pg).map(|b| (b, true)),
-                // An in-map dirty page lives at its own pgno in the map,
-                // which `bytes` views (ADR-0021).
-                Resolved::MapPage => (pgno as usize)
-                    .checked_mul(ps)
-                    .and_then(|base| bytes.get(base..base.checked_add(ps)?))
-                    .map(|b| (b, false))
-                    .ok_or(PageError::BufferTooSmall { got: 0, psize: ps }),
+                Resolved::Clean => map_pages(*map, psize, pgno, 1, *last_pg).map(|b| (b, true)),
+                // An in-map dirty page lives at its own pgno in the map
+                // (ADR-0021).
+                Resolved::MapPage => {
+                    let ps = psize as usize;
+                    (pgno as usize)
+                        .checked_mul(ps)
+                        .and_then(|base| map.get(base, ps))
+                        .map(|b| (b, false))
+                        .ok_or(PageError::BufferTooSmall { got: 0, psize: ps })
+                }
                 Resolved::Frame(frame) => Ok((frame, false)),
             },
         }
     }
+
+    /// The bytes of the overflow run headed at `pgno` that hold a value of
+    /// `dsize` bytes: the `⌈(HEADER_SIZE + dsize) / psize⌉` pages from the
+    /// head, cut at the high-water, or the whole dirty frame. A run that
+    /// would cross the high-water yields the pages below it, so the overflow
+    /// decoder reports the short run as it did when map slices extended to
+    /// the high-water.
+    pub(crate) fn overflow_run(
+        &self,
+        psize: u32,
+        pgno: u64,
+        dsize: u32,
+    ) -> Result<&'a [u8], PageError> {
+        let ps = u64::from(psize);
+        let n = (crate::page::HEADER_SIZE as u64 + u64::from(dsize)).div_ceil(ps);
+        match self {
+            Source::Map { map, last_pg } => map_pages(*map, psize, pgno, n, *last_pg),
+            Source::Writer {
+                dirty,
+                map,
+                last_pg,
+            } => match dirty.resolve(pgno) {
+                Resolved::Clean => map_pages(*map, psize, pgno, n, *last_pg),
+                // A one-page in-map frame; a multi-page in-map run resolves
+                // as `Frame`.
+                Resolved::MapPage => self.bytes_from(psize, pgno),
+                Resolved::Frame(frame) => Ok(frame),
+            },
+        }
+    }
+}
+
+/// Pages `[pgno, pgno + n)` of `map`, cut at the high-water `last_pg` and at
+/// the end of the map. At least one page must be available.
+///
+/// Map reads never go past the snapshot's high-water: the file may not back
+/// the pages there even though the mapping covers them (see the `Source`
+/// field docs). A corrupt reference gets a typed error, not a fault.
+#[inline(always)]
+fn map_pages(
+    map: MapPages<'_>,
+    psize: u32,
+    pgno: u64,
+    n: u64,
+    last_pg: u64,
+) -> Result<&'_ [u8], PageError> {
+    let ps = psize as usize;
+    if pgno > last_pg {
+        return Err(PageError::PageOutOfBounds { pgno, last_pg });
+    }
+    let too_small = PageError::BufferTooSmall { got: 0, psize: ps };
+    let base = (pgno as usize).checked_mul(ps).ok_or(too_small.clone())?;
+    // Pages available from `pgno`: below the high-water and inside the map.
+    let in_map = (map.len().saturating_sub(base) / ps) as u64;
+    let avail = n.min(last_pg - pgno + 1).min(in_map);
+    if avail == 0 {
+        return Err(too_small);
+    }
+    // `avail * ps <= map.len() - base`, so neither overflows.
+    map.get(base, avail as usize * ps).ok_or(too_small)
 }
 
 /// The leaf view of `pgno` from `src`. A memo hit on a map page skips the
@@ -455,7 +502,7 @@ fn resolve_overflow<'a>(
     dsize: u32,
     valid: Option<&ValidatedPages<'_>>,
 ) -> Result<&'a [u8], PageError> {
-    let run = src.bytes_from(psize, head_pgno)?;
+    let run = src.overflow_run(psize, head_pgno, dsize)?;
     if valid.is_some_and(ValidatedPages::trusts_file) {
         let end = crate::page::HEADER_SIZE + dsize as usize;
         return run
@@ -1628,7 +1675,7 @@ mod tests {
     /// last page (built images are exact-length files).
     fn src(img: &[u8]) -> Source<'_> {
         Source::Map {
-            bytes: img,
+            map: MapPages::from_slice(img),
             last_pg: (img.len() / PS as usize) as u64 - 1,
         }
     }

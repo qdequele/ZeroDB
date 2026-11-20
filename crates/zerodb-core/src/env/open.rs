@@ -201,10 +201,10 @@ pub fn open_with_backing_shared(
     // Validate the two meta slots from the mapped bytes (SPEC 02 §3.2). A
     // decode error here (bad page size / truncated buffer) means the file is not
     // a usable env → Invalid.
-    let bytes = backing.bytes();
+    let pages = backing.pages();
     let ps = page_size as usize;
-    let slot0 = read_slot(bytes, META_A_PGNO, page_size)?;
-    let slot1 = read_slot(bytes, META_B_PGNO, page_size)?;
+    let slot0 = read_slot(pages, META_A_PGNO, page_size)?;
+    let slot1 = read_slot(pages, META_B_PGNO, page_size)?;
 
     // Select the live snapshot (SPEC 02 §3.2 / SPEC 06 REC-2..5).
     let (meta, chosen_slot) = match select_meta(&slot0, &slot1, prev_snapshot) {
@@ -226,7 +226,9 @@ pub fn open_with_backing_shared(
     // overwritten two commits later, so the ids are pinned in the Snapshot.
     // `fl_count` passed the §3.2 rule-5 bound + CRC; the ids' GC-29 shape is
     // validated by the consumer before any id is handed out (GC-33).
-    let annex = MetaPage::read_annex(&bytes[chosen_slot * ps..(chosen_slot + 1) * ps], page_size)
+    let annex = pages
+        .get(chosen_slot * ps, ps)
+        .and_then(|slot| MetaPage::read_annex(slot, page_size))
         .ok_or(Error::Mdb(MdbError::Invalid))?;
 
     // SPEC 06 REC-1a / SPEC 02 §3.2 step 6 (geometry validation): a slot can
@@ -366,19 +368,16 @@ pub fn open_with_backing_shared(
 }
 
 /// Validate one meta slot at `pgno` from the mapped bytes.
-fn read_slot(bytes: &[u8], pgno: u64, page_size: u32) -> Result<MetaValidity, Error> {
+fn read_slot(pages: MapPages<'_>, pgno: u64, page_size: u32) -> Result<MetaValidity, Error> {
     let base = pgno as usize * page_size as usize;
-    let end = base
-        .checked_add(page_size as usize)
+    // The mapped region does not even cover both meta slots → not an env.
+    let slot = pages
+        .get(base, page_size as usize)
         .ok_or(Error::Mdb(MdbError::Invalid))?;
-    if end > bytes.len() {
-        // The mapped region does not even cover both meta slots → not an env.
-        return Err(Error::Mdb(MdbError::Invalid));
-    }
     // `validate` never panics on bad content; a decode error (bad reader psize)
     // is impossible here because `page_size` is validated by the caller, but map
     // any such error to Invalid defensively.
-    MetaPage::validate(&bytes[base..end], page_size).map_err(|_| Error::Mdb(MdbError::Invalid))
+    MetaPage::validate(slot, page_size).map_err(|_| Error::Mdb(MdbError::Invalid))
 }
 
 /// The snapshot committed as txnid `t`, decoded from a copy of meta slot
@@ -539,7 +538,7 @@ fn check_snapshot_in_view(
     if needed > view.map_size {
         return Err(Error::Mdb(MdbError::MapResized));
     }
-    if needed > view.bytes.len() as u64 {
+    if needed > view.pages.len() as u64 {
         // A map shorter than its logical size: a bug or corruption.
         return Err(Error::Mdb(MdbError::Invalid));
     }

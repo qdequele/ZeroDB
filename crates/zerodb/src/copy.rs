@@ -766,15 +766,20 @@ fn write_raw(
     // Pages 0..=last_pg. Slots 0/1 are synthesized; the rest are data.
     let n_pages = snap.last_pg + 1;
     let data_end = (snap.last_pg as usize + 1) * ps;
-    let map = txn.map_bytes();
-    let src = map.get(..data_end).ok_or(Error::Mdb(MdbError::Invalid))?;
+    // Free pages below `last_pg` may be written by this process's writer
+    // during the copy, so they are never lent as a `&[u8]`: the kernel reads
+    // them from the map (ADR-0021 amendment 1).
+    let map = txn
+        .map_pages()
+        .prefix(data_end)
+        .ok_or(Error::Mdb(MdbError::Invalid))?;
 
     file.write_all_at(&snapshot_metas(env, txn)?, base)?;
 
     // Data pages in chunks, so progress is observable.
     for_each_chunk(FIRST_DATA_PGNO, n_pages, psize, progress, |pg, end| {
         let (from, to) = (pg as usize * ps, end as usize * ps);
-        file.write_all_at(&src[from..to], base + from as u64)?;
+        zerodb_io::write_map_range(file, map, from, to - from, base + from as u64)?;
         Ok(())
     })?;
     Ok(data_end as u64)

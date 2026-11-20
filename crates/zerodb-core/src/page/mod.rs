@@ -26,6 +26,11 @@
 mod crc32c;
 pub mod geometry;
 mod header;
+// Sanctioned `unsafe` home (unsafe policy: mmap access in
+// `zerodb-core::page`): the page-bounded view of the map (ADR-0021
+// amendment 1).
+#[allow(unsafe_code)]
+mod map;
 pub mod meta;
 mod overflow;
 // Sanctioned `unsafe` home (unsafe policy: page casting in
@@ -42,6 +47,7 @@ pub use crc32c::{crc32c, crc32c_concat};
 pub(crate) use header::read_flags;
 pub(crate) use header::read_page_txnid;
 pub use header::{CommonHeader, PageRef};
+pub use map::MapPages;
 pub use meta::{
     meta_annex_cap, select as select_meta, DBRecord, MetaChoice, MetaPage, MetaValidity,
     DBRECORD_LEN,

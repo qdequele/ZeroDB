@@ -674,6 +674,16 @@ dirty-page store must be built so it is.
   unmapped or moved while any txn is live (§7 close is deferred), and (b) the
   reader's pin (§3) stops the writer reclaiming the pages. Nothing a `RoTxn` can
   do invalidates its own read borrows.
+  **Borrows cover only the pages read (amended 2026-11-20, ADR-0021
+  amendment 1):** every borrow of the map, a reader's or the writer's, covers
+  exactly the page, overflow run or value it resolves, never the whole map or
+  a range up to the high-water. The engine holds the map as a page-bounded
+  handle (`zerodb_core::page::MapPages`) built from the mapping's raw pointer.
+  The writer stores into free pages below every snapshot's high-water (TXN-62,
+  in place under TXN-45b, by `pwrite` otherwise); a borrow spanning them would
+  assert bytes unchanged that do change, which Rust's aliasing rules forbid
+  even when they are never read. The raw environment copy, which does read
+  free pages, hands the kernel the map's address instead of a borrow.
 - **TXN-38** — `RwTxn::get` / cursor reads return bytes from **whichever storage
   currently backs the page**:
   - a page the write txn has **not** touched → borrowed from the read-only mmap
@@ -686,8 +696,10 @@ dirty-page store must be built so it is.
   **High-water bound (added 2026-09-09, security review H1):** every
   committed-map resolution — a reader's, or the writer's map fallback — refuses
   a pgno above the pinned snapshot's `last_pg` with a typed error
-  (`PageError::PageOutOfBounds`), and clamps multi-page (overflow-run) slices
-  at that bound. The mapping covers the full `map_size` (ADR-0004 D4), so map
+  (`PageError::PageOutOfBounds`). An overflow run is resolved as the
+  `⌈(HEADER_SIZE + dsize) / psize⌉` pages its value needs, cut at that bound
+  (and at the end of the map), so a run crossing it reaches the overflow
+  decoder short and fails as it did when map slices extended to the bound. The mapping covers the full `map_size` (ADR-0004 D4), so map
   bytes past the real file end are unbacked: a corrupt/hostile reference there
   must fail typed, not SIGBUS (SPEC 06 REC-14). Dirty frames are exempt — a
   writer legitimately allocates pages beyond its base snapshot's `last_pg`,
@@ -923,17 +935,14 @@ spilling bullet there.)
   in-place realization (TXN-45b, ADR-0021), at the in-place stores of this
   txn's own dirty frames (allocation/edit time) — and **every spill resets
   the writer's validated-pages memo**, so a memo entry never outlives the
-  bytes it vouched for. **Writer view re-derivation (amended 2026-10-02,
-  ADR-0021 B2/M1):** the writer's whole-map `&[u8]` read view is re-derived
-  from the backing at every spill — a view predating a page's write must
-  never serve it (under Stacked/Tree Borrows the write invalidates the stale
-  borrow at exactly the written locations) — and under the in-place
-  realization the view is not cached at all but borrowed lazily per access,
-  like a reader's (TXN-45b writes happen mid-txn, and under Stacked Borrows
-  even *copying* a stale whole-map reference after one is undefined behavior
-  at the written locations; caught by miri on the heap-backed test map,
-  `zerodb-core/tests/writemap_in_place_miri.rs`). The resolution hot path is
-  unchanged
+  bytes it vouched for. **Writer view (amended 2026-11-20, ADR-0021
+  amendment 1; was re-derived per spill, ADR-0021 B2/M1):** the writer keeps
+  the map as the page-bounded handle of TXN-37 in every mode, and every
+  borrow it takes covers only the page or run it reads, so no borrow ever
+  spans a page before that page is rewritten by a spill or an in-place
+  store, and nothing needs re-deriving (checked by miri on the heap-backed
+  test map, `zerodb-core/tests/writemap_in_place_miri.rs`). The resolution
+  hot path is unchanged
   (performance item B13: an extra spilled-page lookup inlined into every descent cost
   read rungs 3–13 %). Nested read children read through the same source; no
   spill runs while one is live (TXN-29 guard precedes the check).
@@ -1065,15 +1074,13 @@ spilling bullet there.)
     function mints `&mut [u8]` from `&self`. The sole sanctioned caller is
     `zerodb-core::dirty::map_mut`, whose `SAFETY` block discharges the
     contract — single writer (TXN-6), TXN-62 target, exactly one live
-    `&mut` per region tied to `&mut DirtyStore` and never stored, and the
-    whole-map read view re-derived per spill / borrowed per access
-    (TXN-71 as amended).
-  - **The writer's whole-map view is lazy.** Because in-place stores mutate
-    map bytes mid-txn, the write txn holds **no** cached whole-map `&[u8]`
-    in this mode; `get`/descent resolutions borrow the view per access, as
-    readers do (TXN-71 as amended; ADR-0021 M1 — under Stacked Borrows a
-    cached reference field is re-asserted on every move of the txn, which
-    is UB at in-place-written locations).
+    `&mut` per region tied to `&mut DirtyStore` and never stored, and no
+    borrow of the map, the writer's or a reader's, covering the region
+    (TXN-37 and TXN-71 as amended).
+  - **No whole-map view.** The write txn holds the map as the page-bounded
+    handle of TXN-37, never a whole-map `&[u8]`: in-place stores mutate map
+    bytes mid-txn, and a reference spanning them is UB even if the stored
+    bytes are never read through it (ADR-0021 M1 and amendment 1).
   - **Release-mode TXN-62 guard (ADR-0021 M2).** Every pgno the allocator
     returns in this mode is checked `pgno > committed_last_pg ∨ pgno ∈
     reclaimed` (each page of a run) **in release builds**, failing with a
@@ -1094,8 +1101,7 @@ spilling bullet there.)
   one-page frame in the map at the pgno itself, or any other frame (an
   overflow-run head). Every change to the index updates them. The write
   txn's page source answers "is this page dirty?" from them, and slices a
-  one-page dirty frame from its own whole-map view without probing the
-  index, as LMDB reads a dirty page at `map + pgno * psize`. The dirty / map
+  one-page dirty frame from its map handle without probing the index, as LMDB reads a dirty page at `map + pgno * psize`. The dirty / map
   classification the memo relies on (above) is unchanged. The bits are not
   carried to the next write txn, and heap modes never build them.
 

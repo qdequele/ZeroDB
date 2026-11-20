@@ -2,7 +2,7 @@
 
 - Status: **Accepted (2026-10-02, maintainer) — spike first**. Opt-in behind `WRITE_MAP`; default (heap-staged) path unchanged. Implementation under the full gate (loom for commit/meta ordering, crash, stress) + the adapter borrow audit; never merged without a green gate and a spec review. (Was: Draft, gated on the spike numbers below and human approval — rule 6: write-path + concurrency + unsafe.)
 - Implementation note (2026-10-05): spike plus the production hardening pass below merged as PR #88 (8b066a6, 2026-10-05; the PR title still read "DRAFT, do not merge"). In-place is now what `WRITE_MAP` does. Ranged msync (issue #45) is ADR-0026. Still open: the open questions at the end.
-- Amendment 1 (2026-11-20): **draft, awaiting approval**: bound reader views of the map to the pages they reference (unsafe audit finding F1). See the end of this ADR.
+- Amendment 1 (2026-11-20): **Option A approved for every mode (maintainer, 2026-11-20)**, implementation gated on the read-path benchmark: bound reader views of the map to the pages they reference (unsafe audit finding F1). See the end of this ADR.
 - Milestone: Phase 3 (performance), PERF-GAP B5 / issue #13; supersedes ADR-0017 (spilling) **for WRITE_MAP envs only**
 - Date: 2026-10-01
 
@@ -331,9 +331,12 @@ fork's own WRITEMAP trade, accepted with the opt-in flag (Open question 3).
 
 ## Amendment 1 (draft, 2026-11-20): reader views bounded to the pages they reference
 
-- Status: **Draft, awaiting maintainer approval.** Nothing below is
-  implemented. It changes the read path's view of the map and a concurrency
-  argument, so it needs approval and a read-path benchmark before any code.
+- Status: **Approved (maintainer, 2026-11-20): Option A, applied to every
+  mode** (open questions 1 and 2). Merging stays gated on the three-column
+  read-path comparison in the Decision section. Open questions 3 and 4 were
+  not answered; the implementation follows the proposals written there (the
+  `FileTrust::VALIDATE` residual is recorded, not addressed; the raw copy
+  takes the fd-to-fd path under `WRITE_MAP` only).
 - Related: issue #178 (unsafe verification), finding F1 in
   [`docs/maintainers/UNSAFE-AUDIT.md`](../maintainers/UNSAFE-AUDIT.md).
 
@@ -495,13 +498,13 @@ live reader in this process. This removes the overlap but also ADR-0021's
 gain for the workload it targets, concurrent search during indexing. LMDB
 has no such mode. Rejected.
 
-### Decision (proposed)
+### Decision
 
 **Option A**, applied to every mode, since `Source` is one type and the
-default mode's kernel writes rest on the same argument. Implementation is
-blocked until:
+default mode's kernel writes rest on the same argument. The maintainer
+approved it on 2026-11-20. It merges only once:
 
-1. the maintainer approves this amendment;
+1. the implementation passes the full check list, miri included;
 2. a three-column read-path comparison (LMDB, ZeroDB before, ZeroDB after)
    from `just bench-ab` on the read rungs (`get`, cursor and range scans,
    overflow values) and the `WRITE_MAP` write rungs shows no regression
@@ -555,3 +558,30 @@ blocked until:
 4. The raw copy under `WRITE_MAP`: switch to the fd-to-fd path (proposed),
    or always use it? The map path is faster without `WRITE_MAP`, where no
    in-process store can race it.
+
+### Implementation notes (2026-11-20)
+
+- `MapPages` lives in `zerodb-core::page::map`. Besides the planned `get`, it
+  has `prefix` (a shorter region, for `check_snapshot`'s `(last_pg + 1) ×
+  psize` cut), `as_ptr` (for the kernel copy below) and `whole`, a whole-map
+  borrow kept for code where no store of this process can run while it
+  lives: the fault backend's seal points and capture (writer thread or
+  paused writer), `zerodb-tools` (its own process), and test hooks
+  (`Env::backing_bytes`). Env open reads the two meta slots through `get`.
+- The real mappings are now `memmap2::MmapRaw` (`map_raw_read_only` and
+  `map_raw`), so the map pointer is never derived from a reference to the
+  whole map. That also gives `MmapWritable::write_at` and `slice_mut` a
+  pointer with write provenance; they used to derive it through `MmapMut`'s
+  `Deref` to `&[u8]`. Creating a raw mapping is safe in memmap2, so the two
+  `unsafe` blocks around `mmap` moved to the `pages()` accessors.
+- The writer keeps its `MapPages` in every mode. TXN-71's re-derivation at
+  every spill, and `RwTxn::whole_map`, are removed.
+- **Open question 4, done differently from the proposal.** The raw copy
+  keeps streaming from the map in every mode, but through
+  `zerodb_io::write_map_range`: a `pwrite` from the map's address, so the
+  kernel reads the free pages and no Rust reference covers them, as LMDB's
+  `mdb_env_copyfd` writes from its map. This avoids changing the copy's
+  route (and its performance) under `WRITE_MAP`, which the proposal's switch
+  to the fd-to-fd path would have done.
+- Open question 3 is unanswered; the `FileTrust::VALIDATE` residual is
+  recorded in `docs/maintainers/UNSAFE-AUDIT.md` (F1) and not addressed.
