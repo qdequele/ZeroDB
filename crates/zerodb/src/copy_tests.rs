@@ -440,3 +440,230 @@ fn clone_replaces_the_destination_and_cleans_up() {
     assert!(err.is_err());
     assert_eq!(std::fs::read_dir(out_dir.path()).unwrap().count(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// I/O-error injection (SPEC 06 REC-23): a copy whose destination writes fail
+// ---------------------------------------------------------------------------
+
+/// How an injected destination write fails.
+#[derive(Debug, Clone, Copy)]
+enum DestFailure {
+    Eio,
+    Enospc,
+    /// The first `keep` bytes reach the file (clamped below the write's
+    /// length), then `ENOSPC`.
+    Short(usize),
+}
+
+impl DestFailure {
+    fn errno(self) -> i32 {
+        match self {
+            DestFailure::Eio => libc::EIO,
+            DestFailure::Enospc | DestFailure::Short(_) => libc::ENOSPC,
+        }
+    }
+}
+
+const DEST_FAILURES: [DestFailure; 4] = [
+    DestFailure::Eio,
+    DestFailure::Enospc,
+    DestFailure::Short(16),
+    DestFailure::Short(5000),
+];
+
+/// A destination whose `nth` write (counted from 1 across the copy) fails.
+struct FailingDest<'f> {
+    file: &'f File,
+    nth: u64,
+    failure: DestFailure,
+    seen: Arc<AtomicU64>,
+}
+
+impl FailingDest<'_> {
+    /// Whether this write is the one that fails. Relaxed: a call counter;
+    /// the compacting copy's writes all come from its one writer thread, in
+    /// order.
+    fn fails_now(&self) -> bool {
+        self.seen.fetch_add(1, Ordering::Relaxed) + 1 == self.nth
+    }
+
+    /// The bytes a short write keeps out of `len`: fewer than all of them.
+    fn kept(&self, len: usize) -> Option<usize> {
+        match self.failure {
+            DestFailure::Short(keep) => Some(keep.min(len.saturating_sub(1))),
+            _ => None,
+        }
+    }
+}
+
+impl ImageDest for FailingDest<'_> {
+    fn write_all_at(&self, buf: &[u8], off: u64) -> std::io::Result<()> {
+        if !self.fails_now() {
+            return FileExt::write_all_at(self.file, buf, off);
+        }
+        if let Some(keep) = self.kept(buf.len()) {
+            FileExt::write_all_at(self.file, &buf[..keep], off)?;
+        }
+        Err(std::io::Error::from_raw_os_error(self.failure.errno()))
+    }
+
+    fn write_map_range(
+        &self,
+        map: zerodb_core::page::MapPages<'_>,
+        src: usize,
+        len: usize,
+        off: u64,
+    ) -> std::io::Result<()> {
+        if !self.fails_now() {
+            return zerodb_io::write_map_range(self.file, map, src, len, off);
+        }
+        if let Some(keep) = self.kept(len) {
+            zerodb_io::write_map_range(self.file, map, src, keep, off)?;
+        }
+        Err(std::io::Error::from_raw_os_error(self.failure.errno()))
+    }
+}
+
+/// Pin a closure to the higher-ranked signature [`WrapDest`] needs.
+fn wrapper<F>(f: F) -> F
+where
+    F: for<'f> Fn(&'f File) -> Box<dyn ImageDest + 'f>,
+{
+    f
+}
+
+/// Copy `env` to `dest` with the `nth` destination write failing (`nth = 0`
+/// fails none); returns the result and how many writes the copy made.
+fn copy_failing(
+    env: &Env,
+    dest: &Path,
+    option: CompactionOption,
+    nth: u64,
+    failure: DestFailure,
+) -> (Result<()>, u64) {
+    let seen = Arc::new(AtomicU64::new(0));
+    let s = Arc::clone(&seen);
+    let wrap = wrapper(move |f| {
+        Box::new(FailingDest {
+            file: f,
+            nth,
+            failure,
+            seen: Arc::clone(&s),
+        })
+    });
+    let r = copy_to_path_with(
+        env,
+        dest,
+        option,
+        &mut |_| {},
+        |_, _, _| RawRoute::Stream,
+        &wrap,
+    );
+    (r, seen.load(Ordering::Relaxed))
+}
+
+fn assert_io_errno(r: &Result<()>, want: i32, what: &str) {
+    match r {
+        Err(Error::Io(e)) => assert_eq!(e.raw_os_error(), Some(want), "{what}: {e}"),
+        other => panic!("{what}: expected Io(errno {want}), got {other:?}"),
+    }
+}
+
+/// Every write of a streaming raw copy and of a compacting copy, failed in
+/// turn: the copy returns the injected `errno`, leaves no destination and no
+/// staging file, and the env it copied keeps working and checks clean.
+#[test]
+fn failed_destination_writes_fail_the_copy_and_leave_nothing() {
+    let dir = TempDir::new("ioerr-src");
+    let env = open_env(dir.path(), EnvFlags::EMPTY, 64 << 20);
+    for s in 0..120 {
+        step(&env, s);
+    }
+    let psize = env.page_size();
+    for option in [CompactionOption::Disabled, CompactionOption::Enabled] {
+        // The writes a copy without faults makes.
+        let out_dir = TempDir::new("ioerr-count");
+        let (r, writes) =
+            copy_failing(&env, &out_dir.path().join("c"), option, 0, DestFailure::Eio);
+        r.unwrap();
+        assert!(
+            writes >= 2,
+            "{option:?}: the metas and at least one data chunk"
+        );
+        for nth in 1..=writes {
+            for failure in DEST_FAILURES {
+                let what = format!("{option:?} write {nth}/{writes} {failure:?}");
+                let out_dir = TempDir::new("ioerr-out");
+                let dest = out_dir.path().join("copy.dat");
+                let (r, _) = copy_failing(&env, &dest, option, nth, failure);
+                assert_io_errno(&r, failure.errno(), &what);
+                assert_eq!(
+                    std::fs::read_dir(out_dir.path()).unwrap().count(),
+                    0,
+                    "{what}: no destination and no staging file is left"
+                );
+            }
+        }
+        // The source is untouched and keeps working.
+        step(&env, 120);
+        let bytes = std::fs::read(dir.path().join(DATA_FILE_NAME)).unwrap();
+        assert_eq!(check_image(&bytes, psize), Vec::<String>::new());
+        let out_dir = TempDir::new("ioerr-after");
+        let dest = out_dir.path().join("copy.dat");
+        copy_failing(&env, &dest, option, 0, DestFailure::Eio)
+            .0
+            .unwrap();
+        assert_eq!(verify_image(&dest, psize, "after failures"), 120);
+        // Undo the extra step for the next option's run.
+        let mut w = env.write_txn().unwrap();
+        let db = env.main_database();
+        db.delete(&mut w, &120u64.to_be_bytes()).unwrap();
+        db.put(
+            &mut w,
+            &(120 - WINDOW).to_be_bytes(),
+            &value_for(120 - WINDOW),
+        )
+        .unwrap();
+        db.put(&mut w, b"gen", &119u64.to_be_bytes()).unwrap();
+        w.commit().unwrap();
+    }
+}
+
+/// Into an open file, a failed write fails the copy with its `errno`; what
+/// was written stays (the file is the caller's, as with LMDB's
+/// `mdb_env_copyfd`), and the file position is left where it was.
+#[test]
+fn failed_write_into_an_open_file_fails_the_copy() {
+    use std::io::{Seek, SeekFrom};
+    let dir = TempDir::new("ioerr-fd-src");
+    let env = open_env(dir.path(), EnvFlags::EMPTY, 64 << 20);
+    for s in 0..60 {
+        step(&env, s);
+    }
+    for option in [CompactionOption::Disabled, CompactionOption::Enabled] {
+        for failure in DEST_FAILURES {
+            let out_dir = TempDir::new("ioerr-fd-out");
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(out_dir.path().join("copy.dat"))
+                .unwrap();
+            f.seek(SeekFrom::Start(100)).unwrap();
+            let seen = Arc::new(AtomicU64::new(0));
+            let wrap = wrapper(move |file| {
+                Box::new(FailingDest {
+                    file,
+                    nth: 2,
+                    failure,
+                    seen: Arc::clone(&seen),
+                })
+            });
+            let r = copy_into_open_file_with(&env, &mut f, option, |_, _| RawRoute::Stream, &wrap);
+            assert_io_errno(&r, failure.errno(), &format!("{option:?} {failure:?}"));
+            assert_eq!(f.stream_position().unwrap(), 100);
+        }
+    }
+    step(&env, 60);
+}

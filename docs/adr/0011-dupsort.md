@@ -2,6 +2,7 @@
 
 - Status: Approved — maintainer, 2026-07-20. All five open questions resolved below.
 - Implementation note (2026-10-05): milestone 2.8 parked 2026-07-20; stage A was never merged or pushed (local work only). DUPSORT/DUPFIXED remain unsupported (D-004).
+- Spike (2026-11-02): [docs/DUPSORT-SPIKE.md](../DUPSORT-SPIKE.md). The sub-page design fits format versions 2 and 3 and the ADR-0020 header unchanged; the duplicate invariants must take the next free IDs (INV-30 today: INV-22..29 belong to the free list, SPEC 05). **Decision (maintainer, 2026-11-02): no-go** — do not implement until a consumer needs it; the spike branch stays unmerged.
 - Milestone: 2.8 (descoped from 1.7 on 2026-07-15, D-004)
 - Date: 2026-07-20
 
@@ -379,7 +380,7 @@ defensive rejection stays for non-dup DBs.
 - **2.8d — Adversarial closure.** check-tool INV-22..27 + dump/load/migrate
   dup support; the dedicated fuzz target's op-distribution tuning; the ≥ 2 h
   clean run (plus a 24 h nightly soak before the milestone is called done);
-  DIVERGENCES/SPEC final sweep; spec-reviewer pass.
+  DIVERGENCES/SPEC final sweep; spec review pass.
 
 A stage may **not** leave: on-disk state a later stage migrates (fence above);
 a partially-implemented cursor op (an op is absent-with-clean-error or fully

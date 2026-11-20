@@ -11,6 +11,25 @@ Two questions this repo has to keep answering:
 Both are driven by [`scripts/consumer.sh`](../../scripts/consumer.sh)
 (`just consumer-check`, `just consumer-suites`, `just consumer-bench`).
 
+## In CI
+
+The `consumers` job of [`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)
+runs the drop-in check and suites nightly and on manual dispatch:
+`scripts/consumer.sh suites` for Meilisearch and `scripts/hannoy.sh suites`
+for hannoy, the same commands as below. The consumer refs are pinned in the
+job's `env` (Meilisearch v1.55.1, hannoy v0.2.0); a manual
+dispatch can override them with the `meilisearch_ref` and `hannoy_ref` inputs
+(a tag or a branch). Each run prints the ZeroDB commit, the consumer ref and
+commit, the toolchain and the summed test counts, also in the job summary, and
+keeps the test logs as an artifact. A green run on the release commit is
+required before a tag ([RELEASING.md](RELEASING.md)). The benchmarks below are
+not run in CI.
+
+Meilisearch v1.56.0 and later depend on heed 0.23. The adapter mirrors heed
+0.22.1, so a `[patch]` on those releases does not apply and the script's
+no-LMDB assertion fails; the pin stays on v1.55.1 until the adapter covers
+heed 0.23.
+
 ## How the swap works
 
 Meilisearch depends on `heed = "0.22.1"`. The script adds this to the
@@ -54,11 +73,13 @@ still links LMDB would prove nothing.
 MEILISEARCH_SRC=~/Projects/Meilisearch/meilisearch just consumer-check
 MEILISEARCH_SRC=~/Projects/Meilisearch/meilisearch just consumer-suites
 FULL=1 MEILISEARCH_SRC=... scripts/consumer.sh suites   # + meilisearch --lib, meilisearch-auth
-MEILISEARCH_REF=main scripts/consumer.sh suites         # any ref; default v1.55.0
+MEILISEARCH_REF=v1.55.0 scripts/consumer.sh suites      # any ref; default v1.55.1
 MEILISEARCH_REF=v1.53.1 scripts/consumer.sh suites      # last release on stock heed 0.22.1
 ```
 
-`suites` runs `cargo test -p milli -p index-scheduler` on ZeroDB. index-scheduler
+`suites` runs `cargo test -p milli -p index-scheduler` on ZeroDB, then prints
+the summed `test result:` counts; the full output is kept under
+`target/consumer/logs/`. index-scheduler
 is the load-bearing one: it exercises the task queue's untyped databases, the
 index registry's open/close churn with `EnvClosingEvent`, `max_readers`,
 `max_dbs`, and `static_read_txn` in async handlers. No test in either crate
@@ -89,8 +110,14 @@ the shim (with the same no-LMDB assertion), and its divan benches —
 `build_hnsw` (5 000 random vectors) and `search_hnsw` (10-NN over 50 000) at
 512, 768 and 1536 dimensions — once on stock LMDB and once on ZeroDB.
 [`scripts/divan-compare.py`](../../scripts/divan-compare.py) puts the medians side
-by side. Default ref is `v0.1.7-nested-rtxns`, the tag the July 2026 numbers
-were taken on (milli pins 0.1.3; override with `HANNOY_REF`).
+by side. Default ref is v0.2.0, the hannoy release Meilisearch v1.55 depends
+on (override with `HANNOY_REF`). The script builds hannoy with the stable
+toolchain, because v0.2.0 pins Rust 1.90, below ZeroDB's `rust-version`.
+
+The July 2026 numbers were taken on `v0.1.7-nested-rtxns`. That tag's suite
+does not pass on either engine: ten `insta` snapshots record the crate as
+version 0.1.6 while the tag builds 0.1.7, and the dump in each snapshot
+includes the version. Use it for benchmarks only.
 
 ## Benchmarks: Meilisearch on LMDB vs ZeroDB
 

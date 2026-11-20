@@ -1,74 +1,63 @@
 //! Custom key comparators (SPEC 03 §2.0; see docs/LMDB-COMPATIBILITY.md, DatabaseFlags).
 //!
-//! LMDB exposes `mdb_set_compare(txn, dbi, MDB_cmp_func*)` — a raw C function
-//! pointer installed per-dbi, per-open. heed hides it completely: its
-//! `Comparator` trait exists but every `Database` is `DefaultComparator`, and
-//! nothing in heed's open path ever reaches `mdb_set_compare`. The LMDB-parity
-//! baseline therefore assumed unsigned lexicographic byte order everywhere (SPEC 00
-//! row 53, SPEC 03 §2 invariant BT-1). This module lifts that assumption for
-//! **named** databases, as a safe Rust trait rather than a function pointer.
+//! LMDB installs a comparator per database with `mdb_set_compare`, a raw C
+//! function pointer. heed never calls it: every heed `Database` uses
+//! `DefaultComparator`, unsigned lexicographic byte order (SPEC 00 row 53,
+//! SPEC 03 §2 invariant BT-1). This module offers a custom order for named
+//! databases as a safe Rust trait.
 //!
-//! ## What is and is not comparator-aware
+//! ## Which trees take a comparator
 //!
-//! | Tree | Comparator | Why |
-//! |---|---|---|
-//! | A named DB | caller's, or memcmp | the whole point of this module |
-//! | The main / unnamed DB | **always memcmp** | it doubles as the named-DB catalog (SPEC 02 §6). Catalog keys are DB *names* and catalog values are engine-internal `DBRecord` bytes; re-ordering them under caller-supplied logic would put engine metadata at the mercy of user code, and a panicking or inconsistent comparator would corrupt the catalog rather than one database. See [`ComparatorError::MainDatabase`]. |
-//! | The GC / free tree | **always memcmp** | keys are big-endian txnids (SPEC 05); memcmp order *is* numeric order, and the GC gate depends on it. Not reachable from the public API at all. |
+//! - A named database: the caller's comparator, or memcmp.
+//! - The main (unnamed) database: always memcmp. It is also the named-database
+//!   catalog (SPEC 02 §6), whose keys are database names and whose values are
+//!   `DBRecord` bytes. A faulty caller comparator there would corrupt the
+//!   catalog, not one database. See [`ComparatorError::MainDatabase`].
+//! - The free-page tree: always memcmp. Its keys are big-endian txnids
+//!   (SPEC 05), so memcmp order is numeric order, which GC depends on.
 //!
-//! ## The comparator is NOT persisted — read this
+//! ## The comparator is not persisted
 //!
-//! Neither LMDB nor ZeroDB stores the comparator in the file. A B+tree is only
-//! meaningful under the ordering that built it, so **reopening a database with
-//! a different comparator than the one that wrote it silently produces wrong
-//! answers**: lookups miss keys that are present, range scans return the wrong
-//! subsets, and subsequent writes interleave two incompatible orderings into
-//! one tree, permanently corrupting it. Nothing detects this at open. It is a
-//! *caller* obligation, exactly as it is under `mdb_set_compare`.
+//! Neither LMDB nor ZeroDB stores the comparator in the file. Reopening a
+//! database with a different comparator than the one that wrote it gives
+//! wrong answers without any error: lookups miss keys that are present, range
+//! scans return the wrong subsets, and later writes mix two orderings in one
+//! tree, corrupting it. Nothing detects this at open. Passing the same
+//! comparator on every open is the caller's obligation, as it is with
+//! `mdb_set_compare`.
 //!
-//! ZeroDB does what it can within the format it has:
-//!
-//! - **In-process mismatch is detected.** A comparator is registered once per
-//!   dbi in [`ComparatorRegistry`]; a second registration for the same
-//!   database with a different [`Comparator::name`] is refused
-//!   ([`ComparatorError::Mismatch`]) instead of silently taking one of them.
-//!   This catches the common real bug — two modules in one process disagreeing
-//!   about a DB — but says nothing about the previous *run*.
-//! - **Cross-open mismatch is NOT detected, and cannot be without a format
-//!   change.** The natural fix is a comparator-identity fingerprint in the
-//!   per-DB record, checked at open. There is nowhere to put one: `DBRecord`
-//!   is exactly 48 bytes with every byte assigned (SPEC 02 §3.1 — `root`,
-//!   4 × page/entry counters, `depth`, `flags`, `leaf2_ksize`), and its only
-//!   two unassigned *values* (`flags` at offset 42, `leaf2_ksize` at offset
-//!   44) are already earmarked for DUPSORT/DUPFIXED support.
-//!   Widening the record or repurposing those fields is an on-disk **format**
-//!   decision that requires an ADR — deliberately not taken here. The hazard
-//!   is therefore **documented, not mitigated**, and is filed in
+//! - A mismatch within one process is detected. A comparator is registered
+//!   once per database in [`ComparatorRegistry`]; a second registration with a
+//!   different [`Comparator::name`] is refused
+//!   ([`ComparatorError::Mismatch`]).
+//! - A mismatch between two opens of the file is not detected. Detecting it
+//!   needs a comparator identity in the per-database record, and `DBRecord`
+//!   has no spare field (SPEC 02 §3.1), so it would be a format change. See
 //!   docs/LMDB-COMPATIBILITY.md (comparator persistence).
 //!
 //! ## Requirements on an implementation
 //!
-//! A [`Comparator`] must be a **total order**: antisymmetric, transitive,
-//! total, and *deterministic* — the same pair of byte strings must always
-//! compare the same way, for the life of the data, across processes and
-//! releases. Violating this does not trigger Rust unsafety (nothing here is
-//! `unsafe`), but it does corrupt the tree in the ordinary sense: a B+tree
-//! built under an inconsistent ordering has no correct search path, and
-//! `zerodb-tools check` will report INV-5/INV-6 violations.
+//! A [`Comparator`] must be a total order and deterministic: the same pair of
+//! byte strings must always compare the same way, for the life of the data,
+//! across processes and releases. A violation is not memory-unsafe, but it
+//! corrupts the tree: a B+tree built under an inconsistent ordering has no
+//! correct search path, and `zerodb-tools check` reports INV-5/INV-6
+//! violations.
 //!
-//! A comparator that **panics** unwinds through the engine. Inside a write
-//! transaction that is safe in the RAII sense — the `RwTxn` is dropped and its
-//! dirty pages discarded, so the durable file is untouched (SPEC 04 §9: the
-//! file changes only at commit) — but the operation is lost. Do not panic.
+//! A comparator that panics unwinds through the engine. In a write
+//! transaction the `RwTxn` is dropped and its dirty pages discarded, so the
+//! file is untouched (SPEC 04 §9: the file changes only at commit), but the
+//! operation is lost.
 
 use std::cmp::Ordering;
 use std::sync::{Mutex, OnceLock};
 
-/// A total order over raw key bytes — ZeroDB's safe
-/// replacement for LMDB's `MDB_cmp_func` C function pointer.
+/// A total order over raw key bytes, the safe counterpart of LMDB's
+/// `MDB_cmp_func` C function pointer.
 ///
 /// Implementations must be a deterministic total order; see the [module
-/// docs](self) for the full contract and the non-persistence hazard.
+/// docs](self) for the contract and for what happens when a database is
+/// reopened with a different comparator.
 ///
 /// `Send + Sync` because one registration is shared by every transaction on
 /// the environment, on any thread (read txns are `Send`, SPEC 00 row 29), and
@@ -83,8 +72,8 @@ pub trait Comparator: Send + Sync + 'static {
     /// Two registrations with the same name are assumed to be the same
     /// ordering, so the name must change whenever the ordering does. Pick
     /// something specific and versioned (`"myapp.facet-key.v2"`), not
-    /// `"custom"`. It is **not** written to disk — it cannot rescue a
-    /// cross-open mismatch (module docs).
+    /// `"custom"`. It is not written to disk, so it cannot detect a mismatch
+    /// between two opens of the file (module docs).
     fn name(&self) -> &str;
 }
 
@@ -107,8 +96,7 @@ impl Comparator for DefaultComparator {
     }
 }
 
-/// A [`Comparator`] built from a plain closure — the "safe Rust closure" form
-/// of `mdb_set_compare`.
+/// A [`Comparator`] built from a closure.
 ///
 /// ```
 /// use std::cmp::Ordering;
@@ -151,9 +139,9 @@ where
 /// `Copy` [`crate::btree::Tree`] and be passed down every descent.
 ///
 /// [`KeyCmp::Default`] is a distinct variant rather than
-/// `Custom(&DefaultComparator)` so the overwhelmingly common path stays a
-/// predictable branch onto an inlined `slice::cmp`, with no vtable call —
-/// this type is on the hot path of every `get`, `put`, and cursor step.
+/// `Custom(&DefaultComparator)` so that the common case is a predictable
+/// branch to an inlined comparison with no vtable call: every `get`, `put`
+/// and cursor step compares keys through this type.
 #[derive(Clone, Copy)]
 pub enum KeyCmp<'a> {
     /// Unsigned lexicographic byte order ([`DefaultComparator`]).
@@ -166,21 +154,18 @@ pub enum KeyCmp<'a> {
 /// Unsigned lexicographic byte comparison (the [`KeyCmp::Default`] ordering),
 /// with a fast path for equal-length 8- and 4-byte keys.
 ///
-/// Meilisearch and hannoy key the hot trees on fixed-width big-endian integers
-/// (u32/u64 document and item ids), so almost every binary-search probe compares
-/// two slices of the same length 8 or 4. For equal-length slices, comparing them
-/// as big-endian integers is *identical* to memcmp order (the most significant
-/// differing byte decides both), so this returns exactly `a.cmp(b)` — but as one
-/// integer load and compare each rather than a `memcmp` call (the aarch64 hot
-/// path showed `bl _memcmp` on every probe; see docs/PERFORMANCE.md,
-/// default key compare). Every other length pair, including 8-vs-4, falls
-/// through to the slice comparison, which never reads past either slice's
-/// length.
+/// Fixed-width big-endian integer keys (u32 and u64 ids) are common, and a
+/// binary search over them compares two slices of the same length 8 or 4 at
+/// every probe. For equal-length slices, comparing them as big-endian
+/// integers gives memcmp order (the most significant differing byte decides
+/// both), so this returns exactly `a.cmp(b)` with one integer load and
+/// compare per side instead of a `memcmp` call (see docs/PERFORMANCE.md).
+/// Every other length pair, including 8 against 4, takes the slice
+/// comparison.
 #[inline]
 fn default_cmp_fast(a: &[u8], b: &[u8]) -> Ordering {
     match (a.len(), b.len()) {
-        // The `try_into` cannot fail — the arm guard fixes each length — and the
-        // fallible branch optimizes out; no bytes outside `a`/`b` are read.
+        // The `try_into` cannot fail: the match arm fixes each length.
         (8, 8) => u64::from_be_bytes(a.try_into().unwrap())
             .cmp(&u64::from_be_bytes(b.try_into().unwrap())),
         (4, 4) => u32::from_be_bytes(a.try_into().unwrap())
@@ -202,12 +187,10 @@ impl KeyCmp<'_> {
 
     /// Whether two keys are the *same key* under this ordering.
     ///
-    /// Deliberately not byte equality: a comparator may consider distinct byte
+    /// This is not byte equality: a comparator may consider distinct byte
     /// strings equal (a case-folding order, say), and the tree stores at most
-    /// one of any comparator-equal group. Every "did I land on the key I asked
-    /// for?" test in the engine goes through here — using `==` instead is the
-    /// classic way a comparator gets applied to descent but not to the final
-    /// hit test.
+    /// one key of any such group. Code that tests whether a search landed on
+    /// the requested key must use this, not `==`.
     #[inline]
     #[must_use]
     pub fn eq(&self, a: &[u8], b: &[u8]) -> bool {
@@ -232,20 +215,27 @@ impl std::fmt::Debug for KeyCmp<'_> {
 }
 
 /// Why registering a comparator was refused.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ComparatorError {
     /// A comparator was requested for the main / unnamed database. Refused
     /// unconditionally: that tree is also the named-DB catalog (SPEC 02 §6),
     /// which is engine-internal and must stay memcmp-ordered. Use a named
     /// database.
+    #[error(
+        "the main/unnamed database is also the named-DB catalog and always uses \
+         memcmp ordering; register a comparator on a named database instead"
+    )]
     MainDatabase,
     /// A *different* comparator is already registered for this database in
     /// this process — the two names disagree. Carries `(registered, requested)`.
     ///
-    /// Refused rather than resolved: silently keeping either one would leave
-    /// half the process reading the database under an ordering it did not ask
-    /// for, which is the exact failure mode this module is trying to make
-    /// impossible to reach by accident.
+    /// Keeping either one would leave part of the process reading the
+    /// database under an ordering it did not ask for, so the registration is
+    /// refused.
+    #[error(
+        "database already has comparator {registered:?} registered in this process; \
+         refusing to also register {requested:?}"
+    )]
     Mismatch {
         /// The [`Comparator::name`] already registered for this database.
         registered: String,
@@ -254,38 +244,16 @@ pub enum ComparatorError {
     },
 }
 
-impl std::fmt::Display for ComparatorError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ComparatorError::MainDatabase => f.write_str(
-                "the main/unnamed database is also the named-DB catalog and always uses \
-                 memcmp ordering; register a comparator on a named database instead",
-            ),
-            ComparatorError::Mismatch {
-                registered,
-                requested,
-            } => write!(
-                f,
-                "database already has comparator {registered:?} registered in this process; \
-                 refusing to also register {requested:?}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for ComparatorError {}
-
 /// The environment's per-database comparator table.
 ///
-/// Sized `max_dbs` at env open and indexed by dbi, so a lookup on the read
-/// path is an index and a `OnceLock::get` — no lock, no allocation. Each slot
-/// is written at most once, which is what lets a lookup hand out a
-/// `&'a dyn Comparator` borrowed from the environment: the registry owns the
-/// boxed comparator for the env's whole life and never moves or replaces it.
+/// Sized `max_dbs` at env open and indexed by dbi, so a lookup is an index
+/// and a `OnceLock::get`, with no lock and no allocation. Each slot is
+/// written at most once, so a lookup can hand out a `&'a dyn Comparator`
+/// borrowed from the environment: the registry owns the boxed comparator for
+/// the env's whole life and never moves or replaces it.
 ///
-/// The `Mutex` beside it is *not* on the read path — it only makes the
-/// "same dbi, second registration" check atomic against a concurrent
-/// registration of the same database, once per `*_with_comparator` open.
+/// The `Mutex` is taken only by registration, to make the check for an
+/// existing comparator and the write of the slot atomic.
 pub struct ComparatorRegistry {
     /// dbi → comparator, written at most once per slot. `None`/unset = memcmp.
     slots: Box<[OnceLock<Box<dyn Comparator>>]>,
@@ -322,9 +290,9 @@ impl ComparatorRegistry {
 
     /// Register `cmp` for named database `dbi`.
     ///
-    /// Idempotent for the same [`Comparator::name`]: re-registering the same
-    /// ordering (the normal case — every process opening the DB must pass its
-    /// comparator) is `Ok` and keeps the first instance.
+    /// Idempotent for the same [`Comparator::name`]: registering the same
+    /// ordering again is `Ok` and keeps the first instance. This is the normal
+    /// case, since every open of the database passes its comparator.
     ///
     /// # Errors
     ///
@@ -348,17 +316,16 @@ impl ComparatorRegistry {
             });
         }
         // The `reg_lock` guard makes this the only writer, so `set` cannot
-        // lose; `let _ =` documents that rather than unwrapping on a value
-        // that is not `Debug`.
+        // fail. Its error type is not `Debug`, so it cannot be unwrapped.
         let _ = slot.set(cmp);
         Ok(())
     }
 
     /// Whether any custom comparator is registered on this environment.
     ///
-    /// Used to gate features that are still memcmp-only (the compacting copy,
-    /// SPEC 03 §2.0) so they refuse loudly instead of silently rebuilding a
-    /// tree in the wrong order.
+    /// Features that support only memcmp order (the compacting copy, SPEC 03
+    /// §2.0) check this and refuse, since they would otherwise rebuild a tree
+    /// in the wrong order.
     #[must_use]
     pub fn any_custom(&self) -> bool {
         self.slots.iter().any(|slot| slot.get().is_some())
@@ -377,6 +344,28 @@ impl std::fmt::Debug for ComparatorRegistry {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn error_messages_and_sources() {
+        use std::error::Error as _;
+        let main = ComparatorError::MainDatabase;
+        assert_eq!(
+            main.to_string(),
+            "the main/unnamed database is also the named-DB catalog and always uses \
+             memcmp ordering; register a comparator on a named database instead"
+        );
+        assert!(main.source().is_none());
+        let mismatch = ComparatorError::Mismatch {
+            registered: "a\"b".to_owned(),
+            requested: "c".to_owned(),
+        };
+        assert_eq!(
+            mismatch.to_string(),
+            "database already has comparator \"a\\\"b\" registered in this process; \
+             refusing to also register \"c\""
+        );
+        assert!(mismatch.source().is_none());
+    }
 
     fn rev() -> Box<dyn Comparator> {
         Box::new(FnComparator::new("test.reverse", |a: &[u8], b: &[u8]| {
@@ -437,8 +426,6 @@ mod tests {
         r.register(9, rev()).unwrap();
         assert!(r.get(9).is_default());
     }
-
-    // --- equal-length integer-compare fast path ---
 
     /// The 8-/4-byte fast path must return exactly memcmp order on the edges
     /// that a naive integer compare could get wrong.
@@ -501,14 +488,13 @@ mod tests {
             b in proptest::collection::vec(any::<u8>(), 0..=16),
         ) {
             prop_assert_eq!(default_cmp_fast(&a, &b), a.cmp(&b));
-            // And through the public choke point, so both call sites benefit.
+            // The public entry point must agree too.
             prop_assert_eq!(KeyCmp::Default.compare(&a, &b), a.cmp(&b));
         }
     }
 
-    /// A leaf/branch binary search over 8-byte big-endian keys must return the
-    /// same Ok/Err positions as `slice::binary_search` on the sorted key list,
-    /// confirming the fast path preserves search results end to end.
+    /// A binary search over 8-byte big-endian keys with the fast comparison
+    /// must return the same `Ok`/`Err` positions as `slice::binary_search`.
     #[test]
     fn lookup_over_be_keys_matches_binary_search() {
         use proptest::test_runner::TestRunner;
@@ -524,11 +510,10 @@ mod tests {
                     let sorted: Vec<[u8; 8]> = keys.iter().map(|k| k.to_be_bytes()).collect();
                     let needle = probe.to_be_bytes();
 
-                    // Reference: linear binary search over the sorted Vec.
+                    // Reference: the standard library's binary search.
                     let expected = sorted.binary_search(&needle);
 
-                    // Under test: the same search driven by KeyCmp::Default,
-                    // mirroring `leaf_lookup`'s loop over a sorted array.
+                    // Under test: the same search driven by `KeyCmp::Default`.
                     let mut lo = 0usize;
                     let mut hi = sorted.len();
                     let mut got = Err(sorted.len());

@@ -39,7 +39,7 @@ use zerodb_io::fault::{splitmix64, Rng};
 use super::model::{Exec, World};
 use super::sigkill::{kill_arg, read_sidecar, Kill, SigkillOpts, MAX_ROUNDS};
 use super::verify::{compare_env_world, compare_rtxn_world};
-use super::workload::gen_spec;
+use super::workload::{gen_spec, repro_command};
 use super::CutReport;
 use crate::tempdir::TempDir;
 
@@ -244,9 +244,10 @@ pub fn run_mp_cycle(seed: u64, opts: &SigkillOpts) -> CutReport {
     };
     let violation = |detail: String| {
         Some(format!(
-            "[mp] seed={seed} mode={} psize={} : {detail} [repro: crash-harness --repro mp:{seed}]",
+            "[mp] seed={seed} mode={} psize={} : {detail} [repro: {}]",
             spec.mode.name(),
-            spec.page_size
+            spec.page_size,
+            repro_command("mp", seed)
         ))
     };
     let mut rng = Rng::new(splitmix64(seed ^ 0x0000_516B_0000_516B));

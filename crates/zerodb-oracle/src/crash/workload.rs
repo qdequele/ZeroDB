@@ -129,7 +129,38 @@ pub struct Spec {
 /// lands mid-run; mechanism A uses round 0).
 pub const OPS_PER_ROUND: usize = 96;
 
-/// Derive the cycle spec from its seed.
+/// The environment variable that pins every cycle's page size, so a run can
+/// cover database page sizes the seed derivation never picks (16 KiB, 64 KiB)
+/// against the host's OS page size. Child processes inherit it, so parent,
+/// child and repro derive the same spec.
+pub const PAGE_SIZE_ENV: &str = "ZERODB_CRASH_PAGE_SIZE";
+
+/// The page size [`PAGE_SIZE_ENV`] pins, if set.
+///
+/// # Panics
+///
+/// If the variable is set to anything but a power of two in `[4096, 65536]`:
+/// a silently ignored typo would make a page-size run test the default.
+#[must_use]
+pub fn page_size_override() -> Option<u32> {
+    let raw = std::env::var(PAGE_SIZE_ENV).ok()?;
+    match raw.parse::<u32>() {
+        Ok(ps) if (4096..=65536).contains(&ps) && ps.is_power_of_two() => Some(ps),
+        _ => panic!("{PAGE_SIZE_ENV}={raw:?} is not a power of two in [4096, 65536]"),
+    }
+}
+
+/// The repro command for one cycle, carrying the page-size override if set.
+#[must_use]
+pub fn repro_command(mechanism: &str, seed: u64) -> String {
+    match page_size_override() {
+        Some(ps) => format!("{PAGE_SIZE_ENV}={ps} crash-harness --repro {mechanism}:{seed}"),
+        None => format!("crash-harness --repro {mechanism}:{seed}"),
+    }
+}
+
+/// Derive the cycle spec from its seed. The page size is drawn from the seed
+/// (4 KiB, or 8 KiB on 1 cycle in 8) unless [`PAGE_SIZE_ENV`] pins it.
 #[must_use]
 pub fn gen_spec(seed: u64) -> Spec {
     let mut rng = Rng::new(splitmix64(seed ^ 0x0000_57EC_0000_57EC));
@@ -148,6 +179,8 @@ pub fn gen_spec(seed: u64) -> Spec {
     // Drawn last so every earlier field keeps its value for a given seed.
     let dirty_limit = rng.ratio(1, 3).then(|| 8 + rng.below(120) as u64);
     let gc_clear = rng.ratio(1, 4);
+    // Applied after every draw, so the override changes no other field.
+    let page_size = page_size_override().unwrap_or(page_size);
     Spec {
         seed,
         mode,

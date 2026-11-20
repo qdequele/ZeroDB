@@ -1,107 +1,34 @@
-//! Bottom-up B+tree builders: the streaming [`EnvStream`] behind compacting
-//! copy, and the batch `build_*_image` loaders tests use.
+//! Bottom-up B+tree builder: the streaming [`EnvStream`] behind compacting
+//! copy. This crate's tests also compile a batch builder (the `batch`
+//! submodule) that packs a whole image in one call, as fixture loader and as
+//! the reference the streaming builder is compared against.
 //!
-//! Given a stream of **pre-sorted, unique** `(key, value)` pairs it packs leaves
-//! at a configurable fill factor, builds branch levels upward, spills big values
-//! to overflow runs (SPEC 02 §5), and emits a complete env-file image (two meta
-//! slots + data pages) whose `main_db` `DBRecord` points at the built tree. The
-//! result is a byte-for-byte valid file that [`crate::env::open_with_backing`]
-//! opens and the [`crate::btree`] read path (and the `zerodb-tools check` tool)
-//! treat identically to a write-path tree — which is what lets the write path
-//! be differential-tested against this loader.
+//! Given a stream of pre-sorted, unique `(key, value)` pairs it packs leaves
+//! at a configurable fill factor, builds branch levels upward, stores big
+//! values on overflow runs (SPEC 02 §5), and emits a complete env-file image
+//! (two meta slots and the data pages) whose `main_db` `DBRecord` points at
+//! the built tree. The result is a valid file: [`crate::env::open_with_backing`]
+//! opens it, and the [`crate::btree`] read path and `zerodb-tools check`
+//! treat it like a tree the write path built.
 //!
-//! Pure logic over a growable `Vec<u8>` page buffer — no I/O, no `unsafe`, so
-//! `miri` exercises it.
+//! The builder writes through a [`PageSink`] and has no I/O and no `unsafe`,
+//! so miri can run all of it.
 
 use crate::page::geometry::{body_size, overflow_page_count, validate_page_size, value_is_inline};
 use crate::page::{
-    write_overflow_head, BranchMut, DBRecord, LeafMut, MetaPage, PageError, FIRST_DATA_PGNO,
-    FORMAT_VERSION, F_SUBDATA, MAGIC, MIN_KEYS_BRANCH,
+    even, write_overflow_head, BranchMut, DBRecord, LeafMut, MetaPage, PageError,
+    BIGDATA_VALUE_LEN, BRANCH_NODE_HEADER, FORMAT_VERSION, F_SUBDATA, LEAF_NODE_HEADER, MAGIC,
+    MIN_KEYS_BRANCH,
 };
 
-/// Default leaf/branch fill factor in permille (~90 %). Sequentially-packed
-/// pages are left ~10 % slack, matching a typical bulk-load target.
+#[cfg(test)]
+mod batch;
+#[cfg(test)]
+pub(crate) use batch::{build_multi_db_image, build_single_db_image, NamedDbData};
+
+/// Default leaf/branch fill factor in permille (90 %): each page keeps
+/// about 10 % free for later inserts.
 pub const DEFAULT_FILL_PERMILLE: u32 = 900;
-
-/// One entry fed to the tree builder: `(key, value, leaf-node flags)`. The flags
-/// are `0` for plain user data and [`F_SUBDATA`] for a named-DB catalog record
-/// on the main tree (SPEC 02 §6). Layout is decided by key/value size only —
-/// the flags do not affect a cell's size (an `F_SUBDATA` record is a fixed
-/// 48-byte inline value).
-type FEntry = (Vec<u8>, Vec<u8>, u16);
-
-/// A named database to place in a multi-DB image ([`build_multi_db_image`]): its
-/// catalog name and its pre-sorted, unique entries.
-pub struct NamedDbData<'a> {
-    /// The database name (the catalog key; 1..=`MAX_DB_NAME` bytes).
-    pub name: &'a [u8],
-    /// The database's entries, strictly ascending and unique by key.
-    pub entries: &'a [(Vec<u8>, Vec<u8>)],
-}
-
-/// Round `n` up to the next even number (2-byte cell alignment; SPEC 02 §2.2).
-#[inline]
-fn even(n: usize) -> usize {
-    (n + 1) & !1
-}
-
-/// A page sink: a growable buffer addressed by page number, with pages 0/1
-/// reserved for the meta slots and data pages allocated from
-/// [`FIRST_DATA_PGNO`] upward.
-struct PageStore {
-    psize: u32,
-    buf: Vec<u8>,
-    next_pgno: u64,
-    overflow_pages: u64,
-}
-
-impl PageStore {
-    fn new(psize: u32) -> PageStore {
-        PageStore {
-            psize,
-            buf: vec![0u8; 2 * psize as usize],
-            next_pgno: FIRST_DATA_PGNO,
-            overflow_pages: 0,
-        }
-    }
-
-    /// Allocate `n` contiguous pages, returning the first pgno.
-    fn alloc(&mut self, n: u64) -> u64 {
-        let p = self.next_pgno;
-        self.next_pgno += n;
-        let need = self.next_pgno as usize * self.psize as usize;
-        if self.buf.len() < need {
-            self.buf.resize(need, 0);
-        }
-        p
-    }
-
-    fn copy_page(&mut self, pgno: u64, page: &[u8]) {
-        let ps = self.psize as usize;
-        let base = pgno as usize * ps;
-        self.buf[base..base + ps].copy_from_slice(&page[..ps]);
-    }
-
-    /// Write a `payload` value across the `n`-page overflow run starting at
-    /// `pgno` (SPEC 02 §5): head page carries the header + first body bytes;
-    /// interior pages are pure payload.
-    fn write_run(
-        &mut self,
-        pgno: u64,
-        n: u64,
-        txnid: u64,
-        payload: &[u8],
-    ) -> Result<(), PageError> {
-        let ps = self.psize as usize;
-        let base = pgno as usize * ps;
-        let region = &mut self.buf[base..base + n as usize * ps];
-        let head_written = write_overflow_head(region, self.psize, pgno, txnid, n as u32, payload)?;
-        let rest = &payload[head_written..];
-        region[ps..ps + rest.len()].copy_from_slice(rest);
-        self.overflow_pages += n;
-        Ok(())
-    }
-}
 
 /// Write the little-endian `pgno` into a scratch page's header (offset 0).
 fn set_pgno(page: &mut [u8], pgno: u64) {
@@ -120,262 +47,43 @@ fn plan_leaf_cell(psize: u32, key: &[u8], val: &[u8]) -> LeafCellPlan {
     let dsize = val.len() as u64;
     if value_is_inline(ksize, dsize, psize) {
         LeafCellPlan {
-            cell_len: even(8 + ksize + val.len()),
+            cell_len: even(LEAF_NODE_HEADER + ksize + val.len()),
             overflow_pages: None,
         }
     } else {
         LeafCellPlan {
-            cell_len: even(8 + ksize + 8), // BIGDATA pointer
+            cell_len: even(LEAF_NODE_HEADER + ksize + BIGDATA_VALUE_LEN),
             overflow_pages: Some(overflow_page_count(dsize, psize)),
         }
     }
 }
 
-/// Pack the leaf level, returning `(first_key, leaf_pgno)` per leaf in order.
-fn build_leaves(
-    store: &mut PageStore,
-    psize: u32,
-    txnid: u64,
-    entries: &[FEntry],
-    fill: u32,
-) -> Result<Vec<(Vec<u8>, u64)>, PageError> {
-    let body = body_size(psize);
-    let target = ((body as u64 * fill as u64) / 1000) as usize;
-    let mut leaves = Vec::new();
-    let mut i = 0usize;
-    while i < entries.len() {
-        let mut scratch = vec![0u8; psize as usize];
-        let mut leaf = LeafMut::init(&mut scratch, psize, 0, txnid)?;
-        let first_key = entries[i].0.clone();
-        let mut used = 0usize;
-        let mut count = 0usize;
-        while i < entries.len() {
-            let (k, v, flags) = &entries[i];
-            let plan = plan_leaf_cell(psize, k, v);
-            let need = plan.cell_len + 2;
-            if count >= 1 && used + need > target {
-                break;
-            }
-            match plan.overflow_pages {
-                Some(n) => {
-                    let opg = store.alloc(n);
-                    store.write_run(opg, n, txnid, v)?;
-                    leaf.insert_bigdata(count, k, v.len() as u32, opg)?;
-                }
-                None => leaf.insert_inline(count, k, *flags, v)?,
-            }
-            used += need;
-            count += 1;
-            i += 1;
-        }
-        let lpg = store.alloc(1);
-        set_pgno(&mut scratch, lpg);
-        store.copy_page(lpg, &scratch);
-        leaves.push((first_key, lpg));
-    }
-    Ok(leaves)
-}
-
 /// Total bytes a branch page holding `group`'s children would use (node 0 has
 /// an empty separator key).
-fn branch_group_bytes(group: &[usize], children: &[(Vec<u8>, u64)], _psize: u32) -> usize {
+fn branch_group_bytes(group: &[usize], children: &[(Vec<u8>, u64)]) -> usize {
     let mut used = 0usize;
     for (j, &cidx) in group.iter().enumerate() {
         let ksize = if j == 0 { 0 } else { children[cidx].0.len() };
-        used += even(10 + ksize) + 2;
+        used += even(BRANCH_NODE_HEADER + ksize) + 2;
     }
     used
 }
 
-/// Ensure every branch group has `>= MIN_KEYS_BRANCH` children (SPEC 03 §11
-/// INV-8). Greedy packing can only leave the **last** group underful; rebalance
-/// the last two groups (merge if they fit one page, else split evenly).
-fn fix_branch_groups(groups: &mut Vec<Vec<usize>>, children: &[(Vec<u8>, u64)], psize: u32) {
-    if groups.len() < 2 {
-        return;
-    }
-    let body = body_size(psize);
-    let last = groups.len() - 1;
-    if groups[last].len() >= MIN_KEYS_BRANCH {
-        return;
-    }
-    let mut merged = groups[last - 1].clone();
-    merged.extend_from_slice(&groups[last]);
-    if branch_group_bytes(&merged, children, psize) <= body {
-        groups[last - 1] = merged;
-        groups.pop();
-    } else {
-        let mid = merged.len() / 2;
-        groups[last - 1] = merged[..mid].to_vec();
-        groups[last] = merged[mid..].to_vec();
-    }
-}
-
-/// Build one branch page over `group` (indices into `children`); node 0 carries
-/// the empty separator, node j≥1 the child's minimum key.
-fn build_one_branch(
-    store: &mut PageStore,
-    psize: u32,
-    txnid: u64,
-    children: &[(Vec<u8>, u64)],
-    group: &[usize],
-) -> Result<u64, PageError> {
-    let mut scratch = vec![0u8; psize as usize];
-    let mut br = BranchMut::init(&mut scratch, psize, 0, txnid)?;
-    for (j, &cidx) in group.iter().enumerate() {
-        let (key, cpgno) = &children[cidx];
-        let sep: &[u8] = if j == 0 { &[] } else { key.as_slice() };
-        br.insert(j, sep, *cpgno)?;
-    }
-    let pgno = store.alloc(1);
-    set_pgno(&mut scratch, pgno);
-    store.copy_page(pgno, &scratch);
-    Ok(pgno)
-}
-
-/// Pack one level of `children` into branch pages, returning the parent level
-/// `(min_key, branch_pgno)`.
-fn pack_branch_level(
-    store: &mut PageStore,
-    psize: u32,
-    txnid: u64,
-    children: &[(Vec<u8>, u64)],
-    fill: u32,
-    branch_pages: &mut u64,
-) -> Result<Vec<(Vec<u8>, u64)>, PageError> {
-    let body = body_size(psize);
-    let target = ((body as u64 * fill as u64) / 1000) as usize;
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut cur: Vec<usize> = Vec::new();
-    let mut used = 0usize;
-    for (idx, (key, _)) in children.iter().enumerate() {
-        let ksize = if cur.is_empty() { 0 } else { key.len() };
-        let need = even(10 + ksize) + 2;
-        if !cur.is_empty() && used + need > target {
-            groups.push(std::mem::take(&mut cur));
-            used = even(10) + 2; // this child is node 0 of the new group (empty key)
-            cur.push(idx);
-        } else {
-            used += need;
-            cur.push(idx);
-        }
-    }
-    if !cur.is_empty() {
-        groups.push(cur);
-    }
-    fix_branch_groups(&mut groups, children, psize);
-
-    let mut parents = Vec::with_capacity(groups.len());
-    for group in &groups {
-        let pgno = build_one_branch(store, psize, txnid, children, group)?;
-        *branch_pages += 1;
-        parents.push((children[group[0]].0.clone(), pgno));
-    }
-    Ok(parents)
-}
-
-/// Build one tree into a shared [`PageStore`], returning its `DBRecord`. The
-/// store's `next_pgno` advances so several trees (named DBs + the main catalog)
-/// pack into one env image ([`build_multi_db_image`]). `entries` are flagged
-/// ([`FEntry`]) so the main catalog can carry `F_SUBDATA` sub-DB records
-/// alongside user data; a per-DB tree passes flags `0`.
-fn build_tree_into(
-    store: &mut PageStore,
-    psize: u32,
-    txnid: u64,
-    entries: &[FEntry],
-    fill: u32,
-) -> Result<DBRecord, PageError> {
-    validate_page_size(psize)?;
-    debug_assert!(
-        entries.windows(2).all(|w| w[0].0 < w[1].0),
-        "build_tree_into requires strictly-ascending, unique keys"
-    );
-    if entries.is_empty() {
-        return Ok(DBRecord::empty());
-    }
-
-    // The store's overflow counter is shared across trees in a multi-DB image,
-    // so snapshot it and diff to get *this* tree's overflow-page count.
-    let overflow_before = store.overflow_pages;
-    let leaves = build_leaves(store, psize, txnid, entries, fill)?;
-    let leaf_pages = leaves.len() as u64;
-
-    let (root, depth, branch_pages) = if leaves.len() == 1 {
-        (leaves[0].1, 1u16, 0u64)
-    } else {
-        let mut level = leaves;
-        let mut branch_pages = 0u64;
-        let mut branch_levels = 0u16;
-        while level.len() > 1 {
-            level = pack_branch_level(store, psize, txnid, &level, fill, &mut branch_pages)?;
-            branch_levels += 1;
-        }
-        (level[0].1, 1 + branch_levels, branch_pages)
-    };
-
-    Ok(DBRecord {
-        root,
-        branch_pages,
-        leaf_pages,
-        overflow_pages: store.overflow_pages - overflow_before,
-        entries: entries.len() as u64,
-        depth,
-        flags: 0,
-        leaf2_ksize: 0,
-    })
-}
-
-/// Finalize a filled [`PageStore`] into a two-meta env image whose `main_db`
-/// roots `main`, `free_db` is empty, and `map_size`/`last_pg` describe the file.
-fn finalize_image(
-    store: PageStore,
-    psize: u32,
-    map_size: u64,
-    txnid: u64,
-    main_db: DBRecord,
-) -> Result<Vec<u8>, PageError> {
-    let last_pg = store.next_pgno - 1;
-    let mut buf = store.buf;
-    if buf.len() < 2 * psize as usize {
-        buf.resize(2 * psize as usize, 0);
-    }
-    let m0 = MetaPage {
-        pgno: 0,
-        txnid,
-        magic: MAGIC,
-        format_version: FORMAT_VERSION,
-        page_size: psize,
-        env_flags: 0,
-        map_size,
-        last_pg,
-        free_db: DBRecord::empty(),
-        main_db,
-        fl_count: 0,
-    };
-    m0.encode(&mut buf[0..psize as usize])?;
-    let mut m1 = m0;
-    m1.pgno = 1;
-    m1.encode(&mut buf[psize as usize..2 * psize as usize])?;
-    Ok(buf)
-}
-
 // ===========================================================================
-// Streaming builder — bounded-memory compaction (docs/PERFORMANCE.md,
-// compaction RAM)
+// Streaming builder: compaction in bounded memory
 // ===========================================================================
 
-/// Where a streaming build lands its pages. `zerodb-core` has no I/O policy, so
-/// the file-backed implementation lives engine-side (`zerodb::copy`); tests use
-/// an in-memory one. Pages may be emitted out of pgno order only for the two
-/// meta slots (patched last); data pages are emitted exactly once each, at the
-/// pgno `alloc` returned for them.
+/// Where a streaming build writes its pages. `zerodb-core` does no I/O, so
+/// the file-backed implementation lives in the `zerodb` crate
+/// (`zerodb::copy`); tests use an in-memory one. Each data page is emitted
+/// exactly once, at the pgno `alloc` returned for it. The two meta slots
+/// are emitted last.
 pub trait PageSink {
     /// Allocate `n` contiguous page numbers, returning the first.
     fn alloc(&mut self, n: u64) -> u64;
     /// The next pgno `alloc` would return (== 1 + highest allocated).
     fn next_pgno(&self) -> u64;
-    /// Land one `psize`-byte frame at `pgno`.
+    /// Write one `psize`-byte frame at `pgno`.
     ///
     /// # Errors
     ///
@@ -383,8 +91,8 @@ pub trait PageSink {
     fn emit(&mut self, pgno: u64, frame: &[u8]) -> std::io::Result<()>;
 }
 
-/// A [`PageSink`] over a growable in-memory image (pages 0/1 reserved for the
-/// meta slots), the differential referee for file-backed streaming in tests.
+/// A [`PageSink`] over a growable in-memory image (pages 0 and 1 reserved
+/// for the meta slots).
 #[cfg(test)]
 pub(crate) struct VecSink {
     psize: u32,
@@ -394,13 +102,14 @@ pub(crate) struct VecSink {
 
 #[cfg(test)]
 impl VecSink {
-    /// A fresh image sink: two zeroed meta slots, data from [`FIRST_DATA_PGNO`].
+    /// A fresh image sink: two zeroed meta slots, data from
+    /// [`FIRST_DATA_PGNO`](crate::page::FIRST_DATA_PGNO).
     #[must_use]
     pub fn new(psize: u32) -> VecSink {
         VecSink {
             psize,
             buf: vec![0u8; 2 * psize as usize],
-            next: FIRST_DATA_PGNO,
+            next: crate::page::FIRST_DATA_PGNO,
         }
     }
 
@@ -438,7 +147,7 @@ impl PageSink for VecSink {
 pub enum StreamBuildError {
     /// Page-encoding failure (invalid geometry, oversized cell, …).
     Page(PageError),
-    /// The sink failed to land a page (file-backed sinks only).
+    /// The sink failed to write a page (file-backed sinks only).
     Io(std::io::Error),
 }
 
@@ -455,8 +164,8 @@ impl From<std::io::Error> for StreamBuildError {
 
 /// One pending (closed but unemitted) branch group: its children `(min_key,
 /// pgno)`. Kept unemitted until the *next* group at the level closes, so the
-/// end-of-level rebalance ([`fix_branch_groups`]'s last-two rule) can still
-/// merge or re-split it.
+/// end-of-level rebalance (the last-two rule in [`TreeStream::finish`]) can
+/// still merge or re-split it.
 struct PendingGroup {
     children: Vec<(Vec<u8>, u64)>,
 }
@@ -469,19 +178,17 @@ struct StreamLevel {
     cur_used: usize,
 }
 
-/// Push-style bottom-up B+tree bulk loader (bounded-memory compaction): the batch
-/// `build_tree_into` logic — same greedy fill targets, same
-/// `fix_branch_groups` last-two rebalance, same overflow spill rule — but
-/// driven one entry at a time and emitting every finished page straight to a
-/// [`PageSink`]. Peak memory is one leaf scratch frame + one overflow scratch
-/// frame + at most **two child lists per branch level** (≲ 2 pages' worth of
-/// separators each): O(depth × psize), independent of tree size — where the
-/// batch path holds the whole image and entry set (~2× env size on the
-/// compaction path).
+/// A bottom-up B+tree bulk loader fed one entry at a time. It applies the
+/// batch builder's rules (the same greedy fill targets, rebalance of the
+/// last two branch groups, and overflow threshold) and emits every finished
+/// page to a [`PageSink`] at once. Peak memory is one leaf scratch frame,
+/// one overflow scratch frame and at most two child lists per branch level
+/// (about two pages of separators each): O(depth × psize), independent of
+/// the tree's size.
 ///
-/// Contract (as the batch builder): entries pushed in strictly-ascending
-/// unique key order; equality is memcmp (custom-comparator scope boundary —
-/// the caller refuses custom-comparator envs).
+/// Contract: entries are pushed in strictly ascending, unique key order.
+/// The order is memcmp, so the caller must refuse an env that has a custom
+/// comparator.
 pub struct TreeStream<'s, S: PageSink> {
     sink: &'s mut S,
     psize: u32,
@@ -511,8 +218,7 @@ impl<'s, S: PageSink> TreeStream<'s, S> {
     ///
     /// # Errors
     ///
-    /// [`PageError::InvalidPageSize`] via the first push if `psize` is bad —
-    /// construction itself validates eagerly.
+    /// [`PageError::InvalidPageSize`] if `psize` is not a valid page size.
     pub fn new(
         sink: &'s mut S,
         psize: u32,
@@ -585,8 +291,8 @@ impl<'s, S: PageSink> TreeStream<'s, S> {
                     val,
                 )?;
                 self.sink.emit(opg, &self.ovf_scratch)?;
-                // Interior pages: pure payload, one scratch frame at a time
-                // (bounded memory; the last page is zero-padded).
+                // Interior pages hold only payload, written one scratch frame
+                // at a time; the last page is zero-padded.
                 let mut off = head_written;
                 for i in 1..n {
                     let take = (val.len() - off).min(ps);
@@ -621,9 +327,9 @@ impl<'s, S: PageSink> TreeStream<'s, S> {
     }
 
     /// Append a child to branch level `lvl`, closing the current group when
-    /// the greedy fill target says so (exactly the batch packer's rule: the
-    /// overflowing child *starts* the next group as its empty-separator
-    /// node 0).
+    /// the fill target is reached. As in the batch builder, the child that
+    /// does not fit starts the next group as its node 0, with the empty
+    /// separator.
     fn add_child(&mut self, lvl: usize, key: Vec<u8>, pgno: u64) -> Result<(), StreamBuildError> {
         if self.levels.len() == lvl {
             self.levels.push(StreamLevel {
@@ -637,10 +343,10 @@ impl<'s, S: PageSink> TreeStream<'s, S> {
         } else {
             key.len()
         };
-        let need = even(10 + ksize) + 2;
+        let need = even(BRANCH_NODE_HEADER + ksize) + 2;
         if !self.levels[lvl].cur.is_empty() && self.levels[lvl].cur_used + need > self.target {
-            // Close the current group; the previous pending one (if any) is
-            // now final — emit it upward.
+            // Close the current group. The previous pending one, if any, is
+            // now final and is emitted.
             let closed = PendingGroup {
                 children: std::mem::take(&mut self.levels[lvl].cur),
             };
@@ -648,7 +354,7 @@ impl<'s, S: PageSink> TreeStream<'s, S> {
                 self.emit_group(lvl, prev)?;
             }
             self.levels[lvl].pending = Some(closed);
-            self.levels[lvl].cur_used = even(10) + 2; // this child is node 0
+            self.levels[lvl].cur_used = even(BRANCH_NODE_HEADER) + 2; // this child is node 0
             self.levels[lvl].cur.push((key, pgno));
         } else {
             self.levels[lvl].cur_used += need;
@@ -675,9 +381,9 @@ impl<'s, S: PageSink> TreeStream<'s, S> {
         self.add_child(lvl + 1, min_key, pgno)
     }
 
-    /// Finish the tree: flush the open leaf, cascade every level (applying the
-    /// batch packer's last-two rebalance so no branch is under
-    /// [`MIN_KEYS_BRANCH`]), and return the tree's [`DBRecord`].
+    /// Finish the tree: flush the open leaf, close every level (rebalancing
+    /// its last two groups so that no branch has fewer than
+    /// [`MIN_KEYS_BRANCH`] children), and return the tree's [`DBRecord`].
     ///
     /// # Errors
     ///
@@ -698,9 +404,8 @@ impl<'s, S: PageSink> TreeStream<'s, S> {
             let cur = std::mem::take(&mut level.cur);
             match (pending, cur) {
                 (None, cur) if cur.len() == 1 && is_top => {
-                    // Single child at the top level: it IS the root; no branch
-                    // page over it. (Level 0 with one leaf never gets here —
-                    // `levels` stays empty for a single-leaf tree.)
+                    // A single child at the top level is the root, with no
+                    // branch page over it.
                     let depth = 1 + lvl as u16;
                     return Ok(self.record(cur[0].1, depth));
                 }
@@ -709,9 +414,9 @@ impl<'s, S: PageSink> TreeStream<'s, S> {
                     self.emit_group(lvl, PendingGroup { children: cur })?;
                 }
                 (Some(prev), cur) => {
-                    // The batch rebalance (`fix_branch_groups`): only the last
-                    // group can be underful; merge into one page if it fits,
-                    // else split the union evenly.
+                    // Only the last group can have too few children: merge it
+                    // with the previous one if they fit one page, else split
+                    // their union evenly.
                     if cur.len() >= MIN_KEYS_BRANCH {
                         self.emit_group(lvl, prev)?;
                         self.emit_group(lvl, PendingGroup { children: cur })?;
@@ -719,7 +424,7 @@ impl<'s, S: PageSink> TreeStream<'s, S> {
                         let mut merged = prev.children;
                         merged.extend(cur);
                         let idx: Vec<usize> = (0..merged.len()).collect();
-                        if branch_group_bytes(&idx, &merged, self.psize) <= body_size(self.psize) {
+                        if branch_group_bytes(&idx, &merged) <= body_size(self.psize) {
                             self.emit_group(lvl, PendingGroup { children: merged })?;
                         } else {
                             let mid = merged.len() / 2;
@@ -752,14 +457,14 @@ impl<'s, S: PageSink> TreeStream<'s, S> {
     }
 }
 
-/// Streaming multi-DB env-image assembly (bounded-memory compaction): the
-/// [`build_multi_db_image`] shape — named DBs first, then the main tree with
-/// `F_SUBDATA` catalog records merged in key order, then both meta slots —
-/// but push-driven over a [`PageSink`], with [`TreeStream`]'s bounded memory.
+/// Builds a whole env image with several databases through a [`PageSink`],
+/// in [`TreeStream`]'s bounded memory: the named databases first, then the
+/// main tree with their `F_SUBDATA` catalog records merged in key order,
+/// then both meta slots.
 ///
-/// Usage: [`named_db`](Self::named_db) once per named DB **in ascending name
-/// order**, then [`finish_main`](Self::finish_main), which returns the sink
-/// for the caller to sync/close/consume.
+/// Usage: [`named_db`](Self::named_db) once per named database, in ascending
+/// name order, then [`finish_main`](Self::finish_main), which returns the
+/// sink.
 pub struct EnvStream<S: PageSink> {
     sink: S,
     psize: u32,
@@ -768,10 +473,10 @@ pub struct EnvStream<S: PageSink> {
     catalog: Vec<(Vec<u8>, DBRecord)>,
 }
 
-/// The main-tree push handle handed out by [`EnvStream::finish_main`]:
-/// interleaves the named-DB catalog records (`F_SUBDATA`) with the pushed
-/// user entries in one ascending memcmp order — the batch builder's
-/// merge-and-sort, without materializing either side.
+/// The handle [`EnvStream::finish_main`] passes to its `feed` callback: it
+/// merges the named-database catalog records (`F_SUBDATA`) with the pushed
+/// user entries in one ascending memcmp order, without collecting the user
+/// entries.
 pub struct MainStream<'s, S: PageSink> {
     ts: TreeStream<'s, S>,
     catalog: std::iter::Peekable<std::vec::IntoIter<(Vec<u8>, DBRecord)>>,
@@ -903,98 +608,6 @@ impl<S: PageSink> EnvStream<S> {
         sink.emit(1, &frame)?;
         Ok(sink)
     }
-}
-
-/// Build a complete single-DB env-file image from pre-sorted, unique `entries`:
-/// two identical valid meta slots at `txnid` whose `main_db` roots the built
-/// tree (SPEC 02 §3). `free_db` is empty (the builder produces no GC state). The
-/// whole dataset lives in the main/unnamed DB; for named DBs use
-/// [`build_multi_db_image`].
-///
-/// The returned bytes can be written to an env's `zerodb.dat` and opened.
-///
-/// # Errors
-///
-/// [`PageError`] on an invalid page size or (never, for valid inputs) a
-/// page-encoding failure.
-///
-/// # Panics (debug only)
-///
-/// If `entries` are not strictly ascending / unique.
-pub fn build_single_db_image(
-    psize: u32,
-    map_size: u64,
-    txnid: u64,
-    entries: &[(Vec<u8>, Vec<u8>)],
-    fill_permille: u32,
-) -> Result<Vec<u8>, PageError> {
-    let fill = fill_permille.clamp(1, 1000);
-    let mut store = PageStore::new(psize);
-    let flagged: Vec<FEntry> = entries
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone(), 0u16))
-        .collect();
-    let main_db = build_tree_into(&mut store, psize, txnid, &flagged, fill)?;
-    finalize_image(store, psize, map_size, txnid, main_db)
-}
-
-/// Build a complete **multi-DB** env-file image: the main/unnamed DB
-/// (`main_user` = its plain user entries) plus every named DB in `named`, each
-/// referenced from the main catalog by an inline `F_SUBDATA` record (SPEC 02
-/// §6). Every tree is packed bottom-up and densely, with no free pages.
-///
-/// Build order: each named DB's tree is packed first (so its root pgno is
-/// known), then the main catalog is packed over `main_user` merged with one
-/// `F_SUBDATA` entry per named DB, sorted by key. `free_db` is empty in the
-/// result (a fresh compact env owns no free pages).
-///
-/// Requirements (as for [`build_single_db_image`]): within each DB the entries
-/// are strictly ascending and unique, and the named-DB names are disjoint from
-/// the main DB's user keys (guaranteed for any image produced from a valid env
-/// — a main-tree key is either a user key or a sub-DB pointer, never both).
-///
-/// # Errors
-///
-/// [`PageError`] on an invalid page size or a page-encoding failure.
-///
-/// # Panics (debug only)
-///
-/// If any DB's entries are not strictly ascending / unique, or a name collides
-/// with a main user key.
-pub fn build_multi_db_image(
-    psize: u32,
-    map_size: u64,
-    txnid: u64,
-    main_user: &[(Vec<u8>, Vec<u8>)],
-    named: &[NamedDbData<'_>],
-    fill_permille: u32,
-) -> Result<Vec<u8>, PageError> {
-    let fill = fill_permille.clamp(1, 1000);
-    let mut store = PageStore::new(psize);
-
-    // Pack each named DB's tree; collect its catalog record keyed by name.
-    let mut catalog: Vec<FEntry> = Vec::with_capacity(named.len());
-    for nd in named {
-        let flagged: Vec<FEntry> = nd
-            .entries
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone(), 0u16))
-            .collect();
-        let rec = build_tree_into(&mut store, psize, txnid, &flagged, fill)?;
-        catalog.push((nd.name.to_vec(), rec.to_bytes().to_vec(), F_SUBDATA));
-    }
-
-    // Merge main user data (flags 0) with the catalog records (F_SUBDATA) and
-    // sort by key: the main tree holds both, in one ascending order.
-    let mut main_entries: Vec<FEntry> = main_user
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone(), 0u16))
-        .collect();
-    main_entries.extend(catalog);
-    main_entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let main_db = build_tree_into(&mut store, psize, txnid, &main_entries, fill)?;
-    finalize_image(store, psize, map_size, txnid, main_db)
 }
 
 #[cfg(test)]
@@ -1147,7 +760,8 @@ mod tests {
 
     #[test]
     fn large_keys_force_thin_branches() {
-        // 511-byte keys: few children per branch page, exercising fix_branch_groups.
+        // 511-byte keys: few children per branch page, so the last branch
+        // groups need rebalancing.
         let entries: Vec<_> = (0u16..300)
             .map(|i| {
                 let mut k = vec![b'a'; 509];
@@ -1210,14 +824,13 @@ mod tests {
         assert_eq!(crate::check::check_image(&img, PS), Vec::<String>::new());
     }
 
-    /// Bounded-memory compaction referee: the streaming builder against the batch builder,
-    /// same mixed corpus (multi-level trees, single-leaf tree, empty named
-    /// DBs on both sides of the user keyspace, multi-page overflow values).
-    /// Layout (pgno order) legitimately differs; everything semantic must
-    /// not: both images check-clean, identical logical content (catalog
-    /// records compared by *following* them — their root pgnos differ by
-    /// design), and identical page economy (same packing rules ⇒ same page
-    /// counts per kind and same depth).
+    /// The streaming builder against the batch builder on the same mixed
+    /// data (multi-level trees, a single-leaf tree, empty named databases on
+    /// both sides of the user keys, multi-page overflow values). The page
+    /// numbering may differ. Both images must pass the checker, hold the same
+    /// logical content (catalog records are compared by following them, since
+    /// their root pgnos differ), and have the same page counts per kind and
+    /// the same depth, since both use the same packing rules.
     #[test]
     fn stream_builder_matches_batch_builder() {
         use std::collections::HashSet;
@@ -1245,8 +858,8 @@ mod tests {
                 name: b"beta",
                 entries: &db_b,
             },
-            // Sorts after every "keyNNNNN" user key: exercises the
-            // stream-side end-of-main catalog drain.
+            // Sorts after every "keyNNNNN" user key, so the stream must emit
+            // this catalog record after the last user entry.
             NamedDbData {
                 name: b"zeta",
                 entries: &[],

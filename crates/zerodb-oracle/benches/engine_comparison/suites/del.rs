@@ -4,7 +4,7 @@
 //! LMDB pushes freed pages onto the FREE_DBI list keyed by txnid; zerodb keeps
 //! its own GC (SPEC 05). A gap that shows up in `churn/reinsert` and nowhere
 //! else points at reclamation, not at the tree (free-list bookkeeping in
-//! docs/PERFORMANCE.md, issue #29).
+//! docs/PERFORMANCE.md).
 //!
 //! Ladder:
 //! * `bulk/all` empties the tree key by key — every leaf eventually merges.

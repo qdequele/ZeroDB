@@ -16,21 +16,31 @@
 //!    `WRITE_MAP`, the writer grows the file to the logical map size before it
 //!    stores through the map (SPEC 04 §6.4). No process truncates the file.
 //! 3. **One writer, writing only unshared pages.** One write txn at a time
-//!    across processes (TXN-6, ADR-0023 §2). It writes only pages no live
+//!    across processes (TXN-6, ADR-0023). It writes only pages no live
 //!    snapshot references (TXN-62: fresh pages, or pages freed before the
 //!    oldest reader) and the two meta slots, which are never lent out as
 //!    borrows (readers use the published snapshot object, TXN-18; a meta is
 //!    read back as a `pread` copy whose CRC rejects a torn slot).
 //! 4. **No live borrow is rewritten.** A spilling write txn rewrites one of its
 //!    own pages only at the start of a later `&mut` call, when no borrow into
-//!    it is live (TXN-39), and re-derives its whole-map view after each spill
-//!    (TXN-71).
+//!    it is live (TXN-39).
+//! 5. **Borrows cover only the pages read.** A map is lent to the engine as a
+//!    [`MapPages`] built from the mapping's raw pointer, never as a whole-map
+//!    `&[u8]`, and the engine borrows from it exactly the page or overflow
+//!    run it reads (ADR-0021 amendment 1). The free pages the writer stores
+//!    to lie below every snapshot's high-water, so a whole-map borrow would
+//!    cover them even though no reader reads them.
 //!
-//! So no `&[u8]` that safe code reads is mutated while it is borrowed.
+//! So no byte a live `&[u8]` covers is mutated while it is borrowed: rule 3
+//! keeps the pages read disjoint from the pages written, and rule 5 keeps
+//! every borrow inside the pages read. The mappings are `memmap2::MmapRaw`,
+//! whose pointer is not derived from a reference to the whole map.
 
 use std::fs::File;
 use std::sync::atomic::{AtomicPtr, Ordering};
+
 use std::sync::{Mutex, PoisonError};
+use zerodb_core::env::MapPages;
 
 /// A read-only (`PROT_READ`, `MAP_SHARED`) map over an env data file.
 ///
@@ -38,7 +48,7 @@ use std::sync::{Mutex, PoisonError};
 /// through `pwrite`, and a longer map is added beside it on resize
 /// ([`MapRegions`]); a mapping is never remapped in place.
 pub(crate) struct Mmap {
-    inner: memmap2::Mmap,
+    inner: memmap2::MmapRaw,
 }
 
 impl Mmap {
@@ -49,10 +59,11 @@ impl Mmap {
     ///
     /// Propagates the `mmap` I/O error.
     pub(crate) fn map(file: &File, len: usize) -> std::io::Result<Mmap> {
-        // SAFETY: the module's aliasing contract: the caller keeps `file` open
-        // for the map's life (1), only in-file pages are dereferenced (2), and
-        // writes through the fd touch only pages no borrow can see (3, 4).
-        let inner = unsafe { memmap2::MmapOptions::new().len(len).map(file)? };
+        // A raw mapping hands out no reference; the dereferences happen
+        // through `pages`, under the module's aliasing contract.
+        let inner = memmap2::MmapOptions::new()
+            .len(len)
+            .map_raw_read_only(file)?;
         Ok(Mmap { inner })
     }
 
@@ -66,9 +77,13 @@ impl Mmap {
         self.inner.advise(memmap2::Advice::Random)
     }
 
-    /// The whole mapped region.
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.inner
+    /// The mapped region, lent page by page (rule 5).
+    pub(crate) fn pages(&self) -> MapPages<'_> {
+        // SAFETY: the pointer and length describe the live mapping, which
+        // stays mapped while `self` is borrowed and whose file outlives it
+        // (1); only in-file pages are dereferenced (2); stores into it keep to
+        // the module's contract (rules 3-5).
+        unsafe { MapPages::from_raw_parts(self.inner.as_ptr(), self.inner.len()) }
     }
 }
 
@@ -80,7 +95,7 @@ impl Mmap {
 /// Every page below the logical map size must be inside the file before
 /// anything is stored through the map, so a store never faults with `SIGBUS`.
 pub(crate) struct MmapWritable {
-    inner: memmap2::MmapMut,
+    inner: memmap2::MmapRaw,
 }
 
 impl MmapWritable {
@@ -101,16 +116,18 @@ impl MmapWritable {
     ///
     /// Propagates the `mmap` I/O error.
     pub(crate) fn map(file: &File, len: usize) -> std::io::Result<MmapWritable> {
-        // SAFETY: the module's aliasing contract (1-4). Stores go only through
-        // `write_at` and `slice_mut`, whose callers keep to it: one writer,
-        // in-file pages no snapshot references, no live borrow rewritten.
-        let inner = unsafe { memmap2::MmapOptions::new().len(len).map_mut(file)? };
+        // A raw mapping hands out no reference. Reads go through `pages` and
+        // stores only through `write_at` and `slice_mut`, whose callers keep
+        // to the module's aliasing contract.
+        let inner = memmap2::MmapOptions::new().len(len).map_raw(file)?;
         Ok(MmapWritable { inner })
     }
 
-    /// The whole mapped region as read-only bytes.
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.inner
+    /// The mapped region, lent page by page (rule 5).
+    pub(crate) fn pages(&self) -> MapPages<'_> {
+        // SAFETY: as `Mmap::pages`: the live mapping, stored to only under
+        // the module's contract (rules 3-5).
+        unsafe { MapPages::from_raw_parts(self.inner.as_ptr(), self.inner.len()) }
     }
 
     /// Byte length of the mapped region.
@@ -123,7 +140,7 @@ impl MmapWritable {
     /// # Safety
     ///
     /// The caller must be the single writer (TXN-6), and no live `&[u8]`
-    /// obtained from [`MmapWritable::bytes`] (or any other view of the file)
+    /// obtained from [`MmapWritable::pages`] (or any other view of the file)
     /// may be read at `[off, off + data.len())` while this runs: the target
     /// must be a page no snapshot references (TXN-62) or a meta slot.
     ///
@@ -143,7 +160,7 @@ impl MmapWritable {
         // the ranges do not overlap. The pointer comes from the map's root
         // allocation, never through a `&[u8]` view.
         unsafe {
-            let dst = self.inner.as_ptr().cast_mut().add(off);
+            let dst = self.inner.as_mut_ptr().add(off);
             std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
     }
@@ -163,8 +180,8 @@ impl MmapWritable {
     /// - there is one write txn (TXN-6), and at most one live `&mut` into the
     ///   region, tied to `&mut` on the dirty store and never stored
     ///   (TXN-39/41/42);
-    /// - no older `&[u8]` view is read at these bytes afterwards: the writer's
-    ///   whole-map view is re-derived after every spill (TXN-71).
+    /// - no `&[u8]` lent from [`MmapWritable::pages`] covers the region while
+    ///   the `&mut` lives: borrows cover only the pages read (rule 5).
     ///
     /// # Panics
     ///
@@ -183,7 +200,7 @@ impl MmapWritable {
         // SAFETY: the range is inside the mapping (assert above) and the
         // pointer comes from the map's root allocation, as in `write_at`.
         // Exclusivity of the region is the caller's contract (`# Safety`).
-        unsafe { std::slice::from_raw_parts_mut(self.inner.as_ptr().cast_mut().add(off), len) }
+        unsafe { std::slice::from_raw_parts_mut(self.inner.as_mut_ptr().add(off), len) }
     }
 
     /// `msync` the whole map: `MS_ASYNC` when `async_flush` (`MAP_ASYNC`,
@@ -260,14 +277,19 @@ impl Mapping {
         }
     }
 
-    /// The whole mapped region.
-    pub(crate) fn bytes(&self) -> &[u8] {
+    /// The mapped region, lent page by page (rule 5).
+    pub(crate) fn pages(&self) -> MapPages<'_> {
         match self {
-            Mapping::Read(m) => m.bytes(),
-            Mapping::Write(m) => m.bytes(),
+            Mapping::Read(m) => m.pages(),
+            Mapping::Write(m) => m.pages(),
             #[cfg(test)]
-            Mapping::Heap(b) => b,
+            Mapping::Heap(b) => MapPages::from_slice(b),
         }
+    }
+
+    /// The mapped region's length in bytes.
+    pub(crate) fn len(&self) -> usize {
+        self.pages().len()
     }
 }
 
@@ -422,7 +444,7 @@ mod tests {
                         // after the final publish.
                         let finished = done.load(Ordering::Acquire);
                         let (m, size) = regions.view();
-                        let bytes = m.bytes();
+                        let bytes = m.pages().whole();
                         assert!(bytes.len() as u64 >= size, "mapping shorter than its size");
                         assert!(size >= last, "a later load returned an older view");
                         last = size;
@@ -451,6 +473,6 @@ mod tests {
             r.join().expect("reader");
         }
         let (m, size) = regions.view();
-        assert_eq!((m.bytes().len(), size), (512, 300));
+        assert_eq!((m.len(), size), (512, 300));
     }
 }

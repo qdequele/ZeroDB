@@ -40,13 +40,14 @@ impl<'env> RwTxn<'env> {
         let base = (pgno as usize)
             .checked_mul(ps)
             .ok_or(Error::Mdb(MdbError::Invalid))?;
-        // The `&'env [u8]` map handle, copied out of `self` so the borrow
-        // does not alias the `&mut self.dirty` op (as in `touch`). The page
-        // was written at a `&mut` boundary before this one, and no borrow into
-        // it is live (TXN-39), so reading it now is the TXN-62 contract.
-        let map: &[u8] = self.bytes;
-        let src = map
-            .get(base..base + ps)
+        // The spilled page alone, borrowed for 'env from the map handle so
+        // the borrow does not alias the `&mut self.dirty` op (as in `touch`).
+        // The page was written at a `&mut` boundary before this one, and no
+        // borrow into it is live (TXN-39), so reading it now is the TXN-62
+        // contract.
+        let src = self
+            .map
+            .get(base, ps)
             .ok_or(Error::Mdb(MdbError::Invalid))?;
         let frame = self.dirty.unspill_copy(pgno, src);
         debug_assert_eq!(
@@ -58,9 +59,9 @@ impl<'env> RwTxn<'env> {
     }
 
     /// Write the frames at `pgnos` (ascending) with the commit's page writer:
-    /// consecutive frames go out as one vectored write — a frame
-    /// at `pgno` covering `n` pages (an overflow run) makes the run
-    /// contiguous iff the next frame starts at `pgno + n`. Used by commit C2
+    /// consecutive frames go out as one vectored write — a frame at `pgno`
+    /// covering `n` pages (an overflow run) makes the run contiguous iff
+    /// the next frame starts at `pgno + n`. Used by commit C2
     /// and by spilling (SPEC 04 TXN-69). Not yet durable.
     pub(super) fn write_frames(&self, pgnos: &[u64]) -> Result<()> {
         let psize = self.psize;
@@ -189,15 +190,6 @@ impl<'env> RwTxn<'env> {
         // touch already stored it in the fully-backed map), so the file backs
         // every page up to `high`; spilled pages resolve from the map below it.
         self.read_high = high;
-        // TXN-71 (ADR-0021): re-derive the cached whole-map read view. The
-        // pages just spilled become resolvable through it, and a view taken
-        // before those writes must never serve them (under Stacked/Tree
-        // Borrows the write invalidates the older borrow). This fresh borrow,
-        // at a `&mut` boundary (TXN-39), postdates every write. In-place
-        // WRITE_MAP keeps no cached view; see `RwTxn::whole_map`.
-        if !self.dirty.in_map_mode() {
-            self.bytes = self.env.inner().backing_bytes();
-        }
         // TXN-71: a spilled page's map bytes change only at in-place writes
         // of this txn's own dirty frames (TXN-45b) and here, so a fresh
         // memo per spill keeps every memo entry true to the current bytes.
@@ -236,8 +228,8 @@ impl<'env> RwTxn<'env> {
     }
 
     /// Whether this txn realizes dirty frames **in the writable map**
-    /// (ADR-0021, SPEC 04 §6.4 TXN-45b). Test and diagnostics hook: the
-    /// WRITE_MAP-parameterized batteries assert the mode is actually active.
+    /// (ADR-0021, SPEC 04 §6.4 TXN-45b). Test and diagnostics hook: tests
+    /// parameterized over `WRITE_MAP` assert the mode is actually active.
     #[doc(hidden)]
     #[must_use]
     pub fn dirty_in_map_mode(&self) -> bool {

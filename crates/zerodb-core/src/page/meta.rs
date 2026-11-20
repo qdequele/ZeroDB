@@ -209,25 +209,19 @@ impl MetaPage {
 
     /// Encode this meta into `buf` with `annex` as the free-list annex ids
     /// (SPEC 02 §3 format v2, ADR-0022; SPEC 05 §2a). This encoder enforces only
-    /// the capacity bound; it does **not** check the GC-29 shape (strictly
-    /// ascending, unique, in range), and it is sound for it not to, because the
-    /// shape is never trusted on the way *out* of a meta — it is re-checked by
-    /// `validate_pil_ids` before any id is handed out (SPEC 05 GC-33). The two
-    /// callers and their inputs:
-    /// - `RwTxn::freelist_save` → the commit path, through
-    ///   `MetaPage::encode_with_annex_over_zeroed`: produces a GC-29-shaped
-    ///   list by construction, so what it encodes is well-formed.
-    /// - `copy::write_raw` → raw env copy: forwards the pinned snapshot's annex
-    ///   verbatim. That annex passed only the open-time count+CRC bound, **not**
-    ///   `validate_pil_ids`, so a hostile-but-CRC-valid source file is copied
-    ///   faithfully (ids unchanged) — the copy is as trustworthy as its source
-    ///   and no more, and the copy's own reader re-validates before any draw.
+    /// the capacity bound. It does not check the GC-29 shape (strictly
+    /// ascending, unique, in range), because a reader never trusts that shape:
+    /// `validate_pil_ids` re-checks it before any id is handed out (SPEC 05
+    /// GC-33). The commit path encodes a list that has the shape by
+    /// construction. A raw env copy forwards the source snapshot's annex
+    /// unchanged, so a source file with a CRC-valid but malformed annex yields
+    /// a copy with the same annex, which the copy's reader rejects in turn.
     ///
     /// # Errors
     ///
     /// [`PageError::InvalidPageSize`], [`PageError::BufferTooSmall`], or
-    /// [`PageError::BadValueSize`] if `annex` exceeds [`meta_annex_cap`]
-    /// (engine bug: the save's fit check owns that bound).
+    /// [`PageError::BadValueSize`] if `annex` exceeds [`meta_annex_cap`]. The
+    /// commit path checks the fit before encoding, so this indicates a bug.
     pub fn encode_with_annex(&self, buf: &mut [u8], annex: &[u64]) -> Result<(), PageError> {
         let psize = self.check_encode(buf, annex)?;
         // Zero the whole page first so every reserved byte is 0.
@@ -354,6 +348,25 @@ impl MetaPage {
     /// meta's *own* `page_size` field is checked as rule 3 and surfaced via
     /// [`MetaValidity::BadPageSize`], not as an error.)
     pub fn validate(buf: &[u8], psize: u32) -> Result<MetaValidity, PageError> {
+        Self::validate_version(buf, psize, FORMAT_VERSION)
+    }
+
+    /// [`MetaPage::validate`] with rule 2 checking `format_version` against
+    /// `version` instead of [`FORMAT_VERSION`].
+    ///
+    /// The meta layout is the same in every format version from 2 on (SPEC 02
+    /// §0), so this decodes a version 2 meta. The engine never calls it with
+    /// another version: it opens only [`FORMAT_VERSION`] files. It exists for
+    /// `zerodb-tools`, which reads an older file's databases to upgrade it.
+    ///
+    /// # Errors
+    ///
+    /// As [`MetaPage::validate`].
+    pub fn validate_version(
+        buf: &[u8],
+        psize: u32,
+        version: u32,
+    ) -> Result<MetaValidity, PageError> {
         validate_page_size(psize)?;
         if buf.len() < psize as usize {
             return Err(PageError::BufferTooSmall {
@@ -369,7 +382,7 @@ impl MetaPage {
         }
         // Rule 2: format version.
         let format_version = read_u32(buf, OFF_FORMAT_VERSION);
-        if format_version != FORMAT_VERSION {
+        if format_version != version {
             return Ok(MetaValidity::BadVersion(format_version));
         }
         // Rule 3: page_size power of two in range.
@@ -428,9 +441,9 @@ pub enum MetaValidity {
     /// `page_size` is not a power of two in range (the observed value).
     BadPageSize(u32),
     /// `fl_count` exceeds the page's annex capacity (SPEC 02 §3.2 rule 5,
-    /// format v2) — the slot is **invalid and discarded** (as §3.3 / REC-8
-    /// word it). The cause is either a torn write or a hostile count; both are
-    /// rejected identically, before the CRC read, so the name covers both.
+    /// format v2): the slot is invalid and discarded (§3.3, REC-8). The cause
+    /// is a torn write or a hostile count; both are rejected before the CRC
+    /// read.
     BadAnnexCount(u32),
     /// Header txnid and body txnid disagree — a torn write (INV-2).
     TxnidMismatch {

@@ -5,7 +5,7 @@
 //!
 //! [`Env::write_txn`] acquires the env's in-process write mutex (TXN-6) and
 //! holds the guard for the txn's whole life. All mutation runs against the
-//! txn-private [`DirtyStore`] (TXN-41 stable frames); reads on the txn resolve
+//! txn-private `DirtyStore` (TXN-41 stable frames); reads on the txn resolve
 //! dirty frames first, then the read-only map (TXN-38), through the same
 //! [`Database`] read API as a `RoTxn` (via [`TxnRead`]). heed's borrow model is
 //! the compile-time enforcement of the value-borrow contract: reads take
@@ -25,8 +25,9 @@
 //! C1, `RwTxn::freelist_save` rewrites drained entries, releases trailing
 //! loose pages (GC-10), and writes this txn's freed set under
 //! `BE(writer_txnid)` in a fixed-point loop (GC-11..13) during which
-//! `allocate` is restricted to loose pages / extend only (GC-12,
-//! `AllocMode::GcSave`). The GC tree is mutated by the **same** split/COW
+//! `allocate` never reads the GC tree: it takes loose pages, draws from the
+//! pools already loaded, or extends (GC-12, GC-13a; `AllocMode::GcSave`,
+//! then `AllocMode::GcSaveExtend`). The GC tree is mutated by the **same** split/COW
 //! code as the main tree, selected by `TreeId`.
 //!
 //! ## Commit (SPEC 04 §9, SPEC 06 §2)
@@ -66,8 +67,8 @@ use crate::page::geometry::{
     overflow_page_count, pil_decode, pil_encode_into, pil_size, value_is_inline, GcKey,
 };
 use crate::page::{
-    write_overflow_head, BranchMut, BranchRef, DBRecord, LeafMut, LeafRef, LeafValue, MetaPage,
-    PageError, PageRef, PageType, DBRECORD_LEN, FILL_THRESHOLD_PERMILLE, FIRST_DATA_PGNO,
+    write_overflow_head, BranchMut, BranchRef, DBRecord, LeafMut, LeafRef, LeafValue, MapPages,
+    MetaPage, PageError, PageRef, PageType, DBRECORD_LEN, FILL_THRESHOLD_PERMILLE, FIRST_DATA_PGNO,
     FORMAT_VERSION, F_SUBDATA, HEADER_SIZE, MAGIC, MAX_DATA_SIZE, MAX_DB_NAME, MAX_KEY_SIZE,
     MIN_KEYS_BRANCH, MIN_KEYS_LEAF, PGNO_INVALID,
 };
@@ -207,6 +208,10 @@ pub(crate) struct WriterCarry {
     /// follows the meta write, so a commit that unwound in between leaves
     /// the next one a prefix to clear.
     meta_dirty: usize,
+    /// The bytes the meta slot held before this commit's C4, kept so a
+    /// failed meta write or meta barrier can put them back (SPEC 06 REC-13,
+    /// ADR-0047). Empty until the first commit, then one page, reused.
+    meta_prev: Vec<u8>,
     /// The txn's state in the env's slot table (ADR-0024), restarted at
     /// every begin, which keeps its handle-check memo allocation
     /// ([`crate::handles::HandleTable::restart`]).
@@ -221,9 +226,9 @@ pub(crate) struct WriterCarry {
     /// The base meta's free-list annex pool (SPEC 05 §2a, ADR-0022): the
     /// pages freed by txn `base.txnid`, parsed (and `validate_pil_ids`-
     /// checked, GC-33) at begin when `base.free_annex > 0`. Drawn by
-    /// [`RwTxn::annex_draw`] (allocate step 2b, gated per GC-31); whatever
-    /// remains is folded into `freed` at the top of `freelist_save` (the
-    /// GC-30 carry) — by then the pool is empty, so GcSave never sees it.
+    /// [`RwTxn::annex_draw`] (allocate step 2b, gated per GC-31), during
+    /// ops and inside `freelist_save`; whatever remains at the save's fixed
+    /// point is carried into this txn's own entry (GC-30).
     annex: Drain,
     /// Entries of `drains` whose `remaining` shrank via an **in-save pool
     /// draw** (GC-12 — see `freelist_save`): each must be
@@ -322,14 +327,14 @@ use insert::*;
 
 fn poisoned_error() -> Error {
     Error::Io(std::io::Error::other(
-        "environment poisoned by a failed durability barrier (SPEC 06 REC-13)",
+        "environment poisoned by a failed durability barrier or meta write (SPEC 06 REC-13)",
     ))
 }
 
 /// The `EACCES` a write txn on a read-only env returns (SPEC 01 Table 1, TXN-8).
 /// The fork's `mdb_txn_begin` returns `EACCES`, which heed surfaces as
 /// `Error::Io(PermissionDenied)` (os error 13); ZeroDB returns the identical
-/// value so the oracle taxonomy agrees.
+/// value, so callers see the same error from both engines.
 fn read_only_error() -> Error {
     Error::Io(std::io::Error::from_raw_os_error(13))
 }
@@ -360,13 +365,11 @@ pub struct RwTxn<'env> {
     /// thread-agnostic [`crate::env`] writer-lock guard, not a
     /// `std::sync::MutexGuard`).
     _guard: crate::env::WriterGuard<'env>,
-    /// The mapped region (fallback source for untouched pages, TXN-38), heap
-    /// modes only, re-derived at every spill (TXN-71). Under in-place
-    /// `WRITE_MAP` (TXN-45b) it is the **empty slice**: a stale whole-map
-    /// reference field would be retagged on every move of the txn, which is
-    /// UB at the written locations, so [`RwTxn::whole_map`] borrows lazily
-    /// instead (ADR-0021).
-    bytes: &'env [u8],
+    /// The mapped region (fallback source for untouched pages, TXN-38). A
+    /// [`MapPages`] holds a pointer, not a reference, so keeping it across
+    /// the txn's in-place stores (TXN-45b), spills (TXN-71) and moves
+    /// asserts nothing about bytes it does not lend (ADR-0021 amendment 1).
+    map: MapPages<'env>,
     /// The snapshot this txn grew from (`writer_txnid = base.txnid + 1`).
     /// `Some` until the txn's drop hands it to the [`WriterCarry`]; read it
     /// through [`RwTxn::base`].
@@ -387,7 +390,7 @@ pub struct RwTxn<'env> {
     validated: ValidatedPages<'env>,
     /// `freelist_save`'s GC-32 placement decision: `true` = this txn's own
     /// entry rides in the meta annex (C4 encodes `freed` as `fl_ids`; no
-    /// GC-tree entry `BE(txnid)` exists), `false` = the v1 tree arm ran (or
+    /// GC-tree entry `BE(txnid)` exists), `false` = the GC-tree arm ran (or
     /// `freed` is empty) and the annex is empty.
     annex_out: bool,
     /// GC-12 allocation restriction (ADR-0005).
@@ -420,6 +423,11 @@ pub struct RwTxn<'env> {
     /// inside a split cascade) leaves the working tree partial, so every later
     /// mutation and `commit` returns `BadTxn`; only abort is valid.
     errored: bool,
+    /// Whether this txn cleared the main database. LMDB's `mdb_drop` marks
+    /// the txn dirty even when the database was already empty, so such a
+    /// commit writes a new meta and takes a new txnid; this keeps the
+    /// unchanged-commit short-circuit from skipping it (TXN-74).
+    cleared_main: bool,
     /// Live nested read children (SPEC 04 TXN-31, ADR-0007), checked by
     /// [`RwTxn::guard_ok`] (TXN-29) and at commit C0 (TXN-33).
     ///
@@ -456,7 +464,7 @@ impl Env {
         }
         let mut guard = inner.lock_writer();
         // In a lock-file environment, also the cross-process writer lock
-        // (ADR-0023 §2); a no-op otherwise.
+        // (ADR-0023); a no-op otherwise.
         inner.lock_writer_shared(&mut guard)?;
         // Recheck under the lock: a concurrent commit may have failed while we
         // blocked on the mutex.
@@ -473,7 +481,7 @@ impl Env {
             grow_file_to_map(inner)?;
         }
         // The latest published snapshot, which in a lock-file env may be
-        // another process's commit (ADR-0023 §4). The previous write txn's
+        // another process's commit (ADR-0023). The previous write txn's
         // snapshot, carried on the writer slot, serves when it is still the
         // latest.
         let cached = guard.carry().snapshot.take();
@@ -538,17 +546,16 @@ impl Env {
             finger_hits: 0,
             psize: inner.page_size(),
             dirty,
-            // ADR-0018: the writer probes the env
-            // cache (the previous commit seeded it with the very pages this
-            // txn's first descent walks) but never publishes from a miss.
+            // ADR-0018: the writer probes the env cache (the previous
+            // commit seeded it with the very pages this txn's first descent
+            // walks) but never publishes from a miss.
             validated: ValidatedPages::for_writer(inner.file_trust(), Some(inner.stamp_cache())),
             annex_out: false,
             alloc_mode: AllocMode::Normal,
             errored: false,
+            cleared_main: false,
             children: ChildCounter::new(),
-            // In-place WRITE_MAP keeps no whole-map reference in the struct
-            // (see the field docs; ADR-0021) — `whole_map` borrows lazily.
-            bytes: if in_map { &[] } else { view.bytes },
+            map: view.pages,
             base: Some(base),
             work: Some(work),
             _guard: guard,
@@ -561,7 +568,7 @@ impl TxnRead for RwTxn<'_> {
     fn source(&self) -> Source<'_> {
         Source::Writer {
             dirty: &self.dirty,
-            bytes: self.whole_map(),
+            map: self.map,
             // Bounds the map fallback only: pages this txn allocated beyond
             // the base snapshot live in `dirty` and resolve before the bound,
             // or were spilled below `read_high` (SPEC 04 TXN-71).
@@ -685,9 +692,9 @@ impl<'env> RwTxn<'env> {
         // and refuses with BadTxn (LMDB `MDB_BAD_TXN` = "transaction … has a
         // child") in BOTH debug and release. Normally unreachable (the child
         // holds a shared `&RwTxn` borrow, so no `&mut` op can even be
-        // called); it backstops `unsafe`/FFI lifetime erasure (e.g. the
-        // oracle). The `Acquire` inside `live()` pairs with each child-drop's
-        // `Release` (see `crate::nested`).
+        // called); it backstops `unsafe`/FFI lifetime erasure. The `Acquire`
+        // inside `live()` pairs with each child-drop's `Release` (see
+        // `crate::nested`).
         if self.children.live() != 0 {
             return Err(Error::Mdb(MdbError::BadTxn));
         }
@@ -742,7 +749,8 @@ impl<'env> RwTxn<'env> {
 
     /// Ensure the named DB `dbi`'s working record is loaded into
     /// [`WriterCarry::open`] (from the catalog view, or empty if the entry
-    /// does not yet exist), and return its tree selector. Idempotent. The main DB needs no loading.
+    /// does not yet exist), and return its tree selector. Idempotent. The
+    /// main DB needs no loading.
     fn ensure_open(&mut self, db: &Database) -> Result<TreeId> {
         // TXN-29 airtightness: `ensure_open` mutates the open table, which
         // live children read through `record_for` — so the child guard fires
@@ -782,32 +790,6 @@ impl<'env> RwTxn<'env> {
         Ok(TreeId::Named(dbi))
     }
 
-    /// The whole-map read view this txn's resolutions go through (TXN-38).
-    ///
-    /// Under in-place `WRITE_MAP` (ADR-0021, TXN-45b) the writer mutates map
-    /// bytes **mid-txn** (through the brokered slices), so a view cached at
-    /// txn begin would predate those writes: under Stacked/Tree Borrows,
-    /// copying such a stale `&[u8]` — let alone reading a spilled page
-    /// through it — is undefined behavior at the written locations
-    /// (ADR-0021). The in-map arm
-    /// therefore borrows the view **lazily per access**, exactly as `RoTxn`
-    /// does: a fresh borrow at a `&self` boundary postdates every in-place
-    /// write, and none can happen while it lives (TXN-39).
-    ///
-    /// Heap modes keep the cached view (`self.bytes`, re-derived per spill —
-    /// TXN-71, ADR-0021): their mid-txn file writes go through the fd,
-    /// and the only Rust-visible map mutation is the commit/spill-time
-    /// `memcpy` of the heap-staged WRITE_MAP backing, which the spill-time
-    /// re-derivation postdates.
-    #[inline]
-    fn whole_map(&self) -> &'env [u8] {
-        if self.dirty.in_map_mode() {
-            self.env.inner().backing_bytes()
-        } else {
-            self.bytes
-        }
-    }
-
     fn load(&self, pgno: u64) -> Result<PageRef<'_>> {
         // Trusted-psize load: psize is env-validated at open.
         PageRef::new_trusted_psize(
@@ -841,14 +823,13 @@ impl<'env> RwTxn<'env> {
         let base = (pgno as usize)
             .checked_mul(ps)
             .ok_or(Error::Mdb(MdbError::Invalid))?;
-        // Take the `&'env [u8]` map view out of `self` (lifetime 'env, so the
-        // source borrow does not alias the `&mut self.dirty` op below —
-        // letting `insert_copy` copy straight into a pooled frame). Under
-        // in-place WRITE_MAP this is a fresh per-access borrow postdating
-        // every brokered write (see `RwTxn::whole_map`).
-        let map: &[u8] = self.whole_map();
-        let src = map
-            .get(base..base + ps)
+        // The committed page alone, borrowed for 'env from the map handle
+        // (so the borrow does not alias the `&mut self.dirty` op below —
+        // letting `insert_copy` copy straight into a pooled frame, or, in
+        // place, into the map at `np`, a page this slice does not cover).
+        let src = self
+            .map
+            .get(base, ps)
             .ok_or(Error::Mdb(MdbError::Invalid))?;
         let np = self.allocate(1)?;
         // Copy the committed page into a fresh (or recycled) frame — under
@@ -1038,6 +1019,7 @@ impl<'env> RwTxn<'env> {
             && work!(self).reclaimed.is_empty()
             && self.next_pgno == self.base().last_pg + 1
             && self.main_db == self.base().main_db
+            && !self.cleared_main
             && self.free_db == self.base().free_db
             // A dirty named-DB working record still needs its catalog write-back
             // (defensive: any named mutation also dirties a page, so this is

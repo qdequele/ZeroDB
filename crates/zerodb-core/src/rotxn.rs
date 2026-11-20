@@ -37,7 +37,7 @@ use crate::cmp::KeyCmp;
 use crate::env::{Env, Snapshot};
 use crate::error::{Error, MdbError, Result};
 use crate::handles::{HandleTable, MemoCell, TxnHandles, DENSE_DBI_LIMIT};
-use crate::page::{DBRecord, PageError, F_SUBDATA};
+use crate::page::{DBRecord, MapPages, PageError, F_SUBDATA};
 use std::cmp::Ordering;
 
 /// Map a structural tree-decode error to the public taxonomy. A corrupt page
@@ -203,10 +203,9 @@ pub struct RoTxn<'env> {
     slot: u32,
     /// Per-txn memo of resolved named-DB records, keyed by dbi.
     ///
-    /// Without it every read op on a named DB would redo the registry lock +
-    /// name clone + a full catalog descent (`resolve_named_record`) — roughly
-    /// doubling the tree work per `get` (docs/PERFORMANCE.md, named-DB
-    /// record re-resolved on every read).
+    /// Without it every read op on a named DB would redo the registry lock,
+    /// the name clone and a full catalog descent (`resolve_named_record`)
+    /// before its own tree descent.
     ///
     /// Soundness: this txn pins an immutable [`Snapshot`] (its catalog cannot
     /// change while pinned, TXN-18/20), and a slot keeps its name for as long
@@ -251,15 +250,15 @@ impl RoTxn<'_> {
         &self.snap
     }
 
-    /// The whole mapped env file as bytes, borrowed for the txn's life
-    /// (SPEC 04 TXN-37). The non-compact `copy_to_file` copies the pinned
-    /// snapshot's pages directly from here; pages this snapshot references are
-    /// immutable while the txn's reader slot is held (TXN-20/21), so the copy
-    /// is torn-free for reachable pages.
+    /// The mapped env file, valid for the txn's life (SPEC 04 TXN-37). It
+    /// lends page-bounded slices (ADR-0021 amendment 1): callers take only
+    /// pages this snapshot references, which are immutable while the txn's
+    /// reader slot is held (TXN-20/21). The free pages below `last_pg` may be
+    /// rewritten by a writer of this process while the txn lives.
     #[must_use]
     #[inline]
-    pub fn map_bytes(&self) -> &[u8] {
-        self.env_ref().inner().backing_bytes()
+    pub fn map_pages(&self) -> MapPages<'_> {
+        self.env_ref().inner().backing_pages()
     }
 
     /// The env this txn reads (borrowed or owned).
@@ -366,11 +365,12 @@ thread_local! {
     /// this thread that had one.
     ///
     /// A read txn that touches a named database allocates its dbi-indexed
-    /// table (`named_dense`), and frees it at drop; for a txn that reads one
-    /// key that was a large share of its cost. LMDB keeps its per-txn
-    /// `mt_dbs` array with the transaction object, which a caller reuses
-    /// through `mdb_txn_reset` / `mdb_txn_renew`; heed 0.22.1 does not expose
-    /// those, so the reuse happens here. Every entry is reset to its default
+    /// table (`named_dense`), and would free it at drop; for a txn that reads
+    /// one key, that allocation is a large share of its cost. LMDB keeps its
+    /// per-txn `mt_dbs` array with the transaction object, which a caller
+    /// reuses through `mdb_txn_reset` / `mdb_txn_renew`; heed 0.22.1 does not
+    /// expose those, so the reuse happens here. Every entry is reset to its
+    /// default
     /// before the table is parked, so a later txn starts with an empty table,
     /// exactly as with a fresh allocation: records belong to one snapshot and
     /// are never carried over.
@@ -409,7 +409,7 @@ impl TxnRead for RoTxn<'_> {
         // life either way (TXN-37: the env cannot close while this txn holds
         // it, borrowed or owned).
         Source::Map {
-            bytes: self.env_ref().inner().backing_bytes(),
+            map: self.env_ref().inner().backing_pages(),
             // The pinned snapshot's committed high-water bounds every map
             // read (SPEC 06 REC-14: no committed reference exceeds it, so any
             // pgno above it is corruption, refused typed).
@@ -1009,10 +1009,7 @@ impl Database {
         &self,
         txn: &'txn T,
     ) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
-        self.checked_tree(txn)?
-            .cursor()
-            .first()
-            .map_err(map_page_err)
+        self.checked_tree(txn)?.first_entry().map_err(map_page_err)
     }
 
     /// `last(txn)` — the maximum entry (SPEC 00 row 42).
@@ -1021,10 +1018,7 @@ impl Database {
     ///
     /// [`MdbError::Invalid`] on a corrupt tree.
     pub fn last<'txn, T: TxnRead>(&self, txn: &'txn T) -> Result<Option<(&'txn [u8], &'txn [u8])>> {
-        self.checked_tree(txn)?
-            .cursor()
-            .last()
-            .map_err(map_page_err)
+        self.checked_tree(txn)?.last_entry().map_err(map_page_err)
     }
 
     /// `get_greater_than_or_equal_to(txn, key)` — first entry `≥ key`
@@ -1237,10 +1231,10 @@ impl<'txn> RoRange<'txn> {
     /// direction (the upper bound going forward, the lower bound going reverse).
     ///
     /// `SKIP` only separates the copy `nth` uses (`true`) from the one `next`
-    /// uses (`false`). Each copy then has a single caller, which is what lets
-    /// LLVM inline this, key compare included, into `next`; with `nth` as a
-    /// second caller of one shared copy it stopped doing so and every plain
-    /// scan paid a call per entry (scan/full measured 1.4x slower).
+    /// uses (`false`). Each copy then has a single caller, which lets LLVM
+    /// inline this, key compare included, into `next`; with one shared copy
+    /// and two callers it is not inlined, and every plain scan pays a call
+    /// per entry.
     fn in_bounds<const SKIP: bool>(&self, key: &[u8]) -> bool {
         match self.dir {
             Dir::Fwd => match &self.hi {
@@ -1319,9 +1313,9 @@ impl<'txn> Iterator for RoRange<'txn> {
             return self.nth(n - 1);
         }
         // The walk moves a copy of the cursor so the bound test can borrow
-        // `self`; the copy is written back below. (Splitting the bound test
-        // out of `self` instead changed how LLVM inlines `next`, costing every
-        // plain scan.)
+        // `self`; the copy is written back below. Splitting the bound test
+        // out of `self` instead would change how LLVM inlines `next` and slow
+        // every plain scan.
         let mut cursor = self.cursor.clone();
         let past_end = |k: &[u8]| !self.in_bounds::<true>(k);
         // The cursor sits on the last yielded entry, so the `n`th next one is
@@ -1354,8 +1348,8 @@ mod send_assertions {
 
     /// SPEC 04 TXN-13 (WithoutTls): a reader-table slot is owned by the txn
     /// object, not a thread, so `RoTxn` — both the borrowed and the `'static`
-    /// env-owning shape — is `Send`. Compile-time assertion; a regression
-    /// (e.g. a non-`Send` field sneaking into `RoTxn`) fails to build.
+    /// env-owning shape — is `Send`. Compile-time assertion: a non-`Send`
+    /// field added to `RoTxn` fails to build.
     #[test]
     fn rotxn_is_send_in_both_shapes() {
         assert_send::<RoTxn<'_>>();

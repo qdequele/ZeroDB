@@ -6,7 +6,7 @@
 //! exercise mutation and in-txn reads but never the commit pipeline — commits
 //! are tested against real files in `crates/zerodb`.
 
-use super::{next_env_id, open_with_backing_policy, Backing, Env, MapView};
+use super::{next_env_id, open_with_backing_policy, Backing, Env, MapPages, MapView};
 use crate::page::FileTrust;
 use crate::page::MetaPage;
 use std::path::PathBuf;
@@ -36,7 +36,7 @@ impl VecBacking {
 impl Backing for VecBacking {
     fn view(&self) -> MapView<'_> {
         MapView {
-            bytes: &self.bytes,
+            pages: MapPages::from_slice(&self.bytes),
             map_size: self.map_size,
         }
     }

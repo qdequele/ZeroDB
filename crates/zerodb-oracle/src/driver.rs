@@ -55,27 +55,9 @@ impl TxnState {
 /// This is the single owner of the op-validity precedence. The precedence for
 /// database-targeting ops is: **no-database first**, then the transaction
 /// requirement.
-///
-/// `cleared_in_txn` is the third tracked fact: whether the current write txn
-/// has executed a `ClearDb`. It exists solely for the [`Skip::KnownForkBug`]
-/// guard (`docs/UPSTREAM-BUGS.md` FORK-1): an `Append` put in a write txn that
-/// has cleared a db can SEGV the vendored fork, so the combination is skipped
-/// symmetrically until the fork is fixed. Engines must set the flag when they
-/// execute a `ClearDb` and reset it at every txn boundary (`BeginRw`, `Commit`,
-/// `Abort`) — a rule derived purely from the op stream, so engines cannot
-/// drift on it.
 #[must_use]
-pub fn classify(op: &Op, txn: TxnState, dbs_empty: bool, cleared_in_txn: bool) -> Option<Skip> {
+pub fn classify(op: &Op, txn: TxnState, dbs_empty: bool) -> Option<Skip> {
     use Op::*;
-
-    // FORK-1 guard: see doc comment above and `docs/UPSTREAM-BUGS.md`.
-    if cleared_in_txn {
-        if let PutFlagged { flag, .. } = op {
-            if matches!(flag, crate::PutFlag::Append) {
-                return Some(Skip::KnownForkBug);
-            }
-        }
-    }
 
     // A read op needs *some* active txn; `None` → NoTxn.
     let read_txn_skip = || {

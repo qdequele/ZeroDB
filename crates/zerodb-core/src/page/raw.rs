@@ -7,15 +7,14 @@
 //! - **Checked** (`read_*`/`write_*`): pure safe Rust — copy the exact bytes
 //!   into a stack array and use `from_le_bytes`/`to_le_bytes`. Panic on
 //!   out-of-bounds. Used by validation, mutation, and every cold path.
-//! - **Unchecked** (`read_*_unchecked`): `unsafe fn`s using
-//!   explicit offsets + [`core::ptr::read_unaligned`] — exactly the pattern
-//!   the unsafe policy prescribes, in one of its sanctioned homes
-//!   (`zerodb-core::page`). Callers must guarantee `off + N <= buf.len()`;
-//!   the only callers are the `tree` view accessors, whose constructors prove
-//!   (full validation walk) or inherit (kind-tagged memo hit / engine-authored
-//!   dirty frame) that every cell lies in bounds. `debug_assert!`s keep the
-//!   contract loud in test builds; the differential fuzzer and miri referee
-//!   it.
+//! - **Unchecked** (`read_*_unchecked`): `unsafe fn`s using explicit offsets
+//!   and [`core::ptr::read_unaligned`], as the unsafe policy
+//!   (CONTRIBUTING.md) allows in `zerodb-core::page`. Callers must guarantee
+//!   `off + N <= buf.len()`. The only callers are the `tree` view accessors,
+//!   whose constructors either prove that every cell lies in bounds (the
+//!   full validation walk) or inherit that proof (a validated-pages memo hit,
+//!   a dirty frame the engine wrote, or a trusted file). `debug_assert!`s
+//!   check the contract in debug builds.
 //!
 //! Checked functions panic on out-of-bounds access; callers in this crate
 //! validate bounds against the page size before invoking them (the view

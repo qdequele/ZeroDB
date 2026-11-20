@@ -9,6 +9,57 @@
 
 log() { printf '\n\033[1m[%s] %s\033[0m\n' "$LOG_TAG" "$*"; }
 
+# note LINE: print LINE, and add it to the job summary when running in GitHub
+# Actions.
+note() {
+    echo "$*"
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then echo "$*" >> "$GITHUB_STEP_SUMMARY"; fi
+}
+
+# report_versions NAME REF: print what is under test, so a log or a recorded
+# result names the exact commits on both sides.
+report_versions() {
+    local zerodb_rev dirty=""
+    zerodb_rev="$(git -C "$ZERODB" rev-parse HEAD 2>/dev/null || echo unknown)"
+    if [ -n "$(git -C "$ZERODB" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+        dirty=" (with uncommitted changes)"
+    fi
+    log "versions under test"
+    note "- ZeroDB \`$zerodb_rev\`$dirty"
+    note "- $1 \`$2\` (\`$(git -C "$CLONE" rev-parse HEAD)\`)"
+    # From inside the clone, so a consumer's rust-toolchain.toml is honoured.
+    note "- \`$(cd "$CLONE" && rustc --version)\`"
+}
+
+# run_tests ARGS...: `cargo test ARGS` in the clone, with the output kept in
+# $WORKDIR/logs/ and the per-binary "test result:" lines summed at the end.
+# The exit status is cargo's: a build break or a failing test fails the run.
+run_tests() {
+    local out
+    out="$WORKDIR/logs/$LOG_TAG-$(date -u +%Y%m%dT%H%M%SZ).log"
+    mkdir -p "$(dirname "$out")"
+    local rc=0
+    (cd "$CLONE" && cargo test "$@") 2>&1 | tee "$out" || rc=$?
+    local totals
+    totals="$(awk '/^test result:/ {
+            for (i = 1; i <= NF; i++) {
+                if ($(i+1) ~ /^passed/)  p += $i
+                if ($(i+1) ~ /^failed/)  f += $i
+                if ($(i+1) ~ /^ignored/) g += $i
+            }
+            n++
+        }
+        END { printf "%d test binaries: %d passed, %d failed, %d ignored", n, p, f, g }' "$out")"
+    echo
+    note "- $LOG_TAG \`cargo test $*\`: $totals (status $rc)"
+    echo "full log: $out"
+    if [ "$rc" -ne 0 ]; then
+        log "FAIL: cargo test $* exited with status $rc"
+        grep -E '^(test .* FAILED|error(\[E[0-9]+\])?:)' "$out" | head -40 >&2 || true
+    fi
+    return "$rc"
+}
+
 # ensure_clone REF SRC URL: check out REF in $CLONE, reusing an existing clone,
 # else cloning from the local checkout SRC (when set) or from URL.
 ensure_clone() {

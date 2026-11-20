@@ -327,7 +327,7 @@ impl RwCursor<'_, '_> {
             }
             Step::First => c.first(),
             Step::Last => c.last(),
-            Step::Ge(k) => c.get_greater_than_or_equal_to(k),
+            Step::Ge(k) => c.set_range(k),
             Step::Gt(k) => c.get_greater_than(k),
             Step::Le(k) => c.get_lower_than_or_equal_to(k),
             Step::Lt(k) => c.get_lower_than(k),

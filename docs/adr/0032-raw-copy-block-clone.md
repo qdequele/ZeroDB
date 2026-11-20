@@ -29,7 +29,7 @@ btrfs and bcachefs. Rust's `std` already uses them: `std::fs::copy` calls
 which the kernel turns into a reflink when both files are on the same
 reflink-capable filesystem and into an in-kernel copy otherwise. Calling any
 of these directly would need FFI (`unsafe`) in `zerodb`, which the `unsafe`
-policy in `AGENTS.md` does not allow. Through `std` it needs none.
+policy in `CONTRIBUTING.md` does not allow. Through `std` it needs none.
 
 The spike (macOS arm64, APFS, a 1.37 GiB env, a raw copy to a path) measured
 the streaming copy at 2.3–16 s and a clone under the read pin at 35–100 ms;

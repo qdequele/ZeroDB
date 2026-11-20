@@ -14,8 +14,8 @@
 //!    (ii) different split-fill policies, and (iii) how freed pages are
 //!    reused for overflow runs: ZeroDB reuses pages one transaction sooner
 //!    (divergence D-027 (a)) and does not re-save its leftover free pages
-//!    coalesced as the fork does, though since issue #29 it merges freed-page
-//!    records for a run as the fork's `me_pghead` does (SPEC 05 GC-21). The
+//!    coalesced as the fork does, though it merges freed-page records for a
+//!    run as the fork's `me_pghead` does (SPEC 05 GC-21). The
 //!    no-overflow variant removes (iii), hence the tighter band.
 //!
 //! `Env::real_disk_size` parity is also asserted structurally: zerodb's value
