@@ -42,6 +42,18 @@ LMDB struct is transliterated.
   `open` with `Io(InvalidInput)`. Selection applies **only when creating** a
   store — reopening adopts the persisted `psize` from the meta page (§3.2) and
   silently ignores the request, exactly as for `map_size`.
+- **What does depend on the OS page size.** Nothing in the format does. The
+  I/O layer does, in four places, none of which may assume the OS page equals
+  `psize` or is 4 KiB: a map may extend past the end of the file, and only
+  OS pages wholly past the end fault, so a store is read through the map only
+  within the file (§3.2 rejects a file shorter than `2 * psize` before
+  mapping it); the ranged `msync` of SPEC 06 REC-12 starts on an OS-page
+  boundary at or below the first page it flushes; `MADV_RANDOM` applies to
+  whole OS pages; and the heed adapter, as LMDB, requires `map_size` to be a
+  multiple of the OS page size and, unless `page_size` is set, gives a new
+  store the OS page size as its `psize`. `crates/zerodb/tests/os_page_size.rs`
+  runs these paths at `psize` 4, 16 and 64 KiB on whatever kernel runs the
+  suite.
 - **Page number** (`pgno`) is a `u64` index into the file: byte offset of a
   page = `pgno * psize`. `PGNO_INVALID = u64::MAX` (`0xFFFF_FFFF_FFFF_FFFF`)
   denotes "no page" (empty tree / end of chain).
