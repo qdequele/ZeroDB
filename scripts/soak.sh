@@ -94,13 +94,14 @@ run_fuzz() {
     if [ -d "$ZERODB/fuzz/corpus/$target" ]; then
         cp -R "$ZERODB/fuzz/corpus/$target/." "$dir/corpus/" 2>/dev/null || true
     fi
-    local mode=()
-    if [ "$workers" -gt 1 ]; then
-        mode=(-fork="$workers" -ignore_crashes=1 -ignore_timeouts=1 -ignore_ooms=1)
-    fi
+    # Fork mode even for one worker: each child process lives at most 300 s,
+    # so the sanitizer's own memory, which grows with the number of inputs
+    # run in one process, never reaches the RSS limit over a long run. An
+    # input that does exhaust memory is still written as an oom-* artifact.
+    local mode=(-fork="$workers" -ignore_crashes=1 -ignore_timeouts=1 -ignore_ooms=1)
     (
         cd "$dir"
-        env "$@" "$FUZZ_BIN/$target" ${mode[@]+"${mode[@]}"} \
+        env "$@" "$FUZZ_BIN/$target" "${mode[@]}" \
             -max_total_time="$(remaining)" -print_final_stats=1 \
             -artifact_prefix="$dir/artifacts/" "$dir/corpus"
     ) >"$OUT/fuzz/$name.log" 2>&1

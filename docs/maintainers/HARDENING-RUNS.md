@@ -9,7 +9,7 @@ lists both as open until a recorded run exists.
 | Run | Command | Length | Machine |
 |---|---|---|---|
 | Soak | `just soak` (`scripts/soak.sh`) | 24 h per architecture | dedicated, ≥ 16 CPUs, x86-64 and aarch64 |
-| Page-size matrix | `just page-size-matrix` (`scripts/page-size-matrix.sh`) | about 1.5 h | aarch64 with a 64 KiB-page kernel |
+| Page-size matrix | `just page-size-matrix` (`scripts/page-size-matrix.sh`) | about 1 h on 12 CPUs | aarch64 with a 64 KiB-page kernel |
 
 Run the aarch64 soak on the 64 KiB-page machine, after the matrix: that one
 machine then covers both open items for aarch64.
@@ -113,7 +113,8 @@ It runs, in order, recording each step and continuing past a failure:
    cycles each.
 3. The two reader/writer stress tests, 180 s each.
 4. The fuzz gate: `diff_ops` native and through the heed adapter, and the two
-   decoder targets, 600 s each. LMDB uses 64 KiB pages here, so the
+   decoder targets, 600 s each, in libFuzzer fork mode (one worker). The step
+   fails if a job writes any crash, timeout or out-of-memory artifact. LMDB uses 64 KiB pages here, so the
    differential compares a 4 KiB native ZeroDB, and a 64 KiB adapter ZeroDB,
    with a 64 KiB LMDB.
 
@@ -152,10 +153,12 @@ For 24 hours, in parallel:
 
 - `diff_ops` native against LMDB, in libFuzzer fork mode on half the CPUs;
 - `diff_ops` through the heed adapter on an eighth of them;
-- `fuzz_page_decode` and `fuzz_image_open`, one worker each;
+- `fuzz_page_decode` and `fuzz_image_open`, one worker each, also in fork
+  mode (a single sanitized process grows past libFuzzer's 2 GB RSS limit
+  within minutes; fork-mode children are restarted every 300 s at most);
 - the crash harness on a quarter of the CPUs, in rounds of 10,000
-  single-process and 500 multi-process cycles, cycling the DB page size through the seed's own (4 or 8 KiB),
-  16 KiB and 64 KiB;
+  single-process and 500 multi-process cycles, cycling the DB page size
+  through the seed's own (4 or 8 KiB), 16 KiB and 64 KiB;
 - the two reader/writer stress tests, in rounds of up to 30 minutes.
 
 Fuzzing keeps going after a finding, so a 24-hour run reports every distinct

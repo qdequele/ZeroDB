@@ -105,8 +105,13 @@ else
         local dir="$OUT/fuzz/$name"
         mkdir -p "$dir/corpus" "$dir/artifacts"
         cd "$dir"
-        env "$@" "$FUZZ_BIN/$target" -max_total_time="$FUZZ_SECS" -print_final_stats=1 \
-            -artifact_prefix="$dir/artifacts/" "$dir/corpus"
+        # One fork-mode worker, as in the soak: children are short-lived, so
+        # sanitizer memory does not accumulate, and fuzzing continues past a
+        # finding. The step fails if any artifact was written.
+        env "$@" "$FUZZ_BIN/$target" -fork=1 -ignore_crashes=1 -ignore_timeouts=1 \
+            -ignore_ooms=1 -max_total_time="$FUZZ_SECS" -print_final_stats=1 \
+            -artifact_prefix="$dir/artifacts/" "$dir/corpus" || return
+        [ -z "$(fuzz_findings "$dir/artifacts")" ]
     }
     mkdir -p "$OUT/fuzz"
     for job in "diff_ops-native diff_ops" "diff_ops-heed diff_ops ZERODB_FUZZ_PAIR=heed" \

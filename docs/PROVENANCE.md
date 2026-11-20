@@ -106,8 +106,12 @@ plainly as the strengths.
 - **No 64 KiB-page kernel.** CI runs on GitHub's x86-64 and aarch64 runners,
   which use 4 KiB OS pages. ZeroDB has not been run on a 64 KiB-page kernel.
   The one run on a larger OS page is a page-size matrix on a 16 KiB-page
-  macOS host (Apple silicon), recorded in
-  [hardening-runs/](hardening-runs/): DB pages of 4 KiB there are smaller
+  macOS host (Apple silicon) on 2026-11-20, recorded in
+  [hardening-runs/](hardening-runs/2026-11-20-macos-arm64-16k-page-size-matrix.md):
+  the test suite, 6,793 crash cycles across DB pages of 4, 16 and 64 KiB,
+  the stress tests and three of the four fuzz jobs passed; the fourth stopped
+  at libFuzzer's memory limit from sanitizer growth, not an engine fault (the
+  record explains). DB pages of 4 KiB there are smaller
   than the OS page, the case a 64 KiB kernel reaches with 4 and 16 KiB DB
   pages, but on Darwin's virtual memory system, not Linux's.
   [maintainers/HARDENING-RUNS.md](maintainers/HARDENING-RUNS.md) has the
