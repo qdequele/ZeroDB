@@ -242,8 +242,12 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 - Using an `Env` in a child after `fork()`, and sharing an environment across
   PID namespaces, are unsupported. `Env::sync` only serializes with this
   process's commits. On macOS, a writer that takes over from a dead writer
-  does not free dead readers' slots; call `clear_stale_readers` (SPEC 04
-  §12.1).
+  does not free dead readers' slots, where LMDB does (D-028, proposed); call
+  `clear_stale_readers` (SPEC 04 §12.1).
+- **Platforms:** Linux (x86-64, aarch64) and macOS (aarch64) are tested in
+  CI. Windows is not supported: the crates stop at a `compile_error!` there,
+  instead of dozens of unresolved Unix imports. ADR-0045 proposes the Windows
+  design (draft). The tiers are in `docs/USING.md#platform-support`.
 
 ## [0.2.0] - 2026-10-05
 

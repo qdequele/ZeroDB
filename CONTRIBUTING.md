@@ -117,9 +117,14 @@ comment justifying it; assume a weak memory model (ARM), never "works on x86".
 ## Target platforms
 
 linux-aarch64 (AWS Graviton 3 and 4) is the primary target; linux-x86_64 and
-macOS aarch64 are for development. The database page size is chosen at
-runtime (4 KiB to 64 KiB) and is independent of the OS page size: never assume
-4 KiB OS pages, since ARM distributions often use 64 KiB.
+macOS aarch64 are also tested in CI. Windows is not supported: the crates
+stop at a `compile_error!` there (ADR-0045 proposes the design). The tiers
+are in [docs/USING.md](docs/USING.md#platform-support), with the list of what
+differs on macOS and the tests that cover each difference: keep that list
+current when a change adds platform-specific code. The database page size is
+chosen at runtime (4 KiB to 64 KiB) and is independent of the OS page size:
+never assume 4 KiB OS pages, since ARM distributions often use 64 KiB and
+Apple silicon uses 16 KiB.
 
 ## Before you open a PR
 
@@ -136,8 +141,8 @@ just stress                               # 180 s reader/writer stress, before a
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and the differential
-fuzz on x86-64 and aarch64 for every PR, and miri, loom and the crash smoke on
-x86-64; nightly it runs the long fuzz, the full crash run and the stress test
+fuzz on x86-64 and aarch64 for every PR, miri, loom and the crash smoke on
+x86-64, and clippy, tests and the crash smoke on macOS aarch64; nightly it runs the long fuzz, the full crash run and the stress test
 on both architectures. It also builds the consumer crates on the workspace
 `rust-version` (the MSRV is for consumers; developing ZeroDB itself needs a
 current stable toolchain for the bench and fuzz tooling). macOS clippy skips
