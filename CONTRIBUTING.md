@@ -105,7 +105,9 @@ from `&self`. The exception also covers the `Backing::map_dirty_page`
 `#[allow(clippy::mut_from_ref)]` on the broker, each with its exclusivity
 contract inline.
 
-`zerodb-core::readers` contains no `unsafe`. The reader table's slot protocol
+`zerodb-core::readers` and `zerodb-core::writer_word` (the Linux writer
+lock's word protocol, whose futex calls stay in `zerodb-io::lockfile`)
+contain no `unsafe`. The reader table's slot protocol
 uses plain atomics and no lock; the published-snapshot cell in the same module
 is a mutex held for one pointer clone or swap.
 
@@ -127,18 +129,19 @@ runtime (4 KiB to 64 KiB) and is independent of the OS page size: never assume
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cargo +nightly miri test -p zerodb-core   # non-mmap logic must pass miri
+just miri                                 # the core, zerodb-io and heed under miri (nightly)
 just fuzz-quick                           # differential fuzz against LMDB
 just crash-test-quick                     # crash-consistency smoke
-just loom                                 # reader-table model check, when touching readers or nested txns
+just loom                                 # loom models, when touching readers, nested txns or the writer locks
 just save-no-draw                         # free-list save without pool draws, when touching the allocator or the save
 just stress                               # 180 s reader/writer stress, before an integration gate
 ```
 
 CI (`.github/workflows/ci.yml`) runs fmt, clippy, tests and the differential
 fuzz on x86-64 and aarch64 for every PR, and miri, loom and the crash smoke on
-x86-64; nightly it runs the long fuzz, the full crash run and the stress test
-on both architectures. It also builds the consumer crates on the workspace
+x86-64; nightly it runs the long fuzz, the full crash run, the stress test and
+the tests under ThreadSanitizer and AddressSanitizer (`just sanitize`) on both
+architectures. It also builds the consumer crates on the workspace
 `rust-version` (the MSRV is for consumers; developing ZeroDB itself needs a
 current stable toolchain for the bench and fuzz tooling). macOS clippy skips
 Linux-only modules, so also lint the `x86_64-unknown-linux-gnu` target when a

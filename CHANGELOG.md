@@ -42,6 +42,13 @@ the release workflow publishes the section matching the tag as the GitHub releas
   `check_snapshot_with_key_order`: a caller that holds a database's custom
   comparator can have key order checked under it, or skipped. `check_image`,
   `check_snapshot` and `zerodb-tools check` are unchanged.
+- Verification of the `unsafe` code: miri now also runs `zerodb-io`'s
+  file-free unit tests and `heed-zerodb`'s unit tests (`just miri`); loom
+  models the in-process writer lock and the Linux cross-process writer word,
+  whose protocol moved unchanged into `zerodb_core::writer_word`; a nightly CI
+  job runs the tests under ThreadSanitizer and AddressSanitizer
+  (`just sanitize`). A brief for an outside review is in
+  `docs/maintainers/UNSAFE-AUDIT.md`, with one open miri finding.
 
 ### Changed
 
@@ -223,6 +230,11 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
   numbers at once (#123).
 - Under corruption, a page error met while `skip` crosses leaves is returned
   as an item instead of ending the iterator silently.
+
+- The safety contract of the heed adapter's write-iterator `unsafe fn`s
+  (`del_current`, `put_current` and the other cursor writes) now matches
+  heed's: no key or value the iterator yielded may be held across the call,
+  not only the current entry's.
 
 ### Removed
 

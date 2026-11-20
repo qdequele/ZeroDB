@@ -207,7 +207,8 @@ How this project was built matters for how far to trust it.
 
 Verified so far: differential tests and fuzzing against LMDB, crash tests
 with injected write faults and real process kills, loom model checks of the
-reader table, and miri on the core crate.
+reader table and the writer locks, miri on the core, the I/O layer and the
+heed adapter, and nightly sanitizer runs.
 
 Not verified so far: there has been no independent audit of the `unsafe`
 code, no I/O-error injection, no power-loss test on a real device, and no run

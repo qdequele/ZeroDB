@@ -212,8 +212,11 @@ heed 0.22.1 in `crates/zerodb-oracle` and nowhere else.
   processes with `SIGKILL`. After each crash, the reopened environment must
   hold exactly one committed prefix of the workload and pass the invariant
   checker.
-- **Model checking and miri.** The reader table and nested transactions are
-  model-checked with loom, and the I/O-free core runs under miri.
+- **Model checking, miri and sanitizers.** The reader table, nested
+  transactions and both writer locks are model-checked with loom. The core,
+  the I/O layer's file-free parts and the heed adapter run under miri over a
+  heap-backed map, and the tests that use real files run nightly under
+  ThreadSanitizer and AddressSanitizer.
 - **The checker.** `zerodb-tools check` walks every tree and the free-page
   accounting and reports violations by rule ID.
 
