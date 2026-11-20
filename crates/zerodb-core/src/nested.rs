@@ -1,61 +1,49 @@
 //! Nested read transactions over a write txn (SPEC 04 §5, ADR-0007).
 //!
 //! A [`NestedRoTxn`] is a read-only child of the active [`RwTxn`] that sees the
-//! writer's **uncommitted, in-progress state** (the fork's ITS#10395 feature,
-//! TXN-26): its snapshot is the writer's working roots and its page source is
-//! the writer's dirty frames first, then the read-only map (TXN-27). It claims
-//! **no reader-table slot** (TXN-25/32 — the writer already gates GC at
-//! `writer_txnid − 1`, and no allocation can occur while children live).
+//! writer's uncommitted state (TXN-26; the feature LMDB ITS#10395 describes).
+//! It reads the writer's dirty frames first, then the read-only map (TXN-27).
+//! It claims no reader-table slot (TXN-25/32): the writer already gates GC at
+//! `writer_txnid − 1`, and no allocation can occur while children live.
 //!
-//! ## The safety story (ADR-0007, zero `unsafe`)
+//! ## Safety without `unsafe`
 //!
-//! The child holds a real `&'p RwTxn` — so the borrow checker itself enforces
-//! writer quiescence (TXN-29/30; see docs/LMDB-COMPATIBILITY.md): while any child is alive, no
-//! `&mut RwTxn` method can be called. The child is [`Send`] **by compiler
-//! derivation**: `&RwTxn: Send ⇔ RwTxn: Sync`, and `RwTxn` is `Sync` as a
-//! **standing asserted contract** (ADR-0007): it has
-//! no interior mutability on any `&self` path — the compile-time assertions in
-//! this module's tests turn any future violation into a build failure, not an
-//! unsoundness. There is no `unsafe impl` anywhere in this design (contrast
-//! heed, whose child holds a raw `MDB_txn` pointer and needs
-//! `unsafe impl Send`).
+//! The child holds a `&'p RwTxn`, so the borrow checker enforces writer
+//! quiescence (TXN-29/30): while a child is alive, no `&mut RwTxn` method can
+//! be called. The child is [`Send`] because `RwTxn` is `Sync` (ADR-0007), and
+//! the compile-time assertions in this module's tests fail the build if
+//! `RwTxn` stops being `Sync`. heed's child, by contrast, holds a raw
+//! `MDB_txn` pointer and needs an `unsafe impl Send`.
 //!
-//! ## What the child sees: delegate-live ≡ snapshot-at-open (ADR-0007)
+//! ## What the child sees
 //!
-//! The child's [`TxnRead`] simply forwards to the parent's. TXN-26 phrases the
-//! snapshot as "the working roots *at child-open time*", and delegation is
-//! observably equivalent: mutation is impossible from the moment the **first**
-//! child exists until the **last** child drops — compile-time (every live
-//! child holds a shared `&wtxn` borrow; opening more children needs only `&`,
-//! which coexists) and runtime (the `ChildCounter` guard in
-//! `RwTxn::guard_ok`, TXN-29). So between any child's open and its drop the
-//! parent's roots, open-table and dirty set are **constant**, and every child
-//! opened in one paused window sees the identical state — there is no window
-//! in which snapshotting could differ from delegating.
+//! The child's [`TxnRead`] forwards to the parent's. TXN-26 defines the
+//! snapshot as the working roots at child-open time, and forwarding is
+//! equivalent to that: the parent cannot be mutated between the first child's
+//! open and the last child's drop, so its roots, open databases and dirty set
+//! are constant for as long as any child can read them.
 //!
 //! ## The runtime backstop (TXN-29) and its memory ordering
 //!
-//! The counter exists for the world where the borrow checker was bypassed
-//! (`unsafe`/FFI at an adapter boundary — e.g. the oracle's lifetime-erased
-//! children). Every mutating `RwTxn` entry checks `live() == 0` and returns
-//! [`MdbError::BadTxn`](crate::error::MdbError::BadTxn) (LMDB's `MDB_BAD_TXN` is literally "transaction …
-//! has a child" — ADR-0007) instead of mutating frozen-but-aliased pages.
-//! Orderings (ARM/weak-memory assumptions, loom-checked as L6):
+//! The live-child counter covers callers that bypass the borrow checker
+//! (`unsafe` or FFI at an adapter boundary, such as lifetime-erased children).
+//! Every mutating `RwTxn` entry checks `live() == 0` and otherwise returns
+//! [`MdbError::BadTxn`](crate::error::MdbError::BadTxn), as LMDB does for a
+//! transaction that has a child. The orderings:
 //!
-//! - open: `fetch_add(1, Relaxed)` — creation happens on a thread already
-//!   holding `&RwTxn`; the child is *published* to its worker by the spawning
-//!   mechanism's own happens-before edge (thread spawn / channel send), so
-//!   the increment itself needs no ordering.
-//! - child drop: `fetch_sub(1, Release)` — makes every read the child
-//!   performed happen-before any observer of the count reaching 0.
-//! - writer-side check: `load(Acquire)` — pairs with the `Release`
+//! - open: `fetch_add(1, Relaxed)`. The opener already holds `&RwTxn`, and
+//!   the child reaches its worker through the happens-before edge of the
+//!   thread spawn or channel send, so the increment needs no ordering.
+//! - child drop: `fetch_sub(1, Release)`. Every read the child performed
+//!   happens-before any observer of the count reaching 0.
+//! - writer-side check: `load(Acquire)`. It pairs with the `Release`
 //!   decrements, so all child activity happens-before the writer mutates or
-//!   commits, even without the join edge.
+//!   commits, even without a join edge.
 //!
-//! `mem::forget(child)`: forget *consumes* the child, so no read
-//! through it can happen afterwards and nothing stays aliased; the counter
-//! simply never reaches 0 again and every later mutating op / `commit`
-//! returns `BadTxn` — a permanently-blocked writer, never UB.
+//! `mem::forget(child)` consumes the child, so no read through it can happen
+//! afterwards and nothing stays aliased. The counter never returns to 0, and
+//! every later mutating operation and `commit` returns `BadTxn`: the writer
+//! is blocked, and no memory is misused.
 
 use crate::btree::Source;
 use crate::page::DBRecord;
@@ -63,10 +51,10 @@ use crate::rotxn::{DbSel, TxnRead};
 use crate::rwtxn::RwTxn;
 use crate::sync::{AtomicUsize, Ordering};
 
-/// The live-child counter on a write txn (SPEC 04 TXN-31,
-/// ADR-0007: `AtomicUsize`, **not** `Cell` — a `Cell` would destroy
-/// `RwTxn: Sync`, and children may drop on worker threads). Factored into
-/// its own type so the loom L6 model checks the exact shipped code.
+/// The live-child counter on a write txn (SPEC 04 TXN-31, ADR-0007). It is an
+/// `AtomicUsize` because a `Cell` would make `RwTxn` not `Sync`, and children
+/// may drop on worker threads. It is its own type so that the loom models
+/// below check the code that ships.
 #[derive(Debug)]
 pub(crate) struct ChildCounter(AtomicUsize);
 
@@ -76,9 +64,9 @@ impl ChildCounter {
     }
 
     /// A child was opened. `Relaxed`: the opener already holds `&RwTxn` and
-    /// the child reaches its worker through a spawn/send happens-before edge;
-    /// the counter value itself is only ever *checked* through the `Acquire`
-    /// load in [`ChildCounter::live`] (see module docs).
+    /// the child reaches its worker through a spawn/send happens-before edge.
+    /// The counter is only checked through the `Acquire` load in
+    /// [`ChildCounter::live`] (see the module docs).
     pub(crate) fn bump(&self) {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
@@ -86,10 +74,9 @@ impl ChildCounter {
     /// A child dropped. `Release`: pairs with the `Acquire` in
     /// [`ChildCounter::live`] so every read the child performed
     /// happens-before the writer observes quiescence and resumes mutating
-    /// (SPEC 04 TXN-31: this Release/Acquire pair is normative by
-    /// per-site comment — loom L6a machine-checks the protocol shape but cannot
-    /// detect an all-Relaxed weakening of this edge; see the mutation-check
-    /// record below).
+    /// (SPEC 04 TXN-31). The loom models check the shape of this protocol but
+    /// cannot detect a weakening of this pair to `Relaxed`; see the note
+    /// above the loom tests.
     pub(crate) fn release(&self) {
         let prev = self.0.fetch_sub(1, Ordering::Release);
         debug_assert!(prev != 0, "child counter underflow");
@@ -101,18 +88,18 @@ impl ChildCounter {
     }
 }
 
-/// A read-only child of the active write txn, seeing its **uncommitted**
-/// state (SPEC 00 row 16, SPEC 04 §5, fork-only semantics).
+/// A read-only child of the active write txn, seeing its uncommitted state
+/// (SPEC 00 row 16, SPEC 04 §5; semantics of the LMDB fork only).
 ///
 /// Obtained from [`RwTxn::nested_read_txn`] (or
 /// [`Env::nested_read_txn`](crate::env::Env)). Reads through the writer's
 /// dirty frames first, then the map (TXN-27); usable with the whole
 /// [`Database`](crate::rotxn::Database) read API via [`TxnRead`]. Arbitrarily
-/// many children may be live concurrently (TXN-28), each `Send` — the
-/// milli/hannoy fan-out moves one to each rayon worker while the writer is
-/// paused. While any child lives the parent cannot mutate, commit, or abort:
-/// compile-time via the shared borrow (TXN-30), runtime via the child counter
-/// (TXN-29 → [`MdbError::BadTxn`](crate::error::MdbError)). The child cannot
+/// many children may be live concurrently (TXN-28), each `Send`, so a caller
+/// can move one to each worker thread while the writer is paused. While any
+/// child lives the parent cannot mutate, commit, or abort: at compile time
+/// through the shared borrow (TXN-30), at run time through the child counter
+/// (TXN-29, [`MdbError::BadTxn`](crate::error::MdbError)). The child cannot
 /// outlive its parent (TXN-31/33).
 ///
 /// Covariant in `'p` (like heed's `RoTxn`): the heed adapter narrows a
@@ -133,10 +120,9 @@ impl<'p> NestedRoTxn<'p> {
         self.parent.env_ident()
     }
 
-    /// Open a child of `parent`, bumping the live-child counter. Only called
-    /// through `RwTxn::nested_read_txn`, which performs the errored-txn check
-    /// first (fork parity: `mdb_txn_begin` on an errored parent →
-    /// `MDB_BAD_TXN`).
+    /// Open a child of `parent`, bumping the live-child counter.
+    /// `RwTxn::nested_read_txn` is the only caller and first refuses an
+    /// errored parent with `MDB_BAD_TXN`, as `mdb_txn_begin` does.
     pub(crate) fn open(parent: &'p RwTxn<'p>) -> NestedRoTxn<'p> {
         parent.children().bump();
         NestedRoTxn {
@@ -178,19 +164,18 @@ impl<'p> NestedRoTxn<'p> {
 
 impl Drop for NestedRoTxn<'_> {
     fn drop(&mut self) {
-        // TXN-31: decrement with `Release` (see ChildCounter::release) — may
-        // run on a worker thread. The parent resumes implicitly (RAII, heed
-        // parity): the next `&mut` op simply passes the TXN-29 guard.
         // ADR-0024: an end without a commit frees what this child opened.
+        // TXN-31: the decrement uses `Release` (see ChildCounter::release) and
+        // may run on a worker thread. The parent needs no explicit resume: its
+        // next `&mut` operation passes the TXN-29 guard.
         self.end_handles(false);
         self.parent.children().release();
     }
 }
 
-/// The child reads the parent's view verbatim (delegate-live, ADR-0007;
-/// equivalence with snapshot-at-open proven in the module docs). This is what
-/// makes the whole read API — gets, cursors, ranges, prefix iters, named DBs
-/// through `record_for`, overflow runs — work on a child unchanged.
+/// The child reads the parent's view (ADR-0007; the module docs explain why
+/// this equals a snapshot taken at open). The whole read API therefore works
+/// on a child unchanged.
 impl TxnRead for NestedRoTxn<'_> {
     fn source(&self) -> Source<'_> {
         self.parent.source()
@@ -230,19 +215,17 @@ impl TxnRead for NestedRoTxn<'_> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// loom L6 (ADR-0007). Run via `just loom` (RUSTFLAGS="--cfg loom",
-// tests filtered `loom_`). Models are tiny (2 spawned threads + main) so loom
-// explores them exhaustively.
+// Loom models of the child counter (ADR-0007). Run with `just loom`. Each
+// model has two spawned threads plus main, so loom explores it exhaustively.
 //
 // Limit: weakening both counter orderings to `Relaxed` is not caught here.
 // The violating execution is load-buffering-shaped, which loom does not
 // explore (tokio-rs/loom#180), yet it is real on AArch64: the child's frame
 // load could complete after its relaxed decrement becomes visible. The
-// `Release`/`Acquire` pair (SPEC 04 TXN-31) is therefore guarded by the
-// per-site comments, not by loom. L6a checks the protocol shape (e.g.
-// decrementing before the read fails it); L6b checks the join-edge world.
-// ---------------------------------------------------------------------------
+// `Release`/`Acquire` pair (SPEC 04 TXN-31) therefore rests on the per-site
+// comments, not on loom. The first model checks the protocol shape (for
+// example, decrementing before the read fails it); the second checks the
+// case where the writer joins the workers.
 
 #[cfg(all(test, loom))]
 mod loom_tests {
@@ -251,10 +234,9 @@ mod loom_tests {
     use loom::thread;
     use std::sync::Arc;
 
-    /// L6a — the counter-only world (Q5 part 1): the TXN-29 backstop with the
-    /// `Release`-decrement / `Acquire`-load pairing as the **only**
-    /// synchronization (models an `unsafe`/FFI bypass of the borrow checker,
-    /// which is exactly what the runtime guard exists for). Two "children" on
+    /// The TXN-29 backstop with the `Release` decrement and `Acquire` load as
+    /// the only synchronization. This models an `unsafe` or FFI bypass of the
+    /// borrow checker, the case the runtime guard exists for. Two "children" on
     /// worker threads read a model dirty frame and release; the "writer"
     /// (main thread) waits until it observes quiescence through the `Acquire`
     /// load, then mutates the frame. No child read may observe the mutation.
@@ -266,8 +248,8 @@ mod loom_tests {
             // happens-before must come from the counter pairing alone.
             let frame = Arc::new(AtomicU64::new(1));
 
-            // Writer opens two children before fanning out (single thread —
-            // the Relaxed bump is justified by this program order).
+            // The writer opens two children before spawning, on one thread:
+            // this program order is what justifies the `Relaxed` bump.
             children.bump();
             children.bump();
 
@@ -282,9 +264,9 @@ mod loom_tests {
                 })
                 .collect();
 
-            // Writer resumes only once the Acquire load observes 0 (the
-            // guard_ok gate). loom's yield marks the spin as such so the
-            // model stays bounded.
+            // The writer resumes only once the `Acquire` load observes 0, as
+            // `RwTxn::guard_ok` requires. The yield tells loom this is a spin
+            // loop, which keeps the model bounded.
             while children.live() != 0 {
                 thread::yield_now();
             }
@@ -302,12 +284,10 @@ mod loom_tests {
         });
     }
 
-    /// L6b — the join-edge world (Q5 part 2): the intended safe-usage
-    /// pattern. The writer *joins* the workers (rayon-scope shape) before
-    /// resuming; after the join the counter MUST be observably 0 — the
-    /// guard_ok gate never fires spuriously in the fan-out pattern — and the
-    /// mutation is trivially ordered after every child read by the join
-    /// happens-before edge.
+    /// The intended usage: the writer joins the workers (as a scoped thread
+    /// pool does) before resuming. After the join the counter must read 0, so
+    /// the runtime guard never blocks a writer that used children correctly,
+    /// and the join edge orders the mutation after every child read.
     #[test]
     fn loom_l6b_join_edge_then_quiescent() {
         loom::model(|| {
@@ -330,7 +310,7 @@ mod loom_tests {
 
             let mut reads = Vec::new();
             for h in handles {
-                reads.push(h.join().unwrap()); // the milli/hannoy join point
+                reads.push(h.join().unwrap());
             }
             assert_eq!(
                 children.live(),
@@ -356,39 +336,31 @@ mod tests {
     fn assert_send<T: Send>() {}
     fn assert_sync<T: Sync>() {}
 
-    /// ADR-0007: `NestedRoTxn<'p>` covariance in `'p` is a design
-    /// requirement for the heed adapter (heed returns a plain covariant
-    /// `RoTxn<'a>`). This function only compiles while the type stays
-    /// covariant — an invariant-making field (`fn(&'p _)`, `Cell<&'p _>`, …)
-    /// breaks the build here, not silently in the adapter.
+    /// The heed adapter needs `NestedRoTxn<'p>` to be covariant in `'p`
+    /// (ADR-0007), because heed returns a covariant `RoTxn<'a>`. This function
+    /// compiles only while the type stays covariant.
     #[allow(dead_code)]
     fn _assert_covariant<'short, 'long: 'short>(x: NestedRoTxn<'long>) -> NestedRoTxn<'short> {
         x
     }
 
-    /// The ADR-0007 standing contract, machine-enforced (risk R2): `RwTxn`
-    /// stays `Sync` (no interior mutability on `&self` paths) and therefore
-    /// `NestedRoTxn` — a `&RwTxn` newtype — is `Send` **by compiler
-    /// derivation**, with no `unsafe impl`. If a future `RwTxn` field breaks
-    /// `Sync`, this fails to build (soundness is never at stake — only the
-    /// build).
+    /// ADR-0007 requires `RwTxn` to stay `Sync`, which makes `NestedRoTxn`
+    /// (it holds a `&RwTxn`) `Send` with no `unsafe impl`. A `RwTxn` field
+    /// that breaks `Sync` fails the build here.
     #[test]
     fn rwtxn_sync_contract_and_child_send() {
         assert_sync::<RwTxn<'static>>();
         assert_send::<NestedRoTxn<'static>>();
-        // Children are also Sync (a shared view of a shared view): rayon
-        // workers may share one behind `&` (hannoy's thread_local pool hands
-        // out `&RoTxn`).
+        // Children are also `Sync`, so worker threads may share one behind
+        // `&`.
         assert_sync::<NestedRoTxn<'static>>();
     }
 
-    /// TXN-26/27/28 on the heap-mode dirty store, miri-exercised (TXN-49
-    /// scenario 3, "nested-reader-reads-dirty"): children see uncommitted
-    /// puts — inline values *and* a multi-page dirty overflow run; multiple
-    /// children coexist; borrows resolve zero-copy out of the frozen frames.
-    /// (`mem_env` is read-only at commit, so the map arm of TXN-27 — reading
-    /// committed-untouched pages — and post-commit visibility are covered on
-    /// real files by `crates/zerodb/tests/nested_fanout.rs`.)
+    /// TXN-26/27/28 on the heap dirty store (TXN-49 scenario 3): children see
+    /// uncommitted puts, both inline values and a multi-page dirty overflow
+    /// run; several children coexist; borrows point into the dirty frames.
+    /// `mem_env` cannot commit, so reading committed pages through a child
+    /// (the map side of TXN-27) is tested on real files in the `zerodb` crate.
     #[test]
     fn children_read_uncommitted_state() {
         let env = mem_env(PS, MAP);
@@ -399,7 +371,8 @@ mod tests {
         let big = vec![0xAB_u8; 3 * PS as usize]; // spans a 4-page overflow run
         db.put(&mut txn, b"overflow", &big).unwrap();
 
-        // TXN-28: multiple concurrent children; both via RwTxn:: and Env::.
+        // TXN-28: several concurrent children, opened through both entry
+        // points.
         let c1 = txn.nested_read_txn().unwrap();
         let c2 = env.nested_read_txn(&txn).unwrap();
         assert_eq!(c1.txnid(), txn.txnid()); // TXN-26
@@ -425,9 +398,8 @@ mod tests {
         assert_eq!(borrowed, b"uncommitted-inline");
         drop(c1);
 
-        // RAII resume: the writer mutates again with no ceremony (TXN-29's
-        // window closed at last-child drop), and a second paused window sees
-        // both generations.
+        // Once the last child drops, the writer mutates again (TXN-29), and
+        // a later child sees both the earlier and the new writes.
         db.put(&mut txn, b"after", b"resumed").unwrap();
         let c3 = txn.nested_read_txn().unwrap();
         assert_eq!(db.get(&c3, b"after").unwrap(), Some(b"resumed".as_slice()));
@@ -436,15 +408,13 @@ mod tests {
         txn.abort();
     }
 
-    /// Risk R1 (ADR-0007): `mem::forget(child)` never decrements the counter.
-    /// The writer degrades to a permanently-blocked-but-sound state: every
-    /// mutating op and `commit` returns `BadTxn` (TXN-29/33), nothing panics,
-    /// nothing dangles (forget consumed the child — no read through it can
-    /// occur). Dropping the txn (abort) stays clean: `RwTxn` deliberately has
-    /// **no** drop-time quiescence assert, because a nonzero counter at drop
-    /// is *only* reachable via this sound forget path — the borrow checker
-    /// makes a live child at parent-drop unrepresentable — so such an assert
-    /// could only ever fire on sound code.
+    /// `mem::forget(child)` never decrements the counter (ADR-0007). The
+    /// writer is then blocked for good but sound: every mutating operation
+    /// and `commit` returns `BadTxn` (TXN-29/33), nothing panics, and nothing
+    /// dangles, since `forget` consumed the child. `RwTxn` has no assertion
+    /// at drop that the counter is 0: the borrow checker rules out a live
+    /// child at parent drop, so a nonzero counter there can only come from
+    /// this sound `forget` path.
     #[test]
     fn forgotten_child_blocks_writer_soundly() {
         let env = mem_env(PS, MAP);
@@ -471,17 +441,16 @@ mod tests {
         // Reads on the parent remain fine (nothing is aliased; &self only).
         assert_eq!(db.get(&txn, b"k").unwrap(), Some(b"v".as_slice()));
 
-        // TXN-33 at C0. commit(self) consumes the txn either way; the
-        // failed-commit drop (= abort) is clean — nothing was aliased.
+        // TXN-33: commit refuses before writing anything. It consumes the
+        // txn either way, and the drop that follows is an ordinary abort.
         match txn.commit() {
             Err(Error::Mdb(MdbError::BadTxn)) => {}
             other => panic!("commit with a leaked child must be BadTxn, got {other:?}"),
         }
     }
 
-    /// An errored (poisoned) parent refuses new children (fork parity:
-    /// `mdb_txn_begin` on an `MDB_TXN_ERROR` parent → `MDB_BAD_TXN`), and a
-    /// child opened *before* the error keeps reading the frozen view.
+    /// An errored parent refuses new children with `MDB_BAD_TXN`, as
+    /// `mdb_txn_begin` does on an `MDB_TXN_ERROR` parent.
     #[test]
     fn errored_parent_refuses_children() {
         let env = mem_env(PS, MAP);
@@ -494,13 +463,12 @@ mod tests {
             Err(_) => {}
             Ok(()) => panic!("a map-sized value must not fit"),
         }
-        // Whether that failure errored the txn depends on where it failed;
-        // guard the assertion on the observable: if the txn is now errored,
-        // nested_read_txn must refuse with BadTxn.
+        // Whether that failure errored the txn depends on where it failed.
+        // If the txn is now errored, nested_read_txn must refuse with BadTxn.
         match txn.nested_read_txn() {
             Ok(child) => {
-                // Validation-stage failure (txn still healthy): the child
-                // works as usual.
+                // The put was rejected before it touched the txn, which is
+                // still healthy: the child works as usual.
                 assert_eq!(db.get(&child, b"huge").unwrap(), None);
             }
             Err(Error::Mdb(MdbError::BadTxn)) => {} // errored parent: correct refusal

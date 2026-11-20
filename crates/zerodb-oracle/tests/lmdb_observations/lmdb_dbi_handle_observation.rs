@@ -1,6 +1,7 @@
 //! What the Meilisearch LMDB fork does with a database handle (`dbi`) once the
 //! transaction that opened it has ended, observed through heed 0.22.1, the
-//! API consumers call. Input for the design of issue #73 (divergence D-013, ADR-0024).
+//! API consumers call. Input for the design of database-handle lifetime
+//! (divergence D-013, ADR-0024).
 //! CONTRIBUTING.md rule 1: observed, not guessed.
 //!
 //! Each case is a short script of heed calls; every step's outcome is recorded

@@ -13,7 +13,8 @@
 
 | Document | What it covers |
 |---|---|
-| [ARCHITECTURE.md](ARCHITECTURE.md) | How the engine works and how it is verified; start here |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | How the engine works, how it differs from LMDB, and how it is verified; start here |
+| [PROVENANCE.md](PROVENANCE.md) | How the project was built, what has been verified and what has not |
 | [../CONTRIBUTING.md](../CONTRIBUTING.md) | The project rules, the `unsafe` policy and the checks to run |
 | [SPEC/](SPEC/) | The reference for formats and algorithms, with the rule IDs (`TXN-61`, `GC-18` …) the code cites |
 | [DECISIONS.md](DECISIONS.md) | Index of the architecture decision records in [adr/](adr/) |
@@ -31,6 +32,10 @@ transactions and MVCC, `05` free-page reuse, and `06` durability and recovery.
 |---|---|
 | [maintainers/RELEASING.md](maintainers/RELEASING.md) | How a version is cut |
 | [maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md) | Running Meilisearch's and hannoy's test suites and benchmarks on ZeroDB |
+| [maintainers/UNSAFE-AUDIT.md](maintainers/UNSAFE-AUDIT.md) | Brief for an outside review of the `unsafe` code: every site, its invariant, tool coverage and findings |
+| [maintainers/POWER-LOSS.md](maintainers/POWER-LOSS.md) | The power-loss harness: dm-log-writes on ext4 and XFS, how to run it |
+| [maintainers/HARDENING-RUNS.md](maintainers/HARDENING-RUNS.md) | The 24-hour fuzz soak and the run on a 64 KiB-page kernel: machines, commands, recording |
+| [maintainers/FORK-1-bug-report.md](maintainers/FORK-1-bug-report.md) | Draft upstream report for the LMDB fork crash FORK-1, not yet filed |
 
 Benchmark reports are in [`benches/results/`](../benches/results/README.md),
 and release history in [CHANGELOG.md](../CHANGELOG.md).

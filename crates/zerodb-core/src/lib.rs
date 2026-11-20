@@ -9,13 +9,16 @@
 //!   [`env::Backing`]; this crate's own `unsafe` is confined to the places
 //!   listed in the lint note below.
 //! - The [`btree`] read path and the [`rotxn`] read API.
-//! - The write path — [`dirty`] (the stable-frame dirty store,
+//! - The write path — `dirty` (the stable-frame dirty store,
 //!   SPEC 04 §6.3), [`rwtxn`] (single-writer txn, COW, split/rebalance, the
 //!   commit pipeline with its test hook points, SPEC 04 §9), and [`check`]
 //!   (the SPEC 03 §11 invariant walker that `zerodb-tools check` wraps).
 //! - The `readers` module — the lock-free MVCC reader table
 //!   and the published-snapshot cell (SPEC 04 §3/§4, ADR-0006), model-checked
 //!   under loom via the `sync` shim (`just loom`).
+//! - The [`writer_word`] module — the Linux cross-process writer lock's word
+//!   protocol (SPEC 04 LCK-4), also model-checked under loom. `zerodb-io`
+//!   supplies the mapped word, the futex and the liveness probe.
 
 #![deny(missing_docs)]
 // `deny`, not `forbid`: the unsafe policy (CONTRIBUTING.md) sanctions these places,
@@ -31,11 +34,25 @@
 // default threshold leaves them out of line on the descent and scan paths.
 #![deny(unsafe_code)]
 
+// ZeroDB runs on Unix only (Linux and macOS; see the platform support table
+// in the README). The Unix-only code is in `zerodb-io`, but the guard is
+// here: every other ZeroDB crate depends on this one, so cargo builds it
+// first and stops at this one error instead of reporting dozens of
+// unresolved Unix imports from `zerodb-io`. Windows support is proposed in
+// docs/adr/0046-windows-support.md and not implemented.
+#[cfg(not(unix))]
+compile_error!(
+    "ZeroDB does not support this target yet: it runs on Unix (Linux and \
+     macOS) only. Windows support is proposed in ZeroDB's \
+     docs/adr/0046-windows-support.md and not implemented; see the platform \
+     support table in ZeroDB's README."
+);
+
 pub mod btree;
 pub mod builder;
 pub mod check;
 pub mod cmp;
-pub mod dirty;
+pub(crate) mod dirty;
 pub mod env;
 pub mod error;
 pub(crate) mod handles;
@@ -47,6 +64,7 @@ pub mod rwtxn;
 pub mod shared;
 pub(crate) mod stamps;
 pub(crate) mod sync;
+pub mod writer_word;
 
 pub use env::{CommitHook, HookPoint, Snapshot};
 pub use nested::NestedRoTxn;

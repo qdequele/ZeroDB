@@ -1480,6 +1480,7 @@ version = "0.2.0"
 dependencies = [
  "libc",
  "memmap2",
+ "thiserror",
  "zerodb-core",
 ]
 
@@ -1506,6 +1507,7 @@ version = "0.2.0"
 dependencies = [
  "heed 0.22.1",
  "heed 0.22.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "thiserror",
  "zerodb",
  "zerodb-core",
  "zerodb-io",

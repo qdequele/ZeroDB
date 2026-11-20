@@ -12,10 +12,13 @@ use super::*;
 /// across threads, and the txn's drop (commit or abort) may run on any
 /// thread. Here the guard only *clears the flag* under a fresh short lock
 /// taken on whichever thread drops it, which is sound on every platform.
+///
+/// Its mutex and condvar come from the `sync` shim, so loom checks this same
+/// code (`just loom`, ADR-0006).
 #[derive(Debug)]
 pub(super) struct WriterLock {
-    occupied: Mutex<WriterSlot>,
-    cv: Condvar,
+    occupied: crate::sync::Mutex<WriterSlot>,
+    cv: crate::sync::Condvar,
 }
 
 /// The state behind [`WriterLock`]'s mutex.
@@ -45,7 +48,7 @@ pub(crate) struct WriterGuard<'env> {
     /// given back at txn end, stored at release.
     carry: Option<Box<crate::rwtxn::WriterCarry>>,
     /// The cross-process writer lock, when this guard also holds it
-    /// (ADR-0023 §2; set by [`EnvInner::lock_writer_shared`]). Released
+    /// (ADR-0023; set by [`EnvInner::lock_writer_shared`]). Released
     /// before the in-process slot on drop.
     pub(super) shared: Option<&'env dyn crate::shared::SharedRegion>,
 }
@@ -71,8 +74,8 @@ impl WriterGuard<'_> {
 impl WriterLock {
     pub(super) fn new() -> WriterLock {
         WriterLock {
-            occupied: Mutex::new(WriterSlot::default()),
-            cv: Condvar::new(),
+            occupied: crate::sync::Mutex::new(WriterSlot::default()),
+            cv: crate::sync::Condvar::new(),
         }
     }
 
@@ -144,8 +147,8 @@ impl Drop for WriterGuard<'_> {
         g.occupied = false;
         g.carry = self.carry.take();
         // One waiter at most can make progress (single writer), so
-        // `notify_one` suffices; drop the flag lock before notify is not
-        // required for correctness (the waiter re-checks under the lock).
+        // `notify_one` suffices. Notifying while the flag lock is still held
+        // is correct: the waiter re-checks under the lock.
         // Skipped when nobody is parked, which is the common, uncontended case.
         if g.waiters > 0 {
             self.lock.cv.notify_one();
@@ -190,5 +193,99 @@ impl SignalEvent {
         }
         let (g2, _res) = self.cv.wait_timeout(g, dur).expect("signal mutex poisoned");
         *g2
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Loom models (`just loom`) of the in-process writer lock (TXN-6). The data a
+// write txn publishes is modelled by a Relaxed load-then-store increment
+// inside the critical section: two holders at once, or an acquisition that
+// does not happen-after the previous release, can lose an increment.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, loom))]
+mod loom_tests {
+    use super::WriterLock;
+    use crate::sync::{AtomicU32, Ordering};
+    use loom::sync::Arc;
+    use loom::thread;
+
+    /// The lock and the critical section's witness, leaked so that a guard
+    /// (which borrows the lock) can move between threads.
+    fn world() -> &'static (WriterLock, AtomicU32) {
+        Box::leak(Box::new((WriterLock::new(), AtomicU32::new(0))))
+    }
+
+    fn critical_section(count: &AtomicU32) {
+        // Relaxed on purpose: only the lock orders this against the previous
+        // holder's store.
+        let v = count.load(Ordering::Relaxed);
+        count.store(v + 1, Ordering::Relaxed);
+    }
+
+    /// Two threads take the lock with `acquire`: one waits on the condvar
+    /// while the other holds it, nobody is left parked (loom reports a lost
+    /// wakeup as a deadlock), and each sees the other's update.
+    #[test]
+    fn loom_wl1_two_writers_exclude_and_wake() {
+        loom::model(|| {
+            let w = world();
+            let t = thread::spawn(move || {
+                let g = w.0.acquire();
+                critical_section(&w.1);
+                drop(g);
+            });
+            let g = w.0.acquire();
+            critical_section(&w.1);
+            drop(g);
+            t.join().unwrap();
+            assert_eq!(w.1.load(Ordering::Relaxed), 2);
+        });
+    }
+
+    /// A guard taken on one thread is released on another (a write txn
+    /// moved across threads, as heed's `WithoutTls` mode allows), while a
+    /// third thread waits in `acquire`. The waiter is woken and sees the
+    /// update made under the moved guard.
+    #[test]
+    fn loom_wl2_release_from_another_thread_wakes_the_waiter() {
+        loom::model(|| {
+            let w = world();
+            let g = w.0.acquire();
+            critical_section(&w.1);
+            let mover = thread::spawn(move || drop(g));
+            let waiter = thread::spawn(move || {
+                let g = w.0.acquire();
+                critical_section(&w.1);
+                drop(g);
+            });
+            mover.join().unwrap();
+            waiter.join().unwrap();
+            assert_eq!(w.1.load(Ordering::Relaxed), 2);
+        });
+    }
+
+    /// `try_acquire` never waits and never takes a held lock; when it
+    /// succeeds it excludes a concurrent `acquire` like any guard.
+    #[test]
+    fn loom_wl3_try_acquire_vs_acquire() {
+        loom::model(|| {
+            let w = world();
+            let won = Arc::new(AtomicU32::new(0));
+            let won2 = Arc::clone(&won);
+            let t = thread::spawn(move || {
+                if let Some(g) = w.0.try_acquire() {
+                    critical_section(&w.1);
+                    won2.store(1, Ordering::Relaxed);
+                    drop(g);
+                }
+            });
+            let g = w.0.acquire();
+            critical_section(&w.1);
+            drop(g);
+            t.join().unwrap();
+            let expected = 1 + won.load(Ordering::Relaxed);
+            assert_eq!(w.1.load(Ordering::Relaxed), expected);
+        });
     }
 }

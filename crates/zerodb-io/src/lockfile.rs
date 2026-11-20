@@ -71,9 +71,9 @@ const WRITER_BYTE: i64 = 1;
 /// Record-lock offset base of the per-PID liveness locks. Far above the
 /// mapped size, so PIDs never collide with bytes 0 and 1.
 const LIVENESS_BASE: i64 = 1 << 32;
-/// Writer-word bit set while a process sleeps on the futex (Linux).
+// The writer-word protocol (Linux, SPEC 04 LCK-4).
 #[cfg(target_os = "linux")]
-const WAITERS: u32 = 1 << 31;
+use zerodb_core::writer_word;
 /// How long a waiting writer sleeps before checking the owner is alive.
 #[cfg(target_os = "linux")]
 const OWNER_PROBE: std::time::Duration = std::time::Duration::from_millis(100);
@@ -89,49 +89,24 @@ const WRLCK: libc::c_short = libc::F_WRLCK as libc::c_short;
 const UNLCK: libc::c_short = libc::F_UNLCK as libc::c_short;
 
 /// Why [`LockFile::open`] failed.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LockOpenError {
     /// This process already has the lock file open. A second descriptor would
     /// drop the first one's record locks when closed.
+    #[error("the lock file is already open in this process")]
     AlreadyOpen,
     /// The lock file was initialized with incompatible parameters.
+    #[error("lock file mismatch: {0}")]
     Mismatch(String),
     /// The lock file cannot be created or opened for writing because it lies
     /// on a read-only filesystem (`EROFS`). A read-only environment then runs
-    /// without a lock file, as LMDB does (ADR-0023,
-    /// `OBS_RDONLY_LOCK_READONLY_FS`); any other caller treats it as the
-    /// `EROFS` I/O error it is.
+    /// without a lock file, as LMDB does (ADR-0023); any other caller treats
+    /// it as the `EROFS` I/O error it is.
+    #[error("the lock file is on a read-only filesystem")]
     ReadOnlyFs,
     /// An I/O error.
-    Io(std::io::Error),
-}
-
-impl From<std::io::Error> for LockOpenError {
-    fn from(e: std::io::Error) -> Self {
-        LockOpenError::Io(e)
-    }
-}
-
-impl std::fmt::Display for LockOpenError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            LockOpenError::AlreadyOpen => {
-                f.write_str("the lock file is already open in this process")
-            }
-            LockOpenError::Mismatch(m) => write!(f, "lock file mismatch: {m}"),
-            LockOpenError::ReadOnlyFs => f.write_str("the lock file is on a read-only filesystem"),
-            LockOpenError::Io(e) => write!(f, "lock file I/O error: {e}"),
-        }
-    }
-}
-
-impl std::error::Error for LockOpenError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            LockOpenError::Io(e) => Some(e),
-            _ => None,
-        }
-    }
+    #[error("lock file I/O error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 /// The lock files this process has open, by [`RegistryKey`]. A poisoned
@@ -348,26 +323,32 @@ pub fn published_max_readers(path: &Path) -> Result<Option<u32>, LockOpenError> 
 
 /// The mapped lock file. Field order matters for `Drop`: the map is
 /// unmapped before the descriptor closes. The registration owns the
-/// descriptor: closing it releases this process's record locks, and only
-/// then is the file's entry removed from the registry (keyed by the file's
-/// identity, not its path), both under the registry lock — so no second
-/// descriptor of this file can be opened by this process while the first is
-/// still open, and no new file that reuses the inode number of an unlinked
-/// one is refused because of a stale entry.
+/// descriptor and, on drop, closes it before removing the file's registry
+/// entry, so this process never has two descriptors of one lock file (see
+/// `Registration`'s `Drop`).
 ///
 /// Sharing one `LockFile` across threads is sound: all shared state is reached
 /// through atomics over the mapping or through `fcntl` on the descriptor.
 pub struct LockFile {
-    map: memmap2::MmapRaw,
+    map: LockMap,
     registration: Registration,
     pid: u32,
     initializer: bool,
+}
+
+/// The mapped bytes of a lock file and the atomic views over them: the only
+/// code in this module that turns mapped bytes into references. Kept apart
+/// from [`LockFile`] so tests can build one over an anonymous map, which miri
+/// supports, without a file, `fcntl` or a futex.
+struct LockMap {
+    map: memmap2::MmapRaw,
+    /// The number of reader slots after the header (`max_readers`).
     slots: u32,
 }
 
 impl LockFile {
     /// Open or create the lock file at `path` and join the environment
-    /// (ADR-0023 §1). The first opener (no other process alive) initializes
+    /// (ADR-0023). The first opener (no other process alive) initializes
     /// the file and holds the election byte exclusively until
     /// [`LockFile::finish_open`]; later openers wait for that, then validate.
     ///
@@ -520,10 +501,10 @@ impl LockFile {
         };
         // A joiner reads `max_readers` with `pread` before mapping. It holds
         // the shared election lock, so the initializer has finished writing.
-        // It adopts that count whatever it asked for, as an LMDB joiner sizes
-        // its reader table from the lock file (`OBS_JOINER_FEWER_MAXREADERS`,
-        // `OBS_JOINER_MORE_MAXREADERS`; ADR-0023 §1). A count no
-        // initializer can write means the file is not a usable lock file.
+        // It adopts that count whatever it asked for, smaller or larger, as
+        // an LMDB joiner sizes its reader table from the lock file
+        // (ADR-0023). A count no initializer can write means the file is not
+        // a usable lock file.
         if initializer {
             check_lock_file_shape(file, path)?;
         }
@@ -532,8 +513,7 @@ impl LockFile {
             // lock file left by an earlier run: as LMDB, which sizes its
             // table from the lock file's length and never shortens it, the
             // count is the larger of the requested one and the recorded one
-            // (`OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS`; ADR-0023 §1 as
-            // amended). The slots themselves are wiped below as always.
+            // (ADR-0023). The slots themselves are wiped below as always.
             previous_run_slots(file)?.map_or(max_readers, |n| n.max(max_readers))
         } else {
             let n = read_u32_at(file, OFF_MAX_READERS)?;
@@ -555,11 +535,10 @@ impl LockFile {
         let map = memmap2::MmapOptions::new().len(len).map_raw(file)?;
         let pid = std::process::id();
         let lock = LockFile {
-            map,
+            map: LockMap { map, slots },
             registration,
             pid,
             initializer,
-            slots,
         };
         if initializer {
             for rs in lock.slots() {
@@ -585,7 +564,7 @@ impl LockFile {
                 ));
             }
         }
-        // This process's liveness lock (ADR-0023 §3), held for the handle's life.
+        // This process's liveness lock (ADR-0023), held for the handle's life.
         if !record_lock(
             lock.file(),
             libc::F_SETLK,
@@ -644,6 +623,21 @@ impl LockFile {
     }
 
     fn u64_at(&self, off: usize) -> &AtomicU64 {
+        self.map.u64_at(off)
+    }
+
+    fn u32_at(&self, off: usize) -> &AtomicU32 {
+        self.map.u32_at(off)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn writer_word(&self) -> &AtomicU32 {
+        self.u32_at(OFF_WRITER)
+    }
+}
+
+impl LockMap {
+    fn u64_at(&self, off: usize) -> &AtomicU64 {
         debug_assert!(off.is_multiple_of(8) && off + 8 <= self.map.len());
         // SAFETY: the map is page-aligned and `off` is a multiple of 8 within
         // its length, so the pointer is aligned and in bounds. The mapping
@@ -660,19 +654,6 @@ impl LockFile {
         unsafe { AtomicU32::from_ptr(self.map.as_mut_ptr().add(off).cast()) }
     }
 
-    #[cfg(target_os = "linux")]
-    fn writer_word(&self) -> &AtomicU32 {
-        self.u32_at(OFF_WRITER)
-    }
-}
-
-impl SharedRegion for LockFile {
-    fn published_txnid(&self) -> &AtomicU64 {
-        self.u64_at(OFF_T)
-    }
-    fn finish_open(&self) -> std::io::Result<()> {
-        LockFile::finish_open(self)
-    }
     fn slots(&self) -> &[ReaderSlot] {
         debug_assert!(OFF_SLOTS + SLOT_STRIDE * self.slots as usize <= self.map.len());
         // SAFETY:
@@ -697,6 +678,18 @@ impl SharedRegion for LockFile {
                 self.slots as usize,
             )
         }
+    }
+}
+
+impl SharedRegion for LockFile {
+    fn published_txnid(&self) -> &AtomicU64 {
+        self.u64_at(OFF_T)
+    }
+    fn finish_open(&self) -> std::io::Result<()> {
+        LockFile::finish_open(self)
+    }
+    fn slots(&self) -> &[ReaderSlot] {
+        self.map.slots()
     }
     fn pid(&self) -> u32 {
         self.pid
@@ -724,77 +717,23 @@ impl SharedRegion for LockFile {
     }
 
     /// Returns `true` from both takeovers (a dead owner, and a stale word
-    /// naming this process's PID), `false` from an ordinary acquisition.
+    /// naming this process's PID), `false` from an ordinary acquisition. The
+    /// word protocol is `zerodb_core::writer_word` (SPEC 04 LCK-4); this
+    /// supplies the mapped word, the futex and the liveness probe.
     #[cfg(target_os = "linux")]
     fn lock_writer(&self) -> std::io::Result<bool> {
         let w = self.writer_word();
-        loop {
-            // Acquire: synchronizes with the previous owner's Release in
-            // `unlock_writer`, so its T store and meta write are visible.
-            let cur = match w.compare_exchange(0, self.pid, Ordering::Acquire, Ordering::Relaxed) {
-                Ok(_) => return Ok(false),
-                Err(cur) => cur,
-            };
-            let owner = cur & !WAITERS;
-            if owner == self.pid {
-                // The word names this process, but this process does not hold
-                // the lock: the core calls `lock_writer` only while holding its
-                // in-process writer lock, so no other thread of this process
-                // can own it. The word is therefore stale, left by a dead
-                // process that had the same PID. Waiting would never end
-                // (`is_alive` reports this PID alive, and other processes see
-                // this process's liveness lock), so take it over at once.
-                // Acquire as above; the waiters bit is kept so this owner's
-                // release wakes the others.
-                if w.compare_exchange(
-                    cur,
-                    self.pid | (cur & WAITERS),
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-                {
-                    return Ok(true);
-                }
-                continue; // the word changed; re-read it
-            }
-            // Relaxed: setting the waiters bit publishes no data; it only
-            // tells the owner's release to issue a wake. The futex syscall
-            // re-checks the word against `cur | WAITERS` in the kernel.
-            if cur & WAITERS == 0
-                && w.compare_exchange(cur, cur | WAITERS, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_err()
-            {
-                continue; // the word changed; re-read it
-            }
-            let timed_out = futex_wait(w, cur | WAITERS, OWNER_PROBE);
-            if timed_out && !self.is_alive(owner)? {
-                // The owner died holding the lock (ADR-0023 §2): take it over.
-                // Relaxed load: the CAS below re-validates the value. Acquire
-                // on the CAS as above. The waiters bit is kept so this
-                // owner's release wakes the others.
-                let now = w.load(Ordering::Relaxed);
-                if now & !WAITERS == owner
-                    && w.compare_exchange(
-                        now,
-                        self.pid | (now & WAITERS),
-                        Ordering::Acquire,
-                        Ordering::Relaxed,
-                    )
-                    .is_ok()
-                {
-                    return Ok(true);
-                }
-            }
-        }
+        writer_word::lock(
+            w,
+            self.pid,
+            |expected| futex_wait(w, expected, OWNER_PROBE),
+            |owner| self.is_alive(owner),
+        )
     }
 
     #[cfg(target_os = "linux")]
     fn unlock_writer(&self) {
-        // Release: publishes this writer's T store and meta write to the next
-        // owner's Acquire.
-        let old = self.writer_word().swap(0, Ordering::Release);
-        if old & WAITERS != 0 {
+        if writer_word::unlock(self.writer_word()) {
             futex_wake_all(self.writer_word());
         }
     }
@@ -804,7 +743,7 @@ impl SharedRegion for LockFile {
     #[cfg(not(target_os = "linux"))]
     fn lock_writer(&self) -> std::io::Result<bool> {
         // POSIX record locks belong to the process, so any thread may release
-        // it, and the kernel drops it if the process dies (ADR-0023 §2).
+        // it, and the kernel drops it if the process dies (ADR-0023).
         record_lock(self.file(), libc::F_SETLKW, WRLCK, WRITER_BYTE).map(|_| false)
     }
 
@@ -968,11 +907,10 @@ fn open_or_create(path: &Path) -> std::io::Result<(File, bool)> {
     }
 }
 
-/// The same-file guard (ADR-0023): fail with `InvalidInput` if
+/// The same-file guard of [`LockFile::open`]: fail with `InvalidInput` if
 /// `file`, the lock file just opened at `path`, is the data file at
-/// `data_path`. A missing data file cannot be the lock file. On refusal, the
-/// lock file is removed only if this open `created` it and it is still empty;
-/// otherwise the name designates the data file, which must not be removed.
+/// `data_path`. On refusal, the lock file is removed only if this open
+/// `created` it and it is still empty.
 fn check_not_data_file(
     file: &File,
     created: bool,
@@ -1013,12 +951,11 @@ fn is_initializer_length(len: u64) -> bool {
     len == magic_only || (len >= header + slot && (len - header).is_multiple_of(slot))
 }
 
-/// The foreign-file guard (ADR-0023), run by the initializer
-/// before it writes to the lock file at `path`: accept an empty file, a file
-/// carrying [`LOCK_MAGIC`] or [`LOCK_MAGIC_INIT`], or one whose header (the
-/// first `OFF_SLOTS` bytes, or the whole file if shorter) is all zero and
-/// whose length an initializer can leave ([`is_initializer_length`]); refuse
-/// anything else with `InvalidInput`, leaving it untouched.
+/// The foreign-file guard of [`LockFile::open`], run by the initializer
+/// before it writes to the lock file at `path`: refuse with `InvalidInput`,
+/// leaving the file untouched, anything that is neither empty, nor carrying
+/// a lock magic, nor an all-zero header with a length an initializer can
+/// leave ([`is_initializer_length`]).
 fn check_lock_file_shape(file: &File, path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     let len = file.metadata()?.len();
@@ -1100,6 +1037,102 @@ fn futex_wake_all(word: &AtomicU32) {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+    #[cfg(target_os = "linux")]
+    use zerodb_core::writer_word::WAITERS;
+
+    /// A lock map over an anonymous mapping of the size `open` maps for
+    /// `slots` reader slots. Anonymous maps are page-aligned like file maps,
+    /// and miri supports them, so this runs the atomic views under miri.
+    fn anonymous_map(slots: u32) -> LockMap {
+        let len = OFF_SLOTS + SLOT_STRIDE * slots as usize;
+        let map = memmap2::MmapOptions::new()
+            .len(len)
+            .map_anon()
+            .expect("anonymous map");
+        LockMap {
+            map: memmap2::MmapRaw::from(map),
+            slots,
+        }
+    }
+
+    /// The atomic views reach every header field and every byte of the slot
+    /// table, from several threads at once. Under miri this checks the views'
+    /// alignment, bounds and provenance, and that the slot table, padding
+    /// included, is only ever accessed atomically.
+    #[test]
+    fn atomic_views_cover_header_and_slots_across_threads() {
+        const SLOTS: u32 = 4;
+        let map = anonymous_map(SLOTS);
+        assert_eq!(map.slots().len(), SLOTS as usize);
+        // Distinct addresses, in layout order, one stride apart.
+        let base = map.slots().as_ptr() as usize;
+        assert_eq!(base, map.map.as_ptr() as usize + OFF_SLOTS);
+        assert_eq!(base % std::mem::align_of::<ReaderSlot>(), 0);
+        for (i, s) in map.slots().iter().enumerate() {
+            assert_eq!(s as *const ReaderSlot as usize, base + i * SLOT_STRIDE);
+        }
+        // Relaxed: the joins below order every access.
+        map.u64_at(OFF_MAGIC).store(LOCK_MAGIC, Ordering::Relaxed);
+        map.u32_at(OFF_FORMAT).store(LOCK_FORMAT, Ordering::Relaxed);
+        map.u32_at(OFF_MAX_READERS).store(SLOTS, Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            for i in 0..SLOTS as usize {
+                let map = &map;
+                scope.spawn(move || {
+                    let slot = &map.slots()[i];
+                    // Relaxed: each thread owns its slot; T is a counter.
+                    slot.owner().store(1000 + i as u64, Ordering::Relaxed);
+                    slot.txnid().store(i as u64, Ordering::Relaxed);
+                    map.u64_at(OFF_T).fetch_add(1, Ordering::Relaxed);
+                    // Every slot, read while the other threads write theirs.
+                    for s in map.slots() {
+                        let _ = s.txnid().load(Ordering::Relaxed);
+                    }
+                });
+            }
+            #[cfg(target_os = "linux")]
+            scope.spawn(|| {
+                map.u32_at(OFF_WRITER).fetch_or(WAITERS, Ordering::Relaxed);
+            });
+        });
+        assert_eq!(map.u64_at(OFF_T).load(Ordering::Relaxed), u64::from(SLOTS));
+        assert_eq!(map.u64_at(OFF_MAGIC).load(Ordering::Relaxed), LOCK_MAGIC);
+        assert_eq!(map.u32_at(OFF_FORMAT).load(Ordering::Relaxed), LOCK_FORMAT);
+        for (i, s) in map.slots().iter().enumerate() {
+            assert_eq!(s.owner().load(Ordering::Relaxed), 1000 + i as u64);
+            assert_eq!(s.txnid().load(Ordering::Relaxed), i as u64);
+        }
+    }
+
+    #[test]
+    fn open_error_messages_and_sources() {
+        use std::error::Error as _;
+        let io = || std::io::Error::other("boom");
+        for (err, text, has_source) in [
+            (
+                LockOpenError::AlreadyOpen,
+                "the lock file is already open in this process",
+                false,
+            ),
+            (
+                LockOpenError::Mismatch("page size".to_owned()),
+                "lock file mismatch: page size",
+                false,
+            ),
+            (
+                LockOpenError::ReadOnlyFs,
+                "the lock file is on a read-only filesystem",
+                false,
+            ),
+            (LockOpenError::from(io()), "lock file I/O error: boom", true),
+        ] {
+            assert_eq!(err.to_string(), text);
+            assert_eq!(
+                err.source().map(ToString::to_string),
+                has_source.then(|| "boom".to_owned())
+            );
+        }
+    }
 
     /// The path of a lock file in a fresh directory, which is removed with
     /// everything in it when this is dropped.
@@ -1151,6 +1184,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn first_opener_initializes_every_slot_free() {
         let path = tmp();
         let l = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 8).expect("open");
@@ -1172,6 +1206,7 @@ mod tests {
     /// A try-exclusive open with no other opener initializes the file and
     /// leaves the initializing magic; the next opener accepts it.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn try_open_exclusive_initializes_without_publishing() {
         let path = tmp();
         let data = path.with_file_name("zerodb.dat");
@@ -1191,10 +1226,10 @@ mod tests {
     }
 
     /// An initializer never shrinks the reader table of a finished lock file
-    /// from an earlier run, as LMDB
-    /// (`OBS_SOLE_OPENER_AFTER_LARGER_RUN_MAXREADERS`), grows it when asked
-    /// for more, and ignores the count of an unfinished file.
+    /// from an earlier run, as LMDB does, grows it when asked for more, and
+    /// ignores the count of an unfinished file.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn initializer_keeps_a_larger_finished_table() {
         let path = tmp();
         let data = path.with_file_name("zerodb.dat");
@@ -1221,6 +1256,7 @@ mod tests {
     /// The recorded `max_readers` is read only from a finished lock file, and
     /// never through a second descriptor of one this process has open.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn published_max_readers_reads_a_finished_file() {
         let path = tmp();
         let data = path.with_file_name("zerodb.dat");
@@ -1241,6 +1277,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn second_open_in_process_is_refused_before_any_fd() {
         let path = tmp();
         let a = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4).expect("open");
@@ -1261,6 +1298,7 @@ mod tests {
     /// `writer_lock_released_on_another_thread_admits_another_process` in
     /// `crates/zerodb/tests/multi_process.rs` covers that case.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn writer_lock_releases_from_another_thread() {
         let path = tmp();
         let l = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4).expect("open");
@@ -1277,6 +1315,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn another_spelling_of_an_open_path_is_refused() {
         let path = tmp();
         let _a = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4).expect("open");
@@ -1291,6 +1330,7 @@ mod tests {
     /// A hard link names the same file under another name. Opening it would
     /// give this process a second descriptor to its own lock file.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn a_hard_link_to_an_open_lock_file_is_refused() {
         let path = tmp();
         let _a = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4).expect("open");
@@ -1304,6 +1344,7 @@ mod tests {
 
     /// The same through a symbolic link.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn a_symlink_to_an_open_lock_file_is_refused() {
         let path = tmp();
         let _a = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4).expect("open");
@@ -1320,6 +1361,7 @@ mod tests {
     /// on forever.
     #[cfg(target_os = "linux")]
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn stale_writer_word_with_own_pid_is_taken_over() {
         let path = tmp();
         let l = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4).expect("open");
@@ -1338,6 +1380,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn page_size_rebind_with_another_value_fails() {
         let path = tmp();
         let l = LockFile::open(&path, &path.with_file_name("zerodb.dat"), 4).expect("open");
@@ -1379,6 +1422,7 @@ mod tests {
     /// An initializer killed after writing the initializing magic leaves it in
     /// the file; the next opener accepts the file and initializes it.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn crashed_initializer_with_provisional_magic_is_reinitialized() {
         let path = tmp();
         let mut bytes = vec![0xA5u8; OFF_SLOTS + 4 * SLOT_STRIDE];
@@ -1394,6 +1438,7 @@ mod tests {
     /// k ≥ 1 slots, for any k (here not this `max_readers`). The slot area
     /// holds garbage.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn all_zero_lock_header_is_reinitialized() {
         for len in [
             8usize,
@@ -1422,6 +1467,7 @@ mod tests {
     /// is free. The file is not truncated: its length is unchanged, and a
     /// marker in a slot's unused bytes, which nothing rewrites, survives.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn finished_file_is_rebuilt_in_place_without_stale_fields() {
         use std::os::unix::fs::FileExt;
         let path = tmp();
@@ -1478,6 +1524,7 @@ mod tests {
     /// it grows a shorter one, and cuts back a longer all-zero one that
     /// records no table.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn initializer_sets_the_exact_length() {
         let exact = |n: usize| (OFF_SLOTS + n * SLOT_STRIDE) as u64;
         let path = tmp();
@@ -1499,6 +1546,7 @@ mod tests {
     /// step order, since zeroing the header before setting the length would
     /// take a new, empty file through length 256, which the guard refuses.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn rebuild_interrupted_after_each_step_is_reinitialized() {
         let finished = |n: u32| {
             let path = tmp();
@@ -1577,6 +1625,7 @@ mod tests {
     /// An all-zero file whose length no initializer leaves is refused
     /// untouched: each length sits just off an accepted one.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn all_zero_file_of_another_length_is_refused() {
         for len in [
             1usize,
@@ -1601,6 +1650,7 @@ mod tests {
     /// file (`0xBEEFC0DE` at byte 0), both with an otherwise zero, otherwise
     /// accepted length.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn foreign_file_is_refused_without_truncating() {
         let mut zero_but_one = vec![0u8; 4096];
         zero_but_one[OFF_SLOTS - 1] = 1;
@@ -1640,6 +1690,7 @@ mod tests {
     /// A lock path that is a hard link to the data file is refused before
     /// anything is written, and the link is not removed.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn lock_file_that_is_the_data_file_is_refused() {
         let path = tmp();
         let data = data_of(&path);
@@ -1656,6 +1707,7 @@ mod tests {
     /// portable stand-in for a case-insensitive name), the refusal removes the
     /// empty file it created.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn a_created_lock_file_that_is_the_data_file_is_removed() {
         let path = tmp();
         let data = data_of(&path);
@@ -1667,6 +1719,7 @@ mod tests {
     /// A missing data file cannot be the lock file: the check is skipped and
     /// the open initializes as usual.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn missing_data_file_skips_the_same_file_check() {
         let path = tmp();
         assert!(!data_of(&path).exists());
@@ -1696,6 +1749,7 @@ mod tests {
     /// by this test, a drop on another thread must not get as far as closing
     /// the descriptor.
     #[test]
+    #[cfg_attr(miri, ignore = "opens real files, which miri isolation forbids")]
     fn an_unlinked_lock_file_closes_and_unregisters_atomically() {
         use std::os::unix::fs::MetadataExt;
         let path = tmp();

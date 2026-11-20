@@ -23,6 +23,37 @@ fn barrier(
     })
 }
 
+/// After a failed meta write (C4) or meta barrier (C5): put the bytes the
+/// slot held before C4 back, then poison the env (SPEC 06 REC-13, ADR-0047).
+///
+/// The failed write may have left the new meta in the page cache (a short
+/// write that carried the whole encoded meta, or a complete write whose
+/// barrier failed). Left there, a reopen would read a commit that reported
+/// failure, and the next writer of this or another process would reuse its
+/// txnid on the older snapshot and could overwrite the pages it references.
+/// The restore is a best effort: its own errors are ignored, since the env
+/// is poisoned either way, and the barrier after it is attempted only when
+/// the commit would have synced its meta.
+fn restore_meta_slot(
+    inner: &crate::env::EnvInner,
+    ranged: bool,
+    async_flush: bool,
+    sync_meta: bool,
+    psize: u32,
+    slot: u64,
+    prev: &[u8],
+) {
+    let backing = inner.backing_ref();
+    if backing.write_at_page(slot, psize, prev).is_ok() && sync_meta {
+        let _ = if ranged {
+            backing.sync_pages(async_flush, psize, &[(slot, 1)])
+        } else {
+            backing.sync(async_flush)
+        };
+    }
+    inner.poison();
+}
+
 impl<'env> RwTxn<'env> {
     /// Commit (SPEC 04 TXN-58/61): run the pipeline; on success the new meta
     /// is durable and published. Consumes the txn; the write mutex is released
@@ -32,8 +63,8 @@ impl<'env> RwTxn<'env> {
     ///
     /// - [`MdbError::BadTxn`] if a mid-mutation failure poisoned the txn (the
     ///   commit is an implicit abort).
-    /// - [`Error::Io`] on a write/fsync failure — a failed **fsync** also
-    ///   poisons the env (SPEC 06 REC-13).
+    /// - [`Error::Io`] on a write/fsync failure — a failed **fsync** or
+    ///   **meta write** also poisons the env (SPEC 06 REC-13).
     /// - [`Error::Io`] when this is the first commit of a `PREV_SNAPSHOT`
     ///   env with a lock file and letting other processes in (the lock-file
     ///   downgrade) fails after the meta write (ADR-0023). The
@@ -49,7 +80,8 @@ impl<'env> RwTxn<'env> {
         // be gone before anything commits. Compile-time this is guaranteed —
         // `commit(self)` is by-value, so a live child's `&self` borrow makes
         // the call unrepresentable; the runtime check backstops lifetime
-        // erasure (oracle/FFI) and `mem::forget`-leaked children.
+        // erasure through `unsafe` code or FFI, and `mem::forget`-leaked
+        // children.
         // Checked before `is_unchanged` too: a leaked child must block even a
         // no-op commit, keeping the degradation mode uniform (always BadTxn).
         if self.children.live() != 0 {
@@ -127,7 +159,7 @@ impl<'env> RwTxn<'env> {
         // map-resident at their final offsets, so `write_frames` writes
         // nothing for them — C2 reduces to the heap frames (none, in pure
         // in-map txns) and the C3 `msync` barrier makes the in-place stores
-        // durable exactly as it made the commit-time `memcpy`s durable.
+        // durable.
         let mut pgnos = std::mem::take(&mut work_mut!(self).pgnos);
         self.dirty.sorted_pgnos_into(&mut pgnos);
         self.write_frames(&pgnos)?;
@@ -136,8 +168,8 @@ impl<'env> RwTxn<'env> {
         // torn) pages are unreferenced garbage (REC-6 H1).
 
         // ----- C3: fsync(data) — MUST complete before C4 (REC-7). Skipped
-        // under NO_SYNC/MAP_ASYNC-none (SPEC 06 REC-9): the pages are written
-        // (C2) but not made durable this commit. -----
+        // under NO_SYNC (SPEC 06 REC-9): the pages are written (C2) but not
+        // made durable this commit. -----
         // Under WRITE_MAP the barrier is a ranged `msync` (SPEC 06 REC-12) of
         // the used prefix `[0, next_pgno)`, as LMDB's: every page any snapshot
         // up to this one can reference, which includes both meta slots (the
@@ -176,6 +208,17 @@ impl<'env> RwTxn<'env> {
             main_db: self.main_db,
             fl_count: annex.len() as u32,
         };
+        // The slot's current bytes (an older commit's meta), kept for
+        // `restore_meta_slot`. A failed read fails the commit before C4,
+        // with the slot untouched.
+        let prev = &mut work.meta_prev;
+        if prev.len() != psize as usize {
+            *prev = vec![0u8; psize as usize];
+        }
+        inner
+            .backing_ref()
+            .read_meta_copy(slot, psize, prev)
+            .map_err(Error::Io)?;
         // The page buffer is the carried one (`WriterCarry::meta_buf`): only
         // the encoded prefix is written, and cleared again after the write,
         // so a commit neither allocates nor zeroes a whole page here.
@@ -193,7 +236,20 @@ impl<'env> RwTxn<'env> {
                 inner
                     .backing_ref()
                     .write_at_page(slot, psize, buf)
-                    .map_err(Error::from)
+                    .map_err(|e| {
+                        // A failed or short meta write may have changed the
+                        // slot (REC-13, ADR-0047).
+                        restore_meta_slot(
+                            inner,
+                            ranged,
+                            async_flush,
+                            sync_meta,
+                            psize,
+                            slot,
+                            &work.meta_prev,
+                        );
+                        Error::from(e)
+                    })
             });
         buf[..work.meta_dirty].fill(0);
         work.meta_dirty = 0;
@@ -211,8 +267,20 @@ impl<'env> RwTxn<'env> {
         // fsynced the data. -----
         if sync_meta {
             // Ranged: the meta slot C4 wrote; C3 already made every data
-            // page durable.
-            barrier(inner, ranged, async_flush, psize, (slot, 1))?;
+            // page durable. On failure the new meta is in the page cache:
+            // take it back out (REC-13, ADR-0047).
+            if let Err(e) = barrier(inner, ranged, async_flush, psize, (slot, 1)) {
+                restore_meta_slot(
+                    inner,
+                    ranged,
+                    async_flush,
+                    sync_meta,
+                    psize,
+                    slot,
+                    &work_mut!(self).meta_prev,
+                );
+                return Err(e);
+            }
         }
         inner.run_hook(HookPoint::H4);
         // Crash here: `N` durable and selected (REC-6 H4).
@@ -232,17 +300,16 @@ impl<'env> RwTxn<'env> {
 
         // ----- The first commit of a `PREV_SNAPSHOT` open that holds the
         // election is durable but not published, as LMDB's (ADR-0023): C5a
-        // and C6 are skipped,
-        // because the next commit reuses this txnid (TXN-2) and builds on the
-        // older snapshot. The election is finished instead, letting waiting
-        // processes join. -----
+        // and C6 are skipped, because the next commit reuses this txnid
+        // (TXN-2) and builds on the older snapshot. The election is finished
+        // instead, letting waiting processes join. -----
         if inner.holds_election() {
             return inner.finish_held_election(snapshot);
         }
 
         // ----- C5a: seed the env-wide validated-pages cache (ADR-0018;
-        // SPEC 04 TXN-38). Every frame C2 wrote is
-        // engine-authored, stamped with this txnid, and now final: C5 is
+        // SPEC 04 TXN-38). Every frame C2 wrote is engine-authored,
+        // stamped with this txnid, and now final: C5 is
         // done, the commit can no longer fail, and txnid `N` is consumed
         // forever — so `(pgno, N)` names exactly these bytes for the env's
         // life. Sits after C5 so a failed commit (whose txnid the next
@@ -262,8 +329,8 @@ impl<'env> RwTxn<'env> {
                     "every committed frame carries the committing txnid (ADR-0018)"
                 );
                 let kind = match crate::page::page_type_of(crate::page::read_flags(bytes)) {
-                    Ok(PageType::Leaf) => crate::stamps::StampKind::Leaf,
-                    Ok(PageType::Branch) => crate::stamps::StampKind::Branch,
+                    Ok(PageType::Leaf) => crate::btree::PageKind::Leaf,
+                    Ok(PageType::Branch) => crate::btree::PageKind::Branch,
                     // Overflow runs are not cacheable; meta pages are never
                     // dirty frames. `Err` is unreachable for engine-authored
                     // frames but must not fail an already-durable commit.

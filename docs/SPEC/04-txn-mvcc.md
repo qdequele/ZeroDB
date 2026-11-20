@@ -674,6 +674,16 @@ dirty-page store must be built so it is.
   unmapped or moved while any txn is live (§7 close is deferred), and (b) the
   reader's pin (§3) stops the writer reclaiming the pages. Nothing a `RoTxn` can
   do invalidates its own read borrows.
+  **Borrows cover only the pages read (amended 2026-11-20, ADR-0021
+  amendment 1):** every borrow of the map, a reader's or the writer's, covers
+  exactly the page, overflow run or value it resolves, never the whole map or
+  a range up to the high-water. The engine holds the map as a page-bounded
+  handle (`zerodb_core::page::MapPages`) built from the mapping's raw pointer.
+  The writer stores into free pages below every snapshot's high-water (TXN-62,
+  in place under TXN-45b, by `pwrite` otherwise); a borrow spanning them would
+  assert bytes unchanged that do change, which Rust's aliasing rules forbid
+  even when they are never read. The raw environment copy, which does read
+  free pages, hands the kernel the map's address instead of a borrow.
 - **TXN-38** — `RwTxn::get` / cursor reads return bytes from **whichever storage
   currently backs the page**:
   - a page the write txn has **not** touched → borrowed from the read-only mmap
@@ -686,8 +696,10 @@ dirty-page store must be built so it is.
   **High-water bound (added 2026-09-09, security review H1):** every
   committed-map resolution — a reader's, or the writer's map fallback — refuses
   a pgno above the pinned snapshot's `last_pg` with a typed error
-  (`PageError::PageOutOfBounds`), and clamps multi-page (overflow-run) slices
-  at that bound. The mapping covers the full `map_size` (ADR-0004 D4), so map
+  (`PageError::PageOutOfBounds`). An overflow run is resolved as the
+  `⌈(HEADER_SIZE + dsize) / psize⌉` pages its value needs, cut at that bound
+  (and at the end of the map), so a run crossing it reaches the overflow
+  decoder short and fails as it did when map slices extended to the bound. The mapping covers the full `map_size` (ADR-0004 D4), so map
   bytes past the real file end are unbacked: a corrupt/hostile reference there
   must fail typed, not SIGBUS (SPEC 06 REC-14). Dirty frames are exempt — a
   writer legitimately allocates pages beyond its base snapshot's `last_pg`,
@@ -923,17 +935,14 @@ spilling bullet there.)
   in-place realization (TXN-45b, ADR-0021), at the in-place stores of this
   txn's own dirty frames (allocation/edit time) — and **every spill resets
   the writer's validated-pages memo**, so a memo entry never outlives the
-  bytes it vouched for. **Writer view re-derivation (amended 2026-10-02,
-  ADR-0021 B2/M1):** the writer's whole-map `&[u8]` read view is re-derived
-  from the backing at every spill — a view predating a page's write must
-  never serve it (under Stacked/Tree Borrows the write invalidates the stale
-  borrow at exactly the written locations) — and under the in-place
-  realization the view is not cached at all but borrowed lazily per access,
-  like a reader's (TXN-45b writes happen mid-txn, and under Stacked Borrows
-  even *copying* a stale whole-map reference after one is undefined behavior
-  at the written locations; caught by miri on the heap-backed test map,
-  `zerodb-core/tests/writemap_in_place_miri.rs`). The resolution hot path is
-  unchanged
+  bytes it vouched for. **Writer view (amended 2026-11-20, ADR-0021
+  amendment 1; was re-derived per spill, ADR-0021 B2/M1):** the writer keeps
+  the map as the page-bounded handle of TXN-37 in every mode, and every
+  borrow it takes covers only the page or run it reads, so no borrow ever
+  spans a page before that page is rewritten by a spill or an in-place
+  store, and nothing needs re-deriving (checked by miri on the heap-backed
+  test map, `zerodb-core/tests/writemap_in_place_miri.rs`). The resolution
+  hot path is unchanged
   (performance item B13: an extra spilled-page lookup inlined into every descent cost
   read rungs 3–13 %). Nested read children read through the same source; no
   spill runs while one is live (TXN-29 guard precedes the check).
@@ -1065,15 +1074,13 @@ spilling bullet there.)
     function mints `&mut [u8]` from `&self`. The sole sanctioned caller is
     `zerodb-core::dirty::map_mut`, whose `SAFETY` block discharges the
     contract — single writer (TXN-6), TXN-62 target, exactly one live
-    `&mut` per region tied to `&mut DirtyStore` and never stored, and the
-    whole-map read view re-derived per spill / borrowed per access
-    (TXN-71 as amended).
-  - **The writer's whole-map view is lazy.** Because in-place stores mutate
-    map bytes mid-txn, the write txn holds **no** cached whole-map `&[u8]`
-    in this mode; `get`/descent resolutions borrow the view per access, as
-    readers do (TXN-71 as amended; ADR-0021 M1 — under Stacked Borrows a
-    cached reference field is re-asserted on every move of the txn, which
-    is UB at in-place-written locations).
+    `&mut` per region tied to `&mut DirtyStore` and never stored, and no
+    borrow of the map, the writer's or a reader's, covering the region
+    (TXN-37 and TXN-71 as amended).
+  - **No whole-map view.** The write txn holds the map as the page-bounded
+    handle of TXN-37, never a whole-map `&[u8]`: in-place stores mutate map
+    bytes mid-txn, and a reference spanning them is UB even if the stored
+    bytes are never read through it (ADR-0021 M1 and amendment 1).
   - **Release-mode TXN-62 guard (ADR-0021 M2).** Every pgno the allocator
     returns in this mode is checked `pgno > committed_last_pg ∨ pgno ∈
     reclaimed` (each page of a run) **in release builds**, failing with a
@@ -1094,8 +1101,7 @@ spilling bullet there.)
   one-page frame in the map at the pgno itself, or any other frame (an
   overflow-run head). Every change to the index updates them. The write
   txn's page source answers "is this page dirty?" from them, and slices a
-  one-page dirty frame from its own whole-map view without probing the
-  index, as LMDB reads a dirty page at `map + pgno * psize`. The dirty / map
+  one-page dirty frame from its map handle without probing the index, as LMDB reads a dirty page at `map + pgno * psize`. The dirty / map
   classification the memo relies on (above) is unchanged. The bits are not
   carried to the next write txn, and heap modes never build them.
 
@@ -1246,6 +1252,16 @@ spilling bullet there.)
 - **TXN-58** — **commit** (`RwTxn::commit`): assert `child_count == 0` (TXN-33),
   then run the commit pipeline (§9), which hands off to SPEC 06 for durability.
   On success the new meta is live (TXN-3/TXN-19) and the write mutex is released.
+- **TXN-74 (unchanged commit)** — A commit whose txn changed nothing (no
+  dirty or spilled page, no freed, loose or reclaimed page, no catalog
+  write-back, the same `main_db`, `free_db` and `next_pgno` as its base)
+  returns `Ok` without running the pipeline: it writes no meta, publishes
+  nothing and consumes no txnid, as LMDB skips a commit whose txn is not
+  `MDB_TXN_DIRTY`. A `clear` of the main database counts as a change even
+  when the database was already empty, because LMDB's `mdb_drop` marks the
+  txn dirty unconditionally: that commit runs the pipeline and takes a new
+  txnid. (A `clear` of a named database already counts, through its catalog
+  write-back.) Observed by the oracle's `noop_clear_commit_advances_txn_id`.
 - **TXN-59** — **abort** (`RwTxn::abort`, also used as a pure write-lock release,
   SPEC 00 row 28): drop the dirty set and freed-page list, discard the working
   `DBRecord`s, make **no** disk change (the live meta is untouched), release the
@@ -1266,7 +1282,7 @@ spilling bullet there.)
 | allocation exceeds map_size | `MdbError::MapFull` | SPEC 02 §8, SPEC 05 GC-17 |
 | txn begin: snapshot beyond this env's map_size (another process grew the data) | `MdbError::MapResized` | SPEC 02 §8, ADR-0023 amendment 15 |
 | nested write txn attempt | unsupported (D-003) | TXN-40 |
-| fsync failed (poisoned) | `Error::Io` / poisoned | SPEC 06 REC-13 |
+| fsync failed, or meta write (C4) failed (poisoned) | `Error::Io` / poisoned; a failed C4 or C5 restores the meta slot | SPEC 06 REC-13, ADR-0047 |
 
 ---
 
@@ -1288,7 +1304,7 @@ every hook; this section defines the steps and their ordering. Both write modes
   | C1 | **freelist_save** (SPEC 05 §4): apply drain rewrites to the GC DB (dirtying GC pages into the dirty set, loop-until-stable, SPEC 05 GC-11) and place this txn's freed set — into the meta free-list annex when it fits (format v2, SPEC 05 §2a GC-32: stashed for C4, no tree write), else into the GC DB as records keyed `(N, seq)` (format v3, SPEC 05 GC-5). | H0 | `N−1` (all changes still in dirty set, nothing written). |
   | C2 | **write dirty pages** to their pgnos (`pwrite` each dirty frame; memcpy-into-map under heap-staged WRITE_MAP, TXN-45a; a no-op per in-map frame under in-place WRITE_MAP, TXN-45b — those bytes were stored at allocation/edit time, under the same TXN-62 invariant). Not yet durable. | **H1** | `N−1` live; new pages sit in free/beyond-HWM slots the `N−1` tree does not reference (TXN-62). Partial/torn data pages are unreferenced garbage. |
   | C3 | **fsync(data)** — flush all data pages (skipped under `NO_SYNC`/`MAP_ASYNC`, SPEC 06 REC-6). | **H2** | `N−1` live; txn `N`'s data fully durable but unreferenced (no meta points at it). |
-  | C4 | **write meta** to slot `N&1` (the *older* slot), with `txnid = writer_txnid`, the C1-stashed free-list annex (format v2, SPEC 02 §3) and a fresh CRC covering both (SPEC 02 §3.3). Not yet durable. | **H3** | Either `N−1` (meta `N` not yet reached disk, or reached but torn → CRC rejects it → older slot wins) or `N` (meta reached disk intact). Never a torn meta accepted. |
+  | C4 | **write meta** to slot `N&1` (the *older* slot), with `txnid = writer_txnid`, the C1-stashed free-list annex (format v2, SPEC 02 §3) and a fresh CRC covering both (SPEC 02 §3.3). Not yet durable. The slot's previous bytes are copied first; if C4 or C5 fails they are written back and the env is poisoned (SPEC 06 REC-13). | **H3** | Either `N−1` (meta `N` not yet reached disk, or reached but torn → CRC rejects it → older slot wins) or `N` (meta reached disk intact). Never a torn meta accepted. |
   | C5 | **fsync(meta)** — flush the meta page (skipped under `NO_META_SYNC`/`NO_SYNC`: the meta is written but not fsynced this commit, SPEC 06 REC-6/REC-7/REC-9). | **H4** | txn `N` durable and live. |
   | C6 | Publish the new snapshot (TXN-18/TXN-19): swap the `Arc<Snapshot>`, then `commit_point.store(writer_txnid, SeqCst)`; update `last_committed_txnid`; release the write mutex. | — | commit complete; new readers see `N`. |
 
@@ -1442,7 +1458,7 @@ every hook; this section defines the steps and their ordering. Both write modes
 
 **Rule count: TXN-1 … TXN-67 (67 normative rules; §4.4 adds sub-rule TXN-18a for
 slot release), plus the later TXN-68 … TXN-72 (§6.3a), TXN-73 (§4.4, added
-2026-10-13), LCK-1 … LCK-11 (§12, added 2026-10-13) and DBI-1 … DBI-10 (§13,
+2026-10-13), TXN-74 (§8, added 2026-11-20), LCK-1 … LCK-11 (§12, added 2026-10-13) and DBI-1 … DBI-10 (§13,
 added 2026-10-17).** TXN-40 (nested write unsupported, D-003) is referenced from
 §5/§8 and defined here:
 
@@ -1477,8 +1493,9 @@ design follows LMDB's lock file in technique (a first-opener election, PID
 liveness by record locks, a shared reader table), not in byte layout: the
 file is ZeroDB's own format, never LMDB's. Normative rules are numbered
 **LCK-n**. Implementation: `zerodb-io::lockfile` (the file, its record locks
-and the futex), `zerodb-core::shared` (the safe interface the core sees) and
-`zerodb-core::readers` (the slot protocol).
+and the futex), `zerodb-core::shared` (the safe interface the core sees),
+`zerodb-core::readers` (the slot protocol) and `zerodb-core::writer_word` (the
+Linux writer word of LCK-4, model-checked with loom).
 
 - **LCK-1 — First-opener election (ADR-0023 §1, amendments 2 and 10).** Every
   opener takes POSIX `fcntl` record locks, which belong to the process. On
@@ -1677,8 +1694,14 @@ against LMDB unless it says so.
   record lock that reports no previous owner (LCK-4), so a writer that
   follows a dead writer does not free dead readers' slots; only
   `clear_stale_readers` and the next initializer do. LMDB's writer takeover
-  was observed on Linux only (amendment 12); its macOS behavior is
-  unobserved.
+  reaps on macOS as on Linux: its SysV semaphore keeps a `locked` flag that
+  the next owner finds still set and reports as a dead owner
+  (`lmdb_reaping_observation.rs::observe_writer_takeover`, which runs on
+  both). This is a behavior difference on macOS, recorded as D-028 (Proposed):
+  `multi_process_differential.rs::killed_writer_takeover_matches_lmdb` fails
+  there (ZeroDB still lists the dead reader, LMDB does not) and therefore
+  runs on Linux only. Matching LMDB needs a change to the macOS writer lock
+  and so an ADR-0023 amendment.
 - **`Env::sync` takes only the in-process writer lock.** A sync in one
   process serializes with this process's commits, not with a commit in
   another process. Whether LMDB's `mdb_env_sync` takes its writer mutex is

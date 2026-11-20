@@ -9,7 +9,7 @@
 //!
 //! The **engine** deliberately does no fallback probing: it opens exactly the
 //! name it was configured with, so the adapter always reads the name it writes
-//! (ADR-0010 §Options D3). The **tools** are read paths where a wrong guess is
+//! (ADR-0010). The **tools** are read paths where a wrong guess is
 //! recoverable and an operator should not have to know which stack wrote the
 //! env, so they probe both names — and treat *both present* as a hard error
 //! rather than silently picking one, because the two files would be two
@@ -104,7 +104,7 @@ pub fn resolve(env_dir: &Path) -> Result<EnvDataFile, NameError> {
 /// Returns `None` if the file is too short to hold a meta header. Used for
 /// engine identification in `stat` and for the `migrate-from-lmdb` mismatch
 /// error — the magic, not the file name, is the authoritative discriminator
-/// (ADR-0010 §Options D2).
+/// (ADR-0010).
 ///
 /// # Errors
 ///

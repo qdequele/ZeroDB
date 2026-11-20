@@ -100,7 +100,7 @@ fn crc_update(crc: u32, bytes: &[u8]) -> u32 {
 /// [`HW_CHUNK_WORDS`] words are therefore cut into chunks of three equal
 /// blocks, checksummed side by side as three independent streams and joined
 /// with [`crc_shift`]: the standard interleaving of hardware CRC
-/// implementations (ADR-0031 Option D). The result is bit-identical to one
+/// implementations (ADR-0031). The result is bit-identical to one
 /// stream.
 #[cfg(all(target_arch = "aarch64", not(miri)))]
 #[target_feature(enable = "crc")]
@@ -223,11 +223,11 @@ fn crc_shift(crc: u32, table: &ShiftTable) -> u32 {
         ^ table[3][(crc >> 24) as usize]
 }
 
-/// The table path, slicing-by-8: each 8-byte block is XORed into the state and folded through
-/// eight table lookups that do not depend on each other, then the last
-/// `len % 8` bytes go through the byte-wise step. The result is bit-identical
-/// to the byte-wise algorithm (pinned by the tests below), about five times
-/// faster on the meta CRC that every commit computes.
+/// The table path, slicing-by-8: each 8-byte block is XORed into the state
+/// and folded through eight table lookups that do not depend on each other,
+/// then the last `len % 8` bytes go through the byte-wise step. The result is
+/// bit-identical to the byte-wise algorithm and faster, which matters because
+/// every commit computes the meta CRC.
 #[inline]
 fn crc_update_table(mut crc: u32, bytes: &[u8]) -> u32 {
     let (blocks, tail) = bytes.as_chunks::<8>();

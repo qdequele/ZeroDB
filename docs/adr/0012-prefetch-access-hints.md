@@ -164,7 +164,7 @@ Tests / invariants:
   — same key/cursor results with and without the call (parity must not move).
 - A unit test that `will_need` on an out-of-map slice is a benign no-op/err (no
   UB, no panic) and that an in-map value advises `len`-covering pages.
-- Bench (required by AGENTS.md for the perf claim): hannoy cold-cache search
+- Bench (required by CONTRIBUTING.md for the perf claim): hannoy cold-cache search
   latency with vs without `will_need`, on linux-aarch64 + EBS gp3 (drop caches
   between runs). No claim ships without the criterion/latency diff pasted in the
   summary.

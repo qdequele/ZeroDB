@@ -195,18 +195,16 @@ fn clear_then_read() {
     assert_matches_lmdb::<ZerodbEngine>(&ops);
 }
 
-/// Regression for a harness drift: a `Reopen` is a txn boundary, so
-/// both engines must reset their `cleared_in_txn` FORK-1-guard fact there. If
-/// only one does, a later `PutFlagged { Append }` makes the shared `classify`
-/// guard fire asymmetrically (`KnownForkBug` vs `NoDb`).
+/// A `Reopen` mid-txn drops the txn and every handle on both engines: a
+/// later `APPEND` put after a clear then skips as `NoDb` on both.
 #[test]
-fn reopen_resets_cleared_in_txn_guard() {
+fn reopen_after_clear_drops_handles_on_both_engines() {
     let ops = vec![
         Op::BeginRw,
         Op::create_db(DbName::Unnamed),
-        Op::ClearDb { db: 0 }, // sets cleared_in_txn on both engines
-        Op::reopen(0),         // must reset it on both
-        // dbs are now empty on both → NoDb, not KnownForkBug.
+        Op::ClearDb { db: 0 },
+        Op::reopen(0),
+        // dbs are now empty on both → NoDb.
         Op::put_flagged(0, b"a", b"1", PutFlag::Append),
     ];
     assert_matches_lmdb::<ZerodbEngine>(&ops);

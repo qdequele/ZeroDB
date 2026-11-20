@@ -3,7 +3,7 @@
 - Status: **Accepted (Option A, maintainer, 2026-10-19), implemented.** It
   changes which bytes a committed page carries in its free gap (never read,
   but written to disk), so it was decided before it was implemented
-  (AGENTS.md rule 5). A spike measured it first (rule 6).
+  (CONTRIBUTING.md rule 5). A spike measured it first (rule 6).
 - Related issue: none yet. Background:
   the 2026-10-19 "crud scan count and batch delete" run.
 - Date: 2026-10-19

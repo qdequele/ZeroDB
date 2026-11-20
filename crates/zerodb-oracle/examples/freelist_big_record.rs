@@ -1,4 +1,4 @@
-//! Small-commit cost after one large delete, LMDB vs ZeroDB (issue #30).
+//! Small-commit cost after one large delete, LMDB vs ZeroDB.
 //!
 //! One transaction clears a database of `pages` overflow pages, so its
 //! freed-page list is too long for the meta page and goes to the free-page

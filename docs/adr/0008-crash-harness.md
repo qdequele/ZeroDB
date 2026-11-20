@@ -447,7 +447,7 @@ model bugs during bring-up (D6's traps firing as designed):
 4. **PRNG:** in-house splitmix64/xoshiro256** in the harness (bit-stable
    forever, ~20 lines of test-only code) vs allowlisted `rand::StdRng`
    (lockfile-stable only). Recommended: in-house; needs your sign-off since
-   AGENTS.md prefers the allowlist.
+   CONTRIBUTING.md prefers the allowlist.
 5. **CI budget:** `crash-test-full` (10k cycles) target wall time and venue —
    nightly on the Graviton runner alongside fuzz-long (recommended), with
    `crash-test-quick` (200) in the per-milestone gate?

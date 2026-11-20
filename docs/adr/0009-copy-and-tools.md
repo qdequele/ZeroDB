@@ -67,7 +67,7 @@ tool invocation (or any process that flocks the file), **not** the engine itself
 so the guard is one `libc::flock` FFI call (SAFETY-commented) in
 `zerodb-tools::lock`. **This expands the unsafe policy** (which lists
 only `zerodb-core::{page,readers}`, `zerodb-io`, and `zerodb-oracle`) to
-`zerodb-tools` — flagged for a human to record in AGENTS.md. `zerodb-core`
+`zerodb-tools` — flagged for a human to record in CONTRIBUTING.md. `zerodb-core`
 remains `#![forbid(unsafe_code)]`.
 
 ## Decision — dump format
@@ -90,6 +90,6 @@ off-by-default `migrate-lmdb` feature (ADR-0001 M1.12 amendment).
   map_bytes}`; `Cursor::current_flags`.
 - `zerodb-tools` becomes a lib + bin; gains `libc` (flock) and, behind
   `migrate-lmdb`, `heed`.
-- Human review items: the ADR-0001 amendment ratification line; the AGENTS.md
+- Human review items: the ADR-0001 amendment ratification line; the CONTRIBUTING.md
   unsafe-policy expansion for `zerodb-tools` flock; the copy's concurrent-writer
   argument.

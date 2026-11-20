@@ -18,8 +18,8 @@ meta pages with a **mandatory** CRC (torn-meta detection is Phase 1); a common
 page header carrying the writer txnID stamp (feeds Phase 3.10) and a reserved
 data-page checksum field (Phase 3.9); DUPSORT format hooks reserved but
 unimplemented (D-004, Phase 2.8); observable max key = 511 bytes and empty key
-rejected (SPEC 01 §S4); no `#[repr(C)]` casting of unaligned data (AGENTS.md).
-LMDB fork sources were read for algorithmic understanding only (AGENTS.md rule
+rejected (SPEC 01 §S4); no `#[repr(C)]` casting of unaligned data (CONTRIBUTING.md).
+LMDB fork sources were read for algorithmic understanding only (CONTRIBUTING.md rule
 4); no C was transliterated.
 
 ## Decisions
@@ -30,7 +30,7 @@ CRC32C, polynomial `0x1EDC6F41` (reflected in/out, init/final `0xFFFFFFFF`).
 Used for the **mandatory meta CRC** (Phase 1) and the **reserved data-page
 checksum** field (Phase 3.9). Phase 1 implementation is a software table; Phase
 3.9 switches to the ARMv8-A `crc32c*` hardware instructions (primary target is
-Graviton — AGENTS.md), which compute exactly this polynomial. (Update
+Graviton — CONTRIBUTING.md), which compute exactly this polynomial. (Update
 2026-10-19: the meta CRC takes those instructions on aarch64 CPUs that have
 them, with the table as fallback — ADR-0031.)
 

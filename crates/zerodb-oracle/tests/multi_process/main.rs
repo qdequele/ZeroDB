@@ -3,4 +3,5 @@
 
 mod lmdb_reaping_observation;
 mod lmdb_stage3_observation;
+mod mp_generated;
 mod multi_process_differential;

@@ -37,7 +37,7 @@
 //!   file's first `(last_pg + 1) × page_size` bytes, which std performs with
 //!   `copy_file_range`, which these filesystems turn into a block clone
 //!   (reflink). Elsewhere `copy_file_range` copies bytes through a pipe,
-//!   measured slower than streaming from the map, so the copy streams.
+//!   which is slower than streaming from the map, so the copy streams.
 //! - **Clone** (macOS, a copy to a path without a progress callback):
 //!   `std::fs::copy` of the whole file, which std performs with
 //!   `fclonefileat` (an APFS clone that shares the file's blocks), and with
@@ -72,13 +72,14 @@ use std::path::{Path, PathBuf};
 use zerodb_core::builder::{EnvStream, PageSink, StreamBuildError, DEFAULT_FILL_PERMILLE};
 use zerodb_core::env::Env;
 use zerodb_core::error::{Error, MdbError, Result};
-use zerodb_core::page::FIRST_DATA_PGNO;
+use zerodb_core::page::{MapPages, FIRST_DATA_PGNO};
 use zerodb_core::page::{MetaPage, FORMAT_VERSION, F_SUBDATA, MAGIC};
 use zerodb_core::{for_each_entry_flagged, named_databases, RoTxn};
 
-/// Whether [`CopyToFile::copy_to_file`] compacts (`heed::CompactionOption`). `Enabled` rewrites into a fresh, densely-packed env with no
-/// free pages (`MDB_CP_COMPACT`); `Disabled` copies the snapshot's pages
-/// verbatim, keeping the freelist.
+/// Whether [`CopyToFile::copy_to_file`] compacts (`heed::CompactionOption`).
+/// `Enabled` rewrites into a fresh, densely-packed env with no free pages
+/// (`MDB_CP_COMPACT`); `Disabled` copies the snapshot's pages verbatim,
+/// keeping the freelist.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionOption {
     /// Rewrite into a fresh compact env (bottom-up packed, no free pages).
@@ -240,6 +241,51 @@ impl CopyToFile for Env {
     }
 }
 
+/// Where a copy writes its image: `write_all_at` on the destination file.
+/// Every public copy writes the file itself ([`plain_dest`]); tests wrap it
+/// to make chosen writes fail (I/O-error injection). The file-copy and clone
+/// routes also move bytes through the file directly (`std::io::copy`,
+/// `std::fs::copy`), outside this seam.
+trait ImageDest: Sync {
+    /// Write all of `buf` at byte offset `off`.
+    fn write_all_at(&self, buf: &[u8], off: u64) -> std::io::Result<()>;
+
+    /// Write the `len` bytes of `map` at byte offset `src` at byte offset
+    /// `off`, without lending them as a `&[u8]` (the raw copy's data pages,
+    /// free pages included; [`zerodb_io::write_map_range`]).
+    fn write_map_range(
+        &self,
+        map: MapPages<'_>,
+        src: usize,
+        len: usize,
+        off: u64,
+    ) -> std::io::Result<()>;
+}
+
+impl ImageDest for &File {
+    fn write_all_at(&self, buf: &[u8], off: u64) -> std::io::Result<()> {
+        FileExt::write_all_at(*self, buf, off)
+    }
+
+    fn write_map_range(
+        &self,
+        map: MapPages<'_>,
+        src: usize,
+        len: usize,
+        off: u64,
+    ) -> std::io::Result<()> {
+        zerodb_io::write_map_range(self, map, src, len, off)
+    }
+}
+
+/// How a copy turns its destination file into an [`ImageDest`].
+type WrapDest<'w> = &'w dyn for<'f> Fn(&'f File) -> Box<dyn ImageDest + 'f>;
+
+/// The destination file itself, unwrapped.
+fn plain_dest(file: &File) -> Box<dyn ImageDest + '_> {
+    Box::new(file)
+}
+
 /// The body of [`CopyToFile::copy_to_file_with_progress`]; `pick` chooses how
 /// a raw copy moves its pages (tests force each route through it).
 fn copy_to_path(
@@ -248,6 +294,18 @@ fn copy_to_path(
     option: CompactionOption,
     on_progress: &mut dyn FnMut(CopyProgress),
     pick: impl FnOnce(Option<&DataFile>, &Path, u64) -> RawRoute,
+) -> Result<()> {
+    copy_to_path_with(env, dest, option, on_progress, pick, &plain_dest)
+}
+
+/// [`copy_to_path`] writing through `wrap` of the staging file.
+fn copy_to_path_with(
+    env: &Env,
+    dest: &Path,
+    option: CompactionOption,
+    on_progress: &mut dyn FnMut(CopyProgress),
+    pick: impl FnOnce(Option<&DataFile>, &Path, u64) -> RawRoute,
+    wrap: WrapDest<'_>,
 ) -> Result<()> {
     // The internal read txn pins the snapshot for the whole copy (SPEC 00
     // row 17: copy opens its own read txn).
@@ -262,10 +320,10 @@ fn copy_to_path(
         }
         // The clone backed off (the path no longer names the env's data
         // file, or the clone came out short): stream from the map instead.
-        return stream_to_path(env, &txn, plan, None, dest, &mut progress);
+        return stream_to_path(env, &txn, plan, None, dest, &mut progress, wrap);
     }
     let src = src.filter(|_| route == RawRoute::FileCopy);
-    stream_to_path(env, &txn, plan, src.as_ref(), dest, &mut progress)
+    stream_to_path(env, &txn, plan, src.as_ref(), dest, &mut progress, wrap)
 }
 
 /// Write the image into a sibling staging file and rename it over `dest`.
@@ -276,6 +334,7 @@ fn stream_to_path(
     src: Option<&DataFile>,
     dest: &Path,
     progress: &mut Progress<'_>,
+    wrap: WrapDest<'_>,
 ) -> Result<()> {
     let (tmp, file) = create_staging_file(dest)?;
     // Remove the temp on every non-rename exit (error or unwinding callback).
@@ -283,7 +342,7 @@ fn stream_to_path(
         path: &tmp,
         armed: true,
     };
-    plan.write(env, txn, &file, 0, src, progress)?;
+    plan.write(env, txn, &file, &*wrap(&file), 0, src, progress)?;
     // Close the temp file before renaming it.
     drop(file);
     // The last callback before `dest` is touched; see the panic contract on
@@ -302,6 +361,17 @@ fn copy_into_open_file(
     option: CompactionOption,
     pick: impl FnOnce(Option<&DataFile>, &File) -> RawRoute,
 ) -> Result<()> {
+    copy_into_open_file_with(env, file, option, pick, &plain_dest)
+}
+
+/// [`copy_into_open_file`] writing through `wrap` of `file`.
+fn copy_into_open_file_with(
+    env: &Env,
+    file: &mut File,
+    option: CompactionOption,
+    pick: impl FnOnce(Option<&DataFile>, &File) -> RawRoute,
+    wrap: WrapDest<'_>,
+) -> Result<()> {
     use std::io::{Seek, SeekFrom};
     let txn = env.read_txn()?;
     let plan = Plan::new(env, &txn, option)?;
@@ -310,7 +380,15 @@ fn copy_into_open_file(
     let base = file.stream_position()?;
     let mut silent = |_: CopyProgress| {};
     let mut progress = Progress::start(plan.total, &mut silent);
-    let len = plan.write(env, &txn, file, base, src.as_ref(), &mut progress)?;
+    let len = plan.write(
+        env,
+        &txn,
+        file,
+        &*wrap(file),
+        base,
+        src.as_ref(),
+        &mut progress,
+    )?;
     file.seek(SeekFrom::Start(base + len))?;
     Ok(())
 }
@@ -366,8 +444,8 @@ fn open_file_route(src: Option<&DataFile>, file: &File) -> RawRoute {
 
 /// Filesystems on which Linux `copy_file_range` within one filesystem shares
 /// blocks (a reflink) instead of copying bytes. Elsewhere (ext4, tmpfs,
-/// overlayfs, NFS, ...) the kernel copies the bytes through a pipe, which was
-/// measured slower than writing from the map (ext4: about twice the time).
+/// overlayfs, NFS, ...) the kernel copies the bytes through a pipe, which is
+/// slower than writing from the map (ADR-0032).
 const REFLINK_FILESYSTEMS: [&str; 3] = ["xfs", "btrfs", "bcachefs"];
 
 /// The type of the filesystem mounted at the deepest mount point containing
@@ -619,23 +697,26 @@ impl Plan {
 
     /// Write the image into `file` at offset `base`, which must be `file`'s
     /// position when `src` is given; returns its length. A raw copy copies
-    /// its pages from `src` when given, from the map otherwise.
+    /// its pages from `src` when given, from the map otherwise. Positioned
+    /// writes go through `dest`, which writes `file`.
+    #[allow(clippy::too_many_arguments)]
     fn write(
         self,
         env: &Env,
         txn: &RoTxn<'_>,
         file: &File,
+        dest: &dyn ImageDest,
         base: u64,
         src: Option<&DataFile>,
         progress: &mut Progress<'_>,
     ) -> Result<u64> {
         match (self.option, src) {
             (CompactionOption::Disabled, Some(src)) => {
-                copy_raw_file(env, txn, src, file, base, progress)
+                copy_raw_file(env, txn, src, file, dest, base, progress)
             }
-            (CompactionOption::Disabled, None) => write_raw(env, txn, file, base, progress),
+            (CompactionOption::Disabled, None) => write_raw(env, txn, dest, base, progress),
             (CompactionOption::Enabled, _) => {
-                write_compact(env, txn, self.names, file, base, progress)
+                write_compact(env, txn, self.names, dest, base, progress)
             }
         }
     }
@@ -755,7 +836,7 @@ fn corrupt(_e: zerodb_core::page::PageError) -> Error {
 fn write_raw(
     env: &Env,
     txn: &RoTxn<'_>,
-    file: &File,
+    file: &dyn ImageDest,
     base: u64,
     progress: &mut Progress<'_>,
 ) -> Result<u64> {
@@ -765,15 +846,20 @@ fn write_raw(
     // Pages 0..=last_pg. Slots 0/1 are synthesized; the rest are data.
     let n_pages = snap.last_pg + 1;
     let data_end = (snap.last_pg as usize + 1) * ps;
-    let map = txn.map_bytes();
-    let src = map.get(..data_end).ok_or(Error::Mdb(MdbError::Invalid))?;
+    // Free pages below `last_pg` may be written by this process's writer
+    // during the copy, so they are never lent as a `&[u8]`: the kernel reads
+    // them from the map (ADR-0021 amendment 1).
+    let map = txn
+        .map_pages()
+        .prefix(data_end)
+        .ok_or(Error::Mdb(MdbError::Invalid))?;
 
     file.write_all_at(&snapshot_metas(env, txn)?, base)?;
 
     // Data pages in chunks, so progress is observable.
     for_each_chunk(FIRST_DATA_PGNO, n_pages, psize, progress, |pg, end| {
         let (from, to) = (pg as usize * ps, end as usize * ps);
-        file.write_all_at(&src[from..to], base + from as u64)?;
+        file.write_map_range(map, from, to - from, base + from as u64)?;
         Ok(())
     })?;
     Ok(data_end as u64)
@@ -789,6 +875,7 @@ fn copy_raw_file(
     txn: &RoTxn<'_>,
     src: &DataFile,
     file: &File,
+    dest: &dyn ImageDest,
     base: u64,
     progress: &mut Progress<'_>,
 ) -> Result<u64> {
@@ -809,7 +896,7 @@ fn copy_raw_file(
         Ok(())
     })?;
     // The file's own meta pages were copied too; replace them.
-    file.write_all_at(&snapshot_metas(env, txn)?, base)?;
+    dest.write_all_at(&snapshot_metas(env, txn)?, base)?;
     Ok(n_pages * u64::from(psize))
 }
 
@@ -888,8 +975,8 @@ fn snapshot_metas(env: &Env, txn: &RoTxn<'_>) -> Result<Vec<u8>> {
 /// would produce a tree whose physical order is the comparator's but whose
 /// builder-side reasoning assumed memcmp — and the resulting file records no
 /// comparator identity, so nothing downstream (`zerodb-tools check`,
-/// `dump`/`load`) could tell. Refusing loudly is the only honest option while
-/// the builder, the dump format and the tools are memcmp-only.
+/// `dump`/`load`) could tell. The copy is therefore refused while the
+/// builder, the dump format and the tools are memcmp-only.
 ///
 /// `CompactionOption::Disabled` (the raw page copy) is unaffected: it is a
 /// byte-level copy that preserves whatever order is on disk.
@@ -920,7 +1007,7 @@ fn write_compact(
     env: &Env,
     txn: &RoTxn<'_>,
     names: Vec<Vec<u8>>,
-    file: &File,
+    file: &dyn ImageDest,
     base: u64,
     progress: &mut Progress<'_>,
 ) -> Result<u64> {

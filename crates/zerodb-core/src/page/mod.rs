@@ -26,6 +26,11 @@
 mod crc32c;
 pub mod geometry;
 mod header;
+// Sanctioned `unsafe` home (unsafe policy: mmap access in
+// `zerodb-core::page`): the page-bounded view of the map (ADR-0021
+// amendment 1).
+#[allow(unsafe_code)]
+mod map;
 pub mod meta;
 mod overflow;
 // Sanctioned `unsafe` home (unsafe policy: page casting in
@@ -42,12 +47,15 @@ pub use crc32c::{crc32c, crc32c_concat};
 pub(crate) use header::read_flags;
 pub(crate) use header::read_page_txnid;
 pub use header::{CommonHeader, PageRef};
+pub use map::MapPages;
 pub use meta::{
     meta_annex_cap, select as select_meta, DBRecord, MetaChoice, MetaPage, MetaValidity,
     DBRECORD_LEN,
 };
 pub use overflow::{write_overflow_head, OverflowRef};
-pub(crate) use tree::copy_tree_page;
+pub(crate) use tree::{
+    copy_tree_page, even, BIGDATA_VALUE_LEN, BRANCH_NODE_HEADER, LEAF_NODE_HEADER,
+};
 pub use tree::{BranchMut, BranchRef, LeafMut, LeafRef, LeafValue};
 pub use trust::FileTrust;
 
@@ -144,7 +152,6 @@ pub const STRUCTURAL_MASK: u16 = P_LEAF | P_BRANCH | P_OVERFLOW | P_META;
 /// head pgno of the run. `dsize` still holds the true logical value length.
 pub const F_BIGDATA: u16 = 0x0001;
 /// Leaf value is a 48-byte sub-DB [`DBRecord`] (a named-DB catalog entry).
-/// Active (named databases); its DUPSORT interaction is deferred with DUPSORT itself.
 pub const F_SUBDATA: u16 = 0x0002;
 /// **Reserved for DUPSORT** — value is a DUPSORT sub-page/sub-tree
 /// (unsupported, see docs/LMDB-COMPATIBILITY.md).

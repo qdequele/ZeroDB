@@ -221,3 +221,18 @@ pub fn device_written_bytes() -> Option<u64> {
         .ok()
         .map(|s| s * 512)
 }
+
+/// Read requests completed by the block device `KVC_DEVICE` since boot, and
+/// the bytes they read, from `/sys/block/<dev>/stat`. Run on an otherwise
+/// idle disk, the difference over a phase is what the engine made the disk
+/// read. `None` when unset or unreadable.
+pub fn device_reads() -> Option<(u64, u64)> {
+    let dev = std::env::var("KVC_DEVICE").ok()?;
+    let stat = std::fs::read_to_string(format!("/sys/block/{dev}/stat")).ok()?;
+    let mut fields = stat.split_whitespace();
+    // Field 1 is reads completed and field 3 sectors read; a sector here is
+    // always 512 bytes.
+    let ios = fields.next()?.parse::<u64>().ok()?;
+    let sectors = fields.nth(1)?.parse::<u64>().ok()?;
+    Some((ios, sectors * 512))
+}

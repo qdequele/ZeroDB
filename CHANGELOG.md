@@ -8,6 +8,27 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ### Added
 
+- **Power-loss harness below the file system** (`power-loss` binary,
+  `scripts/power-loss/`, docs/maintainers/POWER-LOSS.md). The workload runs on
+  ext4 and XFS over a `dm-log-writes` device; each flush point of the log is
+  rebuilt, mounted and checked: the env opens, `zerodb-tools check` passes,
+  every acknowledged commit of a durable mode is present and no later commit
+  is partly visible. Linux and root only; a CI job runs it nightly and on pull
+  requests that touch it.
+- **Hardening runners**: `just soak` runs the fuzz targets,
+  the crash harness and the stress tests side by side for 24 hours and
+  collects sequence counts and findings; `just page-size-matrix` runs the
+  suite, the crash harness at DB pages of 4, 16 and 64 KiB, the stress tests
+  and the fuzz gate on the host's kernel, for a 64 KiB-page aarch64 machine.
+  `docs/maintainers/HARDENING-RUNS.md` says which machines to use. The crash
+  harness takes `ZERODB_CRASH_PAGE_SIZE` to pin every cycle's page size, and
+  `crates/zerodb/tests/os_page_size.rs` exercises the OS-page-rounding paths
+  at each DB page size. Neither long run has been recorded yet.
+- **I/O-error injection** in the fault-injecting backend (`IoFault`): a test
+  can fail the `n`th write, sync or file-growth call with `EIO`, `ENOSPC` or a
+  short write. Tests fail every such call of a commit, of a spill, of the
+  `WRITE_MAP` ranged `msync`, of file growth and of `copy_to_file` and
+  compaction; SPEC 06 REC-23 states the behavior they pin.
 - **Multi-process access** (ADR-0023). Several processes can open one
   environment and read or write it, as with LMDB. A lock file is created next
   to the data file by default: `lock.mdb` through heed, `zerodb.lock`
@@ -26,6 +47,11 @@ the release workflow publishes the section matching the tag as the GitHub releas
   `Env::unique_write_txn` and friends, `non_free_page_size`). Without the
   feature nothing changes. Meilisearch v1.55.0's milli and index-scheduler
   suites pass on it (447 tests).
+- **Consumer gate in CI.** A nightly, manually dispatchable job runs
+  Meilisearch v1.55.1's milli and index-scheduler suites and hannoy v0.2.0's
+  suite on ZeroDB through `scripts/consumer.sh` and `scripts/hannoy.sh`, and a
+  green run is required before a release. Run on 2026-11-20 at `c7e1abf`:
+  448 and 59 tests passed, none failed.
 - Read transactions and nested read transactions gain `commit`: as in LMDB,
   committing one keeps the databases it opened.
 - `ReaderEntry::pid`: `Env::reader_list()` reports each slot's owner process.
@@ -37,10 +63,42 @@ the release workflow publishes the section matching the tag as the GitHub releas
 - `zerodb-core`: `Cursor::advance_by` and `Cursor::retreat_by`.
 - New error variant `MdbError::BadDbi`.
 - A runnable example, `cargo run -p zerodb --example basic`.
+- **`zerodb-tools upgrade <old-env-dir> <new-env-dir>`** copies a format 2
+  environment (0.2.0) into a fresh current-format one, keeping its data-file
+  name and page size, and checks entry counts and invariants. `dump` also reads
+  format 2 files, producing the dump the 0.2.0 tools did.
+- `zerodb_core::page::MetaPage::validate_version`: SPEC 02 §3.2's meta-slot
+  check against a given format version, for tools that read an older file.
 - `zerodb::EnvFlags::from_bits_truncate`.
+- `zerodb_core::check::check_image_with_key_order` and
+  `check_snapshot_with_key_order`: a caller that holds a database's custom
+  comparator can have key order checked under it, or skipped. `check_image`,
+  `check_snapshot` and `zerodb-tools check` are unchanged.
+- Verification of the `unsafe` code: miri now also runs `zerodb-io`'s
+  file-free unit tests and `heed-zerodb`'s unit tests (`just miri`); loom
+  models the in-process writer lock and the Linux cross-process writer word,
+  whose protocol moved unchanged into `zerodb_core::writer_word`; a nightly CI
+  job runs the tests under ThreadSanitizer and AddressSanitizer
+  (`just sanitize`). A brief for an outside review is in
+  `docs/maintainers/UNSAFE-AUDIT.md`.
+- **More of the heed surface compared with LMDB by generated tests.** The
+  oracle's `scenario` module generates sequences with `delete_range`, custom
+  key comparators, several read transactions at different snapshots while a
+  writer commits, reopens with `READ_ONLY`, `PREV_SNAPSHOT`, `NO_LOCK` and
+  `WRITE_MAP`, and the `MapFull` property (the `diff_scenarios` fuzz
+  target). Its `mp` module generates multi-process sequences: reader slots,
+  growth past another process's map, `resize`, `MapResized`, killed readers
+  and stale-reader cleanup. Both run in the PR fuzz gate.
 
 ### Changed
 
+- `zerodb-core` lends the map as `zerodb_core::page::MapPages`, a view that
+  hands out page-bounded slices, instead of a whole-map `&[u8]` (ADR-0021
+  amendment 1). Breaking for `zerodb-core` callers: `RoTxn::map_bytes` is now
+  `RoTxn::map_pages`, `check::check_snapshot` and
+  `check_snapshot_with_key_order` take a `MapPages`, `MapView::bytes` is now
+  `MapView::pages` and `Backing::bytes` is now `Backing::pages`. The heed
+  adapter and the `zerodb` API are unchanged.
 - **Pages are trusted by default, as in LMDB** (ADR-0034). An environment
   no longer validates every page it reads unless opened with
   `file_trust(FileTrust::VALIDATE)`; a corrupt file is then undefined
@@ -55,8 +113,8 @@ the release workflow publishes the section matching the tag as the GitHub releas
   the low end of each record's page range, instead of one record on a long
   overflow run. A later commit that draws pages from that list reads and
   rewrites only the records it draws from, not the whole list. Format-2
-  files are refused at open: migrate with `zerodb-tools dump` built from the
-  previous release, then `load`. `zerodb-tools stat` reports the free-page
+  files are refused at open: migrate with `zerodb-tools upgrade <old-env>
+  <new-env>` from this release, one command and one tool version. `zerodb-tools stat` reports the free-page
   records, and `check` verifies their bound and ranges (INV-29).
 - **The heed adapter is the `[patch]` target itself.** `crates/heed-zerodb`'s
   package is now named `heed` (version 0.22.1), and the `crates/heed-shim` and
@@ -166,6 +224,9 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 - Full scans read entries from the leaf in hand, and trusted mode no longer
   records leaves: `scan/full/fwd` 2.25× → 1.45×, and about 1.0× in trusted
   mode.
+- `first` and `last` descend without building a cursor, as point gets do
+  (#147): 61.9 → 41.7 ns per call against LMDB's 54.5 (1.14× → 0.77×,
+  laptop).
 - `skip` crosses whole leaves without decoding the entries it passes.
 - Short read transactions reuse their memory on the same thread (#25).
 - The meta checksum uses the ARMv8 `crc32c` instructions on aarch64
@@ -176,6 +237,50 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 
 ### Fixed
 
+- **`clear` of the main database now commits a new transaction** even when
+  the database was already empty, as LMDB's `mdb_drop` does: the commit takes
+  a new txnid and writes a meta (SPEC 04 TXN-74).
+- **heed adapter: `get_greater_than` on a database with a custom key
+  comparator** returns heed's result. heed seeks in the database's order but
+  then compares the found key with memcmp, so with a custom comparator it can
+  skip an entry; the adapter returned the least entry strictly greater.
+- **heed adapter: an empty key as a range's seek bound** (the start of
+  `range` and `range_mut`, the end of `rev_range` and `rev_range_mut`) now
+  yields `BadValSize` before the entries, and `delete_range` with an empty
+  start bound returns `Io(InvalidInput)` without deleting anything, as heed
+  does on LMDB. The adapter treated the empty key as the smallest key.
+  `del_current` on a write iterator that has not yet sought (before its
+  first item, or right after that error) returns `Io(InvalidInput)`
+  (`EINVAL`) as LMDB does, instead of `Ok(false)`.
+- **heed adapter: `Env::info().number_of_readers` is 0 with `NO_LOCK`**, as
+  in LMDB, which has no reader table then.
+- A failed meta write (commit step C4) or meta barrier (C5) now writes the
+  meta slot's previous bytes back and poisons the environment, as LMDB marks
+  its environment fatal (SPEC 06 REC-13, ADR-0047). Before, a failed meta
+  write left the environment writable, and a short write that carried the
+  whole meta, followed by a write transaction interrupted between its page
+  writes and its meta write, could leave the file corrupt. Read transactions
+  keep working on the poisoned environment; LMDB refuses them.
+- `zerodb-tools check` on a file it walks raw no longer reports INV-3 for a
+  partial page past the high-water. A write that extended the file and failed
+  part-way (a short write on a full device) leaves one; no snapshot reads it.
+
+- **A commit no longer fails when the free-list save converges slowly**
+  (ADR-0044). The save loop was limited to 64 rounds, a number its
+  termination proof did not give; past it the commit panicked, and a retry
+  of the same batch was likely to panic again. After 8 rounds the save now
+  stops reusing free pages and extends the file by a few pages, which ends
+  it. The remaining guard is computed from the proof (SPEC 05 GC-13,
+  GC-13a). No test, crash or stress run has needed more than 3 rounds.
+- `LeafRef::new` and `BranchRef::new` reject a buffer shorter than the page
+  size, and `LeafMut::lookup` bounds-checks its reads. Both could read out of
+  bounds from safe code when called directly; the engine always passed whole
+  pages.
+- `zerodb-tools check` no longer reads the whole data file into memory when
+  the environment cannot be opened; it walks a read-only map.
+- A `pwritev` interrupted by a signal is retried, not reported as an error.
+- `remove_span` leaves the page unmodified when it returns an error.
+- `zerodb-tools` rejects unexpected extra arguments.
 - heed adapter: `Database::put_reserved` returns `Io(UnexpectedEof)` when the
   closure writes fewer bytes than it reserved, as heed does. It returned `Ok`
   with a zeroed tail.
@@ -201,6 +306,18 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 - Under corruption, a page error met while `skip` crosses leaves is returned
   as an item instead of ending the iterator silently.
 
+- A read transaction in one thread no longer holds a borrow of the whole
+  map while the writer of the same process stores into free pages of it
+  (in place under `WRITE_MAP`, by `pwrite` otherwise). The bytes read were
+  never written, but the borrow covered bytes that changed, which Rust's
+  aliasing rules forbid; miri reported it. Every borrow now covers only the
+  page, overflow run or value read, and the raw `Env::copy` writes the map to
+  the file with `pwrite` from the map's address (ADR-0021 amendment 1).
+- The safety contract of the heed adapter's write-iterator `unsafe fn`s
+  (`del_current`, `put_current` and the other cursor writes) now matches
+  heed's: no key or value the iterator yielded may be held across the call,
+  not only the current entry's.
+
 ### Removed
 
 - Re-exports from `zerodb` that were internals: `build_multi_db_image`,
@@ -219,8 +336,12 @@ Ratios are ZeroDB time ÷ LMDB time on Graviton4 unless stated; details in
 - Using an `Env` in a child after `fork()`, and sharing an environment across
   PID namespaces, are unsupported. `Env::sync` only serializes with this
   process's commits. On macOS, a writer that takes over from a dead writer
-  does not free dead readers' slots; call `clear_stale_readers` (SPEC 04
-  §12.1).
+  does not free dead readers' slots, where LMDB does (D-028, proposed); call
+  `clear_stale_readers` (SPEC 04 §12.1).
+- **Platforms:** Linux (x86-64, aarch64) and macOS (aarch64) are tested in
+  CI. Windows is not supported: the crates stop at a `compile_error!` there,
+  instead of dozens of unresolved Unix imports. ADR-0046 proposes the Windows
+  design (draft). The tiers are in `docs/USING.md#platform-support`.
 
 ## [0.2.0] - 2026-10-05
 
@@ -234,10 +355,12 @@ feature that links C LMDB).
 ### What ZeroDB is
 
 A pure-Rust, transactional, memory-mapped key-value engine with LMDB's
-architecture: a single writer, lock-free MVCC readers, copy-on-write B+trees,
+architecture: a single writer, MVCC readers that never wait on a write
+transaction (beginning one takes a short mutex to pin the snapshot),
+copy-on-write B+trees,
 double-buffered CRC32C meta pages and reader-gated free-page reuse. It ships
 behind a 1:1 re-implementation of the API of heed 0.22.1 (the Rust LMDB wrapper
-Meilisearch uses), and every behavior is checked against the LMDB fork
+Meilisearch uses), and its behavior is checked against the LMDB fork
 Meilisearch runs.
 
 - **Use the engine directly:** `zerodb = "0.2"` from crates.io (with
@@ -305,7 +428,8 @@ performance experiment, kept or reverted, is a line in
   differential fuzz on x86-64 and aarch64, `miri` on the core, `loom` on the
   reader table and a crash-injection smoke; nightly runs add a 4-hour fuzz,
   10,000 crash cycles and a reader/writer stress test.
-- **Consumers**: Meilisearch v1.53.1 and hannoy run unmodified on this release
+- **Consumers**: Meilisearch v1.53.1 and hannoy run on this release with no
+  source changes
   (the benchmarks above). Their own test suites (milli 271 lib + 92 integration
   tests, index-scheduler 80 tests, hannoy) last passed on ZeroDB on 2026-09-09,
   before spilling, in-place `WRITE_MAP` and `format_version` 2; they were not
