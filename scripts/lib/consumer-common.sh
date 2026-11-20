@@ -9,6 +9,13 @@
 
 log() { printf '\n\033[1m[%s] %s\033[0m\n' "$LOG_TAG" "$*"; }
 
+# note LINE: print LINE, and add it to the job summary when running in GitHub
+# Actions.
+note() {
+    echo "$*"
+    if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then echo "$*" >> "$GITHUB_STEP_SUMMARY"; fi
+}
+
 # report_versions NAME REF: print what is under test, so a log or a recorded
 # result names the exact commits on both sides.
 report_versions() {
@@ -18,9 +25,9 @@ report_versions() {
         dirty=" (with uncommitted changes)"
     fi
     log "versions under test"
-    echo "  ZeroDB  $zerodb_rev$dirty"
-    echo "  $1  $2 ($(git -C "$CLONE" rev-parse HEAD))"
-    echo "  $(rustc --version)"
+    note "- ZeroDB \`$zerodb_rev\`$dirty"
+    note "- $1 \`$2\` (\`$(git -C "$CLONE" rev-parse HEAD)\`)"
+    note "- \`$(rustc --version)\`"
 }
 
 # run_tests ARGS...: `cargo test ARGS` in the clone, with the output kept in
@@ -32,7 +39,8 @@ run_tests() {
     mkdir -p "$(dirname "$out")"
     local rc=0
     (cd "$CLONE" && cargo test "$@") 2>&1 | tee "$out" || rc=$?
-    awk '/^test result:/ {
+    local totals
+    totals="$(awk '/^test result:/ {
             for (i = 1; i <= NF; i++) {
                 if ($(i+1) ~ /^passed/)  p += $i
                 if ($(i+1) ~ /^failed/)  f += $i
@@ -40,8 +48,10 @@ run_tests() {
             }
             n++
         }
-        END { printf "\n[summary] %d test binaries: %d passed, %d failed, %d ignored\n", n, p, f, g }' "$out"
-    echo "[summary] full log: $out"
+        END { printf "%d test binaries: %d passed, %d failed, %d ignored", n, p, f, g }' "$out")"
+    echo
+    note "- $LOG_TAG \`cargo test $*\`: $totals (status $rc)"
+    echo "full log: $out"
     if [ "$rc" -ne 0 ]; then
         log "FAIL: cargo test $* exited with status $rc"
         grep -E '^(test .* FAILED|error(\[E[0-9]+\])?:)' "$out" | head -40 >&2 || true
