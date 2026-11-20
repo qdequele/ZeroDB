@@ -8,6 +8,13 @@ the release workflow publishes the section matching the tag as the GitHub releas
 
 ### Added
 
+- **Power-loss harness below the file system** (`power-loss` binary,
+  `scripts/power-loss/`, docs/maintainers/POWER-LOSS.md). The workload runs on
+  ext4 and XFS over a `dm-log-writes` device; each flush point of the log is
+  rebuilt, mounted and checked: the env opens, `zerodb-tools check` passes,
+  every acknowledged commit of a durable mode is present and no later commit
+  is partly visible. Linux and root only; a CI job runs it nightly and on pull
+  requests that touch it.
 - **Multi-process access** (ADR-0023). Several processes can open one
   environment and read or write it, as with LMDB. A lock file is created next
   to the data file by default: `lock.mdb` through heed, `zerodb.lock`

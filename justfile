@@ -81,6 +81,11 @@ crash-test-mp CYCLES='500':
 crash-test-full:
     cargo run -p zerodb-oracle --bin crash-harness -- --cycles 10000
 
+# Power loss below the file system: dm-log-writes on ext4 and XFS. Linux and
+# root only; settings through the environment (docs/maintainers/POWER-LOSS.md).
+power-loss:
+    sudo -E scripts/power-loss/run.sh
+
 # --- Engine comparison: zerodb vs the LMDB fork (heed), both in one binary ---
 #
 # The bench is a LADDER: adjacent rungs differ by exactly one mechanism, so a

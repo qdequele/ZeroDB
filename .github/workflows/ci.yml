@@ -3,9 +3,10 @@
 # Per push / PR: fmt, clippy, tests (x86-64 and aarch64), an MSRV check, miri
 # on the core, loom on the reader table, the free-list save without pool
 # draws, the fuzz gate and the crash smoke.
-# Nightly: the long fuzz, the full crash run, the reader stress, and the
-# consumer gate (Meilisearch's milli and index-scheduler suites and hannoy's
-# suite on ZeroDB, through scripts/consumer.sh and scripts/hannoy.sh).
+# Nightly: the long fuzz, the full crash run, the reader stress, the
+# power-loss run on ext4 and XFS (also on pull requests that touch it), and
+# the consumer gate (Meilisearch's milli and index-scheduler suites and
+# hannoy's suite on ZeroDB, through scripts/consumer.sh and scripts/hannoy.sh).
 # The loom, fuzz, crash and stress jobs run the justfile recipes of the same
 # name, so `just <recipe>` locally runs exactly what CI runs.
 # The oracle crate links the real LMDB fork (lmdb-master-sys), so every job
@@ -190,6 +191,70 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo install just --version 1.58.0 --locked
       - run: just crash-test-quick
+
+  # Power loss below the file system (docs/maintainers/POWER-LOSS.md): the
+  # workload runs on ext4 and XFS over a dm-log-writes device, and every cut
+  # point is rebuilt, mounted and verified. Needs root, loop devices and the
+  # dm-log-writes target, which the hosted runners provide through sudo and
+  # linux-modules-extra. Nightly on both architectures; on a pull request only
+  # when the harness or the I/O crate changed, in a shorter form.
+  power-loss:
+    name: power loss, dm-log-writes (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: ${{ github.event_name == 'pull_request' && 0 || 1 }}
+      - name: decide whether this pull request needs the run
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$RUNNER_ARCH" != X64 ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          elif git diff --name-only "$BASE" HEAD |
+            grep -qE '^(scripts/power-loss/|crates/zerodb-oracle/src/crash/powerloss|crates/zerodb-oracle/src/bin/power-loss|crates/zerodb-io/)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: install xfsprogs and the device-mapper modules
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xfsprogs "linux-modules-extra-$(uname -r)" ||
+            sudo apt-get install -y xfsprogs
+      - name: probe dm-log-writes, dm-snapshot and loop devices
+        if: steps.scope.outputs.run == 'true'
+        run: sudo scripts/power-loss/probe.sh
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master (2026-10-01)
+        if: steps.scope.outputs.run == 'true'
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: steps.scope.outputs.run == 'true'
+      - name: build the harness
+        if: steps.scope.outputs.run == 'true'
+        run: cargo build --release -p zerodb-oracle --bin power-loss -p zerodb-tools --bin zerodb-tools
+      - name: run (ext4 and XFS; default, WRITE_MAP, NO_META_SYNC; with and without spills)
+        if: steps.scope.outputs.run == 'true'
+        env:
+          SEEDS: ${{ github.event_name == 'pull_request' && '7' || '7 24 1' }}
+          MAX_POINTS: ${{ github.event_name == 'pull_request' && '40' || '250' }}
+        run: |
+          sudo env BIN_DIR="$PWD/target/release" FS="ext4 xfs" SEEDS="$SEEDS" \
+            MAX_POINTS="$MAX_POINTS" WORK="$RUNNER_TEMP/power-loss" \
+            scripts/power-loss/run.sh
 
   nightly:
     name: nightly — long fuzz, full crash run, stress (${{ matrix.os }})
