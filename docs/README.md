@@ -31,6 +31,7 @@ transactions and MVCC, `05` free-page reuse, and `06` durability and recovery.
 |---|---|
 | [maintainers/RELEASING.md](maintainers/RELEASING.md) | How a version is cut |
 | [maintainers/CONSUMER-GATE.md](maintainers/CONSUMER-GATE.md) | Running Meilisearch's and hannoy's test suites and benchmarks on ZeroDB |
+| [maintainers/FORK-1-bug-report.md](maintainers/FORK-1-bug-report.md) | Draft upstream report for the LMDB fork crash FORK-1, not yet filed |
 
 Benchmark reports are in [`benches/results/`](../benches/results/README.md),
 and release history in [CHANGELOG.md](../CHANGELOG.md).

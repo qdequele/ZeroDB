@@ -7,23 +7,36 @@ crashes. Such crashes are not ZeroDB divergences. Each one gets a repro in
 this repo and a guard in the harness so fuzzing can continue; the guard is
 removed once the fork is fixed.
 
-## FORK-1: `SIGSEGV` in `_mdb_cursor_put` (APPEND after a same-txn clear of another database)
+## FORK-1: `SIGSEGV` in `_mdb_cursor_put` (put into a named database after a same-txn clear of the main database)
 
 **Status:** open, not yet reported upstream (no matching issue on
-`meilisearch/lmdb`). Found 2026-07-16 by the `diff_ops` fuzz target.
+`meilisearch/lmdb`). Found 2026-07-16 by the `diff_ops` fuzz target; still
+reproduces on 2026-11-20. A ready-to-file report, with a standalone C
+reproduction and the cause, is in
+[maintainers/FORK-1-bug-report.md](maintainers/FORK-1-bug-report.md).
+Stock LMDB is probably affected: the code involved is identical in
+OpenLDAP's `mdb.master` and in `LMDB_0.9.36`, but it has not been run there
+yet.
 
 **Recipe** (all four steps are required):
 
-1. Write txn A: create the named database `X` and commit.
-2. Write txn B: create a second database `Y` and `clear(Y)`.
-3. Still in txn B: an `MDB_APPEND` put of `(k1, v)` into `X` succeeds.
-4. Still in txn B: an `MDB_APPEND` put of `(k2, v')` into `X` with `k2 <= k1`
-   should return `MDB_KEYEXIST`, but crashes with `SIGSEGV` in
-   `_mdb_cursor_put` (a near-null dereference, called from `mdb_put`).
+1. Write txn A: create the named database `X` and commit, leaving it empty.
+2. Write txn B: clear the main (unnamed) database, the one that holds `X`'s
+   record (heed: `create_database(None)` then `clear`).
+3. Still in txn B: a put into `X` succeeds.
+4. Still in txn B: a second put into `X` crashes with `SIGSEGV` in
+   `_mdb_cursor_put` (a near-null dereference, called from `mdb_put`). This
+   holds for an `MDB_APPEND` put that should return `MDB_KEYEXIST`, an
+   `MDB_APPEND` put that should succeed, and a put with no flags.
 
-Value sizes are irrelevant. Removing the `clear`, removing the first
-successful append, or using an ascending key avoids the crash. Under ASan:
-`SEGV on unknown address 0x00000000000a` at `_mdb_cursor_put+0x8b8`.
+Value sizes are irrelevant. Removing the `clear` or the first put avoids the
+crash. Under ASan: `SEGV on unknown address 0x00000000000a` at
+`_mdb_cursor_put` (`mdb.c:8107`).
+
+**Cause:** the first put allocates `X`'s root without refreshing its stale
+record; the second put's refresh finds the main database empty, returns
+`MDB_NOTFOUND`, and `_mdb_cursor_put` inserts at the unpositioned cursor. See
+the report for the code path.
 
 **Repro:** `crates/zerodb-oracle/examples/fork_segv_repro.rs`.
 
@@ -32,11 +45,14 @@ cargo build -p zerodb-oracle --example fork_segv_repro
 VARIANT=with_clear ./target/debug/examples/fork_segv_repro   # exits 139
 ```
 
-**Exposure:** milli uses both `clear` and `APPEND` puts while indexing, so the
-combination inside one write txn is plausible.
+**Exposure:** the trigger is clearing the main database, which holds the
+named databases' records, while named databases are in use. SPEC 02 §6
+records that milli stores no keys of its own in the main database; whether
+any consumer clears it has not been checked.
 
 **Harness guard:** `driver::classify` skips an `APPEND` put in any write txn
-that has run a `ClearDb` (`Skip::KnownForkBug`), on both engines. Pinned by
+that has run a `ClearDb` (`Skip::KnownForkBug`), on both engines. The
+guard covers `APPEND` only; the crash also follows a plain put. Pinned by
 `crates/zerodb-oracle/tests/lmdb_observations/fork_bug_guard.rs`.
 
 **ZeroDB:** returns `KeyExist`, as SPEC 01 §S1 requires
