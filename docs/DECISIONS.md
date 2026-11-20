@@ -94,10 +94,9 @@ Tried, measured, and left out.
 
 ## Reserved numbers
 
-Two numbers are missing above because their ADRs were written on branches
-that are not merged into `main`. The numbers are not reused.
+One number is missing above because its ADR was written on a branch that is
+not merged into `main`. The number is not reused.
 
 | # | Title | Status on its branch | Branch |
 |---|-------|--------|------|
 | 0036 | Grow the memory map on demand, behind an option | Accepted and implemented on the branch; not merged | `qdequele/issue-33-map-growth-adr-4640ce` |
-| 0040 | Refuse unknown persisted flag bits at open | Accepted, not implemented; not merged | `qdequele/silly-torvalds-ba6e41` |
