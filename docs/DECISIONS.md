@@ -76,6 +76,7 @@ Awaiting a decision. Nothing here is implemented in `main`.
 | 0035 | [One atomic word for the in-process writer lock](adr/0035-writer-lock-cell.md) | Proposed | Concurrency, performance (commit), `unsafe` policy |
 | 0038 | [Bounded relaxed durability: steady and weak metas, a durable watermark](adr/0038-bounded-relaxed-durability.md) | Proposed | Durability, page reclamation, on-disk format |
 | 0039 | [Group commit: start the next write transaction during the previous commit's sync](adr/0039-group-commit.md) | Proposed (recommends not building it now) | Durability, concurrency, beyond LMDB |
+| 0040 | [Refuse unknown persisted flag bits at open](adr/0040-refuse-unknown-flag-bits.md) | Accepted (Option B), not implemented | On-disk format, open protocol, beyond LMDB |
 | 0041 | [A new tree page is not zero-filled when its memory is reused, as LMDB](adr/0041-fresh-page-zero-fill.md) | Proposed | Performance (writes), bytes on disk |
 | 0042 | [Streaming and incremental environment export](adr/0042-streaming-and-incremental-export.md) | Draft, awaiting approval | Env copy, beyond LMDB |
 | 0043 | [Adopt `bitflags` for the flag types and `tempfile` for test directories](adr/0043-bitflags-and-tempfile.md) | Proposed | Dependencies, heed API |
@@ -93,10 +94,9 @@ Tried, measured, and left out.
 
 ## Reserved numbers
 
-Two numbers are missing above because their ADRs were written on branches
-that are not merged into `main`. The numbers are not reused.
+One number is missing above because its ADR was written on a branch that is
+not merged into `main`. The number is not reused.
 
 | # | Title | Status on its branch | Branch |
 |---|-------|--------|------|
 | 0036 | Grow the memory map on demand, behind an option | Accepted and implemented on the branch; not merged | `qdequele/issue-33-map-growth-adr-4640ce` |
-| 0040 | Refuse unknown persisted flag bits at open | Accepted, not implemented; not merged | `qdequele/silly-torvalds-ba6e41` |
